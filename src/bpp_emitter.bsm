@@ -1,0 +1,1022 @@
+// bpp_emitter.bsm — C code generator for the unified B++ compiler.
+// Reads AST data from the parser's in-memory structures (no JSON).
+// Writes C source code to stdout.
+
+// ── Emitter-owned globals ──────────────────────────────────
+
+// String buffer alias: points to vbuf (set by bridge_data).
+auto sbuf;
+
+// Extern function table (parallel arrays for fast lookup).
+auto ex_name, ex_lib, ex_ret, ex_args, ex_acnt, ex_cnt;
+
+// Function table (parallel arrays).
+// fn_fidx maps emitter index → parser func_cnt index for type queries.
+auto fn_name, fn_par, fn_pcnt, fn_body, fn_bcnt, fn_cnt, fn_fidx;
+
+// Global variable list.
+auto gl_name, gl_cnt;
+
+// Used extern tracking (deduplicated list of extern calls).
+auto ux_name, ux_cnt;
+
+// Current output indentation level.
+auto g_indent;
+
+// Current function index during emission (used to query per-function types).
+auto cur_fn_idx;
+
+// ── Initialization ─────────────────────────────────────────
+
+init_emitter() {
+    ex_name = malloc(2048); ex_lib = malloc(2048);
+    ex_ret = malloc(2048); ex_args = malloc(2048);
+    ex_acnt = malloc(2048); ex_cnt = 0;
+    fn_name = malloc(65536); fn_par = malloc(65536);
+    fn_pcnt = malloc(65536); fn_body = malloc(65536);
+    fn_bcnt = malloc(65536); fn_fidx = malloc(65536); fn_cnt = 0;
+    gl_name = malloc(65536); gl_cnt = 0;
+    ux_name = malloc(2048); ux_cnt = 0;
+    g_indent = 0;
+    return 0;
+}
+
+// ── Bridge: copy parser data into emitter parallel arrays ──
+// The parser stores functions and externs as 64-byte records.
+// The emitter uses parallel arrays for fast field access.
+// This function translates between the two formats.
+
+bridge_data() {
+    auto i, rec, name_p, idx, j;
+
+    // Point sbuf at the parser's string buffer.
+    sbuf = vbuf;
+
+    // Copy externs from parser's 64-byte records into parallel arrays.
+    ex_cnt = ext_cnt;
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        *(ex_name + i * 8) = *(rec + 8);
+        *(ex_lib  + i * 8) = *(rec + 16);
+        *(ex_ret  + i * 8) = *(rec + 24);
+        *(ex_args + i * 8) = *(rec + 32);
+        *(ex_acnt + i * 8) = *(rec + 40);
+        i = i + 1;
+    }
+
+    // Copy functions from parser's 64-byte records into parallel arrays.
+    // Handle forward declarations: if a function name already exists,
+    // overwrite it with the later (real) definition.
+    fn_cnt = 0;
+    i = 0;
+    while (i < func_cnt) {
+        rec = *(funcs + i * 8);
+        name_p = *(rec + 8);
+        // Check if this function was already added (forward declaration).
+        idx = -1;
+        j = 0;
+        while (j < fn_cnt) {
+            if (str_eq_packed(name_p, *(fn_name + j * 8))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            idx = fn_cnt;
+            fn_cnt = fn_cnt + 1;
+        }
+        *(fn_name + idx * 8) = name_p;
+        *(fn_par  + idx * 8) = *(rec + 16);
+        *(fn_pcnt + idx * 8) = *(rec + 24);
+        *(fn_body + idx * 8) = *(rec + 32);
+        *(fn_bcnt + idx * 8) = *(rec + 40);
+        *(fn_fidx + idx * 8) = i;
+        i = i + 1;
+    }
+
+    // Copy globals (already stored as packed names in a flat array).
+    gl_cnt = glob_cnt;
+    i = 0;
+    while (i < glob_cnt) {
+        *(gl_name + i * 8) = *(globals + i * 8);
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+// ── String utilities ───────────────────────────────────────
+
+// Compare a packed string against a C literal. Returns 1 if equal.
+str_eq(p, lit, litlen) {
+    if (unpack_l(p) != litlen) { return 0; }
+    return buf_eq(sbuf + unpack_s(p), lit, litlen);
+}
+
+// Compare two packed strings byte by byte.
+str_eq_packed(a, b) {
+    auto as, al, bs, bl, i;
+    al = unpack_l(a); bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    as = unpack_s(a); bs = unpack_s(b);
+    i = 0;
+    while (i < al) {
+        if (peek(sbuf + as + i) != peek(sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Print a packed string to stdout.
+print_p(p) {
+    print_buf(sbuf + unpack_s(p), unpack_l(p));
+    return 0;
+}
+
+// ── Used extern tracking ───────────────────────────────────
+
+// Check if a packed name is in the extern table.
+is_extern(name_p) {
+    auto i;
+    i = 0;
+    while (i < ex_cnt) {
+        if (str_eq_packed(name_p, *(ex_name + i * 8))) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Mark an extern function as used (deduplicated).
+mark_used(name_p) {
+    auto i;
+    i = 0;
+    while (i < ux_cnt) {
+        if (str_eq_packed(name_p, *(ux_name + i * 8))) { return 0; }
+        i = i + 1;
+    }
+    *(ux_name + ux_cnt * 8) = name_p;
+    ux_cnt = ux_cnt + 1;
+    return 0;
+}
+
+// Check if an extern is marked as used.
+is_used(name_p) {
+    auto i;
+    i = 0;
+    while (i < ux_cnt) {
+        if (str_eq_packed(name_p, *(ux_name + i * 8))) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Forward declaration.
+scan_calls(node) { return 0; }
+
+// Recursively scan an AST node for extern function calls.
+scan_calls(nd) {
+    auto n: Node;
+    auto t, i, arr, cnt;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        if (is_extern(n.a)) { mark_used(n.a); }
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { scan_calls(*(arr + i * 8)); i = i + 1; }
+        return 0;
+    }
+    if (t == T_BINOP) { scan_calls(n.b); scan_calls(n.c); return 0; }
+    if (t == T_UNARY) { return scan_calls(n.b); }
+    if (t == T_ASSIGN) { scan_calls(n.a); scan_calls(n.b); return 0; }
+    if (t == T_MEMLD) { return scan_calls(n.a); }
+    if (t == T_MEMST) { scan_calls(n.a); scan_calls(n.b); return 0; }
+    if (t == T_RET) { return scan_calls(n.a); }
+    if (t == T_IF) {
+        scan_calls(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { scan_calls(*(arr + i * 8)); i = i + 1; }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            i = 0;
+            while (i < cnt) { scan_calls(*(arr + i * 8)); i = i + 1; }
+        }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        scan_calls(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { scan_calls(*(arr + i * 8)); i = i + 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Scan all function bodies for used extern calls.
+find_used_externs() {
+    auto fi, bi, arr, cnt;
+    fi = 0;
+    while (fi < fn_cnt) {
+        arr = *(fn_body + fi * 8);
+        cnt = *(fn_bcnt + fi * 8);
+        bi = 0;
+        while (bi < cnt) { scan_calls(*(arr + bi * 8)); bi = bi + 1; }
+        fi = fi + 1;
+    }
+    return 0;
+}
+
+// ── Extern lookup helpers ──────────────────────────────────
+
+// Find extern function index by packed name. Returns -1 if not found.
+find_extern(name_p) {
+    auto i;
+    i = 0;
+    while (i < ex_cnt) {
+        if (str_eq_packed(name_p, *(ex_name + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Check if a packed type string is a pointer FFI type.
+is_ptr_type(tp) {
+    if (str_eq(tp, "char*", 5)) { return 1; }
+    if (str_eq(tp, "void*", 5)) { return 1; }
+    if (str_eq(tp, "ptr", 3)) { return 1; }
+    if (str_eq(tp, "word", 4)) { return 1; }
+    return 0;
+}
+
+// Emit a value cast for non-pointer FFI types. Returns 1 if cast emitted.
+emit_val_cast(tp) {
+    if (str_eq(tp, "int", 3)) { out("(int)"); return 1; }
+    if (str_eq(tp, "char", 4)) { out("(char)"); return 1; }
+    if (str_eq(tp, "byte", 4)) { out("(uint8_t)"); return 1; }
+    if (str_eq(tp, "half", 4)) { out("(uint16_t)"); return 1; }
+    if (str_eq(tp, "long", 4)) { out("(long long)"); return 1; }
+    return 0;
+}
+
+// Emit a C type name from a packed FFI type string.
+emit_ctype(tp) {
+    if (str_eq(tp, "int", 3)) { out("int"); return 0; }
+    if (str_eq(tp, "void", 4)) { out("void"); return 0; }
+    if (str_eq(tp, "char*", 5)) { out("const char*"); return 0; }
+    if (str_eq(tp, "void*", 5)) { out("void*"); return 0; }
+    if (str_eq(tp, "ptr", 3)) { out("void*"); return 0; }
+    if (str_eq(tp, "word", 4)) { out("unsigned int"); return 0; }
+    if (str_eq(tp, "long", 4)) { out("long long"); return 0; }
+    print_p(tp);
+    return 0;
+}
+
+// ── C code emitter ─────────────────────────────────────────
+
+// Forward declarations.
+emit_node(node) { return 0; }
+emit_body(arr, cnt) { return 0; }
+
+// Print indentation for the current level.
+emit_pad() {
+    auto i;
+    i = 0;
+    while (i < g_indent) { out("  "); i = i + 1; }
+    return 0;
+}
+
+// Print a decimal integer to stdout. Used for array sizes in C output.
+emit_int(n) {
+    if (n >= 10) { emit_int(n / 10); }
+    putchar(48 + (n % 10));
+    return 0;
+}
+
+// Emit a function name, renaming "main" to "main_bpp".
+emit_fname(name_p) {
+    if (str_eq(name_p, "main", 4)) { out("main_bpp"); }
+    else { print_p(name_p); }
+    return 0;
+}
+
+// Emit a statement list (function body or block body).
+emit_body(arr, cnt) {
+    auto i, di, darr, dcnt, has_int, has_flt, vty;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) {
+            if (n.ntype == T_NOP) {
+                // Skip no-op nodes.
+            } else if (n.ntype == T_DECL) {
+                darr = n.a;
+                dcnt = n.b;
+                // Stack struct: emit as a local array of long longs.
+                if (n.c == 1) {
+                    auto sidx, fc;
+                    sidx = get_var_type(*(darr + 0));
+                    fc = get_struct_size(sidx) / 8;
+                    emit_pad();
+                    out("long long ");
+                    print_p(*(darr + 0));
+                    out("[");
+                    emit_int(fc);
+                    out("];");
+                    putchar('\n');
+                } else {
+                // Emit integer variables.
+                has_int = 0;
+                di = 0;
+                while (di < dcnt) {
+                    vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                    if (vty != TY_FLOAT) {
+                        if (has_int == 0) { emit_pad(); out("long long "); has_int = 1; }
+                        else { out(", "); }
+                        print_p(*(darr + di * 8));
+                    }
+                    di = di + 1;
+                }
+                if (has_int) { out(";"); putchar('\n'); }
+                // Emit float variables.
+                has_flt = 0;
+                di = 0;
+                while (di < dcnt) {
+                    vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                    if (vty == TY_FLOAT) {
+                        if (has_flt == 0) { emit_pad(); out("double "); has_flt = 1; }
+                        else { out(", "); }
+                        print_p(*(darr + di * 8));
+                    }
+                    di = di + 1;
+                }
+                if (has_flt) { out(";"); putchar('\n'); }
+                }
+            } else if (n.ntype == T_IF | n.ntype == T_WHILE) {
+                emit_pad();
+                emit_node(n);
+                putchar('\n');
+            } else {
+                emit_pad();
+                emit_node(n);
+                out(";"); putchar('\n');
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Emit C code for a single AST node (recursive).
+emit_node(nd) {
+    auto n: Node, an: Node;
+    auto t, i, arr, cnt, name_p, exi;
+    auto atype_arr, atype_cnt, atp, arg_node, ret_tp;
+    auto is_str_lit, vs, op_p;
+    if (nd == 0) { out("0"); return 0; }
+    n = nd;
+    t = n.ntype;
+
+    if (t == T_LIT) {
+        // String literals need (long long) cast for B++ function args.
+        if (peek(sbuf + unpack_s(n.a)) == 34) {
+            out("(long long)");
+        }
+        print_p(n.a);
+        return 0;
+    }
+
+    if (t == T_VAR) {
+        // Stack struct: emit address of the local array.
+        if (is_var_stack(n.a)) {
+            out("((long long)(");
+            print_p(n.a);
+            out("))");
+            return 0;
+        }
+        print_p(n.a);
+        return 0;
+    }
+
+    if (t == T_NOP) { return 0; }
+
+    if (t == T_BINOP) {
+        out("(");
+        emit_node(n.b);
+        out(" ");
+        print_p(n.a);
+        out(" ");
+        emit_node(n.c);
+        out(")");
+        return 0;
+    }
+
+    if (t == T_UNARY) {
+        out("(");
+        print_p(n.a);
+        emit_node(n.b);
+        out(")");
+        return 0;
+    }
+
+    if (t == T_ASSIGN) {
+        emit_node(n.a);
+        out(" = ");
+        emit_node(n.b);
+        return 0;
+    }
+
+    if (t == T_MEMLD) {
+        out("(*(long long*)((uintptr_t)(");
+        emit_node(n.a);
+        out(")))");
+        return 0;
+    }
+
+    if (t == T_MEMST) {
+        out("*(long long*)((uintptr_t)(");
+        emit_node(n.a);
+        out(")) = ");
+        emit_node(n.b);
+        return 0;
+    }
+
+    if (t == T_RET) {
+        out("return ");
+        emit_node(n.a);
+        return 0;
+    }
+
+    if (t == T_CALL) {
+        name_p = n.a;
+        arr = n.b;
+        cnt = n.c;
+
+        // Built-in: malloc -> real malloc.
+        if (str_eq(name_p, "malloc", 6)) {
+            out("(long long)malloc(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: free -> release memory.
+        if (str_eq(name_p, "free", 4)) {
+            out("(free((void*)(uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")), 0)");
+            return 0;
+        }
+
+        // Built-in: realloc -> resize memory block.
+        if (str_eq(name_p, "realloc", 7)) {
+            out("(long long)realloc((void*)(uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), ");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: peek -> byte read from real pointer.
+        if (str_eq(name_p, "peek", 4)) {
+            out("((long long)(*(uint8_t*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("))))");
+            return 0;
+        }
+
+        // Built-in: poke -> byte write to real pointer.
+        if (str_eq(name_p, "poke", 4)) {
+            out("(*(uint8_t*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")) = (uint8_t)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out("))");
+            return 0;
+        }
+
+        // Built-in: putchar -> write 1 byte to stdout via syscall.
+        if (str_eq(name_p, "putchar", 7)) {
+            out("(_bpp_scratch[0] = (uint8_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), bpp_sys_write(1, _bpp_scratch, 1))");
+            return 0;
+        }
+
+        // Built-in: getchar -> read 1 byte from stdin via syscall.
+        if (str_eq(name_p, "getchar", 7)) {
+            out("(_bpp_scratch[0] = 0, bpp_sys_read(0, _bpp_scratch, 1) > 0 ? (long long)_bpp_scratch[0] : -1LL)");
+            return 0;
+        }
+
+        // Built-in: str_peek -> read byte from real string pointer.
+        if (str_eq(name_p, "str_peek", 8)) {
+            out("(long long)((uint8_t*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")))[(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")]");
+            return 0;
+        }
+
+        // Built-in: sys_open -> open a file, path is a real pointer.
+        if (str_eq(name_p, "sys_open", 8)) {
+            out("bpp_sys_open((const char*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")), ");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_read -> read from fd into real buffer pointer.
+        if (str_eq(name_p, "sys_read", 8)) {
+            out("bpp_sys_read(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(", (void*)((uintptr_t)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")), ");
+            if (cnt > 2) { emit_node(*(arr + 16)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_close -> close a file descriptor.
+        if (str_eq(name_p, "sys_close", 9)) {
+            out("bpp_sys_close(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_fork -> fork the process.
+        if (str_eq(name_p, "sys_fork", 8)) {
+            out("bpp_sys_fork()");
+            return 0;
+        }
+
+        // Built-in: sys_execve -> replace process image.
+        if (str_eq(name_p, "sys_execve", 10)) {
+            out("bpp_sys_execve(");
+            emit_node(*(arr + 0));
+            out(", ");
+            emit_node(*(arr + 8));
+            out(", ");
+            emit_node(*(arr + 16));
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_waitpid -> wait for child process.
+        if (str_eq(name_p, "sys_waitpid", 11)) {
+            out("bpp_sys_waitpid(");
+            emit_node(*(arr + 0));
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_exit -> terminate process immediately.
+        if (str_eq(name_p, "sys_exit", 8)) {
+            out("bpp_sys_exit(");
+            emit_node(*(arr + 0));
+            out(")");
+            return 0;
+        }
+
+        // Built-in: sys_write -> write to fd from real buffer pointer.
+        if (str_eq(name_p, "sys_write", 9)) {
+            out("bpp_sys_write(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(", (void*)((uintptr_t)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")), ");
+            if (cnt > 2) { emit_node(*(arr + 16)); }
+            out(")");
+            return 0;
+        }
+
+        // Built-in: argv_get -> read argv[i] as a pointer value.
+        if (str_eq(name_p, "argv_get", 8)) {
+            out("((long long)_bpp_argv[(int)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")])");
+            return 0;
+        }
+
+        // Built-in: argc_get -> return argc.
+        if (str_eq(name_p, "argc_get", 8)) {
+            out("((long long)_bpp_argc)");
+            return 0;
+        }
+
+        // Built-in: fn_ptr(name) -> address of a function as a long long.
+        if (str_eq(name_p, "fn_ptr", 6)) {
+            out("((long long)(uintptr_t)");
+            emit_node(*(arr + 0));
+            out(")");
+            return 0;
+        }
+
+        // Built-in: call(fn_ptr, args...) -> indirect function call.
+        if (str_eq(name_p, "call", 4)) {
+            out("((long long(*)(");
+            i = 1;
+            while (i < cnt) {
+                if (i > 1) { out(","); }
+                out("long long");
+                i = i + 1;
+            }
+            out("))((uintptr_t)(");
+            emit_node(*(arr + 0));
+            out(")))(");
+            i = 1;
+            while (i < cnt) {
+                if (i > 1) { out(", "); }
+                emit_node(*(arr + i * 8));
+                i = i + 1;
+            }
+            out(")");
+            return 0;
+        }
+
+        // Extern function call: apply FFI type casts.
+        exi = find_extern(name_p);
+        if (exi >= 0) {
+            ret_tp = *(ex_ret + exi * 8);
+            if (is_ptr_type(ret_tp)) { out("(long long)"); }
+            print_p(name_p);
+            out("(");
+            atype_arr = *(ex_args + exi * 8);
+            atype_cnt = *(ex_acnt + exi * 8);
+            i = 0;
+            while (i < cnt) {
+                if (i > 0) { out(", "); }
+                if (i < atype_cnt) {
+                    atp = *(atype_arr + i * 8);
+                    arg_node = *(arr + i * 8);
+                    if (is_ptr_type(atp)) {
+                        out("(const char*)((uintptr_t)(");
+                        emit_node(arg_node);
+                        out("))");
+                    } else {
+                        emit_val_cast(atp);
+                        emit_node(arg_node);
+                    }
+                } else {
+                    emit_node(*(arr + i * 8));
+                }
+                i = i + 1;
+            }
+            out(")");
+            return 0;
+        }
+
+        // Regular B++ function call.
+        emit_fname(name_p);
+        out("(");
+        i = 0;
+        while (i < cnt) {
+            if (i > 0) { out(", "); }
+            emit_node(*(arr + i * 8));
+            i = i + 1;
+        }
+        out(")");
+        return 0;
+    }
+
+    if (t == T_IF) {
+        out("if (");
+        emit_node(n.a);
+        out(") {"); putchar('\n');
+        g_indent = g_indent + 1;
+        emit_body(n.b, n.c);
+        g_indent = g_indent - 1;
+        emit_pad(); out("}");
+        if (n.e > 0) {
+            out(" else {"); putchar('\n');
+            g_indent = g_indent + 1;
+            emit_body(n.d, n.e);
+            g_indent = g_indent - 1;
+            emit_pad(); out("}");
+        }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        out("while (");
+        emit_node(n.a);
+        out(") {"); putchar('\n');
+        g_indent = g_indent + 1;
+        emit_body(n.b, n.c);
+        g_indent = g_indent - 1;
+        emit_pad(); out("}");
+        return 0;
+    }
+
+    if (t == T_BREAK) {
+        out("break");
+        return 0;
+    }
+
+    return 0;
+}
+
+// ── Top-level C emission ───────────────────────────────────
+
+// Emit #include and forward declarations for used extern functions.
+emit_includes() {
+    auto i, j, args, acnt;
+    out("#include <stdint.h>"); putchar('\n');
+    out("#include <unistd.h>"); putchar('\n');
+    out("#include <sys/wait.h>"); putchar('\n');
+    putchar('\n');
+    i = 0;
+    while (i < ex_cnt) {
+        if (is_used(*(ex_name + i * 8))) {
+            emit_ctype(*(ex_ret + i * 8));
+            out(" ");
+            print_p(*(ex_name + i * 8));
+            out("(");
+            args = *(ex_args + i * 8);
+            acnt = *(ex_acnt + i * 8);
+            j = 0;
+            while (j < acnt) {
+                if (j > 0) { out(", "); }
+                emit_ctype(*(args + j * 8));
+                j = j + 1;
+            }
+            out(");"); putchar('\n');
+        }
+        i = i + 1;
+    }
+    putchar('\n');
+    return 0;
+}
+
+// Helper: output a double-quoted string.
+emit_q(s) {
+    putchar('"'); out(s); putchar('"');
+    return 0;
+}
+
+// Emit the svc + csneg asm string for macOS ARM64 syscalls.
+emit_svc() {
+    putchar('"');
+    out("svc #0x80");
+    putchar(92); putchar(110);
+    putchar(92); putchar(116);
+    out("csneg x0, x0, x0, cc");
+    putchar('"');
+    return 0;
+}
+
+// Helper: output one register asm declaration line.
+emit_reg(reg, val) {
+    out("  register long long ");
+    out(reg);
+    out(" __asm__(");
+    emit_q(reg);
+    out(") = ");
+    out(val);
+    out(";"); putchar('\n');
+    return 0;
+}
+
+// Emit the syscall runtime: bpp_sys_write, bpp_sys_read, bpp_sys_open, bpp_sys_close.
+emit_runtime() {
+    out("// B++ I/O runtime — raw syscalls."); putchar('\n');
+
+    // bpp_sys_write
+    out("static long long bpp_sys_write(long long fd, const void* buf, long long len) {");
+    putchar('\n');
+    emit_reg("x0", "fd");
+    emit_reg("x1", "(long long)buf");
+    emit_reg("x2", "len");
+    emit_reg("x16", "4");
+    out("  __asm__ volatile(");
+    emit_svc();
+    out(" : "); emit_q("+r"); out("(x0) : ");
+    emit_q("r"); out("(x1), "); emit_q("r"); out("(x2), "); emit_q("r"); out("(x16) : ");
+    emit_q("memory"); out(", "); emit_q("cc");
+    out(");"); putchar('\n');
+    out("  return x0;"); putchar('\n');
+    out("}"); putchar('\n');
+
+    // bpp_sys_read
+    out("static long long bpp_sys_read(long long fd, void* buf, long long len) {");
+    putchar('\n');
+    emit_reg("x0", "fd");
+    emit_reg("x1", "(long long)buf");
+    emit_reg("x2", "len");
+    emit_reg("x16", "3");
+    out("  __asm__ volatile(");
+    emit_svc();
+    out(" : "); emit_q("+r"); out("(x0) : ");
+    emit_q("r"); out("(x1), "); emit_q("r"); out("(x2), "); emit_q("r"); out("(x16) : ");
+    emit_q("memory"); out(", "); emit_q("cc");
+    out(");"); putchar('\n');
+    out("  return x0;"); putchar('\n');
+    out("}"); putchar('\n');
+
+    // bpp_sys_open
+    out("static long long bpp_sys_open(const char* path, long long flags) {");
+    putchar('\n');
+    emit_reg("x0", "(long long)path");
+    emit_reg("x1", "flags");
+    emit_reg("x2", "493");
+    emit_reg("x16", "5");
+    out("  __asm__ volatile(");
+    emit_svc();
+    out(" : "); emit_q("+r"); out("(x0) : ");
+    emit_q("r"); out("(x1), "); emit_q("r"); out("(x2), "); emit_q("r"); out("(x16) : ");
+    emit_q("memory"); out(", "); emit_q("cc");
+    out(");"); putchar('\n');
+    out("  return x0;"); putchar('\n');
+    out("}"); putchar('\n');
+
+    // bpp_sys_close
+    out("static long long bpp_sys_close(long long fd) {");
+    putchar('\n');
+    emit_reg("x0", "fd");
+    emit_reg("x16", "6");
+    out("  __asm__ volatile(");
+    emit_svc();
+    out(" : "); emit_q("+r"); out("(x0) : ");
+    emit_q("r"); out("(x16) : ");
+    emit_q("memory"); out(", "); emit_q("cc");
+    out(");"); putchar('\n');
+    out("  return x0;"); putchar('\n');
+    out("}"); putchar('\n');
+
+    // bpp_sys_fork — uses POSIX fork().
+    out("static long long bpp_sys_fork(void) { return (long long)fork(); }");
+    putchar('\n');
+
+    // bpp_sys_execve — uses POSIX execve().
+    out("static long long bpp_sys_execve(long long p, long long a, long long e) {");
+    putchar('\n');
+    out("  return (long long)execve((const char*)(uintptr_t)p,(char*const*)(uintptr_t)a,(char*const*)(uintptr_t)e); }");
+    putchar('\n');
+
+    // bpp_sys_waitpid — uses POSIX waitpid().
+    out("static long long bpp_sys_waitpid(long long pid) { int s; waitpid((pid_t)pid,&s,0); return 0; }");
+    putchar('\n');
+
+    // bpp_sys_exit — uses POSIX _exit().
+    out("static long long bpp_sys_exit(long long c) { _exit((int)c); return 0; }");
+    putchar('\n');
+
+    putchar('\n');
+    return 0;
+}
+
+// Emit the memory model (scratch buffer and argv storage).
+emit_mem_model() {
+    out("#include <stdlib.h>"); putchar('\n');
+    out("static uint8_t _bpp_scratch[16];"); putchar('\n');
+    out("static int _bpp_argc;"); putchar('\n');
+    out("static char** _bpp_argv;"); putchar('\n');
+    putchar('\n');
+    return 0;
+}
+
+// Emit global variable declarations (with deduplication).
+emit_globals() {
+    auto i, j, dup;
+    i = 0;
+    while (i < gl_cnt) {
+        dup = 0;
+        j = 0;
+        while (j < i) {
+            if (str_eq_packed(*(gl_name + i * 8), *(gl_name + j * 8))) { dup = 1; }
+            j = j + 1;
+        }
+        if (dup == 0) {
+            out("long long ");
+            print_p(*(gl_name + i * 8));
+            out(" = 0;"); putchar('\n');
+        }
+        i = i + 1;
+    }
+    if (gl_cnt > 0) { putchar('\n'); }
+    return 0;
+}
+
+// Emit the C type keyword for a function's return or parameter type.
+emit_type_for(ty) {
+    if (ty == TY_FLOAT) { out("double"); }
+    else { out("long long"); }
+    return 0;
+}
+
+// Emit forward declarations for all B++ functions.
+emit_forward_decls() {
+    auto i, j, arr, cnt, rty, pty, pi;
+    i = 0;
+    while (i < fn_cnt) {
+        pi = *(fn_fidx + i * 8);
+        rty = get_fn_ret_type(pi);
+        if (rty == TY_UNKNOWN) { rty = TY_LONG; }
+        emit_type_for(rty);
+        out(" ");
+        emit_fname(*(fn_name + i * 8));
+        out("(");
+        arr = *(fn_par + i * 8);
+        cnt = *(fn_pcnt + i * 8);
+        if (cnt == 0) {
+            out("void");
+        } else {
+            j = 0;
+            while (j < cnt) {
+                if (j > 0) { out(", "); }
+                pty = get_fn_par_type(pi, j);
+                if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                emit_type_for(pty);
+                out(" ");
+                print_p(*(arr + j * 8));
+                j = j + 1;
+            }
+        }
+        out(");"); putchar('\n');
+        i = i + 1;
+    }
+    putchar('\n');
+    return 0;
+}
+
+// Emit all function definitions.
+emit_functions() {
+    auto i, j, arr, cnt, rty, pty, pi;
+    i = 0;
+    while (i < fn_cnt) {
+        pi = *(fn_fidx + i * 8);
+        cur_fn_idx = pi;
+        rty = get_fn_ret_type(pi);
+        if (rty == TY_UNKNOWN) { rty = TY_LONG; }
+        emit_type_for(rty);
+        out(" ");
+        emit_fname(*(fn_name + i * 8));
+        out("(");
+        arr = *(fn_par + i * 8);
+        cnt = *(fn_pcnt + i * 8);
+        if (cnt == 0) {
+            out("void");
+        } else {
+            j = 0;
+            while (j < cnt) {
+                if (j > 0) { out(", "); }
+                pty = get_fn_par_type(pi, j);
+                if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                emit_type_for(pty);
+                out(" ");
+                print_p(*(arr + j * 8));
+                j = j + 1;
+            }
+        }
+        out(") {"); putchar('\n');
+        g_indent = 1;
+        emit_body(*(fn_body + i * 8), *(fn_bcnt + i * 8));
+        g_indent = 0;
+        out("  return 0;"); putchar('\n');
+        out("}"); putchar('\n'); putchar('\n');
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Emit the C main() entry point with argv/argc storage.
+emit_main_entry() {
+    auto i, has_main;
+    has_main = 0;
+    i = 0;
+    while (i < fn_cnt) {
+        if (str_eq(*(fn_name + i * 8), "main", 4)) { has_main = 1; }
+        i = i + 1;
+    }
+    out("int main(int argc, char** argv) {"); putchar('\n');
+    out("  _bpp_argc = argc;"); putchar('\n');
+    out("  _bpp_argv = argv;"); putchar('\n');
+    if (has_main) { out("  main_bpp();"); putchar('\n'); }
+    out("  return 0;"); putchar('\n');
+    out("}"); putchar('\n');
+    return 0;
+}
+
+// ── Public API ─────────────────────────────────────────────
+
+// Run all emission stages in order.
+emit_all() {
+    bridge_data();
+    find_used_externs();
+    emit_includes();
+    emit_mem_model();
+    emit_runtime();
+    emit_globals();
+    emit_forward_decls();
+    emit_functions();
+    emit_main_entry();
+    return 0;
+}

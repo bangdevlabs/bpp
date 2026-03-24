@@ -1,0 +1,279 @@
+// stbstr.bsm — Standard B string library.
+// Two modes of operation:
+//   1. Static: functions on null-terminated C strings (str_len, str_eq, etc.)
+//   2. Dynamic: string builder with shadow header (sb_new, sb_append, etc.)
+//
+// String builder memory layout:
+//   [ length (8 bytes) | capacity (8 bytes) ] [ bytes... \0 ]
+//                                              ^ returned pointer
+//
+// Usage:
+//   auto s;
+//   s = sb_new();
+//   s = sb_cat(s, "Hello ");    // ALWAYS reassign — may move on grow
+//   s = sb_cat(s, "World");
+//   print_msg(s);               // s IS a null-terminated C string
+//   s = sb_free(s);
+
+// ── Static string functions ─────────────────────────────────
+
+// Return the length of a null-terminated string.
+str_len(s) {
+    auto i;
+    i = 0;
+    while (peek(s + i) != 0) { i = i + 1; }
+    return i;
+}
+
+// Compare two strings. Return 1 if equal, 0 otherwise.
+str_eq(a, b) {
+    auto i, ca, cb;
+    i = 0;
+    while (1) {
+        ca = peek(a + i);
+        cb = peek(b + i);
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Copy string src into dst. Returns dst.
+str_cpy(dst, src) {
+    auto i, c;
+    i = 0;
+    while (1) {
+        c = peek(src + i);
+        poke(dst + i, c);
+        if (c == 0) { return dst; }
+        i = i + 1;
+    }
+    return dst;
+}
+
+// Append src to the end of dst. Returns dst. No bounds checking.
+str_cat_raw(dst, src) {
+    auto di, si, c;
+    di = str_len(dst);
+    si = 0;
+    while (1) {
+        c = peek(src + si);
+        poke(dst + di, c);
+        if (c == 0) { return dst; }
+        di = di + 1;
+        si = si + 1;
+    }
+    return dst;
+}
+
+// Return the index of the first occurrence of character c in s, or -1.
+str_chr(s, c) {
+    auto i, ch;
+    i = 0;
+    while (1) {
+        ch = peek(s + i);
+        if (ch == c) { return i; }
+        if (ch == 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Return 1 if s starts with prefix, 0 otherwise.
+str_starts(s, prefix) {
+    auto i, cp;
+    i = 0;
+    while (1) {
+        cp = peek(prefix + i);
+        if (cp == 0) { return 1; }
+        if (peek(s + i) != cp) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Compare at most n bytes of two strings. Return 1 if equal, 0 otherwise.
+str_neq(a, b, n) {
+    auto i, ca, cb;
+    i = 0;
+    while (i < n) {
+        ca = peek(a + i);
+        cb = peek(b + i);
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Copy a string into a new heap-allocated buffer. Returns the buffer.
+str_dup(s) {
+    auto len, buf;
+    len = str_len(s);
+    buf = malloc(len + 1);
+    str_cpy(buf, s);
+    return buf;
+}
+
+// Write an integer as decimal text into buf. Returns number of chars written.
+str_from_int(val, buf) {
+    auto len, tmp, digit, i, j, t, start;
+    len = 0;
+    start = 0;
+    if (val < 0) {
+        poke(buf, 45);
+        len = 1;
+        start = 1;
+        val = 0 - val;
+    }
+    if (val == 0) {
+        poke(buf + len, 48);
+        len = len + 1;
+    } else {
+        tmp = val;
+        while (tmp > 0) {
+            digit = tmp % 10;
+            poke(buf + len, 48 + digit);
+            len = len + 1;
+            tmp = tmp / 10;
+        }
+    }
+    i = start;
+    j = len - 1;
+    while (i < j) {
+        t = peek(buf + i);
+        poke(buf + i, peek(buf + j));
+        poke(buf + j, t);
+        i = i + 1;
+        j = j - 1;
+    }
+    poke(buf + len, 0);
+    return len;
+}
+
+// ── Dynamic string builder ──────────────────────────────────
+// Shadow header: [length (8 bytes) | capacity (8 bytes)] [bytes...\0]
+// The returned pointer IS a valid C string (null-terminated).
+
+auto _SB_HDR;
+auto _SB_INIT;
+
+// Initialize string builder constants. Call once before use.
+init_str() {
+    _SB_HDR  = 16;
+    _SB_INIT = 64;
+    return 0;
+}
+
+// Create a new empty string builder.
+sb_new() {
+    auto raw;
+    raw = malloc(_SB_HDR + _SB_INIT);
+    *(raw + 0) = 0;
+    *(raw + 8) = _SB_INIT;
+    poke(raw + _SB_HDR, 0);
+    return raw + _SB_HDR;
+}
+
+// Grow the string buffer to a new capacity. Copies bytes and frees old.
+_sb_grow(sb, new_cap) {
+    auto len, raw_new, i;
+    len = *(sb - 16);
+    raw_new = malloc(_SB_HDR + new_cap);
+    *(raw_new + 0) = len;
+    *(raw_new + 8) = new_cap;
+    i = 0;
+    while (i <= len) {
+        poke(raw_new + _SB_HDR + i, peek(sb + i));
+        i = i + 1;
+    }
+    free(sb - _SB_HDR);
+    return raw_new + _SB_HDR;
+}
+
+// Ensure the buffer has room for 'extra' more bytes.
+_sb_ensure(sb, extra) {
+    auto len, cap, need;
+    len = *(sb - 16);
+    cap = *(sb - 8);
+    need = len + extra + 1;
+    if (need > cap) {
+        while (cap < need) { cap = cap * 2; }
+        sb = _sb_grow(sb, cap);
+    }
+    return sb;
+}
+
+// Append a null-terminated string to the builder. Returns (possibly moved) pointer.
+sb_cat(sb, src) {
+    auto slen, len, i;
+    if (sb == 0) { sb = sb_new(); }
+    slen = str_len(src);
+    sb = _sb_ensure(sb, slen);
+    len = *(sb - 16);
+    i = 0;
+    while (i < slen) {
+        poke(sb + len + i, peek(src + i));
+        i = i + 1;
+    }
+    len = len + slen;
+    *(sb - 16) = len;
+    poke(sb + len, 0);
+    return sb;
+}
+
+// Append a single character to the builder.
+sb_ch(sb, c) {
+    auto len;
+    if (sb == 0) { sb = sb_new(); }
+    sb = _sb_ensure(sb, 1);
+    len = *(sb - 16);
+    poke(sb + len, c);
+    len = len + 1;
+    *(sb - 16) = len;
+    poke(sb + len, 0);
+    return sb;
+}
+
+// Append an integer as decimal text to the builder.
+sb_int(sb, val) {
+    auto buf, len;
+    if (sb == 0) { sb = sb_new(); }
+    buf = malloc(24);
+    len = str_from_int(val, buf);
+    sb = _sb_ensure(sb, len);
+    auto slen, i;
+    slen = *(sb - 16);
+    i = 0;
+    while (i < len) {
+        poke(sb + slen + i, peek(buf + i));
+        i = i + 1;
+    }
+    slen = slen + len;
+    *(sb - 16) = slen;
+    poke(sb + slen, 0);
+    free(buf);
+    return sb;
+}
+
+// Return the length of the string buffer.
+sb_len(sb) {
+    if (sb == 0) { return 0; }
+    return *(sb - 16);
+}
+
+// Reset the buffer to empty without freeing.
+sb_clear(sb) {
+    if (sb != 0) {
+        *(sb - 16) = 0;
+        poke(sb, 0);
+    }
+    return 0;
+}
+
+// Free the string buffer. Returns 0 for: s = sb_free(s).
+sb_free(sb) {
+    if (sb != 0) { free(sb - _SB_HDR); }
+    return 0;
+}

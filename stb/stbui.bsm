@@ -1,0 +1,346 @@
+// stbui.bpp — Standard B UI library.
+// Immediate-mode game UI with style structs and automatic layout.
+// Call UI functions between draw_begin() and draw_end() every frame.
+
+import "stbdraw.bsm";
+import "stbinput.bsm";
+
+// --- Style System ---
+// Separates appearance from geometry — the B++ equivalent of CSS.
+
+struct Style { bg, fg, font_sz, padding, radius }
+
+// Default UI font size and built-in styles.
+auto UI_FONT_SZ;
+auto _stl_default: Style;
+auto _stl_button: Style;
+auto _stl_panel: Style;
+
+// --- Layout Engine ---
+// Flex-like automatic positioning. Instead of manual x,y the programmer
+// pushes a layout context and widgets stack automatically.
+
+struct Layout { x, y, w, h, cx, cy, pad, dir }
+
+// Layout directions.
+auto LAY_DOWN, LAY_RIGHT;
+
+// Layout stack (up to 8 nested layouts).
+auto _lay_stack, _lay_top;
+
+// --- Reactive Binding ---
+// Widgets can watch a pointer. The old value is stored alongside so the
+// widget only redraws when data changes. For immediate-mode this is an
+// optimisation hint — the widget still renders every frame but the
+// caller can use watch_changed() to trigger side-effects.
+
+struct Watch { ptr, old_val }
+
+// --- Arena Per Frame ---
+// A secondary bump allocator for UI temporaries. Resets every frame so
+// widgets never leak memory.
+
+auto _ui_arena, _ui_arena_ptr, _UI_ARENA_SZ;
+
+// Initialize UI defaults, styles, layout stack, and arena.
+// Called automatically by game_init().
+init_ui() {
+    UI_FONT_SZ = 20;
+    LAY_DOWN = 0;
+    LAY_RIGHT = 1;
+
+    // Default style: white text on transparent background.
+    _stl_default = malloc(sizeof(Style));
+    _stl_default.bg = 0;
+    _stl_default.fg = WHITE;
+    _stl_default.font_sz = 20;
+    _stl_default.padding = 4;
+    _stl_default.radius = 0;
+
+    // Button style: gray background, black text.
+    _stl_button = malloc(sizeof(Style));
+    _stl_button.bg = GRAY;
+    _stl_button.fg = BLACK;
+    _stl_button.font_sz = 20;
+    _stl_button.padding = 10;
+    _stl_button.radius = 0;
+
+    // Panel style: dark background.
+    _stl_panel = malloc(sizeof(Style));
+    _stl_panel.bg = DARKGRAY;
+    _stl_panel.fg = WHITE;
+    _stl_panel.font_sz = 20;
+    _stl_panel.padding = 12;
+    _stl_panel.radius = 0;
+
+    // Layout stack: 8 entries of sizeof(Layout) each.
+    _lay_stack = malloc(8 * sizeof(Layout));
+    _lay_top = -1;
+
+    // UI arena: 32KB scratch space, reset each frame.
+    _UI_ARENA_SZ = 32768;
+    _ui_arena = malloc(_UI_ARENA_SZ);
+    _ui_arena_ptr = 0;
+
+    return 0;
+}
+
+// --- Arena Functions ---
+
+// Allocate bytes from the per-frame UI arena.
+ui_alloc(size) {
+    auto r;
+    r = _ui_arena + _ui_arena_ptr;
+    _ui_arena_ptr = _ui_arena_ptr + size;
+    return r;
+}
+
+// Reset the arena. Call at the start of each frame (draw_begin handles this).
+ui_arena_reset() {
+    _ui_arena_ptr = 0;
+    return 0;
+}
+
+// --- Style Constructors ---
+
+// Create a new style with the given colors, font size, and padding.
+style_new(bg, fg, font_sz, padding) {
+    auto s: Style;
+    s = ui_alloc(sizeof(Style));
+    s.bg = bg;
+    s.fg = fg;
+    s.font_sz = font_sz;
+    s.padding = padding;
+    s.radius = 0;
+    return s;
+}
+
+// --- Layout Functions ---
+
+// Push a new layout context. Widgets inside this context stack automatically.
+// dir: LAY_DOWN (vertical) or LAY_RIGHT (horizontal).
+lay_push(x, y, w, h, pad, dir) {
+    auto l: Layout;
+    _lay_top = _lay_top + 1;
+    l = _lay_stack + (_lay_top * sizeof(Layout));
+    l.x = x;
+    l.y = y;
+    l.w = w;
+    l.h = h;
+    l.cx = x + pad;
+    l.cy = y + pad;
+    l.pad = pad;
+    l.dir = dir;
+    return 0;
+}
+
+// Pop the current layout context.
+lay_pop() {
+    if (_lay_top >= 0) {
+        _lay_top = _lay_top - 1;
+    }
+    return 0;
+}
+
+// Advance the layout cursor after placing a widget of the given size.
+_lay_advance(w, h) {
+    auto l: Layout;
+    if (_lay_top < 0) return 0;
+    l = _lay_stack + (_lay_top * sizeof(Layout));
+    if (l.dir == LAY_DOWN) {
+        l.cy = l.cy + h + l.pad;
+    } else {
+        l.cx = l.cx + w + l.pad;
+    }
+    return 0;
+}
+
+// Return the current layout cursor X position, or the given fallback.
+lay_x(fallback) {
+    auto l: Layout;
+    if (_lay_top < 0) return fallback;
+    l = _lay_stack + (_lay_top * sizeof(Layout));
+    return l.cx;
+}
+
+// Return the current layout cursor Y position, or the given fallback.
+lay_y(fallback) {
+    auto l: Layout;
+    if (_lay_top < 0) return fallback;
+    l = _lay_stack + (_lay_top * sizeof(Layout));
+    return l.cy;
+}
+
+// Return the available width inside the current layout, or the fallback.
+lay_w(fallback) {
+    auto l: Layout;
+    if (_lay_top < 0) return fallback;
+    l = _lay_stack + (_lay_top * sizeof(Layout));
+    return l.w - (l.pad * 2);
+}
+
+// --- Reactive Watch ---
+
+// Create a watch on a memory address. Returns a Watch pointer.
+watch_new(addr) {
+    auto w: Watch;
+    w = ui_alloc(sizeof(Watch));
+    w.ptr = addr;
+    w.old_val = *(addr);
+    return w;
+}
+
+// Check if the watched value changed since last check. Returns 1 if changed.
+watch_changed(w) {
+    auto ww: Watch;
+    auto cur;
+    ww = w;
+    cur = *(ww.ptr);
+    if (cur != ww.old_val) {
+        ww.old_val = cur;
+        return 1;
+    }
+    return 0;
+}
+
+// --- Styled Widgets ---
+
+// Draw a text label at (x, y) in white. Uses layout cursor if active.
+gui_label(x, y, text) {
+    auto rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    draw_text(text, rx, ry, UI_FONT_SZ, WHITE);
+    _lay_advance(measure_text(text, UI_FONT_SZ), UI_FONT_SZ);
+    return 0;
+}
+
+// Draw a text label with a custom color.
+gui_label_c(x, y, text, color) {
+    auto rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    draw_text(text, rx, ry, UI_FONT_SZ, color);
+    _lay_advance(measure_text(text, UI_FONT_SZ), UI_FONT_SZ);
+    return 0;
+}
+
+// Draw a styled text label. Uses the style's font size and foreground color.
+gui_label_s(x, y, text, style) {
+    auto s: Style;
+    auto rx, ry;
+    s = style;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    if (s.bg != 0) {
+        draw_rect(rx, ry, measure_text(text, s.font_sz) + s.padding * 2, s.font_sz + s.padding * 2, s.bg);
+    }
+    draw_text(text, rx + s.padding, ry + s.padding, s.font_sz, s.fg);
+    _lay_advance(measure_text(text, s.font_sz) + s.padding * 2, s.font_sz + s.padding * 2);
+    return 0;
+}
+
+// Draw a number at (x, y) in white.
+gui_number(x, y, val) {
+    auto rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    draw_number(rx, ry, UI_FONT_SZ, WHITE, val);
+    _lay_advance(60, UI_FONT_SZ);
+    return 0;
+}
+
+// Draw a number with a custom color.
+gui_number_c(x, y, val, color) {
+    auto rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    draw_number(rx, ry, UI_FONT_SZ, color, val);
+    _lay_advance(60, UI_FONT_SZ);
+    return 0;
+}
+
+// Draw a filled panel (background rectangle) with the given color.
+gui_panel(x, y, w, h, color) {
+    draw_rect(x, y, w, h, color);
+    return 0;
+}
+
+// Draw a styled panel and push a layout context inside it.
+// Widgets called after this will stack automatically inside the panel.
+gui_panel_s(x, y, w, h, style) {
+    auto s: Style;
+    s = style;
+    draw_rect(x, y, w, h, s.bg);
+    lay_push(x, y, w, h, s.padding, LAY_DOWN);
+    return 0;
+}
+
+// Draw a clickable button. Returns 1 on the frame it is clicked, 0 otherwise.
+gui_button(x, y, w, h, label) {
+    auto mx, my, hover, rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    hover = point_in_rect(mx, my, rx, ry, w, h);
+
+    // Highlight on hover, dim otherwise.
+    if (hover) draw_rect(rx, ry, w, h, WHITE);
+    else draw_rect(rx, ry, w, h, GRAY);
+
+    draw_text(label, rx + 10, ry + (h / 2) - (UI_FONT_SZ / 2), UI_FONT_SZ, BLACK);
+    _lay_advance(w, h);
+
+    if (hover) {
+        if (mouse_pressed(MOUSE_LEFT)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Draw a styled clickable button. Returns 1 on click.
+gui_button_s(x, y, w, h, label, style) {
+    auto s: Style;
+    auto mx, my, hover, rx, ry;
+    s = style;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    hover = point_in_rect(mx, my, rx, ry, w, h);
+
+    // Brighten background on hover.
+    if (hover) draw_rect(rx, ry, w, h, WHITE);
+    else draw_rect(rx, ry, w, h, s.bg);
+
+    draw_text(label, rx + s.padding, ry + (h / 2) - (s.font_sz / 2), s.font_sz, s.fg);
+    _lay_advance(w, h);
+
+    if (hover) {
+        if (mouse_pressed(MOUSE_LEFT)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Draw a horizontal progress bar. val/max_val determines the fill percentage.
+gui_bar(x, y, w, h, val, max_val, color) {
+    auto fill_w, rx, ry;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    draw_rect(rx, ry, w, h, DARKGRAY);
+    fill_w = 0;
+    if (max_val > 0) {
+        fill_w = (val * w) / max_val;
+    }
+    if (fill_w > w) fill_w = w;
+    if (fill_w < 0) fill_w = 0;
+    if (fill_w > 0) {
+        draw_rect(rx, ry, fill_w, h, color);
+    }
+    _lay_advance(w, h);
+    return 0;
+}

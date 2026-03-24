@@ -1,0 +1,213 @@
+// _stb_platform.bsm — macOS native platform layer (internal).
+// Implements _stb_* functions using Cocoa + CoreGraphics via FFI.
+// The developer never imports this file — stbgame.bsm imports it automatically.
+// When targeting a different OS, the compiler substitutes this file.
+
+import "stbbuf.bsm";
+
+import "objc" {
+    ptr objc_getClass(char*);
+    ptr sel_registerName(char*);
+    ptr objc_msgSend(ptr, ptr);
+    ptr objc_msgSend(ptr, ptr, int);
+    ptr objc_msgSend(ptr, ptr, ptr);
+    ptr objc_msgSend(ptr, ptr, ptr, double, double);
+    ptr objc_msgSend(ptr, ptr, double, double, double, double);
+    ptr objc_msgSend(ptr, ptr, double, double, double, double, int, int, int);
+    ptr objc_msgSend(ptr, ptr, int, ptr, ptr, int);
+}
+
+import "System.B" {
+    ptr dlopen(char*, int);
+    ptr dlsym(ptr, char*);
+    long mach_absolute_time();
+    int mach_timebase_info(ptr);
+    int usleep(int);
+}
+
+// macOS virtual keycodes → stb Key enum slots.
+// These must match the Key enum in stbinput.bsm.
+enum VKey {
+    VK_W = 13, VK_A = 0, VK_S = 1, VK_D = 2,
+    VK_E = 14, VK_R = 15, VK_Z = 6, VK_X = 7, VK_G = 5, VK_C = 8, VK_N = 45, VK_T = 17,
+    VK_ESC = 53, VK_SPACE = 49, VK_RETURN = 36, VK_TAB = 48, VK_SHIFT = 56,
+    VK_UP = 126, VK_DOWN = 125, VK_LEFT = 123, VK_RIGHT = 124,
+    VK_0 = 29, VK_1 = 18, VK_2 = 19, VK_3 = 20, VK_4 = 21,
+    VK_5 = 23, VK_6 = 22, VK_7 = 26, VK_8 = 28, VK_9 = 25,
+    VK_F5 = 96, VK_F6 = 97, VK_F9 = 101, VK_F10 = 109,
+    VK_PERIOD = 47, VK_BACKSPACE = 51
+}
+
+// NSEvent types.
+enum NSEvType { NSEvKeyDown = 10, NSEvKeyUp = 11 }
+
+// Internal Cocoa state.
+auto _plt_app, _plt_win, _plt_imgview, _plt_cs;
+auto _plt_cg_ctx, _plt_cg_img, _plt_cg_ctx_rel, _plt_cg_img_rel;
+auto _plt_cf_mode;
+auto _plt_quit_flag;
+auto _plt_time_base, _plt_time_numer, _plt_time_denom;
+
+// Map macOS virtual keycode to stb Key slot (from stbinput.bsm enum).
+_plt_map_vkey(vk) {
+    if (vk == VK_UP) { return 1; }
+    if (vk == VK_DOWN) { return 2; }
+    if (vk == VK_LEFT) { return 3; }
+    if (vk == VK_RIGHT) { return 4; }
+    if (vk == VK_W) { return 5; }
+    if (vk == VK_A) { return 6; }
+    if (vk == VK_S) { return 7; }
+    if (vk == VK_D) { return 8; }
+    if (vk == VK_SPACE) { return 9; }
+    if (vk == VK_RETURN) { return 10; }
+    if (vk == VK_ESC) { return 11; }
+    if (vk == VK_TAB) { return 12; }
+    if (vk == VK_SHIFT) { return 13; }
+    if (vk == VK_E) { return 14; }
+    if (vk == VK_R) { return 15; }
+    if (vk == VK_Z) { return 16; }
+    if (vk == VK_X) { return 17; }
+    if (vk == VK_G) { return 18; }
+    if (vk == VK_C) { return 19; }
+    if (vk == VK_N) { return 20; }
+    if (vk == VK_T) { return 21; }
+    return 0 - 1;
+}
+
+// Open a native macOS window with a framebuffer view.
+_stb_init_window(w, h, title) {
+    auto pool, view, cg, cf;
+
+    // Load frameworks.
+    dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", 1);
+    cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", 1);
+    cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", 1);
+
+    // Resolve CG functions via dlsym.
+    auto fn_cs;
+    fn_cs = dlsym(cg, "CGColorSpaceCreateDeviceRGB");
+    _plt_cg_ctx = dlsym(cg, "CGBitmapContextCreate");
+    _plt_cg_img = dlsym(cg, "CGBitmapContextCreateImage");
+    _plt_cg_ctx_rel = dlsym(cg, "CGContextRelease");
+    _plt_cg_img_rel = dlsym(cg, "CGImageRelease");
+    _plt_cs = call(fn_cs);
+
+    // CFRunLoop mode for event polling.
+    _plt_cf_mode = dlsym(cf, "kCFRunLoopDefaultMode");
+    _plt_cf_mode = *(_plt_cf_mode);
+
+    _plt_quit_flag = 0;
+
+    // Cocoa setup.
+    pool = objc_msgSend(objc_getClass("NSAutoreleasePool"), sel_registerName("new"));
+    _plt_app = objc_msgSend(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+    objc_msgSend(_plt_app, sel_registerName("setActivationPolicy:"), 0);
+
+    // Window at 3x logical size for pixel-perfect scaling.
+    _plt_win = objc_msgSend(objc_getClass("NSWindow"), sel_registerName("alloc"));
+    _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
+        100.0, 100.0, w * 3.0, h * 3.0, 15, 2, 0);
+
+    // NSImageView fills the window for framebuffer display.
+    view = objc_msgSend(_plt_win, sel_registerName("contentView"));
+    _plt_imgview = objc_msgSend(objc_getClass("NSImageView"), sel_registerName("alloc"));
+    _plt_imgview = objc_msgSend(_plt_imgview, sel_registerName("initWithFrame:"),
+        0.0, 0.0, w * 3.0, h * 3.0);
+    objc_msgSend(_plt_imgview, sel_registerName("setImageScaling:"), 3);
+    objc_msgSend(view, sel_registerName("addSubview:"), _plt_imgview);
+
+    objc_msgSend(_plt_win, sel_registerName("makeKeyAndOrderFront:"), 0);
+    objc_msgSend(_plt_app, sel_registerName("activateIgnoringOtherApps:"), 1);
+    objc_msgSend(_plt_app, sel_registerName("finishLaunching"));
+
+    // Init timing with timebase conversion factor.
+    auto tb_info;
+    tb_info = malloc(8);
+    mach_timebase_info(tb_info);
+    _plt_time_numer = read_u32(tb_info, 0);
+    _plt_time_denom = read_u32(tb_info, 4);
+    free(tb_info);
+    _plt_time_base = mach_absolute_time();
+    return 0;
+}
+
+// Copy the software framebuffer to the screen.
+_stb_present() {
+    auto ctx, cgimg, nsimg;
+
+    // Create CGImage from framebuffer data.
+    ctx = call(_plt_cg_ctx, _stb_fb, _stb_w, _stb_h, 8, _stb_w * 4, _plt_cs, 8194);
+    cgimg = call(_plt_cg_img, ctx);
+
+    // Wrap in NSImage and set on the image view.
+    nsimg = objc_msgSend(objc_getClass("NSImage"), sel_registerName("alloc"));
+    nsimg = objc_msgSend(nsimg, sel_registerName("initWithCGImage:size:"),
+        cgimg, _stb_w * 1.0, _stb_h * 1.0);
+    objc_msgSend(_plt_imgview, sel_registerName("setImage:"), nsimg);
+
+    // Tell Cocoa to redraw.
+    objc_msgSend(_plt_app, sel_registerName("updateWindows"));
+
+    call(_plt_cg_img_rel, cgimg);
+    call(_plt_cg_ctx_rel, ctx);
+
+    // Frame rate cap: sleep based on target fps set by game_init.
+    // _stb_frame_ms is set by stbgame (e.g., 100 for 10fps, 16 for 60fps).
+    auto sleep_us;
+    sleep_us = _stb_frame_ms * 1000;
+    if (sleep_us < 1000) { sleep_us = 1000; }
+    usleep(sleep_us - 2000);
+    return 0;
+}
+
+// Poll macOS events and fill _stb_keys / _stb_mouse_* globals.
+_stb_poll_events() {
+    auto ev, dist_past, etype, vk, slot;
+    dist_past = objc_msgSend(objc_getClass("NSDate"), sel_registerName("distantPast"));
+
+    ev = objc_msgSend(_plt_app,
+        sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:"),
+        0 - 1, dist_past, _plt_cf_mode, 1);
+
+    while (ev != 0) {
+        etype = objc_msgSend(ev, sel_registerName("type"));
+
+        if (etype == NSEvKeyDown) {
+            vk = objc_msgSend(ev, sel_registerName("keyCode"));
+            slot = _plt_map_vkey(vk);
+            if (slot >= 0) { poke(_stb_keys + slot, 1); }
+        }
+        if (etype == NSEvKeyUp) {
+            vk = objc_msgSend(ev, sel_registerName("keyCode"));
+            slot = _plt_map_vkey(vk);
+            if (slot >= 0) { poke(_stb_keys + slot, 0); }
+        }
+
+        // Forward non-key events to Cocoa (window management).
+        if (etype != NSEvKeyDown) {
+            if (etype != NSEvKeyUp) {
+                objc_msgSend(_plt_app, sel_registerName("sendEvent:"), ev);
+            }
+        }
+
+        ev = objc_msgSend(_plt_app,
+            sel_registerName("nextEventMatchingMask:untilDate:inMode:dequeue:"),
+            0 - 1, dist_past, _plt_cf_mode, 1);
+    }
+    return 0;
+}
+
+// Return current time in milliseconds since init.
+_stb_get_time() {
+    auto now, ticks, ns;
+    now = mach_absolute_time();
+    ticks = now - _plt_time_base;
+    // Convert ticks to nanoseconds using timebase info, then to milliseconds.
+    ns = ticks * _plt_time_numer / _plt_time_denom;
+    return ns / 1000000;
+}
+
+// Return 1 if the app should close.
+_stb_should_close() {
+    return _plt_quit_flag;
+}

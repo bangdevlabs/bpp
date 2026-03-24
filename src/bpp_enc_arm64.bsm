@@ -1,0 +1,643 @@
+// bpp_enc_arm64.bsm — Binary ARM64 instruction encoder.
+// Emits 4-byte ARM64 instructions into a code buffer.
+// Provides label/fixup system for branch resolution and
+// relocation entries for data references (resolved in Phase 5c).
+//
+// Every ARM64 instruction is exactly 4 bytes, stored little-endian.
+// Call enc_resolve_fixups() after all code is emitted to patch branches.
+
+// ── Code buffer ──────────────────────────────────────────
+
+auto enc_buf;       // Pointer to code buffer (1 MB).
+auto enc_pos;       // Current byte offset in the code buffer.
+
+// ── Label system ─────────────────────────────────────────
+// Labels map numeric IDs to code offsets. Used for branches.
+
+auto enc_lbl_off;   // Array: label ID -> byte offset in code buffer (-1 = undefined).
+auto enc_lbl_max;   // Number of labels allocated so far.
+
+// ── Fixup system ─────────────────────────────────────────
+// Forward branch references that need patching once the target label is defined.
+
+auto enc_fix_pos;   // Array: byte offset of the branch instruction to patch.
+auto enc_fix_lbl;   // Array: target label ID.
+auto enc_fix_ty;    // Array: fixup type (0 = B/BL imm26, 1 = CBZ/CBNZ imm19, 2 = B.cond imm19).
+auto enc_fix_cnt;   // Number of pending fixups.
+
+// ── Relocation system ────────────────────────────────────
+// ADRP+ADD pairs whose page offsets are resolved in the Mach-O writer (Phase 5c).
+
+auto enc_rel_pos;   // Array: byte offset of the ADRP instruction.
+auto enc_rel_sym;   // Array: symbol identifier (packed name or table index).
+auto enc_rel_ty;    // Array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
+auto enc_rel_cnt;   // Number of relocation entries.
+
+// ── Initialization ───────────────────────────────────────
+
+init_enc_arm64() {
+    enc_buf     = malloc(1048576);
+    enc_pos     = 0;
+    enc_lbl_off = malloc(32768);
+    enc_lbl_max = 0;
+    enc_fix_pos = malloc(65536);
+    enc_fix_lbl = malloc(65536);
+    enc_fix_ty  = malloc(65536);
+    enc_fix_cnt = 0;
+    enc_rel_pos = malloc(32768);
+    enc_rel_sym = malloc(32768);
+    enc_rel_ty  = malloc(32768);
+    enc_rel_cnt = 0;
+    return 0;
+}
+
+// ── Buffer operations ────────────────────────────────────
+
+// Write a 32-bit instruction to the code buffer (little-endian).
+enc_emit32(val) {
+    poke(enc_buf + enc_pos,     val & 0xFF);
+    poke(enc_buf + enc_pos + 1, (val >> 8) & 0xFF);
+    poke(enc_buf + enc_pos + 2, (val >> 16) & 0xFF);
+    poke(enc_buf + enc_pos + 3, (val >> 24) & 0xFF);
+    enc_pos = enc_pos + 4;
+    return 0;
+}
+
+// Overwrite a 32-bit value at a specific byte offset (for patching branches).
+enc_patch32(off, val) {
+    poke(enc_buf + off,     val & 0xFF);
+    poke(enc_buf + off + 1, (val >> 8) & 0xFF);
+    poke(enc_buf + off + 2, (val >> 16) & 0xFF);
+    poke(enc_buf + off + 3, (val >> 24) & 0xFF);
+    return 0;
+}
+
+// Read a 32-bit value from the code buffer at a specific byte offset.
+enc_read32(off) {
+    return peek(enc_buf + off)
+         | (peek(enc_buf + off + 1) << 8)
+         | (peek(enc_buf + off + 2) << 16)
+         | (peek(enc_buf + off + 3) << 24);
+}
+
+// ── Label management ─────────────────────────────────────
+
+// Define a label at the current code position.
+enc_def_label(id) {
+    *(enc_lbl_off + id * 8) = enc_pos;
+    if (id >= enc_lbl_max) { enc_lbl_max = id + 1; }
+    return 0;
+}
+
+// Allocate a new undefined label and return its ID.
+enc_new_label() {
+    auto id;
+    id = enc_lbl_max;
+    *(enc_lbl_off + id * 8) = -1;
+    enc_lbl_max = enc_lbl_max + 1;
+    return id;
+}
+
+// ── Fixup management ─────────────────────────────────────
+
+// Record that the instruction at enc_pos branches to the given label.
+// type: 0 = B/BL (imm26), 1 = CBZ/CBNZ (imm19 at [23:5]), 2 = B.cond (imm19 at [23:5]).
+enc_add_fixup(lbl, ty) {
+    *(enc_fix_pos + enc_fix_cnt * 8) = enc_pos;
+    *(enc_fix_lbl + enc_fix_cnt * 8) = lbl;
+    *(enc_fix_ty  + enc_fix_cnt * 8) = ty;
+    enc_fix_cnt = enc_fix_cnt + 1;
+    return 0;
+}
+
+// ── Relocation management ────────────────────────────────
+
+// Record an ADRP+ADD relocation at the given code offset.
+enc_add_reloc(pos, sym, ty) {
+    *(enc_rel_pos + enc_rel_cnt * 8) = pos;
+    *(enc_rel_sym + enc_rel_cnt * 8) = sym;
+    *(enc_rel_ty  + enc_rel_cnt * 8) = ty;
+    enc_rel_cnt = enc_rel_cnt + 1;
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Instruction encoders — each emits exactly one 4-byte word.
+//  Register arguments use hardware numbers: x0=0 .. x30=30, sp/xzr=31.
+//  Float registers: d0=0 .. d31=31.
+// ═══════════════════════════════════════════════════════════
+
+// ── Move immediate ───────────────────────────────────────
+
+// MOVZ Xd, #imm16, LSL #(hw*16). Zeroes other bits.
+enc_movz(rd, imm16, hw) {
+    enc_emit32(0xD2800000 | (hw << 21) | (imm16 << 5) | rd);
+    return 0;
+}
+
+// MOVK Xd, #imm16, LSL #(hw*16). Keeps other bits.
+enc_movk(rd, imm16, hw) {
+    enc_emit32(0xF2800000 | (hw << 21) | (imm16 << 5) | rd);
+    return 0;
+}
+
+// MOVN Xd, #imm16, LSL #(hw*16). Inverts result (~(imm16 << shift)).
+enc_movn(rd, imm16, hw) {
+    enc_emit32(0x92800000 | (hw << 21) | (imm16 << 5) | rd);
+    return 0;
+}
+
+// Load a 64-bit immediate into Xrd using MOVZ + MOVK sequence.
+// Handles up to 4 half-words. For val == -1, uses MOVN.
+enc_mov_wide(rd, val) {
+    auto lo, hi;
+    // Special case: -1 → MOVN Xd, #0.
+    if (val == -1) { enc_movn(rd, 0, 0); return 0; }
+    // Small positive: single MOVZ.
+    if (val >= 0) { if (val < 65536) { enc_movz(rd, val, 0); return 0; } }
+    // General case: MOVZ lowest half-word, then MOVK non-zero higher halves.
+    lo = val & 0xFFFF;
+    enc_movz(rd, lo, 0);
+    hi = (val >> 16) & 0xFFFF;
+    if (hi > 0) { enc_movk(rd, hi, 1); }
+    hi = (val >> 32) & 0xFFFF;
+    if (hi > 0) { enc_movk(rd, hi, 2); }
+    hi = (val >> 48) & 0xFFFF;
+    if (hi > 0) { enc_movk(rd, hi, 3); }
+    return 0;
+}
+
+// ── Register-register ALU ────────────────────────────────
+
+// ADD Xd, Xn, Xm
+enc_add_reg(rd, rn, rm) {
+    enc_emit32(0x8B000000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// SUB Xd, Xn, Xm
+enc_sub_reg(rd, rn, rm) {
+    enc_emit32(0xCB000000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// AND Xd, Xn, Xm
+enc_and_reg(rd, rn, rm) {
+    enc_emit32(0x8A000000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// ORR Xd, Xn, Xm
+enc_orr_reg(rd, rn, rm) {
+    enc_emit32(0xAA000000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// EOR Xd, Xn, Xm
+enc_eor_reg(rd, rn, rm) {
+    enc_emit32(0xCA000000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// CMP Xn, Xm (alias for SUBS XZR, Xn, Xm).
+enc_cmp_reg(rn, rm) {
+    enc_emit32(0xEB000000 | (rm << 16) | (rn << 5) | 0x1F);
+    return 0;
+}
+
+// MVN Xd, Xm — bitwise NOT (alias for ORN Xd, XZR, Xm).
+enc_mvn(rd, rm) {
+    enc_emit32(0xAA200000 | (rm << 16) | (31 << 5) | rd);
+    return 0;
+}
+
+// NEG Xd, Xm (alias for SUB Xd, XZR, Xm).
+enc_neg(rd, rm) {
+    enc_emit32(0xCB000000 | (rm << 16) | (31 << 5) | rd);
+    return 0;
+}
+
+// MOV Xd, Xm (alias for ORR Xd, XZR, Xm). Do not use when SP is involved.
+enc_mov_reg(rd, rm) {
+    enc_emit32(0xAA000000 | (rm << 16) | (31 << 5) | rd);
+    return 0;
+}
+
+// ── Data processing 2-source ─────────────────────────────
+
+// MUL Xd, Xn, Xm (alias for MADD Xd, Xn, Xm, XZR).
+enc_mul(rd, rn, rm) {
+    enc_emit32(0x9B007C00 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// SDIV Xd, Xn, Xm
+enc_sdiv(rd, rn, rm) {
+    enc_emit32(0x9AC00C00 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// MSUB Xd, Xn, Xm, Xa — computes Xa - Xn * Xm. Used for modulo.
+enc_msub(rd, rn, rm, ra) {
+    enc_emit32(0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+    return 0;
+}
+
+// LSLV Xd, Xn, Xm (variable left shift).
+enc_lslv(rd, rn, rm) {
+    enc_emit32(0x9AC02000 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// ASRV Xd, Xn, Xm (variable arithmetic right shift).
+enc_asrv(rd, rn, rm) {
+    enc_emit32(0x9AC02800 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// LSRV Xd, Xn, Xm (variable logical right shift).
+enc_lsrv(rd, rn, rm) {
+    enc_emit32(0x9AC02400 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// ── Immediate ALU ────────────────────────────────────────
+
+// ADD Xd, Xn, #imm12. Works with SP as Xn or Xd.
+enc_add_imm(rd, rn, imm12) {
+    enc_emit32(0x91000000 | (imm12 << 10) | (rn << 5) | rd);
+    return 0;
+}
+
+// SUB Xd, Xn, #imm12.
+enc_sub_imm(rd, rn, imm12) {
+    enc_emit32(0xD1000000 | (imm12 << 10) | (rn << 5) | rd);
+    return 0;
+}
+
+// CMP Xn, #imm12 (alias for SUBS XZR, Xn, #imm12).
+enc_cmp_imm(rn, imm12) {
+    enc_emit32(0xF1000000 | (imm12 << 10) | (rn << 5) | 0x1F);
+    return 0;
+}
+
+// ── Conditional ──────────────────────────────────────────
+// Condition codes: EQ=0, NE=1, CS/HS=2, CC/LO=3, MI=4, PL=5,
+//   VS=6, VC=7, HI=8, LS=9, GE=10, LT=11, GT=12, LE=13.
+
+// CSET Xd, cond — sets Xd to 1 if cond is true, 0 otherwise.
+// Encoded as CSINC Xd, XZR, XZR, invert(cond).
+enc_cset(rd, cond) {
+    enc_emit32(0x9A9F07E0 | ((cond ^ 1) << 12) | rd);
+    return 0;
+}
+
+// CSNEG Xd, Xn, Xm, cond — if cond then Xd=Xn, else Xd=-Xm.
+enc_csneg(rd, rn, rm, cond) {
+    enc_emit32(0xDA800400 | (rm << 16) | (cond << 12) | (rn << 5) | rd);
+    return 0;
+}
+
+// ── Load/store 64-bit unsigned offset ────────────────────
+
+// LDR Xt, [Xn, #uoff]. Byte offset must be a multiple of 8.
+enc_ldr_uoff(rt, rn, uoff) {
+    enc_emit32(0xF9400000 | ((uoff / 8) << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// STR Xt, [Xn, #uoff]. Byte offset must be a multiple of 8.
+enc_str_uoff(rt, rn, uoff) {
+    enc_emit32(0xF9000000 | ((uoff / 8) << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// ── Load/store byte ──────────────────────────────────────
+
+// LDRB Wt, [Xn, #uoff]. Byte offset, no scaling.
+enc_ldrb_uoff(rt, rn, uoff) {
+    enc_emit32(0x39400000 | (uoff << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// STRB Wt, [Xn, #uoff]. Use rt=31 for WZR.
+enc_strb_uoff(rt, rn, uoff) {
+    enc_emit32(0x39000000 | (uoff << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// LDRB Wt, [Xn, Xm] — register offset, no shift.
+enc_ldrb_reg(rt, rn, rm) {
+    enc_emit32(0x38606800 | (rm << 16) | (rn << 5) | rt);
+    return 0;
+}
+
+// ── Pre/post-indexed load/store (push/pop patterns) ──────
+
+// STR Xt, [Xn, #simm9]! — pre-index. Used as push: enc_str_pre(0, 31, -16).
+enc_str_pre(rt, rn, simm) {
+    enc_emit32(0xF8000C00 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
+    return 0;
+}
+
+// LDR Xt, [Xn], #simm9 — post-index. Used as pop: enc_ldr_post(0, 31, 16).
+enc_ldr_post(rt, rn, simm) {
+    enc_emit32(0xF8400400 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
+    return 0;
+}
+
+// STR Dt, [Xn, #simm9]! — float pre-index (float push).
+enc_str_d_pre(rt, rn, simm) {
+    enc_emit32(0xFC000C00 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
+    return 0;
+}
+
+// LDR Dt, [Xn], #simm9 — float post-index (float pop).
+enc_ldr_d_post(rt, rn, simm) {
+    enc_emit32(0xFC400400 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
+    return 0;
+}
+
+// ── STP/LDP (prologue/epilogue) ──────────────────────────
+
+// STP Xt1, Xt2, [Xn, #simm]! — pre-index pair store.
+// simm must be a multiple of 8; encoded as (simm/8) in a 7-bit signed field.
+enc_stp_pre(rt1, rt2, rn, simm) {
+    enc_emit32(0xA9800000 | (((simm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    return 0;
+}
+
+// LDP Xt1, Xt2, [Xn], #simm — post-index pair load.
+enc_ldp_post(rt1, rt2, rn, simm) {
+    enc_emit32(0xA8C00000 | (((simm / 8) & 0x7F) << 15) | (rt2 << 10) | (rn << 5) | rt1);
+    return 0;
+}
+
+// ── Branches (direct offset) ─────────────────────────────
+
+// B offset — unconditional PC-relative branch. Offset in bytes, multiple of 4.
+enc_b(off) {
+    enc_emit32(0x14000000 | ((off / 4) & 0x3FFFFFF));
+    return 0;
+}
+
+// BL offset — branch with link (call). Offset in bytes, multiple of 4.
+enc_bl(off) {
+    enc_emit32(0x94000000 | ((off / 4) & 0x3FFFFFF));
+    return 0;
+}
+
+// CBZ Xt, offset — branch if Xt is zero. Offset in bytes.
+enc_cbz(rt, off) {
+    enc_emit32(0xB4000000 | (((off / 4) & 0x7FFFF) << 5) | rt);
+    return 0;
+}
+
+// CBNZ Xt, offset — branch if Xt is non-zero. Offset in bytes.
+enc_cbnz(rt, off) {
+    enc_emit32(0xB5000000 | (((off / 4) & 0x7FFFF) << 5) | rt);
+    return 0;
+}
+
+// B.cond offset — conditional branch. Offset in bytes.
+enc_b_cond(cond, off) {
+    enc_emit32(0x54000000 | (((off / 4) & 0x7FFFF) << 5) | cond);
+    return 0;
+}
+
+// ── Branches with label (auto fixup) ─────────────────────
+// These emit a branch and, if the label is not yet defined,
+// record a fixup to be patched by enc_resolve_fixups().
+
+// B to label.
+enc_b_label(lbl) {
+    auto target;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) { enc_b(target - enc_pos); return 0; }
+    enc_add_fixup(lbl, 0);
+    enc_emit32(0x14000000);
+    return 0;
+}
+
+// BL to label (call to a B++ function whose code offset is known).
+enc_bl_label(lbl) {
+    auto target;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) { enc_bl(target - enc_pos); return 0; }
+    enc_add_fixup(lbl, 0);
+    enc_emit32(0x94000000);
+    return 0;
+}
+
+// CBZ Xt, label.
+enc_cbz_label(rt, lbl) {
+    auto target;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) { enc_cbz(rt, target - enc_pos); return 0; }
+    enc_add_fixup(lbl, 1);
+    enc_emit32(0xB4000000 | rt);
+    return 0;
+}
+
+// CBNZ Xt, label.
+enc_cbnz_label(rt, lbl) {
+    auto target;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) { enc_cbnz(rt, target - enc_pos); return 0; }
+    enc_add_fixup(lbl, 1);
+    enc_emit32(0xB5000000 | rt);
+    return 0;
+}
+
+// B.cond label.
+enc_b_cond_label(cond, lbl) {
+    auto target;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) { enc_b_cond(cond, target - enc_pos); return 0; }
+    enc_add_fixup(lbl, 2);
+    enc_emit32(0x54000000 | cond);
+    return 0;
+}
+
+// ── System instructions ──────────────────────────────────
+
+// BLR Xn — branch with link to address in register (indirect call).
+enc_blr(rn) {
+    enc_emit32(0xD63F0000 | (rn << 5));
+    return 0;
+}
+
+// RET — return to address in x30.
+enc_ret() {
+    enc_emit32(0xD65F03C0);
+    return 0;
+}
+
+// SVC #imm16 — supervisor call (syscall trap). macOS uses SVC #0x80.
+enc_svc(imm16) {
+    enc_emit32(0xD4000001 | (imm16 << 5));
+    return 0;
+}
+
+// NOP — no operation.
+enc_nop() {
+    enc_emit32(0xD503201F);
+    return 0;
+}
+
+// ── Float arithmetic ─────────────────────────────────────
+
+// FADD Dd, Dn, Dm
+enc_fadd(rd, rn, rm) {
+    enc_emit32(0x1E602800 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// FSUB Dd, Dn, Dm
+enc_fsub(rd, rn, rm) {
+    enc_emit32(0x1E603800 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// FMUL Dd, Dn, Dm
+enc_fmul(rd, rn, rm) {
+    enc_emit32(0x1E600800 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// FDIV Dd, Dn, Dm
+enc_fdiv(rd, rn, rm) {
+    enc_emit32(0x1E601800 | (rm << 16) | (rn << 5) | rd);
+    return 0;
+}
+
+// FCMP Dn, Dm — compare two doubles, set NZCV flags.
+enc_fcmp(rn, rm) {
+    enc_emit32(0x1E602000 | (rm << 16) | (rn << 5));
+    return 0;
+}
+
+// FCMP Dn, #0.0 — compare double against zero.
+enc_fcmp_zero(rn) {
+    enc_emit32(0x1E602008 | (rn << 5));
+    return 0;
+}
+
+// FMOV Dd, Dn — copy between float registers.
+enc_fmov(rd, rn) {
+    enc_emit32(0x1E604000 | (rn << 5) | rd);
+    return 0;
+}
+
+// FNEG Dd, Dn — negate a double.
+enc_fneg(rd, rn) {
+    enc_emit32(0x1E614000 | (rn << 5) | rd);
+    return 0;
+}
+
+// ── Float/integer conversion ─────────────────────────────
+
+// SCVTF Dd, Xn — convert signed 64-bit integer to double.
+enc_scvtf(rd, rn) {
+    enc_emit32(0x9E620000 | (rn << 5) | rd);
+    return 0;
+}
+
+// FCVTZS Xd, Dn — convert double to signed 64-bit integer (round toward zero).
+enc_fcvtzs(rd, rn) {
+    enc_emit32(0x9E780000 | (rn << 5) | rd);
+    return 0;
+}
+
+// FMOV Xd, Dn — bit-transfer from float register to general-purpose register.
+enc_fmov_to_gpr(rd, rn) {
+    enc_emit32(0x9E660000 | (rn << 5) | rd);
+    return 0;
+}
+
+// FMOV Dd, Xn — bit-transfer from general-purpose register to float register.
+enc_fmov_from_gpr(rd, rn) {
+    enc_emit32(0x9E670000 | (rn << 5) | rd);
+    return 0;
+}
+
+// ── Float load/store (unsigned offset) ───────────────────
+
+// LDR Dt, [Xn, #uoff]. Offset in bytes, must be a multiple of 8.
+enc_ldr_d_uoff(rt, rn, uoff) {
+    enc_emit32(0xFD400000 | ((uoff / 8) << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// STR Dt, [Xn, #uoff]. Offset in bytes, must be a multiple of 8.
+enc_str_d_uoff(rt, rn, uoff) {
+    enc_emit32(0xFD000000 | ((uoff / 8) << 10) | (rn << 5) | rt);
+    return 0;
+}
+
+// LDR Xt, [Xn, Xm, LSL #3] — load 8 bytes using scaled register offset.
+// The shift #3 multiplies Xm by 8, making it ideal for 64-bit array indexing.
+enc_ldr_reg_shift3(rt, rn, rm) {
+    enc_emit32(0xF8607800 | (rm << 16) | (rn << 5) | rt);
+    return 0;
+}
+
+// ── PC-relative addressing ───────────────────────────────
+
+// ADRP Xd, 0 — emit with zero page offset; actual value set by relocation.
+enc_adrp(rd) {
+    enc_emit32(0x90000000 | rd);
+    return 0;
+}
+
+// ADR Xd, label — emit PC-relative address with auto fixup.
+// Encodes a 21-bit signed byte offset from PC to the label.
+// If the label is not yet defined, records a fixup (type 3).
+enc_adr_label(rd, lbl) {
+    auto target, off, immlo, immhi;
+    target = *(enc_lbl_off + lbl * 8);
+    if (target >= 0) {
+        off = target - enc_pos;
+        immlo = off & 3;
+        immhi = (off >> 2) & 0x7FFFF;
+        enc_emit32(0x10000000 | (immlo << 29) | (immhi << 5) | rd);
+        return 0;
+    }
+    enc_add_fixup(lbl, 3);
+    enc_emit32(0x10000000 | rd);
+    return 0;
+}
+
+// ── Fixup resolution ─────────────────────────────────────
+
+// Patch all recorded branch fixups. Call after all code has been emitted.
+enc_resolve_fixups() {
+    auto i, pos, lbl, ty, target, off, ins;
+    i = 0;
+    while (i < enc_fix_cnt) {
+        pos    = *(enc_fix_pos + i * 8);
+        lbl    = *(enc_fix_lbl + i * 8);
+        ty     = *(enc_fix_ty  + i * 8);
+        target = *(enc_lbl_off + lbl * 8);
+        off    = (target - pos) / 4;
+        ins    = enc_read32(pos);
+        if (ty == 0) {
+            // B or BL: replace imm26 field at [25:0].
+            ins = (ins & 0xFC000000) | (off & 0x3FFFFFF);
+        }
+        if (ty == 1 | ty == 2) {
+            // CBZ/CBNZ or B.cond: replace imm19 field at [23:5].
+            ins = (ins & 0xFF00001F) | ((off & 0x7FFFF) << 5);
+        }
+        if (ty == 3) {
+            // ADR: replace immlo [30:29] and immhi [23:5].
+            // off is in bytes (not divided by 4 for ADR).
+            off = target - pos;
+            ins = ins & 0x9F00001F;
+            ins = ins | ((off & 3) << 29) | (((off >> 2) & 0x7FFFF) << 5);
+        }
+        enc_patch32(pos, ins);
+        i = i + 1;
+    }
+    return 0;
+}

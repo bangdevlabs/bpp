@@ -1,0 +1,426 @@
+// B++ Unified Compiler — Lexer Module
+// Scans source text and writes tokens into shared arrays (toks, vbuf).
+// Does not read from stdin or write to stdout. All output goes to the
+// token storage owned by the parser module.
+
+// --- Lexer-owned globals ---
+// src      — pointer to the source buffer (set by the orchestrator)
+// src_len  — length of the source in bytes (set by the orchestrator)
+// pos      — current scan position within the source
+
+auto src, src_len, pos;
+
+// --- Shared globals (declared in bpp_parser.bsm) ---
+// toks     — token array, 262144 bytes, 24-byte records
+// tok_cnt  — number of tokens stored so far
+// vbuf     — string value buffer, 131072 bytes
+// vbuf_pos — write position inside vbuf
+
+// --- Token type constants ---
+// TK_KW=0  TK_IMP=1  TK_ID=2  TK_NUM=3  TK_HEX=4
+// TK_STR=5  TK_OP=6  TK_PUNCT=7  TK_FLOAT=8
+
+// ============================================================
+// Token Output
+// ============================================================
+
+// Append a token record to the shared arrays.
+// Copies len bytes from src+start into vbuf, then writes a 24-byte
+// record (tcode, vbuf offset, length) into toks.
+add_token(tcode, start, len) {
+    auto i, base;
+    // Copy the token text from the source buffer into vbuf.
+    i = 0;
+    while (i < len) {
+        poke(vbuf + vbuf_pos + i, peek(src + start + i));
+        i = i + 1;
+    }
+    // Write the 24-byte token record.
+    base = toks + tok_cnt * 24;
+    *(base)      = tcode;
+    *(base + 8)  = vbuf_pos;
+    *(base + 16) = len;
+    // Advance cursors.
+    vbuf_pos = vbuf_pos + len;
+    tok_cnt  = tok_cnt + 1;
+    return 0;
+}
+
+// ============================================================
+// Character Classification
+// ============================================================
+
+// Return 1 if ch is an ASCII letter (A-Z or a-z).
+is_alpha(ch) {
+    if (ch >= 65) { if (ch <= 90) { return 1; } }
+    if (ch >= 97) { if (ch <= 122) { return 1; } }
+    return 0;
+}
+
+// Return 1 if ch is an ASCII digit (0-9).
+is_digit(ch) {
+    if (ch >= 48) { if (ch <= 57) { return 1; } }
+    return 0;
+}
+
+// Return 1 if ch is a hexadecimal digit (0-9, A-F, a-f).
+is_hex(ch) {
+    if (is_digit(ch)) { return 1; }
+    if (ch >= 65) { if (ch <= 70) { return 1; } }
+    if (ch >= 97) { if (ch <= 102) { return 1; } }
+    return 0;
+}
+
+// Return 1 if ch is alphanumeric or underscore.
+is_alnum(ch) {
+    if (is_alpha(ch)) { return 1; }
+    if (is_digit(ch)) { return 1; }
+    if (ch == 95) { return 1; }
+    return 0;
+}
+
+// Return 1 if ch is whitespace (space, tab, newline, carriage return).
+is_space(ch) {
+    if (ch == ' ' | ch == '\t' | ch == '\n' | ch == '\r') { return 1; }
+    return 0;
+}
+
+// Return 1 if ch is an operator character.
+is_op(ch) {
+    if (ch == '+' | ch == '-' | ch == '*' | ch == '/') { return 1; }
+    if (ch == '%' | ch == '=' | ch == '!') { return 1; }
+    if (ch == '<' | ch == '>' | ch == '|' | ch == '&') { return 1; }
+    if (ch == '^' | ch == '~') { return 1; }
+    return 0;
+}
+
+// Return 1 if ch is a punctuation character.
+is_punct(ch) {
+    if (ch == '(' | ch == ')' | ch == '{' | ch == '}') { return 1; }
+    if (ch == '[' | ch == ']' | ch == ';' | ch == ',') { return 1; }
+    if (ch == '.' | ch == ':' | ch == '@') { return 1; }
+    return 0;
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+// Advance pos past any whitespace characters.
+skip_ws() {
+    while (pos < src_len) {
+        if (is_space(peek(src + pos)) == 0) { return 0; }
+        pos = pos + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Keyword Detection
+// ============================================================
+
+// Check whether the word at src+start (length len) is a keyword.
+// Returns 2 for "import", 1 for other keywords, 0 for identifiers.
+check_kw(start, len) {
+    if (len == 2) {
+        if (buf_eq(src + start, "if", 2)) { return 1; }
+    }
+    if (len == 3) {
+        if (buf_eq(src + start, "int", 3)) { return 1; }
+        if (buf_eq(src + start, "ptr", 3)) { return 1; }
+        if (buf_eq(src + start, "var", 3)) { return 1; }
+    }
+    if (len == 4) {
+        if (buf_eq(src + start, "auto", 4)) { return 1; }
+        if (buf_eq(src + start, "else", 4)) { return 1; }
+        if (buf_eq(src + start, "char", 4)) { return 1; }
+        if (buf_eq(src + start, "void", 4)) { return 1; }
+        if (buf_eq(src + start, "word", 4)) { return 1; }
+        if (buf_eq(src + start, "byte", 4)) { return 1; }
+        if (buf_eq(src + start, "half", 4)) { return 1; }
+        if (buf_eq(src + start, "long", 4)) { return 1; }
+        if (buf_eq(src + start, "enum", 4)) { return 1; }
+    }
+    if (len == 5) {
+        if (buf_eq(src + start, "extrn", 5)) { return 1; }
+        if (buf_eq(src + start, "while", 5)) { return 1; }
+        if (buf_eq(src + start, "break", 5)) { return 1; }
+    }
+    if (len == 6) {
+        if (buf_eq(src + start, "return", 6)) { return 1; }
+        if (buf_eq(src + start, "import", 6)) { return 2; }
+        if (buf_eq(src + start, "struct", 6)) { return 1; }
+        if (buf_eq(src + start, "sizeof", 6)) { return 1; }
+    }
+    return 0;
+}
+
+// ============================================================
+// Token Scanners
+// ============================================================
+
+// Try to scan a comment starting at pos. Returns 1 if found, 0 otherwise.
+scan_comment() {
+    auto next;
+    if (pos + 1 >= src_len) { return 0; }
+    next = peek(src + pos + 1);
+    if (next == 47) {
+        // Line comment: skip until newline.
+        pos = pos + 2;
+        while (pos < src_len) {
+            if (peek(src + pos) == 10) { pos = pos + 1; return 1; }
+            pos = pos + 1;
+        }
+        return 1;
+    }
+    if (next == 42) {
+        // Block comment: skip until closing */.
+        pos = pos + 2;
+        while (pos + 1 < src_len) {
+            if (peek(src + pos) == 42) {
+                if (peek(src + pos + 1) == 47) { pos = pos + 2; return 1; }
+            }
+            pos = pos + 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// Scan an identifier or keyword starting at pos.
+scan_word() {
+    auto start, len, kw;
+    start = pos;
+    while (pos < src_len) {
+        if (is_alnum(peek(src + pos)) == 0) {
+            len = pos - start;
+            kw = check_kw(start, len);
+            if (kw == 2) {
+                add_token(1, start, len);
+            } else if (kw == 1) {
+                add_token(0, start, len);
+            } else {
+                add_token(2, start, len);
+            }
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    // Handle word at end of file.
+    len = pos - start;
+    if (len > 0) {
+        kw = check_kw(start, len);
+        if (kw == 2) {
+            add_token(1, start, len);
+        } else if (kw == 1) {
+            add_token(0, start, len);
+        } else {
+            add_token(2, start, len);
+        }
+    }
+    return 0;
+}
+
+// Scan a decimal or hexadecimal number.
+scan_number() {
+    auto start;
+    start = pos;
+    // Check for hex prefix 0x.
+    if (peek(src + pos) == 48) {
+        if (pos + 1 < src_len) {
+            if (peek(src + pos + 1) == 'x' | peek(src + pos + 1) == 'X') {
+                pos = pos + 2;
+                while (pos < src_len) {
+                    if (is_hex(peek(src + pos)) == 0) {
+                        add_token(4, start, pos - start);
+                        return 0;
+                    }
+                    pos = pos + 1;
+                }
+                add_token(4, start, pos - start);
+                return 0;
+            }
+        }
+    }
+    // Decimal number (may include a decimal point for floats).
+    while (pos < src_len) {
+        if (is_digit(peek(src + pos)) == 0) {
+            // Check for decimal point followed by digit -> float literal.
+            if (peek(src + pos) == 46) {
+                if (pos + 1 < src_len) {
+                    if (is_digit(peek(src + pos + 1))) {
+                        pos = pos + 1;
+                        while (pos < src_len) {
+                            if (is_digit(peek(src + pos)) == 0) {
+                                add_token(8, start, pos - start);
+                                return 0;
+                            }
+                            pos = pos + 1;
+                        }
+                        add_token(8, start, pos - start);
+                        return 0;
+                    }
+                }
+            }
+            add_token(3, start, pos - start);
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    add_token(3, start, pos - start);
+    return 0;
+}
+
+// Scan a string literal enclosed in double quotes.
+scan_string() {
+    auto start;
+    start = pos;
+    pos = pos + 1;
+    while (pos < src_len) {
+        if (peek(src + pos) == 34) {
+            pos = pos + 1;
+            add_token(5, start, pos - start);
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    add_token(5, start, pos - start);
+    return 0;
+}
+
+// Scan a char literal ('A', '\n', etc.) and emit as NUMBER with the
+// ASCII value converted to a decimal string written directly into vbuf.
+scan_char() {
+    auto ch, val, tmp, digits, dcnt, j, vstart, vlen, base;
+    // Skip opening quote.
+    pos = pos + 1;
+    ch = peek(src + pos);
+    if (ch == 92) {
+        // Escape sequence: \n \t \r \\ \'
+        pos = pos + 1;
+        ch = peek(src + pos);
+        if (ch == 110) { val = 10; }
+        else if (ch == 116) { val = 9; }
+        else if (ch == 114) { val = 13; }
+        else if (ch == 92) { val = 92; }
+        else if (ch == 39) { val = 39; }
+        else { val = ch; }
+    } else {
+        val = ch;
+    }
+    pos = pos + 1;
+    // Skip closing quote.
+    pos = pos + 1;
+    // Convert val to decimal digits written directly into vbuf.
+    // We use a small scratch area (digits) to build in reverse, then
+    // copy forward into vbuf at vbuf_pos.
+    digits = malloc(8);
+    vstart = vbuf_pos;
+    if (val == 0) {
+        poke(vbuf + vbuf_pos, 48);
+        vbuf_pos = vbuf_pos + 1;
+    } else {
+        tmp = val;
+        dcnt = 0;
+        while (tmp > 0) {
+            poke(digits + dcnt, 48 + tmp % 10);
+            tmp = tmp / 10;
+            dcnt = dcnt + 1;
+        }
+        // Reverse digits into vbuf.
+        j = dcnt - 1;
+        while (j >= 0) {
+            poke(vbuf + vbuf_pos, peek(digits + j));
+            vbuf_pos = vbuf_pos + 1;
+            j = j - 1;
+        }
+    }
+    // Record the token. The value text is already in vbuf at vstart.
+    vlen = vbuf_pos - vstart;
+    // Write the 24-byte token record directly (value is already in vbuf).
+    base = toks + tok_cnt * 24;
+    *(base)      = 3;
+    *(base + 8)  = vstart;
+    *(base + 16) = vlen;
+    tok_cnt = tok_cnt + 1;
+    return 0;
+}
+
+// Scan a one or two character operator.
+scan_op() {
+    auto start, ch, next;
+    start = pos;
+    ch = peek(src + pos);
+    pos = pos + 1;
+    if (pos < src_len) {
+        next = peek(src + pos);
+        // Two-char operators ending with '=': ==, !=, <=, >=, +=, -=, *=, /=, %=
+        if (next == '=') {
+            if (ch == '=' | ch == '!' | ch == '<' | ch == '>') { pos = pos + 1; }
+            if (ch == '+' | ch == '-' | ch == '*' | ch == '/' | ch == '%') { pos = pos + 1; }
+        }
+        // Two-char operators: &&, ||, >>, <<
+        if (ch == '&') { if (next == '&') { pos = pos + 1; } }
+        if (ch == '|') { if (next == '|') { pos = pos + 1; } }
+        if (ch == '>') { if (next == '>') { pos = pos + 1; } }
+        if (ch == '<') { if (next == '<') { pos = pos + 1; } }
+    }
+    add_token(6, start, pos - start);
+    return 0;
+}
+
+// Scan a single punctuation character.
+scan_punct() {
+    add_token(7, pos, 1);
+    pos = pos + 1;
+    return 0;
+}
+
+// ============================================================
+// Token Dispatch
+// ============================================================
+
+// Identify and scan the next token at pos.
+scan_token() {
+    auto ch;
+    ch = peek(src + pos);
+    // Check for comments first (start with /).
+    if (ch == 47) {
+        if (scan_comment()) { return 0; }
+        scan_op();
+        return 0;
+    }
+    if (is_alpha(ch) | ch == 95) { scan_word(); return 0; }
+    if (is_digit(ch)) { scan_number(); return 0; }
+    if (ch == 34) { scan_string(); return 0; }
+    if (ch == 39) { scan_char(); return 0; }
+    if (is_op(ch)) { scan_op(); return 0; }
+    if (is_punct(ch)) { scan_punct(); return 0; }
+    // Unknown character: skip it.
+    pos = pos + 1;
+    return 0;
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+// Initialize the lexer. The orchestrator must set src and src_len
+// before calling lex_all().
+init_lexer() {
+    pos = 0;
+    return 0;
+}
+
+// Scan the entire source buffer and populate the token arrays.
+// Assumes src and src_len have been set by the orchestrator.
+lex_all() {
+    pos = 0;
+    while (pos < src_len) {
+        skip_ws();
+        if (pos < src_len) {
+            scan_token();
+        }
+    }
+    return 0;
+}

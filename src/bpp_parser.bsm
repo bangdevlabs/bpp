@@ -1,0 +1,955 @@
+// bpp_parser.bsm — B++ parser module for the unified compiler.
+// Converts token stream into AST. The lexer fills toks directly;
+// JSON output is handled by separate emitter modules.
+
+// ── Parser-owned globals ────────────────────────────────────
+
+// Token storage (filled by the lexer before parsing begins).
+auto toks, tok_cnt, tok_pos;
+auto vbuf, vbuf_pos;
+
+// Program structure collected during parsing.
+auto globals, glob_cnt;
+auto externs, ext_cnt;
+auto funcs, func_cnt;
+
+// Struct registry: each entry is 32 bytes (name, fields ptr, field_count, size).
+auto struct_defs, struct_cnt;
+
+// Variable type map: each entry is 16 bytes (var_name packed, struct_index).
+auto var_types, vtype_cnt;
+
+// Stack struct flag: tracks which variables are stack-allocated (via var keyword).
+auto var_stack_names, var_stack_cnt;
+
+// Enum constant registry: maps packed names to integer values.
+// Each entry is 16 bytes (packed_name, int_value).
+auto enum_vals, enum_cnt;
+
+// TK_FLOAT is not declared in defs.bpp, so the parser owns it.
+auto TK_FLOAT;
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Allocate parser-specific state. Constants (T_LIT, TK_KW, etc.)
+// are set by init_defs(); list builder (tmp_arr, list_stack, etc.)
+// is allocated by bpp_internal.bsm.
+init_parser() {
+    toks = malloc(4194304);
+    vbuf = malloc(1048576);
+    vbuf_pos = 0;
+    tok_cnt = 0;
+    tok_pos = 0;
+    globals = arr_new();
+    glob_cnt = 0;
+    externs = arr_new();
+    ext_cnt = 0;
+    funcs = arr_new();
+    func_cnt = 0;
+    struct_defs = malloc(64 * 32);
+    struct_cnt = 0;
+    var_types = malloc(512 * 16);
+    vtype_cnt = 0;
+    var_stack_names = malloc(512 * 8);
+    enum_vals = malloc(1024 * 16);
+    enum_cnt = 0;
+    var_stack_cnt = 0;
+    TK_FLOAT = 8;
+    return 0;
+}
+
+// ============================================================
+// String helpers (parser-local)
+// ============================================================
+
+// Compare two packed strings (both stored in vbuf).
+packed_eq(p1, p2) {
+    auto s1, l1, s2, l2, i;
+    s1 = p1 % 0x100000000;
+    l1 = p1 / 0x100000000;
+    s2 = p2 % 0x100000000;
+    l2 = p2 / 0x100000000;
+    if (l1 != l2) { return 0; }
+    i = 0;
+    while (i < l1) {
+        if (peek(vbuf + s1 + i) != peek(vbuf + s2 + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// Struct support
+// ============================================================
+
+// Register a new struct definition. Returns its index.
+add_struct_def(name_p) {
+    auto entry;
+    entry = struct_defs + struct_cnt * 32;
+    *(entry + 0) = name_p;
+    *(entry + 8) = malloc(64 * 8);
+    *(entry + 16) = 0;
+    *(entry + 24) = 0;
+    struct_cnt = struct_cnt + 1;
+    return struct_cnt - 1;
+}
+
+// Add a field to an existing struct. Fields are stored as packed strings.
+add_struct_field(idx, field_p) {
+    auto entry, fields, fc;
+    entry = struct_defs + idx * 32;
+    fields = *(entry + 8);
+    fc = *(entry + 16);
+    *(fields + fc * 8) = field_p;
+    fc = fc + 1;
+    *(entry + 16) = fc;
+    *(entry + 24) = fc * 8;
+    return 0;
+}
+
+// Find a struct by name. Returns its index or -1 if not found.
+find_struct(name_p) {
+    auto i, entry;
+    i = 0;
+    while (i < struct_cnt) {
+        entry = struct_defs + i * 32;
+        if (packed_eq(*(entry + 0), name_p)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get the byte offset of a field within a struct. Returns -1 if not found.
+get_field_offset(idx, field_p) {
+    auto entry, fields, fc, i;
+    entry = struct_defs + idx * 32;
+    fields = *(entry + 8);
+    fc = *(entry + 16);
+    i = 0;
+    while (i < fc) {
+        if (packed_eq(*(fields + i * 8), field_p)) { return i * 8; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get the total size in bytes of a struct.
+get_struct_size(idx) {
+    return *(struct_defs + idx * 32 + 24);
+}
+
+// Record a variable's struct type for dot-access resolution.
+set_var_type(var_p, idx) {
+    auto entry;
+    entry = var_types + vtype_cnt * 16;
+    *(entry + 0) = var_p;
+    *(entry + 8) = idx;
+    vtype_cnt = vtype_cnt + 1;
+    return 0;
+}
+
+// Look up a variable's struct type. Returns struct index or -1.
+get_var_type(var_p) {
+    auto i, entry;
+    i = vtype_cnt - 1;
+    while (i >= 0) {
+        entry = var_types + i * 16;
+        if (packed_eq(*(entry + 0), var_p)) { return *(entry + 8); }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Mark a variable as stack-allocated (declared with var keyword).
+set_var_stack(var_p) {
+    *(var_stack_names + var_stack_cnt * 8) = var_p;
+    var_stack_cnt = var_stack_cnt + 1;
+    return 0;
+}
+
+// Check if a variable is stack-allocated. Returns 1 if yes, 0 otherwise.
+is_var_stack(var_p) {
+    auto i;
+    i = var_stack_cnt - 1;
+    while (i >= 0) {
+        if (packed_eq(*(var_stack_names + i * 8), var_p)) { return 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Register an enum constant: maps a packed name to an integer value.
+add_enum_val(name_p, val) {
+    auto entry;
+    entry = enum_vals + enum_cnt * 16;
+    *(entry + 0) = name_p;
+    *(entry + 8) = val;
+    enum_cnt = enum_cnt + 1;
+    return 0;
+}
+
+// Look up an enum constant by packed name. Returns the value or -1 if not found.
+// Uses a sentinel: stores val+1 so that 0 is distinguishable from "not found".
+find_enum_val(name_p) {
+    auto i, entry;
+    i = enum_cnt - 1;
+    while (i >= 0) {
+        entry = enum_vals + i * 16;
+        if (packed_eq(*(entry + 0), name_p)) { return *(entry + 8); }
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// Parse the current token as a decimal or hex integer literal.
+// Does NOT consume the token — caller must consume() after.
+parse_lit_int() {
+    auto vs, vl, i, ch, val, t;
+    t = peek_type();
+    vs = peek_vstart();
+    vl = peek_vlen();
+    val = 0;
+    if (t == TK_HEX) {
+        // Skip "0x" prefix.
+        i = 2;
+        while (i < vl) {
+            ch = peek(vbuf + vs + i);
+            val = val * 16;
+            if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
+            if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
+            if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
+            i = i + 1;
+        }
+    } else {
+        i = 0;
+        while (i < vl) {
+            ch = peek(vbuf + vs + i);
+            val = val * 10 + ch - 48;
+            i = i + 1;
+        }
+    }
+    return val;
+}
+
+// ============================================================
+// AST helper: integer literal and operator construction
+// ============================================================
+
+// Create a literal AST node holding an integer value.
+make_int_lit(val) {
+    auto start, node, tmp, digit, i, j, t;
+    start = vbuf_pos;
+    if (val == 0) {
+        poke(vbuf + vbuf_pos, 48);
+        vbuf_pos = vbuf_pos + 1;
+    } else {
+        tmp = val;
+        while (tmp > 0) {
+            digit = tmp % 10;
+            poke(vbuf + vbuf_pos, 48 + digit);
+            vbuf_pos = vbuf_pos + 1;
+            tmp = tmp / 10;
+        }
+        // Reverse the digits.
+        i = start;
+        j = vbuf_pos - 1;
+        while (i < j) {
+            t = peek(vbuf + i);
+            poke(vbuf + i, peek(vbuf + j));
+            poke(vbuf + j, t);
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+    node = make_node(T_LIT);
+    *(node + 8) = pack(start, vbuf_pos - start);
+    return node;
+}
+
+// Create a packed string containing a single "+" character.
+make_plus_op() {
+    auto start;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, 43);
+    vbuf_pos = vbuf_pos + 1;
+    return pack(start, 1);
+}
+
+// ============================================================
+// Token access helpers
+// ============================================================
+
+// Return the type code of the current token, or -1 if past end.
+peek_type() {
+    if (tok_pos >= tok_cnt) { return -1; }
+    return *(toks + tok_pos * 24);
+}
+
+// Return the type code of the token at offset from current position.
+peek_type_at(off) {
+    if (tok_pos + off >= tok_cnt) { return -1; }
+    return *(toks + (tok_pos + off) * 24);
+}
+
+// Return the vbuf start offset of the current token's value.
+peek_vstart() { return *(toks + tok_pos * 24 + 8); }
+
+// Return the length of the current token's value.
+peek_vlen() { return *(toks + tok_pos * 24 + 16); }
+
+// Return the current token's value as a packed (start, len) pair.
+cur_packed() { return pack(peek_vstart(), peek_vlen()); }
+
+// Advance past the current token.
+consume() { tok_pos = tok_pos + 1; return 0; }
+
+// Check if the current token's value is a single character c.
+val_is_ch(c) {
+    auto addr;
+    if (tok_pos >= tok_cnt) { return 0; }
+    addr = toks + tok_pos * 24;
+    if (*(addr + 16) != 1) { return 0; }
+    return peek(vbuf + *(addr + 8)) == c;
+}
+
+// Check if the current token's value matches string s of length slen.
+val_is(s, slen) {
+    auto addr, vs, vl;
+    if (tok_pos >= tok_cnt) { return 0; }
+    addr = toks + tok_pos * 24;
+    vs = *(addr + 8);
+    vl = *(addr + 16);
+    if (vl != slen) { return 0; }
+    return buf_eq(vbuf + vs, s, slen);
+}
+
+// Check if the token at offset has a single-character value c.
+val_at_ch(off, c) {
+    auto addr;
+    if (tok_pos + off >= tok_cnt) { return 0; }
+    addr = toks + (tok_pos + off) * 24;
+    if (*(addr + 16) != 1) { return 0; }
+    return peek(vbuf + *(addr + 8)) == c;
+}
+
+// ============================================================
+// Parser: top-level structures
+// ============================================================
+
+// Register a global variable name.
+add_global(p) {
+    globals = arr_push(globals, p);
+    glob_cnt = arr_len(globals);
+    return 0;
+}
+
+// Skip an optional ": TypeName" annotation after a variable name.
+// If present, records the struct type for the variable.
+try_type_annotation(var_p) {
+    auto type_p, idx;
+    if (val_is_ch(':')) {
+        consume();
+        type_p = cur_packed();
+        idx = find_struct(type_p);
+        if (idx >= 0) {
+            set_var_type(var_p, idx);
+        }
+        consume();
+    }
+    return 0;
+}
+
+// Parse a top-level "auto x, y, z;" global declaration.
+parse_global() {
+    auto var_p;
+    consume();
+    var_p = cur_packed();
+    add_global(var_p);
+    consume();
+    try_type_annotation(var_p);
+    while (val_is_ch(';') == 0) {
+        if (val_is_ch(',')) { consume(); }
+        var_p = cur_packed();
+        add_global(var_p);
+        consume();
+        try_type_annotation(var_p);
+    }
+    consume();
+    return 0;
+}
+
+// Parse a bare global identifier followed by optional semicolon.
+parse_global_simple() {
+    add_global(cur_packed());
+    consume();
+    if (val_is_ch(';')) { consume(); }
+    return 0;
+}
+
+// Parse an import block: either a file import or an FFI library import.
+parse_import() {
+    auto lib_p, ret_p, name_p, args_arr, ext;
+    auto tp, ts, tl, pi;
+    consume();
+    // Check if this is a file import (just a string followed by ;).
+    if (peek_type() == TK_STR) {
+        if (val_at_ch(1, ';')) {
+            // File import: skip (handled by the import resolver).
+            consume();
+            consume();
+            return 0;
+        }
+    }
+    // Library import: import "lib" { ... }
+    lib_p = pack(peek_vstart() + 1, peek_vlen() - 2);
+    consume();
+    consume();
+    while (val_is_ch('}') == 0) {
+        // Read the return type. Merge "type" + "*" into "type*".
+        tp = cur_packed();
+        consume();
+        if (val_is_ch('*')) {
+            ts = vbuf_pos;
+            tl = unpack_l(tp);
+            pi = 0;
+            while (pi < tl) {
+                poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
+                vbuf_pos = vbuf_pos + 1;
+                pi = pi + 1;
+            }
+            poke(vbuf + vbuf_pos, 42);
+            vbuf_pos = vbuf_pos + 1;
+            tp = pack(ts, tl + 1);
+            consume();
+        }
+        ret_p = tp;
+        name_p = cur_packed();
+        consume();
+        consume();
+        list_begin();
+        while (val_is_ch(')') == 0) {
+            // Read the argument type. Merge "type" + "*" into "type*".
+            tp = cur_packed();
+            consume();
+            if (val_is_ch('*')) {
+                ts = vbuf_pos;
+                tl = unpack_l(tp);
+                pi = 0;
+                while (pi < tl) {
+                    poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
+                    vbuf_pos = vbuf_pos + 1;
+                    pi = pi + 1;
+                }
+                poke(vbuf + vbuf_pos, 42);
+                vbuf_pos = vbuf_pos + 1;
+                tp = pack(ts, tl + 1);
+                consume();
+            }
+            list_push(tp);
+            if (val_is_ch(',')) { consume(); }
+        }
+        consume();
+        consume();
+        args_arr = list_end();
+        ext = malloc(NODE_SZ);
+        *(ext + 0) = 21;
+        *(ext + 8) = name_p;
+        *(ext + 16) = lib_p;
+        *(ext + 24) = ret_p;
+        *(ext + 32) = args_arr;
+        *(ext + 40) = last_list_cnt;
+        externs = arr_push(externs, ext);
+        ext_cnt = arr_len(externs);
+    }
+    consume();
+    return 0;
+}
+
+// Parse a struct definition: struct Name { field1, field2 }
+parse_struct() {
+    auto name_p, idx;
+    consume();
+    name_p = cur_packed();
+    consume();
+    consume();
+    idx = add_struct_def(name_p);
+    while (val_is_ch('}') == 0) {
+        add_struct_field(idx, cur_packed());
+        consume();
+        // Skip optional type annotation on fields.
+        if (val_is_ch(':')) {
+            consume();
+            consume();
+        }
+        if (val_is_ch(',')) { consume(); }
+    }
+    consume();
+    return 0;
+}
+
+// Parse an enum definition: enum Name { A, B, C = 10, D }
+// Resolves all member names to integer constants at compile time.
+// Members become inline literals — no globals, no runtime cost.
+parse_enum() {
+    auto name_p, val, member_p;
+    consume();
+    // Enum name is optional (for documentation, not used by compiler).
+    name_p = cur_packed();
+    consume();
+    consume();
+    val = 0;
+    while (val_is_ch('}') == 0) {
+        member_p = cur_packed();
+        consume();
+        // Explicit value assignment: MEMBER = N
+        if (val_is_ch('=')) {
+            consume();
+            val = parse_lit_int();
+            consume();
+        }
+        add_enum_val(member_p, val);
+        val = val + 1;
+        if (val_is_ch(',')) { consume(); }
+    }
+    consume();
+    return 0;
+}
+
+// Forward declarations for mutually recursive parse functions.
+parse_statement() { return 0; }
+parse_expr() { return 0; }
+parse_primary() { return 0; }
+parse_unary() { return 0; }
+
+// Parse a function definition: name(params) { body }
+parse_function() {
+    auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p;
+    name_p = cur_packed();
+    consume();
+    consume();
+    list_begin();
+    while (val_is_ch(')') == 0) {
+        var_p = cur_packed();
+        list_push(var_p);
+        consume();
+        try_type_annotation(var_p);
+        if (val_is_ch(',')) { consume(); }
+    }
+    consume();
+    params_arr = list_end();
+    param_cnt = last_list_cnt;
+    consume();
+    list_begin();
+    while (val_is_ch('}') == 0) {
+        list_push(parse_statement());
+    }
+    consume();
+    body_arr = list_end();
+    body_cnt = last_list_cnt;
+    func = malloc(NODE_SZ);
+    *(func + 0) = 22;
+    *(func + 8) = name_p;
+    *(func + 16) = params_arr;
+    *(func + 24) = param_cnt;
+    *(func + 32) = body_arr;
+    *(func + 40) = body_cnt;
+    funcs = arr_push(funcs, func);
+    func_cnt = arr_len(funcs);
+    return 0;
+}
+
+// Top-level parse loop: dispatch imports, globals, structs, and functions.
+parse_program() {
+    while (tok_pos < tok_cnt) {
+        if (peek_type() == TK_IMP) {
+            parse_import();
+        } else if (peek_type() == TK_KW) {
+            if (val_is("auto", 4)) {
+                parse_global();
+            } else if (val_is("struct", 6)) {
+                parse_struct();
+            } else if (val_is("enum", 4)) {
+                parse_enum();
+            } else {
+                consume();
+            }
+        } else if (peek_type() == TK_ID) {
+            if (val_at_ch(1, '(')) {
+                parse_function();
+            } else {
+                parse_global_simple();
+            }
+        } else {
+            consume();
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+// Parser: statements
+// ============================================================
+
+// Parse a brace-enclosed or single-statement body.
+parse_body() {
+    list_begin();
+    if (val_is_ch('{')) {
+        consume();
+        while (val_is_ch('}') == 0) { list_push(parse_statement()); }
+        consume();
+    } else {
+        list_push(parse_statement());
+    }
+    return list_end();
+}
+
+// Parse an if/else statement.
+parse_if() {
+    auto cond, body_arr, body_cnt, else_arr, else_cnt, node;
+    consume();
+    consume();
+    cond = parse_expr();
+    consume();
+    body_arr = parse_body();
+    body_cnt = last_list_cnt;
+    else_arr = 0;
+    else_cnt = 0;
+    if (peek_type() == TK_KW) {
+        if (val_is("else", 4)) {
+            consume();
+            else_arr = parse_body();
+            else_cnt = last_list_cnt;
+        }
+    }
+    node = make_node(T_IF);
+    *(node + 8) = cond;
+    *(node + 16) = body_arr;
+    *(node + 24) = body_cnt;
+    *(node + 32) = else_arr;
+    *(node + 40) = else_cnt;
+    return node;
+}
+
+// Parse a while loop, with optional dispatch hint (@seq, @par, @gpu).
+parse_while(hint_p) {
+    auto cond, body_arr, node;
+    consume();
+    consume();
+    cond = parse_expr();
+    consume();
+    body_arr = parse_body();
+    node = make_node(T_WHILE);
+    *(node + 8) = cond;
+    *(node + 16) = body_arr;
+    *(node + 24) = last_list_cnt;
+    *(node + 32) = hint_p;
+    return node;
+}
+
+// Parse a return statement.
+parse_return() {
+    auto node;
+    consume();
+    node = make_node(T_RET);
+    *(node + 8) = parse_expr();
+    if (val_is_ch(';')) { consume(); }
+    return node;
+}
+
+// Parse a single statement: declaration, if, while, return, or expression.
+parse_statement() {
+    auto node, var_p, hint_p;
+    // Dispatch hint: @seq, @par, @gpu before while.
+    hint_p = 0;
+    if (peek_type() == TK_PUNCT) {
+        if (val_is_ch('@')) {
+            consume();
+            hint_p = cur_packed();
+            consume();
+        }
+    }
+    if (peek_type() == TK_KW) {
+        if (val_is("auto", 4)) {
+            consume();
+            list_begin();
+            var_p = cur_packed();
+            list_push(var_p);
+            consume();
+            try_type_annotation(var_p);
+            while (val_is_ch(';') == 0) {
+                if (val_is_ch(',')) { consume(); }
+                var_p = cur_packed();
+                list_push(var_p);
+                consume();
+                try_type_annotation(var_p);
+            }
+            consume();
+            node = make_node(T_DECL);
+            *(node + 8) = list_end();
+            *(node + 16) = last_list_cnt;
+            return node;
+        }
+        // Stack-allocated struct: var v: Type;
+        // Produces a T_DECL node with c=1 (stack struct flag).
+        if (val_is("var", 3)) {
+            consume();
+            var_p = cur_packed();
+            consume();
+            try_type_annotation(var_p);
+            set_var_stack(var_p);
+            consume();
+            node = make_node(T_DECL);
+            list_begin();
+            list_push(var_p);
+            *(node + 8) = list_end();
+            *(node + 16) = 1;
+            *(node + 24) = 1;
+            return node;
+        }
+        if (val_is("if", 2)) { return parse_if(); }
+        if (val_is("while", 5)) { return parse_while(hint_p); }
+        if (val_is("return", 6)) { return parse_return(); }
+        if (val_is("break", 5)) {
+            consume();
+            if (val_is_ch(';')) { consume(); }
+            return make_node(T_BREAK);
+        }
+    }
+    node = parse_expr();
+    if (val_is_ch(';')) { consume(); }
+    return node;
+}
+
+// ============================================================
+// Parser: expressions with precedence climbing
+// ============================================================
+
+// Return the precedence of the current operator token, or -1 if not an operator.
+get_op_prec() {
+    auto vs, vl, c0, c1;
+    if (peek_type() != TK_OP) { return -1; }
+    vs = peek_vstart();
+    vl = peek_vlen();
+    if (vl == 1) {
+        c0 = peek(vbuf + vs);
+        if (c0 == 124) { return 3; }
+        if (c0 == 94) { return 4; }
+        if (c0 == 38) { return 5; }
+        if (c0 == 60) { return 7; }
+        if (c0 == 62) { return 7; }
+        if (c0 == 43) { return 9; }
+        if (c0 == 45) { return 9; }
+        if (c0 == 42) { return 10; }
+        if (c0 == 47) { return 10; }
+        if (c0 == 37) { return 10; }
+        return -1;
+    }
+    if (vl == 2) {
+        c0 = peek(vbuf + vs);
+        c1 = peek(vbuf + vs + 1);
+        if (c0 == 124) { if (c1 == 124) { return 1; } }
+        if (c0 == 38) { if (c1 == 38) { return 2; } }
+        if (c0 == 61) { if (c1 == 61) { return 6; } }
+        if (c0 == 33) { if (c1 == 61) { return 6; } }
+        if (c0 == 60) { if (c1 == 61) { return 7; } }
+        if (c0 == 62) { if (c1 == 61) { return 7; } }
+        if (c0 == 60) { if (c1 == 60) { return 8; } }
+        if (c0 == 62) { if (c1 == 62) { return 8; } }
+    }
+    return -1;
+}
+
+// Parse binary operators using precedence climbing (Pratt-style).
+parse_binops(left, min_prec) {
+    auto prec, op_p, right, node;
+    while (get_op_prec() >= min_prec) {
+        prec = get_op_prec();
+        op_p = cur_packed();
+        consume();
+        right = parse_unary();
+        while (get_op_prec() > prec) {
+            right = parse_binops(right, get_op_prec());
+        }
+        node = make_node(T_BINOP);
+        *(node + 8) = op_p;
+        *(node + 16) = left;
+        *(node + 24) = right;
+        left = node;
+    }
+    return left;
+}
+
+// Parse a unary expression: dereference (*), negation (-), or primary.
+parse_unary() {
+    auto node, op_p;
+    if (peek_type() == TK_OP) {
+        if (val_is_ch('*')) {
+            consume();
+            node = make_node(T_MEMLD);
+            *(node + 8) = parse_primary();
+            return node;
+        }
+        if (val_is_ch('-')) {
+            op_p = cur_packed();
+            consume();
+            node = make_node(T_UNARY);
+            *(node + 8) = op_p;
+            *(node + 16) = parse_unary();
+            return node;
+        }
+        if (val_is_ch('~')) {
+            op_p = cur_packed();
+            consume();
+            node = make_node(T_UNARY);
+            *(node + 8) = op_p;
+            *(node + 16) = parse_unary();
+            return node;
+        }
+    }
+    return parse_primary();
+}
+
+// Resolve chained .field access on a variable node.
+// Returns a mem_load node with computed offset.
+resolve_dot(base_node, name_p) {
+    auto vtype, field_p, offset, ptr_node, plus_op, off_node;
+    vtype = get_var_type(name_p);
+    while (val_is_ch('.')) {
+        if (vtype < 0) { return base_node; }
+        consume();
+        field_p = cur_packed();
+        consume();
+        offset = get_field_offset(vtype, field_p);
+        // Build: mem_load(ptr: binop(base + offset))
+        plus_op = make_plus_op();
+        off_node = make_int_lit(offset);
+        ptr_node = make_node(T_BINOP);
+        *(ptr_node + 8) = plus_op;
+        *(ptr_node + 16) = base_node;
+        *(ptr_node + 24) = off_node;
+        base_node = make_node(T_MEMLD);
+        *(base_node + 8) = ptr_node;
+        // TODO: update vtype for nested struct fields.
+    }
+    return base_node;
+}
+
+// Parse a full expression: dereference-store, assignment, or binary ops.
+parse_expr() {
+    auto left, deref, node;
+    // Dereference store: *(deref) = val
+    if (peek_type() == TK_OP) {
+        if (val_is_ch('*')) {
+            consume();
+            deref = parse_primary();
+            if (val_is_ch('=')) {
+                consume();
+                node = make_node(T_MEMST);
+                *(node + 8) = deref;
+                *(node + 16) = parse_expr();
+                return node;
+            }
+            left = make_node(T_MEMLD);
+            *(left + 8) = deref;
+            return parse_binops(left, 0);
+        }
+        // Unary minus at expression start.
+        if (val_is_ch('-')) {
+            left = parse_unary();
+            return parse_binops(left, 0);
+        }
+        // Bitwise NOT at expression start.
+        if (val_is_ch('~')) {
+            left = parse_unary();
+            return parse_binops(left, 0);
+        }
+    }
+    left = parse_primary();
+    // Assignment: var = expr or var.field = expr
+    if (val_is_ch('=')) {
+        consume();
+        // If left is a mem_load (from dot access), convert to mem_store.
+        if (*(left + 0) == T_MEMLD) {
+            node = make_node(T_MEMST);
+            *(node + 8) = *(left + 8);
+            *(node + 16) = parse_expr();
+            return node;
+        }
+        node = make_node(T_ASSIGN);
+        *(node + 8) = left;
+        *(node + 16) = parse_expr();
+        return node;
+    }
+    return parse_binops(left, 0);
+}
+
+// Parse a primary expression: literal, variable, call, sizeof, or parenthesized.
+parse_primary() {
+    auto t, node, name_p, args_arr, type_p, sidx;
+    t = peek_type();
+
+    // sizeof(TypeName) — resolve struct size at parse time.
+    if (t == TK_KW) {
+        if (val_is("sizeof", 6)) {
+            consume();
+            consume();
+            type_p = cur_packed();
+            consume();
+            consume();
+            sidx = find_struct(type_p);
+            if (sidx >= 0) {
+                return make_int_lit(get_struct_size(sidx));
+            }
+            return make_int_lit(8);
+        }
+    }
+
+    if (t == TK_NUM | t == TK_HEX | t == TK_STR | t == TK_FLOAT) {
+        node = make_node(T_LIT);
+        *(node + 8) = cur_packed();
+        consume();
+        return node;
+    }
+    if (t == TK_ID) {
+        name_p = cur_packed();
+        consume();
+        if (val_is_ch(40)) {
+            consume();
+            list_begin();
+            while (val_is_ch(')') == 0) {
+                list_push(parse_expr());
+                if (val_is_ch(',')) { consume(); }
+            }
+            consume();
+            args_arr = list_end();
+            node = make_node(T_CALL);
+            *(node + 8) = name_p;
+            *(node + 16) = args_arr;
+            *(node + 24) = last_list_cnt;
+            return node;
+        }
+        // Enum constant: inline as integer literal if found.
+        auto ev;
+        ev = find_enum_val(name_p);
+        if (ev >= 0) {
+            return make_int_lit(ev);
+        }
+        node = make_node(T_VAR);
+        *(node + 8) = name_p;
+        // Handle .field access if this variable has a struct type.
+        if (val_is_ch('.')) {
+            node = resolve_dot(node, name_p);
+        }
+        return node;
+    }
+    if (val_is_ch(40)) {
+        consume();
+        node = parse_expr();
+        consume();
+        return node;
+    }
+    consume();
+    return make_node(T_NOP);
+}

@@ -1,0 +1,122 @@
+// drv_sdl.bsm — SDL2 backend for stb.
+// Implements _stb_* platform functions using SDL2 with texture upload.
+// Import AFTER stbgame.bsm to override the native platform layer.
+//
+// Usage:
+//   import "stbgame.bsm";
+//   import "drv_sdl.bsm";
+
+import "stbbuf.bsm";
+
+import "SDL2" {
+    int  SDL_Init(int);
+    void SDL_Quit();
+    ptr  SDL_CreateWindow(char*, int, int, int, int, int);
+    ptr  SDL_CreateRenderer(ptr, int, int);
+    ptr  SDL_CreateTexture(ptr, int, int, int, int);
+    int  SDL_PollEvent(ptr);
+    int  SDL_UpdateTexture(ptr, ptr, ptr, int);
+    int  SDL_RenderClear(ptr);
+    int  SDL_RenderCopy(ptr, ptr, ptr, ptr);
+    void SDL_RenderPresent(ptr);
+    int  SDL_SetRenderDrawColor(ptr, int, int, int, int);
+    int  SDL_GetRendererOutputSize(ptr, ptr, ptr);
+    long SDL_GetPerformanceCounter();
+    long SDL_GetPerformanceFrequency();
+    void SDL_SetHint(char*, char*);
+    void SDL_Delay(int);
+}
+
+auto _sdl_win, _sdl_ren, _sdl_tex;
+auto _sdl_ev, _sdl_rect, _sdl_ww_buf, _sdl_hh_buf;
+auto _sdl_freq, _sdl_base_time;
+auto _sdl_quit_flag;
+
+// SDL keycode → stb Key enum slot.
+_sdl_map_key(ksym) {
+    if (ksym == 119) { return 5; }
+    if (ksym == 97)  { return 6; }
+    if (ksym == 115) { return 7; }
+    if (ksym == 100) { return 8; }
+    if (ksym == 1073741906) { return 1; }
+    if (ksym == 1073741905) { return 2; }
+    if (ksym == 1073741904) { return 3; }
+    if (ksym == 1073741903) { return 4; }
+    if (ksym == 32)  { return 9; }
+    if (ksym == 13)  { return 10; }
+    if (ksym == 27)  { return 11; }
+    if (ksym == 9)   { return 12; }
+    return 0 - 1;
+}
+
+_stb_init_window(w, h, title) {
+    SDL_Init(32 | 1 | 16384);
+    _sdl_win = SDL_CreateWindow(title, 0x2FFF0000, 0x2FFF0000, w * 3, h * 3, 32 | 8192);
+    _sdl_ren = SDL_CreateRenderer(_sdl_win, 0 - 1, 2 | 4);
+    SDL_SetHint("SDL_RENDER_SCALE_QUALITY", "0");
+    // ARGB8888 = 372645892. Matches stb rgba() format (0xAARRGGBB).
+    _sdl_tex = SDL_CreateTexture(_sdl_ren, 372645892, 1, w, h);
+    _sdl_ev = malloc(64);
+    _sdl_rect = malloc(16);
+    _sdl_ww_buf = malloc(8);
+    _sdl_hh_buf = malloc(8);
+    _sdl_freq = SDL_GetPerformanceFrequency();
+    _sdl_base_time = SDL_GetPerformanceCounter();
+    _sdl_quit_flag = 0;
+    return 0;
+}
+
+_stb_present() {
+    auto ww, hh, sx, sy, k, rw, rh, ox, oy;
+    SDL_UpdateTexture(_sdl_tex, 0, _stb_fb, _stb_w * 4);
+    SDL_GetRendererOutputSize(_sdl_ren, _sdl_ww_buf, _sdl_hh_buf);
+    ww = read_u32(_sdl_ww_buf, 0);
+    hh = read_u32(_sdl_hh_buf, 0);
+    sx = ww / _stb_w; sy = hh / _stb_h;
+    k = sx; if (sy < k) { k = sy; }
+    if (k < 1) { k = 1; }
+    rw = _stb_w * k; rh = _stb_h * k;
+    ox = (ww - rw) / 2; oy = (hh - rh) / 2;
+    write_u32(_sdl_rect, 0, ox);
+    write_u32(_sdl_rect, 4, oy);
+    write_u32(_sdl_rect, 8, rw);
+    write_u32(_sdl_rect, 12, rh);
+    SDL_SetRenderDrawColor(_sdl_ren, 0, 0, 0, 255);
+    SDL_RenderClear(_sdl_ren);
+    SDL_RenderCopy(_sdl_ren, _sdl_tex, 0, _sdl_rect);
+    SDL_RenderPresent(_sdl_ren);
+
+    // Frame rate cap using _stb_frame_ms from stbgame.
+    if (_stb_frame_ms > 16) { SDL_Delay(_stb_frame_ms - 2); }
+    return 0;
+}
+
+_stb_poll_events() {
+    auto etype, ksym, slot;
+    while (SDL_PollEvent(_sdl_ev)) {
+        etype = read_u32(_sdl_ev, 0);
+        if (etype == 256) { _sdl_quit_flag = 1; }
+        if (etype == 768) {
+            ksym = read_u32(_sdl_ev, 20);
+            slot = _sdl_map_key(ksym);
+            if (slot >= 0) { poke(_stb_keys + slot, 1); }
+        }
+        if (etype == 769) {
+            ksym = read_u32(_sdl_ev, 20);
+            slot = _sdl_map_key(ksym);
+            if (slot >= 0) { poke(_stb_keys + slot, 0); }
+        }
+    }
+    return 0;
+}
+
+_stb_get_time() {
+    auto now, ticks;
+    now = SDL_GetPerformanceCounter();
+    ticks = now - _sdl_base_time;
+    return ticks * 1000 / _sdl_freq;
+}
+
+_stb_should_close() {
+    return _sdl_quit_flag;
+}

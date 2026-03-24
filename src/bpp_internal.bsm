@@ -1,0 +1,126 @@
+// bpp_internal.bsm — Shared utilities for the unified B++ compiler.
+// Contains string helpers, AST node creation, and list builder used
+// by multiple compiler stages. Imported before any stage module.
+
+// ── List builder state ─────────────────────────────────────
+// Stack-based list builder for building arrays of AST nodes,
+// parameter lists, and other variable-length sequences.
+
+auto tmp_arr, list_stack, list_sp, list_depth, last_list_cnt;
+
+// ── Initialization ─────────────────────────────────────────
+
+// Allocate shared utility buffers. Call once at startup.
+init_internal() {
+    tmp_arr = malloc(16384);
+    list_stack = malloc(512);
+    list_sp = 0;
+    list_depth = 0;
+    last_list_cnt = 0;
+    return 0;
+}
+
+// ── String helpers ─────────────────────────────────────────
+
+// Print a null-terminated string to stdout. Works with both
+// real pointers (string literals) and mem_base offsets.
+out(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        putchar(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// Compare len bytes at memory address a with string b (may be a literal).
+// Returns 1 if all bytes match, 0 otherwise.
+buf_eq(a, b, len) {
+    auto i;
+    i = 0;
+    while (i < len) {
+        if (peek(a + i) != str_peek(b, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Print len bytes from memory starting at the given address.
+print_buf(start, len) {
+    auto i;
+    i = 0;
+    while (i < len) {
+        putchar(peek(start + i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Compare two packed string references by content (not offset).
+// Returns 1 if they represent the same text, 0 otherwise.
+packed_eq(a, b) {
+    auto al, bl, i;
+    al = unpack_l(a);
+    bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    i = 0;
+    while (i < al) {
+        if (peek(vbuf + unpack_s(a) + i) != peek(vbuf + unpack_s(b) + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── AST node creation ──────────────────────────────────────
+
+// Allocate a new AST node of the given type. All fields are zeroed.
+make_node(type) {
+    auto nd: Node;
+    nd = malloc(sizeof(Node));
+    nd.ntype = type;
+    nd.a = 0; nd.b = 0; nd.c = 0;
+    nd.d = 0; nd.e = 0;
+    nd.dispatch = 0; nd.itype = 0;
+    return nd;
+}
+
+// ── List builder ───────────────────────────────────────────
+// Stack-based builder for creating arrays of pointers/values.
+// Supports nesting: begin/push/end can be called recursively
+// (e.g., parsing function arguments inside an if-condition).
+
+// Start a new list. Saves the current stack position.
+list_begin() {
+    *(list_stack + list_depth * 8) = list_sp;
+    list_depth = list_depth + 1;
+    return 0;
+}
+
+// Append a value to the current list.
+list_push(val) {
+    *(tmp_arr + list_sp * 8) = val;
+    list_sp = list_sp + 1;
+    return 0;
+}
+
+// Finalize the current list. Returns a freshly allocated array
+// containing all pushed values. Sets last_list_cnt to the count.
+list_end() {
+    auto saved, cnt, arr, i;
+    list_depth = list_depth - 1;
+    saved = *(list_stack + list_depth * 8);
+    cnt = list_sp - saved;
+    if (cnt == 0) { last_list_cnt = 0; list_sp = saved; return 0; }
+    arr = malloc(cnt * 8);
+    i = 0;
+    while (i < cnt) {
+        *(arr + i * 8) = *(tmp_arr + (saved + i) * 8);
+        i = i + 1;
+    }
+    list_sp = saved;
+    last_list_cnt = cnt;
+    return arr;
+}
