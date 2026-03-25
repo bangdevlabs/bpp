@@ -2,28 +2,34 @@
 // Single process: source file → merged source → tokens → AST → types → dispatch → output.
 // No JSON between stages. All data stays in memory.
 //
-// Usage: ./bpp source.bpp > output.c          (C backend, default)
-//        ./bpp --asm source.bpp > output.s    (ARM64 assembly backend)
-//        ./bpp --bin source.bpp               (native Mach-O ARM64 binary → a.out)
+// Usage: ./bpp source.bpp > output.c              (C backend)
+//        ./bpp --asm source.bpp > output.s        (ARM64 assembly backend)
+//        ./bpp source.bpp -o out                   (native Mach-O ARM64 binary, default)
+//        ./bpp --linux64 source.bpp -o out         (cross-compile to Linux x86_64 ELF)
 
 import "defs.bsm";
 import "stbarray.bsm";
 import "bpp_internal.bsm";
+import "bpp_diag.bsm";
 import "bpp_import.bsm";
 import "bpp_parser.bsm";
 import "bpp_lexer.bsm";
 import "bpp_types.bsm";
 import "bpp_dispatch.bsm";
+import "bpp_validate.bsm";
 import "bpp_emitter.bsm";
 import "bpp_enc_arm64.bsm";
 import "bpp_codegen_arm64.bsm";
 import "bpp_macho.bsm";
+import "bpp_enc_x86_64.bsm";
+import "bpp_codegen_x86_64.bsm";
+import "bpp_elf.bsm";
 
 main() {
     auto arg_len, arg_ptr, mode, c0, c1, out_name, argi, nargs;
-    auto main_fi, main_lbl, i, fp, fs, fl;
+    auto main_fi, main_lbl, start_lbl, i, fp, fs, fl;
 
-    // mode: 0 = C, 1 = ARM64 assembly, 2 = native Mach-O binary (default).
+    // mode: 0 = C, 1 = ARM64 assembly, 2 = native Mach-O binary (default), 3 = Linux x86_64 ELF.
     mode = 2;
     out_name = 0;
 
@@ -31,6 +37,7 @@ main() {
     init_array();
     init_defs();
     init_internal();
+    init_diag();
     init_import();
     init_parser();
     init_lexer();
@@ -40,6 +47,9 @@ main() {
     init_enc_arm64();
     init_codegen_arm64();
     init_macho();
+    init_x64_enc();
+    init_codegen_x86_64();
+    init_elf();
 
     // Parse command-line arguments.
     // Supported flags: --asm, --bin, -o <name>
@@ -72,6 +82,12 @@ main() {
                 if (str_peek(a, 2) == 'c') {
                     mode = 0;
                 }
+                // --linux64 (cross-compile to Linux x86_64 ELF)
+                if (str_peek(a, 2) == 'l') {
+                    if (str_peek(a, 3) == 'i') {
+                        if (str_peek(a, 4) == 'n') { mode = 3; }
+                    }
+                }
             }
             if (c1 == 'o') {
                 // -o <name>: next argument is the output filename.
@@ -83,6 +99,14 @@ main() {
             arg_ptr = a;
         }
         argi = argi + 1;
+    }
+
+    // Set import target based on compilation mode.
+    if (mode == 3) {
+        poke(_imp_target + 0, 'l'); poke(_imp_target + 1, 'i');
+        poke(_imp_target + 2, 'n'); poke(_imp_target + 3, 'u');
+        poke(_imp_target + 4, 'x');
+        _imp_target_len = 5;
     }
 
     // 1. Import: resolve files, build merged source in outbuf.
@@ -103,7 +127,10 @@ main() {
     // 5. Dispatch: annotate loop dispatch fields.
     run_dispatch();
 
-    // 6. Emit output based on selected backend.
+    // 6. Validate: check IR consistency before codegen.
+    run_validate();
+
+    // 7. Emit output based on selected backend.
     if (mode == 2) {
         // Native binary mode: ARM64 binary codegen + Mach-O writer.
         a64_bin_mode = 1;
@@ -164,13 +191,64 @@ main() {
             poke(pathbuf + 5, 0);
         }
         write_macho(pathbuf, main_lbl, a64_gl_name, a64_gl_cnt);
-    } else {
-        if (mode == 1) {
-            emit_all_arm64();
-        } else {
-            emit_all();
+    }
+    if (mode == 3) {
+        // Linux x86_64 cross-compilation: x86_64 codegen + ELF writer.
+        start_lbl = emit_all_x86_64();
+
+        // Prepare string literal data for the ELF writer.
+        elf_sdata_cnt = x64_str_cnt;
+        elf_sdata_size = 0;
+        i = 0;
+        while (i < x64_str_cnt) {
+            fp = *(x64_str_tbl + i * 8);
+            fs = unpack_s(fp);
+            fl = unpack_l(fp);
+            *(elf_sdata_off + i * 8) = elf_sdata_size;
+            auto sj;
+            sj = 0;
+            while (sj < fl) {
+                poke(elf_sdata + elf_sdata_size, peek(x64_sbuf + fs + sj));
+                elf_sdata_size = elf_sdata_size + 1;
+                sj = sj + 1;
+            }
+            poke(elf_sdata + elf_sdata_size, 0);
+            elf_sdata_size = elf_sdata_size + 1;
+            i = i + 1;
         }
+
+        // Prepare float literal IEEE 754 data using mo_atof (shared with Mach-O writer).
+        elf_flt_cnt = x64_flt_cnt;
+        i = 0;
+        while (i < x64_flt_cnt) {
+            fp = *(x64_flt_tbl + i * 8);
+            fs = unpack_s(fp);
+            *(elf_flt_data + i * 8) = mo_atof(x64_sbuf + fs);
+            i = i + 1;
+        }
+
+        if (out_name != 0) {
+            auto ol;
+            ol = copy_cstr(pathbuf, out_name);
+            poke(pathbuf + ol, 0);
+        } else {
+            poke(pathbuf, 'a');
+            poke(pathbuf + 1, '.');
+            poke(pathbuf + 2, 'o');
+            poke(pathbuf + 3, 'u');
+            poke(pathbuf + 4, 't');
+            poke(pathbuf + 5, 0);
+        }
+
+        write_elf(pathbuf, start_lbl, x64_gl_name, x64_gl_cnt);
+    }
+    if (mode == 1) {
+        emit_all_arm64();
+    }
+    if (mode == 0) {
+        emit_all();
     }
 
+    diag_summary();
     return 0;
 }

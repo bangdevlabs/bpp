@@ -1,0 +1,158 @@
+// bpp_validate.bsm — Semantic validation pass for the B++ compiler.
+// Runs after parsing and type inference, before any codegen.
+// Checks that the IR is complete and consistent: every function call has
+// a target, every struct annotation refers to a known type, etc.
+// All errors are platform-agnostic — this module knows nothing about
+// ARM64, x86, WASM, or any OS. When validate passes, any backend can
+// trust the IR blindly.
+
+// Check if a name is a language builtin (malloc, putchar, sys_write, etc.).
+// Returns 1 if recognized, 0 otherwise.
+val_is_builtin(name_p) {
+    if (buf_eq(vbuf + unpack_s(name_p), "malloc", unpack_l(name_p))) { if (unpack_l(name_p) == 6) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "free", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "realloc", unpack_l(name_p))) { if (unpack_l(name_p) == 7) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "peek", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "poke", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "putchar", unpack_l(name_p))) { if (unpack_l(name_p) == 7) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "getchar", unpack_l(name_p))) { if (unpack_l(name_p) == 7) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "str_peek", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "argc_get", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "argv_get", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", unpack_l(name_p))) { if (unpack_l(name_p) == 6) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "call", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_write", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_read", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_open", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_close", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_fork", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_execve", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_waitpid", unpack_l(name_p))) { if (unpack_l(name_p) == 11) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_exit", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_ioctl", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_nanosleep", unpack_l(name_p))) { if (unpack_l(name_p) == 13) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_clock_gettime", unpack_l(name_p))) { if (unpack_l(name_p) == 17) { return 1; } }
+    return 0;
+}
+
+// Check if a name exists in the parsed function table.
+val_find_func(name_p) {
+    auto i, rec;
+    i = 0;
+    while (i < func_cnt) {
+        rec = *(funcs + i * 8);
+        if (packed_eq(*(rec + 8), name_p)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Check if a name exists in the extern table (any overload).
+val_find_extern(name_p) {
+    auto i, rec;
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        if (packed_eq(*(rec + 8), name_p)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Forward declaration for mutual recursion.
+val_check_node(nd) { return 0; }
+
+// Walk a statement list and validate each node.
+val_check_list(arr, cnt) {
+    auto i;
+    i = 0;
+    while (i < cnt) {
+        val_check_node(*(arr + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Recursively validate an AST node. Reports errors via diag_fatal + sys_exit.
+val_check_node(nd) {
+    auto n: Node, t, name_p;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+
+    // E201: function call to undefined target.
+    if (t == T_CALL) {
+        name_p = n.a;
+        if (val_is_builtin(name_p) == 0) {
+            if (val_find_func(name_p) < 0) {
+                if (val_find_extern(name_p) < 0) {
+                    diag_fatal(201);
+                    diag_str("function '");
+                    diag_packed(name_p);
+                    diag_str("' called but never defined -- missing import?");
+                    diag_newline();
+                    sys_exit(1);
+                }
+            }
+        }
+        // Also validate arguments recursively.
+        val_check_list(n.b, n.c);
+        return 0;
+    }
+
+    // Recurse into sub-expressions and statements.
+    if (t == T_ASSIGN) {
+        val_check_node(n.a);
+        val_check_node(n.b);
+        return 0;
+    }
+    if (t == T_BINOP) {
+        val_check_node(n.b);
+        val_check_node(n.c);
+        return 0;
+    }
+    if (t == T_UNARY) {
+        val_check_node(n.b);
+        return 0;
+    }
+    if (t == T_RET) {
+        val_check_node(n.a);
+        return 0;
+    }
+    if (t == T_IF) {
+        val_check_node(n.a);
+        val_check_list(n.b, n.c);
+        if (n.e > 0) { val_check_list(n.d, n.e); }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        val_check_node(n.a);
+        val_check_list(n.b, n.c);
+        return 0;
+    }
+    if (t == T_MEMLD) {
+        val_check_node(n.a);
+        return 0;
+    }
+    if (t == T_MEMST) {
+        val_check_node(n.a);
+        val_check_node(n.b);
+        return 0;
+    }
+    return 0;
+}
+
+// Run semantic validation on all parsed functions.
+// Call after run_types() and run_dispatch(), before any codegen.
+run_validate() {
+    auto i, rec, body_arr, body_cnt;
+    i = 0;
+    while (i < func_cnt) {
+        rec = *(funcs + i * 8);
+        body_arr = *(rec + 32);
+        body_cnt = *(rec + 40);
+        val_check_list(body_arr, body_cnt);
+        i = i + 1;
+    }
+    return 0;
+}

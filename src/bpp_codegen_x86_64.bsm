@@ -1,0 +1,1272 @@
+// bpp_codegen_x86_64.bsm — x86_64 code generator for the B++ compiler.
+// Reads AST data from the parser's in-memory structures.
+// Emits x86_64 binary code via bpp_x64_enc_x86_64.bsm for Linux targets.
+//
+// Binary-only mode: no assembly text output. Cross-compiles from macOS ARM64.
+// Register convention:
+//   RAX (0)  — accumulator (expression result, also div quotient)
+//   RCX (1)  — secondary operand, shift count (CL), div/temp
+//   RDX (2)  — div remainder, syscall arg3
+//   RBP (5)  — frame pointer
+//   RSP (4)  — stack pointer
+//   R10 (10) — scratch for data addressing
+//   R11 (11) — scratch for indirect calls
+//
+// Linux x86_64 syscall convention:
+//   RAX = syscall number, args in RDI, RSI, RDX, R10, R8, R9.
+//   Return value in RAX. Clobbers RCX and R11.
+//
+// System V AMD64 calling convention (B++ function calls):
+//   Args in RDI, RSI, RDX, RCX, R8, R9. Return in RAX.
+
+// ── Emitter-owned globals ──────────────────────────────────
+
+auto x64_sbuf;
+
+// Function table (parallel arrays, deduplicated from parser).
+auto x64_fn_name, x64_fn_par, x64_fn_pcnt, x64_fn_body, x64_fn_bcnt, x64_fn_cnt, x64_fn_fidx;
+
+// Global variable list.
+auto x64_gl_name, x64_gl_cnt;
+
+// FFI extern table (for future dynamic linking support).
+auto x64_ex_name, x64_ex_ret, x64_ex_args, x64_ex_acnt, x64_ex_cnt;
+
+// Current function's variable scope.
+auto x64_vars, x64_var_cnt;
+
+// Stack struct tracking.
+auto x64_var_stack, x64_var_struct_idx, x64_var_off;
+
+// Float literal table.
+auto x64_flt_tbl, x64_flt_cnt;
+
+// String literal table.
+auto x64_str_tbl, x64_str_cnt;
+
+// Label counter and evaluation stack depth.
+auto x64_lbl_cnt, x64_depth;
+
+// Break label stack for while loops.
+auto x64_break_stack, x64_break_top;
+
+// Current function context.
+auto x64_cur_fn_name, x64_cur_fn_idx;
+
+// Function entry labels and current return label.
+auto x64_fn_lbl, x64_ret_lbl;
+
+// Sentinel packed names for hidden argc/argv globals.
+auto x64_argc_sym, x64_argv_sym;
+
+// ── Initialization ─────────────────────────────────────────
+
+init_codegen_x86_64() {
+    x64_fn_name = malloc(65536); x64_fn_par = malloc(65536);
+    x64_fn_pcnt = malloc(65536); x64_fn_body = malloc(65536);
+    x64_fn_bcnt = malloc(65536); x64_fn_fidx = malloc(65536); x64_fn_cnt = 0;
+    x64_gl_name = malloc(65536); x64_gl_cnt = 0;
+    x64_ex_name = malloc(8192); x64_ex_ret = malloc(8192);
+    x64_ex_args = malloc(8192); x64_ex_acnt = malloc(8192); x64_ex_cnt = 0;
+    x64_vars = malloc(65536); x64_var_cnt = 0;
+    x64_var_stack = malloc(65536);
+    x64_var_struct_idx = malloc(65536);
+    x64_var_off = malloc(65536);
+    x64_flt_tbl = malloc(65536); x64_flt_cnt = 0;
+    x64_str_tbl = malloc(65536); x64_str_cnt = 0;
+    x64_lbl_cnt = 0; x64_depth = 0;
+    x64_break_stack = malloc(256 * 8); x64_break_top = 0;
+    x64_fn_lbl = malloc(65536);
+    x64_ret_lbl = 0;
+    x64_argc_sym = 0 - 1;
+    x64_argv_sym = 0 - 2;
+    return 0;
+}
+
+// ── Bridge: copy parser data into emitter parallel arrays ──
+
+bridge_data_x86_64() {
+    auto i, rec, name_p, idx, j;
+    x64_sbuf = vbuf;
+
+    // Copy functions, handling forward declarations.
+    x64_fn_cnt = 0;
+    i = 0;
+    while (i < func_cnt) {
+        rec = *(funcs + i * 8);
+        name_p = *(rec + 8);
+        idx = -1;
+        j = 0;
+        while (j < x64_fn_cnt) {
+            if (x64_str_eq_packed(name_p, *(x64_fn_name + j * 8))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) { idx = x64_fn_cnt; x64_fn_cnt = x64_fn_cnt + 1; }
+        *(x64_fn_name + idx * 8) = name_p;
+        *(x64_fn_par  + idx * 8) = *(rec + 16);
+        *(x64_fn_pcnt + idx * 8) = *(rec + 24);
+        *(x64_fn_body + idx * 8) = *(rec + 32);
+        *(x64_fn_bcnt + idx * 8) = *(rec + 40);
+        *(x64_fn_fidx + idx * 8) = i;
+        i = i + 1;
+    }
+
+    // Copy globals, deduplicating.
+    x64_gl_cnt = 0;
+    i = 0;
+    while (i < glob_cnt) {
+        name_p = *(globals + i * 8);
+        idx = -1;
+        j = 0;
+        while (j < x64_gl_cnt) {
+            if (x64_str_eq_packed(name_p, *(x64_gl_name + j * 8))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            *(x64_gl_name + x64_gl_cnt * 8) = name_p;
+            x64_gl_cnt = x64_gl_cnt + 1;
+        }
+        i = i + 1;
+    }
+
+    // Copy externs.
+    x64_ex_cnt = 0;
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        *(x64_ex_name + i * 8) = *(rec + 8);
+        *(x64_ex_ret  + i * 8) = *(rec + 24);
+        *(x64_ex_args + i * 8) = *(rec + 32);
+        *(x64_ex_acnt + i * 8) = *(rec + 40);
+        i = i + 1;
+    }
+    x64_ex_cnt = ext_cnt;
+    return 0;
+}
+
+// ── String utilities ───────────────────────────────────────
+
+x64_str_eq(p, lit, litlen) {
+    if (unpack_l(p) != litlen) { return 0; }
+    return buf_eq(x64_sbuf + unpack_s(p), lit, litlen);
+}
+
+x64_str_eq_packed(a, b) {
+    auto as, al, bs, bl, i;
+    al = unpack_l(a); bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    as = unpack_s(a); bs = unpack_s(b);
+    i = 0;
+    while (i < al) {
+        if (peek(x64_sbuf + as + i) != peek(x64_sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── Variable tracking ──────────────────────────────────────
+
+x64_var_add(name_p) {
+    auto idx; idx = x64_var_cnt;
+    *(x64_vars + idx * 8) = name_p;
+    x64_var_cnt = x64_var_cnt + 1;
+    return idx;
+}
+
+x64_var_idx(name_p) {
+    auto i; i = 0;
+    while (i < x64_var_cnt) {
+        if (x64_str_eq_packed(name_p, *(x64_vars + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+x64_var_find(name_p) {
+    auto i;
+    i = x64_var_idx(name_p);
+    if (i >= 0) { return *(x64_var_off + i * 8); }
+    return -1;
+}
+
+// Walk a function body and register all declared variables.
+x64_pre_reg_vars(arr, cnt) {
+    auto i, j;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) {
+            if (n.ntype == T_DECL) {
+                j = 0;
+                while (j < n.b) {
+                    auto vi;
+                    vi = x64_var_add(*(n.a + j * 8));
+                    if (n.c == 1) {
+                        *(x64_var_stack + vi * 8) = 1;
+                        *(x64_var_struct_idx + vi * 8) = get_var_type(*(n.a + j * 8));
+                    }
+                    j = j + 1;
+                }
+            }
+            if (n.ntype == T_IF) {
+                x64_pre_reg_vars(n.b, n.c);
+                if (n.e > 0) { x64_pre_reg_vars(n.d, n.e); }
+            }
+            if (n.ntype == T_WHILE) { x64_pre_reg_vars(n.b, n.c); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Literal helpers ────────────────────────────────────────
+
+x64_parse_int(p) {
+    auto s, l, i, ch, val;
+    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
+    if (l > 2) {
+        if (peek(x64_sbuf + s) == '0') {
+            if (peek(x64_sbuf + s + 1) == 'x' | peek(x64_sbuf + s + 1) == 'X') {
+                i = 2;
+                while (i < l) {
+                    ch = peek(x64_sbuf + s + i); val = val * 16;
+                    if (ch >= '0') { if (ch <= '9') { val = val + ch - '0'; } }
+                    if (ch >= 'A') { if (ch <= 'F') { val = val + ch - 55; } }
+                    if (ch >= 'a') { if (ch <= 'f') { val = val + ch - 87; } }
+                    i = i + 1;
+                }
+                return val;
+            }
+        }
+    }
+    while (i < l) { ch = peek(x64_sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
+    return val;
+}
+
+x64_is_float_lit(p) {
+    auto s, l, i;
+    s = unpack_s(p); l = unpack_l(p);
+    i = 0;
+    while (i < l) {
+        if (peek(x64_sbuf + s + i) == '.') { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Type query helpers ─────────────────────────────────────
+
+x64_var_is_float(vi) {
+    return get_fn_var_type(x64_cur_fn_idx, *(x64_vars + vi * 8)) == TY_FLOAT;
+}
+
+x64_find_fn(name_p) {
+    auto i;
+    i = 0;
+    while (i < x64_fn_cnt) {
+        if (x64_str_eq_packed(name_p, *(x64_fn_name + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+x64_find_ext(name_p) {
+    auto i;
+    i = 0;
+    while (i < x64_ex_cnt) {
+        if (x64_str_eq_packed(name_p, *(x64_ex_name + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+x64_find_ext_by_argc(name_p, argc) {
+    auto i;
+    i = 0;
+    while (i < x64_ex_cnt) {
+        if (x64_str_eq_packed(name_p, *(x64_ex_name + i * 8))) {
+            if (*(x64_ex_acnt + i * 8) == argc) { return i; }
+        }
+        i = i + 1;
+    }
+    return x64_find_ext(name_p);
+}
+
+// Return the System V ABI register for argument position i (0-based).
+// RDI=7, RSI=6, RDX=2, RCX=1, R8=8, R9=9.
+x64_arg_reg(i) {
+    if (i == 0) { return 7; }
+    if (i == 1) { return 6; }
+    if (i == 2) { return 2; }
+    if (i == 3) { return 1; }
+    if (i == 4) { return 8; }
+    if (i == 5) { return 9; }
+    return 0;
+}
+
+// ── Emission primitives ────────────────────────────────────
+
+// Push RAX onto the stack.
+x64_emit_push() {
+    x64_enc_push(0);
+    x64_depth = x64_depth + 1;
+    return 0;
+}
+
+// Pop from the stack into a general-purpose register.
+x64_emit_pop(r) {
+    x64_enc_pop(r);
+    x64_depth = x64_depth - 1;
+    return 0;
+}
+
+// Push XMM0 onto the stack (as 8-byte IEEE 754 bits).
+x64_emit_fpush() {
+    x64_enc_sub_imm(4, 8);
+    x64_enc_store_sd(0, 4, 0);
+    x64_depth = x64_depth + 1;
+    return 0;
+}
+
+// Pop from the stack into an XMM register.
+x64_emit_fpop(xr) {
+    x64_enc_load_sd(xr, 4, 0);
+    x64_enc_add_imm(4, 8);
+    x64_depth = x64_depth - 1;
+    return 0;
+}
+
+// Align the stack to 16 bytes before a CALL if needed.
+// Returns 1 if padding was added, 0 otherwise.
+x64_align_call() {
+    if (x64_depth % 2 != 0) {
+        x64_enc_sub_imm(4, 8);
+        return 1;
+    }
+    return 0;
+}
+
+// Remove alignment padding after a CALL.
+x64_unalign_call(padded) {
+    if (padded) { x64_enc_add_imm(4, 8); }
+    return 0;
+}
+
+// ── Expression emission ────────────────────────────────────
+// Returns 0 if result is integer (in RAX), 1 if float (in XMM0).
+
+x64_emit_node(n) { return 0; }
+
+x64_emit_node(nd) {
+    auto n: Node;
+    auto t, op_s, op_l, c0, c1, arr, cnt, i, off, lbl, lbl2, vi, lty, rty;
+    auto lit_s, lit_l, sid, str_p, fid, use_flt, is_io, uty, ety, fidx_c, fi, fn_name, par_flt: Node;
+    auto padded;
+    if (nd == 0) { x64_enc_xor_zero(0); return 0; }
+    n = nd; t = n.ntype;
+
+    // ── Integer/string/float literal ──
+    if (t == T_LIT) {
+        lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
+        // String literal.
+        if (peek(x64_sbuf + lit_s) == '"') {
+            sid = x64_str_cnt;
+            str_p = pack(lit_s + 1, lit_l - 2);
+            *(x64_str_tbl + sid * 8) = str_p;
+            x64_str_cnt = x64_str_cnt + 1;
+            // LEA RAX, [RIP + string_addr]. Relocation type 1 (string).
+            auto dpos;
+            dpos = x64_enc_lea_rip(0);
+            x64_enc_add_reloc(dpos, sid, 1);
+            return 0;
+        }
+        // Float literal.
+        if (x64_is_float_lit(n.a) == 1) {
+            fid = x64_flt_cnt;
+            *(x64_flt_tbl + fid * 8) = n.a;
+            x64_flt_cnt = x64_flt_cnt + 1;
+            // MOVSD XMM0, [RIP + float_addr]. Relocation type 2 (float).
+            auto dpos;
+            dpos = x64_enc_load_sd_rip(0);
+            x64_enc_add_reloc(dpos, fid, 2);
+            return 1;
+        }
+        // Integer literal.
+        x64_enc_mov_wide(0, x64_parse_int(n.a));
+        return 0;
+    }
+
+    // ── Variable reference ──
+    if (t == T_VAR) {
+        vi = x64_var_idx(n.a);
+        if (vi >= 0) {
+            off = *(x64_var_off + vi * 8);
+            // Stack struct: return address of the struct on the stack.
+            if (*(x64_var_stack + vi * 8)) {
+                x64_enc_lea(0, 5, off);
+                return 0;
+            }
+            // Float variable.
+            if (x64_var_is_float(vi)) {
+                x64_enc_load_sd(0, 5, off);
+                return 1;
+            }
+            // Integer variable.
+            x64_enc_load(0, 5, off);
+            return 0;
+        }
+        // Global variable.
+        if (ty_get_global_type(n.a) == TY_FLOAT) {
+            auto dpos;
+            dpos = x64_enc_lea_rip(10);
+            x64_enc_add_reloc(dpos, n.a, 0);
+            x64_enc_load_sd(0, 10, 0);
+            return 1;
+        }
+        auto dpos;
+        dpos = x64_enc_lea_rip(10);
+        x64_enc_add_reloc(dpos, n.a, 0);
+        x64_enc_load(0, 10, 0);
+        return 0;
+    }
+
+    // ── Binary operation ──
+    if (t == T_BINOP) {
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        c0 = peek(x64_sbuf + op_s);
+        c1 = 0; if (op_l > 1) { c1 = peek(x64_sbuf + op_s + 1); }
+
+        // Check if operator is integer-only.
+        is_io = 0;
+        if (c0 == '%') { is_io = 1; }
+        if (c0 == '^') { is_io = 1; }
+        if (c0 == '&') { if (op_l == 1) { is_io = 1; } }
+        if (c0 == '|') { if (op_l == 1) { is_io = 1; } }
+        if (c0 == '<') { if (c1 == '<') { is_io = 1; } }
+        if (c0 == '>') { if (c1 == '>') { is_io = 1; } }
+
+        // Evaluate left, push.
+        lty = x64_emit_node(n.b);
+        if (lty == 1) { x64_emit_fpush(); } else { x64_emit_push(); }
+
+        // Evaluate right.
+        rty = x64_emit_node(n.c);
+
+        // Determine float path.
+        use_flt = 0;
+        if (is_io == 0) { if (lty == 1 | rty == 1) { use_flt = 1; } }
+
+        if (use_flt == 1) {
+            // Ensure right in XMM0.
+            if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
+            // Pop left into XMM1.
+            if (lty == 1) { x64_emit_fpop(1); }
+            else {
+                x64_emit_pop(0);
+                x64_enc_cvtsi2sd(1, 0);
+            }
+            // XMM1 = left, XMM0 = right.
+
+            // Float arithmetic. XMM1 = left, XMM0 = right.
+            if (c0 == '+') { if (op_l == 1) { x64_enc_addsd(0, 1); return 1; } }
+            if (c0 == '-') { if (op_l == 1) {
+                // XMM0 = left - right: SUBSD XMM1,XMM0 -> XMM1=left-right, MOVSD XMM0,XMM1.
+                x64_enc_subsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; } }
+            if (c0 == '*') { if (op_l == 1) { x64_enc_mulsd(0, 1); return 1; } }
+            if (c0 == '/') { if (op_l == 1) {
+                x64_enc_divsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; } }
+
+            // Float comparisons — result is integer in RAX.
+            // UCOMISD XMM1, XMM0 compares left vs right.
+            if (c0 == '=') { if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; } }
+            if (c0 == '!') { if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; } }
+            if (c0 == '<') {
+                if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_BE, 0); x64_enc_movzx8(0, 0); return 0; }
+                if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_B, 0); x64_enc_movzx8(0, 0); return 0; }
+            }
+            if (c0 == '>') {
+                if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_AE, 0); x64_enc_movzx8(0, 0); return 0; }
+                if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_A, 0); x64_enc_movzx8(0, 0); return 0; }
+            }
+
+            // Float logical && ||: compare each side against zero.
+            if (c0 == '&') { if (c1 == '&') {
+                x64_enc_xorpd(2, 2);
+                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
+                x64_enc_ucomisd(0, 2); // Wait, XMM0 is the right operand. Let me restructure.
+                // Actually XMM0 = right, XMM1 = left, XMM2 = 0.0.
+                // Test left != 0: UCOMISD XMM1, XMM2.
+                // Test right != 0: UCOMISD XMM0, XMM2.
+                // Combine with AND.
+                x64_enc_xorpd(2, 2);
+                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 10); x64_enc_movzx8(10, 10);
+                x64_enc_ucomisd(0, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
+                x64_enc_and_reg(0, 10);
+                return 0;
+            } }
+            if (c0 == '|') { if (c1 == '|') {
+                x64_enc_xorpd(2, 2);
+                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 10); x64_enc_movzx8(10, 10);
+                x64_enc_ucomisd(0, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
+                x64_enc_or_reg(0, 10);
+                return 0;
+            } }
+            return 1;
+        }
+
+        // Integer path. Convert float operands to int if needed.
+        if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+        // Save right to RCX, pop left to RAX.
+        if (lty == 1) {
+            x64_enc_mov_reg(1, 0);
+            x64_emit_fpop(0);
+            x64_enc_cvttsd2si(0, 0);
+        } else {
+            x64_enc_mov_reg(1, 0);
+            x64_emit_pop(0);
+        }
+        // RAX = left, RCX = right.
+
+        if (c0 == '+') { if (op_l == 1) { x64_enc_add_reg(0, 1); return 0; } }
+        if (c0 == '-') { if (op_l == 1) { x64_enc_sub_reg(0, 1); return 0; } }
+        if (c0 == '*') { if (op_l == 1) { x64_enc_imul(0, 1); return 0; } }
+        if (c0 == '/') { if (op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); return 0; } }
+        if (c0 == '%') { if (op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); x64_enc_mov_reg(0, 2); return 0; } }
+
+        // Bitwise operators.
+        if (c0 == '&') { if (op_l == 1) { x64_enc_and_reg(0, 1); return 0; } }
+        if (c0 == '|') { if (op_l == 1) { x64_enc_or_reg(0, 1); return 0; } }
+        if (c0 == '^') { if (op_l == 1) { x64_enc_xor_reg(0, 1); return 0; } }
+
+        // Shift operators. Shift amount is in CL (low byte of RCX).
+        if (c0 == '>') { if (c1 == '>') { x64_enc_sar_cl(0); return 0; } }
+        if (c0 == '<') { if (c1 == '<') { x64_enc_shl_cl(0); return 0; } }
+
+        // Comparison operators: CMP RAX, RCX then SETcc.
+        if (c0 == '=') { if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; } }
+        if (c0 == '!') { if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; } }
+        if (c0 == '<') {
+            if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_LE, 0); x64_enc_movzx8(0, 0); return 0; }
+            if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_L, 0); x64_enc_movzx8(0, 0); return 0; }
+        }
+        if (c0 == '>') {
+            if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_GE, 0); x64_enc_movzx8(0, 0); return 0; }
+            if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_G, 0); x64_enc_movzx8(0, 0); return 0; }
+        }
+
+        // Logical operators.
+        if (c0 == '&') { if (c1 == '&') {
+            x64_enc_test_reg(0, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
+            x64_enc_test_reg(1, 1); x64_enc_setcc(CC_NE, 1); x64_enc_movzx8(1, 1);
+            x64_enc_and_reg(0, 1);
+            return 0;
+        } }
+        if (c0 == '|') { if (c1 == '|') {
+            x64_enc_test_reg(0, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
+            x64_enc_test_reg(1, 1); x64_enc_setcc(CC_NE, 1); x64_enc_movzx8(1, 1);
+            x64_enc_or_reg(0, 1);
+            return 0;
+        } }
+        return 0;
+    }
+
+    // ── Unary operation ──
+    if (t == T_UNARY) {
+        uty = x64_emit_node(n.b);
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        // Bitwise NOT.
+        if (op_l == 1) { if (peek(x64_sbuf + op_s) == '~') {
+            x64_enc_not(0);
+            return 0;
+        } }
+        // Negate.
+        if (uty == 1) {
+            // Float negate: 0.0 - XMM0.
+            x64_enc_xorpd(1, 1);
+            x64_enc_subsd(1, 0);
+            x64_enc_movsd_reg(0, 1);
+            return 1;
+        }
+        x64_enc_neg(0);
+        return 0;
+    }
+
+    // ── Function call ──
+    if (t == T_CALL) {
+        // Built-in: putchar — write 1 byte to stdout.
+        if (x64_str_eq(n.a, "putchar", 7)) {
+            arr = n.b; ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            // Store byte at [RBP - 8] (scratch area).
+            x64_enc_storeb(0, 5, 0 - 8);
+            // write(1, buf, 1): RAX=1, RDI=1, RSI=buf, RDX=1.
+            x64_enc_mov_wide(0, 1);
+            x64_enc_mov_wide(7, 1);
+            x64_enc_lea(6, 5, 0 - 8);
+            x64_enc_mov_wide(2, 1);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: getchar — read 1 byte from stdin.
+        if (x64_str_eq(n.a, "getchar", 7)) {
+            lbl = x64_enc_new_label();
+            lbl2 = x64_enc_new_label();
+            // Clear scratch byte.
+            x64_enc_xor_zero(10);
+            x64_enc_storeb(10, 5, 0 - 8);
+            // read(0, buf, 1): RAX=0, RDI=0, RSI=buf, RDX=1.
+            x64_enc_xor_zero(0);
+            x64_enc_xor_zero(7);
+            x64_enc_lea(6, 5, 0 - 8);
+            x64_enc_mov_wide(2, 1);
+            x64_enc_syscall();
+            // Check if read returned at least 1 byte.
+            x64_enc_cmp_imm(0, 1);
+            x64_enc_jcc_label(CC_L, lbl);
+            x64_enc_loadb(0, 5, 0 - 8);
+            x64_enc_jmp_label(lbl2);
+            x64_enc_def_label(lbl);
+            x64_enc_mov_wide(0, -1);
+            x64_enc_def_label(lbl2);
+            return 0;
+        }
+        // Built-in: malloc — allocate via mmap.
+        if (x64_str_eq(n.a, "malloc", 6)) {
+            arr = n.b; ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            // mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+            // RAX=9, RDI=0, RSI=size, RDX=3, R10=0x22, R8=-1, R9=0.
+            x64_enc_mov_reg(6, 0);
+            x64_enc_xor_zero(7);
+            x64_enc_mov_wide(2, 3);
+            x64_enc_mov_wide(10, 0x22);
+            x64_enc_mov_wide(8, -1);
+            x64_enc_xor_zero(9);
+            x64_enc_mov_wide(0, 9);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: free — no-op with mmap allocator.
+        if (x64_str_eq(n.a, "free", 4)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_enc_xor_zero(0);
+            return 0;
+        }
+        // Built-in: realloc — allocate new block (caller must copy).
+        if (x64_str_eq(n.a, "realloc", 7)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0)); x64_emit_push();
+            x64_emit_node(*(arr + 8));
+            // mmap for new size.
+            x64_enc_mov_reg(6, 0);
+            x64_enc_xor_zero(7);
+            x64_enc_mov_wide(2, 3);
+            x64_enc_mov_wide(10, 0x22);
+            x64_enc_mov_wide(8, -1);
+            x64_enc_xor_zero(9);
+            x64_enc_mov_wide(0, 9);
+            x64_enc_syscall();
+            x64_emit_pop(1);
+            return 0;
+        }
+        // Built-in: peek — load one byte from a pointer.
+        if (x64_str_eq(n.a, "peek", 4)) {
+            arr = n.b; ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            x64_enc_loadb(0, 0, 0);
+            return 0;
+        }
+        // Built-in: poke — store one byte to a pointer.
+        if (x64_str_eq(n.a, "poke", 4)) {
+            arr = n.b;
+            ety = x64_emit_node(*(arr + 8));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            x64_emit_push();
+            ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            x64_emit_pop(1);
+            x64_enc_storeb(1, 0, 0);
+            return 0;
+        }
+        // Built-in: str_peek — byte read from string pointer with index.
+        if (x64_str_eq(n.a, "str_peek", 8)) {
+            arr = n.b;
+            ety = x64_emit_node(*(arr + 8));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            x64_emit_push();
+            ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+            x64_emit_pop(1);
+            x64_enc_add_reg(0, 1);
+            x64_enc_loadb(0, 0, 0);
+            return 0;
+        }
+        // Built-in: sys_write(fd, buf, len).
+        if (x64_str_eq(n.a, "sys_write", 9)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 16)); x64_emit_push();
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            // RAX=fd, stack=[buf, len]
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_emit_pop(2);
+            x64_enc_mov_wide(0, 1);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_read(fd, buf, len).
+        if (x64_str_eq(n.a, "sys_read", 8)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 16)); x64_emit_push();
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_emit_pop(2);
+            x64_enc_xor_zero(0);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_open(path, flags).
+        if (x64_str_eq(n.a, "sys_open", 8)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 8)); x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_enc_mov_wide(2, 493);
+            x64_enc_mov_wide(0, 2);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_close(fd).
+        if (x64_str_eq(n.a, "sys_close", 9)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_enc_mov_wide(0, 3);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_exit(code).
+        if (x64_str_eq(n.a, "sys_exit", 8)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_enc_mov_wide(0, 60);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_fork().
+        if (x64_str_eq(n.a, "sys_fork", 8)) {
+            x64_enc_mov_wide(0, 57);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_execve(path, argv, envp).
+        if (x64_str_eq(n.a, "sys_execve", 10)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0)); x64_emit_push();
+            x64_emit_node(*(arr + 8)); x64_emit_push();
+            x64_emit_node(*(arr + 16));
+            x64_enc_mov_reg(2, 0);
+            x64_emit_pop(6);
+            x64_emit_pop(7);
+            x64_enc_mov_wide(0, 59);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_waitpid(pid).
+        if (x64_str_eq(n.a, "sys_waitpid", 11)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_enc_xor_zero(6);
+            x64_enc_xor_zero(2);
+            x64_enc_xor_zero(10);
+            x64_enc_mov_wide(0, 61);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_ioctl(fd, request, arg) — Linux syscall 16.
+        if (x64_str_eq(n.a, "sys_ioctl", 9)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 16)); x64_emit_push();
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_emit_pop(2);
+            x64_enc_mov_wide(0, 16);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_nanosleep(req, rem) — Linux syscall 35.
+        if (x64_str_eq(n.a, "sys_nanosleep", 13)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_enc_mov_wide(0, 35);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_clock_gettime(clk_id, tp) — Linux syscall 228.
+        if (x64_str_eq(n.a, "sys_clock_gettime", 17)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_enc_mov_wide(0, 228);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: argc_get().
+        if (x64_str_eq(n.a, "argc_get", 8)) {
+            auto dpos;
+            dpos = x64_enc_lea_rip(10);
+            x64_enc_add_reloc(dpos, x64_argc_sym, 0);
+            x64_enc_load(0, 10, 0);
+            return 0;
+        }
+        // Built-in: argv_get(i).
+        if (x64_str_eq(n.a, "argv_get", 8)) {
+            x64_emit_node(*(n.b));
+            x64_emit_push();
+            auto dpos;
+            dpos = x64_enc_lea_rip(10);
+            x64_enc_add_reloc(dpos, x64_argv_sym, 0);
+            x64_enc_load(0, 10, 0);
+            x64_emit_pop(1);
+            x64_enc_shl_imm(1, 3);
+            x64_enc_add_reg(0, 1);
+            x64_enc_load(0, 0, 0);
+            return 0;
+        }
+        // Built-in: fn_ptr(name).
+        if (x64_str_eq(n.a, "fn_ptr", 6)) {
+            arr = n.b;
+            fn_name = *(arr + 0);
+            fi = x64_find_fn(fn_name.a);
+            if (fi < 0) { return 0; }
+            // LEA RAX, [RIP + fn_label]. Use a call-like fixup.
+            auto dpos;
+            dpos = x64_enc_lea_rip(0);
+            // Record fixup for the disp32 to point to the function label.
+            x64_enc_add_fixup(*(x64_fn_lbl + fi * 8));
+            // Patch: the fixup was recorded at x64_enc_pos BEFORE emit32(0) in lea_rip.
+            // Actually, x64_enc_lea_rip already emits the disp32=0 and returns the disp position.
+            // I need to patch that position with (target - (dpos + 4)).
+            // x64_enc_add_fixup records x64_enc_pos at the time of call. But x64_enc_lea_rip already
+            // advanced past the disp32. I need to use the dpos directly.
+            // Let me handle this differently: use the x64_enc_resolve_fixups mechanism.
+            // Actually, x64_enc_add_fixup records x64_enc_pos. But x64_enc_pos has already moved past
+            // the disp32 after x64_enc_lea_rip. So I need to manually fix this.
+            // Simplest: patch dpos directly in the resolve phase. Use x64_enc_add_reloc-style.
+            // For now, use a direct approach: save fixup manually.
+            *(x64_enc_fix_pos + (x64_enc_fix_cnt - 1) * 8) = dpos;
+            return 0;
+        }
+        // Built-in: call(fn_ptr, arg0, arg1, ...) — indirect call.
+        if (x64_str_eq(n.a, "call", 4)) {
+            arr = n.b; cnt = n.c;
+            i = 0;
+            while (i < cnt) {
+                ety = x64_emit_node(*(arr + i * 8));
+                // Bit-transfer float values to GPR for uniform stack push.
+                if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
+                x64_emit_push();
+                i = i + 1;
+            }
+            // Pop real args into System V registers.
+            i = cnt - 2;
+            while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i = i - 1; }
+            // Pop function pointer into R11.
+            x64_emit_pop(11);
+            padded = x64_align_call();
+            x64_enc_call_reg(11);
+            x64_unalign_call(padded);
+            return 0;
+        }
+
+        // Regular B++ function call.
+        // Query bpp_types for callee's parameter types (mirrors ARM64 logic).
+        fidx_c = find_func_idx(n.a);
+        arr = n.b; cnt = n.c;
+        // Evaluate all arguments and push as GPR values (uniform convention).
+        i = 0;
+        while (i < cnt) {
+            ety = x64_emit_node(*(arr + i * 8));
+            if (fidx_c >= 0) {
+                // Cross-function type awareness: convert value to match callee's expected type.
+                par_flt = get_fn_par_type(fidx_c, i) == TY_FLOAT;
+                if (ety == 1) {
+                    if (par_flt) {
+                        // Float expr → float param: bit-transfer XMM0 to RAX.
+                        x64_enc_movq_from_xmm(0, 0);
+                    } else {
+                        // Float expr → int param: value-convert (truncate).
+                        x64_enc_cvttsd2si(0, 0);
+                    }
+                } else {
+                    if (par_flt) {
+                        // Int expr → float param: value-convert to double, then bit-transfer.
+                        x64_enc_cvtsi2sd(0, 0);
+                        x64_enc_movq_from_xmm(0, 0);
+                    }
+                    // Int expr → int param: nothing needed, already in RAX.
+                }
+            } else {
+                // Unknown callee: fallback bit-transfer for float values.
+                if (ety == 1) {
+                    x64_enc_movq_from_xmm(0, 0);
+                }
+            }
+            x64_emit_push();
+            i = i + 1;
+        }
+        // Pop into System V argument registers.
+        i = cnt - 1;
+        while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i = i - 1; }
+
+        // Call the function.
+        fi = x64_find_fn(n.a);
+        padded = x64_align_call();
+        if (fi >= 0) {
+            x64_enc_call_label(*(x64_fn_lbl + fi * 8));
+        } else {
+            // External function: not supported in Phase 1.
+            x64_enc_xor_zero(0);
+        }
+        x64_unalign_call(padded);
+
+        // Check if callee returns float.
+        if (fidx_c >= 0) {
+            if (get_fn_ret_type(fidx_c) == TY_FLOAT) { return 1; }
+        }
+        return 0;
+    }
+
+    // ── Memory load: *(ptr) ──
+    if (t == T_MEMLD) {
+        ety = x64_emit_node(n.a);
+        if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+        x64_enc_load(0, 0, 0);
+        return 0;
+    }
+
+    return 0;
+}
+
+// ── Statement emission ─────────────────────────────────────
+
+x64_emit_body(arr, cnt) {
+    auto i;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) { x64_emit_stmt(n); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+x64_emit_stmt(nd) {
+    auto n: Node;
+    auto lhs: Node;
+    auto t, off, lbl, lbl2, arr, cnt, i, rty, vi, ety;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_DECL) { return 0; }
+
+    if (t == T_ASSIGN) {
+        lhs = n.a;
+        if (lhs.ntype == T_VAR) {
+            vi = x64_var_idx(lhs.a);
+            if (vi >= 0) {
+                // Stack struct copy.
+                if (*(x64_var_stack + vi * 8)) {
+                    x64_emit_node(n.b);
+                    off = *(x64_var_off + vi * 8);
+                    auto fc, j, sidx;
+                    sidx = *(x64_var_struct_idx + vi * 8);
+                    fc = get_struct_size(sidx) / 8;
+                    j = 0;
+                    while (j < fc) {
+                        x64_enc_load(10, 0, j * 8);
+                        x64_enc_store(10, 5, off + j * 8);
+                        j = j + 1;
+                    }
+                    return 0;
+                }
+            }
+        }
+        rty = x64_emit_node(n.b);
+        if (lhs.ntype == T_VAR) {
+            vi = x64_var_idx(lhs.a);
+            if (vi >= 0) {
+                off = *(x64_var_off + vi * 8);
+                if (x64_var_is_float(vi)) {
+                    if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
+                    x64_enc_store_sd(0, 5, off);
+                } else {
+                    if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+                    x64_enc_store(0, 5, off);
+                }
+            } else {
+                // Global variable store.
+                auto dpos;
+                if (ty_get_global_type(lhs.a) == TY_FLOAT) {
+                    if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
+                    dpos = x64_enc_lea_rip(10);
+                    x64_enc_add_reloc(dpos, lhs.a, 0);
+                    x64_enc_store_sd(0, 10, 0);
+                } else {
+                    if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+                    dpos = x64_enc_lea_rip(10);
+                    x64_enc_add_reloc(dpos, lhs.a, 0);
+                    x64_enc_store(0, 10, 0);
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Memory store: *(ptr) = val.
+    if (t == T_MEMST) {
+        ety = x64_emit_node(n.b);
+        if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
+        x64_emit_push();
+        x64_emit_node(n.a);
+        x64_emit_pop(1);
+        x64_enc_store(1, 0, 0);
+        return 0;
+    }
+
+    if (t == T_IF) {
+        lbl = x64_enc_new_label();
+        lbl2 = x64_enc_new_label();
+        ety = x64_emit_node(n.a);
+        if (ety == 1) {
+            x64_enc_xorpd(1, 1);
+            x64_enc_ucomisd(0, 1);
+            x64_enc_setcc(CC_NE, 0);
+            x64_enc_movzx8(0, 0);
+        }
+        x64_enc_test_reg(0, 0);
+        x64_enc_jcc_label(CC_E, lbl);
+        x64_emit_body(n.b, n.c);
+        x64_enc_jmp_label(lbl2);
+        x64_enc_def_label(lbl);
+        if (n.e > 0) { x64_emit_body(n.d, n.e); }
+        x64_enc_def_label(lbl2);
+        return 0;
+    }
+
+    if (t == T_BREAK) {
+        if (x64_break_top > 0) {
+            auto brk_lbl;
+            brk_lbl = *(x64_break_stack + (x64_break_top - 1) * 8);
+            x64_enc_jmp_label(brk_lbl);
+        }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        lbl = x64_enc_new_label();
+        lbl2 = x64_enc_new_label();
+        *(x64_break_stack + x64_break_top * 8) = lbl2;
+        x64_break_top = x64_break_top + 1;
+        x64_enc_def_label(lbl);
+        ety = x64_emit_node(n.a);
+        if (ety == 1) {
+            x64_enc_xorpd(1, 1);
+            x64_enc_ucomisd(0, 1);
+            x64_enc_setcc(CC_NE, 0);
+            x64_enc_movzx8(0, 0);
+        }
+        x64_enc_test_reg(0, 0);
+        x64_enc_jcc_label(CC_E, lbl2);
+        x64_emit_body(n.b, n.c);
+        x64_enc_jmp_label(lbl);
+        x64_enc_def_label(lbl2);
+        x64_break_top = x64_break_top - 1;
+        return 0;
+    }
+
+    if (t == T_RET) {
+        rty = x64_emit_node(n.a);
+        if (get_fn_ret_type(x64_cur_fn_idx) == TY_FLOAT) {
+            if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
+        } else {
+            if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+        }
+        x64_enc_jmp_label(x64_ret_lbl);
+        return 0;
+    }
+
+    if (t == T_NOP) { return 0; }
+
+    // Expression statement.
+    x64_emit_node(nd);
+    return 0;
+}
+
+// ── Function emission ──────────────────────────────────────
+
+x64_emit_func(fi) {
+    auto name_p, par_arr, par_cnt, body_arr, body_cnt;
+    auto frame, i, total, sz;
+    name_p = *(x64_fn_name + fi * 8);
+    par_arr = *(x64_fn_par + fi * 8); par_cnt = *(x64_fn_pcnt + fi * 8);
+    body_arr = *(x64_fn_body + fi * 8); body_cnt = *(x64_fn_bcnt + fi * 8);
+
+    x64_var_cnt = 0;
+    x64_cur_fn_name = name_p;
+    x64_cur_fn_idx = *(x64_fn_fidx + fi * 8);
+    i = 0;
+    while (i < 256) {
+        *(x64_var_stack + i * 8) = 0;
+        *(x64_var_struct_idx + i * 8) = 0 - 1;
+        i = i + 1;
+    }
+
+    // Register params as variables.
+    i = 0;
+    while (i < par_cnt) { x64_var_add(*(par_arr + i * 8)); i = i + 1; }
+
+    // Pre-register all declared variables.
+    x64_pre_reg_vars(body_arr, body_cnt);
+
+    // Compute per-variable frame offsets (negative from RBP).
+    // [RBP - 8] = scratch area (putchar temp).
+    // [RBP - 16] = first variable, [RBP - 24] = second, etc.
+    total = 0;
+    i = 0;
+    while (i < x64_var_cnt) {
+        if (*(x64_var_stack + i * 8)) {
+            sz = get_struct_size(*(x64_var_struct_idx + i * 8));
+        } else {
+            sz = 8;
+        }
+        total = total + sz;
+        *(x64_var_off + i * 8) = 0 - (8 + total);
+        i = i + 1;
+    }
+    // Frame size: 8 (scratch) + total variables, rounded up to 16.
+    frame = 8 + total;
+    frame = (frame + 15) / 16 * 16;
+
+    // Define the label for this function.
+    x64_enc_def_label(*(x64_fn_lbl + fi * 8));
+
+    // Allocate return label.
+    x64_ret_lbl = x64_enc_new_label();
+
+    // Prologue: save frame pointer, allocate stack frame.
+    x64_enc_push(5);                 // push rbp
+    x64_enc_mov_reg(5, 4);           // mov rbp, rsp
+    if (frame > 0) { x64_enc_sub_imm(4, frame); }  // sub rsp, frame
+
+    // In main(), save argc (RDI) and argv (RSI) to hidden globals.
+    // Linux passes argc in RDI and argv in RSI at _start (or via libc crt).
+    // For a static binary with direct entry, the stack has [argc, argv[0], ...].
+    // We handle this in emit_all by emitting a _start stub.
+    if (x64_str_eq(name_p, "main", 4)) {
+        auto dpos;
+        dpos = x64_enc_lea_rip(10);
+        x64_enc_add_reloc(dpos, x64_argc_sym, 0);
+        x64_enc_store(7, 10, 0);
+        dpos = x64_enc_lea_rip(10);
+        x64_enc_add_reloc(dpos, x64_argv_sym, 0);
+        x64_enc_store(6, 10, 0);
+    }
+
+    // Store incoming register arguments to their stack slots.
+    i = 0;
+    while (i < par_cnt) {
+        x64_enc_store(x64_arg_reg(i), 5, *(x64_var_off + i * 8));
+        i = i + 1;
+    }
+
+    // Emit function body.
+    x64_depth = 0;
+    x64_emit_body(body_arr, body_cnt);
+
+    // Epilogue.
+    x64_enc_def_label(x64_ret_lbl);
+    x64_enc_mov_reg(4, 5);           // mov rsp, rbp
+    x64_enc_pop(5);                  // pop rbp
+    x64_enc_ret();
+
+    return 0;
+}
+
+// ── Top-level emission ─────────────────────────────────────
+
+emit_all_x86_64() {
+    auto i, sp, ss, sl, j, fp, fs, fl, main_fi, main_lbl, start_lbl;
+
+    bridge_data_x86_64();
+
+    // Add hidden globals for argc/argv.
+    *(x64_gl_name + x64_gl_cnt * 8) = x64_argc_sym;
+    x64_gl_cnt = x64_gl_cnt + 1;
+    *(x64_gl_name + x64_gl_cnt * 8) = x64_argv_sym;
+    x64_gl_cnt = x64_gl_cnt + 1;
+
+    // Reset encoder state.
+    x64_enc_pos = 0;
+    x64_enc_lbl_max = 0;
+    x64_enc_fix_cnt = 0;
+    x64_enc_rel_cnt = 0;
+
+    // Allocate a label for each function.
+    i = 0;
+    while (i < x64_fn_cnt) {
+        *(x64_fn_lbl + i * 8) = x64_enc_new_label();
+        i = i + 1;
+    }
+
+    // Emit _start stub: extracts argc/argv from stack, calls main, then exits.
+    start_lbl = x64_enc_new_label();
+    x64_enc_def_label(start_lbl);
+    // On Linux, at _start: [RSP] = argc, [RSP+8] = argv[0], ...
+    x64_enc_pop(7);                   // RDI = argc (pop from stack)
+    x64_enc_mov_reg(6, 4);            // RSI = RSP = &argv[0]
+    // Align stack to 16 bytes before calling main.
+    x64_enc_and_imm(4, 0 - 16);
+    // Call main(argc, argv).
+    main_fi = x64_find_fn(pack(0, 0));  // Will be found by name below.
+    i = 0;
+    while (i < x64_fn_cnt) {
+        if (x64_str_eq(*(x64_fn_name + i * 8), "main", 4)) { main_fi = i; }
+        i = i + 1;
+    }
+    if (main_fi >= 0) {
+        x64_enc_call_label(*(x64_fn_lbl + main_fi * 8));
+    }
+    // Exit with main's return value: sys_exit(RAX).
+    x64_enc_mov_reg(7, 0);            // RDI = return value
+    x64_enc_mov_wide(0, 60);          // RAX = SYS_exit
+    x64_enc_syscall();
+
+    // Emit all functions into the code buffer.
+    i = 0;
+    while (i < x64_fn_cnt) { x64_emit_func(i); i = i + 1; }
+
+    // Resolve all forward branch fixups.
+    x64_enc_resolve_fixups();
+
+    // String and float data preparation is done by the caller (bpp.bpp)
+    // after this function returns, using mo_atof for float parsing.
+
+    return start_lbl;
+}

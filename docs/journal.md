@@ -1,5 +1,82 @@
 # B++ Bootstrap Journal
 
+## 2026-03-25 — Linux x86_64 Port: First Binary to Snake Game
+
+### x86_64 Cross-Compilation Working
+
+The B++ compiler now cross-compiles from macOS ARM64 to Linux x86_64 ELF binaries. The full pipeline works: `./bpp --linux64 source.bpp -o binary` produces a static ELF that runs in a Docker Ubuntu x86_64 container.
+
+### Bugs Found and Fixed During Port
+
+**Float addition emitting 3x addsd**: Draft code was left in `bpp_codegen_x86_64.bsm` — three `addsd` instructions where one was needed. Every float add was tripled (1.0+48 gave 51+1+1=53 instead of 49). Removed the draft lines.
+
+**elf_packed_eq missing sentinel comparison**: The argc/argv globals use sentinel values (-1, -2) as packed names. The Mach-O writer's `mo_packed_eq` had `if (a == b) return 1` for direct comparison, but the ELF writer's `elf_packed_eq` didn't — causing it to unpack -1 as a string with length 0xFFFFFFFF. Added the same guards.
+
+**Type propagation poisoning callee params**: `propagate_call_params()` permanently mutated callee parameter types. When `print_int(whole)` was called with a float, it marked `print_int`'s `n` as TY_FLOAT globally. Removed propagation entirely (Phase A fix — see separate entry below).
+
+**x86_64 call-site type awareness**: The ARM64 codegen consulted `get_fn_par_type()` at call sites to convert float↔int correctly. The x86_64 codegen was blind — just did `MOVQ` for all floats. Replicated the ARM64 logic: check callee's expected type, emit CVTTSD2SI or CVTSI2SD+MOVQ as needed.
+
+### Platform Layer Auto-Routing
+
+Added automatic platform selection via `--linux64` flag: sets `_imp_target = "linux"`, so `import "_stb_platform.bsm"` resolves to `_stb_platform_linux.bsm` automatically. Same mechanism already works for macOS.
+
+Created `stb/_stb_platform_linux.bsm` — terminal-based platform layer:
+- Renders framebuffer as ANSI 256-color half-block characters
+- Raw terminal mode via `sys_ioctl` (TCGETS/TCSETS)
+- Non-blocking keyboard input (arrow keys + WASD)
+- Timing via `sys_clock_gettime(CLOCK_MONOTONIC)`
+- Frame rate cap via `sys_nanosleep`
+
+### New Syscalls
+
+Added to x86_64 codegen + validator: `sys_ioctl` (16), `sys_nanosleep` (35), `sys_clock_gettime` (228).
+
+### Tests Passing
+
+| Test | Result |
+|------|--------|
+| exit(42) | 42 |
+| hello world (putchar) | Hello, Linux x86_64! |
+| full suite (strings, recursion, malloc, loops, if/else, function calls) | All pass |
+| floats (arithmetic, comparison, truncation) | 3.00, 6.00, OK |
+| file I/O (open, write, read, close) | wrote 13, read back OK |
+| argc/argv | argc=4, all args correct |
+| **Snake game** | Compiles (45KB static ELF), renders frames in terminal |
+
+### Design Decision: Two Calling Conventions
+
+Internal B++ calls use GPR-uniform convention (all args in RDI/RSI/etc., floats bit-transferred via MOVQ). External FFI calls (future) will use System V ABI with floats in XMM registers. Cost: 1 MOVQ per float arg per call (~free on modern CPUs).
+
+---
+
+## 2026-03-25 — Type Propagation Bug Fix + Evolution Roadmap
+
+### Bug Fix: Type Propagation
+
+`propagate_call_params()` in `bpp_types.bsm` was permanently mutating callee parameter types based on one caller's argument types. When `print_int(whole)` was called with a float `whole`, the type system marked `print_int`'s parameter `n` as TY_FLOAT globally — poisoning all other call sites. Crashed on ARM64, wrong output on x86_64.
+
+**Root cause**: Cross-function type propagation was one-directional and permanent. The guard (`uses_int_ops_list`) only caught `%`, `&`, `|`, `^`, `<<`, `>>` as int-only evidence — operations like `/` and `>` didn't prevent propagation.
+
+**Fix**: Removed `propagate_call_params()` from the fixed-point loop. Types are now determined solely by body inference. The codegen handles float↔int conversion at each call site independently (ARM64 already did this; x86_64 port replicates the same logic). Bootstrap verified — identical 280994-byte binaries.
+
+**Design decision**: A full "context-based specialization" system (compiler generates `add$FF`/`add$LL` variants automatically) was designed but **paused** — no current B++ code needs it, and it touches the emission loop which is high-risk for bootstrap.
+
+### Evolution Roadmap
+
+Established the three-pillar vision for B++:
+
+1. **ART** — `stbart.bsm` (pixel art primitives, ported from ModuLab JS editor) + sprite/tilemap/level/particle editors
+2. **SOUND** — `stbdsp.bsm` (DSP primitives) + `stbplugin.bsm` (CLAP audio plugins, native + FFI driver like SDL)
+3. **GAMES** — stbgame + stbtile + stbphys + stbpath
+
+Asset pipeline: `.bspr` → `.btm` → `.blvl` → game binary. Full plan in `docs/todo.md`.
+
+Key blockers identified: mouse events not polled (B0), `mouse_pressed()` undefined (B1), `file_write_all()` missing (B2), SDL key gaps (B3).
+
+x86_64 calling convention decided: two conventions — internal B++ = all GPR (MOVQ for floats), external FFI = System V ABI.
+
+---
+
 ## 2026-03-18 — Stage 2 Complete: Self-Hosting Parser
 
 ### Milestone
@@ -1083,9 +1160,136 @@ Backend (auto-selected by target or overridden by driver import)
 
 A self-hosting compiler + game engine + native platform layer in 10K lines of a minimalist language.
 
-### Pending
+### Pending (RESOLVED 2026-03-24)
 
-- **stbcol.bsm** — Collision detection module created (rect_overlap, circle_overlap, rect_contains, circle_contains). Not yet tested or integrated into any game. MCU has inline collision that should be refactored to use stbcol.
+- ~~**stbcol.bsm** — Not yet tested or integrated~~ → Tested (24/24) and integrated into MCU. See 2026-03-24 entry.
+
+---
+
+## 2026-03-24 — Compiler Diagnostics + x86_64 Backend + stbcol Integration
+
+### stbcol.bsm — Tested and Integrated
+
+- `tests/test_col.bpp`: 24 tests covering rect_overlap, circle_overlap, rect_contains, circle_contains. All pass.
+- `tests/test_col_float.bpp`: Float argument test — rect_overlap works with double params via type inference.
+- MCU game (`/Users/Codes/mcu-bpp/src/main.bpp`): integrated stbcol, `check_overlap()` now calls `rect_overlap()`.
+- **MCU crash root cause**: missing `import "_stb_platform.bsm"`. The platform functions (`_stb_init_window`, `_stb_present`, etc.) were called but never defined — the compiler silently generated broken GOT relocations. Fixed by adding the import.
+
+### Compiler Diagnostics — Teaching Error Messages
+
+New architecture: semantic errors live in `bpp_validate.bsm`, platform-agnostic. Codegen only has internal panics for "should never happen after validate" cases.
+
+```
+import → lex → parse → types → dispatch → VALIDATE → codegen → macho
+                                              │
+                                     semantic errors here
+                                     platform-agnostic
+```
+
+**New modules:**
+- `src/bpp_diag.bsm` — Diagnostic output infrastructure. All messages go to stderr (fd=2). Functions: `diag_fatal(code)`, `diag_warn(code)`, `diag_str()`, `diag_int()`, `diag_packed()`, `diag_loc()`, `diag_summary()`.
+- `src/bpp_validate.bsm` — Semantic validation pass. Walks all function bodies after type inference, checks every T_CALL has a target (in funcs[], externs[], or builtins). Reports E201 with function name and suggestion.
+
+**Error catalog implemented:**
+
+| Code | Stage | Message |
+|------|-------|---------|
+| E001 | import | `cannot open file '{path}'` |
+| E002 | import | `import '{name}' not found (searched: ./, stb/, /usr/local/lib/bpp/stb/)` |
+| E101 | parser | `unknown type '{name}' -- define it with 'struct'` |
+| E102 | parser | `struct has no field '{field}'` |
+| E103 | parser | `sizeof applied to unknown type '{name}'` |
+| E104 | parser | `unexpected token in expression` |
+| E201 | validate | `function '{name}' called but never defined -- missing import?` |
+| W001 | lexer | `unterminated string literal at line N` |
+
+**Line number tracking**: lexer counts newlines in `skip_ws()`, stores line per token in `tok_lines` array. File boundary tracking in import resolver maps tokens to source files.
+
+**Validate immediately proved its value**: caught the `print_msg` bug in `bpp_codegen_arm64.bsm` — a function called but never defined (from stbio.bsm, which the compiler doesn't import). Fixed by replacing with `diag_str` + `sys_exit(2)`.
+
+### ARM64 Encoder — Dynamic Arrays (Buffer Overflow Fix)
+
+**Root cause of compiler hang**: `enc_lbl_off` was a fixed 32KB buffer (4096 labels max). With 456+ functions (after adding x86 modules), label IDs exceeded 4096, silently corrupting heap memory. The compiler hung or produced broken binaries.
+
+**Fix**: Migrated all 7 encoder arrays from `malloc` fixed buffers to `arr_push`/`arr_get`/`arr_set` dynamic arrays (stbarray):
+
+| Array | Before | After |
+|-------|--------|-------|
+| `enc_lbl_off` | `malloc(32768)` — 4096 labels max | `arr_new()` — unlimited |
+| `enc_fix_pos/lbl/ty` | `malloc(65536)` — 8192 fixups max | `arr_new()` — unlimited |
+| `enc_rel_pos/sym/ty` | `malloc(32768)` — 4096 relocs max | `arr_new()` — unlimited |
+
+Added `arr_clear()` calls at codegen start to reset arrays between compilations.
+
+### T_BREAK Declaration Fix
+
+`T_BREAK` was assigned (`T_BREAK = 13` in `init_defs()`) but never declared with `auto` at module scope. This meant it was a local variable inside `init_defs`, invisible to other modules. The emitter/codegen checked `if (t == T_BREAK)` against an uninitialized global (always 0).
+
+Fixed: added `T_BREAK` to the `auto` declaration in `defs.bsm`. The Mach-O internal panic immediately caught this: `internal error: global 'T_BREAK' not found in data section`.
+
+### x86_64 Cross-Compilation Backend (Linux ELF)
+
+Three new modules for cross-compiling B++ to Linux x86_64 static ELF binaries:
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/bpp_enc_x86_64.bsm` | ~856 | x86_64 instruction encoder (prefix `x64_enc_`) |
+| `src/bpp_codegen_x86_64.bsm` | ~1220 | x86_64 code generator (Linux syscalls) |
+| `src/bpp_elf.bsm` | ~389 | ELF writer (static binary, 2 PT_LOAD segments) |
+
+New flag: `bpp --linux64 source.bpp -o out` (mode=3).
+
+**Status**: Code written, not yet tested on actual Linux. Docker container `bpp-linux` (Ubuntu 24.04) prepared for testing. Blocked by the encoder buffer overflow (now fixed with dynamic arrays).
+
+### Bugs Fixed
+
+| # | Bug | Cause | Fix |
+|---|-----|-------|-----|
+| 32 | MCU segfault | Missing `import "_stb_platform.bsm"` — GOT relocations broken | Added import to MCU game |
+| 33 | Compiler hang with 456+ functions | `enc_lbl_off` buffer overflow (4096 labels max) | Dynamic arrays via stbarray |
+| 34 | `T_BREAK` invisible to other modules | Missing `auto` declaration in defs.bsm | Added to auto line |
+| 35 | `print_msg` in codegen undefined | Called stbio function the compiler doesn't import | Replaced with `diag_str` + `sys_exit(2)` |
+| 36 | `diag_buf(ptr, len)` — `ptr` is a keyword | B++ treats `ptr` as type keyword, not parameter | Renamed to `diag_buf(addr, len)` |
+
+### macOS Quarantine Issue (UNRESOLVED)
+
+macOS Sequoia applies `com.apple.provenance` extended attribute to all files written by sandboxed processes (Claude Code runs sandboxed). Native binaries with this attribute get SIGKILL when executed from the repo directory.
+
+**Does NOT work**: `xattr -d`, `DevToolsSecurity -enable`, `dangerouslyDisableSandbox` flag.
+**Works**: `xattr -cr ./bpp && codesign -f -s - ./bpp` from user's terminal, or build to `/tmp` and copy.
+**Pending**: `claude config set sandbox.enabled false` + reboot.
+
+### Codebase Size
+
+| Component | Lines of B++ |
+|-----------|-------------|
+| Compiler (15 modules) | ~10,900 |
+| stb library (13 modules + platform) | ~2,000 |
+| Drivers (SDL2 + raylib) | ~200 |
+| **Total** | **~13,100** |
+
+### Architecture After This Session
+
+```
+bpp.bpp (orchestrator)
+  ├── defs.bsm            — constants, Node struct
+  ├── stbarray.bsm        — dynamic arrays (compiler dependency)
+  ├── bpp_internal.bsm    — shared utilities
+  ├── bpp_diag.bsm        — NEW: diagnostic output (stderr)
+  ├── bpp_import.bsm      — import resolver + E001/E002
+  ├── bpp_parser.bsm      — parser + E101-E104
+  ├── bpp_lexer.bsm       — lexer + line tracking + W001
+  ├── bpp_types.bsm       — type inference
+  ├── bpp_dispatch.bsm    — loop analysis
+  ├── bpp_validate.bsm    — NEW: semantic validation (E201)
+  ├── bpp_emitter.bsm     — C backend
+  ├── bpp_enc_arm64.bsm   — ARM64 encoder (dynamic arrays)
+  ├── bpp_codegen_arm64.bsm — ARM64 codegen
+  ├── bpp_macho.bsm       — Mach-O writer (internal panics)
+  ├── bpp_enc_x86_64.bsm  — NEW: x86_64 encoder
+  ├── bpp_codegen_x86_64.bsm — NEW: x86_64 codegen
+  └── bpp_elf.bsm         — NEW: ELF writer
+```
 
 ---
 

@@ -572,12 +572,17 @@ Source lives in `src/`. The compiler has 12 modules:
 | `bpp_import.bsm` | File import resolver |
 | `bpp_lexer.bsm` | Tokenizer |
 | `bpp_parser.bsm` | Parser (tokens → AST) |
-| `bpp_types.bsm` | Type inference |
+| `bpp_types.bsm` | Type inference (body-local, no cross-function propagation) |
 | `bpp_dispatch.bsm` | Loop classification |
 | `bpp_emitter.bsm` | C code emitter |
 | `bpp_codegen_arm64.bsm` | ARM64 code generator |
 | `bpp_enc_arm64.bsm` | Binary instruction encoder |
 | `bpp_macho.bsm` | Mach-O writer + SHA-256 codesign |
+| `bpp_diag.bsm` | Diagnostic output to stderr |
+| `bpp_validate.bsm` | Semantic validation pass |
+| `bpp_codegen_x86_64.bsm` | x86_64 code generator (Linux) |
+| `bpp_enc_x86_64.bsm` | x86_64 instruction encoder |
+| `bpp_elf.bsm` | ELF writer (Linux static binaries) |
 
 ### Self-Hosting
 
@@ -594,3 +599,5 @@ To rebuild the compiler:
 *The compiler bootstrapped itself on March 20, 2026.*
 *Zero-dependency native compilation achieved on March 23, 2026.*
 *Native game rendering (Cocoa, no SDL/raylib) achieved on March 24, 2026.*
+*Compiler diagnostics (E001-E201, W001) completed on March 24, 2026.*
+*Type propagation bug fixed, x86_64/ELF backend started on March 25, 2026.*

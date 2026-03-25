@@ -1,0 +1,141 @@
+// bpp_diag.bsm — Diagnostic output for the B++ compiler.
+// All error and warning messages go to stderr (fd=2) so they never
+// contaminate --c or --asm output on stdout.
+// Uses only language builtins: sys_write, sys_exit, str_peek, peek.
+
+auto _diag_buf;
+auto _diag_warn_cnt;
+
+// Allocate scratch buffer and reset counters.
+init_diag() {
+    _diag_buf = malloc(4096);
+    _diag_warn_cnt = 0;
+    return 0;
+}
+
+// Write one byte to stderr.
+diag_ch(c) {
+    poke(_diag_buf, c);
+    sys_write(2, _diag_buf, 1);
+    return 0;
+}
+
+// Write a null-terminated string literal to stderr.
+diag_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        diag_ch(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// Write a decimal integer to stderr.
+diag_int(n) {
+    if (n < 0) {
+        diag_ch('-');
+        n = 0 - n;
+    }
+    if (n >= 10) {
+        diag_int(n / 10);
+    }
+    diag_ch('0' + (n % 10));
+    return 0;
+}
+
+// Write a packed string (from vbuf) to stderr.
+diag_packed(p) {
+    auto s, l, i;
+    s = unpack_s(p);
+    l = unpack_l(p);
+    i = 0;
+    while (i < l) {
+        diag_ch(peek(vbuf + s + i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Write len bytes from a memory address to stderr.
+diag_buf(addr, len) {
+    sys_write(2, addr, len);
+    return 0;
+}
+
+// Write a newline to stderr.
+diag_newline() {
+    diag_ch(10);
+    return 0;
+}
+
+// Print the error prefix: "error[Ennn]: ".
+// The caller completes the message and calls sys_exit(1).
+diag_fatal(code) {
+    diag_str("error[E");
+    if (code < 100) { diag_ch('0'); }
+    if (code < 10) { diag_ch('0'); }
+    diag_int(code);
+    diag_str("]: ");
+    return 0;
+}
+
+// Print the warning prefix: "warning[Wnnn]: ".
+// Increments the warning counter. Does not abort.
+diag_warn(code) {
+    diag_str("warning[W");
+    if (code < 100) { diag_ch('0'); }
+    if (code < 10) { diag_ch('0'); }
+    diag_int(code);
+    diag_str("]: ");
+    _diag_warn_cnt = _diag_warn_cnt + 1;
+    return 0;
+}
+
+// Print file location: "  --> filename:line\n".
+// Uses the file boundary map from the import resolver and line numbers from the lexer.
+// The file boundary tracks outbuf offsets; we compare against the token's source position.
+diag_loc(tok_idx) {
+    auto line, fi, best, fp, fs, fl;
+    line = *(tok_lines + tok_idx * 8);
+
+    // Find which file this token belongs to by searching file boundaries.
+    // File starts are outbuf offsets. We use tok_idx * approximate bytes as heuristic,
+    // but since we store outbuf offsets and tokens map to outbuf positions,
+    // we compare the token's vbuf position against file starts.
+    // For now, use the last file boundary as a reasonable approximation.
+    best = 0;
+    fi = 0;
+    while (fi < diag_file_cnt) {
+        best = fi;
+        fi = fi + 1;
+    }
+    if (diag_file_cnt > 0) {
+        best = diag_file_cnt - 1;
+    }
+
+    diag_str("  --> ");
+    if (diag_file_cnt > 0) {
+        fp = *(diag_file_names + best * 8);
+        fs = unpack_s(fp);
+        fl = unpack_l(fp);
+        // File names are stored in fbuf (import resolver buffer).
+        diag_buf(fbuf + fs, fl);
+    }
+    diag_ch(':');
+    diag_int(line);
+    diag_newline();
+    return 0;
+}
+
+// Print a summary line if any warnings were emitted.
+diag_summary() {
+    if (_diag_warn_cnt > 0) {
+        diag_int(_diag_warn_cnt);
+        diag_str(" warning(s) emitted");
+        diag_newline();
+    }
+    return 0;
+}

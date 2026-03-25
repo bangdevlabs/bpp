@@ -1,0 +1,856 @@
+// bpp_x64_enc_x86_64.bsm — Binary x86_64 instruction encoder.
+// Emits variable-length x86_64 instructions into a code buffer.
+// Provides label/fixup system for branch resolution and
+// relocation entries for data references (resolved by the ELF/PE writer).
+//
+// x86_64 instructions are variable-length (1–15 bytes), stored little-endian.
+// Call x64_enc_resolve_fixups() after all code is emitted to patch branches.
+//
+// Register numbering follows hardware encoding:
+//   RAX=0  RCX=1  RDX=2  RBX=3  RSP=4  RBP=5  RSI=6  RDI=7
+//   R8=8   R9=9   R10=10 R11=11 R12=12 R13=13 R14=14 R15=15
+// Float registers: XMM0=0 .. XMM15=15.
+
+// ── Code buffer ──────────────────────────────────────────
+
+auto x64_enc_buf;       // Pointer to code buffer (1 MB).
+auto x64_enc_pos;       // Current byte offset in the code buffer.
+
+// ── Label system ─────────────────────────────────────────
+// Labels map numeric IDs to code offsets. Used for branches.
+
+auto x64_enc_lbl_off;   // Array: label ID -> byte offset in code buffer (-1 = undefined).
+auto x64_enc_lbl_max;   // Number of labels allocated so far.
+
+// ── Fixup system ─────────────────────────────────────────
+// Forward branch references that need patching once the target label is defined.
+// All x86_64 fixups are rel32: the 4-byte field at the fixup position
+// is patched to (target - (fixup_pos + 4)).
+
+auto x64_enc_fix_pos;   // Array: byte offset of the rel32 field to patch.
+auto x64_enc_fix_lbl;   // Array: target label ID.
+auto x64_enc_fix_cnt;   // Number of pending fixups.
+
+// ── Relocation system ────────────────────────────────────
+// RIP-relative disp32 fields whose final values are resolved by the ELF/PE writer.
+
+auto x64_enc_rel_pos;   // Array: byte offset of the disp32 field.
+auto x64_enc_rel_sym;   // Array: symbol identifier (packed name or table index).
+auto x64_enc_rel_ty;    // Array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
+auto x64_enc_rel_cnt;   // Number of relocation entries.
+
+// ── Condition code constants ─────────────────────────────
+// Used with x64_enc_jcc_label() and x64_enc_setcc().
+
+auto CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A;
+auto CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G;
+
+// ── Initialization ───────────────────────────────────────
+
+init_x64_enc() {
+    x64_enc_buf     = malloc(1048576);
+    x64_enc_pos     = 0;
+    x64_enc_lbl_off = malloc(32768);
+    x64_enc_lbl_max = 0;
+    x64_enc_fix_pos = malloc(65536);
+    x64_enc_fix_lbl = malloc(65536);
+    x64_enc_fix_cnt = 0;
+    x64_enc_rel_pos = malloc(32768);
+    x64_enc_rel_sym = malloc(32768);
+    x64_enc_rel_ty  = malloc(32768);
+    x64_enc_rel_cnt = 0;
+
+    CC_O = 0; CC_NO = 1; CC_B = 2; CC_AE = 3;
+    CC_E = 4; CC_NE = 5; CC_BE = 6; CC_A = 7;
+    CC_S = 8; CC_NS = 9; CC_P = 10; CC_NP = 11;
+    CC_L = 12; CC_GE = 13; CC_LE = 14; CC_G = 15;
+
+    return 0;
+}
+
+// ── Buffer operations ────────────────────────────────────
+
+// Write a single byte to the code buffer.
+x64_enc_emit8(val) {
+    poke(x64_enc_buf + x64_enc_pos, val & 0xFF);
+    x64_enc_pos = x64_enc_pos + 1;
+    return 0;
+}
+
+// Write a 32-bit value to the code buffer (little-endian).
+x64_enc_emit32(val) {
+    poke(x64_enc_buf + x64_enc_pos,     val & 0xFF);
+    poke(x64_enc_buf + x64_enc_pos + 1, (val >> 8) & 0xFF);
+    poke(x64_enc_buf + x64_enc_pos + 2, (val >> 16) & 0xFF);
+    poke(x64_enc_buf + x64_enc_pos + 3, (val >> 24) & 0xFF);
+    x64_enc_pos = x64_enc_pos + 4;
+    return 0;
+}
+
+// Write a 64-bit value to the code buffer (little-endian).
+x64_enc_emit64(val) {
+    x64_enc_emit32(val & 0xFFFFFFFF);
+    x64_enc_emit32((val >> 32) & 0xFFFFFFFF);
+    return 0;
+}
+
+// Overwrite a 32-bit value at a specific byte offset (for patching branches).
+x64_enc_patch32(off, val) {
+    poke(x64_enc_buf + off,     val & 0xFF);
+    poke(x64_enc_buf + off + 1, (val >> 8) & 0xFF);
+    poke(x64_enc_buf + off + 2, (val >> 16) & 0xFF);
+    poke(x64_enc_buf + off + 3, (val >> 24) & 0xFF);
+    return 0;
+}
+
+// Read a 32-bit value from the code buffer at a specific byte offset.
+x64_enc_read32(off) {
+    return peek(x64_enc_buf + off)
+         | (peek(x64_enc_buf + off + 1) << 8)
+         | (peek(x64_enc_buf + off + 2) << 16)
+         | (peek(x64_enc_buf + off + 3) << 24);
+}
+
+// ── Label management ─────────────────────────────────────
+
+// Define a label at the current code position.
+x64_enc_def_label(id) {
+    *(x64_enc_lbl_off + id * 8) = x64_enc_pos;
+    if (id >= x64_enc_lbl_max) { x64_enc_lbl_max = id + 1; }
+    return 0;
+}
+
+// Allocate a new undefined label and return its ID.
+x64_enc_new_label() {
+    auto id;
+    id = x64_enc_lbl_max;
+    *(x64_enc_lbl_off + id * 8) = -1;
+    x64_enc_lbl_max = x64_enc_lbl_max + 1;
+    return id;
+}
+
+// ── Fixup management ─────────────────────────────────────
+
+// Record that a rel32 field at x64_enc_pos needs to be patched to reach the label.
+x64_enc_add_fixup(lbl) {
+    *(x64_enc_fix_pos + x64_enc_fix_cnt * 8) = x64_enc_pos;
+    *(x64_enc_fix_lbl + x64_enc_fix_cnt * 8) = lbl;
+    x64_enc_fix_cnt = x64_enc_fix_cnt + 1;
+    return 0;
+}
+
+// ── Relocation management ────────────────────────────────
+
+// Record a RIP-relative relocation at the given code offset.
+x64_enc_add_reloc(pos, sym, ty) {
+    *(x64_enc_rel_pos + x64_enc_rel_cnt * 8) = pos;
+    *(x64_enc_rel_sym + x64_enc_rel_cnt * 8) = sym;
+    *(x64_enc_rel_ty  + x64_enc_rel_cnt * 8) = ty;
+    x64_enc_rel_cnt = x64_enc_rel_cnt + 1;
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Encoding helpers
+// ═══════════════════════════════════════════════════════════
+
+// Emit a REX prefix byte.
+// w=1 selects 64-bit operand size.
+// r extends the ModR/M reg field (bit 3 of the register number).
+// x extends the SIB index field.
+// b extends the ModR/M r/m field or SIB base field.
+x64_enc_rex(w, r, x, b) {
+    x64_enc_emit8(0x40 | (w << 3) | (r << 2) | (x << 1) | b);
+    return 0;
+}
+
+// Emit a ModR/M byte: mod (2 bits), reg (3 bits), rm (3 bits).
+x64_enc_modrm(mod, reg, rm) {
+    x64_enc_emit8((mod << 6) | ((reg & 7) << 3) | (rm & 7));
+    return 0;
+}
+
+// Emit a memory operand [base + displacement] encoded as ModR/M + optional SIB + disp.
+// reg_field is the register number or opcode extension for the ModR/M reg field.
+// Chooses the shortest encoding: mod=00 (no disp), mod=01 (disp8), or mod=10 (disp32).
+// Handles RSP/R12 (SIB byte required) and RBP/R13 (mod=00 ambiguity) correctly.
+x64_enc_mem(reg_field, base, disp) {
+    auto r, b3, mod, need_sib;
+    r = reg_field & 7;
+    b3 = base & 7;
+    need_sib = 0;
+    if (b3 == 4) { need_sib = 1; }
+
+    // Select the mod field based on displacement magnitude.
+    if (disp == 0) {
+        if (b3 == 5) { mod = 1; }  // RBP/R13: mod=00 rm=5 means [RIP+disp32], use mod=01 instead.
+        else { mod = 0; }
+    } else if (disp >= -128) {
+        if (disp < 128) { mod = 1; }  // Fits in a signed 8-bit displacement.
+        else { mod = 2; }
+    } else {
+        mod = 2;  // Needs a full 32-bit displacement.
+    }
+
+    // Emit ModR/M byte, with rm=4 (SIB marker) when base is RSP or R12.
+    if (need_sib) {
+        x64_enc_emit8((mod << 6) | (r << 3) | 4);
+        x64_enc_emit8(0x24);  // SIB: scale=0, index=4 (none), base=4 (RSP/R12).
+    } else {
+        x64_enc_emit8((mod << 6) | (r << 3) | b3);
+    }
+
+    // Emit displacement bytes according to mod.
+    if (mod == 1) { x64_enc_emit8(disp & 0xFF); }
+    if (mod == 2) { x64_enc_emit32(disp); }
+
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Instruction encoders
+// ═══════════════════════════════════════════════════════════
+
+// ── Move instructions ───────────────────────────────────
+
+// MOV r64, r64 — register to register move.
+x64_enc_mov_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x89);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// MOV r64, imm64 — load full 64-bit immediate (movabs, 10 bytes).
+x64_enc_mov_imm64(rd, imm) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xB8 | (rd & 7));
+    x64_enc_emit64(imm);
+    return 0;
+}
+
+// MOV r64, imm32 — load 32-bit immediate, sign-extended to 64 bits (7 bytes).
+x64_enc_mov_imm32(rd, imm) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xC7);
+    x64_enc_modrm(3, 0, rd);
+    x64_enc_emit32(imm);
+    return 0;
+}
+
+// XOR r32, r32 — zeroes the register efficiently (2–3 bytes).
+// The 32-bit result zero-extends to 64 bits. Breaks dependency chains.
+x64_enc_xor_zero(rd) {
+    if (rd >= 8) { x64_enc_rex(0, (rd >> 3) & 1, 0, (rd >> 3) & 1); }
+    x64_enc_emit8(0x31);
+    x64_enc_modrm(3, rd, rd);
+    return 0;
+}
+
+// Load a 64-bit immediate using the shortest encoding available.
+// Picks XOR (zero), MOV r32,imm32 (small positive), or MOVABS (general case).
+x64_enc_mov_wide(rd, val) {
+    // Zero: XOR is the fastest way to clear a register.
+    if (val == 0) { x64_enc_xor_zero(rd); return 0; }
+    // Positive 32-bit values: MOV r32, imm32 zero-extends to 64 bits (5–6 bytes).
+    if (val > 0) {
+        if (val < 0x100000000) {
+            if (rd >= 8) { x64_enc_emit8(0x41); }
+            x64_enc_emit8(0xB8 | (rd & 7));
+            x64_enc_emit32(val);
+            return 0;
+        }
+    }
+    // Everything else: full 64-bit movabs (10 bytes).
+    x64_enc_mov_imm64(rd, val);
+    return 0;
+}
+
+// ── Register-register ALU ────────────────────────────────
+// Two-operand form: dst = dst OP src.
+
+// ADD r64, r64. dst += src.
+x64_enc_add_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x01);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// SUB r64, r64. dst -= src.
+x64_enc_sub_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x29);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// AND r64, r64. dst &= src.
+x64_enc_and_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x21);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// OR r64, r64. dst |= src.
+x64_enc_or_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x09);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// XOR r64, r64. dst ^= src.
+x64_enc_xor_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x31);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// CMP r64, r64. Sets flags for (dst - src) without storing the result.
+x64_enc_cmp_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x39);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// TEST r64, r64. Sets flags for (dst & src) without storing the result.
+// TEST reg, reg is the standard idiom for checking if a register is zero.
+x64_enc_test_reg(dst, src) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x85);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// ── Immediate ALU ────────────────────────────────────────
+// The 32-bit immediate is sign-extended to 64 bits by the CPU.
+
+// ADD r64, imm32.
+x64_enc_add_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 0, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// SUB r64, imm32.
+x64_enc_sub_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 5, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// CMP r64, imm32.
+x64_enc_cmp_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 7, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// AND r64, imm32.
+x64_enc_and_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 4, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// OR r64, imm32.
+x64_enc_or_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 1, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// XOR r64, imm32.
+x64_enc_xor_imm(rd, imm32) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x81);
+    x64_enc_modrm(3, 6, rd);
+    x64_enc_emit32(imm32);
+    return 0;
+}
+
+// ── Unary operations ─────────────────────────────────────
+
+// NEG r64. rd = -rd.
+x64_enc_neg(rd) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xF7);
+    x64_enc_modrm(3, 3, rd);
+    return 0;
+}
+
+// NOT r64. rd = ~rd.
+x64_enc_not(rd) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xF7);
+    x64_enc_modrm(3, 2, rd);
+    return 0;
+}
+
+// ── Multiply / divide ───────────────────────────────────
+
+// IMUL r64, r64. Two-operand form: dst = dst * src (low 64 bits).
+x64_enc_imul(dst, src) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0xAF);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// IDIV r64. Divides RDX:RAX by src. Quotient in RAX, remainder in RDX.
+// The caller must sign-extend RAX into RDX via CQO before calling this.
+x64_enc_idiv(src) {
+    x64_enc_rex(1, 0, 0, (src >> 3) & 1);
+    x64_enc_emit8(0xF7);
+    x64_enc_modrm(3, 7, src);
+    return 0;
+}
+
+// CQO — sign-extend RAX into RDX:RAX. Required before IDIV.
+x64_enc_cqo() {
+    x64_enc_rex(1, 0, 0, 0);
+    x64_enc_emit8(0x99);
+    return 0;
+}
+
+// ── Shifts ──────────────────────────────────────────────
+
+// SHL r64, CL — variable left shift. Shift amount must be in the CL register.
+x64_enc_shl_cl(rd) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xD3);
+    x64_enc_modrm(3, 4, rd);
+    return 0;
+}
+
+// SHR r64, CL — variable logical right shift.
+x64_enc_shr_cl(rd) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xD3);
+    x64_enc_modrm(3, 5, rd);
+    return 0;
+}
+
+// SAR r64, CL — variable arithmetic right shift (preserves sign bit).
+x64_enc_sar_cl(rd) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xD3);
+    x64_enc_modrm(3, 7, rd);
+    return 0;
+}
+
+// SHL r64, imm8 — shift left by constant amount.
+x64_enc_shl_imm(rd, imm8) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xC1);
+    x64_enc_modrm(3, 4, rd);
+    x64_enc_emit8(imm8 & 0x3F);
+    return 0;
+}
+
+// SHR r64, imm8 — logical shift right by constant amount.
+x64_enc_shr_imm(rd, imm8) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xC1);
+    x64_enc_modrm(3, 5, rd);
+    x64_enc_emit8(imm8 & 0x3F);
+    return 0;
+}
+
+// SAR r64, imm8 — arithmetic shift right by constant amount.
+x64_enc_sar_imm(rd, imm8) {
+    x64_enc_rex(1, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0xC1);
+    x64_enc_modrm(3, 7, rd);
+    x64_enc_emit8(imm8 & 0x3F);
+    return 0;
+}
+
+// ── Push / pop ──────────────────────────────────────────
+// Default operand size for PUSH/POP in 64-bit mode is 64 bits.
+// REX.W is not needed; only REX.B for registers R8–R15.
+
+// PUSH r64.
+x64_enc_push(rd) {
+    if (rd >= 8) { x64_enc_emit8(0x41); }
+    x64_enc_emit8(0x50 | (rd & 7));
+    return 0;
+}
+
+// POP r64.
+x64_enc_pop(rd) {
+    if (rd >= 8) { x64_enc_emit8(0x41); }
+    x64_enc_emit8(0x58 | (rd & 7));
+    return 0;
+}
+
+// ── Memory load / store ─────────────────────────────────
+
+// MOV r64, [base + disp]. Load 64-bit value from memory.
+x64_enc_load(dst, base, disp) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x8B);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// MOV [base + disp], r64. Store 64-bit value to memory.
+x64_enc_store(src, base, disp) {
+    x64_enc_rex(1, (src >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x89);
+    x64_enc_mem(src, base, disp);
+    return 0;
+}
+
+// MOVZX r64, byte [base + disp]. Load one byte, zero-extended to 64 bits.
+x64_enc_loadb(dst, base, disp) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0xB6);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// MOV byte [base + disp], r8. Store the low byte of a register to memory.
+// Always emits a REX prefix so that registers 4–7 map to SPL/BPL/SIL/DIL.
+x64_enc_storeb(src, base, disp) {
+    x64_enc_rex(0, (src >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x88);
+    x64_enc_mem(src, base, disp);
+    return 0;
+}
+
+// LEA r64, [base + disp]. Computes the effective address without accessing memory.
+x64_enc_lea(dst, base, disp) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x8D);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// ── Branches (direct, with label) ───────────────────────
+// All forward references record a fixup; resolved by x64_enc_resolve_fixups().
+// The rel32 field encodes (target - address_after_rel32).
+
+// CALL rel32 to label.
+x64_enc_call_label(lbl) {
+    auto target, rel;
+    target = *(x64_enc_lbl_off + lbl * 8);
+    x64_enc_emit8(0xE8);
+    if (target >= 0) {
+        rel = target - (x64_enc_pos + 4);
+        x64_enc_emit32(rel);
+    } else {
+        x64_enc_add_fixup(lbl);
+        x64_enc_emit32(0);
+    }
+    return 0;
+}
+
+// JMP rel32 to label.
+x64_enc_jmp_label(lbl) {
+    auto target, rel;
+    target = *(x64_enc_lbl_off + lbl * 8);
+    x64_enc_emit8(0xE9);
+    if (target >= 0) {
+        rel = target - (x64_enc_pos + 4);
+        x64_enc_emit32(rel);
+    } else {
+        x64_enc_add_fixup(lbl);
+        x64_enc_emit32(0);
+    }
+    return 0;
+}
+
+// Jcc rel32 to label. cc is the condition code (CC_E, CC_NE, CC_L, CC_G, etc.).
+x64_enc_jcc_label(cc, lbl) {
+    auto target, rel;
+    target = *(x64_enc_lbl_off + lbl * 8);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x80 | cc);
+    if (target >= 0) {
+        rel = target - (x64_enc_pos + 4);
+        x64_enc_emit32(rel);
+    } else {
+        x64_enc_add_fixup(lbl);
+        x64_enc_emit32(0);
+    }
+    return 0;
+}
+
+// ── Indirect call / system ──────────────────────────────
+
+// CALL r64 — indirect call to the address stored in a register.
+x64_enc_call_reg(rd) {
+    if (rd >= 8) { x64_enc_emit8(0x41); }
+    x64_enc_emit8(0xFF);
+    x64_enc_modrm(3, 2, rd);
+    return 0;
+}
+
+// JMP r64 — indirect jump to the address stored in a register.
+x64_enc_jmp_reg(rd) {
+    if (rd >= 8) { x64_enc_emit8(0x41); }
+    x64_enc_emit8(0xFF);
+    x64_enc_modrm(3, 4, rd);
+    return 0;
+}
+
+// RET — return from function.
+x64_enc_ret() {
+    x64_enc_emit8(0xC3);
+    return 0;
+}
+
+// SYSCALL — invoke the Linux kernel.
+x64_enc_syscall() {
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x05);
+    return 0;
+}
+
+// NOP — no operation (1 byte).
+x64_enc_nop() {
+    x64_enc_emit8(0x90);
+    return 0;
+}
+
+// ── Conditional set ─────────────────────────────────────
+
+// SETcc r8 — set the low byte of a register to 1 if the condition is true, 0 otherwise.
+// The caller should zero the full register first (x64_enc_xor_zero) for a clean 64-bit result.
+x64_enc_setcc(cc, rd) {
+    // Always emit REX so registers 4–7 map to SPL/BPL/SIL/DIL, not AH/CH/DH/BH.
+    x64_enc_rex(0, 0, 0, (rd >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x90 | cc);
+    x64_enc_modrm(3, 0, rd);
+    return 0;
+}
+
+// MOVZX r32, r8 — zero-extend a byte register to 32 bits (implicitly to 64 bits).
+x64_enc_movzx8(dst, src) {
+    // Emit REX when using extended registers or byte-addressable SPL/BPL/SIL/DIL.
+    auto need_rex;
+    need_rex = 0;
+    if (dst >= 8) { need_rex = 1; }
+    if (src >= 4) { need_rex = 1; }
+    if (need_rex) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0xB6);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// ── RIP-relative addressing ─────────────────────────────
+// Used to reference global variables, string literals, and float constants
+// in the data section. The disp32 placeholder is patched by the ELF/PE writer.
+
+// LEA r64, [RIP + 0]. Returns the byte offset of the disp32 field for relocation.
+x64_enc_lea_rip(rd) {
+    auto disp_pos;
+    x64_enc_rex(1, (rd >> 3) & 1, 0, 0);
+    x64_enc_emit8(0x8D);
+    x64_enc_modrm(0, rd, 5);   // mod=00, rm=5 encodes [RIP + disp32].
+    disp_pos = x64_enc_pos;
+    x64_enc_emit32(0);          // Placeholder, filled by the binary writer.
+    return disp_pos;
+}
+
+// MOV r64, [RIP + 0]. Load a 64-bit value from a data-section address.
+// Returns the byte offset of the disp32 field for relocation.
+x64_enc_load_rip(rd) {
+    auto disp_pos;
+    x64_enc_rex(1, (rd >> 3) & 1, 0, 0);
+    x64_enc_emit8(0x8B);
+    x64_enc_modrm(0, rd, 5);
+    disp_pos = x64_enc_pos;
+    x64_enc_emit32(0);
+    return disp_pos;
+}
+
+// ── Float arithmetic (SSE2 scalar double) ───────────────
+// All operations use 64-bit double precision (SD suffix).
+// Prefix order: mandatory prefix (F2/66) → REX (if needed) → opcode → ModR/M.
+
+// ADDSD xmm, xmm. dst += src.
+x64_enc_addsd(dst, src) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x58);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// SUBSD xmm, xmm. dst -= src.
+x64_enc_subsd(dst, src) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x5C);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// MULSD xmm, xmm. dst *= src.
+x64_enc_mulsd(dst, src) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x59);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// DIVSD xmm, xmm. dst /= src.
+x64_enc_divsd(dst, src) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x5E);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// UCOMISD xmm, xmm. Compare two doubles and set CPU flags (ZF, PF, CF).
+x64_enc_ucomisd(dst, src) {
+    x64_enc_emit8(0x66);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x2E);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// MOVSD xmm, xmm. Copy a double between XMM registers.
+x64_enc_movsd_reg(dst, src) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x10);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// XORPD xmm, xmm. Bitwise XOR of packed doubles. Use XORPD xmm, xmm to zero a register.
+x64_enc_xorpd(dst, src) {
+    x64_enc_emit8(0x66);
+    if (dst >= 8 | src >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x57);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// ── Float / integer conversion ──────────────────────────
+
+// CVTSI2SD xmm, r64 — convert signed 64-bit integer to double.
+x64_enc_cvtsi2sd(dst, src) {
+    x64_enc_emit8(0xF2);
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x2A);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// CVTTSD2SI r64, xmm — convert double to signed 64-bit integer (truncate toward zero).
+x64_enc_cvttsd2si(dst, src) {
+    x64_enc_emit8(0xF2);
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x2C);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// MOVQ xmm, r64 — bit-transfer from general-purpose register to XMM register.
+x64_enc_movq_to_xmm(dst, src) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x6E);
+    x64_enc_modrm(3, dst, src);
+    return 0;
+}
+
+// MOVQ r64, xmm — bit-transfer from XMM register to general-purpose register.
+x64_enc_movq_from_xmm(dst, src) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(1, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x7E);
+    x64_enc_modrm(3, src, dst);
+    return 0;
+}
+
+// ── Float memory load / store ───────────────────────────
+
+// MOVSD xmm, [base + disp]. Load a double from memory into an XMM register.
+x64_enc_load_sd(dst, base, disp) {
+    x64_enc_emit8(0xF2);
+    if (dst >= 8 | base >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, (base >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x10);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// MOVSD [base + disp], xmm. Store a double from an XMM register to memory.
+x64_enc_store_sd(src, base, disp) {
+    x64_enc_emit8(0xF2);
+    if (src >= 8 | base >= 8) { x64_enc_rex(0, (src >> 3) & 1, 0, (base >> 3) & 1); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x11);
+    x64_enc_mem(src, base, disp);
+    return 0;
+}
+
+// MOVSD xmm, [RIP + 0]. Load a double from the data section (relocated).
+// Returns the byte offset of the disp32 field for relocation.
+x64_enc_load_sd_rip(dst) {
+    auto disp_pos;
+    x64_enc_emit8(0xF2);
+    if (dst >= 8) { x64_enc_rex(0, (dst >> 3) & 1, 0, 0); }
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x10);
+    x64_enc_modrm(0, dst, 5);
+    disp_pos = x64_enc_pos;
+    x64_enc_emit32(0);
+    return disp_pos;
+}
+
+// ── Fixup resolution ─────────────────────────────────────
+
+// Patch all recorded branch fixups. Call after all code has been emitted.
+// Each fixup stores the position of a rel32 field. The patch value is
+// (target_offset - (field_position + 4)), making it relative to the next instruction.
+x64_enc_resolve_fixups() {
+    auto i, pos, lbl, target, off;
+    i = 0;
+    while (i < x64_enc_fix_cnt) {
+        pos    = *(x64_enc_fix_pos + i * 8);
+        lbl    = *(x64_enc_fix_lbl + i * 8);
+        target = *(x64_enc_lbl_off + lbl * 8);
+        off    = target - (pos + 4);
+        x64_enc_patch32(pos, off);
+        i = i + 1;
+    }
+    return 0;
+}

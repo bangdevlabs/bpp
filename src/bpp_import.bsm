@@ -13,6 +13,11 @@ auto linebuf;       // Current line being processed.
 auto outbuf;        // Output buffer (512KB) holding the merged source text.
 auto outbuf_len;    // Current write position in outbuf.
 
+// File boundary tracking for diagnostic location info.
+auto diag_file_starts;  // Array: outbuf offset where each file's content begins.
+auto diag_file_names;   // Array: packed filename for each file.
+auto diag_file_cnt;     // Number of file boundary entries.
+
 // ── Output helpers ───────────────────────────────────────────
 
 // Write a single byte to the output buffer.
@@ -334,12 +339,16 @@ process_file(path_off, path_len) {
 
     fd = sys_open(pathbuf, 0);
     if (fd < 0) {
-        emit_str("// IMPORT ERROR: ");
-        i = 0;
-        while (i < path_len) { emit_ch(peek(fbuf + my_path + i)); i = i + 1; }
-        emit_ch(10);
-        fbuf_top = saved_top;
-        return 0;
+        diag_fatal(1);
+        diag_str("cannot open file '");
+        auto _ei; _ei = 0;
+        while (_ei < path_len) {
+            diag_ch(peek(pathbuf + _ei));
+            _ei = _ei + 1;
+        }
+        diag_str("'");
+        diag_newline();
+        sys_exit(1);
     }
 
     // Read file contents into fbuf at our stack frame.
@@ -353,6 +362,11 @@ process_file(path_off, path_len) {
 
     // Advance fbuf_top past our data so child imports get their own space.
     fbuf_top = my_file + fsize;
+
+    // Record file boundary for diagnostic location info.
+    *(diag_file_starts + diag_file_cnt * 8) = outbuf_len;
+    *(diag_file_names + diag_file_cnt * 8) = pack(my_path, path_len);
+    diag_file_cnt = diag_file_cnt + 1;
 
     // Process line by line.
     pos = 0;
@@ -376,10 +390,16 @@ process_file(path_off, path_len) {
             if (plen > 0) {
                 process_file(pathbuf, plen);
             } else {
-                emit_str("// IMPORT NOT FOUND: ");
-                i = 0;
-                while (i < fname_len) { emit_ch(peek(linebuf + i)); i = i + 1; }
-                emit_ch(10);
+                diag_fatal(2);
+                diag_str("import '");
+                auto _ei; _ei = 0;
+                while (_ei < fname_len) {
+                    diag_ch(peek(linebuf + _ei));
+                    _ei = _ei + 1;
+                }
+                diag_str("' not found (searched: ./, stb/, /usr/local/lib/bpp/stb/)");
+                diag_newline();
+                sys_exit(1);
             }
         } else {
             // Output the line as-is.
@@ -409,6 +429,9 @@ init_import() {
     linebuf = malloc(4096);
     outbuf = malloc(1048576);
     outbuf_len = 0;
+    diag_file_starts = malloc(4096);
+    diag_file_names = malloc(4096);
+    diag_file_cnt = 0;
     init_target();
     return 0;
 }

@@ -8,7 +8,7 @@ But what if a small group of rebels at Bell Labs had taken B in a different dire
 
 B++ is that alternate timeline.
 
-A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, and a compiler that produces native ARM64 binaries directly. No assembler. No linker. No external tools.
+A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, and a compiler that produces native binaries directly. ARM64 macOS and x86_64 Linux. No assembler. No linker. No external tools.
 
 And a standard library that is, itself, a game engine.
 
@@ -64,7 +64,9 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Float math** — `sqrt`, `floor`, `fabs` via system FFI, IEEE 754 doubles
 - **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
 - **Self-hosting** — the compiler compiles itself
-- **Native binaries** — ARM64 Mach-O with built-in codesign, zero external tools
+- **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
+- **Compiler diagnostics** — error codes (E001-E201), warnings (W001), file:line locations
+- **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
 
 ## What B++ Doesn't Have
 
@@ -88,16 +90,22 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
 | `stbfile` | Load files from disk |
 | `stbui` | Immediate-mode UI widgets |
+| `stbcol` | Collision detection (AABB, circles) |
+| `stbio` | Console I/O (print_int, print_msg) |
 
 Every pixel is written to a memory buffer. The compiler's platform layer puts those pixels on screen. On macOS, that's Cocoa + CoreGraphics — no SDL, no OpenGL, no Metal. Just `objc_msgSend` and a `CGBitmapContext`.
 
-## Three Backends, Same Code
+## Four Backends, Same Code
 
 The game code never changes. Only the import:
 
 ```bpp
-// Native — zero dependencies:
+// Native macOS — zero dependencies:
 import "stbgame.bsm";
+
+// Linux terminal — ANSI rendering, zero dependencies:
+import "stbgame.bsm";
+// compile with: bpp --linux64 game.bpp -o game
 
 // SDL2:
 import "stbgame.bsm";
@@ -168,33 +176,36 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/           — Compiler source (12 B++ modules, self-hosting)
+├── src/           — Compiler source (17 B++ modules, self-hosting)
 ├── stb/           — Standard B Library (pure B++, the game engine)
 ├── drivers/       — Backend drivers (SDL2, raylib — optional)
 ├── examples/      — Working game examples
 ├── tests/         — Compiler and library tests
-├── docs/          — Language docs and journal
+├── docs/          — Language docs, journal, and evolution roadmap
 └── bpp            — The compiler binary
 ```
 
 ## Platform Status
 
-B++ is under active construction. It was born on ARM64 macOS (Apple Silicon) and that's the only fully supported target today. The goal is to run on any chip and any OS:
-
 | Target | Status |
 |--------|--------|
 | macOS ARM64 (Apple Silicon) | **Working** — native Cocoa, SDL2, raylib |
-| Linux x86_64 | Planned — codegen + X11 platform layer |
+| Linux x86_64 | **Working** — static ELF binaries, ANSI terminal rendering |
 | Windows x86_64 | Planned — codegen + Win32 platform layer |
 | WebAssembly | Future — codegen + Canvas API |
 
-The architecture is ready for this: stb is 100% pure B++ (no platform code), and each target only needs a new codegen backend + platform layer. The game code and the stb library stay identical across all platforms.
+stb is 100% pure B++ (no platform code). Each target only needs a codegen backend + platform layer. The game code and stb library stay identical across all platforms.
 
-## Requirements (macOS ARM64)
+## Requirements
 
+**macOS ARM64:**
 - **No dependencies** for native games
 - **SDL2** (`brew install sdl2`) for SDL examples
 - **raylib** (`brew install raylib`) for raylib examples
+
+**Linux x86_64:**
+- Cross-compile from macOS: `bpp --linux64 game.bpp -o game`
+- Run natively or in Docker — 45KB static binary, zero dependencies
 
 ## The Compiler
 
@@ -202,18 +213,19 @@ The B++ compiler is written in B++ and compiles itself. It produces
 native ARM64 Mach-O binaries with built-in SHA-256 codesigning.
 
 ```
-bpp source.bpp -o binary     # native ARM64 (default)
-bpp --c source.bpp            # emit C (for debugging)
-bpp --asm source.bpp          # emit ARM64 assembly
+bpp source.bpp -o binary       # native ARM64 macOS (default)
+bpp --linux64 src.bpp -o bin   # cross-compile to x86_64 Linux ELF
+bpp --c source.bpp              # emit C (for debugging)
+bpp --asm source.bpp            # emit ARM64 assembly
 ```
 
-12 modules, ~8000 lines of B++. Self-hosting verified at every stage.
+17 modules, ~11,000 lines of B++. Self-hosting verified at every stage.
 
 ## Contributing
 
 B++ is open source and we want your help. The language is young and there's a lot to build:
 
-**Platform ports** — The biggest opportunity. Each new platform needs a codegen backend (instruction encoder + Mach-O/ELF/PE writer) and a platform layer (window, present, input, timing). If you know x86_64 assembly, Linux/X11, Windows/Win32, or WebAssembly, pick a target and go.
+**Platform ports** — Each new platform needs a codegen backend (instruction encoder + binary writer) and a platform layer (window, present, input, timing). ARM64 macOS and x86_64 Linux are done. Windows/Win32 and WebAssembly are open.
 
 **Game tools** — Sprite editors, tilemap editors, level designers, particle systems — all built in B++ using stb. The language was made for this.
 
@@ -263,3 +275,4 @@ SOFTWARE.
 *The compiler bootstrapped itself on March 20, 2026.*
 *Zero-dependency native compilation on March 23, 2026.*
 *Native game rendering without external libraries on March 24, 2026.*
+*Compiler diagnostics and x86_64 Linux cross-compilation on March 25, 2026.*

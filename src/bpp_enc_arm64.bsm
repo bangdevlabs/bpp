@@ -12,25 +12,25 @@ auto enc_buf;       // Pointer to code buffer (1 MB).
 auto enc_pos;       // Current byte offset in the code buffer.
 
 // ── Label system ─────────────────────────────────────────
-// Labels map numeric IDs to code offsets. Used for branches.
+// Labels map numeric IDs to code offsets. Dynamic array via stbarray.
 
-auto enc_lbl_off;   // Array: label ID -> byte offset in code buffer (-1 = undefined).
+auto enc_lbl_off;   // Dynamic array: label ID -> byte offset (-1 = undefined).
 auto enc_lbl_max;   // Number of labels allocated so far.
 
 // ── Fixup system ─────────────────────────────────────────
 // Forward branch references that need patching once the target label is defined.
 
-auto enc_fix_pos;   // Array: byte offset of the branch instruction to patch.
-auto enc_fix_lbl;   // Array: target label ID.
-auto enc_fix_ty;    // Array: fixup type (0 = B/BL imm26, 1 = CBZ/CBNZ imm19, 2 = B.cond imm19).
+auto enc_fix_pos;   // Dynamic array: byte offset of the branch instruction.
+auto enc_fix_lbl;   // Dynamic array: target label ID.
+auto enc_fix_ty;    // Dynamic array: fixup type (0=B/BL, 1=CBZ/CBNZ, 2=B.cond).
 auto enc_fix_cnt;   // Number of pending fixups.
 
 // ── Relocation system ────────────────────────────────────
-// ADRP+ADD pairs whose page offsets are resolved in the Mach-O writer (Phase 5c).
+// ADRP+ADD pairs whose page offsets are resolved in the Mach-O writer.
 
-auto enc_rel_pos;   // Array: byte offset of the ADRP instruction.
-auto enc_rel_sym;   // Array: symbol identifier (packed name or table index).
-auto enc_rel_ty;    // Array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
+auto enc_rel_pos;   // Dynamic array: byte offset of the ADRP instruction.
+auto enc_rel_sym;   // Dynamic array: symbol identifier (packed name or index).
+auto enc_rel_ty;    // Dynamic array: relocation type (0=global, 1=string, 2=float, 3=extern).
 auto enc_rel_cnt;   // Number of relocation entries.
 
 // ── Initialization ───────────────────────────────────────
@@ -38,15 +38,15 @@ auto enc_rel_cnt;   // Number of relocation entries.
 init_enc_arm64() {
     enc_buf     = malloc(1048576);
     enc_pos     = 0;
-    enc_lbl_off = malloc(32768);
+    enc_lbl_off = arr_new();
     enc_lbl_max = 0;
-    enc_fix_pos = malloc(65536);
-    enc_fix_lbl = malloc(65536);
-    enc_fix_ty  = malloc(65536);
+    enc_fix_pos = arr_new();
+    enc_fix_lbl = arr_new();
+    enc_fix_ty  = arr_new();
     enc_fix_cnt = 0;
-    enc_rel_pos = malloc(32768);
-    enc_rel_sym = malloc(32768);
-    enc_rel_ty  = malloc(32768);
+    enc_rel_pos = arr_new();
+    enc_rel_sym = arr_new();
+    enc_rel_ty  = arr_new();
     enc_rel_cnt = 0;
     return 0;
 }
@@ -84,7 +84,7 @@ enc_read32(off) {
 
 // Define a label at the current code position.
 enc_def_label(id) {
-    *(enc_lbl_off + id * 8) = enc_pos;
+    arr_set(enc_lbl_off, id, enc_pos);
     if (id >= enc_lbl_max) { enc_lbl_max = id + 1; }
     return 0;
 }
@@ -93,7 +93,7 @@ enc_def_label(id) {
 enc_new_label() {
     auto id;
     id = enc_lbl_max;
-    *(enc_lbl_off + id * 8) = -1;
+    enc_lbl_off = arr_push(enc_lbl_off, 0 - 1);
     enc_lbl_max = enc_lbl_max + 1;
     return id;
 }
@@ -103,9 +103,9 @@ enc_new_label() {
 // Record that the instruction at enc_pos branches to the given label.
 // type: 0 = B/BL (imm26), 1 = CBZ/CBNZ (imm19 at [23:5]), 2 = B.cond (imm19 at [23:5]).
 enc_add_fixup(lbl, ty) {
-    *(enc_fix_pos + enc_fix_cnt * 8) = enc_pos;
-    *(enc_fix_lbl + enc_fix_cnt * 8) = lbl;
-    *(enc_fix_ty  + enc_fix_cnt * 8) = ty;
+    enc_fix_pos = arr_push(enc_fix_pos, enc_pos);
+    enc_fix_lbl = arr_push(enc_fix_lbl, lbl);
+    enc_fix_ty  = arr_push(enc_fix_ty, ty);
     enc_fix_cnt = enc_fix_cnt + 1;
     return 0;
 }
@@ -114,9 +114,9 @@ enc_add_fixup(lbl, ty) {
 
 // Record an ADRP+ADD relocation at the given code offset.
 enc_add_reloc(pos, sym, ty) {
-    *(enc_rel_pos + enc_rel_cnt * 8) = pos;
-    *(enc_rel_sym + enc_rel_cnt * 8) = sym;
-    *(enc_rel_ty  + enc_rel_cnt * 8) = ty;
+    enc_rel_pos = arr_push(enc_rel_pos, pos);
+    enc_rel_sym = arr_push(enc_rel_sym, sym);
+    enc_rel_ty  = arr_push(enc_rel_ty, ty);
     enc_rel_cnt = enc_rel_cnt + 1;
     return 0;
 }
@@ -412,7 +412,7 @@ enc_b_cond(cond, off) {
 // B to label.
 enc_b_label(lbl) {
     auto target;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) { enc_b(target - enc_pos); return 0; }
     enc_add_fixup(lbl, 0);
     enc_emit32(0x14000000);
@@ -422,7 +422,7 @@ enc_b_label(lbl) {
 // BL to label (call to a B++ function whose code offset is known).
 enc_bl_label(lbl) {
     auto target;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) { enc_bl(target - enc_pos); return 0; }
     enc_add_fixup(lbl, 0);
     enc_emit32(0x94000000);
@@ -432,7 +432,7 @@ enc_bl_label(lbl) {
 // CBZ Xt, label.
 enc_cbz_label(rt, lbl) {
     auto target;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) { enc_cbz(rt, target - enc_pos); return 0; }
     enc_add_fixup(lbl, 1);
     enc_emit32(0xB4000000 | rt);
@@ -442,7 +442,7 @@ enc_cbz_label(rt, lbl) {
 // CBNZ Xt, label.
 enc_cbnz_label(rt, lbl) {
     auto target;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) { enc_cbnz(rt, target - enc_pos); return 0; }
     enc_add_fixup(lbl, 1);
     enc_emit32(0xB5000000 | rt);
@@ -452,7 +452,7 @@ enc_cbnz_label(rt, lbl) {
 // B.cond label.
 enc_b_cond_label(cond, lbl) {
     auto target;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) { enc_b_cond(cond, target - enc_pos); return 0; }
     enc_add_fixup(lbl, 2);
     enc_emit32(0x54000000 | cond);
@@ -595,7 +595,7 @@ enc_adrp(rd) {
 // If the label is not yet defined, records a fixup (type 3).
 enc_adr_label(rd, lbl) {
     auto target, off, immlo, immhi;
-    target = *(enc_lbl_off + lbl * 8);
+    target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) {
         off = target - enc_pos;
         immlo = off & 3;
@@ -615,10 +615,10 @@ enc_resolve_fixups() {
     auto i, pos, lbl, ty, target, off, ins;
     i = 0;
     while (i < enc_fix_cnt) {
-        pos    = *(enc_fix_pos + i * 8);
-        lbl    = *(enc_fix_lbl + i * 8);
-        ty     = *(enc_fix_ty  + i * 8);
-        target = *(enc_lbl_off + lbl * 8);
+        pos    = arr_get(enc_fix_pos, i);
+        lbl    = arr_get(enc_fix_lbl, i);
+        ty     = arr_get(enc_fix_ty, i);
+        target = arr_get(enc_lbl_off, lbl);
         off    = (target - pos) / 4;
         ins    = enc_read32(pos);
         if (ty == 0) {
