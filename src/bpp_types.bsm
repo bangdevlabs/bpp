@@ -3,7 +3,7 @@
 // with the smallest type that fits the value.
 //
 // Type codes (from defs.bpp):
-//   TY_UNKNOWN=0  TY_BYTE=1  TY_HALF=2  TY_WORD=3  TY_LONG=4  TY_PTR=5  TY_FLOAT=6
+//   TY_UNKNOWN=0  TY_BYTE=1  TY_QUART=2  TY_HALF=3  TY_LONG=4  TY_PTR=5  TY_FLOAT=6
 //
 // Rules:
 //   - Literals: sized by value magnitude (0-255=byte, 0-65535=half, etc.)
@@ -18,13 +18,11 @@
 //   - Cross-function: return types and param types propagated via fixed-point iteration
 
 // ── Symbol table ───────────────────────────────────────────
-// Parallel arrays of packed name and type code.
-// Supports up to 256 variables per function scope.
-auto ty_vt_names, ty_vt_types, ty_vt_count;
+// Dynamic parallel arrays of packed name and type code.
+auto ty_vt_names, ty_vt_types;
 
-// Known function return types: parallel arrays of packed name and type code.
-// Populated before inference runs, from extern declarations and first pass.
-auto ft_names, ft_types, ft_count;
+// Known function return types: dynamic parallel arrays.
+auto ft_names, ft_types;
 
 // Per-function persistent type data (survives scope resets, used by emitter).
 // fn_vt_data[i]  → pointer to interleaved (name, type) pairs for function i.
@@ -37,24 +35,21 @@ auto fn_vt_data, fn_vt_cnts, fn_ret_types, fn_par_types;
 auto ty_cur_ret;
 
 // Global variable type tracking (persists across functions).
-auto ty_gl_names, ty_gl_types, ty_gl_count;
+auto ty_gl_names, ty_gl_types;
 
 // Initialize the type inference engine. Call once at startup.
 init_types() {
-    ty_vt_names = malloc(4096);
-    ty_vt_types = malloc(4096);
-    ty_vt_count = 0;
-    ft_names = malloc(8192);
-    ft_types = malloc(8192);
-    ft_count = 0;
-    fn_vt_data = malloc(8192);
-    fn_vt_cnts = malloc(8192);
-    fn_ret_types = malloc(8192);
-    fn_par_types = malloc(8192);
+    ty_vt_names = arr_new();
+    ty_vt_types = arr_new();
+    ft_names = arr_new();
+    ft_types = arr_new();
+    fn_vt_data = arr_new();
+    fn_vt_cnts = arr_new();
+    fn_ret_types = arr_new();
+    fn_par_types = arr_new();
     ty_cur_ret = TY_UNKNOWN;
-    ty_gl_names = malloc(8192);
-    ty_gl_types = malloc(8192);
-    ty_gl_count = 0;
+    ty_gl_names = arr_new();
+    ty_gl_types = arr_new();
     return 0;
 }
 
@@ -62,16 +57,15 @@ init_types() {
 ty_set_global_type(name_p, ty) {
     auto i;
     i = 0;
-    while (i < ty_gl_count) {
-        if (packed_eq(*(ty_gl_names + i * 8), name_p)) {
-            *(ty_gl_types + i * 8) = promote(*(ty_gl_types + i * 8), ty);
+    while (i < arr_len(ty_gl_names)) {
+        if (packed_eq(arr_get(ty_gl_names, i), name_p)) {
+            arr_set(ty_gl_types, i, promote(arr_get(ty_gl_types, i), ty));
             return 0;
         }
         i = i + 1;
     }
-    *(ty_gl_names + ty_gl_count * 8) = name_p;
-    *(ty_gl_types + ty_gl_count * 8) = ty;
-    ty_gl_count = ty_gl_count + 1;
+    ty_gl_names = arr_push(ty_gl_names, name_p);
+    ty_gl_types = arr_push(ty_gl_types, ty);
     return 0;
 }
 
@@ -79,9 +73,9 @@ ty_set_global_type(name_p, ty) {
 ty_get_global_type(name_p) {
     auto i;
     i = 0;
-    while (i < ty_gl_count) {
-        if (packed_eq(*(ty_gl_names + i * 8), name_p)) {
-            return *(ty_gl_types + i * 8);
+    while (i < arr_len(ty_gl_names)) {
+        if (packed_eq(arr_get(ty_gl_names, i), name_p)) {
+            return arr_get(ty_gl_types, i);
         }
         i = i + 1;
     }
@@ -90,7 +84,8 @@ ty_get_global_type(name_p) {
 
 // Reset the variable table for a new function scope.
 ty_reset_scope() {
-    ty_vt_count = 0;
+    arr_clear(ty_vt_names);
+    arr_clear(ty_vt_types);
     return 0;
 }
 
@@ -98,9 +93,9 @@ ty_reset_scope() {
 ty_var_type(name_p) {
     auto i;
     i = 0;
-    while (i < ty_vt_count) {
-        if (packed_eq(*(ty_vt_names + i * 8), name_p)) {
-            return *(ty_vt_types + i * 8);
+    while (i < arr_len(ty_vt_names)) {
+        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            return arr_get(ty_vt_types, i);
         }
         i = i + 1;
     }
@@ -111,19 +106,18 @@ ty_var_type(name_p) {
 ty_set_var_type(name_p, ty) {
     auto i, old;
     i = 0;
-    while (i < ty_vt_count) {
-        if (packed_eq(*(ty_vt_names + i * 8), name_p)) {
-            old = *(ty_vt_types + i * 8);
-            if (ty == TY_FLOAT) { *(ty_vt_types + i * 8) = TY_FLOAT; }
-            else if (ty > old) { *(ty_vt_types + i * 8) = ty; }
+    while (i < arr_len(ty_vt_names)) {
+        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            old = arr_get(ty_vt_types, i);
+            if (ty == TY_FLOAT) { arr_set(ty_vt_types, i, TY_FLOAT); }
+            else if (ty > old) { arr_set(ty_vt_types, i, ty); }
             return 0;
         }
         i = i + 1;
     }
     // New variable: append to table.
-    *(ty_vt_names + ty_vt_count * 8) = name_p;
-    *(ty_vt_types + ty_vt_count * 8) = ty;
-    ty_vt_count = ty_vt_count + 1;
+    ty_vt_names = arr_push(ty_vt_names, name_p);
+    ty_vt_types = arr_push(ty_vt_types, ty);
     return 0;
 }
 
@@ -132,16 +126,15 @@ ty_set_var_type(name_p, ty) {
 set_func_type(name_p, ty) {
     auto i;
     i = 0;
-    while (i < ft_count) {
-        if (packed_eq(*(ft_names + i * 8), name_p)) {
-            *(ft_types + i * 8) = ty;
+    while (i < arr_len(ft_names)) {
+        if (packed_eq(arr_get(ft_names, i), name_p)) {
+            arr_set(ft_types, i, ty);
             return 0;
         }
         i = i + 1;
     }
-    *(ft_names + ft_count * 8) = name_p;
-    *(ft_types + ft_count * 8) = ty;
-    ft_count = ft_count + 1;
+    ft_names = arr_push(ft_names, name_p);
+    ft_types = arr_push(ft_types, ty);
     return 0;
 }
 
@@ -149,9 +142,9 @@ set_func_type(name_p, ty) {
 func_type(name_p) {
     auto i;
     i = 0;
-    while (i < ft_count) {
-        if (packed_eq(*(ft_names + i * 8), name_p)) {
-            return *(ft_types + i * 8);
+    while (i < arr_len(ft_names)) {
+        if (packed_eq(arr_get(ft_names, i), name_p)) {
+            return arr_get(ft_types, i);
         }
         i = i + 1;
     }
@@ -207,8 +200,8 @@ type_of_lit(vstart, vlen) {
         }
     }
     if (val <= 255) { return TY_BYTE; }
-    if (val <= 65535) { return TY_HALF; }
-    if (val <= 0xFFFFFFFF) { return TY_WORD; }
+    if (val <= 65535) { return TY_QUART; }
+    if (val <= 0xFFFFFFFF) { return TY_HALF; }
     return TY_LONG;
 }
 
@@ -357,17 +350,18 @@ add_type(nd) {
 // Save the current function's variable types to persistent storage.
 // Called after inference completes for each function.
 save_fn_types(func_idx) {
-    auto block, i;
-    block = malloc(ty_vt_count * 16);
+    auto block, i, cnt;
+    cnt = arr_len(ty_vt_names);
+    block = malloc(cnt * 16);
     i = 0;
-    while (i < ty_vt_count) {
-        *(block + i * 16) = *(ty_vt_names + i * 8);
-        *(block + i * 16 + 8) = *(ty_vt_types + i * 8);
+    while (i < cnt) {
+        *(block + i * 16) = arr_get(ty_vt_names, i);
+        *(block + i * 16 + 8) = arr_get(ty_vt_types, i);
         i = i + 1;
     }
-    *(fn_vt_data + func_idx * 8) = block;
-    *(fn_vt_cnts + func_idx * 8) = ty_vt_count;
-    *(fn_ret_types + func_idx * 8) = ty_cur_ret;
+    arr_set(fn_vt_data, func_idx, block);
+    arr_set(fn_vt_cnts, func_idx, cnt);
+    arr_set(fn_ret_types, func_idx, ty_cur_ret);
     return 0;
 }
 
@@ -381,7 +375,7 @@ save_fn_par_types(func_idx, params_arr, param_cnt) {
         *(block + i * 8) = ty_var_type(*(params_arr + i * 8));
         i = i + 1;
     }
-    *(fn_par_types + func_idx * 8) = block;
+    arr_set(fn_par_types, func_idx, block);
     return 0;
 }
 
@@ -389,8 +383,8 @@ save_fn_par_types(func_idx, params_arr, param_cnt) {
 // Used by the emitter to decide double vs long long.
 get_fn_var_type(func_idx, name_p) {
     auto block, cnt, i;
-    block = *(fn_vt_data + func_idx * 8);
-    cnt = *(fn_vt_cnts + func_idx * 8);
+    block = arr_get(fn_vt_data, func_idx);
+    cnt = arr_get(fn_vt_cnts, func_idx);
     i = 0;
     while (i < cnt) {
         if (packed_eq(*(block + i * 16), name_p)) {
@@ -403,13 +397,13 @@ get_fn_var_type(func_idx, name_p) {
 
 // Query a function's inferred return type.
 get_fn_ret_type(func_idx) {
-    return *(fn_ret_types + func_idx * 8);
+    return arr_get(fn_ret_types, func_idx);
 }
 
 // Query a parameter's inferred type for a given function index.
 get_fn_par_type(func_idx, par_idx) {
     auto block;
-    block = *(fn_par_types + func_idx * 8);
+    block = arr_get(fn_par_types, func_idx);
     if (block == 0) { return TY_LONG; }
     return *(block + par_idx * 8);
 }
@@ -420,20 +414,27 @@ get_fn_par_type(func_idx, par_idx) {
 // Returns the inferred return type.
 infer_one_func(func_idx) {
     auto func, name_p, params_arr, param_cnt, body_arr, body_cnt, j, pt;
+    auto hints, h;
     func = *(funcs + func_idx * 8);
-    name_p = *(func + 8);
-    params_arr = *(func + 16);
-    param_cnt = *(func + 24);
-    body_arr = *(func + 32);
-    body_cnt = *(func + 40);
+    name_p = *(func + FN_NAME);
+    params_arr = *(func + FN_PARS);
+    param_cnt = *(func + FN_PCNT);
+    body_arr = *(func + FN_BODY);
+    body_cnt = *(func + FN_BCNT);
+    hints = *(func + FN_HINTS);
 
     ty_reset_scope();
     ty_cur_ret = TY_UNKNOWN;
 
     // Register parameters with their current known types.
+    // Explicit primitive type hints from the programmer always take priority.
     j = 0;
     while (j < param_cnt) {
         pt = get_fn_par_type(func_idx, j);
+        if (hints != 0) {
+            h = *(hints + j * 8);
+            if (h > 0) { pt = h; }
+        }
         if (pt == TY_UNKNOWN) { pt = TY_LONG; }
         ty_set_var_type(*(params_arr + j * 8), pt);
         j = j + 1;
@@ -458,8 +459,8 @@ propagate_call_params() {
     i = 0;
     while (i < func_cnt) {
         func = *(funcs + i * 8);
-        body_arr = *(func + 32);
-        body_cnt = *(func + 40);
+        body_arr = *(func + FN_BODY);
+        body_cnt = *(func + FN_BCNT);
         changed = changed + propagate_in_body(body_arr, body_cnt, i);
         i = i + 1;
     }
@@ -500,10 +501,10 @@ propagate_in_node(nd, caller_idx) {
         fi = find_func_idx(name_p);
         if (fi >= 0) {
             callee_func = *(funcs + fi * 8);
-            callee_params = *(callee_func + 16);
-            callee_pcnt = *(callee_func + 24);
-            callee_body = *(callee_func + 32);
-            callee_bcnt = *(callee_func + 40);
+            callee_params = *(callee_func + FN_PARS);
+            callee_pcnt = *(callee_func + FN_PCNT);
+            callee_body = *(callee_func + FN_BODY);
+            callee_bcnt = *(callee_func + FN_BCNT);
             j = 0;
             while (j < cnt) {
                 an = *(args + j * 8);
@@ -677,13 +678,13 @@ uses_int_ops_node(nd, var_p) {
     return 0;
 }
 
-// Find a function's index by packed name. Returns -1 if not found.
+// Find a function's index by packed name. Returns first match.
 find_func_idx(name_p) {
     auto i, func;
     i = 0;
     while (i < func_cnt) {
         func = *(funcs + i * 8);
-        if (packed_eq(*(func + 8), name_p)) { return i; }
+        if (packed_eq(*(func + FN_NAME), name_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -692,17 +693,68 @@ find_func_idx(name_p) {
 // Set a parameter type in the persistent par_types array.
 propagate_set_par_type(func_idx, par_idx, ty) {
     auto block, pcnt, func, k;
-    block = *(fn_par_types + func_idx * 8);
+    block = arr_get(fn_par_types, func_idx);
     if (block == 0) {
-        func = *(funcs + func_idx * 8);
-        pcnt = *(func + 24);
+        func = arr_get(funcs, func_idx);
+        pcnt = *(func + FN_PCNT);
         block = malloc(pcnt * 8);
-        *(fn_par_types + func_idx * 8) = block;
+        arr_set(fn_par_types, func_idx, block);
         // Initialize all params to TY_LONG.
         k = 0;
         while (k < pcnt) { *(block + k * 8) = TY_LONG; k = k + 1; }
     }
     *(block + par_idx * 8) = ty;
+    return 0;
+}
+
+// Run type inference on functions from a single module.
+// Expects func_mods to be populated. Dependencies' types must already
+// be available in ft_names/ft_types (from .bo export or prior inference).
+infer_module(mi) {
+    auto i, func, name_p, ret_ty;
+
+    // Register extern return types for externs in this module.
+    i = 0;
+    while (i < ext_cnt) {
+        if (arr_get(extern_mods, i) == mi) {
+            auto ret_p, rlen;
+            func = *(externs + i * 8);
+            name_p = *(func + EX_NAME);
+            ret_p = *(func + EX_RET);
+            rlen = unpack_l(ret_p);
+            if (rlen == 6) {
+                if (buf_eq(vbuf + unpack_s(ret_p), "double", 6)) {
+                    set_func_type(name_p, TY_FLOAT);
+                } else {
+                    set_func_type(name_p, TY_LONG);
+                }
+            } else {
+                set_func_type(name_p, TY_LONG);
+            }
+        }
+        i = i + 1;
+    }
+
+    // Ensure per-function arrays are large enough for new functions.
+    while (arr_len(fn_vt_data) < func_cnt) {
+        fn_vt_data = arr_push(fn_vt_data, 0);
+        fn_vt_cnts = arr_push(fn_vt_cnts, 0);
+        fn_ret_types = arr_push(fn_ret_types, 0);
+        fn_par_types = arr_push(fn_par_types, 0);
+    }
+
+    // Infer types for this module's functions only.
+    i = 0;
+    while (i < func_cnt) {
+        if (arr_get(func_mods, i) == mi) {
+            ret_ty = infer_one_func(i);
+            func = *(funcs + i * 8);
+            name_p = *(func + FN_NAME);
+            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_LONG; }
+            set_func_type(name_p, ret_ty);
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -718,8 +770,8 @@ run_types() {
     while (i < ext_cnt) {
         auto ret_p, rlen;
         func = *(externs + i * 8);
-        name_p = *(func + 8);
-        ret_p = *(func + 24);
+        name_p = *(func + EX_NAME);
+        ret_p = *(func + EX_RET);
         rlen = unpack_l(ret_p);
         if (rlen == 6) {
             if (buf_eq(vbuf + unpack_s(ret_p), "double", 6)) {
@@ -733,10 +785,17 @@ run_types() {
         i = i + 1;
     }
 
-    // Initialize par_types to zero (no info yet).
+    // Pre-fill per-function arrays so arr_set can index by func_idx.
+    arr_clear(fn_vt_data);
+    arr_clear(fn_vt_cnts);
+    arr_clear(fn_ret_types);
+    arr_clear(fn_par_types);
     i = 0;
     while (i < func_cnt) {
-        *(fn_par_types + i * 8) = 0;
+        fn_vt_data = arr_push(fn_vt_data, 0);
+        fn_vt_cnts = arr_push(fn_vt_cnts, 0);
+        fn_ret_types = arr_push(fn_ret_types, 0);
+        fn_par_types = arr_push(fn_par_types, 0);
         i = i + 1;
     }
 
@@ -753,7 +812,7 @@ run_types() {
 
             // Update function return type in the lookup table.
             func = *(funcs + i * 8);
-            name_p = *(func + 8);
+            name_p = *(func + FN_NAME);
             if (ret_ty == TY_UNKNOWN) { ret_ty = TY_LONG; }
             set_func_type(name_p, ret_ty);
             i = i + 1;

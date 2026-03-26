@@ -17,27 +17,24 @@ auto x64_enc_buf;       // Pointer to code buffer (1 MB).
 auto x64_enc_pos;       // Current byte offset in the code buffer.
 
 // ── Label system ─────────────────────────────────────────
-// Labels map numeric IDs to code offsets. Used for branches.
+// Labels map numeric IDs to code offsets. Dynamic array via stbarray.
 
-auto x64_enc_lbl_off;   // Array: label ID -> byte offset in code buffer (-1 = undefined).
-auto x64_enc_lbl_max;   // Number of labels allocated so far.
+auto x64_enc_lbl_off;   // Dynamic array: label ID -> byte offset in code buffer (-1 = undefined).
 
 // ── Fixup system ─────────────────────────────────────────
 // Forward branch references that need patching once the target label is defined.
 // All x86_64 fixups are rel32: the 4-byte field at the fixup position
 // is patched to (target - (fixup_pos + 4)).
 
-auto x64_enc_fix_pos;   // Array: byte offset of the rel32 field to patch.
-auto x64_enc_fix_lbl;   // Array: target label ID.
-auto x64_enc_fix_cnt;   // Number of pending fixups.
+auto x64_enc_fix_pos;   // Dynamic array: byte offset of the rel32 field to patch.
+auto x64_enc_fix_lbl;   // Dynamic array: target label ID.
 
 // ── Relocation system ────────────────────────────────────
 // RIP-relative disp32 fields whose final values are resolved by the ELF/PE writer.
 
-auto x64_enc_rel_pos;   // Array: byte offset of the disp32 field.
-auto x64_enc_rel_sym;   // Array: symbol identifier (packed name or table index).
-auto x64_enc_rel_ty;    // Array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
-auto x64_enc_rel_cnt;   // Number of relocation entries.
+auto x64_enc_rel_pos;   // Dynamic array: byte offset of the disp32 field.
+auto x64_enc_rel_sym;   // Dynamic array: symbol identifier (packed name or table index).
+auto x64_enc_rel_ty;    // Dynamic array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
 
 // ── Condition code constants ─────────────────────────────
 // Used with x64_enc_jcc_label() and x64_enc_setcc().
@@ -50,15 +47,12 @@ auto CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G;
 init_x64_enc() {
     x64_enc_buf     = malloc(1048576);
     x64_enc_pos     = 0;
-    x64_enc_lbl_off = malloc(32768);
-    x64_enc_lbl_max = 0;
-    x64_enc_fix_pos = malloc(65536);
-    x64_enc_fix_lbl = malloc(65536);
-    x64_enc_fix_cnt = 0;
-    x64_enc_rel_pos = malloc(32768);
-    x64_enc_rel_sym = malloc(32768);
-    x64_enc_rel_ty  = malloc(32768);
-    x64_enc_rel_cnt = 0;
+    x64_enc_lbl_off = arr_new();
+    x64_enc_fix_pos = arr_new();
+    x64_enc_fix_lbl = arr_new();
+    x64_enc_rel_pos = arr_new();
+    x64_enc_rel_sym = arr_new();
+    x64_enc_rel_ty  = arr_new();
 
     CC_O = 0; CC_NO = 1; CC_B = 2; CC_AE = 3;
     CC_E = 4; CC_NE = 5; CC_BE = 6; CC_A = 7;
@@ -115,17 +109,21 @@ x64_enc_read32(off) {
 
 // Define a label at the current code position.
 x64_enc_def_label(id) {
-    *(x64_enc_lbl_off + id * 8) = x64_enc_pos;
-    if (id >= x64_enc_lbl_max) { x64_enc_lbl_max = id + 1; }
+    arr_set(x64_enc_lbl_off, id, x64_enc_pos);
+    return 0;
+}
+
+// Define a label at a specific byte offset (for loading cached code).
+x64_enc_def_label_at(id, off) {
+    arr_set(x64_enc_lbl_off, id, off);
     return 0;
 }
 
 // Allocate a new undefined label and return its ID.
 x64_enc_new_label() {
     auto id;
-    id = x64_enc_lbl_max;
-    *(x64_enc_lbl_off + id * 8) = -1;
-    x64_enc_lbl_max = x64_enc_lbl_max + 1;
+    id = arr_len(x64_enc_lbl_off);
+    x64_enc_lbl_off = arr_push(x64_enc_lbl_off, 0 - 1);
     return id;
 }
 
@@ -133,9 +131,8 @@ x64_enc_new_label() {
 
 // Record that a rel32 field at x64_enc_pos needs to be patched to reach the label.
 x64_enc_add_fixup(lbl) {
-    *(x64_enc_fix_pos + x64_enc_fix_cnt * 8) = x64_enc_pos;
-    *(x64_enc_fix_lbl + x64_enc_fix_cnt * 8) = lbl;
-    x64_enc_fix_cnt = x64_enc_fix_cnt + 1;
+    x64_enc_fix_pos = arr_push(x64_enc_fix_pos, x64_enc_pos);
+    x64_enc_fix_lbl = arr_push(x64_enc_fix_lbl, lbl);
     return 0;
 }
 
@@ -143,10 +140,9 @@ x64_enc_add_fixup(lbl) {
 
 // Record a RIP-relative relocation at the given code offset.
 x64_enc_add_reloc(pos, sym, ty) {
-    *(x64_enc_rel_pos + x64_enc_rel_cnt * 8) = pos;
-    *(x64_enc_rel_sym + x64_enc_rel_cnt * 8) = sym;
-    *(x64_enc_rel_ty  + x64_enc_rel_cnt * 8) = ty;
-    x64_enc_rel_cnt = x64_enc_rel_cnt + 1;
+    x64_enc_rel_pos = arr_push(x64_enc_rel_pos, pos);
+    x64_enc_rel_sym = arr_push(x64_enc_rel_sym, sym);
+    x64_enc_rel_ty  = arr_push(x64_enc_rel_ty, ty);
     return 0;
 }
 
@@ -535,6 +531,40 @@ x64_enc_storeb(src, base, disp) {
     return 0;
 }
 
+// MOVZX r64, word [base + disp]. Load 16-bit value, zero-extended to 64 bits.
+x64_enc_loadh(dst, base, disp) {
+    x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0xB7);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// MOV word [base + disp], r16. Store the low 16 bits of a register to memory.
+x64_enc_storeh(src, base, disp) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(0, (src >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x89);
+    x64_enc_mem(src, base, disp);
+    return 0;
+}
+
+// MOV r32, [base + disp]. Load 32-bit value, zero-extended to 64 bits.
+x64_enc_load_w(dst, base, disp) {
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x8B);
+    x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// MOV [base + disp], r32. Store the low 32 bits of a register to memory.
+x64_enc_store_w(src, base, disp) {
+    x64_enc_rex(0, (src >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x89);
+    x64_enc_mem(src, base, disp);
+    return 0;
+}
+
 // LEA r64, [base + disp]. Computes the effective address without accessing memory.
 x64_enc_lea(dst, base, disp) {
     x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
@@ -550,7 +580,7 @@ x64_enc_lea(dst, base, disp) {
 // CALL rel32 to label.
 x64_enc_call_label(lbl) {
     auto target, rel;
-    target = *(x64_enc_lbl_off + lbl * 8);
+    target = arr_get(x64_enc_lbl_off, lbl);
     x64_enc_emit8(0xE8);
     if (target >= 0) {
         rel = target - (x64_enc_pos + 4);
@@ -565,7 +595,7 @@ x64_enc_call_label(lbl) {
 // JMP rel32 to label.
 x64_enc_jmp_label(lbl) {
     auto target, rel;
-    target = *(x64_enc_lbl_off + lbl * 8);
+    target = arr_get(x64_enc_lbl_off, lbl);
     x64_enc_emit8(0xE9);
     if (target >= 0) {
         rel = target - (x64_enc_pos + 4);
@@ -580,7 +610,7 @@ x64_enc_jmp_label(lbl) {
 // Jcc rel32 to label. cc is the condition code (CC_E, CC_NE, CC_L, CC_G, etc.).
 x64_enc_jcc_label(cc, lbl) {
     auto target, rel;
-    target = *(x64_enc_lbl_off + lbl * 8);
+    target = arr_get(x64_enc_lbl_off, lbl);
     x64_enc_emit8(0x0F);
     x64_enc_emit8(0x80 | cc);
     if (target >= 0) {
@@ -844,10 +874,10 @@ x64_enc_load_sd_rip(dst) {
 x64_enc_resolve_fixups() {
     auto i, pos, lbl, target, off;
     i = 0;
-    while (i < x64_enc_fix_cnt) {
-        pos    = *(x64_enc_fix_pos + i * 8);
-        lbl    = *(x64_enc_fix_lbl + i * 8);
-        target = *(x64_enc_lbl_off + lbl * 8);
+    while (i < arr_len(x64_enc_fix_pos)) {
+        pos    = arr_get(x64_enc_fix_pos, i);
+        lbl    = arr_get(x64_enc_fix_lbl, i);
+        target = arr_get(x64_enc_lbl_off, lbl);
         off    = target - (pos + 4);
         x64_enc_patch32(pos, off);
         i = i + 1;

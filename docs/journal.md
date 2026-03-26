@@ -1,5 +1,92 @@
 # B++ Bootstrap Journal
 
+## 2026-03-26 — Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization
+
+Two sessions worth of work. The compiler gained dynamic arrays, sub-word type hints, named field offsets, and a full modular compilation pipeline with .bo object files.
+
+### Dynamic Array Migration
+
+87 arrays across 9 compiler modules migrated from fixed-size malloc with manual counters to `arr_new()`/`arr_push()`/`arr_get()`/`arr_set()` (from `stbarray.bsm`). Eliminates all hard-coded limits on structs, enums, variables, functions, and similar entities. Affected modules: `bpp_parser`, `bpp_types`, `bpp_codegen_arm64`, `bpp_codegen_x86_64`, `bpp_enc_arm64`, `bpp_enc_x86_64`, `bpp_macho`, `bpp_elf`, `bpp_dispatch`.
+
+### Type Hints — Sub-Word Types Across All Backends
+
+Real sub-word type support added to all three backends (ARM64, x86_64, C emitter). Syntax: `auto x: byte;`, `fn(x: float)`. Supported types: `byte` (8-bit), `quarter` (16-bit), `half` (32-bit), `int` (64-bit), `float` (64-bit double). ARM64 uses `ldrb`/`strb`/`ldrh`/`strh`/`ldr w`/`str w`. x86_64 mirrors the same narrowing. C emitter maps to `uint8_t`/`uint16_t`/`uint32_t`. Truncation is performed by hardware. Design: sub-word hints are opt-in performance tuning, never auto-inferred.
+
+### Phase 0 — Module Tracking
+
+Added `tok_src_off` in the lexer to track source file boundaries. Parser stores per-entity module ownership via `func_mods[]`/`glob_mods[]`. `fname_buf` provides permanent filename storage. `diag_loc()` uses binary search over source offsets to resolve the correct file and line for diagnostic messages.
+
+### Phase 1 — Hash + Dependency Graph
+
+FNV-1a content hashing per module. Dependency graph via `dep_from[]`/`dep_to[]` arrays. `topo_sort()` implements Kahn's algorithm in reverse order. Hash persistence in `.bpp_cache/hashes`. `propagate_stale()` marks dependents dirty when a source file changes. `--show-deps` flag for inspecting the graph. Also fixed `hex_emit()` for signed values.
+
+### Named Field Offsets
+
+Added named constants for function record fields (`FN_TYPE`/`FN_NAME`/`FN_PARS`/`FN_PCNT`/`FN_BODY`/`FN_BCNT`/`FN_HINTS`) and extern record fields (`EX_TYPE`/`EX_NAME`/`EX_LIB`/`EX_RET`/`EX_ARGS`/`EX_ACNT`) in `defs.bsm`. Refactored ~110 raw numeric offset accesses across 8 files. This eliminates a class of bugs like the n.c/n.d confusion described below.
+
+### Bug Fix: var Struct Flag Collision
+
+The parser set the stack struct flag for `var v: Vec2` in field `n.c` (offset 24), but type hints also stored their value in `n.c`. Since `TY_BYTE = 1` coincided with the struct flag value, every variable declaration was silently treated as byte-typed. All `test_var_*` tests were segfaulting. Fix: moved the struct flag to `n.d` (offset 32).
+
+### Modular Compilation (.bo Files — Go Model)
+
+Full incremental compilation pipeline, modeled after Go's package compilation. Implemented in 8 steps:
+
+- **bpp_bo.bsm**: New module with I/O primitives — `read`/`write` for `u8`/`u16`/`u32`/`u64`, packed string serialization with vbuf re-packing.
+- **Export data serialization**: Functions (return type + parameter types + hints), structs, enums, globals, and externs are serialized into `.bo` files.
+- **Per-module codegen**: `emit_module_arm64`/`emit_module_x86_64` with accumulative `enc_buf`. Cross-module `BL`/`CALL` instructions use type 4 relocations.
+- **Cross-module call resolution**: `bo_resolve_calls` patches `BL`/`CALL` placeholders after all modules are compiled, then removes type 4 entries from the relocation list.
+- **Incremental driver**: `--incremental` flag triggers per-module lex/parse/infer/codegen. `.bo` cache stored in `.bpp_cache/`.
+- **String/float index remapping**: Resolved issue where string and float constant indices collided across modules. Sentinel handling preserved for argc/argv globals.
+- **Extern refresh**: FFI argument rearrangement was empty in the modular path because externs were only loaded once. Fixed by refreshing externs per-module before codegen.
+
+### Module Ownership Tracking
+
+Added `struct_mods[]`/`enum_mods[]`/`extern_mods[]` alongside existing `func_mods[]`/`glob_mods[]`. All entity types now track which source module defined them.
+
+### find_func_idx Backward Scan
+
+Changed `find_func_idx` to scan backward for "last wins" semantics matching codegen behavior. Later reverted — backward scan caused a segfault in gen3 bootstrap due to interaction with type inference. Deferred for future investigation.
+
+### Backend Reorganization
+
+Moved platform-specific files into subdirectories:
+- `src/aarch64/`: `a64_enc.bsm`, `a64_codegen.bsm`, `a64_macho.bsm`
+- `src/x86_64/`: `x64_enc.bsm`, `x64_codegen.bsm`, `x64_elf.bsm`
+
+All import paths updated throughout the compiler source.
+
+### x86_64 _start Stub
+
+Extracted `x64_emit_start_stub()` so the per-module pipeline can emit `_start` after all modules have been compiled rather than at the start of codegen.
+
+### stb Changes
+
+- `stbdraw`: `draw_number()` changed from global `_num_buf` to local malloc+free.
+- `stbui`: Added bounds checks in `ui_alloc()` and `lay_push()`.
+
+### Bugs Found
+
+| Bug | Status |
+|-----|--------|
+| var struct flag collision (`n.c = 1 = TY_BYTE`) | FIXED — moved flag to `n.d` |
+| Extern FFI rearrangement empty in modular path | FIXED — refresh externs per-module |
+| Param float inference regression (params in float expressions stay `TY_LONG`, `fcvtzs` destroys values) | WORKAROUND — `: float` annotation. Root cause: `propagate_call_params()` disabled |
+| `find_func_idx` backward scan segfault in gen3 bootstrap | REVERTED |
+| `ptr` and `len` are reserved words in B++ | Discovered when writing `bpp_bo.bsm` |
+
+### Verification
+
+| Test | Result |
+|------|--------|
+| Bootstrap (monolithic) | Passes |
+| Bootstrap (per-module `--incremental`) | Self-consistent |
+| All test programs | Pass (ARM64 + Linux x86_64) |
+| Snake game | Compiles and runs on all backends |
+| MCU game | Compiles and runs (with `: float` parameter annotations) |
+
+---
+
 ## 2026-03-25 — Linux x86_64 Port: First Binary to Snake Game
 
 ### x86_64 Cross-Compilation Working

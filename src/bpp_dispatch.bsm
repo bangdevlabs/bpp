@@ -13,13 +13,13 @@ auto DSP_SEQ, DSP_PAR, DSP_GPU, DSP_SPLIT;
 
 // Extern purity table: packed names of known-pure extern functions.
 // Any extern not in this table is assumed to have side effects.
-auto pure_ext, pure_ext_cnt;
+auto pure_ext;
 
 // Strided variable set for the current loop analysis.
-auto stride_vars, stride_cnt;
+auto stride_vars;
 
 // Local variable set for the current function scope.
-auto dsp_local_vars, dsp_local_cnt;
+auto dsp_local_vars;
 
 // Initialize the dispatch engine. Call once at startup.
 init_dispatch() {
@@ -27,19 +27,15 @@ init_dispatch() {
     DSP_PAR = 1;
     DSP_GPU = 2;
     DSP_SPLIT = 3;
-    pure_ext = malloc(512);
-    pure_ext_cnt = 0;
-    stride_vars = malloc(512);
-    stride_cnt = 0;
-    dsp_local_vars = malloc(2048);
-    dsp_local_cnt = 0;
+    pure_ext = arr_new();
+    stride_vars = arr_new();
+    dsp_local_vars = arr_new();
     return 0;
 }
 
 // Register a pure extern function (no side effects). Call during setup.
 add_pure_extern(name_p) {
-    *(pure_ext + pure_ext_cnt * 8) = name_p;
-    pure_ext_cnt = pure_ext_cnt + 1;
+    pure_ext = arr_push(pure_ext, name_p);
     return 0;
 }
 
@@ -47,8 +43,8 @@ add_pure_extern(name_p) {
 is_pure_extern(name_p) {
     auto i;
     i = 0;
-    while (i < pure_ext_cnt) {
-        if (*(pure_ext + i * 8) == name_p) { return 1; }
+    while (i < arr_len(pure_ext)) {
+        if (arr_get(pure_ext, i) == name_p) { return 1; }
         i = i + 1;
     }
     return 0;
@@ -56,14 +52,13 @@ is_pure_extern(name_p) {
 
 // Register a local variable for the current function scope.
 dsp_add_local(name_p) {
-    *(dsp_local_vars + dsp_local_cnt * 8) = name_p;
-    dsp_local_cnt = dsp_local_cnt + 1;
+    dsp_local_vars = arr_push(dsp_local_vars, name_p);
     return 0;
 }
 
 // Reset local variables for a new function scope.
 dsp_reset_locals() {
-    dsp_local_cnt = 0;
+    arr_clear(dsp_local_vars);
     return 0;
 }
 
@@ -71,8 +66,8 @@ dsp_reset_locals() {
 dsp_is_local(name_p) {
     auto i;
     i = 0;
-    while (i < dsp_local_cnt) {
-        if (*(dsp_local_vars + i * 8) == name_p) { return 1; }
+    while (i < arr_len(dsp_local_vars)) {
+        if (arr_get(dsp_local_vars, i) == name_p) { return 1; }
         i = i + 1;
     }
     return 0;
@@ -82,8 +77,8 @@ dsp_is_local(name_p) {
 is_strided(name_p) {
     auto i;
     i = 0;
-    while (i < stride_cnt) {
-        if (*(stride_vars + i * 8) == name_p) { return 1; }
+    while (i < arr_len(stride_vars)) {
+        if (arr_get(stride_vars, i) == name_p) { return 1; }
         i = i + 1;
     }
     return 0;
@@ -160,7 +155,7 @@ find_strided(body_arr, body_cnt, loop_var_p) {
     auto i;
     auto stmt: Node, left: Node, right: Node;
     auto r_right: Node;
-    stride_cnt = 0;
+    arr_clear(stride_vars);
     if (loop_var_p == 0) { return 0; }
     i = 0;
     while (i < body_cnt) {
@@ -175,8 +170,7 @@ find_strided(body_arr, body_cnt, loop_var_p) {
                         if (r_right != 0) {
                             if (r_right.ntype == T_BINOP) {
                                 if (contains_var(r_right, loop_var_p)) {
-                                    *(stride_vars + stride_cnt * 8) = left.a;
-                                    stride_cnt = stride_cnt + 1;
+                                    stride_vars = arr_push(stride_vars, left.a);
                                 }
                             }
                         }
@@ -314,8 +308,8 @@ classify_loop(wh) {
     // Step 3: add strided vars and loop var to local scope.
     if (loop_var_p != 0) { dsp_add_local(loop_var_p); }
     i = 0;
-    while (i < stride_cnt) {
-        dsp_add_local(*(stride_vars + i * 8));
+    while (i < arr_len(stride_vars)) {
+        dsp_add_local(arr_get(stride_vars, i));
         i = i + 1;
     }
 
@@ -335,13 +329,13 @@ classify_loop(wh) {
     // Step 5: classify.
     dsp = DSP_SEQ;
     if (impure_cnt == 0) {
-        if (stride_cnt > 0) {
+        if (arr_len(stride_vars) > 0) {
             dsp = DSP_GPU;
         } else {
             dsp = DSP_PAR;
         }
     } else {
-        if (stride_cnt > 0) {
+        if (arr_len(stride_vars) > 0) {
             if (pure_cnt > 0) {
                 dsp = DSP_SPLIT;
             }
@@ -386,10 +380,10 @@ run_dispatch() {
     i = 0;
     while (i < func_cnt) {
         func = *(funcs + i * 8);
-        params_arr = *(func + 16);
-        param_cnt = *(func + 24);
-        body_arr = *(func + 32);
-        body_cnt = *(func + 40);
+        params_arr = *(func + FN_PARS);
+        param_cnt = *(func + FN_PCNT);
+        body_arr = *(func + FN_BODY);
+        body_cnt = *(func + FN_BCNT);
 
         dsp_reset_locals();
 

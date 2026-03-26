@@ -6,24 +6,36 @@
 
 auto fbuf;          // File read buffer (256KB), used as a stack.
 auto fbuf_top;      // Stack pointer within fbuf for nested imports.
-auto imp_hashes;    // Hash table for tracking imported files.
-auto imp_cnt;       // Number of imported files.
+auto imp_hashes;    // Dynamic array: hash values of imported file paths.
 auto pathbuf;       // Scratch buffer for path resolution.
 auto linebuf;       // Current line being processed.
 auto outbuf;        // Output buffer (512KB) holding the merged source text.
 auto outbuf_len;    // Current write position in outbuf.
+auto fname_buf;     // Permanent buffer for module filenames (survives fbuf stack restore).
+auto fname_pos;     // Write position in fname_buf.
 
 // File boundary tracking for diagnostic location info.
-auto diag_file_starts;  // Array: outbuf offset where each file's content begins.
-auto diag_file_names;   // Array: packed filename for each file.
-auto diag_file_cnt;     // Number of file boundary entries.
+auto diag_file_starts;  // Dynamic array: outbuf offset where each file's content begins.
+auto diag_file_names;   // Dynamic array: packed filename for each file.
+auto diag_file_line_starts; // Dynamic array: cumulative line count at each file boundary.
+auto outbuf_lines;      // Running count of newline characters written to outbuf.
+
+// Module dependency graph and hashing.
+auto mod_hashes;        // Dynamic array: FNV-1a hash of each module's file content.
+auto dep_from;          // Dynamic array: source module index for each dependency edge.
+auto dep_to;            // Dynamic array: target module index for each dependency edge.
+auto mod_topo;          // Dynamic array: module indices in topological compilation order.
+auto mod_stale;         // Dynamic array: 1 if module changed since last build, 0 if clean.
+auto _cache_buf;        // Scratch buffer for reading/writing the hash cache file.
 
 // ── Output helpers ───────────────────────────────────────────
 
 // Write a single byte to the output buffer.
+// Tracks newline count for file-relative line number computation.
 emit_ch(ch) {
     poke(outbuf + outbuf_len, ch);
     outbuf_len = outbuf_len + 1;
+    if (ch == 10) { outbuf_lines = outbuf_lines + 1; }
     return 0;
 }
 
@@ -86,16 +98,249 @@ was_imported(path_off, path_len) {
     auto h, i;
     h = hash_mem(path_off, path_len);
     i = 0;
-    while (i < imp_cnt) {
-        if (*(imp_hashes + i * 8) == h) { return 1; }
+    while (i < arr_len(imp_hashes)) {
+        if (arr_get(imp_hashes, i) == h) { return 1; }
         i = i + 1;
     }
     return 0;
 }
 
 mark_imported(path_off, path_len) {
-    *(imp_hashes + imp_cnt * 8) = hash_mem(path_off, path_len);
-    imp_cnt = imp_cnt + 1;
+    imp_hashes = arr_push(imp_hashes, hash_mem(path_off, path_len));
+    return 0;
+}
+
+// Find the module index for a given source buffer offset.
+// Performs binary search on diag_file_starts to find which file
+// the offset belongs to. Returns the 0-based module index.
+mod_idx(src_off) {
+    auto lo, hi, mid, ms;
+    lo = 0; hi = arr_len(diag_file_starts) - 1;
+    while (lo < hi) {
+        mid = (lo + hi + 1) / 2;
+        ms = arr_get(diag_file_starts, mid);
+        if (ms <= src_off) { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+
+// Find the module index for a file path by searching imp_hashes (path hashes).
+// Used during dependency edge recording to identify already-imported modules.
+mod_idx_by_hash(path_off, path_len) {
+    auto h, i;
+    h = hash_mem(path_off, path_len);
+    i = 0;
+    while (i < arr_len(imp_hashes)) {
+        if (arr_get(imp_hashes, i) == h) { return i; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Compute FNV-1a 64-bit hash over len bytes at memory address off.
+// Used for content-based cache invalidation across builds.
+fnv1a(off, len) {
+    auto h, i;
+    h = 0xcbf29ce484222325;
+    i = 0;
+    while (i < len) {
+        h = h ^ peek(off + i);
+        h = h * 0x100000001b3;
+        i = i + 1;
+    }
+    return h;
+}
+
+// ── Topological sort ─────────────────────────────────────────
+
+// Compute topological ordering of the module dependency graph.
+// Uses reverse Kahn's algorithm: leaf modules (that import nothing) come first,
+// the top-level driver comes last. This is the correct compilation order.
+topo_sort() {
+    auto n, i, j, in_deg, queue, head, tail, u;
+    n = arr_len(diag_file_starts);
+    in_deg = malloc(n * 8);
+    // Initialize in-degrees to zero.
+    i = 0; while (i < n) { *(in_deg + i * 8) = 0; i = i + 1; }
+    // Count how many modules each module imports (reverse in-degree).
+    i = 0;
+    while (i < arr_len(dep_from)) {
+        j = arr_get(dep_from, i);
+        *(in_deg + j * 8) = *(in_deg + j * 8) + 1;
+        i = i + 1;
+    }
+    // Enqueue modules that import nothing (leaf modules).
+    queue = malloc(n * 8);
+    head = 0; tail = 0;
+    i = 0;
+    while (i < n) {
+        if (*(in_deg + i * 8) == 0) { *(queue + tail * 8) = i; tail = tail + 1; }
+        i = i + 1;
+    }
+    // Process queue: peel off leaves, decrement importers.
+    mod_topo = arr_new();
+    while (head < tail) {
+        u = *(queue + head * 8); head = head + 1;
+        mod_topo = arr_push(mod_topo, u);
+        // Find all edges where u is the imported module (dep_to[i] == u).
+        i = 0;
+        while (i < arr_len(dep_to)) {
+            if (arr_get(dep_to, i) == u) {
+                j = arr_get(dep_from, i);
+                *(in_deg + j * 8) = *(in_deg + j * 8) - 1;
+                if (*(in_deg + j * 8) == 0) { *(queue + tail * 8) = j; tail = tail + 1; }
+            }
+            i = i + 1;
+        }
+    }
+    free(in_deg); free(queue);
+    return 0;
+}
+
+// ── Hash cache ───────────────────────────────────────────────
+
+// Write a 64-bit value as 16 hexadecimal characters into buf at offset off.
+// Uses bitwise operations to handle unsigned hash values correctly.
+hex_emit(buf, off, val) {
+    auto i, nibble, ch;
+    i = 15;
+    while (i >= 0) {
+        nibble = val & 15;
+        if (nibble < 10) { ch = 48 + nibble; }
+        else { ch = 87 + nibble; }
+        poke(buf + off + i, ch);
+        val = (val >> 4) & 0x0fffffffffffffff;
+        i = i - 1;
+    }
+    return off + 16;
+}
+
+// Parse 16 hexadecimal characters from buf at offset off into a 64-bit value.
+hex_parse(buf, off) {
+    auto val, i, ch, d;
+    val = 0;
+    i = 0;
+    while (i < 16) {
+        ch = peek(buf + off + i);
+        d = 0;
+        if (ch >= 48) { if (ch <= 57) { d = ch - 48; } }
+        if (ch >= 97) { if (ch <= 102) { d = ch - 87; } }
+        if (ch >= 65) { if (ch <= 70) { d = ch - 55; } }
+        val = val * 16 + d;
+        i = i + 1;
+    }
+    return val;
+}
+
+// Load cached hashes from .bpp_cache/hashes and compare against current mod_hashes.
+// Sets mod_stale[i] = 1 for each module whose hash differs from the cached value.
+cache_load() {
+    auto fd, n, i, nread, bpos, line_start, hash_val, j, fname_len;
+    n = arr_len(diag_file_starts);
+    mod_stale = arr_new();
+    // Default: all modules are stale.
+    i = 0;
+    while (i < n) { mod_stale = arr_push(mod_stale, 1); i = i + 1; }
+    // Try to open the cache file.
+    poke(pathbuf+0,'.'); poke(pathbuf+1,'b'); poke(pathbuf+2,'p'); poke(pathbuf+3,'p');
+    poke(pathbuf+4,'_'); poke(pathbuf+5,'c'); poke(pathbuf+6,'a'); poke(pathbuf+7,'c');
+    poke(pathbuf+8,'h'); poke(pathbuf+9,'e'); poke(pathbuf+10,'/');
+    poke(pathbuf+11,'h'); poke(pathbuf+12,'a'); poke(pathbuf+13,'s'); poke(pathbuf+14,'h');
+    poke(pathbuf+15,'e'); poke(pathbuf+16,'s'); poke(pathbuf+17, 0);
+    fd = sys_open(pathbuf, 0);
+    if (fd < 0) { return 0; }
+    nread = sys_read(fd, _cache_buf, 65536);
+    sys_close(fd);
+    if (nread <= 0) { return 0; }
+    // Parse lines: each line is "<16-char hex hash> <filename>\n".
+    bpos = 0;
+    while (bpos + 17 < nread) {
+        hash_val = hex_parse(_cache_buf, bpos);
+        bpos = bpos + 17;
+        // Read filename until newline.
+        line_start = bpos;
+        while (bpos < nread) {
+            if (peek(_cache_buf + bpos) == 10) { bpos = bpos + nread; }
+            if (bpos < nread) { bpos = bpos + 1; }
+        }
+        if (bpos >= nread) { bpos = bpos - nread; }
+        fname_len = bpos - line_start;
+        bpos = bpos + 1;
+        // Match filename against known modules and compare hash.
+        i = 0;
+        while (i < n) {
+            auto fp, fs, fl, match;
+            fp = arr_get(diag_file_names, i);
+            fs = unpack_s(fp); fl = unpack_l(fp);
+            if (fl == fname_len) {
+                match = 1; j = 0;
+                while (j < fl) {
+                    if (peek(fname_buf + fs + j) != peek(_cache_buf + line_start + j)) { match = 0; }
+                    j = j + 1;
+                }
+                if (match) {
+                    if (hash_val == arr_get(mod_hashes, i)) { arr_set(mod_stale, i, 0); }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// Write current module hashes to .bpp_cache/hashes for the next build.
+cache_save() {
+    auto fd, n, i, bpos, fp, fs, fl, j;
+    n = arr_len(diag_file_starts);
+    // Build cache file path (.bpp_cache/hashes).
+    poke(pathbuf+0,'.'); poke(pathbuf+1,'b'); poke(pathbuf+2,'p'); poke(pathbuf+3,'p');
+    poke(pathbuf+4,'_'); poke(pathbuf+5,'c'); poke(pathbuf+6,'a'); poke(pathbuf+7,'c');
+    poke(pathbuf+8,'h'); poke(pathbuf+9,'e'); poke(pathbuf+10,'/');
+    poke(pathbuf+11,'h'); poke(pathbuf+12,'a'); poke(pathbuf+13,'s'); poke(pathbuf+14,'h');
+    poke(pathbuf+15,'e'); poke(pathbuf+16,'s'); poke(pathbuf+17, 0);
+    // Build output in _cache_buf.
+    bpos = 0;
+    i = 0;
+    while (i < n) {
+        bpos = hex_emit(_cache_buf, bpos, arr_get(mod_hashes, i));
+        poke(_cache_buf + bpos, 32); bpos = bpos + 1;
+        fp = arr_get(diag_file_names, i);
+        fs = unpack_s(fp); fl = unpack_l(fp);
+        j = 0;
+        while (j < fl) {
+            poke(_cache_buf + bpos, peek(fname_buf + fs + j));
+            bpos = bpos + 1;
+            j = j + 1;
+        }
+        poke(_cache_buf + bpos, 10); bpos = bpos + 1;
+        i = i + 1;
+    }
+    // Write to file. Graceful skip if directory doesn't exist.
+    fd = sys_open(pathbuf, 0x601);
+    if (fd < 0) { return 0; }
+    sys_write(fd, _cache_buf, bpos);
+    sys_close(fd);
+    return 0;
+}
+
+// Propagate staleness through the dependency graph using topological order.
+// If a module is stale, all modules that depend on it become stale too.
+propagate_stale() {
+    auto i, j, mi;
+    i = 0;
+    while (i < arr_len(mod_topo)) {
+        mi = arr_get(mod_topo, i);
+        if (arr_get(mod_stale, mi)) {
+            j = 0;
+            while (j < arr_len(dep_to)) {
+                if (arr_get(dep_to, j) == mi) {
+                    arr_set(mod_stale, arr_get(dep_from, j), 1);
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -308,7 +553,7 @@ process_file(path_off, path_len) { return 0; }
 process_file(path_off, path_len) {
     auto fd, nread, fsize, pos, line_start, ch;
     auto fname_len, plen, i;
-    auto saved_top, my_path, my_file;
+    auto saved_top, my_path, my_file, my_mod_idx;
 
     if (was_imported(path_off, path_len)) { return 0; }
     mark_imported(path_off, path_len);
@@ -364,9 +609,21 @@ process_file(path_off, path_len) {
     fbuf_top = my_file + fsize;
 
     // Record file boundary for diagnostic location info.
-    *(diag_file_starts + diag_file_cnt * 8) = outbuf_len;
-    *(diag_file_names + diag_file_cnt * 8) = pack(my_path, path_len);
-    diag_file_cnt = diag_file_cnt + 1;
+    // Copy filename to permanent buffer (fbuf is a stack and gets overwritten).
+    auto fn_start;
+    fn_start = fname_pos;
+    i = 0;
+    while (i < path_len) {
+        poke(fname_buf + fname_pos, peek(fbuf + my_path + i));
+        fname_pos = fname_pos + 1;
+        i = i + 1;
+    }
+    diag_file_starts = arr_push(diag_file_starts, outbuf_len);
+    diag_file_names = arr_push(diag_file_names, pack(fn_start, path_len));
+    diag_file_line_starts = arr_push(diag_file_line_starts, outbuf_lines);
+    // Hash the file content for cache invalidation.
+    mod_hashes = arr_push(mod_hashes, fnv1a(fbuf + my_file, fsize));
+    my_mod_idx = arr_len(diag_file_starts) - 1;
 
     // Process line by line.
     pos = 0;
@@ -389,6 +646,9 @@ process_file(path_off, path_len) {
             plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);
             if (plen > 0) {
                 process_file(pathbuf, plen);
+                // Record dependency edge: this module imports the resolved module.
+                dep_from = arr_push(dep_from, my_mod_idx);
+                dep_to = arr_push(dep_to, mod_idx_by_hash(pathbuf, plen));
             } else {
                 diag_fatal(2);
                 diag_str("import '");
@@ -423,15 +683,21 @@ process_file(path_off, path_len) {
 init_import() {
     fbuf = malloc(262144);
     fbuf_top = 0;
-    imp_hashes = malloc(2048);
-    imp_cnt = 0;
+    imp_hashes = arr_new();
     pathbuf = malloc(4096);
     linebuf = malloc(4096);
     outbuf = malloc(1048576);
     outbuf_len = 0;
-    diag_file_starts = malloc(4096);
-    diag_file_names = malloc(4096);
-    diag_file_cnt = 0;
+    fname_buf = malloc(65536);
+    fname_pos = 0;
+    diag_file_starts = arr_new();
+    diag_file_names = arr_new();
+    diag_file_line_starts = arr_new();
+    outbuf_lines = 0;
+    mod_hashes = arr_new();
+    dep_from = arr_new();
+    dep_to = arr_new();
+    _cache_buf = malloc(65536);
     init_target();
     return 0;
 }

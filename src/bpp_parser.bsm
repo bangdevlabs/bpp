@@ -13,21 +13,24 @@ auto globals, glob_cnt;
 auto externs, ext_cnt;
 auto funcs, func_cnt;
 
-// Struct registry: each entry is 32 bytes (name, fields ptr, field_count, size).
-auto struct_defs, struct_cnt;
+// Struct registry: 4 parallel dynamic arrays (name, fields ptr, field count, size).
+auto sd_names, sd_fields, sd_fcounts, sd_sizes;
 
-// Variable type map: each entry is 16 bytes (var_name packed, struct_index).
-auto var_types, vtype_cnt;
+// Variable type map: 2 parallel dynamic arrays (var_name packed, struct_index).
+auto vt_names, vt_sidx;
 
 // Stack struct flag: tracks which variables are stack-allocated (via var keyword).
-auto var_stack_names, var_stack_cnt;
+auto var_stack_names;
 
-// Enum constant registry: maps packed names to integer values.
-// Each entry is 16 bytes (packed_name, int_value).
-auto enum_vals, enum_cnt;
+// Enum constant registry: 2 parallel dynamic arrays (packed_name, int_value).
+auto ev_names, ev_values;
 
 // TK_FLOAT is not declared in defs.bpp, so the parser owns it.
 auto TK_FLOAT;
+
+// Primitive type hint set by try_type_annotation(). 0 = no hint,
+// TY_FLOAT or TY_LONG when the annotation is a primitive name.
+auto _prim_hint;
 
 // ============================================================
 // Initialization
@@ -48,15 +51,22 @@ init_parser() {
     ext_cnt = 0;
     funcs = arr_new();
     func_cnt = 0;
-    struct_defs = malloc(64 * 32);
-    struct_cnt = 0;
-    var_types = malloc(512 * 16);
-    vtype_cnt = 0;
-    var_stack_names = malloc(512 * 8);
-    enum_vals = malloc(1024 * 16);
-    enum_cnt = 0;
-    var_stack_cnt = 0;
+    func_mods = arr_new();
+    glob_mods = arr_new();
+    struct_mods = arr_new();
+    enum_mods = arr_new();
+    extern_mods = arr_new();
+    sd_names = arr_new();
+    sd_fields = arr_new();
+    sd_fcounts = arr_new();
+    sd_sizes = arr_new();
+    vt_names = arr_new();
+    vt_sidx = arr_new();
+    var_stack_names = arr_new();
+    ev_names = arr_new();
+    ev_values = arr_new();
     TK_FLOAT = 8;
+    _prim_hint = 0;
     return 0;
 }
 
@@ -86,36 +96,32 @@ packed_eq(p1, p2) {
 
 // Register a new struct definition. Returns its index.
 add_struct_def(name_p) {
-    auto entry;
-    entry = struct_defs + struct_cnt * 32;
-    *(entry + 0) = name_p;
-    *(entry + 8) = malloc(64 * 8);
-    *(entry + 16) = 0;
-    *(entry + 24) = 0;
-    struct_cnt = struct_cnt + 1;
-    return struct_cnt - 1;
+    sd_names = arr_push(sd_names, name_p);
+    sd_fields = arr_push(sd_fields, malloc(64 * 8));
+    sd_fcounts = arr_push(sd_fcounts, 0);
+    sd_sizes = arr_push(sd_sizes, 0);
+    struct_mods = arr_push(struct_mods, tok_mod(tok_pos));
+    return arr_len(sd_names) - 1;
 }
 
 // Add a field to an existing struct. Fields are stored as packed strings.
 add_struct_field(idx, field_p) {
-    auto entry, fields, fc;
-    entry = struct_defs + idx * 32;
-    fields = *(entry + 8);
-    fc = *(entry + 16);
+    auto fields, fc;
+    fields = arr_get(sd_fields, idx);
+    fc = arr_get(sd_fcounts, idx);
     *(fields + fc * 8) = field_p;
     fc = fc + 1;
-    *(entry + 16) = fc;
-    *(entry + 24) = fc * 8;
+    arr_set(sd_fcounts, idx, fc);
+    arr_set(sd_sizes, idx, fc * 8);
     return 0;
 }
 
 // Find a struct by name. Returns its index or -1 if not found.
 find_struct(name_p) {
-    auto i, entry;
+    auto i;
     i = 0;
-    while (i < struct_cnt) {
-        entry = struct_defs + i * 32;
-        if (packed_eq(*(entry + 0), name_p)) { return i; }
+    while (i < arr_len(sd_names)) {
+        if (packed_eq(arr_get(sd_names, i), name_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -123,10 +129,9 @@ find_struct(name_p) {
 
 // Get the byte offset of a field within a struct. Returns -1 if not found.
 get_field_offset(idx, field_p) {
-    auto entry, fields, fc, i;
-    entry = struct_defs + idx * 32;
-    fields = *(entry + 8);
-    fc = *(entry + 16);
+    auto fields, fc, i;
+    fields = arr_get(sd_fields, idx);
+    fc = arr_get(sd_fcounts, idx);
     i = 0;
     while (i < fc) {
         if (packed_eq(*(fields + i * 8), field_p)) { return i * 8; }
@@ -137,26 +142,22 @@ get_field_offset(idx, field_p) {
 
 // Get the total size in bytes of a struct.
 get_struct_size(idx) {
-    return *(struct_defs + idx * 32 + 24);
+    return arr_get(sd_sizes, idx);
 }
 
 // Record a variable's struct type for dot-access resolution.
 set_var_type(var_p, idx) {
-    auto entry;
-    entry = var_types + vtype_cnt * 16;
-    *(entry + 0) = var_p;
-    *(entry + 8) = idx;
-    vtype_cnt = vtype_cnt + 1;
+    vt_names = arr_push(vt_names, var_p);
+    vt_sidx = arr_push(vt_sidx, idx);
     return 0;
 }
 
 // Look up a variable's struct type. Returns struct index or -1.
 get_var_type(var_p) {
-    auto i, entry;
-    i = vtype_cnt - 1;
+    auto i;
+    i = arr_len(vt_names) - 1;
     while (i >= 0) {
-        entry = var_types + i * 16;
-        if (packed_eq(*(entry + 0), var_p)) { return *(entry + 8); }
+        if (packed_eq(arr_get(vt_names, i), var_p)) { return arr_get(vt_sidx, i); }
         i = i - 1;
     }
     return -1;
@@ -164,17 +165,16 @@ get_var_type(var_p) {
 
 // Mark a variable as stack-allocated (declared with var keyword).
 set_var_stack(var_p) {
-    *(var_stack_names + var_stack_cnt * 8) = var_p;
-    var_stack_cnt = var_stack_cnt + 1;
+    var_stack_names = arr_push(var_stack_names, var_p);
     return 0;
 }
 
 // Check if a variable is stack-allocated. Returns 1 if yes, 0 otherwise.
 is_var_stack(var_p) {
     auto i;
-    i = var_stack_cnt - 1;
+    i = arr_len(var_stack_names) - 1;
     while (i >= 0) {
-        if (packed_eq(*(var_stack_names + i * 8), var_p)) { return 1; }
+        if (packed_eq(arr_get(var_stack_names, i), var_p)) { return 1; }
         i = i - 1;
     }
     return 0;
@@ -182,22 +182,18 @@ is_var_stack(var_p) {
 
 // Register an enum constant: maps a packed name to an integer value.
 add_enum_val(name_p, val) {
-    auto entry;
-    entry = enum_vals + enum_cnt * 16;
-    *(entry + 0) = name_p;
-    *(entry + 8) = val;
-    enum_cnt = enum_cnt + 1;
+    ev_names = arr_push(ev_names, name_p);
+    ev_values = arr_push(ev_values, val);
+    enum_mods = arr_push(enum_mods, tok_mod(tok_pos));
     return 0;
 }
 
 // Look up an enum constant by packed name. Returns the value or -1 if not found.
-// Uses a sentinel: stores val+1 so that 0 is distinguishable from "not found".
 find_enum_val(name_p) {
-    auto i, entry;
-    i = enum_cnt - 1;
+    auto i;
+    i = arr_len(ev_names) - 1;
     while (i >= 0) {
-        entry = enum_vals + i * 16;
-        if (packed_eq(*(entry + 0), name_p)) { return *(entry + 8); }
+        if (packed_eq(arr_get(ev_names, i), name_p)) { return arr_get(ev_values, i); }
         i = i - 1;
     }
     return 0 - 1;
@@ -335,6 +331,18 @@ val_at_ch(off, c) {
 }
 
 // ============================================================
+// ── Module tracking ───────────────────────────────────────────
+// Each function and global records which module it was defined in.
+
+auto func_mods;     // Module index for each parsed function.
+auto glob_mods;     // Module index for each parsed global.
+auto struct_mods;   // Module index for each struct definition.
+auto enum_mods;     // Module index for each enum constant.
+auto extern_mods;   // Module index for each extern declaration.
+
+// Return the module index that a given token belongs to.
+tok_mod(tidx) { return mod_idx(*(tok_src_off + tidx * 8)); }
+
 // Parser: top-level structures
 // ============================================================
 
@@ -342,16 +350,63 @@ val_at_ch(off, c) {
 add_global(p) {
     globals = arr_push(globals, p);
     glob_cnt = arr_len(globals);
+    glob_mods = arr_push(glob_mods, tok_mod(tok_pos));
     return 0;
 }
 
-// Skip an optional ": TypeName" annotation after a variable name.
-// If present, records the struct type for the variable.
+// Parse an optional ": TypeName" annotation after a variable name.
+// Recognizes primitive types and struct types. Primitive names:
+//   float   → TY_FLOAT  (64-bit double)
+//   int     → TY_LONG   (64-bit, the default word size)
+//   half    → TY_HALF   (32-bit, half of a word)
+//   quarter → TY_QUART   (16-bit, quarter of a word)
+//   byte    → TY_BYTE   (8-bit)
+// Sets _prim_hint to the type code, or 0 if no primitive match.
 try_type_annotation(var_p) {
-    auto type_p, idx;
+    auto type_p, idx, tl, ts;
+    _prim_hint = 0;
     if (val_is_ch(':')) {
         consume();
         type_p = cur_packed();
+        tl = unpack_l(type_p);
+        ts = vbuf + unpack_s(type_p);
+
+        // Check primitive type names before struct lookup.
+        if (tl == 5) {
+            if (buf_eq(ts, "float", 5)) {
+                _prim_hint = TY_FLOAT;
+                consume();
+                return 0;
+            }
+        }
+        if (tl == 3) {
+            if (buf_eq(ts, "int", 3)) {
+                _prim_hint = TY_LONG;
+                consume();
+                return 0;
+            }
+        }
+        if (tl == 4) {
+            if (buf_eq(ts, "half", 4)) {
+                _prim_hint = TY_HALF;
+                consume();
+                return 0;
+            }
+            if (buf_eq(ts, "byte", 4)) {
+                _prim_hint = TY_BYTE;
+                consume();
+                return 0;
+            }
+        }
+        if (tl == 7) {
+            if (buf_eq(ts, "quarter", 7)) {
+                _prim_hint = TY_QUART;
+                consume();
+                return 0;
+            }
+        }
+
+        // Struct type lookup.
         idx = find_struct(type_p);
         if (idx >= 0) {
             set_var_type(var_p, idx);
@@ -462,14 +517,15 @@ parse_import() {
         consume();
         args_arr = list_end();
         ext = malloc(NODE_SZ);
-        *(ext + 0) = 21;
-        *(ext + 8) = name_p;
-        *(ext + 16) = lib_p;
-        *(ext + 24) = ret_p;
-        *(ext + 32) = args_arr;
-        *(ext + 40) = last_list_cnt;
+        *(ext + EX_TYPE) = 21;
+        *(ext + EX_NAME) = name_p;
+        *(ext + EX_LIB) = lib_p;
+        *(ext + EX_RET) = ret_p;
+        *(ext + EX_ARGS) = args_arr;
+        *(ext + EX_ACNT) = last_list_cnt;
         externs = arr_push(externs, ext);
         ext_cnt = arr_len(externs);
+        extern_mods = arr_push(extern_mods, tok_mod(tok_pos));
     }
     consume();
     return 0;
@@ -532,17 +588,27 @@ parse_primary() { return 0; }
 parse_unary() { return 0; }
 
 // Parse a function definition: name(params) { body }
+// Collects primitive type hints for parameters and stores them in offset 48.
 parse_function() {
     auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p;
+    auto ph_arr, ph_cnt, has_hints, my_mod;
+    my_mod = tok_mod(tok_pos);
     name_p = cur_packed();
     consume();
     consume();
+    // Collect parameter hints while parsing the parameter list.
+    ph_arr = malloc(64);
+    ph_cnt = 0;
+    has_hints = 0;
     list_begin();
     while (val_is_ch(')') == 0) {
         var_p = cur_packed();
         list_push(var_p);
         consume();
         try_type_annotation(var_p);
+        *(ph_arr + ph_cnt * 8) = _prim_hint;
+        if (_prim_hint > 0) { has_hints = 1; }
+        ph_cnt = ph_cnt + 1;
         if (val_is_ch(',')) { consume(); }
     }
     consume();
@@ -557,20 +623,54 @@ parse_function() {
     body_arr = list_end();
     body_cnt = last_list_cnt;
     func = malloc(NODE_SZ);
-    *(func + 0) = 22;
-    *(func + 8) = name_p;
-    *(func + 16) = params_arr;
-    *(func + 24) = param_cnt;
-    *(func + 32) = body_arr;
-    *(func + 40) = body_cnt;
+    *(func + FN_TYPE) = 22;
+    *(func + FN_NAME) = name_p;
+    *(func + FN_PARS) = params_arr;
+    *(func + FN_PCNT) = param_cnt;
+    *(func + FN_BODY) = body_arr;
+    *(func + FN_BCNT) = body_cnt;
+    // Store parameter hint array in the hints field.
+    if (has_hints) { *(func + FN_HINTS) = ph_arr; }
+    else { *(func + FN_HINTS) = 0; free(ph_arr); }
     funcs = arr_push(funcs, func);
     func_cnt = arr_len(funcs);
+    func_mods = arr_push(func_mods, my_mod);
     return 0;
 }
 
 // Top-level parse loop: dispatch imports, globals, structs, and functions.
 parse_program() {
     while (tok_pos < tok_cnt) {
+        if (peek_type() == TK_IMP) {
+            parse_import();
+        } else if (peek_type() == TK_KW) {
+            if (val_is("auto", 4)) {
+                parse_global();
+            } else if (val_is("struct", 6)) {
+                parse_struct();
+            } else if (val_is("enum", 4)) {
+                parse_enum();
+            } else {
+                consume();
+            }
+        } else if (peek_type() == TK_ID) {
+            if (val_at_ch(1, '(')) {
+                parse_function();
+            } else {
+                parse_global_simple();
+            }
+        } else {
+            consume();
+        }
+    }
+    return 0;
+}
+
+// Parse a single module's tokens. tok_pos must be set to the first token
+// of this module before calling. Parses until tok_pos reaches tok_end.
+// Skips import directives (already processed by process_file).
+parse_module(tok_end) {
+    while (tok_pos < tok_end) {
         if (peek_type() == TK_IMP) {
             parse_import();
         } else if (peek_type() == TK_KW) {
@@ -680,27 +780,32 @@ parse_statement() {
     }
     if (peek_type() == TK_KW) {
         if (val_is("auto", 4)) {
+            auto decl_hint;
             consume();
+            decl_hint = 0;
             list_begin();
             var_p = cur_packed();
             list_push(var_p);
             consume();
             try_type_annotation(var_p);
+            if (_prim_hint > 0) { decl_hint = _prim_hint; }
             while (val_is_ch(';') == 0) {
                 if (val_is_ch(',')) { consume(); }
                 var_p = cur_packed();
                 list_push(var_p);
                 consume();
                 try_type_annotation(var_p);
+                if (_prim_hint > 0) { decl_hint = _prim_hint; }
             }
             consume();
             node = make_node(T_DECL);
             *(node + 8) = list_end();
             *(node + 16) = last_list_cnt;
+            *(node + 24) = decl_hint;
             return node;
         }
         // Stack-allocated struct: var v: Type;
-        // Produces a T_DECL node with c=1 (stack struct flag).
+        // Produces a T_DECL node with d=1 (stack struct flag).
         if (val_is("var", 3)) {
             consume();
             var_p = cur_packed();
@@ -713,7 +818,7 @@ parse_statement() {
             list_push(var_p);
             *(node + 8) = list_end();
             *(node + 16) = 1;
-            *(node + 24) = 1;
+            *(node + 32) = 1;
             return node;
         }
         if (val_is("if", 2)) { return parse_if(); }

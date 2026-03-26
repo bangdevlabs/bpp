@@ -215,6 +215,29 @@ Floating-point literals contain a decimal point:
 The compiler infers float type and uses ARM64 double-precision registers.
 Float and integer values convert automatically in mixed expressions.
 
+## Type Hints
+
+Variables and parameters can be annotated with a type hint for sub-word storage:
+
+    auto x: byte;        // 8-bit (0-255)
+    auto y: quarter;     // 16-bit (0-65535)
+    auto z: half;        // 32-bit
+    auto w: int;         // 64-bit (default, explicit)
+    auto f: float;       // 64-bit double
+
+    update(dt: float) {
+        pos = pos + speed * dt;
+        return 0;
+    }
+
+Type hints are opt-in performance tuning. The compiler uses narrower
+load/store instructions (ldrb/strb on ARM64, movzx on x86_64) and the
+C emitter maps to the corresponding C type. Without a hint, all values
+are 64-bit.
+
+Sub-word values truncate on store: `auto x: byte; x = 300;` gives 44
+(300 & 0xFF). This is hardware truncation, not a runtime check.
+
 ## Comments
 
     // This is a line comment.
@@ -324,7 +347,7 @@ These names are recognized by the compiler and emit special code:
 | `sys_waitpid(pid)` | Wait for child process |
 | `sys_exit(code)` | Terminate process |
 
-I/O is implemented via raw ARM64 macOS syscalls (`svc #0x80`). There is
+I/O is implemented via raw syscalls (ARM64 `svc #0x80` on macOS, `syscall` on Linux x86_64). There is
 no libc dependency.
 
 ## The Standard B Library
@@ -561,28 +584,32 @@ signing (SHA-256).
     bpp source.bpp -o binary     # default: native ARM64 binary
     bpp --c source.bpp > out.c   # emit C (for bootstrap/debug)
     bpp --asm source.bpp > out.s # emit ARM64 assembly
+    bpp --linux64 source.bpp -o binary  # cross-compile to Linux x86_64 ELF
+    bpp --show-deps source.bpp          # print module dependency graph
+    bpp --incremental source.bpp -o out # modular compilation with .bo caching
 
-Source lives in `src/`. The compiler has 12 modules:
+Source lives in `src/`. The compiler has 18 modules:
 
 | Module | Purpose |
 |--------|---------|
 | `bpp.bpp` | Main driver, argument parsing |
-| `defs.bsm` | Constants, struct defs, pack/unpack |
+| `defs.bsm` | Constants, struct defs, pack/unpack, field offset names |
 | `bpp_internal.bsm` | List builder, string helpers |
-| `bpp_import.bsm` | File import resolver |
+| `bpp_import.bsm` | File import resolver, module hashing, dependency graph |
 | `bpp_lexer.bsm` | Tokenizer |
-| `bpp_parser.bsm` | Parser (tokens → AST) |
+| `bpp_parser.bsm` | Parser (tokens → AST), module ownership tracking |
 | `bpp_types.bsm` | Type inference (body-local, no cross-function propagation) |
 | `bpp_dispatch.bsm` | Loop classification |
-| `bpp_emitter.bsm` | C code emitter |
-| `bpp_codegen_arm64.bsm` | ARM64 code generator |
-| `bpp_enc_arm64.bsm` | Binary instruction encoder |
-| `bpp_macho.bsm` | Mach-O writer + SHA-256 codesign |
-| `bpp_diag.bsm` | Diagnostic output to stderr |
 | `bpp_validate.bsm` | Semantic validation pass |
-| `bpp_codegen_x86_64.bsm` | x86_64 code generator (Linux) |
-| `bpp_enc_x86_64.bsm` | x86_64 instruction encoder |
-| `bpp_elf.bsm` | ELF writer (Linux static binaries) |
+| `bpp_emitter.bsm` | C code emitter |
+| `bpp_diag.bsm` | Diagnostic output to stderr |
+| `bpp_bo.bsm` | .bo cache file I/O for modular compilation |
+| `aarch64/a64_enc.bsm` | ARM64 instruction encoder |
+| `aarch64/a64_codegen.bsm` | ARM64 code generator |
+| `aarch64/a64_macho.bsm` | Mach-O writer + SHA-256 codesign |
+| `x86_64/x64_enc.bsm` | x86_64 instruction encoder |
+| `x86_64/x64_codegen.bsm` | x86_64 code generator |
+| `x86_64/x64_elf.bsm` | ELF writer (Linux static binaries) |
 
 ### Self-Hosting
 
@@ -593,6 +620,26 @@ To rebuild the compiler:
 
     bpp src/bpp.bpp -o bpp
 
+### Modular Compilation
+
+B++ supports per-module compilation inspired by Go's build model. Each
+module compiles to a `.bo` (B++ Object) cache file containing export
+data and machine code. On rebuild, unchanged modules load from cache.
+
+    bpp --incremental src/bpp.bpp -o bpp
+
+The compiler hashes each module's content and tracks dependencies. When
+a module changes, it and all its dependents are recompiled. Unchanged
+modules are loaded from `.bpp_cache/` in milliseconds.
+
+The `.bo` format contains: header (magic, content hash, dependency
+hashes), export data (function signatures, structs, enums, globals,
+externs), and object data (machine code, function entry points,
+relocations with string/float index remapping).
+
+Cross-module function calls use type 4 relocations (BL/CALL placeholders)
+resolved after all modules are loaded.
+
 ---
 
 *B++ was designed and implemented by Daniel Obino, 2026.*
@@ -601,3 +648,5 @@ To rebuild the compiler:
 *Native game rendering (Cocoa, no SDL/raylib) achieved on March 24, 2026.*
 *Compiler diagnostics (E001-E201, W001) completed on March 24, 2026.*
 *Type propagation bug fixed, x86_64/ELF backend started on March 25, 2026.*
+*Modular compilation (.bo cache, Go model) implemented on March 26, 2026.*
+*Dynamic array migration and type hints completed on March 26, 2026.*

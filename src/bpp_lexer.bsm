@@ -10,6 +10,7 @@
 
 auto src, src_len, pos;
 auto tok_lines, cur_line;
+auto tok_src_off;   // Source buffer offset (outbuf position) for each token.
 
 // --- Shared globals (declared in bpp_parser.bsm) ---
 // toks     — token array, 262144 bytes, 24-byte records
@@ -41,8 +42,9 @@ add_token(tcode, start, len) {
     *(base)      = tcode;
     *(base + 8)  = vbuf_pos;
     *(base + 16) = len;
-    // Record the source line number for this token.
+    // Record the source line number and source buffer offset for this token.
     *(tok_lines + tok_cnt * 8) = cur_line;
+    *(tok_src_off + tok_cnt * 8) = start;
     // Advance cursors.
     vbuf_pos = vbuf_pos + len;
     tok_cnt  = tok_cnt + 1;
@@ -301,7 +303,8 @@ scan_string() {
 // Scan a char literal ('A', '\n', etc.) and emit as NUMBER with the
 // ASCII value converted to a decimal string written directly into vbuf.
 scan_char() {
-    auto ch, val, tmp, digits, dcnt, j, vstart, vlen, base;
+    auto ch, val, tmp, digits, dcnt, j, vstart, vlen, base, char_start;
+    char_start = pos;
     // Skip opening quote.
     pos = pos + 1;
     ch = peek(src + pos);
@@ -352,6 +355,9 @@ scan_char() {
     *(base)      = 3;
     *(base + 8)  = vstart;
     *(base + 16) = vlen;
+    // Record line number and source offset (missing before — bugfix).
+    *(tok_lines + tok_cnt * 8) = cur_line;
+    *(tok_src_off + tok_cnt * 8) = char_start;
     tok_cnt = tok_cnt + 1;
     return 0;
 }
@@ -421,6 +427,7 @@ init_lexer() {
     pos = 0;
     cur_line = 1;
     tok_lines = malloc(1048576);
+    tok_src_off = malloc(1048576);
     return 0;
 }
 
@@ -431,6 +438,26 @@ lex_all() {
     while (pos < src_len) {
         skip_ws();
         if (pos < src_len) {
+            scan_token();
+        }
+    }
+    return 0;
+}
+
+// Lex a single module's portion of the source buffer.
+// Uses diag_file_starts to find the byte range in outbuf for module mi.
+// Tokens accumulate in toks/vbuf across calls.
+lex_module(mi) {
+    auto mod_start, mod_end, mc;
+    mc = arr_len(diag_file_starts);
+    mod_start = arr_get(diag_file_starts, mi);
+    if (mi + 1 < mc) { mod_end = arr_get(diag_file_starts, mi + 1); }
+    else { mod_end = src_len; }
+    // Set lexer position to module start and lex until module end.
+    pos = mod_start;
+    while (pos < mod_end) {
+        skip_ws();
+        if (pos < mod_end) {
             scan_token();
         }
     }

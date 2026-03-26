@@ -40,15 +40,13 @@ auto elf_has_data;      // 1 if data segment is needed, 0 otherwise.
 
 // ── Float literal data ──────────────────────────────────────
 
-auto elf_flt_data;      // Buffer of 8-byte IEEE 754 doubles.
-auto elf_flt_cnt;       // Number of float literals.
+auto elf_flt_data;      // Dynamic array: 8-byte IEEE 754 doubles.
 
 // ── String literal data ─────────────────────────────────────
 
 auto elf_sdata;         // Buffer holding all string bytes (concatenated, null-terminated).
 auto elf_sdata_size;    // Total bytes used in elf_sdata.
-auto elf_sdata_off;     // Array: string index -> byte offset within elf_sdata.
-auto elf_sdata_cnt;     // Number of string literals stored.
+auto elf_sdata_off;     // Dynamic array: string index -> byte offset within elf_sdata.
 
 // ── Initialization ──────────────────────────────────────────
 
@@ -61,12 +59,10 @@ init_elf() {
     elf_buf = malloc(16777216);
     elf_pos = 0;
 
-    elf_flt_data  = malloc(65536);
-    elf_flt_cnt   = 0;
+    elf_flt_data  = arr_new();
     elf_sdata     = malloc(1048576);
     elf_sdata_size = 0;
-    elf_sdata_off = malloc(65536);
-    elf_sdata_cnt = 0;
+    elf_sdata_off = arr_new();
 
     return 0;
 }
@@ -190,7 +186,7 @@ elf_compute_layout(code_size, gl_count) {
     // Determine if a data segment is needed.
     elf_has_data = 0;
     if (gl_count > 0) { elf_has_data = 1; }
-    if (elf_flt_cnt > 0) { elf_has_data = 1; }
+    if (arr_len(elf_flt_data) > 0) { elf_has_data = 1; }
     if (elf_sdata_size > 0) { elf_has_data = 1; }
 
     // Number of program headers: text + data (if present).
@@ -212,7 +208,7 @@ elf_compute_layout(code_size, gl_count) {
         elf_data_vaddr = ELF_BASE + elf_data_off;
 
         // Data layout: globals (gl_count * 8) + floats (flt_cnt * 8) + strings.
-        raw_data_size = gl_count * 8 + elf_flt_cnt * 8 + elf_sdata_size;
+        raw_data_size = gl_count * 8 + arr_len(elf_flt_data) * 8 + elf_sdata_size;
         elf_data_filesz = raw_data_size;
         elf_data_memsz  = raw_data_size;
     } else {
@@ -244,13 +240,13 @@ elf_resolve_relocations(gl_names, gl_count) {
 
     // Precompute section boundaries within the data segment.
     globals_end = elf_data_vaddr + gl_count * 8;
-    floats_end  = globals_end + elf_flt_cnt * 8;
+    floats_end  = globals_end + arr_len(elf_flt_data) * 8;
 
     i = 0;
-    while (i < x64_enc_rel_cnt) {
-        pos = *(x64_enc_rel_pos + i * 8);
-        sym = *(x64_enc_rel_sym + i * 8);
-        ty  = *(x64_enc_rel_ty  + i * 8);
+    while (i < arr_len(x64_enc_rel_pos)) {
+        pos = arr_get(x64_enc_rel_pos, i);
+        sym = arr_get(x64_enc_rel_sym, i);
+        ty  = arr_get(x64_enc_rel_ty,  i);
 
         // Address of the byte after the disp32 field (where RIP points during execution).
         rip_addr = ELF_BASE + elf_code_off + pos + 4;
@@ -271,7 +267,7 @@ elf_resolve_relocations(gl_names, gl_count) {
         }
         if (ty == 1) {
             // String literal: sym is the string index in elf_sdata_off.
-            target_addr = floats_end + *(elf_sdata_off + sym * 8);
+            target_addr = floats_end + arr_get(elf_sdata_off, sym);
         }
         if (ty == 2) {
             // Float literal: sym is the float index.
@@ -321,7 +317,7 @@ write_elf(filename, main_label, gl_names, gl_count) {
     code_size = x64_enc_pos;
 
     // Find the byte offset of the entry point within the code buffer.
-    main_code_off = *(x64_enc_lbl_off + main_label * 8);
+    main_code_off = arr_get(x64_enc_lbl_off, main_label);
 
     // Compute layout.
     elf_compute_layout(code_size, gl_count);
@@ -368,8 +364,8 @@ write_elf(filename, main_label, gl_names, gl_count) {
 
         // Write float literals as 8-byte IEEE 754 doubles.
         i = 0;
-        while (i < elf_flt_cnt) {
-            flt_bits = *(elf_flt_data + i * 8);
+        while (i < arr_len(elf_flt_data)) {
+            flt_bits = arr_get(elf_flt_data, i);
             elf_w32(flt_bits & 0xFFFFFFFF);
             elf_w32((flt_bits >> 32) & 0xFFFFFFFF);
             i = i + 1;

@@ -1,8 +1,8 @@
 # B++ Evolution Roadmap — Game Engine + Art Tools + Audio Plugins
 
-## Status: 2026-03-25
+## Status: 2026-03-26
 
-Diagnostics complete (E001-E201, W001). Compiler self-hosts. stb ecosystem has: draw, input, game loop, collision, arrays, strings, buffers, file read, math, font, UI, platform (Cocoa + SDL2 + raylib + **Linux terminal**). **x86_64 Linux cross-compilation working** — snake game runs as 45KB static ELF.
+Diagnostics complete (E001-E201, W001-W002). Compiler self-hosts. Modular compilation (Go model) implemented with .bo cache files — `--incremental` opt-in. Named field offsets (FN_NAME, EX_LIB, etc.). Backend files reorganized into `src/aarch64/` and `src/x86_64/`. stb ecosystem has: draw, input, game loop, collision, arrays, strings, buffers, file read, math, font, UI, platform (Cocoa + SDL2 + raylib + Linux terminal). x86_64 Linux cross-compilation working.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -54,9 +54,8 @@ TOOLS (compiler + infra)          ← compiles everything
   - SDL_MOUSEMOTION(1024): `read_u32(_sdl_ev, 20/24)`, divide by 3
   - SDL_MOUSEBUTTONDOWN(1025) / UP(1026): `peek(_sdl_ev + 16)`, set/clear bit
 
-- [ ] **0c** `mouse_pressed()` + `mouse_released()` (`stb/stbinput.bsm`)
-  - Add `_stb_mouse_prev`, save in `_input_save_prev()`
-  - Edge trigger functions
+- [ ] **0c** `mouse_released()` (`stb/stbinput.bsm`)
+  - `mouse_pressed()` already exists. Add `mouse_released()` edge trigger.
 
 - [ ] **0d** `file_write_all()` (`stb/stbfile.bsm`)
   - `sys_open(path, 0x601)` + `sys_write` + `sys_close`
@@ -343,52 +342,33 @@ plugin_process(input, output, frames) {
 
 ---
 
-## Type System — Propagation Bug Fix + Future Specialization
+## Compiler Quality — Priority Tasks
 
-### Bug — FIXED (2026-03-25)
+### P0: Fix param float inference
+Parameters used in float expressions but never assigned float stay TY_LONG → codegen does fcvtzs → destroys float values (e.g., delta-time becomes 0). Workaround: `: float` annotation. Fix options:
+1. Re-enable `propagate_call_params()` with corrected algorithm
+2. Infer param type from expression usage (not just assignments)
+3. Only do `fcvtzs` when param has EXPLICIT non-float hint
 
-`propagate_call_params()` in `bpp_types.bsm` permanently mutated callee parameter types based on one caller's argument types. Poisoned all other call sites. Crashed ARM64, wrong output x86_64.
+### P0: Improve error messages
+- E104 "unexpected token" shows negative line numbers and no token context. Show the actual token text and source line.
+- All errors should show the token that caused the issue, not just "unexpected token in expression"
+- `diag_loc()` line computation incorrect for some modules (negative `line - base_line`)
 
-**Fix**: Removed propagation from fixed-point loop (`changed = 0;`). Bootstrap verified — identical binaries. Types now determined solely by body inference. Codegen handles float↔int conversion at each call site independently.
+### P1: Make --incremental default
+Currently opt-in. Blocked by: extern FFI argument rearrangement needs full validation with Cocoa/SDL apps. Monolithic path produces correct FFI calls; modular path needs extern table refresh timing validated.
 
-**Behavior after fix**: `print_int(3.14)` → prints 3 (truncates correctly). `add(1.5, 2.5)` → returns 3 (body infers int). Acceptable — same as C. Dev writes `a + b + 0.0` for float.
+### P1: Per-variable type hints
+`auto x: byte, y: quarter;` loses x's hint. n.c in T_DECL is one hint per declaration, not per variable. Fix: side table indexed by packed name, or array of hints parallel to the variable list.
 
-### Future — Context-Based Specialization (PAUSED)
+### P2: String dedup across modules
+Duplicate strings in modular compilation create duplicate entries in data segment. Add dedup in the writer (hash string content).
 
-Design for automatic function specialization per call-site type signature. Compiler would generate `add$FF` (float version) and `add$LL` (int version) automatically, dispatching at each call site. Zero annotation, zero runtime cost.
+### P2: `call()` builtin float args
+`call(fp, args...)` ignores float arguments entirely on x86_64. Needs type-aware argument passing.
 
-**Why paused:**
-1. No current B++ code needs polymorphic functions
-2. Code bloat risk in self-hosting compiler
-3. Changing emission loop is high-risk for bootstrap
-4. All three backends (ARM64 binary, x86_64 binary, --c text) would need the same changes
-
-**Design documented in** `memory/project_type_specialization.md`. Resume when real code needs `add(1.5, 2.5) = 4.0`.
-
----
-
-## x86_64 Calling Convention Design Decision
-
-**Problem**: B++ is untyped. On x86_64 System V ABI, int args go in RDI/RSI/RDX/RCX/R8/R9, float args go in XMM0-XMM7. When a float is passed to a function expecting int (or vice versa), values end up in wrong registers.
-
-**Solution**: Two calling conventions:
-
-| | Internal B++ calls | External FFI calls |
-|---|---|---|
-| Args | All GPR (RDI, RSI, ...) | System V ABI (ints GPR, floats XMM) |
-| Float transfer | MOVQ (bit pattern in GPR) | MOVQ GPR→XMM in rearrangement pass |
-| Return | RAX (int) or XMM0 (float) | Standard: RAX or XMM0 |
-| Cost | 1 MOVQ per float arg (~free) | Rearrangement pass before CALL |
-
-**Key fix**: x86_64 call site must replicate ARM64's `get_fn_par_type()` logic:
-- Callee expects float, caller has float → MOVQ (bit transfer to GPR)
-- Callee expects float, caller has int → CVTSI2SD + MOVQ (value convert + GPR)
-- Callee expects int, caller has float → CVTTSD2SI (value convert)
-- Callee expects int, caller has int → nothing
-
-Also fix `call()` builtin — currently ignores float args entirely.
-
-ARM64 already proves this works. The philosophy stays untyped — types live in the codegen, not the language.
+### Future: Context-Based Specialization (PAUSED)
+Automatic function specialization per call-site type signature. `add$FF` (float) vs `add$LL` (int). Resume when real code needs `add(1.5, 2.5) = 4.0`.
 
 ---
 

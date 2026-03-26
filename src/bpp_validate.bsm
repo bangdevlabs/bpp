@@ -41,7 +41,7 @@ val_find_func(name_p) {
     i = 0;
     while (i < func_cnt) {
         rec = *(funcs + i * 8);
-        if (packed_eq(*(rec + 8), name_p)) { return i; }
+        if (packed_eq(*(rec + FN_NAME), name_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -53,7 +53,7 @@ val_find_extern(name_p) {
     i = 0;
     while (i < ext_cnt) {
         rec = *(externs + i * 8);
-        if (packed_eq(*(rec + 8), name_p)) { return i; }
+        if (packed_eq(*(rec + EX_NAME), name_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -63,11 +63,26 @@ val_find_extern(name_p) {
 val_check_node(nd) { return 0; }
 
 // Walk a statement list and validate each node.
+// W005: warn if statements appear after a return in the same block.
 val_check_list(arr, cnt) {
-    auto i;
+    auto i, saw_ret, nd;
+    auto sn: Node;
+    saw_ret = 0;
     i = 0;
     while (i < cnt) {
-        val_check_node(*(arr + i * 8));
+        nd = *(arr + i * 8);
+        if (nd != 0) {
+            if (saw_ret) {
+                diag_warn(5);
+                diag_str("unreachable code after return");
+                diag_newline();
+                // Only warn once per block.
+                saw_ret = 0;
+            }
+            sn = nd;
+            if (sn.ntype == T_RET) { saw_ret = 1; }
+        }
+        val_check_node(nd);
         i = i + 1;
     }
     return 0;
@@ -81,7 +96,11 @@ val_check_node(nd) {
     t = n.ntype;
 
     // E201: function call to undefined target.
+    // W002: implicit float-to-int conversion at call site.
+    // W003: argument count mismatch.
     if (t == T_CALL) {
+        auto fi, callee, expected, ai, arg_nd, arg_ty, par_ty;
+        auto an: Node;
         name_p = n.a;
         if (val_is_builtin(name_p) == 0) {
             if (val_find_func(name_p) < 0) {
@@ -95,6 +114,49 @@ val_check_node(nd) {
                 }
             }
         }
+
+        // W002 + W003: check B++ function calls (not builtins or externs).
+        fi = val_find_func(name_p);
+        if (fi >= 0) {
+            callee = *(funcs + fi * 8);
+            expected = *(callee + 24);
+
+            // W003: argument count mismatch.
+            if (n.c != expected) {
+                diag_warn(3);
+                diag_str("'");
+                diag_packed(name_p);
+                diag_str("' expects ");
+                diag_int(expected);
+                diag_str(" argument(s), got ");
+                diag_int(n.c);
+                diag_newline();
+            }
+
+            // W002: implicit float-to-int conversion.
+            ai = 0;
+            while (ai < n.c) {
+                arg_nd = *(n.b + ai * 8);
+                if (arg_nd != 0) {
+                    an = arg_nd;
+                    arg_ty = an.itype;
+                    par_ty = get_fn_par_type(fi, ai);
+                    if (arg_ty == TY_FLOAT) {
+                        if (par_ty != TY_FLOAT) {
+                            diag_warn(2);
+                            diag_str("implicit float-to-int conversion in argument ");
+                            diag_int(ai + 1);
+                            diag_str(" of '");
+                            diag_packed(name_p);
+                            diag_str("'");
+                            diag_newline();
+                        }
+                    }
+                }
+                ai = ai + 1;
+            }
+        }
+
         // Also validate arguments recursively.
         val_check_list(n.b, n.c);
         return 0;
@@ -149,8 +211,8 @@ run_validate() {
     i = 0;
     while (i < func_cnt) {
         rec = *(funcs + i * 8);
-        body_arr = *(rec + 32);
-        body_cnt = *(rec + 40);
+        body_arr = *(rec + FN_BODY);
+        body_cnt = *(rec + FN_BCNT);
         val_check_list(body_arr, body_cnt);
         i = i + 1;
     }

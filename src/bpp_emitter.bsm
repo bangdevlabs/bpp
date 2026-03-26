@@ -57,11 +57,11 @@ bridge_data() {
     i = 0;
     while (i < ext_cnt) {
         rec = *(externs + i * 8);
-        *(ex_name + i * 8) = *(rec + 8);
-        *(ex_lib  + i * 8) = *(rec + 16);
-        *(ex_ret  + i * 8) = *(rec + 24);
-        *(ex_args + i * 8) = *(rec + 32);
-        *(ex_acnt + i * 8) = *(rec + 40);
+        *(ex_name + i * 8) = *(rec + EX_NAME);
+        *(ex_lib  + i * 8) = *(rec + EX_LIB);
+        *(ex_ret  + i * 8) = *(rec + EX_RET);
+        *(ex_args + i * 8) = *(rec + EX_ARGS);
+        *(ex_acnt + i * 8) = *(rec + EX_ACNT);
         i = i + 1;
     }
 
@@ -72,7 +72,7 @@ bridge_data() {
     i = 0;
     while (i < func_cnt) {
         rec = *(funcs + i * 8);
-        name_p = *(rec + 8);
+        name_p = *(rec + FN_NAME);
         // Check if this function was already added (forward declaration).
         idx = -1;
         j = 0;
@@ -85,10 +85,10 @@ bridge_data() {
             fn_cnt = fn_cnt + 1;
         }
         *(fn_name + idx * 8) = name_p;
-        *(fn_par  + idx * 8) = *(rec + 16);
-        *(fn_pcnt + idx * 8) = *(rec + 24);
-        *(fn_body + idx * 8) = *(rec + 32);
-        *(fn_bcnt + idx * 8) = *(rec + 40);
+        *(fn_par  + idx * 8) = *(rec + FN_PARS);
+        *(fn_pcnt + idx * 8) = *(rec + FN_PCNT);
+        *(fn_body + idx * 8) = *(rec + FN_BODY);
+        *(fn_bcnt + idx * 8) = *(rec + FN_BCNT);
         *(fn_fidx + idx * 8) = i;
         i = i + 1;
     }
@@ -315,7 +315,7 @@ emit_body(arr, cnt) {
                 darr = n.a;
                 dcnt = n.b;
                 // Stack struct: emit as a local array of long longs.
-                if (n.c == 1) {
+                if (n.d == 1) {
                     auto sidx, fc;
                     sidx = get_var_type(*(darr + 0));
                     fc = get_struct_size(sidx) / 8;
@@ -327,19 +327,64 @@ emit_body(arr, cnt) {
                     out("];");
                     putchar('\n');
                 } else {
-                // Emit integer variables.
-                has_int = 0;
-                di = 0;
-                while (di < dcnt) {
-                    vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
-                    if (vty != TY_FLOAT) {
-                        if (has_int == 0) { emit_pad(); out("long long "); has_int = 1; }
-                        else { out(", "); }
-                        print_p(*(darr + di * 8));
+                // Emit variables grouped by their C type.
+                // Sub-word hints in n.c select a narrower C type for truncation semantics.
+                auto dh;
+                dh = n.c;
+                if (dh == TY_BYTE) {
+                    // uint8_t variables.
+                    di = 0; has_int = 0;
+                    while (di < dcnt) {
+                        vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                        if (vty != TY_FLOAT) {
+                            if (has_int == 0) { emit_pad(); out("uint8_t "); has_int = 1; }
+                            else { out(", "); }
+                            print_p(*(darr + di * 8));
+                        }
+                        di = di + 1;
                     }
-                    di = di + 1;
+                    if (has_int) { out(";"); putchar('\n'); }
+                } else if (dh == TY_QUART) {
+                    // uint16_t variables.
+                    di = 0; has_int = 0;
+                    while (di < dcnt) {
+                        vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                        if (vty != TY_FLOAT) {
+                            if (has_int == 0) { emit_pad(); out("uint16_t "); has_int = 1; }
+                            else { out(", "); }
+                            print_p(*(darr + di * 8));
+                        }
+                        di = di + 1;
+                    }
+                    if (has_int) { out(";"); putchar('\n'); }
+                } else if (dh == TY_HALF) {
+                    // uint32_t variables.
+                    di = 0; has_int = 0;
+                    while (di < dcnt) {
+                        vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                        if (vty != TY_FLOAT) {
+                            if (has_int == 0) { emit_pad(); out("uint32_t "); has_int = 1; }
+                            else { out(", "); }
+                            print_p(*(darr + di * 8));
+                        }
+                        di = di + 1;
+                    }
+                    if (has_int) { out(";"); putchar('\n'); }
+                } else {
+                    // Default: long long variables.
+                    has_int = 0;
+                    di = 0;
+                    while (di < dcnt) {
+                        vty = get_fn_var_type(cur_fn_idx, *(darr + di * 8));
+                        if (vty != TY_FLOAT) {
+                            if (has_int == 0) { emit_pad(); out("long long "); has_int = 1; }
+                            else { out(", "); }
+                            print_p(*(darr + di * 8));
+                        }
+                        di = di + 1;
+                    }
+                    if (has_int) { out(";"); putchar('\n'); }
                 }
-                if (has_int) { out(";"); putchar('\n'); }
                 // Emit float variables.
                 has_flt = 0;
                 di = 0;
@@ -905,11 +950,25 @@ emit_globals() {
     return 0;
 }
 
-// Emit the C type keyword for a function's return or parameter type.
+// Emit the C type keyword for a given type code.
+// Respects sub-word types so the C compiler enforces truncation semantics.
 emit_type_for(ty) {
-    if (ty == TY_FLOAT) { out("double"); }
-    else { out("long long"); }
+    if (ty == TY_FLOAT) { out("double"); return 0; }
+    if (ty == TY_BYTE) { out("uint8_t"); return 0; }
+    if (ty == TY_QUART) { out("uint16_t"); return 0; }
+    if (ty == TY_HALF) { out("uint32_t"); return 0; }
+    out("long long");
     return 0;
+}
+
+// Return the parameter type hint from the function record, or 0 if none.
+emit_get_par_hint(fi, j) {
+    auto fn_rec, hints, h;
+    fn_rec = arr_get(funcs, fi);
+    hints = *(fn_rec + 48);
+    if (hints == 0) { return 0; }
+    h = *(hints + j * 8);
+    return h;
 }
 
 // Emit forward declarations for all B++ functions.
@@ -931,9 +990,14 @@ emit_forward_decls() {
         } else {
             j = 0;
             while (j < cnt) {
+                auto ph;
                 if (j > 0) { out(", "); }
-                pty = get_fn_par_type(pi, j);
-                if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                ph = emit_get_par_hint(pi, j);
+                if (ph > 0) { pty = ph; }
+                else {
+                    pty = get_fn_par_type(pi, j);
+                    if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                }
                 emit_type_for(pty);
                 out(" ");
                 print_p(*(arr + j * 8));
@@ -967,9 +1031,14 @@ emit_functions() {
         } else {
             j = 0;
             while (j < cnt) {
+                auto ph;
                 if (j > 0) { out(", "); }
-                pty = get_fn_par_type(pi, j);
-                if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                ph = emit_get_par_hint(pi, j);
+                if (ph > 0) { pty = ph; }
+                else {
+                    pty = get_fn_par_type(pi, j);
+                    if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                }
                 emit_type_for(pty);
                 out(" ");
                 print_p(*(arr + j * 8));

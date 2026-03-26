@@ -65,8 +65,11 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
 - **Self-hosting** — the compiler compiles itself
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
-- **Compiler diagnostics** — error codes (E001-E201), warnings (W001), file:line locations
+- **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
+- **Type hints** — `auto x: byte`, `fn(dt: float)` — opt-in sub-word types for performance tuning
+- **Modular compilation** — Go-model .bo cache files, per-module codegen, incremental builds (`--incremental`)
+- **Module dependency tracking** — content hashing, topological sort, stale propagation (`--show-deps`)
 
 ## What B++ Doesn't Have
 
@@ -176,13 +179,16 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/           — Compiler source (17 B++ modules, self-hosting)
-├── stb/           — Standard B Library (pure B++, the game engine)
-├── drivers/       — Backend drivers (SDL2, raylib — optional)
-├── examples/      — Working game examples
-├── tests/         — Compiler and library tests
-├── docs/          — Language docs, journal, and evolution roadmap
-└── bpp            — The compiler binary
+├── src/              — Compiler core (12 B++ modules, self-hosting)
+│   ├── aarch64/      — ARM64 backend (encoder, codegen, Mach-O writer)
+│   └── x86_64/       — x86_64 backend (encoder, codegen, ELF writer)
+├── stb/              — Standard B Library (pure B++, the game engine)
+├── drivers/          — Backend drivers (SDL2, raylib — optional)
+├── examples/         — Working game examples
+├── tests/            — Compiler and library tests
+├── docs/             — Language manual, journal, and evolution roadmap
+├── .bpp_cache/       — Module cache (.bo files, auto-generated)
+└── bpp               — The compiler binary
 ```
 
 ## Platform Status
@@ -276,3 +282,5 @@ SOFTWARE.
 *Zero-dependency native compilation on March 23, 2026.*
 *Native game rendering without external libraries on March 24, 2026.*
 *Compiler diagnostics and x86_64 Linux cross-compilation on March 25, 2026.*
+
+*Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

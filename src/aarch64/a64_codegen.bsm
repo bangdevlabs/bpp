@@ -10,33 +10,33 @@
 // String buffer alias: points to vbuf (set by bridge_data_arm64).
 auto a64_sbuf;
 
-// Function table (parallel arrays, deduplicated from parser).
+// Function table (parallel dynamic arrays, deduplicated from parser).
 // a64_fn_fidx maps emitter index → parser func_cnt index for type queries.
-auto a64_fn_name, a64_fn_par, a64_fn_pcnt, a64_fn_body, a64_fn_bcnt, a64_fn_cnt, a64_fn_fidx;
+auto a64_fn_name, a64_fn_par, a64_fn_pcnt, a64_fn_body, a64_fn_bcnt, a64_fn_fidx;
 
-// Global variable list.
-auto a64_gl_name, a64_gl_cnt;
+// Global variable list (dynamic array).
+auto a64_gl_name;
 
-// FFI extern table: parallel arrays for type-aware external calls.
-auto a64_ex_name, a64_ex_ret, a64_ex_args, a64_ex_acnt, a64_ex_cnt;
+// FFI extern table: parallel dynamic arrays for type-aware external calls.
+auto a64_ex_name, a64_ex_ret, a64_ex_args, a64_ex_acnt;
 
-// Current function's variable scope (for stack frame layout).
-auto a64_vars, a64_var_cnt;
+// Current function's variable scope (dynamic array, for stack frame layout).
+auto a64_vars;
 
-// Stack struct tracking: per-variable flags and computed frame offsets.
-auto a64_var_stack, a64_var_struct_idx, a64_var_off;
+// Stack struct tracking: per-variable dynamic arrays for flags and computed frame offsets.
+auto a64_var_stack, a64_var_struct_idx, a64_var_off, a64_var_forced_ty;
 
-// Float literal data table: stores packed string refs for .double emission.
-auto a64_flt_tbl, a64_flt_cnt;
+// Float literal data table (dynamic array): stores packed string refs for .double emission.
+auto a64_flt_tbl;
 
-// String literal table: each entry stores the packed string content.
-auto a64_str_tbl, a64_str_cnt;
+// String literal table (dynamic array): each entry stores the packed string content.
+auto a64_str_tbl;
 
 // Label counter and stack depth tracking.
 auto a64_lbl_cnt, a64_depth;
 
-// Break label stack: tracks the exit label of the current while loop.
-auto a64_break_stack, a64_break_top;
+// Break label stack (dynamic array): tracks the exit label of the current while loop.
+auto a64_break_stack;
 
 // Current function being emitted.
 auto a64_cur_fn_name, a64_cur_fn_idx;
@@ -44,7 +44,7 @@ auto a64_cur_fn_name, a64_cur_fn_idx;
 // Binary mode: 0 = text assembly (default), 1 = binary encoding via bpp_enc_arm64.bsm.
 auto a64_bin_mode;
 
-// Binary mode: function entry labels (array mapping fn index → label ID).
+// Binary mode: function entry labels (dynamic array mapping fn index → label ID).
 auto a64_fn_lbl;
 
 // Binary mode: return label for the current function (set in a64_emit_func).
@@ -58,22 +58,23 @@ auto a64_argc_sym, a64_argv_sym;
 // ── Initialization ─────────────────────────────────────────
 
 init_codegen_arm64() {
-    a64_fn_name = malloc(65536); a64_fn_par = malloc(65536);
-    a64_fn_pcnt = malloc(65536); a64_fn_body = malloc(65536);
-    a64_fn_bcnt = malloc(65536); a64_fn_fidx = malloc(65536); a64_fn_cnt = 0;
-    a64_gl_name = malloc(65536); a64_gl_cnt = 0;
-    a64_ex_name = malloc(8192); a64_ex_ret = malloc(8192);
-    a64_ex_args = malloc(8192); a64_ex_acnt = malloc(8192); a64_ex_cnt = 0;
-    a64_vars = malloc(65536); a64_var_cnt = 0;
-    a64_var_stack = malloc(65536);
-    a64_var_struct_idx = malloc(65536);
-    a64_var_off = malloc(65536);
-    a64_flt_tbl = malloc(65536); a64_flt_cnt = 0;
-    a64_str_tbl = malloc(65536); a64_str_cnt = 0;
+    a64_fn_name = arr_new(); a64_fn_par = arr_new();
+    a64_fn_pcnt = arr_new(); a64_fn_body = arr_new();
+    a64_fn_bcnt = arr_new(); a64_fn_fidx = arr_new();
+    a64_gl_name = arr_new();
+    a64_ex_name = arr_new(); a64_ex_ret = arr_new();
+    a64_ex_args = arr_new(); a64_ex_acnt = arr_new();
+    a64_vars = arr_new();
+    a64_var_stack = arr_new();
+    a64_var_struct_idx = arr_new();
+    a64_var_off = arr_new();
+    a64_var_forced_ty = arr_new();
+    a64_flt_tbl = arr_new();
+    a64_str_tbl = arr_new();
     a64_lbl_cnt = 0; a64_depth = 0;
-    a64_break_stack = malloc(256 * 8); a64_break_top = 0;
+    a64_break_stack = arr_new();
     a64_bin_mode = 0;
-    a64_fn_lbl = malloc(65536);
+    a64_fn_lbl = arr_new();
     a64_ret_lbl = 0;
     a64_argc_sym = 0 - 1;
     a64_argv_sym = 0 - 2;
@@ -92,63 +93,71 @@ bridge_data_arm64() {
     // Copy functions from parser's 64-byte records into parallel arrays.
     // Handle forward declarations: if a function name already exists,
     // overwrite it with the later (real) definition.
-    a64_fn_cnt = 0;
+    arr_clear(a64_fn_name); arr_clear(a64_fn_par); arr_clear(a64_fn_pcnt);
+    arr_clear(a64_fn_body); arr_clear(a64_fn_bcnt); arr_clear(a64_fn_fidx);
     i = 0;
     while (i < func_cnt) {
         rec = *(funcs + i * 8);
-        name_p = *(rec + 8);
+        name_p = *(rec + FN_NAME);
         // Check if this function was already added (forward declaration).
         idx = -1;
         j = 0;
-        while (j < a64_fn_cnt) {
-            if (a64_str_eq_packed(name_p, *(a64_fn_name + j * 8))) { idx = j; }
+        while (j < arr_len(a64_fn_name)) {
+            if (a64_str_eq_packed(name_p, arr_get(a64_fn_name, j))) { idx = j; }
             j = j + 1;
         }
         if (idx < 0) {
-            idx = a64_fn_cnt;
-            a64_fn_cnt = a64_fn_cnt + 1;
+            // New function: append to all parallel arrays.
+            idx = arr_len(a64_fn_name);
+            a64_fn_name = arr_push(a64_fn_name, name_p);
+            a64_fn_par  = arr_push(a64_fn_par,  *(rec + FN_PARS));
+            a64_fn_pcnt = arr_push(a64_fn_pcnt, *(rec + FN_PCNT));
+            a64_fn_body = arr_push(a64_fn_body, *(rec + FN_BODY));
+            a64_fn_bcnt = arr_push(a64_fn_bcnt, *(rec + FN_BCNT));
+            a64_fn_fidx = arr_push(a64_fn_fidx, i);
+        } else {
+            // Forward declaration override: overwrite existing entry.
+            arr_set(a64_fn_name, idx, name_p);
+            arr_set(a64_fn_par,  idx, *(rec + FN_PARS));
+            arr_set(a64_fn_pcnt, idx, *(rec + FN_PCNT));
+            arr_set(a64_fn_body, idx, *(rec + FN_BODY));
+            arr_set(a64_fn_bcnt, idx, *(rec + FN_BCNT));
+            arr_set(a64_fn_fidx, idx, i);
         }
-        *(a64_fn_name + idx * 8) = name_p;
-        *(a64_fn_par  + idx * 8) = *(rec + 16);
-        *(a64_fn_pcnt + idx * 8) = *(rec + 24);
-        *(a64_fn_body + idx * 8) = *(rec + 32);
-        *(a64_fn_bcnt + idx * 8) = *(rec + 40);
-        *(a64_fn_fidx + idx * 8) = i;
         i = i + 1;
     }
 
     // Copy globals, deduplicating by string content.
     // The parser may add the same name multiple times (from different modules).
     // Each must map to a single __DATA slot in the binary.
-    a64_gl_cnt = 0;
+    arr_clear(a64_gl_name);
     i = 0;
     while (i < glob_cnt) {
         name_p = *(globals + i * 8);
         idx = -1;
         j = 0;
-        while (j < a64_gl_cnt) {
-            if (a64_str_eq_packed(name_p, *(a64_gl_name + j * 8))) { idx = j; }
+        while (j < arr_len(a64_gl_name)) {
+            if (a64_str_eq_packed(name_p, arr_get(a64_gl_name, j))) { idx = j; }
             j = j + 1;
         }
         if (idx < 0) {
-            *(a64_gl_name + a64_gl_cnt * 8) = name_p;
-            a64_gl_cnt = a64_gl_cnt + 1;
+            a64_gl_name = arr_push(a64_gl_name, name_p);
         }
         i = i + 1;
     }
 
     // Copy externs from parser's 64-byte records into parallel arrays.
-    a64_ex_cnt = 0;
+    arr_clear(a64_ex_name); arr_clear(a64_ex_ret);
+    arr_clear(a64_ex_args); arr_clear(a64_ex_acnt);
     i = 0;
     while (i < ext_cnt) {
         rec = *(externs + i * 8);
-        *(a64_ex_name + i * 8) = *(rec + 8);
-        *(a64_ex_ret  + i * 8) = *(rec + 24);
-        *(a64_ex_args + i * 8) = *(rec + 32);
-        *(a64_ex_acnt + i * 8) = *(rec + 40);
+        a64_ex_name = arr_push(a64_ex_name, *(rec + EX_NAME));
+        a64_ex_ret  = arr_push(a64_ex_ret,  *(rec + EX_RET));
+        a64_ex_args = arr_push(a64_ex_args, *(rec + EX_ARGS));
+        a64_ex_acnt = arr_push(a64_ex_acnt, *(rec + EX_ACNT));
         i = i + 1;
     }
-    a64_ex_cnt = ext_cnt;
 
     return 0;
 }
@@ -159,8 +168,8 @@ bridge_data_arm64() {
 a64_find_ext(name_p) {
     auto i;
     i = 0;
-    while (i < a64_ex_cnt) {
-        if (a64_str_eq_packed(name_p, *(a64_ex_name + i * 8))) { return i; }
+    while (i < arr_len(a64_ex_name)) {
+        if (a64_str_eq_packed(name_p, arr_get(a64_ex_name, i))) { return i; }
         i = i + 1;
     }
     return 0 - 1;
@@ -171,9 +180,9 @@ a64_find_ext(name_p) {
 a64_find_ext_by_argc(name_p, argc) {
     auto i;
     i = 0;
-    while (i < a64_ex_cnt) {
-        if (a64_str_eq_packed(name_p, *(a64_ex_name + i * 8))) {
-            if (*(a64_ex_acnt + i * 8) == argc) { return i; }
+    while (i < arr_len(a64_ex_name)) {
+        if (a64_str_eq_packed(name_p, arr_get(a64_ex_name, i))) {
+            if (arr_get(a64_ex_acnt, i) == argc) { return i; }
         }
         i = i + 1;
     }
@@ -184,7 +193,7 @@ a64_find_ext_by_argc(name_p, argc) {
 // Check if an extern parameter at index par_idx is "double".
 a64_ext_par_is_float(exi, par_idx) {
     auto arr, tp;
-    arr = *(a64_ex_args + exi * 8);
+    arr = arr_get(a64_ex_args, exi);
     tp = *(arr + par_idx * 8);
     return a64_str_eq(tp, "double", 6);
 }
@@ -192,7 +201,7 @@ a64_ext_par_is_float(exi, par_idx) {
 // Check if an extern's return type is "double".
 a64_ext_ret_is_float(exi) {
     auto tp;
-    tp = *(a64_ex_ret + exi * 8);
+    tp = arr_get(a64_ex_ret, exi);
     return a64_str_eq(tp, "double", 6);
 }
 
@@ -240,17 +249,20 @@ a64_print_dec(n) {
 
 // Add a variable to the current scope. Returns its slot index.
 a64_var_add(name_p) {
-    auto idx; idx = a64_var_cnt;
-    *(a64_vars + idx * 8) = name_p;
-    a64_var_cnt = a64_var_cnt + 1;
+    auto idx; idx = arr_len(a64_vars);
+    a64_vars = arr_push(a64_vars, name_p);
+    a64_var_stack = arr_push(a64_var_stack, 0);
+    a64_var_struct_idx = arr_push(a64_var_struct_idx, 0 - 1);
+    a64_var_off = arr_push(a64_var_off, 0);
+    a64_var_forced_ty = arr_push(a64_var_forced_ty, 0);
     return idx;
 }
 
 // Find a variable index by name. Returns index or -1 if not found.
 a64_var_idx(name_p) {
     auto i; i = 0;
-    while (i < a64_var_cnt) {
-        if (a64_str_eq_packed(name_p, *(a64_vars + i * 8))) { return i; }
+    while (i < arr_len(a64_vars)) {
+        if (a64_str_eq_packed(name_p, arr_get(a64_vars, i))) { return i; }
         i = i + 1;
     }
     return -1;
@@ -260,7 +272,7 @@ a64_var_idx(name_p) {
 a64_var_find(name_p) {
     auto i;
     i = a64_var_idx(name_p);
-    if (i >= 0) { return *(a64_var_off + i * 8); }
+    if (i >= 0) { return arr_get(a64_var_off, i); }
     return -1;
 }
 
@@ -277,10 +289,14 @@ a64_pre_reg_vars(arr, cnt) {
                 while (j < n.b) {
                     auto vi;
                     vi = a64_var_add(*(n.a + j * 8));
-                    // Mark stack struct variables (var keyword: n.c == 1).
-                    if (n.c == 1) {
-                        *(a64_var_stack + vi * 8) = 1;
-                        *(a64_var_struct_idx + vi * 8) = get_var_type(*(n.a + j * 8));
+                    // Mark stack struct variables (var keyword: n.d == 1).
+                    if (n.d == 1) {
+                        arr_set(a64_var_stack, vi, 1);
+                        arr_set(a64_var_struct_idx, vi, get_var_type(*(n.a + j * 8)));
+                    }
+                    // Record explicit primitive type hint (byte, quarter, half, float).
+                    if (n.c > 0) {
+                        arr_set(a64_var_forced_ty, vi, n.c);
                     }
                     j = j + 1;
                 }
@@ -338,17 +354,98 @@ a64_is_float_lit(p) {
 // ── Type query helpers ─────────────────────────────────────
 // Wrap bpp_types.bsm queries for cleaner code in emit_node/emit_stmt.
 
+// Return the inferred type code of a local variable by slot index.
+a64_var_type(vi) {
+    return get_fn_var_type(a64_cur_fn_idx, arr_get(a64_vars, vi));
+}
+
 // Check if a variable (by slot index) is float in the current function.
 a64_var_is_float(vi) {
-    return get_fn_var_type(a64_cur_fn_idx, *(a64_vars + vi * 8)) == TY_FLOAT;
+    return a64_var_type(vi) == TY_FLOAT;
+}
+
+// Emit a sized load from [x29, #off] into x0/w0 based on the variable's
+// explicit type annotation. Only uses sub-word ops when the programmer
+// declared a type hint. Inferred types always use 64-bit load.
+// Returns 1 if result is in d0 (float), 0 if in x0 (integer).
+a64_emit_load_var(vi, off) {
+    auto fty;
+    fty = arr_get(a64_var_forced_ty, vi);
+    // Float: always respected whether forced or inferred.
+    if (a64_var_is_float(vi)) {
+        if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, off); }
+        else { out("  ldr d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 1;
+    }
+    // Sub-word loads only when explicitly annotated by the programmer.
+    if (fty == TY_BYTE) {
+        if (a64_bin_mode) { enc_ldrb_uoff(0, 29, off); }
+        else { out("  ldrb w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    if (fty == TY_QUART) {
+        if (a64_bin_mode) { enc_ldrh_uoff(0, 29, off); }
+        else { out("  ldrh w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    if (fty == TY_HALF) {
+        if (a64_bin_mode) { enc_ldr_w_uoff(0, 29, off); }
+        else { out("  ldr w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    // Default: 64-bit load.
+    if (a64_bin_mode) { enc_ldr_uoff(0, 29, off); }
+    else { out("  ldr x0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+    return 0;
+}
+
+// Emit a sized store from x0/d0 into [x29, #off] based on the variable's
+// explicit type annotation. Only uses sub-word ops when the programmer
+// declared a type hint. rty: 0 = integer in x0, 1 = float in d0.
+a64_emit_store_var(vi, off, rty) {
+    auto fty;
+    fty = arr_get(a64_var_forced_ty, vi);
+    // Float: always respected whether forced or inferred.
+    if (a64_var_is_float(vi)) {
+        if (rty == 0) {
+            if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar(10); }
+        }
+        if (a64_bin_mode) { enc_str_d_uoff(0, 29, off); }
+        else { out("  str d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    // Integer path: convert float to int if source is float.
+    if (rty == 1) {
+        if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar(10); }
+    }
+    // Sub-word stores only when explicitly annotated by the programmer.
+    if (fty == TY_BYTE) {
+        if (a64_bin_mode) { enc_strb_uoff(0, 29, off); }
+        else { out("  strb w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    if (fty == TY_QUART) {
+        if (a64_bin_mode) { enc_strh_uoff(0, 29, off); }
+        else { out("  strh w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    if (fty == TY_HALF) {
+        if (a64_bin_mode) { enc_str_w_uoff(0, 29, off); }
+        else { out("  str w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    // Default: 64-bit store.
+    if (a64_bin_mode) { enc_str_uoff(0, 29, off); }
+    else { out("  str x0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+    return 0;
 }
 
 // Find a B++ function's emitter index by packed name. Returns -1 if not found.
 a64_find_fn(name_p) {
     auto i;
     i = 0;
-    while (i < a64_fn_cnt) {
-        if (a64_str_eq_packed(name_p, *(a64_fn_name + i * 8))) { return i; }
+    while (i < arr_len(a64_fn_name)) {
+        if (a64_str_eq_packed(name_p, arr_get(a64_fn_name, i))) { return i; }
         i = i + 1;
     }
     return -1;
@@ -426,10 +523,9 @@ a64_emit_node(nd) {
         lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
         if (peek(a64_sbuf + lit_s) == '"') {
             // String literal: strip quotes, store in string table, emit address load.
-            sid = a64_str_cnt;
+            sid = arr_len(a64_str_tbl);
             str_p = pack(lit_s + 1, lit_l - 2);
-            *(a64_str_tbl + sid * 8) = str_p;
-            a64_str_cnt = a64_str_cnt + 1;
+            a64_str_tbl = arr_push(a64_str_tbl, str_p);
             if (a64_bin_mode) {
                 enc_add_reloc(enc_pos, sid, 1);
                 enc_adrp(0); enc_add_imm(0, 0, 0);
@@ -441,9 +537,8 @@ a64_emit_node(nd) {
         }
         // Check if float literal (contains a decimal point).
         if (a64_is_float_lit(n.a) == 1) {
-            fid = a64_flt_cnt;
-            *(a64_flt_tbl + fid * 8) = n.a;
-            a64_flt_cnt = a64_flt_cnt + 1;
+            fid = arr_len(a64_flt_tbl);
+            a64_flt_tbl = arr_push(a64_flt_tbl, n.a);
             if (a64_bin_mode) {
                 enc_add_reloc(enc_pos, fid, 2);
                 enc_adrp(8); enc_add_imm(8, 8, 0);
@@ -461,21 +556,15 @@ a64_emit_node(nd) {
     if (t == T_VAR) {
         vi = a64_var_idx(n.a);
         if (vi >= 0) {
-            off = *(a64_var_off + vi * 8);
+            off = arr_get(a64_var_off, vi);
             // Stack struct: return the address of the struct on the stack.
-            if (*(a64_var_stack + vi * 8)) {
+            if (arr_get(a64_var_stack, vi)) {
                 if (a64_bin_mode) { enc_add_imm(0, 29, off); }
                 else { out("  add x0, x29, #"); a64_print_dec(off); putchar('\n'); }
                 return 0;
             }
-            if (a64_var_is_float(vi)) {
-                if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, off); }
-                else { out("  ldr d0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n'); }
-                return 1;
-            }
-            if (a64_bin_mode) { enc_ldr_uoff(0, 29, off); }
-            else { out("  ldr x0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n'); }
-            return 0;
+            // Type-aware load: uses the correct instruction for the variable's size.
+            return a64_emit_load_var(vi, off);
         }
         // Global variable: load address then load value.
         // Check if the global was inferred as float across all functions.
@@ -1012,7 +1101,7 @@ a64_emit_node(nd) {
                 sys_exit(2);
             }
             if (a64_bin_mode) {
-                enc_adr_label(0, *(a64_fn_lbl + fi * 8));
+                enc_adr_label(0, arr_get(a64_fn_lbl, fi));
             } else {
                 out("  adrp x0, _"); a64_print_p(fn_name.a); out("@PAGE"); putchar('\n');
                 out("  add x0, x0, _"); a64_print_p(fn_name.a); out("@PAGEOFF"); putchar('\n');
@@ -1112,13 +1201,17 @@ a64_emit_node(nd) {
         if (a64_bin_mode) {
             fi = a64_find_fn(n.a);
             if (fi >= 0) {
-                enc_bl_label(*(a64_fn_lbl + fi * 8));
-            } else {
+                enc_bl_label(arr_get(a64_fn_lbl, fi));
+            } else if (a64_find_ext(n.a) >= 0) {
                 // External function: load address from GOT and call indirectly.
                 enc_add_reloc(enc_pos, n.a, 3);
                 enc_adrp(16);
                 enc_ldr_uoff(16, 16, 0);
                 enc_blr(16);
+            } else {
+                // Cross-module B++ function: BL placeholder with type 4 relocation.
+                enc_add_reloc(enc_pos, n.a, 4);
+                enc_emit32(0x94000000);
             }
         } else {
             out("  bl _"); a64_print_p(n.a); putchar('\n');
@@ -1178,12 +1271,12 @@ a64_emit_stmt(nd) {
             vi = a64_var_idx(lhs.a);
             if (vi >= 0) {
                 // Stack struct copy: copy all fields from source address.
-                if (*(a64_var_stack + vi * 8)) {
+                if (arr_get(a64_var_stack, vi)) {
                     a64_emit_node(n.b);
                     // x0 = source struct address. Copy fields to dest on stack.
-                    off = *(a64_var_off + vi * 8);
+                    off = arr_get(a64_var_off, vi);
                     auto fc, j, sidx;
-                    sidx = *(a64_var_struct_idx + vi * 8);
+                    sidx = arr_get(a64_var_struct_idx, vi);
                     fc = get_struct_size(sidx) / 8;
                     j = 0;
                     while (j < fc) {
@@ -1204,24 +1297,9 @@ a64_emit_stmt(nd) {
         if (lhs.ntype == T_VAR) {
             vi = a64_var_idx(lhs.a);
             if (vi >= 0) {
-                off = *(a64_var_off + vi * 8);
-                if (a64_var_is_float(vi)) {
-                    // Float variable: convert int to float if needed, store as double.
-                    if (rty == 0) {
-                        if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
-                    }
-                    if (a64_bin_mode) { enc_str_d_uoff(0, 29, off); } else {
-                        out("  str d0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
-                    }
-                } else {
-                    // Int variable: convert float to int if needed, store as long.
-                    if (rty == 1) {
-                        if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
-                    }
-                    if (a64_bin_mode) { enc_str_uoff(0, 29, off); } else {
-                        out("  str x0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
-                    }
-                }
+                off = arr_get(a64_var_off, vi);
+                // Type-aware store: uses the correct instruction for the variable's size.
+                a64_emit_store_var(vi, off, rty);
             } else {
                 // Global variable store.
                 if (ty_get_global_type(lhs.a) == TY_FLOAT) {
@@ -1305,9 +1383,9 @@ a64_emit_stmt(nd) {
 
     if (t == T_BREAK) {
         // Jump to the exit label of the innermost while loop.
-        if (a64_break_top > 0) {
+        if (arr_len(a64_break_stack) > 0) {
             auto brk_lbl;
-            brk_lbl = *(a64_break_stack + (a64_break_top - 1) * 8);
+            brk_lbl = arr_last(a64_break_stack);
             if (a64_bin_mode) {
                 enc_b_label(brk_lbl);
             } else {
@@ -1322,8 +1400,7 @@ a64_emit_stmt(nd) {
             lbl = enc_new_label();
             lbl2 = enc_new_label();
             // Push break label.
-            *(a64_break_stack + a64_break_top * 8) = lbl2;
-            a64_break_top = a64_break_top + 1;
+            a64_break_stack = arr_push(a64_break_stack, lbl2);
             enc_def_label(lbl);
             ety = a64_emit_node(n.a);
             if (ety == 1) {
@@ -1334,12 +1411,11 @@ a64_emit_stmt(nd) {
             a64_emit_body(n.b, n.c);
             enc_b_label(lbl);
             enc_def_label(lbl2);
-            a64_break_top = a64_break_top - 1;
+            arr_pop(a64_break_stack);
         } else {
             lbl = a64_new_lbl();
             // Push break label (text mode uses lbl counter, same value).
-            *(a64_break_stack + a64_break_top * 8) = lbl;
-            a64_break_top = a64_break_top + 1;
+            a64_break_stack = arr_push(a64_break_stack, lbl);
             out(".Lloop"); a64_print_dec(lbl); out(":"); putchar('\n');
             ety = a64_emit_node(n.a);
             if (ety == 1) {
@@ -1350,7 +1426,7 @@ a64_emit_stmt(nd) {
             a64_emit_body(n.b, n.c);
             out("  b .Lloop"); a64_print_dec(lbl); putchar('\n');
             out(".Lend"); a64_print_dec(lbl); out(":"); putchar('\n');
-            a64_break_top = a64_break_top - 1;
+            arr_pop(a64_break_stack);
         }
         return 0;
     }
@@ -1387,25 +1463,34 @@ a64_emit_stmt(nd) {
 a64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i;
-    name_p = *(a64_fn_name + fi * 8);
-    par_arr = *(a64_fn_par + fi * 8); par_cnt = *(a64_fn_pcnt + fi * 8);
-    body_arr = *(a64_fn_body + fi * 8); body_cnt = *(a64_fn_bcnt + fi * 8);
+    name_p = arr_get(a64_fn_name, fi);
+    par_arr = arr_get(a64_fn_par, fi); par_cnt = arr_get(a64_fn_pcnt, fi);
+    body_arr = arr_get(a64_fn_body, fi); body_cnt = arr_get(a64_fn_bcnt, fi);
 
     // Reset variable tracking for this function.
-    a64_var_cnt = 0;
+    arr_clear(a64_vars);
+    arr_clear(a64_var_stack);
+    arr_clear(a64_var_struct_idx);
+    arr_clear(a64_var_off);
+    arr_clear(a64_var_forced_ty);
     a64_cur_fn_name = name_p;
-    a64_cur_fn_idx = *(a64_fn_fidx + fi * 8);
-    // Clear stack-struct flags for the new function scope.
-    i = 0;
-    while (i < 256) {
-        *(a64_var_stack + i * 8) = 0;
-        *(a64_var_struct_idx + i * 8) = 0 - 1;
-        i = i + 1;
-    }
+    a64_cur_fn_idx = arr_get(a64_fn_fidx, fi);
 
     // Register params as variables (slots 0..par_cnt-1).
+    // If the function has explicit type hints for params, record them.
+    auto hints, ph, fn_rec;
+    fn_rec = arr_get(funcs, a64_cur_fn_idx);
+    hints = *(fn_rec + 48);
     i = 0;
-    while (i < par_cnt) { a64_var_add(*(par_arr + i * 8)); i = i + 1; }
+    while (i < par_cnt) {
+        auto pvi;
+        pvi = a64_var_add(*(par_arr + i * 8));
+        if (hints != 0) {
+            ph = *(hints + i * 8);
+            if (ph > 0) { arr_set(a64_var_forced_ty, pvi, ph); }
+        }
+        i = i + 1;
+    }
 
     // Pre-register all declared variables from body (including nested blocks).
     a64_pre_reg_vars(body_arr, body_cnt);
@@ -1415,10 +1500,10 @@ a64_emit_func(fi) {
     auto total, sz;
     total = 0;
     i = 0;
-    while (i < a64_var_cnt) {
-        *(a64_var_off + i * 8) = 24 + total;
-        if (*(a64_var_stack + i * 8)) {
-            sz = get_struct_size(*(a64_var_struct_idx + i * 8));
+    while (i < arr_len(a64_vars)) {
+        arr_set(a64_var_off, i, 24 + total);
+        if (arr_get(a64_var_stack, i)) {
+            sz = get_struct_size(arr_get(a64_var_struct_idx, i));
         } else {
             sz = 8;
         }
@@ -1430,7 +1515,7 @@ a64_emit_func(fi) {
 
     if (a64_bin_mode) {
         // Define the label for this function's entry point.
-        enc_def_label(*(a64_fn_lbl + fi * 8));
+        enc_def_label(arr_get(a64_fn_lbl, fi));
 
         // Allocate a return label for this function.
         a64_ret_lbl = enc_new_label();
@@ -1454,7 +1539,7 @@ a64_emit_func(fi) {
         // Store incoming register arguments to their stack slots.
         i = 0;
         while (i < par_cnt) {
-            enc_str_uoff(i, 29, *(a64_var_off + i * 8));
+            enc_str_uoff(i, 29, arr_get(a64_var_off, i));
             i = i + 1;
         }
 
@@ -1493,7 +1578,7 @@ a64_emit_func(fi) {
         // Store incoming register arguments to their stack slots.
         i = 0;
         while (i < par_cnt) {
-            out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(*(a64_var_off + i * 8)); out("]"); putchar('\n');
+            out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n');
             i = i + 1;
         }
 
@@ -1510,6 +1595,133 @@ a64_emit_func(fi) {
     return 0;
 }
 
+// ── Per-module emission (for incremental compilation) ──────
+
+// Initialize the encoder and global tables for per-module codegen.
+// Call once before the per-module loop. Populates globals and externs
+// from the parser so that all modules share the same data tables.
+a64_mod_init() {
+    auto i, rec, name_p, idx, j;
+    a64_sbuf = vbuf;
+
+    // Reset encoder state for a fresh build.
+    enc_pos = 0;
+    enc_lbl_max = 0;
+    arr_clear(enc_lbl_off);
+    enc_fix_cnt = 0;
+    arr_clear(enc_fix_pos); arr_clear(enc_fix_lbl); arr_clear(enc_fix_ty);
+    arr_clear(enc_rel_pos); arr_clear(enc_rel_sym); arr_clear(enc_rel_ty);
+
+    // Clear function tables (will be populated per-module).
+    arr_clear(a64_fn_name); arr_clear(a64_fn_par); arr_clear(a64_fn_pcnt);
+    arr_clear(a64_fn_body); arr_clear(a64_fn_bcnt); arr_clear(a64_fn_fidx);
+    arr_clear(a64_fn_lbl);
+
+    // Copy ALL globals with deduplication (shared across all modules).
+    arr_clear(a64_gl_name);
+    i = 0;
+    while (i < glob_cnt) {
+        name_p = *(globals + i * 8);
+        idx = -1;
+        j = 0;
+        while (j < arr_len(a64_gl_name)) {
+            if (a64_str_eq_packed(name_p, arr_get(a64_gl_name, j))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) { a64_gl_name = arr_push(a64_gl_name, name_p); }
+        i = i + 1;
+    }
+    // Add hidden globals for argc/argv.
+    a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
+    a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+
+    // Externs are refreshed per-module in emit_module_arm64() instead of here,
+    // because in the incremental pipeline modules are parsed one at a time.
+    arr_clear(a64_ex_name); arr_clear(a64_ex_ret);
+    arr_clear(a64_ex_args); arr_clear(a64_ex_acnt);
+
+    return 0;
+}
+
+// Emit code for a single module. Functions accumulate in a64_fn_name
+// across calls. Cross-module calls emit type 4 relocations.
+// Returns the byte offset where this module's code starts in enc_buf.
+emit_module_arm64(mi) {
+    auto fn_start, code_start, i, rec, name_p, idx, j;
+
+    // Record where new functions will start in the accumulated table.
+    fn_start = arr_len(a64_fn_name);
+
+    // Add functions from this module only, with forward-declaration override.
+    i = 0;
+    while (i < func_cnt) {
+        if (arr_get(func_mods, i) == mi) {
+            rec = *(funcs + i * 8);
+            name_p = *(rec + FN_NAME);
+            idx = -1;
+            j = 0;
+            while (j < arr_len(a64_fn_name)) {
+                if (a64_str_eq_packed(name_p, arr_get(a64_fn_name, j))) { idx = j; }
+                j = j + 1;
+            }
+            if (idx < 0) {
+                idx = arr_len(a64_fn_name);
+                a64_fn_name = arr_push(a64_fn_name, name_p);
+                a64_fn_par  = arr_push(a64_fn_par,  *(rec + FN_PARS));
+                a64_fn_pcnt = arr_push(a64_fn_pcnt, *(rec + FN_PCNT));
+                a64_fn_body = arr_push(a64_fn_body, *(rec + FN_BODY));
+                a64_fn_bcnt = arr_push(a64_fn_bcnt, *(rec + FN_BCNT));
+                a64_fn_fidx = arr_push(a64_fn_fidx, i);
+            } else {
+                arr_set(a64_fn_name, idx, name_p);
+                arr_set(a64_fn_par,  idx, *(rec + FN_PARS));
+                arr_set(a64_fn_pcnt, idx, *(rec + FN_PCNT));
+                arr_set(a64_fn_body, idx, *(rec + FN_BODY));
+                arr_set(a64_fn_bcnt, idx, *(rec + FN_BCNT));
+                arr_set(a64_fn_fidx, idx, i);
+            }
+        }
+        i = i + 1;
+    }
+
+    // Assign labels for new functions only.
+    i = fn_start;
+    while (i < arr_len(a64_fn_name)) {
+        a64_fn_lbl = arr_push(a64_fn_lbl, enc_new_label());
+        i = i + 1;
+    }
+
+    // Refresh externs from parser state (may have grown from previous modules).
+    arr_clear(a64_ex_name); arr_clear(a64_ex_ret);
+    arr_clear(a64_ex_args); arr_clear(a64_ex_acnt);
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        a64_ex_name = arr_push(a64_ex_name, *(rec + EX_NAME));
+        a64_ex_ret  = arr_push(a64_ex_ret,  *(rec + EX_RET));
+        a64_ex_args = arr_push(a64_ex_args, *(rec + EX_ARGS));
+        a64_ex_acnt = arr_push(a64_ex_acnt, *(rec + EX_ACNT));
+        i = i + 1;
+    }
+
+    // Clear per-module fixups. Labels and relocations accumulate.
+    enc_fix_cnt = 0;
+    arr_clear(enc_fix_pos); arr_clear(enc_fix_lbl); arr_clear(enc_fix_ty);
+
+    // Record code start and emit new functions only.
+    code_start = enc_pos;
+    i = fn_start;
+    while (i < arr_len(a64_fn_name)) {
+        a64_emit_func(i);
+        i = i + 1;
+    }
+
+    // Resolve internal branch fixups for this module.
+    enc_resolve_fixups();
+
+    return code_start;
+}
+
 // ── Top-level emission ─────────────────────────────────────
 
 // Run all ARM64 emission stages in order.
@@ -1520,10 +1732,8 @@ emit_all_arm64() {
 
     if (a64_bin_mode) {
         // Add hidden globals for argc/argv access in native binaries.
-        *(a64_gl_name + a64_gl_cnt * 8) = a64_argc_sym;
-        a64_gl_cnt = a64_gl_cnt + 1;
-        *(a64_gl_name + a64_gl_cnt * 8) = a64_argv_sym;
-        a64_gl_cnt = a64_gl_cnt + 1;
+        a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
+        a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
 
         // Binary mode: allocate a label for each function, emit code, resolve fixups.
         enc_pos = 0;
@@ -1535,15 +1745,16 @@ emit_all_arm64() {
         arr_clear(enc_rel_pos); arr_clear(enc_rel_sym); arr_clear(enc_rel_ty);
 
         // Allocate a label for each function.
+        arr_clear(a64_fn_lbl);
         i = 0;
-        while (i < a64_fn_cnt) {
-            *(a64_fn_lbl + i * 8) = enc_new_label();
+        while (i < arr_len(a64_fn_name)) {
+            a64_fn_lbl = arr_push(a64_fn_lbl, enc_new_label());
             i = i + 1;
         }
 
         // Emit all functions into the code buffer.
         i = 0;
-        while (i < a64_fn_cnt) { a64_emit_func(i); i = i + 1; }
+        while (i < arr_len(a64_fn_name)) { a64_emit_func(i); i = i + 1; }
 
         // Resolve all forward branch fixups.
         enc_resolve_fixups();
@@ -1557,7 +1768,7 @@ emit_all_arm64() {
 
         // Emit all functions.
         i = 0;
-        while (i < a64_fn_cnt) { a64_emit_func(i); i = i + 1; }
+        while (i < arr_len(a64_fn_name)) { a64_emit_func(i); i = i + 1; }
 
         // Emit global variables in data section.
         out(".section __DATA,__data"); putchar('\n');
@@ -1566,21 +1777,21 @@ emit_all_arm64() {
         out("_bpp_argc: .quad 0"); putchar('\n');
         out("_bpp_argv: .quad 0"); putchar('\n');
         i = 0;
-        while (i < a64_gl_cnt) {
-            out(".globl _"); a64_print_p(*(a64_gl_name + i * 8)); putchar('\n');
+        while (i < arr_len(a64_gl_name)) {
+            out(".globl _"); a64_print_p(arr_get(a64_gl_name, i)); putchar('\n');
             out(".p2align 3"); putchar('\n');
-            out("_"); a64_print_p(*(a64_gl_name + i * 8)); out(":"); putchar('\n');
+            out("_"); a64_print_p(arr_get(a64_gl_name, i)); out(":"); putchar('\n');
             out("  .quad 0"); putchar('\n');
             i = i + 1;
         }
         putchar('\n');
 
         // Emit string literals in a read-only data section.
-        if (a64_str_cnt > 0) {
+        if (arr_len(a64_str_tbl) > 0) {
             out(".section __TEXT,__cstring,cstring_literals"); putchar('\n');
             i = 0;
-            while (i < a64_str_cnt) {
-                sp = *(a64_str_tbl + i * 8);
+            while (i < arr_len(a64_str_tbl)) {
+                sp = arr_get(a64_str_tbl, i);
                 ss = unpack_s(sp); sl = unpack_l(sp);
                 out("_str_"); a64_print_dec(i); out(":"); putchar('\n');
                 out("  .asciz "); putchar('"');
@@ -1600,11 +1811,11 @@ emit_all_arm64() {
         }
 
         // Emit float literal constants in a read-only data section.
-        if (a64_flt_cnt > 0) {
+        if (arr_len(a64_flt_tbl) > 0) {
             out(".section __DATA,__const"); putchar('\n');
             i = 0;
-            while (i < a64_flt_cnt) {
-                fp = *(a64_flt_tbl + i * 8);
+            while (i < arr_len(a64_flt_tbl)) {
+                fp = arr_get(a64_flt_tbl, i);
                 fs = unpack_s(fp); fl = unpack_l(fp);
                 out(".p2align 3"); putchar('\n');
                 out("_flt_"); a64_print_dec(i); out(":"); putchar('\n');

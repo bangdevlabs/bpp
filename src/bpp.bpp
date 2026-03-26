@@ -18,20 +18,25 @@ import "bpp_types.bsm";
 import "bpp_dispatch.bsm";
 import "bpp_validate.bsm";
 import "bpp_emitter.bsm";
-import "bpp_enc_arm64.bsm";
-import "bpp_codegen_arm64.bsm";
-import "bpp_macho.bsm";
-import "bpp_enc_x86_64.bsm";
-import "bpp_codegen_x86_64.bsm";
-import "bpp_elf.bsm";
+import "aarch64/a64_enc.bsm";
+import "aarch64/a64_codegen.bsm";
+import "aarch64/a64_macho.bsm";
+import "x86_64/x64_enc.bsm";
+import "x86_64/x64_codegen.bsm";
+import "x86_64/x64_elf.bsm";
+import "bpp_bo.bsm";
 
 main() {
     auto arg_len, arg_ptr, mode, c0, c1, out_name, argi, nargs;
     auto main_fi, main_lbl, start_lbl, i, fp, fs, fl;
+    auto flag_permod, flag_mono, mi, mk, code_start;
+    auto fn_s, str_s, flt_s, rel_s;
 
     // mode: 0 = C, 1 = ARM64 assembly, 2 = native Mach-O binary (default), 3 = Linux x86_64 ELF.
     mode = 2;
     out_name = 0;
+    flag_permod = 0;
+    flag_mono = 0;
 
     // Initialize all subsystems.
     init_array();
@@ -50,6 +55,7 @@ main() {
     init_x64_enc();
     init_codegen_x86_64();
     init_elf();
+    init_bo();
 
     // Parse command-line arguments.
     // Supported flags: --asm, --bin, -o <name>
@@ -88,6 +94,30 @@ main() {
                         if (str_peek(a, 4) == 'n') { mode = 3; }
                     }
                 }
+                // --show-deps (print module graph and exit)
+                if (str_peek(a, 2) == 's') {
+                    if (str_peek(a, 3) == 'h') {
+                        if (str_peek(a, 4) == 'o') { mode = 4; }
+                    }
+                }
+                // --per-module (use per-module codegen for testing)
+                if (str_peek(a, 2) == 'p') {
+                    if (str_peek(a, 3) == 'e') {
+                        if (str_peek(a, 4) == 'r') { flag_permod = 1; }
+                    }
+                }
+                // --monolithic (force single-pass pipeline)
+                if (str_peek(a, 2) == 'm') {
+                    if (str_peek(a, 3) == 'o') {
+                        if (str_peek(a, 4) == 'n') { flag_mono = 1; }
+                    }
+                }
+                // --incremental (enable modular compilation with .bo caching)
+                if (str_peek(a, 2) == 'i') {
+                    if (str_peek(a, 3) == 'n') {
+                        if (str_peek(a, 4) == 'c') { flag_incr = 1; }
+                    }
+                }
             }
             if (c1 == 'o') {
                 // -o <name>: next argument is the output filename.
@@ -113,142 +143,281 @@ main() {
     arg_len = copy_cstr(pathbuf, arg_ptr);
     process_file(pathbuf, arg_len);
 
-    // 2. Lex: scan outbuf into toks/vbuf arrays.
+    // 1b. Build module dependency graph and check cache for stale modules.
+    topo_sort();
+    cache_load();
+    propagate_stale();
+
+    // --show-deps: print module graph and exit without compiling.
+    if (mode == 4) {
+        auto mi, mk, fp, fs, fl, mn;
+        mn = arr_len(diag_file_starts);
+        diag_str("=== Module Graph (");
+        diag_int(mn);
+        diag_str(" modules) ===");
+        diag_newline();
+        mi = 0;
+        while (mi < mn) {
+            if (arr_get(mod_stale, mi)) { diag_str("[STALE] "); }
+            else { diag_str("[clean] "); }
+            fp = arr_get(diag_file_names, mi);
+            fs = unpack_s(fp); fl = unpack_l(fp);
+            diag_buf(fname_buf + fs, fl);
+            diag_newline();
+            // Print dependencies for this module.
+            mk = 0;
+            while (mk < arr_len(dep_from)) {
+                if (arr_get(dep_from, mk) == mi) {
+                    diag_str("  -> ");
+                    fp = arr_get(diag_file_names, arr_get(dep_to, mk));
+                    fs = unpack_s(fp); fl = unpack_l(fp);
+                    diag_buf(fname_buf + fs, fl);
+                    diag_newline();
+                }
+                mk = mk + 1;
+            }
+            mi = mi + 1;
+        }
+        diag_str("=== Topological Order ===");
+        diag_newline();
+        mi = 0;
+        while (mi < arr_len(mod_topo)) {
+            mk = arr_get(mod_topo, mi);
+            fp = arr_get(diag_file_names, mk);
+            fs = unpack_s(fp); fl = unpack_l(fp);
+            diag_int(mi + 1);
+            diag_str(". ");
+            diag_buf(fname_buf + fs, fl);
+            diag_newline();
+            mi = mi + 1;
+        }
+        cache_save();
+        return 0;
+    }
+
+    // Set source buffer for lexer.
     src = outbuf;
     src_len = outbuf_len;
-    lex_all();
 
-    // 3. Parse: consume toks, build AST.
-    parse_program();
+    // ── Modular pipeline (default for native backends) ──
+    // Each module is processed independently: clean modules load from .bo cache,
+    // stale modules are lexed/parsed/inferred/codegen'd and saved to .bo.
+    auto flag_incr;
+    flag_incr = 1;
+    if (flag_mono) { flag_incr = 0; }
+    if (mode == 0) { flag_incr = 0; }
+    if (mode == 1) { flag_incr = 0; }
+    if (flag_incr) {
+        mk = arr_len(diag_file_starts);
+        auto tok_before;
 
-    // 4. Types: annotate AST itype fields.
-    run_types();
+        if (mode == 2) { a64_bin_mode = 1; a64_mod_init(); }
+        if (mode == 3) { x64_mod_init(); }
 
-    // 5. Dispatch: annotate loop dispatch fields.
-    run_dispatch();
+        i = 0;
+        while (i < mk) {
+            bo_make_path(i);
+            if (arr_get(mod_stale, i) == 0) {
+                if (bo_load_file(bo_pathbuf) > 0) {
+                    if (bo_check_header(i)) {
+                        // Clean module: load export data + cached code.
+                        bo_read_export(i);
+                        if (mode == 2) { bo_load_code_arm64(); }
+                        if (mode == 3) { bo_load_code_x64(); }
+                        i = i + 1;
+                    } else {
+                        // Header mismatch: fall through to stale path.
+                        arr_set(mod_stale, i, 1);
+                    }
+                } else {
+                    // No .bo file: fall through to stale path.
+                    arr_set(mod_stale, i, 1);
+                }
+            }
+            if (arr_get(mod_stale, i) == 1) {
+                // Stale module: lex, parse, infer, codegen, save.
+                tok_before = tok_cnt;
+                lex_module(i);
+                parse_module(tok_cnt);
+                infer_module(i);
 
-    // 6. Validate: check IR consistency before codegen.
-    run_validate();
+                if (mode == 2) {
+                    fn_s = arr_len(a64_fn_name);
+                    str_s = arr_len(a64_str_tbl);
+                    flt_s = arr_len(a64_flt_tbl);
+                    rel_s = arr_len(enc_rel_pos);
+                    code_start = emit_module_arm64(i);
+                    bo_reset();
+                    bo_write_header(i, 0);
+                    bo_write_export(i);
+                    bo_write_code_arm64(code_start, fn_s, str_s, flt_s, rel_s);
+                    bo_save_file(bo_pathbuf);
+                }
+                if (mode == 3) {
+                    fn_s = arr_len(x64_fn_name);
+                    str_s = arr_len(x64_str_tbl);
+                    flt_s = arr_len(x64_flt_tbl);
+                    rel_s = arr_len(x64_enc_rel_pos);
+                    code_start = emit_module_x86_64(i);
+                    bo_reset();
+                    bo_write_header(i, 1);
+                    bo_write_export(i);
+                    bo_write_code_x64(code_start, fn_s, str_s, flt_s, rel_s);
+                    bo_save_file(bo_pathbuf);
+                }
+                i = i + 1;
+            }
+        }
+
+        // Repopulate globals and externs now that all modules have been processed.
+        // a64_mod_init/x64_mod_init ran before the loop when globals were empty.
+        if (mode == 2) {
+            arr_clear(a64_gl_name);
+            mk = 0;
+            while (mk < glob_cnt) {
+                fn_s = *(globals + mk * 8);
+                rel_s = -1;
+                mi = 0;
+                while (mi < arr_len(a64_gl_name)) {
+                    if (a64_str_eq_packed(fn_s, arr_get(a64_gl_name, mi))) { rel_s = mi; }
+                    mi = mi + 1;
+                }
+                if (rel_s < 0) { a64_gl_name = arr_push(a64_gl_name, fn_s); }
+                mk = mk + 1;
+            }
+            a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
+            a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+            bo_resolve_calls_arm64();
+        }
+        if (mode == 3) {
+            arr_clear(x64_gl_name);
+            mk = 0;
+            while (mk < glob_cnt) {
+                fn_s = *(globals + mk * 8);
+                rel_s = -1;
+                mi = 0;
+                while (mi < arr_len(x64_gl_name)) {
+                    if (x64_str_eq_packed(fn_s, arr_get(x64_gl_name, mi))) { rel_s = mi; }
+                    mi = mi + 1;
+                }
+                if (rel_s < 0) { x64_gl_name = arr_push(x64_gl_name, fn_s); }
+                mk = mk + 1;
+            }
+            x64_gl_name = arr_push(x64_gl_name, x64_argc_sym);
+            x64_gl_name = arr_push(x64_gl_name, x64_argv_sym);
+            bo_resolve_calls_x64();
+            start_lbl = x64_emit_start_stub();
+        }
+    }
+
+    // ── Monolithic pipeline (default, unchanged) ──
+    if (flag_incr == 0) {
+        // 2. Lex: scan outbuf into toks/vbuf arrays.
+        lex_all();
+        // 3. Parse: consume toks, build AST.
+        parse_program();
+        // 4. Types: annotate AST itype fields.
+        run_types();
+        // 5. Dispatch: annotate loop dispatch fields.
+        run_dispatch();
+        // 6. Validate: check IR consistency before codegen.
+        run_validate();
+    }
 
     // 7. Emit output based on selected backend.
+    // Incremental codegen already ran above. Monolithic runs here.
     if (mode == 2) {
-        // Native binary mode: ARM64 binary codegen + Mach-O writer.
         a64_bin_mode = 1;
-        emit_all_arm64();
+        if (flag_incr == 0) {
+            if (flag_permod) {
+                a64_mod_init();
+                mk = arr_len(diag_file_starts);
+                i = 0;
+                while (i < mk) { emit_module_arm64(i); i = i + 1; }
+                bo_resolve_calls_arm64();
+            } else {
+                emit_all_arm64();
+            }
+        }
 
-        // Find the "main" function in the function table.
+        // Find main, prep floats/strings/externs, write Mach-O.
         main_fi = -1;
         i = 0;
-        while (i < a64_fn_cnt) {
-            if (a64_str_eq(*(a64_fn_name + i * 8), "main", 4)) {
-                main_fi = i;
-            }
+        while (i < arr_len(a64_fn_name)) {
+            if (a64_str_eq(arr_get(a64_fn_name, i), "main", 4)) { main_fi = i; }
             i = i + 1;
         }
-        main_lbl = *(a64_fn_lbl + main_fi * 8);
-
-        // Precompute float literal IEEE 754 data.
+        main_lbl = arr_get(a64_fn_lbl, main_fi);
         i = 0;
-        while (i < a64_flt_cnt) {
-            fp = *(a64_flt_tbl + i * 8);
-            fs = unpack_s(fp);
-            mo_add_float(a64_sbuf + fs);
-            i = i + 1;
+        while (i < arr_len(a64_flt_tbl)) {
+            fp = arr_get(a64_flt_tbl, i); fs = unpack_s(fp);
+            mo_add_float(a64_sbuf + fs); i = i + 1;
         }
-
-        // Copy string literal data into the Mach-O string buffer.
         i = 0;
-        while (i < a64_str_cnt) {
-            fp = *(a64_str_tbl + i * 8);
-            fs = unpack_s(fp);
-            fl = unpack_l(fp);
-            mo_add_string(a64_sbuf + fs, fl);
-            i = i + 1;
+        while (i < arr_len(a64_str_tbl)) {
+            fp = arr_get(a64_str_tbl, i); fs = unpack_s(fp); fl = unpack_l(fp);
+            mo_add_string(a64_sbuf + fs, fl); i = i + 1;
         }
-
-        // Register external functions for GOT linking.
         auto ext_rec, ext_name, ext_lib;
         i = 0;
         while (i < ext_cnt) {
             ext_rec = *(externs + i * 8);
-            ext_name = *(ext_rec + 8);
-            ext_lib = *(ext_rec + 16);
-            mo_add_got(ext_name, ext_lib);
-            i = i + 1;
+            ext_name = *(ext_rec + EX_NAME); ext_lib = *(ext_rec + EX_LIB);
+            mo_add_got(ext_name, ext_lib); i = i + 1;
         }
-
-        // Write the Mach-O binary. Default name is "a.out" unless -o was given.
         if (out_name != 0) {
-            auto ol;
-            ol = copy_cstr(pathbuf, out_name);
-            poke(pathbuf + ol, 0);
+            auto ol; ol = copy_cstr(pathbuf, out_name); poke(pathbuf + ol, 0);
         } else {
-            poke(pathbuf, 'a');
-            poke(pathbuf + 1, '.');
-            poke(pathbuf + 2, 'o');
-            poke(pathbuf + 3, 'u');
-            poke(pathbuf + 4, 't');
-            poke(pathbuf + 5, 0);
+            poke(pathbuf, 'a'); poke(pathbuf+1, '.'); poke(pathbuf+2, 'o');
+            poke(pathbuf+3, 'u'); poke(pathbuf+4, 't'); poke(pathbuf+5, 0);
         }
-        write_macho(pathbuf, main_lbl, a64_gl_name, a64_gl_cnt);
+        write_macho(pathbuf, main_lbl, a64_gl_name, arr_len(a64_gl_name));
     }
     if (mode == 3) {
-        // Linux x86_64 cross-compilation: x86_64 codegen + ELF writer.
-        start_lbl = emit_all_x86_64();
-
-        // Prepare string literal data for the ELF writer.
-        elf_sdata_cnt = x64_str_cnt;
+        if (flag_incr == 0) {
+            if (flag_permod) {
+                x64_mod_init();
+                mk = arr_len(diag_file_starts);
+                i = 0;
+                while (i < mk) { emit_module_x86_64(i); i = i + 1; }
+                bo_resolve_calls_x64();
+                start_lbl = x64_emit_start_stub();
+            } else {
+                start_lbl = emit_all_x86_64();
+            }
+        }
+        // Prep strings for ELF writer.
         elf_sdata_size = 0;
         i = 0;
-        while (i < x64_str_cnt) {
-            fp = *(x64_str_tbl + i * 8);
-            fs = unpack_s(fp);
-            fl = unpack_l(fp);
-            *(elf_sdata_off + i * 8) = elf_sdata_size;
-            auto sj;
-            sj = 0;
+        while (i < arr_len(x64_str_tbl)) {
+            fp = arr_get(x64_str_tbl, i); fs = unpack_s(fp); fl = unpack_l(fp);
+            elf_sdata_off = arr_push(elf_sdata_off, elf_sdata_size);
+            auto sj; sj = 0;
             while (sj < fl) {
                 poke(elf_sdata + elf_sdata_size, peek(x64_sbuf + fs + sj));
-                elf_sdata_size = elf_sdata_size + 1;
-                sj = sj + 1;
+                elf_sdata_size = elf_sdata_size + 1; sj = sj + 1;
             }
-            poke(elf_sdata + elf_sdata_size, 0);
-            elf_sdata_size = elf_sdata_size + 1;
+            poke(elf_sdata + elf_sdata_size, 0); elf_sdata_size = elf_sdata_size + 1;
             i = i + 1;
         }
-
-        // Prepare float literal IEEE 754 data using mo_atof (shared with Mach-O writer).
-        elf_flt_cnt = x64_flt_cnt;
         i = 0;
-        while (i < x64_flt_cnt) {
-            fp = *(x64_flt_tbl + i * 8);
-            fs = unpack_s(fp);
-            *(elf_flt_data + i * 8) = mo_atof(x64_sbuf + fs);
-            i = i + 1;
+        while (i < arr_len(x64_flt_tbl)) {
+            fp = arr_get(x64_flt_tbl, i); fs = unpack_s(fp);
+            elf_flt_data = arr_push(elf_flt_data, mo_atof(x64_sbuf + fs)); i = i + 1;
         }
-
         if (out_name != 0) {
-            auto ol;
-            ol = copy_cstr(pathbuf, out_name);
-            poke(pathbuf + ol, 0);
+            auto ol; ol = copy_cstr(pathbuf, out_name); poke(pathbuf + ol, 0);
         } else {
-            poke(pathbuf, 'a');
-            poke(pathbuf + 1, '.');
-            poke(pathbuf + 2, 'o');
-            poke(pathbuf + 3, 'u');
-            poke(pathbuf + 4, 't');
-            poke(pathbuf + 5, 0);
+            poke(pathbuf, 'a'); poke(pathbuf+1, '.'); poke(pathbuf+2, 'o');
+            poke(pathbuf+3, 'u'); poke(pathbuf+4, 't'); poke(pathbuf+5, 0);
         }
-
-        write_elf(pathbuf, start_lbl, x64_gl_name, x64_gl_cnt);
+        write_elf(pathbuf, start_lbl, x64_gl_name, arr_len(x64_gl_name));
     }
-    if (mode == 1) {
-        emit_all_arm64();
-    }
-    if (mode == 0) {
-        emit_all();
-    }
+    if (mode == 1) { emit_all_arm64(); }
+    if (mode == 0) { emit_all(); }
 
     diag_summary();
+    // Update the hash cache for the next build.
+    cache_save();
     return 0;
 }

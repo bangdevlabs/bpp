@@ -59,25 +59,21 @@ auto mo_str_size;       // String table size.
 
 // ── Float literal data ────────────────────────────────────────
 
-auto mo_flt_data;       // Buffer of 8-byte IEEE 754 doubles.
-auto mo_flt_cnt;        // Number of float literals.
+auto mo_flt_data;       // Dynamic array: 8-byte IEEE 754 doubles.
 
 // ── String literal data ──────────────────────────────────────
 
 auto mo_sdata;          // Buffer holding all string bytes (content + null terminators).
 auto mo_sdata_size;     // Total bytes used in mo_sdata.
-auto mo_sdata_off;      // Array: byte offset of each string within mo_sdata.
-auto mo_sdata_cnt;      // Number of string literals stored.
+auto mo_sdata_off;      // Dynamic array: byte offset of each string within mo_sdata.
 
 // ── GOT (Global Offset Table) for FFI ───────────────────────
 
-auto mo_got_syms;       // Array: packed function names (one per GOT slot).
-auto mo_got_libs;       // Array: packed library names (one per GOT slot).
-auto mo_got_cnt;        // Number of GOT entries.
+auto mo_got_syms;       // Dynamic array: packed function names (one per GOT slot).
+auto mo_got_libs;       // Dynamic array: packed library names (one per GOT slot).
 auto mo_got_data_off;   // Byte offset of GOT within __DATA (8-byte aligned).
 
-auto mo_ext_libs;       // Array: unique library name packed values.
-auto mo_ext_lib_cnt;    // Number of unique external libraries.
+auto mo_ext_libs;       // Dynamic array: unique library name packed values.
 
 // ── SHA-256 (pure integer, no external dependencies) ────────
 
@@ -218,17 +214,13 @@ init_macho() {
     MO_VM_BASE_HI = 1;
     mo_buf = malloc(16777216);
     mo_pos = 0;
-    mo_flt_data = malloc(8192);
-    mo_flt_cnt = 0;
+    mo_flt_data = arr_new();
     mo_sdata = malloc(1048576);
     mo_sdata_size = 0;
-    mo_sdata_off = malloc(65536);
-    mo_sdata_cnt = 0;
-    mo_got_syms = malloc(4096);
-    mo_got_libs = malloc(4096);
-    mo_got_cnt = 0;
-    mo_ext_libs = malloc(512);
-    mo_ext_lib_cnt = 0;
+    mo_sdata_off = arr_new();
+    mo_got_syms = arr_new();
+    mo_got_libs = arr_new();
+    mo_ext_libs = arr_new();
     return 0;
 }
 
@@ -359,8 +351,7 @@ mo_atof(s) {
 mo_add_float(str_ptr) {
     auto bits;
     bits = mo_atof(str_ptr);
-    *(mo_flt_data + mo_flt_cnt * 8) = bits;
-    mo_flt_cnt = mo_flt_cnt + 1;
+    mo_flt_data = arr_push(mo_flt_data, bits);
     return 0;
 }
 
@@ -369,7 +360,7 @@ mo_add_float(str_ptr) {
 // Records the byte offset so the relocation resolver can find it.
 mo_add_string(src, len) {
     auto i;
-    *(mo_sdata_off + mo_sdata_cnt * 8) = mo_sdata_size;
+    mo_sdata_off = arr_push(mo_sdata_off, mo_sdata_size);
     i = 0;
     while (i < len) {
         poke(mo_sdata + mo_sdata_size, peek(src + i));
@@ -379,7 +370,6 @@ mo_add_string(src, len) {
     // Null terminator.
     poke(mo_sdata + mo_sdata_size, 0);
     mo_sdata_size = mo_sdata_size + 1;
-    mo_sdata_cnt = mo_sdata_cnt + 1;
     return 0;
 }
 
@@ -403,20 +393,18 @@ mo_is_system_lib(lib_name) {
 // "System" is built-in (ordinal 1) and does not add a new LC_LOAD_DYLIB.
 mo_add_got(fn_name, lib_name) {
     auto i, found;
-    *(mo_got_syms + mo_got_cnt * 8) = fn_name;
-    *(mo_got_libs + mo_got_cnt * 8) = lib_name;
-    mo_got_cnt = mo_got_cnt + 1;
+    mo_got_syms = arr_push(mo_got_syms, fn_name);
+    mo_got_libs = arr_push(mo_got_libs, lib_name);
     // Track unique external libraries (skip System which is always ordinal 1).
     if (mo_is_system_lib(lib_name)) { return 0; }
     found = 0;
     i = 0;
-    while (i < mo_ext_lib_cnt) {
-        if (mo_packed_eq(*(mo_ext_libs + i * 8), lib_name)) { found = 1; }
+    while (i < arr_len(mo_ext_libs)) {
+        if (mo_packed_eq(arr_get(mo_ext_libs, i), lib_name)) { found = 1; }
         i = i + 1;
     }
     if (found == 0) {
-        *(mo_ext_libs + mo_ext_lib_cnt * 8) = lib_name;
-        mo_ext_lib_cnt = mo_ext_lib_cnt + 1;
+        mo_ext_libs = arr_push(mo_ext_libs, lib_name);
     }
     return 0;
 }
@@ -425,8 +413,8 @@ mo_add_got(fn_name, lib_name) {
 mo_find_got(fn_name) {
     auto i;
     i = 0;
-    while (i < mo_got_cnt) {
-        if (mo_packed_eq(*(mo_got_syms + i * 8), fn_name)) { return i; }
+    while (i < arr_len(mo_got_syms)) {
+        if (mo_packed_eq(arr_get(mo_got_syms, i), fn_name)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -438,8 +426,8 @@ mo_find_lib_ordinal(lib_name) {
     auto i;
     if (mo_is_system_lib(lib_name)) { return 1; }
     i = 0;
-    while (i < mo_ext_lib_cnt) {
-        if (mo_packed_eq(*(mo_ext_libs + i * 8), lib_name)) { return i + 2; }
+    while (i < arr_len(mo_ext_libs)) {
+        if (mo_packed_eq(arr_get(mo_ext_libs, i), lib_name)) { return i + 2; }
         i = i + 1;
     }
     return 1;
@@ -694,14 +682,14 @@ mo_write_chained_fixups_real(nseg, gl_count) {
     starts_off = 32;
     starts_in_seg_off = starts_off + 4 + data_seg_idx * 4;
     imports_off = starts_off + 4 + nseg * 4 + 24;
-    symbols_off = imports_off + mo_got_cnt * 4;
+    symbols_off = imports_off + arr_len(mo_got_syms) * 4;
 
     // ── dyld_chained_fixups_header (28 bytes, padded to 32) ──
     mo_w32(0);                          // fixups_version
     mo_w32(starts_off);                 // starts_offset
     mo_w32(imports_off);                // imports_offset
     mo_w32(symbols_off);                // symbols_offset
-    mo_w32(mo_got_cnt);                 // imports_count
+    mo_w32(arr_len(mo_got_syms));       // imports_count
     mo_w32(1);                          // imports_format (DYLD_CHAINED_IMPORT)
     mo_w32(0);                          // symbols_format (uncompressed)
     mo_pad(4);                          // pad to 32
@@ -733,13 +721,13 @@ mo_write_chained_fixups_real(nseg, gl_count) {
     // Each import: lib_ordinal(8) | weak_import(1) | name_offset(23).
     sym_pos = 1;                        // symbol string pool offset (skip initial null)
     i = 0;
-    while (i < mo_got_cnt) {
-        lib_ord = mo_find_lib_ordinal(*(mo_got_libs + i * 8));
+    while (i < arr_len(mo_got_syms)) {
+        lib_ord = mo_find_lib_ordinal(arr_get(mo_got_libs, i));
         // name_offset points into symbol string pool.
         imp_val = (lib_ord & 0xFF) | ((sym_pos & 0x7FFFFF) << 9);
         mo_w32(imp_val);
         // Advance sym_pos past "_name\0".
-        sl = unpack_l(*(mo_got_syms + i * 8));
+        sl = unpack_l(arr_get(mo_got_syms, i));
         sym_pos = sym_pos + 1 + sl + 1;  // underscore + name + null
         i = i + 1;
     }
@@ -748,9 +736,9 @@ mo_write_chained_fixups_real(nseg, gl_count) {
     // Starts with a null byte, then "_FunctionName\0" for each import.
     mo_w8(0);                           // initial null byte
     i = 0;
-    while (i < mo_got_cnt) {
-        ss = unpack_s(*(mo_got_syms + i * 8));
-        sl = unpack_l(*(mo_got_syms + i * 8));
+    while (i < arr_len(mo_got_syms)) {
+        ss = unpack_s(arr_get(mo_got_syms, i));
+        sl = unpack_l(arr_get(mo_got_syms, i));
         mo_w8(0x5F);                    // underscore prefix
         j = 0;
         while (j < sl) {
@@ -851,9 +839,9 @@ mo_compute_layout(code_size, data_count) {
     // __DATA is needed if there are globals, float literals, string literals, or GOT entries.
     has_data = 0;
     if (data_count > 0) { has_data = 1; }
-    if (mo_flt_cnt > 0) { has_data = 1; }
+    if (arr_len(mo_flt_data) > 0) { has_data = 1; }
     if (mo_sdata_size > 0) { has_data = 1; }
-    if (mo_got_cnt > 0) { has_data = 1; }
+    if (arr_len(mo_got_syms) > 0) { has_data = 1; }
 
     // Number of segments: PAGEZERO + TEXT + LINKEDIT [+ DATA].
     nseg = 3;
@@ -861,7 +849,7 @@ mo_compute_layout(code_size, data_count) {
 
     // Load commands: segments + chained_fixups + exports + symtab + dysymtab
     //   + dylinker + main + dylib(libSystem) + extra dylibs + code_signature.
-    mo_ncmds = 11 + has_data + mo_ext_lib_cnt;
+    mo_ncmds = 11 + has_data + arr_len(mo_ext_libs);
 
     mo_sizeofcmds = 72              // __PAGEZERO
         + 152                       // __TEXT + __text section
@@ -874,7 +862,7 @@ mo_compute_layout(code_size, data_count) {
         + 32                        // LC_LOAD_DYLINKER
         + 24                        // LC_MAIN
         + 56                        // LC_LOAD_DYLIB (libSystem)
-        + mo_ext_lib_cnt * 80       // LC_LOAD_DYLIB (extra, 80 bytes each, padded)
+        + arr_len(mo_ext_libs) * 80 // LC_LOAD_DYLIB (extra, 80 bytes each, padded)
         + 16;                       // LC_CODE_SIGNATURE
 
     // Code starts after header + load commands + 16 bytes of slack.
@@ -888,13 +876,13 @@ mo_compute_layout(code_size, data_count) {
     mo_main_off = mo_code_off;
 
     // __DATA segment follows __TEXT (page-aligned).
-    // Layout: globals (data_count * 8) + float literals (mo_flt_cnt * 8).
+    // Layout: globals (data_count * 8) + float literals (flt_cnt * 8).
     if (has_data) {
         mo_data_off = mo_text_vmsize;
         // GOT entries must be 8-byte aligned (LDR requires it).
-        mo_got_data_off = data_count * 8 + mo_flt_cnt * 8 + mo_sdata_size;
+        mo_got_data_off = data_count * 8 + arr_len(mo_flt_data) * 8 + mo_sdata_size;
         mo_got_data_off = (mo_got_data_off + 7) / 8 * 8;
-        mo_data_size = mo_got_data_off + mo_got_cnt * 8;
+        mo_data_size = mo_got_data_off + arr_len(mo_got_syms) * 8;
         mo_data_vmsize = mo_page_align(mo_data_size);
         mo_data_vmaddr_lo = MO_VM_BASE + mo_text_vmsize;
         mo_data_vmaddr_hi = MO_VM_BASE_HI;
@@ -919,18 +907,18 @@ mo_compute_layout(code_size, data_count) {
     }
 
     // __LINKEDIT content: chained fixups + exports trie + symtab + strtab.
-    if (mo_got_cnt > 0) {
+    if (arr_len(mo_got_syms) > 0) {
         // Real chained fixups: header(32) + starts_in_image(4+4*nseg)
         //   + starts_in_segment(24) + imports(4*got_cnt) + symbol strings.
         // Compute exact symbol strings size: 1 (null) + sum("_" + name + "\0").
         auto sym_str_size, si;
         sym_str_size = 1;
         si = 0;
-        while (si < mo_got_cnt) {
-            sym_str_size = sym_str_size + 1 + unpack_l(*(mo_got_syms + si * 8)) + 1;
+        while (si < arr_len(mo_got_syms)) {
+            sym_str_size = sym_str_size + 1 + unpack_l(arr_get(mo_got_syms, si)) + 1;
             si = si + 1;
         }
-        cf_data_size = 32 + 4 + nseg * 4 + 24 + mo_got_cnt * 4 + sym_str_size;
+        cf_data_size = 32 + 4 + nseg * 4 + 24 + arr_len(mo_got_syms) * 4 + sym_str_size;
         cf_data_size = (cf_data_size + 3) / 4 * 4;
     } else {
         // Empty chained fixups: header + starts struct + sentinel.
@@ -1020,7 +1008,7 @@ mo_resolve_relocations(gl_names, gl_count) {
         if (ty == 1) {
             // String literal: sym is the string index in mo_sdata_off.
             // Strings are stored after globals + floats in __DATA.
-            target_addr = mo_data_off + gl_count * 8 + mo_flt_cnt * 8 + *(mo_sdata_off + sym * 8);
+            target_addr = mo_data_off + gl_count * 8 + arr_len(mo_flt_data) * 8 + arr_get(mo_sdata_off, sym);
         }
         if (ty == 2) {
             // Float literal: sym is the float ID (index into mo_flt_data).
@@ -1086,7 +1074,7 @@ write_macho(filename, main_label, gl_names, gl_count) {
     code_size = enc_pos;
 
     // Find the byte offset of _main within the code buffer.
-    main_code_off = *(enc_lbl_off + main_label * 8);
+    main_code_off = arr_get(enc_lbl_off, main_label);
 
     // Compute layout.
     mo_compute_layout(code_size, gl_count);
@@ -1100,9 +1088,9 @@ write_macho(filename, main_label, gl_names, gl_count) {
     // Determine segment count. Must match mo_compute_layout's logic.
     has_data = 0;
     if (gl_count > 0) { has_data = 1; }
-    if (mo_flt_cnt > 0) { has_data = 1; }
+    if (arr_len(mo_flt_data) > 0) { has_data = 1; }
     if (mo_sdata_size > 0) { has_data = 1; }
-    if (mo_got_cnt > 0) { has_data = 1; }
+    if (arr_len(mo_got_syms) > 0) { has_data = 1; }
     nseg = 3 + has_data;
 
     // Reset output buffer.
@@ -1170,8 +1158,8 @@ write_macho(filename, main_label, gl_names, gl_count) {
 
     // LC_LOAD_DYLIB for each additional external library.
     i = 0;
-    while (i < mo_ext_lib_cnt) {
-        mo_write_lc_load_dylib_named(*(mo_ext_libs + i * 8));
+    while (i < arr_len(mo_ext_libs)) {
+        mo_write_lc_load_dylib_named(arr_get(mo_ext_libs, i));
         i = i + 1;
     }
 
@@ -1203,8 +1191,8 @@ write_macho(filename, main_label, gl_names, gl_count) {
         // Write float literals as 8-byte IEEE 754 doubles.
         // Each entry in mo_flt_data is a raw 64-bit IEEE 754 value.
         i = 0;
-        while (i < mo_flt_cnt) {
-            flt_bits = *(mo_flt_data + i * 8);
+        while (i < arr_len(mo_flt_data)) {
+            flt_bits = arr_get(mo_flt_data, i);
             mo_w32(flt_bits & 0xFFFFFFFF);
             mo_w32((flt_bits >> 32) & 0xFFFFFFFF);
             i = i + 1;
@@ -1225,9 +1213,9 @@ write_macho(filename, main_label, gl_names, gl_count) {
         //   next=2 means stride of 8 bytes to next entry. next=0 = end of chain.
         //   bind=1 marks this as a bind entry (not a rebase).
         i = 0;
-        while (i < mo_got_cnt) {
+        while (i < arr_len(mo_got_syms)) {
             mo_w32(i);
-            if (i < mo_got_cnt - 1) {
+            if (i < arr_len(mo_got_syms) - 1) {
                 mo_w32(0x80100000);
             } else {
                 mo_w32(0x80000000);
@@ -1241,7 +1229,7 @@ write_macho(filename, main_label, gl_names, gl_count) {
     mo_pad(mo_link_off - mo_pos);
 
     // Chained fixups data.
-    if (mo_got_cnt > 0) {
+    if (arr_len(mo_got_syms) > 0) {
         mo_write_chained_fixups_real(nseg, gl_count);
     } else {
         mo_write_chained_fixups(nseg);
