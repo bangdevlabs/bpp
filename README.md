@@ -1,5 +1,11 @@
 # B++
 
+### Rock Solid B++ —26 March 2026
+
+Self-hosting compiler with modular compilation, type hints, dynamic arrays, two native backends (ARM64 + x86_64), and a monolithic fallback. The compiler compiles itself, caches per-module object files, and produces signed native binaries with zero external tools. Let's rock!
+
+---
+
 ## Back to the Future
 
 In 1972, Ken Thompson's B language evolved into C. The rest is history — C conquered systems programming, operating systems, and eventually everything.
@@ -68,7 +74,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
 - **Type hints** — `auto x: byte`, `fn(dt: float)` — opt-in sub-word types for performance tuning
-- **Modular compilation** — Go-model .bo cache files, per-module codegen, incremental builds (`--incremental`)
+- **Modular compilation** — Go-model per-module codegen with .bo cache files (default for native backends)
+- **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
 - **Module dependency tracking** — content hashing, topological sort, stale propagation (`--show-deps`)
 
 ## What B++ Doesn't Have

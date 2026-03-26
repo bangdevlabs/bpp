@@ -2,7 +2,7 @@
 
 ## Status: 2026-03-26
 
-Diagnostics complete (E001-E201, W001-W002). Compiler self-hosts. Modular compilation (Go model) implemented with .bo cache files — `--incremental` opt-in. Named field offsets (FN_NAME, EX_LIB, etc.). Backend files reorganized into `src/aarch64/` and `src/x86_64/`. stb ecosystem has: draw, input, game loop, collision, arrays, strings, buffers, file read, math, font, UI, platform (Cocoa + SDL2 + raylib + Linux terminal). x86_64 Linux cross-compilation working.
+Diagnostics complete (E001-E201, W001-W002). Compiler self-hosts. Modular compilation (Go model) is the default for native backends — .bo cache files, per-module codegen, cross-module linking. `--monolithic` forces single-pass for C emitter, ASM, and future WASM. Named field offsets (FN_NAME, EX_LIB, etc.). Backend files reorganized into `src/aarch64/` and `src/x86_64/`. stb ecosystem has: draw, input, game loop, collision, arrays, strings, buffers, file read, math, font, UI, platform (Cocoa + SDL2 + raylib + Linux terminal). x86_64 Linux cross-compilation working.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -354,9 +354,6 @@ Parameters used in float expressions but never assigned float stay TY_LONG → c
 - E104 "unexpected token" shows negative line numbers and no token context. Show the actual token text and source line.
 - All errors should show the token that caused the issue, not just "unexpected token in expression"
 - `diag_loc()` line computation incorrect for some modules (negative `line - base_line`)
-
-### P1: Make --incremental default
-Currently opt-in. Blocked by: extern FFI argument rearrangement needs full validation with Cocoa/SDL apps. Monolithic path produces correct FFI calls; modular path needs extern table refresh timing validated.
 
 ### P1: Per-variable type hints
 `auto x: byte, y: quarter;` loses x's hint. n.c in T_DECL is one hint per declaration, not per variable. Fix: side table indexed by packed name, or array of hints parallel to the variable list.

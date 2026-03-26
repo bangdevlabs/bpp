@@ -581,12 +581,12 @@ The B++ compiler is written in B++ and compiles itself. It produces
 native ARM64 Mach-O binaries directly, with built-in ad-hoc code
 signing (SHA-256).
 
-    bpp source.bpp -o binary     # default: native ARM64 binary
-    bpp --c source.bpp > out.c   # emit C (for bootstrap/debug)
-    bpp --asm source.bpp > out.s # emit ARM64 assembly
+    bpp source.bpp -o binary     # native ARM64 binary (modular, default)
     bpp --linux64 source.bpp -o binary  # cross-compile to Linux x86_64 ELF
+    bpp --c source.bpp > out.c   # emit C (monolithic, for bootstrap/debug)
+    bpp --asm source.bpp > out.s # emit ARM64 assembly (monolithic)
+    bpp --monolithic source.bpp -o out  # force single-pass compilation
     bpp --show-deps source.bpp          # print module dependency graph
-    bpp --incremental source.bpp -o out # modular compilation with .bo caching
 
 Source lives in `src/`. The compiler has 18 modules:
 
@@ -622,20 +622,21 @@ To rebuild the compiler:
 
 ### Modular Compilation
 
-B++ supports per-module compilation inspired by Go's build model. Each
-module compiles to a `.bo` (B++ Object) cache file containing export
-data and machine code. On rebuild, unchanged modules load from cache.
+Native backends (ARM64 and x86_64) use per-module compilation by
+default, inspired by Go's build model. Each module compiles to a `.bo`
+(B++ Object) cache file containing export data and machine code. On
+rebuild, unchanged modules load from cache.
 
-    bpp --incremental src/bpp.bpp -o bpp
+    bpp src/bpp.bpp -o bpp
 
 The compiler hashes each module's content and tracks dependencies. When
 a module changes, it and all its dependents are recompiled. Unchanged
 modules are loaded from `.bpp_cache/` in milliseconds.
 
-The `.bo` format contains: header (magic, content hash, dependency
-hashes), export data (function signatures, structs, enums, globals,
-externs), and object data (machine code, function entry points,
-relocations with string/float index remapping).
+The C emitter (`--c`) and assembly output (`--asm`) use the monolithic
+pipeline (single-pass, no caching). Use `--monolithic` to force this
+mode for native backends. Future backends (WASM) will also start
+monolithic until their encoders support per-module output.
 
 Cross-module function calls use type 4 relocations (BL/CALL placeholders)
 resolved after all modules are loaded.
