@@ -460,6 +460,22 @@ mo_w64(lo, hi) {
     return 0;
 }
 
+// Write a ULEB128 (unsigned LEB128) encoded integer.
+// Used for the exports trie address encoding.
+// Uses >> which is arithmetic shift, but val is always positive here.
+mo_write_uleb128(val) {
+    auto b;
+    b = val & 0x7F;
+    val = (val >> 7) & 0x01FFFFFFFFFFFFFF;
+    while (val > 0) {
+        mo_w8(b | 0x80);
+        b = val & 0x7F;
+        val = (val >> 7) & 0x01FFFFFFFFFFFFFF;
+    }
+    mo_w8(b);
+    return 0;
+}
+
 // Write n zero bytes.
 mo_pad(n) {
     auto i;
@@ -786,32 +802,38 @@ mo_write_lc_load_dylib_named(lib_name) {
 // Write the exports trie containing just "_main".
 // Returns the size written.
 mo_write_exports_trie(main_file_offset) {
-    auto start, lo, hi;
+    auto start, uleb_size, term_size, child_off;
     start = mo_pos;
+
+    // Compute ULEB128 size for main_file_offset to get correct terminal_size.
+    // ULEB128: 1 byte per 7 bits of value.
+    uleb_size = 1;
+    if (main_file_offset >= 128) { uleb_size = 2; }
+    if (main_file_offset >= 16384) { uleb_size = 3; }
+    if (main_file_offset >= 2097152) { uleb_size = 4; }
+
+    // Terminal data = flags(1 byte) + address(uleb_size bytes).
+    term_size = 1 + uleb_size;
+
+    // Child node starts at offset 9 from trie start (root is always 9 bytes).
+    child_off = 9;
 
     // Root node: one child with edge "_main".
     mo_w8(0);                       // terminal_size = 0 (not a terminal)
     mo_w8(1);                       // children_count = 1
     mo_wcstr("_main", 5);           // edge label
     mo_w8(0);                       // null terminator for edge
-    mo_w8(9);                       // child node offset from trie start
+    mo_w8(child_off);               // child node offset from trie start
 
-    // Child node at offset 9: _main export info.
-    mo_w8(3);                       // terminal_size = 3 bytes
+    // Child node: _main export info.
+    mo_w8(term_size);               // terminal_size (computed, not hardcoded)
     mo_w8(0);                       // flags = EXPORT_SYMBOL_FLAGS_KIND_REGULAR
-    // ULEB128 encode main_file_offset (offset from __TEXT segment start).
-    lo = main_file_offset & 0x7F;
-    hi = (main_file_offset >> 7) & 0x7F;
-    if (hi > 0) {
-        mo_w8(lo | 0x80);
-        mo_w8(hi);
-    } else {
-        mo_w8(lo);
-    }
+    // ULEB128 encode main_file_offset.
+    mo_write_uleb128(main_file_offset);
     mo_w8(0);                       // children_count = 0
 
-    // Pad to 4-byte alignment relative to trie start (not absolute position).
-    while ((mo_pos - start) % 4 != 0) { mo_w8(0); }
+    // Pad to 8-byte alignment for LINKEDIT content.
+    while ((mo_pos - start) % 8 != 0) { mo_w8(0); }
     return mo_pos - start;
 }
 
@@ -919,16 +941,20 @@ mo_compute_layout(code_size, data_count) {
             si = si + 1;
         }
         cf_data_size = 32 + 4 + nseg * 4 + 24 + arr_len(mo_got_syms) * 4 + sym_str_size;
-        cf_data_size = (cf_data_size + 3) / 4 * 4;
+        cf_data_size = (cf_data_size + 7) / 8 * 8;
     } else {
-        // Empty chained fixups: header + starts struct + sentinel.
+        // Empty chained fixups: header + starts struct + sentinel, 8-byte aligned.
         cf_data_size = 32 + 4 + nseg * 4 + 8;
+        cf_data_size = (cf_data_size + 7) / 8 * 8;
     }
     mo_cf_off = mo_link_off;
     mo_cf_size = cf_data_size;
 
     mo_et_off = mo_cf_off + mo_cf_size;
-    mo_et_size = 16;                // exports trie (estimated, will be exact after writing)
+    // Exports trie: root(9) + child(2 + uleb_size + 1) + pad to 8-byte alignment.
+    // Max ULEB128 size for a reasonable binary is 4 bytes. Worst case: 9+7=16, pad→16.
+    // Actual size computed at write time; estimate must be >= actual.
+    mo_et_size = 24;                // safe upper bound, actual padded to 8-byte alignment
 
     mo_sym_cnt = 2;                 // __mh_execute_header + _main
     mo_sym_off = mo_et_off + mo_et_size;
@@ -1226,7 +1252,8 @@ write_macho(filename, main_label, gl_names, gl_count) {
     }
 
     // ── Write __LINKEDIT ──
-    // Pad to __LINKEDIT offset.
+    // Each sub-section is padded to its exact computed offset.
+    // This ensures load command offsets match actual file positions.
     mo_pad(mo_link_off - mo_pos);
 
     // Chained fixups data.
@@ -1236,13 +1263,14 @@ write_macho(filename, main_label, gl_names, gl_count) {
         mo_write_chained_fixups(nseg);
     }
 
-    // Exports trie.
-    et_actual = mo_write_exports_trie(mo_main_off);
+    // Pad to exact exports trie offset.
+    mo_pad(mo_et_off - mo_pos);
 
-    // Pad if exports trie was smaller than estimated.
-    if (et_actual < mo_et_size) {
-        mo_pad(mo_et_size - et_actual);
-    }
+    // Exports trie.
+    mo_write_exports_trie(mo_main_off);
+
+    // Pad to exact symbol table offset.
+    mo_pad(mo_sym_off - mo_pos);
 
     // Symbol table: __mh_execute_header + _main.
     // __mh_execute_header: strx=2, type=0x0F, sect=1, desc=0x0010
@@ -1250,6 +1278,9 @@ write_macho(filename, main_label, gl_names, gl_count) {
     // _main: strx=22, type=0x0F, sect=1, desc=0x0000
     mo_write_nlist(22, 0x0F, 1, 0x0000,
         MO_VM_BASE + mo_main_off, MO_VM_BASE_HI);
+
+    // Pad to exact string table offset.
+    mo_pad(mo_str_off - mo_pos);
 
     // String table: " \0__mh_execute_header\0_main\0" padded to 32.
     mo_w8(0x20); mo_w8(0);                          // " \0" (2 bytes, index 0-1)

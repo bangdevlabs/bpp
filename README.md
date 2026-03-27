@@ -74,7 +74,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
 - **Type hints** — `auto x: byte, y: quarter` — per-variable sub-word types for performance tuning
-- **Builtins** — `memcpy`, `realloc`, `float_ret()`/`float_ret2()` for struct returns from extern calls
+- **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
+- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `float_ret()`/`float_ret2()`
 - **Modular compilation** — Go-model per-module codegen with .bo cache and Go-style hash chain invalidation
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
 - **Module dependency tracking** — content + dependency hashing, topological sort (`--show-deps`)

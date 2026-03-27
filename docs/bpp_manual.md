@@ -286,16 +286,23 @@ Offsets are in bytes. Each word is 8 bytes:
 
 ## Structs
 
-A struct is a named group of 8-byte fields:
+A struct is a named group of fields. By default each field is 8 bytes:
 
-    struct Vec2 { x, y }
+    struct Vec2 { x, y }           // 16 bytes (2 x 8)
+
+Fields can have type hints for packed layout:
+
+    struct Pixel { r: byte, g: byte, b: byte, a: byte }   // 4 bytes (4 x 1)
+    struct Tile  { id: quarter, flags: byte }              // 3 bytes (2 + 1)
+
+Supported field hints: `byte` (1), `quarter` (2), `half` (4). No hint = 8 bytes.
 
 Heap-allocated structs use `auto` with a type annotation:
 
-    auto p: Vec2;
-    p = malloc(sizeof(Vec2));
-    p.x = 100;
-    p.y = 200;
+    auto p: Pixel;
+    p = malloc(sizeof(Pixel));     // 4 bytes
+    p.r = 255;                     // STRB — 1 byte write
+    p.g = 128;
 
 Stack-allocated structs use `var` — no malloc needed:
 
@@ -303,9 +310,9 @@ Stack-allocated structs use `var` — no malloc needed:
     v.x = 100;
     v.y = 200;
 
-`sizeof(Vec2)` is a compile-time constant (fields times 8).
-Struct access is sugar for pointer arithmetic: `p.x` is `*(p + 0)`,
-`p.y` is `*(p + 8)`.
+`sizeof(Pixel)` is a compile-time constant (sum of field sizes).
+Struct access is sugar for pointer arithmetic with the correct load/store size:
+`p.r` on a `: byte` field emits LDRB/STRB (1 byte), not LDR/STR (8 bytes).
 
 ## Enums
 
@@ -377,6 +384,8 @@ These names are recognized by the compiler and emit special code:
 | `sys_clock_gettime(id, tp)` | Clock read (Linux) |
 | `float_ret()` | Read saved first float return register (d0/xmm0) from last extern call |
 | `float_ret2()` | Read saved second float return register (d1/xmm1) from last extern call |
+| `shr(value, shift)` | Logical right shift (unsigned, fills with zeros). Unlike `>>` which sign-extends |
+| `assert(cond)` | Trap (BRK/INT3) if condition is zero. Zero overhead when true |
 
 I/O is implemented via raw syscalls (ARM64 `svc #0x80` on macOS, `syscall` on Linux x86_64). There is
 no libc dependency.

@@ -13,8 +13,8 @@ auto globals, glob_cnt;
 auto externs, ext_cnt;
 auto funcs, func_cnt;
 
-// Struct registry: 4 parallel dynamic arrays (name, fields ptr, field count, size).
-auto sd_names, sd_fields, sd_fcounts, sd_sizes;
+// Struct registry: 5 parallel dynamic arrays (name, fields ptr, field count, size, field hints).
+auto sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
 
 // Variable type map: 2 parallel dynamic arrays (var_name packed, struct_index).
 auto vt_names, vt_sidx;
@@ -60,6 +60,7 @@ init_parser() {
     sd_fields = arr_new();
     sd_fcounts = arr_new();
     sd_sizes = arr_new();
+    sd_fhints = arr_new();
     vt_names = arr_new();
     vt_sidx = arr_new();
     var_stack_names = arr_new();
@@ -100,19 +101,40 @@ add_struct_def(name_p) {
     sd_fields = arr_push(sd_fields, malloc(64 * 8));
     sd_fcounts = arr_push(sd_fcounts, 0);
     sd_sizes = arr_push(sd_sizes, 0);
+    sd_fhints = arr_push(sd_fhints, malloc(64 * 8));
     struct_mods = arr_push(struct_mods, tok_mod(tok_pos));
     return arr_len(sd_names) - 1;
 }
 
-// Add a field to an existing struct. Fields are stored as packed strings.
-add_struct_field(idx, field_p) {
-    auto fields, fc;
+// Return the byte size of a field given its type hint.
+// No hint (0) or TY_WORD/TY_PTR = 8 bytes. Sub-word hints use their natural size.
+field_hint_size(hint) {
+    if (hint == TY_BYTE) { return 1; }
+    if (hint == TY_QUART) { return 2; }
+    if (hint == TY_HALF) { return 4; }
+    return 8;
+}
+
+// Add a field to an existing struct with an optional type hint.
+// The hint determines the field's byte size for packed layout.
+add_struct_field(idx, field_p, hint) {
+    auto fields, hints, fc, sz;
     fields = arr_get(sd_fields, idx);
+    hints = arr_get(sd_fhints, idx);
     fc = arr_get(sd_fcounts, idx);
     *(fields + fc * 8) = field_p;
+    *(hints + fc * 8) = hint;
     fc = fc + 1;
+    // Recompute total size by summing all field sizes.
+    sz = 0;
+    auto j;
+    j = 0;
+    while (j < fc) {
+        sz = sz + field_hint_size(*(hints + j * 8));
+        j = j + 1;
+    }
     arr_set(sd_fcounts, idx, fc);
-    arr_set(sd_sizes, idx, fc * 8);
+    arr_set(sd_sizes, idx, sz);
     return 0;
 }
 
@@ -128,13 +150,37 @@ find_struct(name_p) {
 }
 
 // Get the byte offset of a field within a struct. Returns -1 if not found.
+// Sums the byte sizes of all preceding fields using their type hints.
 get_field_offset(idx, field_p) {
+    auto fields, hints, fc, i, off;
+    fields = arr_get(sd_fields, idx);
+    hints = arr_get(sd_fhints, idx);
+    fc = arr_get(sd_fcounts, idx);
+    off = 0;
+    i = 0;
+    while (i < fc) {
+        if (packed_eq(*(fields + i * 8), field_p)) { return off; }
+        off = off + field_hint_size(*(hints + i * 8));
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get the type hint of a specific field by index.
+get_field_hint(idx, field_idx) {
+    auto hints;
+    hints = arr_get(sd_fhints, idx);
+    return *(hints + field_idx * 8);
+}
+
+// Get the field index by name. Returns -1 if not found.
+get_field_index(idx, field_p) {
     auto fields, fc, i;
     fields = arr_get(sd_fields, idx);
     fc = arr_get(sd_fcounts, idx);
     i = 0;
     while (i < fc) {
-        if (packed_eq(*(fields + i * 8), field_p)) { return i * 8; }
+        if (packed_eq(*(fields + i * 8), field_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -435,6 +481,8 @@ try_type_annotation(var_p) {
 }
 
 // Parse a top-level "auto x, y, z;" global declaration.
+// Supports per-variable type hints: auto x: float, y: byte;
+// Float hints register the global as TY_FLOAT for correct codegen.
 parse_global() {
     auto var_p;
     consume();
@@ -442,12 +490,14 @@ parse_global() {
     add_global(var_p);
     consume();
     try_type_annotation(var_p);
+    if (_prim_hint == TY_FLOAT) { ty_set_global_type(var_p, TY_FLOAT); }
     while (val_is_ch(';') == 0) {
         if (val_is_ch(',')) { consume(); }
         var_p = cur_packed();
         add_global(var_p);
         consume();
         try_type_annotation(var_p);
+        if (_prim_hint == TY_FLOAT) { ty_set_global_type(var_p, TY_FLOAT); }
     }
     consume();
     return 0;
@@ -543,20 +593,22 @@ parse_import() {
 
 // Parse a struct definition: struct Name { field1, field2 }
 parse_struct() {
-    auto name_p, idx;
+    auto name_p, idx, hint;
     consume();
     name_p = cur_packed();
     consume();
     consume();
     idx = add_struct_def(name_p);
     while (val_is_ch('}') == 0) {
-        add_struct_field(idx, cur_packed());
+        hint = 0;
+        auto fp;
+        fp = cur_packed();
         consume();
-        // Skip optional type annotation on fields.
-        if (val_is_ch(':')) {
-            consume();
-            consume();
-        }
+        // Read optional type hint for packed field layout.
+        // try_type_annotation handles the ':' token internally.
+        try_type_annotation(fp);
+        hint = _prim_hint;
+        add_struct_field(idx, fp, hint);
         if (val_is_ch(',')) { consume(); }
     }
     consume();
@@ -970,8 +1022,10 @@ parse_unary() {
 
 // Resolve chained .field access on a variable node.
 // Returns a mem_load node with computed offset.
+// For packed structs, stores the field type hint in n.b so the codegen
+// can emit the correct sized load (LDRB for byte, LDRH for quarter, etc.).
 resolve_dot(base_node, name_p) {
-    auto vtype, field_p, offset, ptr_node, plus_op, off_node;
+    auto vtype, field_p, offset, ptr_node, plus_op, off_node, fi, fhint;
     vtype = get_var_type(name_p);
     while (val_is_ch('.')) {
         if (vtype < 0) { return base_node; }
@@ -990,7 +1044,11 @@ resolve_dot(base_node, name_p) {
             diag_help("check the struct definition for available field names");
             sys_exit(1);
         }
-        // Build: mem_load(ptr: binop(base + offset))
+        // Get the field's type hint for packed struct support.
+        fi = get_field_index(vtype, field_p);
+        fhint = 0;
+        if (fi >= 0) { fhint = get_field_hint(vtype, fi); }
+        // Build: mem_load(ptr: binop(base + offset), hint: fhint)
         plus_op = make_plus_op();
         off_node = make_int_lit(offset);
         ptr_node = make_node(T_BINOP);
@@ -999,6 +1057,7 @@ resolve_dot(base_node, name_p) {
         *(ptr_node + 24) = off_node;
         base_node = make_node(T_MEMLD);
         *(base_node + 8) = ptr_node;
+        *(base_node + 16) = fhint;
         // TODO: update vtype for nested struct fields.
     }
     return base_node;
@@ -1039,10 +1098,12 @@ parse_expr() {
     if (val_is_ch('=')) {
         consume();
         // If left is a mem_load (from dot access), convert to mem_store.
+        // Copy the field hint from the load node for packed struct support.
         if (*(left + 0) == T_MEMLD) {
             node = make_node(T_MEMST);
             *(node + 8) = *(left + 8);
             *(node + 16) = parse_expr();
+            *(node + 24) = *(left + 16);
             return node;
         }
         node = make_node(T_ASSIGN);

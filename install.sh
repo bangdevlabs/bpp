@@ -28,7 +28,9 @@ echo "==> Installing to $PREFIX (requires sudo)..."
 # Create directories.
 sudo mkdir -p "$BIN_DIR" "$LIB_DIR" "$STB_DIR" "$DRV_DIR"
 
-# Install compiler binary (from /tmp to avoid sandbox restrictions).
+# Install compiler binary. Remove old file first so macOS sees a fresh inode
+# and validates the embedded code signature from scratch (no stale kernel cache).
+sudo rm -f "$BIN_DIR/bpp"
 sudo cp /tmp/bpp_install "$BIN_DIR/bpp"
 sudo chmod 755 "$BIN_DIR/bpp"
 rm -f /tmp/bpp_install
@@ -42,8 +44,8 @@ sudo cp stb/*.bsm "$STB_DIR/"
 # Install drivers.
 sudo cp drivers/*.bsm "$DRV_DIR/"
 
-# Update local bpp too (if not sandboxed).
-cp "$BIN_DIR/bpp" ./bpp 2>/dev/null || true
+# Update local bpp too (if not sandboxed). Remove first for fresh inode.
+rm -f ./bpp 2>/dev/null; cp "$BIN_DIR/bpp" ./bpp 2>/dev/null || true
 
 echo "==> Installed:"
 echo "    $BIN_DIR/bpp"

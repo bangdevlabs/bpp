@@ -1547,3 +1547,99 @@ bootstrap.c was generated on 2026-03-26 but never tested. It cannot compile curr
 - `isVisible` in the event loop (once per frame) is cheap; in `should_close` (per check) causes slowdown
 - `return 0` from main terminates macOS Cocoa processes cleanly — no need for `NSApp terminate:`
 - Always recompile the compiler before testing platform changes — stb modules are compiled by bpp
+
+## 2026-03-27 (session 2) — Mach-O Fix, Packed Structs, shr/assert, C Emitter, Input Lag
+
+Second session of the day. Fixed the Mach-O encoder, added packed structs, new builtins, fixed the C emitter, and eliminated input lag on both platforms.
+
+### Mach-O Encoder Fix
+
+The binary encoder had three bugs that caused SIGKILL on certain code sizes:
+
+1. **ULEB128 hardcoded to 2 bytes**: The exports trie encoded `_main`'s offset with a fixed 2-byte ULEB128 and hardcoded `terminal_size=3`. When `_main` offset exceeded 16384 (large binaries like the compiler itself), it needed 3+ bytes. Now uses `mo_write_uleb128()` with dynamic `terminal_size`.
+
+2. **4-byte alignment on LINKEDIT sub-offsets**: dyld requires `sizeof(void*)` alignment (8 bytes on ARM64) for chained fixups, exports trie, symtab, and strtab offsets. The encoder only aligned chained fixups to 4 bytes. Now all LINKEDIT content is 8-byte aligned.
+
+3. **No explicit padding between LINKEDIT sections**: The layout computed offsets upfront, but writers could produce different sizes than estimated. Now explicit `mo_pad(mo_et_off - mo_pos)` calls between each section guarantee that file positions match load command offsets.
+
+Also discovered: `cp` on macOS can invalidate the kernel's code signature cache (same inode, different content). Fix: `rm -f ./bpp` before `cp` ensures a fresh inode. Updated `install.sh`.
+
+### shr() and assert() Builtins
+
+`shr(value, shift)` — logical right shift (unsigned, fills with zeros). Unlike `>>` which is arithmetic (sign-extending), `shr` uses LSRV on ARM64 and SHR CL on x86_64. Critical for bit manipulation on unsigned values.
+
+`assert(cond)` — traps if condition is zero. ARM64: CBNZ over BRK #0. x86_64: TEST+JNE over INT3. Zero overhead when condition is true (single branch, predicted taken).
+
+### Packed Structs
+
+Struct fields can now have type hints that determine their byte size:
+
+```
+struct Pixel { r: byte, g: byte, b: byte, a: byte }  // 4 bytes total
+struct Fat   { r, g, b, a }                            // 32 bytes (8 per field, unchanged)
+```
+
+Implementation:
+- Parser: `sd_fhints` parallel array stores per-field type hints. `add_struct_field` computes cumulative offsets. `get_field_offset` sums actual field sizes instead of `i * 8`.
+- Codegen: `T_MEMLD` and `T_MEMST` nodes carry the field hint in `n.b`/`n.c`. ARM64 emits LDRB/STRB for byte, LDRH/STRH for quarter, LDR W/STR W for half.
+- `sizeof(Packed)` correctly returns 4, not 32.
+
+Backward compatible: fields without hints remain 8 bytes.
+
+### C Emitter Fix
+
+The C emitter's syscall wrappers used inline assembly (`svc #0x80`) which broke under `-O2` — the compiler reordered stores to `_bpp_scratch` before the asm fence, corrupting output. Fixed by replacing all inline asm syscall wrappers with libc calls (`write()`, `read()`, `open()`, `close()`). The C emitter already links libc for malloc/free/fork.
+
+Added `#include <fcntl.h>` for `open()`.
+
+### Global Float Type Hints
+
+`auto x: float` at global scope now correctly registers the variable as TY_FLOAT via `ty_set_global_type()` in `parse_global()`. Previously, the `: float` annotation was parsed but the `_prim_hint` was never applied to globals — only to locals and struct fields.
+
+### Input Lag Elimination (macOS + Linux)
+
+Moved input polling from `game_frame_begin()` to the end of `_stb_present()`, after the frame sleep. This ensures input is read as close as possible to when it's used, eliminating the 1-frame delay caused by polling before sleep.
+
+Also replaced fixed-duration sleep with smart frame timing: `remaining = budget - elapsed`. Only sleeps the time left in the frame budget, not a full frame duration regardless of render time.
+
+### Key Event Beep Fix
+
+macOS Cocoa plays an alert beep when key events are forwarded via `sendEvent:` without a responder. Fixed by filtering out `NSEvKeyDown` and `NSEvKeyUp` before calling `sendEvent:` — B++ consumes key events directly from the event stream.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/aarch64/a64_macho.bsm` | ULEB128 dynamic, 8-byte alignment, explicit LINKEDIT pads |
+| `src/aarch64/a64_codegen.bsm` | shr(), assert(), packed T_MEMLD/T_MEMST |
+| `src/x86_64/x64_codegen.bsm` | shr(), assert(), packed T_MEMLD/T_MEMST |
+| `src/bpp_parser.bsm` | sd_fhints, packed field offsets, global `: float` registration |
+| `src/bpp_validate.bsm` | shr, assert registered as builtins |
+| `src/bpp_emitter.bsm` | libc wrappers replace inline asm, fcntl.h |
+| `stb/_stb_platform_macos.bsm` | Smart frame timing, post-sleep poll, key filter |
+| `stb/_stb_platform_linux.bsm` | Smart frame timing, post-sleep poll |
+| `stb/stbgame.bsm` | game_frame_begin simplified, first-frame poll |
+| `install.sh` | rm before cp for fresh inode |
+
+### Verification
+
+| Suite | Result |
+|-------|--------|
+| ARM64 | 19/19 (including test_packed, test_builtins) |
+| Linux | 6/6 compile, 5/6 run in Docker |
+| C emitter | PASS with -O2 |
+| Self-host | gen2 compiles and runs |
+| MCU game | Cat chases rat, smooth movement with `: float` globals |
+| Mouse test | Cursor tracking at 60fps, no lag, no beep |
+
+### Lessons Learned
+
+- Mach-O LINKEDIT requires 8-byte aligned offsets — Apple's dyld silently rejects misaligned binaries
+- ULEB128 sizes must be computed dynamically, never hardcoded — binary size determines encoding width
+- `cp` on macOS preserves content but can invalidate kernel code signature cache — always `rm` first
+- C compiler optimizations (-O2) can reorder stores past inline asm even with "memory" clobber — use libc wrappers
+- Global `: float` annotations must be explicitly registered — the parser reads the hint but must apply it
+- Input polling belongs after the frame sleep, not before — eliminates 1 frame of lag
+- Fixed-time sleep wastes frame budget — subtract elapsed time for responsive input
+- Packed structs are backward compatible: no hint = 8 bytes per field, same as before
+- MCU game is the best integration test — catches type system regressions immediately

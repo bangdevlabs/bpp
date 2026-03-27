@@ -28,12 +28,49 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ---
 
-## P0 — Urgent
+## P0 — Developer Experience (immediate priorities)
+
+### 1. Debug printing builtins
+`print_int(x)` and `print_float(x)` that write to stderr/terminal. Every debugging session needs this. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
+
+### 2. Array syntax sugar: buf[i]
+`buf[i]` as sugar for `*(buf + i * 8)` and `buf[i] = val` for `*(buf + i * 8) = val`. Parser-only change — desugars to existing T_MEMLD/T_MEMST. Massive readability improvement for game code.
+
+### 3. Compiler warnings (analysis pass)
+Add warnings for common mistakes without adding new types:
+- W006: variable used before assignment
+- W007: function called with wrong argument count (already E-level, add W for close matches)
+- W008: comparison of pointer with integer literal other than 0
+- W009: unreachable code after return/break
+
+### 4. DWARF debug info → lldb support
+Add `__DWARF` section to Mach-O/ELF with line tables so lldb can:
+- Show source file:line on breakpoints and crashes
+- Step through B++ code line by line
+- Print variable values at break
+
+Implementation:
+- `--debug` flag enables DWARF `.debug_line` emission
+- Map each emitted instruction back to source file:line (already tracked by diag system)
+- Write DWARF line number program into `__DWARF,__debug_line` section
+- Add `LC_UUID` load command for debugger identification
+- `assert(cond)` enhanced to embed file:line in trap metadata
+
+### 5. Sprite/tilemap loader in stb
+`load_sprite16(path)` and `load_tilemap(path)` — every game needs this, shouldn't be 50 lines of manual JSON parsing per project. Part of stbart.bsm.
+
+### 6. Sound
+Basic audio output for game feedback. Evaluate: CoreAudio (macOS native), ALSA (Linux), or minimal beep/sample playback via platform layer.
+
+## P1 — Infrastructure
 
 ### bootstrap.c — Must be functional for distribution
 bootstrap.c was generated but never tested. It cannot compile current B++ source (lexer/parser outdated). Without a working bootstrap, B++ cannot be distributed via GitHub — the bpp binary is platform-specific and should not be committed.
 
 **Fix:** Use `./bpp --c src/bpp.bpp` to regenerate bootstrap.c, then verify: `cc bootstrap.c -o bpp_seed && ./bpp_seed src/bpp.bpp -o bpp`.
+
+### Global float inference (smarter auto-promotion)
+Current rule: globals never auto-promote to float (must annotate `: float`). This fixed the mouse bug but broke MCU. Better rule: only promote a global to float if ALL assignments are float. If any assignment is integer, keep integer. Requires two-pass analysis or post-inference fixup.
 
 ---
 
