@@ -817,26 +817,77 @@ a64_emit_node(nd) {
             if (a64_bin_mode) { enc_mov_wide(0, 0); } else { out("  mov x0, #0"); putchar('\n'); }
             return 0;
         }
-        // Built-in: realloc(ptr, size) — resize memory. With bump allocator, always allocates new block.
+        // Built-in: realloc(ptr, old_size, new_size) — allocate new block and copy old data.
+        // With bump allocator, always allocates a new block via mmap, copies old_size bytes,
+        // and returns the new pointer.
         if (a64_str_eq(n.a, "realloc", 7)) {
             arr = n.b;
-            a64_emit_node(*(arr + 0)); a64_emit_push();  // push old ptr
-            a64_emit_node(*(arr + 8));                     // x0 = new size
-            // Allocate new block (mmap).
+            a64_emit_node(*(arr + 0)); a64_emit_push();   // push old ptr
+            a64_emit_node(*(arr + 8)); a64_emit_push();   // push old_size
+            a64_emit_node(*(arr + 16));                    // x0 = new_size
             if (a64_bin_mode) {
-                enc_mov_reg(1, 0);
-                enc_mov_wide(0, 0);
-                enc_mov_wide(2, 3);
-                enc_mov_wide(3, 0x1002);
-                enc_movn(4, 0, 0);
-                enc_mov_wide(5, 0);
-                enc_mov_wide(16, 197);
+                // mmap(0, new_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+                enc_mov_reg(1, 0);                         // x1 = new_size
+                enc_mov_wide(0, 0);                        // x0 = 0 (addr)
+                enc_mov_wide(2, 3);                        // x2 = PROT_READ|PROT_WRITE
+                enc_mov_wide(3, 0x1002);                   // x3 = MAP_PRIVATE|MAP_ANON
+                enc_movn(4, 0, 0);                         // x4 = -1 (fd)
+                enc_mov_wide(5, 0);                        // x5 = 0 (offset)
+                enc_mov_wide(16, 197);                     // syscall mmap
                 enc_svc(0x80);
                 enc_csneg(0, 0, 0, 3);
-            } else { out("  bl _malloc"); putchar('\n'); }
-            // x0 = new ptr. Old ptr is on stack. Return new ptr.
-            // NOTE: caller must copy data themselves. realloc here is just malloc.
-            a64_emit_pop(1);  // discard old ptr
+                // x0 = new ptr. Stack: [old_size, old_ptr].
+                // Save new ptr, pop old_size and old_ptr, then copy.
+                enc_mov_reg(2, 0);                         // x2 = new ptr (dst, preserved)
+                a64_emit_pop(3);                           // x3 = old_size
+                a64_emit_pop(1);                           // x1 = old ptr (src)
+                // Copy loop: while (x3 > 0) { *x2++ = *x1++; x3--; }
+                auto lbl_top, lbl_end;
+                lbl_top = enc_new_label();
+                lbl_end = enc_new_label();
+                enc_cbz_label(3, lbl_end);
+                enc_def_label(lbl_top);
+                enc_ldrb_post(4, 1, 1);
+                enc_strb_post(4, 2, 1);
+                enc_subs_imm(3, 3, 1);
+                enc_cbnz_label(3, lbl_top);
+                enc_def_label(lbl_end);
+                // x2 has advanced past the copied region. Return original new ptr.
+                // We need to recover it: new_ptr = x2 - old_size.
+                // But old_size was consumed. Simpler: re-emit new_size mmap result.
+                // Actually, x0 still holds the mmap result (untouched by the loop).
+                // x0 = new ptr (return value, never clobbered)
+            } else {
+                out("  bl _realloc"); putchar('\n');
+                a64_emit_pop(1);                           // discard old_size
+                a64_emit_pop(1);                           // discard old ptr
+            }
+            return 0;
+        }
+        // Built-in: memcpy(dst, src, len) — byte-by-byte copy. Returns dst.
+        if (a64_str_eq(n.a, "memcpy", 6)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0)); a64_emit_push();   // push dst
+            a64_emit_node(*(arr + 8)); a64_emit_push();   // push src
+            a64_emit_node(*(arr + 16));                    // x0 = len
+            if (a64_bin_mode) {
+                auto lbl_top, lbl_end;
+                enc_mov_reg(3, 0);                         // x3 = len
+                a64_emit_pop(1);                           // x1 = src
+                a64_emit_pop(2);                           // x2 = dst
+                lbl_top = enc_new_label();
+                lbl_end = enc_new_label();
+                enc_cbz_label(3, lbl_end);                 // skip if len=0
+                enc_def_label(lbl_top);
+                enc_ldrb_post(4, 1, 1);                    // w4 = [x1], x1++
+                enc_strb_post(4, 2, 1);                    // [x2] = w4, x2++
+                enc_subs_imm(3, 3, 1);                     // x3-- (sets flags)
+                enc_cbnz_label(3, lbl_top);                // loop if x3 != 0
+                enc_def_label(lbl_end);
+                enc_mov_reg(0, 2);                         // return dst
+            } else {
+                out("  bl _memcpy"); putchar('\n');
+            }
             return 0;
         }
         // Built-in: peek — byte read from real pointer.
@@ -863,6 +914,14 @@ a64_emit_node(nd) {
             a64_emit_pop(1);
             if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
             return 0;
+        }
+        // Built-in: float_ret2() — capture the second float return register (d1).
+        // Use immediately after a function that returns a struct of two doubles.
+        // Copies d1 to d0 so B++ can read it as a float value.
+        if (a64_str_eq(n.a, "float_ret2", 10)) {
+            if (a64_bin_mode) { enc_fmov(0, 1); }
+            else { out("  fmov d0, d1"); putchar('\n'); }
+            return 1;
         }
         // Built-in: str_peek — byte read from real string pointer.
         if (a64_str_eq(n.a, "str_peek", 8)) {

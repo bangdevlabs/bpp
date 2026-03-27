@@ -15,11 +15,27 @@ itself.
 
 ## Getting Started
 
-Install the compiler and standard library:
+- Install the compiler and standard library manually: 
 
-    sudo cp bpp /usr/local/bin/
-    sudo mkdir -p /usr/local/lib/bpp/stb
-    sudo cp stb/*.bsm /usr/local/lib/bpp/stb/
+sudo cp bpp /usr/local/bin/ 
+sudo mkdir -p /usr/local/lib/bpp/stb 
+sudo cp stb/*.bsm /usr/local/lib/bpp/stb/
+      
+
+- Bootstrap from C source (first time, or if bpp binary is missing):
+
+    clang bootstrap.c -o bpp
+
+- Install the compiler, standard library, and drivers:
+
+    sh install.sh
+
+- Install without re-bootstrapping:
+
+    sh install.sh --skip
+
+The `bootstrap.c` file is the entire compiler emitted as C. It is the
+seed that builds everything. Regenerate it with `bpp --c src/bpp.bpp > bootstrap.c`.
 
 Compile and run a program:
 
@@ -217,18 +233,26 @@ Float and integer values convert automatically in mixed expressions.
 
 ## Type Hints
 
-Variables and parameters can be annotated with a type hint for sub-word storage:
+Variables and parameters can be annotated with a type hint for sub-word storage.
+Each variable in a declaration can have its own hint:
 
-    auto x: byte;        // 8-bit (0-255)
-    auto y: quarter;     // 16-bit (0-65535)
-    auto z: half;        // 32-bit
-    auto w: int;         // 64-bit (default, explicit)
-    auto f: float;       // 64-bit double
+    auto x: byte;            // 8-bit (0-255)
+    auto y: quarter;         // 16-bit (0-65535)
+    auto z: half;            // 32-bit
+    auto w: word;            // 64-bit (default, explicit)
+    auto f: float;           // 64-bit double
+    auto r: byte, g: byte, b: byte;  // per-variable hints
 
     update(dt: float) {
         pos = pos + speed * dt;
         return 0;
     }
+
+Sub-word types also work as standalone declaration keywords:
+
+    byte hp;
+    half score;
+    quarter tile_id;
 
 Type hints are opt-in performance tuning. The compiler uses narrower
 load/store instructions (ldrb/strb on ARM64, movzx on x86_64) and the
@@ -328,7 +352,9 @@ These names are recognized by the compiler and emit special code:
 |----------|-------------|
 | `malloc(n)` | Allocate n bytes, return pointer |
 | `free(ptr)` | Release memory |
-| `realloc(ptr, n)` | Resize memory block |
+| `realloc(ptr, n)` | Resize memory block (2-arg: just allocate) |
+| `realloc(ptr, old, new)` | Resize with copy (3-arg: allocate + copy old bytes) |
+| `memcpy(dst, src, len)` | Copy len bytes from src to dst, return dst |
 | `peek(addr)` | Read one byte |
 | `poke(addr, val)` | Write one byte |
 | `putchar(ch)` | Write one byte to stdout |
@@ -346,6 +372,10 @@ These names are recognized by the compiler and emit special code:
 | `sys_execve(path, argv, envp)` | Replace process image |
 | `sys_waitpid(pid)` | Wait for child process |
 | `sys_exit(code)` | Terminate process |
+| `sys_ioctl(fd, req, arg)` | Device control |
+| `sys_nanosleep(req, rem)` | Sleep (Linux) |
+| `sys_clock_gettime(id, tp)` | Clock read (Linux) |
+| `float_ret2()` | Capture second float return register (d1/xmm1) |
 
 I/O is implemented via raw syscalls (ARM64 `svc #0x80` on macOS, `syscall` on Linux x86_64). There is
 no libc dependency.
@@ -463,6 +493,7 @@ graphics library needed.
 | `measure_text(text, sz)` | Text width in pixels |
 | `clear(color)` | Clear framebuffer |
 | `put_px(x, y, color)` | Single pixel |
+| `blend_px(x, y, color)` | Alpha-blended pixel (ARGB, 255=opaque) |
 | `draw_end()` | Present framebuffer to screen |
 | `rgba(r, g, b, a)` | Pack color components |
 
@@ -476,13 +507,19 @@ All input reads from memory arrays. No external input library needed.
 | Function | Description |
 |----------|-------------|
 | `key_down(k)` | 1 if key is held |
-| `key_pressed(k)` | 1 if key was just pressed |
-| `mouse_x()`, `mouse_y()` | Cursor position |
+| `key_pressed(k)` | 1 if key was just pressed (edge-triggered) |
+| `mouse_x()`, `mouse_y()` | Cursor position in framebuffer coordinates |
 | `mouse_down(btn)` | 1 if button held |
+| `mouse_pressed(btn)` | 1 if button just pressed (edge-triggered) |
+| `mouse_released(btn)` | 1 if button just released (edge-triggered) |
 | `point_in_rect(px,py,x,y,w,h)` | Hit test |
 
 Keys (enum): `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_W`,
-`KEY_A`, `KEY_S`, `KEY_D`, `KEY_SPACE`, `KEY_ENTER`, `KEY_ESC`, `KEY_TAB`.
+`KEY_A`, `KEY_S`, `KEY_D`, `KEY_SPACE`, `KEY_ENTER`, `KEY_ESC`, `KEY_TAB`,
+`KEY_SHIFT`, `KEY_E`, `KEY_R`, `KEY_Z`, `KEY_X`, `KEY_G`, `KEY_C`,
+`KEY_N`, `KEY_T`, `KEY_0`-`KEY_9`, `KEY_PERIOD`, `KEY_BACKSPACE`.
+
+Mouse buttons (enum): `MOUSE_LEFT`, `MOUSE_RIGHT`, `MOUSE_MIDDLE`.
 
 ### stbcol — Collision Detection
 
@@ -505,6 +542,7 @@ Keys (enum): `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_W`,
 | Function | Description |
 |----------|-------------|
 | `file_read_all(path, size_out)` | Read entire file, return buffer pointer |
+| `file_write_all(path, buf, len)` | Write buffer to file, return 0 or -1 |
 
 ### stbfont — 8x8 Bitmap Font
 

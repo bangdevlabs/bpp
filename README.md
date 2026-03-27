@@ -73,10 +73,12 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
-- **Type hints** — `auto x: byte`, `fn(dt: float)` — opt-in sub-word types for performance tuning
-- **Modular compilation** — Go-model per-module codegen with .bo cache files (default for native backends)
+- **Type hints** — `auto x: byte, y: quarter` — per-variable sub-word types for performance tuning
+- **Builtins** — `memcpy(dst, src, len)`, `realloc(ptr, old, new)` with 2-arg and 3-arg support
+- **Modular compilation** — Go-model per-module codegen with .bo cache files and 3-layer manifest hash validation
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
 - **Module dependency tracking** — content hashing, topological sort, stale propagation (`--show-deps`)
+- **Install script** — `sh install.sh` bootstraps and installs compiler + stb + drivers globally
 
 ## What B++ Doesn't Have
 
@@ -98,10 +100,12 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbarray` | Dynamic arrays with shadow header |
 | `stbstr` | String operations and growable string builder |
 | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
-| `stbfile` | Load files from disk |
+| `stbfile` | File I/O — read and write entire files |
 | `stbui` | Immediate-mode UI widgets |
 | `stbcol` | Collision detection (AABB, circles) |
 | `stbio` | Console I/O (print_int, print_msg) |
+
+New in stb: `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection, mouse button events on macOS Cocoa and SDL2.
 
 Every pixel is written to a memory buffer. The compiler's platform layer puts those pixels on screen. On macOS, that's Cocoa + CoreGraphics — no SDL, no OpenGL, no Metal. Just `objc_msgSend` and a `CGBitmapContext`.
 
@@ -128,17 +132,26 @@ import "drv_raylib.bsm";
 
 ## Getting Started
 
+Install the compiler and standard library manually:
+
+sudo cp bpp /usr/local/bin/                                                                
+sudo mkdir -p /usr/local/lib/bpp/stb                                                       
+sudo cp stb/*.bsm /usr/local/lib/bpp/stb/                                                  
+      
 ### Install
 
 ```bash
-# Build the compiler (it compiles itself)
-bpp src/bpp.bpp -o bpp
+# Bootstrap from C source (first time, or if bpp binary is missing)
+clang bootstrap.c -o bpp
 
-# Install globally
-sudo cp bpp /usr/local/bin/
-sudo mkdir -p /usr/local/lib/bpp/stb
-sudo cp stb/*.bsm /usr/local/lib/bpp/stb/
+# Bootstrap + install globally
+sh install.sh
+
+# Or install without re-bootstrapping
+sh install.sh --skip
 ```
+
+The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed that builds everything — no external tools needed beyond a C compiler.
 
 ### Run Examples
 
@@ -232,7 +245,7 @@ bpp --c source.bpp              # emit C (for debugging)
 bpp --asm source.bpp            # emit ARM64 assembly
 ```
 
-17 modules, ~11,000 lines of B++. Self-hosting verified at every stage.
+17 modules, ~11,000 lines of B++. Self-hosting verified at every stage. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
 
 ## Contributing
 
@@ -289,5 +302,7 @@ SOFTWARE.
 *Zero-dependency native compilation on March 23, 2026.*
 *Native game rendering without external libraries on March 24, 2026.*
 *Compiler diagnostics and x86_64 Linux cross-compilation on March 25, 2026.*
+*Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization on March 26, 2026.*
+*Cache modular fix, memcpy/realloc builtins, per-variable hints, mouse events, install script on March 26, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

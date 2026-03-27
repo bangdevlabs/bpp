@@ -232,10 +232,41 @@ hex_parse(buf, off) {
     return val;
 }
 
+// Compute a manifest hash from the full module list.
+// Combines module count + all filenames into a single FNV-1a hash.
+// Different programs (different import trees) produce different manifest hashes,
+// so .bo cache files are never reused across incompatible compilations.
+cache_manifest_hash() {
+    auto h, n, i, fp, fs, fl, j;
+    h = 0xcbf29ce484222325;
+    n = arr_len(diag_file_starts);
+    // Mix in the module count.
+    h = h ^ (n & 0xFF); h = h * 0x100000001b3;
+    h = h ^ ((n >> 8) & 0xFF); h = h * 0x100000001b3;
+    // Mix in each module filename.
+    i = 0;
+    while (i < n) {
+        fp = arr_get(diag_file_names, i);
+        fs = unpack_s(fp); fl = unpack_l(fp);
+        j = 0;
+        while (j < fl) {
+            h = h ^ peek(fname_buf + fs + j);
+            h = h * 0x100000001b3;
+            j = j + 1;
+        }
+        // Separator byte between filenames.
+        h = h ^ 0; h = h * 0x100000001b3;
+        i = i + 1;
+    }
+    return h;
+}
+
 // Load cached hashes from .bpp_cache/hashes and compare against current mod_hashes.
 // Sets mod_stale[i] = 1 for each module whose hash differs from the cached value.
+// The first line is a manifest hash that captures the full module list.
+// If the manifest differs, all modules are stale (different program being compiled).
 cache_load() {
-    auto fd, n, i, nread, bpos, line_start, hash_val, j, fname_len;
+    auto fd, n, i, nread, bpos, line_start, hash_val, j, fname_len, manifest;
     n = arr_len(diag_file_starts);
     mod_stale = arr_new();
     // Default: all modules are stale.
@@ -252,8 +283,13 @@ cache_load() {
     nread = sys_read(fd, _cache_buf, 65536);
     sys_close(fd);
     if (nread <= 0) { return 0; }
-    // Parse lines: each line is "<16-char hex hash> <filename>\n".
-    bpos = 0;
+    // First line: manifest hash. If it doesn't match, the whole cache is invalid.
+    if (nread < 17) { return 0; }
+    manifest = hex_parse(_cache_buf, 0);
+    if (manifest != cache_manifest_hash()) { return 0; }
+    // Skip the manifest line (16 hex chars + newline).
+    bpos = 17;
+    // Parse remaining lines: each line is "<16-char hex hash> <filename>\n".
     while (bpos + 17 < nread) {
         hash_val = hex_parse(_cache_buf, bpos);
         bpos = bpos + 17;
@@ -298,8 +334,10 @@ cache_save() {
     poke(pathbuf+8,'h'); poke(pathbuf+9,'e'); poke(pathbuf+10,'/');
     poke(pathbuf+11,'h'); poke(pathbuf+12,'a'); poke(pathbuf+13,'s'); poke(pathbuf+14,'h');
     poke(pathbuf+15,'e'); poke(pathbuf+16,'s'); poke(pathbuf+17, 0);
-    // Build output in _cache_buf.
+    // Build output in _cache_buf. First line: manifest hash.
     bpos = 0;
+    bpos = hex_emit(_cache_buf, bpos, cache_manifest_hash());
+    poke(_cache_buf + bpos, 10); bpos = bpos + 1;
     i = 0;
     while (i < n) {
         bpos = hex_emit(_cache_buf, bpos, arr_get(mod_hashes, i));
@@ -418,8 +456,36 @@ find_file(base_off, base_len, name_off, name_len) {
     fd = sys_open(pathbuf, 0);
     if (fd >= 0) { sys_close(fd); return 8 + name_len; }
 
-    // Try in /usr/local/lib/bpp/stb/ (global install path).
+    // Try in src/ directory (compiler internal modules).
+    poke(pathbuf + 0, 's'); poke(pathbuf + 1, 'r');
+    poke(pathbuf + 2, 'c'); poke(pathbuf + 3, '/');
+    i = 0;
+    while (i < name_len) {
+        poke(pathbuf + 4 + i, peek(name_off + i));
+        i = i + 1;
+    }
+    poke(pathbuf + 4 + name_len, 0);
+    fd = sys_open(pathbuf, 0);
+    if (fd >= 0) { sys_close(fd); return 4 + name_len; }
+
+    // Try in /usr/local/lib/bpp/ (global install, non-stb modules).
     auto prefix_len, pi;
+    prefix_len = 20;
+    poke(pathbuf+0,'/');  poke(pathbuf+1,'u');  poke(pathbuf+2,'s');  poke(pathbuf+3,'r');
+    poke(pathbuf+4,'/');  poke(pathbuf+5,'l');  poke(pathbuf+6,'o');  poke(pathbuf+7,'c');
+    poke(pathbuf+8,'a');  poke(pathbuf+9,'l');  poke(pathbuf+10,'/'); poke(pathbuf+11,'l');
+    poke(pathbuf+12,'i'); poke(pathbuf+13,'b'); poke(pathbuf+14,'/'); poke(pathbuf+15,'b');
+    poke(pathbuf+16,'p'); poke(pathbuf+17,'p'); poke(pathbuf+18,'/');
+    i = 0;
+    while (i < name_len) {
+        poke(pathbuf + 19 + i, peek(name_off + i));
+        i = i + 1;
+    }
+    poke(pathbuf + 19 + name_len, 0);
+    fd = sys_open(pathbuf, 0);
+    if (fd >= 0) { sys_close(fd); return 19 + name_len; }
+
+    // Try in /usr/local/lib/bpp/stb/ (global install, stb modules).
     prefix_len = 24;
     poke(pathbuf+0,'/');  poke(pathbuf+1,'u');  poke(pathbuf+2,'s');  poke(pathbuf+3,'r');
     poke(pathbuf+4,'/');  poke(pathbuf+5,'l');  poke(pathbuf+6,'o');  poke(pathbuf+7,'c');
@@ -436,6 +502,24 @@ find_file(base_off, base_len, name_off, name_len) {
     poke(pathbuf + 23 + name_len, 0);
     fd = sys_open(pathbuf, 0);
     if (fd >= 0) { sys_close(fd); return 23 + name_len; }
+
+    // Try in /usr/local/lib/bpp/drivers/ (global install, driver modules).
+    // Path: /usr/local/lib/bpp/drivers/ = 28 chars.
+    poke(pathbuf+0,'/');  poke(pathbuf+1,'u');  poke(pathbuf+2,'s');  poke(pathbuf+3,'r');
+    poke(pathbuf+4,'/');  poke(pathbuf+5,'l');  poke(pathbuf+6,'o');  poke(pathbuf+7,'c');
+    poke(pathbuf+8,'a');  poke(pathbuf+9,'l');  poke(pathbuf+10,'/'); poke(pathbuf+11,'l');
+    poke(pathbuf+12,'i'); poke(pathbuf+13,'b'); poke(pathbuf+14,'/'); poke(pathbuf+15,'b');
+    poke(pathbuf+16,'p'); poke(pathbuf+17,'p'); poke(pathbuf+18,'/'); poke(pathbuf+19,'d');
+    poke(pathbuf+20,'r'); poke(pathbuf+21,'i'); poke(pathbuf+22,'v'); poke(pathbuf+23,'e');
+    poke(pathbuf+24,'r'); poke(pathbuf+25,'s'); poke(pathbuf+26,'/');
+    i = 0;
+    while (i < name_len) {
+        poke(pathbuf + 27 + i, peek(name_off + i));
+        i = i + 1;
+    }
+    poke(pathbuf + 27 + name_len, 0);
+    fd = sys_open(pathbuf, 0);
+    if (fd >= 0) { sys_close(fd); return 27 + name_len; }
 
     // File not found. Try with target suffix: "foo.bsm" → "foo_macos.bsm".
     // Find the ".bsm" extension and insert "_<target>" before it.

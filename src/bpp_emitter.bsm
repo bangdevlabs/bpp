@@ -467,6 +467,25 @@ emit_node(nd) {
     }
 
     if (t == T_ASSIGN) {
+        // Stack struct copy: b = a becomes memcpy(b, a, sizeof_struct).
+        an = n.a;
+        if (an.ntype == T_VAR) {
+            if (is_var_stack(an.a)) {
+                auto _sidx, _fc;
+                _sidx = get_var_type(an.a);
+                _fc = get_struct_size(_sidx) / 8;
+                out("memcpy(");
+                print_p(an.a);
+                out(", ");
+                an = n.b;
+                if (an.ntype == T_VAR) { print_p(an.a); }
+                else { emit_node(n.b); }
+                out(", ");
+                emit_int(_fc * 8);
+                out(")");
+                return 0;
+            }
+        }
         emit_node(n.a);
         out(" = ");
         emit_node(n.b);
@@ -515,13 +534,27 @@ emit_node(nd) {
             return 0;
         }
 
-        // Built-in: realloc -> resize memory block.
+        // Built-in: realloc(ptr, old_size, new_size) -> resize with copy.
+        // C realloc copies automatically, so old_size (arg 2) is ignored.
         if (str_eq(name_p, "realloc", 7)) {
-            out("(long long)realloc((void*)(uintptr_t)(");
+            out("(long long)(uintptr_t)realloc((void*)(uintptr_t)(");
             if (cnt > 0) { emit_node(*(arr + 0)); }
-            out("), ");
+            out("), (size_t)(");
+            if (cnt > 2) { emit_node(*(arr + 16)); }
+            else if (cnt > 1) { emit_node(*(arr + 8)); }
+            out("))");
+            return 0;
+        }
+
+        // Built-in: memcpy(dst, src, len) -> copy bytes between buffers.
+        if (str_eq(name_p, "memcpy", 6)) {
+            out("(long long)(uintptr_t)memcpy((void*)(uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), (const void*)(uintptr_t)(");
             if (cnt > 1) { emit_node(*(arr + 8)); }
-            out(")");
+            out("), (size_t)(");
+            if (cnt > 2) { emit_node(*(arr + 16)); }
+            out("))");
             return 0;
         }
 
@@ -921,6 +954,7 @@ emit_runtime() {
 // Emit the memory model (scratch buffer and argv storage).
 emit_mem_model() {
     out("#include <stdlib.h>"); putchar('\n');
+    out("#include <string.h>"); putchar('\n');
     out("static uint8_t _bpp_scratch[16];"); putchar('\n');
     out("static int _bpp_argc;"); putchar('\n');
     out("static char** _bpp_argv;"); putchar('\n');
@@ -978,7 +1012,7 @@ emit_forward_decls() {
     while (i < fn_cnt) {
         pi = *(fn_fidx + i * 8);
         rty = get_fn_ret_type(pi);
-        if (rty == TY_UNKNOWN) { rty = TY_LONG; }
+        if (rty == TY_UNKNOWN) { rty = TY_WORD; }
         emit_type_for(rty);
         out(" ");
         emit_fname(*(fn_name + i * 8));
@@ -996,7 +1030,7 @@ emit_forward_decls() {
                 if (ph > 0) { pty = ph; }
                 else {
                     pty = get_fn_par_type(pi, j);
-                    if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                    if (pty == TY_UNKNOWN) { pty = TY_WORD; }
                 }
                 emit_type_for(pty);
                 out(" ");
@@ -1019,7 +1053,7 @@ emit_functions() {
         pi = *(fn_fidx + i * 8);
         cur_fn_idx = pi;
         rty = get_fn_ret_type(pi);
-        if (rty == TY_UNKNOWN) { rty = TY_LONG; }
+        if (rty == TY_UNKNOWN) { rty = TY_WORD; }
         emit_type_for(rty);
         out(" ");
         emit_fname(*(fn_name + i * 8));
@@ -1037,7 +1071,7 @@ emit_functions() {
                 if (ph > 0) { pty = ph; }
                 else {
                     pty = get_fn_par_type(pi, j);
-                    if (pty == TY_UNKNOWN) { pty = TY_LONG; }
+                    if (pty == TY_UNKNOWN) { pty = TY_WORD; }
                 }
                 emit_type_for(pty);
                 out(" ");

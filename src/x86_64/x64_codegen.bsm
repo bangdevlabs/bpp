@@ -695,21 +695,88 @@ x64_emit_node(nd) {
             x64_enc_xor_zero(0);
             return 0;
         }
-        // Built-in: realloc — allocate new block (caller must copy).
+        // Built-in: realloc(ptr, old_size, new_size) — allocate new block and copy.
+        // Linux: try mremap first, fallback to mmap + copy.
         if (x64_str_eq(n.a, "realloc", 7)) {
             arr = n.b;
-            x64_emit_node(*(arr + 0)); x64_emit_push();
-            x64_emit_node(*(arr + 8));
-            // mmap for new size.
-            x64_enc_mov_reg(6, 0);
-            x64_enc_xor_zero(7);
-            x64_enc_mov_wide(2, 3);
-            x64_enc_mov_wide(10, 0x22);
-            x64_enc_mov_wide(8, -1);
-            x64_enc_xor_zero(9);
-            x64_enc_mov_wide(0, 9);
+            x64_emit_node(*(arr + 0)); x64_emit_push();   // push old ptr
+            x64_emit_node(*(arr + 8)); x64_emit_push();   // push old_size
+            x64_emit_node(*(arr + 16));                    // rax = new_size
+            // Try mremap(old_ptr, old_size, new_size, MREMAP_MAYMOVE=1)
+            auto lbl_ok, lbl_copy, lbl_end;
+            lbl_ok = x64_enc_new_label();
+            lbl_copy = x64_enc_new_label();
+            lbl_end = x64_enc_new_label();
+            x64_enc_mov_reg(2, 0);                         // rdx = new_size
+            x64_emit_pop(6);                               // rsi = old_size
+            x64_emit_pop(7);                               // rdi = old ptr
+            x64_enc_mov_wide(10, 1);                       // r10 = MREMAP_MAYMOVE
+            x64_enc_mov_wide(0, 25);                       // rax = 25 (sys_mremap)
             x64_enc_syscall();
-            x64_emit_pop(1);
+            // Check if mremap succeeded (rax >= 0).
+            x64_enc_test_reg(0, 0);
+            x64_enc_jcc_label(13, lbl_ok);                 // jge ok (CC_GE=13)
+            // mremap failed: fallback to mmap + copy.
+            // Save old_ptr (rdi) and old_size (rsi) — still in regs after syscall.
+            x64_emit_push();                               // push failed rax (discard later)
+            // Re-push old ptr and old_size for copy.
+            x64_enc_mov_reg(0, 7); x64_emit_push();       // push old ptr
+            x64_enc_mov_reg(0, 6); x64_emit_push();       // push old_size
+            // mmap(0, new_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+            x64_enc_mov_reg(6, 2);                         // rsi = new_size (saved in rdx)
+            x64_enc_xor_zero(7);                           // rdi = 0
+            x64_enc_mov_wide(2, 3);                        // rdx = PROT_READ|PROT_WRITE
+            x64_enc_mov_wide(10, 0x22);                    // r10 = MAP_PRIVATE|MAP_ANON
+            x64_enc_mov_wide(8, -1);                       // r8 = -1
+            x64_enc_xor_zero(9);                           // r9 = 0
+            x64_enc_mov_wide(0, 9);                        // rax = 9 (sys_mmap)
+            x64_enc_syscall();
+            // rax = new ptr. Copy old_size bytes.
+            x64_enc_mov_reg(7, 0);                         // rdi = new ptr (dst)
+            x64_emit_pop(1);                               // rcx = old_size
+            x64_emit_pop(6);                               // rsi = old ptr (src)
+            x64_emit_pop(3);                               // discard failed mremap result
+            // Copy loop.
+            x64_enc_def_label(lbl_copy);
+            x64_enc_test_reg(1, 1);
+            x64_enc_jcc_label(4, lbl_end);                 // jz end
+            x64_enc_loadb(0, 6, 0);
+            x64_enc_storeb(0, 7, 0);
+            x64_enc_add_imm(6, 1);
+            x64_enc_add_imm(7, 1);
+            x64_enc_sub_imm(1, 1);
+            x64_enc_jcc_label(5, lbl_copy);                // jnz copy
+            x64_enc_mov_reg(0, 7);                         // rax = new ptr
+            x64_enc_jmp_label(lbl_end);
+            // mremap succeeded.
+            x64_enc_def_label(lbl_ok);
+            // rax already has the new address.
+            x64_enc_def_label(lbl_end);
+            return 0;
+        }
+        // Built-in: memcpy(dst, src, len) — byte-by-byte copy. Returns dst.
+        if (x64_str_eq(n.a, "memcpy", 6)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0)); x64_emit_push();   // push dst
+            x64_emit_node(*(arr + 8)); x64_emit_push();   // push src
+            x64_emit_node(*(arr + 16));                    // rax = len
+            auto lbl_top, lbl_end;
+            x64_enc_mov_reg(1, 0);                         // rcx = len
+            x64_emit_pop(6);                               // rsi = src
+            x64_emit_pop(7);                               // rdi = dst
+            lbl_top = x64_enc_new_label();
+            lbl_end = x64_enc_new_label();
+            x64_enc_test_reg(1, 1);                        // test rcx, rcx
+            x64_enc_jcc_label(4, lbl_end);                 // jz end (skip if len=0)
+            x64_enc_def_label(lbl_top);
+            x64_enc_loadb(0, 6, 0);                        // al = [rsi]
+            x64_enc_storeb(0, 7, 0);                       // [rdi] = al
+            x64_enc_add_imm(6, 1);                         // rsi++
+            x64_enc_add_imm(7, 1);                         // rdi++
+            x64_enc_sub_imm(1, 1);                         // rcx-- (sets ZF)
+            x64_enc_jcc_label(5, lbl_top);                 // jnz top
+            x64_enc_def_label(lbl_end);
+            x64_enc_mov_reg(0, 7);                         // rax = rdi (return dst)
             return 0;
         }
         // Built-in: peek — load one byte from a pointer.
@@ -730,6 +797,11 @@ x64_emit_node(nd) {
             x64_emit_pop(1);
             x64_enc_storeb(1, 0, 0);
             return 0;
+        }
+        // Built-in: float_ret2() — capture the second float return register (xmm1).
+        if (x64_str_eq(n.a, "float_ret2", 10)) {
+            x64_enc_movsd_reg(0, 1);
+            return 1;
         }
         // Built-in: str_peek — byte read from string pointer with index.
         if (x64_str_eq(n.a, "str_peek", 8)) {

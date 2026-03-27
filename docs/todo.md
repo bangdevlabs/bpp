@@ -1,14 +1,12 @@
 # B++ Evolution Roadmap — Game Engine + Art Tools + Audio Plugins
 
-## Status: 2026-03-26
+## Status: 2026-03-26 (evening)
 
-Diagnostics complete (E001-E201, W001-W002). Compiler self-hosts. Modular compilation (Go model) is the default for native backends — .bo cache files, per-module codegen, cross-module linking. `--monolithic` forces single-pass for C emitter, ASM, and future WASM. Named field offsets (FN_NAME, EX_LIB, etc.). Backend files reorganized into `src/aarch64/` and `src/x86_64/`. stb ecosystem has: draw, input, game loop, collision, arrays, strings, buffers, file read, math, font, UI, platform (Cocoa + SDL2 + raylib + Linux terminal). x86_64 Linux cross-compilation working.
+Diagnostics complete (E001-E201, W001-W005, Clang-style caret). Compiler self-hosts with Go-model modular compilation (.bo cache with 3-layer manifest hash validation). Code signature matches system codesign. memcpy/realloc builtins (2-arg + 3-arg). Per-variable type hints (`auto x: byte, y: quarter;`). `word` removed from keywords. Import search paths include `src/`, `/usr/local/lib/bpp/`, drivers. Stack struct copy works in C emitter. `install.sh` for global installation. stb has: file_write_all, blend_px, mouse buttons (macOS Cocoa), edge-triggered mouse_pressed/mouse_released.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
 ```
-B++ faz TUDO que cria um jogo
-────────────────────────────────────────────────────
 
 ART (pixel art, animation)        ← creates visual assets
   stbart.bsm + sprite editor
@@ -30,47 +28,18 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ---
 
-## Critical Blockers
+## P0 — Immediate Priority
 
-| ID | Issue | File | Impact |
-|----|-------|------|--------|
-| B0 | Mouse events not polled | `_stb_platform_macos.bsm`, `drv_sdl.bsm` | Blocks all interactive tools |
-| ~~B1~~ | ~~`mouse_pressed()` undefined~~ | ~~`stbinput.bsm`~~ | **FIXED 2026-03-25** |
-| B2 | `file_write_all()` missing | `stbfile.bsm` | Blocks all save/load |
-| B3 | SDL missing number keys + shift | `drv_sdl.bsm` | Palette shortcuts broken |
+### float_ret2() debug — Mouse position on macOS
+`float_ret2()` builtin is implemented (validator + ARM64 + x86_64 codegen) but d1 gets clobbered between `objc_msgSend` and `float_ret2()` calls. Mouse buttons work, position stuck at 0,0.
 
----
+**Fix options (try in order):**
+1. Save d1 to hidden global `_bpp_d1_save` immediately after every extern/objc call in ARM64 codegen. `float_ret2()` reads from global instead of d1 register.
+2. If (1) is too invasive: dedicated `objc_point_call(obj, sel)` builtin that captures both d0→x and d1→y in one codegen sequence.
 
-## Phase 0 — Infrastructure Fixes (~120 lines, 6 files)
+**Files:** `src/aarch64/a64_codegen.bsm`, `src/x86_64/x64_codegen.bsm`, `stb/_stb_platform_macos.bsm`
 
-- [ ] **0a** Mouse events in macOS platform (`stb/_stb_platform_macos.bsm`)
-  - NSEvent types 1-7 (button down/up, moved, dragged)
-  - Set/clear bits in `_stb_mouse_btn`
-  - Position via CGEvent integer delta fields or `locationInWindow`
-  - Coordinate conversion: divide by 3, flip Y
-  - Risk: NSPoint returns two doubles in d0/d1. Workaround: CGEventGetIntegerValueField for delta accumulation
-
-- [ ] **0b** Mouse events in SDL driver (`drivers/drv_sdl.bsm`)
-  - SDL_MOUSEMOTION(1024): `read_u32(_sdl_ev, 20/24)`, divide by 3
-  - SDL_MOUSEBUTTONDOWN(1025) / UP(1026): `peek(_sdl_ev + 16)`, set/clear bit
-
-- [ ] **0c** `mouse_released()` (`stb/stbinput.bsm`)
-  - `mouse_pressed()` already exists. Add `mouse_released()` edge trigger.
-
-- [ ] **0d** `file_write_all()` (`stb/stbfile.bsm`)
-  - `sys_open(path, 0x601)` + `sys_write` + `sys_close`
-
-- [ ] **0e** SDL key mapping gaps (`drivers/drv_sdl.bsm`)
-  - Number keys (SDL 48-57 → KEY_0-KEY_9)
-  - Shift (SDL 1073742049 + 1073742053 → KEY_SHIFT)
-
-- [ ] **0f** `blend_px()` in stbdraw (`stb/stbdraw.bsm`)
-  - Alpha blend: `out = src * alpha + dst * (255 - alpha)` per channel
-  - ~15 lines. Unlocks onion skin, transparency, overlays for art tools
-
-### Verification
-- `tests/test_mouse.bpp` — visual mouse tracking on both backends
-- `tests/test_file_write.bpp` — write + read back
+**Test:** `examples/mouse_test3.bpp` — square follows mouse, X/Y values update in HUD.
 
 ---
 
@@ -340,23 +309,8 @@ plugin_process(input, output, frames) {
 | **A7** | stbplugin.bsm orchestration | Dev-facing API |
 | **A9** | First plugin: BangFilter.clap | Proof of concept |
 
----
-
-## Compiler Quality — Priority Tasks
-
-### P0: Fix param float inference
-Parameters used in float expressions but never assigned float stay TY_LONG → codegen does fcvtzs → destroys float values (e.g., delta-time becomes 0). Workaround: `: float` annotation. Fix options:
-1. Re-enable `propagate_call_params()` with corrected algorithm
-2. Infer param type from expression usage (not just assignments)
-3. Only do `fcvtzs` when param has EXPLICIT non-float hint
-
-### P0: Improve error messages
-- E104 "unexpected token" shows negative line numbers and no token context. Show the actual token text and source line.
-- All errors should show the token that caused the issue, not just "unexpected token in expression"
-- `diag_loc()` line computation incorrect for some modules (negative `line - base_line`)
-
-### P1: Per-variable type hints
-`auto x: byte, y: quarter;` loses x's hint. n.c in T_DECL is one hint per declaration, not per variable. Fix: side table indexed by packed name, or array of hints parallel to the variable list.
+### ~~P1: Per-variable type hints~~ — **DONE 2026-03-26**
+Parser stores per-variable hints array in T_DECL node field `e` (offset 40). Type inference reads individual hints. `word` removed from keyword list. `byte`/`half`/`quarter` work as standalone declarations.
 
 ### P2: String dedup across modules
 Duplicate strings in modular compilation create duplicate entries in data segment. Add dedup in the writer (hash string content).
@@ -372,9 +326,7 @@ Automatic function specialization per call-site type signature. `add$FF` (float)
 ## Global Execution Order
 
 | Step | What | Size | Blocks |
-|------|------|------|--------|
-| ~~**T1**~~ | ~~Remove type propagation~~ | ~~1 line~~ | **DONE 2026-03-25** |
-| **0a-0f** | Infrastructure fixes (mouse, file, keys, blend) | ~120 lines | Everything |
+|------|------|------|--------||
 | **1e** | **stbart** (pixel art primitives) | ~350 lines | Sprite editor, all art tools |
 | **1a** | stbtile | ~200 lines | Tilemap editor, Level designer |
 | **1b** | stbphys | ~180 lines | Level designer |

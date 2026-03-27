@@ -3,7 +3,7 @@
 // with the smallest type that fits the value.
 //
 // Type codes (from defs.bpp):
-//   TY_UNKNOWN=0  TY_BYTE=1  TY_QUART=2  TY_HALF=3  TY_LONG=4  TY_PTR=5  TY_FLOAT=6
+//   TY_UNKNOWN=0  TY_BYTE=1  TY_QUART=2  TY_HALF=3  TY_WORD=4  TY_PTR=5  TY_FLOAT=6
 //
 // Rules:
 //   - Literals: sized by value magnitude (0-255=byte, 0-65535=half, etc.)
@@ -79,7 +79,7 @@ ty_get_global_type(name_p) {
         }
         i = i + 1;
     }
-    return TY_LONG;
+    return TY_WORD;
 }
 
 // Reset the variable table for a new function scope.
@@ -138,7 +138,7 @@ set_func_type(name_p, ty) {
     return 0;
 }
 
-// Look up a function return type by packed name. Returns TY_LONG if not found.
+// Look up a function return type by packed name. Returns TY_WORD if not found.
 func_type(name_p) {
     auto i;
     i = 0;
@@ -148,7 +148,7 @@ func_type(name_p) {
         }
         i = i + 1;
     }
-    return TY_LONG;
+    return TY_WORD;
 }
 
 // Return the larger of two type codes. Ptr wins everything, float wins integers.
@@ -202,7 +202,7 @@ type_of_lit(vstart, vlen) {
     if (val <= 255) { return TY_BYTE; }
     if (val <= 65535) { return TY_QUART; }
     if (val <= 0xFFFFFFFF) { return TY_HALF; }
-    return TY_LONG;
+    return TY_WORD;
 }
 
 // Forward declaration for mutual recursion.
@@ -276,8 +276,8 @@ add_type(nd) {
     // Memory load: dereference always returns long (64-bit slots).
     if (t == T_MEMLD) {
         add_type(n.a);
-        n.itype = TY_LONG;
-        return TY_LONG;
+        n.itype = TY_WORD;
+        return TY_WORD;
     }
 
     // Memory store: process both pointer and value.
@@ -306,16 +306,29 @@ add_type(nd) {
         return ty;
     }
 
-    // Declaration with optional type hint.
+    // Declaration with optional type hints (per-variable or single).
     if (t == T_DECL) {
-        hint = n.c;
-        if (hint > 0) {
-            arr = n.a;
-            cnt = n.b;
+        auto hints_arr;
+        hints_arr = n.e;
+        arr = n.a;
+        cnt = n.b;
+        if (hints_arr != 0) {
+            // Per-variable hints array: each variable has its own hint.
             i = 0;
             while (i < cnt) {
-                ty_set_var_type(*(arr + i * 8), hint);
+                hint = *(hints_arr + i * 8);
+                if (hint > 0) { ty_set_var_type(*(arr + i * 8), hint); }
                 i = i + 1;
+            }
+        } else {
+            // Single hint applied to all variables (backward compat).
+            hint = n.c;
+            if (hint > 0) {
+                i = 0;
+                while (i < cnt) {
+                    ty_set_var_type(*(arr + i * 8), hint);
+                    i = i + 1;
+                }
             }
         }
         n.itype = TY_UNKNOWN;
@@ -392,7 +405,7 @@ get_fn_var_type(func_idx, name_p) {
         }
         i = i + 1;
     }
-    return TY_LONG;
+    return TY_WORD;
 }
 
 // Query a function's inferred return type.
@@ -404,7 +417,7 @@ get_fn_ret_type(func_idx) {
 get_fn_par_type(func_idx, par_idx) {
     auto block;
     block = arr_get(fn_par_types, func_idx);
-    if (block == 0) { return TY_LONG; }
+    if (block == 0) { return TY_WORD; }
     return *(block + par_idx * 8);
 }
 
@@ -435,7 +448,7 @@ infer_one_func(func_idx) {
             h = *(hints + j * 8);
             if (h > 0) { pt = h; }
         }
-        if (pt == TY_UNKNOWN) { pt = TY_LONG; }
+        if (pt == TY_UNKNOWN) { pt = TY_WORD; }
         ty_set_var_type(*(params_arr + j * 8), pt);
         j = j + 1;
     }
@@ -699,9 +712,9 @@ propagate_set_par_type(func_idx, par_idx, ty) {
         pcnt = *(func + FN_PCNT);
         block = malloc(pcnt * 8);
         arr_set(fn_par_types, func_idx, block);
-        // Initialize all params to TY_LONG.
+        // Initialize all params to TY_WORD.
         k = 0;
-        while (k < pcnt) { *(block + k * 8) = TY_LONG; k = k + 1; }
+        while (k < pcnt) { *(block + k * 8) = TY_WORD; k = k + 1; }
     }
     *(block + par_idx * 8) = ty;
     return 0;
@@ -726,10 +739,10 @@ infer_module(mi) {
                 if (buf_eq(vbuf + unpack_s(ret_p), "double", 6)) {
                     set_func_type(name_p, TY_FLOAT);
                 } else {
-                    set_func_type(name_p, TY_LONG);
+                    set_func_type(name_p, TY_WORD);
                 }
             } else {
-                set_func_type(name_p, TY_LONG);
+                set_func_type(name_p, TY_WORD);
             }
         }
         i = i + 1;
@@ -750,7 +763,7 @@ infer_module(mi) {
             ret_ty = infer_one_func(i);
             func = *(funcs + i * 8);
             name_p = *(func + FN_NAME);
-            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_LONG; }
+            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
         }
         i = i + 1;
@@ -765,7 +778,7 @@ run_types() {
     auto i, func, name_p, ret_ty, changed, pass;
 
     // Register extern return types in the function type table.
-    // Check declared return type: "double" → TY_FLOAT, otherwise TY_LONG.
+    // Check declared return type: "double" → TY_FLOAT, otherwise TY_WORD.
     i = 0;
     while (i < ext_cnt) {
         auto ret_p, rlen;
@@ -777,10 +790,10 @@ run_types() {
             if (buf_eq(vbuf + unpack_s(ret_p), "double", 6)) {
                 set_func_type(name_p, TY_FLOAT);
             } else {
-                set_func_type(name_p, TY_LONG);
+                set_func_type(name_p, TY_WORD);
             }
         } else {
-            set_func_type(name_p, TY_LONG);
+            set_func_type(name_p, TY_WORD);
         }
         i = i + 1;
     }
@@ -813,7 +826,7 @@ run_types() {
             // Update function return type in the lookup table.
             func = *(funcs + i * 8);
             name_p = *(func + FN_NAME);
-            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_LONG; }
+            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
             i = i + 1;
         }

@@ -29,7 +29,7 @@ auto ev_names, ev_values;
 auto TK_FLOAT;
 
 // Primitive type hint set by try_type_annotation(). 0 = no hint,
-// TY_FLOAT or TY_LONG when the annotation is a primitive name.
+// TY_FLOAT or TY_WORD when the annotation is a primitive name.
 auto _prim_hint;
 
 // ============================================================
@@ -298,6 +298,9 @@ peek_vlen() { return *(toks + tok_pos * 24 + 16); }
 // Return the current token's value as a packed (start, len) pair.
 cur_packed() { return pack(peek_vstart(), peek_vlen()); }
 
+// Return the type code of the current token (alias for peek_type).
+cur_type() { return peek_type(); }
+
 // Advance past the current token.
 consume() { tok_pos = tok_pos + 1; return 0; }
 
@@ -357,7 +360,7 @@ add_global(p) {
 // Parse an optional ": TypeName" annotation after a variable name.
 // Recognizes primitive types and struct types. Primitive names:
 //   float   → TY_FLOAT  (64-bit double)
-//   int     → TY_LONG   (64-bit, the default word size)
+//   int     → TY_WORD   (64-bit, the default word size)
 //   half    → TY_HALF   (32-bit, half of a word)
 //   quarter → TY_QUART   (16-bit, quarter of a word)
 //   byte    → TY_BYTE   (8-bit)
@@ -381,7 +384,7 @@ try_type_annotation(var_p) {
         }
         if (tl == 3) {
             if (buf_eq(ts, "int", 3)) {
-                _prim_hint = TY_LONG;
+                _prim_hint = TY_WORD;
                 consume();
                 return 0;
             }
@@ -394,6 +397,11 @@ try_type_annotation(var_p) {
             }
             if (buf_eq(ts, "byte", 4)) {
                 _prim_hint = TY_BYTE;
+                consume();
+                return 0;
+            }
+            if (buf_eq(ts, "word", 4)) {
+                _prim_hint = TY_WORD;
                 consume();
                 return 0;
             }
@@ -417,6 +425,8 @@ try_type_annotation(var_p) {
             diag_str("' -- define it with 'struct'");
             diag_newline();
             diag_loc(tok_pos);
+            diag_show_line(tok_pos);
+            diag_help("declare the type with 'struct <name> { ... };' before using it");
             sys_exit(1);
         }
         consume();
@@ -780,28 +790,62 @@ parse_statement() {
     }
     if (peek_type() == TK_KW) {
         if (val_is("auto", 4)) {
-            auto decl_hint;
+            auto decl_hint, dh_arr, dh_cnt, dh_has;
             consume();
             decl_hint = 0;
+            dh_arr = malloc(64);
+            dh_cnt = 0;
+            dh_has = 0;
             list_begin();
             var_p = cur_packed();
             list_push(var_p);
             consume();
             try_type_annotation(var_p);
-            if (_prim_hint > 0) { decl_hint = _prim_hint; }
+            *(dh_arr + dh_cnt * 8) = _prim_hint;
+            if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+            dh_cnt = dh_cnt + 1;
             while (val_is_ch(';') == 0) {
                 if (val_is_ch(',')) { consume(); }
                 var_p = cur_packed();
                 list_push(var_p);
                 consume();
                 try_type_annotation(var_p);
-                if (_prim_hint > 0) { decl_hint = _prim_hint; }
+                *(dh_arr + dh_cnt * 8) = _prim_hint;
+                if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+                dh_cnt = dh_cnt + 1;
             }
             consume();
             node = make_node(T_DECL);
             *(node + 8) = list_end();
             *(node + 16) = last_list_cnt;
             *(node + 24) = decl_hint;
+            if (dh_has) { *(node + 40) = dh_arr; }
+            else { *(node + 40) = 0; free(dh_arr); }
+            return node;
+        }
+        // Type-keyword declarations: byte hp; half w; quarter c;
+        // These are shorthand for auto with a built-in type hint.
+        if (val_is("byte", 4) || val_is("half", 4) || val_is("quarter", 7)) {
+            auto kw_hint;
+            if (val_is("byte", 4)) { kw_hint = TY_BYTE; }
+            if (val_is("half", 4)) { kw_hint = TY_HALF; }
+            if (val_is("quarter", 7)) { kw_hint = TY_QUART; }
+            consume();
+            list_begin();
+            var_p = cur_packed();
+            list_push(var_p);
+            consume();
+            while (val_is_ch(';') == 0) {
+                if (val_is_ch(',')) { consume(); }
+                var_p = cur_packed();
+                list_push(var_p);
+                consume();
+            }
+            consume();
+            node = make_node(T_DECL);
+            *(node + 8) = list_end();
+            *(node + 16) = last_list_cnt;
+            *(node + 24) = kw_hint;
             return node;
         }
         // Stack-allocated struct: var v: Type;
@@ -942,6 +986,8 @@ resolve_dot(base_node, name_p) {
             diag_str("'");
             diag_newline();
             diag_loc(tok_pos);
+            diag_show_line(tok_pos);
+            diag_help("check the struct definition for available field names");
             sys_exit(1);
         }
         // Build: mem_load(ptr: binop(base + offset))
@@ -1030,6 +1076,8 @@ parse_primary() {
             diag_str("'");
             diag_newline();
             diag_loc(tok_pos);
+            diag_show_line(tok_pos);
+            diag_help("sizeof requires a struct type defined with 'struct <name> { ... };'");
             sys_exit(1);
         }
     }
@@ -1080,9 +1128,21 @@ parse_primary() {
     }
     // E104: unexpected token — nothing matched in parse_primary.
     diag_fatal(104);
-    diag_str("unexpected token in expression");
+    if (cur_type() == TK_KW) {
+        diag_str("keyword '");
+        diag_packed(cur_packed());
+        diag_str("' cannot be used as an expression");
+    } else {
+        diag_str("unexpected token '");
+        diag_packed(cur_packed());
+        diag_str("' in expression");
+    }
     diag_newline();
     diag_loc(tok_pos);
+    diag_show_line(tok_pos);
+    if (cur_type() == TK_KW) {
+        diag_help("keywords like 'auto', 'if', 'while' are statements, not values");
+    }
     consume();
     sys_exit(1);
     return make_node(T_NOP);

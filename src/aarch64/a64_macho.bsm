@@ -945,10 +945,11 @@ mo_compute_layout(code_size, data_count) {
     mo_cs_off = mo_link_off + linkedit_content;
     mo_cs_off = (mo_cs_off + 15) / 16 * 16;
 
-    // Signature size: SuperBlob(12) + BlobIndex(8) + CodeDirectory(88) + id + hashes.
+    // Signature size: SuperBlob(12) + BlobIndex(8) + CodeDirectory(88) + id
+    //   + 2 special slot hashes (64) + code page hashes.
     id_len = 6;  // "a.out\0" (default identifier, 5 chars + null)
     n_code_slots = (mo_cs_off + 4095) / 4096;
-    mo_cs_size = 20 + 88 + id_len + n_code_slots * 32;
+    mo_cs_size = 20 + 88 + id_len + 2 * 32 + n_code_slots * 32;
 
     mo_link_size = (mo_cs_off - mo_link_off) + mo_cs_size;
     mo_link_vmsize = mo_page_align(mo_link_size);
@@ -1274,14 +1275,18 @@ write_macho(filename, main_label, gl_names, gl_count) {
 // Write ad-hoc code signature at the current position in mo_buf.
 // Computes SHA-256 page hashes over everything before mo_cs_off.
 mo_write_code_signature() {
-    auto n_slots, id_len, hash_off, cd_len, sb_len;
+    auto n_slots, n_special, id_len, hash_off, cd_len, sb_len;
     auto i, page_start, page_len, digest;
-    auto cs_start;
+    auto cs_start, j;
 
     cs_start = mo_pos;
     n_slots = (mo_cs_off + 4095) / 4096;
-    id_len = 6;  // "a.out\0"
-    hash_off = 88 + id_len;
+    n_special = 2;                  // info plist slot + requirements slot
+    id_len = 6;                     // "a.out\0"
+    // hashOffset points to the first code slot hash (after special slots).
+    // Special slot hashes sit just before the code slot hashes in the file,
+    // but the hashOffset field points past them (to slot 0).
+    hash_off = 88 + id_len + n_special * 32;
     cd_len = hash_off + n_slots * 32;
     sb_len = 20 + cd_len;
 
@@ -1297,11 +1302,11 @@ mo_write_code_signature() {
     // ── CodeDirectory (88 bytes header, big-endian) ──
     mo_w32be(0xFADE0C02);           // magic (CSMAGIC_CODEDIRECTORY)
     mo_w32be(cd_len);               // length
-    mo_w32be(0x00020400);           // version
-    mo_w32be(0x00020002);           // flags (CS_ADHOC | CS_LINKER_SIGNED)
-    mo_w32be(hash_off);             // hashOffset
+    mo_w32be(0x00020100);           // version (matches system codesign)
+    mo_w32be(0x00000002);           // flags (CS_ADHOC)
+    mo_w32be(hash_off);             // hashOffset (points to code slot 0)
     mo_w32be(88);                   // identOffset (right after header)
-    mo_w32be(0);                    // nSpecialSlots
+    mo_w32be(n_special);            // nSpecialSlots (info plist + requirements)
     mo_w32be(n_slots);              // nCodeSlots
     mo_w32be(mo_cs_off);            // codeLimit
     mo_w8(32);                      // hashSize (SHA-256 = 32 bytes)
@@ -1321,7 +1326,13 @@ mo_write_code_signature() {
     mo_wcstr("a.out", 5);
     mo_w8(0);
 
-    // ── Page hashes (SHA-256 of each 4096-byte page) ──
+    // ── Special slot hashes (written in reverse order: slot -2, slot -1) ──
+    // Slot -2: requirements hash (all zeros = no requirements).
+    // Slot -1: info plist hash (all zeros = no plist).
+    j = 0;
+    while (j < n_special * 32) { mo_w8(0); j = j + 1; }
+
+    // ── Code slot hashes (SHA-256 of each 4096-byte page) ──
     digest = malloc(32);
     i = 0;
     while (i < n_slots) {
@@ -1331,8 +1342,6 @@ mo_write_code_signature() {
             page_len = mo_cs_off - page_start;
         }
         sha256(mo_buf + page_start, page_len, digest);
-        // Write 32-byte hash.
-        auto j;
         j = 0;
         while (j < 32) {
             mo_w8(peek(digest + j));

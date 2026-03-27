@@ -582,14 +582,18 @@ bo_resolve_calls_x64() {
 
 // ── Export data serialization ────────────────────────────────
 
-// Write the .bo header: magic, version, target, source hash, dep hashes.
+// Write the .bo header: magic, version, target, manifest hash, source hash, dep hashes.
+// The manifest hash captures the full module list of the compilation.
+// A .bo file is only valid when loaded by a compilation with the same module set.
 bo_write_header(mi, target) {
     auto k, dc;
-    // Magic "BO" + version 1 + target byte.
+    // Magic "BO" + version 2 + target byte.
     bo_write_u8(66);
     bo_write_u8(79);
-    bo_write_u8(1);
+    bo_write_u8(2);
     bo_write_u8(target);
+    // Manifest hash: fingerprint of the entire module list.
+    bo_write_u64(cache_manifest_hash());
     // Source content hash for this module.
     bo_write_u64(arr_get(mod_hashes, mi));
     // Dependency hashes: count + hash of each direct dependency.
@@ -610,24 +614,48 @@ bo_write_header(mi, target) {
     return 0;
 }
 
-// Validate a .bo header against current module hashes.
-// Returns 1 if valid (hashes match), 0 if stale.
+// Validate a .bo header against the current compilation state.
+// Checks three layers: (1) manifest hash — same module set, (2) source hash —
+// module content unchanged, (3) dependency hashes — no transitive changes.
+// Returns 1 if all checks pass, 0 if stale.
 bo_check_header(mi) {
-    auto m0, m1, ver, tgt, sh, dc, k, dh, dep_mi, j, match;
+    auto m0, m1, ver, tgt, mh, sh, dc, k, dh, dep_mi, j, match;
     m0 = bo_read_u8();
     m1 = bo_read_u8();
     if (m0 != 66) { return 0; }
     if (m1 != 79) { return 0; }
     ver = bo_read_u8();
+    // Reject old version-1 .bo files that lack the manifest hash.
+    if (ver != 2) { return 0; }
     tgt = bo_read_u8();
+    // Layer 1: manifest hash — ensures this .bo was built for the same program.
+    mh = bo_read_u64();
+    if (mh != cache_manifest_hash()) { return 0; }
+    // Layer 2: source hash — ensures the module's own content hasn't changed.
     sh = bo_read_u64();
     if (sh != arr_get(mod_hashes, mi)) { return 0; }
-    // Check dependency hashes.
+    // Layer 3: dependency hashes — ensures no transitive dependency changed.
     dc = bo_read_u16();
     k = 0;
+    j = 0;
     while (k < dc) {
         dh = bo_read_u64();
-        k = k + 1;
+        // Walk dep_from to find the k-th dependency of this module.
+        match = 0;
+        while (j < arr_len(dep_from)) {
+            if (arr_get(dep_from, j) == mi) {
+                dep_mi = arr_get(dep_to, j);
+                j = j + 1;
+                if (dh != arr_get(mod_hashes, dep_mi)) { return 0; }
+                match = 1;
+                k = k + 1;
+                if (k >= dc) { return 1; }
+            } else {
+                j = j + 1;
+            }
+        }
+        // Fewer deps in dep_from than stored in .bo: stale.
+        if (match == 0) { return 0; }
     }
     return 1;
 }

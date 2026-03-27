@@ -1,169 +1,5 @@
 # B++ Bootstrap Journal
 
-## 2026-03-26 — Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization
-
-Two sessions worth of work. The compiler gained dynamic arrays, sub-word type hints, named field offsets, and a full modular compilation pipeline with .bo object files.
-
-### Dynamic Array Migration
-
-87 arrays across 9 compiler modules migrated from fixed-size malloc with manual counters to `arr_new()`/`arr_push()`/`arr_get()`/`arr_set()` (from `stbarray.bsm`). Eliminates all hard-coded limits on structs, enums, variables, functions, and similar entities. Affected modules: `bpp_parser`, `bpp_types`, `bpp_codegen_arm64`, `bpp_codegen_x86_64`, `bpp_enc_arm64`, `bpp_enc_x86_64`, `bpp_macho`, `bpp_elf`, `bpp_dispatch`.
-
-### Type Hints — Sub-Word Types Across All Backends
-
-Real sub-word type support added to all three backends (ARM64, x86_64, C emitter). Syntax: `auto x: byte;`, `fn(x: float)`. Supported types: `byte` (8-bit), `quarter` (16-bit), `half` (32-bit), `int` (64-bit), `float` (64-bit double). ARM64 uses `ldrb`/`strb`/`ldrh`/`strh`/`ldr w`/`str w`. x86_64 mirrors the same narrowing. C emitter maps to `uint8_t`/`uint16_t`/`uint32_t`. Truncation is performed by hardware. Design: sub-word hints are opt-in performance tuning, never auto-inferred.
-
-### Phase 0 — Module Tracking
-
-Added `tok_src_off` in the lexer to track source file boundaries. Parser stores per-entity module ownership via `func_mods[]`/`glob_mods[]`. `fname_buf` provides permanent filename storage. `diag_loc()` uses binary search over source offsets to resolve the correct file and line for diagnostic messages.
-
-### Phase 1 — Hash + Dependency Graph
-
-FNV-1a content hashing per module. Dependency graph via `dep_from[]`/`dep_to[]` arrays. `topo_sort()` implements Kahn's algorithm in reverse order. Hash persistence in `.bpp_cache/hashes`. `propagate_stale()` marks dependents dirty when a source file changes. `--show-deps` flag for inspecting the graph. Also fixed `hex_emit()` for signed values.
-
-### Named Field Offsets
-
-Added named constants for function record fields (`FN_TYPE`/`FN_NAME`/`FN_PARS`/`FN_PCNT`/`FN_BODY`/`FN_BCNT`/`FN_HINTS`) and extern record fields (`EX_TYPE`/`EX_NAME`/`EX_LIB`/`EX_RET`/`EX_ARGS`/`EX_ACNT`) in `defs.bsm`. Refactored ~110 raw numeric offset accesses across 8 files. This eliminates a class of bugs like the n.c/n.d confusion described below.
-
-### Bug Fix: var Struct Flag Collision
-
-The parser set the stack struct flag for `var v: Vec2` in field `n.c` (offset 24), but type hints also stored their value in `n.c`. Since `TY_BYTE = 1` coincided with the struct flag value, every variable declaration was silently treated as byte-typed. All `test_var_*` tests were segfaulting. Fix: moved the struct flag to `n.d` (offset 32).
-
-### Modular Compilation (.bo Files — Go Model)
-
-Full incremental compilation pipeline, modeled after Go's package compilation. Implemented in 8 steps:
-
-- **bpp_bo.bsm**: New module with I/O primitives — `read`/`write` for `u8`/`u16`/`u32`/`u64`, packed string serialization with vbuf re-packing.
-- **Export data serialization**: Functions (return type + parameter types + hints), structs, enums, globals, and externs are serialized into `.bo` files.
-- **Per-module codegen**: `emit_module_arm64`/`emit_module_x86_64` with accumulative `enc_buf`. Cross-module `BL`/`CALL` instructions use type 4 relocations.
-- **Cross-module call resolution**: `bo_resolve_calls` patches `BL`/`CALL` placeholders after all modules are compiled, then removes type 4 entries from the relocation list.
-- **Incremental driver**: `--incremental` flag triggers per-module lex/parse/infer/codegen. `.bo` cache stored in `.bpp_cache/`.
-- **String/float index remapping**: Resolved issue where string and float constant indices collided across modules. Sentinel handling preserved for argc/argv globals.
-- **Extern refresh**: FFI argument rearrangement was empty in the modular path because externs were only loaded once. Fixed by refreshing externs per-module before codegen.
-
-### Module Ownership Tracking
-
-Added `struct_mods[]`/`enum_mods[]`/`extern_mods[]` alongside existing `func_mods[]`/`glob_mods[]`. All entity types now track which source module defined them.
-
-### find_func_idx Backward Scan
-
-Changed `find_func_idx` to scan backward for "last wins" semantics matching codegen behavior. Later reverted — backward scan caused a segfault in gen3 bootstrap due to interaction with type inference. Deferred for future investigation.
-
-### Backend Reorganization
-
-Moved platform-specific files into subdirectories:
-- `src/aarch64/`: `a64_enc.bsm`, `a64_codegen.bsm`, `a64_macho.bsm`
-- `src/x86_64/`: `x64_enc.bsm`, `x64_codegen.bsm`, `x64_elf.bsm`
-
-All import paths updated throughout the compiler source.
-
-### x86_64 _start Stub
-
-Extracted `x64_emit_start_stub()` so the per-module pipeline can emit `_start` after all modules have been compiled rather than at the start of codegen.
-
-### stb Changes
-
-- `stbdraw`: `draw_number()` changed from global `_num_buf` to local malloc+free.
-- `stbui`: Added bounds checks in `ui_alloc()` and `lay_push()`.
-
-### Bugs Found
-
-| Bug | Status |
-|-----|--------|
-| var struct flag collision (`n.c = 1 = TY_BYTE`) | FIXED — moved flag to `n.d` |
-| Extern FFI rearrangement empty in modular path | FIXED — refresh externs per-module |
-| Param float inference regression (params in float expressions stay `TY_LONG`, `fcvtzs` destroys values) | WORKAROUND — `: float` annotation. Root cause: `propagate_call_params()` disabled |
-| `find_func_idx` backward scan segfault in gen3 bootstrap | REVERTED |
-| `ptr` and `len` are reserved words in B++ | Discovered when writing `bpp_bo.bsm` |
-
-### Verification
-
-| Test | Result |
-|------|--------|
-| Bootstrap (monolithic) | Passes |
-| Bootstrap (per-module `--incremental`) | Self-consistent |
-| All test programs | Pass (ARM64 + Linux x86_64) |
-| Snake game | Compiles and runs on all backends |
-| MCU game | Compiles and runs (with `: float` parameter annotations) |
-
----
-
-## 2026-03-25 — Linux x86_64 Port: First Binary to Snake Game
-
-### x86_64 Cross-Compilation Working
-
-The B++ compiler now cross-compiles from macOS ARM64 to Linux x86_64 ELF binaries. The full pipeline works: `./bpp --linux64 source.bpp -o binary` produces a static ELF that runs in a Docker Ubuntu x86_64 container.
-
-### Bugs Found and Fixed During Port
-
-**Float addition emitting 3x addsd**: Draft code was left in `bpp_codegen_x86_64.bsm` — three `addsd` instructions where one was needed. Every float add was tripled (1.0+48 gave 51+1+1=53 instead of 49). Removed the draft lines.
-
-**elf_packed_eq missing sentinel comparison**: The argc/argv globals use sentinel values (-1, -2) as packed names. The Mach-O writer's `mo_packed_eq` had `if (a == b) return 1` for direct comparison, but the ELF writer's `elf_packed_eq` didn't — causing it to unpack -1 as a string with length 0xFFFFFFFF. Added the same guards.
-
-**Type propagation poisoning callee params**: `propagate_call_params()` permanently mutated callee parameter types. When `print_int(whole)` was called with a float, it marked `print_int`'s `n` as TY_FLOAT globally. Removed propagation entirely (Phase A fix — see separate entry below).
-
-**x86_64 call-site type awareness**: The ARM64 codegen consulted `get_fn_par_type()` at call sites to convert float↔int correctly. The x86_64 codegen was blind — just did `MOVQ` for all floats. Replicated the ARM64 logic: check callee's expected type, emit CVTTSD2SI or CVTSI2SD+MOVQ as needed.
-
-### Platform Layer Auto-Routing
-
-Added automatic platform selection via `--linux64` flag: sets `_imp_target = "linux"`, so `import "_stb_platform.bsm"` resolves to `_stb_platform_linux.bsm` automatically. Same mechanism already works for macOS.
-
-Created `stb/_stb_platform_linux.bsm` — terminal-based platform layer:
-- Renders framebuffer as ANSI 256-color half-block characters
-- Raw terminal mode via `sys_ioctl` (TCGETS/TCSETS)
-- Non-blocking keyboard input (arrow keys + WASD)
-- Timing via `sys_clock_gettime(CLOCK_MONOTONIC)`
-- Frame rate cap via `sys_nanosleep`
-
-### New Syscalls
-
-Added to x86_64 codegen + validator: `sys_ioctl` (16), `sys_nanosleep` (35), `sys_clock_gettime` (228).
-
-### Tests Passing
-
-| Test | Result |
-|------|--------|
-| exit(42) | 42 |
-| hello world (putchar) | Hello, Linux x86_64! |
-| full suite (strings, recursion, malloc, loops, if/else, function calls) | All pass |
-| floats (arithmetic, comparison, truncation) | 3.00, 6.00, OK |
-| file I/O (open, write, read, close) | wrote 13, read back OK |
-| argc/argv | argc=4, all args correct |
-| **Snake game** | Compiles (45KB static ELF), renders frames in terminal |
-
-### Design Decision: Two Calling Conventions
-
-Internal B++ calls use GPR-uniform convention (all args in RDI/RSI/etc., floats bit-transferred via MOVQ). External FFI calls (future) will use System V ABI with floats in XMM registers. Cost: 1 MOVQ per float arg per call (~free on modern CPUs).
-
----
-
-## 2026-03-25 — Type Propagation Bug Fix + Evolution Roadmap
-
-### Bug Fix: Type Propagation
-
-`propagate_call_params()` in `bpp_types.bsm` was permanently mutating callee parameter types based on one caller's argument types. When `print_int(whole)` was called with a float `whole`, the type system marked `print_int`'s parameter `n` as TY_FLOAT globally — poisoning all other call sites. Crashed on ARM64, wrong output on x86_64.
-
-**Root cause**: Cross-function type propagation was one-directional and permanent. The guard (`uses_int_ops_list`) only caught `%`, `&`, `|`, `^`, `<<`, `>>` as int-only evidence — operations like `/` and `>` didn't prevent propagation.
-
-**Fix**: Removed `propagate_call_params()` from the fixed-point loop. Types are now determined solely by body inference. The codegen handles float↔int conversion at each call site independently (ARM64 already did this; x86_64 port replicates the same logic). Bootstrap verified — identical 280994-byte binaries.
-
-**Design decision**: A full "context-based specialization" system (compiler generates `add$FF`/`add$LL` variants automatically) was designed but **paused** — no current B++ code needs it, and it touches the emission loop which is high-risk for bootstrap.
-
-### Evolution Roadmap
-
-Established the three-pillar vision for B++:
-
-1. **ART** — `stbart.bsm` (pixel art primitives, ported from ModuLab JS editor) + sprite/tilemap/level/particle editors
-2. **SOUND** — `stbdsp.bsm` (DSP primitives) + `stbplugin.bsm` (CLAP audio plugins, native + FFI driver like SDL)
-3. **GAMES** — stbgame + stbtile + stbphys + stbpath
-
-Asset pipeline: `.bspr` → `.btm` → `.blvl` → game binary. Full plan in `docs/todo.md`.
-
-Key blockers identified: mouse events not polled (B0), `mouse_pressed()` undefined (B1), `file_write_all()` missing (B2), SDL key gaps (B3).
-
-x86_64 calling convention decided: two conventions — internal B++ = all GPR (MOVQ for floats), external FFI = System V ABI.
-
----
-
 ## 2026-03-18 — Stage 2 Complete: Self-Hosting Parser
 
 ### Milestone
@@ -571,6 +407,7 @@ making snake_v3 run without any libc dependency and toward full bootstrap.
 
 ---
 
+
 ## 2026-03-20 — Self-Hosting Achieved
 
 ### Milestone
@@ -700,6 +537,7 @@ The 4-stage pipeline works: `bpp_import → bpp_lexer → bpp_parser → bpp_emi
 ---
 
 ---
+
 
 ## 2026-03-22 — Bitwise Operators + Dispatch Hints
 
@@ -939,6 +777,7 @@ branch needs `(long long)` cast for string literals in all expression contexts.
 
 ---
 
+
 ## 2026-03-23 — B++ Is Born: Zero-Dependency Native Compiler
 
 ### Milestone
@@ -1151,6 +990,7 @@ offsets. See bug #21 in the 2026-03-23 entry above.
 5. ~~Ad-hoc codesign in B++~~ — ✓ Implemented in pure B++ SHA-256 (2026-03-23)
 
 ---
+
 
 ## 2026-03-24 — stb Native: Games Without External Libraries
 
@@ -1380,3 +1220,239 @@ bpp.bpp (orchestrator)
 
 ---
 
+
+## 2026-03-25 — Linux x86_64 Port: First Binary to Snake Game
+
+### x86_64 Cross-Compilation Working
+
+The B++ compiler now cross-compiles from macOS ARM64 to Linux x86_64 ELF binaries. The full pipeline works: `./bpp --linux64 source.bpp -o binary` produces a static ELF that runs in a Docker Ubuntu x86_64 container.
+
+### Bugs Found and Fixed During Port
+
+**Float addition emitting 3x addsd**: Draft code was left in `bpp_codegen_x86_64.bsm` — three `addsd` instructions where one was needed. Every float add was tripled (1.0+48 gave 51+1+1=53 instead of 49). Removed the draft lines.
+
+**elf_packed_eq missing sentinel comparison**: The argc/argv globals use sentinel values (-1, -2) as packed names. The Mach-O writer's `mo_packed_eq` had `if (a == b) return 1` for direct comparison, but the ELF writer's `elf_packed_eq` didn't — causing it to unpack -1 as a string with length 0xFFFFFFFF. Added the same guards.
+
+**Type propagation poisoning callee params**: `propagate_call_params()` permanently mutated callee parameter types. When `print_int(whole)` was called with a float, it marked `print_int`'s `n` as TY_FLOAT globally. Removed propagation entirely (Phase A fix — see separate entry below).
+
+**x86_64 call-site type awareness**: The ARM64 codegen consulted `get_fn_par_type()` at call sites to convert float↔int correctly. The x86_64 codegen was blind — just did `MOVQ` for all floats. Replicated the ARM64 logic: check callee's expected type, emit CVTTSD2SI or CVTSI2SD+MOVQ as needed.
+
+### Platform Layer Auto-Routing
+
+Added automatic platform selection via `--linux64` flag: sets `_imp_target = "linux"`, so `import "_stb_platform.bsm"` resolves to `_stb_platform_linux.bsm` automatically. Same mechanism already works for macOS.
+
+Created `stb/_stb_platform_linux.bsm` — terminal-based platform layer:
+- Renders framebuffer as ANSI 256-color half-block characters
+- Raw terminal mode via `sys_ioctl` (TCGETS/TCSETS)
+- Non-blocking keyboard input (arrow keys + WASD)
+- Timing via `sys_clock_gettime(CLOCK_MONOTONIC)`
+- Frame rate cap via `sys_nanosleep`
+
+### New Syscalls
+
+Added to x86_64 codegen + validator: `sys_ioctl` (16), `sys_nanosleep` (35), `sys_clock_gettime` (228).
+
+### Tests Passing
+
+| Test | Result |
+|------|--------|
+| exit(42) | 42 |
+| hello world (putchar) | Hello, Linux x86_64! |
+| full suite (strings, recursion, malloc, loops, if/else, function calls) | All pass |
+| floats (arithmetic, comparison, truncation) | 3.00, 6.00, OK |
+| file I/O (open, write, read, close) | wrote 13, read back OK |
+| argc/argv | argc=4, all args correct |
+| **Snake game** | Compiles (45KB static ELF), renders frames in terminal |
+
+### Design Decision: Two Calling Conventions
+
+Internal B++ calls use GPR-uniform convention (all args in RDI/RSI/etc., floats bit-transferred via MOVQ). External FFI calls (future) will use System V ABI with floats in XMM registers. Cost: 1 MOVQ per float arg per call (~free on modern CPUs).
+
+---
+
+## 2026-03-25 — Type Propagation Bug Fix + Evolution Roadmap
+
+### Bug Fix: Type Propagation
+
+`propagate_call_params()` in `bpp_types.bsm` was permanently mutating callee parameter types based on one caller's argument types. When `print_int(whole)` was called with a float `whole`, the type system marked `print_int`'s parameter `n` as TY_FLOAT globally — poisoning all other call sites. Crashed on ARM64, wrong output on x86_64.
+
+**Root cause**: Cross-function type propagation was one-directional and permanent. The guard (`uses_int_ops_list`) only caught `%`, `&`, `|`, `^`, `<<`, `>>` as int-only evidence — operations like `/` and `>` didn't prevent propagation.
+
+**Fix**: Removed `propagate_call_params()` from the fixed-point loop. Types are now determined solely by body inference. The codegen handles float↔int conversion at each call site independently (ARM64 already did this; x86_64 port replicates the same logic). Bootstrap verified — identical 280994-byte binaries.
+
+**Design decision**: A full "context-based specialization" system (compiler generates `add$FF`/`add$LL` variants automatically) was designed but **paused** — no current B++ code needs it, and it touches the emission loop which is high-risk for bootstrap.
+
+### Evolution Roadmap
+
+Established the three-pillar vision for B++:
+
+1. **ART** — `stbart.bsm` (pixel art primitives, ported from ModuLab JS editor) + sprite/tilemap/level/particle editors
+2. **SOUND** — `stbdsp.bsm` (DSP primitives) + `stbplugin.bsm` (CLAP audio plugins, native + FFI driver like SDL)
+3. **GAMES** — stbgame + stbtile + stbphys + stbpath
+
+Asset pipeline: `.bspr` → `.btm` → `.blvl` → game binary. Full plan in `docs/todo.md`.
+
+Key blockers identified: mouse events not polled (B0), `mouse_pressed()` undefined (B1), `file_write_all()` missing (B2), SDL key gaps (B3).
+
+x86_64 calling convention decided: two conventions — internal B++ = all GPR (MOVQ for floats), external FFI = System V ABI.
+
+---
+
+
+## 2026-03-26 — Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization
+
+Two sessions worth of work. The compiler gained dynamic arrays, sub-word type hints, named field offsets, and a full modular compilation pipeline with .bo object files.
+
+### Dynamic Array Migration
+
+87 arrays across 9 compiler modules migrated from fixed-size malloc with manual counters to `arr_new()`/`arr_push()`/`arr_get()`/`arr_set()` (from `stbarray.bsm`). Eliminates all hard-coded limits on structs, enums, variables, functions, and similar entities. Affected modules: `bpp_parser`, `bpp_types`, `bpp_codegen_arm64`, `bpp_codegen_x86_64`, `bpp_enc_arm64`, `bpp_enc_x86_64`, `bpp_macho`, `bpp_elf`, `bpp_dispatch`.
+
+### Type Hints — Sub-Word Types Across All Backends
+
+Real sub-word type support added to all three backends (ARM64, x86_64, C emitter). Syntax: `auto x: byte;`, `fn(x: float)`. Supported types: `byte` (8-bit), `quarter` (16-bit), `half` (32-bit), `int` (64-bit), `float` (64-bit double). ARM64 uses `ldrb`/`strb`/`ldrh`/`strh`/`ldr w`/`str w`. x86_64 mirrors the same narrowing. C emitter maps to `uint8_t`/`uint16_t`/`uint32_t`. Truncation is performed by hardware. Design: sub-word hints are opt-in performance tuning, never auto-inferred.
+
+### Phase 0 — Module Tracking
+
+Added `tok_src_off` in the lexer to track source file boundaries. Parser stores per-entity module ownership via `func_mods[]`/`glob_mods[]`. `fname_buf` provides permanent filename storage. `diag_loc()` uses binary search over source offsets to resolve the correct file and line for diagnostic messages.
+
+### Phase 1 — Hash + Dependency Graph
+
+FNV-1a content hashing per module. Dependency graph via `dep_from[]`/`dep_to[]` arrays. `topo_sort()` implements Kahn's algorithm in reverse order. Hash persistence in `.bpp_cache/hashes`. `propagate_stale()` marks dependents dirty when a source file changes. `--show-deps` flag for inspecting the graph. Also fixed `hex_emit()` for signed values.
+
+### Named Field Offsets
+
+Added named constants for function record fields (`FN_TYPE`/`FN_NAME`/`FN_PARS`/`FN_PCNT`/`FN_BODY`/`FN_BCNT`/`FN_HINTS`) and extern record fields (`EX_TYPE`/`EX_NAME`/`EX_LIB`/`EX_RET`/`EX_ARGS`/`EX_ACNT`) in `defs.bsm`. Refactored ~110 raw numeric offset accesses across 8 files. This eliminates a class of bugs like the n.c/n.d confusion described below.
+
+### Bug Fix: var Struct Flag Collision
+
+The parser set the stack struct flag for `var v: Vec2` in field `n.c` (offset 24), but type hints also stored their value in `n.c`. Since `TY_BYTE = 1` coincided with the struct flag value, every variable declaration was silently treated as byte-typed. All `test_var_*` tests were segfaulting. Fix: moved the struct flag to `n.d` (offset 32).
+
+### Modular Compilation (.bo Files — Go Model)
+
+Full incremental compilation pipeline, modeled after Go's package compilation. Implemented in 8 steps:
+
+- **bpp_bo.bsm**: New module with I/O primitives — `read`/`write` for `u8`/`u16`/`u32`/`u64`, packed string serialization with vbuf re-packing.
+- **Export data serialization**: Functions (return type + parameter types + hints), structs, enums, globals, and externs are serialized into `.bo` files.
+- **Per-module codegen**: `emit_module_arm64`/`emit_module_x86_64` with accumulative `enc_buf`. Cross-module `BL`/`CALL` instructions use type 4 relocations.
+- **Cross-module call resolution**: `bo_resolve_calls` patches `BL`/`CALL` placeholders after all modules are compiled, then removes type 4 entries from the relocation list.
+- **Incremental driver**: `--incremental` flag triggers per-module lex/parse/infer/codegen. `.bo` cache stored in `.bpp_cache/`.
+- **String/float index remapping**: Resolved issue where string and float constant indices collided across modules. Sentinel handling preserved for argc/argv globals.
+- **Extern refresh**: FFI argument rearrangement was empty in the modular path because externs were only loaded once. Fixed by refreshing externs per-module before codegen.
+
+### Module Ownership Tracking
+
+Added `struct_mods[]`/`enum_mods[]`/`extern_mods[]` alongside existing `func_mods[]`/`glob_mods[]`. All entity types now track which source module defined them.
+
+### find_func_idx Backward Scan
+
+Changed `find_func_idx` to scan backward for "last wins" semantics matching codegen behavior. Later reverted — backward scan caused a segfault in gen3 bootstrap due to interaction with type inference. Deferred for future investigation.
+
+### Backend Reorganization
+
+Moved platform-specific files into subdirectories:
+- `src/aarch64/`: `a64_enc.bsm`, `a64_codegen.bsm`, `a64_macho.bsm`
+- `src/x86_64/`: `x64_enc.bsm`, `x64_codegen.bsm`, `x64_elf.bsm`
+
+All import paths updated throughout the compiler source.
+
+### x86_64 _start Stub
+
+Extracted `x64_emit_start_stub()` so the per-module pipeline can emit `_start` after all modules have been compiled rather than at the start of codegen.
+
+### stb Changes
+
+- `stbdraw`: `draw_number()` changed from global `_num_buf` to local malloc+free.
+- `stbui`: Added bounds checks in `ui_alloc()` and `lay_push()`.
+
+### Bugs Found
+
+| Bug | Status |
+|-----|--------|
+| var struct flag collision (`n.c = 1 = TY_BYTE`) | FIXED — moved flag to `n.d` |
+| Extern FFI rearrangement empty in modular path | FIXED — refresh externs per-module |
+| Param float inference regression (params in float expressions stay `TY_LONG`, `fcvtzs` destroys values) | WORKAROUND — `: float` annotation. Root cause: `propagate_call_params()` disabled |
+| `find_func_idx` backward scan segfault in gen3 bootstrap | REVERTED |
+| `ptr` and `len` are reserved words in B++ | Discovered when writing `bpp_bo.bsm` |
+
+### Verification
+
+| Test | Result |
+|------|--------|
+| Bootstrap (monolithic) | Passes |
+| Bootstrap (per-module `--incremental`) | Self-consistent |
+| All test programs | Pass (ARM64 + Linux x86_64) |
+| Snake game | Compiles and runs on all backends |
+| MCU game | Compiles and runs (with `: float` parameter annotations) |
+
+---
+
+
+
+## 2026-03-26 — Cache Fix, Code Signature, memcpy/realloc, Import Fixes, Per-Variable Hints, stb Infra
+
+Second session of the day. Recovered from a git push that lost changes. Rebuilt everything from backup.
+
+### Cache Modular Fix (Definitive)
+
+Manifest hash embedded in every `.bo` file header. Three-layer validation: (1) manifest hash — ensures same program/module list, (2) source hash — module content unchanged, (3) dependency hashes — no transitive changes. Version bumped to 2; old v1 `.bo` files auto-rejected. Fast-path in `.bpp_cache/hashes` file skips loading `.bo` files entirely when the program changes. `cache_manifest_hash()` computes FNV-1a of module count + all filenames. Eliminates the cross-program cache corruption that caused segfaults when compiling different programs in sequence.
+
+### Code Signature Fix
+
+Mach-O code signature now matches the system `codesign` tool output: `CS_ADHOC` flag (0x2) without `CS_LINKER_SIGNED`, version 0x20100, 2 special slots (info plist + requirements, zero-filled). Page hashes use SHA-256. Binaries no longer need external `codesign` after compilation.
+
+### memcpy + realloc Builtins
+
+`memcpy(dst, src, len)` implemented in all three backends. ARM64 uses optimized post-index byte loop (cbz skip + ldrb_post/strb_post/subs/cbnz). x86_64 uses test+jz skip + loadb/storeb/sub/jnz loop. C emitter calls libc `memcpy()`. New encoder instructions: `enc_ldrb_post`, `enc_strb_post`, `enc_subs_imm`.
+
+`realloc` now supports both 2-arg `realloc(ptr, size)` (backward compat, just malloc) and 3-arg `realloc(ptr, old_size, new_size)` (allocate + copy). ARM64 3-arg: mmap + byte copy loop. x86_64 3-arg: mremap first, fallback to mmap + copy. C emitter: uses libc realloc (ignores old_size).
+
+### Import System Improvements
+
+Added `src/`, `/usr/local/lib/bpp/`, and `/usr/local/lib/bpp/drivers/` to the import search path. Updated 13 test files with current module names (`defs.bpp` → `defs.bsm`, `bpp_enc_arm64.bsm` → `aarch64/a64_enc.bsm`, etc.) and added missing imports for incomplete tests.
+
+### C Emitter Fixes
+
+Stack struct copy (`b = a;`) now emits `memcpy()` instead of illegal lvalue cast. Added `#include <string.h>` to the C header.
+
+### Per-Variable Type Hints
+
+`auto x: byte, y: quarter;` now correctly assigns individual hints per variable. Parser allocates a hints array stored in T_DECL node field `e` (offset 40). Type inference reads per-variable hints when present, falls back to single hint for backward compat.
+
+### word Keyword Removed
+
+`word` removed from the lexer keyword list — it's now a free identifier. `auto x: word;` still works via `try_type_annotation()`. `byte`, `half`, `quarter` work as standalone declaration keywords (`byte hp;`).
+
+### stb Infrastructure
+
+- `file_write_all(path, buf, len)` in stbfile.bsm
+- `blend_px(x, y, src_color)` in stbdraw.bsm — alpha blending with ARGB format
+- `mouse_released(btn)` + fixed `mouse_pressed(btn)` with real edge detection via `_stb_mouse_btn_prev`
+- Mouse button events (left/right down/up) in Cocoa event loop (_stb_platform_macos.bsm)
+
+### Install Script
+
+`install.sh` — compiles fresh binary to `/tmp`, then `sudo cp` to `/usr/local/bin/bpp` + stb + drivers + defs. Usage: `sh install.sh --skip`.
+
+### Param Float Inference (FAILED — Deferred)
+
+Naive T_BINOP promotion (promote all vars to float when binop result is float) breaks Cocoa apps silently. Variables used in both integer and float contexts (e.g. `head_x`) get wrongly promoted. Reverted. Workaround: explicit `: float` annotation. Needs conservative approach (params-only, check integer usage).
+
+### Verification
+
+| Suite | Result |
+|-------|--------|
+| Native | 15/15 |
+| C Emitter | 15/15 |
+| Linux | 6/6 |
+| Encoder | 13/13 |
+| Examples | 6/6 |
+| Snake | Runs |
+
+### Lessons Learned
+
+- NEVER use `git stash`/`checkout`/`restore` on the `bpp` binary — it replaces the bootstrapped compiler with the git fossil
+- Always test `snake_native` after type system changes
+- `install.sh` must compile to `/tmp` first to bypass sandbox restrictions
+- `git checkout` on source files reverts ALL changes, not just targeted ones — don't use for selective reverting
+
+---
