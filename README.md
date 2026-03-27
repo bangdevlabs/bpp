@@ -1,6 +1,6 @@
 # B++
 
-### Rock Solid B++ —26 March 2026
+### Rock Solid B++ — 27 March 2026
 
 Self-hosting compiler with modular compilation, type hints, dynamic arrays, two native backends (ARM64 + x86_64), and a monolithic fallback. The compiler compiles itself, caches per-module object files, and produces signed native binaries with zero external tools. Let's rock!
 
@@ -74,10 +74,10 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
 - **Type hints** — `auto x: byte, y: quarter` — per-variable sub-word types for performance tuning
-- **Builtins** — `memcpy(dst, src, len)`, `realloc(ptr, old, new)` with 2-arg and 3-arg support
-- **Modular compilation** — Go-model per-module codegen with .bo cache files and 3-layer manifest hash validation
+- **Builtins** — `memcpy`, `realloc`, `float_ret()`/`float_ret2()` for struct returns from extern calls
+- **Modular compilation** — Go-model per-module codegen with .bo cache and Go-style hash chain invalidation
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
-- **Module dependency tracking** — content hashing, topological sort, stale propagation (`--show-deps`)
+- **Module dependency tracking** — content + dependency hashing, topological sort (`--show-deps`)
 - **Install script** — `sh install.sh` bootstraps and installs compiler + stb + drivers globally
 
 ## What B++ Doesn't Have
@@ -105,7 +105,7 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbcol` | Collision detection (AABB, circles) |
 | `stbio` | Console I/O (print_int, print_msg) |
 
-New in stb: `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection, mouse button events on macOS Cocoa and SDL2.
+New in stb: mouse tracking on macOS (float_ret for NSPoint), window close detection, `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection.
 
 Every pixel is written to a memory buffer. The compiler's platform layer puts those pixels on screen. On macOS, that's Cocoa + CoreGraphics — no SDL, no OpenGL, no Metal. Just `objc_msgSend` and a `CGBitmapContext`.
 
@@ -151,7 +151,7 @@ sh install.sh
 sh install.sh --skip
 ```
 
-The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed that builds everything — no external tools needed beyond a C compiler.
+The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed that builds everything — no external tools needed beyond a C compiler. **Note:** bootstrap.c is currently outdated and needs regeneration (see TODO).
 
 ### Run Examples
 
@@ -299,10 +299,17 @@ SOFTWARE.
 *B++ was designed and implemented by Daniel Obino, 2026.*
 
 *The compiler bootstrapped itself on March 20, 2026.*
+
 *Zero-dependency native compilation on March 23, 2026.*
+
 *Native game rendering without external libraries on March 24, 2026.*
+
 *Compiler diagnostics and x86_64 Linux cross-compilation on March 25, 2026.*
+
 *Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization on March 26, 2026.*
+
 *Cache modular fix, memcpy/realloc builtins, per-variable hints, mouse events, install script on March 26, 2026.*
+
+*float_ret Builtins, Go-Style Cache, Type System Fixes, Mouse Tracking on march 27, 2026*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

@@ -272,7 +272,15 @@ x64_is_float_lit(p) {
 
 // ── Type query helpers ─────────────────────────────────────
 
+// An explicit integer type hint (: int, : byte, : half, : quarter) overrides
+// float inference — the programmer's annotation wins.
 x64_var_is_float(vi) {
+    auto fty;
+    fty = arr_get(x64_var_forced_ty, vi);
+    if (fty > 0) {
+        if (fty != TY_FLOAT) { return 0; }
+        return 1;
+    }
     return get_fn_var_type(x64_cur_fn_idx, arr_get(x64_vars, vi)) == TY_FLOAT;
 }
 
@@ -798,9 +806,16 @@ x64_emit_node(nd) {
             x64_enc_storeb(1, 0, 0);
             return 0;
         }
-        // Built-in: float_ret2() — capture the second float return register (xmm1).
+        // Built-in: float_ret() — read the first float return value saved after the last extern call.
+        // Loads xmm0 from the hidden xmm0_save slot at [rbp - 16].
+        if (x64_str_eq(n.a, "float_ret", 9)) {
+            x64_enc_load_sd(0, 5, 0 - 16);
+            return 1;
+        }
+        // Built-in: float_ret2() — read the second float return value saved after the last extern call.
+        // Loads xmm0 from the hidden xmm1_save slot at [rbp - 24].
         if (x64_str_eq(n.a, "float_ret2", 10)) {
-            x64_enc_movsd_reg(0, 1);
+            x64_enc_load_sd(0, 5, 0 - 24);
             return 1;
         }
         // Built-in: str_peek — byte read from string pointer with index.
@@ -1003,6 +1018,9 @@ x64_emit_node(nd) {
             x64_emit_pop(11);
             padded = x64_align_call();
             x64_enc_call_reg(11);
+            // Save float return registers for float_ret() / float_ret2().
+            x64_enc_store_sd(0, 5, 0 - 16);
+            x64_enc_store_sd(1, 5, 0 - 24);
             x64_unalign_call(padded);
             return 0;
         }
@@ -1053,10 +1071,15 @@ x64_emit_node(nd) {
         if (fi >= 0) {
             x64_enc_call_label(arr_get(x64_fn_lbl, fi));
         } else {
-            // Cross-module B++ function: CALL rel32 placeholder with type 4 relocation.
+            // Cross-module or extern function: CALL rel32 placeholder with type 4 relocation.
             x64_enc_add_reloc(x64_enc_pos + 1, n.a, 4);
             x64_enc_emit8(0xE8);
             x64_enc_emit32(0);
+        }
+        // Save float return registers after extern calls for float_ret() / float_ret2().
+        if (x64_find_ext(n.a) >= 0) {
+            x64_enc_store_sd(0, 5, 0 - 16);
+            x64_enc_store_sd(1, 5, 0 - 24);
         }
         x64_unalign_call(padded);
 
@@ -1272,11 +1295,11 @@ x64_emit_func(fi) {
             sz = 8;
         }
         total = total + sz;
-        arr_set(x64_var_off, i, 0 - (8 + total));
+        arr_set(x64_var_off, i, 0 - (24 + total));
         i = i + 1;
     }
-    // Frame size: 8 (scratch) + total variables, rounded up to 16.
-    frame = 8 + total;
+    // Frame size: 8 (scratch) + 16 (xmm0/xmm1 save slots) + total variables, rounded up to 16.
+    frame = 24 + total;
     frame = (frame + 15) / 16 * 16;
 
     // Define the label for this function.

@@ -375,7 +375,8 @@ These names are recognized by the compiler and emit special code:
 | `sys_ioctl(fd, req, arg)` | Device control |
 | `sys_nanosleep(req, rem)` | Sleep (Linux) |
 | `sys_clock_gettime(id, tp)` | Clock read (Linux) |
-| `float_ret2()` | Capture second float return register (d1/xmm1) |
+| `float_ret()` | Read saved first float return register (d0/xmm0) from last extern call |
+| `float_ret2()` | Read saved second float return register (d1/xmm1) from last extern call |
 
 I/O is implemented via raw syscalls (ARM64 `svc #0x80` on macOS, `syscall` on Linux x86_64). There is
 no libc dependency.

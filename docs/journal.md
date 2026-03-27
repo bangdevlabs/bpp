@@ -1455,4 +1455,95 @@ Naive T_BINOP promotion (promote all vars to float when binop result is float) b
 - `install.sh` must compile to `/tmp` first to bypass sandbox restrictions
 - `git checkout` on source files reverts ALL changes, not just targeted ones — don't use for selective reverting
 
----
+## 2026-03-27 — float_ret Builtins, Go-Style Cache, Type System Fixes, Mouse Tracking
+
+The P0 blocker (mouse stuck at 0,0) is resolved. Three independent bugs were found and fixed, plus a long-standing cache invalidation issue that had been causing inconsistent builds since modular compilation was introduced.
+
+### float_ret() / float_ret2() — Design B
+
+Both ARM64 and x86_64 backends now save float return registers (d0/d1 on ARM64, xmm0/xmm1 on x86_64) to hidden stack slots immediately after every extern function call. Two new builtins read from those slots:
+
+- `float_ret()` — first float return value
+- `float_ret2()` — second float return value
+
+Frame layout changed: ARM64 variables start at offset 40 (was 24), x86_64 at -(24+total) (was -(8+total)). The extra 16 bytes per frame hold the saved float registers.
+
+Design B was chosen over Design A (trampoline alias) because it's architecture-agnostic — each backend saves its own registers, no platform-specific function names needed. The pattern works identically across ARM64, x86_64, and future backends (WASM, cc65).
+
+**Pattern:**
+```
+objc_msgSend(ev, sel_registerName("locationInWindow"));
+lx = float_ret();     // d0 saved from last extern call
+ly = float_ret2();    // d1 saved from last extern call
+```
+
+**Root cause of mouse 0,0:** `objc_msgSend` was declared as returning `ptr`, so the codegen emitted `scvtf d0, x0` (converting garbage integer to float) instead of reading d0 directly. And d1 was volatile between statements. float_ret/float_ret2 solve both problems.
+
+### Go-Style Cache Hash Chain
+
+Replaced `propagate_stale()` with `hash_with_deps()`. Each module's hash now includes the hashes of all its dependencies, computed in topological order. Transitive invalidation is automatic — if C changes, B's combined hash changes, A's combined hash changes. No separate propagation step.
+
+**Before:** `propagate_stale()` walked the dependency graph and manually marked dependents. This had bugs — modules could be missed, producing inconsistent binaries (1958 bytes different from a fresh compile).
+
+**After:** `hash_with_deps()` — 15 lines, correct by construction. Proven: incremental compile produces byte-identical binary to fresh compile.
+
+This was the bug that caused 3 days of cache-related build failures since modular compilation was introduced.
+
+### Type System: Forced Hints Override Inference
+
+`a64_var_is_float()` and `x64_var_is_float()` now check the forced type annotation (`: int`, `: byte`, etc.) before consulting type inference. If the programmer annotated a variable, the annotation wins.
+
+**Before:** `auto x: int; x = 3.14;` would store the raw double bit pattern because inference promoted `x` to TY_FLOAT, ignoring the `: int` hint.
+
+**After:** The `: int` hint forces `fcvtzs` (float→int conversion). The programmer's intent is respected.
+
+### Type System: Global Float Poisoning Removed
+
+Removed automatic promotion of global variables to TY_FLOAT (line 270 of bpp_types.bsm). Previously, `_stb_mouse_x = lx / 3.0` would permanently mark `_stb_mouse_x` as a float global, causing all subsequent stores to write raw double bit patterns (19-digit numbers starting with 46).
+
+Now globals are only float if explicitly annotated with `: float`. No globals in the codebase use `: float`, so this change has zero impact on existing code.
+
+### Window Close Detection
+
+Added `isVisible` check at the end of `_stb_poll_events()` (once per frame, after all events are processed). When the user clicks the red X button, `_plt_quit_flag` is set to 1 and `game_should_quit()` returns true.
+
+Also added `game_end()` / `_stb_shutdown()` to stbgame.bsm, but `return 0` from main already terminates the process correctly — `game_end()` is optional for resource cleanup.
+
+### bootstrap.c Status
+
+bootstrap.c was generated on 2026-03-26 but never tested. It cannot compile current B++ source — the lexer/parser are outdated. Marked as P0 in the TODO. Without a working bootstrap.c, B++ cannot be distributed to platforms where a pre-built binary isn't available.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `src/aarch64/a64_codegen.bsm` | float_ret/float_ret2, frame +16 bytes, d0/d1 saves, var_is_float respects hints |
+| `src/x86_64/x64_codegen.bsm` | Same changes for x86_64 |
+| `src/bpp_import.bsm` | `hash_with_deps()` replaces `propagate_stale()` |
+| `src/bpp.bpp` | Calls `hash_with_deps` instead of `propagate_stale` |
+| `src/bpp_types.bsm` | Removed global float auto-promotion |
+| `src/bpp_validate.bsm` | `float_ret` registered as builtin |
+| `stb/_stb_platform_macos.bsm` | Mouse via float_ret, `: int` conversion, window close |
+| `stb/stbgame.bsm` | `game_end()` / `_stb_shutdown()` |
+| `bootstrap.c` | Mirrored changes (non-functional — TODO) |
+| `README.md`, `docs/` | Updated |
+
+### Verification
+
+| Suite | Result |
+|-------|--------|
+| Core tests | 17/17 |
+| Self-hosting | Pass (gen2 compiles test_hello) |
+| Cache test | Incremental == Fresh (byte-identical) |
+| Mouse tracking | Square follows mouse, X/Y in HUD |
+| Window close | ESC + red X both terminate cleanly |
+
+### Lessons Learned
+
+- Cache invalidation bugs manifest as non-deterministic builds — the same source produces different binaries depending on cache state
+- Go's hash-of-hashes approach is simple and correct — propagation-based schemes have edge cases
+- Type inference should never override explicit programmer annotations
+- Global type promotion is dangerous — it silently changes storage format across the entire program
+- `isVisible` in the event loop (once per frame) is cheap; in `should_close` (per check) causes slowdown
+- `return 0` from main terminates macOS Cocoa processes cleanly — no need for `NSApp terminate:`
+- Always recompile the compiler before testing platform changes — stb modules are compiled by bpp

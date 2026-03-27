@@ -360,7 +360,15 @@ a64_var_type(vi) {
 }
 
 // Check if a variable (by slot index) is float in the current function.
+// An explicit integer type hint (: int, : byte, : half, : quarter) overrides
+// float inference — the programmer's annotation wins.
 a64_var_is_float(vi) {
+    auto fty;
+    fty = arr_get(a64_var_forced_ty, vi);
+    if (fty > 0) {
+        if (fty != TY_FLOAT) { return 0; }
+        return 1;
+    }
     return a64_var_type(vi) == TY_FLOAT;
 }
 
@@ -915,12 +923,18 @@ a64_emit_node(nd) {
             if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
             return 0;
         }
-        // Built-in: float_ret2() — capture the second float return register (d1).
-        // Use immediately after a function that returns a struct of two doubles.
-        // Copies d1 to d0 so B++ can read it as a float value.
+        // Built-in: float_ret() — read the first float return value saved after the last extern call.
+        // Loads d0 from the hidden d0_save slot at [x29, #24].
+        if (a64_str_eq(n.a, "float_ret", 9)) {
+            if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, 24); }
+            else { out("  ldr d0, [x29, #24]"); putchar('\n'); }
+            return 1;
+        }
+        // Built-in: float_ret2() — read the second float return value saved after the last extern call.
+        // Loads d0 from the hidden d1_save slot at [x29, #32].
         if (a64_str_eq(n.a, "float_ret2", 10)) {
-            if (a64_bin_mode) { enc_fmov(0, 1); }
-            else { out("  fmov d0, d1"); putchar('\n'); }
+            if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, 32); }
+            else { out("  ldr d0, [x29, #32]"); putchar('\n'); }
             return 1;
         }
         // Built-in: str_peek — byte read from real string pointer.
@@ -1184,8 +1198,16 @@ a64_emit_node(nd) {
             while (i >= 0) { a64_emit_pop(i); i = i - 1; }
             // Pop function pointer into x9 (it was pushed first, so it's last to pop).
             a64_emit_pop(9);
-            // Indirect call.
-            if (a64_bin_mode) { enc_blr(9); } else { out("  blr x9"); putchar('\n'); }
+            // Indirect call. Save d0/d1 for float_ret() / float_ret2().
+            if (a64_bin_mode) {
+                enc_blr(9);
+                enc_str_d_uoff(0, 29, 24);
+                enc_str_d_uoff(1, 29, 32);
+            } else {
+                out("  blr x9"); putchar('\n');
+                out("  str d0, [x29, #24]"); putchar('\n');
+                out("  str d1, [x29, #32]"); putchar('\n');
+            }
             return 0;
         }
 
@@ -1263,10 +1285,13 @@ a64_emit_node(nd) {
                 enc_bl_label(arr_get(a64_fn_lbl, fi));
             } else if (a64_find_ext(n.a) >= 0) {
                 // External function: load address from GOT and call indirectly.
+                // Save d0/d1 after the call for float_ret() / float_ret2().
                 enc_add_reloc(enc_pos, n.a, 3);
                 enc_adrp(16);
                 enc_ldr_uoff(16, 16, 0);
                 enc_blr(16);
+                enc_str_d_uoff(0, 29, 24);
+                enc_str_d_uoff(1, 29, 32);
             } else {
                 // Cross-module B++ function: BL placeholder with type 4 relocation.
                 enc_add_reloc(enc_pos, n.a, 4);
@@ -1274,6 +1299,11 @@ a64_emit_node(nd) {
             }
         } else {
             out("  bl _"); a64_print_p(n.a); putchar('\n');
+            // Save float return registers after extern calls for float_ret() / float_ret2().
+            if (exi >= 0) {
+                out("  str d0, [x29, #24]"); putchar('\n');
+                out("  str d1, [x29, #32]"); putchar('\n');
+            }
         }
         // Check if callee returns float (B++ functions or FFI).
         if (fidx_c >= 0) {
@@ -1560,7 +1590,7 @@ a64_emit_func(fi) {
     total = 0;
     i = 0;
     while (i < arr_len(a64_vars)) {
-        arr_set(a64_var_off, i, 24 + total);
+        arr_set(a64_var_off, i, 40 + total);
         if (arr_get(a64_var_stack, i)) {
             sz = get_struct_size(arr_get(a64_var_struct_idx, i));
         } else {
@@ -1569,7 +1599,7 @@ a64_emit_func(fi) {
         total = total + sz;
         i = i + 1;
     }
-    frame = 24 + total;
+    frame = 40 + total;
     frame = (frame + 15) / 16 * 16;
 
     if (a64_bin_mode) {

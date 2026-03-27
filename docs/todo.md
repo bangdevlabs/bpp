@@ -1,8 +1,8 @@
 # B++ Evolution Roadmap — Game Engine + Art Tools + Audio Plugins
 
-## Status: 2026-03-26 (evening)
+## Status: 2026-03-27
 
-Diagnostics complete (E001-E201, W001-W005, Clang-style caret). Compiler self-hosts with Go-model modular compilation (.bo cache with 3-layer manifest hash validation). Code signature matches system codesign. memcpy/realloc builtins (2-arg + 3-arg). Per-variable type hints (`auto x: byte, y: quarter;`). `word` removed from keywords. Import search paths include `src/`, `/usr/local/lib/bpp/`, drivers. Stack struct copy works in C emitter. `install.sh` for global installation. stb has: file_write_all, blend_px, mouse buttons (macOS Cocoa), edge-triggered mouse_pressed/mouse_released.
+Diagnostics complete (E001-E201, W001-W005, Clang-style caret). Compiler self-hosts with Go-model modular compilation (.bo cache with Go-style hash chain). float_ret()/float_ret2() builtins for struct returns (ARM64 + x86_64). Type hints override float inference (`: int` forces fcvtzs). Mouse tracking works on macOS (Cocoa NSPoint via float_ret). Window close via red X button detected. memcpy/realloc builtins. `install.sh` for global installation.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -28,18 +28,12 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ---
 
-## P0 — Immediate Priority
+## P0 — Urgent
 
-### float_ret2() debug — Mouse position on macOS
-`float_ret2()` builtin is implemented (validator + ARM64 + x86_64 codegen) but d1 gets clobbered between `objc_msgSend` and `float_ret2()` calls. Mouse buttons work, position stuck at 0,0.
+### bootstrap.c — Must be functional for distribution
+bootstrap.c was generated but never tested. It cannot compile current B++ source (lexer/parser outdated). Without a working bootstrap, B++ cannot be distributed via GitHub — the bpp binary is platform-specific and should not be committed.
 
-**Fix options (try in order):**
-1. Save d1 to hidden global `_bpp_d1_save` immediately after every extern/objc call in ARM64 codegen. `float_ret2()` reads from global instead of d1 register.
-2. If (1) is too invasive: dedicated `objc_point_call(obj, sel)` builtin that captures both d0→x and d1→y in one codegen sequence.
-
-**Files:** `src/aarch64/a64_codegen.bsm`, `src/x86_64/x64_codegen.bsm`, `stb/_stb_platform_macos.bsm`
-
-**Test:** `examples/mouse_test3.bpp` — square follows mouse, X/Y values update in HUD.
+**Fix:** Use `./bpp --c src/bpp.bpp` to regenerate bootstrap.c, then verify: `cc bootstrap.c -o bpp_seed && ./bpp_seed src/bpp.bpp -o bpp`.
 
 ---
 

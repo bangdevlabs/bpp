@@ -406,7 +406,7 @@ long long hex_parse(long long buf, long long off);
 long long cache_manifest_hash(void);
 uint8_t cache_load(void);
 uint8_t cache_save(void);
-uint8_t propagate_stale(void);
+uint8_t hash_with_deps(void);
 uint8_t resolve_path(long long base_off, long long base_len, long long name_off, long long name_len);
 uint8_t init_target(void);
 long long find_file(long long base_off, long long base_len, long long name_off, long long name_len);
@@ -1772,23 +1772,23 @@ uint8_t cache_save(void) {
   return 0;
 }
 
-uint8_t propagate_stale(void) {
-  long long i, j, mi;
+uint8_t hash_with_deps(void) {
+  long long i, j, mi, h;
   i = 0;
   while ((i < arr_len(mod_topo))) {
     mi = arr_get(mod_topo, i);
-    if (arr_get(mod_stale, mi)) {
-      j = 0;
-      while ((j < arr_len(dep_to))) {
-        if ((arr_get(dep_to, j) == mi)) {
-          arr_set(mod_stale, arr_get(dep_from, j), 1);
-        }
-        j = (j + 1);
+    h = arr_get(mod_hashes, mi);
+    j = 0;
+    while ((j < arr_len(dep_from))) {
+      if ((arr_get(dep_from, j) == mi)) {
+        h = (h ^ arr_get(mod_hashes, arr_get(dep_to, j)));
+        h = (h * 0x100000001b3);
       }
+      j = (j + 1);
     }
+    arr_set(mod_hashes, mi, h);
     i = (i + 1);
   }
-  return 0;
   return 0;
 }
 
@@ -5240,6 +5240,11 @@ uint8_t val_is_builtin(long long name_p) {
   }
   if (buf_eq((vbuf + unpack_s(name_p)), (long long)"memcpy", unpack_l(name_p))) {
     if ((unpack_l(name_p) == 6)) {
+      return 1;
+    }
+  }
+  if (buf_eq((vbuf + unpack_s(name_p)), (long long)"float_ret", unpack_l(name_p))) {
+    if ((unpack_l(name_p) == 9)) {
       return 1;
     }
   }
@@ -8966,11 +8971,20 @@ uint8_t a64_emit_node(long long nd) {
       }
       return 0;
     }
+    if (a64_str_eq((*(long long*)((uintptr_t)((n + 8)))), (long long)"float_ret", 9)) {
+      if (a64_bin_mode) {
+        enc_ldr_d_uoff(0, 29, 24);
+      } else {
+        out((long long)"  ldr d0, [x29, #24]");
+        (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+      }
+      return 1;
+    }
     if (a64_str_eq((*(long long*)((uintptr_t)((n + 8)))), (long long)"float_ret2", 10)) {
       if (a64_bin_mode) {
-        enc_fmov(0, 1);
+        enc_ldr_d_uoff(0, 29, 32);
       } else {
-        out((long long)"  fmov d0, d1");
+        out((long long)"  ldr d0, [x29, #32]");
         (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
       }
       return 1;
@@ -9328,8 +9342,14 @@ uint8_t a64_emit_node(long long nd) {
       a64_emit_pop(9);
       if (a64_bin_mode) {
         enc_blr(9);
+        enc_str_d_uoff(0, 29, 24);
+        enc_str_d_uoff(1, 29, 32);
       } else {
         out((long long)"  blr x9");
+        (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+        out((long long)"  str d0, [x29, #24]");
+        (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+        out((long long)"  str d1, [x29, #32]");
         (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
       }
       return 0;
@@ -9435,6 +9455,8 @@ uint8_t a64_emit_node(long long nd) {
           enc_adrp(16);
           enc_ldr_uoff(16, 16, 0);
           enc_blr(16);
+          enc_str_d_uoff(0, 29, 24);
+          enc_str_d_uoff(1, 29, 32);
         } else {
           enc_add_reloc(enc_pos, (*(long long*)((uintptr_t)((n + 8)))), 4);
           enc_emit32(0x94000000);
@@ -9444,6 +9466,12 @@ uint8_t a64_emit_node(long long nd) {
       out((long long)"  bl _");
       a64_print_p((*(long long*)((uintptr_t)((n + 8)))));
       (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+      if ((exi >= 0)) {
+        out((long long)"  str d0, [x29, #24]");
+        (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+        out((long long)"  str d1, [x29, #32]");
+        (_bpp_scratch[0] = (uint8_t)(10), bpp_sys_write(1, _bpp_scratch, 1));
+      }
     }
     if ((fidx_c >= 0)) {
       if ((get_fn_ret_type(fidx_c) == TY_FLOAT)) {
@@ -9802,7 +9830,7 @@ uint8_t a64_emit_func(long long fi) {
   total = 0;
   i = 0;
   while ((i < arr_len(a64_vars))) {
-    arr_set(a64_var_off, i, (24 + total));
+    arr_set(a64_var_off, i, (40 + total));
     if (arr_get(a64_var_stack, i)) {
       sz = get_struct_size(arr_get(a64_var_struct_idx, i));
     } else {
@@ -9811,7 +9839,7 @@ uint8_t a64_emit_func(long long fi) {
     total = (total + sz);
     i = (i + 1);
   }
-  frame = (24 + total);
+  frame = (40 + total);
   frame = (((frame + 15) / 16) * 16);
   if (a64_bin_mode) {
     enc_def_label(arr_get(a64_fn_lbl, fi));
@@ -13057,8 +13085,12 @@ uint8_t x64_emit_node(long long nd) {
       x64_enc_storeb(1, 0, 0);
       return 0;
     }
+    if (x64_str_eq((*(long long*)((uintptr_t)((n + 8)))), (long long)"float_ret", 9)) {
+      x64_enc_load_sd(0, 5, (0 - 16));
+      return 1;
+    }
     if (x64_str_eq((*(long long*)((uintptr_t)((n + 8)))), (long long)"float_ret2", 10)) {
-      x64_enc_movsd_reg(0, 1);
+      x64_enc_load_sd(0, 5, (0 - 24));
       return 1;
     }
     if (x64_str_eq((*(long long*)((uintptr_t)((n + 8)))), (long long)"str_peek", 8)) {
@@ -13252,6 +13284,8 @@ uint8_t x64_emit_node(long long nd) {
       x64_emit_pop(11);
       padded = x64_align_call();
       x64_enc_call_reg(11);
+      x64_enc_store_sd(0, 5, (0 - 16));
+      x64_enc_store_sd(1, 5, (0 - 24));
       x64_unalign_call(padded);
       return 0;
     }
@@ -13296,6 +13330,10 @@ uint8_t x64_emit_node(long long nd) {
       x64_enc_add_reloc((x64_enc_pos + 1), (*(long long*)((uintptr_t)((n + 8)))), 4);
       x64_enc_emit8(0xE8);
       x64_enc_emit32(0);
+    }
+    if ((x64_find_ext((*(long long*)((uintptr_t)((n + 8))))) >= 0)) {
+      x64_enc_store_sd(0, 5, (0 - 16));
+      x64_enc_store_sd(1, 5, (0 - 24));
     }
     x64_unalign_call(padded);
     if ((fidx_c >= 0)) {
@@ -13514,10 +13552,10 @@ uint8_t x64_emit_func(long long fi) {
       sz = 8;
     }
     total = (total + sz);
-    arr_set(x64_var_off, i, (0 - (8 + total)));
+    arr_set(x64_var_off, i, (0 - (24 + total)));
     i = (i + 1);
   }
-  frame = (8 + total);
+  frame = (24 + total);
   frame = (((frame + 15) / 16) * 16);
   x64_enc_def_label(arr_get(x64_fn_lbl, fi));
   x64_ret_lbl = x64_enc_new_label();
@@ -14874,7 +14912,7 @@ uint8_t bo_read_export(long long mi) {
 uint8_t main_bpp(void) {
   long long arg_len, arg_ptr, mode, c0, c1, out_name, argi, nargs;
   long long main_fi, main_lbl, start_lbl, i, fp, fs, fl;
-  long long flag_permod, flag_mono, mi, mk, code_start;
+  long long flag_permod, flag_mono, flag_incr, mi, mk, code_start;
   long long fn_s, str_s, flt_s, rel_s;
   mode = 2;
   out_name = 0;
@@ -14987,7 +15025,7 @@ uint8_t main_bpp(void) {
   process_file(pathbuf, arg_len);
   topo_sort();
   cache_load();
-  propagate_stale();
+  hash_with_deps();
   if ((mode == 4)) {
     long long mi, mk, fp, fs, fl, mn;
     mn = arr_len(diag_file_starts);
@@ -15040,7 +15078,6 @@ uint8_t main_bpp(void) {
   }
   src = outbuf;
   src_len = outbuf_len;
-  long long flag_incr;
   flag_incr = 1;
   if (flag_mono) {
     flag_incr = 0;
