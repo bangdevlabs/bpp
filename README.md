@@ -1,6 +1,6 @@
 # B++
 
-### Rock Solid B++ — 27 March 2026
+### Rock Solid B++ — Type System Refactor — 27 March 2026
 
 Self-hosting compiler with modular compilation, type hints, dynamic arrays, two native backends (ARM64 + x86_64), and a monolithic fallback. The compiler compiles itself, caches per-module object files, and produces signed native binaries with zero external tools. Let's rock!
 
@@ -14,7 +14,7 @@ But what if a small group of rebels at Bell Labs had taken B in a different dire
 
 B++ is that alternate timeline.
 
-A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, and a compiler that produces native binaries directly. ARM64 macOS and x86_64 Linux. No assembler. No linker. No external tools.
+A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. ARM64 macOS and x86_64 Linux. No assembler. No linker. No external tools.
 
 And a standard library that is, itself, a game engine.
 
@@ -64,7 +64,7 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 
 ## What B++ Has
 
-- **64-bit words** — every value is a 64-bit integer or double
+- **64-bit words** — every value is a 64-bit integer or double, with optional sub-word slices
 - **Structs** — `struct Vec2 { x, y }` with heap (`auto`) or stack (`var`) allocation
 - **Enums** — `enum State { MENU, PLAY, PAUSE, OVER }` resolved at compile time
 - **Float math** — `sqrt`, `floor`, `fabs` via system FFI, IEEE 754 doubles
@@ -73,7 +73,7 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
-- **Type hints** — `auto x: byte, y: quarter` — per-variable sub-word types for performance tuning
+- **Type hints** — `auto x: byte`, `auto f: half float` — orthogonal base × slice type system (5 bases × 5 slices)
 - **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
 - **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `float_ret()`/`float_ret2()`
 - **Modular compilation** — Go-model per-module codegen with .bo cache and Go-style hash chain invalidation
@@ -312,5 +312,9 @@ SOFTWARE.
 *Cache modular fix, memcpy/realloc builtins, per-variable hints, mouse events, install script on March 26, 2026.*
 
 *float_ret Builtins, Go-Style Cache, Type System Fixes, Mouse Tracking on march 27, 2026*
+
+*Mach-O Fix, Packed Structs, shr/assert, C Emitter, Input Lag on March 27, 2026*
+
+*Type System Refactor: base × slice grid (5×5 = 25 types), f32/f16 support, orthogonal type composition on March 27, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

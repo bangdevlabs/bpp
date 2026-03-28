@@ -107,12 +107,9 @@ add_struct_def(name_p) {
 }
 
 // Return the byte size of a field given its type hint.
-// No hint (0) or TY_WORD/TY_PTR = 8 bytes. Sub-word hints use their natural size.
+// Derives size from the slice component of the packed type.
 field_hint_size(hint) {
-    if (hint == TY_BYTE) { return 1; }
-    if (hint == TY_QUART) { return 2; }
-    if (hint == TY_HALF) { return 4; }
-    return 8;
+    return slice_width(ty_slice(hint)) / 8;
 }
 
 // Add a field to an existing struct with an optional type hint.
@@ -404,13 +401,16 @@ add_global(p) {
 }
 
 // Parse an optional ": TypeName" annotation after a variable name.
-// Recognizes primitive types and struct types. Primitive names:
-//   float   → TY_FLOAT  (64-bit double)
-//   int     → TY_WORD   (64-bit, the default word size)
-//   half    → TY_HALF   (32-bit, half of a word)
-//   quarter → TY_QUART   (16-bit, quarter of a word)
-//   byte    → TY_BYTE   (8-bit)
-// Sets _prim_hint to the type code, or 0 if no primitive match.
+// Recognizes primitive types and struct types. Supports compound annotations:
+//   float         → TY_FLOAT    (64-bit double)
+//   int           → TY_WORD     (64-bit integer)
+//   word          → TY_WORD     (64-bit integer)
+//   half          → TY_WORD_H   (32-bit integer)
+//   half float    → TY_FLOAT_H  (32-bit float)
+//   quarter       → TY_WORD_Q   (16-bit integer)
+//   quarter float → TY_FLOAT_Q  (16-bit float)
+//   byte          → TY_WORD_B   (8-bit integer)
+// Sets _prim_hint to the packed type code, or 0 if no primitive match.
 try_type_annotation(var_p) {
     auto type_p, idx, tl, ts;
     _prim_hint = 0;
@@ -437,12 +437,22 @@ try_type_annotation(var_p) {
         }
         if (tl == 4) {
             if (buf_eq(ts, "half", 4)) {
-                _prim_hint = TY_HALF;
                 consume();
+                // Compound "half float" → TY_FLOAT_H (32-bit float).
+                if (cur_type() == TK_ID) {
+                    if (cur_vlen() == 5) {
+                        if (buf_eq(vbuf + cur_vstart(), "float", 5)) {
+                            _prim_hint = TY_FLOAT_H;
+                            consume();
+                            return 0;
+                        }
+                    }
+                }
+                _prim_hint = TY_WORD_H;
                 return 0;
             }
             if (buf_eq(ts, "byte", 4)) {
-                _prim_hint = TY_BYTE;
+                _prim_hint = TY_WORD_B;
                 consume();
                 return 0;
             }
@@ -454,8 +464,18 @@ try_type_annotation(var_p) {
         }
         if (tl == 7) {
             if (buf_eq(ts, "quarter", 7)) {
-                _prim_hint = TY_QUART;
                 consume();
+                // Compound "quarter float" → TY_FLOAT_Q (16-bit float).
+                if (cur_type() == TK_ID) {
+                    if (cur_vlen() == 5) {
+                        if (buf_eq(vbuf + cur_vstart(), "float", 5)) {
+                            _prim_hint = TY_FLOAT_Q;
+                            consume();
+                            return 0;
+                        }
+                    }
+                }
+                _prim_hint = TY_WORD_Q;
                 return 0;
             }
         }
@@ -490,14 +510,14 @@ parse_global() {
     add_global(var_p);
     consume();
     try_type_annotation(var_p);
-    if (_prim_hint == TY_FLOAT) { ty_set_global_type(var_p, TY_FLOAT); }
+    if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
     while (val_is_ch(';') == 0) {
         if (val_is_ch(',')) { consume(); }
         var_p = cur_packed();
         add_global(var_p);
         consume();
         try_type_annotation(var_p);
-        if (_prim_hint == TY_FLOAT) { ty_set_global_type(var_p, TY_FLOAT); }
+        if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
     }
     consume();
     return 0;
@@ -879,9 +899,9 @@ parse_statement() {
         // These are shorthand for auto with a built-in type hint.
         if (val_is("byte", 4) || val_is("half", 4) || val_is("quarter", 7)) {
             auto kw_hint;
-            if (val_is("byte", 4)) { kw_hint = TY_BYTE; }
-            if (val_is("half", 4)) { kw_hint = TY_HALF; }
-            if (val_is("quarter", 7)) { kw_hint = TY_QUART; }
+            if (val_is("byte", 4)) { kw_hint = TY_WORD_B; }
+            if (val_is("half", 4)) { kw_hint = TY_WORD_H; }
+            if (val_is("quarter", 7)) { kw_hint = TY_WORD_Q; }
             consume();
             list_begin();
             var_p = cur_packed();

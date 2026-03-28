@@ -1643,3 +1643,63 @@ macOS Cocoa plays an alert beep when key events are forwarded via `sendEvent:` w
 - Fixed-time sleep wastes frame budget — subtract elapsed time for responsive input
 - Packed structs are backward compatible: no hint = 8 bytes per field, same as before
 - MCU game is the best integration test — catches type system regressions immediately
+
+---
+
+## 2026-03-27 — Type System Refactor: Base × Slice
+
+### The Change
+
+Replaced the flat type enum (TY_BYTE=1, TY_QUART=2, TY_HALF=3, TY_WORD=4, TY_PTR=5, TY_FLOAT=6, TY_STRUCT=7) with an orthogonal base × slice system packed in a single byte.
+
+5 base types (lower nibble): UNKNOWN(0), WORD(1), FLOAT(2), PTR(3), STRUCT(4)
+5 slices (upper nibble): FULL(0), HALF(1), QUARTER(2), BYTE(3), DOUBLE(4)
+
+Encoding: `base | (slice × 16)`. 25 composed type constants in a 5×5 grid. Every base can combine with every slice — the type system is a LEGO set.
+
+```
+              BYTE(8)  QUARTER(16)  HALF(32)  FULL(64)  DOUBLE(128)
+UNKNOWN       0x30      0x20        0x10      0x00       0x40
+WORD          0x31      0x21        0x11      0x01       0x41
+FLOAT         0x32      0x22        0x12      0x02       0x42
+PTR           0x33      0x23        0x13      0x03       0x43
+STRUCT        0x34      0x24        0x14      0x04       0x44
+```
+
+### What Changed
+
+- **defs.bsm**: 25 type constants, 10 building blocks (5 bases + 5 slices), 6 helper functions (ty_base, ty_slice, ty_make, is_float_type, is_int_type, slice_width)
+- **bpp_types.bsm**: promote() rewritten with base+slice logic — float+wider-int widens float to avoid precision loss. ty_set_var_type() uses promote() instead of fragile `>` comparison. type_of_lit() returns TY_WORD for all integer literals (programmer chooses slice).
+- **bpp_parser.bsm**: try_type_annotation() supports compound "half float" → TY_FLOAT_H and "quarter float" → TY_FLOAT_Q. field_hint_size() uses slice_width(). Global float registration uses is_float_type().
+- **bpp_emitter.bsm**: emit_type_for() dispatches by base then slice. T_DECL grouping uses ty_slice().
+- **bpp_validate.bsm**: W002 uses is_float_type().
+- **a64_codegen.bsm + x64_codegen.bsm**: All `== TY_FLOAT` checks use is_float_type(). All sub-word checks use ty_slice() == SL_BYTE/SL_QUARTER/SL_HALF.
+
+### Why
+
+The flat enum mixed "what it is" (word vs float vs ptr) with "how wide" (byte vs half vs full) in one axis. This:
+- Blocked f32/f16 (needed for audio/GPU)
+- Made promote() depend on fragile numeric ordering
+- Required manual additions to 15+ places for every new type
+- Conflated literal magnitude with variable storage width
+
+The new system separates concerns into two orthogonal axes. Adding a new width or base type is additive, not multiplicative.
+
+### Test Results
+
+| Suite | Result |
+|-------|--------|
+| Native (17 tests) | PASS |
+| Bootstrap verify | Byte-identical |
+| C emitter | PASS |
+| Snake native | Compiles and runs |
+| MCU game | Runs correctly |
+| Mouse tester | Cursor tracking at 60fps |
+
+### Lessons Learned
+
+- B++ functions return one value — this made two-field types impractical. Packed encoding (base | slice << 4) is the right fit for a single-return language.
+- type_of_lit() returning TY_BYTE for small literals was a design mistake — literal magnitude should not determine variable storage width. Slices are programmer opt-in.
+- The codegen already implemented the base+slice decision in two steps ("is it float?" then "which sub-word?"). The refactor just named what was already there.
+- promote() must widen float to at least the integer operand's width: promote(f32, i64) = f64, not f32. Returning the narrower float loses 41 bits of precision.
+- SL_DOUBLE (128-bit) slot is reserved for future SIMD/NEON even though no codegen supports it yet — costs zero to include.

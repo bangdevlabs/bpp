@@ -231,17 +231,42 @@ Floating-point literals contain a decimal point:
 The compiler infers float type and uses ARM64 double-precision registers.
 Float and integer values convert automatically in mixed expressions.
 
-## Type Hints
+## Type System
 
-Variables and parameters can be annotated with a type hint for sub-word storage.
-Each variable in a declaration can have its own hint:
+B++ uses an orthogonal type system with two axes: **base type** (what it is)
+and **slice** (how wide). The compiler infers the base type. The programmer
+optionally specifies the slice for performance tuning.
 
-    auto x: byte;            // 8-bit (0-255)
-    auto y: quarter;         // 16-bit (0-65535)
-    auto z: half;            // 32-bit
-    auto w: word;            // 64-bit (default, explicit)
-    auto f: float;           // 64-bit double
-    auto r: byte, g: byte, b: byte;  // per-variable hints
+### Base types
+
+    word       64-bit integer (the default — every value starts as a word)
+    float      64-bit double (inferred when a value contains '.' or comes from float math)
+    ptr        64-bit pointer (inferred from string literals, malloc, etc.)
+    struct     composite type (defined with the struct keyword)
+
+### Slices
+
+    (none)     full width — 64 bits (default)
+    half       half width — 32 bits
+    quarter    quarter width — 16 bits
+    byte       eighth width — 8 bits
+
+### Combining base and slice
+
+The programmer writes the slice. The compiler figures out the base:
+
+    auto x;                  // word, full (64-bit int) — inferred
+    auto x: byte;            // word, byte (8-bit int)
+    auto x: half;            // word, half (32-bit int)
+    auto x: float;           // float, full (64-bit double)
+    auto x: half float;      // float, half (32-bit float)
+    auto x: quarter float;   // float, quarter (16-bit float)
+
+Per-variable hints in a single declaration:
+
+    auto r: byte, g: byte, b: byte;
+
+Parameters:
 
     update(dt: float) {
         pos = pos + speed * dt;
@@ -254,13 +279,27 @@ Sub-word types also work as standalone declaration keywords:
     half score;
     quarter tile_id;
 
-Type hints are opt-in performance tuning. The compiler uses narrower
-load/store instructions (ldrb/strb on ARM64, movzx on x86_64) and the
-C emitter maps to the corresponding C type. Without a hint, all values
-are 64-bit.
+### How it works
 
-Sub-word values truncate on store: `auto x: byte; x = 300;` gives 44
-(300 & 0xFF). This is hardware truncation, not a runtime check.
+Internally, each type is packed into a single byte: base (lower 4 bits) +
+slice (upper 4 bits). The helpers `ty_base()`, `ty_slice()`, and `ty_make()`
+compose and decompose types. `is_float_type()` checks the base.
+
+The compiler uses narrower load/store instructions for sub-word types:
+`ldrb`/`strb` on ARM64, `movzx` on x86_64. The C emitter maps to the
+corresponding C type (`uint8_t`, `uint16_t`, `uint32_t`, `float`, `double`).
+
+Without a hint, all values are 64-bit. Sub-word values truncate on store:
+`auto x: byte; x = 300;` gives 44 (300 & 0xFF). This is hardware truncation,
+not a runtime check.
+
+### Promotion rules
+
+When mixing types in expressions, the compiler promotes to the wider type:
+- PTR wins everything (pointer arithmetic)
+- FLOAT wins integers (int converts to float)
+- Float widens to at least the integer's width: f32 + i64 = f64 (no precision loss)
+- Same base: wider slice wins (byte + half = half)
 
 ## Comments
 
@@ -295,7 +334,8 @@ Fields can have type hints for packed layout:
     struct Pixel { r: byte, g: byte, b: byte, a: byte }   // 4 bytes (4 x 1)
     struct Tile  { id: quarter, flags: byte }              // 3 bytes (2 + 1)
 
-Supported field hints: `byte` (1), `quarter` (2), `half` (4). No hint = 8 bytes.
+Supported field hints: `byte` (1 byte), `quarter` (2 bytes), `half` (4 bytes),
+`half float` (4 bytes, f32), `quarter float` (2 bytes, f16). No hint = 8 bytes.
 
 Heap-allocated structs use `auto` with a type annotation:
 

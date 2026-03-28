@@ -2,7 +2,7 @@
 
 ## Status: 2026-03-27
 
-Diagnostics complete (E001-E201, W001-W005, Clang-style caret). Compiler self-hosts with Go-model modular compilation (.bo cache with Go-style hash chain). float_ret()/float_ret2() builtins for struct returns (ARM64 + x86_64). Type hints override float inference (`: int` forces fcvtzs). Mouse tracking works on macOS (Cocoa NSPoint via float_ret). Window close via red X button detected. memcpy/realloc builtins. `install.sh` for global installation.
+Type system refactored from flat enum to orthogonal base × slice grid (5 bases × 5 slices = 25 types, packed in 1 byte). Compiler self-hosts with Go-model modular compilation. float_ret()/float_ret2() builtins. Diagnostics (E001-E201, W001-W005). Packed structs. memcpy/realloc builtins. `install.sh` for global installation. Parser supports compound type annotations: `half float` → 32-bit float, `quarter float` → 16-bit float.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -30,20 +30,28 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ## P0 — Developer Experience (immediate priorities)
 
-### 1. Debug printing builtins
+### 1. Native FLOAT_H / FLOAT_Q codegen (Fase 1B)
+Type system supports TY_FLOAT_H (32-bit float) and TY_FLOAT_Q (16-bit float) but codegen still uses 64-bit float instructions. Need:
+- ARM64: s-register load/store/arithmetic (enc_ldr_s_uoff, enc_fadd_s, etc.)
+- x86_64: SS instructions (MOVSS, ADDSS, SUBSS, etc.)
+- Codegen dispatch by ty_slice() within the float path
+- emit_node return value extended: 0=int, 1=FLOAT, 2=FLOAT_H
+~150 lines across encoder + codegen files.
+
+### 2. Debug printing builtins
 `print_int(x)` and `print_float(x)` that write to stderr/terminal. Every debugging session needs this. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
 
-### 2. Array syntax sugar: buf[i]
+### 3. Array syntax sugar: buf[i]
 `buf[i]` as sugar for `*(buf + i * 8)` and `buf[i] = val` for `*(buf + i * 8) = val`. Parser-only change — desugars to existing T_MEMLD/T_MEMST. Massive readability improvement for game code.
 
-### 3. Compiler warnings (analysis pass)
+### 4. Compiler warnings (analysis pass)
 Add warnings for common mistakes without adding new types:
 - W006: variable used before assignment
 - W007: function called with wrong argument count (already E-level, add W for close matches)
 - W008: comparison of pointer with integer literal other than 0
 - W009: unreachable code after return/break
 
-### 4. DWARF debug info → lldb support
+### 5. DWARF debug info → lldb support
 Add `__DWARF` section to Mach-O/ELF with line tables so lldb can:
 - Show source file:line on breakpoints and crashes
 - Step through B++ code line by line
@@ -56,10 +64,10 @@ Implementation:
 - Add `LC_UUID` load command for debugger identification
 - `assert(cond)` enhanced to embed file:line in trap metadata
 
-### 5. Sprite/tilemap loader in stb
+### 6. Sprite/tilemap loader in stb
 `load_sprite16(path)` and `load_tilemap(path)` — every game needs this, shouldn't be 50 lines of manual JSON parsing per project. Part of stbart.bsm.
 
-### 6. Sound
+### 7. Sound
 Basic audio output for game feedback. Evaluate: CoreAudio (macOS native), ALSA (Linux), or minimal beep/sample playback via platform layer.
 
 ## P1 — Infrastructure
@@ -69,8 +77,8 @@ bootstrap.c was generated but never tested. It cannot compile current B++ source
 
 **Fix:** Use `./bpp --c src/bpp.bpp` to regenerate bootstrap.c, then verify: `cc bootstrap.c -o bpp_seed && ./bpp_seed src/bpp.bpp -o bpp`.
 
-### Global float inference (smarter auto-promotion)
-Current rule: globals never auto-promote to float (must annotate `: float`). This fixed the mouse bug but broke MCU. Better rule: only promote a global to float if ALL assignments are float. If any assignment is integer, keep integer. Requires two-pass analysis or post-inference fixup.
+### Multi-return values (Fase 2)
+`return a, b;` and `x, y = foo();`. Second return value in x1/d1 (ARM64) or rdx/xmm1 (x86_64). Eliminates float_ret()/float_ret2() hack. Enables Go-style (value, error) returns. ~190 lines. Prerequisite for Fase 3 (unpack types to two clean fields).
 
 ---
 

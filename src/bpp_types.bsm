@@ -1,21 +1,19 @@
 // bpp_types.bsm — Type inference engine for the unified B++ compiler.
-// Walks the AST bottom-up and annotates each node's itype field
-// with the smallest type that fits the value.
+// Walks the AST bottom-up and annotates each node's itype field.
 //
-// Type codes (from defs.bpp):
-//   TY_UNKNOWN=0  TY_BYTE=1  TY_QUART=2  TY_HALF=3  TY_WORD=4  TY_PTR=5  TY_FLOAT=6
+// Type system: base × slice packed in a single byte (see defs.bsm).
+// Base (lower 4 bits): UNKNOWN=0, WORD=1, FLOAT=2, PTR=3, STRUCT=4
+// Slice (upper 4 bits): FULL=0, HALF=1, QUARTER=2, BYTE=3, DOUBLE=4
 //
 // Rules:
-//   - Literals: sized by value magnitude (0-255=byte, 0-65535=half, etc.)
-//   - Float literals (contain '.'): always TY_FLOAT
-//   - Strings: always ptr
-//   - Variables: largest type seen across all assignments (float wins integers)
-//   - Binary ops: promote to larger operand type (ptr wins everything, float wins integers)
+//   - Literals: integers → TY_WORD, floats → TY_FLOAT, strings → TY_PTR
+//   - Variables: promoted via promote() across all assignments
+//   - Binary ops: promote to wider operand type (ptr wins, float wins int)
 //   - Assignments: right-hand side determines variable type
-//   - mem_load: returns long (all B++ memory slots are 64-bit)
+//   - mem_load: returns TY_WORD (all B++ memory slots are 64-bit)
 //   - Calls: return type from known function table
-//   - Explicit type hints (word x): override inference
-//   - Cross-function: return types and param types propagated via fixed-point iteration
+//   - Explicit type hints: override inference
+//   - Cross-function: return types and param types propagated via fixed-point
 
 // ── Symbol table ───────────────────────────────────────────
 // Dynamic parallel arrays of packed name and type code.
@@ -47,7 +45,7 @@ init_types() {
     fn_vt_cnts = arr_new();
     fn_ret_types = arr_new();
     fn_par_types = arr_new();
-    ty_cur_ret = TY_UNKNOWN;
+    ty_cur_ret = TY_UNK;
     ty_gl_names = arr_new();
     ty_gl_types = arr_new();
     return 0;
@@ -89,7 +87,7 @@ ty_reset_scope() {
     return 0;
 }
 
-// Look up a variable's inferred type by packed name. Returns TY_UNKNOWN if not found.
+// Look up a variable's inferred type by packed name. Returns TY_UNK if not found.
 ty_var_type(name_p) {
     auto i;
     i = 0;
@@ -99,18 +97,17 @@ ty_var_type(name_p) {
         }
         i = i + 1;
     }
-    return TY_UNKNOWN;
+    return TY_UNK;
 }
 
-// Set a variable's inferred type. If the variable exists, promote to the larger type.
+// Set a variable's inferred type. If the variable exists, promote to the wider type.
 ty_set_var_type(name_p, ty) {
     auto i, old;
     i = 0;
     while (i < arr_len(ty_vt_names)) {
         if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
             old = arr_get(ty_vt_types, i);
-            if (ty == TY_FLOAT) { arr_set(ty_vt_types, i, TY_FLOAT); }
-            else if (ty > old) { arr_set(ty_vt_types, i, ty); }
+            arr_set(ty_vt_types, i, promote(old, ty));
             return 0;
         }
         i = i + 1;
@@ -151,13 +148,37 @@ func_type(name_p) {
     return TY_WORD;
 }
 
-// Return the larger of two type codes. Ptr wins everything, float wins integers.
+// Return the wider of two types. PTR wins everything, FLOAT wins integers.
+// When mixing float and integer of different widths, the float widens to
+// at least the integer's width to avoid precision loss.
 promote(a, b) {
-    if (a == TY_PTR) { return TY_PTR; }
-    if (b == TY_PTR) { return TY_PTR; }
-    if (a == TY_FLOAT) { return TY_FLOAT; }
-    if (b == TY_FLOAT) { return TY_FLOAT; }
-    if (a > b) { return a; }
+    auto ab, bb;
+    ab = ty_base(a); bb = ty_base(b);
+    // PTR wins everything.
+    if (ab == BASE_PTR) { return a; }
+    if (bb == BASE_PTR) { return b; }
+    // FLOAT wins integers — but must widen to at least the integer's width.
+    if (ab == BASE_FLOAT) {
+        if (bb == BASE_FLOAT) {
+            // Both float: wider slice wins.
+            if (slice_width(ty_slice(a)) >= slice_width(ty_slice(b))) { return a; }
+            return b;
+        }
+        // Float + integer: widen float to at least integer's width.
+        if (slice_width(ty_slice(a)) < slice_width(ty_slice(b))) {
+            return ty_make(BASE_FLOAT, ty_slice(b));
+        }
+        return a;
+    }
+    if (bb == BASE_FLOAT) {
+        // Integer + float: widen float to at least integer's width.
+        if (slice_width(ty_slice(b)) < slice_width(ty_slice(a))) {
+            return ty_make(BASE_FLOAT, ty_slice(a));
+        }
+        return b;
+    }
+    // Both integer: wider slice wins.
+    if (slice_width(ty_slice(a)) >= slice_width(ty_slice(b))) { return a; }
     return b;
 }
 
@@ -199,9 +220,7 @@ type_of_lit(vstart, vlen) {
             i = i + 1;
         }
     }
-    if (val <= 255) { return TY_BYTE; }
-    if (val <= 65535) { return TY_QUART; }
-    if (val <= 0xFFFFFFFF) { return TY_HALF; }
+    // All integer literals are TY_WORD. The programmer chooses the slice.
     return TY_WORD;
 }
 
@@ -224,7 +243,7 @@ add_type_list(arr, cnt) {
 add_type(nd) {
     auto t, ty, lt, rt, name_p, arr, cnt, hint, i;
     auto n: Node, lhs: Node;
-    if (nd == 0) { return TY_UNKNOWN; }
+    if (nd == 0) { return TY_UNK; }
     n = nd;
     t = n.ntype;
 
@@ -285,8 +304,8 @@ add_type(nd) {
     if (t == T_MEMST) {
         add_type(n.a);
         add_type(n.b);
-        n.itype = TY_UNKNOWN;
-        return TY_UNKNOWN;
+        n.itype = TY_UNK;
+        return TY_UNK;
     }
 
     // Function call: return type from known function table.
@@ -332,8 +351,8 @@ add_type(nd) {
                 }
             }
         }
-        n.itype = TY_UNKNOWN;
-        return TY_UNKNOWN;
+        n.itype = TY_UNK;
+        return TY_UNK;
     }
 
     // If statement: process condition, body, and optional else body.
@@ -343,20 +362,20 @@ add_type(nd) {
         if (n.e > 0) {
             add_type_list(n.d, n.e);
         }
-        n.itype = TY_UNKNOWN;
-        return TY_UNKNOWN;
+        n.itype = TY_UNK;
+        return TY_UNK;
     }
 
     // While loop: process condition and body.
     if (t == T_WHILE) {
         add_type(n.a);
         add_type_list(n.b, n.c);
-        n.itype = TY_UNKNOWN;
-        return TY_UNKNOWN;
+        n.itype = TY_UNK;
+        return TY_UNK;
     }
 
-    n.itype = TY_UNKNOWN;
-    return TY_UNKNOWN;
+    n.itype = TY_UNK;
+    return TY_UNK;
 }
 
 // ── Persistence ───────────────────────────────────────────
@@ -438,7 +457,7 @@ infer_one_func(func_idx) {
     hints = *(func + FN_HINTS);
 
     ty_reset_scope();
-    ty_cur_ret = TY_UNKNOWN;
+    ty_cur_ret = TY_UNK;
 
     // Register parameters with their current known types.
     // Explicit primitive type hints from the programmer always take priority.
@@ -449,7 +468,7 @@ infer_one_func(func_idx) {
             h = *(hints + j * 8);
             if (h > 0) { pt = h; }
         }
-        if (pt == TY_UNKNOWN) { pt = TY_WORD; }
+        if (pt == TY_UNK) { pt = TY_WORD; }
         ty_set_var_type(*(params_arr + j * 8), pt);
         j = j + 1;
     }
@@ -524,10 +543,10 @@ propagate_in_node(nd, caller_idx) {
                 an = *(args + j * 8);
                 if (an != 0) {
                     arg_ty = an.itype;
-                    if (arg_ty == TY_FLOAT) {
+                    if (is_float_type(arg_ty)) {
                         // If callee param is not already float, promote it —
                         // but only if the param is not used with integer-only ops.
-                        if (get_fn_par_type(fi, j) != TY_FLOAT) {
+                        if (is_float_type(get_fn_par_type(fi, j)) == 0) {
                             if (j < callee_pcnt) {
                                 par_p = *(callee_params + j * 8);
                                 if (uses_int_ops_list(callee_body, callee_bcnt, par_p) == 0) {
@@ -742,6 +761,12 @@ infer_module(mi) {
                 } else {
                     set_func_type(name_p, TY_WORD);
                 }
+            } else if (rlen == 5) {
+                if (buf_eq(vbuf + unpack_s(ret_p), "float", 5)) {
+                    set_func_type(name_p, TY_FLOAT_H);
+                } else {
+                    set_func_type(name_p, TY_WORD);
+                }
             } else {
                 set_func_type(name_p, TY_WORD);
             }
@@ -764,7 +789,7 @@ infer_module(mi) {
             ret_ty = infer_one_func(i);
             func = *(funcs + i * 8);
             name_p = *(func + FN_NAME);
-            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_WORD; }
+            if (ret_ty == TY_UNK) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
         }
         i = i + 1;
@@ -779,7 +804,7 @@ run_types() {
     auto i, func, name_p, ret_ty, changed, pass;
 
     // Register extern return types in the function type table.
-    // Check declared return type: "double" → TY_FLOAT, otherwise TY_WORD.
+    // Check declared return type: "double" → TY_FLOAT, "float" → TY_FLOAT_H.
     i = 0;
     while (i < ext_cnt) {
         auto ret_p, rlen;
@@ -790,6 +815,12 @@ run_types() {
         if (rlen == 6) {
             if (buf_eq(vbuf + unpack_s(ret_p), "double", 6)) {
                 set_func_type(name_p, TY_FLOAT);
+            } else {
+                set_func_type(name_p, TY_WORD);
+            }
+        } else if (rlen == 5) {
+            if (buf_eq(vbuf + unpack_s(ret_p), "float", 5)) {
+                set_func_type(name_p, TY_FLOAT_H);
             } else {
                 set_func_type(name_p, TY_WORD);
             }
@@ -827,7 +858,7 @@ run_types() {
             // Update function return type in the lookup table.
             func = *(funcs + i * 8);
             name_p = *(func + FN_NAME);
-            if (ret_ty == TY_UNKNOWN) { ret_ty = TY_WORD; }
+            if (ret_ty == TY_UNK) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
             i = i + 1;
         }

@@ -366,10 +366,9 @@ a64_var_is_float(vi) {
     auto fty;
     fty = arr_get(a64_var_forced_ty, vi);
     if (fty > 0) {
-        if (fty != TY_FLOAT) { return 0; }
-        return 1;
+        return is_float_type(fty);
     }
-    return a64_var_type(vi) == TY_FLOAT;
+    return is_float_type(a64_var_type(vi));
 }
 
 // Emit a sized load from [x29, #off] into x0/w0 based on the variable's
@@ -377,8 +376,9 @@ a64_var_is_float(vi) {
 // declared a type hint. Inferred types always use 64-bit load.
 // Returns 1 if result is in d0 (float), 0 if in x0 (integer).
 a64_emit_load_var(vi, off) {
-    auto fty;
+    auto fty, sl;
     fty = arr_get(a64_var_forced_ty, vi);
+    sl = ty_slice(fty);
     // Float: always respected whether forced or inferred.
     if (a64_var_is_float(vi)) {
         if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, off); }
@@ -386,17 +386,17 @@ a64_emit_load_var(vi, off) {
         return 1;
     }
     // Sub-word loads only when explicitly annotated by the programmer.
-    if (fty == TY_BYTE) {
+    if (sl == SL_BYTE) {
         if (a64_bin_mode) { enc_ldrb_uoff(0, 29, off); }
         else { out("  ldrb w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
     }
-    if (fty == TY_QUART) {
+    if (sl == SL_QUARTER) {
         if (a64_bin_mode) { enc_ldrh_uoff(0, 29, off); }
         else { out("  ldrh w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
     }
-    if (fty == TY_HALF) {
+    if (sl == SL_HALF) {
         if (a64_bin_mode) { enc_ldr_w_uoff(0, 29, off); }
         else { out("  ldr w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
@@ -411,8 +411,9 @@ a64_emit_load_var(vi, off) {
 // explicit type annotation. Only uses sub-word ops when the programmer
 // declared a type hint. rty: 0 = integer in x0, 1 = float in d0.
 a64_emit_store_var(vi, off, rty) {
-    auto fty;
+    auto fty, sl;
     fty = arr_get(a64_var_forced_ty, vi);
+    sl = ty_slice(fty);
     // Float: always respected whether forced or inferred.
     if (a64_var_is_float(vi)) {
         if (rty == 0) {
@@ -427,17 +428,17 @@ a64_emit_store_var(vi, off, rty) {
         if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar(10); }
     }
     // Sub-word stores only when explicitly annotated by the programmer.
-    if (fty == TY_BYTE) {
+    if (sl == SL_BYTE) {
         if (a64_bin_mode) { enc_strb_uoff(0, 29, off); }
         else { out("  strb w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
     }
-    if (fty == TY_QUART) {
+    if (sl == SL_QUARTER) {
         if (a64_bin_mode) { enc_strh_uoff(0, 29, off); }
         else { out("  strh w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
     }
-    if (fty == TY_HALF) {
+    if (sl == SL_HALF) {
         if (a64_bin_mode) { enc_str_w_uoff(0, 29, off); }
         else { out("  str w0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
@@ -576,7 +577,7 @@ a64_emit_node(nd) {
         }
         // Global variable: load address then load value.
         // Check if the global was inferred as float across all functions.
-        if (ty_get_global_type(n.a) == TY_FLOAT) {
+        if (is_float_type(ty_get_global_type(n.a))) {
             if (a64_bin_mode) {
                 enc_add_reloc(enc_pos, n.a, 0);
                 enc_adrp(8); enc_add_imm(8, 8, 0);
@@ -1253,7 +1254,7 @@ a64_emit_node(nd) {
         while (i < cnt) {
             ety = a64_emit_node(*(arr + i * 8));
             if (fidx_c >= 0) {
-                vi = get_fn_par_type(fidx_c, i) == TY_FLOAT;
+                vi = is_float_type(get_fn_par_type(fidx_c, i));
                 if (ety == 1) {
                     if (vi == 1) {
                         if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
@@ -1341,7 +1342,7 @@ a64_emit_node(nd) {
         }
         // Check if callee returns float (B++ functions or FFI).
         if (fidx_c >= 0) {
-            if (get_fn_ret_type(fidx_c) == TY_FLOAT) { return 1; }
+            if (is_float_type(get_fn_ret_type(fidx_c))) { return 1; }
         }
         if (exi >= 0) {
             if (a64_ext_ret_is_float(exi)) { return 1; }
@@ -1359,11 +1360,11 @@ a64_emit_node(nd) {
         if (ety == 1) {
             if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
         }
-        if (fh == TY_BYTE) {
+        if (ty_slice(fh) == SL_BYTE) {
             if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); } else { out("  ldrb w0, [x0]"); putchar('\n'); }
-        } else if (fh == TY_QUART) {
+        } else if (ty_slice(fh) == SL_QUARTER) {
             if (a64_bin_mode) { enc_ldrh_uoff(0, 0, 0); } else { out("  ldrh w0, [x0]"); putchar('\n'); }
-        } else if (fh == TY_HALF) {
+        } else if (ty_slice(fh) == SL_HALF) {
             if (a64_bin_mode) { enc_ldr_w_uoff(0, 0, 0); } else { out("  ldr w0, [x0]"); putchar('\n'); }
         } else {
             if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); } else { out("  ldr x0, [x0]"); putchar('\n'); }
@@ -1437,7 +1438,7 @@ a64_emit_stmt(nd) {
                 a64_emit_store_var(vi, off, rty);
             } else {
                 // Global variable store.
-                if (ty_get_global_type(lhs.a) == TY_FLOAT) {
+                if (is_float_type(ty_get_global_type(lhs.a))) {
                     // Float global: keep value in d0, convert int if needed.
                     if (rty == 0) {
                         if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
@@ -1484,11 +1485,11 @@ a64_emit_stmt(nd) {
         a64_emit_push();
         a64_emit_node(n.a);
         a64_emit_pop(1);
-        if (fh == TY_BYTE) {
+        if (ty_slice(fh) == SL_BYTE) {
             if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
-        } else if (fh == TY_QUART) {
+        } else if (ty_slice(fh) == SL_QUARTER) {
             if (a64_bin_mode) { enc_strh_uoff(1, 0, 0); } else { out("  strh w1, [x0]"); putchar('\n'); }
-        } else if (fh == TY_HALF) {
+        } else if (ty_slice(fh) == SL_HALF) {
             if (a64_bin_mode) { enc_str_w_uoff(1, 0, 0); } else { out("  str w1, [x0]"); putchar('\n'); }
         } else {
             if (a64_bin_mode) { enc_str_uoff(1, 0, 0); } else { out("  str x1, [x0]"); putchar('\n'); }
@@ -1581,7 +1582,7 @@ a64_emit_stmt(nd) {
     if (t == T_RET) {
         rty = a64_emit_node(n.a);
         // Ensure return value matches function's declared return type.
-        if (get_fn_ret_type(a64_cur_fn_idx) == TY_FLOAT) {
+        if (is_float_type(get_fn_ret_type(a64_cur_fn_idx))) {
             if (rty == 0) {
                 if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
             }
