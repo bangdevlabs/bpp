@@ -1,8 +1,10 @@
 # B++ Evolution Roadmap — Game Engine + Art Tools + Audio Plugins
 
-## Status: 2026-03-27
+## Status: 2026-03-30
 
 Type system refactored from flat enum to orthogonal base × slice grid (5 bases × 5 slices = 25 types, packed in 1 byte). Compiler self-hosts with Go-model modular compilation. float_ret()/float_ret2() builtins. Diagnostics (E001-E201, W001-W005). Packed structs. memcpy/realloc builtins. `install.sh` for global installation. Parser supports compound type annotations: `half float` → 32-bit float, `quarter float` → 16-bit float.
+
+**2026-03-30**: Fixed critical .bo cache bug — `sd_fhints` array was not initialized when loading structs from cache, causing NULL dereference in `add_struct_field`. Added `compiler_self_hash()` to cache manifest so cache auto-invalidates when the compiler binary changes. `.bpp_cache/` directory tracked in git via `.gitkeep`.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 

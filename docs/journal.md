@@ -1703,3 +1703,58 @@ The new system separates concerns into two orthogonal axes. Adding a new width o
 - The codegen already implemented the base+slice decision in two steps ("is it float?" then "which sub-word?"). The refactor just named what was already there.
 - promote() must widen float to at least the integer operand's width: promote(f32, i64) = f64, not f32. Returning the narrower float loses 41 bits of precision.
 - SL_DOUBLE (128-bit) slot is reserved for future SIMD/NEON even though no codegen supports it yet — costs zero to include.
+
+## 2026-03-30 — .bo Cache Fix + Compiler Self-Hash
+
+### The Bug
+
+Modular compilation with `.bo` caching had a critical bug: `bo_read_export()` did not push to `sd_fhints` when loading structs from cache. When `add_struct_field()` subsequently called `arr_get(sd_fhints, idx)`, it read beyond the array bounds, got NULL, and crashed with `*(NULL + offset) = value` (SIGSEGV).
+
+This meant the second bootstrap stage always crashed when the cache was populated — `bpp` compiled `bpp2` (populating cache), but `bpp2` crashed compiling `bpp3` (loading corrupt cache). The bug was masked by manually clearing `.bpp_cache/` before each bootstrap.
+
+### Root Cause
+
+In `src/bpp_bo.bsm`, `bo_read_export()` for structs was missing one line compared to `add_struct_def()` in the parser:
+
+```
+// Parser (add_struct_def) — correct:
+sd_fhints = arr_push(sd_fhints, malloc(64 * 8));
+
+// bo_read_export — was missing this line entirely
+```
+
+Additionally, `add_struct_field()` was called with 2 arguments instead of 3 (missing the `hint` parameter).
+
+### Fix
+
+Two lines added to `bo_read_export()`:
+1. `sd_fhints = arr_push(sd_fhints, malloc(64 * 8));` — initialize hints array for cached structs
+2. `add_struct_field(idx, bo_read_str(), 0);` — pass explicit hint=0
+
+### Compiler Self-Hash
+
+Added `compiler_self_hash()` to `bpp_import.bsm`. The cache manifest hash now includes the FNV-1a hash of the first 8KB of the compiler binary (`argv[0]`). When the compiler changes, the entire cache is invalidated automatically — no manual clearing needed.
+
+Uses a private `malloc(8192)` buffer to avoid corrupting `_cache_buf` which is shared by `cache_load()` and `cache_save()`.
+
+### .gitignore Update
+
+`.bpp_cache/` directory is now tracked in git (via `.gitkeep`) so it always exists after clone. Only the contents (`.bo` files and `hashes`) are gitignored.
+
+### Verification
+
+| Test | Result |
+|------|--------|
+| Bootstrap (bpp == bpp2 == bpp3 with cache) | PASS |
+| 13 native tests (macOS ARM64) | PASS |
+| 13 cross-compiled tests (Linux x86_64 via Docker) | PASS |
+| Snake native (Cocoa) | Compiles and runs |
+| MCU game | Compiles and runs |
+| Linux ELF generation | Valid ELF64 binary |
+
+### Files Changed
+
+- `src/bpp_bo.bsm` — 2 lines added (sd_fhints init + hint arg)
+- `src/bpp_import.bsm` — compiler_self_hash() + manifest hash integration
+- `.gitignore` — track .bpp_cache/ directory, ignore contents
+- `.bpp_cache/.gitkeep` — ensure directory exists in repo

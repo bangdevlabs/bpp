@@ -232,13 +232,30 @@ hex_parse(buf, off) {
     return val;
 }
 
-// Compute a manifest hash from the full module list.
-// Combines module count + all filenames into a single FNV-1a hash.
-// Different programs (different import trees) produce different manifest hashes,
-// so .bo cache files are never reused across incompatible compilations.
+// Hash the compiler binary itself so the cache invalidates when bpp changes.
+// Reads the first 8KB of argv[0] into a private buffer and returns its FNV-1a hash.
+compiler_self_hash() {
+    auto path, fd, nread, buf, h;
+    path = argv_get(0);
+    if (path == 0) { return 0; }
+    fd = sys_open(path, 0);
+    if (fd < 0) { return 0; }
+    buf = malloc(8192);
+    nread = sys_read(fd, buf, 8192);
+    sys_close(fd);
+    if (nread <= 0) { free(buf); return 0; }
+    h = fnv1a(buf, nread);
+    free(buf);
+    return h;
+}
+
+// Compute a manifest hash from the compiler binary + full module list.
+// If the compiler changes, all cached .bo files are invalidated.
+// If the module list changes, all cached .bo files are invalidated.
 cache_manifest_hash() {
     auto h, n, i, fp, fs, fl, j;
-    h = 0xcbf29ce484222325;
+    h = compiler_self_hash();
+    if (h == 0) { h = 0xcbf29ce484222325; }
     n = arr_len(diag_file_starts);
     // Mix in the module count.
     h = h ^ (n & 0xFF); h = h * 0x100000001b3;
@@ -353,7 +370,7 @@ cache_save() {
         poke(_cache_buf + bpos, 10); bpos = bpos + 1;
         i = i + 1;
     }
-    // Write to file. Graceful skip if directory doesn't exist.
+    // Write to file. Skips silently if .bpp_cache/ directory doesn't exist.
     fd = sys_open(pathbuf, 0x601);
     if (fd < 0) { return 0; }
     sys_write(fd, _cache_buf, bpos);
