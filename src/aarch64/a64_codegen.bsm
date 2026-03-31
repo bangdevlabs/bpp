@@ -379,10 +379,25 @@ a64_emit_load_var(vi, off) {
     auto fty, sl;
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
-    // Float: always respected whether forced or inferred.
+    // Float sub-types: FLOAT_H loads s-register, FLOAT_Q loads h-register.
+    // All widen to d0 (double) for computation.
     if (a64_var_is_float(vi)) {
+        if (sl == SL_HALF) {
+            if (a64_bin_mode) { enc_ldr_s_uoff(0, 29, off); }
+            if (a64_bin_mode) { enc_fcvt_d_s(0, 0); }
+            if (a64_bin_mode == 0) { out("  ldr s0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+            if (a64_bin_mode == 0) { out("  fcvt d0, s0"); putchar(10); }
+            return 1;
+        }
+        if (sl == SL_QUARTER) {
+            if (a64_bin_mode) { enc_ldr_h_uoff(0, 29, off); }
+            if (a64_bin_mode) { enc_fcvt_d_h(0, 0); }
+            if (a64_bin_mode == 0) { out("  ldr h0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+            if (a64_bin_mode == 0) { out("  fcvt d0, h0"); putchar(10); }
+            return 1;
+        }
         if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, off); }
-        else { out("  ldr d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        if (a64_bin_mode == 0) { out("  ldr d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 1;
     }
     // Sub-word loads only when explicitly annotated by the programmer.
@@ -414,13 +429,28 @@ a64_emit_store_var(vi, off, rty) {
     auto fty, sl;
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
-    // Float: always respected whether forced or inferred.
+    // Float sub-types: convert int→double if needed, then narrow for sub-types.
     if (a64_var_is_float(vi)) {
         if (rty == 0) {
-            if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar(10); }
+            if (a64_bin_mode) { enc_scvtf(0, 0); }
+            if (a64_bin_mode == 0) { out("  scvtf d0, x0"); putchar(10); }
+        }
+        if (sl == SL_HALF) {
+            if (a64_bin_mode) { enc_fcvt_s_d(0, 0); }
+            if (a64_bin_mode) { enc_str_s_uoff(0, 29, off); }
+            if (a64_bin_mode == 0) { out("  fcvt s0, d0"); putchar(10); }
+            if (a64_bin_mode == 0) { out("  str s0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+            return 0;
+        }
+        if (sl == SL_QUARTER) {
+            if (a64_bin_mode) { enc_fcvt_h_d(0, 0); }
+            if (a64_bin_mode) { enc_str_h_uoff(0, 29, off); }
+            if (a64_bin_mode == 0) { out("  fcvt h0, d0"); putchar(10); }
+            if (a64_bin_mode == 0) { out("  str h0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+            return 0;
         }
         if (a64_bin_mode) { enc_str_d_uoff(0, 29, off); }
-        else { out("  str d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        if (a64_bin_mode == 0) { out("  str d0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
         return 0;
     }
     // Integer path: convert float to int if source is float.
@@ -750,6 +780,31 @@ a64_emit_node(nd) {
             } else {
                 out("  strb w0, [x29, #16]"); putchar('\n');
                 out("  mov x0, #1"); putchar('\n');
+                out("  add x1, x29, #16"); putchar('\n');
+                out("  mov x2, #1"); putchar('\n');
+                out("  mov x16, #4"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: putchar_err — write 1 byte to stderr via syscall.
+        if (a64_str_eq(n.a, "putchar_err", 11)) {
+            arr = n.b; ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            if (a64_bin_mode) {
+                enc_strb_uoff(0, 29, 16);
+                enc_mov_wide(0, 2);
+                enc_add_imm(1, 29, 16);
+                enc_mov_wide(2, 1);
+                enc_mov_wide(16, 4);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  strb w0, [x29, #16]"); putchar('\n');
+                out("  mov x0, #2"); putchar('\n');
                 out("  add x1, x29, #16"); putchar('\n');
                 out("  mov x2, #1"); putchar('\n');
                 out("  mov x16, #4"); putchar('\n');
@@ -1360,6 +1415,27 @@ a64_emit_node(nd) {
         if (ety == 1) {
             if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
         }
+        // Float field types: load to float register and widen to double.
+        if (is_float_type(fh)) {
+            if (ty_slice(fh) == SL_HALF) {
+                if (a64_bin_mode) { enc_ldr_s_uoff(0, 0, 0); }
+                if (a64_bin_mode) { enc_fcvt_d_s(0, 0); }
+                if (a64_bin_mode == 0) { out("  ldr s0, [x0]"); putchar('\n'); }
+                if (a64_bin_mode == 0) { out("  fcvt d0, s0"); putchar('\n'); }
+                return 1;
+            }
+            if (ty_slice(fh) == SL_QUARTER) {
+                if (a64_bin_mode) { enc_ldr_h_uoff(0, 0, 0); }
+                if (a64_bin_mode) { enc_fcvt_d_h(0, 0); }
+                if (a64_bin_mode == 0) { out("  ldr h0, [x0]"); putchar('\n'); }
+                if (a64_bin_mode == 0) { out("  fcvt d0, h0"); putchar('\n'); }
+                return 1;
+            }
+            if (a64_bin_mode) { enc_ldr_d_uoff(0, 0, 0); }
+            if (a64_bin_mode == 0) { out("  ldr d0, [x0]"); putchar('\n'); }
+            return 1;
+        }
+        // Integer field types: load to integer register.
         if (ty_slice(fh) == SL_BYTE) {
             if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); } else { out("  ldrb w0, [x0]"); putchar('\n'); }
         } else if (ty_slice(fh) == SL_QUARTER) {
@@ -1472,12 +1548,40 @@ a64_emit_stmt(nd) {
         return 0;
     }
 
-    // mem_store: *(ptr) = val — store 8 bytes to real pointer.
     // mem_store: *(ptr) = val — store to real pointer.
     // n.c holds the field type hint for packed structs (0 = default 8-byte store).
     if (t == T_MEMST) {
         auto fh;
         fh = n.c;
+        // Float field types: keep value in float register, narrow if needed.
+        if (is_float_type(fh)) {
+            ety = a64_emit_node(n.b);
+            if (ety == 0) {
+                if (a64_bin_mode) { enc_scvtf(0, 0); }
+                if (a64_bin_mode == 0) { out("  scvtf d0, x0"); putchar('\n'); }
+            }
+            a64_emit_fpush();
+            a64_emit_node(n.a);
+            a64_emit_fpop(1);
+            if (ty_slice(fh) == SL_HALF) {
+                if (a64_bin_mode) { enc_fcvt_s_d(1, 1); }
+                if (a64_bin_mode) { enc_str_s_uoff(1, 0, 0); }
+                if (a64_bin_mode == 0) { out("  fcvt s1, d1"); putchar('\n'); }
+                if (a64_bin_mode == 0) { out("  str s1, [x0]"); putchar('\n'); }
+            }
+            if (ty_slice(fh) == SL_QUARTER) {
+                if (a64_bin_mode) { enc_fcvt_h_d(1, 1); }
+                if (a64_bin_mode) { enc_str_h_uoff(1, 0, 0); }
+                if (a64_bin_mode == 0) { out("  fcvt h1, d1"); putchar('\n'); }
+                if (a64_bin_mode == 0) { out("  str h1, [x0]"); putchar('\n'); }
+            }
+            if (ty_slice(fh) == SL_FULL) {
+                if (a64_bin_mode) { enc_str_d_uoff(1, 0, 0); }
+                if (a64_bin_mode == 0) { out("  str d1, [x0]"); putchar('\n'); }
+            }
+            return 0;
+        }
+        // Integer field types: convert float to bit pattern and store.
         ety = a64_emit_node(n.b);
         if (ety == 1) {
             if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
@@ -1691,6 +1795,22 @@ a64_emit_func(fi) {
             i = i + 1;
         }
 
+        // Narrow float sub-type params from double to their declared precision.
+        i = 0;
+        while (i < par_cnt) {
+            auto fty_p;
+            fty_p = arr_get(a64_var_forced_ty, i);
+            if (is_float_type(fty_p)) {
+                if (ty_slice(fty_p) == SL_HALF) { enc_ldr_d_uoff(0, 29, arr_get(a64_var_off, i)); }
+                if (ty_slice(fty_p) == SL_HALF) { enc_fcvt_s_d(0, 0); }
+                if (ty_slice(fty_p) == SL_HALF) { enc_str_s_uoff(0, 29, arr_get(a64_var_off, i)); }
+                if (ty_slice(fty_p) == SL_QUARTER) { enc_ldr_d_uoff(0, 29, arr_get(a64_var_off, i)); }
+                if (ty_slice(fty_p) == SL_QUARTER) { enc_fcvt_h_d(0, 0); }
+                if (ty_slice(fty_p) == SL_QUARTER) { enc_str_h_uoff(0, 29, arr_get(a64_var_off, i)); }
+            }
+            i = i + 1;
+        }
+
         // Emit function body.
         a64_depth = 0;
         a64_emit_body(body_arr, body_cnt);
@@ -1727,6 +1847,22 @@ a64_emit_func(fi) {
         i = 0;
         while (i < par_cnt) {
             out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n');
+            i = i + 1;
+        }
+
+        // Narrow float sub-type params from double to their declared precision.
+        i = 0;
+        while (i < par_cnt) {
+            auto fty_p;
+            fty_p = arr_get(a64_var_forced_ty, i);
+            if (is_float_type(fty_p)) {
+                if (ty_slice(fty_p) == SL_HALF) { out("  ldr d0, [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n'); }
+                if (ty_slice(fty_p) == SL_HALF) { out("  fcvt s0, d0"); putchar('\n'); }
+                if (ty_slice(fty_p) == SL_HALF) { out("  str s0, [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n'); }
+                if (ty_slice(fty_p) == SL_QUARTER) { out("  ldr d0, [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n'); }
+                if (ty_slice(fty_p) == SL_QUARTER) { out("  fcvt h0, d0"); putchar('\n'); }
+                if (ty_slice(fty_p) == SL_QUARTER) { out("  str h0, [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n'); }
+            }
             i = i + 1;
         }
 

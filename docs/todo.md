@@ -1,10 +1,12 @@
 # B++ Evolution Roadmap — Game Engine + Art Tools + Audio Plugins
 
-## Status: 2026-03-30
+## Status: 2026-03-31
 
-Type system refactored from flat enum to orthogonal base × slice grid (5 bases × 5 slices = 25 types, packed in 1 byte). Compiler self-hosts with Go-model modular compilation. float_ret()/float_ret2() builtins. Diagnostics (E001-E201, W001-W005). Packed structs. memcpy/realloc builtins. `install.sh` for global installation. Parser supports compound type annotations: `half float` → 32-bit float, `quarter float` → 16-bit float.
+Optimized type encoding (bit-0 float flag, 11 real types, 14 phantoms removed). All float sub-types have working ARM64 codegen: FLOAT_H (32-bit, s-register) and FLOAT_Q (16-bit, h-register). putchar_err builtin. Parser fix for `half float` / `quarter float` compound annotations. ELF writer sys_open flags fixed for Linux. x86_64 encoder has SS instructions but codegen deferred (multi-statement if-block bug blocks x64 self-compile).
 
-**2026-03-30**: Fixed critical .bo cache bug — `sd_fhints` array was not initialized when loading structs from cache, causing NULL dereference in `add_struct_field`. Added `compiler_self_hash()` to cache manifest so cache auto-invalidates when the compiler binary changes. `.bpp_cache/` directory tracked in git via `.gitkeep`.
+**2026-03-31**: Encoding redesign — `is_float_type(ty) = ty & 1` (1 instruction). FLOAT_H/Q codegen active on ARM64. GPU dispatch analysis exists in bpp_dispatch.bsm (DSP_SEQ/PAR/GPU/SPLIT) but no Metal backend yet.
+
+**2026-03-30**: Fixed critical .bo cache bug. Added `compiler_self_hash()` for auto cache invalidation.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -30,15 +32,21 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ---
 
-## P0 — Developer Experience (immediate priorities)
+## P0 — Immediate Priorities
 
-### 1. Native FLOAT_H / FLOAT_Q codegen (Fase 1B)
-Type system supports TY_FLOAT_H (32-bit float) and TY_FLOAT_Q (16-bit float) but codegen still uses 64-bit float instructions. Need:
-- ARM64: s-register load/store/arithmetic (enc_ldr_s_uoff, enc_fadd_s, etc.)
-- x86_64: SS instructions (MOVSS, ADDSS, SUBSS, etc.)
-- Codegen dispatch by ty_slice() within the float path
-- emit_node return value extended: 0=int, 1=FLOAT, 2=FLOAT_H
-~150 lines across encoder + codegen files.
+### 1. GPU Rendering via Metal (stbgpu)
+Currently all rendering is CPU-only (software framebuffer → NSView). Games need GPU rendering for anything beyond simple prototypes. Metal is the path for Apple Silicon.
+
+**What exists**: `bpp_dispatch.bsm` already analyzes loops and classifies them as DSP_SEQ/PAR/GPU/SPLIT. The analysis infrastructure is ready.
+
+**What's needed**:
+- `stb/stbgpu.bsm` — Metal API wrapper via extern (device, command queue, render pipeline)
+- Metal shader files (.metal) for sprite/tile rendering
+- `gpu_init()`, `gpu_begin_frame()`, `gpu_draw_sprite()`, `gpu_end_frame()`
+- Connect bpp_dispatch DSP_GPU loops to Metal compute dispatch
+- Vertex buffers using FLOAT_H (32-bit float, now working)
+
+**Priority**: HIGH — blocks all game development beyond prototypes.
 
 ### 2. Debug printing builtins
 `print_int(x)` and `print_float(x)` that write to stderr/terminal. Every debugging session needs this. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
@@ -352,6 +360,20 @@ plugin_process(input, output, frames) {
 
 ### ~~P1: Per-variable type hints~~ — **DONE 2026-03-26**
 Parser stores per-variable hints array in T_DECL node field `e` (offset 40). Type inference reads individual hints. `word` removed from keyword list. `byte`/`half`/`quarter` work as standalone declarations.
+
+## Known Bugs
+
+### BUG-1: Multi-statement if-block codegen corruption
+Adding multiple function calls inside certain if-block bodies causes the compiled binary to crash (SIGSEGV/SIGILL) or hang. Affects both ARM64 and x86_64 backends. Workaround: use separated if-statements (`if (c) { a(); } if (c) { b(); }` instead of `if (c) { a(); b(); }`). Root cause unknown — likely in how the parser or codegen handles multi-statement if-block bodies at certain nesting depths or function sizes.
+
+### BUG-2: macOS code signing cache (SIGKILL 137)
+macOS kernel caches code signing decisions per filesystem path. Replacing a binary at the same path (e.g., compiling bpp2 over an old bpp2) may cause SIGKILL on the new binary. Workaround: copy to a fresh `/tmp/` path before executing. Not a compiler bug — macOS kernel behavior.
+
+### BUG-3: x86_64 self-compile crash with new encoder functions
+Adding new functions to x64_enc.bsm causes the cross-compiled x86_64 binary to crash during self-compilation (SIGFAULT/SIGILL). Simple programs cross-compile and run correctly. Likely related to BUG-1 (multi-statement if-block) in the x64 codegen when the binary grows beyond a certain size. x86_64 FLOAT_H codegen changes deferred until BUG-1 is fixed.
+
+### BUG-4: bootstrap.c is ARM64-only
+`bootstrap.c` uses ARM64 inline assembly (x0, x16, svc). Cannot compile on x86_64. The C emitter generates portable code (libc wrappers), but `bootstrap.c` was generated from an older version. Needs regeneration, but the C emitter has a validation error (`cur_vlen` not found — from the `_check_next_float` function that's defined but no longer called).
 
 ### P2: String dedup across modules
 Duplicate strings in modular compilation create duplicate entries in data segment. Add dedup in the writer (hash string content).

@@ -281,13 +281,19 @@ Sub-word types also work as standalone declaration keywords:
 
 ### How it works
 
-Internally, each type is packed into a single byte: base (lower 4 bits) +
-slice (upper 4 bits). The helpers `ty_base()`, `ty_slice()`, and `ty_make()`
-compose and decompose types. `is_float_type()` checks the base.
+Internally, each type is packed into a single byte with an optimized encoding:
+- Bit 0 = float flag (1 = float, 0 = not float)
+- Bits 0-3 = base type (WORD=0x02, FLOAT=0x03, PTR=0x04, STRUCT=0x08, UNK=0x0C)
+- Bits 4-5 = slice (FULL=0, HALF=1, QUARTER=2, BYTE=3)
+
+`is_float_type(ty)` reduces to `ty & 1` — a single instruction on ARM64 (TBNZ).
+`ty_base()`, `ty_slice()`, and `ty_make()` compose and decompose types.
 
 The compiler uses narrower load/store instructions for sub-word types:
-`ldrb`/`strb` on ARM64, `movzx` on x86_64. The C emitter maps to the
-corresponding C type (`uint8_t`, `uint16_t`, `uint32_t`, `float`, `double`).
+`ldrb`/`strb` for byte, `ldrh`/`strh` for quarter, `ldr w`/`str w` for half (integer),
+`ldr s`/`str s` + FCVT for half float (single-precision),
+`ldr h`/`str h` + FCVT for quarter float (half-precision, ARM64 FEAT_FP16).
+The C emitter maps to `uint8_t`, `uint16_t`, `uint32_t`, `float`, `double`.
 
 Without a hint, all values are 64-bit. Sub-word values truncate on store:
 `auto x: byte; x = 300;` gives 44 (300 & 0xFF). This is hardware truncation,
@@ -405,6 +411,7 @@ These names are recognized by the compiler and emit special code:
 | `peek(addr)` | Read one byte |
 | `poke(addr, val)` | Write one byte |
 | `putchar(ch)` | Write one byte to stdout |
+| `putchar_err(ch)` | Write one byte to stderr |
 | `getchar()` | Read one byte from stdin, -1 on EOF |
 | `str_peek(s, i)` | Read byte i from string s |
 | `fn_ptr(name)` | Get code address of a function |
@@ -739,3 +746,5 @@ resolved after all modules are loaded.
 *Type propagation bug fixed, x86_64/ELF backend started on March 25, 2026.*
 *Modular compilation (.bo cache, Go model) implemented on March 26, 2026.*
 *Dynamic array migration and type hints completed on March 26, 2026.*
+*.bo cache fix, compiler self-hash on March 30, 2026.*
+*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err on March 31, 2026.*

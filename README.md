@@ -1,6 +1,6 @@
 # B++
 
-### Rock Solid B++ — Type System Refactor — 27 March 2026
+### Rock Solid B++ — Optimized Type Encoding + GPU Dispatch — 31 March 2026
 
 Self-hosting compiler with modular compilation, type hints, dynamic arrays, two native backends (ARM64 + x86_64), and a monolithic fallback. The compiler compiles itself, caches per-module object files, and produces signed native binaries with zero external tools. Let's rock!
 
@@ -73,9 +73,11 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
 - **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
 - **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
-- **Type hints** — `auto x: byte`, `auto f: half float` — orthogonal base × slice type system (5 bases × 5 slices)
+- **Type hints** — `auto x: byte`, `auto f: half float` — optimized encoding with bit-0 float flag (11 real types)
+- **Float sub-types** — `half float` (32-bit, s-register), `quarter float` (16-bit, h-register) — GPU-ready vertex formats
 - **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
-- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `float_ret()`/`float_ret2()`
+- **GPU dispatch analysis** — loop classifier (`DSP_SEQ`/`DSP_PAR`/`DSP_GPU`) detects GPU-candidate loops
+- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `float_ret()`/`float_ret2()`
 - **Modular compilation** — Go-model per-module codegen with .bo cache and Go-style hash chain invalidation
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
 - **Module dependency tracking** — content + dependency hashing, topological sort (`--show-deps`)
@@ -316,5 +318,9 @@ SOFTWARE.
 *Mach-O Fix, Packed Structs, shr/assert, C Emitter, Input Lag on March 27, 2026*
 
 *Type System Refactor: base × slice grid (5×5 = 25 types), f32/f16 support, orthogonal type composition on March 27, 2026.*
+
+*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
+
+*.bo cache fix, compiler self-hash on March 30, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*
