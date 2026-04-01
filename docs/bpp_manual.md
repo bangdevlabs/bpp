@@ -142,10 +142,12 @@ first argument to `call`.
 
 ## Control Flow
 
-There are three control structures: `if`, `while`, and `break`.
+Four control structures: `if`, `else if`, `while`, `for`, and `break`.
 
     if (x > 0) {
         y = x;
+    } else if (x == 0) {
+        y = 1;
     } else {
         y = 0 - x;
     }
@@ -156,14 +158,17 @@ There are three control structures: `if`, `while`, and `break`.
         i = i + 1;
     }
 
+    for (i = 0; i < 10; i = i + 1) {
+        putchar('0' + i);
+    }
+
 The braces are required when the body has more than one statement.
 A single-statement body may omit them:
 
     if (x < 0) x = 0 - x;
 
-`break` exits the innermost `while` loop. Nested loops are supported.
-
-There is no `for`, no `switch`, no `do-while`. You will not miss them.
+`else if` chains without extra braces. `for` desugars to `while` internally.
+`break` exits the innermost loop. There is no `switch`, no `do-while`.
 
 ## Operators
 
@@ -328,6 +333,24 @@ Offsets are in bytes. Each word is 8 bytes:
     *(buf + 8) = 200;     // store word at byte offset 8 (second word)
     auto x;
     x = *(buf + 0);       // load: x is now 100
+
+### Array indexing
+
+`buf[i]` is sugar for `*(buf + i * 8)` — read or write the i-th word:
+
+    auto buf;
+    buf = malloc(40);
+    buf[0] = 10;          // same as *(buf + 0) = 10
+    buf[1] = 20;          // same as *(buf + 8) = 20
+    x = buf[0] + buf[1];  // x is 30
+
+    for (i = 0; i < 5; i = i + 1) {
+        buf[i] = i * 100;
+    }
+
+This works with any pointer: `malloc` buffers, `arr_push` arrays,
+function parameter arrays, struct field arrays. The index is always
+in words (8 bytes), not bytes.
 
 ## Structs
 

@@ -75,13 +75,19 @@ Add texture support to both backends simultaneously to avoid refactoring vertex 
 - Update shaders (Metal + SPIR-V) for texture sampling
 - `render_sprite(tex_id, x, y, w, h)` in stbrender.bsm (agnostic)
 
-### 5. Debug printing builtins
-`print_int(x)` and `print_float(x)` that write to stderr/terminal. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
+### ~~5. Debug printing builtins~~ — **DONE 2026-03-31**
+`print_int` already in stbio.bsm, now auto-imported by stbgame.
 
-### 6. Array syntax sugar: buf[i]
-`buf[i]` as sugar for `*(buf + i * 8)` and `buf[i] = val` for `*(buf + i * 8) = val`. Parser-only change — desugars to existing T_MEMLD/T_MEMST.
+### ~~6. Array syntax sugar: buf[i]~~ — **DONE 2026-03-31**
+`buf[i]` desugars to `*(buf + i * 8)`. Parser-only. ~230 conversions applied to compiler + stb + examples.
 
-### 7. DWARF debug info → lldb/gdb support
+### ~~6b. for loop + else if~~ — **DONE 2026-03-31**
+`for (init; cond; step) { body }` desugars to init + while. `else if` chains without extra braces. ~120 for-loop conversions applied.
+
+### 7. Struct field sugar: rec.name
+Formalize internal compiler structs (FuncRecord, ExternRecord, Node) so `*(rec + FN_NAME)` becomes `rec.name`. The struct system already supports this for user types — need to define compiler-internal structs and annotate variables. ~20 locations to convert. Eliminates magic offset constants.
+
+### 8. DWARF debug info → lldb/gdb support
 Add `__DWARF`/`.debug_line` section to Mach-O/ELF with line tables for debugger stepping.
 
 ## P1 — Infrastructure

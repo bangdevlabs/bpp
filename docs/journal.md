@@ -1976,6 +1976,46 @@ GPU rendering is native per platform via codegen/FFI. No third-party APIs (no SD
 - `stb/_stb_platform_macos.bsm` — removed geometry functions (line/circle/outline)
 - `tests/test_gpu_shapes.bpp` — NEW: visual test for all render primitives
 - `tests/test_gpu_circle.bpp` — NEW: minimal circle test
+- `tests/test_syntax.bpp` — NEW: tests for else if, buf[i], for loop
+
+---
+
+## 2026-03-31d — Syntax Sugar + Codebase Cleanup
+
+### New Syntax (parser-only, zero codegen changes)
+
+**`buf[i]`** — Array indexing desugars to `*(buf + i * 8)` for reads, `*(buf + i * 8) = val` for writes. Added in `parse_primary()` after variable resolution. When parser sees `[`, it builds T_BINOP(+, base, T_BINOP(*, index, 8)) wrapped in T_MEMLD. Assignment to `buf[i]` works automatically because the existing `T_MEMLD = val` → `T_MEMST` conversion handles it.
+
+**`for (init; cond; step) { body }`** — Desugars to `init; while (cond) { body; step; }`. Implemented via `_for_init` global: `parse_for()` stashes the init statement, returns T_WHILE with step appended to body. `parse_body()` and `parse_function()` check `_for_init` and insert before the while node. Added `for` to lexer keywords.
+
+**`else if`** — In `parse_if()`, when `else` is followed by `if`, parse inner `parse_if()` directly as single-element else body. No extra braces needed.
+
+**`print_int` availability** — `stbgame.bsm` now imports `stbio.bsm`. Any program using stbgame gets `print_int`, `print_msg`, `print_ln` automatically.
+
+### Codebase Cleanup (~230 conversions)
+
+Applied the new syntax to the compiler source, stb library, and examples:
+- ~110 `*(arr + i * 8)` → `arr[i]` conversions across 8 compiler files
+- ~120 `while` → `for` loop conversions across 11 files
+- Examples and tests updated with new syntax
+
+### Files Changed
+
+- `src/bpp_lexer.bsm` — `for` keyword added to check_kw
+- `src/bpp_parser.bsm` — parse_for(), else if in parse_if(), buf[i] in parse_primary(), _for_init handling in parse_body() and parse_function()
+- `src/bpp_emitter.bsm` — ~95 syntax conversions (buf[i] + for loops)
+- `src/bpp_types.bsm` — ~50 syntax conversions
+- `src/bpp_dispatch.bsm` — ~29 syntax conversions
+- `src/bpp_validate.bsm` — ~9 syntax conversions
+- `src/bpp_import.bsm` — ~33 syntax conversions
+- `src/bpp_bo.bsm` — ~35 syntax conversions
+- `src/bpp_parser.bsm` — ~15 syntax conversions
+- `src/bpp_diag.bsm` — ~7 syntax conversions
+- `src/bpp.bpp` — ~16 syntax conversions
+- `stb/stbgame.bsm` — imports stbio.bsm, math_trig_init() call
+- `stb/stbmath.bsm` — for loop conversions
+- `examples/*.bpp` — updated with new syntax
+- `tests/test_syntax.bpp` — NEW: validates all three syntax sugars
 
 ### Verification
 

@@ -76,6 +76,9 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Type hints** — `auto x: byte`, `auto f: half float` — optimized encoding with bit-0 float flag (11 real types)
 - **Float sub-types** — `half float` (32-bit, s-register), `quarter float` (16-bit, h-register) — GPU-ready vertex formats
 - **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
+- **Array indexing** — `buf[i]` desugars to `*(buf + i * 8)`, reads and writes
+- **for loops** — `for (i = 0; i < n; i = i + 1) { ... }` desugars to while
+- **else if** — chains without extra braces
 - **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
 - **String escape sequences** — `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\xHH` in string literals
 - **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `sys_mkdir()`, `float_ret()`/`float_ret2()`
@@ -343,7 +346,7 @@ SOFTWARE.
 
 *Mach-O Fix, Packed Structs, shr/assert, C Emitter, Input Lag on March 27, 2026*
 
-*Type System Refactor: base × slice grid (5×5 = 25 types), f32/f16 support, orthogonal type composition on March 27, 2026.*
+*Type System Refactor: base × slice grid, f32/f16 support, orthogonal type composition on March 27, 2026.*
 
 *Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
 
@@ -352,5 +355,7 @@ SOFTWARE.
 *GPU rendering via Metal, Go-style cache, string escape sequences on March 31, 2026.*
 
 *Cache system overhaul (4 bugs), GPU render API (lines, circles, outlines), platform-agnostic trig on March 31, 2026.*
+
+*Syntax Sugar + Codebase Cleanup on April 1, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

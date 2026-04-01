@@ -119,16 +119,14 @@ add_struct_field(idx, field_p, hint) {
     fields = arr_get(sd_fields, idx);
     hints = arr_get(sd_fhints, idx);
     fc = arr_get(sd_fcounts, idx);
-    *(fields + fc * 8) = field_p;
-    *(hints + fc * 8) = hint;
+    fields[fc] = field_p;
+    hints[fc] = hint;
     fc = fc + 1;
     // Recompute total size by summing all field sizes.
     sz = 0;
     auto j;
-    j = 0;
-    while (j < fc) {
-        sz = sz + field_hint_size(*(hints + j * 8));
-        j = j + 1;
+    for (j = 0; j < fc; j = j + 1) {
+        sz = sz + field_hint_size(hints[j]);
     }
     arr_set(sd_fcounts, idx, fc);
     arr_set(sd_sizes, idx, sz);
@@ -156,8 +154,8 @@ get_field_offset(idx, field_p) {
     off = 0;
     i = 0;
     while (i < fc) {
-        if (packed_eq(*(fields + i * 8), field_p)) { return off; }
-        off = off + field_hint_size(*(hints + i * 8));
+        if (packed_eq(fields[i], field_p)) { return off; }
+        off = off + field_hint_size(hints[i]);
         i = i + 1;
     }
     return -1;
@@ -167,7 +165,7 @@ get_field_offset(idx, field_p) {
 get_field_hint(idx, field_idx) {
     auto hints;
     hints = arr_get(sd_fhints, idx);
-    return *(hints + field_idx * 8);
+    return hints[field_idx];
 }
 
 // Get the field index by name. Returns -1 if not found.
@@ -177,7 +175,7 @@ get_field_index(idx, field_p) {
     fc = arr_get(sd_fcounts, idx);
     i = 0;
     while (i < fc) {
-        if (packed_eq(*(fields + i * 8), field_p)) { return i; }
+        if (packed_eq(fields[i], field_p)) { return i; }
         i = i + 1;
     }
     return -1;
@@ -252,21 +250,17 @@ parse_lit_int() {
     val = 0;
     if (t == TK_HEX) {
         // Skip "0x" prefix.
-        i = 2;
-        while (i < vl) {
+        for (i = 2; i < vl; i = i + 1) {
             ch = peek(vbuf + vs + i);
             val = val * 16;
             if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
             if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
             if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
-            i = i + 1;
         }
     } else {
-        i = 0;
-        while (i < vl) {
+        for (i = 0; i < vl; i = i + 1) {
             ch = peek(vbuf + vs + i);
             val = val * 10 + ch - 48;
-            i = i + 1;
         }
     }
     return val;
@@ -387,7 +381,7 @@ auto enum_mods;     // Module index for each enum constant.
 auto extern_mods;   // Module index for each extern declaration.
 
 // Return the module index that a given token belongs to.
-tok_mod(tidx) { return mod_idx(*(tok_src_off + tidx * 8)); }
+tok_mod(tidx) { return mod_idx(tok_src_off[tidx]); }
 
 // Parser: top-level structures
 // ============================================================
@@ -544,11 +538,9 @@ parse_import() {
         if (val_is_ch('*')) {
             ts = vbuf_pos;
             tl = unpack_l(tp);
-            pi = 0;
-            while (pi < tl) {
+            for (pi = 0; pi < tl; pi = pi + 1) {
                 poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
                 vbuf_pos = vbuf_pos + 1;
-                pi = pi + 1;
             }
             poke(vbuf + vbuf_pos, 42);
             vbuf_pos = vbuf_pos + 1;
@@ -567,11 +559,9 @@ parse_import() {
             if (val_is_ch('*')) {
                 ts = vbuf_pos;
                 tl = unpack_l(tp);
-                pi = 0;
-                while (pi < tl) {
+                for (pi = 0; pi < tl; pi = pi + 1) {
                     poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
                     vbuf_pos = vbuf_pos + 1;
-                    pi = pi + 1;
                 }
                 poke(vbuf + vbuf_pos, 42);
                 vbuf_pos = vbuf_pos + 1;
@@ -676,7 +666,7 @@ parse_function() {
         list_push(var_p);
         consume();
         try_type_annotation(var_p);
-        *(ph_arr + ph_cnt * 8) = _prim_hint;
+        ph_arr[ph_cnt] = _prim_hint;
         if (_prim_hint > 0) { has_hints = 1; }
         ph_cnt = ph_cnt + 1;
         if (val_is_ch(',')) { consume(); }
@@ -687,7 +677,11 @@ parse_function() {
     consume();
     list_begin();
     while (val_is_ch('}') == 0) {
-        list_push(parse_statement());
+        auto _fs;
+        _for_init = 0;
+        _fs = parse_statement();
+        if (_for_init != 0) { list_push(_for_init); }
+        list_push(_fs);
     }
     consume();
     body_arr = list_end();
@@ -771,14 +765,27 @@ parse_module(tok_end) {
 // ============================================================
 
 // Parse a brace-enclosed or single-statement body.
+// Stash for 'for' loop desugar: parse_for sets this to the init statement,
+// and parse_body inserts it before the while node.
+auto _for_init;
+
 parse_body() {
+    auto stmt;
     list_begin();
     if (val_is_ch('{')) {
         consume();
-        while (val_is_ch('}') == 0) { list_push(parse_statement()); }
+        while (val_is_ch('}') == 0) {
+            _for_init = 0;
+            stmt = parse_statement();
+            if (_for_init != 0) { list_push(_for_init); }
+            list_push(stmt);
+        }
         consume();
     } else {
-        list_push(parse_statement());
+        _for_init = 0;
+        stmt = parse_statement();
+        if (_for_init != 0) { list_push(_for_init); }
+        list_push(stmt);
     }
     return list_end();
 }
@@ -797,8 +804,20 @@ parse_if() {
     if (peek_type() == TK_KW) {
         if (val_is("else", 4)) {
             consume();
-            else_arr = parse_body();
-            else_cnt = last_list_cnt;
+            // "else if" sugar: parse the inner if directly as a single-statement else body.
+            if (peek_type() == TK_KW) {
+                if (val_is("if", 2)) {
+                    else_arr = malloc(8);
+                    *(else_arr) = parse_if();
+                    else_cnt = 1;
+                } else {
+                    else_arr = parse_body();
+                    else_cnt = last_list_cnt;
+                }
+            } else {
+                else_arr = parse_body();
+                else_cnt = last_list_cnt;
+            }
         }
     }
     node = make_node(T_IF);
@@ -823,6 +842,38 @@ parse_while(hint_p) {
     *(node + 16) = body_arr;
     *(node + 24) = last_list_cnt;
     *(node + 32) = hint_p;
+    return node;
+}
+
+// Parse a for loop: for (init; cond; step) { body }
+// Desugars to: init; while (cond) { body; step; }
+// The init statement is stashed in _for_init for the caller to insert.
+parse_for() {
+    auto init_node, cond, step, body_arr, body_cnt, node;
+    consume();
+    consume();
+    // Parse init: either assignment or expression.
+    init_node = parse_statement();
+    // Parse condition.
+    cond = parse_expr();
+    if (val_is_ch(';')) { consume(); }
+    // Parse step expression.
+    step = parse_expr();
+    consume();
+    // Parse body, then append step to it.
+    body_arr = parse_body();
+    body_cnt = last_list_cnt;
+    // Expand body array to include step as last statement.
+    body_arr[body_cnt] = step;
+    body_cnt = body_cnt + 1;
+    // Stash init for parse_body to insert before the while.
+    _for_init = init_node;
+    // Build while node.
+    node = make_node(T_WHILE);
+    *(node + 8) = cond;
+    *(node + 16) = body_arr;
+    *(node + 24) = body_cnt;
+    *(node + 32) = 0;
     return node;
 }
 
@@ -861,7 +912,7 @@ parse_statement() {
             list_push(var_p);
             consume();
             try_type_annotation(var_p);
-            *(dh_arr + dh_cnt * 8) = _prim_hint;
+            dh_arr[dh_cnt] = _prim_hint;
             if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
             dh_cnt = dh_cnt + 1;
             while (val_is_ch(';') == 0) {
@@ -870,7 +921,7 @@ parse_statement() {
                 list_push(var_p);
                 consume();
                 try_type_annotation(var_p);
-                *(dh_arr + dh_cnt * 8) = _prim_hint;
+                dh_arr[dh_cnt] = _prim_hint;
                 if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
                 dh_cnt = dh_cnt + 1;
             }
@@ -926,6 +977,7 @@ parse_statement() {
             return node;
         }
         if (val_is("if", 2)) { return parse_if(); }
+        if (val_is("for", 3)) { return parse_for(); }
         if (val_is("while", 5)) { return parse_while(hint_p); }
         if (val_is("return", 6)) { return parse_return(); }
         if (val_is("break", 5)) {
@@ -1186,6 +1238,27 @@ parse_primary() {
         // Handle .field access if this variable has a struct type.
         if (val_is_ch('.')) {
             node = resolve_dot(node, name_p);
+        }
+        // Handle array indexing: buf[i] desugars to *(buf + i * 8).
+        if (val_is_ch('[')) {
+            auto idx_node, mul_node, add_node, op_mul, op_add;
+            consume();
+            idx_node = parse_expr();
+            consume();
+            // Create packed operator strings by writing to vbuf.
+            poke(vbuf + vbuf_pos, 42); op_mul = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;
+            poke(vbuf + vbuf_pos, 43); op_add = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;
+            // Build: *(node + idx_node * 8)
+            mul_node = make_node(T_BINOP);
+            *(mul_node + 8) = op_mul;
+            *(mul_node + 16) = idx_node;
+            *(mul_node + 24) = make_int_lit(8);
+            add_node = make_node(T_BINOP);
+            *(add_node + 8) = op_add;
+            *(add_node + 16) = node;
+            *(add_node + 24) = mul_node;
+            node = make_node(T_MEMLD);
+            *(node + 8) = add_node;
         }
         return node;
     }
