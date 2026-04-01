@@ -132,6 +132,35 @@ print_p(p) {
     return 0;
 }
 
+// Emit a C string literal from packed bytes, re-escaping special characters.
+// The packed string includes its delimiters (quotes at position 0 and len-1).
+// Middle bytes are re-escaped: newline, tab, CR, null, backslash, double-quote.
+emit_c_str(p) {
+    auto base, len, i, ch, last;
+    base = sbuf + unpack_s(p);
+    len = unpack_l(p);
+    last = len - 1;
+    // Emit opening quote as-is.
+    putchar(peek(base));
+    i = 1;
+    while (i < last) {
+        ch = peek(base + i);
+        if (ch == 10) { putchar(92); putchar(110); }
+        if (ch == 9) { putchar(92); putchar(116); }
+        if (ch == 13) { putchar(92); putchar(114); }
+        if (ch == 0) { putchar(92); putchar(48); }
+        if (ch == 92) { putchar(92); putchar(92); }
+        if (ch == 34) { putchar(92); putchar(34); }
+        if (ch != 10) { if (ch != 9) { if (ch != 13) { if (ch != 0) { if (ch != 92) { if (ch != 34) {
+            putchar(ch);
+        } } } } } }
+        i = i + 1;
+    }
+    // Emit closing quote.
+    putchar(peek(base + last));
+    return 0;
+}
+
 // ── Used extern tracking ───────────────────────────────────
 
 // Check if a packed name is in the extern table.
@@ -425,11 +454,14 @@ emit_node(nd) {
     t = n.ntype;
 
     if (t == T_LIT) {
-        // String literals need (long long) cast for B++ function args.
+        // String literals need (long long) cast and re-escaping for C output.
         if (peek(sbuf + unpack_s(n.a)) == 34) {
             out("(long long)");
+            emit_c_str(n.a);
         }
-        print_p(n.a);
+        if (peek(sbuf + unpack_s(n.a)) != 34) {
+            print_p(n.a);
+        }
         return 0;
     }
 
@@ -630,6 +662,16 @@ emit_node(nd) {
             return 0;
         }
 
+        // Built-in: sys_mkdir -> create a directory.
+        if (str_eq(name_p, "sys_mkdir", 9)) {
+            out("bpp_sys_mkdir((const char*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(")), ");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")");
+            return 0;
+        }
+
         // Built-in: sys_fork -> fork the process.
         if (str_eq(name_p, "sys_fork", 8)) {
             out("bpp_sys_fork()");
@@ -811,6 +853,7 @@ emit_includes() {
     out("#include <unistd.h>"); putchar('\n');
     out("#include <fcntl.h>"); putchar('\n');
     out("#include <sys/wait.h>"); putchar('\n');
+    out("#include <sys/stat.h>"); putchar('\n');
     putchar('\n');
     i = 0;
     while (i < ex_cnt) {
@@ -889,6 +932,11 @@ emit_runtime() {
     out("static long long bpp_sys_close(long long fd) {");
     putchar('\n');
     out("  return (long long)close((int)fd);"); putchar('\n');
+    out("}"); putchar('\n');
+
+    out("static long long bpp_sys_mkdir(const char* path, long long mode) {");
+    putchar('\n');
+    out("  return (long long)mkdir(path, (mode_t)mode);"); putchar('\n');
     out("}"); putchar('\n');
 
     // bpp_sys_fork — uses POSIX fork().

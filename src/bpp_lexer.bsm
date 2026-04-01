@@ -279,24 +279,95 @@ scan_number() {
 }
 
 // Scan a string literal enclosed in double quotes.
+// Convert a hex digit character (0-9, a-f, A-F) to its numeric value.
+_hex_val(ch) {
+    if (ch >= 48) { if (ch <= 57) { return ch - 48; } }
+    if (ch >= 97) { if (ch <= 102) { return ch - 87; } }
+    if (ch >= 65) { if (ch <= 70) { return ch - 55; } }
+    return 0;
+}
+
+// Scan a string literal with escape sequence processing.
+// Supported escapes: \n \t \r \0 \\ \" \xHH
+// Processed bytes are written directly to vbuf; the token length
+// reflects the decoded output, not the raw source length.
 scan_string() {
-    auto start;
+    auto start, vstart, ch, next, bval;
     start = pos;
+    vstart = vbuf_pos;
+
+    // Copy opening quote.
+    poke(vbuf + vbuf_pos, 34);
+    vbuf_pos = vbuf_pos + 1;
     pos = pos + 1;
+
     while (pos < src_len) {
-        if (peek(src + pos) == 34) {
+        ch = peek(src + pos);
+
+        if (ch == 34) {
+            // Closing quote.
+            poke(vbuf + vbuf_pos, 34);
+            vbuf_pos = vbuf_pos + 1;
             pos = pos + 1;
-            add_token(5, start, pos - start);
+            // Write token record directly (processed length differs from source).
+            auto base, tlen;
+            tlen = vbuf_pos - vstart;
+            base = toks + tok_cnt * 24;
+            *(base) = 5;
+            *(base + 8) = vstart;
+            *(base + 16) = tlen;
+            *(tok_lines + tok_cnt * 8) = cur_line;
+            *(tok_src_off + tok_cnt * 8) = start;
+            tok_cnt = tok_cnt + 1;
             return 0;
         }
-        pos = pos + 1;
+
+        if (ch == 92) {
+            // Backslash — resolve escape sequence.
+            pos = pos + 1;
+            next = peek(src + pos);
+            bval = next;
+            if (next == 110) { bval = 10; }
+            if (next == 116) { bval = 9; }
+            if (next == 114) { bval = 13; }
+            if (next == 48)  { bval = 0; }
+            if (next == 92)  { bval = 92; }
+            if (next == 34)  { bval = 34; }
+            if (next == 120) {
+                // \xHH — two-digit hex escape.
+                auto h1, h2;
+                pos = pos + 1;
+                h1 = _hex_val(peek(src + pos));
+                pos = pos + 1;
+                h2 = _hex_val(peek(src + pos));
+                bval = h1 * 16 + h2;
+            }
+            poke(vbuf + vbuf_pos, bval);
+            vbuf_pos = vbuf_pos + 1;
+            pos = pos + 1;
+        } else {
+            // Regular character — copy as-is.
+            poke(vbuf + vbuf_pos, ch);
+            vbuf_pos = vbuf_pos + 1;
+            pos = pos + 1;
+        }
     }
+
     // W001: unterminated string literal.
     diag_warn(1);
     diag_str("unterminated string literal at line ");
     diag_int(cur_line);
     diag_newline();
-    add_token(5, start, pos - start);
+    // Record what we have so far.
+    auto base2, tlen2;
+    tlen2 = vbuf_pos - vstart;
+    base2 = toks + tok_cnt * 24;
+    *(base2) = 5;
+    *(base2 + 8) = vstart;
+    *(base2 + 16) = tlen2;
+    *(tok_lines + tok_cnt * 8) = cur_line;
+    *(tok_src_off + tok_cnt * 8) = start;
+    tok_cnt = tok_cnt + 1;
     return 0;
 }
 
@@ -452,7 +523,12 @@ lex_module(mi) {
     mc = arr_len(diag_file_starts);
     mod_start = arr_get(diag_file_starts, mi);
     if (mi + 1 < mc) { mod_end = arr_get(diag_file_starts, mi + 1); }
-    else { mod_end = src_len; }
+    else {
+        // Last module by index: stop at module 0's content start,
+        // not src_len, to avoid lexing the top-level .bpp code.
+        if (mod0_real_start >= 0) { mod_end = mod0_real_start; }
+        else { mod_end = src_len; }
+    }
     // Set lexer position to module start and lex until module end.
     pos = mod_start;
     while (pos < mod_end) {

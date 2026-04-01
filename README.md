@@ -1,8 +1,8 @@
 # B++
 
-### Rock Solid B++ — Optimized Type Encoding + GPU Dispatch — 31 March 2026
+### GPU-Accelerated Native Rendering + Go-Style Cache — 31 March 2026
 
-Self-hosting compiler with modular compilation, type hints, dynamic arrays, two native backends (ARM64 + x86_64), and a monolithic fallback. The compiler compiles itself, caches per-module object files, and produces signed native binaries with zero external tools. Let's rock!
+Self-hosting compiler with GPU rendering (Metal on macOS, Vulkan on Linux planned), modular compilation with Go-style content-addressed cache, type hints, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
 
 ---
 
@@ -76,11 +76,12 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Type hints** — `auto x: byte`, `auto f: half float` — optimized encoding with bit-0 float flag (11 real types)
 - **Float sub-types** — `half float` (32-bit, s-register), `quarter float` (16-bit, h-register) — GPU-ready vertex formats
 - **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
-- **GPU dispatch analysis** — loop classifier (`DSP_SEQ`/`DSP_PAR`/`DSP_GPU`) detects GPU-candidate loops
-- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `float_ret()`/`float_ret2()`
-- **Modular compilation** — Go-model per-module codegen with .bo cache and Go-style hash chain invalidation
+- **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
+- **String escape sequences** — `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\xHH` in string literals
+- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `sys_mkdir()`, `float_ret()`/`float_ret2()`
+- **Modular compilation** — Go-model per-module codegen with content-addressed .bo cache at `~/.bpp/cache/`
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
-- **Module dependency tracking** — content + dependency hashing, topological sort (`--show-deps`)
+- **Module dependency tracking** — content + dependency + compiler hashing, topological sort (`--show-deps`)
 - **Install script** — `sh install.sh` bootstraps and installs compiler + stb + drivers globally
 
 ## What B++ Doesn't Have
@@ -99,7 +100,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbinput` | Keyboard and mouse input from memory arrays |
 | `stbgame` | Game loop — init, frame timing, quit |
 | `stbfont` | 8×8 bitmap font for text rendering |
-| `stbmath` | Vec2, PRNG, abs, min, max, clamp |
+| `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines |
+| `stbmath` | Vec2, PRNG, abs, min, max, clamp, fixed-point trig (cos/sin) |
 | `stbarray` | Dynamic arrays with shadow header |
 | `stbstr` | String operations and growable string builder |
 | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
@@ -108,9 +110,11 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbcol` | Collision detection (AABB, circles) |
 | `stbio` | Console I/O (print_int, print_msg) |
 
-New in stb: mouse tracking on macOS (float_ret for NSPoint), window close detection, `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection.
+New in stb: GPU rendering via Metal (stbrender), fixed-point trigonometry (stbmath), mouse tracking on macOS (float_ret for NSPoint), window close detection, `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection.
 
-Every pixel is written to a memory buffer. The compiler's platform layer puts those pixels on screen. On macOS, that's Cocoa + CoreGraphics — no SDL, no OpenGL, no Metal. Just `objc_msgSend` and a `CGBitmapContext`.
+Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan on Linux). Same game code — just swap `draw_end()` for `render_end()`.
+
+GPU rendering uses the platform's native API directly — Metal via `objc_msgSend`, Vulkan via `libvulkan.so`. No SDL. No OpenGL wrappers. The compiler talks to the hardware.
 
 ## Four Backends, Same Code
 
@@ -178,6 +182,7 @@ bpp examples/raylib_demo.bpp -o cubes && ./cubes
 ### Write Your Own
 
 ```bpp
+// CPU rendering (software framebuffer):
 import "stbgame.bsm";
 
 main() {
@@ -189,6 +194,27 @@ main() {
         draw_circle(160, 90, 40, RED);
         draw_text("B++", 140, 82, 2, WHITE);
         draw_end();
+    }
+    return 0;
+}
+```
+
+```bpp
+// GPU rendering (Metal on macOS, Vulkan on Linux):
+import "stbgame.bsm";
+import "stbrender.bsm";
+
+main() {
+    game_init(320, 180, "My Game", 60);
+    render_init();
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        if (key_pressed(KEY_ESC)) { break; }
+        render_begin();
+        render_clear(DARKGRAY);
+        render_circle(160, 90, 40, RED);
+        render_rect(60, 140, 200, 20, BLUE);
+        render_end();
     }
     return 0;
 }
@@ -210,7 +236,7 @@ b++/
 ├── examples/         — Working game examples
 ├── tests/            — Compiler and library tests
 ├── docs/             — Language manual, journal, and evolution roadmap
-├── .bpp_cache/       — Module cache (.bo files, auto-generated)
+├── ~/.bpp/cache/     — Global module cache (.bo files, content-addressed)
 └── bpp               — The compiler binary
 ```
 
@@ -218,12 +244,12 @@ b++/
 
 | Target | Status |
 |--------|--------|
-| macOS ARM64 (Apple Silicon) | **Working** — native Cocoa, SDL2, raylib |
-| Linux x86_64 | **Working** — static ELF binaries, ANSI terminal rendering |
-| Windows x86_64 | Planned — codegen + Win32 platform layer |
-| WebAssembly | Future — codegen + Canvas API |
+| macOS ARM64 (Apple Silicon) | **Working** — native Cocoa + Metal GPU, SDL2, raylib |
+| Linux x86_64 | **Working** — static ELF, terminal rendering. GPU (Vulkan) in progress |
+| Windows x86_64 | Planned — codegen + Win32 + DX12/Vulkan |
+| WebAssembly | Future — codegen + WebGPU |
 
-stb is 100% pure B++ (no platform code). Each target only needs a codegen backend + platform layer. The game code and stb library stay identical across all platforms.
+GPU access is native per platform — Metal on macOS, Vulkan on Linux, DirectX 12 on Windows. No middleware. The compiler talks to the hardware directly via FFI. stb modules are 100% platform-agnostic. Each target only needs a codegen backend + platform layer.
 
 ## Requirements
 
@@ -322,5 +348,9 @@ SOFTWARE.
 *Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
 
 *.bo cache fix, compiler self-hash on March 30, 2026.*
+
+*GPU rendering via Metal, Go-style cache, string escape sequences on March 31, 2026.*
+
+*Cache system overhaul (4 bugs), GPU render API (lines, circles, outlines), platform-agnostic trig on March 31, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

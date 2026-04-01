@@ -522,6 +522,8 @@ expecting `char*`.
 | `min(a, b)`, `max(a, b)` | Minimum, maximum |
 | `clamp(val, lo, hi)` | Clamp to range |
 | `vec2_eq(a, b)` | 1 if equal |
+| `math_cos(i)` | cos(i * 11.25) * 1024 (fixed-point, i=0..32) |
+| `math_sin(i)` | sin(i * 11.25) * 1024 (fixed-point, i=0..32) |
 
 ### stbio — Console I/O
 
@@ -532,7 +534,7 @@ expecting `char*`.
 | `print_ln()` | Write newline |
 | `print_msg(s)` | Write string + newline |
 
-### stbdraw — Drawing
+### stbdraw — CPU Drawing
 
 All drawing operates on a software framebuffer in memory. No external
 graphics library needed.
@@ -556,6 +558,28 @@ graphics library needed.
 
 Colors: `BLACK`, `WHITE`, `RED`, `GREEN`, `BLUE`, `YELLOW`, `ORANGE`,
 `PURPLE`, `GRAY`, `DARKGRAY`.
+
+### stbrender — GPU Drawing
+
+GPU-accelerated 2D rendering. Uses Metal on macOS, Vulkan on Linux
+(planned). Same color constants as stbdraw. Import `stbrender.bsm`
+alongside `stbgame.bsm`.
+
+| Function | Description |
+|----------|-------------|
+| `render_init()` | Initialize GPU (call once after game_init) |
+| `render_begin()` | Start GPU frame |
+| `render_clear(color)` | Set background clear color |
+| `render_rect(x, y, w, h, color)` | Filled rectangle |
+| `render_line(x0, y0, x1, y1, color)` | Line |
+| `render_circle(cx, cy, r, color)` | Filled circle (32 segments) |
+| `render_circle_outline(cx, cy, r, color)` | Circle outline |
+| `render_rect_outline(x, y, w, h, color)` | Rectangle outline |
+| `render_end()` | Flush, present, poll input |
+
+The GPU backend batches vertices (8 bytes each: int16 x,y + uint8
+r,g,b,a) and draws them as triangles. The shader converts integer
+coordinates to clip space on the GPU. No float math needed from B++.
 
 ### stbinput — Keyboard and Mouse
 

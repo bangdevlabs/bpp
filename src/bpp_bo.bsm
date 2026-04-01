@@ -152,50 +152,41 @@ bo_load_file(fpath) {
 
 auto bo_pathbuf;
 
-// Build the .bo cache path for a module. Flattens slashes to underscores.
+// Hex digits for hash-to-filename conversion.
+auto _hex_chars;
+
+_bo_init_hex() {
+    _hex_chars = "0123456789abcdef";
+    return 0;
+}
+
+// Build the .bo cache path for a module using its content hash as filename.
 // Result goes in bo_pathbuf (null-terminated). Example:
-//   stb/stbarray.bsm → .bpp_cache/stb_stbarray.bo
-// Returns the path length.
+//   module with hash 0xb7a1df7edb63d9cd → ~/.bpp/cache/b7a1df7edb63d9cd.bo
+// The hash encodes source + dependencies + compiler version, so the filename
+// is a unique content address. No separate validation needed.
 bo_make_path(mi) {
-    auto fp, fs, fl, i, ch, p;
+    auto p, i, h, nibble, dlen;
     if (bo_pathbuf == 0) { bo_pathbuf = malloc(512); }
-    // Prefix: ".bpp_cache/"
+    if (_cache_dir == 0) { return 0; }
+    // Copy cache directory path.
     p = 0;
-    poke(bo_pathbuf + p, '.'); p = p + 1;
-    poke(bo_pathbuf + p, 'b'); p = p + 1;
-    poke(bo_pathbuf + p, 'p'); p = p + 1;
-    poke(bo_pathbuf + p, 'p'); p = p + 1;
-    poke(bo_pathbuf + p, '_'); p = p + 1;
-    poke(bo_pathbuf + p, 'c'); p = p + 1;
-    poke(bo_pathbuf + p, 'a'); p = p + 1;
-    poke(bo_pathbuf + p, 'c'); p = p + 1;
-    poke(bo_pathbuf + p, 'h'); p = p + 1;
-    poke(bo_pathbuf + p, 'e'); p = p + 1;
-    poke(bo_pathbuf + p, '/'); p = p + 1;
-    // Module filename with slashes replaced by underscores.
-    fp = arr_get(diag_file_names, mi);
-    fs = unpack_s(fp);
-    fl = unpack_l(fp);
     i = 0;
-    while (i < fl) {
-        ch = peek(fname_buf + fs + i);
-        if (ch == '/') { ch = '_'; }
-        poke(bo_pathbuf + p, ch);
+    while (peek(_cache_dir + i) != 0) {
+        poke(bo_pathbuf + p, peek(_cache_dir + i));
         p = p + 1;
         i = i + 1;
     }
-    // Replace extension: find last '.' and write ".bo"
-    i = p - 1;
-    while (i > 11) {
-        if (peek(bo_pathbuf + i) == '.') {
-            poke(bo_pathbuf + i + 1, 'b');
-            poke(bo_pathbuf + i + 2, 'o');
-            poke(bo_pathbuf + i + 3, 0);
-            return i + 3;
-        }
-        i = i - 1;
+    // Append 16-char hex hash of the module's combined hash.
+    h = arr_get(mod_hashes, mi);
+    i = 60;
+    while (i >= 0) {
+        nibble = (h >> i) & 0xF;
+        poke(bo_pathbuf + p, peek(_hex_chars + nibble));
+        p = p + 1;
+        i = i - 4;
     }
-    // No extension found — append .bo
+    // Append ".bo" extension and null terminator.
     poke(bo_pathbuf + p, '.'); p = p + 1;
     poke(bo_pathbuf + p, 'b'); p = p + 1;
     poke(bo_pathbuf + p, 'o'); p = p + 1;
@@ -582,81 +573,27 @@ bo_resolve_calls_x64() {
 
 // ── Export data serialization ────────────────────────────────
 
-// Write the .bo header: magic, version, target, manifest hash, source hash, dep hashes.
-// The manifest hash captures the full module list of the compilation.
-// A .bo file is only valid when loaded by a compilation with the same module set.
+// Write the .bo header: magic bytes + version 3 + target.
+// Content-addressed cache: the filename IS the hash. No hash data in the header.
 bo_write_header(mi, target) {
-    auto k, dc;
-    // Magic "BO" + version 2 + target byte.
     bo_write_u8(66);
     bo_write_u8(79);
-    bo_write_u8(2);
+    bo_write_u8(3);
     bo_write_u8(target);
-    // Manifest hash: fingerprint of the entire module list.
-    bo_write_u64(cache_manifest_hash());
-    // Source content hash for this module.
-    bo_write_u64(arr_get(mod_hashes, mi));
-    // Dependency hashes: count + hash of each direct dependency.
-    dc = 0;
-    k = 0;
-    while (k < arr_len(dep_from)) {
-        if (arr_get(dep_from, k) == mi) { dc = dc + 1; }
-        k = k + 1;
-    }
-    bo_write_u16(dc);
-    k = 0;
-    while (k < arr_len(dep_from)) {
-        if (arr_get(dep_from, k) == mi) {
-            bo_write_u64(arr_get(mod_hashes, arr_get(dep_to, k)));
-        }
-        k = k + 1;
-    }
     return 0;
 }
 
-// Validate a .bo header against the current compilation state.
-// Checks three layers: (1) manifest hash — same module set, (2) source hash —
-// module content unchanged, (3) dependency hashes — no transitive changes.
-// Returns 1 if all checks pass, 0 if stale.
+// Validate a .bo header. Only checks magic bytes and version.
+// Full hash validation is implicit: the filename IS the content hash.
 bo_check_header(mi) {
-    auto m0, m1, ver, tgt, mh, sh, dc, k, dh, dep_mi, j, match;
+    auto m0, m1, ver;
     m0 = bo_read_u8();
     m1 = bo_read_u8();
     if (m0 != 66) { return 0; }
     if (m1 != 79) { return 0; }
     ver = bo_read_u8();
-    // Reject old version-1 .bo files that lack the manifest hash.
-    if (ver != 2) { return 0; }
-    tgt = bo_read_u8();
-    // Layer 1: manifest hash — ensures this .bo was built for the same program.
-    mh = bo_read_u64();
-    if (mh != cache_manifest_hash()) { return 0; }
-    // Layer 2: source hash — ensures the module's own content hasn't changed.
-    sh = bo_read_u64();
-    if (sh != arr_get(mod_hashes, mi)) { return 0; }
-    // Layer 3: dependency hashes — ensures no transitive dependency changed.
-    dc = bo_read_u16();
-    k = 0;
-    j = 0;
-    while (k < dc) {
-        dh = bo_read_u64();
-        // Walk dep_from to find the k-th dependency of this module.
-        match = 0;
-        while (j < arr_len(dep_from)) {
-            if (arr_get(dep_from, j) == mi) {
-                dep_mi = arr_get(dep_to, j);
-                j = j + 1;
-                if (dh != arr_get(mod_hashes, dep_mi)) { return 0; }
-                match = 1;
-                k = k + 1;
-                if (k >= dc) { return 1; }
-            } else {
-                j = j + 1;
-            }
-        }
-        // Fewer deps in dep_from than stored in .bo: stale.
-        if (match == 0) { return 0; }
-    }
+    if (ver != 3) { return 0; }
+    bo_read_u8();
     return 1;
 }
 

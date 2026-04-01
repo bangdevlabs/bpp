@@ -4,6 +4,7 @@
 // When targeting a different OS, the compiler substitutes this file.
 
 import "stbbuf.bsm";
+import "stbstr.bsm";
 
 import "objc" {
     ptr objc_getClass(char*);
@@ -76,6 +77,16 @@ _plt_map_vkey(vk) {
     if (vk == VK_C) { return 19; }
     if (vk == VK_N) { return 20; }
     if (vk == VK_T) { return 21; }
+    if (vk == VK_0) { return 22; }
+    if (vk == VK_1) { return 23; }
+    if (vk == VK_2) { return 24; }
+    if (vk == VK_3) { return 25; }
+    if (vk == VK_4) { return 26; }
+    if (vk == VK_5) { return 27; }
+    if (vk == VK_6) { return 28; }
+    if (vk == VK_7) { return 29; }
+    if (vk == VK_8) { return 30; }
+    if (vk == VK_9) { return 31; }
     return 0 - 1;
 }
 
@@ -136,36 +147,30 @@ _stb_init_window(w, h, title) {
     return 0;
 }
 
-// Copy the software framebuffer to the screen.
+// Copy the software framebuffer to the screen. Only presentation, no timing.
 _stb_present() {
     auto ctx, cgimg, nsimg;
 
-    // Create CGImage from framebuffer data.
     ctx = call(_plt_cg_ctx, _stb_fb, _stb_w, _stb_h, 8, _stb_w * 4, _plt_cs, 8194);
     cgimg = call(_plt_cg_img, ctx);
 
-    // Wrap in NSImage and set on the image view.
     nsimg = objc_msgSend(objc_getClass("NSImage"), sel_registerName("alloc"));
     nsimg = objc_msgSend(nsimg, sel_registerName("initWithCGImage:size:"),
         cgimg, _stb_w * 1.0, _stb_h * 1.0);
     objc_msgSend(_plt_imgview, sel_registerName("setImage:"), nsimg);
-
-    // Tell Cocoa to redraw.
     objc_msgSend(_plt_app, sel_registerName("updateWindows"));
 
     call(_plt_cg_img_rel, cgimg);
     call(_plt_cg_ctx_rel, ctx);
+    return 0;
+}
 
-    // Frame rate cap: sleep only the remaining time in the frame budget.
+// Sleep for the remaining time in the current frame budget.
+_stb_frame_wait() {
     auto elapsed_ms, remaining_us;
     elapsed_ms = _stb_get_time() - _stb_last_time;
     remaining_us = (_stb_frame_ms - elapsed_ms) * 1000;
     if (remaining_us > 1000) { usleep(remaining_us - 1000); }
-
-    // Poll input AFTER sleep so it's as fresh as possible for the next frame.
-    // This eliminates the 1-frame input lag from polling before sleep.
-    _input_save_prev();
-    _stb_poll_events();
     return 0;
 }
 
@@ -258,5 +263,272 @@ _stb_should_close() {
 _stb_shutdown() {
     objc_msgSend(_plt_win, sel_registerName("orderOut:"), 0);
     sys_exit(0);
+    return 0;
+}
+
+// ── GPU rendering (Metal) ────────────────────────────────
+
+// Metal objects (persistent across frames).
+auto _gpu_device, _gpu_queue, _gpu_layer;
+auto _gpu_pipeline;
+auto _gpu_vbuf, _gpu_vptr;
+auto _gpu_screen_buf;
+auto _gpu_msg;
+auto _gpu_vert_count;
+
+// Per-frame state.
+auto _gpu_drawable, _gpu_cmdbuf, _gpu_enc;
+
+// Clear color (0.0 to 1.0 per component).
+auto _gpu_clear_r: float, _gpu_clear_g: float;
+auto _gpu_clear_b: float, _gpu_clear_a: float;
+
+// Build the Metal shader source string at runtime.
+_gpu_build_shader() {
+    auto s;
+    s = sb_new();
+    s = sb_cat(s, "#include <metal_stdlib>\n");
+    s = sb_cat(s, "using namespace metal;\n");
+    s = sb_cat(s, "struct V { float4 position [[position]]; float4 color; };\n");
+    s = sb_cat(s, "vertex V vert(uint vid [[vertex_id]],\n");
+    s = sb_cat(s, "  constant uchar *vd [[buffer(0)]],\n");
+    s = sb_cat(s, "  constant int *sc [[buffer(1)]]) {\n");
+    s = sb_cat(s, "  uint b = vid * 8;\n");
+    s = sb_cat(s, "  short px = short(vd[b+0]) | (short(vd[b+1]) << 8);\n");
+    s = sb_cat(s, "  short py = short(vd[b+2]) | (short(vd[b+3]) << 8);\n");
+    s = sb_cat(s, "  float sw = float(sc[0]); float sh = float(sc[1]);\n");
+    s = sb_cat(s, "  V o;\n");
+    s = sb_cat(s, "  o.position = float4(float(px)/sw*2.0-1.0, 1.0-float(py)/sh*2.0, 0.0, 1.0);\n");
+    s = sb_cat(s, "  o.color = float4(float(vd[b+4]),float(vd[b+5]),float(vd[b+6]),float(vd[b+7]))/255.0;\n");
+    s = sb_cat(s, "  return o; }\n");
+    s = sb_cat(s, "fragment float4 frag(V in [[stage_in]]) { return in.color; }\n");
+    return s;
+}
+
+// Create an NSString from a C string.
+_gpu_nsstr(cstr) {
+    auto ns;
+    ns = objc_msgSend(objc_getClass("NSString"), sel_registerName("alloc"));
+    ns = objc_msgSend(ns, sel_registerName("initWithUTF8String:"), cstr);
+    return ns;
+}
+
+// Initialize the Metal rendering pipeline.
+// Creates device, command queue, CAMetalLayer, shader pipeline, vertex buffer.
+// Must be called after game_init() so _plt_win exists.
+_stb_gpu_init(w, h) {
+    auto metal, qc, fn_create, view;
+    sys_write(2, "gpu init\n", 9);
+
+    // Load Metal and QuartzCore frameworks.
+    metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", 1);
+    qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", 1);
+
+    // Cache objc_msgSend as a function pointer for call() with 4+ args.
+    auto objc_lib;
+    objc_lib = dlopen("/usr/lib/libobjc.A.dylib", 1);
+    _gpu_msg = dlsym(objc_lib, "objc_msgSend");
+
+    // Create the default Metal device (GPU).
+    fn_create = dlsym(metal, "MTLCreateSystemDefaultDevice");
+    _gpu_device = call(fn_create);
+
+    // Create the command queue for submitting work to the GPU.
+    _gpu_queue = objc_msgSend(_gpu_device, sel_registerName("newCommandQueue"));
+
+    // Create a CAMetalLayer and configure it for BGRA8 rendering.
+    _gpu_layer = objc_msgSend(objc_getClass("CAMetalLayer"), sel_registerName("layer"));
+    objc_msgSend(_gpu_layer, sel_registerName("setDevice:"), _gpu_device);
+    objc_msgSend(_gpu_layer, sel_registerName("setPixelFormat:"), 80);
+
+    // Remove the software-rendering NSImageView before switching to GPU.
+    view = objc_msgSend(_plt_win, sel_registerName("contentView"));
+    objc_msgSend(_plt_imgview, sel_registerName("removeFromSuperview"));
+
+    // Attach the Metal layer to the content view.
+    objc_msgSend(view, sel_registerName("setWantsLayer:"), 1);
+    objc_msgSend(view, sel_registerName("setLayer:"), _gpu_layer);
+
+    // Compile the shader and build the render pipeline.
+    auto src, ns_src, err_buf, lib, vert_fn, frag_fn, pdesc, ca;
+    src = _gpu_build_shader();
+    ns_src = _gpu_nsstr(src);
+    err_buf = malloc(8);
+    write_u64(err_buf, 0, 0);
+
+    // [device newLibraryWithSource:options:error:] — 5 args via call().
+    lib = call(_gpu_msg, _gpu_device,
+               sel_registerName("newLibraryWithSource:options:error:"),
+               ns_src, 0, err_buf);
+
+    if (lib == 0) {
+        // Shader compilation failed. Print error and abort.
+        auto ns_err, ns_desc, cstr;
+        ns_err = read_u64(err_buf, 0);
+        if (ns_err != 0) {
+            ns_desc = objc_msgSend(ns_err, sel_registerName("localizedDescription"));
+            cstr = objc_msgSend(ns_desc, sel_registerName("UTF8String"));
+            sys_write(2, cstr, str_len(cstr));
+            putchar_err(10);
+        }
+        sys_write(2, "gpu: shader compile failed\n", 27);
+        sys_exit(1);
+    }
+
+    vert_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"), _gpu_nsstr("vert"));
+    frag_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"), _gpu_nsstr("frag"));
+    if (vert_fn == 0) { sys_write(2, "gpu: vert_fn nil\n", 17); sys_exit(1); }
+    if (frag_fn == 0) { sys_write(2, "gpu: frag_fn nil\n", 17); sys_exit(1); }
+
+    // Build the render pipeline descriptor.
+    pdesc = objc_msgSend(objc_getClass("MTLRenderPipelineDescriptor"), sel_registerName("alloc"));
+    pdesc = objc_msgSend(pdesc, sel_registerName("init"));
+    objc_msgSend(pdesc, sel_registerName("setVertexFunction:"), vert_fn);
+    objc_msgSend(pdesc, sel_registerName("setFragmentFunction:"), frag_fn);
+
+    ca = objc_msgSend(pdesc, sel_registerName("colorAttachments"));
+    ca = objc_msgSend(ca, sel_registerName("objectAtIndexedSubscript:"), 0);
+    objc_msgSend(ca, sel_registerName("setPixelFormat:"), 80);
+    objc_msgSend(ca, sel_registerName("setBlendingEnabled:"), 1);
+    objc_msgSend(ca, sel_registerName("setSourceRGBBlendFactor:"), 4);
+    objc_msgSend(ca, sel_registerName("setDestinationRGBBlendFactor:"), 5);
+    objc_msgSend(ca, sel_registerName("setSourceAlphaBlendFactor:"), 1);
+    objc_msgSend(ca, sel_registerName("setDestinationAlphaBlendFactor:"), 5);
+
+    // [device newRenderPipelineStateWithDescriptor:error:] — 4 args via call().
+    write_u64(err_buf, 0, 0);
+    _gpu_pipeline = call(_gpu_msg, _gpu_device,
+                         sel_registerName("newRenderPipelineStateWithDescriptor:error:"),
+                         pdesc, err_buf);
+
+    if (_gpu_pipeline == 0) {
+        auto ns_err2, ns_desc2, cstr2;
+        ns_err2 = read_u64(err_buf, 0);
+        if (ns_err2 != 0) {
+            ns_desc2 = objc_msgSend(ns_err2, sel_registerName("localizedDescription"));
+            cstr2 = objc_msgSend(ns_desc2, sel_registerName("UTF8String"));
+            sys_write(2, cstr2, str_len(cstr2));
+            putchar_err(10);
+        }
+        sys_write(2, "gpu: pipeline failed\n", 21);
+        sys_exit(1);
+    }
+
+    // Create a shared vertex buffer (256KB, enough for ~5000 quads).
+    _gpu_vbuf = call(_gpu_msg, _gpu_device,
+                     sel_registerName("newBufferWithLength:options:"),
+                     262144, 0);
+    _gpu_vptr = objc_msgSend(_gpu_vbuf, sel_registerName("contents"));
+
+    // Create screen size uniform buffer (2 x int32).
+    _gpu_screen_buf = call(_gpu_msg, _gpu_device,
+                           sel_registerName("newBufferWithLength:options:"),
+                           8, 0);
+    auto sp;
+    sp = objc_msgSend(_gpu_screen_buf, sel_registerName("contents"));
+    write_u32(sp, 0, w);
+    write_u32(sp, 4, h);
+
+    _gpu_vert_count = 0;
+    // Default clear color: black.
+    _gpu_clear_r = 0.0;
+    _gpu_clear_g = 0.0;
+    _gpu_clear_b = 0.0;
+    _gpu_clear_a = 1.0;
+
+    sb_free(src);
+    free(err_buf);
+    return 0;
+}
+
+// Store the clear color for the next frame. Components are 0.0 to 1.0.
+_stb_gpu_clear(r: float, g: float, b: float, a: float) {
+    _gpu_clear_r = r;
+    _gpu_clear_g = g;
+    _gpu_clear_b = b;
+    _gpu_clear_a = a;
+    return 0;
+}
+
+// Begin a GPU render frame.
+// Gets the next drawable, creates a command buffer, opens a render pass,
+// and binds the shader pipeline.
+_stb_gpu_begin() {
+    auto desc, attachments, att0, tex;
+
+    _gpu_drawable = objc_msgSend(_gpu_layer, sel_registerName("nextDrawable"));
+    _gpu_cmdbuf = objc_msgSend(_gpu_queue, sel_registerName("commandBuffer"));
+
+    // Build the render pass descriptor with a clear operation.
+    desc = objc_msgSend(objc_getClass("MTLRenderPassDescriptor"),
+                        sel_registerName("renderPassDescriptor"));
+    attachments = objc_msgSend(desc, sel_registerName("colorAttachments"));
+    att0 = objc_msgSend(attachments, sel_registerName("objectAtIndexedSubscript:"), 0);
+
+    tex = objc_msgSend(_gpu_drawable, sel_registerName("texture"));
+    objc_msgSend(att0, sel_registerName("setTexture:"), tex);
+    objc_msgSend(att0, sel_registerName("setLoadAction:"), 2);
+    objc_msgSend(att0, sel_registerName("setStoreAction:"), 1);
+    objc_msgSend(att0, sel_registerName("setClearColor:"),
+                 _gpu_clear_r, _gpu_clear_g, _gpu_clear_b, _gpu_clear_a);
+
+    _gpu_enc = objc_msgSend(_gpu_cmdbuf,
+                            sel_registerName("renderCommandEncoderWithDescriptor:"), desc);
+
+    // Bind the shader pipeline and uniform buffers.
+    objc_msgSend(_gpu_enc, sel_registerName("setRenderPipelineState:"), _gpu_pipeline);
+    // [encoder setVertexBuffer:_gpu_screen_buf offset:0 atIndex:1] — 5 args via call().
+    call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
+         _gpu_screen_buf, 0, 1);
+
+    // Reset vertex counter for this frame.
+    _gpu_vert_count = 0;
+
+    return 0;
+}
+
+// Write one vertex to the batch buffer.
+// Each vertex is 8 bytes: int16 x, int16 y, uint8 r, g, b, a.
+_stb_gpu_vertex(x, y, r, g, b, a) {
+    auto off;
+    off = _gpu_vert_count * 8;
+    write_u16(_gpu_vptr, off, x);
+    write_u16(_gpu_vptr, off + 2, y);
+    poke(_gpu_vptr + off + 4, r);
+    poke(_gpu_vptr + off + 5, g);
+    poke(_gpu_vptr + off + 6, b);
+    poke(_gpu_vptr + off + 7, a);
+    _gpu_vert_count = _gpu_vert_count + 1;
+    return 0;
+}
+
+// Add a filled rectangle to the vertex batch as 2 triangles (6 vertices).
+_stb_gpu_rect(x, y, w, h, r, g, b, a) {
+    auto x1, y1;
+    x1 = x + w;
+    y1 = y + h;
+    // Triangle 1: top-left, top-right, bottom-left.
+    _stb_gpu_vertex(x,  y,  r, g, b, a);
+    _stb_gpu_vertex(x1, y,  r, g, b, a);
+    _stb_gpu_vertex(x,  y1, r, g, b, a);
+    // Triangle 2: top-right, bottom-right, bottom-left.
+    _stb_gpu_vertex(x1, y,  r, g, b, a);
+    _stb_gpu_vertex(x1, y1, r, g, b, a);
+    _stb_gpu_vertex(x,  y1, r, g, b, a);
+    return 0;
+}
+
+// Flush the GPU vertex batch and present the drawable. Only GPU work, no timing.
+_stb_gpu_present() {
+    if (_gpu_vert_count > 0) {
+        call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
+             _gpu_vbuf, 0, 0);
+        call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
+             3, 0, _gpu_vert_count);
+    }
+
+    objc_msgSend(_gpu_enc, sel_registerName("endEncoding"));
+    objc_msgSend(_gpu_cmdbuf, sel_registerName("presentDrawable:"), _gpu_drawable);
+    objc_msgSend(_gpu_cmdbuf, sel_registerName("commit"));
     return 0;
 }

@@ -56,6 +56,8 @@ main() {
     init_codegen_x86_64();
     init_elf();
     init_bo();
+    _bo_init_hex();
+    cache_init();
 
     // Parse command-line arguments.
     // Supported flags: --asm, --bin, -o <name>
@@ -148,7 +150,7 @@ main() {
     // This makes cache_load detect transitive changes automatically.
     topo_sort();
     hash_with_deps();
-    cache_load();
+    cache_init_stale();
 
     // --show-deps: print module graph and exit without compiling.
     if (mode == 4) {
@@ -193,7 +195,6 @@ main() {
             diag_newline();
             mi = mi + 1;
         }
-        cache_save();
         return 0;
     }
 
@@ -216,7 +217,10 @@ main() {
         if (mode == 2) { a64_bin_mode = 1; a64_mod_init(); }
         if (mode == 3) { x64_mod_init(); }
 
-        i = 0;
+        // Start at module 1: module 0 (the .bpp file) has its content at the
+        // end of outbuf (after all imports), so lex_module(0) gets the wrong range.
+        // Module 0 is compiled after the loop using full lex+parse.
+        i = 1;
         while (i < mk) {
             bo_make_path(i);
             if (arr_get(mod_stale, i) == 0) {
@@ -271,8 +275,37 @@ main() {
             }
         }
 
+        // Compile module 0 (the top-level .bpp file).
+        // Its content is at the end of outbuf (after all imports),
+        // starting at mod0_real_start. If no imports (-1), lex from 0.
+        auto m0s, m0_tok_before;
+        m0s = mod0_real_start;
+        if (m0s < 0) { m0s = 0; }
+        m0_tok_before = tok_cnt;
+        pos = m0s;
+            while (pos < src_len) {
+                skip_ws();
+                if (pos < src_len) { scan_token(); }
+            }
+            parse_module(tok_cnt);
+            infer_module(0);
+
+            if (mode == 2) {
+                fn_s = arr_len(a64_fn_name);
+                str_s = arr_len(a64_str_tbl);
+                flt_s = arr_len(a64_flt_tbl);
+                rel_s = arr_len(enc_rel_pos);
+                emit_module_arm64(0);
+            }
+            if (mode == 3) {
+                fn_s = arr_len(x64_fn_name);
+                str_s = arr_len(x64_str_tbl);
+                flt_s = arr_len(x64_flt_tbl);
+                rel_s = arr_len(x64_enc_rel_pos);
+                emit_module_x86_64(0);
+            }
+
         // Repopulate globals and externs now that all modules have been processed.
-        // a64_mod_init/x64_mod_init ran before the loop when globals were empty.
         if (mode == 2) {
             arr_clear(a64_gl_name);
             mk = 0;
@@ -419,7 +452,5 @@ main() {
     if (mode == 0) { emit_all(); }
 
     diag_summary();
-    // Update the hash cache for the next build.
-    cache_save();
     return 0;
 }

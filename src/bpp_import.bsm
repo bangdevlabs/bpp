@@ -26,7 +26,8 @@ auto dep_from;          // Dynamic array: source module index for each dependenc
 auto dep_to;            // Dynamic array: target module index for each dependency edge.
 auto mod_topo;          // Dynamic array: module indices in topological compilation order.
 auto mod_stale;         // Dynamic array: 1 if module changed since last build, 0 if clean.
-auto _cache_buf;        // Scratch buffer for reading/writing the hash cache file.
+auto _cache_dir;        // Global cache directory path (~/.bpp/cache/).
+auto mod0_real_start;   // True outbuf position where module 0's content begins (-1 = no imports).
 
 // ── Output helpers ───────────────────────────────────────────
 
@@ -115,6 +116,11 @@ mark_imported(path_off, path_len) {
 // the offset belongs to. Returns the 0-based module index.
 mod_idx(src_off) {
     auto lo, hi, mid, ms;
+    // Module 0's content is at the end of outbuf (after all imports).
+    // The binary search below would misattribute it to the last stb module.
+    if (mod0_real_start >= 0) {
+        if (src_off >= mod0_real_start) { return 0; }
+    }
     lo = 0; hi = arr_len(diag_file_starts) - 1;
     while (lo < hi) {
         mid = (lo + hi + 1) / 2;
@@ -240,141 +246,89 @@ compiler_self_hash() {
     if (path == 0) { return 0; }
     fd = sys_open(path, 0);
     if (fd < 0) { return 0; }
+    // Read the entire binary in 8KB chunks to capture all code changes.
     buf = malloc(8192);
+    h = 0xcbf29ce484222325;
     nread = sys_read(fd, buf, 8192);
+    while (nread > 0) {
+        h = h ^ fnv1a(buf, nread);
+        h = h * 0x100000001b3;
+        nread = sys_read(fd, buf, 8192);
+    }
     sys_close(fd);
-    if (nread <= 0) { free(buf); return 0; }
-    h = fnv1a(buf, nread);
     free(buf);
+    if (h == 0xcbf29ce484222325) { return 0; }
     return h;
 }
 
-// Compute a manifest hash from the compiler binary + full module list.
-// If the compiler changes, all cached .bo files are invalidated.
-// If the module list changes, all cached .bo files are invalidated.
-cache_manifest_hash() {
-    auto h, n, i, fp, fs, fl, j;
-    h = compiler_self_hash();
-    if (h == 0) { h = 0xcbf29ce484222325; }
-    n = arr_len(diag_file_starts);
-    // Mix in the module count.
-    h = h ^ (n & 0xFF); h = h * 0x100000001b3;
-    h = h ^ ((n >> 8) & 0xFF); h = h * 0x100000001b3;
-    // Mix in each module filename.
-    i = 0;
-    while (i < n) {
-        fp = arr_get(diag_file_names, i);
-        fs = unpack_s(fp); fl = unpack_l(fp);
+// Read an environment variable by name. Returns pointer to value, or 0 if not found.
+// Walks the environ array which sits right after argv's NULL terminator in memory.
+_getenv(name) {
+    auto i, p, j, nlen, match;
+    nlen = 0;
+    while (peek(name + nlen) != 0) { nlen = nlen + 1; }
+    i = argc_get() + 1;
+    p = argv_get(i);
+    while (p != 0) {
+        match = 1;
         j = 0;
-        while (j < fl) {
-            h = h ^ peek(fname_buf + fs + j);
-            h = h * 0x100000001b3;
+        while (j < nlen) {
+            if (peek(p + j) != peek(name + j)) { match = 0; }
             j = j + 1;
         }
-        // Separator byte between filenames.
-        h = h ^ 0; h = h * 0x100000001b3;
+        if (match) {
+            if (peek(p + nlen) == 61) { return p + nlen + 1; }
+        }
         i = i + 1;
-    }
-    return h;
-}
-
-// Load cached hashes from .bpp_cache/hashes and compare against current mod_hashes.
-// Sets mod_stale[i] = 1 for each module whose hash differs from the cached value.
-// The first line is a manifest hash that captures the full module list.
-// If the manifest differs, all modules are stale (different program being compiled).
-cache_load() {
-    auto fd, n, i, nread, bpos, line_start, hash_val, j, fname_len, manifest;
-    n = arr_len(diag_file_starts);
-    mod_stale = arr_new();
-    // Default: all modules are stale.
-    i = 0;
-    while (i < n) { mod_stale = arr_push(mod_stale, 1); i = i + 1; }
-    // Try to open the cache file.
-    poke(pathbuf+0,'.'); poke(pathbuf+1,'b'); poke(pathbuf+2,'p'); poke(pathbuf+3,'p');
-    poke(pathbuf+4,'_'); poke(pathbuf+5,'c'); poke(pathbuf+6,'a'); poke(pathbuf+7,'c');
-    poke(pathbuf+8,'h'); poke(pathbuf+9,'e'); poke(pathbuf+10,'/');
-    poke(pathbuf+11,'h'); poke(pathbuf+12,'a'); poke(pathbuf+13,'s'); poke(pathbuf+14,'h');
-    poke(pathbuf+15,'e'); poke(pathbuf+16,'s'); poke(pathbuf+17, 0);
-    fd = sys_open(pathbuf, 0);
-    if (fd < 0) { return 0; }
-    nread = sys_read(fd, _cache_buf, 65536);
-    sys_close(fd);
-    if (nread <= 0) { return 0; }
-    // First line: manifest hash. If it doesn't match, the whole cache is invalid.
-    if (nread < 17) { return 0; }
-    manifest = hex_parse(_cache_buf, 0);
-    if (manifest != cache_manifest_hash()) { return 0; }
-    // Skip the manifest line (16 hex chars + newline).
-    bpos = 17;
-    // Parse remaining lines: each line is "<16-char hex hash> <filename>\n".
-    while (bpos + 17 < nread) {
-        hash_val = hex_parse(_cache_buf, bpos);
-        bpos = bpos + 17;
-        // Read filename until newline.
-        line_start = bpos;
-        while (bpos < nread) {
-            if (peek(_cache_buf + bpos) == 10) { bpos = bpos + nread; }
-            if (bpos < nread) { bpos = bpos + 1; }
-        }
-        if (bpos >= nread) { bpos = bpos - nread; }
-        fname_len = bpos - line_start;
-        bpos = bpos + 1;
-        // Match filename against known modules and compare hash.
-        i = 0;
-        while (i < n) {
-            auto fp, fs, fl, match;
-            fp = arr_get(diag_file_names, i);
-            fs = unpack_s(fp); fl = unpack_l(fp);
-            if (fl == fname_len) {
-                match = 1; j = 0;
-                while (j < fl) {
-                    if (peek(fname_buf + fs + j) != peek(_cache_buf + line_start + j)) { match = 0; }
-                    j = j + 1;
-                }
-                if (match) {
-                    if (hash_val == arr_get(mod_hashes, i)) { arr_set(mod_stale, i, 0); }
-                }
-            }
-            i = i + 1;
-        }
+        p = argv_get(i);
     }
     return 0;
 }
 
-// Write current module hashes to .bpp_cache/hashes for the next build.
-cache_save() {
-    auto fd, n, i, bpos, fp, fs, fl, j;
-    n = arr_len(diag_file_starts);
-    // Build cache file path (.bpp_cache/hashes).
-    poke(pathbuf+0,'.'); poke(pathbuf+1,'b'); poke(pathbuf+2,'p'); poke(pathbuf+3,'p');
-    poke(pathbuf+4,'_'); poke(pathbuf+5,'c'); poke(pathbuf+6,'a'); poke(pathbuf+7,'c');
-    poke(pathbuf+8,'h'); poke(pathbuf+9,'e'); poke(pathbuf+10,'/');
-    poke(pathbuf+11,'h'); poke(pathbuf+12,'a'); poke(pathbuf+13,'s'); poke(pathbuf+14,'h');
-    poke(pathbuf+15,'e'); poke(pathbuf+16,'s'); poke(pathbuf+17, 0);
-    // Build output in _cache_buf. First line: manifest hash.
-    bpos = 0;
-    bpos = hex_emit(_cache_buf, bpos, cache_manifest_hash());
-    poke(_cache_buf + bpos, 10); bpos = bpos + 1;
+// Initialize the global cache directory at ~/.bpp/cache/.
+// Creates the directories if they don't exist. Called once at startup.
+cache_init() {
+    auto home, hlen, p;
+    home = _getenv("HOME");
+    if (home == 0) { return 0; }
+    hlen = 0;
+    while (peek(home + hlen) != 0) { hlen = hlen + 1; }
+    // Build ~/.bpp/ path and create it.
+    _cache_dir = malloc(512);
+    p = 0;
+    auto i;
     i = 0;
-    while (i < n) {
-        bpos = hex_emit(_cache_buf, bpos, arr_get(mod_hashes, i));
-        poke(_cache_buf + bpos, 32); bpos = bpos + 1;
-        fp = arr_get(diag_file_names, i);
-        fs = unpack_s(fp); fl = unpack_l(fp);
-        j = 0;
-        while (j < fl) {
-            poke(_cache_buf + bpos, peek(fname_buf + fs + j));
-            bpos = bpos + 1;
-            j = j + 1;
-        }
-        poke(_cache_buf + bpos, 10); bpos = bpos + 1;
-        i = i + 1;
-    }
-    // Write to file. Skips silently if .bpp_cache/ directory doesn't exist.
-    fd = sys_open(pathbuf, 0x601);
-    if (fd < 0) { return 0; }
-    sys_write(fd, _cache_buf, bpos);
-    sys_close(fd);
+    while (i < hlen) { poke(_cache_dir + p, peek(home + i)); p = p + 1; i = i + 1; }
+    poke(_cache_dir + p, '/'); p = p + 1;
+    poke(_cache_dir + p, '.'); p = p + 1;
+    poke(_cache_dir + p, 'b'); p = p + 1;
+    poke(_cache_dir + p, 'p'); p = p + 1;
+    poke(_cache_dir + p, 'p'); p = p + 1;
+    poke(_cache_dir + p, 0);
+    sys_mkdir(_cache_dir, 493);
+    // Extend to ~/.bpp/cache/ and create it.
+    poke(_cache_dir + p, '/'); p = p + 1;
+    poke(_cache_dir + p, 'c'); p = p + 1;
+    poke(_cache_dir + p, 'a'); p = p + 1;
+    poke(_cache_dir + p, 'c'); p = p + 1;
+    poke(_cache_dir + p, 'h'); p = p + 1;
+    poke(_cache_dir + p, 'e'); p = p + 1;
+    poke(_cache_dir + p, '/'); p = p + 1;
+    poke(_cache_dir + p, 0);
+    sys_mkdir(_cache_dir, 493);
+    return 0;
+}
+
+// Initialize mod_stale: all modules start as clean (0) except module 0.
+// Module 0 is the top-level .bpp file which changes between programs,
+// so it must always be recompiled from source (never cached).
+cache_init_stale() {
+    auto n, i;
+    n = arr_len(diag_file_starts);
+    mod_stale = arr_new();
+    mod_stale = arr_push(mod_stale, 1);
+    i = 1;
+    while (i < n) { mod_stale = arr_push(mod_stale, 0); i = i + 1; }
     return 0;
 }
 
@@ -386,11 +340,16 @@ cache_save() {
 // After this, cache_load() can detect any change in the dependency chain
 // by comparing a single hash per module. No separate propagation step needed.
 hash_with_deps() {
-    auto i, j, mi, h;
+    auto i, j, mi, h, ch;
+    // Mix compiler binary hash into every module so upgrading bpp invalidates all.
+    ch = compiler_self_hash();
+    if (ch == 0) { ch = 0xcbf29ce484222325; }
     i = 0;
     while (i < arr_len(mod_topo)) {
         mi = arr_get(mod_topo, i);
         h = arr_get(mod_hashes, mi);
+        h = h ^ ch;
+        h = h * 0x100000001b3;
         // Mix in the combined hash of each module that mi imports.
         j = 0;
         while (j < arr_len(dep_from)) {
@@ -757,6 +716,8 @@ process_file(path_off, path_len) {
                 // Record dependency edge: this module imports the resolved module.
                 dep_from = arr_push(dep_from, my_mod_idx);
                 dep_to = arr_push(dep_to, mod_idx_by_hash(pathbuf, plen));
+                // Track where module 0's content resumes after imports.
+                if (my_mod_idx == 0) { mod0_real_start = outbuf_len; }
             } else {
                 diag_fatal(2);
                 diag_str("import '");
@@ -802,10 +763,10 @@ init_import() {
     diag_file_names = arr_new();
     diag_file_line_starts = arr_new();
     outbuf_lines = 0;
+    mod0_real_start = 0 - 1;
     mod_hashes = arr_new();
     dep_from = arr_new();
     dep_to = arr_new();
-    _cache_buf = malloc(65536);
     init_target();
     return 0;
 }

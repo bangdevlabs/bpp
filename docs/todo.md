@@ -2,13 +2,13 @@
 
 ## Status: 2026-03-31
 
-Optimized type encoding (bit-0 float flag, 11 real types, 14 phantoms removed). All float sub-types have working ARM64 codegen: FLOAT_H (32-bit, s-register) and FLOAT_Q (16-bit, h-register). putchar_err builtin. Parser fix for `half float` / `quarter float` compound annotations. ELF writer sys_open flags fixed for Linux. x86_64 encoder has SS instructions but codegen deferred (multi-statement if-block bug blocks x64 self-compile).
+**GPU rendering working on macOS ARM64 via Metal.** Lines, circles, rects, outlines — all platform-agnostic in stbrender.bsm. Trig in stbmath.bsm. Backend only needs `_stb_gpu_vertex` + `_stb_gpu_rect`.
 
-**2026-03-31**: Encoding redesign — `is_float_type(ty) = ty & 1` (1 instruction). FLOAT_H/Q codegen active on ARM64. GPU dispatch analysis exists in bpp_dispatch.bsm (DSP_SEQ/PAR/GPU/SPLIT) but no Metal backend yet.
+**Cache system fixed.** 4 bugs resolved: compiler_self_hash read full binary, module 0 isolation, mod_idx attribution, lex_module boundary. Modular compilation works without manual cache clearing.
 
-**2026-03-30**: Fixed critical .bo cache bug. Added `compiler_self_hash()` for auto cache invalidation.
+**Next: ELF dynamic linking → Linux X11 + Vulkan GPU.** The x86_64 ELF writer needs PLT/GOT for shared library calls. This unblocks Vulkan on Linux and any future FFI. Then sprites/textures on both backends simultaneously.
 
-**Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
+**Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself. GPU access is native per platform (Metal/Vulkan/DX12), no third-party APIs.
 
 ```
 
@@ -23,7 +23,7 @@ SOUND (music, SFX)                ← creates audio assets
 GAMES (engine + logic)            ← assembles everything
   stbgame + stbdraw + stbinput
   stbtile + stbphys + stbpath
-
+, eu re
 TOOLS (compiler + infra)          ← compiles everything
   bpp (self-hosting, ARM64 + x86_64)
 ```
@@ -34,51 +34,55 @@ TOOLS (compiler + infra)          ← compiles everything
 
 ## P0 — Immediate Priorities
 
-### 1. GPU Rendering via Metal (stbgpu)
-Currently all rendering is CPU-only (software framebuffer → NSView). Games need GPU rendering for anything beyond simple prototypes. Metal is the path for Apple Silicon.
+### 1. ELF Dynamic Linking (BLOCKS Linux GPU) ← NEXT
+The x86_64 ELF writer produces fully static binaries. Vulkan (and any FFI on Linux) requires dynamic linking to shared libraries. Must add PLT/GOT infrastructure to `x64_elf.bsm`, mirroring the Mach-O writer's chained fixups.
 
-**What exists**: `bpp_dispatch.bsm` already analyzes loops and classifies them as DSP_SEQ/PAR/GPU/SPLIT. The analysis infrastructure is ready.
+**What's needed (~500 lines in x64_elf.bsm):**
+- PT_INTERP program header (`/lib64/ld-linux-x86-64.so.2`)
+- `.dynamic` section (DT_NEEDED, DT_SYMTAB, DT_STRTAB, etc.)
+- `.dynsym` + `.dynstr` (dynamic symbol/string tables)
+- `.rela.plt` (relocation entries for PLT stubs)
+- `.plt` + `.got.plt` (PLT stubs → GOT → lazy resolution by ld.so)
+- Relocation type 3 in x64_codegen for extern calls (instead of type 4)
+- Wire up `elf_add_got()` in bpp.bpp (mirror macOS lines 396-402)
 
-**What's needed**:
-- `stb/stbgpu.bsm` — Metal API wrapper via extern (device, command queue, render pipeline)
-- Metal shader files (.metal) for sprite/tile rendering
-- `gpu_init()`, `gpu_begin_frame()`, `gpu_draw_sprite()`, `gpu_end_frame()`
-- Connect bpp_dispatch DSP_GPU loops to Metal compute dispatch
-- Vertex buffers using FLOAT_H (32-bit float, now working)
+**Test:** Cross-compile a program that calls `printf` from libc.
 
-**Priority**: HIGH — blocks all game development beyond prototypes.
+### 2. Linux Syscall Builtins (~170 lines in x64_codegen.bsm)
+Add missing syscalls for X11/Vulkan:
+- `sys_socket(domain, type, protocol)` — syscall 41
+- `sys_connect(fd, addr, addrlen)` — syscall 42
+- `sys_mmap(addr, len, prot, flags, fd, offset)` — syscall 9
+- `sys_munmap(addr, len)` — syscall 11
+- `sys_poll(fds, nfds, timeout)` — syscall 7
+- `sys_sendmsg(fd, msg, flags)` — syscall 46
+- `sys_recvmsg(fd, msg, flags)` — syscall 47
 
-### 2. Debug printing builtins
-`print_int(x)` and `print_float(x)` that write to stderr/terminal. Every debugging session needs this. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
+### 3. X11 Window + Vulkan GPU Backend (~900 lines in _stb_platform_linux.bsm)
+Replace terminal-only Linux backend with native windowed GPU rendering.
 
-### 3. Array syntax sugar: buf[i]
-`buf[i]` as sugar for `*(buf + i * 8)` and `buf[i] = val` for `*(buf + i * 8) = val`. Parser-only change — desugars to existing T_MEMLD/T_MEMST. Massive readability improvement for game code.
+**X11 (via libX11.so FFI):** `XOpenDisplay`, `XCreateSimpleWindow`, `XMapWindow`, event polling, keycode mapping. Uses same FFI mechanism as Vulkan.
 
-### 4. Compiler warnings (analysis pass)
-Add warnings for common mistakes without adding new types:
-- W006: variable used before assignment
-- W007: function called with wrong argument count (already E-level, add W for close matches)
-- W008: comparison of pointer with integer literal other than 0
-- W009: unreachable code after return/break
+**Vulkan (via libvulkan.so FFI):** instance, surface (VK_KHR_xlib_surface), device, swapchain, render pass, pipeline, SPIR-V shaders (embedded byte arrays), vertex batching. Same vertex format as Metal (8 bytes: int16 x,y + uint8 r,g,b,a).
 
-### 5. DWARF debug info → lldb support
-Add `__DWARF` section to Mach-O/ELF with line tables so lldb can:
-- Show source file:line on breakpoints and crashes
-- Step through B++ code line by line
-- Print variable values at break
+**Test:** Cross-compile test_gpu_shapes.bpp to Linux ELF, run in Docker with lavapipe (software Vulkan) or UTM VM with virtio-gpu.
 
-Implementation:
-- `--debug` flag enables DWARF `.debug_line` emission
-- Map each emitted instruction back to source file:line (already tracked by diag system)
-- Write DWARF line number program into `__DWARF,__debug_line` section
-- Add `LC_UUID` load command for debugger identification
-- `assert(cond)` enhanced to embed file:line in trap metadata
+### 4. GPU Sprites + Textures (Metal + Vulkan together)
+Add texture support to both backends simultaneously to avoid refactoring vertex format twice.
+- `_stb_gpu_texture_create(w, h, pixels)` — upload RGBA texture
+- `_stb_gpu_texture_bind(tex_id)` — bind for drawing
+- Vertex format expands: add UV coordinates (int16 u, v → 12 bytes per vertex)
+- Update shaders (Metal + SPIR-V) for texture sampling
+- `render_sprite(tex_id, x, y, w, h)` in stbrender.bsm (agnostic)
 
-### 6. Sprite/tilemap loader in stb
-`load_sprite16(path)` and `load_tilemap(path)` — every game needs this, shouldn't be 50 lines of manual JSON parsing per project. Part of stbart.bsm.
+### 5. Debug printing builtins
+`print_int(x)` and `print_float(x)` that write to stderr/terminal. Also `print_str(s)` without manual str_peek loops. ~20 lines each in stbio.bsm, no compiler changes needed.
 
-### 7. Sound
-Basic audio output for game feedback. Evaluate: CoreAudio (macOS native), ALSA (Linux), or minimal beep/sample playback via platform layer.
+### 6. Array syntax sugar: buf[i]
+`buf[i]` as sugar for `*(buf + i * 8)` and `buf[i] = val` for `*(buf + i * 8) = val`. Parser-only change — desugars to existing T_MEMLD/T_MEMST.
+
+### 7. DWARF debug info → lldb/gdb support
+Add `__DWARF`/`.debug_line` section to Mach-O/ELF with line tables for debugger stepping.
 
 ## P1 — Infrastructure
 
@@ -373,7 +377,7 @@ macOS kernel caches code signing decisions per filesystem path. Replacing a bina
 Adding new functions to x64_enc.bsm causes the cross-compiled x86_64 binary to crash during self-compilation (SIGFAULT/SIGILL). Simple programs cross-compile and run correctly. Likely related to BUG-1 (multi-statement if-block) in the x64 codegen when the binary grows beyond a certain size. x86_64 FLOAT_H codegen changes deferred until BUG-1 is fixed.
 
 ### BUG-4: bootstrap.c is ARM64-only
-`bootstrap.c` uses ARM64 inline assembly (x0, x16, svc). Cannot compile on x86_64. The C emitter generates portable code (libc wrappers), but `bootstrap.c` was generated from an older version. Needs regeneration, but the C emitter has a validation error (`cur_vlen` not found — from the `_check_next_float` function that's defined but no longer called).
+`bootstrap.c` uses ARM64 inline assembly (x0, x16, svc). Cannot compile on x86_64. The C emitter generates portable code (libc wrappers), but `bootstrap.c` was generated from an older version. Needs regeneration. C emitter now has `emit_c_str()` and `sys/stat.h` include (fixed 2026-03-31c).
 
 ### P2: String dedup across modules
 Duplicate strings in modular compilation create duplicate entries in data segment. Add dedup in the writer (hash string content).

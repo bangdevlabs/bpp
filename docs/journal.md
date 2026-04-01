@@ -1829,3 +1829,187 @@ macOS kernel caches code signing decisions per filesystem path. When a binary at
 - `src/bpp_parser.bsm` — _parse_half_hint, _parse_quarter_hint helpers
 - `src/x86_64/x64_enc.bsm` — MOVSS/CVTSS2SD/CVTSD2SS encoder functions
 - `src/x86_64/x64_elf.bsm` — sys_open flags fix (0x601 → 0x241)
+
+---
+
+## 2026-03-31b — GPU Rendering via Metal + Go-Style Cache
+
+### GPU Rendering (stbrender)
+
+First GPU rendering in B++. Metal backend embedded in `_stb_platform_macos.bsm` (one file per platform). Public API in `stb/stbrender.bsm`.
+
+**Working API:**
+- `render_init()` — creates Metal device, command queue, CAMetalLayer, compiles shader, builds pipeline
+- `render_begin()` — gets drawable, opens render pass with clear color
+- `render_clear(color)` — sets clear color (ARGB packed, same as stbdraw)
+- `render_rect(x, y, w, h, color)` — batched colored rectangle (6 vertices per quad)
+- `render_end()` — flushes batch, presents, frame timing, input polling
+
+**Vertex format:** 8 bytes per vertex (int16 x,y + uint8 r,g,b,a). All integer — no float writes from B++. Shader converts int→float on GPU.
+
+**Shader:** Embedded as string literal, compiled at runtime via `[MTLDevice newLibraryWithSource:options:error:]`. Shader source built with `sb_cat()` + `\n` escape sequences.
+
+**Architecture decision:** GPU code lives IN the platform file. `stbrender.bsm` is platform-agnostic. `_stb_gpu_*` functions are platform implementations.
+
+### String Escape Sequences
+
+`scan_string()` in lexer now processes escape sequences, matching `scan_char()` behavior:
+- `\n` (10), `\t` (9), `\r` (13), `\0` (0)
+- `\\` (92), `\"` (34)
+- `\xHH` (hex byte)
+
+Processed bytes written directly to vbuf; token length reflects decoded output.
+
+### Platform Architecture Refactor
+
+**stbgame imports platform internally.** Game files no longer need `import "_stb_platform.bsm"`. Removed from 4 files. Driver override still works (last-definition-wins).
+
+**Frame timing and input polling extracted from platform files.** Platform only provides raw operations:
+- `_stb_present()` — blit framebuffer (macOS: CoreGraphics, Linux: ANSI)
+- `_stb_gpu_present()` — flush batch + Metal commit
+- `_stb_frame_wait()` — sleep remaining frame budget (macOS: usleep, Linux: nanosleep)
+
+Orchestration moved to agnostic modules:
+- `draw_end()` = `_stb_present()` + `_stb_frame_wait()` + `_input_save_prev()` + `_stb_poll_events()`
+- `render_end()` = `_stb_gpu_present()` + `_stb_frame_wait()` + `_input_save_prev()` + `_stb_poll_events()`
+
+### Go-Style Build Cache
+
+Migrated from per-project `.bpp_cache/` to global `~/.bpp/cache/`. Files named by content hash.
+
+**Old system:**
+- `.bpp_cache/stb_stbgame.bo` (filename = module path)
+- `.bpp_cache/hashes` (text file with manifest + per-module hashes)
+- 3-layer validation (manifest hash + source hash + dependency hashes)
+
+**New system:**
+- `~/.bpp/cache/b7a1df7edb63d9cd.bo` (filename IS the hash)
+- No hashes file needed
+- Validation = file exists (hash encodes source + deps + compiler version)
+- Compiler hash mixed into every module hash (upgrading bpp invalidates all)
+- Shared across projects (stbdraw compiles once, any project reuses)
+
+Added `_getenv("HOME")` (pure B++, reads environ from argv memory), `cache_init()` (creates `~/.bpp/` and `~/.bpp/cache/`), `cache_init_stale()`.
+
+Removed `cache_load()`, `cache_save()`, `cache_manifest_hash()`, `_cache_buf`.
+
+### Other Changes
+
+- `sys_mkdir(path, mode)` builtin: ARM64 (syscall 136), x86_64 (syscall 83), C emitter. Not yet in validator.
+- `init_str()` called by `game_init()` so `sb_new()`/`sb_cat()` work for GPU shader builder.
+- macOS number key mapping: KEY_0–KEY_9 added to `_plt_map_vkey()`.
+- Parser workarounds removed: `_parse_half_hint`, `_parse_quarter_hint`, `_check_next_float` inlined back into `try_type_annotation`. Multi-statement if-blocks confirmed working.
+- `.bo` header version bumped to 3 (no hash data in header, simplified to magic + version + target).
+
+### RESOLVED: "Mach-O Writer Bug" Was Cache Bug
+
+The SIGSEGV when adding functions was NOT a Mach-O writer bug. It was the .bo cache serving stale object files. Root cause: `compiler_self_hash()` only read 8KB of the compiler binary — insufficient to detect code changes past the first few modules.
+
+---
+
+## 2026-03-31c — Cache Fixes + GPU Primitives + Architecture
+
+### Cache Bug Fixes (3 separate bugs)
+
+**Bug 1: compiler_self_hash() read only 8KB.** The compiler binary is ~347KB. Changes to modules compiled after the first 8KB were invisible to the cache. Fix: read entire binary in 8KB chunks, accumulate hash.
+
+**Bug 2: Module 0 (top-level .bpp) not isolated in outbuf.** The modular pipeline used `lex_module(0)` which got the wrong source range because module 0's content is at the END of outbuf (after all imports), not at position 0 where `diag_file_starts[0]` pointed. Fix: track `mod0_real_start` (set after last import), compile module 0 separately after the cache loop using the correct range.
+
+**Bug 3: mod_idx() misattributed module 0 tokens.** The binary search in `mod_idx()` returned the last stb module for tokens belonging to module 0 (because module 0's content is past all other modules in outbuf). This caused the last stb module's .bo to contain module 0's functions and strings. Fix: special case in `mod_idx()` — if `src_off >= mod0_real_start`, return 0.
+
+**Bug 4: lex_module for last module included module 0 content.** `lex_module(mk-1)` lexed from `starts[mk-1]` to `src_len`, which included module 0's code at the end. Fix: stop at `mod0_real_start` instead of `src_len`.
+
+### Validator Updates
+
+Registered `sys_mkdir` and `putchar_err` as builtins in `bpp_validate.bsm`. C backend compilation no longer fails on these.
+
+### C Emitter Fixes
+
+- `emit_c_str()`: re-escapes `\n`, `\t`, `\r`, `\0`, `\\`, `\"` in string literals. The lexer now processes escape sequences into raw bytes, so the C emitter must re-escape them for valid C output.
+- Added `#include <sys/stat.h>` for `mkdir()` in the C runtime.
+
+### GPU Render API Expansion
+
+Added to `stbrender.bsm` (platform-agnostic, uses `_stb_gpu_vertex` + `_stb_gpu_rect`):
+- `render_line(x0, y0, x1, y1, color)` — axis-aligned as 1px rect, diagonal as thin quad
+- `render_circle(cx, cy, radius, color)` — triangle fan, 32 segments
+- `render_circle_outline(cx, cy, radius, color)` — line segments
+- `render_rect_outline(x, y, w, h, color)` — 4 lines
+
+### Trigonometry Moved to stbmath.bsm
+
+Fixed-point cos/sin table (32 segments, ×1024) moved from `_stb_platform_macos.bsm` to `stbmath.bsm`. Functions `math_cos(i)` and `math_sin(i)` are platform-agnostic. Geometry functions in stbrender use these instead of per-backend trig tables. `math_trig_init()` called by `game_init()`.
+
+Removed `_stb_gpu_line`, `_stb_gpu_circle`, `_stb_gpu_circle_outline` from macOS backend. Backend now only provides raw primitives: `_stb_gpu_vertex`, `_stb_gpu_rect`, `_stb_gpu_clear`, `_stb_gpu_begin`, `_stb_gpu_present`.
+
+### Architecture Decision: GPU Philosophy
+
+GPU rendering is native per platform via codegen/FFI. No third-party APIs (no SDL, no GLFW).
+- macOS ARM64: Metal via objc_msgSend (DONE)
+- Linux x86_64: Vulkan via libvulkan.so FFI (PLANNED)
+- Windows x86_64: DirectX 12 or Vulkan (FUTURE)
+
+`stbrender.bsm` is identical on all platforms. Backend primitives (`_stb_gpu_*`) are platform-specific.
+
+### Verification
+
+| Test | Result |
+|------|--------|
+| Bootstrap convergence (gen2=gen3) | PASS |
+| Cache: different programs get correct strings | PASS (rect→circle→rect) |
+| Cache: no manual clearing needed | PASS |
+| test_hello (no imports) | PASS |
+| test_gpu_circle (filled circle) | PASS |
+| test_gpu_shapes (lines, circles, outlines, rects) | PASS |
+| test_gpu_rect (WASD movement) | PASS |
+
+### Files Changed
+
+- `src/bpp_import.bsm` — compiler_self_hash reads full binary, mod0_real_start tracking, mod_idx special case for module 0
+- `src/bpp_lexer.bsm` — lex_module stops at mod0_real_start for last module
+- `src/bpp_validate.bsm` — sys_mkdir + putchar_err registered
+- `src/bpp_emitter.bsm` — emit_c_str, sys/stat.h include
+- `src/bpp.bpp` — module 0 compiled separately after cache loop
+- `stb/stbmath.bsm` — math_cos/math_sin, fixed-point trig table
+- `stb/stbgame.bsm` — math_trig_init() in game_init
+- `stb/stbrender.bsm` — render_line, render_circle, render_circle_outline, render_rect_outline
+- `stb/_stb_platform_macos.bsm` — removed geometry functions (line/circle/outline)
+- `tests/test_gpu_shapes.bpp` — NEW: visual test for all render primitives
+- `tests/test_gpu_circle.bpp` — NEW: minimal circle test
+
+### Verification
+
+| Test | Result |
+|------|--------|
+| ARM64 bootstrap convergence | PASS (SHA 88a5a9da) |
+| Parser workaround removal | PASS (half float, quarter float) |
+| String escape sequences | PASS (\n, \t, \xHH, \\, \") |
+| GPU clear (Metal) | PASS (color switching 1-6) |
+| GPU rectangles (Metal) | PASS (5 rects + WASD movement) |
+| snake_native (software) | PASS |
+| SDL/raylib examples | Compile OK |
+| Linux cross-compile (6 tests) | PASS |
+| C emitter output | PASS |
+| Go-style cache location | PASS (~/.bpp/cache/) |
+| Cache invalidation | PASS (hash changes on source edit) |
+| 13 unit tests | PASS |
+
+### Files Changed
+
+- `src/bpp_lexer.bsm` — escape sequences in scan_string, _hex_val helper
+- `src/bpp_parser.bsm` — removed workaround helpers, inlined half/quarter parsing
+- `src/bpp_import.bsm` — _getenv, cache_init, cache_init_stale, compiler hash in deps, removed cache_load/cache_save/cache_manifest_hash
+- `src/bpp_bo.bsm` — hash-based bo_make_path, v3 header, _bo_init_hex
+- `src/bpp_emitter.bsm` — sys_mkdir builtin + runtime
+- `src/bpp_validate.bsm` — (needs sys_mkdir registration, TODO)
+- `src/aarch64/a64_codegen.bsm` — sys_mkdir builtin
+- `src/x86_64/x64_codegen.bsm` — sys_mkdir builtin
+- `src/bpp.bpp` — cache_init, _bo_init_hex, removed cache_save
+- `stb/stbgame.bsm` — imports _stb_platform + stbstr, init_str in game_init
+- `stb/stbdraw.bsm` — draw_end orchestrates present+wait+poll
+- `stb/stbrender.bsm` — NEW: GPU rendering public API
+- `stb/_stb_platform_macos.bsm` — Metal GPU backend, _stb_frame_wait, number keys, removeFromSuperview fix
+- `stb/_stb_platform_linux.bsm` — _stb_frame_wait extracted
+- `tests/test_gpu_clear.bpp` — NEW: GPU clear with color switching
+- `tests/test_gpu_rect.bpp` — NEW: GPU rectangles with movement
+- `tests/test_escape.bpp` — NEW: escape sequence validation
