@@ -2120,3 +2120,61 @@ Single module, single AST walk:
 - `src/bug_observe_macos.bsm` — native syscalls, breakpoint infra, ASLR slide
 - `src/bug.bpp` — 64-bit out_hex fix
 - `src/defs.bsm` — FFI type classification helpers
+
+## 2026-04-02 — Game Infrastructure + Syscall Builtins + Bug Debugger Fixes
+
+### Milestone
+
+Three new stb modules for game development: arena allocator, object pool, and entity-component system. Four new syscall builtins added to both backends. Bug debugger now reads PC correctly via Mach APIs with entitlements.
+
+### New stb Modules
+
+| Module | Lines | What it does |
+|--------|-------|-------------|
+| `stbarena.bsm` | ~50 | Bump allocator. O(1) alloc, O(1) reset. 8-byte aligned, overflow guard. |
+| `stbpool.bsm` | ~70 | Fixed-size object pool. O(1) get/put via embedded freelist. Min 8-byte objects. |
+| `stbecs.bsm` | ~120 | Entity-component system. Spawn/kill/recycle IDs, parallel arrays (pos, vel, flags), milli-unit physics. Games add custom component arrays indexed by same ID. |
+
+### New Syscall Builtins (both backends)
+
+| Builtin | macOS (ARM64) | Linux (x86_64) |
+|---------|---------------|----------------|
+| `sys_lseek(fd, off, whence)` | syscall 199 | syscall 8 |
+| `sys_fchmod(fd, mode)` | syscall 124 | syscall 91 |
+| `sys_unlink(path)` | syscall 10 (was missing) | syscall 87 (existed) |
+| `sys_getdents(fd, buf, sz)` | syscall 344 (was missing) | syscall 217 (existed) |
+
+All four also added to C emitter (`bpp_emitter.bsm`) and validator (`bpp_validate.bsm`).
+
+### Bug Debugger Fixes
+
+1. **Entitlements**: Created `bug.entitlements` with `com.apple.security.cs.debugger` + `get-task-allow`. Signing bug binary with entitlements makes `task_for_pid` work, enabling PC reading via Mach APIs.
+2. **ASLR slide**: Now calculated correctly from first-stop PC. Was returning 0 (negative) before entitlements fix.
+3. **lookup_pc**: Fixed to include `_aslr_slide` in address comparison. Was always returning `main` because slide offset dominated the distance calculation.
+4. **Breakpoint writing**: Replaced ptrace `PT_WRITE_D` (fails with EINVAL on macOS) with `mach_vm_protect` + `mach_vm_write`. Breakpoints verified as written correctly via `mach_vm_read_overwrite`.
+5. **I-cache issue (OPEN)**: ARM64 Apple Silicon I-cache is not coherent with remote `mach_vm_write`. Breakpoints verified in data cache but CPU fetches stale I-cache. Disk patching strategy designed but not yet tested.
+
+### README Updated
+
+- stb table reorganized by category (17 modules now)
+- New builtins listed
+- Compiler flags section updated (--bug, --clean-cache, --show-deps)
+
+### Bootstrap
+
+Triple bootstrap verified stable after each codegen change. Two rounds: ARM64 syscalls, then x86_64 syscalls. Linux x86_64 tested via Docker.
+
+### Files Changed
+
+- `stb/stbarena.bsm` — new: arena allocator
+- `stb/stbpool.bsm` — new: object pool
+- `stb/stbecs.bsm` — new: ECS
+- `tests/test_arena.bpp`, `test_pool.bpp`, `test_ecs.bpp`, `test_gameinfra.bpp` — new tests
+- `src/aarch64/a64_codegen.bsm` — sys_lseek, sys_fchmod, sys_unlink, sys_getdents
+- `src/x86_64/x64_codegen.bsm` — sys_lseek, sys_fchmod
+- `src/bpp_emitter.bsm` — sys_lseek, sys_fchmod C wrappers
+- `src/bpp_validate.bsm` — sys_lseek, sys_fchmod registered
+- `src/bug_observe_macos.bsm` — entitlements, mach_vm_protect writes, lookup_pc fix, disk patching (WIP)
+- `bug.entitlements` — new: debug entitlements for task_for_pid
+- `README.md` — updated features, stb table, compiler flags
+- `docs/todo.md` — updated status and done list

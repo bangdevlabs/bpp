@@ -1,8 +1,8 @@
 # B++ Roadmap
 
-## Status: 2026-04-01
+## Status: 2026-04-02
 
-GPU rendering working (Metal macOS). Go-style modular cache with per-program isolation. Native debugger (`bug`) integrated. Type system: Base×Slice with FLOAT_H/Q codegen. Two backends (ARM64 + x86_64). `buf[i]` and `for` loop syntax sugar.
+GPU rendering working (Metal macOS). Go-style modular cache with per-program isolation. Native debugger (`bug`) integrated. Game infrastructure (arena, pool, ECS). Type system: Base×Slice with FLOAT_H/Q codegen. Two backends (ARM64 + x86_64). `buf[i]` and `for` loop syntax sugar. 17 stb modules.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -135,3 +135,9 @@ Duplicate strings in modular compilation create duplicate entries in data segmen
 - Compiler diagnostics: E001-E201, W001-W011, Clang-style source+caret (2026-03-24+)
 - putchar_err builtin (2026-03-31)
 - Packed struct fields with sub-word load/store (2026-03-27)
+- stbarena: generic bump allocator, 8-byte aligned, overflow guard (2026-04-02)
+- stbpool: fixed-size object pool, O(1) freelist get/put (2026-04-02)
+- stbecs: entity-component system, milli-unit physics, ID recycling (2026-04-02)
+- sys_lseek + sys_fchmod builtins, both backends + C emitter (2026-04-02)
+- sys_unlink + sys_getdents added to ARM64 (were x86_64-only) (2026-04-02)
+- Bug debugger: entitlements fix, ASLR slide fix, lookup_pc fix (2026-04-02)

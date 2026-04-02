@@ -1,8 +1,8 @@
 # B++
 
-### Structural Overhaul: Cache Fix + sys_fork + Bug Debugger — 1 April 2026
+### Game Infrastructure: Arena + Pool + ECS — 2 April 2026
 
-Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache (per-program isolation, cascading invalidation), native debugger (`bug`), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache (per-program isolation, cascading invalidation), native debugger (`bug`), game infrastructure (arena allocator, object pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
 
 ---
 
@@ -18,14 +18,12 @@ A language with the soul of B — every value is a word, no type declarations, n
 
 And a standard library that is, itself, a game engine.
 
-## Latest (1 April 2026)
+## Latest (2 April 2026)
 
+- **Game infrastructure**: `stbarena` (bump allocator, 8-byte aligned, overflow guard), `stbpool` (fixed-size object pool, O(1) freelist), `stbecs` (entity-component system with milli-unit physics, ID recycling, parallel arrays).
 - **Cache fixed for real**: Go-style modular cache with per-program isolation. Explicit inter-module imports create a real dependency graph. Changing one module auto-invalidates all dependents. `--clean-cache` to wipe.
-- **sys_fork works on macOS ARM64**: Correct child process detection (`cbz x1` with proper encoder labels).
-- **New syscall builtins**: `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` on both ARM64 and x86_64.
 - **Bug debugger integrated**: `--bug` flag emits `.bug` debug maps. `bug` program launches/observes/crash-reports target processes.
-- **Unified validation**: Type checker (Layer 2 hint checks) merged into validate pass. One module, one AST walk.
-- **FFI type helpers**: `ffi_is_ptr()`, `ffi_is_float()`, etc. in defs.bsm for future auto-marshalling.
+- **New syscall builtins**: `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` on both ARM64 and x86_64.
 
 ## The Language
 
@@ -90,7 +88,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **else if** — chains without extra braces
 - **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
 - **String escape sequences** — `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\xHH` in string literals
-- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `sys_mkdir()`, `float_ret()`/`float_ret2()`
+- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `sys_mkdir()`, `sys_ptrace()`, `sys_wait4()`, `sys_getdents()`, `sys_unlink()`, `float_ret()`/`float_ret2()`
+- **Native debugger** — `--bug` flag emits `.bug` debug maps, `bug` program observes running processes
 - **Modular compilation** — Go-model per-module codegen with content-addressed .bo cache at `~/.bpp/cache/`
 - **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
 - **Module dependency tracking** — content + dependency + compiler hashing, topological sort (`--show-deps`)
@@ -106,23 +105,59 @@ You write code. You compile it. You run it.
 
 stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++.
 
+**Rendering:**
+
 | Module | What it does |
 |--------|-------------|
 | `stbdraw` | Software framebuffer rendering — rects, circles, lines, sprites, text |
-| `stbinput` | Keyboard and mouse input from memory arrays |
-| `stbgame` | Game loop — init, frame timing, quit |
+| `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines (Metal) |
 | `stbfont` | 8×8 bitmap font for text rendering |
-| `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines |
+
+**Game loop & input:**
+
+| Module | What it does |
+|--------|-------------|
+| `stbgame` | Game loop — init, frame timing, quit |
+| `stbinput` | Keyboard and mouse input from memory arrays |
+| `stbui` | Immediate-mode UI widgets with per-frame arena |
+
+**Math & physics:**
+
+| Module | What it does |
+|--------|-------------|
 | `stbmath` | Vec2, PRNG, abs, min, max, clamp, fixed-point trig (cos/sin) |
+| `stbcol` | Collision detection (AABB, circles) |
+
+**Data structures:**
+
+| Module | What it does |
+|--------|-------------|
 | `stbarray` | Dynamic arrays with shadow header |
 | `stbstr` | String operations and growable string builder |
 | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
-| `stbfile` | File I/O — read and write entire files |
-| `stbui` | Immediate-mode UI widgets |
-| `stbcol` | Collision detection (AABB, circles) |
-| `stbio` | Console I/O (print_int, print_msg) |
 
-New in stb: GPU rendering via Metal (stbrender), fixed-point trigonometry (stbmath), mouse tracking on macOS (float_ret for NSPoint), window close detection, `blend_px()` for alpha blending, `file_write_all()` for saving files, `mouse_pressed()`/`mouse_released()` with edge detection.
+**Game infrastructure:**
+
+| Module | What it does |
+|--------|-------------|
+| `stbarena` | Generic bump allocator — O(1) alloc, O(1) reset, 8-byte aligned |
+| `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
+| `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics |
+
+**I/O & assets:**
+
+| Module | What it does |
+|--------|-------------|
+| `stbfile` | File I/O — read and write entire files |
+| `stbio` | Console I/O (print_int, print_msg) |
+| `stbimage` | Image loading (PNG, JPEG, BMP) via stb_image FFI |
+
+**Platform layers** (internal, selected automatically):
+
+| Module | What it does |
+|--------|-------------|
+| `_stb_platform_macos` | Cocoa window, Metal GPU, CoreGraphics software, keyboard/mouse |
+| `_stb_platform_linux` | Terminal ANSI rendering, keyboard input |
 
 Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan on Linux). Same game code — just swap `draw_end()` for `render_end()`.
 
@@ -240,7 +275,7 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/              — Compiler core (12 B++ modules, self-hosting)
+├── src/              — Compiler core (16 B++ modules, self-hosting)
 │   ├── aarch64/      — ARM64 backend (encoder, codegen, Mach-O writer)
 │   └── x86_64/       — x86_64 backend (encoder, codegen, ELF writer)
 ├── stb/              — Standard B Library (pure B++, the game engine)
@@ -282,11 +317,14 @@ native ARM64 Mach-O binaries with built-in SHA-256 codesigning.
 ```
 bpp source.bpp -o binary       # native ARM64 macOS (default)
 bpp --linux64 src.bpp -o bin   # cross-compile to x86_64 Linux ELF
+bpp --bug source.bpp -o bin    # emit .bug debug map alongside binary
 bpp --c source.bpp              # emit C (for debugging)
 bpp --asm source.bpp            # emit ARM64 assembly
+bpp --show-deps source.bpp     # print module dependency graph
+bpp --clean-cache              # delete all cached .bo files
 ```
 
-17 modules, ~11,000 lines of B++. Self-hosting verified at every stage. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
+16 compiler modules + 17 stb library modules, ~13,000 lines of B++. Self-hosting verified at every stage. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
 
 ## Contributing
 
@@ -357,9 +395,9 @@ SOFTWARE.
 
 *Type System Refactor: base × slice grid, f32/f16 support, orthogonal type composition on March 27, 2026.*
 
-*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
-
 *.bo cache fix, compiler self-hash on March 30, 2026.*
+
+*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
 
 *GPU rendering via Metal, Go-style cache, string escape sequences on March 31, 2026.*
 
@@ -367,6 +405,8 @@ SOFTWARE.
 
 *Syntax Sugar + Codebase Cleanup on April 1, 2026.*
 
-*Cache Fix, sys_fork, Bug Debugger, Structural Overhaul on April 2, 2026*
+*Cache Fix, sys_fork, Bug Debugger, Structural Overhaul on April 1, 2026.*
+
+*Game Infrastructure: Arena allocator, Object Pool, Entity-Component System, Syscall Builtins, Bug Debugger Fixes on April 2, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*
