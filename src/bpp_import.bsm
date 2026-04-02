@@ -2,6 +2,10 @@
 // Reads a B++ source file, recursively resolves import "file.bpp" directives,
 // and writes the merged source into outbuf for the lexer to consume.
 
+import "defs.bsm";
+import "stbarray.bsm";
+import "bpp_internal.bsm";
+
 // ── State ────────────────────────────────────────────────────
 
 auto fbuf;          // File read buffer (256KB), used as a stack.
@@ -299,6 +303,28 @@ cache_init() {
     return 0;
 }
 
+// Delete all .bo files in the cache directory by removing and recreating it.
+// Uses sys_fork + sys_execve to run /bin/rm -rf on the cache directory.
+cache_clean() {
+    auto pid, argv;
+    if (_cache_dir == 0) { return 0; }
+    pid = sys_fork();
+    if (pid == 0) {
+        argv = malloc(32);
+        *(argv + 0) = "/bin/rm";
+        *(argv + 8) = "-rf";
+        *(argv + 16) = _cache_dir;
+        *(argv + 24) = 0;
+        sys_execve("/bin/rm", argv, 0);
+        sys_exit(1);
+    }
+    sys_waitpid(pid);
+    sys_mkdir(_cache_dir, 493);
+    diag_str("cache cleaned");
+    diag_newline();
+    return 0;
+}
+
 // Initialize mod_stale: all modules start as clean (0) except module 0.
 // Module 0 is the top-level .bpp file which changes between programs,
 // so it must always be recompiled from source (never cached).
@@ -319,14 +345,20 @@ cache_init_stale() {
 // After this, cache_load() can detect any change in the dependency chain
 // by comparing a single hash per module. No separate propagation step needed.
 hash_with_deps() {
-    auto i, j, mi, h, ch;
+    auto i, j, mi, h, ch, main_h;
     // Mix compiler binary hash into every module so upgrading bpp invalidates all.
     ch = compiler_self_hash();
     if (ch == 0) { ch = 0xcbf29ce484222325; }
+    // Mix main file hash (module 0) into every module so different programs
+    // using the same .bsm files get separate cache entries. Without this,
+    // compiling bug.bpp pollutes the cache for hello.bpp.
+    main_h = arr_get(mod_hashes, 0);
     for (i = 0; i < arr_len(mod_topo); i = i + 1) {
         mi = arr_get(mod_topo, i);
         h = arr_get(mod_hashes, mi);
         h = h ^ ch;
+        h = h * 0x100000001b3;
+        h = h ^ main_h;
         h = h * 0x100000001b3;
         // Mix in the combined hash of each module that mi imports.
         for (j = 0; j < arr_len(dep_from); j = j + 1) {

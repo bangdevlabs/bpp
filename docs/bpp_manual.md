@@ -445,11 +445,16 @@ These names are recognized by the compiler and emit special code:
 | `sys_read(fd, buf, len)` | Raw read syscall |
 | `sys_open(path, flags)` | Raw open syscall |
 | `sys_close(fd)` | Raw close syscall |
-| `sys_fork()` | Fork process |
+| `sys_fork()` | Fork process (macOS: returns 0 in child) |
 | `sys_execve(path, argv, envp)` | Replace process image |
-| `sys_waitpid(pid)` | Wait for child process |
+| `sys_waitpid(pid)` | Wait for child process (1 arg, status=NULL) |
+| `sys_wait4(pid, status, opts, rusage)` | Wait with full control (4 args) |
 | `sys_exit(code)` | Terminate process |
 | `sys_ioctl(fd, req, arg)` | Device control |
+| `sys_ptrace(req, pid, addr, data)` | Process trace (debug) |
+| `sys_getdents(fd, buf, size)` | Read directory entries |
+| `sys_unlink(path)` | Delete a file |
+| `sys_mkdir(path, mode)` | Create a directory |
 | `sys_nanosleep(req, rem)` | Sleep (Linux) |
 | `sys_clock_gettime(id, tp)` | Clock read (Linux) |
 | `float_ret()` | Read saved first float return register (d0/xmm0) from last extern call |

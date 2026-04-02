@@ -1,0 +1,476 @@
+// bug_observe_macos.bsm -- macOS process observation for the bug debugger.
+// Launches a target binary, monitors execution via ptrace and Mach APIs,
+// and reports crashes with source-level function names from the .bug map.
+
+import "stbarray.bsm";
+import "stbbuf.bsm";
+
+import "System.B" {
+    int task_for_pid(int, int, ptr);
+    int task_threads(int, ptr, ptr);
+    int thread_get_state(int, int, ptr, ptr);
+    int mach_vm_read_overwrite(int, long, long, ptr, ptr);
+    int mach_vm_write(int, long, ptr, int);
+    int mach_vm_protect(int, long, long, int, int);
+    ptr dlopen(char*, int);
+    ptr dlsym(ptr, char*);
+}
+
+// -- Constants ------------------------------------------------
+
+auto PT_TRACE_ME, PT_CONTINUE, PT_STEP, PT_KILL;
+auto SIGTRAP, SIGSEGV, SIGBUS, SIGABRT;
+auto ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT;
+
+// Mach task self port (read via dlsym, not a function call).
+auto _mach_self;
+
+init_observe() {
+    PT_TRACE_ME = 0;
+    PT_CONTINUE = 7;
+    PT_STEP = 9;
+    PT_KILL = 8;
+    SIGTRAP = 5;
+    SIGSEGV = 11;
+    SIGBUS = 10;
+    SIGABRT = 6;
+    ARM_THREAD_STATE64 = 6;
+    ARM_THREAD_STATE64_COUNT = 68;
+
+    // mach_task_self_ is a global variable in libSystem, not a function.
+    // Read its value via dlsym.
+    auto lib, sym;
+    lib = dlopen(0, 2);
+    sym = dlsym(lib, "mach_task_self_");
+    _mach_self = *(sym) & 0xFFFFFFFF;
+    return 0;
+}
+
+// -- Mach-O parsing -------------------------------------------
+
+auto _mo_text_addr;
+auto _mo_text_vmaddr;   // VA of __TEXT segment (base for ASLR slide calc)
+auto _mo_entry_off;     // entryoff from LC_MAIN
+auto _aslr_slide;       // runtime ASLR slide
+
+// Read a little-endian u32 from a buffer.
+_rd32(buf, off) {
+    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8) | ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
+}
+
+// Read a little-endian u64 from a buffer.
+_rd64(buf, off) {
+    auto lo, hi;
+    lo = _rd32(buf, off);
+    hi = _rd32(buf, off + 4);
+    return lo | (hi << 32);
+}
+
+// Parse a Mach-O file to extract the __text section virtual address.
+parse_macho_header(path) {
+    auto fd, buf, nread, ncmds, i, cmd, cmdsize, pos;
+    auto nsects, si, sp;
+
+    buf = malloc(8192);
+    fd = sys_open(path, 0);
+    if (fd < 0) { free(buf); return 0 - 1; }
+    nread = sys_read(fd, buf, 8192);
+    sys_close(fd);
+    if (nread < 64) { free(buf); return 0 - 1; }
+
+    if (_rd32(buf, 0) != 0xFEEDFACF) { free(buf); return 0 - 1; }
+
+    ncmds = _rd32(buf, 16);
+    pos = 32;
+    _mo_text_addr = 0;
+    _mo_text_vmaddr = 0;
+    _mo_entry_off = 0;
+
+    for (i = 0; i < ncmds; i = i + 1) {
+        if (pos + 8 > nread) { free(buf); return 0; }
+        cmd = _rd32(buf, pos);
+        cmdsize = _rd32(buf, pos + 4);
+
+        // LC_MAIN = 0x80000028. Extract entryoff.
+        if (cmd == 0x80000028) {
+            _mo_entry_off = _rd64(buf, pos + 8);
+        }
+
+        // LC_SEGMENT_64 = 0x19.
+        if (cmd == 0x19) {
+            if (peek(buf+pos+8) == '_') {
+                if (peek(buf+pos+10) == 'T') {
+                    // __TEXT segment. Record vmaddr for ASLR slide calculation.
+                    _mo_text_vmaddr = _rd64(buf, pos + 24);
+                    nsects = _rd32(buf, pos + 64);
+                    sp = pos + 72;
+                    for (si = 0; si < nsects; si = si + 1) {
+                        if (peek(buf+sp) == '_') {
+                            if (peek(buf+sp+2) == 't') {
+                                if (peek(buf+sp+3) == 'e') {
+                                    _mo_text_addr = _rd64(buf, sp + 32);
+                                }
+                            }
+                        }
+                        sp = sp + 80;
+                    }
+                }
+            }
+        }
+        pos = pos + cmdsize;
+    }
+
+    free(buf);
+    return 0;
+}
+
+// -- Register reading -----------------------------------------
+
+auto _thread_state, _task_buf, _tlist_buf, _tcnt_buf;
+
+// Read the program counter of a stopped traced child.
+read_pc(pid) {
+    auto task, tlist, tcnt, kr, pc, thread0;
+
+    // Get task port via task_for_pid.
+    poke(_task_buf, 0); poke(_task_buf+1, 0); poke(_task_buf+2, 0); poke(_task_buf+3, 0);
+    kr = task_for_pid(_mach_self, pid, _task_buf);
+    if (kr != 0) { return 0; }
+    task = _rd32(_task_buf, 0);
+    if (task == 0) { return 0; }
+
+    // Get thread list.
+    poke(_tlist_buf, 0); poke(_tlist_buf+1, 0); poke(_tlist_buf+2, 0); poke(_tlist_buf+3, 0);
+    poke(_tlist_buf+4, 0); poke(_tlist_buf+5, 0); poke(_tlist_buf+6, 0); poke(_tlist_buf+7, 0);
+    poke(_tcnt_buf, 0); poke(_tcnt_buf+1, 0); poke(_tcnt_buf+2, 0); poke(_tcnt_buf+3, 0);
+    kr = task_threads(task, _tlist_buf, _tcnt_buf);
+    if (kr != 0) { return 0; }
+    tlist = *(_tlist_buf);
+    tcnt = _rd32(_tcnt_buf, 0);
+    if (tcnt == 0) { return 0; }
+
+    // Read thread port (mach_port_t = 4 bytes) from the thread list.
+    thread0 = _rd32(tlist, 0);
+
+    // Set count to ARM_THREAD_STATE64_COUNT (32-bit).
+    poke(_tcnt_buf, ARM_THREAD_STATE64_COUNT & 0xFF);
+    poke(_tcnt_buf+1, 0); poke(_tcnt_buf+2, 0); poke(_tcnt_buf+3, 0);
+    poke(_tcnt_buf+4, 0); poke(_tcnt_buf+5, 0); poke(_tcnt_buf+6, 0); poke(_tcnt_buf+7, 0);
+
+    kr = thread_get_state(thread0, ARM_THREAD_STATE64, _thread_state, _tcnt_buf);
+    if (kr != 0) { return 0; }
+
+    // PC is at offset 256 in ARM64 thread state (x0-x28, fp, lr, sp, pc).
+    pc = *(_thread_state + 256);
+    return pc;
+}
+
+// -- Address map lookup ---------------------------------------
+
+// Look up which address map entry contains the given PC.
+// Returns the index into bug_am_name/bug_am_off, or -1 if not found.
+lookup_pc(pc) {
+    auto i, off, best_idx, best_dist, dist;
+    best_idx = 0 - 1;
+    best_dist = 0x7FFFFFFFFFFFFFFF;
+
+    for (i = 0; i < bug_am_count; i = i + 1) {
+        off = arr_get(bug_am_off, i);
+        dist = pc - (_mo_text_addr + off);
+        if (dist >= 0) {
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = i;
+            }
+        }
+    }
+    return best_idx;
+}
+
+// -- Breakpoint management ------------------------------------
+
+// Breakpoint state: parallel arrays of address and saved instruction.
+auto _bp_addrs;     // virtual addresses where BRK was written
+auto _bp_saved;     // original 4-byte instructions at those addresses
+auto _bp_count;     // number of active breakpoints
+auto _bp_task;      // Mach task port of target process
+auto _bp_pid;       // pid of target process (for ptrace read/write)
+
+// BRK #0 instruction (ARM64): causes SIGTRAP when executed.
+auto BRK_INSN;
+
+// Initialize breakpoint arrays.
+_bp_init() {
+    _bp_addrs = arr_new();
+    _bp_saved = arr_new();
+    _bp_count = 0;
+    BRK_INSN = 0xD4200000;
+    return 0;
+}
+
+// Get Mach task port for a pid. Stores in _bp_task.
+_bp_attach(pid) {
+    auto kr;
+    poke(_task_buf, 0); poke(_task_buf+1, 0); poke(_task_buf+2, 0); poke(_task_buf+3, 0);
+    kr = task_for_pid(_mach_self, pid, _task_buf);
+    _bp_task = read_u32(_task_buf, 0);
+    return kr;
+}
+
+// Read 4 bytes from target process memory via Mach API.
+_bp_read4(addr) {
+    auto buf, out_sz, kr, val;
+    buf = malloc(16);
+    out_sz = malloc(16);
+    *(out_sz) = 8;
+    kr = mach_vm_read_overwrite(_bp_task, addr, 4, buf, out_sz);
+    val = read_u32(buf, 0);
+    free(buf);
+    free(out_sz);
+    return val;
+}
+
+// Write 4 bytes to target process memory via ptrace POKEDATA.
+// PT_WRITE_D = 5 on macOS. The data is passed as the 4th argument.
+_bp_write4(addr, val) {
+    auto kr;
+    kr = sys_ptrace(5, _bp_pid, addr, val);
+    if (kr != 0) {
+        out_str("bug: ptrace write err=");
+        out_int(kr);
+        out_str(" pid=");
+        out_int(_bp_pid);
+        out_nl();
+    }
+    return kr;
+}
+
+// Set a breakpoint at the given virtual address.
+_bp_set(addr) {
+    auto orig;
+    orig = _bp_read4(addr);
+    _bp_addrs = arr_push(_bp_addrs, addr);
+    _bp_saved = arr_push(_bp_saved, orig);
+    _bp_write4(addr, BRK_INSN);
+    _bp_count = _bp_count + 1;
+    // Debug: print first breakpoint details.
+    if (_bp_count == 1) {
+        out_str("bug: bp0 addr=");
+        out_hex(addr);
+        out_str(" orig=");
+        out_hex(orig);
+        out_str(" brk=");
+        out_hex(BRK_INSN);
+        out_nl();
+    }
+    return 0;
+}
+
+// Find breakpoint index by address. Returns -1 if not found.
+_bp_find(addr) {
+    auto i;
+    for (i = 0; i < _bp_count; i = i + 1) {
+        if (arr_get(_bp_addrs, i) == addr) { return i; }
+    }
+    return 0 - 1;
+}
+
+// Set breakpoints at all function entry points from the address map.
+_bp_set_all() {
+    auto i, addr;
+    for (i = 0; i < bug_am_count; i = i + 1) {
+        addr = _mo_text_addr + arr_get(bug_am_off, i) + _aslr_slide;
+        _bp_set(addr);
+    }
+    out_str("bug: ");
+    out_int(_bp_count);
+    out_str(" breakpoints set");
+    out_nl();
+    return 0;
+}
+
+// -- Process launcher -----------------------------------------
+
+build_argv(start_idx, argc) {
+    auto argv, i, cnt;
+    cnt = argc - start_idx;
+    argv = malloc((cnt + 1) * 8);
+    for (i = 0; i < cnt; i = i + 1) {
+        argv[i] = argv_get(start_idx + i);
+    }
+    argv[cnt] = 0;
+    return argv;
+}
+
+bug_run(target_path, start_idx, argc) {
+    auto pid, status, sig, exit_code, pc, fi;
+    auto stopped, first_stop, argv, lcnt, lnames, li;
+
+    // Allocate buffers for Mach API calls.
+    _thread_state = malloc(512);
+    _task_buf = malloc(16);
+    _tlist_buf = malloc(16);
+    _tcnt_buf = malloc(16);
+
+    // Parse the Mach-O header to get __text section address.
+    if (parse_macho_header(target_path) < 0) {
+        out_str("bug: warning: cannot parse Mach-O header");
+        out_nl();
+    }
+
+    _bp_init();
+
+    pid = sys_fork();
+    if (pid < 0) {
+        out_str("bug: fork failed");
+        out_nl();
+        return 1;
+    }
+
+    if (pid == 0) {
+        sys_ptrace(PT_TRACE_ME, 0, 0, 0);
+        argv = build_argv(start_idx, argc);
+        sys_execve(target_path, argv, 0);
+        sys_exit(127);
+    }
+
+    out_str("bug: observing pid ");
+    out_int(pid);
+    out_str(" (");
+    out_int(bug_fn_count);
+    out_str(" functions mapped)");
+    out_nl();
+
+    status = malloc(8);
+    first_stop = 1;
+    stopped = 1;
+
+    while (stopped) {
+        sys_wait4(pid, status, 0, 0);
+        sig = *status & 0xFFFF;
+
+        if ((sig & 0x7F) == 0) {
+            exit_code = (sig >> 8) & 0xFF;
+            out_str("bug: process exited with code ");
+            out_int(exit_code);
+            out_nl();
+            stopped = 0;
+        } else if ((sig & 0x7F) == 0x7F) {
+            sig = (sig >> 8) & 0xFF;
+
+            if (sig == SIGTRAP) {
+                if (first_stop) {
+                    // First stop after exec: calculate ASLR slide from PC.
+                    first_stop = 0;
+                    _bp_pid = pid;
+                    _bp_attach(pid);
+                    pc = read_pc(pid);
+                    // The first stop PC is at the entry point (dyld or main).
+                    // slide = actual_PC - (text_vmaddr + entry_off)
+                    _aslr_slide = pc - (_mo_text_vmaddr + _mo_entry_off);
+                    out_str("bug: slide=");
+                    out_hex(_aslr_slide);
+                    out_nl();
+                    _bp_set_all();
+                    sys_ptrace(PT_CONTINUE, pid, 1, 0);
+                } else {
+                    // Breakpoint hit: PC is 4 bytes PAST the BRK instruction.
+                    pc = read_pc(pid);
+                    if (pc != 0) {
+                        auto bp_addr, bp_idx;
+                        bp_addr = pc - 4;
+                        bp_idx = _bp_find(bp_addr);
+                        if (bp_idx >= 0) {
+                            fi = lookup_pc(bp_addr);
+                            if (fi >= 0) {
+                                out_str("-> ");
+                                out_packed(arr_get(bug_am_name, fi));
+                                out_str("()");
+                                out_nl();
+                            }
+                            // Restore original instruction, single-step, re-set breakpoint.
+                            _bp_write4(bp_addr, arr_get(_bp_saved, bp_idx));
+                            // TODO: rewind PC by 4 so the original instruction executes.
+                            // For now, just continue (may skip the first instruction).
+                            sys_ptrace(PT_CONTINUE, pid, 1, 0);
+                        } else {
+                            // Unknown trap — just continue.
+                            sys_ptrace(PT_CONTINUE, pid, 1, 0);
+                        }
+                    } else {
+                        sys_ptrace(PT_CONTINUE, pid, 1, 0);
+                    }
+                }
+            } else {
+                // Fatal signal.
+                pc = read_pc(pid);
+                out_nl();
+                out_str("=== CRASH REPORT ===");
+                out_nl();
+                out_str("signal: ");
+                if (sig == SIGSEGV) { out_str("SIGSEGV (segmentation fault)"); }
+                else if (sig == SIGBUS) { out_str("SIGBUS (bus error)"); }
+                else if (sig == SIGABRT) { out_str("SIGABRT (abort)"); }
+                else { out_str("signal "); out_int(sig); }
+                out_nl();
+
+                if (pc != 0) {
+                    out_str("pc:     ");
+                    out_hex(pc);
+                    out_nl();
+
+                    fi = lookup_pc(pc);
+                    if (fi >= 0) {
+                        out_str("func:   ");
+                        out_packed(arr_get(bug_am_name, fi));
+                        out_str("()");
+                        out_nl();
+
+                        lcnt = arr_get(bug_fn_lcnt, fi);
+                        lnames = arr_get(bug_fn_lnames, fi);
+                        if (lcnt > 0) {
+                            out_str("locals: ");
+                            for (li = 0; li < lcnt; li = li + 1) {
+                                if (li > 0) { out_str(", "); }
+                                out_packed(lnames[li]);
+                            }
+                            out_nl();
+                        }
+                    } else {
+                        out_str("func:   (unknown -- not in .bug map)");
+                        out_nl();
+                        if (_mo_text_addr != 0) {
+                            out_str("text:   ");
+                            out_hex(_mo_text_addr);
+                            out_str("  offset: ");
+                            out_hex(pc - _mo_text_addr);
+                            out_nl();
+                        }
+                    }
+                } else {
+                    out_str("pc:     (could not read -- sign with bug.entitlements)");
+                    out_nl();
+                }
+                out_str("====================");
+                out_nl();
+
+                sys_ptrace(PT_KILL, pid, 0, 0);
+                sys_wait4(pid, status, 0, 0);
+                stopped = 0;
+            }
+        } else {
+            sig = sig & 0x7F;
+            out_str("bug: process killed by signal ");
+            out_int(sig);
+            out_nl();
+            stopped = 0;
+        }
+    }
+
+    free(_thread_state);
+    free(_task_buf);
+    free(_tlist_buf);
+    free(_tcnt_buf);
+    free(status);
+    return 0;
+}

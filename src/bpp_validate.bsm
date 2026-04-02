@@ -1,13 +1,52 @@
-// bpp_validate.bsm — Semantic validation pass for the B++ compiler.
-// Runs after parsing and type inference, before any codegen.
-// Checks that the IR is complete and consistent: every function call has
-// a target, every struct annotation refers to a known type, etc.
-// All errors are platform-agnostic — this module knows nothing about
-// ARM64, x86, WASM, or any OS. When validate passes, any backend can
-// trust the IR blindly.
+// bpp_validate.bsm — Unified validation + type checking for the B++ compiler.
+// Runs after type inference, before codegen. Checks:
+//   Layer 1 (always on): undefined functions, arg count, unreachable code, float→int at call.
+//   Layer 2 (hint-activated): type compatibility on annotated variables.
+// All errors are platform-agnostic. When validate passes, any backend can trust the IR.
 
-// Check if a name is a language builtin (malloc, putchar, sys_write, etc.).
-// Returns 1 if recognized, 0 otherwise.
+import "defs.bsm";
+import "stbarray.bsm";
+import "bpp_internal.bsm";
+import "bpp_diag.bsm";
+import "bpp_parser.bsm";
+import "bpp_types.bsm";
+
+// ── Hint table (per-function, tracks type annotations) ──────
+
+auto _val_hn, _val_ht;
+
+init_validate() {
+    _val_hn = arr_new();
+    _val_ht = arr_new();
+    return 0;
+}
+
+_val_reset_hints() {
+    arr_clear(_val_hn);
+    arr_clear(_val_ht);
+    return 0;
+}
+
+_val_add_hint(name_p, hint) {
+    auto i;
+    for (i = 0; i < arr_len(_val_hn); i = i + 1) {
+        if (packed_eq(arr_get(_val_hn, i), name_p)) { return 0; }
+    }
+    _val_hn = arr_push(_val_hn, name_p);
+    _val_ht = arr_push(_val_ht, hint);
+    return 0;
+}
+
+_val_get_hint(name_p) {
+    auto i;
+    for (i = 0; i < arr_len(_val_hn); i = i + 1) {
+        if (packed_eq(arr_get(_val_hn, i), name_p)) { return arr_get(_val_ht, i); }
+    }
+    return 0;
+}
+
+// ── Builtin recognition ─────────────────────────────────────
+
 val_is_builtin(name_p) {
     if (buf_eq(vbuf + unpack_s(name_p), "malloc", unpack_l(name_p))) { if (unpack_l(name_p) == 6) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "free", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
@@ -34,6 +73,10 @@ val_is_builtin(name_p) {
     if (buf_eq(vbuf + unpack_s(name_p), "sys_execve", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_waitpid", unpack_l(name_p))) { if (unpack_l(name_p) == 11) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_exit", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_getdents", unpack_l(name_p))) { if (unpack_l(name_p) == 12) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_unlink", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_ptrace", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_wait4", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_ioctl", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_nanosleep", unpack_l(name_p))) { if (unpack_l(name_p) == 13) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_clock_gettime", unpack_l(name_p))) { if (unpack_l(name_p) == 17) { return 1; } }
@@ -42,35 +85,137 @@ val_is_builtin(name_p) {
     return 0;
 }
 
-// Check if a name exists in the parsed function table.
+// ── Lookup helpers ──────────────────────────────────────────
+
 val_find_func(name_p) {
     auto i, rec;
-    i = 0;
-    while (i < func_cnt) {
+    for (i = 0; i < func_cnt; i = i + 1) {
         rec = funcs[i];
         if (packed_eq(*(rec + FN_NAME), name_p)) { return i; }
-        i = i + 1;
     }
     return -1;
 }
 
-// Check if a name exists in the extern table (any overload).
 val_find_extern(name_p) {
     auto i, rec;
-    i = 0;
-    while (i < ext_cnt) {
+    for (i = 0; i < ext_cnt; i = i + 1) {
         rec = externs[i];
         if (packed_eq(*(rec + EX_NAME), name_p)) { return i; }
-        i = i + 1;
     }
     return -1;
 }
+
+// ── Type name helper (for diagnostics) ──────────────────────
+
+val_type_name(ty) {
+    if (ty == TY_WORD)    { return "word"; }
+    if (ty == TY_WORD_H)  { return "half"; }
+    if (ty == TY_WORD_Q)  { return "quarter"; }
+    if (ty == TY_WORD_B)  { return "byte"; }
+    if (ty == TY_FLOAT)   { return "float"; }
+    if (ty == TY_FLOAT_H) { return "half float"; }
+    if (ty == TY_FLOAT_Q) { return "quarter float"; }
+    if (ty == TY_PTR)     { return "ptr"; }
+    if (ty == TY_STRUCT)  { return "struct"; }
+    return "unknown";
+}
+
+// ── Layer 2: type compatibility check ───────────────────────
+
+// Check assignment compatibility when the variable has a type hint.
+// Returns 0=ok, 1=warning, 2=error.
+val_check_assign_compat(hint_ty, val_ty, var_name_p) {
+    auto hb, vb, hs, vs;
+    if (val_ty == TY_UNK) { return 0; }
+
+    hb = ty_base(hint_ty);
+    vb = ty_base(val_ty);
+    hs = ty_slice(hint_ty);
+    vs = ty_slice(val_ty);
+
+    // E050: ptr to non-ptr.
+    if (vb == BASE_PTR) {
+        if (hb != BASE_PTR) {
+            diag_fatal(50);
+            diag_str("cannot assign ptr to '");
+            diag_packed(var_name_p);
+            diag_str("' (declared as ");
+            diag_str(val_type_name(hint_ty));
+            diag_str(")");
+            diag_newline();
+            sys_exit(1);
+        }
+    }
+
+    // E053: non-ptr to ptr.
+    if (hb == BASE_PTR) {
+        if (vb != BASE_PTR) {
+            diag_fatal(53);
+            diag_str("assigning ");
+            diag_str(val_type_name(val_ty));
+            diag_str(" to '");
+            diag_packed(var_name_p);
+            diag_str("' (declared as ptr) without cast");
+            diag_newline();
+            sys_exit(1);
+        }
+    }
+
+    // E052: float to int.
+    if (vb == BASE_FLOAT) {
+        if (hb == BASE_WORD) {
+            diag_fatal(52);
+            diag_str("assigning float to '");
+            diag_packed(var_name_p);
+            diag_str("' (declared as ");
+            diag_str(val_type_name(hint_ty));
+            diag_str(") without cast");
+            diag_newline();
+            sys_exit(1);
+        }
+    }
+
+    // W011: int to narrow float (precision loss).
+    if (hb == BASE_FLOAT) {
+        if (vb == BASE_WORD) {
+            if (slice_width(hs) < slice_width(vs)) {
+                diag_warn(11);
+                diag_str("possible precision loss: ");
+                diag_str(val_type_name(val_ty));
+                diag_str(" to '");
+                diag_packed(var_name_p);
+                diag_str("' (");
+                diag_str(val_type_name(hint_ty));
+                diag_str(")");
+                diag_newline();
+            }
+        }
+    }
+
+    // W010: narrowing same base.
+    if (hb == vb) {
+        if (slice_width(hs) < slice_width(vs)) {
+            diag_warn(10);
+            diag_str("narrowing: ");
+            diag_str(val_type_name(val_ty));
+            diag_str(" to '");
+            diag_packed(var_name_p);
+            diag_str("' (");
+            diag_str(val_type_name(hint_ty));
+            diag_str(")");
+            diag_newline();
+        }
+    }
+
+    return 0;
+}
+
+// ── AST walker ──────────────────────────────────────────────
 
 // Forward declaration for mutual recursion.
 val_check_node(nd) { return 0; }
 
-// Walk a statement list and validate each node.
-// W005: warn if statements appear after a return in the same block.
+// Walk a statement list. W005: warn on unreachable code after return.
 val_check_list(arr, cnt) {
     auto i, saw_ret, nd;
     auto sn: Node;
@@ -82,7 +227,6 @@ val_check_list(arr, cnt) {
                 diag_warn(5);
                 diag_str("unreachable code after return");
                 diag_newline();
-                // Only warn once per block.
                 saw_ret = 0;
             }
             sn = nd;
@@ -93,20 +237,58 @@ val_check_list(arr, cnt) {
     return 0;
 }
 
-// Recursively validate an AST node. Reports errors via diag_fatal + sys_exit.
+// Recursively validate + type-check an AST node.
 val_check_node(nd) {
     auto n: Node, t, name_p;
     if (nd == 0) { return 0; }
     n = nd;
     t = n.ntype;
 
-    // E201: function call to undefined target.
-    // W002: implicit float-to-int conversion at call site.
-    // W003: argument count mismatch.
+    // ── T_DECL: collect type hints ──────────────────────────
+    if (t == T_DECL) {
+        auto vars_arr, var_cnt, hints_arr, single_hint, i, h;
+        vars_arr = n.a;
+        var_cnt = n.b;
+        hints_arr = n.e;
+        single_hint = n.c;
+        if (hints_arr != 0) {
+            for (i = 0; i < var_cnt; i = i + 1) {
+                h = hints_arr[i];
+                if (h > 0) { _val_add_hint(vars_arr[i], h); }
+            }
+        } else if (single_hint > 0) {
+            for (i = 0; i < var_cnt; i = i + 1) {
+                _val_add_hint(vars_arr[i], single_hint);
+            }
+        }
+        return 0;
+    }
+
+    // ── T_ASSIGN: Layer 2 type check on hinted variables ────
+    if (t == T_ASSIGN) {
+        auto lhs: Node, hint_ty, val_ty;
+        lhs = n.a;
+        if (lhs != 0) {
+            if (lhs.ntype == T_VAR) {
+                hint_ty = _val_get_hint(lhs.a);
+                if (hint_ty > 0) {
+                    val_ty = n.itype;
+                    val_check_assign_compat(hint_ty, val_ty, lhs.a);
+                }
+            }
+        }
+        val_check_node(n.a);
+        val_check_node(n.b);
+        return 0;
+    }
+
+    // ── T_CALL: E201/W002/W003 + Layer 1 checks ────────────
     if (t == T_CALL) {
         auto fi, callee, expected, ai, arg_nd, arg_ty, par_ty;
         auto an: Node;
         name_p = n.a;
+
+        // E201: undefined function.
         if (val_is_builtin(name_p) == 0) {
             if (val_find_func(name_p) < 0) {
                 if (val_find_extern(name_p) < 0) {
@@ -120,13 +302,12 @@ val_check_node(nd) {
             }
         }
 
-        // W002 + W003: check B++ function calls (not builtins or externs).
+        // W003 + W002: check B++ function calls.
         fi = val_find_func(name_p);
         if (fi >= 0) {
             callee = funcs[fi];
-            expected = *(callee + 24);
+            expected = *(callee + FN_PCNT);
 
-            // W003: argument count mismatch.
             if (n.c != expected) {
                 diag_warn(3);
                 diag_str("'");
@@ -138,7 +319,6 @@ val_check_node(nd) {
                 diag_newline();
             }
 
-            // W002: implicit float-to-int conversion.
             for (ai = 0; ai < n.c; ai = ai + 1) {
                 arg_nd = n.b[ai];
                 if (arg_nd != 0) {
@@ -161,61 +341,50 @@ val_check_node(nd) {
             }
         }
 
-        // Also validate arguments recursively.
         val_check_list(n.b, n.c);
         return 0;
     }
 
-    // Recurse into sub-expressions and statements.
-    if (t == T_ASSIGN) {
-        val_check_node(n.a);
-        val_check_node(n.b);
-        return 0;
-    }
-    if (t == T_BINOP) {
-        val_check_node(n.b);
-        val_check_node(n.c);
-        return 0;
-    }
-    if (t == T_UNARY) {
-        val_check_node(n.b);
-        return 0;
-    }
-    if (t == T_RET) {
-        val_check_node(n.a);
-        return 0;
-    }
+    // ── Recurse into sub-expressions ────────────────────────
+    if (t == T_BINOP) { val_check_node(n.b); val_check_node(n.c); return 0; }
+    if (t == T_UNARY) { val_check_node(n.b); return 0; }
+    if (t == T_RET)   { val_check_node(n.a); return 0; }
     if (t == T_IF) {
         val_check_node(n.a);
         val_check_list(n.b, n.c);
         if (n.e > 0) { val_check_list(n.d, n.e); }
         return 0;
     }
-    if (t == T_WHILE) {
-        val_check_node(n.a);
-        val_check_list(n.b, n.c);
-        return 0;
-    }
-    if (t == T_MEMLD) {
-        val_check_node(n.a);
-        return 0;
-    }
-    if (t == T_MEMST) {
-        val_check_node(n.a);
-        val_check_node(n.b);
-        return 0;
-    }
+    if (t == T_WHILE) { val_check_node(n.a); val_check_list(n.b, n.c); return 0; }
+    if (t == T_MEMLD) { val_check_node(n.a); return 0; }
+    if (t == T_MEMST) { val_check_node(n.a); val_check_node(n.b); return 0; }
     return 0;
 }
 
-// Run semantic validation on all parsed functions.
-// Call after run_types() and run_dispatch(), before any codegen.
+// ── Entry point ─────────────────────────────────────────────
+
+// Run validation on all functions. Per-function: reset hints, collect
+// param hints, walk body.
 run_validate() {
-    auto i, rec, body_arr, body_cnt;
+    auto i, rec, body_arr, body_cnt, hints, h, j, params_arr, param_cnt;
     for (i = 0; i < func_cnt; i = i + 1) {
         rec = funcs[i];
         body_arr = *(rec + FN_BODY);
         body_cnt = *(rec + FN_BCNT);
+        params_arr = *(rec + FN_PARS);
+        param_cnt = *(rec + FN_PCNT);
+        hints = *(rec + FN_HINTS);
+
+        _val_reset_hints();
+
+        // Register parameter type hints.
+        if (hints != 0) {
+            for (j = 0; j < param_cnt; j = j + 1) {
+                h = hints[j];
+                if (h > 0) { _val_add_hint(params_arr[j], h); }
+            }
+        }
+
         val_check_list(body_arr, body_cnt);
     }
     return 0;

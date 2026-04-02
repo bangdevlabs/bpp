@@ -1,0 +1,399 @@
+// bug.bpp -- B++ native debugger.
+// Reads .bug debug maps and observes running programs.
+//
+// Usage:
+//   ./bug file.bug              Dump debug info from a .bug file
+//   ./bug ./program [args...]   Run program and observe (requires .bug alongside)
+
+import "stbarray.bsm";
+import "bug_reader.bsm";
+import "bug_observe.bsm";
+
+// -- Output helpers -------------------------------------------
+// All output goes to stdout (fd=1). Diagnostics go to stderr (fd=2).
+
+auto _out_buf;
+
+out_ch(c) {
+    poke(_out_buf, c);
+    sys_write(1, _out_buf, 1);
+    return 0;
+}
+
+out_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        out_ch(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+out_int(n) {
+    if (n < 0) { out_ch('-'); n = 0 - n; }
+    if (n >= 10) { out_int(n / 10); }
+    out_ch('0' + (n % 10));
+    return 0;
+}
+
+out_hex(n) {
+    auto i, d;
+    out_str("0x");
+    for (i = 60; i >= 0; i = i - 4) {
+        d = (n >> i) & 0xF;
+        if (d < 10) { out_ch('0' + d); }
+        else { out_ch('a' + d - 10); }
+    }
+    return 0;
+}
+
+out_nl() { out_ch(10); return 0; }
+
+out_packed(p) {
+    br_print_out(p);
+    return 0;
+}
+
+// -- Type name formatting -------------------------------------
+
+out_type(ty) {
+    if (ty == 0x02) { out_str("word"); return 0; }
+    if (ty == 0x12) { out_str("half"); return 0; }
+    if (ty == 0x22) { out_str("quarter"); return 0; }
+    if (ty == 0x32) { out_str("byte"); return 0; }
+    if (ty == 0x03) { out_str("float"); return 0; }
+    if (ty == 0x13) { out_str("float_h"); return 0; }
+    if (ty == 0x23) { out_str("float_q"); return 0; }
+    if (ty == 0x33) { out_str("float_b"); return 0; }
+    if (ty == 0x04) { out_str("ptr"); return 0; }
+    if (ty == 0x08) { out_str("struct"); return 0; }
+    if (ty == 0x0C) { out_str("unknown"); return 0; }
+    if (ty == 0) { out_str("void"); return 0; }
+    out_str("ty:");
+    out_int(ty);
+    return 0;
+}
+
+// -- Dump mode ------------------------------------------------
+// Print all debug info from a parsed .bug file.
+
+dump_header() {
+    out_str("=== .bug Debug Map ===");
+    out_nl();
+    out_str("version: ");
+    out_int(bug_version);
+    out_str("  target: ");
+    if (bug_target == 0) { out_str("ARM64"); }
+    else { out_str("x86_64"); }
+    out_nl();
+    out_nl();
+    return 0;
+}
+
+dump_functions() {
+    auto i, j, pcnt, lcnt, pnames, ptypes, lnames, ltypes;
+    out_str("--- Functions (");
+    out_int(bug_fn_count);
+    out_str(") ---");
+    out_nl();
+
+    for (i = 0; i < bug_fn_count; i = i + 1) {
+        out_str("  ");
+        out_packed(arr_get(bug_fn_name, i));
+        out_str("(");
+
+        // Parameters.
+        pcnt = arr_get(bug_fn_pcnt, i);
+        pnames = arr_get(bug_fn_pnames, i);
+        ptypes = arr_get(bug_fn_ptypes, i);
+        for (j = 0; j < pcnt; j = j + 1) {
+            if (j > 0) { out_str(", "); }
+            out_packed(pnames[j]);
+            out_str(": ");
+            out_type(ptypes[j]);
+        }
+        out_str(") -> ");
+        out_type(arr_get(bug_fn_rtype, i));
+        out_nl();
+
+        // Locals.
+        lcnt = arr_get(bug_fn_lcnt, i);
+        lnames = arr_get(bug_fn_lnames, i);
+        ltypes = arr_get(bug_fn_ltypes, i);
+        if (lcnt > 0) {
+            out_str("    locals: ");
+            for (j = 0; j < lcnt; j = j + 1) {
+                if (j > 0) { out_str(", "); }
+                out_packed(lnames[j]);
+                out_str(": ");
+                out_type(ltypes[j]);
+            }
+            out_nl();
+        }
+    }
+    out_nl();
+    return 0;
+}
+
+dump_structs() {
+    auto i, j, fc, fnames, foffs, fsizes, ftypes;
+    if (bug_st_count == 0) { return 0; }
+    out_str("--- Structs (");
+    out_int(bug_st_count);
+    out_str(") ---");
+    out_nl();
+
+    for (i = 0; i < bug_st_count; i = i + 1) {
+        out_str("  struct ");
+        out_packed(arr_get(bug_st_name, i));
+        out_str(" (");
+        out_int(arr_get(bug_st_size, i));
+        out_str(" bytes)");
+        out_nl();
+
+        fc = arr_get(bug_st_fcnt, i);
+        fnames = arr_get(bug_st_fnames, i);
+        foffs = arr_get(bug_st_foffs, i);
+        fsizes = arr_get(bug_st_fsizes, i);
+        ftypes = arr_get(bug_st_ftypes, i);
+        for (j = 0; j < fc; j = j + 1) {
+            out_str("    +");
+            out_int(foffs[j]);
+            out_str("  ");
+            out_packed(fnames[j]);
+            out_str(" (");
+            out_int(fsizes[j]);
+            out_str("b ");
+            out_type(ftypes[j]);
+            out_str(")");
+            out_nl();
+        }
+    }
+    out_nl();
+    return 0;
+}
+
+dump_globals() {
+    auto i;
+    if (bug_gl_count == 0) { return 0; }
+    out_str("--- Globals (");
+    out_int(bug_gl_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_gl_count; i = i + 1) {
+        out_str("  ");
+        out_packed(arr_get(bug_gl_name, i));
+        out_str(": ");
+        out_type(arr_get(bug_gl_type, i));
+        out_nl();
+    }
+    out_nl();
+    return 0;
+}
+
+dump_externs() {
+    auto i, j, acnt, args;
+    if (bug_ex_count == 0) { return 0; }
+    out_str("--- Externs (");
+    out_int(bug_ex_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_ex_count; i = i + 1) {
+        out_str("  ");
+        out_packed(arr_get(bug_ex_name, i));
+        out_str(" [");
+        out_packed(arr_get(bug_ex_lib, i));
+        out_str("] -> ");
+        out_packed(arr_get(bug_ex_ret, i));
+        out_str("(");
+        acnt = arr_get(bug_ex_acnt, i);
+        args = arr_get(bug_ex_args, i);
+        for (j = 0; j < acnt; j = j + 1) {
+            if (j > 0) { out_str(", "); }
+            out_packed(args[j]);
+        }
+        out_str(")");
+        out_nl();
+    }
+    out_nl();
+    return 0;
+}
+
+dump_addrmap() {
+    auto i;
+    if (bug_am_count == 0) { return 0; }
+    out_str("--- Address Map (");
+    out_int(bug_am_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_am_count; i = i + 1) {
+        out_str("  ");
+        out_hex(arr_get(bug_am_off, i));
+        out_str("  ");
+        out_packed(arr_get(bug_am_name, i));
+        out_nl();
+    }
+    out_nl();
+    return 0;
+}
+
+dump_stackmap() {
+    auto i, j, fi, vcnt, voffs;
+    if (bug_sk_count == 0) { return 0; }
+    out_str("--- Stack Map (");
+    out_int(bug_sk_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_sk_count; i = i + 1) {
+        out_str("  ");
+        out_packed(arr_get(bug_sk_name, i));
+        out_str("  frame=");
+        out_int(arr_get(bug_sk_frame, i));
+        vcnt = arr_get(bug_sk_vcnt, i);
+        if (vcnt > 0) {
+            out_str("  vars=[");
+            voffs = arr_get(bug_sk_voffs, i);
+            for (j = 0; j < vcnt; j = j + 1) {
+                if (j > 0) { out_str(","); }
+                out_int(voffs[j]);
+            }
+            out_str("]");
+        }
+        out_nl();
+    }
+    out_nl();
+    return 0;
+}
+
+dump_all() {
+    dump_header();
+    dump_functions();
+    dump_structs();
+    dump_globals();
+    dump_externs();
+    dump_addrmap();
+    dump_stackmap();
+    return 0;
+}
+
+// -- Path utilities -------------------------------------------
+
+auto pathbuf;
+
+// Copy a null-terminated C string to pathbuf. Returns length.
+copy_cstr(dst, src) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(src, i);
+    while (ch != 0) {
+        poke(dst + i, ch);
+        i = i + 1;
+        ch = str_peek(src, i);
+    }
+    poke(dst + i, 0);
+    return i;
+}
+
+// Check if a path ends with ".bug". Returns 1 if so.
+ends_with_bug(path) {
+    auto i, len;
+    len = 0;
+    i = str_peek(path, 0);
+    while (i != 0) { len = len + 1; i = str_peek(path, len); }
+    if (len < 4) { return 0; }
+    if (str_peek(path, len - 4) != '.') { return 0; }
+    if (str_peek(path, len - 3) != 'b') { return 0; }
+    if (str_peek(path, len - 2) != 'u') { return 0; }
+    if (str_peek(path, len - 1) != 'g') { return 0; }
+    return 1;
+}
+
+// -- Main -----------------------------------------------------
+
+main() {
+    auto nargs, arg, len, loaded;
+
+    _out_buf = malloc(16);
+    pathbuf = malloc(4096);
+
+    init_array();
+    init_reader();
+    init_observe();
+
+    nargs = argc_get();
+    if (nargs < 2) {
+        out_str("usage: bug <file.bug>          dump debug map");
+        out_nl();
+        out_str("       bug <program> [args]    observe program (TODO)");
+        out_nl();
+        return 1;
+    }
+
+    arg = argv_get(1);
+
+    if (ends_with_bug(arg)) {
+        // Dump mode: read and display .bug file contents.
+        len = copy_cstr(pathbuf, arg);
+        loaded = bug_load(pathbuf);
+        if (loaded < 0) {
+            out_str("error: cannot open ");
+            out_str(arg);
+            out_nl();
+            return 1;
+        }
+        if (bug_parse() < 0) {
+            out_str("error: invalid .bug file (bad magic)");
+            out_nl();
+            return 1;
+        }
+        out_str("loaded ");
+        out_int(loaded);
+        out_str(" bytes from ");
+        out_str(arg);
+        out_nl();
+        out_nl();
+        dump_all();
+    } else {
+        // Run mode: launch target and observe.
+        // Build .bug path by appending ".bug" to the binary path.
+        len = copy_cstr(pathbuf, arg);
+        poke(pathbuf + len, '.');
+        poke(pathbuf + len + 1, 'b');
+        poke(pathbuf + len + 2, 'u');
+        poke(pathbuf + len + 3, 'g');
+        poke(pathbuf + len + 4, 0);
+
+        loaded = bug_load(pathbuf);
+        if (loaded < 0) {
+            out_str("error: no .bug file found at ");
+            auto i;
+            i = 0;
+            while (peek(pathbuf + i) != 0) {
+                out_ch(peek(pathbuf + i));
+                i = i + 1;
+            }
+            out_nl();
+            out_str("hint: compile with --bug to generate it");
+            out_nl();
+            return 1;
+        }
+        if (bug_parse() < 0) {
+            out_str("error: invalid .bug file");
+            out_nl();
+            return 1;
+        }
+
+        // Build target path for execve (null-terminated).
+        auto target_path;
+        target_path = malloc(4096);
+        copy_cstr(target_path, arg);
+
+        // Run and observe the target process.
+        bug_run(target_path, 1, nargs);
+    }
+
+    return 0;
+}

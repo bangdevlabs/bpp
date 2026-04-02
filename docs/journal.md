@@ -2053,3 +2053,70 @@ Applied the new syntax to the compiler source, stb library, and examples:
 - `tests/test_gpu_clear.bpp` — NEW: GPU clear with color switching
 - `tests/test_gpu_rect.bpp` — NEW: GPU rectangles with movement
 - `tests/test_escape.bpp` — NEW: escape sequence validation
+
+---
+
+## 2026-04-01 — Cache Fix, sys_fork, Bug Debugger, Structural Overhaul
+
+### Milestone
+
+Three structural bugs that plagued B++ for days were found and fixed in a single session. The modular cache now works like Go's build cache. The `sys_fork` syscall works correctly. The `bug` native debugger is integrated into the compiler.
+
+### Root Causes Found
+
+**"BUG-1" was never a codegen bug.** The "multi-statement if-block crash" was actually three separate cache bugs:
+
+1. **Missing dependency edges**: All 16 compiler .bsm modules imported everything through bpp.bpp (flat imports). The dependency graph had zero inter-module edges. `hash_with_deps()` couldn't propagate changes because there were no edges to propagate on. Fix: added explicit `import` statements to every module.
+
+2. **sys_fork label mismatch**: macOS fork returns PID in x0 for both parent and child, uses x1 to distinguish. The fix needed `enc_cbz_label(1, lbl)` but was coded with `a64_new_lbl()` (text label counter) instead of `enc_new_label()` (binary encoder label). Fix: one word change.
+
+3. **Cache cross-contamination**: All programs shared the same .bo files in `~/.bpp/cache/`. Fix: mix the main file hash (module 0) into every module's combined hash, isolating each program's cache.
+
+### New Syscall Builtins (both backends)
+
+| Builtin | macOS (ARM64) | Linux (x86_64) |
+|---------|---------------|----------------|
+| `sys_ptrace(req, pid, addr, data)` | syscall 26 | syscall 101 |
+| `sys_wait4(pid, status, opts, rusage)` | syscall 7 | syscall 61 |
+| `sys_getdents(fd, buf, size)` | getdirentries64 (344) | getdents64 (217) |
+| `sys_unlink(path)` | syscall 10 | syscall 87 |
+
+`sys_fork` fixed on ARM64: `cbz x1, lbl; mov x0, #0` after `svc #0x80`.
+
+### Bug Debugger Integration
+
+- `--bug` flag generates `.bug` debug map alongside binary
+- `bug` program compiles standalone, reads `.bug`, launches target
+- Dump mode: functions, structs, globals, address map, stack map
+- Run mode: fork+exec, ptrace observe, crash reports with function names
+- ASLR slide calculated at runtime
+- Breakpoint infrastructure complete but blocked by macOS W^X (BUG-5)
+
+### Cache System (Go Model)
+
+- Explicit imports in all 16 modules create real dependency graph
+- `hash_with_deps()` propagates transitively (leaf-first topological order)
+- Main file hash mixed into all modules (per-program isolation)
+- `--clean-cache` deletes `~/.bpp/cache/` via native sys_fork + /bin/rm
+
+### Validate + Typeck Merged
+
+Single module, single AST walk:
+- Layer 1 (always on): E201 undefined function, W002/W003/W005
+- Layer 2 (hint-activated): E050/E052/E053, W010/W011
+- Per-function hint table for Layer 2
+
+### Files Changed (22 files, +595 lines)
+
+- `src/bpp.bpp` — --bug flag, --clean-cache, init_bug/init_validate, bug_save
+- `src/bpp_import.bsm` — explicit imports, cache_clean, main_hash in hash_with_deps
+- `src/bpp_validate.bsm` — complete rewrite: merged typeck
+- `src/bpp_diag.bsm`, `bpp_internal.bsm`, `bpp_lexer.bsm`, `bpp_parser.bsm`, `bpp_types.bsm`, `bpp_dispatch.bsm`, `bpp_emitter.bsm`, `bpp_bo.bsm` — explicit imports
+- `src/aarch64/a64_codegen.bsm` — sys_fork fix, sys_ptrace, sys_wait4, sys_getdents, sys_unlink
+- `src/aarch64/a64_enc.bsm`, `a64_macho.bsm` — explicit imports
+- `src/x86_64/x64_codegen.bsm` — sys_ptrace, sys_wait4
+- `src/x86_64/x64_enc.bsm`, `x64_elf.bsm` — explicit imports
+- `src/bpp_emitter.bsm` — sys_ptrace/sys_wait4/sys_getdents/sys_unlink C wrappers
+- `src/bug_observe_macos.bsm` — native syscalls, breakpoint infra, ASLR slide
+- `src/bug.bpp` — 64-bit out_hex fix
+- `src/defs.bsm` — FFI type classification helpers

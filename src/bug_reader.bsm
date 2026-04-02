@@ -1,0 +1,405 @@
+// bug_reader.bsm -- .bug debug map file reader.
+// Parses a .bug binary file into in-memory arrays for the bug debugger.
+// Mirrors the format written by bpp_bug.bsm in the compiler.
+
+// -- File buffer (reusable read primitives) --------------------
+
+auto _br_buf;       // File contents loaded into memory.
+auto _br_pos;       // Current read position in the buffer.
+auto _br_size;      // Total bytes loaded.
+
+// Read one byte from the buffer and advance.
+br_read_u8() {
+    auto val;
+    val = peek(_br_buf + _br_pos) & 0xFF;
+    _br_pos = _br_pos + 1;
+    return val;
+}
+
+// Read a little-endian u16 from the buffer.
+br_read_u16() {
+    auto lo, hi;
+    lo = peek(_br_buf + _br_pos) & 0xFF;
+    hi = peek(_br_buf + _br_pos + 1) & 0xFF;
+    _br_pos = _br_pos + 2;
+    return lo | (hi << 8);
+}
+
+// Read a little-endian u32 from the buffer.
+br_read_u32() {
+    auto b0, b1, b2, b3;
+    b0 = peek(_br_buf + _br_pos) & 0xFF;
+    b1 = peek(_br_buf + _br_pos + 1) & 0xFF;
+    b2 = peek(_br_buf + _br_pos + 2) & 0xFF;
+    b3 = peek(_br_buf + _br_pos + 3) & 0xFF;
+    _br_pos = _br_pos + 4;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Read a length-prefixed string from the buffer into strbuf.
+// Returns a packed (offset, length) value.
+br_read_str() {
+    auto l, start, i;
+    l = br_read_u16();
+    start = _br_strbuf_pos;
+    for (i = 0; i < l; i = i + 1) {
+        poke(_br_strbuf + _br_strbuf_pos, peek(_br_buf + _br_pos));
+        _br_strbuf_pos = _br_strbuf_pos + 1;
+        _br_pos = _br_pos + 1;
+    }
+    return start + (l * 0x100000000);
+}
+
+// String buffer for all names read from the .bug file.
+auto _br_strbuf;
+auto _br_strbuf_pos;
+
+// -- Parsed data ----------------------------------------------
+
+// Header fields.
+auto bug_version;    // Format version (currently 1).
+auto bug_target;     // Target arch: 0 = ARM64, 1 = x86_64.
+
+// Functions: parallel arrays indexed by function index.
+auto bug_fn_name;    // Packed name.
+auto bug_fn_pcnt;    // Parameter count.
+auto bug_fn_pnames;  // Pointer to array of packed param names (or 0).
+auto bug_fn_ptypes;  // Pointer to array of param type bytes (or 0).
+auto bug_fn_lcnt;    // Local variable count.
+auto bug_fn_lnames;  // Pointer to array of packed local names (or 0).
+auto bug_fn_ltypes;  // Pointer to array of local type bytes (or 0).
+auto bug_fn_rtype;   // Return type byte.
+auto bug_fn_count;   // Total number of functions.
+
+// Structs: parallel arrays indexed by struct index.
+auto bug_st_name;    // Packed name.
+auto bug_st_size;    // Total byte size.
+auto bug_st_fcnt;    // Field count.
+auto bug_st_fnames;  // Pointer to array of packed field names.
+auto bug_st_foffs;   // Pointer to array of field offsets.
+auto bug_st_fsizes;  // Pointer to array of field sizes.
+auto bug_st_ftypes;  // Pointer to array of field type bytes.
+auto bug_st_count;   // Total number of structs.
+
+// Globals: parallel arrays.
+auto bug_gl_name;    // Packed name.
+auto bug_gl_type;    // Type byte.
+auto bug_gl_count;   // Total number of globals.
+
+// Externs: parallel arrays.
+auto bug_ex_name;    // Packed name.
+auto bug_ex_lib;     // Packed library name.
+auto bug_ex_ret;     // Packed return type string.
+auto bug_ex_acnt;    // Argument count.
+auto bug_ex_args;    // Pointer to array of packed arg type strings.
+auto bug_ex_count;   // Total number of externs.
+
+// Source map: parallel arrays indexed by function index.
+auto bug_sm_fidx;    // Function index.
+auto bug_sm_midx;    // Module index.
+auto bug_sm_pos;     // Source position.
+auto bug_sm_count;   // Total source map entries.
+
+// Address map: parallel arrays indexed by codegen function index.
+auto bug_am_name;    // Parser-level function index.
+auto bug_am_off;     // Code offset in the binary.
+auto bug_am_count;   // Total address map entries.
+
+// Stack map: parallel arrays indexed by codegen function index.
+auto bug_sk_name;    // Function name (packed string).
+auto bug_sk_frame;   // Frame size in bytes.
+auto bug_sk_vcnt;    // Variable count.
+auto bug_sk_voffs;   // Pointer to array of variable stack offsets.
+auto bug_sk_count;   // Total stack map entries.
+
+// -- Initialization -------------------------------------------
+
+init_reader() {
+    _br_buf = malloc(262144);
+    _br_pos = 0;
+    _br_size = 0;
+    _br_strbuf = malloc(262144);
+    _br_strbuf_pos = 0;
+
+    bug_fn_name = arr_new();
+    bug_fn_pcnt = arr_new();
+    bug_fn_pnames = arr_new();
+    bug_fn_ptypes = arr_new();
+    bug_fn_lcnt = arr_new();
+    bug_fn_lnames = arr_new();
+    bug_fn_ltypes = arr_new();
+    bug_fn_rtype = arr_new();
+    bug_fn_count = 0;
+
+    bug_st_name = arr_new();
+    bug_st_size = arr_new();
+    bug_st_fcnt = arr_new();
+    bug_st_fnames = arr_new();
+    bug_st_foffs = arr_new();
+    bug_st_fsizes = arr_new();
+    bug_st_ftypes = arr_new();
+    bug_st_count = 0;
+
+    bug_gl_name = arr_new();
+    bug_gl_type = arr_new();
+    bug_gl_count = 0;
+
+    bug_ex_name = arr_new();
+    bug_ex_lib = arr_new();
+    bug_ex_ret = arr_new();
+    bug_ex_acnt = arr_new();
+    bug_ex_args = arr_new();
+    bug_ex_count = 0;
+
+    bug_sm_fidx = arr_new();
+    bug_sm_midx = arr_new();
+    bug_sm_pos = arr_new();
+    bug_sm_count = 0;
+
+    bug_am_name = arr_new();
+    bug_am_off = arr_new();
+    bug_am_count = 0;
+
+    bug_sk_name = arr_new();
+    bug_sk_frame = arr_new();
+    bug_sk_vcnt = arr_new();
+    bug_sk_voffs = arr_new();
+    bug_sk_count = 0;
+
+    return 0;
+}
+
+// -- File loading ---------------------------------------------
+
+// Load a .bug file from disk. Returns bytes read or -1 on error.
+bug_load(path) {
+    auto fd, nread;
+    fd = sys_open(path, 0);
+    if (fd < 0) { return 0 - 1; }
+    nread = sys_read(fd, _br_buf, 262144);
+    sys_close(fd);
+    if (nread <= 0) { return 0 - 1; }
+    _br_pos = 0;
+    _br_size = nread;
+    return nread;
+}
+
+// -- Parsing --------------------------------------------------
+
+// Parse the header. Returns 0 on success, -1 on bad magic.
+bug_parse_header() {
+    auto m0, m1;
+    m0 = br_read_u8();
+    m1 = br_read_u8();
+    if (m0 != 66) { return 0 - 1; }
+    if (m1 != 71) { return 0 - 1; }
+    bug_version = br_read_u8();
+    bug_target = br_read_u8();
+    return 0;
+}
+
+// Parse the FUNCTIONS section.
+bug_parse_functions() {
+    auto fc, i, j, name_p, pcnt, lcnt, rty;
+    auto pnames, ptypes, lnames, ltypes;
+    fc = br_read_u16();
+    bug_fn_count = fc;
+
+    for (i = 0; i < fc; i = i + 1) {
+        name_p = br_read_str();
+        bug_fn_name = arr_push(bug_fn_name, name_p);
+
+        // Parameters.
+        pcnt = br_read_u16();
+        bug_fn_pcnt = arr_push(bug_fn_pcnt, pcnt);
+        pnames = 0;
+        ptypes = 0;
+        if (pcnt > 0) {
+            pnames = malloc(pcnt * 8);
+            ptypes = malloc(pcnt * 8);
+            for (j = 0; j < pcnt; j = j + 1) {
+                pnames[j] = br_read_str();
+                ptypes[j] = br_read_u8();
+            }
+        }
+        bug_fn_pnames = arr_push(bug_fn_pnames, pnames);
+        bug_fn_ptypes = arr_push(bug_fn_ptypes, ptypes);
+
+        // Locals.
+        lcnt = br_read_u16();
+        bug_fn_lcnt = arr_push(bug_fn_lcnt, lcnt);
+        lnames = 0;
+        ltypes = 0;
+        if (lcnt > 0) {
+            lnames = malloc(lcnt * 8);
+            ltypes = malloc(lcnt * 8);
+            for (j = 0; j < lcnt; j = j + 1) {
+                lnames[j] = br_read_str();
+                ltypes[j] = br_read_u8();
+            }
+        }
+        bug_fn_lnames = arr_push(bug_fn_lnames, lnames);
+        bug_fn_ltypes = arr_push(bug_fn_ltypes, ltypes);
+
+        // Return type.
+        rty = br_read_u8();
+        bug_fn_rtype = arr_push(bug_fn_rtype, rty);
+    }
+    return 0;
+}
+
+// Parse the STRUCTS section.
+bug_parse_structs() {
+    auto sc, i, j, name_p, sz, fc;
+    auto fnames, foffs, fsizes, ftypes;
+    sc = br_read_u16();
+    bug_st_count = sc;
+
+    for (i = 0; i < sc; i = i + 1) {
+        name_p = br_read_str();
+        bug_st_name = arr_push(bug_st_name, name_p);
+        sz = br_read_u32();
+        bug_st_size = arr_push(bug_st_size, sz);
+
+        fc = br_read_u16();
+        bug_st_fcnt = arr_push(bug_st_fcnt, fc);
+
+        fnames = 0;
+        foffs = 0;
+        fsizes = 0;
+        ftypes = 0;
+        if (fc > 0) {
+            fnames = malloc(fc * 8);
+            foffs = malloc(fc * 8);
+            fsizes = malloc(fc * 8);
+            ftypes = malloc(fc * 8);
+            for (j = 0; j < fc; j = j + 1) {
+                fnames[j] = br_read_str();
+                foffs[j] = br_read_u16();
+                fsizes[j] = br_read_u8();
+                ftypes[j] = br_read_u8();
+            }
+        }
+        bug_st_fnames = arr_push(bug_st_fnames, fnames);
+        bug_st_foffs = arr_push(bug_st_foffs, foffs);
+        bug_st_fsizes = arr_push(bug_st_fsizes, fsizes);
+        bug_st_ftypes = arr_push(bug_st_ftypes, ftypes);
+    }
+    return 0;
+}
+
+// Parse the GLOBALS section.
+bug_parse_globals() {
+    auto gc, i;
+    gc = br_read_u16();
+    bug_gl_count = gc;
+    for (i = 0; i < gc; i = i + 1) {
+        bug_gl_name = arr_push(bug_gl_name, br_read_str());
+        bug_gl_type = arr_push(bug_gl_type, br_read_u8());
+    }
+    return 0;
+}
+
+// Parse the EXTERNS section.
+bug_parse_externs() {
+    auto ec, i, j, acnt, args;
+    ec = br_read_u16();
+    bug_ex_count = ec;
+    for (i = 0; i < ec; i = i + 1) {
+        bug_ex_name = arr_push(bug_ex_name, br_read_str());
+        bug_ex_lib = arr_push(bug_ex_lib, br_read_str());
+        bug_ex_ret = arr_push(bug_ex_ret, br_read_str());
+        acnt = br_read_u16();
+        bug_ex_acnt = arr_push(bug_ex_acnt, acnt);
+        args = 0;
+        if (acnt > 0) {
+            args = malloc(acnt * 8);
+            for (j = 0; j < acnt; j = j + 1) {
+                args[j] = br_read_str();
+            }
+        }
+        bug_ex_args = arr_push(bug_ex_args, args);
+    }
+    return 0;
+}
+
+// Parse the SOURCE MAP section.
+bug_parse_srcmap() {
+    auto sc, i;
+    sc = br_read_u16();
+    bug_sm_count = sc;
+    for (i = 0; i < sc; i = i + 1) {
+        bug_sm_fidx = arr_push(bug_sm_fidx, br_read_u16());
+        bug_sm_midx = arr_push(bug_sm_midx, br_read_u16());
+        bug_sm_pos = arr_push(bug_sm_pos, br_read_u32());
+    }
+    return 0;
+}
+
+// Parse the ADDRESS MAP section.
+bug_parse_addrmap() {
+    auto ac, i;
+    ac = br_read_u16();
+    bug_am_count = ac;
+    for (i = 0; i < ac; i = i + 1) {
+        bug_am_name = arr_push(bug_am_name, br_read_str());
+        bug_am_off = arr_push(bug_am_off, br_read_u32());
+    }
+    return 0;
+}
+
+// Parse the STACK MAP section.
+bug_parse_stackmap() {
+    auto sc, i, j, vcnt, voffs;
+    sc = br_read_u16();
+    bug_sk_count = sc;
+    for (i = 0; i < sc; i = i + 1) {
+        bug_sk_name = arr_push(bug_sk_name, br_read_str());
+        bug_sk_frame = arr_push(bug_sk_frame, br_read_u16());
+        vcnt = br_read_u16();
+        bug_sk_vcnt = arr_push(bug_sk_vcnt, vcnt);
+        voffs = 0;
+        if (vcnt > 0) {
+            voffs = malloc(vcnt * 8);
+            for (j = 0; j < vcnt; j = j + 1) {
+                voffs[j] = br_read_u16();
+            }
+        }
+        bug_sk_voffs = arr_push(bug_sk_voffs, voffs);
+    }
+    return 0;
+}
+
+// Parse the entire .bug file. Call after bug_load().
+// Returns 0 on success, -1 on error.
+bug_parse() {
+    if (bug_parse_header() < 0) { return 0 - 1; }
+    bug_parse_functions();
+    bug_parse_structs();
+    bug_parse_globals();
+    bug_parse_externs();
+    bug_parse_srcmap();
+    bug_parse_addrmap();
+    bug_parse_stackmap();
+    return 0;
+}
+
+// -- String utilities -----------------------------------------
+
+// Print a packed string from the reader's string buffer to stderr.
+br_print(p) {
+    auto s, l;
+    s = p % 0x100000000;
+    l = p / 0x100000000;
+    sys_write(2, _br_strbuf + s, l);
+    return 0;
+}
+
+// Print a packed string from the reader's string buffer to stdout.
+br_print_out(p) {
+    auto s, l;
+    s = p % 0x100000000;
+    l = p / 0x100000000;
+    sys_write(1, _br_strbuf + s, l);
+    return 0;
+}

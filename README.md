@@ -1,8 +1,8 @@
 # B++
 
-### GPU-Accelerated Native Rendering + Go-Style Cache — 31 March 2026
+### Structural Overhaul: Cache Fix + sys_fork + Bug Debugger — 1 April 2026
 
-Self-hosting compiler with GPU rendering (Metal on macOS, Vulkan on Linux planned), modular compilation with Go-style content-addressed cache, type hints, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache (per-program isolation, cascading invalidation), native debugger (`bug`), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
 
 ---
 
@@ -17,6 +17,15 @@ B++ is that alternate timeline.
 A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. ARM64 macOS and x86_64 Linux. No assembler. No linker. No external tools.
 
 And a standard library that is, itself, a game engine.
+
+## Latest (1 April 2026)
+
+- **Cache fixed for real**: Go-style modular cache with per-program isolation. Explicit inter-module imports create a real dependency graph. Changing one module auto-invalidates all dependents. `--clean-cache` to wipe.
+- **sys_fork works on macOS ARM64**: Correct child process detection (`cbz x1` with proper encoder labels).
+- **New syscall builtins**: `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` on both ARM64 and x86_64.
+- **Bug debugger integrated**: `--bug` flag emits `.bug` debug maps. `bug` program launches/observes/crash-reports target processes.
+- **Unified validation**: Type checker (Layer 2 hint checks) merged into validate pass. One module, one AST walk.
+- **FFI type helpers**: `ffi_is_ptr()`, `ffi_is_float()`, etc. in defs.bsm for future auto-marshalling.
 
 ## The Language
 
@@ -357,5 +366,7 @@ SOFTWARE.
 *Cache system overhaul (4 bugs), GPU render API (lines, circles, outlines), platform-agnostic trig on March 31, 2026.*
 
 *Syntax Sugar + Codebase Cleanup on April 1, 2026.*
+
+*Cache Fix, sys_fork, Bug Debugger, Structural Overhaul on April 2, 2026*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

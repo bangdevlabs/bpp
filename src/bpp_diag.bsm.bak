@@ -1,0 +1,186 @@
+// bpp_diag.bsm — Diagnostic output for the B++ compiler.
+// All error and warning messages go to stderr (fd=2) so they never
+// contaminate --c or --asm output on stdout.
+// Uses only language builtins: sys_write, sys_exit, str_peek, peek.
+
+auto _diag_buf;
+auto _diag_warn_cnt;
+
+// Allocate scratch buffer and reset counters.
+init_diag() {
+    _diag_buf = malloc(4096);
+    _diag_warn_cnt = 0;
+    return 0;
+}
+
+// Write one byte to stderr.
+diag_ch(c) {
+    poke(_diag_buf, c);
+    sys_write(2, _diag_buf, 1);
+    return 0;
+}
+
+// Write a null-terminated string literal to stderr.
+diag_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        diag_ch(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// Write a decimal integer to stderr.
+diag_int(n) {
+    if (n < 0) {
+        diag_ch('-');
+        n = 0 - n;
+    }
+    if (n >= 10) {
+        diag_int(n / 10);
+    }
+    diag_ch('0' + (n % 10));
+    return 0;
+}
+
+// Write a packed string (from vbuf) to stderr.
+diag_packed(p) {
+    auto s, l, i;
+    s = unpack_s(p);
+    l = unpack_l(p);
+    for (i = 0; i < l; i = i + 1) {
+        diag_ch(peek(vbuf + s + i));
+    }
+    return 0;
+}
+
+// Write len bytes from a memory address to stderr.
+diag_buf(addr, len) {
+    sys_write(2, addr, len);
+    return 0;
+}
+
+// Write a newline to stderr.
+diag_newline() {
+    diag_ch(10);
+    return 0;
+}
+
+// Print the error prefix: "error[Ennn]: ".
+// The caller completes the message and calls sys_exit(1).
+diag_fatal(code) {
+    diag_str("error[E");
+    if (code < 100) { diag_ch('0'); }
+    if (code < 10) { diag_ch('0'); }
+    diag_int(code);
+    diag_str("]: ");
+    return 0;
+}
+
+// Print the warning prefix: "warning[Wnnn]: ".
+// Increments the warning counter. Does not abort.
+diag_warn(code) {
+    diag_str("warning[W");
+    if (code < 100) { diag_ch('0'); }
+    if (code < 10) { diag_ch('0'); }
+    diag_int(code);
+    diag_str("]: ");
+    _diag_warn_cnt = _diag_warn_cnt + 1;
+    return 0;
+}
+
+// Print file location: "  --> filename:line\n".
+// Uses mod_idx() to binary search diag_file_starts for precise file attribution.
+// Line numbers are converted from absolute (across merged source) to file-relative.
+diag_loc(tok_idx) {
+    auto line, mi, fp, fs, fl, base_line;
+    if (tok_idx < 0) { return 0; }
+    line = *(tok_lines + tok_idx * 8);
+    mi = mod_idx(*(tok_src_off + tok_idx * 8));
+    base_line = arr_get(diag_file_line_starts, mi);
+    diag_str("  --> ");
+    if (arr_len(diag_file_starts) > 0) {
+        fp = arr_get(diag_file_names, mi);
+        fs = unpack_s(fp);
+        fl = unpack_l(fp);
+        diag_buf(fname_buf + fs, fl);
+    }
+    diag_ch(':');
+    diag_int(line - base_line);
+    diag_newline();
+    return 0;
+}
+
+// Print the source line containing a token, with a caret pointing at the token.
+// Produces Clang/Rust-style output:
+//     10 |   x = foo(y);
+//        |       ^^^
+diag_show_line(tok_idx) {
+    auto off, line_start, line_end, col, tlen, i, ch, lnum, mi, base_line;
+    if (tok_idx < 0) { return 0; }
+    // Find the token's offset in the merged source buffer.
+    off = *(tok_src_off + tok_idx * 8);
+    // Walk backwards to find the start of the line.
+    line_start = off;
+    while (line_start > 0) {
+        if (peek(src + line_start - 1) == 10) { line_start = 0 - 1; }
+        else { line_start = line_start - 1; }
+    }
+    if (line_start < 0) { line_start = off - (0 - line_start - 1) + 1; }
+    // Walk forwards to find the end of the line.
+    line_end = off;
+    while (line_end < src_len) {
+        if (peek(src + line_end) == 10) { line_end = src_len + line_end; }
+        else { line_end = line_end + 1; }
+    }
+    if (line_end >= src_len) { line_end = line_end - src_len; }
+    // Column = distance from line start to token.
+    col = off - line_start;
+    tlen = *(toks + tok_idx * 24 + 16);
+    if (tlen < 1) { tlen = 1; }
+    // Compute file-relative line number.
+    mi = mod_idx(off);
+    base_line = arr_get(diag_file_line_starts, mi);
+    lnum = *(tok_lines + tok_idx * 8) - base_line;
+    // Print: "  <lnum> | <source line>"
+    diag_str("  ");
+    diag_int(lnum);
+    diag_str(" | ");
+    for (i = line_start; i < line_end; i = i + 1) {
+        ch = peek(src + i);
+        if (ch == 9) { diag_ch(' '); } else { diag_ch(ch); }
+    }
+    diag_newline();
+    // Print: "       | <spaces><carets>"
+    diag_str("  ");
+    // Pad to match line number width.
+    i = lnum;
+    if (i == 0) { diag_ch(' '); }
+    while (i > 0) { diag_ch(' '); i = i / 10; }
+    diag_str(" | ");
+    for (i = 0; i < col; i = i + 1) { diag_ch(' '); }
+    for (i = 0; i < tlen; i = i + 1) { diag_ch('^'); }
+    diag_newline();
+    return 0;
+}
+
+// Print a help message: "  = help: <msg>\n".
+diag_help(msg) {
+    diag_str("  = help: ");
+    diag_str(msg);
+    diag_newline();
+    return 0;
+}
+
+// Print a summary line if any warnings were emitted.
+diag_summary() {
+    if (_diag_warn_cnt > 0) {
+        diag_int(_diag_warn_cnt);
+        diag_str(" warning(s) emitted");
+        diag_newline();
+    }
+    return 0;
+}

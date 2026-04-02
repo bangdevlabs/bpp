@@ -1,0 +1,292 @@
+// bpp_bug.bsm -- .bug debug map file emitter for the B++ compiler.
+// Writes a binary debug map alongside the compiled output when --bug is set.
+// The .bug file maps function names, types, struct layouts, globals, externs,
+// source positions, code offsets, and stack layouts so that a debugger can
+// correlate machine addresses back to source-level constructs.
+//
+// The module reads compiler state but never modifies it. All serialization
+// reuses the bo_buf/bo_pos machinery from bpp_bo.bsm.
+
+// -- Module state ----------------------------------------------
+
+// Flag: set to 1 by the --bug command-line option to enable .bug emission.
+auto flag_bug;
+
+// Scratch buffer for constructing the .bug output path.
+auto _bug_pathbuf;
+
+// -- Initialization --------------------------------------------
+
+// Allocate module state. Call once at startup before compilation begins.
+init_bug() {
+    flag_bug = 0;
+    _bug_pathbuf = malloc(4096);
+    return 0;
+}
+
+// -- Part 1: Platform-agnostic debug data ----------------------
+// Emits function signatures, struct layouts, globals, externs, and
+// a source map. Call after type inference completes but before the
+// backend-specific part is appended.
+
+bug_write_agnostic() {
+    auto i, j, rec, name_p, pcnt, block, cnt, rty;
+    auto fields, hints, fc, off, sz, ty;
+    auto args, acnt, par_arr;
+
+    // -- Section: FUNCTIONS ------------------------------------
+    // Each entry records the function's name, parameter names and types,
+    // local variable names and types, and the inferred return type.
+    bo_write_u16(func_cnt);
+
+    for (i = 0; i < func_cnt; i = i + 1) {
+        rec = funcs[i];
+        name_p = *(rec + FN_NAME);
+
+        // Function name.
+        bo_write_str(name_p);
+
+        // Parameters: count, then (name, type) pairs.
+        // Cached functions have FN_PARS=0, so skip param details for those.
+        pcnt = *(rec + FN_PCNT);
+        par_arr = *(rec + FN_PARS);
+        if (par_arr == 0) { pcnt = 0; }
+        bo_write_u16(pcnt);
+        for (j = 0; j < pcnt; j = j + 1) {
+            bo_write_str(par_arr[j]);
+            bo_write_u8(get_fn_par_type(i, j));
+        }
+
+        // Locals: count, then (name, type) pairs from the persistent
+        // variable table built by the type inference pass.
+        cnt = arr_get(fn_vt_cnts, i);
+        block = arr_get(fn_vt_data, i);
+        bo_write_u16(cnt);
+        for (j = 0; j < cnt; j = j + 1) {
+            bo_write_str(block[j * 2]);
+            bo_write_u8(block[j * 2 + 1]);
+        }
+
+        // Return type.
+        bo_write_u8(get_fn_ret_type(i));
+    }
+
+    // -- Section: STRUCTS --------------------------------------
+    // Each entry records the struct name, total byte size, field count,
+    // and per-field name, byte offset, byte size, and type hint.
+    bo_write_u16(arr_len(sd_names));
+
+    for (i = 0; i < arr_len(sd_names); i = i + 1) {
+        bo_write_str(arr_get(sd_names, i));
+        bo_write_u32(arr_get(sd_sizes, i));
+
+        fc = arr_get(sd_fcounts, i);
+        bo_write_u16(fc);
+
+        fields = arr_get(sd_fields, i);
+        hints = arr_get(sd_fhints, i);
+        off = 0;
+        for (j = 0; j < fc; j = j + 1) {
+            bo_write_str(fields[j]);
+            bo_write_u16(off);
+            sz = field_hint_size(hints[j]);
+            bo_write_u8(sz);
+            bo_write_u8(hints[j]);
+            off = off + sz;
+        }
+    }
+
+    // -- Section: GLOBALS --------------------------------------
+    // Each entry records the global variable name and its inferred type.
+    bo_write_u16(glob_cnt);
+
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        bo_write_str(arr_get(globals, i));
+        bo_write_u8(ty_get_global_type(arr_get(globals, i)));
+    }
+
+    // -- Section: EXTERNS --------------------------------------
+    // Each entry records the extern name, library, return type string,
+    // argument count, and per-argument type string.
+    bo_write_u16(ext_cnt);
+
+    for (i = 0; i < ext_cnt; i = i + 1) {
+        rec = externs[i];
+        bo_write_str(*(rec + EX_NAME));
+        bo_write_str(*(rec + EX_LIB));
+        bo_write_str(*(rec + EX_RET));
+        acnt = *(rec + EX_ACNT);
+        bo_write_u16(acnt);
+        args = *(rec + EX_ARGS);
+        for (j = 0; j < acnt; j = j + 1) {
+            bo_write_str(args[j]);
+        }
+    }
+
+    // -- Section: SOURCE MAP ----------------------------------
+    // Maps each function to its source module and position so the
+    // debugger can show the correct file and line.
+    bo_write_u16(func_cnt);
+
+    for (i = 0; i < func_cnt; i = i + 1) {
+        bo_write_u16(i);
+        bo_write_u16(arr_get(func_mods, i));
+        // Source position: 0 for cached functions (no token info available).
+        bo_write_u32(0);
+    }
+
+    return 0;
+}
+
+// -- Part 2: ARM64 backend-specific debug data -----------------
+// Emits the address map (function index to code offset) and stack map
+// (frame layout for each function). Call after ARM64 codegen completes.
+
+bug_write_arm64() {
+    auto i, fi, lbl, off, fn_cnt;
+    auto vt_cnt, frame, total, j;
+
+    fn_cnt = arr_len(a64_fn_name);
+
+    // -- Section: ADDRESS MAP ----------------------------------
+    // Maps each codegen function to its byte offset in the code section.
+    // Each entry: func_name(str) + code_offset(u32).
+    // Uses a64_fn_name directly (not a64_fn_fidx, which is 0 for cached modules).
+    bo_write_u16(fn_cnt);
+
+    for (i = 0; i < fn_cnt; i = i + 1) {
+        bo_write_str(arr_get(a64_fn_name, i));
+        lbl = arr_get(a64_fn_lbl, i);
+        off = arr_get(enc_lbl_off, lbl);
+        bo_write_u32(off);
+    }
+
+    // -- Section: STACK MAP ------------------------------------
+    // Records the frame size and per-variable stack offsets for each function.
+    // Each entry: func_name(str) + frame_size(u16) + var_count(u16) + offsets.
+    // Uses a64_fn_name directly (not a64_fn_fidx, which is 0 for cached modules).
+    bo_write_u16(fn_cnt);
+
+    for (i = 0; i < fn_cnt; i = i + 1) {
+        fi = arr_get(a64_fn_fidx, i);
+        bo_write_str(arr_get(a64_fn_name, i));
+
+        vt_cnt = arr_get(fn_vt_cnts, fi);
+        total = vt_cnt * 8;
+        frame = 40 + total;
+        frame = (frame + 15) / 16 * 16;
+        bo_write_u16(frame);
+
+        bo_write_u16(vt_cnt);
+        for (j = 0; j < vt_cnt; j = j + 1) {
+            bo_write_u16(40 + j * 8);
+        }
+    }
+
+    return 0;
+}
+
+// -- Part 2: x86_64 backend-specific debug data ----------------
+// Emits the address map and stack map for x86_64 targets. Call after
+// x86_64 codegen completes.
+
+bug_write_x64() {
+    auto i, fi, lbl, off, fn_cnt;
+    auto vt_cnt, frame, total, j;
+
+    fn_cnt = arr_len(x64_fn_name);
+
+    // -- Section: ADDRESS MAP ----------------------------------
+    // Maps each codegen function to its byte offset in the code section.
+    bo_write_u16(fn_cnt);
+
+    for (i = 0; i < fn_cnt; i = i + 1) {
+        fi = arr_get(x64_fn_fidx, i);
+        bo_write_u16(fi);
+        lbl = arr_get(x64_fn_lbl, i);
+        off = arr_get(x64_enc_lbl_off, lbl);
+        bo_write_u32(off);
+    }
+
+    // -- Section: STACK MAP ------------------------------------
+    // Records the frame size and per-variable stack offsets. On x86_64,
+    // offsets are stored as positive values; debugger negates from RBP.
+    bo_write_u16(fn_cnt);
+
+    for (i = 0; i < fn_cnt; i = i + 1) {
+        fi = arr_get(x64_fn_fidx, i);
+        bo_write_u16(fi);
+
+        vt_cnt = arr_get(fn_vt_cnts, fi);
+        total = vt_cnt * 8;
+        frame = 24 + total;
+        frame = (frame + 15) / 16 * 16;
+        bo_write_u16(frame);
+
+        bo_write_u16(vt_cnt);
+        for (j = 0; j < vt_cnt; j = j + 1) {
+            bo_write_u16(24 + (j + 1) * 8);
+        }
+    }
+
+    return 0;
+}
+
+// -- File emission ---------------------------------------------
+// Writes the complete .bug file: header, platform-agnostic data, and
+// backend-specific data. The output path is derived from the binary's
+// output path by appending ".bug".
+
+bug_save(out_path) {
+    auto i, ch, p, target;
+
+    // Build the .bug path by copying out_path and appending ".bug".
+    p = 0;
+    i = 0;
+    ch = str_peek(out_path, i);
+    while (ch != 0) {
+        poke(_bug_pathbuf + p, ch);
+        p = p + 1;
+        i = i + 1;
+        ch = str_peek(out_path, i);
+    }
+    poke(_bug_pathbuf + p, '.'); p = p + 1;
+    poke(_bug_pathbuf + p, 'b'); p = p + 1;
+    poke(_bug_pathbuf + p, 'u'); p = p + 1;
+    poke(_bug_pathbuf + p, 'g'); p = p + 1;
+    poke(_bug_pathbuf + p, 0);
+
+    // Determine the target code: 0 = ARM64, 1 = x86_64.
+    // The caller decides which backend-specific writer to invoke based on
+    // the compilation mode, so we check which codegen arrays are populated.
+    target = 0;
+    if (arr_len(x64_fn_name) > 0) { target = 1; }
+
+    // Reset the serialization buffer and write the file header.
+    bo_reset();
+
+    // Header: magic "BG" + version 1 + target architecture.
+    bo_write_u8(66);
+    bo_write_u8(71);
+    bo_write_u8(1);
+    bo_write_u8(target);
+
+    // Part 1: platform-agnostic data (functions, structs, globals, externs, source map).
+    bug_write_agnostic();
+
+    // Part 2: backend-specific data (address map, stack map).
+    if (target == 0) {
+        bug_write_arm64();
+    } else {
+        bug_write_x64();
+    }
+
+    // Write the buffer to disk.
+    bo_save_file(_bug_pathbuf);
+
+    diag_str("debug: wrote ");
+    diag_buf(_bug_pathbuf, p);
+    diag_newline();
+
+    return 0;
+}
