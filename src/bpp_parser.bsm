@@ -29,12 +29,19 @@ auto var_stack_names;
 // Enum constant registry: 2 parallel dynamic arrays (packed_name, int_value).
 auto ev_names, ev_values;
 
+// Const function registry: name, params array, param count, body array, body count.
+auto cf_names, cf_params, cf_pcnts, cf_bodies, cf_bcnts, cf_count;
+
 // TK_FLOAT is not declared in defs.bpp, so the parser owns it.
 auto TK_FLOAT;
 
 // Primitive type hint set by try_type_annotation(). 0 = no hint,
 // TY_FLOAT or TY_WORD when the annotation is a primitive name.
 auto _prim_hint;
+
+// Block nesting depth. 0 = function top level. Incremented by parse_body
+// when called from if/while/for. Used to warn about auto inside blocks.
+auto _block_depth;
 
 // ============================================================
 // Initialization
@@ -70,8 +77,15 @@ init_parser() {
     var_stack_names = arr_new();
     ev_names = arr_new();
     ev_values = arr_new();
+    cf_names = arr_new();
+    cf_params = arr_new();
+    cf_pcnts = arr_new();
+    cf_bodies = arr_new();
+    cf_bcnts = arr_new();
+    cf_count = 0;
     TK_FLOAT = 8;
     _prim_hint = 0;
+    _block_depth = 0;
     return 0;
 }
 
@@ -233,14 +247,23 @@ add_enum_val(name_p, val) {
     return 0;
 }
 
-// Look up an enum constant by packed name. Returns the value or -1 if not found.
-find_enum_val(name_p) {
+// Look up an enum/const by packed name. Returns the index or -1 if not found.
+find_enum_idx(name_p) {
     auto i;
     i = arr_len(ev_names) - 1;
     while (i >= 0) {
-        if (packed_eq(arr_get(ev_names, i), name_p)) { return arr_get(ev_values, i); }
+        if (packed_eq(arr_get(ev_names, i), name_p)) { return i; }
         i = i - 1;
     }
+    return 0 - 1;
+}
+
+// Look up an enum constant by packed name. Returns the value or -1 if not found.
+// WARNING: breaks for negative values. Use find_enum_idx + arr_get instead.
+find_enum_val(name_p) {
+    auto i;
+    i = find_enum_idx(name_p);
+    if (i >= 0) { return arr_get(ev_values, i); }
     return 0 - 1;
 }
 
@@ -275,8 +298,19 @@ parse_lit_int() {
 // ============================================================
 
 // Create a literal AST node holding an integer value.
+// For negative values, wraps in a T_UNARY('-') node so codegen handles it.
 make_int_lit(val) {
-    auto start, node, tmp, digit, i, j, t;
+    auto start, node, tmp, digit, i, j, t, inner, neg_op, neg_node;
+    if (val < 0) {
+        inner = make_int_lit(0 - val);
+        neg_op = pack(vbuf_pos, 1);
+        poke(vbuf + vbuf_pos, 45);
+        vbuf_pos = vbuf_pos + 1;
+        neg_node = make_node(T_UNARY);
+        *(neg_node + 8) = neg_op;
+        *(neg_node + 16) = inner;
+        return neg_node;
+    }
     start = vbuf_pos;
     if (val == 0) {
         poke(vbuf + vbuf_pos, 48);
@@ -595,7 +629,7 @@ parse_import() {
 
 // Parse a struct definition: struct Name { field1, field2 }
 parse_struct() {
-    auto name_p, idx, hint;
+    auto name_p, idx, hint, fp;
     consume();
     name_p = cur_packed();
     consume();
@@ -603,7 +637,6 @@ parse_struct() {
     idx = add_struct_def(name_p);
     while (val_is_ch('}') == 0) {
         hint = 0;
-        auto fp;
         fp = cur_packed();
         consume();
         // Read optional type hint for packed field layout.
@@ -614,6 +647,220 @@ parse_struct() {
         if (val_is_ch(',')) { consume(); }
     }
     consume();
+    return 0;
+}
+
+// ============================================================
+// Const: compile-time evaluated constants
+// ============================================================
+
+// Evaluate an AST node as a compile-time constant.
+// Supports literals, enum/const references, arithmetic, unary ops.
+// Returns the integer value. Calls sys_exit on non-const expressions.
+const_eval_node(node) {
+    auto ntype, l, r, op, vs, vl, ch, p, val, i, ch2, fi;
+    ntype = *(node + 0);
+
+    // Literal integer or hex — parse the value from the token buffer.
+    if (ntype == T_LIT) {
+        p = *(node + 8);
+        vs = p % 0x100000000;
+        vl = p / 0x100000000;
+        val = 0;
+        // Check if hex (starts with '0' 'x').
+        if (vl > 2) {
+            if (peek(vbuf + vs) == 48) {
+                if (peek(vbuf + vs + 1) == 120) {
+                    for (i = 2; i < vl; i = i + 1) {
+                        ch = peek(vbuf + vs + i);
+                        val = val * 16;
+                        if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
+                        if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
+                        if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
+                    }
+                    return val;
+                }
+            }
+        }
+        // Check if char literal (starts with single quote).
+        if (peek(vbuf + vs) == 39) {
+            return peek(vbuf + vs + 1);
+        }
+        // Decimal integer.
+        for (i = 0; i < vl; i = i + 1) {
+            ch = peek(vbuf + vs + i);
+            val = val * 10 + ch - 48;
+        }
+        return val;
+    }
+
+    // Binary operation: evaluate both sides and compute.
+    if (ntype == T_BINOP) {
+        l = const_eval_node(*(node + 16));
+        r = const_eval_node(*(node + 24));
+        op = *(node + 8);
+        vs = op % 0x100000000;
+        vl = op / 0x100000000;
+        ch = peek(vbuf + vs);
+        if (ch == '+') { return l + r; }
+        if (ch == '-') { return l - r; }
+        if (ch == '*') { return l * r; }
+        if (ch == '/') { return l / r; }
+        if (ch == '%') { return l % r; }
+        if (ch == '&') { return l & r; }
+        if (ch == '|') { return l | r; }
+        if (ch == '^') { return l ^ r; }
+        // Shift and comparison operators (2-char).
+        if (vl == 2) {
+            ch2 = peek(vbuf + vs + 1);
+            if (ch == '<') { if (ch2 == '<') { return shr(l * 1, 0 - r); } }
+            if (ch == '>') { if (ch2 == '>') { return shr(l, r); } }
+            if (ch == '<') { if (ch2 == '=') { if (l <= r) { return 1; } return 0; } }
+            if (ch == '>') { if (ch2 == '=') { if (l >= r) { return 1; } return 0; } }
+            if (ch == '=') { if (ch2 == '=') { if (l == r) { return 1; } return 0; } }
+            if (ch == '!') { if (ch2 == '=') { if (l != r) { return 1; } return 0; } }
+        }
+        if (ch == '<') { if (l < r) { return 1; } return 0; }
+        if (ch == '>') { if (l > r) { return 1; } return 0; }
+        return 0;
+    }
+
+    // Unary operation: negation or bitwise not.
+    if (ntype == T_UNARY) {
+        l = const_eval_node(*(node + 16));
+        op = *(node + 8);
+        vs = op % 0x100000000;
+        ch = peek(vbuf + vs);
+        if (ch == '-') { return 0 - l; }
+        if (ch == '~') { return ~l; }
+        return l;
+    }
+
+    // Variable reference: look up in enum table (const function params are bound there).
+    if (ntype == T_VAR) {
+        fi = find_enum_idx(*(node + 8));
+        if (fi >= 0) { return arr_get(ev_values, fi); }
+    }
+
+    // Const function call: delegate to separate function for clean stack frame.
+    if (ntype == T_CALL) {
+        fi = const_eval_call(node);
+        if (fi != 0x7EADBEEF) { return fi; }
+    }
+
+    // Anything else is not a constant expression.
+    diag_fatal(120);
+    diag_str("expression is not a compile-time constant");
+    diag_newline();
+    diag_loc(tok_pos);
+    diag_show_line(tok_pos);
+    sys_exit(1);
+    return 0;
+}
+
+// Evaluate a const function call. Returns the result value,
+// or 0x7EADBEEF as sentinel if the call target is not a const function.
+const_eval_call(node) {
+    auto fn_name, fi, cparams, cpcnt, cbody, cbcnt;
+    auto args_arr, acnt, save, j, arg_val, result;
+    fn_name = *(node + 8);
+    fi = const_find_fn(fn_name);
+    if (fi < 0) { return 0x7EADBEEF; }
+    cparams = arr_get(cf_params, fi);
+    cpcnt = arr_get(cf_pcnts, fi);
+    cbody = arr_get(cf_bodies, fi);
+    cbcnt = arr_get(cf_bcnts, fi);
+    args_arr = *(node + 16);
+    acnt = *(node + 24);
+    save = arr_len(ev_names);
+    for (j = 0; j < cpcnt; j = j + 1) {
+        arg_val = const_eval_node(args_arr[j]);
+        add_enum_val(cparams[j], arg_val);
+    }
+    result = const_eval_body(cbody, cbcnt);
+    arr_truncate(ev_names, save);
+    arr_truncate(ev_values, save);
+    arr_truncate(enum_mods, save);
+    return result;
+}
+
+// Look up a const function by packed name. Returns index or -1.
+const_find_fn(name_p) {
+    auto i, b;
+    for (i = 0; i < cf_count; i = i + 1) {
+        b = arr_get(cf_names, i);
+        if (packed_eq(b, name_p)) { return i; }
+    }
+    return 0 - 1;
+}
+
+// Evaluate the body of a const function. Walks statements looking for
+// T_RET (returns its value) and T_IF (evaluates condition, walks branch).
+const_eval_body(body, bcnt) {
+    auto i, stmt, t, cond;
+    for (i = 0; i < bcnt; i = i + 1) {
+        stmt = body[i];
+        t = *(stmt + 0);
+        if (t == T_RET) {
+            return const_eval_node(*(stmt + 8));
+        }
+        if (t == T_IF) {
+            cond = const_eval_node(*(stmt + 8));
+            if (cond != 0) {
+                return const_eval_body(*(stmt + 16), *(stmt + 24));
+            } else if (*(stmt + 40) > 0) {
+                return const_eval_body(*(stmt + 32), *(stmt + 40));
+            }
+        }
+    }
+    return 0;
+}
+
+// Parse a const declaration or const function definition.
+// const NAME = expr;           → compile-time constant value
+// const NAME(args) { body }    → compile-time evaluated function
+parse_const() {
+    auto name_p, expr_node, val;
+    auto params, pcnt, body, bcnt;
+    consume();
+    name_p = cur_packed();
+    consume();
+
+    // Const function: const NAME(args) { body }
+    if (val_is_ch('(')) {
+        consume();
+        list_begin();
+        while (val_is_ch(')') == 0) {
+            list_push(cur_packed());
+            consume();
+            if (val_is_ch(',')) { consume(); }
+        }
+        consume();
+        params = list_end();
+        pcnt = last_list_cnt;
+        consume();
+        list_begin();
+        while (val_is_ch('}') == 0) {
+            list_push(parse_statement());
+        }
+        consume();
+        body = list_end();
+        bcnt = last_list_cnt;
+        cf_names = arr_push(cf_names, name_p);
+        cf_params = arr_push(cf_params, params);
+        cf_pcnts = arr_push(cf_pcnts, pcnt);
+        cf_bodies = arr_push(cf_bodies, body);
+        cf_bcnts = arr_push(cf_bcnts, bcnt);
+        cf_count = cf_count + 1;
+        return 0;
+    }
+
+    // Const value: const NAME = expr;
+    consume();
+    expr_node = parse_expr();
+    val = const_eval_node(expr_node);
+    add_enum_val(name_p, val);
+    if (val_is_ch(';')) { consume(); }
     return 0;
 }
 
@@ -654,7 +901,7 @@ parse_unary() { return 0; }
 // Parse a function definition: name(params) { body }
 // Collects primitive type hints for parameters and stores them in offset 48.
 parse_function() {
-    auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p;
+    auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p, _fs;
     auto ph_arr, ph_cnt, has_hints, my_mod;
     my_mod = tok_mod(tok_pos);
     name_p = cur_packed();
@@ -679,9 +926,9 @@ parse_function() {
     params_arr = list_end();
     param_cnt = last_list_cnt;
     consume();
+    _block_depth = 0;
     list_begin();
     while (val_is_ch('}') == 0) {
-        auto _fs;
         _for_init = 0;
         _fs = parse_statement();
         if (_for_init != 0) { list_push(_for_init); }
@@ -718,6 +965,8 @@ parse_program() {
                 parse_struct();
             } else if (val_is("enum", 4)) {
                 parse_enum();
+            } else if (val_is("const", 5)) {
+                parse_const();
             } else {
                 consume();
             }
@@ -748,6 +997,8 @@ parse_module(tok_end) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
                 parse_enum();
+            } else if (val_is("const", 5)) {
+                parse_const();
             } else {
                 consume();
             }
@@ -775,6 +1026,7 @@ auto _for_init;
 
 parse_body() {
     auto stmt;
+    _block_depth = _block_depth + 1;
     list_begin();
     if (val_is_ch('{')) {
         consume();
@@ -791,6 +1043,7 @@ parse_body() {
         if (_for_init != 0) { list_push(_for_init); }
         list_push(stmt);
     }
+    _block_depth = _block_depth - 1;
     return list_end();
 }
 
@@ -893,7 +1146,7 @@ parse_return() {
 
 // Parse a single statement: declaration, if, while, return, or expression.
 parse_statement() {
-    auto node, var_p, hint_p;
+    auto node, var_p, hint_p, decl_hint, dh_arr, dh_cnt, dh_has, kw_hint;
     // Dispatch hint: @seq, @par, @gpu before while.
     hint_p = 0;
     if (peek_type() == TK_PUNCT) {
@@ -905,7 +1158,6 @@ parse_statement() {
     }
     if (peek_type() == TK_KW) {
         if (val_is("auto", 4)) {
-            auto decl_hint, dh_arr, dh_cnt, dh_has;
             consume();
             decl_hint = 0;
             dh_arr = malloc(64);
@@ -941,7 +1193,6 @@ parse_statement() {
         // Type-keyword declarations: byte hp; half w; quarter c;
         // These are shorthand for auto with a built-in type hint.
         if (val_is("byte", 4) || val_is("half", 4) || val_is("quarter", 7)) {
-            auto kw_hint;
             if (val_is("byte", 4)) { kw_hint = TY_WORD_B; }
             if (val_is("half", 4)) { kw_hint = TY_WORD_H; }
             if (val_is("quarter", 7)) { kw_hint = TY_WORD_Q; }
@@ -1180,7 +1431,8 @@ parse_expr() {
 
 // Parse a primary expression: literal, variable, call, sizeof, or parenthesized.
 parse_primary() {
-    auto t, node, name_p, args_arr, type_p, sidx;
+    auto t, node, name_p, args_arr, type_p, sidx, ev_idx;
+    auto idx_node, mul_node, add_node, op_mul, op_add;
     t = peek_type();
 
     // sizeof(TypeName) — resolve struct size at parse time.
@@ -1231,11 +1483,10 @@ parse_primary() {
             *(node + 24) = last_list_cnt;
             return node;
         }
-        // Enum constant: inline as integer literal if found.
-        auto ev;
-        ev = find_enum_val(name_p);
-        if (ev >= 0) {
-            return make_int_lit(ev);
+        // Enum/const: inline as integer literal if found.
+        ev_idx = find_enum_idx(name_p);
+        if (ev_idx >= 0) {
+            return make_int_lit(arr_get(ev_values, ev_idx));
         }
         node = make_node(T_VAR);
         *(node + 8) = name_p;
@@ -1245,7 +1496,6 @@ parse_primary() {
         }
         // Handle array indexing: buf[i] desugars to *(buf + i * 8).
         if (val_is_ch('[')) {
-            auto idx_node, mul_node, add_node, op_mul, op_add;
             consume();
             idx_node = parse_expr();
             consume();

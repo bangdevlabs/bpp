@@ -1,111 +1,186 @@
 // bug_observe_macos.bsm -- macOS process observation for the bug debugger.
-// Launches a target binary, monitors execution via ptrace and Mach APIs,
-// and reports crashes with source-level function names from the .bug map.
+// Spawns Apple's debugserver and communicates via GDB remote protocol.
+// No entitlements, no codesign, no ptrace, no Mach APIs needed on bug itself.
 
-import "stbarray.bsm";
-import "stbbuf.bsm";
+import "bug_gdb.bsm";
 
-import "System.B" {
-    int task_for_pid(int, int, ptr);
-    int task_threads(int, ptr, ptr);
-    int thread_get_state(int, int, ptr, ptr);
-    int thread_set_state(int, int, ptr, int);
-    int mach_vm_read_overwrite(int, long, long, ptr, ptr);
-    int mach_vm_write(int, long, ptr, int);
-    int mach_vm_protect(int, long, long, int, int);
-    ptr dlopen(char*, int);
-    ptr dlsym(ptr, char*);
-    void sys_icache_invalidate(ptr, long);
-    long lseek(int, long, int);
-    int fchmod(int, int);
-}
+// -- Constants ---------------------------------------------------
 
-// -- Constants ------------------------------------------------
+auto _ds_port;       // TCP port debugserver listens on.
+auto _ds_pid;        // PID of debugserver process.
 
-auto PT_TRACE_ME, PT_CONTINUE, PT_STEP, PT_KILL;
 auto SIGTRAP, SIGSEGV, SIGBUS, SIGABRT;
-auto ARM_THREAD_STATE64, ARM_THREAD_STATE64_COUNT;
 
-// Mach task self port (read via dlsym, not a function call).
-auto _mach_self;
+auto _ds_path;
+auto _ds_path_xcode;
 
 init_observe() {
-    PT_TRACE_ME = 0;
-    PT_CONTINUE = 7;
-    PT_STEP = 9;
-    PT_KILL = 8;
     SIGTRAP = 5;
     SIGSEGV = 11;
     SIGBUS = 10;
     SIGABRT = 6;
-    ARM_THREAD_STATE64 = 6;
-    ARM_THREAD_STATE64_COUNT = 68;
+    _ds_port = 0;
+    _ds_pid = 0;
 
-    // mach_task_self_ is a global variable in libSystem, not a function.
-    // Read its value via dlsym.
-    auto lib, sym;
-    lib = dlopen(0, 2);
-    sym = dlsym(lib, "mach_task_self_");
-    _mach_self = *(sym) & 0xFFFFFFFF;
+    // Command Line Tools path.
+    _ds_path = malloc(256);
+    auto p, i;
+    p = "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver";
+    i = 0;
+    while (str_peek(p, i) != 0) { poke(_ds_path + i, str_peek(p, i)); i = i + 1; }
+    poke(_ds_path + i, 0);
+
+    // Xcode path.
+    _ds_path_xcode = malloc(256);
+    p = "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver";
+    i = 0;
+    while (str_peek(p, i) != 0) { poke(_ds_path_xcode + i, str_peek(p, i)); i = i + 1; }
+    poke(_ds_path_xcode + i, 0);
+
+    init_gdb(0);
     return 0;
 }
 
-// -- Mach-O parsing -------------------------------------------
+// -- Helpers -----------------------------------------------------
+
+// Check if a file exists at a given path.
+_ds_exists(path) {
+    auto fd;
+    fd = sys_open(path, 0);
+    if (fd >= 0) { sys_close(fd); return 1; }
+    return 0;
+}
+
+// Convert integer to decimal string in buffer. Returns length.
+_itoa(buf, n) {
+    auto tmp, len, i;
+    tmp = malloc(32);
+    len = 0;
+    if (n == 0) { poke(tmp, '0'); len = 1; }
+    while (n > 0) {
+        poke(tmp + len, '0' + (n % 10));
+        len = len + 1;
+        n = n / 10;
+    }
+    for (i = 0; i < len; i = i + 1) {
+        poke(buf + i, peek(tmp + len - 1 - i));
+    }
+    poke(buf + len, 0);
+    free(tmp);
+    return len;
+}
+
+// -- Debugserver launcher ----------------------------------------
+
+_spawn_debugserver(target_path, start_idx, argc) {
+    auto pid, ds_path, argv, host_port, plen, i, cnt;
+
+    // Find debugserver.
+    if (_ds_exists(_ds_path)) { ds_path = _ds_path; }
+    else if (_ds_exists(_ds_path_xcode)) { ds_path = _ds_path_xcode; }
+    else {
+        out_str("bug: error: debugserver not found");
+        out_nl();
+        out_str("hint: install Xcode or Command Line Tools");
+        out_nl();
+        return 0 - 1;
+    }
+
+    // Pick a port based on a short-lived fork (pseudo-random PID).
+    pid = sys_fork();
+    if (pid == 0) { sys_exit(0); }
+    sys_wait4(pid, malloc(8), 0, 0);
+    _ds_port = 49152 + (pid & 0x3FFF);
+
+    // Build "localhost:PORT" string.
+    host_port = malloc(64);
+    auto p;
+    p = "localhost:";
+    i = 0;
+    while (str_peek(p, i) != 0) { poke(host_port + i, str_peek(p, i)); i = i + 1; }
+    plen = _itoa(host_port + i, _ds_port);
+
+    // Build argv: [debugserver, host:port, target, args..., NULL]
+    cnt = argc - start_idx;
+    argv = malloc((cnt + 3 + 1) * 8);
+    argv[0] = ds_path;
+    argv[1] = host_port;
+    argv[2] = target_path;
+    for (i = 0; i < cnt; i = i + 1) {
+        argv[3 + i] = argv_get(start_idx + i);
+    }
+    argv[3 + cnt] = 0;
+
+    pid = sys_fork();
+    if (pid < 0) {
+        out_str("bug: fork failed");
+        out_nl();
+        return 0 - 1;
+    }
+
+    if (pid == 0) {
+        // Child: redirect stdout+stderr to /dev/null.
+        sys_close(1);
+        sys_close(2);
+        sys_open("/dev/null", 1);
+        sys_open("/dev/null", 1);
+        sys_execve(ds_path, argv, 0);
+        sys_exit(127);
+    }
+
+    _ds_pid = pid;
+    return 0;
+}
+
+// -- Mach-O parsing (for __text section address) -----------------
 
 auto _mo_text_addr;
-auto _mo_text_vmaddr;   // VA of __TEXT segment (base for ASLR slide calc)
-auto _mo_entry_off;     // entryoff from LC_MAIN
-auto _aslr_slide;       // runtime ASLR slide
+auto _mo_text_seg_vmaddr;
 
-// Read a little-endian u32 from a buffer.
 _rd32(buf, off) {
-    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8) | ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
+    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8) |
+           ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
 }
 
-// Read a little-endian u64 from a buffer.
 _rd64(buf, off) {
-    auto lo, hi;
-    lo = _rd32(buf, off);
-    hi = _rd32(buf, off + 4);
-    return lo | (hi << 32);
+    return _rd32(buf, off) | (_rd32(buf, off + 4) << 32);
 }
 
-// Parse a Mach-O file to extract the __text section virtual address.
+// Parse Mach-O header to find __text section address.
+// Also reads the symbol table to build an address map (function name → code offset).
+// This replaces the .bug file for basic function tracing.
 parse_macho_header(path) {
     auto fd, buf, nread, ncmds, i, cmd, cmdsize, pos;
     auto nsects, si, sp;
+    auto sym_off, sym_cnt, str_off, str_size;
 
-    buf = malloc(8192);
+    buf = malloc(262144);
     fd = sys_open(path, 0);
     if (fd < 0) { free(buf); return 0 - 1; }
-    nread = sys_read(fd, buf, 8192);
+    nread = sys_read(fd, buf, 262144);
     sys_close(fd);
     if (nread < 64) { free(buf); return 0 - 1; }
-
     if (_rd32(buf, 0) != 0xFEEDFACF) { free(buf); return 0 - 1; }
 
     ncmds = _rd32(buf, 16);
     pos = 32;
     _mo_text_addr = 0;
-    _mo_text_vmaddr = 0;
-    _mo_entry_off = 0;
+    _mo_text_seg_vmaddr = 0;
+    sym_off = 0;
+    sym_cnt = 0;
+    str_off = 0;
+    str_size = 0;
 
     for (i = 0; i < ncmds; i = i + 1) {
         if (pos + 8 > nread) { free(buf); return 0; }
         cmd = _rd32(buf, pos);
         cmdsize = _rd32(buf, pos + 4);
 
-        // LC_MAIN = 0x80000028. Extract entryoff.
-        if (cmd == 0x80000028) {
-            _mo_entry_off = _rd64(buf, pos + 8);
-        }
-
         // LC_SEGMENT_64 = 0x19.
         if (cmd == 0x19) {
             if (peek(buf+pos+8) == '_') {
                 if (peek(buf+pos+10) == 'T') {
-                    // __TEXT segment. Record vmaddr for ASLR slide calculation.
-                    _mo_text_vmaddr = _rd64(buf, pos + 24);
+                    _mo_text_seg_vmaddr = _rd64(buf, pos + 24);
                     nsects = _rd32(buf, pos + 64);
                     sp = pos + 72;
                     for (si = 0; si < nsects; si = si + 1) {
@@ -121,69 +196,109 @@ parse_macho_header(path) {
                 }
             }
         }
+
+        // LC_SYMTAB = 0x02. Extract symbol table and string table offsets.
+        if (cmd == 0x02) {
+            sym_off = _rd32(buf, pos + 8);
+            sym_cnt = _rd32(buf, pos + 12);
+            str_off = _rd32(buf, pos + 16);
+            str_size = _rd32(buf, pos + 20);
+        }
+
         pos = pos + cmdsize;
+    }
+
+    // Read symbol table entries and build address map.
+    // Only include symbols in the __text section (n_sect=1, n_type has N_SECT=0x0E).
+    if (sym_off > 0) {
+        if (sym_off + sym_cnt * 16 <= nread) {
+            if (str_off + str_size <= nread) {
+                auto si, n_strx, n_type, n_sect, n_value;
+                auto name_start, name_len, ch, name_packed;
+                for (si = 0; si < sym_cnt; si = si + 1) {
+                    sp = sym_off + si * 16;
+                    n_strx = _rd32(buf, sp);
+                    n_type = peek(buf + sp + 4) & 0xFF;
+                    n_sect = peek(buf + sp + 5) & 0xFF;
+                    n_value = _rd64(buf, sp + 8);
+
+                    // N_SECT = 0x0E or 0x0F, sect 1 = __text.
+                    if (n_sect == 1) {
+                        if ((n_type & 0x0E) == 0x0E) {
+                            // Read function name from string table.
+                            name_start = str_off + n_strx;
+                            // Skip leading underscore (C symbol prefix).
+                            if (peek(buf + name_start) == '_') {
+                                name_start = name_start + 1;
+                            }
+                            // Skip __mh_execute_header (starts with "_mh").
+                            auto skip;
+                            skip = 0;
+                            if (peek(buf + name_start) == '_') {
+                                if (peek(buf + name_start + 1) == 'm') {
+                                    if (peek(buf + name_start + 2) == 'h') {
+                                        skip = 1;
+                                    }
+                                }
+                            }
+                            if (skip == 0) {
+                                // Measure name length.
+                                name_len = 0;
+                                ch = peek(buf + name_start + name_len);
+                                while (ch != 0) {
+                                    name_len = name_len + 1;
+                                    if (name_start + name_len < nread) {
+                                        ch = peek(buf + name_start + name_len);
+                                    } else { ch = 0; }
+                                }
+                                if (name_len > 0) {
+                                    // Deduplicate: skip if we already have this offset.
+                                    auto code_off_check, dup;
+                                    code_off_check = n_value - _mo_text_addr;
+                                    dup = 0;
+                                    auto di;
+                                    for (di = 0; di < bug_am_count; di = di + 1) {
+                                        if (arr_get(bug_am_off, di) == code_off_check) { dup = 1; }
+                                    }
+                                  if (dup == 0) {
+                                    // Pack the name: store in _br_strbuf.
+                                    auto pi;
+                                    auto pack_start;
+                                    pack_start = _br_strbuf_pos;
+                                    for (pi = 0; pi < name_len; pi = pi + 1) {
+                                        poke(_br_strbuf + _br_strbuf_pos, peek(buf + name_start + pi));
+                                        _br_strbuf_pos = _br_strbuf_pos + 1;
+                                    }
+                                    name_packed = pack_start + (name_len * 0x100000000);
+                                    // Code offset = n_value - _mo_text_addr.
+                                    auto code_off;
+                                    code_off = n_value - _mo_text_addr;
+                                    bug_am_name = arr_push(bug_am_name, name_packed);
+                                    bug_am_off = arr_push(bug_am_off, code_off);
+                                    bug_am_count = bug_am_count + 1;
+                                  }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     free(buf);
     return 0;
 }
 
-// -- Register reading -----------------------------------------
+// -- Address map lookup ------------------------------------------
 
-auto _thread_state, _task_buf, _tlist_buf, _tcnt_buf;
-
-// Read the program counter of a stopped traced child.
-read_pc(pid) {
-    auto task, tlist, tcnt, kr, pc, thread0;
-
-    // Get task port via task_for_pid.
-    poke(_task_buf, 0); poke(_task_buf+1, 0); poke(_task_buf+2, 0); poke(_task_buf+3, 0);
-    kr = task_for_pid(_mach_self, pid, _task_buf);
-    if (kr != 0) { return 0; }
-    task = _rd32(_task_buf, 0);
-    if (task == 0) { return 0; }
-
-    // Get thread list.
-    poke(_tlist_buf, 0); poke(_tlist_buf+1, 0); poke(_tlist_buf+2, 0); poke(_tlist_buf+3, 0);
-    poke(_tlist_buf+4, 0); poke(_tlist_buf+5, 0); poke(_tlist_buf+6, 0); poke(_tlist_buf+7, 0);
-    poke(_tcnt_buf, 0); poke(_tcnt_buf+1, 0); poke(_tcnt_buf+2, 0); poke(_tcnt_buf+3, 0);
-    kr = task_threads(task, _tlist_buf, _tcnt_buf);
-    if (kr != 0) { return 0; }
-    tlist = *(_tlist_buf);
-    tcnt = _rd32(_tcnt_buf, 0);
-    if (tcnt == 0) { return 0; }
-
-    // Read thread port (mach_port_t = 4 bytes) from the thread list.
-    thread0 = _rd32(tlist, 0);
-
-    // Set count to ARM_THREAD_STATE64_COUNT (32-bit).
-    poke(_tcnt_buf, ARM_THREAD_STATE64_COUNT & 0xFF);
-    poke(_tcnt_buf+1, 0); poke(_tcnt_buf+2, 0); poke(_tcnt_buf+3, 0);
-    poke(_tcnt_buf+4, 0); poke(_tcnt_buf+5, 0); poke(_tcnt_buf+6, 0); poke(_tcnt_buf+7, 0);
-
-    kr = thread_get_state(thread0, ARM_THREAD_STATE64, _thread_state, _tcnt_buf);
-    if (kr != 0) { return 0; }
-
-    // PC is at offset 256 in ARM64 thread state (x0-x28, fp, lr, sp, pc).
-    pc = *(_thread_state + 256);
-    return pc;
-}
-
-// -- Address map lookup ---------------------------------------
-
-// Look up which address map entry contains the given PC.
-// Returns the index into bug_am_name/bug_am_off, or -1 if not found.
-// Look up which address map entry contains the given PC.
-// Returns the index into bug_am_name/bug_am_off, or -1 if not found.
-// PC includes ASLR slide, so we add _aslr_slide to each entry's base address.
-lookup_pc(pc) {
+lookup_pc(pc, text_base) {
     auto i, off, best_idx, best_dist, dist;
     best_idx = 0 - 1;
     best_dist = 0x7FFFFFFFFFFFFFFF;
-
     for (i = 0; i < bug_am_count; i = i + 1) {
         off = arr_get(bug_am_off, i);
-        dist = pc - (_mo_text_addr + off + _aslr_slide);
+        dist = pc - (text_base + off);
         if (dist >= 0) {
             if (dist < best_dist) {
                 best_dist = dist;
@@ -194,297 +309,262 @@ lookup_pc(pc) {
     return best_idx;
 }
 
-// -- Breakpoint management ------------------------------------
-// Patches the target binary ON DISK with BRK instructions before launch.
-// ARM64 I-cache is not coherent with mach_vm_write for remote processes,
-// so runtime patching doesn't work reliably. Disk patching ensures the
-// kernel loads the BRK instructions into I-cache naturally.
+// -- Backtrace: walk FP chain ------------------------------------
 
-// Breakpoint state: parallel arrays of address offset and saved instruction.
-auto _bp_offs;      // code offsets where BRK was written
-auto _bp_saved;     // original 4-byte instructions at those offsets
-auto _bp_count;     // number of active breakpoints
-
-// BRK #0 instruction (ARM64): causes SIGTRAP when executed.
-auto BRK_INSN;
-
-// File offset of __text section (from Mach-O header parse).
-auto _text_file_off;
-
-_bp_init() {
-    _bp_offs = arr_new();
-    _bp_saved = arr_new();
-    _bp_count = 0;
-    BRK_INSN = 0xD4200000;
-    _text_file_off = 0;
-    return 0;
-}
-
-// Read a little-endian u32 from a buffer.
-_file_rd32(buf, off) {
-    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8)
-         | ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
-}
-
-// Write a little-endian u32 to a buffer.
-_file_wr32(buf, off, val) {
-    poke(buf+off, val & 0xFF);
-    poke(buf+off+1, (val >> 8) & 0xFF);
-    poke(buf+off+2, (val >> 16) & 0xFF);
-    poke(buf+off+3, (val >> 24) & 0xFF);
-    return 0;
-}
-
-// Patch the binary on disk: replace function entries with BRK.
-// Returns a malloc'd buffer with the patched binary, and sets *size_out.
-// The caller must write this to a temp file and run it.
-_bp_patch_binary(path, size_out) {
-    auto fd, buf, sz, i, off, foff, orig;
-
-    // Read the entire binary into memory.
-    fd = sys_open(path, 0);
-    if (fd < 0) { return 0; }
-    sz = sys_lseek(fd, 0, 2);
-    sys_lseek(fd, 0, 0);
-    buf = malloc(sz + 16);
-    sys_read(fd, buf, sz);
-    sys_close(fd);
-    *(size_out) = sz;
-
-    // Find __text section file offset from Mach-O header.
-    // LC_SEGMENT_64 with __TEXT segment, __text section.
-    auto ncmds, pos, cmd, cmdsize, nsects, sp, si;
-    ncmds = _file_rd32(buf, 16);
-    pos = 32;
-    for (i = 0; i < ncmds; i = i + 1) {
-        cmd = _file_rd32(buf, pos);
-        cmdsize = _file_rd32(buf, pos + 4);
-        if (cmd == 0x19) {
-            if (peek(buf+pos+8) == '_') {
-                if (peek(buf+pos+10) == 'T') {
-                    nsects = _file_rd32(buf, pos + 64);
-                    sp = pos + 72;
-                    for (si = 0; si < nsects; si = si + 1) {
-                        if (peek(buf+sp) == '_') {
-                            if (peek(buf+sp+2) == 't') {
-                                if (peek(buf+sp+3) == 'e') {
-                                    _text_file_off = _file_rd32(buf, sp + 48);
-                                }
-                            }
-                        }
-                        sp = sp + 80;
+_print_backtrace(text_base) {
+    auto fp, lr, fi, depth;
+    fp = gdb_read_fp();
+    depth = 0;
+    out_str("  backtrace:");
+    out_nl();
+    while (fp != 0) {
+        if (depth > 20) { out_str("    ... (truncated)"); out_nl(); fp = 0; }
+        else {
+            // ARM64 frame: [fp] = saved_fp, [fp+8] = saved_lr
+            lr = gdb_read_mem(fp + 8, 8);
+            if (lr == 0) { fp = 0; }
+            else {
+                fi = lookup_pc(lr, text_base);
+                out_str("    ");
+                if (fi >= 0) {
+                    out_packed(arr_get(bug_am_name, fi));
+                    out_str("()");
+                } else {
+                    out_str("0x");
+                    auto hi;
+                    for (hi = 60; hi >= 0; hi = hi - 4) {
+                        auto d;
+                        d = (lr >> hi) & 0xF;
+                        if (d < 10) { out_ch('0' + d); }
+                        else { out_ch('a' + d - 10); }
                     }
                 }
+                out_nl();
+                fp = gdb_read_mem(fp, 8);
+                depth = depth + 1;
             }
         }
-        pos = pos + cmdsize;
     }
-
-    // Patch each function entry with BRK.
-    for (i = 0; i < bug_am_count; i = i + 1) {
-        off = arr_get(bug_am_off, i);
-        foff = _text_file_off + off;
-        // Save original instruction.
-        orig = _file_rd32(buf, foff);
-        _bp_offs = arr_push(_bp_offs, off);
-        _bp_saved = arr_push(_bp_saved, orig);
-        // Write BRK #0.
-        _file_wr32(buf, foff, BRK_INSN);
-        _bp_count = _bp_count + 1;
-    }
-
-    return buf;
+    return 0;
 }
 
-// Find breakpoint index by code offset. Returns -1 if not found.
-_bp_find_off(off) {
-    auto i;
-    for (i = 0; i < _bp_count; i = i + 1) {
-        if (arr_get(_bp_offs, i) == off) { return i; }
+// -- Packed string comparison ------------------------------------
+
+// Compare two packed strings by content. Returns 1 if equal, 0 otherwise.
+_packed_eq(a, b) {
+    auto sa, la, sb, lb, i;
+    la = a / 0x100000000;
+    sa = a % 0x100000000;
+    lb = b / 0x100000000;
+    sb = b % 0x100000000;
+    if (la != lb) { return 0; }
+    for (i = 0; i < la; i = i + 1) {
+        if (peek(_br_strbuf + sa + i) != peek(_br_strbuf + sb + i)) { return 0; }
     }
-    return 0 - 1;
+    return 1;
 }
 
-// -- Process launcher -----------------------------------------
+// -- Crash locals: read variables from stack frame ---------------
 
-build_argv(start_idx, argc, patched_path) {
-    auto argv, i, cnt;
-    cnt = argc - start_idx;
-    argv = malloc((cnt + 1) * 8);
-    // First arg is the patched binary path.
-    argv[0] = patched_path;
-    for (i = 1; i < cnt; i = i + 1) {
-        argv[i] = argv_get(start_idx + i);
+_print_crash_locals(fi, text_base) {
+    auto fp, vcnt, voffs, vnames, vi, val;
+
+    // Use fi as index into stack map and function table.
+    // The .bug file stores these in the same order as the address map.
+    if (fi >= bug_sk_count) { return 0; }
+    if (fi >= bug_fn_count) { return 0; }
+
+    vcnt = arr_get(bug_sk_vcnt, fi);
+    if (vcnt <= 0) { return 0; }
+
+    fp = gdb_read_fp();
+    voffs = arr_get(bug_sk_voffs, fi);
+    vnames = arr_get(bug_fn_lnames, fi);
+
+    out_str("  locals:");
+    out_nl();
+    for (vi = 0; vi < vcnt; vi = vi + 1) {
+        val = gdb_read_mem(fp + voffs[vi], 8);
+        out_str("    ");
+        if (vnames != 0) { out_packed(vnames[vi]); }
+        else { out_str("var"); out_int(vi); }
+        out_str(" = ");
+        out_int(val);
+        out_str(" (0x");
+        auto hi;
+        for (hi = 28; hi >= 0; hi = hi - 4) {
+            auto d;
+            d = (val >> hi) & 0xF;
+            if (d < 10) { out_ch('0' + d); }
+            else { out_ch('a' + d - 10); }
+        }
+        out_str(")");
+        out_nl();
     }
-    argv[cnt] = 0;
-    return argv;
+    return 0;
 }
+
+// -- Main runner -------------------------------------------------
 
 bug_run(target_path, start_idx, argc) {
-    auto pid, status, sig, exit_code, pc, fi;
-    auto stopped, first_stop, argv, lcnt, lnames, li;
-    auto patched_buf, patched_sz, patched_path, patched_fd;
-    auto sz_buf;
+    auto ret, sig, pc, fi, i;
+    auto slide, text_base, retries;
+    auto call_depth, has_bug;
 
-    // Allocate buffers for Mach API calls.
-    _thread_state = malloc(512);
-    _task_buf = malloc(16);
-    _tlist_buf = malloc(16);
-    _tcnt_buf = malloc(16);
+    // Check if .bug file was loaded (enhanced mode with locals + filtered trace).
+    has_bug = 0;
+    if (bug_fn_count > 0) { has_bug = 1; }
 
-    // Parse the Mach-O header to get __text section address.
-    if (parse_macho_header(target_path) < 0) {
-        out_str("bug: warning: cannot parse Mach-O header");
-        out_nl();
+    // Parse Mach-O header. If no .bug file was loaded, also reads symbol table
+    // to build the address map for basic function tracing.
+    if (has_bug) {
+        // .bug loaded: only parse Mach-O for __text addr, skip symbol table.
+        // bug_am is already populated from the .bug file.
+        auto save_count;
+        save_count = bug_am_count;
+        parse_macho_header(target_path);
+        // Undo any symbol table entries added by parse_macho_header.
+        bug_am_count = save_count;
+    } else {
+        parse_macho_header(target_path);
     }
 
-    _bp_init();
+    // Spawn debugserver.
+    ret = _spawn_debugserver(target_path, start_idx, argc);
+    if (ret < 0) { return 1; }
 
-    // Patch the binary on disk with BRK instructions at function entries.
-    // ARM64 I-cache is not coherent with mach_vm_write for remote processes,
-    // so we patch the file and let the kernel load it fresh.
-    sz_buf = malloc(8);
-    patched_buf = _bp_patch_binary(target_path, sz_buf);
-    patched_sz = *(sz_buf);
-    free(sz_buf);
-
-    if (patched_buf == 0) {
-        out_str("bug: cannot read binary");
+    // Connect (retry up to 5 seconds).
+    retries = 0;
+    ret = 0 - 1;
+    while (retries < 50) {
+        sys_usleep(100000);
+        ret = gdb_connect(_ds_port);
+        if (ret >= 0) { retries = 999; }
+        else { retries = retries + 1; }
+    }
+    if (ret < 0) {
+        out_str("bug: error: cannot connect to debugserver");
         out_nl();
         return 1;
     }
 
-    // Write patched binary to temp file.
-    patched_path = "/tmp/_bug_patched";
-    patched_fd = sys_open_create(patched_path);
-    sys_write(patched_fd, patched_buf, patched_sz);
-    sys_close(patched_fd);
-    // Make executable.
-    sys_chmod(patched_path, 493);
-    free(patched_buf);
+    // Handshake and get ASLR slide.
+    gdb_handshake();
+    gdb_query_stop();
+    slide = gdb_query_slide(_mo_text_seg_vmaddr);
+    text_base = _mo_text_addr + slide;
+
+    // Set breakpoints at all function entry points.
+    auto bp_count;
+    bp_count = 0;
+    for (i = 0; i < bug_am_count; i = i + 1) {
+        auto addr;
+        addr = _mo_text_addr + slide + arr_get(bug_am_off, i);
+        ret = gdb_set_bp(addr);
+        if (ret == 0) { bp_count = bp_count + 1; }
+    }
 
     out_str("bug: ");
-    out_int(_bp_count);
-    out_str(" breakpoints patched");
+    out_int(bp_count);
+    out_str("/");
+    out_int(bug_am_count);
+    out_str(" breakpoints");
+    if (has_bug) { out_str(" (filtered)"); }
     out_nl();
 
-    // Fork and exec the patched binary.
-    pid = sys_fork();
-    if (pid < 0) {
-        out_str("bug: fork failed");
-        out_nl();
-        return 1;
-    }
+    // Main debug loop with call depth tracking.
+    auto running;
+    running = 1;
+    call_depth = 0;
 
-    if (pid == 0) {
-        sys_ptrace(PT_TRACE_ME, 0, 0, 0);
-        argv = build_argv(start_idx, argc, patched_path);
-        sys_execve(patched_path, argv, 0);
-        sys_exit(127);
-    }
+    while (running) {
+        sig = gdb_continue();
 
-    out_str("bug: observing pid ");
-    out_int(pid);
-    out_nl();
-
-    status = malloc(8);
-    first_stop = 1;
-    stopped = 1;
-
-    while (stopped) {
-        sys_wait4(pid, status, 0, 0);
-        sig = *status & 0xFFFF;
-
-        if ((sig & 0x7F) == 0) {
-            exit_code = (sig >> 8) & 0xFF;
+        if (sig == 0) {
             out_str("bug: exit ");
-            out_int(exit_code);
+            out_int(_gdb_exit_code);
             out_nl();
-            stopped = 0;
-        } else if ((sig & 0x7F) == 0x7F) {
-            sig = (sig >> 8) & 0xFF;
+            running = 0;
 
-            if (sig == SIGTRAP) {
-                if (first_stop) {
-                    // First stop after exec: calculate ASLR slide.
-                    first_stop = 0;
-                    pc = read_pc(pid);
-                    if (pc != 0) {
-                        _aslr_slide = pc - (_mo_text_vmaddr + _mo_entry_off);
-                    } else {
-                        _aslr_slide = 0;
-                    }
-                    sys_ptrace(PT_CONTINUE, pid, 1, 0);
-                } else {
-                    // Breakpoint hit. PC points to the BRK instruction.
-                    pc = read_pc(pid);
-                    if (pc != 0) {
-                        // Convert PC to code offset.
-                        auto code_off, bp_idx;
-                        code_off = pc - (_mo_text_addr + _aslr_slide);
-                        bp_idx = _bp_find_off(code_off);
-                        if (bp_idx >= 0) {
-                            fi = lookup_pc(pc);
-                            if (fi >= 0) {
-                                out_str("-> ");
-                                out_packed(arr_get(bug_am_name, fi));
-                                out_str("()");
-                                out_nl();
-                            }
-                        }
-                    }
-                    // Skip the BRK: advance PC by 4 and continue.
-                    // We don't restore the original — just jump past it.
-                    // This means the function's first instruction is skipped,
-                    // which is always the stack frame setup (stp x29, x30, ...).
-                    // TODO: restore original and re-execute properly.
-                    // For now, skip with NOP effect (lossy but shows the trace).
-                    sys_ptrace(PT_CONTINUE, pid, 1, 0);
-                }
-            } else {
-                // Fatal signal — crash report.
-                pc = read_pc(pid);
+        } else if (sig == SIGTRAP) {
+            // Breakpoint hit — function entry.
+            pc = gdb_read_pc();
+            fi = lookup_pc(pc, text_base);
+            if (fi >= 0) {
+                // Indentation based on call depth.
+                auto d;
+                for (d = 0; d < call_depth; d = d + 1) { out_str("  "); }
+                out_str("-> ");
+                out_packed(arr_get(bug_am_name, fi));
+                out_str("()");
                 out_nl();
-                out_str("=== CRASH ===");
-                out_nl();
-                out_str("signal: ");
-                if (sig == SIGSEGV) { out_str("SIGSEGV"); }
-                else if (sig == SIGBUS) { out_str("SIGBUS"); }
-                else if (sig == SIGABRT) { out_str("SIGABRT"); }
-                else { out_str("sig "); out_int(sig); }
-                out_nl();
-
-                if (pc != 0) {
-                    out_str("pc: ");
-                    out_hex(pc);
-                    out_nl();
-                    fi = lookup_pc(pc);
-                    if (fi >= 0) {
-                        out_str("in: ");
-                        out_packed(arr_get(bug_am_name, fi));
-                        out_str("()");
-                        out_nl();
-                    }
-                }
-                out_str("=============");
-                out_nl();
-
-                sys_ptrace(PT_KILL, pid, 0, 0);
-                sys_wait4(pid, status, 0, 0);
-                stopped = 0;
+                call_depth = call_depth + 1;
+                if (call_depth > 30) { call_depth = 30; }
             }
+
+            // Step past breakpoint.
+            gdb_remove_bp(pc);
+            gdb_step();
+            gdb_set_bp(pc);
+
+        } else if (sig > 0) {
+            // Fatal signal — crash report with backtrace and locals.
+            pc = gdb_read_pc();
+            out_nl();
+            out_str("=== CRASH ===");
+            out_nl();
+            out_str("signal: ");
+            if (sig == SIGSEGV) { out_str("SIGSEGV"); }
+            else if (sig == SIGBUS) { out_str("SIGBUS"); }
+            else if (sig == SIGABRT) { out_str("SIGABRT"); }
+            else { out_str("sig "); out_int(sig); }
+            out_nl();
+
+            if (pc != 0) {
+                out_str("pc: ");
+                out_hex(pc);
+                out_nl();
+
+                fi = lookup_pc(pc, text_base);
+                if (fi >= 0) {
+                    out_str("in: ");
+                    out_packed(arr_get(bug_am_name, fi));
+                    out_str("()");
+                    out_nl();
+
+                    // Print local variables if .bug file was loaded.
+                    if (has_bug) { _print_crash_locals(fi, text_base); }
+                }
+
+                // Walk the frame pointer chain for a full backtrace.
+                _print_backtrace(text_base);
+            }
+            out_str("=============");
+            out_nl();
+            gdb_kill();
+            running = 0;
+
         } else {
-            stopped = 0;
+            if (sig == 0 - 2) {
+                out_str("bug: killed by signal ");
+                out_int(_gdb_stop_sig);
+                out_nl();
+            } else {
+                out_str("bug: connection lost");
+                out_nl();
+            }
+            running = 0;
         }
     }
 
-    // Clean up temp file.
-    sys_unlink(patched_path);
+    gdb_disconnect();
 
-    free(_thread_state);
-    free(_task_buf);
-    free(_tlist_buf);
-    free(_tcnt_buf);
-    free(status);
+    if (_ds_pid > 0) {
+        auto status;
+        status = malloc(8);
+        sys_wait4(_ds_pid, status, 0, 0);
+        free(status);
+    }
+
     return 0;
 }

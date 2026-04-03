@@ -455,6 +455,9 @@ These names are recognized by the compiler and emit special code:
 | `sys_getdents(fd, buf, size)` | Read directory entries |
 | `sys_unlink(path)` | Delete a file |
 | `sys_mkdir(path, mode)` | Create a directory |
+| `sys_socket(domain, type, proto)` | Create a TCP/UDP socket |
+| `sys_connect(fd, addr, len)` | Connect a socket to an address |
+| `sys_usleep(microseconds)` | Sleep for N microseconds |
 | `sys_nanosleep(req, rem)` | Sleep (Linux) |
 | `sys_clock_gettime(id, tp)` | Clock read (Linux) |
 | `float_ret()` | Read saved first float return register (d0/xmm0) from last extern call |
@@ -757,6 +760,41 @@ Source lives in `src/`. The compiler has 18 modules:
 | `x86_64/x64_enc.bsm` | x86_64 instruction encoder |
 | `x86_64/x64_codegen.bsm` | x86_64 code generator |
 | `x86_64/x64_elf.bsm` | ELF writer (Linux static binaries) |
+
+## The Debugger
+
+B++ includes `bug`, a native debugger that runs alongside the compiler.
+It uses the GDB remote protocol to communicate with Apple's debugserver
+(macOS) or gdbserver (Linux). No special flags or compilation steps needed.
+
+### Basic usage
+
+    bpp source.bpp -o program      # compile normally
+    ./bug ./program                 # trace + crash report
+
+### What it does automatically
+
+- **Function tracing**: prints every function call with indented call depth
+- **Crash report**: on SIGSEGV/SIGBUS/SIGABRT, shows signal + PC + function name
+- **Backtrace**: walks the frame pointer chain to show the full call stack
+- **Symbol table**: reads function names directly from the Mach-O/ELF binary
+
+### Enhanced mode (with .bug file)
+
+    bpp --bug source.bpp -o program   # compile with debug metadata
+    ./bug ./program                    # trace + crash report + locals
+
+When a `.bug` file is present, the debugger also:
+
+- **Reads local variables** on crash (names + values from the stack frame)
+- **Filters trace** to only user-defined functions (skips stb library internals)
+
+### Architecture
+
+    bug (TCP client) → debugserver/gdbserver (OS debug server) → target process
+
+The bug binary needs no entitlements or codesign. The OS debug server handles
+all privileged operations (ptrace, breakpoints, I-cache coherence).
 
 ### Self-Hosting
 

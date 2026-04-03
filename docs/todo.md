@@ -2,7 +2,7 @@
 
 ## Status: 2026-04-02
 
-GPU rendering working (Metal macOS). Go-style modular cache with per-program isolation. Native debugger (`bug`) integrated. Game infrastructure (arena, pool, ECS). Type system: Base×Slice with FLOAT_H/Q codegen. Two backends (ARM64 + x86_64). `buf[i]` and `for` loop syntax sugar. 17 stb modules.
+GPU rendering working (Metal macOS). Go-style modular cache with per-program isolation. Native debugger (`bug`) with debugserver/gdbserver backend — zero-flag function tracing, crash backtrace, locals dump. Game infrastructure (arena, pool, ECS). Type system: Base×Slice with FLOAT_H/Q codegen. Two backends (ARM64 + x86_64). `buf[i]` and `for` loop syntax sugar. 17 stb modules. New builtins: sys_socket, sys_connect, sys_usleep.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -10,16 +10,14 @@ GPU rendering working (Metal macOS). Go-style modular cache with per-program iso
 
 ## P0 — Next Up
 
-### Bug debugger: breakpoint write (BUG-5)
-macOS W^X blocks `mach_vm_write` on code pages. Infrastructure ready (ASLR slide, address map, breakpoint arrays). Two solutions:
-1. Compile BRK inline via `--bug` flag (emit BRK at function entry in codegen)
-2. Use `posix_spawn` with `_POSIX_SPAWN_DISABLE_ASLR` + Mach exception ports
-
 ### FFI auto-marshalling
 The compiler knows FFI param types (`int*`, `float`, `double`) but ignores them in codegen. All args passed as 64-bit words. Helpers ready in defs.bsm (`ffi_is_ptr`, `ffi_is_float`, etc.). Needs codegen changes in all 3 backends to route float args to XMM/d-registers and handle int* out-params.
 
 ### ELF dynamic linking (blocks Linux GPU)
 x86_64 ELF writer produces static binaries only. Vulkan/X11 needs PLT/GOT for shared libraries. ~500 lines in `x64_elf.bsm`.
+
+### GPU text (glyph atlas) — blocks snake GPU
+Upload 8x8 bitmap font as Metal texture. Each character = 1 textured quad (2 triangles). Needs: UV coords in vertex format, texture sampler in shader, texture upload at init. ~100 lines in stbrender + _stb_render_macos. Unlocks `render_text` and `render_number`. Same infra reused for sprites.
 
 ### GPU sprites + textures
 Texture upload + sampling on Metal (and Vulkan when ready). Vertex format needs UV coords. Shader update. `render_sprite(tex, x, y, w, h)` in stbrender.bsm.
@@ -68,7 +66,7 @@ Real module identity, versioning, namespaces, package manager. Needed when B++ h
 
 ## P4 — Linux Native (X11 + Vulkan)
 
-1. Syscalls: sys_socket, sys_connect, sys_mmap, sys_munmap, sys_poll
+1. Syscalls: sys_mmap, sys_munmap, sys_poll (sys_socket + sys_connect done)
 2. X11 window via libX11.so FFI
 3. Vulkan GPU backend via libvulkan.so FFI
 4. Test: cross-compile GPU game, run in Docker/VM
@@ -99,8 +97,8 @@ Replacing a binary at the same path may cause SIGKILL. Workaround: use fresh `/t
 ### BUG-4: bootstrap.c is ARM64-only
 Needs regeneration with current C emitter.
 
-### BUG-5: macOS W^X blocks debugger breakpoints
-`mach_vm_write` and `ptrace(PT_WRITE_D)` fail on code pages. Bug debugger can observe/crash-report but cannot set software breakpoints yet.
+### ~~BUG-5: macOS W^X blocks debugger breakpoints~~ RESOLVED
+Solved by delegating to Apple's debugserver via GDB remote protocol. No more direct ptrace/Mach API usage.
 
 ### P2-level: String dedup across modules
 Duplicate strings in modular compilation create duplicate entries in data segment.
@@ -141,3 +139,11 @@ Duplicate strings in modular compilation create duplicate entries in data segmen
 - sys_lseek + sys_fchmod builtins, both backends + C emitter (2026-04-02)
 - sys_unlink + sys_getdents added to ARM64 (were x86_64-only) (2026-04-02)
 - Bug debugger: entitlements fix, ASLR slide fix, lookup_pc fix (2026-04-02)
+- Bug debugger v2: debugserver/gdbserver backend, GDB remote protocol, zero-flag debugging (2026-04-02)
+- sys_socket, sys_connect, sys_usleep builtins — all 3 backends (2026-04-02)
+- Mach-O symbol table: all functions exported (enables debugger without --bug) (2026-04-02)
+- Crash backtrace + crash locals + call depth indentation in bug (2026-04-02)
+- const keyword: compile-time values + functions + DCE (2026-04-02)
+- arr_truncate in stbarray (2026-04-02)
+- Block-scoped auto confirmed working (false myth retracted) (2026-04-02)
+- snake_full.bpp: snake with const + ECS + arena + pool (2026-04-02)

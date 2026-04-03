@@ -2178,3 +2178,129 @@ Triple bootstrap verified stable after each codegen change. Two rounds: ARM64 sy
 - `bug.entitlements` — new: debug entitlements for task_for_pid
 - `README.md` — updated features, stb table, compiler flags
 - `docs/todo.md` — updated status and done list
+
+## 2026-04-02b — Bug Debugger v2: debugserver Backend + Full Debug Features
+
+### Architecture rewrite
+
+Replaced the entire bug debugger backend. Instead of using ptrace/Mach APIs directly (which couldn't write breakpoints due to I-cache issues), bug now delegates to Apple's `debugserver` (macOS) and `gdbserver` (Linux) via the GDB remote protocol over TCP.
+
+```
+bug (B++ program, no entitlements)
+  → spawns debugserver/gdbserver (has kernel-level debug privileges)
+  → communicates via GDB remote protocol over TCP socket
+  → debugserver handles I-cache coherence for software breakpoints
+```
+
+### Zero-flag debugging
+
+The debugger now works with zero special flags:
+
+```bash
+./bpp examples/snake_full.bpp -o build/snake_full
+./bug build/snake_full
+```
+
+Function names are read directly from the Mach-O/ELF symbol table — no `--bug` flag needed for basic function tracing. The `--bug` flag remains available for enhanced debugging (local variables, types) via the `.bug` metadata file.
+
+### New features (all automatic, no flags)
+
+1. **Call depth indentation** — nested calls are visually indented
+2. **Crash backtrace** — FP chain walk shows the full call stack on crash
+3. **Crash locals** — when `.bug` file is present, reads local variables from the target's stack frame via GDB `m` command
+4. **Smart filtering** — with `.bug` file: traces only user functions. Without: traces everything from symbol table.
+
+### Example output: crash report
+
+```
+-> main()
+  -> foo()
+    -> bar()
+
+=== CRASH ===
+signal: SIGSEGV
+pc: 0x0000000104cb8330
+in: bar()
+  locals:
+    x = 45 (0x0000002d)
+    y = 10 (0x0000000a)
+    p = 0  (0x00000000)
+  backtrace:
+    foo()
+    main()
+=============
+```
+
+### New builtins (all 3 backends: C emitter + ARM64 + x86_64)
+
+| Builtin | macOS | Linux | Purpose |
+|---------|-------|-------|---------|
+| `sys_socket(domain, type, proto)` | syscall 97 | syscall 41 | Create TCP/UDP socket |
+| `sys_connect(fd, addr, len)` | syscall 98 | syscall 42 | Connect socket to address |
+| `sys_usleep(microseconds)` | select() timeout | poll() timeout | Sleep for N microseconds |
+
+### Mach-O symbol table
+
+The ARM64 codegen now emits nlist entries for ALL user functions in the Mach-O symbol table. Previously only `_main` and `__mh_execute_header` were exported. Now `nm binary` shows every function, enabling the debugger to work without the `.bug` file.
+
+### New files
+
+- `src/bug_gdb.bsm` — GDB remote protocol client (TCP socket, packet I/O, breakpoints, registers, memory reads, ASLR slide query)
+- `src/bug_observe_macos.bsm` — rewritten: spawns debugserver, Mach-O symbol table parsing, all debug features
+- `src/bug_observe_linux.bsm` — rewritten: spawns gdbserver, ELF symbol table parsing, same debug features
+
+### What was removed
+
+- All ptrace/Mach API code from the observer (task_for_pid, thread_get_state, mach_vm_write, etc.)
+- BRK embedding in codegen (`--bug` no longer modifies the binary)
+- Codesign requirement for the bug binary
+- FFI imports in bug_gdb.bsm (replaced with builtins: sys_socket, sys_read, sys_write)
+
+### BUG-5 resolved
+
+The I-cache coherence issue is permanently solved. Apple's debugserver has kernel-level privileges (`com.apple.private.cs.debugger`) that provide I-cache coherence for software breakpoints. We delegate to it instead of trying to work around the limitation ourselves.
+
+### Bootstrap
+
+gen2==gen3 verified after: sys_socket/sys_connect/sys_usleep builtins, BRK removal, symbol table emission, Mach-O layout changes.
+
+### Const (language feature, same session)
+
+- `const NAME = expr;` — compile-time evaluated constants with full arithmetic
+- `const fn(args) { body }` — compile-time functions with if/else, recursion, composition
+- Negative values supported via T_UNARY wrapping in make_int_lit
+- Dead code elimination: `if (0) { ... }` skipped in ARM64 + x86_64 codegens
+- `const` keyword added to lexer, parser dispatches in parse_program/parse_module
+- const_eval_node: handles T_LIT, T_BINOP, T_UNARY, T_VAR (enum/param lookup), T_CALL
+- const_eval_call: separate function to avoid stack frame overflow (23 vars in one function)
+- const_eval_body: walks T_RET + T_IF for const function evaluation
+- find_enum_idx: returns index (not value) to support negative const values
+- arr_truncate added to stbarray.bsm for const function scope cleanup
+
+### W012 Warning (added then removed)
+
+- Added W012 "auto inside block may corrupt stack" — detected 60+ warnings in compiler
+- Investigation revealed: `a64_pre_reg_vars`/`x64_pre_reg_vars` ALREADY scan T_IF/T_WHILE recursively
+- auto inside blocks was NEVER broken — the pre-scan allocates stack correctly
+- W012 removed as false positive. Bootstrap manual updated to document block-scoped auto as supported.
+- Retracted myth documented in memory alongside the unicode false correlation.
+
+### Snake ECS (`examples/snake_full.bpp`)
+
+- Complete rewrite using const, stbecs, stbarena, stbpool
+- Particles as ECS entities with velocity + lifetime in flags
+- WASD + arrow key input
+- Score ranking system
+- CPU rendering (stbdraw) — GPU version planned (needs render_text via glyph atlas)
+
+### Files Changed (additional)
+
+- `src/bpp_lexer.bsm` — `const` keyword
+- `src/bpp_parser.bsm` — const_eval_node, const_eval_call, const_eval_body, parse_const, const_find_fn, find_enum_idx, make_int_lit negative support, _block_depth (added then removed)
+- `src/aarch64/a64_codegen.bsm` — DCE for T_IF with literal condition
+- `src/x86_64/x64_codegen.bsm` — DCE for T_IF with literal condition
+- `src/bpp_diag.bsm` — negative line number guard (show ? instead)
+- `src/bpp_import.bsm` — moved auto nbuf to function top
+- `stb/stbarray.bsm` — arr_truncate
+- `docs/bootstrap_manual.md` — corrected: auto inside blocks is supported
+- `examples/snake_full.bpp` — new: snake with all game infrastructure

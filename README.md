@@ -1,8 +1,8 @@
 # B++
 
-### Game Infrastructure: Arena + Pool + ECS — 2 April 2026
+### Bug Debugger v2 + Game Infrastructure — 2 April 2026
 
-Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache (per-program isolation, cascading invalidation), native debugger (`bug`), game infrastructure (arena allocator, object pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache, **native debugger** (`bug` — zero-flag function tracing, crash backtrace, local variable dump via debugserver/gdbserver), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
 
 ---
 
@@ -20,10 +20,10 @@ And a standard library that is, itself, a game engine.
 
 ## Latest (2 April 2026)
 
-- **Game infrastructure**: `stbarena` (bump allocator, 8-byte aligned, overflow guard), `stbpool` (fixed-size object pool, O(1) freelist), `stbecs` (entity-component system with milli-unit physics, ID recycling, parallel arrays).
-- **Cache fixed for real**: Go-style modular cache with per-program isolation. Explicit inter-module imports create a real dependency graph. Changing one module auto-invalidates all dependents. `--clean-cache` to wipe.
-- **Bug debugger integrated**: `--bug` flag emits `.bug` debug maps. `bug` program launches/observes/crash-reports target processes.
-- **New syscall builtins**: `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` on both ARM64 and x86_64.
+- **Bug debugger v2**: `./bug ./program` — zero flags, just works. Function tracing with call depth indentation, crash backtrace via FP chain walk, local variable dump on crash. Uses Apple's debugserver (macOS) / gdbserver (Linux) via GDB remote protocol. Reads function names directly from Mach-O/ELF symbol table.
+- **Game infrastructure**: `stbarena` (bump allocator), `stbpool` (O(1) freelist), `stbecs` (entity-component system with milli-unit physics).
+- **New builtins**: `sys_socket`, `sys_connect`, `sys_usleep`, `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` — all three backends.
+- **Cache fixed for real**: Go-style modular cache with per-program isolation and cascading invalidation.
 
 ## The Language
 
@@ -71,29 +71,35 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 
 ## What B++ Has
 
-- **64-bit words** — every value is a 64-bit integer or double, with optional sub-word slices
-- **Structs** — `struct Vec2 { x, y }` with heap (`auto`) or stack (`var`) allocation
+**Language:**
+- **64-bit words** — every value is a 64-bit integer or double
+- **Structs** — `struct Vec2 { x, y }` with heap or stack allocation, packed fields
 - **Enums** — `enum State { MENU, PLAY, PAUSE, OVER }` resolved at compile time
-- **Float math** — `sqrt`, `floor`, `fabs` via system FFI, IEEE 754 doubles
+- **Constants** — `const W = 320;` and `const abs(x) { ... }` with dead code elimination
+- **Type hints** — `auto x: byte`, `auto f: half float` — 5 bases × 4 slices (11 real types)
+- **Syntax sugar** — `buf[i]`, `for` loops, `else if`, string escapes (`\n`, `\t`, `\xHH`)
 - **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
-- **Self-hosting** — the compiler compiles itself
+- **Float math** — `sqrt`, `floor`, `fabs` via FFI, IEEE 754 doubles, half/quarter float codegen
+
+**Compiler:**
+- **Self-hosting** — the compiler compiles itself (fixed-point verified)
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
-- **Compiler diagnostics** — error codes (E001-E201), warnings (W001-W005), file:line locations
-- **Cross-compilation** — compile Linux binaries from macOS (`--linux64`)
-- **Type hints** — `auto x: byte`, `auto f: half float` — optimized encoding with bit-0 float flag (11 real types)
-- **Float sub-types** — `half float` (32-bit, s-register), `quarter float` (16-bit, h-register) — GPU-ready vertex formats
-- **Packed structs** — `struct Pixel { r: byte, g: byte, b: byte, a: byte }` — 4 bytes instead of 32
-- **Array indexing** — `buf[i]` desugars to `*(buf + i * 8)`, reads and writes
-- **for loops** — `for (i = 0; i < n; i = i + 1) { ... }` desugars to while
-- **else if** — chains without extra braces
+- **Cross-compilation** — `bpp --linux64 game.bpp -o game` from macOS
+- **Modular compilation** — Go-style per-module codegen with content-addressed `.bo` cache
+- **Diagnostics** — error codes (E001-E201), warnings (W001-W011), file:line:caret locations
+
+**Debugger (`bug`):**
+- **Zero-flag debugging** — `./bug ./program` just works, reads symbol table from binary
+- **Function tracing** — call depth indentation, every function entry logged
+- **Crash backtrace** — frame pointer chain walk shows full call stack
+- **Local variable dump** — reads variable values from stack frame on crash (with `--bug`)
+- **Cross-platform** — debugserver (macOS) + gdbserver (Linux) via GDB remote protocol
+
+**Game engine (stb):**
 - **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
-- **String escape sequences** — `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\xHH` in string literals
-- **Builtins** — `memcpy`, `realloc`, `shr()`, `assert()`, `putchar_err()`, `sys_mkdir()`, `sys_ptrace()`, `sys_wait4()`, `sys_getdents()`, `sys_unlink()`, `float_ret()`/`float_ret2()`
-- **Native debugger** — `--bug` flag emits `.bug` debug maps, `bug` program observes running processes
-- **Modular compilation** — Go-model per-module codegen with content-addressed .bo cache at `~/.bpp/cache/`
-- **Monolithic fallback** — single-pass pipeline for C emitter, ASM output, and future backends (WASM)
-- **Module dependency tracking** — content + dependency + compiler hashing, topological sort (`--show-deps`)
-- **Install script** — `sh install.sh` bootstraps and installs compiler + stb + drivers globally
+- **Software rendering** — CPU framebuffer with rects, circles, lines, sprites, text
+- **Game infrastructure** — arena allocator, object pool, entity-component system
+- **17 modules** — draw, render, font, game, input, ui, math, col, array, str, buf, file, io, image, arena, pool, ecs
 
 ## What B++ Doesn't Have
 
@@ -210,20 +216,11 @@ The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed
 ### Run Examples
 
 ```bash
-# Snake — native (no dependencies)
-bpp examples/snake_native.bpp -o snake && ./snake
+# Snake with ECS + arena + pool (native, no dependencies)
+bpp examples/snake_full.bpp -o snake && ./snake
 
-# Snake — SDL2 (requires SDL2 installed)
-bpp examples/snake_sdl.bpp -o snake && ./snake
-
-# Snake — raylib (requires raylib installed)
-bpp examples/snake_raylib.bpp -o snake && ./snake
-
-# Interactive demo — SDL2
-bpp examples/sdl_demo.bpp -o demo && ./demo
-
-# Bouncing cubes — raylib direct FFI
-bpp examples/raylib_demo.bpp -o cubes && ./cubes
+# Debug snake with function tracing
+./bug ./snake
 ```
 
 ### Write Your Own
@@ -284,7 +281,8 @@ b++/
 ├── tests/            — Compiler and library tests
 ├── docs/             — Language manual, journal, and evolution roadmap
 ├── ~/.bpp/cache/     — Global module cache (.bo files, content-addressed)
-└── bpp               — The compiler binary
+├── bpp               — The compiler binary
+└── bug               — The debugger binary
 ```
 
 ## Platform Status
@@ -317,7 +315,7 @@ native ARM64 Mach-O binaries with built-in SHA-256 codesigning.
 ```
 bpp source.bpp -o binary       # native ARM64 macOS (default)
 bpp --linux64 src.bpp -o bin   # cross-compile to x86_64 Linux ELF
-bpp --bug source.bpp -o bin    # emit .bug debug map alongside binary
+bpp --bug source.bpp -o bin    # emit .bug debug map (enhanced debugging)
 bpp --c source.bpp              # emit C (for debugging)
 bpp --asm source.bpp            # emit ARM64 assembly
 bpp --show-deps source.bpp     # print module dependency graph
@@ -325,6 +323,15 @@ bpp --clean-cache              # delete all cached .bo files
 ```
 
 16 compiler modules + 17 stb library modules, ~13,000 lines of B++. Self-hosting verified at every stage. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
+
+### The Debugger
+
+```
+./bug ./program                  # trace + crash report (reads symbol table)
+./bug ./program                  # + locals if .bug file present
+```
+
+`bug` is a B++ program that uses the GDB remote protocol to communicate with Apple's debugserver (macOS) or gdbserver (Linux). No entitlements, no codesign, no special flags needed. Function names come from the Mach-O/ELF symbol table automatically.
 
 ## Contributing
 
@@ -408,5 +415,7 @@ SOFTWARE.
 *Cache Fix, sys_fork, Bug Debugger, Structural Overhaul on April 1, 2026.*
 
 *Game Infrastructure: Arena allocator, Object Pool, Entity-Component System, Syscall Builtins, Bug Debugger Fixes on April 2, 2026.*
+
+*Bug Debugger v2: debugserver/gdbserver backend, GDB remote protocol, zero-flag debugging, crash backtrace + locals, sys_socket/sys_connect/sys_usleep builtins, Mach-O symbol table export on April 2, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

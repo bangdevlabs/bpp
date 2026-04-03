@@ -61,6 +61,11 @@ auto mo_sym_off;        // Symbol table file offset.
 auto mo_sym_cnt;        // Number of symbol table entries.
 auto mo_str_off;        // String table file offset.
 auto mo_str_size;       // String table size.
+
+// Function symbol info: populated by the codegen before mo_finalize.
+auto mo_fn_names;       // Dynamic array of packed function names.
+auto mo_fn_offsets;     // Dynamic array of code offsets for each function.
+auto mo_fn_count;       // Number of function symbols to emit.
 // Slack: 32 bytes reserved after load commands for codesign to insert
 // LC_CODE_SIGNATURE without overwriting code bytes.
 
@@ -228,6 +233,9 @@ init_macho() {
     mo_got_syms = arr_new();
     mo_got_libs = arr_new();
     mo_ext_libs = arr_new();
+    mo_fn_names = arr_new();
+    mo_fn_offsets = arr_new();
+    mo_fn_count = 0;
     return 0;
 }
 
@@ -963,13 +971,21 @@ mo_compute_layout(code_size, data_count) {
     // Actual size computed at write time; estimate must be >= actual.
     mo_et_size = 24;                // safe upper bound, actual padded to 8-byte alignment
 
-    mo_sym_cnt = 2;                 // __mh_execute_header + _main
+    // Symbol count: __mh_execute_header + _main + user functions (minus main duplicate).
+    mo_sym_cnt = 2 + mo_fn_count - 1;
     mo_sym_off = mo_et_off + mo_et_size;
     // nlist_64 is 16 bytes each.
 
     mo_str_off = mo_sym_off + mo_sym_cnt * 16;
-    // String table: " \0" + "__mh_execute_header\0" + "_main\0" = 2 + 20 + 6 = 28, padded to 32.
-    mo_str_size = 32;
+    // String table: " \0" (2) + "__mh_execute_header\0" (20) + "_main\0" (6)
+    //   + for each function: "_" + name + "\0"
+    auto fn_str_sz, fi;
+    fn_str_sz = 0;
+    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
+        fn_str_sz = fn_str_sz + 1 + unpack_l(arr_get(mo_fn_names, fi)) + 1;
+    }
+    mo_str_size = 2 + 20 + 6 + fn_str_sz;
+    mo_str_size = (mo_str_size + 7) / 8 * 8;  // 8-byte align
 
     auto linkedit_content, n_code_slots, id_len;
     linkedit_content = mo_cf_size + mo_et_size + mo_sym_cnt * 16 + mo_str_size;
@@ -1279,21 +1295,54 @@ write_macho(filename, main_label, gl_names, gl_count) {
     // Pad to exact symbol table offset.
     mo_pad(mo_sym_off - mo_pos);
 
-    // Symbol table: __mh_execute_header + _main.
-    // __mh_execute_header: strx=2, type=0x0F, sect=1, desc=0x0010
+    // Symbol table: __mh_execute_header + _main + user functions.
     mo_write_nlist(2, 0x0F, 1, 0x0010, MO_VM_BASE, MO_VM_BASE_HI);
-    // _main: strx=22, type=0x0F, sect=1, desc=0x0000
     mo_write_nlist(22, 0x0F, 1, 0x0000,
         MO_VM_BASE + mo_main_off, MO_VM_BASE_HI);
+
+    // Write nlist entries for all user functions.
+    auto fi, fn_strx, fn_name_p, fn_name_len, fn_off, fn_addr_lo, fn_addr_hi;
+    fn_strx = 28;  // Start after " \0" + "__mh_execute_header\0" + "_main\0"
+    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
+        // Skip main — already emitted as the global _main above.
+        if (arr_get(mo_fn_offsets, fi) == main_code_off) {
+            fn_name_len = unpack_l(arr_get(mo_fn_names, fi));
+            fn_strx = fn_strx + 1 + fn_name_len + 1;
+        } else {
+        fn_off = mo_code_off + arr_get(mo_fn_offsets, fi);
+        fn_addr_lo = MO_VM_BASE + fn_off;
+        fn_addr_hi = MO_VM_BASE_HI;
+        if (fn_addr_lo < fn_off) { fn_addr_hi = fn_addr_hi + 1; }
+        // type 0x0E = N_SECT | N_EXT (defined external), sect 1 = __text.
+        mo_write_nlist(fn_strx, 0x0E, 1, 0x0000, fn_addr_lo, fn_addr_hi);
+        fn_name_len = unpack_l(arr_get(mo_fn_names, fi));
+        fn_strx = fn_strx + 1 + fn_name_len + 1;  // "_" + name + "\0"
+        }
+    }
 
     // Pad to exact string table offset.
     mo_pad(mo_str_off - mo_pos);
 
-    // String table: " \0__mh_execute_header\0_main\0" padded to 32.
-    mo_w8(0x20); mo_w8(0);                          // " \0" (2 bytes, index 0-1)
-    mo_wcstr("__mh_execute_header", 19); mo_w8(0);  // 20 bytes (index 2-21)
-    mo_wcstr("_main", 5); mo_w8(0);                 // 6 bytes (index 22-27)
-    mo_pad(4);                                       // pad to 32 bytes
+    // String table: " \0" + "__mh_execute_header\0" + "_main\0" + function names.
+    mo_w8(0x20); mo_w8(0);
+    mo_wcstr("__mh_execute_header", 19); mo_w8(0);
+    mo_wcstr("_main", 5); mo_w8(0);
+
+    // Write each function name as "_<name>\0".
+    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
+        fn_name_p = arr_get(mo_fn_names, fi);
+        fn_name_len = unpack_l(fn_name_p);
+        auto fn_name_off;
+        fn_name_off = unpack_s(fn_name_p);
+        mo_w8('_');  // C symbol prefix
+        auto ci;
+        for (ci = 0; ci < fn_name_len; ci = ci + 1) {
+            mo_w8(peek(a64_sbuf + fn_name_off + ci));
+        }
+        mo_w8(0);
+    }
+    // Pad string table to aligned size.
+    mo_pad(mo_str_off + mo_str_size - mo_pos);
 
     // ── Write code signature ──
     // Pad to mo_cs_off (16-byte aligned).

@@ -1,0 +1,282 @@
+// snake_ecs.bpp — Snake rewritten with B++ game infrastructure.
+// Demonstrates: const, stbecs, stbarena, stbpool.
+
+import "stbgame.bsm";
+import "stbio.bsm";
+import "stbecs.bsm";
+import "stbarena.bsm";
+import "stbpool.bsm";
+
+// ── Compile-time constants ──────────────────────────────────
+
+const W = 320;
+const H = 180;
+const CELL = 10;
+const GRID_W = W / CELL;
+const GRID_H = H / CELL;
+const MAX_BODY = 500;
+const FPS = 5;
+
+const DIR_UP = 0;
+const DIR_RIGHT = 1;
+const DIR_DOWN = 2;
+const DIR_LEFT = 3;
+
+const abs(x) {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+const max(a, b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+// ── Game state ──────────────────────────────────────────────
+
+auto world;         // ECS world for apples and particles
+auto body_pool;     // Pool of body segments (x, y pairs = 16 bytes each)
+auto frame_arena;   // Per-frame scratch memory
+
+auto head_x, head_y;
+auto body, body_len;
+auto facing, dead, score;
+auto apple_x, apple_y;
+
+// Score ranking.
+auto scores, num_scores, score_saved;
+
+// ── Helpers ─────────────────────────────────────────────────
+
+randomize_apple() {
+    apple_x = randi(GRID_W) * CELL;
+    apple_y = randi(GRID_H) * CELL;
+    return 0;
+}
+
+shift_body() {
+    auto i;
+    i = body_len;
+    while (i > 0) {
+        body[i * 2] = body[(i - 1) * 2];
+        body[i * 2 + 1] = body[(i - 1) * 2 + 1];
+        i = i - 1;
+    }
+    return 0;
+}
+
+// ── Particle system (uses ECS) ──────────────────────────────
+
+// Spawn burst of particles at position using ECS.
+spawn_particles(px, py, count, color) {
+    auto i, id;
+    for (i = 0; i < count; i = i + 1) {
+        id = ecs_spawn(world);
+        if (id >= 0) {
+            // Position in milli-units.
+            ecs_set_pos(world, id, px * 1000, py * 1000);
+            // Random velocity in milli-units per second.
+            ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
+            // Flags: color in high bits, lifetime in low byte.
+            ecs_set_flags(world, id, color * 256 + 30);
+        }
+    }
+    return 0;
+}
+
+// Update and draw particles.
+update_particles(dt) {
+    auto i, cap, flags, life;
+    cap = ecs_capacity(world);
+    ecs_physics(world, dt);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            life = flags & 0xFF;
+            if (life <= 0) {
+                ecs_kill(world, i);
+            } else {
+                ecs_set_flags(world, i, (flags & 0xFFFFFF00) + life - 1);
+                auto px, py, color;
+                px = ecs_get_x(world, i) / 1000;
+                py = ecs_get_y(world, i) / 1000;
+                color = (flags >> 8) & 0xFFFFFF;
+                draw_rect(px, py, 3, 3, color);
+            }
+        }
+    }
+    return 0;
+}
+
+// ── Init / Reset ────────────────────────────────────────────
+
+init_game() {
+    head_x = W / 2;
+    head_y = H / 2;
+    body_len = 3;
+    facing = DIR_RIGHT;
+    score = 0;
+    dead = 0;
+    score_saved = 0;
+
+    // Reset body segments using the pool's backing memory directly.
+    auto i;
+    for (i = 0; i < MAX_BODY * 2; i = i + 1) {
+        body[i] = 0;
+    }
+
+    randomize_apple();
+    return 0;
+}
+
+// ── Update ──────────────────────────────────────────────────
+
+update() {
+    auto i, bx, by;
+    if (dead) { return 0; }
+
+    // Input.
+    if (key_down(KEY_UP))    { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
+    if (key_down(KEY_RIGHT)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
+    if (key_down(KEY_DOWN))  { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
+    if (key_down(KEY_LEFT))  { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+
+    if (key_down(KEY_W)) { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
+    if (key_down(KEY_D)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
+    if (key_down(KEY_S)) { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
+    if (key_down(KEY_A)) { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+
+    // Move body.
+    shift_body();
+    body[0] = head_x;
+    body[1] = head_y;
+
+    if (facing == DIR_UP)    { head_y = head_y - CELL; }
+    if (facing == DIR_RIGHT) { head_x = head_x + CELL; }
+    if (facing == DIR_DOWN)  { head_y = head_y + CELL; }
+    if (facing == DIR_LEFT)  { head_x = head_x - CELL; }
+
+    // Wall collision.
+    if (head_x < 0)  { dead = 1; }
+    if (head_x >= W) { dead = 1; }
+    if (head_y < 0)  { dead = 1; }
+    if (head_y >= H) { dead = 1; }
+
+    // Apple collision.
+    if (head_x == apple_x) {
+        if (head_y == apple_y) {
+            score = score + 1;
+            body_len = body_len + 1;
+            // Particle burst at apple position (yellow).
+            spawn_particles(apple_x, apple_y, 8, YELLOW);
+            randomize_apple();
+        }
+    }
+
+    // Self collision.
+    for (i = 0; i < body_len; i = i + 1) {
+        bx = body[i * 2];
+        by = body[i * 2 + 1];
+        if (head_x == bx) {
+            if (head_y == by) {
+                dead = 1;
+                // Red particle burst on death.
+                spawn_particles(head_x, head_y, 16, RED);
+            }
+        }
+    }
+    return 0;
+}
+
+// ── Ranking ─────────────────────────────────────────────────
+
+add_score(s) {
+    auto i, j, pos, cur;
+    pos = num_scores;
+    for (i = 0; i < num_scores; i = i + 1) {
+        cur = scores[i];
+        if (s > cur) { if (pos == num_scores) { pos = i; } }
+    }
+    if (num_scores < 5) { num_scores = num_scores + 1; }
+    j = num_scores - 1;
+    while (j > pos) {
+        scores[j] = scores[j - 1];
+        j = j - 1;
+    }
+    if (pos < 5) { scores[pos] = s; }
+    return 0;
+}
+
+// ── Main ────────────────────────────────────────────────────
+
+main() {
+    auto i, dt;
+
+    game_init(W, H, "B++ Snake (ECS + Arena + Pool)", FPS);
+
+    // Allocate game infrastructure.
+    world = ecs_new(200);
+    frame_arena = arena_new(4096);
+    body = malloc(MAX_BODY * 2 * 8);
+    scores = malloc(40);
+    num_scores = 0;
+
+    init_game();
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        dt = game_dt_ms();
+        arena_reset(frame_arena);
+
+        if (key_pressed(KEY_ESC)) { break; }
+
+        update();
+
+        if (dead) {
+            if (score_saved == 0) {
+                add_score(score);
+                score_saved = 1;
+            }
+            if (key_pressed(KEY_SPACE)) { init_game(); }
+        }
+
+        // ── Draw ────────────────────────────────────────────
+        clear(DARKGRAY);
+
+        // Apple.
+        draw_rect(apple_x, apple_y, CELL - 1, CELL - 1, RED);
+
+        // Body.
+        for (i = 0; i < body_len; i = i + 1) {
+            draw_rect(body[i * 2], body[i * 2 + 1], CELL - 1, CELL - 1, GREEN);
+        }
+
+        // Head.
+        if (dead) { draw_rect(head_x, head_y, CELL - 1, CELL - 1, RED); }
+        else { draw_rect(head_x, head_y, CELL - 1, CELL - 1, WHITE); }
+
+        // Particles (ECS-driven).
+        update_particles(dt);
+
+        // HUD.
+        draw_text("SCORE", 4, 4, 1, WHITE);
+        draw_number(50, 4, 1, WHITE, score);
+
+        if (dead) {
+            draw_rect(80, 50, 160, 80, BLACK);
+            draw_text("GAME OVER", 104, 58, 1, WHITE);
+            draw_text("RANKING", 116, 74, 1, YELLOW);
+            for (i = 0; i < num_scores; i = i + 1) {
+                draw_number(100, 88 + i * 10, 1, WHITE, i + 1);
+                draw_text(".", 108, 88 + i * 10, 1, WHITE);
+                draw_number(120, 88 + i * 10, 1, GREEN, scores[i]);
+            }
+            draw_text("SPACE restart", 96, 122, 1, GRAY);
+        }
+
+        draw_end();
+    }
+
+    arena_free(frame_arena);
+    return 0;
+}

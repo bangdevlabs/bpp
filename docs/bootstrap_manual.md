@@ -75,26 +75,18 @@ The B++ compiler handles UTF-8 in comments correctly. Previous sessions
 incorrectly blamed unicode for crashes — the actual cause was stale .bo cache.
 Unicode in string literals is NOT tested.
 
-### All Variables at Function Top
+### Variables Inside Blocks
 
-Declare all `auto` variables at the top of each function body. Do NOT declare
-variables inside `if`, `for`, or `while` blocks. The codegen may not allocate
-stack space for them, causing silent stack corruption.
+Variables can be declared inside `if`, `for`, or `while` blocks. The codegen
+pre-scans all blocks recursively (`a64_pre_reg_vars`, `x64_pre_reg_vars`) and
+allocates stack space for every `auto` declaration regardless of nesting depth.
 
 ```bpp
-// GOOD
-my_func() {
-    auto i, j, tmp, result;
-    for (i = 0; ...) {
-        tmp = something();
-    }
-}
-
-// BAD — may cause SIGBUS or Heisenbug
+// Both styles work correctly:
 my_func() {
     auto i;
-    for (i = 0; ...) {
-        auto tmp;          // <- stack corruption risk
+    for (i = 0; i < 10; i = i + 1) {
+        auto tmp;          // stack space is pre-allocated
         tmp = something();
     }
 }

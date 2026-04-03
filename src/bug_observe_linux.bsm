@@ -1,90 +1,257 @@
 // bug_observe_linux.bsm -- Linux process observation for the bug debugger.
-// Uses ptrace via sys_ptrace builtin. No FFI needed (static binary).
-// ptrace(PTRACE_GETREGS) reads all registers directly, no root required.
+// Spawns gdbserver and communicates via GDB remote protocol.
+// Same features as macOS observer: indentation, backtrace, crash locals.
 
-// -- ptrace constants (Linux x86_64) --------------------------
+import "bug_gdb.bsm";
 
-auto PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_CONT;
-auto PTRACE_SINGLESTEP, PTRACE_GETREGS, PTRACE_KILL;
-auto SIG_TRAP, SIG_SEGV, SIG_BUS, SIG_ABRT;
+// -- Constants ---------------------------------------------------
 
-// x86_64 user_regs_struct: RIP is at offset 128 (field index 16).
-auto REGS_RIP_OFF;
+auto _gs_port;       // TCP port gdbserver listens on.
+auto _gs_pid;        // PID of gdbserver process.
+
+auto SIGTRAP, SIGSEGV, SIGBUS, SIGABRT;
 
 init_observe() {
-    PTRACE_TRACEME = 0;
-    PTRACE_PEEKTEXT = 1;
-    PTRACE_CONT = 7;
-    PTRACE_SINGLESTEP = 9;
-    PTRACE_GETREGS = 12;
-    PTRACE_KILL = 8;
-    SIG_TRAP = 5;
-    SIG_SEGV = 11;
-    SIG_BUS = 7;
-    SIG_ABRT = 6;
-    REGS_RIP_OFF = 128;
+    SIGTRAP = 5;
+    SIGSEGV = 11;
+    SIGBUS = 7;
+    SIGABRT = 6;
+    _gs_port = 0;
+    _gs_pid = 0;
+    init_gdb(1);
     return 0;
 }
 
-// -- ELF parsing ----------------------------------------------
-// Read the entry point and code section address from the target ELF.
+// -- Helpers -----------------------------------------------------
+
+_itoa(buf, n) {
+    auto tmp, len, i;
+    tmp = malloc(32);
+    len = 0;
+    if (n == 0) { poke(tmp, '0'); len = 1; }
+    while (n > 0) {
+        poke(tmp + len, '0' + (n % 10));
+        len = len + 1;
+        n = n / 10;
+    }
+    for (i = 0; i < len; i = i + 1) {
+        poke(buf + i, peek(tmp + len - 1 - i));
+    }
+    poke(buf + len, 0);
+    free(tmp);
+    return len;
+}
+
+// -- Gdbserver launcher ------------------------------------------
+
+_spawn_gdbserver(target_path, start_idx, argc) {
+    auto pid, argv, host_port, plen, i, cnt;
+    auto gs_path, p;
+
+    gs_path = malloc(32);
+    p = "/usr/bin/gdbserver";
+    i = 0;
+    while (str_peek(p, i) != 0) { poke(gs_path + i, str_peek(p, i)); i = i + 1; }
+    poke(gs_path + i, 0);
+
+    // Pick ephemeral port.
+    pid = sys_fork();
+    if (pid == 0) { sys_exit(0); }
+    sys_wait4(pid, malloc(8), 0, 0);
+    _gs_port = 49152 + (pid & 0x3FFF);
+
+    // Build "localhost:PORT".
+    host_port = malloc(64);
+    p = "localhost:";
+    i = 0;
+    while (str_peek(p, i) != 0) { poke(host_port + i, str_peek(p, i)); i = i + 1; }
+    plen = _itoa(host_port + i, _gs_port);
+
+    // Build argv: [gdbserver, host:port, target, args..., NULL]
+    cnt = argc - start_idx;
+    argv = malloc((cnt + 3 + 1) * 8);
+    argv[0] = gs_path;
+    argv[1] = host_port;
+    argv[2] = target_path;
+    for (i = 0; i < cnt; i = i + 1) {
+        argv[3 + i] = argv_get(start_idx + i);
+    }
+    argv[3 + cnt] = 0;
+
+    pid = sys_fork();
+    if (pid < 0) {
+        out_str("bug: fork failed");
+        out_nl();
+        return 0 - 1;
+    }
+
+    if (pid == 0) {
+        sys_close(1);
+        sys_close(2);
+        sys_open("/dev/null", 1);
+        sys_open("/dev/null", 1);
+        sys_execve(gs_path, argv, 0);
+        sys_exit(127);
+    }
+
+    _gs_pid = pid;
+    return 0;
+}
+
+// -- ELF parsing -------------------------------------------------
 
 auto _elf_text_addr;
 
-parse_elf_header(path) {
-    auto fd, buf, nread, phoff, phnum, phsz, i, pos;
-    auto p_type, p_flags, p_vaddr_lo, p_vaddr_hi, p_offset;
+_rd32(buf, off) {
+    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8) |
+           ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
+}
 
-    buf = malloc(8192);
+_rd64(buf, off) {
+    return _rd32(buf, off) | (_rd32(buf, off + 4) << 32);
+}
+
+// Parse ELF64 to find .text section address and read symbol table
+// for function names (when no .bug file is present).
+parse_elf_header(path) {
+    auto fd, buf, nread, shoff, shnum, shsz, shstrndx;
+    auto i, pos, sh_name, sh_type;
+    auto strtab_off, strtab_size, name_off;
+    auto symtab_off, symtab_size, symtab_entsize, symtab_link;
+    auto sym_strtab_off, sym_strtab_size;
+
+    buf = malloc(262144);
     fd = sys_open(path, 0);
     if (fd < 0) { free(buf); return 0 - 1; }
-    nread = sys_read(fd, buf, 8192);
+    nread = sys_read(fd, buf, 262144);
     sys_close(fd);
     if (nread < 64) { free(buf); return 0 - 1; }
 
-    // Verify ELF magic: 7f 45 4c 46.
     if (peek(buf) != 0x7F) { free(buf); return 0 - 1; }
-    if (peek(buf + 1) != 0x45) { free(buf); return 0 - 1; }
+    if (peek(buf+1) != 0x45) { free(buf); return 0 - 1; }
 
-    // Program header offset (offset 32 in ELF64 header, 8 bytes).
-    phoff = peek(buf + 32) & 0xFF;
-    phoff = phoff | ((peek(buf + 33) & 0xFF) << 8);
-    phoff = phoff | ((peek(buf + 34) & 0xFF) << 16);
-    phoff = phoff | ((peek(buf + 35) & 0xFF) << 24);
+    shoff = _rd64(buf, 40);
+    shsz = (peek(buf+58) & 0xFF) | ((peek(buf+59) & 0xFF) << 8);
+    shnum = (peek(buf+60) & 0xFF) | ((peek(buf+61) & 0xFF) << 8);
+    shstrndx = (peek(buf+62) & 0xFF) | ((peek(buf+63) & 0xFF) << 8);
 
-    // Program header entry size (offset 54, 2 bytes).
-    phsz = (peek(buf + 54) & 0xFF) | ((peek(buf + 55) & 0xFF) << 8);
-
-    // Number of program headers (offset 56, 2 bytes).
-    phnum = (peek(buf + 56) & 0xFF) | ((peek(buf + 57) & 0xFF) << 8);
-
-    // Scan program headers for the first PT_LOAD with execute flag.
     _elf_text_addr = 0;
-    for (i = 0; i < phnum; i = i + 1) {
-        pos = phoff + i * phsz;
-        if (pos + 56 > nread) { free(buf); return 0; }
+    symtab_off = 0;
+    symtab_size = 0;
+    symtab_entsize = 0;
+    symtab_link = 0;
 
-        // p_type (4 bytes at offset 0). PT_LOAD = 1.
-        p_type = peek(buf + pos) & 0xFF;
-        p_type = p_type | ((peek(buf + pos + 1) & 0xFF) << 8);
+    // First pass: find .text section address, .symtab, and section name strtab.
+    if (shoff + shstrndx * shsz + 64 <= nread) {
+        pos = shoff + shstrndx * shsz;
+        strtab_off = _rd64(buf, pos + 24);
+        strtab_size = _rd64(buf, pos + 32);
 
-        // p_flags (4 bytes at offset 4). PF_X = 1.
-        p_flags = peek(buf + pos + 4) & 0xFF;
+        for (i = 0; i < shnum; i = i + 1) {
+            pos = shoff + i * shsz;
+            if (pos + 64 <= nread) {
+                sh_name = _rd32(buf, pos);
+                sh_type = _rd32(buf, pos + 4);
 
-        if (p_type == 1) {
-            if (p_flags & 1) {
-                // Executable PT_LOAD segment. p_vaddr at offset 16 (8 bytes).
-                auto a0, a1, a2, a3, a4, a5, a6, a7;
-                a0 = peek(buf + pos + 16) & 0xFF;
-                a1 = peek(buf + pos + 17) & 0xFF;
-                a2 = peek(buf + pos + 18) & 0xFF;
-                a3 = peek(buf + pos + 19) & 0xFF;
-                a4 = peek(buf + pos + 20) & 0xFF;
-                a5 = peek(buf + pos + 21) & 0xFF;
-                a6 = peek(buf + pos + 22) & 0xFF;
-                a7 = peek(buf + pos + 23) & 0xFF;
-                _elf_text_addr = a0 | (a1 << 8) | (a2 << 16) | (a3 << 24);
-                _elf_text_addr = _elf_text_addr | ((a4 | (a5 << 8) | (a6 << 16) | (a7 << 24)) << 32);
+                name_off = strtab_off + sh_name;
+                if (name_off + 7 <= nread) {
+                    // .text section (SHT_PROGBITS = 1).
+                    if (sh_type == 1) {
+                        if (peek(buf+name_off) == '.') {
+                            if (peek(buf+name_off+1) == 't') {
+                                if (peek(buf+name_off+2) == 'e') {
+                                    if (peek(buf+name_off+3) == 'x') {
+                                        if (peek(buf+name_off+4) == 't') {
+                                            _elf_text_addr = _rd64(buf, pos + 16);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // .symtab section (SHT_SYMTAB = 2).
+                    if (sh_type == 2) {
+                        if (peek(buf+name_off) == '.') {
+                            if (peek(buf+name_off+1) == 's') {
+                                if (peek(buf+name_off+2) == 'y') {
+                                    symtab_off = _rd64(buf, pos + 24);
+                                    symtab_size = _rd64(buf, pos + 32);
+                                    symtab_entsize = _rd64(buf, pos + 56);
+                                    symtab_link = _rd32(buf, pos + 40);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Read the symbol string table (linked from .symtab via sh_link).
+        if (symtab_link > 0) {
+            if (symtab_link < shnum) {
+                pos = shoff + symtab_link * shsz;
+                sym_strtab_off = _rd64(buf, pos + 24);
+                sym_strtab_size = _rd64(buf, pos + 32);
+            }
+        }
+    }
+
+    // Read symbol table entries and build address map.
+    // ELF64 Sym: st_name(4), st_info(1), st_other(1), st_shndx(2), st_value(8), st_size(8) = 24 bytes.
+    if (symtab_off > 0) {
+        if (symtab_entsize == 0) { symtab_entsize = 24; }
+        auto sym_cnt, si, sp;
+        auto st_name, st_info, st_shndx, st_value;
+        auto name_start, name_len, ch, name_packed;
+        sym_cnt = symtab_size / symtab_entsize;
+
+        for (si = 0; si < sym_cnt; si = si + 1) {
+            sp = symtab_off + si * symtab_entsize;
+            if (sp + 24 <= nread) {
+                st_name = _rd32(buf, sp);
+                st_info = peek(buf + sp + 4) & 0xFF;
+                st_shndx = (peek(buf + sp + 6) & 0xFF) | ((peek(buf + sp + 7) & 0xFF) << 8);
+                st_value = _rd64(buf, sp + 8);
+
+                // STT_FUNC = 2 (low nibble of st_info).
+                if ((st_info & 0xF) == 2) {
+                    if (st_value >= _elf_text_addr) {
+                        // Read name from symbol string table.
+                        name_start = sym_strtab_off + st_name;
+                        if (name_start < nread) {
+                            name_len = 0;
+                            ch = peek(buf + name_start + name_len);
+                            while (ch != 0) {
+                                name_len = name_len + 1;
+                                if (name_start + name_len < nread) {
+                                    ch = peek(buf + name_start + name_len);
+                                } else { ch = 0; }
+                            }
+                            if (name_len > 0) {
+                                // Deduplicate by offset.
+                                auto code_off_check, dup, di;
+                                code_off_check = st_value - _elf_text_addr;
+                                dup = 0;
+                                for (di = 0; di < bug_am_count; di = di + 1) {
+                                    if (arr_get(bug_am_off, di) == code_off_check) { dup = 1; }
+                                }
+                                if (dup == 0) {
+                                    // Pack the name into _br_strbuf.
+                                    auto pi, pack_start;
+                                    pack_start = _br_strbuf_pos;
+                                    for (pi = 0; pi < name_len; pi = pi + 1) {
+                                        poke(_br_strbuf + _br_strbuf_pos, peek(buf + name_start + pi));
+                                        _br_strbuf_pos = _br_strbuf_pos + 1;
+                                    }
+                                    name_packed = pack_start + (name_len * 0x100000000);
+                                    bug_am_name = arr_push(bug_am_name, name_packed);
+                                    bug_am_off = arr_push(bug_am_off, code_off_check);
+                                    bug_am_count = bug_am_count + 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -93,201 +260,250 @@ parse_elf_header(path) {
     return 0;
 }
 
-// -- Register reading -----------------------------------------
+// -- Address map lookup ------------------------------------------
 
-auto _regs_buf;
-
-// Read the instruction pointer of a stopped traced child.
-// Uses PTRACE_GETREGS which fills a user_regs_struct buffer.
-read_pc(pid) {
-    auto result;
-    if (_regs_buf == 0) { _regs_buf = malloc(256); }
-
-    result = sys_ptrace(PTRACE_GETREGS, pid, 0, _regs_buf);
-    if (result < 0) { return 0; }
-
-    // RIP is at offset 128 in user_regs_struct (8 bytes, little-endian).
-    return *(_regs_buf + REGS_RIP_OFF);
-}
-
-// -- Address map lookup ---------------------------------------
-
-lookup_pc(pc) {
-    auto i, off, best_fi, best_dist, dist;
-
-    best_fi = 0 - 1;
+lookup_pc(pc, text_base) {
+    auto i, off, best_idx, best_dist, dist;
+    best_idx = 0 - 1;
     best_dist = 0x7FFFFFFFFFFFFFFF;
-
     for (i = 0; i < bug_am_count; i = i + 1) {
         off = arr_get(bug_am_off, i);
-        dist = pc - (_elf_text_addr + off);
+        dist = pc - (text_base + off);
         if (dist >= 0) {
             if (dist < best_dist) {
                 best_dist = dist;
-                best_fi = i;
+                best_idx = i;
             }
         }
     }
-
-    return best_fi;
+    return best_idx;
 }
 
-// -- Process runner -------------------------------------------
+// -- Backtrace: walk RBP chain -----------------------------------
 
-build_argv(start_idx, argc) {
-    auto argv, i, cnt;
-    cnt = argc - start_idx;
-    argv = malloc((cnt + 1) * 8);
-    for (i = 0; i < cnt; i = i + 1) {
-        argv[i] = argv_get(start_idx + i);
+_print_backtrace(text_base) {
+    auto fp, lr, fi, depth;
+    fp = gdb_read_fp();
+    depth = 0;
+    out_str("  backtrace:");
+    out_nl();
+    while (fp != 0) {
+        if (depth > 20) { out_str("    ... (truncated)"); out_nl(); fp = 0; }
+        else {
+            // x86_64 frame: [rbp] = saved_rbp, [rbp+8] = return address
+            lr = gdb_read_mem(fp + 8, 8);
+            if (lr == 0) { fp = 0; }
+            else {
+                fi = lookup_pc(lr, text_base);
+                out_str("    ");
+                if (fi >= 0) {
+                    out_packed(arr_get(bug_am_name, fi));
+                    out_str("()");
+                } else {
+                    out_str("0x");
+                    auto hi;
+                    for (hi = 60; hi >= 0; hi = hi - 4) {
+                        auto d;
+                        d = (lr >> hi) & 0xF;
+                        if (d < 10) { out_ch('0' + d); }
+                        else { out_ch('a' + d - 10); }
+                    }
+                }
+                out_nl();
+                fp = gdb_read_mem(fp, 8);
+                depth = depth + 1;
+            }
+        }
     }
-    argv[cnt] = 0;
-    return argv;
+    return 0;
 }
 
-bug_run(target_path, start_idx, argc) {
-    auto pid, status_buf, sig, exit_code, pc, fi;
-    auto stopped, first_stop;
+// -- Crash locals ------------------------------------------------
 
-    _regs_buf = malloc(256);
+_print_crash_locals(fi, text_base) {
+    auto fp, vcnt, voffs, vnames, vi, val;
 
-    // Parse the ELF header to find the code section address.
-    if (parse_elf_header(target_path) < 0) {
-        out_str("bug: warning: cannot parse ELF header");
+    if (fi >= bug_sk_count) { return 0; }
+    if (fi >= bug_fn_count) { return 0; }
+
+    vcnt = arr_get(bug_sk_vcnt, fi);
+    if (vcnt <= 0) { return 0; }
+
+    fp = gdb_read_fp();
+    voffs = arr_get(bug_sk_voffs, fi);
+    vnames = arr_get(bug_fn_lnames, fi);
+
+    out_str("  locals:");
+    out_nl();
+    for (vi = 0; vi < vcnt; vi = vi + 1) {
+        val = gdb_read_mem(fp + voffs[vi], 8);
+        out_str("    ");
+        if (vnames != 0) { out_packed(vnames[vi]); }
+        else { out_str("var"); out_int(vi); }
+        out_str(" = ");
+        out_int(val);
+        out_str(" (0x");
+        auto hi;
+        for (hi = 28; hi >= 0; hi = hi - 4) {
+            auto d;
+            d = (val >> hi) & 0xF;
+            if (d < 10) { out_ch('0' + d); }
+            else { out_ch('a' + d - 10); }
+        }
+        out_str(")");
         out_nl();
     }
+    return 0;
+}
 
-    // Fork the child process.
-    pid = sys_fork();
-    if (pid < 0) {
-        out_str("bug: fork failed");
+// -- Main runner -------------------------------------------------
+
+bug_run(target_path, start_idx, argc) {
+    auto ret, sig, pc, fi, i;
+    auto text_base, retries;
+    auto call_depth, has_bug;
+
+    has_bug = 0;
+    if (bug_fn_count > 0) { has_bug = 1; }
+
+    // Parse ELF. If no .bug file loaded, also reads symbol table.
+    if (has_bug) {
+        auto save_count;
+        save_count = bug_am_count;
+        parse_elf_header(target_path);
+        bug_am_count = save_count;
+    } else {
+        parse_elf_header(target_path);
+    }
+
+    // Static Linux ELF: no ASLR.
+    text_base = _elf_text_addr;
+
+    // Spawn gdbserver.
+    ret = _spawn_gdbserver(target_path, start_idx, argc);
+    if (ret < 0) { return 1; }
+
+    // Connect (retry up to 5 seconds).
+    retries = 0;
+    ret = 0 - 1;
+    while (retries < 50) {
+        sys_usleep(100000);
+        ret = gdb_connect(_gs_port);
+        if (ret >= 0) { retries = 999; }
+        else { retries = retries + 1; }
+    }
+    if (ret < 0) {
+        out_str("bug: error: cannot connect to gdbserver");
         out_nl();
         return 1;
     }
 
-    if (pid == 0) {
-        // Child: enable tracing and exec the target.
-        sys_ptrace(PTRACE_TRACEME, 0, 0, 0);
-        auto argv;
-        argv = build_argv(start_idx, argc);
-        sys_execve(target_path, argv, 0);
-        sys_exit(127);
+    // Handshake.
+    gdb_handshake();
+    gdb_query_stop();
+
+    // Set breakpoints at all function entry points.
+    auto bp_count;
+    bp_count = 0;
+    for (i = 0; i < bug_am_count; i = i + 1) {
+        auto addr;
+        addr = text_base + arr_get(bug_am_off, i);
+        ret = gdb_set_bp(addr);
+        if (ret == 0) { bp_count = bp_count + 1; }
     }
 
-    // Parent: wait for the child.
-    out_str("bug: observing pid ");
-    out_int(pid);
-    out_str(" (");
-    out_int(bug_fn_count);
-    out_str(" functions mapped)");
+    out_str("bug: ");
+    out_int(bp_count);
+    out_str("/");
+    out_int(bug_am_count);
+    out_str(" breakpoints");
+    if (has_bug) { out_str(" (filtered)"); }
     out_nl();
 
-    status_buf = malloc(8);
-    first_stop = 1;
-    stopped = 1;
+    // Main debug loop with call depth tracking.
+    auto running;
+    running = 1;
+    call_depth = 0;
 
-    while (stopped) {
-        sys_wait4(pid, status_buf, 0, 0);
-        sig = *status_buf & 0xFFFF;
+    while (running) {
+        sig = gdb_continue();
 
-        // Child exited normally: low 7 bits == 0.
-        if ((sig & 0x7F) == 0) {
-            exit_code = (sig >> 8) & 0xFF;
-            out_str("bug: process exited with code ");
-            out_int(exit_code);
+        if (sig == 0) {
+            out_str("bug: exit ");
+            out_int(_gdb_exit_code);
             out_nl();
-            stopped = 0;
-        } else if ((sig & 0x7F) == 0x7F) {
-            // Child stopped by signal.
-            sig = (sig >> 8) & 0xFF;
+            running = 0;
 
-            if (sig == SIG_TRAP) {
-                if (first_stop) {
-                    first_stop = 0;
-                    sys_ptrace(PTRACE_CONT, pid, 0, 0);
-                } else {
-                    pc = read_pc(pid);
-                    if (pc != 0) {
-                        fi = lookup_pc(pc);
-                        out_str("bug: TRAP at ");
-                        out_hex(pc);
-                        if (fi >= 0) {
-                            out_str(" in ");
-                            out_packed(arr_get(bug_fn_name, fi));
-                        }
-                        out_nl();
-                    }
-                    sys_ptrace(PTRACE_CONT, pid, 0, 0);
-                }
-            } else {
-                // Fatal signal.
-                pc = read_pc(pid);
+        } else if (sig == SIGTRAP) {
+            pc = gdb_read_pc();
+            fi = lookup_pc(pc, text_base);
+            if (fi >= 0) {
+                auto d;
+                for (d = 0; d < call_depth; d = d + 1) { out_str("  "); }
+                out_str("-> ");
+                out_packed(arr_get(bug_am_name, fi));
+                out_str("()");
                 out_nl();
-                out_str("=== CRASH REPORT ===");
-                out_nl();
-                out_str("signal: ");
-                if (sig == SIG_SEGV) { out_str("SIGSEGV (segmentation fault)"); }
-                else if (sig == SIG_BUS) { out_str("SIGBUS (bus error)"); }
-                else if (sig == SIG_ABRT) { out_str("SIGABRT (abort)"); }
-                else { out_str("signal "); out_int(sig); }
-                out_nl();
-
-                if (pc != 0) {
-                    out_str("pc:     ");
-                    out_hex(pc);
-                    out_nl();
-
-                    fi = lookup_pc(pc);
-                    if (fi >= 0) {
-                        out_str("func:   ");
-                        out_packed(arr_get(bug_fn_name, fi));
-                        out_str("()");
-                        out_nl();
-
-                        auto lcnt, lnames, ltypes, li;
-                        lcnt = arr_get(bug_fn_lcnt, fi);
-                        lnames = arr_get(bug_fn_lnames, fi);
-                        ltypes = arr_get(bug_fn_ltypes, fi);
-                        if (lcnt > 0) {
-                            out_str("locals: ");
-                            for (li = 0; li < lcnt; li = li + 1) {
-                                if (li > 0) { out_str(", "); }
-                                out_packed(lnames[li]);
-                            }
-                            out_nl();
-                        }
-                    } else {
-                        out_str("func:   (unknown -- address not in .bug map)");
-                        out_nl();
-                        if (_elf_text_addr != 0) {
-                            out_str("text:   ");
-                            out_hex(_elf_text_addr);
-                            out_str("  offset: ");
-                            out_hex(pc - _elf_text_addr);
-                            out_nl();
-                        }
-                    }
-                } else {
-                    out_str("pc:     (could not read registers)");
-                    out_nl();
-                }
-                out_str("====================");
-                out_nl();
-
-                sys_ptrace(PTRACE_KILL, pid, 0, 0);
-                sys_wait4(pid, status_buf, 0, 0);
-                stopped = 0;
+                call_depth = call_depth + 1;
+                if (call_depth > 30) { call_depth = 30; }
             }
-        } else {
-            sig = sig & 0x7F;
-            out_str("bug: process killed by signal ");
-            out_int(sig);
+            gdb_remove_bp(pc);
+            gdb_step();
+            gdb_set_bp(pc);
+
+        } else if (sig > 0) {
+            pc = gdb_read_pc();
             out_nl();
-            stopped = 0;
+            out_str("=== CRASH ===");
+            out_nl();
+            out_str("signal: ");
+            if (sig == SIGSEGV) { out_str("SIGSEGV"); }
+            else if (sig == SIGBUS) { out_str("SIGBUS"); }
+            else if (sig == SIGABRT) { out_str("SIGABRT"); }
+            else { out_str("sig "); out_int(sig); }
+            out_nl();
+
+            if (pc != 0) {
+                out_str("pc: ");
+                out_hex(pc);
+                out_nl();
+
+                fi = lookup_pc(pc, text_base);
+                if (fi >= 0) {
+                    out_str("in: ");
+                    out_packed(arr_get(bug_am_name, fi));
+                    out_str("()");
+                    out_nl();
+                    if (has_bug) { _print_crash_locals(fi, text_base); }
+                }
+                _print_backtrace(text_base);
+            }
+            out_str("=============");
+            out_nl();
+            gdb_kill();
+            running = 0;
+
+        } else {
+            if (sig == 0 - 2) {
+                out_str("bug: killed by signal ");
+                out_int(_gdb_stop_sig);
+                out_nl();
+            } else {
+                out_str("bug: connection lost");
+                out_nl();
+            }
+            running = 0;
         }
     }
 
-    free(_regs_buf);
-    free(status_buf);
+    gdb_disconnect();
+
+    if (_gs_pid > 0) {
+        auto status;
+        status = malloc(8);
+        sys_wait4(_gs_pid, status, 0, 0);
+        free(status);
+    }
+
     return 0;
 }
