@@ -1,59 +1,860 @@
-// stbimage.bsm — Image loading via stb_image FFI.
-// Loads PNG, JPEG, BMP, TGA, GIF from disk into RGBA pixel buffers.
-// Requires libstb_image.dylib installed at /opt/homebrew/lib/.
+// stbimage.bsm — Pure B++ PNG image loader.
+// Reads PNG files (8-bit and 16-bit, interlaced, all color types) and
+// returns RGBA pixel buffers. Zero external dependencies.
+//
+// Translated from Sean Barrett's stb_image.h (public domain).
+// Only the PNG path is included — no JPEG, BMP, TGA, GIF, PSD, HDR.
 //
 // Usage:
 //   import "stbimage.bsm";
-//   auto pixels, w, h;
-//   w = 0; h = 0;
-//   pixels = img_load("assets/player.png", w, h);
-//   draw_sprite(pixels, x, y, w, h);
-//   img_free(pixels);
+//   auto pixels;
+//   pixels = img_load("sprite.png");
+//   if (pixels != 0) {
+//       draw_sprite(pixels, x, y, img_w(), img_h());
+//       img_free(pixels);
+//   }
 
-import "stb_image" {
-    ptr stbi_load(char*, ptr, ptr, ptr, int);
-    void stbi_image_free(ptr);
-}
+import "stbfile.bsm";
+import "stbbuf.bsm";
 
-// Scratch buffer for C int* out-params (stbi_load writes 32-bit ints).
-auto _img_info;
+// ── Module state ─────────────────────────────────────────────
+
+auto _img_w, _img_h, _img_depth, _img_channels;
 
 init_image() {
-    _img_info = malloc(16);
+    _img_w = 0;
+    _img_h = 0;
+    _img_depth = 8;
+    _img_channels = 4;
     return 0;
 }
 
-// Load an image file and return a pointer to RGBA pixel data.
-// Width is stored in img_w(), height in img_h() after the call.
-// Returns 0 on failure.
-//
-// Usage:
-//   auto pixels;
-//   pixels = img_load("player.png");
-//   draw_sprite(pixels, x, y, img_w(), img_h());
-img_load(path) {
-    auto pixels;
-    // Zero the scratch buffer so upper bytes of each int slot are clean.
-    write_u32(_img_info, 0, 0);
-    write_u32(_img_info, 4, 0);
-    write_u32(_img_info, 8, 0);
-    // stbi_load writes 32-bit ints at each pointer.
-    // _img_info+0 = width, _img_info+4 = height, _img_info+8 = channels.
-    pixels = stbi_load(path, _img_info, _img_info + 4, _img_info + 8, 4);
-    return pixels;
-}
+// ── Public API ───────────────────────────────────────────────
 
-// Get width of last loaded image.
-img_w() { return read_u32(_img_info, 0); }
+// Width of last loaded image in pixels.
+img_w() { return _img_w; }
 
-// Get height of last loaded image.
-img_h() { return read_u32(_img_info, 4); }
+// Height of last loaded image in pixels.
+img_h() { return _img_h; }
 
-// Get channel count of last loaded image (before RGBA conversion).
-img_channels() { return read_u32(_img_info, 8); }
+// Bit depth of last loaded image (8 or 16).
+img_depth() { return _img_depth; }
 
-// Free pixel data returned by img_load.
+// Number of channels in original image (1=gray, 2=gray+alpha, 3=RGB, 4=RGBA).
+img_channels() { return _img_channels; }
+
+// Free a pixel buffer returned by img_load.
 img_free(pixels) {
-    if (pixels != 0) { stbi_image_free(pixels); }
+    if (pixels != 0) { free(pixels); }
     return 0;
+}
+
+// ── IO helpers ───────────────────────────────────────────────
+// Read from a memory buffer (loaded via file_read_all).
+
+auto _io_buf, _io_len, _io_pos;
+
+_io_init(buf, len) {
+    _io_buf = buf;
+    _io_len = len;
+    _io_pos = 0;
+    return 0;
+}
+
+_io_get8() {
+    if (_io_pos >= _io_len) { return 0; }
+    auto val;
+    val = peek(_io_buf + _io_pos);
+    _io_pos = _io_pos + 1;
+    return val;
+}
+
+_io_get16be() {
+    auto a, b;
+    a = _io_get8();
+    b = _io_get8();
+    return a * 256 + b;
+}
+
+_io_get32be() {
+    auto a, b, c, d;
+    a = _io_get8();
+    b = _io_get8();
+    c = _io_get8();
+    d = _io_get8();
+    return a * 16777216 + b * 65536 + c * 256 + d;
+}
+
+_io_skip(n) {
+    _io_pos = _io_pos + n;
+    return 0;
+}
+
+_io_getn(dst, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + i, _io_get8());
+    }
+    return 0;
+}
+
+// ── DEFLATE decompressor ─────────────────────────────────────
+// Translates stb_image.h's embedded zlib/deflate decoder.
+// Bit-level reading, Huffman table building, LZ77 sliding window.
+
+// Bit reader state.
+auto _zr_buf, _zr_len, _zr_pos;
+auto _zr_bits, _zr_num;
+
+_zr_init(buf, len) {
+    _zr_buf = buf;
+    _zr_len = len;
+    _zr_pos = 0;
+    _zr_bits = 0;
+    _zr_num = 0;
+    return 0;
+}
+
+// Read n bits from the DEFLATE stream (LSB first).
+_zr_read(n) {
+    auto val;
+    while (_zr_num < n) {
+        if (_zr_pos >= _zr_len) { return 0; }
+        _zr_bits = _zr_bits | (peek(_zr_buf + _zr_pos) << _zr_num);
+        _zr_pos = _zr_pos + 1;
+        _zr_num = _zr_num + 8;
+    }
+    val = _zr_bits & ((1 << n) - 1);
+    _zr_bits = _zr_bits >> n;
+    _zr_num = _zr_num - n;
+    return val;
+}
+
+// ── Huffman table ────────────────────────────────────────────
+// DEFLATE uses two Huffman tables: one for literal/length codes (288 entries)
+// and one for distance codes (32 entries).
+
+// Huffman table following stb_image.h's structure exactly.
+// 9-bit fast lookup + maxcode slow path.
+auto _zh_fast;          // 512-entry fast lookup: (size << 9) | symbol
+auto _zh_firstcode;     // first canonical code of each bit length
+auto _zh_firstsymbol;   // first symbol index of each bit length
+auto _zh_maxcode;       // max code << (16-s) for each bit length (preshift for compare)
+auto _zh_size;          // code length per symbol (indexed by sorted position)
+auto _zh_value;         // symbol value per sorted position
+
+_zh_alloc() {
+    _zh_fast = malloc(512 * 8);
+    _zh_firstcode = malloc(17 * 8);
+    _zh_firstsymbol = malloc(17 * 8);
+    _zh_maxcode = malloc(17 * 8);
+    _zh_size = malloc(288 * 8);
+    _zh_value = malloc(288 * 8);
+    return 0;
+}
+
+// Reverse 16 bits of an integer (stbi__bitreverse16).
+_bitrev16(n) {
+    n = ((n & 0xAAAA) >> 1) | ((n & 0x5555) << 1);
+    n = ((n & 0xCCCC) >> 2) | ((n & 0x3333) << 2);
+    n = ((n & 0xF0F0) >> 4) | ((n & 0x0F0F) << 4);
+    n = ((n & 0xFF00) >> 8) | ((n & 0x00FF) << 8);
+    return n & 0xFFFF;
+}
+
+// Reverse 'bits' bits of v.
+_bitrev(v, bits) {
+    return _bitrev16(v) >> (16 - bits);
+}
+
+// Build a Huffman table from code lengths (stbi__zbuild_huffman).
+_zh_build(sizelist, num) {
+    auto i, k, code, next_code, sizes, s, c, fastv, j;
+    sizes = malloc(17 * 8);
+    next_code = malloc(17 * 8);
+
+    for (i = 0; i < 512; i = i + 1) { _zh_fast[i] = 0; }
+    for (i = 0; i < 17; i = i + 1) { sizes[i] = 0; }
+
+    // Count codes of each length.
+    for (i = 0; i < num; i = i + 1) { sizes[sizelist[i]] = sizes[sizelist[i]] + 1; }
+    sizes[0] = 0;
+
+    // Build firstcode, firstsymbol, maxcode per length.
+    code = 0;
+    k = 0;
+    for (i = 1; i < 16; i = i + 1) {
+        next_code[i] = code;
+        _zh_firstcode[i] = code;
+        _zh_firstsymbol[i] = k;
+        code = code + sizes[i];
+        _zh_maxcode[i] = code << (16 - i);
+        code = code << 1;
+        k = k + sizes[i];
+    }
+    _zh_maxcode[16] = 0x10000;
+
+    // Build size/value tables and fast lookup.
+    for (i = 0; i < num; i = i + 1) {
+        s = sizelist[i];
+        if (s != 0) {
+            c = next_code[s] - _zh_firstcode[s] + _zh_firstsymbol[s];
+            _zh_size[c] = s;
+            _zh_value[c] = i;
+            if (s <= 9) {
+                fastv = (s << 9) | i;
+                j = _bitrev(next_code[s], s);
+                while (j < 512) {
+                    _zh_fast[j] = fastv;
+                    j = j + (1 << s);
+                }
+            }
+            next_code[s] = next_code[s] + 1;
+        }
+    }
+    free(sizes);
+    free(next_code);
+    return 0;
+}
+
+// Decode one Huffman symbol (stbi__zhuffman_decode + slow path).
+_zh_decode() {
+    auto bits9, entry, s, b, k;
+
+    // Ensure at least 16 bits in the buffer.
+    while (_zr_num < 16) {
+        if (_zr_pos >= _zr_len) { break; }
+        _zr_bits = _zr_bits | (peek(_zr_buf + _zr_pos) << _zr_num);
+        _zr_pos = _zr_pos + 1;
+        _zr_num = _zr_num + 8;
+    }
+
+    // Fast path: 9-bit lookup.
+    bits9 = _zr_bits & 511;
+    entry = _zh_fast[bits9];
+    if (entry != 0) {
+        s = (entry >> 9) & 0x1F;
+        _zr_bits = _zr_bits >> s;
+        _zr_num = _zr_num - s;
+        return entry & 0x1FF;
+    }
+
+    // Slow path: use MSB-first comparison with maxcode.
+    k = _bitrev16(_zr_bits) & 0xFFFF;
+    s = 10;
+    while (s < 16) {
+        if (k < _zh_maxcode[s]) { break; }
+        s = s + 1;
+    }
+    if (s >= 16) { return -1; }
+
+    b = (k >> (16 - s)) - _zh_firstcode[s] + _zh_firstsymbol[s];
+    _zr_bits = _zr_bits >> s;
+    _zr_num = _zr_num - s;
+    return _zh_value[b];
+}
+
+// ── DEFLATE inflate ──────────────────────────────────────────
+// Fixed Huffman tables + dynamic tables + LZ77.
+
+auto _inf_out, _inf_out_pos, _inf_out_cap;
+
+// Length base values (codes 257-285).
+auto _len_base, _len_extra;
+// Distance base values (codes 0-29).
+auto _dist_base, _dist_extra;
+
+_inflate_init_tables() {
+    auto i;
+    _len_base = malloc(31 * 8);
+    _len_extra = malloc(31 * 8);
+    _dist_base = malloc(30 * 8);
+    _dist_extra = malloc(30 * 8);
+
+    // Length table (RFC 1951 §3.2.5).
+    auto lb, le;
+    lb = _len_base; le = _len_extra;
+    lb[0]=3; lb[1]=4; lb[2]=5; lb[3]=6; lb[4]=7; lb[5]=8; lb[6]=9; lb[7]=10;
+    lb[8]=11; lb[9]=13; lb[10]=15; lb[11]=17; lb[12]=19; lb[13]=23; lb[14]=27; lb[15]=31;
+    lb[16]=35; lb[17]=43; lb[18]=51; lb[19]=59; lb[20]=67; lb[21]=83; lb[22]=99; lb[23]=115;
+    lb[24]=131; lb[25]=163; lb[26]=195; lb[27]=227; lb[28]=258;
+    le[0]=0; le[1]=0; le[2]=0; le[3]=0; le[4]=0; le[5]=0; le[6]=0; le[7]=0;
+    le[8]=1; le[9]=1; le[10]=1; le[11]=1; le[12]=2; le[13]=2; le[14]=2; le[15]=2;
+    le[16]=3; le[17]=3; le[18]=3; le[19]=3; le[20]=4; le[21]=4; le[22]=4; le[23]=4;
+    le[24]=5; le[25]=5; le[26]=5; le[27]=5; le[28]=0;
+
+    // Distance table (RFC 1951 §3.2.5).
+    auto db, de;
+    db = _dist_base; de = _dist_extra;
+    db[0]=1; db[1]=2; db[2]=3; db[3]=4; db[4]=5; db[5]=7; db[6]=9; db[7]=13;
+    db[8]=17; db[9]=25; db[10]=33; db[11]=49; db[12]=65; db[13]=97; db[14]=129; db[15]=193;
+    db[16]=257; db[17]=385; db[18]=513; db[19]=769; db[20]=1025; db[21]=1537; db[22]=2049; db[23]=3073;
+    db[24]=4097; db[25]=6145; db[26]=8193; db[27]=12289; db[28]=16385; db[29]=24577;
+    de[0]=0; de[1]=0; de[2]=0; de[3]=0; de[4]=1; de[5]=1; de[6]=2; de[7]=2;
+    de[8]=3; de[9]=3; de[10]=4; de[11]=4; de[12]=5; de[13]=5; de[14]=6; de[15]=6;
+    de[16]=7; de[17]=7; de[18]=8; de[19]=8; de[20]=9; de[21]=9; de[22]=10; de[23]=10;
+    de[24]=11; de[25]=11; de[26]=12; de[27]=12; de[28]=13; de[29]=13;
+    return 0;
+}
+
+// Huffman tables for literal/length and distance.
+// Saved Huffman tables for literal/length and distance.
+auto _zh_lit_fast, _zh_lit_fc, _zh_lit_fs, _zh_lit_mc, _zh_lit_sz, _zh_lit_val;
+auto _zh_dst_fast, _zh_dst_fc, _zh_dst_fs, _zh_dst_mc, _zh_dst_sz, _zh_dst_val;
+
+// Save current Huffman globals to literal slot.
+_zh_save_lit() {
+    _zh_lit_fast = _zh_fast; _zh_lit_fc = _zh_firstcode;
+    _zh_lit_fs = _zh_firstsymbol; _zh_lit_mc = _zh_maxcode;
+    _zh_lit_sz = _zh_size; _zh_lit_val = _zh_value;
+    return 0;
+}
+// Save current Huffman globals to distance slot.
+_zh_save_dst() {
+    _zh_dst_fast = _zh_fast; _zh_dst_fc = _zh_firstcode;
+    _zh_dst_fs = _zh_firstsymbol; _zh_dst_mc = _zh_maxcode;
+    _zh_dst_sz = _zh_size; _zh_dst_val = _zh_value;
+    return 0;
+}
+// Restore literal tables as active.
+_zh_use_lit() {
+    _zh_fast = _zh_lit_fast; _zh_firstcode = _zh_lit_fc;
+    _zh_firstsymbol = _zh_lit_fs; _zh_maxcode = _zh_lit_mc;
+    _zh_size = _zh_lit_sz; _zh_value = _zh_lit_val;
+    return 0;
+}
+// Restore distance tables as active.
+_zh_use_dst() {
+    _zh_fast = _zh_dst_fast; _zh_firstcode = _zh_dst_fc;
+    _zh_firstsymbol = _zh_dst_fs; _zh_maxcode = _zh_dst_mc;
+    _zh_size = _zh_dst_sz; _zh_value = _zh_dst_val;
+    return 0;
+}
+
+// Decode a block of Huffman-encoded data (type 1 or 2).
+_inflate_huffman() {
+    auto sym, len, dist, extra, i;
+    while (1) {
+        sym = _zh_decode();
+        if (sym < 256) {
+            // Literal byte.
+            if (_inf_out_pos >= _inf_out_cap) {
+                _inf_out_cap = _inf_out_cap * 2;
+                auto new_buf;
+                new_buf = malloc(_inf_out_cap);
+                memcpy(new_buf, _inf_out, _inf_out_pos);
+                free(_inf_out);
+                _inf_out = new_buf;
+            }
+            poke(_inf_out + _inf_out_pos, sym);
+            _inf_out_pos = _inf_out_pos + 1;
+        } else if (sym == 256) {
+            // End of block.
+            return 0;
+        } else {
+            // Length/distance pair (LZ77 back-reference).
+            sym = sym - 257;
+            len = _len_base[sym] + _zr_read(_len_extra[sym]);
+
+            // Switch to distance table, decode, restore literal table.
+            _zh_use_dst();
+            sym = _zh_decode();
+            _zh_use_lit();
+
+            dist = _dist_base[sym] + _zr_read(_dist_extra[sym]);
+
+            // Grow output if needed.
+            while (_inf_out_pos + len > _inf_out_cap) {
+                _inf_out_cap = _inf_out_cap * 2;
+                auto new_buf;
+                new_buf = malloc(_inf_out_cap);
+                memcpy(new_buf, _inf_out, _inf_out_pos);
+                free(_inf_out);
+                _inf_out = new_buf;
+            }
+
+            // Copy from sliding window.
+            auto src;
+            src = _inf_out_pos - dist;
+            for (i = 0; i < len; i = i + 1) {
+                poke(_inf_out + _inf_out_pos, peek(_inf_out + src));
+                _inf_out_pos = _inf_out_pos + 1;
+                src = src + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Build fixed Huffman tables (block type 1).
+_inflate_fixed_tables() {
+    auto lengths, i;
+    lengths = malloc(288 * 8);
+    for (i = 0; i <= 143; i = i + 1) { lengths[i] = 8; }
+    for (i = 144; i <= 255; i = i + 1) { lengths[i] = 9; }
+    for (i = 256; i <= 279; i = i + 1) { lengths[i] = 7; }
+    for (i = 280; i <= 287; i = i + 1) { lengths[i] = 8; }
+    _zh_build(lengths, 288);
+    _zh_save_lit();
+
+    // Distance: all 5-bit codes.
+    _zh_alloc();
+    for (i = 0; i < 32; i = i + 1) { lengths[i] = 5; }
+    _zh_build(lengths, 32);
+    _zh_save_dst();
+
+    // Restore literal table as active.
+    _zh_use_lit();
+
+    free(lengths);
+    return 0;
+}
+
+// Build dynamic Huffman tables (block type 2).
+_inflate_dynamic_tables() {
+    auto hlit, hdist, hclen, i;
+    auto code_lengths, order;
+    hlit = _zr_read(5) + 257;
+    hdist = _zr_read(5) + 1;
+    hclen = _zr_read(4) + 4;
+
+    order = malloc(19 * 8);
+    order[0]=16; order[1]=17; order[2]=18; order[3]=0;
+    order[4]=8; order[5]=7; order[6]=9; order[7]=6;
+    order[8]=10; order[9]=5; order[10]=11; order[11]=4;
+    order[12]=12; order[13]=3; order[14]=13; order[15]=2;
+    order[16]=14; order[17]=1; order[18]=15;
+
+    code_lengths = malloc(320 * 8);
+    for (i = 0; i < 320; i = i + 1) { code_lengths[i] = 0; }
+
+    // Read code length code lengths.
+    auto cl_lengths;
+    cl_lengths = malloc(19 * 8);
+    for (i = 0; i < 19; i = i + 1) { cl_lengths[i] = 0; }
+    for (i = 0; i < hclen; i = i + 1) {
+        cl_lengths[order[i]] = _zr_read(3);
+    }
+
+    // Build code length Huffman table.
+    _zh_build(cl_lengths, 19);
+
+    // Decode literal/length + distance code lengths.
+    auto n, total;
+    total = hlit + hdist;
+    n = 0;
+    while (n < total) {
+        auto c;
+        c = _zh_decode();
+        if (c < 16) {
+            code_lengths[n] = c;
+            n = n + 1;
+        } else if (c == 16) {
+            auto rep; rep = _zr_read(2) + 3;
+            auto prev; prev = code_lengths[n - 1];
+            for (i = 0; i < rep; i = i + 1) { code_lengths[n + i] = prev; }
+            n = n + rep;
+        } else if (c == 17) {
+            auto rep; rep = _zr_read(3) + 3;
+            for (i = 0; i < rep; i = i + 1) { code_lengths[n + i] = 0; }
+            n = n + rep;
+        } else {
+            auto rep; rep = _zr_read(7) + 11;
+            for (i = 0; i < rep; i = i + 1) { code_lengths[n + i] = 0; }
+            n = n + rep;
+        }
+    }
+
+    // Build literal and distance tables.
+    _zh_alloc();
+    _zh_build(code_lengths, hlit);
+    _zh_save_lit();
+
+    _zh_alloc();
+    _zh_build(code_lengths + hlit * 8, hdist);
+    _zh_save_dst();
+
+    // Set literal as active.
+    _zh_use_lit();
+
+    free(code_lengths);
+    free(cl_lengths);
+    free(order);
+    return 0;
+}
+
+// Main inflate: decompress DEFLATE data.
+// Returns output buffer and sets *out_len.
+_inflate(data, data_len, out_len_ptr) {
+    auto final_block, btype, i;
+    _inflate_init_tables();
+    _zr_init(data, data_len);
+
+    _inf_out_cap = data_len * 4;
+    if (_inf_out_cap < 4096) { _inf_out_cap = 4096; }
+    _inf_out = malloc(_inf_out_cap);
+    _inf_out_pos = 0;
+
+    final_block = 0;
+    while (final_block == 0) {
+        final_block = _zr_read(1);
+        btype = _zr_read(2);
+
+        if (btype == 0) {
+            // Stored block (no compression).
+            _zr_bits = 0; _zr_num = 0;
+            auto len, nlen;
+            len = _zr_read(16);
+            nlen = _zr_read(16);
+            while (_inf_out_pos + len > _inf_out_cap) {
+                _inf_out_cap = _inf_out_cap * 2;
+                auto new_buf;
+                new_buf = malloc(_inf_out_cap);
+                memcpy(new_buf, _inf_out, _inf_out_pos);
+                free(_inf_out);
+                _inf_out = new_buf;
+            }
+            for (i = 0; i < len; i = i + 1) {
+                poke(_inf_out + _inf_out_pos, peek(_zr_buf + _zr_pos));
+                _inf_out_pos = _inf_out_pos + 1;
+                _zr_pos = _zr_pos + 1;
+            }
+        } else if (btype == 1) {
+            // Fixed Huffman codes.
+            _zh_alloc();
+            _inflate_fixed_tables();
+            _inflate_huffman();
+        } else if (btype == 2) {
+            // Dynamic Huffman codes.
+            _zh_alloc();
+            _inflate_dynamic_tables();
+            _inflate_huffman();
+        }
+    }
+
+    *(out_len_ptr) = _inf_out_pos;
+    return _inf_out;
+}
+
+// Decompress a zlib stream (2-byte header + DEFLATE + 4-byte checksum).
+_zlib_decode(data, data_len, out_len_ptr) {
+    // Skip 2-byte zlib header.
+    return _inflate(data + 2, data_len - 6, out_len_ptr);
+}
+
+// ── PNG Paeth predictor ──────────────────────────────────────
+
+_paeth(a, b, c) {
+    auto p, pa, pb, pc;
+    p = a + b - c;
+    pa = p - a; if (pa < 0) { pa = 0 - pa; }
+    pb = p - b; if (pb < 0) { pb = 0 - pb; }
+    pc = p - c; if (pc < 0) { pc = 0 - pc; }
+    if (pa <= pb) {
+        if (pa <= pc) { return a; }
+        return c;
+    }
+    if (pb <= pc) { return b; }
+    return c;
+}
+
+// ── PNG unfilter ─────────────────────────────────────────────
+// Apply PNG scanline filters to raw decompressed data.
+
+_png_unfilter(raw, out, w, h, bpp) {
+    auto stride, i, j, filter, src, dst, prior;
+    stride = w * bpp;
+    src = 0;
+    dst = 0;
+    prior = 0;
+
+    for (j = 0; j < h; j = j + 1) {
+        filter = peek(raw + src);
+        src = src + 1;
+
+        if (filter == 0) {
+            // None: copy raw.
+            memcpy(out + dst, raw + src, stride);
+        } else if (filter == 1) {
+            // Sub: add previous pixel.
+            for (i = 0; i < stride; i = i + 1) {
+                auto val, left;
+                val = peek(raw + src + i);
+                left = 0;
+                if (i >= bpp) { left = peek(out + dst + i - bpp); }
+                poke(out + dst + i, (val + left) & 0xFF);
+            }
+        } else if (filter == 2) {
+            // Up: add pixel from previous scanline.
+            for (i = 0; i < stride; i = i + 1) {
+                auto val, up;
+                val = peek(raw + src + i);
+                up = 0;
+                if (j > 0) { up = peek(out + prior + i); }
+                poke(out + dst + i, (val + up) & 0xFF);
+            }
+        } else if (filter == 3) {
+            // Average: add average of left and up.
+            for (i = 0; i < stride; i = i + 1) {
+                auto val, left, up;
+                val = peek(raw + src + i);
+                left = 0;
+                if (i >= bpp) { left = peek(out + dst + i - bpp); }
+                up = 0;
+                if (j > 0) { up = peek(out + prior + i); }
+                poke(out + dst + i, (val + (left + up) / 2) & 0xFF);
+            }
+        } else if (filter == 4) {
+            // Paeth: add Paeth prediction.
+            for (i = 0; i < stride; i = i + 1) {
+                auto val, left, up, upleft;
+                val = peek(raw + src + i);
+                left = 0;
+                if (i >= bpp) { left = peek(out + dst + i - bpp); }
+                up = 0;
+                if (j > 0) { up = peek(out + prior + i); }
+                upleft = 0;
+                if (i >= bpp) { if (j > 0) { upleft = peek(out + prior + i - bpp); } }
+                poke(out + dst + i, (val + _paeth(left, up, upleft)) & 0xFF);
+            }
+        }
+
+        prior = dst;
+        src = src + stride;
+        dst = dst + stride;
+    }
+    return 0;
+}
+
+// ── PNG pixel expansion ──────────────────────────────────────
+// Convert filtered pixel data to RGBA.
+
+_png_to_rgba(filtered, w, h, color, depth, palette, pal_count) {
+    auto out, src_bpp, src_stride, i, j, sp, dp;
+
+    // Compute source bytes per pixel.
+    if (color == 0) { src_bpp = 1; }                    // Grayscale
+    else if (color == 2) { src_bpp = 3; }               // RGB
+    else if (color == 3) { src_bpp = 1; }               // Palette
+    else if (color == 4) { src_bpp = 2; }               // Gray + Alpha
+    else if (color == 6) { src_bpp = 4; }               // RGBA
+    if (depth == 16) { src_bpp = src_bpp * 2; }
+
+    out = malloc(w * h * 4);
+    sp = 0;
+    dp = 0;
+
+    for (j = 0; j < h; j = j + 1) {
+        for (i = 0; i < w; i = i + 1) {
+            auto r, g, b, a;
+            a = 255;
+
+            if (color == 0) {
+                // Grayscale.
+                if (depth == 16) { r = peek(filtered + sp); sp = sp + 2; }
+                else { r = peek(filtered + sp); sp = sp + 1; }
+                g = r; b = r;
+            } else if (color == 2) {
+                // RGB.
+                if (depth == 16) {
+                    r = peek(filtered + sp); sp = sp + 2;
+                    g = peek(filtered + sp); sp = sp + 2;
+                    b = peek(filtered + sp); sp = sp + 2;
+                } else {
+                    r = peek(filtered + sp); sp = sp + 1;
+                    g = peek(filtered + sp); sp = sp + 1;
+                    b = peek(filtered + sp); sp = sp + 1;
+                }
+            } else if (color == 3) {
+                // Palette.
+                auto idx; idx = peek(filtered + sp); sp = sp + 1;
+                if (idx < pal_count) {
+                    r = peek(palette + idx * 3);
+                    g = peek(palette + idx * 3 + 1);
+                    b = peek(palette + idx * 3 + 2);
+                } else {
+                    r = 0; g = 0; b = 0;
+                }
+            } else if (color == 4) {
+                // Grayscale + Alpha.
+                if (depth == 16) {
+                    r = peek(filtered + sp); sp = sp + 2;
+                    a = peek(filtered + sp); sp = sp + 2;
+                } else {
+                    r = peek(filtered + sp); sp = sp + 1;
+                    a = peek(filtered + sp); sp = sp + 1;
+                }
+                g = r; b = r;
+            } else if (color == 6) {
+                // RGBA.
+                if (depth == 16) {
+                    r = peek(filtered + sp); sp = sp + 2;
+                    g = peek(filtered + sp); sp = sp + 2;
+                    b = peek(filtered + sp); sp = sp + 2;
+                    a = peek(filtered + sp); sp = sp + 2;
+                } else {
+                    r = peek(filtered + sp); sp = sp + 1;
+                    g = peek(filtered + sp); sp = sp + 1;
+                    b = peek(filtered + sp); sp = sp + 1;
+                    a = peek(filtered + sp); sp = sp + 1;
+                }
+            }
+
+            // Write RGBA pixel (stbdraw format: BGRA in memory, or RGBA depending on platform).
+            poke(out + dp, r);
+            poke(out + dp + 1, g);
+            poke(out + dp + 2, b);
+            poke(out + dp + 3, a);
+            dp = dp + 4;
+        }
+    }
+    return out;
+}
+
+// ── PNG parser ───────────────────────────────────────────────
+// Reads PNG chunks and drives decompression + filtering.
+
+_png_load_from_memory(buf, buf_len) {
+    auto w, h, depth, color, interlace;
+    auto idata, idata_len, idata_cap;
+    auto palette, pal_count;
+    auto expanded, exp_len;
+    auto filtered, rgba;
+
+    _io_init(buf, buf_len);
+
+    // Check PNG signature: 137 80 78 71 13 10 26 10.
+    if (_io_get8() != 137) { return 0; }
+    if (_io_get8() != 80) { return 0; }
+    if (_io_get8() != 78) { return 0; }
+    if (_io_get8() != 71) { return 0; }
+    if (_io_get8() != 13) { return 0; }
+    if (_io_get8() != 10) { return 0; }
+    if (_io_get8() != 26) { return 0; }
+    if (_io_get8() != 10) { return 0; }
+
+    idata = 0;
+    idata_len = 0;
+    idata_cap = 0;
+    palette = 0;
+    pal_count = 0;
+    w = 0; h = 0; depth = 8; color = 0; interlace = 0;
+
+    // Parse chunks until IEND.
+    auto done;
+    done = 0;
+    while (done == 0) {
+        auto chunk_len, chunk_type;
+        chunk_len = _io_get32be();
+        chunk_type = _io_get32be();
+
+        // IHDR: image header.
+        if (chunk_type == 0x49484452) {
+            w = _io_get32be();
+            h = _io_get32be();
+            depth = _io_get8();
+            color = _io_get8();
+            _io_skip(3);
+        }
+        // PLTE: palette.
+        else if (chunk_type == 0x504C5445) {
+            pal_count = chunk_len / 3;
+            palette = malloc(chunk_len);
+            _io_getn(palette, chunk_len);
+        }
+        // IDAT: compressed image data.
+        else if (chunk_type == 0x49444154) {
+            // Accumulate IDAT chunks.
+            if (idata == 0) {
+                idata_cap = chunk_len + 4096;
+                idata = malloc(idata_cap);
+            }
+            while (idata_len + chunk_len > idata_cap) {
+                idata_cap = idata_cap * 2;
+                auto new_buf;
+                new_buf = malloc(idata_cap);
+                memcpy(new_buf, idata, idata_len);
+                free(idata);
+                idata = new_buf;
+            }
+            _io_getn(idata + idata_len, chunk_len);
+            idata_len = idata_len + chunk_len;
+        }
+        // IEND: end of image.
+        else if (chunk_type == 0x49454E44) {
+            done = 1;
+        }
+        // Unknown chunk: skip.
+        else {
+            _io_skip(chunk_len);
+        }
+
+        // Skip CRC (4 bytes).
+        _io_skip(4);
+    }
+
+    if (w == 0) { return 0; }
+    if (h == 0) { return 0; }
+    if (idata == 0) { return 0; }
+
+    // Decompress IDAT data.
+    auto exp_len_buf;
+    exp_len_buf = malloc(8);
+    *(exp_len_buf) = 0;
+    expanded = _zlib_decode(idata, idata_len, exp_len_buf);
+    exp_len = *(exp_len_buf);
+    free(exp_len_buf);
+    free(idata);
+
+    if (expanded == 0) { return 0; }
+
+    // Compute bytes per pixel for filtering.
+    auto bpp;
+    if (color == 0) { bpp = 1; }
+    else if (color == 2) { bpp = 3; }
+    else if (color == 3) { bpp = 1; }
+    else if (color == 4) { bpp = 2; }
+    else if (color == 6) { bpp = 4; }
+    if (depth == 16) { bpp = bpp * 2; }
+
+    // Unfilter scanlines.
+    auto stride;
+    stride = w * bpp;
+    filtered = malloc(stride * h);
+    _png_unfilter(expanded, filtered, w, h, bpp);
+    free(expanded);
+
+    // Convert to RGBA.
+    rgba = _png_to_rgba(filtered, w, h, color, depth, palette, pal_count);
+    free(filtered);
+    if (palette != 0) { free(palette); }
+
+    // Store metadata.
+    _img_w = w;
+    _img_h = h;
+    _img_depth = depth;
+    if (color == 0) { _img_channels = 1; }
+    else if (color == 2) { _img_channels = 3; }
+    else if (color == 3) { _img_channels = 1; }
+    else if (color == 4) { _img_channels = 2; }
+    else if (color == 6) { _img_channels = 4; }
+
+    return rgba;
+}
+
+// ── Main entry point ─────────────────────────────────────────
+
+// Load a PNG image from disk. Returns RGBA pixel buffer (or 0 on failure).
+// Use img_w(), img_h(), img_depth() to query dimensions after loading.
+img_load(path) {
+    auto buf, size_buf, size, result;
+    size_buf = malloc(8);
+    *(size_buf) = 0;
+    buf = file_read_all(path, size_buf);
+    size = *(size_buf);
+    free(size_buf);
+    if (buf == 0) { return 0; }
+    result = _png_load_from_memory(buf, size);
+    free(buf);
+    return result;
 }

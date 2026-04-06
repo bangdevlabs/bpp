@@ -16,7 +16,8 @@
 //       render_end();
 //   }
 
-import "stbdraw.bsm";
+import "stbcolor.bsm";
+import "stbfont.bsm";
 
 // Initialize the GPU renderer. Call once after game_init().
 render_init() {
@@ -79,12 +80,12 @@ render_line(x0, y0, x1, y1, color) {
         return 0;
     }
     // Diagonal: thin quad (2 triangles).
-    _stb_gpu_vertex(x0, y0, r, g, b, a);
-    _stb_gpu_vertex(x1, y1, r, g, b, a);
-    _stb_gpu_vertex(x0 + 1, y0 + 1, r, g, b, a);
-    _stb_gpu_vertex(x1, y1, r, g, b, a);
-    _stb_gpu_vertex(x1 + 1, y1 + 1, r, g, b, a);
-    _stb_gpu_vertex(x0 + 1, y0 + 1, r, g, b, a);
+    _stb_gpu_vertex(x0, y0, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x1, y1, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x0 + 1, y0 + 1, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x1, y1, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x1 + 1, y1 + 1, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x0 + 1, y0 + 1, r, g, b, a, 0, 0, 0);
     return 0;
 }
 
@@ -99,9 +100,9 @@ render_circle(cx, cy, radius, color) {
         py = cy + radius * math_sin(i) / 1024;
         nx = cx + radius * math_cos(i + 1) / 1024;
         ny = cy + radius * math_sin(i + 1) / 1024;
-        _stb_gpu_vertex(cx, cy, r, g, b, a);
-        _stb_gpu_vertex(px, py, r, g, b, a);
-        _stb_gpu_vertex(nx, ny, r, g, b, a);
+        _stb_gpu_vertex(cx, cy, r, g, b, a, 0, 0, 0);
+        _stb_gpu_vertex(px, py, r, g, b, a, 0, 0, 0);
+        _stb_gpu_vertex(nx, ny, r, g, b, a, 0, 0, 0);
         i = i + 1;
     }
     return 0;
@@ -129,6 +130,173 @@ render_rect_outline(x, y, w, h, color) {
     render_line(x + w, y + h, x, y + h, color);
     render_line(x, y + h, x, y, color);
     return 0;
+}
+
+// Load a TrueType font and upload its atlas to the GPU.
+// Call after render_init(). Falls back to 8x8 bitmap if loading fails.
+render_font(path, pixel_height) {
+    auto ok;
+    ok = font_load(path, pixel_height);
+    if (ok) {
+        _stb_gpu_upload_atlas(_ttf_atlas, _ttf_atlas_w, _ttf_atlas_h);
+    }
+    return ok;
+}
+
+// Draw text on GPU using the active atlas (TrueType or 8x8 bitmap fallback).
+// Each character becomes a textured quad (6 vertices).
+render_text(text, x, y, sz, color) {
+    auto i, ch, r, g, b, a, u0, v0, u1, v1, dx, dy, gw, gh;
+    r = _rcol_r(color); g = _rcol_g(color);
+    b = _rcol_b(color); a = _rcol_a(color);
+
+    if (font_loaded()) {
+        // TrueType path: variable-width glyphs from pre-rendered atlas.
+        dx = x;
+        i = 0;
+        ch = peek(text + i);
+        while (ch != 0) {
+            if (ch >= 32) { if (ch < 128) {
+                auto idx, ax, ay, xoff, yoff, advance;
+                idx = (ch - 32) * 8;
+                ax = _ttf_glyph_info[idx];
+                ay = _ttf_glyph_info[idx + 1];
+                gw = _ttf_glyph_info[idx + 2];
+                gh = _ttf_glyph_info[idx + 3];
+                xoff = _ttf_glyph_info[idx + 4];
+                yoff = _ttf_glyph_info[idx + 5];
+                advance = _ttf_glyph_info[idx + 6] * sz;
+
+                if (gw > 0) {
+                    // Normalize atlas pixel coords to 0-65535 (shader divides by 65535).
+                    u0 = ax * 65535 / _ttf_atlas_w;
+                    v0 = ay * 65535 / _ttf_atlas_h;
+                    u1 = (ax + gw) * 65535 / _ttf_atlas_w;
+                    v1 = (ay + gh) * 65535 / _ttf_atlas_h;
+                    auto px, py, pw, ph;
+                    px = dx + xoff * sz;
+                    py = y + yoff * sz;
+                    pw = gw * sz;
+                    ph = gh * sz;
+                    _stb_gpu_vertex(px,      py,      r, g, b, a, u0, v0, 255);
+                    _stb_gpu_vertex(px + pw, py,      r, g, b, a, u1, v0, 255);
+                    _stb_gpu_vertex(px,      py + ph, r, g, b, a, u0, v1, 255);
+                    _stb_gpu_vertex(px + pw, py,      r, g, b, a, u1, v0, 255);
+                    _stb_gpu_vertex(px + pw, py + ph, r, g, b, a, u1, v1, 255);
+                    _stb_gpu_vertex(px,      py + ph, r, g, b, a, u0, v1, 255);
+                }
+                dx = dx + advance;
+            } }
+            i = i + 1;
+            ch = peek(text + i);
+        }
+    } else {
+        // Bitmap 8x8 fallback path.
+        auto pw, ph;
+        pw = 8 * sz;
+        ph = 8 * sz;
+        i = 0;
+        ch = peek(text + i);
+        while (ch != 0) {
+            if (ch >= 32) { if (ch < 128) {
+                // Atlas pixel coords in 128x64 bitmap atlas, normalized to 0-65535.
+                u0 = ((ch - 32) % 16) * 8 * 65535 / 128;
+                v0 = ((ch - 32) / 16) * 8 * 65535 / 64;
+                u1 = u0 + 8 * 65535 / 128;
+                v1 = v0 + 8 * 65535 / 64;
+                dx = x + i * pw;
+                _stb_gpu_vertex(dx,      y,      r, g, b, a, u0, v0, 255);
+                _stb_gpu_vertex(dx + pw, y,      r, g, b, a, u1, v0, 255);
+                _stb_gpu_vertex(dx,      y + ph, r, g, b, a, u0, v1, 255);
+                _stb_gpu_vertex(dx + pw, y,      r, g, b, a, u1, v0, 255);
+                _stb_gpu_vertex(dx + pw, y + ph, r, g, b, a, u1, v1, 255);
+                _stb_gpu_vertex(dx,      y + ph, r, g, b, a, u0, v1, 255);
+            } }
+            i = i + 1;
+            ch = peek(text + i);
+        }
+    }
+    return 0;
+}
+
+// Draw an integer number on GPU. Converts to string then calls render_text.
+render_number(x, y, sz, color, val) {
+    auto buf, len, tmp, digit, i, j, t, start;
+    buf = malloc(24);
+    len = 0; start = 0;
+    if (val < 0) { poke(buf, 45); len = 1; start = 1; val = 0 - val; }
+    if (val == 0) { poke(buf + len, 48); len = len + 1; }
+    else {
+        tmp = val;
+        while (tmp > 0) { digit = tmp % 10; poke(buf + len, 48 + digit); len = len + 1; tmp = tmp / 10; }
+    }
+    i = start; j = len - 1;
+    while (i < j) {
+        t = peek(buf + i); poke(buf + i, peek(buf + j)); poke(buf + j, t);
+        i = i + 1; j = j - 1;
+    }
+    poke(buf + len, 0);
+    render_text(buf, x, y, sz, color);
+    free(buf);
+    return 0;
+}
+
+// Create a GPU texture from a 16x16 palette-indexed sprite.
+// spr = 256 bytes (palette indices), pal = palette (ARGB u32 per entry).
+// Returns a texture handle for use with render_sprite().
+render_create_sprite16(spr, pal) {
+    auto rgba, x, y, idx, color;
+    rgba = malloc(16 * 16 * 4);
+    for (y = 0; y < 16; y = y + 1) {
+        for (x = 0; x < 16; x = x + 1) {
+            idx = peek(spr + y * 16 + x);
+            if (idx > 0) {
+                color = read_u32(pal, idx * 4);
+                auto off;
+                off = (y * 16 + x) * 4;
+                poke(rgba + off,     (color >> 16) & 0xFF);  // R
+                poke(rgba + off + 1, (color >> 8) & 0xFF);   // G
+                poke(rgba + off + 2, color & 0xFF);           // B
+                poke(rgba + off + 3, (color >> 24) & 0xFF);  // A
+            } else {
+                // Transparent pixel.
+                auto off;
+                off = (y * 16 + x) * 4;
+                poke(rgba + off, 0); poke(rgba + off + 1, 0);
+                poke(rgba + off + 2, 0); poke(rgba + off + 3, 0);
+            }
+        }
+    }
+    auto tex;
+    tex = _stb_gpu_create_texture(rgba, 16, 16);
+    // Do not free rgba here — replaceRegion may not have finished copying
+    // on Apple Silicon unified memory. The 1KB cost per sprite is negligible.
+    return tex;
+}
+
+// Draw a sprite texture on the GPU at position (x, y).
+// tex = handle from render_create_sprite16(), sz = scale multiplier.
+render_sprite(tex, x, y, sz) {
+    _stb_gpu_sprite(tex, x, y, 16 * sz, 16 * sz, 16, 16);
+    return 0;
+}
+
+// Draw a progress bar (background + filled portion) on GPU.
+render_bar(x, y, w, h, val, max_val, color) {
+    auto fill_w;
+    if (max_val > 0) { fill_w = w * val / max_val; }
+    else { fill_w = 0; }
+    render_rect(x - 1, y - 1, w + 2, h + 2, BLACK);
+    render_rect(x, y, fill_w, h, color);
+    return 0;
+}
+
+// Measure text width in pixels.
+render_measure(text, sz) {
+    auto i;
+    i = 0;
+    while (peek(text + i) != 0) { i = i + 1; }
+    return i * 8 * sz;
 }
 
 // End the GPU render frame — flush batch, present, wait for frame budget, poll input.

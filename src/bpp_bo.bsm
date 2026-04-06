@@ -123,6 +123,10 @@ bo_read_str() {
         vbuf_pos = vbuf_pos + 1;
         bo_pos = bo_pos + 1;
     }
+    // Null-terminate so consumers that scan by character (like mo_atof)
+    // stop at the end of this string instead of reading into the next one.
+    poke(vbuf + vbuf_pos, 0);
+    vbuf_pos = vbuf_pos + 1;
     return pack(start, l);
 }
 
@@ -665,16 +669,22 @@ bo_read_export(mi) {
         pcnt = bo_read_u8();
         // Register return type in the function type table.
         set_func_type(name_p, rty);
-        // Read and store param types + hints.
+        // Read param types and hints from the .bo file.
+        // Param types must be registered in fn_par_types so the codegen
+        // generates correct calling conventions for cross-module calls.
+        auto ptypes;
+        ptypes = 0;
         hints = 0;
-        if (pcnt > 0) { hints = malloc(pcnt * 8); }
+        if (pcnt > 0) { ptypes = malloc(pcnt * 8); hints = malloc(pcnt * 8); }
         for (j = 0; j < pcnt; j = j + 1) {
-            bo_read_u8();
+            auto pt;
+            pt = bo_read_u8();
             h = bo_read_u8();
+            if (ptypes != 0) { ptypes[j] = pt; }
             if (hints != 0) { *(hints + j * 8) = h; }
         }
         // Create a dummy function record so codegen can find it by name.
-        // body_arr=0, body_cnt=0: signals a cached function (ADENDO A).
+        // body_arr=0, body_cnt=0: signals a cached function (no re-emit).
         rec = malloc(NODE_SZ);
         *(rec + FN_TYPE) = 22;
         *(rec + FN_NAME) = name_p;
@@ -686,6 +696,17 @@ bo_read_export(mi) {
         funcs = arr_push(funcs, rec);
         func_cnt = arr_len(funcs);
         func_mods = arr_push(func_mods, mi);
+        // Grow per-function type arrays to match func_cnt, then store
+        // param types and return type so the codegen generates correct
+        // calling conventions for cross-module calls.
+        while (arr_len(fn_par_types) < func_cnt) {
+            fn_vt_data = arr_push(fn_vt_data, 0);
+            fn_vt_cnts = arr_push(fn_vt_cnts, 0);
+            fn_ret_types = arr_push(fn_ret_types, 0);
+            fn_par_types = arr_push(fn_par_types, 0);
+        }
+        arr_set(fn_par_types, func_cnt - 1, ptypes);
+        arr_set(fn_ret_types, func_cnt - 1, rty);
     }
 
     // Structs: register definitions and fields.

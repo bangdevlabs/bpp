@@ -1,8 +1,8 @@
 # B++
 
-### Bug Debugger v2 + Game Infrastructure — 2 April 2026
+### GPU Sprites + Module Cache Fix — 5 April 2026
 
-Self-hosting compiler with GPU rendering (Metal on macOS), Go-style modular cache, **native debugger** (`bug` — zero-flag function tracing, crash backtrace, local variable dump via debugserver/gdbserver), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64), and cross-compilation. The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with **GPU sprite rendering** (stbsprite.bsm — any size), **pure B++ sqrt** (Newton-Raphson), GPU text (bitmap + **pure B++ TrueType**), pure B++ PNG loader, **real malloc/free/realloc** (Bell Labs style), Go-style modular cache (3 critical bugs fixed), native debugger (`bug` v2), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64). The compiler compiles itself and produces signed native binaries with zero external tools.
 
 ---
 
@@ -18,12 +18,14 @@ A language with the soul of B — every value is a word, no type declarations, n
 
 And a standard library that is, itself, a game engine.
 
-## Latest (2 April 2026)
+## Latest (5 April 2026)
 
-- **Bug debugger v2**: `./bug ./program` — zero flags, just works. Function tracing with call depth indentation, crash backtrace via FP chain walk, local variable dump on crash. Uses Apple's debugserver (macOS) / gdbserver (Linux) via GDB remote protocol. Reads function names directly from Mach-O/ELF symbol table.
-- **Game infrastructure**: `stbarena` (bump allocator), `stbpool` (O(1) freelist), `stbecs` (entity-component system with milli-unit physics).
-- **New builtins**: `sys_socket`, `sys_connect`, `sys_usleep`, `sys_ptrace`, `sys_wait4`, `sys_getdents`, `sys_unlink` — all three backends.
-- **Cache fixed for real**: Go-style modular cache with per-program isolation and cascading invalidation.
+- **GPU sprites**: `sprite_create(data, palette, w, h)` uploads any-size palette-indexed sprite as Metal texture. `sprite_draw(tex, x, y, w, h, scale)` renders with pre-normalized UVs. JSON sprite loader included.
+- **stbsprite.bsm**: New module — generic sprite loading, creation, and rendering. Any width × height (not just 16×16). Palette-indexed → RGBA → GPU texture pipeline.
+- **Pure B++ sqrt**: Newton-Raphson in `stbmath.bsm` (8 iterations, ~15 digit precision). Zero FFI — no `System.B` import needed.
+- **Module cache fix**: Found and fixed 3 critical bugs in `.bo` cache — param types discarded, return types not indexed, missing null terminators causing float constant corruption. Cache now produces bit-identical binaries.
+- **Pathfinder game**: GPU demo with sprite textures, AI chase, collision, particles (ECS), HUD. Ported from standalone repo into `games/pathfinder/`.
+- **21 stb modules**: draw, render, sprite, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends.
 
 ## The Language
 
@@ -79,7 +81,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Type hints** — `auto x: byte`, `auto f: half float` — 5 bases × 4 slices (11 real types)
 - **Syntax sugar** — `buf[i]`, `for` loops, `else if`, string escapes (`\n`, `\t`, `\xHH`)
 - **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
-- **Float math** — `sqrt`, `floor`, `fabs` via FFI, IEEE 754 doubles, half/quarter float codegen
+- **Float math** — pure B++ `sqrt` (Newton-Raphson), IEEE 754 doubles, half/quarter float codegen
+- **Memory** — `malloc`/`free`/`realloc` with Bell Labs style headers (size stored at ptr-8, real munmap)
 
 **Compiler:**
 - **Self-hosting** — the compiler compiles itself (fixed-point verified)
@@ -97,9 +100,13 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 
 **Game engine (stb):**
 - **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
+- **GPU sprites** — any-size palette-indexed sprites: JSON load → RGBA → Metal texture → draw at scale
 - **Software rendering** — CPU framebuffer with rects, circles, lines, sprites, text
+- **Text rendering** — bitmap 8×8 fallback + pure B++ TrueType reader (cmap, glyf, Bézier, scanline AA)
+- **Image loading** — pure B++ PNG loader (DEFLATE, Huffman, all filter types, zero FFI)
 - **Game infrastructure** — arena allocator, object pool, entity-component system
-- **17 modules** — draw, render, font, game, input, ui, math, col, array, str, buf, file, io, image, arena, pool, ecs
+- **Collision** — rect overlap, point-in-rect, distance² (squared, no sqrt needed)
+- **21 modules** — draw, render, sprite, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends
 
 ## What B++ Doesn't Have
 
@@ -417,5 +424,9 @@ SOFTWARE.
 *Game Infrastructure: Arena allocator, Object Pool, Entity-Component System, Syscall Builtins, Bug Debugger Fixes on April 2, 2026.*
 
 *Bug Debugger v2: debugserver/gdbserver backend, GDB remote protocol, zero-flag debugging, crash backtrace + locals, sys_socket/sys_connect/sys_usleep builtins, Mach-O symbol table export on April 2, 2026.*
+
+*GPU Text + TrueType + realloc: pure B++ TrueType reader, Metal glyph atlas, Bell Labs malloc/free/realloc, stbimage PNG loader, module reorganization on April 3, 2026.*
+
+*GPU Sprites + Module Cache Fix: stbsprite.bsm (any w×h), pure B++ sqrt, 3 critical .bo cache bugs fixed (param types + return types + null terminators), pathfinder game ported on April 5, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

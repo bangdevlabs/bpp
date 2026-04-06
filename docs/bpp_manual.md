@@ -838,3 +838,8 @@ resolved after all modules are loaded.
 *Dynamic array migration and type hints completed on March 26, 2026.*
 *.bo cache fix, compiler self-hash on March 30, 2026.*
 *Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err on March 31, 2026.*
+*GPU rendering (Metal), Go-style cache, escape sequences on March 31, 2026.*
+*Cache overhaul (4 bugs), GPU render API, platform-agnostic trig on March 31, 2026.*
+*Arena allocator, Object Pool, ECS, Bug Debugger v2 on April 2, 2026.*
+*GPU text + pure B++ TrueType, Bell Labs realloc, PNG loader on April 3, 2026.*
+*GPU sprites (stbsprite.bsm), pure B++ sqrt, 3 critical .bo cache bugs fixed on April 5, 2026.*

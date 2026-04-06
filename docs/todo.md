@@ -1,29 +1,43 @@
 # B++ Roadmap
 
-## Status: 2026-04-02
+## Status: 2026-04-03
 
-GPU rendering working (Metal macOS). Go-style modular cache with per-program isolation. Native debugger (`bug`) with debugserver/gdbserver backend — zero-flag function tracing, crash backtrace, locals dump. Game infrastructure (arena, pool, ECS). Type system: Base×Slice with FLOAT_H/Q codegen. Two backends (ARM64 + x86_64). `buf[i]` and `for` loop syntax sugar. 17 stb modules. New builtins: sys_socket, sys_connect, sys_usleep.
+GPU text rendering working (bitmap 8x8 + TrueType with antialiasing). Pure B++ PNG loader (stbimage.bsm). Pure B++ TrueType reader (stbfont.bsm). realloc with header (Bell Labs style) — malloc stores size, free does real munmap, realloc copies automatically. Module reorganization: stbcolor (palette), stbfont (font data + TTF), stbrender (GPU), stbdraw (CPU) — fully independent. 18 stb modules. Go-style modular cache. Native debugger (bug v2). Two backends (ARM64 + x86_64).
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
 ---
 
+## Done (this cycle)
+
+- **GPU text**: render_text + render_number on Metal, 16-byte vertex with UV+texture, glyph atlas
+- **TrueType**: pure B++ reader (~500 lines), cmap, glyf, rasterizer with AA, atlas builder, font_load()
+- **stbimage.bsm**: pure B++ PNG loader (876 lines), DEFLATE fixed
+- **realloc**: header-based (3 backends), free does real munmap, 2-arg API
+- **stbcolor.bsm**: color palette as independent module
+- **Module reorg**: stbrender independent of stbdraw
+
+---
+
 ## P0 — Next Up
 
-### FFI auto-marshalling
-The compiler knows FFI param types (`int*`, `float`, `double`) but ignores them in codegen. All args passed as 64-bit words. Helpers ready in defs.bsm (`ffi_is_ptr`, `ffi_is_float`, etc.). Needs codegen changes in all 3 backends to route float args to XMM/d-registers and handle int* out-params.
-
-### ELF dynamic linking (blocks Linux GPU)
-x86_64 ELF writer produces static binaries only. Vulkan/X11 needs PLT/GOT for shared libraries. ~500 lines in `x64_elf.bsm`.
-
-### GPU text (glyph atlas) — blocks snake GPU
-Upload 8x8 bitmap font as Metal texture. Each character = 1 textured quad (2 triangles). Needs: UV coords in vertex format, texture sampler in shader, texture upload at init. ~100 lines in stbrender + _stb_render_macos. Unlocks `render_text` and `render_number`. Same infra reused for sprites.
+### Retina support
+contentsScale = 2.0 on CAMetalLayer. Render at 2x physical pixels. Needs drawable size query for shader uniforms.
 
 ### GPU sprites + textures
-Texture upload + sampling on Metal (and Vulkan when ready). Vertex format needs UV coords. Shader update. `render_sprite(tex, x, y, w, h)` in stbrender.bsm.
+Texture upload infra done (glyph atlas uses it). Needs: `render_sprite(tex, x, y, w, h)` with arbitrary textures. Load PNG via stbimage.bsm → upload as MTLTexture → render with UV quads.
+
+### Snake GPU migration
+Replace draw_* → render_* in examples/snake_full.bpp. ~15 lines. Blocked on nothing — all infra ready.
 
 ### Platformer test game
-`games/platformer/game.bpp` exists with placeholder graphics. Needs: stb_image FFI for PNG loading, real Kenney assets, enemies, scrolling camera. Stress-tests all stb modules.
+`games/platformer/game.bpp` exists with placeholder graphics. Needs: real Kenney assets via stbimage, enemies, scrolling camera. Stress-tests all stb modules.
+
+### FFI auto-marshalling
+The compiler knows FFI param types but ignores them in codegen. Helpers ready in defs.bsm. Needs codegen changes in all 3 backends.
+
+### ELF dynamic linking (blocks Linux GPU)
+x86_64 ELF writer produces static binaries only. Vulkan/X11 needs PLT/GOT for shared libraries.
 
 ---
 

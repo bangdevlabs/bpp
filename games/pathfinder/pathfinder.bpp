@@ -1,0 +1,275 @@
+// pathfinder.bpp — A rat chased by a cat on a 320x180 Metal-rendered screen.
+// Demonstrates: GPU sprites (stbsprite), render_text, arena, pool, ECS, collision.
+// Ported from mcu-bpp/src/mcu_gpu.bpp. Sprites now loaded via stbsprite.bsm.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbsprite.bsm";
+import "stbcol.bsm";
+import "stbfile.bsm";
+import "stbecs.bsm";
+import "stbarena.bsm";
+import "stbpool.bsm";
+
+
+// ── Constants ────────────────────────────────────────────
+
+const SCREEN_W   = 320;
+const SCREEN_H   = 180;
+const CELL       = 16;
+const PARTICLE_MAX = 100;
+const SPR_SIZE   = 16;
+
+// ── Palette ──────────────────────────────────────────────
+
+auto PAL;
+
+// Allocate and fill the shared 8-color palette (ARGB u32 format).
+init_palette() {
+    PAL = malloc(8 * 4);
+    write_u32(PAL, 0,  0x00000000);  // 0: transparent
+    write_u32(PAL, 4,  0xFF000000);  // 1: black
+    write_u32(PAL, 8,  0xFF8C1A1A);  // 2: dark red
+    write_u32(PAL, 12, 0xFF808080);  // 3: gray
+    write_u32(PAL, 16, 0xFFFFA500);  // 4: orange
+    write_u32(PAL, 20, 0xFF008000);  // 5: green
+    write_u32(PAL, 24, 0xFF800080);  // 6: purple
+    write_u32(PAL, 28, 0xFFFFFF00);  // 7: yellow
+    return 0;
+}
+
+// ── Game State ───────────────────────────────────────────
+
+auto spr_rat_data, spr_cat_data;
+auto tex_rat, tex_cat;
+
+auto rat_x: float, rat_y: float, rat_speed: float;
+auto rat_hp, rat_max_hp, rat_size;
+
+auto cat_x: float, cat_y: float, cat_speed: float;
+auto cat_size;
+
+auto invuln_timer: float, game_over;
+auto frame_arena;
+auto world;
+
+auto score, score_timer: float;
+
+// ── Init ─────────────────────────────────────────────────
+
+init_game() {
+    rat_x = 160.0; rat_y = 90.0;
+    rat_speed = 90.0; rat_size = SPR_SIZE;
+    rat_hp = 3; rat_max_hp = 3;
+
+    cat_x = 32.0; cat_y = 32.0;
+    cat_speed = 65.0; cat_size = SPR_SIZE;
+
+    invuln_timer = 0.0; game_over = 0;
+    score = 0; score_timer = 0.0;
+    return 0;
+}
+
+// ── Update ───────────────────────────────────────────────
+
+// Move the rat based on keyboard input. Normalizes diagonal movement.
+update_rat(dt: float) {
+    auto vx, vy, len;
+    vx = 0.0; vy = 0.0;
+    if (key_down(KEY_W) | key_down(KEY_UP))    { vy = vy - 1.0; }
+    if (key_down(KEY_S) | key_down(KEY_DOWN))  { vy = vy + 1.0; }
+    if (key_down(KEY_A) | key_down(KEY_LEFT))  { vx = vx - 1.0; }
+    if (key_down(KEY_D) | key_down(KEY_RIGHT)) { vx = vx + 1.0; }
+    if (vx != 0.0) { if (vy != 0.0) {
+        len = sqrt(vx * vx + vy * vy);
+        vx = vx / len; vy = vy / len;
+    } }
+    rat_x = rat_x + vx * rat_speed * dt;
+    rat_y = rat_y + vy * rat_speed * dt;
+    if (rat_x < 0.0)   { rat_x = 0.0; }
+    if (rat_y < 0.0)   { rat_y = 0.0; }
+    if (rat_x > 304.0) { rat_x = 304.0; }
+    if (rat_y > 164.0) { rat_y = 164.0; }
+    return 0;
+}
+
+// Move the cat directly toward the rat each frame.
+update_cat(dt: float) {
+    auto dx, dy, len, move;
+    dx = rat_x - cat_x;
+    dy = rat_y - cat_y;
+    len = sqrt(dx * dx + dy * dy);
+    if (len > 1.0) { dx = dx / len; dy = dy / len; }
+    move = cat_speed * dt;
+    cat_x = cat_x + dx * move;
+    cat_y = cat_y + dy * move;
+    if (cat_x < 0.0)   { cat_x = 0.0; }
+    if (cat_y < 0.0)   { cat_y = 0.0; }
+    if (cat_x > 304.0) { cat_x = 304.0; }
+    if (cat_y > 164.0) { cat_y = 164.0; }
+    return 0;
+}
+
+// Handle score accumulation, invulnerability cooldown, and collision.
+// On hit, spawns red damage particles via the ECS world.
+update_mechanics(dt: float) {
+    if (game_over) { return 0; }
+
+    // Increment survival score once per second.
+    score_timer = score_timer + dt;
+    if (score_timer >= 1.0) { score = score + 1; score_timer = score_timer - 1.0; }
+
+    // Count down invulnerability window after a hit.
+    if (invuln_timer > 0.0) { invuln_timer = invuln_timer - dt; }
+
+    // Rect-vs-rect collision between rat and cat.
+    if (invuln_timer <= 0.0) {
+        if (rect_overlap(rat_x, rat_y, rat_size * 1.0, rat_size * 1.0,
+                          cat_x, cat_y, cat_size * 1.0, cat_size * 1.0)) {
+            rat_hp = rat_hp - 1;
+            if (rat_hp <= 0) { rat_hp = 0; game_over = 1; }
+            else { invuln_timer = 0.6; }
+
+            // Spawn 8 red particles at the rat's position.
+            auto pi, id;
+            for (pi = 0; pi < 8; pi = pi + 1) {
+                id = ecs_spawn(world);
+                if (id >= 0) {
+                    ecs_set_pos(world, id, rat_x * 1000, rat_y * 1000);
+                    ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
+                    ecs_set_flags(world, id, 0xFF0000 * 256 + 20);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Step ECS physics and draw each live particle as a 2x2 red rect.
+// Life counter is stored in the low byte of the entity flags.
+update_particles(dt) {
+    auto i, cap, flags, life;
+    cap = ecs_capacity(world);
+    ecs_physics(world, dt);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            life = flags & 0xFF;
+            if (life <= 0) {
+                ecs_kill(world, i);
+            } else {
+                ecs_set_flags(world, i, (flags & 0xFFFFFF00) + life - 1);
+                auto px, py, color;
+                px = ecs_get_x(world, i) / 1000;
+                py = ecs_get_y(world, i) / 1000;
+                color = (flags >> 8) & 0xFFFFFF;
+                render_rect(px, py, 2, 2, color);
+            }
+        }
+    }
+    return 0;
+}
+
+// Reset all game state to starting values without reallocating anything.
+reset_game() {
+    rat_x = 160.0; rat_y = 90.0;
+    rat_hp = rat_max_hp;
+    cat_x = 32.0; cat_y = 32.0;
+    invuln_timer = 0.0; game_over = 0;
+    score = 0; score_timer = 0.0;
+    return 0;
+}
+
+// ── Main ─────────────────────────────────────────────────
+
+main() {
+    auto dt;
+
+    game_init(320, 180, "Pathfinder (B++ GPU)", 60);
+    render_init();
+
+    init_palette();
+
+    // Allocate raw sprite buffers, load JSON data, upload to GPU.
+    spr_rat_data = malloc(SPR_SIZE * SPR_SIZE);
+    spr_cat_data = malloc(SPR_SIZE * SPR_SIZE);
+    load_sprite("assets/sprites/rat_sprite.json", spr_rat_data, SPR_SIZE, SPR_SIZE);
+    load_sprite("assets/sprites/cat_sprite.json", spr_cat_data, SPR_SIZE, SPR_SIZE);
+
+    // DEBUG: print first 16 bytes of rat sprite to terminal.
+    print_msg("rat row0: ");
+    auto di;
+    for (di = 0; di < 16; di = di + 1) {
+        print_int(peek(spr_rat_data + di));
+        print_char(' ');
+    }
+    print_ln();
+
+    // TEST: use sprite_create from stbsprite instead of render_create_sprite16.
+    tex_rat = sprite_create(spr_rat_data, PAL, SPR_SIZE, SPR_SIZE);
+    tex_cat = sprite_create(spr_cat_data, PAL, SPR_SIZE, SPR_SIZE);
+
+    // Set up game infrastructure.
+    world = ecs_new(PARTICLE_MAX);
+    frame_arena = arena_new(4096);
+
+    init_game();
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        dt = game_dt();
+        arena_reset(frame_arena);
+
+        if (key_pressed(KEY_ESC)) { break; }
+
+        if (game_over == 0) {
+            update_rat(dt);
+            update_cat(dt);
+            update_mechanics(dt);
+        } else {
+            if (key_pressed(KEY_SPACE)) { reset_game(); }
+        }
+
+        // ── Render ───────────────────────────────────────
+        render_begin();
+        render_clear(DARKGRAY);
+
+        // Draw the rat sprite; blink every other frame when invulnerable.
+        auto rx, ry, cx, cy;
+        rx = rat_x; ry = rat_y;
+        cx = cat_x; cy = cat_y;
+
+        if (invuln_timer <= 0.0) {
+            render_sprite(tex_rat, rx, ry, 1);
+        } else {
+            if (score & 1) { render_sprite(tex_rat, rx, ry, 1); }
+        }
+
+        render_sprite(tex_cat, cx, cy, 1);
+
+        // Advance and draw damage particles (passes dt in milliseconds).
+        auto dt_ms;
+        dt_ms = game_dt_ms();
+        update_particles(dt_ms);
+
+        // HUD: health bar + score display.
+        render_bar(8, 4, 60, 6, rat_hp, rat_max_hp, RED);
+        render_text("SCORE", 230, 4, 1, WHITE);
+        render_number(272, 4, 1, YELLOW, score);
+
+        // Game-over overlay: score summary + restart prompt.
+        if (game_over) {
+            render_rect(80, 50, 160, 80, BLACK);
+            render_text("GAME OVER", 104, 62, 1, WHITE);
+            render_text("SCORE", 128, 80, 1, YELLOW);
+            render_number(140, 92, 2, WHITE, score);
+            render_text("SPACE restart", 96, 116, 1, GRAY);
+        }
+
+        render_end();
+    }
+
+    arena_free(frame_arena);
+    free(spr_rat_data); free(spr_cat_data); free(PAL);
+    return 0;
+}

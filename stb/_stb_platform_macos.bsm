@@ -275,6 +275,8 @@ auto _gpu_vbuf, _gpu_vptr;
 auto _gpu_screen_buf;
 auto _gpu_msg;
 auto _gpu_vert_count;
+auto _gpu_font_tex;
+auto _gpu_atlas_w, _gpu_atlas_h;
 
 // Per-frame state.
 auto _gpu_drawable, _gpu_cmdbuf, _gpu_enc;
@@ -284,24 +286,41 @@ auto _gpu_clear_r: float, _gpu_clear_g: float;
 auto _gpu_clear_b: float, _gpu_clear_a: float;
 
 // Build the Metal shader source string at runtime.
+// Vertex format: 16 bytes per vertex (x,y,r,g,b,a,u,v,use_tex,pad).
+// Fragment shader samples glyph atlas texture when use_tex > 0.5.
 _gpu_build_shader() {
     auto s;
     s = sb_new();
     s = sb_cat(s, "#include <metal_stdlib>\n");
     s = sb_cat(s, "using namespace metal;\n");
-    s = sb_cat(s, "struct V { float4 position [[position]]; float4 color; };\n");
+    s = sb_cat(s, "struct V { float4 position [[position]]; float4 color; float2 uv; float use_tex; };\n");
     s = sb_cat(s, "vertex V vert(uint vid [[vertex_id]],\n");
     s = sb_cat(s, "  constant uchar *vd [[buffer(0)]],\n");
     s = sb_cat(s, "  constant int *sc [[buffer(1)]]) {\n");
-    s = sb_cat(s, "  uint b = vid * 8;\n");
+    s = sb_cat(s, "  uint b = vid * 16;\n");
     s = sb_cat(s, "  short px = short(vd[b+0]) | (short(vd[b+1]) << 8);\n");
     s = sb_cat(s, "  short py = short(vd[b+2]) | (short(vd[b+3]) << 8);\n");
     s = sb_cat(s, "  float sw = float(sc[0]); float sh = float(sc[1]);\n");
+    s = sb_cat(s, "  ushort ru = ushort(vd[b+8]) | (ushort(vd[b+9]) << 8);\n");
+    s = sb_cat(s, "  ushort rv = ushort(vd[b+10]) | (ushort(vd[b+11]) << 8);\n");
     s = sb_cat(s, "  V o;\n");
     s = sb_cat(s, "  o.position = float4(float(px)/sw*2.0-1.0, 1.0-float(py)/sh*2.0, 0.0, 1.0);\n");
     s = sb_cat(s, "  o.color = float4(float(vd[b+4]),float(vd[b+5]),float(vd[b+6]),float(vd[b+7]))/255.0;\n");
+    // UV is pre-normalized to the 0-65535 range at vertex-emit time.
+    // Dividing by 65535 gives a 0.0-1.0 value regardless of texture size.
+    s = sb_cat(s, "  o.uv = float2(float(ru)/65535.0, float(rv)/65535.0);\n");
+    s = sb_cat(s, "  o.use_tex = float(vd[b+12])/255.0;\n");
     s = sb_cat(s, "  return o; }\n");
-    s = sb_cat(s, "fragment float4 frag(V in [[stage_in]]) { return in.color; }\n");
+    s = sb_cat(s, "constexpr sampler smp(filter::linear);\n");
+    s = sb_cat(s, "fragment float4 frag(V in [[stage_in]],\n");
+    s = sb_cat(s, "  texture2d<float> tex [[texture(0)]]) {\n");
+    s = sb_cat(s, "  if (in.use_tex > 0.75) {\n");
+    s = sb_cat(s, "    float a = tex.sample(smp, in.uv).r;\n");
+    s = sb_cat(s, "    return float4(in.color.rgb, in.color.a * a); }\n");
+    s = sb_cat(s, "  if (in.use_tex > 0.25) {\n");
+    s = sb_cat(s, "    float4 t = tex.sample(smp, in.uv);\n");
+    s = sb_cat(s, "    return float4(t.rgb, t.a * in.color.a); }\n");
+    s = sb_cat(s, "  return in.color; }\n");
     return s;
 }
 
@@ -317,7 +336,7 @@ _gpu_nsstr(cstr) {
 // Creates device, command queue, CAMetalLayer, shader pipeline, vertex buffer.
 // Must be called after game_init() so _plt_win exists.
 _stb_gpu_init(w, h) {
-    auto metal, qc, fn_create, view;
+    auto metal, qc, fn_create, view, i;
     sys_write(2, "gpu init\n", 9);
 
     // Load Metal and QuartzCore frameworks.
@@ -420,14 +439,16 @@ _stb_gpu_init(w, h) {
                      262144, 0);
     _gpu_vptr = objc_msgSend(_gpu_vbuf, sel_registerName("contents"));
 
-    // Create screen size uniform buffer (2 x int32).
+    // Create screen+atlas uniform buffer (4 x int32: w, h, atlas_w, atlas_h).
     _gpu_screen_buf = call(_gpu_msg, _gpu_device,
                            sel_registerName("newBufferWithLength:options:"),
-                           8, 0);
+                           16, 0);
     auto sp;
     sp = objc_msgSend(_gpu_screen_buf, sel_registerName("contents"));
     write_u32(sp, 0, w);
     write_u32(sp, 4, h);
+    write_u32(sp, 8, 128);
+    write_u32(sp, 12, 64);
 
     _gpu_vert_count = 0;
     // Default clear color: black.
@@ -435,6 +456,54 @@ _stb_gpu_init(w, h) {
     _gpu_clear_g = 0.0;
     _gpu_clear_b = 0.0;
     _gpu_clear_a = 1.0;
+
+    // Build the glyph atlas texture (128x64, R8Unorm).
+    // 96 characters (ASCII 32-127) arranged in a 16x6 grid, 8px per glyph.
+    auto tex_data, ch, cx, cy, py, px, glyph, row_bits;
+    tex_data = malloc(128 * 64);
+    for (i = 0; i < 128 * 64; i = i + 1) { poke(tex_data + i, 0); }
+
+    for (ch = 32; ch < 128; ch = ch + 1) {
+        cx = ((ch - 32) % 16) * 8;
+        cy = ((ch - 32) / 16) * 8;
+        glyph = _stb_font + (ch - 32) * 8;
+        for (py = 0; py < 8; py = py + 1) {
+            row_bits = peek(glyph + py);
+            for (px = 0; px < 8; px = px + 1) {
+                if (row_bits & (128 >> px)) {
+                    poke(tex_data + (cy + py) * 128 + cx + px, 255);
+                }
+            }
+        }
+    }
+
+    // Create Metal texture descriptor (128x64, R8Unorm = pixel format 10).
+    auto texdesc;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 10);
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), 128);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), 64);
+
+    _gpu_font_tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+    _gpu_atlas_w = 128;
+    _gpu_atlas_h = 64;
+
+    // Upload atlas data. MTLRegion is 48 bytes (6 x NSUInteger).
+    // ARM64 ABI passes large structs by reference, so we pass a pointer.
+    auto region;
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, 128);
+    write_u64(region, 32, 64);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, _gpu_font_tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, tex_data, 128);
+    free(tex_data);
 
     sb_free(src);
     free(err_buf);
@@ -481,23 +550,77 @@ _stb_gpu_begin() {
     call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
          _gpu_screen_buf, 0, 1);
 
+    // Reset vertex batch state for the new frame.
+    _gpu_vert_count = 0;
+    _gpu_flush_off = 0;
+
+    // Bind the glyph atlas texture for text rendering.
+    if (_gpu_font_tex != 0) {
+        call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
+             _gpu_font_tex, 0);
+    }
+
     // Reset vertex counter for this frame.
     _gpu_vert_count = 0;
 
     return 0;
 }
 
+// Upload a new atlas texture to the GPU and update uniform buffer.
+// data = R8 pixel buffer, w = width, h = height.
+_stb_gpu_upload_atlas(data, w, h) {
+    // Create texture descriptor.
+    auto texdesc;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 10);
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
+
+    _gpu_font_tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+
+    // Upload pixel data via replaceRegion (MTLRegion passed by reference on ARM64).
+    auto region;
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, w);
+    write_u64(region, 32, h);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, _gpu_font_tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, data, w);
+    free(region);
+
+    // Store atlas dimensions for sprite rendering restore.
+    _gpu_atlas_w = w;
+    _gpu_atlas_h = h;
+    // Update atlas dimensions in uniform buffer.
+    auto sp;
+    sp = objc_msgSend(_gpu_screen_buf, sel_registerName("contents"));
+    write_u32(sp, 8, w);
+    write_u32(sp, 12, h);
+    return 0;
+}
+
 // Write one vertex to the batch buffer.
-// Each vertex is 8 bytes: int16 x, int16 y, uint8 r, g, b, a.
-_stb_gpu_vertex(x, y, r, g, b, a) {
+// Each vertex is 16 bytes: int16 x,y + uint8 r,g,b,a + uint16 u,v + uint8 use_tex + 3 pad.
+_stb_gpu_vertex(x, y, r, g, b, a, u, v, tex) {
     auto off;
-    off = _gpu_vert_count * 8;
+    off = (_gpu_flush_off + _gpu_vert_count) * 16;
     write_u16(_gpu_vptr, off, x);
     write_u16(_gpu_vptr, off + 2, y);
     poke(_gpu_vptr + off + 4, r);
     poke(_gpu_vptr + off + 5, g);
     poke(_gpu_vptr + off + 6, b);
     poke(_gpu_vptr + off + 7, a);
+    write_u16(_gpu_vptr, off + 8, u);
+    write_u16(_gpu_vptr, off + 10, v);
+    poke(_gpu_vptr + off + 12, tex);
+    poke(_gpu_vptr + off + 13, 0);
+    write_u16(_gpu_vptr, off + 14, 0);
     _gpu_vert_count = _gpu_vert_count + 1;
     return 0;
 }
@@ -508,21 +631,101 @@ _stb_gpu_rect(x, y, w, h, r, g, b, a) {
     x1 = x + w;
     y1 = y + h;
     // Triangle 1: top-left, top-right, bottom-left.
-    _stb_gpu_vertex(x,  y,  r, g, b, a);
-    _stb_gpu_vertex(x1, y,  r, g, b, a);
-    _stb_gpu_vertex(x,  y1, r, g, b, a);
+    _stb_gpu_vertex(x,  y,  r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x1, y,  r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x,  y1, r, g, b, a, 0, 0, 0);
     // Triangle 2: top-right, bottom-right, bottom-left.
-    _stb_gpu_vertex(x1, y,  r, g, b, a);
-    _stb_gpu_vertex(x1, y1, r, g, b, a);
-    _stb_gpu_vertex(x,  y1, r, g, b, a);
+    _stb_gpu_vertex(x1, y,  r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x1, y1, r, g, b, a, 0, 0, 0);
+    _stb_gpu_vertex(x,  y1, r, g, b, a, 0, 0, 0);
+    return 0;
+}
+
+// Create an RGBA texture from pixel data. Returns a MTLTexture handle.
+// data = RGBA8 pixel buffer (4 bytes per pixel), w = width, h = height.
+_stb_gpu_create_texture(data, w, h) {
+    auto texdesc, tex, region;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 70);  // MTLPixelFormatRGBA8Unorm
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
+    tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, w);
+    write_u64(region, 32, h);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, data, w * 4);
+    // Do not free region — Metal may read the MTLRegion struct asynchronously.
+    return tex;
+}
+
+// Flush the current vertex batch mid-frame (for texture switches).
+// Uses _gpu_flush_off to track where in the buffer each batch starts,
+// avoiding GPU/CPU race conditions on shared vertex buffer memory.
+auto _gpu_flush_off;
+
+_stb_gpu_flush() {
+    if (_gpu_vert_count > 0) {
+        auto byte_off;
+        byte_off = _gpu_flush_off * 16;
+        call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
+             _gpu_vbuf, byte_off, 0);
+        call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
+             3, 0, _gpu_vert_count);
+        _gpu_flush_off = _gpu_flush_off + _gpu_vert_count;
+        _gpu_vert_count = 0;
+    }
+    return 0;
+}
+
+// Bind a different texture for subsequent draw calls.
+// Flushes the current batch first so previous vertices use the old texture.
+_stb_gpu_bind_texture(tex) {
+    _stb_gpu_flush();
+    call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
+         tex, 0);
+    return 0;
+}
+
+// Re-bind the font atlas texture (call after sprite rendering).
+_stb_gpu_bind_font() {
+    _stb_gpu_bind_texture(_gpu_font_tex);
+    return 0;
+}
+
+// Draw a textured sprite quad. tex = MTLTexture handle from _stb_gpu_create_texture.
+// tw,th = source texture dimensions (unused — UV is always full-texture 0-65535).
+// w,h = quad size on screen. use_tex=128 triggers RGBA sampling in shader.
+_stb_gpu_sprite(tex, x, y, w, h, tw, th) {
+    auto x1, y1;
+    _stb_gpu_bind_texture(tex);
+    x1 = x + w; y1 = y + h;
+    // UV is pre-normalized: 0 = 0.0, 65535 = 1.0. No atlas dimension needed.
+    _stb_gpu_vertex(x,  y,  255, 255, 255, 255, 0,     0,     128);
+    _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     128);
+    _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 128);
+    _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     128);
+    _stb_gpu_vertex(x1, y1, 255, 255, 255, 255, 65535, 65535, 128);
+    _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 128);
+    _stb_gpu_bind_font();
     return 0;
 }
 
 // Flush the GPU vertex batch and present the drawable. Only GPU work, no timing.
 _stb_gpu_present() {
     if (_gpu_vert_count > 0) {
+        auto byte_off;
+        byte_off = _gpu_flush_off * 16;
         call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
-             _gpu_vbuf, 0, 0);
+             _gpu_vbuf, byte_off, 0);
         call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
              3, 0, _gpu_vert_count);
     }

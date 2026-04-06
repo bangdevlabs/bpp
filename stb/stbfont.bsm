@@ -1,12 +1,14 @@
-// stbfont.bsm — 8x8 bitmap font for B++.
+// stbfont.bsm — Font data for B++ rendering.
 // Provides glyph data for ASCII 32-127 (96 characters × 8 bytes = 768 bytes).
-// Used by stbdraw's draw_text(). Pure B++, no external dependencies.
+// Used by stbrender (GPU text) and stbdraw (CPU text).
 //
 // Font source: font8x8_basic (public domain).
-// Future: data will be embedded in __DATA via _stb_get_font() built-in.
-// For now: initialized at startup with poke.
+// Future: TrueType reader for scalable fonts (stb_truetype.h translation).
 
-// Initialize the font and set _stb_font (declared in stbdraw).
+// Font data pointer (768 bytes: 96 chars × 8 rows × 1 byte).
+auto _stb_font;
+
+// Initialize the 8x8 bitmap font.
 init_font() {
     auto f, i;
     f = malloc(768);
@@ -176,4 +178,790 @@ init_font() {
     poke(f+72+0,48);poke(f+72+1,24);poke(f+72+2,12);poke(f+72+3,12);poke(f+72+4,12);poke(f+72+5,24);poke(f+72+6,48);
 
     return 0;
+}
+
+// ══════════════════════════════════════════════════════════════
+// TrueType font reader — translates stb_truetype.h to pure B++.
+// Parses .ttf files, rasterizes glyphs with antialiasing, builds atlas.
+// Zero FFI, zero external dependencies.
+// ══════════════════════════════════════════════════════════════
+
+import "stbfile.bsm";
+import "stbbuf.bsm";
+
+// ── TrueType state ──────────────────────────────────────────
+// One font loaded at a time (global state, like stbimage.bsm).
+
+auto _ttf_data, _ttf_len;        // Raw .ttf file in memory.
+auto _ttf_num_tables;             // Number of tables in the font.
+
+// Table offsets (byte offset from start of file).
+auto _ttf_head, _ttf_hhea, _ttf_maxp, _ttf_hmtx;
+auto _ttf_loca, _ttf_glyf, _ttf_cmap, _ttf_kern;
+
+// Font metrics from head/hhea/maxp.
+auto _ttf_units_per_em;           // Design units per em square.
+auto _ttf_num_glyphs;             // Total glyph count.
+auto _ttf_num_hmetrics;           // Entries in hmtx table.
+auto _ttf_loca_format;            // 0 = short offsets, 1 = long offsets.
+auto _ttf_ascent, _ttf_descent;   // Typographic ascent/descent (design units).
+
+// Scale factor in 16.16 fixed point (set by font_load for target pixel height).
+auto _ttf_scale;
+
+// Atlas state (pre-rendered ASCII 32-127).
+auto _ttf_atlas;                  // Pixel buffer (R8 alpha mask).
+auto _ttf_atlas_w, _ttf_atlas_h;  // Atlas dimensions.
+auto _ttf_glyph_info;            // Per-glyph info: 96 entries × 8 fields.
+// Fields per glyph (index = (ch-32) * 8):
+//   [0] atlas_x  [1] atlas_y  [2] width  [3] height
+//   [4] xoff     [5] yoff     [6] advance [7] lsb
+
+auto _ttf_loaded;                 // 1 if TrueType font is active.
+
+// ── Big-endian readers ──────────────────────────────────────
+// TrueType is big-endian throughout.
+
+_ttf_u8(off) { return peek(_ttf_data + off); }
+
+_ttf_u16(off) {
+    return peek(_ttf_data + off) * 256 + peek(_ttf_data + off + 1);
+}
+
+_ttf_i16(off) {
+    auto v;
+    v = _ttf_u16(off);
+    if (v >= 32768) { v = v - 65536; }
+    return v;
+}
+
+_ttf_u32(off) {
+    return peek(_ttf_data + off) * 16777216 + peek(_ttf_data + off + 1) * 65536
+         + peek(_ttf_data + off + 2) * 256 + peek(_ttf_data + off + 3);
+}
+
+// ── Table directory parser ──────────────────────────────────
+// Reads the font's table directory and stores offsets to key tables.
+
+_ttf_find_tables() {
+    auto i, tag, off, num;
+    num = _ttf_u16(4);
+    _ttf_num_tables = num;
+
+    _ttf_head = 0; _ttf_hhea = 0; _ttf_maxp = 0; _ttf_hmtx = 0;
+    _ttf_loca = 0; _ttf_glyf = 0; _ttf_cmap = 0; _ttf_kern = 0;
+
+    for (i = 0; i < num; i = i + 1) {
+        // Each table record is 16 bytes starting at offset 12.
+        off = 12 + i * 16;
+        tag = _ttf_u32(off);
+
+        // Match 4-byte ASCII tags against known table IDs.
+        if (tag == 0x68656164) { _ttf_head = _ttf_u32(off + 8); }      // 'head'
+        else if (tag == 0x68686561) { _ttf_hhea = _ttf_u32(off + 8); } // 'hhea'
+        else if (tag == 0x6D617870) { _ttf_maxp = _ttf_u32(off + 8); } // 'maxp'
+        else if (tag == 0x686D7478) { _ttf_hmtx = _ttf_u32(off + 8); } // 'hmtx'
+        else if (tag == 0x6C6F6361) { _ttf_loca = _ttf_u32(off + 8); } // 'loca'
+        else if (tag == 0x676C7966) { _ttf_glyf = _ttf_u32(off + 8); } // 'glyf'
+        else if (tag == 0x636D6170) { _ttf_cmap = _ttf_u32(off + 8); } // 'cmap'
+        else if (tag == 0x6B65726E) { _ttf_kern = _ttf_u32(off + 8); } // 'kern'
+    }
+    return 0;
+}
+
+// Read font metrics from head, hhea, and maxp tables.
+_ttf_read_metrics() {
+    // head table: unitsPerEm at offset 18, indexToLocFormat at offset 50.
+    _ttf_units_per_em = _ttf_u16(_ttf_head + 18);
+    _ttf_loca_format = _ttf_i16(_ttf_head + 50);
+
+    // hhea table: ascent at offset 4, descent at offset 6, numOfLongHorMetrics at offset 34.
+    _ttf_ascent = _ttf_i16(_ttf_hhea + 4);
+    _ttf_descent = _ttf_i16(_ttf_hhea + 6);
+    _ttf_num_hmetrics = _ttf_u16(_ttf_hhea + 34);
+
+    // maxp table: numGlyphs at offset 4.
+    _ttf_num_glyphs = _ttf_u16(_ttf_maxp + 4);
+    return 0;
+}
+
+// ── Cmap Format 4 decoder ───────────────────────────────────
+// Maps Unicode codepoints to glyph indices.
+
+// Find the Format 4 subtable offset within the cmap table.
+_ttf_cmap4_off() {
+    auto num_sub, i, plat, enc, fmt, sub_off;
+    num_sub = _ttf_u16(_ttf_cmap + 2);
+    for (i = 0; i < num_sub; i = i + 1) {
+        plat = _ttf_u16(_ttf_cmap + 4 + i * 8);
+        enc = _ttf_u16(_ttf_cmap + 4 + i * 8 + 2);
+        sub_off = _ttf_u32(_ttf_cmap + 4 + i * 8 + 4);
+        // Platform 3 (Windows), encoding 1 (Unicode BMP) or
+        // Platform 0 (Unicode), any encoding.
+        if (plat == 3) { if (enc == 1) {
+            fmt = _ttf_u16(_ttf_cmap + sub_off);
+            if (fmt == 4) { return _ttf_cmap + sub_off; }
+        } }
+        if (plat == 0) {
+            fmt = _ttf_u16(_ttf_cmap + sub_off);
+            if (fmt == 4) { return _ttf_cmap + sub_off; }
+        }
+    }
+    return 0;
+}
+
+// Look up a codepoint in Format 4 cmap. Returns glyph index (0 = missing).
+_ttf_cmap_lookup(codepoint) {
+    auto base, seg_count, i, end_off, start_off, delta_off, range_off;
+    auto end_code, start_code, delta, roff, idx;
+    base = _ttf_cmap4_off();
+    if (base == 0) { return 0; }
+
+    seg_count = _ttf_u16(base + 6) / 2;
+    end_off = base + 14;
+    start_off = end_off + seg_count * 2 + 2;
+    delta_off = start_off + seg_count * 2;
+    range_off = delta_off + seg_count * 2;
+
+    for (i = 0; i < seg_count; i = i + 1) {
+        end_code = _ttf_u16(end_off + i * 2);
+        if (codepoint <= end_code) {
+            start_code = _ttf_u16(start_off + i * 2);
+            if (codepoint < start_code) { return 0; }
+            delta = _ttf_i16(delta_off + i * 2);
+            roff = _ttf_u16(range_off + i * 2);
+            if (roff == 0) {
+                return (codepoint + delta) & 0xFFFF;
+            } else {
+                // Offset into glyphIdArray.
+                idx = _ttf_u16(range_off + i * 2 + roff + (codepoint - start_code) * 2);
+                if (idx == 0) { return 0; }
+                return (idx + delta) & 0xFFFF;
+            }
+        }
+    }
+    return 0;
+}
+
+// ── Glyph location ─────────────────────────────────────────
+// Find byte offset of a glyph's outline data in the glyf table.
+
+_ttf_glyph_offset(glyph_idx) {
+    if (_ttf_loca_format == 0) {
+        // Short format: offsets are uint16 × 2.
+        return _ttf_glyf + _ttf_u16(_ttf_loca + glyph_idx * 2) * 2;
+    } else {
+        // Long format: offsets are uint32.
+        return _ttf_glyf + _ttf_u32(_ttf_loca + glyph_idx * 4);
+    }
+}
+
+// Get glyph bounding box. Returns 1 if glyph has contours, 0 if empty.
+// Writes xmin, ymin, xmax, ymax to the provided buffer (4 words).
+_ttf_glyph_box(glyph_idx, box) {
+    auto off, next_off, num_contours;
+    off = _ttf_glyph_offset(glyph_idx);
+    next_off = _ttf_glyph_offset(glyph_idx + 1);
+    if (off == next_off) { return 0; }
+
+    num_contours = _ttf_i16(off);
+    box[0] = _ttf_i16(off + 2);   // xMin
+    box[1] = _ttf_i16(off + 4);   // yMin
+    box[2] = _ttf_i16(off + 6);   // xMax
+    box[3] = _ttf_i16(off + 8);   // yMax
+    return num_contours;
+}
+
+// ── Horizontal metrics ──────────────────────────────────────
+
+// Get advance width for a glyph (in design units).
+_ttf_get_advance(glyph_idx) {
+    if (glyph_idx < _ttf_num_hmetrics) {
+        return _ttf_u16(_ttf_hmtx + glyph_idx * 4);
+    }
+    // Glyphs beyond numOfLongHorMetrics share the last advance.
+    return _ttf_u16(_ttf_hmtx + (_ttf_num_hmetrics - 1) * 4);
+}
+
+// Get left side bearing for a glyph (in design units).
+_ttf_get_lsb(glyph_idx) {
+    if (glyph_idx < _ttf_num_hmetrics) {
+        return _ttf_i16(_ttf_hmtx + glyph_idx * 4 + 2);
+    }
+    return _ttf_i16(_ttf_hmtx + _ttf_num_hmetrics * 4 + (glyph_idx - _ttf_num_hmetrics) * 2);
+}
+
+// ── Kern table (format 0) ───────────────────────────────────
+
+// Get kerning adjustment between two glyphs (design units). 0 if no kerning.
+_ttf_get_kern(g1, g2) {
+    auto num_tables, off, i, num_pairs, j, left, right;
+    if (_ttf_kern == 0) { return 0; }
+
+    num_tables = _ttf_u16(_ttf_kern + 2);
+    off = _ttf_kern + 4;
+    for (i = 0; i < num_tables; i = i + 1) {
+        auto length, coverage, format;
+        length = _ttf_u16(off + 2);
+        coverage = _ttf_u16(off + 4);
+        format = coverage >> 8;
+        if (format == 0) {
+            num_pairs = _ttf_u16(off + 6);
+            // Linear search (could binary search, but pairs are few for ASCII).
+            for (j = 0; j < num_pairs; j = j + 1) {
+                left = _ttf_u16(off + 14 + j * 6);
+                right = _ttf_u16(off + 14 + j * 6 + 2);
+                if (left == g1) { if (right == g2) {
+                    return _ttf_i16(off + 14 + j * 6 + 4);
+                } }
+            }
+        }
+        off = off + length;
+    }
+    return 0;
+}
+
+// ── Public API: font_loaded ─────────────────────────────────
+
+font_loaded() { return _ttf_loaded; }
+
+// ── Glyf outline loader ────────────────────────────────────
+// Extracts contour points from a simple glyph and builds vertex commands.
+// Vertex types: 1=moveto, 2=lineto, 3=curveto (quadratic Bézier).
+
+// Vertex buffer: each vertex is 5 words [type, x, y, cx, cy].
+auto _ttf_verts, _ttf_nverts, _ttf_verts_cap;
+
+_ttf_vert_init() {
+    _ttf_verts_cap = 256;
+    _ttf_verts = malloc(_ttf_verts_cap * 5 * 8);
+    _ttf_nverts = 0;
+    return 0;
+}
+
+_ttf_vert_add(type, x, y, cx, cy) {
+    if (_ttf_nverts >= _ttf_verts_cap) {
+        auto new_cap, new_buf;
+        new_cap = _ttf_verts_cap * 2;
+        new_buf = malloc(new_cap * 5 * 8);
+        memcpy(new_buf, _ttf_verts, _ttf_nverts * 5 * 8);
+        free(_ttf_verts);
+        _ttf_verts = new_buf;
+        _ttf_verts_cap = new_cap;
+    }
+    auto base;
+    base = _ttf_nverts * 5;
+    _ttf_verts[base] = type;
+    _ttf_verts[base + 1] = x;
+    _ttf_verts[base + 2] = y;
+    _ttf_verts[base + 3] = cx;
+    _ttf_verts[base + 4] = cy;
+    _ttf_nverts = _ttf_nverts + 1;
+    return 0;
+}
+
+// Load a simple glyph's outline into the vertex buffer.
+// Returns number of vertices, or 0 for empty/compound glyphs.
+_ttf_load_glyph(glyph_idx) {
+    auto off, next_off, num_contours, p;
+    auto end_pts, num_points, flags_off, x_off, y_off;
+    auto i, j, flag_byte, repeat, flags, xs, ys;
+    auto was_off, sx, sy, scx, scy, cx, cy, x, y, next_off_curve;
+
+    off = _ttf_glyph_offset(glyph_idx);
+    next_off = _ttf_glyph_offset(glyph_idx + 1);
+    if (off == next_off) { return 0; }
+
+    num_contours = _ttf_i16(off);
+    if (num_contours < 0) { return 0; }
+
+    _ttf_nverts = 0;
+
+    // Read end-point indices for each contour.
+    end_pts = malloc(num_contours * 8);
+    for (i = 0; i < num_contours; i = i + 1) {
+        end_pts[i] = _ttf_u16(off + 10 + i * 2);
+    }
+    num_points = end_pts[num_contours - 1] + 1;
+
+    // Skip instructions.
+    auto ins_len;
+    ins_len = _ttf_u16(off + 10 + num_contours * 2);
+    p = off + 10 + num_contours * 2 + 2 + ins_len;
+
+    // Read flags (run-length encoded).
+    flags = malloc(num_points * 8);
+    i = 0;
+    while (i < num_points) {
+        flag_byte = _ttf_u8(p);
+        p = p + 1;
+        flags[i] = flag_byte;
+        i = i + 1;
+        if (flag_byte & 8) {
+            repeat = _ttf_u8(p);
+            p = p + 1;
+            for (j = 0; j < repeat; j = j + 1) {
+                flags[i] = flag_byte;
+                i = i + 1;
+            }
+        }
+    }
+
+    // Read X coordinates (delta-encoded).
+    xs = malloc(num_points * 8);
+    x = 0;
+    for (i = 0; i < num_points; i = i + 1) {
+        auto f; f = flags[i];
+        if (f & 2) {
+            // 1 byte, sign in bit 4.
+            auto dx; dx = _ttf_u8(p); p = p + 1;
+            if (f & 16) { x = x + dx; } else { x = x - dx; }
+        } else {
+            if (f & 16) {
+                // Same as previous (delta=0).
+            } else {
+                x = x + _ttf_i16(p); p = p + 2;
+            }
+        }
+        xs[i] = x;
+    }
+
+    // Read Y coordinates (delta-encoded).
+    ys = malloc(num_points * 8);
+    y = 0;
+    for (i = 0; i < num_points; i = i + 1) {
+        auto f; f = flags[i];
+        if (f & 4) {
+            auto dy; dy = _ttf_u8(p); p = p + 1;
+            if (f & 32) { y = y + dy; } else { y = y - dy; }
+        } else {
+            if (f & 32) {
+                // Same as previous (delta=0).
+            } else {
+                y = y + _ttf_i16(p); p = p + 2;
+            }
+        }
+        ys[i] = y;
+    }
+
+    // Convert points to move/line/curve vertices.
+    // Walk each contour, handling on-curve and off-curve points.
+    auto ci, start, end;
+    ci = 0;
+    i = 0;
+    while (ci < num_contours) {
+        start = 0;
+        if (ci > 0) { start = end_pts[ci - 1] + 1; }
+        end = end_pts[ci];
+
+        // Find first on-curve point to start the contour.
+        auto first, first_x, first_y;
+        first = start;
+        sx = xs[start]; sy = ys[start];
+
+        // Emit moveto for contour start.
+        _ttf_vert_add(1, sx, sy, 0, 0);
+        was_off = 0;
+        cx = 0; cy = 0;
+
+        j = start + 1;
+        while (j <= end) {
+            auto on_curve;
+            on_curve = flags[j] & 1;
+            if (on_curve) {
+                if (was_off) {
+                    // Curve from previous off-curve control to this on-curve.
+                    _ttf_vert_add(3, xs[j], ys[j], cx, cy);
+                } else {
+                    _ttf_vert_add(2, xs[j], ys[j], 0, 0);
+                }
+                was_off = 0;
+            } else {
+                if (was_off) {
+                    // Two consecutive off-curve: implicit on-curve midpoint.
+                    auto mx, my;
+                    mx = (cx + xs[j]) / 2;
+                    my = (cy + ys[j]) / 2;
+                    _ttf_vert_add(3, mx, my, cx, cy);
+                }
+                cx = xs[j]; cy = ys[j];
+                was_off = 1;
+            }
+            j = j + 1;
+        }
+
+        // Close the contour back to start point.
+        if (was_off) {
+            _ttf_vert_add(3, sx, sy, cx, cy);
+        } else {
+            _ttf_vert_add(2, sx, sy, 0, 0);
+        }
+
+        ci = ci + 1;
+    }
+
+    free(flags);
+    free(xs);
+    free(ys);
+    free(end_pts);
+    return _ttf_nverts;
+}
+
+// ── Rasterizer ──────────────────────────────────────────────
+// Edge-based scanline rasterizer with antialiasing.
+// Translates quadratic Bézier outlines to pixel alpha masks.
+
+// Edge structure: 5 words [x0_fp, dx_fp, y_min, y_max, direction].
+// x0_fp and dx_fp are 16.16 fixed point.
+auto _ttf_edges, _ttf_nedges, _ttf_edges_cap;
+
+_ttf_edge_init() {
+    _ttf_edges_cap = 512;
+    _ttf_edges = malloc(_ttf_edges_cap * 5 * 8);
+    _ttf_nedges = 0;
+    return 0;
+}
+
+// Add an edge from pixel coordinates (x0,y0) to (x1,y1).
+// Computes fixed-point x start and dx/dy, handles direction normalization.
+_ttf_edge_add(x0, y0, x1, y1) {
+    if (y0 == y1) { return 0; }
+    if (_ttf_nedges >= _ttf_edges_cap) {
+        auto new_cap, new_buf;
+        new_cap = _ttf_edges_cap * 2;
+        new_buf = malloc(new_cap * 5 * 8);
+        memcpy(new_buf, _ttf_edges, _ttf_nedges * 5 * 8);
+        free(_ttf_edges);
+        _ttf_edges = new_buf;
+        _ttf_edges_cap = new_cap;
+    }
+    auto base, dir, ymin, ymax, xmin_fp, dx_fp;
+    if (y0 < y1) {
+        dir = 1; ymin = y0; ymax = y1;
+        xmin_fp = x0 * 65536;
+        dx_fp = (x1 - x0) * 65536 / (y1 - y0);
+    } else {
+        dir = 0 - 1; ymin = y1; ymax = y0;
+        xmin_fp = x1 * 65536;
+        dx_fp = (x0 - x1) * 65536 / (y0 - y1);
+    }
+    base = _ttf_nedges * 5;
+    _ttf_edges[base] = xmin_fp;
+    _ttf_edges[base + 1] = dx_fp;
+    _ttf_edges[base + 2] = ymin;
+    _ttf_edges[base + 3] = ymax;
+    _ttf_edges[base + 4] = dir;
+    _ttf_nedges = _ttf_nedges + 1;
+    return 0;
+}
+
+// Flatten quadratic Bézier curve into line segments and add edges.
+_ttf_flatten_curve(x0, y0, cx, cy, x1, y1) {
+    // Simple recursive subdivision with fixed depth (5 levels = 32 segments max).
+    auto mx, my, mcx, mcy;
+    mx = (x0 + 2 * cx + x1) / 4;
+    my = (y0 + 2 * cy + y1) / 4;
+
+    // Check flatness: if midpoint is close to line midpoint, emit line.
+    auto lmx, lmy, dx, dy;
+    lmx = (x0 + x1) / 2;
+    lmy = (y0 + y1) / 2;
+    dx = mx - lmx; if (dx < 0) { dx = 0 - dx; }
+    dy = my - lmy; if (dy < 0) { dy = 0 - dy; }
+    if (dx + dy < 2) {
+        _ttf_edge_add(x0, y0, x1, y1);
+        return 0;
+    }
+    // Subdivide: split at midpoint.
+    auto ax, ay, bx, by;
+    ax = (x0 + cx) / 2; ay = (y0 + cy) / 2;
+    bx = (cx + x1) / 2; by = (cy + y1) / 2;
+    _ttf_flatten_curve(x0, y0, ax, ay, mx, my);
+    _ttf_flatten_curve(mx, my, bx, by, x1, y1);
+    return 0;
+}
+
+// Build edge list from vertex buffer.
+_ttf_build_edges(scale_x, scale_y, off_x, off_y) {
+    auto i, type, x, y, cx, cy, px, py, base;
+    _ttf_nedges = 0;
+    px = 0; py = 0;
+    for (i = 0; i < _ttf_nverts; i = i + 1) {
+        base = i * 5;
+        type = _ttf_verts[base];
+        x = _ttf_verts[base + 1] * scale_x / 65536 + off_x;
+        y = _ttf_verts[base + 2] * scale_y / 65536 + off_y;
+        if (type == 1) {
+            // moveto
+            px = x; py = y;
+        } else if (type == 2) {
+            // lineto: add edge from previous to current.
+            _ttf_edge_add(px, py, x, y);
+            px = x; py = y;
+        } else if (type == 3) {
+            // curveto: flatten Bézier then add edges.
+            cx = _ttf_verts[base + 3] * scale_x / 65536 + off_x;
+            cy = _ttf_verts[base + 4] * scale_y / 65536 + off_y;
+            _ttf_flatten_curve(px, py, cx, cy, x, y);
+            px = x; py = y;
+        }
+    }
+    return 0;
+}
+
+// Sort edges by y_min (insertion sort — good enough for glyph-sized lists).
+_ttf_sort_edges() {
+    auto i, j, b, key0, key1, key2, key3, key4;
+    for (i = 1; i < _ttf_nedges; i = i + 1) {
+        b = i * 5;
+        key0 = _ttf_edges[b]; key1 = _ttf_edges[b+1];
+        key2 = _ttf_edges[b+2]; key3 = _ttf_edges[b+3]; key4 = _ttf_edges[b+4];
+        j = i - 1;
+        while (j >= 0) {
+            if (_ttf_edges[j * 5 + 2] <= key2) { break; }
+            // Shift edge right.
+            auto s, d; s = j * 5; d = (j + 1) * 5;
+            _ttf_edges[d] = _ttf_edges[s]; _ttf_edges[d+1] = _ttf_edges[s+1];
+            _ttf_edges[d+2] = _ttf_edges[s+2]; _ttf_edges[d+3] = _ttf_edges[s+3];
+            _ttf_edges[d+4] = _ttf_edges[s+4];
+            j = j - 1;
+        }
+        b = (j + 1) * 5;
+        _ttf_edges[b] = key0; _ttf_edges[b+1] = key1;
+        _ttf_edges[b+2] = key2; _ttf_edges[b+3] = key3; _ttf_edges[b+4] = key4;
+    }
+    return 0;
+}
+
+// Rasterize a glyph to an alpha bitmap.
+// Returns a malloc'd buffer of w*h bytes (0-255 alpha values).
+_ttf_rasterize(w, h) {
+    auto buf, row, ei, x_fp, b;
+    buf = malloc(w * h);
+    // Clear to zero.
+    auto k;
+    for (k = 0; k < w * h; k = k + 1) { poke(buf + k, 0); }
+
+    _ttf_sort_edges();
+
+    // Scanline loop with 4x vertical oversampling for antialiasing.
+    auto sub, scanline;
+    scanline = malloc(w * 8);
+    ei = 0;
+
+    for (row = 0; row < h; row = row + 1) {
+        // Clear scanline accumulator.
+        for (k = 0; k < w; k = k + 1) { scanline[k] = 0; }
+
+        // 4 sub-scanlines per pixel row.
+        for (sub = 0; sub < 4; sub = sub + 1) {
+            auto y_fp;
+            y_fp = row * 4 + sub;
+
+            // Walk active edges for this sub-scanline.
+            auto crossings, nc;
+            crossings = malloc(128 * 8);
+            nc = 0;
+
+            for (k = 0; k < _ttf_nedges; k = k + 1) {
+                b = k * 5;
+                auto ey_min, ey_max;
+                ey_min = _ttf_edges[b + 2] * 4;
+                ey_max = _ttf_edges[b + 3] * 4;
+                if (ey_min <= y_fp) { if (ey_max > y_fp) {
+                    // Edge is active. Compute X crossing.
+                    // dx_fp is per pixel, (y_fp - ey_min) is in sub-pixels, so divide by 4.
+                    auto ex, dir;
+                    ex = _ttf_edges[b] + _ttf_edges[b + 1] * (y_fp - ey_min) / 4;
+                    dir = _ttf_edges[b + 4];
+                    // Store crossing as (x_fp, direction).
+                    if (nc < 128) {
+                        crossings[nc * 2] = ex;
+                        crossings[nc * 2 + 1] = dir;
+                        nc = nc + 1;
+                    }
+                } }
+            }
+
+            // Sort crossings by X (insertion sort).
+            auto ci, cj;
+            for (ci = 1; ci < nc; ci = ci + 1) {
+                auto kx, kd;
+                kx = crossings[ci * 2]; kd = crossings[ci * 2 + 1];
+                cj = ci - 1;
+                while (cj >= 0) {
+                    if (crossings[cj * 2] <= kx) { break; }
+                    crossings[(cj + 1) * 2] = crossings[cj * 2];
+                    crossings[(cj + 1) * 2 + 1] = crossings[cj * 2 + 1];
+                    cj = cj - 1;
+                }
+                crossings[(cj + 1) * 2] = kx;
+                crossings[(cj + 1) * 2 + 1] = kd;
+            }
+
+            // Fill using non-zero winding rule.
+            auto winding, prev_x, cx_px;
+            winding = 0;
+            prev_x = 0;
+            for (ci = 0; ci < nc; ci = ci + 1) {
+                auto cur_x;
+                cur_x = crossings[ci * 2] / 65536;
+                if (cur_x < 0) { cur_x = 0; }
+                if (cur_x > w) { cur_x = w; }
+                if (winding != 0) {
+                    // Fill from prev_x to cur_x.
+                    for (cx_px = prev_x; cx_px < cur_x; cx_px = cx_px + 1) {
+                        if (cx_px >= 0) { if (cx_px < w) {
+                            scanline[cx_px] = scanline[cx_px] + 1;
+                        } }
+                    }
+                }
+                winding = winding + crossings[ci * 2 + 1];
+                prev_x = cur_x;
+            }
+            free(crossings);
+        }
+
+        // Write scanline to output (divide by 4 for antialiasing, scale to 0-255).
+        for (k = 0; k < w; k = k + 1) {
+            auto val;
+            val = scanline[k] * 255 / 4;
+            if (val > 255) { val = 255; }
+            if (val < 0) { val = 0; }
+            poke(buf + row * w + k, val);
+        }
+    }
+
+    free(scanline);
+    return buf;
+}
+
+// ── Atlas builder ───────────────────────────────────────────
+// Pre-renders ASCII 32-127 into a texture atlas.
+
+font_load(path, pixel_height) {
+    auto size_buf;
+
+    // Load font file.
+    size_buf = malloc(8);
+    *(size_buf) = 0;
+    _ttf_data = file_read_all(path, size_buf);
+    _ttf_len = *(size_buf);
+    free(size_buf);
+    if (_ttf_data == 0) { return 0; }
+
+    // Parse tables and metrics.
+    _ttf_find_tables();
+    if (_ttf_head == 0) { free(_ttf_data); return 0; }
+    _ttf_read_metrics();
+
+    // Compute scale factor: pixel_height / (ascent - descent) in design units.
+    auto design_height;
+    design_height = _ttf_ascent - _ttf_descent;
+    _ttf_scale = pixel_height * 65536 / design_height;
+
+    // Initialize vertex and edge buffers.
+    _ttf_vert_init();
+    _ttf_edge_init();
+
+    // Pre-render ASCII 32-127 into atlas.
+    // First pass: compute glyph sizes for atlas layout.
+    _ttf_glyph_info = malloc(96 * 8 * 8);
+    auto ch, gi, box, gw, gh, adv, lsb, total_w, max_h;
+    box = malloc(32);
+    total_w = 0;
+    max_h = 0;
+
+    for (ch = 32; ch < 128; ch = ch + 1) {
+        gi = _ttf_cmap_lookup(ch);
+        adv = _ttf_get_advance(gi);
+        lsb = _ttf_get_lsb(gi);
+        auto nc;
+        nc = _ttf_glyph_box(gi, box);
+
+        auto idx;
+        idx = (ch - 32) * 8;
+        if (nc > 0) {
+            gw = (box[2] - box[0]) * _ttf_scale / 65536 + 2;
+            gh = (box[3] - box[1]) * _ttf_scale / 65536 + 2;
+        } else {
+            gw = 0; gh = 0;
+        }
+        _ttf_glyph_info[idx + 2] = gw;
+        _ttf_glyph_info[idx + 3] = gh;
+        _ttf_glyph_info[idx + 4] = box[0] * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 5] = _ttf_ascent * _ttf_scale / 65536 - box[3] * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 6] = adv * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 7] = lsb * _ttf_scale / 65536;
+
+        total_w = total_w + gw + 1;
+        if (gh > max_h) { max_h = gh; }
+    }
+
+    // Row-based atlas packing: 16 chars per row.
+    auto atlas_w, atlas_h, row_h, cols, rows, ax, ay;
+    cols = 16;
+    row_h = max_h + 1;
+    rows = (96 + cols - 1) / cols;
+    atlas_w = 1;
+    // Find power-of-2 width that fits.
+    auto max_row_w;
+    max_row_w = total_w / rows + cols;
+    while (atlas_w < max_row_w) { atlas_w = atlas_w * 2; }
+    if (atlas_w < 256) { atlas_w = 256; }
+    atlas_h = 1;
+    while (atlas_h < rows * row_h) { atlas_h = atlas_h * 2; }
+
+    _ttf_atlas = malloc(atlas_w * atlas_h);
+    for (ch = 0; ch < atlas_w * atlas_h; ch = ch + 1) { poke(_ttf_atlas + ch, 0); }
+    _ttf_atlas_w = atlas_w;
+    _ttf_atlas_h = atlas_h;
+
+    // Second pass: rasterize each glyph and blit into atlas.
+    ax = 0; ay = 0;
+    for (ch = 32; ch < 128; ch = ch + 1) {
+        auto idx;
+        idx = (ch - 32) * 8;
+        gw = _ttf_glyph_info[idx + 2];
+        gh = _ttf_glyph_info[idx + 3];
+
+        if (ax + gw + 1 > atlas_w) { ax = 0; ay = ay + row_h; }
+
+        _ttf_glyph_info[idx] = ax;
+        _ttf_glyph_info[idx + 1] = ay;
+
+        if (gw > 0) {
+            gi = _ttf_cmap_lookup(ch);
+            auto nc2;
+            nc2 = _ttf_glyph_box(gi, box);
+            if (nc2 > 0) {
+                // Load outline and rasterize.
+                _ttf_load_glyph(gi);
+                auto scale_x_fp, scale_y_fp, off_x, off_y;
+                scale_x_fp = _ttf_scale;
+                scale_y_fp = 0 - _ttf_scale;
+                off_x = 0 - box[0] * _ttf_scale / 65536 + 1;
+                off_y = box[3] * _ttf_scale / 65536 + 1;
+                _ttf_build_edges(scale_x_fp, scale_y_fp, off_x, off_y);
+
+                auto glyph_bmp;
+                glyph_bmp = _ttf_rasterize(gw, gh);
+
+                // Blit into atlas.
+                auto gy, gx;
+                for (gy = 0; gy < gh; gy = gy + 1) {
+                    for (gx = 0; gx < gw; gx = gx + 1) {
+                        poke(_ttf_atlas + (ay + gy) * atlas_w + ax + gx,
+                             peek(glyph_bmp + gy * gw + gx));
+                    }
+                }
+                free(glyph_bmp);
+            }
+        }
+        ax = ax + gw + 1;
+    }
+
+    free(box);
+    _ttf_loaded = 1;
+    return 1;
 }

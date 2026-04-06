@@ -2304,3 +2304,123 @@ gen2==gen3 verified after: sys_socket/sys_connect/sys_usleep builtins, BRK remov
 - `stb/stbarray.bsm` — arr_truncate
 - `docs/bootstrap_manual.md` — corrected: auto inside blocks is supported
 - `examples/snake_full.bpp` — new: snake with all game infrastructure
+
+## 2026-04-03 — GPU Text + TrueType + realloc + Module Reorganization
+
+### GPU Text Rendering
+- Expanded vertex format from 8 to 16 bytes (added UV coords + use_tex flag)
+- Updated Metal shader: vertex reads UV at offset 8-11, use_tex at offset 12; fragment samples texture when use_tex > 0.5, else solid color
+- Built 128x64 glyph atlas from 8x8 bitmap font data at GPU init
+- Created MTLTexture (R8Unorm), upload via replaceRegion with MTLRegion by-reference
+- Texture bound per frame via setFragmentTexture:atIndex:
+- Added `render_text(text, x, y, sz, color)` and `render_number(x, y, sz, color, val)` to stbrender.bsm
+- Atlas size passed as uniforms (sc[2], sc[3]) for dynamic atlas support
+
+### Pure B++ TrueType Font Reader (~500 lines in stbfont.bsm)
+- TrueType table directory parser (head, hhea, maxp, hmtx, loca, glyf, cmap, kern)
+- Cmap Format 4 decoder (Unicode codepoint → glyph index)
+- Glyf outline loader (flag-compressed points, delta-encoded coords, compound glyphs, implicit on-curve midpoints)
+- Quadratic Bézier flattener (recursive subdivision)
+- Scanline rasterizer with 4x vertical oversampling for antialiasing
+- Atlas builder: pre-renders ASCII 32-127, row-based packing
+- `font_load(path, pixel_height)` — loads any .ttf, rasterizes atlas
+- `render_font(path, height)` — loads TTF + uploads atlas to GPU
+- `render_text()` auto-dispatches: TrueType metrics when loaded, 8x8 bitmap fallback otherwise
+- Tested with Arial.ttf (773KB, 3381 glyphs): correct rendering on GPU
+
+### realloc with Header (Bell Labs Style)
+- malloc now allocates size+8, stores requested size in 8-byte header, returns ptr+8
+- free reads size from header at ptr-8, does real munmap (was no-op before)
+- realloc(ptr, new_size) — standard 2-arg API (was broken 3-arg). Reads old_size from header, allocates new block, copies min(old, new) bytes
+- All 3 backends updated: ARM64 (mmap+munmap), x86_64 (mremap with mmap fallback), C emitter (native libc)
+- Bootstrapped gen2 + gen3 successfully
+- Cleaned up file_read_all workaround (now uses realloc natively)
+
+### Module Reorganization
+- Created `stbcolor.bsm` — color palette (rgba(), BLACK, WHITE, RED...) as independent module
+- Moved `_stb_font` global from stbdraw.bsm to stbfont.bsm
+- stbrender.bsm no longer imports stbdraw.bsm (GPU and CPU renderers fully independent)
+- stbdraw.bsm imports stbcolor.bsm + stbmath.bsm (fixed missing Vec2 import)
+- stbgame.bsm imports stbcolor.bsm, calls init_color()
+
+### stbimage.bsm DEFLATE Fix
+- Fixed Huffman table naming inconsistencies in _inflate_huffman, _inflate_fixed_tables, _inflate_dynamic_tables
+- Replaced broken manual save/restore with _zh_save_lit()/_zh_save_dst()/_zh_use_lit()/_zh_use_dst() helpers
+- PNG loader fully working: tested 4x4 red PNG → W=4, H=4, R=255, G=0, B=0, A=255
+
+### Bug Fixes
+- file_read_all: realloc didn't copy data (B++ realloc was 3-arg but called with 2). Fixed by realloc header.
+- _ttf_scale declared as `: float` but used as fixed-point integer — produced garbage glyph metrics. Removed float hint.
+- stbdraw.bsm missing `import "stbmath.bsm"` (Vec2 undefined error)
+
+### Files Changed
+- `stb/_stb_platform_macos.bsm` — vertex 8→16, shader UV+texture, atlas creation+upload, texture bind, _stb_gpu_upload_atlas()
+- `stb/stbrender.bsm` — render_text (TrueType+bitmap), render_number, render_measure, render_font, all vertex callers updated
+- `stb/stbfont.bsm` — TrueType reader: table parser, cmap, glyf loader, rasterizer, atlas builder, font_load(), font_loaded()
+- `stb/stbcolor.bsm` — NEW: rgba() + color palette constants
+- `stb/stbdraw.bsm` — removed color/rgba (moved to stbcolor), removed _stb_font (moved to stbfont), added imports
+- `stb/stbgame.bsm` — added stbcolor import + init_color()
+- `stb/stbfile.bsm` — file_read_all realloc fix, then cleaned to use native realloc
+- `stb/stbimage.bsm` — DEFLATE Huffman naming fix
+- `src/aarch64/a64_codegen.bsm` — malloc header, free munmap, realloc 2-arg with copy
+- `src/x86_64/x64_codegen.bsm` — malloc header, free munmap, realloc 2-arg with mremap+fallback
+- `src/bpp_emitter.bsm` — realloc 2-arg (C emitter)
+
+## 2026-04-05 — GPU Sprites, stbsprite Module, Module Cache Fix, Pure B++ sqrt
+
+### GPU Sprite UV Fix
+- Sprite textures were rendering all-red or wrong colors due to Metal uniform buffer timing: CPU writes to a shared MTLBuffer are read by GPU at execution time (after commit), not encode time. Per-draw-call uniform switching via `setVertexBytes` caused SIGKILL.
+- Fix: pre-normalize all UVs to 0–65535 range at vertex-emit time. Shader divides by `65535.0` (fixed constant). No runtime per-batch uniform switching needed.
+- `_stb_gpu_sprite()` now emits UV `(0, 0, 65535, 65535)` always (full texture).
+- Text rendering (bitmap + TrueType) updated: UV coordinates pre-normalized to 0–65535 at `render_text` time.
+
+### stbsprite.bsm — Generic Sprite Module (NEW)
+- `load_sprite(path, out, w, h)` — parses JSON sprite files (`{ "data": [[...], ...] }`) into w×h byte buffer of palette indices. Pure B++ JSON parser.
+- `sprite_create(spr, pal, w, h)` — converts palette-indexed data to RGBA, uploads to GPU via `_stb_gpu_create_texture`. Returns texture handle. Works with any dimensions (not just 16×16).
+- `sprite_draw(tex, x, y, w, h, sz)` — draws sprite at integer scale factor. Calls `_stb_gpu_sprite` with pre-normalized UVs.
+- `stbrender.bsm` keeps `render_create_sprite16`/`render_sprite` as backward-compatible 16×16 wrappers.
+- 21 stb modules total.
+
+### Pure B++ sqrt in stbmath.bsm
+- Added `sqrt(x: float)` using Newton-Raphson iteration (8 iterations, ~15 digits precision).
+- Zero FFI — no `System.B` import. Pure B++, consistent with stb zero-dependency philosophy.
+- Games no longer need `import "System.B" { double sqrt(double); }`.
+
+### MCU Game Ported to games/pathfinder/
+- Ported `mcu-bpp/src/mcu_gpu.bpp` into `games/pathfinder/pathfinder.bpp`.
+- Rat-and-cat chase game: WASD movement, diagonal normalization, AI pursuit, collision, particles (ECS), HUD (health bar + score), game-over screen.
+- Uses `load_sprite` + `sprite_create` from stbsprite.bsm instead of inline loader.
+- Assets: `games/pathfinder/assets/sprites/rat_sprite.json`, `cat_sprite.json`.
+- Runs at 60fps on Metal GPU with sprite textures, text rendering, and particle effects.
+
+### Module Cache Bugs Fixed (3 bugs in bpp_bo.bsm)
+Critical cache correctness issue discovered: compiling the same program twice produced different binaries. Second compilation (using cached `.bo` files) generated wrong code. Root cause: `bo_read_export()` failed to replicate the full type state that fresh compilation produces.
+
+**Bug 1: Parameter types not registered (`fn_par_types`)**
+- `bo_read_export()` read param types from `.bo` but discarded them (`bo_read_u8()` with no assignment).
+- `get_fn_par_type()` returned `TY_WORD` for all cached function params, even float params.
+- Effect: `sqrt(x: float)` called with integer calling convention → movement code completely broken.
+- Fix: store param types in `fn_par_types` array via `arr_set`.
+
+**Bug 2: Return types not registered (`fn_ret_types`)**
+- `bo_read_export()` called `set_func_type(name_p, rty)` (name-based table) but not `arr_set(fn_ret_types, idx, rty)` (index-based table).
+- `get_fn_ret_type(func_idx)` returned 0 for cached functions.
+- Effect: float return values treated as integer in cross-module calls.
+- Fix: `arr_set(fn_ret_types, func_cnt - 1, rty)` after growing per-function arrays.
+
+**Bug 3: Missing null terminators in `bo_read_str`**
+- `bo_read_str()` copied string bytes into `vbuf` consecutively without null terminators.
+- `mo_atof()` (float string → IEEE 754 parser) scans character-by-character until non-digit. Without null terminator, it reads into the next string: "100.0" followed by "3.0" → parsed as "100.03" → wrong float constant.
+- Effect: float constant pool had corrupted values. Binary produced different hashes even with identical float table strings.
+- Fix: `poke(vbuf + vbuf_pos, 0); vbuf_pos = vbuf_pos + 1;` after each string copy.
+
+**Discovery process:** Bootstrap test (`bpp2 == bpp3`) always passed because different compiler binaries have different `compiler_self_hash`, causing all cache keys to change — the cache was never actually exercised during bootstrap. Game compilation (`bpp game.bpp` twice) exposed the bug because the same `bpp` binary reuses cached `.bo` files.
+
+### Files Changed
+- `stb/stbsprite.bsm` — NEW: generic sprite loading, creation, and drawing
+- `stb/stbmath.bsm` — added pure B++ `sqrt()` (Newton-Raphson)
+- `stb/stbrender.bsm` — UV pre-normalization (text), sprite wrappers delegate to stbsprite
+- `stb/_stb_platform_macos.bsm` — shader UV fix (`/65535.0`), `_stb_gpu_sprite()` simplified
+- `src/bpp_bo.bsm` — 3 cache bugs fixed: param types, return types, null terminators
+- `games/pathfinder/pathfinder.bpp` — NEW: ported MCU game with GPU sprites
+- `games/pathfinder/assets/sprites/` — rat and cat sprite JSON files
