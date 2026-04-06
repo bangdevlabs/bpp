@@ -123,8 +123,10 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `stbdraw` | Software framebuffer rendering — rects, circles, lines, sprites, text |
-| `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines (Metal) |
-| `stbfont` | 8×8 bitmap font for text rendering |
+| `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines, text, sprites (Metal) |
+| `stbsprite` | GPU sprite loading and rendering — any w×h, palette-indexed, JSON loader |
+| `stbfont` | 8×8 bitmap font fallback + pure B++ TrueType reader (cmap, glyf, Bezier, scanline AA) |
+| `stbcolor` | Color palette — `rgba()`, named constants (BLACK, WHITE, RED, BLUE, ...) |
 
 **Game loop & input:**
 
@@ -138,8 +140,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 
 | Module | What it does |
 |--------|-------------|
-| `stbmath` | Vec2, PRNG, abs, min, max, clamp, fixed-point trig (cos/sin) |
-| `stbcol` | Collision detection (AABB, circles) |
+| `stbmath` | Vec2, PRNG, sqrt (Newton-Raphson), abs, min, max, clamp, fixed-point trig |
+| `stbcol` | Collision detection — rect overlap, point-in-rect, distance squared |
 
 **Data structures:**
 
@@ -162,17 +164,17 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `stbfile` | File I/O — read and write entire files |
-| `stbio` | Console I/O (print_int, print_msg) |
-| `stbimage` | Image loading (PNG, JPEG, BMP) via stb_image FFI |
+| `stbio` | Console I/O (print_int, print_msg, print_char) |
+| `stbimage` | Pure B++ PNG loader — DEFLATE, Huffman, all filter types, zero FFI |
 
 **Platform layers** (internal, selected automatically):
 
 | Module | What it does |
 |--------|-------------|
-| `_stb_platform_macos` | Cocoa window, Metal GPU, CoreGraphics software, keyboard/mouse |
+| `_stb_platform_macos` | Cocoa window, Metal GPU, texture upload, CoreGraphics software, keyboard/mouse |
 | `_stb_platform_linux` | Terminal ANSI rendering, keyboard input |
 
-Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan on Linux). Same game code — just swap `draw_end()` for `render_end()`.
+Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan planned for Linux). Same game code — just swap `draw_end()` for `render_end()`.
 
 GPU rendering uses the platform's native API directly — Metal via `objc_msgSend`, Vulkan via `libvulkan.so`. No SDL. No OpenGL wrappers. The compiler talks to the hardware.
 
