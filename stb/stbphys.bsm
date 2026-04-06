@@ -1,0 +1,192 @@
+// stbphys.bsm — Platformer physics engine for B++ games.
+// Provides milli-unit physics with gravity, tile collision,
+// ground detection, and jump mechanics.
+//
+// Positions are stored in milli-pixels (pixel * 1000) for sub-pixel
+// precision without floating point. Velocities are in pixels/second
+// (numerically equal to milli-pixels/millisecond).
+//
+// Usage:
+//   import "stbphys.bsm";
+//
+//   auto body;
+//   body = phys_body(12, 16, 600, 0 - 280, 120);
+//   phys_set_pos(body, 32, 160);
+//
+//   // Each frame:
+//   body.vx = 0;
+//   if (key_down(KEY_RIGHT)) { body.vx = body.move_spd; }
+//   if (key_pressed(KEY_SPACE)) { phys_jump(body); }
+//   phys_update(body, dt_ms, tilemap);
+
+import "stbtile.bsm";
+import "stbmath.bsm";
+
+// ── Body struct ─────────────────────────────────────────────
+
+struct Body {
+    x, y,           // position in milli-pixels
+    vx, vy,         // velocity in pixels/second
+    w, h,           // hitbox dimensions in pixels
+    on_ground,      // 1 if standing on a solid tile
+    gravity,        // downward acceleration in pixels/second^2
+    jump_vel,       // jump impulse (negative = upward)
+    move_spd        // horizontal movement speed in pixels/second
+}
+
+// ── Module init ─────────────────────────────────────────────
+
+// Initialize the physics module. Currently a no-op.
+init_phys() {
+    return 0;
+}
+
+// ── Body lifecycle ──────────────────────────────────────────
+
+// Create a new physics body with the given hitbox and movement parameters.
+// w, h       = hitbox dimensions in pixels.
+// gravity    = downward acceleration (pixels/sec^2), e.g. 600.
+// jump_vel   = initial jump velocity (negative = upward), e.g. -280.
+// move_spd   = horizontal speed (pixels/sec), e.g. 120.
+phys_body(w, h, gravity, jump_vel, move_spd) {
+    auto b: Body;
+    b = malloc(sizeof(Body));
+    b.x = 0;
+    b.y = 0;
+    b.vx = 0;
+    b.vy = 0;
+    b.w = w;
+    b.h = h;
+    b.on_ground = 0;
+    b.gravity = gravity;
+    b.jump_vel = jump_vel;
+    b.move_spd = move_spd;
+    return b;
+}
+
+// Free a physics body.
+phys_free(b) {
+    free(b);
+    return 0;
+}
+
+// ── Position helpers ────────────────────────────────────────
+
+// Convert body X position from milli-pixels to pixels.
+phys_px_x(b) {
+    auto body: Body;
+    body = b;
+    return body.x / 1000;
+}
+
+// Convert body Y position from milli-pixels to pixels.
+phys_px_y(b) {
+    auto body: Body;
+    body = b;
+    return body.y / 1000;
+}
+
+// Set body position from pixel coordinates (auto-converts to milli-pixels).
+phys_set_pos(b, px, py) {
+    auto body: Body;
+    body = b;
+    body.x = px * 1000;
+    body.y = py * 1000;
+    return 0;
+}
+
+// Set body velocity directly (in pixels/second).
+phys_set_vel(b, vx, vy) {
+    auto body: Body;
+    body = b;
+    body.vx = vx;
+    body.vy = vy;
+    return 0;
+}
+
+// ── Physics step ────────────────────────────────────────────
+
+// Apply gravity to the body's vertical velocity.
+// dt = delta time in milliseconds.
+phys_apply_gravity(b, dt) {
+    auto body: Body;
+    body = b;
+    body.vy = body.vy + body.gravity * dt / 1000;
+    return 0;
+}
+
+// Move the body horizontally and check for tile collision.
+// If the new position would overlap a solid tile, the move is cancelled.
+// dt = delta time in milliseconds. tm = Tilemap pointer.
+phys_move_x(b, dt, tm) {
+    auto body: Body;
+    body = b;
+    auto new_px, py;
+
+    new_px = (body.x + body.vx * dt) / 1000;
+    py = body.y / 1000;
+
+    if (tile_collides(tm, new_px, py, body.w, body.h) == 0) {
+        body.x = body.x + body.vx * dt;
+    }
+    return 0;
+}
+
+// Move the body vertically and check for tile collision.
+// On downward collision (landing), snaps to the tile surface and sets on_ground.
+// On any collision, vertical velocity is zeroed.
+// dt = delta time in milliseconds. tm = Tilemap pointer.
+phys_move_y(b, dt, tm) {
+    auto body: Body, m: Tilemap;
+    body = b;
+    m = tm;
+    auto px, new_py;
+
+    px = body.x / 1000;
+    new_py = (body.y + body.vy * dt) / 1000;
+
+    if (tile_collides(tm, px, new_py, body.w, body.h) == 0) {
+        // No collision: apply movement.
+        body.y = body.y + body.vy * dt;
+        // Ground probe: check if solid tile is 1 pixel below.
+        // This keeps on_ground reliable while standing on a surface.
+        if (body.vy >= 0) {
+            if (tile_collides(tm, px, new_py + 1, body.w, body.h)) {
+                body.on_ground = 1;
+            } else {
+                body.on_ground = 0;
+            }
+        } else {
+            body.on_ground = 0;
+        }
+    } else {
+        if (body.vy > 0) {
+            // Landing: snap body bottom to the top of the ground tile.
+            // Use (new_py + body.h) to find which tile row the feet entered.
+            body.y = (((new_py + body.h) / m.th) * m.th - body.h) * 1000;
+            body.on_ground = 1;
+        }
+        body.vy = 0;
+    }
+    return 0;
+}
+
+// Apply jump impulse if the body is on the ground.
+phys_jump(b) {
+    auto body: Body;
+    body = b;
+    if (body.on_ground) {
+        body.vy = body.jump_vel;
+        body.on_ground = 0;
+    }
+    return 0;
+}
+
+// Full physics step: gravity, then horizontal, then vertical movement.
+// dt = delta time in milliseconds. tm = Tilemap pointer.
+phys_update(b, dt, tm) {
+    phys_apply_gravity(b, dt);
+    phys_move_x(b, dt, tm);
+    phys_move_y(b, dt, tm);
+    return 0;
+}

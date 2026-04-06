@@ -1,8 +1,20 @@
 # B++
 
-### GPU Sprites + Module Cache Fix — 5 April 2026
+### B++ 2.0 — Tilemap, Physics, Address-of — 6 April 2026
 
-Self-hosting compiler with **GPU sprite rendering** (stbsprite.bsm — any size), **pure B++ sqrt** (Newton-Raphson), GPU text (bitmap + **pure B++ TrueType**), pure B++ PNG loader, **real malloc/free/realloc** (Bell Labs style), Go-style modular cache (3 critical bugs fixed), native debugger (`bug` v2), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64). The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with **three playable GPU games** (Snake, Pathfinder, Platformer with Kenney assets), **tilemap engine + physics** (stbtile, stbphys), **address-of operator** (`&x`), **PNG transparency** (tRNS chunk + alpha discard), **GPU sprite rendering**, **pure B++ sqrt**, GPU text (bitmap + **pure B++ TrueType**), pure B++ PNG loader, **real malloc/free/realloc** (Bell Labs style), Go-style modular cache, native debugger (`bug` v2), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64). The compiler compiles itself and produces signed native binaries with zero external tools.
+
+---
+
+## Three Games, One Engine
+
+B++ ships with three demo games in `games/`, all GPU-accelerated on Metal:
+
+| Game | Folder | What it is |
+|------|--------|-----------|
+| **Snake** | `games/snake/` | Classic snake with ECS particle effects, high-score ranking, arena + pool allocators. Eat the apple, grow the tail, don't bite yourself. |
+| **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. |
+| **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
 
 ---
 
@@ -18,14 +30,15 @@ A language with the soul of B — every value is a word, no type declarations, n
 
 And a standard library that is, itself, a game engine.
 
-## Latest (5 April 2026)
+## Latest (6 April 2026)
 
-- **GPU sprites**: `sprite_create(data, palette, w, h)` uploads any-size palette-indexed sprite as Metal texture. `sprite_draw(tex, x, y, w, h, scale)` renders with pre-normalized UVs. JSON sprite loader included.
-- **stbsprite.bsm**: New module — generic sprite loading, creation, and rendering. Any width × height (not just 16×16). Palette-indexed → RGBA → GPU texture pipeline.
-- **Pure B++ sqrt**: Newton-Raphson in `stbmath.bsm` (8 iterations, ~15 digit precision). Zero FFI — no `System.B` import needed.
-- **Module cache fix**: Found and fixed 3 critical bugs in `.bo` cache — param types discarded, return types not indexed, missing null terminators causing float constant corruption. Cache now produces bit-identical binaries.
-- **Pathfinder game**: GPU demo with sprite textures, AI chase, collision, particles (ECS), HUD. Ported from standalone repo into `games/pathfinder/`.
-- **21 stb modules**: draw, render, sprite, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends.
+- **stbtile.bsm**: Tilemap engine — `tile_new`, `tile_get/set`, `tile_solid`, `tile_collides`, `tile_load_set` (PNG tileset → GPU textures), `tile_map_type` (remap game types to tileset indices), `tile_draw` (GPU render with camera culling). 1 texture per tile — no atlas UV complexity.
+- **stbphys.bsm**: Platformer physics — `Body` struct with milli-pixel convention, gravity, impulse jumping, separate-axis tile collision, reliable ground probe. Two subtle bugs fixed: landing snap formula (use body bottom, not top) and ground probe (1-frame on_ground was unreliable).
+- **Address-of `&` operator**: B++ now supports `&variable` to get the memory address of a local or global. Eliminates the `malloc(8)` out-parameter workaround. `T_ADDR` AST node, codegen for x86_64 (LEA) and aarch64 (ADD). New warning W012 for incompatibility with `call()` and extern FFI.
+- **PNG transparency**: `stbimage` now reads the tRNS chunk for palette-indexed PNGs. Metal fragment shader has `discard_fragment()` for alpha < 0.01. Kenney sprites render cleanly on any background.
+- **Platformer with Kenney assets**: `games/platformer/platform.bpp` loads `tilemap_packed.png` (18×18 tiles) and character sprites (24×24). Real pixel-art platformer running on GPU.
+- **Particle system fixed**: Snake ECS particles had a 24-bit color mask that dropped the alpha byte on re-encoding. Worked by accident in software (alpha ignored), invisible on GPU (alpha blended). Fixed with `flags - 1` decrement.
+- **24 stb modules**: draw, render, sprite, tile, phys, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends.
 
 ## The Language
 
@@ -79,6 +92,7 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Enums** — `enum State { MENU, PLAY, PAUSE, OVER }` resolved at compile time
 - **Constants** — `const W = 320;` and `const abs(x) { ... }` with dead code elimination
 - **Type hints** — `auto x: byte`, `auto f: half float` — 5 bases × 4 slices (11 real types)
+- **Pointers** — `*(ptr)` dereference, `&var` address-of, `buf[i]` array indexing, `obj.field` struct access
 - **Syntax sugar** — `buf[i]`, `for` loops, `else if`, string escapes (`\n`, `\t`, `\xHH`)
 - **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
 - **Float math** — pure B++ `sqrt` (Newton-Raphson), IEEE 754 doubles, half/quarter float codegen
@@ -89,7 +103,7 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
 - **Cross-compilation** — `bpp --linux64 game.bpp -o game` from macOS
 - **Modular compilation** — Go-style per-module codegen with content-addressed `.bo` cache
-- **Diagnostics** — error codes (E001-E201), warnings (W001-W011), file:line:caret locations
+- **Diagnostics** — error codes (E001-E201), warnings (W001-W012), file:line:caret locations
 
 **Debugger (`bug`):**
 - **Zero-flag debugging** — `./bug ./program` just works, reads symbol table from binary
@@ -101,12 +115,14 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 **Game engine (stb):**
 - **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
 - **GPU sprites** — any-size palette-indexed sprites: JSON load → RGBA → Metal texture → draw at scale
+- **Tilemap engine** — grid + collision layer + PNG tileset loader + camera-aware GPU draw with type remap
+- **Platformer physics** — milli-pixel Body, gravity, impulse jumping, separate-axis tile collision, ground probe
 - **Software rendering** — CPU framebuffer with rects, circles, lines, sprites, text
 - **Text rendering** — bitmap 8×8 fallback + pure B++ TrueType reader (cmap, glyf, Bézier, scanline AA)
-- **Image loading** — pure B++ PNG loader (DEFLATE, Huffman, all filter types, zero FFI)
+- **Image loading** — pure B++ PNG loader with tRNS transparency (DEFLATE, Huffman, all filter types, zero FFI)
 - **Game infrastructure** — arena allocator, object pool, entity-component system
 - **Collision** — rect overlap, point-in-rect, distance² (squared, no sqrt needed)
-- **21 modules** — draw, render, sprite, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends
+- **24 modules** — draw, render, sprite, tile, phys, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends
 
 ## What B++ Doesn't Have
 
@@ -142,6 +158,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 |--------|-------------|
 | `stbmath` | Vec2, PRNG, sqrt (Newton-Raphson), abs, min, max, clamp, fixed-point trig |
 | `stbcol` | Collision detection — rect overlap, point-in-rect, distance squared |
+| `stbphys` | Platformer physics — Body struct, gravity, jump, tile collision, milli-pixel precision |
+| `stbtile` | Tilemap engine — grid, collision layer, PNG tileset loader, camera-aware GPU draw, type remap |
 
 **Data structures:**
 
@@ -174,7 +192,7 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `_stb_platform_macos` | Cocoa window, Metal GPU, texture upload, CoreGraphics software, keyboard/mouse |
 | `_stb_platform_linux` | Terminal ANSI rendering, keyboard input |
 
-Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan planned for Linux). Same game code — just swap `draw_end()` for `render_end()`.
+Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan planned for Linux). Same game code — just swap `draw_*` for `render_*` and add `render_init()` after `game_init()`.
 
 GPU rendering uses the platform's native API directly — Metal via `objc_msgSend`, Vulkan via `libvulkan.so`. No SDL. No OpenGL wrappers. The compiler talks to the hardware.
 
@@ -222,14 +240,37 @@ sh install.sh --skip
 
 The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed that builds everything — no external tools needed beyond a C compiler. **Note:** bootstrap.c is currently outdated and needs regeneration (see TODO).
 
-### Run Examples
+### Play the Games
+
+Each game lives in its own folder under `games/` with its own assets. Compile and run from inside the folder so that relative asset paths resolve:
 
 ```bash
-# Snake with ECS + arena + pool (native, no dependencies)
-bpp examples/snake_full.bpp -o snake && ./snake
+# Snake with ECS particles, ranking, arena + pool
+cd games/snake
+bpp --clean-cache snake_gpu.bpp -o snake
+./snake
 
-# Debug snake with function tracing
-./bug ./snake
+# Pathfinder — rat vs cat chase
+cd games/pathfind
+bpp --clean-cache pathfind.bpp -o path
+./path
+
+# Platformer with Kenney Pixel Platformer assets (CC0)
+cd games/platformer
+bpp --clean-cache platformer.bpp -o plat_asset
+./plat_asset
+
+# Platformer with debug rectangles (no assets needed)
+cd games/platformer
+bpp --clean-cache platform_noasset.bpp -o plat_noasset
+./plat_noasset
+```
+
+### Debug Any Game
+
+```bash
+./bug ./snake               # function tracing + crash report
+./bug ./plat_assets         # works on any bpp binary, no flags needed
 ```
 
 ### Write Your Own
@@ -281,14 +322,18 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/              — Compiler core (16 B++ modules, self-hosting)
+├── src/              — Compiler core (self-hosting, ~18 B++ modules)
 │   ├── aarch64/      — ARM64 backend (encoder, codegen, Mach-O writer)
 │   └── x86_64/       — x86_64 backend (encoder, codegen, ELF writer)
-├── stb/              — Standard B Library (pure B++, the game engine)
+├── stb/              — Standard B Library (24 modules, pure B++, the game engine)
+├── games/            — Complete playable games
+│   ├── snake/        — Snake with ECS particles + ranking
+│   ├── pathfind/     — Rat-and-cat chase with AI pursuit
+│   └── platformer/   — Side-scrolling platformer with Kenney assets
+├── examples/         — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/          — Backend drivers (SDL2, raylib — optional)
-├── examples/         — Working game examples
 ├── tests/            — Compiler and library tests
-├── docs/             — Language manual, journal, and evolution roadmap
+├── docs/             — Language manual, journal, TODO, plan reviews
 ├── ~/.bpp/cache/     — Global module cache (.bo files, content-addressed)
 ├── bpp               — The compiler binary
 └── bug               — The debugger binary
@@ -331,7 +376,7 @@ bpp --show-deps source.bpp     # print module dependency graph
 bpp --clean-cache              # delete all cached .bo files
 ```
 
-16 compiler modules + 17 stb library modules, ~13,000 lines of B++. Self-hosting verified at every stage. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
+18 compiler modules + 24 stb library modules, ~15,000 lines of B++. Self-hosting verified at every stage (`shasum bpp2 == bpp3`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
 
 ### The Debugger
 
@@ -430,5 +475,7 @@ SOFTWARE.
 *GPU Text + TrueType + realloc: pure B++ TrueType reader, Metal glyph atlas, Bell Labs malloc/free/realloc, stbimage PNG loader, module reorganization on April 3, 2026.*
 
 *GPU Sprites + Module Cache Fix: stbsprite.bsm (any w×h), pure B++ sqrt, 3 critical .bo cache bugs fixed (param types + return types + null terminators), pathfinder game ported on April 5, 2026.*
+
+*B++ 2.0 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed, 24 stb modules total on April 6, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

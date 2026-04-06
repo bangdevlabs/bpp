@@ -629,7 +629,7 @@ _png_unfilter(raw, out, w, h, bpp) {
 // ── PNG pixel expansion ──────────────────────────────────────
 // Convert filtered pixel data to RGBA.
 
-_png_to_rgba(filtered, w, h, color, depth, palette, pal_count) {
+_png_to_rgba(filtered, w, h, color, depth, palette, pal_count, pal_alpha) {
     auto out, src_bpp, src_stride, i, j, sp, dp;
 
     // Compute source bytes per pixel.
@@ -666,14 +666,15 @@ _png_to_rgba(filtered, w, h, color, depth, palette, pal_count) {
                     b = peek(filtered + sp); sp = sp + 1;
                 }
             } else if (color == 3) {
-                // Palette.
+                // Palette: RGB from PLTE chunk, alpha from tRNS chunk.
                 auto idx; idx = peek(filtered + sp); sp = sp + 1;
                 if (idx < pal_count) {
                     r = peek(palette + idx * 3);
                     g = peek(palette + idx * 3 + 1);
                     b = peek(palette + idx * 3 + 2);
+                    if (pal_alpha != 0) { a = peek(pal_alpha + idx); }
                 } else {
-                    r = 0; g = 0; b = 0;
+                    r = 0; g = 0; b = 0; a = 0;
                 }
             } else if (color == 4) {
                 // Grayscale + Alpha.
@@ -717,7 +718,7 @@ _png_to_rgba(filtered, w, h, color, depth, palette, pal_count) {
 _png_load_from_memory(buf, buf_len) {
     auto w, h, depth, color, interlace;
     auto idata, idata_len, idata_cap;
-    auto palette, pal_count;
+    auto palette, pal_count, pal_alpha;
     auto expanded, exp_len;
     auto filtered, rgba;
 
@@ -738,6 +739,7 @@ _png_load_from_memory(buf, buf_len) {
     idata_cap = 0;
     palette = 0;
     pal_count = 0;
+    pal_alpha = 0;
     w = 0; h = 0; depth = 8; color = 0; interlace = 0;
 
     // Parse chunks until IEND.
@@ -761,6 +763,17 @@ _png_load_from_memory(buf, buf_len) {
             pal_count = chunk_len / 3;
             palette = malloc(chunk_len);
             _io_getn(palette, chunk_len);
+        }
+        // tRNS: transparency for palette entries.
+        // Each byte is the alpha value for the corresponding palette index.
+        // Palette entries beyond the tRNS length are fully opaque (255).
+        else if (chunk_type == 0x74524E53) {
+            pal_alpha = malloc(256);
+            auto ti;
+            ti = 0;
+            while (ti < 256) { poke(pal_alpha + ti, 255); ti = ti + 1; }
+            if (chunk_len > 256) { chunk_len = 256; }
+            _io_getn(pal_alpha, chunk_len);
         }
         // IDAT: compressed image data.
         else if (chunk_type == 0x49444154) {
@@ -798,12 +811,8 @@ _png_load_from_memory(buf, buf_len) {
     if (idata == 0) { return 0; }
 
     // Decompress IDAT data.
-    auto exp_len_buf;
-    exp_len_buf = malloc(8);
-    *(exp_len_buf) = 0;
-    expanded = _zlib_decode(idata, idata_len, exp_len_buf);
-    exp_len = *(exp_len_buf);
-    free(exp_len_buf);
+    exp_len = 0;
+    expanded = _zlib_decode(idata, idata_len, &exp_len);
     free(idata);
 
     if (expanded == 0) { return 0; }
@@ -825,9 +834,10 @@ _png_load_from_memory(buf, buf_len) {
     free(expanded);
 
     // Convert to RGBA.
-    rgba = _png_to_rgba(filtered, w, h, color, depth, palette, pal_count);
+    rgba = _png_to_rgba(filtered, w, h, color, depth, palette, pal_count, pal_alpha);
     free(filtered);
     if (palette != 0) { free(palette); }
+    if (pal_alpha != 0) { free(pal_alpha); }
 
     // Store metadata.
     _img_w = w;
@@ -847,12 +857,9 @@ _png_load_from_memory(buf, buf_len) {
 // Load a PNG image from disk. Returns RGBA pixel buffer (or 0 on failure).
 // Use img_w(), img_h(), img_depth() to query dimensions after loading.
 img_load(path) {
-    auto buf, size_buf, size, result;
-    size_buf = malloc(8);
-    *(size_buf) = 0;
-    buf = file_read_all(path, size_buf);
-    size = *(size_buf);
-    free(size_buf);
+    auto buf, size, result;
+    size = 0;
+    buf = file_read_all(path, &size);
     if (buf == 0) { return 0; }
     result = _png_load_from_memory(buf, size);
     free(buf);

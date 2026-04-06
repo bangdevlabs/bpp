@@ -1,0 +1,319 @@
+// stbtile.bsm — Tilemap engine for B++ games.
+// Provides tilemap creation, tile collision, GPU rendering with
+// camera-aware culling, and PNG tileset loading.
+//
+// Usage:
+//   import "stbtile.bsm";
+//
+//   auto tm;
+//   tm = tile_new(40, 14, 16, 16);
+//   tile_solid(tm, 1);              // mark tile type 1 as solid
+//   tile_set(tm, 5, 10, 1);         // place tile at grid (5, 10)
+//   tile_draw(tm, cam_x, cam_y, 320, 180);
+//
+//   // Optional: load a tileset PNG for textured rendering.
+//   auto ts, count;
+//   count = tile_load_set("assets/tileset.png", 18, 18, &ts);
+//   tile_bind_set(tm, ts, count);
+//
+//   // Map game tile types to tileset positions.
+//   // The map stores logical types (1, 2, 3...).
+//   // The remap connects them to tileset tile indices.
+//   tile_map_type(tm, 1, 63);  // type 1 draws tileset tile 63
+//   tile_map_type(tm, 2, 39);  // type 2 draws tileset tile 39
+
+import "stbimage.bsm";
+import "stbfile.bsm";
+
+// ── Tilemap struct ──────────────────────────────────────────
+
+struct Tilemap {
+    w, h,               // grid dimensions in tiles
+    tw, th,             // tile dimensions in pixels
+    data,               // flat byte array (w * h bytes), 1 byte per cell
+    solid_mask,         // 256-byte array, 1 = solid tile type
+    tileset,            // array of GPU texture handles (indexed by tileset ID)
+    tile_count,         // number of tiles in the tileset
+    remap               // 256-entry array: remap[game_type] = tileset index
+}
+
+// ── Module init ─────────────────────────────────────────────
+
+// Initialize the tilemap module. Currently a no-op.
+init_tile() {
+    return 0;
+}
+
+// ── Tilemap lifecycle ───────────────────────────────────────
+
+// Create a new tilemap with the given grid and tile dimensions.
+// All cells are initialized to 0 (empty). No tile types are solid by default.
+tile_new(w, h, tw, th) {
+    auto tm: Tilemap, i;
+    tm = malloc(sizeof(Tilemap));
+    tm.w = w;
+    tm.h = h;
+    tm.tw = tw;
+    tm.th = th;
+
+    // Allocate tile data (1 byte per cell, up to 255 tile types).
+    tm.data = malloc(w * h);
+    i = 0;
+    while (i < w * h) { poke(tm.data + i, 0); i = i + 1; }
+
+    // Allocate solid mask (256 entries, one per possible tile type).
+    tm.solid_mask = malloc(256);
+    i = 0;
+    while (i < 256) { poke(tm.solid_mask + i, 0); i = i + 1; }
+
+    tm.tileset = 0;
+    tm.tile_count = 0;
+
+    // Remap table: maps game tile types to tileset indices.
+    // Default: identity (tile type N draws tileset tile N).
+    tm.remap = malloc(256 * 8);
+    i = 0;
+    while (i < 256) { tm.remap[i] = i; i = i + 1; }
+
+    return tm;
+}
+
+// Free a tilemap and all its associated memory.
+tile_free(tm) {
+    auto m: Tilemap;
+    m = tm;
+    if (m.data != 0) { free(m.data); }
+    if (m.solid_mask != 0) { free(m.solid_mask); }
+    if (m.tileset != 0) { free(m.tileset); }
+    if (m.remap != 0) { free(m.remap); }
+    free(tm);
+    return 0;
+}
+
+// ── Tile access ─────────────────────────────────────────────
+
+// Read the tile type at grid position (gx, gy).
+// Returns 0 (empty) for out-of-bounds coordinates.
+tile_get(tm, gx, gy) {
+    auto m: Tilemap;
+    m = tm;
+    if (gx < 0) { return 0; }
+    if (gy < 0) { return 0; }
+    if (gx >= m.w) { return 0; }
+    if (gy >= m.h) { return 0; }
+    return peek(m.data + gy * m.w + gx);
+}
+
+// Write a tile type at grid position (gx, gy).
+// Silently ignored for out-of-bounds coordinates.
+tile_set(tm, gx, gy, val) {
+    auto m: Tilemap;
+    m = tm;
+    if (gx < 0) { return 0; }
+    if (gy < 0) { return 0; }
+    if (gx >= m.w) { return 0; }
+    if (gy >= m.h) { return 0; }
+    poke(m.data + gy * m.w + gx, val);
+    return 0;
+}
+
+// ── Collision layer ─────────────────────────────────────────
+
+// Mark a tile type as solid (blocks movement).
+tile_solid(tm, tile_type) {
+    auto m: Tilemap;
+    m = tm;
+    poke(m.solid_mask + tile_type, 1);
+    return 0;
+}
+
+// Query whether a tile type is solid.
+tile_is_solid(tm, tile_type) {
+    auto m: Tilemap;
+    m = tm;
+    return peek(m.solid_mask + tile_type);
+}
+
+// Check if an axis-aligned bounding box collides with any solid tile.
+// px, py = top-left corner in pixels. pw, ph = box dimensions in pixels.
+// Returns 1 if any overlap with a solid tile, 0 otherwise.
+tile_collides(tm, px, py, pw, ph) {
+    auto m: Tilemap;
+    m = tm;
+    auto left, right, top, bottom, gx, gy, tile;
+
+    left = px / m.tw;
+    right = (px + pw - 1) / m.tw;
+    top = py / m.th;
+    bottom = (py + ph - 1) / m.th;
+
+    // Negative pixel coords mean we are outside the map on the left/top.
+    if (px < 0) { return 0; }
+    if (py < 0) { return 0; }
+
+    gx = left;
+    while (gx <= right) {
+        gy = top;
+        while (gy <= bottom) {
+            tile = tile_get(tm, gx, gy);
+            if (peek(m.solid_mask + tile)) { return 1; }
+            gy = gy + 1;
+        }
+        gx = gx + 1;
+    }
+    return 0;
+}
+
+// ── Tile type remapping ──────────────────────────────────────
+
+// Map a game tile type to a tileset index for rendering.
+// The map data stores game types (e.g. T_GROUND=1, T_BRICK=2).
+// The tileset stores textures by position in the PNG grid (1-based).
+// This function connects the two: tile_map_type(tm, T_GROUND, 63)
+// means "tile type 1 should render as tileset tile 63".
+tile_map_type(tm, game_type, tileset_index) {
+    auto m: Tilemap;
+    m = tm;
+    m.remap[game_type] = tileset_index;
+    return 0;
+}
+
+// Return the tile type at a pixel position. Converts to grid coordinates internally.
+tile_at(tm, px, py) {
+    auto m: Tilemap;
+    m = tm;
+    return tile_get(tm, px / m.tw, py / m.th);
+}
+
+// ── Tileset loading ─────────────────────────────────────────
+
+// Load a tileset PNG and cut it into individual GPU textures.
+// Returns the number of tiles loaded (0 on failure).
+// ts_out is a pointer where the texture array will be stored.
+// Tile IDs are 1-based: textures[1] = first tile from the PNG grid.
+// textures[0] is always 0 (empty/transparent).
+//
+// The RGBA buffers are intentionally not freed after GPU upload.
+// On Apple Silicon unified memory, replaceRegion is async and the
+// buffer must survive until the command buffer commits.
+tile_load_set(path, tw, th, ts_out) {
+    auto pixels, iw, ih, cols, rows, count, textures;
+    auto r, c, tile_rgba, sy, sx, src_off, dst_off, tile_idx;
+
+    init_image();
+    pixels = img_load(path);
+    if (pixels == 0) { return 0; }
+
+    iw = img_w();
+    ih = img_h();
+    cols = iw / tw;
+    rows = ih / th;
+    count = cols * rows;
+
+    // +1 because tile 0 is reserved for empty.
+    textures = malloc((count + 1) * 8);
+    textures[0] = 0;
+
+    r = 0;
+    while (r < rows) {
+        c = 0;
+        while (c < cols) {
+            tile_rgba = malloc(tw * th * 4);
+
+            // Copy the pixel rectangle for this tile from the source image.
+            sy = 0;
+            while (sy < th) {
+                sx = 0;
+                while (sx < tw) {
+                    src_off = ((r * th + sy) * iw + (c * tw + sx)) * 4;
+                    dst_off = (sy * tw + sx) * 4;
+                    poke(tile_rgba + dst_off,     peek(pixels + src_off));
+                    poke(tile_rgba + dst_off + 1, peek(pixels + src_off + 1));
+                    poke(tile_rgba + dst_off + 2, peek(pixels + src_off + 2));
+                    poke(tile_rgba + dst_off + 3, peek(pixels + src_off + 3));
+                    sx = sx + 1;
+                }
+                sy = sy + 1;
+            }
+
+            // Tile index is 1-based (row-major order).
+            tile_idx = r * cols + c + 1;
+            textures[tile_idx] = _stb_gpu_create_texture(tile_rgba, tw, th);
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    img_free(pixels);
+    *(ts_out) = textures;
+    return count;
+}
+
+// Bind a tileset (array of GPU texture handles) to a tilemap.
+// After binding, tile_draw will render tiles as textured sprites.
+tile_bind_set(tm, textures, count) {
+    auto m: Tilemap;
+    m = tm;
+    m.tileset = textures;
+    m.tile_count = count;
+    return 0;
+}
+
+// ── Rendering ───────────────────────────────────────────────
+
+// Draw the visible portion of the tilemap using GPU rendering.
+// cam_x, cam_y = camera offset in pixels.
+// scr_w, scr_h = screen dimensions in pixels.
+// If a tileset is bound, tiles render as textured sprites.
+// Otherwise, tiles render as colored debug rectangles.
+tile_draw(tm, cam_x, cam_y, scr_w, scr_h) {
+    auto m: Tilemap;
+    m = tm;
+    auto start_gx, start_gy, end_gx, end_gy, gx, gy, tile, sx, sy, tex, ts_idx;
+
+    start_gx = cam_x / m.tw;
+    start_gy = cam_y / m.th;
+    end_gx = (cam_x + scr_w) / m.tw + 1;
+    end_gy = (cam_y + scr_h) / m.th + 1;
+
+    if (start_gx < 0) { start_gx = 0; }
+    if (start_gy < 0) { start_gy = 0; }
+    if (end_gx > m.w) { end_gx = m.w; }
+    if (end_gy > m.h) { end_gy = m.h; }
+
+    gy = start_gy;
+    while (gy < end_gy) {
+        gx = start_gx;
+        while (gx < end_gx) {
+            tile = peek(m.data + gy * m.w + gx);
+            if (tile != 0) {
+                sx = gx * m.tw - cam_x;
+                sy = gy * m.th - cam_y;
+
+                if (m.tileset != 0) {
+                    // Resolve game tile type to tileset index via remap.
+                    ts_idx = m.remap[tile];
+                    if (ts_idx > 0) {
+                        if (ts_idx <= m.tile_count) {
+                            tex = m.tileset[ts_idx];
+                            if (tex != 0) {
+                                _stb_gpu_sprite(tex, sx, sy, m.tw, m.th, m.tw, m.th);
+                            } else {
+                                render_rect(sx, sy, m.tw, m.th, rgba(255, 0, 255, 255));
+                            }
+                        }
+                    } else {
+                        // Unmapped tile type: magenta debug rect.
+                        render_rect(sx, sy, m.tw, m.th, rgba(255, 0, 255, 255));
+                    }
+                } else {
+                    // No tileset: colored debug rectangles.
+                    render_rect(sx, sy, m.tw, m.th, rgba(60 + tile * 30, 80 + tile * 15, 40 + tile * 10, 255));
+                }
+            }
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    return 0;
+}

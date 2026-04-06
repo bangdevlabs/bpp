@@ -1,0 +1,372 @@
+// platformer — A test platformer to stress-test B++ game capabilities.
+// Uses Kenney Pixel Platformer assets (CC0).
+// Tests: tilemap rendering, sprite animation, physics, collision,
+// scrolling camera, HUD, file loading, keyboard input.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbtile.bsm";
+import "stbphys.bsm";
+
+// ── Constants ────────────────────────────────────────────
+
+auto TILE_W;    // tile width in pixels
+auto TILE_H;    // tile height in pixels
+auto MAP_W;     // map width in tiles
+auto MAP_H;     // map height in tiles
+
+// ── Tile types ───────────────────────────────────────────
+
+enum Tile {
+    T_EMPTY,
+    T_GROUND,
+    T_BRICK,
+    T_PLATFORM,
+    T_COIN,
+    T_SPIKE,
+    T_FLAG
+}
+
+// ── Tile colors (used for HUD elements and debug fallback) ──
+
+auto CLR_SKY;
+auto CLR_COIN;
+auto CLR_SPIKE;
+auto CLR_FLAG;
+auto CLR_PLAYER;
+
+// ── Game state ───────────────────────────────────────────
+
+auto tilemap;        // Tilemap struct from stbtile
+auto player;         // Body struct from stbphys
+auto player_facing;  // 0 = right, 1 = left
+auto player_anim;    // animation frame
+auto player_anim_t;  // animation timer
+auto player_alive;
+
+auto score;
+auto coins_total;
+auto CAM_X, CAM_Y;
+
+// ── Level design ─────────────────────────────────────────
+
+// Build the test level. A hand-crafted platformer stage.
+build_level() {
+    auto x, y;
+
+    // Ground floor (full width).
+    x = 0;
+    while (x < MAP_W) {
+        tile_set(tilemap, x, MAP_H - 1, T_GROUND);
+        tile_set(tilemap, x, MAP_H - 2, T_GROUND);
+        x = x + 1;
+    }
+
+    // Gap in the ground (pit).
+    x = 12;
+    while (x < 16) {
+        tile_set(tilemap, x, MAP_H - 1, T_EMPTY);
+        tile_set(tilemap, x, MAP_H - 2, T_EMPTY);
+        x = x + 1;
+    }
+
+    // Floating platforms.
+    x = 4;
+    while (x < 8) { tile_set(tilemap, x, MAP_H - 5, T_PLATFORM); x = x + 1; }
+    x = 10;
+    while (x < 13) { tile_set(tilemap, x, MAP_H - 7, T_PLATFORM); x = x + 1; }
+    x = 16;
+    while (x < 20) { tile_set(tilemap, x, MAP_H - 5, T_PLATFORM); x = x + 1; }
+    x = 22;
+    while (x < 25) { tile_set(tilemap, x, MAP_H - 8, T_PLATFORM); x = x + 1; }
+    x = 27;
+    while (x < 31) { tile_set(tilemap, x, MAP_H - 6, T_PLATFORM); x = x + 1; }
+    x = 33;
+    while (x < 36) { tile_set(tilemap, x, MAP_H - 9, T_PLATFORM); x = x + 1; }
+
+    // Brick walls (obstacle).
+    y = MAP_H - 3;
+    while (y >= MAP_H - 6) {
+        tile_set(tilemap, 8, y, T_BRICK);
+        tile_set(tilemap, 9, y, T_BRICK);
+        y = y - 1;
+    }
+
+    // Coins scattered around.
+    tile_set(tilemap, 5, MAP_H - 6, T_COIN);
+    tile_set(tilemap, 6, MAP_H - 6, T_COIN);
+    tile_set(tilemap, 11, MAP_H - 8, T_COIN);
+    tile_set(tilemap, 12, MAP_H - 8, T_COIN);
+    tile_set(tilemap, 17, MAP_H - 6, T_COIN);
+    tile_set(tilemap, 18, MAP_H - 6, T_COIN);
+    tile_set(tilemap, 23, MAP_H - 9, T_COIN);
+    tile_set(tilemap, 24, MAP_H - 9, T_COIN);
+    tile_set(tilemap, 28, MAP_H - 7, T_COIN);
+    tile_set(tilemap, 29, MAP_H - 7, T_COIN);
+    tile_set(tilemap, 34, MAP_H - 10, T_COIN);
+    tile_set(tilemap, 35, MAP_H - 10, T_COIN);
+
+    coins_total = 12;
+
+    // Spikes in the pit.
+    x = 12;
+    while (x < 16) { tile_set(tilemap, x, MAP_H - 1, T_SPIKE); x = x + 1; }
+
+    // Flag at the end.
+    tile_set(tilemap, MAP_W - 3, MAP_H - 3, T_FLAG);
+
+    return 0;
+}
+
+// ── Camera ───────────────────────────────────────────────
+
+update_camera() {
+    auto target_x, target_y, scr_w, scr_h;
+    scr_w = 320;
+    scr_h = 180;
+
+    // Center camera on player.
+    target_x = phys_px_x(player) - scr_w / 2 + 8;
+    target_y = phys_px_y(player) - scr_h / 2 + 8;
+
+    // Clamp to map bounds.
+    CAM_X = clamp(target_x, 0, MAP_W * TILE_W - scr_w);
+    CAM_Y = clamp(target_y, 0, MAP_H * TILE_H - scr_h);
+
+    return 0;
+}
+
+// ── Player update ────────────────────────────────────────
+
+update_player(dt) {
+    auto px, py, tile;
+    auto b: Body;
+    b = player;
+
+    if (player_alive == 0) { return 0; }
+
+    // Horizontal input.
+    b.vx = 0;
+    if (key_down(KEY_LEFT)) {
+        b.vx = 0 - b.move_spd;
+        player_facing = 1;
+    }
+    if (key_down(KEY_RIGHT)) {
+        b.vx = b.move_spd;
+        player_facing = 0;
+    }
+    if (key_down(KEY_A)) {
+        b.vx = 0 - b.move_spd;
+        player_facing = 1;
+    }
+    if (key_down(KEY_D)) {
+        b.vx = b.move_spd;
+        player_facing = 0;
+    }
+
+    // Jump.
+    if (key_pressed(KEY_SPACE)) { phys_jump(player); }
+    if (key_pressed(KEY_W)) { phys_jump(player); }
+    if (key_pressed(KEY_UP)) { phys_jump(player); }
+
+    // Full physics step: gravity, horizontal move, vertical move.
+    phys_update(player, dt, tilemap);
+
+    // Collect coins.
+    px = phys_px_x(player) + 6;
+    py = phys_px_y(player) + 8;
+    tile = tile_at(tilemap, px, py);
+    if (tile == T_COIN) {
+        tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
+        score = score + 100;
+    }
+
+    // Check spikes.
+    if (tile == T_SPIKE) {
+        player_alive = 0;
+    }
+
+    // Check flag (win).
+    if (tile == T_FLAG) {
+        score = score + 1000;
+        tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
+    }
+
+    // Fall off map = death.
+    if (phys_px_y(player) > MAP_H * TILE_H) {
+        player_alive = 0;
+    }
+
+    // Animation.
+    if (b.vx != 0) {
+        player_anim_t = player_anim_t + dt;
+        if (player_anim_t > 150) {
+            player_anim = (player_anim + 1) % 4;
+            player_anim_t = 0;
+        }
+    } else {
+        player_anim = 0;
+        player_anim_t = 0;
+    }
+
+    return 0;
+}
+
+// ── Rendering ────────────────────────────────────────────
+
+// Draw the player character.
+draw_player() {
+    auto sx, sy, color;
+    sx = phys_px_x(player) - CAM_X;
+    sy = phys_px_y(player) - CAM_Y;
+
+    if (player_alive == 0) {
+        color = RED;
+    } else {
+        color = CLR_PLAYER;
+    }
+
+    // Body.
+    render_rect(sx + 2, sy, 12, 16, color);
+    // Eyes (facing direction).
+    if (player_facing == 0) {
+        render_rect(sx + 10, sy + 4, 3, 3, WHITE);
+        render_rect(sx + 11, sy + 5, 2, 2, BLACK);
+    } else {
+        render_rect(sx + 3, sy + 4, 3, 3, WHITE);
+        render_rect(sx + 3, sy + 5, 2, 2, BLACK);
+    }
+
+    // Walk animation: leg movement.
+    if (player_alive) {
+        if (player_anim == 1) {
+            render_rect(sx + 2, sy + 14, 4, 3, rgba(60, 60, 180, 255));
+            render_rect(sx + 9, sy + 12, 4, 3, rgba(60, 60, 180, 255));
+        }
+        if (player_anim == 3) {
+            render_rect(sx + 2, sy + 12, 4, 3, rgba(60, 60, 180, 255));
+            render_rect(sx + 9, sy + 14, 4, 3, rgba(60, 60, 180, 255));
+        }
+    }
+
+    return 0;
+}
+
+// Draw parallax background (simple gradient sky + mountains).
+draw_background() {
+    auto y, r, g, b;
+
+    // Sky gradient.
+    y = 0;
+    while (y < 180) {
+        r = 50 + y / 3;
+        g = 100 + y / 4;
+        b = 200 - y / 6;
+        render_rect(0, y, 320, 1, rgba(r, g, b, 255));
+        y = y + 1;
+    }
+
+    // Distant mountains (parallax: move at half camera speed).
+    auto mx, mh;
+    mx = 0 - CAM_X / 3;
+    mh = 40;
+    while (mx < 340) {
+        render_rect(mx, 180 - mh - 30, 60, mh + 30, rgba(80, 100, 80, 255));
+        render_rect(mx + 20, 180 - mh - 45, 40, mh + 45, rgba(70, 90, 70, 255));
+        mx = mx + 80;
+        mh = 30 + (mh * 7 + 13) % 20;
+    }
+
+    return 0;
+}
+
+// Draw HUD overlay.
+draw_hud() {
+    // Score.
+    render_text("SCORE", 8, 4, 1, WHITE);
+    render_number(50, 4, 1, YELLOW, score);
+
+    // Coins.
+    render_circle(8, 20, 4, CLR_COIN);
+    render_number(16, 16, 1, WHITE, score / 100);
+
+    // Death message.
+    if (player_alive == 0) {
+        render_text("PRESS R TO RESTART", 80, 80, 1, RED);
+    }
+
+    return 0;
+}
+
+// ── Init / Reset ─────────────────────────────────────────
+
+init_game() {
+    TILE_W = 16;
+    TILE_H = 16;
+    MAP_W = 40;
+    MAP_H = 14;
+
+    CLR_SKY = rgba(100, 150, 220, 255);
+    CLR_COIN = rgba(255, 220, 50, 255);
+    CLR_SPIKE = rgba(220, 40, 40, 255);
+    CLR_FLAG = rgba(50, 220, 50, 255);
+    CLR_PLAYER = rgba(80, 120, 220, 255);
+
+    // Create tilemap and mark solid tile types.
+    tilemap = tile_new(MAP_W, MAP_H, TILE_W, TILE_H);
+    tile_solid(tilemap, T_GROUND);
+    tile_solid(tilemap, T_BRICK);
+    tile_solid(tilemap, T_PLATFORM);
+    build_level();
+
+    // Create physics body: 12x16 hitbox, gravity=600, jump=-280, speed=120.
+    player = phys_body(12, 16, 600, 0 - 280, 120);
+    phys_set_pos(player, 32, (MAP_H - 4) * TILE_H);
+
+    player_facing = 0;
+    player_anim = 0;
+    player_anim_t = 0;
+    player_alive = 1;
+
+    score = 0;
+    CAM_X = 0;
+    CAM_Y = 0;
+
+    return 0;
+}
+
+// ── Main ─────────────────────────────────────────────────
+
+main() {
+    game_init(320, 180, "B++ Platformer", 60);
+    render_init();
+    init_game();
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        auto dt;
+        dt = game_dt_ms();
+
+        // Restart on death.
+        if (key_pressed(KEY_R)) {
+            init_game();
+        }
+
+        if (key_pressed(KEY_ESC)) { break; }
+
+        update_player(dt);
+        update_camera();
+
+        render_begin();
+        render_clear(CLR_SKY);
+
+        draw_background();
+        tile_draw(tilemap, CAM_X, CAM_Y, 320, 180);
+        draw_player();
+        draw_hud();
+
+        render_end();
+    }
+
+    return 0;
+}

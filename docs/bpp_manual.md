@@ -190,6 +190,7 @@ Unary operators:
     -              negate
     ~              bitwise not
     *              dereference (memory load)
+    &              address-of (get memory address of a variable)
 
 Assignment:
 
@@ -333,6 +334,26 @@ Offsets are in bytes. Each word is 8 bytes:
     *(buf + 8) = 200;     // store word at byte offset 8 (second word)
     auto x;
     x = *(buf + 0);       // load: x is now 100
+
+### Address-of
+
+`&x` returns the memory address of variable `x` on the stack (or in the
+data section for globals). This is the inverse of dereference: `*(&x) == x`.
+
+Use it to pass out-parameters to functions without allocating memory:
+
+    set_value(dest, val) { *(dest) = val; return 0; }
+
+    main() {
+        auto x;
+        x = 0;
+        set_value(&x, 42);  // x is now 42
+        return x;
+    }
+
+**Note:** `&` does not work with extern FFI functions or `call()` (function
+pointer calls). The compiler emits warning W012 for this case. Use
+`malloc(8)` as a workaround for FFI out-parameters.
 
 ### Array indexing
 

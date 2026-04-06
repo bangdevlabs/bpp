@@ -2366,6 +2366,117 @@ gen2==gen3 verified after: sys_socket/sys_connect/sys_usleep builtins, BRK remov
 - `src/x86_64/x64_codegen.bsm` — malloc header, free munmap, realloc 2-arg with mremap+fallback
 - `src/bpp_emitter.bsm` — realloc 2-arg (C emitter)
 
+## 2026-04-06 — B++ 2.0: Tilemap, Physics, Address-of, Kenney Assets
+
+### Milestone
+B++ 2.0. Three new stb modules, a new compiler feature, PNG transparency, and a platformer running with real pixel art assets on Metal GPU.
+
+### stbtile.bsm — Tilemap Engine (NEW — module #22)
+- `tile_new(w, h, tw, th)` — create tilemap with any grid and tile dimensions.
+- `tile_get/tile_set` — byte-level tile access, bounds-checked, returns 0 for OOB.
+- `tile_solid(tm, type)` / `tile_is_solid` — collision layer via 256-entry mask.
+- `tile_collides(tm, px, py, pw, ph)` — AABB vs solid tiles. Lifted from platformer's inline code, made generic.
+- `tile_at(tm, px, py)` — tile type at pixel position (auto grid conversion).
+- `tile_load_set(path, tw, th, &ts_out)` — loads PNG tileset via stbimage, cuts into individual GPU textures (1 per tile). No atlas UV — each tile is its own texture. RGBA buffers intentionally leaked (Apple Silicon async pattern).
+- `tile_bind_set(tm, textures, count)` — bind tileset to tilemap.
+- `tile_map_type(tm, game_type, tileset_index)` — remap game tile types (T_GROUND=1) to tileset indices (63). Decouples game logic from tileset layout. Default: identity mapping.
+- `tile_draw(tm, cam_x, cam_y, scr_w, scr_h)` — GPU render with camera-aware culling and remap. Falls back to colored debug rects if no tileset bound.
+- ~200 lines. Depends on stbimage + stbfile.
+
+### stbphys.bsm — Platformer Physics (NEW — module #23)
+- `struct Body { x, y, vx, vy, w, h, on_ground, gravity, jump_vel, move_spd }`.
+- Milli-pixel convention: positions in px×1000, velocities in px/sec. `pos += vel * dt_ms` works directly.
+- `phys_body(w, h, gravity, jump_vel, move_spd)` — create body with movement parameters.
+- `phys_update(b, dt, tm)` — full step: gravity → move_x → move_y (separate axis collision resolution).
+- `phys_jump(b)` — impulse if on_ground.
+- **Bug fix #1 — snap formula**: original used `new_py / th` (top of body) to find ground tile. Correct: `(new_py + body.h) / th` (bottom of body). Old formula snapped 1 tile too high, causing constant mini-bouncing.
+- **Bug fix #2 — ground probe**: `on_ground` lasted exactly 1 frame (set on collision, cleared next frame). Added 1px-below probe: `tile_collides(tm, px, new_py + 1, w, h)` keeps on_ground=1 while standing on solid ground. Without this, jump input had <2% chance of catching the on_ground frame.
+- ~180 lines. Depends on stbtile + stbmath.
+
+### Address-of Operator `&` (COMPILER FEATURE)
+B++ now supports `&variable` to get the memory address of a local or global variable. Eliminates the `malloc(8)` out-parameter workaround that was used throughout the codebase.
+
+Before: `buf = malloc(8); func(buf); val = *(buf); free(buf);` (4 lines, memory leak risk)
+After: `func(&val);` (1 line, zero allocation)
+
+**Implementation:**
+- New AST node: `T_ADDR = 14` in defs.bsm.
+- Parser: added `&` to both `parse_unary()` (for `&x` as operand) and `parse_expr()` (for `&x` at expression start — same dispatch pattern as `-` and `~`). Missing the `parse_expr` dispatch was the bug that took 2 attempts to find.
+- x86-64 codegen: `LEA RAX, [RBP + offset]` for locals, `LEA RAX, [RIP + reloc]` for globals.
+- aarch64 codegen: `ADD X0, FP, #offset` for locals, `ADRP + ADD` for globals.
+- All analysis passes updated: validate, typeck, types (3 locations), emitter, dispatch (2 locations). 9 files total.
+- Bootstrap verified: `shasum bpp2 == bpp3`.
+
+**Known limitation (W012):** `&` does not work as an argument to extern FFI functions or `call()` (function pointer calls). The stack address gets clobbered by the calling convention. Workaround: use `malloc(8)` for FFI out-parameters. Compiler emits W012 warning when this pattern is detected.
+
+**Codebase cleanup:** 6 files converted from `malloc(8)` to `&` — stbsprite, stbfont, stbimage (×2), bug_observe_macos (×2), bug_observe_linux (×2). ~30 lines of workaround eliminated.
+
+### stbimage.bsm — tRNS Chunk Support
+- PNG palette-indexed images (8-bit colormap) can have per-entry transparency via the tRNS chunk. stbimage did not read this chunk — all palette pixels got alpha=255.
+- Added tRNS chunk handler: reads alpha byte array (up to 256 entries), applies during RGBA expansion in `_png_to_rgba`. Palette entries beyond tRNS length default to 255 (opaque).
+- Kenney Pixel Platformer sprites now render with correct transparency.
+
+### Metal Shader — Alpha Discard
+- Fragment shader's sprite path (`use_tex > 0.25`) now has `if (t.a < 0.01) discard_fragment()`.
+- Without this, pixels with alpha=0 (from tRNS) were still composited as black rectangles.
+- Combined with tRNS support, character sprites render cleanly on any background.
+
+### Platformer with Kenney Assets
+- `games/platformer/platform_noasset.bpp` — GPU rendering with debug rectangles, stbtile + stbphys. 16x16 tiles.
+- `games/platformer/platform_assets.bpp` — Kenney Pixel Platformer (CC0) tileset. 18x18 tiles, 20×9 grid (180 tiles). Character sprites 24x24 (9×3 grid, 27 sprites).
+- Tile remap: game types (T_GROUND=1, T_DIRT=2...) mapped to tileset indices (63, 123...) via `tile_map_type`.
+- Kenney assets downloaded to `games/platformer/assets/` (tilemap_packed.png, tilemap-characters_packed.png).
+- Parallax background, scrolling camera, HUD with score + coins, death/restart.
+
+### W012 Diagnostic
+- New compiler warning: `'&' used as argument to extern/call() — may crash at runtime`.
+- Fires when T_ADDR node appears as argument to an extern function or `call()` built-in.
+- Added to bpp_validate.bsm in the T_CALL validation section.
+- Discovered after `mach_timebase_info(&tb)` and `call(..., &err)` caused segfaults in the Metal platform init. The stack address computed by `&` is correct for B++ function calls, but the codegen path for `call()` and extern FFI does not preserve it across the calling convention.
+- Workaround: use `malloc(8)` for FFI out-parameters. Native B++ functions (`file_read_all(path, &size)`, etc.) work correctly with `&`.
+- Future fix: make the codegen path for extern/call() arguments save-and-restore registers before evaluating argument expressions, so LEA-produced stack addresses survive across nested evaluations.
+
+### Snake ECS Particle Bug (found while testing on GPU)
+Symptom: snake_full.bpp had working yellow particles on apple eat using software rendering. After migrating to GPU (snake_gpu.bpp in games/snake/), particles became invisible.
+
+Root cause: two bit-width bugs in `update_particles`. The flags field packs `color << 8 | life` — but color is 32-bit ARGB (alpha in top byte), and the code used 24-bit masks that lost the alpha:
+
+```
+ecs_set_flags(world, i, (flags & 0xFFFFFF00) + life - 1);  // BUG: 24-bit mask drops alpha
+color = (flags >> 8) & 0xFFFFFF;                            // BUG: same mask drops alpha
+```
+
+Worked by accident on CPU: `draw_rect` software path didn't use alpha for blending, so RGB was visible regardless. On GPU, Metal multiplies by alpha and discards pixels with alpha < 0.01 (the fragment shader change we did today for Kenney sprite transparency) — particles with alpha=0 became completely invisible.
+
+Fix: decrement the life byte directly with `flags - 1` (safe because life > 0 in the branch), and extract color with `flags >> 8` (no mask needed — life is the only thing below).
+
+Key lesson: "it worked before" is a lie when changing backends. Implicit assumptions about alpha handling (or any other blend state) leak through.
+
+### Files Changed
+- `src/defs.bsm` — T_ADDR = 14
+- `src/bpp_parser.bsm` — `&` in parse_unary + parse_expr
+- `src/x86_64/x64_codegen.bsm` — T_ADDR codegen (LEA)
+- `src/aarch64/a64_codegen.bsm` — T_ADDR codegen (ADD)
+- `src/bpp_validate.bsm` — T_ADDR validation + W012
+- `src/bpp_typeck.bsm` — T_ADDR type check
+- `src/bpp_types.bsm` — T_ADDR type inference (×3 locations)
+- `src/bpp_emitter.bsm` — T_ADDR C emitter + scan_calls
+- `src/bpp_dispatch.bsm` — T_ADDR contains_var + has_side_effects
+- `stb/stbtile.bsm` — NEW: tilemap engine
+- `stb/stbphys.bsm` — NEW: platformer physics
+- `stb/stbimage.bsm` — tRNS chunk + `&` cleanup
+- `stb/stbsprite.bsm` — `&` cleanup
+- `stb/stbfont.bsm` — `&` cleanup
+- `stb/_stb_platform_macos.bsm` — alpha discard in shader
+- `src/bug_observe_macos.bsm` — `&` cleanup
+- `src/bug_observe_linux.bsm` — `&` cleanup
+- `games/platformer/platform_noasset.bpp` — NEW: platformer with stbtile+stbphys
+- `games/platformer/platform_assets.bpp` — NEW: platformer with Kenney assets
+- `docs/todo.md` — updated roadmap, X11 as priority
+- `docs/x11_plan_review.md` — NEW: review notes for X11 agent
+
+---
+
 ## 2026-04-05 — GPU Sprites, stbsprite Module, Module Cache Fix, Pure B++ sqrt
 
 ### GPU Sprite UV Fix
