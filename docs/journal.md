@@ -2535,3 +2535,230 @@ Critical cache correctness issue discovered: compiling the same program twice pr
 - `src/bpp_bo.bsm` — 3 cache bugs fixed: param types, return types, null terminators
 - `games/pathfinder/pathfinder.bpp` — NEW: ported MCU game with GPU sprites
 - `games/pathfinder/assets/sprites/` — rat and cat sprite JSON files
+
+## 2026-04-06 — B++ 0.21: Linux X11, Validator Integration, C Emitter Modernized
+
+### X11 Wire Protocol on Linux (Phases 1-3)
+The Linux platform layer (`stb/_stb_platform_linux.bsm`) grew from 276 to 1160 lines, gaining a full X11 wire-protocol client. Zero FFI, zero shared libraries — raw `sys_socket`/`sys_connect`/`sys_read`/`sys_write` over a Unix domain socket (or TCP for Docker+XQuartz). Mode is auto-selected at init time: if `DISPLAY` is set and an X server is reachable, the platform switches into windowed mode; otherwise it falls back to the existing terminal ANSI rendering — no regression.
+
+**Phase 1** — Connection + window:
+- DISPLAY parser reading `/proc/self/environ` (no getenv syscall needed)
+- `_x11_resolve_hosts` walks `/etc/hosts` so Docker's `host.docker.internal` mapping works without DNS
+- Manual byte-swap of `sin_port` because B++'s `write_u16` is little-endian and TCP expects big-endian
+- 12-byte connection setup, vendor-string parsing, pixel format validation
+- CreateWindow with `event_mask = 2261071` (FocusChangeMask = 2097152 included so FocusOut actually fires)
+- InternAtom + ChangeProperty to register WM_DELETE_WINDOW
+- WM_NAME via the predefined STRING atom (39) so window managers display a title
+
+**Phase 2** — Software rendering:
+- CreateGC + XPutImage (opcode 72)
+- Critical insight: stbdraw's framebuffer is already in BGRA byte order on a little-endian host (because `write_u32(fb, off, ARGB)` lands as `[B, G, R, A]` in memory). Direct copy, no swizzle — first attempt was double-swapping R↔B and produced inverted colors.
+
+**Phase 3** — Input:
+- Event drain via `sys_ioctl(fd, FIONREAD, &avail)` using the new `&` operator (no malloc scratch)
+- Full event dispatcher: error (type 0), KeyPress, KeyRelease, ButtonPress, ButtonRelease, MotionNotify, FocusOut (clears `_stb_keys` to fix stuck keys after Alt-Tab), Expose, ClientMessage (WM_DELETE_WINDOW)
+- **evdev/Apple keycode auto-detect**: Xorg uses evdev codes (arrows = 111/116/113/114), XQuartz forwards Apple ADB codes (arrows = 134/133/131/132). Both servers report `vendor = "The X.Org Foundation"`, so vendor-string detection is impossible. Solution: try evdev first, fall back to Apple, lock into Apple mode the first time an Apple-only code is recognized. Verified working with Xvfb (evdev path) via xdotool injection.
+- Helpers `_x11_err_str`/`_x11_err_dec` write to stderr via `putchar_err` for protocol error logging.
+
+**Snake on Linux**: `bpp --linux64 examples/snake_cpu.bpp -o /tmp/snake_x11`, then `docker run --rm --add-host host.docker.internal:host-gateway -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp ubuntu:22.04 /tmp/snake_x11` opens the game window in XQuartz with full input — first B++ game running on Linux outside of the terminal.
+
+### Validator Integrated into Incremental Pipeline
+`run_validate()` had been monolithic-only since the validator was written, meaning the ARM64 and x86_64 native backends never ran the strict semantic checks (E050 ptr mismatch, E201 undefined function, W002/W003 arg count, etc.). Only the `--c` and `--asm` paths caught these. Snake bug reports stayed buried.
+
+Fix: `run_validate()` now runs at the end of the incremental pipeline, after every module (including module 0) has been parsed and inferred, just before the final binary linking. A per-module variant `validate_module(mi)` is also exported for future use, but the loop iterates module indices in raw order — not topological — so per-module validation would fire before the dependencies of the module had been parsed. The end-of-flow approach side-steps this.
+
+### E052 Removed
+The validator's `float-to-word` check (E052) rejected the canonical pattern:
+```bpp
+auto lx: float, ix: int;
+ix = lx / 3.0;        // E052 fired here
+```
+…even though the explicit `: int` hint **is** the cast. Native backends already emit `fcvtzs` implicitly for this case, and the C emitter relies on C's implicit `double → long long` truncation. The check was a phantom — it only ever fired in monolithic mode, and only against legitimate explicit conversions. Removed entirely.
+
+### `bpp_typeck.bsm` Deleted
+A 507-line orphan file from a never-finished plan. No imports, no callers, dead since it was created. Removed.
+
+### C Emitter Modernized
+Eight builtins were missing from `bpp_emitter.bsm` after they had been added to the native backends:
+- `putchar_err` → `bpp_sys_write(2, ...)`
+- `assert` → `(cond) ? 0 : (abort(), 0)`
+- `shr` → `((uint64_t)(value)) >> shift`
+- `float_ret` / `float_ret2` → reads global `_bpp_float_ret_1/2`
+- `sys_ioctl`, `sys_nanosleep`, `sys_clock_gettime` → libc wrappers
+
+`#include <sys/ioctl.h>` and `<time.h>` added to the C preamble. Two static `double _bpp_float_ret_1/2` slots added to the memory model.
+
+**Extern dedup**: B++ source can declare the same FFI name multiple times with different signatures (notably `objc_msgSend` on macOS). C does not allow overloaded forward declarations. Fix: `emit_includes()` walks the extern table once per unique name, and when a name has more than one signature it appends `, ...` varargs so the single declaration accepts any call shape. **Caveat**: varargs ABI on arm64-darwin pushes args to the stack instead of registers, which breaks `objc_msgSend` if you actually call it through the C output. The right path for Cocoa via the C emitter is function pointer casts at the call site (deferred). For portable C output via raylib/SDL drivers, the dedup is fine because those drivers do not call objc_msgSend.
+
+**libc symbol skip**: `is_libc_symbol(name_p)` returns 1 for POSIX names already declared by the headers we include (`usleep`, `sleep`, `nanosleep`, `clock_gettime`, `ioctl`, `read`, `write`, `open`, `close`, `lseek`, `fchmod`, `mkdir`, `unlink`, `fork`, `execve`, `waitpid`, `wait4`, `ptrace`, `_exit`, `socket`, `connect`, `mmap`, `munmap`, `malloc`, `free`, `realloc`, `abort`). These extern declarations are skipped to avoid conflicts with the real prototypes (which differ — `usleep` takes `useconds_t` on macOS, not `int`).
+
+### C Emitter Verified End-to-End
+- `bpp --c games/snake/snake_gpu.bpp > snake_gpu.c; gcc -lobjc snake_gpu.c -o snake_gpu_c` produces a 96 KB Mach-O. Runs but crashes inside `_stb_init_window` because of the varargs ABI mismatch on `objc_msgSend` — known limitation, deferred to future work.
+- `bpp --c examples/snake_raylib.bpp > snake_raylib.c; gcc -I/opt/homebrew/include -L/opt/homebrew/lib -lraylib -lobjc snake_raylib.c -o snake_raylib_c` produces a 94 KB Mach-O that **runs the game correctly via raylib**. This is the canonical "portable C output" path: write the game with `drv_raylib.bsm` instead of `stbgame.bsm`, emit C, link against raylib, run anywhere raylib runs (macOS, Linux, Windows, BSDs).
+
+### Architectural Rule Confirmed
+Two clean paths emerge:
+- **Native binary** (`bpp foo.bpp`): import `stbgame.bsm`, talks to Cocoa/Metal via dlopen + objc_msgSend. Native ABI is correct because the backends know the exact calling convention per call site. Zero external tools.
+- **Portable C output** (`bpp --c foo.bpp`): import `drv_raylib.bsm` or `drv_sdl.bsm`. Generated C calls regular C functions with fixed signatures — no objc_msgSend, no varargs hell. Compile with gcc + raylib/SDL on the target platform.
+
+Mixing them (`stbgame.bsm` through `--c`) is the path that hits the objc_msgSend varargs problem and is the one not currently usable.
+
+### Files Changed
+- `stb/_stb_platform_linux.bsm` — 276 → 1160 lines, X11 wire protocol added
+- `tests/test_x11_window.bpp` — NEW (Phase 1 verification)
+- `tests/test_x11_draw.bpp` — NEW (Phase 2 verification)
+- `tests/test_x11_input.bpp` — NEW (Phase 3 verification)
+- `tests/test_x11_movement.bpp` — NEW (automated input test via xdotool)
+- `tests/test_x11_snake_min.bpp` — NEW (input isolation)
+- `docs/x11_session_notes.md` — NEW (implementation log)
+- `src/bpp_emitter.bsm` — 8 builtins added, `is_libc_symbol`, extern dedup with varargs
+- `src/bpp_validate.bsm` — `validate_module(mi)` added, E052 removed, builtin recognition extended
+- `src/bpp.bpp` — `run_validate()` now runs after module 0 in incremental mode
+- `src/bpp_typeck.bsm` — DELETED (507-line orphan)
+- `docs/todo.md` — version 0.21, ELF dynamic linking promoted to P0, P4 Vulkan revised
+
+---
+
+## 2026-04-06b — B++ 0.21 (continued): stbhash, stbpath, O(1) Compiler Symbols, Auto-Platform
+
+### Milestone
+The afternoon and evening of 2026-04-06 turned the morning's tilemap+physics+X11 release into a more complete 0.21: two new pure-B++ data structures (a hash map and an A* pathfinder), six O(n) lookups in the compiler replaced with O(1) hash queries, the platform-layer indirection removed from `stbgame.bsm` and turned into a compiler-level auto-injection, all platform/observe sources moved into the appropriate chip folders, the pathfinder game refactored end-to-end onto the milli-unit convention, and the test suite cleaned of legacy drift (71 → 52 tests, 100% passing).
+
+### sys_socket / sys_connect / sys_usleep validator fix
+First problem of the day. `install.sh` was failing in the "compile debugger" step:
+```
+error[E201]: function 'sys_socket' called but never defined -- missing import?
+```
+Discovery story: the validator's `val_is_builtin()` enumerates every B++ builtin by name. Three names — `sys_socket`, `sys_connect`, `sys_usleep` — were present in `src/x86_64/x64_codegen.bsm` and `src/aarch64/a64_codegen.bsm` but **never added to the validator list**. The bug had existed since these syscalls were introduced, but stayed hidden because the `.bo` cache held cached versions of `bug_observe_*` and validation was skipped for cached functions. Cache cleanup (or fresh checkout) exposed it.
+
+Fix: 4 lines in `bpp_validate.bsm`. Bootstrap-verified, promoted.
+
+Lesson: codegen and validator are two parallel lists that must stay in sync. A cross-grep test would catch this — added to the cleanup ideas.
+
+### stbhash.bsm — Generic hash maps (NEW — module #25)
+Pure B++ hash map. Two flavors share the file:
+- **`Hash`** (word keys → word values): Knuth multiplicative hash, open addressing, linear probing, tombstone-aware delete, 75%-load resize.
+- **`HashStr`** (byte-sequence keys → word values): djb2 hash over the key bytes, copies keys on insert (caller's source buffer can be freed immediately).
+
+API for both: `*_new`, `*_set`, `*_get`, `*_has`, `*_del`, `*_clear`, `*_count`, `*_free`. ~610 lines, zero dependencies, leaf module.
+
+Designed primarily because the compiler needed it (see the symbol-table refactor below), but the API is generic enough for any program: entity ID lookup, asset cache, frequency counting, sparse arrays, string interning.
+
+`tests/test_hash.bpp` exercises both flavors with 49 assertions including a 100-key resize stress.
+
+### stbpath.bsm — A* pathfinding (NEW — module #26)
+Pure B++ A* on a grid. Three design choices that took deliberate discussion:
+
+**1. Leaf module, no stbtile dependency.** First draft imported `stbtile.bsm` for a `path_load_from_tilemap` convenience function. That dragged the entire image-loading and GPU-texture stack into anyone who wanted to use A* on a grid — including unit tests. Fixed by deleting the bridge function and documenting the 5-line tilemap → PathFinder loop as an inline snippet in the header comment. stbpath is now a true leaf, importable from puzzle solvers, AI planners, and the compiler test suite.
+
+**2. Binary min-heap with indexed `heap_pos[]` for true decrease-key.** Initial draft used a linear-scan open list — O(n) per pop, O(n²) per query, breaks down at ~100×100 grids. Replaced with a binary heap (parent at `(i-1)/2`, children at `2i+1`/`2i+2`). Each cell's position in the heap is tracked in `heap_pos[]`, so when a relaxation finds a better g-score for a cell already in the heap, we sift it up in O(log n) — no lazy deletion, no stale pops. Total search complexity: O((w·h) · log(w·h)).
+
+**3. Half-word scores rejected.** Considered storing `g_score`/`f_score` as half-word (16-bit) for 50% memory savings, but the max value of 65535 limits the implementation to grids around 256×256 before silent overflow. The footgun outweighs the savings. Scores stay word-sized; the future answer for huge grids is a separate `stbpath_sparse.bsm` using `stbhash` for the visited set (P2 todo).
+
+~440 lines. `tests/test_path.bpp` covers seven scenarios: open-grid straight line, trivial start==goal, U-shaped wall detour, unreachable goal, blocked endpoints, out-of-bounds endpoints, scratch reuse across queries.
+
+### Compiler symbol-table refactor: 6 lookups → O(1)
+Audited the compiler for the `for (i = 0; i < *_cnt; ...)` symbol-lookup pattern and found six call sites:
+
+| Function | File | Strategy | Reason |
+|---|---|---|---|
+| `val_find_func` | bpp_validate.bsm | Eager rebuild at `run_validate`/`validate_module` entry | funcs[] stable during validation pass |
+| `val_find_extern` | bpp_validate.bsm | Eager rebuild | Same reason |
+| `find_func_idx` | bpp_types.bsm | Eager rebuild at `run_types`/`infer_module` entry | Called from BOTH type inference AND codegen, eager works for both |
+| `find_struct` | bpp_parser.bsm + bpp_bo.bsm | **Incremental update** at insertion sites | Structs added DURING parsing, lookups happen DURING parsing — interleaved, lazy would be O(n²) |
+| `is_extern` | bpp_emitter.bsm | Lazy rebuild on stale | C emitter is a cold path, simplicity wins |
+| `find_extern` | bpp_emitter.bsm | Lazy rebuild (shares hash with `is_extern`) | Same reason |
+
+The choice between **eager**, **lazy**, and **incremental** hash sync was the most interesting design conversation of the session. Each strategy has a real trade-off:
+
+- **Eager** (rebuild at phase entry): predictable O(n) once per pass, no per-lookup overhead, but the caller must remember to rebuild at the right places. Works when phase boundaries are clear.
+- **Lazy** (rebuild on stale check inside the lookup): self-contained, no caller cooperation needed, but adds a branch on every lookup and has a pathological worst case if inserts and lookups are interleaved. Best when the lookup function is the only entry point and the table is mostly stable.
+- **Incremental** (update hash at every insertion site): zero rebuild cost ever, lookups are pure O(1), but **requires a complete audit of every insertion site** — miss one and lookups fail silently for the missed entries. Best when the insertion sites are few and well-known.
+
+The `find_struct` choice almost broke production. The incremental approach requires updating the hash at every place that calls `arr_push(sd_names, ...)`. There are TWO such places: `add_struct_def` in `bpp_parser.bsm` (the fresh-parse path) AND `bpp_bo.bsm:712` (the cached `.bo` loader, which inlines the struct registration to avoid calling `tok_mod()` during cache load). The first commit only updated the parser path. **Second compilation of the platformer game then failed** with `E101: unknown type 'Body'` because `Body` came from `stbphys.bsm` which was loaded from cache, where the bo loader had pushed it into `sd_names` directly without touching the hash.
+
+Fix: extracted a public helper `register_struct_hash(name_p, idx)` in `bpp_parser.bsm` and called it from BOTH insertion sites. The incremental approach now works, and the helper makes any future insertion site obvious.
+
+Note that `find_func_idx` had the SAME structural risk (`bpp_bo.bsm:696` also pushes to `funcs[]` directly) — but escaped because its strategy is **eager rebuild**, which reads `funcs[]` at the start of each pass and doesn't care who put things there. This is exactly why eager is more forgiving than incremental: it tolerates missed insertion sites by re-deriving from the live state.
+
+Each refactor was bootstrap-verified independently before promotion (`shasum bpp_new == shasum bpp_verify`). Six fixed-point cycles, all passing.
+
+Functional speedup: hard to measure exactly without a benchmark harness, but a fresh bootstrap of `src/bpp.bpp` (~1500 functions, ~10000 call sites in the AST) replaces O(n²) symbol resolution work with O(n) — back-of-envelope ~500x fewer comparisons in the validator and codegen passes.
+
+### Platform/observe files moved into chip folders
+Four files moved out of confusing locations:
+- `stb/_stb_platform_macos.bsm` → `src/aarch64/_stb_platform_macos.bsm`
+- `stb/_stb_platform_linux.bsm` → `src/x86_64/_stb_platform_linux.bsm`
+- `src/bug_observe_macos.bsm` → `src/aarch64/bug_observe_macos.bsm`
+- `src/bug_observe_linux.bsm` → `src/x86_64/bug_observe_linux.bsm`
+
+`find_file()` in `bpp_import.bsm` extended with four new search paths: `src/aarch64/`, `src/x86_64/`, `/usr/local/lib/bpp/aarch64/`, `/usr/local/lib/bpp/x86_64/`. `install.sh` updated to copy from `src/aarch64/*.bsm` and `src/x86_64/*.bsm` into the new install directories.
+
+**Architectural caveat**: chip and OS aren't the same thing. macOS is OS, aarch64 is chip. They happen to be 1:1 paired in B++ today (Apple Silicon = aarch64+macOS, B++ has no Linux ARM yet) but will diverge when a new combination lands. Each chip folder now has a `README.md` explaining the current chip+OS coupling and documenting the future `arch/` + `os/` + `targets/` split (P3 in `docs/todo.md`).
+
+The codegen files (`a64_codegen.bsm`, `x64_codegen.bsm`) were ALREADY chip+OS bundles — the encoder logic is chip-pure but the binary writer (Mach-O for macOS, ELF for Linux) and syscall numbers are OS-specific. So the platform layer joining the codegen in the chip folder reflects reality: each chip folder is a complete target backend.
+
+### Auto-injection of `_stb_platform.bsm`
+Before: `stb/stbgame.bsm` had `import "_stb_platform.bsm";` on line 14, and the import resolver's target-suffix fallback (`_imp_target` = "macos" or "linux") rewrote that to the per-OS file. The indirection worked but exposed an ugly import to anyone reading stbgame.
+
+After: the explicit import is gone from stbgame. `process_file()` in `bpp_import.bsm` detects when the file being processed is `stbgame.bsm` (suffix match via a small `_path_is_stbgame` helper) and auto-pulls `_stb_platform.bsm` into the import graph BEFORE stbgame's own line scan runs. The platform module appears in the topology like any other dependency, the existing target-suffix fallback resolves it to the per-OS file, and stbgame's source no longer mentions the platform layer at all.
+
+The trigger is "stbgame is being imported" rather than "the program references `_stb_*` symbols" — both produce identical results today (every `_stb_*` consumer goes through stbgame), and the import-graph trigger is far cheaper to implement than a symbol-table scan. Future option: switch to a full symbol scan if a non-stbgame consumer ever appears.
+
+`hello.bpp` and other minimal programs that don't import stbgame stay lightweight: no platform layer pulled in, no Cocoa/Metal overhead. The auto-injection costs nothing for programs that don't need it.
+
+### pathfind.bpp refactor: milli-unit + tilemap + A*
+The morning's pathfinder game was running fine but emitted four W002 warnings on the `rect_overlap` call:
+```bpp
+if (rect_overlap(rat_x, rat_y, rat_size * 1.0, rat_size * 1.0, ...))
+```
+The `* 1.0` round-trip was promoting integer `rat_size` to float just to be truncated back to int inside `rect_overlap`. Dead weight, plus the warning was the compiler nudging at a deeper issue: `rat_x` and `rat_y` were `auto rat_x: float`, **the old game-state convention from before stbphys.bsm existed**.
+
+Rewrote the game end-to-end to match the new milli-unit convention from stbphys/stbecs:
+- All positions in `int * 1000` (milli-pixels)
+- All velocities in pixels/sec (int)
+- `pos = pos + vel * dt_ms` works directly in integer math, no float in game state at all
+- Pixel position recovered with `pos / 1000` only at draw time and tile lookup time
+
+Then layered the new modules on top:
+- `stbtile.bsm` provides the arena: a 20×11 tilemap with two vertical walls, a horizontal stripe, and a couple of obstacles. Walls are tile type 1, marked solid via `tile_solid`.
+- `stbpath.bsm` provides the cat's brain: every frame, run A* from the cat's tile to the rat's tile, walk one step toward the next waypoint along the returned path. The cat now navigates around walls instead of just pointing at the rat.
+- The `* 1.0` round-trips in `rect_overlap` are gone (rat/cat sizes are passed as plain ints).
+- The leftover `rat row0:` debug print at line 199 is gone.
+
+The game compiles with **zero warnings** and runs at 60 fps on Metal GPU. The cat actually pathfinds.
+
+### Test suite cleanup: 71 → 52, 100% passing
+Audited every test file in `tests/`. Found 20 failing — none of them regressions from the day's work. All were legacy drift from earlier B++ eras:
+- Seven `test_io*` tests using `print_str`, `pstr`, `io_print_str`, `eprint_msg` — all functions removed long ago. Path was also wrong (`import "stb/stbio.bsm"` instead of `import "stbio.bsm"`).
+- `test_types.bpp` with `byte lives;` (pre-base×slice syntax), `test_init2.bpp` and `test_import.bpp` calling the removed `init_defs()`, `test_q.bpp` with the never-shipped quoteless `import stbio;` syntax.
+- `test_enc_arm64.bpp` importing `aarch64/a64_enc.bsm` (wrong path), `test_getdents.bpp` hardcoding `/Users/obino/.bpp/cache`.
+- `test_debug_bin.bpp` and `test_native_debug2/3/4.bpp` importing many internal compiler modules — scratch dev programs, not regression tests.
+- `test_stbdraw.bpp` redefining `_stb_present` as a no-op, which collided with the auto-imported platform layer.
+- `test_linux_exit.bpp` returning `42` intentionally as a cross-compile smoke test — not a real regression test.
+
+All 19 deleted (one file kept and rewritten: `tests/test_io.bpp` is now a clean exercise of the current `print_msg`/`print_int`/`print_char`/`print_ln` API). Re-ran the suite: **52/52 passing**.
+
+### Files Changed
+- `src/bpp_validate.bsm` — 3 syscalls added to builtin list, hash refactor of val_find_func/val_find_extern, eager rebuild in run_validate/validate_module
+- `src/bpp_types.bsm` — hash refactor of find_func_idx, eager rebuild in run_types/infer_module
+- `src/bpp_parser.bsm` — incremental hash for find_struct, register_struct_hash helper exposed
+- `src/bpp_bo.bsm` — register_struct_hash call added at the cached struct insertion site
+- `src/bpp_emitter.bsm` — lazy hash for is_extern/find_extern
+- `src/bpp_import.bsm` — find_file gains src/aarch64, src/x86_64 + global install paths; process_file auto-injects _stb_platform when stbgame is imported
+- `stb/stbgame.bsm` — `import "_stb_platform.bsm"` removed (now compiler-injected)
+- `stb/stbhash.bsm` — NEW: word + byte-keyed hash maps, ~610 lines
+- `stb/stbpath.bsm` — NEW: A* with binary min-heap + indexed decrease-key, ~440 lines
+- `src/aarch64/_stb_platform_macos.bsm` — moved from stb/
+- `src/aarch64/bug_observe_macos.bsm` — moved from src/
+- `src/aarch64/README.md` — NEW: chip+OS coupling note
+- `src/x86_64/_stb_platform_linux.bsm` — moved from stb/
+- `src/x86_64/bug_observe_linux.bsm` — moved from src/
+- `src/x86_64/README.md` — NEW: chip+OS coupling note
+- `install.sh` — copies from src/aarch64 and src/x86_64 into per-target install dirs
+- `games/pathfind/pathfind.bpp` — full rewrite: milli-unit positions, tilemap arena, A* cat AI, removed `* 1.0` round-trips and debug print
+- `tests/test_hash.bpp` — NEW: 49 assertions, both Hash and HashStr
+- `tests/test_path.bpp` — NEW: 7 A* scenarios
+- `tests/test_io.bpp` — rewritten for current stbio API
+- `tests/test_io2.bpp`, `test_io4.bpp`, `test_io6.bpp`, `test_io7.bpp`, `test_io8.bpp`, `test_io_simple.bpp`, `test_q.bpp`, `test_stbio_q.bpp`, `test_types.bpp`, `test_init2.bpp`, `test_import.bpp`, `test_enc_arm64.bpp`, `test_getdents.bpp`, `test_debug_bin.bpp`, `test_native_debug2.bpp`, `test_native_debug3.bpp`, `test_native_debug4.bpp`, `test_stbdraw.bpp`, `test_linux_exit.bpp` — DELETED (legacy drift)
+- `docs/todo.md` — Done section reorganized by category, P0 stbaudio + host-aware compiler, P2 stbpath/stbhash done, P3 target architecture refactor

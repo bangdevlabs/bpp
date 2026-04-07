@@ -1,0 +1,1334 @@
+// _stb_platform_linux.bsm — Linux platform layer with X11 support.
+//
+// Two rendering modes, chosen at init time based on the DISPLAY env var:
+//
+//   1. X11 windowed mode (when DISPLAY is set and connection succeeds):
+//      Pure wire protocol over a Unix domain socket or TCP — no libX11,
+//      no shared libraries, just raw syscalls. The framebuffer is sent
+//      each frame via XPutImage. Handles keyboard and mouse events.
+//
+//   2. Terminal ANSI mode (fallback when no DISPLAY or X11 connect fails):
+//      Renders the framebuffer to the terminal using ANSI escape codes
+//      and half-block characters. Input read from stdin in raw mode.
+//
+// The mode is tracked in _x11_mode. Every dispatch point in the public
+// platform API checks this global and routes to the correct backend.
+
+import "stbbuf.bsm";
+
+// Original terminal settings (saved for restore on exit).
+auto _plt_orig_termios;
+// Quit flag.
+auto _plt_quit_flag;
+// Timing: base timestamp in milliseconds.
+auto _plt_time_base;
+// Output buffer for batched terminal writes.
+auto _plt_outbuf, _plt_outpos;
+// Downscale factor: each game pixel maps to (1/scale) terminal cells.
+auto _plt_scale;
+// Terminal grid dimensions (in characters).
+auto _plt_cols, _plt_rows;
+
+// ── X11 state ───────────────────────────────────────────────────
+// Selected rendering mode: 0 = terminal ANSI, 1 = X11 window.
+auto _x11_mode;
+// Socket file descriptor to the X server (-1 when not connected).
+auto _x11_fd;
+// Parsed DISPLAY components.
+auto _x11_display;      // Display number, usually 0
+auto _x11_screen;       // Screen number, usually 0
+auto _x11_is_tcp;       // 1 = TCP, 0 = Unix domain socket
+auto _x11_host;         // Host name buffer, 64 bytes
+auto _x11_host_len;     // Host name length
+// Server identity from the connection setup reply.
+auto _x11_rid_base;     // Base of the resource-id range we can allocate
+auto _x11_rid_mask;     // Mask of the resource-id range
+auto _x11_rid_next;     // Next unused resource-id offset
+auto _x11_root;         // Root window id
+auto _x11_root_depth;   // Root depth, usually 24
+auto _x11_root_visual;  // Root visual id
+auto _x11_root_colormap;// Default colormap
+auto _x11_bpp;          // Bits per pixel for depth 24 (should be 32)
+auto _x11_server_type;  // 0 = evdev (Xorg/Xwayland), 1 = XQuartz (Apple ADB)
+auto _x11_setup_buf;    // Reusable buffer for setup response
+// Our window and graphics context ids.
+auto _x11_wid;
+auto _x11_gc;
+// Atoms used for clean window close.
+auto _x11_wm_protocols;
+auto _x11_wm_delete;
+// Reusable buffers for rendering and input.
+auto _x11_pixbuf;       // RGBA→BGRX conversion buffer for XPutImage
+auto _x11_reqbuf;       // Reusable 24-byte PutImage header
+auto _x11_evbuf;        // Reusable 32-byte X11 event buffer
+auto _x11_needs_redraw; // Set by Expose events
+
+// Write a byte to the output buffer. Stops silently if buffer is full.
+_plt_emit(c) {
+    if (_plt_outpos >= 1048576) { return 0; }
+    poke(_plt_outbuf + _plt_outpos, c);
+    _plt_outpos = _plt_outpos + 1;
+    return 0;
+}
+
+// Write a null-terminated string literal to the output buffer.
+_plt_emit_str(s) {
+    auto i, c;
+    i = 0;
+    c = peek(s + i);
+    while (c != 0) {
+        _plt_emit(c);
+        i = i + 1;
+        c = peek(s + i);
+    }
+    return 0;
+}
+
+// Write a decimal number to the output buffer.
+_plt_emit_dec(n) {
+    auto buf, len, d;
+    buf = malloc(16);
+    len = 0;
+    if (n == 0) { _plt_emit(48); free(buf); return 0; }
+    while (n > 0) {
+        d = n - (n / 10) * 10;
+        poke(buf + len, d + 48);
+        len = len + 1;
+        n = n / 10;
+    }
+    while (len > 0) {
+        len = len - 1;
+        _plt_emit(peek(buf + len));
+    }
+    free(buf);
+    return 0;
+}
+
+// Flush the output buffer to stdout.
+_plt_flush() {
+    if (_plt_outpos > 0) {
+        sys_write(1, _plt_outbuf, _plt_outpos);
+        _plt_outpos = 0;
+    }
+    return 0;
+}
+
+// Get current time in milliseconds using clock_gettime(CLOCK_MONOTONIC).
+_plt_now_ms() {
+    auto ts, sec, nsec;
+    ts = malloc(16);
+    sys_clock_gettime(1, ts);
+    sec = *(ts);
+    nsec = *(ts + 8);
+    free(ts);
+    return sec * 1000 + nsec / 1000000;
+}
+
+// Find the nearest ANSI 256-color index for an RGB triplet.
+// Uses the 6x6x6 color cube (indices 16-231).
+_plt_rgb_to_ansi(r, g, b) {
+    auto ri, gi, bi;
+    ri = (r * 5 + 127) / 255;
+    gi = (g * 5 + 127) / 255;
+    bi = (b * 5 + 127) / 255;
+    return 16 + ri * 36 + gi * 6 + bi;
+}
+
+// ── X11: stderr logging helpers ──────────────────────────────
+//
+// The X server sends Error replies on the same socket as events. We log
+// them directly to stderr via putchar_err so that errors are visible
+// even when the terminal path is unused.
+
+// Write a null-terminated string to stderr.
+_x11_err_str(s) {
+    auto i, c;
+    i = 0;
+    while (1) {
+        c = peek(s + i);
+        if (c == 0) { return 0; }
+        putchar_err(c);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Write an unsigned decimal integer to stderr.
+_x11_err_dec(n) {
+    auto buf, len;
+    buf = malloc(16);
+    len = 0;
+    if (n == 0) { putchar_err(48); free(buf); return 0; }
+    while (n > 0) {
+        poke(buf + len, 48 + (n % 10));
+        n = n / 10;
+        len = len + 1;
+    }
+    while (len > 0) {
+        len = len - 1;
+        putchar_err(peek(buf + len));
+    }
+    free(buf);
+    return 0;
+}
+
+// ── X11: DISPLAY parsing ─────────────────────────────────────
+//
+// The DISPLAY environment variable encodes the X server address as
+// "[host]:display[.screen]". We read it directly from /proc/self/environ
+// (a null-separated list of "KEY=VALUE" entries) so no extra syscall
+// is needed. This function fills _x11_host, _x11_display, _x11_screen,
+// and _x11_is_tcp, returning 1 on success or 0 when DISPLAY is absent.
+
+_x11_parse_display() {
+    auto fd, buf, n, i, start, c, val, host_end, colon, dot;
+
+    _x11_display = 0;
+    _x11_screen = 0;
+    _x11_is_tcp = 0;
+    _x11_host_len = 0;
+
+    fd = sys_open("/proc/self/environ", 0);
+    if (fd < 0) { return 0; }
+    buf = malloc(8192);
+    n = sys_read(fd, buf, 8192);
+    sys_close(fd);
+    if (n <= 0) { free(buf); return 0; }
+
+    // Scan for "DISPLAY=" at start or after a null byte.
+    i = 0;
+    while (i < n) {
+        // Start of an entry: i == 0 or previous byte is null.
+        auto at_start;
+        at_start = 0;
+        if (i == 0) { at_start = 1; }
+        else { if (peek(buf + i - 1) == 0) { at_start = 1; } }
+        if (at_start) {
+            if (i + 8 <= n) {
+                if (peek(buf + i    ) == 'D') {
+                if (peek(buf + i + 1) == 'I') {
+                if (peek(buf + i + 2) == 'S') {
+                if (peek(buf + i + 3) == 'P') {
+                if (peek(buf + i + 4) == 'L') {
+                if (peek(buf + i + 5) == 'A') {
+                if (peek(buf + i + 6) == 'Y') {
+                if (peek(buf + i + 7) == '=') {
+                    // Found the key; parse value up to the next null byte.
+                    val = i + 8;
+                    start = val;
+                    while (val < n) {
+                        if (peek(buf + val) == 0) { break; }
+                        val = val + 1;
+                    }
+                    // val is now the end offset; length = val - start.
+                    // Find the colon that separates host from display.
+                    colon = 0 - 1;
+                    c = start;
+                    while (c < val) {
+                        if (peek(buf + c) == ':') { colon = c; break; }
+                        c = c + 1;
+                    }
+                    if (colon < 0) { free(buf); return 0; }
+                    host_end = colon;
+                    // Copy host (may be empty).
+                    _x11_host_len = host_end - start;
+                    if (_x11_host_len > 63) { _x11_host_len = 63; }
+                    c = 0;
+                    while (c < _x11_host_len) {
+                        poke(_x11_host + c, peek(buf + start + c));
+                        c = c + 1;
+                    }
+                    poke(_x11_host + _x11_host_len, 0);
+                    if (_x11_host_len > 0) { _x11_is_tcp = 1; }
+                    // Parse display number (digits after ':').
+                    _x11_display = 0;
+                    c = colon + 1;
+                    while (c < val) {
+                        auto ch;
+                        ch = peek(buf + c);
+                        if (ch == '.') { break; }
+                        if (ch < '0') { break; }
+                        if (ch > '9') { break; }
+                        _x11_display = _x11_display * 10 + (ch - '0');
+                        c = c + 1;
+                    }
+                    // Optional screen number after '.'.
+                    if (c < val) {
+                        if (peek(buf + c) == '.') {
+                            c = c + 1;
+                            _x11_screen = 0;
+                            while (c < val) {
+                                auto ch2;
+                                ch2 = peek(buf + c);
+                                if (ch2 < '0') { break; }
+                                if (ch2 > '9') { break; }
+                                _x11_screen = _x11_screen * 10 + (ch2 - '0');
+                                c = c + 1;
+                            }
+                        }
+                    }
+                    free(buf);
+                    return 1;
+                } } } } } } } }
+            }
+        }
+        i = i + 1;
+    }
+    free(buf);
+    return 0;
+}
+
+// ── X11: hostname resolution via /etc/hosts ─────────────────
+//
+// B++ has no DNS resolver. For X11 we only need to support:
+//   - "localhost" or empty host → 127.0.0.1
+//   - dotted-decimal IP literal → parsed in place
+//   - any other hostname → looked up in /etc/hosts
+// This covers Docker Desktop (which maps host.docker.internal in
+// /etc/hosts automatically) and direct TCP XQuartz.
+
+// Compare a byte range against a null-terminated C string.
+// Returns 1 if they match exactly, 0 otherwise.
+_x11_mem_eq_str(buf, blen, s) {
+    auto i;
+    i = 0;
+    while (i < blen) {
+        if (peek(s + i) == 0) { return 0; }
+        if (peek(buf + i) != peek(s + i)) { return 0; }
+        i = i + 1;
+    }
+    if (peek(s + i) != 0) { return 0; }
+    return 1;
+}
+
+// Parse a dotted-decimal IPv4 address (e.g. "192.168.65.254") into
+// four bytes at out_ip. Returns 1 on success, 0 on failure.
+_x11_parse_dotted_ip(host, hlen, out_ip) {
+    auto i, oct, idx, ch;
+    i = 0;
+    oct = 0;
+    idx = 0;
+    while (i < hlen) {
+        ch = peek(host + i);
+        if (ch >= '0') { if (ch <= '9') {
+            oct = oct * 10 + (ch - '0');
+            if (oct > 255) { return 0; }
+            i = i + 1;
+            // Continue reading digits.
+            while (i < hlen) {
+                ch = peek(host + i);
+                if (ch < '0') { break; }
+                if (ch > '9') { break; }
+                oct = oct * 10 + (ch - '0');
+                if (oct > 255) { return 0; }
+                i = i + 1;
+            }
+            poke(out_ip + idx, oct);
+            idx = idx + 1;
+            if (idx == 4) {
+                if (i != hlen) { return 0; }
+                return 1;
+            }
+            if (i >= hlen) { return 0; }
+            if (peek(host + i) != '.') { return 0; }
+            i = i + 1;
+            oct = 0;
+        } else { return 0; } }
+        else { return 0; }
+    }
+    return 0;
+}
+
+// Resolve a hostname to a 4-byte IPv4 address written to out_ip.
+// Returns 1 on success, 0 on failure.
+_x11_resolve_hosts(hostname, hlen, out_ip) {
+    auto fd, buf, n, i, line_start, line_end;
+    auto ip_start, ip_end, name_start, name_end, found;
+
+    // Fast path: localhost or empty → 127.0.0.1.
+    if (hlen == 0) {
+        poke(out_ip + 0, 127); poke(out_ip + 1, 0);
+        poke(out_ip + 2, 0);   poke(out_ip + 3, 1);
+        return 1;
+    }
+    if (_x11_mem_eq_str(hostname, hlen, "localhost")) {
+        poke(out_ip + 0, 127); poke(out_ip + 1, 0);
+        poke(out_ip + 2, 0);   poke(out_ip + 3, 1);
+        return 1;
+    }
+
+    // Try parsing as a dotted-decimal literal first.
+    if (_x11_parse_dotted_ip(hostname, hlen, out_ip)) { return 1; }
+
+    // Scan /etc/hosts for a matching hostname. Each line is
+    // "<ip> <name> [aliases...]" possibly with tab separators.
+    fd = sys_open("/etc/hosts", 0);
+    if (fd < 0) { return 0; }
+    buf = malloc(16384);
+    n = sys_read(fd, buf, 16384);
+    sys_close(fd);
+    if (n <= 0) { free(buf); return 0; }
+
+    found = 0;
+    i = 0;
+    while (i < n) {
+        line_start = i;
+        while (i < n) {
+            if (peek(buf + i) == 10) { break; }
+            i = i + 1;
+        }
+        line_end = i;
+        if (i < n) { i = i + 1; }
+
+        // Skip comment lines and blanks.
+        if (line_start < line_end) {
+            if (peek(buf + line_start) != '#') {
+                // ip = first whitespace-delimited token.
+                ip_start = line_start;
+                ip_end = ip_start;
+                while (ip_end < line_end) {
+                    auto wc;
+                    wc = peek(buf + ip_end);
+                    if (wc == ' ') { break; }
+                    if (wc == 9)   { break; }
+                    ip_end = ip_end + 1;
+                }
+                // Scan remaining tokens (hostname + aliases).
+                auto pos;
+                pos = ip_end;
+                while (pos < line_end) {
+                    // Skip whitespace.
+                    while (pos < line_end) {
+                        auto wc2;
+                        wc2 = peek(buf + pos);
+                        if (wc2 != ' ') { if (wc2 != 9) { break; } }
+                        pos = pos + 1;
+                    }
+                    if (pos >= line_end) { break; }
+                    name_start = pos;
+                    while (pos < line_end) {
+                        auto wc3;
+                        wc3 = peek(buf + pos);
+                        if (wc3 == ' ') { break; }
+                        if (wc3 == 9)   { break; }
+                        pos = pos + 1;
+                    }
+                    name_end = pos;
+                    auto nlen;
+                    nlen = name_end - name_start;
+                    if (nlen == hlen) {
+                        auto match, k;
+                        match = 1;
+                        k = 0;
+                        while (k < nlen) {
+                            if (peek(buf + name_start + k) != peek(hostname + k)) {
+                                match = 0;
+                                break;
+                            }
+                            k = k + 1;
+                        }
+                        if (match) {
+                            // Parse the IP.
+                            if (_x11_parse_dotted_ip(buf + ip_start, ip_end - ip_start, out_ip)) {
+                                found = 1;
+                            }
+                            pos = line_end;
+                        }
+                    }
+                }
+                if (found) { i = n; }
+            }
+        }
+    }
+    free(buf);
+    return found;
+}
+
+// ── X11: socket connection ───────────────────────────────────
+// Connect to the X server at the address parsed by _x11_parse_display.
+// Returns a non-negative socket fd on success, -1 on failure.
+
+// Connect via the abstract Unix socket at /tmp/.X11-unix/X<display>.
+_x11_connect_unix() {
+    auto sock, addr, ret, path_i, dn, tmp, tlen, i;
+    sock = sys_socket(1, 1, 0);        // AF_UNIX, SOCK_STREAM
+    if (sock < 0) { return 0 - 1; }
+    addr = malloc(112);
+    // Zero the structure.
+    i = 0;
+    while (i < 112) { poke(addr + i, 0); i = i + 1; }
+    // sun_family = AF_UNIX (2 bytes LE)
+    poke(addr, 1); poke(addr + 1, 0);
+    // sun_path starts at offset 2: "/tmp/.X11-unix/X<display>"
+    auto prefix;
+    prefix = "/tmp/.X11-unix/X";
+    path_i = 0;
+    while (peek(prefix + path_i) != 0) {
+        poke(addr + 2 + path_i, peek(prefix + path_i));
+        path_i = path_i + 1;
+    }
+    // Append display number as decimal digits.
+    dn = _x11_display;
+    if (dn == 0) {
+        poke(addr + 2 + path_i, '0');
+        path_i = path_i + 1;
+    } else {
+        tmp = malloc(16); tlen = 0;
+        while (dn > 0) {
+            poke(tmp + tlen, 48 + (dn % 10));
+            dn = dn / 10;
+            tlen = tlen + 1;
+        }
+        while (tlen > 0) {
+            tlen = tlen - 1;
+            poke(addr + 2 + path_i, peek(tmp + tlen));
+            path_i = path_i + 1;
+        }
+        free(tmp);
+    }
+    poke(addr + 2 + path_i, 0);
+    ret = sys_connect(sock, addr, 110);
+    free(addr);
+    if (ret < 0) { sys_close(sock); return 0 - 1; }
+    return sock;
+}
+
+// Connect via TCP to <host>:6000+<display>. The hostname is resolved
+// using /etc/hosts (so Docker's host.docker.internal mapping works).
+_x11_connect_tcp() {
+    auto sock, addr, ret, port, i;
+    sock = sys_socket(2, 1, 0);        // AF_INET, SOCK_STREAM
+    if (sock < 0) { return 0 - 1; }
+    addr = malloc(16);
+    i = 0;
+    while (i < 16) { poke(addr + i, 0); i = i + 1; }
+    // sin_family = AF_INET (u16 LE)
+    poke(addr + 0, 2);
+    poke(addr + 1, 0);
+    // sin_port — BIG-ENDIAN u16, manual byte swap (do NOT use write_u16).
+    port = 6000 + _x11_display;
+    poke(addr + 2, (port >> 8) & 255);
+    poke(addr + 3, port & 255);
+    // sin_addr — 4 bytes in network order, stored directly byte-by-byte.
+    if (_x11_resolve_hosts(_x11_host, _x11_host_len, addr + 4) == 0) {
+        free(addr);
+        sys_close(sock);
+        return 0 - 1;
+    }
+    ret = sys_connect(sock, addr, 16);
+    free(addr);
+    if (ret < 0) { sys_close(sock); return 0 - 1; }
+    return sock;
+}
+
+// ── X11: connection setup handshake ──────────────────────────
+//
+// Send a 12-byte setup request with no auth, read the 8-byte header,
+// then read the variable-length setup reply. Extracts the resource-id
+// range, pixel format, and root window metadata needed to create
+// drawables later.
+
+_x11_handshake() {
+    auto req, i, n, status, add_len, total, p, vendor_len, fmt_cnt, scr_cnt;
+    auto fmt_off, scr_off, depth, bpp;
+
+    req = malloc(12);
+    i = 0; while (i < 12) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 0x6c);             // byte-order: little-endian
+    poke(req + 1, 0);                // pad
+    write_u16(req, 2, 11);           // protocol-major-version
+    write_u16(req, 4, 0);            // protocol-minor-version
+    write_u16(req, 6, 0);            // auth-protocol-name-length
+    write_u16(req, 8, 0);            // auth-protocol-data-length
+    write_u16(req, 10, 0);           // pad
+    n = sys_write(_x11_fd, req, 12);
+    free(req);
+    if (n != 12) { return 0 - 1; }
+
+    // Read the 8-byte reply header.
+    auto hdr;
+    hdr = malloc(8);
+    n = sys_read(_x11_fd, hdr, 8);
+    if (n != 8) { free(hdr); return 0 - 1; }
+    status = peek(hdr + 0);
+    add_len = read_u16(hdr, 6);
+    free(hdr);
+    if (status != 1) { return 0 - 1; }
+
+    total = add_len * 4;
+    if (_x11_setup_buf == 0) { _x11_setup_buf = malloc(16384); }
+    if (total > 16384) { return 0 - 1; }
+    // The server may not send everything in one chunk; loop until full.
+    p = 0;
+    while (p < total) {
+        n = sys_read(_x11_fd, _x11_setup_buf + p, total - p);
+        if (n <= 0) { return 0 - 1; }
+        p = p + n;
+    }
+
+    // Parse setup info:
+    //   u32 release
+    //   u32 resource_id_base
+    //   u32 resource_id_mask
+    //   u32 motion_buffer_size
+    //   u16 vendor_length
+    //   u16 maximum_request_length
+    //   u8  number_of_roots
+    //   u8  number_of_formats
+    //   u8  image_byte_order, bitmap_scanline_unit, ...
+    //   u8  bitmap_scanline_pad, min_keycode, max_keycode, 4 pad
+    //   byte vendor[vendor_length + pad]
+    //   FORMAT formats[number_of_formats] (8 bytes each)
+    //   SCREEN screens[number_of_roots] (variable)
+    _x11_rid_base = read_u32(_x11_setup_buf, 4);
+    _x11_rid_mask = read_u32(_x11_setup_buf, 8);
+    _x11_rid_next = 0;
+    vendor_len = read_u16(_x11_setup_buf, 16);
+    scr_cnt = peek(_x11_setup_buf + 20);
+    fmt_cnt = peek(_x11_setup_buf + 21);
+
+    // Server type is auto-detected on the first Apple-only keycode seen
+    // during _x11_map_keycode (see the comment there). Start in evdev
+    // mode and switch to Apple if an Apple-specific code arrives.
+    _x11_server_type = 0;
+
+    // Vendor string is padded to a multiple of 4 bytes.
+    auto vendor_padded;
+    vendor_padded = vendor_len + 3;
+    vendor_padded = vendor_padded - (vendor_padded % 4);
+    fmt_off = 32 + vendor_padded;
+
+    // Walk the pixel format array looking for depth 24 with bpp 32.
+    _x11_bpp = 32;
+    i = 0;
+    while (i < fmt_cnt) {
+        auto off;
+        off = fmt_off + i * 8;
+        depth = peek(_x11_setup_buf + off);
+        bpp = peek(_x11_setup_buf + off + 1);
+        if (depth == 24) {
+            _x11_bpp = bpp;
+            if (bpp != 32) {
+                _x11_err_str("X11 warn: depth 24 has bpp=");
+                _x11_err_dec(bpp);
+                _x11_err_str(" (expected 32)\n");
+            }
+        }
+        i = i + 1;
+    }
+
+    // First SCREEN entry begins right after the formats array.
+    scr_off = fmt_off + fmt_cnt * 8;
+    _x11_root          = read_u32(_x11_setup_buf, scr_off + 0);
+    _x11_root_colormap = read_u32(_x11_setup_buf, scr_off + 4);
+    _x11_root_visual   = read_u32(_x11_setup_buf, scr_off + 32);
+    _x11_root_depth    = peek(_x11_setup_buf + scr_off + 38);
+
+    return 0;
+}
+
+// Allocate a new X resource id from the server's assigned range.
+_x11_alloc_id() {
+    auto id;
+    id = _x11_rid_base | (_x11_rid_next & _x11_rid_mask);
+    _x11_rid_next = _x11_rid_next + 1;
+    return id;
+}
+
+// ── X11: window + GC creation ────────────────────────────────
+
+// Create an InputOutput window as a direct child of the root, then
+// subscribe to keyboard, mouse, exposure, structure notify, and focus
+// events. FocusChangeMask is mandatory — without it the stuck-key
+// cleanup in _x11_handle_event never fires.
+_x11_create_window(w, h) {
+    auto req, mask, ev_mask, n;
+    _x11_wid = _x11_alloc_id();
+    req = malloc(40);
+    auto i; i = 0; while (i < 40) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 1);                    // opcode: CreateWindow
+    poke(req + 1, _x11_root_depth);      // depth
+    write_u16(req, 2, 10);               // request length (words): 8 base + 2 values
+    write_u32(req, 4, _x11_wid);         // window id
+    write_u32(req, 8, _x11_root);        // parent = root
+    write_u16(req, 12, 0);               // x
+    write_u16(req, 14, 0);               // y
+    write_u16(req, 16, w);               // width
+    write_u16(req, 18, h);               // height
+    write_u16(req, 20, 0);               // border width
+    write_u16(req, 22, 1);               // class: InputOutput
+    write_u32(req, 24, 0);               // visual: CopyFromParent
+    // value-mask: background-pixel (bit 1) | event-mask (bit 11) = 0x802
+    mask = 0x802;
+    write_u32(req, 28, mask);
+    // value-list[0]: background-pixel = black
+    write_u32(req, 32, 0);
+    // value-list[1]: event-mask.
+    //   KeyPress(1) | KeyRelease(2) | ButtonPress(4) | ButtonRelease(8) |
+    //   PointerMotion(64) | Exposure(32768) | StructureNotify(131072) |
+    //   FocusChange(2097152) = 2261071
+    // CRITICAL: FocusChangeMask MUST be present or FocusOut never fires
+    // and the stuck-key cleanup becomes dead code.
+    ev_mask = 2261071;
+    write_u32(req, 36, ev_mask);
+    n = sys_write(_x11_fd, req, 40);
+    free(req);
+    return 0;
+}
+
+// Map the window (make it visible). Opcode 8, 8-byte request.
+_x11_map_window(wid) {
+    auto req, n;
+    req = malloc(8);
+    poke(req + 0, 8); poke(req + 1, 0);
+    write_u16(req, 2, 2);
+    write_u32(req, 4, wid);
+    n = sys_write(_x11_fd, req, 8);
+    free(req);
+    return 0;
+}
+
+// Create a default Graphics Context bound to our window. Opcode 55,
+// 16-byte request, no value list.
+_x11_create_gc() {
+    auto req, n;
+    req = malloc(16);
+    auto i; i = 0; while (i < 16) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 55);
+    write_u16(req, 2, 4);
+    write_u32(req, 4, _x11_gc);
+    write_u32(req, 8, _x11_wid);
+    write_u32(req, 12, 0);               // value-mask: none
+    n = sys_write(_x11_fd, req, 16);
+    free(req);
+    return 0;
+}
+
+// Send an InternAtom request and read the 32-byte reply synchronously.
+// Returns the atom id, or 0 on failure.
+_x11_intern_atom(name, nlen) {
+    auto req, reply, pad, req_bytes, n, i, atom;
+    // Padding: request body is 4 (header words) + name + pad, all in
+    // multiples of 4 bytes.
+    pad = 0;
+    while ((nlen + pad) % 4 != 0) { pad = pad + 1; }
+    req_bytes = 8 + nlen + pad;
+    req = malloc(req_bytes);
+    i = 0; while (i < req_bytes) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 16);                   // opcode: InternAtom
+    poke(req + 1, 0);                    // only-if-exists = false
+    write_u16(req, 2, req_bytes / 4);    // request length in words
+    write_u16(req, 4, nlen);             // name length
+    write_u16(req, 6, 0);                // pad
+    i = 0;
+    while (i < nlen) {
+        poke(req + 8 + i, peek(name + i));
+        i = i + 1;
+    }
+    n = sys_write(_x11_fd, req, req_bytes);
+    free(req);
+    // Read the 32-byte reply. Reply format starts with 1 (reply type).
+    reply = malloc(32);
+    n = sys_read(_x11_fd, reply, 32);
+    if (n != 32) { free(reply); return 0; }
+    if (peek(reply + 0) != 1) { free(reply); return 0; }
+    atom = read_u32(reply, 8);
+    free(reply);
+    return atom;
+}
+
+// Set the WM_NAME property on our window so window managers display
+// a title bar label. Uses ChangeProperty (opcode 18) with the built-in
+// STRING atom (id 31) instead of allocating a new atom — any X server
+// has STRING hardcoded as predefined atom 31.
+_x11_set_title(title) {
+    auto req, tlen, padded, total, words, i, n;
+    // Measure the title string.
+    tlen = 0;
+    while (peek(title + tlen) != 0) { tlen = tlen + 1; }
+    // Round up to a multiple of 4 bytes (ChangeProperty padding rule).
+    padded = tlen;
+    while (padded % 4 != 0) { padded = padded + 1; }
+    total = 24 + padded;
+    words = total / 4;
+    req = malloc(total);
+    i = 0; while (i < total) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 18);                     // opcode: ChangeProperty
+    poke(req + 1, 0);                      // mode: Replace
+    write_u16(req, 2, words);              // request length in words
+    write_u32(req, 4, _x11_wid);           // window
+    write_u32(req, 8, 39);                 // property = WM_NAME (atom 39)
+    write_u32(req, 12, 31);                // type = STRING (atom 31)
+    poke(req + 16, 8);                     // format = 8 bits per element
+    write_u32(req, 20, tlen);              // length in bytes
+    i = 0;
+    while (i < tlen) {
+        poke(req + 24 + i, peek(title + i));
+        i = i + 1;
+    }
+    n = sys_write(_x11_fd, req, total);
+    free(req);
+    return 0;
+}
+
+// Register WM_DELETE_WINDOW as a WM_PROTOCOLS atom on our window so
+// the window manager sends us a ClientMessage when the user clicks
+// the close button instead of killing the connection.
+_x11_setup_wm_delete() {
+    auto req, n, i;
+    _x11_wm_protocols = _x11_intern_atom("WM_PROTOCOLS", 12);
+    _x11_wm_delete    = _x11_intern_atom("WM_DELETE_WINDOW", 16);
+    if (_x11_wm_protocols == 0) { return 0; }
+    if (_x11_wm_delete == 0)    { return 0; }
+    // ChangeProperty (opcode 18): set WM_PROTOCOLS = [WM_DELETE_WINDOW].
+    req = malloc(28);
+    i = 0; while (i < 28) { poke(req + i, 0); i = i + 1; }
+    poke(req + 0, 18);                   // opcode: ChangeProperty
+    poke(req + 1, 0);                    // mode: Replace
+    write_u16(req, 2, 7);                // request length (words)
+    write_u32(req, 4, _x11_wid);         // window
+    write_u32(req, 8, _x11_wm_protocols);// property
+    write_u32(req, 12, 4);               // type = ATOM
+    poke(req + 16, 32);                  // format = 32 bits per entry
+    write_u32(req, 20, 1);               // length = 1 entry
+    write_u32(req, 24, _x11_wm_delete);  // data = WM_DELETE_WINDOW atom
+    n = sys_write(_x11_fd, req, 28);
+    free(req);
+    return 0;
+}
+
+// ── X11: framebuffer upload via XPutImage ────────────────────
+//
+// X11 ZPixmap depth 24 on little-endian systems expects BGRX byte
+// order. Our framebuffer is RGBA, so we swizzle each pixel into a
+// dedicated conversion buffer and send the whole buffer in one request.
+
+// Convert the current _stb_fb to the byte order X11 ZPixmap expects.
+//
+// The framebuffer is filled via write_u32 with an ARGB-packed color:
+//   color = (A << 24) | (R << 16) | (G << 8) | B
+// On a little-endian host this lands in memory as [B, G, R, A], which
+// is exactly the byte order X11 ZPixmap depth 24 expects on an LE
+// server. We only need to zero the fourth (pad) byte.
+_x11_convert_fb(w, h) {
+    auto i, total, off;
+    total = w * h;
+    i = 0;
+    while (i < total) {
+        off = i * 4;
+        poke(_x11_pixbuf + off,     peek(_stb_fb + off));
+        poke(_x11_pixbuf + off + 1, peek(_stb_fb + off + 1));
+        poke(_x11_pixbuf + off + 2, peek(_stb_fb + off + 2));
+        poke(_x11_pixbuf + off + 3, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Send a PutImage (opcode 72) request with the BGRX pixel data. Single
+// request per frame — at 320x180 the body is 230400 bytes, well under
+// the 262140 byte max_request_length used by most X servers. Larger
+// windows will need strip splitting (TODO, deferred to Phase 4).
+_x11_put_image(w, h) {
+    auto pixel_bytes, req_words, n;
+    pixel_bytes = w * h * 4;
+    req_words = (24 + pixel_bytes) / 4;
+    // Build header in _x11_reqbuf.
+    auto i; i = 0; while (i < 24) { poke(_x11_reqbuf + i, 0); i = i + 1; }
+    poke(_x11_reqbuf + 0, 72);           // opcode: PutImage
+    poke(_x11_reqbuf + 1, 2);            // format: ZPixmap
+    write_u16(_x11_reqbuf, 2, req_words);
+    write_u32(_x11_reqbuf, 4, _x11_wid);
+    write_u32(_x11_reqbuf, 8, _x11_gc);
+    write_u16(_x11_reqbuf, 12, w);       // width
+    write_u16(_x11_reqbuf, 14, h);       // height
+    write_u16(_x11_reqbuf, 16, 0);       // dst-x
+    write_u16(_x11_reqbuf, 18, 0);       // dst-y
+    poke(_x11_reqbuf + 20, 0);           // left-pad (must be 0)
+    poke(_x11_reqbuf + 21, 24);          // depth
+    write_u16(_x11_reqbuf, 22, 0);       // pad
+    n = sys_write(_x11_fd, _x11_reqbuf, 24);
+    n = sys_write(_x11_fd, _x11_pixbuf, pixel_bytes);
+    return 0;
+}
+
+// ── X11: input and event handling ────────────────────────────
+//
+// X11 keycodes on Linux are evdev-based and need their own mapping
+// table distinct from the macOS virtual key codes used by the Cocoa
+// platform. The slot numbers here match the KEY_* enum in stbinput.bsm.
+
+// X11 keycodes vary between servers: native Linux (Xorg/Xwayland) uses
+// evdev keycodes, XQuartz forwards Apple ADB keycodes + 8. Both servers
+// report the same vendor string ("The X.Org Foundation") so we cannot
+// distinguish them at handshake time. Instead we auto-detect on the
+// first keycode that only appears in one table: once an Apple-specific
+// code (such as arrow keys 131..134) is seen, _x11_server_type locks
+// into 1 and all subsequent lookups go through the Apple table. Before
+// that happens we try evdev first and fall back to Apple.
+//
+// Zero FFI, zero dependencies — the detection runs against the same
+// keycode stream used for input, so it works identically on native
+// Linux, XQuartz-via-Docker, Xwayland, or any future X server.
+_x11_map_keycode(kc) {
+    auto slot;
+    if (_x11_server_type == 1) { return _x11_map_keycode_apple(kc); }
+    slot = _x11_map_keycode_evdev(kc);
+    if (slot >= 0) { return slot; }
+    slot = _x11_map_keycode_apple(kc);
+    if (slot >= 0) {
+        // First Apple-only keycode seen — switch permanently.
+        _x11_server_type = 1;
+    }
+    return slot;
+}
+
+// Mapping for native Linux X servers (Xorg/Xwayland with evdev).
+_x11_map_keycode_evdev(kc) {
+    // Arrow keys.
+    if (kc == 111) { return 1; }       // Up
+    if (kc == 116) { return 2; }       // Down
+    if (kc == 113) { return 3; }       // Left
+    if (kc == 114) { return 4; }       // Right
+    // WASD.
+    if (kc == 25) { return 5; }        // W
+    if (kc == 38) { return 6; }        // A
+    if (kc == 39) { return 7; }        // S
+    if (kc == 40) { return 8; }        // D
+    // Special keys.
+    if (kc == 65) { return 9; }        // Space
+    if (kc == 36) { return 10; }       // Return
+    if (kc == 9)  { return 11; }       // Escape
+    if (kc == 23) { return 12; }       // Tab
+    if (kc == 50) { return 13; }       // Left Shift
+    // Additional letters.
+    if (kc == 26) { return 14; }       // E
+    if (kc == 27) { return 15; }       // R
+    if (kc == 52) { return 16; }       // Z
+    if (kc == 53) { return 17; }       // X
+    if (kc == 42) { return 18; }       // G
+    if (kc == 54) { return 19; }       // C
+    if (kc == 57) { return 20; }       // N
+    if (kc == 28) { return 21; }       // T
+    // Number row 0..9.
+    if (kc == 19) { return 22; }       // 0
+    if (kc == 10) { return 23; }       // 1
+    if (kc == 11) { return 24; }       // 2
+    if (kc == 12) { return 25; }       // 3
+    if (kc == 13) { return 26; }       // 4
+    if (kc == 14) { return 27; }       // 5
+    if (kc == 15) { return 28; }       // 6
+    if (kc == 16) { return 29; }       // 7
+    if (kc == 17) { return 30; }       // 8
+    if (kc == 18) { return 31; }       // 9
+    // Function keys.
+    if (kc == 71) { return 32; }       // F5
+    if (kc == 72) { return 33; }       // F6
+    if (kc == 75) { return 34; }       // F9
+    if (kc == 76) { return 35; }       // F10
+    // Punctuation.
+    if (kc == 60) { return 36; }       // Period
+    if (kc == 22) { return 37; }       // Backspace
+    return 0 - 1;
+}
+
+// Mapping for XQuartz (Apple ADB keycode + 8).
+// Reference: Carbon/Events.h kVK_* constants, add 8 to each.
+_x11_map_keycode_apple(kc) {
+    // Arrow keys — ADB 0x7B..0x7E + 8 = 131..134.
+    if (kc == 134) { return 1; }       // Up    (kVK_UpArrow    0x7E)
+    if (kc == 133) { return 2; }       // Down  (kVK_DownArrow  0x7D)
+    if (kc == 131) { return 3; }       // Left  (kVK_LeftArrow  0x7B)
+    if (kc == 132) { return 4; }       // Right (kVK_RightArrow 0x7C)
+    // WASD — ADB 0x0D/0x00/0x01/0x02 + 8.
+    if (kc == 21) { return 5; }        // W (kVK_ANSI_W 0x0D)
+    if (kc == 8)  { return 6; }        // A (kVK_ANSI_A 0x00)
+    if (kc == 9)  { return 7; }        // S (kVK_ANSI_S 0x01)
+    if (kc == 10) { return 8; }        // D (kVK_ANSI_D 0x02)
+    // Special keys.
+    if (kc == 57) { return 9; }        // Space  (kVK_Space  0x31)
+    if (kc == 44) { return 10; }       // Return (kVK_Return 0x24)
+    if (kc == 61) { return 11; }       // Escape (kVK_Escape 0x35)
+    if (kc == 56) { return 12; }       // Tab    (kVK_Tab    0x30)
+    if (kc == 64) { return 13; }       // Shift  (kVK_Shift  0x38)
+    // Additional letters.
+    if (kc == 22) { return 14; }       // E (kVK_ANSI_E 0x0E)
+    if (kc == 23) { return 15; }       // R (kVK_ANSI_R 0x0F)
+    if (kc == 14) { return 16; }       // Z (kVK_ANSI_Z 0x06)
+    if (kc == 15) { return 17; }       // X (kVK_ANSI_X 0x07)
+    if (kc == 13) { return 18; }       // G (kVK_ANSI_G 0x05)
+    if (kc == 16) { return 19; }       // C (kVK_ANSI_C 0x08)
+    if (kc == 53) { return 20; }       // N (kVK_ANSI_N 0x2D)
+    if (kc == 25) { return 21; }       // T (kVK_ANSI_T 0x11)
+    // Number row.
+    if (kc == 37) { return 22; }       // 0 (kVK_ANSI_0 0x1D)
+    if (kc == 26) { return 23; }       // 1 (kVK_ANSI_1 0x12)
+    if (kc == 27) { return 24; }       // 2 (kVK_ANSI_2 0x13)
+    if (kc == 28) { return 25; }       // 3 (kVK_ANSI_3 0x14)
+    if (kc == 29) { return 26; }       // 4 (kVK_ANSI_4 0x15)
+    if (kc == 31) { return 27; }       // 5 (kVK_ANSI_5 0x17)
+    if (kc == 30) { return 28; }       // 6 (kVK_ANSI_6 0x16)
+    if (kc == 34) { return 29; }       // 7 (kVK_ANSI_7 0x1A)
+    if (kc == 36) { return 30; }       // 8 (kVK_ANSI_8 0x1C)
+    if (kc == 33) { return 31; }       // 9 (kVK_ANSI_9 0x19)
+    // Function keys.
+    if (kc == 104) { return 32; }      // F5  (kVK_F5  0x60)
+    if (kc == 105) { return 33; }      // F6  (kVK_F6  0x61)
+    if (kc == 109) { return 34; }      // F9  (kVK_F9  0x65)
+    if (kc == 117) { return 35; }      // F10 (kVK_F10 0x6D)
+    // Punctuation.
+    if (kc == 55) { return 36; }       // Period     (kVK_ANSI_Period    0x2F)
+    if (kc == 59) { return 37; }       // Backspace/Delete (kVK_Delete   0x33)
+    return 0 - 1;
+}
+
+// Handle a single 32-byte X11 event, updating the global input arrays
+// and quit flag as appropriate.
+_x11_handle_event(buf) {
+    auto type;
+    type = peek(buf) & 0x7F;
+
+    // X11 Error reply. Log to stderr and continue.
+    if (type == 0) {
+        auto err_code, seq, major;
+        err_code = peek(buf + 1);
+        seq = read_u16(buf, 2);
+        major = peek(buf + 10);
+        _x11_err_str("X11 error: code=");
+        _x11_err_dec(err_code);
+        _x11_err_str(" seq=");
+        _x11_err_dec(seq);
+        _x11_err_str(" major=");
+        _x11_err_dec(major);
+        putchar_err(10);
+        return 0;
+    }
+
+    if (type == 2) {                  // KeyPress
+        auto slot;
+        slot = _x11_map_keycode(peek(buf + 1));
+        if (slot >= 0) { poke(_stb_keys + slot, 1); }
+        return 0;
+    }
+    if (type == 3) {                  // KeyRelease
+        auto slot2, kc2;
+        kc2 = peek(buf + 1);
+        slot2 = _x11_map_keycode(kc2);
+        if (slot2 >= 0) { poke(_stb_keys + slot2, 0); }
+        return 0;
+    }
+    if (type == 4) {                  // ButtonPress
+        auto btn;
+        btn = peek(buf + 1);
+        if (btn == 1) { _stb_mouse_btn = _stb_mouse_btn | 1; }
+        if (btn == 3) { _stb_mouse_btn = _stb_mouse_btn | 2; }
+        if (btn == 2) { _stb_mouse_btn = _stb_mouse_btn | 4; }
+        return 0;
+    }
+    if (type == 5) {                  // ButtonRelease
+        auto btn2;
+        btn2 = peek(buf + 1);
+        if (btn2 == 1) { _stb_mouse_btn = _stb_mouse_btn & (0 - 2); }
+        if (btn2 == 3) { _stb_mouse_btn = _stb_mouse_btn & (0 - 3); }
+        if (btn2 == 2) { _stb_mouse_btn = _stb_mouse_btn & (0 - 5); }
+        return 0;
+    }
+    if (type == 6) {                  // MotionNotify
+        _stb_mouse_x = read_u16(buf, 24);
+        _stb_mouse_y = read_u16(buf, 26);
+        if (_stb_mouse_x >= _stb_w) { _stb_mouse_x = _stb_w - 1; }
+        if (_stb_mouse_y >= _stb_h) { _stb_mouse_y = _stb_h - 1; }
+        return 0;
+    }
+    if (type == 10) {                 // FocusOut — clear all keys.
+        auto k;
+        k = 0;
+        while (k < 256) { poke(_stb_keys + k, 0); k = k + 1; }
+        return 0;
+    }
+    if (type == 12) {                 // Expose
+        _x11_needs_redraw = 1;
+        return 0;
+    }
+    if (type == 33) {                 // ClientMessage
+        // Bytes 12-15 = data.l[0] = WM_DELETE_WINDOW atom id
+        auto atom;
+        atom = read_u32(buf, 12);
+        if (atom == _x11_wm_delete) { _plt_quit_flag = 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Drain any pending X11 events from the socket buffer without blocking.
+// Uses FIONREAD (via sys_ioctl + & operator) to peek at the available
+// byte count, then reads events in 32-byte chunks.
+_x11_read_events() {
+    auto avail, n;
+    avail = 0;
+    sys_ioctl(_x11_fd, 0x541B, &avail);
+    while (avail >= 32) {
+        n = sys_read(_x11_fd, _x11_evbuf, 32);
+        if (n < 32) { return 0; }
+        _x11_handle_event(_x11_evbuf);
+        avail = avail - 32;
+    }
+    return 0;
+}
+
+// Initialize the platform layer. Tries X11 first (if DISPLAY is set);
+// falls back to terminal ANSI rendering on failure.
+_stb_init_window(w, h, title) {
+    auto new_termios, i, fd;
+    _plt_quit_flag = 0;
+    _x11_mode = 0;
+    _x11_fd = 0 - 1;
+    _x11_needs_redraw = 0;
+    if (_x11_host == 0) { _x11_host = malloc(64); }
+
+    // Try the X11 path first. If DISPLAY is set and a connection can
+    // be established, we switch into windowed mode and skip all the
+    // terminal initialization below.
+    if (_x11_parse_display()) {
+        fd = 0 - 1;
+        if (_x11_is_tcp) { fd = _x11_connect_tcp(); }
+        else             { fd = _x11_connect_unix(); }
+        if (fd >= 0) {
+            _x11_fd = fd;
+            if (_x11_handshake() >= 0) {
+                _x11_create_window(w, h);
+                _x11_gc = _x11_alloc_id();
+                _x11_create_gc();
+                if (title != 0) { _x11_set_title(title); }
+                _x11_map_window(_x11_wid);
+                _x11_setup_wm_delete();
+                // Allocate per-frame buffers.
+                _x11_pixbuf = malloc(w * h * 4);
+                _x11_reqbuf = malloc(24);
+                _x11_evbuf  = malloc(32);
+                _x11_mode = 1;
+                _plt_time_base = _plt_now_ms();
+                return 0;
+            }
+            sys_close(fd);
+            _x11_fd = 0 - 1;
+        }
+    }
+
+    // Fallback: terminal ANSI rendering.
+    // Allocate output buffer (enough for full-color frame).
+    _plt_outbuf = malloc(1048576);
+    _plt_outpos = 0;
+
+    // Save original terminal settings.
+    // struct termios is 60 bytes on Linux x86_64.
+    _plt_orig_termios = malloc(64);
+    sys_ioctl(0, 0x5401, _plt_orig_termios);
+
+    // Set raw mode: disable canonical mode and echo.
+    new_termios = malloc(64);
+    i = 0;
+    while (i < 60) { poke(new_termios + i, peek(_plt_orig_termios + i)); i = i + 1; }
+    // c_lflag is at offset 12 (4 bytes). Clear ICANON (bit 1) and ECHO (bit 3).
+    auto lflag;
+    lflag = read_u32(new_termios, 12);
+    lflag = lflag & (0 - 1 - 2 - 8);
+    write_u32(new_termios, 12, lflag);
+    // Set VMIN=0, VTIME=0 for non-blocking reads.
+    // c_cc array starts at offset 17. VMIN=index 6, VTIME=index 5.
+    poke(new_termios + 17 + 6, 0);
+    poke(new_termios + 17 + 5, 0);
+    sys_ioctl(0, 0x5402, new_termios);
+    free(new_termios);
+
+    // Downscale: 2 pixels per character cell vertically (half-block).
+    // Horizontally, each pixel is 1 character wide.
+    // For 320x180, that gives 320 cols x 90 rows — too wide for most terminals.
+    // Scale down by factor of 4: 80 cols x 45 rows.
+    _plt_scale = 4;
+    _plt_cols = w / _plt_scale;
+    _plt_rows = h / _plt_scale / 2;
+
+    // Hide cursor + clear screen.
+    _plt_emit_str("\x1b[?25l");
+    _plt_emit_str("\x1b[2J");
+    _plt_flush();
+
+    // Init timing.
+    _plt_time_base = _plt_now_ms();
+
+    return 0;
+}
+
+// Restore terminal or close X11 connection on exit. Currently missing
+// from the Linux platform — added here so game_end() has somewhere to
+// hook into.
+_stb_shutdown() {
+    if (_x11_mode == 1) {
+        if (_x11_fd >= 0) { sys_close(_x11_fd); _x11_fd = 0 - 1; }
+        if (_x11_pixbuf != 0) { free(_x11_pixbuf); _x11_pixbuf = 0; }
+        if (_x11_evbuf != 0)  { free(_x11_evbuf);  _x11_evbuf  = 0; }
+        if (_x11_reqbuf != 0) { free(_x11_reqbuf); _x11_reqbuf = 0; }
+        return 0;
+    }
+    // Terminal mode: restore cursor, reset attributes, flush, and
+    // restore the original termios. The tcsetattr ioctl is TCSETS (0x5402).
+    _plt_emit_str("\x1b[?25h");
+    _plt_emit_str("\x1b[0m");
+    _plt_emit(10);
+    _plt_flush();
+    if (_plt_orig_termios != 0) {
+        sys_ioctl(0, 0x5402, _plt_orig_termios);
+        free(_plt_orig_termios);
+        _plt_orig_termios = 0;
+    }
+    return 0;
+}
+
+// Sample the framebuffer at (x, y) and return the ANSI color index.
+_plt_sample(x, y) {
+    auto off, r, g, b;
+    if (x >= _stb_w) { x = _stb_w - 1; }
+    if (y >= _stb_h) { y = _stb_h - 1; }
+    off = (y * _stb_w + x) * 4;
+    r = peek(_stb_fb + off);
+    g = peek(_stb_fb + off + 1);
+    b = peek(_stb_fb + off + 2);
+    return _plt_rgb_to_ansi(r, g, b);
+}
+
+// Render the framebuffer: X11 XPutImage if in window mode, ANSI otherwise.
+_stb_present() {
+    auto row, col, sx, sy_top, sy_bot, c_top, c_bot;
+    auto prev_top, prev_bot;
+
+    if (_x11_mode == 1) {
+        _x11_convert_fb(_stb_w, _stb_h);
+        _x11_put_image(_stb_w, _stb_h);
+        return 0;
+    }
+
+    // Move cursor to top-left.
+    _plt_emit_str("\x1b[H");
+
+    prev_top = -1;
+    prev_bot = -1;
+
+    row = 0;
+    while (row < _plt_rows) {
+        col = 0;
+        while (col < _plt_cols) {
+            sx = col * _plt_scale;
+            sy_top = row * 2 * _plt_scale;
+            sy_bot = sy_top + _plt_scale;
+
+            c_top = _plt_sample(sx, sy_top);
+            c_bot = _plt_sample(sx, sy_bot);
+
+            // Emit ANSI: foreground = top pixel, background = bottom pixel.
+            // Use half-block: upper half filled with fg color, lower with bg.
+            if (c_top != prev_top) {
+                _plt_emit_str("\x1b[38;5;");
+                _plt_emit_dec(c_top);
+                _plt_emit('m');
+                prev_top = c_top;
+            }
+            if (c_bot != prev_bot) {
+                _plt_emit_str("\x1b[48;5;");
+                _plt_emit_dec(c_bot);
+                _plt_emit('m');
+                prev_bot = c_bot;
+            }
+
+            // Upper half block character (U+2580 = UTF-8: E2 96 80).
+            _plt_emit(0xE2);
+            _plt_emit(0x96);
+            _plt_emit(0x80);
+
+            col = col + 1;
+        }
+        // Reset colors at end of row and newline.
+        _plt_emit_str("\x1b[0m");
+        _plt_emit(10);
+        prev_top = -1;
+        prev_bot = -1;
+        row = row + 1;
+    }
+
+    _plt_flush();
+    return 0;
+}
+
+// Sleep for the remaining time in the current frame budget.
+_stb_frame_wait() {
+    auto elapsed_ms, remaining_ns, ts;
+    elapsed_ms = _stb_get_time() - _stb_last_time;
+    remaining_ns = (_stb_frame_ms - elapsed_ms) * 1000000;
+    if (remaining_ns > 1000000) {
+        ts = malloc(16);
+        *(ts) = 0;
+        *(ts + 8) = remaining_ns - 1000000;
+        sys_nanosleep(ts, 0);
+        free(ts);
+    }
+    return 0;
+}
+
+// Poll input events: X11 socket events or stdin ANSI sequences.
+_stb_poll_events() {
+    auto buf, n, c;
+
+    if (_x11_mode == 1) {
+        _x11_read_events();
+        return 0;
+    }
+
+    buf = malloc(16);
+
+    n = sys_read(0, buf, 8);
+    while (n > 0) {
+        c = peek(buf);
+
+        // ESC key (standalone, not part of escape sequence).
+        if (n == 1) {
+            if (c == 27) { poke(_stb_keys + 11, 1); }
+            if (c == 32) { poke(_stb_keys + 9, 1); }
+            if (c == 10) { poke(_stb_keys + 10, 1); }
+            // WASD keys.
+            if (c == 'w') { poke(_stb_keys + 5, 1); }
+            if (c == 'a') { poke(_stb_keys + 6, 1); }
+            if (c == 's') { poke(_stb_keys + 7, 1); }
+            if (c == 'd') { poke(_stb_keys + 8, 1); }
+            if (c == 'q') { _plt_quit_flag = 1; }
+        }
+
+        // Arrow keys: ESC [ A/B/C/D.
+        if (n >= 3) {
+            if (c == 27) {
+                if (peek(buf + 1) == 91) {
+                    auto arrow;
+                    arrow = peek(buf + 2);
+                    if (arrow == 65) { poke(_stb_keys + 1, 1); }
+                    if (arrow == 66) { poke(_stb_keys + 2, 1); }
+                    if (arrow == 68) { poke(_stb_keys + 3, 1); }
+                    if (arrow == 67) { poke(_stb_keys + 4, 1); }
+                }
+            }
+        }
+
+        n = sys_read(0, buf, 8);
+    }
+
+    free(buf);
+    return 0;
+}
+
+// Return current time in milliseconds since init.
+_stb_get_time() {
+    return _plt_now_ms() - _plt_time_base;
+}
+
+// Return 1 if the app should close.
+_stb_should_close() {
+    return _plt_quit_flag;
+}

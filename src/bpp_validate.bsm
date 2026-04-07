@@ -6,6 +6,7 @@
 
 import "defs.bsm";
 import "stbarray.bsm";
+import "stbhash.bsm";
 import "bpp_internal.bsm";
 import "bpp_diag.bsm";
 import "bpp_parser.bsm";
@@ -15,9 +16,19 @@ import "bpp_types.bsm";
 
 auto _val_hn, _val_ht;
 
+// Symbol lookup acceleration. _val_func_hash maps a function name's
+// byte sequence to (index + 1) in funcs[] — the +1 keeps "absent"
+// distinguishable from "index 0". Same scheme for externs. The hashes
+// are rebuilt at the start of each validation pass (run_validate or
+// validate_module) so they always reflect the current func/extern
+// tables, including modules loaded incrementally.
+auto _val_func_hash, _val_extern_hash;
+
 init_validate() {
     _val_hn = arr_new();
     _val_ht = arr_new();
+    _val_func_hash = hash_str_new(256);
+    _val_extern_hash = hash_str_new(64);
     return 0;
 }
 
@@ -80,6 +91,9 @@ val_is_builtin(name_p) {
     if (buf_eq(vbuf + unpack_s(name_p), "sys_lseek", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_fchmod", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_ioctl", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_socket", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_connect", unpack_l(name_p))) { if (unpack_l(name_p) == 11) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "sys_usleep", unpack_l(name_p))) { if (unpack_l(name_p) == 10) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_nanosleep", unpack_l(name_p))) { if (unpack_l(name_p) == 13) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_clock_gettime", unpack_l(name_p))) { if (unpack_l(name_p) == 17) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_mkdir", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
@@ -89,22 +103,56 @@ val_is_builtin(name_p) {
 
 // ── Lookup helpers ──────────────────────────────────────────
 
-val_find_func(name_p) {
-    auto i, rec;
+// Rebuild the function-name hash from the current funcs[] table.
+// Called at the top of every validation pass so the hash always
+// reflects the live symbol table (modules can be loaded incrementally
+// and grow funcs[] between passes). Stores (i + 1) so a return of 0
+// from hash_str_get unambiguously means "absent".
+_val_build_func_hash() {
+    auto i, rec, name_p;
+    hash_str_clear(_val_func_hash);
     for (i = 0; i < func_cnt; i = i + 1) {
         rec = funcs[i];
-        if (packed_eq(*(rec + FN_NAME), name_p)) { return i; }
+        name_p = *(rec + FN_NAME);
+        hash_str_set(_val_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
     }
-    return -1;
+    return 0;
 }
 
-val_find_extern(name_p) {
-    auto i, rec;
+// Rebuild the extern-name hash from the current externs[] table.
+_val_build_extern_hash() {
+    auto i, rec, name_p;
+    hash_str_clear(_val_extern_hash);
     for (i = 0; i < ext_cnt; i = i + 1) {
         rec = externs[i];
-        if (packed_eq(*(rec + EX_NAME), name_p)) { return i; }
+        name_p = *(rec + EX_NAME);
+        hash_str_set(_val_extern_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
     }
-    return -1;
+    return 0;
+}
+
+// Look up a function by packed name. O(1) via the hash; falls back to
+// returning -1 if absent. The +1/-1 dance compensates for hash_str_get
+// returning 0 for absent keys.
+val_find_func(name_p) {
+    auto v;
+    v = hash_str_get(_val_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return 0 - 1; }
+    return v - 1;
+}
+
+// Look up an extern by packed name. O(1) via the hash.
+val_find_extern(name_p) {
+    auto v;
+    v = hash_str_get(_val_extern_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return 0 - 1; }
+    return v - 1;
 }
 
 // ── Type name helper (for diagnostics) ──────────────────────
@@ -163,19 +211,12 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
         }
     }
 
-    // E052: float to int.
-    if (vb == BASE_FLOAT) {
-        if (hb == BASE_WORD) {
-            diag_fatal(52);
-            diag_str("assigning float to '");
-            diag_packed(var_name_p);
-            diag_str("' (declared as ");
-            diag_str(val_type_name(hint_ty));
-            diag_str(") without cast");
-            diag_newline();
-            sys_exit(1);
-        }
-    }
+    // Float-to-word truncation is intentional and commonly used to
+    // convert float results to integer storage (e.g. rounding screen
+    // coordinates). The native backends emit fcvtzs implicitly and the
+    // C emitter relies on C's implicit double→long long truncation, so
+    // no diagnostic fires here. See _stb_platform_macos.bsm mouse code
+    // for the canonical pattern.
 
     // W011: int to narrow float (precision loss).
     if (hb == BASE_FLOAT) {
@@ -402,28 +443,71 @@ val_check_node(nd) {
 // ── Entry point ─────────────────────────────────────────────
 
 // Run validation on all functions. Per-function: reset hints, collect
-// param hints, walk body.
+// param hints, walk body. Symbol hashes are rebuilt up front so every
+// val_find_func / val_find_extern call inside the body walk is O(1).
 run_validate() {
     auto i, rec, body_arr, body_cnt, hints, h, j, params_arr, param_cnt;
+    _val_build_func_hash();
+    _val_build_extern_hash();
     for (i = 0; i < func_cnt; i = i + 1) {
         rec = funcs[i];
         body_arr = *(rec + FN_BODY);
         body_cnt = *(rec + FN_BCNT);
-        params_arr = *(rec + FN_PARS);
-        param_cnt = *(rec + FN_PCNT);
-        hints = *(rec + FN_HINTS);
+        // Skip cached functions loaded from .bo (no body to check).
+        if (body_cnt == 0) { i = i; }
+        else {
+            params_arr = *(rec + FN_PARS);
+            param_cnt = *(rec + FN_PCNT);
+            hints = *(rec + FN_HINTS);
 
-        _val_reset_hints();
+            _val_reset_hints();
 
-        // Register parameter type hints.
-        if (hints != 0) {
-            for (j = 0; j < param_cnt; j = j + 1) {
-                h = hints[j];
-                if (h > 0) { _val_add_hint(params_arr[j], h); }
+            // Register parameter type hints.
+            if (hints != 0) {
+                for (j = 0; j < param_cnt; j = j + 1) {
+                    h = hints[j];
+                    if (h > 0) { _val_add_hint(params_arr[j], h); }
+                }
+            }
+
+            val_check_list(body_arr, body_cnt);
+        }
+    }
+    return 0;
+}
+
+// Per-module version for the incremental pipeline.
+// Validates only functions belonging to the given module index. Cached
+// functions loaded from .bo have body_cnt==0 and are skipped (they were
+// already validated when the cache was built in a previous compilation).
+// Symbol hashes are rebuilt before each module pass so they include any
+// functions or externs added since the previous pass.
+validate_module(mi) {
+    auto i, rec, body_arr, body_cnt, hints, h, j, params_arr, param_cnt;
+    _val_build_func_hash();
+    _val_build_extern_hash();
+    for (i = 0; i < func_cnt; i = i + 1) {
+        if (arr_get(func_mods, i) == mi) {
+            rec = funcs[i];
+            body_arr = *(rec + FN_BODY);
+            body_cnt = *(rec + FN_BCNT);
+            if (body_cnt > 0) {
+                params_arr = *(rec + FN_PARS);
+                param_cnt = *(rec + FN_PCNT);
+                hints = *(rec + FN_HINTS);
+
+                _val_reset_hints();
+
+                if (hints != 0) {
+                    for (j = 0; j < param_cnt; j = j + 1) {
+                        h = hints[j];
+                        if (h > 0) { _val_add_hint(params_arr[j], h); }
+                    }
+                }
+
+                val_check_list(body_arr, body_cnt);
             }
         }
-
-        val_check_list(body_arr, body_cnt);
     }
     return 0;
 }

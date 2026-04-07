@@ -1,0 +1,608 @@
+// stbhash.bsm — Generic hash map for B++.
+//
+// Two flavors share this file:
+//   - Hash    : word keys -> word values. Use for integer, pointer, or
+//               any 64-bit key.
+//   - HashStr : byte-sequence keys -> word values. Use for string keys
+//               or arbitrary byte buffers. The hash COPIES the key bytes
+//               on insert, so the caller's source buffer can be freed
+//               or reused immediately afterward.
+//
+// Both flavors use open addressing with linear probing and resize at
+// 75% load factor. Slot occupancy is tracked with a separate byte array:
+// 0 = empty, 1 = live, 2 = tombstone (for delete).
+//
+// Pure B++. Zero dependencies. Leaf module — safe to import from any
+// program, including the compiler itself.
+//
+// Usage (word-keyed):
+//   import "stbhash.bsm";
+//
+//   auto h;
+//   h = hash_new(64);                 // initial capacity, rounded up
+//   hash_set(h, 42, 1000);
+//   hash_set(h, 17, 2000);
+//   if (hash_has(h, 42)) {
+//       auto v;
+//       v = hash_get(h, 42);          // 1000
+//   }
+//   hash_del(h, 17);
+//   hash_free(h);
+//
+// Usage (byte-key, e.g. compiler symbol table):
+//   import "stbhash.bsm";
+//
+//   auto h, name;
+//   h = hash_str_new(256);
+//   name = "main";
+//   hash_str_set(h, name, 4, 7);      // function "main" -> index 7
+//   auto idx;
+//   idx = hash_str_get(h, "main", 4); // 7
+//   hash_str_free(h);
+
+// ── Tuning constants ────────────────────────────────────────
+
+// Default starting capacity. Always rounded up to a power of two.
+const HASH_INITIAL_CAP = 16;
+
+// Resize threshold expressed as a fraction: cnt * DEN >= cap * NUM
+// triggers a doubling. NUM=3 / DEN=4 means resize at 75% load.
+const HASH_LOAD_NUM = 3;
+const HASH_LOAD_DEN = 4;
+
+// Knuth's multiplicative hash constant for word keys.
+// Approximately 2^64 * (golden ratio - 1), masked to fit a B++ word.
+const HASH_KNUTH = 2654435769;
+
+// Slot states stored in the `used` byte array.
+const HASH_EMPTY     = 0;
+const HASH_LIVE      = 1;
+const HASH_TOMBSTONE = 2;
+
+// ── Word-keyed Hash struct ──────────────────────────────────
+
+struct Hash {
+    cap,        // capacity, always a power of two
+    cnt,        // number of live entries
+    keys,       // word array of size cap
+    vals,       // word array of size cap
+    used        // byte array of size cap, see HASH_EMPTY/LIVE/TOMBSTONE
+}
+
+// ── Module init ─────────────────────────────────────────────
+
+// Initialize the hash module. Currently a no-op.
+init_hash() {
+    return 0;
+}
+
+// ── Word-keyed lifecycle ────────────────────────────────────
+
+// Create a new word-keyed hash map. The given capacity hint is rounded
+// up to the next power of two so the modulo can use a fast bitmask.
+hash_new(initial_cap) {
+    auto h: Hash, cap, i;
+    cap = HASH_INITIAL_CAP;
+    while (cap < initial_cap) { cap = cap * 2; }
+
+    h = malloc(sizeof(Hash));
+    h.cap = cap;
+    h.cnt = 0;
+    h.keys = malloc(cap * 8);
+    h.vals = malloc(cap * 8);
+    h.used = malloc(cap);
+
+    i = 0;
+    while (i < cap) {
+        h.keys[i] = 0;
+        h.vals[i] = 0;
+        poke(h.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+    return h;
+}
+
+// Free a word-keyed hash map and its internal buffers.
+hash_free(h) {
+    auto m: Hash;
+    m = h;
+    if (m.keys != 0) { free(m.keys); }
+    if (m.vals != 0) { free(m.vals); }
+    if (m.used != 0) { free(m.used); }
+    free(h);
+    return 0;
+}
+
+// ── Word-keyed internals ────────────────────────────────────
+
+// Compute the initial slot index for a word key.
+// `mask` must equal `cap - 1` (cap is a power of two).
+_hash_slot(key, mask) {
+    return (key * HASH_KNUTH) & mask;
+}
+
+// Insert a key/value pair into the table without checking the load
+// factor or scanning for tombstones — used by the resize routine to
+// repopulate a freshly allocated bucket array.
+_hash_insert_raw(h, key, val) {
+    auto m: Hash, mask, slot;
+    m = h;
+    mask = m.cap - 1;
+    slot = _hash_slot(key, mask);
+    while (peek(m.used + slot) != HASH_EMPTY) {
+        slot = (slot + 1) & mask;
+    }
+    m.keys[slot] = key;
+    m.vals[slot] = val;
+    poke(m.used + slot, HASH_LIVE);
+    m.cnt = m.cnt + 1;
+    return 0;
+}
+
+// Double the table size and reinsert all live entries. Tombstones are
+// dropped during the rebuild, which keeps probe sequences short.
+_hash_resize(h) {
+    auto m: Hash, old_cap, old_keys, old_vals, old_used, i;
+    m = h;
+    old_cap  = m.cap;
+    old_keys = m.keys;
+    old_vals = m.vals;
+    old_used = m.used;
+
+    m.cap = old_cap * 2;
+    m.cnt = 0;
+    m.keys = malloc(m.cap * 8);
+    m.vals = malloc(m.cap * 8);
+    m.used = malloc(m.cap);
+    i = 0;
+    while (i < m.cap) {
+        m.keys[i] = 0;
+        m.vals[i] = 0;
+        poke(m.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < old_cap) {
+        if (peek(old_used + i) == HASH_LIVE) {
+            _hash_insert_raw(h, old_keys[i], old_vals[i]);
+        }
+        i = i + 1;
+    }
+
+    free(old_keys);
+    free(old_vals);
+    free(old_used);
+    return 0;
+}
+
+// ── Word-keyed API ──────────────────────────────────────────
+
+// Insert or update a key. Resizes the table when load exceeds 75%.
+hash_set(h, key, val) {
+    auto m: Hash, mask, slot, u, first_tomb, found_tomb;
+    m = h;
+
+    if (m.cnt * HASH_LOAD_DEN >= m.cap * HASH_LOAD_NUM) {
+        _hash_resize(h);
+    }
+
+    mask = m.cap - 1;
+    slot = _hash_slot(key, mask);
+    found_tomb = 0;
+    first_tomb = 0;
+
+    while (1) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) {
+            // First empty slot ends the probe sequence. If we passed a
+            // tombstone earlier, prefer that slot to keep probes short.
+            if (found_tomb) { slot = first_tomb; }
+            m.keys[slot] = key;
+            m.vals[slot] = val;
+            poke(m.used + slot, HASH_LIVE);
+            m.cnt = m.cnt + 1;
+            return 0;
+        }
+        if (u == HASH_LIVE) {
+            if (m.keys[slot] == key) {
+                m.vals[slot] = val;
+                return 0;
+            }
+        } else {
+            // Tombstone — remember it but keep probing for an existing key.
+            if (found_tomb == 0) {
+                found_tomb = 1;
+                first_tomb = slot;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    return 0;
+}
+
+// Look up a key. Returns the stored value, or 0 if the key is absent.
+// Use hash_has if you need to distinguish "absent" from "value 0".
+hash_get(h, key) {
+    auto m: Hash, mask, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    slot = _hash_slot(key, mask);
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (m.keys[slot] == key) { return m.vals[slot]; }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Returns 1 if the key is present, 0 otherwise.
+hash_has(h, key) {
+    auto m: Hash, mask, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    slot = _hash_slot(key, mask);
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (m.keys[slot] == key) { return 1; }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Delete a key. Returns 1 if the key was present, 0 otherwise.
+hash_del(h, key) {
+    auto m: Hash, mask, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    slot = _hash_slot(key, mask);
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (m.keys[slot] == key) {
+                poke(m.used + slot, HASH_TOMBSTONE);
+                m.cnt = m.cnt - 1;
+                return 1;
+            }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Reset the table to empty without releasing memory. Capacity is preserved.
+hash_clear(h) {
+    auto m: Hash, i;
+    m = h;
+    i = 0;
+    while (i < m.cap) {
+        poke(m.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+    m.cnt = 0;
+    return 0;
+}
+
+// Number of live entries currently in the table.
+hash_count(h) {
+    auto m: Hash;
+    m = h;
+    return m.cnt;
+}
+
+// ── Byte-keyed HashStr struct ───────────────────────────────
+
+struct HashStr {
+    cap,        // capacity, always a power of two
+    cnt,        // number of live entries
+    key_bufs,   // word array: pointer to copy of key bytes (0 if slot empty)
+    key_lens,   // word array: length of the key in bytes
+    vals,       // word array of size cap
+    used        // byte array of size cap (HASH_EMPTY/LIVE/TOMBSTONE)
+}
+
+// ── Byte-keyed lifecycle ────────────────────────────────────
+
+// Create a new byte-keyed hash map. Capacity rounded up to a power of two.
+hash_str_new(initial_cap) {
+    auto h: HashStr, cap, i;
+    cap = HASH_INITIAL_CAP;
+    while (cap < initial_cap) { cap = cap * 2; }
+
+    h = malloc(sizeof(HashStr));
+    h.cap = cap;
+    h.cnt = 0;
+    h.key_bufs = malloc(cap * 8);
+    h.key_lens = malloc(cap * 8);
+    h.vals = malloc(cap * 8);
+    h.used = malloc(cap);
+
+    i = 0;
+    while (i < cap) {
+        h.key_bufs[i] = 0;
+        h.key_lens[i] = 0;
+        h.vals[i] = 0;
+        poke(h.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+    return h;
+}
+
+// Free a byte-keyed hash map. Releases all copied key buffers and the
+// internal arrays.
+hash_str_free(h) {
+    auto m: HashStr, i;
+    m = h;
+    i = 0;
+    while (i < m.cap) {
+        if (peek(m.used + i) == HASH_LIVE) {
+            if (m.key_bufs[i] != 0) { free(m.key_bufs[i]); }
+        }
+        i = i + 1;
+    }
+    free(m.key_bufs);
+    free(m.key_lens);
+    free(m.vals);
+    free(m.used);
+    free(h);
+    return 0;
+}
+
+// ── Byte-keyed internals ────────────────────────────────────
+
+// djb2 hash for a byte sequence. Decent distribution and trivial to
+// compute. Returns a word; the slot is found by masking with cap-1.
+_hash_str_compute(buf, len) {
+    auto h, i;
+    h = 5381;
+    i = 0;
+    while (i < len) {
+        h = h * 33 + peek(buf + i);
+        i = i + 1;
+    }
+    return h;
+}
+
+// Byte-by-byte equality check for two key buffers.
+_hash_str_eq(a_buf, a_len, b_buf, b_len) {
+    auto i;
+    if (a_len != b_len) { return 0; }
+    i = 0;
+    while (i < a_len) {
+        if (peek(a_buf + i) != peek(b_buf + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Insert into a freshly allocated table during resize. Takes ownership
+// of the existing key buffer pointer (no copy).
+_hash_str_insert_raw(h, key_buf, key_len, val) {
+    auto m: HashStr, mask, slot, hash;
+    m = h;
+    mask = m.cap - 1;
+    hash = _hash_str_compute(key_buf, key_len);
+    slot = hash & mask;
+    while (peek(m.used + slot) != HASH_EMPTY) {
+        slot = (slot + 1) & mask;
+    }
+    m.key_bufs[slot] = key_buf;
+    m.key_lens[slot] = key_len;
+    m.vals[slot] = val;
+    poke(m.used + slot, HASH_LIVE);
+    m.cnt = m.cnt + 1;
+    return 0;
+}
+
+// Double the table size and reinsert all live entries.
+_hash_str_resize(h) {
+    auto m: HashStr, old_cap, old_bufs, old_lens, old_vals, old_used, i;
+    m = h;
+    old_cap  = m.cap;
+    old_bufs = m.key_bufs;
+    old_lens = m.key_lens;
+    old_vals = m.vals;
+    old_used = m.used;
+
+    m.cap = old_cap * 2;
+    m.cnt = 0;
+    m.key_bufs = malloc(m.cap * 8);
+    m.key_lens = malloc(m.cap * 8);
+    m.vals = malloc(m.cap * 8);
+    m.used = malloc(m.cap);
+    i = 0;
+    while (i < m.cap) {
+        m.key_bufs[i] = 0;
+        m.key_lens[i] = 0;
+        m.vals[i] = 0;
+        poke(m.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < old_cap) {
+        if (peek(old_used + i) == HASH_LIVE) {
+            _hash_str_insert_raw(h, old_bufs[i], old_lens[i], old_vals[i]);
+        }
+        i = i + 1;
+    }
+
+    free(old_bufs);
+    free(old_lens);
+    free(old_vals);
+    free(old_used);
+    return 0;
+}
+
+// ── Byte-keyed API ──────────────────────────────────────────
+
+// Insert or update a key/value pair. The key bytes are copied into a
+// fresh buffer owned by the hash, so the caller's source can be freed
+// or reused immediately. Resizes the table when load exceeds 75%.
+hash_str_set(h, buf, len, val) {
+    auto m: HashStr, mask, hash, slot, u, copy, i;
+    auto first_tomb, found_tomb;
+    m = h;
+
+    if (m.cnt * HASH_LOAD_DEN >= m.cap * HASH_LOAD_NUM) {
+        _hash_str_resize(h);
+    }
+
+    mask = m.cap - 1;
+    hash = _hash_str_compute(buf, len);
+    slot = hash & mask;
+    found_tomb = 0;
+    first_tomb = 0;
+
+    while (1) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) {
+            // Reuse a previous tombstone if we passed one — keeps probe
+            // sequences from growing without bound after deletes.
+            if (found_tomb) { slot = first_tomb; }
+            copy = malloc(len);
+            i = 0;
+            while (i < len) {
+                poke(copy + i, peek(buf + i));
+                i = i + 1;
+            }
+            m.key_bufs[slot] = copy;
+            m.key_lens[slot] = len;
+            m.vals[slot] = val;
+            poke(m.used + slot, HASH_LIVE);
+            m.cnt = m.cnt + 1;
+            return 0;
+        }
+        if (u == HASH_LIVE) {
+            if (_hash_str_eq(m.key_bufs[slot], m.key_lens[slot], buf, len)) {
+                m.vals[slot] = val;
+                return 0;
+            }
+        } else {
+            if (found_tomb == 0) {
+                found_tomb = 1;
+                first_tomb = slot;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    return 0;
+}
+
+// Look up a byte-key. Returns the stored value, or 0 if the key is absent.
+hash_str_get(h, buf, len) {
+    auto m: HashStr, mask, hash, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    hash = _hash_str_compute(buf, len);
+    slot = hash & mask;
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (_hash_str_eq(m.key_bufs[slot], m.key_lens[slot], buf, len)) {
+                return m.vals[slot];
+            }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Returns 1 if the byte-key is present, 0 otherwise.
+hash_str_has(h, buf, len) {
+    auto m: HashStr, mask, hash, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    hash = _hash_str_compute(buf, len);
+    slot = hash & mask;
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (_hash_str_eq(m.key_bufs[slot], m.key_lens[slot], buf, len)) {
+                return 1;
+            }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Delete a byte-key. Frees the slot's owned key buffer and marks the
+// slot as a tombstone. Returns 1 if the key was present, 0 otherwise.
+hash_str_del(h, buf, len) {
+    auto m: HashStr, mask, hash, slot, u, probes;
+    m = h;
+    mask = m.cap - 1;
+    hash = _hash_str_compute(buf, len);
+    slot = hash & mask;
+    probes = 0;
+
+    while (probes < m.cap) {
+        u = peek(m.used + slot);
+        if (u == HASH_EMPTY) { return 0; }
+        if (u == HASH_LIVE) {
+            if (_hash_str_eq(m.key_bufs[slot], m.key_lens[slot], buf, len)) {
+                free(m.key_bufs[slot]);
+                m.key_bufs[slot] = 0;
+                m.key_lens[slot] = 0;
+                poke(m.used + slot, HASH_TOMBSTONE);
+                m.cnt = m.cnt - 1;
+                return 1;
+            }
+        }
+        slot = (slot + 1) & mask;
+        probes = probes + 1;
+    }
+    return 0;
+}
+
+// Reset the table to empty, freeing all owned key buffers. Capacity
+// is preserved for reuse.
+hash_str_clear(h) {
+    auto m: HashStr, i;
+    m = h;
+    i = 0;
+    while (i < m.cap) {
+        if (peek(m.used + i) == HASH_LIVE) {
+            if (m.key_bufs[i] != 0) {
+                free(m.key_bufs[i]);
+                m.key_bufs[i] = 0;
+            }
+        }
+        poke(m.used + i, HASH_EMPTY);
+        i = i + 1;
+    }
+    m.cnt = 0;
+    return 0;
+}
+
+// Number of live entries currently in the byte-keyed table.
+hash_str_count(h) {
+    auto m: HashStr;
+    m = h;
+    return m.cnt;
+}

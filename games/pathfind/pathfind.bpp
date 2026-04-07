@@ -1,6 +1,14 @@
-// pathfinder.bpp — A rat chased by a cat on a 320x180 Metal-rendered screen.
-// Demonstrates: GPU sprites (stbsprite), render_text, arena, pool, ECS, collision.
-// Ported from mcu-bpp/src/mcu_gpu.bpp. Sprites now loaded via stbsprite.bsm.
+// pathfind.bpp — A rat chased by a cat through a walled arena.
+// 320x180 Metal-rendered top-down chase. The rat is keyboard-driven.
+// The cat uses A* pathfinding (stbpath) to navigate around walls in
+// a tilemap (stbtile) toward the rat each frame.
+//
+// All game state lives in milli-pixels (pixel * 1000) for sub-pixel
+// precision without floating point — same convention as stbphys and
+// stbecs. Velocities are in pixels/second so `pos += vel * dt_ms`
+// works directly with integer arithmetic.
+//
+// Demonstrates: stbtile, stbpath, GPU sprites, ECS particles, arena.
 
 import "stbgame.bsm";
 import "stbrender.bsm";
@@ -10,15 +18,24 @@ import "stbfile.bsm";
 import "stbecs.bsm";
 import "stbarena.bsm";
 import "stbpool.bsm";
-
+import "stbtile.bsm";
+import "stbpath.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
-const SCREEN_W   = 320;
-const SCREEN_H   = 180;
-const CELL       = 16;
+const SCREEN_W     = 320;
+const SCREEN_H     = 180;
+const TILE_W       = 16;
+const TILE_H       = 16;
+const GRID_W       = 20;        // 320 / 16
+const GRID_H       = 11;        // 176 / 16, leave 4 px for HUD bar
+const SPR_SIZE     = 16;
 const PARTICLE_MAX = 100;
-const SPR_SIZE   = 16;
+const MAX_PATH     = 256;
+
+// Tile types in the tilemap.
+const T_EMPTY = 0;
+const T_WALL  = 1;
 
 // ── Palette ──────────────────────────────────────────────
 
@@ -43,221 +60,363 @@ init_palette() {
 auto spr_rat_data, spr_cat_data;
 auto tex_rat, tex_cat;
 
-auto rat_x: float, rat_y: float, rat_speed: float;
-auto rat_hp, rat_max_hp, rat_size;
+// Positions and velocities are in milli-pixels (pixel * 1000).
+// Speeds are in pixels/second.
+auto rat_x, rat_y, rat_speed;
+auto rat_hp, rat_max_hp;
 
-auto cat_x: float, cat_y: float, cat_speed: float;
-auto cat_size;
+auto cat_x, cat_y, cat_speed;
 
-auto invuln_timer: float, game_over;
+// invuln is in milliseconds remaining on the rat after a hit.
+auto invuln_ms, game_over;
+
 auto frame_arena;
 auto world;
 
-auto score, score_timer: float;
+auto score, score_timer_ms;
+
+// Tilemap (walls) and pathfinder (cat AI).
+auto tm, pf;
+auto path_buf, path_len;
+
+// ── World setup ──────────────────────────────────────────
+
+// Lay out a small arena: a few walls that force the cat to go around.
+// The walls are tile_type 1 (T_WALL); empty cells are 0.
+build_arena() {
+    auto gx, gy;
+
+    // Outer top/bottom rows are open. We use the inner area for walls.
+
+    // Left vertical wall column (gx=5) from gy=2 to gy=7
+    gy = 2;
+    while (gy <= 7) { tile_set(tm, 5, gy, T_WALL); gy = gy + 1; }
+
+    // Right vertical wall column (gx=14) from gy=3 to gy=8
+    gy = 3;
+    while (gy <= 8) { tile_set(tm, 14, gy, T_WALL); gy = gy + 1; }
+
+    // Horizontal stripe in the middle (gy=5) from gx=8 to gx=11
+    gx = 8;
+    while (gx <= 11) { tile_set(tm, gx, 5, T_WALL); gx = gx + 1; }
+
+    // A couple of single-block obstacles for variety
+    tile_set(tm, 3, 9, T_WALL);
+    tile_set(tm, 17, 2, T_WALL);
+
+    return 0;
+}
+
+// Mirror the tilemap's solid mask into the PathFinder. Inline 8-line
+// bridge — stbpath is intentionally dependency-free, so this lives in
+// the game rather than in the library.
+sync_path_from_tilemap() {
+    auto gx, gy;
+    gy = 0;
+    while (gy < GRID_H) {
+        gx = 0;
+        while (gx < GRID_W) {
+            path_set_blocked(pf, gx, gy, tile_is_solid(tm, tile_get(tm, gx, gy)));
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    return 0;
+}
 
 // ── Init ─────────────────────────────────────────────────
 
 init_game() {
-    rat_x = 160.0; rat_y = 90.0;
-    rat_speed = 90.0; rat_size = SPR_SIZE;
-    rat_hp = 3; rat_max_hp = 3;
+    // Rat starts top-left corner area, in pixel coordinates converted
+    // to milli-pixels. Cat starts bottom-right.
+    rat_x = 16 * 1000;
+    rat_y = 16 * 1000;
+    rat_speed = 90;
+    rat_hp = 3;
+    rat_max_hp = 3;
 
-    cat_x = 32.0; cat_y = 32.0;
-    cat_speed = 65.0; cat_size = SPR_SIZE;
+    cat_x = (SCREEN_W - 32) * 1000;
+    cat_y = (GRID_H * TILE_H - 32) * 1000;
+    cat_speed = 60;
 
-    invuln_timer = 0.0; game_over = 0;
-    score = 0; score_timer = 0.0;
+    invuln_ms = 0;
+    game_over = 0;
+    score = 0;
+    score_timer_ms = 0;
     return 0;
 }
 
-// ── Update ───────────────────────────────────────────────
+// ── Update: rat (player) ─────────────────────────────────
 
-// Move the rat based on keyboard input. Normalizes diagonal movement.
-update_rat(dt: float) {
-    auto vx, vy, len;
-    vx = 0.0; vy = 0.0;
-    if (key_down(KEY_W) | key_down(KEY_UP))    { vy = vy - 1.0; }
-    if (key_down(KEY_S) | key_down(KEY_DOWN))  { vy = vy + 1.0; }
-    if (key_down(KEY_A) | key_down(KEY_LEFT))  { vx = vx - 1.0; }
-    if (key_down(KEY_D) | key_down(KEY_RIGHT)) { vx = vx + 1.0; }
-    if (vx != 0.0) { if (vy != 0.0) {
-        len = sqrt(vx * vx + vy * vy);
-        vx = vx / len; vy = vy / len;
-    } }
-    rat_x = rat_x + vx * rat_speed * dt;
-    rat_y = rat_y + vy * rat_speed * dt;
-    if (rat_x < 0.0)   { rat_x = 0.0; }
-    if (rat_y < 0.0)   { rat_y = 0.0; }
-    if (rat_x > 304.0) { rat_x = 304.0; }
-    if (rat_y > 164.0) { rat_y = 164.0; }
+// Move the rat from keyboard input. Each axis is checked separately
+// against the tilemap so the rat can slide along walls. Diagonal motion
+// is intentionally not normalized — feels snappier in a top-down game.
+update_rat(dt_ms) {
+    auto vx, vy, new_x, new_y, px, py;
+    vx = 0; vy = 0;
+    if (key_down(KEY_W)) { vy = vy - 1; }
+    if (key_down(KEY_UP)) { vy = vy - 1; }
+    if (key_down(KEY_S)) { vy = vy + 1; }
+    if (key_down(KEY_DOWN)) { vy = vy + 1; }
+    if (key_down(KEY_A)) { vx = vx - 1; }
+    if (key_down(KEY_LEFT)) { vx = vx - 1; }
+    if (key_down(KEY_D)) { vx = vx + 1; }
+    if (key_down(KEY_RIGHT)) { vx = vx + 1; }
+
+    // Clamp the per-axis vote so simultaneous keys don't double-speed.
+    if (vx > 1)  { vx = 1; }
+    if (vx < 0 - 1) { vx = 0 - 1; }
+    if (vy > 1)  { vy = 1; }
+    if (vy < 0 - 1) { vy = 0 - 1; }
+
+    // Try X then Y, with separate-axis collision so the rat slides.
+    new_x = rat_x + vx * rat_speed * dt_ms;
+    px = new_x / 1000;
+    py = rat_y / 1000;
+    if (tile_collides(tm, px, py, SPR_SIZE, SPR_SIZE) == 0) { rat_x = new_x; }
+
+    new_y = rat_y + vy * rat_speed * dt_ms;
+    px = rat_x / 1000;
+    py = new_y / 1000;
+    if (tile_collides(tm, px, py, SPR_SIZE, SPR_SIZE) == 0) { rat_y = new_y; }
+
+    // Clamp to playable bounds (HUD strip at the bottom).
+    if (rat_x < 0) { rat_x = 0; }
+    if (rat_y < 0) { rat_y = 0; }
+    if (rat_x > (SCREEN_W - SPR_SIZE) * 1000) { rat_x = (SCREEN_W - SPR_SIZE) * 1000; }
+    if (rat_y > (GRID_H * TILE_H - SPR_SIZE) * 1000) { rat_y = (GRID_H * TILE_H - SPR_SIZE) * 1000; }
     return 0;
 }
 
-// Move the cat directly toward the rat each frame.
-update_cat(dt: float) {
-    auto dx, dy, len, move;
-    dx = rat_x - cat_x;
-    dy = rat_y - cat_y;
-    len = sqrt(dx * dx + dy * dy);
-    if (len > 1.0) { dx = dx / len; dy = dy / len; }
-    move = cat_speed * dt;
-    cat_x = cat_x + dx * move;
-    cat_y = cat_y + dy * move;
-    if (cat_x < 0.0)   { cat_x = 0.0; }
-    if (cat_y < 0.0)   { cat_y = 0.0; }
-    if (cat_x > 304.0) { cat_x = 304.0; }
-    if (cat_y > 164.0) { cat_y = 164.0; }
+// ── Update: cat (AI) ─────────────────────────────────────
+
+// The cat re-runs A* every frame against the rat's current tile and
+// then walks toward the next waypoint along the path. Re-pathing every
+// frame is cheap on a 20x11 grid (heap-based A* is well under a
+// millisecond) and keeps the chase responsive when the rat darts.
+update_cat(dt_ms) {
+    auto cat_cx, cat_cy, rat_cx, rat_cy;
+    auto cat_gx, cat_gy, rat_gx, rat_gy;
+    auto target_gx, target_gy, target_px, target_py, step;
+
+    // Convert to pixel-center for tile lookup.
+    cat_cx = cat_x / 1000 + SPR_SIZE / 2;
+    cat_cy = cat_y / 1000 + SPR_SIZE / 2;
+    rat_cx = rat_x / 1000 + SPR_SIZE / 2;
+    rat_cy = rat_y / 1000 + SPR_SIZE / 2;
+
+    cat_gx = cat_cx / TILE_W;
+    cat_gy = cat_cy / TILE_H;
+    rat_gx = rat_cx / TILE_W;
+    rat_gy = rat_cy / TILE_H;
+
+    // If either endpoint is somehow inside a wall (shouldn't happen
+    // given collision, but be defensive), skip this frame.
+    if (path_is_blocked(pf, cat_gx, cat_gy)) { return 0; }
+    if (path_is_blocked(pf, rat_gx, rat_gy)) { return 0; }
+
+    path_len = path_find(pf, cat_gx, cat_gy, rat_gx, rat_gy, path_buf, MAX_PATH);
+    if (path_len < 2) { return 0; }   // already adjacent or unreachable
+
+    // Walk toward the second waypoint (path_buf[2..3]). Index 0 is the
+    // cat's own tile so we skip it.
+    target_gx = path_buf[2];
+    target_gy = path_buf[3];
+    target_px = (target_gx * TILE_W + TILE_W / 2 - SPR_SIZE / 2) * 1000;
+    target_py = (target_gy * TILE_H + TILE_H / 2 - SPR_SIZE / 2) * 1000;
+
+    step = cat_speed * dt_ms;
+
+    // Move along X toward target, snapping if we overshoot.
+    if (cat_x < target_px) {
+        cat_x = cat_x + step;
+        if (cat_x > target_px) { cat_x = target_px; }
+    }
+    if (cat_x > target_px) {
+        cat_x = cat_x - step;
+        if (cat_x < target_px) { cat_x = target_px; }
+    }
+
+    // Same for Y.
+    if (cat_y < target_py) {
+        cat_y = cat_y + step;
+        if (cat_y > target_py) { cat_y = target_py; }
+    }
+    if (cat_y > target_py) {
+        cat_y = cat_y - step;
+        if (cat_y < target_py) { cat_y = target_py; }
+    }
     return 0;
 }
 
-// Handle score accumulation, invulnerability cooldown, and collision.
-// On hit, spawns red damage particles via the ECS world.
-update_mechanics(dt: float) {
+// ── Update: collision, scoring, particles ────────────────
+
+// Score ticks once per second. Invulnerability counts down. On contact
+// the rat loses 1 HP, gets a 600ms iframe, and 8 red particles spawn.
+update_mechanics(dt_ms) {
+    auto pi, id;
     if (game_over) { return 0; }
 
-    // Increment survival score once per second.
-    score_timer = score_timer + dt;
-    if (score_timer >= 1.0) { score = score + 1; score_timer = score_timer - 1.0; }
+    score_timer_ms = score_timer_ms + dt_ms;
+    if (score_timer_ms >= 1000) {
+        score = score + 1;
+        score_timer_ms = score_timer_ms - 1000;
+    }
 
-    // Count down invulnerability window after a hit.
-    if (invuln_timer > 0.0) { invuln_timer = invuln_timer - dt; }
+    if (invuln_ms > 0) {
+        invuln_ms = invuln_ms - dt_ms;
+        if (invuln_ms < 0) { invuln_ms = 0; }
+    }
 
-    // Rect-vs-rect collision between rat and cat.
-    if (invuln_timer <= 0.0) {
-        if (rect_overlap(rat_x, rat_y, rat_size * 1.0, rat_size * 1.0,
-                          cat_x, cat_y, cat_size * 1.0, cat_size * 1.0)) {
+    if (invuln_ms == 0) {
+        if (rect_overlap(rat_x / 1000, rat_y / 1000, SPR_SIZE, SPR_SIZE,
+                         cat_x / 1000, cat_y / 1000, SPR_SIZE, SPR_SIZE)) {
             rat_hp = rat_hp - 1;
-            if (rat_hp <= 0) { rat_hp = 0; game_over = 1; }
-            else { invuln_timer = 0.6; }
+            if (rat_hp <= 0) {
+                rat_hp = 0;
+                game_over = 1;
+            } else {
+                invuln_ms = 600;
+            }
 
-            // Spawn 8 red particles at the rat's position.
-            auto pi, id;
-            for (pi = 0; pi < 8; pi = pi + 1) {
+            // Spawn 8 red damage particles. ECS state is already in
+            // milli-units so positions go in directly.
+            pi = 0;
+            while (pi < 8) {
                 id = ecs_spawn(world);
                 if (id >= 0) {
-                    ecs_set_pos(world, id, rat_x * 1000, rat_y * 1000);
+                    ecs_set_pos(world, id, rat_x, rat_y);
                     ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
                     ecs_set_flags(world, id, 0xFF0000 * 256 + 20);
                 }
+                pi = pi + 1;
             }
         }
     }
     return 0;
 }
 
-// Step ECS physics and draw each live particle as a 2x2 red rect.
-// Life counter is stored in the low byte of the entity flags.
-update_particles(dt) {
-    auto i, cap, flags, life;
+// Step the ECS particle system and draw each live particle as a 2x2
+// red rect. Life is the low byte of flags; color is everything above.
+// Decrement uses `flags - 1` (safe because life > 0 in the branch),
+// avoiding the 24-bit mask bug that bit us in snake.
+update_particles(dt_ms) {
+    auto i, cap, flags, life, px, py, color;
     cap = ecs_capacity(world);
-    ecs_physics(world, dt);
-    for (i = 0; i < cap; i = i + 1) {
+    ecs_physics(world, dt_ms);
+    i = 0;
+    while (i < cap) {
         if (ecs_alive(world, i)) {
             flags = ecs_get_flags(world, i);
             life = flags & 0xFF;
             if (life <= 0) {
                 ecs_kill(world, i);
             } else {
-                ecs_set_flags(world, i, (flags & 0xFFFFFF00) + life - 1);
-                auto px, py, color;
+                ecs_set_flags(world, i, flags - 1);
                 px = ecs_get_x(world, i) / 1000;
                 py = ecs_get_y(world, i) / 1000;
-                color = (flags >> 8) & 0xFFFFFF;
+                color = flags >> 8;
                 render_rect(px, py, 2, 2, color);
             }
         }
+        i = i + 1;
     }
     return 0;
 }
 
-// Reset all game state to starting values without reallocating anything.
+// ── Reset ────────────────────────────────────────────────
+
 reset_game() {
-    rat_x = 160.0; rat_y = 90.0;
+    rat_x = 16 * 1000;
+    rat_y = 16 * 1000;
     rat_hp = rat_max_hp;
-    cat_x = 32.0; cat_y = 32.0;
-    invuln_timer = 0.0; game_over = 0;
-    score = 0; score_timer = 0.0;
+    cat_x = (SCREEN_W - 32) * 1000;
+    cat_y = (GRID_H * TILE_H - 32) * 1000;
+    invuln_ms = 0;
+    game_over = 0;
+    score = 0;
+    score_timer_ms = 0;
     return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────
 
 main() {
-    auto dt;
+    auto dt_ms;
 
-    game_init(320, 180, "Pathfinder (B++ GPU)", 60);
+    game_init(SCREEN_W, SCREEN_H, "Pathfind (B++ GPU)", 60);
     render_init();
 
     init_palette();
 
-    // Allocate raw sprite buffers, load JSON data, upload to GPU.
+    // Sprite buffers and GPU textures.
     spr_rat_data = malloc(SPR_SIZE * SPR_SIZE);
     spr_cat_data = malloc(SPR_SIZE * SPR_SIZE);
     load_sprite("assets/sprites/rat_sprite.json", spr_rat_data, SPR_SIZE, SPR_SIZE);
     load_sprite("assets/sprites/cat_sprite.json", spr_cat_data, SPR_SIZE, SPR_SIZE);
-
-    // DEBUG: print first 16 bytes of rat sprite to terminal.
-    print_msg("rat row0: ");
-    auto di;
-    for (di = 0; di < 16; di = di + 1) {
-        print_int(peek(spr_rat_data + di));
-        print_char(' ');
-    }
-    print_ln();
-
-    // TEST: use sprite_create from stbsprite instead of render_create_sprite16.
     tex_rat = sprite_create(spr_rat_data, PAL, SPR_SIZE, SPR_SIZE);
     tex_cat = sprite_create(spr_cat_data, PAL, SPR_SIZE, SPR_SIZE);
 
-    // Set up game infrastructure.
+    // World infrastructure: ECS for particles, arena for per-frame
+    // scratch, tilemap for the arena geometry, A* pathfinder for the cat.
     world = ecs_new(PARTICLE_MAX);
     frame_arena = arena_new(4096);
+
+    tm = tile_new(GRID_W, GRID_H, TILE_W, TILE_H);
+    tile_solid(tm, T_WALL);
+    build_arena();
+
+    pf = path_new(GRID_W, GRID_H);
+    sync_path_from_tilemap();
+    path_buf = malloc(MAX_PATH * 16);
+    path_len = 0;
 
     init_game();
 
     while (game_should_quit() == 0) {
         game_frame_begin();
-        dt = game_dt();
         arena_reset(frame_arena);
 
         if (key_pressed(KEY_ESC)) { break; }
 
+        dt_ms = game_dt_ms();
+
         if (game_over == 0) {
-            update_rat(dt);
-            update_cat(dt);
-            update_mechanics(dt);
+            update_rat(dt_ms);
+            update_cat(dt_ms);
+            update_mechanics(dt_ms);
         } else {
             if (key_pressed(KEY_SPACE)) { reset_game(); }
         }
 
         // ── Render ───────────────────────────────────────
         render_begin();
-        render_clear(DARKGRAY);
+        render_clear(rgba(20, 20, 30, 255));
 
-        // Draw the rat sprite; blink every other frame when invulnerable.
-        auto rx, ry, cx, cy;
-        rx = rat_x; ry = rat_y;
-        cx = cat_x; cy = cat_y;
+        // Draw the wall tilemap (no tileset bound = colored debug rects).
+        tile_draw(tm, 0, 0, SCREEN_W, SCREEN_H);
 
-        if (invuln_timer <= 0.0) {
-            render_sprite(tex_rat, rx, ry, 1);
+        // Rat sprite, blink while invulnerable.
+        if (invuln_ms == 0) {
+            render_sprite(tex_rat, rat_x / 1000, rat_y / 1000, 1);
         } else {
-            if (score & 1) { render_sprite(tex_rat, rx, ry, 1); }
+            if ((score_timer_ms / 100) & 1) {
+                render_sprite(tex_rat, rat_x / 1000, rat_y / 1000, 1);
+            }
         }
 
-        render_sprite(tex_cat, cx, cy, 1);
+        // Cat sprite.
+        render_sprite(tex_cat, cat_x / 1000, cat_y / 1000, 1);
 
-        // Advance and draw damage particles (passes dt in milliseconds).
-        auto dt_ms;
-        dt_ms = game_dt_ms();
+        // Particles.
         update_particles(dt_ms);
 
-        // HUD: health bar + score display.
+        // HUD: health bar + score.
         render_bar(8, 4, 60, 6, rat_hp, rat_max_hp, RED);
         render_text("SCORE", 230, 4, 1, WHITE);
         render_number(272, 4, 1, YELLOW, score);
 
-        // Game-over overlay: score summary + restart prompt.
+        // Game-over overlay.
         if (game_over) {
             render_rect(80, 50, 160, 80, BLACK);
             render_text("GAME OVER", 104, 62, 1, WHITE);
@@ -270,6 +429,11 @@ main() {
     }
 
     arena_free(frame_arena);
-    free(spr_rat_data); free(spr_cat_data); free(PAL);
+    free(spr_rat_data);
+    free(spr_cat_data);
+    free(PAL);
+    free(path_buf);
+    path_free(pf);
+    tile_free(tm);
     return 0;
 }

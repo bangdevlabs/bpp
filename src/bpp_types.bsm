@@ -17,6 +17,7 @@
 
 import "defs.bsm";
 import "stbarray.bsm";
+import "stbhash.bsm";
 import "bpp_internal.bsm";
 import "bpp_parser.bsm";
 
@@ -686,14 +687,43 @@ uses_int_ops_node(nd, var_p) {
     return 0;
 }
 
-// Find a function's index by packed name. Returns first match.
-find_func_idx(name_p) {
-    auto i, func;
+// Symbol lookup acceleration for find_func_idx. The hash maps a
+// function name's byte sequence to (func_idx + 1); the +1 keeps
+// "absent" distinguishable from "index 0". The hash is rebuilt at the
+// start of each top-level type-inference pass (run_types and
+// infer_module) — funcs[] is stable inside a pass, so lookups remain
+// O(1) without any per-call stale check.
+auto _ty_func_hash;
+
+// Rebuild the function-name hash from the current funcs[] table.
+// Called from run_types and infer_module before any find_func_idx
+// queries fire. Lazy allocation on first call.
+_ty_rebuild_func_hash() {
+    auto i, func, name_p;
+    if (_ty_func_hash == 0) {
+        _ty_func_hash = hash_str_new(256);
+    } else {
+        hash_str_clear(_ty_func_hash);
+    }
     for (i = 0; i < func_cnt; i = i + 1) {
         func = funcs[i];
-        if (packed_eq(*(func + FN_NAME), name_p)) { return i; }
+        name_p = *(func + FN_NAME);
+        hash_str_set(_ty_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
     }
-    return -1;
+    return 0;
+}
+
+// Find a function's index by packed name. O(1) hash lookup. Caller
+// must ensure _ty_rebuild_func_hash has been invoked since the last
+// time funcs[] grew (run_types and infer_module both do this).
+find_func_idx(name_p) {
+    auto v;
+    v = hash_str_get(_ty_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return 0 - 1; }
+    return v - 1;
 }
 
 // Set a parameter type in the persistent par_types array.
@@ -717,6 +747,11 @@ propagate_set_par_type(func_idx, par_idx, ty) {
 // be available in ft_names/ft_types (from .bo export or prior inference).
 infer_module(mi) {
     auto i, func, name_p, ret_ty;
+
+    // Refresh the function-name hash before any find_func_idx queries
+    // run inside the body walks below. funcs[] is stable for the rest
+    // of this pass.
+    _ty_rebuild_func_hash();
 
     // Register extern return types for externs in this module.
     for (i = 0; i < ext_cnt; i = i + 1) {
@@ -770,6 +805,11 @@ infer_module(mi) {
 // update function return types, re-infer until stable.
 run_types() {
     auto i, func, name_p, ret_ty, changed, pass;
+
+    // Refresh the function-name hash before any find_func_idx queries
+    // run inside the body walks below. funcs[] is stable for the
+    // entire pass.
+    _ty_rebuild_func_hash();
 
     // Register extern return types in the function type table.
     // Check declared return type: "double" → TY_FLOAT, "float" → TY_FLOAT_H.

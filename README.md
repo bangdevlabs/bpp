@@ -1,8 +1,10 @@
 # B++
 
-### B++ 2.0 — Tilemap, Physics, Address-of — 6 April 2026
+### B++ 0.21 — stbhash, stbpath, O(1) Compiler, Auto-Platform — 6 April 2026
 
-Self-hosting compiler with **three playable GPU games** (Snake, Pathfinder, Platformer with Kenney assets), **tilemap engine + physics** (stbtile, stbphys), **address-of operator** (`&x`), **PNG transparency** (tRNS chunk + alpha discard), **GPU sprite rendering**, **pure B++ sqrt**, GPU text (bitmap + **pure B++ TrueType**), pure B++ PNG loader, **real malloc/free/realloc** (Bell Labs style), Go-style modular cache, native debugger (`bug` v2), game infrastructure (arena, pool, ECS), type hints with Base×Slice system, two native backends (ARM64 + x86_64). The compiler compiles itself and produces signed native binaries with zero external tools.
+Self-hosting compiler with **three playable GPU games** (Snake, Pathfinder, Platformer with Kenney assets) and **Snake running on Linux via raw X11 wire protocol** (no FFI, no libX11, no Xlib — just `sys_socket` over a Unix socket). The compiler's six linear-scan symbol lookups are now **O(1) hash queries** via the new `stbhash.bsm`. Cat AI in Pathfinder navigates around walls using **pure B++ A\*** via the new `stbpath.bsm`. The platform layer is **auto-injected by the compiler** when `stbgame` is in the import graph — `stbgame.bsm` no longer mentions any platform module by name. **Test suite cleaned**: 71 → 52 tests, 100% passing. Tilemap engine + physics, address-of operator `&`, PNG transparency, GPU sprite rendering, pure B++ sqrt and TrueType, Go-style modular cache, native debugger (`bug` v2), arena/pool/ECS, type hints with Base×Slice system, two native backends (ARM64 + x86_64). **23 stb modules** (plus 2 platform layers in the chip backends), all leaf-or-purposeful, all pure B++. Self-hosting and zero external tools for native builds.
+
+> **Version 0.21**: B++ ships **1.0** when a complete indie retro game is shipped, end to end, in pure B++. Until then we count fractional progress.
 
 ---
 
@@ -26,19 +28,23 @@ But what if a small group of rebels at Bell Labs had taken B in a different dire
 
 B++ is that alternate timeline.
 
-A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. ARM64 macOS and x86_64 Linux. No assembler. No linker. No external tools.
+A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. No assembler. No linker. No external tools.
 
-And a standard library that is, itself, a game engine.
+But what if a Sean Barret later joined tha group with his STB all written in B++?
 
-## Latest (6 April 2026)
+And now we have a standard library that is, itself, a game engine and is ready to ship!
 
-- **stbtile.bsm**: Tilemap engine — `tile_new`, `tile_get/set`, `tile_solid`, `tile_collides`, `tile_load_set` (PNG tileset → GPU textures), `tile_map_type` (remap game types to tileset indices), `tile_draw` (GPU render with camera culling). 1 texture per tile — no atlas UV complexity.
-- **stbphys.bsm**: Platformer physics — `Body` struct with milli-pixel convention, gravity, impulse jumping, separate-axis tile collision, reliable ground probe. Two subtle bugs fixed: landing snap formula (use body bottom, not top) and ground probe (1-frame on_ground was unreliable).
-- **Address-of `&` operator**: B++ now supports `&variable` to get the memory address of a local or global. Eliminates the `malloc(8)` out-parameter workaround. `T_ADDR` AST node, codegen for x86_64 (LEA) and aarch64 (ADD). New warning W012 for incompatibility with `call()` and extern FFI.
-- **PNG transparency**: `stbimage` now reads the tRNS chunk for palette-indexed PNGs. Metal fragment shader has `discard_fragment()` for alpha < 0.01. Kenney sprites render cleanly on any background.
+## Latest (6 April 2026 — version 0.21)
+
+- **Snake runs on Linux** via raw X11 wire protocol — Phase 1-3 of the X11 plan implemented in `stb/_stb_platform_linux.bsm` (276 → 1160 lines). Unix socket and TCP, handshake, CreateWindow with FocusChangeMask, XPutImage software rendering, full keyboard + mouse input with auto-detect for evdev/Apple keycodes. Zero FFI, zero `libX11`. See **Run on Linux** section below.
+- **Validator integrated into incremental pipeline**: `run_validate()` had been monolithic-only since it was written. ARM64 and x86_64 builds now run the strict semantic checks (E050, E201, W002/W003, etc.) just like `--c` always did. E052 (the bogus float→int reject) removed.
+- **C emitter modernized**: 8 missing builtins (`putchar_err`, `assert`, `shr`, `float_ret`, `float_ret2`, `sys_ioctl`, `sys_nanosleep`, `sys_clock_gettime`). Extern dedup with varargs for collisions. `is_libc_symbol()` skip avoids conflicts with system headers. `bpp_typeck.bsm` (507-line orphan) deleted. Snake via the raylib driver compiles to portable C and runs as a 94 KB Mach-O — same source compiles for any platform with raylib installed.
+- **stbtile.bsm**: Tilemap engine — `tile_new`, `tile_get/set`, `tile_solid`, `tile_collides`, `tile_load_set` (PNG tileset → GPU textures), `tile_map_type`, `tile_draw` (GPU render with camera culling). 1 texture per tile — no atlas UV complexity.
+- **stbphys.bsm**: Platformer physics — `Body` struct with milli-pixel convention, gravity, impulse jumping, separate-axis tile collision, reliable ground probe.
+- **Address-of `&` operator**: B++ now supports `&variable` to get the memory address of a local or global. Eliminates the `malloc(8)` out-parameter workaround. `T_ADDR` AST node, codegen for x86_64 (LEA) and aarch64 (ADD).
+- **PNG transparency**: `stbimage` reads the tRNS chunk for palette-indexed PNGs. Metal fragment shader has `discard_fragment()` for alpha < 0.01.
 - **Platformer with Kenney assets**: `games/platformer/platform.bpp` loads `tilemap_packed.png` (18×18 tiles) and character sprites (24×24). Real pixel-art platformer running on GPU.
-- **Particle system fixed**: Snake ECS particles had a 24-bit color mask that dropped the alpha byte on re-encoding. Worked by accident in software (alpha ignored), invisible on GPU (alpha blended). Fixed with `flags - 1` decrement.
-- **24 stb modules**: draw, render, sprite, tile, phys, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends.
+- **23 stb modules + 2 platform layers** (in chip backends): draw, render, sprite, tile, phys, **path**, font, game, input, ui, math, col, color, array, **hash**, str, buf, file, io, image, arena, pool, ecs.
 
 ## The Language
 
@@ -103,6 +109,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
 - **Cross-compilation** — `bpp --linux64 game.bpp -o game` from macOS
 - **Modular compilation** — Go-style per-module codegen with content-addressed `.bo` cache
+- **O(1) symbol tables** — six linear-scan lookups in the compiler refactored to hash queries via stbhash (eager / lazy / incremental strategies per call site)
+- **Auto-injected platform layer** — the compiler pulls `_stb_platform_<target>.bsm` automatically when `stbgame` is in the import graph; library code never names the platform module
 - **Diagnostics** — error codes (E001-E201), warnings (W001-W012), file:line:caret locations
 
 **Debugger (`bug`):**
@@ -117,12 +125,14 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **GPU sprites** — any-size palette-indexed sprites: JSON load → RGBA → Metal texture → draw at scale
 - **Tilemap engine** — grid + collision layer + PNG tileset loader + camera-aware GPU draw with type remap
 - **Platformer physics** — milli-pixel Body, gravity, impulse jumping, separate-axis tile collision, ground probe
+- **A\* pathfinding** — pure B++ A\* on a grid, binary min-heap with indexed decrease-key, leaf module, used by the cat AI in Pathfinder
+- **Hash maps** — open addressing with linear probing, word keys (Knuth) and byte-sequence keys (djb2), tombstones, used by the compiler symbol tables
 - **Software rendering** — CPU framebuffer with rects, circles, lines, sprites, text
 - **Text rendering** — bitmap 8×8 fallback + pure B++ TrueType reader (cmap, glyf, Bézier, scanline AA)
 - **Image loading** — pure B++ PNG loader with tRNS transparency (DEFLATE, Huffman, all filter types, zero FFI)
 - **Game infrastructure** — arena allocator, object pool, entity-component system
 - **Collision** — rect overlap, point-in-rect, distance² (squared, no sqrt needed)
-- **24 modules** — draw, render, sprite, tile, phys, font, game, input, ui, math, col, color, array, str, buf, file, io, image, arena, pool, ecs + 2 platform backends
+- **23 modules** in `stb/` — draw, render, sprite, tile, phys, **path**, font, game, input, ui, math, col, color, array, **hash**, str, buf, file, io, image, arena, pool, ecs. Plus 2 platform layers that live alongside the per-chip backends in `src/aarch64/` and `src/x86_64/` (auto-injected by the compiler when `stbgame` is in the import graph).
 
 ## What B++ Doesn't Have
 
@@ -131,6 +141,8 @@ No classes. No templates. No exceptions. No garbage collector. No package manage
 You write code. You compile it. You run it.
 
 ## The Standard B Library (stb)
+
+The name **stb** is a tribute to [Sean Barrett's stb libraries](https://github.com/nothings/stb) — the single-header C libraries that defined a generation of small, focused, dependency-free building blocks for graphics, audio, fonts, and data. `stb_image.h`, `stb_truetype.h`, `stb_vorbis.c`, `stb_ds.h` and the rest are how a lot of indie game developers learned that "the right amount of library" is one file you can read in an afternoon. B++'s standard library is the same idea reframed as a pure-B++ collection: small modules, no headers (B++ has no headers anyway), no third-party dependencies, the minimum API surface for the maximum game.
 
 stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++.
 
@@ -152,7 +164,7 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbinput` | Keyboard and mouse input from memory arrays |
 | `stbui` | Immediate-mode UI widgets with per-frame arena |
 
-**Math & physics:**
+**Math, physics & AI:**
 
 | Module | What it does |
 |--------|-------------|
@@ -160,12 +172,14 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbcol` | Collision detection — rect overlap, point-in-rect, distance squared |
 | `stbphys` | Platformer physics — Body struct, gravity, jump, tile collision, milli-pixel precision |
 | `stbtile` | Tilemap engine — grid, collision layer, PNG tileset loader, camera-aware GPU draw, type remap |
+| `stbpath` | A* pathfinding on a grid — binary min-heap with indexed decrease-key, Manhattan heuristic, leaf module |
 
 **Data structures:**
 
 | Module | What it does |
 |--------|-------------|
-| `stbarray` | Dynamic arrays with shadow header |
+| `stbarray` | Dynamic arrays with shadow header (stb_ds.h style) |
+| `stbhash` | Hash maps — word keys (Knuth) and byte-sequence keys (djb2), open addressing, tombstones |
 | `stbstr` | String operations and growable string builder |
 | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
 
@@ -266,6 +280,119 @@ bpp --clean-cache platform_noasset.bpp -o plat_noasset
 ./plat_noasset
 ```
 
+### Run on Linux (X11 via Docker + XQuartz)
+
+You can cross-compile a B++ game to a Linux x86_64 ELF binary on macOS and run it inside an Ubuntu container, with the window appearing on your Mac via XQuartz. The Linux platform layer talks raw X11 wire protocol over a TCP socket — no `libX11`, no FFI, just `sys_socket` + `sys_connect` + `sys_write`.
+
+**One-time setup on macOS:**
+
+```bash
+# 1. Install XQuartz (X11 server for macOS)
+brew install --cask xquartz
+
+# 2. Open XQuartz, then enable network connections:
+#    XQuartz → Preferences → Security → "Allow connections from network clients"
+#    Then quit XQuartz fully and reopen.
+
+# 3. Persist the listen-on-TCP setting (XQuartz defaults to off)
+defaults write org.xquartz.X11 nolisten_tcp 0
+killall XQuartz 2>/dev/null
+open -a XQuartz
+
+# 4. Allow localhost connections to the X server
+xhost +localhost
+
+# 5. Install Docker Desktop for Mac if you do not already have it.
+```
+
+**Cross-compile and run a game:**
+
+```bash
+# Cross-compile snake to a Linux x86_64 ELF binary
+bpp --linux64 examples/snake_cpu.bpp -o /tmp/snake_x11
+
+# Run inside Ubuntu with the host XQuartz as the display
+docker run --rm \
+  --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 \
+  -v /tmp:/tmp \
+  ubuntu:22.04 \
+  /tmp/snake_x11
+```
+
+A 320×180 window opens in XQuartz showing snake running on Linux. Arrow keys move the snake, the game speed and behavior are identical to the native macOS build. The window obeys the close button and the FocusOut handler clears stuck keys when you Alt-Tab away.
+
+**The full X11 test suite that ships in `tests/`:**
+
+These were used to verify each phase of the X11 wire-protocol implementation. They are also the easiest way to confirm a working XQuartz + Docker setup on a fresh machine.
+
+```bash
+# Phase 1 — dark blue window, ESC or close button to exit
+docker run --rm --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp \
+  ubuntu:22.04 /tmp/test_x11_window
+
+# Phase 2 — animated rectangles + circle + text
+docker run --rm --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp \
+  ubuntu:22.04 /tmp/test_x11_draw
+
+# Phase 3 — input test (arrows to move player, mouse to draw yellow ball, ESC to quit)
+docker run --rm --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp \
+  ubuntu:22.04 /tmp/test_x11_input
+
+# Movement test — prints player position to terminal every 30 frames
+docker run --rm --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp \
+  ubuntu:22.04 /tmp/test_x11_movement
+
+# Snake on Linux — arrow keys to move, eat the apple, grow the tail
+docker run --rm --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 -v /tmp:/tmp \
+  ubuntu:22.04 /tmp/snake_x11
+```
+
+If `docker` is not on your `PATH` after a Docker Desktop install on macOS, the binary lives at `/Applications/Docker.app/Contents/Resources/bin/docker` — substitute that for `docker` in any of the commands above.
+
+**Caveats**:
+- Currently only `draw_*` (CPU framebuffer) games work via X11. GPU games (`render_*`) need Vulkan, which is deferred (see TODO).
+- macOS Docker has no GPU passthrough — even if Vulkan were implemented, real GPU rendering would require Linux hardware. The X11 path is software-only.
+- You can also run without `DISPLAY`: the same binary falls back to ANSI terminal rendering.
+
+### Run via the C Emitter (raylib path, portable C output)
+
+The C emitter (`bpp --c`) translates B++ to portable C99. The right pattern is to write the game using `drv_raylib.bsm` instead of `stbgame.bsm`, so the generated C calls regular C functions (no Objective-C, no `objc_msgSend` calling-convention issues).
+
+**Install raylib and gcc:**
+
+```bash
+# macOS
+brew install raylib
+
+# Ubuntu / Debian
+sudo apt-get install libraylib-dev gcc
+```
+
+**Compile and run a game:**
+
+```bash
+# 1. Generate C from a raylib-flavored game
+bpp --c examples/snake_raylib.bpp > /tmp/snake_raylib.c
+
+# 2. Compile the C with gcc + raylib + objc (objc only on macOS)
+gcc -Wno-implicit-function-declaration \
+    -Wno-parentheses-equality \
+    -I/opt/homebrew/include -L/opt/homebrew/lib \
+    /tmp/snake_raylib.c -o /tmp/snake_raylib_c \
+    -lraylib -lobjc
+
+# 3. Run
+/tmp/snake_raylib_c
+```
+
+On Linux, drop `-lobjc` and use `/usr/include` / `/usr/lib` paths. The same `.c` file should compile on Windows (with raylib for MSYS2/Visual Studio), BSDs, and Emscripten.
+
 ### Debug Any Game
 
 ```bash
@@ -325,7 +452,7 @@ b++/
 ├── src/              — Compiler core (self-hosting, ~18 B++ modules)
 │   ├── aarch64/      — ARM64 backend (encoder, codegen, Mach-O writer)
 │   └── x86_64/       — x86_64 backend (encoder, codegen, ELF writer)
-├── stb/              — Standard B Library (24 modules, pure B++, the game engine)
+├── stb/              — Standard B Library (23 modules, pure B++, the game engine)
 ├── games/            — Complete playable games
 │   ├── snake/        — Snake with ECS particles + ranking
 │   ├── pathfind/     — Rat-and-cat chase with AI pursuit
@@ -376,7 +503,7 @@ bpp --show-deps source.bpp     # print module dependency graph
 bpp --clean-cache              # delete all cached .bo files
 ```
 
-18 compiler modules + 24 stb library modules, ~15,000 lines of B++. Self-hosting verified at every stage (`shasum bpp2 == bpp3`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `/usr/local/lib/bpp/`.
+16 compiler core modules + 5 files per chip backend (`src/aarch64/`, `src/x86_64/`) + 23 stb library modules, ~17,000 lines of B++. Self-hosting verified at every stage (`shasum bpp2 == bpp3`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/aarch64/`, `src/x86_64/`, `/usr/local/lib/bpp/` and its subfolders.
 
 ### The Debugger
 
@@ -476,6 +603,10 @@ SOFTWARE.
 
 *GPU Sprites + Module Cache Fix: stbsprite.bsm (any w×h), pure B++ sqrt, 3 critical .bo cache bugs fixed (param types + return types + null terminators), pathfinder game ported on April 5, 2026.*
 
-*B++ 2.0 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed, 24 stb modules total on April 6, 2026.*
+*B++ 2.0 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed on April 6, 2026.*
+
+*B++ 0.21 — Linux X11, Validator Integration, C Emitter Modernized: X11 wire protocol Phases 1-3 (`_stb_platform_linux.bsm` 276 → 1160 lines, Unix socket + TCP, handshake, CreateWindow with FocusChangeMask, XPutImage, evdev/Apple keycode auto-detect, FocusOut stuck-key fix, WM_DELETE close, WM_NAME title), validator integrated into the incremental ARM64/x86_64 pipeline (was monolithic-only since written), E052 phantom check removed, `bpp_typeck.bsm` 507-line orphan deleted, C emitter modernized (8 builtins added, extern dedup with varargs, libc symbol skip), Snake running on Linux via Docker + XQuartz, raylib path verified end-to-end on April 6, 2026.*
+
+*B++ 0.21 — stbhash, stbpath, O(1) Compiler Symbols, Auto-Platform: stbhash.bsm (word + byte-keyed hash maps, ~610 lines, used by the compiler), stbpath.bsm (A* with binary heap + indexed decrease-key, leaf module, ~440 lines), six compiler symbol lookups refactored from linear scan to O(1) hash (val_find_func/extern eager, find_func_idx eager, find_struct incremental at parser AND bo cache loader, is_extern/find_extern lazy), platform/observe files moved into chip folders (`src/aarch64/`, `src/x86_64/`) with chip+OS coupling READMEs, `_stb_platform.bsm` auto-injected by the compiler when stbgame is in the import graph (explicit import removed from stbgame.bsm), pathfind game refactored to milli-unit + tilemap + A* cat AI, test suite cleaned (71 → 52 tests, 100% passing), 23 stb modules + 2 platform layers in chip folders on April 6, 2026.*
 
 *Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*

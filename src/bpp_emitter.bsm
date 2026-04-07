@@ -2,6 +2,7 @@
 
 import "defs.bsm";
 import "stbarray.bsm";
+import "stbhash.bsm";
 import "bpp_internal.bsm";
 import "bpp_parser.bsm";
 import "bpp_types.bsm";
@@ -13,6 +14,14 @@ auto sbuf;
 
 // Extern function table (parallel arrays for fast lookup).
 auto ex_name, ex_lib, ex_ret, ex_args, ex_acnt, ex_cnt;
+
+// Extern lookup acceleration. Lazy strategy: the C emitter is a cold
+// path (only used when the user passes --c), so we trade a per-call
+// stale check for the simplicity of not needing the caller to invoke
+// rebuild explicitly. _emit_ex_hash_cnt is the ex_cnt snapshot at the
+// last build; when ex_cnt grows, the next is_extern/find_extern call
+// rebuilds the hash before querying.
+auto _emit_ex_hash, _emit_ex_hash_cnt;
 
 // Function table (parallel arrays).
 // fn_fidx maps emitter index → parser func_cnt index for type queries.
@@ -155,11 +164,34 @@ emit_c_str(p) {
 
 // ── Used extern tracking ───────────────────────────────────
 
+// Rebuild the extern-name hash from the current ex_name table.
+// Triggered on demand when _emit_ex_hash_cnt is out of sync with
+// ex_cnt. Lazy because the emitter is a cold path and we'd rather
+// have one branch per lookup than require callers to remember to
+// rebuild at phase boundaries.
+_emit_rebuild_ex_hash() {
+    auto i, name_p;
+    if (_emit_ex_hash == 0) {
+        _emit_ex_hash = hash_str_new(64);
+    } else {
+        hash_str_clear(_emit_ex_hash);
+    }
+    for (i = 0; i < ex_cnt; i = i + 1) {
+        name_p = ex_name[i];
+        hash_str_set(_emit_ex_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
+    }
+    _emit_ex_hash_cnt = ex_cnt;
+    return 0;
+}
+
 // Check if a packed name is in the extern table.
 is_extern(name_p) {
-    auto i;
-    for (i = 0; i < ex_cnt; i = i + 1) {
-        if (str_eq_packed(name_p, ex_name[i])) { return 1; }
+    if (_emit_ex_hash_cnt != ex_cnt) { _emit_rebuild_ex_hash(); }
+    if (hash_str_get(_emit_ex_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p)) > 0) {
+        return 1;
     }
     return 0;
 }
@@ -240,12 +272,14 @@ find_used_externs() {
 // ── Extern lookup helpers ──────────────────────────────────
 
 // Find extern function index by packed name. Returns -1 if not found.
+// Shares the lazy-rebuilt hash with is_extern above.
 find_extern(name_p) {
-    auto i;
-    for (i = 0; i < ex_cnt; i = i + 1) {
-        if (str_eq_packed(name_p, ex_name[i])) { return i; }
-    }
-    return -1;
+    auto v;
+    if (_emit_ex_hash_cnt != ex_cnt) { _emit_rebuild_ex_hash(); }
+    v = hash_str_get(_emit_ex_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return 0 - 1; }
+    return v - 1;
 }
 
 // Check if a packed type string is a pointer FFI type.
@@ -593,6 +627,49 @@ emit_node(nd) {
             return 0;
         }
 
+        // Built-in: putchar_err -> write 1 byte to stderr via syscall.
+        if (str_eq(name_p, "putchar_err", 11)) {
+            out("(_bpp_scratch[0] = (uint8_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), bpp_sys_write(2, _bpp_scratch, 1))");
+            return 0;
+        }
+
+        // Built-in: shr(value, shift) -> logical right shift (unsigned).
+        // Unlike >> which is arithmetic on signed types, shr always fills
+        // with zeros by casting through uint64_t.
+        if (str_eq(name_p, "shr", 3)) {
+            out("((long long)((uint64_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(") >> (");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out(")))");
+            return 0;
+        }
+
+        // Built-in: assert(cond) -> abort if condition is zero.
+        // Matches the native backends which emit brk/int3 on failure.
+        if (str_eq(name_p, "assert", 6)) {
+            out("((");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out(") ? 0LL : (abort(), 0LL))");
+            return 0;
+        }
+
+        // Built-in: float_ret() -> read the first float return value saved
+        // after the last extern call. Returns the bit pattern of the saved
+        // double cast to long long.
+        if (str_eq(name_p, "float_ret", 9)) {
+            out("_bpp_float_ret_1");
+            return 0;
+        }
+
+        // Built-in: float_ret2() -> read the second float return value.
+        if (str_eq(name_p, "float_ret2", 10)) {
+            out("_bpp_float_ret_2");
+            return 0;
+        }
+
         // Built-in: getchar -> read 1 byte from stdin via syscall.
         if (str_eq(name_p, "getchar", 7)) {
             out("(_bpp_scratch[0] = 0, bpp_sys_read(0, _bpp_scratch, 1) > 0 ? (long long)_bpp_scratch[0] : -1LL)");
@@ -771,6 +848,40 @@ emit_node(nd) {
             return 0;
         }
 
+        // Built-in: sys_ioctl(fd, request, arg) -> device control.
+        if (str_eq(name_p, "sys_ioctl", 9)) {
+            out("(long long)ioctl((int)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), (unsigned long)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out("), (void*)(uintptr_t)(");
+            if (cnt > 2) { emit_node(*(arr + 16)); }
+            out("))");
+            return 0;
+        }
+
+        // Built-in: sys_nanosleep(req, rem) -> high-precision sleep.
+        // req and rem point to struct timespec {tv_sec, tv_nsec}.
+        if (str_eq(name_p, "sys_nanosleep", 13)) {
+            out("(long long)nanosleep((const struct timespec*)(uintptr_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), (struct timespec*)(uintptr_t)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out("))");
+            return 0;
+        }
+
+        // Built-in: sys_clock_gettime(clock_id, tp) -> read a clock.
+        // tp points to struct timespec {tv_sec, tv_nsec}.
+        if (str_eq(name_p, "sys_clock_gettime", 17)) {
+            out("(long long)clock_gettime((clockid_t)(");
+            if (cnt > 0) { emit_node(*(arr + 0)); }
+            out("), (struct timespec*)(uintptr_t)(");
+            if (cnt > 1) { emit_node(*(arr + 8)); }
+            out("))");
+            return 0;
+        }
+
         // Built-in: sys_exit -> terminate process immediately.
         if (str_eq(name_p, "sys_exit", 8)) {
             out("bpp_sys_exit(");
@@ -913,29 +1024,105 @@ emit_node(nd) {
 
 // ── Top-level C emission ───────────────────────────────────
 
+// Return 1 if `name_p` matches a POSIX/libc symbol that is already
+// declared by one of the system headers we emit. Skipping these avoids
+// conflicting declarations between the B++ FFI import and the real
+// system prototype (e.g. usleep has `useconds_t` on macOS, not `int`).
+is_libc_symbol(name_p) {
+    if (str_eq(name_p, "usleep", 6))        { return 1; }
+    if (str_eq(name_p, "sleep", 5))         { return 1; }
+    if (str_eq(name_p, "nanosleep", 9))     { return 1; }
+    if (str_eq(name_p, "clock_gettime", 13)){ return 1; }
+    if (str_eq(name_p, "ioctl", 5))         { return 1; }
+    if (str_eq(name_p, "read", 4))          { return 1; }
+    if (str_eq(name_p, "write", 5))         { return 1; }
+    if (str_eq(name_p, "open", 4))          { return 1; }
+    if (str_eq(name_p, "close", 5))         { return 1; }
+    if (str_eq(name_p, "lseek", 5))         { return 1; }
+    if (str_eq(name_p, "fchmod", 6))        { return 1; }
+    if (str_eq(name_p, "mkdir", 5))         { return 1; }
+    if (str_eq(name_p, "unlink", 6))        { return 1; }
+    if (str_eq(name_p, "fork", 4))          { return 1; }
+    if (str_eq(name_p, "execve", 6))        { return 1; }
+    if (str_eq(name_p, "waitpid", 7))       { return 1; }
+    if (str_eq(name_p, "wait4", 5))         { return 1; }
+    if (str_eq(name_p, "ptrace", 6))        { return 1; }
+    if (str_eq(name_p, "_exit", 5))         { return 1; }
+    if (str_eq(name_p, "socket", 6))        { return 1; }
+    if (str_eq(name_p, "connect", 7))       { return 1; }
+    if (str_eq(name_p, "mmap", 4))          { return 1; }
+    if (str_eq(name_p, "munmap", 6))        { return 1; }
+    if (str_eq(name_p, "malloc", 6))        { return 1; }
+    if (str_eq(name_p, "free", 4))          { return 1; }
+    if (str_eq(name_p, "realloc", 7))       { return 1; }
+    if (str_eq(name_p, "abort", 5))         { return 1; }
+    return 0;
+}
+
 // Emit #include and forward declarations for used extern functions.
+//
+// B++ source may declare the same FFI name multiple times with different
+// signatures (notably objc_msgSend on macOS, called with many argument
+// shapes). C does not allow overloaded forward declarations, so we:
+//   1. Walk the extern table tracking which names have been emitted.
+//   2. Emit one declaration per unique name.
+//   3. When a name has more than one signature, append `...` varargs so
+//      the single declaration accepts any call shape used by the program.
+//   4. Skip names that are already declared by the standard headers we
+//      include (via is_libc_symbol), so the compiler does not see two
+//      conflicting prototypes for the same function.
 emit_includes() {
-    auto i, j, args, acnt;
+    auto i, j, k, args, acnt, name_p, dup_count, already;
     out("#include <stdint.h>"); putchar('\n');
     out("#include <unistd.h>"); putchar('\n');
     out("#include <fcntl.h>"); putchar('\n');
     out("#include <sys/wait.h>"); putchar('\n');
     out("#include <sys/stat.h>"); putchar('\n');
     out("#include <sys/socket.h>"); putchar('\n');
+    out("#include <sys/ioctl.h>"); putchar('\n');
+    out("#include <time.h>"); putchar('\n');
     putchar('\n');
     for (i = 0; i < ex_cnt; i = i + 1) {
         if (is_used(ex_name[i])) {
-            emit_ctype(ex_ret[i]);
-            out(" ");
-            print_p(ex_name[i]);
-            out("(");
-            args = ex_args[i];
-            acnt = ex_acnt[i];
-            for (j = 0; j < acnt; j = j + 1) {
-                if (j > 0) { out(", "); }
-                emit_ctype(args[j]);
+            name_p = ex_name[i];
+            // Skip POSIX/libc symbols already declared by the headers
+            // we include above. Re-declaring them with B++'s simplified
+            // signatures would conflict with the real prototypes.
+            if (is_libc_symbol(name_p) == 0) {
+            // Skip this entry if a prior extern with the same name was
+            // already emitted.
+            already = 0;
+            for (k = 0; k < i; k = k + 1) {
+                if (is_used(ex_name[k])) {
+                    if (packed_eq(ex_name[k], name_p)) { already = 1; }
+                }
             }
-            out(");"); putchar('\n');
+            if (already == 0) {
+                // Count total signatures for this name so we know whether
+                // to append `...` varargs.
+                dup_count = 0;
+                for (k = 0; k < ex_cnt; k = k + 1) {
+                    if (packed_eq(ex_name[k], name_p)) {
+                        if (is_used(ex_name[k])) { dup_count = dup_count + 1; }
+                    }
+                }
+                emit_ctype(ex_ret[i]);
+                out(" ");
+                print_p(name_p);
+                out("(");
+                args = ex_args[i];
+                acnt = ex_acnt[i];
+                for (j = 0; j < acnt; j = j + 1) {
+                    if (j > 0) { out(", "); }
+                    emit_ctype(args[j]);
+                }
+                if (dup_count > 1) {
+                    if (acnt > 0) { out(", ..."); }
+                    else { out("..."); }
+                }
+                out(");"); putchar('\n');
+            }
+            }
         }
     }
     putchar('\n');
@@ -1034,13 +1221,19 @@ emit_runtime() {
     return 0;
 }
 
-// Emit the memory model (scratch buffer and argv storage).
+// Emit the memory model (scratch buffer, argv storage, float return slots).
 emit_mem_model() {
     out("#include <stdlib.h>"); putchar('\n');
     out("#include <string.h>"); putchar('\n');
     out("static uint8_t _bpp_scratch[16];"); putchar('\n');
     out("static int _bpp_argc;"); putchar('\n');
     out("static char** _bpp_argv;"); putchar('\n');
+    // Float return slots. Populated after every FFI call whose declared
+    // return type is a float/double, so that float_ret()/float_ret2()
+    // builtins can read back the last value even when the call result
+    // was used in a void-statement context.
+    out("static double _bpp_float_ret_1 = 0.0;"); putchar('\n');
+    out("static double _bpp_float_ret_2 = 0.0;"); putchar('\n');
     putchar('\n');
     return 0;
 }

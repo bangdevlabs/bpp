@@ -2,40 +2,38 @@
 
 ## A Language for Games
 
-B++ is a small, low-level language for writing games. It has no type
-declarations, no header files, and no standard C library dependency.
-The compiler infers types automatically. You write simple code; the
-compiler does the rest.
+B++ is a small, low-level language for writing games. There are no type
+declarations, no header files, and no dependency on the standard C
+library. The compiler infers types and emits native machine code
+directly — no assembler, no linker, no external tools.
 
 B++ descends from B, the language Ken Thompson wrote for early Unix.
-Like B, every value is a machine word. Unlike B, the word is 64 bits,
-structs have named fields, the compiler emits native ARM64 binaries
-directly, and the whole system is self-hosting — the compiler compiles
-itself.
+Every value is a machine word, just as it was in B. The word is now
+64 bits. Structs carry named fields. The compiler is written in B++
+and compiles itself.
+
+The system is small enough to read in an afternoon and large enough
+to ship a game.
 
 ## Getting Started
 
-- Install the compiler and standard library manually: 
-
-sudo cp bpp /usr/local/bin/ 
-sudo mkdir -p /usr/local/lib/bpp/stb 
-sudo cp stb/*.bsm /usr/local/lib/bpp/stb/
-      
-
-- Bootstrap from C source (first time, or if bpp binary is missing):
-
-    clang bootstrap.c -o bpp
-
-- Install the compiler, standard library, and drivers:
+The shipped repo contains the compiler binary `bpp` already built. To
+install it system-wide along with the standard library:
 
     sh install.sh
 
-- Install without re-bootstrapping:
+`install.sh` bootstraps the compiler from source, then copies `bpp`
+and `bug` into `/usr/local/bin/` and the `stb/` library into
+`/usr/local/lib/bpp/`. The bootstrap step verifies the compiler can
+build itself before installing — see `bootprod_manual.md` for the
+full bootstrap discipline.
 
-    sh install.sh --skip
+If `bpp` is missing or unusable, recover it from the C source seed:
 
-The `bootstrap.c` file is the entire compiler emitted as C. It is the
-seed that builds everything. Regenerate it with `bpp --c src/bpp.bpp > bootstrap.c`.
+    clang bootstrap.c -o bpp
+
+`bootstrap.c` is the compiler emitted as C99. Regenerate it any time
+with `bpp --c src/bpp.bpp > bootstrap.c`.
 
 Compile and run a program:
 
@@ -44,16 +42,67 @@ Compile and run a program:
 
 A game with no external dependencies:
 
-    bpp examples/snake_native.bpp -o snake
+    bpp games/snake/snake_gpu.bpp -o snake
     ./snake
 
-The same game with SDL2:
+The compiler produces a signed Mach-O ARM64 binary on macOS or a
+static x86_64 ELF binary on Linux (via `--linux64` from macOS, native
+on Linux once host detection lands).
 
-    bpp examples/snake_sdl.bpp -o snake
+### Cross-Compiling to Linux
+
+Pass `--linux64` to produce a static x86_64 ELF binary:
+
+    bpp --linux64 examples/snake_cpu.bpp -o snake_linux
+
+The Linux build uses the X11 wire protocol (Phases 1-3 implemented:
+window, software framebuffer via XPutImage, keyboard + mouse) when
+`DISPLAY` is set, and falls back to ANSI terminal rendering when it
+is not. To run the binary inside a Docker container with the window
+showing on a macOS host:
+
+    # One-time XQuartz setup on the macOS host
+    brew install --cask xquartz
+    defaults write org.xquartz.X11 nolisten_tcp 0
+    killall XQuartz 2>/dev/null
+    open -a XQuartz
+    xhost +localhost
+
+    # Run the cross-compiled binary
+    docker run --rm \
+      --add-host host.docker.internal:host-gateway \
+      -e DISPLAY=host.docker.internal:0 \
+      -v /tmp:/tmp \
+      ubuntu:22.04 \
+      /tmp/snake_linux
+
+Currently only `draw_*` (CPU framebuffer) games work via X11. GPU games
+(`render_*`) need Vulkan, which is deferred (see `docs/todo.md`).
+
+### Portable C Output (raylib / SDL drivers)
+
+The C emitter (`--c`) translates B++ to portable C99 source. The right
+pattern is to write the game with `drv_raylib.bsm` (or `drv_sdl.bsm`)
+instead of `stbgame.bsm`, so the generated C calls regular C functions:
+
+    bpp --c examples/snake_raylib.bpp > snake.c
+    gcc -I/opt/homebrew/include -L/opt/homebrew/lib \
+        snake.c -o snake -lraylib -lobjc
     ./snake
 
-The compiler produces a signed Mach-O ARM64 binary. No assembler, no
-linker, no external tools.
+The same `snake.c` should compile on any platform with raylib installed
+(macOS, Linux, Windows, BSDs, Emscripten). Avoid mixing `stbgame.bsm`
+with `--c`: `stbgame` calls Cocoa via `objc_msgSend`, which has a
+calling-convention pitfall when reached through C — see `bootstrap_manual.md`.
+
+The driver model is the bridge between the B++ engine API and external
+C libraries. Each driver implements the same `_stb_*` interface that the
+native platform layer provides:
+
+| Driver         | Library | Use case |
+|----------------|---------|----------|
+| `drv_raylib.bsm` | raylib  | Portable C output via the C emitter |
+| `drv_sdl.bsm`    | SDL2    | Same, when SDL is preferred over raylib |
 
 ## A First Program
 
@@ -663,6 +712,137 @@ Mouse buttons (enum): `MOUSE_LEFT`, `MOUSE_RIGHT`, `MOUSE_MIDDLE`.
 | `rect_contains(rx,ry,rw,rh,px,py)` | Point inside rectangle |
 | `circle_contains(cx,cy,r,px,py)` | Point inside circle |
 
+### stbcolor — Color Constants
+
+| Function / Constant | Description |
+|----------------------|-------------|
+| `rgba(r, g, b, a)` | Pack four bytes into an ARGB word |
+| `BLACK`, `WHITE`, `RED`, `GREEN`, `BLUE`, `YELLOW`, `ORANGE`, `PURPLE`, `GRAY`, `DARKGRAY` | Pre-built colors |
+
+### stbtile — Tilemap Engine
+
+A grid of tile types with a separate solid mask, an optional textured
+tileset, and a remap from game-defined types to tileset indices.
+
+| Function | Description |
+|----------|-------------|
+| `tile_new(w, h, tw, th)` | Allocate a tilemap |
+| `tile_get/tile_set(tm, gx, gy, val)` | Read/write a single tile |
+| `tile_solid(tm, type)` | Mark a tile type as solid |
+| `tile_collides(tm, px, py, pw, ph)` | AABB hit-test against solid tiles |
+| `tile_load_set(path, tw, th, &out)` | Load a PNG tileset, one GPU texture per tile |
+| `tile_map_type(tm, game_type, ts_idx)` | Remap a logical tile to a tileset index |
+| `tile_draw(tm, cx, cy, sw, sh)` | GPU render with camera culling |
+
+### stbphys — Platformer Physics
+
+A `Body` struct with milli-pixel positions and pixel/sec velocities.
+`pos += vel * dt_ms` works directly in integer math.
+
+| Function | Description |
+|----------|-------------|
+| `phys_body(w, h, gravity, jump_vel, move_spd)` | Allocate a body |
+| `phys_set_pos(b, px, py)` | Set position from pixel coordinates |
+| `phys_jump(b)` | Apply jump impulse if grounded |
+| `phys_update(b, dt_ms, tm)` | Gravity, X move, Y move with tile collision |
+| `phys_px_x(b)` / `phys_px_y(b)` | Pixel-coordinate position for drawing |
+
+### stbpath — A* Pathfinding
+
+Grid-based A* with a binary min-heap and indexed decrease-key. Pure
+algorithm, no graphics dependency.
+
+| Function | Description |
+|----------|-------------|
+| `path_new(w, h)` | Allocate a PathFinder |
+| `path_set_blocked(pf, gx, gy, blocked)` | Mark a cell |
+| `path_find(pf, sx, sy, gx, gy, out, max)` | Run A*, write waypoints, return count |
+
+The grid is dependency-free — you fill it with `path_set_blocked` from
+any source. To bridge from a Tilemap, inline an 8-line loop calling
+`tile_is_solid` (the snippet is documented in `stbpath.bsm`).
+
+### stbhash — Hash Maps
+
+Two flavors share the file: word keys and byte-sequence keys. Both use
+open addressing with linear probing, tombstones, and 75%-load resize.
+
+| Word-keyed | Byte-keyed |
+|------------|------------|
+| `hash_new(cap)` | `hash_str_new(cap)` |
+| `hash_set(h, key, val)` | `hash_str_set(h, buf, len, val)` |
+| `hash_get(h, key)` | `hash_str_get(h, buf, len)` |
+| `hash_has(h, key)` | `hash_str_has(h, buf, len)` |
+| `hash_del(h, key)` | `hash_str_del(h, buf, len)` |
+| `hash_clear`/`hash_count`/`hash_free` | `hash_str_clear`/`hash_str_count`/`hash_str_free` |
+
+The byte-keyed flavor copies the key bytes on insert, so the caller's
+source buffer can be freed immediately. The compiler itself uses
+`HashStr` for symbol-table lookups.
+
+### stbarena — Bump Allocator
+
+Frame-scoped allocation with O(1) reset.
+
+| Function | Description |
+|----------|-------------|
+| `arena_new(size)` | Allocate an arena of `size` bytes |
+| `arena_alloc(a, n)` | Carve `n` bytes off the bump pointer |
+| `arena_reset(a)` | Reset the bump pointer to zero |
+| `arena_free(a)` | Release the arena |
+
+### stbpool — Object Pool
+
+Fixed-size object pool with embedded freelist for O(1) get/put.
+
+| Function | Description |
+|----------|-------------|
+| `pool_new(obj_size, capacity)` | Allocate a pool |
+| `pool_get(p)` | Take a free object, returns pointer |
+| `pool_put(p, obj)` | Return an object to the freelist |
+
+### stbecs — Entity-Component System
+
+Parallel-array ECS for game entities. Positions and velocities live in
+milli-units (px×1000) for sub-pixel precision without floats.
+
+| Function | Description |
+|----------|-------------|
+| `ecs_new(capacity)` | Allocate a world |
+| `ecs_spawn(w)` | Allocate an entity, returns id |
+| `ecs_kill(w, id)` / `ecs_alive(w, id)` | Lifecycle |
+| `ecs_set_pos/vel/flags(w, id, ...)` | Write components |
+| `ecs_get_x/y/flags(w, id)` | Read components |
+| `ecs_physics(w, dt_ms)` | Step every live entity by `vel * dt_ms` |
+| `ecs_capacity(w)` | Total slot count |
+
+### stbsprite — GPU Sprites
+
+Palette-indexed sprite loading and drawing on the GPU.
+
+| Function | Description |
+|----------|-------------|
+| `load_sprite(path, out, w, h)` | Parse a JSON sprite into a byte buffer of palette indices |
+| `sprite_create(spr, pal, w, h)` | Convert to RGBA and upload as a GPU texture |
+| `sprite_draw(tex, x, y, w, h, scale)` | Draw at integer scale |
+
+### stbimage — PNG Loader
+
+Pure B++ PNG decoder. Supports DEFLATE, all five filter types,
+palette-indexed images, and the tRNS chunk for palette transparency.
+
+| Function | Description |
+|----------|-------------|
+| `img_load(path)` | Decode a PNG, returns RGBA pixel buffer |
+| `img_w()` / `img_h()` | Width and height of the last load |
+| `img_free(buf)` | Release pixel buffer |
+
+### stbfont — Text Rendering
+
+8×8 bitmap font for ASCII 32-127, plus a pure-B++ TrueType reader
+(`cmap`, `glyf`, Bézier rasterization, scanline antialiasing). Used
+internally by `draw_text` and `render_text`.
+
 ### stbbuf — Raw Buffer Access
 
 | Function | Description |
@@ -697,15 +877,16 @@ Provides glyph data for ASCII 32-127. Used internally by `draw_text`.
         return 0;
     }
 
-The game runs natively on macOS — no SDL, no raylib, no OpenGL, no
-Metal. The compiler's platform layer opens a window via `objc_msgSend`
-(Cocoa), renders the framebuffer via `CGBitmapContext` (CoreGraphics),
-and reads keyboard input via `NSEvent`. This is fully implemented and
-working as of March 24, 2026.
+The game runs natively on the host. On macOS the platform layer opens
+a window through `objc_msgSend` (Cocoa) and presents pixels via
+`CGBitmapContext` (CoreGraphics) for `draw_*`, or via Metal for
+`render_*`. On Linux the layer speaks the X11 wire protocol directly
+over a Unix socket — no Xlib, no shared libraries.
 
 `game_init` calls all subsystem inits automatically (stbmath, stbinput,
-stbdraw, stbfont, stbui). The dev never needs to call `init_array()`,
-`init_str()`, etc. manually when using stbgame.
+stbdraw, stbfont, stbui). The platform layer itself is injected by the
+compiler when it sees that `stbgame` is in the import graph, so
+`stbgame.bsm` no longer mentions any platform module by name.
 
 | Function | Description |
 |----------|-------------|
@@ -759,28 +940,41 @@ signing (SHA-256).
     bpp --monolithic source.bpp -o out  # force single-pass compilation
     bpp --show-deps source.bpp          # print module dependency graph
 
-Source lives in `src/`. The compiler has 18 modules:
+Source lives in `src/`. The compiler is roughly 16 core modules plus
+a per-target backend bundle in each chip folder.
+
+**Core (`src/`):**
 
 | Module | Purpose |
 |--------|---------|
 | `bpp.bpp` | Main driver, argument parsing |
-| `defs.bsm` | Constants, struct defs, pack/unpack, field offset names |
-| `bpp_internal.bsm` | List builder, string helpers |
-| `bpp_import.bsm` | File import resolver, module hashing, dependency graph |
+| `defs.bsm` | Constants, struct field offsets, pack/unpack helpers |
+| `bpp_internal.bsm` | List builder, string helpers (`buf_eq`, `packed_eq`) |
+| `bpp_import.bsm` | Import resolver, module hashing, dependency graph, target-suffix fallback, platform auto-injection |
 | `bpp_lexer.bsm` | Tokenizer |
-| `bpp_parser.bsm` | Parser (tokens → AST), module ownership tracking |
-| `bpp_types.bsm` | Type inference (body-local, no cross-function propagation) |
+| `bpp_parser.bsm` | Parser (tokens → AST), struct registry with hashed lookup |
+| `bpp_types.bsm` | Type inference, function-table hash, cross-module propagation |
 | `bpp_dispatch.bsm` | Loop classification |
-| `bpp_validate.bsm` | Semantic validation pass |
-| `bpp_emitter.bsm` | C code emitter |
+| `bpp_validate.bsm` | Semantic validation, builtin recognition, symbol-table hashes |
+| `bpp_emitter.bsm` | C code emitter, extern dedup, libc symbol skip |
 | `bpp_diag.bsm` | Diagnostic output to stderr |
-| `bpp_bo.bsm` | .bo cache file I/O for modular compilation |
-| `aarch64/a64_enc.bsm` | ARM64 instruction encoder |
-| `aarch64/a64_codegen.bsm` | ARM64 code generator |
-| `aarch64/a64_macho.bsm` | Mach-O writer + SHA-256 codesign |
-| `x86_64/x64_enc.bsm` | x86_64 instruction encoder |
-| `x86_64/x64_codegen.bsm` | x86_64 code generator |
-| `x86_64/x64_elf.bsm` | ELF writer (Linux static binaries) |
+| `bpp_bo.bsm` | `.bo` cache file I/O for modular compilation |
+| `bpp_bug.bsm` | `.bug` debug map writer |
+
+**Per-target backend (`src/aarch64/`, `src/x86_64/`):**
+
+Each chip folder is a complete target bundle: encoder + binary writer
++ syscall numbers + platform layer + bug observer for the OS currently
+paired with that chip. See the `README.md` in each folder for the
+chip+OS coupling note and the future split plan.
+
+| File | Purpose |
+|------|---------|
+| `a64_enc.bsm`, `x64_enc.bsm` | Instruction encoder (chip pure) |
+| `a64_macho.bsm`, `x64_elf.bsm` | Binary format writer (OS) |
+| `a64_codegen.bsm`, `x64_codegen.bsm` | AST → machine code (chip + OS syscalls) |
+| `_stb_platform_macos.bsm`, `_stb_platform_linux.bsm` | OS platform layer (window, GPU/X11, input) |
+| `bug_observe_macos.bsm`, `bug_observe_linux.bsm` | OS process observation for the debugger |
 
 ## The Debugger
 
@@ -851,16 +1045,5 @@ resolved after all modules are loaded.
 
 *B++ was designed and implemented by Daniel Obino, 2026.*
 *The compiler bootstrapped itself on March 20, 2026.*
-*Zero-dependency native compilation achieved on March 23, 2026.*
-*Native game rendering (Cocoa, no SDL/raylib) achieved on March 24, 2026.*
-*Compiler diagnostics (E001-E201, W001) completed on March 24, 2026.*
-*Type propagation bug fixed, x86_64/ELF backend started on March 25, 2026.*
-*Modular compilation (.bo cache, Go model) implemented on March 26, 2026.*
-*Dynamic array migration and type hints completed on March 26, 2026.*
-*.bo cache fix, compiler self-hash on March 30, 2026.*
-*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err on March 31, 2026.*
-*GPU rendering (Metal), Go-style cache, escape sequences on March 31, 2026.*
-*Cache overhaul (4 bugs), GPU render API, platform-agnostic trig on March 31, 2026.*
-*Arena allocator, Object Pool, ECS, Bug Debugger v2 on April 2, 2026.*
-*GPU text + pure B++ TrueType, Bell Labs realloc, PNG loader on April 3, 2026.*
-*GPU sprites (stbsprite.bsm), pure B++ sqrt, 3 critical .bo cache bugs fixed on April 5, 2026.*
+
+*See `docs/journal.md` for the full development chronology.*

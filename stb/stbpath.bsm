@@ -1,0 +1,438 @@
+// stbpath.bsm — Grid-based A* pathfinding for B++ games.
+//
+// Provides a PathFinder that searches a 2D grid for the shortest walkable
+// path between two cells using the A* algorithm with a Manhattan heuristic.
+// Cells are either walkable (0) or blocked (1). Movement is 4-directional
+// (up, down, left, right). Each step has unit cost.
+//
+// Pure B++. Zero dependencies. No floating point.
+//
+// Implementation notes:
+//   - Open list is a binary min-heap on f_score, with an indexed
+//     heap_pos array so decrease-key is O(log n) instead of pushing
+//     duplicate entries (no lazy deletion, no stale pops).
+//   - Total time complexity: O((w*h) * log(w*h)) per query.
+//   - Memory: ~33 bytes per cell. A 200x200 grid uses ~1.3 MB per
+//     PathFinder. For grids larger than ~500x500 you probably want
+//     sparse storage — see the planned stbpath_sparse module.
+//
+// Usage:
+//   import "stbpath.bsm";
+//
+//   auto pf;
+//   pf = path_new(40, 14);                  // grid 40 cells wide, 14 tall
+//   path_set_blocked(pf, 5, 3, 1);          // mark a wall
+//
+//   // Find a path from (1, 1) to (38, 12). Output buffer must be at
+//   // least max_steps * 16 bytes (each waypoint is 2 words = 16 bytes).
+//   auto out, count;
+//   out = malloc(256 * 16);
+//   count = path_find(pf, 1, 1, 38, 12, out, 256);
+//   if (count > 0) {
+//       // out[0..1] = first waypoint (gx, gy), out[2..3] = next, ...
+//       auto i;
+//       for (i = 0; i < count; i = i + 1) {
+//           print_int(out[i * 2]); print_char(' ');
+//           print_int(out[i * 2 + 1]); print_ln();
+//       }
+//   }
+//
+// Loading the grid from a stbtile.bsm Tilemap is intentionally NOT a
+// function in this module — keeping stbpath dependency-free lets puzzle
+// games, AI planners, and non-graphical tools use it without dragging
+// in the tilemap and image stack. Inline this 8-line snippet in your
+// game after creating the PathFinder:
+//
+//   auto gx, gy;
+//   gy = 0;
+//   while (gy < tm.h) {
+//       gx = 0;
+//       while (gx < tm.w) {
+//           path_set_blocked(pf, gx, gy,
+//               tile_is_solid(tm, tile_get(tm, gx, gy)));
+//           gx = gx + 1;
+//       }
+//       gy = gy + 1;
+//   }
+
+// ── PathFinder struct ───────────────────────────────────────
+
+// Per-cell scratch buffers are allocated once at path_new and reused
+// across queries by path_clear. All sizes are w*h.
+//
+// The open list is a binary min-heap stored as an array of cell indices.
+// `heap_pos[cell_idx]` is the position of that cell in the heap, or -1
+// if the cell is not currently in the heap. Maintaining this index lets
+// us perform decrease-key in O(log n) when relaxing a neighbor that
+// already has a worse score in the open list.
+struct PathFinder {
+    w, h,               // grid dimensions in cells
+    cells,              // w*h byte array: 0 = walkable, 1 = blocked
+    g_score,            // w*h word array: cost from start to this cell
+    f_score,            // w*h word array: g_score + manhattan(cell, goal)
+    came_from,          // w*h word array: previous cell index, -1 = none
+    heap,               // w*h word array: min-heap of cell indices by f_score
+    heap_pos,           // w*h word array: heap_pos[cell] = pos in heap, -1 if absent
+    heap_cnt,           // current heap size in entries
+    closed              // w*h byte array: 1 if cell has been finalized
+}
+
+// Sentinel value used in the g_score / f_score arrays to mean "infinity".
+// Any unvisited cell starts at this value so the first relaxation wins.
+const PATH_INF = 2000000000;
+
+// ── Module init ─────────────────────────────────────────────
+
+// Initialize the pathfinding module. Currently a no-op — kept for
+// symmetry with other stb modules.
+init_path() {
+    return 0;
+}
+
+// ── Lifecycle ───────────────────────────────────────────────
+
+// Allocate a new PathFinder for a grid of (w x h) cells.
+// All cells start walkable. Internal buffers are sized for the worst
+// case (heap can hold every cell at once).
+path_new(w, h) {
+    auto pf: PathFinder, n, i;
+    pf = malloc(sizeof(PathFinder));
+    pf.w = w;
+    pf.h = h;
+    n = w * h;
+
+    pf.cells     = malloc(n);            // 1 byte per cell
+    pf.g_score   = malloc(n * 8);
+    pf.f_score   = malloc(n * 8);
+    pf.came_from = malloc(n * 8);
+    pf.heap      = malloc(n * 8);
+    pf.heap_pos  = malloc(n * 8);
+    pf.closed    = malloc(n);
+    pf.heap_cnt  = 0;
+
+    // Zero the cell mask. Other buffers are reset by path_clear before
+    // each query, so leaving them uninitialized here is fine.
+    i = 0;
+    while (i < n) { poke(pf.cells + i, 0); i = i + 1; }
+    return pf;
+}
+
+// Free a PathFinder and all its associated scratch buffers.
+path_free(pf) {
+    auto p: PathFinder;
+    p = pf;
+    if (p.cells != 0)     { free(p.cells); }
+    if (p.g_score != 0)   { free(p.g_score); }
+    if (p.f_score != 0)   { free(p.f_score); }
+    if (p.came_from != 0) { free(p.came_from); }
+    if (p.heap != 0)      { free(p.heap); }
+    if (p.heap_pos != 0)  { free(p.heap_pos); }
+    if (p.closed != 0)    { free(p.closed); }
+    free(pf);
+    return 0;
+}
+
+// ── Cell access ─────────────────────────────────────────────
+
+// Mark a single cell as walkable (blocked = 0) or blocked (blocked = 1).
+// Out-of-bounds writes are silently ignored.
+path_set_blocked(pf, gx, gy, blocked) {
+    auto p: PathFinder;
+    p = pf;
+    if (gx < 0)     { return 0; }
+    if (gy < 0)     { return 0; }
+    if (gx >= p.w)  { return 0; }
+    if (gy >= p.h)  { return 0; }
+    poke(p.cells + gy * p.w + gx, blocked);
+    return 0;
+}
+
+// Query whether a cell is blocked. Returns 1 for blocked or out-of-bounds,
+// 0 for walkable.
+path_is_blocked(pf, gx, gy) {
+    auto p: PathFinder;
+    p = pf;
+    if (gx < 0)     { return 1; }
+    if (gy < 0)     { return 1; }
+    if (gx >= p.w)  { return 1; }
+    if (gy >= p.h)  { return 1; }
+    return peek(p.cells + gy * p.w + gx);
+}
+
+// ── Search internals ────────────────────────────────────────
+
+// Reset all per-query state: scores to infinity, came_from to -1,
+// heap and heap_pos cleared, closed set empty.
+path_clear(pf) {
+    auto p: PathFinder, n, i;
+    p = pf;
+    n = p.w * p.h;
+
+    i = 0;
+    while (i < n) {
+        p.g_score[i]   = PATH_INF;
+        p.f_score[i]   = PATH_INF;
+        p.came_from[i] = 0 - 1;
+        p.heap_pos[i]  = 0 - 1;
+        poke(p.closed + i, 0);
+        i = i + 1;
+    }
+    p.heap_cnt = 0;
+    return 0;
+}
+
+// Manhattan distance between two grid cells. Used as the A* heuristic
+// because movement is 4-directional with unit cost.
+_path_manhattan(ax, ay, bx, by) {
+    auto dx, dy;
+    dx = ax - bx;
+    if (dx < 0) { dx = 0 - dx; }
+    dy = ay - by;
+    if (dy < 0) { dy = 0 - dy; }
+    return dx + dy;
+}
+
+// ── Binary heap with indexed positions ──────────────────────
+
+// Swap two heap entries by position and update heap_pos for both cells.
+// Keeping heap_pos in sync after every swap is what makes decrease-key
+// possible without searching the heap linearly.
+_path_heap_swap(pf, i, j) {
+    auto p: PathFinder, ci, cj;
+    p = pf;
+    ci = p.heap[i];
+    cj = p.heap[j];
+    p.heap[i] = cj;
+    p.heap[j] = ci;
+    p.heap_pos[ci] = j;
+    p.heap_pos[cj] = i;
+    return 0;
+}
+
+// Move the entry at position i upward toward the root while its
+// f_score is less than its parent's. Stops when the heap property
+// is satisfied or the entry reaches the root.
+_path_heap_sift_up(pf, i) {
+    auto p: PathFinder, parent;
+    p = pf;
+    while (i > 0) {
+        parent = (i - 1) / 2;
+        if (p.f_score[p.heap[parent]] <= p.f_score[p.heap[i]]) { return 0; }
+        _path_heap_swap(pf, i, parent);
+        i = parent;
+    }
+    return 0;
+}
+
+// Move the entry at position i downward, swapping with the smaller
+// child while the heap property is violated. Stops when both children
+// have larger f_score or the entry has no children.
+_path_heap_sift_down(pf, i) {
+    auto p: PathFinder, n, left, right, smallest;
+    p = pf;
+    n = p.heap_cnt;
+    while (1) {
+        left = i * 2 + 1;
+        right = i * 2 + 2;
+        smallest = i;
+        if (left < n) {
+            if (p.f_score[p.heap[left]] < p.f_score[p.heap[smallest]]) {
+                smallest = left;
+            }
+        }
+        if (right < n) {
+            if (p.f_score[p.heap[right]] < p.f_score[p.heap[smallest]]) {
+                smallest = right;
+            }
+        }
+        if (smallest == i) { return 0; }
+        _path_heap_swap(pf, i, smallest);
+        i = smallest;
+    }
+    return 0;
+}
+
+// Append a cell index to the heap and sift it up to its correct
+// position. Assumes the cell is not already in the heap.
+_path_heap_push(pf, cell_idx) {
+    auto p: PathFinder, i;
+    p = pf;
+    i = p.heap_cnt;
+    p.heap[i] = cell_idx;
+    p.heap_pos[cell_idx] = i;
+    p.heap_cnt = p.heap_cnt + 1;
+    _path_heap_sift_up(pf, i);
+    return 0;
+}
+
+// Remove and return the cell index with the smallest f_score from the
+// heap. Caller must check heap_cnt > 0 first.
+_path_heap_pop_min(pf) {
+    auto p: PathFinder, root_idx, last_idx;
+    p = pf;
+    root_idx = p.heap[0];
+    p.heap_pos[root_idx] = 0 - 1;
+
+    p.heap_cnt = p.heap_cnt - 1;
+    if (p.heap_cnt > 0) {
+        last_idx = p.heap[p.heap_cnt];
+        p.heap[0] = last_idx;
+        p.heap_pos[last_idx] = 0;
+        _path_heap_sift_down(pf, 0);
+    }
+    return root_idx;
+}
+
+// Decrease-key: a neighbor's f_score has just been lowered, so its
+// position in the heap may need to move toward the root. Cheap because
+// heap_pos already tells us exactly where the entry lives.
+_path_heap_decrease_key(pf, cell_idx) {
+    auto p: PathFinder, pos;
+    p = pf;
+    pos = p.heap_pos[cell_idx];
+    if (pos < 0) { return 0; }
+    _path_heap_sift_up(pf, pos);
+    return 0;
+}
+
+// ── Search core ─────────────────────────────────────────────
+
+// Walk came_from backwards from the goal cell to the start. Waypoints
+// are written to out_buf (2 words each, gx then gy) and then reversed
+// in place so the caller iterates start -> goal.
+//
+// Returns the number of waypoints written, or 0 if the buffer would
+// overflow.
+_path_reconstruct(pf, goal_idx, out_buf, max_steps) {
+    auto p: PathFinder, count, idx, gx, gy, i, j, tmp_x, tmp_y;
+    p = pf;
+
+    count = 0;
+    idx = goal_idx;
+    while (idx >= 0) {
+        if (count >= max_steps) { return 0; }
+        gx = idx % p.w;
+        gy = idx / p.w;
+        out_buf[count * 2]     = gx;
+        out_buf[count * 2 + 1] = gy;
+        count = count + 1;
+        idx = p.came_from[idx];
+    }
+
+    // Reverse in place: out_buf currently runs goal -> start.
+    i = 0;
+    j = count - 1;
+    while (i < j) {
+        tmp_x = out_buf[i * 2];
+        tmp_y = out_buf[i * 2 + 1];
+        out_buf[i * 2]     = out_buf[j * 2];
+        out_buf[i * 2 + 1] = out_buf[j * 2 + 1];
+        out_buf[j * 2]     = tmp_x;
+        out_buf[j * 2 + 1] = tmp_y;
+        i = i + 1;
+        j = j - 1;
+    }
+    return count;
+}
+
+// Try to relax the edge from `cur_idx` to its neighbor at (nx, ny).
+// If the neighbor is in bounds, walkable, not closed, and the new
+// tentative g-score improves on the existing one, update its scores
+// and place it in the open heap (or move it up if already there).
+_path_relax(pf, cur_idx, nx, ny, gx, gy) {
+    auto p: PathFinder, n_idx, tentative;
+    p = pf;
+
+    if (nx < 0)    { return 0; }
+    if (ny < 0)    { return 0; }
+    if (nx >= p.w) { return 0; }
+    if (ny >= p.h) { return 0; }
+
+    n_idx = ny * p.w + nx;
+    if (peek(p.cells + n_idx))  { return 0; }   // blocked
+    if (peek(p.closed + n_idx)) { return 0; }   // already finalized
+
+    tentative = p.g_score[cur_idx] + 1;
+    if (tentative >= p.g_score[n_idx]) { return 0; }
+
+    p.came_from[n_idx] = cur_idx;
+    p.g_score[n_idx]   = tentative;
+    p.f_score[n_idx]   = tentative + _path_manhattan(nx, ny, gx, gy);
+
+    if (p.heap_pos[n_idx] < 0) {
+        _path_heap_push(pf, n_idx);
+    } else {
+        _path_heap_decrease_key(pf, n_idx);
+    }
+    return 0;
+}
+
+// ── Public search entry point ───────────────────────────────
+
+// Find a path from (sx, sy) to (gx, gy) on the PathFinder's grid.
+// Writes waypoints to out_buf as (gx, gy) word pairs, including both
+// start and goal cells. Returns the number of waypoints found, or 0
+// if no path exists or the buffer overflows.
+//
+// max_steps is the capacity of out_buf in waypoint count (so the
+// buffer must be at least max_steps * 16 bytes).
+//
+// The start and goal cells must be walkable. Out-of-bounds endpoints
+// return 0.
+path_find(pf, sx, sy, gx, gy, out_buf, max_steps) {
+    auto p: PathFinder, start_idx, goal_idx, cur_idx, cx, cy;
+    p = pf;
+
+    // Bounds check.
+    if (sx < 0)    { return 0; }
+    if (sy < 0)    { return 0; }
+    if (sx >= p.w) { return 0; }
+    if (sy >= p.h) { return 0; }
+    if (gx < 0)    { return 0; }
+    if (gy < 0)    { return 0; }
+    if (gx >= p.w) { return 0; }
+    if (gy >= p.h) { return 0; }
+
+    start_idx = sy * p.w + sx;
+    goal_idx  = gy * p.w + gx;
+
+    // Endpoints must be walkable.
+    if (peek(p.cells + start_idx)) { return 0; }
+    if (peek(p.cells + goal_idx))  { return 0; }
+
+    // Trivial case: already there.
+    if (start_idx == goal_idx) {
+        out_buf[0] = sx;
+        out_buf[1] = sy;
+        return 1;
+    }
+
+    path_clear(pf);
+
+    // Seed the open heap with the start cell.
+    p.g_score[start_idx] = 0;
+    p.f_score[start_idx] = _path_manhattan(sx, sy, gx, gy);
+    _path_heap_push(pf, start_idx);
+
+    while (p.heap_cnt > 0) {
+        cur_idx = _path_heap_pop_min(pf);
+
+        if (cur_idx == goal_idx) {
+            return _path_reconstruct(pf, goal_idx, out_buf, max_steps);
+        }
+
+        poke(p.closed + cur_idx, 1);
+
+        cx = cur_idx % p.w;
+        cy = cur_idx / p.w;
+
+        // 4-directional neighbors: right, left, down, up.
+        _path_relax(pf, cur_idx, cx + 1, cy,     gx, gy);
+        _path_relax(pf, cur_idx, cx - 1, cy,     gx, gy);
+        _path_relax(pf, cur_idx, cx,     cy + 1, gx, gy);
+        _path_relax(pf, cur_idx, cx,     cy - 1, gx, gy);
+    }
+
+    // Heap exhausted without reaching the goal.
+    return 0;
+}
