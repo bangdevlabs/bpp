@@ -1,0 +1,88 @@
+// test_maestro.bpp — Smoke test for bpp_maestro.bsm.
+// Verifies that:
+//   1. maestro_configure + register_* API populate the callback slots.
+//   2. maestro_run actually fires the callbacks in the right order
+//      (init → solo → base → render → ... → quit).
+//   3. The base phase can dispatch parallel work via job_parallel_for
+//      and see results when render runs.
+//
+// The test runs for a fixed number of ticks then calls sys_exit(0)
+// from the solo callback. This bypasses the clean shutdown path
+// (which is OK for a smoke test — Phase 1 commit 6 / snake_maestro
+// exercises the full teardown via window-close).
+//
+// Returns 0 on success. If something goes wrong before the tick
+// counter reaches its limit, the test exits with a non-zero code
+// from one of the callbacks.
+
+import "bpp_maestro.bsm";
+import "bpp_job.bsm";
+
+// Tick counter and ordering log (one byte per phase event).
+auto _tick, _max_ticks;
+auto _saw_init, _saw_solo, _saw_base, _saw_render;
+auto _base_results;
+
+// Base-phase worker. Each worker writes its index back into the
+// results buffer so render can verify they ran.
+test_base_worker(idx) {
+    *(_base_results + idx * 8) = idx + 100;
+    return 0;
+}
+
+test_init_phase() {
+    _saw_init = 1;
+    _base_results = malloc(8 * 8);
+    return 0;
+}
+
+test_solo_phase(dt) {
+    _saw_solo = _saw_solo + 1;
+    if (dt < 0) { sys_exit(11); }
+    if (_tick >= _max_ticks) {
+        // Sanity-check the order-tracking globals before exiting.
+        if (_saw_init != 1)              { sys_exit(20); }
+        if (_saw_solo < _max_ticks)      { sys_exit(21); }
+        if (_saw_base < _max_ticks)      { sys_exit(22); }
+        if (_saw_render < _max_ticks)    { sys_exit(23); }
+        sys_exit(0);
+    }
+    return 0;
+}
+
+test_base_phase(dt) {
+    auto i;
+    _saw_base = _saw_base + 1;
+    // Clear results, dispatch 8 jobs, wait will be called by maestro.
+    for (i = 0; i < 8; i = i + 1) { *(_base_results + i * 8) = 0; }
+    job_parallel_for(8, fn_ptr(test_base_worker));
+    return 0;
+}
+
+test_render_phase(dt) {
+    auto i;
+    _saw_render = _saw_render + 1;
+    // After base + maestro's auto job_wait_all, results must be ready.
+    for (i = 0; i < 8; i = i + 1) {
+        if (*(_base_results + i * 8) != i + 100) { sys_exit(30 + i); }
+    }
+    _tick = _tick + 1;
+    return 0;
+}
+
+main() {
+    _tick = 0;
+    _max_ticks = 5;
+    _saw_init = 0;
+    _saw_solo = 0;
+    _saw_base = 0;
+    _saw_render = 0;
+
+    maestro_configure(160, 90, "test_maestro", 60);
+    maestro_register_init(fn_ptr(test_init_phase));
+    maestro_register_solo(fn_ptr(test_solo_phase));
+    maestro_register_base(fn_ptr(test_base_phase));
+    maestro_register_render(fn_ptr(test_render_phase));
+    maestro_run();
+    return 0;
+}

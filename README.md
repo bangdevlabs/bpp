@@ -30,7 +30,7 @@ B++ is that alternate timeline.
 
 A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. No assembler. No linker. No external tools.
 
-But what if a Sean Barret later joined tha group with his STB all written in B++?
+But what if Sean Barret later joined tha group with his STB all written in B++?
 
 And now we have a standard library that is, itself, a game engine and is ready to ship!
 
@@ -603,7 +603,7 @@ SOFTWARE.
 
 *GPU Sprites + Module Cache Fix: stbsprite.bsm (any w×h), pure B++ sqrt, 3 critical .bo cache bugs fixed (param types + return types + null terminators), pathfinder game ported on April 5, 2026.*
 
-*B++ 2.0 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed on April 6, 2026.*
+*B++ 0.2 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed on April 6, 2026.*
 
 *B++ 0.21 — Linux X11, Validator Integration, C Emitter Modernized: X11 wire protocol Phases 1-3 (`_stb_platform_linux.bsm` 276 → 1160 lines, Unix socket + TCP, handshake, CreateWindow with FocusChangeMask, XPutImage, evdev/Apple keycode auto-detect, FocusOut stuck-key fix, WM_DELETE close, WM_NAME title), validator integrated into the incremental ARM64/x86_64 pipeline (was monolithic-only since written), E052 phantom check removed, `bpp_typeck.bsm` 507-line orphan deleted, C emitter modernized (8 builtins added, extern dedup with varargs, libc symbol skip), Snake running on Linux via Docker + XQuartz, raylib path verified end-to-end on April 6, 2026.*
 

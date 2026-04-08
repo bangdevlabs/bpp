@@ -1,0 +1,50 @@
+// test_thread.bpp — Calling-convention bridge test for pthread FFI.
+// This is the gate before stbjob can be built. It validates that:
+//   1. _stb_thread_create successfully starts a new thread.
+//   2. The new thread runs B++ code (the entry function) without
+//      corrupting registers or stack on the way in.
+//   3. The thread can write to a buffer the main thread allocated.
+//   4. _stb_thread_join blocks until the thread exits and the
+//      main thread sees the worker's writes after the join.
+//
+// If any of these fails, the B++ `long long(long long)` ABI is NOT
+// bit-compatible with pthread's `void*(void*)` ABI on this host and
+// the fix is to introduce an explicit trampoline (declare the entry
+// point via FFI with the matching signature). Returns 0 on success.
+
+import "stbgame.bsm";
+
+// Worker entry point. Receives a pointer to a buffer and writes a
+// known marker (42) into the first slot, then a sentinel (0xCAFE)
+// into the second slot. Returns 0 by B++ convention.
+worker_entry(arg) {
+    auto buf;
+    buf = arg;
+    *buf = 42;
+    *(buf + 8) = 0xCAFE;
+    return 0;
+}
+
+main() {
+    auto buf, tid, rc;
+
+    // Allocate a 16-byte buffer the worker will write into.
+    buf = malloc(16);
+    *buf = 0;
+    *(buf + 8) = 0;
+
+    // Spawn the worker.
+    tid = _stb_thread_create(fn_ptr(worker_entry), buf);
+    if (tid == 0) { free(buf); return 1; }
+
+    // Block until it finishes.
+    rc = _stb_thread_join(tid);
+    if (rc != 0) { free(buf); return 2; }
+
+    // Verify the worker wrote what we expected.
+    if (*buf != 42) { free(buf); return 3; }
+    if (*(buf + 8) != 0xCAFE) { free(buf); return 4; }
+
+    free(buf);
+    return 0;
+}

@@ -2,8 +2,8 @@
 // Reads a B++ source file, recursively resolves import "file.bpp" directives,
 // and writes the merged source into outbuf for the lexer to consume.
 
-import "defs.bsm";
-import "stbarray.bsm";
+import "bpp_defs.bsm";
+import "bpp_array.bsm";
 import "bpp_internal.bsm";
 
 // ── State ────────────────────────────────────────────────────
@@ -791,10 +791,31 @@ process_file(path_off, path_len) {
             // Use my_path (saved in fbuf stack) for dirname resolution.
             plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);
             if (plen > 0) {
+                // Save the resolved path before process_file recurses, because
+                // pathbuf is shared scratch — nested find_file calls inside
+                // process_file will overwrite it. We need the original path
+                // intact for the post-recursion mod_idx_by_hash lookup, otherwise
+                // the lookup misses and mod_idx_by_hash returns 0, mis-attributing
+                // every affected dep edge to module 0 (the entry file). This bug
+                // was latent until import trees got deep enough (e.g. stbmaestro
+                // → stbgame) to reliably clobber pathbuf during recursion.
+                auto saved_path, _spi;
+                saved_path = fbuf_top;
+                for (_spi = 0; _spi < plen; _spi = _spi + 1) {
+                    poke(fbuf + saved_path + _spi, peek(pathbuf + _spi));
+                }
+                fbuf_top = fbuf_top + plen;
+
                 process_file(pathbuf, plen);
+
                 // Record dependency edge: this module imports the resolved module.
                 dep_from = arr_push(dep_from, my_mod_idx);
-                dep_to = arr_push(dep_to, mod_idx_by_hash(pathbuf, plen));
+                dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + saved_path, plen));
+
+                // Restore fbuf stack so the next iteration's saved_path reuses
+                // the same slot instead of growing the stack on every import.
+                fbuf_top = saved_path;
+
                 // Track where module 0's content resumes after imports.
                 if (my_mod_idx == 0) { mod0_real_start = outbuf_len; }
             } else {

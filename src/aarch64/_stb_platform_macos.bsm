@@ -3,8 +3,8 @@
 // The developer never imports this file — stbgame.bsm imports it automatically.
 // When targeting a different OS, the compiler substitutes this file.
 
-import "stbbuf.bsm";
-import "stbstr.bsm";
+import "bpp_buf.bsm";
+import "bpp_str.bsm";
 
 import "objc" {
     ptr objc_getClass(char*);
@@ -24,6 +24,13 @@ import "System.B" {
     long mach_absolute_time();
     int mach_timebase_info(ptr);
     int usleep(int);
+    // pthread is part of libSystem on macOS — already linked, no
+    // additional flag needed. The third argument to pthread_create
+    // is the entry function pointer; the calling-convention bridge
+    // (B++ long long(long long) ↔ pthread void*(void*)) is verified
+    // by tests/test_thread.bpp before any worker pool code uses it.
+    int pthread_create(ptr, ptr, ptr, ptr);
+    int pthread_join(long, ptr);
 }
 
 // macOS virtual keycodes → stb Key enum slots.
@@ -251,6 +258,40 @@ _stb_get_time() {
     // Convert ticks to nanoseconds using timebase info, then to milliseconds.
     ns = ticks * _plt_time_numer / _plt_time_denom;
     return ns / 1000000;
+}
+
+// ── Threads (pthread wrappers) ───────────────────────────
+//
+// stbjob and stbmaestro use these wrappers instead of calling
+// pthread directly so the rest of the stb library stays
+// platform-agnostic. When ELF dynamic linking lands on Linux, the
+// linux platform layer will gain matching wrappers and stbjob
+// inherits Linux support with no library changes.
+//
+// _stb_thread_create takes a B++ function pointer and an argument,
+// allocates a slot for the pthread_t handle, calls pthread_create,
+// and returns the handle (or 0 on failure). The entry function
+// must have the B++ signature `long long(long long)` — the bridge
+// to pthread's `void*(void*)` is bit-compatible because both ABIs
+// pass the first argument in x0/rdi and the return in x0/rax for
+// one-arg/one-return functions. Validated by tests/test_thread.bpp.
+_stb_thread_create(start_fn, arg) {
+    auto tid_buf, rc, tid;
+    tid_buf = malloc(8);
+    *tid_buf = 0;
+    rc = pthread_create(tid_buf, 0, start_fn, arg);
+    if (rc != 0) { free(tid_buf); return 0; }
+    tid = *tid_buf;
+    free(tid_buf);
+    return tid;
+}
+
+// Block until the given thread exits and reap its resources.
+// Returns 0 on success, non-zero on error. The retval slot is
+// passed as NULL because B++ thread entry points return through
+// the B++ ABI (long long), not via pthread's void* slot.
+_stb_thread_join(tid) {
+    return pthread_join(tid, 0);
 }
 
 // Return 1 if the app should close.

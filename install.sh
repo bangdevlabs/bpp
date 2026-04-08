@@ -46,8 +46,45 @@ sudo cp /tmp/bug_install "$BIN_DIR/bug"
 sudo chmod 755 "$BIN_DIR/bug"
 rm -f /tmp/bug_install
 
-# Install compiler internal modules.
-sudo cp src/defs.bsm "$LIB_DIR/"
+# Clear stale .bsm files from every install dir before copying. Without
+# this, files that move between directories across releases (e.g. the
+# platform layer migrating from stb/ to aarch64/ in 0.21, or the runtime
+# modules migrating from stb/ to src/ in the smart-dispatch work) leave
+# behind ghost copies that find_file can pick up depending on cwd. The
+# install dirs are managed exclusively by install.sh, so wiping their
+# .bsm files is safe — anything legitimate gets re-copied below.
+sudo rm -f "$LIB_DIR"/*.bsm
+sudo rm -f "$STB_DIR"/*.bsm
+sudo rm -f "$DRV_DIR"/*.bsm
+sudo rm -f "$ARM64_DIR"/*.bsm
+sudo rm -f "$X64_DIR"/*.bsm
+
+# Install compiler internal modules and runtime modules. bpp_defs.bsm is
+# the constant table the compiler injects into every program. The other
+# bpp_*.bsm modules in src/ are core runtime / generic utilities that
+# live alongside the compiler internals because they are part of the
+# language, not optional libraries:
+#   bpp_array  — dynamic arrays with shadow header (used by compiler + games)
+#   bpp_buf    — raw buffer access for multi-byte reads/writes
+#   bpp_str    — null-terminated and dynamic string utilities
+#   bpp_hash   — open-addressing hash maps (Hash + HashStr flavors)
+#   bpp_beat   — universal monotonic clock
+#   bpp_job    — N×SPSC worker pool
+#   bpp_maestro — solo / base / render bandleader
+# bpp_beat / bpp_job / bpp_maestro are auto-injected when stbgame is
+# brought in. The others are imported explicitly by user programs that
+# want generic utilities.
+sudo cp src/bpp_defs.bsm "$LIB_DIR/"
+sudo cp src/bpp_array.bsm "$LIB_DIR/"
+sudo cp src/bpp_buf.bsm "$LIB_DIR/"
+sudo cp src/bpp_str.bsm "$LIB_DIR/"
+sudo cp src/bpp_hash.bsm "$LIB_DIR/"
+sudo cp src/bpp_io.bsm "$LIB_DIR/"
+sudo cp src/bpp_math.bsm "$LIB_DIR/"
+sudo cp src/bpp_file.bsm "$LIB_DIR/"
+sudo cp src/bpp_beat.bsm "$LIB_DIR/"
+sudo cp src/bpp_job.bsm "$LIB_DIR/"
+sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"

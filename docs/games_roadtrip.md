@@ -349,11 +349,139 @@ hour, and never thinks once about the language it was written in.
 
 ---
 
+## Open Architectural Questions
+
+The roadtrip has two blocking design questions that must be resolved
+before Game 1 is written. These are not implementation details — they
+are decisions about the shape of B++ itself, and they affect every
+game that follows.
+
+### Threading Model for Audio (BLOCKING Rhythm Teacher)
+
+B++ is single-threaded by design. CoreAudio (macOS) and ALSA (Linux)
+both call your audio callback from a realtime audio thread that the
+OS created. The callback has a hard deadline (typically 1–5 ms) and
+must not allocate memory, take locks, or do blocking syscalls. It
+must read audio samples from somewhere and copy them into a buffer
+the OS provides.
+
+The main thread needs to produce those samples (play a note, advance
+a song cursor, mix voices) and hand them off to the callback. That
+is a producer/consumer relationship across two threads.
+
+C and C++ solve this with a single-producer single-consumer lock-free
+ring buffer. The producer writes data, then advances a write index.
+The consumer reads up to the write index, then advances a read index.
+Aligned word-sized loads and stores are atomic at the hardware level
+on both ARM64 and x86_64. The only thing missing is a memory barrier
+between the data write and the index update — without it, the CPU
+can reorder and the consumer sees the new index before the data.
+
+**The minimum B++ needs** to support this pattern:
+
+1. **One new builtin**: `mem_barrier()`. Emits `DMB ISH` on ARM64,
+   `MFENCE` on x86_64. Five lines per codegen file.
+2. **Function pointers are already addresses**: `fn_ptr(callback)`
+   already returns the right thing for CoreAudio or ALSA to call. The
+   audio thread can execute B++ code as long as that code follows
+   audio callback rules (no malloc, no syscalls except the audio
+   output write).
+
+**The standard pattern** for `stbaudio.bsm` with this primitive:
+
+```bpp
+// Pre-allocated at init time. Size is a power of two so wrap is
+// just a bitmask — no modulo, no branch.
+auto _audio_ring;        // byte buffer, capacity = RING_SIZE
+auto _audio_read_idx;    // consumer (audio thread) advances this
+auto _audio_write_idx;   // producer (main thread) advances this
+
+// Main thread: produce samples by writing to the ring.
+audio_push(sample) {
+    auto next;
+    next = (_audio_write_idx + 1) & (RING_SIZE - 1);
+    if (next == _audio_read_idx) { return 0; }   // ring full
+    poke(_audio_ring + _audio_write_idx, sample);
+    mem_barrier();                                // data visible before index
+    _audio_write_idx = next;
+    return 1;
+}
+
+// Audio thread: CoreAudio/ALSA callback runs this. No malloc, no
+// syscalls (except the audio output write that the OS is already
+// doing for us).
+_audio_callback(out_buf, out_len) {
+    auto i;
+    for (i = 0; i < out_len; i = i + 1) {
+        if (_audio_read_idx == _audio_write_idx) {
+            poke(out_buf + i, 0);                 // underrun: silence
+        } else {
+            poke(out_buf + i, peek(_audio_ring + _audio_read_idx));
+            mem_barrier();                        // data consumed before index
+            _audio_read_idx = (_audio_read_idx + 1) & (RING_SIZE - 1);
+        }
+    }
+    return 0;
+}
+```
+
+This is the smallest addition to B++ that unblocks a professional
+audio module. Everything else the audio module needs is already in
+the language. The pattern generalizes: the same ring-buffer shape
+works for network I/O callbacks, worker-thread messages, and any
+other OS-threaded boundary B++ might meet later.
+
+**Alternative: polling only.** If `mem_barrier()` is too much to add
+for Rhythm Teacher, the fallback is to run audio entirely on the
+main thread and poll an audio syscall every frame. This caps audio
+latency to the frame time (~16 ms at 60 FPS), which works for most
+games but is borderline for a rhythm game. Real rhythm games expect
+5–10 ms total latency, reachable only with a proper callback thread.
+
+**The decision**: add `mem_barrier()` as a builtin before Game 1
+starts. It is the highest-leverage primitive addition possible —
+five lines of compiler code per backend unlock decades of lock-free
+concurrent programming patterns, and every audio / networking /
+worker-pool module that comes after inherits it for free.
+
+### CI and regression catching (BLOCKING everything beyond Game 1)
+
+Today the 52-test suite passes because the maintainer remembers to
+run it. This worked for 0.21 because the maintainer wrote most of it
+in one head. As the roadtrip grows (5+ new modules during Rhythm
+Teacher alone, many more later), regression catching-in-the-head
+stops scaling.
+
+**The minimum setup** that buys a lot:
+
+1. A single shell script `tests/run_all.sh` that compiles and runs
+   every `tests/test_*.bpp` and reports `52/52 passing` or lists
+   failures. This already exists in the README as a snippet — move
+   it into a committed file.
+2. The script runs at the end of every bootstrap cycle in
+   `install.sh`, so installation itself is gated on tests passing.
+3. Optional: a Git pre-push hook that runs the script. Manual but
+   cheap to add.
+4. Later: a GitHub Actions workflow that runs the same script on
+   macOS and Ubuntu runners on every push and PR.
+
+**Not in scope for the roadtrip**: elaborate CI infrastructure, test
+coverage reporting, benchmark tracking. The goal is "don't regress
+silently between games", not "solve testing as a discipline".
+
+**The decision**: `tests/run_all.sh` + `install.sh` integration
+before Rhythm Teacher ships. GitHub Actions whenever the project
+goes public.
+
+---
+
 ## Status
 
 | Milestone | State | Date |
 |---|---|---|
 | B++ 0.21 | shipped | 2026-04-06 |
+| `mem_barrier()` builtin | pending (blocks Game 1 threading) | — |
+| `tests/run_all.sh` + install.sh gate | pending (blocks Game 1 regression safety) | — |
 | Rhythm Teacher | not started | — |
 | Wolf3D Phase 1 | not started | — |
 | Wolf3D Phase 2 | not started | — |

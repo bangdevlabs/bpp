@@ -1,0 +1,286 @@
+// bpp_job.bsm — Worker pool with N independent SPSC queues.
+//
+// Core runtime, not a stb library. Auto-injected by the compiler when
+// stbgame is brought into a program (alongside the platform layer,
+// bpp_beat, and bpp_maestro). Programs that want explicit job control
+// without going through maestro can also import "bpp_job.bsm" directly.
+//
+// bpp_job spins up N OS threads at init time and gives each one its
+// own private SPSC (single-producer, single-consumer) ring buffer.
+// The main thread is the only producer for every queue; each worker
+// is the only consumer of its own queue. Submission is round-robin:
+// each call to job_submit advances a counter and pushes onto the
+// next worker's queue.
+//
+// Why N queues instead of one shared queue: a single shared queue
+// would be SPMC (single-producer, multi-consumer), and SPMC requires
+// CAS to prevent two workers from popping the same job. With one
+// queue per worker, every queue has exactly one writer and one
+// reader, so a memory barrier is sufficient. No CAS, no contention,
+// no work-stealing — load balance is round-robin and that's it.
+// Work-stealing is documented future work for the day a real game
+// proves it matters.
+//
+// Memory ordering: every queue operation that crosses the producer/
+// consumer boundary is sandwiched between mem_barrier() calls.
+// mem_barrier() is a full bidirectional fence (DMB ISH on ARM64,
+// MFENCE on x86_64), which is overkill compared to release/acquire,
+// but acquire/release primitives can wait until a real audio hot
+// loop proves they matter.
+//
+// Usage:
+//   // Auto-injected if your program imports stbgame. Otherwise:
+//   import "bpp_job.bsm";
+//
+//   worker_task(idx) { ... }   // pure, called from a worker thread
+//
+//   main() {
+//       job_init(4);                          // 4 worker threads
+//       job_submit(fn_ptr(worker_task), 0);
+//       job_submit(fn_ptr(worker_task), 1);
+//       job_submit(fn_ptr(worker_task), 2);
+//       job_wait_all();                       // block until done
+//       job_shutdown();                       // join all workers
+//       return 0;
+//   }
+//
+// bpp_job depends on stbgame for the platform layer that exposes
+// _stb_thread_create / _stb_thread_join / sys_usleep. This coupling
+// is consistent with bpp_beat — both runtime modules currently rely
+// on the platform layer being injected via stbgame's hook.
+
+import "stbgame.bsm";
+
+// Per-worker state. The ring buffer slots live in queue_buf and
+// each slot is 16 bytes (fn_ptr + arg). head is the producer index
+// (written only by main), tail is the consumer index (written only
+// by the worker). submit_count and done_count are bookkeeping that
+// job_wait_all uses to know when every submitted job has finished
+// executing — submit_count is only written by main, done_count is
+// only written by the worker, so neither has multi-writer races.
+struct Worker {
+    tid,
+    queue_buf,
+    head,
+    tail,
+    capacity,
+    submit_count,
+    done_count
+}
+
+// Slot size in bytes. Each slot stores (fn_ptr, arg) — 8 + 8.
+auto _JOB_SLOT_SIZE;
+
+// Default per-worker queue depth. 64 slots is plenty for snake-rate
+// workloads (~10 jobs per frame, 600 per second). Audio mixers that
+// submit at 44.1 kHz will want larger queues — that's a future tune.
+auto _JOB_DEFAULT_CAPACITY;
+
+// Pool state.
+auto _job_n_workers;
+auto _job_workers;       // array of Worker pointers, length _job_n_workers
+auto _job_next;          // round-robin submit counter
+auto _job_inited;
+
+// Worker thread entry point. Receives a Worker* in arg and runs the
+// pop-execute-advance loop forever, until it sees a shutdown sentinel
+// (fn_ptr = 0) at which point it returns.
+_job_worker_main(arg) {
+    auto w: Worker, head, tail, slot, fn, job_arg, next_tail;
+
+    w = arg;
+
+    while (1) {
+        // Wait for the queue to have something to do. Acquire-fence
+        // before each peek so we see the producer's writes.
+        while (1) {
+            mem_barrier();
+            head = w.head;
+            tail = w.tail;
+            if (head != tail) { break; }
+            // Queue empty — yield briefly to avoid burning a core.
+            // 100 microseconds is small enough to keep latency low
+            // and large enough to let the OS schedule other work.
+            sys_usleep(100);
+        }
+
+        // Pop one slot.
+        slot = w.queue_buf + (tail * _JOB_SLOT_SIZE);
+        fn = *slot;
+        job_arg = *(slot + 8);
+
+        // Sentinel: a fn_ptr of 0 means "shut down". Acknowledge by
+        // advancing tail (so the producer's wait knows we processed
+        // it) and exit. Bump done_count so wait_all is consistent.
+        if (fn == 0) {
+            next_tail = (tail + 1) % w.capacity;
+            mem_barrier();
+            w.tail = next_tail;
+            w.done_count = w.done_count + 1;
+            mem_barrier();
+            return 0;
+        }
+
+        // Execute the job. The worker is on its own thread so any
+        // syscalls or pure work the job does are isolated from the
+        // main thread.
+        call(fn, job_arg);
+
+        // Mark complete. Advance tail (so the producer can reuse the
+        // slot) and bump done_count (so wait_all knows progress).
+        next_tail = (tail + 1) % w.capacity;
+        mem_barrier();
+        w.tail = next_tail;
+        w.done_count = w.done_count + 1;
+        mem_barrier();
+    }
+    return 0;
+}
+
+// Initialize the worker pool. Spawns n_workers OS threads, each with
+// its own SPSC queue. Idempotent — calling twice is a no-op.
+job_init(n_workers) {
+    auto i, w: Worker;
+
+    if (_job_inited != 0) { return 0; }
+
+    _JOB_SLOT_SIZE = 16;
+    _JOB_DEFAULT_CAPACITY = 64;
+
+    _job_n_workers = n_workers;
+    _job_workers = malloc(n_workers * 8);
+    _job_next = 0;
+
+    for (i = 0; i < n_workers; i = i + 1) {
+        w = malloc(sizeof(Worker));
+        w.queue_buf = malloc(_JOB_DEFAULT_CAPACITY * _JOB_SLOT_SIZE);
+        w.head = 0;
+        w.tail = 0;
+        w.capacity = _JOB_DEFAULT_CAPACITY;
+        w.submit_count = 0;
+        w.done_count = 0;
+        _job_workers[i] = w;
+        // Spawn the OS thread last so the worker's struct is fully
+        // initialized before the worker can read it.
+        mem_barrier();
+        w.tid = _stb_thread_create(fn_ptr(_job_worker_main), w);
+    }
+
+    _job_inited = 1;
+    return 0;
+}
+
+// Submit one job to the next worker (round-robin). Returns 0 on
+// success, non-zero if the chosen queue is full (rare — only happens
+// if the producer outruns the consumer for 64 slots in a row).
+job_submit(fn, arg) {
+    auto idx, w: Worker, head, tail, next_head, slot;
+
+    if (_job_inited == 0) { return 1; }
+    if (fn == 0) { return 2; }   // 0 is the shutdown sentinel
+
+    idx = _job_next % _job_n_workers;
+    _job_next = _job_next + 1;
+    w = _job_workers[idx];
+
+    // Wait for a free slot. SPSC: producer-side reads of tail need
+    // an acquire fence so we see the worker's most recent advance.
+    while (1) {
+        mem_barrier();
+        head = w.head;
+        tail = w.tail;
+        next_head = (head + 1) % w.capacity;
+        if (next_head != tail) { break; }
+        // Queue is full. Yield briefly and re-check.
+        sys_usleep(50);
+    }
+
+    // Write payload, then publish the new head with a release fence.
+    slot = w.queue_buf + (head * _JOB_SLOT_SIZE);
+    *slot = fn;
+    *(slot + 8) = arg;
+    mem_barrier();
+    w.head = next_head;
+    w.submit_count = w.submit_count + 1;
+
+    return 0;
+}
+
+// Block until every submitted job has finished executing on every
+// worker. Polls submit_count vs done_count per worker, with a brief
+// usleep between rounds to avoid burning a CPU.
+job_wait_all() {
+    auto i, w: Worker, all_done;
+
+    if (_job_inited == 0) { return 0; }
+
+    all_done = 0;
+    while (all_done == 0) {
+        all_done = 1;
+        for (i = 0; i < _job_n_workers; i = i + 1) {
+            w = _job_workers[i];
+            mem_barrier();
+            if (w.done_count != w.submit_count) { all_done = 0; }
+        }
+        if (all_done == 0) { sys_usleep(50); }
+    }
+    return 0;
+}
+
+// Submit n jobs and wait for them to complete. Each job receives
+// its index (0..n-1) as the argument. The workhorse for parallel-for
+// patterns: split a loop body into a function and call this.
+job_parallel_for(n, fn) {
+    auto i;
+    if (_job_inited == 0) { return 0; }
+    for (i = 0; i < n; i = i + 1) {
+        job_submit(fn, i);
+    }
+    job_wait_all();
+    return 0;
+}
+
+// Send the shutdown sentinel to every worker and join their threads.
+// After this returns, the worker pool is gone — call job_init again
+// before submitting more jobs.
+job_shutdown() {
+    auto i, w: Worker, head, tail, next_head, slot;
+
+    if (_job_inited == 0) { return 0; }
+
+    // Push a sentinel onto every worker's queue. Don't go through
+    // job_submit because that uses round-robin and we want to be
+    // sure each worker gets exactly one shutdown signal.
+    for (i = 0; i < _job_n_workers; i = i + 1) {
+        w = _job_workers[i];
+        // Wait for room in this worker's queue.
+        while (1) {
+            mem_barrier();
+            head = w.head;
+            tail = w.tail;
+            next_head = (head + 1) % w.capacity;
+            if (next_head != tail) { break; }
+            sys_usleep(50);
+        }
+        slot = w.queue_buf + (head * _JOB_SLOT_SIZE);
+        *slot = 0;             // sentinel
+        *(slot + 8) = 0;
+        mem_barrier();
+        w.head = next_head;
+        w.submit_count = w.submit_count + 1;
+    }
+
+    // Join every worker thread.
+    for (i = 0; i < _job_n_workers; i = i + 1) {
+        w = _job_workers[i];
+        _stb_thread_join(w.tid);
+        free(w.queue_buf);
+        free(w);
+    }
+
+    free(_job_workers);
+    _job_workers = 0;
+    _job_n_workers = 0;
+    _job_inited = 0;
+    return 0;
+}

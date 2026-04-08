@@ -1,0 +1,51 @@
+// test_barrier.bpp — Smoke test for the mem_barrier() builtin.
+// This test runs entirely on the main thread, so it cannot validate
+// inter-thread ordering — that needs test_thread.bpp once pthread
+// FFI lands. What it CAN check:
+//   1. mem_barrier() compiles and links.
+//   2. mem_barrier() returns 0 by convention.
+//   3. mem_barrier() does not corrupt surrounding values when used
+//      in a single-threaded ring-buffer style sequence.
+// Returns 0 on success.
+
+main() {
+    auto buf, head, tail, i, val, rc;
+
+    // Allocate a 16-slot ring buffer.
+    buf = malloc(16 * 8);
+    head = 0;
+    tail = 0;
+
+    // Producer-side write with a barrier afterwards (simulating the
+    // pattern stbjob will use: store payload, barrier, advance head).
+    *(buf + head * 8) = 42;
+    rc = mem_barrier();
+    if (rc != 0) { return 1; }
+    head = head + 1;
+
+    // Consumer-side read with a barrier before the load (the matching
+    // stbjob pattern: load head, barrier, load payload).
+    if (head == tail) { return 2; }   // ring is empty (would be a bug)
+    rc = mem_barrier();
+    if (rc != 0) { return 3; }
+    val = *(buf + tail * 8);
+    if (val != 42) { return 4; }
+    tail = tail + 1;
+
+    // Push a sequence of values, drain them, and verify FIFO ordering
+    // (with barriers between every push and every pop).
+    for (i = 0; i < 8; i = i + 1) {
+        *(buf + head * 8) = i * 10;
+        mem_barrier();
+        head = head + 1;
+    }
+    for (i = 0; i < 8; i = i + 1) {
+        mem_barrier();
+        val = *(buf + tail * 8);
+        if (val != i * 10) { return 5; }
+        tail = tail + 1;
+    }
+
+    free(buf);
+    return 0;
+}

@@ -1,9 +1,9 @@
 // bpp_parser.bsm — B++ parser module for the unified compiler.
 // Converts token stream into AST.
 
-import "defs.bsm";
-import "stbarray.bsm";
-import "stbhash.bsm";
+import "bpp_defs.bsm";
+import "bpp_array.bsm";
+import "bpp_hash.bsm";
 import "bpp_internal.bsm";
 import "bpp_diag.bsm";
 
@@ -15,6 +15,14 @@ auto vbuf, vbuf_pos;
 
 // Program structure collected during parsing.
 auto globals, glob_cnt;
+// 1 if the global was declared with the `global` keyword (shared with
+// worker threads, dispatchable from auto-parallelized loops); 0 if it
+// was declared with `auto` at file scope (legacy / main-thread-only,
+// conservative default that the auto-dispatch pass refuses to touch).
+// Both forms produce the same runtime layout — the difference is purely
+// a static intent flag that smart dispatch consults to decide whether
+// a loop touching the global is safe to fan out across workers.
+auto glob_shared;
 auto externs, ext_cnt;
 auto funcs, func_cnt;
 
@@ -67,6 +75,7 @@ init_parser() {
     tok_pos = 0;
     globals = arr_new();
     glob_cnt = 0;
+    glob_shared = arr_new();
     externs = arr_new();
     ext_cnt = 0;
     funcs = arr_new();
@@ -451,11 +460,16 @@ tok_mod(tidx) { return mod_idx(tok_src_off[tidx]); }
 // Parser: top-level structures
 // ============================================================
 
-// Register a global variable name.
-add_global(p) {
+// Register a global variable name. The is_shared flag tags whether
+// the declaration came from `global x;` (1, dispatchable across workers)
+// or from `auto x;` at file scope (0, conservative main-thread-only).
+// Cached globals loaded from .bo files default to 0 until the cache
+// format learns to round-trip the flag in a follow-up commit.
+add_global(p, is_shared) {
     globals = arr_push(globals, p);
     glob_cnt = arr_len(globals);
     glob_mods = arr_push(glob_mods, tok_mod(tok_pos));
+    glob_shared = arr_push(glob_shared, is_shared);
     return 0;
 }
 
@@ -547,21 +561,25 @@ try_type_annotation(var_p) {
     return 0;
 }
 
-// Parse a top-level "auto x, y, z;" global declaration.
+// Parse a top-level "auto x, y, z;" or "global x, y, z;" declaration.
 // Supports per-variable type hints: auto x: float, y: byte;
 // Float hints register the global as TY_FLOAT for correct codegen.
-parse_global() {
+// is_shared = 0 for `auto` (legacy / serialized), 1 for `global`
+// (multi-thread shared, dispatchable). The flag is forwarded to
+// add_global so the smart-dispatch pass can later decide whether a
+// loop touching the variable is safe to fan out across workers.
+parse_global(is_shared) {
     auto var_p;
     consume();
     var_p = cur_packed();
-    add_global(var_p);
+    add_global(var_p, is_shared);
     consume();
     try_type_annotation(var_p);
     if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
     while (val_is_ch(';') == 0) {
         if (val_is_ch(',')) { consume(); }
         var_p = cur_packed();
-        add_global(var_p);
+        add_global(var_p, is_shared);
         consume();
         try_type_annotation(var_p);
         if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
@@ -572,7 +590,10 @@ parse_global() {
 
 // Parse a bare global identifier followed by optional semicolon.
 parse_global_simple() {
-    add_global(cur_packed());
+    // Shorthand "x;" at file scope. No keyword, no type annotation.
+    // Treated as legacy/serialized — the explicit `global` keyword is
+    // the only path that opts the variable into worker visibility.
+    add_global(cur_packed(), 0);
     consume();
     if (val_is_ch(';')) { consume(); }
     return 0;
@@ -987,7 +1008,9 @@ parse_program() {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global();
+                parse_global(0);
+            } else if (val_is("global", 6)) {
+                parse_global(1);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
@@ -1019,7 +1042,9 @@ parse_module(tok_end) {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global();
+                parse_global(0);
+            } else if (val_is("global", 6)) {
+                parse_global(1);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {

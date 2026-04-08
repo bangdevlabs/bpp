@@ -1,0 +1,331 @@
+// snake_maestro.bpp — Snake on the maestro pattern.
+//
+// Functionally identical to snake_gpu.bpp (same gameplay, same sprites,
+// same scoring, same particles), but reorganized into the solo / base /
+// render phases that bpp_maestro orchestrates. This is the FIRST B++
+// game to run on real worker threads — proof that the maestro pattern
+// works end-to-end on a real game loop, not just a synthetic test.
+//
+// Phase responsibilities:
+//   solo   — input, snake state mutation, collision detection
+//   base   — particle physics, dispatched to a worker thread
+//   render — all GPU draw calls
+//
+// Why the base phase only does particles: snake's per-frame workload
+// is tiny, and the snake state itself has tight serial dependencies
+// (each cell follows the previous, head moves once per tick). The
+// particle system is the only piece with naturally parallel work, and
+// even then snake spawns just 8-16 particles at once. The point of
+// running it on a worker is to PROVE the architecture works, not to
+// extract speedup — the next game (rhythm teacher) will have audio
+// mixing that actually justifies the workers.
+//
+// snake_gpu.bpp stays untouched alongside this file as the baseline
+// for visual validation: side-by-side runs must look and feel identical.
+
+import "bpp_maestro.bsm";
+import "bpp_job.bsm";
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "bpp_io.bsm";
+import "stbecs.bsm";
+import "stbarena.bsm";
+import "stbpool.bsm";
+
+// ── Compile-time constants ──────────────────────────────────
+
+const W = 320;
+const H = 180;
+const CELL = 10;
+const GRID_W = W / CELL;
+const GRID_H = H / CELL;
+const MAX_BODY = 500;
+const FPS = 10;
+const N_WORKERS = 4;
+
+const DIR_UP = 0;
+const DIR_RIGHT = 1;
+const DIR_DOWN = 2;
+const DIR_LEFT = 3;
+
+// ── Game state ──────────────────────────────────────────────
+
+auto world;
+auto frame_arena;
+
+auto head_x, head_y;
+auto body, body_len;
+auto facing, dead, score;
+auto apple_x, apple_y;
+
+auto scores, num_scores, score_saved;
+
+// Cached dt for the base-phase particle worker. The base phase function
+// doesn't see dt directly (job_submit only carries one arg slot), so the
+// solo phase stashes it here before the base callback fires.
+auto _last_dt;
+
+// ── Helpers ─────────────────────────────────────────────────
+
+randomize_apple() {
+    apple_x = randi(GRID_W) * CELL;
+    apple_y = randi(GRID_H) * CELL;
+    return 0;
+}
+
+shift_body() {
+    auto i;
+    i = body_len;
+    while (i > 0) {
+        body[i * 2] = body[(i - 1) * 2];
+        body[i * 2 + 1] = body[(i - 1) * 2 + 1];
+        i = i - 1;
+    }
+    return 0;
+}
+
+// ── Particle system ─────────────────────────────────────────
+
+spawn_particles(px, py, count, color) {
+    auto i, id;
+    for (i = 0; i < count; i = i + 1) {
+        id = ecs_spawn(world);
+        if (id >= 0) {
+            ecs_set_pos(world, id, px * 1000, py * 1000);
+            ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
+            ecs_set_flags(world, id, color * 256 + 30);
+        }
+    }
+    return 0;
+}
+
+// Worker job — runs on a worker thread during the base phase. Updates
+// particle physics (one ecs_physics call) and then iterates the pool
+// to decrement each particle's life byte and cull the dead ones.
+// Pure work over the global ECS world; no main-thread state is touched
+// while the job runs because the maestro loop is parked at base→wait.
+particle_base_job(_arg) {
+    auto i, cap, flags, life;
+    cap = ecs_capacity(world);
+    ecs_physics(world, _last_dt);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            life = flags & 0xFF;
+            if (life <= 0) {
+                ecs_kill(world, i);
+            } else {
+                // Decrement only the life byte. Subtracting 1 is safe
+                // because life > 0 here, so no underflow into color bits.
+                ecs_set_flags(world, i, flags - 1);
+            }
+        }
+    }
+    return 0;
+}
+
+// Render-side particle pass: walk the live ECS slots and emit one
+// render_rect per particle. Runs on the main thread during render.
+draw_particles() {
+    auto i, cap, flags, px, py, color;
+    cap = ecs_capacity(world);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            px = ecs_get_x(world, i) / 1000;
+            py = ecs_get_y(world, i) / 1000;
+            color = flags >> 8;
+            render_rect(px, py, 3, 3, color);
+        }
+    }
+    return 0;
+}
+
+// ── Init / Reset ────────────────────────────────────────────
+
+init_game() {
+    head_x = W / 2;
+    head_y = H / 2;
+    body_len = 3;
+    facing = DIR_RIGHT;
+    score = 0;
+    dead = 0;
+    score_saved = 0;
+
+    auto i;
+    for (i = 0; i < MAX_BODY * 2; i = i + 1) {
+        body[i] = 0;
+    }
+
+    randomize_apple();
+    return 0;
+}
+
+// ── Ranking ─────────────────────────────────────────────────
+
+add_score(s) {
+    auto i, j, pos, cur;
+    pos = num_scores;
+    for (i = 0; i < num_scores; i = i + 1) {
+        cur = scores[i];
+        if (s > cur) { if (pos == num_scores) { pos = i; } }
+    }
+    if (num_scores < 5) { num_scores = num_scores + 1; }
+    j = num_scores - 1;
+    while (j > pos) {
+        scores[j] = scores[j - 1];
+        j = j - 1;
+    }
+    if (pos < 5) { scores[pos] = s; }
+    return 0;
+}
+
+// ── Maestro phase callbacks ─────────────────────────────────
+
+// Init phase — runs once before the loop. Allocates world, body, ranking
+// buffer, then sets up the first level via init_game().
+snake_init_phase() {
+    render_init();
+    world = ecs_new(200);
+    frame_arena = arena_new(4096);
+    body = malloc(MAX_BODY * 2 * 8);
+    scores = malloc(40);
+    num_scores = 0;
+    init_game();
+    return 0;
+}
+
+// Solo phase — runs every tick on the main thread. Reads input, mutates
+// snake state, advances head, checks collisions. This is the part that
+// MUST stay sequential because snake's update has tight ordering: input
+// → direction → move → collide → death.
+snake_solo_phase(dt) {
+    auto i, bx, by;
+
+    arena_reset(frame_arena);
+    _last_dt = dt;
+
+    if (key_pressed(KEY_ESC)) { sys_exit(0); }
+
+    if (dead) {
+        if (score_saved == 0) { add_score(score); score_saved = 1; }
+        if (key_pressed(KEY_SPACE)) { init_game(); }
+        return 0;
+    }
+
+    if (key_down(KEY_UP))    { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
+    if (key_down(KEY_RIGHT)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
+    if (key_down(KEY_DOWN))  { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
+    if (key_down(KEY_LEFT))  { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+
+    if (key_down(KEY_W)) { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
+    if (key_down(KEY_D)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
+    if (key_down(KEY_S)) { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
+    if (key_down(KEY_A)) { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+
+    shift_body();
+    body[0] = head_x;
+    body[1] = head_y;
+
+    if (facing == DIR_UP)    { head_y = head_y - CELL; }
+    if (facing == DIR_RIGHT) { head_x = head_x + CELL; }
+    if (facing == DIR_DOWN)  { head_y = head_y + CELL; }
+    if (facing == DIR_LEFT)  { head_x = head_x - CELL; }
+
+    if (head_x < 0)  { dead = 1; }
+    if (head_x >= W) { dead = 1; }
+    if (head_y < 0)  { dead = 1; }
+    if (head_y >= H) { dead = 1; }
+
+    if (head_x == apple_x) {
+        if (head_y == apple_y) {
+            score = score + 1;
+            body_len = body_len + 1;
+            spawn_particles(apple_x, apple_y, 8, YELLOW);
+            randomize_apple();
+        }
+    }
+
+    for (i = 0; i < body_len; i = i + 1) {
+        bx = body[i * 2];
+        by = body[i * 2 + 1];
+        if (head_x == bx) {
+            if (head_y == by) {
+                dead = 1;
+                spawn_particles(head_x, head_y, 16, RED);
+            }
+        }
+    }
+    return 0;
+}
+
+// Base phase — dispatches the particle update to a worker thread, then
+// returns. Maestro auto-calls job_wait_all() after this returns, so by
+// the time render runs the particle state is fully advanced.
+snake_base_phase(dt) {
+    job_submit(fn_ptr(particle_base_job), 0);
+    return 0;
+}
+
+// Render phase — runs every tick on the main thread after base+wait.
+// Submits all GPU draw commands. Reads particle positions that the base
+// phase already finished updating.
+snake_render_phase(dt) {
+    auto i;
+
+    render_begin();
+    render_clear(DARKGRAY);
+
+    // Apple.
+    render_rect(apple_x, apple_y, CELL - 1, CELL - 1, RED);
+
+    // Body.
+    for (i = 0; i < body_len; i = i + 1) {
+        render_rect(body[i * 2], body[i * 2 + 1], CELL - 1, CELL - 1, GREEN);
+    }
+
+    // Head.
+    if (dead) { render_rect(head_x, head_y, CELL - 1, CELL - 1, RED); }
+    else { render_rect(head_x, head_y, CELL - 1, CELL - 1, WHITE); }
+
+    // Particles (results of base phase).
+    draw_particles();
+
+    // HUD.
+    render_text("SCORE", 4, 4, 1, WHITE);
+    render_number(50, 4, 1, WHITE, score);
+
+    if (dead) {
+        render_rect(80, 50, 160, 80, BLACK);
+        render_text("GAME OVER", 104, 58, 1, WHITE);
+        render_text("RANKING", 116, 74, 1, YELLOW);
+        for (i = 0; i < num_scores; i = i + 1) {
+            render_number(100, 88 + i * 10, 1, WHITE, i + 1);
+            render_text(".", 108, 88 + i * 10, 1, WHITE);
+            render_number(120, 88 + i * 10, 1, GREEN, scores[i]);
+        }
+        render_text("SPACE restart", 96, 122, 1, GRAY);
+    }
+
+    render_end();
+    return 0;
+}
+
+snake_quit_phase() {
+    arena_free(frame_arena);
+    return 0;
+}
+
+// ── Main ────────────────────────────────────────────────────
+
+main() {
+    maestro_configure(W, H, "B++ Snake Maestro", FPS);
+    maestro_set_workers(N_WORKERS);
+    maestro_register_init(fn_ptr(snake_init_phase));
+    maestro_register_solo(fn_ptr(snake_solo_phase));
+    maestro_register_base(fn_ptr(snake_base_phase));
+    maestro_register_render(fn_ptr(snake_render_phase));
+    maestro_register_quit(fn_ptr(snake_quit_phase));
+    maestro_run();
+    return 0;
+}

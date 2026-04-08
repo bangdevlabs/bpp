@@ -1,0 +1,77 @@
+// test_job.bpp — Smoke + stress test for bpp_job.bsm.
+// Verifies the worker pool can:
+//   1. Initialize 4 workers without crashing.
+//   2. Run 100 trivial jobs and complete all of them.
+//   3. Stress-test with 10000 jobs to exercise queue wraparound.
+//   4. Shut down cleanly via the sentinel-and-join path.
+//
+// Each test job adds its argument to a shared accumulator. Because
+// multiple workers update the accumulator concurrently, the accumulator
+// itself uses an atomic-via-mem_barrier pattern: each worker reads the
+// current value, computes the new value, and stores it back. This
+// would race in general, but the accumulator is only used as a
+// "did the work happen" signal in this test, not as a precise sum.
+//
+// Returns 0 on success.
+
+import "bpp_job.bsm";
+
+// Counters incremented by jobs. Each worker thread adds 1 to its
+// own slot, indexed by the job argument (which we use as worker_id).
+auto _slot_buf;
+
+// Job body: increment the slot indexed by `idx`. Each slot is owned
+// by exactly one job in this test, so there's no race even though
+// the slot lives in shared memory.
+test_job_body(idx) {
+    *(_slot_buf + idx * 8) = *(_slot_buf + idx * 8) + 1;
+    return 0;
+}
+
+main() {
+    auto i, n, sum, expected;
+
+    // Allocate slot buffer for 10000 jobs.
+    _slot_buf = malloc(10000 * 8);
+    for (i = 0; i < 10000; i = i + 1) { *(_slot_buf + i * 8) = 0; }
+
+    // Initialize 4-worker pool.
+    job_init(4);
+
+    // Phase 1: 100 trivial jobs.
+    for (i = 0; i < 100; i = i + 1) {
+        job_submit(fn_ptr(test_job_body), i);
+    }
+    job_wait_all();
+
+    // Verify each slot was incremented exactly once.
+    for (i = 0; i < 100; i = i + 1) {
+        if (*(_slot_buf + i * 8) != 1) {
+            free(_slot_buf);
+            return 10 + i;
+        }
+    }
+
+    // Phase 2: stress test — 10000 jobs.
+    n = 10000;
+    for (i = 0; i < n; i = i + 1) { *(_slot_buf + i * 8) = 0; }
+
+    for (i = 0; i < n; i = i + 1) {
+        job_submit(fn_ptr(test_job_body), i);
+    }
+    job_wait_all();
+
+    // Verify sum of slots == n (each was incremented exactly once).
+    sum = 0;
+    for (i = 0; i < n; i = i + 1) { sum = sum + *(_slot_buf + i * 8); }
+    if (sum != n) {
+        free(_slot_buf);
+        return 2;
+    }
+
+    // Phase 3: clean shutdown.
+    job_shutdown();
+
+    free(_slot_buf);
+    return 0;
+}
