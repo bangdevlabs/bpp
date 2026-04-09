@@ -3,12 +3,22 @@
 // by multiple compiler stages.
 
 import "bpp_defs.bsm";
+import "bpp_arena.bsm";
 
 // ── List builder state ─────────────────────────────────────
 // Stack-based list builder for building arrays of AST nodes,
 // parameter lists, and other variable-length sequences.
 
 auto tmp_arr, list_stack, list_sp, list_depth, last_list_cnt;
+
+// ── AST arena ──────────────────────────────────────────────
+// All AST nodes are allocated from a single contiguous arena instead
+// of individual malloc calls. This gives better cache locality for
+// every pass that walks the AST (type inference, dispatch analysis,
+// call graph build, validation). The arena is never reset during
+// compilation — nodes persist through all passes until the process exits.
+// 2MB covers the compiler's own self-host (~14K nodes × 64 bytes = ~900KB).
+auto _ast_arena;
 
 // ── Initialization ─────────────────────────────────────────
 
@@ -19,6 +29,8 @@ init_internal() {
     list_sp = 0;
     list_depth = 0;
     last_list_cnt = 0;
+    _ast_arena = arena_new(8388608);
+    _ast_overflow_warned = 0;
     return 0;
 }
 
@@ -78,14 +90,31 @@ packed_eq(a, b) {
 
 // ── AST node creation ──────────────────────────────────────
 
-// Allocate a new AST node of the given type. All fields are zeroed.
+// Allocate a new AST node of the given type from the AST arena.
+// All fields are zeroed. Using the arena instead of malloc gives
+// contiguous memory layout — better cache performance for every
+// pass that walks the AST (type inference, dispatch, validation).
+// Falls back to malloc if the arena is full (prints a warning once).
+auto _ast_overflow_warned;
 make_node(type) {
     auto nd: Node;
-    nd = malloc(sizeof(Node));
+    nd = arena_alloc(_ast_arena, sizeof(Node));
+    if (nd == 0) {
+        // Arena full — fall back to malloc. This shouldn't happen with
+        // a properly sized arena (8MB covers ~130K nodes). If it does,
+        // increase the arena size in init_internal.
+        if (_ast_overflow_warned == 0) {
+            diag_str("warning: AST arena full, falling back to malloc");
+            diag_newline();
+            _ast_overflow_warned = 1;
+        }
+        nd = malloc(sizeof(Node));
+    }
     nd.ntype = type;
     nd.a = 0; nd.b = 0; nd.c = 0;
     nd.d = 0; nd.e = 0;
     nd.dispatch = 0; nd.itype = 0;
+    nd.src_tok = tok_pos;
     return nd;
 }
 
@@ -116,7 +145,8 @@ list_end() {
     saved = *(list_stack + list_depth * 8);
     cnt = list_sp - saved;
     if (cnt == 0) { last_list_cnt = 0; list_sp = saved; return 0; }
-    arr = malloc(cnt * 8);
+    arr = arena_alloc(_ast_arena, cnt * 8);
+    if (arr == 0) { arr = malloc(cnt * 8); }
     i = 0;
     while (i < cnt) {
         *(arr + i * 8) = *(tmp_arr + (saved + i) * 8);

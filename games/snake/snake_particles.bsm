@@ -1,0 +1,61 @@
+// snake_particles.bsm — Particle system for snake_maestro.
+// Extracted as a separate module to test the `load` keyword and
+// verify multi-file games work with bug, --show-promotions, and
+// the smart dispatch pipeline.
+//
+// Uses the global `world` (ECS handle) and `_last_dt` from the
+// main game module. These are declared there as extrn/global.
+
+import "stbecs.bsm";
+import "stbrender.bsm";
+
+// Spawn count particles at position (px, py) with the given color.
+// Each particle gets random velocity and a 30-frame lifetime packed
+// into the ECS flags field (color in high byte, life in low byte).
+spawn_particles(px, py, count, color) {
+    auto i, id;
+    for (i = 0; i < count; i = i + 1) {
+        id = ecs_spawn(world);
+        if (id >= 0) {
+            ecs_set_pos(world, id, px * 1000, py * 1000);
+            ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
+            ecs_set_flags(world, id, color * 256 + 30);
+        }
+    }
+}
+
+// Worker job — runs on a worker thread during the base phase. Updates
+// particle physics (one ecs_physics call) and then iterates the pool
+// to decrement each particle's life byte and cull the dead ones.
+particle_base_job(_arg) {
+    auto i, cap, flags, life;
+    cap = ecs_capacity(world);
+    ecs_physics(world, _last_dt);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            life = flags & 0xFF;
+            if (life <= 0) {
+                ecs_kill(world, i);
+            } else {
+                ecs_set_flags(world, i, flags - 1);
+            }
+        }
+    }
+}
+
+// Render-side particle pass: walk the live ECS slots and emit one
+// render_rect per particle. Runs on the main thread during render.
+draw_particles() {
+    auto i, cap, flags, px, py, color;
+    cap = ecs_capacity(world);
+    for (i = 0; i < cap; i = i + 1) {
+        if (ecs_alive(world, i)) {
+            flags = ecs_get_flags(world, i);
+            px = ecs_get_x(world, i) / 1000;
+            py = ecs_get_y(world, i) / 1000;
+            color = flags >> 8;
+            render_rect(px, py, 3, 3, color);
+        }
+    }
+}

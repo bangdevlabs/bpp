@@ -1,8 +1,18 @@
-// _stb_platform.bsm — macOS native platform layer (internal).
-// Implements _stb_* functions using Cocoa + CoreGraphics via FFI.
-// The developer never imports this file — stbgame.bsm imports it automatically.
-// When targeting a different OS, the compiler substitutes this file.
+// _stb_platform.bsm — macOS game platform layer (internal).
+// Implements _stb_* functions for window, input, software framebuffer,
+// and Metal GPU using Cocoa + CoreGraphics via FFI.
+//
+// The developer never imports this file — stbgame.bsm imports it
+// automatically. When targeting a different OS, the compiler substitutes
+// this file.
+//
+// Time and threads live in the COMPANION _stb_core_macos.bsm which is
+// auto-injected for any user main() program. This file imports
+// _stb_core.bsm (resolved to _stb_core_macos.bsm via target-suffix
+// fallback) for the few internal calls that need a clock — keeping the
+// game-specific stuff cleanly separated from the universal core.
 
+import "_stb_core.bsm";
 import "bpp_buf.bsm";
 import "bpp_str.bsm";
 
@@ -21,16 +31,7 @@ import "objc" {
 import "System.B" {
     ptr dlopen(char*, int);
     ptr dlsym(ptr, char*);
-    long mach_absolute_time();
-    int mach_timebase_info(ptr);
     int usleep(int);
-    // pthread is part of libSystem on macOS — already linked, no
-    // additional flag needed. The third argument to pthread_create
-    // is the entry function pointer; the calling-convention bridge
-    // (B++ long long(long long) ↔ pthread void*(void*)) is verified
-    // by tests/test_thread.bpp before any worker pool code uses it.
-    int pthread_create(ptr, ptr, ptr, ptr);
-    int pthread_join(long, ptr);
 }
 
 // macOS virtual keycodes → stb Key enum slots.
@@ -59,7 +60,10 @@ auto _plt_app, _plt_win, _plt_imgview, _plt_cs;
 auto _plt_cg_ctx, _plt_cg_img, _plt_cg_ctx_rel, _plt_cg_img_rel;
 auto _plt_cf_mode;
 auto _plt_quit_flag;
-auto _plt_time_base, _plt_time_numer, _plt_time_denom;
+// Timing globals (_plt_time_base/numer/denom) are owned by _stb_core_macos.bsm
+// and lazy-initialized on first _stb_get_time call. This file no longer
+// declares them, since duplicate global declarations would either conflict
+// or merge ambiguously depending on import order.
 
 // Map macOS virtual keycode to stb Key slot (from stbinput.bsm enum).
 _plt_map_vkey(vk) {
@@ -143,14 +147,11 @@ _stb_init_window(w, h, title) {
     objc_msgSend(_plt_app, sel_registerName("activateIgnoringOtherApps:"), 1);
     objc_msgSend(_plt_app, sel_registerName("finishLaunching"));
 
-    // Init timing with timebase conversion factor.
-    auto tb_info;
-    tb_info = malloc(8);
-    mach_timebase_info(tb_info);
-    _plt_time_numer = read_u32(tb_info, 0);
-    _plt_time_denom = read_u32(tb_info, 4);
-    free(tb_info);
-    _plt_time_base = mach_absolute_time();
+    // Timebase init used to live here. It now lives in _stb_core_macos.bsm
+    // as a lazy init inside _stb_get_time itself, so any program that calls
+    // _stb_get_time gets the timebase set up on first read — no longer
+    // requires _stb_init_window to have run first. Programs without windows
+    // (CLI tools, audio servers) can use the clock without opening Cocoa.
     return 0;
 }
 
@@ -250,49 +251,13 @@ _stb_poll_events() {
     return 0;
 }
 
-// Return current time in milliseconds since init.
-_stb_get_time() {
-    auto now, ticks, ns;
-    now = mach_absolute_time();
-    ticks = now - _plt_time_base;
-    // Convert ticks to nanoseconds using timebase info, then to milliseconds.
-    ns = ticks * _plt_time_numer / _plt_time_denom;
-    return ns / 1000000;
-}
-
-// ── Threads (pthread wrappers) ───────────────────────────
-//
-// stbjob and stbmaestro use these wrappers instead of calling
-// pthread directly so the rest of the stb library stays
-// platform-agnostic. When ELF dynamic linking lands on Linux, the
-// linux platform layer will gain matching wrappers and stbjob
-// inherits Linux support with no library changes.
-//
-// _stb_thread_create takes a B++ function pointer and an argument,
-// allocates a slot for the pthread_t handle, calls pthread_create,
-// and returns the handle (or 0 on failure). The entry function
-// must have the B++ signature `long long(long long)` — the bridge
-// to pthread's `void*(void*)` is bit-compatible because both ABIs
-// pass the first argument in x0/rdi and the return in x0/rax for
-// one-arg/one-return functions. Validated by tests/test_thread.bpp.
-_stb_thread_create(start_fn, arg) {
-    auto tid_buf, rc, tid;
-    tid_buf = malloc(8);
-    *tid_buf = 0;
-    rc = pthread_create(tid_buf, 0, start_fn, arg);
-    if (rc != 0) { free(tid_buf); return 0; }
-    tid = *tid_buf;
-    free(tid_buf);
-    return tid;
-}
-
-// Block until the given thread exits and reap its resources.
-// Returns 0 on success, non-zero on error. The retval slot is
-// passed as NULL because B++ thread entry points return through
-// the B++ ABI (long long), not via pthread's void* slot.
-_stb_thread_join(tid) {
-    return pthread_join(tid, 0);
-}
+// _stb_get_time, _stb_thread_create, _stb_thread_join used to live here.
+// They moved to _stb_core_macos.bsm as part of the platform layer split:
+// time + threads are universal core (auto-injected for any user main()),
+// while window/input/GPU stay here as game-specific. The companion file
+// is imported at the top of this module so its symbols are visible to
+// any internal call this file makes (none currently — but the import
+// preserves the dependency in the cache + dep graph).
 
 // Return 1 if the app should close.
 _stb_should_close() {

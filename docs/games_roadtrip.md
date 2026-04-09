@@ -1,24 +1,55 @@
 # B++ Games Roadtrip
 
-The path from B++ 0.21 to B++ 1.0. Three games, in order, each one
-proving that B++ can do something the previous one could not. The
-language reaches version 1.0 the day a complete indie retro game ships,
-end to end, in pure B++.
+The path from B++ 0.22 to B++ 1.0. Five games across six phases, in
+order, each one proving that B++ can do something the previous one
+could not. **Each game is a demo-level vertical slice**, not a complete
+clone. The goal is to prove the production pipeline — that B++ can
+carry a real game loop end to end — not to ship commercial-quality
+titles. The language, the toolchain, and **bangscript** (the adventure
+game DSL) are what ship at 1.0. The games are the proof.
 
 ## Vision
 
 B++ is a language for making games. Not a toy language with a few demos.
-Not a research project. A real tool that can carry a complete commercial
-game from first line of code to shipped binary, with the engine, the
-art, the audio and the runtime all written in B++.
+Not a research project. A real tool that can carry a complete indie
+retro game from first line of code to shipped binary, with the engine,
+the art, the audio and the runtime all written in B++.
 
-The roadtrip below is the proof. Each game forces the language and the
-standard library to grow exactly where the next game will need them.
+The roadtrip below is the proof. Each game forces the language, the
+standard library, AND the developer workflow to grow exactly where the
+next game will need them.
+
+### Scope discipline: demo level, not full clone
+
+The five games are proof points, not products. A "demo level" means:
+
+- **Rhythm Teacher**: 3 songs, 1 difficulty, core loop complete. Not a
+  song pack. Not a leaderboard. Not multiplayer.
+- **Wolfenstein 3D**: 1 playable level with 1 enemy type, 1 weapon, and
+  the core raycaster working at 60 fps. Not the full E1 campaign.
+- **RPG Dungeon**: 1 dungeon room, 1 NPC, 1 enemy, 1 item, dialogue
+  and inventory functional. Not a full Zelda overworld.
+- **RTS**: 1 map, 2 unit types, 1 building, core combat + pathfinding.
+  Not the full tech tree. Not the AI opponent with build orders.
+- **Adventure Puzzle**: 1 scene, 3-5 hotspots, 1 multi-step puzzle,
+  verb system and cutscene functional. Not a full Monkey Island chapter.
+
+This discipline is load-bearing. Building the full games would take
+years. Building one well-chosen vertical slice of each proves the
+pipeline in weeks to months. When a player downloads the Adventure
+demo, solves the puzzle, watches the cutscene, and the demo is
+complete from intro to credits without ever thinking about the
+language it was written in, the proof is in. That's B++ 1.0.
 
 ```
-B++ 0.21
+B++ 0.22
    │
    ▼
+┌──────────────────────────────────┐
+│  Dev loop foundation (see below) │  ← multi-error, debugger, profiler
+└────────┬─────────────────────────┘
+         │
+         ▼
 ┌──────────────────┐
 │  Rhythm Teacher  │  ← drives stbaudio (WAV loader, mixer, timing)
 └────────┬─────────┘
@@ -28,10 +59,21 @@ B++ 0.21
 │  Wolfenstein 3D (Phase 1: CPU) │  ← stress test CPU rendering
 │  Wolfenstein 3D (Phase 2: GPU) │  ← engine composition + polish
 └────────┬───────────────────────┘
+         │                             (hot reload lands here)
+         ▼
+┌──────────────────┐
+│  RPG Dungeon     │  ← UI foundation: dialogue, inventory, menu, save
+└────────┬─────────┘
+         │                             (metaprogramming lands here)
+         ▼
+┌──────────────────┐
+│  RTS demo        │  ← scale + concurrency graduation
+└────────┬─────────┘
          │
          ▼
 ┌──────────────────┐
-│  RTS v1.0        │  ← graduation game
+│  bangscript      │  ← adventure game DSL (see bangscript_plan.md)
+│  Adventure Puzzle│  ← the cherry on top
 └──────────────────┘
        B++ 1.0
 ```
@@ -216,28 +258,42 @@ B++ — not a line-by-line port.
 
 ### Phase 1 estimate
 
-6-8 weeks. The pure CPU raycaster is well-understood (Lode Vandevenne's
-raycasting tutorial is the canonical reference) and the modules it
-depends on (`stbgame`, `stbdraw`, `stbimage`, `stbaudio`, `stbecs`) are
-all in place by then.
+4-6 weeks for the demo level (1 level, 1 enemy type, 1 weapon, playable
+start-to-finish). The pure CPU raycaster is well-understood (Lode
+Vandevenne's raycasting tutorial is the canonical reference) and the
+modules it depends on (`stbgame`, `stbdraw`, `stbimage`, `stbaudio`,
+`stbecs`) are all in place by then. **Profiler must land before this
+phase starts** — without it, hitting 60 fps becomes Sherlock with
+printf.
 
 ### Phase 2 estimate
 
 2-3 weeks. Mechanical translation of the CPU rendering loop into GPU
-quad emission. No new modules required.
+quad emission. No new modules required. Hot reload should land here or
+between Phase 2 and the RTS — tuning the feel (weapon recoil, enemy
+speed, level layout) is where hot reload pays for itself.
 
 ---
 
-## Game 3 — RTS v1.0
+## Game 3 — RTS demo
 
-**Goal**: ship the game that defines B++ 1.0. A complete, playable,
-strategically interesting real-time strategy game with AI opponent,
-written entirely in B++.
+**Goal**: ship a vertical slice that defines B++ 1.0. A playable
+real-time strategy scenario with tilemap, unit pathfinding, audio,
+and enough game state to prove the production pipeline end to end.
 
-This is the graduation project. Everything the previous games
-exercised lands here at the same time: tilemap rendering, pathfinding
-at scale, ECS with hundreds of units, audio mixer with many concurrent
-sounds, fog of war, UI, and a competent AI player.
+Demo scope: **1 map, 2 unit types, 1 building, core combat**. No full
+tech tree. No build-order AI. No victory conditions beyond "destroy
+the enemy base". This is deliberately narrow — the goal is to prove
+that B++ can carry a simultaneously-complex game loop (rendering +
+pathfinding + audio + AI + UI all ticking at 60 fps), not to ship
+a commercial RTS.
+
+Everything the previous games exercised lands here at the same time:
+tilemap rendering, pathfinding, ECS with dozens of units, audio mixer
+with several concurrent sounds, fog of war, UI, and a simple AI
+opponent. Metaprogramming lands during this phase because the RTS is
+where boilerplate hurts the most (multiple unit types × save/load/
+update/render/debug).
 
 ### Reference candidates (open assets)
 
@@ -254,62 +310,204 @@ The pragmatic recommendation is **OpenRA-style** (Red Alert assets,
 freely distributed by EA) for nostalgia plus legal cleanliness. Final
 decision deferred until Wolfenstein 3D ships.
 
-### Capabilities this game forces
+### Capabilities this demo forces
 
 | Capability | Module |
 |---|---|
 | Tilemap rendering with camera scroll | `stbtile.bsm` (already done) |
-| A* pathfinding for many units | `stbpath.bsm` (already done) |
-| ECS with hundreds of entities | `stbecs.bsm` (already done) |
+| A* pathfinding for several units | `stbpath.bsm` (already done) |
+| ECS with dozens of entities | `stbecs.bsm` (already done) |
 | Sprite animation (frame sequences, direction) | new `stbanim.bsm` or extend `stbsprite.bsm` |
-| Selection box, command queue, formations | game-side, no new module |
-| Fog of war (per-unit visibility, cached) | game-side, ~200 lines |
-| Resource counters, build menus, minimap | `stbui.bsm` (already done) |
-| Audio mixer with many concurrent sounds | `stbaudio.bsm` (already done by then) |
-| AI opponent (build orders, tactical, strategic) | game-side, the hardest part |
-| Save and load game state | new `stbsave.bsm`, ~150 lines |
-
-### What B++ 1.0 looks like
-
-- A complete RTS that two humans can play against the AI for an hour
-  without it feeling like a tech demo
-- Three or four playable maps
-- A tutorial mission
-- Build orders, unit production, combat resolution, victory conditions
-- Sound effects, music with state transitions
-- A `bpp` binary, an `rts` binary, and a folder of assets
-- All written in pure B++, compiled by the bootstrapped B++ compiler,
-  rendered by the B++ standard library, audio played by the B++ audio
-  module
-- Runs natively on macOS (Metal) and Linux (X11 + future Vulkan)
-
-That is B++ 1.0.
+| Selection box, command queue | game-side, no new module |
+| Fog of war (per-unit visibility) | game-side, ~150 lines |
+| Resource counters, minimap | `stbui.bsm` (already done) |
+| Audio mixer with several concurrent sounds | `stbaudio.bsm` (already done by then) |
+| Simple AI opponent (reactive, not strategic) | game-side |
+| Save and load scenario state | new `stbsave.bsm`, ~150 lines |
 
 ### Estimate
 
-6-12 months. The graduation project. Will likely surface dozens of
-small language and standard library improvements as it grows.
+2-4 months for the demo vertical slice. Shorter than a full RTS would
+ever be, because the scope is locked at "one map, two units, basic
+combat". Will likely surface a dozen small language and standard
+library improvements as it grows.
+
+---
+
+## Game 4 — RPG Dungeon
+
+**Goal**: build the UI foundation that Adventure and RTS both need —
+dialogue, inventory, menus, and save/load — by making a game that
+depends on all four.
+
+A top-down dungeon room (Zelda / Pokemon style). One NPC with a
+dialogue tree, one enemy, one item to collect, one treasure to find.
+The game proves that B++ can handle narrative + UI-heavy gameplay, not
+just action.
+
+### Design (minimum playable)
+
+- 320×240 window. Top-down tilemap, 1 room (16×12 tiles).
+- Player moves with arrow keys, interacts with E key.
+- 1 NPC with branching dialogue (stbdialogue).
+- 1 item in a chest (stbinventory).
+- 1 enemy that follows the player (stbpath for A*).
+- Pause menu with save/load (stbmenu + stbsave).
+- Victory condition: collect item, talk to NPC, exit room.
+
+### Capabilities this game forces
+
+| Capability | Where it lands |
+|---|---|
+| Dialogue boxes with word wrap and choices | new `stbdialogue.bsm`, ~200 lines |
+| Inventory with item slots | new `stbinventory.bsm`, ~150 lines |
+| Nested menus with keyboard navigation | new `stbmenu.bsm`, ~200 lines |
+| Save and load game state | new `stbsave.bsm`, ~150 lines |
+| Tilemap collision and movement | `stbtile.bsm` + `stbphys.bsm` (already done) |
+| NPC pathfinding | `stbpath.bsm` (already done) |
+| Font rendering for dialogue | `stbfont.bsm` (already done) |
+| Audio: ambient + SFX | `stbaudio.bsm` (already done by then) |
+
+### Assets
+
+Clean legal path: Tuxemon (CC-BY-SA), LPC sprites (CC0), Kenney
+dungeon tileset (CC0). All freely usable for demo purposes.
+
+### What ships
+
+- `games/rpg/rpg.bpp` — the game
+- `games/rpg/assets/` — tileset, sprites, dialogue JSON
+- `stb/stbdialogue.bsm` — dialogue module (reused by Adventure)
+- `stb/stbinventory.bsm` — inventory module (reused by Adventure)
+- `stb/stbmenu.bsm` — menu module (reused by RTS command UI)
+- `stb/stbsave.bsm` — save/load module (reused by RTS and Adventure)
+
+### Estimate
+
+2-3 weeks. The gameplay is simple; the value is the four new UI
+modules that every subsequent game inherits.
+
+---
+
+## Game 5 — Adventure Puzzle (the cherry on top)
+
+**Goal**: prove that B++ can express narrative-driven, puzzle-based
+gameplay through **bangscript**, B++'s embedded adventure game DSL.
+This is the game the project was born to make.
+
+See `docs/bangscript_plan.md` for the full bangscript specification.
+
+An adventure scene in the style of Indiana Jones: Fate of Atlantis,
+Monkey Island 2, and Gabriel Knight. Point-and-click verb system,
+hotspot interactions, inventory puzzles, and a cinematic cutscene.
+The game proves that B++ can handle expressiveness, not just
+performance.
+
+### Design (prologue scope — 1.0 target)
+
+- 640×360 window. Pre-rendered background, character sprites.
+- SCUMM-style verb bar at the bottom (LOOK, USE, TALK, PICK UP, etc.).
+- Mouse-driven: click verb, click hotspot, watch result.
+- 1 scene with 3-5 interactive hotspots.
+- 1 multi-step puzzle (find item → combine → use on target).
+- 1 short cutscene (walk, talk, camera pan, fade).
+- Inventory panel with 3-4 items.
+- Save point.
+
+### Stretch: episode zero (~20-30 min gameplay)
+
+If the prologue ships cleanly and the artist delivers assets for
+multiple scenes: 3-4 scenes, multiple interconnected puzzles,
+inventory progression, and a cinematic intro. This is the demo people
+will remember.
+
+### Capabilities this game forces
+
+| Capability | Where it lands |
+|---|---|
+| Coroutine scheduler (frame-spanning jobs) | new `stbbangs.bsm`, ~400 lines |
+| Scene graph (rooms, hotspots, exits) | new `stbscene.bsm`, ~200 lines |
+| Cutscene primitives (walk_to, say, cam_pan) | new `stbcutscene.bsm`, ~250 lines |
+| Verb/interaction system (USE X WITH Y) | new `stbverb.bsm`, ~200 lines |
+| Cursor state machine (walk/look/use modes) | new `stbcursor.bsm`, ~80 lines |
+| Compiler: `yield`/`await`/`wait` keywords | ~200 lines in lexer/parser/codegen |
+| Compiler: time literals (`3s`, `500ms`, `2f`) | ~50 lines in lexer |
+| Compiler: `scene { }` / `cutscene { }` blocks | ~150 lines in parser |
+| Compiler: simple pattern match for verb system | ~300 lines in parser/metaprog |
+| Dialogue trees with branches and flags | `stbdialogue.bsm` (from RPG) |
+| Inventory with item combinations | `stbinventory.bsm` (from RPG) |
+| Save/load puzzle state | `stbsave.bsm` (from RPG) |
+
+### Assets
+
+Original art by a confirmed artist. No copyright issues. The asset
+pipeline uses `stbimage.bsm` for PNG backgrounds and `stbsprite.bsm`
+for character sprites — both already shipping.
+
+### What ships
+
+- `games/adventure/adventure.bpp` — the game (bangscript syntax)
+- `games/adventure/assets/` — backgrounds, sprites, audio
+- `stb/stbbangs.bsm` — coroutine scheduler
+- `stb/stbscene.bsm` — scene graph
+- `stb/stbcutscene.bsm` — cutscene primitives
+- `stb/stbverb.bsm` — verb system
+- `stb/stbcursor.bsm` — cursor state machine
+- Compiler extensions: coroutines, time literals, block parsing,
+  pattern match (~700 lines across lexer/parser/codegen)
+
+### What B++ 1.0 looks like
+
+When a player downloads the Adventure demo, solves the puzzle, watches
+the cutscene play out with walking actors, panning camera, and fading
+music, and the demo is complete from intro to credits without ever
+thinking about the language it was written in — that is B++ 1.0.
+
+Five demo games covering five fundamental game categories:
+- Audio + timing precision (Rhythm Teacher)
+- CPU rendering + 3D math (Wolf3D Phase 1)
+- GPU composition (Wolf3D Phase 2)
+- Narrative + UI (RPG Dungeon)
+- Scale + concurrency (RTS)
+- Expressiveness + DSL (Adventure via bangscript)
+
+A production pipeline proven, a scripting language born, and a
+community that sees what B++ is for.
+
+### Estimate
+
+4-6 weeks after bangscript compiler extensions and runtime modules
+ship. ~500-800 lines of game code. The prologue is achievable; the
+episode zero depends on asset delivery pace.
 
 ---
 
 ## Module Dependencies
 
-| Module | Status | Needed for | Notes |
+| Module | Status | Built during | Used by |
 |---|---|---|---|
-| `stbaudio.bsm` | TODO | Rhythm, Wolf3D, RTS | Built during Game 1 |
-| `stbanim.bsm` | TODO | RTS | Sprite animation frames + direction tables |
-| `stbsave.bsm` | TODO | RTS | Save/load game state |
-| `stbart.bsm` | TODO | optional asset creation | Not a hard dependency for any game |
-| `stbtile.bsm` | DONE | Wolf3D map grid (loose), RTS | Already shipped |
-| `stbphys.bsm` | DONE | optional | Wolf3D uses raycaster collision, not stbphys |
-| `stbpath.bsm` | DONE | RTS | Already shipped |
-| `stbsprite.bsm` | DONE | All three | Animation extension may be needed for RTS |
-| `stbecs.bsm` | DONE | Wolf3D enemies, RTS units | Already proven in Pathfinder, Snake |
-| `stbimage.bsm` | DONE | Asset loaders | Already shipped |
-| `stbrender.bsm` | DONE | Wolf3D Phase 2, RTS | Already shipped |
-| `stbdraw.bsm` | DONE | Wolf3D Phase 1, fallback | Already shipped |
-| ELF dynamic linking | TODO (P0) | Vulkan on Linux | Blocks Linux GPU rendering for Phase 2 + RTS |
-| Vulkan platform layer | TODO (P4) | Linux GPU | Depends on ELF dynamic linking |
+| `stbaudio.bsm` | TODO | Rhythm Teacher | All games |
+| `stbdialogue.bsm` | TODO | RPG Dungeon | RPG, Adventure |
+| `stbinventory.bsm` | TODO | RPG Dungeon | RPG, Adventure |
+| `stbmenu.bsm` | TODO | RPG Dungeon | RPG, RTS |
+| `stbsave.bsm` | TODO | RPG Dungeon | RPG, RTS, Adventure |
+| `stbanim.bsm` | TODO | RTS | RTS, RPG, Adventure |
+| `stbbangs.bsm` | TODO | bangscript | Adventure |
+| `stbscene.bsm` | TODO | bangscript | Adventure |
+| `stbcutscene.bsm` | TODO | bangscript | Adventure |
+| `stbverb.bsm` | TODO | bangscript | Adventure |
+| `stbcursor.bsm` | TODO | bangscript | Adventure |
+| `stbart.bsm` | TODO | post-1.0 | optional asset creation |
+| `stbtile.bsm` | DONE | 0.21 | Wolf3D (loose), RPG, RTS |
+| `stbphys.bsm` | DONE | 0.21 | RPG collision |
+| `stbpath.bsm` | DONE | 0.21 | RPG enemies, RTS units |
+| `stbsprite.bsm` | DONE | 0.21 | All games |
+| `stbecs.bsm` | DONE | 0.21 | Wolf3D, RPG, RTS |
+| `stbimage.bsm` | DONE | 0.20 | Asset loaders |
+| `stbrender.bsm` | DONE | 0.20 | Wolf3D Phase 2, RTS, RPG, Adventure |
+| `stbdraw.bsm` | DONE | 0.20 | Wolf3D Phase 1, fallback |
+| ELF dynamic linking | TODO (P1) | — | Vulkan on Linux |
+| Vulkan platform layer | TODO (P3) | — | Linux GPU |
 
 ---
 
@@ -320,7 +518,9 @@ small language and standard library improvements as it grows.
 | Rhythm Teacher | 16 ms (60 FPS) | 320×180 | Audio latency under 20 ms is the real constraint |
 | Wolfenstein 3D Phase 1 (pure CPU) | 16 ms (60 FPS) | 320×180 | The honest stress test |
 | Wolfenstein 3D Phase 2 (hybrid) | 4 ms (240 FPS-capable) | 640×360 or higher | GPU has plenty of headroom |
-| RTS v1.0 | 16 ms (60 FPS) | 640×360 or higher | Hundreds of units + pathfinding + audio + AI |
+| RPG Dungeon | 16 ms (60 FPS) | 320×240 | UI-bound, not GPU-bound |
+| RTS | 16 ms (60 FPS) | 640×360 or higher | Hundreds of units + pathfinding + audio + AI |
+| Adventure Puzzle | 16 ms (60 FPS) | 640×360 | Cutscene coroutines are the constraint, not rendering |
 
 If any game misses its budget, treat it as compiler optimization
 information, not as a reason to lower the target. The point of the
@@ -339,139 +539,89 @@ roadtrip is to find where B++ needs to grow.
 3. **GPU composition third.** Once CPU rendering ships and works, the
    hybrid upgrade is mechanical. It demonstrates that the existing 2D
    GPU pipeline composes into 3D without shader changes.
-4. **RTS last.** The graduation project needs every module the previous
-   games delivered, plus animation and save state. Doing it before
-   Wolfenstein would mean fighting AI design and CPU performance at
-   the same time as fighting the audio module.
+4. **RPG fourth.** The RPG is simpler than what follows but forces the
+   four UI modules (dialogue, inventory, menu, save) that both the RTS
+   and Adventure need. Building these inside an RTS or adventure game
+   would mean fighting UI design and game logic at the same time.
+5. **RTS fifth.** The scale graduation project needs every module the
+   previous games delivered, plus animation. The pathfinding, audio,
+   and UI modules arrive battle-tested from earlier games.
+6. **Adventure last.** The cherry on top. bangscript is the biggest
+   language addition in 1.0. It needs metaprogramming, coroutines,
+   hot reload, and every UI module to be mature. Placing it after the
+   RTS means the entire infrastructure is proven before the DSL goes
+   live. The adventure game is why B++ exists — it ships last because
+   it deserves the strongest foundation.
 
-The roadtrip ends when a player downloads the RTS, plays it for an
-hour, and never thinks once about the language it was written in.
+The roadtrip ends when a player downloads the Adventure demo, solves
+the puzzle, watches the cutscene, and never thinks once about the
+language it was written in.
 
 ---
 
-## Open Architectural Questions
+## Dev Loop Foundation (all five ship WITH 1.0)
 
-The roadtrip has two blocking design questions that must be resolved
-before Game 1 is written. These are not implementation details — they
-are decisions about the shape of B++ itself, and they affect every
-game that follows.
+The roadtrip surfaced a realization that changes the shape of 1.0: the
+bottleneck on the path to a shippable game is not "can B++ express
+this?" (it can) but "how many iterations per hour can the developer
+do?" (not enough yet). A solo developer building the roadtrip spends
+more time waiting on the dev loop than writing code, which is both a
+velocity problem AND a motivation problem for a multi-month solo
+project.
 
-### Threading Model for Audio (BLOCKING Rhythm Teacher)
+Five dev loop capabilities are therefore **blockers for 1.0**, not
+nice-to-haves deferred to 1.1. They land in a specific order aligned
+with the games that need them:
 
-B++ is single-threaded by design. CoreAudio (macOS) and ALSA (Linux)
-both call your audio callback from a realtime audio thread that the
-OS created. The callback has a hard deadline (typically 1–5 ms) and
-must not allocate memory, take locks, or do blocking syscalls. It
-must read audio samples from somewhere and copy them into a buffer
-the OS provides.
+| # | Item | Ships before | Why |
+|---|---|---|---|
+| 1 | Multi-error + warning log | Wolf3D Phase 1 | Compiler today exits on first `diag_fatal` via `sys_exit(1)`. Real code has multiple errors per compile; fix-one-recompile is painful at scale. Fixing the diagnostic system first makes the other four dev loop items much less painful to build. |
+| 2 | `bug` with breakpoints | Wolf3D Phase 1 | Wolf3D has state-machine enemy AI and collision logic. Without step-through, a "why did the enemy walk through the wall at frame 523?" bug takes hours instead of minutes. B++ already has `bug` v2 with debugserver/gdbserver — this is adding a breakpoint API on top, reusing the existing infrastructure. |
+| 3 | Profiler (minimal + sampling) | Wolf3D Phase 1 runs | Wolf3D CPU at 60 fps is the honest benchmark. If it drops to 30 fps, without a profiler the developer is Sherlock with printf. Two tiers: a `bench("label") { ... }` builtin for manual measurement (~30 lines), and a sampling profiler that captures stack traces at N ms intervals and aggregates by function (~300 lines, reuses the `bug` stack walker). The sampling profiler answers "where is the hot spot?" without any instrumentation. |
+| 4 | Hot reload (watch mode) | RTS demo starts | `bpp --watch game.bpp` detects source changes, recompiles to a fresh `/tmp` path, kills the old process, restarts. Not true live code injection (hard), just full restart automation. Cuts 80% of the iteration atrito for the fraction of cost. Hot reload becomes critical when tuning gameplay feel — weapon recoil, enemy speed, level geometry, audio filters — where the dev needs to see the effect in under 5 seconds. |
+| 5 | Metaprogramming (`$T` generics + compile-time reflection) | RTS demo mid-development | The RTS is where boilerplate hurts most: N unit types × (save / load / update / render / debug) = NxM hand-written functions. Jai is the reference — `$T` generic parameters + `#run` compile-time execution + struct field reflection is enough to generate all of it from a schema. B++ already has `const FUNC` compile-time execution; the leap is exposing struct field metadata and letting compile-time code emit new functions. Biggest scope of the 5 (~1500-2500 lines) but the one with the most multiplicative payoff on the RTS. |
 
-The main thread needs to produce those samples (play a note, advance
-a song cursor, mix voices) and hand them off to the callback. That
-is a producer/consumer relationship across two threads.
+### Why this order is load-bearing
 
-C and C++ solve this with a single-producer single-consumer lock-free
-ring buffer. The producer writes data, then advances a write index.
-The consumer reads up to the write index, then advances a read index.
-Aligned word-sized loads and stores are atomic at the hardware level
-on both ARM64 and x86_64. The only thing missing is a memory barrier
-between the data write and the index update — without it, the CPU
-can reorder and the consumer sees the new index before the data.
+Each item unlocks the next game to be built with less pain:
 
-**The minimum B++ needs** to support this pattern:
+- Items 1-3 land before Wolf3D Phase 1 because Wolf3D is where "can B++
+  hit 60 fps on CPU?" becomes a live question. Without error recovery
+  the dev loop is slow, without the debugger game logic bugs take
+  hours, without the profiler frame timing is blind.
+- Item 4 lands before RTS because tuning an RTS (unit balance, combat
+  feel, economy pacing) needs iteration counts that only hot reload
+  delivers.
+- Item 5 lands during the RTS because that's the first game with
+  enough entity types to feel the boilerplate pain. Landing it earlier
+  would be premature (Wolf3D has 1-2 unit types, metaprogramming pays
+  nothing).
 
-1. **One new builtin**: `mem_barrier()`. Emits `DMB ISH` on ARM64,
-   `MFENCE` on x86_64. Five lines per codegen file.
-2. **Function pointers are already addresses**: `fn_ptr(callback)`
-   already returns the right thing for CoreAudio or ALSA to call. The
-   audio thread can execute B++ code as long as that code follows
-   audio callback rules (no malloc, no syscalls except the audio
-   output write).
+The total scope of the five is meaningful (~3000-4000 lines of
+compiler and tooling work combined) but they share infrastructure with
+the games themselves (the debugger reuses `bug`, the profiler reuses
+the stack walker, metaprogramming reuses `const FUNC`). The actual
+marginal cost of adding the five is lower than it sounds because the
+foundation is already there.
 
-**The standard pattern** for `stbaudio.bsm` with this primitive:
+### Threading for audio — RESOLVED by maestro
 
-```bpp
-// Pre-allocated at init time. Size is a power of two so wrap is
-// just a bitmask — no modulo, no branch.
-auto _audio_ring;        // byte buffer, capacity = RING_SIZE
-auto _audio_read_idx;    // consumer (audio thread) advances this
-auto _audio_write_idx;   // producer (main thread) advances this
+An earlier draft of this document listed "threading model for audio"
+as an open architectural question. That question is now resolved: the
+maestro pattern (`stbmaestro` + `stbjob` + `stbbeat`) lands before
+Rhythm Teacher and provides the full threading story. The original
+`mem_barrier()` primitive is now one of the handful of new builtins
+added alongside the maestro work. The audio callback runs as a
+thread-pool consumer using the same SPSC ring buffer pattern described
+in the earlier draft, just wrapped in the standard maestro/stbjob API.
+See `docs/maestro_plan.md` for the full specification.
 
-// Main thread: produce samples by writing to the ring.
-audio_push(sample) {
-    auto next;
-    next = (_audio_write_idx + 1) & (RING_SIZE - 1);
-    if (next == _audio_read_idx) { return 0; }   // ring full
-    poke(_audio_ring + _audio_write_idx, sample);
-    mem_barrier();                                // data visible before index
-    _audio_write_idx = next;
-    return 1;
-}
+### Regression catching — RESOLVED by `tests/run_all.sh` gate
 
-// Audio thread: CoreAudio/ALSA callback runs this. No malloc, no
-// syscalls (except the audio output write that the OS is already
-// doing for us).
-_audio_callback(out_buf, out_len) {
-    auto i;
-    for (i = 0; i < out_len; i = i + 1) {
-        if (_audio_read_idx == _audio_write_idx) {
-            poke(out_buf + i, 0);                 // underrun: silence
-        } else {
-            poke(out_buf + i, peek(_audio_ring + _audio_read_idx));
-            mem_barrier();                        // data consumed before index
-            _audio_read_idx = (_audio_read_idx + 1) & (RING_SIZE - 1);
-        }
-    }
-    return 0;
-}
-```
-
-This is the smallest addition to B++ that unblocks a professional
-audio module. Everything else the audio module needs is already in
-the language. The pattern generalizes: the same ring-buffer shape
-works for network I/O callbacks, worker-thread messages, and any
-other OS-threaded boundary B++ might meet later.
-
-**Alternative: polling only.** If `mem_barrier()` is too much to add
-for Rhythm Teacher, the fallback is to run audio entirely on the
-main thread and poll an audio syscall every frame. This caps audio
-latency to the frame time (~16 ms at 60 FPS), which works for most
-games but is borderline for a rhythm game. Real rhythm games expect
-5–10 ms total latency, reachable only with a proper callback thread.
-
-**The decision**: add `mem_barrier()` as a builtin before Game 1
-starts. It is the highest-leverage primitive addition possible —
-five lines of compiler code per backend unlock decades of lock-free
-concurrent programming patterns, and every audio / networking /
-worker-pool module that comes after inherits it for free.
-
-### CI and regression catching (BLOCKING everything beyond Game 1)
-
-Today the 52-test suite passes because the maintainer remembers to
-run it. This worked for 0.21 because the maintainer wrote most of it
-in one head. As the roadtrip grows (5+ new modules during Rhythm
-Teacher alone, many more later), regression catching-in-the-head
-stops scaling.
-
-**The minimum setup** that buys a lot:
-
-1. A single shell script `tests/run_all.sh` that compiles and runs
-   every `tests/test_*.bpp` and reports `52/52 passing` or lists
-   failures. This already exists in the README as a snippet — move
-   it into a committed file.
-2. The script runs at the end of every bootstrap cycle in
-   `install.sh`, so installation itself is gated on tests passing.
-3. Optional: a Git pre-push hook that runs the script. Manual but
-   cheap to add.
-4. Later: a GitHub Actions workflow that runs the same script on
-   macOS and Ubuntu runners on every push and PR.
-
-**Not in scope for the roadtrip**: elaborate CI infrastructure, test
-coverage reporting, benchmark tracking. The goal is "don't regress
-silently between games", not "solve testing as a discipline".
-
-**The decision**: `tests/run_all.sh` + `install.sh` integration
-before Rhythm Teacher ships. GitHub Actions whenever the project
-goes public.
+The earlier draft also listed regression catching as open. Resolved:
+`tests/run_all.sh` is commit 0 of the maestro plan and blocks every
+commit that follows. Also wired into `install.sh` so installation
+itself is gated on tests passing.
 
 ---
 
@@ -479,10 +629,21 @@ goes public.
 
 | Milestone | State | Date |
 |---|---|---|
-| B++ 0.21 | shipped | 2026-04-06 |
-| `mem_barrier()` builtin | pending (blocks Game 1 threading) | — |
-| `tests/run_all.sh` + install.sh gate | pending (blocks Game 1 regression safety) | — |
-| Rhythm Teacher | not started | — |
-| Wolf3D Phase 1 | not started | — |
-| Wolf3D Phase 2 | not started | — |
-| RTS v1.0 → B++ 1.0 | not started | — |
+| B++ 0.22 | shipped | 2026-04-08 |
+| `tests/run_all.sh` + install.sh gate | done (maestro plan commit 0) | 2026-04-08 |
+| Maestro Phase 1 (stbmaestro/stbjob/stbbeat) | done | 2026-04-08 |
+| Function dedup + mod0_real_start fix | done | 2026-04-09 |
+| Maestro batch 2 (standalone runtime) | in progress | — |
+| `extrn` keyword + auto smart promotion | pending | — |
+| Multi-error + warning log | pending (blocks Wolf3D Phase 1) | — |
+| `bug` with breakpoints | pending (blocks Wolf3D Phase 1) | — |
+| Profiler (minimal + sampling) | pending (blocks Wolf3D Phase 1 runs) | — |
+| Rhythm Teacher demo | not started | — |
+| Wolf3D Phase 1 demo level (1 level, 1 enemy) | not started | — |
+| Wolf3D Phase 2 hybrid GPU | not started | — |
+| Hot reload watch mode | pending (blocks RPG demo start) | — |
+| RPG Dungeon demo (1 room, dialogue, inventory) | not started | — |
+| Metaprogramming (`$T` + compile-time reflection) | pending (lands during RTS) | — |
+| RTS demo (1 map, 2 unit types) | not started | — |
+| bangscript compiler extensions + runtime | not started | — |
+| Adventure Puzzle demo → B++ 1.0 | not started | — |

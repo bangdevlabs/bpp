@@ -52,32 +52,34 @@
 //       return 0;
 //   }
 
-import "stbgame.bsm";
+import "_stb_core.bsm";
 import "bpp_beat.bsm";
 import "bpp_job.bsm";
 
 // Configuration captured by maestro_configure, consumed by maestro_run.
-auto _ms_w, _ms_h, _ms_title, _ms_fps;
+// Just the tick rate — window/title/dimensions belong to whatever module
+// is providing the I/O surface (stbgame for windowed games, nothing for
+// CLI tools, future stbaudio for audio plugins). Maestro stays neutral.
+auto _ms_fps;
 auto _ms_n_workers;
 auto _ms_configured;
+auto _ms_quit_flag;
 
 // Lifecycle callbacks. 0 means "not registered", maestro skips.
 auto _ms_cb_init, _ms_cb_solo, _ms_cb_base, _ms_cb_render, _ms_cb_quit;
 
 // Default worker count when none is configured. 4 is a reasonable
-// starting point for snake-class games on Apple Silicon (which has
-// 4-8 performance cores). Larger games can override via
-// maestro_set_workers() before maestro_run().
+// starting point on Apple Silicon (4-8 performance cores). Larger
+// programs can override via maestro_set_workers() before maestro_run().
 auto _MS_DEFAULT_WORKERS;
 
 // Capture configuration. Does not start anything yet.
-maestro_configure(w, h, title, fps) {
+// fps is the target tick rate; maestro sleeps to fit the per-frame budget.
+maestro_configure(fps) {
     _MS_DEFAULT_WORKERS = 4;
-    _ms_w = w;
-    _ms_h = h;
-    _ms_title = title;
     _ms_fps = fps;
     if (_ms_n_workers == 0) { _ms_n_workers = _MS_DEFAULT_WORKERS; }
+    _ms_quit_flag = 0;
     _ms_configured = 1;
     return 0;
 }
@@ -88,13 +90,23 @@ maestro_set_workers(n) {
     return 0;
 }
 
+// Signal the maestro loop to exit cleanly. Call from any callback
+// (solo, base, render, signal handler) to terminate the run.
+// Game programs typically check stbgame's game_should_quit() in
+// their solo phase and call maestro_quit() if it returns 1.
+maestro_quit() {
+    _ms_quit_flag = 1;
+    return 0;
+}
+
 // Register the init callback. Called once before the loop starts,
-// after the window is open and the worker pool is alive. Use this
-// to allocate world state, load assets, etc.
+// after the worker pool is alive. Use this to allocate state, load
+// assets, etc.
 maestro_register_init(fn) { _ms_cb_init = fn; return 0; }
 
 // Register the solo callback. Called every tick on the main thread
-// before the base phase. Reads input, updates game state.
+// before the base phase. Reads input, updates state, decides whether
+// to call maestro_quit().
 // Argument: dt_ms (delta time in milliseconds for this frame).
 maestro_register_solo(fn) { _ms_cb_solo = fn; return 0; }
 
@@ -106,68 +118,80 @@ maestro_register_solo(fn) { _ms_cb_solo = fn; return 0; }
 maestro_register_base(fn) { _ms_cb_base = fn; return 0; }
 
 // Register the render callback. Called every tick after base+wait.
-// Submit draw commands here.
+// Present results, submit draw commands, write output, etc.
 // Argument: dt_ms.
 maestro_register_render(fn) { _ms_cb_render = fn; return 0; }
 
 // Register the quit callback. Called once after the loop exits,
-// before the worker pool is torn down. Use this to free world
-// state, save game, etc.
+// before the worker pool is torn down. Use this to free state,
+// save data, close files, etc.
 maestro_register_quit(fn) { _ms_cb_quit = fn; return 0; }
 
-// Start the game. Blocks until game_should_quit() returns 1.
-// Owns the platform layer, the beat clock, the worker pool, and
-// the run loop. Returns 0 on clean shutdown.
+// Start the loop. Blocks until maestro_quit() is called from one of
+// the callbacks. Owns the beat clock, the worker pool, and the run
+// loop. Returns 0 on clean shutdown.
+//
+// Maestro is neutral about what kind of program it's driving — it
+// doesn't open windows, it doesn't bind sockets, it doesn't read
+// files. Programs that need any of those wire them up via the
+// init/solo/render callbacks. For windowed games, the convention is:
+// stbgame's game_run() wrapper calls game_init before maestro_run
+// and game_end after, then the user's solo callback calls
+// game_frame_begin and checks game_should_quit.
 maestro_run() {
-    auto dt;
+    auto dt, last_time, now, frame_ms, elapsed;
 
     if (_ms_configured == 0) { return 1; }
 
-    // 1. Spin up the worker pool BEFORE Cocoa is initialized. macOS
-    // Cocoa has a single-threaded → multi-threaded transition that
-    // is supposed to fire on first NSThread detach, but creating
-    // pthreads via FFI after NSApplication is already up causes the
-    // process to receive SIGTERM (observed via the bug debugger:
-    // crash signal 15 inside job_init, immediately after game_init).
-    // Spawning workers first means pthread_create runs while we're
-    // still a plain command-line process. The workers immediately
-    // park in their spin loop and don't touch any user state until
-    // a job is submitted, so this reordering is safe.
+    // 1. Spin up the worker pool BEFORE the user's init callback runs.
+    // On macOS, NSApplication has a single-thread → multi-thread
+    // transition that breaks if pthread_create runs after NSApplication
+    // is already up. Spawning workers first means pthread_create runs
+    // while we're still a plain command-line process. Workers park in
+    // their spin loop and don't touch any user state until a job is
+    // submitted, so this reordering is safe.
     job_init(_ms_n_workers);
 
-    // 2. Open the window via the standard game infrastructure.
-    game_init(_ms_w, _ms_h, _ms_title, _ms_fps);
-
-    // 3. Anchor the beat clock at the same moment the window opens.
+    // 2. Anchor the beat clock at the start of the run.
     init_beat();
 
-    // 4. User init.
+    // 3. User init. Game programs typically call game_init() inside
+    // here (via stbgame's game_run wrapper). CLI tools allocate
+    // buffers and parse args here.
     if (_ms_cb_init != 0) { call(_ms_cb_init); }
 
-    // 5. Tick loop. solo → base → wait → render, until quit.
-    while (game_should_quit() == 0) {
-        // Frame begin updates _stb_dt_ms via stbgame. Maestro reads
-        // it once and passes the same value to every phase, so all
-        // three phases see the same dt for this tick.
-        game_frame_begin();
-        dt = game_dt_ms();
+    // 4. Tick loop. solo → base → wait → render, until maestro_quit.
+    frame_ms = 1000 / _ms_fps;
+    last_time = beat_now_ms();
+    while (_ms_quit_flag == 0) {
+        // Compute dt against the previous frame. Clamped to avoid
+        // huge jumps after a stall (debug pause, GC pause, etc.).
+        now = beat_now_ms();
+        dt = now - last_time;
+        if (dt < 1)  { dt = 1; }
+        if (dt > 50) { dt = 50; }
+        last_time = now;
 
-        if (_ms_cb_solo != 0)   { call(_ms_cb_solo, dt); }
-        if (_ms_cb_base != 0)   { call(_ms_cb_base, dt); }
-        // Drain all worker queues so render sees the results of
-        // any job_submit / job_parallel_for the base callback did.
+        if (_ms_cb_solo   != 0) { call(_ms_cb_solo, dt); }
+        if (_ms_cb_base   != 0) { call(_ms_cb_base, dt); }
+        // Drain all worker queues so render sees the results of any
+        // job_submit / job_parallel_for the base callback did.
         job_wait_all();
         if (_ms_cb_render != 0) { call(_ms_cb_render, dt); }
+
+        // Sleep to fit the frame budget. sys_usleep takes microseconds.
+        elapsed = beat_now_ms() - now;
+        if (elapsed < frame_ms) {
+            sys_usleep((frame_ms - elapsed) * 1000);
+        }
     }
 
-    // 6. User quit hook (still has access to workers and window).
+    // 5. User quit hook (workers still alive).
     if (_ms_cb_quit != 0) { call(_ms_cb_quit); }
 
-    // 7. Tear down workers, then the window. Order matters: workers
-    // must finish before we close the platform layer they were
-    // making syscalls into.
+    // 6. Tear down workers. The user's quit callback closes any
+    // window/file/socket they opened in init.
     job_shutdown();
-    game_end();
 
     return 0;
 }

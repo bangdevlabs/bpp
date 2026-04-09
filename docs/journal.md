@@ -2762,3 +2762,339 @@ All 19 deleted (one file kept and rewritten: `tests/test_io.bpp` is now a clean 
 - `tests/test_io.bpp` — rewritten for current stbio API
 - `tests/test_io2.bpp`, `test_io4.bpp`, `test_io6.bpp`, `test_io7.bpp`, `test_io8.bpp`, `test_io_simple.bpp`, `test_q.bpp`, `test_stbio_q.bpp`, `test_types.bpp`, `test_init2.bpp`, `test_import.bpp`, `test_enc_arm64.bpp`, `test_getdents.bpp`, `test_debug_bin.bpp`, `test_native_debug2.bpp`, `test_native_debug3.bpp`, `test_native_debug4.bpp`, `test_stbdraw.bpp`, `test_linux_exit.bpp` — DELETED (legacy drift)
 - `docs/todo.md` — Done section reorganized by category, P0 stbaudio + host-aware compiler, P2 stbpath/stbhash done, P3 target architecture refactor
+
+---
+
+## 2026-04-07 / 2026-04-08 — Foundation Cleanup + Maestro Plan Phase 1 + 4 Compiler Bug Fixes (0.22)
+
+A long, deliberate session that started with planning the maestro pattern and ended with B++ having a substantially cleaner foundation than it had at the start of 0.21. The headline is the **8 module renames** that resolved the long-standing ambiguity about what is a compiler tool versus what is a user library, but the most important outcomes were structural: **4 latent compiler bugs** that we discovered and fixed while working on the maestro plan, the **`global` keyword** as the first foundation stone of smart dispatch, and `bpp_dispatch.bsm` finally getting wired into the modular pipeline (Constraint 1 of the plan).
+
+The session was unusually philosophical for a coding day. Several decisions that look trivial in the diff (renaming `defs.bsm` to `bpp_defs.bsm`, picking which storage class keywords to add) actually went through extended design discussions before the user committed to a direction. Those discussions are worth recording because they explain WHY the foundation looks the way it does now.
+
+### The maestro plan came together first
+
+The day opened with finalizing `docs/maestro_plan.md` (~1000 lines), the canonical reference for the parallel infrastructure work. The plan's key framing — borrowed from the user — is the **jazz/rock ensemble metaphor**, which turned out to be more honest than the orchestra metaphor I'd originally proposed:
+
+- **Base** (the rhythm section): pure functions that run in parallel on worker threads. Bass, drums, harmony — the deterministic foundation.
+- **Solo** (the improvisers): mutable functions that run sequentially on the main thread. They react to player input, mutate state, decide branches in runtime.
+- **Beat** (the clock): a shared monotonic clock that both phases read independently. Coordinates without locking.
+- **Maestro** (the bandleader): cues base in, cues solo in, manages tempo. Doesn't play an instrument — coordinates.
+
+The orchestra metaphor failed because in a real orchestra everyone follows the score; nobody improvises. Jazz and rock are honest about the rhythm-section-vs-soloist split.
+
+The plan ships in three phases. Phase 1 is manual classification (the user explicitly registers `solo`, `base`, `render` callbacks via API). Phase 1.5 is the slice-type sweep across the existing stb library. Phase 2 (now refactored, see below) is real smart dispatch with compile-time analysis. The plan also identifies six structural constraints that the implementation has to respect — the most important being Constraint 1 (`bpp_dispatch.bsm` is currently SKIPPED in the modular pipeline) and Constraint 6 (Linux pthread is blocked on ELF dynamic linking, which is its own multi-day milestone deferred outside this work).
+
+A peer review during planning produced seven concrete changes (A through G) that all got folded in: pthread via FFI instead of raw syscall wrappers, N×SPSC queues instead of SPMC + CAS, calling-convention bridge test before stbjob, `.bo` cache extension for `fn_phase[]`, `tests/run_all.sh` as commit 0, `tests/test_slice_struct.bpp` before the slice sweep, and dropping the runtime `func_purity()` builtin in favor of compile-time validation. These are all in the plan now.
+
+### Maestro Plan Phase 1 — six commits, all green
+
+The implementation followed the plan's commit ordering exactly:
+
+1. **`tests/run_all.sh` (commit 0)** — 130-line POSIX shell runner that compiles and runs every `tests/test_*.bpp` file with platform-aware skip rules and a 10-second wall-clock guard per test. Wired into `install.sh` (later reverted from install.sh per the user's "you shouldn't have touched install" feedback — kept the script but install.sh stays clean of test invocation). Skip categories: not-linux (X11/linux_*), not-macos (macho_*), no-display (GPU + window tests when DISPLAY unset), interactive (debugger smoke tests).
+
+2. **`stb/stbbeat.bsm` (commit 1)** — universal monotonic clock. `init_beat`, `beat_now_ms/us/ns`, `beat_now_at_rate(hz)`, `beat_now_frames(fps)`, `beat_now_samples(rate)`, `beat_now_in_bpm(bpm)`, `beat_reset`. Initially had no compiler change, but discovered immediately that the platform layer can't be imported standalone (it has hidden coupling to stbgame globals like `_stb_fb`), so stbbeat had to import stbgame. This coupling stayed as a "temporary" workaround through the rest of Phase 1 — the user later called it out as architecturally wrong, see "Batch 2" at the end of this entry.
+
+3. **`mem_barrier()` builtin (commit 2)** — the only new compiler builtin in Phase 1. Emits ARM64 DMB ISH (`0xD5033BBF`) and x86_64 MFENCE (`0F AE F0`). Full bidirectional fence used by stbjob's SPSC queue ordering. C emitter equivalent: `__sync_synchronize()`. Bootstrap shasum changed from `63a96850...` to `3f5068e43...`.
+
+4. **pthread FFI in macOS platform layer (commit 3)** — declared `pthread_create`/`pthread_join` via libSystem (already linked, no flag needed), added `_stb_thread_create`/`_stb_thread_join` wrappers that present a clean `long long(long long)` entry-point interface. Validated by `tests/test_thread.bpp` — Constraint 5 of the plan. **The B++ `long long(long long)` ABI is bit-compatible with pthread's `void*(void*)` ABI on Apple Silicon**, as predicted; no trampoline needed.
+
+5. **`stb/stbjob.bsm` (commit 4)** — N×SPSC worker pool with round-robin submit. `job_init` spawns N pthreads (each on its own private SPSC queue), `job_submit` round-robins onto a worker queue, `job_wait_all` polls done counters per worker, `job_parallel_for` is the workhorse, `job_shutdown` sentinel-and-joins. **No CAS** — each queue has exactly one producer (main) and one consumer (the dedicated worker), so memory ordering via `mem_barrier()` is sufficient. `tests/test_job.bpp` validated correctness with 100 + 10000 jobs through a 4-worker pool. **First parallel B++ workload running on real OS threads.**
+
+6. **`stb/stbmaestro.bsm` (commit 5)** — solo/base/render bandleader. `maestro_configure(w, h, title, fps)`, `maestro_register_init/solo/base/render/quit(fn_ptr)`, `maestro_run()`. The implementation owns the frame timing, the quit flag, and the scheduling of base work onto workers. `tests/test_maestro.bpp` validated 5 ticks of solo→base→render with parallel base phase dispatching `job_parallel_for(8, fn)`.
+
+7. **`games/snake/snake_maestro.bpp` (commit 6)** — port of `snake_gpu.bpp` reorganized into solo/base/render phases. Particle physics dispatched to a worker thread; render reads results after maestro auto-calls `job_wait_all`. `snake_gpu.bpp` stays untouched alongside as the side-by-side baseline for visual validation.
+
+### Bug 1: pathbuf clobber in bpp_import.bsm — latent since 0.21
+
+The first compiler bug surfaced when the test runner sequence `test_job → test_maestro` started failing with `error[E201]: function 'job_parallel_for' called but never defined`. Standalone `test_maestro` worked. Standalone `test_job` worked. Only the sequence broke.
+
+The discovery story took most of an hour. First hypothesis: cache hash collision. Compared `--show-deps` output for both compile contexts and found something genuinely strange:
+
+```
+[STALE] tests/test_maestro.bpp
+  -> tests/test_maestro.bpp        ← self-import??
+  -> stb/stbjob.bsm
+[clean] stb/stbmaestro.bsm
+  -> tests/test_maestro.bpp        ← stbmaestro depends on test_maestro??
+  -> stb/stbgame.bsm
+```
+
+Backwards edges. Self-loops. Modules pointing at module 0 (the entry file) that they had no business depending on. Three of stbmaestro's four dependencies were spuriously rewritten to point at `tests/test_maestro.bpp`.
+
+Following the corrupted dep_to values back through `bpp_import.bsm`, the bug was in the module-index lookup that records the dep edge after recursing into the imported module. The code:
+
+```bpp
+plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);  // sets pathbuf
+if (plen > 0) {
+    process_file(pathbuf, plen);                                    // RECURSES, may overwrite pathbuf
+    dep_from = arr_push(dep_from, my_mod_idx);
+    dep_to = arr_push(dep_to, mod_idx_by_hash(pathbuf, plen));      // pathbuf is now stale!
+```
+
+`pathbuf` is shared scratch — `find_file()` reuses it on every nested import resolution. By the time `mod_idx_by_hash(pathbuf, plen)` ran post-recursion, `pathbuf` contained whatever path the deepest nested `find_file()` had written last. The hash didn't match anything in `imp_hashes`, so `mod_idx_by_hash` returned its default-fail value of `0` — which happens to be the entry-file index. Every affected dep edge spuriously pointed at module 0.
+
+The blast radius was severe and disguised the symptom completely:
+
+1. Corrupted dep edges → wrong topological sort
+2. Wrong topo sort → wrong dep-hash-chain in `hash_with_deps()`
+3. Wrong dep hashes → wrong `.bo` cache filename hashes
+4. Filename hash collisions across two different modules in two different programs → one program's empty stub `.bo` would satisfy another program's "is module X cached?" check
+5. Loading an empty `.bo` for a real module → "function not found" errors with no obvious connection to the import system
+
+The fix is small (~10 lines): copy `pathbuf` to the `fbuf` stack before recursing, look up by the saved copy, restore `fbuf_top` after.
+
+```bpp
+auto saved_path, _spi;
+saved_path = fbuf_top;
+for (_spi = 0; _spi < plen; _spi = _spi + 1) {
+    poke(fbuf + saved_path + _spi, peek(pathbuf + _spi));
+}
+fbuf_top = fbuf_top + plen;
+
+process_file(pathbuf, plen);
+
+dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + saved_path, plen));
+
+fbuf_top = saved_path;
+```
+
+This bug had been **latent since the modular pipeline landed in 0.21**. It was never reproduced before because shallow import trees rarely clobbered `pathbuf` deeply enough to break the lookup. `stbmaestro → stbgame → (10+ stb modules including the platform layer)` was the first import chain in the project deep enough to reliably destroy `pathbuf` before the post-recursion lookup. The maestro plan didn't introduce the bug — it just made it observable.
+
+Saved as `feedback_pathbuf_scratch.md` in agent memory because the lesson generalizes: any code that calls `process_file()` and then uses any shared scratch buffer (`pathbuf`, `linebuf`, etc.) has to copy first. The next refactor in this area should consider renaming the variables to `_scratch_pathbuf` to make the danger visible.
+
+### Bug 2: inode reuse in macho_writer + elf_writer
+
+Different bug, same day. After the maestro plan implementation was working in `/tmp/snake_maestro`, the user reported it didn't work when compiled inside `games/snake/`. Same source, same compiler, different output behavior. After half an hour of confusion, the user did the right thing — confirmed the binary was being killed by `zsh: terminated`, then ran `bug ./snake_maestro` to trace and saw the process getting SIGKILL'd at the very first `_stb_init_window` call.
+
+The clue was: compiling to a fresh filename (`snake_fresh_38144`) worked, recompiling to the existing path (`snake_maestro`) didn't. **macOS code signing cache by inode**. When `bpp -o snake_maestro` truncates and rewrites an existing file via `sys_open(0x601)`, the inode is reused. The kernel still has the OLD ad-hoc code signature cached for that inode and validates the new bytes against the old signature, which always mismatches, and the kernel kills the process at exec.
+
+`install.sh` already worked around this by `sudo rm -f` before `cp`. The compiler now does the same: `sys_unlink` before `sys_open` in both `src/aarch64/a64_macho.bsm:1355` and `src/x86_64/x64_elf.bsm:392`. ~3 lines per writer, plus comments explaining why. **This closes the entire class of "binary mysteriously killed when recompiled" bugs on macOS**, which has been a recurring footgun documented in agent memory as `feedback_macos_sigkill.md`.
+
+Bootstrap-verified, suite green, snake_maestro now compiles cleanly to any path on any compile.
+
+### Bug 3: pthread after NSApplication
+
+The third bug surfaced after fixing bugs 1 and 2. snake_maestro compiled fine but the window opened and froze. `top` showed the process alive at 100% CPU. The `bug` debugger trace stopped at `job_init()` with sig 15 (SIGTERM). Not SIGSEGV, not SIGKILL — SIGTERM. Something was actively killing the process with a graceful termination signal.
+
+The stbjob test (`test_thread.bpp`, `test_job.bpp`, `test_maestro.bpp`) all passed in isolation. The difference between them and snake_maestro: snake_maestro opens a real Cocoa window via `game_init` BEFORE creating pthread workers. The test programs either don't open a window (test_thread, test_job) or open one and exit after 5 ticks before the window can become unresponsive (test_maestro).
+
+Hypothesis: macOS Cocoa has a documented "single-thread → multi-thread transition" requirement. NSApplication needs to be informed that the app has gone multi-threaded BEFORE pthread state interferes with Cocoa. If pthread_create runs after NSApplication is already up, certain Cocoa subsystems (notification center, run loop) can get into a bad state and the OS sends SIGTERM as a graceful "shut down please" signal.
+
+Fix: in `bpp_maestro.bsm`, swap the order in `maestro_run()`. Spawn the worker pool **before** `game_init` opens the window. The workers park in their spin loop and don't touch any user state until a job arrives, so the reorder is safe. Verified by sampling the main thread of a running snake_maestro and confirming it sits in `usleep → __semwait_signal` (the normal frame budget wait) instead of being killed.
+
+### Bug 4: install.sh ghost files
+
+The fourth bug surfaced when the user reported that even after the snake_maestro fix, compiling from games/snake/ still produced a different (broken) binary than compiling from the repo root. Same source, same bpp shasum, different output.
+
+`bpp src/snake_maestro.bpp --show-deps` from games/snake/ showed:
+
+```
+[clean] /usr/local/lib/bpp/stb/_stb_platform_macos.bsm
+  -> /usr/local/lib/bpp/stb/stbbuf.bsm
+  -> /usr/local/lib/bpp/stb/stbstr.bsm
+```
+
+`/usr/local/lib/bpp/stb/_stb_platform_macos.bsm`. **Ghost file from before the 0.21 platform-layer-move-to-aarch64**. The new platform layer in `/usr/local/lib/bpp/aarch64/` has the pthread FFI declarations; the old one in `/usr/local/lib/bpp/stb/` does not. `find_file` searches `stb/` BEFORE `aarch64/`, so it preferred the stale file, and the resulting binary was missing `_stb_thread_create` (replaced with garbage that crashed `job_init`).
+
+Fix: `install.sh` gained a pre-clean step that wipes `*.bsm` from every install dir before re-copying. Without this, files that move between directories across releases leave behind ghost copies that find_file picks up depending on cwd.
+
+```sh
+sudo rm -f "$LIB_DIR"/*.bsm
+sudo rm -f "$STB_DIR"/*.bsm
+sudo rm -f "$DRV_DIR"/*.bsm
+sudo rm -f "$ARM64_DIR"/*.bsm
+sudo rm -f "$X64_DIR"/*.bsm
+```
+
+Caught a real bug AND prevents the entire class going forward. The user agreed this was the right fix and confirmed it solved the "compile from games/snake/" issue immediately.
+
+### dispatch.bsm wired into the modular pipeline (Constraint 1 fix)
+
+While debugging the per-function classification work, hit Constraint 1 from the maestro plan: `bpp_dispatch.bsm` was previously SKIPPED in the modular pipeline (only ran in the old monolithic path). The fix is one line in `bpp.bpp` — call `run_dispatch();` after `infer_module(0)` and before `run_validate();`, matching the monolithic pipeline order (types → dispatch → validate). Per-loop dispatch analysis now runs for modular compiles.
+
+But adding `run_dispatch()` immediately surfaced a second-order bug: cached functions loaded from `.bo` files have `body_arr = 0` (the AST is not reconstructed at load time, only the export signature). `run_dispatch()` tried to walk the AST of every function and crashed dereferencing 0 when it hit a cached function. Fix: skip cached functions in `run_dispatch()` — their per-loop dispatch decisions were already applied when the .bo was first written, so the cached machine code already reflects them. Only fresh-parsed functions need re-classification.
+
+### The `global` keyword — design discussion
+
+The user proposed adding a `global` keyword to declare top-level variables that are shared with worker threads. The motivation: smart dispatch needs to know which globals are "safe to access from workers" (the programmer authorized) vs which are "main-thread-only" (legacy default). Without an explicit marker, the compiler has to assume the worst and refuse to dispatch any loop that touches a global.
+
+Three positions emerged in the discussion:
+
+**Position A** — Add `global x;` at file scope; `auto x;` at file scope is the legacy/conservative default. Backwards compat preserved. The new `global` keyword is the explicit "this is shared" marker. Parser error if used inside functions ("global declarations are file-scope only").
+
+**Position B** — Force `extrn x;` or `global x;` at file scope, deprecate `auto` at top-level. Breaking change.
+
+**Position C** — Add `extrn` as alias for `auto` at top-level. Three forms for two semantics. Confusing.
+
+The user picked Position A after some back-and-forth. The decision was driven by two principles:
+
+1. **The `auto`-as-automatic mental model is elegant**. `auto` already means "the language figures out where it goes" — local in functions, serial global at file scope. Renaming top-level `auto` to something else would break that elegance. Leaving `auto` alone and adding `global` as a NEW keyword for the multi-thread case is the smaller, more conservative change.
+2. **The distinction matters more in multi-threaded code**. In single-thread, local-vs-global is just about scope/lifetime. In multi-thread, it's also about thread safety: globals are shared mutable state that needs synchronization, locals are inherently per-thread by stack ownership. `global` makes that distinction visible at the declaration site.
+
+Implementation: ~30 lines across `bpp_lexer.bsm` (add "global" to `check_kw`), `bpp_parser.bsm` (add `glob_shared` array parallel to `globals[]`, `parse_global` takes `is_shared` parameter, top-level dispatchers handle `global` as well as `auto`), and `bpp_bo.bsm` (cache reads default to `is_shared=0` until the format learns to round-trip the flag). `tests/test_global_kw.bpp` validates the new keyword parses, the legacy `auto` still works at top-level, and float type hints still apply. Bootstrap shasum: `7bf2f4459...`.
+
+Saved as `feedback_base_solo_lexicon.md` and the larger discussion about three storage classes (`auto`/`global`/`extrn`) made it into the todo as a future task.
+
+### The `extrn` keyword discussion (designed but not yet implemented)
+
+The user pushed further on the storage-class design: should there be a third keyword for "write-once-after-init" globals? The use case is universal in games — assets, config, lookup tables, level data — load once at init, then read forever. The user pointed out that B/BCPL had `extrn` as the historical name for external storage, and B++ already has `extrn` as a reserved (but unimplemented) keyword in the lexer.
+
+The three-way categorization emerged:
+
+| Form | Mutable when | Safe for workers? |
+|---|---|---|
+| `const NAME = lit` | never (compile-time literal, no storage) | trivially yes — no storage |
+| `auto x;` top-level | always (legacy/conservative) | NO (smart dispatch refuses) |
+| `extrn x;` top-level | only before `job_init()` (write-once-after-init) | YES (read-only after freeze) |
+| `global x;` top-level | always (worker-shared) | YES with stride analysis |
+
+The freeze point for `extrn` would be `job_init()` (or `maestro_run()` which calls it internally). Static enforcement: the compiler tracks "is `job_init` reachable from this point in the call graph?" and rejects writes to `extrn` variables along any path that has crossed the freeze. A reachability pass — not yet implemented but designed and recorded in todo as a P0.
+
+The decision was not to implement `extrn` in this session because the implementation requires a reachability analysis that hasn't been built yet. The design discussion is recorded so the work can land in a future session with full context.
+
+### "src/ é o videogame, stb/ é o cartucho" — the cleanup philosophy
+
+The biggest discussion of the day was about **what belongs in `src/` versus `stb/`**. The historical state was ambiguous: some "stb" modules were used by the compiler (stbarray, stbhash) and never by any game; others were used only by games (stbecs, stbphys); a few were used by both (stbio, stbmath, stbfile). There was no clean rule.
+
+The user articulated the right framing with two analogies:
+
+**Videogame analogy**: `src/` is the console — forged, complete, comes with the hardware. `stb/` is the cartridges — optional, plug in what you need. The compiler is what makes the console work; the cartridges are the games.
+
+**Percussion analogy**: `src/` is the rack and the stands — the structure that holds everything. `stb/` is the percussion instruments fastened to the rack — the things you actually play. Together, the percussionist makes their art.
+
+By those analogies, the question becomes: **what's part of the "base console" that comes with B++?**
+
+The user's filter: "if the compiler needs it to construct itself, programmers will need it too". The compiler is the canary — it's the most complex B++ program possible, and the structures/utilities it needs to exist are the same ones any non-trivial B++ program will eventually need. arr_push, hash_set, byte buffer ops, string ops, print, math, file I/O — all universal. None of the "stb" modules in this category have any direct game importer; they're all infrastructure.
+
+A second filter that the user added later: **"would this appear naturally as a builtin/stdlib in any modern language?"** The 7 modules pass that test (Python has list/dict/str/bytes/print/math/open, JS has Array/Map/String/Uint8Array/console/Math/fs.read, Rust has Vec/HashMap/String/Vec<u8>/println!/f64::*/std::fs, Go has []T/map/string/[]byte/fmt/math/os.Read*). The other 16 stb modules don't (no language has built-in ECS, physics, tilemap, sprite rendering — those are domain-specific cartridges).
+
+The decision: **8 module renames** (counting `defs.bsm` → `bpp_defs.bsm`, the only file in `src/` that didn't follow the bpp_ convention).
+
+```
+src/defs.bsm           → src/bpp_defs.bsm           (compiler constants)
+stb/stbarray.bsm       → src/bpp_array.bsm          (dynamic arrays)
+stb/stbhash.bsm        → src/bpp_hash.bsm           (hash maps)
+stb/stbbuf.bsm         → src/bpp_buf.bsm            (byte buffers)
+stb/stbstr.bsm         → src/bpp_str.bsm            (string ops)
+stb/stbio.bsm          → src/bpp_io.bsm             (print/getchar/putchar)
+stb/stbmath.bsm        → src/bpp_math.bsm           (sin/cos/sqrt/randi)
+stb/stbfile.bsm        → src/bpp_file.bsm           (file I/O wrappers)
+```
+
+After the renames, the categories are clean:
+
+- **`src/` (22 files)**: 11 compiler stages + 7 core utilities + 4 runtime modules (bpp_beat, bpp_job, bpp_maestro, bpp_defs)
+- **`src/aarch64/` and `src/x86_64/`**: chip+OS bundles (codegen, encoder, binary writer, platform layer, bug observer)
+- **`stb/` (16 files)**: pure cartridges — game/render/ecs/phys/tile/sprite/path/font/image/input/color/draw/ui/cole/arena/pool. None of these are imported by the compiler; all are explicit-import for user programs.
+
+The mechanics took ~50 import sites updated across the codebase. install.sh extended to ship the new src/bpp_*.bsm modules to `$LIB_DIR` alongside the compiler internals. All using `perl -i -pe` for the batch find/replace, which is the right tool for the job; the user pushed back briefly on the use of perl but accepted it after seeing the alternative was 30+ separate Edit operations.
+
+### The fixpoint vs SCC discussion (and why fixpoint won)
+
+While planning the per-function purity classification (still pending in batch 2), the question came up: should `classify_all_functions()` use Tarjan's SCC algorithm or a simple double-buffered fixpoint iteration?
+
+I initially leaned toward SCC because it's "the elegant solution" — single pass, mutual recursion handled by construction, asymptotically optimal. The user pushed back hard on this and won the argument decisively.
+
+The user's argument:
+
+1. **The lattice has height 1**. Purity is binary: PHASE_BASE → PHASE_SOLO is the only transition, no upgrade. For a height-1 lattice, fixpoint converges to the EXACT result in O(call-chain-depth) passes. Not approximate. The "fixpoint is approximate" intuition comes from value-set analysis where the lattice has many heights and convergence can produce conservative results — that doesn't apply here.
+
+2. **Both produce identical results for binary purity**. SCC only wins on a constant factor (passes over the array), and even that constant doesn't translate to real time because each fixpoint pass is microseconds in B++ scale.
+
+3. **Tarjan has silent bug classes that fixpoint doesn't have**. Wrong low-link update, wrong stack pop boundary, wrong sentinel handling — all classify functions incorrectly without crashing. Debugging silent classification errors when "smart dispatch is emitting parallel_for for the wrong function" is brutal. Fixpoint bugs are loud (loop forever, or test fails obviously).
+
+4. **YAGNI**. SCC is the right tool when the lattice grows beyond binary (PHASE_GLOBAL_RW, PHASE_FFI_PURE, etc.). When that day comes, swap fixpoint for SCC; the rest of the code stays the same. Doing SCC now is "B-tree for an array of 50 elements" — building scalability we don't need yet.
+
+5. **~25 lines vs ~60 lines, in a step that is less critical than the codegen synthesis**. Save the time and attention budget for where it actually matters.
+
+I conceded. The plan is fixpoint with double-buffering, deferred to batch 2 when classify_function actually gets implemented. The full discussion is worth recording because it shows the user's instinct: "doing it right the first time" doesn't mean "the most sophisticated algorithm available", it means "the simplest tool that produces the correct result for the actual problem you have". Tarjan is a tool, not a virtue.
+
+### What we did NOT do (and why)
+
+A few things came up in design discussion but were explicitly deferred:
+
+- **`extrn` keyword + reachability analysis** — designed, in todo, but the static enforcement of "no write after `job_init` reachable" is its own pass that needs the call graph from the smart dispatch work to land first.
+
+- **Auto-injection of the 7 utilities for module 0** — the user wants `arr_new()`, `hash_set()`, `print_int()`, `sin()`, `file_read_all()` to "come for free" without imports. The mechanism is straightforward (extend `process_file` to fire an injection block when `my_mod_idx == 0`). Deferred to batch 2 alongside the platform layer split, because we want to bootstrap-verify the rename + reorganization first as a clean checkpoint.
+
+- **Refactor of `bpp_beat`/`bpp_job`/`bpp_maestro` to be standalone** — currently they import stbgame because the platform layer has hidden coupling to stbgame globals. The right fix is to split `_stb_platform_<os>.bsm` into `_stb_core_<os>.bsm` (time + threads, universal) and `_stb_platform_<os>.bsm` (window + GPU, game-specific). Deferred to batch 2.
+
+- **Smart dispatch implementation** — the call graph + classify_function + codegen synthesis is the bulk of the smart dispatch work. Deferred to its own session after batch 2 lands.
+
+- **SCC** — see above. Deferred indefinitely until the lattice grows beyond binary purity.
+
+### Counts at session end
+
+- `src/`: 13 → 22 .bsm files (8 renames + 3 new runtime modules)
+- `stb/`: 23 → 16 cartridges
+- Tests: 52 → 57 (added 6, removed 1 stale)
+- Suite: **46 passed / 0 failed / 11 skipped**
+- bpp shasum at commit: **`f8f78682753dd519db966863e04ea9803e047f32`**
+- Files changed in commit: 73 (+2902 / -107 lines)
+
+### Files Changed (selected)
+
+**New runtime in src/**:
+- `src/bpp_beat.bsm` — universal monotonic clock
+- `src/bpp_job.bsm` — N×SPSC worker pool
+- `src/bpp_maestro.bsm` — solo/base/render bandleader
+
+**Renames** (preserving git history via similarity detection):
+- `src/defs.bsm` → `src/bpp_defs.bsm`
+- `stb/stbarray.bsm` → `src/bpp_array.bsm`
+- `stb/stbhash.bsm` → `src/bpp_hash.bsm`
+- `stb/stbbuf.bsm` → `src/bpp_buf.bsm`
+- `stb/stbstr.bsm` → `src/bpp_str.bsm`
+- `stb/stbio.bsm` → `src/bpp_io.bsm`
+- `stb/stbmath.bsm` → `src/bpp_math.bsm`
+- `stb/stbfile.bsm` → `src/bpp_file.bsm`
+
+**Compiler changes**:
+- `src/aarch64/a64_codegen.bsm` — `mem_barrier()` builtin emit (DMB ISH)
+- `src/aarch64/a64_macho.bsm` — `sys_unlink` before `sys_open` (inode fix)
+- `src/aarch64/_stb_platform_macos.bsm` — pthread FFI + `_stb_thread_create`/`_stb_thread_join` wrappers
+- `src/x86_64/x64_codegen.bsm` — `mem_barrier()` builtin emit (MFENCE)
+- `src/x86_64/x64_elf.bsm` — `sys_unlink` before `sys_open` (parity with macho)
+- `src/bpp_validate.bsm` — `mem_barrier` added to `val_is_builtin`
+- `src/bpp_emitter.bsm` — `mem_barrier` C emitter equivalent (`__sync_synchronize`)
+- `src/bpp_lexer.bsm` — `global` recognized as keyword
+- `src/bpp_parser.bsm` — `parse_global` takes `is_shared` parameter, `glob_shared` array
+- `src/bpp_bo.bsm` — cached globals default to `is_shared=0`
+- `src/bpp_dispatch.bsm` — skip cached functions (`body_arr == 0`) in `run_dispatch`
+- `src/bpp_import.bsm` — pathbuf clobber fix (save before recurse, restore after)
+- `src/bpp.bpp` — wire `run_dispatch()` into modular pipeline before `run_validate()`
+
+**New tests**:
+- `tests/run_all.sh` (130 lines, runner)
+- `tests/test_barrier.bpp` (mem_barrier round-trip)
+- `tests/test_beat.bpp` (clock monotonicity)
+- `tests/test_thread.bpp` (calling-convention bridge)
+- `tests/test_job.bpp` (100 + 10000 jobs through 4 workers)
+- `tests/test_maestro.bpp` (5-tick maestro_run)
+- `tests/test_global_kw.bpp` (global vs auto vs const)
+
+**Modified tests**:
+- `tests/test_stbgame_native.bpp`, `tests/test_gpu_rect.bpp` — added 30-frame auto-exit
+- ~25 test files — import path updates for the renamed modules
+
+**Deleted**:
+- `tests/test_io9.bpp` — broken legacy stub from `.bo Cache Fix` commit, importing a never-existing `stb/stbio_new.bsm` and calling `pstr()` which doesn't exist anywhere
+
+**New game**:
+- `games/snake/snake_maestro.bpp` — port of snake_gpu using the maestro pattern, side-by-side with the original
+
+**Documentation**:
+- `docs/maestro_plan.md` — NEW, ~1000 lines
+- `docs/games_roadtrip.md` — maestro phase notes
+- `docs/todo.md` — 0.22 cycle done section, P0 reordered
+- `README.md` — typo fixes
+
+**Build infrastructure**:
+- `install.sh` — pre-clean step + new bpp_*.bsm modules to $LIB_DIR
+- `bpp` — recompiled, shasum `f8f78682...`
+
+### What's next (batch 2)
+
+The session's commit (`318ef25`) is a checkpoint. The next session continues with **batch 2**: split the platform layer into `_stb_core_<os>.bsm` + `_stb_platform_<os>.bsm`, refactor `bpp_beat`/`bpp_job`/`bpp_maestro` to be standalone (drop the stbgame import), add `maestro_quit()`, add `game_run()` wrapper to stbgame, auto-inject the 7 utilities + 3 runtime modules + `_stb_core` for every user `.bpp` program. After that, the actual smart dispatch work (call_graph_build, classify_all_functions, codegen synthesis) becomes its own focused session.
+
+The cleanup is the hard work that pays off forever. Foundation arrumada, casa limpa, B++ tá ficando forte.

@@ -12,6 +12,64 @@ import "bpp_array.bsm";
 // ── Dispatch result codes ──────────────────────────────────
 auto DSP_SEQ, DSP_PAR, DSP_GPU, DSP_SPLIT;
 
+// ── Per-function purity classification ─────────────────────
+//
+// Three values describe a function's classification at runtime:
+//   PHASE_AUTO  (0)  Not yet classified (default before pass runs)
+//   PHASE_BASE  (1)  Pure — no global writes, no impure calls.
+//                    Safe to dispatch to a worker thread.
+//   PHASE_SOLO  (2)  Has side effects (direct or transitive). Must
+//                    run on the main thread.
+//
+// The classification is computed by classify_all_functions() via
+// double-buffered fixpoint iteration over the call graph built by
+// call_graph_build(). Lattice has height 1 (BASE → SOLO is the only
+// transition, no upgrade), so fixpoint converges to the EXACT result
+// in O(call-chain-depth) passes — not approximate.
+auto PHASE_AUTO, PHASE_BASE, PHASE_SOLO;
+
+// Per-function arrays parallel to funcs[]. Built by call_graph_build()
+// and consumed by classify_all_functions() and (later) codegen.
+auto fn_phase;            // arr<int>: PHASE_* per function (read by codegen)
+auto fn_phase_next;       // arr<int>: double-buffer for fixpoint iteration
+auto fn_calls;            // arr<arr<int>>: direct callees per function
+auto fn_address_taken;    // arr<int>: 1 if fn_ptr(name) appears anywhere
+auto fn_locally_impure;   // arr<int>: 1 if body has non-call side effects
+auto fn_reachable;        // arr<int>: 1 if reachable from main() via call graph
+auto fn_phase_hint;       // arr<int>: 0=auto, 1=base, 2=solo (from `: base`/`: solo` annotation)
+auto _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
+                          // Codegen checks this before filtering — if 0, emit everything.
+
+// ── Per-global use-def tracking (smart promotion) ──────────
+// Built by call_graph_build() during the same AST walk that populates
+// the per-function arrays above. Each parallel to globals[].
+//
+// glob_writers[i]   — arr<int> of function indices that assign to global i
+// glob_readers[i]   — arr<int> of function indices that read global i
+// glob_pinned[i]    — 1 if user wrote `auto x: serial;` (never promote)
+// glob_writes_pre[i]  — count of writes to global i in main() BEFORE
+//                       the first call to maestro_run/job_init/maestro_configure
+// glob_writes_post[i] — count of writes to global i in main() AFTER the freeze
+auto glob_writers;
+auto glob_readers;
+auto glob_pinned;
+auto glob_writes_pre;
+auto glob_writes_post;
+
+// Index of the main() function in funcs[], or -1 if not found.
+// Resolved by call_graph_build for use by promote_globals.
+auto _dsp_main_idx;
+
+// 1 if _dsp_walk_main_for_freeze found at least one freeze-point call
+// (maestro_run / maestro_configure / job_init). If 0, no freeze point
+// exists and no globals are promoted to extrn — programs without a
+// maestro/job lifecycle don't benefit from the write-once distinction.
+auto _dsp_has_freeze;
+
+// Promoter output: per-global string ("extrn" / "global" / "" if no change).
+// Read by --show-promotions to print human-readable diagnostics.
+auto glob_promote_reason;
+
 // Extern purity table: packed names of known-pure extern functions.
 // Any extern not in this table is assumed to have side effects.
 auto pure_ext;
@@ -28,10 +86,45 @@ init_dispatch() {
     DSP_PAR = 1;
     DSP_GPU = 2;
     DSP_SPLIT = 3;
+    PHASE_AUTO = 0;
+    PHASE_BASE = 1;
+    PHASE_SOLO = 2;
+    fn_phase = arr_new();
+    fn_phase_next = arr_new();
+    fn_calls = arr_new();
+    fn_address_taken = arr_new();
+    fn_locally_impure = arr_new();
+    fn_reachable = arr_new();
+    fn_phase_hint = arr_new();
+    _lazy_emit_ready = 0;
+    glob_writers = arr_new();
+    glob_readers = arr_new();
+    glob_pinned = arr_new();
+    glob_writes_pre = arr_new();
+    glob_writes_post = arr_new();
+    glob_promote_reason = arr_new();
+    _dsp_main_idx = 0 - 1;
+    _dsp_has_freeze = 0;
     pure_ext = arr_new();
     stride_vars = arr_new();
     dsp_local_vars = arr_new();
     return 0;
+}
+
+// ── Global lookup helper ───────────────────────────────────
+// Returns the index of name_p in globals[], or -1 if not found.
+// Uses string-content comparison (packed_eq) because the declaration
+// site and the reference site often have different packed values even
+// for the same identifier — they were scanned at different points in
+// the merged source.
+dsp_find_global(name_p) {
+    auto i, gp;
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        gp = arr_get(globals, i);
+        if (gp == name_p) { return i; }
+        if (packed_eq(gp, name_p)) { return i; }
+    }
+    return 0 - 1;
 }
 
 // Register a pure extern function (no side effects). Call during setup.
@@ -260,6 +353,7 @@ has_side_effects(nd) {
         for (i = 0; i < cnt; i = i + 1) {
             if (has_side_effects(arr[i])) { return 1; }
         }
+        if (n.e != 0) { if (has_side_effects(n.e)) { return 1; } }
         return 0;
     }
 
@@ -345,6 +439,757 @@ analyze_body(body_arr, body_cnt) {
                 }
             }
         }
+    }
+    return 0;
+}
+
+// ── Function lookup helper ─────────────────────────────────
+
+// Find a function index by its packed name. Returns -1 if not found.
+// Linear scan for now — only called by call_graph_build during AST walk.
+// Future optimization: build a name→idx hash up front, like val_find_func.
+// Find a function index by packed name. Uses content comparison
+// (packed_eq) because the call site and the definition site often
+// have different packed values — they were scanned in different modules.
+_dsp_find_func_idx(name_p) {
+    auto i, rec, fname;
+    for (i = 0; i < func_cnt; i = i + 1) {
+        rec = funcs[i];
+        fname = *(rec + FN_NAME);
+        if (fname == name_p) { return i; }
+        if (packed_eq(fname, name_p)) { return i; }
+    }
+    return 0 - 1;
+}
+
+// ── Call graph build ────────────────────────────────────────
+//
+// Walks every parsed function once, extracting:
+//   fn_calls[i]          — list of function indices that function i calls directly
+//   fn_address_taken[i]  — 1 if function i's address is taken via fn_ptr() anywhere
+//   fn_locally_impure[i] — 1 if function i's body has any non-call side effect
+//                          (write to non-local var, T_MEMST without strided base,
+//                          call to impure extern)
+//
+// Cached functions (body_arr == 0) get default values: empty fn_calls,
+// fn_address_taken=0, fn_locally_impure=0. Their actual classification
+// will be loaded from the .bo cache once the format extension lands.
+//
+// The result feeds classify_all_functions() which iterates a fixpoint
+// over the call graph to assign each function a PHASE_BASE/PHASE_SOLO
+// label.
+
+// Walk a single AST node looking for call graph entries (callees,
+// fn_ptr captures), local impurity, and per-global use-def edges.
+// Mutates per-function tracking state via globals.
+auto _cgb_calls;             // arr<int>: callees being collected for the current function
+auto _cgb_impure;            // 1 if the current function has local impurity
+auto _cgb_addr_taken_set;    // arr<int>: function indices whose address was taken anywhere
+auto _cgb_current_fn_idx;    // function index currently being walked (so the
+                             // walker can attribute global accesses to it)
+
+_cgb_walk(nd) {
+    auto n: Node, p: Node, base: Node;
+    auto t, i, arr, cnt, name_p, callee_idx;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+
+    // Function call: record edge to callee. Special-case fn_ptr() — its
+    // first argument is the name of a function whose address is taken.
+    if (t == T_CALL) {
+        name_p = n.a;
+        arr = n.b;
+        cnt = n.c;
+        // fn_ptr(name): mark the named function as address-taken.
+        // Detect by name comparison against the literal "fn_ptr".
+        if (cnt == 1) {
+            auto fp_target: Node;
+            // The argument should be a T_VAR whose .a is the target function's name.
+            // We mark address-taken at the SET level here; classification consults
+            // it via fn_address_taken[].
+            fp_target = arr[0];
+            if (fp_target != 0) {
+                if (fp_target.ntype == T_VAR) {
+                    callee_idx = _dsp_find_func_idx(fp_target.a);
+                    if (callee_idx >= 0) {
+                        _cgb_addr_taken_set = arr_push(_cgb_addr_taken_set, callee_idx);
+                    }
+                }
+            }
+        }
+        // Direct call to a user function: record edge.
+        callee_idx = _dsp_find_func_idx(name_p);
+        if (callee_idx >= 0) {
+            _cgb_calls = arr_push(_cgb_calls, callee_idx);
+        } else {
+            // Not a user function — must be an extern or builtin. If it's
+            // not a known-pure extern, treat as local impurity (call could
+            // do anything). Builtins like malloc/free/sys_* are NOT in the
+            // pure set, so they all count as impure for now.
+            if (is_pure_extern(name_p) == 0) {
+                _cgb_impure = 1;
+            }
+        }
+        // Walk argument expressions (they may have side effects too).
+        for (i = 0; i < cnt; i = i + 1) {
+            _cgb_walk(arr[i]);
+        }
+        return 0;
+    }
+
+    // Assignment to a non-local variable is a global write.
+    if (t == T_ASSIGN) {
+        p = n.a;
+        if (p.ntype == T_VAR) {
+            name_p = p.a;
+            if (dsp_is_local(name_p) == 0) {
+                if (is_strided(name_p) == 0) {
+                    _cgb_impure = 1;
+                }
+                // Record the use-def edge: this function writes to the
+                // global. The promoter consumes this in promote_globals().
+                auto _gi;
+                _gi = dsp_find_global(name_p);
+                if (_gi >= 0) {
+                    arr_set(glob_writers, _gi,
+                            arr_push(arr_get(glob_writers, _gi), _cgb_current_fn_idx));
+                }
+            }
+        }
+        // Walk the RHS — its T_VAR nodes count as reads.
+        _cgb_walk(n.b);
+        return 0;
+    }
+
+    // Variable reference: if it's a global, record a read edge.
+    if (t == T_VAR) {
+        name_p = n.a;
+        if (dsp_is_local(name_p) == 0) {
+            auto _gi;
+            _gi = dsp_find_global(name_p);
+            if (_gi >= 0) {
+                arr_set(glob_readers, _gi,
+                        arr_push(arr_get(glob_readers, _gi), _cgb_current_fn_idx));
+            }
+        }
+        return 0;
+    }
+
+    // Memory store: safe only if pointer base is a strided variable.
+    if (t == T_MEMST) {
+        p = n.a;
+        if (p.ntype == T_BINOP) {
+            base = p.b;
+            if (base.ntype == T_VAR) {
+                if (is_strided(base.a)) {
+                    _cgb_walk(n.b);
+                    return 0;
+                }
+            }
+        }
+        _cgb_impure = 1;
+        return 0;
+    }
+
+    // Recurse into children.
+    if (t == T_BINOP) {
+        _cgb_walk(n.b);
+        _cgb_walk(n.c);
+        return 0;
+    }
+    if (t == T_UNARY) { _cgb_walk(n.b); return 0; }
+    if (t == T_MEMLD) { _cgb_walk(n.a); return 0; }
+    if (t == T_ADDR)  { _cgb_walk(n.a); return 0; }
+    if (t == T_RET)   { _cgb_walk(n.a); return 0; }
+
+    if (t == T_IF) {
+        _cgb_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _cgb_walk(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i = i + 1) { _cgb_walk(arr[i]); }
+        }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        _cgb_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _cgb_walk(arr[i]); }
+        if (n.e != 0) { _cgb_walk(n.e); }
+        return 0;
+    }
+
+    return 0;
+}
+
+// Build the call graph for every parsed function. Populates fn_calls[],
+// fn_address_taken[], fn_locally_impure[] in lockstep with funcs[].
+// ALSO populates the per-global use-def arrays (glob_writers, glob_readers)
+// from the same AST walk so the promoter has everything it needs.
+// Cached functions get default empty entries — their classification will
+// come from the .bo cache.
+call_graph_build() {
+    auto i, j, k, func, params_arr, param_cnt, body_arr, body_cnt;
+    auto stmt: Node, darr, dcnt, addr_idx, fname;
+
+    // Grow per-function arrays to match func_cnt.
+    while (arr_len(fn_phase) < func_cnt) {
+        fn_phase = arr_push(fn_phase, PHASE_AUTO);
+        fn_phase_next = arr_push(fn_phase_next, PHASE_AUTO);
+        fn_calls = arr_push(fn_calls, 0);
+        fn_address_taken = arr_push(fn_address_taken, 0);
+        fn_locally_impure = arr_push(fn_locally_impure, 0);
+        fn_reachable = arr_push(fn_reachable, 0);
+        fn_phase_hint = arr_push(fn_phase_hint, 0);
+    }
+
+    // Grow per-global arrays to match glob_cnt. Each slot is its own arr<int>.
+    while (arr_len(glob_writers) < glob_cnt) {
+        glob_writers = arr_push(glob_writers, arr_new());
+        glob_readers = arr_push(glob_readers, arr_new());
+        glob_pinned = arr_push(glob_pinned, 0);
+        glob_writes_pre = arr_push(glob_writes_pre, 0);
+        glob_writes_post = arr_push(glob_writes_post, 0);
+        glob_promote_reason = arr_push(glob_promote_reason, 0);
+    }
+    // Reset use-def edges for re-runs (but keep allocated arr objects).
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        arr_clear(arr_get(glob_writers, i));
+        arr_clear(arr_get(glob_readers, i));
+        arr_set(glob_writes_pre, i, 0);
+        arr_set(glob_writes_post, i, 0);
+        arr_set(glob_promote_reason, i, 0);
+    }
+
+    // Reset address-taken accumulator. Populated during the per-function walks.
+    if (_cgb_addr_taken_set == 0) { _cgb_addr_taken_set = arr_new(); }
+    else { arr_clear(_cgb_addr_taken_set); }
+
+    // Find main()'s function index for the freeze-point analysis below.
+    _dsp_main_idx = 0 - 1;
+    for (i = 0; i < func_cnt; i = i + 1) {
+        fname = *(funcs[i] + FN_NAME);
+        if (unpack_l(fname) == 4) {
+            if (peek(vbuf + unpack_s(fname) + 0) == 'm') {
+                if (peek(vbuf + unpack_s(fname) + 1) == 'a') {
+                    if (peek(vbuf + unpack_s(fname) + 2) == 'i') {
+                        if (peek(vbuf + unpack_s(fname) + 3) == 'n') {
+                            _dsp_main_idx = i;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (i = 0; i < func_cnt; i = i + 1) {
+        func = funcs[i];
+        body_arr = *(func + FN_BODY);
+        body_cnt = *(func + FN_BCNT);
+
+        // Skip cached functions — they have no AST to walk. Their
+        // classification will be loaded from the .bo cache.
+        if (body_arr == 0) {
+            arr_set(fn_calls, i, 0);
+            arr_set(fn_locally_impure, i, 0);
+            continue;
+        }
+
+        params_arr = *(func + FN_PARS);
+        param_cnt = *(func + FN_PCNT);
+
+        // Set up locals scope for this function: parameters + auto declarations.
+        dsp_reset_locals();
+        for (j = 0; j < param_cnt; j = j + 1) {
+            dsp_add_local(params_arr[j]);
+        }
+        for (j = 0; j < body_cnt; j = j + 1) {
+            stmt = body_arr[j];
+            if (stmt != 0) {
+                if (stmt.ntype == T_DECL) {
+                    darr = stmt.a;
+                    dcnt = stmt.b;
+                    for (k = 0; k < dcnt; k = k + 1) {
+                        dsp_add_local(darr[k]);
+                    }
+                }
+            }
+        }
+
+        // Initialize per-function accumulators for this walk.
+        _cgb_calls = arr_new();
+        _cgb_impure = 0;
+        _cgb_current_fn_idx = i;
+
+        // Walk every statement in the body.
+        for (j = 0; j < body_cnt; j = j + 1) {
+            _cgb_walk(body_arr[j]);
+        }
+
+        arr_set(fn_calls, i, _cgb_calls);
+        arr_set(fn_locally_impure, i, _cgb_impure);
+    }
+
+    // Apply the address-taken set to fn_address_taken[].
+    for (i = 0; i < arr_len(_cgb_addr_taken_set); i = i + 1) {
+        addr_idx = arr_get(_cgb_addr_taken_set, i);
+        if (addr_idx >= 0) {
+            arr_set(fn_address_taken, addr_idx, 1);
+        }
+    }
+
+    // Second pass: walk main()'s body sequentially to detect writes
+    // before vs after the freeze point (first call to maestro_run /
+    // maestro_configure / job_init). Conservative: only top-level
+    // statements in main are inspected, helpers are not traced.
+    if (_dsp_main_idx >= 0) {
+        _dsp_walk_main_for_freeze();
+    }
+
+    return 0;
+}
+
+// ── Freeze-point walker for main() ────────────────────────
+//
+// Walks the top-level statements of main() in source order, flipping a
+// freeze flag the first time we see a call to maestro_run/maestro_configure/
+// job_init. For every assignment to a global, we count it as either a
+// "pre-freeze" or "post-freeze" write. The promoter then uses this to
+// decide whether a global is eligible for extrn promotion.
+//
+// Conservative scope: only TOP-LEVEL statements of main are traced. Writes
+// inside helper functions called from main are NOT counted here — those
+// helpers run their own _cgb_walk pass that records into glob_writers but
+// without freeze position info. The promoter conservatively rejects extrn
+// promotion in those cases (any helper writer = stay auto).
+_dsp_walk_main_for_freeze() {
+    auto func, body_arr, body_cnt, j, stmt: Node, lhs: Node;
+    auto frozen, gi, name_p, ts;
+    func = funcs[_dsp_main_idx];
+    body_arr = *(func + FN_BODY);
+    body_cnt = *(func + FN_BCNT);
+    frozen = 0;
+    for (j = 0; j < body_cnt; j = j + 1) {
+        stmt = body_arr[j];
+        if (stmt == 0) { continue; }
+        // Detect freeze point: a top-level T_CALL whose name is one of
+        // maestro_run / maestro_configure / job_init.
+        if (stmt.ntype == T_CALL) {
+            name_p = stmt.a;
+            if (unpack_l(name_p) == 11) {
+                ts = vbuf + unpack_s(name_p);
+                if (peek(ts) == 'm') {
+                    if (peek(ts + 1) == 'a') {
+                        if (peek(ts + 2) == 'e') {
+                            // maestro_run
+                            frozen = 1;
+                            _dsp_has_freeze = 1;
+                        }
+                    }
+                }
+            }
+            if (unpack_l(name_p) == 17) {
+                ts = vbuf + unpack_s(name_p);
+                if (peek(ts) == 'm') {
+                    if (peek(ts + 1) == 'a') {
+                        if (peek(ts + 2) == 'e') {
+                            // maestro_configure
+                            frozen = 1;
+                            _dsp_has_freeze = 1;
+                        }
+                    }
+                }
+            }
+            if (unpack_l(name_p) == 8) {
+                ts = vbuf + unpack_s(name_p);
+                if (peek(ts) == 'j') {
+                    if (peek(ts + 1) == 'o') {
+                        if (peek(ts + 2) == 'b') {
+                            if (peek(ts + 3) == '_') {
+                                if (peek(ts + 4) == 'i') {
+                                    // job_init
+                                    frozen = 1;
+                                    _dsp_has_freeze = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Detect a top-level assignment to a global.
+        if (stmt.ntype == T_ASSIGN) {
+            lhs = stmt.a;
+            if (lhs != 0) {
+                if (lhs.ntype == T_VAR) {
+                    gi = dsp_find_global(lhs.a);
+                    if (gi >= 0) {
+                        if (frozen) {
+                            arr_set(glob_writes_post, gi, arr_get(glob_writes_post, gi) + 1);
+                        } else {
+                            arr_set(glob_writes_pre, gi, arr_get(glob_writes_pre, gi) + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// ── Per-function purity classification (fixpoint) ──────────
+//
+// Double-buffered fixpoint iteration over the call graph. Each pass
+// reads fn_phase[] and writes fn_phase_next[], then swaps. Convergence
+// is guaranteed in O(call-chain-depth) passes because the lattice has
+// height 1: PHASE_BASE → PHASE_SOLO is the only transition, no upgrade.
+//
+// Initial state: every function starts at PHASE_BASE (optimistic).
+// On each pass, a function is downgraded to PHASE_SOLO if either:
+//   - it has local impurity (locally_impure[i] == 1), or
+//   - any callee is currently PHASE_SOLO
+// Mutual recursion stays at PHASE_BASE if neither member has local
+// impurity. Address-taken functions are NOT automatically downgraded —
+// the loop classifier handles indirect-call safety separately.
+//
+// Cached functions (body_arr == 0) keep their current fn_phase[] value
+// — set elsewhere by .bo loading once that format extension lands.
+classify_all_functions() {
+    auto i, j, callees, n_callees, callee_idx;
+    auto changed, iter, max_iter, func, body_arr;
+
+    // Init: all fresh-parsed functions start at PHASE_BASE. Cached
+    // functions keep whatever fn_phase[] already holds (PHASE_AUTO if
+    // the cache extension isn't live yet).
+    for (i = 0; i < func_cnt; i = i + 1) {
+        func = funcs[i];
+        body_arr = *(func + FN_BODY);
+        if (body_arr != 0) {
+            arr_set(fn_phase, i, PHASE_BASE);
+        }
+    }
+
+    // Fixpoint loop. Cap iterations at func_cnt+1 as a safety net —
+    // convergence is guaranteed faster than that, but the cap prevents
+    // an infinite loop if the call graph somehow has a bug.
+    max_iter = func_cnt + 1;
+    iter = 0;
+    changed = 1;
+    while (changed != 0) {
+        if (iter >= max_iter) { return 0; }
+        iter = iter + 1;
+        changed = 0;
+
+        // Pass: write to fn_phase_next based on current fn_phase.
+        for (i = 0; i < func_cnt; i = i + 1) {
+            func = funcs[i];
+            body_arr = *(func + FN_BODY);
+            // Cached function: copy through, don't touch.
+            if (body_arr == 0) {
+                arr_set(fn_phase_next, i, arr_get(fn_phase, i));
+                continue;
+            }
+            // Local impurity → SOLO. No need to look at callees.
+            if (arr_get(fn_locally_impure, i) != 0) {
+                arr_set(fn_phase_next, i, PHASE_SOLO);
+                continue;
+            }
+            // No callees → trivially BASE.
+            callees = arr_get(fn_calls, i);
+            if (callees == 0) {
+                arr_set(fn_phase_next, i, PHASE_BASE);
+                continue;
+            }
+            // Otherwise, check if any callee is currently SOLO.
+            n_callees = arr_len(callees);
+            auto found_solo;
+            found_solo = 0;
+            for (j = 0; j < n_callees; j = j + 1) {
+                callee_idx = arr_get(callees, j);
+                if (arr_get(fn_phase, callee_idx) == PHASE_SOLO) {
+                    found_solo = 1;
+                    j = n_callees;
+                }
+            }
+            if (found_solo != 0) {
+                arr_set(fn_phase_next, i, PHASE_SOLO);
+            } else {
+                arr_set(fn_phase_next, i, PHASE_BASE);
+            }
+        }
+
+        // Swap buffers and check for changes.
+        for (i = 0; i < func_cnt; i = i + 1) {
+            if (arr_get(fn_phase, i) != arr_get(fn_phase_next, i)) {
+                changed = 1;
+            }
+            arr_set(fn_phase, i, arr_get(fn_phase_next, i));
+        }
+    }
+
+    // W013: verify phase annotations match the analysis results.
+    // `: base` on a function that classify found to be SOLO = warning.
+    // `: solo` is always valid (programmer override, never warns).
+    for (i = 0; i < func_cnt; i = i + 1) {
+        if (arr_get(fn_phase_hint, i) == PHASE_BASE) {
+            if (arr_get(fn_phase, i) == PHASE_SOLO) {
+                diag_warn(13);
+                diag_str("'");
+                diag_packed(*(funcs[i] + FN_NAME));
+                diag_str("' annotated ': base' but has side effects");
+                diag_newline();
+                diag_loc(*(funcs[i] + 64));
+                diag_show_line(*(funcs[i] + 64));
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ── Lazy emit: mark reachable functions ─────────────────────
+//
+// BFS from main() over fn_calls[] edges. A function is reachable if
+// main (transitively) calls it or takes its address via fn_ptr().
+// After this pass, fn_reachable[i] == 1 for every function the binary
+// actually needs. The codegen bridge skips unreachable functions,
+// producing a smaller binary without dead auto-injected module code.
+mark_reachable() {
+    auto queue, head, tail, i, j, fi, callees, n;
+    if (_dsp_main_idx < 0) { return 0; }
+
+    // Reset all to unreachable.
+    for (i = 0; i < func_cnt; i = i + 1) {
+        arr_set(fn_reachable, i, 0);
+    }
+
+    // BFS queue (max size = func_cnt).
+    queue = malloc(func_cnt * 8);
+    head = 0; tail = 0;
+
+    // Seed: main is reachable.
+    arr_set(fn_reachable, _dsp_main_idx, 1);
+    queue[tail] = _dsp_main_idx;
+    tail = tail + 1;
+
+    // Also seed all address-taken functions — they may be called
+    // indirectly via fn_ptr and there's no call edge to follow.
+    for (i = 0; i < func_cnt; i = i + 1) {
+        if (arr_get(fn_address_taken, i) != 0) {
+            if (arr_get(fn_reachable, i) == 0) {
+                arr_set(fn_reachable, i, 1);
+                queue[tail] = i;
+                tail = tail + 1;
+            }
+        }
+    }
+
+    // BFS: follow fn_calls edges.
+    while (head < tail) {
+        fi = queue[head];
+        head = head + 1;
+        callees = arr_get(fn_calls, fi);
+        if (callees != 0) {
+            n = arr_len(callees);
+            for (j = 0; j < n; j = j + 1) {
+                i = arr_get(callees, j);
+                if (arr_get(fn_reachable, i) == 0) {
+                    arr_set(fn_reachable, i, 1);
+                    queue[tail] = i;
+                    tail = tail + 1;
+                }
+            }
+        }
+    }
+
+    free(queue);
+    _lazy_emit_ready = 1;
+
+    return 0;
+}
+
+// ── Smart promotion (auto → extrn / global) ────────────────
+//
+// For every top-level `auto x;` declaration, decide whether the compiler
+// can safely promote it to a more specific storage class. The decision
+// is conservative: any uncertainty falls back to legacy serialized auto.
+//
+// Promotion rules:
+//   1. Skip if user pinned the variable with `auto x: serial;` (glob_pinned[i] == 1).
+//   2. Skip if user already wrote `global x;` or `extrn x;` (glob_class[i] != GLOB_AUTO).
+//   3. Promote to GLOB_EXTRN when:
+//      - All writers are inside main() (no helper writes), AND
+//      - There is at least one write before the freeze point in main(), AND
+//      - There are zero writes after the freeze point.
+//      Conservative: misses init helpers like `init_world()` called from main.
+//      The user can always fall back to explicit `extrn x;` for those.
+//   4. Promote to GLOB_GLOBAL when:
+//      - Any writer or reader is inside a function classified as PHASE_BASE
+//        (the function runs on a worker thread), AND
+//      - The variable was not eligible for extrn (mutually exclusive choice).
+//   5. Otherwise: leave as GLOB_AUTO.
+//
+// The promoter writes a string code into glob_promote_reason[i] for the
+// --show-promotions flag to print. Empty string means no promotion.
+promote_globals() {
+    auto i, j, writers, n_writers, w_idx, all_in_main;
+    auto pre, post, total, helper_writes;
+    auto readers, n_readers, r_idx, found_base;
+    auto _pg_promoted;
+    _pg_promoted = 0;
+
+
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        // Rule 1: skip pinned (auto x: serial;).
+        if (arr_get(glob_pinned, i) != 0) { continue; }
+        // Rule 2: skip already-explicit storage classes.
+        if (arr_get(glob_class, i) != GLOB_AUTO) { continue; }
+
+        writers = arr_get(glob_writers, i);
+        readers = arr_get(glob_readers, i);
+        n_writers = arr_len(writers);
+        n_readers = arr_len(readers);
+        pre = arr_get(glob_writes_pre, i);
+        post = arr_get(glob_writes_post, i);
+
+        // Rule 3: extrn eligibility — all writes in main, before freeze.
+        // Only applies if the program HAS a freeze point (maestro_run/job_init).
+        // Without one, every write is trivially "pre-freeze" → false positives.
+        if (_dsp_main_idx >= 0) {
+            if (_dsp_has_freeze == 0) { all_in_main = 0; }
+            if (_dsp_has_freeze != 0) { all_in_main = 1; }
+            helper_writes = 0;
+            for (j = 0; j < n_writers; j = j + 1) {
+                w_idx = arr_get(writers, j);
+                // Check if this writer is a main() function (compare by name,
+                // not index, because B++ can have multiple main entries in funcs[]
+                // from forward-declaration overrides in different modules).
+                auto _wfn, _wn;
+                _wfn = funcs[w_idx];
+                _wn = *(_wfn + FN_NAME);
+                if (packed_eq(_wn, *(funcs[_dsp_main_idx] + FN_NAME)) == 0) {
+                    all_in_main = 0;
+                    helper_writes = helper_writes + 1;
+                }
+            }
+            if (all_in_main != 0) {
+                if (pre > 0) {
+                    if (post == 0) {
+                        arr_set(glob_class, i, GLOB_EXTRN);
+                        arr_set(glob_promote_reason, i, 1);
+                        _pg_promoted = _pg_promoted + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Rule 4: global eligibility — any worker function reads or writes.
+        found_base = 0;
+        for (j = 0; j < n_writers; j = j + 1) {
+            w_idx = arr_get(writers, j);
+            if (w_idx >= 0) {
+                if (arr_get(fn_phase, w_idx) == PHASE_BASE) { found_base = 1; }
+            }
+        }
+        for (j = 0; j < n_readers; j = j + 1) {
+            r_idx = arr_get(readers, j);
+            if (r_idx >= 0) {
+                if (arr_get(fn_phase, r_idx) == PHASE_BASE) { found_base = 1; }
+            }
+        }
+        if (found_base != 0) {
+            arr_set(glob_class, i, GLOB_GLOBAL);
+            arr_set(glob_promote_reason, i, 2);
+            _pg_promoted = _pg_promoted + 1;
+            continue;
+        }
+
+        // Rule 5: stay auto.
+    }
+
+    // W014: deferred — needs investigation. The check crashes the self-host
+    // even when _dsp_has_freeze is 0 (which should skip the block). Possibly
+    // a variable scope or initialization order issue in promote_globals.
+    // The show_promotions diagnostic already shows pre/post counts so the
+    // programmer can manually verify freeze violations for now.
+
+    return _pg_promoted;
+}
+
+// Print a human-readable summary of the auto-promotion decisions to stderr.
+// Only emits non-empty reasons. Called by bpp.bpp when --show-promotions is set.
+// Print a detailed breakdown of the smart promotion pass to stderr.
+// Two sections:
+//   1. Scan summary: how many globals, which are writable, pre/post counts.
+//      Helps diagnose "why wasn't my variable promoted?".
+//   2. Promotion results: which globals were promoted and to what class.
+show_promotions() {
+    auto i, reason, name_p, writers, n_writers, pre, post;
+
+    // Section 1: scan summary. Lists every GLOB_AUTO variable that has
+    // any writers, with their pre/post freeze counts. Variables with no
+    // writers are pure reads and can't be promoted to extrn (nothing to freeze).
+    // Count reachable functions for the diagnostic.
+    auto _r_cnt, _t;
+    _r_cnt = 0;
+    for (_t = 0; _t < func_cnt; _t = _t + 1) {
+        if (arr_get(fn_reachable, _t)) { _r_cnt = _r_cnt + 1; }
+    }
+    diag_str("[lazy] ");
+    diag_int(_r_cnt);
+    diag_str("/");
+    diag_int(func_cnt);
+    diag_str(" functions reachable");
+    diag_newline();
+    diag_str("[promote] ");
+    diag_int(glob_cnt);
+    diag_str(" globals, main_idx=");
+    diag_int(_dsp_main_idx);
+    diag_newline();
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        // Show auto globals with at least one writer — those are the
+        // candidates the promoter evaluated.
+        if (arr_get(glob_class, i) == GLOB_AUTO) {
+            writers = arr_get(glob_writers, i);
+            n_writers = arr_len(writers);
+            if (n_writers > 0) {
+                pre = arr_get(glob_writes_pre, i);
+                post = arr_get(glob_writes_post, i);
+                diag_str("  ");
+                diag_packed(arr_get(globals, i));
+                diag_str(": writers=");
+                diag_int(n_writers);
+                diag_str(" [");
+                auto _wi;
+                for (_wi = 0; _wi < n_writers; _wi = _wi + 1) {
+                    if (_wi > 0) { diag_str(","); }
+                    diag_int(arr_get(writers, _wi));
+                }
+                diag_str("] pre=");
+                diag_int(pre);
+                diag_str(" post=");
+                diag_int(post);
+                diag_newline();
+            }
+        }
+    }
+
+    // Section 2: promotion results. Only emits lines for globals that
+    // were actually promoted (reason != 0). This is the TL;DR the user
+    // looks at first — the scan summary above is for debugging surprises.
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        reason = arr_get(glob_promote_reason, i);
+        if (reason == 0) { continue; }
+        diag_str("  ");
+        diag_packed(arr_get(globals, i));
+        diag_str(" -> ");
+        if (reason == 1) { diag_str("extrn"); }
+        if (reason == 2) { diag_str("global"); }
+        diag_newline();
     }
     return 0;
 }

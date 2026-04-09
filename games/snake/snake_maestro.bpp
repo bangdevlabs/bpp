@@ -23,14 +23,16 @@
 // snake_gpu.bpp stays untouched alongside this file as the baseline
 // for visual validation: side-by-side runs must look and feel identical.
 
-import "bpp_maestro.bsm";
-import "bpp_job.bsm";
+// bpp_maestro, bpp_job, bpp_io, bpp_array, bpp_hash, bpp_buf, bpp_str,
+// bpp_math, bpp_file, _stb_core, bpp_beat are all auto-injected by the
+// compiler for any user main() program — no explicit import needed.
+// We import only the stb cartridges this game opts into.
 import "stbgame.bsm";
 import "stbrender.bsm";
-import "bpp_io.bsm";
 import "stbecs.bsm";
-import "stbarena.bsm";
+import "bpp_arena.bsm";
 import "stbpool.bsm";
+load "snake_particles.bsm";
 
 // ── Compile-time constants ──────────────────────────────────
 
@@ -49,21 +51,38 @@ const DIR_DOWN = 2;
 const DIR_LEFT = 3;
 
 // ── Game state ──────────────────────────────────────────────
+//
+// Storage classes:
+//   extrn — pointers allocated once at init() and never reassigned. The
+//           memory they point at is still mutable (ECS components, body
+//           cells, score cells), but the storage slot itself is frozen
+//           after maestro_run() takes over.
+//   auto  — per-frame mutable game state owned by the solo phase.
+//
+// This split is the explicit baseline for the auto-promotion task — once
+// the smart-dispatch promoter lands, the same `auto world;` form should
+// produce identical runtime semantics. Diff this file before/after the
+// promoter to verify nothing slipped.
 
-auto world;
-auto frame_arena;
+extrn world;        // ECS handle, allocated once via ecs_new(200)
+extrn frame_arena;  // per-frame scratch arena, reset each tick (pointer fixed)
+extrn body;         // snake body cells (heap array, contents mutate)
+extrn scores;       // ranking storage (heap array, contents mutate)
 
 auto head_x, head_y;
-auto body, body_len;
+auto body_len;
 auto facing, dead, score;
 auto apple_x, apple_y;
 
-auto scores, num_scores, score_saved;
+auto num_scores, score_saved;
 
 // Cached dt for the base-phase particle worker. The base phase function
 // doesn't see dt directly (job_submit only carries one arg slot), so the
-// solo phase stashes it here before the base callback fires.
-auto _last_dt;
+// solo phase stashes it here before the base callback fires. The worker
+// reads it from particle_base_job, so it's `global` (worker-visible) —
+// the solo write happens before maestro's auto job_wait_all separator,
+// so the worker read is well-ordered without explicit synchronization.
+global _last_dt;
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -84,62 +103,8 @@ shift_body() {
     return 0;
 }
 
-// ── Particle system ─────────────────────────────────────────
-
-spawn_particles(px, py, count, color) {
-    auto i, id;
-    for (i = 0; i < count; i = i + 1) {
-        id = ecs_spawn(world);
-        if (id >= 0) {
-            ecs_set_pos(world, id, px * 1000, py * 1000);
-            ecs_set_vel(world, id, (randi(200) - 100) * 1000, (randi(200) - 100) * 1000);
-            ecs_set_flags(world, id, color * 256 + 30);
-        }
-    }
-    return 0;
-}
-
-// Worker job — runs on a worker thread during the base phase. Updates
-// particle physics (one ecs_physics call) and then iterates the pool
-// to decrement each particle's life byte and cull the dead ones.
-// Pure work over the global ECS world; no main-thread state is touched
-// while the job runs because the maestro loop is parked at base→wait.
-particle_base_job(_arg) {
-    auto i, cap, flags, life;
-    cap = ecs_capacity(world);
-    ecs_physics(world, _last_dt);
-    for (i = 0; i < cap; i = i + 1) {
-        if (ecs_alive(world, i)) {
-            flags = ecs_get_flags(world, i);
-            life = flags & 0xFF;
-            if (life <= 0) {
-                ecs_kill(world, i);
-            } else {
-                // Decrement only the life byte. Subtracting 1 is safe
-                // because life > 0 here, so no underflow into color bits.
-                ecs_set_flags(world, i, flags - 1);
-            }
-        }
-    }
-    return 0;
-}
-
-// Render-side particle pass: walk the live ECS slots and emit one
-// render_rect per particle. Runs on the main thread during render.
-draw_particles() {
-    auto i, cap, flags, px, py, color;
-    cap = ecs_capacity(world);
-    for (i = 0; i < cap; i = i + 1) {
-        if (ecs_alive(world, i)) {
-            flags = ecs_get_flags(world, i);
-            px = ecs_get_x(world, i) / 1000;
-            py = ecs_get_y(world, i) / 1000;
-            color = flags >> 8;
-            render_rect(px, py, 3, 3, color);
-        }
-    }
-    return 0;
-}
+// Particle system extracted to snake_particles.bsm (loaded above).
+// Functions available: spawn_particles, particle_base_job, draw_particles.
 
 // ── Init / Reset ────────────────────────────────────────────
 
@@ -199,13 +164,20 @@ snake_init_phase() {
 // snake state, advances head, checks collisions. This is the part that
 // MUST stay sequential because snake's update has tight ordering: input
 // → direction → move → collide → death.
+//
+// Polls Cocoa events via game_frame_begin (since maestro doesn't know
+// about windows) and signals maestro_quit if the user closed the window
+// or pressed ESC.
 snake_solo_phase(dt) {
     auto i, bx, by;
+
+    game_frame_begin();
+    if (game_should_quit()) { maestro_quit(); return 0; }
 
     arena_reset(frame_arena);
     _last_dt = dt;
 
-    if (key_pressed(KEY_ESC)) { sys_exit(0); }
+    if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
 
     if (dead) {
         if (score_saved == 0) { add_score(score); score_saved = 1; }
@@ -319,13 +291,15 @@ snake_quit_phase() {
 // ── Main ────────────────────────────────────────────────────
 
 main() {
-    maestro_configure(W, H, "B++ Snake Maestro", FPS);
     maestro_set_workers(N_WORKERS);
     maestro_register_init(fn_ptr(snake_init_phase));
     maestro_register_solo(fn_ptr(snake_solo_phase));
     maestro_register_base(fn_ptr(snake_base_phase));
     maestro_register_render(fn_ptr(snake_render_phase));
     maestro_register_quit(fn_ptr(snake_quit_phase));
-    maestro_run();
+    // game_run wraps game_init + maestro_configure + maestro_run + game_end.
+    // The window is opened, the maestro loop drives solo/base/render at FPS,
+    // and the snake_solo_phase polls game_frame_begin + game_should_quit.
+    game_run(W, H, "B++ Snake Maestro", FPS);
     return 0;
 }

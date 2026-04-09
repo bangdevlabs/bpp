@@ -538,10 +538,13 @@ bo_resolve_calls_x64() {
 
 // Write the .bo header: magic bytes + version 3 + target.
 // Content-addressed cache: the filename IS the hash. No hash data in the header.
+// Version history:
+//   3 — original layout (functions/structs/enums/globals/externs)
+//   4 — globals carry a 1-byte storage class (GLOB_AUTO/GLOB_GLOBAL/GLOB_EXTRN)
 bo_write_header(mi, target) {
     bo_write_u8(66);
     bo_write_u8(79);
-    bo_write_u8(3);
+    bo_write_u8(4);
     bo_write_u8(target);
     return 0;
 }
@@ -555,7 +558,7 @@ bo_check_header(mi) {
     if (m0 != 66) { return 0; }
     if (m1 != 79) { return 0; }
     ver = bo_read_u8();
-    if (ver != 3) { return 0; }
+    if (ver != 4) { return 0; }
     bo_read_u8();
     return 1;
 }
@@ -620,7 +623,8 @@ bo_write_export(mi) {
         }
     }
 
-    // Globals belonging to this module.
+    // Globals belonging to this module. Each entry is a packed name plus
+    // a 1-byte storage class (GLOB_AUTO/GLOB_GLOBAL/GLOB_EXTRN).
     fc = 0;
     for (i = 0; i < glob_cnt; i = i + 1) {
         if (arr_get(glob_mods, i) == mi) { fc = fc + 1; }
@@ -629,6 +633,7 @@ bo_write_export(mi) {
     for (i = 0; i < glob_cnt; i = i + 1) {
         if (arr_get(glob_mods, i) == mi) {
             bo_write_str(arr_get(globals, i));
+            bo_write_u8(arr_get(glob_class, i));
         }
     }
 
@@ -693,6 +698,7 @@ bo_read_export(mi) {
         *(rec + FN_BODY) = 0;
         *(rec + FN_BCNT) = 0;
         *(rec + FN_HINTS) = hints;
+        *(rec + FN_STUB) = 0;
         funcs = arr_push(funcs, rec);
         func_cnt = arr_len(funcs);
         func_mods = arr_push(func_mods, mi);
@@ -741,17 +747,18 @@ bo_read_export(mi) {
         enum_mods = arr_push(enum_mods, mi);
     }
 
-    // Globals: register variable names. Cached globals default to
-    // is_shared=0 (legacy/serialized) until the .bo format learns to
-    // round-trip the flag. Existing games stay safe; only freshly
-    // parsed `global x;` declarations carry the new flag for now.
+    // Globals: register variable names with their storage class.
+    // The class byte was added in BO_VERSION 4 — older caches were
+    // invalidated automatically by the version bump.
     fc = bo_read_u16();
     for (i = 0; i < fc; i = i + 1) {
+        auto _gc;
         name_p = bo_read_str();
+        _gc = bo_read_u8();
         globals = arr_push(globals, name_p);
         glob_cnt = arr_len(globals);
         glob_mods = arr_push(glob_mods, mi);
-        glob_shared = arr_push(glob_shared, 0);
+        glob_class = arr_push(glob_class, _gc);
     }
 
     // Externs: create extern records and register.

@@ -188,6 +188,33 @@ topo_sort() {
         }
     }
     free(in_deg); free(queue);
+
+    // Check for circular dependencies: if any module was not visited
+    // by the topological sort, there is a cycle in the import graph.
+    auto _topo_cnt, _total, _ci, _cj, _cfound;
+    _topo_cnt = arr_len(mod_topo);
+    _total = arr_len(diag_file_starts);
+    if (_topo_cnt < _total) {
+        diag_fatal(222);
+        diag_str("circular dependency between modules");
+        diag_newline();
+        for (_ci = 0; _ci < _total; _ci = _ci + 1) {
+            _cfound = 0;
+            for (_cj = 0; _cj < _topo_cnt; _cj = _cj + 1) {
+                if (arr_get(mod_topo, _cj) == _ci) { _cfound = 1; }
+            }
+            if (_cfound == 0) {
+                auto _fp, _fs, _fl;
+                diag_str("  unresolved: ");
+                _fp = arr_get(diag_file_names, _ci);
+                _fs = unpack_s(_fp); _fl = unpack_l(_fp);
+                diag_buf(fname_buf + _fs, _fl);
+                diag_newline();
+            }
+        }
+        sys_exit(1);
+    }
+
     return 0;
 }
 
@@ -580,9 +607,15 @@ find_file(base_off, base_len, name_off, name_len) {
 // Check if a line (at loff, llen bytes in mem_base) is a file import.
 // If so, extract the filename into linebuf and return its length.
 // Returns 0 if not a file import.
+// Set to 1 by check_file_import when the line uses `load` instead of
+// `import`. The caller uses this to restrict the search path to the
+// entry file's directory only (project-local, no engine fallback).
+auto _import_is_load;
+
 check_file_import(loff, llen) {
     auto p, q, ch, name_start, name_len;
     p = 0;
+    _import_is_load = 0;
 
     // Skip leading whitespace.
     while (p < llen) {
@@ -593,15 +626,29 @@ check_file_import(loff, llen) {
     }
     if (p >= llen) { p = p - llen; }
 
-    // Check for "import" (6 chars).
-    if (p + 6 > llen) { return 0; }
-    if (peek(loff + p) != 105) { return 0; }     // i
-    if (peek(loff + p + 1) != 109) { return 0; }  // m
-    if (peek(loff + p + 2) != 112) { return 0; }  // p
-    if (peek(loff + p + 3) != 111) { return 0; }  // o
-    if (peek(loff + p + 4) != 114) { return 0; }  // r
-    if (peek(loff + p + 5) != 116) { return 0; }  // t
-    p = p + 6;
+    // Check for "import" (6 chars) or "load" (4 chars).
+    if (p + 4 <= llen) {
+        if (peek(loff + p) == 108) {     // l
+            if (peek(loff + p + 1) == 111) { // o
+                if (peek(loff + p + 2) == 97) {  // a
+                    if (peek(loff + p + 3) == 100) { // d
+                        _import_is_load = 1;
+                        p = p + 4;
+                    }
+                }
+            }
+        }
+    }
+    if (_import_is_load == 0) {
+        if (p + 6 > llen) { return 0; }
+        if (peek(loff + p) != 105) { return 0; }     // i
+        if (peek(loff + p + 1) != 109) { return 0; }  // m
+        if (peek(loff + p + 2) != 112) { return 0; }  // p
+        if (peek(loff + p + 3) != 111) { return 0; }  // o
+        if (peek(loff + p + 4) != 114) { return 0; }  // r
+        if (peek(loff + p + 5) != 116) { return 0; }  // t
+        p = p + 6;
+    }
 
     // Must be followed by whitespace.
     if (p >= llen) { return 0; }
@@ -771,6 +818,103 @@ process_file(path_off, path_len) {
         }
     }
 
+    // ── Auto-inject core utilities and runtime for the entry .bpp ──
+    //
+    // Every B++ program written by a user gets the "videogame console"
+    // for free: dynamic arrays, hash maps, byte buffers, strings, I/O,
+    // math, file ops, the universal time + thread core, and the
+    // parallel runtime (beat / job / maestro). Programs that don't use
+    // them pay the binary size cost (~30KB total until lazy emit lands),
+    // but in exchange writing a B++ program never requires boilerplate
+    // imports for foundational utilities. The console comes complete.
+    //
+    // Compiler self-host (bpp.bpp) imports several of these explicitly
+    // anyway via its own import block; was_imported() makes the
+    // auto-injection idempotent in that case. Modules already loaded
+    // via the explicit chain are simply skipped on second visit.
+    //
+    // No dep edge is recorded for the auto-injects (same convention as
+    // the stbgame trigger above). Topo sort tolerates orphan modules
+    // and the import order doesn't affect parser semantics because
+    // validation runs once after all parsing.
+    if (my_mod_idx == 0) {
+        auto _ai_pname, _ai_plen, _ai_i;
+        auto _ai_namebuf, _ai_savedtop;
+
+        // bpp_array.bsm  (13 bytes)
+        _ai_pname = "bpp_array.bsm";
+        for (_ai_i = 0; _ai_i < 13; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 13);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_hash.bsm  (12 bytes)
+        _ai_pname = "bpp_hash.bsm";
+        for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_buf.bsm  (11 bytes)
+        _ai_pname = "bpp_buf.bsm";
+        for (_ai_i = 0; _ai_i < 11; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 11);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_str.bsm  (11 bytes)
+        _ai_pname = "bpp_str.bsm";
+        for (_ai_i = 0; _ai_i < 11; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 11);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_io.bsm  (10 bytes)
+        _ai_pname = "bpp_io.bsm";
+        for (_ai_i = 0; _ai_i < 10; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 10);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_math.bsm  (12 bytes)
+        _ai_pname = "bpp_math.bsm";
+        for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_file.bsm  (12 bytes)
+        _ai_pname = "bpp_file.bsm";
+        for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // _stb_core.bsm  (13 bytes) — resolves via target-suffix to _stb_core_macos.bsm
+        _ai_pname = "_stb_core.bsm";
+        for (_ai_i = 0; _ai_i < 13; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 13);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_beat.bsm  (12 bytes)
+        _ai_pname = "bpp_beat.bsm";
+        for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_job.bsm  (11 bytes)
+        _ai_pname = "bpp_job.bsm";
+        for (_ai_i = 0; _ai_i < 11; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 11);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+
+        // bpp_maestro.bsm  (15 bytes)
+        _ai_pname = "bpp_maestro.bsm";
+        for (_ai_i = 0; _ai_i < 15; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 15);
+        if (_ai_plen > 0) { process_file(pathbuf, _ai_plen); }
+    }
+
+    // Mark where module 0's own content starts in outbuf.
+    // All auto-injected modules are now in outbuf. Anything emitted
+    // from this point forward belongs to the current file.
+    // If the entry file has explicit imports, line 910 updates this
+    // further after each import resolves.
+    if (my_mod_idx == 0) { mod0_real_start = outbuf_len; }
+
     // Process line by line.
     pos = 0;
     while (pos < fsize) {
@@ -785,11 +929,22 @@ process_file(path_off, path_len) {
         }
         if (pos > fsize) { pos = pos - fsize; }
 
-        // Check if this line is a file import.
+        // Check if this line is a file import or load.
         fname_len = check_file_import(fbuf + my_file + line_start, pos - line_start);
         if (fname_len > 0) {
-            // Use my_path (saved in fbuf stack) for dirname resolution.
-            plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);
+            if (_import_is_load) {
+                // `load` keyword: resolve ONLY relative to the entry file's
+                // directory. No fallback to stb/ or installed paths. This
+                // enforces that loaded files are part of the project, not engine.
+                plen = resolve_path(fbuf + my_path, path_len, linebuf, fname_len);
+                auto _lfd;
+                _lfd = sys_open(pathbuf, 0);
+                if (_lfd >= 0) { sys_close(_lfd); }
+                else { plen = 0; }
+            } else {
+                // `import` keyword: full search path (relative, stb/, installed).
+                plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);
+            }
             if (plen > 0) {
                 // Save the resolved path before process_file recurses, because
                 // pathbuf is shared scratch — nested find_file calls inside
@@ -820,12 +975,20 @@ process_file(path_off, path_len) {
                 if (my_mod_idx == 0) { mod0_real_start = outbuf_len; }
             } else {
                 diag_fatal(2);
-                diag_str("import '");
+                if (_import_is_load) {
+                    diag_str("load '");
+                } else {
+                    diag_str("import '");
+                }
                 auto _ei;
                 for (_ei = 0; _ei < fname_len; _ei = _ei + 1) {
                     diag_ch(peek(linebuf + _ei));
                 }
-                diag_str("' not found (searched: ./, stb/, /usr/local/lib/bpp/stb/)");
+                if (_import_is_load) {
+                    diag_str("' not found in entry file directory");
+                } else {
+                    diag_str("' not found (searched: ./, stb/, /usr/local/lib/bpp/stb/)");
+                }
                 diag_newline();
                 sys_exit(1);
             }

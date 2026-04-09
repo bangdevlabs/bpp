@@ -57,14 +57,19 @@ auto x64_lbl_cnt, x64_depth;
 // Break label stack for while loops.
 auto x64_break_stack;
 
+// Continue label stack for while loops.
+// Plain while: lands just before the back-branch to top.
+// For-loops: lands just before the step expression.
+auto x64_continue_stack;
+
 // Current function context.
 auto x64_cur_fn_name, x64_cur_fn_idx;
 
 // Function entry labels and current return label.
 auto x64_fn_lbl, x64_ret_lbl;
 
-// Sentinel packed names for hidden argc/argv globals.
-auto x64_argc_sym, x64_argv_sym;
+// Sentinel packed names for hidden argc/argv/envp globals.
+auto x64_argc_sym, x64_argv_sym, x64_envp_sym;
 
 // ── Initialization ─────────────────────────────────────────
 
@@ -84,10 +89,24 @@ init_codegen_x86_64() {
     x64_str_tbl = arr_new();
     x64_lbl_cnt = 0; x64_depth = 0;
     x64_break_stack = arr_new();
+    x64_continue_stack = arr_new();
     x64_fn_lbl = arr_new();
     x64_ret_lbl = 0;
     x64_argc_sym = 0 - 1;
     x64_argv_sym = 0 - 2;
+    x64_envp_sym = 0 - 3;
+    return 0;
+}
+
+// ── Hidden globals helper ──────────────────────────────────
+// Push the runtime's hidden global symbols (argc/argv/envp) onto x64_gl_name.
+// Always called AFTER user globals have been copied so the hidden slots
+// land at the end of the data section. Adding a new hidden global = add
+// one line here, no other site to remember.
+x64_add_hidden_globals() {
+    x64_gl_name = arr_push(x64_gl_name, x64_argc_sym);
+    x64_gl_name = arr_push(x64_gl_name, x64_argv_sym);
+    x64_gl_name = arr_push(x64_gl_name, x64_envp_sym);
     return 0;
 }
 
@@ -97,11 +116,15 @@ bridge_data_x86_64() {
     auto i, rec, name_p, idx, j;
     x64_sbuf = vbuf;
 
-    // Copy functions, handling forward declarations.
+    // Copy reachable functions, handling forward declarations.
     arr_clear(x64_fn_name); arr_clear(x64_fn_par); arr_clear(x64_fn_pcnt);
     arr_clear(x64_fn_body); arr_clear(x64_fn_bcnt); arr_clear(x64_fn_fidx);
     i = 0;
     while (i < func_cnt) {
+        // Lazy emit: skip unreachable functions.
+        if (_lazy_emit_ready) {
+            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+        }
         rec = *(funcs + i * 8);
         name_p = *(rec + FN_NAME);
         idx = -1;
@@ -1203,6 +1226,22 @@ x64_emit_node(nd) {
             x64_enc_load(0, 0, 0);
             return 0;
         }
+        // Built-in: envp_get(i) — read i-th environment string pointer.
+        // Returns 0 once i passes the NULL terminator. Used by getenv()
+        // in bpp_io.bsm to walk the env vars.
+        if (x64_str_eq(n.a, "envp_get", 8)) {
+            x64_emit_node(*(n.b));
+            x64_emit_push();
+            auto dpos;
+            dpos = x64_enc_lea_rip(10);
+            x64_enc_add_reloc(dpos, x64_envp_sym, 0);
+            x64_enc_load(0, 10, 0);
+            x64_emit_pop(1);
+            x64_enc_shl_imm(1, 3);
+            x64_enc_add_reg(0, 1);
+            x64_enc_load(0, 0, 0);
+            return 0;
+        }
         // Built-in: fn_ptr(name).
         if (x64_str_eq(n.a, "fn_ptr", 6)) {
             arr = n.b;
@@ -1486,10 +1525,26 @@ x64_emit_stmt(nd) {
         return 0;
     }
 
+    if (t == T_CONTINUE) {
+        if (arr_len(x64_continue_stack) > 0) {
+            auto cnt_lbl;
+            cnt_lbl = arr_last(x64_continue_stack);
+            x64_enc_jmp_label(cnt_lbl);
+        }
+        return 0;
+    }
+
     if (t == T_WHILE) {
+        // n.e (offset 40) holds the for-loop step expression, or 0 for plain while.
+        // The continue label is emitted between body and step so continue runs the
+        // step before re-testing the condition.
+        auto step_node, lbl3;
+        step_node = n.e;
         lbl = x64_enc_new_label();
         lbl2 = x64_enc_new_label();
+        lbl3 = x64_enc_new_label();
         x64_break_stack = arr_push(x64_break_stack, lbl2);
+        x64_continue_stack = arr_push(x64_continue_stack, lbl3);
         x64_enc_def_label(lbl);
         ety = x64_emit_node(n.a);
         if (ety == 1) {
@@ -1501,9 +1556,12 @@ x64_emit_stmt(nd) {
         x64_enc_test_reg(0, 0);
         x64_enc_jcc_label(CC_E, lbl2);
         x64_emit_body(n.b, n.c);
+        x64_enc_def_label(lbl3);
+        if (step_node != 0) { x64_emit_stmt(step_node); }
         x64_enc_jmp_label(lbl);
         x64_enc_def_label(lbl2);
         arr_pop(x64_break_stack);
+        arr_pop(x64_continue_stack);
         return 0;
     }
 
@@ -1587,10 +1645,10 @@ x64_emit_func(fi) {
     x64_enc_mov_reg(5, 4);           // mov rbp, rsp
     if (frame > 0) { x64_enc_sub_imm(4, frame); }  // sub rsp, frame
 
-    // In main(), save argc (RDI) and argv (RSI) to hidden globals.
-    // Linux passes argc in RDI and argv in RSI at _start (or via libc crt).
-    // For a static binary with direct entry, the stack has [argc, argv[0], ...].
-    // We handle this in emit_all by emitting a _start stub.
+    // In main(), save argc (RDI), argv (RSI), and envp (RDX) to hidden
+    // globals. The _start stub below sets up RDI/RSI/RDX from the kernel
+    // stack so that main sees the standard `(int argc, char**argv, char**envp)`
+    // signature even though Linux passes these via the stack at process entry.
     if (x64_str_eq(name_p, "main", 4)) {
         auto dpos;
         dpos = x64_enc_lea_rip(10);
@@ -1599,6 +1657,9 @@ x64_emit_func(fi) {
         dpos = x64_enc_lea_rip(10);
         x64_enc_add_reloc(dpos, x64_argv_sym, 0);
         x64_enc_store(6, 10, 0);
+        dpos = x64_enc_lea_rip(10);
+        x64_enc_add_reloc(dpos, x64_envp_sym, 0);
+        x64_enc_store(2, 10, 0);
     }
 
     // Store incoming register arguments to their stack slots.
@@ -1611,6 +1672,9 @@ x64_emit_func(fi) {
     // Emit function body.
     x64_depth = 0;
     x64_emit_body(body_arr, body_cnt);
+
+    // Implicit return 0: set rax = 0 for functions without explicit return.
+    x64_enc_xor_zero(0);
 
     // Epilogue.
     x64_enc_def_label(x64_ret_lbl);
@@ -1654,9 +1718,8 @@ x64_mod_init() {
         if (idx < 0) { x64_gl_name = arr_push(x64_gl_name, name_p); }
         i = i + 1;
     }
-    // Add hidden globals for argc/argv.
-    x64_gl_name = arr_push(x64_gl_name, x64_argc_sym);
-    x64_gl_name = arr_push(x64_gl_name, x64_argv_sym);
+    // Add hidden globals (argc/argv/envp) at the end of the data section.
+    x64_add_hidden_globals();
 
     // Copy ALL externs.
     arr_clear(x64_ex_name); arr_clear(x64_ex_ret);
@@ -1735,16 +1798,21 @@ emit_module_x86_64(mi) {
 }
 
 // Emit the _start entry point stub after all modules have been emitted.
-// Finds main in x64_fn_name, emits argc/argv setup, calls main, exits.
+// Finds main in x64_fn_name, emits argc/argv/envp setup, calls main, exits.
 // Returns the _start label ID.
 x64_emit_start_stub() {
     auto start_lbl, main_fi, i;
     arr_clear(x64_enc_fix_pos); arr_clear(x64_enc_fix_lbl);
     start_lbl = x64_enc_new_label();
     x64_enc_def_label(start_lbl);
-    x64_enc_pop(7);
-    x64_enc_mov_reg(6, 4);
-    x64_enc_and_imm(4, 0 - 16);
+    x64_enc_pop(7);                  // RDI = argc
+    x64_enc_mov_reg(6, 4);           // RSI = &argv[0]
+    // Compute envp = &argv[argc+1] before alignment.
+    x64_enc_mov_reg(2, 7);           // RDX = argc
+    x64_enc_shl_imm(2, 3);           // RDX = argc * 8
+    x64_enc_add_reg(2, 6);           // RDX = &argv[argc]
+    x64_enc_add_imm(2, 8);           // RDX = &argv[argc+1] = envp[0]
+    x64_enc_and_imm(4, 0 - 16);      // align stack
     main_fi = 0 - 1;
     i = 0;
     while (i < arr_len(x64_fn_name)) {
@@ -1768,9 +1836,8 @@ emit_all_x86_64() {
 
     bridge_data_x86_64();
 
-    // Add hidden globals for argc/argv.
-    x64_gl_name = arr_push(x64_gl_name, x64_argc_sym);
-    x64_gl_name = arr_push(x64_gl_name, x64_argv_sym);
+    // Add hidden globals (argc/argv/envp) at the end of the data section.
+    x64_add_hidden_globals();
 
     // Reset encoder state.
     x64_enc_pos = 0;
@@ -1789,15 +1856,23 @@ emit_all_x86_64() {
         i = i + 1;
     }
 
-    // Emit _start stub: extracts argc/argv from stack, calls main, then exits.
+    // Emit _start stub: extracts argc/argv/envp from stack, calls main, then exits.
     start_lbl = x64_enc_new_label();
     x64_enc_def_label(start_lbl);
-    // On Linux, at _start: [RSP] = argc, [RSP+8] = argv[0], ...
+    // On Linux, at _start: [RSP] = argc, [RSP+8] = argv[0], ...,
+    // [RSP+(argc+1)*8] = envp[0]. Layout per the SysV ABI process startup.
     x64_enc_pop(7);                   // RDI = argc (pop from stack)
     x64_enc_mov_reg(6, 4);            // RSI = RSP = &argv[0]
+    // Compute envp = &argv[argc+1] BEFORE aligning the stack, because
+    // the alignment loses RSP's relationship to the original kernel layout.
+    // Equivalent to lea rdx, [rsi + rdi*8 + 8].
+    x64_enc_mov_reg(2, 7);            // RDX = RDI = argc
+    x64_enc_shl_imm(2, 3);            // RDX = argc * 8
+    x64_enc_add_reg(2, 6);            // RDX = RSI + argc*8 = &argv[argc] (NULL terminator)
+    x64_enc_add_imm(2, 8);            // RDX = &argv[argc+1] = envp[0]
     // Align stack to 16 bytes before calling main.
     x64_enc_and_imm(4, 0 - 16);
-    // Call main(argc, argv).
+    // Call main(argc, argv, envp). RDI=argc, RSI=argv, RDX=envp now set.
     main_fi = x64_find_fn(pack(0, 0));  // Will be found by name below.
     i = 0;
     while (i < arr_len(x64_fn_name)) {

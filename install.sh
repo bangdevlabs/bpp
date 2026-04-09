@@ -85,6 +85,7 @@ sudo cp src/bpp_file.bsm "$LIB_DIR/"
 sudo cp src/bpp_beat.bsm "$LIB_DIR/"
 sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
+sudo cp src/bpp_arena.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
@@ -110,7 +111,7 @@ rm -f ./bug 2>/dev/null; cp "$BIN_DIR/bug" ./bug 2>/dev/null || true
 echo "==> Installed:"
 echo "    $BIN_DIR/bpp (compiler)"
 echo "    $BIN_DIR/bug (debugger)"
-echo "    $LIB_DIR/defs.bsm"
+echo "    $LIB_DIR/bpp_defs.bsm"
 echo "    $STB_DIR/ ($(ls stb/*.bsm | wc -l | tr -d ' ') modules)"
 echo "    $DRV_DIR/ ($(ls drivers/*.bsm | wc -l | tr -d ' ') drivers)"
 echo "    $ARM64_DIR/ ($(ls src/aarch64/*.bsm | wc -l | tr -d ' ') modules)"

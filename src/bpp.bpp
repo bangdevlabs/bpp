@@ -39,6 +39,10 @@ main() {
     flag_permod = 0;
     flag_mono = 0;
     flag_bug = 0;
+    auto flag_show_promotions;
+    flag_show_promotions = 0;
+    auto flag_stats;
+    flag_stats = 0;
 
     // Initialize all subsystems.
     init_array();
@@ -109,10 +113,19 @@ main() {
                         if (str_peek(a, 4) == 'n') { mode = 3; }
                     }
                 }
-                // --show-deps (print module graph and exit)
+                // --show-deps (print module graph and exit) vs
+                // --show-promotions (print smart-dispatch decisions to stderr).
+                // Disambiguate by char 7 (after "--show-"): 'd' or 'p'.
                 if (str_peek(a, 2) == 's') {
                     if (str_peek(a, 3) == 'h') {
-                        if (str_peek(a, 4) == 'o') { mode = 4; }
+                        if (str_peek(a, 4) == 'o') {
+                            if (str_peek(a, 7) == 'd') { mode = 4; }
+                            if (str_peek(a, 7) == 'p') { flag_show_promotions = 1; }
+                        }
+                    }
+                    // --stats (print build statistics to stderr)
+                    if (str_peek(a, 3) == 't') {
+                        if (str_peek(a, 4) == 'a') { flag_stats = 1; }
                     }
                 }
                 // --per-module (use per-module codegen for testing)
@@ -224,31 +237,26 @@ main() {
         if (mode == 2) { a64_bin_mode = 1; a64_mod_init(); }
         if (mode == 3) { x64_mod_init(); }
 
-        // Start at module 1: module 0 (the .bpp file) has its content at the
-        // end of outbuf (after all imports), so lex_module(0) gets the wrong range.
-        // Module 0 is compiled after the loop using full lex+parse.
+        // Compile modules 1..N: cached modules load exports + code from .bo,
+        // stale modules are fully compiled and saved to .bo.
         i = 1;
         while (i < mk) {
             bo_make_path(i);
             if (arr_get(mod_stale, i) == 0) {
                 if (bo_load_file(bo_pathbuf) > 0) {
                     if (bo_check_header(i)) {
-                        // Clean module: load export data + cached code.
                         bo_read_export(i);
                         if (mode == 2) { bo_load_code_arm64(); }
                         if (mode == 3) { bo_load_code_x64(); }
                         i = i + 1;
                     } else {
-                        // Header mismatch: fall through to stale path.
                         arr_set(mod_stale, i, 1);
                     }
                 } else {
-                    // No .bo file: fall through to stale path.
                     arr_set(mod_stale, i, 1);
                 }
             }
             if (arr_get(mod_stale, i) == 1) {
-                // Stale module: lex, parse, infer, codegen, save.
                 tok_before = tok_cnt;
                 lex_module(i);
                 parse_module(tok_cnt);
@@ -283,37 +291,37 @@ main() {
         }
 
         // Compile module 0 (the top-level .bpp file).
-        // Its content is at the end of outbuf (after all imports),
-        // starting at mod0_real_start. If no imports (-1), lex from 0.
         auto m0s, m0_tok_before;
         m0s = mod0_real_start;
         if (m0s < 0) { m0s = 0; }
         m0_tok_before = tok_cnt;
         pos = m0s;
+            // Reset cur_line AND diag_file_line_starts[0] to the correct
+            // absolute line for module 0's content start. Module 0's
+            // import region is at position 0, but its CODE starts at
+            // mod0_real_start (after all auto-injected modules).
+            auto _nl_count, _ni;
+            _nl_count = 0;
+            for (_ni = 0; _ni < m0s; _ni = _ni + 1) {
+                if (peek(src + _ni) == 10) { _nl_count = _nl_count + 1; }
+            }
+            cur_line = _nl_count + 1;
+            arr_set(diag_file_line_starts, 0, _nl_count);
             while (pos < src_len) {
                 skip_ws();
                 if (pos < src_len) { scan_token(); }
             }
+            _parser_is_entry = 1;
             parse_module(tok_cnt);
+            _parser_is_entry = 0;
             infer_module(0);
-            // Dispatch analysis: classify every loop in funcs[] as
-            // DSP_SEQ / DSP_PAR / DSP_GPU / DSP_SPLIT before validation
-            // runs. Same ordering as the monolithic pipeline (types →
-            // dispatch → validate). Per-module dispatch would break for
-            // the same forward-reference reason validate has — modules
-            // are walked in module-index order, not topological order,
-            // so cross-module callees might not be parsed yet. Running
-            // once after every module is parsed and inferred sidesteps
-            // that. The result lives on each loop's AST node as
-            // w.dispatch and is consumed by codegen in a later commit;
-            // for now the wiring just runs the existing analysis pass
-            // so the modular pipeline matches the monolithic one.
+            // Dispatch analysis pipeline.
+            call_graph_build();
+            classify_all_functions();
+            mark_reachable();
+            promote_globals();
+            if (flag_show_promotions) { show_promotions(); }
             run_dispatch();
-            // Validation runs once, after every module (including module 0)
-            // has been parsed and inferred. Running it per-module in the
-            // incremental loop would break because the loop iterates by
-            // module index, not topological order, so a module may reference
-            // functions from a module that has not been parsed yet.
             run_validate();
 
             if (mode == 2) {
@@ -332,6 +340,11 @@ main() {
             }
 
         // Repopulate globals and externs now that all modules have been processed.
+        // mod_init runs BEFORE module 0 is parsed, so module-0 globals don't
+        // exist at that point and we have to resync them here. Hidden globals
+        // are pushed via the per-target add_hidden_globals helper so adding a
+        // new sentinel only edits one site (see task #26 for the full
+        // refactor that kills this duplicated repopulate block).
         if (mode == 2) {
             arr_clear(a64_gl_name);
             for (mk = 0; mk < glob_cnt; mk = mk + 1) {
@@ -342,8 +355,7 @@ main() {
                 }
                 if (rel_s < 0) { a64_gl_name = arr_push(a64_gl_name, fn_s); }
             }
-            a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
-            a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+            a64_add_hidden_globals();
             bo_resolve_calls_arm64();
         }
         if (mode == 3) {
@@ -356,8 +368,7 @@ main() {
                 }
                 if (rel_s < 0) { x64_gl_name = arr_push(x64_gl_name, fn_s); }
             }
-            x64_gl_name = arr_push(x64_gl_name, x64_argc_sym);
-            x64_gl_name = arr_push(x64_gl_name, x64_argv_sym);
+            x64_add_hidden_globals();
             bo_resolve_calls_x64();
             start_lbl = x64_emit_start_stub();
         }
@@ -368,10 +379,20 @@ main() {
         // 2. Lex: scan outbuf into toks/vbuf arrays.
         lex_all();
         // 3. Parse: consume toks, build AST.
+        // Monolithic mode processes everything as one blob — entry file
+        // content is interleaved, so we mark the entire parse as entry.
+        _parser_is_entry = 1;
         parse_program();
+        _parser_is_entry = 0;
         // 4. Types: annotate AST itype fields.
         run_types();
-        // 5. Dispatch: annotate loop dispatch fields.
+        // 5. Dispatch pipeline: call graph → per-function purity → per-loop dispatch.
+        // Same three-step sequence as the modular pipeline above.
+        call_graph_build();
+        classify_all_functions();
+        mark_reachable();
+        promote_globals();
+        if (flag_show_promotions) { show_promotions(); }
         run_dispatch();
         // 6. Validate: check IR consistency before codegen.
         run_validate();
@@ -468,6 +489,54 @@ main() {
     }
     if (mode == 1) { emit_all_arm64(); }
     if (mode == 0) { emit_all(); }
+
+    // ── Build statistics ──
+    // Printed to stderr when --stats is passed. Gives the programmer
+    // visibility into compile time, module counts, function counts, and
+    // how much the lazy emit pruned. This is the embryonic profiler that
+    // informs all future performance decisions.
+    if (flag_stats) {
+        auto _st_mods, _st_cached, _st_stale, _st_reach;
+        _st_mods = arr_len(diag_file_starts);
+        _st_cached = 0;
+        _st_stale = 0;
+        for (i = 0; i < _st_mods; i = i + 1) {
+            if (arr_get(mod_stale, i)) { _st_stale = _st_stale + 1; }
+            else { _st_cached = _st_cached + 1; }
+        }
+        _st_reach = 0;
+        if (_lazy_emit_ready) {
+            for (i = 0; i < func_cnt; i = i + 1) {
+                if (arr_get(fn_reachable, i)) { _st_reach = _st_reach + 1; }
+            }
+        }
+        diag_str("  modules:   ");
+        diag_int(_st_mods);
+        diag_str(" (");
+        diag_int(_st_cached);
+        diag_str(" cached, ");
+        diag_int(_st_stale);
+        diag_str(" stale)");
+        diag_newline();
+        diag_str("  functions: ");
+        diag_int(func_cnt);
+        if (_lazy_emit_ready) {
+            diag_str(" (");
+            diag_int(_st_reach);
+            diag_str(" reachable, ");
+            diag_int(func_cnt - _st_reach);
+            diag_str(" pruned)");
+        }
+        diag_newline();
+        diag_str("  globals:   ");
+        diag_int(glob_cnt);
+        diag_str("   structs: ");
+        diag_int(arr_len(sd_names));
+        diag_newline();
+        diag_str("  tokens:    ");
+        diag_int(tok_cnt);
+        diag_newline();
+    }
 
     diag_summary();
     return 0;

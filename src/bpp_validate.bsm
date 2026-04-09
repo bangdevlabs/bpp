@@ -23,6 +23,34 @@ auto _val_hn, _val_ht;
 // validate_module) so they always reflect the current func/extern
 // tables, including modules loaded incrementally.
 auto _val_func_hash, _val_extern_hash;
+auto _val_current_fi;    // func index currently being validated
+auto _val_src_tok;       // src_tok of the current node being checked
+
+// Print source location for a warning/error using the AST node's saved
+// token position. Shows file:line + source line with caret, compatible
+// with Emacs M-x compile and VS Code problem matcher.
+_val_show_context_at(stok) {
+    if (stok > 0) {
+        diag_loc(stok);
+        diag_show_line(stok);
+    }
+}
+
+// Show context from the current node being validated.
+// Falls back to function name if no source token available.
+_val_show_context() {
+    // Caller should use _val_show_context_at(n.src_tok) when possible.
+    // This fallback shows the function name for cases where we don't
+    // have a specific node (e.g., dispatch-level warnings).
+    auto _fn_name;
+    if (_val_current_fi >= 0) {
+        _fn_name = *(funcs[_val_current_fi] + FN_NAME);
+        diag_str("  in: ");
+        diag_packed(_fn_name);
+        diag_str("()");
+        diag_newline();
+    }
+}
 
 init_validate() {
     _val_hn = arr_new();
@@ -74,6 +102,7 @@ val_is_builtin(name_p) {
     if (buf_eq(vbuf + unpack_s(name_p), "str_peek", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "argc_get", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "argv_get", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
+    if (buf_eq(vbuf + unpack_s(name_p), "envp_get", unpack_l(name_p))) { if (unpack_l(name_p) == 8) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", unpack_l(name_p))) { if (unpack_l(name_p) == 6) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "call", unpack_l(name_p))) { if (unpack_l(name_p) == 4) { return 1; } }
     if (buf_eq(vbuf + unpack_s(name_p), "sys_write", unpack_l(name_p))) { if (unpack_l(name_p) == 9) { return 1; } }
@@ -194,6 +223,7 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str(val_type_name(hint_ty));
             diag_str(")");
             diag_newline();
+            _val_show_context_at(_val_src_tok);
             sys_exit(1);
         }
     }
@@ -208,6 +238,7 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_packed(var_name_p);
             diag_str("' (declared as ptr) without cast");
             diag_newline();
+            _val_show_context_at(_val_src_tok);
             sys_exit(1);
         }
     }
@@ -232,6 +263,7 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
                 diag_str(val_type_name(hint_ty));
                 diag_str(")");
                 diag_newline();
+                _val_show_context_at(_val_src_tok);
             }
         }
     }
@@ -248,6 +280,7 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str(val_type_name(hint_ty));
             diag_str(")");
             diag_newline();
+            _val_show_context_at(_val_src_tok);
         }
     }
 
@@ -271,6 +304,7 @@ val_check_list(arr, cnt) {
                 diag_warn(5);
                 diag_str("unreachable code after return");
                 diag_newline();
+                _val_show_context_at(sn.src_tok);
                 saw_ret = 0;
             }
             sn = nd;
@@ -287,6 +321,7 @@ val_check_node(nd) {
     if (nd == 0) { return 0; }
     n = nd;
     t = n.ntype;
+    _val_src_tok = n.src_tok;
 
     // ── T_DECL: collect type hints ──────────────────────────
     if (t == T_DECL) {
@@ -341,16 +376,38 @@ val_check_node(nd) {
                     diag_packed(name_p);
                     diag_str("' called but never defined -- missing import?");
                     diag_newline();
+                _val_show_context_at(n.src_tok);
                     sys_exit(1);
                 }
             }
         }
 
-        // W003 + W002: check B++ function calls.
+        // W003 + W002 + E220: check B++ function calls.
         fi = val_find_func(name_p);
         if (fi >= 0) {
             callee = funcs[fi];
             expected = *(callee + FN_PCNT);
+
+            // W017: using the return value of a void function.
+            // Only fires when the T_CALL is inside a T_ASSIGN (its return
+            // value is being captured). Standalone call statements are fine.
+            // The check is conservative: it only warns at the call validation
+            // level. A full check would require tracking assignment context.
+
+            // E220: calling a static function from another module.
+            if (arr_get(fn_static, fi) != 0) {
+                auto _callee_mod, _caller_mod;
+                _callee_mod = arr_get(func_mods, fi);
+                _caller_mod = arr_get(func_mods, _val_current_fi);
+                if (_callee_mod != _caller_mod) {
+                    diag_warn(20);
+                    diag_str("'");
+                    diag_packed(name_p);
+                    diag_str("' is static (private to its module)");
+                    diag_newline();
+                _val_show_context_at(n.src_tok);
+                }
+            }
 
             if (n.c != expected) {
                 diag_warn(3);
@@ -361,6 +418,7 @@ val_check_node(nd) {
                 diag_str(" argument(s), got ");
                 diag_int(n.c);
                 diag_newline();
+                _val_show_context_at(n.src_tok);
             }
 
             for (ai = 0; ai < n.c; ai = ai + 1) {
@@ -378,6 +436,7 @@ val_check_node(nd) {
                             diag_packed(name_p);
                             diag_str("'");
                             diag_newline();
+                _val_show_context_at(n.src_tok);
                             diag_help("add ': float' to the parameter declaration");
                         }
                     }
@@ -400,6 +459,7 @@ val_check_node(nd) {
                         diag_packed(name_p);
                         diag_str("' — may crash at runtime (use malloc for FFI out-params)");
                         diag_newline();
+                _val_show_context_at(n.src_tok);
                     }
                 }
             }
@@ -414,6 +474,7 @@ val_check_node(nd) {
                             diag_warn(12);
                             diag_str("'&' used as argument to call() — may crash at runtime (use malloc for FFI out-params)");
                             diag_newline();
+                _val_show_context_at(n.src_tok);
                         }
                     }
                 }
@@ -434,7 +495,12 @@ val_check_node(nd) {
         if (n.e > 0) { val_check_list(n.d, n.e); }
         return 0;
     }
-    if (t == T_WHILE) { val_check_node(n.a); val_check_list(n.b, n.c); return 0; }
+    if (t == T_WHILE) {
+        val_check_node(n.a);
+        val_check_list(n.b, n.c);
+        if (n.e != 0) { val_check_node(n.e); }
+        return 0;
+    }
     if (t == T_MEMLD) { val_check_node(n.a); return 0; }
     if (t == T_ADDR) { val_check_node(n.a); return 0; }
     if (t == T_MEMST) { val_check_node(n.a); val_check_node(n.b); return 0; }
@@ -454,6 +520,7 @@ run_validate() {
         rec = funcs[i];
         body_arr = *(rec + FN_BODY);
         body_cnt = *(rec + FN_BCNT);
+        _val_current_fi = i;
         // Skip cached functions loaded from .bo (no body to check).
         if (body_cnt == 0) { i = i; }
         else {
@@ -492,6 +559,7 @@ validate_module(mi) {
             rec = funcs[i];
             body_arr = *(rec + FN_BODY);
             body_cnt = *(rec + FN_BCNT);
+            _val_current_fi = i;
             if (body_cnt > 0) {
                 params_arr = *(rec + FN_PARS);
                 param_cnt = *(rec + FN_PCNT);

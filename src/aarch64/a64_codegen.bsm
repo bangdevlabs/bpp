@@ -5,6 +5,13 @@
 // Usage: import this module into bpp.bpp, then call emit_all_arm64()
 // after run_types()/run_dispatch() to emit assembly instead of C.
 
+import "bpp_defs.bsm";
+import "bpp_array.bsm";
+import "bpp_internal.bsm";
+import "bpp_parser.bsm";
+import "bpp_types.bsm";
+import "aarch64/a64_enc.bsm";
+
 // ── Emitter-owned globals ──────────────────────────────────
 
 // String buffer alias: points to vbuf (set by bridge_data_arm64).
@@ -38,6 +45,11 @@ auto a64_lbl_cnt, a64_depth;
 // Break label stack (dynamic array): tracks the exit label of the current while loop.
 auto a64_break_stack;
 
+// Continue label stack (dynamic array): tracks the loop-step label of the current while.
+// For plain while, this points just before the unconditional branch back to top.
+// For for-loops, this points just before the step expression so continue runs the step.
+auto a64_continue_stack;
+
 // Current function being emitted.
 auto a64_cur_fn_name, a64_cur_fn_idx;
 
@@ -50,9 +62,9 @@ auto a64_fn_lbl;
 // Binary mode: return label for the current function (set in a64_emit_func).
 auto a64_ret_lbl;
 
-// Sentinel packed names for hidden argc/argv globals.
+// Sentinel packed names for hidden argc/argv/envp globals.
 // These use negative values that can never collide with real packed names.
-auto a64_argc_sym, a64_argv_sym;
+auto a64_argc_sym, a64_argv_sym, a64_envp_sym;
 
 
 // ── Initialization ─────────────────────────────────────────
@@ -73,11 +85,25 @@ init_codegen_arm64() {
     a64_str_tbl = arr_new();
     a64_lbl_cnt = 0; a64_depth = 0;
     a64_break_stack = arr_new();
+    a64_continue_stack = arr_new();
     a64_bin_mode = 0;
     a64_fn_lbl = arr_new();
     a64_ret_lbl = 0;
     a64_argc_sym = 0 - 1;
     a64_argv_sym = 0 - 2;
+    a64_envp_sym = 0 - 3;
+    return 0;
+}
+
+// ── Hidden globals helper ──────────────────────────────────
+// Push the runtime's hidden global symbols (argc/argv/envp) onto a64_gl_name.
+// Always called AFTER user globals have been copied so the hidden slots
+// land at the end of the data section. Adding a new hidden global = add
+// one line here, no other site to remember.
+a64_add_hidden_globals() {
+    a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
+    a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+    a64_gl_name = arr_push(a64_gl_name, a64_envp_sym);
     return 0;
 }
 
@@ -90,13 +116,16 @@ bridge_data_arm64() {
     // Point string buffer at the parser's vbuf.
     a64_sbuf = vbuf;
 
-    // Copy functions from parser's 64-byte records into parallel arrays.
-    // Handle forward declarations: if a function name already exists,
-    // overwrite it with the later (real) definition.
+    // Copy reachable functions from parser's 64-byte records into parallel
+    // arrays. Unreachable functions (not called from main) are skipped.
     arr_clear(a64_fn_name); arr_clear(a64_fn_par); arr_clear(a64_fn_pcnt);
     arr_clear(a64_fn_body); arr_clear(a64_fn_bcnt); arr_clear(a64_fn_fidx);
     i = 0;
     while (i < func_cnt) {
+        // Lazy emit: skip unreachable functions.
+        if (_lazy_emit_ready) {
+            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+        }
         rec = *(funcs + i * 8);
         name_p = *(rec + FN_NAME);
         // Check if this function was already added (forward declaration).
@@ -1438,6 +1467,28 @@ a64_emit_node(nd) {
             }
             return 0;
         }
+        // Built-in: envp_get(i) — return a pointer to the i-th environment
+        // string ("NAME=value\0"). Returns 0 once i passes the NULL terminator.
+        // Use this to walk the env vars; the higher-level getenv() in
+        // bpp_io.bsm searches by name and returns just the value.
+        if (a64_str_eq(n.a, "envp_get", 8)) {
+            a64_emit_node(*(n.b));
+            a64_emit_push();
+            if (a64_bin_mode) {
+                enc_add_reloc(enc_pos, a64_envp_sym, 0);
+                enc_adrp(8); enc_add_imm(8, 8, 0);
+                enc_ldr_uoff(0, 8, 0);
+                a64_emit_pop(1);
+                enc_ldr_reg_shift3(0, 0, 1);
+            } else {
+                out("  adrp x8, _bpp_envp@PAGE"); putchar('\n');
+                out("  add x8, x8, _bpp_envp@PAGEOFF"); putchar('\n');
+                out("  ldr x0, [x8]"); putchar('\n');
+                a64_emit_pop(1);
+                out("  ldr x0, [x0, x1, lsl #3]"); putchar('\n');
+            }
+            return 0;
+        }
 
         // Built-in: fn_ptr(name) — return the code address of a B++ function.
         if (a64_str_eq(n.a, "fn_ptr", 6)) {
@@ -1877,12 +1928,37 @@ a64_emit_stmt(nd) {
         return 0;
     }
 
+    if (t == T_CONTINUE) {
+        // Jump to the continue label of the innermost while loop. For
+        // plain while this lands just before the back-branch to top; for
+        // for-loops it lands just before the step expression so the step
+        // still runs before the next condition test.
+        if (arr_len(a64_continue_stack) > 0) {
+            auto cnt_lbl;
+            cnt_lbl = arr_last(a64_continue_stack);
+            if (a64_bin_mode) {
+                enc_b_label(cnt_lbl);
+            } else {
+                out("  b .Lcont"); a64_print_dec(cnt_lbl); putchar('\n');
+            }
+        }
+        return 0;
+    }
+
     if (t == T_WHILE) {
+        // n.e (offset 40) holds the for-loop step expression, or 0 for plain while.
+        // The continue label is emitted between the body and the step so that
+        // `continue` runs the step before re-testing the condition.
+        // The step is a statement (T_ASSIGN typically), so it must be emitted
+        // via a64_emit_stmt — a64_emit_node doesn't handle T_ASSIGN.
+        auto step_node, lbl3;
+        step_node = n.e;
         if (a64_bin_mode) {
             lbl = enc_new_label();
             lbl2 = enc_new_label();
-            // Push break label.
+            lbl3 = enc_new_label();
             a64_break_stack = arr_push(a64_break_stack, lbl2);
+            a64_continue_stack = arr_push(a64_continue_stack, lbl3);
             enc_def_label(lbl);
             ety = a64_emit_node(n.a);
             if (ety == 1) {
@@ -1891,13 +1967,17 @@ a64_emit_stmt(nd) {
             }
             enc_cbz_label(0, lbl2);
             a64_emit_body(n.b, n.c);
+            enc_def_label(lbl3);
+            if (step_node != 0) { a64_emit_stmt(step_node); }
             enc_b_label(lbl);
             enc_def_label(lbl2);
             arr_pop(a64_break_stack);
+            arr_pop(a64_continue_stack);
         } else {
             lbl = a64_new_lbl();
-            // Push break label (text mode uses lbl counter, same value).
+            lbl3 = a64_new_lbl();
             a64_break_stack = arr_push(a64_break_stack, lbl);
+            a64_continue_stack = arr_push(a64_continue_stack, lbl3);
             out(".Lloop"); a64_print_dec(lbl); out(":"); putchar('\n');
             ety = a64_emit_node(n.a);
             if (ety == 1) {
@@ -1906,9 +1986,12 @@ a64_emit_stmt(nd) {
             }
             out("  cbz x0, .Lend"); a64_print_dec(lbl); putchar('\n');
             a64_emit_body(n.b, n.c);
+            out(".Lcont"); a64_print_dec(lbl3); out(":"); putchar('\n');
+            if (step_node != 0) { a64_emit_stmt(step_node); }
             out("  b .Lloop"); a64_print_dec(lbl); putchar('\n');
             out(".Lend"); a64_print_dec(lbl); out(":"); putchar('\n');
             arr_pop(a64_break_stack);
+            arr_pop(a64_continue_stack);
         }
         return 0;
     }
@@ -2008,9 +2091,10 @@ a64_emit_func(fi) {
         // The --bug flag now only generates the .bug metadata file.
         enc_add_imm(29, 31, 0);
 
-        // In main(), save x0 (argc) and x1 (argv) to hidden globals
-        // before anything else clobbers them. dyld passes these via
-        // the standard calling convention when using LC_MAIN.
+        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to hidden
+        // globals before anything else clobbers them. dyld passes these
+        // via the standard calling convention when using LC_MAIN —
+        // signature is `int main(int argc, char *argv[], char *envp[], char *apple[])`.
         if (a64_str_eq(name_p, "main", 4)) {
             enc_add_reloc(enc_pos, a64_argc_sym, 0);
             enc_adrp(8); enc_add_imm(8, 8, 0);
@@ -2018,6 +2102,9 @@ a64_emit_func(fi) {
             enc_add_reloc(enc_pos, a64_argv_sym, 0);
             enc_adrp(8); enc_add_imm(8, 8, 0);
             enc_str_uoff(1, 8, 0);
+            enc_add_reloc(enc_pos, a64_envp_sym, 0);
+            enc_adrp(8); enc_add_imm(8, 8, 0);
+            enc_str_uoff(2, 8, 0);
         }
 
         // Store incoming register arguments to their stack slots.
@@ -2047,6 +2134,12 @@ a64_emit_func(fi) {
         a64_depth = 0;
         a64_emit_body(body_arr, body_cnt);
 
+        // Implicit return 0: if the body falls through without an explicit
+        // return statement, x0 is set to 0. Explicit returns branch directly
+        // to the epilogue label with x0 already set, so this mov is dead
+        // code in that case — the branch jumps over it.
+        enc_mov_wide(0, 0);
+
         // Epilogue.
         enc_def_label(a64_ret_lbl);
         enc_ldp_post(29, 30, 31, frame);
@@ -2065,7 +2158,7 @@ a64_emit_func(fi) {
         out("  stp x29, x30, [sp, #-"); a64_print_dec(frame); out("]!"); putchar('\n');
         out("  mov x29, sp"); putchar('\n');
 
-        // In main(), save x0 (argc) and x1 (argv) to globals.
+        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to globals.
         if (a64_str_eq(name_p, "main", 4)) {
             out("  adrp x8, _bpp_argc@PAGE"); putchar('\n');
             out("  add x8, x8, _bpp_argc@PAGEOFF"); putchar('\n');
@@ -2073,6 +2166,9 @@ a64_emit_func(fi) {
             out("  adrp x8, _bpp_argv@PAGE"); putchar('\n');
             out("  add x8, x8, _bpp_argv@PAGEOFF"); putchar('\n');
             out("  str x1, [x8]"); putchar('\n');
+            out("  adrp x8, _bpp_envp@PAGE"); putchar('\n');
+            out("  add x8, x8, _bpp_envp@PAGEOFF"); putchar('\n');
+            out("  str x2, [x8]"); putchar('\n');
         }
 
         // Store incoming register arguments to their stack slots.
@@ -2101,6 +2197,9 @@ a64_emit_func(fi) {
         // Emit function body.
         a64_depth = 0;
         a64_emit_body(body_arr, body_cnt);
+
+        // Implicit return 0 for functions without explicit return.
+        out("  mov x0, #0"); putchar('\n');
 
         // Epilogue.
         out(".Lret_"); a64_print_p(name_p); out(":"); putchar('\n');
@@ -2147,9 +2246,8 @@ a64_mod_init() {
         if (idx < 0) { a64_gl_name = arr_push(a64_gl_name, name_p); }
         i = i + 1;
     }
-    // Add hidden globals for argc/argv.
-    a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
-    a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+    // Add hidden globals (argc/argv/envp) at the end of the data section.
+    a64_add_hidden_globals();
 
     // Externs are refreshed per-module in emit_module_arm64() instead of here,
     // because in the incremental pipeline modules are parsed one at a time.
@@ -2169,8 +2267,12 @@ emit_module_arm64(mi) {
     fn_start = arr_len(a64_fn_name);
 
     // Add functions from this module only, with forward-declaration override.
+    // Lazy emit: skip unreachable functions when the pass has run.
     i = 0;
     while (i < func_cnt) {
+        if (_lazy_emit_ready) {
+            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+        }
         if (arr_get(func_mods, i) == mi) {
             rec = *(funcs + i * 8);
             name_p = *(rec + FN_NAME);
@@ -2247,9 +2349,8 @@ emit_all_arm64() {
     bridge_data_arm64();
 
     if (a64_bin_mode) {
-        // Add hidden globals for argc/argv access in native binaries.
-        a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
-        a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
+        // Add hidden globals (argc/argv/envp) for native binary mode.
+        a64_add_hidden_globals();
 
         // Binary mode: allocate a label for each function, emit code, resolve fixups.
         enc_pos = 0;
@@ -2288,10 +2389,11 @@ emit_all_arm64() {
 
         // Emit global variables in data section.
         out(".section __DATA,__data"); putchar('\n');
-        // Hidden globals for argc/argv access.
+        // Hidden globals for argc/argv/envp access.
         out(".p2align 3"); putchar('\n');
         out("_bpp_argc: .quad 0"); putchar('\n');
         out("_bpp_argv: .quad 0"); putchar('\n');
+        out("_bpp_envp: .quad 0"); putchar('\n');
         i = 0;
         while (i < arr_len(a64_gl_name)) {
             out(".globl _"); a64_print_p(arr_get(a64_gl_name, i)); putchar('\n');

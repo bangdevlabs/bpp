@@ -22,9 +22,21 @@ auto globals, glob_cnt;
 // Both forms produce the same runtime layout — the difference is purely
 // a static intent flag that smart dispatch consults to decide whether
 // a loop touching the global is safe to fan out across workers.
-auto glob_shared;
+// Per-global storage class (parallel to globals[]). One of GLOB_AUTO,
+// GLOB_GLOBAL, or GLOB_EXTRN. Codegen and the smart-dispatch pass read
+// this to decide whether a loop touching the variable is safe to fan out.
+auto glob_class;
+
+// Set to 1 by the orchestrator (bpp.bpp) when parsing the entry file's
+// content (module 0). Used by Fix 2 to enforce "main() only in entry file"
+// without relying on tok_mod() which returns incorrect module attribution
+// for module 0 (its content sits at mod0_real_start, past all auto-injected
+// modules, but diag_file_starts[0] points to position 0 in outbuf).
+auto _parser_is_entry;
 auto externs, ext_cnt;
 auto funcs, func_cnt;
+auto fn_static;   // parallel to funcs[]: 1 if static (private to module)
+auto fn_void;     // parallel to funcs[]: 1 if void (no useful return)
 
 // Struct registry: 5 parallel dynamic arrays (name, fields ptr, field count, size, field hints).
 auto sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
@@ -75,12 +87,15 @@ init_parser() {
     tok_pos = 0;
     globals = arr_new();
     glob_cnt = 0;
-    glob_shared = arr_new();
+    glob_class = arr_new();
+    _parser_is_entry = 0;
     externs = arr_new();
     ext_cnt = 0;
     funcs = arr_new();
     func_cnt = 0;
     func_mods = arr_new();
+    fn_static = arr_new();
+    fn_void = arr_new();
     glob_mods = arr_new();
     struct_mods = arr_new();
     enum_mods = arr_new();
@@ -107,25 +122,7 @@ init_parser() {
     return 0;
 }
 
-// ============================================================
-// String helpers (parser-local)
-// ============================================================
-
-// Compare two packed strings (both stored in vbuf).
-packed_eq(p1, p2) {
-    auto s1, l1, s2, l2, i;
-    s1 = p1 % 0x100000000;
-    l1 = p1 / 0x100000000;
-    s2 = p2 % 0x100000000;
-    l2 = p2 / 0x100000000;
-    if (l1 != l2) { return 0; }
-    i = 0;
-    while (i < l1) {
-        if (peek(vbuf + s1 + i) != peek(vbuf + s2 + i)) { return 0; }
-        i = i + 1;
-    }
-    return 1;
-}
+// packed_eq is defined in bpp_internal.bsm — no longer duplicated here.
 
 // ============================================================
 // Struct support
@@ -460,18 +457,30 @@ tok_mod(tidx) { return mod_idx(tok_src_off[tidx]); }
 // Parser: top-level structures
 // ============================================================
 
-// Register a global variable name. The is_shared flag tags whether
-// the declaration came from `global x;` (1, dispatchable across workers)
-// or from `auto x;` at file scope (0, conservative main-thread-only).
-// Cached globals loaded from .bo files default to 0 until the cache
-// format learns to round-trip the flag in a follow-up commit.
-add_global(p, is_shared) {
+// Register a global variable name and tag its storage class. The class
+// describes the runtime semantics of the declaration:
+//   GLOB_AUTO   — `auto x;` at file scope, legacy serialized
+//   GLOB_GLOBAL — `global x;`, worker-shared mutable
+//   GLOB_EXTRN  — `extrn x;`, write-once-after-init
+// Cached globals loaded from .bo files round-trip the class via the
+// extended .bo format (BO_VERSION 4+).
+add_global(p, gclass) {
     globals = arr_push(globals, p);
     glob_cnt = arr_len(globals);
     glob_mods = arr_push(glob_mods, tok_mod(tok_pos));
-    glob_shared = arr_push(glob_shared, is_shared);
+    glob_class = arr_push(glob_class, gclass);
+    // Grow glob_pinned alongside — parser may set it via `: serial` hint.
+    while (arr_len(glob_pinned) < glob_cnt) {
+        glob_pinned = arr_push(glob_pinned, 0);
+    }
     return 0;
 }
+
+// Flag set by try_type_annotation when it encounters `: serial`.
+// Read by parse_global to mark the variable as promotion-pinned
+// (glob_pinned[i] = 1). Prevents auto smart promotion from changing
+// the storage class. Only meaningful at file scope; ignored in functions.
+auto _serial_hint;
 
 // Parse an optional ": TypeName" annotation after a variable name.
 // Recognizes primitive types and struct types. Supports compound annotations:
@@ -487,11 +496,22 @@ add_global(p, is_shared) {
 try_type_annotation(var_p) {
     auto type_p, idx, tl, ts;
     _prim_hint = 0;
+    _serial_hint = 0;
     if (val_is_ch(':')) {
         consume();
         type_p = cur_packed();
         tl = unpack_l(type_p);
         ts = vbuf + unpack_s(type_p);
+
+        // Storage class hint: `: serial` prevents auto smart promotion.
+        // Only meaningful at file scope (parse_global reads _serial_hint).
+        if (tl == 6) {
+            if (buf_eq(ts, "serial", 6)) {
+                _serial_hint = 1;
+                consume();
+                return 0;
+            }
+        }
 
         // Check primitive type names before struct lookup.
         if (tl == 5) {
@@ -561,28 +581,34 @@ try_type_annotation(var_p) {
     return 0;
 }
 
-// Parse a top-level "auto x, y, z;" or "global x, y, z;" declaration.
-// Supports per-variable type hints: auto x: float, y: byte;
+// Parse a top-level "auto x, y, z;", "global x, y, z;", or "extrn x, y, z;"
+// declaration. Supports per-variable type hints: auto x: float, y: byte;
 // Float hints register the global as TY_FLOAT for correct codegen.
-// is_shared = 0 for `auto` (legacy / serialized), 1 for `global`
-// (multi-thread shared, dispatchable). The flag is forwarded to
-// add_global so the smart-dispatch pass can later decide whether a
-// loop touching the variable is safe to fan out across workers.
-parse_global(is_shared) {
-    auto var_p;
+// gclass selects the storage class:
+//   GLOB_AUTO   — `auto`   (legacy serialized, conservative main-thread-only)
+//   GLOB_GLOBAL — `global` (worker-shared mutable, programmer manages stride)
+//   GLOB_EXTRN  — `extrn`  (write-once-after-init, frozen after maestro_run)
+// The class flows to add_global so the smart-dispatch pass and codegen
+// can decide how to handle loops that touch the variable.
+parse_global(gclass) {
+    auto var_p, gi;
     consume();
     var_p = cur_packed();
-    add_global(var_p, is_shared);
+    add_global(var_p, gclass);
+    gi = glob_cnt - 1;
     consume();
     try_type_annotation(var_p);
     if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
+    if (_serial_hint) { arr_set(glob_pinned, gi, 1); }
     while (val_is_ch(';') == 0) {
         if (val_is_ch(',')) { consume(); }
         var_p = cur_packed();
-        add_global(var_p, is_shared);
+        add_global(var_p, gclass);
+        gi = glob_cnt - 1;
         consume();
         try_type_annotation(var_p);
         if (is_float_type(_prim_hint)) { ty_set_global_type(var_p, _prim_hint); }
+        if (_serial_hint) { arr_set(glob_pinned, gi, 1); }
     }
     consume();
     return 0;
@@ -591,9 +617,9 @@ parse_global(is_shared) {
 // Parse a bare global identifier followed by optional semicolon.
 parse_global_simple() {
     // Shorthand "x;" at file scope. No keyword, no type annotation.
-    // Treated as legacy/serialized — the explicit `global` keyword is
-    // the only path that opts the variable into worker visibility.
-    add_global(cur_packed(), 0);
+    // Treated as legacy/serialized — the explicit `global` or `extrn`
+    // keywords are the only paths that opt into worker-aware behavior.
+    add_global(cur_packed(), GLOB_AUTO);
     consume();
     if (val_is_ch(';')) { consume(); }
     return 0;
@@ -948,7 +974,7 @@ parse_unary() { return 0; }
 
 // Parse a function definition: name(params) { body }
 // Collects primitive type hints for parameters and stores them in offset 48.
-parse_function() {
+parse_function(is_stub, is_static, is_void) {
     auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p, _fs;
     auto ph_arr, ph_cnt, has_hints, my_mod;
     my_mod = tok_mod(tok_pos);
@@ -973,6 +999,27 @@ parse_function() {
     consume();
     params_arr = list_end();
     param_cnt = last_list_cnt;
+    // Check for optional phase annotation between ) and {.
+    // `: base` = function is pure (worker-safe), compiler verifies.
+    // `: solo` = function is sequential (main-thread), programmer override.
+    // Peek at the token AFTER `:` to avoid consuming `:` when it's a
+    // return type hint (e.g., `: half float`) instead of a phase annotation.
+    auto phase_hint, _nxt_s, _nxt_l;
+    phase_hint = 0;
+    if (val_is_ch(':')) {
+        if (tok_pos + 1 < tok_cnt) {
+            _nxt_s = *(toks + (tok_pos + 1) * 24 + 8);
+            _nxt_l = *(toks + (tok_pos + 1) * 24 + 16);
+            if (_nxt_l == 4) {
+                if (buf_eq(vbuf + _nxt_s, "base", 4)) {
+                    consume(); phase_hint = 1; consume();
+                }
+                if (buf_eq(vbuf + _nxt_s, "solo", 4)) {
+                    consume(); phase_hint = 2; consume();
+                }
+            }
+        }
+    }
     consume();
     _block_depth = 0;
     list_begin();
@@ -995,9 +1042,100 @@ parse_function() {
     // Store parameter hint array in the hints field.
     if (has_hints) { *(func + FN_HINTS) = ph_arr; }
     else { *(func + FN_HINTS) = 0; free(ph_arr); }
-    funcs = arr_push(funcs, func);
-    func_cnt = arr_len(funcs);
-    func_mods = arr_push(func_mods, my_mod);
+    // Mark as stub if declared with the `stub` keyword. Stubs are
+    // intentional placeholders that can be silently overridden by a
+    // real definition in any module without triggering W015.
+    *(func + FN_STUB) = is_stub;
+    // Store the defining token position (offset 64 = 9th slot, same as
+    // Node.src_tok). Used by dispatch W013 to show the source line.
+    *(func + 64) = tok_pos;
+    // Dedup: check if a function with this name already exists in funcs[].
+    // Three cases produce duplicates, each handled differently:
+    //
+    // 1. Same-module replacement (forward-declaration pattern):
+    //    B++ requires forward declarations for mutually recursive functions.
+    //    A stub at the top of a module is replaced by the real definition
+    //    later in the same module. Always silent.
+    //
+    // 2. Entry file overrides a module function (callback pattern):
+    //    stbgame.bsm defines game_init/game_update/game_draw as stubs.
+    //    The user's .bpp provides the real implementations. Module 0
+    //    (the entry file) is always processed last, so its definitions
+    //    win. Always silent.
+    //
+    // 3. Cross-module duplicate (suspicious):
+    //    Two different non-entry modules both define the same function
+    //    with real bodies. This is likely a bug. Emit W015.
+    auto _dup_idx, _dup_found;
+    _dup_found = 0;
+    for (_dup_idx = 0; _dup_idx < func_cnt; _dup_idx = _dup_idx + 1) {
+        if (packed_eq(*(funcs[_dup_idx] + FN_NAME), name_p)) {
+            auto _existing_body;
+            _existing_body = *(funcs[_dup_idx] + FN_BODY);
+            if (_existing_body != 0) {
+                auto _existing_stub;
+                _existing_stub = *(funcs[_dup_idx] + FN_STUB);
+                // Stub override is always silent — the stub was placed
+                // explicitly as a placeholder for this exact replacement.
+                if (_existing_stub == 0) {
+                    if (arr_get(func_mods, _dup_idx) != my_mod) {
+                        if (my_mod != 0) {
+                            // Case 3: cross-module duplicate, both with
+                            // real bodies, neither is a stub. Suspicious.
+                            diag_fatal(221);
+                            diag_str("duplicate definition of '");
+                            diag_packed(name_p);
+                            diag_str("' across modules");
+                            diag_newline();
+                            diag_loc(tok_pos);
+                            sys_exit(1);
+                        }
+                    }
+                }
+            }
+            // Replace the existing entry with the new one.
+            arr_set(funcs, _dup_idx, func);
+            arr_set(func_mods, _dup_idx, my_mod);
+            arr_set(fn_static, _dup_idx, is_static);
+            arr_set(fn_void, _dup_idx, is_void);
+            arr_set(fn_phase_hint, _dup_idx, phase_hint);
+            _dup_found = 1;
+            _dup_idx = func_cnt;
+        }
+    }
+    if (_dup_found == 0) {
+        funcs = arr_push(funcs, func);
+        func_cnt = arr_len(funcs);
+        func_mods = arr_push(func_mods, my_mod);
+        fn_static = arr_push(fn_static, is_static);
+        fn_void = arr_push(fn_void, is_void);
+        fn_phase_hint = arr_push(fn_phase_hint, phase_hint);
+    }
+
+    // Fix 2: enforce main() only in the entry file (module 0).
+    // Module files (.bsm) must not define main — they are libraries.
+    // Uses _parser_is_entry flag set by the orchestrator (bpp.bpp) instead
+    // of tok_mod() which has unreliable module attribution for module 0.
+    if (_parser_is_entry == 0) {
+        auto _ns;
+        _ns = vbuf + unpack_s(name_p);
+        if (unpack_l(name_p) == 4) {
+            if (peek(_ns) == 'm') {
+                if (peek(_ns+1) == 'a') {
+                    if (peek(_ns+2) == 'i') {
+                        if (peek(_ns+3) == 'n') {
+                            diag_fatal(105);
+                            diag_str("main() not allowed in module files — only the entry .bpp can define main()");
+                            diag_newline();
+                            diag_loc(tok_pos);
+                            diag_show_line(tok_pos);
+                            sys_exit(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     return 0;
 }
 
@@ -1008,21 +1146,48 @@ parse_program() {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global(0);
+                parse_global(GLOB_AUTO);
             } else if (val_is("global", 6)) {
-                parse_global(1);
+                parse_global(GLOB_GLOBAL);
+            } else if (val_is("extrn", 5)) {
+                parse_global(GLOB_EXTRN);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
                 parse_enum();
             } else if (val_is("const", 5)) {
                 parse_const();
+            } else if (val_is("stub", 4)) {
+                consume();
+                parse_function(1, 0, 0);
+            } else if (val_is("void", 4)) {
+                consume();
+                if (peek_type() == TK_ID) {
+                    if (val_at_ch(1, '(')) { parse_function(0, 0, 1); }
+                }
+            } else if (val_is("static", 6)) {
+                consume();
+                if (peek_type() == TK_KW) {
+                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO); }
+                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL); }
+                    else if (val_is("extrn", 5)) { parse_global(GLOB_EXTRN); }
+                    else if (val_is("void", 4)) {
+                        consume();
+                        if (peek_type() == TK_ID) {
+                            if (val_at_ch(1, '(')) { parse_function(0, 1, 1); }
+                        }
+                    }
+                    else { consume(); }
+                } else if (peek_type() == TK_ID) {
+                    if (val_at_ch(1, '(')) { parse_function(0, 1, 0); }
+                    else { parse_global_simple(); }
+                }
             } else {
                 consume();
             }
         } else if (peek_type() == TK_ID) {
             if (val_at_ch(1, '(')) {
-                parse_function();
+                parse_function(0, 0, 0);
             } else {
                 parse_global_simple();
             }
@@ -1033,30 +1198,55 @@ parse_program() {
     return 0;
 }
 
-// Parse a single module's tokens. tok_pos must be set to the first token
-// of this module before calling. Parses until tok_pos reaches tok_end.
-// Skips import directives (already processed by process_file).
+// Parse a single module's tokens.
 parse_module(tok_end) {
     while (tok_pos < tok_end) {
         if (peek_type() == TK_IMP) {
             parse_import();
         } else if (peek_type() == TK_KW) {
             if (val_is("auto", 4)) {
-                parse_global(0);
+                parse_global(GLOB_AUTO);
             } else if (val_is("global", 6)) {
-                parse_global(1);
+                parse_global(GLOB_GLOBAL);
+            } else if (val_is("extrn", 5)) {
+                parse_global(GLOB_EXTRN);
             } else if (val_is("struct", 6)) {
                 parse_struct();
             } else if (val_is("enum", 4)) {
                 parse_enum();
             } else if (val_is("const", 5)) {
                 parse_const();
+            } else if (val_is("stub", 4)) {
+                consume();
+                parse_function(1, 0, 0);
+            } else if (val_is("void", 4)) {
+                consume();
+                if (peek_type() == TK_ID) {
+                    if (val_at_ch(1, '(')) { parse_function(0, 0, 1); }
+                }
+            } else if (val_is("static", 6)) {
+                consume();
+                if (peek_type() == TK_KW) {
+                    if (val_is("auto", 4)) { parse_global(GLOB_AUTO); }
+                    else if (val_is("global", 6)) { parse_global(GLOB_GLOBAL); }
+                    else if (val_is("extrn", 5)) { parse_global(GLOB_EXTRN); }
+                    else if (val_is("void", 4)) {
+                        consume();
+                        if (peek_type() == TK_ID) {
+                            if (val_at_ch(1, '(')) { parse_function(0, 1, 1); }
+                        }
+                    }
+                    else { consume(); }
+                } else if (peek_type() == TK_ID) {
+                    if (val_at_ch(1, '(')) { parse_function(0, 1, 0); }
+                    else { parse_global_simple(); }
+                }
             } else {
                 consume();
             }
         } else if (peek_type() == TK_ID) {
             if (val_at_ch(1, '(')) {
-                parse_function();
+                parse_function(0, 0, 0);
             } else {
                 parse_global_simple();
             }
@@ -1139,6 +1329,7 @@ parse_if() {
 }
 
 // Parse a while loop, with optional dispatch hint (@seq, @par, @gpu).
+// node.e (offset 40) is left at 0 — only for-loops use it for the step.
 parse_while(hint_p) {
     auto cond, body_arr, node;
     consume();
@@ -1151,11 +1342,16 @@ parse_while(hint_p) {
     *(node + 16) = body_arr;
     *(node + 24) = last_list_cnt;
     *(node + 32) = hint_p;
+    *(node + 40) = 0;
     return node;
 }
 
 // Parse a for loop: for (init; cond; step) { body }
-// Desugars to: init; while (cond) { body; step; }
+// Desugars to: init; while (cond) { body }, with the step expression
+// stored in node.e (offset 40). Codegen places a continue label between
+// body and step, then emits step before branching back to top — that
+// way `continue` runs the step before re-testing the condition, just
+// like C semantics.
 // The init statement is stashed in _for_init for the caller to insert.
 parse_for() {
     auto init_node, cond, step, body_arr, body_cnt, node;
@@ -1169,20 +1365,20 @@ parse_for() {
     // Parse step expression.
     step = parse_expr();
     consume();
-    // Parse body, then append step to it.
+    // Parse body — leave it untouched. The step lives in node.e.
     body_arr = parse_body();
     body_cnt = last_list_cnt;
-    // Expand body array to include step as last statement.
-    body_arr[body_cnt] = step;
-    body_cnt = body_cnt + 1;
     // Stash init for parse_body to insert before the while.
     _for_init = init_node;
-    // Build while node.
+    // Build while node. node.e (offset 40) carries the step expression
+    // so that codegen can emit it between the body and the back-branch,
+    // making `continue` skip to the step before re-testing the condition.
     node = make_node(T_WHILE);
     *(node + 8) = cond;
     *(node + 16) = body_arr;
     *(node + 24) = body_cnt;
     *(node + 32) = 0;
+    *(node + 40) = step;
     return node;
 }
 
@@ -1291,6 +1487,11 @@ parse_statement() {
             consume();
             if (val_is_ch(';')) { consume(); }
             return make_node(T_BREAK);
+        }
+        if (val_is("continue", 8)) {
+            consume();
+            if (val_is_ch(';')) { consume(); }
+            return make_node(T_CONTINUE);
         }
     }
     node = parse_expr();

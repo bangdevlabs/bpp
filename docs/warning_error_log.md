@@ -1,0 +1,111 @@
+# B++ Warning & Error Reference
+
+Every diagnostic the compiler can emit, where it's defined, what triggers it,
+and whether it currently shows source location (file:line + source + caret).
+
+**Rule: every new warning or error MUST show source location.** No exceptions.
+If you can't get the exact line, at minimum show the function name and module.
+Update this document and `tests/test_diagnostics.bpp` when adding new codes.
+
+## Status Summary
+
+```
+Total diagnostics:  22
+With source location: 12  ✅
+WITHOUT source location: 10  ❌  ← these need fixing
+```
+
+## Errors (fatal — compilation stops)
+
+| Code | Message | File | Line | Has loc? | Trigger |
+|------|---------|------|------|----------|---------|
+| E001 | recursive import | bpp_import.bsm | 756 | ❌ | Module imports itself |
+| E002 | import/load not found | bpp_import.bsm | 977 | ❌ | File not found in search paths |
+| E050 | struct field type mismatch | bpp_validate.bsm | 218 | ❌ | Struct field with wrong type |
+| E053 | type annotation error | bpp_validate.bsm | 232 | ❌ | Invalid type annotation |
+| E101 | unknown type | bpp_parser.bsm | 569 | ✅ | `: UnknownType` after variable |
+| E102 | unexpected token in primary | bpp_parser.bsm | 1609 | ✅ | Invalid start of expression |
+| E103 | unexpected keyword | bpp_parser.bsm | 1712 | ✅ | Keyword used as expression |
+| E104 | unexpected token | bpp_parser.bsm | 1788 | ❌ | Parser fallthrough error |
+| E105 | main() in module file | bpp_parser.bsm | 1127 | ❌ | main() defined in .bsm not .bpp |
+| E120 | parse error (generic) | bpp_parser.bsm | 826 | ✅ | General parse failure |
+| E201 | undefined function | bpp_validate.bsm | 368 | ✅ | Call to undeclared function |
+| E221 | duplicate definition | bpp_parser.bsm | 1085 | ✅ | Same function in two modules |
+| E222 | circular dependency | bpp_import.bsm | 198 | ❌ | Module import cycle |
+
+## Warnings (compilation continues)
+
+| Code | Message | File | Line | Has loc? | Trigger |
+|------|---------|------|------|----------|---------|
+| W002 | implicit float-to-int | bpp_validate.bsm | 426 | ❌ | Float arg passed to int param |
+| W003 | wrong argument count | bpp_validate.bsm | 407 | ❌ | Call with mismatched arg count |
+| W005 | unreachable code | bpp_validate.bsm | 299 | ✅ | Code after return statement |
+| W010 | narrowing conversion | bpp_validate.bsm | 270 | ❌ | Float narrowed to half/quarter |
+| W011 | precision loss | bpp_validate.bsm | 254 | ❌ | Word to half float |
+| W012 | & in FFI argument | bpp_validate.bsm | 451 | ✅ | Address-of passed to extern/call |
+| W013 | : base mismatch | bpp_dispatch.bsm | 939 | ✅ | Function annotated base but impure |
+| W020 | static cross-module | bpp_validate.bsm | 397 | ✅ | Calling static fn from other module |
+
+## What "has location" means
+
+**✅ Shows source location:**
+```
+warning[W003]: 'add' expects 2 argument(s), got 1
+  --> game.bpp:42
+  42 | x = add(10);
+     |            ^
+```
+
+**❌ Missing source location:**
+```
+warning[W003]: 'add' expects 2 argument(s), got 1
+```
+
+The ❌ ones need `diag_loc(n.src_tok)` + `diag_show_line(n.src_tok)` added.
+AST nodes now carry `src_tok` (the token position at creation time) so the
+information is available — it just needs to be wired through.
+
+## How to add source location to a warning
+
+In the validator (val_check_node), after the warning message:
+```bpp
+diag_warn(N);
+diag_str("message...");
+diag_newline();
+_val_show_context_at(n.src_tok);    // ← add this line
+```
+
+In the dispatch (classify_all_functions), use the function record's stored position:
+```bpp
+diag_warn(N);
+diag_str("message...");
+diag_newline();
+diag_loc(*(funcs[i] + 64));         // ← tok_pos stored at offset 64
+diag_show_line(*(funcs[i] + 64));
+```
+
+In the import resolver, use the current line position:
+```bpp
+diag_fatal(N);
+diag_str("message...");
+diag_newline();
+// Import errors don't have tok_pos — show the filename instead.
+```
+
+## Line number accuracy
+
+The line number shown is file-relative (not absolute in the merged source).
+`diag_loc` converts absolute → relative using `diag_file_line_starts[module]`.
+
+Known issue: module 0 (entry file) line numbers may be off if `cur_line` is
+not reset before lexing. The fix: set `cur_line` to the newline count up to
+`mod0_real_start` before module 0's lex loop in bpp.bpp.
+
+## Process: adding a new diagnostic
+
+1. Choose a code: errors use E-series, warnings use W-series
+2. Add `diag_fatal(N)` or `diag_warn(N)` with clear message
+3. Add `diag_loc(tok_pos or n.src_tok)` + `diag_show_line(...)` 
+4. Update this document with the new code
+5. Add a test case to `tests/test_diagnostics.bpp`
+6. Run `tests/run_all.sh` to verify no regression
