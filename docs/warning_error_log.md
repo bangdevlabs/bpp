@@ -11,8 +11,11 @@ Update this document and `tests/test_diagnostics.bpp` when adding new codes.
 
 ```
 Total diagnostics:  22
-With source location: 12  ✅
-WITHOUT source location: 10  ❌  ← these need fixing
+With source location: 19  ✅  (file:line + source + caret)
+With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok_pos)
+  E001 (cannot open file) — shows filename
+  E002 (import not found) — shows filename + search paths
+  E222 (circular import)  — shows unresolved module names
 ```
 
 ## Errors (fatal — compilation stops)
