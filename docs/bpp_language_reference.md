@@ -129,12 +129,13 @@ import "stbecs.bsm";        // engine — permissive rules
 
 | Keyword | What it does |
 |---------|-------------|
-| `if` / `else` | Conditional execution. |
+| `if` / `else` | Conditional execution. Binary decisions (2 branches). |
 | `for` | C-style for loop: `for (init; cond; step) { body }`. |
 | `while` | While loop: `while (cond) { body }`. |
+| `switch` | Multi-way dispatch. Two forms: value dispatch `switch (expr) { V { } }` and condition dispatch `switch { cond { } }`. No fallthrough, no break, no case. Comma for multi-value: `A, B { }`. `else` for default. W021 if no `else`. Inherited from B (1969), corrected. |
 | `break` | Exit the innermost loop immediately. |
 | `continue` | Skip to the next iteration. In `for` loops, runs the step expression before re-testing the condition (C semantics). |
-| `return` | Return a value from the current function. |
+| `return` | Return a value from the current function. Bare `return;` supported in void functions. |
 
 ---
 

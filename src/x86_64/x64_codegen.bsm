@@ -259,6 +259,17 @@ x64_pre_reg_vars(arr, cnt) {
                 if (n.e > 0) { x64_pre_reg_vars(n.d, n.e); }
             }
             if (n.ntype == T_WHILE) { x64_pre_reg_vars(n.b, n.c); }
+            if (n.ntype == T_SWITCH) {
+                auto sw_bodies, sw_cnt2, si2, sb_arr2, sb_cnt2;
+                sw_bodies = n.src_tok;
+                sw_cnt2 = n.c;
+                for (si2 = 0; si2 < sw_cnt2; si2 = si2 + 1) {
+                    sb_arr2 = sw_bodies[si2 * 2];
+                    sb_cnt2 = sw_bodies[si2 * 2 + 1];
+                    x64_pre_reg_vars(sb_arr2, sb_cnt2);
+                }
+                if (n.d != 0) { x64_pre_reg_vars(n.d, n.e); }
+            }
         }
         i = i + 1;
     }
@@ -324,7 +335,7 @@ x64_emit_load_var(vi, off) {
     }
     if (ty_slice(fty) == SL_BYTE) { x64_enc_loadb(0, 5, off); return 0; }
     if (ty_slice(fty) == SL_QUARTER) { x64_enc_loadh(0, 5, off); return 0; }
-    if (ty_slice(fty) == SL_HALF) { x64_enc_load_w(0, 5, off); return 0; }
+    if (ty_slice(fty) == SL_HALF) { x64_enc_load_sw(0, 5, off); return 0; }
     x64_enc_load(0, 5, off);
     return 0;
 }
@@ -1365,7 +1376,7 @@ x64_emit_node(nd) {
         if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
         if (ty_slice(fh) == SL_BYTE) { x64_enc_loadb(0, 0, 0); }
         else if (ty_slice(fh) == SL_QUARTER) { x64_enc_loadh(0, 0, 0); }
-        else if (ty_slice(fh) == SL_HALF) { x64_enc_load_w(0, 0, 0); }
+        else if (ty_slice(fh) == SL_HALF) { x64_enc_load_sw(0, 0, 0); }
         else { x64_enc_load(0, 0, 0); }
         return 0;
     }
@@ -1573,6 +1584,57 @@ x64_emit_stmt(nd) {
             if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
         }
         x64_enc_jmp_label(x64_ret_lbl);
+        return 0;
+    }
+
+    if (t == T_SWITCH) {
+        auto sw_arms, sw_bodies, sw_cnt, sw_end_lbl;
+        auto si, sv_arr, sv_cnt, sb_arr, sb_cnt, snext_lbl;
+        sw_arms = n.b;
+        sw_bodies = n.src_tok;
+        sw_cnt = n.c;
+        sw_end_lbl = x64_enc_new_label();
+
+        for (si = 0; si < sw_cnt; si = si + 1) {
+            sv_arr = sw_arms[si * 2];
+            sv_cnt = sw_arms[si * 2 + 1];
+            sb_arr = sw_bodies[si * 2];
+            sb_cnt = sw_bodies[si * 2 + 1];
+            snext_lbl = x64_enc_new_label();
+
+            auto smatch_lbl, sk;
+            smatch_lbl = x64_enc_new_label();
+            if (n.a == 0) {
+                // Form 2: condition dispatch. Evaluate, test nonzero.
+                x64_emit_node(sv_arr[0]);
+                x64_enc_test_reg(0, 0);
+                x64_enc_jcc_label(5, smatch_lbl);   // JNE = 5 (nonzero)
+            } else {
+                // Form 1: value dispatch.
+                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                    x64_emit_node(n.a);
+                    x64_emit_push();
+                    x64_emit_node(sv_arr[sk]);
+                    x64_emit_pop(1);
+                    x64_enc_cmp_reg(1, 0);
+                    x64_enc_jcc_label(4, smatch_lbl);
+                }
+            }
+            x64_enc_jmp_label(snext_lbl);
+
+            x64_enc_def_label(smatch_lbl);
+            for (sk = 0; sk < sb_cnt; sk = sk + 1) { x64_emit_stmt(sb_arr[sk]); }
+            x64_enc_jmp_label(sw_end_lbl);
+
+            x64_enc_def_label(snext_lbl);
+        }
+
+        if (n.d != 0) {
+            auto ek;
+            for (ek = 0; ek < n.e; ek = ek + 1) { x64_emit_stmt(n.d[ek]); }
+        }
+
+        x64_enc_def_label(sw_end_lbl);
         return 0;
     }
 

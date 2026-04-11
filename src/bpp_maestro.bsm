@@ -11,125 +11,132 @@
 // Maestro takes over from there: it owns the frame timing, the
 // quit flag, and the scheduling of base work onto workers.
 //
-// Phase order on every tick:
-//   1. solo  — runs on the main thread, mutates game state, reads
-//              input. Improvisational, sequential.
-//   2. base  — runs on the main thread but typically dispatches
-//              parallel work via job_submit / job_parallel_for.
-//              Maestro calls job_wait_all() after base returns so
-//              the render phase sees all results.
-//   3. render — runs on the main thread, submits draw commands.
+// Phase order on every tick (fixed timestep accumulator):
+//   1. Accumulate real elapsed time into a bucket.
+//   2. While the bucket holds at least one fixed_dt:
+//      a. solo(fixed_dt)  — main thread, mutates state, reads input.
+//      b. base(fixed_dt)  — main thread, dispatches parallel work.
+//      c. job_wait_all()  — drain workers before the next step.
+//      d. Subtract fixed_dt from the bucket.
+//   3. render(alpha) — alpha is 0-1000, the interpolation factor
+//      between the last physics tick and the next. Renderers can
+//      use this to smooth positions when physics_hz < render_fps.
 //
-// Beat is initialized at the same moment as the platform window so
-// every reading of beat_now_* during the loop is monotonic from
-// the moment the program "started playing".
+// The accumulator pattern (Glenn Fiedler's "Fix Your Timestep")
+// gives solo and base a deterministic fixed_dt every tick, regardless
+// of how fast or slow the display runs. This eliminates frame-rate
+// dependent physics and prevents the spiral-of-death on stalls.
 //
-// Constraint 3 from the maestro plan: maestro does NOT compute its
-// own dt. It calls game_frame_begin() (which already computes dt
-// from stbgame's _stb_last_time) and passes game_dt_ms() down to
-// each phase callback. This avoids the dual-clock drift bug where
-// two independent reads of _stb_get_time() would diverge by one
-// platform-clock interval per frame.
+// By default physics_hz == fps (same rate). Call maestro_set_physics_hz
+// before maestro_run to decouple them — e.g. render at 60fps but run
+// physics at 10hz for a grid game like snake.
+//
+// Beat is initialized at the same moment as the worker pool so every
+// reading of beat_now_* during the loop is monotonic from the moment
+// the program "started playing".
 //
 // Usage:
-//   // Auto-injected if your program imports stbgame. Otherwise:
 //   import "bpp_maestro.bsm";
 //
-//   game_init_phase()       { /* set up world */ return 0; }
-//   game_solo_phase(dt)     { /* read input, mutate state */ return 0; }
-//   game_base_phase(dt)     { job_parallel_for(N, work_fn); return 0; }
-//   game_render_phase(dt)   { /* submit draws */ return 0; }
-//   game_quit_phase()       { /* tear down */ return 0; }
+//   game_init_phase()            { /* set up world */ }
+//   game_solo_phase(fixed_dt)    { /* read input, mutate state */ }
+//   game_base_phase(fixed_dt)    { job_parallel_for(N, work_fn); }
+//   game_render_phase(alpha)     { /* submit draws, interpolate with alpha */ }
+//   game_quit_phase()            { /* tear down */ }
 //
 //   main() {
-//       maestro_configure(640, 360, "My Game", 60);
 //       maestro_register_init(fn_ptr(game_init_phase));
 //       maestro_register_solo(fn_ptr(game_solo_phase));
 //       maestro_register_base(fn_ptr(game_base_phase));
 //       maestro_register_render(fn_ptr(game_render_phase));
 //       maestro_register_quit(fn_ptr(game_quit_phase));
+//       maestro_configure(60);
 //       maestro_run();
-//       return 0;
 //   }
 
 import "_stb_core.bsm";
 import "bpp_beat.bsm";
 import "bpp_job.bsm";
 
-// Configuration captured by maestro_configure, consumed by maestro_run.
-// Just the tick rate — window/title/dimensions belong to whatever module
-// is providing the I/O surface (stbgame for windowed games, nothing for
-// CLI tools, future stbaudio for audio plugins). Maestro stays neutral.
-auto _ms_fps;
-auto _ms_n_workers;
-auto _ms_configured;
-auto _ms_quit_flag;
+// Default worker count. Set in maestro_configure, never changes after.
+static auto _MS_DEFAULT_WORKERS;
 
-// Lifecycle callbacks. 0 means "not registered", maestro skips.
-auto _ms_cb_init, _ms_cb_solo, _ms_cb_base, _ms_cb_render, _ms_cb_quit;
-
-// Default worker count when none is configured. 4 is a reasonable
-// starting point on Apple Silicon (4-8 performance cores). Larger
-// programs can override via maestro_set_workers() before maestro_run().
-auto _MS_DEFAULT_WORKERS;
+// Configuration and lifecycle state. Set once in configure/register,
+// frozen during maestro_run. Quit flag is the only one mutated in the loop.
+static auto _ms_fps;
+static auto _ms_n_workers;
+static auto _ms_configured;
+static auto _ms_physics_hz;
+static auto _ms_quit_flag;
+static auto _ms_cb_init, _ms_cb_solo, _ms_cb_base, _ms_cb_render, _ms_cb_quit;
 
 // Capture configuration. Does not start anything yet.
-// fps is the target tick rate; maestro sleeps to fit the per-frame budget.
-maestro_configure(fps) {
+// fps is the target render rate; maestro sleeps to fit the per-frame budget.
+// Rule 3: side-effect only.
+void maestro_configure(fps) {
     _MS_DEFAULT_WORKERS = 4;
     _ms_fps = fps;
     if (_ms_n_workers == 0) { _ms_n_workers = _MS_DEFAULT_WORKERS; }
     _ms_quit_flag = 0;
     _ms_configured = 1;
-    return 0;
 }
 
 // Override the default worker count. Call BEFORE maestro_run.
-maestro_set_workers(n) {
+// Rule 3: side-effect only.
+void maestro_set_workers(n) {
     _ms_n_workers = n;
-    return 0;
+}
+
+// Decouple the physics tick rate from the render frame rate.
+// Call BEFORE maestro_run. When physics_hz < fps, solo and base
+// run fewer times per second than render, and render receives an
+// interpolation alpha so positions can be smoothed. When not called
+// (or called with 0), physics_hz defaults to fps.
+// Rule 3: side-effect only.
+void maestro_set_physics_hz(hz) {
+    _ms_physics_hz = hz;
 }
 
 // Signal the maestro loop to exit cleanly. Call from any callback
 // (solo, base, render, signal handler) to terminate the run.
 // Game programs typically check stbgame's game_should_quit() in
 // their solo phase and call maestro_quit() if it returns 1.
-maestro_quit() {
+// Rule 3: side-effect only.
+void maestro_quit() {
     _ms_quit_flag = 1;
-    return 0;
 }
 
 // Register the init callback. Called once before the loop starts,
-// after the worker pool is alive. Use this to allocate state, load
-// assets, etc.
-maestro_register_init(fn) { _ms_cb_init = fn; return 0; }
+// after the worker pool is alive. Use for allocating state, loading
+// assets, etc. Rule 3: side-effect only.
+void maestro_register_init(fn) { _ms_cb_init = fn; }
 
-// Register the solo callback. Called every tick on the main thread
-// before the base phase. Reads input, updates state, decides whether
-// to call maestro_quit().
-// Argument: dt_ms (delta time in milliseconds for this frame).
-maestro_register_solo(fn) { _ms_cb_solo = fn; return 0; }
+// Register the solo callback. Called every fixed-timestep tick on
+// the main thread before the base phase. Reads input, updates state,
+// decides whether to call maestro_quit().
+// Argument: fixed_dt (fixed physics timestep in milliseconds).
+void maestro_register_solo(fn) { _ms_cb_solo = fn; }
 
-// Register the base callback. Called every tick on the main thread
-// after solo. Inside this callback, dispatch parallel work via
-// job_submit or job_parallel_for. Maestro calls job_wait_all()
+// Register the base callback. Called every fixed-timestep tick on
+// the main thread after solo. Inside this callback, dispatch parallel
+// work via job_submit or job_parallel_for. Maestro calls job_wait_all
 // automatically after this returns.
-// Argument: dt_ms.
-maestro_register_base(fn) { _ms_cb_base = fn; return 0; }
+// Argument: fixed_dt.
+void maestro_register_base(fn) { _ms_cb_base = fn; }
 
-// Register the render callback. Called every tick after base+wait.
-// Present results, submit draw commands, write output, etc.
-// Argument: dt_ms.
-maestro_register_render(fn) { _ms_cb_render = fn; return 0; }
+// Register the render callback. Called every frame after the
+// accumulator drains. Presents results, submits draw commands.
+// Argument: alpha (0-1000 interpolation factor between physics ticks).
+void maestro_register_render(fn) { _ms_cb_render = fn; }
 
 // Register the quit callback. Called once after the loop exits,
-// before the worker pool is torn down. Use this to free state,
-// save data, close files, etc.
-maestro_register_quit(fn) { _ms_cb_quit = fn; return 0; }
+// before the worker pool is torn down. Use for freeing state,
+// saving data, closing files, etc. Rule 3: side-effect only.
+void maestro_register_quit(fn) { _ms_cb_quit = fn; }
 
 // Start the loop. Blocks until maestro_quit() is called from one of
 // the callbacks. Owns the beat clock, the worker pool, and the run
-// loop. Returns 0 on clean shutdown.
+// loop. Returns 0 on clean shutdown, 1 if not configured.
 //
 // Maestro is neutral about what kind of program it's driving — it
 // doesn't open windows, it doesn't bind sockets, it doesn't read
@@ -138,8 +145,15 @@ maestro_register_quit(fn) { _ms_cb_quit = fn; return 0; }
 // stbgame's game_run() wrapper calls game_init before maestro_run
 // and game_end after, then the user's solo callback calls
 // game_frame_begin and checks game_should_quit.
+//
+// The loop uses the accumulator pattern (Glenn Fiedler, "Fix Your
+// Timestep"). Real elapsed time is accumulated into a bucket. The
+// bucket is drained in fixed_dt steps — solo and base always receive
+// the same deterministic timestep regardless of frame rate. After
+// draining, render receives alpha (0-1000): how far between the
+// last physics tick and the next, for position interpolation.
 maestro_run() {
-    auto dt, last_time, now, frame_ms, elapsed;
+    auto now, dt, last_time, accumulator, fixed_dt, frame_ms, elapsed, alpha;
 
     if (_ms_configured == 0) { return 1; }
 
@@ -155,42 +169,63 @@ maestro_run() {
     // 2. Anchor the beat clock at the start of the run.
     init_beat();
 
-    // 3. User init. Game programs typically call game_init() inside
-    // here (via stbgame's game_run wrapper). CLI tools allocate
-    // buffers and parse args here.
+    // 3. User init callback.
     if (_ms_cb_init != 0) { call(_ms_cb_init); }
 
-    // 4. Tick loop. solo → base → wait → render, until maestro_quit.
+    // 4. Compute timing constants. Physics tick rate defaults to the
+    // render frame rate when not explicitly set via maestro_set_physics_hz.
+    if (_ms_physics_hz == 0) { _ms_physics_hz = _ms_fps; }
+    fixed_dt = 1000 / _ms_physics_hz;
     frame_ms = 1000 / _ms_fps;
+    // Pre-seed so the first frame runs one physics step immediately
+    // instead of rendering an empty frame while waiting for time to
+    // accumulate. Standard practice in fixed-timestep game loops.
+    accumulator = fixed_dt;
     last_time = beat_now_ms();
+
+    // 5. Accumulator loop. Drain physics in fixed steps, then render.
     while (_ms_quit_flag == 0) {
-        // Compute dt against the previous frame. Clamped to avoid
-        // huge jumps after a stall (debug pause, GC pause, etc.).
         now = beat_now_ms();
         dt = now - last_time;
-        if (dt < 1)  { dt = 1; }
+        // Clamp to 50ms to prevent spiral of death after a stall
+        // (debug pause, system sleep, etc.). At worst the game runs
+        // in slow motion instead of trying to catch up forever.
         if (dt > 50) { dt = 50; }
         last_time = now;
+        accumulator = accumulator + dt;
 
-        if (_ms_cb_solo   != 0) { call(_ms_cb_solo, dt); }
-        if (_ms_cb_base   != 0) { call(_ms_cb_base, dt); }
-        // Drain all worker queues so render sees the results of any
-        // job_submit / job_parallel_for the base callback did.
-        job_wait_all();
-        if (_ms_cb_render != 0) { call(_ms_cb_render, dt); }
+        // Drain the accumulator in fixed-size physics steps. Solo and
+        // base always receive the same fixed_dt, producing deterministic
+        // results regardless of how fast the display refreshes.
+        while (accumulator >= fixed_dt) {
+            if (_ms_cb_solo != 0) { call(_ms_cb_solo, fixed_dt); }
+            if (_ms_cb_base != 0) { call(_ms_cb_base, fixed_dt); }
+            // Drain all worker queues so the next physics step (or
+            // render) sees the results of any parallel work.
+            job_wait_all();
+            accumulator = accumulator - fixed_dt;
+        }
 
-        // Sleep to fit the frame budget. sys_usleep takes microseconds.
+        // Alpha is the interpolation factor (0-1000) telling the
+        // renderer how far between the last physics tick and the next.
+        // A renderer can lerp positions: draw_x = prev_x + (cur_x - prev_x) * alpha / 1000.
+        // For grid games like snake where physics_hz == fps, alpha is
+        // always 0 and render just draws the current state.
+        alpha = 0;
+        if (fixed_dt > 0) { alpha = accumulator * 1000 / fixed_dt; }
+        if (_ms_cb_render != 0) { call(_ms_cb_render, alpha); }
+
+        // Sleep to fit the render frame budget. sys_usleep takes microseconds.
         elapsed = beat_now_ms() - now;
         if (elapsed < frame_ms) {
             sys_usleep((frame_ms - elapsed) * 1000);
         }
     }
 
-    // 5. User quit hook (workers still alive).
+    // 6. User quit hook (workers still alive for teardown work).
     if (_ms_cb_quit != 0) { call(_ms_cb_quit); }
 
-    // 6. Tear down workers. The user's quit callback closes any
-    // window/file/socket they opened in init.
+    // 7. Tear down workers.
     job_shutdown();
 
     return 0;

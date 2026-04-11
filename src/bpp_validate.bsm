@@ -29,7 +29,7 @@ auto _val_src_tok;       // src_tok of the current node being checked
 // Print source location for a warning/error using the AST node's saved
 // token position. Shows file:line + source line with caret, compatible
 // with Emacs M-x compile and VS Code problem matcher.
-_val_show_context_at(stok) {
+static void _val_show_context_at(stok) {
     if (stok > 0) {
         diag_loc(stok);
         diag_show_line(stok);
@@ -38,7 +38,7 @@ _val_show_context_at(stok) {
 
 // Show context from the current node being validated.
 // Falls back to function name if no source token available.
-_val_show_context() {
+static void _val_show_context() {
     // Caller should use _val_show_context_at(n.src_tok) when possible.
     // This fallback shows the function name for cases where we don't
     // have a specific node (e.g., dispatch-level warnings).
@@ -52,31 +52,28 @@ _val_show_context() {
     }
 }
 
-init_validate() {
+void init_validate() {
     _val_hn = arr_new();
     _val_ht = arr_new();
     _val_func_hash = hash_str_new(256);
     _val_extern_hash = hash_str_new(64);
-    return 0;
 }
 
-_val_reset_hints() {
+static void _val_reset_hints() {
     arr_clear(_val_hn);
     arr_clear(_val_ht);
-    return 0;
 }
 
-_val_add_hint(name_p, hint) {
+static void _val_add_hint(name_p, hint) {
     auto i;
     for (i = 0; i < arr_len(_val_hn); i = i + 1) {
-        if (packed_eq(arr_get(_val_hn, i), name_p)) { return 0; }
+        if (packed_eq(arr_get(_val_hn, i), name_p)) { return; }
     }
     _val_hn = arr_push(_val_hn, name_p);
     _val_ht = arr_push(_val_ht, hint);
-    return 0;
 }
 
-_val_get_hint(name_p) {
+static _val_get_hint(name_p) {
     auto i;
     for (i = 0; i < arr_len(_val_hn); i = i + 1) {
         if (packed_eq(arr_get(_val_hn, i), name_p)) { return arr_get(_val_ht, i); }
@@ -138,7 +135,7 @@ val_is_builtin(name_p) {
 // reflects the live symbol table (modules can be loaded incrementally
 // and grow funcs[] between passes). Stores (i + 1) so a return of 0
 // from hash_str_get unambiguously means "absent".
-_val_build_func_hash() {
+static void _val_build_func_hash() {
     auto i, rec, name_p;
     hash_str_clear(_val_func_hash);
     for (i = 0; i < func_cnt; i = i + 1) {
@@ -148,11 +145,10 @@ _val_build_func_hash() {
                      vbuf + unpack_s(name_p), unpack_l(name_p),
                      i + 1);
     }
-    return 0;
 }
 
 // Rebuild the extern-name hash from the current externs[] table.
-_val_build_extern_hash() {
+static void _val_build_extern_hash() {
     auto i, rec, name_p;
     hash_str_clear(_val_extern_hash);
     for (i = 0; i < ext_cnt; i = i + 1) {
@@ -162,7 +158,6 @@ _val_build_extern_hash() {
                      vbuf + unpack_s(name_p), unpack_l(name_p),
                      i + 1);
     }
-    return 0;
 }
 
 // Look up a function by packed name. O(1) via the hash; falls back to
@@ -216,7 +211,7 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
     // E050: ptr to non-ptr.
     if (vb == BASE_PTR) {
         if (hb != BASE_PTR) {
-            diag_fatal(50);
+            diag_error(50);
             diag_str("cannot assign ptr to '");
             diag_packed(var_name_p);
             diag_str("' (declared as ");
@@ -224,14 +219,13 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str(")");
             diag_newline();
             _val_show_context_at(_val_src_tok);
-            sys_exit(1);
         }
     }
 
     // E053: non-ptr to ptr.
     if (hb == BASE_PTR) {
         if (vb != BASE_PTR) {
-            diag_fatal(53);
+            diag_error(53);
             diag_str("assigning ");
             diag_str(val_type_name(val_ty));
             diag_str(" to '");
@@ -239,7 +233,6 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str("' (declared as ptr) without cast");
             diag_newline();
             _val_show_context_at(_val_src_tok);
-            sys_exit(1);
         }
     }
 
@@ -323,8 +316,8 @@ val_check_node(nd) {
     t = n.ntype;
     _val_src_tok = n.src_tok;
 
-    // ── T_DECL: collect type hints ──────────────────────────
-    if (t == T_DECL) {
+    switch (t) {
+    T_DECL {
         auto vars_arr, var_cnt, hints_arr, single_hint, i, h;
         vars_arr = n.a;
         var_cnt = n.b;
@@ -342,9 +335,7 @@ val_check_node(nd) {
         }
         return 0;
     }
-
-    // ── T_ASSIGN: Layer 2 type check on hinted variables ────
-    if (t == T_ASSIGN) {
+    T_ASSIGN {
         auto lhs: Node, hint_ty, val_ty;
         lhs = n.a;
         if (lhs != 0) {
@@ -360,41 +351,27 @@ val_check_node(nd) {
         val_check_node(n.b);
         return 0;
     }
-
-    // ── T_CALL: E201/W002/W003 + Layer 1 checks ────────────
-    if (t == T_CALL) {
+    T_CALL {
         auto fi, callee, expected, ai, arg_nd, arg_ty, par_ty;
         auto an: Node;
         name_p = n.a;
-
-        // E201: undefined function.
         if (val_is_builtin(name_p) == 0) {
             if (val_find_func(name_p) < 0) {
                 if (val_find_extern(name_p) < 0) {
-                    diag_fatal(201);
+                    diag_error(201);
                     diag_str("function '");
                     diag_packed(name_p);
                     diag_str("' called but never defined -- missing import?");
                     diag_newline();
-                _val_show_context_at(n.src_tok);
-                    sys_exit(1);
+                    _val_show_context_at(n.src_tok);
+                    return 0;
                 }
             }
         }
-
-        // W003 + W002 + E220: check B++ function calls.
         fi = val_find_func(name_p);
         if (fi >= 0) {
             callee = funcs[fi];
             expected = *(callee + FN_PCNT);
-
-            // W017: using the return value of a void function.
-            // Only fires when the T_CALL is inside a T_ASSIGN (its return
-            // value is being captured). Standalone call statements are fine.
-            // The check is conservative: it only warns at the call validation
-            // level. A full check would require tracking assignment context.
-
-            // E220: calling a static function from another module.
             if (arr_get(fn_static, fi) != 0) {
                 auto _callee_mod, _caller_mod;
                 _callee_mod = arr_get(func_mods, fi);
@@ -405,10 +382,9 @@ val_check_node(nd) {
                     diag_packed(name_p);
                     diag_str("' is static (private to its module)");
                     diag_newline();
-                _val_show_context_at(n.src_tok);
+                    _val_show_context_at(n.src_tok);
                 }
             }
-
             if (n.c != expected) {
                 diag_warn(3);
                 diag_str("'");
@@ -420,7 +396,6 @@ val_check_node(nd) {
                 diag_newline();
                 _val_show_context_at(n.src_tok);
             }
-
             for (ai = 0; ai < n.c; ai = ai + 1) {
                 arg_nd = n.b[ai];
                 if (arg_nd != 0) {
@@ -436,18 +411,13 @@ val_check_node(nd) {
                             diag_packed(name_p);
                             diag_str("'");
                             diag_newline();
-                _val_show_context_at(n.src_tok);
+                            _val_show_context_at(n.src_tok);
                             diag_help("add ': float' to the parameter declaration");
                         }
                     }
                 }
             }
         }
-
-        // W012: & (address-of) does not work correctly as an argument to
-        // extern functions or call() (FFI function pointer calls).
-        // The stack address may be clobbered by the calling convention.
-        // Use malloc(8) as a workaround for FFI out-parameters.
         if (val_find_extern(name_p) >= 0) {
             for (ai = 0; ai < n.c; ai = ai + 1) {
                 arg_nd = n.b[ai];
@@ -459,7 +429,7 @@ val_check_node(nd) {
                         diag_packed(name_p);
                         diag_str("' — may crash at runtime (use malloc for FFI out-params)");
                         diag_newline();
-                _val_show_context_at(n.src_tok);
+                        _val_show_context_at(n.src_tok);
                     }
                 }
             }
@@ -474,36 +444,35 @@ val_check_node(nd) {
                             diag_warn(12);
                             diag_str("'&' used as argument to call() — may crash at runtime (use malloc for FFI out-params)");
                             diag_newline();
-                _val_show_context_at(n.src_tok);
+                            _val_show_context_at(n.src_tok);
                         }
                     }
                 }
             } }
         }
-
         val_check_list(n.b, n.c);
         return 0;
     }
-
-    // ── Recurse into sub-expressions ────────────────────────
-    if (t == T_BINOP) { val_check_node(n.b); val_check_node(n.c); return 0; }
-    if (t == T_UNARY) { val_check_node(n.b); return 0; }
-    if (t == T_RET)   { val_check_node(n.a); return 0; }
-    if (t == T_IF) {
+    T_BINOP { val_check_node(n.b); val_check_node(n.c); return 0; }
+    T_UNARY { val_check_node(n.b); return 0; }
+    T_RET   { val_check_node(n.a); return 0; }
+    T_IF {
         val_check_node(n.a);
         val_check_list(n.b, n.c);
         if (n.e > 0) { val_check_list(n.d, n.e); }
         return 0;
     }
-    if (t == T_WHILE) {
+    T_WHILE {
         val_check_node(n.a);
         val_check_list(n.b, n.c);
         if (n.e != 0) { val_check_node(n.e); }
         return 0;
     }
-    if (t == T_MEMLD) { val_check_node(n.a); return 0; }
-    if (t == T_ADDR) { val_check_node(n.a); return 0; }
-    if (t == T_MEMST) { val_check_node(n.a); val_check_node(n.b); return 0; }
+    T_MEMLD { val_check_node(n.a); return 0; }
+    T_ADDR  { val_check_node(n.a); return 0; }
+    T_MEMST { val_check_node(n.a); val_check_node(n.b); return 0; }
+    else { }
+    }
     return 0;
 }
 
@@ -512,7 +481,7 @@ val_check_node(nd) {
 // Run validation on all functions. Per-function: reset hints, collect
 // param hints, walk body. Symbol hashes are rebuilt up front so every
 // val_find_func / val_find_extern call inside the body walk is O(1).
-run_validate() {
+void run_validate() {
     auto i, rec, body_arr, body_cnt, hints, h, j, params_arr, param_cnt;
     _val_build_func_hash();
     _val_build_extern_hash();
@@ -541,7 +510,7 @@ run_validate() {
             val_check_list(body_arr, body_cnt);
         }
     }
-    return 0;
+    diag_check_errors();
 }
 
 // Per-module version for the incremental pipeline.

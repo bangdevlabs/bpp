@@ -335,6 +335,18 @@ a64_pre_reg_vars(arr, cnt) {
                 if (n.e > 0) { a64_pre_reg_vars(n.d, n.e); }
             }
             if (n.ntype == T_WHILE) { a64_pre_reg_vars(n.b, n.c); }
+            if (n.ntype == T_SWITCH) {
+                // Recurse into each switch arm body to find auto declarations.
+                auto sw_bodies, sw_cnt2, si2, sb_arr2, sb_cnt2;
+                sw_bodies = n.src_tok;
+                sw_cnt2 = n.c;
+                for (si2 = 0; si2 < sw_cnt2; si2 = si2 + 1) {
+                    sb_arr2 = sw_bodies[si2 * 2];
+                    sb_cnt2 = sw_bodies[si2 * 2 + 1];
+                    a64_pre_reg_vars(sb_arr2, sb_cnt2);
+                }
+                if (n.d != 0) { a64_pre_reg_vars(n.d, n.e); }
+            }
         }
         i = i + 1;
     }
@@ -1678,7 +1690,7 @@ a64_emit_node(nd) {
         } else if (ty_slice(fh) == SL_QUARTER) {
             if (a64_bin_mode) { enc_ldrh_uoff(0, 0, 0); } else { out("  ldrh w0, [x0]"); putchar('\n'); }
         } else if (ty_slice(fh) == SL_HALF) {
-            if (a64_bin_mode) { enc_ldr_w_uoff(0, 0, 0); } else { out("  ldr w0, [x0]"); putchar('\n'); }
+            if (a64_bin_mode) { enc_ldrsw_uoff(0, 0, 0); } else { out("  ldrsw x0, [x0]"); putchar('\n'); }
         } else {
             if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); } else { out("  ldr x0, [x0]"); putchar('\n'); }
         }
@@ -2013,6 +2025,70 @@ a64_emit_stmt(nd) {
         } else {
             out("  b .Lret_"); a64_print_p(a64_cur_fn_name); putchar('\n');
         }
+        return 0;
+    }
+
+    if (t == T_SWITCH) {
+        // Two forms:
+        // Form 1 (n.a != 0): value dispatch — compare condition against each arm value
+        // Form 2 (n.a == 0): condition dispatch — evaluate each arm as boolean
+        auto sw_arms, sw_bodies, sw_cnt, sw_end_lbl;
+        auto si, sv_arr, sv_cnt, sb_arr, sb_cnt, snext_lbl;
+        sw_arms = n.b;
+        sw_bodies = n.src_tok;
+        sw_cnt = n.c;
+        if (a64_bin_mode) { sw_end_lbl = enc_new_label(); }
+        else { sw_end_lbl = a64_new_lbl(); }
+
+        for (si = 0; si < sw_cnt; si = si + 1) {
+            sv_arr = sw_arms[si * 2];
+            sv_cnt = sw_arms[si * 2 + 1];
+            sb_arr = sw_bodies[si * 2];
+            sb_cnt = sw_bodies[si * 2 + 1];
+            if (a64_bin_mode) { snext_lbl = enc_new_label(); }
+            else { snext_lbl = a64_new_lbl(); }
+
+            auto smatch_lbl, sk;
+            if (a64_bin_mode) { smatch_lbl = enc_new_label(); }
+            else { smatch_lbl = a64_new_lbl(); }
+
+            if (n.a == 0) {
+                // Form 2: condition dispatch. Evaluate the condition expression.
+                // If truthy (nonzero), enter the body.
+                a64_emit_node(sv_arr[0]);
+                if (a64_bin_mode) { enc_cbnz_label(0, smatch_lbl); }
+                else { out("  cbnz x0, .L"); a64_print_dec(smatch_lbl); putchar('\n'); }
+            } else {
+                // Form 1: value dispatch. Compare condition against each value.
+                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                    a64_emit_node(n.a);
+                    a64_emit_push();
+                    a64_emit_node(sv_arr[sk]);
+                    a64_emit_pop(1);
+                    if (a64_bin_mode) { enc_cmp_reg(1, 0); enc_b_cond_label(0, smatch_lbl); }
+                    else { out("  cmp x1, x0"); putchar('\n'); out("  b.eq .L"); a64_print_dec(smatch_lbl); putchar('\n'); }
+                }
+            }
+            if (a64_bin_mode) { enc_b_label(snext_lbl); }
+            else { out("  b .L"); a64_print_dec(snext_lbl); putchar('\n'); }
+
+            if (a64_bin_mode) { enc_def_label(smatch_lbl); }
+            else { out(".L"); a64_print_dec(smatch_lbl); out(":"); putchar('\n'); }
+            for (sk = 0; sk < sb_cnt; sk = sk + 1) { a64_emit_stmt(sb_arr[sk]); }
+            if (a64_bin_mode) { enc_b_label(sw_end_lbl); }
+            else { out("  b .L"); a64_print_dec(sw_end_lbl); putchar('\n'); }
+
+            if (a64_bin_mode) { enc_def_label(snext_lbl); }
+            else { out(".L"); a64_print_dec(snext_lbl); out(":"); putchar('\n'); }
+        }
+
+        if (n.d != 0) {
+            auto ek;
+            for (ek = 0; ek < n.e; ek = ek + 1) { a64_emit_stmt(n.d[ek]); }
+        }
+
+        if (a64_bin_mode) { enc_def_label(sw_end_lbl); }
+        else { out(".L"); a64_print_dec(sw_end_lbl); out(":"); putchar('\n'); }
         return 0;
     }
 

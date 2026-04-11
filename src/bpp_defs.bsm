@@ -23,28 +23,38 @@
 //   FUNC   packed_name params_arr param_cnt  body_arr   body_cnt
 //   EXT    packed_name packed_lib packed_ret  argtypes   argc
 
-struct Node { ntype, a, b, c, d, e, dispatch, itype, src_tok }
+// Node struct: the fundamental AST building block. Millions of instances
+// per compilation via the 8MB arena. Three fields are sliced to :byte
+// because their values never exceed 255:
+//   ntype    — 0-15  (T_LIT..T_CONTINUE)
+//   dispatch — 0-3   (DSP_SEQ..DSP_SPLIT)
+//   itype    — 0-51  (type codes: TY_UNK..TY_FLOAT_B)
+// This reduces each node from 72 to 51 bytes (29% smaller), improving
+// cache locality during AST walks. All field access uses dot syntax so
+// the compiler computes offsets automatically from the packed layout.
+struct Node { ntype: byte, a, b, c, d, e, dispatch: byte, itype: byte, src_tok }
 
 // Node type codes (AST node kinds)
-auto T_LIT, T_VAR, T_BINOP, T_UNARY, T_ASSIGN;
-auto T_MEMLD, T_MEMST, T_CALL, T_IF, T_WHILE, T_RET, T_DECL, T_NOP, T_BREAK, T_ADDR;
-auto T_CONTINUE;
+extrn T_LIT, T_VAR, T_BINOP, T_UNARY, T_ASSIGN;
+extrn T_MEMLD, T_MEMST, T_CALL, T_IF, T_WHILE, T_RET, T_DECL, T_NOP, T_BREAK, T_ADDR;
+extrn T_CONTINUE;
+extrn T_SWITCH;
 
 // Token type codes (lexer output categories)
-auto TK_KW, TK_IMP, TK_ID, TK_NUM, TK_HEX, TK_STR, TK_OP, TK_PUNCT;
+extrn TK_KW, TK_IMP, TK_ID, TK_NUM, TK_HEX, TK_STR, TK_OP, TK_PUNCT;
 
 // Type system: base × slice, packed into a single byte.
 // Base (bits 0-3), slice (bits 4-5), bits 6-7 free.
 // Bit 0 = float flag: FLOAT bases have bit 0 set, all others clear.
 // Compose with ty_make(base, slice), decompose with ty_base(ty) / ty_slice(ty).
-auto BASE_UNKNOWN, BASE_WORD, BASE_FLOAT, BASE_PTR, BASE_STRUCT;
-auto SL_FULL, SL_HALF, SL_QUARTER, SL_BYTE;
+extrn BASE_UNKNOWN, BASE_WORD, BASE_FLOAT, BASE_PTR, BASE_STRUCT;
+extrn SL_FULL, SL_HALF, SL_QUARTER, SL_BYTE;
 
 // 11 real type constants: WORD and FLOAT × 4 slices + PTR + STRUCT + UNK.
-auto TY_UNK;
-auto TY_WORD,  TY_WORD_H,  TY_WORD_Q,  TY_WORD_B;
-auto TY_FLOAT, TY_FLOAT_H, TY_FLOAT_Q, TY_FLOAT_B;
-auto TY_PTR, TY_STRUCT;
+extrn TY_UNK;
+extrn TY_WORD,  TY_WORD_H,  TY_WORD_Q,  TY_WORD_B;
+extrn TY_FLOAT, TY_FLOAT_H, TY_FLOAT_Q, TY_FLOAT_B;
+extrn TY_PTR, TY_STRUCT;
 
 // Top-level variable storage class. Stored per-global in glob_class[],
 // parallel to globals[]. Determines the runtime semantics of a variable
@@ -56,38 +66,43 @@ auto TY_PTR, TY_STRUCT;
 //   GLOB_EXTRN  (2)  Write-once-after-init. Mutable before maestro_run/job_init,
 //                    immutable after. Reads are safe from any worker because
 //                    the memory is literally frozen. Set by `extrn x;`.
-auto GLOB_AUTO, GLOB_GLOBAL, GLOB_EXTRN;
+extrn GLOB_AUTO, GLOB_GLOBAL, GLOB_EXTRN;
 
-// Legacy offset aliases — kept until all modules migrate to struct access.
-auto NODE_SZ, ND_TYPE, ND_ITYPE;
+// NODE_SZ = sizeof(Node) — the packed size of an AST node.
+// RECORD_SZ = 72 — fixed size for function and extern records (9 word slots).
+// Function/extern records are NOT Node structs — they use raw 8-byte offsets.
+// RECORD_SZ is decoupled from sizeof(Node) so Node can be sliced without
+// breaking function record layout.
+extrn NODE_SZ, RECORD_SZ, ND_TYPE, ND_ITYPE;
 
-// Function record field offsets (record size = NODE_SZ = 64 bytes).
-// Layout: type(22) | name | params_arr | param_cnt | body_arr | body_cnt | hints | stub
-auto FN_TYPE, FN_NAME, FN_PARS, FN_PCNT, FN_BODY, FN_BCNT, FN_HINTS, FN_STUB;
+// Function record field offsets (record size = RECORD_SZ = 72 bytes).
+// Layout: type(22) | name | params_arr | param_cnt | body_arr | body_cnt | hints | stub | tok_pos
+extrn FN_TYPE, FN_NAME, FN_PARS, FN_PCNT, FN_BODY, FN_BCNT, FN_HINTS, FN_STUB;
 
-// Extern record field offsets (record size = NODE_SZ = 64 bytes).
+// Extern record field offsets (record size = RECORD_SZ = 72 bytes).
 // Layout: type(21) | name | lib | ret_type_str | args_arr | arg_cnt
-auto EX_TYPE, EX_NAME, EX_LIB, EX_RET, EX_ARGS, EX_ACNT;
+extrn EX_TYPE, EX_NAME, EX_LIB, EX_RET, EX_ARGS, EX_ACNT;
 
 // Pack a string reference into a single 64-bit value.
 // Lower 32 bits = start offset in vbuf, upper 32 bits = length.
-pack(s, l) {
+pack(s, l) : base {
     return s + (l * 0x100000000);
 }
 
 // Extract the start offset from a packed string reference.
-unpack_s(p) {
+unpack_s(p) : base {
     return p % 0x100000000;
 }
 
 // Extract the length from a packed string reference.
-unpack_l(p) {
+unpack_l(p) : base {
     return p / 0x100000000;
 }
 
 // Initialize all constants. Must be called before using any definition.
-init_defs() {
+void init_defs() {
     NODE_SZ = sizeof(Node);
+    RECORD_SZ = 72;
     ND_TYPE = 0;
     ND_ITYPE = 56;
 
@@ -100,6 +115,7 @@ init_defs() {
     T_MEMLD = 5; T_MEMST = 6; T_CALL = 7; T_IF = 8; T_WHILE = 9;
     T_RET = 10; T_DECL = 11; T_NOP = 12; T_BREAK = 13; T_ADDR = 14;
     T_CONTINUE = 15;
+    T_SWITCH = 16;
 
     GLOB_AUTO = 0; GLOB_GLOBAL = 1; GLOB_EXTRN = 2;
 
@@ -118,24 +134,22 @@ init_defs() {
     TY_FLOAT  = 0x03; TY_FLOAT_H = 0x13; TY_FLOAT_Q = 0x23; TY_FLOAT_B = 0x33;
     TY_PTR    = 0x04;
     TY_STRUCT = 0x08;
-
-    return 0;
 }
 
 // Extract the base type from a packed type code.
-ty_base(ty) { return ty & 0xF; }
+ty_base(ty) : base { return ty & 0xF; }
 
 // Extract the slice from a packed type code (bits 4-5).
-ty_slice(ty) { return (ty / 16) & 0x3; }
+ty_slice(ty) : base { return (ty / 16) & 0x3; }
 
 // Compose a type from base and slice components.
-ty_make(base, slice) { return base + slice * 16; }
+ty_make(base, slice) : base { return base + slice * 16; }
 
 // Return 1 if the type is any float variant. Uses bit 0 of the encoding.
-is_float_type(ty) { return ty & 1; }
+is_float_type(ty) : base { return ty & 1; }
 
 // Return the bit width for a slice code.
-slice_width(sl) {
+slice_width(sl) : base {
     if (sl == SL_FULL) { return 64; }
     if (sl == SL_HALF) { return 32; }
     if (sl == SL_QUARTER) { return 16; }

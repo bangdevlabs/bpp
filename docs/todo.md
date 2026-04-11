@@ -1,8 +1,8 @@
 # B++ Roadmap
 
-## Status: 2026-04-08 — version 0.22
+## Status: 2026-04-11 — version 0.22
 
-B++ 0.22 milestone. **Foundation cleanup**: 8 module renames promoted compiler tools and runtime infrastructure from `stb/` to `src/bpp_*.bsm`, eliminating the layering inversion where the compiler depended on its own "standard library". src/ is now the videogame base (compiler stages + 7 core utilities + 3 runtime modules); stb/ is now exclusively game cartridges. **Maestro Plan Phase 1**: working solo/base/render orchestrator, N×SPSC worker pool with pthread on macOS, monotonic clock, and snake_maestro side-by-side with snake_gpu. **4 structural compiler bug fixes** found and fixed during the work. New `global` keyword as foundation for smart dispatch. Suite at **46 passed / 0 failed / 11 skipped** out of 57.
+B++ 0.22 continues. **Tonify sweep** (batches 1-5 complete, 6-7 pending): ~350 void, ~200 static, ~50 :base, ~50 while→for, Node struct sliced (29% smaller AST), raw ptr→dot syntax refactor. **New language features**: `switch` statement (value + condition dispatch, inherited from B, no fallthrough), `bare return;`, multi-error diagnostics, E230 guard. **Codegen fixes**: `:half` sign-extension (LDRSW/MOVSXD both backends), `_stb_core_linux.bsm` created (Linux cross-compile unblocked), `dsp_is_local` packed_eq fix. **Progressive enhancement architecture**: `job_parallel_for` falls back to serial when no workers — smart dispatch auto-rewrite never silently drops work. Suite at **62 passed / 0 failed**.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 

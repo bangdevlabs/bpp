@@ -10,12 +10,13 @@ Update this document and `tests/test_diagnostics.bpp` when adding new codes.
 ## Status Summary
 
 ```
-Total diagnostics:  22
+Total diagnostics:  23 active + 2 reserved
 With source location: 19  ✅  (file:line + source + caret)
 With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok_pos)
   E001 (cannot open file) — shows filename
   E002 (import not found) — shows filename + search paths
   E222 (circular import)  — shows unresolved module names
+Reserved:              2  (W017, W014 — see Reserved section)
 ```
 
 ## Errors (fatal — compilation stops)
@@ -35,6 +36,7 @@ With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok
 | E201 | undefined function | bpp_validate.bsm | 368 | ✅ | Call to undeclared function |
 | E221 | duplicate definition | bpp_parser.bsm | 1085 | ✅ | Same function in two modules |
 | E222 | circular dependency | bpp_import.bsm | 198 | ❌ | Module import cycle |
+| E230 | static const at file scope | bpp_parser.bsm | TBD | ✅ | `static const X = N;` silently produces 0 at runtime |
 
 ## Warnings (compilation continues)
 
@@ -48,6 +50,7 @@ With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok
 | W012 | & in FFI argument | bpp_validate.bsm | 451 | ✅ | Address-of passed to extern/call |
 | W013 | : base mismatch | bpp_dispatch.bsm | 939 | ✅ | Function annotated base but impure |
 | W020 | static cross-module | bpp_validate.bsm | 397 | ✅ | Calling static fn from other module |
+| W021 | switch not exhaustive | bpp_parser.bsm | TBD | ✅ | switch without else arm |
 
 ## What "has location" means
 
@@ -104,11 +107,21 @@ Known issue: module 0 (entry file) line numbers may be off if `cur_line` is
 not reset before lexing. The fix: set `cur_line` to the newline count up to
 `mod0_real_start` before module 0's lex loop in bpp.bpp.
 
+## Reserved / Planned codes
+
+Codes reserved for planned features. Do NOT reuse these numbers for other diagnostics.
+
+| Code | Planned for | Status |
+|------|-------------|--------|
+| W017 | void used as value (`x = void_func()`) | Reserved — ships with void keyword validation |
+| W014 | extrn written after freeze point | Reserved — needs investigation (crashed self-host) |
+
 ## Process: adding a new diagnostic
 
 1. Choose a code: errors use E-series, warnings use W-series
-2. Add `diag_fatal(N)` or `diag_warn(N)` with clear message
-3. Add `diag_loc(tok_pos or n.src_tok)` + `diag_show_line(...)` 
-4. Update this document with the new code
-5. Add a test case to `tests/test_diagnostics.bpp`
-6. Run `tests/run_all.sh` to verify no regression
+2. Check the Reserved table above — do not reuse reserved codes
+3. Add `diag_fatal(N)` or `diag_warn(N)` with clear message
+4. Add `diag_loc(tok_pos or n.src_tok)` + `diag_show_line(...)` 
+5. Update this document with the new code
+6. Add a test case to `tests/test_diagnostics.bpp`
+7. Run `tests/run_all.sh` to verify no regression

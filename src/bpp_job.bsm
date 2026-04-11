@@ -69,24 +69,21 @@ struct Worker {
     done_count
 }
 
-// Slot size in bytes. Each slot stores (fn_ptr, arg) — 8 + 8.
-auto _JOB_SLOT_SIZE;
+// Set once in job_init, never changes after.
+static auto _JOB_SLOT_SIZE;
+static auto _JOB_DEFAULT_CAPACITY;
 
-// Default per-worker queue depth. 64 slots is plenty for snake-rate
-// workloads (~10 jobs per frame, 600 per second). Audio mixers that
-// submit at 44.1 kHz will want larger queues — that's a future tune.
-auto _JOB_DEFAULT_CAPACITY;
-
-// Pool state.
-auto _job_n_workers;
-auto _job_workers;       // array of Worker pointers, length _job_n_workers
-auto _job_next;          // round-robin submit counter
-auto _job_inited;
+// Pool state — set in job_init, reset in job_shutdown.
+static auto _job_n_workers;
+static auto _job_workers;       // array of Worker pointers, length _job_n_workers
+static auto _job_next;          // round-robin submit counter
+static auto _job_inited;
 
 // Worker thread entry point. Receives a Worker* in arg and runs the
 // pop-execute-advance loop forever, until it sees a shutdown sentinel
 // (fn_ptr = 0) at which point it returns.
-_job_worker_main(arg) {
+// Rule 2: only referenced inside this file (fn_ptr in job_init).
+static _job_worker_main(arg) {
     auto w: Worker, head, tail, slot, fn, job_arg, next_tail;
 
     w = arg;
@@ -147,7 +144,6 @@ job_init(n_workers) {
 
     _JOB_SLOT_SIZE = 16;
     _JOB_DEFAULT_CAPACITY = 64;
-
     _job_n_workers = n_workers;
     _job_workers = malloc(n_workers * 8);
     _job_next = 0;
@@ -231,9 +227,20 @@ job_wait_all() {
 // Submit n jobs and wait for them to complete. Each job receives
 // its index (0..n-1) as the argument. The workhorse for parallel-for
 // patterns: split a loop body into a function and call this.
+//
+// If no workers are initialized, falls back to serial execution on
+// the main thread. This guarantees that smart dispatch auto-rewrite
+// never silently drops work — programs without maestro_run() still
+// execute correctly, just without parallelism.
 job_parallel_for(n, fn) {
     auto i;
-    if (_job_inited == 0) { return 0; }
+    if (_job_inited == 0) {
+        // No workers — run serially. The work still happens.
+        for (i = 0; i < n; i = i + 1) {
+            call(fn, i);
+        }
+        return 0;
+    }
     for (i = 0; i < n; i = i + 1) {
         job_submit(fn, i);
     }

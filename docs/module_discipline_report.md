@@ -152,7 +152,7 @@ global ray_result;                // public + worker-shared
 ### Error message
 
 ```
-error[E220]: 'helper' is private to wolf3d_ray.bsm (declared static)
+warning[W020]: 'helper' is private to wolf3d_ray.bsm (declared static)
   --> wolf3d_hud.bsm:42
 ```
 
@@ -181,7 +181,7 @@ Recognize `static` as a keyword (TK_KW). Same mechanism as `auto`,
 **File: `src/bpp_validate.bsm`** (~15 lines)
 
 In the call validation pass: if the callee has FN_STATIC set and
-`func_mods[callee] != func_mods[caller]`, emit E220.
+`func_mods[callee] != func_mods[caller]`, emit W020.
 
 In the global access pass: same check for globals with static flag.
 
@@ -413,16 +413,16 @@ The agent implementing the remaining changes should start from bootstrap
 
 | # | Change | Lines | Keywords | Error codes | Status |
 |---|--------|-------|----------|-------------|--------|
-| 1 | `load` keyword | ~30 | `load` | — | ⬜ TODO |
-| 2 | `static` keyword | ~35 | `static` | E220 | ⬜ TODO |
-| 3 | `void` keyword | ~20 | `void` | W017 | ⬜ TODO |
-| 4 | Implicit return 0 | ~15 | — | — | ⬜ TODO |
-| 5 | Cross-module dup = error | ~5 | — | E221 | ⬜ TODO (upgrade W015→fatal) |
-| 6 | Circular import = error | ~20 | — | E222 | ⬜ TODO |
+| 1 | `load` keyword | ~30 | `load` | — | ✅ DONE |
+| 2 | `static` keyword | ~35 | `static` | W020 | ✅ DONE (implemented as warning, not E220) |
+| 3 | `void` keyword | ~20 | `void` | W017 (reserved) | ✅ DONE (W017 not yet wired) |
+| 4 | Implicit return 0 | ~15 | — | — | ✅ DONE |
+| 5 | Cross-module dup = error | ~5 | — | E221 | ✅ DONE |
+| 6 | Circular import = error | ~20 | — | E222 | ✅ DONE |
 | 7 | main in .bsm = error | ~8 | — | E223/E105 | ✅ DONE |
-| 8 | Arg count check | ~20 | — | W018 | ⬜ TODO |
-| 9 | `: base` / `: solo` annotations | ~40 | — | W013 | ⬜ TODO |
-| **Total remaining** | | **~185** | **3 new** | **5 new** | |
+| 8 | Arg count check | ~20 | — | W003 | ✅ DONE (already existed as W003) |
+| 9 | `: base` / `: solo` annotations | ~40 | — | W013 | ✅ DONE |
+| `stub` keyword | ~15 | `stub` | — | ✅ DONE |
 
 ---
 
@@ -656,7 +656,7 @@ echo 'load "stbgame.bsm"; main() { return 0; }' > /tmp/test_badload.bpp
 # 4. Test static enforcement.
 echo 'static secret() { return 1; }' > /tmp/test_mod/helper.bsm
 echo 'load "helper.bsm"; main() { return secret(); }' > /tmp/test_mod/game.bpp
-./bpp /tmp/test_mod/game.bpp 2>&1   # should error: E220 private
+./bpp /tmp/test_mod/game.bpp 2>&1   # should warn: W020 private
 
 # 5. Test void keyword.
 echo 'void noop() { } main() { auto x; x = noop(); return x; }' > /tmp/test_void.bpp

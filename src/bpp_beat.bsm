@@ -1,112 +1,88 @@
 // bpp_beat.bsm — Universal monotonic clock for B++.
 //
-// Core runtime, not a stb library. Standalone — depends only on
-// _stb_core (time + threads), the universal core platform layer
-// auto-injected for any user main() program. NO dependency on stbgame,
-// so CLI tools, audio plugins, network servers, anything with a main()
-// can use the clock without opening a Cocoa window.
-//
+// Core runtime. Standalone — depends only on _stb_core (time + threads).
 // The "beat" is the band's shared clock. Every part of a real-time
-// program — the solo phase on the main thread, the base phase on
-// worker threads, the audio mixer, the animation timer — needs to
-// agree on what time it is and how much time has passed since the
-// program started. Beat is the single source of truth for that.
+// program — solo phase, base phase workers, audio mixer, animation —
+// needs to agree on what time it is. Beat is the single source of truth.
 //
-// The clock is monotonic: it never goes backwards, never resets
-// without an explicit beat_reset() call, and is anchored at the
-// moment init_beat() runs. All beat_now_* functions return values
-// relative to that anchor, expressed in whatever unit the caller
-// asked for.
-//
-// Underlying precision is milliseconds (the granularity exposed by
-// _stb_get_time()). The microsecond and nanosecond accessors are
-// API conveniences for code that wants to think in those units; they
-// do not represent sub-millisecond precision.
+// The clock is monotonic: never goes backwards, anchored at the moment
+// the first beat_now_* call runs (lazy init). All values are 64-bit
+// integer milliseconds — no float degradation even after days of play.
 //
 // Usage:
-//   // Auto-injected for any user main() program. You can also import
-//   // explicitly to make the dependency visible:
-//   import "bpp_beat.bsm";
-//
-//   main() {
-//       init_beat();
-//       // ... do work ...
-//       auto elapsed_ms;
-//       elapsed_ms = beat_now_ms();
-//       // 60 fps frame number since init:
-//       auto frame;
-//       frame = beat_now_frames(60);
-//       return 0;
-//   }
+//   auto elapsed;
+//   elapsed = beat_now_ms();         // ms since first call (lazy init)
+//   auto frame;
+//   frame = beat_now_frames(60);     // frame count at 60fps
 
 import "_stb_core.bsm";
 
-// Time captured at init_beat(), in milliseconds since the platform
-// layer's own zero point. Subtracting this from a fresh _stb_get_time()
-// reading yields milliseconds since init_beat().
-auto _beat_zero, _beat_inited;
+// Rule 1: written once at init → extrn. Rule 2: only this file → static.
+static extrn _beat_zero;
+static auto _beat_inited;
 
-// Initialize the beat clock. Captures the current platform time as
-// the zero point. Idempotent — calling it again resets the zero point
-// to "now" (same as beat_reset()).
-init_beat() {
+// Ensure the clock is initialized. Called automatically by every
+// beat_now_* function on first use (lazy init). The programmer never
+// needs to call this manually. Maestro also calls it explicitly for
+// deterministic anchor point, which is fine (idempotent after first call
+// is suppressed by _beat_inited check).
+static void _beat_ensure_init() {
+    if (_beat_inited == 0) {
+        _beat_zero = _stb_get_time();
+        _beat_inited = 1;
+    }
+}
+
+// Rule 3: side-effect only → void.
+void init_beat() {
     _beat_zero = _stb_get_time();
     _beat_inited = 1;
-    return 0;
 }
 
-// Reset the zero point to the current time. Useful for re-anchoring
-// the clock between phases (e.g., resetting at level start so a level
-// timer starts at zero).
-beat_reset() {
+// Reset the zero point to now. Useful for re-anchoring between levels.
+void beat_reset() {
     _beat_zero = _stb_get_time();
-    return 0;
 }
 
-// Return milliseconds elapsed since init_beat(). This is the canonical
-// reading; every other beat_now_* function is a unit conversion of this.
+// Return milliseconds elapsed since first use (or init_beat).
+// Lazy init: safe to call without any setup.
 beat_now_ms() {
+    _beat_ensure_init();
     return _stb_get_time() - _beat_zero;
 }
 
-// Return microseconds elapsed since init_beat(). The underlying source
-// is millisecond-grained, so this is ms * 1000 — useful for code that
-// wants to think in microseconds, not for sub-millisecond accuracy.
+// Microseconds (ms * 1000, not sub-ms precision).
 beat_now_us() {
+    _beat_ensure_init();
     return (_stb_get_time() - _beat_zero) * 1000;
 }
 
-// Return nanoseconds elapsed since init_beat(). Same caveat as _us:
-// ms * 1000000, not actual nanosecond precision.
+// Nanoseconds (ms * 1000000, not sub-ms precision).
 beat_now_ns() {
+    _beat_ensure_init();
     return (_stb_get_time() - _beat_zero) * 1000000;
 }
 
-// Return the current tick count for an arbitrary rate, in Hz. For
-// example, beat_now_at_rate(60) returns the number of 60 Hz ticks
-// elapsed since init_beat(). Use this when you need to drive
-// sample-and-hold style logic at a fixed rate.
+// Tick count at arbitrary rate in Hz.
 beat_now_at_rate(hz) {
+    _beat_ensure_init();
     return ((_stb_get_time() - _beat_zero) * hz) / 1000;
 }
 
-// Return the current frame number for a given fps target. Identical
-// math to beat_now_at_rate(fps), exposed under a game-specific name
-// because game code reads better as "what frame are we on" than
-// "what tick at 60 Hz".
+// Frame number at given fps.
 beat_now_frames(fps) {
+    _beat_ensure_init();
     return ((_stb_get_time() - _beat_zero) * fps) / 1000;
 }
 
-// Return the current sample index for an audio sample rate. Use this
-// to drive a streaming audio callback at, e.g., 44100 or 48000 Hz.
+// Sample index at audio sample rate (44100, 48000, etc).
 beat_now_samples(rate) {
+    _beat_ensure_init();
     return ((_stb_get_time() - _beat_zero) * rate) / 1000;
 }
 
-// Return the current musical beat count for a given tempo in BPM.
-// Useful for music-driven gameplay (rhythm games, sequencers,
-// metronomes). 120 BPM = 2 beats per second = 1 beat per 500 ms.
+// Musical beat count at tempo in BPM. 120 BPM = 2 beats/sec.
 beat_now_in_bpm(bpm) {
+    _beat_ensure_init();
     return ((_stb_get_time() - _beat_zero) * bpm) / 60000;
 }

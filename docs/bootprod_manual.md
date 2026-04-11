@@ -41,13 +41,41 @@ produce slightly different machine code than what the old compiler would. gen2
 is compiled by gen1 (the NEW compiler), so it reflects the new codegen fully.
 
 If gen1 == gen2 (byte-identical), the bootstrap is stable. If they differ,
-you need gen3:
+**try `--clean-cache` first** before assuming a real codegen change:
+
+```bash
+# gen1 != gen2 — is it a real change or stale cache?
+./bpp --clean-cache
+./bpp src/bpp.bpp -o /tmp/bpp_gen1
+/tmp/bpp_gen1 src/bpp.bpp -o /tmp/bpp_gen2
+diff <(xxd /tmp/bpp_gen1) <(xxd /tmp/bpp_gen2)
+# If they now match: stale cache was the problem. Install gen2.
+# If they still differ: real codegen change. Continue to gen3.
+```
+
+The cache is the **first suspect** when gen1 != gen2. Even though the
+transitive content hash should auto-invalidate, certain events can
+corrupt the cache state:
+- Running `codesign` on `./bpp` (changes compiler_hash, poisons all .bo keys)
+- Manually editing a `.bo` file
+- Filesystem corruption
+
+If gen1 still differs from gen2 after clean-cache, it is a real codegen
+change (e.g. you changed how the compiler emits code for a feature it
+uses internally). In that case, you need gen3:
 
 ```bash
 /tmp/bpp_gen2 src/bpp.bpp -o /tmp/bpp_gen3
 diff <(xxd /tmp/bpp_gen2) <(xxd /tmp/bpp_gen3)
 # gen2 == gen3 means stable; install gen3
 ```
+
+If gen2 != gen3 but gen1 == gen3, you have a **2-cycle oscillation**.
+This means the codegen output depends on which compiler binary compiled
+it, not just the source — a real bug. Known cause: `static` on file-scope
+variables in auto-injected modules (bpp_beat, bpp_job, bpp_maestro)
+changes the global table between generations. Workaround: remove `static`
+from those variables and investigate the root cause.
 
 ## macOS Gotchas
 
