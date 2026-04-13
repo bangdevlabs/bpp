@@ -22,7 +22,12 @@ Anything NOT on the path to 1.0 is in "Post-1.0" at the bottom. When in doubt, m
 ### 1.0 path — in commit order
 
 ```
-0.22  ─┬─► [Module discipline: load, private, dup-error, circular-error]  ← FOUNDATION
+0.22  ─┬─► [Language finalization: static, void, load, implicit return]   ← FOUNDATION
+       │
+       ├─► [Tonify batches 1-5, 7 (NOT batch 6)]
+       │
+       ├─► [libb: brt0 + bsys table + bmem allocator]                    ← NEW
+       ├─► [Tonify batch 6 (codegens, post-libb)]
        │
        ├─► [Maestro batch 2]
        │
@@ -96,6 +101,43 @@ Seven changes (~133 lines total, 3 new keywords):
 
 7. **`main()` in `.bsm` = error** (~8 lines): E223.
    Enforces `.bpp` vs `.bsm` contract.
+
+### 0b. Tonify batches 1-5, 7 (NOT batch 6)
+
+Apply the tonify checklist (`docs/tonify_checklist.md`) to all files
+EXCEPT the codegen batch (batch 6: a64_enc, a64_codegen, a64_macho,
+x64_enc, x64_codegen, x64_elf). Batch 6 waits for libb extraction
+(step 0c below) to avoid tonifying code that's about to be restructured.
+
+### 0c. libb — B++ runtime library (brt0 + bsys + bmem hybrid)
+
+Extract runtime code from the codegens into a proper runtime library.
+The codegens today have ~55 if-chains for builtins; after extraction
+they shrink to ~27 (9 inline primitives + 1 syscall table).
+
+**Hybrid model**: use libc where it exists (macOS libSystem, C emitter),
+own allocator only where needed (Linux static). Same approach as Zig.
+Interoperability with the C family is part of B++ DNA.
+
+Three pieces:
+
+1. **bsys table** (~80 lines): Collapse 18 syscall if-blocks into one
+   `emit_syscall(name, argc)` function + a table of (name, number, argc)
+   per target. The codegen stays inline (no function call overhead) but
+   the syscall numbers are centralized instead of scattered in if-chains.
+
+2. **brt0.bsm** (~100 lines): Extract startup code from a64_macho.bsm
+   and x64_elf.bsm. Centralize argc/argv/envp setup, init_beat(),
+   main() call, exit(). Not new code — reorganization of what exists.
+
+3. **bmem.bsm** (~300 lines, Linux only): Own allocator for Linux
+   static binaries via sys_mmap + free list + header + coalescing.
+   macOS keeps libSystem malloc (battle-tested, Apple-guaranteed).
+   C emitter keeps libc malloc. Future bare metal uses bmem as fallback.
+
+After libb lands: **tonify batch 6** on the now-smaller codegens.
+Also investigate fn_ptr in struct fields (may be a codegen gap that
+becomes visible after the cleanup).
 
 ### 1. Maestro Plan 0.22 Batch 2 — runtime modules go standalone
 

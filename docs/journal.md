@@ -3009,7 +3009,7 @@ The user's argument:
 
 I conceded. The plan is fixpoint with double-buffering, deferred to batch 2 when classify_function actually gets implemented. The full discussion is worth recording because it shows the user's instinct: "doing it right the first time" doesn't mean "the most sophisticated algorithm available", it means "the simplest tool that produces the correct result for the actual problem you have". Tarjan is a tool, not a virtue.
 
-### What we did NOT do (and why)
+u### What we did NOT do (and why)
 
 A few things came up in design discussion but were explicitly deferred:
 
