@@ -1,5 +1,110 @@
 # B++ Bootstrap Journal
 
+## 2026-04-13/14 — Foundation Refactor Mega-Session + Mini Cooper Plan
+
+Marathon session that landed five major structural changes back-to-back
+and closed with a fresh plan for the next ambitious push. Bootstrap
+verified after every step; `51 passed / 0 failed / 11 skipped` throughout.
+
+**1. Cache removal (commit `0d3f282`).** The `.bo` module cache was
+the #1 bug source (stale cache, phantom errors, bootstrap oscillation
+across multiple sessions). Measured full-rebuild time at 0.27s; cache
+saved 0.17s at the cost of hundreds of lines of complexity. Removed
+entirely: ~630 lines net across `bpp.bpp`, `bpp_bo.bsm`,
+`bpp_import.bsm`. Every compilation is now from source. Go 1.20 and
+Jai both proved this model works when the compiler is fast enough.
+
+**2. Repo reorganization (same commit).** Old `src/aarch64/` and
+`src/x86_64/` collapsed chip + OS concerns. New layout:
+
+```
+src/backend/
+  chip/aarch64/ | chip/x86_64/      ← pure CPU encoding/codegen
+  os/macos/ | os/linux/              ← platform + syscall + runtime
+  target/aarch64_macos/              ← Mach-O writer
+  target/x86_64_linux/               ← ELF writer
+  c/bpp_emitter.bsm                  ← C source backend
+```
+
+Added a `_try_dir()` helper in `find_file()` that replaced ~90 lines
+of per-path poke() chains with ~20 lines of clean calls. Adding a new
+target is now creating new folders — zero compiler changes.
+
+**3. bsys/brt0 runtime extraction (commits `0d3f282` and `f5ce95a`).**
+The 18 hard-coded syscall numbers in each codegen collapsed into
+BSYS_* const tables per OS (`_bsys_macos.bsm`, `_bsys_linux.bsm`).
+Startup globals `_bpp_argc/_bpp_argv/_bpp_envp` moved from codegen
+sentinels (-1/-2/-3) to real B++ globals declared in
+`_brt0_<target>.bsm` — the codegen looks them up via
+`a64_bind_startup_syms` / `x64_bind_startup_syms` after brt0 is
+parsed. `add_hidden_globals()` helpers removed from both codegens.
+
+**4. putchar/getchar as B++ functions (commit `d0bba09`).** Phase 3
+closes: `putchar`, `putchar_err`, `getchar` left the codegen builtin
+list and became actual B++ functions in `bpp_io.bsm` using
+`sys_write(1, &buf, 1)` via the little-endian-trick local-var
+pattern. ~80 lines of inline machine code per backend eliminated. C
+emitter keeps its hard-coded `bpp_sys_write` wrappers — by design,
+the C path uses libc.
+
+**5. bmem allocator (commit `9eca4de`).** B++ now has its own
+malloc/free/realloc written in B++ itself. `sys_mmap` and
+`sys_munmap` got promoted to proper builtins (with NEON-like 6-arg
+and 2-arg handlers in both codegens + C emitter `mmap()`/`munmap()`
+wrappers). `_bmem_linux.bsm` and `_bmem_macos.bsm` implement a
+minimal mmap-per-allocation allocator with an 8-byte size header.
+Linux static ELF binaries no longer link anything at all — true
+libc-free. `bpp_mem.bsm` is the public API shim, auto-injected.
+
+**6. Jump tables + eval-once switch (commit `7b2b578`).** Form-1
+value-dispatch switches with dense integer arms now emit a branch
+table on both backends: ARM64 uses `adr + add + br` into a `b arm_lbl`
+table, x86_64 uses `shl rax, 3 + lea + add + jmp rcx` into 8-byte
+slots (`jmp rel32` + 3 nops). Fallback (non-dense switches) now
+evaluates the switch condition ONCE and peeks it from `[sp]` per
+comparison — the old pattern re-emitted the condition per arm-value,
+turning switch-on-function-call into N function calls. C emitter
+upgraded to emit real C `switch` statements (previously if/else-if
+chain) so gcc can apply its own jump-table optimization.
+
+**7. Sliced struct access bug discovered and documented.** The root
+cause of a jump-table bug was a B++-ism: `*(node + 8)` did NOT read
+`.a` because Node's sliced layout packs fields without alignment
+padding. `.a` actually lives at byte offset 1 (not 8) because
+`ntype: byte` consumes 1 byte with no padding after it. Same bug was
+latent in the T_IF dead-code-elimination path since slicing landed —
+`*(cond_node + 0) == T_LIT` never matched because junk bytes from
+`.a` bled into the 8-byte read. Both call sites fixed to use typed
+access (`auto n: Node; n.a`). `docs/tonify_checklist.md` Rule 8
+added. `feedback_sliced_struct_access.md` saved to agent memory.
+
+**8. Mini Cooper plan approved.** End of session produced a fresh
+multi-session plan at `~/.claude/plans/compressed-soaring-turing.md`:
+native performance ladder (B0 const folding, B1 expression register
+allocation, B2 inline `: base` functions, B3 local RA, B4 `: double`
+slice + SIMD builtins) plus language gaps (A1 bitfields, A2 aligned
+malloc). Target: Wolfenstein 3D at 60 fps and RTS with 1000+ units on
+native B++ without `bpp --c | gcc -O2`. Honest speedup expectation:
+30-40% of gcc -O2 in general code, 60-80% on hot paths with manual
+SIMD. Enough on modern hardware (Apple M4 has ~100× the compute of
+the 386 that shipped Wolf3D in 1992).
+
+**Counts at session end**
+- Commits landed: `0d3f282`, `f5ce95a`, `d0bba09`, `9eca4de`,
+  `7b2b578`, `4b2ccef`.
+- Suite: 51 passed / 0 failed / 11 skipped.
+- Compile time: 0.27s baseline, unchanged after all refactors.
+- Compiler self-hash: stable gen2 == gen3 at every checkpoint.
+- Linux cross-compile validated via Docker: hello + switch stress
+  test produce identical output (31711) on both platforms.
+
+**What ships next (in plan order)**
+A1 (bitfields) → A2 (aligned malloc) → B0 (const fold + DCE) → B1a-d
+(expression RA, sub-stepped) → B2 (inline) → B3 (local RA) → C (batch
+6 tonify on post-perf codegen) → B4 (`: double` + SIMD) → D (docs).
+
+---
+
 ## 2026-03-18 — Stage 2 Complete: Self-Hosting Parser
 
 ### Milestone

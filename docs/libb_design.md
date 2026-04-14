@@ -1,5 +1,18 @@
 # libb — B++ Runtime Library Design
 
+**STATUS: IMPLEMENTED.** Landed in commits `0d3f282` (bsys tables),
+`f5ce95a` (brt0 globals), and `9eca4de` (bmem allocator). Linux static
+ELF binaries link nothing at all; macOS binaries link libSystem only
+because dyld requires it. See `docs/journal.md` 2026-04-13/14 entry
+for implementation notes.
+
+Final directory layout differs slightly from the original proposal:
+runtime files live under `src/backend/os/<target>/` (not a top-level
+`libb/`), matching the chip/os/target split applied to the rest of
+the backend. The functional design below is unchanged.
+
+---
+
 B++ ships its own runtime library instead of depending on libc. The
 runtime provides three services that every B++ binary needs: process
 startup (brt0), system call abstraction (bsys), and memory allocation

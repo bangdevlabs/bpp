@@ -41,41 +41,33 @@ produce slightly different machine code than what the old compiler would. gen2
 is compiled by gen1 (the NEW compiler), so it reflects the new codegen fully.
 
 If gen1 == gen2 (byte-identical), the bootstrap is stable. If they differ,
-**try `--clean-cache` first** before assuming a real codegen change:
-
-```bash
-# gen1 != gen2 — is it a real change or stale cache?
-./bpp --clean-cache
-./bpp src/bpp.bpp -o /tmp/bpp_gen1
-/tmp/bpp_gen1 src/bpp.bpp -o /tmp/bpp_gen2
-diff <(xxd /tmp/bpp_gen1) <(xxd /tmp/bpp_gen2)
-# If they now match: stale cache was the problem. Install gen2.
-# If they still differ: real codegen change. Continue to gen3.
-```
-
-The cache is the **first suspect** when gen1 != gen2. Even though the
-transitive content hash should auto-invalidate, certain events can
-corrupt the cache state:
-- Running `codesign` on `./bpp` (changes compiler_hash, poisons all .bo keys)
-- Manually editing a `.bo` file
-- Filesystem corruption
-
-If gen1 still differs from gen2 after clean-cache, it is a real codegen
-change (e.g. you changed how the compiler emits code for a feature it
-uses internally). In that case, you need gen3:
+the codegen change is real — compile gen3 to confirm convergence:
 
 ```bash
 /tmp/bpp_gen2 src/bpp.bpp -o /tmp/bpp_gen3
 diff <(xxd /tmp/bpp_gen2) <(xxd /tmp/bpp_gen3)
-# gen2 == gen3 means stable; install gen3
+# gen2 == gen3 means stable (1-cycle oscillation was expected); install gen3.
 ```
 
-If gen2 != gen3 but gen1 == gen3, you have a **2-cycle oscillation**.
-This means the codegen output depends on which compiler binary compiled
-it, not just the source — a real bug. Known cause: `static` on file-scope
-variables in auto-injected modules (bpp_beat, bpp_job, bpp_maestro)
-changes the global table between generations. Workaround: remove `static`
-from those variables and investigate the root cause.
+**1-cycle oscillation is normal** when you change how the compiler emits
+code for a feature it uses internally. The old compiler emits the old
+pattern into gen1; gen1 (the new compiler) re-emits its own source with
+the new pattern, producing gen2; gen2 and gen3 then match because both
+were compiled by a new-pattern compiler. Expected after any codegen
+refactor.
+
+If gen2 != gen3 but gen1 == gen3, you have a **2-cycle oscillation** —
+the codegen output depends on which compiler binary compiled it, not
+just the source. That's a real bug. Known historical cause: `static`
+on file-scope variables in auto-injected modules changed the global
+table between generations. Diagnose with `--show-deps` and by comparing
+the byte layout between generations.
+
+**There is no module cache to flag as a suspect.** The `.bo` cache was
+removed in 0.23.x — B++ compiles every module from source on every
+invocation. Full rebuilds take ~0.27s for the compiler, too fast to
+benefit from caching. Any bootstrap divergence is a real codegen issue,
+not staleness.
 
 ## macOS Gotchas
 
@@ -97,17 +89,33 @@ B++:
 
 ### Exit 139 (SIGSEGV) — Null Pointer
 
-Often caused by accessing compiler data structures that are NULL for cached
-modules. Functions loaded from `.bo` cache have `FN_PARS = 0` but may have
-`FN_PCNT > 0`. Always guard pointer access.
+Often a raw pointer dereference on memory that was not allocated, or
+accessing a struct pointer that was never initialized. Always guard
+pointer access at system boundaries.
+
+### Raw offset access on sliced structs returns garbage
+
+**New class of bug.** If you write `*(node + 8)` expecting to read
+`node.a`, you will get junk bytes. B++ slicing packs struct fields
+without alignment padding — the declaration-order offset is wrong.
+
+Always use typed access:
+```bpp
+auto n: Node;
+n = node_ptr;
+n.a           // correct: compiler emits the real packed offset
+```
+
+See `docs/tonify_checklist.md` Rule 8 for the full rule. Manual
+records (RECORD_SZ, tokens) are unsliced by design and may still use
+named offset constants — only sliced structs need typed access.
 
 ## Source File Rules
 
 ### Unicode in Comments is OK
 
-The B++ compiler handles UTF-8 in comments correctly. Previous sessions
-incorrectly blamed unicode for crashes — the actual cause was stale .bo cache.
-Unicode in string literals is NOT tested.
+The B++ compiler handles UTF-8 in comments correctly. Unicode in
+string literals is NOT tested.
 
 ### Variables Inside Blocks
 
@@ -155,9 +163,9 @@ The compiler has two pipelines. Both must work:
 
 ### Never Do
 
-- Do NOT run `codesign` on bpp — it changes bytes and breaks hash-based cache.
-- Do NOT manually delete `~/.bpp/cache/` — use `bpp --clean-cache` instead.
-  The cache is at `~/.bpp/cache/` (NOT `.bpp_cache/` in the repo).
+- Do NOT run `codesign` on bpp — it changes bytes and previously
+  corrupted the module cache; cache is gone now but codesign still
+  produces non-deterministic binaries, breaking bootstrap reproducibility.
 - Do NOT test with binaries in `build/` — use `/tmp/` or project root.
 - Do NOT leave `bpp` processes running in the background.
 - Do NOT create intermediate binaries in the repo (bpp_new, bpp_check, etc.).
@@ -167,39 +175,36 @@ The compiler has two pipelines. Both must work:
 1. Create `src/bpp_mymodule.bsm`.
 2. Add explicit imports at the top of your module for everything it uses:
    ```
-   import "defs.bsm";
-   import "stbarray.bsm";
+   import "bpp_defs.bsm";
+   import "bpp_array.bsm";
    import "bpp_internal.bsm";  // if you use buf_eq, packed_eq, etc.
    ```
-   **This is critical for the modular cache.** Without explicit imports,
-   the dependency graph won't have edges for your module, and changes to
-   your dependencies won't invalidate your .bo cache file.
 3. Add `import "bpp_mymodule.bsm";` to `src/bpp.bpp`.
 4. Add `init_mymodule();` to the init block in `main()`.
 5. Wire the module's entry point into the pipeline.
 6. Run the full bootstrap cycle (gen1 → gen2 → diff).
-7. Test with both simple programs AND a different program (to verify cache isolation).
+7. Add a test file in `tests/` if the module has behavior worth locking in.
 
-## Cache System
+## Compilation Model
 
-The build cache lives at `~/.bpp/cache/`. It's global per user (like Go's GOCACHE).
+B++ uses modular compilation: each imported module is parsed,
+type-checked, and codegen'd independently, in topological order.
+**There is no persistent cache** — every invocation compiles from
+source. Full compiler rebuild is ~0.27s; the C emitter path
+(`bpp --c`) is the only place where compilation ever takes meaningful
+time (gcc, not B++).
 
-### How it works
-- Each module gets a hash: `fnv1a(source) ^ compiler_hash ^ dep_hashes ^ main_hash`
-- The .bo filename IS the hash — different content = different file
-- When source changes, hash changes, old .bo is ignored, module recompiled
-- `main_hash` isolates programs: compiling `bug.bpp` won't pollute `hello.bpp`
-
-### When to clean
-- `bpp --clean-cache` deletes everything. Next build is slower (recompiles all).
-- Only needed if cache grows too large. The cache auto-invalidates correctly.
-- Never needed for correctness — only for disk space.
-
-### Common cache issues
-If a build produces unexpected results:
-1. Try `bpp --clean-cache` first
-2. If that fixes it, the cache was stale (should not happen with explicit imports)
-3. If not, the bug is in the source, not the cache
+Modular pipeline:
+1. Resolve all imports and auto-inject core utilities (bpp_array,
+   bpp_hash, bpp_io, ..., _stb_core, bpp_beat, bpp_job, bpp_maestro,
+   brt0, bpp_mem).
+2. Topologically sort modules so dependencies emit before dependents.
+3. For each module: lex → parse → type-infer → emit machine code
+   directly into the encoder buffer.
+4. After all modules, run dispatch analysis, validation, and resolve
+   cross-module calls via `bo_resolve_calls_arm64/x64`.
+5. Binary writer (Mach-O or ELF) consumes the encoder buffer and the
+   global/string/float tables to produce the final binary.
 
 ## Compiler Flags Reference
 
@@ -212,7 +217,8 @@ If a build produces unexpected results:
 | `--linux64`     | Cross-compile to Linux x86_64 ELF           |
 | `--bug`         | Emit `.bug` debug map alongside the binary   |
 | `--show-deps`   | Print module dependency graph and exit       |
-| `--clean-cache` | Delete all .bo files in `~/.bpp/cache/`     |
+| `--clean-cache` | **No-op**, kept for backward compat with scripts. |
+| `--stats`       | Print module/function/token counts to stderr |
 | `-o <name>`     | Output filename                              |
 
 ## Cross-Compiling and Running Games
@@ -490,26 +496,29 @@ Adding one requires touching **four** places. Miss any of them and
 either the validator rejects your builtin as undefined or one of the
 backends fails to lower it.
 
-1. **`src/aarch64/a64_codegen.bsm`** — emit ARM64 machine code for
-   the builtin's call site. Find the existing handler block (search
-   for `"malloc"` to land in the right area) and add your case. Use
-   the existing `a64_str_eq(n.a, "name", len)` pattern.
+1. **`src/backend/chip/aarch64/a64_codegen.bsm`** — emit ARM64 machine
+   code for the builtin's call site. Find the existing handler block
+   (search for `"sys_write"` to land in the right area) and add your
+   case. Use the existing `a64_str_eq(n.a, "name", len)` pattern. For
+   syscalls, import the BSYS_* constant from `_bsys_macos.bsm`.
 
-2. **`src/x86_64/x64_codegen.bsm`** — emit x86_64 machine code for
-   the same builtin. Same structure, same naming pattern. Use the
-   right Linux syscall number when relevant.
+2. **`src/backend/chip/x86_64/x64_codegen.bsm`** — emit x86_64 machine
+   code. Same structure, same naming pattern. Syscall numbers come
+   from `_bsys_linux.bsm`.
 
 3. **`src/bpp_validate.bsm`** — add the builtin to `val_is_builtin()`
    so the validator does not reject it as `E201: undefined function`.
-   This is the file that bit us when `sys_socket`/`sys_connect`/
-   `sys_usleep` were missing — the codegens knew, the validator did
-   not. Always add to all three at the same time.
+   Always add to all three at the same time — this is the file that
+   historically bit us when syscalls were missing from the validator
+   but present in the codegens.
 
-4. **`src/bpp_emitter.bsm`** — if the builtin should also work
-   through the C emitter (`bpp --c`), add a handler in the call
+4. **`src/backend/c/bpp_emitter.bsm`** — if the builtin should also
+   work through the C emitter (`bpp --c`), add a handler in the call
    emission code. Map it to the equivalent libc/POSIX function or
-   inline a C expression. If the builtin is native-only, skip this
-   step but document why in the validator entry comment.
+   inline a C expression. Remember to add any new header to
+   `emit_runtime()` (e.g. `<sys/mman.h>` for mmap). If the builtin is
+   native-only, skip this step but document why in the validator
+   entry comment.
 
 After all four edits, run a full bootstrap cycle:
 ```bash
@@ -528,29 +537,46 @@ echo 'main() { my_new_builtin(42); return 0; }' > /tmp/test.bpp
 
 ## Backend Layout
 
-The native backends live under `src/aarch64/` and `src/x86_64/`. Each
-chip folder is currently a complete **target bundle** — encoder +
-binary writer + syscall numbers + platform layer + bug observer for
-the OS that B++ pairs with that chip today.
+The native backends live under `src/backend/` with a three-way split:
 
-| Chip folder | Encoder | Binary writer | Platform | Observer | Pairs with |
-|-------------|---------|---------------|----------|----------|------------|
-| `src/aarch64/` | `a64_enc.bsm` | `a64_macho.bsm` | `_stb_platform_macos.bsm` | `bug_observe_macos.bsm` | macOS |
-| `src/x86_64/` | `x64_enc.bsm` | `x64_elf.bsm` | `_stb_platform_linux.bsm` | `bug_observe_linux.bsm` | Linux |
+```
+src/backend/
+  chip/              ← pure CPU — instruction encoding + AST dispatch
+    aarch64/         ← a64_enc.bsm, a64_codegen.bsm
+    x86_64/          ← x64_enc.bsm, x64_codegen.bsm
+  os/                ← pure OS — platform APIs, syscalls, runtime
+    macos/           ← _stb_core_macos, _stb_platform_macos,
+                       bug_observe_macos, _bsys_macos, _brt0_macos,
+                       _bmem_macos
+    linux/           ← mirror for Linux
+  target/            ← chip + OS specific binary format writers
+    aarch64_macos/   ← a64_macho.bsm (Mach-O writer)
+    x86_64_linux/    ← x64_elf.bsm (ELF writer)
+  c/                 ← alternative backend: C source emitter
+    bpp_emitter.bsm
+```
 
-Within a backend, the codegen file (`a64_codegen.bsm`,
-`x64_codegen.bsm`) is the bridge between AST and bytes. It calls into
-the encoder for individual instructions and into the binary writer
-for sections, relocations, and symbol tables. Syscall numbers are
-hardcoded in the codegen — they are OS-specific (Linux `write` is 1,
-macOS `write` is 4), so the codegen carries them rather than the
-encoder.
+Each layer has a clear responsibility:
 
-When B++ adds a second OS for an existing chip (Linux ARM, Intel
-macOS, Windows x86_64), each chip folder will be split into three:
-pure-chip `arch/`, pure-OS `os/`, and `targets/<chip>_<os>.bsm` glue.
-See `src/aarch64/README.md` for the full plan and `docs/todo.md` P3
-for the trigger conditions.
+- **chip/** files know about the CPU but nothing about the OS. The
+  ARM64 codegen imports `_bsys_macos.bsm` directly because in the
+  current ship list ARM64 always pairs with macOS — that coupling is
+  documented in the import comment so a future Linux-ARM64 split is
+  obvious.
+- **os/** files know about the OS but nothing about the CPU. Syscall
+  numbers live in `_bsys_<os>.bsm` constants. Runtime startup globals
+  (`_bpp_argc`, `_bpp_argv`, `_bpp_envp`) are declared in
+  `_brt0_<os>.bsm`. The allocator (`_bmem_<os>.bsm`) implements
+  malloc/free/realloc/memcpy over sys_mmap.
+- **target/** files combine chip + OS into the final binary format
+  (Mach-O on macOS, ELF on Linux). These know BOTH the chip's
+  encoding rules and the OS's loader conventions.
+- **c/** is the portable escape hatch — emits C source that compiles
+  via gcc/clang on any platform with a C toolchain.
+
+When Linux-ARM64 or Intel-macOS arrives, a new `os/<os>/` or
+`target/<chip>_<os>/` folder drops in without disturbing existing
+backends. See `docs/todo.md` for the timeline.
 
 ## Auto-Import System
 

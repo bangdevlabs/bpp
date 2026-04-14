@@ -138,10 +138,18 @@ For struct definitions with fields that are smaller than a word:
 
 | Field range | Annotation | Example |
 |-------------|-----------|---------|
+| 0-1 (single flag) | `: bit` | `alive: bit` (Phase A1) |
+| 0-7 (small enum, 3 bits) | `: bit3` | `direction: bit3` (Phase A1) |
+| 0-15 (larger enum, 4 bits) | `: bit4` | `level: bit4` (Phase A1) |
 | 0-255 (boolean, flags, small count) | `: byte` | `on_ground: byte` |
 | 0-65535 (moderate count, dimensions) | `: quarter` | `w: quarter, h: quarter` |
 | Signed 32-bit (physics values, accelerations) | `: half` | `gravity: half` |
 | Full 64-bit (positions, pointers) | (none) | `x, y` |
+| 128-bit SIMD register (4× float32) | `: double` | `angles: double` (Phase B4) |
+
+Bit-sliced fields pack LSB-first into the current byte. When a bit
+field overflows the current byte, a new byte starts. Non-bit fields
+terminate bit-packing (remaining bits in the last byte are padding).
 
 ## Rule 7: Comments
 
@@ -150,6 +158,36 @@ For struct definitions with fields that are smaller than a word:
 | Comment says `return 0` after removal | Delete the comment too |
 | Comment mentions old name (stbarena, stbio) | Update to new name |
 | Comment is accurate | Keep |
+
+## Rule 8: Typed struct access for sliced types
+
+Raw offset access `*(ptr + N)` does NOT respect sliced struct layouts.
+B++ packs sliced fields without alignment padding, so the offset you
+would guess from declaration order is wrong. When reading or writing a
+struct field, declare the pointer with its struct type and use dot
+notation — the compiler emits the real packed offset.
+
+| Pattern | Action |
+|---------|--------|
+| `*(node + 8)` with hardcoded offset on Node (sliced) | Convert to typed: `auto n: Node; n = node; n.a` |
+| `auto p;` where p points to a struct | Annotate: `auto p: StructName;` |
+| Stale offset constants from pre-slicing era (ND_ITYPE, etc.) | Delete if unused |
+
+**Why.** Raw `*(ptr + N)` emits a blind 8-byte load at `ptr + N`.
+Typed access calls `get_field_offset` at codegen time to compute the
+actual packed offset. Example: in the Node struct, `.a` lives at byte
+offset 1 (not 8) because `ntype: byte` consumes 1 byte with no
+padding after it. Any code that hardcodes `*(node + 8)` reads bytes
+straddling the end of `.a` and the start of `.b` — garbage.
+
+**Escape hatch.** Manual records (RECORD_SZ, token slots, function
+records) are unsliced by design and use named offset constants like
+`FN_NAME = 8`. Those are word-aligned layouts independent of the
+sliced-struct system. Rule 8 applies ONLY to sliced structs.
+
+See `~/.claude/projects/-Users-Codes-b--/memory/feedback_sliced_struct_access.md`
+for the full incident history (DCE and jump-table bugs caused by this
+exact pattern).
 
 ---
 
@@ -170,12 +208,20 @@ division by zero, null pointer dereference, etc.
 **Diagnostic**: E230 (fatal error if `static const` is used at file scope).
 **Fix needed**: the parser/codegen must handle `static` + `const` together.
 
-### Pitfall 2: 2-cycle bootstrap oscillation is almost always stale cache
+### Pitfall 2: 1-cycle bootstrap oscillation is normal after codegen changes
 
-If gen1 != gen2 and gen1 == gen3 (a 2-cycle), the first suspect is
-**stale cache**, not a codegen bug. The most common cause is running
-`codesign` on `./bpp` (Pitfall 3), which changes the compiler_hash
-and poisons every cached `.bo` file.
+If gen1 != gen2 but gen2 == gen3, the bootstrap has a **1-cycle
+oscillation** — expected after any codegen refactor. The old compiler
+emits the old code pattern into gen1; gen1 (with new codegen logic)
+re-emits its own source using the new pattern, producing gen2; gen2
+and gen3 both run new-pattern codegen so they match. Install gen3 and
+move on.
+
+If gen2 != gen3 (the new compiler does NOT produce the same output
+when compiling itself), that is a real codegen bug. Diagnose with
+`--show-deps` and by byte-diffing gen2 vs gen3 around specific
+functions. The module cache was removed in 0.23.x, so stale-cache is
+no longer a suspect — every compilation is from source.
 
 **Fix**: `./bpp --clean-cache`, then re-run the bootstrap. If gen1 == gen2
 after clean-cache, the oscillation was stale cache — not a real issue.

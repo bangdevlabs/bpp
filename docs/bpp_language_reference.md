@@ -145,21 +145,37 @@ Annotations use the existing `:` syntax after a variable name or function parame
 
 ### Type/size annotations (after variable name)
 
-| Annotation | What it does |
-|------------|-------------|
-| `: byte` | 8-bit unsigned integer (0-255) |
-| `: half` | 32-bit integer |
-| `: quarter` | 16-bit integer |
-| `: float` | 64-bit double |
-| `: half float` | 32-bit float |
-| `: quarter float` | 16-bit float |
-| `: StructName` | Typed struct access (enables dot syntax) |
+The slice ladder runs from 1 bit to 128 bits, one unified system for
+both integer and float types. Apply to struct fields (for packed
+layout) or to local variables (for storage class hints).
+
+| Annotation | What it does | Phase |
+|------------|-------------|-------|
+| `: bit` | 1 bit (boolean flag) | A1 |
+| `: bit3` | 3 bits (0-7) | A1 |
+| `: bit4` | 4 bits (0-15) | A1 |
+| `: byte` | 8-bit unsigned integer (0-255) | (ship) |
+| `: quarter` | 16-bit integer | (ship) |
+| `: half` | 32-bit integer | (ship) |
+| (default) | 64-bit word | (ship) |
+| `: quarter float` | 16-bit float | (ship) |
+| `: half float` | 32-bit float | (ship) |
+| `: float` | 64-bit double | (ship) |
+| `: double` | 128-bit SIMD (4× float32) | B4 |
+| `: StructName` | Typed struct access (enables dot syntax) | (ship) |
 
 ```bpp
 auto hp: byte;              // 8-bit health points
 auto velocity: half float;  // 32-bit float velocity
 auto player: Player;        // typed struct with dot access
+auto flags: bit4;           // 4 flags packed in 4 bits (Phase A1)
+auto lanes: double;         // 128-bit SIMD vector (Phase B4)
 ```
+
+**Important — Rule 8:** When a pointer targets a sliced struct, always
+use typed access (`auto p: Struct; p.field`). Raw offset `*(ptr + N)`
+does NOT respect the packed layout and will read wrong memory. See
+`docs/tonify_checklist.md` Rule 8.
 
 ### Storage annotation (after top-level variable name)
 
