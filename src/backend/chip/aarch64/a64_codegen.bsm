@@ -842,10 +842,49 @@ a64_emit_node(nd) {
         return 0;
     }
 
+    // Conditional expression `cond ? then : else`. Short-circuit by contract:
+    // ONLY the selected branch evaluates. This is also the lowering target
+    // for `&&` / `||` (parser rewrites them so backends never see those
+    // operators). The result type is whichever branch ran (returned in x0
+    // for integers, d0 for floats); both branches are expected to agree.
+    if (t == T_TERNARY) {
+        auto lbl_else, lbl_done, ety_then, ety_else;
+        ety = a64_emit_node(n.a);
+        // Normalize float condition to an integer truth value so cbz can branch.
+        if (ety == 1) {
+            if (a64_bin_mode) { enc_fcmp_zero(0); enc_cset(0, 1); }
+            else { out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); }
+        }
+        if (a64_bin_mode) {
+            lbl_else = enc_new_label();
+            lbl_done = enc_new_label();
+            enc_cbz_label(0, lbl_else);
+            ety_then = a64_emit_node(n.b);
+            enc_b_label(lbl_done);
+            enc_def_label(lbl_else);
+            ety_else = a64_emit_node(n.c);
+            enc_def_label(lbl_done);
+        } else {
+            lbl_else = a64_new_lbl();
+            lbl_done = a64_new_lbl();
+            out("  cbz x0, .Lter"); a64_print_dec(lbl_else); putchar('\n');
+            ety_then = a64_emit_node(n.b);
+            out("  b .Lter"); a64_print_dec(lbl_done); putchar('\n');
+            out(".Lter"); a64_print_dec(lbl_else); out(":"); putchar('\n');
+            ety_else = a64_emit_node(n.c);
+            out(".Lter"); a64_print_dec(lbl_done); out(":"); putchar('\n');
+        }
+        // Branches must agree on result type; trust the parser to enforce.
+        return ety_then;
+    }
+
     if (t == T_BINOP) {
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         c0 = peek(a64_sbuf + op_s);
         c1 = 0; if (op_l > 1) { c1 = peek(a64_sbuf + op_s + 1); }
+
+        // Constant folding lives in the parser — by the time a T_BINOP
+        // reaches codegen, at least one operand is guaranteed non-literal.
 
         // Check if this is an integer-only operator (%, &, |, ^, <<, >>).
         is_io = 0;
@@ -892,17 +931,8 @@ a64_emit_node(nd) {
                 if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,10); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
                 if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,12); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
             }
-            // Float logical operators: compare each side against zero.
-            if (c0 == '&') { if (c1 == '&') {
-                if (a64_bin_mode) { enc_fcmp_zero(1); enc_cset(1,1); enc_fcmp_zero(0); enc_cset(0,1); enc_and_reg(0,1,0); }
-                else { out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  and x0, x1, x0"); putchar('\n'); }
-                return 0;
-            } }
-            if (c0 == '|') { if (c1 == '|') {
-                if (a64_bin_mode) { enc_fcmp_zero(1); enc_cset(1,1); enc_fcmp_zero(0); enc_cset(0,1); enc_orr_reg(0,1,0); }
-                else { out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  orr x0, x1, x0"); putchar('\n'); }
-                return 0;
-            } }
+            // && and || removed from T_BINOP — parser now lowers them to
+            // T_TERNARY which carries the short-circuit contract directly.
             return 1;
         }
 
@@ -942,17 +972,8 @@ a64_emit_node(nd) {
             if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,10); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
             if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,12); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
         }
-        // Logical operators: convert to boolean first.
-        if (c0 == '&') { if (c1 == '&') {
-            if (a64_bin_mode) { enc_cmp_imm(1,0); enc_cset(1,1); enc_cmp_imm(0,0); enc_cset(0,1); enc_and_reg(0,1,0); }
-            else { out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  and x0, x1, x0"); putchar('\n'); }
-            return 0;
-        } }
-        if (c0 == '|') { if (c1 == '|') {
-            if (a64_bin_mode) { enc_cmp_imm(1,0); enc_cset(1,1); enc_cmp_imm(0,0); enc_cset(0,1); enc_orr_reg(0,1,0); }
-            else { out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  orr x0, x1, x0"); putchar('\n'); }
-            return 0;
-        } }
+        // && and || removed from T_BINOP integer path — parser lowers them
+        // to T_TERNARY (see parse_binops in bpp_parser.bsm).
         return 0;
     }
 
@@ -1667,12 +1688,30 @@ a64_emit_node(nd) {
             if (a64_bin_mode == 0) { out("  ldr d0, [x0]"); putchar('\n'); }
             return 1;
         }
+        // Bit-packed field types: load the containing byte, extract the
+        // requested bit slice with UBFX. The bit offset within the byte
+        // travels in bits 8-10 of the hint word (encoded by resolve_dot).
+        auto sl, bo, bw;
+        sl = ty_slice(fh);
+        if (sl >= SL_BIT && sl <= SL_BIT7) {
+            bo = (fh / 256) & 7;
+            bw = sl - 3;
+            if (a64_bin_mode) {
+                enc_ldrb_uoff(0, 0, 0);
+                enc_ubfx_w(0, 0, bo, bw);
+            } else {
+                out("  ldrb w0, [x0]"); putchar('\n');
+                out("  ubfx w0, w0, #"); a64_print_dec(bo);
+                out(", #"); a64_print_dec(bw); putchar('\n');
+            }
+            return 0;
+        }
         // Integer field types: load to integer register.
-        if (ty_slice(fh) == SL_BYTE) {
+        if (sl == SL_BYTE) {
             if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); } else { out("  ldrb w0, [x0]"); putchar('\n'); }
-        } else if (ty_slice(fh) == SL_QUARTER) {
+        } else if (sl == SL_QUARTER) {
             if (a64_bin_mode) { enc_ldrh_uoff(0, 0, 0); } else { out("  ldrh w0, [x0]"); putchar('\n'); }
-        } else if (ty_slice(fh) == SL_HALF) {
+        } else if (sl == SL_HALF) {
             if (a64_bin_mode) { enc_ldrsw_uoff(0, 0, 0); } else { out("  ldrsw x0, [x0]"); putchar('\n'); }
         } else {
             if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); } else { out("  ldr x0, [x0]"); putchar('\n'); }
@@ -1749,7 +1788,7 @@ a64_emit_stmt(nd) {
                     off = arr_get(a64_var_off, vi);
                     auto fc, j, sidx;
                     sidx = arr_get(a64_var_struct_idx, vi);
-                    fc = get_struct_size(sidx) / 8;
+                    fc = (get_struct_size(sidx) + 7) / 8;
                     j = 0;
                     while (j < fc) {
                         if (a64_bin_mode) {
@@ -1849,11 +1888,31 @@ a64_emit_stmt(nd) {
         a64_emit_push();
         a64_emit_node(n.a);
         a64_emit_pop(1);
-        if (ty_slice(fh) == SL_BYTE) {
+        // Bit-packed field stores: load the containing byte, splice the new
+        // value's low bits in via BFI, store the byte back. x0 holds the
+        // pointer (post-pop) and x1 holds the source value.
+        auto sl, bo, bw;
+        sl = ty_slice(fh);
+        if (sl >= SL_BIT && sl <= SL_BIT7) {
+            bo = (fh / 256) & 7;
+            bw = sl - 3;
+            if (a64_bin_mode) {
+                enc_ldrb_uoff(2, 0, 0);
+                enc_bfi_w(2, 1, bo, bw);
+                enc_strb_uoff(2, 0, 0);
+            } else {
+                out("  ldrb w2, [x0]"); putchar('\n');
+                out("  bfi w2, w1, #"); a64_print_dec(bo);
+                out(", #"); a64_print_dec(bw); putchar('\n');
+                out("  strb w2, [x0]"); putchar('\n');
+            }
+            return 0;
+        }
+        if (sl == SL_BYTE) {
             if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
-        } else if (ty_slice(fh) == SL_QUARTER) {
+        } else if (sl == SL_QUARTER) {
             if (a64_bin_mode) { enc_strh_uoff(1, 0, 0); } else { out("  strh w1, [x0]"); putchar('\n'); }
-        } else if (ty_slice(fh) == SL_HALF) {
+        } else if (sl == SL_HALF) {
             if (a64_bin_mode) { enc_str_w_uoff(1, 0, 0); } else { out("  str w1, [x0]"); putchar('\n'); }
         } else {
             if (a64_bin_mode) { enc_str_uoff(1, 0, 0); } else { out("  str x1, [x0]"); putchar('\n'); }
@@ -1862,24 +1921,9 @@ a64_emit_stmt(nd) {
     }
 
     if (t == T_IF) {
-        // Dead code elimination: if condition is a compile-time literal,
-        // skip the branch entirely and emit only the taken path.
-        // Raw `*(cond + N)` does NOT respect sliced Node layout — must
-        // use typed access via `auto cond_node: Node`.
-        auto cond_node: Node;
-        cond_node = n.a;
-        if (cond_node.ntype == T_LIT) {
-            auto cond_val;
-            cond_val = a64_parse_int(cond_node.a);
-            if (cond_val == 0) {
-                // Condition is always false: emit only the else branch.
-                if (n.e > 0) { a64_emit_body(n.d, n.e); }
-            } else {
-                // Condition is always true: emit only the if body.
-                a64_emit_body(n.b, n.c);
-            }
-            return 0;
-        }
+        // Literal-condition DCE lives in the parser (parse_if rewrites
+        // `if (literal)` to T_BLOCK of the taken branch) — by the time a
+        // T_IF reaches here, the condition is a runtime value.
         if (a64_bin_mode) {
             lbl = enc_new_label();
             lbl2 = enc_new_label();
@@ -2111,6 +2155,11 @@ a64_emit_stmt(nd) {
 
     if (t == T_NOP) { return 0; }
 
+    // T_BLOCK holds a statement array produced by parser-level DCE when a
+    // literal `if` condition collapses to its taken branch. Emit each
+    // child as a normal statement — there is no header or terminator.
+    if (t == T_BLOCK) { a64_emit_body(n.b, n.c); return 0; }
+
     // Expression statement (e.g., function call as statement).
     a64_emit_node(nd);
     return 0;
@@ -2161,7 +2210,9 @@ a64_emit_func(fi) {
     while (i < arr_len(a64_vars)) {
         arr_set(a64_var_off, i, 40 + total);
         if (arr_get(a64_var_stack, i)) {
-            sz = get_struct_size(arr_get(a64_var_struct_idx, i));
+            // Round struct slot up to a multiple of 8 so the 8-byte chunked
+            // copy never spills into the next variable's storage.
+            sz = (get_struct_size(arr_get(a64_var_struct_idx, i)) + 7) / 8 * 8;
         } else {
             sz = 8;
         }

@@ -1,0 +1,67 @@
+// test_short_circuit.bpp — Validates that `&&` and `||` honor C-style
+// short-circuit semantics. The parser lowers both operators to T_TERNARY
+// (see commit history for the `&&` / `||` rewrite). This test confirms
+// that the second operand DOES NOT evaluate when the first determines
+// the result — the canonical use case being null-pointer guards like
+// `if (p != 0 && peek(p) > 0)` which was a memory-safety bug before.
+//
+// Running this binary tests the entire chain: parser builds T_TERNARY,
+// codegen emits canonical short-circuit branch, runtime takes only the
+// selected path. If short-circuit ever regresses, this test SIGSEGVs
+// because the guard call dereferences a deliberately invalid pointer.
+
+// Trips a sentinel global so the test can prove the second operand of
+// && / || was NOT evaluated even when its result would have been useful.
+auto _sc_calls;
+
+side_effect() {
+    _sc_calls = _sc_calls + 1;
+    return 1;
+}
+
+main() {
+    // && skips the right side when the left is false.
+    _sc_calls = 0;
+    if (0 && side_effect()) { return 10; }
+    if (_sc_calls != 0) { return 11; }
+
+    // && evaluates the right side when the left is true.
+    _sc_calls = 0;
+    if (1 && side_effect()) {
+        if (_sc_calls != 1) { return 20; }
+    } else {
+        return 21;
+    }
+
+    // || skips the right side when the left is true.
+    _sc_calls = 0;
+    if (1 || side_effect()) {
+        if (_sc_calls != 0) { return 30; }
+    } else {
+        return 31;
+    }
+
+    // || evaluates the right side when the left is false.
+    _sc_calls = 0;
+    if (0 || side_effect()) {
+        if (_sc_calls != 1) { return 40; }
+    } else {
+        return 41;
+    }
+
+    // Null-pointer guard pattern. Pre-fix this SIGSEGV'd because peek(0)
+    // tried to dereference address 0. With short-circuit, peek never runs.
+    auto p;
+    p = 0;
+    if (p != 0 && peek(p) > 0) { return 50; }
+
+    // Symmetric pattern for ||: skips the right side when left is truthy.
+    p = 1;
+    if (p != 0 || peek(p) > 0) {
+        // Took the short-circuit; peek never ran, so we did not crash.
+    } else {
+        return 60;
+    }
+
+    return 0;
+}

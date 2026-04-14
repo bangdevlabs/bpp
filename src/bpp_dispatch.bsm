@@ -186,6 +186,18 @@ contains_var(nd, name_p): base {
         if (contains_var(n.b, name_p)) { return 1; }
         return contains_var(n.c, name_p);
     }
+    if (t == T_TERNARY) {
+        if (contains_var(n.a, name_p)) { return 1; }
+        if (contains_var(n.b, name_p)) { return 1; }
+        return contains_var(n.c, name_p);
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) {
+            if (contains_var(arr[i], name_p)) { return 1; }
+        }
+        return 0;
+    }
     if (t == T_UNARY) { return contains_var(n.b, name_p); }
     if (t == T_CALL) {
         arr = n.b;
@@ -322,6 +334,19 @@ has_side_effects(nd) {
         if (has_side_effects(n.b)) { return 1; }
         return has_side_effects(n.c);
     }
+    if (t == T_TERNARY) {
+        // Conservative: any of the three children with effects taints the whole.
+        if (has_side_effects(n.a)) { return 1; }
+        if (has_side_effects(n.b)) { return 1; }
+        return has_side_effects(n.c);
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) {
+            if (has_side_effects(arr[i])) { return 1; }
+        }
+        return 0;
+    }
     if (t == T_UNARY) { return has_side_effects(n.b); }
     if (t == T_MEMLD) { return has_side_effects(n.a); }
     if (t == T_ADDR) { return has_side_effects(n.a); }
@@ -402,11 +427,7 @@ classify_loop(wh) {
     // Step 5: classify.
     dsp = DSP_SEQ;
     if (impure_cnt == 0) {
-        if (arr_len(stride_vars) > 0) {
-            dsp = DSP_GPU;
-        } else {
-            dsp = DSP_PAR;
-        }
+        dsp = arr_len(stride_vars) > 0 ? DSP_GPU : DSP_PAR;
     } else {
         if (arr_len(stride_vars) > 0) {
             if (pure_cnt > 0) {
@@ -593,6 +614,17 @@ static _cgb_walk(nd) {
     if (t == T_BINOP) {
         _cgb_walk(n.b);
         _cgb_walk(n.c);
+        return 0;
+    }
+    if (t == T_TERNARY) {
+        _cgb_walk(n.a);
+        _cgb_walk(n.b);
+        _cgb_walk(n.c);
+        return 0;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _cgb_walk(arr[i]); }
         return 0;
     }
     if (t == T_UNARY) { _cgb_walk(n.b); return 0; }
@@ -824,11 +856,9 @@ static void _dsp_walk_main_for_freeze() {
                 if (lhs.ntype == T_VAR) {
                     gi = dsp_find_global(lhs.a);
                     if (gi >= 0) {
-                        if (frozen) {
-                            arr_set(glob_writes_post, gi, arr_get(glob_writes_post, gi) + 1);
-                        } else {
-                            arr_set(glob_writes_pre, gi, arr_get(glob_writes_pre, gi) + 1);
-                        }
+                        auto wbucket;
+                        wbucket = frozen ? glob_writes_post : glob_writes_pre;
+                        arr_set(wbucket, gi, arr_get(wbucket, gi) + 1);
                     }
                 }
             }
@@ -910,11 +940,7 @@ classify_all_functions() {
                     j = n_callees;
                 }
             }
-            if (found_solo != 0) {
-                arr_set(fn_phase_next, i, PHASE_SOLO);
-            } else {
-                arr_set(fn_phase_next, i, PHASE_BASE);
-            }
+            arr_set(fn_phase_next, i, found_solo != 0 ? PHASE_SOLO : PHASE_BASE);
         }
 
         // Swap buffers and check for changes.

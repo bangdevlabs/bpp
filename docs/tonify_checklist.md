@@ -139,8 +139,12 @@ For struct definitions with fields that are smaller than a word:
 | Field range | Annotation | Example |
 |-------------|-----------|---------|
 | 0-1 (single flag) | `: bit` | `alive: bit` (Phase A1) |
+| 0-3 (2 bits) | `: bit2` | `tier: bit2` (Phase A1) |
 | 0-7 (small enum, 3 bits) | `: bit3` | `direction: bit3` (Phase A1) |
 | 0-15 (larger enum, 4 bits) | `: bit4` | `level: bit4` (Phase A1) |
+| 0-31 (5 bits) | `: bit5` | `quality: bit5` (Phase A1) |
+| 0-63 (6 bits) | `: bit6` | `slot: bit6` (Phase A1) |
+| 0-127 (7 bits) | `: bit7` | `score: bit7` (Phase A1) |
 | 0-255 (boolean, flags, small count) | `: byte` | `on_ground: byte` |
 | 0-65535 (moderate count, dimensions) | `: quarter` | `w: quarter, h: quarter` |
 | Signed 32-bit (physics values, accelerations) | `: half` | `gravity: half` |
@@ -188,6 +192,115 @@ sliced-struct system. Rule 8 applies ONLY to sliced structs.
 See `~/.claude/projects/-Users-Codes-b--/memory/feedback_sliced_struct_access.md`
 for the full incident history (DCE and jump-table bugs caused by this
 exact pattern).
+
+## Rule 9: Local struct allocation — `var` vs `auto x: Type`
+
+Two ways to declare a struct-typed local exist; they look similar but
+allocate different things. Picking the wrong one is silent — the program
+compiles and then segfaults at the first field write.
+
+| Pattern | What it allocates | When to use |
+|---------|-------------------|-------------|
+| `var x: T;` | `sizeof(T)` bytes on the stack, in place. `x` IS the struct. | Short-lived struct used only inside the function. No pointer to `x` escapes. |
+| `auto x: T; x = malloc(sizeof(T));` | 1 word slot, then heap allocation. `x` holds the pointer. | Struct outlives the function, is returned, or is stored elsewhere. |
+| `auto x: T;` alone | 1 word slot, **uninitialized (== 0)**. `x` is a null pointer. | Only when `x` will be assigned a real pointer from elsewhere (function return, array element, etc.) before any field access. |
+
+**Pitfall.** `auto x: T; x.field = v;` looks like a stack-struct declaration
+but is silently broken — `x` is null until you assign a pointer to it,
+so the field write goes to address 0 and SIGBUSes. The compiler does
+not warn because the type hint is legal; only the missing initialization
+is the bug.
+
+**Rule of thumb.** If the struct lives entirely within the function and
+you do not need a pointer to it elsewhere, use `var`. If it crosses
+function boundaries or feeds an array of structs, use `auto x: T;` plus
+`malloc`.
+
+| Bad | Good |
+|-----|------|
+| `auto e: Entity; e.hp = 100;` | `var e: Entity; e.hp = 100;` |
+| `auto e: Entity; e.hp = 100;` (when e escapes) | `auto e: Entity; e = malloc(sizeof(Entity)); e.hp = 100;` |
+
+## Rule 10: Portable built-ins (cross-platform first)
+
+When adding functionality that user programs will call from any platform
+(macOS, Linux, C transpilation), expose it as a B++ built-in. Don't push
+the platform conditionals onto user code. The 2026-04-13 backend reorg
+introduced this methodology specifically so B++ stays agnostic and easy
+to port — the user should never write `if (macos) { ... } else { ... }`.
+
+**The pattern** (worked examples: `malloc`, `malloc_aligned`, `memcpy`,
+`putchar`, `getchar`):
+
+| Layer | File | Purpose |
+|-------|------|---------|
+| Public API | `src/bpp_<area>.bsm` | Declares the function; imports the per-OS implementation file. |
+| OS implementation | `src/backend/os/<os>/_<area>_<os>.bsm` | Uses `sys_*` syscalls and OS-specific constants. One file per supported OS. |
+| C transpiler mapping | `src/backend/c/bpp_emitter.bsm` | Maps the call to a libc equivalent so `bpp --c` produces working C. |
+
+**Decision rule.** If a user program would need to write
+`if (platform == macos) { ... } else { ... }` to do this thing on
+multiple platforms, the thing is a missing built-in. Add it.
+
+**Don't expose as user-facing API:**
+
+| Primitive | Why it stays internal |
+|-----------|----------------------|
+| `sys_mmap`, `sys_open`, `sys_lseek`, ...   | Syscall numbers and signatures differ across OSs |
+| `MAP_PRIVATE` / `MAP_ANON` numeric values | Different on macOS vs Linux |
+| File mode bits, flag constants | Platform-specific encodings |
+| Anything in `src/backend/os/<os>/` directly | Layer is OS implementation, not user API |
+
+These primitives exist so the built-ins above can use them. User code
+should never see them.
+
+**When in doubt**, ask: "would it be embarrassing if a user had to
+write this by hand on every new platform B++ ports to?" If yes, it
+needs to be a built-in. The whole point of the backend split is that
+porting B++ to a new OS = adding `src/backend/os/<newos>/_*.bsm` files
+without touching user programs or the frontend.
+
+**Cross-reference**: `~/.claude/projects/-Users-Codes-b--/memory/feedback_backend_layers.md`
+for the full layer map (chip / os / target / c).
+
+## Rule 11: Ternary and short-circuit idioms
+
+Two language features landed together as a side quest: `?:` as a real
+expression and `&&` / `||` with C-style short-circuit semantics. Use
+them where they fit instead of the longer alternatives.
+
+### Use ternary for value-selecting `if/else`
+
+| Before | After |
+|--------|-------|
+| `if (cond) { x = a; } else { x = b; }` | `x = cond ? a : b;` |
+| `auto val; if (hp < 20) { val = 99; } else { val = 0; }` | `auto val = hp < 20 ? 99 : 0;` |
+| Dispatch to one of two function calls | `(cond ? f : g)(args)` — wait, no function pointers yet; use `cond ? f(args) : g(args)` |
+
+Ternary is right-associative: `a ? b : c ? d : e` parses as
+`a ? b : (c ? d : e)`. Use that to flatten cascades.
+
+### Use `&&` for null-pointer guards and combined conditions
+
+`&&` is now short-circuit. The right operand only runs when the left
+is truthy. That makes the `if (ptr != 0 && ptr.field > 0)` pattern
+memory-safe — the dereference never executes when the pointer is null.
+
+| Before | After |
+|--------|-------|
+| `if (p != 0) { if (p.field > 0) { ... } }` | `if (p != 0 && p.field > 0) { ... }` |
+| `if (a) { if (b) { if (c) { ... } } }` | `if (a && b && c) { ... }` |
+| Side-effect-bearing right operand inside `if (0 && ...)` | Just delete the call — it's dead code now |
+
+### When NOT to use
+
+- If the else branch is multiple statements: keep `if/else` — ternary is for value selection, not statement blocks.
+- If ternary nesting would exceed two levels: use explicit control flow.
+- If the right operand of `&&` or `||` has observable side effects that you want run unconditionally: split into two statements.
+
+Both forms desugar to `T_TERNARY` in the AST, so the backends see a
+single canonical node. Adding the idiom costs zero runtime overhead
+versus the longer form.
 
 ---
 

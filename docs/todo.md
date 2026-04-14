@@ -1,8 +1,10 @@
 # B++ Roadmap
 
-## Status: 2026-04-11 — version 0.22
+## Status: 2026-04-14 — version 0.23.x, Mini Cooper Phase A + B0 shipped
 
-B++ 0.22 continues. **Tonify sweep** (batches 1-5 complete, 6-7 pending): ~350 void, ~200 static, ~50 :base, ~50 while→for, Node struct sliced (29% smaller AST), raw ptr→dot syntax refactor. **New language features**: `switch` statement (value + condition dispatch, inherited from B, no fallthrough), `bare return;`, multi-error diagnostics, E230 guard. **Codegen fixes**: `:half` sign-extension (LDRSW/MOVSXD both backends), `_stb_core_linux.bsm` created (Linux cross-compile unblocked), `dsp_is_local` packed_eq fix. **Progressive enhancement architecture**: `job_parallel_for` falls back to serial when no workers — smart dispatch auto-rewrite never silently drops work. Suite at **62 passed / 0 failed**.
+B++ 0.23.x continues. **Foundation refactor** landed: `.bo` cache removed entirely (~630 lines net), repo split into `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + `c/`, syscalls collapsed into `BSYS_*` tables per OS, `bmem` pure-B++ allocator (malloc/free/realloc + malloc_aligned), `brt0` runtime with real B++ globals for `_bpp_argc/_bpp_argv/_bpp_envp`, `putchar`/`getchar` demoted from codegen builtins to B++ functions. Linux static ELF now links literally nothing.
+
+**Mini Cooper Phase A + B0 shipped**: bitfields (`: bit` through `: bit7`, LSB-first packing, UBFX/BFI codegen), `malloc_aligned(size, align)` with uniform 16-byte bmem header, parser-level constant folding and DCE (`if(0)`/`if(1)`/`while(0)` collapsed before backends see them), `T_TERNARY` AST node, `&&`/`||` short-circuit via parser rewrite to T_TERNARY (closed the native↔C emitter divergence on null-pointer guards), `T_BLOCK` for DCE statement groups, jump-table codegen for dense switch. **Tonify** batches 1-5 done + batch 5.5 Rule 11 sweep (ternary and short-circuit idioms across 11 sites). **Canonical tests** added: bitfield, aligned_alloc, const_fold, realloc, signed_half, switch, ternary, short_circuit. Suite at **59 passed / 0 failed / 11 skipped**.
 
 **Vision**: B++ makes everything that makes a game — the art, the sound, AND the game itself.
 
@@ -241,13 +243,11 @@ Estimated scope: ~50-100 globals across ~30 files. Mechanical sweep, one file at
 
 ### 5. Maestro Plan Phase 2 — smart dispatch codegen
 
-Already partially shipped (call graph + fixpoint classifier are DONE in 0.22). Remaining work:
-
-- **`.bo` cache format extension**: serialize `fn_phase[]` per exported function AND `glob_class[]` per exported global. Same BO_VERSION bump. Depends on step 2 (transitive content hash) so cache invalidation is sound.
+Already partially shipped (call graph + fixpoint classifier DONE in 0.22; smart promotion of `auto` → `extrn` / `global` DONE in 0.23). The `.bo` cache format extension that originally gated this item **no longer applies** — the cache was removed entirely in the 2026-04-13 foundation refactor, so every compile reads purity data fresh from source and the cache-serialization design dependency evaporated. Remaining work is now cleaner:
 
 - **Codegen reads `w.dispatch`** + consults `glob_class[]` for the loop classifier. When a `for` loop has only induction-var-or-global-or-loop-local reads/writes AND only calls to `PHASE_BASE` functions AND the touched globals are `global` (not `auto` legacy), the codegen rewrites the loop body into a synthesized function and emits `job_parallel_for(N, fn_ptr(synthesized_fn))` instead of the serial loop.
 
-- **Function synthesis from loop body**: extract loop body to a new function that takes the induction variable as its single argument. Restriction A (induction var + globals only): no closure capture needed. Loops that reference outer locals stay serial. Snake's particle update fits restriction A exactly.
+- **Function synthesis from loop body**: extract loop body to a new function that takes the induction variable as its single argument. Restriction A (induction var + globals only): no closure capture needed. Loops that reference outer locals stay serial. Snake's particle update fits restriction A exactly. The Mini Cooper parser-level improvements make this cleaner: short-circuit `&&` / `||` already lower to `T_TERNARY`, so the classifier doesn't have to special-case them in loop bodies; const-folded sub-trees are already `T_LIT` and trivially safe to move across worker boundaries.
 
 - **Migrate `snake_maestro.bpp`** to declare its globals with `global`, remove the explicit `register_base` calls, verify the compiler auto-dispatches particle physics without intervention.
 

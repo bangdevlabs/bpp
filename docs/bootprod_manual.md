@@ -535,6 +535,72 @@ echo 'main() { my_new_builtin(42); return 0; }' > /tmp/test.bpp
 ./bpp /tmp/test.bpp -o /tmp/test_out && /tmp/test_out
 ```
 
+## Where to Implement a Feature
+
+Before writing code, ask: **"Would a new backend need to reimplement
+this?"** If yes, the feature is in the wrong layer. Push decisions as
+early in the pipeline as possible. The earlier a decision is made, the
+fewer backends carry the weight.
+
+```
+Source → Lexer → Parser → AST → Dispatch/Validate → Codegen → Binary
+         ↑                 ↑            ↑                ↑
+     token rules     SEMANTICS     analysis        EMISSION
+     (rarely new)    (go here)    (classification)  (go here only
+                                                     if chip/OS
+                                                     specific)
+```
+
+### Decision tree
+
+1. **Does the feature define WHAT the program does?** (language
+   semantics: short-circuit, operator lowering, control flow sugar)
+   → **Parser / frontend.** One implementation, all backends inherit.
+   Example: `a && b` → `if (a) then b else 0`. The backend never
+   sees `&&`. A future RISC-V or WASM backend gets short-circuit
+   for free.
+
+2. **Does the feature need a chip-specific instruction?** (SIMD,
+   bitfield extract, atomic ops)
+   → **`src/backend/chip/<arch>/`.** One implementation per chip.
+   Example: UBFX on ARM64 for bitfield loads, SHR+AND on x86_64.
+
+3. **Does the feature need an OS syscall or API?** (memory allocation,
+   I/O, time, threads)
+   → **`src/backend/os/<os>/`.** One implementation per OS.
+   Example: `_bmem_linux.bsm` uses sys_mmap, `_bmem_macos.bsm`
+   uses libSystem.
+
+4. **Does the feature need chip+OS specific binary format?** (section
+   layout, relocations, entry point)
+   → **`src/backend/target/<chip_os>/`.** One per target combination.
+   Example: Mach-O writer knows ARM64 relocations AND macOS loader.
+
+### The portability test
+
+When in doubt, imagine adding a new backend (say, RISC-V Linux).
+Count how many files you would need to touch to support the feature:
+
+- If the answer is **zero** (the feature is in the parser/frontend):
+  the implementation is in the right place.
+- If the answer is **one** (a new chip or OS file): acceptable.
+- If the answer is **two or more existing files**: the feature is
+  too spread out. Centralize before adding the new backend.
+
+### Anti-pattern: duplicated semantics across backends
+
+If you find the same logical decision (not the same instruction, but
+the same *rule*) implemented in `a64_codegen.bsm` AND `x64_codegen.bsm`
+AND `bpp_emitter.bsm`, that is a sign the decision belongs in the
+frontend. The backends should only differ in HOW they emit, not in
+WHAT they decide to emit.
+
+Historical example: `if (0) { ... }` dead code elimination was
+duplicated in both native codegens. Short-circuit `&&`/`||` was
+heading the same way until caught. Both belong in the parser.
+
+---
+
 ## Backend Layout
 
 The native backends live under `src/backend/` with a three-way split:

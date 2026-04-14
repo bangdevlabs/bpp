@@ -136,6 +136,19 @@ import "stbecs.bsm";        // engine — permissive rules
 | `break` | Exit the innermost loop immediately. |
 | `continue` | Skip to the next iteration. In `for` loops, runs the step expression before re-testing the condition (C semantics). |
 | `return` | Return a value from the current function. Bare `return;` supported in void functions. |
+| `cond ? a : b` | Ternary conditional expression. Only the selected branch evaluates. Right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`. |
+
+**Short-circuit `&&` and `||`.** Both operators respect C-style short-circuit
+semantics: the right operand evaluates ONLY when the left cannot determine
+the result. `0 && expr` never runs `expr`; `1 || expr` never runs `expr`.
+This is a language guarantee — all backends honour it because the parser
+desugars `a && b` and `a || b` to a ternary node before codegen. Null-pointer
+guards like `if (p != 0 && p.field > 0)` are memory-safe on every backend.
+
+**Compile-time evaluation.** Integer-literal expressions fold at parse time:
+`3 + 5` becomes `8` in the AST; `if (0) { ... }` and `while (0) { ... }` drop
+their bodies; `if (1) { x } else { y }` keeps only `x`. These happen in the
+frontend, so every backend sees already-simplified trees.
 
 ---
 
@@ -152,8 +165,12 @@ layout) or to local variables (for storage class hints).
 | Annotation | What it does | Phase |
 |------------|-------------|-------|
 | `: bit` | 1 bit (boolean flag) | A1 |
+| `: bit2` | 2 bits (0-3) | A1 |
 | `: bit3` | 3 bits (0-7) | A1 |
 | `: bit4` | 4 bits (0-15) | A1 |
+| `: bit5` | 5 bits (0-31) | A1 |
+| `: bit6` | 6 bits (0-63) | A1 |
+| `: bit7` | 7 bits (0-127) | A1 |
 | `: byte` | 8-bit unsigned integer (0-255) | (ship) |
 | `: quarter` | 16-bit integer | (ship) |
 | `: half` | 32-bit integer | (ship) |

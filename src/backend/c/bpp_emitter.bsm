@@ -226,6 +226,12 @@ void scan_calls(nd) {
         return;
     }
     if (t == T_BINOP) { scan_calls(n.b); scan_calls(n.c); return; }
+    if (t == T_TERNARY) { scan_calls(n.a); scan_calls(n.b); scan_calls(n.c); return; }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { scan_calls(arr[i]); }
+        return;
+    }
     if (t == T_UNARY) { scan_calls(n.b); return; }
     if (t == T_ASSIGN) { scan_calls(n.a); scan_calls(n.b); return; }
     if (t == T_MEMLD) { scan_calls(n.a); return; }
@@ -344,7 +350,10 @@ void emit_body(arr, cnt) {
                 if (n.d == 1) {
                     auto sidx, fc;
                     sidx = get_var_type(darr[0]);
-                    fc = get_struct_size(sidx) / 8;
+                    // Round struct size up to a whole number of long longs.
+                    // Bit-packed structs and any size not a multiple of 8 need
+                    // the rounding so the allocation covers the final partial slot.
+                    fc = (get_struct_size(sidx) + 7) / 8;
                     emit_pad();
                     out("long long ");
                     print_p(darr[0]);
@@ -481,6 +490,19 @@ void emit_node(nd) {
         return;
     }
 
+    // Ternary: leans on C's native short-circuit `?:` so the contract is
+    // honoured for free — only the selected branch evaluates at runtime.
+    if (t == T_TERNARY) {
+        out("((");
+        emit_node(n.a);
+        out(") ? (");
+        emit_node(n.b);
+        out(") : (");
+        emit_node(n.c);
+        out("))");
+        return;
+    }
+
     if (t == T_UNARY) {
         out("(");
         print_p(n.a);
@@ -496,7 +518,7 @@ void emit_node(nd) {
             if (is_var_stack(an.a)) {
                 auto _sidx, _fc;
                 _sidx = get_var_type(an.a);
-                _fc = get_struct_size(_sidx) / 8;
+                _fc = (get_struct_size(_sidx) + 7) / 8;
                 out("memcpy(");
                 print_p(an.a);
                 out(", ");
@@ -516,6 +538,24 @@ void emit_node(nd) {
     }
 
     if (t == T_MEMLD) {
+        // Bit-packed field reads: load the containing byte, shift the field
+        // down to bit 0, mask off the high bits. The pointer expression
+        // built by resolve_dot is pure, so evaluating it once is enough.
+        auto ld_sl, ld_bo, ld_bw, ld_mask;
+        ld_sl = ty_slice(n.b);
+        if (ld_sl >= SL_BIT && ld_sl <= SL_BIT7) {
+            ld_bo = (n.b / 256) & 7;
+            ld_bw = ld_sl - 3;
+            ld_mask = (1 << ld_bw) - 1;
+            out("(((*(uint8_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) >> ");
+            emit_int(ld_bo);
+            out(") & ");
+            emit_int(ld_mask);
+            out("))");
+            return;
+        }
         out("(*(long long*)((uintptr_t)(");
         emit_node(n.a);
         out(")))");
@@ -530,6 +570,32 @@ void emit_node(nd) {
     }
 
     if (t == T_MEMST) {
+        // Bit-packed field writes: read-modify-write the containing byte.
+        // The pointer expression is pure (built by resolve_dot from a base
+        // var plus a constant offset), so evaluating it twice is safe and
+        // avoids needing a GCC statement-expression wrapper.
+        auto st_sl, st_bo, st_bw, st_mask, st_clear;
+        st_sl = ty_slice(n.c);
+        if (st_sl >= SL_BIT && st_sl <= SL_BIT7) {
+            st_bo = (n.c / 256) & 7;
+            st_bw = st_sl - 3;
+            st_mask = (1 << st_bw) - 1;
+            st_clear = 255 ^ (st_mask << st_bo);
+            out("(*(uint8_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) = (uint8_t)((*(uint8_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) & ");
+            emit_int(st_clear);
+            out(") | ((((");
+            emit_node(n.b);
+            out(") & ");
+            emit_int(st_mask);
+            out(") << ");
+            emit_int(st_bo);
+            out("))))");
+            return;
+        }
         out("*(long long*)((uintptr_t)(");
         emit_node(n.a);
         out(")) = ");
@@ -553,6 +619,24 @@ void emit_node(nd) {
             out("(long long)malloc(");
             if (cnt > 0) { emit_node(arr[0]); }
             out(")");
+            return;
+        }
+
+        // Built-in: malloc_aligned(size, align) -> C aligned_alloc(align, size).
+        // Note the argument order swap: the C standard takes alignment first,
+        // and the size must be a multiple of alignment, so we round it up.
+        if (emit_name_eq(name_p, "malloc_aligned", 14)) {
+            out("(long long)aligned_alloc((size_t)(");
+            if (cnt > 1) { emit_node(arr[1]); }
+            out("), (size_t)((((");
+            if (cnt > 0) { emit_node(arr[0]); }
+            out(") + (");
+            if (cnt > 1) { emit_node(arr[1]); }
+            out(") - 1) / (");
+            if (cnt > 1) { emit_node(arr[1]); }
+            out(") * (");
+            if (cnt > 1) { emit_node(arr[1]); }
+            out("))))");
             return;
         }
 
@@ -1011,6 +1095,15 @@ void emit_node(nd) {
         return;
     }
 
+    // T_BLOCK holds a statement array produced by parser-level DCE when
+    // a literal `if` condition collapses to its taken branch. Emit each
+    // child as a normal statement; no braces, since the parent context
+    // (function body, while body, etc.) already owns its own scope.
+    if (t == T_BLOCK) {
+        emit_body(n.b, n.c);
+        return;
+    }
+
     if (t == T_IF) {
         // Dead code elimination: let the C compiler handle it via if(0)/if(1).
         // No need to skip here — C optimizers eliminate dead branches.
@@ -1149,6 +1242,7 @@ is_libc_symbol(name_p) {
     if (emit_name_eq(name_p, "mmap", 4))          { return 1; }
     if (emit_name_eq(name_p, "munmap", 6))        { return 1; }
     if (emit_name_eq(name_p, "malloc", 6))        { return 1; }
+    if (emit_name_eq(name_p, "malloc_aligned", 14)) { return 1; }
     if (emit_name_eq(name_p, "free", 4))          { return 1; }
     if (emit_name_eq(name_p, "realloc", 7))       { return 1; }
     if (emit_name_eq(name_p, "memcpy", 6))        { return 1; }

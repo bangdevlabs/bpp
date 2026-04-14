@@ -40,8 +40,11 @@ auto funcs, func_cnt;
 auto fn_static;   // parallel to funcs[]: 1 if static (private to module)
 auto fn_void;     // parallel to funcs[]: 1 if void (no useful return)
 
-// Struct registry: 5 parallel dynamic arrays (name, fields ptr, field count, size, field hints).
+// Struct registry: 7 parallel dynamic arrays (name, fields ptr, field count, size, hints, byte offs, bit offs).
+// sd_byte_offs[i][j] = byte offset of field j in struct i (precomputed by add_struct_field).
+// sd_bit_offs[i][j]  = bit offset within that byte for bit-packed fields; 0 for byte+ fields.
 auto sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
+auto sd_byte_offs, sd_bit_offs;
 
 // Struct lookup acceleration. _parser_struct_hash maps a struct
 // name's byte sequence to (struct_idx + 1). Updated incrementally by
@@ -107,6 +110,8 @@ void init_parser() {
     sd_fcounts = arr_new();
     sd_sizes = arr_new();
     sd_fhints = arr_new();
+    sd_byte_offs = arr_new();
+    sd_bit_offs = arr_new();
     vt_names = arr_new();
     vt_sidx = arr_new();
     var_stack_names = arr_new();
@@ -151,36 +156,80 @@ add_struct_def(name_p) {
     sd_fcounts = arr_push(sd_fcounts, 0);
     sd_sizes = arr_push(sd_sizes, 0);
     sd_fhints = arr_push(sd_fhints, malloc(64 * 8));
+    // Per-field precomputed layout: byte and bit offsets, populated by add_struct_field.
+    sd_byte_offs = arr_push(sd_byte_offs, malloc(64 * 8));
+    sd_bit_offs = arr_push(sd_bit_offs, malloc(64 * 8));
     struct_mods = arr_push(struct_mods, tok_mod(tok_pos));
     idx = arr_len(sd_names) - 1;
     register_struct_hash(name_p, idx);
     return idx;
 }
 
-// Return the byte size of a field given its type hint.
-// Derives size from the slice component of the packed type.
-field_hint_size(hint) {
-    return slice_width(ty_slice(hint)) / 8;
+// Return the byte cost of a field given its type hint.
+// Bit-sliced fields return 0 because they share a byte with neighbours;
+// the actual byte placement is computed by add_struct_field's layout pass.
+field_hint_size(hint) : base {
+    auto sl;
+    sl = ty_slice(hint);
+    if (sl >= SL_BIT && sl <= SL_BIT7) { return 0; }
+    return slice_width(sl) / 8;
 }
 
 // Add a field to an existing struct with an optional type hint.
-// The hint determines the field's byte size for packed layout.
+// Recomputes the full layout each call so bit-packed fields stay coherent
+// with byte-aligned fields. Bit fields pack LSB-first within the current
+// byte; a byte+ field or an overflowing bit width starts a fresh byte.
 void add_struct_field(idx, field_p, hint) {
-    auto fields, hints, fc, sz;
+    auto fields, hints, byte_offs, bit_offs, fc;
+    auto j, h, sl, bw, byte_cur, bit_cur, total;
     fields = arr_get(sd_fields, idx);
     hints = arr_get(sd_fhints, idx);
+    byte_offs = arr_get(sd_byte_offs, idx);
+    bit_offs = arr_get(sd_bit_offs, idx);
     fc = arr_get(sd_fcounts, idx);
     fields[fc] = field_p;
     hints[fc] = hint;
     fc = fc + 1;
-    // Recompute total size by summing all field sizes.
-    sz = 0;
-    auto j;
+
+    // Layout pass: walk every field and assign (byte, bit) offsets.
+    byte_cur = 0;
+    bit_cur = 0;
     for (j = 0; j < fc; j = j + 1) {
-        sz = sz + field_hint_size(hints[j]);
+        h = hints[j];
+        sl = ty_slice(h);
+        if (sl >= SL_BIT && sl <= SL_BIT7) {
+            // Bit-packed field — places into the current byte if it fits,
+            // otherwise rolls onto a fresh one. Width is encoded as sl - 3.
+            bw = sl - 3;
+            if (bit_cur + bw > 8) {
+                byte_cur = byte_cur + 1;
+                bit_cur = 0;
+            }
+            byte_offs[j] = byte_cur;
+            bit_offs[j] = bit_cur;
+            bit_cur = bit_cur + bw;
+            if (bit_cur == 8) {
+                byte_cur = byte_cur + 1;
+                bit_cur = 0;
+            }
+        } else {
+            // Byte+ field (including future SL_DOUBLE) — flush any in-flight
+            // bit packing first so this field starts on a fresh byte.
+            if (bit_cur > 0) {
+                byte_cur = byte_cur + 1;
+                bit_cur = 0;
+            }
+            byte_offs[j] = byte_cur;
+            bit_offs[j] = 0;
+            byte_cur = byte_cur + slice_width(sl) / 8;
+        }
     }
+    // Total size: round up if any bit packing is still in flight.
+    total = byte_cur;
+    if (bit_cur > 0) { total = total + 1; }
+
     arr_set(sd_fcounts, idx, fc);
-    arr_set(sd_sizes, idx, sz);
+    arr_set(sd_sizes, idx, total);
 }
 
 // Find a struct by name. O(1) hash lookup. The hash is kept in sync
@@ -195,18 +244,48 @@ find_struct(name_p) {
 }
 
 // Get the byte offset of a field within a struct. Returns -1 if not found.
-// Sums the byte sizes of all preceding fields using their type hints.
+// Reads the precomputed byte offset stored by add_struct_field's layout pass.
 static get_field_offset(idx, field_p) {
-    auto fields, hints, fc, i, off;
+    auto fields, byte_offs, fc, i;
+    fields = arr_get(sd_fields, idx);
+    byte_offs = arr_get(sd_byte_offs, idx);
+    fc = arr_get(sd_fcounts, idx);
+    for (i = 0; i < fc; i = i + 1) {
+        if (packed_eq(fields[i], field_p)) { return byte_offs[i]; }
+    }
+    return -1;
+}
+
+// Get the bit offset of a bit-packed field within its byte. Returns 0 for
+// byte-aligned fields and unknown fields. Codegen calls this only when the
+// field's slice is SL_BIT..SL_BIT7.
+get_field_bit_off(idx, field_p) {
+    auto fields, bit_offs, fc, i;
+    fields = arr_get(sd_fields, idx);
+    bit_offs = arr_get(sd_bit_offs, idx);
+    fc = arr_get(sd_fcounts, idx);
+    for (i = 0; i < fc; i = i + 1) {
+        if (packed_eq(fields[i], field_p)) { return bit_offs[i]; }
+    }
+    return 0;
+}
+
+// Get the bit width (1..7) of a bit-packed field. Returns 0 for byte+ fields.
+// Convenience wrapper so codegen does not need to derive the width from the
+// slice ordinal itself.
+get_field_bit_width(idx, field_p) {
+    auto fields, hints, fc, i, sl;
     fields = arr_get(sd_fields, idx);
     hints = arr_get(sd_fhints, idx);
     fc = arr_get(sd_fcounts, idx);
-    off = 0;
     for (i = 0; i < fc; i = i + 1) {
-        if (packed_eq(fields[i], field_p)) { return off; }
-        off = off + field_hint_size(hints[i]);
+        if (packed_eq(fields[i], field_p)) {
+            sl = ty_slice(hints[i]);
+            if (sl >= SL_BIT && sl <= SL_BIT7) { return sl - 3; }
+            return 0;
+        }
     }
-    return -1;
+    return 0;
 }
 
 // Get the type hint of a specific field by index.
@@ -315,6 +394,55 @@ static parse_lit_int() {
 // ============================================================
 // AST helper: integer literal and operator construction
 // ============================================================
+
+// Parse a packed integer literal (decimal or hex) into its numeric value.
+// String and float literals must be filtered out by the caller — this
+// helper assumes the input is already known to be an integer literal.
+static parse_int_lit_value(p) {
+    auto s, l, i, ch, val, is_hex;
+    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
+    is_hex = 0;
+    if (l > 2) {
+        if (peek(vbuf + s) == '0') {
+            if (peek(vbuf + s + 1) == 'x') { is_hex = 1; i = 2; }
+        }
+    }
+    if (is_hex) {
+        while (i < l) {
+            ch = peek(vbuf + s + i);
+            if (ch >= '0' && ch <= '9') { val = val * 16 + ch - '0'; }
+            else if (ch >= 'a' && ch <= 'f') { val = val * 16 + ch - 'a' + 10; }
+            else if (ch >= 'A' && ch <= 'F') { val = val * 16 + ch - 'A' + 10; }
+            i = i + 1;
+        }
+    } else {
+        while (i < l) {
+            ch = peek(vbuf + s + i);
+            if (ch >= '0' && ch <= '9') { val = val * 10 + ch - '0'; }
+            i = i + 1;
+        }
+    }
+    return val;
+}
+
+// Check whether an AST node is a pure integer literal suitable for
+// compile-time folding. String literals (start with '"') and float
+// literals (contain '.') return 0 so the folder skips them.
+static is_int_lit_node(node_p) {
+    auto n: Node, s, l, i, ch;
+    n = node_p;
+    if (n.ntype != T_LIT) { return 0; }
+    s = unpack_s(n.a);
+    l = unpack_l(n.a);
+    if (l == 0) { return 0; }
+    if (peek(vbuf + s) == '"') { return 0; }
+    i = 0;
+    while (i < l) {
+        if (peek(vbuf + s + i) == '.') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
 
 // Create a literal AST node holding an integer value.
 // For negative values, wraps in a T_UNARY('-') node so codegen handles it.
@@ -512,6 +640,12 @@ static void try_type_annotation(var_p) {
                 consume();
                 return;
             }
+            // Single-bit field hint: `: bit`.
+            if (buf_eq(ts, "bit", 3)) {
+                _prim_hint = TY_WORD_BIT;
+                consume();
+                return;
+            }
         }
         if (tl == 4) {
             if (buf_eq(ts, "half", 4)) {
@@ -533,6 +667,13 @@ static void try_type_annotation(var_p) {
                 consume();
                 return;
             }
+            // Multi-bit field hints: `: bit2` .. `: bit7`.
+            if (buf_eq(ts, "bit2", 4)) { _prim_hint = TY_WORD_BIT2; consume(); return; }
+            if (buf_eq(ts, "bit3", 4)) { _prim_hint = TY_WORD_BIT3; consume(); return; }
+            if (buf_eq(ts, "bit4", 4)) { _prim_hint = TY_WORD_BIT4; consume(); return; }
+            if (buf_eq(ts, "bit5", 4)) { _prim_hint = TY_WORD_BIT5; consume(); return; }
+            if (buf_eq(ts, "bit6", 4)) { _prim_hint = TY_WORD_BIT6; consume(); return; }
+            if (buf_eq(ts, "bit7", 4)) { _prim_hint = TY_WORD_BIT7; consume(); return; }
         }
         if (tl == 7) {
             if (buf_eq(ts, "quarter", 7)) {
@@ -1291,24 +1432,37 @@ static parse_if() {
     body_cnt = last_list_cnt;
     else_arr = 0;
     else_cnt = 0;
-    if (peek_type() == TK_KW) {
-        if (val_is("else", 4)) {
-            consume();
-            // "else if" sugar: parse the inner if directly as a single-statement else body.
-            if (peek_type() == TK_KW) {
-                if (val_is("if", 2)) {
-                    else_arr = malloc(8);
-                    *(else_arr) = parse_if();
-                    else_cnt = 1;
-                } else {
-                    else_arr = parse_body();
-                    else_cnt = last_list_cnt;
-                }
-            } else {
-                else_arr = parse_body();
-                else_cnt = last_list_cnt;
-            }
+    if (peek_type() == TK_KW && val_is("else", 4)) {
+        consume();
+        // "else if" sugar: parse the inner if directly as a single-statement else body.
+        if (peek_type() == TK_KW && val_is("if", 2)) {
+            else_arr = malloc(8);
+            *(else_arr) = parse_if();
+            else_cnt = 1;
+        } else {
+            else_arr = parse_body();
+            else_cnt = last_list_cnt;
         }
+    }
+    // Dead code elimination: when the condition is a compile-time integer
+    // literal, collapse the `if` to the taken branch wrapped in T_BLOCK.
+    // Backends never see the dead branch. A missing else on `if (0)` just
+    // produces T_NOP.
+    if (is_int_lit_node(cond)) {
+        auto lit_n: Node, lit_val;
+        lit_n = cond;
+        lit_val = parse_int_lit_value(lit_n.a);
+        if (lit_val == 0) {
+            if (else_cnt == 0) { return make_node(T_NOP); }
+            node = make_node(T_BLOCK);
+            node.b = else_arr;
+            node.c = else_cnt;
+            return node;
+        }
+        node = make_node(T_BLOCK);
+        node.b = body_arr;
+        node.c = body_cnt;
+        return node;
     }
     node = make_node(T_IF);
     node.a = cond;
@@ -1322,16 +1476,26 @@ static parse_if() {
 // Parse a while loop, with optional dispatch hint (@seq, @par, @gpu).
 // node.e (offset 40) is left at 0 — only for-loops use it for the step.
 static parse_while(hint_p) {
-    auto cond, body_arr, node: Node;
+    auto cond, body_arr, body_cnt, node: Node;
     consume();
     consume();
     cond = parse_expr();
     consume();
     body_arr = parse_body();
+    body_cnt = last_list_cnt;
+    // Dead code elimination: `while (0) { body }` never runs — drop it.
+    // `while (1)` is a legitimate infinite loop (game loops, REPLs) so
+    // that case stays as-is and the body emits normally.
+    if (is_int_lit_node(cond)) {
+        auto lit_n: Node, lit_val;
+        lit_n = cond;
+        lit_val = parse_int_lit_value(lit_n.a);
+        if (lit_val == 0) { return make_node(T_NOP); }
+    }
     node = make_node(T_WHILE);
     node.a = cond;
     node.b = body_arr;
-    node.c = last_list_cnt;
+    node.c = body_cnt;
     node.d = hint_p;
     node.e = 0;
     return node;
@@ -1621,9 +1785,43 @@ static get_op_prec() {
     return -1;
 }
 
+// Wrap an expression with a ternary tail when `?` follows it. Right-associative
+// so `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`. Called by parse_expr
+// after parse_binops so that `?:` sits below all binary operators in precedence.
+static maybe_ternary(cond) {
+    auto then_e, else_e, node: Node;
+    if (val_is_ch('?') == 0) { return cond; }
+    consume();
+    then_e = parse_expr();
+    if (val_is_ch(':') == 0) {
+        diag_fatal(106);
+        diag_str("expected ':' to separate ternary branches");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_help("ternary syntax is `cond ? then_value : else_value`");
+        sys_exit(1);
+    }
+    consume();
+    else_e = parse_expr();
+    node = make_node(T_TERNARY);
+    node.a = cond;
+    node.b = then_e;
+    node.c = else_e;
+    return node;
+}
+
 // Parse binary operators using precedence climbing (Pratt-style).
+// Performs two canonical rewrites before constructing the node:
+//   1. Constant folding: `lit op lit` → single literal with the result.
+//   2. Short-circuit lowering: `a && b` and `a || b` become T_TERNARY
+//      so every backend honours short-circuit semantics identically.
+// Backends therefore never see `&&` / `||` operators and never need to
+// fold integer constants themselves — both responsibilities live here.
 static parse_binops(left, min_prec) {
     auto prec, op_p, right, node: Node;
+    auto op_s, op_l, c0, c1;
+    auto lv, rv, folded, fold_ok;
     while (get_op_prec() >= min_prec) {
         prec = get_op_prec();
         op_p = cur_packed();
@@ -1632,11 +1830,61 @@ static parse_binops(left, min_prec) {
         while (get_op_prec() > prec) {
             right = parse_binops(right, get_op_prec());
         }
-        node = make_node(T_BINOP);
-        node.a = op_p;
-        node.b = left;
-        node.c = right;
-        left = node;
+        op_s = unpack_s(op_p);
+        op_l = unpack_l(op_p);
+        c0 = peek(vbuf + op_s);
+        c1 = 0;
+        if (op_l > 1) { c1 = peek(vbuf + op_s + 1); }
+
+        // Constant folding when both operands are integer literals.
+        fold_ok = 0;
+        folded = 0;
+        if (is_int_lit_node(left) && is_int_lit_node(right)) {
+            auto left_n: Node, right_n: Node;
+            left_n = left;
+            right_n = right;
+            lv = parse_int_lit_value(left_n.a);
+            rv = parse_int_lit_value(right_n.a);
+            fold_ok = 1;
+            if (op_l == 1) {
+                switch (c0) {
+                    '+' { folded = lv + rv; }
+                    '-' { folded = lv - rv; }
+                    '*' { folded = lv * rv; }
+                    '/' { if (rv == 0) { fold_ok = 0; } else { folded = lv / rv; } }
+                    '%' { if (rv == 0) { fold_ok = 0; } else { folded = lv % rv; } }
+                    '&' { folded = lv & rv; }
+                    '|' { folded = lv | rv; }
+                    '^' { folded = lv ^ rv; }
+                    else { fold_ok = 0; }
+                }
+            } else if (op_l == 2 && c0 == '<' && c1 == '<') { folded = lv << rv; }
+            else if (op_l == 2 && c0 == '>' && c1 == '>') { folded = lv >> rv; }
+            else { fold_ok = 0; }
+        }
+
+        if (fold_ok) {
+            left = make_int_lit(folded);
+        } else if (op_l == 2 && c0 == c1 && (c0 == '&' || c0 == '|')) {
+            // Short-circuit lowering: `a && b` → cond=a, then=b, else=0
+            //                         `a || b` → cond=a, then=1, else=b
+            node = make_node(T_TERNARY);
+            node.a = left;
+            if (c0 == '&') {
+                node.b = right;
+                node.c = make_int_lit(0);
+            } else {
+                node.b = make_int_lit(1);
+                node.c = right;
+            }
+            left = node;
+        } else {
+            node = make_node(T_BINOP);
+            node.a = op_p;
+            node.b = left;
+            node.c = right;
+            left = node;
+        }
     }
     return left;
 }
@@ -1705,6 +1953,15 @@ static resolve_dot(base_node, name_p) {
         fi = get_field_index(vtype, field_p);
         fhint = 0;
         if (fi >= 0) { fhint = get_field_hint(vtype, fi); }
+        // Bit-packed fields carry their bit-within-byte offset in bits 8-10
+        // of the hint word. The codegen decodes it only when the slice is
+        // SL_BIT..SL_BIT7; byte+ paths see the hint exactly as before.
+        auto fsl, fbo;
+        fsl = ty_slice(fhint);
+        if (fsl >= SL_BIT && fsl <= SL_BIT7) {
+            fbo = get_field_bit_off(vtype, field_p);
+            fhint = fhint + fbo * 256;
+        }
         // Build: mem_load(ptr: binop(base + offset), hint: fhint)
         plus_op = make_plus_op();
         off_node = make_int_lit(offset);
@@ -1738,22 +1995,22 @@ static parse_expr() {
             }
             left = make_node(T_MEMLD);
             left.a = deref;
-            return parse_binops(left, 0);
+            return maybe_ternary(parse_binops(left, 0));
         }
         // Unary minus at expression start.
         if (val_is_ch('-')) {
             left = parse_unary();
-            return parse_binops(left, 0);
+            return maybe_ternary(parse_binops(left, 0));
         }
         // Bitwise NOT at expression start.
         if (val_is_ch('~')) {
             left = parse_unary();
-            return parse_binops(left, 0);
+            return maybe_ternary(parse_binops(left, 0));
         }
         // Address-of at expression start.
         if (val_is_ch('&')) {
             left = parse_unary();
-            return parse_binops(left, 0);
+            return maybe_ternary(parse_binops(left, 0));
         }
     }
     left = parse_primary();
@@ -1774,7 +2031,7 @@ static parse_expr() {
         node.b = parse_expr();
         return node;
     }
-    return parse_binops(left, 0);
+    return maybe_ternary(parse_binops(left, 0));
 }
 
 // Parse a primary expression: literal, variable, call, sizeof, or parenthesized.

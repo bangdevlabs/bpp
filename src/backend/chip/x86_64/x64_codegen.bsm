@@ -320,6 +320,7 @@ x64_is_float_lit(p) {
     return 0;
 }
 
+
 // ── Type query helpers ─────────────────────────────────────
 
 // An explicit integer type hint (: int, : byte, : half, : quarter) overrides
@@ -662,11 +663,40 @@ x64_emit_node(nd) {
         return 0;
     }
 
+    // Conditional expression `cond ? then : else`. Short-circuit by contract:
+    // ONLY the selected branch evaluates. Also the lowering target for `&&`
+    // and `||` (parser rewrites them so backends never see those operators).
+    if (t == T_TERNARY) {
+        auto lbl_else, lbl_done, ety_then;
+        ety = x64_emit_node(n.a);
+        // Normalize float condition to an integer truth value so jz works.
+        if (ety == 1) {
+            x64_enc_xorpd(1, 1);
+            x64_enc_ucomisd(0, 1);
+            x64_enc_setcc(CC_NE, 0);
+            x64_enc_movzx8(0, 0);
+        }
+        lbl_else = x64_enc_new_label();
+        lbl_done = x64_enc_new_label();
+        x64_enc_test_reg(0, 0);
+        x64_enc_jcc_label(CC_E, lbl_else);
+        ety_then = x64_emit_node(n.b);
+        x64_enc_jmp_label(lbl_done);
+        x64_enc_def_label(lbl_else);
+        x64_emit_node(n.c);
+        x64_enc_def_label(lbl_done);
+        // Branches must agree on result type; trust the parser to enforce.
+        return ety_then;
+    }
+
     // ── Binary operation ──
     if (t == T_BINOP) {
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         c0 = peek(x64_sbuf + op_s);
         c1 = 0; if (op_l > 1) { c1 = peek(x64_sbuf + op_s + 1); }
+
+        // Constant folding lives in the parser — by the time a T_BINOP
+        // reaches codegen, at least one operand is guaranteed non-literal.
 
         // Check if operator is integer-only.
         is_io = 0;
@@ -721,28 +751,8 @@ x64_emit_node(nd) {
                 if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_A, 0); x64_enc_movzx8(0, 0); return 0; }
             }
 
-            // Float logical && ||: compare each side against zero.
-            if (c0 == '&') { if (c1 == '&') {
-                x64_enc_xorpd(2, 2);
-                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
-                x64_enc_ucomisd(0, 2); // Wait, XMM0 is the right operand. Let me restructure.
-                // Actually XMM0 = right, XMM1 = left, XMM2 = 0.0.
-                // Test left != 0: UCOMISD XMM1, XMM2.
-                // Test right != 0: UCOMISD XMM0, XMM2.
-                // Combine with AND.
-                x64_enc_xorpd(2, 2);
-                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 10); x64_enc_movzx8(10, 10);
-                x64_enc_ucomisd(0, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
-                x64_enc_and_reg(0, 10);
-                return 0;
-            } }
-            if (c0 == '|') { if (c1 == '|') {
-                x64_enc_xorpd(2, 2);
-                x64_enc_ucomisd(1, 2); x64_enc_setcc(CC_NE, 10); x64_enc_movzx8(10, 10);
-                x64_enc_ucomisd(0, 2); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
-                x64_enc_or_reg(0, 10);
-                return 0;
-            } }
+            // && and || removed from T_BINOP — parser lowers them to
+            // T_TERNARY which carries the short-circuit contract directly.
             return 1;
         }
 
@@ -786,19 +796,8 @@ x64_emit_node(nd) {
             if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_G, 0); x64_enc_movzx8(0, 0); return 0; }
         }
 
-        // Logical operators.
-        if (c0 == '&') { if (c1 == '&') {
-            x64_enc_test_reg(0, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
-            x64_enc_test_reg(1, 1); x64_enc_setcc(CC_NE, 1); x64_enc_movzx8(1, 1);
-            x64_enc_and_reg(0, 1);
-            return 0;
-        } }
-        if (c0 == '|') { if (c1 == '|') {
-            x64_enc_test_reg(0, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0);
-            x64_enc_test_reg(1, 1); x64_enc_setcc(CC_NE, 1); x64_enc_movzx8(1, 1);
-            x64_enc_or_reg(0, 1);
-            return 0;
-        } }
+        // && and || removed from T_BINOP — parser lowers them to T_TERNARY
+        // (see parse_binops in bpp_parser.bsm).
         return 0;
     }
 
@@ -1351,13 +1350,26 @@ x64_emit_node(nd) {
     // ── Memory load: *(ptr) ──
     // mem_load: *(ptr) — n.b holds field type hint for packed structs.
     if (t == T_MEMLD) {
-        auto fh;
+        auto fh, sl, bo, bw, mask;
         fh = n.b;
         ety = x64_emit_node(n.a);
         if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
-        if (ty_slice(fh) == SL_BYTE) { x64_enc_loadb(0, 0, 0); }
-        else if (ty_slice(fh) == SL_QUARTER) { x64_enc_loadh(0, 0, 0); }
-        else if (ty_slice(fh) == SL_HALF) { x64_enc_load_sw(0, 0, 0); }
+        sl = ty_slice(fh);
+        // Bit-packed fields: load the containing byte, shift the field down to
+        // bit 0, mask off the high bits. The bit offset within the byte is
+        // encoded in bits 8-10 of the hint by resolve_dot.
+        if (sl >= SL_BIT && sl <= SL_BIT7) {
+            bo = (fh / 256) & 7;
+            bw = sl - 3;
+            mask = (1 << bw) - 1;
+            x64_enc_loadb(0, 0, 0);
+            if (bo > 0) { x64_enc_shr_imm(0, bo); }
+            x64_enc_and_imm(0, mask);
+            return 0;
+        }
+        if (sl == SL_BYTE) { x64_enc_loadb(0, 0, 0); }
+        else if (sl == SL_QUARTER) { x64_enc_loadh(0, 0, 0); }
+        else if (sl == SL_HALF) { x64_enc_load_sw(0, 0, 0); }
         else { x64_enc_load(0, 0, 0); }
         return 0;
     }
@@ -1422,7 +1434,7 @@ x64_emit_stmt(nd) {
                     off = arr_get(x64_var_off, vi);
                     auto fc, j, sidx;
                     sidx = arr_get(x64_var_struct_idx, vi);
-                    fc = get_struct_size(sidx) / 8;
+                    fc = (get_struct_size(sidx) + 7) / 8;
                     j = 0;
                     while (j < fc) {
                         x64_enc_load(10, 0, j * 8);
@@ -1461,35 +1473,42 @@ x64_emit_stmt(nd) {
 
     // Memory store: *(ptr) = val. n.c holds field type hint for packed structs.
     if (t == T_MEMST) {
-        auto fh;
+        auto fh, sl, bo, bw, mask, clear_mask;
         fh = n.c;
         ety = x64_emit_node(n.b);
         if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
         x64_emit_push();
         x64_emit_node(n.a);
         x64_emit_pop(1);
-        if (ty_slice(fh) == SL_BYTE) { x64_enc_storeb(1, 0, 0); }
-        else if (ty_slice(fh) == SL_QUARTER) { x64_enc_storeh(1, 0, 0); }
-        else if (ty_slice(fh) == SL_HALF) { x64_enc_store_w(1, 0, 0); }
+        sl = ty_slice(fh);
+        // Bit-packed field stores: load the containing byte into rdx, clear
+        // the destination field bits, shift the source value into position,
+        // OR them together, store the byte back. rax holds the pointer and
+        // rcx holds the source value after the pop.
+        if (sl >= SL_BIT && sl <= SL_BIT7) {
+            bo = (fh / 256) & 7;
+            bw = sl - 3;
+            mask = (1 << bw) - 1;
+            clear_mask = 255 ^ (mask << bo);
+            x64_enc_loadb(2, 0, 0);
+            x64_enc_and_imm(2, clear_mask);
+            x64_enc_and_imm(1, mask);
+            if (bo > 0) { x64_enc_shl_imm(1, bo); }
+            x64_enc_or_reg(2, 1);
+            x64_enc_storeb(2, 0, 0);
+            return 0;
+        }
+        if (sl == SL_BYTE) { x64_enc_storeb(1, 0, 0); }
+        else if (sl == SL_QUARTER) { x64_enc_storeh(1, 0, 0); }
+        else if (sl == SL_HALF) { x64_enc_store_w(1, 0, 0); }
         else { x64_enc_store(1, 0, 0); }
         return 0;
     }
 
     if (t == T_IF) {
-        // Dead code elimination: compile-time literal condition.
-        // Typed Node access — raw offsets do not work with sliced layouts.
-        auto cond_node: Node;
-        cond_node = n.a;
-        if (cond_node.ntype == T_LIT) {
-            auto cond_val;
-            cond_val = x64_parse_int(cond_node.a);
-            if (cond_val == 0) {
-                if (n.e > 0) { x64_emit_body(n.d, n.e); }
-            } else {
-                x64_emit_body(n.b, n.c);
-            }
-            return 0;
-        }
+        // Literal-condition DCE lives in the parser (parse_if rewrites
+        // `if (literal)` to T_BLOCK of the taken branch) — by the time a
+        // T_IF reaches here, the condition is a runtime value.
         lbl = x64_enc_new_label();
         lbl2 = x64_enc_new_label();
         ety = x64_emit_node(n.a);
@@ -1643,6 +1662,11 @@ x64_emit_stmt(nd) {
 
     if (t == T_NOP) { return 0; }
 
+    // T_BLOCK holds a statement array produced by parser-level DCE when a
+    // literal `if` condition collapses to its taken branch. Emit each
+    // child as a normal statement — there is no header or terminator.
+    if (t == T_BLOCK) { x64_emit_body(n.b, n.c); return 0; }
+
     // Expression statement.
     x64_emit_node(nd);
     return 0;
@@ -1687,7 +1711,9 @@ x64_emit_func(fi) {
     i = 0;
     while (i < arr_len(x64_vars)) {
         if (arr_get(x64_var_stack, i)) {
-            sz = get_struct_size(arr_get(x64_var_struct_idx, i));
+            // Round struct slot up to a multiple of 8 so the 8-byte chunked
+            // copy never spills into the next variable's storage.
+            sz = (get_struct_size(arr_get(x64_var_struct_idx, i)) + 7) / 8 * 8;
         } else {
             sz = 8;
         }

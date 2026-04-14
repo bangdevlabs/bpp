@@ -39,21 +39,42 @@ extrn T_LIT, T_VAR, T_BINOP, T_UNARY, T_ASSIGN;
 extrn T_MEMLD, T_MEMST, T_CALL, T_IF, T_WHILE, T_RET, T_DECL, T_NOP, T_BREAK, T_ADDR;
 extrn T_CONTINUE;
 extrn T_SWITCH;
+// T_TERNARY is the conditional expression `cond ? a : b`. Backends MUST
+// emit short-circuit code: only the selected branch evaluates. This is
+// the canonical lowering target for `&&` and `||` (parser rewrites them
+// here so backends never see the operators directly).
+extrn T_TERNARY;
+// T_BLOCK wraps a statement array (.b = arr, .c = cnt) into a single
+// node. The parser emits it when DCE collapses a branch with a literal
+// condition (e.g. `if (0) { ... } else { body }` becomes T_BLOCK(body)).
+// Backends emit each child statement in sequence — no conditional.
+extrn T_BLOCK;
 
 // Token type codes (lexer output categories)
 extrn TK_KW, TK_IMP, TK_ID, TK_NUM, TK_HEX, TK_STR, TK_OP, TK_PUNCT;
 
-// Type system: base × slice, packed into a single byte.
-// Base (bits 0-3), slice (bits 4-5), bits 6-7 free.
-// Bit 0 = float flag: FLOAT bases have bit 0 set, all others clear.
+// Type system: base × slice, packed into the low byte of a 64-bit word.
+// Base (bits 0-3): 16 slots; bit 0 = float flag.
+// Slice (bits 4-7): 16 slots; current ladder uses 12, slots 12-15 reserved.
+// Bits 8-63 of the type word remain free if a future expansion needs more.
 // Compose with ty_make(base, slice), decompose with ty_base(ty) / ty_slice(ty).
+//
+// Slice ladder (low to high width):
+//   SL_BIT (1) .. SL_BIT7 (7)  — bit-packed sub-byte slices (Phase A1)
+//   SL_BYTE (8) | SL_QUARTER (16) | SL_HALF (32) | SL_FULL (64)
+//   SL_DOUBLE (128)            — reserved for Phase B4 (NEON / SSE SIMD)
 extrn BASE_UNKNOWN, BASE_WORD, BASE_FLOAT, BASE_PTR, BASE_STRUCT;
 extrn SL_FULL, SL_HALF, SL_QUARTER, SL_BYTE;
+extrn SL_BIT, SL_BIT2, SL_BIT3, SL_BIT4, SL_BIT5, SL_BIT6, SL_BIT7;
+extrn SL_DOUBLE;
 
-// 11 real type constants: WORD and FLOAT × 4 slices + PTR + STRUCT + UNK.
+// 18 real type constants: WORD and FLOAT × 4 byte+ slices + 7 bit slices on WORD + PTR + STRUCT + UNK.
+// SL_DOUBLE-tagged TY_* codes are introduced by Phase B4.
 extrn TY_UNK;
 extrn TY_WORD,  TY_WORD_H,  TY_WORD_Q,  TY_WORD_B;
 extrn TY_FLOAT, TY_FLOAT_H, TY_FLOAT_Q, TY_FLOAT_B;
+extrn TY_WORD_BIT, TY_WORD_BIT2, TY_WORD_BIT3, TY_WORD_BIT4;
+extrn TY_WORD_BIT5, TY_WORD_BIT6, TY_WORD_BIT7;
 extrn TY_PTR, TY_STRUCT;
 
 // Top-level variable storage class. Stored per-global in glob_class[],
@@ -116,6 +137,8 @@ void init_defs() {
     T_RET = 10; T_DECL = 11; T_NOP = 12; T_BREAK = 13; T_ADDR = 14;
     T_CONTINUE = 15;
     T_SWITCH = 16;
+    T_TERNARY = 17;
+    T_BLOCK = 18;
 
     GLOB_AUTO = 0; GLOB_GLOBAL = 1; GLOB_EXTRN = 2;
 
@@ -125,13 +148,22 @@ void init_defs() {
     // Base type codes (lower nibble). Bit 0 = float flag.
     BASE_WORD = 0x02; BASE_FLOAT = 0x03; BASE_PTR = 0x04; BASE_STRUCT = 0x08; BASE_UNKNOWN = 0x0C;
 
-    // Slice codes (bits 4-5, stored as value × 16).
+    // Slice codes (bits 4-7, stored as value × 16).
+    // 0-3: byte+ slices (full / half / quarter / byte).
     SL_FULL = 0; SL_HALF = 1; SL_QUARTER = 2; SL_BYTE = 3;
+    // 4-10: bit-packed sub-byte slices, value = bit width.
+    SL_BIT = 4; SL_BIT2 = 5; SL_BIT3 = 6; SL_BIT4 = 7;
+    SL_BIT5 = 8; SL_BIT6 = 9; SL_BIT7 = 10;
+    // 11: reserved for Phase B4 (128-bit SIMD slice).
+    SL_DOUBLE = 11;
+    // 12-15: free for future use.
 
-    // 11 real types: base + slice × 16.
+    // Type codes: base + slice × 16. Bit slices on WORD only — float bitfields are not a thing.
     TY_UNK    = 0x0C;
     TY_WORD   = 0x02; TY_WORD_H  = 0x12; TY_WORD_Q  = 0x22; TY_WORD_B  = 0x32;
     TY_FLOAT  = 0x03; TY_FLOAT_H = 0x13; TY_FLOAT_Q = 0x23; TY_FLOAT_B = 0x33;
+    TY_WORD_BIT  = 0x42; TY_WORD_BIT2 = 0x52; TY_WORD_BIT3 = 0x62; TY_WORD_BIT4 = 0x72;
+    TY_WORD_BIT5 = 0x82; TY_WORD_BIT6 = 0x92; TY_WORD_BIT7 = 0xA2;
     TY_PTR    = 0x04;
     TY_STRUCT = 0x08;
 }
@@ -139,8 +171,8 @@ void init_defs() {
 // Extract the base type from a packed type code.
 ty_base(ty) : base { return ty & 0xF; }
 
-// Extract the slice from a packed type code (bits 4-5).
-ty_slice(ty) : base { return (ty / 16) & 0x3; }
+// Extract the slice from a packed type code (bits 4-7).
+ty_slice(ty) : base { return (ty / 16) & 0xF; }
 
 // Compose a type from base and slice components.
 ty_make(base, slice) : base { return base + slice * 16; }
@@ -149,11 +181,15 @@ ty_make(base, slice) : base { return base + slice * 16; }
 is_float_type(ty) : base { return ty & 1; }
 
 // Return the bit width for a slice code.
+// Bit slices (SL_BIT..SL_BIT7) carry their width directly: SL_BIT - 3 == 1, SL_BIT7 - 3 == 7.
 slice_width(sl) : base {
     if (sl == SL_FULL) { return 64; }
     if (sl == SL_HALF) { return 32; }
     if (sl == SL_QUARTER) { return 16; }
-    return 8;
+    if (sl == SL_BYTE) { return 8; }
+    if (sl == SL_DOUBLE) { return 128; }
+    // SL_BIT (4) .. SL_BIT7 (10) → width 1..7
+    return sl - 3;
 }
 
 // ── FFI type classification ──────────────────────────────
