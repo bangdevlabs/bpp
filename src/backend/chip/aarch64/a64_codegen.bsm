@@ -572,6 +572,162 @@ a64_emit_mov(val) {
     return 0;
 }
 
+// ── Switch jump-table analysis ───────────────────────────────
+//
+// A switch is eligible for jump-table emission when all arm values are
+// compile-time integer literals (T_LIT nodes) AND the range is dense
+// enough to make the table small. Results are stored in these globals
+// so callers read them without handling out-parameters.
+
+auto a64_sw_min;     // Lowest arm value seen (signed 64-bit).
+auto a64_sw_max;     // Highest arm value seen.
+auto a64_sw_total;   // Total count of arm values (across all arms).
+
+// Return 1 when the switch is eligible for a jump table, 0 otherwise.
+// On success, a64_sw_min/max/total hold the observed range and count.
+// Density rule: range (max - min) must be under 2 * total, and the
+// range must fit in 512 table entries — keeps worst-case table size
+// bounded (2 KB of code). Fewer than 3 distinct values use the plain
+// comparison chain — a branch table saves nothing at that size.
+static a64_switch_is_dense(sw_arms, sw_cnt) {
+    auto si, sk, sv_arr, sv_cnt, val, first, range;
+    auto node: Node;
+    first = 1;
+    a64_sw_min = 0;
+    a64_sw_max = 0;
+    a64_sw_total = 0;
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        sv_arr = sw_arms[si * 2];
+        sv_cnt = sw_arms[si * 2 + 1];
+        for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+            node = sv_arr[sk];
+            if (node.ntype != T_LIT) { return 0; }
+            val = a64_parse_int(node.a);
+            if (first) {
+                a64_sw_min = val;
+                a64_sw_max = val;
+                first = 0;
+            } else {
+                if (val < a64_sw_min) { a64_sw_min = val; }
+                if (val > a64_sw_max) { a64_sw_max = val; }
+            }
+            a64_sw_total = a64_sw_total + 1;
+        }
+    }
+    if (a64_sw_total < 3) { return 0; }
+    range = a64_sw_max - a64_sw_min;
+    if (range < 0) { return 0; }
+    if (range > 512) { return 0; }
+    if (range >= 2 * a64_sw_total) { return 0; }
+    return 1;
+}
+
+// Emit an ARM64 jump table for a dense Form-1 switch.
+// Layout:
+//   <cond eval + normalize + bounds check + adr + add + br>
+//   table_lbl:
+//     b arm_label_0
+//     b arm_label_1
+//     ... one slot per value in [min..max]; gaps target else.
+//   arm_label_0: body_0 + b sw_end
+//   arm_label_1: body_1 + b sw_end
+//   ...
+//   else_lbl: else_body
+//   sw_end_lbl:
+//
+// Saves O(N) comparison instructions per switch execution at the cost
+// of a single indirect branch plus (range+1) words of branch-table code.
+static void a64_emit_switch_jtbl(nd, sw_end_lbl) {
+    auto n: Node;
+    auto node: Node;
+    auto sw_arms, sw_bodies, sw_cnt, range;
+    auto arm_labels, else_lbl, table_lbl;
+    auto si, sk, sv_arr, sv_cnt, sb_arr, sb_cnt, i, target, val;
+
+    n = nd;
+    sw_arms = n.b;
+    sw_bodies = n.src_tok;
+    sw_cnt = n.c;
+    range = a64_sw_max - a64_sw_min;
+
+    // Allocate one match label per arm plus the else label.
+    arm_labels = malloc(sw_cnt * 8);
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        arm_labels[si] = enc_new_label();
+    }
+    else_lbl = enc_new_label();
+    table_lbl = enc_new_label();
+
+    // Evaluate condition into x0.
+    a64_emit_node(n.a);
+
+    // Normalize to 0-based index by subtracting min_val.
+    // Small positive min: 12-bit sub immediate; otherwise load via mov+sub.
+    if (a64_sw_min != 0) {
+        if (a64_sw_min > 0) {
+            if (a64_sw_min < 0x1000) {
+                enc_sub_imm(0, 0, a64_sw_min);
+            } else {
+                a64_emit_mov(a64_sw_min);
+                enc_sub_reg(0, 0, 0);
+            }
+        } else {
+            // Negative min: add |min| via load.
+            a64_emit_push();
+            a64_emit_mov(a64_sw_min);
+            enc_mov_reg(1, 0);
+            a64_emit_pop(0);
+            enc_sub_reg(0, 0, 1);
+        }
+    }
+
+    // Bounds check: x0 > range ? go to else (unsigned comparison catches
+    // negatives too — they wrap to huge unsigned values).
+    enc_cmp_imm(0, range);
+    enc_b_cond_label(8, else_lbl);  // B.HI = unsigned higher than
+
+    // Indirect branch: x1 = table_base + (x0 << 2); br x1.
+    enc_adr_label(1, table_lbl);
+    enc_add_reg_shift(1, 1, 0, 2);
+    enc_br(1);
+
+    // Emit the branch table: one `b` instruction per slot in [min..max].
+    enc_def_label(table_lbl);
+    for (i = 0; i <= range; i = i + 1) {
+        target = else_lbl;
+        for (si = 0; si < sw_cnt; si = si + 1) {
+            sv_arr = sw_arms[si * 2];
+            sv_cnt = sw_arms[si * 2 + 1];
+            for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                node = sv_arr[sk];
+                val = a64_parse_int(node.a);
+                if (val == a64_sw_min + i) { target = arm_labels[si]; }
+            }
+        }
+        enc_b_label(target);
+    }
+
+    // Emit arm bodies. Each body ends with a branch to sw_end.
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        enc_def_label(arm_labels[si]);
+        sb_arr = sw_bodies[si * 2];
+        sb_cnt = sw_bodies[si * 2 + 1];
+        for (sk = 0; sk < sb_cnt; sk = sk + 1) { a64_emit_stmt(sb_arr[sk]); }
+        enc_b_label(sw_end_lbl);
+    }
+
+    // Else body.
+    enc_def_label(else_lbl);
+    if (n.d != 0) {
+        auto ek;
+        for (ek = 0; ek < n.e; ek = ek + 1) { a64_emit_stmt(n.d[ek]); }
+    }
+
+    enc_def_label(sw_end_lbl);
+    free(arm_labels);
+    return;
+}
+
 // Push x0 onto the stack. Maintains 16-byte alignment.
 a64_emit_push() {
     if (a64_bin_mode) { enc_str_pre(0, 31, -16); } else { out("  str x0, [sp, #-16]!"); putchar('\n'); }
@@ -1708,11 +1864,13 @@ a64_emit_stmt(nd) {
     if (t == T_IF) {
         // Dead code elimination: if condition is a compile-time literal,
         // skip the branch entirely and emit only the taken path.
-        auto cond_node;
+        // Raw `*(cond + N)` does NOT respect sliced Node layout — must
+        // use typed access via `auto cond_node: Node`.
+        auto cond_node: Node;
         cond_node = n.a;
-        if (*(cond_node + 0) == T_LIT) {
+        if (cond_node.ntype == T_LIT) {
             auto cond_val;
-            cond_val = a64_parse_int(*(cond_node + 8));
+            cond_val = a64_parse_int(cond_node.a);
             if (cond_val == 0) {
                 // Condition is always false: emit only the else branch.
                 if (n.e > 0) { a64_emit_body(n.d, n.e); }
@@ -1859,6 +2017,14 @@ a64_emit_stmt(nd) {
         // Two forms:
         // Form 1 (n.a != 0): value dispatch — compare condition against each arm value
         // Form 2 (n.a == 0): condition dispatch — evaluate each arm as boolean
+        //
+        // Form 1 evaluates the condition expression ONCE and peeks it from
+        // the stack for each comparison. Previous implementation re-evaluated
+        // the condition per arm-value, turning N-arm switches into N function
+        // calls when the condition was e.g. get_token_type(node). Stack grows
+        // by 16 bytes (alignment); bodies use FP-relative addressing so the
+        // imbalance is invisible to them. Each match and the else fall-through
+        // pop the saved cond before running the body.
         auto sw_arms, sw_bodies, sw_cnt, sw_end_lbl;
         auto si, sv_arr, sv_cnt, sb_arr, sb_cnt, snext_lbl;
         sw_arms = n.b;
@@ -1866,6 +2032,22 @@ a64_emit_stmt(nd) {
         sw_cnt = n.c;
         if (a64_bin_mode) { sw_end_lbl = enc_new_label(); }
         else { sw_end_lbl = a64_new_lbl(); }
+
+        // Form 1 dense switches go through the jump-table path.
+        if (a64_bin_mode) {
+            if (n.a != 0) {
+                if (a64_switch_is_dense(sw_arms, sw_cnt)) {
+                    a64_emit_switch_jtbl(n, sw_end_lbl);
+                    return 0;
+                }
+            }
+        }
+
+        // Form 1: evaluate condition once, push.
+        if (n.a != 0) {
+            a64_emit_node(n.a);
+            a64_emit_push();
+        }
 
         for (si = 0; si < sw_cnt; si = si + 1) {
             sv_arr = sw_arms[si * 2];
@@ -1886,14 +2068,17 @@ a64_emit_stmt(nd) {
                 if (a64_bin_mode) { enc_cbnz_label(0, smatch_lbl); }
                 else { out("  cbnz x0, .L"); a64_print_dec(smatch_lbl); putchar('\n'); }
             } else {
-                // Form 1: value dispatch. Compare condition against each value.
+                // Form 1: compare condition (peeked from [sp]) against each value.
                 for (sk = 0; sk < sv_cnt; sk = sk + 1) {
-                    a64_emit_node(n.a);
-                    a64_emit_push();
                     a64_emit_node(sv_arr[sk]);
-                    a64_emit_pop(1);
-                    if (a64_bin_mode) { enc_cmp_reg(1, 0); enc_b_cond_label(0, smatch_lbl); }
-                    else { out("  cmp x1, x0"); putchar('\n'); out("  b.eq .L"); a64_print_dec(smatch_lbl); putchar('\n'); }
+                    if (a64_bin_mode) {
+                        enc_ldr_uoff(1, 31, 0);
+                        enc_cmp_reg(1, 0); enc_b_cond_label(0, smatch_lbl);
+                    } else {
+                        out("  ldr x1, [sp]"); putchar('\n');
+                        out("  cmp x1, x0"); putchar('\n');
+                        out("  b.eq .L"); a64_print_dec(smatch_lbl); putchar('\n');
+                    }
                 }
             }
             if (a64_bin_mode) { enc_b_label(snext_lbl); }
@@ -1901,6 +2086,8 @@ a64_emit_stmt(nd) {
 
             if (a64_bin_mode) { enc_def_label(smatch_lbl); }
             else { out(".L"); a64_print_dec(smatch_lbl); out(":"); putchar('\n'); }
+            // Pop saved cond before running the body (stack rebalance).
+            if (n.a != 0) { a64_emit_pop(9); }
             for (sk = 0; sk < sb_cnt; sk = sk + 1) { a64_emit_stmt(sb_arr[sk]); }
             if (a64_bin_mode) { enc_b_label(sw_end_lbl); }
             else { out("  b .L"); a64_print_dec(sw_end_lbl); putchar('\n'); }
@@ -1908,6 +2095,9 @@ a64_emit_stmt(nd) {
             if (a64_bin_mode) { enc_def_label(snext_lbl); }
             else { out(".L"); a64_print_dec(snext_lbl); out(":"); putchar('\n'); }
         }
+
+        // Fell through all arms — pop cond before else body or end.
+        if (n.a != 0) { a64_emit_pop(9); }
 
         if (n.d != 0) {
             auto ek;

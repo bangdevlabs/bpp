@@ -924,7 +924,7 @@ void emit_node(nd) {
 
         // Built-in: argv_get -> read argv[i] as a pointer value.
         if (emit_name_eq(name_p, "argv_get", 8)) {
-            out("((long long)_bpp_argv[(int)(");
+            out("((long long)((char**)(uintptr_t)_bpp_argv)[(int)(");
             if (cnt > 0) { emit_node(arr[0]); }
             out(")])");
             return;
@@ -938,7 +938,7 @@ void emit_node(nd) {
 
         // Built-in: envp_get -> read envp[i] as a pointer value.
         if (emit_name_eq(name_p, "envp_get", 8)) {
-            out("((long long)_bpp_envp[(int)(");
+            out("((long long)((char**)(uintptr_t)_bpp_envp)[(int)(");
             if (cnt > 0) { emit_node(arr[0]); }
             out(")])");
             return;
@@ -1060,28 +1060,50 @@ void emit_node(nd) {
     }
 
     if (t == T_SWITCH) {
-        // Emit as C if/else if chain (C switch needs break, simpler to emit as ifs).
+        // Form 1 (value dispatch) emits a real C switch statement so GCC
+        // can apply its own jump-table optimization. Each arm lists its
+        // values as fall-through `case` labels with an explicit break.
+        // Form 2 (condition dispatch) has no direct C equivalent and
+        // stays as an if/else-if chain.
         auto sw_arms, sw_bodies, sw_cnt, si, sk;
         auto sv_arr, sv_cnt, sb_arr, sb_cnt;
         sw_arms = n.b;
         sw_bodies = n.src_tok;
         sw_cnt = n.c;
+
+        if (n.a != 0) {
+            // Form 1 → C switch. Case labels must be integer constants,
+            // which B++ switch values always are in practice (literals
+            // or const-references that inline to literals).
+            out("switch ("); emit_node(n.a); out(") {\n");
+            for (si = 0; si < sw_cnt; si = si + 1) {
+                sv_arr = sw_arms[si * 2];
+                sv_cnt = sw_arms[si * 2 + 1];
+                sb_arr = sw_bodies[si * 2];
+                sb_cnt = sw_bodies[si * 2 + 1];
+                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                    out("case "); emit_node(sv_arr[sk]); out(": ");
+                }
+                out("{\n");
+                emit_body(sb_arr, sb_cnt);
+                out("break; }\n");
+            }
+            if (n.d != 0) {
+                out("default: {\n");
+                emit_body(n.d, n.e);
+                out("break; }\n");
+            }
+            out("}"); putchar('\n');
+            return;
+        }
+
+        // Form 2: condition dispatch — if/else-if chain.
         for (si = 0; si < sw_cnt; si = si + 1) {
             sv_arr = sw_arms[si * 2];
-            sv_cnt = sw_arms[si * 2 + 1];
             sb_arr = sw_bodies[si * 2];
             sb_cnt = sw_bodies[si * 2 + 1];
             if (si == 0) { out("if ("); } else { out("else if ("); }
-            if (n.a == 0) {
-                // Form 2: condition dispatch — emit condition directly.
-                emit_node(sv_arr[0]);
-            } else {
-                // Form 1: value dispatch — emit equality comparisons.
-                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
-                    if (sk > 0) { out(" || "); }
-                    out("("); emit_node(n.a); out(") == ("); emit_node(sv_arr[sk]); out(")");
-                }
-            }
+            emit_node(sv_arr[0]);
             out(") {\n");
             emit_body(sb_arr, sb_cnt);
             out("}");
@@ -1129,6 +1151,10 @@ is_libc_symbol(name_p) {
     if (emit_name_eq(name_p, "malloc", 6))        { return 1; }
     if (emit_name_eq(name_p, "free", 4))          { return 1; }
     if (emit_name_eq(name_p, "realloc", 7))       { return 1; }
+    if (emit_name_eq(name_p, "memcpy", 6))        { return 1; }
+    if (emit_name_eq(name_p, "getenv", 6))        { return 1; }
+    if (emit_name_eq(name_p, "putchar", 7))       { return 1; }
+    if (emit_name_eq(name_p, "getchar", 7))       { return 1; }
     if (emit_name_eq(name_p, "abort", 5))         { return 1; }
     return 0;
 }
@@ -1302,9 +1328,9 @@ void emit_mem_model() {
     out("#include <stdlib.h>"); putchar('\n');
     out("#include <string.h>"); putchar('\n');
     out("static uint8_t _bpp_scratch[16];"); putchar('\n');
-    out("static int _bpp_argc;"); putchar('\n');
-    out("static char** _bpp_argv;"); putchar('\n');
-    out("static char** _bpp_envp;"); putchar('\n');
+    // _bpp_argc/_bpp_argv/_bpp_envp are now declared in brt0.bsm as B++
+    // globals, so the C emitter produces them through the normal global
+    // emission path. The runtime only needs the scratch buffer here.
     // Float return slots. Populated after every FFI call whose declared
     // return type is a float/double, so that float_ret()/float_ret2()
     // builtins can read back the last value even when the call result
@@ -1356,9 +1382,11 @@ emit_get_par_hint(fi, j) {
 }
 
 // Emit forward declarations for all B++ functions.
+// Skips libc-colliding names for the same reason as emit_functions().
 void emit_forward_decls() {
     auto i, j, arr, cnt, rty, pty, pi;
     for (i = 0; i < fn_cnt; i = i + 1) {
+        if (is_libc_symbol(fn_name[i])) { continue; }
         pi = fn_fidx[i];
         rty = get_fn_ret_type(pi);
         if (rty == TY_UNK) { rty = TY_WORD; }
@@ -1394,6 +1422,13 @@ void emit_forward_decls() {
 void emit_functions() {
     auto i, j, arr, cnt, rty, pty, pi;
     for (i = 0; i < fn_cnt; i = i + 1) {
+        // Skip B++ function definitions that collide with libc symbols.
+        // The C emitter maps malloc/free/realloc/memcpy directly to libc
+        // (see the hardcoded builtin handlers) and is_libc_symbol() already
+        // filters externs — functions defined in B++ with the same name
+        // (from bmem.bsm / bpp_io.bsm) would produce a duplicate symbol
+        // at C link time. Skip the emission entirely for the C path.
+        if (is_libc_symbol(fn_name[i])) { continue; }
         pi = fn_fidx[i];
         cur_fn_idx = pi;
         rty = get_fn_ret_type(pi);
@@ -1438,9 +1473,9 @@ void emit_main_entry() {
         if (emit_name_eq(fn_name[i], "main", 4)) { has_main = 1; }
     }
     out("int main(int argc, char** argv, char** envp) {"); putchar('\n');
-    out("  _bpp_argc = argc;"); putchar('\n');
-    out("  _bpp_argv = argv;"); putchar('\n');
-    out("  _bpp_envp = envp;"); putchar('\n');
+    out("  _bpp_argc = (long long)argc;"); putchar('\n');
+    out("  _bpp_argv = (long long)(uintptr_t)argv;"); putchar('\n');
+    out("  _bpp_envp = (long long)(uintptr_t)envp;"); putchar('\n');
     if (has_main) { out("  main_bpp();"); putchar('\n'); }
     out("  return 0;"); putchar('\n');
     out("}"); putchar('\n');

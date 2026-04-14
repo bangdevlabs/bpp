@@ -413,6 +413,139 @@ x64_arg_reg(i) {
 
 // ── Emission primitives ────────────────────────────────────
 
+// ── Switch jump-table analysis (x86_64) ─────────────────────
+//
+// Mirror of the ARM64 logic: detect dense Form-1 switches where every
+// arm value is a compile-time integer literal and emit a branch table
+// instead of the per-arm comparison chain.
+
+auto x64_sw_min;
+auto x64_sw_max;
+auto x64_sw_total;
+
+static x64_switch_is_dense(sw_arms, sw_cnt) {
+    auto si, sk, sv_arr, sv_cnt, val, first, range;
+    auto node: Node;
+    first = 1;
+    x64_sw_min = 0;
+    x64_sw_max = 0;
+    x64_sw_total = 0;
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        sv_arr = sw_arms[si * 2];
+        sv_cnt = sw_arms[si * 2 + 1];
+        for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+            node = sv_arr[sk];
+            if (node.ntype != T_LIT) { return 0; }
+            val = x64_parse_int(node.a);
+            if (first) {
+                x64_sw_min = val;
+                x64_sw_max = val;
+                first = 0;
+            } else {
+                if (val < x64_sw_min) { x64_sw_min = val; }
+                if (val > x64_sw_max) { x64_sw_max = val; }
+            }
+            x64_sw_total = x64_sw_total + 1;
+        }
+    }
+    if (x64_sw_total < 3) { return 0; }
+    range = x64_sw_max - x64_sw_min;
+    if (range < 0) { return 0; }
+    if (range > 512) { return 0; }
+    if (range >= 2 * x64_sw_total) { return 0; }
+    return 1;
+}
+
+// Emit a Linux x86_64 jump table for a dense Form-1 switch.
+// Layout:
+//   <cond eval + sub min + cmp range + ja else>
+//   shl rax, 3                ; rax *= 8 (8-byte slots)
+//   lea rcx, [rip + table]
+//   add rcx, rax              ; rcx = table + idx*8
+//   jmp rcx
+//   table:
+//     jmp arm_0 (5B) + 3×nop  ; 8-byte slot
+//     jmp arm_1 + nops         ; ...
+//   arm_0: body + jmp sw_end
+//   arm_1: body + jmp sw_end
+//   ...
+//   else: body
+//   sw_end:
+static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
+    auto n: Node;
+    auto node: Node;
+    auto sw_arms, sw_bodies, sw_cnt, range;
+    auto arm_labels, else_lbl, table_lbl;
+    auto si, sk, sv_arr, sv_cnt, sb_arr, sb_cnt, i, target, val, pad;
+
+    n = nd;
+    sw_arms = n.b;
+    sw_bodies = n.src_tok;
+    sw_cnt = n.c;
+    range = x64_sw_max - x64_sw_min;
+
+    arm_labels = malloc(sw_cnt * 8);
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        arm_labels[si] = x64_enc_new_label();
+    }
+    else_lbl = x64_enc_new_label();
+    table_lbl = x64_enc_new_label();
+
+    // Evaluate condition into RAX.
+    x64_emit_node(n.a);
+
+    // Normalize index: rax -= min.
+    if (x64_sw_min != 0) { x64_enc_sub_imm(0, x64_sw_min); }
+
+    // Bounds check: JA (unsigned higher) jumps to else if rax > range.
+    x64_enc_cmp_imm(0, range);
+    x64_enc_jcc_label(7, else_lbl);   // JA = cc 7
+
+    // Index * 8, then compute rcx = table + rax; jmp rcx.
+    x64_enc_shl_imm(0, 3);
+    x64_enc_lea_label(1, table_lbl);
+    x64_enc_add_reg(1, 0);
+    x64_enc_jmp_reg(1);
+
+    // Branch table: one 8-byte slot per index in [min..max].
+    // Slot layout: jmp rel32 (5 bytes) + 3 nops.
+    x64_enc_def_label(table_lbl);
+    for (i = 0; i <= range; i = i + 1) {
+        target = else_lbl;
+        for (si = 0; si < sw_cnt; si = si + 1) {
+            sv_arr = sw_arms[si * 2];
+            sv_cnt = sw_arms[si * 2 + 1];
+            for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                node = sv_arr[sk];
+                val = x64_parse_int(node.a);
+                if (val == x64_sw_min + i) { target = arm_labels[si]; }
+            }
+        }
+        x64_enc_jmp_label(target);
+        for (pad = 0; pad < 3; pad = pad + 1) { x64_enc_nop(); }
+    }
+
+    // Arm bodies.
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        x64_enc_def_label(arm_labels[si]);
+        sb_arr = sw_bodies[si * 2];
+        sb_cnt = sw_bodies[si * 2 + 1];
+        for (sk = 0; sk < sb_cnt; sk = sk + 1) { x64_emit_stmt(sb_arr[sk]); }
+        x64_enc_jmp_label(sw_end_lbl);
+    }
+
+    // Else body.
+    x64_enc_def_label(else_lbl);
+    if (n.d != 0) {
+        auto ek;
+        for (ek = 0; ek < n.e; ek = ek + 1) { x64_emit_stmt(n.d[ek]); }
+    }
+
+    x64_enc_def_label(sw_end_lbl);
+    free(arm_labels);
+    return;
+}
+
 // Push RAX onto the stack.
 x64_emit_push() {
     x64_enc_push(0);
@@ -1344,11 +1477,12 @@ x64_emit_stmt(nd) {
 
     if (t == T_IF) {
         // Dead code elimination: compile-time literal condition.
-        auto cond_node;
+        // Typed Node access — raw offsets do not work with sliced layouts.
+        auto cond_node: Node;
         cond_node = n.a;
-        if (*(cond_node + 0) == T_LIT) {
+        if (cond_node.ntype == T_LIT) {
             auto cond_val;
-            cond_val = x64_parse_int(*(cond_node + 8));
+            cond_val = x64_parse_int(cond_node.a);
             if (cond_val == 0) {
                 if (n.e > 0) { x64_emit_body(n.d, n.e); }
             } else {
@@ -1436,12 +1570,30 @@ x64_emit_stmt(nd) {
     }
 
     if (t == T_SWITCH) {
+        // Form 1 evaluates the condition ONCE, pushes it, then peeks from
+        // [rsp] for each comparison. Bodies use RBP-relative addressing so
+        // the stack imbalance is invisible to them. Each match and the
+        // else fall-through pops the saved cond before running the body.
         auto sw_arms, sw_bodies, sw_cnt, sw_end_lbl;
         auto si, sv_arr, sv_cnt, sb_arr, sb_cnt, snext_lbl;
         sw_arms = n.b;
         sw_bodies = n.src_tok;
         sw_cnt = n.c;
         sw_end_lbl = x64_enc_new_label();
+
+        // Form 1 dense switches go through the jump-table path.
+        if (n.a != 0) {
+            if (x64_switch_is_dense(sw_arms, sw_cnt)) {
+                x64_emit_switch_jtbl(n, sw_end_lbl);
+                return 0;
+            }
+        }
+
+        // Form 1: evaluate condition once, push.
+        if (n.a != 0) {
+            x64_emit_node(n.a);
+            x64_emit_push();
+        }
 
         for (si = 0; si < sw_cnt; si = si + 1) {
             sv_arr = sw_arms[si * 2];
@@ -1458,12 +1610,10 @@ x64_emit_stmt(nd) {
                 x64_enc_test_reg(0, 0);
                 x64_enc_jcc_label(5, smatch_lbl);   // JNE = 5 (nonzero)
             } else {
-                // Form 1: value dispatch.
+                // Form 1: compare each value against cond peeked from [rsp].
                 for (sk = 0; sk < sv_cnt; sk = sk + 1) {
-                    x64_emit_node(n.a);
-                    x64_emit_push();
                     x64_emit_node(sv_arr[sk]);
-                    x64_emit_pop(1);
+                    x64_enc_load(1, 4, 0);           // rcx = [rsp]
                     x64_enc_cmp_reg(1, 0);
                     x64_enc_jcc_label(4, smatch_lbl);
                 }
@@ -1471,11 +1621,16 @@ x64_emit_stmt(nd) {
             x64_enc_jmp_label(snext_lbl);
 
             x64_enc_def_label(smatch_lbl);
+            // Pop saved cond before running the body (stack rebalance).
+            if (n.a != 0) { x64_emit_pop(1); }
             for (sk = 0; sk < sb_cnt; sk = sk + 1) { x64_emit_stmt(sb_arr[sk]); }
             x64_enc_jmp_label(sw_end_lbl);
 
             x64_enc_def_label(snext_lbl);
         }
+
+        // Fell through all arms — pop cond before else body or end.
+        if (n.a != 0) { x64_emit_pop(1); }
 
         if (n.d != 0) {
             auto ek;

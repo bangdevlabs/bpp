@@ -509,6 +509,18 @@ x64_enc_load(dst, base, disp) {
     return 0;
 }
 
+// MOV r64, [base + idx*8]. Scaled-index load for jump tables and arrays.
+// Emits REX + 0x8B + ModR/M(mod=00, reg=dst, rm=100=SIB) + SIB(scale=3, idx, base).
+// Base register cannot be RBP (5) or R13 (13) with mod=00 — callers must
+// arrange a different base (e.g. via LEA into a scratch register first).
+x64_enc_load_sib8(dst, base, idx) {
+    x64_enc_rex(1, (dst >> 3) & 1, (idx >> 3) & 1, (base >> 3) & 1);
+    x64_enc_emit8(0x8B);
+    x64_enc_modrm(0, dst, 4);
+    x64_enc_emit8((3 << 6) | ((idx & 7) << 3) | (base & 7));
+    return 0;
+}
+
 // MOV [base + disp], r64. Store 64-bit value to memory.
 x64_enc_store(src, base, disp) {
     x64_enc_rex(1, (src >> 3) & 1, 0, (base >> 3) & 1);
@@ -584,6 +596,26 @@ x64_enc_lea(dst, base, disp) {
     x64_enc_rex(1, (dst >> 3) & 1, 0, (base >> 3) & 1);
     x64_enc_emit8(0x8D);
     x64_enc_mem(dst, base, disp);
+    return 0;
+}
+
+// LEA r64, [RIP + rel32-to-label]. Loads the absolute address of an
+// intra-function label into a register. Used by jump tables: compute
+// the table's base address, then add the scaled index to reach an
+// entry. The rel32 field is patched by x64_enc_resolve_fixups.
+x64_enc_lea_label(dst, lbl) {
+    auto target, rel;
+    x64_enc_rex(1, (dst >> 3) & 1, 0, 0);
+    x64_enc_emit8(0x8D);
+    x64_enc_emit8((0 << 6) | ((dst & 7) << 3) | 5);
+    target = arr_get(x64_enc_lbl_off, lbl);
+    if (target >= 0) {
+        rel = target - (x64_enc_pos + 4);
+        x64_enc_emit32(rel);
+    } else {
+        x64_enc_add_fixup(lbl);
+        x64_enc_emit32(0);
+    }
     return 0;
 }
 
