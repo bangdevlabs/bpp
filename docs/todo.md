@@ -22,16 +22,29 @@ Anything NOT on the path to 1.0 is in "Post-1.0" at the bottom. When in doubt, m
 ### 1.0 path — in commit order
 
 ```
-0.22  ─┬─► [Language finalization: static, void, load, implicit return]   ← FOUNDATION
+0.22  ─┬─► [Language finalization: static, void, load, implicit return]   ✅ DONE
        │
-       ├─► [Tonify batches 1-5, 7 (NOT batch 6)]
+       ├─► [Tonify batches 1-5, 7 (NOT batch 6)]                          ✅ DONE
        │
-       ├─► [libb: brt0 + bsys table + bmem allocator]                    ← NEW
-       ├─► [Tonify batch 6 (codegens, post-libb)]
+       ├─► [libb: brt0 + bsys table + bmem allocator]                    ✅ DONE
+       │
+       ├─► [Foundation: cache removal + repo reorg (src/backend/)]        ✅ DONE
+       │
+       ├─► [Phase 5: jump tables + eval-once switch + sliced struct fix]  ✅ DONE
+       │
+       ├─► [Mini Cooper — Native Perf Ladder + Language Gaps]            ← IN PROGRESS
+       │     docs plan: ~/.claude/plans/compressed-soaring-turing.md
+       │     Phase A1: Bitfields (: bit, : bit3, ...)
+       │     Phase A2: Aligned malloc
+       │     Phase B0: Constant folding + DCE
+       │     Phase B1: Expression register allocation (B1a-B1d sub-steps)
+       │     Phase B2: Inline : base functions
+       │     Phase B3: Local register allocation
+       │     Phase C:  Batch 6 tonify (codegens, post-perf)
+       │     Phase B4: : double slice + SIMD builtins
+       │     Phase D:  Docs (Rule 8 typed access, Rule 6 bit slices)
        │
        ├─► [Maestro batch 2]
-       │
-       ├─► [Transitive .bo content hash fix]
        │
        ├─► [extrn keyword + auto smart promotion]
        │
@@ -39,13 +52,13 @@ Anything NOT on the path to 1.0 is in "Post-1.0" at the bottom. When in doubt, m
        │
        ├─► [Smart dispatch codegen (Maestro Phase 2)]
        │
-       ├─► [Dev Loop 1: Multi-error + warning log]
+       ├─► [Dev Loop 1: Multi-error + warning log]                        ✅ DONE in 0.22
        ├─► [Dev Loop 2: Debugger breakpoints]
        ├─► [Dev Loop 3: Profiler minimal + sampling]
        │
-       ├─► [stbaudio.bsm + Rhythm Teacher demo]
+       ├─► [stbaudio.bsm + Rhythm Teacher demo]                           (uses aligned malloc from A2 + SIMD from B4)
        │
-       ├─► [Wolf3D Phase 1: 1 level CPU raycaster]
+       ├─► [Wolf3D Phase 1: 1 level CPU raycaster]                        (native perf from B1-B4 target)
        ├─► [Wolf3D Phase 2: hybrid CPU+GPU]
        │
        ├─► [Dev Loop 4: Hot reload watch mode]
@@ -54,12 +67,26 @@ Anything NOT on the path to 1.0 is in "Post-1.0" at the bottom. When in doubt, m
        │
        ├─► [Dev Loop 5: Metaprogramming ($T + reflection)]
        │
-       ├─► [RTS demo: 1 map, 2 unit types]
+       ├─► [RTS demo: 1 map, 2 unit types]                                (native perf from B1-B4 target)
        │
-       ├─► [bangscript: compiler extensions + runtime]
+       ├─► [bangscript: compiler extensions + runtime]                    (uses offsetof from deferred items)
        │
        └─► [Adventure Puzzle demo]  ──────────────► 1.0
 ```
+
+### Deferred items (tracked, not yet P-ranked in the path above)
+
+- **`restrict` keyword** — only useful when the native codegen does
+  aliasing-aware optimization, which is NOT part of Phases B0-B4. If
+  the C-emitter path wants `restrict` to flow through to gcc, add a
+  parser-level no-op pass-through. Revisit post-1.0.
+- **`offsetof` / field reflection** — P1 for bangscript runtime.
+  Exposes the compile-time field offsets computed by `get_field_offset`
+  as runtime constants. Enables auto-generated serializers and
+  metaprogramming. Separate task.
+- **Prefetch builtins (`__builtin_prefetch`)** — P2. Add when real
+  profiling on RTS-sized workloads shows the win.
+- **Full aliasing-aware optimizer** — post-1.0. Not in scope.
 
 Each step is detailed below.
 
