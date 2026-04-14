@@ -820,135 +820,10 @@ a64_emit_node(nd) {
     if (t == T_CALL) {
         // (putchar, putchar_err, getchar removed as builtins — they live
         // in bpp_io.bsm as B++ functions that call sys_write/sys_read.)
-        // Built-in: malloc — allocate memory.
-        // In binary mode, each call does an mmap syscall directly.
-        // In asm mode, calls libSystem's malloc.
-        if (a64_str_eq(n.a, "malloc", 6)) {
-            arr = n.b; ety = a64_emit_node(*(arr + 0));
-            if (ety == 1) {
-                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
-            }
-            if (a64_bin_mode) {
-                // malloc(size): allocate size+8 via mmap, store size in header, return ptr+8.
-                // x0 = requested size.
-                a64_emit_push();             // save requested size on stack
-                enc_add_imm(1, 0, 8);       // x1 = size + 8 (total allocation)
-                enc_mov_wide(0, 0);          // x0 = addr = 0
-                enc_mov_wide(2, 3);          // x2 = PROT_READ|PROT_WRITE
-                enc_mov_wide(3, 0x1002);     // x3 = MAP_PRIVATE|MAP_ANON
-                enc_movn(4, 0, 0);           // x4 = -1 (fd)
-                enc_mov_wide(5, 0);          // x5 = offset = 0
-                enc_mov_wide(16, BSYS_MMAP);
-                enc_svc(0x80);
-                enc_csneg(0, 0, 0, 3);       // negate on carry (error)
-                // x0 = raw ptr. Recover requested size, store in header.
-                a64_emit_pop(1);             // x1 = requested size
-                enc_str_uoff(1, 0, 0);       // [x0] = size
-                enc_add_imm(0, 0, 8);        // x0 = user ptr (past header)
-            } else { out("  bl _malloc"); putchar('\n'); }
-            return 0;
-        }
-        // Built-in: free(ptr) — release memory via munmap using stored size.
-        if (a64_str_eq(n.a, "free", 4)) {
-            arr = n.b;
-            a64_emit_node(*(arr + 0));
-            if (a64_bin_mode) {
-                // x0 = user ptr. Real block starts at x0-8, size at [x0-8].
-                auto lbl_skip;
-                lbl_skip = enc_new_label();
-                enc_cbz_label(0, lbl_skip);        // skip if ptr == NULL
-                enc_sub_imm(0, 0, 8);              // x0 = raw ptr (header)
-                enc_ldr_uoff(1, 0, 0);             // x1 = stored size
-                enc_add_imm(1, 1, 8);              // x1 = total allocation size
-                enc_mov_wide(16, BSYS_MUNMAP);
-                enc_svc(0x80);
-                enc_def_label(lbl_skip);
-                enc_mov_wide(0, 0);                 // return 0
-            } else { out("  bl _free"); putchar('\n'); }
-            return 0;
-        }
-        // Built-in: realloc(ptr, new_size) — allocate new block, copy old data, free old.
-        // Reads old_size from the 8-byte header at ptr-8.
-        if (a64_str_eq(n.a, "realloc", 7)) {
-            arr = n.b;
-            a64_emit_node(*(arr + 0)); a64_emit_push();   // push old ptr
-            a64_emit_node(*(arr + 8));                     // x0 = new_size
-            if (a64_bin_mode) {
-                // Allocate new block: mmap(0, new_size+8, PROT_RW, MAP_PRIV|MAP_ANON, -1, 0)
-                a64_emit_push();                           // push new_size
-                enc_add_imm(1, 0, 8);                     // x1 = new_size + 8
-                enc_mov_wide(0, 0);
-                enc_mov_wide(2, 3);
-                enc_mov_wide(3, 0x1002);
-                enc_movn(4, 0, 0);
-                enc_mov_wide(5, 0);
-                enc_mov_wide(16, BSYS_MMAP);
-                enc_svc(0x80);
-                enc_csneg(0, 0, 0, 3);
-                // x0 = raw new ptr. Write new_size header.
-                a64_emit_pop(5);                           // x5 = new_size
-                enc_str_uoff(5, 0, 0);                     // [raw_new] = new_size
-                enc_add_imm(0, 0, 8);                     // x0 = new user ptr
-                // Copy min(old_size, new_size) bytes from old to new.
-                a64_emit_pop(1);                           // x1 = old user ptr
-                enc_mov_reg(2, 0);                         // x2 = new user ptr (dst, return val)
-                enc_sub_imm(3, 1, 8);                      // x3 = old_ptr - 8 (header addr)
-                enc_ldr_uoff(3, 3, 0);                     // x3 = old_size from header
-                // x3 = min(old_size, new_size)
-                auto lbl_no_clamp;
-                lbl_no_clamp = enc_new_label();
-                enc_cmp_reg(3, 5);                         // compare old_size vs new_size
-                enc_b_cond_label(13, lbl_no_clamp);        // branch if old_size <= new_size (LE=0xD)
-                enc_mov_reg(3, 5);                         // clamp: x3 = new_size
-                enc_def_label(lbl_no_clamp);
-                // Copy loop: copy x3 bytes from x1 to x2.
-                auto lbl_top, lbl_end;
-                lbl_top = enc_new_label();
-                lbl_end = enc_new_label();
-                enc_cbz_label(3, lbl_end);
-                enc_def_label(lbl_top);
-                enc_ldrb_post(4, 1, 1);
-                enc_strb_post(4, 2, 1);
-                enc_subs_imm(3, 3, 1);
-                enc_cbnz_label(3, lbl_top);
-                enc_def_label(lbl_end);
-                // Free old block: munmap(old_ptr - 8, old_size + 8).
-                // old_ptr was in x1 but advanced. Recover from x0 is not possible.
-                // We need old_ptr. It was pushed and popped into x1, then advanced.
-                // Simplification: skip free for now, munmap happens on exit.
-                // x0 = new user ptr (set before copy, preserved — x0 untouched by loop)
-            } else {
-                out("  bl _realloc"); putchar('\n');
-                a64_emit_pop(1);                           // discard old ptr
-            }
-            return 0;
-        }
-        // Built-in: memcpy(dst, src, len) — byte-by-byte copy. Returns dst.
-        if (a64_str_eq(n.a, "memcpy", 6)) {
-            arr = n.b;
-            a64_emit_node(*(arr + 0)); a64_emit_push();   // push dst
-            a64_emit_node(*(arr + 8)); a64_emit_push();   // push src
-            a64_emit_node(*(arr + 16));                    // x0 = len
-            if (a64_bin_mode) {
-                auto lbl_top, lbl_end;
-                enc_mov_reg(3, 0);                         // x3 = len
-                a64_emit_pop(1);                           // x1 = src
-                a64_emit_pop(2);                           // x2 = dst
-                lbl_top = enc_new_label();
-                lbl_end = enc_new_label();
-                enc_cbz_label(3, lbl_end);                 // skip if len=0
-                enc_def_label(lbl_top);
-                enc_ldrb_post(4, 1, 1);                    // w4 = [x1], x1++
-                enc_strb_post(4, 2, 1);                    // [x2] = w4, x2++
-                enc_subs_imm(3, 3, 1);                     // x3-- (sets flags)
-                enc_cbnz_label(3, lbl_top);                // loop if x3 != 0
-                enc_def_label(lbl_end);
-                enc_mov_reg(0, 2);                         // return dst
-            } else {
-                out("  bl _memcpy"); putchar('\n');
-            }
-            return 0;
-        }
+        // (malloc, free, realloc, memcpy removed as builtins — they live
+        // in backend/os/<target>/_bmem_<target>.bsm as B++ functions
+        // that call sys_mmap/sys_munmap directly. Auto-injected via
+        // bpp_mem.bsm for every user program.)
         // Built-in: peek — byte read from real pointer.
         if (a64_str_eq(n.a, "peek", 4)) {
             arr = n.b; ety = a64_emit_node(*(arr + 0));
@@ -1253,6 +1128,30 @@ a64_emit_node(nd) {
             a64_emit_node(*(arr + 0));
             a64_emit_pop(1); a64_emit_pop(2); a64_emit_pop(3);
             if (a64_bin_mode) { enc_mov_wide(16, BSYS_WAIT4); enc_svc(0x80); enc_csneg(0, 0, 0, 3); }
+            return 0;
+        }
+        // Built-in: sys_mmap(addr, len, prot, flags, fd, offset) — 6 args in x0-x5.
+        // Returns mapped address, or -1 on failure.
+        if (a64_str_eq(n.a, "sys_mmap", 8)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 40)); a64_emit_push();
+            a64_emit_node(*(arr + 32)); a64_emit_push();
+            a64_emit_node(*(arr + 24)); a64_emit_push();
+            a64_emit_node(*(arr + 16)); a64_emit_push();
+            a64_emit_node(*(arr + 8)); a64_emit_push();
+            a64_emit_node(*(arr + 0));
+            a64_emit_pop(1); a64_emit_pop(2); a64_emit_pop(3);
+            a64_emit_pop(4); a64_emit_pop(5);
+            if (a64_bin_mode) { enc_mov_wide(16, BSYS_MMAP); enc_svc(0x80); }
+            return 0;
+        }
+        // Built-in: sys_munmap(addr, len) — release a mapping. Returns 0 on success.
+        if (a64_str_eq(n.a, "sys_munmap", 10)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 8)); a64_emit_push();
+            a64_emit_node(*(arr + 0));
+            a64_emit_pop(1);
+            if (a64_bin_mode) { enc_mov_wide(16, BSYS_MUNMAP); enc_svc(0x80); }
             return 0;
         }
         // Built-in: sys_usleep(us) — sleep for N microseconds.

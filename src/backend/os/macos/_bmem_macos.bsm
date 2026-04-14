@@ -1,0 +1,72 @@
+// _bmem_macos.bsm — macOS/ARM64 memory allocator.
+//
+// Each allocation maps a private, anonymous region via sys_mmap and
+// stores the requested size in an 8-byte header. free() returns the
+// region to the kernel via sys_munmap using the stored size.
+//
+// This is a correct, self-contained allocator with no libc dependency.
+// It is deliberately simple: one mmap per allocation, no free list.
+// Small-allocation workloads waste pages; that is acceptable until a
+// real free-list allocator replaces this module.
+
+// mmap protection: PROT_READ | PROT_WRITE.
+const _BMEM_PROT_RW = 3;
+
+// mmap flags on macOS: MAP_PRIVATE (0x0002) | MAP_ANON (0x1000).
+const _BMEM_FLAGS = 0x1002;
+
+// Header size — stores the requested allocation size so free() knows
+// how many bytes to unmap.
+const _BMEM_HEADER = 8;
+
+// Error return from sys_mmap (and the "no fd" sentinel for anon maps).
+const _BMEM_FAIL = 0 - 1;
+
+// Allocate `size` bytes. Returns a pointer the caller can write through,
+// or 0 if the kernel refused the mapping.
+malloc(size) {
+    auto raw;
+    raw = sys_mmap(0, size + _BMEM_HEADER, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    *raw = size;
+    return raw + _BMEM_HEADER;
+}
+
+// Release memory previously returned by malloc. Safe to call with 0.
+void free(p) {
+    auto raw, size;
+    if (p == 0) { return; }
+    raw = p - _BMEM_HEADER;
+    size = *raw;
+    sys_munmap(raw, size + _BMEM_HEADER);
+}
+
+// Resize an existing allocation. On success returns the new pointer
+// (may differ from the old one). On failure returns 0 and leaves the
+// old block alive so the caller can recover.
+realloc(p, new_size) {
+    auto new_p, old_size, raw, i, limit;
+    if (p == 0) { return malloc(new_size); }
+    raw = p - _BMEM_HEADER;
+    old_size = *raw;
+    new_p = malloc(new_size);
+    if (new_p == 0) { return 0; }
+    limit = old_size;
+    if (new_size < limit) { limit = new_size; }
+    for (i = 0; i < limit; i = i + 1) {
+        poke(new_p + i, peek(p + i));
+    }
+    free(p);
+    return new_p;
+}
+
+// Copy `n` bytes from `src` to `dst`. Returns `dst` for chaining.
+// Byte-by-byte loop — simple and portable; future optimization can
+// use word-sized copies when both pointers are 8-byte aligned.
+memcpy(dst, src, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + i, peek(src + i));
+    }
+    return dst;
+}

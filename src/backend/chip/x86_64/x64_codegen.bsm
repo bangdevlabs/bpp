@@ -694,152 +694,9 @@ x64_emit_node(nd) {
     if (t == T_CALL) {
         // (putchar, putchar_err, getchar removed as builtins — they live
         // in bpp_io.bsm as B++ functions that call sys_write/sys_read.)
-        // Built-in: malloc — allocate via mmap.
-        if (x64_str_eq(n.a, "malloc", 6)) {
-            arr = n.b; ety = x64_emit_node(*(arr + 0));
-            if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
-            // malloc(size): allocate size+8 via mmap, store size in header, return ptr+8.
-            // rax = requested size. Save it, mmap size+8, write header.
-            x64_emit_push();                               // save requested size
-            x64_enc_add_imm(0, 8);                         // rax = size + 8
-            x64_enc_mov_reg(6, 0);                         // rsi = total size
-            x64_enc_xor_zero(7);                           // rdi = 0
-            x64_enc_mov_wide(2, 3);                        // rdx = PROT_READ|PROT_WRITE
-            x64_enc_mov_wide(10, 0x22);                    // r10 = MAP_PRIVATE|MAP_ANON
-            x64_enc_mov_wide(8, -1);                       // r8 = -1
-            x64_enc_xor_zero(9);                           // r9 = 0
-            x64_enc_mov_wide(0, BSYS_MMAP);
-            x64_enc_syscall();
-            // rax = raw ptr. Store requested size at [rax], return rax+8.
-            x64_emit_pop(1);                               // rcx = requested size
-            x64_enc_store(1, 0, 0);                        // [rax] = size
-            x64_enc_add_imm(0, 8);                         // rax = user ptr
-            return 0;
-        }
-        // Built-in: free(ptr) — munmap using stored size from header.
-        if (x64_str_eq(n.a, "free", 4)) {
-            arr = n.b;
-            x64_emit_node(*(arr + 0));
-            // rax = user ptr. Header at rax-8.
-            auto lbl_skip;
-            lbl_skip = x64_enc_new_label();
-            x64_enc_test_reg(0, 0);
-            x64_enc_jcc_label(4, lbl_skip);                // jz skip (NULL check)
-            x64_enc_sub_imm(0, 8);                         // rax = raw ptr (header)
-            x64_enc_load(6, 0, 0);                         // rsi = stored size
-            x64_enc_add_imm(6, 8);                         // rsi = total alloc size
-            x64_enc_mov_reg(7, 0);                         // rdi = raw ptr
-            x64_enc_mov_wide(0, BSYS_MUNMAP);
-            x64_enc_syscall();
-            x64_enc_def_label(lbl_skip);
-            x64_enc_xor_zero(0);                           // return 0
-            return 0;
-        }
-        // Built-in: realloc(ptr, new_size) — allocate new, copy old data, free old.
-        // Reads old_size from 8-byte header at ptr-8.
-        // Linux: try mremap first (includes header), fallback to mmap+copy.
-        if (x64_str_eq(n.a, "realloc", 7)) {
-            arr = n.b;
-            x64_emit_node(*(arr + 0)); x64_emit_push();   // push old user ptr
-            x64_emit_node(*(arr + 8));                     // rax = new_size
-            x64_emit_push();                               // push new_size
-            // Read old_size from header.
-            // Stack: [new_size, old_ptr]
-            x64_enc_load(1, 4, 8);                         // rcx = old_ptr (peek stack slot 1)
-            x64_enc_load(6, 1, 0 - 8);                     // rsi = old_size from [old_ptr-8]
-            // Try mremap(old_ptr-8, old_size+8, new_size+8, MREMAP_MAYMOVE=1)
-            auto lbl_ok, lbl_copy, lbl_end;
-            lbl_ok = x64_enc_new_label();
-            lbl_copy = x64_enc_new_label();
-            lbl_end = x64_enc_new_label();
-            x64_enc_sub_imm(1, 8);                         // rcx = raw old ptr
-            x64_enc_mov_reg(7, 1);                         // rdi = raw old ptr
-            x64_enc_add_imm(6, 8);                         // rsi = old total size
-            x64_enc_load(2, 4, 0);                         // rdx = new_size (peek stack top)
-            x64_enc_add_imm(2, 8);                         // rdx = new total size
-            x64_enc_mov_wide(10, 1);                       // r10 = MREMAP_MAYMOVE
-            x64_enc_mov_wide(0, BSYS_MREMAP);
-            x64_enc_syscall();
-            // Check if mremap succeeded (rax >= 0).
-            x64_enc_test_reg(0, 0);
-            x64_enc_jcc_label(13, lbl_ok);                 // jge ok
-            // mremap failed: fallback to mmap + copy.
-            x64_emit_pop(2);                               // rdx = new_size
-            x64_emit_pop(1);                               // rcx = old user ptr
-            // Save old_ptr and new_size for later.
-            x64_enc_mov_reg(0, 1); x64_emit_push();       // push old user ptr
-            x64_enc_mov_reg(0, 2); x64_emit_push();       // push new_size
-            // mmap(0, new_size+8, PROT_RW, MAP_PRIV|MAP_ANON, -1, 0)
-            x64_enc_mov_reg(6, 2);                         // rsi = new_size
-            x64_enc_add_imm(6, 8);                         // rsi = new_size + 8
-            x64_enc_xor_zero(7);                           // rdi = 0
-            x64_enc_mov_wide(2, 3);                        // rdx = PROT_READ|PROT_WRITE
-            x64_enc_mov_wide(10, 0x22);                    // r10 = MAP_PRIVATE|MAP_ANON
-            x64_enc_mov_wide(8, -1);                       // r8 = -1
-            x64_enc_xor_zero(9);                           // r9 = 0
-            x64_enc_mov_wide(0, BSYS_MMAP);
-            x64_enc_syscall();
-            // rax = raw new ptr. Write new_size header.
-            x64_emit_pop(2);                               // rdx = new_size
-            x64_enc_store(2, 0, 0);                        // [raw_new] = new_size
-            x64_enc_add_imm(0, 8);                         // rax = new user ptr
-            // Copy min(old_size, new_size) bytes.
-            x64_emit_pop(6);                               // rsi = old user ptr
-            x64_enc_load(1, 6, 0 - 8);                     // rcx = old_size from header
-            // clamp: rcx = min(old_size, new_size)
-            x64_enc_cmp_reg(1, 2);                         // cmp old_size, new_size
-            auto lbl_no_clamp;
-            lbl_no_clamp = x64_enc_new_label();
-            x64_enc_jcc_label(14, lbl_no_clamp);           // jle no_clamp (old <= new)
-            x64_enc_mov_reg(1, 2);                         // rcx = new_size
-            x64_enc_def_label(lbl_no_clamp);
-            x64_enc_mov_reg(7, 0);                         // rdi = new user ptr (dst)
-            // Copy loop.
-            x64_enc_def_label(lbl_copy);
-            x64_enc_test_reg(1, 1);
-            x64_enc_jcc_label(4, lbl_end);                 // jz end
-            x64_enc_loadb(3, 6, 0);                        // dl = [src]
-            x64_enc_storeb(3, 7, 0);                       // [dst] = dl
-            x64_enc_add_imm(6, 1);
-            x64_enc_add_imm(7, 1);
-            x64_enc_sub_imm(1, 1);
-            x64_enc_jcc_label(5, lbl_copy);                // jnz copy
-            // rax = new user ptr (set above, preserved).
-            x64_enc_jmp_label(lbl_end);
-            // mremap succeeded: rax = raw new ptr. Write new header, return user ptr.
-            x64_enc_def_label(lbl_ok);
-            x64_emit_pop(2);                               // rdx = new_size
-            x64_emit_pop(1);                               // discard old ptr
-            x64_enc_store(2, 0, 0);                        // [raw_new] = new_size
-            x64_enc_add_imm(0, 8);                         // rax = new user ptr
-            x64_enc_def_label(lbl_end);
-            return 0;
-        }
-        // Built-in: memcpy(dst, src, len) — byte-by-byte copy. Returns dst.
-        if (x64_str_eq(n.a, "memcpy", 6)) {
-            arr = n.b;
-            x64_emit_node(*(arr + 0)); x64_emit_push();   // push dst
-            x64_emit_node(*(arr + 8)); x64_emit_push();   // push src
-            x64_emit_node(*(arr + 16));                    // rax = len
-            auto lbl_top, lbl_end;
-            x64_enc_mov_reg(1, 0);                         // rcx = len
-            x64_emit_pop(6);                               // rsi = src
-            x64_emit_pop(7);                               // rdi = dst
-            lbl_top = x64_enc_new_label();
-            lbl_end = x64_enc_new_label();
-            x64_enc_test_reg(1, 1);                        // test rcx, rcx
-            x64_enc_jcc_label(4, lbl_end);                 // jz end (skip if len=0)
-            x64_enc_def_label(lbl_top);
-            x64_enc_loadb(0, 6, 0);                        // al = [rsi]
-            x64_enc_storeb(0, 7, 0);                       // [rdi] = al
-            x64_enc_add_imm(6, 1);                         // rsi++
-            x64_enc_add_imm(7, 1);                         // rdi++
-            x64_enc_sub_imm(1, 1);                         // rcx-- (sets ZF)
-            x64_enc_jcc_label(5, lbl_top);                 // jnz top
-            x64_enc_def_label(lbl_end);
-            x64_enc_mov_reg(0, 7);                         // rax = rdi (return dst)
-            return 0;
-        }
+        // (malloc, free, realloc, memcpy removed as builtins — they live
+        // in backend/os/<target>/_bmem_<target>.bsm as B++ functions
+        // that call sys_mmap/sys_munmap directly.)
         // Built-in: peek — load one byte from a pointer.
         if (x64_str_eq(n.a, "peek", 4)) {
             arr = n.b; ety = x64_emit_node(*(arr + 0));
@@ -1068,6 +925,37 @@ x64_emit_node(nd) {
             x64_emit_pop(2);
             x64_emit_pop(10);
             x64_enc_mov_wide(0, BSYS_PTRACE);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_mmap(addr, len, prot, flags, fd, offset) — 6 args.
+        // Linux calling convention: RDI, RSI, RDX, R10, R8, R9.
+        if (x64_str_eq(n.a, "sys_mmap", 8)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 40)); x64_emit_push();
+            x64_emit_node(*(arr + 32)); x64_emit_push();
+            x64_emit_node(*(arr + 24)); x64_emit_push();
+            x64_emit_node(*(arr + 16)); x64_emit_push();
+            x64_emit_node(*(arr + 8));  x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_emit_pop(2);
+            x64_emit_pop(10);
+            x64_emit_pop(8);
+            x64_emit_pop(9);
+            x64_enc_mov_wide(0, BSYS_MMAP);
+            x64_enc_syscall();
+            return 0;
+        }
+        // Built-in: sys_munmap(addr, len) — 2 args. Returns 0 on success.
+        if (x64_str_eq(n.a, "sys_munmap", 10)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 8)); x64_emit_push();
+            x64_emit_node(*(arr + 0));
+            x64_enc_mov_reg(7, 0);
+            x64_emit_pop(6);
+            x64_enc_mov_wide(0, BSYS_MUNMAP);
             x64_enc_syscall();
             return 0;
         }

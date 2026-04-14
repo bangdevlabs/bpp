@@ -1,0 +1,70 @@
+// _bmem_linux.bsm — Linux/x86_64 memory allocator.
+//
+// Each allocation maps a private, anonymous region via sys_mmap and
+// stores the requested size in an 8-byte header. free() returns the
+// region to the kernel via sys_munmap using the stored size.
+//
+// Static ELF binaries have no libc available, so this module IS the
+// allocator — not a wrapper. It is deliberately simple: one mmap per
+// allocation, no free list. Future work can replace this with a real
+// free-list allocator without changing the public API.
+
+// mmap protection: PROT_READ | PROT_WRITE.
+const _BMEM_PROT_RW = 3;
+
+// mmap flags on Linux: MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20).
+const _BMEM_FLAGS = 0x22;
+
+// Header size — stores the requested allocation size so free() knows
+// how many bytes to unmap.
+const _BMEM_HEADER = 8;
+
+// Error return from sys_mmap (and the "no fd" sentinel for anon maps).
+const _BMEM_FAIL = 0 - 1;
+
+// Allocate `size` bytes. Returns a pointer the caller can write through,
+// or 0 if the kernel refused the mapping.
+malloc(size) {
+    auto raw;
+    raw = sys_mmap(0, size + _BMEM_HEADER, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    *raw = size;
+    return raw + _BMEM_HEADER;
+}
+
+// Release memory previously returned by malloc. Safe to call with 0.
+void free(p) {
+    auto raw, size;
+    if (p == 0) { return; }
+    raw = p - _BMEM_HEADER;
+    size = *raw;
+    sys_munmap(raw, size + _BMEM_HEADER);
+}
+
+// Resize an existing allocation. On success returns the new pointer
+// (may differ from the old one). On failure returns 0 and leaves the
+// old block alive so the caller can recover.
+realloc(p, new_size) {
+    auto new_p, old_size, raw, i, limit;
+    if (p == 0) { return malloc(new_size); }
+    raw = p - _BMEM_HEADER;
+    old_size = *raw;
+    new_p = malloc(new_size);
+    if (new_p == 0) { return 0; }
+    limit = old_size;
+    if (new_size < limit) { limit = new_size; }
+    for (i = 0; i < limit; i = i + 1) {
+        poke(new_p + i, peek(p + i));
+    }
+    free(p);
+    return new_p;
+}
+
+// Copy `n` bytes from `src` to `dst`. Returns `dst` for chaining.
+memcpy(dst, src, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + i, peek(src + i));
+    }
+    return dst;
+}
