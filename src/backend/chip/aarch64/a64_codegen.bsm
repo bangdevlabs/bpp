@@ -12,8 +12,10 @@ import "bpp_parser.bsm";
 import "bpp_types.bsm";
 import "a64_enc.bsm";
 // ARM64 codegen always targets macOS (the chip+OS coupling B++ has today).
-// Import the macOS syscall table directly, not via target-suffix.
+// Import the macOS syscall table and runtime startup globals directly,
+// not via target-suffix — this codegen cannot target any other OS.
 import "_bsys_macos.bsm";
+import "_brt0_macos.bsm";
 
 // ── Emitter-owned globals ──────────────────────────────────
 
@@ -92,22 +94,28 @@ init_codegen_arm64() {
     a64_bin_mode = 0;
     a64_fn_lbl = arr_new();
     a64_ret_lbl = 0;
-    a64_argc_sym = 0 - 1;
-    a64_argv_sym = 0 - 2;
-    a64_envp_sym = 0 - 3;
+    // Initialized to 0 (invalid packed name). Real values are assigned
+    // by a64_bind_startup_syms() once brt0.bsm has been parsed.
+    a64_argc_sym = 0;
+    a64_argv_sym = 0;
+    a64_envp_sym = 0;
     return 0;
 }
 
-// ── Hidden globals helper ──────────────────────────────────
-// Push the runtime's hidden global symbols (argc/argv/envp) onto a64_gl_name.
-// Always called AFTER user globals have been copied so the hidden slots
-// land at the end of the data section. Adding a new hidden global = add
-// one line here, no other site to remember.
-a64_add_hidden_globals() {
-    a64_gl_name = arr_push(a64_gl_name, a64_argc_sym);
-    a64_gl_name = arr_push(a64_gl_name, a64_argv_sym);
-    a64_gl_name = arr_push(a64_gl_name, a64_envp_sym);
-    return 0;
+// Look up the packed names of brt0's hidden globals (_bpp_argc, _bpp_argv,
+// _bpp_envp) from the globals array. Must be called AFTER brt0.bsm has been
+// parsed (any time during module 0 emission). The packed names are then
+// used as relocation targets for argc_get/argv_get/envp_get builtins and
+// for the argc/argv/envp save in main()'s prologue.
+void a64_bind_startup_syms() {
+    auto i, name_p;
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        name_p = *(globals + i * 8);
+        if (a64_str_eq(name_p, "_bpp_argc", 9)) { a64_argc_sym = name_p; }
+        if (a64_str_eq(name_p, "_bpp_argv", 9)) { a64_argv_sym = name_p; }
+        if (a64_str_eq(name_p, "_bpp_envp", 9)) { a64_envp_sym = name_p; }
+    }
+    return;
 }
 
 // ── Bridge: copy parser data into emitter parallel arrays ──
@@ -2325,8 +2333,8 @@ a64_mod_init() {
         if (idx < 0) { a64_gl_name = arr_push(a64_gl_name, name_p); }
         i = i + 1;
     }
-    // Add hidden globals (argc/argv/envp) at the end of the data section.
-    a64_add_hidden_globals();
+    // Hidden runtime globals (_bpp_argc/argv/envp) come in via brt0.bsm
+    // as regular entries in globals[], so the loop above already includes them.
 
     // Externs are refreshed per-module in emit_module_arm64() instead of here,
     // because in the incremental pipeline modules are parsed one at a time.
@@ -2428,8 +2436,7 @@ emit_all_arm64() {
     bridge_data_arm64();
 
     if (a64_bin_mode) {
-        // Add hidden globals (argc/argv/envp) for native binary mode.
-        a64_add_hidden_globals();
+        // Hidden runtime globals come in via brt0.bsm (auto-injected).
 
         // Binary mode: allocate a label for each function, emit code, resolve fixups.
         enc_pos = 0;
