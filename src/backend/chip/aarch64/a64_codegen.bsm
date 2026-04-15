@@ -71,6 +71,18 @@ auto a64_ret_lbl;
 // These use negative values that can never collide with real packed names.
 auto a64_argc_sym, a64_argv_sym, a64_envp_sym;
 
+// ── Phase B1 register freelists ──────────────────────────────
+//
+// Two pools from day one. gp_freelist backs B1-B3 (integer / pointer
+// temps). simd_freelist is allocated empty and activated by B4, where
+// `: double` variables bind to it. Keeping both pools present now means
+// B4 does not have to touch B1-B3 code.
+//
+// GP pool = x9..x15 (7 temps). Bit i set = reg (9+i) is free.
+// SIMD pool = v0..v15 (16 regs). Bit i set = reg i is free.
+static auto a64_gp_free_mask;
+static auto a64_simd_free_mask;
+
 
 // ── Initialization ─────────────────────────────────────────
 
@@ -99,6 +111,104 @@ init_codegen_arm64() {
     a64_argc_sym = 0;
     a64_argv_sym = 0;
     a64_envp_sym = 0;
+    a64_gp_free_mask = 0;
+    a64_simd_free_mask = 0;
+    return 0;
+}
+
+// ── Phase B1 register freelist helpers ──────────────────────
+//
+// Reset both pools to fully-free at the start of every function. GP
+// pool covers x9..x15 (bit i = reg 9+i free). SIMD pool covers v0..v15
+// (bit i = reg i free). Fallbacks to push/pop are unconditional — if
+// the freelist is full, the caller must emit the old stack-save path
+// so no code path ever runs out of options.
+
+static void a64_freelist_reset() {
+    a64_gp_free_mask = 0x7F;     // bits 0..6 set = x9..x15 all free
+    a64_simd_free_mask = 0xFFFF; // bits 0..15 set = v0..v15 all free
+}
+
+// Allocate a free GP temp. Returns register number (9..15) on success
+// or -1 when the pool is exhausted. Callers must fall back to
+// a64_emit_push / a64_emit_pop on -1.
+static a64_gp_alloc() {
+    auto i, m;
+    for (i = 0; i < 7; i = i + 1) {
+        m = 1 << i;
+        if (a64_gp_free_mask & m) {
+            a64_gp_free_mask = a64_gp_free_mask & ~m;
+            return 9 + i;
+        }
+    }
+    return 0 - 1;
+}
+
+// Return a previously-allocated GP reg to the pool. No-op if reg is
+// outside the x9..x15 range — freeing a permanent reg (x0-x8) would
+// corrupt the mask bookkeeping. Double-free is silent (bit stays set).
+static void a64_gp_free(reg) {
+    auto m;
+    if (reg < 9 || reg > 15) { return; }
+    m = 1 << (reg - 9);
+    a64_gp_free_mask = a64_gp_free_mask | m;
+}
+
+// Allocate a free SIMD reg. Returns register number (0..15) or -1.
+// The SIMD pool is reserved from day one for Phase B4 (: double slice)
+// so its existence does not become a B1-B3 refactor later.
+static a64_simd_alloc() {
+    auto i, m;
+    for (i = 0; i < 16; i = i + 1) {
+        m = 1 << i;
+        if (a64_simd_free_mask & m) {
+            a64_simd_free_mask = a64_simd_free_mask & ~m;
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+// Return a SIMD reg to the pool. Bounds-checked the same way as GP.
+static void a64_simd_free(reg) {
+    auto m;
+    if (reg < 0 || reg > 15) { return; }
+    m = 1 << reg;
+    a64_simd_free_mask = a64_simd_free_mask | m;
+}
+
+// Return 1 if the given subtree contains any T_CALL node. Used by the
+// T_BINOP freelist path to decide whether a register save via mov is
+// safe across the right-side emission. ARM64 treats x9..x15 as caller-
+// saved, so a BL instruction anywhere in the right-side expression
+// would clobber a value we parked there — in that case we must fall
+// back to the stack-save path.
+//
+// Pure tree scan, no side effects — eligible for `: base`.
+static _a64_has_call(nd) : base {
+    auto n: Node, t;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    switch (t) {
+    T_CALL { return 1; }
+    T_BINOP {
+        if (_a64_has_call(n.b)) { return 1; }
+        return _a64_has_call(n.c);
+    }
+    T_TERNARY {
+        if (_a64_has_call(n.a)) { return 1; }
+        if (_a64_has_call(n.b)) { return 1; }
+        return _a64_has_call(n.c);
+    }
+    T_ASSIGN, T_MEMST {
+        if (_a64_has_call(n.a)) { return 1; }
+        return _a64_has_call(n.b);
+    }
+    T_UNARY { return _a64_has_call(n.b); }
+    T_MEMLD, T_ADDR, T_RET { return _a64_has_call(n.a); }
+    else { return 0; }
+    }
     return 0;
 }
 
@@ -895,9 +1005,28 @@ a64_emit_node(nd) {
         if (c0 == '<') { if (c1 == '<') { is_io = 1; } }
         if (c0 == '>') { if (c1 == '>') { is_io = 1; } }
 
-        // Evaluate left operand, push onto stack.
+        // Evaluate left operand, save it for the op below. Phase B1a.2:
+        // try the GP freelist before falling back to push/pop — a single
+        // mov beats two memory accesses through the stack. Float operands
+        // always use the float stack because the freelist is integer-only.
+        auto alloc_reg, left_reg_int;
+        alloc_reg = 0 - 1;
         lty = a64_emit_node(n.b);
-        if (lty == 1) { a64_emit_fpush(); } else { a64_emit_push(); }
+        if (lty == 1) {
+            a64_emit_fpush();
+        } else if (_a64_has_call(n.c)) {
+            // A BL inside the right-side would clobber x9..x15 (caller-
+            // saved on ARM64). Skip the freelist and push to stack.
+            a64_emit_push();
+        } else {
+            alloc_reg = a64_gp_alloc();
+            if (alloc_reg >= 0) {
+                if (a64_bin_mode) { enc_mov_reg(alloc_reg, 0); }
+                else { out("  mov x"); a64_print_dec(alloc_reg); out(", x0"); putchar('\n'); }
+            } else {
+                a64_emit_push();
+            }
+        }
 
         // Evaluate right operand.
         rty = a64_emit_node(n.c);
@@ -909,9 +1038,19 @@ a64_emit_node(nd) {
         if (use_flt == 1) {
             // Ensure right operand is in d0.
             if (rty == 0) { if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); } }
-            // Pop left operand into d1.
-            if (lty == 1) { a64_emit_fpop(1); }
-            else { a64_emit_pop(1); if (a64_bin_mode) { enc_scvtf(1, 1); } else { out("  scvtf d1, x1"); putchar('\n'); } }
+            // Place left operand in d1. Three sources, depending on how
+            // we saved it: the float stack, a freelist reg, or a push.
+            if (lty == 1) {
+                a64_emit_fpop(1);
+            } else if (alloc_reg >= 0) {
+                if (a64_bin_mode) { enc_scvtf(1, alloc_reg); }
+                else { out("  scvtf d1, x"); a64_print_dec(alloc_reg); putchar('\n'); }
+                a64_gp_free(alloc_reg);
+                alloc_reg = 0 - 1;
+            } else {
+                a64_emit_pop(1);
+                if (a64_bin_mode) { enc_scvtf(1, 1); } else { out("  scvtf d1, x1"); putchar('\n'); }
+            }
             // d1 = left, d0 = right.
 
             // Float arithmetic operators.
@@ -936,41 +1075,56 @@ a64_emit_node(nd) {
             return 1;
         }
 
-        // Integer path. Convert float operands to int if needed.
+        // Integer path. Convert float operands to int if needed, then
+        // place left in either the allocated freelist reg or in x1 via
+        // the fallback pop. left_reg_int names that register so every
+        // op below emits through a single parameter.
         if (rty == 1) { if (a64_bin_mode) { enc_fcvtzs(0,0); } else { out("  fcvtzs x0, d0"); putchar('\n'); } }
         if (lty == 1) {
             a64_emit_fpop(0);
             if (a64_bin_mode) { enc_fcvtzs(1,0); } else { out("  fcvtzs x1, d0"); putchar('\n'); }
+            left_reg_int = 1;
+        } else if (alloc_reg >= 0) {
+            left_reg_int = alloc_reg;
+            // Free the freelist bit up front — the data still lives in
+            // the register until the single op instruction below reads
+            // it, so bookkeeping can run ahead of the actual read.
+            a64_gp_free(alloc_reg);
+            alloc_reg = 0 - 1;
         } else {
             a64_emit_pop(1);
+            left_reg_int = 1;
         }
-        // x1 = left, x0 = right.
-        if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_add_reg(0,1,0); } else { out("  add x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_sub_reg(0,1,0); } else { out("  sub x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_mul(0,1,0); } else { out("  mul x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_sdiv(0,1,0); } else { out("  sdiv x0, x1, x0"); putchar('\n'); } return 0; } }
+        // x{left_reg_int} = left, x0 = right.
+        if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_add_reg(0,left_reg_int,0); } else { out("  add x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_sub_reg(0,left_reg_int,0); } else { out("  sub x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_mul(0,left_reg_int,0); } else { out("  mul x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_sdiv(0,left_reg_int,0); } else { out("  sdiv x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
         if (c0 == '%') { if (op_l == 1) {
-            if (a64_bin_mode) { enc_sdiv(8,1,0); enc_msub(0,8,0,1); }
-            else { out("  sdiv x8, x1, x0"); putchar('\n'); out("  msub x0, x8, x0, x1"); putchar('\n'); }
+            if (a64_bin_mode) { enc_sdiv(8,left_reg_int,0); enc_msub(0,8,0,left_reg_int); }
+            else {
+                out("  sdiv x8, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n');
+                out("  msub x0, x8, x0, x"); a64_print_dec(left_reg_int); putchar('\n');
+            }
             return 0;
         } }
         // Bitwise operators.
-        if (c0 == '&') { if (op_l == 1) { if (a64_bin_mode) { enc_and_reg(0,1,0); } else { out("  and x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '|') { if (op_l == 1) { if (a64_bin_mode) { enc_orr_reg(0,1,0); } else { out("  orr x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '^') { if (op_l == 1) { if (a64_bin_mode) { enc_eor_reg(0,1,0); } else { out("  eor x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '&') { if (op_l == 1) { if (a64_bin_mode) { enc_and_reg(0,left_reg_int,0); } else { out("  and x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '|') { if (op_l == 1) { if (a64_bin_mode) { enc_orr_reg(0,left_reg_int,0); } else { out("  orr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '^') { if (op_l == 1) { if (a64_bin_mode) { enc_eor_reg(0,left_reg_int,0); } else { out("  eor x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
         // Shift operators.
-        if (c0 == '>') { if (c1 == '>') { if (a64_bin_mode) { enc_asrv(0,1,0); } else { out("  asr x0, x1, x0"); putchar('\n'); } return 0; } }
-        if (c0 == '<') { if (c1 == '<') { if (a64_bin_mode) { enc_lslv(0,1,0); } else { out("  lsl x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '>') { if (c1 == '>') { if (a64_bin_mode) { enc_asrv(0,left_reg_int,0); } else { out("  asr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '<') { if (c1 == '<') { if (a64_bin_mode) { enc_lslv(0,left_reg_int,0); } else { out("  lsl x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
         // Comparison operators.
-        if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,0); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
-        if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,1); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
+        if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,0); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
+        if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,1); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
         if (c0 == '<') {
-            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,13); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); } return 0; }
-            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,11); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); } return 0; }
+            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,13); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); } return 0; }
+            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,11); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); } return 0; }
         }
         if (c0 == '>') {
-            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,10); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
-            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,12); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
+            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,10); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
+            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,12); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
         }
         // && and || removed from T_BINOP integer path — parser lowers them
         // to T_TERNARY (see parse_binops in bpp_parser.bsm).
@@ -1880,17 +2034,36 @@ a64_emit_stmt(nd) {
             }
             return 0;
         }
-        // Integer field types: convert float to bit pattern and store.
+        // Integer field types: emit value, save it, emit pointer, store.
+        // Phase B1c: freelist the value save when safe. The pointer
+        // expression in n.a might trigger a BL (caller-saved clobber),
+        // in which case we keep the push/pop fallback.
+        auto alloc_reg_st, val_reg;
+        alloc_reg_st = 0 - 1;
+        val_reg = 1;
         ety = a64_emit_node(n.b);
         if (ety == 1) {
             if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
         }
-        a64_emit_push();
+        if (_a64_has_call(n.a)) {
+            a64_emit_push();
+        } else {
+            alloc_reg_st = a64_gp_alloc();
+            if (alloc_reg_st >= 0) {
+                if (a64_bin_mode) { enc_mov_reg(alloc_reg_st, 0); }
+                else { out("  mov x"); a64_print_dec(alloc_reg_st); out(", x0"); putchar('\n'); }
+            } else {
+                a64_emit_push();
+            }
+        }
         a64_emit_node(n.a);
-        a64_emit_pop(1);
-        // Bit-packed field stores: load the containing byte, splice the new
-        // value's low bits in via BFI, store the byte back. x0 holds the
-        // pointer (post-pop) and x1 holds the source value.
+        if (alloc_reg_st >= 0) {
+            val_reg = alloc_reg_st;
+            a64_gp_free(alloc_reg_st);
+        } else {
+            a64_emit_pop(1);
+        }
+        // x0 = pointer, x{val_reg} = source value.
         auto sl, bo, bw;
         sl = ty_slice(fh);
         if (sl >= SL_BIT && sl <= SL_BIT7) {
@@ -1898,24 +2071,28 @@ a64_emit_stmt(nd) {
             bw = sl - 3;
             if (a64_bin_mode) {
                 enc_ldrb_uoff(2, 0, 0);
-                enc_bfi_w(2, 1, bo, bw);
+                enc_bfi_w(2, val_reg, bo, bw);
                 enc_strb_uoff(2, 0, 0);
             } else {
                 out("  ldrb w2, [x0]"); putchar('\n');
-                out("  bfi w2, w1, #"); a64_print_dec(bo);
+                out("  bfi w2, w"); a64_print_dec(val_reg); out(", #"); a64_print_dec(bo);
                 out(", #"); a64_print_dec(bw); putchar('\n');
                 out("  strb w2, [x0]"); putchar('\n');
             }
             return 0;
         }
         if (sl == SL_BYTE) {
-            if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
+            if (a64_bin_mode) { enc_strb_uoff(val_reg, 0, 0); }
+            else { out("  strb w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
         } else if (sl == SL_QUARTER) {
-            if (a64_bin_mode) { enc_strh_uoff(1, 0, 0); } else { out("  strh w1, [x0]"); putchar('\n'); }
+            if (a64_bin_mode) { enc_strh_uoff(val_reg, 0, 0); }
+            else { out("  strh w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
         } else if (sl == SL_HALF) {
-            if (a64_bin_mode) { enc_str_w_uoff(1, 0, 0); } else { out("  str w1, [x0]"); putchar('\n'); }
+            if (a64_bin_mode) { enc_str_w_uoff(val_reg, 0, 0); }
+            else { out("  str w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
         } else {
-            if (a64_bin_mode) { enc_str_uoff(1, 0, 0); } else { out("  str x1, [x0]"); putchar('\n'); }
+            if (a64_bin_mode) { enc_str_uoff(val_reg, 0, 0); }
+            else { out("  str x"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
         }
         return 0;
     }
@@ -2180,6 +2357,7 @@ a64_emit_func(fi) {
     arr_clear(a64_var_struct_idx);
     arr_clear(a64_var_off);
     arr_clear(a64_var_forced_ty);
+    a64_freelist_reset();
     a64_cur_fn_name = name_p;
     a64_cur_fn_idx = arr_get(a64_fn_fidx, fi);
 
