@@ -1,0 +1,53 @@
+// test_smart_dispatch.bpp — End-to-end validation for Phase 2 smart
+// dispatch. A for-loop with worker-safe storage is rewritten into a
+// call to job_parallel_for with a synthesized worker function.
+//
+// This test deliberately does NOT call job_init, so job_parallel_for
+// falls back to its serial path. That keeps the test cross-platform
+// (Linux + macOS) while still proving the rewrite is correct: the
+// compiler generated a valid call to a valid function, and the
+// synthesized function computed the expected per-index value.
+//
+// Imports bpp_job.bsm directly so job_parallel_for is linked in even
+// though stbgame was not pulled. Without this import the rewrite
+// would skip and the loop would stay serial — still correct, but
+// skipping the Phase 2 codegen path the test is meant to exercise.
+
+import "bpp_job.bsm";
+
+const N = 128;
+
+// Worker-shared storage. The `global` class is required: the scanner
+// rejects loops that touch GLOB_AUTO globals because no freeze-point
+// guarantee exists for them. Here we opt in explicitly.
+global results;
+
+// Pure filler. The body reads only the induction variable and writes
+// only the `global`-classed pointer target, so the scanner accepts
+// the loop and Stage 3 rewrites it into job_parallel_for(N, ...).
+void fill_results() {
+    auto i;
+    for (i = 0; i < N; i = i + 1) {
+        results[i] = i * 2;
+    }
+}
+
+main() {
+    auto i, ok;
+
+    results = malloc(N * 8);
+
+    // Invokes the rewritten loop — serial fallback inside the job
+    // runtime because no workers were initialized.
+    fill_results();
+
+    // Verify every slot carries the expected value.
+    ok = 1;
+    for (i = 0; i < N; i = i + 1) {
+        if (results[i] != i * 2) { ok = 0; }
+    }
+
+    free(results);
+    if (ok) { return 0; }
+    return 1;
+}

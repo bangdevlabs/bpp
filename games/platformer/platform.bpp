@@ -11,13 +11,18 @@ import "stbimage.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
-auto TILE_W;    // tile width in pixels (18 for Kenney)
-auto TILE_H;    // tile height in pixels
-auto MAP_W;     // map width in tiles
-auto MAP_H;     // map height in tiles
+// Kenney tile geometry: 18x18 pixel tiles on a 40x14 game grid.
+const TILE_W = 18;
+const TILE_H = 18;
+const MAP_W = 40;
+const MAP_H = 14;
 
-auto CHAR_W;    // character sprite width (24)
-auto CHAR_H;    // character sprite height (24)
+// Character sprite dimensions (Kenney character sheet is 24x24 per cell).
+const CHAR_W = 24;
+const CHAR_H = 24;
+
+// Index into the character sheet for the player sprite (1-based).
+const CHAR_PLAYER = 1;
 
 // ── Tile types (game logic) ─────────────────────────────
 
@@ -36,41 +41,44 @@ enum Tile {
 // Position in tilemap_packed.png (1-based, row-major, 20 cols).
 // Index = row * 20 + col + 1 (row/col 0-indexed).
 
-auto TS_GROUND;     // grass-topped ground surface
-auto TS_DIRT;       // brown dirt fill (underground)
-auto TS_BRICK;      // crate/brick block
-auto TS_PLATFORM;   // stone floating platform
-auto TS_COIN;       // gold coin collectible
-auto TS_SPIKE;      // spike/hazard
-auto TS_FLAG;       // flag goal marker
+const TS_GROUND   = 63;    // row 3, col 2: grass-topped ground
+const TS_DIRT     = 123;   // row 6, col 2: brown dirt underground
+const TS_BRICK    = 10;    // row 0, col 9: orange/brown block
+const TS_PLATFORM = 50;    // row 2, col 9: stone platform
+const TS_COIN     = 68;    // row 3, col 7: gold coin
+const TS_SPIKE    = 73;    // row 3, col 12: spike hazard
+const TS_FLAG     = 89;    // row 4, col 8: flag/marker
 
 // ── Character sprite handles ────────────────────────────
 
-auto char_sprites;  // array of GPU texture handles from character sheet
-auto char_count;    // number of character sprites loaded
-auto CHAR_PLAYER;   // index into char_sprites for player character
+// Loaded once by load_characters, frozen for the rest of the run.
+extrn char_sprites;
+extrn char_count;
 
 // ── Colors (HUD only) ───────────────────────────────────
 
-auto CLR_SKY;
-auto CLR_COIN;
+// Runtime-computed palette — rgba() is a B++ call, so these cannot be
+// `const`, but they are set once in init_game and read thereafter.
+extrn CLR_SKY;
+extrn CLR_COIN;
 
 // ── Game state ───────────────────────────────────────────
 
-auto tilemap;
-auto player;
+extrn tilemap;             // allocated once, tiles mutate but pointer is frozen
+extrn player;              // phys_body, same contract
+extrn coins_total;         // level constant set by build_level
+
 auto player_facing;
 auto player_anim;
 auto player_anim_t;
 auto player_alive;
 
 auto score;
-auto coins_total;
 auto CAM_X, CAM_Y;
 
 // ── Level design ─────────────────────────────────────────
 
-build_level() {
+void build_level() {
     auto x, y;
 
     // Ground: grass surface on top row, dirt fill below.
@@ -132,13 +140,11 @@ build_level() {
 
     // Flag at the end.
     tile_set(tilemap, MAP_W - 3, MAP_H - 3, T_FLAG);
-
-    return 0;
 }
 
 // ── Camera ───────────────────────────────────────────────
 
-update_camera() {
+void update_camera() {
     auto target_x, target_y, scr_w, scr_h;
     scr_w = 320;
     scr_h = 180;
@@ -146,49 +152,50 @@ update_camera() {
     target_y = phys_px_y(player) - scr_h / 2 + 8;
     CAM_X = clamp(target_x, 0, MAP_W * TILE_W - scr_w);
     CAM_Y = clamp(target_y, 0, MAP_H * TILE_H - scr_h);
-    return 0;
 }
 
 // ── Player update ────────────────────────────────────────
 
-update_player(dt) {
+void update_player(dt) {
     auto px, py, tile;
     auto b: Body;
     b = player;
 
-    if (player_alive == 0) { return 0; }
+    if (player_alive == 0) { return; }
 
+    // Arrow keys and WASD share input meaning for movement and jump.
     b.vx = 0;
-    if (key_down(KEY_LEFT)) { b.vx = 0 - b.move_spd; player_facing = 1; }
-    if (key_down(KEY_RIGHT)) { b.vx = b.move_spd; player_facing = 0; }
-    if (key_down(KEY_A)) { b.vx = 0 - b.move_spd; player_facing = 1; }
-    if (key_down(KEY_D)) { b.vx = b.move_spd; player_facing = 0; }
+    if (key_down(KEY_LEFT)  || key_down(KEY_A)) { b.vx = 0 - b.move_spd; player_facing = 1; }
+    if (key_down(KEY_RIGHT) || key_down(KEY_D)) { b.vx = b.move_spd;     player_facing = 0; }
 
-    if (key_pressed(KEY_SPACE)) { phys_jump(player); }
-    if (key_pressed(KEY_W)) { phys_jump(player); }
-    if (key_pressed(KEY_UP)) { phys_jump(player); }
+    if (key_pressed(KEY_SPACE) || key_pressed(KEY_W) || key_pressed(KEY_UP)) {
+        phys_jump(player);
+    }
 
     phys_update(player, dt, tilemap);
 
-    // Collect coins.
+    // Interact with the tile the player is standing on. Tile dispatch
+    // via switch keeps COIN/SPIKE/FLAG side effects clearly separated.
     px = phys_px_x(player) + 6;
     py = phys_px_y(player) + 8;
     tile = tile_at(tilemap, px, py);
-    if (tile == T_COIN) {
+    switch (tile) {
+    T_COIN {
         tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
         score = score + 100;
     }
-
-    if (tile == T_SPIKE) { player_alive = 0; }
-
-    if (tile == T_FLAG) {
+    T_SPIKE { player_alive = 0; }
+    T_FLAG {
         score = score + 1000;
         tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
+    }
+    else { }
     }
 
     if (phys_px_y(player) > MAP_H * TILE_H) { player_alive = 0; }
 
-    // Animation.
+    // Animation. Advance the walk cycle while moving; snap to frame 0
+    // when standing still so the next move starts clean.
     if (b.vx != 0) {
         player_anim_t = player_anim_t + dt;
         if (player_anim_t > 150) {
@@ -199,14 +206,12 @@ update_player(dt) {
         player_anim = 0;
         player_anim_t = 0;
     }
-
-    return 0;
 }
 
 // ── Rendering ────────────────────────────────────────────
 
 // Draw the player using a Kenney character sprite.
-draw_player() {
+void draw_player() {
     auto sx, sy, tex;
     sx = phys_px_x(player) - CAM_X;
     sy = phys_px_y(player) - CAM_Y;
@@ -223,20 +228,15 @@ draw_player() {
                 render_rect(sx, sy, CHAR_W, CHAR_H, RED);
             }
             _stb_gpu_sprite(tex, sx, sy, CHAR_W, CHAR_H, CHAR_W, CHAR_H);
-            return 0;
+            return;
         }
     }
 
     // Fallback: colored rectangle if sprite not loaded.
-    if (player_alive == 0) {
-        render_rect(sx + 5, sy + 6, 14, 18, RED);
-    } else {
-        render_rect(sx + 5, sy + 6, 14, 18, rgba(80, 120, 220, 255));
-    }
-    return 0;
+    render_rect(sx + 5, sy + 6, 14, 18, player_alive == 0 ? RED : rgba(80, 120, 220, 255));
 }
 
-draw_background() {
+void draw_background() {
     auto y, r, g, b;
     y = 0;
     while (y < 180) {
@@ -256,11 +256,9 @@ draw_background() {
         mx = mx + 80;
         mh = 30 + (mh * 7 + 13) % 20;
     }
-
-    return 0;
 }
 
-draw_hud() {
+void draw_hud() {
     render_text("SCORE", 8, 4, 1, WHITE);
     render_number(50, 4, 1, YELLOW, score);
     render_circle(8, 20, 4, CLR_COIN);
@@ -269,41 +267,19 @@ draw_hud() {
     if (player_alive == 0) {
         render_text("PRESS R TO RESTART", 80, 80, 1, RED);
     }
-
-    return 0;
 }
 
 // ── Init / Reset ─────────────────────────────────────────
 
 // Load character sprites from the Kenney character sheet.
 // Called once at startup (not on restart).
-load_characters() {
-    CHAR_W = 24;
-    CHAR_H = 24;
-    CHAR_PLAYER = 1;    // first character in the sheet (1-based)
-
+void load_characters() {
     char_count = tile_load_set("assets/Tilemap/tilemap-characters_packed.png", CHAR_W, CHAR_H, &char_sprites);
-    return 0;
 }
 
-init_game() {
-    TILE_W = 18;
-    TILE_H = 18;
-    MAP_W = 40;
-    MAP_H = 14;
-
+void init_game() {
     CLR_SKY = rgba(100, 150, 220, 255);
     CLR_COIN = rgba(255, 220, 50, 255);
-
-    // Kenney tileset tile indices (1-based, row-major in 20-col grid).
-    // To find a tile: index = row * 20 + col + 1 (row/col 0-indexed).
-    TS_GROUND   = 63;   // row 3, col 2: grass-topped ground
-    TS_DIRT     = 123;  // row 6, col 2: brown dirt underground
-    TS_BRICK    = 10;   // row 0, col 9: orange/brown block
-    TS_PLATFORM = 50;   // row 2, col 9: stone platform (middle)
-    TS_COIN     = 68;   // row 3, col 7: gold coin
-    TS_SPIKE    = 73;   // row 3, col 12: spike hazard
-    TS_FLAG     = 89;   // row 4, col 8: flag/marker
 
     // Create tilemap with 18x18 tile dimensions.
     tilemap = tile_new(MAP_W, MAP_H, TILE_W, TILE_H);
@@ -342,8 +318,6 @@ init_game() {
     score = 0;
     CAM_X = 0;
     CAM_Y = 0;
-
-    return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────

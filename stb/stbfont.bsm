@@ -6,7 +6,10 @@
 // Future: TrueType reader for scalable fonts (stb_truetype.h translation).
 
 // Font data pointer (768 bytes: 96 chars × 8 rows × 1 byte).
-auto _stb_font;
+// extrn: set once by init_font, read by every draw_text / render_text call
+// afterwards. The pointer and the bytes it points at are frozen after
+// initialization, which matches the GLOB_EXTRN worker-visibility contract.
+extrn _stb_font;
 
 // Initialize the 8x8 bitmap font.
 void init_font() {
@@ -189,51 +192,62 @@ import "bpp_buf.bsm";
 
 // ── TrueType state ──────────────────────────────────────────
 // One font loaded at a time (global state, like stbimage.bsm).
+//
+// Every slot below is populated by font_load at program init and read
+// by every downstream rendering / text measurement call. Declared
+// extrn so the dispatch scanner treats them as worker-visible-safe.
+// If a program ever calls font_load after maestro_run / job_init,
+// the extrn contract breaks — callers who need runtime reload should
+// stop workers first.
 
-auto _ttf_data, _ttf_len;        // Raw .ttf file in memory.
-auto _ttf_num_tables;             // Number of tables in the font.
+extrn _ttf_data, _ttf_len;        // Raw .ttf file in memory.
+extrn _ttf_num_tables;            // Number of tables in the font.
 
 // Table offsets (byte offset from start of file).
-auto _ttf_head, _ttf_hhea, _ttf_maxp, _ttf_hmtx;
-auto _ttf_loca, _ttf_glyf, _ttf_cmap, _ttf_kern;
+extrn _ttf_head, _ttf_hhea, _ttf_maxp, _ttf_hmtx;
+extrn _ttf_loca, _ttf_glyf, _ttf_cmap, _ttf_kern;
 
 // Font metrics from head/hhea/maxp.
-auto _ttf_units_per_em;           // Design units per em square.
-auto _ttf_num_glyphs;             // Total glyph count.
-auto _ttf_num_hmetrics;           // Entries in hmtx table.
-auto _ttf_loca_format;            // 0 = short offsets, 1 = long offsets.
-auto _ttf_ascent, _ttf_descent;   // Typographic ascent/descent (design units).
+extrn _ttf_units_per_em;          // Design units per em square.
+extrn _ttf_num_glyphs;            // Total glyph count.
+extrn _ttf_num_hmetrics;          // Entries in hmtx table.
+extrn _ttf_loca_format;           // 0 = short offsets, 1 = long offsets.
+extrn _ttf_ascent, _ttf_descent;  // Typographic ascent/descent (design units).
 
 // Scale factor in 16.16 fixed point (set by font_load for target pixel height).
-auto _ttf_scale;
+extrn _ttf_scale;
 
 // Atlas state (pre-rendered ASCII 32-127).
-auto _ttf_atlas;                  // Pixel buffer (R8 alpha mask).
-auto _ttf_atlas_w, _ttf_atlas_h;  // Atlas dimensions.
-auto _ttf_glyph_info;            // Per-glyph info: 96 entries × 8 fields.
+extrn _ttf_atlas;                 // Pixel buffer (R8 alpha mask).
+extrn _ttf_atlas_w, _ttf_atlas_h; // Atlas dimensions.
+extrn _ttf_glyph_info;            // Per-glyph info: 96 entries × 8 fields.
 // Fields per glyph (index = (ch-32) * 8):
 //   [0] atlas_x  [1] atlas_y  [2] width  [3] height
 //   [4] xoff     [5] yoff     [6] advance [7] lsb
 
-auto _ttf_loaded;                 // 1 if TrueType font is active.
+extrn _ttf_loaded;                // 1 if TrueType font is active.
 
 // ── Big-endian readers ──────────────────────────────────────
 // TrueType is big-endian throughout.
+//
+// Each reader touches only the frozen _ttf_data byte array via peek,
+// which is a pure-extern builtin, so the dispatch classifier accepts
+// the `: base` annotation. That keeps any loop that composes these
+// readers eligible for automatic parallel dispatch in the future.
 
-static _ttf_u8(off) { return peek(_ttf_data + off); }
+static _ttf_u8(off) : base { return peek(_ttf_data + off); }
 
-static _ttf_u16(off) {
+static _ttf_u16(off) : base {
     return peek(_ttf_data + off) * 256 + peek(_ttf_data + off + 1);
 }
 
-static _ttf_i16(off) {
+static _ttf_i16(off) : base {
     auto v;
     v = _ttf_u16(off);
-    if (v >= 32768) { v = v - 65536; }
-    return v;
+    return v >= 32768 ? v - 65536 : v;
 }
 
-static _ttf_u32(off) {
+static _ttf_u32(off) : base {
     return peek(_ttf_data + off) * 16777216 + peek(_ttf_data + off + 1) * 65536
          + peek(_ttf_data + off + 2) * 256 + peek(_ttf_data + off + 3);
 }
@@ -254,15 +268,21 @@ static void _ttf_find_tables() {
         off = 12 + i * 16;
         tag = _ttf_u32(off);
 
-        // Match 4-byte ASCII tags against known table IDs.
-        if (tag == 0x68656164) { _ttf_head = _ttf_u32(off + 8); }      // 'head'
-        else if (tag == 0x68686561) { _ttf_hhea = _ttf_u32(off + 8); } // 'hhea'
-        else if (tag == 0x6D617870) { _ttf_maxp = _ttf_u32(off + 8); } // 'maxp'
-        else if (tag == 0x686D7478) { _ttf_hmtx = _ttf_u32(off + 8); } // 'hmtx'
-        else if (tag == 0x6C6F6361) { _ttf_loca = _ttf_u32(off + 8); } // 'loca'
-        else if (tag == 0x676C7966) { _ttf_glyf = _ttf_u32(off + 8); } // 'glyf'
-        else if (tag == 0x636D6170) { _ttf_cmap = _ttf_u32(off + 8); } // 'cmap'
-        else if (tag == 0x6B65726E) { _ttf_kern = _ttf_u32(off + 8); } // 'kern'
+        // Match 4-byte ASCII tags against known table IDs. The hex
+        // values are 'head', 'hhea', 'maxp', 'hmtx', 'loca', 'glyf',
+        // 'cmap', 'kern' — TrueType stores them big-endian so the
+        // numeric equivalents read straight off _ttf_u32.
+        switch (tag) {
+        0x68656164 { _ttf_head = _ttf_u32(off + 8); }
+        0x68686561 { _ttf_hhea = _ttf_u32(off + 8); }
+        0x6D617870 { _ttf_maxp = _ttf_u32(off + 8); }
+        0x686D7478 { _ttf_hmtx = _ttf_u32(off + 8); }
+        0x6C6F6361 { _ttf_loca = _ttf_u32(off + 8); }
+        0x676C7966 { _ttf_glyf = _ttf_u32(off + 8); }
+        0x636D6170 { _ttf_cmap = _ttf_u32(off + 8); }
+        0x6B65726E { _ttf_kern = _ttf_u32(off + 8); }
+        else { }
+        }
     }
 }
 
@@ -294,10 +314,10 @@ static _ttf_cmap4_off() {
         sub_off = _ttf_u32(_ttf_cmap + 4 + i * 8 + 4);
         // Platform 3 (Windows), encoding 1 (Unicode BMP) or
         // Platform 0 (Unicode), any encoding.
-        if (plat == 3) { if (enc == 1) {
+        if (plat == 3 && enc == 1) {
             fmt = _ttf_u16(_ttf_cmap + sub_off);
             if (fmt == 4) { return _ttf_cmap + sub_off; }
-        } }
+        }
         if (plat == 0) {
             fmt = _ttf_u16(_ttf_cmap + sub_off);
             if (fmt == 4) { return _ttf_cmap + sub_off; }
@@ -407,9 +427,9 @@ static _ttf_get_kern(g1, g2) {
             for (j = 0; j < num_pairs; j = j + 1) {
                 left = _ttf_u16(off + 14 + j * 6);
                 right = _ttf_u16(off + 14 + j * 6 + 2);
-                if (left == g1) { if (right == g2) {
+                if (left == g1 && right == g2) {
                     return _ttf_i16(off + 14 + j * 6 + 4);
-                } }
+                }
             }
         }
         off = off + length;
@@ -757,7 +777,7 @@ static _ttf_rasterize(w, h) {
                 auto ey_min, ey_max;
                 ey_min = _ttf_edges[b + 2] * 4;
                 ey_max = _ttf_edges[b + 3] * 4;
-                if (ey_min <= y_fp) { if (ey_max > y_fp) {
+                if (ey_min <= y_fp && ey_max > y_fp) {
                     // Edge is active. Compute X crossing.
                     // dx_fp is per pixel, (y_fp - ey_min) is in sub-pixels, so divide by 4.
                     auto ex, dir;
@@ -769,7 +789,7 @@ static _ttf_rasterize(w, h) {
                         crossings[nc * 2 + 1] = dir;
                         nc = nc + 1;
                     }
-                } }
+                }
             }
 
             // Sort crossings by X (insertion sort).
@@ -800,9 +820,9 @@ static _ttf_rasterize(w, h) {
                 if (winding != 0) {
                     // Fill from prev_x to cur_x.
                     for (cx_px = prev_x; cx_px < cur_x; cx_px = cx_px + 1) {
-                        if (cx_px >= 0) { if (cx_px < w) {
+                        if (cx_px >= 0 && cx_px < w) {
                             scanline[cx_px] = scanline[cx_px] + 1;
-                        } }
+                        }
                     }
                 }
                 winding = winding + crossings[ci * 2 + 1];

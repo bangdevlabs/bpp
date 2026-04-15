@@ -35,17 +35,24 @@ const max(a, b) {
 }
 
 // ── Game state ──────────────────────────────────────────────
+//
+// extrn: pointers allocated once in main(), backing memory mutates but
+//        the pointer slot itself is frozen post-init.
+// auto:  per-frame mutable scalars. Main-thread-only (snake_gpu has
+//        no workers, unlike snake_maestro).
 
-auto world;
-auto body_pool;
-auto frame_arena;
+extrn world;
+extrn body_pool;
+extrn frame_arena;
+extrn body;
+extrn scores;
 
 auto head_x, head_y;
-auto body, body_len;
+auto body_len;
 auto facing, dead, score;
 auto apple_x, apple_y;
 
-auto scores, num_scores, score_saved;
+auto num_scores, score_saved;
 
 // ── Helpers ─────────────────────────────────────────────────
 
@@ -126,47 +133,44 @@ void update() {
     auto i, bx, by;
     if (dead) { return; }
 
-    if (key_down(KEY_UP))    { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
-    if (key_down(KEY_RIGHT)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
-    if (key_down(KEY_DOWN))  { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
-    if (key_down(KEY_LEFT))  { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+    // Arrow keys and WASD both steer; block 180° reversals.
+    if (key_down(KEY_UP)    && facing != DIR_DOWN)  { facing = DIR_UP; }
+    if (key_down(KEY_RIGHT) && facing != DIR_LEFT)  { facing = DIR_RIGHT; }
+    if (key_down(KEY_DOWN)  && facing != DIR_UP)    { facing = DIR_DOWN; }
+    if (key_down(KEY_LEFT)  && facing != DIR_RIGHT) { facing = DIR_LEFT; }
 
-    if (key_down(KEY_W)) { if (facing != DIR_DOWN)  { facing = DIR_UP; } }
-    if (key_down(KEY_D)) { if (facing != DIR_LEFT)  { facing = DIR_RIGHT; } }
-    if (key_down(KEY_S)) { if (facing != DIR_UP)    { facing = DIR_DOWN; } }
-    if (key_down(KEY_A)) { if (facing != DIR_RIGHT) { facing = DIR_LEFT; } }
+    if (key_down(KEY_W) && facing != DIR_DOWN)  { facing = DIR_UP; }
+    if (key_down(KEY_D) && facing != DIR_LEFT)  { facing = DIR_RIGHT; }
+    if (key_down(KEY_S) && facing != DIR_UP)    { facing = DIR_DOWN; }
+    if (key_down(KEY_A) && facing != DIR_RIGHT) { facing = DIR_LEFT; }
 
     shift_body();
     body[0] = head_x;
     body[1] = head_y;
 
-    if (facing == DIR_UP)    { head_y = head_y - CELL; }
-    if (facing == DIR_RIGHT) { head_x = head_x + CELL; }
-    if (facing == DIR_DOWN)  { head_y = head_y + CELL; }
-    if (facing == DIR_LEFT)  { head_x = head_x - CELL; }
+    switch (facing) {
+    DIR_UP    { head_y = head_y - CELL; }
+    DIR_RIGHT { head_x = head_x + CELL; }
+    DIR_DOWN  { head_y = head_y + CELL; }
+    DIR_LEFT  { head_x = head_x - CELL; }
+    else      { }
+    }
 
-    if (head_x < 0)  { dead = 1; }
-    if (head_x >= W) { dead = 1; }
-    if (head_y < 0)  { dead = 1; }
-    if (head_y >= H) { dead = 1; }
+    if (head_x < 0 || head_x >= W || head_y < 0 || head_y >= H) { dead = 1; }
 
-    if (head_x == apple_x) {
-        if (head_y == apple_y) {
-            score = score + 1;
-            body_len = body_len + 1;
-            spawn_particles(apple_x, apple_y, 8, YELLOW);
-            randomize_apple();
-        }
+    if (head_x == apple_x && head_y == apple_y) {
+        score = score + 1;
+        body_len = body_len + 1;
+        spawn_particles(apple_x, apple_y, 8, YELLOW);
+        randomize_apple();
     }
 
     for (i = 0; i < body_len; i = i + 1) {
         bx = body[i * 2];
         by = body[i * 2 + 1];
-        if (head_x == bx) {
-            if (head_y == by) {
-                dead = 1;
-                spawn_particles(head_x, head_y, 16, RED);
-            }
+        if (head_x == bx && head_y == by) {
+            dead = 1;
+            spawn_particles(head_x, head_y, 16, RED);
         }
     }
 }
@@ -178,7 +182,7 @@ void add_score(s) {
     pos = num_scores;
     for (i = 0; i < num_scores; i = i + 1) {
         cur = scores[i];
-        if (s > cur) { if (pos == num_scores) { pos = i; } }
+        if (s > cur && pos == num_scores) { pos = i; }
     }
     if (num_scores < 5) { num_scores = num_scores + 1; }
     for (j = num_scores - 1; j > pos; j = j - 1) {
@@ -232,9 +236,8 @@ main() {
             render_rect(body[i * 2], body[i * 2 + 1], CELL - 1, CELL - 1, GREEN);
         }
 
-        // Head.
-        if (dead) { render_rect(head_x, head_y, CELL - 1, CELL - 1, RED); }
-        else { render_rect(head_x, head_y, CELL - 1, CELL - 1, WHITE); }
+        // Head. Red while dying, white while alive.
+        render_rect(head_x, head_y, CELL - 1, CELL - 1, dead ? RED : WHITE);
 
         // Particles (ECS-driven).
         update_particles(dt);

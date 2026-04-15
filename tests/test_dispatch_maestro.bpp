@@ -1,0 +1,65 @@
+// test_dispatch_maestro.bpp — Reproducer for the snake_maestro runtime
+// regression. Mirrors the pattern that triggers it: extrn array assigned
+// once at init, then zeroed via a dispatchable for-loop. Workers are
+// active (maestro_run spawned them) when the rewritten loop runs.
+//
+// The test does NOT use stbgame or open a window. maestro_run drives
+// solo/base/render callbacks; the solo callback immediately flips the
+// quit flag, so the loop runs exactly one tick and exits.
+//
+// Returns 0 if the init-phase zeroing produced correct contents, 1
+// otherwise. Detects crashes or deadlocks through the test runner's
+// timeout (run_all.sh defaults), since a hanging job_wait_all would
+// never return.
+
+import "bpp_maestro.bsm";
+
+const N = 1000;
+
+// extrn storage: assigned once inside init, frozen afterwards.
+// Matches snake_maestro's `extrn body;` / `extrn scores;` shape, which
+// is exactly what the Phase 2 scanner promotes to dispatch-safe.
+extrn buf;
+
+// The canary loop — identical in shape to snake_maestro's init_game
+// body zeroing. The scanner rewrites it into job_parallel_for.
+void zero_buf() {
+    auto i;
+    for (i = 0; i < N; i = i + 1) {
+        buf[i] = 0;
+    }
+}
+
+// Init phase — allocate buf and zero it. Runs on the main thread after
+// job_init has already spawned workers, so the rewritten zero_buf fires
+// its jobs into live queues.
+void init_phase() {
+    buf = malloc(N * 8);
+    zero_buf();
+}
+
+// Solo phase — verify the init-phase results and stop the loop on the
+// very first tick. If any slot is non-zero the test fails; if the loop
+// hangs (missing worker, bad sync) the test runner times out.
+auto _result;
+void solo_phase(dt) {
+    auto i;
+    _result = 0;
+    for (i = 0; i < N; i = i + 1) {
+        if (buf[i] != 0) { _result = 1; }
+    }
+    maestro_quit();
+}
+
+void base_phase(dt) { }
+void render_phase(alpha) { }
+
+main() {
+    maestro_register_init(fn_ptr(init_phase));
+    maestro_register_solo(fn_ptr(solo_phase));
+    maestro_register_base(fn_ptr(base_phase));
+    maestro_register_render(fn_ptr(render_phase));
+    maestro_configure(60);
+    maestro_run();
+    return _result;
+}

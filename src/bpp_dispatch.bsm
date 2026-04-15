@@ -108,6 +108,24 @@ void init_dispatch() {
     pure_ext = arr_new();
     stride_vars = arr_new();
     dsp_local_vars = arr_new();
+
+    // Seed the pure-extern set with builtins the compiler emits inline
+    // and that have no observable side effect. Without this seed the
+    // classifier is pessimistic about any function that touches raw
+    // memory, which downgrades genuinely pure helpers (e.g. string
+    // length, packed field readers) all the way to PHASE_SOLO and
+    // triggers a spurious W013 wave on the `: base` annotations that
+    // those helpers legitimately carry.
+    //
+    // Members of the set must be read-only: they may compute over
+    // arguments and read memory through explicit pointers, but they
+    // must not write through any pointer, allocate, block, or call a
+    // syscall. Today that narrows the list to the single-byte loaders.
+    //   peek(p)           — read 8 bytes at p. Pure.
+    //   str_peek(s, i)    — read byte s[i] of a C-string. Pure.
+    // Expand with care: `poke` writes memory and therefore stays out.
+    add_pure_extern(_dsp_pack_name("peek", 4));
+    add_pure_extern(_dsp_pack_name("str_peek", 8));
 }
 
 // ── Global lookup helper ───────────────────────────────────
@@ -126,17 +144,23 @@ dsp_find_global(name_p) {
     return 0 - 1;
 }
 
-// Register a pure extern function (no side effects). Call during setup.
-add_pure_extern(name_p) {
+// Register a pure extern function (no side effects). Call during setup,
+// typically from init_dispatch for compiler-known builtins or from
+// library code that wraps FFI calls it has audited as side-effect-free.
+void add_pure_extern(name_p) {
     pure_ext = arr_push(pure_ext, name_p);
-    return 0;
 }
 
-// Check if a packed name is a known-pure extern.
+// Return 1 if a packed name matches any registered pure extern, 0
+// otherwise. Uses content comparison (packed_eq) because the same
+// identifier can be interned at different vbuf offsets at the seed
+// site (init_dispatch) and the call sites the compiler scans later.
 is_pure_extern(name_p) {
-    auto i;
+    auto i, v;
     for (i = 0; i < arr_len(pure_ext); i = i + 1) {
-        if (arr_get(pure_ext, i) == name_p) { return 1; }
+        v = arr_get(pure_ext, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
     }
     return 0;
 }
@@ -963,8 +987,8 @@ classify_all_functions() {
                 diag_packed(*(funcs[i] + FN_NAME));
                 diag_str("' annotated ': base' but has side effects");
                 diag_newline();
-                diag_loc(*(funcs[i] + 64));
-                diag_show_line(*(funcs[i] + 64));
+                diag_loc(*(funcs[i] + FN_SRC_TOK));
+                diag_show_line(*(funcs[i] + FN_SRC_TOK));
             }
         }
     }
@@ -1214,6 +1238,615 @@ show_promotions() {
         diag_newline();
     }
     return 0;
+}
+
+// ── Phase 2: smart dispatch loop synthesis (Stage 1 scanner) ──
+//
+// After classify_all_functions() and promote_globals() finish, this
+// pass walks every parsed function body looking for `for` loops that
+// qualify for transparent parallel dispatch through job_parallel_for.
+//
+// A loop is a candidate if ALL of the following hold:
+//   A. It is a desugared `for` loop — a T_WHILE whose step expression
+//      is stashed in node.e (pure `while` loops carry node.e == 0).
+//   B. The step expression has the form `i = i + 1` (MVP: stride 1).
+//   C. The condition has the form `i < N` where N is either an
+//      integer literal or a reference to a global variable whose
+//      glob_class[] is GLOB_EXTRN or GLOB_GLOBAL. Globals still at
+//      GLOB_AUTO are main-thread-only, so using one as the bound
+//      would be unsafe to observe from a worker thread.
+//   D. The body reads and writes ONLY:
+//        - the induction variable,
+//        - `auto` declarations made inside the body (loop-locals),
+//        - globals whose class is GLOB_EXTRN or GLOB_GLOBAL.
+//   E. Every T_CALL in the body targets either a known-pure extern
+//      function or a user function already classified PHASE_BASE by
+//      classify_all_functions().
+//   F. The body contains no T_BREAK, T_CONTINUE, or T_RET. Those
+//      cannot cross the boundary of the synthesized worker function.
+//
+// Stage 1 is read-only. It populates dispatch_candidates[] with the
+// eligible loops so the programmer can inspect the analysis with the
+// `--dispatch` flag. Stage 2 will synthesize the worker function;
+// Stage 3 will rewrite the loop into a call to job_parallel_for and
+// validate on snake_maestro.
+//
+// Why GLOB_EXTRN is considered safe even though workers may read it:
+// GLOB_EXTRN means "assigned before the freeze point and never after",
+// so every worker observes a stable post-init snapshot. GLOB_GLOBAL
+// is the programmer's explicit opt-in to shared mutable state. Only
+// GLOB_AUTO carries no ordering guarantee, and is always rejected.
+
+// Parallel arrays, one slot per candidate loop found this pass.
+auto dispatch_candidates;      // arr<Node*>:  the T_WHILE node itself
+auto dispatch_cand_fn_idx;     // arr<int>:    index of the enclosing fn
+auto dispatch_cand_loop_var;   // arr<int>:    packed name of induction var
+auto dispatch_cand_bound;      // arr<Node*>:  the cond RHS (the N expr)
+auto dispatch_cand_synth_idx;  // arr<int>:    funcs[] slot of the synth fn
+auto dispatch_cand_synth_name; // arr<int>:    packed name of the synth fn
+
+// Scratch set of packed names declared via `auto` at the top level of
+// the candidate body. Rebuilt per candidate by _fdc_try_candidate.
+auto _fdc_loop_locals;
+
+// Return the one-character operator stored inside a packed identifier,
+// or 0 if the packed value is not exactly a one-character name. Used
+// to recognize `+` and `<` without relying on pointer-identity compare,
+// because the parser may allocate several vbuf slots for the same op.
+static _fdc_op_char(packed) {
+    if (unpack_l(packed) != 1) { return 0; }
+    return peek(vbuf + unpack_s(packed));
+}
+
+// Return 1 if the packed name refers to a safe target inside a
+// candidate loop body: the induction variable, a loop-local auto, or
+// a global whose storage class is GLOB_EXTRN / GLOB_GLOBAL. Function
+// parameters and outer function-locals are rejected because the worker
+// has no access to the main thread's stack frame, and GLOB_AUTO
+// globals are rejected by contract.
+static _fdc_name_is_safe(name_p, loop_var_p) {
+    auto i, v, gi, cls;
+    if (name_p == loop_var_p) { return 1; }
+    if (packed_eq(name_p, loop_var_p)) { return 1; }
+    for (i = 0; i < arr_len(_fdc_loop_locals); i = i + 1) {
+        v = arr_get(_fdc_loop_locals, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
+    }
+    gi = dsp_find_global(name_p);
+    if (gi >= 0) {
+        cls = arr_get(glob_class, gi);
+        if (cls == GLOB_EXTRN) { return 1; }
+        if (cls == GLOB_GLOBAL) { return 1; }
+    }
+    return 0;
+}
+
+// Return 1 if the packed value looks like a decimal or hex integer
+// literal. Rejects strings (leading `"`) and float literals (any `.`).
+// Inline here so the dispatch module does not need to reach into
+// parser internals — parse_int_lit_value / is_int_lit_node are static.
+static _fdc_is_int_lit(packed) {
+    auto s, l, i;
+    s = unpack_s(packed);
+    l = unpack_l(packed);
+    if (l == 0) { return 0; }
+    if (peek(vbuf + s) == '"') { return 0; }
+    for (i = 0; i < l; i = i + 1) {
+        if (peek(vbuf + s + i) == '.') { return 0; }
+    }
+    return 1;
+}
+
+// Walk an AST subtree verifying that every reference, call, and
+// statement inside it is dispatch-safe. Returns 1 when the subtree
+// can run on a worker thread, 0 when anything unsafe appears.
+//
+// The checker is stricter than has_side_effects() above: it is not
+// enough for an expression to be pure — every storage location it
+// reads or writes must also be legal for a worker thread to touch.
+//
+// Self-recursive; no forward declaration needed (same pattern as
+// contains_var above).
+static _fdc_subtree_safe(nd, loop_var_p) {
+    auto n: Node, p: Node;
+    auto t, i, arr, cnt, name_p, callee_idx;
+    if (nd == 0) { return 1; }
+    n = nd;
+    t = n.ntype;
+
+    switch (t) {
+    T_LIT, T_NOP, T_DECL { return 1; }
+    T_BREAK, T_CONTINUE, T_RET { return 0; }
+    T_VAR { return _fdc_name_is_safe(n.a, loop_var_p); }
+    T_ASSIGN {
+        p = n.a;
+        if (p != 0) {
+            if (p.ntype == T_VAR) {
+                if (_fdc_name_is_safe(p.a, loop_var_p) == 0) { return 0; }
+            } else {
+                if (_fdc_subtree_safe(n.a, loop_var_p) == 0) { return 0; }
+            }
+        }
+        return _fdc_subtree_safe(n.b, loop_var_p);
+    }
+    T_CALL {
+        name_p = n.a;
+        callee_idx = _dsp_find_func_idx(name_p);
+        if (callee_idx >= 0) {
+            if (arr_get(fn_phase, callee_idx) != PHASE_BASE) { return 0; }
+        } else {
+            if (is_pure_extern(name_p) == 0) { return 0; }
+        }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) {
+            if (_fdc_subtree_safe(arr[i], loop_var_p) == 0) { return 0; }
+        }
+        return 1;
+    }
+    T_BINOP {
+        if (_fdc_subtree_safe(n.b, loop_var_p) == 0) { return 0; }
+        return _fdc_subtree_safe(n.c, loop_var_p);
+    }
+    T_TERNARY {
+        if (_fdc_subtree_safe(n.a, loop_var_p) == 0) { return 0; }
+        if (_fdc_subtree_safe(n.b, loop_var_p) == 0) { return 0; }
+        return _fdc_subtree_safe(n.c, loop_var_p);
+    }
+    T_UNARY { return _fdc_subtree_safe(n.b, loop_var_p); }
+    T_MEMLD { return _fdc_subtree_safe(n.a, loop_var_p); }
+    T_ADDR  { return _fdc_subtree_safe(n.a, loop_var_p); }
+    T_MEMST {
+        if (_fdc_subtree_safe(n.a, loop_var_p) == 0) { return 0; }
+        return _fdc_subtree_safe(n.b, loop_var_p);
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) {
+            if (_fdc_subtree_safe(arr[i], loop_var_p) == 0) { return 0; }
+        }
+        return 1;
+    }
+    T_IF {
+        if (_fdc_subtree_safe(n.a, loop_var_p) == 0) { return 0; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) {
+            if (_fdc_subtree_safe(arr[i], loop_var_p) == 0) { return 0; }
+        }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i = i + 1) {
+                if (_fdc_subtree_safe(arr[i], loop_var_p) == 0) { return 0; }
+            }
+        }
+        return 1;
+    }
+    T_WHILE, T_SWITCH { return 0; }
+    else { return 0; }
+    }
+    return 0;
+}
+
+// Evaluate a single T_WHILE node against every candidacy criterion.
+// If every check passes, push the loop into the dispatch_candidates[]
+// arrays. Side-effect only — caller treats it as void.
+static void _fdc_try_candidate(wh_p, fn_idx) {
+    auto wh: Node, cond: Node, step: Node;
+    auto cond_lhs: Node, cond_rhs: Node;
+    auto step_lhs: Node, step_rhs: Node, step_rhs_l: Node, step_rhs_r: Node;
+    auto body_arr, body_cnt, i, loop_var_p, bound_n;
+    auto stmt: Node, darr, dcnt, k;
+
+    wh = wh_p;
+
+    // A. Desugared for: node.e carries the step expression.
+    if (wh.e == 0) { return; }
+    step = wh.e;
+    if (step.ntype != T_ASSIGN) { return; }
+
+    // B. Step shape: i = i + 1.
+    step_lhs = step.a;
+    if (step_lhs.ntype != T_VAR) { return; }
+    loop_var_p = step_lhs.a;
+    step_rhs = step.b;
+    if (step_rhs.ntype != T_BINOP) { return; }
+    if (_fdc_op_char(step_rhs.a) != '+') { return; }
+    step_rhs_l = step_rhs.b;
+    step_rhs_r = step_rhs.c;
+    if (step_rhs_l.ntype != T_VAR) { return; }
+    if (step_rhs_l.a != loop_var_p) {
+        if (packed_eq(step_rhs_l.a, loop_var_p) == 0) { return; }
+    }
+    // Stride must be the literal character '1'. Direct character match
+    // avoids a dependency on parser's static int-literal decoder.
+    if (step_rhs_r.ntype != T_LIT) { return; }
+    if (unpack_l(step_rhs_r.a) != 1) { return; }
+    if (peek(vbuf + unpack_s(step_rhs_r.a)) != '1') { return; }
+
+    // C. Condition shape: i < N with a safe N.
+    cond = wh.a;
+    if (cond.ntype != T_BINOP) { return; }
+    if (_fdc_op_char(cond.a) != '<') { return; }
+    cond_lhs = cond.b;
+    cond_rhs = cond.c;
+    if (cond_lhs.ntype != T_VAR) { return; }
+    if (cond_lhs.a != loop_var_p) {
+        if (packed_eq(cond_lhs.a, loop_var_p) == 0) { return; }
+    }
+    if (cond_rhs.ntype == T_LIT) {
+        if (_fdc_is_int_lit(cond_rhs.a) == 0) { return; }
+        bound_n = cond_rhs;
+    } else {
+        if (cond_rhs.ntype != T_VAR) { return; }
+        if (_fdc_name_is_safe(cond_rhs.a, loop_var_p) == 0) { return; }
+        bound_n = cond_rhs;
+    }
+
+    // D/E/F. Collect top-level loop-locals first so forward references
+    // resolve as safe, then verify every statement is dispatch-safe.
+    // Loop-locals declared in nested blocks are not collected, which
+    // keeps the MVP conservative — such loops will simply be rejected.
+    arr_clear(_fdc_loop_locals);
+    body_arr = wh.b;
+    body_cnt = wh.c;
+    for (i = 0; i < body_cnt; i = i + 1) {
+        stmt = body_arr[i];
+        if (stmt != 0) {
+            if (stmt.ntype == T_DECL) {
+                darr = stmt.a; dcnt = stmt.b;
+                for (k = 0; k < dcnt; k = k + 1) {
+                    _fdc_loop_locals = arr_push(_fdc_loop_locals, darr[k]);
+                }
+            }
+        }
+    }
+    for (i = 0; i < body_cnt; i = i + 1) {
+        if (_fdc_subtree_safe(body_arr[i], loop_var_p) == 0) { return; }
+    }
+
+    // All criteria met — record the candidate.
+    dispatch_candidates = arr_push(dispatch_candidates, wh_p);
+    dispatch_cand_fn_idx = arr_push(dispatch_cand_fn_idx, fn_idx);
+    dispatch_cand_loop_var = arr_push(dispatch_cand_loop_var, loop_var_p);
+    dispatch_cand_bound = arr_push(dispatch_cand_bound, bound_n);
+}
+
+// Scan every parsed function body and record every top-level for-loop
+// that qualifies for smart dispatch. Must run AFTER promote_globals()
+// so glob_class[] reflects the final storage-class decisions.
+void find_dispatch_candidates() {
+    auto i, func, body_arr, body_cnt, j;
+    auto stmt: Node;
+
+    if (dispatch_candidates == 0) { dispatch_candidates = arr_new(); }
+    else { arr_clear(dispatch_candidates); }
+    if (dispatch_cand_fn_idx == 0) { dispatch_cand_fn_idx = arr_new(); }
+    else { arr_clear(dispatch_cand_fn_idx); }
+    if (dispatch_cand_loop_var == 0) { dispatch_cand_loop_var = arr_new(); }
+    else { arr_clear(dispatch_cand_loop_var); }
+    if (dispatch_cand_bound == 0) { dispatch_cand_bound = arr_new(); }
+    else { arr_clear(dispatch_cand_bound); }
+    if (dispatch_cand_synth_idx == 0) { dispatch_cand_synth_idx = arr_new(); }
+    else { arr_clear(dispatch_cand_synth_idx); }
+    if (dispatch_cand_synth_name == 0) { dispatch_cand_synth_name = arr_new(); }
+    else { arr_clear(dispatch_cand_synth_name); }
+    if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
+
+    for (i = 0; i < func_cnt; i = i + 1) {
+        func = funcs[i];
+        body_arr = *(func + FN_BODY);
+        body_cnt = *(func + FN_BCNT);
+        // Cached functions carry no AST to inspect.
+        if (body_arr == 0) { continue; }
+        // MVP scope: only top-level for-loops in the function body.
+        // Nested fors inside branches stay serial until the MVP proves
+        // the architecture on snake_maestro.
+        for (j = 0; j < body_cnt; j = j + 1) {
+            stmt = body_arr[j];
+            if (stmt != 0) {
+                if (stmt.ntype == T_WHILE) {
+                    _fdc_try_candidate(stmt, i);
+                }
+            }
+        }
+    }
+}
+
+// Print the dispatch-candidate list to stderr. Triggered by the flag
+// `--dispatch`. Pure visibility for Stage 1 — no code generation
+// changes, the programmer simply sees which loops Stage 2 will
+// synthesize and Stage 3 will rewrite into job_parallel_for calls.
+void show_dispatch_candidates() {
+    auto n, i, wh: Node, fi, fname, bound: Node;
+
+    n = arr_len(dispatch_candidates);
+    diag_str("[dispatch] ");
+    diag_int(n);
+    diag_str(" candidate loop(s)");
+    diag_newline();
+
+    for (i = 0; i < n; i = i + 1) {
+        wh = arr_get(dispatch_candidates, i);
+        fi = arr_get(dispatch_cand_fn_idx, i);
+        fname = *(funcs[fi] + FN_NAME);
+        bound = arr_get(dispatch_cand_bound, i);
+        diag_str("  ");
+        diag_packed(fname);
+        diag_str(": for (");
+        diag_packed(arr_get(dispatch_cand_loop_var, i));
+        diag_str(" = 0; ");
+        diag_packed(arr_get(dispatch_cand_loop_var, i));
+        diag_str(" < ");
+        diag_packed(bound.a);
+        diag_str("; ");
+        diag_packed(arr_get(dispatch_cand_loop_var, i));
+        diag_str(" = ");
+        diag_packed(arr_get(dispatch_cand_loop_var, i));
+        diag_str(" + 1)");
+        diag_newline();
+    }
+}
+
+// ── Phase 2: Stage 2 — worker function synthesis ──────────
+//
+// For every candidate recorded by find_dispatch_candidates(), create
+// a fresh top-level function whose body is the loop body and whose
+// single parameter is the induction variable. Register the new
+// function in funcs[] and extend every parallel array used by the
+// codegen pipeline.
+//
+// Stage 2 does NOT rewrite the original loop yet. The synthesized
+// function is orphaned — fn_reachable[] stays 0 so the emitter will
+// not produce code for it, and fn_address_taken[] is 1 so Stage 3
+// can safely call fn_ptr() on it. Running Stage 2 in isolation is
+// therefore a no-op at runtime: funcs[] grows but nothing new gets
+// emitted, and the bootstrap must still produce byte-identical output.
+//
+// The loop body array is SHARED, not deep-copied. Every AST node
+// lives in the global AST arena and persists for the lifetime of the
+// compiler process. Stage 3 will replace the original T_WHILE node
+// with a T_CALL to job_parallel_for, at which point the body array
+// is effectively donated to the synthesized function. No other pass
+// depends on the T_WHILE node continuing to exist in its original
+// slot.
+//
+// Why the induction variable does not need rewriting: parameter
+// lookup is lexical per function. Once the synthesized function
+// declares `i` as its first parameter, every T_VAR node inside the
+// body that references `i` resolves against the synth function's
+// stack slot at codegen time, regardless of any `auto i;` sitting in
+// the enclosing function.
+
+// Monotonic counter used to produce unique synthetic names across all
+// candidates discovered in a single compilation.
+auto _synth_counter;
+
+// Build a packed synthetic function name of the form `__synth_N`,
+// with N being a monotonic counter. The double-underscore prefix
+// keeps the name out of any user program's namespace, so an
+// accidental collision with a hand-written function is not possible.
+// Returns the packed name.
+static _synth_make_name() {
+    auto start, n, tmp, digits, i;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, 's'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, 'y'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, 'n'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, 't'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, 'h'); vbuf_pos = vbuf_pos + 1;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos = vbuf_pos + 1;
+    n = _synth_counter;
+    if (n == 0) {
+        poke(vbuf + vbuf_pos, '0'); vbuf_pos = vbuf_pos + 1;
+    } else {
+        // Count digits first, then write them in place right-to-left.
+        tmp = n;
+        digits = 0;
+        while (tmp > 0) { digits = digits + 1; tmp = tmp / 10; }
+        vbuf_pos = vbuf_pos + digits;
+        tmp = n;
+        for (i = 0; i < digits; i = i + 1) {
+            poke(vbuf + vbuf_pos - 1 - i, '0' + tmp % 10);
+            tmp = tmp / 10;
+        }
+    }
+    _synth_counter = _synth_counter + 1;
+    return pack(start, vbuf_pos - start);
+}
+
+// Create one synthesized worker function per candidate recorded by
+// find_dispatch_candidates(). Must run AFTER that scanner and BEFORE
+// the first emit_module_* call so the new functions are visible to
+// the Stage 3 rewriter, which will then add the T_CALL that actually
+// invokes them.
+//
+// Parallel arrays populated for each new function:
+//   funcs[]            — the record itself (malloc'd 72 bytes)
+//   func_cnt           — refreshed from arr_len(funcs)
+//   func_mods[]        — module index of the enclosing function, so
+//                        the synth rides along with it at emit time
+//   fn_static[]        — 1, the synth is a compiler internal
+//   fn_void[]          — 1, the body discards any returns
+//   fn_phase_hint[]    — 0, no user annotation
+//   fn_phase[]         — PHASE_BASE, body already proved worker-safe
+//   fn_phase_next[]    — matches fn_phase for a clean fixpoint
+//   fn_calls[]         — empty, call-graph edges out of the synth
+//                        are not needed until Stage 3 rewrites the
+//                        invoking loop
+//   fn_address_taken[] — 1, Stage 3 will take the address via fn_ptr
+//   fn_locally_impure[]— 0, the dispatch predicate already proved it
+//   fn_reachable[]     — 0, Stage 2 must not cause any new emission.
+//                        Stage 3 flips this to 1 when it wires the
+//                        call through job_parallel_for.
+void synthesize_loop_fn() {
+    auto n, i, wh: Node, src_fi, loop_var_p, src_mod;
+    auto fname, params_arr, record, src_tok;
+
+    _synth_counter = 0;
+    n = arr_len(dispatch_candidates);
+    for (i = 0; i < n; i = i + 1) {
+        wh = arr_get(dispatch_candidates, i);
+        src_fi = arr_get(dispatch_cand_fn_idx, i);
+        loop_var_p = arr_get(dispatch_cand_loop_var, i);
+        src_mod = arr_get(func_mods, src_fi);
+        src_tok = wh.src_tok;
+
+        // Build the function record. Fields match parse_function's
+        // registration path so downstream passes see a regular entry.
+        fname = _synth_make_name();
+        params_arr = malloc(8);
+        *(params_arr) = loop_var_p;
+        record = malloc(RECORD_SZ);
+        *(record + FN_TYPE) = 22;
+        *(record + FN_NAME) = fname;
+        *(record + FN_PARS) = params_arr;
+        *(record + FN_PCNT) = 1;
+        *(record + FN_BODY) = wh.b;
+        *(record + FN_BCNT) = wh.c;
+        *(record + FN_HINTS) = 0;
+        *(record + FN_STUB) = 0;
+        *(record + FN_SRC_TOK) = src_tok;
+
+        // Register in funcs[] and every parallel array the parser
+        // populates for regular user functions.
+        funcs = arr_push(funcs, record);
+        func_cnt = arr_len(funcs);
+        func_mods = arr_push(func_mods, src_mod);
+        fn_static = arr_push(fn_static, 1);
+        fn_void = arr_push(fn_void, 1);
+        fn_phase_hint = arr_push(fn_phase_hint, 0);
+
+        // Extend the dispatch-analysis arrays too. These were sized
+        // to the pre-synthesis func_cnt by call_graph_build, so every
+        // new function needs an explicit slot.
+        fn_phase = arr_push(fn_phase, PHASE_BASE);
+        fn_phase_next = arr_push(fn_phase_next, PHASE_BASE);
+        fn_calls = arr_push(fn_calls, arr_new());
+        fn_address_taken = arr_push(fn_address_taken, 1);
+        fn_locally_impure = arr_push(fn_locally_impure, 0);
+        fn_reachable = arr_push(fn_reachable, 0);
+
+        // Expose the freshly synthesized function to Stage 3. The
+        // rewriter needs the packed name to build the fn_ptr() call
+        // and the funcs[] slot to flip fn_reachable when the call is
+        // wired through job_parallel_for.
+        dispatch_cand_synth_idx = arr_push(dispatch_cand_synth_idx, func_cnt - 1);
+        dispatch_cand_synth_name = arr_push(dispatch_cand_synth_name, fname);
+    }
+}
+
+// ── Phase 2: Stage 3 — loop-to-call rewrite ────────────────
+//
+// Every eligible loop gets turned in place into a call to
+// job_parallel_for(N, fn_ptr(synth)). The T_WHILE node is mutated in
+// the AST arena: its ntype flips to T_CALL, .a carries the packed
+// name of job_parallel_for, and .b points at a new two-slot argument
+// array. Because every other pass refers to the loop through the
+// single pointer slot its parent owns, in-place mutation keeps the
+// rest of the AST intact.
+//
+// Reachability: the enclosing function already reached main(), so
+// the inserted call to job_parallel_for extends the graph by one
+// edge. Appending that edge to fn_calls[] for the enclosing function
+// and re-running mark_reachable is enough — job_parallel_for's own
+// fn_calls were computed by the original call_graph_build pass, so
+// the BFS follows through to job_submit / job_wait_all. The synth
+// function is picked up automatically via fn_address_taken[].
+//
+// If job_parallel_for is not visible (e.g. the user did not import
+// bpp_job.bsm), the rewrite is skipped entirely and the synthesized
+// functions stay dead — Stage 2 left fn_reachable[] at 0 for them,
+// so no emission occurs and the program keeps the original serial
+// loop. This is the graceful-fallback contract.
+
+// Copy a C-style string literal into vbuf and return its packed
+// handle. Used once per compilation run to materialize the packed
+// names `job_parallel_for` and `fn_ptr` that the rewrite injects.
+static _dsp_pack_name(s, l) {
+    auto start, i;
+    start = vbuf_pos;
+    for (i = 0; i < l; i = i + 1) {
+        poke(vbuf + vbuf_pos, str_peek(s, i));
+        vbuf_pos = vbuf_pos + 1;
+    }
+    return pack(start, l);
+}
+
+// Transform every candidate loop into a call to job_parallel_for and
+// wire the new edges so mark_reachable sees the synth function and
+// the job runtime as reachable. Runs after synthesize_loop_fn.
+void rewrite_dispatch_loops() {
+    auto n, i, wh: Node, src_fi, bound_n, synth_idx, synth_name;
+    auto jpf_name, fnptr_name, jpf_idx;
+    auto fnptr_call: Node, synth_var: Node, args_arr, inner_args_arr;
+    auto callees;
+
+    n = arr_len(dispatch_candidates);
+    if (n == 0) { return; }
+
+    // Materialize the packed names the injected calls will reference.
+    jpf_name = _dsp_pack_name("job_parallel_for", 16);
+    fnptr_name = _dsp_pack_name("fn_ptr", 6);
+
+    // Look up job_parallel_for in funcs[]. If absent, the program
+    // never imported bpp_job.bsm and there is no runtime to dispatch
+    // through. Skip the rewrite entirely so the original for-loops
+    // remain and the synth entries stay unreachable.
+    jpf_idx = _dsp_find_func_idx(jpf_name);
+    if (jpf_idx < 0) { return; }
+
+    for (i = 0; i < n; i = i + 1) {
+        wh = arr_get(dispatch_candidates, i);
+        src_fi = arr_get(dispatch_cand_fn_idx, i);
+        bound_n = arr_get(dispatch_cand_bound, i);
+        synth_idx = arr_get(dispatch_cand_synth_idx, i);
+        synth_name = arr_get(dispatch_cand_synth_name, i);
+
+        // Build fn_ptr(synth_name). Inner T_CALL with one T_VAR arg.
+        synth_var = make_node(T_VAR);
+        synth_var.a = synth_name;
+        inner_args_arr = malloc(8);
+        *(inner_args_arr) = synth_var;
+        fnptr_call = make_node(T_CALL);
+        fnptr_call.a = fnptr_name;
+        fnptr_call.b = inner_args_arr;
+        fnptr_call.c = 1;
+
+        // Build the outer args array: [bound, fn_ptr_call].
+        args_arr = malloc(16);
+        *(args_arr) = bound_n;
+        *(args_arr + 8) = fnptr_call;
+
+        // Mutate the T_WHILE node in place into a T_CALL to
+        // job_parallel_for. Fields .d and .e were the for-hint and
+        // step expression; both become dead once this is no longer
+        // a while loop, so clear them to keep downstream code from
+        // tripping on stale payloads.
+        wh.ntype = T_CALL;
+        wh.a = jpf_name;
+        wh.b = args_arr;
+        wh.c = 2;
+        wh.d = 0;
+        wh.e = 0;
+        wh.dispatch = 0;
+
+        // Record the new edge from the enclosing function to
+        // job_parallel_for so mark_reachable follows it on re-run.
+        callees = arr_get(fn_calls, src_fi);
+        if (callees == 0) {
+            callees = arr_new();
+            arr_set(fn_calls, src_fi, callees);
+        }
+        callees = arr_push(callees, jpf_idx);
+        arr_set(fn_calls, src_fi, callees);
+    }
+
+    // Rebuild reachability. Seeds include every address-taken
+    // function (which now includes the synth entries from Stage 2),
+    // and every function called via the freshly appended edges.
+    mark_reachable();
 }
 
 // ── Orchestrator ───────────────────────────────────────────

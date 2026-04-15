@@ -39,7 +39,9 @@ const T_WALL  = 1;
 
 // ── Palette ──────────────────────────────────────────────
 
-auto PAL;
+// Shared 8-color palette (ARGB u32 format). Allocated once in
+// init_palette and read thereafter — the classic GLOB_EXTRN contract.
+extrn PAL;
 
 // Allocate and fill the shared 8-color palette (ARGB u32 format).
 void init_palette() {
@@ -55,34 +57,43 @@ void init_palette() {
 }
 
 // ── Game State ───────────────────────────────────────────
+//
+// extrn: allocated or set once during main/init and never reassigned.
+// auto:  per-frame or per-collision mutable state.
 
-auto spr_rat_data, spr_cat_data;
-auto tex_rat, tex_cat;
+extrn spr_rat_data, spr_cat_data;
+extrn tex_rat, tex_cat;
 
 // Positions and velocities are in milli-pixels (pixel * 1000).
-// Speeds are in pixels/second.
-auto rat_x, rat_y, rat_speed;
-auto rat_hp, rat_max_hp;
+// Speeds are in pixels/second; they are configuration, not per-frame.
+auto rat_x, rat_y;
+extrn rat_speed;
+extrn rat_max_hp;
+auto rat_hp;
 
-auto cat_x, cat_y, cat_speed;
+auto cat_x, cat_y;
+extrn cat_speed;
 
 // invuln is in milliseconds remaining on the rat after a hit.
 auto invuln_ms, game_over;
 
-auto frame_arena;
-auto world;
+extrn frame_arena;
+extrn world;
 
 auto score, score_timer_ms;
 
-// Tilemap (walls) and pathfinder (cat AI).
-auto tm, pf;
-auto path_buf, path_len;
+// Tilemap (walls) and pathfinder (cat AI). The tm / pf handles plus the
+// reusable path output buffer are allocated once at startup; path_len
+// is overwritten every frame by path_find.
+extrn tm, pf;
+extrn path_buf;
+auto path_len;
 
 // ── World setup ──────────────────────────────────────────
 
 // Lay out a small arena: a few walls that force the cat to go around.
 // The walls are tile_type 1 (T_WALL); empty cells are 0.
-build_arena() {
+void build_arena() {
     auto gx, gy;
 
     // Outer top/bottom rows are open. We use the inner area for walls.
@@ -102,14 +113,12 @@ build_arena() {
     // A couple of single-block obstacles for variety
     tile_set(tm, 3, 9, T_WALL);
     tile_set(tm, 17, 2, T_WALL);
-
-    return 0;
 }
 
 // Mirror the tilemap's solid mask into the PathFinder. Inline 8-line
 // bridge — stbpath is intentionally dependency-free, so this lives in
 // the game rather than in the library.
-sync_path_from_tilemap() {
+void sync_path_from_tilemap() {
     auto gx, gy;
     gy = 0;
     while (gy < GRID_H) {
@@ -120,12 +129,11 @@ sync_path_from_tilemap() {
         }
         gy = gy + 1;
     }
-    return 0;
 }
 
 // ── Init ─────────────────────────────────────────────────
 
-init_game() {
+void init_game() {
     // Rat starts top-left corner area, in pixel coordinates converted
     // to milli-pixels. Cat starts bottom-right.
     rat_x = 16 * 1000;
@@ -142,7 +150,6 @@ init_game() {
     game_over = 0;
     score = 0;
     score_timer_ms = 0;
-    return 0;
 }
 
 // ── Update: rat (player) ─────────────────────────────────
@@ -150,23 +157,17 @@ init_game() {
 // Move the rat from keyboard input. Each axis is checked separately
 // against the tilemap so the rat can slide along walls. Diagonal motion
 // is intentionally not normalized — feels snappier in a top-down game.
-update_rat(dt_ms) {
-    auto vx, vy, new_x, new_y, px, py;
+void update_rat(dt_ms) {
+    auto vx, vy, new_x, new_y, px, py, max_x, max_y;
     vx = 0; vy = 0;
-    if (key_down(KEY_W)) { vy = vy - 1; }
-    if (key_down(KEY_UP)) { vy = vy - 1; }
-    if (key_down(KEY_S)) { vy = vy + 1; }
-    if (key_down(KEY_DOWN)) { vy = vy + 1; }
-    if (key_down(KEY_A)) { vx = vx - 1; }
-    if (key_down(KEY_LEFT)) { vx = vx - 1; }
-    if (key_down(KEY_D)) { vx = vx + 1; }
-    if (key_down(KEY_RIGHT)) { vx = vx + 1; }
+    if (key_down(KEY_W) || key_down(KEY_UP))    { vy = vy - 1; }
+    if (key_down(KEY_S) || key_down(KEY_DOWN))  { vy = vy + 1; }
+    if (key_down(KEY_A) || key_down(KEY_LEFT))  { vx = vx - 1; }
+    if (key_down(KEY_D) || key_down(KEY_RIGHT)) { vx = vx + 1; }
 
     // Clamp the per-axis vote so simultaneous keys don't double-speed.
-    if (vx > 1)  { vx = 1; }
-    if (vx < 0 - 1) { vx = 0 - 1; }
-    if (vy > 1)  { vy = 1; }
-    if (vy < 0 - 1) { vy = 0 - 1; }
+    vx = vx > 1 ? 1 : vx < 0 - 1 ? 0 - 1 : vx;
+    vy = vy > 1 ? 1 : vy < 0 - 1 ? 0 - 1 : vy;
 
     // Try X then Y, with separate-axis collision so the rat slides.
     new_x = rat_x + vx * rat_speed * dt_ms;
@@ -180,11 +181,10 @@ update_rat(dt_ms) {
     if (tile_collides(tm, px, py, SPR_SIZE, SPR_SIZE) == 0) { rat_y = new_y; }
 
     // Clamp to playable bounds (HUD strip at the bottom).
-    if (rat_x < 0) { rat_x = 0; }
-    if (rat_y < 0) { rat_y = 0; }
-    if (rat_x > (SCREEN_W - SPR_SIZE) * 1000) { rat_x = (SCREEN_W - SPR_SIZE) * 1000; }
-    if (rat_y > (GRID_H * TILE_H - SPR_SIZE) * 1000) { rat_y = (GRID_H * TILE_H - SPR_SIZE) * 1000; }
-    return 0;
+    max_x = (SCREEN_W - SPR_SIZE) * 1000;
+    max_y = (GRID_H * TILE_H - SPR_SIZE) * 1000;
+    rat_x = rat_x < 0 ? 0 : rat_x > max_x ? max_x : rat_x;
+    rat_y = rat_y < 0 ? 0 : rat_y > max_y ? max_y : rat_y;
 }
 
 // ── Update: cat (AI) ─────────────────────────────────────
@@ -193,7 +193,7 @@ update_rat(dt_ms) {
 // then walks toward the next waypoint along the path. Re-pathing every
 // frame is cheap on a 20x11 grid (heap-based A* is well under a
 // millisecond) and keeps the chase responsive when the rat darts.
-update_cat(dt_ms) {
+void update_cat(dt_ms) {
     auto cat_cx, cat_cy, rat_cx, rat_cy;
     auto cat_gx, cat_gy, rat_gx, rat_gy;
     auto target_gx, target_gy, target_px, target_py, step;
@@ -211,11 +211,10 @@ update_cat(dt_ms) {
 
     // If either endpoint is somehow inside a wall (shouldn't happen
     // given collision, but be defensive), skip this frame.
-    if (path_is_blocked(pf, cat_gx, cat_gy)) { return 0; }
-    if (path_is_blocked(pf, rat_gx, rat_gy)) { return 0; }
+    if (path_is_blocked(pf, cat_gx, cat_gy) || path_is_blocked(pf, rat_gx, rat_gy)) { return; }
 
     path_len = path_find(pf, cat_gx, cat_gy, rat_gx, rat_gy, path_buf, MAX_PATH);
-    if (path_len < 2) { return 0; }   // already adjacent or unreachable
+    if (path_len < 2) { return; }   // already adjacent or unreachable
 
     // Walk toward the second waypoint (path_buf[2..3]). Index 0 is the
     // cat's own tile so we skip it.
@@ -245,16 +244,15 @@ update_cat(dt_ms) {
         cat_y = cat_y - step;
         if (cat_y < target_py) { cat_y = target_py; }
     }
-    return 0;
 }
 
 // ── Update: collision, scoring, particles ────────────────
 
 // Score ticks once per second. Invulnerability counts down. On contact
 // the rat loses 1 HP, gets a 600ms iframe, and 8 red particles spawn.
-update_mechanics(dt_ms) {
+void update_mechanics(dt_ms) {
     auto pi, id;
-    if (game_over) { return 0; }
+    if (game_over) { return; }
 
     score_timer_ms = score_timer_ms + dt_ms;
     if (score_timer_ms >= 1000) {
@@ -266,6 +264,10 @@ update_mechanics(dt_ms) {
         invuln_ms = invuln_ms - dt_ms;
         if (invuln_ms < 0) { invuln_ms = 0; }
     }
+    // The double guard above (invuln_ms > 0 then recompute) stays
+    // explicit because the subtraction only fires while invuln is
+    // active — collapsing with max(0, invuln_ms - dt_ms) would decay
+    // every frame even past zero.
 
     if (invuln_ms == 0) {
         if (rect_overlap(rat_x / 1000, rat_y / 1000, SPR_SIZE, SPR_SIZE,
@@ -292,19 +294,17 @@ update_mechanics(dt_ms) {
             }
         }
     }
-    return 0;
 }
 
 // Step the ECS particle system and draw each live particle as a 2x2
 // red rect. Life is the low byte of flags; color is everything above.
 // Decrement uses `flags - 1` (safe because life > 0 in the branch),
 // avoiding the 24-bit mask bug that bit us in snake.
-update_particles(dt_ms) {
+void update_particles(dt_ms) {
     auto i, cap, flags, life, px, py, color;
     cap = ecs_capacity(world);
     ecs_physics(world, dt_ms);
-    i = 0;
-    while (i < cap) {
+    for (i = 0; i < cap; i = i + 1) {
         if (ecs_alive(world, i)) {
             flags = ecs_get_flags(world, i);
             life = flags & 0xFF;
@@ -318,14 +318,12 @@ update_particles(dt_ms) {
                 render_rect(px, py, 2, 2, color);
             }
         }
-        i = i + 1;
     }
-    return 0;
 }
 
 // ── Reset ────────────────────────────────────────────────
 
-reset_game() {
+void reset_game() {
     rat_x = 16 * 1000;
     rat_y = 16 * 1000;
     rat_hp = rat_max_hp;
@@ -335,7 +333,6 @@ reset_game() {
     game_over = 0;
     score = 0;
     score_timer_ms = 0;
-    return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────
@@ -395,13 +392,10 @@ main() {
         // Draw the wall tilemap (no tileset bound = colored debug rects).
         tile_draw(tm, 0, 0, SCREEN_W, SCREEN_H);
 
-        // Rat sprite, blink while invulnerable.
-        if (invuln_ms == 0) {
+        // Rat sprite. Blinks every 100 ms while the iframe is active by
+        // skipping the draw on odd timer ticks.
+        if (invuln_ms == 0 || (score_timer_ms / 100) & 1) {
             render_sprite(tex_rat, rat_x / 1000, rat_y / 1000, 1);
-        } else {
-            if ((score_timer_ms / 100) & 1) {
-                render_sprite(tex_rat, rat_x / 1000, rat_y / 1000, 1);
-            }
         }
 
         // Cat sprite.

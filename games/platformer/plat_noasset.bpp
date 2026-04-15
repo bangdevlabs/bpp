@@ -10,10 +10,12 @@ import "stbphys.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
-auto TILE_W;    // tile width in pixels
-auto TILE_H;    // tile height in pixels
-auto MAP_W;     // map width in tiles
-auto MAP_H;     // map height in tiles
+// 16x16 tiles on a 40x14 grid — same level layout as platform.bpp but
+// no PNG assets, so the tile size is the classic pixel 16.
+const TILE_W = 16;
+const TILE_H = 16;
+const MAP_W = 40;
+const MAP_H = 14;
 
 // ── Tile types ───────────────────────────────────────────
 
@@ -29,29 +31,32 @@ enum Tile {
 
 // ── Tile colors (used for HUD elements and debug fallback) ──
 
-auto CLR_SKY;
-auto CLR_COIN;
-auto CLR_SPIKE;
-auto CLR_FLAG;
-auto CLR_PLAYER;
+// Runtime-computed palette — rgba() is a call, not a literal, so these
+// cannot be `const`. Assigned once in init_game and read after.
+extrn CLR_SKY;
+extrn CLR_COIN;
+extrn CLR_SPIKE;
+extrn CLR_FLAG;
+extrn CLR_PLAYER;
 
 // ── Game state ───────────────────────────────────────────
 
-auto tilemap;        // Tilemap struct from stbtile
-auto player;         // Body struct from stbphys
+extrn tilemap;       // Tilemap struct from stbtile (allocated once)
+extrn player;        // Body struct from stbphys (allocated once)
+extrn coins_total;   // level constant set by build_level
+
 auto player_facing;  // 0 = right, 1 = left
 auto player_anim;    // animation frame
 auto player_anim_t;  // animation timer
 auto player_alive;
 
 auto score;
-auto coins_total;
 auto CAM_X, CAM_Y;
 
 // ── Level design ─────────────────────────────────────────
 
 // Build the test level. A hand-crafted platformer stage.
-build_level() {
+void build_level() {
     auto x, y;
 
     // Ground floor (full width).
@@ -114,13 +119,11 @@ build_level() {
 
     // Flag at the end.
     tile_set(tilemap, MAP_W - 3, MAP_H - 3, T_FLAG);
-
-    return 0;
 }
 
 // ── Camera ───────────────────────────────────────────────
 
-update_camera() {
+void update_camera() {
     auto target_x, target_y, scr_w, scr_h;
     scr_w = 320;
     scr_h = 180;
@@ -132,64 +135,45 @@ update_camera() {
     // Clamp to map bounds.
     CAM_X = clamp(target_x, 0, MAP_W * TILE_W - scr_w);
     CAM_Y = clamp(target_y, 0, MAP_H * TILE_H - scr_h);
-
-    return 0;
 }
 
 // ── Player update ────────────────────────────────────────
 
-update_player(dt) {
+void update_player(dt) {
     auto px, py, tile;
     auto b: Body;
     b = player;
 
-    if (player_alive == 0) { return 0; }
+    if (player_alive == 0) { return; }
 
-    // Horizontal input.
+    // Horizontal input — arrow keys and WASD share meaning.
     b.vx = 0;
-    if (key_down(KEY_LEFT)) {
-        b.vx = 0 - b.move_spd;
-        player_facing = 1;
-    }
-    if (key_down(KEY_RIGHT)) {
-        b.vx = b.move_spd;
-        player_facing = 0;
-    }
-    if (key_down(KEY_A)) {
-        b.vx = 0 - b.move_spd;
-        player_facing = 1;
-    }
-    if (key_down(KEY_D)) {
-        b.vx = b.move_spd;
-        player_facing = 0;
-    }
+    if (key_down(KEY_LEFT)  || key_down(KEY_A)) { b.vx = 0 - b.move_spd; player_facing = 1; }
+    if (key_down(KEY_RIGHT) || key_down(KEY_D)) { b.vx = b.move_spd;     player_facing = 0; }
 
-    // Jump.
-    if (key_pressed(KEY_SPACE)) { phys_jump(player); }
-    if (key_pressed(KEY_W)) { phys_jump(player); }
-    if (key_pressed(KEY_UP)) { phys_jump(player); }
+    // Jump triggers on space, W, or up arrow.
+    if (key_pressed(KEY_SPACE) || key_pressed(KEY_W) || key_pressed(KEY_UP)) {
+        phys_jump(player);
+    }
 
     // Full physics step: gravity, horizontal move, vertical move.
     phys_update(player, dt, tilemap);
 
-    // Collect coins.
+    // Interact with the tile the player is standing on.
     px = phys_px_x(player) + 6;
     py = phys_px_y(player) + 8;
     tile = tile_at(tilemap, px, py);
-    if (tile == T_COIN) {
+    switch (tile) {
+    T_COIN {
         tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
         score = score + 100;
     }
-
-    // Check spikes.
-    if (tile == T_SPIKE) {
-        player_alive = 0;
-    }
-
-    // Check flag (win).
-    if (tile == T_FLAG) {
+    T_SPIKE { player_alive = 0; }
+    T_FLAG {
         score = score + 1000;
         tile_set(tilemap, px / TILE_W, py / TILE_H, T_EMPTY);
+    }
+    else { }
     }
 
     // Fall off map = death.
@@ -197,7 +181,8 @@ update_player(dt) {
         player_alive = 0;
     }
 
-    // Animation.
+    // Walk-cycle animation. Snap to frame 0 while standing still so
+    // the next move starts with a fresh step.
     if (b.vx != 0) {
         player_anim_t = player_anim_t + dt;
         if (player_anim_t > 150) {
@@ -208,23 +193,17 @@ update_player(dt) {
         player_anim = 0;
         player_anim_t = 0;
     }
-
-    return 0;
 }
 
 // ── Rendering ────────────────────────────────────────────
 
 // Draw the player character.
-draw_player() {
+void draw_player() {
     auto sx, sy, color;
     sx = phys_px_x(player) - CAM_X;
     sy = phys_px_y(player) - CAM_Y;
 
-    if (player_alive == 0) {
-        color = RED;
-    } else {
-        color = CLR_PLAYER;
-    }
+    color = player_alive == 0 ? RED : CLR_PLAYER;
 
     // Body.
     render_rect(sx + 2, sy, 12, 16, color);
@@ -237,23 +216,19 @@ draw_player() {
         render_rect(sx + 3, sy + 5, 2, 2, BLACK);
     }
 
-    // Walk animation: leg movement.
-    if (player_alive) {
-        if (player_anim == 1) {
-            render_rect(sx + 2, sy + 14, 4, 3, rgba(60, 60, 180, 255));
-            render_rect(sx + 9, sy + 12, 4, 3, rgba(60, 60, 180, 255));
-        }
-        if (player_anim == 3) {
-            render_rect(sx + 2, sy + 12, 4, 3, rgba(60, 60, 180, 255));
-            render_rect(sx + 9, sy + 14, 4, 3, rgba(60, 60, 180, 255));
-        }
+    // Walk animation: leg movement on odd anim frames.
+    if (player_alive && player_anim == 1) {
+        render_rect(sx + 2, sy + 14, 4, 3, rgba(60, 60, 180, 255));
+        render_rect(sx + 9, sy + 12, 4, 3, rgba(60, 60, 180, 255));
     }
-
-    return 0;
+    if (player_alive && player_anim == 3) {
+        render_rect(sx + 2, sy + 12, 4, 3, rgba(60, 60, 180, 255));
+        render_rect(sx + 9, sy + 14, 4, 3, rgba(60, 60, 180, 255));
+    }
 }
 
 // Draw parallax background (simple gradient sky + mountains).
-draw_background() {
+void draw_background() {
     auto y, r, g, b;
 
     // Sky gradient.
@@ -276,12 +251,10 @@ draw_background() {
         mx = mx + 80;
         mh = 30 + (mh * 7 + 13) % 20;
     }
-
-    return 0;
 }
 
 // Draw HUD overlay.
-draw_hud() {
+void draw_hud() {
     // Score.
     render_text("SCORE", 8, 4, 1, WHITE);
     render_number(50, 4, 1, YELLOW, score);
@@ -294,18 +267,11 @@ draw_hud() {
     if (player_alive == 0) {
         render_text("PRESS R TO RESTART", 80, 80, 1, RED);
     }
-
-    return 0;
 }
 
 // ── Init / Reset ─────────────────────────────────────────
 
-init_game() {
-    TILE_W = 16;
-    TILE_H = 16;
-    MAP_W = 40;
-    MAP_H = 14;
-
+void init_game() {
     CLR_SKY = rgba(100, 150, 220, 255);
     CLR_COIN = rgba(255, 220, 50, 255);
     CLR_SPIKE = rgba(220, 40, 40, 255);
@@ -331,8 +297,6 @@ init_game() {
     score = 0;
     CAM_X = 0;
     CAM_Y = 0;
-
-    return 0;
 }
 
 // ── Main ─────────────────────────────────────────────────
