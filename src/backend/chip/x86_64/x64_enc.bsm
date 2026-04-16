@@ -867,6 +867,112 @@ void x64_enc_cvtsd2ss(dst, src) {
     x64_enc_modrm(3, dst, src);
 }
 
+// ── SSE2 128-bit packed float32 (Phase B4) ────────────────
+// Packed-form SSE instructions (suffix `ps`) take no 0xF2/0xF3 prefix;
+// the memory forms reuse x64_enc_mem for mod/SIB selection. XMM register
+// numbers 0..15 share the same numbering as GPRs 0..15.
+
+// MOVUPS xmm, [mem] — unaligned 128-bit load (works on any 16-aligned
+// or unaligned pointer). Using the unaligned form avoids MOVAPS's fault
+// when the pointer happens to be misaligned (e.g. a plain malloc result).
+void x64_enc_movups_load(dst, base, disp) {
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x10);
+    x64_enc_mem(dst, base, disp);
+}
+
+// MOVUPS [mem], xmm — unaligned 128-bit store.
+void x64_enc_movups_store(src, base, disp) {
+    x64_enc_rex(0, (src >> 3) & 1, 0, (base >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x11);
+    x64_enc_mem(src, base, disp);
+}
+
+// Common SSE2 packed ALU pattern: optional REX + 0F + opcode + modrm.
+// Public so that codegen-level helpers (e.g. a generic vec_*
+// dispatcher) can emit an arbitrary packed op without duplicating
+// the REX/modrm dance for each case.
+void x64_enc_sse_packed(opcode, dst, src) {
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(opcode);
+    x64_enc_modrm(3, dst, src);
+}
+
+// ADDPS xmm, xmm — packed 4-wide float32 add.
+void x64_enc_addps(dst, src) { x64_enc_sse_packed(0x58, dst, src); }
+// SUBPS xmm, xmm
+void x64_enc_subps(dst, src) { x64_enc_sse_packed(0x5C, dst, src); }
+// MULPS xmm, xmm
+void x64_enc_mulps(dst, src) { x64_enc_sse_packed(0x59, dst, src); }
+// DIVPS xmm, xmm
+void x64_enc_divps(dst, src) { x64_enc_sse_packed(0x5E, dst, src); }
+// MINPS xmm, xmm
+void x64_enc_minps(dst, src) { x64_enc_sse_packed(0x5D, dst, src); }
+// MAXPS xmm, xmm
+void x64_enc_maxps(dst, src) { x64_enc_sse_packed(0x5F, dst, src); }
+// MOVHLPS xmm, xmm — copy the high 64 bits of src to the low 64 of dst.
+// Used by vec_dot4's 4→2 reduction step.
+void x64_enc_movhlps(dst, src) { x64_enc_sse_packed(0x12, dst, src); }
+// MOVAPS xmm, xmm — 128-bit register-to-register copy. Aligned form is
+// fine for reg-reg (no memory operand), and one byte shorter than MOVUPS.
+void x64_enc_movaps_reg(dst, src) { x64_enc_sse_packed(0x28, dst, src); }
+
+// SHUFPS xmm, xmm, imm8 — shuffle 4 single-precision lanes. `imm8`
+// picks the destination lane source (2 bits per lane, lanes 0..3).
+// imm8 = 0x00 broadcasts lane 0 to all four lanes.
+void x64_enc_shufps(dst, src, imm8) {
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0xC6);
+    x64_enc_modrm(3, dst, src);
+    x64_enc_emit8(imm8 & 0xFF);
+}
+
+// PSHUFD xmm, xmm, imm8 — integer-lane shuffle (same shuffle pattern as
+// SHUFPS but picks from ONE register). 0x66 prefix selects the packed-
+// integer encoding. Used by vec_get4's lane extraction.
+void x64_enc_pshufd(dst, src, imm8) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x70);
+    x64_enc_modrm(3, dst, src);
+    x64_enc_emit8(imm8 & 0xFF);
+}
+
+// ADDSS xmm, xmm — scalar single-precision add (low-lane only).
+// Used by vec_dot4's final lane-0 + lane-1 sum.
+void x64_enc_addss(dst, src) {
+    x64_enc_emit8(0xF3);
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x58);
+    x64_enc_modrm(3, dst, src);
+}
+
+// MOVD xmm, r32 — copy 32-bit GPR to the low lane of XMM (upper zeroed).
+// Used by vec_splat4 when the source is an integer in EAX.
+void x64_enc_movd_to_xmm(dst, src) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(0, (dst >> 3) & 1, 0, (src >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x6E);
+    x64_enc_modrm(3, dst, src);
+}
+
+// MOVD r32, xmm — copy XMM low 32 bits to a GPR. Used by vec_get4 after
+// PSHUFD positions the requested lane into the low slot.
+void x64_enc_movd_to_gpr(dst, src) {
+    x64_enc_emit8(0x66);
+    x64_enc_rex(0, (src >> 3) & 1, 0, (dst >> 3) & 1);
+    x64_enc_emit8(0x0F);
+    x64_enc_emit8(0x7E);
+    x64_enc_modrm(3, src, dst);
+}
+
 // ── Fixup resolution ─────────────────────────────────────
 
 // Patch all recorded branch fixups. Call after all code has been emitted.

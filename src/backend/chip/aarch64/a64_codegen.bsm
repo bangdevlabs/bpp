@@ -656,6 +656,13 @@ static a64_emit_load_var(vi, off) {
     }
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
+    // `: double` — 128-bit SIMD local. Value lives on the stack as a
+    // 16-byte slot; LDR Q pulls it straight into V0 for the caller.
+    if (sl == SL_DOUBLE) {
+        if (a64_bin_mode) { enc_ldr_q_uoff(0, 29, off); }
+        else { out("  ldr q0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 2;
+    }
     // Float sub-types: FLOAT_H loads s-register, FLOAT_Q loads h-register.
     // All widen to d0 (double) for computation.
     if (a64_var_is_float(vi)) {
@@ -714,6 +721,26 @@ static void a64_emit_store_var(vi, off, rty) {
     }
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
+    // `: double` — 128-bit SIMD. Incoming value is expected in V0 (rty=2);
+    // STR Q writes the whole 16-byte slot back to the stack.
+    if (sl == SL_DOUBLE) {
+        if (rty != 2) {
+            diag_error(231);
+            diag_str("cannot assign non-SIMD value to ': double' local");
+            diag_newline();
+        }
+        if (a64_bin_mode) { enc_str_q_uoff(0, 29, off); }
+        else { out("  str q0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
+        return 0;
+    }
+    // Guard: SIMD value assigned to a non-SIMD local is a type error.
+    // B3 may have promoted the target to a GPR — writing V0's bits to
+    // X0 / a callee-saved reg produces silent garbage.
+    if (rty == 2) {
+        diag_error(231);
+        diag_str("cannot assign SIMD value to non-':double' local (declare it ': double')");
+        diag_newline();
+    }
     // Float sub-types: convert int→double if needed, then narrow for sub-types.
     if (a64_var_is_float(vi)) {
         if (rty == 0) {
@@ -978,6 +1005,40 @@ static void a64_emit_fpush() {
 static void a64_emit_fpop(r) {
     if (a64_bin_mode) { enc_ldr_d_post(r, 31, 16); } else { out("  ldr d"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
     a64_depth = a64_depth - 1; return 0;
+}
+
+// Push v0 onto the stack as a 16-byte SIMD value (Phase B4). a64_depth
+// tracks 16-byte slots one unit at a time so SIMD push matches scalar
+// push for depth bookkeeping.
+static void a64_emit_vpush() {
+    if (a64_bin_mode) { enc_str_q_pre(0, 31, 0 - 16); }
+    else { out("  str q0, [sp, #-16]!"); putchar('\n'); }
+    a64_depth = a64_depth + 1;
+}
+
+// Pop a 16-byte SIMD value from the stack into the given V register.
+static void a64_emit_vpop(r) {
+    if (a64_bin_mode) { enc_ldr_q_post(r, 31, 16); }
+    else { out("  ldr q"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
+    a64_depth = a64_depth - 1;
+}
+
+// Phase B4: emit a two-operand SIMD builtin through a single helper.
+// All six packed-float ops (add/sub/mul/div/min/max) share the same
+// spill-right/reload-left choreography — only the NEON opcode and the
+// asm mnemonic differ. Caller passes both so the bin and asm paths
+// emit in sync.
+static void _a64_vec_binop(n: Node, opcode, mnemonic) {
+    auto arr;
+    arr = n.b;
+    a64_emit_node(*(arr + 0));   // left  → v0
+    a64_emit_vpush();
+    a64_emit_node(*(arr + 8));   // right → v0
+    a64_emit_vpop(1);             // v1 = left
+    if (a64_bin_mode) { enc_neon_vvv(opcode, 0, 1, 0); }
+    else {
+        out("  "); out(mnemonic); out(" v0.4s, v1.4s, v0.4s"); putchar('\n');
+    }
 }
 
 // ── Expression emission ────────────────────────────────────
@@ -1822,6 +1883,100 @@ static a64_emit_node(nd) {
             return 0;
         }
 
+        // ── Phase B4: SIMD builtins (4-wide float32) ──
+        // Each builtin lowers to NEON V-register ops. Binary ops route
+        // through _a64_vec_binop with the encoder opcode + asm mnemonic;
+        // the spill/reload dance for the left operand is shared. Result
+        // lands in V0 for return; return type 2 signals SIMD, 1 signals
+        // scalar float (used by vec_dot4 / vec_get4).
+        if (a64_str_eq(n.a, "vec_load4", 9)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            if (a64_bin_mode) { enc_ldr_q_uoff(0, 0, 0); }
+            else { out("  ldr q0, [x0]"); putchar('\n'); }
+            return 2;
+        }
+        if (a64_str_eq(n.a, "vec_store4", 10)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 8));   // value → v0
+            a64_emit_vpush();
+            a64_emit_node(*(arr + 0));   // ptr → x0
+            a64_emit_vpop(1);             // v1 = value
+            if (a64_bin_mode) { enc_str_q_uoff(1, 0, 0); }
+            else { out("  str q1, [x0]"); putchar('\n'); }
+            return 0;
+        }
+        if (a64_str_eq(n.a, "vec_add4", 8)) { _a64_vec_binop(n, 0x4E20D400, "fadd"); return 2; }
+        if (a64_str_eq(n.a, "vec_sub4", 8)) { _a64_vec_binop(n, 0x4EA0D400, "fsub"); return 2; }
+        if (a64_str_eq(n.a, "vec_mul4", 8)) { _a64_vec_binop(n, 0x6E20DC00, "fmul"); return 2; }
+        if (a64_str_eq(n.a, "vec_div4", 8)) { _a64_vec_binop(n, 0x6E20FC00, "fdiv"); return 2; }
+        if (a64_str_eq(n.a, "vec_min4", 8)) { _a64_vec_binop(n, 0x4EA0F400, "fmin"); return 2; }
+        if (a64_str_eq(n.a, "vec_max4", 8)) { _a64_vec_binop(n, 0x4E20F400, "fmax"); return 2; }
+        if (a64_str_eq(n.a, "vec_splat4", 10)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                // Float scalar in d0: convert double→single, broadcast from S0.
+                if (a64_bin_mode) { enc_fcvt_s_d(0, 0); enc_dup_v_4s_from_s(0, 0); }
+                else { out("  fcvt s0, d0"); putchar('\n'); out("  dup v0.4s, v0.s[0]"); putchar('\n'); }
+            } else {
+                // Integer in x0: broadcast W0 to all 4 lanes.
+                if (a64_bin_mode) { enc_dup_v_4s(0, 0); }
+                else { out("  dup v0.4s, w0"); putchar('\n'); }
+            }
+            return 2;
+        }
+        if (a64_str_eq(n.a, "vec_dot4", 8)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            if (a64_bin_mode) { enc_str_q_pre(0, 31, 0 - 16); }
+            else { out("  str q0, [sp, #-16]!"); putchar('\n'); }
+            a64_emit_node(*(arr + 8));
+            // Horizontal sum via two FADDPs — matches LLVM's lowering of
+            // `vaddvq_f32` and avoids the single-instruction FADDV path
+            // whose encoding is easy to mis-assemble by hand.
+            if (a64_bin_mode) {
+                enc_ldr_q_post(1, 31, 16);
+                enc_fmul_v_4s(0, 1, 0);
+                enc_faddp_v_4s(0, 0, 0);
+                enc_faddp_s(0, 0);
+            } else {
+                out("  ldr q1, [sp], #16"); putchar('\n');
+                out("  fmul v0.4s, v1.4s, v0.4s"); putchar('\n');
+                out("  faddp v0.4s, v0.4s, v0.4s"); putchar('\n');
+                out("  faddp s0, v0.2s"); putchar('\n');
+            }
+            // Result is scalar float in s0; widen to d0 for the float convention.
+            if (a64_bin_mode) { enc_fcvt_d_s(0, 0); }
+            else { out("  fcvt d0, s0"); putchar('\n'); }
+            return 1;
+        }
+        // vec_get4(v, lane) — extract one float32 lane as a scalar double.
+        // Lane index must be a compile-time literal (0..3). Spills the
+        // vector to the stack and loads the lane as a 32-bit float,
+        // avoiding the need for a specialized scalar-DUP encoder.
+        if (a64_str_eq(n.a, "vec_get4", 8)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            auto lane_nd: Node, lane_v;
+            lane_nd = *(arr + 8);
+            lane_v = a64_parse_int(lane_nd.a);
+            if (a64_bin_mode) {
+                enc_sub_imm(31, 31, 16);
+                enc_str_q_uoff(0, 31, 0);
+                enc_ldr_s_uoff(0, 31, lane_v * 4);
+                enc_add_imm(31, 31, 16);
+                enc_fcvt_d_s(0, 0);
+            } else {
+                out("  sub sp, sp, #16"); putchar('\n');
+                out("  str q0, [sp]"); putchar('\n');
+                out("  ldr s0, [sp, #"); a64_print_dec(lane_v * 4); out("]"); putchar('\n');
+                out("  add sp, sp, #16"); putchar('\n');
+                out("  fcvt d0, s0"); putchar('\n');
+            }
+            return 1;
+        }
+
         // Regular B++ function call.
         // Query bpp_types.bsm for callee's parameter and return types.
         fidx_c = find_func_idx(n.a);
@@ -1950,23 +2105,32 @@ static a64_emit_node(nd) {
             if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
         }
         // Float field types: load to float register and widen to double.
+        // SIMD (`: double`, 128 bits) stays in V0 as a SIMD value; the
+        // narrower forms load + widen to D0 per the scalar convention.
         if (is_float_type(fh)) {
+            if (ty_slice(fh) == SL_DOUBLE) {
+                if (a64_bin_mode) { enc_ldr_q_uoff(0, 0, 0); }
+                else { out("  ldr q0, [x0]"); putchar('\n'); }
+                return 2;
+            }
             if (ty_slice(fh) == SL_HALF) {
-                if (a64_bin_mode) { enc_ldr_s_uoff(0, 0, 0); }
-                if (a64_bin_mode) { enc_fcvt_d_s(0, 0); }
-                if (a64_bin_mode == 0) { out("  ldr s0, [x0]"); putchar('\n'); }
-                if (a64_bin_mode == 0) { out("  fcvt d0, s0"); putchar('\n'); }
+                if (a64_bin_mode) { enc_ldr_s_uoff(0, 0, 0); enc_fcvt_d_s(0, 0); }
+                else {
+                    out("  ldr s0, [x0]"); putchar('\n');
+                    out("  fcvt d0, s0"); putchar('\n');
+                }
                 return 1;
             }
             if (ty_slice(fh) == SL_QUARTER) {
-                if (a64_bin_mode) { enc_ldr_h_uoff(0, 0, 0); }
-                if (a64_bin_mode) { enc_fcvt_d_h(0, 0); }
-                if (a64_bin_mode == 0) { out("  ldr h0, [x0]"); putchar('\n'); }
-                if (a64_bin_mode == 0) { out("  fcvt d0, h0"); putchar('\n'); }
+                if (a64_bin_mode) { enc_ldr_h_uoff(0, 0, 0); enc_fcvt_d_h(0, 0); }
+                else {
+                    out("  ldr h0, [x0]"); putchar('\n');
+                    out("  fcvt d0, h0"); putchar('\n');
+                }
                 return 1;
             }
             if (a64_bin_mode) { enc_ldr_d_uoff(0, 0, 0); }
-            if (a64_bin_mode == 0) { out("  ldr d0, [x0]"); putchar('\n'); }
+            else { out("  ldr d0, [x0]"); putchar('\n'); }
             return 1;
         }
         // Bit-packed field types: load the containing byte, extract the
@@ -2131,31 +2295,57 @@ static void a64_emit_stmt(nd) {
     if (t == T_MEMST) {
         auto fh;
         fh = n.c;
-        // Float field types: keep value in float register, narrow if needed.
+        // Float field types: keep the value in a float register, narrow
+        // if the slice calls for it. SIMD (`: double`, 128 bits) takes a
+        // distinct path since the value must stay in a V register — not
+        // the scalar D-register pipeline the narrower slices use.
         if (is_float_type(fh)) {
+            auto fh_sl;
+            fh_sl = ty_slice(fh);
+            if (fh_sl == SL_DOUBLE) {
+                // Value side is SIMD (rty=2) already in V0. Spill to the
+                // SIMD push slot, evaluate the pointer, reload into V1,
+                // and store at [x0].
+                ety = a64_emit_node(n.b);
+                if (ety != 2) {
+                    diag_error(231);
+                    diag_str("cannot store non-SIMD value through a ': double' field");
+                    diag_newline();
+                }
+                a64_emit_vpush();
+                a64_emit_node(n.a);
+                a64_emit_vpop(1);
+                if (a64_bin_mode) { enc_str_q_uoff(1, 0, 0); }
+                else { out("  str q1, [x0]"); putchar('\n'); }
+                return 0;
+            }
+            // Scalar float slice: coerce int→double, push as scalar, then
+            // narrow on the store side per slice width.
             ety = a64_emit_node(n.b);
             if (ety == 0) {
                 if (a64_bin_mode) { enc_scvtf(0, 0); }
-                if (a64_bin_mode == 0) { out("  scvtf d0, x0"); putchar('\n'); }
+                else { out("  scvtf d0, x0"); putchar('\n'); }
             }
             a64_emit_fpush();
             a64_emit_node(n.a);
             a64_emit_fpop(1);
-            if (ty_slice(fh) == SL_HALF) {
-                if (a64_bin_mode) { enc_fcvt_s_d(1, 1); }
-                if (a64_bin_mode) { enc_str_s_uoff(1, 0, 0); }
-                if (a64_bin_mode == 0) { out("  fcvt s1, d1"); putchar('\n'); }
-                if (a64_bin_mode == 0) { out("  str s1, [x0]"); putchar('\n'); }
+            if (fh_sl == SL_HALF) {
+                if (a64_bin_mode) { enc_fcvt_s_d(1, 1); enc_str_s_uoff(1, 0, 0); }
+                else {
+                    out("  fcvt s1, d1"); putchar('\n');
+                    out("  str s1, [x0]"); putchar('\n');
+                }
             }
-            if (ty_slice(fh) == SL_QUARTER) {
-                if (a64_bin_mode) { enc_fcvt_h_d(1, 1); }
-                if (a64_bin_mode) { enc_str_h_uoff(1, 0, 0); }
-                if (a64_bin_mode == 0) { out("  fcvt h1, d1"); putchar('\n'); }
-                if (a64_bin_mode == 0) { out("  str h1, [x0]"); putchar('\n'); }
+            if (fh_sl == SL_QUARTER) {
+                if (a64_bin_mode) { enc_fcvt_h_d(1, 1); enc_str_h_uoff(1, 0, 0); }
+                else {
+                    out("  fcvt h1, d1"); putchar('\n');
+                    out("  str h1, [x0]"); putchar('\n');
+                }
             }
-            if (ty_slice(fh) == SL_FULL) {
+            if (fh_sl == SL_FULL) {
                 if (a64_bin_mode) { enc_str_d_uoff(1, 0, 0); }
-                if (a64_bin_mode == 0) { out("  str d1, [x0]"); putchar('\n'); }
+                else { out("  str d1, [x0]"); putchar('\n'); }
             }
             return 0;
         }
@@ -2508,22 +2698,30 @@ static void a64_emit_func(fi) {
     // Pre-register all declared variables from body (including nested blocks).
     a64_pre_reg_vars(body_arr, body_cnt);
 
-    // Compute per-variable frame offsets. Stack structs get N*8 bytes,
-    // regular variables get 8 bytes each.
-    auto total, sz;
+    // Compute per-variable frame offsets. Slots start after the 40-byte
+    // hidden area (fp/lr + scratch). `: double` (SIMD) locals need 16
+    // bytes AND a 16-byte aligned absolute address so STR Q / LDR Q get
+    // natural alignment — rounding `total` alone is not enough, since
+    // 40 itself is only 8-aligned; we round `abs_off = 40 + total`.
+    // Stack structs round their size up to 8 so the 8-byte chunked
+    // struct-copy path never spills into the next slot.
+    auto total, sz, _fty, abs_off;
     total = 0;
-    i = 0;
-    while (i < arr_len(a64_vars)) {
-        arr_set(a64_var_off, i, 40 + total);
-        if (arr_get(a64_var_stack, i)) {
-            // Round struct slot up to a multiple of 8 so the 8-byte chunked
-            // copy never spills into the next variable's storage.
+    for (i = 0; i < arr_len(a64_vars); i = i + 1) {
+        _fty = arr_get(a64_var_forced_ty, i);
+        abs_off = 40 + total;
+        if (slice_width(ty_slice(_fty)) == 128) {
+            abs_off = (abs_off + 15) / 16 * 16;
+            arr_set(a64_var_off, i, abs_off);
+            total = abs_off - 40 + 16;
+        } else if (arr_get(a64_var_stack, i)) {
+            arr_set(a64_var_off, i, abs_off);
             sz = (get_struct_size(arr_get(a64_var_struct_idx, i)) + 7) / 8 * 8;
+            total = total + sz;
         } else {
-            sz = 8;
+            arr_set(a64_var_off, i, abs_off);
+            total = total + 8;
         }
-        total = total + sz;
-        i = i + 1;
     }
 
     // Phase B3: walk body, count refs, select promotions.

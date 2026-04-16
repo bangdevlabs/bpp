@@ -445,6 +445,12 @@ static x64_emit_load_var(vi, off) {
         return 0;
     }
     fty = arr_get(x64_var_forced_ty, vi);
+    // `: double` — 128-bit SIMD local. MOVUPS pulls the 16-byte slot
+    // straight into xmm0. Unaligned form is safe for any stack offset.
+    if (ty_slice(fty) == SL_DOUBLE) {
+        x64_enc_movups_load(0, 5, off);
+        return 2;
+    }
     if (x64_var_is_float(vi)) {
         x64_enc_load_sd(0, 5, off);
         return 1;
@@ -466,6 +472,23 @@ static void x64_emit_store_var(vi, off, rty) {
         return 0;
     }
     fty = arr_get(x64_var_forced_ty, vi);
+    // `: double` — 128-bit SIMD. Expected incoming value is xmm0 (rty=2);
+    // MOVUPS writes the whole 16-byte slot back to the stack.
+    if (ty_slice(fty) == SL_DOUBLE) {
+        if (rty != 2) {
+            diag_error(231);
+            diag_str("cannot assign non-SIMD value to ': double' local");
+            diag_newline();
+        }
+        x64_enc_movups_store(0, 5, off);
+        return 0;
+    }
+    // Guard: SIMD value to a non-SIMD local would be silently truncated.
+    if (rty == 2) {
+        diag_error(231);
+        diag_str("cannot assign SIMD value to non-':double' local (declare it ': double')");
+        diag_newline();
+    }
     if (x64_var_is_float(vi)) {
         if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
         x64_enc_store_sd(0, 5, off);
@@ -666,6 +689,45 @@ static void x64_emit_push() {
 static void x64_emit_pop(r) {
     x64_enc_pop(r);
     x64_depth = x64_depth - 1;
+}
+
+// Push XMM0 onto the stack as a 16-byte SIMD value (Phase B4).
+// x64_depth tracks 8-byte slots so a SIMD value counts as two.
+static void x64_emit_vpush() {
+    x64_enc_sub_imm(4, 16);
+    x64_enc_movups_store(0, 4, 0);
+    x64_depth = x64_depth + 2;
+}
+
+// Pop a 16-byte SIMD value from the stack into the given XMM register.
+static void x64_emit_vpop(xr) {
+    x64_enc_movups_load(xr, 4, 0);
+    x64_enc_add_imm(4, 16);
+    x64_depth = x64_depth - 2;
+}
+
+// Phase B4: emit a two-operand SIMD builtin (vec_add4, vec_sub4, …).
+// Evaluates the left child, spills, evaluates the right child, reloads
+// the left into xmm1, and runs the packed op. For commutative ops the
+// result lands directly in xmm0 (`op xmm0, xmm1`). For non-commutative
+// ops the lanes would be reversed, so we emit `op xmm1, xmm0` and copy
+// xmm1 → xmm0 with MOVAPS afterwards.
+static void _x64_vec_binop(n: Node, opcode, commutative) {
+    auto arr;
+    arr = n.b;
+    x64_emit_node(*(arr + 0));   // left → xmm0
+    x64_emit_vpush();
+    x64_emit_node(*(arr + 8));   // right → xmm0
+    x64_emit_vpop(1);             // xmm1 = left
+    if (commutative) {
+        // xmm0 = op(xmm0, xmm1) — lanes pairwise with the right operand
+        // already in xmm0; commutativity makes the pair order irrelevant.
+        x64_enc_sse_packed(opcode, 0, 1);
+    } else {
+        // xmm1 = op(left, right), then move to xmm0 for the SIMD return reg.
+        x64_enc_sse_packed(opcode, 1, 0);
+        x64_enc_movaps_reg(0, 1);
+    }
 }
 
 // Push XMM0 onto the stack (as 8-byte IEEE 754 bits).
@@ -1381,6 +1443,88 @@ static x64_emit_node(nd) {
             return 0;
         }
 
+        // ── Phase B4: SIMD builtins (4-wide float32) ──
+        // Each builtin lowers to SSE2 packed instructions. Binary ops
+        // factor through a single helper so add/sub/mul/div/min/max read
+        // as "opcode byte + commutative flag" rather than six copies of
+        // the same spill/reload choreography.
+        if (x64_str_eq(n.a, "vec_load4", 9)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_enc_movups_load(0, 0, 0);
+            return 2;
+        }
+        if (x64_str_eq(n.a, "vec_store4", 10)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 8));  // value → xmm0
+            x64_emit_vpush();
+            x64_emit_node(*(arr + 0));  // ptr → rax
+            x64_emit_vpop(1);            // xmm1 = value
+            x64_enc_movups_store(1, 0, 0);
+            return 0;
+        }
+        // Binary ops dispatch through _x64_vec_binop.
+        if (x64_str_eq(n.a, "vec_add4", 8)) { _x64_vec_binop(n, 0x58, 1); return 2; }
+        if (x64_str_eq(n.a, "vec_mul4", 8)) { _x64_vec_binop(n, 0x59, 1); return 2; }
+        if (x64_str_eq(n.a, "vec_min4", 8)) { _x64_vec_binop(n, 0x5D, 1); return 2; }
+        if (x64_str_eq(n.a, "vec_max4", 8)) { _x64_vec_binop(n, 0x5F, 1); return 2; }
+        if (x64_str_eq(n.a, "vec_sub4", 8)) { _x64_vec_binop(n, 0x5C, 0); return 2; }
+        if (x64_str_eq(n.a, "vec_div4", 8)) { _x64_vec_binop(n, 0x5E, 0); return 2; }
+        if (x64_str_eq(n.a, "vec_splat4", 10)) {
+            arr = n.b;
+            ety = x64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                // Float scalar in xmm0 (double). Convert to single, then
+                // shuffle to broadcast lane 0 across all four lanes.
+                x64_enc_cvtsd2ss(0, 0);
+            } else {
+                // Integer in rax. MOVD transfers low 32 bits into xmm0's
+                // low lane with upper 96 zeroed.
+                x64_enc_movd_to_xmm(0, 0);
+            }
+            x64_enc_shufps(0, 0, 0x00);
+            return 2;
+        }
+        if (x64_str_eq(n.a, "vec_dot4", 8)) {
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            x64_emit_vpush();
+            x64_emit_node(*(arr + 8));
+            x64_emit_vpop(1);
+            // SSE2-only horizontal sum (no DPPS — SSE4.1 is out of scope):
+            //   MULPS   xmm0, xmm1          ; xmm0 = a * b
+            //   MOVHLPS xmm1, xmm0          ; xmm1 low = xmm0 high
+            //   ADDPS   xmm0, xmm1          ; pairs summed in low 64
+            //   PSHUFD  xmm1, xmm0, 0x01    ; xmm1[0] = xmm0[1]
+            //   ADDSS   xmm0, xmm1          ; xmm0[0] = full dot product
+            x64_enc_mulps(0, 1);
+            x64_enc_movhlps(1, 0);
+            x64_enc_addps(0, 1);
+            x64_enc_pshufd(1, 0, 0x01);
+            x64_enc_addss(0, 1);
+            // Widen single-precision result to double for the float convention.
+            x64_enc_cvtss2sd(0, 0);
+            return 1;
+        }
+        if (x64_str_eq(n.a, "vec_get4", 8)) {
+            // Lane index must be a compile-time literal (0..3). PSHUFD
+            // moves the chosen lane to position 0; a stack-round-trip
+            // reloads those bits as a scalar single; CVTSS2SD widens.
+            arr = n.b;
+            x64_emit_node(*(arr + 0));
+            auto lane_nd: Node, lane_v, lane_mask;
+            lane_nd = *(arr + 8);
+            lane_v = x64_parse_int(lane_nd.a);
+            lane_mask = lane_v | (lane_v << 2) | (lane_v << 4) | (lane_v << 6);
+            x64_enc_pshufd(0, 0, lane_mask);
+            x64_enc_sub_imm(4, 16);
+            x64_enc_movups_store(0, 4, 0);
+            x64_enc_load_ss(0, 4, 0);
+            x64_enc_add_imm(4, 16);
+            x64_enc_cvtss2sd(0, 0);
+            return 1;
+        }
+
         // Regular B++ function call.
         // Query bpp_types for callee's parameter types (mirrors ARM64 logic).
         fidx_c = find_func_idx(n.a);
@@ -1461,6 +1605,12 @@ static x64_emit_node(nd) {
         ety = x64_emit_node(n.a);
         if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
         sl = ty_slice(fh);
+        // `: double` field (128-bit SIMD) — MOVUPS into xmm0 and return
+        // type 2 (SIMD) so chained vec_* ops receive the right-width reg.
+        if (sl == SL_DOUBLE) {
+            x64_enc_movups_load(0, 0, 0);
+            return 2;
+        }
         // Bit-packed fields: load the containing byte, shift the field down to
         // bit 0, mask off the high bits. The bit offset within the byte is
         // encoded in bits 8-10 of the hint by resolve_dot.
@@ -1579,12 +1729,28 @@ static void x64_emit_stmt(nd) {
     if (t == T_MEMST) {
         auto fh, sl, bo, bw, mask, clear_mask;
         fh = n.c;
+        sl = ty_slice(fh);
+        // `: double` field (128-bit SIMD). Value must already be in xmm0
+        // (rty=2); spill through the SIMD stack slot, evaluate pointer,
+        // reload into xmm1, then MOVUPS to [rax].
+        if (sl == SL_DOUBLE) {
+            ety = x64_emit_node(n.b);
+            if (ety != 2) {
+                diag_error(231);
+                diag_str("cannot store non-SIMD value through a ': double' field");
+                diag_newline();
+            }
+            x64_emit_vpush();
+            x64_emit_node(n.a);
+            x64_emit_vpop(1);
+            x64_enc_movups_store(1, 0, 0);
+            return 0;
+        }
         ety = x64_emit_node(n.b);
         if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
         x64_emit_push();
         x64_emit_node(n.a);
         x64_emit_pop(1);
-        sl = ty_slice(fh);
         // Bit-packed field stores: load the containing byte into rdx, clear
         // the destination field bits, shift the source value into position,
         // OR them together, store the byte back. rax holds the pointer and
@@ -1809,22 +1975,30 @@ static void x64_emit_func(fi) {
     // Pre-register all declared variables.
     x64_pre_reg_vars(body_arr, body_cnt);
 
-    // Compute per-variable frame offsets (negative from RBP).
-    // [RBP - 8] = scratch area (putchar temp).
-    // [RBP - 16] = first variable, [RBP - 24] = second, etc.
+    // Compute per-variable frame offsets (negative from rbp).
+    // [rbp - 8]  = scratch, [rbp - 16] = xmm0 save, [rbp - 24] = xmm1
+    // save. First variable at rbp - 32 and so on. `: double` locals
+    // need the absolute offset from rbp to be a multiple of 16 so
+    // MOVUPS / MOVAPS see natural alignment. The scratch area is 24
+    // bytes so `total` starts 8 mod 16 — rounding needs to happen on
+    // `24 + total` (the absolute magnitude), not `total` alone.
+    auto _fty, abs_mag;
     total = 0;
-    i = 0;
-    while (i < arr_len(x64_vars)) {
-        if (arr_get(x64_var_stack, i)) {
-            // Round struct slot up to a multiple of 8 so the 8-byte chunked
-            // copy never spills into the next variable's storage.
+    for (i = 0; i < arr_len(x64_vars); i = i + 1) {
+        _fty = arr_get(x64_var_forced_ty, i);
+        abs_mag = 24 + total;
+        if (slice_width(ty_slice(_fty)) == 128) {
+            abs_mag = (abs_mag + 15) / 16 * 16;
+            total = abs_mag - 24 + 16;
+            arr_set(x64_var_off, i, 0 - abs_mag - 16);
+        } else if (arr_get(x64_var_stack, i)) {
             sz = (get_struct_size(arr_get(x64_var_struct_idx, i)) + 7) / 8 * 8;
+            total = total + sz;
+            arr_set(x64_var_off, i, 0 - (24 + total));
         } else {
-            sz = 8;
+            total = total + 8;
+            arr_set(x64_var_off, i, 0 - (24 + total));
         }
-        total = total + sz;
-        arr_set(x64_var_off, i, 0 - (24 + total));
-        i = i + 1;
     }
     // Phase B3: walk body, count refs, select promotions. Done before
     // frame size is finalized so the spill area shares the allocation.

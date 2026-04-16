@@ -228,6 +228,104 @@ critical_section(): solo {           // always sequential, no auto-dispatch
 
 ---
 
+## SIMD (`: double` and `vec_*` builtins)
+
+128-bit SIMD lives in the language as the widest rung of the slice
+ladder. A local declared `: double` reserves a 16-byte, 16-byte-aligned
+stack slot holding four 32-bit floats. Eleven `vec_*` builtins operate
+on those slots and lower to NEON on ARM64 and SSE2 on x86_64 — no
+library call, no runtime feature check.
+
+### Declaring a SIMD local
+
+```bpp
+auto v: double;           // four float32 lanes, 16-byte aligned
+v = vec_splat4(2.0);      // every lane = 2.0
+```
+
+`: double` also works as a struct field. Field offsets are computed
+in 16-byte steps, so a mixed struct lays out cleanly:
+
+```bpp
+struct Particle {
+    pos: double,          // offset  0, 16 bytes
+    vel: double,          // offset 16, 16 bytes
+    mass: half float,     // offset 32,  4 bytes
+    id,                   // offset 40,  8 bytes
+}
+```
+
+Access through a typed local (`auto p: Particle; p.pos = ...`)
+respects the packed layout. Raw `*(ptr + N)` does NOT — see
+Rule 8 in `tonify_checklist.md`.
+
+### Builtins
+
+All eleven return or consume values in a SIMD register (v0 on ARM64,
+xmm0 on x86_64). Assigning a SIMD result to a non-`: double` local is
+error E231.
+
+| Builtin | Meaning |
+|---------|---------|
+| `vec_load4(ptr)` | Load 4 float32 lanes from memory (unaligned-safe). |
+| `vec_store4(ptr, v)` | Store 4 float32 lanes to memory (unaligned-safe). |
+| `vec_splat4(x)` | Broadcast scalar `x` to every lane. Int or float scalar; float is converted to single precision. |
+| `vec_add4(a, b)` | Lane-wise addition. |
+| `vec_sub4(a, b)` | Lane-wise subtraction. |
+| `vec_mul4(a, b)` | Lane-wise multiplication. |
+| `vec_div4(a, b)` | Lane-wise division. |
+| `vec_min4(a, b)` | Lane-wise minimum. |
+| `vec_max4(a, b)` | Lane-wise maximum. |
+| `vec_dot4(a, b)` | Horizontal sum of `a * b`. Returns scalar float. |
+| `vec_get4(v, i)` | Extract lane `i` (0..3) as a scalar float. |
+
+```bpp
+auto a: double;
+auto b: double;
+a = vec_splat4(2.0);
+b = vec_splat4(3.0);
+a = vec_add4(a, b);                        // [5, 5, 5, 5]
+auto lane;
+lane = vec_get4(a, 2);                     // 5.0
+auto dot;
+dot = vec_dot4(a, vec_splat4(1.0));        // 20.0 (sum of four 5s)
+```
+
+### Alignment
+
+- **Stack slots** (`auto v: double;`) are always 16-byte aligned.
+  The compiler rounds the absolute frame offset, not just the
+  relative one — verified by `test_vec_align_stack.bpp`.
+- **Heap buffers** passed to `vec_load4` / `vec_store4` do NOT need
+  to be 16-byte aligned. The native backends always emit the
+  unaligned form (LDR Q on ARM64, MOVUPS on x86_64), so both
+  `malloc_aligned(size, 16)` and plain `malloc(size)` work.
+- For consumers that care about perf (audio DSP, SIMD-heavy inner
+  loops), prefer `malloc_aligned(size, 16)`. The 16-byte alignment
+  is also the default `malloc` alignment since Phase A2, so in
+  practice unaligned access only happens when pointer arithmetic
+  offsets into the middle of a buffer.
+
+### Baseline ISA
+
+- **ARM64**: ARMv8 base. FADD/FMUL/FDIV/FMIN/FMAX `.4S`, DUP,
+  FADDP, LDR Q / STR Q. No ARMv8.1+ extensions required.
+- **x86_64**: SSE2 only (part of the x86_64 baseline). ADDPS,
+  MULPS, MOVUPS, SHUFPS, MOVHLPS. No SSE4.1 DPPS, no AVX, no
+  runtime feature detection. Any x86_64 chip runs the binary.
+
+### C backend
+
+The C transpile path (`bpp --c`) does NOT currently map `: double`
+or `vec_*` — it requires typing every local that holds a SIMD value
+as `__m128`, which is an invasive change to the emitter. Programs
+that use SIMD and go through the C backend will fail at the
+extern-lookup stage, which is the correct signal. Native `bpp`
+(ARM64 / x86_64) is the supported SIMD target; C-backend support
+is tracked in `docs/todo.md`.
+
+---
+
 ## Design Principles
 
 **Public by default.** Write code, it works. Add `static` when the project grows and you need module boundaries.
