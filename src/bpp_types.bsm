@@ -23,7 +23,7 @@ import "bpp_parser.bsm";
 
 // ── Symbol table ───────────────────────────────────────────
 // Dynamic parallel arrays of packed name and type code.
-auto ty_vt_names, ty_vt_types;
+auto ty_vt_names, ty_vt_types, ty_vt_locked;
 
 // Known function return types: dynamic parallel arrays.
 auto ft_names, ft_types;
@@ -43,8 +43,9 @@ auto ty_gl_names, ty_gl_types;
 
 // Initialize the type inference engine. Call once at startup.
 void init_types() {
-    ty_vt_names = arr_new();
-    ty_vt_types = arr_new();
+    ty_vt_names  = arr_new();
+    ty_vt_types  = arr_new();
+    ty_vt_locked = arr_new();
     ft_names = arr_new();
     ft_types = arr_new();
     fn_vt_data = arr_new();
@@ -84,6 +85,7 @@ ty_get_global_type(name_p) {
 void ty_reset_scope() {
     arr_clear(ty_vt_names);
     arr_clear(ty_vt_types);
+    arr_clear(ty_vt_locked);
 }
 
 // Look up a variable's inferred type by packed name. Returns TY_UNK if not found.
@@ -97,19 +99,39 @@ ty_var_type(name_p) {
     return TY_UNK;
 }
 
-// Set a variable's inferred type. If the variable exists, promote to the wider type.
+// Set a variable's inferred type. If the variable exists, promote to the wider
+// type — UNLESS the variable was locked via ty_lock_var (i.e. the programmer
+// gave it an explicit `: word` / `: float` / etc. hint). Locked variables keep
+// their declared type even when an inferred-wider type would otherwise win:
+// the explicit annotation is the user's contract with the codegen, and the
+// E232 / E233 diagnostics rely on it being authoritative.
 void ty_set_var_type(name_p, ty) {
     auto i, old;
     for (i = 0; i < arr_len(ty_vt_names); i = i + 1) {
         if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            if (arr_get(ty_vt_locked, i)) { return; }
             old = arr_get(ty_vt_types, i);
             arr_set(ty_vt_types, i, promote(old, ty));
             return;
         }
     }
-    // New variable: append to table.
-    ty_vt_names = arr_push(ty_vt_names, name_p);
-    ty_vt_types = arr_push(ty_vt_types, ty);
+    // New variable: append to table, unlocked by default.
+    ty_vt_names  = arr_push(ty_vt_names,  name_p);
+    ty_vt_types  = arr_push(ty_vt_types,  ty);
+    ty_vt_locked = arr_push(ty_vt_locked, 0);
+}
+
+// Lock a variable's type. Subsequent ty_set_var_type calls become no-ops, so
+// inference cannot widen `: word` into float. Called by the typer during
+// T_AUTO whenever the parser attached an explicit type hint.
+void ty_lock_var(name_p) {
+    auto i;
+    for (i = 0; i < arr_len(ty_vt_names); i = i + 1) {
+        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            arr_set(ty_vt_locked, i, 1);
+            return;
+        }
+    }
 }
 
 // Register or update a known function return type.
@@ -323,7 +345,10 @@ add_type(nd) {
             // Per-variable hints array: each variable has its own hint.
             for (i = 0; i < cnt; i = i + 1) {
                 hint = hints_arr[i];
-                if (hint > 0) { ty_set_var_type(arr[i], hint); }
+                if (hint > 0) {
+                    ty_set_var_type(arr[i], hint);
+                    ty_lock_var(arr[i]);
+                }
             }
         } else {
             // Single hint applied to all variables (backward compat).
@@ -331,6 +356,7 @@ add_type(nd) {
             if (hint > 0) {
                 for (i = 0; i < cnt; i = i + 1) {
                     ty_set_var_type(arr[i], hint);
+                    ty_lock_var(arr[i]);
                 }
             }
         }
@@ -436,15 +462,20 @@ infer_one_func(func_idx) {
     ty_cur_ret = TY_UNK;
 
     // Register parameters with their current known types.
-    // Explicit primitive type hints from the programmer always take priority.
+    // Explicit primitive type hints from the programmer always take priority,
+    // and they LOCK the parameter so subsequent inference inside the body
+    // cannot widen `: word` into float (the same lock semantics that protect
+    // explicit local hints from inference upgrades).
     for (j = 0; j < param_cnt; j = j + 1) {
         pt = get_fn_par_type(func_idx, j);
+        h = 0;
         if (hints != 0) {
             h = hints[j];
             if (h > 0) { pt = h; }
         }
         if (pt == TY_UNK) { pt = TY_WORD; }
         ty_set_var_type(params_arr[j], pt);
+        if (h > 0) { ty_lock_var(params_arr[j]); }
     }
 
     // Walk the function body.

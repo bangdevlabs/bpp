@@ -378,14 +378,55 @@ val_check_node(nd) {
         return 0;
     }
     T_ASSIGN {
-        auto lhs: Node, hint_ty, val_ty;
+        auto lhs: Node, hint_ty, val_ty, lhs_ty;
         lhs = n.a;
         if (lhs != 0) {
             if (lhs.ntype == T_VAR) {
                 hint_ty = _val_get_hint(lhs.a);
+                val_ty  = n.itype;
+                lhs_ty  = lhs.itype;
                 if (hint_ty > 0) {
-                    val_ty = n.itype;
                     val_check_assign_compat(hint_ty, val_ty, lhs.a);
+                }
+                // E232: storing a float value into a destination with NO type
+                // annotation silently drops the IEEE 754 bits. The runtime
+                // FCVTZS converts 44100.0 to integer 44100 — fine if you
+                // wanted truncation, disastrous when you wanted to preserve
+                // the bit pattern (e.g. building a CoreAudio sample-rate
+                // field). The principle: a literal that ends in `.0` declares
+                // float intent; storing it into a variable that never said
+                // anything about its type is almost always a bug or a
+                // copy-paste accident. Make the user choose explicitly.
+                //
+                // The error fires only when the destination is COMPLETELY
+                // unannotated. An explicit `: word` (or any other int slice)
+                // counts as a deliberate choice to truncate — that path stays
+                // silent because the user already opted in. An explicit
+                // `: float` (or float slice) means no conversion at all — also
+                // silent. The error catches the middle case: untyped local or
+                // untyped global being asked to swallow a float behind your
+                // back.
+                if (is_float_type(val_ty)) {
+                    if (hint_ty == 0) {
+                        if (is_float_type(lhs_ty) == 0) {
+                            if (is_float_type(ty_get_global_type(lhs.a)) == 0) {
+                                diag_error(232);
+                                diag_str("'");
+                                diag_packed(lhs.a);
+                                diag_str("' has no type annotation but the value being stored is a float — the IEEE 754 bits will be silently truncated to an integer");
+                                diag_newline();
+                                _val_show_context_at(_val_src_tok);
+                                diag_help("a number literal with a decimal point (e.g. 3.0) is a FLOAT; without the decimal point (3) it is an INT");
+                                diag_newline();
+                                diag_help("if you want integer math, drop the decimal point: write `3` instead of `3.0`");
+                                diag_newline();
+                                diag_help("if you want to keep the float value, declare '");
+                                diag_packed(lhs.a);
+                                diag_str(": float' so the variable holds the bit pattern");
+                                diag_newline();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -446,15 +487,27 @@ val_check_node(nd) {
                     par_ty = get_fn_par_type(fi, ai);
                     if (is_float_type(arg_ty)) {
                         if (is_float_type(par_ty) == 0) {
-                            diag_warn(2);
-                            diag_str("implicit float-to-int conversion in argument ");
+                            // E233: passing a float-typed value to a parameter
+                            // declared without `: float` drops the IEEE 754
+                            // bits the same way E232 does at assignment sites.
+                            // Hard error for consistency — the language never
+                            // silently corrupts a float on its way to a callee.
+                            diag_error(233);
+                            diag_str("argument ");
                             diag_int(ai + 1);
                             diag_str(" of '");
                             diag_packed(name_p);
-                            diag_str("'");
+                            diag_str("' is a float, but the parameter is an int — the IEEE 754 bits will be silently truncated");
                             diag_newline();
                             _val_show_context_at(n.src_tok);
-                            diag_help("add ': float' to the parameter declaration");
+                            diag_help("a number literal with a decimal point (e.g. 3.0) is a FLOAT; without the decimal point (3) it is an INT");
+                            diag_newline();
+                            diag_help("if you meant to pass an integer, drop the decimal point on the literal");
+                            diag_newline();
+                            diag_help("if '");
+                            diag_packed(name_p);
+                            diag_str("' should accept a float, declare its parameter with ': float'");
+                            diag_newline();
                         }
                     }
                 }
