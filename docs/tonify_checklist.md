@@ -302,6 +302,59 @@ Both forms desugar to `T_TERNARY` in the AST, so the backends see a
 single canonical node. Adding the idiom costs zero runtime overhead
 versus the longer form.
 
+## Rule 12: Float bits across an `auto` slot need `: float`
+
+Storing a float-typed value into a bare `auto` local converts it to
+int via FCVTZS — the IEEE 754 bit pattern is gone. The compiler now
+catches this with E232 (assignment) and E233 (call site), so the
+practical rule is: when a local needs to hold a float, annotate it.
+
+| Pattern | Action |
+|---------|--------|
+| `auto sr; sr = 44100.0;` | Annotate: `auto sr: float;` |
+| `auto pi; pi = 3.14159;` | Annotate: `auto pi: float;` |
+| `auto x; x = some_float_func();` | Annotate `x: float`, OR use the return as a float-typed expression directly |
+| Truncation IS the intent | Drop the decimal point on the literal: `auto x; x = 3;` |
+
+The compiler emits the explicit conversion path (`FCVTZS` on ARM64,
+`CVTTSD2SI` on x86_64) for explicitly-int destinations annotated
+`: word`, `: byte`, `: half`, `: quarter`. The `: int` synonym was
+removed in 0.23.x — `: word` is the canonical name.
+
+Cross-reference: `~/.claude/projects/-Users-Codes-b--/memory/feedback_auto_float_silent_int.md`
+for the discovery story (CoreAudio sample-rate field corruption).
+
+## Rule 13: Public API parameters use explicit hints when non-word
+
+Functions declared without `static` form the module's public API.
+Parameters that expect non-word types (float, byte, struct pointer,
+small enum) should carry an explicit hint in the signature. Static
+functions are implementation detail — they are free to experiment with
+inferred types. Public functions should communicate their type
+expectations to every caller.
+
+| Pattern | Action |
+|---------|--------|
+| `audio_play(rate, buf, len)` where `rate` is float | Add: `audio_play(rate: float, buf, len: word)` |
+| `static helper(tmp)` where `tmp` is internal | Keep as-is — `static` is implementation |
+| `pos_set(x, y)` where both are word | Keep as-is — word is the default |
+| `set_color(r, g, b, a)` where all are float | Add: `set_color(r: float, g: float, b: float, a: float)` |
+| `set_pixel(x: byte, y: byte, c: byte)` already follows the rule | No change |
+
+**Why.** API is contract. Without explicit hints on public parameters,
+two callers using the same function disagree about its type intent.
+One caller passes `1.0` (float), the next passes `1` (int) — both
+"compile" but they exercise different codegen paths and one of them is
+the bug. Explicit hints turn the function signature into the single
+source of truth.
+
+**W025 (planned, deferred):** the compiler nudge for Rule 13. When a
+non-`static` function uses a parameter in a clearly float-typed
+context inside its body but the parameter has no `: float` hint, fire
+a non-fatal warning suggesting the annotation. A first cut hit a
+subtle bootstrap regression and was shelved for dedicated debugging.
+Until it ships, Rule 13 is convention-only — apply it in code review.
+
 ---
 
 ## Known pitfalls (discovered during batch 2)

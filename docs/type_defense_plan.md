@@ -165,10 +165,11 @@ Add to `docs/tonify_checklist.md`:
 | `static helper(tmp)` where tmp is internal | Keep as-is |
 | `pos_set(x, y)` where both are word | Keep as-is (default) |
 
-Convention-driven, not compiler-enforced. W025 fires only when a clear
-mismatch exists at call sites.
+Convention-driven. W025 (the compiler nudge) was attempted in this
+sprint and triggered a bootstrap regression — see the W025 status
+note below; for now Rule 13 is enforced by code review.
 
-### W025 — public function with ambiguous param type
+### W025 — public function with ambiguous param type — STATUS: deferred
 
 **Trigger:**
 - Function called is non-`static`
@@ -179,6 +180,19 @@ mismatch exists at call sites.
 
 **Where:** `src/bpp_validate.bsm`, function-level pass over non-static
 functions.
+
+**Status (2026-04-16):** A first-cut implementation introduced a
+parameter-name-tracking helper (`_val_params` array, `_val_remember_param`,
+`_val_is_param`, `_val_w025_check`) and a check inside the T_BINOP
+handler. The helpers themselves caused a 1-cycle bootstrap oscillation
+and, when the diag_help message was added, the gen2 binary failed with
+"internal error: global 'break' not found in data section" — a codegen
+issue that surfaces only when the new validator code is compiled by
+the previous-generation `bpp`. Bisection narrowed the trigger to the
+specific combination of helpers + T_BINOP wiring + a long help string,
+but root cause is not pinned. Shelved for a dedicated debugging
+session. Rule 13 still ships as documented convention; W025 is
+tracked here.
 
 ### Files touched (Level 2)
 
@@ -324,3 +338,51 @@ Post-MVP feature.
 
 Three sprints, each independently bootstrappable. Can be done in
 sequence or parallel (different files touched, minimal overlap).
+
+---
+
+## Post-plan sweep (mandatory)
+
+After each level ships, apply the new feature across `src/` and `stb/`.
+Sweeps are not "extra work" — they are the integral closing of each
+level. Without the sweep, features stay decorative: language gets the
+tool but the codebase doesn't use it, and a newcomer reading
+canonical code does not learn the new pattern.
+
+| Level shipped | Sweep | What it does |
+|---|---|---|
+| Level 1 → | **Sweep 2a** | Fix every E240-E244 site that fires across `src/` + `stb/` + `games/`. Each fire is either a latent bug to fix or a place that needs an explicit hint. |
+| Level 2 → | **Sweep 2b** | Apply Rule 13 to every public API in `stb/`. Annotate parameters with their real types where the type is not word. Modules: stbaudio, stbfont, stbrender, stbecs, stbphys, stbmath, etc. |
+| Level 4 → | **Sweep 2c** | Annotate `: realtime` / `: io` / `: gpu` across `src/` + `stb/`. The audio callback in `stbaudio` becomes `: realtime` (this is the killer demo: compiler proves no malloc inside callback). Render-path functions in stbgame/stbrender become `: gpu`. I/O wrappers become `: io`. |
+
+### Why this matters
+
+Adding `: realtime` does not catch bugs if nobody annotates. The audio
+callback without `: realtime` keeps accepting anything. Value only
+appears once `stbaudio.audio_callback` carries the annotation and the
+compiler proves `malloc` does not reach it.
+
+Sweep is where the loop closes between feature and practice. It also
+calibrates the feature itself: if a sweep finds many latent bugs, the
+diagnostic was worth shipping. If it finds nothing, the diagnostic was
+either too conservative (relax it) or covers a problem that does not
+exist in this codebase (consider removing).
+
+### Estimated cost
+
+- **Sweep 2a:** 30-80 sites depending on how aggressive E240-E244 are
+  in practice. 1-2 sessions.
+- **Sweep 2b:** ~15 stb modules with public APIs, ~5-15 functions each
+  worth a hint. ~50-100 hints added. 1 session.
+- **Sweep 2c:** ~30-50 functions across `src/` + `stb/` that earn an
+  effect annotation. 1-2 sessions.
+
+**Total post-plan sweep:** 4-5 sessions of mechanical-but-criterious
+work (each site evaluated individually).
+
+### Discipline
+
+Sweep ships in the same PR as the level it sweeps for. Don't merge
+"Level 2 + Rule 13 docs" without merging "Sweep 2b adds the hints" in
+the same window. Otherwise the canonical code drifts from the
+canonical rule and the language teaches the wrong pattern by example.
