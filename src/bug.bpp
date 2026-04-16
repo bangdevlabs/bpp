@@ -333,13 +333,65 @@ ends_with_bug(path) {
     return 1;
 }
 
+// -- Breakpoint-spec state ------------------------------------
+// Populated by the --break CLI parser. bug_run reads these to decide
+// whether to trace every function (legacy default) or only the named
+// ones (selective mode).
+//
+// bp_names  — array of up to 32 C-string pointers (directly from argv,
+//             so no allocation). Each entry is a function name the
+//             user wants to break on.
+// bp_count  — number of entries filled in bp_names.
+// flag_break_all — set by --break-all so the user can combine
+//             selective breakpoints with full tracing. When no
+//             --break flags are given at all, legacy behaviour
+//             kicks in and every function is traced.
+static extrn bp_names;
+static extrn bp_count;
+static extrn flag_break_all;
+
+// Compare two null-terminated C strings. Returns 1 if identical,
+// 0 otherwise. Used only for matching CLI flags like `--break`.
+static _cstr_eq(a, b) {
+    auto i, ca, cb;
+    i = 0;
+    ca = str_peek(a, 0);
+    cb = str_peek(b, 0);
+    while (ca == cb) {
+        if (ca == 0) { return 1; }
+        i = i + 1;
+        ca = str_peek(a, i);
+        cb = str_peek(b, i);
+    }
+    return 0;
+}
+
+// Returns 1 if the C-string `s` contains byte `ch` before its NUL
+// terminator. Used to reject `name:line` breakpoints in the MVP
+// while the per-line source map remains off-by-N (see docs/todo.md
+// bug #3b).
+static _cstr_has(s, ch) {
+    auto i, c;
+    i = 0;
+    c = str_peek(s, 0);
+    while (c != 0) {
+        if (c == ch) { return 1; }
+        i = i + 1;
+        c = str_peek(s, i);
+    }
+    return 0;
+}
+
 // -- Main -----------------------------------------------------
 
 main() {
-    auto nargs, arg, len, loaded;
+    auto nargs, arg, len, loaded, target_idx, i;
 
     _out_buf = malloc(16);
     pathbuf = malloc(4096);
+    bp_names = malloc(32 * 8);
+    bp_count = 0;
+    flag_break_all = 0;
 
     init_array();
     init_reader();
@@ -347,14 +399,58 @@ main() {
 
     nargs = argc_get();
     if (nargs < 2) {
-        out_str("usage: bug <file.bug>          dump debug map");
-        out_nl();
-        out_str("       bug <program> [args]    observe program (TODO)");
-        out_nl();
+        out_str("usage: bug [flags] <program> [args]"); out_nl();
+        out_str("       bug <file.bug>   dump debug map"); out_nl();
+        out_str(""); out_nl();
+        out_str("flags:"); out_nl();
+        out_str("  --break <fn>     stop at entry of function <fn>"); out_nl();
+        out_str("  --break-all      also trace every function (default when no --break given)"); out_nl();
         return 1;
     }
 
-    arg = argv_get(1);
+    // Parse --break / --break-all flags. Target program is the first
+    // non-flag argument; everything after it is passed to the target.
+    target_idx = 1;
+    auto _done;
+    _done = 0;
+    while (_done == 0) {
+        if (target_idx >= nargs) { _done = 1; }
+        else {
+            arg = argv_get(target_idx);
+            if (_cstr_eq(arg, "--break")) {
+                if (target_idx + 1 >= nargs) {
+                    out_str("bug: --break requires a function name"); out_nl();
+                    return 1;
+                }
+                if (bp_count >= 32) {
+                    out_str("bug: too many --break flags (max 32)"); out_nl();
+                    return 1;
+                }
+                auto spec;
+                spec = argv_get(target_idx + 1);
+                if (_cstr_has(spec, ':')) {
+                    out_str("bug: `name:line` breakpoints are not yet implemented "); out_nl();
+                    out_str("     (MVP supports function entry only -- see docs/todo.md #3b)"); out_nl();
+                    return 1;
+                }
+                *(bp_names + bp_count * 8) = spec;
+                bp_count = bp_count + 1;
+                target_idx = target_idx + 2;
+            } else if (_cstr_eq(arg, "--break-all")) {
+                flag_break_all = 1;
+                target_idx = target_idx + 1;
+            } else {
+                _done = 1;
+            }
+        }
+    }
+
+    if (target_idx >= nargs) {
+        out_str("bug: missing target program"); out_nl();
+        return 1;
+    }
+
+    arg = argv_get(target_idx);
 
     if (ends_with_bug(arg)) {
         // Dump mode: read and display .bug file contents.
@@ -404,10 +500,16 @@ main() {
         target_path = malloc(4096);
         copy_cstr(target_path, arg);
 
-        // Run and observe the target process.
-        // The observer will read the symbol table from the binary itself
-        // to build the address map for function tracing.
-        bug_run(target_path, 1, nargs);
+        // Run and observe the target process. start_idx is the argv
+        // position of the target program itself — the observer passes
+        // argv[start_idx+1 .. nargs-1] through to the target as its
+        // own argument list. bp_names / bp_count / flag_break_all come
+        // from the --break flags parsed earlier; when bp_count == 0
+        // and flag_break_all == 0 the observer falls back to legacy
+        // "trace every function" mode (sub-step 3 wires the selective
+        // path in).
+        bug_run(target_path, target_idx, nargs,
+                bp_names, bp_count, flag_break_all);
     }
 
     return 0;
