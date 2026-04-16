@@ -403,6 +403,33 @@ _cstr_eq_packed(cstr, packed) {
     return 1;
 }
 
+// Read a target-memory address as a null-terminated C-string and
+// print it to bug's own stdout as `"..."`. Useful for --dump-str:
+// every B++ call whose first args are string pointers becomes
+// self-describing in the trace without hand-decoding hex. Caps at 32
+// bytes to keep trace lines short; strings longer than that end with
+// `…"` so the user knows there was more.
+static _dump_cstr_at(label, addr) {
+    auto i, ch, w, off, printed;
+    if (addr == 0) { return 0; }
+    out_str(label);
+    out_str("=\"");
+    printed = 0;
+    for (off = 0; off < 32; off = off + 8) {
+        w = gdb_read_mem(addr + off, 8);
+        for (i = 0; i < 8; i = i + 1) {
+            ch = (w >> (i * 8)) & 0xFF;
+            if (ch == 0) { out_ch('"'); return 0; }
+            if (printed >= 32) { out_str("\u2026\""); return 0; }
+            if (ch >= 32 && ch < 127) { out_ch(ch); }
+            else { out_ch('.'); }
+            printed = printed + 1;
+        }
+    }
+    out_str("\"");
+    return 0;
+}
+
 // Resolve a --break function name (as a C-string from argv) to an
 // absolute text-section address the debugger can hand to gdb_set_bp.
 // Returns the address on match, or 0 when the name is not in the
@@ -475,6 +502,12 @@ _print_crash_locals(fi, text_base) {
 // the legacy "trace every function" mode - unchanged from before the
 // --break flag existed. Sub-step 4 teaches this routine to respect
 // the new arguments; today they are accepted but not acted on.
+// Global flag set from bug.bpp main(): when non-zero, every
+// breakpoint hit also prints the first ~32 bytes at [x0] and [x1]
+// as C-strings. Indispensable for tracing calls like buf_eq(src,
+// "break", 5) where the literal-address argument is the suspect.
+auto flag_dump_str;
+
 bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     auto ret, sig, pc, fi, i;
     auto slide, text_base, retries;
@@ -628,6 +661,17 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                     }
                 }
                 out_str(")");
+                if (flag_dump_str) {
+                    auto x0v, x1v, d2;
+                    out_nl();
+                    for (d2 = 0; d2 < call_depth + 1; d2 = d2 + 1) { out_str("  "); }
+                    out_str("   ");
+                    x0v = gdb_read_reg(0);
+                    x1v = gdb_read_reg(1);
+                    _dump_cstr_at("x0", x0v);
+                    out_str(" ");
+                    _dump_cstr_at("x1", x1v);
+                }
                 out_nl();
                 call_depth = call_depth + 1;
                 if (call_depth > 30) { call_depth = 30; }

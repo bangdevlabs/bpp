@@ -131,3 +131,45 @@ Codes reserved for planned features. Do NOT reuse these numbers for other diagno
 5. Update this document with the new code
 6. Add a test case to `tests/test_diagnostics.bpp`
 7. Run `tests/run_all.sh` to verify no regression
+
+## Backend / linker bugs (historical, non-diagnostic)
+
+Bugs that were NOT compiler diagnostics — they surfaced at runtime
+(dyld, the kernel loader, or miscompiled code) and were silent for
+long stretches before something tipped them over a threshold. They
+live here because the lesson — "what signal did we miss, what tool
+finally caught it" — belongs next to the diagnostics we do have.
+
+### `chained_fixups_page_count` — hardcoded page_count = 1 (2026-04-16, fixed)
+
+- **Where it lived.** `src/backend/target/aarch64_macos/a64_macho.bsm`
+  — `mo_write_chained_fixups_real`. Emitted the chained-fixups
+  header with a literal `mo_w8(1); mo_w8(0);` for `page_count`.
+- **Why it worked for months.** As long as `__DATA` fit in one
+  16 KB page, a single rebasable page was always the correct
+  count.
+- **What tipped it.** The 16th dispatch seed in `init_dispatch()`
+  (`sys_lseek`, four bytes of literal plus the 15 prior seed
+  names that each carried a four-byte-or-longer literal) pushed
+  `__DATA` past 16 KB. dyld rebased page 0 only; GOT pointers on
+  page 1 kept their on-disk values, and ASLR-relative string
+  literal reads returned garbage.
+- **Runtime error shape.** Compiler refused to self-compile with
+  `global 'break' not found in data section`. The 'break' string
+  literal the lexer was looking up had been silently corrupted
+  because its GOT pointer sat on page 1.
+- **Signal we had been ignoring.** `DYLD_PRINT_WARNINGS=1` had
+  been printing `dyld[...]: fixup chain entry off end of page` on
+  every build for weeks. Nobody read the warning.
+- **Tool that caught it.** `bug --break buf_eq --dump-str` showed
+  the literal argument's pointer contents as gibberish at call
+  time, which disproved every hypothesis about the *lookup* logic
+  and forced attention onto the *bytes themselves*. See
+  `docs/debug_with_bug.md` for the full case study.
+- **Fix.** Dynamic `page_count = ceil(mo_data_size / 16 KB)` +
+  per-page start offsets in the header; dynamic `imports_off`
+  that tracks the now-variable segment size.
+- **Lesson recorded.** When a runtime symbol lookup fails against
+  a literal the compiler definitely emitted, the first check is
+  always "do the runtime bytes match the file bytes." Everything
+  else is plumbing around that one question.

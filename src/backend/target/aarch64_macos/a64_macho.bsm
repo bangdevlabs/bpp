@@ -682,7 +682,16 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
     // starts_in_segment: 28 bytes (24 header + 2*1 page_start + 2 pad).
     starts_off = 32;
     starts_in_seg_off = starts_off + 4 + data_seg_idx * 4;
-    imports_off = starts_off + 4 + nseg * 4 + 24;
+    // chained_starts_in_segment size = 22 fixed header + 2 * page_count,
+    // padded to 4-byte alignment. mo_write_chained_fixups_real computes
+    // the exact same _pc below; keep the two in sync so imports_off
+    // lands where dyld expects.
+    auto _pc_imp, _seg_size;
+    _pc_imp = (mo_data_size + MO_PAGE_SIZE - 1) / MO_PAGE_SIZE;
+    if (_pc_imp < 1) { _pc_imp = 1; }
+    _seg_size = 22 + _pc_imp * 2;
+    if ((_seg_size & 3) != 0) { _seg_size = _seg_size + (4 - (_seg_size & 3)); }
+    imports_off = starts_off + 4 + nseg * 4 + _seg_size;
     symbols_off = imports_off + arr_len(mo_got_syms) * 4;
 
     // ── dyld_chained_fixups_header (28 bytes, padded to 32) ──
@@ -709,14 +718,42 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
     }
 
     // ── dyld_chained_starts_in_segment (for __DATA) ──
-    mo_w32(24);                         // size (22 fixed + 2*page_count)
-    mo_w8(0); mo_w8(0x40);             // page_size = 0x4000 (16384) as uint16
-    mo_w8(6); mo_w8(0);                // pointer_format = 6 (DYLD_CHAINED_PTR_64_OFFSET) as uint16
+    // page_count covers the entire __DATA segment. The hardcoded
+    // `page_count = 1` that lived here only worked while __DATA fit
+    // inside the 16 KB fixup page. Once the segment grew beyond
+    // 16 KB (triggered when init_dispatch crossed a specific size in
+    // the Level 4 roll-out), dyld walked only page 0 and left the
+    // GOT pointers on page 1+ un-rebased — the runtime symptom was
+    // "global 'break' not found in data section" because string
+    // literals referenced via the GOT read from random ASLR memory.
+    auto _pc, _hdr_size, _pg;
+    _pc = (mo_data_size + MO_PAGE_SIZE - 1) / MO_PAGE_SIZE;
+    if (_pc < 1) { _pc = 1; }
+    _hdr_size = 22 + _pc * 2;           // 22 fixed bytes + 2 per page_start
+    if ((_hdr_size & 3) != 0) { _hdr_size = _hdr_size + (4 - (_hdr_size & 3)); }
+    mo_w32(_hdr_size);                  // size (22 fixed + 2*page_count, padded)
+    mo_w8(0); mo_w8(0x40);              // page_size = 0x4000 (16384) as uint16
+    mo_w8(6); mo_w8(0);                 // pointer_format = 6 (DYLD_CHAINED_PTR_64_OFFSET) as uint16
     mo_w64(mo_text_vmsize, 0);          // segment_offset (VM offset of __DATA from image base)
     mo_w32(0);                          // max_valid_pointer
-    mo_w8(1); mo_w8(0);                // page_count = 1 as uint16
-    mo_w8(got_page_off & 0xFF);        // page_start[0] = byte offset within page
-    mo_w8((got_page_off >> 8) & 0xFF);
+    mo_w8(_pc & 0xFF); mo_w8((_pc >> 8) & 0xFF);   // page_count
+    // page_start[i] for each page: DYLD_CHAINED_PTR_START_NONE (0xFFFF)
+    // means the page has no fixups; the real chain is on the GOT page.
+    _pg = 0;
+    while (_pg < _pc) {
+        if (_pg == got_page) {
+            mo_w8(got_page_off & 0xFF);
+            mo_w8((got_page_off >> 8) & 0xFF);
+        } else {
+            mo_w8(0xFF); mo_w8(0xFF);
+        }
+        _pg = _pg + 1;
+    }
+    // Pad up to declared header size.
+    while (22 + _pc * 2 < _hdr_size) {
+        mo_w8(0);
+        _hdr_size = _hdr_size - 1;
+    }
 
     // ── Imports table (4 bytes each) ──
     // Each import: lib_ordinal(8) | weak_import(1) | name_offset(23).
