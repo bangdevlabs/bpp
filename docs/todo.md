@@ -49,6 +49,36 @@ about the language it was written in.
 
 ## Active — in commit order
 
+### 0. Type defense ladder — finish what's open
+
+In flight from the 2026-04-16 sprint (`docs/type_defense_plan.md`).
+Levels 1 and 2-partial are shipped; pieces below are tracked here.
+
+- **W025 — Rule 13 compiler nudge.** First-cut implementation caused a
+  bootstrap regression ("internal error: global 'break' not found in
+  data section") when `_val_w025_check` body grew to include
+  `_val_show_context_at` + `diag_help`. Bisect narrowed to that
+  specific combination but root cause not pinned. Defer until
+  Dev Loop 2 (`bug --break`) ships so we can single-step through the
+  gen2 codegen path and find the actual breakage. Plan stub already
+  written in `docs/type_defense_plan.md`.
+- **Sweep 2b — Rule 13 hints across stb (essentially empty).** Audit
+  on 2026-04-16 found the stb already follows Rule 13 by happenstance:
+  `_stb_gpu_clear` has `r: float, g: float, b: float, a: float`,
+  `phys_body` uses int milli-units, `rgba` packs bytes. The suite is
+  66/0/11 with E233 active, which proves no caller silently passes a
+  float to an int param anywhere. Reopen this item only if Level 4 or
+  W025 surface new Rule 13 violations during their sweeps.
+- **Level 4 — phase annotations expanded (`: realtime` / `: io` /
+  `: gpu`).** 3 sub-steps: (A) parser accepts new annotations,
+  zero-diff; (B) builtin effect table + propagation; (C) enforcement
+  at call sites. Killer demo is `stbaudio.audio_callback : realtime`
+  proving no malloc reaches the realtime thread. ~145 lines code +
+  100 test + 100 docs per the plan estimate.
+- **Sweep 2c — annotate `: realtime` / `: io` / `: gpu` across
+  src/ + stb/.** Lands with Level 4 sub-step C in the same commit
+  window. ~30-50 functions get an effect annotation.
+
 ### 1. Dev Loop 2: `bug` breakpoints
 
 `bug foo --break main:42 --break update_enemy`. Translate source:line
