@@ -178,15 +178,49 @@ gdb_recv_pkt() {
     return plen;
 }
 
-// Receive a packet, skipping 'O' (output) packets from the target's stdout.
-// Returns payload length of the first non-output packet.
+// Decode one hex digit (0-9, a-f, A-F) to its numeric value.
+// Returns 0 for invalid input — callers should only pass valid digits.
+static _hex_digit(c) {
+    if (c >= '0') { if (c <= '9') { return c - '0'; } }
+    if (c >= 'a') { if (c <= 'f') { return c - 'a' + 10; } }
+    if (c >= 'A') { if (c <= 'F') { return c - 'A' + 10; } }
+    return 0;
+}
+
+// Decode an 'O' (target stdout) packet and write its bytes to the
+// debugger's own fd 1 so the user sees the target's output. Packet
+// body (after the leading 'O') is pairs of hex digits; each pair
+// decodes to one output byte. sys_write goes directly to fd 1 —
+// bypassing any higher-level print wrapper so the target's output is
+// visually distinct from bug's own trace lines (which use out_str).
+static _emit_output_packet(len) {
+    auto i, hi, lo, ch, buf;
+    buf = malloc(1);
+    i = 1;
+    while (i + 1 < len) {
+        hi = _hex_digit(peek(_gdb_rbuf + i));
+        lo = _hex_digit(peek(_gdb_rbuf + i + 1));
+        ch = hi * 16 + lo;
+        poke(buf, ch);
+        sys_write(1, buf, 1);
+        i = i + 2;
+    }
+    free(buf);
+}
+
+// Receive a packet, decoding any 'O' (output) packets along the way
+// so the target's stdout reaches the user. Returns the payload length
+// of the first non-output packet.
 gdb_recv_stop() {
     auto nr;
     while (1) {
         nr = gdb_recv_pkt();
         if (nr < 0) { return nr; }
-        // 'O' packets contain hex-encoded target stdout. Skip them.
         if (peek(_gdb_rbuf) != 'O') { return nr; }
+        // 'O' packet — forward target's bytes to our own stdout.
+        // debugserver routes the target's fd 1 writes through here,
+        // so without this the debug run runs blind.
+        _emit_output_packet(nr);
     }
     return 0 - 1;
 }

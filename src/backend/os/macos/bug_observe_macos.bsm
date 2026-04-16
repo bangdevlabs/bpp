@@ -101,16 +101,32 @@ _spawn_debugserver(target_path, start_idx, argc) {
     while (str_peek(p, i) != 0) { poke(host_port + i, str_peek(p, i)); i = i + 1; }
     plen = _itoa(host_port + i, _ds_port);
 
-    // Build argv: [debugserver, host:port, target, args..., NULL]
-    cnt = argc - start_idx;
-    argv = malloc((cnt + 3 + 1) * 8);
+    // Build argv: [debugserver, host:port, target, --, args..., NULL].
+    // debugserver's argv[2] is the target and argv[3+] are the
+    // target's own argv[1+] (argv[0] gets set to target_path by
+    // execve). The caller's `start_idx` points at the target's
+    // argv slot, so the real args start at start_idx + 1 — NOT
+    // start_idx. The previous loop included argv_get(start_idx),
+    // which duplicated the target path and made the target see its
+    // own binary as "argv[1]" (first meaningful argument).
+    //
+    // The literal "--" between target and target-args stops
+    // debugserver's own flag parsing. Without it, a compiler arg like
+    // "-o" was interpreted by debugserver as one of its options and
+    // the target never received it. Every toolchain invocation that
+    // used short flags was unusable under bug until the separator
+    // landed.
+    cnt = argc - start_idx - 1;
+    if (cnt < 0) { cnt = 0; }
+    argv = malloc((cnt + 4 + 1) * 8);
     argv[0] = ds_path;
     argv[1] = host_port;
     argv[2] = target_path;
+    argv[3] = "--";
     for (i = 0; i < cnt; i = i + 1) {
-        argv[3 + i] = argv_get(start_idx + i);
+        argv[4 + i] = argv_get(start_idx + 1 + i);
     }
-    argv[3 + cnt] = 0;
+    argv[4 + cnt] = 0;
 
     pid = sys_fork();
     if (pid < 0) {
@@ -120,11 +136,14 @@ _spawn_debugserver(target_path, start_idx, argc) {
     }
 
     if (pid == 0) {
-        // Child: redirect stdout+stderr to /dev/null.
-        sys_close(1);
-        sys_close(2);
-        sys_open("/dev/null", 1);
-        sys_open("/dev/null", 1);
+        // Child runs debugserver. Previously fd 1 and 2 were redirected
+        // to /dev/null to silence debugserver's own chatter — but that
+        // silenced the TARGET too, because debugserver's execve makes
+        // the traced program inherit fd 1/2. Every error message from
+        // the debugged compiler landed in /dev/null, and observing
+        // real-world bugs was blind. Leave the fds connected to the
+        // parent's terminal so the target's stdout/stderr reach the
+        // user; debugserver's small startup banner is worth the trade.
         sys_execve(ds_path, argv, 0);
         sys_exit(127);
     }
