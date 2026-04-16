@@ -398,7 +398,7 @@ static parse_lit_int() {
 // Parse a packed integer literal (decimal or hex) into its numeric value.
 // String and float literals must be filtered out by the caller — this
 // helper assumes the input is already known to be an integer literal.
-static parse_int_lit_value(p) {
+parse_int_lit_value(p) {
     auto s, l, i, ch, val, is_hex;
     s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
     is_hex = 0;
@@ -428,7 +428,7 @@ static parse_int_lit_value(p) {
 // Check whether an AST node is a pure integer literal suitable for
 // compile-time folding. String literals (start with '"') and float
 // literals (contain '.') return 0 so the folder skips them.
-static is_int_lit_node(node_p) {
+is_int_lit_node(node_p) {
     auto n: Node, s, l, i, ch;
     n = node_p;
     if (n.ntype != T_LIT) { return 0; }
@@ -442,6 +442,26 @@ static is_int_lit_node(node_p) {
         i = i + 1;
     }
     return 1;
+}
+
+// True when the AST node is a float literal — a T_LIT whose value
+// string contains a decimal point. Used by diagnostics like E244 to
+// catch float literals in int-only contexts (array index, shift count)
+// at parse time, before the AST mutates the literal beyond recognition.
+is_float_lit_node(node_p) {
+    auto n: Node, s, l, i;
+    n = node_p;
+    if (n.ntype != T_LIT) { return 0; }
+    s = unpack_s(n.a);
+    l = unpack_l(n.a);
+    if (l == 0) { return 0; }
+    if (peek(vbuf + s) == '"') { return 0; }
+    i = 0;
+    while (i < l) {
+        if (peek(vbuf + s + i) == '.') { return 1; }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // Create a literal AST node holding an integer value.
@@ -2114,6 +2134,18 @@ static parse_primary() {
             consume();
             idx_node = parse_expr();
             consume();
+            // E244: array indices are integer offsets — a float literal here
+            // (e.g. arr[3.14]) almost always means the programmer typed `.`
+            // by accident or pasted a float-shaped literal where they meant
+            // an int. Catch it before the desugaring multiplies the literal
+            // into a binop where the type ambiguity disappears.
+            if (is_float_lit_node(idx_node)) {
+                diag_error(244);
+                diag_str("array index is a float literal — array indices must be integers");
+                diag_newline();
+                diag_help("drop the decimal point: write `arr[3]` instead of `arr[3.0]`");
+                diag_newline();
+            }
             // Create packed operator strings by writing to vbuf.
             poke(vbuf + vbuf_pos, 42); op_mul = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;
             poke(vbuf + vbuf_pos, 43); op_add = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;

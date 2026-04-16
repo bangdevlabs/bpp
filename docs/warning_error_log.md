@@ -37,12 +37,18 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | E221 | duplicate definition | bpp_parser.bsm | 1085 | ✅ | Same function in two modules |
 | E222 | circular dependency | bpp_import.bsm | 198 | ❌ | Module import cycle |
 | E230 | static const at file scope | bpp_parser.bsm | TBD | ✅ | `static const X = N;` silently produces 0 at runtime |
+| E232 | silent float→int at assignment | bpp_validate.bsm | 396 | ✅ | `auto x; x = 3.14;` drops IEEE 754 bits; annotate `: float` or write int literal |
+| E233 | silent float→int at call site | bpp_validate.bsm | 495 | ✅ | float arg passed to int param (promoted from W002) |
+| E240 | int passed to float param | bpp_validate.bsm | 519 | ✅ | callee expects float, caller passed int — annotate source `: float` or use float literal |
+| E242 | shift count out of range | bpp_validate.bsm | 558 | ✅ | shift count > 63 — hardware masks to 6 bits, value silently wrong |
+| E243 | pointer compared to non-zero literal | bpp_validate.bsm | 600 | ✅ | `if (ptr == 42)` is almost always a bug; only 0 is the canonical null check |
+| E244 | float literal in int context | bpp_parser.bsm + bpp_validate.bsm | 2122 + 583 | ✅ | array index or shift count cannot be a float literal |
 
 ## Warnings (compilation continues)
 
 | Code | Message | File | Line | Has loc? | Trigger |
 |------|---------|------|------|----------|---------|
-| W002 | implicit float-to-int | bpp_validate.bsm | 426 | ❌ | Float arg passed to int param |
+| W002 | implicit float-to-int | bpp_validate.bsm | n/a | n/a | RETIRED in 0.23.x — promoted to E233 (silent float→int at call site is now a fatal error, not a warning) |
 | W003 | wrong argument count | bpp_validate.bsm | 407 | ❌ | Call with mismatched arg count |
 | W005 | unreachable code | bpp_validate.bsm | 299 | ✅ | Code after return statement |
 | W010 | narrowing conversion | bpp_validate.bsm | 270 | ❌ | Float narrowed to half/quarter |

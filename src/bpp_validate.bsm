@@ -510,6 +510,30 @@ val_check_node(nd) {
                             diag_newline();
                         }
                     }
+                    // E240: callee expects float, caller passed something
+                    // explicitly int-typed. The codegen would either reinterpret
+                    // the integer's bits as a float (junk) or silently convert
+                    // (via SCVTF) — both are bug-shaped. Force the user to
+                    // either annotate the local `: float` or write the value
+                    // as a float literal.
+                    if (is_float_type(par_ty)) {
+                        if (is_float_type(arg_ty) == 0) {
+                            if (arg_ty != TY_UNK) {
+                                diag_error(240);
+                                diag_str("argument ");
+                                diag_int(ai + 1);
+                                diag_str(" of '");
+                                diag_packed(name_p);
+                                diag_str("' must be a float, but the value passed is an int");
+                                diag_newline();
+                                _val_show_context_at(n.src_tok);
+                                diag_help("if the source variable holds a float, declare it ': float' so its bits flow through unchanged");
+                                diag_newline();
+                                diag_help("if you meant to pass a literal, write it with a decimal point (e.g. 44100.0)");
+                                diag_newline();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -548,7 +572,87 @@ val_check_node(nd) {
         val_check_list(n.b, n.c);
         return 0;
     }
-    T_BINOP { val_check_node(n.b); val_check_node(n.c); return 0; }
+    T_BINOP {
+        // E242: shift count out of range. Bit shifts wider than 63 are
+        // architecturally undefined on x86_64 (the SHL/SHR instructions
+        // mask the count to 6 bits) and meaningless on a 64-bit word
+        // anywhere. Catch them at the AST level when the shift count is
+        // a literal — runtime values still reach codegen unchanged.
+        auto opp, op_s, op_l, op0, op1, rhs_n: Node, sc;
+        opp = n.a;
+        op_s = unpack_s(opp);
+        op_l = unpack_l(opp);
+        if (op_l == 2) {
+            op0 = peek(vbuf + op_s);
+            op1 = peek(vbuf + op_s + 1);
+            if ((op0 == '<' && op1 == '<') || (op0 == '>' && op1 == '>')) {
+                rhs_n = n.c;
+                if (is_int_lit_node(rhs_n)) {
+                    sc = parse_int_lit_value(rhs_n.a);
+                    if (sc > 63) {
+                        diag_error(242);
+                        diag_str("shift count ");
+                        diag_int(sc);
+                        diag_str(" is out of range — bit shifts on a 64-bit word must be 0..63");
+                        diag_newline();
+                        _val_show_context_at(n.src_tok);
+                        diag_help("on x86_64 the hardware masks the count to 6 bits, so `x << 64` actually emits `x << 0` — the value is silently wrong");
+                        diag_newline();
+                    }
+                }
+                // E244 (shift form): float literal as shift count is
+                // nonsense — shifts are bit positions, not fractional
+                // amounts. Caught here at the validator alongside the
+                // array-index case in the parser.
+                if (is_float_lit_node(rhs_n)) {
+                    diag_error(244);
+                    diag_str("shift count is a float literal — shifts take an integer bit count");
+                    diag_newline();
+                    _val_show_context_at(n.src_tok);
+                    diag_help("drop the decimal point on the shift count");
+                    diag_newline();
+                }
+            }
+            // E243: pointer compared to non-zero literal. Comparing a
+            // pointer to 0 is the canonical null check; comparing it to
+            // any other integer almost always means the programmer
+            // confused a value with an address. Caught here on `==` and
+            // `!=` when one side is pointer-typed and the other is a
+            // non-zero int literal.
+            if ((op0 == '=' && op1 == '=') || (op0 == '!' && op1 == '=')) {
+                auto lhs_n: Node, lit_n: Node, has_ptr, sv;
+                lhs_n = n.b;
+                rhs_n = n.c;
+                has_ptr = 0;
+                lit_n = 0;
+                if (ty_base(lhs_n.itype) == BASE_PTR) {
+                    has_ptr = 1;
+                    if (is_int_lit_node(rhs_n)) { lit_n = rhs_n; }
+                }
+                if (ty_base(rhs_n.itype) == BASE_PTR) {
+                    has_ptr = 1;
+                    if (is_int_lit_node(lhs_n)) { lit_n = lhs_n; }
+                }
+                if (has_ptr) {
+                    if (lit_n != 0) {
+                        sv = parse_int_lit_value(lit_n.a);
+                        if (sv != 0) {
+                            diag_error(243);
+                            diag_str("pointer compared to non-zero literal ");
+                            diag_int(sv);
+                            diag_str(" — this is almost always a bug");
+                            diag_newline();
+                            _val_show_context_at(n.src_tok);
+                            diag_help("`ptr == 0` and `ptr != 0` are the canonical null checks; any other integer rarely makes sense as an address");
+                            diag_newline();
+                        }
+                    }
+                }
+            }
+        }
+        val_check_node(n.b); val_check_node(n.c);
+        return 0;
+    }
     T_UNARY { val_check_node(n.b); return 0; }
     T_RET   { val_check_node(n.a); return 0; }
     T_IF {
