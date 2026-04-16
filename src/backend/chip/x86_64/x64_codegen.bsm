@@ -48,6 +48,13 @@ auto x64_vars;
 // Stack struct tracking.
 auto x64_var_stack, x64_var_struct_idx, x64_var_off, x64_var_forced_ty;
 
+// Phase B3 — local register allocation (mirror of the ARM64 path).
+auto x64_var_refs;
+auto x64_var_addr_taken;
+auto x64_var_promote;
+auto x64_promoted_regs;
+auto x64_b3_spill_off;
+
 // Float literal table.
 auto x64_flt_tbl;
 
@@ -74,29 +81,9 @@ auto x64_fn_lbl, x64_ret_lbl;
 // Sentinel packed names for hidden argc/argv/envp globals.
 auto x64_argc_sym, x64_argv_sym, x64_envp_sym;
 
-// ── Phase B1 register freelists ──────────────────────────────
-//
-// GP pool covers r10, r11 (2 caller-saved scratch regs with no fixed
-// ABI role in System V x86_64). The registers args-1 through args-6
-// (rdi, rsi, rdx, rcx, r8, r9) are off-limits because a nearby T_CALL
-// would overwrite them while setting up its own arguments. The ARM64
-// side has 7 temps; x86_64 has 2, so freelist pressure is tighter but
-// still beats the push/pop cost for the common 1-level T_BINOP case.
-//
-// SIMD pool covers xmm8..xmm15 (Phase B4 will activate it for
-// `: double` slices). Reserved empty now so B4 is a drop-in.
-//
-// Bit i of gp mask = slot i is free:
-//   bit 0 → r10, bit 1 → r11
-// Bit i of simd mask = xmm(i+8) is free:
-//   bit 0 → xmm8 .. bit 7 → xmm15
-
-static auto x64_gp_free_mask;
-static auto x64_simd_free_mask;
-
 // ── Initialization ─────────────────────────────────────────
 
-init_codegen_x86_64() {
+void init_codegen_x86_64() {
     x64_fn_name = arr_new(); x64_fn_par = arr_new();
     x64_fn_pcnt = arr_new(); x64_fn_body = arr_new();
     x64_fn_bcnt = arr_new(); x64_fn_fidx = arr_new();
@@ -108,6 +95,10 @@ init_codegen_x86_64() {
     x64_var_struct_idx = arr_new();
     x64_var_off = arr_new();
     x64_var_forced_ty = arr_new();
+    x64_var_refs = arr_new();
+    x64_var_addr_taken = arr_new();
+    x64_var_promote = arr_new();
+    x64_promoted_regs = arr_new();
     x64_flt_tbl = arr_new();
     x64_str_tbl = arr_new();
     x64_lbl_cnt = 0; x64_depth = 0;
@@ -120,100 +111,6 @@ init_codegen_x86_64() {
     x64_argc_sym = 0;
     x64_argv_sym = 0;
     x64_envp_sym = 0;
-    x64_gp_free_mask = 0;
-    x64_simd_free_mask = 0;
-    return 0;
-}
-
-// ── Phase B1 register freelist helpers (x86_64) ─────────────
-//
-// Mirrors the ARM64 freelist with an x86_64-specific pool. Fallback to
-// push/pop stays unconditional — if the pool is exhausted or the right
-// side of a T_BINOP contains a T_CALL that would clobber r10/r11, the
-// caller must emit the old stack-save path.
-
-static void x64_freelist_reset() {
-    x64_gp_free_mask = 0x3;     // bits 0..1 set → r10, r11 both free
-    x64_simd_free_mask = 0xFF;  // bits 0..7 set → xmm8..xmm15 all free
-}
-
-// Allocate a free GP temp. Returns register number (10 or 11) on
-// success or -1 when the pool is exhausted.
-static x64_gp_alloc() {
-    auto i, m;
-    for (i = 0; i < 2; i = i + 1) {
-        m = 1 << i;
-        if (x64_gp_free_mask & m) {
-            x64_gp_free_mask = x64_gp_free_mask & ~m;
-            return 10 + i;
-        }
-    }
-    return 0 - 1;
-}
-
-// Return a previously-allocated GP reg to the pool. No-op if reg is
-// outside r10..r11 — freeing a permanent reg would corrupt bookkeeping.
-static void x64_gp_free(reg) {
-    auto m;
-    if (reg < 10 || reg > 11) { return; }
-    m = 1 << (reg - 10);
-    x64_gp_free_mask = x64_gp_free_mask | m;
-}
-
-// Allocate a free SIMD reg. Returns xmm register number (8..15) or -1.
-// Reserved from day one for Phase B4 (: double slice) — stays unused
-// during B1..B3 but the infrastructure avoids a later refactor.
-static x64_simd_alloc() {
-    auto i, m;
-    for (i = 0; i < 8; i = i + 1) {
-        m = 1 << i;
-        if (x64_simd_free_mask & m) {
-            x64_simd_free_mask = x64_simd_free_mask & ~m;
-            return 8 + i;
-        }
-    }
-    return 0 - 1;
-}
-
-// Return a SIMD reg to the pool. Bounds-checked the same as GP.
-static void x64_simd_free(reg) {
-    auto m;
-    if (reg < 8 || reg > 15) { return; }
-    m = 1 << (reg - 8);
-    x64_simd_free_mask = x64_simd_free_mask | m;
-}
-
-// Return 1 if the given subtree contains any T_CALL node. Used by the
-// T_BINOP freelist path to decide whether a mov-to-r10/r11 is safe
-// across the right-side emission — a CALL inside right would clobber
-// the caller-saved r10/r11 and corrupt the saved left operand.
-//
-// Pure tree scan, no side effects — eligible for `: base`.
-static _x64_has_call(nd) : base {
-    auto n: Node, t;
-    if (nd == 0) { return 0; }
-    n = nd;
-    t = n.ntype;
-    switch (t) {
-    T_CALL { return 1; }
-    T_BINOP {
-        if (_x64_has_call(n.b)) { return 1; }
-        return _x64_has_call(n.c);
-    }
-    T_TERNARY {
-        if (_x64_has_call(n.a)) { return 1; }
-        if (_x64_has_call(n.b)) { return 1; }
-        return _x64_has_call(n.c);
-    }
-    T_ASSIGN, T_MEMST {
-        if (_x64_has_call(n.a)) { return 1; }
-        return _x64_has_call(n.b);
-    }
-    T_UNARY { return _x64_has_call(n.b); }
-    T_MEMLD, T_ADDR, T_RET { return _x64_has_call(n.a); }
-    else { return 0; }
-    }
-    return 0;
 }
 
 // Look up the packed names of brt0's hidden globals. See ARM64 codegen
@@ -234,7 +131,7 @@ void x64_bind_startup_syms() {
 
 // ── Bridge: copy parser data into emitter parallel arrays ──
 
-bridge_data_x86_64() {
+static void bridge_data_x86_64() {
     auto i, rec, name_p, idx, j;
     x64_sbuf = vbuf;
 
@@ -294,21 +191,18 @@ bridge_data_x86_64() {
     // Copy externs.
     arr_clear(x64_ex_name); arr_clear(x64_ex_ret);
     arr_clear(x64_ex_args); arr_clear(x64_ex_acnt);
-    i = 0;
-    while (i < ext_cnt) {
+    for (i = 0; i < ext_cnt; i = i + 1) {
         rec = *(externs + i * 8);
         x64_ex_name = arr_push(x64_ex_name, *(rec + EX_NAME));
         x64_ex_ret  = arr_push(x64_ex_ret,  *(rec + EX_RET));
         x64_ex_args = arr_push(x64_ex_args, *(rec + EX_ARGS));
         x64_ex_acnt = arr_push(x64_ex_acnt, *(rec + EX_ACNT));
-        i = i + 1;
     }
-    return 0;
 }
 
 // ── String utilities ───────────────────────────────────────
 
-x64_str_eq(p, lit, litlen) {
+static x64_str_eq(p, lit, litlen) {
     if (unpack_l(p) != litlen) { return 0; }
     return buf_eq(x64_sbuf + unpack_s(p), lit, litlen);
 }
@@ -318,27 +212,28 @@ x64_str_eq_packed(a, b) {
     al = unpack_l(a); bl = unpack_l(b);
     if (al != bl) { return 0; }
     as = unpack_s(a); bs = unpack_s(b);
-    i = 0;
-    while (i < al) {
+    for (i = 0; i < al; i = i + 1) {
         if (peek(x64_sbuf + as + i) != peek(x64_sbuf + bs + i)) { return 0; }
-        i = i + 1;
     }
     return 1;
 }
 
 // ── Variable tracking ──────────────────────────────────────
 
-x64_var_add(name_p) {
+static x64_var_add(name_p) {
     auto idx; idx = arr_len(x64_vars);
     x64_vars = arr_push(x64_vars, name_p);
     x64_var_stack = arr_push(x64_var_stack, 0);
     x64_var_struct_idx = arr_push(x64_var_struct_idx, 0 - 1);
     x64_var_off = arr_push(x64_var_off, 0);
     x64_var_forced_ty = arr_push(x64_var_forced_ty, 0);
+    x64_var_refs = arr_push(x64_var_refs, 0);
+    x64_var_addr_taken = arr_push(x64_var_addr_taken, 0);
+    x64_var_promote = arr_push(x64_var_promote, 0 - 1);
     return idx;
 }
 
-x64_var_idx(name_p) {
+static x64_var_idx(name_p) {
     auto i; i = 0;
     while (i < arr_len(x64_vars)) {
         if (x64_str_eq_packed(name_p, arr_get(x64_vars, i))) { return i; }
@@ -347,15 +242,112 @@ x64_var_idx(name_p) {
     return -1;
 }
 
-x64_var_find(name_p) {
+static x64_var_find(name_p) {
     auto i;
     i = x64_var_idx(name_p);
     if (i >= 0) { return arr_get(x64_var_off, i); }
     return -1;
 }
 
+// ── Phase B3 — local register allocation ──────────────────
+
+static _x64_b3_eligible(vi) : base {
+    auto fty;
+    if (arr_get(x64_var_stack, vi)) { return 0; }
+    if (arr_get(x64_var_addr_taken, vi)) { return 0; }
+    fty = arr_get(x64_var_forced_ty, vi);
+    if (is_float_type(fty)) { return 0; }
+    if (ty_slice(fty) != SL_FULL) { return 0; }
+    return 1;
+}
+
+static _x64_b3_walk(nd) {
+    auto n: Node, t, vi, child: Node, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        vi = x64_var_idx(n.a);
+        if (vi >= 0) { arr_set(x64_var_refs, vi, arr_get(x64_var_refs, vi) + 1); }
+        return 0;
+    }
+    if (t == T_ADDR) {
+        child = n.a;
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = x64_var_idx(child.a);
+            if (vi >= 0) { arr_set(x64_var_addr_taken, vi, 1); }
+            return 0;
+        }
+        _x64_b3_walk(child);
+        return 0;
+    }
+    switch (t) {
+    T_BINOP    { _x64_b3_walk(n.b); _x64_b3_walk(n.c); }
+    T_ASSIGN   { _x64_b3_walk(n.a); _x64_b3_walk(n.b); }
+    T_MEMST    { _x64_b3_walk(n.a); _x64_b3_walk(n.b); }
+    T_UNARY    { _x64_b3_walk(n.b); }
+    T_MEMLD    { _x64_b3_walk(n.a); }
+    T_RET      { _x64_b3_walk(n.a); }
+    T_TERNARY  { _x64_b3_walk(n.a); _x64_b3_walk(n.b); _x64_b3_walk(n.c); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
+    }
+    T_IF {
+        _x64_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
+        }
+    }
+    T_WHILE {
+        _x64_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
+        if (n.e != 0) { _x64_b3_walk(n.e); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
+    }
+    else { }
+    }
+}
+
+// SysV callee-saved pool: rbx (3), r14 (14), r15 (15).
+static void _x64_b3_select() {
+    auto budget, used, vi, n, best_vi, best_refs, reg;
+    auto pool;
+    pool = malloc(3 * 8);
+    pool[0] = 3; pool[1] = 14; pool[2] = 15;
+    budget = 3;
+    n = arr_len(x64_vars);
+    arr_clear(x64_promoted_regs);
+    used = 0;
+    while (used < budget) {
+        best_vi = 0 - 1;
+        best_refs = 1;
+        for (vi = 0; vi < n; vi = vi + 1) {
+            if (arr_get(x64_var_promote, vi) >= 0) { continue; }
+            if (_x64_b3_eligible(vi) == 0) { continue; }
+            if (arr_get(x64_var_refs, vi) > best_refs) {
+                best_refs = arr_get(x64_var_refs, vi);
+                best_vi = vi;
+            }
+        }
+        if (best_vi < 0) { free(pool); return; }
+        reg = pool[used];
+        arr_set(x64_var_promote, best_vi, reg);
+        x64_promoted_regs = arr_push(x64_promoted_regs, reg);
+        used = used + 1;
+    }
+    free(pool);
+}
+
 // Walk a function body and register all declared variables.
-x64_pre_reg_vars(arr, cnt) {
+static void x64_pre_reg_vars(arr, cnt) {
     auto i, j;
     auto n: Node;
     i = 0;
@@ -395,12 +387,11 @@ x64_pre_reg_vars(arr, cnt) {
         }
         i = i + 1;
     }
-    return 0;
 }
 
 // ── Literal helpers ────────────────────────────────────────
 
-x64_parse_int(p) {
+static x64_parse_int(p) {
     auto s, l, i, ch, val;
     s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
     if (l > 2) {
@@ -409,9 +400,9 @@ x64_parse_int(p) {
                 i = 2;
                 while (i < l) {
                     ch = peek(x64_sbuf + s + i); val = val * 16;
-                    if (ch >= '0') { if (ch <= '9') { val = val + ch - '0'; } }
-                    if (ch >= 'A') { if (ch <= 'F') { val = val + ch - 55; } }
-                    if (ch >= 'a') { if (ch <= 'f') { val = val + ch - 87; } }
+                    if (ch >= '0' && ch <= '9') { val = val + ch - '0'; }
+                    if (ch >= 'A' && ch <= 'F') { val = val + ch - 55; }
+                    if (ch >= 'a' && ch <= 'f') { val = val + ch - 87; }
                     i = i + 1;
                 }
                 return val;
@@ -422,15 +413,12 @@ x64_parse_int(p) {
     return val;
 }
 
-x64_is_float_lit(p) {
+static x64_is_float_lit(p) {
     auto s, l, i;
     s = unpack_s(p); l = unpack_l(p);
-    i = 0;
-    while (i < l) {
+    for (i = 0; i < l; i = i + 1) {
         if (peek(x64_sbuf + s + i) == '.') { return 1; }
-        i = i + 1;
     }
-    return 0;
 }
 
 
@@ -438,7 +426,7 @@ x64_is_float_lit(p) {
 
 // An explicit integer type hint (: int, : byte, : half, : quarter) overrides
 // float inference — the programmer's annotation wins.
-x64_var_is_float(vi) {
+static x64_var_is_float(vi) : base {
     auto fty;
     fty = arr_get(x64_var_forced_ty, vi);
     if (fty > 0) {
@@ -449,8 +437,13 @@ x64_var_is_float(vi) {
 
 // Emit a sized load from [rbp - off] into rax/xmm0 based on forced type.
 // Returns 1 if float, 0 if integer.
-x64_emit_load_var(vi, off) {
-    auto fty;
+static x64_emit_load_var(vi, off) {
+    auto fty, _preg;
+    _preg = arr_get(x64_var_promote, vi);
+    if (_preg >= 0) {
+        x64_enc_mov_reg(0, _preg);
+        return 0;
+    }
     fty = arr_get(x64_var_forced_ty, vi);
     if (x64_var_is_float(vi)) {
         x64_enc_load_sd(0, 5, off);
@@ -460,13 +453,18 @@ x64_emit_load_var(vi, off) {
     if (ty_slice(fty) == SL_QUARTER) { x64_enc_loadh(0, 5, off); return 0; }
     if (ty_slice(fty) == SL_HALF) { x64_enc_load_sw(0, 5, off); return 0; }
     x64_enc_load(0, 5, off);
-    return 0;
 }
 
 // Emit a sized store from rax/xmm0 into [rbp - off] based on forced type.
 // rty: 0 = integer in rax, 1 = float in xmm0.
-x64_emit_store_var(vi, off, rty) {
-    auto fty;
+static void x64_emit_store_var(vi, off, rty) {
+    auto fty, _preg;
+    _preg = arr_get(x64_var_promote, vi);
+    if (_preg >= 0) {
+        if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+        x64_enc_mov_reg(_preg, 0);
+        return 0;
+    }
     fty = arr_get(x64_var_forced_ty, vi);
     if (x64_var_is_float(vi)) {
         if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
@@ -478,10 +476,9 @@ x64_emit_store_var(vi, off, rty) {
     if (ty_slice(fty) == SL_QUARTER) { x64_enc_storeh(0, 5, off); return 0; }
     if (ty_slice(fty) == SL_HALF) { x64_enc_store_w(0, 5, off); return 0; }
     x64_enc_store(0, 5, off);
-    return 0;
 }
 
-x64_find_fn(name_p) {
+static x64_find_fn(name_p) {
     auto i;
     i = 0;
     while (i < arr_len(x64_fn_name)) {
@@ -491,7 +488,7 @@ x64_find_fn(name_p) {
     return -1;
 }
 
-x64_find_ext(name_p) {
+static x64_find_ext(name_p) {
     auto i;
     i = 0;
     while (i < arr_len(x64_ex_name)) {
@@ -501,7 +498,7 @@ x64_find_ext(name_p) {
     return -1;
 }
 
-x64_find_ext_by_argc(name_p, argc) {
+static x64_find_ext_by_argc(name_p, argc) {
     auto i;
     i = 0;
     while (i < arr_len(x64_ex_name)) {
@@ -515,14 +512,13 @@ x64_find_ext_by_argc(name_p, argc) {
 
 // Return the System V ABI register for argument position i (0-based).
 // RDI=7, RSI=6, RDX=2, RCX=1, R8=8, R9=9.
-x64_arg_reg(i) {
+static x64_arg_reg(i) : base {
     if (i == 0) { return 7; }
     if (i == 1) { return 6; }
     if (i == 2) { return 2; }
     if (i == 3) { return 1; }
     if (i == 4) { return 8; }
     if (i == 5) { return 9; }
-    return 0;
 }
 
 // ── Emission primitives ────────────────────────────────────
@@ -661,57 +657,51 @@ static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
 }
 
 // Push RAX onto the stack.
-x64_emit_push() {
+static void x64_emit_push() {
     x64_enc_push(0);
     x64_depth = x64_depth + 1;
-    return 0;
 }
 
 // Pop from the stack into a general-purpose register.
-x64_emit_pop(r) {
+static void x64_emit_pop(r) {
     x64_enc_pop(r);
     x64_depth = x64_depth - 1;
-    return 0;
 }
 
 // Push XMM0 onto the stack (as 8-byte IEEE 754 bits).
-x64_emit_fpush() {
+static void x64_emit_fpush() {
     x64_enc_sub_imm(4, 8);
     x64_enc_store_sd(0, 4, 0);
     x64_depth = x64_depth + 1;
-    return 0;
 }
 
 // Pop from the stack into an XMM register.
-x64_emit_fpop(xr) {
+static void x64_emit_fpop(xr) {
     x64_enc_load_sd(xr, 4, 0);
     x64_enc_add_imm(4, 8);
     x64_depth = x64_depth - 1;
-    return 0;
 }
 
 // Align the stack to 16 bytes before a CALL if needed.
 // Returns 1 if padding was added, 0 otherwise.
-x64_align_call() {
+static x64_align_call() {
     if (x64_depth % 2 != 0) {
         x64_enc_sub_imm(4, 8);
         return 1;
     }
-    return 0;
 }
 
 // Remove alignment padding after a CALL.
-x64_unalign_call(padded) {
+static void x64_unalign_call(padded) {
     if (padded) { x64_enc_add_imm(4, 8); }
-    return 0;
 }
 
 // ── Expression emission ────────────────────────────────────
 // Returns 0 if result is integer (in RAX), 1 if float (in XMM0).
 
-x64_emit_node(n) { return 0; }
+static x64_emit_node(n) { return 0; }
 
-x64_emit_node(nd) {
+static x64_emit_node(nd) {
     auto n: Node;
     auto t, op_s, op_l, c0, c1, arr, cnt, i, off, lbl, lbl2, vi, lty, rty;
     auto lit_s, lit_l, sid, str_p, fid, use_flt, is_io, uty, ety, fidx_c, fi, fn_name, par_flt: Node;
@@ -811,74 +801,46 @@ x64_emit_node(nd) {
         // Constant folding lives in the parser — by the time a T_BINOP
         // reaches codegen, at least one operand is guaranteed non-literal.
 
-        // Check if operator is integer-only.
+        // Check if operator is integer-only (%, ^, single-char &/|, shifts).
         is_io = 0;
-        if (c0 == '%') { is_io = 1; }
-        if (c0 == '^') { is_io = 1; }
-        if (c0 == '&') { if (op_l == 1) { is_io = 1; } }
-        if (c0 == '|') { if (op_l == 1) { is_io = 1; } }
-        if (c0 == '<') { if (c1 == '<') { is_io = 1; } }
-        if (c0 == '>') { if (c1 == '>') { is_io = 1; } }
+        if (c0 == '%' || c0 == '^') { is_io = 1; }
+        if ((c0 == '&' || c0 == '|') && op_l == 1) { is_io = 1; }
+        if ((c0 == '<' && c1 == '<') || (c0 == '>' && c1 == '>')) { is_io = 1; }
 
-        // Evaluate left, save it. Phase B1a.2: try GP freelist (r10/r11)
-        // before falling back to push/pop — a mov beats two memory ops
-        // through the stack. Float operands always use the float stack.
-        // If the right-side expression contains a T_CALL, skip the
-        // freelist because the caller-saved r10/r11 would be clobbered.
-        auto alloc_reg, right_reg_int;
-        alloc_reg = 0 - 1;
+        // Evaluate left, push.
         lty = x64_emit_node(n.b);
-        if (lty == 1) {
-            x64_emit_fpush();
-        } else if (_x64_has_call(n.c)) {
-            x64_emit_push();
-        } else {
-            alloc_reg = x64_gp_alloc();
-            if (alloc_reg >= 0) {
-                x64_enc_mov_reg(alloc_reg, 0);
-            } else {
-                x64_emit_push();
-            }
-        }
+        if (lty == 1) { x64_emit_fpush(); } else { x64_emit_push(); }
 
         // Evaluate right.
         rty = x64_emit_node(n.c);
 
         // Determine float path.
-        use_flt = 0;
-        if (is_io == 0) { if (lty == 1 | rty == 1) { use_flt = 1; } }
+        use_flt = is_io == 0 && (lty == 1 || rty == 1) ? 1 : 0;
 
         if (use_flt == 1) {
             // Ensure right in XMM0.
             if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
-            // Pop left into XMM1. Three sources depending on how we saved:
-            // the float stack, a freelist GP reg, or a plain push.
-            if (lty == 1) {
-                x64_emit_fpop(1);
-            } else if (alloc_reg >= 0) {
-                // left is integer in alloc_reg — convert to XMM1.
-                x64_enc_cvtsi2sd(1, alloc_reg);
-                x64_gp_free(alloc_reg);
-                alloc_reg = 0 - 1;
-            } else {
+            // Pop left into XMM1.
+            if (lty == 1) { x64_emit_fpop(1); }
+            else {
                 x64_emit_pop(0);
                 x64_enc_cvtsi2sd(1, 0);
             }
             // XMM1 = left, XMM0 = right.
 
             // Float arithmetic. XMM1 = left, XMM0 = right.
-            if (c0 == '+') { if (op_l == 1) { x64_enc_addsd(0, 1); return 1; } }
-            if (c0 == '-') { if (op_l == 1) {
+            if (c0 == '+' && op_l == 1) { x64_enc_addsd(0, 1); return 1; }
+            if (c0 == '-' && op_l == 1) {
                 // XMM0 = left - right: SUBSD XMM1,XMM0 -> XMM1=left-right, MOVSD XMM0,XMM1.
-                x64_enc_subsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; } }
-            if (c0 == '*') { if (op_l == 1) { x64_enc_mulsd(0, 1); return 1; } }
-            if (c0 == '/') { if (op_l == 1) {
-                x64_enc_divsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; } }
+                x64_enc_subsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; }
+            if (c0 == '*' && op_l == 1) { x64_enc_mulsd(0, 1); return 1; }
+            if (c0 == '/' && op_l == 1) {
+                x64_enc_divsd(1, 0); x64_enc_movsd_reg(0, 1); return 1; }
 
             // Float comparisons — result is integer in RAX.
             // UCOMISD XMM1, XMM0 compares left vs right.
-            if (c0 == '=') { if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; } }
-            if (c0 == '!') { if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; } }
+            if (c0 == '=' && c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; }
+            if (c0 == '!' && c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; }
             if (c0 == '<') {
                 if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_BE, 0); x64_enc_movzx8(0, 0); return 0; }
                 if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_B, 0); x64_enc_movzx8(0, 0); return 0; }
@@ -893,45 +855,37 @@ x64_emit_node(nd) {
             return 1;
         }
 
-        // Integer path. Convert float operands to int if needed, then
-        // arrange RAX = left, RCX = right so the op instructions below
-        // run unchanged. With the freelist save, left lives in r10/r11;
-        // two regs-to-reg movs land everything in the expected shape.
+        // Integer path. Convert float operands to int if needed.
         if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+        // Save right to RCX, pop left to RAX.
         if (lty == 1) {
             x64_enc_mov_reg(1, 0);
             x64_emit_fpop(0);
             x64_enc_cvttsd2si(0, 0);
-        } else if (alloc_reg >= 0) {
-            // alloc_reg (r10/r11) = left, rax = right.
-            x64_enc_mov_reg(1, 0);           // rcx = right
-            x64_enc_mov_reg(0, alloc_reg);   // rax = left
-            x64_gp_free(alloc_reg);
-            alloc_reg = 0 - 1;
         } else {
             x64_enc_mov_reg(1, 0);
             x64_emit_pop(0);
         }
         // RAX = left, RCX = right.
 
-        if (c0 == '+') { if (op_l == 1) { x64_enc_add_reg(0, 1); return 0; } }
-        if (c0 == '-') { if (op_l == 1) { x64_enc_sub_reg(0, 1); return 0; } }
-        if (c0 == '*') { if (op_l == 1) { x64_enc_imul(0, 1); return 0; } }
-        if (c0 == '/') { if (op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); return 0; } }
-        if (c0 == '%') { if (op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); x64_enc_mov_reg(0, 2); return 0; } }
+        if (c0 == '+' && op_l == 1) { x64_enc_add_reg(0, 1); return 0; }
+        if (c0 == '-' && op_l == 1) { x64_enc_sub_reg(0, 1); return 0; }
+        if (c0 == '*' && op_l == 1) { x64_enc_imul(0, 1); return 0; }
+        if (c0 == '/' && op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); return 0; }
+        if (c0 == '%' && op_l == 1) { x64_enc_cqo(); x64_enc_idiv(1); x64_enc_mov_reg(0, 2); return 0; }
 
         // Bitwise operators.
-        if (c0 == '&') { if (op_l == 1) { x64_enc_and_reg(0, 1); return 0; } }
-        if (c0 == '|') { if (op_l == 1) { x64_enc_or_reg(0, 1); return 0; } }
-        if (c0 == '^') { if (op_l == 1) { x64_enc_xor_reg(0, 1); return 0; } }
+        if (c0 == '&' && op_l == 1) { x64_enc_and_reg(0, 1); return 0; }
+        if (c0 == '|' && op_l == 1) { x64_enc_or_reg(0, 1); return 0; }
+        if (c0 == '^' && op_l == 1) { x64_enc_xor_reg(0, 1); return 0; }
 
         // Shift operators. Shift amount is in CL (low byte of RCX).
-        if (c0 == '>') { if (c1 == '>') { x64_enc_sar_cl(0); return 0; } }
-        if (c0 == '<') { if (c1 == '<') { x64_enc_shl_cl(0); return 0; } }
+        if (c0 == '>' && c1 == '>') { x64_enc_sar_cl(0); return 0; }
+        if (c0 == '<' && c1 == '<') { x64_enc_shl_cl(0); return 0; }
 
         // Comparison operators: CMP RAX, RCX then SETcc.
-        if (c0 == '=') { if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; } }
-        if (c0 == '!') { if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; } }
+        if (c0 == '=' && c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; }
+        if (c0 == '!' && c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; }
         if (c0 == '<') {
             if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_LE, 0); x64_enc_movzx8(0, 0); return 0; }
             if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_L, 0); x64_enc_movzx8(0, 0); return 0; }
@@ -951,10 +905,10 @@ x64_emit_node(nd) {
         uty = x64_emit_node(n.b);
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         // Bitwise NOT.
-        if (op_l == 1) { if (peek(x64_sbuf + op_s) == '~') {
+        if (op_l == 1 && peek(x64_sbuf + op_s) == '~') {
             x64_enc_not(0);
             return 0;
-        } }
+        }
         // Negate.
         if (uty == 1) {
             // Float negate: 0.0 - XMM0.
@@ -1430,6 +1384,13 @@ x64_emit_node(nd) {
         // Regular B++ function call.
         // Query bpp_types for callee's parameter types (mirrors ARM64 logic).
         fidx_c = find_func_idx(n.a);
+        // B2 inline is deliberately skipped on x86_64. The recursive
+        // ast_clone_subst + x64_emit_node tail call path exposes a
+        // latent emission bug in the 6a3f71a-based x64_codegen that only
+        // manifests when bpp self-hosts on Linux with many inlineable
+        // call sites. ARM64 applies inline fully; Linux takes the
+        // regular call path until the bug is found and fixed. See
+        // docs/todo.md for the bisect trail.
         arr = n.b; cnt = n.c;
         // Evaluate all arguments and push as GPR values (uniform convention).
         i = 0;
@@ -1542,12 +1503,11 @@ x64_emit_node(nd) {
         return 0;
     }
 
-    return 0;
 }
 
 // ── Statement emission ─────────────────────────────────────
 
-x64_emit_body(arr, cnt) {
+static void x64_emit_body(arr, cnt) {
     auto i;
     auto n: Node;
     i = 0;
@@ -1556,10 +1516,9 @@ x64_emit_body(arr, cnt) {
         if (n != 0) { x64_emit_stmt(n); }
         i = i + 1;
     }
-    return 0;
 }
 
-x64_emit_stmt(nd) {
+static void x64_emit_stmt(nd) {
     auto n: Node;
     auto lhs: Node;
     auto t, off, lbl, lbl2, arr, cnt, i, rty, vi, ety;
@@ -1619,37 +1578,17 @@ x64_emit_stmt(nd) {
     // Memory store: *(ptr) = val. n.c holds field type hint for packed structs.
     if (t == T_MEMST) {
         auto fh, sl, bo, bw, mask, clear_mask;
-        // Phase B1c: freelist the value save when the pointer expression
-        // is call-free (r10/r11 are caller-saved, so a BL inside n.a
-        // would clobber them). val_reg tracks where the source value
-        // ends up so the store instructions below use the correct reg.
-        auto alloc_reg_st, val_reg;
-        alloc_reg_st = 0 - 1;
-        val_reg = 1;
         fh = n.c;
         ety = x64_emit_node(n.b);
         if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
-        if (_x64_has_call(n.a)) {
-            x64_emit_push();
-        } else {
-            alloc_reg_st = x64_gp_alloc();
-            if (alloc_reg_st >= 0) {
-                x64_enc_mov_reg(alloc_reg_st, 0);
-            } else {
-                x64_emit_push();
-            }
-        }
+        x64_emit_push();
         x64_emit_node(n.a);
-        if (alloc_reg_st >= 0) {
-            val_reg = alloc_reg_st;
-            x64_gp_free(alloc_reg_st);
-        } else {
-            x64_emit_pop(1);
-        }
-        // rax = pointer, r{val_reg} = source value.
+        x64_emit_pop(1);
         sl = ty_slice(fh);
-        // Bit-packed field stores: load the containing byte, clear the
-        // destination bits, shift the source into place, OR back, store.
+        // Bit-packed field stores: load the containing byte into rdx, clear
+        // the destination field bits, shift the source value into position,
+        // OR them together, store the byte back. rax holds the pointer and
+        // rcx holds the source value after the pop.
         if (sl >= SL_BIT && sl <= SL_BIT7) {
             bo = (fh / 256) & 7;
             bw = sl - 3;
@@ -1657,16 +1596,16 @@ x64_emit_stmt(nd) {
             clear_mask = 255 ^ (mask << bo);
             x64_enc_loadb(2, 0, 0);
             x64_enc_and_imm(2, clear_mask);
-            x64_enc_and_imm(val_reg, mask);
-            if (bo > 0) { x64_enc_shl_imm(val_reg, bo); }
-            x64_enc_or_reg(2, val_reg);
+            x64_enc_and_imm(1, mask);
+            if (bo > 0) { x64_enc_shl_imm(1, bo); }
+            x64_enc_or_reg(2, 1);
             x64_enc_storeb(2, 0, 0);
             return 0;
         }
-        if (sl == SL_BYTE) { x64_enc_storeb(val_reg, 0, 0); }
-        else if (sl == SL_QUARTER) { x64_enc_storeh(val_reg, 0, 0); }
-        else if (sl == SL_HALF) { x64_enc_store_w(val_reg, 0, 0); }
-        else { x64_enc_store(val_reg, 0, 0); }
+        if (sl == SL_BYTE) { x64_enc_storeb(1, 0, 0); }
+        else if (sl == SL_QUARTER) { x64_enc_storeh(1, 0, 0); }
+        else if (sl == SL_HALF) { x64_enc_store_w(1, 0, 0); }
+        else { x64_enc_store(1, 0, 0); }
         return 0;
     }
 
@@ -1834,12 +1773,11 @@ x64_emit_stmt(nd) {
 
     // Expression statement.
     x64_emit_node(nd);
-    return 0;
 }
 
 // ── Function emission ──────────────────────────────────────
 
-x64_emit_func(fi) {
+static void x64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i, total, sz;
     name_p = arr_get(x64_fn_name, fi);
@@ -1848,7 +1786,8 @@ x64_emit_func(fi) {
 
     arr_clear(x64_vars); arr_clear(x64_var_stack);
     arr_clear(x64_var_struct_idx); arr_clear(x64_var_off); arr_clear(x64_var_forced_ty);
-    x64_freelist_reset();
+    arr_clear(x64_var_refs); arr_clear(x64_var_addr_taken);
+    arr_clear(x64_var_promote); arr_clear(x64_promoted_regs);
     x64_cur_fn_name = name_p;
     x64_cur_fn_idx = arr_get(x64_fn_fidx, fi);
 
@@ -1887,6 +1826,17 @@ x64_emit_func(fi) {
         arr_set(x64_var_off, i, 0 - (24 + total));
         i = i + 1;
     }
+    // Phase B3: walk body, count refs, select promotions. Done before
+    // frame size is finalized so the spill area shares the allocation.
+    auto stmt_i: Node;
+    for (i = 0; i < body_cnt; i = i + 1) {
+        stmt_i = body_arr[i];
+        if (stmt_i != 0) { _x64_b3_walk(stmt_i); }
+    }
+    _x64_b3_select();
+    x64_b3_spill_off = 0 - (24 + total);
+    total = total + arr_len(x64_promoted_regs) * 8;
+
     // Frame size: 8 (scratch) + 16 (xmm0/xmm1 save slots) + total variables, rounded up to 16.
     frame = 24 + total;
     frame = (frame + 15) / 16 * 16;
@@ -1901,6 +1851,15 @@ x64_emit_func(fi) {
     x64_enc_push(5);                 // push rbp
     x64_enc_mov_reg(5, 4);           // mov rbp, rsp
     if (frame > 0) { x64_enc_sub_imm(4, frame); }  // sub rsp, frame
+
+    // Phase B3: spill the chosen callee-saved registers.
+    auto _b3_i, _b3_n, _b3_reg, _b3_off;
+    _b3_n = arr_len(x64_promoted_regs);
+    for (_b3_i = 0; _b3_i < _b3_n; _b3_i = _b3_i + 1) {
+        _b3_reg = arr_get(x64_promoted_regs, _b3_i);
+        _b3_off = x64_b3_spill_off - (_b3_i + 1) * 8;
+        x64_enc_store(_b3_reg, 5, _b3_off);
+    }
 
     // In main(), save argc (RDI), argv (RSI), and envp (RDX) to hidden
     // globals. The _start stub below sets up RDI/RSI/RDX from the kernel
@@ -1919,11 +1878,26 @@ x64_emit_func(fi) {
         x64_enc_store(2, 10, 0);
     }
 
-    // Store incoming register arguments to their stack slots.
+    // Store incoming register arguments. Promoted parameters land
+    // straight in their assigned callee-saved register.
+    auto _p_preg;
     i = 0;
     while (i < par_cnt) {
-        x64_enc_store(x64_arg_reg(i), 5, arr_get(x64_var_off, i));
+        _p_preg = arr_get(x64_var_promote, i);
+        if (_p_preg >= 0) {
+            x64_enc_mov_reg(_p_preg, x64_arg_reg(i));
+        } else {
+            x64_enc_store(x64_arg_reg(i), 5, arr_get(x64_var_off, i));
+        }
         i = i + 1;
+    }
+
+    // Phase B3: zero any promoted local that is NOT a parameter.
+    auto _z_vi, _z_n, _z_preg;
+    _z_n = arr_len(x64_vars);
+    for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
+        _z_preg = arr_get(x64_var_promote, _z_vi);
+        if (_z_preg >= 0) { x64_enc_xor_zero(_z_preg); }
     }
 
     // Emit function body.
@@ -1933,20 +1907,27 @@ x64_emit_func(fi) {
     // Implicit return 0: set rax = 0 for functions without explicit return.
     x64_enc_xor_zero(0);
 
-    // Epilogue.
+    // Epilogue. Centralized so every explicit return restores the
+    // spilled callee-saved registers exactly once.
     x64_enc_def_label(x64_ret_lbl);
+    auto _e_i, _e_n, _e_reg, _e_off;
+    _e_n = arr_len(x64_promoted_regs);
+    for (_e_i = 0; _e_i < _e_n; _e_i = _e_i + 1) {
+        _e_reg = arr_get(x64_promoted_regs, _e_i);
+        _e_off = x64_b3_spill_off - (_e_i + 1) * 8;
+        x64_enc_load(_e_reg, 5, _e_off);
+    }
     x64_enc_mov_reg(4, 5);           // mov rsp, rbp
     x64_enc_pop(5);                  // pop rbp
     x64_enc_ret();
 
-    return 0;
 }
 
 // ── Per-module emission (for incremental compilation) ──────
 
 // Initialize encoder and global tables for per-module x86_64 codegen.
 // Call once before the per-module loop.
-x64_mod_init() {
+void x64_mod_init() {
     auto i, rec, name_p, idx, j;
     x64_sbuf = vbuf;
 
@@ -1980,21 +1961,18 @@ x64_mod_init() {
     // Copy ALL externs.
     arr_clear(x64_ex_name); arr_clear(x64_ex_ret);
     arr_clear(x64_ex_args); arr_clear(x64_ex_acnt);
-    i = 0;
-    while (i < ext_cnt) {
+    for (i = 0; i < ext_cnt; i = i + 1) {
         rec = *(externs + i * 8);
         x64_ex_name = arr_push(x64_ex_name, *(rec + EX_NAME));
         x64_ex_ret  = arr_push(x64_ex_ret,  *(rec + EX_RET));
         x64_ex_args = arr_push(x64_ex_args, *(rec + EX_ARGS));
         x64_ex_acnt = arr_push(x64_ex_acnt, *(rec + EX_ACNT));
-        i = i + 1;
     }
 
-    return 0;
 }
 
 // Emit code for one module. Returns code_start offset in x64_enc_buf.
-emit_module_x86_64(mi) {
+void emit_module_x86_64(mi) {
     auto fn_start, code_start, i, rec, name_p, idx, j;
 
     fn_start = arr_len(x64_fn_name);
@@ -2087,7 +2065,7 @@ x64_emit_start_stub() {
 
 // ── Top-level emission ─────────────────────────────────────
 
-emit_all_x86_64() {
+void emit_all_x86_64() {
     auto i, sp, ss, sl, j, fp, fs, fl, main_fi, main_lbl, start_lbl;
 
     bridge_data_x86_64();

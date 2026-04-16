@@ -37,6 +37,7 @@ auto fn_address_taken;    // arr<int>: 1 if fn_ptr(name) appears anywhere
 auto fn_locally_impure;   // arr<int>: 1 if body has non-call side effects
 auto fn_reachable;        // arr<int>: 1 if reachable from main() via call graph
 auto fn_phase_hint;       // arr<int>: 0=auto, 1=base, 2=solo (from `: base`/`: solo` annotation)
+auto fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place (Phase B2)
 auto _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
 
@@ -96,6 +97,7 @@ void init_dispatch() {
     fn_locally_impure = arr_new();
     fn_reachable = arr_new();
     fn_phase_hint = arr_new();
+    fn_inlineable = arr_new();
     _lazy_emit_ready = 0;
     glob_writers = arr_new();
     glob_readers = arr_new();
@@ -1987,6 +1989,193 @@ void annotate_temps() {
             if (stmt != 0) { _annot_count(stmt); }
         }
     }
+}
+
+// ── Phase B2 — Inline tiny `: base` functions ─────────────
+//
+// Trivial accessors like `peek`, `arr_get`, `unpack_s`, `is_float_type`
+// translate to a 1-2 instruction body wrapped in a ~10 instruction
+// call frame. Splicing the body straight into the caller deletes the
+// call entirely. Eligibility is decided once, here, so each codegen
+// only needs a small T_CALL branch that calls `ast_clone_subst` and
+// hands the result to its existing emit_node loop.
+//
+// Eligibility criteria (all must hold):
+//   1. fn_phase[i] == PHASE_BASE  — pure, no side effects.
+//   2. body_cnt == 1, body[0] is a `T_RET` returning a real expression.
+//   3. The return expression has ≤ 5 AST nodes.
+//   4. param_cnt ≤ 3.
+//   5. The body contains zero T_CALL (avoids transitive blow-up).
+//   6. Each parameter is referenced at most once in the body
+//      (so substituting an argument can never duplicate side effects;
+//      this lets us skip the bind-to-temp machinery entirely).
+
+// Count AST nodes in an expression subtree. Used by criterion 3.
+static _inline_count_nodes(nd) : base {
+    auto n: Node, t, sum, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    sum = 1;
+    switch (t) {
+    T_LIT, T_VAR, T_NOP, T_BREAK, T_CONTINUE { return 1; }
+    T_BINOP    { sum = sum + _inline_count_nodes(n.b) + _inline_count_nodes(n.c); }
+    T_UNARY    { sum = sum + _inline_count_nodes(n.b); }
+    T_MEMLD    { sum = sum + _inline_count_nodes(n.a); }
+    T_ADDR     { sum = sum + _inline_count_nodes(n.a); }
+    T_TERNARY  { sum = sum + _inline_count_nodes(n.a) + _inline_count_nodes(n.b) + _inline_count_nodes(n.c); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { sum = sum + _inline_count_nodes(arr[i]); }
+    }
+    else { return 99; }
+    }
+    return sum;
+}
+
+// Return 1 if the subtree contains any T_CALL (criterion 5).
+static _inline_has_tcall(nd) : base {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) { return 1; }
+    switch (t) {
+    T_BINOP    { return _inline_has_tcall(n.b) || _inline_has_tcall(n.c); }
+    T_UNARY    { return _inline_has_tcall(n.b); }
+    T_MEMLD    { return _inline_has_tcall(n.a); }
+    T_ADDR     { return _inline_has_tcall(n.a); }
+    T_TERNARY  { return _inline_has_tcall(n.a) || _inline_has_tcall(n.b) || _inline_has_tcall(n.c); }
+    else { return 0; }
+    }
+    return 0;
+}
+
+// Count references to packed name `name_p` inside an expression subtree.
+// Uses packed_eq to handle name fragments scanned at different sites.
+static _inline_param_refs(nd, name_p) : base {
+    auto n: Node, t, arr, cnt, i, sum;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) { return packed_eq(n.a, name_p) ? 1 : 0; }
+    sum = 0;
+    switch (t) {
+    T_BINOP    { sum = _inline_param_refs(n.b, name_p) + _inline_param_refs(n.c, name_p); }
+    T_UNARY    { sum = _inline_param_refs(n.b, name_p); }
+    T_MEMLD    { sum = _inline_param_refs(n.a, name_p); }
+    T_ADDR     { sum = _inline_param_refs(n.a, name_p); }
+    T_TERNARY  { sum = _inline_param_refs(n.a, name_p) + _inline_param_refs(n.b, name_p) + _inline_param_refs(n.c, name_p); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { sum = sum + _inline_param_refs(arr[i], name_p); }
+    }
+    else { return 0; }
+    }
+    return sum;
+}
+
+// Walk the function table and tag every entry that meets the inline
+// criteria above. Must run after classify_all_functions so fn_phase
+// is final. Codegens read fn_inlineable when emitting T_CALL.
+void classify_inlineable() {
+    auto i, func, body_arr, body_cnt, params, pcnt, ret_stmt: Node;
+    auto ret_expr, j, ok, refs;
+    // Grow the array to exactly func_cnt slots so arr_set below is safe.
+    // arr_set does not bounds-check or resize; the naked indexed writes
+    // below would smash adjacent heap allocations once i passes the
+    // initial capacity of 8. Pre-seeding with arr_push keeps length and
+    // capacity in sync.
+    while (arr_len(fn_inlineable) < func_cnt) {
+        fn_inlineable = arr_push(fn_inlineable, 0);
+    }
+    for (i = 0; i < func_cnt; i = i + 1) {
+        arr_set(fn_inlineable, i, 0);
+        if (arr_get(fn_phase, i) != PHASE_BASE) { continue; }
+        func = funcs[i];
+        body_arr = *(func + FN_BODY);
+        body_cnt = *(func + FN_BCNT);
+        if (body_arr == 0) { continue; }
+        if (body_cnt != 1) { continue; }
+        ret_stmt = body_arr[0];
+        if (ret_stmt == 0) { continue; }
+        if (ret_stmt.ntype != T_RET) { continue; }
+        ret_expr = ret_stmt.a;
+        if (ret_expr == 0) { continue; }
+        pcnt = *(func + FN_PCNT);
+        if (pcnt > 3) { continue; }
+        if (_inline_count_nodes(ret_expr) > 5) { continue; }
+        if (_inline_has_tcall(ret_expr)) { continue; }
+        // Reject any function that reads or returns a float — inlining
+        // bypasses the regular call path's int/float coercion logic, so
+        // restrict Phase B2 to the pure-integer `: base` helpers that
+        // benefit the most (peek, arr_get, unpack_s, is_float_type, …).
+        if (is_float_type(get_fn_ret_type(i))) { continue; }
+        ok = 1;
+        for (j = 0; j < pcnt; j = j + 1) {
+            if (is_float_type(get_fn_par_type(i, j))) { ok = 0; }
+        }
+        if (ok == 0) { continue; }
+        params = *(func + FN_PARS);
+        for (j = 0; j < pcnt; j = j + 1) {
+            refs = _inline_param_refs(ret_expr, *(params + j * 8));
+            if (refs > 1) { ok = 0; }
+        }
+        if (ok == 0) { continue; }
+        arr_set(fn_inlineable, i, 1);
+    }
+}
+
+// Clone an expression subtree, replacing every T_VAR whose packed name
+// matches a parameter with the corresponding argument node. Argument
+// nodes are SHARED, not copied — criterion 6 of classify_inlineable
+// guarantees no parameter is referenced twice, so each shared arg lands
+// in the cloned tree exactly once. Public because both codegens call
+// it directly from their T_CALL branches.
+ast_clone_subst(nd, params, pcnt, args) {
+    auto orig: Node, cl: Node, t, i, arr, cnt, new_arr;
+    if (nd == 0) { return 0; }
+    orig = nd;
+    t = orig.ntype;
+    if (t == T_VAR) {
+        for (i = 0; i < pcnt; i = i + 1) {
+            if (packed_eq(orig.a, *(params + i * 8))) { return *(args + i * 8); }
+        }
+        cl = make_node(T_VAR);
+        cl.a = orig.a;
+        cl.itype = orig.itype;
+        cl.dispatch = orig.dispatch;
+        return cl;
+    }
+    cl = make_node(t);
+    cl.a = orig.a; cl.b = orig.b; cl.c = orig.c;
+    cl.d = orig.d; cl.e = orig.e;
+    cl.itype = orig.itype;
+    cl.dispatch = orig.dispatch;
+    switch (t) {
+    T_BINOP {
+        cl.b = ast_clone_subst(orig.b, params, pcnt, args);
+        cl.c = ast_clone_subst(orig.c, params, pcnt, args);
+    }
+    T_UNARY    { cl.b = ast_clone_subst(orig.b, params, pcnt, args); }
+    T_MEMLD    { cl.a = ast_clone_subst(orig.a, params, pcnt, args); }
+    T_ADDR     { cl.a = ast_clone_subst(orig.a, params, pcnt, args); }
+    T_TERNARY {
+        cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        cl.b = ast_clone_subst(orig.b, params, pcnt, args);
+        cl.c = ast_clone_subst(orig.c, params, pcnt, args);
+    }
+    T_CALL {
+        arr = orig.b; cnt = orig.c;
+        new_arr = malloc(cnt * 8);
+        for (i = 0; i < cnt; i = i + 1) {
+            new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+        }
+        cl.b = new_arr;
+    }
+    else { }
+    }
+    return cl;
 }
 
 // ── Orchestrator ───────────────────────────────────────────

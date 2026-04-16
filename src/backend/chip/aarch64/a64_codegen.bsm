@@ -38,6 +38,13 @@ auto a64_vars;
 // Stack struct tracking: per-variable dynamic arrays for flags and computed frame offsets.
 auto a64_var_stack, a64_var_struct_idx, a64_var_off, a64_var_forced_ty;
 
+// Phase B3 — local register allocation.
+auto a64_var_refs;
+auto a64_var_addr_taken;
+auto a64_var_promote;
+auto a64_promoted_regs;
+auto a64_b3_spill_base;
+
 // Float literal data table (dynamic array): stores packed string refs for .double emission.
 auto a64_flt_tbl;
 
@@ -86,7 +93,7 @@ static auto a64_simd_free_mask;
 
 // ── Initialization ─────────────────────────────────────────
 
-init_codegen_arm64() {
+void init_codegen_arm64() {
     a64_fn_name = arr_new(); a64_fn_par = arr_new();
     a64_fn_pcnt = arr_new(); a64_fn_body = arr_new();
     a64_fn_bcnt = arr_new(); a64_fn_fidx = arr_new();
@@ -98,6 +105,10 @@ init_codegen_arm64() {
     a64_var_struct_idx = arr_new();
     a64_var_off = arr_new();
     a64_var_forced_ty = arr_new();
+    a64_var_refs = arr_new();
+    a64_var_addr_taken = arr_new();
+    a64_var_promote = arr_new();
+    a64_promoted_regs = arr_new();
     a64_flt_tbl = arr_new();
     a64_str_tbl = arr_new();
     a64_lbl_cnt = 0; a64_depth = 0;
@@ -113,7 +124,6 @@ init_codegen_arm64() {
     a64_envp_sym = 0;
     a64_gp_free_mask = 0;
     a64_simd_free_mask = 0;
-    return 0;
 }
 
 // ── Phase B1 register freelist helpers ──────────────────────
@@ -209,7 +219,6 @@ static _a64_has_call(nd) : base {
     T_MEMLD, T_ADDR, T_RET { return _a64_has_call(n.a); }
     else { return 0; }
     }
-    return 0;
 }
 
 // Look up the packed names of brt0's hidden globals (_bpp_argc, _bpp_argv,
@@ -234,7 +243,7 @@ void a64_bind_startup_syms() {
 // ── Bridge: copy parser data into emitter parallel arrays ──
 // Same pattern as bpp_emitter.bsm:bridge_data().
 
-bridge_data_arm64() {
+static void bridge_data_arm64() {
     auto i, rec, name_p, idx, j;
 
     // Point string buffer at the parser's vbuf.
@@ -312,13 +321,12 @@ bridge_data_arm64() {
         i = i + 1;
     }
 
-    return 0;
 }
 
 // ── String utilities ───────────────────────────────────────
 
 // Find an extern function by packed name. Returns first match index or -1.
-a64_find_ext(name_p) {
+static a64_find_ext(name_p) {
     auto i;
     i = 0;
     while (i < arr_len(a64_ex_name)) {
@@ -330,7 +338,7 @@ a64_find_ext(name_p) {
 
 // Find an extern function by packed name AND argument count.
 // Allows multiple declarations of the same name with different signatures.
-a64_find_ext_by_argc(name_p, argc) {
+static a64_find_ext_by_argc(name_p, argc) {
     auto i;
     i = 0;
     while (i < arr_len(a64_ex_name)) {
@@ -344,7 +352,7 @@ a64_find_ext_by_argc(name_p, argc) {
 }
 
 // Check if an extern parameter at index par_idx is "double".
-a64_ext_par_is_float(exi, par_idx) {
+static a64_ext_par_is_float(exi, par_idx) {
     auto arr, tp;
     arr = arr_get(a64_ex_args, exi);
     tp = *(arr + par_idx * 8);
@@ -352,7 +360,7 @@ a64_ext_par_is_float(exi, par_idx) {
 }
 
 // Check if an extern's return type is "double".
-a64_ext_ret_is_float(exi) {
+static a64_ext_ret_is_float(exi) {
     auto tp;
     tp = arr_get(a64_ex_ret, exi);
     return a64_str_eq(tp, "double", 6);
@@ -379,40 +387,46 @@ a64_str_eq_packed(a, b) {
 }
 
 // Print a packed string to stdout.
-a64_print_p(p) {
+static void a64_print_p(p) {
     print_buf(a64_sbuf + unpack_s(p), unpack_l(p));
-    return 0;
 }
 
 // ── Helper functions ───────────────────────────────────────
 
 // Print a decimal integer to stdout. Used for assembly immediates.
-a64_print_dec(n) {
+static void a64_print_dec(n) {
     auto buf, len, i;
     if (n < 0) { putchar('-'); n = 0 - n; }
-    if (n == 0) { putchar('0'); return 0; }
+    if (n == 0) { putchar('0'); return; }
     buf = malloc(20); len = 0;
-    while (n > 0) { poke(buf + len, '0' + n % 10); len = len + 1; n = n / 10; }
-    i = len - 1;
-    while (i >= 0) { putchar(peek(buf + i)); i = i - 1; }
-    return 0;
+    while (n > 0) {
+        poke(buf + len, '0' + n % 10);
+        len = len + 1;
+        n = n / 10;
+    }
+    for (i = len - 1; i >= 0; i = i - 1) {
+        putchar(peek(buf + i));
+    }
 }
 
 // ── Variable tracking for current function ─────────────────
 
 // Add a variable to the current scope. Returns its slot index.
-a64_var_add(name_p) {
+static a64_var_add(name_p) {
     auto idx; idx = arr_len(a64_vars);
     a64_vars = arr_push(a64_vars, name_p);
     a64_var_stack = arr_push(a64_var_stack, 0);
     a64_var_struct_idx = arr_push(a64_var_struct_idx, 0 - 1);
     a64_var_off = arr_push(a64_var_off, 0);
     a64_var_forced_ty = arr_push(a64_var_forced_ty, 0);
+    a64_var_refs = arr_push(a64_var_refs, 0);
+    a64_var_addr_taken = arr_push(a64_var_addr_taken, 0);
+    a64_var_promote = arr_push(a64_var_promote, 0 - 1);
     return idx;
 }
 
 // Find a variable index by name. Returns index or -1 if not found.
-a64_var_idx(name_p) {
+static a64_var_idx(name_p) {
     auto i; i = 0;
     while (i < arr_len(a64_vars)) {
         if (a64_str_eq_packed(name_p, arr_get(a64_vars, i))) { return i; }
@@ -421,8 +435,101 @@ a64_var_idx(name_p) {
     return -1;
 }
 
+// ── Phase B3 — local register allocation ──────────────────
+
+static _a64_b3_eligible(vi) : base {
+    auto fty;
+    if (arr_get(a64_var_stack, vi)) { return 0; }
+    if (arr_get(a64_var_addr_taken, vi)) { return 0; }
+    fty = arr_get(a64_var_forced_ty, vi);
+    if (is_float_type(fty)) { return 0; }
+    if (ty_slice(fty) != SL_FULL) { return 0; }
+    return 1;
+}
+
+static _a64_b3_walk(nd) {
+    auto n: Node, t, vi, child: Node, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        vi = a64_var_idx(n.a);
+        if (vi >= 0) { arr_set(a64_var_refs, vi, arr_get(a64_var_refs, vi) + 1); }
+        return 0;
+    }
+    if (t == T_ADDR) {
+        child = n.a;
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = a64_var_idx(child.a);
+            if (vi >= 0) { arr_set(a64_var_addr_taken, vi, 1); }
+            return 0;
+        }
+        _a64_b3_walk(child);
+        return 0;
+    }
+    switch (t) {
+    T_BINOP    { _a64_b3_walk(n.b); _a64_b3_walk(n.c); }
+    T_ASSIGN   { _a64_b3_walk(n.a); _a64_b3_walk(n.b); }
+    T_MEMST    { _a64_b3_walk(n.a); _a64_b3_walk(n.b); }
+    T_UNARY    { _a64_b3_walk(n.b); }
+    T_MEMLD    { _a64_b3_walk(n.a); }
+    T_RET      { _a64_b3_walk(n.a); }
+    T_TERNARY  { _a64_b3_walk(n.a); _a64_b3_walk(n.b); _a64_b3_walk(n.c); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _a64_b3_walk(arr[i]); }
+    }
+    T_IF {
+        _a64_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _a64_b3_walk(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i = i + 1) { _a64_b3_walk(arr[i]); }
+        }
+    }
+    T_WHILE {
+        _a64_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _a64_b3_walk(arr[i]); }
+        if (n.e != 0) { _a64_b3_walk(n.e); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { _a64_b3_walk(arr[i]); }
+    }
+    else { }
+    }
+}
+
+// ARM64 callee-saved pool: x19..x24 (6 regs).
+static void _a64_b3_select() {
+    auto budget, used, vi, n, best_vi, best_refs, reg;
+    budget = 6;
+    n = arr_len(a64_vars);
+    arr_clear(a64_promoted_regs);
+    used = 0;
+    while (used < budget) {
+        best_vi = 0 - 1;
+        best_refs = 1;
+        for (vi = 0; vi < n; vi = vi + 1) {
+            if (arr_get(a64_var_promote, vi) >= 0) { continue; }
+            if (_a64_b3_eligible(vi) == 0) { continue; }
+            if (arr_get(a64_var_refs, vi) > best_refs) {
+                best_refs = arr_get(a64_var_refs, vi);
+                best_vi = vi;
+            }
+        }
+        if (best_vi < 0) { return; }
+        reg = 19 + used;
+        arr_set(a64_var_promote, best_vi, reg);
+        a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+        used = used + 1;
+    }
+}
+
 // Find a variable by name. Returns stack offset from x29, or -1 if not found.
-a64_var_find(name_p) {
+static a64_var_find(name_p) {
     auto i;
     i = a64_var_idx(name_p);
     if (i >= 0) { return arr_get(a64_var_off, i); }
@@ -430,7 +537,7 @@ a64_var_find(name_p) {
 }
 
 // Walk a function body and register all declared variables (for frame sizing).
-a64_pre_reg_vars(arr, cnt) {
+static void a64_pre_reg_vars(arr, cnt) {
     auto i, j;
     auto n: Node;
     i = 0;
@@ -474,13 +581,12 @@ a64_pre_reg_vars(arr, cnt) {
         }
         i = i + 1;
     }
-    return 0;
 }
 
 // ── Literal helpers ────────────────────────────────────────
 
 // Parse a packed integer literal (decimal or hex). Returns the numeric value.
-a64_parse_int(p) {
+static a64_parse_int(p) {
     auto s, l, i, ch, val;
     s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
     // Hex: 0x...
@@ -490,9 +596,9 @@ a64_parse_int(p) {
                 i = 2;
                 while (i < l) {
                     ch = peek(a64_sbuf + s + i); val = val * 16;
-                    if (ch >= '0') { if (ch <= '9') { val = val + ch - '0'; } }
-                    if (ch >= 'A') { if (ch <= 'F') { val = val + ch - 55; } }
-                    if (ch >= 'a') { if (ch <= 'f') { val = val + ch - 87; } }
+                    if (ch >= '0' && ch <= '9') { val = val + ch - '0'; }
+                    if (ch >= 'A' && ch <= 'F') { val = val + ch - 55; }
+                    if (ch >= 'a' && ch <= 'f') { val = val + ch - 87; }
                     i = i + 1;
                 }
                 return val;
@@ -505,7 +611,7 @@ a64_parse_int(p) {
 }
 
 // Check if a packed literal contains a decimal point (float literal).
-a64_is_float_lit(p) {
+static a64_is_float_lit(p) {
     auto s, l, i;
     s = unpack_s(p); l = unpack_l(p);
     i = 0;
@@ -513,21 +619,20 @@ a64_is_float_lit(p) {
         if (peek(a64_sbuf + s + i) == '.') { return 1; }
         i = i + 1;
     }
-    return 0;
 }
 
 // ── Type query helpers ─────────────────────────────────────
 // Wrap bpp_types.bsm queries for cleaner code in emit_node/emit_stmt.
 
 // Return the inferred type code of a local variable by slot index.
-a64_var_type(vi) {
+static a64_var_type(vi) {
     return get_fn_var_type(a64_cur_fn_idx, arr_get(a64_vars, vi));
 }
 
 // Check if a variable (by slot index) is float in the current function.
 // An explicit integer type hint (: int, : byte, : half, : quarter) overrides
 // float inference — the programmer's annotation wins.
-a64_var_is_float(vi) {
+static a64_var_is_float(vi) {
     auto fty;
     fty = arr_get(a64_var_forced_ty, vi);
     if (fty > 0) {
@@ -540,8 +645,15 @@ a64_var_is_float(vi) {
 // explicit type annotation. Only uses sub-word ops when the programmer
 // declared a type hint. Inferred types always use 64-bit load.
 // Returns 1 if result is in d0 (float), 0 if in x0 (integer).
-a64_emit_load_var(vi, off) {
-    auto fty, sl;
+static a64_emit_load_var(vi, off) {
+    auto fty, sl, _preg;
+    // Phase B3: promoted local — emit register move, skip stack load.
+    _preg = arr_get(a64_var_promote, vi);
+    if (_preg >= 0) {
+        if (a64_bin_mode) { enc_add_imm(0, _preg, 0); }
+        else { out("  mov x0, x"); a64_print_dec(_preg); putchar(10); }
+        return 0;
+    }
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
     // Float sub-types: FLOAT_H loads s-register, FLOAT_Q loads h-register.
@@ -584,14 +696,22 @@ a64_emit_load_var(vi, off) {
     // Default: 64-bit load.
     if (a64_bin_mode) { enc_ldr_uoff(0, 29, off); }
     else { out("  ldr x0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
-    return 0;
 }
 
 // Emit a sized store from x0/d0 into [x29, #off] based on the variable's
 // explicit type annotation. Only uses sub-word ops when the programmer
 // declared a type hint. rty: 0 = integer in x0, 1 = float in d0.
-a64_emit_store_var(vi, off, rty) {
-    auto fty, sl;
+static void a64_emit_store_var(vi, off, rty) {
+    auto fty, sl, _preg;
+    _preg = arr_get(a64_var_promote, vi);
+    if (_preg >= 0) {
+        if (rty == 1) {
+            if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar(10); }
+        }
+        if (a64_bin_mode) { enc_add_imm(_preg, 0, 0); }
+        else { out("  mov x"); a64_print_dec(_preg); out(", x0"); putchar(10); }
+        return 0;
+    }
     fty = arr_get(a64_var_forced_ty, vi);
     sl = ty_slice(fty);
     // Float sub-types: convert int→double if needed, then narrow for sub-types.
@@ -641,11 +761,10 @@ a64_emit_store_var(vi, off, rty) {
     // Default: 64-bit store.
     if (a64_bin_mode) { enc_str_uoff(0, 29, off); }
     else { out("  str x0, [x29, #"); a64_print_dec(off); out("]"); putchar(10); }
-    return 0;
 }
 
 // Find a B++ function's emitter index by packed name. Returns -1 if not found.
-a64_find_fn(name_p) {
+static a64_find_fn(name_p) {
     auto i;
     i = 0;
     while (i < arr_len(a64_fn_name)) {
@@ -658,10 +777,10 @@ a64_find_fn(name_p) {
 // ── ARM64 emission primitives ──────────────────────────────
 
 // Generate a unique label number.
-a64_new_lbl() { auto l; l = a64_lbl_cnt; a64_lbl_cnt = a64_lbl_cnt + 1; return l; }
+static a64_new_lbl() { auto l; l = a64_lbl_cnt; a64_lbl_cnt = a64_lbl_cnt + 1; return l; }
 
 // Load a 64-bit immediate into x0 using movz/movk sequence.
-a64_emit_mov(val) {
+static void a64_emit_mov(val) {
     auto lo, hi;
     if (a64_bin_mode) { enc_mov_wide(0, val); return 0; }
     if (val >= 0) {
@@ -679,7 +798,6 @@ a64_emit_mov(val) {
     if (hi > 0) { out("  movk x0, #"); a64_print_dec(hi); out(", lsl #32"); putchar('\n'); }
     hi = (val >> 48) & 0xFFFF;
     if (hi > 0) { out("  movk x0, #"); a64_print_dec(hi); out(", lsl #48"); putchar('\n'); }
-    return 0;
 }
 
 // ── Switch jump-table analysis ───────────────────────────────
@@ -839,25 +957,25 @@ static void a64_emit_switch_jtbl(nd, sw_end_lbl) {
 }
 
 // Push x0 onto the stack. Maintains 16-byte alignment.
-a64_emit_push() {
+static void a64_emit_push() {
     if (a64_bin_mode) { enc_str_pre(0, 31, -16); } else { out("  str x0, [sp, #-16]!"); putchar('\n'); }
     a64_depth = a64_depth + 1; return 0;
 }
 
 // Pop from the stack into a register (0=x0, 1=x1, etc.).
-a64_emit_pop(r) {
+static void a64_emit_pop(r) {
     if (a64_bin_mode) { enc_ldr_post(r, 31, 16); } else { out("  ldr x"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
     a64_depth = a64_depth - 1; return 0;
 }
 
 // Push d0 onto the stack (float value).
-a64_emit_fpush() {
+static void a64_emit_fpush() {
     if (a64_bin_mode) { enc_str_d_pre(0, 31, -16); } else { out("  str d0, [sp, #-16]!"); putchar('\n'); }
     a64_depth = a64_depth + 1; return 0;
 }
 
 // Pop from the stack into a float register (0=d0, 1=d1, etc.).
-a64_emit_fpop(r) {
+static void a64_emit_fpop(r) {
     if (a64_bin_mode) { enc_ldr_d_post(r, 31, 16); } else { out("  ldr d"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
     a64_depth = a64_depth - 1; return 0;
 }
@@ -866,9 +984,9 @@ a64_emit_fpop(r) {
 // Emits ARM64 code for an expression node.
 // Returns 0 if result is integer (in x0), 1 if float (in d0).
 
-a64_emit_node(n) { return 0; }
+static a64_emit_node(n) { return 0; }
 
-a64_emit_node(nd) {
+static a64_emit_node(nd) {
     auto n: Node;
     auto t, op_s, op_l, c0, c1, arr, cnt, i, off, lbl, lbl2, vi, lty, rty;
     auto lit_s, lit_l, sid, str_p, fid, use_flt, is_io, uty, ety, fidx_c, fi, fn_name: Node;
@@ -998,12 +1116,9 @@ a64_emit_node(nd) {
 
         // Check if this is an integer-only operator (%, &, |, ^, <<, >>).
         is_io = 0;
-        if (c0 == '%') { is_io = 1; }
-        if (c0 == '^') { is_io = 1; }
-        if (c0 == '&') { if (op_l == 1) { is_io = 1; } }
-        if (c0 == '|') { if (op_l == 1) { is_io = 1; } }
-        if (c0 == '<') { if (c1 == '<') { is_io = 1; } }
-        if (c0 == '>') { if (c1 == '>') { is_io = 1; } }
+        if (c0 == '%' || c0 == '^') { is_io = 1; }
+        if ((c0 == '&' || c0 == '|') && op_l == 1) { is_io = 1; }
+        if ((c0 == '<' && c1 == '<') || (c0 == '>' && c1 == '>')) { is_io = 1; }
 
         // Evaluate left operand, save it for the op below. Phase B1a.2:
         // try the GP freelist before falling back to push/pop — a single
@@ -1032,8 +1147,7 @@ a64_emit_node(nd) {
         rty = a64_emit_node(n.c);
 
         // Determine if we use float arithmetic.
-        use_flt = 0;
-        if (is_io == 0) { if (lty == 1 | rty == 1) { use_flt = 1; } }
+        use_flt = is_io == 0 && (lty == 1 || rty == 1) ? 1 : 0;
 
         if (use_flt == 1) {
             // Ensure right operand is in d0.
@@ -1054,14 +1168,14 @@ a64_emit_node(nd) {
             // d1 = left, d0 = right.
 
             // Float arithmetic operators.
-            if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_fadd(0,1,0); } else { out("  fadd d0, d1, d0"); putchar('\n'); } return 1; } }
-            if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_fsub(0,1,0); } else { out("  fsub d0, d1, d0"); putchar('\n'); } return 1; } }
-            if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_fmul(0,1,0); } else { out("  fmul d0, d1, d0"); putchar('\n'); } return 1; } }
-            if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_fdiv(0,1,0); } else { out("  fdiv d0, d1, d0"); putchar('\n'); } return 1; } }
+            if (c0 == '+' && op_l == 1) { if (a64_bin_mode) { enc_fadd(0,1,0); } else { out("  fadd d0, d1, d0"); putchar('\n'); } return 1; }
+            if (c0 == '-' && op_l == 1) { if (a64_bin_mode) { enc_fsub(0,1,0); } else { out("  fsub d0, d1, d0"); putchar('\n'); } return 1; }
+            if (c0 == '*' && op_l == 1) { if (a64_bin_mode) { enc_fmul(0,1,0); } else { out("  fmul d0, d1, d0"); putchar('\n'); } return 1; }
+            if (c0 == '/' && op_l == 1) { if (a64_bin_mode) { enc_fdiv(0,1,0); } else { out("  fdiv d0, d1, d0"); putchar('\n'); } return 1; }
 
             // Float comparison operators — result is integer in x0.
-            if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,0); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
-            if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,1); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
+            if (c0 == '=' && c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,0); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; }
+            if (c0 == '!' && c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,1); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; }
             if (c0 == '<') {
                 if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,9); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ls"); putchar('\n'); } return 0; }
                 if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,4); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, mi"); putchar('\n'); } return 0; }
@@ -1096,28 +1210,28 @@ a64_emit_node(nd) {
             left_reg_int = 1;
         }
         // x{left_reg_int} = left, x0 = right.
-        if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_add_reg(0,left_reg_int,0); } else { out("  add x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_sub_reg(0,left_reg_int,0); } else { out("  sub x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_mul(0,left_reg_int,0); } else { out("  mul x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_sdiv(0,left_reg_int,0); } else { out("  sdiv x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '%') { if (op_l == 1) {
+        if (c0 == '+' && op_l == 1) { if (a64_bin_mode) { enc_add_reg(0,left_reg_int,0); } else { out("  add x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '-' && op_l == 1) { if (a64_bin_mode) { enc_sub_reg(0,left_reg_int,0); } else { out("  sub x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '*' && op_l == 1) { if (a64_bin_mode) { enc_mul(0,left_reg_int,0); } else { out("  mul x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '/' && op_l == 1) { if (a64_bin_mode) { enc_sdiv(0,left_reg_int,0); } else { out("  sdiv x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '%' && op_l == 1) {
             if (a64_bin_mode) { enc_sdiv(8,left_reg_int,0); enc_msub(0,8,0,left_reg_int); }
             else {
                 out("  sdiv x8, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n');
                 out("  msub x0, x8, x0, x"); a64_print_dec(left_reg_int); putchar('\n');
             }
             return 0;
-        } }
+        }
         // Bitwise operators.
-        if (c0 == '&') { if (op_l == 1) { if (a64_bin_mode) { enc_and_reg(0,left_reg_int,0); } else { out("  and x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '|') { if (op_l == 1) { if (a64_bin_mode) { enc_orr_reg(0,left_reg_int,0); } else { out("  orr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '^') { if (op_l == 1) { if (a64_bin_mode) { enc_eor_reg(0,left_reg_int,0); } else { out("  eor x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '&' && op_l == 1) { if (a64_bin_mode) { enc_and_reg(0,left_reg_int,0); } else { out("  and x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '|' && op_l == 1) { if (a64_bin_mode) { enc_orr_reg(0,left_reg_int,0); } else { out("  orr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '^' && op_l == 1) { if (a64_bin_mode) { enc_eor_reg(0,left_reg_int,0); } else { out("  eor x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
         // Shift operators.
-        if (c0 == '>') { if (c1 == '>') { if (a64_bin_mode) { enc_asrv(0,left_reg_int,0); } else { out("  asr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
-        if (c0 == '<') { if (c1 == '<') { if (a64_bin_mode) { enc_lslv(0,left_reg_int,0); } else { out("  lsl x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; } }
+        if (c0 == '>' && c1 == '>') { if (a64_bin_mode) { enc_asrv(0,left_reg_int,0); } else { out("  asr x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
+        if (c0 == '<' && c1 == '<') { if (a64_bin_mode) { enc_lslv(0,left_reg_int,0); } else { out("  lsl x0, x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); } return 0; }
         // Comparison operators.
-        if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,0); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
-        if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,1); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
+        if (c0 == '=' && c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,0); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; }
+        if (c0 == '!' && c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,1); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; }
         if (c0 == '<') {
             if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,13); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); } return 0; }
             if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,11); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); } return 0; }
@@ -1135,11 +1249,11 @@ a64_emit_node(nd) {
         uty = a64_emit_node(n.b);
         // Check if operator is '~' (bitwise NOT) or '-' (negate).
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
-        if (op_l == 1) { if (peek(a64_sbuf + op_s) == '~') {
+        if (op_l == 1 && peek(a64_sbuf + op_s) == '~') {
             // Bitwise NOT: MVN Xd, Xn
             if (a64_bin_mode) { enc_mvn(0, 0); } else { out("  mvn x0, x0"); putchar('\n'); }
             return 0;
-        } }
+        }
         if (uty == 1) {
             if (a64_bin_mode) { enc_fneg(0, 0); } else { out("  fneg d0, d0"); putchar('\n'); }
             return 1;
@@ -1711,6 +1825,19 @@ a64_emit_node(nd) {
         // Regular B++ function call.
         // Query bpp_types.bsm for callee's parameter and return types.
         fidx_c = find_func_idx(n.a);
+        // Phase B2: splice tiny pure `: base` helpers inline.
+        if (fidx_c >= 0 && arr_get(fn_inlineable, fidx_c)) {
+            auto inl_callee, inl_body, inl_ret: Node, inl_expr;
+            auto inl_params, inl_pcnt, inl_cloned;
+            inl_callee = funcs[fidx_c];
+            inl_body = *(inl_callee + FN_BODY);
+            inl_ret = inl_body[0];
+            inl_expr = inl_ret.a;
+            inl_params = *(inl_callee + FN_PARS);
+            inl_pcnt = *(inl_callee + FN_PCNT);
+            inl_cloned = ast_clone_subst(inl_expr, inl_params, inl_pcnt, n.b);
+            return a64_emit_node(inl_cloned);
+        }
         arr = n.b; cnt = n.c;
         i = 0;
         while (i < cnt) {
@@ -1901,12 +2028,11 @@ a64_emit_node(nd) {
         return 0;
     }
 
-    return 0;
 }
 
 // ── Statement emission ─────────────────────────────────────
 
-a64_emit_body(arr, cnt) {
+static void a64_emit_body(arr, cnt) {
     auto i;
     auto n: Node;
     i = 0;
@@ -1915,10 +2041,9 @@ a64_emit_body(arr, cnt) {
         if (n != 0) { a64_emit_stmt(n); }
         i = i + 1;
     }
-    return 0;
 }
 
-a64_emit_stmt(nd) {
+static void a64_emit_stmt(nd) {
     auto n: Node;
     auto lhs: Node;
     auto t, off, lbl, lbl2, arr, cnt, i, rty, vi, ety;
@@ -2339,12 +2464,11 @@ a64_emit_stmt(nd) {
 
     // Expression statement (e.g., function call as statement).
     a64_emit_node(nd);
-    return 0;
 }
 
 // ── Function emission ──────────────────────────────────────
 
-a64_emit_func(fi) {
+static void a64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i;
     name_p = arr_get(a64_fn_name, fi);
@@ -2357,6 +2481,10 @@ a64_emit_func(fi) {
     arr_clear(a64_var_struct_idx);
     arr_clear(a64_var_off);
     arr_clear(a64_var_forced_ty);
+    arr_clear(a64_var_refs);
+    arr_clear(a64_var_addr_taken);
+    arr_clear(a64_var_promote);
+    arr_clear(a64_promoted_regs);
     a64_freelist_reset();
     a64_cur_fn_name = name_p;
     a64_cur_fn_idx = arr_get(a64_fn_fidx, fi);
@@ -2397,6 +2525,17 @@ a64_emit_func(fi) {
         total = total + sz;
         i = i + 1;
     }
+
+    // Phase B3: walk body, count refs, select promotions.
+    auto stmt_i: Node;
+    for (i = 0; i < body_cnt; i = i + 1) {
+        stmt_i = body_arr[i];
+        if (stmt_i != 0) { _a64_b3_walk(stmt_i); }
+    }
+    _a64_b3_select();
+    a64_b3_spill_base = 40 + total;
+    total = total + arr_len(a64_promoted_regs) * 8;
+
     frame = 40 + total;
     frame = (frame + 15) / 16 * 16;
 
@@ -2408,15 +2547,26 @@ a64_emit_func(fi) {
         a64_ret_lbl = enc_new_label();
 
         // Prologue: save frame pointer and return address, allocate frame.
-        enc_stp_pre(29, 30, 31, 0 - frame);
-        // BRK embedding removed — debugserver handles breakpoints at runtime.
-        // The --bug flag now only generates the .bug metadata file.
+        // stp pre-index caps at ±504 in its 7-bit immediate — split for larger frames.
+        if (frame <= 504) {
+            enc_stp_pre(29, 30, 31, 0 - frame);
+        } else {
+            enc_sub_imm(31, 31, frame);
+            enc_str_uoff(29, 31, 0);
+            enc_str_uoff(30, 31, 8);
+        }
         enc_add_imm(29, 31, 0);
 
-        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to hidden
-        // globals before anything else clobbers them. dyld passes these
-        // via the standard calling convention when using LC_MAIN —
-        // signature is `int main(int argc, char *argv[], char *envp[], char *apple[])`.
+        // Phase B3: spill chosen callee-saved registers.
+        auto _b3_i, _b3_n, _b3_reg, _b3_off;
+        _b3_n = arr_len(a64_promoted_regs);
+        for (_b3_i = 0; _b3_i < _b3_n; _b3_i = _b3_i + 1) {
+            _b3_reg = arr_get(a64_promoted_regs, _b3_i);
+            _b3_off = a64_b3_spill_base + _b3_i * 8;
+            enc_str_uoff(_b3_reg, 29, _b3_off);
+        }
+
+        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to hidden globals.
         if (a64_str_eq(name_p, "main", 4)) {
             enc_add_reloc(enc_pos, a64_argc_sym, 0);
             enc_adrp(8); enc_add_imm(8, 8, 0);
@@ -2429,11 +2579,26 @@ a64_emit_func(fi) {
             enc_str_uoff(2, 8, 0);
         }
 
-        // Store incoming register arguments to their stack slots.
+        // Store incoming register arguments. Promoted params go straight into
+        // their callee-saved register.
+        auto _p_preg;
         i = 0;
         while (i < par_cnt) {
-            enc_str_uoff(i, 29, arr_get(a64_var_off, i));
+            _p_preg = arr_get(a64_var_promote, i);
+            if (_p_preg >= 0) {
+                enc_add_imm(_p_preg, i, 0);
+            } else {
+                enc_str_uoff(i, 29, arr_get(a64_var_off, i));
+            }
             i = i + 1;
+        }
+
+        // Phase B3: zero non-parameter promoted locals.
+        auto _z_vi, _z_n, _z_preg;
+        _z_n = arr_len(a64_vars);
+        for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
+            _z_preg = arr_get(a64_var_promote, _z_vi);
+            if (_z_preg >= 0) { enc_mov_wide(_z_preg, 0); }
         }
 
         // Narrow float sub-type params from double to their declared precision.
@@ -2462,9 +2627,22 @@ a64_emit_func(fi) {
         // code in that case — the branch jumps over it.
         enc_mov_wide(0, 0);
 
-        // Epilogue.
+        // Epilogue. Centralized restore of spilled callee-saved regs.
         enc_def_label(a64_ret_lbl);
-        enc_ldp_post(29, 30, 31, frame);
+        auto _e_i, _e_n, _e_reg, _e_off;
+        _e_n = arr_len(a64_promoted_regs);
+        for (_e_i = 0; _e_i < _e_n; _e_i = _e_i + 1) {
+            _e_reg = arr_get(a64_promoted_regs, _e_i);
+            _e_off = a64_b3_spill_base + _e_i * 8;
+            enc_ldr_uoff(_e_reg, 29, _e_off);
+        }
+        if (frame <= 504) {
+            enc_ldp_post(29, 30, 31, frame);
+        } else {
+            enc_ldr_uoff(29, 31, 0);
+            enc_ldr_uoff(30, 31, 8);
+            enc_add_imm(31, 31, frame);
+        }
         enc_ret();
     } else {
         // Emit function header.
@@ -2477,8 +2655,23 @@ a64_emit_func(fi) {
         }
 
         // Prologue: save frame pointer and return address, allocate frame.
-        out("  stp x29, x30, [sp, #-"); a64_print_dec(frame); out("]!"); putchar('\n');
+        if (frame <= 504) {
+            out("  stp x29, x30, [sp, #-"); a64_print_dec(frame); out("]!"); putchar('\n');
+        } else {
+            out("  sub sp, sp, #"); a64_print_dec(frame); putchar('\n');
+            out("  str x29, [sp]"); putchar('\n');
+            out("  str x30, [sp, #8]"); putchar('\n');
+        }
         out("  mov x29, sp"); putchar('\n');
+
+        // Phase B3: spill chosen callee-saved registers.
+        auto _b3_i, _b3_n, _b3_reg, _b3_off;
+        _b3_n = arr_len(a64_promoted_regs);
+        for (_b3_i = 0; _b3_i < _b3_n; _b3_i = _b3_i + 1) {
+            _b3_reg = arr_get(a64_promoted_regs, _b3_i);
+            _b3_off = a64_b3_spill_base + _b3_i * 8;
+            out("  str x"); a64_print_dec(_b3_reg); out(", [x29, #"); a64_print_dec(_b3_off); out("]"); putchar('\n');
+        }
 
         // In main(), save x0 (argc), x1 (argv), and x2 (envp) to globals.
         if (a64_str_eq(name_p, "main", 4)) {
@@ -2493,11 +2686,27 @@ a64_emit_func(fi) {
             out("  str x2, [x8]"); putchar('\n');
         }
 
-        // Store incoming register arguments to their stack slots.
+        // Store incoming register arguments. Promoted params go to their reg.
+        auto _p_preg;
         i = 0;
         while (i < par_cnt) {
-            out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n');
+            _p_preg = arr_get(a64_var_promote, i);
+            if (_p_preg >= 0) {
+                out("  mov x"); a64_print_dec(_p_preg); out(", x"); a64_print_dec(i); putchar('\n');
+            } else {
+                out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(arr_get(a64_var_off, i)); out("]"); putchar('\n');
+            }
             i = i + 1;
+        }
+
+        // Phase B3: zero non-parameter promoted locals.
+        auto _z_vi, _z_n, _z_preg;
+        _z_n = arr_len(a64_vars);
+        for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
+            _z_preg = arr_get(a64_var_promote, _z_vi);
+            if (_z_preg >= 0) {
+                out("  mov x"); a64_print_dec(_z_preg); out(", #0"); putchar('\n');
+            }
         }
 
         // Narrow float sub-type params from double to their declared precision.
@@ -2523,13 +2732,25 @@ a64_emit_func(fi) {
         // Implicit return 0 for functions without explicit return.
         out("  mov x0, #0"); putchar('\n');
 
-        // Epilogue.
+        // Epilogue. Centralized restore of spilled callee-saved regs.
         out(".Lret_"); a64_print_p(name_p); out(":"); putchar('\n');
-        out("  ldp x29, x30, [sp], #"); a64_print_dec(frame); putchar('\n');
+        auto _e_i, _e_n, _e_reg, _e_off;
+        _e_n = arr_len(a64_promoted_regs);
+        for (_e_i = 0; _e_i < _e_n; _e_i = _e_i + 1) {
+            _e_reg = arr_get(a64_promoted_regs, _e_i);
+            _e_off = a64_b3_spill_base + _e_i * 8;
+            out("  ldr x"); a64_print_dec(_e_reg); out(", [x29, #"); a64_print_dec(_e_off); out("]"); putchar('\n');
+        }
+        if (frame <= 504) {
+            out("  ldp x29, x30, [sp], #"); a64_print_dec(frame); putchar('\n');
+        } else {
+            out("  ldr x29, [sp]"); putchar('\n');
+            out("  ldr x30, [sp, #8]"); putchar('\n');
+            out("  add sp, sp, #"); a64_print_dec(frame); putchar('\n');
+        }
         out("  ret"); putchar('\n');
         putchar('\n');
     }
-    return 0;
 }
 
 // ── Per-module emission (for incremental compilation) ──────
@@ -2537,7 +2758,7 @@ a64_emit_func(fi) {
 // Initialize the encoder and global tables for per-module codegen.
 // Call once before the per-module loop. Populates globals and externs
 // from the parser so that all modules share the same data tables.
-a64_mod_init() {
+void a64_mod_init() {
     auto i, rec, name_p, idx, j;
     a64_sbuf = vbuf;
 
@@ -2576,13 +2797,12 @@ a64_mod_init() {
     arr_clear(a64_ex_name); arr_clear(a64_ex_ret);
     arr_clear(a64_ex_args); arr_clear(a64_ex_acnt);
 
-    return 0;
 }
 
 // Emit code for a single module. Functions accumulate in a64_fn_name
 // across calls. Cross-module calls emit type 4 relocations.
 // Returns the byte offset where this module's code starts in enc_buf.
-emit_module_arm64(mi) {
+void emit_module_arm64(mi) {
     auto fn_start, code_start, i, rec, name_p, idx, j;
 
     // Record where new functions will start in the accumulated table.
@@ -2665,7 +2885,7 @@ emit_module_arm64(mi) {
 // ── Top-level emission ─────────────────────────────────────
 
 // Run all ARM64 emission stages in order.
-emit_all_arm64() {
+void emit_all_arm64() {
     auto i, sp, ss, sl, j, ch, fp, fs, fl;
 
     bridge_data_arm64();
@@ -2768,5 +2988,4 @@ emit_all_arm64() {
         }
     }
 
-    return 0;
 }

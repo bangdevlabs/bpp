@@ -21,43 +21,51 @@ import "x64_enc.bsm";
 //   [ELF header 64B] [PHdr text 56B] [PHdr data 56B] [code] [pad] [data]
 
 // ── Constants ───────────────────────────────────────────────
+// Declared with `static extrn` because `static const` at file scope is
+// E230 today (docs/tonify_checklist.md Pitfall 1). Values are written
+// once from init_elf and treated as read-only everywhere else.
 
-extrn ELF_PAGE;         // 4096 (page size).
-extrn ELF_BASE;         // 0x400000 (text segment virtual base address).
-extrn ELF_HDRSZ;        // 64 (ELF header size).
-extrn ELF_PHSZ;         // 56 (program header entry size).
+static extrn ELF_PAGE;     // 4096 (page size).
+static extrn ELF_BASE;     // 0x400000 (text segment virtual base address).
+static extrn ELF_HDRSZ;    // 64 (ELF header size).
+static extrn ELF_PHSZ;     // 56 (program header entry size).
 
 // ── Output buffer ───────────────────────────────────────────
+// elf_buf holds the staging area written to disk at the end of
+// write_elf. Allocated once, reused across compilations.
 
-auto elf_buf;           // Output buffer (up to 16 MB).
-auto elf_pos;           // Current write position.
+static extrn elf_buf;      // Output buffer (up to 16 MB).
+static auto elf_pos;       // Current write position.
 
 // ── Computed layout values (set by elf_compute_layout) ──────
 
-auto elf_code_off;      // File offset where code begins (after headers).
-auto elf_text_filesz;   // Text segment file size (headers + code).
-auto elf_text_memsz;    // Text segment memory size (same as filesz).
-auto elf_data_off;      // File offset of data segment (page-aligned).
-auto elf_data_vaddr;    // Virtual address of data segment.
-auto elf_data_filesz;   // Data segment file size.
-auto elf_data_memsz;    // Data segment memory size.
-auto elf_entry;         // Entry point virtual address.
-auto elf_phnum;         // Number of program headers (1 or 2).
-auto elf_has_data;      // 1 if data segment is needed, 0 otherwise.
+static auto elf_code_off;     // File offset where code begins (after headers).
+static auto elf_text_filesz;  // Text segment file size (headers + code).
+static auto elf_text_memsz;   // Text segment memory size (same as filesz).
+static auto elf_data_off;     // File offset of data segment (page-aligned).
+static auto elf_data_vaddr;   // Virtual address of data segment.
+static auto elf_data_filesz;  // Data segment file size.
+static auto elf_data_memsz;   // Data segment memory size.
+static auto elf_entry;        // Entry point virtual address.
+static auto elf_phnum;        // Number of program headers (1 or 2).
+static auto elf_has_data;     // 1 if data segment is needed, 0 otherwise.
 
 // ── Float literal data ──────────────────────────────────────
+// Written by bpp.bpp before write_elf runs, so these stay public.
 
-auto elf_flt_data;      // Dynamic array: 8-byte IEEE 754 doubles.
+auto elf_flt_data;           // Dynamic array: 8-byte IEEE 754 doubles.
 
 // ── String literal data ─────────────────────────────────────
+// Same: bpp.bpp populates these as it walks the x64 codegen's string
+// table, then hands them off to write_elf.
 
-auto elf_sdata;         // Buffer holding all string bytes (concatenated, null-terminated).
-auto elf_sdata_size;    // Total bytes used in elf_sdata.
-auto elf_sdata_off;     // Dynamic array: string index -> byte offset within elf_sdata.
+extrn elf_sdata;             // Buffer holding all string bytes (concatenated, null-terminated).
+auto elf_sdata_size;         // Total bytes used in elf_sdata.
+auto elf_sdata_off;          // Dynamic array: string index -> byte offset within elf_sdata.
 
 // ── Initialization ──────────────────────────────────────────
 
-init_elf() {
+void init_elf() {
     ELF_PAGE  = 4096;
     ELF_BASE  = 0x400000;
     ELF_HDRSZ = 64;
@@ -70,74 +78,72 @@ init_elf() {
     elf_sdata     = malloc(1048576);
     elf_sdata_size = 0;
     elf_sdata_off = arr_new();
-
-    return 0;
 }
 
 // ── Write helpers ───────────────────────────────────────────
 
 // Write a single byte to the output buffer.
-elf_w8(v) {
+static void elf_w8(v) {
     poke(elf_buf + elf_pos, v & 0xFF);
     elf_pos = elf_pos + 1;
-    return 0;
 }
 
 // Write a 16-bit value in little-endian format.
-elf_w16(v) {
+static void elf_w16(v) {
     poke(elf_buf + elf_pos,     v & 0xFF);
     poke(elf_buf + elf_pos + 1, (v >> 8) & 0xFF);
     elf_pos = elf_pos + 2;
-    return 0;
 }
 
 // Write a 32-bit value in little-endian format.
-elf_w32(v) {
+static void elf_w32(v) {
     poke(elf_buf + elf_pos,     v & 0xFF);
     poke(elf_buf + elf_pos + 1, (v >> 8) & 0xFF);
     poke(elf_buf + elf_pos + 2, (v >> 16) & 0xFF);
     poke(elf_buf + elf_pos + 3, (v >> 24) & 0xFF);
     elf_pos = elf_pos + 4;
-    return 0;
 }
 
 // Write a 64-bit value in little-endian format.
-elf_w64(v) {
+static void elf_w64(v) {
     elf_w32(v & 0xFFFFFFFF);
     elf_w32((v >> 32) & 0xFFFFFFFF);
-    return 0;
 }
 
 // Write n zero bytes.
-elf_pad(n) {
+static void elf_pad(n) {
     auto i;
-    i = 0;
-    while (i < n) { poke(elf_buf + elf_pos, 0); elf_pos = elf_pos + 1; i = i + 1; }
-    return 0;
+    for (i = 0; i < n; i = i + 1) {
+        poke(elf_buf + elf_pos, 0);
+        elf_pos = elf_pos + 1;
+    }
 }
 
 // Pad with zeros until elf_pos is aligned to 'a' bytes.
-elf_align(a) {
-    while (elf_pos % a != 0) { poke(elf_buf + elf_pos, 0); elf_pos = elf_pos + 1; }
-    return 0;
+static void elf_align(a) {
+    while (elf_pos % a != 0) {
+        poke(elf_buf + elf_pos, 0);
+        elf_pos = elf_pos + 1;
+    }
 }
 
 // Write a C string literal into the buffer (from B++ string literal address).
-elf_wcstr(s, n) {
+static void elf_wcstr(s, n) {
     auto i;
-    i = 0;
-    while (i < n) { poke(elf_buf + elf_pos, str_peek(s, i)); elf_pos = elf_pos + 1; i = i + 1; }
-    return 0;
+    for (i = 0; i < n; i = i + 1) {
+        poke(elf_buf + elf_pos, str_peek(s, i));
+        elf_pos = elf_pos + 1;
+    }
 }
 
 // Round up 'v' to the next multiple of ELF_PAGE.
-elf_page_align(v) {
+static elf_page_align(v) : base {
     return (v + ELF_PAGE - 1) / ELF_PAGE * ELF_PAGE;
 }
 
 // ── ELF header (64 bytes) ───────────────────────────────────
 
-elf_write_header() {
+static void elf_write_header() {
     // e_ident (16 bytes)
     elf_w8(0x7F);                   // EI_MAG0
     elf_w8(0x45);                   // EI_MAG1 'E'
@@ -163,13 +169,11 @@ elf_write_header() {
     elf_w16(0);                     // e_shentsize
     elf_w16(0);                     // e_shnum
     elf_w16(0);                     // e_shstrndx: SHN_UNDEF
-
-    return 0;
 }
 
 // ── Program header (56 bytes) ───────────────────────────────
 
-elf_write_phdr(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) {
+static void elf_write_phdr(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) {
     elf_w32(p_type);                // p_type
     elf_w32(p_flags);               // p_flags
     elf_w64(p_offset);              // p_offset
@@ -178,7 +182,6 @@ elf_write_phdr(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) {
     elf_w64(p_filesz);              // p_filesz
     elf_w64(p_memsz);               // p_memsz
     elf_w64(p_align);               // p_align
-    return 0;
 }
 
 // ── Layout computation ──────────────────────────────────────
@@ -187,18 +190,17 @@ elf_write_phdr(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align) {
 // Must be called before writing any data.
 //   code_size:  number of bytes in the code buffer (x64_enc_pos)
 //   gl_count:   number of 8-byte global variable slots
-elf_compute_layout(code_size, gl_count) {
+static void elf_compute_layout(code_size, gl_count) {
     auto raw_data_size;
 
-    // Determine if a data segment is needed.
-    elf_has_data = 0;
-    if (gl_count > 0) { elf_has_data = 1; }
-    if (arr_len(elf_flt_data) > 0) { elf_has_data = 1; }
-    if (elf_sdata_size > 0) { elf_has_data = 1; }
+    // A data segment is only emitted when the program actually needs
+    // one — either it declares globals, uses a float literal, or holds
+    // a string literal. Programs with none of these get a single text
+    // segment and no second PT_LOAD.
+    elf_has_data = (gl_count > 0 || arr_len(elf_flt_data) > 0 || elf_sdata_size > 0) ? 1 : 0;
 
     // Number of program headers: text + data (if present).
-    elf_phnum = 1;
-    if (elf_has_data) { elf_phnum = 2; }
+    elf_phnum = elf_has_data ? 2 : 1;
 
     // Code starts immediately after the ELF header and all program headers.
     // ELF header = 64 bytes, each program header = 56 bytes.
@@ -224,8 +226,6 @@ elf_compute_layout(code_size, gl_count) {
         elf_data_filesz = 0;
         elf_data_memsz  = 0;
     }
-
-    return 0;
 }
 
 // ── Relocation resolution ───────────────────────────────────
@@ -240,17 +240,18 @@ elf_compute_layout(code_size, gl_count) {
 //
 // RIP-relative: disp32 = target_addr - (instruction_addr + 4)
 // where instruction_addr = ELF_BASE + elf_code_off + reloc_pos.
-elf_resolve_relocations(gl_names, gl_count) {
+static void elf_resolve_relocations(gl_names, gl_count) {
     auto i, pos, sym, ty;
     auto rip_addr, target_addr, disp;
     auto gl_idx, j, globals_end, floats_end;
+    auto rel_cnt;
 
     // Precompute section boundaries within the data segment.
     globals_end = elf_data_vaddr + gl_count * 8;
     floats_end  = globals_end + arr_len(elf_flt_data) * 8;
 
-    i = 0;
-    while (i < arr_len(x64_enc_rel_pos)) {
+    rel_cnt = arr_len(x64_enc_rel_pos);
+    for (i = 0; i < rel_cnt; i = i + 1) {
         pos = arr_get(x64_enc_rel_pos, i);
         sym = arr_get(x64_enc_rel_sym, i);
         ty  = arr_get(x64_enc_rel_ty,  i);
@@ -258,53 +259,44 @@ elf_resolve_relocations(gl_names, gl_count) {
         // Address of the byte after the disp32 field (where RIP points during execution).
         rip_addr = ELF_BASE + elf_code_off + pos + 4;
 
-        if (ty == 0) {
+        switch (ty) {
+        0 {
             // Global variable: find its index in the globals table by packed name.
-            gl_idx = -1;
-            j = 0;
-            while (j < gl_count) {
+            gl_idx = 0 - 1;
+            for (j = 0; j < gl_count; j = j + 1) {
                 if (elf_packed_eq(*(gl_names + j * 8), sym)) { gl_idx = j; }
-                j = j + 1;
             }
-            if (gl_idx >= 0) {
-                target_addr = elf_data_vaddr + gl_idx * 8;
-            } else {
-                target_addr = elf_data_vaddr;
-            }
+            target_addr = gl_idx >= 0 ? elf_data_vaddr + gl_idx * 8 : elf_data_vaddr;
         }
-        if (ty == 1) {
+        1 {
             // String literal: sym is the string index in elf_sdata_off.
             target_addr = floats_end + arr_get(elf_sdata_off, sym);
         }
-        if (ty == 2) {
+        2 {
             // Float literal: sym is the float index.
             target_addr = globals_end + sym * 8;
+        }
+        else { }
         }
 
         // Patch the disp32 field in the code buffer.
         disp = target_addr - rip_addr;
         x64_enc_patch32(pos, disp);
-
-        i = i + 1;
     }
-    return 0;
 }
 
 // Compare two packed string references for equality.
 // Each packed value has the string offset in the low 32 bits and length in the high 32 bits.
-elf_packed_eq(a, b) {
+static elf_packed_eq(a, b) : base {
     auto sa, la, sb, lb, i;
     // Sentinel values (-1 = argc, -2 = argv, -3 = envp) match only themselves.
     if (a == b) { return 1; }
-    if (a < 0) { return 0; }
-    if (b < 0) { return 0; }
+    if (a < 0 || b < 0) { return 0; }
     sa = unpack_s(a); la = unpack_l(a);
     sb = unpack_s(b); lb = unpack_l(b);
     if (la != lb) { return 0; }
-    i = 0;
-    while (i < la) {
+    for (i = 0; i < la; i = i + 1) {
         if (peek(vbuf + sa + i) != peek(vbuf + sb + i)) { return 0; }
-        i = i + 1;
     }
     return 1;
 }
@@ -317,7 +309,7 @@ elf_packed_eq(a, b) {
 //   main_label — label ID of the entry point function
 //   gl_names   — array of packed global variable names
 //   gl_count   — number of global variables
-write_elf(filename, main_label, gl_names, gl_count) {
+void write_elf(filename, main_label, gl_names, gl_count) {
     auto fd, written, code_size, main_code_off;
     auto i, flt_bits;
 
@@ -354,11 +346,9 @@ write_elf(filename, main_label, gl_names, gl_count) {
 
     // ── Write code section ──
     // Code starts right after program headers (no padding needed, elf_code_off is exact).
-    i = 0;
-    while (i < code_size) {
+    for (i = 0; i < code_size; i = i + 1) {
         poke(elf_buf + elf_pos, peek(x64_enc_buf + i));
         elf_pos = elf_pos + 1;
-        i = i + 1;
     }
 
     // ── Write data section ──
@@ -370,20 +360,18 @@ write_elf(filename, main_label, gl_names, gl_count) {
         elf_pad(gl_count * 8);
 
         // Write float literals as 8-byte IEEE 754 doubles.
-        i = 0;
-        while (i < arr_len(elf_flt_data)) {
+        auto flt_cnt;
+        flt_cnt = arr_len(elf_flt_data);
+        for (i = 0; i < flt_cnt; i = i + 1) {
             flt_bits = arr_get(elf_flt_data, i);
             elf_w32(flt_bits & 0xFFFFFFFF);
             elf_w32((flt_bits >> 32) & 0xFFFFFFFF);
-            i = i + 1;
         }
 
         // Write string literal data (raw bytes copied from elf_sdata).
-        i = 0;
-        while (i < elf_sdata_size) {
+        for (i = 0; i < elf_sdata_size; i = i + 1) {
             poke(elf_buf + elf_pos, peek(elf_sdata + i));
             elf_pos = elf_pos + 1;
-            i = i + 1;
         }
     }
 
@@ -398,6 +386,4 @@ write_elf(filename, main_label, gl_names, gl_count) {
     fd = sys_open(filename, 0x241);
     written = sys_write(fd, elf_buf, elf_pos);
     sys_close(fd);
-
-    return 0;
 }

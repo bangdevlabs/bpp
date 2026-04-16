@@ -150,20 +150,18 @@ void enc_movn(rd, imm16, hw) {
 // Load a 64-bit immediate into Xrd using MOVZ + MOVK sequence.
 // Handles up to 4 half-words. For val == -1, uses MOVN.
 void enc_mov_wide(rd, val) {
-    auto lo, hi;
+    auto lo, hi, hw;
     // Special case: -1 → MOVN Xd, #0.
     if (val == -1) { enc_movn(rd, 0, 0); return; }
     // Small positive: single MOVZ.
-    if (val >= 0) { if (val < 65536) { enc_movz(rd, val, 0); return; } }
+    if (val >= 0 && val < 65536) { enc_movz(rd, val, 0); return; }
     // General case: MOVZ lowest half-word, then MOVK non-zero higher halves.
     lo = val & 0xFFFF;
     enc_movz(rd, lo, 0);
-    hi = (val >> 16) & 0xFFFF;
-    if (hi > 0) { enc_movk(rd, hi, 1); }
-    hi = (val >> 32) & 0xFFFF;
-    if (hi > 0) { enc_movk(rd, hi, 2); }
-    hi = (val >> 48) & 0xFFFF;
-    if (hi > 0) { enc_movk(rd, hi, 3); }
+    for (hw = 1; hw <= 3; hw = hw + 1) {
+        hi = (val >> (hw * 16)) & 0xFFFF;
+        if (hi > 0) { enc_movk(rd, hi, hw); }
+    }
 }
 
 // ── Register-register ALU ────────────────────────────────
@@ -447,328 +445,282 @@ void enc_b_cond(cond, off) {
 // record a fixup to be patched by enc_resolve_fixups().
 
 // B to label.
-enc_b_label(lbl) {
+void enc_b_label(lbl) {
     auto target;
     target = arr_get(enc_lbl_off, lbl);
-    if (target >= 0) { enc_b(target - enc_pos); return 0; }
+    if (target >= 0) { enc_b(target - enc_pos); return; }
     enc_add_fixup(lbl, 0);
     enc_emit32(0x14000000);
-    return 0;
 }
 
 // BL to label (call to a B++ function whose code offset is known).
-enc_bl_label(lbl) {
+void enc_bl_label(lbl) {
     auto target;
     target = arr_get(enc_lbl_off, lbl);
-    if (target >= 0) { enc_bl(target - enc_pos); return 0; }
+    if (target >= 0) { enc_bl(target - enc_pos); return; }
     enc_add_fixup(lbl, 0);
     enc_emit32(0x94000000);
-    return 0;
 }
 
 // CBZ Xt, label.
-enc_cbz_label(rt, lbl) {
+void enc_cbz_label(rt, lbl) {
     auto target;
     target = arr_get(enc_lbl_off, lbl);
-    if (target >= 0) { enc_cbz(rt, target - enc_pos); return 0; }
+    if (target >= 0) { enc_cbz(rt, target - enc_pos); return; }
     enc_add_fixup(lbl, 1);
     enc_emit32(0xB4000000 | rt);
-    return 0;
 }
 
 // CBNZ Xt, label.
-enc_cbnz_label(rt, lbl) {
+void enc_cbnz_label(rt, lbl) {
     auto target;
     target = arr_get(enc_lbl_off, lbl);
-    if (target >= 0) { enc_cbnz(rt, target - enc_pos); return 0; }
+    if (target >= 0) { enc_cbnz(rt, target - enc_pos); return; }
     enc_add_fixup(lbl, 1);
     enc_emit32(0xB5000000 | rt);
-    return 0;
 }
 
 // B.cond label.
-enc_b_cond_label(cond, lbl) {
+void enc_b_cond_label(cond, lbl) {
     auto target;
     target = arr_get(enc_lbl_off, lbl);
-    if (target >= 0) { enc_b_cond(cond, target - enc_pos); return 0; }
+    if (target >= 0) { enc_b_cond(cond, target - enc_pos); return; }
     enc_add_fixup(lbl, 2);
     enc_emit32(0x54000000 | cond);
-    return 0;
 }
 
 // ── System instructions ──────────────────────────────────
 
 // BLR Xn — branch with link to address in register (indirect call).
-enc_blr(rn) {
+void enc_blr(rn) {
     enc_emit32(0xD63F0000 | (rn << 5));
-    return 0;
 }
 
 // BR Xn — branch to address in register (indirect jump, no link).
 // Used by jump tables: load target address, branch to it without
 // saving return address. Complement to BLR for dispatch-style code.
-enc_br(rn) {
+void enc_br(rn) {
     enc_emit32(0xD61F0000 | (rn << 5));
-    return 0;
 }
 
 // RET — return to address in x30.
-enc_ret() {
+void enc_ret() {
     enc_emit32(0xD65F03C0);
-    return 0;
 }
 
 // SVC #imm16 — supervisor call (syscall trap). macOS uses SVC #0x80.
-enc_svc(imm16) {
+void enc_svc(imm16) {
     enc_emit32(0xD4000001 | (imm16 << 5));
-    return 0;
 }
 
 // BRK #imm16 — breakpoint for debugger tracing.
-enc_brk(imm16) {
+void enc_brk(imm16) {
     enc_emit32(0xD4200000 | ((imm16 & 0xFFFF) << 5));
-    return 0;
 }
 
 // NOP — no operation.
-enc_nop() {
+void enc_nop() {
     enc_emit32(0xD503201F);
-    return 0;
 }
 
 // ── Float arithmetic ─────────────────────────────────────
 
 // FADD Dd, Dn, Dm
-enc_fadd(rd, rn, rm) {
+void enc_fadd(rd, rn, rm) {
     enc_emit32(0x1E602800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FSUB Dd, Dn, Dm
-enc_fsub(rd, rn, rm) {
+void enc_fsub(rd, rn, rm) {
     enc_emit32(0x1E603800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FMUL Dd, Dn, Dm
-enc_fmul(rd, rn, rm) {
+void enc_fmul(rd, rn, rm) {
     enc_emit32(0x1E600800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FDIV Dd, Dn, Dm
-enc_fdiv(rd, rn, rm) {
+void enc_fdiv(rd, rn, rm) {
     enc_emit32(0x1E601800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FCMP Dn, Dm — compare two doubles, set NZCV flags.
-enc_fcmp(rn, rm) {
+void enc_fcmp(rn, rm) {
     enc_emit32(0x1E602000 | (rm << 16) | (rn << 5));
-    return 0;
 }
 
 // FCMP Dn, #0.0 — compare double against zero.
-enc_fcmp_zero(rn) {
+void enc_fcmp_zero(rn) {
     enc_emit32(0x1E602008 | (rn << 5));
-    return 0;
 }
 
 // FMOV Dd, Dn — copy between float registers.
-enc_fmov(rd, rn) {
+void enc_fmov(rd, rn) {
     enc_emit32(0x1E604000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FNEG Dd, Dn — negate a double.
-enc_fneg(rd, rn) {
+void enc_fneg(rd, rn) {
     enc_emit32(0x1E614000 | (rn << 5) | rd);
-    return 0;
 }
 
 // ── Single-precision float arithmetic (32-bit, s-register) ──
 
 // FADD Sd, Sn, Sm — add two single-precision floats.
-enc_fadd_s(rd, rn, rm) {
+void enc_fadd_s(rd, rn, rm) {
     enc_emit32(0x1E202800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FSUB Sd, Sn, Sm — subtract two single-precision floats.
-enc_fsub_s(rd, rn, rm) {
+void enc_fsub_s(rd, rn, rm) {
     enc_emit32(0x1E203800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FMUL Sd, Sn, Sm — multiply two single-precision floats.
-enc_fmul_s(rd, rn, rm) {
+void enc_fmul_s(rd, rn, rm) {
     enc_emit32(0x1E200800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FDIV Sd, Sn, Sm — divide two single-precision floats.
-enc_fdiv_s(rd, rn, rm) {
+void enc_fdiv_s(rd, rn, rm) {
     enc_emit32(0x1E201800 | (rm << 16) | (rn << 5) | rd);
-    return 0;
 }
 
 // FCMP Sn, Sm — compare two single-precision floats, set NZCV flags.
-enc_fcmp_s(rn, rm) {
+void enc_fcmp_s(rn, rm) {
     enc_emit32(0x1E202000 | (rm << 16) | (rn << 5));
-    return 0;
 }
 
 // FCMP Sn, #0.0 — compare single-precision float against zero.
-enc_fcmp_s_zero(rn) {
+void enc_fcmp_s_zero(rn) {
     enc_emit32(0x1E202008 | (rn << 5));
-    return 0;
 }
 
 // FNEG Sd, Sn — negate a single-precision float.
-enc_fneg_s(rd, rn) {
+void enc_fneg_s(rd, rn) {
     enc_emit32(0x1E214000 | (rn << 5) | rd);
-    return 0;
 }
 
 // ── Float/integer conversion ─────────────────────────────
 
 // SCVTF Dd, Xn — convert signed 64-bit integer to double.
-enc_scvtf(rd, rn) {
+void enc_scvtf(rd, rn) {
     enc_emit32(0x9E620000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FCVTZS Xd, Dn — convert double to signed 64-bit integer (round toward zero).
-enc_fcvtzs(rd, rn) {
+void enc_fcvtzs(rd, rn) {
     enc_emit32(0x9E780000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FMOV Xd, Dn — bit-transfer from float register to general-purpose register.
-enc_fmov_to_gpr(rd, rn) {
+void enc_fmov_to_gpr(rd, rn) {
     enc_emit32(0x9E660000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FMOV Dd, Xn — bit-transfer from general-purpose register to float register.
-enc_fmov_from_gpr(rd, rn) {
+void enc_fmov_from_gpr(rd, rn) {
     enc_emit32(0x9E670000 | (rn << 5) | rd);
-    return 0;
 }
 
 // ── Single-precision float/integer conversion ────────────
 
 // SCVTF Sd, Xn — convert signed 64-bit integer to single-precision float.
-enc_scvtf_s(rd, rn) {
+void enc_scvtf_s(rd, rn) {
     enc_emit32(0x9E220000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FCVTZS Xd, Sn — convert single-precision float to signed 64-bit integer.
-enc_fcvtzs_s(rd, rn) {
+void enc_fcvtzs_s(rd, rn) {
     enc_emit32(0x9E380000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FCVT Dd, Sn — convert single-precision to double-precision.
-enc_fcvt_d_s(rd, rn) {
+void enc_fcvt_d_s(rd, rn) {
     enc_emit32(0x1E22C000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FCVT Sd, Dn — convert double-precision to single-precision.
-enc_fcvt_s_d(rd, rn) {
+void enc_fcvt_s_d(rd, rn) {
     enc_emit32(0x1E624000 | (rn << 5) | rd);
-    return 0;
 }
 
 // ── Half-precision float conversion (FEAT_FP16, Apple M1+) ──
 
 // FCVT Dd, Hn — convert half-precision to double-precision.
-enc_fcvt_d_h(rd, rn) {
+void enc_fcvt_d_h(rd, rn) {
     enc_emit32(0x1EE2C000 | (rn << 5) | rd);
-    return 0;
 }
 
 // FCVT Hd, Dn — convert double-precision to half-precision.
-enc_fcvt_h_d(rd, rn) {
+void enc_fcvt_h_d(rd, rn) {
     enc_emit32(0x1E63C000 | (rn << 5) | rd);
-    return 0;
 }
 
 // ── Float load/store (unsigned offset) ───────────────────
 
 // LDR Dt, [Xn, #uoff]. Offset in bytes, must be a multiple of 8.
-enc_ldr_d_uoff(rt, rn, uoff) {
+void enc_ldr_d_uoff(rt, rn, uoff) {
     enc_emit32(0xFD400000 | ((uoff / 8) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // STR Dt, [Xn, #uoff]. Offset in bytes, must be a multiple of 8.
-enc_str_d_uoff(rt, rn, uoff) {
+void enc_str_d_uoff(rt, rn, uoff) {
     enc_emit32(0xFD000000 | ((uoff / 8) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // ── Single-precision float load/store (32-bit, s-register) ──
 
 // LDR St, [Xn, #uoff]. Offset in bytes, must be a multiple of 4.
-enc_ldr_s_uoff(rt, rn, uoff) {
+void enc_ldr_s_uoff(rt, rn, uoff) {
     enc_emit32(0xBD400000 | ((uoff / 4) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // STR St, [Xn, #uoff]. Offset in bytes, must be a multiple of 4.
-enc_str_s_uoff(rt, rn, uoff) {
+void enc_str_s_uoff(rt, rn, uoff) {
     enc_emit32(0xBD000000 | ((uoff / 4) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // STR St, [Xn, #simm9]! — pre-index store for s-register push.
-enc_str_s_pre(rt, rn, simm) {
+void enc_str_s_pre(rt, rn, simm) {
     enc_emit32(0xBC000C00 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
-    return 0;
 }
 
 // LDR St, [Xn], #simm9 — post-index load for s-register pop.
-enc_ldr_s_post(rt, rn, simm) {
+void enc_ldr_s_post(rt, rn, simm) {
     enc_emit32(0xBC400400 | ((simm & 0x1FF) << 12) | (rn << 5) | rt);
-    return 0;
 }
 
 // ── Half-precision float load/store (16-bit, h-register) ────
 
 // LDR Ht, [Xn, #uoff]. Offset in bytes, must be a multiple of 2.
-enc_ldr_h_uoff(rt, rn, uoff) {
+void enc_ldr_h_uoff(rt, rn, uoff) {
     enc_emit32(0x7D400000 | ((uoff / 2) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // STR Ht, [Xn, #uoff]. Offset in bytes, must be a multiple of 2.
-enc_str_h_uoff(rt, rn, uoff) {
+void enc_str_h_uoff(rt, rn, uoff) {
     enc_emit32(0x7D000000 | ((uoff / 2) << 10) | (rn << 5) | rt);
-    return 0;
 }
 
 // LDR Xt, [Xn, Xm, LSL #3] — load 8 bytes using scaled register offset.
 // The shift #3 multiplies Xm by 8, making it ideal for 64-bit array indexing.
-enc_ldr_reg_shift3(rt, rn, rm) {
+void enc_ldr_reg_shift3(rt, rn, rm) {
     enc_emit32(0xF8607800 | (rm << 16) | (rn << 5) | rt);
-    return 0;
 }
 
 // ── PC-relative addressing ───────────────────────────────
 
 // ADRP Xd, 0 — emit with zero page offset; actual value set by relocation.
-enc_adrp(rd) {
+void enc_adrp(rd) {
     enc_emit32(0x90000000 | rd);
-    return 0;
 }
 
 // ADR Xd, label — emit PC-relative address with auto fixup.
 // Encodes a 21-bit signed byte offset from PC to the label.
 // If the label is not yet defined, records a fixup (type 3).
-enc_adr_label(rd, lbl) {
+void enc_adr_label(rd, lbl) {
     auto target, off, immlo, immhi;
     target = arr_get(enc_lbl_off, lbl);
     if (target >= 0) {
@@ -776,43 +728,42 @@ enc_adr_label(rd, lbl) {
         immlo = off & 3;
         immhi = (off >> 2) & 0x7FFFF;
         enc_emit32(0x10000000 | (immlo << 29) | (immhi << 5) | rd);
-        return 0;
+        return;
     }
     enc_add_fixup(lbl, 3);
     enc_emit32(0x10000000 | rd);
-    return 0;
 }
 
 // ── Fixup resolution ─────────────────────────────────────
 
 // Patch all recorded branch fixups. Call after all code has been emitted.
-enc_resolve_fixups() {
+void enc_resolve_fixups() {
     auto i, pos, lbl, ty, target, off, ins;
-    i = 0;
-    while (i < enc_fix_cnt) {
+    for (i = 0; i < enc_fix_cnt; i = i + 1) {
         pos    = arr_get(enc_fix_pos, i);
         lbl    = arr_get(enc_fix_lbl, i);
         ty     = arr_get(enc_fix_ty, i);
         target = arr_get(enc_lbl_off, lbl);
         off    = (target - pos) / 4;
         ins    = enc_read32(pos);
-        if (ty == 0) {
+        switch (ty) {
+        0 {
             // B or BL: replace imm26 field at [25:0].
             ins = (ins & 0xFC000000) | (off & 0x3FFFFFF);
         }
-        if (ty == 1 | ty == 2) {
+        1, 2 {
             // CBZ/CBNZ or B.cond: replace imm19 field at [23:5].
             ins = (ins & 0xFF00001F) | ((off & 0x7FFFF) << 5);
         }
-        if (ty == 3) {
+        3 {
             // ADR: replace immlo [30:29] and immhi [23:5].
             // off is in bytes (not divided by 4 for ADR).
             off = target - pos;
             ins = ins & 0x9F00001F;
             ins = ins | ((off & 3) << 29) | (((off >> 2) & 0x7FFFF) << 5);
         }
+        else { }
+        }
         enc_patch32(pos, ins);
-        i = i + 1;
     }
-    return 0;
 }

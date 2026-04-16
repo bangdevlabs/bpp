@@ -425,6 +425,62 @@ Fix 1 (mod0_real_start) and Fix 1b (dedup refinement) are already done.
 
 These items are important but don't sit on the direct path to 1.0. They land opportunistically or in a cleanup pass after 1.0 ships.
 
+### x86_64 perf parity — B1 freelist + B2 inline
+
+ARM64 has the full Mini Cooper Phase B stack (B1 Sethi-Ullman + freelist,
+B2 inline of tiny `: base` helpers, B3 hot locals in callee-saved regs).
+x86_64 currently carries only B3 — B1 and B2 were deliberately skipped
+on Linux to restore self-host after a bisect-confirmed regression.
+
+**What Linux has today**
+- Pre-B1 push/pop for T_BINOP / T_MEMST intermediate saves (the 6a3f71a
+  baseline, no r10/r11 freelist).
+- B2 inline path deliberately skipped in `x64_emit_node` T_CALL (regular
+  BL path for every call).
+- B3 promoting up to three hot locals per function to rbx / r14 / r15.
+
+**Why the gap exists**
+Phase B1 reorganized `x64_emit_node` T_BINOP / T_MEMST around the new
+`_x64_has_call` walker plus freelist save/restore. The B1 emission
+passes ARM64 bootstrap and cross-compiles user programs correctly, but
+when the **compiler itself** is cross-compiled to Linux with B1 active,
+the resulting `bpp` segfaults on every self-host invocation. Bisect
+proved the trigger is in the B1 x64 reorganization: reverting ONLY
+`x64_codegen.bsm` to 6a3f71a while keeping every other B1 change intact
+restores Linux self-host.
+
+Narrower probes that did NOT locate the trigger:
+- Forcing `alloc_reg = -1` (freelist never used) still crashes.
+- Moving inline `auto alloc_reg, val_reg` declarations to the top of
+  their functions still crashes.
+- Reverting `_x64_has_call` to always return 1 makes small programs
+  compile but `bpp` self-host still crashes.
+- Disabling the B2 inline call site in x86_64 while keeping the rest
+  of B1 restored the regression, so B2 on Linux is parked for now too.
+
+The bug is almost certainly in how the 6a3f71a-era `x64_emit_func`
+emits x86_64 code for B1's added shapes (recursive `_x64_has_call`,
+deep T_BINOP trees with freelist save, or some interaction between the
+two). Needs fresh eyes — probably with the Linux-native debugger
+landing below so we can break on the first corrupt instruction instead
+of guessing from Rosetta-translated strace output.
+
+**Impact**
+- Linux build of `bpp` runs at pre-B1 speed (~37% slower self-compile
+  than macOS ARM64 in the reference measurement).
+- User programs cross-compiled from macOS to Linux miss the x86_64
+  freelist optimization but still benefit from Sethi-Ullman annotation
+  (emitted inert) and B3 hot-local promotion.
+- No correctness impact — emitted code is valid x86_64, just not as
+  tight as it could be.
+
+**Unblock path**
+1. Land `bug` Linux/x86_64 support (gdbserver backend) so we can
+   single-step through a self-host crash.
+2. Restore B1 x64 changes one hunk at a time with the debugger open,
+   diffing instruction bytes against ARM64's emission.
+3. Fix the offending emission path; re-enable B2 inline on x86_64.
+
 ### ELF Dynamic Linking
 
 B++'s x86_64 backend produces only static ELF binaries. To use any shared library on Linux (raylib, libpng, libsqlite, **libvulkan**, **libasound for ALSA**), the ELF writer needs PLT/GOT, `DT_NEEDED`, `PT_INTERP`, dlopen/dlsym builtins. This unlocks:
