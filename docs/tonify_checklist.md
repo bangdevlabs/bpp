@@ -79,7 +79,7 @@ Bare `return;` (no expression) is supported in B++ and produces an implicit
 `return 0`. Use it in `void` functions for early-exit guards instead of
 the misleading `return 0;`.
 
-## Rule 4: Phase annotations (`: base` / `: solo`)
+## Rule 4: Phase annotations (`: base` / `: solo` / `: realtime` / `: io` / `: gpu`)
 
 For functions where the intent is clear:
 
@@ -87,11 +87,45 @@ For functions where the intent is clear:
 |---------|--------|
 | Pure function: reads args, computes, returns value. No global writes. | Add `: base` |
 | Side-effect function: writes globals, calls impure functions | Add `: solo` (optional — compiler infers) |
+| Audio callback / realtime path: no malloc, no IO, bounded time | Add `: realtime` |
+| Touches files / network / stdout / syscalls | Add `: io` |
+| Touches GPU resources (calls `_stb_gpu_*`) | Add `: gpu` |
 | Unclear / mixed | Leave unannotated (compiler auto-classifies) |
 
 **Only annotate when the intent is OBVIOUS.** Don't guess. The compiler classifies automatically for unannotated functions.
 
 **WARNING: do NOT mark `: base` on functions that call builtins** (malloc, free, putchar, str_peek, envp_get, sys_*, etc.). The classifier treats ALL builtins as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len, etc.). W013 will catch mistakes — trust it.
+
+**Effect annotations form a strict-to-loose ladder:**
+
+```
+realtime  (most strict — can only call base or other realtime)
+   ↓
+io / gpu  (sibling categories — can call base or own kind)
+   ↓
+base      (pure, callable by everyone)
+   ↓
+solo      (catch-all — most permissive, can call anything)
+```
+
+The killer use case: an audio callback annotated `: realtime` is verified
+by the compiler to never call `malloc`, `putchar`, or anything `: io` /
+`: gpu` — eliminating an entire class of audible glitches by proof
+rather than testing.
+
+**Status (2026-04-16):** parser accepts all five (Level 4 sub-step A
+landed). Propagation + enforcement (sub-steps B + C) shipping next —
+until then `: realtime` / `: io` / `: gpu` are inert documentation.
+Apply them now anyway: they document intent that won't drift, and the
+sweep that lands them survives sub-step C without source churn.
+
+| Module category | Suggested effect annotation |
+|---|---|
+| `_stb_gpu_*` primitives, `render_*`, `sprite_*`, `tile_draw` | `: gpu` |
+| `*_load`, `audio_*`, `_stb_audio_tone_*`, `_stb_init_window` | `: io` |
+| Audio callbacks (e.g. `_aud_square_cb`) | `: realtime` |
+| Pure helpers (math, string, array, hash) | `: base` |
+| Game `init` / `update` / orchestrator `main` | leave unannotated (`: solo` inferred) |
 
 ## Rule 5: Control flow (`continue` + `for` + `switch`)
 

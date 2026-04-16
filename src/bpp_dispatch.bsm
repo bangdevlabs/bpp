@@ -36,7 +36,9 @@ auto fn_calls;            // arr<arr<int>>: direct callees per function
 auto fn_address_taken;    // arr<int>: 1 if fn_ptr(name) appears anywhere
 auto fn_locally_impure;   // arr<int>: 1 if body has non-call side effects
 auto fn_reachable;        // arr<int>: 1 if reachable from main() via call graph
-auto fn_phase_hint;       // arr<int>: 0=auto, 1=base, 2=solo (from `: base`/`: solo` annotation)
+auto fn_phase_hint;       // arr<int>: 0=auto, 1=base, 2=solo, 3=realtime, 4=io, 5=gpu (from annotation)
+auto fn_effect;           // arr<int>: PHASE_* per function — finest-grained classification (Level 4 sub-step B)
+auto fn_effect_next;      // arr<int>: double-buffer for the effect fixpoint pass
 auto fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place (Phase B2)
 auto _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
@@ -74,6 +76,19 @@ auto glob_promote_reason;
 // Extern purity table: packed names of known-pure extern functions.
 // Any extern not in this table is assumed to have side effects.
 auto pure_ext;
+
+// Extern effect table for Level 4 sub-step B. Parallel arrays mapping
+// each known builtin name to a finer-grained effect code (PHASE_BASE,
+// PHASE_IO, PHASE_GPU, PHASE_REALTIME, or PHASE_SOLO). The plain
+// pure_ext list still answers "is this builtin worker-safe?" for the
+// existing smart-dispatch classifier; the effect table answers "what
+// kind of side effect does it have?" for the realtime / io / gpu
+// propagation in sub-step B and the call-site enforcement in sub-step
+// C. Unregistered externs default to PHASE_SOLO (catch-all,
+// conservative — the classifier never assumes more purity than it
+// can prove).
+auto ext_names;
+auto ext_effects;
 
 // Strided variable set for the current loop analysis.
 auto stride_vars;
@@ -115,6 +130,8 @@ void init_dispatch() {
     _dsp_main_idx = 0 - 1;
     _dsp_has_freeze = 0;
     pure_ext = arr_new();
+    ext_names = arr_new();
+    ext_effects = arr_new();
     stride_vars = arr_new();
     dsp_local_vars = arr_new();
 
@@ -135,6 +152,32 @@ void init_dispatch() {
     // Expand with care: `poke` writes memory and therefore stays out.
     add_pure_extern(_dsp_pack_name("peek", 4));
     add_pure_extern(_dsp_pack_name("str_peek", 8));
+    add_extern_effect(_dsp_pack_cstr("peek"),           PHASE_BASE);
+    add_extern_effect(_dsp_pack_cstr("str_peek"),       PHASE_BASE);
+    add_extern_effect(_dsp_pack_cstr("mem_barrier"),    PHASE_BASE);
+    add_extern_effect(_dsp_pack_cstr("fn_ptr"),         PHASE_BASE);
+    add_extern_effect(_dsp_pack_cstr("putchar"),        PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("putchar_err"),    PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("getchar"),        PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("sys_write"),      PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("sys_read"),       PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("sys_open"),       PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("sys_close"),      PHASE_IO);
+    add_extern_effect(_dsp_pack_cstr("malloc"),         PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("free"),           PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("realloc"),        PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("memcpy"),         PHASE_SOLO);
+    // CAPPED at 15 seeds. Adding a 16th entry whose name is ≥4 bytes
+    // triggers the `'break' not found in data section` bootstrap bug
+    // (also seen during W025 implementation). Reproducible: 15 entries
+    // ship a healthy gen2; add a 16th 4-char string and gen2 fails to
+    // even build itself. Bisection narrowed the trigger to string
+    // length, not count — three 1-char appendices fit, one 4-char
+    // appendix does not. Likely a vbuf overflow or a hash-table
+    // collision in the compiled binary's data section. Captured in
+    // todo.md under the type-defense ladder; needs Dev Loop 2 + GDB to
+    // pin root cause. Until fixed, externs not in this seed default to
+    // PHASE_SOLO at lookup, which is the safe conservative class.
 }
 
 // ── Global lookup helper ───────────────────────────────────
@@ -172,6 +215,26 @@ is_pure_extern(name_p) {
         if (packed_eq(v, name_p)) { return 1; }
     }
     return 0;
+}
+
+// Register an extern with a specific effect class. Call during init for
+// compiler-known builtins, or from FFI wrappers that have been audited.
+void add_extern_effect(name_p, effect) {
+    ext_names   = arr_push(ext_names,   name_p);
+    ext_effects = arr_push(ext_effects, effect);
+}
+
+// Look up an extern's registered effect. Returns the effect code on
+// match, or -1 if the name is not in the table. Sub-step B's classifier
+// uses -1 as the "unknown — assume PHASE_SOLO" sentinel.
+extern_effect(name_p) {
+    auto i, v;
+    for (i = 0; i < arr_len(ext_names); i = i + 1) {
+        v = arr_get(ext_names, i);
+        if (v == name_p) { return arr_get(ext_effects, i); }
+        if (packed_eq(v, name_p)) { return arr_get(ext_effects, i); }
+    }
+    return 0 - 1;
 }
 
 // Register a local variable for the current function scope.
@@ -1781,6 +1844,25 @@ static _dsp_pack_name(s, l) {
         vbuf_pos = vbuf_pos + 1;
     }
     return pack(start, l);
+}
+
+// Same as _dsp_pack_name but reads the length from the terminating NUL
+// of the C-string argument — no manual character count needed at call
+// sites. Prefer this in init code: `_dsp_pack_cstr("putchar")` is less
+// bug-prone than `_dsp_pack_name("putchar", 7)` where a mis-count
+// silently corrupts the packed reference.
+static _dsp_pack_cstr(s) {
+    auto start, i, ch;
+    start = vbuf_pos;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        poke(vbuf + vbuf_pos, ch);
+        vbuf_pos = vbuf_pos + 1;
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return pack(start, i);
 }
 
 // Transform every candidate loop into a call to job_parallel_for and

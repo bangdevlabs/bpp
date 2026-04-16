@@ -181,18 +181,39 @@ note below; for now Rule 13 is enforced by code review.
 **Where:** `src/bpp_validate.bsm`, function-level pass over non-static
 functions.
 
-**Status (2026-04-16):** A first-cut implementation introduced a
-parameter-name-tracking helper (`_val_params` array, `_val_remember_param`,
-`_val_is_param`, `_val_w025_check`) and a check inside the T_BINOP
-handler. The helpers themselves caused a 1-cycle bootstrap oscillation
-and, when the diag_help message was added, the gen2 binary failed with
-"internal error: global 'break' not found in data section" — a codegen
-issue that surfaces only when the new validator code is compiled by
-the previous-generation `bpp`. Bisection narrowed the trigger to the
-specific combination of helpers + T_BINOP wiring + a long help string,
-but root cause is not pinned. Shelved for a dedicated debugging
-session. Rule 13 still ships as documented convention; W025 is
-tracked here.
+**Status (2026-04-16 — updated after Level 4 sub-step B bisect):**
+
+A first-cut W025 implementation introduced a parameter-name-tracking
+helper (`_val_params` array, `_val_remember_param`, `_val_is_param`,
+`_val_w025_check`) plus a check inside the T_BINOP handler. The
+helpers alone caused a 1-cycle bootstrap oscillation; adding the
+`diag_help` message tipped it into a hard failure:
+`internal error: global 'break' not found in data section` during
+gen2's self-compile.
+
+**Same failure mode later reproduced during Level 4 sub-step B** when
+seeding the builtin effect table. 15 long `add_extern_effect` calls
+work; adding a 16th whose name is ≥4 bytes breaks identically. 15
+long + a 1/2/3-char 16th works. Threshold looks like ~125 cumulative
+vbuf bytes written during `init_dispatch`.
+
+**Unified diagnosis.** Both regressions produce the identical error
+text, both manifest as the macho relocation resolver failing to find
+"break" in the globals table. The cause must be: parser or codegen
+is synthesizing a relocation with symbol "break" that was never
+declared. Most likely: lexer fails to recognize the `break` keyword
+under some state, treats it as T_VAR, codegen emits a global-load
+relocation, link fails. The triggering state looks tied to either
+vbuf byte-count crossing a threshold OR a fixed-size compiler table
+overflowing in a way that corrupts downstream lexing.
+
+**Root cause not pinned without single-step runtime debugger.**
+Ship Dev Loop 2 (`bug --break`), use it to observe gen1 as it
+compiles source, capture the moment `break` tokenization goes wrong.
+Both W025 and the 16-seed cap fall to the same investigation.
+
+Rule 13 still ships as documented convention; W025 code sits out
+until debugger lands.
 
 ### Files touched (Level 2)
 

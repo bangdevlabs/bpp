@@ -49,35 +49,95 @@ about the language it was written in.
 
 ## Active — in commit order
 
-### 0. Type defense ladder — finish what's open
+### 0. Three blocked bugs — unblock via Dev Loop 2 first
+
+Strategic pivot on 2026-04-16: three distinct bugs surfaced this
+sprint, all blocked by the same missing tool (single-step runtime
+debugger). Instead of debugging them blind with printf archaeology,
+ship Dev Loop 2 next, then debug all three in one sprint.
+
+**Bug #1 — W025 bootstrap regression.** First-cut implementation of
+the Rule 13 compiler nudge caused the gen1 binary to fail with
+`internal error: global 'break' not found in data section` during
+its own self-compile. Bisection narrowed the trigger to the
+combination `_val_w025_check` body + `_val_show_context_at` call +
+`diag_help` long string. Root cause unknown.
+
+**Bug #2 — init_dispatch 16-seed threshold.** Same failure mode:
+adding a 16th `add_extern_effect` call in `init_dispatch` where the
+new string's length is ≥4 bytes causes gen1 to fail with
+`'break' not found in data section`. Bisection: 15 long strings work;
+15 long + 16th short (1-3 bytes) works; 15 long + 16th of 4+ bytes
+breaks. Threshold looks like cumulative vbuf bytes written during
+init crossing ~125.
+
+**Bugs #1 and #2 share the same root.** Both produce identical
+symptom text. The fix for one will likely fix the other. Both manifest
+as: parser or codegen synthesizes a relocation to a symbol named
+"break" that was never declared as a global. Likely cause: lexer fails
+to recognize `break` keyword under some internal-state condition,
+treats it as T_VAR, codegen emits a global reference, link fails.
+
+**Bug #3 — diagnostic line numbers off by ~365.** During W025
+debugging, the compiler reported an error at `bpp_parser.bsm:1540` but
+the actual offending `switch (c0) {` is at line 1905. Off by 365 is
+consistent with a fixed offset miscalculation (possibly
+`mod0_real_start` not applied when computing the diagnostic's
+line-relative position). Affects every error message from the parser
+on module 0. Real bug, tracked for the same Dev Loop 2 debug session.
+
+### 1. Dev Loop 2 — `bug` runtime observe + `--break` flag
+
+Moved up the priority stack. The existing `bug` binary has:
+- `.bug` file format with symbol map, struct layouts, address map
+- GDB remote protocol client in `bug_gdb.bsm` that speaks `Z0`/`z0`
+  (set/clear software breakpoint), `c` (continue), `s` (step),
+  register reads, memory reads
+- debugserver spawn and attach on macOS
+- Call-tree auto-trace mode (sets breakpoints at every function entry)
+
+What's missing for unblocking bugs #1-3:
+- **Observe-program mode** — `bug <program> [args]` currently prints
+  "TODO". Need to wire the existing infrastructure to actually launch
+  and observe. ~100 LOC.
+- **`--break name` CLI flag** — stop at entry of named function.
+  ~80 LOC argv parsing + address lookup + `gdb_set_bp` call.
+- **`--break name:line` source-line form** — needs `source_pos` in
+  the .bug file (today hardcoded to 0) populated from the parser's
+  `FN_SRC_TOK`. Then address lookup resolves `(file, line)` → function
+  index → byte address via existing maps. ~60 LOC + ~30 LOC in
+  `bpp_bug.bsm`.
+- **Reuse `diag_loc` / `diag_file_line_starts`** from `bpp_diag.bsm`
+  for the tok → line conversion — do NOT hand-roll. The multi-error
+  log already owns this mapping.
+
+MVP total: ~300-400 LOC. Ships as its own sprint. After it ships,
+bugs #1-3 debug in one session.
+
+### 2. Type defense ladder — finish what's open (after Dev Loop 2)
 
 In flight from the 2026-04-16 sprint (`docs/type_defense_plan.md`).
-Levels 1 and 2-partial are shipped; pieces below are tracked here.
+Levels 1 shipped; 2-partial and 4-partial sit behind the three bugs
+above. Pieces listed below unblock after bugs #1-2 are fixed.
 
-- **W025 — Rule 13 compiler nudge.** First-cut implementation caused a
-  bootstrap regression ("internal error: global 'break' not found in
-  data section") when `_val_w025_check` body grew to include
-  `_val_show_context_at` + `diag_help`. Bisect narrowed to that
-  specific combination but root cause not pinned. Defer until
-  Dev Loop 2 (`bug --break`) ships so we can single-step through the
-  gen2 codegen path and find the actual breakage. Plan stub already
-  written in `docs/type_defense_plan.md`.
-- **Sweep 2b — Rule 13 hints across stb (essentially empty).** Audit
-  on 2026-04-16 found the stb already follows Rule 13 by happenstance:
-  `_stb_gpu_clear` has `r: float, g: float, b: float, a: float`,
-  `phys_body` uses int milli-units, `rgba` packs bytes. The suite is
-  66/0/11 with E233 active, which proves no caller silently passes a
-  float to an int param anywhere. Reopen this item only if Level 4 or
-  W025 surface new Rule 13 violations during their sweeps.
-- **Level 4 — phase annotations expanded (`: realtime` / `: io` /
-  `: gpu`).** 3 sub-steps: (A) parser accepts new annotations,
-  zero-diff; (B) builtin effect table + propagation; (C) enforcement
-  at call sites. Killer demo is `stbaudio.audio_callback : realtime`
-  proving no malloc reaches the realtime thread. ~145 lines code +
-  100 test + 100 docs per the plan estimate.
-- **Sweep 2c — annotate `: realtime` / `: io` / `: gpu` across
-  src/ + stb/.** Lands with Level 4 sub-step C in the same commit
-  window. ~30-50 functions get an effect annotation.
+- **W025 full implementation.** Helper + T_BINOP wiring + `diag_help`
+  suggestion. Blocked by bug #1.
+- **Level 4 sub-step B full propagation.** The effect table is seeded
+  with 15 builtins today; adding more blocks on bug #2. Propagation
+  loop (fn_effect fixpoint parallel to fn_phase) is ready to write
+  once the seed can grow.
+- **Level 4 sub-step C enforcement.** Call-site checks using
+  fn_effect. Depends on sub-step B completing.
+- **Sweep 2c full revalidation.** Today's sweep already annotated
+  `: gpu` / `: io` / `: realtime` across stb + games (commit `3ea02a4`
+  and batch 2 on the way). After sub-step C ships, the compiler
+  validates each annotation — any wrong call fires the diagnostic,
+  caught in one pass.
+- **Sweep 2b — essentially empty by happenstance.** stb already
+  follows Rule 13 (`_stb_gpu_clear` has `r: float, …`, phys_body uses
+  int milli-units, rgba packs bytes). 66/0/11 with E233 active proves
+  no silent float-to-int slips through. Reopen only if Level 4 surfaces
+  new violations.
 
 ### 1. Dev Loop 2: `bug` breakpoints
 
