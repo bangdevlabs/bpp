@@ -1,0 +1,297 @@
+// _stb_audio_macos.bsm — macOS audio platform layer via CoreAudio AudioQueue.
+//
+// Iteration 3 of the stbaudio bring-up plan. Resolves the AudioToolbox
+// framework at runtime via dlopen/dlsym, sets up a single output queue
+// with three buffers, and plays a fixed square wave through the default
+// output device when the user calls `_stb_audio_tone_start(freq)`. The
+// caller stops it with `_stb_audio_tone_stop()`.
+//
+// Why a square wave. A proof-of-life tone does not need spectral purity
+// — it only needs to confirm that the FFI, the callback ABI bridge, and
+// the audio buffer handshake all work. A square wave is unmistakable by
+// ear, uses only integer arithmetic (no sin table dependency on
+// bpp_math init ordering), and makes clicks or gaps immediately audible.
+//
+// SPSC ring-buffer mixer and user-supplied callbacks arrive in
+// iteration 4; this file is deliberately scoped to "make a sound come
+// out" without any sample-producer/consumer separation.
+//
+// Framework resolution follows the same pattern as CoreGraphics /
+// CoreFoundation in _stb_platform_macos.bsm — dlopen the framework
+// by absolute path, dlsym each function once during init, then call
+// through the resolved pointers via the `call` builtin.
+
+import "System.B" {
+    ptr dlopen(char*, int);
+    ptr dlsym(ptr, char*);
+    int usleep(int);
+}
+
+// ── Framework handle and resolved function pointers ──────────────
+//
+// Set exactly once by _stb_audio_init_ffi() during the first call to
+// _stb_audio_tone_start; never written again. Rule 1: extrn.
+static extrn _aud_tb;
+static extrn _aud_fn_new_output;
+static extrn _aud_fn_alloc_buffer;
+static extrn _aud_fn_enqueue_buffer;
+static extrn _aud_fn_start;
+static extrn _aud_fn_stop;
+static extrn _aud_fn_dispose;
+
+// Active queue handle. Set by _stb_audio_tone_start, consumed by
+// _stb_audio_tone_stop, and read inside the callback when it
+// re-enqueues a drained buffer. Rule 1: extrn.
+static extrn _aud_queue;
+
+// Square-wave oscillator state. `_aud_half_period` is set once at
+// start time (samples per half-cycle of the tone); `_aud_phase` is
+// advanced only by the callback thread, so only one writer and one
+// reader touch it from a single thread's point of view. Still declared
+// global to make cross-thread intent explicit. `_aud_amplitude` is
+// fixed by init, read by callback. Rule 1.
+static extrn _aud_half_period;
+static extrn _aud_amplitude;
+global _aud_phase;
+
+// Diagnostic counter bumped once per callback invocation. Readable
+// from the main thread after the queue is stopped. Non-zero means the
+// realtime callback bridge works end-to-end; zero means CoreAudio
+// never invoked us and the bug is in the queue setup or the callback
+// function pointer.
+global _aud_cb_count;
+
+// ── AudioStreamBasicDescription layout ────────────────────────────
+//
+// Mirrors the C struct from <CoreAudio/CoreAudioTypes.h>. Offsets are
+// fixed by the macOS ABI and must not drift. The struct is 56 bytes
+// aligned to 8 bytes (mSampleRate is a double at offset 0).
+//
+//   offset  type    field
+//   ------  ------  ----------------------------
+//    0      double  mSampleRate
+//    8      u32     mFormatID
+//   12      u32     mFormatFlags
+//   16      u32     mBytesPerPacket
+//   20      u32     mFramesPerPacket
+//   24      u32     mBytesPerFrame
+//   28      u32     mChannelsPerFrame
+//   32      u32     mBitsPerChannel
+//   36      u32     mReserved
+//
+// `kAudioFormatLinearPCM` is the four-char code 'lpcm' packed big-endian
+// → 0x6C70636D. Format flags enable signed integer + packed layout.
+
+// AudioQueueBuffer struct fields we touch from the callback. Apple
+// exposes this struct publicly so reading these fields from B++ is safe.
+//
+//   offset  type    field
+//    0      u32     mAudioDataBytesCapacity
+//    8      ptr     mAudioData
+//   16      u32     mAudioDataByteSize
+//   ... (we do not touch packet description fields)
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+// Write a 32-bit little-endian value into a byte buffer. CoreAudio
+// structs are native-endian; on every supported Mac (Apple Silicon +
+// Intel) native is little-endian, so we encode explicitly.
+static _aud_poke_u32(buf, val) {
+    poke(buf + 0, val & 0xff);
+    poke(buf + 1, (val >> 8) & 0xff);
+    poke(buf + 2, (val >> 16) & 0xff);
+    poke(buf + 3, (val >> 24) & 0xff);
+}
+
+// Write a 64-bit little-endian value into a byte buffer. Used for the
+// mSampleRate field, which is an IEEE 754 double. The caller passes
+// the raw 64-bit bit pattern (e.g. 0x40E5888000000000 for 44100.0) so
+// we never depend on the B++ compiler emitting float literals as
+// doubles — which it does not.
+static _aud_poke_u64(buf, val) {
+    poke(buf + 0, val & 0xff);
+    poke(buf + 1, (val >> 8) & 0xff);
+    poke(buf + 2, (val >> 16) & 0xff);
+    poke(buf + 3, (val >> 24) & 0xff);
+    poke(buf + 4, (val >> 32) & 0xff);
+    poke(buf + 5, (val >> 40) & 0xff);
+    poke(buf + 6, (val >> 48) & 0xff);
+    poke(buf + 7, (val >> 56) & 0xff);
+}
+
+// Resolve the AudioToolbox framework and cache every function pointer
+// we use. Idempotent: safe to call repeatedly, does real work only the
+// first time. Rule 2: only called from inside this file.
+static void _aud_init_ffi() {
+    if (_aud_tb != 0) { return; }
+    _aud_tb = dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", 1);
+    _aud_fn_new_output     = dlsym(_aud_tb, "AudioQueueNewOutput");
+    _aud_fn_alloc_buffer   = dlsym(_aud_tb, "AudioQueueAllocateBuffer");
+    _aud_fn_enqueue_buffer = dlsym(_aud_tb, "AudioQueueEnqueueBuffer");
+    _aud_fn_start          = dlsym(_aud_tb, "AudioQueueStart");
+    _aud_fn_stop           = dlsym(_aud_tb, "AudioQueueStop");
+    _aud_fn_dispose        = dlsym(_aud_tb, "AudioQueueDispose");
+}
+
+// Build the AudioStreamBasicDescription that asks CoreAudio for 16-bit
+// signed PCM, stereo, interleaved, at 44.1 kHz. Writes 56 bytes
+// starting at `desc`. The sample rate field is an IEEE 754 double; we
+// hard-code its bit pattern (0x40E5888000000000 = 44100.0) rather than
+// relying on the B++ compiler to emit float literals as 64-bit doubles,
+// which it does not today — the earlier diagnostic run with the
+// `*desc = sr` approach dropped CoreAudio's buffer-refill cadence to
+// ~3 callbacks per second, consistent with a zero or subnormal sample
+// rate rather than 44100.
+static void _aud_fill_desc(desc) {
+    _aud_poke_u64(desc +  0, 0x40E5888000000000);  // mSampleRate = 44100.0
+    _aud_poke_u32(desc +  8, 0x6C70636D);          // mFormatID = 'lpcm'
+    _aud_poke_u32(desc + 12, 0x0C);                // kAudioFormatFlagIsSignedInteger | IsPacked
+    _aud_poke_u32(desc + 16, 4);                   // mBytesPerPacket (2 ch * 2 bytes)
+    _aud_poke_u32(desc + 20, 1);                   // mFramesPerPacket
+    _aud_poke_u32(desc + 24, 4);                   // mBytesPerFrame
+    _aud_poke_u32(desc + 28, 2);                   // mChannelsPerFrame (stereo)
+    _aud_poke_u32(desc + 32, 16);                  // mBitsPerChannel
+    _aud_poke_u32(desc + 36, 0);                   // mReserved
+}
+
+// ── Callback (runs on CoreAudio's realtime thread) ───────────────
+//
+// Fills the supplied buffer with a square-wave stereo signal and
+// re-enqueues it. Runs on a thread owned by CoreAudio — must not
+// allocate, must not touch any syscall beyond the enqueue call, must
+// not block. Only reads `_aud_half_period` / `_aud_amplitude` (both
+// write-once) and advances `_aud_phase` (single-writer by contract).
+//
+// Signature matches AudioQueueOutputCallback: (void*, AudioQueueRef,
+// AudioQueueBufferRef). B++'s AAPCS calling convention places the three
+// pointers in x0/x1/x2, which is bit-compatible with the C ABI the
+// audio system uses.
+static _aud_square_cb(user, queue, buffer) {
+    auto cap, data, i, sample, phase, hp, amp, frames;
+
+    cap   = peek(buffer + 0) + peek(buffer + 1) * 256
+          + peek(buffer + 2) * 65536 + peek(buffer + 3) * 16777216;
+    data  = *(buffer + 8);
+    phase = _aud_phase;
+    hp    = _aud_half_period;
+    amp   = _aud_amplitude;
+
+    // Each frame is 4 bytes (stereo s16). Emit the same sample on both
+    // channels so the tone is centered.
+    frames = cap / 4;
+    for (i = 0; i < frames; i = i + 1) {
+        if (phase < hp) { sample = amp; } else { sample = 0 - amp; }
+        // Left channel (offset 0 of the frame).
+        poke(data + i * 4 + 0, sample & 0xff);
+        poke(data + i * 4 + 1, (sample >> 8) & 0xff);
+        // Right channel (offset 2 of the frame).
+        poke(data + i * 4 + 2, sample & 0xff);
+        poke(data + i * 4 + 3, (sample >> 8) & 0xff);
+        phase = phase + 1;
+        if (phase >= hp + hp) { phase = 0; }
+    }
+
+    _aud_phase = phase;
+    _aud_cb_count = _aud_cb_count + 1;
+
+    // Tell CoreAudio the buffer is full and hand it back to the queue.
+    _aud_poke_u32(buffer + 16, cap);
+    call(_aud_fn_enqueue_buffer, queue, buffer, 0, 0);
+    return 0;
+}
+
+// Read the callback invocation count. Main thread only. Used by
+// diagnostic tests to prove the audio path is actually running.
+_stb_audio_cb_count() {
+    return _aud_cb_count;
+}
+
+// Read a single dlsym'd function pointer for diagnostic dumping.
+// Non-zero means the framework resolved the symbol successfully.
+_stb_audio_fn_probe(idx) {
+    if (idx == 0) { return _aud_tb; }
+    if (idx == 1) { return _aud_fn_new_output; }
+    if (idx == 2) { return _aud_fn_alloc_buffer; }
+    if (idx == 3) { return _aud_fn_enqueue_buffer; }
+    if (idx == 4) { return _aud_fn_start; }
+    if (idx == 5) { return _aud_fn_stop; }
+    if (idx == 6) { return _aud_fn_dispose; }
+    return 0;
+}
+
+// ── Public entry points ──────────────────────────────────────────
+
+// Start playing a square wave at the given frequency. Blocks only long
+// enough to configure CoreAudio; returns once the queue is running and
+// samples are flowing to the device. Returns 0 on success, non-zero on
+// any setup failure.
+//
+// The stereo buffers are 4 KiB each (1024 frames = ~23 ms at 44.1 kHz),
+// and three are queued so the callback always has at least two frames
+// of runway while the third is being refilled.
+_stb_audio_tone_start(freq_hz) {
+    auto desc, queue_slot, buffer_slot, queue, buffer, i, rc;
+
+    _aud_init_ffi();
+    if (_aud_tb == 0) { return 1; }
+
+    // Build the format descriptor on the heap; CoreAudio copies it, but
+    // Apple's docs say the memory must stay alive until the queue is
+    // created, which is trivially true here because we free after the
+    // AudioQueueNewOutput call returns.
+    desc = malloc(56);
+    _aud_fill_desc(desc);
+
+    // AudioQueueNewOutput wants an out-parameter for the queue handle,
+    // so pass a one-word slot it can write into.
+    queue_slot = malloc(8);
+    *queue_slot = 0;
+    rc = call(_aud_fn_new_output, desc, fn_ptr(_aud_square_cb), 0, 0, 0, 0, queue_slot);
+    queue = *queue_slot;
+    free(queue_slot);
+    free(desc);
+    if (rc != 0) { return 2; }
+
+    // Seed the oscillator state before any callback fires.
+    _aud_queue       = queue;
+    _aud_phase       = 0;
+    _aud_amplitude   = 8000;
+    _aud_half_period = 44100 / freq_hz / 2;
+    if (_aud_half_period < 1) { _aud_half_period = 1; }
+
+    // Allocate + prime + enqueue three buffers. Priming calls the
+    // callback directly so the queue already has audio when it starts.
+    buffer_slot = malloc(8);
+    for (i = 0; i < 3; i = i + 1) {
+        *buffer_slot = 0;
+        rc = call(_aud_fn_alloc_buffer, queue, 4096, buffer_slot);
+        if (rc != 0) { free(buffer_slot); return 3; }
+        buffer = *buffer_slot;
+        _aud_square_cb(0, queue, buffer);
+    }
+    free(buffer_slot);
+
+    // Start the queue. Samples begin flowing to the device.
+    rc = call(_aud_fn_start, queue, 0);
+    if (rc != 0) { return 4; }
+    return 0;
+}
+
+// Stop playback and release the queue. After this returns, the audio
+// hardware is silent and the callback will not fire again. Passing 1
+// as the "immediate" argument asks AudioQueueStop to flush and return
+// synchronously.
+void _stb_audio_tone_stop() {
+    if (_aud_queue == 0) { return; }
+    call(_aud_fn_stop, _aud_queue, 1);
+    call(_aud_fn_dispose, _aud_queue, 1);
+    _aud_queue = 0;
+}
+
+// Block the calling thread for `ms` milliseconds. Used by the public
+// `audio_tone_test` wrapper so the tone actually plays long enough to
+// hear. Lives in the platform file (not stbaudio.bsm) so stbaudio stays
+// free of syscall surface — only this file touches System.B.
+void _stb_audio_sleep_ms(ms) {
+    usleep(ms * 1000);
+}
