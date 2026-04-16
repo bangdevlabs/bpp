@@ -78,13 +78,28 @@ as: parser or codegen synthesizes a relocation to a symbol named
 to recognize `break` keyword under some internal-state condition,
 treats it as T_VAR, codegen emits a global reference, link fails.
 
-**Bug #3 — diagnostic line numbers off by ~365.** During W025
-debugging, the compiler reported an error at `bpp_parser.bsm:1540` but
-the actual offending `switch (c0) {` is at line 1905. Off by 365 is
-consistent with a fixed offset miscalculation (possibly
+**Bug #3 — diagnostic line numbers off.** Same family as #3b below.
+During W025 debugging, the compiler reported an error at
+`bpp_parser.bsm:1540` but the actual `switch (c0) {` is at line 1905.
+Off by 365 is consistent with a fixed offset miscalculation (possibly
 `mod0_real_start` not applied when computing the diagnostic's
 line-relative position). Affects every error message from the parser
 on module 0. Real bug, tracked for the same Dev Loop 2 debug session.
+
+**Bug #3b — `.bug` source_pos off by N per module.** Discovered during
+Dev Loop 2 sub-step 1. The source-pos emission in `bpp_bug.bsm` uses
+the canonical `tok_lines[tidx] - diag_file_line_starts[mod_idx]`
+formula (same as `diag_loc`), but the reported line for `malloc`
+(actual line 34 of `_bmem_macos.bsm`) comes out as line 10. The lexer
+sees only 9 newlines between `diag_file_line_starts[3]` and malloc's
+name token, but the source file has 33. So either `outbuf` for that
+module was written with missing newlines OR `diag_file_line_starts[3]`
+was captured AFTER additional content was already written. Same
+arithmetic as bug #3, same likely root cause. Will fix in the same
+session once `bug --break` can single-step through `process_file` and
+`emit_ch` to see which newlines are getting lost. For now, the MVP
+scope cut for `--break fn:line` is "not implemented yet" — avoids
+depending on possibly-wrong line numbers.
 
 ### 1. Dev Loop 2 — `bug` runtime observe + `--break` flag
 
