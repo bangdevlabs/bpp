@@ -1,12 +1,12 @@
 # B++
 
-### B++ 0.70 — Polyphonic Synthesizer, Audio Stack, Effect Lattice — 17 April 2026
+### B++ 0.68 — Polyphonic Synthesizer, Audio Stack, Effect Lattice — 17 April 2026
 
 A self-hosting compiled language with a **working 8-voice polyphonic synthesizer** in 300 lines of B++. Four waveforms (sine, triangle, sawtooth, square) morphed by a continuous fader. Bitcrush + decimation dirt control. WAV recording. All running on a native audio stack built from scratch — CoreAudio FFI, SPSC ring buffer, realtime callback — with zero external dependencies.
 
 The synthesizer is not a demo. It is a musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. Press keys, hear notes, modulate timbre, record to disk.
 
-> **Version 0.70**: 68 tests pass. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
+> **Version 0.68**: 68 tests pass. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
 
 ---
 
@@ -177,7 +177,7 @@ You write code. You compile it. You run it.
 
 The name **stb** is a tribute to [Sean Barrett's stb libraries](https://github.com/nothings/stb) — the single-header C libraries that defined a generation of small, focused, dependency-free building blocks for graphics, audio, fonts, and data. `stb_image.h`, `stb_truetype.h`, `stb_vorbis.c`, `stb_ds.h` and the rest are how a lot of indie game developers learned that "the right amount of library" is one file you can read in an afternoon. B++'s standard library is the same idea reframed as a pure-B++ collection: small modules, no headers (B++ has no headers anyway), no third-party dependencies, the minimum API surface for the maximum game.
 
-stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++.
+stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 18 modules, all auto-injected by the compiler when you `import "stbgame.bsm"`.
 
 **Rendering:**
 
@@ -197,30 +197,19 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbinput` | Keyboard and mouse input from memory arrays |
 | `stbui` | Immediate-mode UI widgets with per-frame arena |
 
-**Math, physics & AI:**
+**Physics, collision & AI:**
 
 | Module | What it does |
 |--------|-------------|
-| `stbmath` | Vec2, PRNG, sqrt (Newton-Raphson), abs, min, max, clamp, fixed-point trig |
 | `stbcol` | Collision detection — rect overlap, point-in-rect, distance squared |
 | `stbphys` | Platformer physics — Body struct, gravity, jump, tile collision, milli-pixel precision |
 | `stbtile` | Tilemap engine — grid, collision layer, PNG tileset loader, camera-aware GPU draw, type remap |
-| `stbpath` | A* pathfinding on a grid — binary min-heap with indexed decrease-key, Manhattan heuristic, leaf module |
-
-**Data structures:**
-
-| Module | What it does |
-|--------|-------------|
-| `stbarray` | Dynamic arrays with shadow header (stb_ds.h style) |
-| `stbhash` | Hash maps — word keys (Knuth) and byte-sequence keys (djb2), open addressing, tombstones |
-| `stbstr` | String operations and growable string builder |
-| `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
+| `stbpath` | A* pathfinding on a grid — binary min-heap with indexed decrease-key, Manhattan heuristic |
 
 **Game infrastructure:**
 
 | Module | What it does |
 |--------|-------------|
-| `stbarena` | Generic bump allocator — O(1) alloc, O(1) reset, 8-byte aligned |
 | `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
 | `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics |
 
@@ -232,13 +221,35 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbmixer` | Polyphonic 8-voice mixer — square/sine/tri/saw waveforms, fader morph, dirt (bitcrush + decimation), master volume |
 | `stbsound` | Audio file formats — WAV read/write (RIFF PCM 44100 stereo s16) |
 
-**I/O & assets:**
+**Assets:**
 
 | Module | What it does |
 |--------|-------------|
-| `stbfile` | File I/O — read and write entire files |
-| `stbio` | Console I/O (print_int, print_msg, print_char) |
 | `stbimage` | Pure B++ PNG loader — DEFLATE, Huffman, all filter types, zero FFI |
+
+### Universal runtime (promoted from stb to src)
+
+Eight modules that started as `stb*` but turned out to be things every B++ program needs — not just games. They migrated from `stb/` to `src/` as `bpp_*.bsm` and became auto-injected for every compile, without requiring an `import` line. They are the compiler's own primitives as much as the game engine's.
+
+| Module | Formerly | What it does |
+|--------|----------|-------------|
+| `bpp_array` | `stbarray` | Dynamic arrays with shadow header (stb_ds.h style) |
+| `bpp_hash` | `stbhash` | Hash maps — word keys (Knuth) and byte-sequence keys (djb2), open addressing, tombstones |
+| `bpp_buf` | `stbbuf` | Raw buffer read/write (u8, u16, u32, u64) |
+| `bpp_str` | `stbstr` | String operations and growable string builder |
+| `bpp_math` | `stbmath` | Vec2, PRNG, sqrt (Newton-Raphson), abs, min, max, clamp, fixed-point trig |
+| `bpp_io` | `stbio` | Console I/O (`print_int`, `print_msg`, `print_char`, `putchar`, `getchar`) |
+| `bpp_file` | `stbfile` | File I/O — read and write entire files |
+| `bpp_arena` | `stbarena` | Generic bump allocator — O(1) alloc, O(1) reset, 8-byte aligned |
+
+Three more `bpp_*` modules ship as core runtime alongside these, with no prior stb life:
+
+| Module | What it does |
+|--------|-------------|
+| `bpp_beat` | Monotonic clock — milliseconds, microseconds, samples, BPM, frames, from one source of truth |
+| `bpp_job` | Worker pool with lock-free SPSC queues and `mem_barrier` fences |
+| `bpp_maestro` | Game loop — solo / base / render phase split, fixed-timestep accumulator |
+| `bpp_mem` | `malloc`/`free`/`realloc` via `sys_mmap` — the libb allocator that replaces libc on the native path |
 
 **Platform layers** (internal, selected automatically):
 
