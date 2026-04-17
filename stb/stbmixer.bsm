@@ -1,0 +1,302 @@
+// stbmixer.bsm — Polyphonic square-wave mixer over stbaudio.
+//
+// Sits above the SPSC ring from stbaudio. Maintains a fixed pool of
+// 8 voice slots; each voice plays a square wave at its configured
+// frequency until note_off is called. The main thread drives
+// ticking via mixer_stream(n) which generates n mixed stereo
+// frames and pushes them into the audio ring.
+//
+// ── Timing contract ──────────────────────────────────────────────
+// stbmixer assumes a monotonic sample timeline anchored at
+// init_beat(). The program's main() must call init_beat() before
+// mixer_init — either directly, or indirectly via maestro_run or
+// stbgame's game_init. All voice timing derives from
+// beat_now_samples(44100) and is read fresh inside every fill
+// call, so phase stays continuous across fill boundaries and the
+// same timeline is observable by Rhythm Teacher's note scheduler.
+//
+// ── Polyphony ────────────────────────────────────────────────────
+// 8 simultaneous voices. Per-voice amplitude is scaled by 1/N so
+// the additive mix never clips s16. Release is instantaneous — the
+// slot goes idle the moment mixer_note_off fires. An ADSR envelope
+// is a future slice and lives in a separate voice kind.
+//
+// ── Waveform ─────────────────────────────────────────────────────
+// Square only. The shape is fixed so synthkey and Snake's one-shot
+// apple sample can share a uniform voice-state layout without
+// branching inside the per-frame loop. Additional waveforms and
+// sampled playback plug in as new voice kinds later.
+
+import "stbaudio.bsm";
+
+// ── Configuration ──────────────────────────────────────────────
+// All set once inside mixer_init. Rule 1: static extrn for
+// write-once module-private state.
+static extrn _MX_MAX_VOICES;
+static extrn _MX_SAMPLE_RATE;
+static extrn _MX_VOICE_AMP;        // per-voice amplitude (s16 / MAX_VOICES)
+static extrn _MX_FILL_BUF;         // scratch buffer for mixer_stream
+static extrn _MX_FILL_BUF_FRAMES;  // capacity of _MX_FILL_BUF in frames
+
+// ── Voice table (5 parallel arrays) ───────────────────────────
+// Parallel arrays — not a struct. 8 voices × 5 arrays × 8 bytes =
+// 320 bytes total, well under a single cache line family. The
+// pointers here are write-once (set inside mixer_init). Array
+// contents mutate via poke / subscript writes.
+static extrn _mx_voice_active;   // arr[i] = 1 if voice i carries a live note
+static extrn _mx_voice_key;      // arr[i] = key_id the caller passed to note_on
+static extrn _mx_voice_hp;     // arr[i] = samples per half-period (square)
+static extrn _mx_voice_amp;      // arr[i] = per-voice amplitude
+static extrn _mx_voice_phase;    // arr[i] = current phase within the period (incremental, like the callback)
+
+// Waveform fader — blends across four waveforms from clean to dirty.
+//   0   = pure sine (cleanest)
+//   256 = pure triangle
+//   512 = pure sawtooth
+//   768 = pure square (dirtiest)
+// Values between crossfade the two neighbors. Set via mixer_set_fader.
+static extrn _mx_fader;
+
+static extrn _mx_inited;
+
+// Initialize the mixer. Idempotent — calling twice is a no-op.
+// Allocates the voice arrays and the fill scratch buffer. Does NOT
+// call init_beat (the program is responsible for anchoring the
+// timeline). Does NOT open the audio device either — the caller
+// opens it via audio_open before the first mixer_stream call.
+void mixer_init() {
+    if (_mx_inited != 0) { return; }
+    // Sine waveform needs the 32-point trig table. Both calls are
+    // idempotent so double-init from game_init + mixer_init is safe.
+    init_math();
+    math_trig_init();
+
+    _MX_MAX_VOICES   = 8;
+    _MX_SAMPLE_RATE  = 44100;
+    _MX_VOICE_AMP    = 8000;
+    _MX_FILL_BUF_FRAMES = 512;
+    _MX_FILL_BUF     = malloc(_MX_FILL_BUF_FRAMES * 4);
+
+    _mx_voice_active = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_key    = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_hp   = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_amp    = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_phase  = malloc(_MX_MAX_VOICES * 8);
+
+    auto i;
+    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+        _mx_voice_active[i] = 0;
+        _mx_voice_key[i]    = 0;
+        _mx_voice_hp[i]   = 0;
+        _mx_voice_amp[i]    = 0;
+        _mx_voice_phase[i]  = 0;
+    }
+    _mx_fader         = 768;
+    _mx_master_vol    = 80;
+    _mx_dirt          = 0;
+    _mx_decim_counter = 0;
+    _mx_held_sample   = 0;
+    _mx_inited        = 1;
+}
+
+// Start a note with unique `key_id` at `freq_hz`. If a voice is
+// already playing the same key, returns that voice's slot without
+// restarting it — the held note keeps sustaining. Returns the
+// voice slot on success, -1 if every slot is busy.
+mixer_note_on(key_id: word, freq_hz: word) {
+    auto i, hp;
+
+    // Already playing this key? Return the existing slot unchanged.
+    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+        if (_mx_voice_active[i] != 0) {
+            if (_mx_voice_key[i] == key_id) { return i; }
+        }
+    }
+
+    // First free slot wins. Square wave half-period in samples.
+    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+        if (_mx_voice_active[i] == 0) {
+            hp = _MX_SAMPLE_RATE / freq_hz / 2;
+            if (hp < 1) { hp = 1; }
+            _mx_voice_hp[i]    = hp;
+            _mx_voice_amp[i]   = _MX_VOICE_AMP;
+            _mx_voice_key[i]   = key_id;
+            _mx_voice_phase[i] = 0;
+            _mx_voice_active[i] = 1;
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+// Release every voice currently playing the given key_id. No-op
+// when the key is not active. Rule 3: void because it only mutates
+// global state.
+void mixer_note_off(key_id: word) {
+    auto i;
+    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+        if (_mx_voice_active[i] != 0) {
+            if (_mx_voice_key[i] == key_id) {
+                _mx_voice_active[i] = 0;
+            }
+        }
+    }
+}
+
+// Count voices currently sustaining. Handy for instrumentation and
+// test assertions. Rule 4: pure read, Rule 11 ternary not useful
+// here since we accumulate.
+mixer_active_voices() : base {
+    auto i, n;
+    n = 0;
+    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+        if (_mx_voice_active[i] != 0) { n = n + 1; }
+    }
+    return n;
+}
+
+// Set the waveform fader. 0 = sine, 256 = triangle, 512 = saw,
+// 768 = square. Clamped to [0, 768].
+void mixer_set_fader(val: word) {
+    if (val < 0)   { val = 0; }
+    if (val > 768) { val = 768; }
+    _mx_fader = val;
+}
+
+// Read the current fader position.
+mixer_get_fader() : base { return _mx_fader; }
+
+// Master volume (0..100). Scales the final mixed sum before pushing
+// to the ring. Default 80 to leave headroom.
+static extrn _mx_master_vol;
+
+void mixer_set_master_volume(vol: word) {
+    if (vol < 0)   { vol = 0; }
+    if (vol > 100) { vol = 100; }
+    _mx_master_vol = vol;
+}
+
+mixer_get_master_volume() : base { return _mx_master_vol; }
+
+// Dirt level (0..256). 0 = pristine clean, 256 = maximum crunch.
+// Two effects stack: bitcrush (reduce bit depth of the final sum)
+// and decimation (sample-and-hold, repeat each sample N frames).
+// At 0 both are off and the output is the pure waveform. Moving
+// the fader up introduces progressively harsher digital artifacts
+// — the "fritação" the user heard from the integer sine table at
+// low resolutions, now controllable.
+static extrn _mx_dirt;
+static extrn _mx_decim_counter;
+static extrn _mx_held_sample;
+
+void mixer_set_dirt(val: word) {
+    if (val < 0)   { val = 0; }
+    if (val > 256) { val = 256; }
+    _mx_dirt = val;
+}
+
+mixer_get_dirt() : base { return _mx_dirt; }
+
+// Fill `buf` with `n` stereo s16 frames of the current mix. Writes
+// 4*n bytes — (left_lo, left_hi, right_lo, right_hi) per frame.
+// Returns n. Callers wanting to analyse or record raw samples use
+// this primitive directly; the streaming wrapper below uses it too.
+mixer_fill(buf, n: word) {
+    auto f, v, sum, sample, phase, hp, amp, period;
+    auto sn, tri, saw, sq, t, fader, si;
+
+    fader = _mx_fader;
+
+    for (f = 0; f < n; f = f + 1) {
+        sum = 0;
+        for (v = 0; v < _MX_MAX_VOICES; v = v + 1) {
+            if (_mx_voice_active[v] != 0) {
+                hp    = _mx_voice_hp[v];
+                amp   = _mx_voice_amp[v];
+                phase = _mx_voice_phase[v];
+                period = hp + hp;
+
+                // Square: identical to _aud_square_cb in the tone test.
+                sq = phase < hp ? amp : 0 - amp;
+
+                // Sine: 32-point table lookup from bpp_math, scaled.
+                si = (phase * 32) / period;
+                if (si > 31) { si = 31; }
+                sn = math_sin(si) * amp / 1024;
+
+                // Triangle: ramp up first half, ramp down second half.
+                tri = phase < hp
+                    ? 0 - amp + (2 * amp * phase) / hp
+                    : 3 * amp - (2 * amp * phase) / hp;
+
+                // Sawtooth: linear ramp -amp → +amp over the period.
+                saw = 0 - amp + (amp * phase) / hp;
+
+                // Crossfade between adjacent waveform pairs.
+                //   0..256:   sine → triangle
+                //   256..512: triangle → sawtooth
+                //   512..768: sawtooth → square
+                if (fader <= 256) {
+                    t = fader;
+                    sample = (sn * (256 - t) + tri * t) / 256;
+                } else if (fader <= 512) {
+                    t = fader - 256;
+                    sample = (tri * (256 - t) + saw * t) / 256;
+                } else {
+                    t = fader - 512;
+                    sample = (saw * (256 - t) + sq * t) / 256;
+                }
+
+                sum = sum + sample;
+
+                // Advance phase by exactly 1 per sample — same
+                // discipline as _aud_square_cb. No wall-clock lookup,
+                // no modulo, no jitter.
+                phase = phase + 1;
+                if (phase >= period) { phase = 0; }
+                _mx_voice_phase[v] = phase;
+            }
+        }
+        // Master volume + clip to s16.
+        sum = sum * _mx_master_vol / 100;
+        if (sum >  32767) { sum =  32767; }
+        if (sum < 0 - 32768) { sum = 0 - 32768; }
+
+        // Dirt: bitcrush + decimation (sample-and-hold).
+        if (_mx_dirt > 0) {
+            auto crush, decim;
+            crush = _mx_dirt * 8 / 256;
+            if (crush > 0) {
+                sum = (sum >> crush) << crush;
+            }
+            decim = 1 + _mx_dirt * 15 / 256;
+            _mx_decim_counter = _mx_decim_counter + 1;
+            if (_mx_decim_counter >= decim) {
+                _mx_held_sample = sum;
+                _mx_decim_counter = 0;
+            }
+            sum = _mx_held_sample;
+        }
+
+        poke(buf + f * 4 + 0,  sum        & 0xff);
+        poke(buf + f * 4 + 1, (sum >> 8)  & 0xff);
+        poke(buf + f * 4 + 2,  sum        & 0xff);
+        poke(buf + f * 4 + 3, (sum >> 8)  & 0xff);
+    }
+    return n;
+}
+
+// Generate up to `n` mixed frames and push them into the audio
+// ring. `n` is clamped to the scratch buffer capacity
+// (_MX_FILL_BUF_FRAMES). Returns the number of frames the ring
+// actually accepted; fewer than the requested amount means the
+// ring is full. Callers should typically pass min(audio_ring_space,
+// 512) and sleep briefly between calls.
+mixer_stream(n: word) {
+    auto produced, pushed;
+    if (n <= 0) { return 0; }
+    if (n > _MX_FILL_BUF_FRAMES) { n = _MX_FILL_BUF_FRAMES; }
+    produced = mixer_fill(_MX_FILL_BUF, n);
+    pushed   = audio_push_frames(_MX_FILL_BUF, produced);
+    return pushed;
+}

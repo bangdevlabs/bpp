@@ -1,0 +1,160 @@
+// stbsound.bsm — Audio file format module.
+//
+// Reads and writes audio files in common formats. Today: WAV (RIFF
+// PCM). The module is format-only — it has no dependency on the
+// audio device (stbaudio) or the synthesis engine (stbmixer). A
+// program that wants to analyse a WAV on disk without playing it
+// can import stbsound alone.
+//
+// All functions assume 44100 Hz, 16-bit signed, stereo interleaved
+// (the same format stbaudio's SPSC ring uses). Each "frame" is
+// 4 bytes: left_lo, left_hi, right_lo, right_hi.
+
+import "bpp_io.bsm";
+
+// ── WAV constants ─────────────────────────────────────────────
+static extrn _SND_RATE;
+static extrn _SND_CHANNELS;
+static extrn _SND_BPS;
+static extrn _SND_BLOCK_ALIGN;
+static extrn _SND_BYTE_RATE;
+static extrn _snd_inited;
+
+// Last-loaded buffer and frame count. Set by sound_load_wav,
+// consumed by the caller via sound_buf / sound_frames.
+static extrn _snd_last_buf;
+static extrn _snd_last_frames;
+
+void init_sound() {
+    if (_snd_inited != 0) { return; }
+    _SND_RATE        = 44100;
+    _SND_CHANNELS    = 2;
+    _SND_BPS         = 16;
+    _SND_BLOCK_ALIGN = _SND_CHANNELS * (_SND_BPS / 8);
+    _SND_BYTE_RATE   = _SND_RATE * _SND_BLOCK_ALIGN;
+    _snd_last_buf    = 0;
+    _snd_last_frames = 0;
+    _snd_inited      = 1;
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+static void _snd_w16(buf, off, val) {
+    poke(buf + off,     val & 0xFF);
+    poke(buf + off + 1, (val >> 8) & 0xFF);
+}
+
+static void _snd_w32(buf, off, val) {
+    poke(buf + off,     val & 0xFF);
+    poke(buf + off + 1, (val >> 8) & 0xFF);
+    poke(buf + off + 2, (val >> 16) & 0xFF);
+    poke(buf + off + 3, (val >> 24) & 0xFF);
+}
+
+static _snd_r16(buf, off) : base {
+    return peek(buf + off) + peek(buf + off + 1) * 256;
+}
+
+static _snd_r32(buf, off) : base {
+    return peek(buf + off)
+         + peek(buf + off + 1) * 256
+         + peek(buf + off + 2) * 65536
+         + peek(buf + off + 3) * 16777216;
+}
+
+// ── Save ──────────────────────────────────────────────────────
+
+// Write a RIFF WAV file with the given PCM data. `buf` holds
+// `n_frames` stereo s16 frames (4 bytes each). The file is
+// created or truncated at `path`. Returns 0 on success, -1 on
+// file-open failure.
+sound_save_wav(path, buf, n_frames) : io {
+    auto hdr, fd, data_bytes;
+    init_sound();
+    data_bytes = n_frames * _SND_BLOCK_ALIGN;
+    hdr = malloc(44);
+
+    // RIFF header.
+    poke(hdr + 0, 'R'); poke(hdr + 1, 'I');
+    poke(hdr + 2, 'F'); poke(hdr + 3, 'F');
+    _snd_w32(hdr, 4, 36 + data_bytes);
+    poke(hdr + 8, 'W'); poke(hdr + 9, 'A');
+    poke(hdr + 10, 'V'); poke(hdr + 11, 'E');
+
+    // fmt sub-chunk (16 bytes, PCM).
+    poke(hdr + 12, 'f'); poke(hdr + 13, 'm');
+    poke(hdr + 14, 't'); poke(hdr + 15, ' ');
+    _snd_w32(hdr, 16, 16);
+    _snd_w16(hdr, 20, 1);
+    _snd_w16(hdr, 22, _SND_CHANNELS);
+    _snd_w32(hdr, 24, _SND_RATE);
+    _snd_w32(hdr, 28, _SND_BYTE_RATE);
+    _snd_w16(hdr, 32, _SND_BLOCK_ALIGN);
+    _snd_w16(hdr, 34, _SND_BPS);
+
+    // data sub-chunk.
+    poke(hdr + 36, 'd'); poke(hdr + 37, 'a');
+    poke(hdr + 38, 't'); poke(hdr + 39, 'a');
+    _snd_w32(hdr, 40, data_bytes);
+
+    // O_WRONLY | O_CREAT | O_TRUNC = 0x601 on macOS.
+    fd = sys_open(path, 0x601);
+    if (fd < 0) { free(hdr); return 0 - 1; }
+    sys_fchmod(fd, 420);
+    sys_write(fd, hdr, 44);
+    sys_write(fd, buf, data_bytes);
+    sys_close(fd);
+    free(hdr);
+    return 0;
+}
+
+// ── Load ──────────────────────────────────────────────────────
+
+// Read a RIFF WAV file and return the number of stereo s16 frames
+// loaded. The PCM data lands in an internal buffer accessible via
+// sound_buf(). Returns -1 if the file cannot be opened or the
+// header is invalid.
+//
+// Only 16-bit stereo PCM at 44100 Hz is accepted today. Other
+// formats return -1 (the caller should transcode offline or add
+// a format branch here).
+sound_load_wav(path) : io {
+    auto fd, hdr, data_bytes, n_frames, buf;
+    init_sound();
+
+    fd = sys_open(path, 0);
+    if (fd < 0) { return 0 - 1; }
+
+    hdr = malloc(44);
+    sys_read(fd, hdr, 44);
+
+    // Validate RIFF + WAVE magic.
+    if (peek(hdr + 0) != 'R') { free(hdr); sys_close(fd); return 0 - 1; }
+    if (peek(hdr + 8) != 'W') { free(hdr); sys_close(fd); return 0 - 1; }
+
+    // Validate PCM format.
+    if (_snd_r16(hdr, 20) != 1) { free(hdr); sys_close(fd); return 0 - 1; }
+    if (_snd_r16(hdr, 22) != 2) { free(hdr); sys_close(fd); return 0 - 1; }
+    if (_snd_r32(hdr, 24) != 44100) { free(hdr); sys_close(fd); return 0 - 1; }
+    if (_snd_r16(hdr, 34) != 16) { free(hdr); sys_close(fd); return 0 - 1; }
+
+    data_bytes = _snd_r32(hdr, 40);
+    free(hdr);
+
+    n_frames = data_bytes / _SND_BLOCK_ALIGN;
+    buf = malloc(data_bytes);
+    sys_read(fd, buf, data_bytes);
+    sys_close(fd);
+
+    if (_snd_last_buf != 0) { free(_snd_last_buf); }
+    _snd_last_buf    = buf;
+    _snd_last_frames = n_frames;
+    return n_frames;
+}
+
+// Pointer to the last-loaded WAV's PCM data. Valid until the next
+// sound_load_wav call (which frees the prior buffer).
+sound_buf() : base { return _snd_last_buf; }
+
+// Frame count of the last-loaded WAV.
+sound_frames() : base { return _snd_last_frames; }

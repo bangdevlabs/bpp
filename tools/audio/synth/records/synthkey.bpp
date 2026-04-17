@@ -1,0 +1,306 @@
+// synthkey.bpp — 4-octave polyphonic keyboard synthesizer.
+//
+//   Row 1  1 2 3 4 5 6 7 8 9 0 - =      C6..B6  (highest)
+//   Row 2  Q W E R T Y U I O P [ ]      C5..B5
+//   Row 3  A S D F G H J K L ; ' \      C4..B4  (middle C)
+//   Row 4  Z X C V B N M , . /          C3..A#3 (10 keys)
+//
+// LEFT/RIGHT  — waveform shape: sine → triangle → saw → square
+// UP/DOWN     — dirt: clean (pure wave) → dirty (bitcrush + decimation)
+// ESC         — quit
+
+import "stbgame.bsm";
+import "stbmixer.bsm";
+import "stbsound.bsm";
+
+auto NUM_KEYS;
+auto _sk_keys, _sk_midi, _sk_freq, _sk_prev;
+auto _sk_note_names;
+
+// Recording state. SPACE toggles. Max 10 seconds.
+auto _sk_recording;
+auto _sk_rec_buf;
+auto _sk_rec_pos;
+auto _sk_rec_cap;
+auto _sk_fill_buf;
+auto _sk_wav_path;
+
+static void _sk_map(idx, key_enum, midi) {
+    _sk_keys[idx] = key_enum;
+    _sk_midi[idx] = midi;
+}
+
+static void _sk_init_freq() {
+    _sk_freq[0]=131;  _sk_freq[1]=139;  _sk_freq[2]=147;
+    _sk_freq[3]=156;  _sk_freq[4]=165;  _sk_freq[5]=175;
+    _sk_freq[6]=185;  _sk_freq[7]=196;  _sk_freq[8]=208;
+    _sk_freq[9]=220;  _sk_freq[10]=233; _sk_freq[11]=247;
+    _sk_freq[12]=262; _sk_freq[13]=277; _sk_freq[14]=294;
+    _sk_freq[15]=311; _sk_freq[16]=330; _sk_freq[17]=349;
+    _sk_freq[18]=370; _sk_freq[19]=392; _sk_freq[20]=415;
+    _sk_freq[21]=440; _sk_freq[22]=466; _sk_freq[23]=494;
+    _sk_freq[24]=523; _sk_freq[25]=554; _sk_freq[26]=587;
+    _sk_freq[27]=622; _sk_freq[28]=659; _sk_freq[29]=698;
+    _sk_freq[30]=740; _sk_freq[31]=784; _sk_freq[32]=831;
+    _sk_freq[33]=880; _sk_freq[34]=932; _sk_freq[35]=988;
+    _sk_freq[36]=1047; _sk_freq[37]=1109; _sk_freq[38]=1175;
+    _sk_freq[39]=1245; _sk_freq[40]=1319; _sk_freq[41]=1397;
+    _sk_freq[42]=1480; _sk_freq[43]=1568; _sk_freq[44]=1661;
+    _sk_freq[45]=1760; _sk_freq[46]=1865; _sk_freq[47]=1976;
+}
+
+static void _sk_init_names() {
+    _sk_note_names = malloc(12 * 8);
+    _sk_note_names[0]  = "C";  _sk_note_names[1]  = "C#";
+    _sk_note_names[2]  = "D";  _sk_note_names[3]  = "D#";
+    _sk_note_names[4]  = "E";  _sk_note_names[5]  = "F";
+    _sk_note_names[6]  = "F#"; _sk_note_names[7]  = "G";
+    _sk_note_names[8]  = "G#"; _sk_note_names[9]  = "A";
+    _sk_note_names[10] = "A#"; _sk_note_names[11] = "B";
+}
+
+static void _sk_init_keys() {
+    _sk_map(0,  KEY_Z,     48); _sk_map(1,  KEY_X,     49);
+    _sk_map(2,  KEY_C,     50); _sk_map(3,  KEY_V,     51);
+    _sk_map(4,  KEY_B,     52); _sk_map(5,  KEY_N,     53);
+    _sk_map(6,  KEY_M,     54); _sk_map(7,  KEY_COMMA, 55);
+    _sk_map(8,  KEY_PERIOD,56); _sk_map(9,  KEY_SLASH, 57);
+    _sk_map(10, KEY_A,60); _sk_map(11, KEY_S,61);
+    _sk_map(12, KEY_D,62); _sk_map(13, KEY_F,63);
+    _sk_map(14, KEY_G,64); _sk_map(15, KEY_H,65);
+    _sk_map(16, KEY_J,66); _sk_map(17, KEY_K,67);
+    _sk_map(18, KEY_L,68); _sk_map(19, KEY_SEMICOLON,69);
+    _sk_map(20, KEY_QUOTE,70); _sk_map(21, KEY_BACKSLASH,71);
+    _sk_map(22, KEY_Q,72); _sk_map(23, KEY_W,73);
+    _sk_map(24, KEY_E,74); _sk_map(25, KEY_R,75);
+    _sk_map(26, KEY_T,76); _sk_map(27, KEY_Y,77);
+    _sk_map(28, KEY_U,78); _sk_map(29, KEY_I,79);
+    _sk_map(30, KEY_O,80); _sk_map(31, KEY_P,81);
+    _sk_map(32, KEY_LBRACKET,82); _sk_map(33, KEY_RBRACKET,83);
+    _sk_map(34, KEY_1,84); _sk_map(35, KEY_2,85);
+    _sk_map(36, KEY_3,86); _sk_map(37, KEY_4,87);
+    _sk_map(38, KEY_5,88); _sk_map(39, KEY_6,89);
+    _sk_map(40, KEY_7,90); _sk_map(41, KEY_8,91);
+    _sk_map(42, KEY_9,92); _sk_map(43, KEY_0,93);
+    _sk_map(44, KEY_MINUS,94); _sk_map(45, KEY_EQUAL,95);
+}
+
+static _is_black(semi) : base {
+    return semi == 1 || semi == 3 || semi == 6 || semi == 8 || semi == 10;
+}
+
+// ARGB color helper — all raw colors need alpha=0xFF to be visible.
+static _rgb(r, g, b) : base { return rgba(r, g, b, 255); }
+
+static void _sk_draw_key(x, y, midi, pressed) {
+    auto semi, octave, is_blk, kw, kh, bg, txt_color;
+    semi   = midi % 12;
+    octave = midi / 12 - 1;
+    is_blk = _is_black(semi);
+    if (is_blk) {
+        kw = 14; kh = 20;
+        bg = pressed ? _rgb(51, 153, 255) : _rgb(34, 34, 51);
+        txt_color = pressed ? WHITE : _rgb(100, 100, 140);
+    } else {
+        kw = 22; kh = 30;
+        bg = pressed ? _rgb(68, 204, 255) : _rgb(180, 190, 200);
+        txt_color = pressed ? _rgb(15, 15, 26) : _rgb(60, 60, 80);
+    }
+    draw_rect(x, y, kw, kh, bg);
+    draw_rect(x, y, kw, 1, _rgb(17, 17, 34));
+    draw_rect(x, y, 1, kh, _rgb(17, 17, 34));
+    draw_rect(x + kw - 1, y, 1, kh, _rgb(17, 17, 34));
+    draw_rect(x, y + kh - 1, kw, 1, _rgb(17, 17, 34));
+    // Note name inside the key.
+    draw_text(_sk_note_names[semi], x + 2, y + kh - 10, 1, txt_color);
+    draw_number(x + 2, y + kh - 18, 1, txt_color, octave);
+}
+
+static void _sk_draw_fader(label_text, y, val, max_val) {
+    auto bar_w, total_w, seg;
+    total_w = 200;
+    bar_w   = val * total_w / max_val;
+
+    draw_text(label_text, 8, y, 1, _rgb(100, 130, 170));
+    draw_rect(60, y, total_w, 8, _rgb(34, 34, 51));
+    draw_rect(60, y, bar_w, 8, _rgb(68, 187, 255));
+    if (bar_w > 2) {
+        draw_rect(60 + bar_w - 2, y - 1, 4, 10, WHITE);
+    }
+}
+
+main() {
+    auto i, now, was, midi, freq, space, row, col;
+    auto kx, ky, fval, seg_label;
+
+    NUM_KEYS = 46;
+
+    // Output WAV path: first argument or default.
+    if (argc_get() >= 2) {
+        _sk_wav_path = argv_get(1);
+    } else {
+        _sk_wav_path = "synthkey.wav";
+    }
+
+    _sk_keys = malloc(NUM_KEYS * 8);
+    _sk_midi = malloc(NUM_KEYS * 8);
+    _sk_freq = malloc(48 * 8);
+    _sk_prev = malloc(NUM_KEYS * 8);
+
+    _sk_init_freq();
+    _sk_init_keys();
+    _sk_init_names();
+    for (i = 0; i < NUM_KEYS; i = i + 1) { _sk_prev[i] = 0; }
+
+    // Recording buffer: 10 seconds @ 44100 stereo s16 = 1,764,000 bytes.
+    _sk_rec_cap = 44100 * 4 * 10;
+    _sk_rec_buf = malloc(_sk_rec_cap);
+    _sk_rec_pos = 0;
+    _sk_recording = 0;
+
+    // Pre-allocated scratch buffer for the fill→push→record loop.
+    // 1024 frames = one CoreAudio buffer worth. Avoids malloc/free
+    // per frame which was causing kernel-call jitter.
+    _sk_fill_buf = malloc(1024 * 4);
+
+    init_beat();
+    audio_open(4096);
+    mixer_init();
+    game_init(320, 180, "SynthKey", 60);
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        // LEFT/RIGHT: waveform fader (sine → tri → saw → square).
+        if (key_down(KEY_RIGHT)) {
+            mixer_set_fader(mixer_get_fader() + 8);
+        }
+        if (key_down(KEY_LEFT)) {
+            auto fv;
+            fv = mixer_get_fader() - 8;
+            if (fv < 0) { fv = 0; }
+            mixer_set_fader(fv);
+        }
+
+        // UP/DOWN: dirt (clean → dirty).
+        if (key_down(KEY_UP)) {
+            mixer_set_dirt(mixer_get_dirt() + 4);
+        }
+        if (key_down(KEY_DOWN)) {
+            auto dv;
+            dv = mixer_get_dirt() - 4;
+            if (dv < 0) { dv = 0; }
+            mixer_set_dirt(dv);
+        }
+
+        // SPACE toggles recording.
+        if (key_pressed(KEY_SPACE)) {
+            if (_sk_recording) {
+                // Stop — save WAV.
+                _sk_recording = 0;
+                auto n_frames;
+                n_frames = _sk_rec_pos / 4;
+                if (n_frames > 0) {
+                    sound_save_wav(_sk_wav_path, _sk_rec_buf, n_frames);
+                }
+            } else {
+                // Start — reset buffer.
+                _sk_rec_pos = 0;
+                _sk_recording = 1;
+            }
+        }
+
+        // Edge detection: press → note_on, release → note_off.
+        for (i = 0; i < NUM_KEYS; i = i + 1) {
+            now = key_down(_sk_keys[i]);
+            was = _sk_prev[i];
+            if (now && was == 0) {
+                midi = _sk_midi[i];
+                freq = _sk_freq[midi - 48];
+                mixer_note_on(midi, freq);
+            }
+            if (now == 0 && was) {
+                mixer_note_off(_sk_midi[i]);
+            }
+            _sk_prev[i] = now;
+        }
+
+        // Feed the audio ring in batches of 1024. Keep filling until
+        // the ring has less than 1024 frames of space — this ensures
+        // the callback always has enough runway. No malloc per frame;
+        // _sk_fill_buf is pre-allocated once.
+        space = audio_ring_space();
+        while (space >= 1024) {
+            auto produced, pushed, bi, batch;
+            batch = 1024;
+            produced = mixer_fill(_sk_fill_buf, batch);
+            pushed = audio_push_frames(_sk_fill_buf, produced);
+            if (_sk_recording && _sk_rec_pos + produced * 4 <= _sk_rec_cap) {
+                for (bi = 0; bi < produced * 4; bi = bi + 1) {
+                    poke(_sk_rec_buf + _sk_rec_pos + bi, peek(_sk_fill_buf + bi));
+                }
+                _sk_rec_pos = _sk_rec_pos + produced * 4;
+            }
+            if (pushed < produced) { space = 0; }
+            else { space = audio_ring_space(); }
+        }
+
+        // ── Draw ──────────────────────────────────────────────
+        clear(_rgb(15, 15, 26));
+
+        // Title.
+        draw_text("SynthKey", 8, 2, 1, _rgb(68, 187, 255));
+        draw_text("C3-B6  8-voice poly", 90, 2, 1, _rgb(85, 85, 119));
+
+        // Piano keys — white first, then black overlay.
+        for (i = 0; i < NUM_KEYS; i = i + 1) {
+            midi = _sk_midi[i];
+            if (_is_black(midi % 12)) { continue; }
+            now = key_down(_sk_keys[i]);
+            if (i < 10)      { row = 3; col = i; }
+            else if (i < 22) { row = 2; col = i - 10; }
+            else if (i < 34) { row = 1; col = i - 22; }
+            else             { row = 0; col = i - 34; }
+            kx = 6 + col * 24;
+            ky = 14 + row * 34;
+            _sk_draw_key(kx, ky, midi, now);
+        }
+        for (i = 0; i < NUM_KEYS; i = i + 1) {
+            midi = _sk_midi[i];
+            if (_is_black(midi % 12) == 0) { continue; }
+            now = key_down(_sk_keys[i]);
+            if (i < 10)      { row = 3; col = i; }
+            else if (i < 22) { row = 2; col = i - 10; }
+            else if (i < 34) { row = 1; col = i - 22; }
+            else             { row = 0; col = i - 34; }
+            kx = 6 + col * 24 + 5;
+            ky = 14 + row * 34;
+            _sk_draw_key(kx, ky, midi, now);
+        }
+
+        // Faders at the bottom.
+        fval = mixer_get_fader();
+        seg_label = fval <= 128 ? "SINE"
+                  : fval <= 384 ? "TRI"
+                  : fval <= 640 ? "SAW"
+                  : "SQR";
+        _sk_draw_fader("WAVE", 155, fval, 768);
+        draw_text(seg_label, 270, 155, 1, _rgb(136, 170, 204));
+        _sk_draw_fader("DIRT", 167, mixer_get_dirt(), 256);
+
+        // Recording indicator.
+        if (_sk_recording) {
+            draw_rect(296, 2, 8, 8, RED);
+            draw_text("REC", 270, 2, 1, RED);
+            auto secs;
+            secs = _sk_rec_pos / (44100 * 4);
+            draw_number(306, 2, 1, RED, secs);
+        }
+
+        draw_end();
+    }
+
+    audio_close();
+    return 0;
+}

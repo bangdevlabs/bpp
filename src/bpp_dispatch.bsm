@@ -26,7 +26,7 @@ auto DSP_SEQ, DSP_PAR, DSP_GPU, DSP_SPLIT;
 // call_graph_build(). Lattice has height 1 (BASE → SOLO is the only
 // transition, no upgrade), so fixpoint converges to the EXACT result
 // in O(call-chain-depth) passes — not approximate.
-auto PHASE_AUTO, PHASE_BASE, PHASE_SOLO, PHASE_REALTIME, PHASE_IO, PHASE_GPU, PHASE_HEAP;
+auto PHASE_AUTO, PHASE_BASE, PHASE_SOLO, PHASE_REALTIME, PHASE_IO, PHASE_GPU, PHASE_HEAP, PHASE_PANIC;
 
 // Per-function arrays parallel to funcs[]. Built by call_graph_build()
 // and consumed by classify_all_functions() and (later) codegen.
@@ -120,6 +120,16 @@ void init_dispatch() {
     // honest annotations. The plan's table had `heap (currently SOLO;
     // eventually distinct)` as a TODO — this makes it distinct.
     PHASE_HEAP = 6;
+    // PHASE_PANIC = never-returns abort path (sys_exit). Bottom element
+    // of the lattice: PANIC ∨ X = X for any X. If a function reaches
+    // sys_exit, the process is dead — no observable effect survives.
+    // The function's effect is whatever it does WHEN IT RETURNS, and
+    // sys_exit never returns. Formally identical to Rust's `!` / Never
+    // type or C++'s [[noreturn]] in effect analysis. Only sys_exit
+    // gets this seed explicitly; other abort paths (diag_fatal, assert
+    // wrappers) inherit IO + PANIC = IO via transitive propagation,
+    // which is correct — they print before dying, so the IO is real.
+    PHASE_PANIC = 7;
     fn_phase = arr_new();
     fn_phase_next = arr_new();
     fn_calls = arr_new();
@@ -194,7 +204,7 @@ void init_dispatch() {
     add_extern_effect(_dsp_pack_cstr("sys_getdents"),     PHASE_IO);
     add_extern_effect(_dsp_pack_cstr("sys_mmap"),         PHASE_HEAP);
     add_extern_effect(_dsp_pack_cstr("sys_munmap"),       PHASE_HEAP);
-    add_extern_effect(_dsp_pack_cstr("sys_exit"),         PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("sys_exit"),         PHASE_PANIC);
     add_extern_effect(_dsp_pack_cstr("sys_fork"),         PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_execve"),       PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_waitpid"),      PHASE_SOLO);
@@ -278,6 +288,9 @@ extern_effect(name_p) {
 // ordering via _dsp_eff_permits below. PHASE_AUTO (0) is the "unknown"
 // bottom and is absorbed by any real value.
 _dsp_eff_join(a, b) {
+    // PANIC is the lattice bottom (⊥). Absorbed by everything.
+    if (a == PHASE_PANIC) { return b; }
+    if (b == PHASE_PANIC) { return a; }
     if (a == PHASE_SOLO) { return PHASE_SOLO; }
     if (b == PHASE_SOLO) { return PHASE_SOLO; }
     if (a == PHASE_AUTO) { return b; }

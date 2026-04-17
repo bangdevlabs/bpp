@@ -488,6 +488,32 @@ _stb_audio_push_frame(left, right) {
     return 1;
 }
 
+// Bulk push — copy `n` stereo s16 frames from `buf` into the ring.
+// Each frame in `buf` is 4 bytes (left lo, left hi, right lo, right
+// hi). Returns the number of frames actually accepted; fewer than
+// `n` means the ring filled mid-copy and the caller should spin
+// briefly and retry with the remainder. One mem_barrier sandwich
+// covers the entire batch so the callback can only observe the
+// updated write index after every byte is in place.
+_stb_audio_push_frames(buf, n) {
+    auto local_read, space, f, widx, off;
+    mem_barrier();
+    local_read = _aud_ring_read;
+    space = _aud_ring_cap - (_aud_ring_write - local_read);
+    if (space > n) { space = n; }
+    for (f = 0; f < space; f = f + 1) {
+        widx = (_aud_ring_write + f) & _aud_ring_mask;
+        off  = f * 4;
+        poke(_aud_ring_data + widx * 4 + 0, peek(buf + off + 0));
+        poke(_aud_ring_data + widx * 4 + 1, peek(buf + off + 1));
+        poke(_aud_ring_data + widx * 4 + 2, peek(buf + off + 2));
+        poke(_aud_ring_data + widx * 4 + 3, peek(buf + off + 3));
+    }
+    mem_barrier();
+    _aud_ring_write = _aud_ring_write + space;
+    return space;
+}
+
 // Report how many frames the consumer callback has drained since
 // `_stb_audio_open`. Used by tests to prove the SPSC ring is alive
 // end-to-end without needing an audible signal.

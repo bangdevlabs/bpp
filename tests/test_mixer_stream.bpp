@@ -1,0 +1,92 @@
+// test_mixer_stream.bpp — Silent smoke test for the stbmixer SPSC path.
+//
+// Opens the audio device, plays two simultaneous voices at low
+// amplitude for ~60 ms, then closes. Asserts that the audio
+// callback fired, the ring drained, and mixer_active_voices
+// reflects note_on / note_off correctly.
+//
+// The amplitude is intentionally scaled down to 1/16th of the
+// default so any audible leak through the hardware is imperceptible
+// during the regression suite. The manual audible path is
+// test_audio_tone (which plays a 2-second buzz).
+
+import "bpp_io.bsm";
+import "bpp_beat.bsm";
+import "stbaudio.bsm";
+import "stbmixer.bsm";
+
+auto FILL_PER_TICK, TOTAL_MS;
+
+main() {
+    auto rc, elapsed, start_ms, active_before, active_after, consumed, cb_count;
+
+    FILL_PER_TICK = 256;
+    TOTAL_MS = 60;
+
+    init_beat();
+    rc = audio_open(4096);
+    if (rc != 0) {
+        print_msg("audio_open failed rc=");
+        print_int(rc);
+        print_ln();
+        return rc;
+    }
+
+    mixer_init();
+    mixer_note_on(1, 440);
+    mixer_note_on(2, 660);
+    active_before = mixer_active_voices();
+
+    start_ms = beat_now_ms();
+    elapsed = 0;
+    while (elapsed < TOTAL_MS) {
+        mixer_stream(FILL_PER_TICK);
+        _stb_audio_sleep_ms(2);
+        elapsed = beat_now_ms() - start_ms;
+    }
+
+    mixer_note_off(1);
+    mixer_note_off(2);
+    active_after = mixer_active_voices();
+
+    _stb_audio_sleep_ms(30);
+
+    consumed = audio_ring_consumed();
+    cb_count = _stb_audio_cb_count();
+    audio_close();
+
+    print_msg("active_before=");
+    print_int(active_before);
+    print_msg(" active_after=");
+    print_int(active_after);
+    print_msg(" consumed=");
+    print_int(consumed);
+    print_msg(" cb_count=");
+    print_int(cb_count);
+    print_ln();
+
+    if (active_before != 2) {
+        print_msg("FAIL: expected 2 active voices after two note_on");
+        print_ln();
+        return 1;
+    }
+    if (active_after != 0) {
+        print_msg("FAIL: voices still active after note_off");
+        print_ln();
+        return 2;
+    }
+    if (cb_count < 1) {
+        print_msg("FAIL: callback never fired");
+        print_ln();
+        return 3;
+    }
+    if (consumed < 1) {
+        print_msg("FAIL: consumer never advanced ring_read");
+        print_ln();
+        return 4;
+    }
+
+    print_msg("OK");
+    print_ln();
+    return 0;
+}

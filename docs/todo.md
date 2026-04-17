@@ -32,9 +32,18 @@ about the language it was written in.
  ─────────────────────────────────────────────────────────────────────
      ↓ WE ARE HERE ↓
  ─────────────────────────────────────────────────────────────────────
-     Dev Loop 2 — `bug` breakpoints
+  ✅ Dev Loop 2 — `bug --break`, `--dump-str`, observer fixes
+  ✅ Type defense L1-L4 — W025/W026, effect lattice (HEAP/PANIC)
+  ✅ stbaudio Day 1-3 — SPSC ring, mixer, stbsound WAV
+  ✅ stbinput full keyboard (77 keys, macOS + Linux)
+  ✅ synthkey — 4-octave polyphonic synth with WAV recording
+ ─────────────────────────────────────────────────────────────────────
+     ↓ WE ARE HERE ↓
+ ─────────────────────────────────────────────────────────────────────
+     stbwindow — lightweight window + native file dialogs (NSSavePanel)
+     snake with audio sample (mixer one-shot + stbsound load)
+     rhythm — Rhythm Teacher demo                      (first 1.0 game)
      Dev Loop 3 — profiler (bench + sampling)
-     stbaudio + Rhythm Teacher demo                    (first 1.0 game)
      Wolf3D Phase 1  — CPU raycaster, 1 level
      Wolf3D Phase 2  — hybrid CPU + GPU
      Dev Loop 4 — hot reload watch mode
@@ -49,108 +58,25 @@ about the language it was written in.
 
 ## Active — in commit order
 
-### 0. Bug queue — two closed, two still open
+### Shipped this sprint (2026-04-16/17) — moved to journal
 
-Four bugs were queued 2026-04-16. Status after the page_count fix
-and W025 retry:
+- ✅ Bug #1 (W025 regression) + Bug #2 (16-seed) — root cause was
+  page_count=1 in Mach-O chained fixups. Fixed.
+- ✅ Bug #3 + #3b (diag line numbers off) — scan_comment not ticking
+  cur_line. Fixed, .bug source map 1-for-1 with source.
+- ✅ W025 — Rule 13 nudge shipped.
+- ✅ Dev Loop 2 MVP — `bug --break`, `--dump-str`, observer fixes.
+- ✅ Type defense L1-L4 — effect lattice with PHASE_HEAP + PHASE_PANIC.
+  W025 + W026. 33 extern seeds. 25 diagnostics total.
+- ✅ stbaudio Day 1-3 — CoreAudio + SPSC ring + bulk push.
+- ✅ stbmixer — 8-voice polyphonic, 4-way waveform fader, dirt, volume.
+- ✅ stbsound — WAV save/load.
+- ✅ stbinput full keyboard — 77 keys, macOS + Linux.
+- ✅ synthkey — 4-octave poly synth with WAV recording.
 
-**Bug #1 — W025 bootstrap regression. ✅ CLOSED 2026-04-16.** The
-"global 'break' not found in data section" error during gen2
-self-compile was the page_count symptom, not a W025 bug. Fixing
-`mo_write_chained_fixups_real` (dynamic page_count, commit
-`df92cb8`) dissolved the regression. W025 shipped the same day:
-minimal `_val_is_unhinted_param` helper + T_BINOP check with
-`diag_help`. Caught `_stb_init_window(w, h, title)` in the first
-scan; annotated to `w: word, h: word` across macos / linux /
-drv_sdl / drv_raylib.
+Full write-up in `docs/journal.md` entry 2026-04-16/17.
 
-**Bug #2 — init_dispatch 16-seed threshold. ✅ CLOSED 2026-04-16.**
-Same root cause as #1. `__DATA` passing 16 KB with the 16th seed
-exposed the hardcoded `page_count = 1`. Dispatch now runs with 33
-seeds and the lattice is the broader shape Level 4 needs.
-
-**Bug #3 + #3b — comment newlines not counted in cur_line. ✅
-CLOSED 2026-04-16.** Single root cause for both. The lexer's
-`scan_comment()` in `bpp_lexer.bsm` skipped over newlines inside
-`//` line comments and `/* */` block comments without ticking
-`cur_line`. Every comment-ended line caused every subsequent
-token to report its source position N lines early, where N is
-the cumulative count of comment-delimited newlines seen so far.
-
-For `_bmem_macos.bsm`: `malloc` at source line 34 had 24 comment
-lines before it, and was reported as line 10. Exactly matches.
-For `bpp_parser.bsm` module-0 parser errors: 357 `//` lines plus
-a handful of block-comment newlines in the first 1905 source
-lines, matching the ~365-line offset reported earlier.
-
-Fix: `scan_comment()` now ticks `cur_line` on every newline it
-crosses, in both the `//` and `/* */` branches. `.bug` source
-map entries now match source line numbers exactly (verified on
-`test_arena.bug`: `malloc` → 34, `malloc_aligned` → 47, `free` →
-63, `realloc` → 74, `memcpy` → 93 — all one-for-one with the
-source). Unblocks `bug --break fn:line` for Dev Loop 2 Day 2+.
-
-### 1. Dev Loop 2 — `bug` runtime observe + `--break` flag
-
-Moved up the priority stack. The existing `bug` binary has:
-- `.bug` file format with symbol map, struct layouts, address map
-- GDB remote protocol client in `bug_gdb.bsm` that speaks `Z0`/`z0`
-  (set/clear software breakpoint), `c` (continue), `s` (step),
-  register reads, memory reads
-- debugserver spawn and attach on macOS
-- Call-tree auto-trace mode (sets breakpoints at every function entry)
-
-What's missing for unblocking bugs #1-3:
-- **Observe-program mode** — `bug <program> [args]` currently prints
-  "TODO". Need to wire the existing infrastructure to actually launch
-  and observe. ~100 LOC.
-- **`--break name` CLI flag** — stop at entry of named function.
-  ~80 LOC argv parsing + address lookup + `gdb_set_bp` call.
-- **`--break name:line` source-line form** — needs `source_pos` in
-  the .bug file (today hardcoded to 0) populated from the parser's
-  `FN_SRC_TOK`. Then address lookup resolves `(file, line)` → function
-  index → byte address via existing maps. ~60 LOC + ~30 LOC in
-  `bpp_bug.bsm`.
-- **Reuse `diag_loc` / `diag_file_line_starts`** from `bpp_diag.bsm`
-  for the tok → line conversion — do NOT hand-roll. The multi-error
-  log already owns this mapping.
-
-MVP total: ~300-400 LOC. Ships as its own sprint. After it ships,
-bugs #1-3 debug in one session.
-
-### 2. Type defense ladder — finish what's open (after Dev Loop 2)
-
-In flight from the 2026-04-16 sprint (`docs/type_defense_plan.md`).
-Levels 1 shipped; 2-partial and 4-partial sit behind the three bugs
-above. Pieces listed below unblock after bugs #1-2 are fixed.
-
-- **W025 full implementation.** Helper + T_BINOP wiring + `diag_help`
-  suggestion. Blocked by bug #1.
-- **Level 4 sub-step B full propagation.** The effect table is seeded
-  with 15 builtins today; adding more blocks on bug #2. Propagation
-  loop (fn_effect fixpoint parallel to fn_phase) is ready to write
-  once the seed can grow.
-- **Level 4 sub-step C enforcement.** Call-site checks using
-  fn_effect. Depends on sub-step B completing.
-- **Sweep 2c full revalidation.** Today's sweep already annotated
-  `: gpu` / `: io` / `: realtime` across stb + games (commit `3ea02a4`
-  and batch 2 on the way). After sub-step C ships, the compiler
-  validates each annotation — any wrong call fires the diagnostic,
-  caught in one pass.
-- **Sweep 2b — essentially empty by happenstance.** stb already
-  follows Rule 13 (`_stb_gpu_clear` has `r: float, …`, phys_body uses
-  int milli-units, rgba packs bytes). 66/0/11 with E233 active proves
-  no silent float-to-int slips through. Reopen only if Level 4 surfaces
-  new violations.
-
-### 1. Dev Loop 2: `bug` breakpoints
-
-`bug foo --break main:42 --break update_enemy`. Translate source:line
-to byte addresses via the `.bug` symbol map, set breakpoints via the
-existing GDB remote protocol client in `bug_gdb.bsm`. Variable watch
-comes for free once breakpoints work. ~400-600 lines in `src/bug.bpp`
-and `src/bug_gdb.bsm`. Ships before Wolf3D Phase 1 — that is where the
-pain of printf-debugging enemy AI shows up.
+### 1. `stbwindow` — lightweight window + native file dialogs
 
 ### 2. Dev Loop 3: Profiler (minimal + sampling)
 
@@ -164,17 +90,47 @@ Two tiers:
 
 Ships before Wolf3D Phase 1.
 
-### 3. `stbaudio.bsm` + Rhythm Teacher demo
+### 3. `stbwindow` — lightweight window + native dialogs
+
+Side quest born from synthkey: opening a window + getting key
+events currently requires the full stbgame stack (GPU, framebuffer,
+game loop). Audio tools, text editors, and utilities shouldn't need
+a game engine just for a window.
+
+**stbwindow** (new module) provides:
+- Window open/close + event loop
+- Key press/release events (same KEY_* enum from stbinput)
+- **Native file dialogs**: NSSavePanel / NSOpenPanel on macOS,
+  Zenity or kdialog on Linux. Platform-agnostic API:
+  `window_save_dialog(title, default_name)` → returns path or 0.
+  `window_open_dialog(title, filter)` → returns path or 0.
+
+This is frontend-agnostic — stbgame can build on top of stbwindow
+(adding GPU, framebuffer, game loop) while standalone tools use
+stbwindow directly.
+
+### 4. Snake with audio sample
+
+Load a WAV recorded from synthkey via `sound_load_wav()`. Play it
+as a one-shot when the snake eats an apple via a new mixer API:
+`mixer_play_once(buf, n_frames)`. The "cobra comendo o próprio
+rabo" demo — B++ tools producing content for B++ games.
+
+### 5. Rhythm Teacher demo (`games/rhythm`)
 
 **Game** (`docs/games_roadtrip.md` Game 1): 320×180 window, 4 lanes,
 notes scroll down, timing graded PERFECT/GOOD/OK/MISS, 3 songs,
 teacher mode (next key one bar ahead). Demo scope: 3 songs, 1
 difficulty, core loop complete.
 
-**Capabilities forced:**
-- WAV loader (PCM 16-bit) — `audio_load(path)`
-- Mixer with N voice slots — `audio_play(voice, sample)`
-- Sample-accurate timing — frame counter from device
+**Shipped capabilities (stbaudio Day 1-3 + stbmixer + stbsound):**
+- ✅ WAV loader/saver — `stbsound.bsm`
+- ✅ Mixer with 8 voice slots — `stbmixer.bsm`
+- ✅ SPSC ring + CoreAudio AudioQueue — `stbaudio.bsm`
+- ✅ Full keyboard input — `stbinput.bsm`
+
+**Still needed:**
+- Sample-accurate timing — bpp_beat integration at mixer level
 - Streaming background music — looped voice slot
 - Audio platform layer: CoreAudio AudioQueue on macOS; ALSA on Linux
   deferred until ELF dynamic linking (see P1).

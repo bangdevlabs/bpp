@@ -3262,3 +3262,38 @@ Suite 61 → 65 passing, 0 failed, 11 skipped.
 **Plan + review discipline held.** Plan mode → Plan agent review → Jedi-master sanity check → implementation, all logged. The Jedi review caught the `vec_get4` tuple (store+reload via stack spill + scalar single-precision reload + CVTSS2SD was the only SSE2-friendly path) before the first encoder was written, and flagged the need for the E231 diagnostic before the first wrong program could be compiled.
 
 **Mini Cooper done marker.** Phases A (bitfields + aligned malloc) + B0 (parser constfold/DCE) + B1 (Sethi-Ullman freelist) + B2 (inline `: base` helpers) + B3 (hot locals in callee-saves) + C (batch 6 tonify) + B4 (`: double` SIMD) have all shipped. The native perf ladder the plan promised is delivered. `stbaudio` and the Rhythm Teacher demo are the next move — they were the whole reason B4 had a specific shape: a 4-wide float mixer with aligned buffers is the shortest path from here to audible output.
+
+## 2026-04-16/17 — Mega session: page_count fix + effect lattice + stbaudio Day 2-3 + synthkey
+
+The longest single session in B++ history. Started debugging a 3-day-old bootstrap regression and ended with a working polyphonic synthesizer with WAV recording.
+
+**Mach-O chained fixups page_count (the bug that blocked everything).** `a64_macho.bsm` hardcoded `page_count = 1` in the chained-fixups header. When `__DATA` grew past 16 KB (tipped by the 16th dispatch seed), dyld rebased only page 0; GOT pointers on page 1 kept their on-disk values and string literal ADRP+ADD reads returned ASLR-shifted garbage. The `dyld[...]: fixup chain entry off end of page` warning had been printing on every build for weeks — nobody read it. `bug --dump-str` pinpointed the bytes in one run. Fix: dynamic page_count + per-page start offsets. Also fixed: `imports_off` was hardcoded `+24` and broke when the header grew.
+
+**W025 shipped (Rule 13 compiler nudge).** The "W025 bootstrap regression" that shelved it 3 days earlier was the page_count bug in disguise. Re-implemented: `_val_is_unhinted_param` + T_BINOP check + `diag_help`. First catch: `_stb_init_window(w, h, title)` using `w * 3.0` — annotated `w: word, h: word` across all 4 backends.
+
+**Bugs #3 + #3b closed.** Lexer's `scan_comment()` skipped newlines without ticking `cur_line`. Every `//` comment line caused all subsequent tokens to report N lines early. `malloc` at source:34 of `_bmem_macos.bsm` came back as line 10 (24 comment lines before it — matched exactly). Fix: tick `cur_line` in both `//` and `/* */` branches. `.bug` source map now 1-for-1 with source files.
+
+**Level 4 effect lattice (sub-steps B + C + PHASE_HEAP + PHASE_PANIC).** Four lattice refinements in one session:
+
+- **L4-B**: `fn_effect[]` populated via extern seeds + call-graph fixpoint. `_dsp_eff_join` implements the lattice join.
+- **L4-C**: W026 fires when `fn_effect` disagrees with `: realtime` / `: io` / `: gpu` annotations. Gradual model — unknown externs default to PHASE_AUTO so only KNOWN violations fire.
+- **PHASE_HEAP**: malloc/free/realloc/memcpy reclassified from SOLO to HEAP. HEAP is subsumed by IO/GPU in the join, so `: io` audio setup that allocates scaffolding stays honestly annotated. `: realtime` still rejects HEAP (the killer check for audio callbacks). The plan's "heap (currently SOLO; eventually distinct)" TODO is now shipped.
+- **PHASE_PANIC**: sys_exit = never-returns = lattice bottom (⊥). `PANIC ∨ X = X`. Functions with error-path `sys_exit` no longer contaminate their effect. Formally identical to Rust's `!` / Swift's `Never`. `_stb_shutdown` (io + sys_exit) resolved cleanly; `_stb_gpu_init` has 1 remaining true-positive (error diagnostics print via sys_write before sys_exit).
+
+Lattice order: `AUTO < BASE < REALTIME < HEAP < {IO, GPU} < SOLO`, PANIC = ⊥ (absorbed by everything).
+
+**stbinput full keyboard.** 40 new Key enum slots (total 77). All 26 letters, punctuation (`- = [ ] ; ' \ , / ``), F1-F12 complete, Ctrl/Alt/Meta, Delete/Home/End/PgUp/PgDn. macOS VKey enum + `_plt_map_vkey` extended. Linux evdev + XQuartz mapping tables extended in parallel. Needed for synthkey's 4-octave layout; benefits every future keyboard-heavy app.
+
+**stbaudio Day 2 — SPSC ring buffer.** `_stb_audio_open(cap_frames)` allocates a power-of-two ring, spins up the CoreAudio queue, starts the consumer callback (`_aud_stream_cb`). Producer feeds via `_stb_audio_push_frame(left, right)` or bulk `_stb_audio_push_frames(buf, n)`. When producer falls behind, callback pads with silence. `mem_barrier` sandwich on both sides. `test_audio_stream.bpp` added (silent, headless).
+
+**stbmixer.bsm — polyphonic 8-voice mixer.** Parallel-array voice state (active / key / hp / amp / phase). Phase increments +1 per sample — identical to the tone-test callback, zero jitter. API: `mixer_init`, `mixer_note_on(key_id, freq)`, `mixer_note_off(key_id)`, `mixer_fill(buf, n)`, `mixer_stream(n)`. 4-way waveform fader (sine → triangle → sawtooth → square) via crossfade blend. Dirt control (bitcrush + decimation/sample-and-hold). Master volume.
+
+**stbsound.bsm — audio file formats.** `sound_save_wav(path, buf, n_frames)` writes RIFF PCM WAV (44100 stereo s16). `sound_load_wav(path)` reads and returns frame count + buffer. Pure I/O + format, no device dependency.
+
+**tools/audio/synth/synthkey.bpp — the demo.** 4-octave polyphonic keyboard synth. ZXCV/ASDF/QWERTY/numrow = MIDI 48-95. Press to sustain, release to stop. LEFT/RIGHT = waveform shape (sine → tri → saw → square). UP/DOWN = dirt (clean → bitcrush + decimation). SPACE = record/stop WAV. Note names + octave numbers drawn inside each key. Piano-style UI with white/black key layout and highlight on press. Two visual faders (WAVE + DIRT).
+
+**Audio quality investigation.** The WAV recording sounded clean while real-time playback had "fritação" (digital crackling). Root cause: the fill loop capped at 512 samples/frame but the device consumed 735/frame (44100÷60). Deficit of 223 samples/frame drained the ring in ~5 seconds → callback hit silence gaps → clicks. Also: `malloc` + `free` every frame for the scratch buffer = kernel call per frame = timing jitter. Fix: pre-allocated 1024-frame scratch buffer, fill loop runs in batches until ring is topped up. Real-time playback now matches the WAV quality.
+
+**New stb modules:** stbmixer (16th module), stbsound (17th module).
+
+Suite 66 → 68 passing (test_audio_stream + test_mixer_stream). Bootstrap sha stable throughout. 25 active diagnostics (W025 + W026 added).

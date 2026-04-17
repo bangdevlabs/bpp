@@ -1,10 +1,32 @@
 # B++
 
-### B++ 0.23.x — Language Syntax Complete, Smart Dispatch, Mini Cooper Phase A + B0 — 14 April 2026
+### B++ 0.70 — Polyphonic Synthesizer, Audio Stack, Effect Lattice — 17 April 2026
 
-Self-hosting compiler with **three playable GPU games** (Snake, Pathfinder, Platformer with Kenney assets), **Snake running on Linux via raw X11 wire protocol** (no FFI, no libX11, no Xlib — just `sys_socket` over a Unix socket), and **parallel runtime** via the maestro pattern (worker pool + SPSC queues + jazz/rock solo-base-render phases). The language shape locked in for 1.0: 22 keywords + 6 annotations (`load` / `static` / `void` / `switch` / `continue` / `extrn` / `global`; `: base` / `: solo` / slice hints). **Smart dispatch engine shipped**: call-graph + fixpoint purity classifier + auto-promote of `auto` to `const` / `extrn` / `global`; only the codegen rewrite remains. **Mini Cooper Phase A + B0**: bitfields (`: bit` through `: bit7`), `malloc_aligned`, parser-level constant folding + DCE, `T_TERNARY` AST node, `&&` / `||` desugared to T_TERNARY so short-circuit is canonical. **Foundation refactor**: `.bo` cache removed (every compile from source at 0.27 s), repo split into `chip` / `os` / `target` / `c` backend layers, `bsys` syscall tables, `bmem` pure-B++ allocator, `brt0` runtime startup in B++ source. Suite at **59 passed / 0 failed / 11 skipped** with eight new canonical feature tests.
+A self-hosting compiled language with a **working 8-voice polyphonic synthesizer** in 300 lines of B++. Four waveforms (sine, triangle, sawtooth, square) morphed by a continuous fader. Bitcrush + decimation dirt control. WAV recording. All running on a native audio stack built from scratch — CoreAudio FFI, SPSC ring buffer, realtime callback — with zero external dependencies.
 
-> **Version 0.23.x**: B++ ships **1.0** when a complete indie retro game is shipped, end to end, in pure B++. Until then we count fractional progress.
+The synthesizer is not a demo. It is a musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. Press keys, hear notes, modulate timbre, record to disk.
+
+> **Version 0.70**: 68 tests pass. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
+
+---
+
+## The Synthesizer
+
+`tools/audio/synth/synthkey.bpp` — 300 lines, polyphonic, 4 octaves (C3–B6), WAV recording:
+
+```
+bpp synthkey.bpp -o synth && ./synth
+```
+
+| Control | What it does |
+|---------|-------------|
+| **Keyboard rows** (ZXCV / ASDF / QWERTY / 1234) | 46 chromatic keys across 4 octaves. Press to sustain, release to stop. 8 simultaneous voices. |
+| **LEFT / RIGHT** | Waveform morph: sine (clean) → triangle → sawtooth → square (harsh) |
+| **UP / DOWN** | Dirt: clean signal → bitcrush + sample-and-hold decimation |
+| **SPACE** | Toggle WAV recording (saves to disk on stop) |
+| **ESC** | Quit |
+
+The same audio stack powers the game engine. Snake can play a WAV sample recorded in synthkey. Rhythm Teacher (next) will use the mixer for sample-accurate note timing.
 
 ---
 
@@ -30,20 +52,35 @@ B++ is that alternate timeline.
 
 A language with the soul of B — every value is a word, no type declarations, no header files — but with 64-bit words, named struct fields, an orthogonal type system, and a compiler that produces native binaries directly. No assembler. No linker. No external tools.
 
-But what if Sean Barret later joined tha group with his STB all written in B++?
+But what if Sean Barrett later joined that group with his STB — all written in B++?
 
-And now we have a standard library that is, itself, a game engine and is ready to ship!
+And now we have a standard library that is, itself, a game engine. With audio. And it just played its first chord.
 
-## Latest (14 April 2026 — version 0.23.x)
+## From Silence to Music
 
-- **Mini Cooper Phase A + B0 shipped** — bitfields (`: bit` through `: bit7` with LSB-first packing, UBFX/BFI on ARM64 and SHR+AND on x86_64), `malloc_aligned(size, alignment)` built-in (uniform 16-byte bmem header, SIMD-ready), parser-level constant folding (`3 + 5` → `8`) and dead-code elimination (`if (0)` / `if (1)` / `while (0)` collapsed before the backends see them).
-- **Ternary operator `?:` and short-circuit `&&` / `||`** — new `T_TERNARY` AST node, parser rewrites `a && b` → `T_TERNARY(a, b, 0)` and `a || b` → `T_TERNARY(a, 1, b)` so null-pointer guards like `if (p != 0 && p.field > 0)` are memory-safe on every backend. C emitter leans on C's native `?:`; both chip backends emit a single canonical handler.
-- **Foundation refactor** — `.bo` module cache removed (~630 lines net, the #1 historical bug source), repo split into `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + `c/`. Syscalls collapsed into per-OS `BSYS_*` tables; `malloc` / `free` / `realloc` / `putchar` / `getchar` demoted from codegen builtins to real B++ functions in `bmem` / `bio`. Linux static ELF binaries now link literally nothing.
-- **Language syntax complete for 1.0** — 22 keywords + 6 annotations. `load` (project-local imports), `static` (module-private with W020), `void` (implicit return 0), `switch` (value + condition dispatch, jump-table codegen for dense integer arms), `continue`, `extrn` (write-once-then-frozen storage class), `global` (worker-shared). Annotations `: base` / `: solo` bind to the smart dispatch engine.
-- **Smart dispatch engine shipped (codegen rewrite pending)** — `call_graph_build` + `classify_all_functions` fixpoint + `promote_globals` auto-classification + `mark_reachable` BFS. `--show-promotions` prints every verdict. Lazy emit shrinks snake from 69 KB to 33 KB (52%).
-- **Snake on Linux** via raw X11 wire protocol (zero FFI, zero libX11, zero libc on ELF). Cross-compile + Docker + XQuartz.
-- **Tonify campaign** (batches 1-5 complete, ~350 `void` + ~200 `static` + ~50 `: base`), Node struct sliced (29% smaller AST), Rule 8 (typed struct access), Rule 9 (`var` vs `auto` struct decl), Rule 10 (portable built-ins), Rule 11 (ternary + short-circuit idioms) — all codified in `docs/tonify_checklist.md`.
-- **23 stb modules + 2 platform layers** (in chip backends): draw, render, sprite, tile, phys, path, font, game, input, ui, math, col, color, array, hash, str, buf, file, io, image, arena, pool, ecs.
+Two weeks ago B++ could draw pixels but couldn't make a sound. The compiler worked, the games ran, but the speakers were silent.
+
+Then we cleaned the house. Eight modules moved from `stb/` into `src/` — array, hash, buf, str, io, math, file, arena — because they weren't game library code, they were foundation. Things every program needs. They became auto-injected: no import line required, just call the function and it's there. On top of them we built `bpp_beat` (a monotonic clock that thinks in milliseconds, microseconds, samples, BPM, and frames), `bpp_job` (a worker pool with lock-free SPSC queues and `mem_barrier` fences), and `bpp_maestro` (a game loop that splits work into solo, base, and render phases — jazz band, not orchestra).
+
+The repo got reorganized. `src/backend/chip/` for instruction encoding, `os/` for syscalls and platform code, `target/` for binary formats, `c/` for the transpiler. The `.bo` module cache — the #1 historical source of bugs — got deleted entirely. Every compile runs from source now. Takes 0.27 seconds. Nobody misses the cache.
+
+The language syntax locked in. `switch` with jump tables. `?:` ternary. `&&`/`||` short-circuit. `static` for module privacy. `void` for functions that return nothing. `extrn` for write-once state. `global` for shared mutable state. Bitfields (`: bit` through `: bit7`). 128-bit SIMD (`: double`, eleven `vec_*` builtins on NEON and SSE2). Every keyword earned its place because a game or tool needed it.
+
+Then came the tonify sweep — a week of reading every line of B++ code written so far and asking "does this say what it means?" 350 functions got `void`. 200 got `static`. 50 got `: base` (verified pure by the compiler). The Node struct that holds the AST shrank 29% by slicing fields to byte-width. The smart dispatch engine — call-graph analysis + fixpoint purity classifier — shrank Snake from 69 KB to 33 KB just by not emitting dead code.
+
+And then we turned the sound on.
+
+`stbaudio` opens the audio device via CoreAudio FFI. A lock-free ring buffer sits between the main thread (producer) and CoreAudio's realtime callback (consumer). `stbmixer` runs eight voices simultaneously — sine, triangle, sawtooth, square — blended by a continuous fader with bitcrush and decimation for that digital dirt. `stbsound` reads and writes WAV files.
+
+We didn't plan to build a synthesizer. The plan said "audio stack, then Rhythm Teacher game." But the infrastructure was strong enough that a 300-line polyphonic synth fell out naturally. 46 chromatic keys across 4 octaves, 8 simultaneous voices, waveform morphing, dirt control, WAV recording. Someone sat down and played chords.
+
+The compiler now understands effects. Every function carries a classification — pure, heap, I/O, GPU, realtime, or solo — propagated through the call graph by a fixpoint lattice. The audio callback is annotated `: realtime`. If someone accidentally adds a `malloc` or a `putchar` inside the callback path, W026 fires at compile time. The click never reaches the speakers.
+
+The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
+
+23 compiler modules in `src/`. 18 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 68 tests, zero failures.
+
+The version number is the test count.
 
 ## The Language
 
@@ -91,47 +128,44 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 
 ## What B++ Has
 
-**Language:**
-- **64-bit words** — every value is a 64-bit integer or double
-- **Structs** — `struct Vec2 { x, y }` with heap or stack allocation, packed fields
-- **Enums** — `enum State { MENU, PLAY, PAUSE, OVER }` resolved at compile time
-- **Constants** — `const W = 320;` and `const abs(x) { ... }` with dead code elimination
-- **Type hints** — `auto x: byte`, `auto f: half float` — 5 bases × 4 slices (11 real types)
-- **Pointers** — `*(ptr)` dereference, `&var` address-of, `buf[i]` array indexing, `obj.field` struct access
-- **Syntax sugar** — `buf[i]`, `for` loops, `else if`, string escapes (`\n`, `\t`, `\xHH`)
-- **FFI** — call any C library: `import "SDL2" { void InitWindow(...); }`
-- **Float math** — pure B++ `sqrt` (Newton-Raphson), IEEE 754 doubles, half/quarter float codegen
-- **Memory** — `malloc`/`free`/`realloc` with Bell Labs style headers (size stored at ptr-8, real munmap)
+**Language core:**
+- **Typeless words** — every value is a 64-bit slot that can hold an integer, a pointer, or a packed value
+- **Optional slices** — `auto x: byte`, `: quarter`, `: half`, `: float`, `: double` (128-bit SIMD), `: bit3` for packed struct fields. One unified ladder from 1 bit to 128 bits
+- **Structs with dot access** — `struct Vec2 { x, y }`, `p.x = 10`, field-packing with bit slices
+- **Enums** — `enum State { MENU, PLAY, OVER }` resolved at compile time
+- **Constants and compile-time functions** — `const W = 320;` and `const abs(x) { ... }` with dead-code elimination lifted to the parser
+- **Pointers** — `*(ptr)` dereference, `&var` address-of, `buf[i]` array, `obj.field` struct access
+- **Storage classes** — `auto` (default), `static` (module-private), `extrn` (frozen post-init), `global` (worker-shared), `const` (compile-time)
+- **Phase annotations** — `: base` (pure), `: solo` (main-thread), `: realtime` (no malloc, no blocking), `: io`, `: gpu`. Compiler infers; programmer overrides
+- **Ternary and short-circuit** — `x = a ? b : c;`, `if (p != 0 && p.field > 0)` both lowered in the parser (one implementation, every backend inherits)
+- **SIMD** — 11 `vec_*` builtins lowering to NEON (ARM64) or SSE2 (x86_64). `auto v: double` allocates from the SIMD register pool
+- **Smart dispatch** — compiler analyzes purity across the call graph and auto-parallelizes worker-safe loops into `job_parallel_for`
+- **FFI** — `import "SDL2" { void InitWindow(...); }` calls any C library
 
 **Compiler:**
-- **Self-hosting** — the compiler compiles itself (fixed-point verified)
-- **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in codesign, zero external tools
+- **Self-hosting** — the compiler compiles itself, fixed-point verified
+- **Native binaries** — ARM64 Mach-O + x86_64 ELF, built-in SHA-256 codesign, zero external toolchain
 - **Cross-compilation** — `bpp --linux64 game.bpp -o game` from macOS
-- **Modular compilation** — Go-style per-module codegen with content-addressed `.bo` cache
-- **O(1) symbol tables** — six linear-scan lookups in the compiler refactored to hash queries via stbhash (eager / lazy / incremental strategies per call site)
-- **Auto-injected platform layer** — the compiler pulls `_stb_platform_<target>.bsm` automatically when `stbgame` is in the import graph; library code never names the platform module
-- **Diagnostics** — error codes (E001-E201), warnings (W001-W012), file:line:caret locations
+- **Own runtime (libb)** — `bmem` allocator via `sys_mmap`, `brt0` startup code, `bsys` syscall tables. Native binaries have zero libc dependency
+- **Module discipline** — `static` private to module, `load` vs `import` separates project from library, circular imports are errors (E222), cross-module duplicates are errors (E221)
+- **Effect lattice** — PANIC ≤ BASE ≤ {IO, GPU, HEAP} ≤ SOLO propagated by a fixpoint classifier. Compiler proves `audio_callback: realtime` never reaches `malloc`
+- **Three-backend split** — `chip/`, `os/`, `target/`. Adding Linux ARM64 or Windows is a folder, not a rewrite
+- **Diagnostics** — 25 error/warning codes with `file:line:caret` locations, multi-error recovery, 20-error cap
+- **Self-compile speed** — ~0.1 seconds from scratch, no cache
 
 **Debugger (`bug`):**
-- **Zero-flag debugging** — `./bug ./program` just works, reads symbol table from binary
-- **Function tracing** — call depth indentation, every function entry logged
-- **Crash backtrace** — frame pointer chain walk shows full call stack
-- **Local variable dump** — reads variable values from stack frame on crash (with `--bug`)
-- **Cross-platform** — debugserver (macOS) + gdbserver (Linux) via GDB remote protocol
+- **Zero-flag** — `./bug ./program` reads the symbol table and runs
+- **GDB remote protocol** — debugserver (macOS) + gdbserver (Linux), no entitlements, no codesign dance
+- **Function tracing** — call depth indentation on every entry
+- **Crash backtrace** — frame pointer chain with full call stack
+- **Local variables** — stack frame dump on crash when compiled with `--bug`
 
-**Game engine (stb):**
-- **GPU rendering** — Metal (macOS), Vulkan planned (Linux) — native API, no wrappers
-- **GPU sprites** — any-size palette-indexed sprites: JSON load → RGBA → Metal texture → draw at scale
-- **Tilemap engine** — grid + collision layer + PNG tileset loader + camera-aware GPU draw with type remap
-- **Platformer physics** — milli-pixel Body, gravity, impulse jumping, separate-axis tile collision, ground probe
-- **A\* pathfinding** — pure B++ A\* on a grid, binary min-heap with indexed decrease-key, leaf module, used by the cat AI in Pathfinder
-- **Hash maps** — open addressing with linear probing, word keys (Knuth) and byte-sequence keys (djb2), tombstones, used by the compiler symbol tables
-- **Software rendering** — CPU framebuffer with rects, circles, lines, sprites, text
-- **Text rendering** — bitmap 8×8 fallback + pure B++ TrueType reader (cmap, glyf, Bézier, scanline AA)
-- **Image loading** — pure B++ PNG loader with tRNS transparency (DEFLATE, Huffman, all filter types, zero FFI)
-- **Game infrastructure** — arena allocator, object pool, entity-component system
-- **Collision** — rect overlap, point-in-rect, distance² (squared, no sqrt needed)
-- **23 modules** in `stb/` — draw, render, sprite, tile, phys, **path**, font, game, input, ui, math, col, color, array, **hash**, str, buf, file, io, image, arena, pool, ecs. Plus 2 platform layers that live alongside the per-chip backends in `src/aarch64/` and `src/x86_64/` (auto-injected by the compiler when `stbgame` is in the import graph).
+**Audio stack:**
+- **stbaudio** — CoreAudio AudioQueue FFI, SPSC ring buffer, realtime callback annotated `: realtime`
+- **stbmixer** — polyphonic 8-voice mixer, 4 waveforms (sine/tri/saw/square) with continuous morph, bitcrush + decimation distortion, master volume
+- **stbsound** — WAV read/write, RIFF PCM 44100 stereo s16
+
+The first B++ audio program was a 440 Hz sine tone. The second was a 300-line polyphonic synthesizer with WAV recording, 46 keys mapped to 4 chromatic octaves, waveform and dirt controls, zero glitches under load. See `tools/audio/synth/synthkey.bpp`.
 
 ## What B++ Doesn't Have
 
@@ -190,6 +224,14 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
 | `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics |
 
+**Audio:**
+
+| Module | What it does |
+|--------|-------------|
+| `stbaudio` | Audio device I/O — CoreAudio AudioQueue, SPSC ring buffer, realtime callback |
+| `stbmixer` | Polyphonic 8-voice mixer — square/sine/tri/saw waveforms, fader morph, dirt (bitcrush + decimation), master volume |
+| `stbsound` | Audio file formats — WAV read/write (RIFF PCM 44100 stereo s16) |
+
 **I/O & assets:**
 
 | Module | What it does |
@@ -203,7 +245,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `_stb_platform_macos` | Cocoa window, Metal GPU, texture upload, CoreGraphics software, keyboard/mouse |
-| `_stb_platform_linux` | Terminal ANSI rendering, keyboard input |
+| `_stb_platform_linux` | X11 wire protocol (raw socket), terminal ANSI fallback, keyboard input |
+| `_stb_audio_macos` | CoreAudio AudioQueue FFI, realtime callback, SPSC ring consumer |
 
 Two rendering paths: `stbdraw` for CPU software rendering (framebuffer → CoreGraphics/ANSI), `stbrender` for GPU-accelerated rendering (Metal on macOS, Vulkan planned for Linux). Same game code — just swap `draw_*` for `render_*` and add `render_init()` after `game_init()`.
 
@@ -448,21 +491,29 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/              — Compiler core (self-hosting, ~18 B++ modules)
-│   ├── aarch64/      — ARM64 backend (encoder, codegen, Mach-O writer)
-│   └── x86_64/       — x86_64 backend (encoder, codegen, ELF writer)
-├── stb/              — Standard B Library (23 modules, pure B++, the game engine)
-├── games/            — Complete playable games
-│   ├── snake/        — Snake with ECS particles + ranking
-│   ├── pathfind/     — Rat-and-cat chase with AI pursuit
-│   └── platformer/   — Side-scrolling platformer with Kenney assets
-├── examples/         — Small demos (hello, mouse, gpu_colours, raylib/sdl)
-├── drivers/          — Backend drivers (SDL2, raylib — optional)
-├── tests/            — Compiler and library tests
-├── docs/             — Language manual, journal, TODO, plan reviews
-├── ~/.bpp/cache/     — Global module cache (.bo files, content-addressed)
-├── bpp               — The compiler binary
-└── bug               — The debugger binary
+├── src/                        — Compiler core + universal runtime (23 B++ modules)
+│   ├── bpp_*.bsm               — Core utilities (array, hash, buf, str, io, math, file, arena)
+│   ├── bpp_beat/job/maestro    — Clock, worker pool, game loop orchestrator
+│   └── backend/
+│       ├── chip/aarch64/       — ARM64 encoder + codegen
+│       ├── chip/x86_64/        — x86_64 encoder + codegen
+│       ├── os/macos/           — libSystem FFI, platform layer, audio
+│       ├── os/linux/           — X11 wire protocol, syscalls
+│       ├── target/aarch64_macos/ — Mach-O writer
+│       ├── target/x86_64_linux/  — ELF writer
+│       └── c/                  — C transpiler (portable escape hatch)
+├── stb/                        — Standard B Library (18 modules, game engine)
+├── tools/audio/synth/          — Polyphonic synthesizer (300 lines)
+├── games/                      — Complete playable games
+│   ├── snake/                  — Snake with ECS particles + ranking
+│   ├── pathfind/               — Rat-and-cat chase with AI pursuit
+│   └── platformer/             — Side-scrolling platformer with Kenney assets
+├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
+├── drivers/                    — Backend drivers (SDL2, raylib — optional)
+├── tests/                      — Compiler and library tests (68 passing)
+├── docs/                       — Language manual, journal, TODO, bootprod_manual
+├── bpp                         — The compiler binary
+└── bug                         — The debugger binary
 ```
 
 ## Platform Status
@@ -502,7 +553,7 @@ bpp --show-deps source.bpp     # print module dependency graph
 bpp --clean-cache              # delete all cached .bo files
 ```
 
-16 compiler core modules + 5 files per chip backend (`src/aarch64/`, `src/x86_64/`) + 23 stb library modules, ~17,000 lines of B++. Self-hosting verified at every stage (`shasum bpp2 == bpp3`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/aarch64/`, `src/x86_64/`, `/usr/local/lib/bpp/` and its subfolders.
+23 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 18 stb library modules, ~20,000 lines of B++. Self-hosting verified at every commit (`shasum gen1 == gen2`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
 
 ### The Debugger
 
@@ -562,62 +613,41 @@ SOFTWARE.
 
 ---
 
-*B++ was designed and implemented by Daniel Obino, 2026.*
+## Timeline
 
-*The compiler bootstrapped itself on March 20, 2026.*
+B++ is 30 days old. The following are the milestones, in order:
 
-*Zero-dependency native compilation on March 23, 2026.*
+| Date | Milestone |
+|------|-----------|
+| **Mar 18** | First parser written in B++. Bootstrap stage 2 reached. |
+| **Mar 20** | **Self-hosting** — compiler compiles itself, fixed-point verified. |
+| **Mar 23** | Zero-dependency native compilation (ARM64 Mach-O, built-in codesign). |
+| **Mar 24** | Native game rendering with no external libraries. |
+| **Mar 25** | x86_64 Linux cross-compilation. Clang-style diagnostics with source locations. |
+| **Mar 26-27** | Modular compilation + dynamic arrays + type hints + packed structs + mouse input. |
+| **Mar 27** | **Type system final** — base × slice grid, orthogonal composition, f16/f32/f64 float codegen. |
+| **Mar 31** | **GPU rendering via Metal** — native 2D pipeline, platform-agnostic trig. |
+| **Apr 1** | Syntax sugar — `buf[i]`, `for`, `else if`, string escapes. |
+| **Apr 2** | **Bug debugger v2** — debugserver/gdbserver via GDB remote protocol, zero flags, crash backtrace, local variables. |
+| **Apr 3** | Pure B++ TrueType reader. Metal glyph atlas. Bell Labs malloc/free/realloc. |
+| **Apr 5** | GPU sprites any size. Pure B++ `sqrt` via Newton-Raphson. Pathfinder game ported. |
+| **Apr 6** | **B++ 0.2** — Tilemap engine, platformer physics, address-of operator, PNG tRNS transparency, Kenney Pixel Platformer (CC0). |
+| **Apr 6** | **B++ 0.21** — Linux X11 (wire protocol, Unix + TCP socket, 1160 lines). Snake runs on Linux via Docker + XQuartz. |
+| **Apr 6** | stbhash + stbpath + O(1) compiler symbol tables. Auto-injected platform layer. |
+| **Apr 8** | **B++ 0.22** — Maestro Phase 1 (worker pool, SPSC queues, jazz metaphor). `global` keyword. Four structural compiler bugs fixed. |
+| **Apr 9** | **B++ 0.23** — Language syntax locked in. `load`/`static`/`void`/`:base`/`:solo`. Smart dispatch engine (fixpoint classifier + auto-promotion). 8 MB arena-backed AST. Lazy emit shrinks Snake 52%. |
+| **Apr 11** | Tonify batches 1-5. `switch` with jump tables. Multi-error recovery. Node struct sliced 29% smaller. Maestro accumulator pattern. |
+| **Apr 13-14** | **Foundation refactor** — `.bo` cache deleted (#1 bug source across history). Repo reorganized into chip/os/target/c. `bsys`/`brt0`/`bmem` libb replaces libc on the native path. Switch jump tables. |
+| **Apr 14** | **Mini Cooper Phase A + B0** — Bitfields (`: bit3`). `malloc_aligned`. `T_TERNARY` side quest closes short-circuit divergence. Const fold + DCE lifted to parser. |
+| **Apr 15-16** | **Mini Cooper B1-B4 complete** — Sethi-Ullman register allocation. Inline of small `: base` helpers. Local register allocation across callee-saved regs. `: double` 128-bit SIMD with 11 `vec_*` builtins (NEON + SSE2). Tonify sweep across every codegen file. |
+| **Apr 16** | **Smart dispatch Phase 2** — compiler auto-parallelizes worker-safe loops into `job_parallel_for` with zero programmer intervention. |
+| **Apr 16** | **First sound** — `stbaudio` opens CoreAudio device. 440 Hz sine tone plays through the speakers from B++ code. |
+| **Apr 17** | **Polyphonic synthesizer** — 300-line `synthkey.bpp` with 4 octaves, 8 voices, 4 waveforms with continuous morph, bitcrush + decimation dirt, WAV recording. A musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. |
 
-*Native game rendering without external libraries on March 24, 2026.*
+B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into `docs/bootprod_manual.md` as canonical rule. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 
-*Compiler diagnostics and x86_64 Linux cross-compilation on March 25, 2026.*
+The version number is the test count. When the test count reaches the point where a complete indie retro game ships end-to-end in pure B++, that's 1.0.
 
-*Modular Compilation, Dynamic Arrays, Type Hints, and Backend Reorganization on March 26, 2026.*
+---
 
-*Cache modular fix, memcpy/realloc builtins, per-variable hints, mouse events, install script on March 26, 2026.*
-
-*float_ret Builtins, Go-Style Cache, Type System Fixes, Mouse Tracking on march 27, 2026*
-
-*Mach-O Fix, Packed Structs, shr/assert, C Emitter, Input Lag on March 27, 2026*
-
-*Type System Refactor: base × slice grid, f32/f16 support, orthogonal type composition on March 27, 2026.*
-
-*.bo cache fix, compiler self-hash on March 30, 2026.*
-
-*Optimized type encoding (bit-0 float flag), FLOAT_H/Q codegen, putchar_err, parser half-float fix on March 31, 2026.*
-
-*GPU rendering via Metal, Go-style cache, string escape sequences on March 31, 2026.*
-
-*Cache system overhaul (4 bugs), GPU render API (lines, circles, outlines), platform-agnostic trig on March 31, 2026.*
-
-*Syntax Sugar + Codebase Cleanup on April 1, 2026.*
-
-*Cache Fix, sys_fork, Bug Debugger, Structural Overhaul on April 1, 2026.*
-
-*Game Infrastructure: Arena allocator, Object Pool, Entity-Component System, Syscall Builtins, Bug Debugger Fixes on April 2, 2026.*
-
-*Bug Debugger v2: debugserver/gdbserver backend, GDB remote protocol, zero-flag debugging, crash backtrace + locals, sys_socket/sys_connect/sys_usleep builtins, Mach-O symbol table export on April 2, 2026.*
-
-*GPU Text + TrueType + realloc: pure B++ TrueType reader, Metal glyph atlas, Bell Labs malloc/free/realloc, stbimage PNG loader, module reorganization on April 3, 2026.*
-
-*GPU Sprites + Module Cache Fix: stbsprite.bsm (any w×h), pure B++ sqrt, 3 critical .bo cache bugs fixed (param types + return types + null terminators), pathfinder game ported on April 5, 2026.*
-
-*B++ 0.2 — Tilemap, Physics, Address-of, Kenney assets: stbtile.bsm (tilemap engine), stbphys.bsm (platformer physics), address-of operator `&x` (9 compiler files + W012 diagnostic), PNG tRNS transparency, Metal alpha discard, platformer with Kenney Pixel Platformer assets (CC0), ECS particle alpha bug fixed on April 6, 2026.*
-
-*B++ 0.21 — Linux X11, Validator Integration, C Emitter Modernized: X11 wire protocol Phases 1-3 (`_stb_platform_linux.bsm` 276 → 1160 lines, Unix socket + TCP, handshake, CreateWindow with FocusChangeMask, XPutImage, evdev/Apple keycode auto-detect, FocusOut stuck-key fix, WM_DELETE close, WM_NAME title), validator integrated into the incremental ARM64/x86_64 pipeline (was monolithic-only since written), E052 phantom check removed, `bpp_typeck.bsm` 507-line orphan deleted, C emitter modernized (8 builtins added, extern dedup with varargs, libc symbol skip), Snake running on Linux via Docker + XQuartz, raylib path verified end-to-end on April 6, 2026.*
-
-*B++ 0.21 — stbhash, stbpath, O(1) Compiler Symbols, Auto-Platform: stbhash.bsm (word + byte-keyed hash maps, ~610 lines, used by the compiler), stbpath.bsm (A* with binary heap + indexed decrease-key, leaf module, ~440 lines), six compiler symbol lookups refactored from linear scan to O(1) hash (val_find_func/extern eager, find_func_idx eager, find_struct incremental at parser AND bo cache loader, is_extern/find_extern lazy), platform/observe files moved into chip folders (`src/aarch64/`, `src/x86_64/`) with chip+OS coupling READMEs, `_stb_platform.bsm` auto-injected by the compiler when stbgame is in the import graph (explicit import removed from stbgame.bsm), pathfind game refactored to milli-unit + tilemap + A* cat AI, test suite cleaned (71 → 52 tests, 100% passing), 23 stb modules + 2 platform layers in chip folders on April 6, 2026.*
-
-*B++ 0.22 — Foundation Cleanup, Maestro Phase 1, Four Compiler Bug Fixes: eight modules promoted from `stb/` to `src/` as `bpp_*.bsm` (defs, array, hash, buf, str, io, math, file — compiler primitives and universal utilities no longer pretending to be standard library), `bpp_beat.bsm` + `bpp_job.bsm` + `bpp_maestro.bsm` shipping the first parallel B++ runtime (worker pool, SPSC queues, fixed-timestep frame loop, jazz/rock solo-base-render metaphor canonized), `mem_barrier` builtin (ARM64 DMB ISH + x86_64 MFENCE + C `__sync_synchronize`), pthread FFI via libSystem, snake_maestro.bpp as the first parallel game, `global` keyword as the foundation stone of smart dispatch, four latent compiler bugs fixed (pathbuf clobber on nested `process_file`, inode reuse poisoning macOS codesign cache, pthread-after-NSApp SIGTERM, install.sh ghost files from pre-0.21 directory moves) on April 8, 2026.*
-
-*B++ 0.23 — Language Syntax Complete, Smart Dispatch Engine, Module Discipline: `load` / `static` / `void` keywords and `: base` / `: solo` annotations (the boundary between programmer-written and compiler-inferred locks in for 1.0), full smart dispatch implementation (`call_graph_build`, `classify_all_functions` double-buffered fixpoint on a height-1 lattice, `promote_globals` analysis, `mark_reachable` BFS, `--show-promotions` and `--stats` flags), function dedup + `stub` keyword + E105 (main in .bsm) + E221 (cross-module duplicate) + E222 (circular import), arena-backed AST via `bpp_arena.bsm` (8 MB arena, cache-local AST walks), Clang-style diagnostics with source line + caret + `Node.src_tok` position tracking, lazy emit shrinking snake from 69 KB to 33 KB (52%), bug debugger Level 1 with `[auto]` / `[global]` / `[extrn]` tags per variable, `continue` + `extrn` + `envp` / `getenv` on April 9, 2026.*
-
-*B++ 0.23.1 — Cache Integrity, Diagnostic Accuracy, Tonify Infrastructure: two critical cache bugs fixed (auto-injected modules recording dep edges so cross-module invalidation works, `bo_read_export` populating `fn_static` / `fn_void` / `fn_phase_hint` to match `funcs[]` length), `docs/tonify_checklist.md` codified as the expert-mode reference for sweeping `.bsm` files, Rule 4 warning about `: base` on builtin-calling functions documented after the first W013 fire during batch 1, `bpp_io` / `bpp_array` / `bpp_buf` / `bpp_str` tonified as batch 1 canary on April 9, 2026.*
-
-*Tonify Batches 1-5, Switch Statement, Multi-Error Diagnostics, Node Struct Slice, LDRSW Sign-Extension: ~350 `void` annotations + ~200 `static` markers + ~50 `: base` annotations + ~50 `while`-with-counter converted to `for` across 15 stb modules + 12 compiler internals + both platform layers, `switch` statement with value and condition dispatch forms (no fallthrough, jump-table codegen for dense integer arms, W021 exhaustiveness warning), `bare return;` in void functions, multi-error `diag_error` accumulation with capped output, Node struct sliced (`ntype: byte` / `dispatch: byte` / `itype: byte` shrinking the AST 29%), RECORD_SZ decoupled from NODE_SZ, ~200 raw `*(node + 8)` sites refactored to typed `n.a` access (sliced struct access rule born here), `: half` sign-extension fixed on both chip backends (ARM64 LDRSW, x86_64 MOVSXD), `_stb_core_linux.bsm` unblocking Linux cross-compile, maestro accumulator pattern for fixed timestep, `job_parallel_for` serial fallback for progressive enhancement, E230 (static const at file scope) diagnostic on April 11, 2026.*
-
-*Foundation Refactor Mega-Session — Cache Removal, Repo Reorganization, bsys Tables, brt0 Runtime, bmem Allocator, Switch Jump Tables: the `.bo` module cache removed entirely (~630 lines net, the single largest bug source across the bootstrap's history, every compile now from source at 0.27 s), repo reorganized into `src/backend/chip/<arch>/` + `src/backend/os/<os>/` + `src/backend/target/<arch>_<os>/` + `src/backend/c/` to separate chip from OS from container from transpiler, bsys tables per OS replacing 18 hardcoded syscall numbers per codegen, `_brt0_<target>.bsm` moving `_bpp_argc` / `_bpp_argv` / `_bpp_envp` from codegen sentinels to real B++ globals, `putchar` / `putchar_err` / `getchar` demoted from codegen builtins to B++ functions in `bpp_io.bsm`, `bmem` allocator (`_bmem_<os>.bsm`) making `malloc` / `free` / `realloc` real B++ functions with `sys_mmap` / `sys_munmap` as the only builtins, switch jump tables on both backends + eval-once condition for sparse switches + C emitter switch (previously if/else-if chain), sliced struct access bug discovered and documented as Rule 8 in tonify on April 13-14, 2026.*
-
-*Mini Cooper Phase A + B0, T_TERNARY Side Quest, Rule 11 Sweep: bitfields (`: bit`, `: bit2` through `: bit7`) with LSB-first packing, precomputed `(byte, bit)` per field, UBFX/BFI on ARM64 and SHR+AND/RMW on x86_64, `malloc_aligned(size, alignment)` built-in with uniform 16-byte header shared between regular and aligned allocations, constant folding and dead-code elimination lifted to the parser (single implementation all backends inherit, per-backend duplicates deleted), new `T_TERNARY` AST node and parser rewrite of `a && b` → `T_TERNARY(a, b, 0)` and `a || b` → `T_TERNARY(a, 1, b)` closing the short-circuit divergence between the C emitter and native backends, new `T_BLOCK` node for DCE statement groups, eight canonical tests added (bitfield, aligned_alloc, const_fold, realloc, signed_half, switch, ternary, short_circuit), Rule 11 idioms (ternary and short-circuit) swept across `bpp_types`, `bpp_parser`, `bpp_lexer`, `bpp_import`, `bpp_dispatch`, and `stb/stbimage` so the compiler source demonstrates the new patterns in the places programmers read first on April 14, 2026.*
-
-*Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026.*
+*Designed and built by Daniel Obino. Compiler bootstrapped March 20, 2026. First sound April 16, 2026.*
