@@ -514,7 +514,7 @@ b++/
 │       ├── target/x86_64_linux/  — ELF writer
 │       └── c/                  — C transpiler (portable escape hatch)
 ├── stb/                        — Standard B Library (18 modules, game engine)
-├── tools/audio/synth/          — Polyphonic synthesizer (300 lines)
+├── tools/audio/mini_synth/     — Polyphonic synthesizer (300 lines)
 ├── games/                      — Complete playable games
 │   ├── snake/                  — Snake with ECS particles + ranking
 │   ├── pathfind/               — Rat-and-cat chase with AI pursuit
@@ -522,7 +522,7 @@ b++/
 ├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/                    — Backend drivers (SDL2, raylib — optional)
 ├── tests/                      — Compiler and library tests (68 passing)
-├── docs/                       — Language manual, journal, TODO, bootprod_manual
+├── docs/                       — The book (the_b++_programming_language.md), dev guide (how_to_dev_b++.md), journal, TODO, debug_with_bug
 ├── bpp                         — The compiler binary
 └── bug                         — The debugger binary
 ```
@@ -654,8 +654,9 @@ B++ is 30 days old. The following are the milestones, in order:
 | **Apr 16** | **Smart dispatch Phase 2** — compiler auto-parallelizes worker-safe loops into `job_parallel_for` with zero programmer intervention. |
 | **Apr 16** | **First sound** — `stbaudio` opens CoreAudio device. 440 Hz sine tone plays through the speakers from B++ code. |
 | **Apr 17** | **Polyphonic synthesizer** — 300-line `synthkey.bpp` with 4 octaves, 8 voices, 4 waveforms with continuous morph, bitcrush + decimation dirt, WAV recording. A musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. |
+| **Apr 17** | **The book + zero-warning clean compile** — `docs/bpp_manual.md` and `docs/bpp_language_reference.md` merged into `docs/the_b++_programming_language.md` (K&R-style, 16 chapters). `docs/how_to_dev_b++.md` consolidates production discipline + tonify expert mode. Last two W026 false positives resolved (`_stb_gpu_init` + `render_init` were annotated `: gpu` but honestly reach IO on shader-compile error paths — the lattice was right, the annotations weren't). Every game in the repo now compiles with zero warnings. |
 
-B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into `docs/bootprod_manual.md` as canonical rule. Adding a new chip, OS, or feature follows the same pattern the existing code does.
+B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into `docs/how_to_dev_b++.md` as canonical rule, and the language itself is documented K&R-style in `docs/the_b++_programming_language.md`. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 
 The version number is the test count. When the test count reaches the point where a complete indie retro game ships end-to-end in pure B++, that's 1.0.
 

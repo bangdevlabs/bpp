@@ -3297,3 +3297,86 @@ Lattice order: `AUTO < BASE < REALTIME < HEAP < {IO, GPU} < SOLO`, PANIC = ⊥ (
 **New stb modules:** stbmixer (16th module), stbsound (17th module).
 
 Suite 66 → 68 passing (test_audio_stream + test_mixer_stream). Bootstrap sha stable throughout. 25 active diagnostics (W025 + W026 added).
+
+## 2026-04-17b — The Book + zero-warning clean compile
+
+Short cleanup day after the synthkey marathon. Two outcomes: the
+docs got their long-overdue consolidation, and the last two W026
+false positives were resolved — every game in the repo now compiles
+with zero warnings.
+
+**The book.** `docs/bpp_manual.md` (1049 lines, tutorial) and
+`docs/bpp_language_reference.md` (568 lines, reference) merged into
+a single K&R-style volume: `docs/the_b++_programming_language.md`.
+16 chapters totalling 1318 lines, covering Preface → Tutorial →
+Variables/Storage → Functions → Control Flow → Operators → Literals
+→ Comments → Type System → Memory → Composite Types → Modules →
+Concurrency → Builtins → Standard Library → Compiler → Debugger +
+Design Principles appendix. Updates since the old manuals: `switch`
+documented (the manual still claimed "there is no switch"), full
+effect lattice with PANIC/HEAP/REALTIME/IO/GPU, SIMD entire chapter,
+`load` vs `import` distinction, `void`/`stub`/`: serial`, `&`
+address-of as a first-class section, E232 note on the
+`auto x = 44100.0` silent-int-conversion trap. The two source files
+are gone from `docs/`; `.md~` backups remain.
+
+**The production guide.** Earlier the same day,
+`docs/bootprod_manual.md` (760 lines) and `docs/tonify_checklist.md`
+(538 lines) were consolidated into `docs/how_to_dev_b++.md`
+(830 lines, 9 parts): Daily Loop, Tonify Expert Mode, Architectural
+Discipline, Writing Modules, File Order / Sweep Discipline, Testing,
+Cross-Compile and Deploy, Compiler Flags Reference, Recovery. The
+`how_to_dev` and `the_book` are the two canonical references now;
+`bootprod_manual.md` and `tonify_checklist.md` become historical.
+
+**Language reference filled in.** Before the merge, the standalone
+reference got expanded: full phase annotations table (all five
+writable phases + heap/panic notes), operators section (arithmetic,
+comparison, bitwise, logical, memory, assignment, ternary),
+address-of as its own section with syscall examples, literals
+(integer/float/string/char with escape table), comments, core
+builtins table with effect codes for each. Went 343 → 568 lines.
+
+**install.sh cross-checked.** Every auto-injected module in
+`bpp_import.bsm` (`bpp_mem`, `bpp_array`, `bpp_hash`, `bpp_buf`,
+`bpp_str`, `bpp_io`, `bpp_math`, `bpp_file`, `bpp_beat`, `bpp_job`,
+`bpp_maestro`) is in the install list, plus `bpp_defs` (codegen-time)
+and `bpp_arena` (explicit-import). `stb/*.bsm` wildcard picks up all
+18 modules including the three new audio ones. `src/backend/` layers
+all copied by wildcard. Nothing stale, nothing missing.
+
+**W026 cleanup — `: gpu` on init was wrong.** After the
+`: realtime` audio path landed last session, two warnings kept
+firing on every game compile:
+
+```
+warning[W026]: '_stb_gpu_init' annotated ': gpu' but reaches IO
+warning[W026]: 'render_init' annotated ': gpu' but reaches IO
+```
+
+The classifier was right. `_stb_gpu_init` prints to stderr and
+calls `sys_exit(1)` when Metal shader compilation fails. The
+`bpp_dispatch.bsm` comment already spelled out why this isn't
+absorbed by PHASE_PANIC: "they print before dying, so the IO is
+real." Join(GPU, IO) = SOLO in the lattice — init is genuinely
+SOLO, not GPU. Fix: drop the `: gpu` annotation from both (the
+compiler infers SOLO from the body, which is what we want).
+Per-frame helpers (`render_begin`, `render_clear`, `render_rect`,
+`render_end`, `_stb_gpu_vertex`, `_stb_gpu_present`, etc.) stay
+`: gpu` — those never touch syscalls. Comments added at both
+sites explaining why future re-annotation will re-trigger W026.
+
+Result: `bpp games/snake/snake_maestro.bpp`,
+`bpp games/platformer/platform.bpp`, and every other game in the
+repo now emit **zero warnings**. Bootstrap hash stable
+(c7b5d8de...).
+
+**Takeaway on the lattice.** The 2026-04-16 PHASE_PANIC refinement
+made `sys_exit` the bottom element — `PANIC ∨ X = X`. It does NOT
+make "the whole function that eventually calls sys_exit" bottom.
+IO that executes before sys_exit is still observable (the process
+is still alive during the write). This distinction was already in
+the dispatch comment; the fix landed on the call sites rather than
+on the classifier. Same policy whenever an effect annotation
+disagrees with a function's real behaviour: change the annotation
+first, change the lattice last.
