@@ -277,7 +277,7 @@ Each builtin needs an effect tag. Extend `classify_all_functions()`:
 
 | Builtin | Effect |
 |---|---|
-| `malloc`, `free`, `realloc`, `memcpy` | heap (currently SOLO; eventually distinct) |
+| `malloc`, `free`, `realloc`, `memcpy` | PHASE_HEAP (shipped 2026-04-16 — distinct from SOLO) |
 | `sys_write`, `sys_read`, `sys_open`, `sys_close` | io |
 | `putchar`, `putchar_err`, `getchar` | io |
 | `_stb_gpu_present`, `_stb_gpu_vertex`, etc. | gpu |

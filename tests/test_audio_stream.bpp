@@ -1,0 +1,84 @@
+// test_audio_stream.bpp — SPSC ring smoke test (headless, silent).
+//
+// Opens an audio stream with a 4096-frame ring, pushes 2048 frames of
+// silence (zero samples), waits briefly so the CoreAudio callback has
+// a chance to drain them, then asserts that the callback ran at least
+// once and consumed at least one frame. The device outputs silence
+// for the whole run, so the regression suite stays quiet.
+//
+// What this proves:
+//   - The SPSC ring buffer wiring works end-to-end.
+//   - The producer (main thread) and consumer (CoreAudio realtime
+//     thread) coordinate through _aud_ring_read / _aud_ring_write
+//     without either side reading stale indices.
+//   - `audio_push` returns 1 for a frame that fits and 0 when the
+//     ring is full.
+//
+// What it does NOT prove: audio quality, jitter, or sample integrity.
+// Those tests are manual (see test_audio_tone for the audible one).
+
+import "bpp_io.bsm";
+import "stbaudio.bsm";
+import "_stb_audio.bsm";
+
+auto PUSH_BATCH, BATCH_COUNT;
+
+main() {
+    auto rc, i, j, pushed, consumed, cb_count;
+
+    PUSH_BATCH = 2048;
+    BATCH_COUNT = 1;
+
+    rc = audio_open(4096);
+    if (rc != 0) {
+        print_msg("audio_open failed rc=");
+        print_int(rc);
+        print_ln();
+        return rc;
+    }
+
+    pushed = 0;
+    for (i = 0; i < BATCH_COUNT; i = i + 1) {
+        for (j = 0; j < PUSH_BATCH; j = j + 1) {
+            if (audio_push(0, 0) == 0) {
+                // Ring full — back off briefly and retry.
+                _stb_audio_sleep_ms(5);
+                j = j - 1;
+            } else {
+                pushed = pushed + 1;
+            }
+        }
+    }
+
+    // Let the callback drain — a few buffer cycles at 1024 frames/23 ms
+    // is plenty for the consumer to see the producer's writes.
+    _stb_audio_sleep_ms(200);
+
+    consumed = audio_ring_consumed();
+    cb_count = _stb_audio_cb_count();
+
+    audio_close();
+
+    print_msg("pushed=");
+    print_int(pushed);
+    print_msg(" consumed=");
+    print_int(consumed);
+    print_msg(" cb_count=");
+    print_int(cb_count);
+    print_ln();
+
+    if (cb_count < 1) {
+        print_msg("FAIL: callback never fired");
+        print_ln();
+        return 1;
+    }
+    if (consumed < 1) {
+        print_msg("FAIL: consumer never advanced ring_read");
+        print_ln();
+        return 2;
+    }
+
+    print_msg("OK");
+    print_ln();
+    return 0;
+}

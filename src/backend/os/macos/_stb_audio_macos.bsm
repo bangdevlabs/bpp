@@ -61,6 +61,29 @@ global _aud_phase;
 // function pointer.
 global _aud_cb_count;
 
+// ── Iteration 4: SPSC sample ring ────────────────────────────────
+//
+// The producer lives on the main thread; the consumer is the
+// CoreAudio realtime callback. Frames are stereo s16 = 4 bytes each,
+// stored in a power-of-two capacity buffer so index wrap is a bitmask.
+//
+// Index discipline (standard SPSC):
+//   producer reads `_aud_ring_read`, writes samples at
+//     `(_aud_ring_write & (cap-1)) * 4`, mem_barrier(), advances
+//     `_aud_ring_write` by the sample count.
+//   consumer reads `_aud_ring_write`, mem_barrier(), reads samples,
+//     mem_barrier(), advances `_aud_ring_read`.
+//
+// Both indices are unbounded 64-bit counters; the wrap happens only
+// when indexing the storage buffer. That keeps "available frames =
+// write - read" unambiguous without ever needing to special-case the
+// post-wrap vs pre-wrap case.
+static extrn _aud_ring_data;     // byte buffer, _aud_ring_cap * 4 bytes
+static extrn _aud_ring_cap;      // frame capacity (power of 2)
+static extrn _aud_ring_mask;     // cap - 1, precomputed
+global _aud_ring_write;          // producer-written frame counter
+global _aud_ring_read;           // consumer-written frame counter
+
 // ── AudioStreamBasicDescription layout ────────────────────────────
 //
 // Mirrors the C struct from <CoreAudio/CoreAudioTypes.h>. Offsets are
@@ -212,6 +235,63 @@ _stb_audio_cb_count() {
     return _aud_cb_count;
 }
 
+// ── Iteration 4 callback — consumes frames from the SPSC ring ────
+//
+// Reads up to `cap / 4` frames from the ring into the CoreAudio
+// buffer. If the ring is short of frames (producer falling behind),
+// the remainder is padded with silence so the audio device never
+// gets starved bytes. Never blocks, never allocates, never calls a
+// syscall — same contract as the square-wave callback above.
+static _aud_stream_cb(user, queue, buffer) : realtime {
+    auto cap, data, frames, i, local_write, local_read, avail, sample;
+    auto ridx;
+
+    cap   = peek(buffer + 0) + peek(buffer + 1) * 256
+          + peek(buffer + 2) * 65536 + peek(buffer + 3) * 16777216;
+    data  = *(buffer + 8);
+    frames = cap / 4;
+
+    // Acquire the producer's published write index. The mem_barrier
+    // guarantees every frame byte the producer wrote before advancing
+    // _aud_ring_write is visible to us now.
+    mem_barrier();
+    local_write = _aud_ring_write;
+    local_read  = _aud_ring_read;
+    avail       = local_write - local_read;
+    if (avail > frames) { avail = frames; }
+
+    // Copy `avail` frames from the ring into the buffer.
+    for (i = 0; i < avail; i = i + 1) {
+        ridx = (local_read + i) & _aud_ring_mask;
+        poke(data + i * 4 + 0, peek(_aud_ring_data + ridx * 4 + 0));
+        poke(data + i * 4 + 1, peek(_aud_ring_data + ridx * 4 + 1));
+        poke(data + i * 4 + 2, peek(_aud_ring_data + ridx * 4 + 2));
+        poke(data + i * 4 + 3, peek(_aud_ring_data + ridx * 4 + 3));
+    }
+
+    // Pad the tail with silence (zero s16) when the producer is behind.
+    for (i = avail; i < frames; i = i + 1) {
+        poke(data + i * 4 + 0, 0);
+        poke(data + i * 4 + 1, 0);
+        poke(data + i * 4 + 2, 0);
+        poke(data + i * 4 + 3, 0);
+    }
+
+    // Publish the new read index. The mem_barrier ensures the
+    // producer sees it only after every ring byte we touched is
+    // visible — otherwise a burst of producer pushes could race into
+    // slots the callback is still reading.
+    mem_barrier();
+    _aud_ring_read = local_read + avail;
+
+    _aud_cb_count = _aud_cb_count + 1;
+
+    // Tell CoreAudio the buffer is full and hand it back.
+    _aud_poke_u32(buffer + 16, cap);
+    call(_aud_fn_enqueue_buffer, queue, buffer, 0, 0);
+    return 0;
+}
+
 // Read a single dlsym'd function pointer for diagnostic dumping.
 // Non-zero means the framework resolved the symbol successfully.
 _stb_audio_fn_probe(idx) {
@@ -300,4 +380,118 @@ void _stb_audio_tone_stop() : io {
 // free of syscall surface — only this file touches System.B.
 void _stb_audio_sleep_ms(ms) : io {
     usleep(ms * 1000);
+}
+
+// ── Iteration 4 public API — SPSC-driven streaming ───────────────
+//
+// Open the device with a ring of `cap_frames` stereo s16 slots.
+// `cap_frames` MUST be a power of two (the callback indexes via
+// `& mask`). Returns 0 on success, non-zero on any setup failure.
+//
+// After open, the device is running and the callback is consuming
+// from the ring. Push frames with `_stb_audio_push_frame`; query
+// free capacity with `_stb_audio_ring_space`. When the producer
+// falls behind, the callback emits silence for the shortfall — the
+// device never underruns hardware-side.
+_stb_audio_open(cap_frames) : io {
+    auto desc, queue_slot, buffer_slot, queue, buffer, i, rc;
+
+    _aud_init_ffi();
+    if (_aud_tb == 0) { return 1; }
+
+    _aud_ring_cap   = cap_frames;
+    _aud_ring_mask  = cap_frames - 1;
+    _aud_ring_data  = malloc(cap_frames * 4);
+    _aud_ring_write = 0;
+    _aud_ring_read  = 0;
+
+    // Zero the ring so callback reads return silence before the
+    // producer pushes anything.
+    for (i = 0; i < cap_frames * 4; i = i + 1) {
+        poke(_aud_ring_data + i, 0);
+    }
+
+    desc = malloc(56);
+    _aud_fill_desc(desc);
+
+    queue_slot = malloc(8);
+    *queue_slot = 0;
+    rc = call(_aud_fn_new_output, desc, fn_ptr(_aud_stream_cb), 0, 0, 0, 0, queue_slot);
+    queue = *queue_slot;
+    free(queue_slot);
+    free(desc);
+    if (rc != 0) { return 2; }
+
+    _aud_queue = queue;
+
+    // Three triple-buffered 4 KiB buffers (1024 frames ≈ 23 ms).
+    // Prime each by priming it with the first callback call so the
+    // queue is warm before Start runs.
+    buffer_slot = malloc(8);
+    for (i = 0; i < 3; i = i + 1) {
+        *buffer_slot = 0;
+        rc = call(_aud_fn_alloc_buffer, queue, 4096, buffer_slot);
+        if (rc != 0) { free(buffer_slot); return 3; }
+        buffer = *buffer_slot;
+        _aud_stream_cb(0, queue, buffer);
+    }
+    free(buffer_slot);
+
+    rc = call(_aud_fn_start, queue, 0);
+    if (rc != 0) { return 4; }
+    return 0;
+}
+
+// Tear down the device. Stops the callback, disposes the queue, and
+// releases the ring buffer. After this returns the hardware is silent
+// and it is safe to call `_stb_audio_open` again.
+void _stb_audio_close() : io {
+    if (_aud_queue == 0) { return; }
+    call(_aud_fn_stop, _aud_queue, 1);
+    call(_aud_fn_dispose, _aud_queue, 1);
+    _aud_queue = 0;
+    if (_aud_ring_data != 0) {
+        free(_aud_ring_data);
+        _aud_ring_data = 0;
+    }
+}
+
+// Return the number of frames the producer can push without blocking.
+// The consumer can be draining concurrently, so the number can grow
+// between two calls — treat it as a lower bound.
+_stb_audio_ring_space() : base {
+    auto local_read;
+    mem_barrier();
+    local_read = _aud_ring_read;
+    return _aud_ring_cap - (_aud_ring_write - local_read);
+}
+
+// Push one stereo s16 frame to the ring. Returns 1 on success, 0 if
+// the ring is full (the producer should back off and retry). The
+// mem_barrier before publishing the new write index guarantees the
+// callback cannot observe the updated counter before the frame bytes
+// have actually landed in the buffer.
+_stb_audio_push_frame(left, right) {
+    auto widx, local_read;
+    mem_barrier();
+    local_read = _aud_ring_read;
+    if (_aud_ring_write - local_read >= _aud_ring_cap) { return 0; }
+
+    widx = _aud_ring_write & _aud_ring_mask;
+    poke(_aud_ring_data + widx * 4 + 0, left  & 0xff);
+    poke(_aud_ring_data + widx * 4 + 1, (left  >> 8) & 0xff);
+    poke(_aud_ring_data + widx * 4 + 2, right & 0xff);
+    poke(_aud_ring_data + widx * 4 + 3, (right >> 8) & 0xff);
+
+    mem_barrier();
+    _aud_ring_write = _aud_ring_write + 1;
+    return 1;
+}
+
+// Report how many frames the consumer callback has drained since
+// `_stb_audio_open`. Used by tests to prove the SPSC ring is alive
+// end-to-end without needing an audible signal.
+_stb_audio_ring_consumed() : base {
+    mem_barrier();
+    return _aud_ring_read;
 }

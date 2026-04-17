@@ -26,7 +26,7 @@ auto DSP_SEQ, DSP_PAR, DSP_GPU, DSP_SPLIT;
 // call_graph_build(). Lattice has height 1 (BASE → SOLO is the only
 // transition, no upgrade), so fixpoint converges to the EXACT result
 // in O(call-chain-depth) passes — not approximate.
-auto PHASE_AUTO, PHASE_BASE, PHASE_SOLO, PHASE_REALTIME, PHASE_IO, PHASE_GPU;
+auto PHASE_AUTO, PHASE_BASE, PHASE_SOLO, PHASE_REALTIME, PHASE_IO, PHASE_GPU, PHASE_HEAP;
 
 // Per-function arrays parallel to funcs[]. Built by call_graph_build()
 // and consumed by classify_all_functions() and (later) codegen.
@@ -112,6 +112,14 @@ void init_dispatch() {
     PHASE_REALTIME = 3;
     PHASE_IO = 4;
     PHASE_GPU = 5;
+    // PHASE_HEAP = transient allocation. Lives BELOW IO/GPU/SOLO in the
+    // lattice but ABOVE BASE/REALTIME — you can build an IO or GPU
+    // function on top of malloc, but a realtime callback still cannot
+    // touch the heap. Added 2026-04-16 when `: io` audio setup
+    // (malloc + FFI) reached SOLO by propagation and W026 screamed at
+    // honest annotations. The plan's table had `heap (currently SOLO;
+    // eventually distinct)` as a TODO — this makes it distinct.
+    PHASE_HEAP = 6;
     fn_phase = arr_new();
     fn_phase_next = arr_new();
     fn_calls = arr_new();
@@ -154,6 +162,7 @@ void init_dispatch() {
     // Expand with care: `poke` writes memory and therefore stays out.
     add_pure_extern(_dsp_pack_name("peek", 4));
     add_pure_extern(_dsp_pack_name("str_peek", 8));
+    add_pure_extern(_dsp_pack_name("mem_barrier", 11));
     add_extern_effect(_dsp_pack_cstr("peek"),           PHASE_BASE);
     add_extern_effect(_dsp_pack_cstr("str_peek"),       PHASE_BASE);
     add_extern_effect(_dsp_pack_cstr("mem_barrier"),    PHASE_BASE);
@@ -165,10 +174,10 @@ void init_dispatch() {
     add_extern_effect(_dsp_pack_cstr("sys_read"),       PHASE_IO);
     add_extern_effect(_dsp_pack_cstr("sys_open"),       PHASE_IO);
     add_extern_effect(_dsp_pack_cstr("sys_close"),      PHASE_IO);
-    add_extern_effect(_dsp_pack_cstr("malloc"),         PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("free"),           PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("realloc"),        PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("memcpy"),         PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("malloc"),         PHASE_HEAP);
+    add_extern_effect(_dsp_pack_cstr("free"),           PHASE_HEAP);
+    add_extern_effect(_dsp_pack_cstr("realloc"),        PHASE_HEAP);
+    add_extern_effect(_dsp_pack_cstr("memcpy"),         PHASE_HEAP);
     add_extern_effect(_dsp_pack_cstr("sys_lseek"),      PHASE_IO);
     // Broader syscall classification. Everything that blocks, touches
     // the filesystem, or reads wall time is PHASE_IO. Process-lifecycle
@@ -183,16 +192,23 @@ void init_dispatch() {
     add_extern_effect(_dsp_pack_cstr("sys_fchmod"),       PHASE_IO);
     add_extern_effect(_dsp_pack_cstr("sys_ioctl"),        PHASE_IO);
     add_extern_effect(_dsp_pack_cstr("sys_getdents"),     PHASE_IO);
-    add_extern_effect(_dsp_pack_cstr("sys_mmap"),         PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("sys_munmap"),       PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("sys_mmap"),         PHASE_HEAP);
+    add_extern_effect(_dsp_pack_cstr("sys_munmap"),       PHASE_HEAP);
     add_extern_effect(_dsp_pack_cstr("sys_exit"),         PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_fork"),         PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_execve"),       PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_waitpid"),      PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_wait4"),        PHASE_SOLO);
     add_extern_effect(_dsp_pack_cstr("sys_ptrace"),       PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("malloc_aligned"),   PHASE_SOLO);
-    add_extern_effect(_dsp_pack_cstr("call"),             PHASE_SOLO);
+    add_extern_effect(_dsp_pack_cstr("malloc_aligned"),   PHASE_HEAP);
+    // `call` is intentionally NOT seeded. It is opaque at compile time
+    // — the effect is whatever the function pointer's target has, and
+    // we cannot know that statically. Registering it as PHASE_SOLO
+    // would force every FFI-using function to SOLO through the
+    // fixpoint, which drowns the Rule 4 signal in false positives.
+    // Leaving it unregistered means the lookup returns -1, which the
+    // walker maps to PHASE_AUTO — the lattice no-op. The caller's
+    // annotation remains the contract.
 }
 
 // ── Global lookup helper ───────────────────────────────────
@@ -253,12 +269,14 @@ extern_effect(name_p) {
 }
 
 // Join two effect codes according to the Level 4 lattice:
-//   BASE < REALTIME < {IO, GPU} < SOLO
+//   BASE < REALTIME < HEAP < {IO, GPU} < SOLO
 // IO and GPU are incomparable, so a function that touches both lands
-// at SOLO (the top of the lattice). PHASE_AUTO (0) is the "unknown"
-// bottom and is absorbed by any real value. Used by the effect
-// propagation pass in classify_all_functions to combine the effects
-// of a function's callees + externs.
+// at SOLO (the top of the lattice). HEAP is the transient-allocation
+// class — malloc / free / realloc / memcpy / sys_mmap / sys_munmap —
+// and is subsumed by IO or GPU (both IO and GPU functions routinely
+// allocate scaffolding). Annotation enforcement consults this
+// ordering via _dsp_eff_permits below. PHASE_AUTO (0) is the "unknown"
+// bottom and is absorbed by any real value.
 _dsp_eff_join(a, b) {
     if (a == PHASE_SOLO) { return PHASE_SOLO; }
     if (b == PHASE_SOLO) { return PHASE_SOLO; }
@@ -271,6 +289,12 @@ _dsp_eff_join(a, b) {
     // REALTIME + IO = IO (REALTIME is a constraint, not an effect).
     if (a == PHASE_REALTIME) { return b; }
     if (b == PHASE_REALTIME) { return a; }
+    // HEAP is subsumed by IO / GPU — a function that both allocates
+    // and does IO is simply an IO function; the fact that it also
+    // touches the heap is an implementation detail the IO annotation
+    // already permits.
+    if (a == PHASE_HEAP) { return b; }
+    if (b == PHASE_HEAP) { return a; }
     // Only case left: one is IO, the other is GPU. Incomparable → SOLO.
     return PHASE_SOLO;
 }
@@ -1168,16 +1192,25 @@ classify_all_functions() {
     // stbaudio callback guarantee. IO and GPU are included for symmetry
     // and will start firing when the Rule 4 sweep annotates those paths.
     for (i = 0; i < func_cnt; i = i + 1) {
-        auto _h, _e;
+        auto _h, _e, _name, _label;
         _h = arr_get(fn_phase_hint, i);
         _e = arr_get(fn_effect, i);
+        _name = _e == PHASE_IO ? "IO"
+              : _e == PHASE_GPU ? "GPU"
+              : _e == PHASE_HEAP ? "HEAP"
+              : _e == PHASE_SOLO ? "SOLO"
+              : _e == PHASE_REALTIME ? "REALTIME"
+              : "BASE";
         if (_h == PHASE_REALTIME) {
+            // Realtime = the strictest annotation. Callees must be
+            // BASE or REALTIME; HEAP, IO, GPU, SOLO all violate — an
+            // audio callback that touches malloc will glitch.
             if (_e != PHASE_BASE && _e != PHASE_REALTIME && _e != PHASE_AUTO) {
                 diag_warn(26);
                 diag_str("'");
                 diag_packed(*(funcs[i] + FN_NAME));
                 diag_str("' annotated ': realtime' but reaches ");
-                diag_str(_e == PHASE_IO ? "IO" : (_e == PHASE_GPU ? "GPU" : "SOLO"));
+                diag_str(_name);
                 diag_str(" through its call graph");
                 diag_newline();
                 diag_loc(*(funcs[i] + FN_SRC_TOK));
@@ -1185,12 +1218,14 @@ classify_all_functions() {
             }
         }
         if (_h == PHASE_IO) {
+            // IO permits HEAP (nearly every IO function allocates
+            // scaffolding). GPU and SOLO are incompatible.
             if (_e == PHASE_GPU || _e == PHASE_SOLO) {
                 diag_warn(26);
                 diag_str("'");
                 diag_packed(*(funcs[i] + FN_NAME));
                 diag_str("' annotated ': io' but reaches ");
-                diag_str(_e == PHASE_GPU ? "GPU" : "SOLO");
+                diag_str(_name);
                 diag_str(" through its call graph");
                 diag_newline();
                 diag_loc(*(funcs[i] + FN_SRC_TOK));
@@ -1198,12 +1233,13 @@ classify_all_functions() {
             }
         }
         if (_h == PHASE_GPU) {
+            // GPU permits HEAP. IO and SOLO are incompatible.
             if (_e == PHASE_IO || _e == PHASE_SOLO) {
                 diag_warn(26);
                 diag_str("'");
                 diag_packed(*(funcs[i] + FN_NAME));
                 diag_str("' annotated ': gpu' but reaches ");
-                diag_str(_e == PHASE_IO ? "IO" : "SOLO");
+                diag_str(_name);
                 diag_str(" through its call graph");
                 diag_newline();
                 diag_loc(*(funcs[i] + FN_SRC_TOK));
