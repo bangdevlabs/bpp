@@ -10,7 +10,7 @@ Update this document and `tests/test_diagnostics.bpp` when adding new codes.
 ## Status Summary
 
 ```
-Total diagnostics:  23 active + 2 reserved
+Total diagnostics:  25 active + 2 reserved
 With source location: 19  ✅  (file:line + source + caret)
 With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok_pos)
   E001 (cannot open file) — shows filename
@@ -57,6 +57,8 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | W013 | : base mismatch | bpp_dispatch.bsm | 939 | ✅ | Function annotated base but impure |
 | W020 | static cross-module | bpp_validate.bsm | 397 | ✅ | Calling static fn from other module |
 | W021 | switch not exhaustive | bpp_parser.bsm | TBD | ✅ | switch without else arm |
+| W025 | public param without hint used in float arithmetic | bpp_validate.bsm | 681 | ✅ | Non-static fn uses un-hinted param in a T_BINOP where the other side is float-typed — annotate `: float` to preserve IEEE bits or `: word` to document integer intent (Rule 13) |
+| W026 | phase annotation violated by effect lattice | bpp_dispatch.bsm | 1118 | ✅ | Function annotated `: realtime` / `: io` / `: gpu` transitively reaches an incompatible effect (IO / GPU / SOLO) through its call graph — Level 4 sub-step C. Gradual: unknown externs default to PHASE_AUTO so only KNOWN-to-be-incompatible paths fire |
 
 ## What "has location" means
 

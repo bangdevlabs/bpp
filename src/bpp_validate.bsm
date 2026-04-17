@@ -81,6 +81,27 @@ static _val_get_hint(name_p) {
     return 0;
 }
 
+// Returns 1 if name_p is the name of an un-hinted parameter of the
+// function currently under validation. Used by W025 to detect the
+// shape "public function, param used in float arithmetic, caller
+// never told us whether the param is int or float".
+static _val_is_unhinted_param(name_p) {
+    auto rec, params_arr, hints, pc, j;
+    if (_val_current_fi < 0) { return 0; }
+    rec = funcs[_val_current_fi];
+    params_arr = *(rec + FN_PARS);
+    hints = *(rec + FN_HINTS);
+    pc = *(rec + FN_PCNT);
+    for (j = 0; j < pc; j = j + 1) {
+        if (packed_eq(params_arr[j], name_p)) {
+            if (hints == 0) { return 1; }
+            if (hints[j] == 0) { return 1; }
+            return 0;
+        }
+    }
+    return 0;
+}
+
 // ── Builtin recognition ─────────────────────────────────────
 
 // Compare a packed name against a C literal of known length. Pure: only
@@ -648,6 +669,47 @@ val_check_node(nd) {
                         }
                     }
                 }
+            }
+        }
+        // W025 — public function receives an un-hinted parameter that
+        // the body uses in float arithmetic. Caller sees the signature
+        // with no type hint and has no way to know whether the param
+        // wants an int or a float; the body's internal use promotes
+        // silently at the call site. Only fires for non-static
+        // functions (static callers have a single intra-module
+        // call surface that code review can catch).
+        if (_val_current_fi >= 0 && arr_get(fn_static, _val_current_fi) == 0) {
+            auto w_lhs: Node, w_rhs: Node, w_var: Node, w_other: Node, w_fire;
+            w_lhs = n.b;
+            w_rhs = n.c;
+            w_fire = 0;
+            w_var = 0;
+            w_other = 0;
+            if (w_lhs.ntype == T_VAR && _val_is_unhinted_param(w_lhs.a)) {
+                if (ty_base(w_rhs.itype) == BASE_FLOAT) {
+                    w_fire = 1;
+                    w_var = w_lhs;
+                    w_other = w_rhs;
+                }
+            }
+            if (w_fire == 0 && w_rhs.ntype == T_VAR && _val_is_unhinted_param(w_rhs.a)) {
+                if (ty_base(w_lhs.itype) == BASE_FLOAT) {
+                    w_fire = 1;
+                    w_var = w_rhs;
+                    w_other = w_lhs;
+                }
+            }
+            if (w_fire) {
+                diag_warn(25);
+                diag_str("parameter `");
+                diag_packed(w_var.a);
+                diag_str("` of public function `");
+                diag_packed(*(funcs[_val_current_fi] + FN_NAME));
+                diag_str("` is used in float arithmetic but has no type hint");
+                diag_newline();
+                _val_show_context_at(n.src_tok);
+                diag_help("annotate the parameter so callers know what to pass — `name: float` preserves IEEE bits, `name: word` forces integer");
+                diag_newline();
             }
         }
         val_check_node(n.b); val_check_node(n.c);

@@ -382,12 +382,18 @@ One caller passes `1.0` (float), the next passes `1` (int) — both
 the bug. Explicit hints turn the function signature into the single
 source of truth.
 
-**W025 (planned, deferred):** the compiler nudge for Rule 13. When a
-non-`static` function uses a parameter in a clearly float-typed
-context inside its body but the parameter has no `: float` hint, fire
-a non-fatal warning suggesting the annotation. A first cut hit a
-subtle bootstrap regression and was shelved for dedicated debugging.
-Until it ships, Rule 13 is convention-only — apply it in code review.
+**W025 (shipped 2026-04-16):** the compiler nudge for Rule 13. Fires
+when a non-`static` function uses an un-hinted parameter in float
+arithmetic — the exact shape where a caller cannot tell from the
+signature whether the param wants an int or a float. The fix is
+usually `param: float` (promote at call site) or `param: word`
+(document integer intent, the body promotes internally). First-cut
+implementation hit a bootstrap regression in an earlier sprint that
+turned out to be a Mach-O chained-fixups page_count bug unrelated to
+W025 itself; fixing page_count unblocked the nudge. The first
+violation it caught was `_stb_init_window(w, h, title)` using
+`w * 3.0` / `h * 3.0` inside a Cocoa CGRect setup — annotated to
+`w: word, h: word` since pixel counts are integers at the call site.
 
 ---
 

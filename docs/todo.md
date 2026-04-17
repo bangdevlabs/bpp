@@ -49,57 +49,46 @@ about the language it was written in.
 
 ## Active — in commit order
 
-### 0. Three blocked bugs — unblock via Dev Loop 2 first
+### 0. Bug queue — two closed, two still open
 
-Strategic pivot on 2026-04-16: three distinct bugs surfaced this
-sprint, all blocked by the same missing tool (single-step runtime
-debugger). Instead of debugging them blind with printf archaeology,
-ship Dev Loop 2 next, then debug all three in one sprint.
+Four bugs were queued 2026-04-16. Status after the page_count fix
+and W025 retry:
 
-**Bug #1 — W025 bootstrap regression.** First-cut implementation of
-the Rule 13 compiler nudge caused the gen1 binary to fail with
-`internal error: global 'break' not found in data section` during
-its own self-compile. Bisection narrowed the trigger to the
-combination `_val_w025_check` body + `_val_show_context_at` call +
-`diag_help` long string. Root cause unknown.
+**Bug #1 — W025 bootstrap regression. ✅ CLOSED 2026-04-16.** The
+"global 'break' not found in data section" error during gen2
+self-compile was the page_count symptom, not a W025 bug. Fixing
+`mo_write_chained_fixups_real` (dynamic page_count, commit
+`df92cb8`) dissolved the regression. W025 shipped the same day:
+minimal `_val_is_unhinted_param` helper + T_BINOP check with
+`diag_help`. Caught `_stb_init_window(w, h, title)` in the first
+scan; annotated to `w: word, h: word` across macos / linux /
+drv_sdl / drv_raylib.
 
-**Bug #2 — init_dispatch 16-seed threshold.** Same failure mode:
-adding a 16th `add_extern_effect` call in `init_dispatch` where the
-new string's length is ≥4 bytes causes gen1 to fail with
-`'break' not found in data section`. Bisection: 15 long strings work;
-15 long + 16th short (1-3 bytes) works; 15 long + 16th of 4+ bytes
-breaks. Threshold looks like cumulative vbuf bytes written during
-init crossing ~125.
+**Bug #2 — init_dispatch 16-seed threshold. ✅ CLOSED 2026-04-16.**
+Same root cause as #1. `__DATA` passing 16 KB with the 16th seed
+exposed the hardcoded `page_count = 1`. Dispatch now runs with 33
+seeds and the lattice is the broader shape Level 4 needs.
 
-**Bugs #1 and #2 share the same root.** Both produce identical
-symptom text. The fix for one will likely fix the other. Both manifest
-as: parser or codegen synthesizes a relocation to a symbol named
-"break" that was never declared as a global. Likely cause: lexer fails
-to recognize `break` keyword under some internal-state condition,
-treats it as T_VAR, codegen emits a global reference, link fails.
+**Bug #3 + #3b — comment newlines not counted in cur_line. ✅
+CLOSED 2026-04-16.** Single root cause for both. The lexer's
+`scan_comment()` in `bpp_lexer.bsm` skipped over newlines inside
+`//` line comments and `/* */` block comments without ticking
+`cur_line`. Every comment-ended line caused every subsequent
+token to report its source position N lines early, where N is
+the cumulative count of comment-delimited newlines seen so far.
 
-**Bug #3 — diagnostic line numbers off.** Same family as #3b below.
-During W025 debugging, the compiler reported an error at
-`bpp_parser.bsm:1540` but the actual `switch (c0) {` is at line 1905.
-Off by 365 is consistent with a fixed offset miscalculation (possibly
-`mod0_real_start` not applied when computing the diagnostic's
-line-relative position). Affects every error message from the parser
-on module 0. Real bug, tracked for the same Dev Loop 2 debug session.
+For `_bmem_macos.bsm`: `malloc` at source line 34 had 24 comment
+lines before it, and was reported as line 10. Exactly matches.
+For `bpp_parser.bsm` module-0 parser errors: 357 `//` lines plus
+a handful of block-comment newlines in the first 1905 source
+lines, matching the ~365-line offset reported earlier.
 
-**Bug #3b — `.bug` source_pos off by N per module.** Discovered during
-Dev Loop 2 sub-step 1. The source-pos emission in `bpp_bug.bsm` uses
-the canonical `tok_lines[tidx] - diag_file_line_starts[mod_idx]`
-formula (same as `diag_loc`), but the reported line for `malloc`
-(actual line 34 of `_bmem_macos.bsm`) comes out as line 10. The lexer
-sees only 9 newlines between `diag_file_line_starts[3]` and malloc's
-name token, but the source file has 33. So either `outbuf` for that
-module was written with missing newlines OR `diag_file_line_starts[3]`
-was captured AFTER additional content was already written. Same
-arithmetic as bug #3, same likely root cause. Will fix in the same
-session once `bug --break` can single-step through `process_file` and
-`emit_ch` to see which newlines are getting lost. For now, the MVP
-scope cut for `--break fn:line` is "not implemented yet" — avoids
-depending on possibly-wrong line numbers.
+Fix: `scan_comment()` now ticks `cur_line` on every newline it
+crosses, in both the `//` and `/* */` branches. `.bug` source
+map entries now match source line numbers exactly (verified on
+`test_arena.bug`: `malloc` → 34, `malloc_aligned` → 47, `free` →
+63, `realloc` → 74, `memcpy` → 93 — all one-for-one with the
+source). Unblocks `bug --break fn:line` for Dev Loop 2 Day 2+.
 
 ### 1. Dev Loop 2 — `bug` runtime observe + `--break` flag
 
