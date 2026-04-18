@@ -32,6 +32,9 @@ import "stbrender.bsm";
 import "stbecs.bsm";
 import "bpp_arena.bsm";
 import "stbpool.bsm";
+import "stbasset.bsm";
+import "stbaudio.bsm";
+import "stbmixer.bsm";
 load   "particles.bsm";
 
 // ── Compile-time constants ──────────────────────────────────
@@ -49,6 +52,17 @@ const DIR_UP = 0;
 const DIR_RIGHT = 1;
 const DIR_DOWN = 2;
 const DIR_LEFT = 3;
+
+// Audio ring sizing. Snake runs at FPS=10 so the audio pump only
+// fires every 100 ms. CoreAudio drains ~4410 frames per tick at
+// 44100 Hz; the ring must stay above one drain cycle to avoid
+// underruns. 8192 frames = ~186 ms capacity = ample margin.
+// Latency doesn't matter for snake's ambient music + eat SFX, so
+// this is the right trade: simplicity + stability over responsive
+// input. (Contrast with rhythm where the ring is 4096 and the
+// main loop runs at 60 FPS for tight feel.)
+const SNAKE_RING_FRAMES  = 8192;
+const SNAKE_CHUNK_FRAMES = 1024;
 
 // ── Game state ──────────────────────────────────────────────
 //
@@ -68,6 +82,22 @@ extrn world;        // ECS handle, allocated once via ecs_new(200)
 extrn frame_arena;  // per-frame scratch arena, reset each tick (pointer fixed)
 extrn body;         // snake body cells (heap array, contents mutate)
 extrn scores;       // ranking storage (heap array, contents mutate)
+
+// Audio state.
+//   snd_loop       — MusicHandle for the background groove. The WAV
+//                    was recorded in tools/audio/mini_synth and loads
+//                    from assets/samples/snake_loop.wav at init.
+//   shot_buf       — synthesized-in-code SFX for apple-eat. We
+//                    generate a 60 ms 880 Hz square-wave burst with a
+//                    linear decay envelope at init; this gives an
+//                    instant attack (first sample is full amplitude)
+//                    instead of whatever onset the recorded WAV had.
+//   shot_frames    — frame count of shot_buf.
+//   audio_fill_buf — scratch buffer for mixer_fill → audio_push.
+extrn snd_loop;
+extrn shot_buf;
+extrn shot_frames;
+extrn audio_fill_buf;
 
 auto head_x, head_y;
 auto body_len;
@@ -101,6 +131,44 @@ void shift_body() {
 
 // Particle system extracted to snake_particles.bsm (loaded above).
 // Functions available: spawn_particles, particle_base_job, draw_particles.
+
+// Synthesize a short SFX burst for apple-eat. 60 ms of 880 Hz
+// square wave with a linear decay envelope on the tail 40% so the
+// tone doesn't end abruptly with a click. Returns a newly-allocated
+// stereo s16 LE buffer and writes the frame count into *n_out.
+// Pure math + poke — no WAV decoding, no file I/O.
+static _gen_shot_sample(n_out) {
+    auto buf, n_frames, hp, amp, env_start;
+    auto i, phase, sample;
+
+    n_frames = 44100 * 60 / 1000;   // 60 ms → 2646 frames
+    hp = 44100 / 880 / 2;            // half-period at 880 Hz ≈ 25 samples
+    amp = 9000;                      // headroom below s16 peak (32767)
+    env_start = n_frames * 60 / 100; // start decay at 60% of the burst
+
+    buf = malloc(n_frames * 4);
+    phase = 0;
+    for (i = 0; i < n_frames; i = i + 1) {
+        // Square wave: top half of period = +amp, bottom = -amp.
+        sample = phase < hp ? amp : 0 - amp;
+
+        // Linear decay on the last 40% — eliminates the tail click.
+        if (i > env_start) {
+            sample = sample * (n_frames - i) / (n_frames - env_start);
+        }
+
+        // Stereo s16 little-endian.
+        poke(buf + i * 4 + 0,  sample        & 0xFF);
+        poke(buf + i * 4 + 1, (sample >> 8)  & 0xFF);
+        poke(buf + i * 4 + 2,  sample        & 0xFF);
+        poke(buf + i * 4 + 3, (sample >> 8)  & 0xFF);
+
+        phase = phase + 1;
+        if (phase >= hp + hp) { phase = 0; }
+    }
+    *n_out = n_frames;
+    return buf;
+}
 
 // ── Init / Reset ────────────────────────────────────────────
 
@@ -140,14 +208,49 @@ void add_score(s) {
 // ── Maestro phase callbacks ─────────────────────────────────
 
 // Init phase — runs once before the loop. Allocates world, body, ranking
-// buffer, then sets up the first level via init_game().
+// buffer, wires up the audio stack, then sets up the first level via
+// init_game(). Audio: open CoreAudio + mixer + asset manager, load the
+// two snake WAVs via path_asset (binary-relative, so we work from any
+// build layout), then start the background loop. The first tick of
+// solo_phase inherits a priming-complete audio pipeline.
 void snake_init_phase() {
+    auto loop_path, loop_ptr, loop_frames;
+
     render_init();
     world = ecs_new(200);
     frame_arena = arena_new(4096);
     body = malloc(MAX_BODY * 2 * 8);
     scores = malloc(40);
     num_scores = 0;
+
+    // Audio: ring + mixer + assets.
+    audio_open(SNAKE_RING_FRAMES);
+    mixer_init();
+    init_asset();
+    audio_fill_buf = malloc(SNAKE_CHUNK_FRAMES * 4);
+
+    // Background groove loads from the recorded WAV (a longer
+    // musical loop from mini_synth). If asset load fails,
+    // stbasset has already printed the reason to stderr; the game
+    // continues silent-but-playable.
+    loop_path = path_asset("assets/samples/snake_loop.wav");
+    snd_loop  = asset_load_music(loop_path);
+    free(loop_path);
+    if (snd_loop != 0) {
+        loop_ptr    = asset_get(snd_loop);
+        loop_frames = asset_width(snd_loop);
+        if (loop_ptr != 0) {
+            mixer_play_music(loop_ptr, loop_frames, 1);
+            mixer_set_bus_volume(MX_BUS_MUSIC, 60);
+        }
+    }
+
+    // Eat SFX is generated in code (see _gen_shot_sample). The
+    // recorded snake_shot.wav had a slow attack that lagged behind
+    // the "eat the apple" moment — a fresh-synth square-wave burst
+    // fires instantly on the first sample.
+    shot_buf = _gen_shot_sample(&shot_frames);
+
     init_game();
 }
 
@@ -208,6 +311,12 @@ void snake_solo_phase(dt) {
         body_len = body_len + 1;
         spawn_particles(apple_x, apple_y, 8, YELLOW);
         randomize_apple();
+        // Eat SFX — fire-and-forget on the SFX bus. shot_buf is
+        // synthesized in init (instant attack), so the beep hits
+        // the speakers the same frame the apple disappears.
+        if (shot_buf != 0) {
+            mixer_play_sample(shot_buf, shot_frames);
+        }
     }
 
     for (i = 0; i < body_len; i = i + 1) {
@@ -217,6 +326,19 @@ void snake_solo_phase(dt) {
             dead = 1;
             spawn_particles(head_x, head_y, 16, RED);
         }
+    }
+
+    // Audio pump — fill the ring until it's near-full. At FPS=10
+    // we tick every ~100 ms and the callback drains ~4410 frames
+    // between ticks; 8192-frame ring + fill-until-near-full keeps
+    // the consumer fed without jitter.
+    auto space, produced, pushed;
+    space = audio_ring_space();
+    while (space >= SNAKE_CHUNK_FRAMES) {
+        produced = mixer_fill(audio_fill_buf, SNAKE_CHUNK_FRAMES);
+        pushed = audio_push_frames(audio_fill_buf, produced);
+        if (pushed < produced) { break; }
+        space = audio_ring_space();
     }
 }
 

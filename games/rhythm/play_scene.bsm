@@ -1,0 +1,628 @@
+// play_scene.bsm — Core rhythm game loop (port of ironplate's
+// rhythm_scene.c). Three phases cycle the player through:
+//
+//   PHASE_DEMO        — all notes auto-play so the player can listen
+//                       and watch the pattern. DEMO_BARS worth of
+//                       notes play, then TRANSITION.
+//   PHASE_TRANSITION  — "SUA VEZ!" 3.5-second countdown before the
+//                       play reset. Notes rewind to start so the
+//                       player sees them coming from the top.
+//   PHASE_PLAY        — hi-hat and kick still auto-play; SNARE
+//                       (lane 3, key F) is the player's to hit.
+//                       ±20 ms = perfect (green), ±60 ms = ok
+//                       (yellow), anything later = miss.
+//
+// The whole scene renders in the 320×180 window. Notes fall from
+// y=0 to y=HIT_LINE over NOTE_TRAVEL_MS milliseconds, velocity
+// derived from the audio time rather than wall clock so the note
+// is always correctly positioned for its beat.
+//
+// Scoring at end of play transitions to the results scene, which
+// reads the module-level _score/_combo/_hits globals.
+
+load "beat_map.bsm";
+
+// ── Layout constants ─────────────────────────────────────────
+static extrn SCREEN_W;
+static extrn SCREEN_H;
+static extrn HIT_LINE_Y;
+static extrn NOTE_TRAVEL_MS;    // milliseconds a note spends on-screen
+static extrn NOTE_RADIUS;
+
+// Per-lane screen X. Four lanes evenly spaced.
+static extrn _LANE_X_0;
+static extrn _LANE_X_1;
+static extrn _LANE_X_2;
+static extrn _LANE_X_3;
+
+// Lane colors for note rendering + lane stripes.
+static extrn _COLOR_HIHAT;
+static extrn _COLOR_KICK;
+static extrn _COLOR_SNARE;
+static extrn _COLOR_HIT_PERFECT;
+static extrn _COLOR_HIT_OK;
+static extrn _COLOR_HIT_MISS;
+
+// ── Hit windows ──────────────────────────────────────────────
+// Milliseconds either side of beat_ms. Tighter inner = "perfect".
+static extrn PERFECT_WINDOW_MS;
+static extrn HIT_WINDOW_MS;
+
+// ── Demo/play parameters ─────────────────────────────────────
+static extrn DEMO_BARS;
+static extrn TRANSITION_MS;
+
+// ── Scene state ──────────────────────────────────────────────
+static extrn _phase;               // PHASE_DEMO / PHASE_TRANSITION / PHASE_PLAY
+static extrn PHASE_DEMO;
+static extrn PHASE_TRANSITION;
+static extrn PHASE_PLAY;
+static extrn PHASE_DONE;
+
+static extrn _map;                 // BeatMap pointer
+static extrn _note_hit;            // per-note array: 0 = live, 1 = resolved (hit or missed)
+static extrn _note_perfect;        // per-note: 1 if hit in perfect window
+static extrn _note_missed;         // per-note: 1 if missed
+static extrn _audio_time_ms;       // advances by dt_ms each frame
+static extrn _demo_end_ms;         // when demo flips to transition
+static extrn _transition_accum_ms; // time spent in transition so far
+
+static extrn _snd_hihat;
+static extrn _snd_kick;
+static extrn _snd_snare;
+
+// Scoring — readable by results_scene via extrn globals below.
+extrn rhythm_score;
+extrn rhythm_combo;
+extrn rhythm_max_combo;
+extrn rhythm_hits;
+extrn rhythm_misses;
+extrn rhythm_snare_total;
+
+// Hit flash feedback — decays in update_play, drawn in draw.
+static extrn _hit_flash_ms;
+static extrn _hit_flash_lane;
+static extrn _hit_flash_kind;     // 0 none, 1 perfect, 2 ok, 3 miss
+
+// Teacher expression state — drawn as a simple geometric face.
+static extrn _teacher_state;       // 0 idle / 1 hit / 2 miss / 3 celebrate
+static extrn _teacher_timer_ms;    // time in current state (for auto-revert)
+
+// ── Helpers ─────────────────────────────────────────────────
+
+// Translate raw lane index (0..3) to screen X.
+static _lane_x(lane) : base {
+    if (lane == 0) { return _LANE_X_0; }
+    if (lane == 1) { return _LANE_X_1; }
+    if (lane == 2) { return _LANE_X_2; }
+    return _LANE_X_3;
+}
+
+// Instrument kind for a lane (0 hi-hat / 1 kick / 2 snare). Mirrors
+// ironplate's lane_to_inst but using integer-indexed lanes.
+//   lane 0   -> hi-hat
+//   lane 1,2 -> kick
+//   lane 3   -> snare
+static _lane_to_inst(lane) : base {
+    if (lane == 0) { return 0; }
+    if (lane == 3) { return 2; }
+    return 1;
+}
+
+// Pick the lane color given the inst index.
+static _inst_color(inst) : base {
+    if (inst == 0) { return _COLOR_HIHAT; }
+    if (inst == 2) { return _COLOR_SNARE; }
+    return _COLOR_KICK;
+}
+
+// Play the correct sample for the lane. Uses the new mixer sample
+// voices; one-shot, routed to BUS_SFX.
+static void _play_lane(lane) {
+    auto inst, handle, buf, frames;
+    inst = _lane_to_inst(lane);
+    if (inst == 0) { handle = _snd_hihat; }
+    else if (inst == 1) { handle = _snd_kick; }
+    else { handle = _snd_snare; }
+    buf = asset_get(handle);
+    if (buf == 0) { return; }
+    frames = asset_width(handle);
+    mixer_play_sample(buf, frames);
+}
+
+// Convert an absolute beat_ms to screen Y given current audio time.
+// Returns the y pixel. Outside of NOTE_TRAVEL_MS, values are
+// off-screen and the caller should skip drawing.
+static _note_y(beat_ms, audio_ms) : base {
+    auto ms_until, t;
+    ms_until = beat_ms - audio_ms;
+    // t = 1 - (ms_until / NOTE_TRAVEL_MS). Integer math: we want
+    // pixel_y = (1 - ms_until/TRAVEL) * HIT_LINE_Y
+    //        = HIT_LINE_Y - ms_until * HIT_LINE_Y / TRAVEL
+    t = HIT_LINE_Y - ms_until * HIT_LINE_Y / NOTE_TRAVEL_MS;
+    return t;
+}
+
+// ── Scene lifecycle ─────────────────────────────────────────
+
+void play_load() {
+    auto i, beat_period_ms, first_beat, map: BeatMap;
+
+    // Geometry and tunable constants.
+    SCREEN_W = 320;
+    SCREEN_H = 180;
+    HIT_LINE_Y = 150;
+    NOTE_TRAVEL_MS = 2000;
+    NOTE_RADIUS = 6;
+
+    _LANE_X_0 =  80;
+    _LANE_X_1 = 140;
+    _LANE_X_2 = 200;
+    _LANE_X_3 = 260;
+
+    _COLOR_HIHAT = rgba(220, 190,  60, 255);
+    _COLOR_KICK  = rgba( 80, 140, 220, 255);
+    _COLOR_SNARE = rgba(220,  80,  80, 255);
+    _COLOR_HIT_PERFECT = rgba( 80, 220,  80, 255);
+    _COLOR_HIT_OK      = rgba(240, 210,  80, 255);
+    _COLOR_HIT_MISS    = rgba(180, 100, 100, 255);
+
+    PERFECT_WINDOW_MS = 20;
+    HIT_WINDOW_MS     = 60;
+
+    DEMO_BARS      = 2;
+    TRANSITION_MS  = 3500;
+
+    PHASE_DEMO       = 0;
+    PHASE_TRANSITION = 1;
+    PHASE_PLAY       = 2;
+    PHASE_DONE       = 3;
+
+    // Resolve assets relative to the binary's own directory
+    // (path_asset builds `<exe_dir>/<relpath>`). This means
+    // `./rhythm` inside games/rhythm/ works, and
+    // `games/rhythm/rhythm` from the repo root works too —
+    // CWD no longer matters.
+    auto map_path;
+    map_path = path_asset("assets/beat_map.txt");
+    _map = beat_map_load(map_path);
+    free(map_path);
+    if (_map == 0) {
+        print_err_msg("rhythm: assets/beat_map.txt not found next to the binary");
+        scene_switch(0);    // back to SCENE_MENU
+        return;
+    }
+
+    // Parallel arrays: hit / perfect / miss flags indexed by note #.
+    _note_hit     = malloc(beat_map_count(_map) * 8);
+    _note_perfect = malloc(beat_map_count(_map) * 8);
+    _note_missed  = malloc(beat_map_count(_map) * 8);
+    for (i = 0; i < beat_map_count(_map); i = i + 1) {
+        _note_hit[i]     = 0;
+        _note_perfect[i] = 0;
+        _note_missed[i]  = 0;
+    }
+
+    // Total snare notes drive the accuracy percentage.
+    rhythm_snare_total = 0;
+    for (i = 0; i < beat_map_count(_map); i = i + 1) {
+        auto note: BeatNote;
+        note = beat_map_note(_map, i);
+        if (note.lane == 3) {
+            rhythm_snare_total = rhythm_snare_total + 1;
+        }
+    }
+
+    // Load samples through stbasset. path_asset resolves paths
+    // next to the binary so the same binary works whether launched
+    // from games/rhythm/ or from the repo root. Dedup by path is
+    // built into stbasset, so repeated entry into this scene (e.g.
+    // after a results-screen retry) reuses the loaded buffers.
+    auto snd_path;
+    snd_path = path_asset("assets/samples/HI-HAT.wav");
+    _snd_hihat = asset_load_sound(snd_path);
+    free(snd_path);
+    snd_path = path_asset("assets/samples/KICK.wav");
+    _snd_kick = asset_load_sound(snd_path);
+    free(snd_path);
+    snd_path = path_asset("assets/samples/SNARE.wav");
+    _snd_snare = asset_load_sound(snd_path);
+    free(snd_path);
+
+    // Scoring fresh.
+    rhythm_score     = 0;
+    rhythm_combo     = 0;
+    rhythm_max_combo = 0;
+    rhythm_hits      = 0;
+    rhythm_misses    = 0;
+
+    _audio_time_ms       = 0;
+    _hit_flash_ms        = 0;
+    _hit_flash_lane      = 0;
+    _hit_flash_kind      = 0;
+    _teacher_state       = 0;
+    _teacher_timer_ms    = 0;
+    _transition_accum_ms = 0;
+
+    // Demo window: first note + DEMO_BARS at 4/4 = 4 beats per bar.
+    beat_period_ms = 60000 / beat_map_bpm(_map);
+    map = _map;
+    if (map.count > 0) {
+        auto first: BeatNote;
+        first = beat_map_note(_map, 0);
+        first_beat = first.beat_ms;
+    } else {
+        first_beat = 0;
+    }
+    _demo_end_ms = first_beat + DEMO_BARS * 4 * beat_period_ms;
+
+    _phase = PHASE_DEMO;
+}
+
+// ── Update: Demo phase ──────────────────────────────────────
+// Every note fires automatically at its beat. Transition to
+// TRANSITION once every note has played OR demo window ends.
+static void _update_demo(dt_ms) {
+    auto i, count, all_done;
+    all_done = 1;
+    count = beat_map_count(_map);
+    for (i = 0; i < count; i = i + 1) {
+        if (_note_hit[i] != 0) { continue; }
+        auto note: BeatNote;
+        note = beat_map_note(_map, i);
+        if (_audio_time_ms >= note.beat_ms) {
+            _note_hit[i] = 1;
+            _play_lane(note.lane);
+        } else {
+            all_done = 0;
+        }
+    }
+    if (all_done != 0 || _audio_time_ms >= _demo_end_ms) {
+        _phase = PHASE_TRANSITION;
+        _transition_accum_ms = 0;
+    }
+}
+
+// ── Update: Transition phase ────────────────────────────────
+// Counts down TRANSITION_MS then resets the map, rewinds time, and
+// jumps to PHASE_PLAY.
+static void _update_transition(dt_ms) {
+    auto i, count, first_beat, note: BeatNote;
+    _transition_accum_ms = _transition_accum_ms + dt_ms;
+    if (_transition_accum_ms < TRANSITION_MS) { return; }
+
+    // Reset every note to live.
+    count = beat_map_count(_map);
+    for (i = 0; i < count; i = i + 1) {
+        _note_hit[i]     = 0;
+        _note_perfect[i] = 0;
+        _note_missed[i]  = 0;
+    }
+
+    // Start the play clock slightly before the first beat so notes
+    // are already in flight when PLAY begins. Needed: first_beat -
+    // NOTE_TRAVEL_MS. Clamp to zero for safety.
+    if (count > 0) {
+        note = beat_map_note(_map, 0);
+        first_beat = note.beat_ms;
+    } else {
+        first_beat = 0;
+    }
+    if (first_beat > NOTE_TRAVEL_MS) {
+        _audio_time_ms = first_beat - NOTE_TRAVEL_MS;
+    } else {
+        _audio_time_ms = 0;
+    }
+
+    rhythm_score     = 0;
+    rhythm_combo     = 0;
+    rhythm_max_combo = 0;
+    rhythm_hits      = 0;
+    rhythm_misses    = 0;
+
+    _phase = PHASE_PLAY;
+}
+
+// ── Play phase: auto-play kick/hihat, player hits snare ─────
+// Register a player hit against a specific note. Only called when
+// the player's input landed inside HIT_WINDOW_MS of `note_idx`'s
+// beat — outside-window presses are handled separately (the sound
+// still plays, just no scoring credit). The caller already fired
+// the snare sample for immediate feedback, so this function does
+// NOT trigger the audio itself.
+static void _register_hit(lane, delta_ms, note_idx) {
+    auto abs_delta, kind;
+    abs_delta = delta_ms;
+    if (abs_delta < 0) { abs_delta = 0 - abs_delta; }
+
+    if (abs_delta <= PERFECT_WINDOW_MS) {
+        kind = 1;
+        rhythm_score = rhythm_score + 100 + rhythm_combo * 10;
+        _note_perfect[note_idx] = 1;
+    } else {
+        // Known to be <= HIT_WINDOW_MS because the caller
+        // filtered on it already. Classify as OK (yellow).
+        kind = 2;
+        rhythm_score = rhythm_score + 100 + rhythm_combo * 10;
+    }
+
+    rhythm_hits = rhythm_hits + 1;
+    rhythm_combo = rhythm_combo + 1;
+    if (rhythm_combo > rhythm_max_combo) { rhythm_max_combo = rhythm_combo; }
+    _note_hit[note_idx] = 1;
+    _teacher_state = 1;
+    _teacher_timer_ms = 0;
+    _hit_flash_ms   = 300;
+    _hit_flash_lane = lane;
+    _hit_flash_kind = kind;
+}
+
+static void _update_play(dt_ms) {
+    auto i, count, inst, note: BeatNote;
+    auto snare_pressed, delta, abs_delta, best_idx, best_delta;
+
+    // Decay the hit flash (~300ms total).
+    if (_hit_flash_ms > 0) {
+        _hit_flash_ms = _hit_flash_ms - dt_ms;
+        if (_hit_flash_ms < 0) { _hit_flash_ms = 0; }
+    }
+
+    // Teacher state auto-revert after ~700ms back to idle.
+    _teacher_timer_ms = _teacher_timer_ms + dt_ms;
+    if (_teacher_state != 0) {
+        if (_teacher_timer_ms > 700) {
+            _teacher_state = 0;
+            _teacher_timer_ms = 0;
+        }
+    }
+
+    count = beat_map_count(_map);
+
+    // Auto-play kick and hi-hat.
+    for (i = 0; i < count; i = i + 1) {
+        if (_note_hit[i] != 0) { continue; }
+        note = beat_map_note(_map, i);
+        inst = _lane_to_inst(note.lane);
+        if (inst == 2) { continue; }    // snare handled below
+        if (_audio_time_ms >= note.beat_ms) {
+            _note_hit[i] = 1;
+            _play_lane(note.lane);
+        }
+    }
+
+    // Snare miss detection: a snare note older than HIT_WINDOW_MS
+    // past its beat and still live is now a miss.
+    for (i = 0; i < count; i = i + 1) {
+        if (_note_hit[i] != 0) { continue; }
+        note = beat_map_note(_map, i);
+        if (note.lane != 3) { continue; }
+        if (_audio_time_ms > note.beat_ms + HIT_WINDOW_MS) {
+            _note_missed[i] = 1;
+            _note_hit[i]    = 1;
+            rhythm_misses = rhythm_misses + 1;
+            rhythm_combo = 0;
+            _teacher_state = 2;
+            _teacher_timer_ms = 0;
+            _hit_flash_kind = 3;
+            _hit_flash_lane = 3;
+            _hit_flash_ms = 300;
+        }
+    }
+
+    // Player snare input. Two keys fire the snare lane: F (for
+    // the four-key A/S/D/F layout used by most rhythm games) and
+    // SPACE (the one-handed play style that matches ironplate's
+    // original). Either press:
+    //   1. Always plays the snare sample immediately — the player
+    //      gets audible feedback regardless of whether a note is
+    //      currently in the hit window.
+    //   2. Tries to match against the nearest live snare note
+    //      inside HIT_WINDOW_MS; on match, register a scored hit.
+    //   3. Presses outside the window are scoring-neutral (no
+    //      penalty, no combo break) — free practice rolls.
+    snare_pressed = key_pressed(KEY_F);
+    if (key_pressed(KEY_SPACE) != 0) { snare_pressed = 1; }
+    if (snare_pressed != 0) {
+        _play_lane(3);    // immediate audible feedback
+
+        best_idx = 0 - 1;
+        best_delta = HIT_WINDOW_MS + 1;
+        for (i = 0; i < count; i = i + 1) {
+            if (_note_hit[i] != 0) { continue; }
+            note = beat_map_note(_map, i);
+            if (note.lane != 3) { continue; }
+            delta = _audio_time_ms - note.beat_ms;
+            abs_delta = delta;
+            if (abs_delta < 0) { abs_delta = 0 - abs_delta; }
+            if (abs_delta <= HIT_WINDOW_MS) {
+                if (abs_delta < best_delta) {
+                    best_delta = abs_delta;
+                    best_idx = i;
+                }
+            }
+        }
+        if (best_idx >= 0) {
+            note = beat_map_note(_map, best_idx);
+            _register_hit(3, _audio_time_ms - note.beat_ms, best_idx);
+        }
+    }
+
+    // Done: every note resolved. Jump to results (scene id 2).
+    auto all_done;
+    all_done = 1;
+    for (i = 0; i < count; i = i + 1) {
+        if (_note_hit[i] == 0) { all_done = 0; break; }
+    }
+    if (all_done != 0) {
+        _phase = PHASE_DONE;
+        scene_switch(2);
+    }
+}
+
+// ── Public scene hooks ──────────────────────────────────────
+void play_update(dt_ms) {
+    _audio_time_ms = _audio_time_ms + dt_ms;
+
+    if (_phase == PHASE_DEMO)       { _update_demo(dt_ms); }
+    else if (_phase == PHASE_TRANSITION) { _update_transition(dt_ms); }
+    else if (_phase == PHASE_PLAY)  { _update_play(dt_ms); }
+
+    // Global ESC bail-out goes to menu (scene 0).
+    if (key_pressed(KEY_ESC) != 0) { scene_switch(0); }
+}
+
+// ── Render ──────────────────────────────────────────────────
+
+// Draw the static lane stripes + hit line.
+static void _draw_playfield() {
+    auto strip_color;
+    // Background.
+    render_clear(rgba(8, 10, 18, 255));
+
+    // Lane stripes — subtle.
+    strip_color = rgba(24, 28, 40, 255);
+    render_rect(_LANE_X_0 - 12, 0, 24, SCREEN_H, strip_color);
+    render_rect(_LANE_X_1 - 12, 0, 24, SCREEN_H, strip_color);
+    render_rect(_LANE_X_2 - 12, 0, 24, SCREEN_H, strip_color);
+    render_rect(_LANE_X_3 - 12, 0, 24, SCREEN_H, strip_color);
+
+    // Hit line across all four lanes.
+    render_rect(_LANE_X_0 - 12, HIT_LINE_Y, SCREEN_W - (_LANE_X_0 - 12) - 40, 2,
+                rgba(120, 140, 200, 255));
+
+    // Per-lane key label under hit line.
+    render_text("A", _LANE_X_0 - 2, HIT_LINE_Y + 10, 1, GRAY);
+    render_text("S", _LANE_X_1 - 2, HIT_LINE_Y + 10, 1, GRAY);
+    render_text("D", _LANE_X_2 - 2, HIT_LINE_Y + 10, 1, GRAY);
+    render_text("F", _LANE_X_3 - 2, HIT_LINE_Y + 10, 1, GRAY);
+}
+
+// Draw a single note at its computed y position. `color` is the
+// instrument color; `active` = 1 during its hit window to draw a
+// glow outline.
+static void _draw_note(lane, y, color, active) {
+    auto x, glow;
+    x = _lane_x(lane);
+    if (active != 0) {
+        glow = rgba(240, 240, 240, 255);
+        render_circle(x, y, NOTE_RADIUS + 2, glow);
+    }
+    render_circle(x, y, NOTE_RADIUS, color);
+}
+
+// Draw every note that is currently on-screen.
+static void _draw_notes() {
+    auto i, count, y, color, inst, active, note: BeatNote;
+    auto ms_until;
+    count = beat_map_count(_map);
+    for (i = 0; i < count; i = i + 1) {
+        if (_note_hit[i] != 0) { continue; }
+        note = beat_map_note(_map, i);
+
+        // Skip notes too far in the future (off-screen).
+        ms_until = note.beat_ms - _audio_time_ms;
+        if (ms_until > NOTE_TRAVEL_MS) { continue; }
+        if (ms_until < 0 - HIT_WINDOW_MS) { continue; }
+
+        y = _note_y(note.beat_ms, _audio_time_ms);
+        inst = _lane_to_inst(note.lane);
+        color = _inst_color(inst);
+
+        active = 0;
+        if (ms_until >= 0 - HIT_WINDOW_MS) {
+            if (ms_until <= HIT_WINDOW_MS) { active = 1; }
+        }
+
+        _draw_note(note.lane, y, color, active);
+    }
+}
+
+// Simple geometric teacher at top-left. States change head color +
+// mouth curve. Zero external art.
+static void _draw_teacher() {
+    auto head_x, head_y, head_color, eye_l, eye_r;
+
+    head_x = 30;
+    head_y = 36;
+
+    // Color per state: idle = gray, hit = green, miss = red, celebrate = yellow.
+    if (_teacher_state == 1) {
+        head_color = rgba(100, 220, 140, 255);
+    } else if (_teacher_state == 2) {
+        head_color = rgba(220, 110, 110, 255);
+    } else if (_teacher_state == 3) {
+        head_color = rgba(240, 220,  80, 255);
+    } else {
+        head_color = rgba(200, 200, 210, 255);
+    }
+
+    // Head.
+    render_circle(head_x, head_y, 16, head_color);
+    // Eyes.
+    eye_l = rgba(10, 10, 20, 255);
+    eye_r = eye_l;
+    render_circle(head_x - 5, head_y - 3, 2, eye_l);
+    render_circle(head_x + 5, head_y - 3, 2, eye_r);
+    // Mouth — simple rectangle whose shape depends on state.
+    if (_teacher_state == 1) {
+        render_rect(head_x - 6, head_y + 4, 12, 4, rgba(30, 60, 30, 255));
+    } else if (_teacher_state == 2) {
+        render_rect(head_x - 4, head_y + 6, 8,  2, rgba(60, 30, 30, 255));
+    } else if (_teacher_state == 3) {
+        render_rect(head_x - 8, head_y + 4, 16, 5, rgba(60, 50, 20, 255));
+    } else {
+        render_rect(head_x - 5, head_y + 5, 10, 2, rgba(40, 40, 50, 255));
+    }
+}
+
+// Draw the score + combo + phase banner.
+static void _draw_hud() {
+    // Score.
+    render_text("SCORE", 4, 4, 1, WHITE);
+    render_number(4, 12, 1, WHITE, rhythm_score);
+
+    // Combo.
+    if (rhythm_combo > 1) {
+        render_text("COMBO", 60, 4, 1, rgba(220, 200, 120, 255));
+        render_number(60, 12, 1, rgba(220, 200, 120, 255), rhythm_combo);
+    }
+
+    // Phase banner.
+    if (_phase == PHASE_DEMO) {
+        render_text("WATCH + LISTEN", 200, 4, 1, rgba(120, 180, 220, 255));
+    } else if (_phase == PHASE_TRANSITION) {
+        auto remain;
+        remain = (TRANSITION_MS - _transition_accum_ms) / 1000 + 1;
+        render_text("YOUR TURN!", 120, 80, 2, rgba(240, 220, 80, 255));
+        render_number(156, 110, 2, WHITE, remain);
+    } else if (_phase == PHASE_PLAY) {
+        render_text("HIT THE SNARE (F)", 180, 4, 1, rgba(220, 120, 120, 255));
+    }
+
+    // Hit flash — short pulse at the lane the player just hit.
+    if (_hit_flash_ms > 0) {
+        auto fx, fc;
+        fx = _lane_x(_hit_flash_lane);
+        if (_hit_flash_kind == 1) { fc = _COLOR_HIT_PERFECT; }
+        else if (_hit_flash_kind == 2) { fc = _COLOR_HIT_OK; }
+        else { fc = _COLOR_HIT_MISS; }
+        render_circle(fx, HIT_LINE_Y, 14, fc);
+    }
+}
+
+void play_draw() {
+    _draw_playfield();
+    _draw_notes();
+    _draw_teacher();
+    _draw_hud();
+}
+
+void play_unload() {
+    if (_map != 0) {
+        beat_map_free(_map);
+        _map = 0;
+    }
+    if (_note_hit != 0) { free(_note_hit); _note_hit = 0; }
+    if (_note_perfect != 0) { free(_note_perfect); _note_perfect = 0; }
+    if (_note_missed != 0) { free(_note_missed); _note_missed = 0; }
+}

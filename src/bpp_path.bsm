@@ -1,0 +1,206 @@
+// bpp_path.bsm — Path utilities for locating assets relative to the
+// running binary.
+//
+// Problem: games that load files with hard-coded relative paths
+// ("assets/foo.png") only work when the user's shell is in a
+// specific directory. Running from ../other-dir or via a symlink
+// breaks asset discovery.
+//
+// Solution: path_exe_dir() computes the binary's own directory
+// from argv[0] at startup. path_asset(relpath) then builds a
+// fully-qualified path by joining the exe directory with the
+// supplied relative path, so `game/rhythm/rhythm` finds
+// `assets/beat_map.txt` alongside it regardless of CWD.
+//
+// Usage:
+//
+//     auto full;
+//     full = path_asset("assets/samples/snare.wav");
+//     handle = asset_load_sound(full);
+//     free(full);                     // caller owns the returned buffer
+//
+// Path resolution walks three steps:
+//   1. argv[0] is the exact string the user typed
+//      (./rhythm, games/rhythm/rhythm, /abs/path/rhythm, or bare
+//       "rhythm" if discovered through PATH).
+//   2. The directory portion is everything up to and including
+//      the last '/'. For bare names (no slash), we fall back to
+//      the empty prefix — caller's CWD wins and everything still
+//      works when the user cd'd into the game directory.
+//   3. The returned buffer concatenates (prefix, relpath) with an
+//      extra null terminator for C-string consumers.
+
+// Cached exe directory. First call to path_exe_dir resolves and
+// stores; subsequent calls reuse. Null-terminated, caller must
+// never free this pointer.
+static extrn _path_exe_dir;
+static extrn _path_exe_dir_len;
+
+// Cached "walk-up" prefix relative to the exe dir that gets us
+// to the asset root. Empty string when assets live alongside the
+// binary; "../" when the binary lives in a subdir like build/;
+// "../../" two levels up, etc. Populated lazily on the first
+// successful probe and reused for every subsequent path_asset
+// call to avoid repeating the filesystem walk.
+static extrn _path_asset_prefix;
+static extrn _path_asset_prefix_len;
+static extrn _path_asset_probed;
+
+// Find the last slash in `s` (byte offset). Returns -1 when the
+// string contains no '/'. Uses peek byte-by-byte — cheap and
+// allocation-free.
+static _path_last_slash(s) {
+    auto i, len, last, ch;
+    len = str_len(s);
+    last = 0 - 1;
+    for (i = 0; i < len; i = i + 1) {
+        ch = peek(s + i);
+        if (ch == '/') { last = i; }
+    }
+    return last;
+}
+
+// Lazy resolver for the exe directory. Derives it from argv[0]
+// exactly once and caches in a module-scope static. Safe to call
+// from any phase — a pure read after the first invocation.
+path_exe_dir() {
+    auto argv0, last_slash, prefix_len, out;
+    if (_path_exe_dir != 0) { return _path_exe_dir; }
+
+    argv0 = argv_get(0);
+    if (argv0 == 0) {
+        // Program was invoked without an argv (unlikely on any
+        // mainstream OS). Fall back to the empty prefix so asset
+        // lookups resolve relative to the current working
+        // directory.
+        _path_exe_dir     = str_dup("");
+        _path_exe_dir_len = 0;
+        return _path_exe_dir;
+    }
+
+    last_slash = _path_last_slash(argv0);
+    if (last_slash < 0) {
+        // Bare invocation (e.g. `./rhythm` → actually last_slash=1;
+        // `rhythm` via PATH → -1). Empty prefix means paths
+        // resolve relative to CWD, which is consistent with how
+        // users expect PATH-based tools to behave.
+        _path_exe_dir     = str_dup("");
+        _path_exe_dir_len = 0;
+        return _path_exe_dir;
+    }
+
+    // Include the trailing slash so path_join can simply append.
+    prefix_len = last_slash + 1;
+    out = malloc(prefix_len + 1);
+    memcpy(out, argv0, prefix_len);
+    poke(out + prefix_len, 0);
+    _path_exe_dir     = out;
+    _path_exe_dir_len = prefix_len;
+    return _path_exe_dir;
+}
+
+// Probe if `full` points to a readable file. Returns 1 on success,
+// 0 otherwise. Uses sys_open for a lightweight existence check
+// instead of pulling the whole content via file_read_all.
+// O_RDONLY = 0 on both macOS and Linux, so the two platforms
+// share this path.
+static _path_file_exists(full) {
+    auto fd;
+    fd = sys_open(full, 0);
+    if (fd < 0) { return 0; }
+    sys_close(fd);
+    return 1;
+}
+
+// Assemble `<dir><prefix><relpath>` into a freshly-malloc'd null-
+// terminated string. `prefix` is a string like "" or "../" or
+// "../../" that walks up from the exe dir to the project root.
+static _path_build(dir, dir_len, prefix, prefix_len, relpath, rel_len) {
+    auto out;
+    out = malloc(dir_len + prefix_len + rel_len + 1);
+    if (dir_len > 0) { memcpy(out, dir, dir_len); }
+    if (prefix_len > 0) { memcpy(out + dir_len, prefix, prefix_len); }
+    memcpy(out + dir_len + prefix_len, relpath, rel_len);
+    poke(out + dir_len + prefix_len + rel_len, 0);
+    return out;
+}
+
+// Walk up from the exe directory up to 4 levels searching for a
+// prefix that makes `<dir><prefix><relpath>` resolve to a readable
+// file. Caches the winning prefix in _path_asset_prefix so later
+// path_asset calls skip the walk. Called once per program run.
+static void _path_probe_asset_root(dir, dir_len, relpath, rel_len) {
+    auto depth, prefix_len, i, candidate, prefix;
+
+    _path_asset_probed = 1;
+
+    // Depth 0 = exe dir itself. Each step up adds "../".
+    for (depth = 0; depth < 5; depth = depth + 1) {
+        prefix_len = depth * 3;
+        prefix = malloc(prefix_len + 1);
+        for (i = 0; i < depth; i = i + 1) {
+            poke(prefix + i * 3 + 0, '.');
+            poke(prefix + i * 3 + 1, '.');
+            poke(prefix + i * 3 + 2, '/');
+        }
+        poke(prefix + prefix_len, 0);
+
+        candidate = _path_build(dir, dir_len, prefix, prefix_len,
+                                 relpath, rel_len);
+        if (_path_file_exists(candidate) != 0) {
+            _path_asset_prefix     = prefix;
+            _path_asset_prefix_len = prefix_len;
+            free(candidate);
+            return;
+        }
+        free(prefix);
+        free(candidate);
+    }
+
+    // Nothing worked — cache an empty prefix so subsequent calls
+    // don't re-probe. Returned paths will be wrong but the caller
+    // already has a dedicated "file not found" fallback.
+    _path_asset_prefix     = str_dup("");
+    _path_asset_prefix_len = 0;
+}
+
+// Build a full asset path relative to the "asset root" — the
+// nearest ancestor of the binary that contains the requested file.
+// The first call probes the filesystem; subsequent calls reuse
+// the cached prefix so there is no per-call disk cost.
+//
+// Callers pass relative paths like "assets/foo.png" (no leading
+// slash). Absolute paths ("/tmp/bar") are returned as-is after a
+// str_dup, bypassing the prefix. The returned buffer is malloc'd
+// and the caller owns it (free after use).
+//
+// Resolution examples (binary at `games/rhythm/build/rhythm`):
+//
+//   path_asset("assets/beat_map.txt")
+//     → probes `games/rhythm/build/assets/beat_map.txt` (miss)
+//     → probes `games/rhythm/build/../assets/beat_map.txt` (hit)
+//     → caches prefix = "../"
+//     → returns `games/rhythm/build/../assets/beat_map.txt`
+//
+//   path_asset("assets/samples/SNARE.wav")   (second call)
+//     → reuses cached "../"
+//     → returns `games/rhythm/build/../assets/samples/SNARE.wav`
+path_asset(relpath) {
+    auto dir, dir_len, rel_len;
+    if (relpath == 0) { return 0; }
+
+    // Absolute paths bypass the prefix entirely.
+    if (peek(relpath) == '/') { return str_dup(relpath); }
+
+    dir     = path_exe_dir();
+    dir_len = _path_exe_dir_len;
+    rel_len = str_len(relpath);
+
+    if (_path_asset_probed == 0) {
+        _path_probe_asset_root(dir, dir_len, relpath, rel_len);
+    }
+
+    return _path_build(dir, dir_len,
+                        _path_asset_prefix, _path_asset_prefix_len,
+                        relpath, rel_len);
+}

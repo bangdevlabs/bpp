@@ -102,12 +102,13 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 #   bpp_beat    — universal monotonic clock
 #   bpp_job     — N×SPSC worker pool
 #   bpp_maestro — solo / base / render bandleader
-#   bpp_arena   — bump allocator (imported explicitly by programs that want it)
-# Every module in this list except bpp_arena is auto-injected by
-# bpp_import.bsm for any user main() program — so missing one here
-# breaks every user compile with a confusing "malloc never defined"
-# cascade. When bpp_import gains a new auto-injected module, add it
-# to this list at the same time.
+#   bpp_arena   — bump allocator (auto-injected since 0.75)
+#   bpp_path    — argv[0]-relative asset resolution (auto-injected since 0.75)
+# Every module in this list is auto-injected by bpp_import.bsm for
+# any user main() program — so missing one here breaks every user
+# compile with a confusing "malloc never defined" cascade. When
+# bpp_import gains a new auto-injected module, add it to this list
+# at the same time.
 sudo cp src/bpp_defs.bsm "$LIB_DIR/"
 sudo cp src/bpp_mem.bsm "$LIB_DIR/"
 sudo cp src/bpp_array.bsm "$LIB_DIR/"
@@ -121,6 +122,7 @@ sudo cp src/bpp_beat.bsm "$LIB_DIR/"
 sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 sudo cp src/bpp_arena.bsm "$LIB_DIR/"
+sudo cp src/bpp_path.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"

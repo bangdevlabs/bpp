@@ -1,0 +1,98 @@
+// test_mixer_sample.bpp — exercise the new sample / music / bus API.
+//
+// Covers:
+//   1. mixer_play_sample grabs a free slot and advances frame by frame
+//   2. mixer_play_music lands on the dedicated slot 8
+//   3. Looping music wraps position to 0 at end-of-buffer
+//   4. Non-looping music deactivates at end-of-buffer
+//   5. Bus volumes clamp to 0..100
+//
+// No audio device involved — everything runs through mixer_fill into
+// a scratch buffer that we read back.
+
+import "stbaudio.bsm";
+import "stbmixer.bsm";
+import "stbsound.bsm";
+
+main() {
+    auto h, voice, out, snd_buf, snd_frames;
+
+    // Mixer needs a timeline anchor like synthkey does.
+    init_beat();
+    mixer_init();
+
+    // (1) mixer_play_sample on empty mixer takes slot 0.
+    //     Build a tiny 4-frame buffer so we can watch it drain.
+    snd_frames = 4;
+    snd_buf = malloc(snd_frames * 4);
+    auto i;
+    for (i = 0; i < snd_frames * 4; i = i + 1) { poke(snd_buf + i, 0); }
+    voice = mixer_play_sample(snd_buf, snd_frames);
+    if (voice != 0) {
+        print_msg("FAIL: first play_sample should use slot 0");
+        return 1;
+    }
+    if (mixer_active_voices() != 1) {
+        print_msg("FAIL: active_voices should be 1 after play_sample");
+        return 1;
+    }
+
+    // (2) mixer_fill 4 frames should drain it (pos advances past end).
+    out = malloc(16);
+    mixer_fill(out, snd_frames);
+    if (mixer_active_voices() != 0) {
+        print_msg("FAIL: sample should deactivate after end-of-buffer");
+        return 1;
+    }
+
+    // (3) mixer_play_music lands on slot 8.
+    mixer_play_music(snd_buf, snd_frames, 1);   // loop = 1
+    if (mixer_active_voices() != 1) {
+        print_msg("FAIL: music should count as one active voice");
+        return 1;
+    }
+
+    // (4) Looping music stays alive past its frame count.
+    mixer_fill(out, snd_frames * 3);
+    if (mixer_active_voices() != 1) {
+        print_msg("FAIL: looped music should still be active after 3x drain");
+        return 1;
+    }
+
+    // (5) Stop music.
+    mixer_stop_music();
+    if (mixer_active_voices() != 0) {
+        print_msg("FAIL: stop_music should deactivate slot 8");
+        return 1;
+    }
+
+    // (6) Non-looping music deactivates naturally.
+    mixer_play_music(snd_buf, snd_frames, 0);    // loop = 0
+    mixer_fill(out, snd_frames);
+    if (mixer_active_voices() != 0) {
+        print_msg("FAIL: non-looping music should deactivate at end");
+        return 1;
+    }
+
+    // (7) Bus volume clamps.
+    mixer_set_bus_volume(MX_BUS_MUSIC, 150);
+    if (mixer_get_bus_volume(MX_BUS_MUSIC) != 100) {
+        print_msg("FAIL: bus_volume should clamp to 100");
+        return 1;
+    }
+    mixer_set_bus_volume(MX_BUS_SFX, 0 - 10);
+    if (mixer_get_bus_volume(MX_BUS_SFX) != 0) {
+        print_msg("FAIL: bus_volume should clamp to 0");
+        return 1;
+    }
+
+    // (8) Out-of-range bus ids are silently ignored, get returns 0.
+    mixer_set_bus_volume(99, 50);
+    if (mixer_get_bus_volume(99) != 0) {
+        print_msg("FAIL: out-of-range bus get should return 0");
+        return 1;
+    }
+
+    print_msg("stbmixer: sample + music + buses passed");
+    return 0;
+}

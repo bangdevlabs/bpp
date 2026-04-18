@@ -187,17 +187,61 @@ being a thing.
 
 So far the answer has always been yes.
 
+## The Snake Ate Its Own Tail (2026-04-18)
+
+The ouroboros closed on 2026-04-18. On that day:
+
+1. **`mini_synth`** — a B++ polyphonic synthesizer (compiled by
+   B++, running the B++ audio stack) — was used to play a simple
+   drum groove. The recording was saved as `snake_loop.wav` via
+   `sound_save_wav`, written in B++.
+2. **`snake_maestro.bpp`** loaded that same WAV through the
+   `stbasset` handle-based asset manager and handed the PCM buffer
+   to `stbmixer`'s music slot with `mixer_play_music(..., loop=1)`.
+3. The groove now plays under snake as its background track. When
+   the snake eats an apple, a fresh 60 ms 880 Hz square-wave burst
+   — synthesized inline in `snake_maestro.bpp` at init — fires as
+   the eat SFX.
+
+Every byte of audible sound while snake runs comes from B++ code:
+the instrument, the recording, the decoder, the mixer, the ring
+buffer, the CoreAudio FFI, the bus routing, the eat-SFX generator.
+No external library except CoreAudio itself. The dog-food loop —
+"a cobra comeu o próprio rabo" — is complete.
+
+The infrastructure that made this possible shipped the same week:
+
+- **`stbasset.bsm`** — handle-based asset manager with path dedup
+  and 16-bit generation counters. Snake holds a `MusicHandle` for
+  the loop and a raw PCM pointer for the in-code SFX.
+- **`bpp_path.bsm`** — resolves asset paths relative to the
+  running binary (via `argv[0]`), so `./build/snake` from inside
+  the game directory or `games/snake/build/snake` from the repo
+  root both find `assets/samples/snake_loop.wav`.
+- **`stbmixer` buses** — MASTER / MUSIC / SFX volume groups, so
+  the background loop can be dropped to 60% while the eat SFX
+  stays at full volume on top.
+- **`sound_load_wav` rewrite** — chunk scanner + PCM 8/16/24/32 +
+  IEEE float + mono→stereo auto-expand, so WAVs exported from any
+  DAW (or the quick ones mini_synth produces) just work.
+
+What snake gains audibly is small. What the week's infrastructure
+unlocks is enormous: rhythm teacher, sound-reactive UI, SFX across
+every game in the fleet, and — more importantly — a pipeline
+where B++ produces its own content.
+
 ## What's Next
 
 - **Snake on Vulkan** when ELF dynamic linking lands — same source,
   same game, talking to the Linux GPU instead of the Linux X11
   framebuffer.
-- **Snake with audio** when stbaudio lands — apple-eat sound, death
-  jingle, restart cue. The smallest game becomes the smallest
-  audio test.
 - **Snake on Windows** when the Windows backend lands — same source,
   same game, on the third operating system. The fleet sails on.
+- **Snake plays a new loop every session** — tied to a live-record
+  flow where the groove is generated fresh at game boot. The
+  instrument, the recording, the game, all one binary.
 
 ---
 
-*Snake first ran on 2026-03-19. It has not stopped running.*
+*Snake first ran on 2026-03-19. On 2026-04-18 it started playing
+music recorded by its sibling. It has not stopped running.*

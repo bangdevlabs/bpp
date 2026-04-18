@@ -16,6 +16,24 @@ B++ is self-hosting. Every change to the compiler or to a module it imports has 
 git show HEAD:bpp > ./bpp && chmod +x ./bpp
 ```
 
+### What earns a bootstrap / full suite?
+
+Token-cost awareness: don't bootstrap + run all tests after every
+touch. Rebuild only what you actually affected.
+
+| What you changed | Minimum verification |
+|------------------|----------------------|
+| A game file (`games/<game>/*.bpp` or `.bsm`) | Compile just that game: `./bpp games/<game>/<game>.bpp -o /tmp/out` |
+| A tool (`tools/<tool>/*.bpp` / `.bsm`)       | Compile just that tool |
+| An `stb/*.bsm` module                         | Full suite (`./tests/run_all.sh`) — tests import stb |
+| A `src/bpp_*.bsm` runtime module              | Full suite — every program auto-imports them |
+| The compiler (`src/bpp.bpp`, parser, lexer, codegen, validate, dispatch, import, types, bug, bo, internal, defs) | Full **bootstrap cycle** + full suite |
+| Platform layer (`src/backend/os/<os>/*`)      | Compile at least one game that uses it (stbgame) |
+| Chip / target backend (`src/backend/chip/...`, `target/...`) | Bootstrap + full suite (the compiler itself re-emits through them) |
+| Docs (`docs/*.md`, `README.md`)               | Nothing to verify — read-only |
+
+The most common mistake is running `./bpp src/bpp.bpp -o /tmp/bpp_bt` + `./tests/run_all.sh` after touching a game. That's a 2-second rebuild of the entire compiler + 70 tests just to verify the game compiles. Compile the game alone instead.
+
 ### Bootstrap cycle
 
 Every change to the compiler source runs through this:
@@ -475,7 +493,7 @@ After all four edits, bootstrap.
 
 A leaf module has zero `import` statements pointing at other stb files. It only depends on compiler builtins and auto-injected core modules. Leaf modules are testable in isolation.
 
-Examples of leaf modules today: `stbcol`, `stbcolor`, `stbecs`, `stbinput`, `stbpath`, `stbpool`, `stbsound`.
+Examples of leaf modules today: `stbcol`, `stbcolor`, `stbecs`, `stbinput`, `stbpath`, `stbpool`, `stbscene`, `stbsound`.
 
 Couple a module only when the **purpose** demands it. `stbphys` imports `stbtile` because "platformer physics for tilemaps" is its purpose. `stbtile` imports `stbimage` because loading a tileset PNG needs a decoder. Those couplings are honest.
 
@@ -589,6 +607,8 @@ Batch 4 — Game cartridges (stb/):
   stb/stbaudio.bsm
   stb/stbmixer.bsm
   stb/stbsound.bsm
+  stb/stbasset.bsm
+  stb/stbscene.bsm
 
 Batch 5 — Compiler internals:
   src/bpp_defs.bsm

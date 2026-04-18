@@ -1,12 +1,12 @@
 # B++
 
-### B++ 0.68 — Polyphonic Synthesizer, Audio Stack, Effect Lattice — 17 April 2026
+### B++ 0.75 — Rhythm Teacher Prototype + Snake Closes the Dog-Food Loop — 18 April 2026
 
-A self-hosting compiled language with a **working 8-voice polyphonic synthesizer** in 300 lines of B++. Four waveforms (sine, triangle, sawtooth, square) morphed by a continuous fader. Bitcrush + decimation dirt control. WAV recording. All running on a native audio stack built from scratch — CoreAudio FFI, SPSC ring buffer, realtime callback — with zero external dependencies.
+A self-hosting compiled language with **games that hear themselves**. Snake now plays a drum loop recorded live inside mini_synth — the polyphonic synthesizer built in the same language — while a fresh in-code 880 Hz SFX fires every time it eats an apple. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and the industry-standard text-file beat-map format.
 
-The synthesizer is not a demo. It is a musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. Press keys, hear notes, modulate timbre, record to disk.
+B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
-> **Version 0.68**: 68 tests pass. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
+> **Version 0.75**: 75 passing tests. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
 
 ---
 
@@ -32,13 +32,14 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 
 ## Three Games, One Engine
 
-B++ ships with three demo games in `games/`, all GPU-accelerated on Metal:
+B++ ships with four demo games in `games/`, all GPU-accelerated on Metal:
 
 | Game | Folder | What it is |
 |------|--------|-----------|
-| **Snake** | `games/snake/` | Classic snake with ECS particle effects, high-score ranking, arena + pool allocators. Eat the apple, grow the tail, don't bite yourself. |
+| **Snake** | `games/snake/` | Classic snake with ECS particle effects, high-score ranking, arena + pool allocators, **background music + in-code eat SFX**. Eat the apple, grow the tail, don't bite yourself. |
 | **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. |
 | **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
+| **Rhythm** | `games/rhythm/` | Rhythm-genre prototype. Menu → demo (auto-play) → transition countdown → play (snare on F or SPACE). Hit-windows: ±20 ms perfect, ±60 ms ok. Uses stbscene / stbasset / stbmixer music+SFX buses / beat_map text parser. |
 
 ---
 
@@ -78,7 +79,7 @@ The compiler now understands effects. Every function carries a classification �
 
 The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
 
-23 compiler modules in `src/`. 18 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 68 tests, zero failures.
+24 compiler modules in `src/`. 20 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 75 tests, zero failures.
 
 The version number is the test count.
 
@@ -177,7 +178,7 @@ You write code. You compile it. You run it.
 
 The name **stb** is a tribute to [Sean Barrett's stb libraries](https://github.com/nothings/stb) — the single-header C libraries that defined a generation of small, focused, dependency-free building blocks for graphics, audio, fonts, and data. `stb_image.h`, `stb_truetype.h`, `stb_vorbis.c`, `stb_ds.h` and the rest are how a lot of indie game developers learned that "the right amount of library" is one file you can read in an afternoon. B++'s standard library is the same idea reframed as a pure-B++ collection: small modules, no headers (B++ has no headers anyway), no third-party dependencies, the minimum API surface for the maximum game.
 
-stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 18 modules, all auto-injected by the compiler when you `import "stbgame.bsm"`.
+stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 20 modules, all auto-injected by the compiler when you `import "stbgame.bsm"`.
 
 **Rendering:**
 
@@ -211,20 +212,22 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
-| `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics |
+| `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics, custom components via `ecs_component_new` |
+| `stbscene` | Scene manager — register/switch/load/update/draw/unload with deferred switches |
 
 **Audio:**
 
 | Module | What it does |
 |--------|-------------|
 | `stbaudio` | Audio device I/O — CoreAudio AudioQueue, SPSC ring buffer, realtime callback |
-| `stbmixer` | Polyphonic 8-voice mixer — square/sine/tri/saw waveforms, fader morph, dirt (bitcrush + decimation), master volume |
+| `stbmixer` | 10-voice mixer — tones, one-shot samples, looping music, three independent buses (MASTER/MUSIC/SFX), bitcrush + decimation dirt |
 | `stbsound` | Audio file formats — WAV read/write (RIFF PCM 44100 stereo s16) |
 
 **Assets:**
 
 | Module | What it does |
 |--------|-------------|
+| `stbasset` | Handle-based asset manager — `uint32` handles with 16-bit generation, dedup by path, ABA-safe stale detection, one table for sprites/sounds/music/fonts |
 | `stbimage` | Pure B++ PNG loader — DEFLATE, Huffman, all filter types, zero FFI |
 
 ### Universal runtime (promoted from stb to src)
@@ -309,28 +312,36 @@ The `bootstrap.c` file is the compiler emitted as C (~15K lines). It is the seed
 
 ### Play the Games
 
-Each game lives in its own folder under `games/` with its own assets. Compile and run from inside the folder so that relative asset paths resolve:
+Each game lives in its own folder under `games/`. Since 0.75, asset paths are resolved relative to the **binary** (via `bpp_path` auto-injected) — you can `cd` into the game folder *or* run the binary from the repo root, both work.
 
 ```bash
-# Snake with ECS particles, ranking, arena + pool
+# Snake with ECS particles, ranking, arena + pool, music loop, eat SFX
 cd games/snake
-bpp --clean-cache snake_gpu.bpp -o snake
-./snake
+bpp snake_maestro.bpp -o build/snake
+./build/snake
 
 # Pathfinder — rat vs cat chase
 cd games/pathfind
-bpp --clean-cache pathfind.bpp -o path
-./path
+bpp pathfind.bpp -o build/pathfind
+./build/pathfind
 
 # Platformer with Kenney Pixel Platformer assets (CC0)
 cd games/platformer
-bpp --clean-cache platformer.bpp -o plat_asset
-./plat_asset
+bpp platform.bpp -o build/plat_asset
+./build/plat_asset
 
 # Platformer with debug rectangles (no assets needed)
 cd games/platformer
-bpp --clean-cache platform_noasset.bpp -o plat_noasset
-./plat_noasset
+bpp plat_noasset.bpp -o build/plat_noasset
+./build/plat_noasset
+
+# Rhythm — rhythm-genre prototype
+cd games/rhythm
+bpp rhythm.bpp -o build/rhythm
+./build/rhythm
+#  ENTER          start
+#  F or SPACE     hit snare (during PLAY phase)
+#  ESC            back to menu
 ```
 
 ### Run on Linux (X11 via Docker + XQuartz)
@@ -513,15 +524,16 @@ b++/
 │       ├── target/aarch64_macos/ — Mach-O writer
 │       ├── target/x86_64_linux/  — ELF writer
 │       └── c/                  — C transpiler (portable escape hatch)
-├── stb/                        — Standard B Library (18 modules, game engine)
+├── stb/                        — Standard B Library (20 modules, game engine)
 ├── tools/audio/mini_synth/     — Polyphonic synthesizer (300 lines)
 ├── games/                      — Complete playable games
-│   ├── snake/                  — Snake with ECS particles + ranking
+│   ├── snake/                  — Snake + ECS particles + ranking + music + SFX
 │   ├── pathfind/               — Rat-and-cat chase with AI pursuit
-│   └── platformer/             — Side-scrolling platformer with Kenney assets
+│   ├── platformer/             — Side-scrolling platformer with Kenney assets
+│   └── rhythm/                 — Rhythm-genre prototype (menu → demo → play)
 ├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/                    — Backend drivers (SDL2, raylib — optional)
-├── tests/                      — Compiler and library tests (68 passing)
+├── tests/                      — Compiler and library tests (74 passing)
 ├── docs/                       — The book (the_b++_programming_language.md), dev guide (how_to_dev_b++.md), journal, TODO, debug_with_bug
 ├── bpp                         — The compiler binary
 └── bug                         — The debugger binary
@@ -564,7 +576,7 @@ bpp --show-deps source.bpp     # print module dependency graph
 bpp --clean-cache              # delete all cached .bo files
 ```
 
-23 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 18 stb library modules, ~20,000 lines of B++. Self-hosting verified at every commit (`shasum gen1 == gen2`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
+23 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 20 stb library modules, ~20,000 lines of B++. Self-hosting verified at every commit (`shasum gen1 == gen2`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
 
 ### The Debugger
 
@@ -655,6 +667,8 @@ B++ is 30 days old. The following are the milestones, in order:
 | **Apr 16** | **First sound** — `stbaudio` opens CoreAudio device. 440 Hz sine tone plays through the speakers from B++ code. |
 | **Apr 17** | **Polyphonic synthesizer** — 300-line `synthkey.bpp` with 4 octaves, 8 voices, 4 waveforms with continuous morph, bitcrush + decimation dirt, WAV recording. A musical instrument written in B++, compiled by B++, producing audio through B++'s own standard library. |
 | **Apr 17** | **The book + zero-warning clean compile** — `docs/bpp_manual.md` and `docs/bpp_language_reference.md` merged into `docs/the_b++_programming_language.md` (K&R-style, 16 chapters). `docs/how_to_dev_b++.md` consolidates production discipline + tonify expert mode. Last two W026 false positives resolved (`_stb_gpu_init` + `render_init` were annotated `: gpu` but honestly reach IO on shader-compile error paths — the lattice was right, the annotations weren't). Every game in the repo now compiles with zero warnings. |
+| **Apr 18** | **Infra week, day 1 — Rhythm Teacher foundations**. Five new/extended modules land in a single pass, all tested and clean-compiling. **`stbasset`** (new) — handle-based asset manager. 32-bit handles `[generation\|slot]` with O(1) dedup-by-path, stale-handle detection, kind-tagged slots for sprite/sound/music/font. **`stbscene`** (new) — scene manager with deferred switch, register/update/draw/unload lifecycle. **`stbmixer`** (extended) — sample voices + dedicated music slot + three buses (MASTER/MUSIC/SFX) with independent gain; `mixer_play_sample`, `mixer_play_music`, `mixer_music_ms` for note-chart sync. **`stbecs`** (extended) — `ecs_component_new` / `ecs_component_at` helpers for custom parallel components. **`stbsprite`** (extended) — `sprite_draw_frame` for spritesheet row/col sampling, `anim_frame` for time-based frame selection. Platform layer picks up `_stb_gpu_sprite_uv` for UV sub-rectangles. Suite 68 → 74 passing. Bootstrap sha stable. Zero warnings. |
+| **Apr 18** | **`bpp_path` + auto-inject promotion + the dog-food loop closed**. New `src/bpp_path.bsm` resolves asset paths relative to `argv[0]` with upward filesystem probe — games run from any directory without breaking relative paths. `bpp_arena` + `bpp_path` promoted to auto-inject (every user program gets them for free). `sound_load_wav` rewritten into a proper chunk scanner: PCM 8/16/24/32, IEEE float 32, mono-to-stereo auto-expand, skips LIST/INFO chunks. `stbsound`/`stbimage`/`stbfont` now emit stderr diagnostics on asset load failure (format code, bit depth, missing chunks, not-a-PNG) — programmer no longer cegos quando um asset some. `games/rhythm/` ships as a real rhythm-genre prototype: beat_map text loader, menu + play (demo/transition/play phases) + results scenes, teacher character drawn in primitives, hit windows ±20ms perfect / ±60ms ok. `games/snake/snake_maestro.bpp` loads `snake_loop.wav` (recorded in mini_synth) as background music and fires an in-code 880 Hz square-wave burst on apple-eat — **a cobra comeu o próprio rabo**: B++ producing content for B++ games, end to end. |
 
 B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into `docs/how_to_dev_b++.md` as canonical rule, and the language itself is documented K&R-style in `docs/the_b++_programming_language.md`. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 

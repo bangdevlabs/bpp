@@ -44,6 +44,40 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | E243 | pointer compared to non-zero literal | bpp_validate.bsm | 600 | ✅ | `if (ptr == 42)` is almost always a bug; only 0 is the canonical null check |
 | E244 | float literal in int context | bpp_parser.bsm + bpp_validate.bsm | 2122 + 583 | ✅ | array index or shift count cannot be a float literal |
 
+## Runtime asset-load diagnostics (stderr, not compile-time)
+
+Not diagnostics from the compiler — these are printed by stb
+library loaders at runtime when an asset fails to load.
+Programmer-facing messages so games don't have "silent missing
+sprite / silent muted sample" bugs. Added 2026-04-18 after the
+ironplate WAV import surfaced several silent-format-reject
+cases.
+
+All follow the same shape: `<module>: '<path>': <reason>`.
+
+**stbsound** (`sound_load_wav`):
+- `file not found or unreadable`
+- `truncated (under 12 bytes)`
+- `not a RIFF/WAVE file`
+- `missing fmt chunk`
+- `missing data chunk`
+- `unsupported PCM bit depth <N> (need 8, 16, 24, or 32)`
+- `IEEE float must be 32-bit, got <N>-bit`
+- `format code <N> not supported (accepts PCM=1 or IEEE float=3)`
+- `<N> channels not supported (need mono or stereo)`
+
+**stbimage** (`img_load`):
+- `file not found or unreadable`
+- `not a valid PNG or unsupported chunk layout`
+
+**stbfont** (`font_load`):
+- `file not found or unreadable`
+- `no 'head' table (not a valid TTF)`
+
+Convention: the loader prints + returns 0; callers in
+`stbasset.bsm` propagate the null handle, never wrap or
+re-log.
+
 ## Warnings (compilation continues)
 
 | Code | Message | File | Line | Has loc? | Trigger |

@@ -1,0 +1,127 @@
+// rhythm.bpp — games/rhythm entry point.
+//
+// Rhythm-genre prototype for B++. Port of the rhythm_teacher game
+// originally prototyped in C (ironplate engine on raylib), rebuilt
+// against the B++ native stack: stbgame + stbrender + stbscene +
+// stbmixer + stbasset.
+//
+// Play flow:
+//   SCENE_MENU (0) → SCENE_PLAY (1) → SCENE_RESULTS (2)
+// SCENE_PLAY runs three internal phases (DEMO / TRANSITION / PLAY)
+// inside a single stbscene — the phase transitions are invisible to
+// the scene manager; only MENU/PLAY/RESULTS are registered scenes.
+//
+// Uses the new stbmixer buses: samples route to BUS_SFX, master bus
+// stays at default 100. Background music is deferred — the demo
+// phase already plays kick+hi-hat patterns which doubles as a
+// click-track. Proper WAV music lands when we compose one.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbscene.bsm";
+import "stbasset.bsm";
+import "stbaudio.bsm";
+import "stbmixer.bsm";
+// bpp_path is auto-injected since 0.75 — no need to import it.
+
+load "menu_scene.bsm";
+load "play_scene.bsm";
+load "results_scene.bsm";
+
+const SCENE_MENU    = 0;
+const SCENE_PLAY    = 1;
+const SCENE_RESULTS = 2;
+
+// Pre-allocated scratch buffer for the mixer → audio-ring pump.
+// 1024 stereo s16 frames = 4096 bytes. Lives at module scope so we
+// never malloc inside the main loop (Rule from
+// feedback_audio_quality.md).
+extrn _fill_buf;
+
+// Audio ring sizing. 4096 frames at 44100 Hz = up to 93 ms of
+// worst-case app-side buffering. Earlier attempts to cut this in
+// half under-produced at 60 FPS (the consumer drains ~735
+// samples/frame; we can't reliably produce less than that and
+// keep the ring primed), so we mirror the mini_synth pattern:
+// large enough ring + fill-until-near-full pump. Perceived
+// latency lands around ~40-60 ms in practice since the pump
+// replenishes continuously, not worst-case.
+const _RING_FRAMES = 4096;
+const _CHUNK_FRAMES = 1024;
+
+main() {
+    auto space, produced, pushed;
+
+    game_init(320, 180, "B++ Rhythm", 60);
+    render_init();
+
+    // Audio + mixer pipeline.
+    audio_open(_RING_FRAMES);
+    mixer_init();
+    _fill_buf = malloc(_CHUNK_FRAMES * 4);
+
+    // Asset manager — needed before the scene load functions call
+    // asset_load_sound.
+    init_asset();
+
+    // Scene registry. Each entry pairs a symbolic id to its four
+    // lifecycle function pointers.
+    init_scene();
+    scene_register(SCENE_MENU,
+                   fn_ptr(menu_load),
+                   fn_ptr(menu_update),
+                   fn_ptr(menu_draw),
+                   fn_ptr(menu_unload));
+    scene_register(SCENE_PLAY,
+                   fn_ptr(play_load),
+                   fn_ptr(play_update),
+                   fn_ptr(play_draw),
+                   fn_ptr(play_unload));
+    scene_register(SCENE_RESULTS,
+                   fn_ptr(results_load),
+                   fn_ptr(results_update),
+                   fn_ptr(results_draw),
+                   fn_ptr(results_unload));
+
+    // Boot into the menu.
+    scene_switch(SCENE_MENU);
+
+    // Main loop. scene_tick runs any pending switch and then calls
+    // the active scene's update; scene_draw renders it. The audio
+    // ring is kept topped up by filling 1024-frame batches until
+    // the ring has less than 1024 frames of free space — same
+    // pattern as mini_synth's proven-good audio pump. This handles
+    // frame-timing jitter without underrun clicks.
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        render_begin();
+
+        scene_tick(game_dt_ms());
+        scene_draw();
+
+        // Audio pump — mini_synth-proven "fill until ring is
+        // near full". Every frame, keep pushing 1024-frame chunks
+        // into the ring while there is at least one chunk of free
+        // space left. The ring drifts to near-full at equilibrium,
+        // which gives the callback plenty of buffered audio to
+        // pull from and tolerates frame-timing jitter.
+        //
+        // A tempting optimization is to keep less queued for
+        // lower input latency, but at 60 FPS the consumer drains
+        // ~735 samples/frame; under-filling leads to underruns
+        // that show up as stutter / pseudo time-stretching. Don't
+        // tune this unless you have a reliable jitter measurement.
+        space = audio_ring_space();
+        while (space >= _CHUNK_FRAMES) {
+            produced = mixer_fill(_fill_buf, _CHUNK_FRAMES);
+            pushed = audio_push_frames(_fill_buf, produced);
+            if (pushed < produced) { break; }
+            space = audio_ring_space();
+        }
+
+        render_end();
+    }
+
+    scene_shutdown();
+    return 0;
+}

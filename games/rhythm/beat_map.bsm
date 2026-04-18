@@ -1,0 +1,273 @@
+// beat_map.bsm — Text-file beat map loader for games/rhythm.
+//
+// File format (see assets/beat_map.txt for a working example):
+//
+//   # comment lines start with '#'
+//   bpm 120                  — beats per minute (default 120)
+//   offset 0.5               — audio lead-in seconds before note 0
+//   1.0  0  0                — beat_time, lane, type (tap or hold)
+//   3.5  2  1  0.6           — hold note: beat_time, lane, 1, hold_seconds
+//
+// Lane routing (port of ironplate rhythm_teacher):
+//   lane 0 -> hi-hat (auto-play in both demo and play)
+//   lane 1 -> kick   (auto-play)
+//   lane 2 -> kick   (auto-play)
+//   lane 3 -> snare  (player must hit — the whole "teacher" point)
+//
+// Stored numbers are scaled to milliseconds + milli-lanes so the
+// whole file parses through the integer path without any float math.
+// A beat_time of 1.5 seconds becomes 1500 ms; a lane of 0 becomes 0.
+
+// Depends on auto-injected bpp_str / bpp_io / bpp_file — no manual
+// import needed; those modules are pulled in by every user program.
+
+// One parsed note. Times in milliseconds, lane is the raw integer
+// from the file (0..3). For the port we don't need hold notes yet;
+// hold_ms stays 0 for tap notes and records the hold window for
+// future expansion.
+struct BeatNote {
+    beat_ms,          // 8 — absolute ms from song start (offset applied)
+    lane: byte,       // 1 — 0..3
+    type: byte,       // 1 — 0 tap, 1 hold
+    // 6 padding bytes
+    hold_ms,          // 8 — hold duration in ms; 0 for tap
+}
+
+// Whole parsed map. `notes` is a contiguous BeatNote array, count is
+// the number of valid notes. bpm/offset survive the parse for any
+// code that wants to reason about beat grid (metronome etc).
+struct BeatMap {
+    notes,
+    count,
+    bpm,              // stored as integer beats-per-minute
+    offset_ms,        // lead-in before first beat, in ms
+}
+
+// Maximum notes in a single chart. Ironplate allocated per-file;
+// we pick a fixed ceiling that fits a 2-minute song at 8 notes per
+// second.
+static extrn _BM_MAX_NOTES;
+
+// Parse one integer starting at byte offset `pos` in buffer `buf`.
+// Consumes digits (and optional leading '-'); returns the value
+// and writes the new position back via the pos_out pointer.
+// Skips leading spaces. Returns 0 if no digit was seen.
+static _bm_parse_int(buf, pos, size, pos_out) {
+    auto val, sign, ch, saw_digit;
+    // Skip whitespace.
+    while (pos < size) {
+        ch = peek(buf + pos);
+        if (ch != ' ' && ch != '\t') { break; }
+        pos = pos + 1;
+    }
+    sign = 1;
+    if (pos < size) {
+        if (peek(buf + pos) == '-') { sign = 0 - 1; pos = pos + 1; }
+    }
+    val = 0;
+    saw_digit = 0;
+    while (pos < size) {
+        ch = peek(buf + pos);
+        if (ch < '0' || ch > '9') { break; }
+        val = val * 10 + (ch - '0');
+        saw_digit = 1;
+        pos = pos + 1;
+    }
+    *(pos_out) = pos;
+    if (saw_digit == 0) { return 0; }
+    return val * sign;
+}
+
+// Parse a decimal number (integer part + optional fractional) and
+// return it as milliseconds. "1.5" yields 1500, "2" yields 2000.
+// Same skip-whitespace + pos_out protocol as _bm_parse_int.
+static _bm_parse_ms(buf, pos, size, pos_out) {
+    auto whole, frac, frac_div, ch, sign;
+    // Skip whitespace.
+    while (pos < size) {
+        ch = peek(buf + pos);
+        if (ch != ' ' && ch != '\t') { break; }
+        pos = pos + 1;
+    }
+    sign = 1;
+    if (pos < size) {
+        if (peek(buf + pos) == '-') { sign = 0 - 1; pos = pos + 1; }
+    }
+    whole = 0;
+    while (pos < size) {
+        ch = peek(buf + pos);
+        if (ch < '0' || ch > '9') { break; }
+        whole = whole * 10 + (ch - '0');
+        pos = pos + 1;
+    }
+    frac = 0;
+    frac_div = 1;
+    if (pos < size) {
+        if (peek(buf + pos) == '.') {
+            pos = pos + 1;
+            while (pos < size) {
+                ch = peek(buf + pos);
+                if (ch < '0' || ch > '9') { break; }
+                frac = frac * 10 + (ch - '0');
+                frac_div = frac_div * 10;
+                pos = pos + 1;
+            }
+        }
+    }
+    *(pos_out) = pos;
+    // Combine: whole * 1000 + frac * 1000 / frac_div. Using integer
+    // math only — avoids float->int truncation that would lose the
+    // fractional portion.
+    return (whole * 1000 + frac * 1000 / frac_div) * sign;
+}
+
+// Skip to end of current line. Advances past '\n' if present.
+static _bm_skip_line(buf, pos, size) : base {
+    auto ch;
+    while (pos < size) {
+        ch = peek(buf + pos);
+        pos = pos + 1;
+        if (ch == 10) { return pos; }  // '\n'
+    }
+    return pos;
+}
+
+// Compare a prefix in buf (starting at pos) against a C-string.
+// Returns 1 if match, 0 otherwise. Doesn't advance pos.
+static _bm_match(buf, pos, size, s, s_len) : base {
+    auto i;
+    if (pos + s_len > size) { return 0; }
+    for (i = 0; i < s_len; i = i + 1) {
+        if (peek(buf + pos + i) != peek(s + i)) { return 0; }
+    }
+    return 1;
+}
+
+// Parse a whole beat map file from disk. Returns a BeatMap pointer
+// on success, 0 on read failure. The caller takes ownership of the
+// returned map + its internal note array and frees via beat_map_free.
+beat_map_load(path) : io {
+    auto buf, size_ptr, size, map: BeatMap, notes, pos, count;
+    auto ch, bm_next, beat, lane, ntype, hold;
+    auto n: BeatNote, offset_ms, bpm, note_ptr;
+
+    _BM_MAX_NOTES = 1024;
+
+    size_ptr = malloc(8);
+    *(size_ptr) = 0;
+    buf = file_read_all(path, size_ptr);
+    if (buf == 0) { free(size_ptr); return 0; }
+    size = *(size_ptr);
+    free(size_ptr);
+
+    notes = malloc(_BM_MAX_NOTES * sizeof(BeatNote));
+    count = 0;
+    bpm = 120;
+    offset_ms = 0;
+
+    pos = 0;
+    while (pos < size) {
+        ch = peek(buf + pos);
+
+        // Skip blank lines and comments.
+        if (ch == '#' || ch == 10 || ch == 13) {
+            pos = _bm_skip_line(buf, pos, size);
+            continue;
+        }
+
+        // Leading whitespace on the line.
+        if (ch == ' ' || ch == '\t') { pos = pos + 1; continue; }
+
+        // "bpm <N>"
+        if (_bm_match(buf, pos, size, "bpm ", 4) != 0) {
+            pos = pos + 4;
+            bpm = _bm_parse_int(buf, pos, size, &bm_next);
+            pos = _bm_skip_line(buf, bm_next, size);
+            continue;
+        }
+
+        // "offset <N>"
+        if (_bm_match(buf, pos, size, "offset ", 7) != 0) {
+            pos = pos + 7;
+            offset_ms = _bm_parse_ms(buf, pos, size, &bm_next);
+            pos = _bm_skip_line(buf, bm_next, size);
+            continue;
+        }
+
+        // Otherwise: note line — beat lane [type [hold]]
+        beat = _bm_parse_ms(buf, pos, size, &bm_next);
+        pos = bm_next;
+        lane = _bm_parse_int(buf, pos, size, &bm_next);
+        if (bm_next == pos) {
+            // Couldn't parse a lane — abandon this line.
+            pos = _bm_skip_line(buf, pos, size);
+            continue;
+        }
+        pos = bm_next;
+        ntype = _bm_parse_int(buf, pos, size, &bm_next);
+        pos = bm_next;
+        hold = 0;
+        if (ntype != 0) {
+            hold = _bm_parse_ms(buf, pos, size, &bm_next);
+            pos = bm_next;
+        }
+        pos = _bm_skip_line(buf, pos, size);
+
+        if (count < _BM_MAX_NOTES) {
+            note_ptr = notes + count * sizeof(BeatNote);
+            n = note_ptr;
+            n.beat_ms = beat + offset_ms;
+            n.lane    = lane;
+            n.type    = ntype;
+            n.hold_ms = hold;
+            count = count + 1;
+        }
+    }
+
+    free(buf);
+
+    map = malloc(sizeof(BeatMap));
+    map.notes = notes;
+    map.count = count;
+    map.bpm = bpm;
+    map.offset_ms = offset_ms;
+    return map;
+}
+
+// Access the i-th note as a typed pointer. i must be < map.count.
+// Returns 0 for a null map so callers guarded by beat_map_count == 0
+// never reach a bad field read.
+beat_map_note(map, i) : base {
+    auto m: BeatMap;
+    if (map == 0) { return 0; }
+    m = map;
+    return m.notes + i * sizeof(BeatNote);
+}
+
+// Number of notes in the map. A null map reports 0 — loops then
+// iterate zero times and the rest of the game logic degrades
+// gracefully instead of dereferencing a null struct pointer.
+beat_map_count(map) : base {
+    auto m: BeatMap;
+    if (map == 0) { return 0; }
+    m = map;
+    return m.count;
+}
+
+// BPM of the chart. Defaults to 120 when map is null so any ms-per-beat
+// computation stays non-zero.
+beat_map_bpm(map) : base {
+    auto m: BeatMap;
+    if (map == 0) { return 120; }
+    m = map;
+    return m.bpm;
+}
+
+// Release a map's backing memory.
+void beat_map_free(map) {
+    auto m: BeatMap;
+    if (map == 0) { return; }
+    m = map;
+    free(m.notes);
+    free(map);
+}

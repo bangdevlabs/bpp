@@ -118,42 +118,284 @@ sound_save_wav(path, buf, n_frames) : io {
 // Only 16-bit stereo PCM at 44100 Hz is accepted today. Other
 // formats return -1 (the caller should transcode offline or add
 // a format branch here).
+// Supported WAV variants:
+//   format 1  (PCM integer),   bits = 8 / 16 / 24 / 32
+//   format 3  (IEEE float),    bits = 32
+//   channels  = 1 (mono) or 2 (stereo); mono gets duplicated to
+//               both speakers on load
+//   sample_rate = any; the current mixer assumes 44100 Hz so
+//               off-rate files play at the wrong pitch but don't
+//               fail — format tolerance beats format correctness
+//               while a resampler is not yet written.
+//
+// All supported inputs are decoded to the internal mixer format
+// (16-bit PCM stereo) before `sound_last_buf` is updated. The
+// returned buffer is always `n_frames * 4` bytes regardless of
+// the input's own bit depth or channel count.
+//
+// The scanner walks chunks rather than assuming the canonical
+// 44-byte header layout, so LIST/INFO/fact chunks emitted by
+// Audacity, Logic, DAWs with metadata, etc. are skipped
+// transparently.
 sound_load_wav(path) : io {
-    auto fd, hdr, data_bytes, n_frames, buf;
+    auto buf, size_out, size;
+    auto pos, chunk_id, chunk_size, chunk_pad;
+    auto fmt_code, channels, sample_rate, bits;
+    auto data_off, data_size;
+    auto found_fmt, found_data;
+    auto n_frames, out, i, src, in_bpf;
+    // `: word` annotation on left_s / right_s makes the
+    // float-to-int truncation in the IEEE-float branch an explicit
+    // opt-in under E232 (unannotated locals are rejected).
+    auto left_s: word, right_s: word, mono, is_float;
+    auto s_lo, s_hi, sample_i24, v, b0, b1, b2, b3;
+
     init_sound();
 
-    fd = sys_open(path, 0);
-    if (fd < 0) { return 0 - 1; }
+    // Read the whole file — WAVs are small enough (sounds/samples
+    // up to a few MB) that streaming the parser buys nothing and
+    // complicates chunk scanning.
+    size_out = malloc(8);
+    *size_out = 0;
+    buf = file_read_all(path, size_out);
+    size = *size_out;
+    free(size_out);
+    if (buf == 0) {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': file not found or unreadable"); print_err_ln();
+        return 0 - 1;
+    }
 
-    hdr = malloc(44);
-    sys_read(fd, hdr, 44);
+    // Need at least the 12-byte RIFF/WAVE header.
+    if (size < 12) {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': truncated (under 12 bytes)"); print_err_ln();
+        free(buf); return 0 - 1;
+    }
 
     // Validate RIFF + WAVE magic.
-    if (peek(hdr + 0) != 'R') { free(hdr); sys_close(fd); return 0 - 1; }
-    if (peek(hdr + 8) != 'W') { free(hdr); sys_close(fd); return 0 - 1; }
+    if (peek(buf + 0)  != 'R' || peek(buf + 1)  != 'I'
+     || peek(buf + 2)  != 'F' || peek(buf + 3)  != 'F'
+     || peek(buf + 8)  != 'W' || peek(buf + 9)  != 'A'
+     || peek(buf + 10) != 'V' || peek(buf + 11) != 'E') {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': not a RIFF/WAVE file"); print_err_ln();
+        free(buf); return 0 - 1;
+    }
 
-    // Validate PCM format.
-    if (_snd_r16(hdr, 20) != 1) { free(hdr); sys_close(fd); return 0 - 1; }
-    if (_snd_r16(hdr, 22) != 2) { free(hdr); sys_close(fd); return 0 - 1; }
-    if (_snd_r32(hdr, 24) != 44100) { free(hdr); sys_close(fd); return 0 - 1; }
-    if (_snd_r16(hdr, 34) != 16) { free(hdr); sys_close(fd); return 0 - 1; }
+    // Scan chunks starting at offset 12. Each chunk: 4-byte id,
+    // 4-byte size (LE), then size bytes + possible 1-byte pad to
+    // align the next chunk to even offset.
+    pos = 12;
+    found_fmt = 0;
+    found_data = 0;
+    fmt_code = 0; channels = 0; sample_rate = 0; bits = 0;
+    data_off = 0; data_size = 0;
 
-    data_bytes = _snd_r32(hdr, 40);
-    free(hdr);
+    while (pos + 8 <= size) {
+        chunk_size = _snd_r32(buf, pos + 4);
 
-    n_frames = data_bytes / _SND_BLOCK_ALIGN;
-    buf = malloc(data_bytes);
-    sys_read(fd, buf, data_bytes);
-    sys_close(fd);
+        // Match chunk id by its four bytes directly. Comparing a
+        // packed 32-bit value via read_u32 would need knowing the
+        // little-endian integer for each id; peeking bytes is
+        // clearer and avoids endian confusion.
+        if (peek(buf + pos + 0) == 'f'
+         && peek(buf + pos + 1) == 'm'
+         && peek(buf + pos + 2) == 't'
+         && peek(buf + pos + 3) == ' ') {
+            if (pos + 8 + 16 <= size) {
+                fmt_code    = _snd_r16(buf, pos +  8);
+                channels    = _snd_r16(buf, pos + 10);
+                sample_rate = _snd_r32(buf, pos + 12);
+                bits        = _snd_r16(buf, pos + 22);
+                found_fmt   = 1;
+            }
+        }
+        if (peek(buf + pos + 0) == 'd'
+         && peek(buf + pos + 1) == 'a'
+         && peek(buf + pos + 2) == 't'
+         && peek(buf + pos + 3) == 'a') {
+            data_off   = pos + 8;
+            data_size  = chunk_size;
+            found_data = 1;
+        }
 
-    if (_snd_last_buf != 0) { free(_snd_last_buf); }
-    _snd_last_buf    = buf;
+        // Advance past this chunk. RIFF pads chunks to 2-byte
+        // alignment — if chunk_size is odd, skip one extra byte.
+        pos = pos + 8 + chunk_size;
+        chunk_pad = chunk_size & 1;
+        if (chunk_pad != 0) { pos = pos + 1; }
+    }
+
+    if (found_fmt == 0) {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': missing fmt chunk"); print_err_ln();
+        free(buf); return 0 - 1;
+    }
+    if (found_data == 0) {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': missing data chunk"); print_err_ln();
+        free(buf); return 0 - 1;
+    }
+
+    // Supported format validation.
+    is_float = 0;
+    if (fmt_code == 1) {
+        // PCM integer — 8/16/24/32-bit.
+        if (bits != 8 && bits != 16 && bits != 24 && bits != 32) {
+            print_err_msg("stbsound: '"); print_err_msg(path);
+            print_err_msg("': unsupported PCM bit depth ");
+            print_err_int(bits);
+            print_err_msg(" (need 8, 16, 24, or 32)"); print_err_ln();
+            free(buf); return 0 - 1;
+        }
+    } else if (fmt_code == 3) {
+        // IEEE float — only 32-bit is practical.
+        if (bits != 32) {
+            print_err_msg("stbsound: '"); print_err_msg(path);
+            print_err_msg("': IEEE float must be 32-bit, got ");
+            print_err_int(bits);
+            print_err_msg("-bit"); print_err_ln();
+            free(buf); return 0 - 1;
+        }
+        is_float = 1;
+    } else {
+        // A-law, µ-law, WAVE_FORMAT_EXTENSIBLE, other: unsupported.
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': format code ");
+        print_err_int(fmt_code);
+        print_err_msg(" not supported (accepts PCM=1 or IEEE float=3)");
+        print_err_ln();
+        free(buf); return 0 - 1;
+    }
+
+    if (channels != 1 && channels != 2) {
+        print_err_msg("stbsound: '"); print_err_msg(path);
+        print_err_msg("': ");
+        print_err_int(channels);
+        print_err_msg(" channels not supported (need mono or stereo)");
+        print_err_ln();
+        free(buf); return 0 - 1;
+    }
+    mono = 0;
+    if (channels == 1) { mono = 1; }
+
+    // Bytes per source frame (before normalization to stereo s16).
+    in_bpf = channels * bits / 8;
+    n_frames = data_size / in_bpf;
+
+    // Allocate the internal stereo 16-bit buffer (4 bytes per frame).
+    out = malloc(n_frames * 4);
+
+    for (i = 0; i < n_frames; i = i + 1) {
+        src = data_off + i * in_bpf;
+
+        if (is_float == 0) {
+            // --- PCM integer path ---------------------------------
+            if (bits == 16) {
+                left_s = _snd_r16(buf, src);
+                if (left_s >= 32768) { left_s = left_s - 65536; }
+                if (mono != 0) {
+                    right_s = left_s;
+                } else {
+                    right_s = _snd_r16(buf, src + 2);
+                    if (right_s >= 32768) { right_s = right_s - 65536; }
+                }
+            } else if (bits == 8) {
+                // 8-bit WAV is unsigned (0..255 with 128 = zero).
+                // Widen to signed 16 by ((u - 128) << 8).
+                left_s = (peek(buf + src) - 128) * 256;
+                if (mono != 0) {
+                    right_s = left_s;
+                } else {
+                    right_s = (peek(buf + src + 1) - 128) * 256;
+                }
+            } else if (bits == 24) {
+                // 24-bit PCM is signed little-endian. Assemble into
+                // a 24-bit integer, sign-extend, then drop the low
+                // 8 bits to fit 16-bit output.
+                b0 = peek(buf + src + 0);
+                b1 = peek(buf + src + 1);
+                b2 = peek(buf + src + 2);
+                sample_i24 = b0 + b1 * 256 + b2 * 65536;
+                if (sample_i24 >= 8388608) {
+                    sample_i24 = sample_i24 - 16777216;
+                }
+                left_s = sample_i24 / 256;
+                if (mono != 0) {
+                    right_s = left_s;
+                } else {
+                    b0 = peek(buf + src + 3);
+                    b1 = peek(buf + src + 4);
+                    b2 = peek(buf + src + 5);
+                    sample_i24 = b0 + b1 * 256 + b2 * 65536;
+                    if (sample_i24 >= 8388608) {
+                        sample_i24 = sample_i24 - 16777216;
+                    }
+                    right_s = sample_i24 / 256;
+                }
+            } else {
+                // 32-bit PCM int: shift down 16 bits, preserve sign.
+                v = _snd_r32(buf, src);
+                if (v >= 2147483648) { v = v - 4294967296; }
+                left_s = v / 65536;
+                if (mono != 0) {
+                    right_s = left_s;
+                } else {
+                    v = _snd_r32(buf, src + 4);
+                    if (v >= 2147483648) { v = v - 4294967296; }
+                    right_s = v / 65536;
+                }
+            }
+        } else {
+            // --- IEEE float 32-bit path ---------------------------
+            // Reinterpret 4 raw bytes as a single-precision float
+            // via an addressed `: half float` local. poke writes
+            // the bytes into the local's stack slot; reading back
+            // with `f` loads a float register.
+            auto f: half float;
+            poke(&f + 0, peek(buf + src + 0));
+            poke(&f + 1, peek(buf + src + 1));
+            poke(&f + 2, peek(buf + src + 2));
+            poke(&f + 3, peek(buf + src + 3));
+            auto lf: float;
+            lf = f * 32767.0;
+            left_s = lf;
+            if (left_s >  32767)     { left_s =  32767; }
+            if (left_s < 0 - 32768)  { left_s = 0 - 32768; }
+            if (mono != 0) {
+                right_s = left_s;
+            } else {
+                poke(&f + 0, peek(buf + src + 4));
+                poke(&f + 1, peek(buf + src + 5));
+                poke(&f + 2, peek(buf + src + 6));
+                poke(&f + 3, peek(buf + src + 7));
+                lf = f * 32767.0;
+                right_s = lf;
+                if (right_s >  32767)    { right_s =  32767; }
+                if (right_s < 0 - 32768) { right_s = 0 - 32768; }
+            }
+        }
+
+        // Write the normalized frame: little-endian stereo s16.
+        _snd_w16(out, i * 4 + 0, left_s  & 0xFFFF);
+        _snd_w16(out, i * 4 + 2, right_s & 0xFFFF);
+    }
+
+    free(buf);
+
+    // Caller owns `out`. We don't free the previous _snd_last_buf
+    // so any asset handle still holding it remains valid.
+    _snd_last_buf    = out;
     _snd_last_frames = n_frames;
     return n_frames;
 }
 
-// Pointer to the last-loaded WAV's PCM data. Valid until the next
-// sound_load_wav call (which frees the prior buffer).
+// Pointer to the most-recent WAV's PCM data. The buffer is owned
+// by the caller: after consuming it via sound_buf()/sound_frames(),
+// the caller must `free(sound_buf())` when done. Calling
+// sound_load_wav again without freeing the previous buffer leaks
+// it (but does NOT dangle any handles the caller stored).
 sound_buf() : base { return _snd_last_buf; }
 
 // Frame count of the last-loaded WAV.

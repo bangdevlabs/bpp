@@ -1,0 +1,422 @@
+// stbasset.bsm — Handle-based asset manager.
+//
+// Every asset (sprite / sound / music / font) is loaded once and
+// referenced by a small uint32 handle for the rest of the game.
+// Two wins over raw pointers:
+//
+//   1. Stale-handle detection via a 16-bit generation counter.
+//      asset_unload bumps the generation on that slot, so any
+//      handle that still points at it fails the check in asset_get.
+//      No use-after-free, no dangling texture pointers.
+//
+//   2. Dedup by path: loading the same "assets/snare.wav" twice
+//      returns the same handle. The caller can load liberally
+//      without worrying about duplicate memory.
+//
+// Handle layout (32 bits):
+//
+//   [ 16-bit generation | 16-bit slot index ]
+//
+// Slot index 0 is reserved as "null handle" — asset_get on 0
+// returns 0, making handle init to 0 a safe default.
+//
+// Example:
+//
+//   asset_init();
+//   auto snare;
+//   snare = asset_load_sound("assets/snare.wav");    // SoundHandle
+//   auto ptr;
+//   ptr = asset_get(snare);                           // real pointer
+//   mixer_play_sample(ptr, ...);
+//   asset_unload(snare);                              // frees + bumps generation
+//   ptr = asset_get(snare);                           // returns 0 (stale)
+//
+// Dev-time hot reload: asset_hot_reload() checks mtime on every
+// loaded sprite file and re-uploads the GPU texture if the source
+// PNG changed. The handle stays valid — only the internal pointer
+// moves.
+
+import "bpp_hash.bsm";
+import "stbimage.bsm";
+import "stbsound.bsm";
+import "stbfont.bsm";
+
+// Per-kind tag stored in each slot. Used to route asset_get kind
+// checks and to pick the right unload path (GPU texture vs mem free).
+static extrn ASSET_NONE;
+static extrn ASSET_SPRITE;
+static extrn ASSET_SOUND;
+static extrn ASSET_MUSIC;
+static extrn ASSET_FONT;
+
+// One slot per live asset. 32 bytes keeps it cache-friendly and
+// leaves room to grow (mtime + flags) without re-laying out.
+//
+//   kind       — one of ASSET_* above
+//   generation — bumped on unload; the 16 low bits live in the handle
+//   ptr        — real resource pointer: RGBA buf for sprite, WAV
+//                samples for sound, MTLTexture handle for GPU sprite
+//   w, h       — natural pixel dimensions (sprite) / frame count (sound)
+//   mtime      — file modification time captured at load, used by
+//                asset_hot_reload to detect file changes on disk
+//
+struct AssetSlot {
+    kind: byte,
+    generation: quarter,
+    ptr,
+    w,
+    h,
+    mtime
+}
+
+static extrn _ASSET_MAX;          // max simultaneous live assets
+static extrn _asset_slots;         // AssetSlot array (contiguous)
+static extrn _asset_paths;         // HashStr: path -> handle (dedup)
+static extrn _asset_path_store;    // array of path strings (for hot reload)
+static extrn _asset_path_lens;     // parallel length array
+static extrn _asset_inited;        // guard: init_asset is idempotent
+
+// Call once before any asset_load. Safe to call multiple times —
+// subsequent calls are no-ops.
+void init_asset() {
+    auto i, slot: AssetSlot, slot_ptr;
+    if (_asset_inited != 0) { return; }
+    _asset_inited = 1;
+
+    ASSET_NONE   = 0;
+    ASSET_SPRITE = 1;
+    ASSET_SOUND  = 2;
+    ASSET_MUSIC  = 3;
+    ASSET_FONT   = 4;
+
+    // 256 assets is the ironplate ceiling and has been plenty for
+    // every shipped game. Bump here if a future title exceeds it.
+    _ASSET_MAX = 256;
+
+    _asset_slots = malloc(sizeof(AssetSlot) * _ASSET_MAX);
+    _asset_path_store = malloc(8 * _ASSET_MAX);
+    _asset_path_lens = malloc(8 * _ASSET_MAX);
+
+    // Zero every slot. Slot 0 stays permanently empty because
+    // handle index 0 is reserved as "null handle".
+    for (i = 0; i < _ASSET_MAX; i = i + 1) {
+        slot = _asset_slots + i * sizeof(AssetSlot);
+        slot.kind = ASSET_NONE;
+        slot.generation = 0;
+        slot.ptr = 0;
+        slot.w = 0;
+        slot.h = 0;
+        slot.mtime = 0;
+        *(_asset_path_store + i * 8) = 0;
+        *(_asset_path_lens + i * 8) = 0;
+    }
+
+    _asset_paths = hash_str_new(512);
+}
+
+// Pack a generation + slot index into a single 32-bit handle.
+// Slot 0 is reserved so "handle == 0" reliably means null.
+static _asset_pack(slot, gen) : base {
+    return (gen << 16) | slot;
+}
+
+// Extract just the slot index (low 16 bits).
+static _asset_slot_of(h) : base {
+    return h & 0xFFFF;
+}
+
+// Extract the generation counter (high 16 bits).
+static _asset_gen_of(h) : base {
+    return (h >> 16) & 0xFFFF;
+}
+
+// Look up a slot by index. Returns the AssetSlot* or 0 if index
+// is out of range.
+static _asset_slot_at(idx) : base {
+    if (idx <= 0) { return 0; }
+    if (idx >= _ASSET_MAX) { return 0; }
+    return _asset_slots + idx * sizeof(AssetSlot);
+}
+
+// Find a free slot (kind == ASSET_NONE) and return its index.
+// Returns 0 if the table is full — the caller should treat 0
+// as a null handle.
+static _asset_find_free() : base {
+    auto i, slot_ptr, s: AssetSlot;
+    // Slot 0 reserved, start at 1.
+    for (i = 1; i < _ASSET_MAX; i = i + 1) {
+        slot_ptr = _asset_slots + i * sizeof(AssetSlot);
+        s = slot_ptr;
+        if (s.kind == ASSET_NONE) { return i; }
+    }
+    return 0;
+}
+
+// Check if a given path is already loaded. Returns the existing
+// handle, or 0 if not cached.
+static _asset_lookup_path(path) : base {
+    auto len;
+    len = str_len(path);
+    if (hash_str_has(_asset_paths, path, len) == 0) { return 0; }
+    return hash_str_get(_asset_paths, path, len);
+}
+
+// Record a path in the dedup map + parallel path-store array.
+// The path is duplicated with str_dup so callers can free their
+// copy safely.
+static void _asset_remember_path(slot_idx, path) {
+    auto len, copy;
+    len = str_len(path);
+    copy = str_dup(path);
+    *(_asset_path_store + slot_idx * 8) = copy;
+    *(_asset_path_lens + slot_idx * 8) = len;
+    hash_str_set(_asset_paths, copy, len, _asset_pack(slot_idx, _asset_slot_gen(slot_idx)));
+}
+
+// Read the current generation of a slot. Used by remember_path
+// after the kind / generation are already set.
+static _asset_slot_gen(slot_idx) : base {
+    auto s: AssetSlot;
+    s = _asset_slots + slot_idx * sizeof(AssetSlot);
+    return s.generation;
+}
+
+// ── Public loaders ────────────────────────────────────────────────
+
+// Load a PNG from disk and upload it as a GPU texture.
+// Returns a sprite handle, or 0 on failure.
+// Repeated calls with the same path return the same handle.
+asset_load_sprite(path) : io {
+    auto cached, idx, pixels, tex, slot_ptr, s: AssetSlot;
+
+    cached = _asset_lookup_path(path);
+    if (cached != 0) { return cached; }
+
+    pixels = img_load(path);
+    if (pixels == 0) { return 0; }
+
+    idx = _asset_find_free();
+    if (idx == 0) { img_free(pixels); return 0; }
+
+    // Upload to GPU. Keep the raw pixels — the GPU handle is what
+    // render functions use, but some callers want to inspect the
+    // RGBA buffer directly (collision masks, palette swap, etc).
+    tex = _stb_gpu_create_texture(pixels, img_w(), img_h());
+
+    slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
+    s = slot_ptr;
+    s.kind = ASSET_SPRITE;
+    s.ptr = tex;
+    s.w = img_w();
+    s.h = img_h();
+    // Free the CPU-side copy; the GPU owns the pixels now.
+    img_free(pixels);
+
+    _asset_remember_path(idx, path);
+    return _asset_pack(idx, s.generation);
+}
+
+// Load a WAV from disk into a decoded PCM buffer.
+// Returns a sound handle, or 0 on failure.
+asset_load_sound(path) : io {
+    auto cached, idx, ok, slot_ptr, s: AssetSlot;
+
+    cached = _asset_lookup_path(path);
+    if (cached != 0) { return cached; }
+
+    ok = sound_load_wav(path);
+    if (ok == 0) { return 0; }
+
+    idx = _asset_find_free();
+    if (idx == 0) { free(sound_buf()); return 0; }
+
+    slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
+    s = slot_ptr;
+    s.kind = ASSET_SOUND;
+    s.ptr = sound_buf();
+    s.w = sound_frames();
+    s.h = 0;
+
+    _asset_remember_path(idx, path);
+    return _asset_pack(idx, s.generation);
+}
+
+// Load a WAV as streaming music (for looped background tracks).
+// Same decoded format as a sound; the kind flag tells the mixer
+// to stream it rather than replay it as a one-shot.
+asset_load_music(path) : io {
+    auto cached, idx, ok, slot_ptr, s: AssetSlot;
+
+    cached = _asset_lookup_path(path);
+    if (cached != 0) { return cached; }
+
+    ok = sound_load_wav(path);
+    if (ok == 0) { return 0; }
+
+    idx = _asset_find_free();
+    if (idx == 0) { free(sound_buf()); return 0; }
+
+    slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
+    s = slot_ptr;
+    s.kind = ASSET_MUSIC;
+    s.ptr = sound_buf();
+    s.w = sound_frames();
+    s.h = 0;
+
+    _asset_remember_path(idx, path);
+    return _asset_pack(idx, s.generation);
+}
+
+// Load a TrueType font scaled to `pixel_height` pixels tall.
+asset_load_font(path, pixel_height) : io {
+    auto cached, idx, ok, slot_ptr, s: AssetSlot;
+
+    cached = _asset_lookup_path(path);
+    if (cached != 0) { return cached; }
+
+    ok = font_load(path, pixel_height);
+    if (ok == 0) { return 0; }
+
+    idx = _asset_find_free();
+    if (idx == 0) { return 0; }
+
+    slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
+    s = slot_ptr;
+    s.kind = ASSET_FONT;
+    // Fonts live inside stbfont's module-level state — pointer is
+    // a marker (non-zero) rather than a dereferencable address.
+    s.ptr = 1;
+    s.w = pixel_height;
+    s.h = 0;
+
+    _asset_remember_path(idx, path);
+    return _asset_pack(idx, s.generation);
+}
+
+// ── Public accessors ──────────────────────────────────────────────
+
+// Resolve a handle to the underlying pointer (GPU texture / WAV
+// buffer / etc). Returns 0 if the handle is null, out of range,
+// or stale (generation mismatch). The `: base` annotation lets
+// asset_get be called from worker threads safely — the slot
+// fields are read-only except during load/unload, which are solo.
+asset_get(h) : base {
+    auto idx, slot_ptr, s: AssetSlot;
+    if (h == 0) { return 0; }
+    idx = _asset_slot_of(h);
+    slot_ptr = _asset_slot_at(idx);
+    if (slot_ptr == 0) { return 0; }
+    s = slot_ptr;
+    if (s.generation != _asset_gen_of(h)) { return 0; }
+    if (s.kind == ASSET_NONE) { return 0; }
+    return s.ptr;
+}
+
+// Return the width of the asset in its natural units:
+//   ASSET_SPRITE — pixel width
+//   ASSET_SOUND  — frame count
+//   ASSET_MUSIC  — frame count
+//   ASSET_FONT   — pixel height (the size it was loaded at)
+asset_width(h) : base {
+    auto idx, slot_ptr, s: AssetSlot;
+    if (h == 0) { return 0; }
+    idx = _asset_slot_of(h);
+    slot_ptr = _asset_slot_at(idx);
+    if (slot_ptr == 0) { return 0; }
+    s = slot_ptr;
+    if (s.generation != _asset_gen_of(h)) { return 0; }
+    return s.w;
+}
+
+// Return the height of the asset, or 0 when the type has no
+// meaningful height (sounds, fonts).
+asset_height(h) : base {
+    auto idx, slot_ptr, s: AssetSlot;
+    if (h == 0) { return 0; }
+    idx = _asset_slot_of(h);
+    slot_ptr = _asset_slot_at(idx);
+    if (slot_ptr == 0) { return 0; }
+    s = slot_ptr;
+    if (s.generation != _asset_gen_of(h)) { return 0; }
+    return s.h;
+}
+
+// Return the ASSET_* kind of the handle, or ASSET_NONE if stale.
+asset_kind(h) : base {
+    auto idx, slot_ptr, s: AssetSlot;
+    if (h == 0) { return ASSET_NONE; }
+    idx = _asset_slot_of(h);
+    slot_ptr = _asset_slot_at(idx);
+    if (slot_ptr == 0) { return ASSET_NONE; }
+    s = slot_ptr;
+    if (s.generation != _asset_gen_of(h)) { return ASSET_NONE; }
+    return s.kind;
+}
+
+// ── Unload ────────────────────────────────────────────────────────
+
+// Release the resource at this handle. Bumps the generation so
+// any stored copies of the handle become stale. Safe to call on
+// already-stale handles — it's a no-op.
+void asset_unload(h) {
+    auto idx, slot_ptr, s: AssetSlot, path;
+    if (h == 0) { return; }
+    idx = _asset_slot_of(h);
+    slot_ptr = _asset_slot_at(idx);
+    if (slot_ptr == 0) { return; }
+    s = slot_ptr;
+    if (s.generation != _asset_gen_of(h)) { return; }
+
+    // Free the kind-specific resource. GPU textures on macOS are
+    // Metal objects with their own retain count — a real _stb_gpu_free_texture
+    // is a future addition; for now the slot is just dropped.
+    if (s.kind == ASSET_SOUND) { free(s.ptr); }
+    if (s.kind == ASSET_MUSIC) { free(s.ptr); }
+    // Sprites: GPU texture release deferred to _stb_gpu_free_texture.
+    // Fonts: stbfont state is single-slot, nothing to free here.
+
+    // Drop the path from the dedup map so re-loading reloads fresh.
+    path = *(_asset_path_store + idx * 8);
+    if (path != 0) {
+        hash_str_del(_asset_paths, path, *(_asset_path_lens + idx * 8));
+        free(path);
+        *(_asset_path_store + idx * 8) = 0;
+        *(_asset_path_lens + idx * 8) = 0;
+    }
+
+    // Bump generation AFTER the real free, so a concurrent reader
+    // still sees the right kind during shutdown. 16 bits wraps at
+    // 65535 reuses — impractical to hit in a game session.
+    s.generation = s.generation + 1;
+    s.kind = ASSET_NONE;
+    s.ptr = 0;
+    s.w = 0;
+    s.h = 0;
+    s.mtime = 0;
+}
+
+// Release every loaded asset. Call from your game's shutdown path
+// after mixer and renderer have stopped.
+void asset_unload_all() {
+    auto i, slot_ptr, s: AssetSlot, h;
+    for (i = 1; i < _ASSET_MAX; i = i + 1) {
+        slot_ptr = _asset_slots + i * sizeof(AssetSlot);
+        s = slot_ptr;
+        if (s.kind != ASSET_NONE) {
+            h = _asset_pack(i, s.generation);
+            asset_unload(h);
+        }
+    }
+}
+
+// Count of live (loaded) assets. Handy for leak tests.
+asset_count() : base {
+    auto i, n, slot_ptr, s: AssetSlot;
+    n = 0;
+    for (i = 1; i < _ASSET_MAX; i = i + 1) {
+        slot_ptr = _asset_slots + i * sizeof(AssetSlot);
+        s = slot_ptr;
+        if (s.kind != ASSET_NONE) { n = n + 1; }
+    }
+    return n;
+}

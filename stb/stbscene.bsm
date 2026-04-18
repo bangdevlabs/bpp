@@ -1,0 +1,165 @@
+// stbscene.bsm — Scene (aka screen, aka state) manager.
+//
+// A scene is a named bundle of four function pointers:
+//
+//   load(ctx)     — called once when the scene is entered. Allocate.
+//   update(dt_ms) — per-frame logic. Takes delta time in milliseconds.
+//   draw()        — per-frame render. No dt: read any needed state.
+//   unload()      — called once when the scene is left. Free everything
+//                   load allocated.
+//
+// The manager lets a game flip between MENU / PLAY / RESULTS without
+// the main loop caring about any of them. One place registers every
+// scene; game code just calls scene_switch(MY_SCENE_ID).
+//
+// Switches are deferred to the next update() tick, so it's safe to
+// call scene_switch from inside a draw or update handler without
+// corrupting mid-frame state.
+//
+// Example:
+//
+//   #define SCENE_MENU    0
+//   #define SCENE_GAME    1
+//   #define SCENE_RESULTS 2
+//
+//   init_scene();
+//   scene_register(SCENE_MENU,
+//                  fn_ptr(menu_load),
+//                  fn_ptr(menu_update),
+//                  fn_ptr(menu_draw),
+//                  fn_ptr(menu_unload));
+//   scene_register(SCENE_GAME, ...);
+//   scene_register(SCENE_RESULTS, ...);
+//   scene_switch(SCENE_MENU);
+//
+//   while (game_should_quit() == 0) {
+//       game_frame_begin();
+//       scene_tick(game_dt_ms());
+//       scene_draw();
+//       draw_end();
+//   }
+//   scene_shutdown();
+//
+// From menu_update you call scene_switch(SCENE_GAME) when the player
+// hits ENTER. The actual switch happens on the next scene_tick.
+
+static extrn _SCENE_MAX;            // max registered scenes
+static extrn _scene_load_fns;       // array[SCENE_MAX] of fn pointers
+static extrn _scene_update_fns;     //   "
+static extrn _scene_draw_fns;       //   "
+static extrn _scene_unload_fns;     //   "
+static extrn _scene_registered;     // parallel 0/1 flag
+static extrn _scene_current;        // currently active id, -1 = none
+static extrn _scene_pending;        // queued switch target, -1 = none
+static extrn _scene_inited;         // guard: init_scene is idempotent
+
+// Call once before any scene_register / scene_switch.
+// Idempotent — safe to call from game_init and again from per-game
+// setup code.
+void init_scene() {
+    auto i;
+    if (_scene_inited != 0) { return; }
+    _scene_inited = 1;
+
+    // 16 scenes is generous — the biggest shipped game to date uses 3.
+    // Bump here if a future RPG needs more.
+    _SCENE_MAX = 16;
+    _scene_load_fns   = malloc(8 * _SCENE_MAX);
+    _scene_update_fns = malloc(8 * _SCENE_MAX);
+    _scene_draw_fns   = malloc(8 * _SCENE_MAX);
+    _scene_unload_fns = malloc(8 * _SCENE_MAX);
+    _scene_registered = malloc(8 * _SCENE_MAX);
+
+    for (i = 0; i < _SCENE_MAX; i = i + 1) {
+        *(_scene_load_fns + i * 8) = 0;
+        *(_scene_update_fns + i * 8) = 0;
+        *(_scene_draw_fns + i * 8) = 0;
+        *(_scene_unload_fns + i * 8) = 0;
+        *(_scene_registered + i * 8) = 0;
+    }
+    _scene_current = 0 - 1;
+    _scene_pending = 0 - 1;
+}
+
+// Register one scene. Any of the four function pointers may be 0
+// (null) if the scene has nothing to do at that stage — a MENU that
+// never heap-allocates can pass 0 for load and unload, for example.
+// Pass function pointers via fn_ptr(name).
+void scene_register(id, load_fn, update_fn, draw_fn, unload_fn) {
+    if (id < 0) { return; }
+    if (id >= _SCENE_MAX) { return; }
+    *(_scene_load_fns   + id * 8) = load_fn;
+    *(_scene_update_fns + id * 8) = update_fn;
+    *(_scene_draw_fns   + id * 8) = draw_fn;
+    *(_scene_unload_fns + id * 8) = unload_fn;
+    *(_scene_registered + id * 8) = 1;
+}
+
+// Request a scene switch. The actual unload + load runs on the next
+// scene_tick, so this is safe to call from inside any scene handler.
+// Silently ignored if id is out of range or unregistered.
+void scene_switch(id) {
+    if (id < 0) { return; }
+    if (id >= _SCENE_MAX) { return; }
+    if (*(_scene_registered + id * 8) == 0) { return; }
+    _scene_pending = id;
+}
+
+// Internal: run the deferred unload/load pair. Called by scene_tick
+// at the top of every frame.
+static void _scene_do_switch(id) {
+    auto fn;
+    if (_scene_current >= 0) {
+        if (*(_scene_registered + _scene_current * 8) != 0) {
+            fn = *(_scene_unload_fns + _scene_current * 8);
+            if (fn != 0) { call(fn); }
+        }
+    }
+    _scene_current = id;
+    fn = *(_scene_load_fns + id * 8);
+    if (fn != 0) { call(fn); }
+}
+
+// Advance the current scene by dt_ms milliseconds. Runs any pending
+// scene switch first, then calls the current scene's update fn.
+void scene_tick(dt_ms) {
+    auto fn;
+    if (_scene_pending >= 0) {
+        _scene_do_switch(_scene_pending);
+        _scene_pending = 0 - 1;
+    }
+    if (_scene_current < 0) { return; }
+    fn = *(_scene_update_fns + _scene_current * 8);
+    if (fn != 0) { call(fn, dt_ms); }
+}
+
+// Render the current scene. Call after scene_tick and after
+// render_begin / clear, before draw_end or render_end.
+void scene_draw() {
+    auto fn;
+    if (_scene_current < 0) { return; }
+    fn = *(_scene_draw_fns + _scene_current * 8);
+    if (fn != 0) { call(fn); }
+}
+
+// Unload the current scene and drop every registration. Call from
+// your game's shutdown path.
+void scene_shutdown() {
+    auto fn, i;
+    if (_scene_current >= 0) {
+        if (*(_scene_registered + _scene_current * 8) != 0) {
+            fn = *(_scene_unload_fns + _scene_current * 8);
+            if (fn != 0) { call(fn); }
+        }
+    }
+    _scene_current = 0 - 1;
+    _scene_pending = 0 - 1;
+    for (i = 0; i < _SCENE_MAX; i = i + 1) {
+        *(_scene_registered + i * 8) = 0;
+    }
+}
+
+// Introspection: id of the currently active scene, -1 if none.
+scene_current() : base {
+    return _scene_current;
+}

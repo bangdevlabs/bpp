@@ -3380,3 +3380,278 @@ the dispatch comment; the fix landed on the call sites rather than
 on the classifier. Same policy whenever an effect annotation
 disagrees with a function's real behaviour: change the annotation
 first, change the lattice last.
+
+## 2026-04-18 — Infra week day 1: Rhythm Teacher foundations
+
+User opened: "a nossa próxima missão é rythm teacher e depois
+wolf3d". Then revealed the ironplate prototype — a complete
+Rhythm Teacher already built in C/raylib, 1540 lines of game
+code on top of a 1300-line engine. Reading it answered every
+open question about what a B++ port needs.
+
+Key finding: the ironplate engine already uses **handles**. A
+morning's research rabbit-hole on reference counting vs handles
+(Kevin Lawler, Unreal TSharedPtr, Giordano's resource post, Bevy
+Handle<T>, SFML sf::Sound/SoundBuffer, CoreAudio retained types)
+had landed at the same conclusion independently: handles beat
+refcount for game asset management. Validated by encountering
+the same pattern in a live C engine.
+
+User's framing: "é a nossa última semana de max, não quero
+deixar pra depois essas coisas que posso fazer agora de infra".
+Translation: build all the infra this week so next week is
+pure game work. Five gaps identified:
+
+  1. Handle-based asset manager (bridge to rhythm teacher's
+     load_sprite/load_sound/load_music/load_font)
+  2. Scene manager (MENU → PLAY → RESULTS without a main-loop rewrite)
+  3. Audio buses + music streaming (game needs MASTER/MUSIC/SFX + BGM)
+  4. Generic ECS components (rhythm teacher's RhythmNote doesn't fit
+     the pos/vel/flags core)
+  5. Spritesheet frame picker (teacher animation is 4 rows × 5 frames)
+
+All five shipped clean in one pass. Details below.
+
+**stbasset.bsm (new, 364 lines).** Handle layout is 32-bit:
+[16-bit generation | 16-bit slot index]. Slot 0 reserved as
+null handle so `auto h;` (= 0) is always a safe "no asset"
+default. `HashStr` dedupes by path so loading the same WAV
+twice returns the same handle. `asset_unload` bumps generation;
+all outstanding handles fail the check on next `asset_get` —
+ABA-safe without atomics (single-threaded asset ops).
+Four loaders: `asset_load_sprite` (PNG → GPU texture),
+`asset_load_sound` / `asset_load_music` (WAV → PCM, differs
+only in kind tag for mixer routing), `asset_load_font` (TTF
+through stbfont's single-slot state).
+
+**stbscene.bsm (new, 155 lines).** Scene = 4 function pointers
+(load, update, draw, unload). Switches are deferred to the top
+of the next `scene_tick` so any handler can safely call
+`scene_switch` without corrupting mid-frame state. 16 scene
+slots; ironplate got by with 3 so plenty of headroom. Uses
+B++ `fn_ptr(name)` + `call(fp, ...)` — no callback struct, no
+vtable boilerplate.
+
+**stbmixer.bsm (extended, +170 lines).** Voice table grew from
+5 parallel arrays to 11. New fields: `kind`, `buf`, `pos`,
+`frames`, `bus`, `loop`. Voice kinds:
+
+  - `MX_KIND_TONE`   — synthkey's existing waveform synthesis
+  - `MX_KIND_SAMPLE` — one-shot stereo s16 playback from buffer
+  - `MX_KIND_MUSIC`  — looping streaming with position tracking
+
+Voice pool grew 8 → 10: slots 0-7 for tones/SFX, slot 8
+dedicated to music (can't be evicted by SFX flood), slot 9
+spare. Three buses (`MX_BUS_MASTER` / `MUSIC` / `SFX`) with
+independent 0..100 gain. The mixer_fill inner loop now
+branches on `kind` — a modest cost since it's still one
+read-write per voice per frame, way below the 44100×10 = 441K
+ops/sec budget.
+
+New public API: `mixer_play_sample(buf, n)`, `mixer_play_music(
+buf, n, loop)`, `mixer_stop_music()`, `mixer_music_frames()`,
+`mixer_music_ms()`, `mixer_set_bus_volume(bus, vol)`,
+`mixer_get_bus_volume(bus)`. The `mixer_music_ms()` is the
+critical glue for rhythm teacher — the note chart schedules
+against it to stay sync-locked to BGM.
+
+**stbecs.bsm (extended, +25 lines).** Added
+`ecs_component_new(w, element_size)` and `ecs_component_at(base,
+id, element_size)` for custom components. They're thin wrappers
+over `malloc(capacity * size)` and pointer arithmetic, but they
+document the pattern and keep game code from reinventing it.
+Game-defined structs like `RhythmNote` work through typed
+locals: `auto n: RhythmNote; n = ecs_component_at(notes, id,
+sizeof(RhythmNote)); n.beat_time = 1.0;`.
+
+**stbsprite.bsm + _stb_platform_macos.bsm (extended).**
+Platform: added `_stb_gpu_sprite_uv(tex, x, y, w, h, u0, v0,
+u1, v1)` — same 6-vertex quad as `_stb_gpu_sprite` but with
+caller-supplied UVs in 0..65535 fixed point. stbsprite: added
+`sprite_draw_frame(tex, x, y, fw, fh, sheet_w, sheet_h, row,
+col, scale)` that computes UVs from sheet grid coords, and
+`anim_frame(elapsed_ms, fps, frame_count, loop)` for
+time-based frame picking. These make the rhythm teacher
+character animation (4 rows × N frames per state) a one-liner
+per draw.
+
+**Tests (6 new).** test_asset (handle semantics), test_asset_wav
+(WAV load + dedup + unload cycle with real file on disk),
+test_scene (register + switch + tick + shutdown lifecycle),
+test_mixer_sample (sample voices + music slot + bus clamp +
+loop vs one-shot), test_ecs_component (custom components with
+struct layout round-trip), test_anim_frame (time → frame math).
+Suite: 68 → 74 passing, zero failures.
+
+**Discoveries on the way.**
+
+- `: heap` is not a user-facing annotation. The lattice has
+  `PHASE_HEAP` but the parser doesn't accept it as an input —
+  the five writable phases are still `base`, `solo`, `realtime`,
+  `io`, `gpu`. Tried `: heap` on ecs_component_new, compiler
+  caught it with E104. Kept ecs_component_new un-annotated;
+  compiler infers PHASE_HEAP from the malloc.
+
+- `ptr` is a reserved keyword. Test file used `auto ptr` and
+  got E104. Renamed to `buf`. Should log this to `feedback_
+  keyword_collisions.md`.
+
+- Linux cross-compile of snake_maestro still fails (GPU-only,
+  no Vulkan on Linux yet). Pre-existing issue, not a
+  regression. `snake_cpu.bpp` Linux cross still clean.
+
+Bootstrap hash stable (`c7b5d8de...`). All four games
+(snake_maestro, pathfind, platform, plat_noasset) plus
+mini_synth compile zero-warning. Module count 18 → 20 stb.
+Version bumped 0.68 → 0.74 (test count is the version).
+
+**Next up**: port `games/rhythm/` itself. beat_map loader,
+timing windows, scoring, teacher sprite animation, menu +
+results scenes. With the infra done, the port is 1500 lines
+of game logic — tomorrow's work.
+
+## 2026-04-18b — Rhythm prototype ships + snake closes the dog-food loop
+
+Second half of the same day. Two games shipped, `bpp_path`
+promoted to auto-inject, `sound_load_wav` grew into a real chunk
+scanner, asset-load failures now print specific stderr lines
+instead of silently returning 0, and snake started playing a
+groove recorded live inside mini_synth. "A cobra comeu o próprio
+rabo" is the canonical phrasing for the moment — B++ producing
+the audio content that B++ games play.
+
+**games/rhythm ships.** Structured the port faithful to the
+ironplate C prototype: three scenes (`menu_scene`, `play_scene`,
+`results_scene`) via the new `stbscene` module, `beat_map.bsm`
+parses a text-file chart with BPM + offset + note lines, play
+scene runs the three-phase DEMO → TRANSITION ("YOUR TURN!" 3.5 s
+countdown) → PLAY pattern, teacher character drawn from
+primitives (head circle, eye dots, mouth rect) with state
+machines (idle / hit / miss / celebrate). Hit windows: ±20 ms
+perfect (green), ±60 ms ok (yellow), else miss. Both F and SPACE
+fire the snare — matches ironplate's "any tap plays the snare"
+design, so the player gets instant audible feedback regardless
+of whether a note is in the window. A classic "boom-chick"
+4-bar rock groove ships as `assets/beat_map.txt` (49 notes:
+kick + hi-hat on 1 and 3, snare + hi-hat on 2 and 4, hi-hat
+on every eighth, snare fill on the last half-bar).
+
+**bpp_path.bsm (new).** Games that load assets with hard-coded
+relative paths only work when the user's shell happens to be in
+the right directory. `bpp_path` fixes that: `path_exe_dir()`
+computes the binary's own directory from `argv[0]`, `path_asset(
+relpath)` joins it with the supplied relative path and —
+critically — probes the filesystem walking up to 4 levels
+(`<dir>/relpath`, `<dir>/../relpath`, ..., `<dir>/../../../../relpath`)
+caching the first prefix that resolves. So `./build/rhythm`
+inside `games/rhythm/` AND `games/rhythm/build/rhythm` from
+the repo root BOTH find `assets/beat_map.txt` transparently.
+
+**Auto-injection: bpp_arena + bpp_path.** Both now auto-injected
+alongside bpp_mem / bpp_array / bpp_hash / etc. Every user
+program gets them for free. Bootstrap cycle converged in gen2 ==
+gen3 (1-cycle oscillation as expected for auto-inject change).
+Sha `d08a9e99...`.
+
+**sound_load_wav rewrite — the bug that blocked Rhythm audio.**
+Initial port to stbasset loaded 3 drum samples and produced
+silence. Investigation found THREE compounding bugs:
+
+1. Ironplate's samples weren't PCM-16 stereo 44100. HI-HAT.wav
+   was IEEE Float stereo. KICK.wav and SNARE.wav were PCM-16
+   MONO. The old `sound_load_wav` rejected all three silently
+   — returned `-1`, asset_load_sound returned 0, mixer
+   never played.
+2. The old `sound_load_wav` auto-freed `_snd_last_buf` on every
+   call. When stbasset loaded three sounds in sequence, each
+   load freed the previous buffer while stbasset still held the
+   pointer → dangling + silence on the earlier handles.
+3. `_aud_ring` got over-fed and under-fed in different
+   experiments as we tried to shave latency; the wrong middle
+   produced time-stretch stuttering.
+
+Fixes:
+- Removed the auto-free from sound_load_wav; caller owns the
+  buffer.
+- Rewrote sound_load_wav into a chunk scanner (handles LIST /
+  INFO / fact chunks between fmt and data), supporting PCM
+  8/16/24/32-bit + IEEE Float 32-bit + mono (auto-expanded to
+  stereo) + stereo. Rejects unsupported formats cleanly with a
+  specific stderr diagnostic, not silent.
+- Audio pump matches the mini_synth proven pattern: ring size
+  4096 for rhythm (fill-until-near-full, chunks of 1024), ring
+  size 8192 for snake (FPS=10 means the pump only fires every
+  100 ms; the larger ring survives the drain cycle without
+  under-production).
+
+**Asset-load error logging (the user asked for this).**
+Previously failures were silent — asset_load_sprite returned 0,
+asset_load_sound returned 0, and the programmer had a silent
+transparent sprite / silent game with zero information. Now:
+- `stbsound`: prints `stbsound: '<path>': <reason>` for each
+  reject case. `<reason>` is one of: `file not found or
+  unreadable`, `truncated (under 12 bytes)`, `not a RIFF/WAVE
+  file`, `missing fmt chunk`, `missing data chunk`,
+  `unsupported PCM bit depth <N>`, `IEEE float must be 32-bit,
+  got <N>-bit`, `format code <N> not supported`, `<N> channels
+  not supported`.
+- `stbimage`: `stbimage: '<path>': file not found or
+  unreadable` / `not a valid PNG or unsupported chunk layout`.
+- `stbfont`: `stbfont: '<path>': file not found or unreadable`
+  / `no 'head' table (not a valid TTF)`.
+
+Programmers finally see what went wrong without breaking out
+`bug`.
+
+**Snake closes the dog-food loop.** `snake_maestro.bpp`:
+- `stbasset` loads `assets/samples/snake_loop.wav` (recorded
+  in mini_synth).
+- `mixer_play_music(..., loop=1)` on the dedicated music slot.
+- Music bus drops to 60% so the eat SFX stays punchy.
+- Eat SFX generated in code — `_gen_shot_sample()` builds a 60
+  ms 880 Hz square wave with a linear decay envelope on the
+  tail 40%. First sample at full amplitude means instant
+  attack (the recorded snake_shot.wav had a slow onset that
+  lagged behind the apple-eat frame). Called via
+  `mixer_play_sample(shot_buf, shot_frames)`.
+- Audio pump at the tail of solo_phase (10 Hz = once per
+  snake tick); 8192-frame ring survives the 100 ms drain
+  between ticks.
+
+Every sound audible while snake runs now came from B++ code:
+the instrument, the recording, the decoder, the mixer, the
+ring buffer, the FFI, the bus gain, the eat-SFX generator.
+**A cobra comeu o próprio rabo.**
+
+**how_to_dev scope rule.** User called out a waste pattern
+(running bootstrap + full suite after every game-file touch).
+Added a table to Part 1 mapping what-you-changed → minimum
+verification. Game/tool edits only compile that artifact;
+stb/ needs full suite; src/ compiler needs bootstrap + suite;
+docs need nothing.
+
+**Counts.** 20 stb modules (unchanged), 24 compiler+runtime
+modules in src/ (bpp_path new). 75 tests passing (rhythm
+adds test_beat_map). Bootstrap sha stable
+(`d08a9e99...`). Zero warnings across snake_gpu /
+snake_maestro / pathfind / platform / plat_noasset /
+rhythm / mini_synth.
+
+**Next up (branch point).** Infra week budget remains. Two
+paths diverge:
+
+- **(A) ModuLab port** — port the user's JS pixel art editor
+  (4 files, 1415 lines) to B++ as tools/modulab/. Estimated
+  4-5 days including the last infra pieces (bpp_json, stbui
+  widgets, optional stbwindow file dialogs). Delivers a
+  complete native tool for producing game art in the B++
+  ecosystem.
+- **(B) FPS prototype (Wolf3D)** — jump straight to a first-
+  person CPU raycaster + WL1 shareware loader. The last
+  "genre of game" the fleet still doesn't have. 2-3 weeks
+  for the vertical slice. Art comes from the shareware files,
+  not ModuLab.
+
+Both are valid closes-of-the-week. ModuLab is deeper
+dog-fooding; Wolf3D is broader genre coverage. User to
+decide.

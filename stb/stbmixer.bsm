@@ -38,16 +38,41 @@ static extrn _MX_VOICE_AMP;        // per-voice amplitude (s16 / MAX_VOICES)
 static extrn _MX_FILL_BUF;         // scratch buffer for mixer_stream
 static extrn _MX_FILL_BUF_FRAMES;  // capacity of _MX_FILL_BUF in frames
 
-// ── Voice table (5 parallel arrays) ───────────────────────────
-// Parallel arrays — not a struct. 8 voices × 5 arrays × 8 bytes =
-// 320 bytes total, well under a single cache line family. The
+// ── Voice table (9 parallel arrays) ───────────────────────────
+// Parallel arrays — not a struct. 8 voices × 9 arrays × 8 bytes =
+// 576 bytes total, well under a single cache line family. The
 // pointers here are write-once (set inside mixer_init). Array
 // contents mutate via poke / subscript writes.
 static extrn _mx_voice_active;   // arr[i] = 1 if voice i carries a live note
+static extrn _mx_voice_kind;     // arr[i] = MX_KIND_* tag (tone / sample / music)
 static extrn _mx_voice_key;      // arr[i] = key_id the caller passed to note_on
-static extrn _mx_voice_hp;     // arr[i] = samples per half-period (square)
+static extrn _mx_voice_hp;       // arr[i] = samples per half-period (tone)
 static extrn _mx_voice_amp;      // arr[i] = per-voice amplitude
-static extrn _mx_voice_phase;    // arr[i] = current phase within the period (incremental, like the callback)
+static extrn _mx_voice_phase;    // arr[i] = phase inside the period (tone)
+static extrn _mx_voice_buf;      // arr[i] = sample buffer pointer (s16 stereo)
+static extrn _mx_voice_pos;      // arr[i] = sample frame position
+static extrn _mx_voice_frames;   // arr[i] = sample total frame count
+static extrn _mx_voice_bus;      // arr[i] = MX_BUS_* tag (routes to a volume bus)
+static extrn _mx_voice_loop;     // arr[i] = 1 if voice loops at end (music)
+
+// Voice kinds — stored in _mx_voice_kind. MX_KIND_NONE means the
+// slot is mixable as silence (legacy code paths that only check
+// _mx_voice_active still work: a voice with kind NONE never has
+// active=1).
+static extrn MX_KIND_NONE;
+static extrn MX_KIND_TONE;     // synthesized waveform via note_on
+static extrn MX_KIND_SAMPLE;   // one-shot WAV playback
+static extrn MX_KIND_MUSIC;    // looping WAV playback for BGM
+
+// Audio buses — route voices to independent volume sliders. The
+// final output is `sum * bus_vol * master_vol / (100 * 100)`.
+static extrn MX_BUS_MASTER;
+static extrn MX_BUS_MUSIC;
+static extrn MX_BUS_SFX;
+static extrn _MX_BUS_COUNT;
+
+// Bus volumes: 0..100. master is at index MX_BUS_MASTER, etc.
+static extrn _mx_bus_vol;
 
 // Waveform fader — blends across four waveforms from clean to dirty.
 //   0   = pure sine (cleanest)
@@ -71,26 +96,59 @@ void mixer_init() {
     init_math();
     math_trig_init();
 
-    _MX_MAX_VOICES   = 8;
+    // Voice kinds and buses get their integer tag assigned here.
+    MX_KIND_NONE   = 0;
+    MX_KIND_TONE   = 1;
+    MX_KIND_SAMPLE = 2;
+    MX_KIND_MUSIC  = 3;
+
+    MX_BUS_MASTER = 0;
+    MX_BUS_MUSIC  = 1;
+    MX_BUS_SFX    = 2;
+    _MX_BUS_COUNT = 3;
+
+    // Two extra voice slots reserved at the end: MUSIC always lives
+    // on slot _MX_MAX_VOICES (index 8) so BGM can't be knocked out
+    // by a flood of SFX. The slot beyond it is a spare for future
+    // streaming voices. Total pool: 10 slots.
+    _MX_MAX_VOICES   = 10;
     _MX_SAMPLE_RATE  = 44100;
     _MX_VOICE_AMP    = 8000;
     _MX_FILL_BUF_FRAMES = 512;
     _MX_FILL_BUF     = malloc(_MX_FILL_BUF_FRAMES * 4);
 
     _mx_voice_active = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_kind   = malloc(_MX_MAX_VOICES * 8);
     _mx_voice_key    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_hp   = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_hp     = malloc(_MX_MAX_VOICES * 8);
     _mx_voice_amp    = malloc(_MX_MAX_VOICES * 8);
     _mx_voice_phase  = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_buf    = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_pos    = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_frames = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_bus    = malloc(_MX_MAX_VOICES * 8);
+    _mx_voice_loop   = malloc(_MX_MAX_VOICES * 8);
 
     auto i;
     for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
         _mx_voice_active[i] = 0;
+        _mx_voice_kind[i]   = MX_KIND_NONE;
         _mx_voice_key[i]    = 0;
-        _mx_voice_hp[i]   = 0;
+        _mx_voice_hp[i]     = 0;
         _mx_voice_amp[i]    = 0;
         _mx_voice_phase[i]  = 0;
+        _mx_voice_buf[i]    = 0;
+        _mx_voice_pos[i]    = 0;
+        _mx_voice_frames[i] = 0;
+        _mx_voice_bus[i]    = MX_BUS_SFX;
+        _mx_voice_loop[i]   = 0;
     }
+
+    _mx_bus_vol = malloc(_MX_BUS_COUNT * 8);
+    _mx_bus_vol[MX_BUS_MASTER] = 100;
+    _mx_bus_vol[MX_BUS_MUSIC]  = 80;
+    _mx_bus_vol[MX_BUS_SFX]    = 100;
+
     _mx_fader         = 768;
     _mx_master_vol    = 80;
     _mx_dirt          = 0;
@@ -107,26 +165,113 @@ mixer_note_on(key_id: word, freq_hz: word) {
     auto i, hp;
 
     // Already playing this key? Return the existing slot unchanged.
+    // Only tone voices carry a key_id, so cross-kind collision is
+    // not possible.
     for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
         if (_mx_voice_active[i] != 0) {
-            if (_mx_voice_key[i] == key_id) { return i; }
+            if (_mx_voice_kind[i] == MX_KIND_TONE) {
+                if (_mx_voice_key[i] == key_id) { return i; }
+            }
         }
     }
 
-    // First free slot wins. Square wave half-period in samples.
-    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
+    // First 8 slots are the SFX/tone pool. Slot 8 is reserved for
+    // music, slot 9 is a spare — don't let tones land there.
+    for (i = 0; i < 8; i = i + 1) {
         if (_mx_voice_active[i] == 0) {
             hp = _MX_SAMPLE_RATE / freq_hz / 2;
             if (hp < 1) { hp = 1; }
-            _mx_voice_hp[i]    = hp;
-            _mx_voice_amp[i]   = _MX_VOICE_AMP;
-            _mx_voice_key[i]   = key_id;
-            _mx_voice_phase[i] = 0;
+            _mx_voice_kind[i]   = MX_KIND_TONE;
+            _mx_voice_hp[i]     = hp;
+            _mx_voice_amp[i]    = _MX_VOICE_AMP;
+            _mx_voice_key[i]    = key_id;
+            _mx_voice_phase[i]  = 0;
+            _mx_voice_bus[i]    = MX_BUS_SFX;
             _mx_voice_active[i] = 1;
             return i;
         }
     }
     return 0 - 1;
+}
+
+// Play a decoded PCM buffer as a one-shot SFX. `buf` is a stereo
+// s16 buffer (4 bytes per frame) of length `n_frames`. Typically
+// the buffer comes from sound_load_wav — the mixer never copies,
+// so the caller must keep it alive until playback finishes.
+// Returns the voice slot used, or -1 if all SFX slots are busy.
+mixer_play_sample(buf, n_frames: word) {
+    auto i;
+    // SFX pool: slots 0..7. Skip slot 8 (music) and beyond.
+    for (i = 0; i < 8; i = i + 1) {
+        if (_mx_voice_active[i] == 0) {
+            _mx_voice_kind[i]   = MX_KIND_SAMPLE;
+            _mx_voice_buf[i]    = buf;
+            _mx_voice_pos[i]    = 0;
+            _mx_voice_frames[i] = n_frames;
+            _mx_voice_amp[i]    = _MX_VOICE_AMP;
+            _mx_voice_bus[i]    = MX_BUS_SFX;
+            _mx_voice_loop[i]   = 0;
+            _mx_voice_active[i] = 1;
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+// Start playing a decoded PCM buffer as background music. `loop`
+// is 1 for looping, 0 for one-shot. Only one music voice plays at
+// a time — calling mixer_play_music while music is already playing
+// replaces the previous track. Returns 1 on success.
+mixer_play_music(buf, n_frames: word, loop: word) {
+    auto i;
+    // Music lives on the dedicated slot 8.
+    i = 8;
+    _mx_voice_kind[i]   = MX_KIND_MUSIC;
+    _mx_voice_buf[i]    = buf;
+    _mx_voice_pos[i]    = 0;
+    _mx_voice_frames[i] = n_frames;
+    _mx_voice_amp[i]    = _MX_VOICE_AMP;
+    _mx_voice_bus[i]    = MX_BUS_MUSIC;
+    _mx_voice_loop[i]   = loop;
+    _mx_voice_active[i] = 1;
+    return 1;
+}
+
+// Stop the music voice. No-op when no music is playing.
+void mixer_stop_music() {
+    _mx_voice_active[8] = 0;
+    _mx_voice_kind[8]   = MX_KIND_NONE;
+}
+
+// Return the playback position of the music voice in frames.
+// Divide by the sample rate (44100) to convert to seconds — that
+// gives the note-chart-synchronized `audio_time` that Rhythm
+// Teacher schedules against.
+mixer_music_frames() : base {
+    if (_mx_voice_active[8] == 0) { return 0; }
+    if (_mx_voice_kind[8] != MX_KIND_MUSIC) { return 0; }
+    return _mx_voice_pos[8];
+}
+
+// Return current music time in milliseconds for convenience.
+mixer_music_ms() : base {
+    return mixer_music_frames() * 1000 / _MX_SAMPLE_RATE;
+}
+
+// Set a bus volume (0..100). `bus` is MX_BUS_MASTER / MX_BUS_MUSIC
+// / MX_BUS_SFX. Clamped; out-of-range ids are silently ignored.
+void mixer_set_bus_volume(bus: word, vol: word) {
+    if (bus < 0) { return; }
+    if (bus >= _MX_BUS_COUNT) { return; }
+    if (vol < 0) { vol = 0; }
+    if (vol > 100) { vol = 100; }
+    _mx_bus_vol[bus] = vol;
+}
+
+mixer_get_bus_volume(bus: word) : base {
+    if (bus < 0) { return 0; }
+    if (bus >= _MX_BUS_COUNT) { return 0; }
+    return _mx_bus_vol[bus];
 }
 
 // Release every voice currently playing the given key_id. No-op
@@ -201,19 +346,36 @@ mixer_get_dirt() : base { return _mx_dirt; }
 // 4*n bytes — (left_lo, left_hi, right_lo, right_hi) per frame.
 // Returns n. Callers wanting to analyse or record raw samples use
 // this primitive directly; the streaming wrapper below uses it too.
+//
+// Left and right channels carry the same mono sum — stereo panning
+// is a future slice. Tone voices synthesize a waveform per sample;
+// sample voices read two s16s (stereo) from their buffer; music
+// voices do the same but loop (or stop) at end-of-buffer.
 mixer_fill(buf, n: word) {
     auto f, v, sum, sample, phase, hp, amp, period;
     auto sn, tri, saw, sq, t, fader, si;
+    auto kind, bus, bus_vol, sbuf, spos, sframes, left_s, right_s;
+    auto master_bus_vol;
 
     fader = _mx_fader;
+    master_bus_vol = _mx_bus_vol[MX_BUS_MASTER];
 
     for (f = 0; f < n; f = f + 1) {
-        sum = 0;
+        auto left, right;
+        left  = 0;
+        right = 0;
         for (v = 0; v < _MX_MAX_VOICES; v = v + 1) {
-            if (_mx_voice_active[v] != 0) {
-                hp    = _mx_voice_hp[v];
-                amp   = _mx_voice_amp[v];
-                phase = _mx_voice_phase[v];
+            if (_mx_voice_active[v] == 0) { continue; }
+
+            kind    = _mx_voice_kind[v];
+            bus     = _mx_voice_bus[v];
+            bus_vol = _mx_bus_vol[bus];
+            sample  = 0;
+
+            if (kind == MX_KIND_TONE) {
+                hp     = _mx_voice_hp[v];
+                amp    = _mx_voice_amp[v];
+                phase  = _mx_voice_phase[v];
                 period = hp + hp;
 
                 // Square: identical to _aud_square_cb in the tone test.
@@ -247,18 +409,87 @@ mixer_fill(buf, n: word) {
                     sample = (saw * (256 - t) + sq * t) / 256;
                 }
 
-                sum = sum + sample;
-
                 // Advance phase by exactly 1 per sample — same
                 // discipline as _aud_square_cb. No wall-clock lookup,
                 // no modulo, no jitter.
                 phase = phase + 1;
                 if (phase >= period) { phase = 0; }
                 _mx_voice_phase[v] = phase;
+
+                // Apply the SFX bus gain then fold tone into both
+                // channels (mono).
+                sample = sample * bus_vol / 100;
+                left  = left  + sample;
+                right = right + sample;
+
+            } else if (kind == MX_KIND_SAMPLE) {
+                // One-shot sample. Read one stereo s16 pair then
+                // advance position; deactivate at end of buffer.
+                sbuf    = _mx_voice_buf[v];
+                spos    = _mx_voice_pos[v];
+                sframes = _mx_voice_frames[v];
+
+                left_s  = peek(sbuf + spos * 4 + 0) |
+                         (peek(sbuf + spos * 4 + 1) << 8);
+                right_s = peek(sbuf + spos * 4 + 2) |
+                         (peek(sbuf + spos * 4 + 3) << 8);
+                // Sign-extend 16-bit samples.
+                if (left_s  >= 32768) { left_s  = left_s  - 65536; }
+                if (right_s >= 32768) { right_s = right_s - 65536; }
+
+                left_s  = left_s  * bus_vol / 100;
+                right_s = right_s * bus_vol / 100;
+                left  = left  + left_s;
+                right = right + right_s;
+
+                spos = spos + 1;
+                if (spos >= sframes) {
+                    _mx_voice_active[v] = 0;
+                    _mx_voice_kind[v]   = MX_KIND_NONE;
+                } else {
+                    _mx_voice_pos[v] = spos;
+                }
+
+            } else if (kind == MX_KIND_MUSIC) {
+                // Looping (or one-shot) streaming. Same read as SAMPLE
+                // but wraps to 0 at end when loop flag is set.
+                sbuf    = _mx_voice_buf[v];
+                spos    = _mx_voice_pos[v];
+                sframes = _mx_voice_frames[v];
+
+                left_s  = peek(sbuf + spos * 4 + 0) |
+                         (peek(sbuf + spos * 4 + 1) << 8);
+                right_s = peek(sbuf + spos * 4 + 2) |
+                         (peek(sbuf + spos * 4 + 3) << 8);
+                if (left_s  >= 32768) { left_s  = left_s  - 65536; }
+                if (right_s >= 32768) { right_s = right_s - 65536; }
+
+                left_s  = left_s  * bus_vol / 100;
+                right_s = right_s * bus_vol / 100;
+                left  = left  + left_s;
+                right = right + right_s;
+
+                spos = spos + 1;
+                if (spos >= sframes) {
+                    if (_mx_voice_loop[v] != 0) {
+                        spos = 0;
+                    } else {
+                        _mx_voice_active[v] = 0;
+                        _mx_voice_kind[v]   = MX_KIND_NONE;
+                    }
+                }
+                _mx_voice_pos[v] = spos;
             }
         }
-        // Master volume + clip to s16.
+        // Mix down to mono for the rest of the chain — the dirt and
+        // master gain are mono-only. Left/right carried the bus-gain
+        // split so far, so average them back now.
+        sum = (left + right) / 2;
+
+        // Master gain: per-program master_vol (kept for backward
+        // compatibility with synthkey) then the MASTER bus slider.
         sum = sum * _mx_master_vol / 100;
+        sum = sum * master_bus_vol / 100;
         if (sum >  32767) { sum =  32767; }
         if (sum < 0 - 32768) { sum = 0 - 32768; }
 

@@ -950,25 +950,43 @@ buffer feeding the callback.
 | `audio_write(buf, frames)`          | Push frames into the ring |
 | `audio_shutdown()`                  | Stop and free |
 
-### 14.6 stbmixer — Polyphonic Synth
+### 14.6 stbmixer — Polyphonic Mixer
 
-8-voice polyphonic mixer with waveform morph and bitcrush dirt.
+10-voice mixer that handles three voice kinds: synthesized tones
+(via note_on), one-shot samples (SFX), and looping streams (BGM
+music). Tones and SFX share the first 8 slots; music lives on the
+dedicated slot 8 so BGM can't be knocked out by a flood of effects.
 
-| Function | Description |
-|----------|-------------|
-| `mixer_init(sample_rate)`           | Allocate and initialise |
-| `mixer_note_on(v, freq, amp)`       | Start a voice |
-| `mixer_note_off(v)`                 | Release a voice |
-| `mixer_fill(buf, frames): realtime` | Render into buffer |
-
-### 14.7 stbsound — Sound Effects
-
-WAV loading and sample playback over the mixer.
+Three independent volume buses — `MX_BUS_MASTER`, `MX_BUS_MUSIC`,
+`MX_BUS_SFX` — route voice output with per-bus 0..100 gain.
 
 | Function | Description |
 |----------|-------------|
-| `sound_load(path)`   | Decode a WAV into a sample handle |
-| `sound_play(handle)` | Trigger on a free voice |
+| `mixer_init()`                       | Allocate voice and bus tables |
+| `mixer_note_on(key_id, freq_hz)`     | Start a tone voice |
+| `mixer_note_off(key_id)`             | Release tones matching key |
+| `mixer_play_sample(buf, n_frames)`   | One-shot stereo s16 sample |
+| `mixer_play_music(buf, n_frames, loop)` | Stream BGM on slot 8 |
+| `mixer_stop_music()`                 | Halt the music voice |
+| `mixer_music_frames()`               | Playback position (frames) |
+| `mixer_music_ms()`                   | Playback position (ms) |
+| `mixer_set_bus_volume(bus, vol)`     | Set a bus's 0..100 gain |
+| `mixer_get_bus_volume(bus)`          | Read a bus's gain |
+| `mixer_set_fader(val)`               | Tone waveform morph 0..768 |
+| `mixer_set_dirt(val)`                | Bitcrush + decimation 0..256 |
+| `mixer_fill(buf, n): realtime`       | Render mono-summed stereo |
+| `mixer_stream(n)`                    | Render + push to audio ring |
+
+### 14.7 stbsound — WAV I/O
+
+WAV read/write (RIFF PCM, 44100 stereo s16). Pure codec — no
+device dependency.
+
+| Function | Description |
+|----------|-------------|
+| `sound_load_wav(path)`          | Decode a WAV; buffer via `sound_buf()` |
+| `sound_save_wav(path, buf, n)`  | Write a WAV to disk |
+| `sound_buf()` / `sound_frames()` | Last-loaded buffer + length |
 
 ### 14.8 stbtile — Tilemap Engine
 
@@ -1012,23 +1030,33 @@ algorithm, no graphics dependency.
 ### 14.11 stbecs — Entity-Component System
 
 Parallel-array ECS. Positions and velocities in milli-units.
+Custom game components live in caller-owned parallel arrays keyed
+by the same entity ID — `ecs_component_new` allocates a
+capacity-sized array, `ecs_component_at` returns a typed pointer
+to the id-th element.
 
 | Function | Description |
 |----------|-------------|
-| `ecs_new(capacity)`                    | Allocate a world |
-| `ecs_spawn(w)`                         | Allocate an entity |
-| `ecs_kill(w, id)` / `ecs_alive(w, id)` | Lifecycle |
-| `ecs_set_pos/vel/flags(w, id, ...)`    | Write components |
-| `ecs_get_x/y/flags(w, id)`             | Read components |
-| `ecs_physics(w, dt_ms)`                | Step everything by `vel * dt_ms` |
+| `ecs_new(capacity)`                       | Allocate a world |
+| `ecs_spawn(w)`                            | Allocate an entity |
+| `ecs_kill(w, id)` / `ecs_alive(w, id)`    | Lifecycle |
+| `ecs_set_pos/vel/flags(w, id, ...)`       | Write core components |
+| `ecs_get_x/y/flags(w, id)`                | Read core components |
+| `ecs_physics(w, dt_ms)`                   | Step by `vel * dt_ms` |
+| `ecs_component_new(w, element_size)`      | Allocate a custom parallel array |
+| `ecs_component_at(base, id, element_size)`| Typed pointer to id-th element |
 
 ### 14.12 stbsprite — GPU Sprites
+
+Palette-indexed sprite loader + sheet animation helpers.
 
 | Function | Description |
 |----------|-------------|
 | `load_sprite(path, out, w, h)`         | Parse a JSON palette sprite |
 | `sprite_create(spr, pal, w, h)`        | Upload as GPU texture |
 | `sprite_draw(tex, x, y, w, h, scale)`  | Draw at integer scale |
+| `sprite_draw_frame(tex, x, y, fw, fh, sheet_w, sheet_h, row, col, scale)` | Draw one cell of a spritesheet |
+| `anim_frame(elapsed_ms, fps, frame_count, loop)` | Pick current frame from a time accumulator |
 
 ### 14.13 stbimage — PNG Loader
 
@@ -1076,7 +1104,48 @@ Fixed-size object pool with embedded freelist for O(1) get/put.
 | `pool_get(p)`                  | Take an object |
 | `pool_put(p, obj)`             | Return to freelist |
 
-### 14.18 Universal runtime (auto-injected)
+### 14.18 stbasset — Handle-Based Asset Manager
+
+Loads sprites, sounds, music, and fonts once and hands out
+`uint32` handles (16-bit generation + 16-bit slot). Stale
+handles fail generation check — no use-after-free. Repeated
+loads of the same path return the same handle (dedup).
+
+| Function | Description |
+|----------|-------------|
+| `init_asset()`                             | Allocate the slot table |
+| `asset_load_sprite(path)` → `SpriteHandle` | Decode PNG + upload to GPU |
+| `asset_load_sound(path)` → `SoundHandle`   | Decode WAV into PCM buffer |
+| `asset_load_music(path)` → `MusicHandle`   | Decode WAV for looped BGM |
+| `asset_load_font(path, pixel_size)` → `FontHandle` | Load a TTF |
+| `asset_get(h)`                             | Resolve to raw pointer, 0 if stale |
+| `asset_width(h)` / `asset_height(h)`       | Natural dimensions |
+| `asset_kind(h)`                            | One of `ASSET_SPRITE` etc. |
+| `asset_unload(h)`                          | Free + bump generation |
+| `asset_unload_all()`                       | Drop every loaded asset |
+| `asset_count()`                            | Live-asset count (leak probe) |
+
+Handle layout: `[16-bit generation | 16-bit slot index]`. Slot 0
+is reserved as the null handle, so `auto h;` initialised to 0 is
+always a safe "no asset" sentinel.
+
+### 14.19 stbscene — Scene Manager
+
+Register scenes (menu, play, results) by numeric id and switch
+between them from any callback. Actual switches are deferred to
+the next tick — safe to call from inside update or draw.
+
+| Function | Description |
+|----------|-------------|
+| `init_scene()`                                       | Allocate scene table |
+| `scene_register(id, load_fn, update_fn, draw_fn, unload_fn)` | Register a scene |
+| `scene_switch(id)`                                   | Queue switch to scene |
+| `scene_tick(dt_ms)`                                  | Run deferred switch + update |
+| `scene_draw()`                                       | Draw current scene |
+| `scene_shutdown()`                                   | Unload active scene + clear |
+| `scene_current()`                                    | Active id, -1 if none |
+
+### 14.20 Universal runtime (auto-injected)
 
 These live in `src/bpp_*.bsm` and are injected into every user
 program — documented here for completeness.
@@ -1099,7 +1168,7 @@ program — documented here for completeness.
 - **bpp_arena**   — bump allocator (explicit import only, not
   auto-injected)
 
-### 14.19 Backend Drivers
+### 14.21 Backend Drivers
 
 By default, `stbgame` runs natively on macOS using Cocoa/Metal
 and on Linux using X11. To override with a portable driver:
