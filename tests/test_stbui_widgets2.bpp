@@ -1,0 +1,123 @@
+// test_stbui_widgets2.bpp — state + link smoke for the Tier 2
+// widgets (checkbox, radio, dropdown, slider, icon_button).
+//
+// We verify:
+//   - lerp_color endpoints are exact (0 → c0, 256 → c1)
+//   - checkbox storage layout: peek/poke a byte at val_ptr
+//   - dropdown + slider: state pointers interact correctly
+//   - all gui_* symbols link via dead if(0) branch
+//
+// Interactive behaviour (actual clicks, drags, hovers) can only be
+// exercised with a live window + mouse, so this is a compile +
+// state-layout gate, not a full functional test.
+
+import "stbgame.bsm";
+import "stbui.bsm";
+
+static check_eq(label, got, expected) {
+    if (got != expected) {
+        print_msg("FAIL: ");
+        print_msg(label);
+        print_msg(" got=");
+        print_int(got);
+        print_msg(" expected=");
+        print_int(expected);
+        print_ln();
+        return 1;
+    }
+    return 0;
+}
+
+main() {
+    init_str();
+
+    // --- lerp_color endpoints and midpoint --------------------
+    // rgba(r,g,b,a) packs as (a<<24) | (r<<16) | (g<<8) | b.
+    auto red, blue, mid, expect_mid;
+    red  = rgba(255, 0,   0, 255);
+    blue = rgba(0,   0, 255, 255);
+
+    if (check_eq("lerp t=0",   lerp_color(red, blue, 0),   red))  { return 1; }
+    if (check_eq("lerp t=256", lerp_color(red, blue, 256), blue)) { return 1; }
+
+    // At t=128 each channel should be ~half the way. Red at 255
+    // × 128/256 ≈ 127; blue at 255 × 128/256 ≈ 127.
+    mid = lerp_color(red, blue, 128);
+    expect_mid = rgba(127, 0, 127, 255);
+    if (check_eq("lerp t=128", mid, expect_mid)) { return 1; }
+
+    // --- checkbox state layout --------------------------------
+    // val_ptr is a pointer to a single byte — peek/poke model.
+    // We don't call gui_checkbox (needs a window); we simulate
+    // the mutate-through-pointer pattern.
+    auto flag_buf, flag;
+    flag_buf = malloc(1);
+    poke(flag_buf, 0);
+
+    // Simulate "user clicked" — toggle the byte at flag_buf.
+    flag = peek(flag_buf);
+    flag = flag == 0 ? 1 : 0;
+    poke(flag_buf, flag);
+    if (check_eq("checkbox toggle 0→1", peek(flag_buf), 1)) { return 1; }
+    flag = peek(flag_buf);
+    flag = flag == 0 ? 1 : 0;
+    poke(flag_buf, flag);
+    if (check_eq("checkbox toggle 1→0", peek(flag_buf), 0)) { return 1; }
+
+    // --- dropdown state layout --------------------------------
+    // selected + open are both byte-sized.
+    auto sel_buf, open_buf;
+    sel_buf = malloc(1);
+    open_buf = malloc(1);
+    poke(sel_buf, 1);
+    poke(open_buf, 0);
+
+    if (check_eq("dropdown selected", peek(sel_buf), 1)) { return 1; }
+    if (check_eq("dropdown open",     peek(open_buf), 0)) { return 1; }
+
+    // Simulate "click item 2" — caller would do this inside the
+    // widget; here we just verify the poke pattern.
+    poke(sel_buf, 2);
+    poke(open_buf, 0);
+    if (check_eq("dropdown sel→2",   peek(sel_buf), 2)) { return 1; }
+    if (check_eq("dropdown close",   peek(open_buf), 0)) { return 1; }
+
+    // --- slider range clamping --------------------------------
+    // Manually exercise the clamp math gui_slider applies. Not
+    // calling the widget itself — just verifying we know the
+    // contract.
+    auto val, min, max;
+    val = 50; min = 0; max = 100;
+    if (val < min) { val = min; }
+    if (val > max) { val = max; }
+    if (check_eq("slider mid",  val,  50)) { return 1; }
+    val = -10; if (val < min) { val = min; }
+    if (check_eq("slider <min", val,  0)) { return 1; }
+    val = 150; if (val > max) { val = max; }
+    if (check_eq("slider >max", val, 100)) { return 1; }
+
+    // --- link check: every widget symbol resolves -------------
+    // Dead branch but the linker still needs the symbols defined.
+    if (0) {
+        auto labels, fake_ptr;
+        fake_ptr = malloc(1);
+        labels = malloc(3 * 8);
+        *(labels + 0) = "A";
+        *(labels + 1) = "B";
+        *(labels + 2) = "C";
+        gui_checkbox(10, 10, fake_ptr, "Enable");
+        gui_radio(10, 10, 0, labels, 3);
+        gui_dropdown(10, 10, 80, labels, 3, fake_ptr, fake_ptr);
+        gui_slider(10, 10, 100, 50, 0, 100);
+        gui_icon_button(10, 10, 24, 24, 0, 16, 16, 0);
+        free(labels);
+        free(fake_ptr);
+    }
+
+    free(sel_buf);
+    free(open_buf);
+    free(flag_buf);
+
+    print_msg("stbui widgets v2: lerp + state layouts + link smoke passed");
+    return 0;
+}

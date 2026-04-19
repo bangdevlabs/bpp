@@ -4,6 +4,7 @@
 
 import "stbdraw.bsm";
 import "stbinput.bsm";
+import "bpp_maestro.bsm";
 
 // --- Style System ---
 // Separates appearance from geometry — the B++ equivalent of CSS.
@@ -66,21 +67,26 @@ void init_ui() {
     _stl_default.padding = 4;
     _stl_default.radius = 0;
 
-    // Button style: gray background, black text.
+    // Button style: a muted blue-gray with rounded corners. The
+    // hover path is computed from this base via _ui_hover_fade so
+    // every button gets a consistent animated highlight without
+    // the style struct having to encode an "accent" field.
     _stl_button = malloc(sizeof(Style));
-    _stl_button.bg = GRAY;
-    _stl_button.fg = BLACK;
+    _stl_button.bg = rgba(58, 66, 86, 255);
+    _stl_button.fg = WHITE;
     _stl_button.font_sz = UI_FONT_SZ;
     _stl_button.padding = 10;
-    _stl_button.radius = 0;
+    _stl_button.radius = 6;
 
-    // Panel style: dark background.
+    // Panel style: dark slate with a softer corner radius. Panels
+    // are backdrops, not buttons, so the radius is larger to match
+    // card-style layouts.
     _stl_panel = malloc(sizeof(Style));
-    _stl_panel.bg = DARKGRAY;
+    _stl_panel.bg = rgba(28, 32, 44, 255);
     _stl_panel.fg = WHITE;
     _stl_panel.font_sz = UI_FONT_SZ;
     _stl_panel.padding = 12;
-    _stl_panel.radius = 0;
+    _stl_panel.radius = 8;
 
     // Layout stack: 8 entries of sizeof(Layout) each.
     _lay_stack = malloc(8 * sizeof(Layout));
@@ -89,6 +95,94 @@ void init_ui() {
     // UI arena: fixed 32 KiB scratch space, reset each frame.
     _ui_arena = malloc(_UI_ARENA_SZ);
     _ui_arena_ptr = 0;
+
+    // Hover fade state — single slot. The mouse only lives in one
+    // widget at a time, so one globally-tracked identity is enough
+    // to drive the fade-in; fade-out is a snap (acceptable for 1-day
+    // Tier 1 polish). _ui_hover_id is a packed (x<<16)|y of the
+    // hovered widget's top-left corner; 0 means "nothing hovered".
+    _ui_hover_id = 0;
+    _ui_hover_start_ms = 0;
+    _ui_pressed_id = 0;
+}
+
+// Cross-frame hover tracking. Entries are keyed by (x<<16)|y hash
+// so the same widget at the same screen position is recognised
+// between frames without the caller having to pass an explicit id.
+// Collisions are possible but low-impact (the worst case is a
+// slightly-wrong fade, recovering inside 120 ms). _ui_pressed_id
+// tracks the button currently held down so the pressed state
+// survives a drag off the button and back onto it.
+static extrn _ui_hover_id;
+static extrn _ui_hover_start_ms;
+static extrn _ui_pressed_id;
+
+// Hover fade duration in milliseconds. Short enough that the
+// motion feels responsive, long enough that the eye catches it.
+const _UI_FADE_MS = 120;
+
+// Return the 0..256 hover-fade amount for the widget at screen
+// position (rx, ry). Updates the module's hover slot as a side
+// effect. When the widget is not under the cursor, fade drops to
+// 0 instantly. Over time this can be upgraded to a symmetric
+// fade-in / fade-out; for now fade-out snap matches the one-day
+// time-box and looks fine on solid backgrounds.
+_ui_hover_fade(rx, ry, hovered) {
+    auto id, elapsed;
+    if (hovered == 0) {
+        id = (rx << 16) | ry;
+        if (_ui_hover_id == id) { _ui_hover_id = 0; }
+        return 0;
+    }
+    id = (rx << 16) | ry;
+    if (_ui_hover_id != id) {
+        _ui_hover_id = id;
+        _ui_hover_start_ms = beat_now_ms();
+    }
+    elapsed = beat_now_ms() - _ui_hover_start_ms;
+    if (elapsed >= _UI_FADE_MS) { return 256; }
+    return elapsed * 256 / _UI_FADE_MS;
+}
+
+// Update the module's "pressed" widget slot. Called by gui_button
+// on press-edge and by _handle_mouse on release. The slot lets a
+// drag out and back onto a held button still render pressed —
+// simple approach without needing a per-widget capture state.
+_ui_press_track(rx, ry, press, release) {
+    auto id;
+    id = (rx << 16) | ry;
+    if (press != 0) { _ui_pressed_id = id; return; }
+    if (release != 0 && _ui_pressed_id == id) { _ui_pressed_id = 0; }
+}
+
+// Is the widget at (rx, ry) the one the mouse is currently
+// holding? Used by gui_button to render the pressed state even
+// when the cursor has wandered off.
+_ui_is_pressed(rx, ry) : base {
+    auto id;
+    id = (rx << 16) | ry;
+    return _ui_pressed_id == id;
+}
+
+// Linear blend between two ARGB colors. `t` is 0..256 where 0
+// returns c0 and 256 returns c1. Each channel is blended
+// independently. Used by every hover-animated widget.
+lerp_color(c0, c1, t) : base {
+    auto inv, r0, g0, b0, a0, r1, g1, b1, a1, r, g, b, a;
+    inv = 256 - t;
+    r0 = (c0 >> 16) & 0xFF;
+    g0 = (c0 >> 8)  & 0xFF;
+    b0 =  c0        & 0xFF;
+    a0 = (c0 >> 24) & 0xFF;
+    r1 = (c1 >> 16) & 0xFF;
+    g1 = (c1 >> 8)  & 0xFF;
+    b1 =  c1        & 0xFF;
+    a1 = (c1 >> 24) & 0xFF;
+    r = (r0 * inv + r1 * t) >> 8;
+    g = (g0 * inv + g1 * t) >> 8;
+    b = (b0 * inv + b1 * t) >> 8;
+    a = (a0 * inv + a1 * t) >> 8;
+    return rgba(r, g, b, a);
 }
 
 // --- Arena Functions ---
@@ -260,54 +354,133 @@ void gui_number_c(x, y, val, color) {
 }
 
 // Draw a filled panel (background rectangle) with the given color.
+// Square corners for maximum back-compat; callers wanting rounded
+// edges use gui_panel_r or gui_panel_s with a Style.
 void gui_panel(x, y, w, h, color) {
     draw_rect(x, y, w, h, color);
 }
 
-// Draw a styled panel and push a layout context inside it.
-// Widgets called after this will stack automatically inside the panel.
+// Rounded-corner panel. Convenience wrapper over draw_rounded_rect.
+void gui_panel_r(x, y, w, h, color, radius) {
+    draw_rounded_rect(x, y, w, h, radius, color);
+}
+
+// Draw a styled panel with a soft drop shadow and push a layout
+// context inside it. Widgets drawn after this call stack
+// automatically within the panel's padded interior.
 void gui_panel_s(x, y, w, h, style) {
     auto s: Style;
     s = style;
-    draw_rect(x, y, w, h, s.bg);
+
+    // Soft shadow behind the card — three alpha-blended layers
+    // via draw_shadow_rounded so the shadow corners match the
+    // panel's corners. Skipped on radius=0 panels where square
+    // chrome looks fine without falloff.
+    if (s.radius > 0) {
+        draw_shadow_rounded(x, y, w, h, s.radius, 50);
+    }
+    draw_rounded_rect(x, y, w, h, s.radius, s.bg);
     lay_push(x, y, w, h, s.padding, LAY_DOWN);
 }
 
-// Draw a clickable button. Returns 1 on the frame it is clicked, 0 otherwise.
+// Draw a clickable button with hover fade, pressed state, and a
+// rounded-corner silhouette. Returns 1 on the frame the user
+// presses the mouse inside the button (press-edge semantics —
+// matches B++'s existing button convention). A drag-off-then-
+// back visually re-presses but does not re-trigger the click.
+//
+// Rendering stack — bottom to top:
+//   1. draw_shadow (dropped when pressed so the button
+//      "sinks" into the surface).
+//   2. Rounded-rect body filled with a hover-lerped color. The
+//      idle and hover colors come from _stl_button so styling
+//      stays consistent across every unstyled button.
+//   3. Top-edge highlight (1px lighter band) for a soft bevel.
+//   4. Label text, nudged 1px down while pressed to sell the
+//      physical depression.
 gui_button(x, y, w, h, label) {
-    auto mx, my, hover, rx, ry;
+    auto s: Style;
+    auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
+    auto y_off;
+
+    s = _stl_button;
     rx = lay_x(x);
     ry = lay_y(y);
     mx = mouse_x();
     my = mouse_y();
     hover = point_in_rect(mx, my, rx, ry, w, h);
+    press   = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+    release = mouse_released(MOUSE_LEFT) != 0;
+    _ui_press_track(rx, ry, press, release);
+    held = hover != 0 && _ui_is_pressed(rx, ry);
 
-    // Highlight on hover, dim otherwise.
-    draw_rect(rx, ry, w, h, hover ? WHITE : GRAY);
-    draw_text(label, rx + 10, ry + (h / 2) - (UI_FONT_SZ / 2), UI_FONT_SZ, BLACK);
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    bg = lerp_color(s.bg, rgba(90, 110, 150, 255), fade);
+    if (held != 0) { bg = rgba(38, 44, 58, 255); }
+
+    y_off = held != 0 ? 1 : 0;
+
+    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
+    draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
+
+    // Top-edge highlight — skipped when pressed (the button is
+    // no longer catching light from above).
+    if (held == 0 && s.radius > 0) {
+        hl = lerp_color(bg, rgba(255, 255, 255, 255), 40);
+        draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
+    }
+
+    draw_text(label, rx + 10,
+              ry + y_off + (h / 2) - (UI_FONT_SZ / 2),
+              UI_FONT_SZ, s.fg);
     _lay_advance(w, h);
 
-    if (hover && mouse_pressed(MOUSE_LEFT)) { return 1; }
+    if (press != 0) { return 1; }
     return 0;
 }
 
-// Draw a styled clickable button. Returns 1 on click.
+// Styled button. Same render stack as gui_button but pulls bg /
+// fg / padding / radius / font_sz from the caller's Style. The
+// hover accent is always a blend toward the built-in accent
+// rgba(90, 110, 150, 255) — keeping it as a fixed target means
+// every button in the program glows the same color on hover even
+// when the base color is customised.
 gui_button_s(x, y, w, h, label, style) {
     auto s: Style;
-    auto mx, my, hover, rx, ry;
+    auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
+    auto y_off;
+
     s = style;
     rx = lay_x(x);
     ry = lay_y(y);
     mx = mouse_x();
     my = mouse_y();
     hover = point_in_rect(mx, my, rx, ry, w, h);
+    press   = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+    release = mouse_released(MOUSE_LEFT) != 0;
+    _ui_press_track(rx, ry, press, release);
+    held = hover != 0 && _ui_is_pressed(rx, ry);
 
-    // Brighten background on hover.
-    draw_rect(rx, ry, w, h, hover ? WHITE : s.bg);
-    draw_text(label, rx + s.padding, ry + (h / 2) - (s.font_sz / 2), s.font_sz, s.fg);
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    bg = lerp_color(s.bg, rgba(90, 110, 150, 255), fade);
+    if (held != 0) { bg = lerp_color(s.bg, BLACK, 80); }
+
+    y_off = held != 0 ? 1 : 0;
+
+    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
+    draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
+
+    if (held == 0 && s.radius > 0) {
+        hl = lerp_color(bg, rgba(255, 255, 255, 255), 40);
+        draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
+    }
+
+    draw_text(label, rx + s.padding,
+              ry + y_off + (h / 2) - (s.font_sz / 2),
+              s.font_sz, s.fg);
     _lay_advance(w, h);
 
-    if (hover && mouse_pressed(MOUSE_LEFT)) { return 1; }
+    if (press != 0) { return 1; }
     return 0;
 }
 
@@ -400,7 +573,7 @@ gui_text_input(ti, x, y, w, h) : io {
     auto t: TextInput;
     auto rx, ry, mx, my, hover, click;
     auto n_typed, i, ch;
-    auto border, bg, text_color;
+    auto border, bg, text_color, caret_x, caret_on, fade, radius;
 
     t = ti;
     rx = lay_x(x);
@@ -417,18 +590,28 @@ gui_text_input(ti, x, y, w, h) : io {
         else            { t.focused = 0; }
     }
 
-    // Visual styling mirrors gui_button: darker background, a
-    // highlighted border when focused, grey-on-black text.
-    if (t.focused != 0) { border = rgba(97, 218, 251, 255); bg = rgba(18, 22, 33, 255); }
-    else                { border = GRAY;                    bg = rgba(12, 15, 22, 255); }
+    // Visual styling. The border colour lerps between grey (idle)
+    // and accent cyan as hover + focus ramp up. Focused wins over
+    // hover so the border reads as "this one is active" even while
+    // the cursor drifts over another field.
+    radius = 4;
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    if (t.focused != 0) {
+        border = rgba(97, 218, 251, 255);
+        bg     = rgba(18, 22, 33, 255);
+    } else {
+        border = lerp_color(rgba(70, 78, 96, 255),
+                            rgba(130, 150, 180, 255),
+                            fade);
+        bg     = rgba(12, 15, 22, 255);
+    }
     text_color = WHITE;
 
-    draw_rect(rx, ry, w, h, bg);
-    // Border — four thin rectangles (top/bottom/left/right).
-    draw_rect(rx,         ry,         w, 1, border);
-    draw_rect(rx,         ry + h - 1, w, 1, border);
-    draw_rect(rx,         ry,         1, h, border);
-    draw_rect(rx + w - 1, ry,         1, h, border);
+    // Rounded rim — fill a slightly larger rect in the border
+    // colour, then punch the interior back to bg. Cheaper than
+    // drawing an explicit ring at the sizes text inputs use.
+    draw_rounded_rect(rx - 1, ry - 1, w + 2, h + 2, radius + 1, border);
+    draw_rounded_rect(rx,     ry,     w,     h,     radius,     bg);
 
     // Draw the current text content, clipped to the widget width.
     // UI_FONT_SZ is the default font scale from stbui.
@@ -436,12 +619,16 @@ gui_text_input(ti, x, y, w, h) : io {
               UI_FONT_SZ, text_color);
 
     // Caret — a vertical bar right after the last character while
-    // focused. At 8 px/char scaled by UI_FONT_SZ.
+    // focused. Blinks at 1 Hz (500 ms on, 500 ms off) keyed off the
+    // process-wall clock so every focused field across every
+    // program blinks in sync.
     if (t.focused != 0) {
-        auto caret_x;
         caret_x = rx + 4 + t.len * 8 * UI_FONT_SZ;
         if (caret_x >= rx + w - 2) { caret_x = rx + w - 2; }
-        draw_rect(caret_x, ry + 2, 1, h - 4, text_color);
+        caret_on = (beat_now_ms() / 500) & 1;
+        if (caret_on == 0) {
+            draw_rect(caret_x, ry + 2, 1, h - 4, text_color);
+        }
     }
 
     _lay_advance(w, h);
@@ -538,7 +725,7 @@ gui_grid(x, y, cols, rows, cell_size, border_color) : io {
 
 gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
     auto rx, ry, mx, my, i, col, row;
-    auto cx, cy, color, hover, clicked, rows;
+    auto cx, cy, color, hover, clicked, rows, radius, pad;
 
     rx = lay_x(x);
     ry = lay_y(y);
@@ -554,25 +741,35 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
         cx = rx + col * cell_size;
         cy = ry + row * cell_size;
         color = *(colors + i * 8);
-
-        draw_rect(cx, cy, cell_size, cell_size, color);
-
-        // Outline every swatch so adjacent same-color cells stay
-        // distinguishable.
-        draw_rect(cx,                cy,                cell_size, 1, BLACK);
-        draw_rect(cx,                cy + cell_size - 1, cell_size, 1, BLACK);
-        draw_rect(cx,                cy,                1, cell_size, BLACK);
-        draw_rect(cx + cell_size - 1, cy,                1, cell_size, BLACK);
-
         hover = point_in_rect(mx, my, cx, cy, cell_size, cell_size);
+
+        radius = cell_size / 4;
+        if (radius > 6) { radius = 6; }
+        pad = 2;
+
+        // Selected swatch gets a glowing accent halo; idle swatches
+        // get a subtle dark outline to stay distinguishable. Hover
+        // pushes a brighter outline without committing the halo —
+        // that way the selection is still clear even while the
+        // cursor hovers somewhere else.
         if (i == selected) {
-            // Highlight selected — cyan accent border, inset by 1 px.
-            auto sel_c;
-            sel_c = rgba(97, 218, 251, 255);
-            draw_rect(cx + 1,                cy + 1,                cell_size - 2, 1, sel_c);
-            draw_rect(cx + 1,                cy + cell_size - 2,   cell_size - 2, 1, sel_c);
-            draw_rect(cx + 1,                cy + 1,                1, cell_size - 2, sel_c);
-            draw_rect(cx + cell_size - 2,    cy + 1,                1, cell_size - 2, sel_c);
+            draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
+                              rgba(97, 218, 251, 255));
+            draw_rounded_rect(cx + pad, cy + pad,
+                              cell_size - 2 * pad, cell_size - 2 * pad,
+                              radius, color);
+        } else if (hover != 0) {
+            draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
+                              rgba(180, 195, 220, 255));
+            draw_rounded_rect(cx + 1, cy + 1,
+                              cell_size - 2, cell_size - 2,
+                              radius, color);
+        } else {
+            draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
+                              rgba(0, 0, 0, 200));
+            draw_rounded_rect(cx + 1, cy + 1,
+                              cell_size - 2, cell_size - 2,
+                              radius, color);
         }
 
         if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
@@ -582,4 +779,389 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
 
     _lay_advance(per_row * cell_size, rows * cell_size);
     return clicked;
+}
+
+// ─── Toggle checkbox ────────────────────────────────────────
+//
+// val_ptr holds the toggle state (0 = unchecked, 1 = checked).
+// Click toggles; value is written through the pointer and also
+// returned for convenience. The label sits to the right of the
+// box, text-color white.
+//
+// Example:
+//   auto on: byte;
+//   ...
+//   on = gui_checkbox(x, y, &on, "Dither");
+
+gui_checkbox(x, y, val_ptr, label) : io {
+    auto rx, ry, mx, my, hover, clicked, val, box_sz, fade;
+    auto bg, border, accent, label_w;
+    box_sz = 14;
+    accent = rgba(97, 218, 251, 255);
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+
+    // Hit area covers box + label for a generous click target.
+    label_w = measure_text(label, UI_FONT_SZ);
+    hover = point_in_rect(mx, my, rx, ry, box_sz + 6 + label_w, box_sz);
+    clicked = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+
+    val = peek(val_ptr);
+    if (clicked != 0) {
+        val = val == 0 ? 1 : 0;
+        poke(val_ptr, val);
+    }
+
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    bg = lerp_color(rgba(18, 22, 33, 255), rgba(28, 36, 52, 255), fade);
+    border = val != 0 ? accent : rgba(70, 78, 96, 255);
+
+    // Rim ring: fill slightly larger rounded rect in border color,
+    // then punch inside back to bg.
+    draw_rounded_rect(rx - 1, ry - 1, box_sz + 2, box_sz + 2, 3, border);
+    draw_rounded_rect(rx, ry, box_sz, box_sz, 2, bg);
+
+    // Checkmark when checked — 4 stepped squares form a diagonal
+    // tick from bottom-left to top-right. Deliberately chunky so
+    // it reads clearly on the 14px box.
+    if (val != 0) {
+        draw_rect(rx + 3, ry + 7, 2, 2, accent);
+        draw_rect(rx + 5, ry + 9, 2, 2, accent);
+        draw_rect(rx + 7, ry + 6, 2, 2, accent);
+        draw_rect(rx + 9, ry + 3, 2, 2, accent);
+    }
+
+    draw_text(label, rx + box_sz + 6,
+              ry + (box_sz / 2) - (UI_FONT_SZ / 2),
+              UI_FONT_SZ, WHITE);
+
+    _lay_advance(box_sz + 6 + label_w, box_sz + 4);
+    return val;
+}
+
+// ─── Radio group (mutually-exclusive) ───────────────────────
+//
+// Draw a vertical stack of n radio buttons, starting at (x, y).
+// `options` is an array of n C-string pointers (8 bytes each).
+// Returns the (potentially new) selected index. Caller reassigns.
+//
+// Example:
+//   auto options;
+//   options = malloc(3 * 8);
+//   *(options + 0) = "None";
+//   *(options + 1) = "2x2";
+//   *(options + 2) = "4x4";
+//   dither = gui_radio(x, y, dither, options, 3);
+
+gui_radio(x, y, selected, options, n) : io {
+    auto rx, ry, mx, my, i, new_sel, yoff, hover, clicked;
+    auto opt, circle_r, row_h, label_w, hit_w;
+    auto accent, idle, bg;
+
+    circle_r = 7;
+    row_h = 20;
+    accent = rgba(97, 218, 251, 255);
+    idle   = rgba(70, 78, 96, 255);
+    bg     = rgba(18, 22, 33, 255);
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    new_sel = selected;
+
+    for (i = 0; i < n; i = i + 1) {
+        yoff = i * row_h;
+        opt = *(options + i * 8);
+        label_w = measure_text(opt, UI_FONT_SZ);
+        hit_w = circle_r * 2 + 6 + label_w;
+        hover = point_in_rect(mx, my, rx, ry + yoff, hit_w, row_h);
+        clicked = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+        if (clicked != 0) { new_sel = i; }
+
+        // Outer ring: accent when selected, idle otherwise.
+        // "Circle" is a rounded-rect with r = circle_r → fully
+        // rounded so the corner stepping forms a ~circle.
+        auto ring, fill_c;
+        ring = i == new_sel ? accent : idle;
+        draw_rounded_rect(rx, ry + yoff + row_h / 2 - circle_r,
+                          circle_r * 2, circle_r * 2, circle_r, ring);
+        fill_c = bg;
+        draw_rounded_rect(rx + 1, ry + yoff + row_h / 2 - circle_r + 1,
+                          circle_r * 2 - 2, circle_r * 2 - 2,
+                          circle_r - 1, fill_c);
+
+        // Inner dot for the selected radio. 4px wide so the center
+        // is visually distinct from the ring without dominating.
+        if (i == new_sel) {
+            draw_rounded_rect(rx + 4, ry + yoff + row_h / 2 - circle_r + 4,
+                              circle_r * 2 - 8, circle_r * 2 - 8,
+                              circle_r - 4, accent);
+        }
+
+        draw_text(opt, rx + circle_r * 2 + 6,
+                  ry + yoff + row_h / 2 - UI_FONT_SZ / 2,
+                  UI_FONT_SZ, WHITE);
+    }
+
+    _lay_advance(120, n * row_h);
+    return new_sel;
+}
+
+// ─── Dropdown selector ──────────────────────────────────────
+//
+// Collapsed-by-default list. Click the button → open; click an
+// item → select + close; click outside (or press Escape) → close.
+//
+// Persistent state lives in the caller-provided open_ptr (0 or 1)
+// and selected_ptr (0..n-1). selected_ptr is also returned so
+// code like `selected = gui_dropdown(...)` reads naturally.
+//
+// IMPORTANT: render dropdowns LAST in each panel — the expanded
+// list draws below the button and would be occluded by any
+// widget drawn after this call. Immediate-mode has no z-order.
+//
+// Example:
+//   auto universe_open: byte, universe_sel: byte;
+//   auto labels;
+//   labels = malloc(3 * 8);
+//   *(labels + 0) = "NKOTC";
+//   *(labels + 1) = "CB";
+//   *(labels + 2) = "MCU";
+//   universe_sel = gui_dropdown(x, y, 120, labels, 3,
+//                                &universe_sel, &universe_open);
+
+gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) : io {
+    auto rx, ry, mx, my, hover_btn, click_btn, btn_h;
+    auto selected, is_open;
+    auto i, item_y, hover_item, click_item, opt, label_w;
+    auto bg, border, fade, arrow_x, arrow_y;
+    auto accent;
+
+    accent = rgba(97, 218, 251, 255);
+    btn_h = 22;
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+
+    selected = peek(selected_ptr);
+    is_open = peek(open_ptr);
+
+    // Collapsed button: show the current label + a chevron.
+    hover_btn = point_in_rect(mx, my, rx, ry, w, btn_h);
+    click_btn = hover_btn != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+
+    if (click_btn != 0) {
+        is_open = is_open == 0 ? 1 : 0;
+        poke(open_ptr, is_open);
+    }
+
+    fade = _ui_hover_fade(rx, ry, hover_btn != 0);
+    bg = lerp_color(rgba(28, 32, 44, 255), rgba(38, 46, 62, 255), fade);
+    border = is_open != 0 ? accent : rgba(70, 78, 96, 255);
+
+    draw_rounded_rect(rx - 1, ry - 1, w + 2, btn_h + 2, 5, border);
+    draw_rounded_rect(rx, ry, w, btn_h, 4, bg);
+
+    // Current selection label.
+    if (n > 0 && selected >= 0 && selected < n) {
+        opt = *(labels + selected * 8);
+        draw_text(opt, rx + 8, ry + btn_h / 2 - UI_FONT_SZ / 2,
+                  UI_FONT_SZ, WHITE);
+    }
+
+    // Chevron — 3-row pyramid pointing down (closed) or up (open).
+    arrow_x = rx + w - 14;
+    arrow_y = ry + btn_h / 2 - 2;
+    if (is_open != 0) {
+        draw_rect(arrow_x + 3, arrow_y,     2, 1, WHITE);
+        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, WHITE);
+        draw_rect(arrow_x,     arrow_y + 2, 8, 1, WHITE);
+    } else {
+        draw_rect(arrow_x,     arrow_y,     8, 1, WHITE);
+        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, WHITE);
+        draw_rect(arrow_x + 3, arrow_y + 2, 2, 1, WHITE);
+    }
+
+    // Expansion list when open. Click-outside closes without
+    // changing selection.
+    if (is_open != 0) {
+        auto list_y, list_h;
+        list_y = ry + btn_h + 2;
+        list_h = n * btn_h;
+
+        // Shadowed panel behind the list for depth.
+        draw_shadow_rounded(rx, list_y, w, list_h, 4, 60);
+        draw_rounded_rect(rx - 1, list_y - 1, w + 2, list_h + 2, 5,
+                          rgba(70, 78, 96, 255));
+        draw_rounded_rect(rx, list_y, w, list_h, 4, rgba(28, 32, 44, 255));
+
+        for (i = 0; i < n; i = i + 1) {
+            item_y = list_y + i * btn_h;
+            hover_item = point_in_rect(mx, my, rx, item_y, w, btn_h);
+            click_item = hover_item != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+
+            if (hover_item != 0) {
+                draw_rect(rx + 2, item_y + 1, w - 4, btn_h - 2,
+                          rgba(58, 78, 110, 255));
+            }
+            if (i == selected) {
+                draw_rect(rx + 2, item_y + 1, 2, btn_h - 2, accent);
+            }
+
+            opt = *(labels + i * 8);
+            draw_text(opt, rx + 8,
+                      item_y + btn_h / 2 - UI_FONT_SZ / 2,
+                      UI_FONT_SZ, WHITE);
+
+            if (click_item != 0) {
+                selected = i;
+                is_open = 0;
+                poke(selected_ptr, selected);
+                poke(open_ptr, 0);
+            }
+        }
+
+        // Click outside closes without changing selection.
+        if (mouse_pressed(MOUSE_LEFT) != 0
+         && hover_btn == 0
+         && point_in_rect(mx, my, rx, list_y, w, list_h) == 0) {
+            poke(open_ptr, 0);
+        }
+
+        _lay_advance(w, btn_h + 2 + list_h);
+    } else {
+        _lay_advance(w, btn_h);
+    }
+
+    return selected;
+}
+
+// ─── Horizontal slider ──────────────────────────────────────
+//
+// Drag on the track to change val. Returns the new value
+// (caller reassigns). Integer math only — val is clamped to
+// [min, max]. The slider maintains a per-ID "dragging" state so
+// the cursor can leave the track vertically without the drag
+// breaking.
+
+gui_slider(x, y, w, val, min, max) : io {
+    auto rx, ry, mx, my, hover, down, id;
+    auto track_h, knob_w, range, knob_x, track_y;
+    auto bg, fill, knob_color, fade;
+
+    track_h = 6;
+    knob_w = 10;
+    range = max - min;
+    if (range <= 0) { return val; }
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    id = (rx << 16) | ry;
+
+    // Hit area covers the full knob height for forgiving clicks.
+    hover = point_in_rect(mx, my, rx, ry, w, knob_w);
+    down  = mouse_down(MOUSE_LEFT);
+
+    // Start drag: press inside starts dragging; release ends it.
+    if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+        _ui_pressed_id = id;
+    }
+    if (down == 0) {
+        if (_ui_pressed_id == id) { _ui_pressed_id = 0; }
+    }
+
+    // While this slider is the active drag target, follow cursor X.
+    if (_ui_pressed_id == id && down != 0) {
+        auto cx;
+        cx = mx - rx;
+        if (cx < 0) { cx = 0; }
+        if (cx > w) { cx = w; }
+        val = min + cx * range / w;
+    }
+    if (val < min) { val = min; }
+    if (val > max) { val = max; }
+
+    // Track: full width, muted. Fill portion: accent up to knob.
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    bg   = rgba(38, 44, 58, 255);
+    fill = rgba(97, 218, 251, 255);
+    track_y = ry + (knob_w - track_h) / 2;
+
+    draw_rounded_rect(rx, track_y, w, track_h, track_h / 2, bg);
+    knob_x = (val - min) * w / range;
+    if (knob_x > 0) {
+        draw_rounded_rect(rx, track_y, knob_x, track_h, track_h / 2, fill);
+    }
+
+    // Knob: larger when hovered/pressed.
+    auto k_sz;
+    k_sz = knob_w;
+    if (_ui_pressed_id == id || hover != 0) { k_sz = knob_w + 2; }
+    knob_color = lerp_color(WHITE, fill, fade / 2);
+    draw_rounded_rect(rx + knob_x - k_sz / 2, ry + (knob_w - k_sz) / 2,
+                      k_sz, k_sz, k_sz / 2, knob_color);
+
+    _lay_advance(w, knob_w);
+    return val;
+}
+
+// ─── Icon button ────────────────────────────────────────────
+//
+// Same silhouette as gui_button but renders a sprite texture
+// centred inside the rounded body instead of a text label. The
+// `tex` argument is a GPU texture handle from
+// sprite_create / _stb_gpu_create_texture, with `tex_w`×`tex_h`
+// natural pixel dimensions. `selected = 1` draws an accent
+// border around the body for toolbar "active" state.
+//
+// This widget uses the GPU sprite path, so the caller must be
+// between render_begin / render_end and have imported stbrender.
+// For CPU-only draw paths, stick with gui_button + text labels.
+
+gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) : io {
+    auto rx, ry, mx, my, hover, press, release, held, fade, bg;
+    auto y_off, accent, dx, dy;
+
+    accent = rgba(97, 218, 251, 255);
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    hover = point_in_rect(mx, my, rx, ry, w, h);
+    press   = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+    release = mouse_released(MOUSE_LEFT) != 0;
+    _ui_press_track(rx, ry, press, release);
+    held = hover != 0 && _ui_is_pressed(rx, ry);
+
+    fade = _ui_hover_fade(rx, ry, hover != 0);
+    bg = lerp_color(_stl_button.bg, rgba(90, 110, 150, 255), fade);
+    if (held != 0) { bg = rgba(38, 44, 58, 255); }
+
+    y_off = held != 0 ? 1 : 0;
+
+    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
+    draw_rounded_rect(rx, ry + y_off, w, h, 6, bg);
+
+    if (selected != 0) {
+        draw_rounded_rect(rx - 1, ry + y_off - 1, w + 2, h + 2, 7, accent);
+        draw_rounded_rect(rx, ry + y_off, w, h, 6, bg);
+    }
+
+    // Centre the sprite in the button. Uses the GPU sprite path.
+    dx = rx + (w - tex_w) / 2;
+    dy = ry + y_off + (h - tex_h) / 2;
+    _stb_gpu_sprite(tex, dx, dy, tex_w, tex_h, tex_w, tex_h);
+
+    _lay_advance(w, h);
+
+    if (press != 0) { return 1; }
+    return 0;
 }

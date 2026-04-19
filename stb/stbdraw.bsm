@@ -155,6 +155,133 @@ void draw_bar(x, y, w, h, val, max_val, color) {
     draw_rect(x, y, fill_w, h, color);
 }
 
+// Draw a 4-edge outlined rectangle with a given thickness. Saves
+// the caller from chaining four draw_rect calls — the common
+// pattern every widget uses for borders.
+void draw_border(x, y, w, h, color, thickness) {
+    if (thickness <= 0) { thickness = 1; }
+    draw_rect(x,                 y,                 w, thickness,         color);
+    draw_rect(x,                 y + h - thickness, w, thickness,         color);
+    draw_rect(x,                 y + thickness, thickness, h - 2 * thickness, color);
+    draw_rect(x + w - thickness, y + thickness, thickness, h - 2 * thickness, color);
+}
+
+// Blend-fill a rectangular region. Uses blend_px per cell so the
+// source's alpha channel is honoured. Slower than draw_rect — use
+// for shadows and overlays, not for bulk geometry.
+void fill_rect_blend(x, y, w, h, color) {
+    auto yy, xx;
+    for (yy = y; yy < y + h; yy = yy + 1) {
+        for (xx = x; xx < x + w; xx = xx + 1) {
+            blend_px(xx, yy, color);
+        }
+    }
+}
+
+// Filled rectangle with rounded corners. Radius is clamped so the
+// shape never self-intersects (r <= min(w, h) / 2). Corners are
+// pixel-stepped — the ellipse boundary inside each corner is a
+// staircase rather than anti-aliased curves. That matches B++'s
+// pixel-art aesthetic and keeps the cost at a handful of integer
+// compares per row.
+void draw_rounded_rect(x, y, w, h, r, color) {
+    auto j, d, m, inset;
+    if (r < 0) { r = 0; }
+    if (r > w / 2) { r = w / 2; }
+    if (r > h / 2) { r = h / 2; }
+    if (r == 0) { draw_rect(x, y, w, h, color); return; }
+
+    // Middle body — every row between the two corner bands is a
+    // full-width strip.
+    draw_rect(x, y + r, w, h - 2 * r, color);
+
+    // Top + bottom corner bands. Row j in [0, r): distance from
+    // the corner centre on the y-axis is (r - j). The largest
+    // horizontal inset m that still lies inside the circle is the
+    // greatest integer with m² + (r - j)² <= r². Solved with a
+    // tiny while loop since r is typically small (<= 16).
+    for (j = 0; j < r; j = j + 1) {
+        d = r - j;
+        m = r;
+        while (m > 0 && m * m + d * d > r * r) { m = m - 1; }
+        inset = r - m;
+        draw_rect(x + inset,       y + j,             w - 2 * inset, 1, color);
+        draw_rect(x + inset,       y + h - 1 - j,     w - 2 * inset, 1, color);
+    }
+}
+
+// Vertical linear gradient from c_top at y to c_bot at y + h - 1.
+// Alpha is blended the same way so gradients between translucent
+// colors stay translucent across the ramp.
+void draw_gradient(x, y, w, h, c_top, c_bot) {
+    auto j, t, inv;
+    auto r0, g0, b0, a0, r1, g1, b1, a1;
+    auto rr, gg, bb, aa, c;
+    r0 = (c_top >> 16) & 0xFF;
+    g0 = (c_top >> 8)  & 0xFF;
+    b0 =  c_top        & 0xFF;
+    a0 = (c_top >> 24) & 0xFF;
+    r1 = (c_bot >> 16) & 0xFF;
+    g1 = (c_bot >> 8)  & 0xFF;
+    b1 =  c_bot        & 0xFF;
+    a1 = (c_bot >> 24) & 0xFF;
+    if (h <= 1) { draw_rect(x, y, w, 1, c_top); return; }
+    for (j = 0; j < h; j = j + 1) {
+        t = j * 256 / (h - 1);
+        inv = 256 - t;
+        rr = (r0 * inv + r1 * t) >> 8;
+        gg = (g0 * inv + g1 * t) >> 8;
+        bb = (b0 * inv + b1 * t) >> 8;
+        aa = (a0 * inv + a1 * t) >> 8;
+        c = rgba(rr, gg, bb, aa);
+        draw_rect(x, y + j, w, 1, c);
+    }
+}
+
+// Drop shadow stack. Draws three translucent black layers, each
+// offset one pixel further down-right with decreasing alpha, to
+// emulate a soft falloff without a real blur. Call BEFORE drawing
+// the shape on top so the shape overlaps the shadow's near edge.
+// `intensity` controls the top-layer alpha (sane range 32..128).
+void draw_shadow(x, y, w, h, intensity) {
+    auto i, a;
+    if (intensity <= 0) { return; }
+    for (i = 0; i < 3; i = i + 1) {
+        a = intensity >> i;
+        if (a <= 0) { break; }
+        fill_rect_blend(x - i, y + 1 + i, w + 2 * i, h + i,
+                        rgba(0, 0, 0, a));
+    }
+}
+
+// Rounded drop shadow — same falloff as draw_shadow but respects
+// corner radius. Expensive (alpha-blended ring), call sparingly.
+void draw_shadow_rounded(x, y, w, h, r, intensity) {
+    auto i, a, j, d, m, inset;
+    if (intensity <= 0) { return; }
+    if (r < 0) { r = 0; }
+    for (i = 0; i < 3; i = i + 1) {
+        a = intensity >> i;
+        if (a <= 0) { break; }
+        // Body + corner bands for this shadow layer.
+        fill_rect_blend(x - i,             y + 1 + i + r,
+                        w + 2 * i,         h + i - 2 * r,
+                        rgba(0, 0, 0, a));
+        for (j = 0; j < r; j = j + 1) {
+            d = r - j;
+            m = r;
+            while (m > 0 && m * m + d * d > r * r) { m = m - 1; }
+            inset = r - m;
+            fill_rect_blend(x - i + inset,             y + 1 + i + j,
+                            w + 2 * i - 2 * inset,     1,
+                            rgba(0, 0, 0, a));
+            fill_rect_blend(x - i + inset,             y + 1 + i + h + i - 1 - j,
+                            w + 2 * i - 2 * inset,     1,
+                            rgba(0, 0, 0, a));
+        }
+    }
+}
+
 // ── Text rendering ───────────────────────────────────────
 
 // Draw a string using the 8x8 bitmap font.
