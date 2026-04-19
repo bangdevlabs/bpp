@@ -12,7 +12,7 @@ B++ tools producing content for B++ games, on a stack where every byte — from 
 
 ## The Synthesizer
 
-`tools/audio/synth/synthkey.bpp` — 300 lines, polyphonic, 4 octaves (C3–B6), WAV recording:
+`tools/mini_synth/mini_synth.bpp` — 300 lines, polyphonic, 4 octaves (C3–B6), WAV recording:
 
 ```
 bpp synthkey.bpp -o synth && ./synth
@@ -166,7 +166,7 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **stbmixer** — polyphonic 8-voice mixer, 4 waveforms (sine/tri/saw/square) with continuous morph, bitcrush + decimation distortion, master volume
 - **stbsound** — WAV read/write, RIFF PCM 44100 stereo s16
 
-The first B++ audio program was a 440 Hz sine tone. The second was a 300-line polyphonic synthesizer with WAV recording, 46 keys mapped to 4 chromatic octaves, waveform and dirt controls, zero glitches under load. See `tools/audio/synth/synthkey.bpp`.
+The first B++ audio program was a 440 Hz sine tone. The second was a 300-line polyphonic synthesizer with WAV recording, 46 keys mapped to 4 chromatic octaves, waveform and dirt controls, zero glitches under load. See `tools/mini_synth/mini_synth.bpp`.
 
 ## What B++ Doesn't Have
 
@@ -525,7 +525,7 @@ b++/
 │       ├── target/x86_64_linux/  — ELF writer
 │       └── c/                  — C transpiler (portable escape hatch)
 ├── stb/                        — Standard B Library (20 modules, game engine)
-├── tools/audio/mini_synth/     — Polyphonic synthesizer (300 lines)
+├── tools/mini_synth/           — Polyphonic synthesizer (300 lines)
 ├── games/                      — Complete playable games
 │   ├── snake/                  — Snake + ECS particles + ranking + music + SFX
 │   ├── pathfind/               — Rat-and-cat chase with AI pursuit

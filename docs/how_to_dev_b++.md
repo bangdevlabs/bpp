@@ -640,7 +640,7 @@ Batch 7 — Entry points + games:
   games/snake/snake_gpu.bpp
   games/pathfind/pathfind.bpp
   games/platformer/platformer.bpp
-  tools/audio/synth/synthkey.bpp
+  tools/mini_synth/mini_synth.bpp
 ```
 
 ### Recheck after each batch
