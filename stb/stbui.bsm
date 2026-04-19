@@ -1165,3 +1165,201 @@ gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) : io {
     if (press != 0) { return 1; }
     return 0;
 }
+
+// ─── Scroll view (thumb drag, no clipping) ──────────────────
+//
+// Renders a scrollbar on the right edge of a (w × h) viewport
+// and returns the caller's scroll offset after any drag input.
+// The caller is responsible for drawing its content offset by
+// the returned `scroll_y` — B++'s draw primitives don't have
+// a clip rect, so widgets drawn outside the viewport will
+// overdraw adjacent UI. Keep content strictly inside (x, y,
+// w - bar_w, h).
+//
+// Interaction: click + drag the thumb. Scroll-wheel support is
+// not wired up (stbinput doesn't expose it yet); when it lands
+// this widget will grow a wheel branch without changing the
+// caller API.
+//
+// Example:
+//   auto scroll_y;
+//   scroll_y = 0;
+//   // each frame:
+//   scroll_y = gui_scroll_view(x, y, w, h, total_h, scroll_y);
+//   // draw content at effective y = row_i * row_h - scroll_y + y
+
+gui_scroll_view(x, y, w, h, content_h, scroll_y) : io {
+    auto rx, ry, mx, my, bar_w, track_x, track_h;
+    auto max_scroll, thumb_h, thumb_y, hover_thumb;
+    auto down, id, drag_y, bg;
+
+    bar_w = 6;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+
+    // Short-circuit: content fits, no bar needed. Reset scroll
+    // so the caller's offset clamps to zero.
+    if (content_h <= h) {
+        _lay_advance(w, h);
+        return 0;
+    }
+
+    max_scroll = content_h - h;
+    if (scroll_y < 0)          { scroll_y = 0; }
+    if (scroll_y > max_scroll) { scroll_y = max_scroll; }
+
+    // Track runs the full viewport height on the right.
+    track_x = rx + w - bar_w;
+    track_h = h;
+    draw_rounded_rect(track_x, ry, bar_w, track_h, bar_w / 2,
+                      rgba(28, 32, 44, 255));
+
+    // Thumb height is proportional to viewport / content. Clamp
+    // to a minimum so the thumb is grabbable on tall content.
+    thumb_h = h * h / content_h;
+    if (thumb_h < 20) { thumb_h = 20; }
+    if (thumb_h > h)  { thumb_h = h; }
+    thumb_y = ry + scroll_y * (h - thumb_h) / max_scroll;
+
+    // Hover + drag state via packed ID (same _ui_pressed_id
+    // pattern gui_slider uses).
+    id = (track_x << 16) | ry;
+    hover_thumb = point_in_rect(mx, my, track_x, thumb_y,
+                                 bar_w, thumb_h);
+    down = mouse_down(MOUSE_LEFT);
+
+    if (hover_thumb != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+        _ui_pressed_id = id;
+    }
+    if (down == 0) {
+        if (_ui_pressed_id == id) { _ui_pressed_id = 0; }
+    }
+
+    if (_ui_pressed_id == id && down != 0) {
+        // Map cursor y to scroll offset. Cursor at track top →
+        // scroll 0; cursor at bottom minus thumb_h → max_scroll.
+        drag_y = my - ry - thumb_h / 2;
+        if (drag_y < 0) { drag_y = 0; }
+        if (drag_y > h - thumb_h) { drag_y = h - thumb_h; }
+        scroll_y = drag_y * max_scroll / (h - thumb_h);
+    }
+
+    // Thumb color tracks interaction state.
+    if (_ui_pressed_id == id) {
+        bg = rgba(97, 218, 251, 255);
+    } else if (hover_thumb != 0) {
+        bg = rgba(130, 150, 180, 255);
+    } else {
+        bg = rgba(70, 78, 96, 255);
+    }
+    draw_rounded_rect(track_x, thumb_y, bar_w, thumb_h, bar_w / 2, bg);
+
+    _lay_advance(w, h);
+    return scroll_y;
+}
+
+// ─── Tab strip ──────────────────────────────────────────────
+//
+// Horizontal row of tabs. Each tab is `tab_w` wide by 26 tall.
+// Returns the currently-selected index, potentially mutated by
+// click. The selected tab draws taller-and-lighter and shares a
+// bottom edge with the content area below — the "folder tab"
+// illusion from desktop apps.
+
+gui_tabs(x, y, tab_w, labels, n, selected) : io {
+    auto rx, ry, mx, my, i, yoff, tab_h;
+    auto hover, click, opt, bg, accent;
+    auto new_sel, fade;
+
+    tab_h = 26;
+    accent = rgba(97, 218, 251, 255);
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    new_sel = selected;
+
+    for (i = 0; i < n; i = i + 1) {
+        yoff = i * tab_w;
+        opt = *(labels + i * 8);
+        hover = point_in_rect(mx, my, rx + yoff, ry, tab_w, tab_h);
+        click = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
+        if (click != 0) { new_sel = i; }
+
+        fade = _ui_hover_fade(rx + yoff, ry, hover != 0);
+        if (i == new_sel) {
+            // Active tab: slightly lifted, accent top stripe.
+            bg = rgba(38, 46, 62, 255);
+            draw_rounded_rect(rx + yoff + 1, ry, tab_w - 2, tab_h + 2,
+                              5, bg);
+            draw_rect(rx + yoff + 5, ry, tab_w - 10, 2, accent);
+        } else {
+            // Inactive: darker, slightly recessed.
+            bg = lerp_color(rgba(20, 24, 34, 255),
+                            rgba(30, 36, 50, 255), fade);
+            draw_rounded_rect(rx + yoff + 1, ry + 2, tab_w - 2, tab_h - 2,
+                              5, bg);
+        }
+
+        draw_text(opt,
+                  rx + yoff + tab_w / 2 - measure_text(opt, UI_FONT_SZ) / 2,
+                  ry + tab_h / 2 - UI_FONT_SZ / 2,
+                  UI_FONT_SZ, WHITE);
+    }
+
+    // Baseline — 1px strip under all tabs that meets the active
+    // tab's bottom edge, completing the folder-tab illusion.
+    draw_rect(rx, ry + tab_h, n * tab_w, 1, rgba(97, 218, 251, 100));
+
+    _lay_advance(n * tab_w, tab_h + 4);
+    return new_sel;
+}
+
+// ─── Tooltip ────────────────────────────────────────────────
+//
+// Floating label near the mouse cursor. Caller decides when to
+// show (typical: hover a widget for ~400 ms, then draw). Renders
+// LAST in the frame — the tooltip must sit above everything
+// else, and immediate-mode has no z-order.
+//
+// Offset +14 px right + down so the cursor doesn't occlude the
+// tip; clamps to an 800×600 viewport by default.
+
+void gui_tooltip(text) : io {
+    auto mx, my, tx, ty, tw, th, pad;
+    pad = 4;
+    mx = mouse_x();
+    my = mouse_y();
+    tw = measure_text(text, UI_FONT_SZ) + pad * 2;
+    th = UI_FONT_SZ + pad * 2;
+    tx = mx + 14;
+    ty = my + 14;
+
+    if (tx + tw > 800) { tx = mx - tw - 4; }
+    if (ty + th > 600) { ty = my - th - 4; }
+
+    draw_shadow(tx, ty, tw, th, 50);
+    draw_rounded_rect(tx - 1, ty - 1, tw + 2, th + 2, 4,
+                      rgba(97, 218, 251, 200));
+    draw_rounded_rect(tx, ty, tw, th, 3, rgba(20, 24, 34, 240));
+    draw_text(text, tx + pad, ty + pad, UI_FONT_SZ, WHITE);
+}
+
+// ─── Status bar ─────────────────────────────────────────────
+//
+// Full-width strip at the bottom of the viewport showing status
+// text. 18 px tall by convention. `color` 0 selects the default
+// dark slate; any non-zero value overrides.
+
+void gui_status_bar(y, w, text, color) : io {
+    auto bg, height;
+    height = 18;
+    if (color == 0) { bg = rgba(18, 22, 33, 255); }
+    else            { bg = color; }
+    draw_rect(0, y, w, height, bg);
+    draw_rect(0, y, w, 1, rgba(60, 68, 84, 255));
+    draw_text(text, 8, y + height / 2 - UI_FONT_SZ / 2,
+              UI_FONT_SZ, rgba(200, 210, 220, 255));
+}
