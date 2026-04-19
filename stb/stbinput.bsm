@@ -45,6 +45,15 @@ enum MouseBtn { MOUSE_LEFT = 0, MOUSE_RIGHT, MOUSE_MIDDLE }
 // same way snake_maestro's `extrn body;` does.
 extrn _stb_keys, _stb_keys_prev;
 
+// Text input ring for this frame. Printable characters typed
+// during the current frame are appended to _stb_text_buf by the
+// platform's event pump (see _input_push_char below). The buffer
+// is cleared at the start of every frame by _input_save_prev.
+// 64 bytes comfortably exceeds human single-frame typing speed.
+extrn _stb_text_buf;
+extrn _stb_text_len;
+static extrn _STB_TEXT_CAP;
+
 // Mouse state. Written by _stb_poll_events every frame, read from the
 // solo phase on the main thread. Stays auto because the values (not
 // pointers) mutate per frame; promoting to global would be an opt-in
@@ -57,14 +66,46 @@ void init_input() {
     _stb_keys_prev = malloc(256);
     auto i;
     for (i = 0; i < 256; i = i + 1) { poke(_stb_keys + i, 0); poke(_stb_keys_prev + i, 0); }
+    _STB_TEXT_CAP = 64;
+    _stb_text_buf = malloc(_STB_TEXT_CAP);
+    _stb_text_len = 0;
     _stb_mouse_x = 0; _stb_mouse_y = 0; _stb_mouse_btn = 0; _stb_mouse_btn_prev = 0;
 }
 
 // Copy current state to prev (called BEFORE _stb_poll_events each frame).
+// Also clears the per-frame text-input ring — stbinput exposes
+// typed characters frame-by-frame, never as a lingering buffer.
 void _input_save_prev() {
     auto i;
     for (i = 0; i < 256; i = i + 1) { poke(_stb_keys_prev + i, peek(_stb_keys + i)); }
     _stb_mouse_btn_prev = _stb_mouse_btn;
+    _stb_text_len = 0;
+}
+
+// Called by the platform event pump when a printable character is
+// typed. Overflow silently drops — 64 bytes per frame is far more
+// than a human produces at any realistic typing speed, so the
+// drop path is effectively unreachable but still safe.
+void _input_push_char(ch) {
+    if (_stb_text_len >= _STB_TEXT_CAP) { return; }
+    poke(_stb_text_buf + _stb_text_len, ch);
+    _stb_text_len = _stb_text_len + 1;
+}
+
+// Number of printable characters typed during the current frame.
+// Widgets iterate this range with input_text_char(i) to consume
+// each character into their own editing state.
+input_text_len() : base {
+    return _stb_text_len;
+}
+
+// Byte at position i of the this-frame character stream. Returns
+// 0 when i is out of range — convenient for while loops that
+// iterate until the zero sentinel.
+input_text_char(i) : base {
+    if (i < 0) { return 0; }
+    if (i >= _stb_text_len) { return 0; }
+    return peek(_stb_text_buf + i);
 }
 
 // Return 1 if the key is currently held down. Pure read of the extrn

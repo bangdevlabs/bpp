@@ -186,6 +186,11 @@ void _stb_init_window(w: word, h: word, title) : io {
     objc_msgSend(_plt_app, sel_registerName("setActivationPolicy:"), 0);
 
     // Window at 3x logical size for pixel-perfect scaling.
+    // The initial origin (100, 100) is a placeholder — `center`
+    // below picks the actual position on the main screen. In Cocoa
+    // coordinates (origin = bottom-left), (100, 100) would put the
+    // window near the bottom-left corner, which is the "always
+    // spawning in the corner" bug games saw before this fix.
     _plt_win = objc_msgSend(objc_getClass("NSWindow"), sel_registerName("alloc"));
     _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
         100.0, 100.0, w * 3.0, h * 3.0, 15, 2, 0);
@@ -197,6 +202,11 @@ void _stb_init_window(w: word, h: word, title) : io {
         0.0, 0.0, w * 3.0, h * 3.0);
     objc_msgSend(_plt_imgview, sel_registerName("setImageScaling:"), 3);
     objc_msgSend(view, sel_registerName("addSubview:"), _plt_imgview);
+
+    // Center on the active screen before showing. -[NSWindow center]
+    // computes (screen_visible_frame.width - win.width) / 2 on both
+    // axes, which matches what users expect from a fresh app.
+    objc_msgSend(_plt_win, sel_registerName("center"));
 
     objc_msgSend(_plt_win, sel_registerName("makeKeyAndOrderFront:"), 0);
     objc_msgSend(_plt_app, sel_registerName("activateIgnoringOtherApps:"), 1);
@@ -250,6 +260,24 @@ void _stb_poll_events() : io {
             vk = objc_msgSend(ev, sel_registerName("keyCode"));
             slot = _plt_map_vkey(vk);
             if (slot >= 0) { poke(_stb_keys + slot, 1); }
+
+            // Feed printable characters into stbinput's per-frame
+            // text ring. -[NSEvent characters] returns an NSString
+            // of the typed characters (usually one, but multi-key
+            // dead-key sequences can resolve to more). We filter
+            // to printable ASCII (0x20..0x7E) so widgets don't
+            // have to strip control codes before echoing.
+            auto chars_ns, char_count, ci, ch;
+            chars_ns = objc_msgSend(ev, sel_registerName("characters"));
+            if (chars_ns != 0) {
+                char_count = objc_msgSend(chars_ns, sel_registerName("length"));
+                for (ci = 0; ci < char_count; ci = ci + 1) {
+                    ch = objc_msgSend(chars_ns, sel_registerName("characterAtIndex:"), ci);
+                    if (ch >= 0x20 && ch <= 0x7E) {
+                        _input_push_char(ch);
+                    }
+                }
+            }
         }
         if (etype == NSEvKeyUp) {
             vk = objc_msgSend(ev, sel_registerName("keyCode"));
@@ -382,11 +410,142 @@ static _gpu_build_shader() {
 }
 
 // Create an NSString from a C string.
-static _gpu_nsstr(cstr) {
+// NSString from a C string. Drops the `static` guard the GPU code
+// originally had so stbwindow's dialog helpers (later in this file)
+// can reuse it without duplicating the three-line builder. Caller
+// doesn't need to release — we rely on the window's autorelease
+// pool to reclaim transient strings at the next frame boundary.
+_gpu_nsstr(cstr) {
     auto ns;
     ns = objc_msgSend(objc_getClass("NSString"), sel_registerName("alloc"));
     ns = objc_msgSend(ns, sel_registerName("initWithUTF8String:"), cstr);
     return ns;
+}
+
+// ── Native dialogs (file + alerts) ──────────────────────────
+//
+// Wrappers around NSSavePanel / NSOpenPanel / NSAlert. Used by
+// stbwindow.bsm to expose a portable API. All of these BLOCK the
+// main thread via -[runModal] until the user dismisses the panel,
+// so callers must not be inside an audio-callback or worker
+// context.
+//
+// Return contract: the two *_dialog functions return a malloc'd
+// null-terminated C string (caller frees), or 0 if the user
+// cancelled. The alert functions return void except _confirm
+// which returns 1 for OK, 0 for Cancel.
+
+// Copy the UTF-8 bytes out of an NSString into a fresh malloc'd
+// buffer. Needed because the NSString goes away on the next
+// autorelease cycle; the caller wants a path they can free at
+// their own convenience.
+static _stb_copy_nsstring_cstr(ns_str) {
+    auto src, len, out, i;
+    src = objc_msgSend(ns_str, sel_registerName("UTF8String"));
+    if (src == 0) { return 0; }
+    len = str_len(src);
+    out = malloc(len + 1);
+    for (i = 0; i < len; i = i + 1) { poke(out + i, peek(src + i)); }
+    poke(out + len, 0);
+    return out;
+}
+
+// Native Save As dialog. `title` appears at the top, `default_name`
+// pre-fills the name field (pass 0 to skip). Returns a malloc'd
+// path or 0 if the user cancelled.
+_stb_dialog_save(title, default_name) : io {
+    auto panel, title_ns, default_ns, result, url, path;
+
+    panel = objc_msgSend(objc_getClass("NSSavePanel"), sel_registerName("savePanel"));
+    if (title != 0) {
+        title_ns = _gpu_nsstr(title);
+        objc_msgSend(panel, sel_registerName("setTitle:"), title_ns);
+    }
+    if (default_name != 0) {
+        default_ns = _gpu_nsstr(default_name);
+        objc_msgSend(panel, sel_registerName("setNameFieldStringValue:"), default_ns);
+    }
+
+    // runModal: NSModalResponseOK = 1, NSModalResponseCancel = 0.
+    result = objc_msgSend(panel, sel_registerName("runModal"));
+    if (result != 1) { return 0; }
+
+    url  = objc_msgSend(panel, sel_registerName("URL"));
+    path = objc_msgSend(url,   sel_registerName("path"));
+    return _stb_copy_nsstring_cstr(path);
+}
+
+// Native Open dialog. Single-file selection, no directories, no
+// multi-select — matching ModuLab's current import flow. Returns
+// a malloc'd path or 0.
+_stb_dialog_open(title) : io {
+    auto panel, title_ns, result, url, path;
+
+    panel = objc_msgSend(objc_getClass("NSOpenPanel"), sel_registerName("openPanel"));
+    if (title != 0) {
+        title_ns = _gpu_nsstr(title);
+        objc_msgSend(panel, sel_registerName("setTitle:"), title_ns);
+    }
+    objc_msgSend(panel, sel_registerName("setCanChooseFiles:"),          1);
+    objc_msgSend(panel, sel_registerName("setCanChooseDirectories:"),    0);
+    objc_msgSend(panel, sel_registerName("setAllowsMultipleSelection:"), 0);
+
+    result = objc_msgSend(panel, sel_registerName("runModal"));
+    if (result != 1) { return 0; }
+
+    url  = objc_msgSend(panel, sel_registerName("URL"));
+    path = objc_msgSend(url,   sel_registerName("path"));
+    return _stb_copy_nsstring_cstr(path);
+}
+
+// Informational alert. One OK button, blocks until dismissed.
+void _stb_alert_info(title, message) : io {
+    auto alert, title_ns, msg_ns;
+    alert = objc_msgSend(objc_getClass("NSAlert"), sel_registerName("alloc"));
+    alert = objc_msgSend(alert, sel_registerName("init"));
+    title_ns = _gpu_nsstr(title);
+    msg_ns   = _gpu_nsstr(message);
+    objc_msgSend(alert, sel_registerName("setMessageText:"),     title_ns);
+    objc_msgSend(alert, sel_registerName("setInformativeText:"), msg_ns);
+    // NSAlertStyle: warning=0, informational=1, critical=2.
+    objc_msgSend(alert, sel_registerName("setAlertStyle:"), 1);
+    objc_msgSend(alert, sel_registerName("runModal"));
+}
+
+// Warning alert with OK / Cancel. Returns 1 if the user clicked
+// OK (first button), 0 for Cancel (second button).
+_stb_alert_confirm(title, message) : io {
+    auto alert, title_ns, msg_ns, ok_ns, cancel_ns, result;
+    alert = objc_msgSend(objc_getClass("NSAlert"), sel_registerName("alloc"));
+    alert = objc_msgSend(alert, sel_registerName("init"));
+    title_ns = _gpu_nsstr(title);
+    msg_ns   = _gpu_nsstr(message);
+    objc_msgSend(alert, sel_registerName("setMessageText:"),     title_ns);
+    objc_msgSend(alert, sel_registerName("setInformativeText:"), msg_ns);
+    objc_msgSend(alert, sel_registerName("setAlertStyle:"), 0);
+    ok_ns     = _gpu_nsstr("OK");
+    cancel_ns = _gpu_nsstr("Cancel");
+    objc_msgSend(alert, sel_registerName("addButtonWithTitle:"), ok_ns);
+    objc_msgSend(alert, sel_registerName("addButtonWithTitle:"), cancel_ns);
+
+    // NSAlertFirstButtonReturn = 1000, Second = 1001, etc.
+    result = objc_msgSend(alert, sel_registerName("runModal"));
+    if (result == 1000) { return 1; }
+    return 0;
+}
+
+// Critical alert — red icon, OK to dismiss. Use for fatal errors
+// the user needs to see before the app proceeds.
+void _stb_alert_error(title, message) : io {
+    auto alert, title_ns, msg_ns;
+    alert = objc_msgSend(objc_getClass("NSAlert"), sel_registerName("alloc"));
+    alert = objc_msgSend(alert, sel_registerName("init"));
+    title_ns = _gpu_nsstr(title);
+    msg_ns   = _gpu_nsstr(message);
+    objc_msgSend(alert, sel_registerName("setMessageText:"),     title_ns);
+    objc_msgSend(alert, sel_registerName("setInformativeText:"), msg_ns);
+    objc_msgSend(alert, sel_registerName("setAlertStyle:"), 2);
+    objc_msgSend(alert, sel_registerName("runModal"));
 }
 
 // Initialize the Metal rendering pipeline.

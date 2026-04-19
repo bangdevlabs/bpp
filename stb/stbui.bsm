@@ -328,3 +328,258 @@ void gui_bar(x, y, w, h, val, max_val, color) {
     }
     _lay_advance(w, h);
 }
+
+// ─── Editable text field ────────────────────────────────────
+//
+// Call `text_input_new` once during setup to initialise a state
+// block and its backing buffer. Call `gui_text_input` every frame
+// to draw + update. Focus is handled automatically: a click
+// inside the widget focuses it, a click outside unfocuses. While
+// focused the widget consumes characters from the input_text_char
+// stream (see stbinput) and Backspace from key_pressed.
+//
+// Layout: the state is a typed struct the caller owns — either
+// on the heap (`auto ti: TextInput; ti = malloc(sizeof(TextInput))`)
+// or on the stack (`var ti: TextInput;`). The buffer is caller-
+// allocated at size `maxlen + 1` (the +1 reserves the null
+// terminator).
+//
+// Return value: gui_text_input returns 1 on the frame Enter was
+// pressed (caller's cue to commit), 0 otherwise. The buffer
+// contents are null-terminated at all times.
+
+struct TextInput {
+    buf,        // pointer to caller-provided char buffer (null-terminated)
+    len,        // current length in bytes
+    maxlen,     // capacity (excluding the null terminator slot)
+    focused,    // 1 while this widget holds keyboard focus
+}
+
+// Initialize a TextInput state. `buf` must hold at least
+// `maxlen + 1` bytes; the function writes a null terminator at
+// position 0 so `buf` is immediately a valid empty C-string.
+void text_input_new(ti, buf, maxlen) {
+    auto t: TextInput;
+    t = ti;
+    t.buf = buf;
+    t.len = 0;
+    t.maxlen = maxlen;
+    t.focused = 0;
+    poke(buf, 0);
+}
+
+// Clear the buffer to the empty string without dropping focus.
+void text_input_clear(ti) {
+    auto t: TextInput;
+    t = ti;
+    t.len = 0;
+    poke(t.buf, 0);
+}
+
+// Set the buffer contents to `s` (null-terminated). Truncates at
+// maxlen if s is longer. Ignores focus state.
+void text_input_set(ti, s) {
+    auto t: TextInput;
+    auto i, ch;
+    t = ti;
+    i = 0;
+    while (i < t.maxlen) {
+        ch = peek(s + i);
+        if (ch == 0) { break; }
+        poke(t.buf + i, ch);
+        i = i + 1;
+    }
+    poke(t.buf + i, 0);
+    t.len = i;
+}
+
+// Draw the field + consume input this frame. Returns 1 if Enter
+// was pressed while focused, 0 otherwise. The caller decides what
+// to do on commit — read buf, close a save dialog, etc.
+gui_text_input(ti, x, y, w, h) : io {
+    auto t: TextInput;
+    auto rx, ry, mx, my, hover, click;
+    auto n_typed, i, ch;
+    auto border, bg, text_color;
+
+    t = ti;
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    hover = point_in_rect(mx, my, rx, ry, w, h);
+
+    // Click-to-focus: left click inside focuses; left click
+    // anywhere else removes focus. Simple immediate-mode model.
+    click = mouse_pressed(MOUSE_LEFT);
+    if (click != 0) {
+        if (hover != 0) { t.focused = 1; }
+        else            { t.focused = 0; }
+    }
+
+    // Visual styling mirrors gui_button: darker background, a
+    // highlighted border when focused, grey-on-black text.
+    if (t.focused != 0) { border = rgba(97, 218, 251, 255); bg = rgba(18, 22, 33, 255); }
+    else                { border = GRAY;                    bg = rgba(12, 15, 22, 255); }
+    text_color = WHITE;
+
+    draw_rect(rx, ry, w, h, bg);
+    // Border — four thin rectangles (top/bottom/left/right).
+    draw_rect(rx,         ry,         w, 1, border);
+    draw_rect(rx,         ry + h - 1, w, 1, border);
+    draw_rect(rx,         ry,         1, h, border);
+    draw_rect(rx + w - 1, ry,         1, h, border);
+
+    // Draw the current text content, clipped to the widget width.
+    // UI_FONT_SZ is the default font scale from stbui.
+    draw_text(t.buf, rx + 4, ry + (h / 2) - (UI_FONT_SZ / 2),
+              UI_FONT_SZ, text_color);
+
+    // Caret — a vertical bar right after the last character while
+    // focused. At 8 px/char scaled by UI_FONT_SZ.
+    if (t.focused != 0) {
+        auto caret_x;
+        caret_x = rx + 4 + t.len * 8 * UI_FONT_SZ;
+        if (caret_x >= rx + w - 2) { caret_x = rx + w - 2; }
+        draw_rect(caret_x, ry + 2, 1, h - 4, text_color);
+    }
+
+    _lay_advance(w, h);
+
+    // Consume keyboard while focused. Backspace first (it fires on
+    // press edge regardless of the char stream), then queued chars.
+    if (t.focused != 0) {
+        if (key_pressed(KEY_BACKSPACE) != 0) {
+            if (t.len > 0) {
+                t.len = t.len - 1;
+                poke(t.buf + t.len, 0);
+            }
+        }
+        n_typed = input_text_len();
+        for (i = 0; i < n_typed; i = i + 1) {
+            ch = input_text_char(i);
+            if (ch == 0) { break; }
+            if (t.len < t.maxlen) {
+                poke(t.buf + t.len, ch);
+                t.len = t.len + 1;
+                poke(t.buf + t.len, 0);
+            }
+        }
+        if (key_pressed(KEY_ENTER) != 0) { return 1; }
+        if (key_pressed(KEY_TAB)   != 0) { t.focused = 0; }
+    }
+    return 0;
+}
+
+// ─── Grid cell picker ───────────────────────────────────────
+//
+// Draws a `cols`×`rows` grid of cells of `cell_size` pixels each.
+// Returns the cell index (0..cols*rows-1) the user clicked this
+// frame, or -1 if no cell was clicked. The grid draws an outline
+// in `border_color` and highlights the cell under the cursor.
+// Callers typically render their own content over the grid
+// afterwards (e.g. tile sprites, palette swatches).
+
+gui_grid(x, y, cols, rows, cell_size, border_color) : io {
+    auto rx, ry, mx, my, total_w, total_h;
+    auto col, row, cell_x, cell_y, hovered_idx, clicked_idx;
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+    total_w = cols * cell_size;
+    total_h = rows * cell_size;
+
+    // Compute which cell the cursor is over, if any.
+    hovered_idx = 0 - 1;
+    if (mx >= rx && mx < rx + total_w && my >= ry && my < ry + total_h) {
+        col = (mx - rx) / cell_size;
+        row = (my - ry) / cell_size;
+        hovered_idx = row * cols + col;
+    }
+
+    // Draw horizontal and vertical grid lines.
+    for (row = 0; row <= rows; row = row + 1) {
+        draw_rect(rx, ry + row * cell_size, total_w + 1, 1, border_color);
+    }
+    for (col = 0; col <= cols; col = col + 1) {
+        draw_rect(rx + col * cell_size, ry, 1, total_h + 1, border_color);
+    }
+
+    // Highlight hovered cell with a subtle overlay.
+    if (hovered_idx >= 0) {
+        col = hovered_idx % cols;
+        row = hovered_idx / cols;
+        cell_x = rx + col * cell_size + 1;
+        cell_y = ry + row * cell_size + 1;
+        draw_rect(cell_x, cell_y, cell_size - 1, cell_size - 1,
+                  rgba(255, 255, 255, 40));
+    }
+
+    _lay_advance(total_w, total_h);
+
+    clicked_idx = 0 - 1;
+    if (hovered_idx >= 0) {
+        if (mouse_pressed(MOUSE_LEFT) != 0) { clicked_idx = hovered_idx; }
+    }
+    return clicked_idx;
+}
+
+// ─── Palette swatch picker ──────────────────────────────────
+//
+// Specialised grid for choosing among a set of pre-defined colors.
+// `colors` is a caller-owned array of ARGB words (stride = 8
+// bytes). Draws `n` swatches in a row of `per_row` cells, each
+// cell_size × cell_size. Highlights the currently-selected index
+// with a contrasting border. Returns the index clicked this
+// frame, or -1 if no click landed on a swatch. Use for palettes,
+// theme pickers, team-color choosers.
+
+gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
+    auto rx, ry, mx, my, i, col, row;
+    auto cx, cy, color, hover, clicked, rows;
+
+    rx = lay_x(x);
+    ry = lay_y(y);
+    mx = mouse_x();
+    my = mouse_y();
+
+    rows = (n + per_row - 1) / per_row;
+    clicked = 0 - 1;
+
+    for (i = 0; i < n; i = i + 1) {
+        col = i % per_row;
+        row = i / per_row;
+        cx = rx + col * cell_size;
+        cy = ry + row * cell_size;
+        color = *(colors + i * 8);
+
+        draw_rect(cx, cy, cell_size, cell_size, color);
+
+        // Outline every swatch so adjacent same-color cells stay
+        // distinguishable.
+        draw_rect(cx,                cy,                cell_size, 1, BLACK);
+        draw_rect(cx,                cy + cell_size - 1, cell_size, 1, BLACK);
+        draw_rect(cx,                cy,                1, cell_size, BLACK);
+        draw_rect(cx + cell_size - 1, cy,                1, cell_size, BLACK);
+
+        hover = point_in_rect(mx, my, cx, cy, cell_size, cell_size);
+        if (i == selected) {
+            // Highlight selected — cyan accent border, inset by 1 px.
+            auto sel_c;
+            sel_c = rgba(97, 218, 251, 255);
+            draw_rect(cx + 1,                cy + 1,                cell_size - 2, 1, sel_c);
+            draw_rect(cx + 1,                cy + cell_size - 2,   cell_size - 2, 1, sel_c);
+            draw_rect(cx + 1,                cy + 1,                1, cell_size - 2, sel_c);
+            draw_rect(cx + cell_size - 2,    cy + 1,                1, cell_size - 2, sel_c);
+        }
+
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+            clicked = i;
+        }
+    }
+
+    _lay_advance(per_row * cell_size, rows * cell_size);
+    return clicked;
+}

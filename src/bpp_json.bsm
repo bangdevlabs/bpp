@@ -1,0 +1,918 @@
+// bpp_json.bsm — JSON reader + writer for B++.
+//
+// Scope: the subset of JSON that game tooling actually needs —
+// objects, arrays, strings, integers, floats, booleans, null. No
+// exponential-notation edge cases, no Unicode escapes beyond
+// \uXXXX in the BMP, no streaming parser. The whole document
+// lives in memory on both the read and write side; for ModuLab
+// save files (hundreds of KB at the worst) that's entirely fine.
+//
+// Two design choices to keep the API small:
+//
+//   1. The reader produces a value tree built from two parallel
+//      arrays (type + payload). Type codes live in JSON_* enum
+//      constants. Payload for strings is a pointer into a dup'd
+//      byte buffer; for ints/bools a direct integer; for floats
+//      a `: float` slot interpreted via raw bytes; for arrays
+//      and objects a pair of indices (first child + child count)
+//      pointing into the same flat table.
+//
+//   2. The writer takes a buffer + cursor and appends. Callers
+//      build documents with nested json_write_object_begin / end
+//      and json_write_string etc. calls. No intermediate tree
+//      means zero allocation during write beyond the output
+//      buffer grow.
+//
+// Typical write:
+//
+//   auto buf;
+//   buf = sb_new();
+//   buf = json_write_object_begin(buf);
+//     buf = json_write_string_field(buf, "name", "snake");
+//     buf = json_write_int_field(buf, "score", 42);
+//     buf = json_write_array_field_begin(buf, "palette");
+//       buf = json_write_string(buf, "#ff0000");
+//       buf = json_write_string(buf, "#00ff00");
+//     buf = json_write_array_end(buf);
+//   buf = json_write_object_end(buf);
+//   file_write_all("out.json", buf, sb_len(buf));
+//   buf = sb_free(buf);
+//
+// Typical read:
+//
+//   auto doc, root, name, score;
+//   doc = json_parse(src, src_len);
+//   if (doc == 0) { /* error on stderr already */ return; }
+//   root = json_root(doc);
+//   name = json_object_get_string(doc, root, "name");
+//   score = json_object_get_int(doc, root, "score", 0);
+//   json_free(doc);
+
+// ── Type tags ───────────────────────────────────────────────
+auto JSON_NULL, JSON_BOOL, JSON_INT, JSON_FLOAT;
+auto JSON_STRING, JSON_ARRAY, JSON_OBJECT;
+
+// Document handle — opaque to callers. Internally a struct that
+// carries the flat node arrays and the dup'd string pool.
+//
+//   types       — byte array, one JSON_* code per node
+//   payload     — word array, 8 bytes of payload per node
+//   child_count — word array, number of children (array/object) or
+//                 string length (for JSON_STRING). Unused for
+//                 scalars, kept at 0.
+//   strings     — allocation holding all the dup'd string bytes
+//                 concatenated; string payloads are byte offsets
+//                 into this buffer rather than raw pointers so a
+//                 future compaction / grow doesn't dangle.
+//   key_offsets — for object members, the offset of the key
+//                 (into `strings`) for the node at index i.
+//                 Unused (0) for array elements and the root.
+//   node_count  — number of populated entries in the arrays
+//   node_cap    — allocation capacity
+//   strings_len / strings_cap — same for the string pool
+struct JsonDoc {
+    types,
+    payload,
+    child_count,
+    strings,
+    key_offsets,
+    node_count,
+    node_cap,
+    strings_len,
+    strings_cap
+}
+
+// Module-level inited flag mirroring the pattern used in bpp_hash /
+// bpp_array. The constants are set on the first json_parse or
+// writer call.
+static extrn _json_inited;
+
+static void _json_init() {
+    if (_json_inited != 0) { return; }
+    _json_inited = 1;
+    JSON_NULL   = 0;
+    JSON_BOOL   = 1;
+    JSON_INT    = 2;
+    JSON_FLOAT  = 3;
+    JSON_STRING = 4;
+    JSON_ARRAY  = 5;
+    JSON_OBJECT = 6;
+}
+
+// ── Node table growth ──────────────────────────────────────
+
+static _json_grow_nodes(doc) {
+    auto d: JsonDoc, new_cap, i;
+    d = doc;
+    new_cap = d.node_cap * 2;
+    if (new_cap < 16) { new_cap = 16; }
+
+    auto new_types, new_payload, new_children, new_keys;
+    new_types    = malloc(new_cap);
+    new_payload  = malloc(new_cap * 8);
+    new_children = malloc(new_cap * 8);
+    new_keys     = malloc(new_cap * 8);
+
+    for (i = 0; i < d.node_count; i = i + 1) {
+        poke(new_types + i, peek(d.types + i));
+        *(new_payload  + i * 8) = *(d.payload  + i * 8);
+        *(new_children + i * 8) = *(d.child_count + i * 8);
+        *(new_keys     + i * 8) = *(d.key_offsets + i * 8);
+    }
+    if (d.types       != 0) { free(d.types); }
+    if (d.payload     != 0) { free(d.payload); }
+    if (d.child_count != 0) { free(d.child_count); }
+    if (d.key_offsets != 0) { free(d.key_offsets); }
+    d.types       = new_types;
+    d.payload     = new_payload;
+    d.child_count = new_children;
+    d.key_offsets = new_keys;
+    d.node_cap    = new_cap;
+    return d;
+}
+
+// Append `bytes` at `src` (length `len`) into the string pool,
+// growing it if needed. Returns the offset at which the bytes
+// landed. A null terminator is appended for C-string safety but
+// not counted in `len`.
+static _json_intern(doc, src, len) {
+    auto d: JsonDoc, new_cap, new_strings, off, i;
+    d = doc;
+    if (d.strings_len + len + 1 > d.strings_cap) {
+        new_cap = d.strings_cap * 2;
+        if (new_cap < 256) { new_cap = 256; }
+        while (new_cap < d.strings_len + len + 1) { new_cap = new_cap * 2; }
+        new_strings = malloc(new_cap);
+        for (i = 0; i < d.strings_len; i = i + 1) {
+            poke(new_strings + i, peek(d.strings + i));
+        }
+        if (d.strings != 0) { free(d.strings); }
+        d.strings     = new_strings;
+        d.strings_cap = new_cap;
+    }
+    off = d.strings_len;
+    for (i = 0; i < len; i = i + 1) {
+        poke(d.strings + off + i, peek(src + i));
+    }
+    poke(d.strings + off + len, 0);
+    // Include the null terminator in the committed length so the
+    // next intern call doesn't overwrite it. json_object_get relies
+    // on the terminator to distinguish "name" from "name" embedded
+    // inside a longer stored key like "namespace".
+    d.strings_len = off + len + 1;
+    return off;
+}
+
+// Add a node with the given type + payload. Returns the new
+// node's index. `key_off` is the offset of the key string in the
+// string pool for object members; pass 0 (or -1) when not inside
+// an object.
+static _json_add_node(doc, ty, payload, children, key_off) {
+    auto d: JsonDoc, idx;
+    d = doc;
+    if (d.node_count >= d.node_cap) { _json_grow_nodes(doc); }
+    idx = d.node_count;
+    poke(d.types + idx, ty);
+    *(d.payload     + idx * 8) = payload;
+    *(d.child_count + idx * 8) = children;
+    *(d.key_offsets + idx * 8) = key_off;
+    d.node_count = idx + 1;
+    return idx;
+}
+
+// ── Parser ──────────────────────────────────────────────────
+
+// Cursor state is kept on the stack as two locals in json_parse.
+// Each `_parse_*` helper returns the new cursor position.
+
+static _json_skip_ws(src, pos, len) {
+    auto ch;
+    while (pos < len) {
+        ch = peek(src + pos);
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') { return pos; }
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+// Expect a literal identifier starting at pos (e.g. "true",
+// "false", "null"). Returns the new pos if matched, or -1 on
+// mismatch.
+static _json_expect(src, pos, len, lit, lit_len) {
+    auto i;
+    if (pos + lit_len > len) { return 0 - 1; }
+    for (i = 0; i < lit_len; i = i + 1) {
+        if (peek(src + pos + i) != peek(lit + i)) { return 0 - 1; }
+    }
+    return pos + lit_len;
+}
+
+// Parse a JSON string starting at the opening quote. Writes the
+// decoded (escape-resolved) bytes into the string pool and
+// returns the pool offset + length through out_off + out_len.
+// Returns the position AFTER the closing quote, or -1 on error.
+static _json_parse_string(doc, src, pos, len, out_off, out_len) {
+    auto d: JsonDoc, start_len, ch, hex_val, hex_i, hex_ch, escape_buf, escape_pos;
+    d = doc;
+    if (pos >= len) { return 0 - 1; }
+    if (peek(src + pos) != '"') { return 0 - 1; }
+    pos = pos + 1;
+
+    // Intern the decoded bytes into a temporary buffer first, then
+    // copy into the pool once we know the final length. 256 bytes
+    // covers ModuLab's longest labels; grows dynamically as needed.
+    escape_buf = malloc(256);
+    auto buf_cap;
+    buf_cap = 256;
+    escape_pos = 0;
+
+    while (pos < len) {
+        ch = peek(src + pos);
+        if (ch == '"') {
+            // End of string.
+            *(out_off) = _json_intern(doc, escape_buf, escape_pos);
+            *(out_len) = escape_pos;
+            free(escape_buf);
+            return pos + 1;
+        }
+        if (ch == '\\') {
+            pos = pos + 1;
+            if (pos >= len) { free(escape_buf); return 0 - 1; }
+            ch = peek(src + pos);
+            if (ch == '"')  { ch = '"'; }
+            else if (ch == '\\') { ch = '\\'; }
+            else if (ch == '/') { ch = '/'; }
+            else if (ch == 'n') { ch = 10; }
+            else if (ch == 't') { ch = 9; }
+            else if (ch == 'r') { ch = 13; }
+            else if (ch == 'b') { ch = 8; }
+            else if (ch == 'f') { ch = 12; }
+            else if (ch == 'u') {
+                // 4-hex-digit BMP escape — we emit as UTF-8 up to
+                // 3 bytes. Surrogate pairs get flattened to
+                // replacement char; the tools we ship don't
+                // exchange them.
+                pos = pos + 1;
+                if (pos + 4 > len) { free(escape_buf); return 0 - 1; }
+                hex_val = 0;
+                for (hex_i = 0; hex_i < 4; hex_i = hex_i + 1) {
+                    hex_ch = peek(src + pos + hex_i);
+                    if (hex_ch >= '0' && hex_ch <= '9') {
+                        hex_val = hex_val * 16 + (hex_ch - '0');
+                    } else if (hex_ch >= 'a' && hex_ch <= 'f') {
+                        hex_val = hex_val * 16 + (hex_ch - 'a' + 10);
+                    } else if (hex_ch >= 'A' && hex_ch <= 'F') {
+                        hex_val = hex_val * 16 + (hex_ch - 'A' + 10);
+                    } else {
+                        free(escape_buf); return 0 - 1;
+                    }
+                }
+                pos = pos + 3;    // outer loop pos+=1 at end covers the 4th
+                // Encode as UTF-8. Skip tables; do it inline.
+                if (hex_val < 0x80) {
+                    ch = hex_val;
+                } else if (hex_val < 0x800) {
+                    if (escape_pos + 2 > buf_cap) {
+                        auto ng: word;
+                        ng = buf_cap * 2;
+                        auto nb;
+                        nb = malloc(ng);
+                        auto cpi;
+                        for (cpi = 0; cpi < escape_pos; cpi = cpi + 1) {
+                            poke(nb + cpi, peek(escape_buf + cpi));
+                        }
+                        free(escape_buf);
+                        escape_buf = nb;
+                        buf_cap = ng;
+                    }
+                    poke(escape_buf + escape_pos,     0xC0 | (hex_val >> 6));
+                    poke(escape_buf + escape_pos + 1, 0x80 | (hex_val & 0x3F));
+                    escape_pos = escape_pos + 2;
+                    pos = pos + 1;
+                    continue;
+                } else {
+                    if (escape_pos + 3 > buf_cap) {
+                        auto ng2: word;
+                        ng2 = buf_cap * 2;
+                        auto nb2;
+                        nb2 = malloc(ng2);
+                        auto cpi2;
+                        for (cpi2 = 0; cpi2 < escape_pos; cpi2 = cpi2 + 1) {
+                            poke(nb2 + cpi2, peek(escape_buf + cpi2));
+                        }
+                        free(escape_buf);
+                        escape_buf = nb2;
+                        buf_cap = ng2;
+                    }
+                    poke(escape_buf + escape_pos,     0xE0 | (hex_val >> 12));
+                    poke(escape_buf + escape_pos + 1, 0x80 | ((hex_val >> 6) & 0x3F));
+                    poke(escape_buf + escape_pos + 2, 0x80 | (hex_val & 0x3F));
+                    escape_pos = escape_pos + 3;
+                    pos = pos + 1;
+                    continue;
+                }
+            } else {
+                free(escape_buf); return 0 - 1;
+            }
+        }
+        if (escape_pos >= buf_cap) {
+            auto ng3: word;
+            ng3 = buf_cap * 2;
+            auto nb3;
+            nb3 = malloc(ng3);
+            auto cpi3;
+            for (cpi3 = 0; cpi3 < escape_pos; cpi3 = cpi3 + 1) {
+                poke(nb3 + cpi3, peek(escape_buf + cpi3));
+            }
+            free(escape_buf);
+            escape_buf = nb3;
+            buf_cap = ng3;
+        }
+        poke(escape_buf + escape_pos, ch);
+        escape_pos = escape_pos + 1;
+        pos = pos + 1;
+    }
+
+    // Unterminated string.
+    free(escape_buf);
+    return 0 - 1;
+}
+
+// Parse a JSON integer (or a float skipped to its end). MVP
+// implementation: integer part only; any fractional or exponent
+// digits are consumed and discarded, with is_float flagged so the
+// caller knows the value is approximate. All locals declared at
+// the top — B++ has historically preferred that pattern, nested
+// `auto` inside loops/ifs sometimes confuses stack layout.
+static _json_parse_number(src, pos, len, out_kind, out_int) {
+    auto ch, sign, int_val, is_float;
+
+    sign = 1;
+    is_float = 0;
+    int_val = 0;
+
+    if (pos < len) {
+        if (peek(src + pos) == '-') { sign = 0 - 1; pos = pos + 1; }
+    }
+    while (pos < len) {
+        ch = peek(src + pos);
+        if (ch < '0' || ch > '9') { break; }
+        int_val = int_val * 10 + (ch - '0');
+        pos = pos + 1;
+    }
+    // Fractional digits — consume but discard for MVP.
+    if (pos < len) {
+        if (peek(src + pos) == '.') {
+            is_float = 1;
+            pos = pos + 1;
+            while (pos < len) {
+                ch = peek(src + pos);
+                if (ch < '0' || ch > '9') { break; }
+                pos = pos + 1;
+            }
+        }
+    }
+    // Scientific notation — same treatment.
+    if (pos < len) {
+        ch = peek(src + pos);
+        if (ch == 'e' || ch == 'E') {
+            is_float = 1;
+            pos = pos + 1;
+            if (pos < len) {
+                ch = peek(src + pos);
+                if (ch == '+' || ch == '-') { pos = pos + 1; }
+            }
+            while (pos < len) {
+                ch = peek(src + pos);
+                if (ch < '0' || ch > '9') { break; }
+                pos = pos + 1;
+            }
+        }
+    }
+
+    if (is_float != 0) { *(out_kind) = JSON_FLOAT; }
+    else               { *(out_kind) = JSON_INT; }
+    *(out_int) = int_val * sign;
+    return pos;
+}
+
+// Recursive-descent value parser. Returns the new pos on success,
+// -1 on error. Appends the parsed node (and any children) into
+// the doc's flat table. All locals at the top so the stack frame
+// is flat — nested `auto` declarations inside if/while blocks have
+// historically produced garbage reads in B++, so the function keeps
+// a single declaration block at the top and reuses locals.
+static _json_parse_value(doc, src, pos, len, key_off, out_idx) {
+    auto d: JsonDoc;
+    auto ch, node_idx, sub_idx, kind, int_val;
+    auto str_off, str_len_val, children, first_child;
+    auto k_off, k_len;
+
+    pos = _json_skip_ws(src, pos, len);
+    if (pos >= len) { return 0 - 1; }
+    ch = peek(src + pos);
+
+    // Null / true / false.
+    if (ch == 'n') {
+        pos = _json_expect(src, pos, len, "null", 4);
+        if (pos < 0) { return 0 - 1; }
+        node_idx = _json_add_node(doc, JSON_NULL, 0, 0, key_off);
+        *(out_idx) = node_idx;
+        return pos;
+    }
+    if (ch == 't') {
+        pos = _json_expect(src, pos, len, "true", 4);
+        if (pos < 0) { return 0 - 1; }
+        node_idx = _json_add_node(doc, JSON_BOOL, 1, 0, key_off);
+        *(out_idx) = node_idx;
+        return pos;
+    }
+    if (ch == 'f') {
+        pos = _json_expect(src, pos, len, "false", 5);
+        if (pos < 0) { return 0 - 1; }
+        node_idx = _json_add_node(doc, JSON_BOOL, 0, 0, key_off);
+        *(out_idx) = node_idx;
+        return pos;
+    }
+
+    // Number. Kind is INT for whole numbers, FLOAT when the
+    // source had a fractional part or an exponent. Float values
+    // lose their fractional resolution in this MVP; we keep the
+    // integer portion so games can still read counters and IDs
+    // exported as "42.0" etc.
+    if (ch == '-' || (ch >= '0' && ch <= '9')) {
+        pos = _json_parse_number(src, pos, len, &kind, &int_val);
+        node_idx = _json_add_node(doc, kind, int_val, 0, key_off);
+        *(out_idx) = node_idx;
+        return pos;
+    }
+
+    // String.
+    if (ch == '"') {
+        pos = _json_parse_string(doc, src, pos, len, &str_off, &str_len_val);
+        if (pos < 0) { return 0 - 1; }
+        node_idx = _json_add_node(doc, JSON_STRING, str_off, str_len_val, key_off);
+        *(out_idx) = node_idx;
+        return pos;
+    }
+
+    // Array. Container node is added FIRST so that root = node 0;
+    // children recursion fills further indices. A per-container
+    // malloc'd index array holds the children's node indices
+    // (children aren't guaranteed to be contiguous in the table
+    // — nested arrays interleave descendants between siblings).
+    if (ch == '[') {
+        auto kids, kids_cap;
+        kids_cap = 4;
+        kids = malloc(kids_cap * 8);
+        children = 0;
+        node_idx = _json_add_node(doc, JSON_ARRAY, 0, 0, key_off);
+        pos = pos + 1;
+        pos = _json_skip_ws(src, pos, len);
+        if (pos < len && peek(src + pos) == ']') {
+            pos = pos + 1;
+        } else {
+            while (1) {
+                pos = _json_skip_ws(src, pos, len);
+                pos = _json_parse_value(doc, src, pos, len, 0, &sub_idx);
+                if (pos < 0) { free(kids); return 0 - 1; }
+                if (children >= kids_cap) {
+                    auto new_cap, new_kids, cpi;
+                    new_cap = kids_cap * 2;
+                    new_kids = malloc(new_cap * 8);
+                    for (cpi = 0; cpi < children; cpi = cpi + 1) {
+                        *(new_kids + cpi * 8) = *(kids + cpi * 8);
+                    }
+                    free(kids);
+                    kids = new_kids;
+                    kids_cap = new_cap;
+                }
+                *(kids + children * 8) = sub_idx;
+                children = children + 1;
+                pos = _json_skip_ws(src, pos, len);
+                if (pos >= len) { free(kids); return 0 - 1; }
+                ch = peek(src + pos);
+                if (ch == ',') { pos = pos + 1; continue; }
+                if (ch == ']') { pos = pos + 1; break; }
+                free(kids); return 0 - 1;
+            }
+        }
+        // Patch the container's payload + count now that the full
+        // child list is known. doc's struct pointer may have been
+        // reallocated by _json_add_node; re-read it via the local.
+        d = doc;
+        *(d.payload     + node_idx * 8) = kids;
+        *(d.child_count + node_idx * 8) = children;
+        *(out_idx) = node_idx;
+        return pos;
+    }
+
+    // Object. Same shape as arrays; per-child key offset is
+    // stored in d.key_offsets at each child's own node index.
+    if (ch == '{') {
+        auto kids, kids_cap;
+        kids_cap = 4;
+        kids = malloc(kids_cap * 8);
+        children = 0;
+        node_idx = _json_add_node(doc, JSON_OBJECT, 0, 0, key_off);
+        pos = pos + 1;
+        pos = _json_skip_ws(src, pos, len);
+        if (pos < len && peek(src + pos) == '}') {
+            pos = pos + 1;
+        } else {
+            while (1) {
+                pos = _json_skip_ws(src, pos, len);
+                pos = _json_parse_string(doc, src, pos, len, &k_off, &k_len);
+                if (pos < 0) { free(kids); return 0 - 1; }
+                pos = _json_skip_ws(src, pos, len);
+                if (pos >= len) { free(kids); return 0 - 1; }
+                if (peek(src + pos) != ':') { free(kids); return 0 - 1; }
+                pos = pos + 1;
+                pos = _json_parse_value(doc, src, pos, len, k_off, &sub_idx);
+                if (pos < 0) { free(kids); return 0 - 1; }
+                if (children >= kids_cap) {
+                    auto new_cap2, new_kids2, cpi2;
+                    new_cap2 = kids_cap * 2;
+                    new_kids2 = malloc(new_cap2 * 8);
+                    for (cpi2 = 0; cpi2 < children; cpi2 = cpi2 + 1) {
+                        *(new_kids2 + cpi2 * 8) = *(kids + cpi2 * 8);
+                    }
+                    free(kids);
+                    kids = new_kids2;
+                    kids_cap = new_cap2;
+                }
+                *(kids + children * 8) = sub_idx;
+                children = children + 1;
+                pos = _json_skip_ws(src, pos, len);
+                if (pos >= len) { free(kids); return 0 - 1; }
+                ch = peek(src + pos);
+                if (ch == ',') { pos = pos + 1; continue; }
+                if (ch == '}') { pos = pos + 1; break; }
+                free(kids); return 0 - 1;
+            }
+        }
+        d = doc;
+        *(d.payload     + node_idx * 8) = kids;
+        *(d.child_count + node_idx * 8) = children;
+        *(out_idx) = node_idx;
+        return pos;
+    }
+
+    return 0 - 1;
+}
+
+// Parse `src` of length `len` into a new JsonDoc. Returns 0 on
+// failure (prints a stderr diagnostic explaining what went wrong
+// so game code gets the same "why" that stbsound/stbimage offer).
+json_parse(src, len) : io {
+    auto doc: JsonDoc, root_idx, end_pos;
+    _json_init();
+
+    doc = malloc(sizeof(JsonDoc));
+    doc.types        = 0;
+    doc.payload      = 0;
+    doc.child_count  = 0;
+    doc.strings      = 0;
+    doc.key_offsets  = 0;
+    doc.node_count   = 0;
+    doc.node_cap     = 0;
+    doc.strings_len  = 0;
+    doc.strings_cap  = 0;
+
+    root_idx = 0 - 1;
+    end_pos = _json_parse_value(doc, src, 0, len, 0, &root_idx);
+    if (end_pos < 0 || root_idx < 0) {
+        print_err_msg("bpp_json: parse failed"); print_err_ln();
+        json_free(doc);
+        return 0;
+    }
+    return doc;
+}
+
+// Release all memory owned by a JsonDoc — the flat node arrays,
+// the string pool, AND each container's child-index list.
+void json_free(doc) {
+    auto d: JsonDoc;
+    auto i, ty, kids;
+    if (doc == 0) { return; }
+    d = doc;
+    if (d.types != 0 && d.payload != 0) {
+        for (i = 0; i < d.node_count; i = i + 1) {
+            ty = peek(d.types + i);
+            if (ty == JSON_ARRAY || ty == JSON_OBJECT) {
+                kids = *(d.payload + i * 8);
+                if (kids != 0) { free(kids); }
+            }
+        }
+    }
+    if (d.types       != 0) { free(d.types); }
+    if (d.payload     != 0) { free(d.payload); }
+    if (d.child_count != 0) { free(d.child_count); }
+    if (d.strings     != 0) { free(d.strings); }
+    if (d.key_offsets != 0) { free(d.key_offsets); }
+    free(doc);
+}
+
+// Root node index — always 0 in the current implementation
+// because _json_parse_value is called first.
+json_root(doc) : base {
+    return 0;
+}
+
+// ── Reader accessors ───────────────────────────────────────
+
+json_type(doc, idx) : base {
+    auto d: JsonDoc;
+    d = doc;
+    return peek(d.types + idx);
+}
+
+json_int(doc, idx) : base {
+    auto d: JsonDoc;
+    d = doc;
+    return *(d.payload + idx * 8);
+}
+
+json_bool(doc, idx) : base {
+    auto d: JsonDoc;
+    d = doc;
+    return *(d.payload + idx * 8);
+}
+
+// Return the string payload of a STRING node as a pointer into
+// the doc's string pool. Null-terminated (intern appends a 0).
+// Valid until json_free(doc).
+json_string(doc, idx) : base {
+    auto d: JsonDoc, off;
+    d = doc;
+    off = *(d.payload + idx * 8);
+    return d.strings + off;
+}
+
+// Number of children in an ARRAY or OBJECT.
+json_length(doc, idx) : base {
+    auto d: JsonDoc;
+    d = doc;
+    return *(d.child_count + idx * 8);
+}
+
+// i-th child of an ARRAY / OBJECT. The container's payload slot
+// holds a pointer to the malloc'd word array of child node
+// indices, each 8 bytes wide.
+json_child(doc, parent, i) : base {
+    auto d: JsonDoc, kids;
+    d = doc;
+    kids = *(d.payload + parent * 8);
+    return *(kids + i * 8);
+}
+
+// Look up an object member by key. Returns the child node index
+// or -1 if not found. Linear scan — fine for object sizes up to
+// a few hundred; swap in a hash when that becomes the bottleneck.
+json_object_get(doc, obj, key) : base {
+    auto d: JsonDoc, n, kids, i, ch_idx, key_off, j, ok, key_byte;
+    d = doc;
+    n = *(d.child_count + obj * 8);
+    kids = *(d.payload + obj * 8);
+    for (i = 0; i < n; i = i + 1) {
+        ch_idx = *(kids + i * 8);
+        key_off = *(d.key_offsets + ch_idx * 8);
+        ok = 1;
+        j = 0;
+        while (1) {
+            key_byte = peek(key + j);
+            if (key_byte == 0) { break; }
+            if (peek(d.strings + key_off + j) != key_byte) { ok = 0; break; }
+            j = j + 1;
+        }
+        if (ok != 0) {
+            // Stored key must end at j too — "name" and "namespace"
+            // share a prefix; we require the terminator to match.
+            if (peek(d.strings + key_off + j) == 0) { return ch_idx; }
+        }
+    }
+    return 0 - 1;
+}
+
+// Convenience typed lookups with defaults. Each returns the
+// defaulted value when the key is missing OR the actual type
+// doesn't match the requested one.
+json_object_get_int(doc, obj, key, fallback) : base {
+    auto idx;
+    idx = json_object_get(doc, obj, key);
+    if (idx < 0) { return fallback; }
+    if (json_type(doc, idx) != JSON_INT) { return fallback; }
+    return json_int(doc, idx);
+}
+
+json_object_get_string(doc, obj, key) : base {
+    auto idx;
+    idx = json_object_get(doc, obj, key);
+    if (idx < 0) { return 0; }
+    if (json_type(doc, idx) != JSON_STRING) { return 0; }
+    return json_string(doc, idx);
+}
+
+json_object_get_bool(doc, obj, key, fallback) : base {
+    auto idx;
+    idx = json_object_get(doc, obj, key);
+    if (idx < 0) { return fallback; }
+    if (json_type(doc, idx) != JSON_BOOL) { return fallback; }
+    return json_bool(doc, idx);
+}
+
+// ── Writer ──────────────────────────────────────────────────
+//
+// The writer is state-light: every helper takes and returns an
+// sb_* string builder, appending the next token. Callers maintain
+// a comma-between-items discipline by alternating begin/end pairs
+// and using the *_field helpers inside objects. A lightweight
+// depth tracker lives at module scope — not thread-safe, but
+// fine because writers run serially on the main thread anyway.
+
+static extrn _json_depth;
+static extrn _json_needs_comma;
+
+// Track whether the current level has emitted a first child yet,
+// so later ones get a comma prefix. Stack-shaped as a bitmap:
+// bit at position `depth` is 1 when a prior child has landed.
+// Depth 64 is more than enough for any realistic document —
+// ModuLab nests at most 4 deep (root object / data / rows /
+// numbers).
+static extrn _json_stack_emitted;
+
+// Begin writing a fresh document. Resets internal state.
+json_writer_begin(sb) {
+    _json_init();
+    _json_depth = 0;
+    _json_stack_emitted = 0;
+    return sb;
+}
+
+// Internal — prepends ", " when not the first child at this depth.
+static _json_sep(sb) {
+    auto mask;
+    mask = 1 << _json_depth;
+    if ((_json_stack_emitted & mask) != 0) {
+        sb = sb_cat(sb, ",");
+    } else {
+        _json_stack_emitted = _json_stack_emitted | mask;
+    }
+    return sb;
+}
+
+// Clear the "emitted" bit at the current depth so the next nested
+// level starts fresh.
+static void _json_level_reset() {
+    auto mask;
+    mask = 1 << _json_depth;
+    _json_stack_emitted = _json_stack_emitted & (0 - 1 - mask);
+}
+
+// Escape a string into sb. Handles \", \\, \n, \t, \r, \b, \f
+// and control characters via \uXXXX.
+static _json_emit_escaped(sb, s) {
+    auto i, ch, hex, nibble;
+    sb = sb_cat(sb, "\"");
+    i = 0;
+    while (1) {
+        ch = peek(s + i);
+        if (ch == 0) { break; }
+        if (ch == '"')       { sb = sb_cat(sb, "\\\""); }
+        else if (ch == '\\') { sb = sb_cat(sb, "\\\\"); }
+        else if (ch == 10)   { sb = sb_cat(sb, "\\n"); }
+        else if (ch == 9)    { sb = sb_cat(sb, "\\t"); }
+        else if (ch == 13)   { sb = sb_cat(sb, "\\r"); }
+        else if (ch == 8)    { sb = sb_cat(sb, "\\b"); }
+        else if (ch == 12)   { sb = sb_cat(sb, "\\f"); }
+        else if (ch < 0x20) {
+            sb = sb_cat(sb, "\\u00");
+            nibble = (ch >> 4) & 0xF;
+            if (nibble < 10) { sb = sb_ch(sb, '0' + nibble); }
+            else             { sb = sb_ch(sb, 'a' + nibble - 10); }
+            nibble = ch & 0xF;
+            if (nibble < 10) { sb = sb_ch(sb, '0' + nibble); }
+            else             { sb = sb_ch(sb, 'a' + nibble - 10); }
+        }
+        else { sb = sb_ch(sb, ch); }
+        i = i + 1;
+    }
+    sb = sb_cat(sb, "\"");
+    return sb;
+}
+
+// ── Container writers ───────────────────────────────────────
+
+json_write_object_begin(sb) {
+    sb = _json_sep(sb);
+    sb = sb_cat(sb, "{");
+    _json_depth = _json_depth + 1;
+    _json_level_reset();
+    return sb;
+}
+
+json_write_object_end(sb) {
+    _json_depth = _json_depth - 1;
+    sb = sb_cat(sb, "}");
+    return sb;
+}
+
+json_write_array_begin(sb) {
+    sb = _json_sep(sb);
+    sb = sb_cat(sb, "[");
+    _json_depth = _json_depth + 1;
+    _json_level_reset();
+    return sb;
+}
+
+json_write_array_end(sb) {
+    _json_depth = _json_depth - 1;
+    sb = sb_cat(sb, "]");
+    return sb;
+}
+
+// ── Scalar writers (for use inside arrays) ─────────────────
+
+json_write_string(sb, s) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, s);
+    return sb;
+}
+
+json_write_int(sb, n) {
+    sb = _json_sep(sb);
+    sb = sb_int(sb, n);
+    return sb;
+}
+
+json_write_bool(sb, v) {
+    sb = _json_sep(sb);
+    if (v != 0) { sb = sb_cat(sb, "true"); }
+    else        { sb = sb_cat(sb, "false"); }
+    return sb;
+}
+
+json_write_null(sb) {
+    sb = _json_sep(sb);
+    sb = sb_cat(sb, "null");
+    return sb;
+}
+
+// ── Field writers (object members) ──────────────────────────
+//
+// These combine key + value. The leading comma-or-nothing is
+// handled by _json_sep; the key/value pair is always emitted
+// together so the writer never leaves a document in a
+// mid-field state.
+
+json_write_string_field(sb, key, value) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":");
+    sb = _json_emit_escaped(sb, value);
+    return sb;
+}
+
+json_write_int_field(sb, key, value) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":");
+    sb = sb_int(sb, value);
+    return sb;
+}
+
+json_write_bool_field(sb, key, value) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":");
+    if (value != 0) { sb = sb_cat(sb, "true"); }
+    else            { sb = sb_cat(sb, "false"); }
+    return sb;
+}
+
+json_write_null_field(sb, key) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":null");
+    return sb;
+}
+
+// Open a nested object / array as an object member. Pairs with
+// json_write_object_end / json_write_array_end.
+json_write_object_field_begin(sb, key) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":{");
+    _json_depth = _json_depth + 1;
+    _json_level_reset();
+    return sb;
+}
+
+json_write_array_field_begin(sb, key) {
+    sb = _json_sep(sb);
+    sb = _json_emit_escaped(sb, key);
+    sb = sb_cat(sb, ":[");
+    _json_depth = _json_depth + 1;
+    _json_level_reset();
+    return sb;
+}

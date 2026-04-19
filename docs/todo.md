@@ -1,57 +1,15 @@
 # B++ Roadmap
 
-## Status — 2026-04-18
+## Status — 2026-04-15
 
-**Version 0.75.** Self-hosting, dual-backend (ARM64 native macOS +
-x86_64 cross-compile Linux), C emitter in parity. **Mini Cooper
-shipped** (A + B0 + B1 + B2 + B3 + C + B4). 128-bit SIMD (`: double`
-+ eleven `vec_*` builtins) in B4. **Audio stack in production**:
-CoreAudio FFI, SPSC ring, polyphonic mixer with sample voices +
-music streaming + 3 volume buses, WAV loader with PCM 8/16/24/32
-+ IEEE float + mono/stereo support. **Handle-based asset manager
-(stbasset)**, **scene manager (stbscene)**, **`bpp_path` argv[0]-
-relative asset resolution** (auto-injected). **Rhythm Teacher
-prototype ships** (`games/rhythm/`). **Snake plays music recorded
-in mini_synth** — the dog-food loop is closed. Suite: **75 passed
-/ 0 failed / 11 skipped**.
+Version 0.23.x. Self-hosting, dual-backend (ARM64 native macOS + x86_64
+cross-compile Linux), C emitter in parity. **Mini Cooper shipped** (all
+seven phases: A + B0 + B1 + B2 + B3 + C + B4). 128-bit SIMD (`: double`
++ eleven `vec_*` builtins) landed in B4. Suite at **65 passed / 0 failed
+/ 11 skipped**.
 
 For the story of how we got here, see `docs/journal.md`. This file is
 forward-looking only.
-
-## ⚠️ Open decision — next sprint
-
-The infra week delivered more than the original plan budgeted for.
-Two paths diverge at this branch point; the user decides.
-
-**(A) ModuLab port (deep dog-food)**
-Port the existing JS pixel art editor (4 files, 1415 lines) to
-`tools/modulab/`. Output format is already the palette-indexed
-JSON that `stbsprite` reads — zero impedance mismatch. Blocked on
-a small amount of tool infra (`bpp_json` writer, stbui text_input
-+ grid + color_picker widgets, optionally stbwindow file dialogs
-via NSSavePanel). Estimated 4-5 days. Delivers a complete
-native pixel art tool in the B++ ecosystem. Dog-food philosophy
-deepens: **B++ compiles itself, plays its own music, paints its
-own sprites.**
-
-**(B) Wolf3D Phase 1 (genre expansion)**
-Jump straight to a first-person CPU raycaster + WL1 shareware
-loader. The last major retro genre the fleet still doesn't have.
-Assets come from the shareware files, not ModuLab. Estimated 2-3
-weeks for the vertical slice. Proves B++ runs real per-pixel
-rendering workloads at 60 fps on Apple Silicon. Philosophy: the
-breadth of genre coverage is the ultimate readiness test for
-B++ 1.0.
-
-Both are legitimate. (A) is a 4-5 day sprint ending in a visible
-tool; (B) is a 2-3 week sprint ending in a playable FPS slice. (A)
-lets (B) benefit from better tooling when it does come. (B)
-answers "can B++ ship a real game?" sooner.
-
-Default lean (if the user doesn't pick): **(A) first, (B) after**,
-because ModuLab unlocks art pipeline for every future game
-including Wolf3D-style ones. But (B) directly is also a good
-answer.
 
 **Vision.** B++ makes everything that makes a game — the art, the sound,
 AND the game itself. Version 1.0 ships when the Adventure Puzzle demo
@@ -302,14 +260,6 @@ Linux x86_64, `bpp game.bpp` produces a Linux ELF with no flag.
 `install.sh` mirrors it. Cross-compilation stays available via
 `--target`. Transforms B++ from "macOS tool that cross-compiles" into
 "native tool that adapts to the host."
-
-### Maestro Phase 1.5 — slice sweep on stb hot structs
-
-Per `docs/maestro_plan.md`. Apply slice types (`: byte`, `: quarter`,
-`: half`) to bookkeeping fields of stb hot structs (Body in stbphys,
-World in stbecs, Hash/HashStr in bpp_hash). Cache hygiene + canonical
-worked examples. Revisit after smart dispatch is proven with real game
-workloads.
 
 ### Refinements (each under 50 lines, land while touching the file)
 

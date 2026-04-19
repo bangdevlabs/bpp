@@ -3655,3 +3655,106 @@ paths diverge:
 Both are valid closes-of-the-week. ModuLab is deeper
 dog-fooding; Wolf3D is broader genre coverage. User to
 decide.
+
+## 2026-04-19 — ModuLab sprint starts: the tool infra bundle
+
+User picked ModuLab. Before touching the port itself, today built
+the four pieces of infra every pixel-editor-shaped tool needs.
+The port proper starts tomorrow with every dependency already
+shipping.
+
+**Window centering fix.** Games were spawning bottom-left because
+`_stb_init_window` left the initial origin at `(100, 100)` in
+Cocoa coordinates (origin = bottom-left corner). Added
+`-[NSWindow center]` before `makeKeyAndOrderFront`. All games
+now open centered on the active screen — snake, rhythm,
+platformer, pathfind, synth.
+
+**stbwindow.bsm (new).** Public API for native dialogs:
+`window_save_dialog`, `window_open_dialog`, `window_alert`,
+`window_confirm`, `window_error`. Backed by objc_msgSend wrappers
+in the platform layer hitting NSSavePanel / NSOpenPanel / NSAlert.
+All `-[runModal]` calls block the main thread until dismissed —
+the expected UX for save flows. Dialog returns malloc'd paths the
+caller frees; alerts return void except `confirm` which returns
+1/0 for OK/Cancel. `_gpu_nsstr` dropped its `static` guard so the
+platform-side dialog functions can reuse the same NSString builder
+the GPU code uses.
+
+**stbinput text-input stream.** Added `_stb_text_buf` (64-byte
+ring), `_stb_text_len`, cleared at the top of every frame by
+`_input_save_prev`. Platform's NSEvKeyDown handler grabs
+`-[NSEvent characters]` and feeds printable ASCII (0x20..0x7E)
+into the ring via `_input_push_char`. Public API: `input_text_len()`
++ `input_text_char(i)` for widgets to iterate. Control keys
+(arrows, ESC, backspace, etc.) stay in the key_pressed lane so
+text widgets can still handle editing commands explicitly.
+
+**bpp_json.bsm (new, ~800 lines).** Full reader + writer, no
+external dependencies. Reader uses a flat node table plus a
+string pool plus per-container child-index lists; writer uses
+an sb_* string builder with depth-tracked comma emission. Types
+supported: objects, arrays, strings with full escape set
+(including `\uXXXX` transcoded to UTF-8), ints, bools, null,
+floats (integer portion preserved; fractional + exponent
+consumed but discarded in MVP).
+
+Two bugs caught during test bring-up:
+
+- **Null-terminator overwrite.** `_json_intern` committed
+  `strings_len = off + len` (no terminator). Next intern
+  overwrote the terminator → `json_object_get("name")` failed
+  because the comparison loop read `'s'` from "snake" where
+  `'\0'` was expected. Fix: `strings_len = off + len + 1`.
+
+- **Non-contiguous children.** Parser assumed a container's
+  children were stored at `first_child + i` in the node table.
+  Recursive descent interleaves nested-container descendants
+  between siblings of the outer container, so that assumption
+  broke once the test had a nested array. Fix: each container
+  node allocates its own word array of child-node indices;
+  `json_child` dereferences that list. `json_free` walks the
+  node table and frees every container's child list.
+
+The test exercises object with string / int / bool / null /
+array of strings / array of arrays of ints — every round-trip
+survives. Typed convenience getters (`_int`, `_string`, `_bool`
+with defaults) work. 77th passing test.
+
+**stbui widgets.** Three new widgets for the tool-shaped apps:
+
+- `gui_text_input(ti, x, y, w, h)` — editable text field with
+  click-to-focus, backspace, Enter-commit. Caller owns a
+  `TextInput` struct + backing buffer via `text_input_new`;
+  `text_input_set` / `text_input_clear` for programmatic edits.
+  Draws a focused border when active, caret after the last
+  character, consumes chars from stbinput's per-frame stream.
+- `gui_grid(x, y, cols, rows, cell_size, border)` — empty-cell
+  grid with hover highlight, returns the clicked cell index
+  (0..cols×rows-1) or -1 for no click. Foundation for the
+  tilemap editor and ModuLab's pixel canvas.
+- `gui_palette(x, y, colors, n, per_row, cell_size, selected)` —
+  swatch array with a selected-border accent. Direct use in
+  ModuLab's palette row + any theme picker.
+
+78th passing test.
+
+**Rebuild-scope rule documented.** User flagged the waste of
+running full bootstrap + suite after every touch. Added a table
+to `docs/how_to_dev_b++.md` mapping what-you-changed →
+minimum verification. Game/tool edits compile that one artifact;
+stb/ needs the full suite; src/ compiler needs bootstrap + suite;
+docs need nothing. Kills a big source of unnecessary rebuild
+cycles in a typical session.
+
+**Counts.** 25 bpp_* runtime + compiler core in src/, 21 stb
+modules (stbwindow added), 78 passing tests / 11 skipped, zero
+failures. Version bumped 0.75 → 0.78.
+
+**Tomorrow.** ModuLab port proper. Start with
+`tools/modulab/core.bsm` (universes, paletas, state struct) and
+`canvas.bsm` (brush, eraser, fill, line, rect, oval, select,
+undo/redo snapshots). Day 2: I/O (export JSON, spritesheet PNG
+grid, import JSON). Day 3: UI wiring (palette row, frame list,
+tools sidebar) + integration test (paint a sprite in ModuLab,
+reload in a game).
