@@ -15,6 +15,23 @@
 import "_stb_core.bsm";
 import "bpp_buf.bsm";
 import "bpp_str.bsm";
+// _stb_fb / _stb_w / _stb_h are declared extrn in stbdraw — the
+// platform layer reads/writes the framebuffer via those symbols,
+// so declaring the dep here makes the module linkable standalone.
+import "stbdraw.bsm";
+// _stb_font lives in stbfont — the Metal glyph-atlas builder below
+// unpacks the 8x8 bitmap into a texture, so declaring the dep
+// makes that path linkable without relying on downstream imports.
+// _input_push_char lives in stbinput — the key-event handler below
+// forwards characters into that ring so gui_text_input and friends
+// can consume them.
+import "stbinput.bsm";
+
+// Frame-timing globals own their slots here since this is where
+// _stb_get_time() is implemented. stbgame references them via
+// extrn — this keeps the platform module linkable standalone.
+extrn _stb_frame_ms;
+auto _stb_last_time;
 
 import "objc" {
     ptr objc_getClass(char*);
@@ -67,6 +84,10 @@ static extrn _plt_app, _plt_win, _plt_imgview, _plt_cs;
 static extrn _plt_cg_ctx, _plt_cg_img, _plt_cg_ctx_rel, _plt_cg_img_rel;
 static extrn _plt_cf_mode;
 static auto _plt_quit_flag;
+// Window-to-logical scale factor picked at init time (1, 2, or 3).
+// Mouse polling divides locationInWindow by this to map screen
+// points back to the framebuffer's coordinate space.
+static auto _plt_scale;
 // Timing globals (_plt_time_base/numer/denom) are owned by _stb_core_macos.bsm
 // and lazy-initialized on first _stb_get_time call. This file no longer
 // declares them, since duplicate global declarations would either conflict
@@ -159,6 +180,9 @@ static _plt_map_vkey(vk) {
 // Open a native macOS window with a framebuffer view.
 void _stb_init_window(w: word, h: word, title) : io {
     auto pool, view, cg, cf;
+    auto fn_main_disp, fn_disp_wide, fn_disp_high;
+    auto disp_id, scr_w, scr_h, max_w, max_h, scale;
+    auto win_w, win_h;
 
     // Load frameworks.
     dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", 1);
@@ -185,21 +209,47 @@ void _stb_init_window(w: word, h: word, title) : io {
     _plt_app = objc_msgSend(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
     objc_msgSend(_plt_app, sel_registerName("setActivationPolicy:"), 0);
 
-    // Window at 3x logical size for pixel-perfect scaling.
-    // The initial origin (100, 100) is a placeholder — `center`
-    // below picks the actual position on the main screen. In Cocoa
-    // coordinates (origin = bottom-left), (100, 100) would put the
-    // window near the bottom-left corner, which is the "always
+    // Pick the largest integer scale in {1,2,3} that keeps the
+    // window within the main screen. Historically the platform
+    // multiplied blindly by 3x for retro-style pixel-perfect
+    // games; that over-sizes windows for tools that already ask
+    // for realistic dimensions (800x600 → 2400x1800 doesn't fit
+    // most MacBook screens and the top gets clipped behind the
+    // menu bar). CGDisplayPixelsWide/High on a scaled retina
+    // display returns logical points, so we compare apples to
+    // apples against the requested w/h. Reserve 80pt vertical
+    // for menu bar + title bar and 40pt horizontal for margins.
+    fn_main_disp = dlsym(cg, "CGMainDisplayID");
+    fn_disp_wide = dlsym(cg, "CGDisplayPixelsWide");
+    fn_disp_high = dlsym(cg, "CGDisplayPixelsHigh");
+    disp_id = call(fn_main_disp);
+    scr_w = call(fn_disp_wide, disp_id);
+    scr_h = call(fn_disp_high, disp_id);
+    max_w = scr_w - 40;
+    max_h = scr_h - 80;
+    scale = 3;
+    while (scale > 1 && (w * scale > max_w || h * scale > max_h)) {
+        scale = scale - 1;
+    }
+    win_w = w * scale;
+    win_h = h * scale;
+    _plt_scale = scale;
+
+    // Window at the chosen scale. The initial origin (100, 100)
+    // is a placeholder — `center` below picks the actual
+    // position on the main screen. In Cocoa coordinates
+    // (origin = bottom-left), (100, 100) would put the window
+    // near the bottom-left corner, which is the "always
     // spawning in the corner" bug games saw before this fix.
     _plt_win = objc_msgSend(objc_getClass("NSWindow"), sel_registerName("alloc"));
     _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
-        100.0, 100.0, w * 3.0, h * 3.0, 15, 2, 0);
+        100.0, 100.0, win_w * 1.0, win_h * 1.0, 15, 2, 0);
 
     // NSImageView fills the window for framebuffer display.
     view = objc_msgSend(_plt_win, sel_registerName("contentView"));
     _plt_imgview = objc_msgSend(objc_getClass("NSImageView"), sel_registerName("alloc"));
     _plt_imgview = objc_msgSend(_plt_imgview, sel_registerName("initWithFrame:"),
-        0.0, 0.0, w * 3.0, h * 3.0);
+        0.0, 0.0, win_w * 1.0, win_h * 1.0);
     objc_msgSend(_plt_imgview, sel_registerName("setImageScaling:"), 3);
     objc_msgSend(view, sel_registerName("addSubview:"), _plt_imgview);
 
@@ -293,17 +343,20 @@ void _stb_poll_events() : io {
 
         // Mouse position: [ev locationInWindow] returns NSPoint (d0=x, d1=y).
         // float_ret() / float_ret2() read the saved d0/d1 from the last extern call.
-        // Window is 3x scaled: divide by 3. Cocoa Y is flipped: subtract from height.
+        // Window is scaled by _plt_scale (chosen at init to fit the screen):
+        // divide locationInWindow by that factor. Cocoa Y is flipped:
+        // subtract from framebuffer height.
         if (etype == NSEvMouseMoved || etype == NSEvLeftDrag || etype == NSEvRightDrag) {
-            auto lx: float, ly: float, ix: word, iy: word;
+            auto lx: float, ly: float, ix: word, iy: word, inv: float;
             objc_msgSend(ev, sel_registerName("locationInWindow"));
             lx = float_ret();
             ly = float_ret2();
             // Convert to integer via : word locals. The forced type hint makes
             // the codegen emit fcvtzs (float→int) and prevents the float type
             // from poisoning the integer globals _stb_mouse_x / _stb_mouse_y.
-            ix = lx / 3.0;
-            iy = _stb_h - ly / 3.0;
+            inv = 1.0 / (_plt_scale * 1.0);
+            ix = lx * inv;
+            iy = _stb_h - ly * inv;
             _stb_mouse_x = ix;
             _stb_mouse_y = iy;
             if (_stb_mouse_x < 0) { _stb_mouse_x = 0; }
@@ -395,16 +448,36 @@ static _gpu_build_shader() {
     s = sb_cat(s, "  o.uv = float2(float(ru)/65535.0, float(rv)/65535.0);\n");
     s = sb_cat(s, "  o.use_tex = float(vd[b+12])/255.0;\n");
     s = sb_cat(s, "  return o; }\n");
+    // Two samplers: `smp` (linear) for RGBA sprites and font
+    // glyphs where filtering is fine; `smp_n` (nearest) for
+    // palette-indexed sprites where filtering would corrupt
+    // indices and for palette lookup where the texture is a
+    // 1-row LUT (exact pixel centers, never blended).
     s = sb_cat(s, "constexpr sampler smp(filter::linear);\n");
+    s = sb_cat(s, "constexpr sampler smp_n(filter::nearest);\n");
     s = sb_cat(s, "fragment float4 frag(V in [[stage_in]],\n");
-    s = sb_cat(s, "  texture2d<float> tex [[texture(0)]]) {\n");
-    s = sb_cat(s, "  if (in.use_tex > 0.75) {\n");
+    s = sb_cat(s, "  texture2d<float> tex [[texture(0)]],\n");
+    s = sb_cat(s, "  texture2d<float> pal [[texture(1)]]) {\n");
+    // Marker 255 = font glyph (R channel = alpha, color from vertex).
+    s = sb_cat(s, "  if (in.use_tex > 0.90) {\n");
     s = sb_cat(s, "    float a = tex.sample(smp, in.uv).r;\n");
     s = sb_cat(s, "    return float4(in.color.rgb, in.color.a * a); }\n");
+    // Marker 192 = palette-indexed sprite. Sprite texture is R8
+    // storing the raw palette index [0..255]; palette texture is
+    // a 1x256 BGRA row. Index 0 is transparent by convention.
+    s = sb_cat(s, "  if (in.use_tex > 0.65) {\n");
+    s = sb_cat(s, "    float raw = tex.sample(smp_n, in.uv).r;\n");
+    s = sb_cat(s, "    float idx = raw * 255.0;\n");
+    s = sb_cat(s, "    if (idx < 0.5) discard_fragment();\n");
+    s = sb_cat(s, "    float pu = (idx + 0.5) / 256.0;\n");
+    s = sb_cat(s, "    float4 c = pal.sample(smp_n, float2(pu, 0.5));\n");
+    s = sb_cat(s, "    return float4(c.rgb, c.a * in.color.a); }\n");
+    // Marker 128 = RGBA sprite (legacy path, palette expanded at create).
     s = sb_cat(s, "  if (in.use_tex > 0.25) {\n");
     s = sb_cat(s, "    float4 t = tex.sample(smp, in.uv);\n");
     s = sb_cat(s, "    if (t.a < 0.01) discard_fragment();\n");
     s = sb_cat(s, "    return float4(t.rgb, t.a * in.color.a); }\n");
+    // Marker 0 = solid fill (color from vertex only).
     s = sb_cat(s, "  return in.color; }\n");
     return s;
 }
@@ -879,6 +952,142 @@ _stb_gpu_create_texture(data, w, h) : gpu {
          region, 0, data, w * 4);
     // Do not free region — Metal may read the MTLRegion struct asynchronously.
     return tex;
+}
+
+// Create an R8 (single-byte-per-pixel) texture from palette-index
+// data. Used by the palette-indexed sprite path: the bytes are
+// raw palette indices (0..255), looked up in a separate palette
+// texture inside the fragment shader. One byte per pixel keeps
+// the sprite texture small even at big canvas sizes.
+_stb_gpu_create_texture_r8(data, w, h) : gpu {
+    auto texdesc, tex, region;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    // MTLPixelFormatR8Unorm = 10.
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 10);
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
+    tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, w);
+    write_u64(region, 32, h);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, data, w);
+    return tex;
+}
+
+// Create a 1x256 palette look-up texture. `argb_data` is the
+// word-stride palette buffer (count * 8 bytes, each slot holds
+// one ARGB word). Only the first `count` slots contribute; the
+// rest of the 256-pixel row is padded with zeros so out-of-range
+// indices sample transparent. Upload format is BGRA8Unorm, which
+// matches the little-endian memory layout of our ARGB words —
+// no byte-swap needed.
+_stb_gpu_create_palette_texture(argb_data, count) : gpu {
+    auto texdesc, tex, region;
+    auto scratch, i, c;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    // MTLPixelFormatBGRA8Unorm = 80.
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 80);
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), 256);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), 1);
+    tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+
+    // Densify the word-stride palette into tight 4-byte BGRA
+    // pixels. 256 slots so out-of-range indices are guaranteed
+    // safe (transparent) instead of reading garbage.
+    scratch = malloc(256 * 4);
+    for (i = 0; i < 256 * 4; i = i + 1) { poke(scratch + i, 0); }
+    for (i = 0; i < count && i < 256; i = i + 1) {
+        c = *(argb_data + i * 8);
+        poke(scratch + i * 4 + 0,  c        & 0xFF);
+        poke(scratch + i * 4 + 1, (c >> 8)  & 0xFF);
+        poke(scratch + i * 4 + 2, (c >> 16) & 0xFF);
+        poke(scratch + i * 4 + 3, (c >> 24) & 0xFF);
+    }
+
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, 256);
+    write_u64(region, 32, 1);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, scratch, 256 * 4);
+    // Do not free scratch — Metal reads asynchronously on unified
+    // memory systems. The buffer survives the frame.
+    return tex;
+}
+
+// Re-upload an existing palette texture's contents in place.
+// Called every time a palette cycle / lerp / LUT updates the
+// CPU-side palette.data. 256 pixels * 4 bytes = 1 KB per call —
+// negligible even at 60 FPS with multiple palettes.
+void _stb_gpu_update_palette_texture(tex, argb_data, count) : gpu {
+    auto scratch, i, c, region;
+    scratch = malloc(256 * 4);
+    for (i = 0; i < 256 * 4; i = i + 1) { poke(scratch + i, 0); }
+    for (i = 0; i < count && i < 256; i = i + 1) {
+        c = *(argb_data + i * 8);
+        poke(scratch + i * 4 + 0,  c        & 0xFF);
+        poke(scratch + i * 4 + 1, (c >> 8)  & 0xFF);
+        poke(scratch + i * 4 + 2, (c >> 16) & 0xFF);
+        poke(scratch + i * 4 + 3, (c >> 24) & 0xFF);
+    }
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, 256);
+    write_u64(region, 32, 1);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, scratch, 256 * 4);
+    // scratch + region retained for the frame per Metal async
+    // copy semantics; reclaimed by the autorelease pool.
+}
+
+// Bind the palette texture to fragment slot 1 so the indexed
+// branch in the Metal shader can look up colors from it. Flushes
+// the current vertex batch first — palette binding is a state
+// change that applies to subsequent vertices only.
+void _stb_gpu_bind_palette(tex) : gpu {
+    _stb_gpu_flush();
+    call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
+         tex, 1);
+}
+
+// Draw a palette-indexed sprite. The sprite texture (R8) + the
+// bound palette texture get resolved per-pixel in the fragment
+// shader via the `use_tex == 192` branch. Index 0 in the sprite
+// is transparent by convention. w,h = on-screen size; tw,th =
+// source texture dimensions (unused — UV is always 0..65535).
+void _stb_gpu_sprite_indexed(sprite_tex, pal_tex, x, y, w, h, tw, th) : gpu {
+    auto x1, y1;
+    _stb_gpu_bind_texture(sprite_tex);
+    _stb_gpu_bind_palette(pal_tex);
+    x1 = x + w; y1 = y + h;
+    // Marker 192 lands in the [0.65, 0.90] band that the shader
+    // routes to the indexed branch.
+    _stb_gpu_vertex(x,  y,  255, 255, 255, 255, 0,     0,     192);
+    _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     192);
+    _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 192);
+    _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     192);
+    _stb_gpu_vertex(x1, y1, 255, 255, 255, 255, 65535, 65535, 192);
+    _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 192);
+    _stb_gpu_bind_font();
 }
 
 // Flush the current vertex batch mid-frame (for texture switches).

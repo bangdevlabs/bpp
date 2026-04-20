@@ -2,16 +2,47 @@
 // All drawing operates on a software framebuffer in memory (_stb_fb).
 // No external dependencies — pure B++. The codegen handles presenting
 // the framebuffer to the screen via _stb_present().
+//
+// Absorbed modules (2026-04-19 consolidation):
+//   - stbcolor: rgba() packing + standard palette constants.
 
 import "bpp_buf.bsm";
 import "bpp_math.bsm";
-import "stbcolor.bsm";
 
 // Framebuffer state (set by stbgame during init).
 extrn _stb_fb, _stb_w, _stb_h;
 
+// ── Color palette (absorbed from stbcolor) ───────────────────
+// Colors are packed as 32-bit ARGB values:
+//   bits 24-31: alpha
+//   bits 16-23: red
+//   bits  8-15: green
+//   bits  0-7:  blue
+extrn BLACK, WHITE, RED, GREEN, BLUE, YELLOW, ORANGE, PURPLE, GRAY, DARKGRAY;
+
+// Pack RGBA components (0-255 each) into a 32-bit ARGB color value.
+rgba(r, g, b, a) : base {
+    return b + g * 256 + r * 65536 + a * 16777216;
+}
+
+// Initialize the standard color palette. Called by init_draw.
+void init_color() {
+    BLACK    = rgba(0, 0, 0, 255);
+    WHITE    = rgba(255, 255, 255, 255);
+    RED      = rgba(230, 41, 55, 255);
+    GREEN    = rgba(0, 228, 48, 255);
+    BLUE     = rgba(0, 121, 241, 255);
+    YELLOW   = rgba(253, 249, 0, 255);
+    ORANGE   = rgba(255, 161, 0, 255);
+    PURPLE   = rgba(200, 122, 255, 255);
+    GRAY     = rgba(130, 130, 130, 255);
+    DARKGRAY = rgba(80, 80, 80, 255);
+}
+
 // Initialize the CPU drawing subsystem.
 void init_draw() {
+    init_color();
+    init_layer_blends();
 }
 
 // ── Pixel operations ─────────────────────────────────────
@@ -283,13 +314,46 @@ void draw_shadow_rounded(x, y, w, h, r, intensity) {
 }
 
 // ── Text rendering ───────────────────────────────────────
+//
+// `sz` is the target text PIXEL HEIGHT — NOT a multiplier. This
+// was changed from the pre-TTF era where sz was an integer scale
+// over an 8×8 bitmap cell (sz=2 meant 16 px). If you see a call
+// site passing small integers (sz=1/2/3) the TRANSITIONAL warning
+// below fires once per process to flag it for migration.
+//
+// Path selection:
+//   _ttf_loaded == 0  — bitmap fallback. sz gets clamped to >= 8
+//                       and rounded down to the nearest multiple
+//                       of 8 as a bitmap multiplier (so sz=14
+//                       renders at 8 px; sz=16 renders at 16 px;
+//                       sz=24 renders at 24 px). Values < 8 are
+//                       clamped to 8 px so old `sz=1` callers
+//                       keep their visual.
+//   _ttf_loaded == 1  — TTF atlas path. Glyphs scale from the
+//                       cached atlas size (_ttf_pixel_height) to
+//                       `sz` via nearest-neighbour sampling.
 
-// Draw a string using the 8x8 bitmap font.
-// Requires _stb_font from stbfont.bsm.
+// One-shot stderr warning for callers that still pass legacy
+// sub-pixel-height sz values. Turns off after the first trigger
+// so console doesn't spam. Marked TRANSITIONAL — remove once the
+// tree is clean.
+static extrn _sz_warned_small;
 
-void draw_text(text, x, y, sz, color) {
-    auto i, ch, glyph, row, px, py;
+static void _warn_small_sz(sz) {
+    if (_sz_warned_small != 0) { return; }
+    if (sz >= 8) { return; }
+    _sz_warned_small = 1;
+    print_err_msg("draw_text: sz<8 detected — sz is now pixel height (min 8), not a multiplier. Update call site.");
+    print_err_ln();
+}
+
+static void _draw_text_bitmap(text, x, y, sz, color) {
+    auto i, ch, glyph, row, px, py, mult, px_h;
     if (_stb_font == 0) { return; }
+    // Clamp + round down to nearest multiple of 8 so the bitmap
+    // scale stays an integer.
+    px_h = sz < 8 ? 8 : sz;
+    mult = px_h / 8;
     i = 0;
     ch = str_peek(text, i);
     while (ch != 0) {
@@ -299,10 +363,11 @@ void draw_text(text, x, y, sz, color) {
                 row = peek(glyph + py);
                 for (px = 0; px < 8; px = px + 1) {
                     if (row & (128 >> px)) {
-                        if (sz == 1) {
+                        if (mult == 1) {
                             put_px(x + i * 8 + px, y + py, color);
                         } else {
-                            draw_rect(x + i * 8 * sz + px * sz, y + py * sz, sz, sz, color);
+                            draw_rect(x + i * 8 * mult + px * mult,
+                                      y + py * mult, mult, mult, color);
                         }
                     }
                 }
@@ -313,13 +378,86 @@ void draw_text(text, x, y, sz, color) {
     }
 }
 
-// Return the pixel width of a string at the given size.
+// TTF glyph blit. Iterates each character, looks up its entry in
+// _ttf_glyph_info, and blits the atlas rectangle into the
+// framebuffer at the scaled size. Simple nearest-neighbour scale
+// with alpha blending against `color`'s alpha channel.
+static void _draw_text_ttf(text, x, y, sz, color) {
+    auto i, ch, idx, gx, gy, gw, gh, xoff, yoff, adv;
+    auto pen_x, py, px, src_off, alpha, scaled_w, scaled_h;
+    auto dy, dx, src_y, src_x;
+    if (_ttf_atlas == 0 || _ttf_pixel_height <= 0) { return; }
+    pen_x = x;
+    i = 0;
+    ch = str_peek(text, i);
+    while (ch != 0) {
+        if (ch >= 32 && ch < 128) {
+            idx = (ch - 32) * 8;
+            gx   = _ttf_glyph_info[idx + 0];
+            gy   = _ttf_glyph_info[idx + 1];
+            gw   = _ttf_glyph_info[idx + 2];
+            gh   = _ttf_glyph_info[idx + 3];
+            xoff = _ttf_glyph_info[idx + 4];
+            yoff = _ttf_glyph_info[idx + 5];
+            adv  = _ttf_glyph_info[idx + 6];
+
+            scaled_w = gw * sz / _ttf_pixel_height;
+            scaled_h = gh * sz / _ttf_pixel_height;
+
+            for (dy = 0; dy < scaled_h; dy = dy + 1) {
+                src_y = dy * gh / scaled_h;
+                if (src_y >= gh) { src_y = gh - 1; }
+                for (dx = 0; dx < scaled_w; dx = dx + 1) {
+                    src_x = dx * gw / scaled_w;
+                    if (src_x >= gw) { src_x = gw - 1; }
+                    src_off = (gy + src_y) * _ttf_atlas_w + (gx + src_x);
+                    alpha = peek(_ttf_atlas + src_off);
+                    if (alpha == 0) { continue; }
+                    if (alpha < 64) {
+                        auto c_blend;
+                        c_blend = (color & 0x00FFFFFF) | (alpha << 24);
+                        blend_px(pen_x + (xoff * sz / _ttf_pixel_height) + dx,
+                                 y + (yoff * sz / _ttf_pixel_height) + dy,
+                                 c_blend);
+                    } else {
+                        put_px(pen_x + (xoff * sz / _ttf_pixel_height) + dx,
+                               y + (yoff * sz / _ttf_pixel_height) + dy,
+                               color);
+                    }
+                }
+            }
+
+            pen_x = pen_x + (adv * sz / _ttf_pixel_height);
+        }
+        i = i + 1;
+        ch = str_peek(text, i);
+    }
+}
+
+void draw_text(text, x, y, sz, color) {
+    _warn_small_sz(sz);
+    if (_ttf_loaded != 0) {
+        _draw_text_ttf(text, x, y, sz, color);
+    } else {
+        _draw_text_bitmap(text, x, y, sz, color);
+    }
+}
+
+// Return the pixel width of a string at the given size. Uses the
+// bitmap rule (8 px per char at the effective multiplier) as an
+// approximation even when TTF is loaded — proportional TTF widths
+// vary per glyph, but the approximation is good enough for UI
+// layout and keeps the function `: base`. A future TTF-aware
+// measure helper can live alongside if proportional precision
+// becomes necessary.
 measure_text(text, sz) : base {
-    auto i, ch;
+    auto i, ch, px_h, mult;
     i = 0;
     ch = str_peek(text, i);
     while (ch != 0) { i = i + 1; ch = str_peek(text, i); }
-    return i * 8 * sz;
+    px_h = sz < 8 ? 8 : sz;
+    mult = px_h / 8;
+    return i * 8 * mult;
 }
 
 // Draw an integer on screen. Converts number to text in a local buffer.
@@ -354,4 +492,1375 @@ void draw_end() {
     _stb_frame_wait();
     _input_save_prev();
     _stb_poll_events();
+}
+
+// ── Sprites (absorbed from stbsprite) ─────────────────────────
+//
+// GPU sprite loading + rendering for palette-indexed sprites of any
+// size. Sprites are loaded from JSON files and uploaded as GPU
+// textures. The GPU paths (_stb_gpu_*) come from the platform
+// layer, resolved via target-suffix.
+//
+// Usage:
+//   auto spr, pal, tex;
+//   spr = malloc(w * h);
+//   pal = malloc(n_colors * 4);
+//   load_sprite("assets/hero.json", spr, w, h);
+//   tex = sprite_create(spr, pal, w, h);
+//   free(spr); free(pal);
+//
+//   // Inside the render loop:
+//   sprite_draw(tex, x, y, w, h, scale);
+
+// Load a palette-indexed sprite from a JSON file into a pre-allocated
+// buffer. Format: { "data": [[row0col0, ...], [row1col0, ...], ...] }
+// Each value is a palette index (0 = transparent). `out` must be at
+// least w * h bytes. Returns 1 on success, 0 on failure.
+load_sprite(path, out, w, h) : io {
+    auto buf, pos, ch;
+    auto y, x, val, i, total;
+
+    total = w * h;
+    i = 0;
+    while (i < total) { poke(out + i, 0); i = i + 1; }
+
+    auto fsize;
+    buf = file_read_all(path, &fsize);
+    if (buf == 0) { return 0; }
+
+    // Scan for the "data" key in the JSON object. The 6 characters
+    // `"data"` are tested with short-circuit && so the chain aborts
+    // on the first mismatch without paying for the remaining peeks.
+    pos = 0;
+    while (pos + 5 < fsize) {
+        if (peek(buf + pos)     == '"'
+         && peek(buf + pos + 1) == 'd'
+         && peek(buf + pos + 2) == 'a'
+         && peek(buf + pos + 3) == 't'
+         && peek(buf + pos + 4) == 'a'
+         && peek(buf + pos + 5) == '"') {
+            pos = pos + 6;
+            break;
+        }
+        pos = pos + 1;
+    }
+
+    // Find the opening bracket of the outer array.
+    while (pos < fsize) {
+        if (peek(buf + pos) == '[') { pos = pos + 1; break; }
+        pos = pos + 1;
+    }
+
+    // Parse h rows, each containing w palette index values.
+    y = 0;
+    while (y < h) {
+        while (pos < fsize) {
+            ch = peek(buf + pos); pos = pos + 1;
+            if (ch == '[') { break; }
+        }
+        x = 0;
+        while (x < w) {
+            while (pos < fsize) {
+                ch = peek(buf + pos);
+                if (ch >= '0' && ch <= '9') { break; }
+                pos = pos + 1;
+            }
+            val = peek(buf + pos) - '0';
+            pos = pos + 1;
+            while (pos < fsize) {
+                ch = peek(buf + pos);
+                if (ch < '0' || ch > '9') { break; }
+                val = val * 10 + (ch - '0');
+                pos = pos + 1;
+            }
+            if (val < 0)   { val = 0;   }
+            if (val > 255) { val = 255; }
+            poke(out + y * w + x, val);
+            x = x + 1;
+        }
+        while (pos < fsize) {
+            ch = peek(buf + pos); pos = pos + 1;
+            if (ch == ']') { break; }
+        }
+        y = y + 1;
+    }
+
+    free(buf);
+    return 1;
+}
+
+// Create a GPU texture from a palette-indexed sprite buffer.
+// spr  = w*h bytes of palette indices (0 = transparent).
+// pal  = array of ARGB u32 color values, one per palette entry.
+// w, h = sprite dimensions in pixels.
+// Returns a texture handle for use with sprite_draw().
+sprite_create(spr, pal, w, h) : gpu {
+    auto rgba, x, y, idx, color, off, tex;
+    rgba = malloc(w * h * 4);
+    for (y = 0; y < h; y = y + 1) {
+        for (x = 0; x < w; x = x + 1) {
+            idx = peek(spr + y * w + x);
+            off = (y * w + x) * 4;
+            if (idx > 0) {
+                color = read_u32(pal, idx * 4);
+                poke(rgba + off,     (color >> 16) & 0xFF);
+                poke(rgba + off + 1, (color >> 8)  & 0xFF);
+                poke(rgba + off + 2,  color         & 0xFF);
+                poke(rgba + off + 3, (color >> 24)  & 0xFF);
+            } else {
+                poke(rgba + off, 0); poke(rgba + off + 1, 0);
+                poke(rgba + off + 2, 0); poke(rgba + off + 3, 0);
+            }
+        }
+    }
+    // Upload to GPU. Do not free rgba — replaceRegion on Apple Silicon
+    // unified memory is async; the buffer must survive until commit.
+    tex = _stb_gpu_create_texture(rgba, w, h);
+    return tex;
+}
+
+// Draw a sprite texture on the GPU at screen position (x, y).
+// tex  = handle returned by sprite_create().
+// w, h = original sprite dimensions in pixels (before scaling).
+// sz   = integer scale factor (1 = 1:1, 2 = double size, etc.).
+void sprite_draw(tex, x, y, w, h, sz) : gpu {
+    _stb_gpu_sprite(tex, x, y, w * sz, h * sz, w, h);
+}
+
+// Draw one frame out of a spritesheet. The sheet is a grid of cells,
+// each frame_w × frame_h pixels, laid out row by row. UVs computed
+// in the 0..65535 fixed-point space the GPU shader expects.
+void sprite_draw_frame(tex, x, y, frame_w, frame_h, sheet_w, sheet_h,
+                        row, col, sz) : gpu {
+    auto u0, v0, u1, v1;
+    u0 = (col * frame_w * 65535) / sheet_w;
+    v0 = (row * frame_h * 65535) / sheet_h;
+    u1 = ((col + 1) * frame_w * 65535) / sheet_w;
+    v1 = ((row + 1) * frame_h * 65535) / sheet_h;
+    _stb_gpu_sprite_uv(tex, x, y, frame_w * sz, frame_h * sz, u0, v0, u1, v1);
+}
+
+// Spritesheet animation helper. Given an elapsed time accumulator at
+// `fps` frames per second, return the current frame index within
+// `frame_count`. `loop` = 1 wraps; `loop` = 0 holds the last frame.
+anim_frame(elapsed_ms, fps, frame_count, loop) : base {
+    auto total_ms, frame;
+    if (frame_count <= 1) { return 0; }
+    total_ms = elapsed_ms * fps / 1000;
+    if (loop != 0) { return total_ms % frame_count; }
+    frame = total_ms;
+    if (frame >= frame_count) { return frame_count - 1; }
+    return frame;
+}
+
+// ── Fonts (absorbed from stbfont) ─────────────────────────────
+//
+// 8x8 bitmap font data (ASCII 32-127, font8x8_basic public domain)
+// plus a pure-B++ TrueType loader for scalable fonts. Used by the
+// CPU `draw_text` path in this file AND by the GPU render_text in
+// stbrender.
+extrn _stb_font;
+
+// Initialize the 8x8 bitmap font.
+void init_font() {
+    auto f, i;
+    f = malloc(768);
+    _stb_font = f;
+
+    // Clear all glyphs to zero.
+    i = 0;
+    while (i < 768) { poke(f + i, 0); i = i + 1; }
+
+    // Space (32) is all zeros — already set.
+
+    // ! (33)
+    poke(f+8+0,24);poke(f+8+1,24);poke(f+8+2,24);poke(f+8+3,24);poke(f+8+4,24);poke(f+8+5,0);poke(f+8+6,24);
+
+    // " (34)
+    poke(f+16+0,54);poke(f+16+1,54);
+
+    // 0-9 (48-57) — offset = (ch-32)*8
+    // 0
+    poke(f+128+0,60);poke(f+128+1,102);poke(f+128+2,110);poke(f+128+3,118);poke(f+128+4,102);poke(f+128+5,102);poke(f+128+6,60);
+    // 1
+    poke(f+136+0,24);poke(f+136+1,56);poke(f+136+2,24);poke(f+136+3,24);poke(f+136+4,24);poke(f+136+5,24);poke(f+136+6,126);
+    // 2
+    poke(f+144+0,60);poke(f+144+1,102);poke(f+144+2,6);poke(f+144+3,12);poke(f+144+4,24);poke(f+144+5,48);poke(f+144+6,126);
+    // 3
+    poke(f+152+0,60);poke(f+152+1,102);poke(f+152+2,6);poke(f+152+3,28);poke(f+152+4,6);poke(f+152+5,102);poke(f+152+6,60);
+    // 4
+    poke(f+160+0,12);poke(f+160+1,28);poke(f+160+2,44);poke(f+160+3,76);poke(f+160+4,126);poke(f+160+5,12);poke(f+160+6,12);
+    // 5
+    poke(f+168+0,126);poke(f+168+1,96);poke(f+168+2,124);poke(f+168+3,6);poke(f+168+4,6);poke(f+168+5,102);poke(f+168+6,60);
+    // 6
+    poke(f+176+0,60);poke(f+176+1,96);poke(f+176+2,96);poke(f+176+3,124);poke(f+176+4,102);poke(f+176+5,102);poke(f+176+6,60);
+    // 7
+    poke(f+184+0,126);poke(f+184+1,6);poke(f+184+2,12);poke(f+184+3,24);poke(f+184+4,24);poke(f+184+5,24);poke(f+184+6,24);
+    // 8
+    poke(f+192+0,60);poke(f+192+1,102);poke(f+192+2,102);poke(f+192+3,60);poke(f+192+4,102);poke(f+192+5,102);poke(f+192+6,60);
+    // 9
+    poke(f+200+0,60);poke(f+200+1,102);poke(f+200+2,102);poke(f+200+3,62);poke(f+200+4,6);poke(f+200+5,6);poke(f+200+6,60);
+
+    // A-Z (65-90) — offset = (ch-32)*8
+    // A
+    poke(f+264+0,24);poke(f+264+1,60);poke(f+264+2,102);poke(f+264+3,102);poke(f+264+4,126);poke(f+264+5,102);poke(f+264+6,102);
+    // B
+    poke(f+272+0,124);poke(f+272+1,102);poke(f+272+2,102);poke(f+272+3,124);poke(f+272+4,102);poke(f+272+5,102);poke(f+272+6,124);
+    // C
+    poke(f+280+0,60);poke(f+280+1,102);poke(f+280+2,96);poke(f+280+3,96);poke(f+280+4,96);poke(f+280+5,102);poke(f+280+6,60);
+    // D
+    poke(f+288+0,120);poke(f+288+1,108);poke(f+288+2,102);poke(f+288+3,102);poke(f+288+4,102);poke(f+288+5,108);poke(f+288+6,120);
+    // E
+    poke(f+296+0,126);poke(f+296+1,96);poke(f+296+2,96);poke(f+296+3,124);poke(f+296+4,96);poke(f+296+5,96);poke(f+296+6,126);
+    // F
+    poke(f+304+0,126);poke(f+304+1,96);poke(f+304+2,96);poke(f+304+3,124);poke(f+304+4,96);poke(f+304+5,96);poke(f+304+6,96);
+    // G
+    poke(f+312+0,60);poke(f+312+1,102);poke(f+312+2,96);poke(f+312+3,110);poke(f+312+4,102);poke(f+312+5,102);poke(f+312+6,60);
+    // H
+    poke(f+320+0,102);poke(f+320+1,102);poke(f+320+2,102);poke(f+320+3,126);poke(f+320+4,102);poke(f+320+5,102);poke(f+320+6,102);
+    // I
+    poke(f+328+0,126);poke(f+328+1,24);poke(f+328+2,24);poke(f+328+3,24);poke(f+328+4,24);poke(f+328+5,24);poke(f+328+6,126);
+    // J
+    poke(f+336+0,6);poke(f+336+1,6);poke(f+336+2,6);poke(f+336+3,6);poke(f+336+4,102);poke(f+336+5,102);poke(f+336+6,60);
+    // K
+    poke(f+344+0,102);poke(f+344+1,108);poke(f+344+2,120);poke(f+344+3,112);poke(f+344+4,120);poke(f+344+5,108);poke(f+344+6,102);
+    // L
+    poke(f+352+0,96);poke(f+352+1,96);poke(f+352+2,96);poke(f+352+3,96);poke(f+352+4,96);poke(f+352+5,96);poke(f+352+6,126);
+    // M
+    poke(f+360+0,99);poke(f+360+1,119);poke(f+360+2,127);poke(f+360+3,107);poke(f+360+4,99);poke(f+360+5,99);poke(f+360+6,99);
+    // N
+    poke(f+368+0,102);poke(f+368+1,118);poke(f+368+2,126);poke(f+368+3,110);poke(f+368+4,102);poke(f+368+5,102);poke(f+368+6,102);
+    // O
+    poke(f+376+0,60);poke(f+376+1,102);poke(f+376+2,102);poke(f+376+3,102);poke(f+376+4,102);poke(f+376+5,102);poke(f+376+6,60);
+    // P
+    poke(f+384+0,124);poke(f+384+1,102);poke(f+384+2,102);poke(f+384+3,124);poke(f+384+4,96);poke(f+384+5,96);poke(f+384+6,96);
+    // Q
+    poke(f+392+0,60);poke(f+392+1,102);poke(f+392+2,102);poke(f+392+3,102);poke(f+392+4,106);poke(f+392+5,60);poke(f+392+6,6);
+    // R
+    poke(f+400+0,124);poke(f+400+1,102);poke(f+400+2,102);poke(f+400+3,124);poke(f+400+4,108);poke(f+400+5,102);poke(f+400+6,102);
+    // S
+    poke(f+408+0,60);poke(f+408+1,102);poke(f+408+2,96);poke(f+408+3,60);poke(f+408+4,6);poke(f+408+5,102);poke(f+408+6,60);
+    // T
+    poke(f+416+0,126);poke(f+416+1,24);poke(f+416+2,24);poke(f+416+3,24);poke(f+416+4,24);poke(f+416+5,24);poke(f+416+6,24);
+    // U
+    poke(f+424+0,102);poke(f+424+1,102);poke(f+424+2,102);poke(f+424+3,102);poke(f+424+4,102);poke(f+424+5,102);poke(f+424+6,60);
+    // V
+    poke(f+432+0,102);poke(f+432+1,102);poke(f+432+2,102);poke(f+432+3,102);poke(f+432+4,102);poke(f+432+5,60);poke(f+432+6,24);
+    // W
+    poke(f+440+0,99);poke(f+440+1,99);poke(f+440+2,99);poke(f+440+3,107);poke(f+440+4,127);poke(f+440+5,119);poke(f+440+6,99);
+    // X
+    poke(f+448+0,102);poke(f+448+1,102);poke(f+448+2,60);poke(f+448+3,24);poke(f+448+4,60);poke(f+448+5,102);poke(f+448+6,102);
+    // Y
+    poke(f+456+0,102);poke(f+456+1,102);poke(f+456+2,102);poke(f+456+3,60);poke(f+456+4,24);poke(f+456+5,24);poke(f+456+6,24);
+    // Z
+    poke(f+464+0,126);poke(f+464+1,6);poke(f+464+2,12);poke(f+464+3,24);poke(f+464+4,48);poke(f+464+5,96);poke(f+464+6,126);
+
+    // a-z (97-122) — offset = (ch-32)*8
+    // a
+    poke(f+520+0,0);poke(f+520+1,0);poke(f+520+2,60);poke(f+520+3,6);poke(f+520+4,62);poke(f+520+5,102);poke(f+520+6,62);
+    // b
+    poke(f+528+0,96);poke(f+528+1,96);poke(f+528+2,124);poke(f+528+3,102);poke(f+528+4,102);poke(f+528+5,102);poke(f+528+6,124);
+    // c
+    poke(f+536+0,0);poke(f+536+1,0);poke(f+536+2,60);poke(f+536+3,96);poke(f+536+4,96);poke(f+536+5,96);poke(f+536+6,60);
+    // d
+    poke(f+544+0,6);poke(f+544+1,6);poke(f+544+2,62);poke(f+544+3,102);poke(f+544+4,102);poke(f+544+5,102);poke(f+544+6,62);
+    // e
+    poke(f+552+0,0);poke(f+552+1,0);poke(f+552+2,60);poke(f+552+3,102);poke(f+552+4,126);poke(f+552+5,96);poke(f+552+6,60);
+    // f
+    poke(f+560+0,28);poke(f+560+1,48);poke(f+560+2,48);poke(f+560+3,124);poke(f+560+4,48);poke(f+560+5,48);poke(f+560+6,48);
+    // g
+    poke(f+568+0,0);poke(f+568+1,0);poke(f+568+2,62);poke(f+568+3,102);poke(f+568+4,102);poke(f+568+5,62);poke(f+568+6,6);poke(f+568+7,60);
+    // h
+    poke(f+576+0,96);poke(f+576+1,96);poke(f+576+2,124);poke(f+576+3,102);poke(f+576+4,102);poke(f+576+5,102);poke(f+576+6,102);
+    // i
+    poke(f+584+0,24);poke(f+584+1,0);poke(f+584+2,56);poke(f+584+3,24);poke(f+584+4,24);poke(f+584+5,24);poke(f+584+6,60);
+    // j
+    poke(f+592+0,6);poke(f+592+1,0);poke(f+592+2,6);poke(f+592+3,6);poke(f+592+4,6);poke(f+592+5,102);poke(f+592+6,60);
+    // k
+    poke(f+600+0,96);poke(f+600+1,96);poke(f+600+2,102);poke(f+600+3,108);poke(f+600+4,120);poke(f+600+5,108);poke(f+600+6,102);
+    // l
+    poke(f+608+0,56);poke(f+608+1,24);poke(f+608+2,24);poke(f+608+3,24);poke(f+608+4,24);poke(f+608+5,24);poke(f+608+6,60);
+    // m
+    poke(f+616+0,0);poke(f+616+1,0);poke(f+616+2,118);poke(f+616+3,127);poke(f+616+4,107);poke(f+616+5,99);poke(f+616+6,99);
+    // n
+    poke(f+624+0,0);poke(f+624+1,0);poke(f+624+2,124);poke(f+624+3,102);poke(f+624+4,102);poke(f+624+5,102);poke(f+624+6,102);
+    // o
+    poke(f+632+0,0);poke(f+632+1,0);poke(f+632+2,60);poke(f+632+3,102);poke(f+632+4,102);poke(f+632+5,102);poke(f+632+6,60);
+    // p
+    poke(f+640+0,0);poke(f+640+1,0);poke(f+640+2,124);poke(f+640+3,102);poke(f+640+4,102);poke(f+640+5,124);poke(f+640+6,96);poke(f+640+7,96);
+    // q
+    poke(f+648+0,0);poke(f+648+1,0);poke(f+648+2,62);poke(f+648+3,102);poke(f+648+4,102);poke(f+648+5,62);poke(f+648+6,6);poke(f+648+7,6);
+    // r
+    poke(f+656+0,0);poke(f+656+1,0);poke(f+656+2,108);poke(f+656+3,118);poke(f+656+4,96);poke(f+656+5,96);poke(f+656+6,96);
+    // s
+    poke(f+664+0,0);poke(f+664+1,0);poke(f+664+2,62);poke(f+664+3,96);poke(f+664+4,60);poke(f+664+5,6);poke(f+664+6,124);
+    // t
+    poke(f+672+0,48);poke(f+672+1,48);poke(f+672+2,124);poke(f+672+3,48);poke(f+672+4,48);poke(f+672+5,48);poke(f+672+6,28);
+    // u
+    poke(f+680+0,0);poke(f+680+1,0);poke(f+680+2,102);poke(f+680+3,102);poke(f+680+4,102);poke(f+680+5,102);poke(f+680+6,62);
+    // v
+    poke(f+688+0,0);poke(f+688+1,0);poke(f+688+2,102);poke(f+688+3,102);poke(f+688+4,102);poke(f+688+5,60);poke(f+688+6,24);
+    // w
+    poke(f+696+0,0);poke(f+696+1,0);poke(f+696+2,99);poke(f+696+3,99);poke(f+696+4,107);poke(f+696+5,127);poke(f+696+6,54);
+    // x
+    poke(f+704+0,0);poke(f+704+1,0);poke(f+704+2,102);poke(f+704+3,60);poke(f+704+4,24);poke(f+704+5,60);poke(f+704+6,102);
+    // y
+    poke(f+712+0,0);poke(f+712+1,0);poke(f+712+2,102);poke(f+712+3,102);poke(f+712+4,62);poke(f+712+5,6);poke(f+712+6,60);
+    // z
+    poke(f+720+0,0);poke(f+720+1,0);poke(f+720+2,126);poke(f+720+3,12);poke(f+720+4,24);poke(f+720+5,48);poke(f+720+6,126);
+
+    // : (58)
+    poke(f+208+0,0);poke(f+208+1,24);poke(f+208+2,24);poke(f+208+3,0);poke(f+208+4,0);poke(f+208+5,24);poke(f+208+6,24);
+
+    // - (45)
+    poke(f+104+0,0);poke(f+104+1,0);poke(f+104+2,0);poke(f+104+3,126);poke(f+104+4,0);poke(f+104+5,0);poke(f+104+6,0);
+
+    // + (43)
+    poke(f+88+0,0);poke(f+88+1,24);poke(f+88+2,24);poke(f+88+3,126);poke(f+88+4,24);poke(f+88+5,24);poke(f+88+6,0);
+
+    // . (46)
+    poke(f+112+0,0);poke(f+112+1,0);poke(f+112+2,0);poke(f+112+3,0);poke(f+112+4,0);poke(f+112+5,24);poke(f+112+6,24);
+
+    // , (44)
+    poke(f+96+0,0);poke(f+96+1,0);poke(f+96+2,0);poke(f+96+3,0);poke(f+96+4,0);poke(f+96+5,24);poke(f+96+6,24);poke(f+96+7,48);
+
+    // ( (40)
+    poke(f+64+0,12);poke(f+64+1,24);poke(f+64+2,48);poke(f+64+3,48);poke(f+64+4,48);poke(f+64+5,24);poke(f+64+6,12);
+
+    // ) (41)
+    poke(f+72+0,48);poke(f+72+1,24);poke(f+72+2,12);poke(f+72+3,12);poke(f+72+4,12);poke(f+72+5,24);poke(f+72+6,48);
+}
+
+// ══════════════════════════════════════════════════════════════
+// TrueType font reader — translates stb_truetype.h to pure B++.
+// Parses .ttf files, rasterizes glyphs with antialiasing, builds atlas.
+// Zero FFI, zero external dependencies.
+// ══════════════════════════════════════════════════════════════
+
+import "bpp_file.bsm";
+import "bpp_buf.bsm";
+
+// ── TrueType state ──────────────────────────────────────────
+// One font loaded at a time (global state, like stbimage.bsm).
+//
+// Every slot below is populated by font_load at program init and read
+// by every downstream rendering / text measurement call. Declared
+// extrn so the dispatch scanner treats them as worker-visible-safe.
+// If a program ever calls font_load after maestro_run / job_init,
+// the extrn contract breaks — callers who need runtime reload should
+// stop workers first.
+
+extrn _ttf_data, _ttf_len;        // Raw .ttf file in memory.
+extrn _ttf_num_tables;            // Number of tables in the font.
+
+// Table offsets (byte offset from start of file).
+extrn _ttf_head, _ttf_hhea, _ttf_maxp, _ttf_hmtx;
+extrn _ttf_loca, _ttf_glyf, _ttf_cmap, _ttf_kern;
+
+// Font metrics from head/hhea/maxp.
+extrn _ttf_units_per_em;          // Design units per em square.
+extrn _ttf_num_glyphs;            // Total glyph count.
+extrn _ttf_num_hmetrics;          // Entries in hmtx table.
+extrn _ttf_loca_format;           // 0 = short offsets, 1 = long offsets.
+extrn _ttf_ascent, _ttf_descent;  // Typographic ascent/descent (design units).
+
+// Scale factor in 16.16 fixed point (set by font_load for target pixel height).
+extrn _ttf_scale;
+
+// Atlas state (pre-rendered ASCII 32-127).
+extrn _ttf_atlas;                 // Pixel buffer (R8 alpha mask).
+extrn _ttf_atlas_w, _ttf_atlas_h; // Atlas dimensions.
+extrn _ttf_glyph_info;            // Per-glyph info: 96 entries × 8 fields.
+// Fields per glyph (index = (ch-32) * 8):
+//   [0] atlas_x  [1] atlas_y  [2] width  [3] height
+//   [4] xoff     [5] yoff     [6] advance [7] lsb
+
+extrn _ttf_loaded;                // 1 if TrueType font is active.
+extrn _ttf_pixel_height;          // Target rasterisation height in pixels.
+
+// ── Big-endian readers ──────────────────────────────────────
+// TrueType is big-endian throughout.
+//
+// Each reader touches only the frozen _ttf_data byte array via peek,
+// which is a pure-extern builtin, so the dispatch classifier accepts
+// the `: base` annotation. That keeps any loop that composes these
+// readers eligible for automatic parallel dispatch in the future.
+
+static _ttf_u8(off) : base { return peek(_ttf_data + off); }
+
+static _ttf_u16(off) : base {
+    return peek(_ttf_data + off) * 256 + peek(_ttf_data + off + 1);
+}
+
+static _ttf_i16(off) : base {
+    auto v;
+    v = _ttf_u16(off);
+    return v >= 32768 ? v - 65536 : v;
+}
+
+static _ttf_u32(off) : base {
+    return peek(_ttf_data + off) * 16777216 + peek(_ttf_data + off + 1) * 65536
+         + peek(_ttf_data + off + 2) * 256 + peek(_ttf_data + off + 3);
+}
+
+// ── Table directory parser ──────────────────────────────────
+// Reads the font's table directory and stores offsets to key tables.
+
+static void _ttf_find_tables() {
+    auto i, tag, off, num;
+    num = _ttf_u16(4);
+    _ttf_num_tables = num;
+
+    _ttf_head = 0; _ttf_hhea = 0; _ttf_maxp = 0; _ttf_hmtx = 0;
+    _ttf_loca = 0; _ttf_glyf = 0; _ttf_cmap = 0; _ttf_kern = 0;
+
+    for (i = 0; i < num; i = i + 1) {
+        // Each table record is 16 bytes starting at offset 12.
+        off = 12 + i * 16;
+        tag = _ttf_u32(off);
+
+        // Match 4-byte ASCII tags against known table IDs. The hex
+        // values are 'head', 'hhea', 'maxp', 'hmtx', 'loca', 'glyf',
+        // 'cmap', 'kern' — TrueType stores them big-endian so the
+        // numeric equivalents read straight off _ttf_u32.
+        switch (tag) {
+        0x68656164 { _ttf_head = _ttf_u32(off + 8); }
+        0x68686561 { _ttf_hhea = _ttf_u32(off + 8); }
+        0x6D617870 { _ttf_maxp = _ttf_u32(off + 8); }
+        0x686D7478 { _ttf_hmtx = _ttf_u32(off + 8); }
+        0x6C6F6361 { _ttf_loca = _ttf_u32(off + 8); }
+        0x676C7966 { _ttf_glyf = _ttf_u32(off + 8); }
+        0x636D6170 { _ttf_cmap = _ttf_u32(off + 8); }
+        0x6B65726E { _ttf_kern = _ttf_u32(off + 8); }
+        else { }
+        }
+    }
+}
+
+// Read font metrics from head, hhea, and maxp tables.
+static void _ttf_read_metrics() {
+    // head table: unitsPerEm at offset 18, indexToLocFormat at offset 50.
+    _ttf_units_per_em = _ttf_u16(_ttf_head + 18);
+    _ttf_loca_format = _ttf_i16(_ttf_head + 50);
+
+    // hhea table: ascent at offset 4, descent at offset 6, numOfLongHorMetrics at offset 34.
+    _ttf_ascent = _ttf_i16(_ttf_hhea + 4);
+    _ttf_descent = _ttf_i16(_ttf_hhea + 6);
+    _ttf_num_hmetrics = _ttf_u16(_ttf_hhea + 34);
+
+    // maxp table: numGlyphs at offset 4.
+    _ttf_num_glyphs = _ttf_u16(_ttf_maxp + 4);
+}
+
+// ── Cmap Format 4 decoder ───────────────────────────────────
+// Maps Unicode codepoints to glyph indices.
+
+// Find the Format 4 subtable offset within the cmap table.
+static _ttf_cmap4_off() {
+    auto num_sub, i, plat, enc, fmt, sub_off;
+    num_sub = _ttf_u16(_ttf_cmap + 2);
+    for (i = 0; i < num_sub; i = i + 1) {
+        plat = _ttf_u16(_ttf_cmap + 4 + i * 8);
+        enc = _ttf_u16(_ttf_cmap + 4 + i * 8 + 2);
+        sub_off = _ttf_u32(_ttf_cmap + 4 + i * 8 + 4);
+        // Platform 3 (Windows), encoding 1 (Unicode BMP) or
+        // Platform 0 (Unicode), any encoding.
+        if (plat == 3 && enc == 1) {
+            fmt = _ttf_u16(_ttf_cmap + sub_off);
+            if (fmt == 4) { return _ttf_cmap + sub_off; }
+        }
+        if (plat == 0) {
+            fmt = _ttf_u16(_ttf_cmap + sub_off);
+            if (fmt == 4) { return _ttf_cmap + sub_off; }
+        }
+    }
+    return 0;
+}
+
+// Look up a codepoint in Format 4 cmap. Returns glyph index (0 = missing).
+static _ttf_cmap_lookup(codepoint) {
+    auto base, seg_count, i, end_off, start_off, delta_off, range_off;
+    auto end_code, start_code, delta, roff, idx;
+    base = _ttf_cmap4_off();
+    if (base == 0) { return 0; }
+
+    seg_count = _ttf_u16(base + 6) / 2;
+    end_off = base + 14;
+    start_off = end_off + seg_count * 2 + 2;
+    delta_off = start_off + seg_count * 2;
+    range_off = delta_off + seg_count * 2;
+
+    for (i = 0; i < seg_count; i = i + 1) {
+        end_code = _ttf_u16(end_off + i * 2);
+        if (codepoint <= end_code) {
+            start_code = _ttf_u16(start_off + i * 2);
+            if (codepoint < start_code) { return 0; }
+            delta = _ttf_i16(delta_off + i * 2);
+            roff = _ttf_u16(range_off + i * 2);
+            if (roff == 0) {
+                return (codepoint + delta) & 0xFFFF;
+            } else {
+                // Offset into glyphIdArray.
+                idx = _ttf_u16(range_off + i * 2 + roff + (codepoint - start_code) * 2);
+                if (idx == 0) { return 0; }
+                return (idx + delta) & 0xFFFF;
+            }
+        }
+    }
+    return 0;
+}
+
+// ── Glyph location ─────────────────────────────────────────
+// Find byte offset of a glyph's outline data in the glyf table.
+
+static _ttf_glyph_offset(glyph_idx) {
+    if (_ttf_loca_format == 0) {
+        // Short format: offsets are uint16 × 2.
+        return _ttf_glyf + _ttf_u16(_ttf_loca + glyph_idx * 2) * 2;
+    } else {
+        // Long format: offsets are uint32.
+        return _ttf_glyf + _ttf_u32(_ttf_loca + glyph_idx * 4);
+    }
+}
+
+// Get glyph bounding box. Returns 1 if glyph has contours, 0 if empty.
+// Writes xmin, ymin, xmax, ymax to the provided buffer (4 words).
+static _ttf_glyph_box(glyph_idx, box) {
+    auto off, next_off, num_contours;
+    off = _ttf_glyph_offset(glyph_idx);
+    next_off = _ttf_glyph_offset(glyph_idx + 1);
+    if (off == next_off) { return 0; }
+
+    num_contours = _ttf_i16(off);
+    box[0] = _ttf_i16(off + 2);   // xMin
+    box[1] = _ttf_i16(off + 4);   // yMin
+    box[2] = _ttf_i16(off + 6);   // xMax
+    box[3] = _ttf_i16(off + 8);   // yMax
+    return num_contours;
+}
+
+// ── Horizontal metrics ──────────────────────────────────────
+
+// Get advance width for a glyph (in design units).
+static _ttf_get_advance(glyph_idx) {
+    if (glyph_idx < _ttf_num_hmetrics) {
+        return _ttf_u16(_ttf_hmtx + glyph_idx * 4);
+    }
+    // Glyphs beyond numOfLongHorMetrics share the last advance.
+    return _ttf_u16(_ttf_hmtx + (_ttf_num_hmetrics - 1) * 4);
+}
+
+// Get left side bearing for a glyph (in design units).
+static _ttf_get_lsb(glyph_idx) {
+    if (glyph_idx < _ttf_num_hmetrics) {
+        return _ttf_i16(_ttf_hmtx + glyph_idx * 4 + 2);
+    }
+    return _ttf_i16(_ttf_hmtx + _ttf_num_hmetrics * 4 + (glyph_idx - _ttf_num_hmetrics) * 2);
+}
+
+// ── Kern table (format 0) ───────────────────────────────────
+
+// Get kerning adjustment between two glyphs (design units). 0 if no kerning.
+static _ttf_get_kern(g1, g2) {
+    auto num_tables, off, i, num_pairs, j, left, right;
+    if (_ttf_kern == 0) { return 0; }
+
+    num_tables = _ttf_u16(_ttf_kern + 2);
+    off = _ttf_kern + 4;
+    for (i = 0; i < num_tables; i = i + 1) {
+        auto length, coverage, format;
+        length = _ttf_u16(off + 2);
+        coverage = _ttf_u16(off + 4);
+        format = coverage >> 8;
+        if (format == 0) {
+            num_pairs = _ttf_u16(off + 6);
+            // Linear search (could binary search, but pairs are few for ASCII).
+            for (j = 0; j < num_pairs; j = j + 1) {
+                left = _ttf_u16(off + 14 + j * 6);
+                right = _ttf_u16(off + 14 + j * 6 + 2);
+                if (left == g1 && right == g2) {
+                    return _ttf_i16(off + 14 + j * 6 + 4);
+                }
+            }
+        }
+        off = off + length;
+    }
+    return 0;
+}
+
+// ── Public API: font_loaded ─────────────────────────────────
+
+font_loaded() { return _ttf_loaded; }
+
+// ── Glyf outline loader ────────────────────────────────────
+// Extracts contour points from a simple glyph and builds vertex commands.
+// Vertex types: 1=moveto, 2=lineto, 3=curveto (quadratic Bézier).
+
+// Vertex buffer: each vertex is 5 words [type, x, y, cx, cy].
+auto _ttf_verts, _ttf_nverts, _ttf_verts_cap;
+
+static void _ttf_vert_init() {
+    _ttf_verts_cap = 256;
+    _ttf_verts = malloc(_ttf_verts_cap * 5 * 8);
+    _ttf_nverts = 0;
+}
+
+static void _ttf_vert_add(type, x, y, cx, cy) {
+    if (_ttf_nverts >= _ttf_verts_cap) {
+        auto new_cap, new_buf;
+        new_cap = _ttf_verts_cap * 2;
+        new_buf = malloc(new_cap * 5 * 8);
+        memcpy(new_buf, _ttf_verts, _ttf_nverts * 5 * 8);
+        free(_ttf_verts);
+        _ttf_verts = new_buf;
+        _ttf_verts_cap = new_cap;
+    }
+    auto base;
+    base = _ttf_nverts * 5;
+    _ttf_verts[base] = type;
+    _ttf_verts[base + 1] = x;
+    _ttf_verts[base + 2] = y;
+    _ttf_verts[base + 3] = cx;
+    _ttf_verts[base + 4] = cy;
+    _ttf_nverts = _ttf_nverts + 1;
+}
+
+// Load a simple glyph's outline into the vertex buffer.
+// Returns number of vertices, or 0 for empty/compound glyphs.
+static _ttf_load_glyph(glyph_idx) {
+    auto off, next_off, num_contours, p;
+    auto end_pts, num_points, flags_off, x_off, y_off;
+    auto i, j, flag_byte, repeat, flags, xs, ys;
+    auto was_off, sx, sy, scx, scy, cx, cy, x, y, next_off_curve;
+
+    off = _ttf_glyph_offset(glyph_idx);
+    next_off = _ttf_glyph_offset(glyph_idx + 1);
+    if (off == next_off) { return 0; }
+
+    num_contours = _ttf_i16(off);
+    if (num_contours < 0) { return 0; }
+
+    _ttf_nverts = 0;
+
+    // Read end-point indices for each contour.
+    end_pts = malloc(num_contours * 8);
+    for (i = 0; i < num_contours; i = i + 1) {
+        end_pts[i] = _ttf_u16(off + 10 + i * 2);
+    }
+    num_points = end_pts[num_contours - 1] + 1;
+
+    // Skip instructions.
+    auto ins_len;
+    ins_len = _ttf_u16(off + 10 + num_contours * 2);
+    p = off + 10 + num_contours * 2 + 2 + ins_len;
+
+    // Read flags (run-length encoded).
+    flags = malloc(num_points * 8);
+    i = 0;
+    while (i < num_points) {
+        flag_byte = _ttf_u8(p);
+        p = p + 1;
+        flags[i] = flag_byte;
+        i = i + 1;
+        if (flag_byte & 8) {
+            repeat = _ttf_u8(p);
+            p = p + 1;
+            for (j = 0; j < repeat; j = j + 1) {
+                flags[i] = flag_byte;
+                i = i + 1;
+            }
+        }
+    }
+
+    // Read X coordinates (delta-encoded).
+    xs = malloc(num_points * 8);
+    x = 0;
+    for (i = 0; i < num_points; i = i + 1) {
+        auto f; f = flags[i];
+        if (f & 2) {
+            // 1 byte, sign in bit 4.
+            auto dx; dx = _ttf_u8(p); p = p + 1;
+            if (f & 16) { x = x + dx; } else { x = x - dx; }
+        } else {
+            if (f & 16) {
+                // Same as previous (delta=0).
+            } else {
+                x = x + _ttf_i16(p); p = p + 2;
+            }
+        }
+        xs[i] = x;
+    }
+
+    // Read Y coordinates (delta-encoded).
+    ys = malloc(num_points * 8);
+    y = 0;
+    for (i = 0; i < num_points; i = i + 1) {
+        auto f; f = flags[i];
+        if (f & 4) {
+            auto dy; dy = _ttf_u8(p); p = p + 1;
+            if (f & 32) { y = y + dy; } else { y = y - dy; }
+        } else {
+            if (f & 32) {
+                // Same as previous (delta=0).
+            } else {
+                y = y + _ttf_i16(p); p = p + 2;
+            }
+        }
+        ys[i] = y;
+    }
+
+    // Convert points to move/line/curve vertices.
+    // Walk each contour, handling on-curve and off-curve points.
+    auto ci, start, end;
+    ci = 0;
+    i = 0;
+    while (ci < num_contours) {
+        start = 0;
+        if (ci > 0) { start = end_pts[ci - 1] + 1; }
+        end = end_pts[ci];
+
+        // Find first on-curve point to start the contour.
+        auto first, first_x, first_y;
+        first = start;
+        sx = xs[start]; sy = ys[start];
+
+        // Emit moveto for contour start.
+        _ttf_vert_add(1, sx, sy, 0, 0);
+        was_off = 0;
+        cx = 0; cy = 0;
+
+        j = start + 1;
+        while (j <= end) {
+            auto on_curve;
+            on_curve = flags[j] & 1;
+            if (on_curve) {
+                if (was_off) {
+                    // Curve from previous off-curve control to this on-curve.
+                    _ttf_vert_add(3, xs[j], ys[j], cx, cy);
+                } else {
+                    _ttf_vert_add(2, xs[j], ys[j], 0, 0);
+                }
+                was_off = 0;
+            } else {
+                if (was_off) {
+                    // Two consecutive off-curve: implicit on-curve midpoint.
+                    auto mx, my;
+                    mx = (cx + xs[j]) / 2;
+                    my = (cy + ys[j]) / 2;
+                    _ttf_vert_add(3, mx, my, cx, cy);
+                }
+                cx = xs[j]; cy = ys[j];
+                was_off = 1;
+            }
+            j = j + 1;
+        }
+
+        // Close the contour back to start point.
+        if (was_off) {
+            _ttf_vert_add(3, sx, sy, cx, cy);
+        } else {
+            _ttf_vert_add(2, sx, sy, 0, 0);
+        }
+
+        ci = ci + 1;
+    }
+
+    free(flags);
+    free(xs);
+    free(ys);
+    free(end_pts);
+    return _ttf_nverts;
+}
+
+// ── Rasterizer ──────────────────────────────────────────────
+// Edge-based scanline rasterizer with antialiasing.
+// Translates quadratic Bézier outlines to pixel alpha masks.
+
+// Edge structure: 5 words [x0_fp, dx_fp, y_min, y_max, direction].
+// x0_fp and dx_fp are 16.16 fixed point.
+auto _ttf_edges, _ttf_nedges, _ttf_edges_cap;
+
+static void _ttf_edge_init() {
+    _ttf_edges_cap = 512;
+    _ttf_edges = malloc(_ttf_edges_cap * 5 * 8);
+    _ttf_nedges = 0;
+}
+
+// Add an edge from pixel coordinates (x0,y0) to (x1,y1).
+// Computes fixed-point x start and dx/dy, handles direction normalization.
+static void _ttf_edge_add(x0, y0, x1, y1) {
+    if (y0 == y1) { return; }
+    if (_ttf_nedges >= _ttf_edges_cap) {
+        auto new_cap, new_buf;
+        new_cap = _ttf_edges_cap * 2;
+        new_buf = malloc(new_cap * 5 * 8);
+        memcpy(new_buf, _ttf_edges, _ttf_nedges * 5 * 8);
+        free(_ttf_edges);
+        _ttf_edges = new_buf;
+        _ttf_edges_cap = new_cap;
+    }
+    auto base, dir, ymin, ymax, xmin_fp, dx_fp;
+    if (y0 < y1) {
+        dir = 1; ymin = y0; ymax = y1;
+        xmin_fp = x0 * 65536;
+        dx_fp = (x1 - x0) * 65536 / (y1 - y0);
+    } else {
+        dir = 0 - 1; ymin = y1; ymax = y0;
+        xmin_fp = x1 * 65536;
+        dx_fp = (x0 - x1) * 65536 / (y0 - y1);
+    }
+    base = _ttf_nedges * 5;
+    _ttf_edges[base] = xmin_fp;
+    _ttf_edges[base + 1] = dx_fp;
+    _ttf_edges[base + 2] = ymin;
+    _ttf_edges[base + 3] = ymax;
+    _ttf_edges[base + 4] = dir;
+    _ttf_nedges = _ttf_nedges + 1;
+}
+
+// Flatten quadratic Bézier curve into line segments and add edges.
+static void _ttf_flatten_curve(x0, y0, cx, cy, x1, y1) {
+    // Simple recursive subdivision with fixed depth (5 levels = 32 segments max).
+    auto mx, my, mcx, mcy;
+    mx = (x0 + 2 * cx + x1) / 4;
+    my = (y0 + 2 * cy + y1) / 4;
+
+    // Check flatness: if midpoint is close to line midpoint, emit line.
+    auto lmx, lmy, dx, dy;
+    lmx = (x0 + x1) / 2;
+    lmy = (y0 + y1) / 2;
+    dx = mx - lmx; if (dx < 0) { dx = 0 - dx; }
+    dy = my - lmy; if (dy < 0) { dy = 0 - dy; }
+    if (dx + dy < 2) {
+        _ttf_edge_add(x0, y0, x1, y1);
+        return;
+    }
+    // Subdivide: split at midpoint.
+    auto ax, ay, bx, by;
+    ax = (x0 + cx) / 2; ay = (y0 + cy) / 2;
+    bx = (cx + x1) / 2; by = (cy + y1) / 2;
+    _ttf_flatten_curve(x0, y0, ax, ay, mx, my);
+    _ttf_flatten_curve(mx, my, bx, by, x1, y1);
+}
+
+// Build edge list from vertex buffer.
+static void _ttf_build_edges(scale_x, scale_y, off_x, off_y) {
+    auto i, type, x, y, cx, cy, px, py, base;
+    _ttf_nedges = 0;
+    px = 0; py = 0;
+    for (i = 0; i < _ttf_nverts; i = i + 1) {
+        base = i * 5;
+        type = _ttf_verts[base];
+        x = _ttf_verts[base + 1] * scale_x / 65536 + off_x;
+        y = _ttf_verts[base + 2] * scale_y / 65536 + off_y;
+        if (type == 1) {
+            // moveto
+            px = x; py = y;
+        } else if (type == 2) {
+            // lineto: add edge from previous to current.
+            _ttf_edge_add(px, py, x, y);
+            px = x; py = y;
+        } else if (type == 3) {
+            // curveto: flatten Bézier then add edges.
+            cx = _ttf_verts[base + 3] * scale_x / 65536 + off_x;
+            cy = _ttf_verts[base + 4] * scale_y / 65536 + off_y;
+            _ttf_flatten_curve(px, py, cx, cy, x, y);
+            px = x; py = y;
+        }
+    }
+}
+
+// Sort edges by y_min (insertion sort — good enough for glyph-sized lists).
+static void _ttf_sort_edges() {
+    auto i, j, b, key0, key1, key2, key3, key4;
+    for (i = 1; i < _ttf_nedges; i = i + 1) {
+        b = i * 5;
+        key0 = _ttf_edges[b]; key1 = _ttf_edges[b+1];
+        key2 = _ttf_edges[b+2]; key3 = _ttf_edges[b+3]; key4 = _ttf_edges[b+4];
+        j = i - 1;
+        while (j >= 0) {
+            if (_ttf_edges[j * 5 + 2] <= key2) { break; }
+            // Shift edge right.
+            auto s, d; s = j * 5; d = (j + 1) * 5;
+            _ttf_edges[d] = _ttf_edges[s]; _ttf_edges[d+1] = _ttf_edges[s+1];
+            _ttf_edges[d+2] = _ttf_edges[s+2]; _ttf_edges[d+3] = _ttf_edges[s+3];
+            _ttf_edges[d+4] = _ttf_edges[s+4];
+            j = j - 1;
+        }
+        b = (j + 1) * 5;
+        _ttf_edges[b] = key0; _ttf_edges[b+1] = key1;
+        _ttf_edges[b+2] = key2; _ttf_edges[b+3] = key3; _ttf_edges[b+4] = key4;
+    }
+}
+
+// Rasterize a glyph to an alpha bitmap.
+// Returns a malloc'd buffer of w*h bytes (0-255 alpha values).
+static _ttf_rasterize(w, h) {
+    auto buf, row, ei, x_fp, b;
+    buf = malloc(w * h);
+    // Clear to zero.
+    auto k;
+    for (k = 0; k < w * h; k = k + 1) { poke(buf + k, 0); }
+
+    _ttf_sort_edges();
+
+    // Scanline loop with 4x vertical oversampling for antialiasing.
+    auto sub, scanline;
+    scanline = malloc(w * 8);
+    ei = 0;
+
+    for (row = 0; row < h; row = row + 1) {
+        // Clear scanline accumulator.
+        for (k = 0; k < w; k = k + 1) { scanline[k] = 0; }
+
+        // 4 sub-scanlines per pixel row.
+        for (sub = 0; sub < 4; sub = sub + 1) {
+            auto y_fp;
+            y_fp = row * 4 + sub;
+
+            // Walk active edges for this sub-scanline.
+            auto crossings, nc;
+            crossings = malloc(128 * 8);
+            nc = 0;
+
+            for (k = 0; k < _ttf_nedges; k = k + 1) {
+                b = k * 5;
+                auto ey_min, ey_max;
+                ey_min = _ttf_edges[b + 2] * 4;
+                ey_max = _ttf_edges[b + 3] * 4;
+                if (ey_min <= y_fp && ey_max > y_fp) {
+                    // Edge is active. Compute X crossing.
+                    // dx_fp is per pixel, (y_fp - ey_min) is in sub-pixels, so divide by 4.
+                    auto ex, dir;
+                    ex = _ttf_edges[b] + _ttf_edges[b + 1] * (y_fp - ey_min) / 4;
+                    dir = _ttf_edges[b + 4];
+                    // Store crossing as (x_fp, direction).
+                    if (nc < 128) {
+                        crossings[nc * 2] = ex;
+                        crossings[nc * 2 + 1] = dir;
+                        nc = nc + 1;
+                    }
+                }
+            }
+
+            // Sort crossings by X (insertion sort).
+            auto ci, cj;
+            for (ci = 1; ci < nc; ci = ci + 1) {
+                auto kx, kd;
+                kx = crossings[ci * 2]; kd = crossings[ci * 2 + 1];
+                cj = ci - 1;
+                while (cj >= 0) {
+                    if (crossings[cj * 2] <= kx) { break; }
+                    crossings[(cj + 1) * 2] = crossings[cj * 2];
+                    crossings[(cj + 1) * 2 + 1] = crossings[cj * 2 + 1];
+                    cj = cj - 1;
+                }
+                crossings[(cj + 1) * 2] = kx;
+                crossings[(cj + 1) * 2 + 1] = kd;
+            }
+
+            // Fill using non-zero winding rule.
+            auto winding, prev_x, cx_px;
+            winding = 0;
+            prev_x = 0;
+            for (ci = 0; ci < nc; ci = ci + 1) {
+                auto cur_x;
+                cur_x = crossings[ci * 2] / 65536;
+                if (cur_x < 0) { cur_x = 0; }
+                if (cur_x > w) { cur_x = w; }
+                if (winding != 0) {
+                    // Fill from prev_x to cur_x.
+                    for (cx_px = prev_x; cx_px < cur_x; cx_px = cx_px + 1) {
+                        if (cx_px >= 0 && cx_px < w) {
+                            scanline[cx_px] = scanline[cx_px] + 1;
+                        }
+                    }
+                }
+                winding = winding + crossings[ci * 2 + 1];
+                prev_x = cur_x;
+            }
+            free(crossings);
+        }
+
+        // Write scanline to output (divide by 4 for antialiasing, scale to 0-255).
+        for (k = 0; k < w; k = k + 1) {
+            auto val;
+            val = scanline[k] * 255 / 4;
+            if (val > 255) { val = 255; }
+            if (val < 0) { val = 0; }
+            poke(buf + row * w + k, val);
+        }
+    }
+
+    free(scanline);
+    return buf;
+}
+
+// ── Atlas builder ───────────────────────────────────────────
+// Pre-renders ASCII 32-127 into a texture atlas.
+
+font_load(path, pixel_height) : io {
+    // Load font file. Emits a stderr diagnostic on any failure so
+    // game programmers don't hit a silent "where's my text?" bug.
+    _ttf_data = file_read_all(path, &_ttf_len);
+    if (_ttf_data == 0) {
+        print_err_msg("stbfont: '"); print_err_msg(path);
+        print_err_msg("': file not found or unreadable"); print_err_ln();
+        return 0;
+    }
+
+    // Parse tables and metrics.
+    _ttf_find_tables();
+    if (_ttf_head == 0) {
+        print_err_msg("stbfont: '"); print_err_msg(path);
+        print_err_msg("': no 'head' table (not a valid TTF)");
+        print_err_ln();
+        free(_ttf_data); return 0;
+    }
+    _ttf_read_metrics();
+
+    // Compute scale factor: pixel_height / (ascent - descent) in design units.
+    auto design_height;
+    design_height = _ttf_ascent - _ttf_descent;
+    _ttf_scale = pixel_height * 65536 / design_height;
+    _ttf_pixel_height = pixel_height;
+
+    // Initialize vertex and edge buffers.
+    _ttf_vert_init();
+    _ttf_edge_init();
+
+    // Pre-render ASCII 32-127 into atlas.
+    // First pass: compute glyph sizes for atlas layout.
+    _ttf_glyph_info = malloc(96 * 8 * 8);
+    auto ch, gi, box, gw, gh, adv, lsb, total_w, max_h;
+    box = malloc(32);
+    total_w = 0;
+    max_h = 0;
+
+    for (ch = 32; ch < 128; ch = ch + 1) {
+        gi = _ttf_cmap_lookup(ch);
+        adv = _ttf_get_advance(gi);
+        lsb = _ttf_get_lsb(gi);
+        auto nc;
+        nc = _ttf_glyph_box(gi, box);
+
+        auto idx;
+        idx = (ch - 32) * 8;
+        if (nc > 0) {
+            gw = (box[2] - box[0]) * _ttf_scale / 65536 + 2;
+            gh = (box[3] - box[1]) * _ttf_scale / 65536 + 2;
+        } else {
+            gw = 0; gh = 0;
+        }
+        _ttf_glyph_info[idx + 2] = gw;
+        _ttf_glyph_info[idx + 3] = gh;
+        _ttf_glyph_info[idx + 4] = box[0] * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 5] = _ttf_ascent * _ttf_scale / 65536 - box[3] * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 6] = adv * _ttf_scale / 65536;
+        _ttf_glyph_info[idx + 7] = lsb * _ttf_scale / 65536;
+
+        total_w = total_w + gw + 1;
+        if (gh > max_h) { max_h = gh; }
+    }
+
+    // Row-based atlas packing: 16 chars per row.
+    auto atlas_w, atlas_h, row_h, cols, rows, ax, ay;
+    cols = 16;
+    row_h = max_h + 1;
+    rows = (96 + cols - 1) / cols;
+    atlas_w = 1;
+    // Find power-of-2 width that fits.
+    auto max_row_w;
+    max_row_w = total_w / rows + cols;
+    while (atlas_w < max_row_w) { atlas_w = atlas_w * 2; }
+    if (atlas_w < 256) { atlas_w = 256; }
+    atlas_h = 1;
+    while (atlas_h < rows * row_h) { atlas_h = atlas_h * 2; }
+
+    _ttf_atlas = malloc(atlas_w * atlas_h);
+    for (ch = 0; ch < atlas_w * atlas_h; ch = ch + 1) { poke(_ttf_atlas + ch, 0); }
+    _ttf_atlas_w = atlas_w;
+    _ttf_atlas_h = atlas_h;
+
+    // Second pass: rasterize each glyph and blit into atlas.
+    ax = 0; ay = 0;
+    for (ch = 32; ch < 128; ch = ch + 1) {
+        auto idx;
+        idx = (ch - 32) * 8;
+        gw = _ttf_glyph_info[idx + 2];
+        gh = _ttf_glyph_info[idx + 3];
+
+        if (ax + gw + 1 > atlas_w) { ax = 0; ay = ay + row_h; }
+
+        _ttf_glyph_info[idx] = ax;
+        _ttf_glyph_info[idx + 1] = ay;
+
+        if (gw > 0) {
+            gi = _ttf_cmap_lookup(ch);
+            auto nc2;
+            nc2 = _ttf_glyph_box(gi, box);
+            if (nc2 > 0) {
+                // Load outline and rasterize.
+                _ttf_load_glyph(gi);
+                auto scale_x_fp, scale_y_fp, off_x, off_y;
+                scale_x_fp = _ttf_scale;
+                scale_y_fp = 0 - _ttf_scale;
+                off_x = 0 - box[0] * _ttf_scale / 65536 + 1;
+                off_y = box[3] * _ttf_scale / 65536 + 1;
+                _ttf_build_edges(scale_x_fp, scale_y_fp, off_x, off_y);
+
+                auto glyph_bmp;
+                glyph_bmp = _ttf_rasterize(gw, gh);
+
+                // Blit into atlas.
+                auto gy, gx;
+                for (gy = 0; gy < gh; gy = gy + 1) {
+                    for (gx = 0; gx < gw; gx = gx + 1) {
+                        poke(_ttf_atlas + (ay + gy) * atlas_w + ax + gx,
+                             peek(glyph_bmp + gy * gw + gx));
+                    }
+                }
+                free(glyph_bmp);
+            }
+        }
+        ax = ax + gw + 1;
+    }
+
+    free(box);
+    _ttf_loaded = 1;
+    return 1;
+}
+
+// ── Layer compositor (palette-indexed → ARGB blit) ──────────
+//
+// A Layer is a palette-indexed framebuffer with an alpha, visibility,
+// and blend mode. layer_composite_indexed walks the layer cell by
+// cell, looks up each index in a caller-supplied ARGB palette, and
+// writes the result into a destination ARGB buffer using the
+// layer's blend mode. The destination buffer is what the game's
+// screen render consumes — not the framebuffer directly, because
+// layer compositing wants to combine multiple sources.
+//
+// Blend modes (Item 2 MVP):
+//   BLEND_NORMAL   — source-over with per-layer alpha.
+//   BLEND_MULTIPLY — channel-wise multiply (scaled back by /255).
+//
+// Transparent source cells (index 0) never contribute regardless
+// of mode — they're "holes" through which lower layers show.
+//
+// Memory ownership: layer_new malloc's the fb; caller must
+// layer_free when done. The fb is palette-indexed 1 byte per pixel.
+
+struct Layer { fb, w, h, alpha, blend, visible }
+
+extrn BLEND_NORMAL;
+extrn BLEND_MULTIPLY;
+
+// Initialise blend-mode constants. Call once from game_init or
+// any manual init path; safe to call more than once.
+void init_layer_blends() {
+    BLEND_NORMAL   = 0;
+    BLEND_MULTIPLY = 1;
+}
+
+// Allocate a new Layer with a zero-filled framebuffer. `blend`
+// picks the composite mode (BLEND_NORMAL or BLEND_MULTIPLY). The
+// layer starts fully visible at alpha 255.
+layer_new(w, h, blend) {
+    auto l: Layer;
+    auto i, bytes;
+    l = malloc(sizeof(Layer));
+    l.fb      = malloc(w * h);
+    l.w       = w;
+    l.h       = h;
+    l.alpha   = 255;
+    l.blend   = blend;
+    l.visible = 1;
+    bytes = w * h;
+    for (i = 0; i < bytes; i = i + 1) { poke(l.fb + i, 0); }
+    return l;
+}
+
+void layer_free(layer) {
+    auto l: Layer;
+    if (layer == 0) { return; }
+    l = layer;
+    if (l.fb != 0) { free(l.fb); }
+    free(layer);
+}
+
+void layer_set_alpha(layer, a) {
+    auto l: Layer;
+    l = layer;
+    if (a < 0)   { a = 0; }
+    if (a > 255) { a = 255; }
+    l.alpha = a;
+}
+
+void layer_set_visible(layer, v) {
+    auto l: Layer;
+    l = layer;
+    l.visible = v != 0 ? 1 : 0;
+}
+
+void layer_set_blend(layer, mode) {
+    auto l: Layer;
+    l = layer;
+    l.blend = mode;
+}
+
+// Read a byte from the layer's framebuffer. Out-of-bounds reads
+// return 0 (the transparent convention), mirroring how sprite
+// rendering treats edge overflow.
+layer_get(layer, x, y) : base {
+    auto l: Layer;
+    l = layer;
+    if (x < 0 || y < 0 || x >= l.w || y >= l.h) { return 0; }
+    return peek(l.fb + y * l.w + x);
+}
+
+// Write a byte to the layer's framebuffer. Out-of-bounds writes
+// are dropped silently so callers don't have to bounds-check
+// inside drawing loops.
+void layer_set(layer, x, y, idx) {
+    auto l: Layer;
+    l = layer;
+    if (x < 0 || y < 0 || x >= l.w || y >= l.h) { return; }
+    poke(l.fb + y * l.w + x, idx);
+}
+
+// Fill every byte of the layer's framebuffer with `idx`. Useful
+// for clearing a layer to transparent (idx=0) or seeding a
+// background tile.
+void layer_clear(layer, idx) {
+    auto l: Layer;
+    auto i, total;
+    l = layer;
+    total = l.w * l.h;
+    for (i = 0; i < total; i = i + 1) { poke(l.fb + i, idx); }
+}
+
+// 4-connected flood fill starting at (x, y). Walks a queue,
+// replacing every cell whose value matches the seed's original
+// value with `idx`. No-op if the seed is already `idx` or the
+// seed is out of bounds. The scratch queue is sized to w*h +
+// 1 so it can never overflow even when the entire layer is
+// the target color.
+void layer_fill(layer, x, y, idx) {
+    auto l: Layer;
+    auto target, cap, queue, head, tail, i, px, py;
+    l = layer;
+    if (x < 0 || y < 0 || x >= l.w || y >= l.h) { return; }
+    target = peek(l.fb + y * l.w + x);
+    if (target == idx) { return; }
+
+    cap   = l.w * l.h;
+    queue = malloc(cap * 8);
+    head  = 0;
+    tail  = 0;
+    *(queue + tail * 8) = y * l.w + x;
+    tail = tail + 1;
+    poke(l.fb + y * l.w + x, idx);
+
+    while (head < tail) {
+        i  = *(queue + head * 8);
+        head = head + 1;
+        px = i % l.w;
+        py = i / l.w;
+        if (px > 0 && peek(l.fb + py * l.w + px - 1) == target) {
+            poke(l.fb + py * l.w + px - 1, idx);
+            *(queue + tail * 8) = py * l.w + px - 1;
+            tail = tail + 1;
+        }
+        if (px + 1 < l.w && peek(l.fb + py * l.w + px + 1) == target) {
+            poke(l.fb + py * l.w + px + 1, idx);
+            *(queue + tail * 8) = py * l.w + px + 1;
+            tail = tail + 1;
+        }
+        if (py > 0 && peek(l.fb + (py - 1) * l.w + px) == target) {
+            poke(l.fb + (py - 1) * l.w + px, idx);
+            *(queue + tail * 8) = (py - 1) * l.w + px;
+            tail = tail + 1;
+        }
+        if (py + 1 < l.h && peek(l.fb + (py + 1) * l.w + px) == target) {
+            poke(l.fb + (py + 1) * l.w + px, idx);
+            *(queue + tail * 8) = (py + 1) * l.w + px;
+            tail = tail + 1;
+        }
+    }
+    free(queue);
+}
+
+// Composite `src_layer` onto an ARGB destination buffer, placing
+// the layer's origin at (ox, oy) in destination coordinates. The
+// palette array is an 8-byte-stride word array of ARGB colors
+// (matching the layout core.bsm's g_palette uses, which in turn
+// matches gui_palette's expected input).
+//
+// dst_argb is laid out left-to-right, top-to-bottom, 4 bytes per
+// pixel in ARGB byte order (same as stbimage / img_save_png).
+// Out-of-bounds writes are clipped silently. Invisible or zero-
+// alpha layers are skipped.
+void layer_composite_indexed(dst_argb, dst_w, dst_h,
+                              src_layer, ox, oy, palette) {
+    auto l: Layer;
+    auto y, x, idx, color, sa, la;
+    auto dr, dg, db, da, sr, sg, sb;
+    auto or, og, ob, oa, dst_off;
+
+    l = src_layer;
+    if (l.visible == 0) { return; }
+    la = l.alpha;
+    if (la <= 0) { return; }
+
+    for (y = 0; y < l.h; y = y + 1) {
+        if (oy + y < 0)       { continue; }
+        if (oy + y >= dst_h)  { break; }
+        for (x = 0; x < l.w; x = x + 1) {
+            if (ox + x < 0)       { continue; }
+            if (ox + x >= dst_w)  { break; }
+
+            idx = peek(l.fb + y * l.w + x);
+            if (idx == 0) { continue; }      // transparent cell
+
+            // Palette lookup. Each slot is 8 bytes; low 32 bits
+            // are the ARGB value (matches g_palette layout).
+            color = *(palette + idx * 8);
+            sa = (color >> 24) & 0xFF;
+            if (sa == 0) { continue; }       // palette-transparent
+
+            sr = (color >> 16) & 0xFF;
+            sg = (color >> 8)  & 0xFF;
+            sb =  color        & 0xFF;
+
+            // Effective source alpha = palette alpha × layer alpha.
+            sa = (sa * la) / 255;
+
+            dst_off = ((oy + y) * dst_w + (ox + x)) * 4;
+            da = peek(dst_argb + dst_off + 3);
+            dr = peek(dst_argb + dst_off + 2);
+            dg = peek(dst_argb + dst_off + 1);
+            db = peek(dst_argb + dst_off);
+
+            if (l.blend == BLEND_MULTIPLY) {
+                // Multiply: channel * channel / 255 with alpha blend.
+                sr = (sr * dr) / 255;
+                sg = (sg * dg) / 255;
+                sb = (sb * db) / 255;
+            }
+
+            // Alpha blend: out = src*sa + dst*(255-sa), /255.
+            or = (sr * sa + dr * (255 - sa)) / 255;
+            og = (sg * sa + dg * (255 - sa)) / 255;
+            ob = (sb * sa + db * (255 - sa)) / 255;
+            // Destination alpha stays max(da, sa) so later passes
+            // don't erode coverage built up by earlier layers.
+            oa = da > sa ? da : sa;
+
+            poke(dst_argb + dst_off,     ob);
+            poke(dst_argb + dst_off + 1, og);
+            poke(dst_argb + dst_off + 2, or);
+            poke(dst_argb + dst_off + 3, oa);
+        }
+    }
 }

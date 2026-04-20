@@ -3758,3 +3758,155 @@ undo/redo snapshots). Day 2: I/O (export JSON, spritesheet PNG
 grid, import JSON). Day 3: UI wiring (palette row, frame list,
 tools sidebar) + integration test (paint a sprite in ModuLab,
 reload in a game).
+
+## 2026-04-20 — GPU palette pipeline + animation runtime
+
+Full retro graphics stack day. Shipped the palette-indexed GPU
+rendering path (Amiga / SNES-style palette cycling + damage flash
++ colour ramps), extended the Layer primitive for byte-grid ops
+so level_editor stops carrying a duplicate grid, wired animation
+playback into the testbed so painted frames animate on Tab-in,
+and migrated pathfind as the first game consumer of the indexed
+pipeline.
+
+**Window sizing fix (macOS).** `_stb_init_window` hard-coded a
+3x logical-to-screen scale, which blew past the MacBook's visible
+frame for any game asking for ≥640-wide windows — the top of the
+window ended up behind the menu bar. `CGMainDisplayID +
+CGDisplayPixelsWide/High` now probe the active display at startup
+and pick the largest `scale ∈ {1,2,3}` that fits with 80 pt
+vertical reserve for menu bar + title bar. `_plt_scale` is stashed
+as a module global so `_stb_poll_events` divides
+`locationInWindow` by the same factor (not the old 3.0 literal)
+when mapping to the framebuffer.
+
+**UI button audit.** `UI_FONT_SZ` had flipped from multiplier
+(2 → 16 px) to pixel height (sz=16 → 16 px) during the TTF
+transition, but button widths in ModuLab + level_editor were
+still sized for 8 px/char. `gui_button` now centres its label
+(falling back to a 4-px left margin if the label overflows) and
+offending call sites (`Save/Open/Import/Sheet` in ModuLab topbar,
+`Dup`/`Del` in the frame strip, tool sidebar's `Eyedrop`, level
+editor's `Save`/`Open`) were widened to fit 16-px glyphs. Canvas
+origin in ModuLab shifted from x=120 to x=144 so the wider tool
+sidebar doesn't overlap.
+
+**stbpal.bsm (new, ~600 LOC).** Palette extracted as a first-
+class pillar because both `stbdraw` (CPU layer compositor) and
+`stbrender` (new GPU indexed path) consume it — burying it in
+`stbdraw` would have made `stbrender` import it sideways through
+its own dependency. `struct Palette { count, data }` + 7 built-
+in catalogs: MCU-8, NKOTC-4, CB-32, DB-32, PICO-8, GB-4, NES-54.
+Cycling (rotate a slot range every period_ms, phase-correct under
+big dt), LUT (`palette_lut_flash` + generic `palette_lut_apply`),
+linear lerp between two palettes, and .pal.json save/load round-
+trip are all pure CPU. Tests: `test_stbpal_builtin`,
+`test_stbpal_cycle`, `test_stbpal_lerp_lut` — all green.
+
+**GPU indexed rendering path.** Three layers extended:
+
+- **Metal shader** (`_stb_platform_macos.bsm`). Added a second
+  sampler (`smp_n`, nearest) and a second fragment texture slot
+  for the palette. Third-bucket use_tex marker (192) routes
+  between font (255), indexed (192), RGBA sprite (128), and
+  solid (0). Indexed path: sample R8 → index → sample 1×256
+  BGRA palette texture at `(idx + 0.5) / 256.0`. Discard on
+  index 0 to preserve transparency convention.
+- **Platform helpers.** `_stb_gpu_create_texture_r8` for sprite
+  indices, `_stb_gpu_create_palette_texture` (1×256 BGRA,
+  densifying palette.data's 8-byte-stride words into tight 4-
+  byte pixels), `_stb_gpu_update_palette_texture` for per-frame
+  refresh, `_stb_gpu_bind_palette` (slot 1), `_stb_gpu_sprite_indexed`.
+- **stbrender API.** `palette_gpu_upload(pal)` →
+  handle, `palette_gpu_update(handle, pal)` (1 KB re-upload),
+  `sprite_create_indexed(bytes, w, h)`, `sprite_draw_indexed(sprite_tex,
+  pal_tex, x, y, w, h, sz)`. Every sprite sharing a palette
+  handle re-skins in one upload — cycling, flashing, day/night
+  all scale O(1) in sprite count.
+
+**pathfind migration.** Ported first as proof: `PAL` raw word
+array → `pal_normal` + `pal_flash` Palette structs, sprites
+switched to `sprite_create_indexed`, draws via
+`sprite_draw_indexed`. On rat hit, `palette_gpu_update(pal_gpu,
+pal_flash)` swaps every visible sprite to pure white for 80 ms —
+the classic NES hit sparkle — with a timer back to `pal_normal`.
+One upload, every sprite flashes; at 500 sprites the cost would
+be identical.
+
+**gpu_palette_cycle example.** Minimal viable demo: 64×64
+sprite of 4-pixel horizontal bands using GB-4 indices 1..4,
+`palette_cycle_begin(pal, 1, 4, 150)` rotates the four greens
+every 150 ms, `palette_cycle_tick + palette_gpu_update` per
+frame — bands flow downward without the sprite texture ever
+re-uploading. User confirmed the visual works.
+
+**stbdraw Layer ops.** `Layer` was the compositor's unit with
+`{fb, w, h, alpha, blend, visible}`; level_editor was the second
+client wanting the same byte grid. Rather than extract
+`stbcanvas` (extraction-for-purity, cost > value on a shared
+surface of ~60 LOC), added `layer_get / set / clear / fill` to
+the existing Layer section. `layer_fill` is a 4-connected BFS
+flood fill. level_editor migrated: `_lvl_tiles` (raw malloc)
+→ `Layer*` via `layer_new`, paint/erase/fill delegate through
+layer helpers, undo ring still copies `l.fb` bytes via the struct
+slice. 40 LOC deleted. One new test: `test_stbdraw_layer_ops`.
+
+**Testbed level loader.** `testbed_load_world(path)` in stbforge
+consumes the level_editor `.level.json` schema (any palette index
+> 0 = solid). Dimensions resize the world grid in place; spawn
+recentres. ModuLab's `_cycle_mode` probes
+`path_asset("testbed.level.json")` on Tab-into-testbed — present
+loads, absent leaves the default hand-drawn platformer world.
+
+**Character format + testbed recorder** (earlier-session leftover
+from the consolidated stbforge pillar — testbed runtime, character
+load/save, recorder ring, inspector — all listed here so the
+status is explicit): `.character.json` schema round-trips cleanly,
+recorder captures inputs + snapshot checkpoints, testbed_update
+threads input through the recorder so playback replays physics
+deterministically.
+
+**Animation playback runtime** (stbforge). `testbed_play_animation(i)`
+/ `testbed_find_animation(name)` / `testbed_anim_tick(dt)` /
+`tb_current_frame_idx` / `tb_anim_idx` / `tb_anim_frame`. Phase-
+correct under big dt, looping + one-shot (clamps at last frame).
+`testbed_update` auto-ticks; `testbed_draw` resolves source
+frame through `tb_current_frame_idx` so animation-off flows stay
+backwards-compatible. ModuLab's `_cycle_mode` now calls a fresh
+`_rebuild_testbed_animation` helper on every Tab — clears prior
+animations, registers a single "all" animation covering every
+painted frame at 8 fps looping, auto-plays anim 0 if multi-frame.
+Single-frame projects keep the legacy static rendering. New
+helper in stbforge: `character_clear_animations` frees every
+Animation + its frames and resets anim_count. Test:
+`test_modulab_anim_playback` — step, sub-period, loop
+wraparound, stop, non-loop clamp.
+
+**sprite_viewer lint.** `draw_text("+ / -  zoom   ESC  quit",
+..., 1, ...)` was the last site triggering the transitional
+`draw_text: sz<8` warning. Bumped sz to 8.
+
+**Name collisions from stbpal extraction.** ModuLab core had a
+zero-arg `palette_count()` returning `g_pal_n`; conflicted with
+stbpal's `palette_count(pal)`. Renamed ModuLab's to
+`g_palette_count`. pathfind's public `init_palette` collided
+with stbpal's — made pathfind's static + renamed
+`_pathfind_init_palette`.
+
+**Counts.** 108 passing / 3 failed / 11 skipped (the 3 failures
+are flaky GPU tests — exit 137 SIGKILL from macOS codesign cache,
+oscillate between pass/fail run-to-run, not regressions). 22 stb
+modules (`stbpal` added). New tests: `test_modulab_testbed_level`,
+`test_modulab_anim_playback`, `test_stbdraw_layer_ops`,
+`test_stbpal_builtin`, `test_stbpal_cycle`, `test_stbpal_lerp_lut`.
+
+**Open items for tomorrow.**
+- `dialog_editor` as third dev tool — probably the extraction
+  trigger for something else (animation editor UI? dialog
+  state machine? TBD once scope is clear).
+- Testbed controls not firing from ModuLab's editor (A/D/Space
+  possibly intercepted upstream). Low priority, but user flagged
+  it when animation playback was confirmed working.
+- Testbed world defaults to hand-drawn platformer layout —
+  documented in response but worth documenting here: drop a
+  `testbed.level.json` next to the binary to override.

@@ -16,6 +16,10 @@
 
 import "bpp_file.bsm";
 import "bpp_buf.bsm";
+// render_rect comes from stbrender (used by the atlas-grid fallback
+// drawer). Declaring the dep here keeps stbimage self-contained so
+// any caller that imports it gets a resolvable graph.
+import "stbrender.bsm";
 
 // ── Module state ─────────────────────────────────────────────
 
@@ -870,4 +874,233 @@ img_load(path) : io {
         print_err_ln();
     }
     return result;
+}
+
+// ═════════════════════════════════════════════════════════
+// PNG WRITER
+// ═════════════════════════════════════════════════════════
+//
+// Pair for the loader above. Accepts a 32-bit RGBA buffer (same
+// layout img_load produces) and emits a standards-compliant PNG.
+// No external dependencies, no libz — the DEFLATE stream uses
+// only uncompressed "stored" blocks so the writer is CRC32 +
+// ADLER32 + a few chunk headers.
+//
+// Round-trip-readable by img_load above; external tools (Preview,
+// browsers, `file`) accept the output because chunk CRCs are
+// valid and the uncompressed DEFLATE stream is canonical.
+//
+// Trade-off: no compression at all. A 256x256 RGBA image is
+// ~262 KB on disk vs ~30 KB with real DEFLATE. Acceptable for
+// pixel-art sprites and spritesheets; a proper DEFLATE encoder
+// can slot in later without changing the public API.
+
+// ── CRC32 table (IEEE polynomial, reversed 0xEDB88320) ───
+
+static extrn _png_crc_table;
+static extrn _png_crc_table_ready;
+
+// Populate the CRC table lazily on the first save. Keeps state_init
+// -like coupling out of this module — callers don't have to remember
+// a init_img_write() hook.
+static void _png_crc_init() {
+    auto i, j, c;
+    if (_png_crc_table_ready != 0) { return; }
+    _png_crc_table = malloc(256 * 8);
+    for (i = 0; i < 256; i = i + 1) {
+        c = i;
+        for (j = 0; j < 8; j = j + 1) {
+            if ((c & 1) != 0) { c = 0xEDB88320 ^ (c >> 1); }
+            else              { c = c >> 1; }
+        }
+        *(_png_crc_table + i * 8) = c;
+    }
+    _png_crc_table_ready = 1;
+}
+
+// CRC32 over `buf[0..len-1]`. The PNG spec folds the chunk type
+// bytes into the CRC along with the data, so callers pass a
+// concatenated buffer rather than type + data separately.
+static _png_crc32(buf, len) {
+    auto c, i, idx;
+    _png_crc_init();
+    c = 0xFFFFFFFF;
+    for (i = 0; i < len; i = i + 1) {
+        idx = (c ^ peek(buf + i)) & 0xFF;
+        c = *(_png_crc_table + idx * 8) ^ (c >> 8);
+    }
+    return c ^ 0xFFFFFFFF;
+}
+
+// ── ADLER32 (mod 65521) ──────────────────────────────────
+
+static _png_adler32(buf, len) {
+    auto a, b, i;
+    a = 1;
+    b = 0;
+    for (i = 0; i < len; i = i + 1) {
+        a = (a + peek(buf + i)) % 65521;
+        b = (b + a) % 65521;
+    }
+    return (b << 16) | a;
+}
+
+// ── Byte helpers ─────────────────────────────────────────
+
+// Write a big-endian 32-bit value at `buf + off`. Returns off + 4.
+static _put_be32(buf, off, v) {
+    poke(buf + off    , (v >> 24) & 0xFF);
+    poke(buf + off + 1, (v >> 16) & 0xFF);
+    poke(buf + off + 2, (v >> 8)  & 0xFF);
+    poke(buf + off + 3,  v        & 0xFF);
+    return off + 4;
+}
+
+static _put_le16(buf, off, v) {
+    poke(buf + off    ,  v       & 0xFF);
+    poke(buf + off + 1, (v >> 8) & 0xFF);
+    return off + 2;
+}
+
+// Copy `n` bytes from `src` to `dst + off`. Returns off + n.
+static _put_bytes(dst, off, src, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + off + i, peek(src + i));
+    }
+    return off + n;
+}
+
+// Emit one PNG chunk at `buf + off`: length(4 BE) + type(4) +
+// data(len) + crc(4). `type` is a 4-byte C-string. `data` may be
+// 0 when len is 0 (IEND). Returns the new offset.
+static _put_chunk(buf, off, type_str, data, len) {
+    auto crc_start, crc, i;
+    off = _put_be32(buf, off, len);
+    crc_start = off;
+    // Type bytes are part of the CRC, so we write them AS bytes.
+    for (i = 0; i < 4; i = i + 1) {
+        poke(buf + off + i, peek(type_str + i));
+    }
+    off = off + 4;
+    if (len > 0) { off = _put_bytes(buf, off, data, len); }
+    crc = _png_crc32(buf + crc_start, 4 + len);
+    off = _put_be32(buf, off, crc);
+    return off;
+}
+
+// ── DEFLATE (stored blocks only) ─────────────────────────
+
+// Build a zlib stream around the raw filtered pixel bytes. The
+// stream = CMF(1) + FLG(1) + stored-block chunks + adler32(4).
+// Each stored block holds at most 65535 bytes, final bit set on
+// the last one. Writes to `dst + off` and returns the new offset.
+static _put_deflate_stored(dst, off, src, src_len) {
+    auto pos, remaining, block_len, final_bit;
+
+    // CMF: deflate (bit 0..3 = 8) + window size 32K (bit 4..7 = 7).
+    // FLG: no preset dict, default compression. (CMF*256+FLG) % 31
+    // must be 0 per the zlib spec — 0x7801 satisfies that.
+    poke(dst + off,     0x78); off = off + 1;
+    poke(dst + off,     0x01); off = off + 1;
+
+    pos = 0;
+    while (pos < src_len) {
+        remaining = src_len - pos;
+        if (remaining > 65535) { block_len = 65535; final_bit = 0; }
+        else                    { block_len = remaining; final_bit = 1; }
+
+        // Block header: 1 byte. Low bit = BFINAL, next 2 = BTYPE.
+        // BTYPE=0 (stored). So byte is final_bit | (0<<1) = final_bit.
+        poke(dst + off, final_bit & 1); off = off + 1;
+        off = _put_le16(dst, off, block_len);
+        off = _put_le16(dst, off, (block_len ^ 0xFFFF) & 0xFFFF);
+        off = _put_bytes(dst, off, src + pos, block_len);
+        pos = pos + block_len;
+    }
+
+    off = _put_be32(dst, off, _png_adler32(src, src_len));
+    return off;
+}
+
+// ── Public API ───────────────────────────────────────────
+
+// Write an RGBA buffer to a PNG file. `rgba` must hold w*h*4 bytes
+// in top-to-bottom, left-to-right order with (R, G, B, A) stored
+// in that order (img_load's native layout). Returns 0 on success,
+// -1 on failure; failure prints a one-line stderr diagnostic.
+img_save_png(path, rgba, w, h) : io {
+    auto filtered, filtered_len, filtered_off, y, row_len;
+    auto out, off, ihdr, idat_cap, rc;
+    auto png_sig, zlib_buf, zlib_end;
+    auto type_ihdr, type_idat, type_iend;
+
+    // Filtered pixel stream: one filter byte (0 = None) per row
+    // followed by that row's RGBA bytes. Filter None keeps the
+    // encoder trivial; real compressors pick the filter per row.
+    row_len = w * 4;
+    filtered_len = h * (1 + row_len);
+    filtered = malloc(filtered_len);
+    filtered_off = 0;
+    for (y = 0; y < h; y = y + 1) {
+        poke(filtered + filtered_off, 0);
+        filtered_off = filtered_off + 1;
+        filtered_off = _put_bytes(filtered, filtered_off,
+                                  rgba + y * row_len, row_len);
+    }
+
+    // Worst-case output size: 8 (sig) + 12 + 13 (IHDR) +
+    //   12 + 2 + 4 + ceil(L / 65535) * 5 + L (IDAT with zlib wrap)
+    //   + 12 (IEND). Round up generously.
+    idat_cap = 32 + filtered_len + 32 + (filtered_len / 65535 + 1) * 8;
+
+    out = malloc(idat_cap);
+    off = 0;
+
+    // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+    png_sig = malloc(8);
+    poke(png_sig + 0, 0x89); poke(png_sig + 1, 0x50);
+    poke(png_sig + 2, 0x4E); poke(png_sig + 3, 0x47);
+    poke(png_sig + 4, 0x0D); poke(png_sig + 5, 0x0A);
+    poke(png_sig + 6, 0x1A); poke(png_sig + 7, 0x0A);
+    off = _put_bytes(out, off, png_sig, 8);
+    free(png_sig);
+
+    // IHDR chunk: 13 bytes.
+    ihdr = malloc(13);
+    _put_be32(ihdr, 0, w);
+    _put_be32(ihdr, 4, h);
+    poke(ihdr +  8, 8);   // bit depth
+    poke(ihdr +  9, 6);   // color type: 6 = RGBA (truecolour + alpha)
+    poke(ihdr + 10, 0);   // compression method (must be 0)
+    poke(ihdr + 11, 0);   // filter method (must be 0)
+    poke(ihdr + 12, 0);   // interlace method (0 = none)
+    type_ihdr = "IHDR";
+    off = _put_chunk(out, off, type_ihdr, ihdr, 13);
+    free(ihdr);
+
+    // IDAT chunk — zlib-wrapped uncompressed deflate. We build the
+    // zlib stream into a scratch buffer first so the chunk helper
+    // can CRC it in one pass.
+    zlib_buf = malloc(filtered_len + filtered_len / 65535 * 8 + 32);
+    zlib_end = _put_deflate_stored(zlib_buf, 0, filtered, filtered_len);
+    type_idat = "IDAT";
+    off = _put_chunk(out, off, type_idat, zlib_buf, zlib_end);
+    free(zlib_buf);
+
+    // IEND chunk: empty payload.
+    type_iend = "IEND";
+    off = _put_chunk(out, off, type_iend, 0, 0);
+
+    rc = file_write_all(path, out, off);
+    free(out);
+    free(filtered);
+
+    if (rc != 0) {
+        print_err_msg("stbimage: '");
+        print_err_msg(path);
+        print_err_msg("': write failed\n");
+        return 0 - 1;
+    }
+    return 0;
 }

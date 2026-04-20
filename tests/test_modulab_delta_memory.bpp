@@ -1,0 +1,64 @@
+// test_modulab_delta_memory.bpp — proves delta-undo keeps tiny
+// strokes tiny even on a 256×256 canvas.
+//
+// A single 5-cell stroke should allocate on the order of 1 KB —
+// far from the 33 MB a snapshot-based ring would reserve at n=256
+// (32 slots × 16 frames × 65536 bytes). This test doesn't measure
+// the allocator directly; it asserts the stroke's declared
+// capacity + count, which are proportional to the memory cost.
+
+import "stbgame.bsm";
+load "../tools/modulab/core.bsm";
+
+main() {
+    auto ds, d: DeltaStroke;
+
+    init_str();
+    state_init(256);
+
+    // Paint 5 cells in one stroke.
+    history_begin_stroke();
+    pix_set(0, 0, 1);
+    pix_set(1, 0, 2);
+    pix_set(2, 0, 3);
+    pix_set(3, 0, 4);
+    pix_set(4, 0, 5);
+    history_commit();
+
+    if (history_len() != 1) {
+        print_msg("FAIL: expected one committed stroke");
+        return 1;
+    }
+
+    // Reach into the ring and inspect the committed stroke.
+    ds = *(g_hist_slots + (g_frame_idx * MAX_UNDO + 0) * 8);
+    if (ds == 0) {
+        print_msg("FAIL: slot 0 is empty after commit");
+        return 1;
+    }
+    d = ds;
+
+    if (d.kind != KIND_CELLS) {
+        print_msg("FAIL: 5-cell stroke should stay in KIND_CELLS");
+        return 1;
+    }
+    if (d.count != 5) {
+        print_msg("FAIL: expected count=5 got ");
+        print_int(d.count); print_ln();
+        return 1;
+    }
+
+    // Capacity is 64 after one grow-cycle from initial 64 (no grow
+    // needed for 5 cells). Memory footprint = 64 * 16 = 1024 bytes
+    // plus the 48-byte header. Under 2 KB total, vs the 65 KB a
+    // snapshot would have taken for a 256×256 layer.
+    if (d.capacity > 128) {
+        print_msg("FAIL: 5-cell stroke should fit in initial capacity");
+        print_int(d.capacity); print_ln();
+        return 1;
+    }
+
+    state_free();
+    print_msg("OK");
+    return 0;
+}

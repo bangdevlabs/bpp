@@ -58,6 +58,70 @@ about the language it was written in.
 
 ## Active — in commit order
 
+### Shipped 2026-04-20 — moved to journal
+
+- ✅ `stbpal` — Palette struct + 7 built-in catalogs (MCU-8, NKOTC-4,
+  CB-32, DB-32, PICO-8, GB-4, NES-54). Cycling (phase-correct),
+  LUT remap (+ flash convenience), palette lerp, `.pal.json` load/
+  save. Three tests green.
+- ✅ GPU indexed rendering path — Metal shader 4th branch (marker
+  192), R8 sprite texture + 1×256 BGRA palette texture, palette
+  re-upload ≈ 1 KB / frame per palette. `palette_gpu_upload` +
+  `palette_gpu_update` + `sprite_create_indexed` +
+  `sprite_draw_indexed` in stbrender.
+- ✅ pathfind migrated to indexed path — damage flash via
+  `palette_gpu_update(pal_gpu, pal_flash)` on hit (every sprite
+  flashes white in a single 1 KB upload).
+- ✅ `examples/gpu_palette_cycle` demo — 64×64 GB-4 bands flowing
+  down at 150 ms/step.
+- ✅ stbdraw Layer byte-grid ops — `layer_get/set/clear/fill`
+  (flood 4-connected). level_editor migrated from raw malloc to
+  `Layer*`; 40 LOC of duplicated grid logic deleted.
+- ✅ stbforge testbed level loader — consumes level_editor's
+  `.level.json`; ModuLab auto-loads `testbed.level.json` on Tab.
+- ✅ stbforge animation runtime — `testbed_play_animation`,
+  `testbed_find_animation`, `testbed_anim_tick`,
+  `tb_current_frame_idx`. Loop + one-shot. ModuLab rebuilds an
+  "all frames" animation at 8 fps on every Tab-into-testbed.
+- ✅ macOS window-sizing fix — `_stb_init_window` now probes
+  CGDisplayPixels[Wide/High] and picks the max scale that fits
+  with menu-bar + title-bar reserve. Mouse divisor stays in sync
+  via `_plt_scale`.
+- ✅ UI button audit — `gui_button` centres labels, widths
+  adjusted in ModuLab + level_editor for TTF-era 16 px glyphs.
+- ✅ sprite_viewer default asset path routed through `path_asset`
+  (works from any cwd) + last `sz=1` warning fixed.
+
+### Tomorrow (2026-04-21) — dialog_editor
+
+Third dev tool. Whatever it ends up being (branching dialog
+state machine? animation timeline editor? scene composer?) the
+motivation is to become the second/third client of something
+currently modulab-local — that's what triggers the next
+extraction. Scope decision at start of session.
+
+Candidate directions:
+- **Dialog / cutscene editor** — node graph of lines + choices,
+  character portraits pulled from ModuLab sprite JSON, saves a
+  `.dialog.json` loadable at runtime by games.
+- **Animation editor** — explicit UI for building animations
+  (right now ModuLab auto-derives "all frames at 8 fps"). Scrub
+  timeline, per-anim fps, loop toggle, event markers.
+- **Scene composer** — wire level_editor tilemaps + ModuLab
+  sprites + character animations into a `.scene.json` the
+  testbed consumes.
+
+### Low-priority follow-ups
+
+- Testbed controls (A/D/Space) not firing from ModuLab editor.
+  Possibly upstream key interception. Investigate when dialog_editor
+  surfaces similar issues, or sooner if it blocks playtest flow.
+- Recorder `.` / `,` hotkeys bug (carried from earlier session —
+  keys map correctly in stbinput but UI doesn't fire them).
+- 3 flaky GPU tests (`test_gpu_circle/clear/shapes`) — exit 137
+  SIGKILL on macOS codesign cache, oscillate run-to-run. Not
+  regressions; the cache clears after a few runs.
+
 ### Shipped this sprint (2026-04-16/17) — moved to journal
 
 - ✅ Bug #1 (W025 regression) + Bug #2 (16-seed) — root cause was

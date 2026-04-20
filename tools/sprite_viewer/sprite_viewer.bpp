@@ -1,0 +1,146 @@
+// sprite_viewer.bpp — minimal viewer for ModuLab-produced sprite JSON.
+//
+// Loads any palette-indexed sprite written by ModuLab (or hand-
+// authored to the same { "data": [[idx,...]] } shape) and renders
+// it centred in a 640x480 window. Ships with the MCU-8 palette as
+// default — the same palette ModuLab's MCU universe produces and
+// pathfind's init_palette uses — so a sprite painted in the MCU
+// universe renders identically here as it does in the game.
+//
+// Usage:
+//   ./sprite_viewer                         → rat_sprite.json at 16x16
+//   ./sprite_viewer path/to/my.json         → 16x16 default
+//   ./sprite_viewer path/to/my.json 32      → explicit square size
+//
+// Keys:
+//   + / -    zoom in / out
+//   ESC      quit
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+
+// MCU-8 palette — mirrors pathfind.bpp:init_palette so painted
+// sprites render identically across the toolchain.
+static extrn _pal;
+
+static void _init_palette() {
+    _pal = malloc(8 * 4);
+    write_u32(_pal,  0, 0x00000000);  // 0: transparent
+    write_u32(_pal,  4, 0xFF000000);  // 1: black
+    write_u32(_pal,  8, 0xFF8C1A1A);  // 2: dark red
+    write_u32(_pal, 12, 0xFF808080);  // 3: gray
+    write_u32(_pal, 16, 0xFFFFA500);  // 4: orange
+    write_u32(_pal, 20, 0xFF008000);  // 5: green
+    write_u32(_pal, 24, 0xFF800080);  // 6: purple
+    write_u32(_pal, 28, 0xFFFFFF00);  // 7: yellow
+}
+
+// Parse a small positive integer from a null-terminated C string.
+// Returns the parsed value or 0 if the string has no leading digits.
+static _parse_uint(s) {
+    auto v, i, ch;
+    v = 0;
+    i = 0;
+    while (1) {
+        ch = peek(s + i);
+        if (ch < '0' || ch > '9') { break; }
+        v = v * 10 + (ch - '0');
+        i = i + 1;
+    }
+    return v;
+}
+
+main() {
+    auto path, size, spr, tex;
+    auto ok, scale, win_w, win_h;
+    auto draw_x, draw_y;
+
+    win_w = 640;
+    win_h = 480;
+
+    // Defaults. argv[1] is the JSON path, argv[2] the canvas side.
+    // The built-in default routes through path_asset so the
+    // viewer finds the sample sprite regardless of which
+    // directory it was launched from — path_asset walks the
+    // binary's parent dirs probing for the asset. User-supplied
+    // argv[1] paths pass through unchanged so absolute paths
+    // from a file dialog keep working.
+    size = 16;
+    if (argc_get() >= 2) {
+        path = argv_get(1);
+    } else {
+        path = path_asset("games/pathfind/assets/sprites/rat_sprite.json");
+    }
+    if (argc_get() >= 3) {
+        size = _parse_uint(argv_get(2));
+        if (size < 1) { size = 16; }
+    }
+
+    game_init(win_w, win_h, "Sprite Viewer", 60);
+    render_init();
+
+    _init_palette();
+
+    spr = malloc(size * size);
+    ok = load_sprite(path, spr, size, size);
+    if (ok == 0) {
+        print_err_msg("sprite_viewer: load_sprite failed for '");
+        print_err_msg(path);
+        print_err_msg("' at size ");
+        print_err_int(size);
+        print_err_msg(". Try a different size argument.\n");
+        free(spr);
+        game_end();
+        return 1;
+    }
+
+    tex = sprite_create(spr, _pal, size, size);
+
+    // Initial scale — pick whatever fits with a comfortable margin.
+    scale = 16;
+    while (size * scale > win_w - 80 || size * scale > win_h - 80) {
+        scale = scale - 1;
+        if (scale <= 0) { scale = 1; break; }
+    }
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        if (key_pressed(KEY_EQUAL) || key_pressed(KEY_RBRACKET)) {
+            if (size * (scale + 1) <= win_w - 40
+             && size * (scale + 1) <= win_h - 40) {
+                scale = scale + 1;
+            }
+        }
+        if (key_pressed(KEY_MINUS) || key_pressed(KEY_LBRACKET)) {
+            if (scale > 1) { scale = scale - 1; }
+        }
+
+        draw_x = (win_w - size * scale) / 2;
+        draw_y = (win_h - size * scale) / 2;
+
+        render_begin();
+        render_clear(rgba(24, 28, 38, 255));
+        sprite_draw(tex, draw_x, draw_y, size, size, scale);
+
+        // Overlay: path + current scale, drawn via CPU text after
+        // GPU sprite so it sits on top. Software framebuffer text
+        // is fine for a HUD line or two.
+        draw_text(path, 12, 8, 8, rgba(180, 200, 230, 255));
+        draw_number(12, 22, 8, rgba(140, 160, 190, 255), size);
+        draw_text("x", 44, 22, 8, rgba(140, 160, 190, 255));
+        draw_number(52, 22, 8, rgba(140, 160, 190, 255), size);
+        draw_text("scale:", 100, 22, 8, rgba(140, 160, 190, 255));
+        draw_number(152, 22, 8, rgba(140, 160, 190, 255), scale);
+        draw_text("+ / -  zoom   ESC  quit",
+                  win_w - 220, win_h - 18, 8,
+                  rgba(100, 110, 130, 255));
+        render_end();
+    }
+
+    free(spr);
+    free(_pal);
+    game_end();
+    return 0;
+}

@@ -898,6 +898,19 @@ Software framebuffer drawing. Same colour constants as `stbrender`.
 Colours: `BLACK`, `WHITE`, `RED`, `GREEN`, `BLUE`, `YELLOW`,
 `ORANGE`, `PURPLE`, `GRAY`, `DARKGRAY`.
 
+`Layer` is the palette-indexed byte-grid primitive shared by the
+compositor and any tool that wants a "canvas" (level_editor
+consumes it directly; modulab keeps its own wrapper on top).
+
+| Function | Description |
+|----------|-------------|
+| `layer_new(w, h, blend)` / `layer_free(l)` | Lifecycle |
+| `layer_get(l, x, y)` / `layer_set(l, x, y, idx)` | Bounds-safe single-cell access |
+| `layer_clear(l, idx)` | Fill the whole grid |
+| `layer_fill(l, x, y, idx)` | 4-connected flood fill |
+| `layer_set_alpha/visible/blend(l, v)` | Compositor parameters |
+| `layer_composite_indexed(dst, w, h, l, ox, oy, palette)` | Blit through palette onto ARGB destination |
+
 ### 14.3 stbrender — GPU Drawing
 
 Metal on macOS, Vulkan on Linux (planned). Same colours as
@@ -1048,15 +1061,48 @@ to the id-th element.
 
 ### 14.12 stbsprite — GPU Sprites
 
-Palette-indexed sprite loader + sheet animation helpers.
+Palette-indexed sprite loader + sheet animation helpers. Two
+paths: the legacy one expands a palette + index grid into an
+RGBA texture at creation (palette baked in), and the indexed
+path (below) uploads the index grid as-is plus a separate
+palette texture so runtime palette effects (cycling, flash,
+day/night fades) cost a single 1 KB re-upload per palette —
+every sprite sharing the palette re-skins in one call.
 
 | Function | Description |
 |----------|-------------|
 | `load_sprite(path, out, w, h)`         | Parse a JSON palette sprite |
-| `sprite_create(spr, pal, w, h)`        | Upload as GPU texture |
-| `sprite_draw(tex, x, y, w, h, scale)`  | Draw at integer scale |
+| `sprite_create(spr, pal, w, h)`        | Legacy: upload as RGBA texture |
+| `sprite_draw(tex, x, y, w, h, scale)`  | Legacy draw |
 | `sprite_draw_frame(tex, x, y, fw, fh, sheet_w, sheet_h, row, col, scale)` | Draw one cell of a spritesheet |
 | `anim_frame(elapsed_ms, fps, frame_count, loop)` | Pick current frame from a time accumulator |
+| `sprite_create_indexed(bytes, w, h)` | Indexed: upload R8 sprite texture (palette separate) |
+| `sprite_draw_indexed(sprite_tex, pal_tex, x, y, w, h, scale)` | Indexed draw — samples palette per-pixel in the shader |
+| `palette_gpu_upload(pal)` | Upload a `Palette*` as a 1×256 BGRA texture; returns a handle |
+| `palette_gpu_update(handle, pal)` | Re-upload palette contents (≈1 KB); same handle |
+
+### 14.12a stbpal — Palette catalog and effects
+
+A `Palette` is a named ARGB colour array (index 0 reserved for
+transparency) consumed by both the CPU layer compositor and the
+GPU indexed path. The same struct drives classic retro effects:
+palette cycling, look-up-table remaps (damage flash, day/night),
+linear interpolation between two palettes.
+
+| Function | Description |
+|----------|-------------|
+| `palette_builtin(id)` | Borrow a built-in; never freed by caller. IDs: `PAL_MCU_8`, `PAL_NKOTC_4`, `PAL_CB_32`, `PAL_DB_32`, `PAL_PICO_8`, `PAL_GB_4`, `PAL_NES_54` |
+| `palette_new(n)` / `palette_free(p)` / `palette_clone(p)` | Lifecycle |
+| `palette_get(p, i)` / `palette_set(p, i, argb)` / `palette_count(p)` / `palette_data(p)` | Accessors |
+| `palette_cycle_begin(p, start, count, period_ms)` | Register a rotating slot range |
+| `palette_cycle_tick(p, dt_ms)` | Advance every active cycle |
+| `palette_cycle_stop(p, start)` | Remove the cycle whose window starts at `start` |
+| `palette_lut_new(count)` / `palette_lut_free(lut)` | LUT lifecycle |
+| `palette_lut_set(lut, from_idx, to_idx)` | Remap one entry |
+| `palette_lut_flash(count, to_idx)` | Convenience: every non-transparent slot → `to_idx` (classic hit flash) |
+| `palette_lut_apply(src, lut, dst)` | Write `src`-through-`lut` into `dst` |
+| `palette_lerp(a, b, t, out)` | Per-channel blend at `t ∈ 0..255` |
+| `palette_load(path)` / `palette_save(p, path, name)` | `.pal.json` round-trip |
 
 ### 14.13 stbimage — PNG Loader
 

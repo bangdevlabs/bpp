@@ -12,14 +12,12 @@
 
 import "stbgame.bsm";
 import "stbrender.bsm";
-import "stbsprite.bsm";
 import "stbcol.bsm";
-import "bpp_file.bsm";
 import "stbecs.bsm";
-import "bpp_arena.bsm";
 import "stbpool.bsm";
 import "stbtile.bsm";
 import "stbpath.bsm";
+import "stbpal.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
@@ -38,22 +36,37 @@ const T_EMPTY = 0;
 const T_WALL  = 1;
 
 // ── Palette ──────────────────────────────────────────────
+//
+// The game uses stbpal's MCU-8 built-in for the sprite look-up
+// table — same 8 colors the hand-authored assets were painted
+// against in ModuLab. Two palette copies live in parallel:
+//
+//   pal_normal  — the baseline MCU-8 colors.
+//   pal_flash   — every non-transparent slot collapsed to white;
+//                 applied as a 2-frame flash when the rat takes
+//                 damage (the classic hit-sparkle effect).
+//
+// pal_gpu is the single GPU handle every sprite samples from;
+// swapping its contents (palette_gpu_update) swaps the visual
+// for every sprite on screen in one 1 KB upload.
 
-// Shared 8-color palette (ARGB u32 format). Allocated once in
-// init_palette and read thereafter — the classic GLOB_EXTRN contract.
-extrn PAL;
+extrn pal_normal, pal_flash, pal_gpu;
 
-// Allocate and fill the shared 8-color palette (ARGB u32 format).
-void init_palette() {
-    PAL = malloc(8 * 4);
-    write_u32(PAL, 0,  0x00000000);  // 0: transparent
-    write_u32(PAL, 4,  0xFF000000);  // 1: black
-    write_u32(PAL, 8,  0xFF8C1A1A);  // 2: dark red
-    write_u32(PAL, 12, 0xFF808080);  // 3: gray
-    write_u32(PAL, 16, 0xFFFFA500);  // 4: orange
-    write_u32(PAL, 20, 0xFF008000);  // 5: green
-    write_u32(PAL, 24, 0xFF800080);  // 6: purple
-    write_u32(PAL, 28, 0xFFFFFF00);  // 7: yellow
+static void _pathfind_init_palette() {
+    auto i;
+    init_palette();
+    // Borrow-then-clone so cycling / LUTs run against our own
+    // copy without mutating the shared MCU-8 catalog entry.
+    pal_normal = palette_clone(palette_builtin(PAL_MCU_8));
+    pal_flash  = palette_clone(pal_normal);
+    // Flash palette: every non-transparent slot → pure white so
+    // the hit sparkle reads instantly against the dark arena.
+    // Slot 0 stays transparent so hit-tests (alpha-zero pixels)
+    // are unaffected.
+    for (i = 1; i < 8; i = i + 1) {
+        palette_set(pal_flash, i, 0xFFFFFFFF);
+    }
+    pal_gpu = palette_gpu_upload(pal_normal);
 }
 
 // ── Game State ───────────────────────────────────────────
@@ -76,6 +89,12 @@ extrn cat_speed;
 
 // invuln is in milliseconds remaining on the rat after a hit.
 auto invuln_ms, game_over;
+// Damage-flash timer. >0 means the palette GPU handle currently
+// holds pal_flash; when it ticks down to 0 we re-upload
+// pal_normal. A short 80 ms window matches the classic NES
+// "hit sparkle" duration — any longer and the sprite feels
+// stuck in a dead state.
+auto flash_ms;
 
 extrn frame_arena;
 extrn world;
@@ -264,6 +283,15 @@ void update_mechanics(dt_ms) {
         invuln_ms = invuln_ms - dt_ms;
         if (invuln_ms < 0) { invuln_ms = 0; }
     }
+    // Decay the damage-flash timer. When it hits zero we re-upload
+    // the normal palette so sprites return to their painted look.
+    if (flash_ms > 0) {
+        flash_ms = flash_ms - dt_ms;
+        if (flash_ms <= 0) {
+            flash_ms = 0;
+            palette_gpu_update(pal_gpu, pal_normal);
+        }
+    }
     // The double guard above (invuln_ms > 0 then recompute) stays
     // explicit because the subtraction only fires while invuln is
     // active — collapsing with max(0, invuln_ms - dt_ms) would decay
@@ -279,6 +307,12 @@ void update_mechanics(dt_ms) {
             } else {
                 invuln_ms = 600;
             }
+            // Kick off a palette flash. 80 ms on every sprite is
+            // enough to read as "hit" without masking the rat's
+            // subsequent i-frame blink. One GPU upload does all
+            // sprites at once.
+            flash_ms = 80;
+            palette_gpu_update(pal_gpu, pal_flash);
 
             // Spawn 8 red damage particles. ECS state is already in
             // milli-units so positions go in directly.
@@ -343,15 +377,18 @@ main() {
     game_init(SCREEN_W, SCREEN_H, "Pathfind (B++ GPU)", 60);
     render_init();
 
-    init_palette();
+    _pathfind_init_palette();
 
     // Sprite buffers and GPU textures.
     spr_rat_data = malloc(SPR_SIZE * SPR_SIZE);
     spr_cat_data = malloc(SPR_SIZE * SPR_SIZE);
     load_sprite("assets/sprites/rat_sprite.json", spr_rat_data, SPR_SIZE, SPR_SIZE);
     load_sprite("assets/sprites/cat_sprite.json", spr_cat_data, SPR_SIZE, SPR_SIZE);
-    tex_rat = sprite_create(spr_rat_data, PAL, SPR_SIZE, SPR_SIZE);
-    tex_cat = sprite_create(spr_cat_data, PAL, SPR_SIZE, SPR_SIZE);
+    // Indexed upload: the sprite texture is 1 byte/pixel (palette
+    // index), and the palette lives in its own GPU texture so
+    // palette swaps (damage flash) re-skin every sprite at once.
+    tex_rat = sprite_create_indexed(spr_rat_data, SPR_SIZE, SPR_SIZE);
+    tex_cat = sprite_create_indexed(spr_cat_data, SPR_SIZE, SPR_SIZE);
 
     // World infrastructure: ECS for particles, arena for per-frame
     // scratch, tilemap for the arena geometry, A* pathfinder for the cat.
@@ -395,11 +432,15 @@ main() {
         // Rat sprite. Blinks every 100 ms while the iframe is active by
         // skipping the draw on odd timer ticks.
         if (invuln_ms == 0 || (score_timer_ms / 100) & 1) {
-            render_sprite(tex_rat, rat_x / 1000, rat_y / 1000, 1);
+            sprite_draw_indexed(tex_rat, pal_gpu,
+                                rat_x / 1000, rat_y / 1000,
+                                SPR_SIZE, SPR_SIZE, 1);
         }
 
         // Cat sprite.
-        render_sprite(tex_cat, cat_x / 1000, cat_y / 1000, 1);
+        sprite_draw_indexed(tex_cat, pal_gpu,
+                            cat_x / 1000, cat_y / 1000,
+                            SPR_SIZE, SPR_SIZE, 1);
 
         // Particles.
         update_particles(dt_ms);
@@ -424,7 +465,8 @@ main() {
     arena_free(frame_arena);
     free(spr_rat_data);
     free(spr_cat_data);
-    free(PAL);
+    palette_free(pal_normal);
+    palette_free(pal_flash);
     free(path_buf);
     path_free(pf);
     tile_free(tm);

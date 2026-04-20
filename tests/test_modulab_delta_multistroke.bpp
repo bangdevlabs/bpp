@@ -1,0 +1,98 @@
+// test_modulab_delta_multistroke.bpp — two interleaved strokes,
+// undo both, assert the canvas restores byte-for-byte to its
+// pre-stroke state. Exercises:
+//   - Delta recording across multiple strokes on overlapping cells.
+//   - Reverse-apply ordering (cells written twice must restore to
+//     their earliest recorded `old`, which is the pre-stroke value).
+//   - history_redo after a full undo walk returns to the tip state.
+
+import "stbgame.bsm";
+load "../tools/modulab/core.bsm";
+
+main() {
+    auto n, total, i, x, y;
+    auto pristine, after_a, after_b;
+
+    init_str();
+    state_init(8);
+
+    n = g_canvas_n;
+    total = n * n;
+
+    // Snapshot the pristine (all transparent) state.
+    pristine = malloc(total);
+    for (i = 0; i < total; i = i + 1) {
+        poke(pristine + i, peek(g_frame_data + i));
+    }
+
+    // Stroke A — diagonal, 5 cells in colour 3.
+    history_begin_stroke();
+    pix_set(0, 0, 3);
+    pix_set(1, 1, 3);
+    pix_set(2, 2, 3);
+    pix_set(3, 3, 3);
+    pix_set(4, 4, 3);
+    history_commit();
+
+    after_a = malloc(total);
+    for (i = 0; i < total; i = i + 1) {
+        poke(after_a + i, peek(g_frame_data + i));
+    }
+
+    // Stroke B — overlaps cell (2,2) with a different colour +
+    // touches two new cells.
+    history_begin_stroke();
+    pix_set(2, 2, 5);
+    pix_set(5, 0, 7);
+    pix_set(6, 0, 7);
+    history_commit();
+
+    after_b = malloc(total);
+    for (i = 0; i < total; i = i + 1) {
+        poke(after_b + i, peek(g_frame_data + i));
+    }
+
+    // Undo B — should return to after_a state exactly.
+    if (history_undo() == 0) { print_msg("FAIL: undo B returned 0"); return 1; }
+    for (i = 0; i < total; i = i + 1) {
+        if (peek(g_frame_data + i) != peek(after_a + i)) {
+            x = i % n; y = i / n;
+            print_msg("FAIL: after undo B, cell mismatch at ");
+            print_int(x); print_msg(","); print_int(y);
+            print_msg(" got "); print_int(peek(g_frame_data + i));
+            print_msg(" want "); print_int(peek(after_a + i));
+            print_ln();
+            return 1;
+        }
+    }
+
+    // Undo A — pristine state.
+    if (history_undo() == 0) { print_msg("FAIL: undo A returned 0"); return 1; }
+    for (i = 0; i < total; i = i + 1) {
+        if (peek(g_frame_data + i) != peek(pristine + i)) {
+            x = i % n; y = i / n;
+            print_msg("FAIL: after undo A, expected pristine at ");
+            print_int(x); print_msg(","); print_int(y); print_ln();
+            return 1;
+        }
+    }
+
+    // Redo A, then B — return to after_b.
+    if (history_redo() == 0) { print_msg("FAIL: redo A returned 0"); return 1; }
+    if (history_redo() == 0) { print_msg("FAIL: redo B returned 0"); return 1; }
+    for (i = 0; i < total; i = i + 1) {
+        if (peek(g_frame_data + i) != peek(after_b + i)) {
+            x = i % n; y = i / n;
+            print_msg("FAIL: after redo, expected after_b at ");
+            print_int(x); print_msg(","); print_int(y); print_ln();
+            return 1;
+        }
+    }
+
+    free(pristine);
+    free(after_a);
+    free(after_b);
+    state_free();
+    print_msg("OK");
+    return 0;
+}

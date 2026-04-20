@@ -11,10 +11,23 @@ import "bpp_maestro.bsm";
 
 struct Style { bg, fg, font_sz, padding, radius }
 
-// Default UI font size. Compile-time constant — every widget reads it
-// but nothing reassigns it, so `const` inlines the value at the call
-// sites and frees the name from the runtime globals table.
-const UI_FONT_SZ = 20;
+// Default UI font PIXEL HEIGHT. Passed directly as the `sz`
+// argument to draw_text / measure_text / draw_number, which the
+// rewritten stbdraw interprets as the target height in pixels
+// (no more multiplier-over-8x8 semantics). Bitmap fallback
+// rounds down to the nearest multiple of 8; TTF path uses it
+// directly as target pixel height. 16 is the post-TTF default —
+// keeps the visual at roughly what UI_FONT_SZ=2 (multiplier)
+// produced in the pre-change era.
+//
+// HISTORICAL NOTE: before the stbdraw sz-semantic change the
+// value was 2 (meaning 2×8 = 16 px tall under the old multiplier
+// rule). Before THAT it was 20 — accidentally treated as pixel
+// height and producing 160 px glyphs that bled over every widget.
+// Now sz is pixel height by contract, and 16 preserves the
+// corrected look without forcing stb or app callers to change
+// their draw_text arguments.
+const UI_FONT_SZ = 16;
 
 // Built-in styles. Allocated once in init_ui and never reassigned,
 // matching the GLOB_EXTRN contract (pointer frozen, struct fields can
@@ -22,6 +35,175 @@ const UI_FONT_SZ = 20;
 extrn _stl_default: Style;
 extrn _stl_button: Style;
 extrn _stl_panel: Style;
+
+// --- Theme ---
+// One Theme struct holds every design token the widgets consult.
+// `_theme` is a pointer to the currently-active Theme, set once by
+// init_ui (defaults to theme_dark) and swappable at any time via
+// theme_set / theme_dark / theme_light / theme_retro.
+//
+// Convention: widgets read only from _theme for default styling.
+// A caller-passed Style struct overrides the theme for one call.
+// Never hard-code an rgba inside a widget body — it defeats the
+// whole point of this struct.
+//
+// Naming chosen so "surface > surface_alt > surface_dim" reads as
+// increasing interactivity: idle → hover → depressed. Accent sits
+// outside that ladder because it's the one interactive hue that
+// isn't a grayscale step.
+
+struct Theme {
+    // ── Surfaces ── (backgrounds, in order of emphasis)
+    bg,                // page / window background
+    surface,           // panels, cards, dropdown content bg
+    surface_alt,       // hovered surface, dropdown-item hover
+    surface_dim,       // input fields, tooltips (darker than surface)
+    surface_pressed,   // button held down
+
+    // ── Accent ── (the one interactive hue)
+    accent,            // focus, selected, checked, active
+    accent_hover,      // blend target when hovering accent-less widget
+
+    // ── Borders ── (ring / outline colors)
+    border,            // default muted outline
+    border_strong,     // hover border, dropdown list border
+    border_focus,      // focus ring — typically matches accent
+
+    // ── Text ──
+    text,              // primary text on surfaces
+    text_muted,        // secondary labels, status bar
+    text_on_accent,    // text drawn on top of an accent-filled shape
+
+    // ── Buttons ──
+    button_bg,         // idle button background
+    button_hover_bg,   // blend TARGET (not source) during hover fade
+
+    // ── Radii ──
+    radius_sm,         // inputs, small chips (3-4 px)
+    radius_md,         // buttons (5-6 px)
+    radius_lg,         // panels, modals (7-8 px)
+
+    // ── Motion ──
+    anim_hover_ms,     // hover-fade duration
+    shadow_intensity,  // default alpha for draw_shadow
+}
+
+// Active theme. Pointer is frozen post-init but the struct it
+// points at can be mutated by a theme_* call at any time to
+// re-skin everything. Widgets read via _theme.<field> — mirrors
+// the _stl_* pattern above.
+extrn _theme: Theme;
+
+// Allocate + populate the theme to the canonical dark look the
+// repo has used since the Tier 1 hover-fade landed. Acts as the
+// default set by init_ui and is re-callable at runtime to reset
+// a customized theme back to baseline.
+void theme_dark() {
+    if (_theme == 0) { _theme = malloc(sizeof(Theme)); }
+
+    _theme.bg               = rgba( 15,  18,  26, 255);
+    _theme.surface          = rgba( 28,  32,  44, 255);
+    _theme.surface_alt      = rgba( 38,  46,  62, 255);
+    _theme.surface_dim      = rgba( 18,  22,  33, 255);
+    _theme.surface_pressed  = rgba( 38,  44,  58, 255);
+
+    _theme.accent           = rgba( 97, 218, 251, 255);
+    _theme.accent_hover     = rgba(130, 230, 255, 255);
+
+    _theme.border           = rgba( 70,  78,  96, 255);
+    _theme.border_strong    = rgba(130, 150, 180, 255);
+    _theme.border_focus     = rgba( 97, 218, 251, 255);
+
+    _theme.text             = WHITE;
+    _theme.text_muted       = rgba(200, 210, 220, 255);
+    _theme.text_on_accent   = rgba( 12,  18,  28, 255);
+
+    _theme.button_bg        = rgba( 58,  66,  86, 255);
+    _theme.button_hover_bg  = rgba( 90, 110, 150, 255);
+
+    _theme.radius_sm        = 3;
+    _theme.radius_md        = 6;
+    _theme.radius_lg        = 8;
+
+    _theme.anim_hover_ms    = 120;
+    _theme.shadow_intensity = 40;
+}
+
+// Light-mode preset. Surfaces are near-white; accent stays cyan
+// because it reads well on either. Text swaps to a dark slate so
+// it's legible on the light backgrounds.
+void theme_light() {
+    if (_theme == 0) { _theme = malloc(sizeof(Theme)); }
+
+    _theme.bg               = rgba(245, 247, 250, 255);
+    _theme.surface          = rgba(255, 255, 255, 255);
+    _theme.surface_alt      = rgba(235, 240, 248, 255);
+    _theme.surface_dim      = rgba(225, 230, 240, 255);
+    _theme.surface_pressed  = rgba(210, 218, 232, 255);
+
+    _theme.accent           = rgba( 30, 144, 220, 255);
+    _theme.accent_hover     = rgba( 55, 170, 245, 255);
+
+    _theme.border           = rgba(200, 208, 220, 255);
+    _theme.border_strong    = rgba(150, 165, 190, 255);
+    _theme.border_focus     = rgba( 30, 144, 220, 255);
+
+    _theme.text             = rgba( 20,  28,  40, 255);
+    _theme.text_muted       = rgba( 90, 100, 120, 255);
+    _theme.text_on_accent   = WHITE;
+
+    _theme.button_bg        = rgba(220, 226, 238, 255);
+    _theme.button_hover_bg  = rgba(180, 200, 232, 255);
+
+    _theme.radius_sm        = 3;
+    _theme.radius_md        = 6;
+    _theme.radius_lg        = 8;
+
+    _theme.anim_hover_ms    = 120;
+    _theme.shadow_intensity = 25;
+}
+
+// Retro preset — sharp corners, saturated flat colors, no hover
+// fade. Suits NES-ish games (Snake, Rhythm) where the smooth
+// modern look feels out of place. Accent is a warning-red to
+// pop on the muted background.
+void theme_retro() {
+    if (_theme == 0) { _theme = malloc(sizeof(Theme)); }
+
+    _theme.bg               = BLACK;
+    _theme.surface          = rgba( 40,  40,  40, 255);
+    _theme.surface_alt      = rgba( 60,  60,  60, 255);
+    _theme.surface_dim      = rgba( 20,  20,  20, 255);
+    _theme.surface_pressed  = rgba( 80,  80,  80, 255);
+
+    _theme.accent           = rgba(240,  80,  80, 255);
+    _theme.accent_hover     = rgba(255, 130, 130, 255);
+
+    _theme.border           = rgba(100, 100, 100, 255);
+    _theme.border_strong    = rgba(180, 180, 180, 255);
+    _theme.border_focus     = rgba(240,  80,  80, 255);
+
+    _theme.text             = WHITE;
+    _theme.text_muted       = rgba(180, 180, 180, 255);
+    _theme.text_on_accent   = WHITE;
+
+    _theme.button_bg        = rgba( 60,  60,  60, 255);
+    _theme.button_hover_bg  = rgba( 90,  90,  90, 255);
+
+    _theme.radius_sm        = 0;
+    _theme.radius_md        = 0;
+    _theme.radius_lg        = 0;
+
+    _theme.anim_hover_ms    = 0;
+    _theme.shadow_intensity = 0;
+}
+
+// Swap in a caller-built Theme. The pointer becomes the module's
+// active theme — callers who want to revert must keep a pointer
+// to the prior theme themselves.
+void theme_set(t) {
+    _theme = t;
+}
 
 // --- Layout Engine ---
 // Flex-like automatic positioning. Instead of manual x,y the programmer
@@ -59,34 +241,41 @@ auto _ui_arena_ptr;
 // Initialize UI defaults, styles, layout stack, and arena.
 // Called automatically by game_init().
 void init_ui() {
-    // Default style: white text on transparent background.
+    // Install the default theme BEFORE any style allocations —
+    // the styles derive their colors and radii from the theme, so
+    // the theme has to exist first. Callers can swap themes any
+    // time via theme_set / theme_light / theme_retro; this just
+    // guarantees a sane starting point.
+    theme_dark();
+
+    // Default style: primary text on transparent background.
     _stl_default = malloc(sizeof(Style));
-    _stl_default.bg = 0;
-    _stl_default.fg = WHITE;
+    _stl_default.bg      = 0;
+    _stl_default.fg      = _theme.text;
     _stl_default.font_sz = UI_FONT_SZ;
     _stl_default.padding = 4;
-    _stl_default.radius = 0;
+    _stl_default.radius  = 0;
 
-    // Button style: a muted blue-gray with rounded corners. The
-    // hover path is computed from this base via _ui_hover_fade so
-    // every button gets a consistent animated highlight without
-    // the style struct having to encode an "accent" field.
+    // Button style: theme-button base + medium radius. The hover
+    // path is computed from this base via _ui_hover_fade so every
+    // button gets a consistent animated highlight without the
+    // style struct having to encode an "accent" field.
     _stl_button = malloc(sizeof(Style));
-    _stl_button.bg = rgba(58, 66, 86, 255);
-    _stl_button.fg = WHITE;
+    _stl_button.bg      = _theme.button_bg;
+    _stl_button.fg      = _theme.text;
     _stl_button.font_sz = UI_FONT_SZ;
     _stl_button.padding = 10;
-    _stl_button.radius = 6;
+    _stl_button.radius  = _theme.radius_md;
 
-    // Panel style: dark slate with a softer corner radius. Panels
-    // are backdrops, not buttons, so the radius is larger to match
+    // Panel style: surface color + larger radius. Panels are
+    // backdrops, not buttons, so the radius is larger to match
     // card-style layouts.
     _stl_panel = malloc(sizeof(Style));
-    _stl_panel.bg = rgba(28, 32, 44, 255);
-    _stl_panel.fg = WHITE;
+    _stl_panel.bg      = _theme.surface;
+    _stl_panel.fg      = _theme.text;
     _stl_panel.font_sz = UI_FONT_SZ;
     _stl_panel.padding = 12;
-    _stl_panel.radius = 8;
+    _stl_panel.radius  = _theme.radius_lg;
 
     // Layout stack: 8 entries of sizeof(Layout) each.
     _lay_stack = malloc(8 * sizeof(Layout));
@@ -117,18 +306,14 @@ static extrn _ui_hover_id;
 static extrn _ui_hover_start_ms;
 static extrn _ui_pressed_id;
 
-// Hover fade duration in milliseconds. Short enough that the
-// motion feels responsive, long enough that the eye catches it.
-const _UI_FADE_MS = 120;
-
 // Return the 0..256 hover-fade amount for the widget at screen
 // position (rx, ry). Updates the module's hover slot as a side
 // effect. When the widget is not under the cursor, fade drops to
-// 0 instantly. Over time this can be upgraded to a symmetric
-// fade-in / fade-out; for now fade-out snap matches the one-day
-// time-box and looks fine on solid backgrounds.
+// 0 instantly. Duration comes from _theme.anim_hover_ms — a theme
+// with anim=0 (theme_retro) short-circuits to a boolean snap.
 _ui_hover_fade(rx, ry, hovered) {
-    auto id, elapsed;
+    auto id, elapsed, fade_ms;
+    fade_ms = _theme.anim_hover_ms;
     if (hovered == 0) {
         id = (rx << 16) | ry;
         if (_ui_hover_id == id) { _ui_hover_id = 0; }
@@ -139,9 +324,10 @@ _ui_hover_fade(rx, ry, hovered) {
         _ui_hover_id = id;
         _ui_hover_start_ms = beat_now_ms();
     }
+    if (fade_ms <= 0) { return 256; }
     elapsed = beat_now_ms() - _ui_hover_start_ms;
-    if (elapsed >= _UI_FADE_MS) { return 256; }
-    return elapsed * 256 / _UI_FADE_MS;
+    if (elapsed >= fade_ms) { return 256; }
+    return elapsed * 256 / fade_ms;
 }
 
 // Update the module's "pressed" widget slot. Called by gui_button
@@ -375,9 +561,12 @@ void gui_panel_s(x, y, w, h, style) {
     // Soft shadow behind the card — three alpha-blended layers
     // via draw_shadow_rounded so the shadow corners match the
     // panel's corners. Skipped on radius=0 panels where square
-    // chrome looks fine without falloff.
+    // chrome looks fine without falloff. Panel shadows are a
+    // notch stronger than button shadows (they're bigger
+    // elements that sit on top of backgrounds, not next to peers).
     if (s.radius > 0) {
-        draw_shadow_rounded(x, y, w, h, s.radius, 50);
+        draw_shadow_rounded(x, y, w, h, s.radius,
+                            _theme.shadow_intensity + 10);
     }
     draw_rounded_rect(x, y, w, h, s.radius, s.bg);
     lay_push(x, y, w, h, s.padding, LAY_DOWN);
@@ -401,7 +590,7 @@ void gui_panel_s(x, y, w, h, style) {
 gui_button(x, y, w, h, label) {
     auto s: Style;
     auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
-    auto y_off;
+    auto y_off, tw, tx;
 
     s = _stl_button;
     rx = lay_x(x);
@@ -415,22 +604,29 @@ gui_button(x, y, w, h, label) {
     held = hover != 0 && _ui_is_pressed(rx, ry);
 
     fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(s.bg, rgba(90, 110, 150, 255), fade);
-    if (held != 0) { bg = rgba(38, 44, 58, 255); }
+    bg = lerp_color(s.bg, _theme.button_hover_bg, fade);
+    if (held != 0) { bg = _theme.surface_pressed; }
 
     y_off = held != 0 ? 1 : 0;
 
-    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
+    if (held == 0) { draw_shadow(rx, ry, w, h, _theme.shadow_intensity); }
     draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
 
     // Top-edge highlight — skipped when pressed (the button is
     // no longer catching light from above).
     if (held == 0 && s.radius > 0) {
-        hl = lerp_color(bg, rgba(255, 255, 255, 255), 40);
+        hl = lerp_color(bg, WHITE, 40);
         draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
     }
 
-    draw_text(label, rx + 10,
+    // Center the label horizontally. Falls back to a 4-px left
+    // margin when the label is wider than the button so the
+    // leading characters stay readable instead of disappearing
+    // off the left edge.
+    tw = measure_text(label, UI_FONT_SZ);
+    tx = rx + (w - tw) / 2;
+    if (tx < rx + 4) { tx = rx + 4; }
+    draw_text(label, tx,
               ry + y_off + (h / 2) - (UI_FONT_SZ / 2),
               UI_FONT_SZ, s.fg);
     _lay_advance(w, h);
@@ -441,10 +637,11 @@ gui_button(x, y, w, h, label) {
 
 // Styled button. Same render stack as gui_button but pulls bg /
 // fg / padding / radius / font_sz from the caller's Style. The
-// hover accent is always a blend toward the built-in accent
-// rgba(90, 110, 150, 255) — keeping it as a fixed target means
-// every button in the program glows the same color on hover even
-// when the base color is customised.
+// hover target is always the current theme's button_hover_bg —
+// keeping that as a fixed target means every button in the
+// program glows the same color on hover, regardless of whether
+// it's using the default style or a custom one, and swapping
+// themes re-skins the hover across the entire app.
 gui_button_s(x, y, w, h, label, style) {
     auto s: Style;
     auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
@@ -462,16 +659,16 @@ gui_button_s(x, y, w, h, label, style) {
     held = hover != 0 && _ui_is_pressed(rx, ry);
 
     fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(s.bg, rgba(90, 110, 150, 255), fade);
+    bg = lerp_color(s.bg, _theme.button_hover_bg, fade);
     if (held != 0) { bg = lerp_color(s.bg, BLACK, 80); }
 
     y_off = held != 0 ? 1 : 0;
 
-    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
+    if (held == 0) { draw_shadow(rx, ry, w, h, _theme.shadow_intensity); }
     draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
 
     if (held == 0 && s.radius > 0) {
-        hl = lerp_color(bg, rgba(255, 255, 255, 255), 40);
+        hl = lerp_color(bg, WHITE, 40);
         draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
     }
 
@@ -590,22 +787,19 @@ gui_text_input(ti, x, y, w, h) : io {
         else            { t.focused = 0; }
     }
 
-    // Visual styling. The border colour lerps between grey (idle)
-    // and accent cyan as hover + focus ramp up. Focused wins over
-    // hover so the border reads as "this one is active" even while
-    // the cursor drifts over another field.
-    radius = 4;
+    // Visual styling. Border lerps muted → strong on hover; a
+    // focused field locks the border to accent regardless so the
+    // "this one is active" signal is never ambiguous.
+    radius = _theme.radius_sm + 1;
     fade = _ui_hover_fade(rx, ry, hover != 0);
     if (t.focused != 0) {
-        border = rgba(97, 218, 251, 255);
-        bg     = rgba(18, 22, 33, 255);
+        border = _theme.border_focus;
+        bg     = _theme.surface_dim;
     } else {
-        border = lerp_color(rgba(70, 78, 96, 255),
-                            rgba(130, 150, 180, 255),
-                            fade);
-        bg     = rgba(12, 15, 22, 255);
+        border = lerp_color(_theme.border, _theme.border_strong, fade);
+        bg     = _theme.surface_dim;
     }
-    text_color = WHITE;
+    text_color = _theme.text;
 
     // Rounded rim — fill a slightly larger rect in the border
     // colour, then punch the interior back to bg. Cheaper than
@@ -623,7 +817,12 @@ gui_text_input(ti, x, y, w, h) : io {
     // process-wall clock so every focused field across every
     // program blinks in sync.
     if (t.focused != 0) {
-        caret_x = rx + 4 + t.len * 8 * UI_FONT_SZ;
+        // Char-width approximation: at UI_FONT_SZ=16 the bitmap
+        // path renders 16 px per char, so char_w ≈ UI_FONT_SZ.
+        // TTF would use proportional widths but this caret is for
+        // display only — precise TTF caret positioning can arrive
+        // when it's needed.
+        caret_x = rx + 4 + t.len * UI_FONT_SZ;
         if (caret_x >= rx + w - 2) { caret_x = rx + w - 2; }
         caret_on = (beat_now_ms() / 500) & 1;
         if (caret_on == 0) {
@@ -754,17 +953,20 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
         // cursor hovers somewhere else.
         if (i == selected) {
             draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
-                              rgba(97, 218, 251, 255));
+                              _theme.accent);
             draw_rounded_rect(cx + pad, cy + pad,
                               cell_size - 2 * pad, cell_size - 2 * pad,
                               radius, color);
         } else if (hover != 0) {
             draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
-                              rgba(180, 195, 220, 255));
+                              _theme.border_strong);
             draw_rounded_rect(cx + 1, cy + 1,
                               cell_size - 2, cell_size - 2,
                               radius, color);
         } else {
+            // Separator outline — a very dark translucent ring
+            // so adjacent swatches stay distinguishable regardless
+            // of the theme's surface colour.
             draw_rounded_rect(cx, cy, cell_size, cell_size, radius + 1,
                               rgba(0, 0, 0, 200));
             draw_rounded_rect(cx + 1, cy + 1,
@@ -795,9 +997,8 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) : io {
 
 gui_checkbox(x, y, val_ptr, label) : io {
     auto rx, ry, mx, my, hover, clicked, val, box_sz, fade;
-    auto bg, border, accent, label_w;
+    auto bg, border, label_w;
     box_sz = 14;
-    accent = rgba(97, 218, 251, 255);
 
     rx = lay_x(x);
     ry = lay_y(y);
@@ -816,27 +1017,29 @@ gui_checkbox(x, y, val_ptr, label) : io {
     }
 
     fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(rgba(18, 22, 33, 255), rgba(28, 36, 52, 255), fade);
-    border = val != 0 ? accent : rgba(70, 78, 96, 255);
+    bg = lerp_color(_theme.surface_dim, _theme.surface_alt, fade);
+    border = val != 0 ? _theme.accent : _theme.border;
 
     // Rim ring: fill slightly larger rounded rect in border color,
     // then punch inside back to bg.
-    draw_rounded_rect(rx - 1, ry - 1, box_sz + 2, box_sz + 2, 3, border);
-    draw_rounded_rect(rx, ry, box_sz, box_sz, 2, bg);
+    draw_rounded_rect(rx - 1, ry - 1, box_sz + 2, box_sz + 2,
+                      _theme.radius_sm, border);
+    draw_rounded_rect(rx, ry, box_sz, box_sz,
+                      _theme.radius_sm - 1, bg);
 
     // Checkmark when checked — 4 stepped squares form a diagonal
     // tick from bottom-left to top-right. Deliberately chunky so
     // it reads clearly on the 14px box.
     if (val != 0) {
-        draw_rect(rx + 3, ry + 7, 2, 2, accent);
-        draw_rect(rx + 5, ry + 9, 2, 2, accent);
-        draw_rect(rx + 7, ry + 6, 2, 2, accent);
-        draw_rect(rx + 9, ry + 3, 2, 2, accent);
+        draw_rect(rx + 3, ry + 7, 2, 2, _theme.accent);
+        draw_rect(rx + 5, ry + 9, 2, 2, _theme.accent);
+        draw_rect(rx + 7, ry + 6, 2, 2, _theme.accent);
+        draw_rect(rx + 9, ry + 3, 2, 2, _theme.accent);
     }
 
     draw_text(label, rx + box_sz + 6,
               ry + (box_sz / 2) - (UI_FONT_SZ / 2),
-              UI_FONT_SZ, WHITE);
+              UI_FONT_SZ, _theme.text);
 
     _lay_advance(box_sz + 6 + label_w, box_sz + 4);
     return val;
@@ -851,21 +1054,20 @@ gui_checkbox(x, y, val_ptr, label) : io {
 // Example:
 //   auto options;
 //   options = malloc(3 * 8);
-//   *(options + 0) = "None";
-//   *(options + 1) = "2x2";
-//   *(options + 2) = "4x4";
+//   *(options + 0 * 8) = "None";
+//   *(options + 1 * 8) = "2x2";
+//   *(options + 2 * 8) = "4x4";
 //   dither = gui_radio(x, y, dither, options, 3);
+// options is a word-array (8 bytes per slot). Always stride
+// with `+ i * 8`; `+ 0`, `+ 1` would overlap the pointers and
+// crash draw_text on the first render.
 
 gui_radio(x, y, selected, options, n) : io {
     auto rx, ry, mx, my, i, new_sel, yoff, hover, clicked;
     auto opt, circle_r, row_h, label_w, hit_w;
-    auto accent, idle, bg;
 
     circle_r = 7;
     row_h = 20;
-    accent = rgba(97, 218, 251, 255);
-    idle   = rgba(70, 78, 96, 255);
-    bg     = rgba(18, 22, 33, 255);
 
     rx = lay_x(x);
     ry = lay_y(y);
@@ -882,29 +1084,28 @@ gui_radio(x, y, selected, options, n) : io {
         clicked = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
         if (clicked != 0) { new_sel = i; }
 
-        // Outer ring: accent when selected, idle otherwise.
+        // Outer ring: accent when selected, muted border otherwise.
         // "Circle" is a rounded-rect with r = circle_r → fully
         // rounded so the corner stepping forms a ~circle.
-        auto ring, fill_c;
-        ring = i == new_sel ? accent : idle;
+        auto ring;
+        ring = i == new_sel ? _theme.accent : _theme.border;
         draw_rounded_rect(rx, ry + yoff + row_h / 2 - circle_r,
                           circle_r * 2, circle_r * 2, circle_r, ring);
-        fill_c = bg;
         draw_rounded_rect(rx + 1, ry + yoff + row_h / 2 - circle_r + 1,
                           circle_r * 2 - 2, circle_r * 2 - 2,
-                          circle_r - 1, fill_c);
+                          circle_r - 1, _theme.surface_dim);
 
         // Inner dot for the selected radio. 4px wide so the center
         // is visually distinct from the ring without dominating.
         if (i == new_sel) {
             draw_rounded_rect(rx + 4, ry + yoff + row_h / 2 - circle_r + 4,
                               circle_r * 2 - 8, circle_r * 2 - 8,
-                              circle_r - 4, accent);
+                              circle_r - 4, _theme.accent);
         }
 
         draw_text(opt, rx + circle_r * 2 + 6,
                   ry + yoff + row_h / 2 - UI_FONT_SZ / 2,
-                  UI_FONT_SZ, WHITE);
+                  UI_FONT_SZ, _theme.text);
     }
 
     _lay_advance(120, n * row_h);
@@ -928,20 +1129,22 @@ gui_radio(x, y, selected, options, n) : io {
 //   auto universe_open: byte, universe_sel: byte;
 //   auto labels;
 //   labels = malloc(3 * 8);
-//   *(labels + 0) = "NKOTC";
-//   *(labels + 1) = "CB";
-//   *(labels + 2) = "MCU";
+//   *(labels + 0 * 8) = "NKOTC";
+//   *(labels + 1 * 8) = "CB";
+//   *(labels + 2 * 8) = "MCU";
 //   universe_sel = gui_dropdown(x, y, 120, labels, 3,
 //                                &universe_sel, &universe_open);
+// IMPORTANT: labels is a word-array (8 bytes per slot). `*(p + i)`
+// does BYTE arithmetic on the pointer, so writing with `+ 0`,
+// `+ 1`, `+ 2` overlaps adjacent strings and yields garbage
+// pointers that crash inside draw_text. Always use `+ i * 8`.
 
 gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) : io {
     auto rx, ry, mx, my, hover_btn, click_btn, btn_h;
     auto selected, is_open;
-    auto i, item_y, hover_item, click_item, opt, label_w;
+    auto i, item_y, hover_item, click_item, opt;
     auto bg, border, fade, arrow_x, arrow_y;
-    auto accent;
 
-    accent = rgba(97, 218, 251, 255);
     btn_h = 22;
 
     rx = lay_x(x);
@@ -962,30 +1165,32 @@ gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) : io {
     }
 
     fade = _ui_hover_fade(rx, ry, hover_btn != 0);
-    bg = lerp_color(rgba(28, 32, 44, 255), rgba(38, 46, 62, 255), fade);
-    border = is_open != 0 ? accent : rgba(70, 78, 96, 255);
+    bg = lerp_color(_theme.surface, _theme.surface_alt, fade);
+    border = is_open != 0 ? _theme.accent : _theme.border;
 
-    draw_rounded_rect(rx - 1, ry - 1, w + 2, btn_h + 2, 5, border);
-    draw_rounded_rect(rx, ry, w, btn_h, 4, bg);
+    draw_rounded_rect(rx - 1, ry - 1, w + 2, btn_h + 2,
+                      _theme.radius_md - 1, border);
+    draw_rounded_rect(rx, ry, w, btn_h,
+                      _theme.radius_sm + 1, bg);
 
     // Current selection label.
     if (n > 0 && selected >= 0 && selected < n) {
         opt = *(labels + selected * 8);
         draw_text(opt, rx + 8, ry + btn_h / 2 - UI_FONT_SZ / 2,
-                  UI_FONT_SZ, WHITE);
+                  UI_FONT_SZ, _theme.text);
     }
 
     // Chevron — 3-row pyramid pointing down (closed) or up (open).
     arrow_x = rx + w - 14;
     arrow_y = ry + btn_h / 2 - 2;
     if (is_open != 0) {
-        draw_rect(arrow_x + 3, arrow_y,     2, 1, WHITE);
-        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, WHITE);
-        draw_rect(arrow_x,     arrow_y + 2, 8, 1, WHITE);
+        draw_rect(arrow_x + 3, arrow_y,     2, 1, _theme.text);
+        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, _theme.text);
+        draw_rect(arrow_x,     arrow_y + 2, 8, 1, _theme.text);
     } else {
-        draw_rect(arrow_x,     arrow_y,     8, 1, WHITE);
-        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, WHITE);
-        draw_rect(arrow_x + 3, arrow_y + 2, 2, 1, WHITE);
+        draw_rect(arrow_x,     arrow_y,     8, 1, _theme.text);
+        draw_rect(arrow_x + 2, arrow_y + 1, 4, 1, _theme.text);
+        draw_rect(arrow_x + 3, arrow_y + 2, 2, 1, _theme.text);
     }
 
     // Expansion list when open. Click-outside closes without
@@ -995,11 +1200,16 @@ gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) : io {
         list_y = ry + btn_h + 2;
         list_h = n * btn_h;
 
-        // Shadowed panel behind the list for depth.
-        draw_shadow_rounded(rx, list_y, w, list_h, 4, 60);
-        draw_rounded_rect(rx - 1, list_y - 1, w + 2, list_h + 2, 5,
-                          rgba(70, 78, 96, 255));
-        draw_rounded_rect(rx, list_y, w, list_h, 4, rgba(28, 32, 44, 255));
+        // Shadowed panel behind the list for depth. Dropdown
+        // shadow is bumped above the default to separate the
+        // floating list from the content below it.
+        draw_shadow_rounded(rx, list_y, w, list_h,
+                            _theme.radius_sm + 1,
+                            _theme.shadow_intensity + 20);
+        draw_rounded_rect(rx - 1, list_y - 1, w + 2, list_h + 2,
+                          _theme.radius_md - 1, _theme.border);
+        draw_rounded_rect(rx, list_y, w, list_h,
+                          _theme.radius_sm + 1, _theme.surface);
 
         for (i = 0; i < n; i = i + 1) {
             item_y = list_y + i * btn_h;
@@ -1008,16 +1218,17 @@ gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) : io {
 
             if (hover_item != 0) {
                 draw_rect(rx + 2, item_y + 1, w - 4, btn_h - 2,
-                          rgba(58, 78, 110, 255));
+                          _theme.surface_alt);
             }
             if (i == selected) {
-                draw_rect(rx + 2, item_y + 1, 2, btn_h - 2, accent);
+                draw_rect(rx + 2, item_y + 1, 2, btn_h - 2,
+                          _theme.accent);
             }
 
             opt = *(labels + i * 8);
             draw_text(opt, rx + 8,
                       item_y + btn_h / 2 - UI_FONT_SZ / 2,
-                      UI_FONT_SZ, WHITE);
+                      UI_FONT_SZ, _theme.text);
 
             if (click_item != 0) {
                 selected = i;
@@ -1091,8 +1302,8 @@ gui_slider(x, y, w, val, min, max) : io {
 
     // Track: full width, muted. Fill portion: accent up to knob.
     fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg   = rgba(38, 44, 58, 255);
-    fill = rgba(97, 218, 251, 255);
+    bg   = _theme.surface_pressed;
+    fill = _theme.accent;
     track_y = ry + (knob_w - track_h) / 2;
 
     draw_rounded_rect(rx, track_y, w, track_h, track_h / 2, bg);
@@ -1101,7 +1312,9 @@ gui_slider(x, y, w, val, min, max) : io {
         draw_rounded_rect(rx, track_y, knob_x, track_h, track_h / 2, fill);
     }
 
-    // Knob: larger when hovered/pressed.
+    // Knob: larger when hovered/pressed. Knob color lerps from
+    // white toward the accent so the knob reads as "on top of"
+    // the track even when the user hasn't touched it.
     auto k_sz;
     k_sz = knob_w;
     if (_ui_pressed_id == id || hover != 0) { k_sz = knob_w + 2; }
@@ -1128,9 +1341,9 @@ gui_slider(x, y, w, val, min, max) : io {
 
 gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) : io {
     auto rx, ry, mx, my, hover, press, release, held, fade, bg;
-    auto y_off, accent, dx, dy;
+    auto y_off, dx, dy, r;
 
-    accent = rgba(97, 218, 251, 255);
+    r = _theme.radius_md;
     rx = lay_x(x);
     ry = lay_y(y);
     mx = mouse_x();
@@ -1142,17 +1355,21 @@ gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) : io {
     held = hover != 0 && _ui_is_pressed(rx, ry);
 
     fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(_stl_button.bg, rgba(90, 110, 150, 255), fade);
-    if (held != 0) { bg = rgba(38, 44, 58, 255); }
+    bg = lerp_color(_theme.button_bg, _theme.button_hover_bg, fade);
+    if (held != 0) { bg = _theme.surface_pressed; }
 
     y_off = held != 0 ? 1 : 0;
 
-    if (held == 0) { draw_shadow(rx, ry, w, h, 40); }
-    draw_rounded_rect(rx, ry + y_off, w, h, 6, bg);
+    if (held == 0) { draw_shadow(rx, ry, w, h, _theme.shadow_intensity); }
+    draw_rounded_rect(rx, ry + y_off, w, h, r, bg);
 
+    // "Selected" state (toolbar active tool) rings the body in
+    // the accent so it reads as a toggle even when the hover
+    // fade is at 0.
     if (selected != 0) {
-        draw_rounded_rect(rx - 1, ry + y_off - 1, w + 2, h + 2, 7, accent);
-        draw_rounded_rect(rx, ry + y_off, w, h, 6, bg);
+        draw_rounded_rect(rx - 1, ry + y_off - 1, w + 2, h + 2,
+                          r + 1, _theme.accent);
+        draw_rounded_rect(rx, ry + y_off, w, h, r, bg);
     }
 
     // Centre the sprite in the button. Uses the GPU sprite path.
@@ -1214,7 +1431,7 @@ gui_scroll_view(x, y, w, h, content_h, scroll_y) : io {
     track_x = rx + w - bar_w;
     track_h = h;
     draw_rounded_rect(track_x, ry, bar_w, track_h, bar_w / 2,
-                      rgba(28, 32, 44, 255));
+                      _theme.surface_dim);
 
     // Thumb height is proportional to viewport / content. Clamp
     // to a minimum so the thumb is grabbable on tall content.
@@ -1246,13 +1463,14 @@ gui_scroll_view(x, y, w, h, content_h, scroll_y) : io {
         scroll_y = drag_y * max_scroll / (h - thumb_h);
     }
 
-    // Thumb color tracks interaction state.
+    // Thumb color tracks interaction state — pressed promotes to
+    // accent, hover to the stronger border, idle stays muted.
     if (_ui_pressed_id == id) {
-        bg = rgba(97, 218, 251, 255);
+        bg = _theme.accent;
     } else if (hover_thumb != 0) {
-        bg = rgba(130, 150, 180, 255);
+        bg = _theme.border_strong;
     } else {
-        bg = rgba(70, 78, 96, 255);
+        bg = _theme.border;
     }
     draw_rounded_rect(track_x, thumb_y, bar_w, thumb_h, bar_w / 2, bg);
 
@@ -1270,11 +1488,11 @@ gui_scroll_view(x, y, w, h, content_h, scroll_y) : io {
 
 gui_tabs(x, y, tab_w, labels, n, selected) : io {
     auto rx, ry, mx, my, i, yoff, tab_h;
-    auto hover, click, opt, bg, accent;
-    auto new_sel, fade;
+    auto hover, click, opt, bg, baseline;
+    auto new_sel, fade, r;
 
     tab_h = 26;
-    accent = rgba(97, 218, 251, 255);
+    r = _theme.radius_sm + 2;
     rx = lay_x(x);
     ry = lay_y(y);
     mx = mouse_x();
@@ -1290,28 +1508,32 @@ gui_tabs(x, y, tab_w, labels, n, selected) : io {
 
         fade = _ui_hover_fade(rx + yoff, ry, hover != 0);
         if (i == new_sel) {
-            // Active tab: slightly lifted, accent top stripe.
-            bg = rgba(38, 46, 62, 255);
+            // Active tab: slightly lifted on surface_alt, with
+            // an accent top stripe that matches the baseline below.
+            bg = _theme.surface_alt;
             draw_rounded_rect(rx + yoff + 1, ry, tab_w - 2, tab_h + 2,
-                              5, bg);
-            draw_rect(rx + yoff + 5, ry, tab_w - 10, 2, accent);
+                              r, bg);
+            draw_rect(rx + yoff + 5, ry, tab_w - 10, 2, _theme.accent);
         } else {
-            // Inactive: darker, slightly recessed.
-            bg = lerp_color(rgba(20, 24, 34, 255),
-                            rgba(30, 36, 50, 255), fade);
+            // Inactive tabs fade between bg and surface on hover so
+            // the user gets tactile feedback even before clicking.
+            bg = lerp_color(_theme.bg, _theme.surface, fade);
             draw_rounded_rect(rx + yoff + 1, ry + 2, tab_w - 2, tab_h - 2,
-                              5, bg);
+                              r, bg);
         }
 
         draw_text(opt,
                   rx + yoff + tab_w / 2 - measure_text(opt, UI_FONT_SZ) / 2,
                   ry + tab_h / 2 - UI_FONT_SZ / 2,
-                  UI_FONT_SZ, WHITE);
+                  UI_FONT_SZ, _theme.text);
     }
 
     // Baseline — 1px strip under all tabs that meets the active
-    // tab's bottom edge, completing the folder-tab illusion.
-    draw_rect(rx, ry + tab_h, n * tab_w, 1, rgba(97, 218, 251, 100));
+    // tab's bottom edge, completing the folder-tab illusion. We
+    // drop the accent to 40% alpha so it reads as a hint rather
+    // than a full separator.
+    baseline = (_theme.accent & 0x00FFFFFF) | (100 << 24);
+    draw_rect(rx, ry + tab_h, n * tab_w, 1, baseline);
 
     _lay_advance(n * tab_w, tab_h + 4);
     return new_sel;
@@ -1328,7 +1550,7 @@ gui_tabs(x, y, tab_w, labels, n, selected) : io {
 // tip; clamps to an 800×600 viewport by default.
 
 void gui_tooltip(text) : io {
-    auto mx, my, tx, ty, tw, th, pad;
+    auto mx, my, tx, ty, tw, th, pad, border, bg;
     pad = 4;
     mx = mouse_x();
     my = mouse_y();
@@ -1340,11 +1562,17 @@ void gui_tooltip(text) : io {
     if (tx + tw > 800) { tx = mx - tw - 4; }
     if (ty + th > 600) { ty = my - th - 4; }
 
-    draw_shadow(tx, ty, tw, th, 50);
-    draw_rounded_rect(tx - 1, ty - 1, tw + 2, th + 2, 4,
-                      rgba(97, 218, 251, 200));
-    draw_rounded_rect(tx, ty, tw, th, 3, rgba(20, 24, 34, 240));
-    draw_text(text, tx + pad, ty + pad, UI_FONT_SZ, WHITE);
+    // Border uses accent colour at 80% alpha so the tip reads as
+    // "attention" without glaring; bg uses surface_dim at 94% so
+    // a pixel of content can still show through the backdrop.
+    border = (_theme.accent      & 0x00FFFFFF) | (200 << 24);
+    bg     = (_theme.surface_dim & 0x00FFFFFF) | (240 << 24);
+
+    draw_shadow(tx, ty, tw, th, _theme.shadow_intensity + 10);
+    draw_rounded_rect(tx - 1, ty - 1, tw + 2, th + 2,
+                      _theme.radius_sm + 1, border);
+    draw_rounded_rect(tx, ty, tw, th, _theme.radius_sm, bg);
+    draw_text(text, tx + pad, ty + pad, UI_FONT_SZ, _theme.text);
 }
 
 // ─── Status bar ─────────────────────────────────────────────
@@ -1356,10 +1584,14 @@ void gui_tooltip(text) : io {
 void gui_status_bar(y, w, text, color) : io {
     auto bg, height;
     height = 18;
-    if (color == 0) { bg = rgba(18, 22, 33, 255); }
+    // Theme default: darkest surface. Caller-provided color wins
+    // when non-zero so error / success states can tint the bar.
+    if (color == 0) { bg = _theme.surface_dim; }
     else            { bg = color; }
     draw_rect(0, y, w, height, bg);
-    draw_rect(0, y, w, 1, rgba(60, 68, 84, 255));
+    // 1-pixel top edge so the bar separates visually from the
+    // viewport above even when bg matches the viewport bg closely.
+    draw_rect(0, y, w, 1, _theme.border);
     draw_text(text, 8, y + height / 2 - UI_FONT_SZ / 2,
-              UI_FONT_SZ, rgba(200, 210, 220, 255));
+              UI_FONT_SZ, _theme.text_muted);
 }

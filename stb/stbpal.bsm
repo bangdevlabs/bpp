@@ -1,0 +1,798 @@
+// stbpal.bsm — palette catalog + palette effects for retro games.
+//
+// A Palette is a named, fixed-size list of ARGB colors with index 0
+// reserved for transparency. The same Palette struct drives two
+// unrelated consumers:
+//
+//   CPU path (stbdraw)    — layer_composite_indexed samples
+//                            palette.data directly when it blits
+//                            palette-indexed framebuffers to ARGB.
+//   GPU path (stbrender)  — palette_gpu_upload stages the palette
+//                            as a 1xN MTLTexture, sprites sampled
+//                            indexed at draw time look up colors
+//                            in the fragment shader.
+//
+// Both paths share the same CPU-side helpers for palette cycling,
+// LUT remapping, and linear interpolation between two palettes.
+// A CPU-side update (e.g. palette_cycle_tick) + a GPU re-upload
+// (palette_gpu_update, 4 bytes per color = 128 bytes for a 32-color
+// palette) means every sprite sharing the GPU handle animates in
+// unison — Amiga / SNES-style palette animation.
+//
+// The struct stays intentionally tiny: count + data pointer. Raw
+// data access (`palette.data`) is part of the public API so render
+// hot loops don't go through accessors.
+
+import "bpp_file.bsm";
+import "bpp_str.bsm";
+import "bpp_buf.bsm";
+
+// ── Struct ───────────────────────────────────────────────
+
+struct Palette {
+    count,  // number of colors (including the reserved index 0)
+    data    // malloc'd buffer, count * 8 bytes, each slot stores
+            // one ARGB word at offset i*8
+}
+
+// ── Built-in palette identifiers ─────────────────────────
+//
+// Passed to palette_builtin. Numeric values are arbitrary but
+// stable — applications may persist them in prefs or level files.
+
+extrn PAL_MCU_8;       // 8-color ModuLab / pathfind default
+extrn PAL_NKOTC_4;     // 4-color NES tile (black, red, white + transparent)
+extrn PAL_CB_32;       // 32-color Captain Buddy (grays/reds/greens/blues)
+extrn PAL_DB_32;       // 32-color DawnBringer 32 — the classic pixel-art
+                       // reference palette (Aseprite default)
+extrn PAL_PICO_8;      // 16-color PICO-8 fantasy-console palette
+extrn PAL_GB_4;        // 4-color Game Boy greens
+extrn PAL_NES_54;      // 54-color NES-style spread
+
+// Storage for the 7 built-in Palette records. Allocated lazily on
+// first palette_builtin call, then reused for the whole process.
+// Caller treats the returned pointer as borrowed — DO NOT free.
+static extrn _pal_builtins;
+static extrn _pal_builtins_init;
+
+// ── Core API ─────────────────────────────────────────────
+
+// Allocate an empty palette with `n` slots, all zero (transparent).
+// Caller fills via palette_set or a preset loader, then frees
+// with palette_free.
+palette_new(n) {
+    auto p: Palette, i;
+    p = malloc(sizeof(Palette));
+    p.count = n;
+    p.data  = malloc(n * 8);
+    for (i = 0; i < n; i = i + 1) {
+        *(p.data + i * 8) = 0;
+    }
+    return p;
+}
+
+void palette_free(pal) {
+    auto p: Palette;
+    if (pal == 0) { return; }
+    p = pal;
+    if (p.data != 0) { free(p.data); }
+    free(pal);
+}
+
+// Deep copy. Useful when an app wants to mutate a built-in
+// without stomping on the shared catalog (palette cycling, LUT
+// application).
+palette_clone(pal) {
+    auto src: Palette, dst: Palette, i;
+    src = pal;
+    dst = palette_new(src.count);
+    for (i = 0; i < src.count; i = i + 1) {
+        *(dst.data + i * 8) = *(src.data + i * 8);
+    }
+    return dst;
+}
+
+palette_count(pal) : base {
+    auto p: Palette;
+    p = pal;
+    return p.count;
+}
+
+// Fetch the ARGB word at index `i`. Returns 0 (fully transparent)
+// for out-of-range queries so calling code doesn't crash on a stale
+// index after a palette-size change.
+palette_get(pal, i) : base {
+    auto p: Palette;
+    p = pal;
+    if (i < 0 || i >= p.count) { return 0; }
+    return *(p.data + i * 8);
+}
+
+void palette_set(pal, i, argb) {
+    auto p: Palette;
+    p = pal;
+    if (i < 0 || i >= p.count) { return; }
+    *(p.data + i * 8) = argb;
+}
+
+// Raw data pointer. Hot loops (layer compositor, GPU upload) read
+// straight from here. Caller must honour the count * 8 layout —
+// writing past count causes out-of-bounds damage on future reads.
+palette_data(pal) : base {
+    auto p: Palette;
+    p = pal;
+    return p.data;
+}
+
+// ── Built-in catalog ─────────────────────────────────────
+
+// Fill a fresh Palette with MCU-8 — the reference 8-color spread
+// shared by ModuLab's MCU universe, pathfind's init_palette, and
+// level_editor's default. Kept byte-for-byte so cross-tool sprites
+// render identically.
+static void _fill_mcu_8(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data + 0 * 8) = 0x00000000;  // 0: transparent
+    *(pp.data + 1 * 8) = 0xFF000000;  // 1: black
+    *(pp.data + 2 * 8) = 0xFF8C1A1A;  // 2: dark red
+    *(pp.data + 3 * 8) = 0xFF808080;  // 3: gray
+    *(pp.data + 4 * 8) = 0xFFFFA500;  // 4: orange
+    *(pp.data + 5 * 8) = 0xFF008000;  // 5: green
+    *(pp.data + 6 * 8) = 0xFF800080;  // 6: purple
+    *(pp.data + 7 * 8) = 0xFFFFFF00;  // 7: yellow
+}
+
+// NES-style minimalist — honours the hardware rule of 3 colors +
+// transparent per sprite slot.
+static void _fill_nkotc_4(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data + 0 * 8) = 0x00000000;  // 0: transparent
+    *(pp.data + 1 * 8) = 0xFF0C0C0C;  // 1: NES black
+    *(pp.data + 2 * 8) = 0xFFE40000;  // 2: NES red
+    *(pp.data + 3 * 8) = 0xFFFCFCFC;  // 3: NES white
+}
+
+// Captain Buddy 32-color — organised as 4 rows of 8 (grays / reds
+// / greens / blues) so UI palette pickers can lay it out as a
+// 4x8 grid.
+static void _fill_cb_32(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data +  0 * 8) = 0x00000000;  //  0: transparent
+    *(pp.data +  1 * 8) = 0xFF000000;  //  1: black
+    *(pp.data +  2 * 8) = 0xFF202028;  //  2: ink
+    *(pp.data +  3 * 8) = 0xFF404048;  //  3: dark slate
+    *(pp.data +  4 * 8) = 0xFF606070;  //  4: slate
+    *(pp.data +  5 * 8) = 0xFF909098;  //  5: stone
+    *(pp.data +  6 * 8) = 0xFFC0C0C8;  //  6: silver
+    *(pp.data +  7 * 8) = 0xFFFFFFFF;  //  7: white
+    *(pp.data +  8 * 8) = 0xFF3A0000;  //  8: blood
+    *(pp.data +  9 * 8) = 0xFF8C1A1A;  //  9: dark red
+    *(pp.data + 10 * 8) = 0xFFD43030;  // 10: red
+    *(pp.data + 11 * 8) = 0xFFFF7070;  // 11: pink
+    *(pp.data + 12 * 8) = 0xFF3A1F00;  // 12: brown
+    *(pp.data + 13 * 8) = 0xFFA05000;  // 13: dark orange
+    *(pp.data + 14 * 8) = 0xFFFF9020;  // 14: orange
+    *(pp.data + 15 * 8) = 0xFFFFD080;  // 15: peach
+    *(pp.data + 16 * 8) = 0xFF505000;  // 16: olive
+    *(pp.data + 17 * 8) = 0xFFA09000;  // 17: mustard
+    *(pp.data + 18 * 8) = 0xFFFFE000;  // 18: yellow
+    *(pp.data + 19 * 8) = 0xFFFFF8B0;  // 19: cream
+    *(pp.data + 20 * 8) = 0xFF003018;  // 20: forest
+    *(pp.data + 21 * 8) = 0xFF006030;  // 21: green
+    *(pp.data + 22 * 8) = 0xFF40B050;  // 22: grass
+    *(pp.data + 23 * 8) = 0xFFA0E080;  // 23: mint
+    *(pp.data + 24 * 8) = 0xFF003040;  // 24: deep teal
+    *(pp.data + 25 * 8) = 0xFF006890;  // 25: teal
+    *(pp.data + 26 * 8) = 0xFF40B0D0;  // 26: cyan
+    *(pp.data + 27 * 8) = 0xFF002080;  // 27: navy
+    *(pp.data + 28 * 8) = 0xFF2060E0;  // 28: blue
+    *(pp.data + 29 * 8) = 0xFF80A0FF;  // 29: sky
+    *(pp.data + 30 * 8) = 0xFF600080;  // 30: purple
+    *(pp.data + 31 * 8) = 0xFFD070E0;  // 31: magenta
+}
+
+// DawnBringer 32 — the default Aseprite palette and a de-facto
+// standard for modern indie pixel art. Index 0 is transparent so
+// the palette plays nice with the rest of the catalog; remaining
+// 32 entries are Dawnbringer's original ordering (dark to light,
+// then hue-clustered). Reference values match the published hex
+// codes exactly.
+static void _fill_db_32(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data +  0 * 8) = 0x00000000;  //  0: transparent
+    *(pp.data +  1 * 8) = 0xFF000000;  //  1: black
+    *(pp.data +  2 * 8) = 0xFF222034;  //  2: dark blue
+    *(pp.data +  3 * 8) = 0xFF45283C;  //  3: plum
+    *(pp.data +  4 * 8) = 0xFF663931;  //  4: brown
+    *(pp.data +  5 * 8) = 0xFF8F563B;  //  5: tan
+    *(pp.data +  6 * 8) = 0xFFDF7126;  //  6: orange
+    *(pp.data +  7 * 8) = 0xFFD9A066;  //  7: sandstone
+    *(pp.data +  8 * 8) = 0xFFEEC39A;  //  8: cream
+    *(pp.data +  9 * 8) = 0xFFFBF236;  //  9: yellow
+    *(pp.data + 10 * 8) = 0xFF99E550;  // 10: green
+    *(pp.data + 11 * 8) = 0xFF6ABE30;  // 11: forest
+    *(pp.data + 12 * 8) = 0xFF37946E;  // 12: sea
+    *(pp.data + 13 * 8) = 0xFF4B692F;  // 13: olive
+    *(pp.data + 14 * 8) = 0xFF524B24;  // 14: dark olive
+    *(pp.data + 15 * 8) = 0xFF323C39;  // 15: slate
+    *(pp.data + 16 * 8) = 0xFF3F3F74;  // 16: steel blue
+    *(pp.data + 17 * 8) = 0xFF306082;  // 17: teal
+    *(pp.data + 18 * 8) = 0xFF5B6EE1;  // 18: blue
+    *(pp.data + 19 * 8) = 0xFF639BFF;  // 19: sky
+    *(pp.data + 20 * 8) = 0xFF5FCDE4;  // 20: cyan
+    *(pp.data + 21 * 8) = 0xFFCBDBFC;  // 21: ice
+    *(pp.data + 22 * 8) = 0xFFFFFFFF;  // 22: white
+    *(pp.data + 23 * 8) = 0xFF9BADB7;  // 23: silver
+    *(pp.data + 24 * 8) = 0xFF847E87;  // 24: stone
+    *(pp.data + 25 * 8) = 0xFF696A6A;  // 25: gray
+    *(pp.data + 26 * 8) = 0xFF595652;  // 26: charcoal
+    *(pp.data + 27 * 8) = 0xFF76428A;  // 27: purple
+    *(pp.data + 28 * 8) = 0xFFAC3232;  // 28: red
+    *(pp.data + 29 * 8) = 0xFFD95763;  // 29: pink
+    *(pp.data + 30 * 8) = 0xFFD77BBA;  // 30: magenta
+    *(pp.data + 31 * 8) = 0xFF8F974A;  // 31: olive green
+}
+
+// PICO-8 fantasy-console — 16 colors, a widely recognised retro
+// spread popularised by Lexaloffle's console. Index 0 is
+// transparent per our convention; original slot 0 (black) is
+// shifted to index 1 and so on (15 non-transparent entries).
+static void _fill_pico_8(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data +  0 * 8) = 0x00000000;  //  0: transparent
+    *(pp.data +  1 * 8) = 0xFF000000;  //  1: black
+    *(pp.data +  2 * 8) = 0xFF1D2B53;  //  2: dark blue
+    *(pp.data +  3 * 8) = 0xFF7E2553;  //  3: dark purple
+    *(pp.data +  4 * 8) = 0xFF008751;  //  4: dark green
+    *(pp.data +  5 * 8) = 0xFFAB5236;  //  5: brown
+    *(pp.data +  6 * 8) = 0xFF5F574F;  //  6: dark gray
+    *(pp.data +  7 * 8) = 0xFFC2C3C7;  //  7: light gray
+    *(pp.data +  8 * 8) = 0xFFFFF1E8;  //  8: white
+    *(pp.data +  9 * 8) = 0xFFFF004D;  //  9: red
+    *(pp.data + 10 * 8) = 0xFFFFA300;  // 10: orange
+    *(pp.data + 11 * 8) = 0xFFFFEC27;  // 11: yellow
+    *(pp.data + 12 * 8) = 0xFF00E436;  // 12: green
+    *(pp.data + 13 * 8) = 0xFF29ADFF;  // 13: blue
+    *(pp.data + 14 * 8) = 0xFF83769C;  // 14: lavender
+    *(pp.data + 15 * 8) = 0xFFFF77A8;  // 15: pink
+}
+
+// Game Boy DMG — the original four-shade green LCD palette.
+// Iconic, tiny, and a perfect tester for palette cycling /
+// sunset fades (lerp it with a warmer 4-color palette and watch
+// the screen drift from green dawn to amber dusk).
+static void _fill_gb_4(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data + 0 * 8) = 0x00000000;  // 0: transparent
+    *(pp.data + 1 * 8) = 0xFF0F380F;  // 1: darkest green
+    *(pp.data + 2 * 8) = 0xFF306230;  // 2: dark green
+    *(pp.data + 3 * 8) = 0xFF8BAC0F;  // 3: light green
+    *(pp.data + 4 * 8) = 0xFF9BBC0F;  // 4: lightest green
+}
+
+// NES-accurate 54 colors. A superset useful for authentic NES
+// art; games targeting a specific cart colour scheme pick 4-slot
+// sub-palettes from this pool.
+static void _fill_nes_54(p) {
+    auto pp: Palette;
+    pp = p;
+    *(pp.data +  0 * 8) = 0x00000000;  //  0: transparent
+    // Row 0 — grays + dark blues.
+    *(pp.data +  1 * 8) = 0xFF7C7C7C;  //  1: gray
+    *(pp.data +  2 * 8) = 0xFF0000FC;  //  2: blue
+    *(pp.data +  3 * 8) = 0xFF0000BC;  //  3: dark blue
+    *(pp.data +  4 * 8) = 0xFF4428BC;  //  4: violet
+    *(pp.data +  5 * 8) = 0xFF940084;  //  5: magenta
+    *(pp.data +  6 * 8) = 0xFFA80020;  //  6: red
+    *(pp.data +  7 * 8) = 0xFFA81000;  //  7: red-orange
+    *(pp.data +  8 * 8) = 0xFF881400;  //  8: brown
+    *(pp.data +  9 * 8) = 0xFF503000;  //  9: olive
+    *(pp.data + 10 * 8) = 0xFF007800;  // 10: forest
+    *(pp.data + 11 * 8) = 0xFF006800;  // 11: green
+    *(pp.data + 12 * 8) = 0xFF005800;  // 12: dark green
+    *(pp.data + 13 * 8) = 0xFF004058;  // 13: deep teal
+    // Row 1 — mid tones.
+    *(pp.data + 14 * 8) = 0xFFBCBCBC;  // 14: silver
+    *(pp.data + 15 * 8) = 0xFF0078F8;  // 15: light blue
+    *(pp.data + 16 * 8) = 0xFF0058F8;  // 16: azure
+    *(pp.data + 17 * 8) = 0xFF6844FC;  // 17: lavender
+    *(pp.data + 18 * 8) = 0xFFD800CC;  // 18: pink magenta
+    *(pp.data + 19 * 8) = 0xFFE40058;  // 19: hot pink
+    *(pp.data + 20 * 8) = 0xFFF83800;  // 20: scarlet
+    *(pp.data + 21 * 8) = 0xFFE45C10;  // 21: orange
+    *(pp.data + 22 * 8) = 0xFFAC7C00;  // 22: bronze
+    *(pp.data + 23 * 8) = 0xFF00B800;  // 23: grass
+    *(pp.data + 24 * 8) = 0xFF00A800;  // 24: lime
+    *(pp.data + 25 * 8) = 0xFF00A844;  // 25: mint
+    *(pp.data + 26 * 8) = 0xFF008888;  // 26: teal
+    // Row 2 — highlights.
+    *(pp.data + 27 * 8) = 0xFFF8F8F8;  // 27: white
+    *(pp.data + 28 * 8) = 0xFF3CBCFC;  // 28: sky blue
+    *(pp.data + 29 * 8) = 0xFF6888FC;  // 29: periwinkle
+    *(pp.data + 30 * 8) = 0xFF9878F8;  // 30: light violet
+    *(pp.data + 31 * 8) = 0xFFF878F8;  // 31: lilac
+    *(pp.data + 32 * 8) = 0xFFF85898;  // 32: coral
+    *(pp.data + 33 * 8) = 0xFFF87858;  // 33: peach
+    *(pp.data + 34 * 8) = 0xFFFCA044;  // 34: amber
+    *(pp.data + 35 * 8) = 0xFFF8B800;  // 35: gold
+    *(pp.data + 36 * 8) = 0xFFB8F818;  // 36: chartreuse
+    *(pp.data + 37 * 8) = 0xFF58D854;  // 37: spring
+    *(pp.data + 38 * 8) = 0xFF58F898;  // 38: aqua
+    *(pp.data + 39 * 8) = 0xFF00E8D8;  // 39: turquoise
+    // Row 3 — pastels.
+    *(pp.data + 40 * 8) = 0xFFFCFCFC;  // 40: snow
+    *(pp.data + 41 * 8) = 0xFFA4E4FC;  // 41: pale blue
+    *(pp.data + 42 * 8) = 0xFFB8B8F8;  // 42: pale lilac
+    *(pp.data + 43 * 8) = 0xFFD8B8F8;  // 43: pale violet
+    *(pp.data + 44 * 8) = 0xFFF8B8F8;  // 44: pale pink
+    *(pp.data + 45 * 8) = 0xFFF8A4C0;  // 45: pale rose
+    *(pp.data + 46 * 8) = 0xFFF0D0B0;  // 46: pale peach
+    *(pp.data + 47 * 8) = 0xFFFCE0A8;  // 47: pale amber
+    *(pp.data + 48 * 8) = 0xFFF8D878;  // 48: sunflower
+    *(pp.data + 49 * 8) = 0xFFD8F878;  // 49: pale chartreuse
+    *(pp.data + 50 * 8) = 0xFFB8F8B8;  // 50: pale mint
+    *(pp.data + 51 * 8) = 0xFFB8F8D8;  // 51: pale spring
+    *(pp.data + 52 * 8) = 0xFF00FCFC;  // 52: bright cyan
+    *(pp.data + 53 * 8) = 0xFFF8D8F8;  // 53: pale lavender
+}
+
+// Ensure the built-in catalog is initialised. First call builds
+// the 7 Palette records; subsequent calls are cheap pointer tests.
+// Called automatically by palette_builtin; apps don't need to
+// invoke directly.
+static void _pal_init_builtins() {
+    auto arr;
+    if (_pal_builtins_init != 0) { return; }
+    // Seed the enum + knob values here so even callers that skip
+    // init_palette (e.g. a test that jumps straight to
+    // palette_builtin) see non-zero constants.
+    PAL_MCU_8      = 0;
+    PAL_NKOTC_4    = 1;
+    PAL_CB_32      = 2;
+    PAL_DB_32      = 3;
+    PAL_PICO_8     = 4;
+    PAL_GB_4       = 5;
+    PAL_NES_54     = 6;
+    MAX_PAL_CYCLES = 8;
+    arr = malloc(7 * 8);
+    *(arr + PAL_MCU_8   * 8) = palette_new(8);
+    *(arr + PAL_NKOTC_4 * 8) = palette_new(4);
+    *(arr + PAL_CB_32   * 8) = palette_new(32);
+    *(arr + PAL_DB_32   * 8) = palette_new(32);
+    *(arr + PAL_PICO_8  * 8) = palette_new(16);
+    *(arr + PAL_GB_4    * 8) = palette_new(5);
+    *(arr + PAL_NES_54  * 8) = palette_new(54);
+    _fill_mcu_8  (*(arr + PAL_MCU_8   * 8));
+    _fill_nkotc_4(*(arr + PAL_NKOTC_4 * 8));
+    _fill_cb_32  (*(arr + PAL_CB_32   * 8));
+    _fill_db_32  (*(arr + PAL_DB_32   * 8));
+    _fill_pico_8 (*(arr + PAL_PICO_8  * 8));
+    _fill_gb_4   (*(arr + PAL_GB_4    * 8));
+    _fill_nes_54 (*(arr + PAL_NES_54  * 8));
+    _pal_builtins      = arr;
+    _pal_builtins_init = 1;
+}
+
+// Fetch a built-in palette by identifier. Returns a BORROWED
+// pointer — never freed by the caller. If the app wants to mutate
+// a built-in (e.g. to cycle indices), call palette_clone first.
+palette_builtin(name) {
+    _pal_init_builtins();
+    if (name < 0 || name > PAL_NES_54) { return 0; }
+    return *(_pal_builtins + name * 8);
+}
+
+// One-time setup. The built-in identifier constants are resolved
+// lazily when palette_builtin runs, but callers may want explicit
+// initialisation for deterministic ordering (tests, prefs).
+void init_palette() {
+    if (_pal_builtins_init != 0) { return; }
+    PAL_MCU_8     = 0;
+    PAL_NKOTC_4   = 1;
+    PAL_CB_32     = 2;
+    PAL_DB_32     = 3;
+    PAL_PICO_8    = 4;
+    PAL_GB_4      = 5;
+    PAL_NES_54    = 6;
+    MAX_PAL_CYCLES = 8;
+}
+
+// ── Palette cycling ──────────────────────────────────────
+//
+// Amiga / SNES style: rotate a slice of palette indices over time
+// to animate color without touching sprite art. A single palette
+// can host multiple independent cycles (e.g. indices 8..11 cycle
+// at 250 ms, indices 20..23 cycle at 500 ms). The cycle state
+// lives in a per-palette malloc'd ring, created on first cycle
+// definition.
+
+struct PalCycle {
+    start,     // first index in the rotating range
+    count,     // number of indices participating (>= 2)
+    period_ms, // ms per step
+    accum_ms   // running tick accumulator
+}
+
+// Up to MAX_CYCLES active cycles per palette. Eight is more than
+// any retro game needs and keeps the state struct pinned.
+extrn MAX_PAL_CYCLES;
+
+// Per-palette cycle storage: malloc'd (MAX_PAL_CYCLES * sizeof(PalCycle))
+// + an int count of active cycles. Created on first palette_cycle_begin.
+struct PalCycleSet {
+    active,   // number of active cycles in ring
+    ring      // PalCycle[MAX_PAL_CYCLES]
+}
+
+// Side table mapping Palette* -> PalCycleSet*. A linear scan
+// suffices — no game keeps more than a handful of palettes alive
+// simultaneously, and the lookup happens once per cycle_tick.
+static extrn _pal_cyc_keys;   // Palette* array
+static extrn _pal_cyc_sets;   // PalCycleSet* array
+static extrn _pal_cyc_count;
+static extrn _pal_cyc_cap;
+
+static _pal_cyc_lookup(pal) {
+    auto i;
+    for (i = 0; i < _pal_cyc_count; i = i + 1) {
+        if (*(_pal_cyc_keys + i * 8) == pal) { return i; }
+    }
+    return 0 - 1;
+}
+
+static _pal_cyc_grow() {
+    auto new_cap, new_keys, new_sets, i;
+    new_cap = _pal_cyc_cap == 0 ? 4 : _pal_cyc_cap * 2;
+    new_keys = malloc(new_cap * 8);
+    new_sets = malloc(new_cap * 8);
+    for (i = 0; i < _pal_cyc_count; i = i + 1) {
+        *(new_keys + i * 8) = *(_pal_cyc_keys + i * 8);
+        *(new_sets + i * 8) = *(_pal_cyc_sets + i * 8);
+    }
+    if (_pal_cyc_keys != 0) { free(_pal_cyc_keys); }
+    if (_pal_cyc_sets != 0) { free(_pal_cyc_sets); }
+    _pal_cyc_keys = new_keys;
+    _pal_cyc_sets = new_sets;
+    _pal_cyc_cap  = new_cap;
+}
+
+static _pal_cyc_set_for(pal) {
+    auto slot, set: PalCycleSet;
+    slot = _pal_cyc_lookup(pal);
+    if (slot >= 0) { return *(_pal_cyc_sets + slot * 8); }
+    if (_pal_cyc_count >= _pal_cyc_cap) { _pal_cyc_grow(); }
+    set = malloc(sizeof(PalCycleSet));
+    set.active = 0;
+    set.ring   = malloc(MAX_PAL_CYCLES * sizeof(PalCycle));
+    *(_pal_cyc_keys + _pal_cyc_count * 8) = pal;
+    *(_pal_cyc_sets + _pal_cyc_count * 8) = set;
+    _pal_cyc_count = _pal_cyc_count + 1;
+    return set;
+}
+
+// Register a new palette cycle. Returns 0 on success, -1 when the
+// palette already has MAX_PAL_CYCLES active (drop one via
+// palette_cycle_stop first). `start`, `count` define the sliding
+// window; `period_ms` is the time between one-step rotations.
+palette_cycle_begin(pal, start, count, period_ms) {
+    auto set: PalCycleSet, c: PalCycle, slot;
+    if (count < 2) { return 0 - 1; }
+    if (period_ms <= 0) { return 0 - 1; }
+    set = _pal_cyc_set_for(pal);
+    if (set.active >= MAX_PAL_CYCLES) { return 0 - 1; }
+    c = set.ring + set.active * sizeof(PalCycle);
+    c.start     = start;
+    c.count     = count;
+    c.period_ms = period_ms;
+    c.accum_ms  = 0;
+    set.active = set.active + 1;
+    return 0;
+}
+
+// Stop the cycle whose window starts at `start`. No-op when no
+// matching cycle exists. Cycles further down the ring shift left
+// to keep the active prefix contiguous.
+void palette_cycle_stop(pal, start) {
+    auto set: PalCycleSet, c: PalCycle, src: PalCycle, i, j;
+    set = _pal_cyc_set_for(pal);
+    for (i = 0; i < set.active; i = i + 1) {
+        c = set.ring + i * sizeof(PalCycle);
+        if (c.start == start) {
+            // Shift tail left over the removed slot.
+            for (j = i; j < set.active - 1; j = j + 1) {
+                c   = set.ring + j * sizeof(PalCycle);
+                src = set.ring + (j + 1) * sizeof(PalCycle);
+                c.start     = src.start;
+                c.count     = src.count;
+                c.period_ms = src.period_ms;
+                c.accum_ms  = src.accum_ms;
+            }
+            set.active = set.active - 1;
+            return;
+        }
+    }
+}
+
+// Advance every cycle on `pal` by `dt_ms`. For each cycle whose
+// accumulator reached its period, rotate the palette entries
+// [start .. start+count) one slot and reset the accumulator.
+// Rotation is a simple cyclic left-shift: the first color moves
+// to the last position; everything else slides up by one.
+void palette_cycle_tick(pal, dt_ms) {
+    auto set: PalCycleSet, c: PalCycle, p: Palette;
+    auto i, steps, first, j, k;
+    p   = pal;
+    set = _pal_cyc_set_for(pal);
+    for (i = 0; i < set.active; i = i + 1) {
+        c = set.ring + i * sizeof(PalCycle);
+        c.accum_ms = c.accum_ms + dt_ms;
+        // Handle large dt by stepping multiple times — keeps
+        // cycle phase correct across frame hitches.
+        while (c.accum_ms >= c.period_ms) {
+            c.accum_ms = c.accum_ms - c.period_ms;
+            first = *(p.data + c.start * 8);
+            for (j = 0; j < c.count - 1; j = j + 1) {
+                k = c.start + j;
+                *(p.data + k * 8) = *(p.data + (k + 1) * 8);
+            }
+            *(p.data + (c.start + c.count - 1) * 8) = first;
+        }
+    }
+}
+
+// ── LUT (look-up table) ──────────────────────────────────
+//
+// A PaletteLUT remaps indices to indices. palette_lut_apply
+// produces a new Palette whose slot i holds the color from the
+// source palette at the LUT's target index. Classic uses: damage
+// flash (every index → white or red), day/night swap, seasonal
+// tint.
+
+struct PaletteLUT {
+    count,  // number of entries (matches source palette's count)
+    map     // count bytes, each the target index
+}
+
+palette_lut_new(count) {
+    auto lut: PaletteLUT, i;
+    lut = malloc(sizeof(PaletteLUT));
+    lut.count = count;
+    lut.map   = malloc(count);
+    // Identity map by default — no-op until caller overrides.
+    for (i = 0; i < count; i = i + 1) { poke(lut.map + i, i); }
+    return lut;
+}
+
+void palette_lut_free(lut) {
+    auto l: PaletteLUT;
+    if (lut == 0) { return; }
+    l = lut;
+    if (l.map != 0) { free(l.map); }
+    free(lut);
+}
+
+void palette_lut_set(lut, from_idx, to_idx) {
+    auto l: PaletteLUT;
+    l = lut;
+    if (from_idx < 0 || from_idx >= l.count) { return; }
+    poke(l.map + from_idx, to_idx);
+}
+
+// Convenience: every index maps to `to_idx`. A flash effect —
+// when applied to the live palette, every visible sprite reads
+// the single color. Typically used for a 2-3 frame hit flash
+// where the target is white (index of the brightest slot).
+palette_lut_flash(count, to_idx) {
+    auto lut: PaletteLUT, i;
+    lut = palette_lut_new(count);
+    for (i = 0; i < count; i = i + 1) {
+        poke(lut.map + i, to_idx);
+    }
+    return lut;
+}
+
+// Apply `lut` on top of `src`, writing into `dst`. Caller owns
+// both palettes; dst.count must equal lut.count. Index 0 is
+// preserved regardless of LUT contents so transparent pixels
+// stay transparent.
+void palette_lut_apply(src, lut, dst) {
+    auto sp: Palette, dp: Palette, l: PaletteLUT;
+    auto i, target;
+    sp = src; dp = dst; l = lut;
+    for (i = 0; i < l.count; i = i + 1) {
+        if (i == 0) {
+            *(dp.data + 0) = 0;
+        } else {
+            target = peek(l.map + i);
+            if (target < 0 || target >= sp.count) { target = i; }
+            *(dp.data + i * 8) = *(sp.data + target * 8);
+        }
+    }
+}
+
+// ── Linear interpolation (palette blend) ─────────────────
+//
+// Per-channel lerp between two palettes at parameter t ∈ [0..255]
+// (0 = a, 255 = b). Palettes must have matching counts. Writes
+// into `out`. Used for day/night fades, damage flashes that decay
+// smoothly, or cross-fading between two palette sets.
+
+static _lerp_byte(a, b, t) : base {
+    return (a * (255 - t) + b * t) / 255;
+}
+
+static _lerp_argb(ca, cb, t) : base {
+    auto ar, ag, ab, aa, br, bg, bb, ba, r, g, b, a;
+    aa = (ca >> 24) & 0xFF;
+    ar = (ca >> 16) & 0xFF;
+    ag = (ca >> 8)  & 0xFF;
+    ab =  ca        & 0xFF;
+    ba = (cb >> 24) & 0xFF;
+    br = (cb >> 16) & 0xFF;
+    bg = (cb >> 8)  & 0xFF;
+    bb =  cb        & 0xFF;
+    a = _lerp_byte(aa, ba, t);
+    r = _lerp_byte(ar, br, t);
+    g = _lerp_byte(ag, bg, t);
+    b = _lerp_byte(ab, bb, t);
+    return b + g * 256 + r * 65536 + a * 16777216;
+}
+
+// Blend every slot of `a` with the same slot of `b` at parameter
+// `t` (0..255). Writes into `out`. Clamps t and requires all three
+// palettes to share a count.
+void palette_lerp(a, b, t, out) {
+    auto pa: Palette, pb: Palette, po: Palette;
+    auto i, n;
+    pa = a; pb = b; po = out;
+    n  = pa.count;
+    if (pb.count != n || po.count != n) { return; }
+    if (t < 0)   { t = 0; }
+    if (t > 255) { t = 255; }
+    for (i = 0; i < n; i = i + 1) {
+        *(po.data + i * 8) = _lerp_argb(*(pa.data + i * 8),
+                                         *(pb.data + i * 8),
+                                         t);
+    }
+}
+
+// ── JSON load / save ─────────────────────────────────────
+
+// Format:
+//   {
+//     "type": "palette",
+//     "version": 1,
+//     "name": "sunset_32",
+//     "colors": ["#00000000", "#FF000000", ...]
+//   }
+// Colors are 8-char uppercase hex AARRGGBB. Index 0 should be
+// transparent (alpha 0) by convention but the loader accepts any
+// value and the saver writes whatever is in the palette.
+
+static _hex_digit(ch) : base {
+    if (ch >= '0' && ch <= '9') { return ch - '0'; }
+    if (ch >= 'a' && ch <= 'f') { return 10 + (ch - 'a'); }
+    if (ch >= 'A' && ch <= 'F') { return 10 + (ch - 'A'); }
+    return 0;
+}
+
+static _parse_hex_color(s) : base {
+    // Expect "#AARRGGBB" exactly (9 chars). Leading '#' tolerated,
+    // not required. 8-char inputs are accepted.
+    auto i, len, v, ch, start;
+    v = 0;
+    len = str_len(s);
+    start = (len >= 9 && peek(s) == '#') ? 1 : 0;
+    for (i = 0; i < 8; i = i + 1) {
+        ch = peek(s + start + i);
+        v = v * 16 + _hex_digit(ch);
+    }
+    return v;
+}
+
+static _emit_hex_color(sb, color) {
+    auto out, i, shift, nibble, ch;
+    out = malloc(10);
+    poke(out, '#');
+    for (i = 0; i < 8; i = i + 1) {
+        shift = (7 - i) * 4;
+        nibble = (color >> shift) & 0xF;
+        ch = nibble < 10 ? '0' + nibble : 'A' + (nibble - 10);
+        poke(out + 1 + i, ch);
+    }
+    poke(out + 9, 0);
+    // Wrap in JSON string quotes so the array element is a
+    // proper string literal, not a bare identifier.
+    sb = json_write_string(sb, out);
+    free(out);
+    return sb;
+}
+
+// Read a palette from `path`. Returns a fresh Palette* (caller
+// frees) or 0 on read / parse / schema failure. Missing files
+// are logged to stderr; malformed files are logged loudly since
+// the user likely authored them.
+palette_load(path) : io {
+    auto buf, size_out, doc, root, idx, name_idx, colors_idx;
+    auto count, i, color_node, color_str, pal: Palette;
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        print_err_msg("palette_load: read failed '");
+        print_err_msg(path);
+        print_err_msg("'\n");
+        free(size_out);
+        return 0;
+    }
+    doc = json_parse(buf, *(size_out));
+    free(buf);
+    free(size_out);
+    if (doc == 0) {
+        print_err_msg("palette_load: JSON parse failed '");
+        print_err_msg(path);
+        print_err_msg("'\n");
+        return 0;
+    }
+    root = json_root(doc);
+    colors_idx = json_object_get(doc, root, "colors");
+    if (colors_idx < 0) {
+        json_free(doc);
+        print_err_msg("palette_load: missing 'colors' array\n");
+        return 0;
+    }
+    count = json_length(doc, colors_idx);
+    if (count < 1) {
+        json_free(doc);
+        print_err_msg("palette_load: 'colors' empty\n");
+        return 0;
+    }
+    pal = palette_new(count);
+    for (i = 0; i < count; i = i + 1) {
+        color_node = json_child(doc, colors_idx, i);
+        color_str  = json_string(doc, color_node);
+        if (color_str != 0) {
+            *(pal.data + i * 8) = _parse_hex_color(color_str);
+        }
+    }
+    json_free(doc);
+    return pal;
+}
+
+// Write `pal` to `path` as .pal.json. `name` is embedded in the
+// document for human-readable round-trips; pass 0 to skip.
+// Returns 0 on success, -1 on write failure.
+palette_save(pal, path, name) : io {
+    auto p: Palette, sb, i, rc;
+    p = pal;
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "palette");
+    sb = json_write_int_field(sb, "version", 1);
+    if (name != 0) {
+        sb = json_write_string_field(sb, "name", name);
+    }
+    sb = json_write_array_field_begin(sb, "colors");
+    for (i = 0; i < p.count; i = i + 1) {
+        sb = _emit_hex_color(sb, *(p.data + i * 8));
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("palette_save: write failed '");
+        print_err_msg(path);
+        print_err_msg("'\n");
+        return 0 - 1;
+    }
+    return 0;
+}

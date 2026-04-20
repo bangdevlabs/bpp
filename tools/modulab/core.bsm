@@ -1,0 +1,1141 @@
+// core.bsm — ModuLab editor state.
+//
+// Holds the canvas, palette, active frame, and the currently selected
+// tool / color / brush size. Every other ModuLab module reads these
+// globals via `extrn`; only core.bsm writes them.
+//
+// Memory model (Phase 2):
+//   - Up to MAX_FRAMES frames, each a square canvas of g_canvas_n x
+//     g_canvas_n cells. Frames share a single backing pool so
+//     frame_switch is a pointer update, not a copy.
+//   - Each cell is one byte (palette index). Index 0 is transparent,
+//     matching stbsprite's load_sprite convention; indices 1..g_pal_n
+//     are the visible colors.
+//   - Palette is stored as an 8-byte-stride ARGB word array so it
+//     feeds directly into gui_palette without a per-frame copy.
+//   - Every frame owns its own undo ring (MAX_UNDO snapshots, 1B per
+//     pixel). Snapshots are post-mutation canvas states; the cursor
+//     points at the current state and moves left on undo, right on
+//     redo.
+//
+// Phases 3-4 extend this with universes + dither + stencil without
+// changing the public surface below.
+
+// ── Globals ──────────────────────────────────────────────
+//
+// Pointer slots that are allocated once in state_init and read-only
+// afterwards live as `static extrn` so the symbol address is fixed
+// at link time. Values that mutate every action (selected tool,
+// selected color, brush size, dirty flag, frame index) are plain
+// `auto` globals the handlers update in place.
+
+// Side length of the square canvas. Set by state_init.
+static extrn g_canvas_n;
+
+// Per-frame state. g_frames is a word array of Frame* pointers
+// (size MAX_FRAMES); a slot is 0 when the frame hasn't been
+// allocated yet. Each Frame owns up to MAX_LAYERS Layer structs
+// (from stbdraw.bsm's Layer primitive).
+//
+// The active layer of the active frame is what pix_set / pix_get
+// read and write. `g_frame_data` is kept as a byte pointer into
+// that layer's fb so existing canvas.bsm code (canvas_draw,
+// canvas_snapshot/restore) keeps working unchanged — it just
+// operates on one layer at a time. Multi-layer compositing is a
+// canvas_draw concern, not a pix_set concern.
+struct Frame {
+    layer_count,        // 1..MAX_LAYERS
+    active_idx,         // 0..layer_count - 1
+    layers_arr,         // malloc(MAX_LAYERS * 8) — Layer* pointers
+}
+
+static extrn g_frames;
+
+// Cached byte pointer into the active layer's fb. Mutated by
+// frame_switch / layer_active_set / layer_add / layer_delete via
+// _refresh_frame_data(). Reads are hot-path (every pix_set) so
+// the extra pointer is worth avoiding the two dereferences.
+extrn g_frame_data;
+
+// Total number of frames currently allocated (1..MAX_FRAMES).
+auto g_frame_count;
+
+// Index of the active frame (0..g_frame_count - 1).
+auto g_frame_idx;
+
+// Max simultaneous layers per frame. Plan decision #4.
+extrn MAX_LAYERS;
+
+// 8-byte-stride ARGB palette. Low 32 bits of each slot are the
+// ARGB word stbsprite's sprite_create expects; the rest is unused
+// padding that gui_palette skips over.
+static extrn g_palette;
+
+// Number of visible palette slots in g_palette (counting index 0,
+// which is reserved as transparent).
+static extrn g_pal_n;
+
+// Currently selected palette index the brush paints with.
+auto g_sel_color;
+
+// Diamond brush radius in cells. 1 means a single-cell brush;
+// radius r paints every cell within Manhattan distance <= r - 1.
+auto g_brush_size;
+
+// Active tool. See the TOOL_* constants below.
+auto g_tool;
+
+// Dirty flag raised by any tool that mutates the canvas. Saved-state
+// UI (title bar, status line) reads this to show "unsaved".
+auto g_dirty;
+
+// ── History (per-frame delta-undo ring) ─────────────────
+//
+// Each ring slot holds a pointer to a DeltaStroke. A stroke is
+// either a list of (x, y, layer, old, new) cell tuples (KIND_CELLS)
+// or a full pre-stroke snapshot of the target layer (KIND_SNAPSHOT).
+// The snapshot form is used when a stroke mutates so many cells
+// that the delta list would exceed the snapshot size — typically a
+// canvas-wide flood fill on a 256² canvas.
+//
+// Semantics:
+//   g_hist_slots[f * MAX_UNDO + k] — DeltaStroke* or 0
+//   g_hist_len[f]    — number of committed strokes (0..MAX_UNDO)
+//   g_hist_cursor[f] — current state index; undo reverses
+//                      slots[cursor-1], redo re-applies slots[cursor]
+//   g_hist_open[f]   — in-flight stroke being accumulated, or 0
+//
+// Pristine frame: len=0, cursor=0, every slot is 0. First commit
+// writes to slots[0], len=cursor=1. Tip of history always has
+// cursor == len; after undo cursor < len and redo is possible.
+
+struct DeltaStroke {
+    kind,          // KIND_CELLS or KIND_SNAPSHOT
+    count,         // # cells recorded (CELLS only)
+    capacity,      // cell array capacity (CELLS only)
+    layer,         // which layer this stroke targeted (Item 1: always 0)
+    data,          // CELLS → capacity*16 bytes of cell words
+                   // SNAPSHOT → w*h bytes of pre-stroke layer state
+    post_data,     // SNAPSHOT only: post-stroke state, lazily filled
+                   //                on first undo so redo can restore.
+}
+
+static extrn KIND_CELLS;
+static extrn KIND_SNAPSHOT;
+
+static extrn g_hist_slots;
+static extrn g_hist_len;
+static extrn g_hist_cursor;
+static extrn g_hist_open;
+
+// Capacity constants. Public via extrn so tests can assert the
+// numbers without duplicating them.
+extrn MAX_FRAMES, MAX_UNDO;
+
+// Tool identifiers. Phase 2 extends the set to cover shapes +
+// eyedrop; select/stamp lands in Phase 3.
+extrn TOOL_BRUSH, TOOL_ERASER, TOOL_FILL;
+extrn TOOL_LINE, TOOL_RECT, TOOL_OVAL, TOOL_EYEDROP;
+extrn TOOL_SELECT;
+
+// Universe identifiers. A universe bundles a default canvas size
+// with a palette; switching universes wipes the active project
+// (all frames + history) and installs the preset. The MCU default
+// is index 0 so `int` zero-initialisation does the right thing.
+extrn UNIVERSE_MCU, UNIVERSE_NKOTC, UNIVERSE_CB;
+
+// Active universe id. Used by io.bsm to record the universe in
+// the canonical save and by ui.bsm to highlight the dropdown.
+auto g_universe;
+
+// ── Phase 4 editing flags (dither + stencil) ─────────────
+
+// Dither mode: 0 = off (solid color), 1 = 2x2 checker,
+// 2 = 4x4 Bayer (coarser pattern). When non-zero, brush/fill
+// alternate between g_sel_color and g_dither_alt on the grid.
+auto g_dither_mode;
+
+// Alternate palette index the dither pattern swaps in. Defaults
+// to 0 (transparent) so dither-off-transparent produces a
+// recognisable see-through pattern.
+auto g_dither_alt;
+
+// Stencil state. When g_stencil_on is non-zero, pix_set refuses
+// to overwrite cells whose current value equals g_stencil_color.
+// Lets the user protect a silhouette while painting over
+// everything else.
+auto g_stencil_on;
+auto g_stencil_color;
+
+// Onion skin flag + alpha multiplier. Owned by canvas.bsm; core
+// holds a forward declaration so state_init can seed sane
+// defaults in one place.
+extrn g_onion_on;
+extrn g_onion_alpha;
+
+// ── Frame + layer helpers ───────────────────────────────
+
+// Return the active layer of the active frame as a Layer struct
+// pointer. Returns 0 if no frame / no layer is present.
+static _active_layer() : base {
+    auto f: Frame, fr;
+    fr = *(g_frames + g_frame_idx * 8);
+    if (fr == 0) { return 0; }
+    f = fr;
+    if (f.active_idx < 0 || f.active_idx >= f.layer_count) { return 0; }
+    return *(f.layers_arr + f.active_idx * 8);
+}
+
+// Return the byte framebuffer pointer for (frame_idx, layer_idx).
+// 0 if the frame or layer is out of range. Used by history
+// undo/redo to target the layer that owned a recorded stroke.
+static _layer_fb(frame_idx, layer_idx) : base {
+    auto f: Frame, fr, l: Layer, lp;
+    if (frame_idx < 0 || frame_idx >= g_frame_count) { return 0; }
+    fr = *(g_frames + frame_idx * 8);
+    if (fr == 0) { return 0; }
+    f = fr;
+    if (layer_idx < 0 || layer_idx >= f.layer_count) { return 0; }
+    lp = *(f.layers_arr + layer_idx * 8);
+    if (lp == 0) { return 0; }
+    l = lp;
+    return l.fb;
+}
+
+// Refresh `g_frame_data` to point at the active layer's fb.
+// Called after every frame / layer switch.
+static void _refresh_frame_data() {
+    auto lp, l: Layer;
+    lp = _active_layer();
+    if (lp == 0) { g_frame_data = 0; return; }
+    l = lp;
+    g_frame_data = l.fb;
+}
+
+// Allocate a new Frame struct with one blank layer. Caller owns
+// the returned Frame*. layer_count=1, active_idx=0, layers[0] =
+// layer_new result.
+static _frame_new() {
+    auto f: Frame, fp, layer;
+    fp = malloc(sizeof(Frame));
+    f = fp;
+    f.layer_count = 1;
+    f.active_idx  = 0;
+    f.layers_arr  = malloc(MAX_LAYERS * 8);
+    auto k;
+    for (k = 0; k < MAX_LAYERS; k = k + 1) {
+        *(f.layers_arr + k * 8) = 0;
+    }
+    layer = layer_new(g_canvas_n, g_canvas_n, BLEND_NORMAL);
+    *(f.layers_arr) = layer;
+    return fp;
+}
+
+// Free a Frame and every layer it owns. Safe on 0.
+static void _frame_free(fp) {
+    auto f: Frame;
+    auto k, lp;
+    if (fp == 0) { return; }
+    f = fp;
+    for (k = 0; k < f.layer_count; k = k + 1) {
+        lp = *(f.layers_arr + k * 8);
+        if (lp != 0) { layer_free(lp); }
+    }
+    if (f.layers_arr != 0) { free(f.layers_arr); }
+    free(fp);
+}
+
+// ── Initialisation ───────────────────────────────────────
+
+// Walk every ring slot + open slot for one frame and free the
+// DeltaStrokes it points at. Used before deallocating a frame's
+// history (universe switch, frame_del, state_free).
+static void _free_frame_history(f) {
+    auto k, ds;
+    for (k = 0; k < MAX_UNDO; k = k + 1) {
+        ds = *(g_hist_slots + (f * MAX_UNDO + k) * 8);
+        if (ds != 0) { _delta_free(ds); }
+        *(g_hist_slots + (f * MAX_UNDO + k) * 8) = 0;
+    }
+    ds = *(g_hist_open + f * 8);
+    if (ds != 0) { _delta_free(ds); }
+    *(g_hist_open + f * 8) = 0;
+    *(g_hist_len    + f * 8) = 0;
+    *(g_hist_cursor + f * 8) = 0;
+}
+
+// Free every frame (Frame* + its layers), every stroke on every
+// ring slot, and the backing arrays. Keeps g_palette alive so
+// universe-install helpers can reuse the allocation when only
+// the colours change.
+static void _free_canvas_buffers() {
+    auto f;
+    if (g_hist_slots != 0) {
+        for (f = 0; f < MAX_FRAMES; f = f + 1) { _free_frame_history(f); }
+        free(g_hist_slots);  g_hist_slots  = 0;
+    }
+    if (g_hist_len    != 0) { free(g_hist_len);    g_hist_len    = 0; }
+    if (g_hist_cursor != 0) { free(g_hist_cursor); g_hist_cursor = 0; }
+    if (g_hist_open   != 0) { free(g_hist_open);   g_hist_open   = 0; }
+    if (g_frames != 0) {
+        for (f = 0; f < MAX_FRAMES; f = f + 1) {
+            _frame_free(*(g_frames + f * 8));
+            *(g_frames + f * 8) = 0;
+        }
+        free(g_frames); g_frames = 0;
+    }
+}
+
+// Allocate the canvas-scale buffers for a given side length. The
+// g_frames array is a word array of Frame pointers, with slot 0
+// lazily populated with an initial 1-layer Frame so the editor
+// starts with a usable blank canvas. Remaining slots are 0 and
+// get lazily created by frame_add.
+static void _alloc_canvas_buffers(n) {
+    auto i, slots_bytes, frames_bytes;
+
+    g_canvas_n   = n;
+    slots_bytes  = MAX_FRAMES * MAX_UNDO * 8;
+    frames_bytes = MAX_FRAMES * 8;
+
+    g_frames = malloc(frames_bytes);
+    for (i = 0; i < frames_bytes; i = i + 1) { poke(g_frames + i, 0); }
+
+    g_frame_count = 1;
+    g_frame_idx   = 0;
+    // Seed frame 0 with a 1-layer Frame. _frame_new reads
+    // g_canvas_n, so we set g_canvas_n above first.
+    *(g_frames) = _frame_new();
+
+    g_hist_slots  = malloc(slots_bytes);
+    g_hist_len    = malloc(MAX_FRAMES * 8);
+    g_hist_cursor = malloc(MAX_FRAMES * 8);
+    g_hist_open   = malloc(MAX_FRAMES * 8);
+    for (i = 0; i < slots_bytes; i = i + 1) { poke(g_hist_slots + i, 0); }
+    for (i = 0; i < MAX_FRAMES; i = i + 1) {
+        *(g_hist_len    + i * 8) = 0;
+        *(g_hist_cursor + i * 8) = 0;
+        *(g_hist_open   + i * 8) = 0;
+    }
+
+    _refresh_frame_data();
+}
+
+// ── Preset palettes (one per universe) ───────────────────
+//
+// Each installer overwrites g_palette in place when the new size
+// matches the old allocation, or reallocates when it does not.
+// Caller must have ensured g_palette is either 0 (first call) or
+// points at a valid allocation of g_pal_n * 8 bytes.
+
+static void _install_palette(n_colors) {
+    if (g_palette != 0) { free(g_palette); }
+    g_pal_n = n_colors;
+    g_palette = malloc(n_colors * 8);
+}
+
+// MCU-8: the default 8-color sprite palette that matches
+// games/pathfind/assets/sprites/*.json. Kept byte-for-byte so a
+// saved hero.json drops into pathfind without any re-mapping.
+static void _install_palette_mcu() {
+    _install_palette(8);
+    *(g_palette + 0 * 8) = 0x00000000;  // 0: transparent
+    *(g_palette + 1 * 8) = 0xFF000000;  // 1: black
+    *(g_palette + 2 * 8) = 0xFF8C1A1A;  // 2: dark red
+    *(g_palette + 3 * 8) = 0xFF808080;  // 3: gray
+    *(g_palette + 4 * 8) = 0xFFFFA500;  // 4: orange
+    *(g_palette + 5 * 8) = 0xFF008000;  // 5: green
+    *(g_palette + 6 * 8) = 0xFF800080;  // 6: purple
+    *(g_palette + 7 * 8) = 0xFFFFFF00;  // 7: yellow
+}
+
+// NKOTC: 4-color NES-style sprite palette. Minimalist on purpose —
+// NES hardware enforced 3 colors + transparent per sprite, and the
+// 8x8 canvas size makes an honest NES tile workflow.
+static void _install_palette_nkotc() {
+    _install_palette(4);
+    *(g_palette + 0 * 8) = 0x00000000;  // 0: transparent
+    *(g_palette + 1 * 8) = 0xFF0C0C0C;  // 1: NES black
+    *(g_palette + 2 * 8) = 0xFFE40000;  // 2: NES red
+    *(g_palette + 3 * 8) = 0xFFFCFCFC;  // 3: NES white
+}
+
+// CB: 32-color palette for the 32x32 "Captain Buddy" universe.
+// Organised as 4 rows of 8 (grays / reds / greens / blues) so
+// gui_palette's per_row layout produces a legible grid.
+static void _install_palette_cb() {
+    _install_palette(32);
+    *(g_palette +  0 * 8) = 0x00000000;  //  0: transparent
+    *(g_palette +  1 * 8) = 0xFF000000;  //  1: black
+    *(g_palette +  2 * 8) = 0xFF202028;  //  2: ink
+    *(g_palette +  3 * 8) = 0xFF404048;  //  3: dark slate
+    *(g_palette +  4 * 8) = 0xFF606070;  //  4: slate
+    *(g_palette +  5 * 8) = 0xFF909098;  //  5: stone
+    *(g_palette +  6 * 8) = 0xFFC0C0C8;  //  6: silver
+    *(g_palette +  7 * 8) = 0xFFFFFFFF;  //  7: white
+    *(g_palette +  8 * 8) = 0xFF3A0000;  //  8: blood
+    *(g_palette +  9 * 8) = 0xFF8C1A1A;  //  9: dark red
+    *(g_palette + 10 * 8) = 0xFFD43030;  // 10: red
+    *(g_palette + 11 * 8) = 0xFFFF7070;  // 11: pink
+    *(g_palette + 12 * 8) = 0xFF3A1F00;  // 12: brown
+    *(g_palette + 13 * 8) = 0xFFA05000;  // 13: dark orange
+    *(g_palette + 14 * 8) = 0xFFFF9020;  // 14: orange
+    *(g_palette + 15 * 8) = 0xFFFFD080;  // 15: peach
+    *(g_palette + 16 * 8) = 0xFF505000;  // 16: olive
+    *(g_palette + 17 * 8) = 0xFFA09000;  // 17: mustard
+    *(g_palette + 18 * 8) = 0xFFFFE000;  // 18: yellow
+    *(g_palette + 19 * 8) = 0xFFFFF8B0;  // 19: cream
+    *(g_palette + 20 * 8) = 0xFF003018;  // 20: forest
+    *(g_palette + 21 * 8) = 0xFF006030;  // 21: green
+    *(g_palette + 22 * 8) = 0xFF40B050;  // 22: grass
+    *(g_palette + 23 * 8) = 0xFFA0E080;  // 23: mint
+    *(g_palette + 24 * 8) = 0xFF003040;  // 24: deep teal
+    *(g_palette + 25 * 8) = 0xFF006890;  // 25: teal
+    *(g_palette + 26 * 8) = 0xFF40B0D0;  // 26: cyan
+    *(g_palette + 27 * 8) = 0xFF002080;  // 27: navy
+    *(g_palette + 28 * 8) = 0xFF2060E0;  // 28: blue
+    *(g_palette + 29 * 8) = 0xFF80A0FF;  // 29: sky
+    *(g_palette + 30 * 8) = 0xFF600080;  // 30: purple
+    *(g_palette + 31 * 8) = 0xFFD070E0;  // 31: magenta
+}
+
+// Allocate every backing buffer and prime the Phase 4 defaults: a
+// single MCU-8 frame that matches games/pathfind/assets/sprites/
+// rat_sprite.json byte-for-byte. Call once at program start.
+void state_init(n) {
+    MAX_FRAMES = 16;
+    MAX_UNDO   = 256;
+    MAX_LAYERS = 16;
+
+    KIND_CELLS    = 0;
+    KIND_SNAPSHOT = 1;
+
+    // Blend constants are set by stbdraw's init_draw (called from
+    // game_init). Force them here too in case state_init runs from
+    // a headless test before game_init.
+    init_layer_blends();
+
+    TOOL_BRUSH   = 0;
+    TOOL_ERASER  = 1;
+    TOOL_FILL    = 2;
+    TOOL_LINE    = 3;
+    TOOL_RECT    = 4;
+    TOOL_OVAL    = 5;
+    TOOL_EYEDROP = 6;
+    TOOL_SELECT  = 7;
+
+    UNIVERSE_MCU   = 0;
+    UNIVERSE_NKOTC = 1;
+    UNIVERSE_CB    = 2;
+
+    g_palette = 0;   // _install_palette_* asserts non-null free is safe
+    _alloc_canvas_buffers(n);
+    _install_palette_mcu();
+
+    g_universe    = UNIVERSE_MCU;
+    g_sel_color   = 1;
+    g_brush_size  = 1;
+    g_tool        = TOOL_BRUSH;
+    g_dirty       = 0;
+    g_dither_mode = 0;
+    g_dither_alt  = 0;
+    g_stencil_on  = 0;
+    g_stencil_color = 0;
+    g_onion_on    = 0;
+    g_onion_alpha = 76;  // ≈ 30% — Aseprite's default looks good
+}
+
+// Release every backing buffer. A second call is a no-op because
+// the pointers are cleared to 0.
+void state_free() {
+    _free_canvas_buffers();
+    if (g_palette != 0) { free(g_palette); g_palette = 0; }
+}
+
+// ── Universes ────────────────────────────────────────────
+
+// Default canvas side for a universe. Encoded here so the caller
+// never has to remember which universe goes with which size.
+universe_default_size(id) : base {
+    if (id == UNIVERSE_NKOTC) { return 8; }
+    if (id == UNIVERSE_CB)    { return 32; }
+    return 16;  // MCU + anything unknown
+}
+
+// Short label for the dropdown + status line. The stable strings
+// live in the module so callers don't have to build their own
+// table.
+universe_label(id) : base {
+    if (id == UNIVERSE_NKOTC) { return "NKOTC"; }
+    if (id == UNIVERSE_CB)    { return "CB"; }
+    return "MCU";
+}
+
+// Swap the active universe. Wipes every frame and undo ring —
+// the caller should confirm-before-apply if g_dirty is set. Size
+// changes reallocate the pool + history; same-size swaps only
+// replace the palette. Clamps g_sel_color so it stays a valid
+// index on the new palette.
+void universe_apply(id) {
+    auto new_n, old_n;
+
+    new_n = universe_default_size(id);
+    old_n = g_canvas_n;
+
+    // Close any in-flight stroke before we wipe state — keeps
+    // history ring allocations consistent during _free.
+    history_commit();
+
+    // Same-size or different-size swap both take the same path
+    // now: free every frame + history, then rebuild. Cheaper
+    // same-size optimisation that reuses allocations isn't worth
+    // the special case given Frame/Layer are separate mallocs.
+    _free_canvas_buffers();
+    _alloc_canvas_buffers(new_n);
+
+    if (id == UNIVERSE_NKOTC)     { _install_palette_nkotc(); }
+    else if (id == UNIVERSE_CB)   { _install_palette_cb(); }
+    else                           { _install_palette_mcu(); }
+
+    g_universe = id;
+    if (g_sel_color >= g_pal_n) { g_sel_color = g_pal_n - 1; }
+    if (g_sel_color < 1)        { g_sel_color = 1; }
+    if (g_stencil_color >= g_pal_n) { g_stencil_color = 0; g_stencil_on = 0; }
+    g_dirty = 0;
+}
+
+// ── Pixel access ─────────────────────────────────────────
+
+// Read the palette index at (x, y). Out-of-range coordinates return
+// 0 so tools that sweep a neighbourhood don't need explicit bounds
+// tests at every peek.
+pix_get(x, y) : base {
+    if (x < 0 || y < 0) { return 0; }
+    if (x >= g_canvas_n || y >= g_canvas_n) { return 0; }
+    return peek(g_frame_data + y * g_canvas_n + x);
+}
+
+// Write `idx` into the cell at (x, y). Silently ignores out-of-range
+// writes and clamps idx to the 0..255 byte range. Sets g_dirty on
+// any successful write. Callers batch into strokes and commit to
+// history via history_commit() at stroke boundary, not per-pixel.
+//
+// Stencil: when g_stencil_on is set, a write whose *destination*
+// cell currently holds g_stencil_color is refused. Protected-only
+// strokes produce no delta entries (decision #9). Per-cell no-op
+// short-circuit: we read old first and skip the poke + record when
+// old == idx to keep redundant paints from bloating the stroke.
+void pix_set(x, y, idx) {
+    auto old;
+    if (x < 0 || y < 0) { return; }
+    if (x >= g_canvas_n || y >= g_canvas_n) { return; }
+    if (idx < 0) { idx = 0; }
+    if (idx > 255) { idx = 255; }
+    old = peek(g_frame_data + y * g_canvas_n + x);
+    if (g_stencil_on != 0 && old == g_stencil_color) { return; }
+    if (old == idx) { return; }
+    poke(g_frame_data + y * g_canvas_n + x, idx);
+    g_dirty = 1;
+    if (*(g_hist_open + g_frame_idx * 8) != 0) {
+        history_record(x, y, layer_active_idx(), old, idx);
+    }
+}
+
+// Raw write used by history_undo/redo to replay cells without
+// feeding the delta recorder (infinite loop otherwise). No stencil
+// test either — replays must be byte-exact regardless of current
+// stencil state. Writes to the LAYER the stroke recorded against,
+// not g_frame_data — so undo still lands on the right layer even
+// if the user has since switched the active layer.
+void pix_write_raw_layer(fb, x, y, idx) {
+    if (fb == 0) { return; }
+    if (x < 0 || y < 0) { return; }
+    if (x >= g_canvas_n || y >= g_canvas_n) { return; }
+    poke(fb + y * g_canvas_n + x, idx & 0xFF);
+}
+
+// Pointer to the first byte of frame `i`'s ACTIVE layer. Kept for
+// backward-compat with io.bsm v1 save and ui.bsm thumbnail code
+// that renders a single-layer preview. io.bsm v2 will switch to
+// layer_at + iterating every layer.
+frame_get(i) : base {
+    auto f: Frame, fp, lp, l: Layer;
+    if (i < 0 || i >= g_frame_count) { return 0; }
+    fp = *(g_frames + i * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    if (f.active_idx < 0 || f.active_idx >= f.layer_count) { return 0; }
+    lp = *(f.layers_arr + f.active_idx * 8);
+    if (lp == 0) { return 0; }
+    l = lp;
+    return l.fb;
+}
+
+// Clear the active frame back to transparent (index 0). Wraps the
+// zeroing loop in a stroke so Ctrl+Z restores the pre-clear state.
+// Soft-cap promotion kicks in at commit time when count*8 > w*h,
+// converting the big delta list into a single pre-state snapshot.
+void canvas_clear() {
+    auto x, y, n;
+    history_begin_stroke();
+    n = g_canvas_n;
+    for (y = 0; y < n; y = y + 1) {
+        for (x = 0; x < n; x = x + 1) {
+            pix_set(x, y, 0);
+        }
+    }
+    history_commit();
+}
+
+// Convenience accessors used by save/load and the UI status line.
+canvas_n() : base { return g_canvas_n; }
+palette_ptr() : base { return g_palette; }
+g_palette_count() : base { return g_pal_n; }
+frame_count() : base { return g_frame_count; }
+frame_idx()   : base { return g_frame_idx; }
+
+// ── History (delta-based undo/redo) ──────────────────────
+//
+// Cell layout inside a KIND_CELLS stroke. Each cell occupies 16
+// bytes (two words):
+//   word 0 — (x:8) | (y:8 << 8) | (layer:8 << 16)
+//   word 1 — (old:8) | (new:8 << 8)
+// Fields past those bits are zero-reserved. Decoders below mask
+// with 0xFF before use to stay byte-safe regardless of padding.
+
+// Allocate an empty CELLS stroke with initial cell capacity.
+static _delta_new(layer) {
+    auto d: DeltaStroke;
+    d = malloc(sizeof(DeltaStroke));
+    d.kind       = KIND_CELLS;
+    d.count      = 0;
+    d.capacity   = 64;
+    d.layer      = layer;
+    d.data       = malloc(64 * 16);
+    d.post_data  = 0;
+    return d;
+}
+
+// Free a stroke's backing memory + the struct itself. Safe on 0.
+static void _delta_free(ds) {
+    auto d: DeltaStroke;
+    if (ds == 0) { return; }
+    d = ds;
+    if (d.data      != 0) { free(d.data); }
+    if (d.post_data != 0) { free(d.post_data); }
+    free(ds);
+}
+
+// Grow a CELLS stroke by doubling its cell capacity. Keeps existing
+// data; the struct itself is not reallocated, only the data array.
+static void _delta_grow(ds) {
+    auto d: DeltaStroke;
+    auto new_cap, new_data, i, bytes;
+    d = ds;
+    new_cap  = d.capacity * 2;
+    new_data = malloc(new_cap * 16);
+    bytes    = d.count * 16;
+    for (i = 0; i < bytes; i = i + 1) { poke(new_data + i, peek(d.data + i)); }
+    free(d.data);
+    d.data     = new_data;
+    d.capacity = new_cap;
+}
+
+// Append a (x, y, layer, old, new) cell to the open CELLS stroke.
+// Called from pix_set. Grows on capacity overflow. `old` and `new`
+// are already canvas-valid bytes (caller short-circuits on
+// old == new so this path only runs on real mutations).
+void history_record(x, y, layer, old, new) {
+    auto d: DeltaStroke, ds, off, w0, w1;
+    ds = *(g_hist_open + g_frame_idx * 8);
+    if (ds == 0) { return; }
+    d = ds;
+    if (d.count >= d.capacity) { _delta_grow(ds); }
+    off = d.count * 16;
+    w0 = (x & 0xFF) | ((y & 0xFF) << 8) | ((layer & 0xFF) << 16);
+    w1 = (old & 0xFF) | ((new & 0xFF) << 8);
+    *(d.data + off    ) = w0;
+    *(d.data + off + 8) = w1;
+    d.count = d.count + 1;
+}
+
+// Promote a CELLS stroke past the soft-cap threshold into a
+// SNAPSHOT stroke. Rebuilds the pre-stroke state by copying the
+// current layer and applying every recorded delta in reverse
+// (writing `old` back). The rebuilt buffer replaces the cell list;
+// the original data allocation is freed.
+static void _delta_promote(ds) {
+    auto d: DeltaStroke;
+    auto n, bytes, snap, i, off, w0, w1, x, y, old;
+    d = ds;
+    n     = g_canvas_n;
+    bytes = n * n;
+    snap  = malloc(bytes);
+    for (i = 0; i < bytes; i = i + 1) { poke(snap + i, peek(g_frame_data + i)); }
+    for (i = d.count - 1; i >= 0; i = i - 1) {
+        off = i * 16;
+        w0  = *(d.data + off);
+        w1  = *(d.data + off + 8);
+        x   = w0 & 0xFF;
+        y   = (w0 >> 8) & 0xFF;
+        old = w1 & 0xFF;
+        poke(snap + y * n + x, old);
+    }
+    free(d.data);
+    d.data      = snap;
+    d.kind      = KIND_SNAPSHOT;
+    d.count     = 0;
+    d.capacity  = 0;
+    d.post_data = 0;
+}
+
+// Begin a new undo stroke. Caller MUST pair with history_commit()
+// before calling begin again. Double-begin without intermediate
+// commit is a caller bug — the module logs an error to stderr and
+// ignores the second begin so the first stroke's accumulation
+// stays intact.
+void history_begin_stroke() {
+    if (*(g_hist_open + g_frame_idx * 8) != 0) {
+        print_err_msg("history_begin_stroke: previous stroke not committed");
+        print_err_ln();
+        return;
+    }
+    *(g_hist_open + g_frame_idx * 8) = _delta_new(layer_active_idx());
+}
+
+// Finalise the open stroke and place it on the ring. Empty strokes
+// are dropped (no slot advances). On ring full, evict oldest.
+void history_commit() {
+    auto ds, len, cursor, k, bytes, old_ds, oldest;
+    auto d: DeltaStroke;
+
+    ds = *(g_hist_open + g_frame_idx * 8);
+    if (ds == 0) { return; }
+    *(g_hist_open + g_frame_idx * 8) = 0;
+
+    d = ds;
+    if (d.count == 0 && d.kind == KIND_CELLS) {
+        _delta_free(ds);
+        return;
+    }
+
+    bytes = g_canvas_n * g_canvas_n;
+    if (d.kind == KIND_CELLS && d.count * 8 > bytes) {
+        _delta_promote(ds);
+    }
+
+    len    = *(g_hist_len    + g_frame_idx * 8);
+    cursor = *(g_hist_cursor + g_frame_idx * 8);
+
+    // Truncate redo tail: free every slot in [cursor, len).
+    for (k = cursor; k < len; k = k + 1) {
+        old_ds = *(g_hist_slots + (g_frame_idx * MAX_UNDO + k) * 8);
+        if (old_ds != 0) { _delta_free(old_ds); }
+        *(g_hist_slots + (g_frame_idx * MAX_UNDO + k) * 8) = 0;
+    }
+    len = cursor;
+
+    // Shift-on-full: drop slot 0, shift [1..MAX_UNDO-1] left.
+    if (len == MAX_UNDO) {
+        oldest = *(g_hist_slots + (g_frame_idx * MAX_UNDO) * 8);
+        if (oldest != 0) { _delta_free(oldest); }
+        for (k = 0; k < MAX_UNDO - 1; k = k + 1) {
+            *(g_hist_slots + (g_frame_idx * MAX_UNDO + k) * 8)
+                = *(g_hist_slots + (g_frame_idx * MAX_UNDO + k + 1) * 8);
+        }
+        *(g_hist_slots + (g_frame_idx * MAX_UNDO + MAX_UNDO - 1) * 8) = 0;
+        len    = MAX_UNDO - 1;
+        cursor = MAX_UNDO - 1;
+    }
+
+    *(g_hist_slots + (g_frame_idx * MAX_UNDO + len) * 8) = ds;
+    cursor = len + 1;
+    len    = len + 1;
+    *(g_hist_cursor + g_frame_idx * 8) = cursor;
+    *(g_hist_len    + g_frame_idx * 8) = len;
+}
+
+// Reverse-apply a CELLS stroke: write each recorded `old` back.
+// Targets the layer the stroke originated from so replay lands on
+// the correct layer even if the user switched active in between.
+static void _delta_apply_reverse_cells(ds) {
+    auto d: DeltaStroke;
+    auto i, off, w0, w1, x, y, old, fb;
+    d = ds;
+    fb = _layer_fb(g_frame_idx, d.layer);
+    if (fb == 0) { return; }
+    for (i = 0; i < d.count; i = i + 1) {
+        off = i * 16;
+        w0  = *(d.data + off);
+        w1  = *(d.data + off + 8);
+        x   = w0 & 0xFF;
+        y   = (w0 >> 8) & 0xFF;
+        old = w1 & 0xFF;
+        pix_write_raw_layer(fb, x, y, old);
+    }
+}
+
+// Forward-apply a CELLS stroke: write each recorded `new`.
+static void _delta_apply_forward_cells(ds) {
+    auto d: DeltaStroke;
+    auto i, off, w0, w1, x, y, new, fb;
+    d = ds;
+    fb = _layer_fb(g_frame_idx, d.layer);
+    if (fb == 0) { return; }
+    for (i = 0; i < d.count; i = i + 1) {
+        off = i * 16;
+        w0  = *(d.data + off);
+        w1  = *(d.data + off + 8);
+        x   = w0 & 0xFF;
+        y   = (w0 >> 8) & 0xFF;
+        new = (w1 >> 8) & 0xFF;
+        pix_write_raw_layer(fb, x, y, new);
+    }
+}
+
+// Reverse one step. Returns 1 if a step was applied, 0 at pristine.
+//
+// NOTE: if the stroke's target layer has been deleted since the
+// stroke was recorded, _layer_fb returns 0 and this call becomes
+// a silent no-op — the cursor does not advance and the canvas
+// stays unchanged. This is a known limitation; reconstituting
+// deleted layers on demand is Fase B enhancement work. Users
+// deleting a layer should expect undo history targeting that
+// layer to be effectively lost.
+history_undo() {
+    auto cursor, ds, i, bytes, fb;
+    auto d: DeltaStroke;
+
+    cursor = *(g_hist_cursor + g_frame_idx * 8);
+    if (cursor <= 0) { return 0; }
+    ds = *(g_hist_slots + (g_frame_idx * MAX_UNDO + cursor - 1) * 8);
+    if (ds == 0) { return 0; }
+    d = ds;
+
+    // Bail if the target layer was deleted — cursor stays put so
+    // no-op is honest (no "ghost undo" that advanced history but
+    // did nothing).
+    if (_layer_fb(g_frame_idx, d.layer) == 0) { return 0; }
+
+    if (d.kind == KIND_CELLS) {
+        _delta_apply_reverse_cells(ds);
+    } else {
+        // SNAPSHOT: capture the post-stroke state lazily on the
+        // first undo so a subsequent redo has something to restore.
+        // Targets the stroke's recorded layer — same rule as
+        // CELLS mode, so undo keeps working even when the user
+        // switched active layer after the stroke.
+        fb = _layer_fb(g_frame_idx, d.layer);
+        if (fb == 0) { return 0; }
+        bytes = g_canvas_n * g_canvas_n;
+        if (d.post_data == 0) {
+            d.post_data = malloc(bytes);
+            for (i = 0; i < bytes; i = i + 1) {
+                poke(d.post_data + i, peek(fb + i));
+            }
+        }
+        for (i = 0; i < bytes; i = i + 1) {
+            poke(fb + i, peek(d.data + i));
+        }
+    }
+
+    *(g_hist_cursor + g_frame_idx * 8) = cursor - 1;
+    g_dirty = 1;
+    return 1;
+}
+
+// Forward one step. Returns 1 if a step was applied, 0 at tip.
+history_redo() {
+    auto cursor, len, ds, i, bytes, fb;
+    auto d: DeltaStroke;
+
+    cursor = *(g_hist_cursor + g_frame_idx * 8);
+    len    = *(g_hist_len    + g_frame_idx * 8);
+    if (cursor >= len) { return 0; }
+    ds = *(g_hist_slots + (g_frame_idx * MAX_UNDO + cursor) * 8);
+    if (ds == 0) { return 0; }
+    d = ds;
+
+    // Same guard as history_undo — deleted target layer == no-op.
+    if (_layer_fb(g_frame_idx, d.layer) == 0) { return 0; }
+
+    if (d.kind == KIND_CELLS) {
+        _delta_apply_forward_cells(ds);
+    } else {
+        fb = _layer_fb(g_frame_idx, d.layer);
+        if (fb == 0) { return 0; }
+        bytes = g_canvas_n * g_canvas_n;
+        if (d.post_data == 0) {
+            // Redo without prior undo — no post_data yet. Bail
+            // safely rather than emit garbage. Unreachable by
+            // normal use (redo only after undo).
+            return 0;
+        }
+        for (i = 0; i < bytes; i = i + 1) {
+            poke(fb + i, peek(d.post_data + i));
+        }
+    }
+
+    *(g_hist_cursor + g_frame_idx * 8) = cursor + 1;
+    g_dirty = 1;
+    return 1;
+}
+
+// Read-only accessors for the UI status line.
+history_len()    : base { return *(g_hist_len    + g_frame_idx * 8); }
+history_cursor() : base { return *(g_hist_cursor + g_frame_idx * 8); }
+
+// ── Frames ───────────────────────────────────────────────
+
+// Switch the active frame. Silently clamps to the valid range so
+// callers can pass raw keyboard input without guarding.
+void frame_switch(i) {
+    if (i < 0) { i = 0; }
+    if (i >= g_frame_count) { i = g_frame_count - 1; }
+    g_frame_idx = i;
+    _refresh_frame_data();
+}
+
+// Append a new blank frame (one fresh layer) after the last one
+// and switch to it. Returns the new frame index, or -1 on cap.
+frame_add() {
+    auto new_idx;
+    if (g_frame_count >= MAX_FRAMES) { return 0 - 1; }
+    new_idx = g_frame_count;
+    // If the slot has a stale Frame left by a prior frame_del,
+    // free it before overwriting.
+    if (*(g_frames + new_idx * 8) != 0) {
+        _frame_free(*(g_frames + new_idx * 8));
+    }
+    *(g_frames + new_idx * 8) = _frame_new();
+    _free_frame_history(new_idx);
+    g_frame_count = g_frame_count + 1;
+    frame_switch(new_idx);
+    return new_idx;
+}
+
+// Duplicate the active frame (every layer, content-copied) after
+// it and switch to the copy. History of the new frame is empty.
+frame_dup() {
+    auto new_idx, src_fp, dst_fp, src: Frame, dst: Frame;
+    auto k, src_lp, dst_lp, src_l: Layer, dst_l: Layer, total, i;
+
+    if (g_frame_count >= MAX_FRAMES) { return 0 - 1; }
+    new_idx = g_frame_count;
+
+    src_fp = *(g_frames + g_frame_idx * 8);
+    if (src_fp == 0) { return 0 - 1; }
+    src = src_fp;
+
+    // Build a fresh Frame + per-layer copies of each source layer.
+    dst_fp = malloc(sizeof(Frame));
+    dst = dst_fp;
+    dst.layer_count = src.layer_count;
+    dst.active_idx  = src.active_idx;
+    dst.layers_arr  = malloc(MAX_LAYERS * 8);
+    for (k = 0; k < MAX_LAYERS; k = k + 1) { *(dst.layers_arr + k * 8) = 0; }
+
+    total = g_canvas_n * g_canvas_n;
+    for (k = 0; k < src.layer_count; k = k + 1) {
+        src_lp = *(src.layers_arr + k * 8);
+        if (src_lp == 0) { continue; }
+        src_l = src_lp;
+        dst_lp = layer_new(g_canvas_n, g_canvas_n, src_l.blend);
+        dst_l = dst_lp;
+        dst_l.alpha   = src_l.alpha;
+        dst_l.visible = src_l.visible;
+        for (i = 0; i < total; i = i + 1) { poke(dst_l.fb + i, peek(src_l.fb + i)); }
+        *(dst.layers_arr + k * 8) = dst_lp;
+    }
+
+    if (*(g_frames + new_idx * 8) != 0) {
+        _frame_free(*(g_frames + new_idx * 8));
+    }
+    *(g_frames + new_idx * 8) = dst_fp;
+
+    _free_frame_history(new_idx);
+    g_frame_count = g_frame_count + 1;
+    frame_switch(new_idx);
+    return new_idx;
+}
+
+// Delete the frame at index `i`. Refuses to delete the last
+// remaining frame (always keeps at least one). Shifts higher
+// frames down one slot so indices stay contiguous.
+frame_del(i) {
+    auto j, k, src_slot, victim;
+
+    if (g_frame_count <= 1) { return 0; }
+    if (i < 0 || i >= g_frame_count) { return 0; }
+
+    // Close any open stroke on the victim OR the active frame so
+    // history invariants stay consistent across the shift.
+    history_commit();
+
+    // Free the victim frame + its history BEFORE any shift.
+    _free_frame_history(i);
+    victim = *(g_frames + i * 8);
+    if (victim != 0) { _frame_free(victim); }
+    *(g_frames + i * 8) = 0;
+
+    for (j = i; j < g_frame_count - 1; j = j + 1) {
+        *(g_frames + j * 8) = *(g_frames + (j + 1) * 8);
+
+        for (k = 0; k < MAX_UNDO; k = k + 1) {
+            src_slot = *(g_hist_slots + ((j + 1) * MAX_UNDO + k) * 8);
+            *(g_hist_slots + (j * MAX_UNDO + k) * 8) = src_slot;
+        }
+        *(g_hist_len    + j * 8) = *(g_hist_len    + (j + 1) * 8);
+        *(g_hist_cursor + j * 8) = *(g_hist_cursor + (j + 1) * 8);
+        *(g_hist_open   + j * 8) = *(g_hist_open   + (j + 1) * 8);
+    }
+
+    // Clear the now-orphaned last slot (its Frame was moved down).
+    j = g_frame_count - 1;
+    *(g_frames + j * 8) = 0;
+    for (k = 0; k < MAX_UNDO; k = k + 1) {
+        *(g_hist_slots + (j * MAX_UNDO + k) * 8) = 0;
+    }
+    *(g_hist_len    + j * 8) = 0;
+    *(g_hist_cursor + j * 8) = 0;
+    *(g_hist_open   + j * 8) = 0;
+
+    g_frame_count = g_frame_count - 1;
+    if (g_frame_idx >= g_frame_count) { g_frame_idx = g_frame_count - 1; }
+    frame_switch(g_frame_idx);
+    g_dirty = 1;
+    return 1;
+}
+
+// ── Layers ───────────────────────────────────────────────
+
+// Append a new blank layer to the active frame above the current
+// active layer and make it active. Returns the new layer index or
+// -1 if the frame is already at MAX_LAYERS.
+layer_add() {
+    auto f: Frame, fp, lp;
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return 0 - 1; }
+    f = fp;
+    if (f.layer_count >= MAX_LAYERS) { return 0 - 1; }
+    lp = layer_new(g_canvas_n, g_canvas_n, BLEND_NORMAL);
+    *(f.layers_arr + f.layer_count * 8) = lp;
+    f.layer_count = f.layer_count + 1;
+    f.active_idx  = f.layer_count - 1;
+    _refresh_frame_data();
+    g_dirty = 1;
+    return f.active_idx;
+}
+
+// Delete the layer at index `k` in the active frame. Refuses if
+// the frame only has one layer (always keeps at least one). The
+// active_idx is clamped to a valid range afterwards. Commits any
+// in-flight stroke first so we never leave a DeltaStroke open
+// against a layer that's about to vanish.
+layer_delete(k) {
+    auto f: Frame, fp, j, lp;
+    history_commit();
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    if (f.layer_count <= 1) { return 0; }
+    if (k < 0 || k >= f.layer_count) { return 0; }
+    lp = *(f.layers_arr + k * 8);
+    if (lp != 0) { layer_free(lp); }
+    for (j = k; j < f.layer_count - 1; j = j + 1) {
+        *(f.layers_arr + j * 8) = *(f.layers_arr + (j + 1) * 8);
+    }
+    *(f.layers_arr + (f.layer_count - 1) * 8) = 0;
+    f.layer_count = f.layer_count - 1;
+    if (f.active_idx >= f.layer_count) { f.active_idx = f.layer_count - 1; }
+    _refresh_frame_data();
+    g_dirty = 1;
+    return 1;
+}
+
+// Swap layer positions in the active frame. `k1` stays active if
+// it was the active index.
+layer_move(src_k, dst_k) {
+    auto f: Frame, fp, a, b;
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    if (src_k < 0 || src_k >= f.layer_count) { return 0; }
+    if (dst_k < 0 || dst_k >= f.layer_count) { return 0; }
+    if (src_k == dst_k) { return 1; }
+    a = *(f.layers_arr + src_k * 8);
+    b = *(f.layers_arr + dst_k * 8);
+    *(f.layers_arr + src_k * 8) = b;
+    *(f.layers_arr + dst_k * 8) = a;
+    if      (f.active_idx == src_k) { f.active_idx = dst_k; }
+    else if (f.active_idx == dst_k) { f.active_idx = src_k; }
+    _refresh_frame_data();
+    g_dirty = 1;
+    return 1;
+}
+
+// Set the active layer index within the active frame.
+void layer_active_set(k) {
+    auto f: Frame, fp;
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return; }
+    f = fp;
+    if (k < 0 || k >= f.layer_count) { return; }
+    f.active_idx = k;
+    _refresh_frame_data();
+}
+
+// Read-only accessors used by canvas.bsm, io.bsm, ui.bsm.
+layer_count() : base {
+    auto f: Frame, fp;
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    return f.layer_count;
+}
+
+layer_active_idx() : base {
+    auto f: Frame, fp;
+    fp = *(g_frames + g_frame_idx * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    return f.active_idx;
+}
+
+// Return the Layer* at (frame_idx, layer_idx). 0 on out-of-range.
+layer_at(frame_idx, layer_idx) : base {
+    auto f: Frame, fp;
+    if (frame_idx < 0 || frame_idx >= g_frame_count) { return 0; }
+    fp = *(g_frames + frame_idx * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    if (layer_idx < 0 || layer_idx >= f.layer_count) { return 0; }
+    return *(f.layers_arr + layer_idx * 8);
+}
+
+// Return the number of layers in frame i (used by io.bsm save).
+frame_layer_count(i) : base {
+    auto f: Frame, fp;
+    if (i < 0 || i >= g_frame_count) { return 0; }
+    fp = *(g_frames + i * 8);
+    if (fp == 0) { return 0; }
+    f = fp;
+    return f.layer_count;
+}
+
+// Ensure a Frame struct exists at slot `i`. Used by the load path
+// in io.bsm when a file has more frames than currently allocated.
+// Grows g_frame_count to max(current, i+1) and creates missing
+// Frame slots with one blank layer. Silent no-op when i is already
+// valid.
+void ensure_frame(i) {
+    auto j;
+    if (i < 0 || i >= MAX_FRAMES) { return; }
+    for (j = g_frame_count; j <= i; j = j + 1) {
+        if (*(g_frames + j * 8) == 0) {
+            *(g_frames + j * 8) = _frame_new();
+            _free_frame_history(j);
+        }
+    }
+    if (i >= g_frame_count) { g_frame_count = i + 1; }
+}

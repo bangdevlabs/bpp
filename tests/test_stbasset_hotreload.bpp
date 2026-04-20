@@ -1,0 +1,95 @@
+// test_stbasset_hotreload.bpp — hot-reload detection.
+//
+// Writes a sound file, loads it via asset_load_sound, rewrites
+// the file with different content, calls asset_hot_reload(), and
+// verifies the slot's content hash changed and the frame count
+// tracks the new file's data.
+//
+// (Sprite + font paths aren't exercised here — sprite needs a
+// real GPU context, font needs a TTF file. Sound is the leanest
+// way to verify the hot-reload machinery end-to-end.)
+
+import "stbgame.bsm";
+import "stbasset.bsm";
+import "bpp_file.bsm";
+
+// Construct a minimal valid WAV (PCM 16-bit mono 44100) with N
+// zero samples. The header is 44 bytes; then N * 2 bytes of data.
+// We're testing the hot-reload hash compare, not the codec — any
+// two distinct-sized WAVs work.
+static _make_wav(path, n_samples) {
+    auto total, buf, i, data_bytes;
+    data_bytes = n_samples * 2;
+    total = 44 + data_bytes;
+    buf = malloc(total);
+
+    // "RIFF" header.
+    poke(buf + 0, 'R'); poke(buf + 1, 'I'); poke(buf + 2, 'F'); poke(buf + 3, 'F');
+    write_u32(buf, 4, 36 + data_bytes);    // chunk size = 36 + data
+    poke(buf + 8, 'W'); poke(buf + 9, 'A'); poke(buf + 10, 'V'); poke(buf + 11, 'E');
+
+    // "fmt " subchunk.
+    poke(buf + 12, 'f'); poke(buf + 13, 'm'); poke(buf + 14, 't'); poke(buf + 15, ' ');
+    write_u32(buf, 16, 16);        // subchunk size
+    poke(buf + 20, 1); poke(buf + 21, 0);  // PCM format
+    poke(buf + 22, 1); poke(buf + 23, 0);  // mono
+    write_u32(buf, 24, 44100);     // sample rate
+    write_u32(buf, 28, 88200);     // byte rate
+    poke(buf + 32, 2); poke(buf + 33, 0);  // block align
+    poke(buf + 34, 16); poke(buf + 35, 0); // bits per sample
+
+    // "data" subchunk header.
+    poke(buf + 36, 'd'); poke(buf + 37, 'a'); poke(buf + 38, 't'); poke(buf + 39, 'a');
+    write_u32(buf, 40, data_bytes);
+
+    // Zero samples.
+    for (i = 0; i < data_bytes; i = i + 1) { poke(buf + 44 + i, 0); }
+
+    file_write_all(path, buf, total);
+    free(buf);
+}
+
+main() {
+    auto h, reloaded, initial_frames, new_frames;
+
+    init_str();
+    init_asset();
+
+    // Version A — 100 samples.
+    _make_wav("/tmp/test_hotreload.wav", 100);
+    h = asset_load_sound("/tmp/test_hotreload.wav");
+    if (h == 0) { print_msg("FAIL: initial load returned 0"); return 1; }
+    initial_frames = asset_width(h);
+
+    // Hot-reload with no change should be a no-op.
+    reloaded = asset_hot_reload();
+    if (reloaded != 0) {
+        print_msg("FAIL: hot_reload triggered without file change, count=");
+        print_int(reloaded); print_ln();
+        return 1;
+    }
+
+    // Rewrite the file with a different size.
+    _make_wav("/tmp/test_hotreload.wav", 200);
+
+    reloaded = asset_hot_reload();
+    if (reloaded == 0) {
+        print_msg("FAIL: hot_reload missed file change");
+        return 1;
+    }
+    new_frames = asset_width(h);
+    if (new_frames == initial_frames) {
+        print_msg("FAIL: frames did not update after reload");
+        return 1;
+    }
+
+    // Another reload with no further change — back to no-op.
+    reloaded = asset_hot_reload();
+    if (reloaded != 0) {
+        print_msg("FAIL: hot_reload triggered twice on one change");
+        return 1;
+    }
+
+    print_msg("OK");
+    return 0;
+}

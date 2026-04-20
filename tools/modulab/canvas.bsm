@@ -1,0 +1,547 @@
+// canvas.bsm — Canvas rendering, hit testing, and tools.
+//
+// The canvas is drawn as a grid of cells, each `zoom` screen pixels
+// across. An indexed cell renders as a filled square in the matching
+// palette color; index 0 (transparent) renders as a light/dark
+// checkerboard so the user can distinguish empty cells from a colored
+// fill.
+//
+// Reads all canvas state from core.bsm via `extrn`. The tool
+// handlers call pix_set() for every write. History commits happen at
+// stroke boundaries from modulab.bpp, not inside the tool functions,
+// so a drag that keeps re-applying line/rect/oval produces a single
+// undo entry instead of one per cursor update.
+
+import "stbdraw.bsm";
+
+extrn g_canvas_n, g_frame_data, g_palette, g_pal_n;
+extrn g_sel_color, g_brush_size, g_tool;
+extrn g_dither_mode, g_dither_alt;
+extrn TOOL_BRUSH, TOOL_ERASER, TOOL_FILL;
+extrn TOOL_LINE, TOOL_RECT, TOOL_OVAL, TOOL_EYEDROP;
+
+// Onion skin toggle. When non-zero, canvas_draw composites the
+// previous frame's layers underneath the active frame with an
+// alpha multiplier so animators can reference the previous pose
+// while drawing the next. Default off; toggled by modulab.bpp.
+auto g_onion_on;
+
+// Alpha multiplier applied to the previous frame during onion
+// render (0..255). 76 ≈ 30% — blends without dominating the
+// live stroke. Exposed so prefs.bsm could persist tastes later.
+auto g_onion_alpha;
+
+// Transparent-background checker colors. Picked to contrast with
+// every palette color in MCU-8 without being visually loud.
+static _checker_a() : base { return rgba(40, 40, 50, 255); }
+static _checker_b() : base { return rgba(60, 60, 75, 255); }
+
+// ── Rendering ────────────────────────────────────────────
+
+// Cached ARGB compositing buffer. Grown on demand when the canvas
+// resizes (universe swap). Freed only at program shutdown; the
+// memory cost is bounded by MAX canvas n, typically 32 KB at n=64
+// or 256 KB at n=128, which is a fraction of what the old
+// per-frame snapshot ring consumed.
+static extrn _canvas_composite;
+static extrn _canvas_composite_cap;
+
+static void _ensure_composite(bytes) {
+    if (_canvas_composite_cap >= bytes) { return; }
+    if (_canvas_composite != 0) { free(_canvas_composite); }
+    _canvas_composite     = malloc(bytes);
+    _canvas_composite_cap = bytes;
+}
+
+// Draw the canvas with its top-left corner at (x0, y0). `zoom` is
+// the per-cell side length in screen pixels. Composites every
+// visible layer bottom-up into a scratch ARGB buffer; cells with
+// no layer coverage (α=0) render as the transparency checker.
+void canvas_draw(x0, y0, zoom) {
+    auto y, x, color, px, py, n, nbytes;
+    auto i, k, lp, off, sa, sr, sg, sb, side, lc;
+
+    n = g_canvas_n;
+    nbytes = n * n * 4;
+    _ensure_composite(nbytes);
+    for (i = 0; i < nbytes; i = i + 1) { poke(_canvas_composite + i, 0); }
+
+    // Onion skin pass — render frame[idx-1] first with a
+    // dampened per-layer alpha so the previous pose shows
+    // through faintly behind the active frame. We temporarily
+    // scale each onion layer's alpha field down, composite,
+    // then restore. No allocation; just visits the same
+    // Layer structs canvas_draw normally uses.
+    if (g_onion_on != 0 && g_frame_idx > 0) {
+        auto onion_lc, onion_lp, l: Layer, saved_alpha, scaled;
+        onion_lc = frame_layer_count(g_frame_idx - 1);
+        for (k = 0; k < onion_lc; k = k + 1) {
+            onion_lp = layer_at(g_frame_idx - 1, k);
+            if (onion_lp == 0) { continue; }
+            l = onion_lp;
+            saved_alpha = l.alpha;
+            scaled = saved_alpha * g_onion_alpha / 255;
+            l.alpha = scaled;
+            layer_composite_indexed(_canvas_composite, n, n,
+                                     onion_lp, 0, 0, g_palette);
+            l.alpha = saved_alpha;
+        }
+    }
+
+    lc = layer_count();
+    for (k = 0; k < lc; k = k + 1) {
+        lp = layer_at(g_frame_idx, k);
+        if (lp == 0) { continue; }
+        layer_composite_indexed(_canvas_composite, n, n, lp, 0, 0, g_palette);
+    }
+
+    for (y = 0; y < n; y = y + 1) {
+        for (x = 0; x < n; x = x + 1) {
+            px = x0 + x * zoom;
+            py = y0 + y * zoom;
+            off = (y * n + x) * 4;
+            sa = peek(_canvas_composite + off + 3);
+            if (sa == 0) {
+                color = ((x + y) & 1) != 0 ? _checker_a() : _checker_b();
+            } else {
+                sr = peek(_canvas_composite + off + 2);
+                sg = peek(_canvas_composite + off + 1);
+                sb = peek(_canvas_composite + off);
+                color = rgba(sr, sg, sb, sa);
+            }
+            draw_rect(px, py, zoom, zoom, color);
+        }
+    }
+
+    // Thin grid lines every cell.
+    side = n * zoom;
+    color = rgba(20, 22, 30, 255);
+    for (y = 0; y <= n; y = y + 1) {
+        draw_rect(x0, y0 + y * zoom, side + 1, 1, color);
+    }
+    for (x = 0; x <= n; x = x + 1) {
+        draw_rect(x0 + x * zoom, y0, 1, side + 1, color);
+    }
+}
+
+// ── Hit testing ──────────────────────────────────────────
+
+// Map a screen-space point to a canvas cell. Returns the linear
+// index `cy * g_canvas_n + cx` when the point is inside the canvas,
+// or -1 when the point misses. The caller decodes back to (cx, cy)
+// with `% g_canvas_n` and `/ g_canvas_n`.
+canvas_hit(mx, my, x0, y0, zoom) : base {
+    auto side, cx, cy;
+    side = g_canvas_n * zoom;
+    if (mx < x0 || my < y0) { return 0 - 1; }
+    if (mx >= x0 + side || my >= y0 + side) { return 0 - 1; }
+    cx = (mx - x0) / zoom;
+    cy = (my - y0) / zoom;
+    return cy * g_canvas_n + cx;
+}
+
+// ── Dither ───────────────────────────────────────────────
+//
+// _dither_pick returns 1 when the cell at (x, y) should use the
+// alternate colour under the active dither mode, or 0 to keep the
+// primary. Modes:
+//   0 — off (always 0)
+//   1 — 2x2 checker (x + y parity)
+//   2 — 4x4 Bayer — threshold half of the 16-entry matrix so the
+//       split is 50/50 at a coarser spatial scale than the checker.
+//
+// The Bayer matrix values map screen-space position to a 0..15
+// priority; below the threshold of 8 we swap, above we keep. Values
+// were picked to match the classic recursive-subdivision Bayer
+// pattern so adjacent cells alternate diagonally.
+
+static _dither_pick(x, y) : base {
+    auto mx, my, v;
+    if (g_dither_mode == 0) { return 0; }
+    if (g_dither_mode == 1) {
+        return (x + y) & 1;
+    }
+    // 4x4 Bayer.
+    mx = x & 3;
+    my = y & 3;
+    // Row-packed matrix flattened into a 16-entry lookup; values
+    // are the canonical 4x4 Bayer thresholds.
+    if (my == 0) {
+        v = mx == 0 ? 0 : mx == 1 ? 8 : mx == 2 ? 2 : 10;
+    } else if (my == 1) {
+        v = mx == 0 ? 12 : mx == 1 ? 4 : mx == 2 ? 14 : 6;
+    } else if (my == 2) {
+        v = mx == 0 ? 3 : mx == 1 ? 11 : mx == 2 ? 1 : 9;
+    } else {
+        v = mx == 0 ? 15 : mx == 1 ? 7 : mx == 2 ? 13 : 5;
+    }
+    return v < 8 ? 0 : 1;
+}
+
+// Palette index the current selection should paint at (x, y).
+// Respects dither — callers that want to erase, stamp fixed
+// colors, or honour stencil separately use pix_set directly.
+static _idx_for(x, y) : base {
+    if (g_dither_mode == 0) { return g_sel_color; }
+    if (_dither_pick(x, y) != 0) { return g_dither_alt; }
+    return g_sel_color;
+}
+
+// ── Diamond brush stamp ──────────────────────────────────
+
+// Write every cell within Manhattan distance (g_brush_size - 1)
+// of (cx, cy) using the dither-aware colour picker. Radius 1
+// paints a single cell; radius 2 a plus; radius 3 a 5-cell
+// diamond; etc.
+void _brush_stamp_dither(cx, cy) {
+    auto r, dx, dy, ad, ax;
+    r = g_brush_size - 1;
+    if (r < 0) { r = 0; }
+    for (dy = 0 - r; dy <= r; dy = dy + 1) {
+        for (dx = 0 - r; dx <= r; dx = dx + 1) {
+            ad = dy; if (ad < 0) { ad = 0 - ad; }
+            ax = dx; if (ax < 0) { ax = 0 - ax; }
+            if (ad + ax <= r) {
+                pix_set(cx + dx, cy + dy, _idx_for(cx + dx, cy + dy));
+            }
+        }
+    }
+}
+
+// Same as _brush_stamp_dither but writes a fixed `idx` everywhere.
+// Used by the eraser — erasing with a dither pattern would leave
+// unexpected colour specks behind, so eraser always stays solid.
+void _brush_stamp_fixed(cx, cy, idx) {
+    auto r, dx, dy, ad, ax;
+    r = g_brush_size - 1;
+    if (r < 0) { r = 0; }
+    for (dy = 0 - r; dy <= r; dy = dy + 1) {
+        for (dx = 0 - r; dx <= r; dx = dx + 1) {
+            ad = dy; if (ad < 0) { ad = 0 - ad; }
+            ax = dx; if (ax < 0) { ax = 0 - ax; }
+            if (ad + ax <= r) {
+                pix_set(cx + dx, cy + dy, idx);
+            }
+        }
+    }
+}
+
+// ── Continuous-drag tools (brush, eraser) ───────────────
+
+// Stamp the brush shape with the dither-aware colour at (cx, cy).
+void tool_brush_apply(cx, cy) {
+    _brush_stamp_dither(cx, cy);
+}
+
+// Stamp transparent at (cx, cy), erasing under the brush. Always
+// solid — dither-erase produces visually confusing results.
+void tool_eraser_apply(cx, cy) {
+    _brush_stamp_fixed(cx, cy, 0);
+}
+
+// Brush-segment between two cells so fast mouse motion doesn't
+// leave gaps in the stroke. Plain Bresenham, dither-aware stamp
+// at every intermediate cell.
+void tool_brush_segment(x0, y0, x1, y1) {
+    auto dx, dy, sx, sy, err, e2;
+    dx = x1 - x0; if (dx < 0) { dx = 0 - dx; }
+    dy = y1 - y0; if (dy < 0) { dy = 0 - dy; } dy = 0 - dy;
+    sx = x0 < x1 ? 1 : 0 - 1;
+    sy = y0 < y1 ? 1 : 0 - 1;
+    err = dx + dy;
+    while (1) {
+        _brush_stamp_dither(x0, y0);
+        if (x0 == x1 && y0 == y1) { break; }
+        e2 = err + err;
+        if (e2 >= dy) { err = err + dy; x0 = x0 + sx; }
+        if (e2 <= dx) { err = err + dx; y0 = y0 + sy; }
+    }
+}
+
+void tool_eraser_segment(x0, y0, x1, y1) {
+    auto dx, dy, sx, sy, err, e2;
+    dx = x1 - x0; if (dx < 0) { dx = 0 - dx; }
+    dy = y1 - y0; if (dy < 0) { dy = 0 - dy; } dy = 0 - dy;
+    sx = x0 < x1 ? 1 : 0 - 1;
+    sy = y0 < y1 ? 1 : 0 - 1;
+    err = dx + dy;
+    while (1) {
+        _brush_stamp_fixed(x0, y0, 0);
+        if (x0 == x1 && y0 == y1) { break; }
+        e2 = err + err;
+        if (e2 >= dy) { err = err + dy; x0 = x0 + sx; }
+        if (e2 <= dx) { err = err + dx; y0 = y0 + sy; }
+    }
+}
+
+// ── Flood fill ───────────────────────────────────────────
+
+// Iterative 4-connected flood fill starting at (cx, cy). The seed
+// cell's existing colour becomes the "target"; every connected
+// cell that matches the target is recoloured via _idx_for so
+// dither patterns propagate through the fill naturally.
+//
+// When dither is off we bail out if target == g_sel_color — the
+// result would be a no-op and the while-loop guard can't see
+// that without the early exit. With dither on we always proceed
+// because the alt colour may still differ.
+void tool_fill(cx, cy) {
+    auto target, head, tail, cap, queue;
+    auto idx, x, y, n;
+
+    if (cx < 0 || cy < 0) { return; }
+    if (cx >= g_canvas_n || cy >= g_canvas_n) { return; }
+
+    target = pix_get(cx, cy);
+    if (g_dither_mode == 0 && target == g_sel_color) { return; }
+
+    n = g_canvas_n;
+    cap = n * n;
+    queue = malloc(cap * 8);
+    head = 0;
+    tail = 0;
+
+    *(queue + tail * 8) = cy * n + cx;
+    tail = tail + 1;
+    pix_set(cx, cy, _idx_for(cx, cy));
+
+    while (head < tail) {
+        idx = *(queue + head * 8);
+        head = head + 1;
+        x = idx % n;
+        y = idx / n;
+
+        if (x > 0 && pix_get(x - 1, y) == target) {
+            pix_set(x - 1, y, _idx_for(x - 1, y));
+            *(queue + tail * 8) = y * n + (x - 1);
+            tail = tail + 1;
+        }
+        if (x + 1 < n && pix_get(x + 1, y) == target) {
+            pix_set(x + 1, y, _idx_for(x + 1, y));
+            *(queue + tail * 8) = y * n + (x + 1);
+            tail = tail + 1;
+        }
+        if (y > 0 && pix_get(x, y - 1) == target) {
+            pix_set(x, y - 1, _idx_for(x, y - 1));
+            *(queue + tail * 8) = (y - 1) * n + x;
+            tail = tail + 1;
+        }
+        if (y + 1 < n && pix_get(x, y + 1) == target) {
+            pix_set(x, y + 1, _idx_for(x, y + 1));
+            *(queue + tail * 8) = (y + 1) * n + x;
+            tail = tail + 1;
+        }
+    }
+
+    free(queue);
+}
+
+// ── Shape tools (line, rect, oval) ──────────────────────
+//
+// Shape tools are reconstructive: the modulab.bpp drag handler
+// snapshots the canvas on press, and then every frame during the
+// drag it restores the snapshot and re-runs the shape from anchor
+// to current cursor. History_commit fires on release.
+//
+// Each shape therefore needs just one cell-walking function that
+// writes pix_set for every cell on the shape. No preview flag, no
+// separate render path — the canvas itself IS the preview.
+
+// Bresenham line from (x0, y0) to (x1, y1) in the selected color.
+// Single-cell strokes (ignores g_brush_size to keep the line sharp;
+// the brush tool is the right choice for thick strokes).
+void tool_line(x0, y0, x1, y1) {
+    auto dx, dy, sx, sy, err, e2;
+    dx = x1 - x0; if (dx < 0) { dx = 0 - dx; }
+    dy = y1 - y0; if (dy < 0) { dy = 0 - dy; } dy = 0 - dy;
+    sx = x0 < x1 ? 1 : 0 - 1;
+    sy = y0 < y1 ? 1 : 0 - 1;
+    err = dx + dy;
+    while (1) {
+        pix_set(x0, y0, _idx_for(x0, y0));
+        if (x0 == x1 && y0 == y1) { break; }
+        e2 = err + err;
+        if (e2 >= dy) { err = err + dy; x0 = x0 + sx; }
+        if (e2 <= dx) { err = err + dx; y0 = y0 + sy; }
+    }
+}
+
+// Axis-aligned rectangle from (x0, y0) to (x1, y1). `filled = 0`
+// draws the 4-pixel border; `filled = 1` fills the interior too.
+// Endpoints are inclusive in both dimensions.
+void tool_rect(x0, y0, x1, y1, filled) {
+    auto xa, xb, ya, yb, x, y;
+    xa = x0 < x1 ? x0 : x1;
+    xb = x0 < x1 ? x1 : x0;
+    ya = y0 < y1 ? y0 : y1;
+    yb = y0 < y1 ? y1 : y0;
+    if (filled != 0) {
+        for (y = ya; y <= yb; y = y + 1) {
+            for (x = xa; x <= xb; x = x + 1) {
+                pix_set(x, y, _idx_for(x, y));
+            }
+        }
+    } else {
+        for (x = xa; x <= xb; x = x + 1) {
+            pix_set(x, ya, _idx_for(x, ya));
+            pix_set(x, yb, _idx_for(x, yb));
+        }
+        for (y = ya; y <= yb; y = y + 1) {
+            pix_set(xa, y, _idx_for(xa, y));
+            pix_set(xb, y, _idx_for(xb, y));
+        }
+    }
+}
+
+// Midpoint ellipse inscribed in the axis-aligned rectangle from
+// (x0, y0) to (x1, y1). `filled = 0` draws the outline; `filled = 1`
+// scans horizontal lines between the two perimeter points at each
+// row. Uses the integer midpoint decision variables so no float
+// math is needed. Degenerate cases (1-cell-tall, 1-cell-wide) fall
+// back to rect-equivalent behaviour by construction — the ellipse
+// reduces to its bounding line when rx or ry is 0.
+void tool_oval(x0, y0, x1, y1, filled) {
+    auto xa, xb, ya, yb, cx2, cy2, rx, ry;
+    auto x, y, rx2, ry2, two_rx2, two_ry2;
+    auto p, px, py, idx;
+
+    xa = x0 < x1 ? x0 : x1;
+    xb = x0 < x1 ? x1 : x0;
+    ya = y0 < y1 ? y0 : y1;
+    yb = y0 < y1 ? y1 : y0;
+
+    rx = (xb - xa + 1) / 2;
+    ry = (yb - ya + 1) / 2;
+    if (rx < 1 && ry < 1) {
+        pix_set(xa, ya, _idx_for(xa, ya));
+        return;
+    }
+    if (rx < 1) { tool_line(xa, ya, xa, yb); return; }
+    if (ry < 1) { tool_line(xa, ya, xb, ya); return; }
+
+    // Centre in double-integer space so we can handle even AND odd
+    // bounding rect sizes without losing a pixel to rounding.
+    cx2 = xa + xb;  // 2 * center_x
+    cy2 = ya + yb;  // 2 * center_y
+
+    rx2 = rx * rx;
+    ry2 = ry * ry;
+    two_rx2 = 2 * rx2;
+    two_ry2 = 2 * ry2;
+
+    // Region 1: slope shallower than -1.
+    x = 0;
+    y = ry;
+    px = 0;
+    py = two_rx2 * y;
+    _oval_plot(cx2, cy2, x, y, filled);
+    p = ry2 - (rx2 * ry) + (rx2 / 4);
+    while (px < py) {
+        x = x + 1;
+        px = px + two_ry2;
+        if (p < 0) {
+            p = p + ry2 + px;
+        } else {
+            y = y - 1;
+            py = py - two_rx2;
+            p = p + ry2 + px - py;
+        }
+        _oval_plot(cx2, cy2, x, y, filled);
+    }
+
+    // Region 2: slope steeper than -1.
+    p = ry2 * (2 * x + 1) * (2 * x + 1) / 4
+      + rx2 * (y - 1) * (y - 1)
+      - rx2 * ry2;
+    while (y > 0) {
+        y = y - 1;
+        py = py - two_rx2;
+        if (p > 0) {
+            p = p + rx2 - py;
+        } else {
+            x = x + 1;
+            px = px + two_ry2;
+            p = p + rx2 - py + px;
+        }
+        _oval_plot(cx2, cy2, x, y, filled);
+    }
+}
+
+// Plot the four ellipse symmetry points, using the doubled-centre
+// trick so even-sized bounding rects stay exactly inside. When
+// `filled` is set, also scan-line-fills the two horizontal chords
+// between the left and right perimeter points.
+static void _oval_plot(cx2, cy2, x, y, filled) {
+    auto xa, xb, ya, yb, i;
+
+    // (cx2 + x) / 2 is right side; (cx2 - x) / 2 - (cx2 & 1) is left.
+    // The (& 1) term accounts for an odd centre: odd cx2 means the
+    // centre sits between two cells and left/right are not
+    // symmetric around a single column.
+    xa = (cx2 - x) / 2;
+    xb = (cx2 + x) / 2;
+    ya = (cy2 - y) / 2;
+    yb = (cy2 + y) / 2;
+
+    if (filled != 0) {
+        for (i = xa; i <= xb; i = i + 1) { pix_set(i, ya, _idx_for(i, ya)); }
+        if (yb != ya) {
+            for (i = xa; i <= xb; i = i + 1) { pix_set(i, yb, _idx_for(i, yb)); }
+        }
+    } else {
+        pix_set(xa, ya, _idx_for(xa, ya));
+        pix_set(xb, ya, _idx_for(xb, ya));
+        pix_set(xa, yb, _idx_for(xa, yb));
+        pix_set(xb, yb, _idx_for(xb, yb));
+    }
+}
+
+// ── Eyedrop ──────────────────────────────────────────────
+
+// Read the cell at (cx, cy) into g_sel_color if it points at a
+// non-transparent pixel. Silently ignores a click on a transparent
+// cell so the user doesn't lose their current color by missing the
+// sprite.
+void tool_eyedrop(cx, cy) {
+    auto idx;
+    idx = pix_get(cx, cy);
+    if (idx > 0 && idx < g_pal_n) { g_sel_color = idx; }
+}
+
+// ── Tool dispatch (one-off actions, no drag involved) ───
+
+// Apply a "single-click" tool at the linear cell index `idx`.
+// Handles brush / eraser / fill / eyedrop. Shapes are driven by
+// modulab.bpp's drag state machine instead, since they need the
+// press anchor + release event.
+void tool_apply_at(idx) {
+    auto x, y;
+    if (idx < 0) { return; }
+    x = idx % g_canvas_n;
+    y = idx / g_canvas_n;
+    if (g_tool == TOOL_BRUSH)        { tool_brush_apply(x, y); }
+    else if (g_tool == TOOL_ERASER)  { tool_eraser_apply(x, y); }
+    else if (g_tool == TOOL_FILL)    { tool_fill(x, y); }
+    else if (g_tool == TOOL_EYEDROP) { tool_eyedrop(x, y); }
+}
+
+// Restore a snapshot buffer into the active canvas. Used by the
+// drag handler to repaint the "pre-stroke" state before re-running
+// a shape tool from anchor to the current cursor.
+void canvas_restore(snapshot) {
+    auto i, total;
+    total = g_canvas_n * g_canvas_n;
+    for (i = 0; i < total; i = i + 1) {
+        poke(g_frame_data + i, peek(snapshot + i));
+    }
+}
+
+// Copy the active canvas into a caller-allocated buffer of n² bytes.
+// Used at press to remember the pre-stroke state for shape drags.
+void canvas_snapshot(dst) {
+    auto i, total;
+    total = g_canvas_n * g_canvas_n;
+    for (i = 0; i < total; i = i + 1) {
+        poke(dst + i, peek(g_frame_data + i));
+    }
+}

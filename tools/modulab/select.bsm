@@ -1,0 +1,232 @@
+// select.bsm — rect selection + clipboard, modulab-local.
+//
+// Two pieces of state live here:
+//
+//   selection — a rectangular region in cell coordinates. Tracked
+//   during a mouse drag with the select tool; once released, the
+//   rect stays active so copy / cut / paste apply to it. select_clear
+//   drops the active selection.
+//
+//   clipboard — a byte buffer of palette indices captured by copy or
+//   cut. Paste stamps the buffer at a given cell via pix_set so the
+//   active stroke records every delta and undo rolls back cleanly.
+//   The clipboard carries its own width + height — paste targets a
+//   rect of the SAME dimensions as the copy source regardless of
+//   any currently-active selection.
+//
+// Stays modulab-local because selection rect math + clipboard cell
+// semantics don't generalise beyond a pixel editor (level editor
+// would want tile-rect select that hits a different data model).
+// Extract to stb when a second tool needs it — following the
+// "second client pays the abstraction tax" rule.
+//
+// Paste contract (documented + asserted in test_modulab_select):
+//   • targets the active layer of the active frame
+//   • respects stencil: cells whose destination equals
+//     g_stencil_color are refused (pix_set handles this)
+//   • cross-layer copy requires the user to switch layers between
+//     copy and paste; select_copy / select_paste both read / write
+//     the currently-active layer
+
+import "stbdraw.bsm";
+
+extrn g_canvas_n, g_frame_data;
+
+// Selection rect. Coordinates are inclusive on both axes so that a
+// 1x1 "point" selection has x0==x1 && y0==y1. When g_sel_active is
+// 0, the rect fields are garbage and callers must check first.
+auto g_sel_active;
+auto g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1;
+
+// Drag state for the active rect-select gesture. Separate from
+// modulab.bpp's _drag_mode because select has its own stroke
+// lifecycle — no history_begin_stroke on drag since selecting
+// doesn't mutate.
+auto g_sel_dragging;
+
+// Clipboard. Palette-indexed byte buffer (malloc'd), plus its
+// width + height. g_clip_has flags non-empty clipboard; without
+// it we'd need to check every pointer separately.
+auto g_clip_data;
+auto g_clip_w;
+auto g_clip_h;
+auto g_clip_has;
+
+// ── Lifecycle ────────────────────────────────────────────
+
+void select_clear() {
+    g_sel_active   = 0;
+    g_sel_dragging = 0;
+}
+
+void select_free() {
+    if (g_clip_data != 0) { free(g_clip_data); g_clip_data = 0; }
+    g_clip_has = 0;
+    select_clear();
+}
+
+// ── Drag lifecycle ───────────────────────────────────────
+
+// Begin a new selection rect at (cx, cy). Any previous selection
+// is replaced; the clipboard is untouched.
+void select_begin(cx, cy) {
+    g_sel_dragging = 1;
+    g_sel_active   = 1;
+    g_sel_x0 = cx; g_sel_y0 = cy;
+    g_sel_x1 = cx; g_sel_y1 = cy;
+}
+
+// Update the dragging rect to (cx, cy). Called every mouse-move
+// frame while the select tool is being dragged.
+void select_update(cx, cy) {
+    if (g_sel_dragging == 0) { return; }
+    g_sel_x1 = cx;
+    g_sel_y1 = cy;
+}
+
+// End the drag. Selection stays active until cleared so the user
+// can then invoke copy / cut.
+void select_end() {
+    g_sel_dragging = 0;
+}
+
+// ── Clipboard ────────────────────────────────────────────
+
+// Normalised selection rect — x0<=x1, y0<=y1. Returns 0 when no
+// selection is active. Not `: base` because the four out-pointer
+// writes are side effects.
+static _sel_normalised(out_x0, out_y0, out_x1, out_y1) {
+    auto xa, xb, ya, yb;
+    if (g_sel_active == 0) { return 0; }
+    xa = g_sel_x0 < g_sel_x1 ? g_sel_x0 : g_sel_x1;
+    xb = g_sel_x0 < g_sel_x1 ? g_sel_x1 : g_sel_x0;
+    ya = g_sel_y0 < g_sel_y1 ? g_sel_y0 : g_sel_y1;
+    yb = g_sel_y0 < g_sel_y1 ? g_sel_y1 : g_sel_y0;
+    *(out_x0) = xa;
+    *(out_y0) = ya;
+    *(out_x1) = xb;
+    *(out_y1) = yb;
+    return 1;
+}
+
+// Copy active-layer cells in the current selection rect into the
+// clipboard. Returns 1 on success, 0 when nothing is selected.
+select_copy() {
+    auto xa, ya, xb, yb, w, h, x, y, total, src_off, dst_off;
+    auto a, b, c, d;
+    a = malloc(8); b = malloc(8); c = malloc(8); d = malloc(8);
+    if (_sel_normalised(a, b, c, d) == 0) {
+        free(a); free(b); free(c); free(d);
+        return 0;
+    }
+    xa = *(a); ya = *(b); xb = *(c); yb = *(d);
+    free(a); free(b); free(c); free(d);
+
+    w = xb - xa + 1;
+    h = yb - ya + 1;
+    total = w * h;
+    if (g_clip_data != 0) { free(g_clip_data); }
+    g_clip_data = malloc(total);
+    g_clip_w    = w;
+    g_clip_h    = h;
+    g_clip_has  = 1;
+
+    for (y = 0; y < h; y = y + 1) {
+        for (x = 0; x < w; x = x + 1) {
+            src_off = (ya + y) * g_canvas_n + (xa + x);
+            dst_off = y * w + x;
+            poke(g_clip_data + dst_off, peek(g_frame_data + src_off));
+        }
+    }
+    return 1;
+}
+
+// Copy then clear the selected cells on the active layer. Wraps
+// the erase in its own stroke so Ctrl+Z reverts the cut. Leaves
+// the selection rect active so further operations target the
+// same region.
+select_cut() {
+    auto xa, ya, xb, yb, x, y;
+    auto a, b, c, d;
+
+    if (select_copy() == 0) { return 0; }
+
+    a = malloc(8); b = malloc(8); c = malloc(8); d = malloc(8);
+    _sel_normalised(a, b, c, d);
+    xa = *(a); ya = *(b); xb = *(c); yb = *(d);
+    free(a); free(b); free(c); free(d);
+
+    history_begin_stroke();
+    for (y = ya; y <= yb; y = y + 1) {
+        for (x = xa; x <= xb; x = x + 1) {
+            pix_set(x, y, 0);
+        }
+    }
+    history_commit();
+    return 1;
+}
+
+// Stamp the clipboard at (cx, cy). Paste lands inside a stroke so
+// undo rolls the whole stamp back in one step. Targets the active
+// layer (pix_set handles stencil + delta record). Returns 1 on
+// paste, 0 if the clipboard is empty.
+select_paste(cx, cy) {
+    auto x, y;
+    if (g_clip_has == 0 || g_clip_data == 0) { return 0; }
+    history_begin_stroke();
+    for (y = 0; y < g_clip_h; y = y + 1) {
+        for (x = 0; x < g_clip_w; x = x + 1) {
+            pix_set(cx + x, cy + y, peek(g_clip_data + y * g_clip_w + x));
+        }
+    }
+    history_commit();
+    return 1;
+}
+
+// ── Overlay rendering ────────────────────────────────────
+
+// Marching-ants outline around the active selection. Toggles
+// phase every ~160ms via beat_now_ms so the dashes shimmer.
+// Draws 4 edges of alternating cyan/transparent 2-cell dashes.
+void select_draw_overlay(x0, y0, zoom) {
+    auto xa, ya, xb, yb, px, py, pw, ph, phase;
+    auto a, b, c, d, x, y, c_on, c_off;
+
+    a = malloc(8); b = malloc(8); c = malloc(8); d = malloc(8);
+    if (_sel_normalised(a, b, c, d) == 0) {
+        free(a); free(b); free(c); free(d);
+        return;
+    }
+    xa = *(a); ya = *(b); xb = *(c); yb = *(d);
+    free(a); free(b); free(c); free(d);
+
+    px = x0 + xa * zoom;
+    py = y0 + ya * zoom;
+    pw = (xb - xa + 1) * zoom;
+    ph = (yb - ya + 1) * zoom;
+
+    phase = (beat_now_ms() / 160) & 1;
+    c_on  = phase != 0 ? rgba(255, 255, 255, 220)
+                       : rgba( 97, 218, 251, 220);
+    c_off = phase != 0 ? rgba( 97, 218, 251, 220)
+                       : rgba(255, 255, 255, 220);
+
+    // Dashed outline — 4-cell-wide on/off pattern along each edge.
+    for (x = 0; x < pw; x = x + 1) {
+        auto on;
+        on = ((x / 4) & 1) == 0 ? c_on : c_off;
+        draw_rect(px + x, py,          1, 1, on);
+        draw_rect(px + x, py + ph - 1, 1, 1, on);
+    }
+    for (y = 0; y < ph; y = y + 1) {
+        auto on;
+        on = ((y / 4) & 1) == 0 ? c_on : c_off;
+        draw_rect(px,          py + y, 1, 1, on);
+        draw_rect(px + pw - 1, py + y, 1, 1, on);
+    }
+}
+
+// ── Accessors ────────────────────────────────────────────
+
+select_active() : base { return g_sel_active; }
+select_has_clip() : base { return g_clip_has; }

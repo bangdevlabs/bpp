@@ -1,0 +1,645 @@
+// io.bsm — ModuLab save/load.
+//
+// Two sidecar formats (per plan Decision #7):
+//
+//   <name>.json           — active-frame-only payload shaped
+//                           { "type":"sprite16", "width":N, "height":N,
+//                             "palette":"MCU-8",
+//                             "data": [[idx,...], [idx,...], ...] }
+//                           Drops straight into stbsprite's
+//                           load_sprite() without engine changes.
+//
+//   <name>.modulab.json   — full project state:
+//                           { "type":"modulab", "size":N,
+//                             "palette":[argb, argb, ...],
+//                             "frames":[[[idx,...], ...]] }
+//                           Round-trip format for Phase 3's Open
+//                           dialog; Phase 1 only writes it.
+//
+// Phase 1 load is intentionally absent — Phase 3 wires the Open
+// dialog and parse path.
+
+import "stbimage.bsm";
+import "stbwindow.bsm";
+
+extrn g_canvas_n, g_frame_data, g_palette, g_pal_n;
+extrn g_frame_count;
+
+// ── Save: stbsprite-compatible sidecar ──────────────────
+
+// Write the active frame as a sprite16-shaped JSON at `path`.
+// Returns 0 on success, -1 on write failure. Prints a one-line
+// stderr diagnostic on every failure path so console output is
+// enough to tell what went wrong.
+mlab_save_sprite_compat(path) : io {
+    auto sb, y, x, idx, rc;
+
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "sprite16");
+    sb = json_write_int_field(sb, "width",  g_canvas_n);
+    sb = json_write_int_field(sb, "height", g_canvas_n);
+    sb = json_write_string_field(sb, "palette", "MCU-8");
+    sb = json_write_array_field_begin(sb, "data");
+    for (y = 0; y < g_canvas_n; y = y + 1) {
+        sb = json_write_array_begin(sb);
+        for (x = 0; x < g_canvas_n; x = x + 1) {
+            idx = peek(g_frame_data + y * g_canvas_n + x);
+            sb = json_write_int(sb, idx);
+        }
+        sb = json_write_array_end(sb);
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+
+    if (rc != 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': write failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// ── Save: canonical ModuLab sidecar (schema v2) ─────────
+
+// Write the full project state at `path`. Schema v2 — every
+// frame carries its layer list; each layer has alpha, blend
+// mode, visibility, and a 2D index grid. v1 files (single
+// `data` array per frame) continue to load via the v1-compat
+// path in mlab_load_canonical.
+mlab_save_canonical(path) : io {
+    auto sb, y, x, i, idx, rc, fi, fbase;
+    auto lc, k, lp, l: Layer;
+
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "modulab");
+    sb = json_write_int_field(sb, "version", 2);
+    sb = json_write_int_field(sb, "size", g_canvas_n);
+
+    // Palette as an array of ARGB integers.
+    sb = json_write_array_field_begin(sb, "palette");
+    for (i = 0; i < g_pal_n; i = i + 1) {
+        sb = json_write_int(sb, *(g_palette + i * 8));
+    }
+    sb = json_write_array_end(sb);
+
+    // Frames — each frame is an object { active_idx, layers: [...] }.
+    // Each layer is an object { alpha, blend, visible, data: [[...]] }.
+    sb = json_write_array_field_begin(sb, "frames");
+    for (fi = 0; fi < g_frame_count; fi = fi + 1) {
+        lc = frame_layer_count(fi);
+        sb = json_write_object_begin(sb);
+        sb = json_write_int_field(sb, "active_idx",
+                                   fi == g_frame_idx ? layer_active_idx() : 0);
+        sb = json_write_array_field_begin(sb, "layers");
+        for (k = 0; k < lc; k = k + 1) {
+            lp = layer_at(fi, k);
+            if (lp == 0) { continue; }
+            l = lp;
+            fbase = l.fb;
+            sb = json_write_object_begin(sb);
+            sb = json_write_int_field(sb, "alpha",   l.alpha);
+            sb = json_write_int_field(sb, "blend",   l.blend);
+            sb = json_write_int_field(sb, "visible", l.visible);
+            sb = json_write_array_field_begin(sb, "data");
+            for (y = 0; y < g_canvas_n; y = y + 1) {
+                sb = json_write_array_begin(sb);
+                for (x = 0; x < g_canvas_n; x = x + 1) {
+                    idx = peek(fbase + y * g_canvas_n + x);
+                    sb = json_write_int(sb, idx);
+                }
+                sb = json_write_array_end(sb);
+            }
+            sb = json_write_array_end(sb);
+            sb = json_write_object_end(sb);
+        }
+        sb = json_write_array_end(sb);
+        sb = json_write_object_end(sb);
+    }
+    sb = json_write_array_end(sb);
+
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+
+    if (rc != 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': write failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// ── Save: both sidecars side by side ────────────────────
+
+// Save both files sharing a common base path. `base` should include
+// the desired directory + filename without any extension. This is
+// the single entry point the main loop calls on Ctrl+S.
+// Example: mlab_save_both("games/pathfind/assets/sprites/hero")
+// produces:
+//   games/pathfind/assets/sprites/hero.json
+//   games/pathfind/assets/sprites/hero.modulab.json
+// Returns 0 on success, -1 if either write failed.
+mlab_save_both(base) : io {
+    auto p_sprite, p_canon, sb1, sb2, rc1, rc2;
+
+    sb1 = sb_new();
+    sb1 = sb_cat(sb1, base);
+    sb1 = sb_cat(sb1, ".json");
+    p_sprite = sb1;
+
+    sb2 = sb_new();
+    sb2 = sb_cat(sb2, base);
+    sb2 = sb_cat(sb2, ".modulab.json");
+    p_canon = sb2;
+
+    rc1 = mlab_save_sprite_compat(p_sprite);
+    rc2 = mlab_save_canonical(p_canon);
+
+    if (rc1 == 0 && rc2 == 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(base);
+        print_err_msg(".json' saved (");
+        print_err_int(g_canvas_n);
+        print_err_msg("x");
+        print_err_int(g_canvas_n);
+        print_err_msg(" MCU-8)\n");
+    }
+
+    sb1 = sb_free(sb1);
+    sb2 = sb_free(sb2);
+
+    if (rc1 != 0 || rc2 != 0) { return 0 - 1; }
+    return 0;
+}
+
+// Load one frame node from JSON into modulab state. Handles both
+// v1 shape (frame_node is a 2D int array) and v2 shape (object
+// with `layers`). Called once per frame by mlab_load_canonical.
+static void _load_frame_node(doc, frame_node, f) {
+    auto ty, layers_idx, active_idx_idx, lc_file, k;
+    auto layer_node, alpha_idx, blend_idx, visible_idx, data_idx;
+    auto row_node, cell, x, y, lp, l: Layer, fbase;
+    auto a_val, b_val, v_val, saved_frame_idx, i;
+
+    ty = json_type(doc, frame_node);
+
+    if (ty != JSON_OBJECT) {
+        // v1: frame_node IS the 2D int array. Shrink target frame
+        // to a single layer, restore the stored indices into it.
+        saved_frame_idx = g_frame_idx;
+        frame_switch(f);
+        while (layer_count() > 1) { layer_delete(layer_count() - 1); }
+        lp = layer_at(f, 0);
+        if (lp == 0) { frame_switch(saved_frame_idx); return; }
+        l = lp;
+        l.alpha   = 255;
+        l.visible = 1;
+        l.blend   = BLEND_NORMAL;
+        fbase = l.fb;
+        for (y = 0; y < g_canvas_n; y = y + 1) {
+            row_node = json_child(doc, frame_node, y);
+            for (x = 0; x < g_canvas_n; x = x + 1) {
+                cell = json_int(doc, json_child(doc, row_node, x));
+                if (cell < 0)   { cell = 0; }
+                if (cell > 255) { cell = 255; }
+                poke(fbase + y * g_canvas_n + x, cell);
+            }
+        }
+        frame_switch(saved_frame_idx);
+        return;
+    }
+
+    // v2: {active_idx, layers: [...]}
+    layers_idx     = json_object_get(doc, frame_node, "layers");
+    active_idx_idx = json_object_get(doc, frame_node, "active_idx");
+    if (layers_idx < 0) { return; }
+
+    lc_file = json_length(doc, layers_idx);
+    if (lc_file > MAX_LAYERS) { lc_file = MAX_LAYERS; }
+    if (lc_file < 1)           { lc_file = 1; }
+
+    // Resize the frame's layer stack to match the file. Adds or
+    // removes layers from the top of the stack.
+    saved_frame_idx = g_frame_idx;
+    frame_switch(f);
+    while (layer_count() < lc_file) { layer_add(); }
+    while (layer_count() > lc_file) { layer_delete(layer_count() - 1); }
+
+    for (k = 0; k < lc_file; k = k + 1) {
+        layer_node  = json_child(doc, layers_idx, k);
+        alpha_idx   = json_object_get(doc, layer_node, "alpha");
+        blend_idx   = json_object_get(doc, layer_node, "blend");
+        visible_idx = json_object_get(doc, layer_node, "visible");
+        data_idx    = json_object_get(doc, layer_node, "data");
+
+        lp = layer_at(f, k);
+        if (lp == 0) { continue; }
+        l = lp;
+        a_val = alpha_idx   >= 0 ? json_int(doc, alpha_idx)   : 255;
+        b_val = blend_idx   >= 0 ? json_int(doc, blend_idx)   : 0;
+        v_val = visible_idx >= 0 ? json_int(doc, visible_idx) : 1;
+        l.alpha   = a_val;
+        l.blend   = b_val;
+        l.visible = v_val;
+        fbase = l.fb;
+        if (data_idx < 0) {
+            // Layer had no data field — leave its fb zeroed.
+            for (i = 0; i < g_canvas_n * g_canvas_n; i = i + 1) {
+                poke(fbase + i, 0);
+            }
+            continue;
+        }
+        for (y = 0; y < g_canvas_n; y = y + 1) {
+            row_node = json_child(doc, data_idx, y);
+            for (x = 0; x < g_canvas_n; x = x + 1) {
+                cell = json_int(doc, json_child(doc, row_node, x));
+                if (cell < 0)   { cell = 0; }
+                if (cell > 255) { cell = 255; }
+                poke(fbase + y * g_canvas_n + x, cell);
+            }
+        }
+    }
+
+    // Restore active_idx from the file (clamped).
+    if (active_idx_idx >= 0) {
+        k = json_int(doc, active_idx_idx);
+        if (k < 0)            { k = 0; }
+        if (k >= lc_file)     { k = lc_file - 1; }
+        layer_active_set(k);
+    } else {
+        layer_active_set(0);
+    }
+    frame_switch(saved_frame_idx);
+}
+
+// ── Load: canonical ModuLab ─────────────────────────────
+
+// Parse a <name>.modulab.json file and copy its frames + palette
+// into the current state. Returns 0 on success, -1 on any parse /
+// validation failure. Prints a one-line stderr diagnostic on every
+// rejection path.
+//
+// Phase 3 requirement: the file's "size" must match g_canvas_n. An
+// import that would resize the canvas is deferred to Phase 4
+// (universe switching) so open-of-wrong-size fails loudly instead
+// of silently truncating or stretching the art.
+mlab_load_canonical(path) : io {
+    auto buf, size_out, doc, root;
+    auto size_idx, pal_idx, frames_idx;
+    auto size_value, pal_len, frames_len;
+    auto i, f, y, x, frame_node, row_node, cell, fbase, color_word;
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': read failed\n");
+        free(size_out);
+        return 0 - 1;
+    }
+
+    doc = json_parse(buf, *(size_out));
+    free(size_out);
+    free(buf);
+    if (doc == 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': JSON parse failed\n");
+        return 0 - 1;
+    }
+
+    root = json_root(doc);
+    size_idx   = json_object_get(doc, root, "size");
+    pal_idx    = json_object_get(doc, root, "palette");
+    frames_idx = json_object_get(doc, root, "frames");
+    if (size_idx < 0 || pal_idx < 0 || frames_idx < 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': missing required field (size/palette/frames)\n");
+        json_free(doc);
+        return 0 - 1;
+    }
+
+    size_value = json_int(doc, size_idx);
+    if (size_value != g_canvas_n) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': size mismatch, need ");
+        print_err_int(g_canvas_n);
+        print_err_msg(" got ");
+        print_err_int(size_value);
+        print_err_msg(" (Phase 4 universe switch required)\n");
+        json_free(doc);
+        return 0 - 1;
+    }
+
+    // Copy palette. Any slots past g_pal_n are ignored; any slots
+    // short of g_pal_n leave the trailing entries at their current
+    // values.
+    pal_len = json_length(doc, pal_idx);
+    if (pal_len > g_pal_n) { pal_len = g_pal_n; }
+    for (i = 0; i < pal_len; i = i + 1) {
+        color_word = json_int(doc, json_child(doc, pal_idx, i));
+        *(g_palette + i * 8) = color_word;
+    }
+
+    // Copy frames. Two on-disk shapes are supported:
+    //   v1 — frames[f] is a 2D array [[idx,...], ...]. Single
+    //        implicit layer. Any existing layers on the target
+    //        frame beyond the first are dropped.
+    //   v2 — frames[f] is an object with `layers: [...]` and an
+    //        optional `active_idx`. Every layer is restored with
+    //        its alpha / blend / visible / data fields.
+    frames_len = json_length(doc, frames_idx);
+    if (frames_len < 1)          { frames_len = 1; }
+    if (frames_len > 16)         { frames_len = 16; }   // MAX_FRAMES ceiling
+    for (f = 0; f < frames_len; f = f + 1) {
+        ensure_frame(f);
+        frame_node = json_child(doc, frames_idx, f);
+        _load_frame_node(doc, frame_node, f);
+    }
+    g_frame_count = frames_len;
+
+    json_free(doc);
+
+    // Re-prime the current-frame pointer. Walking the file may have
+    // left g_frame_idx pointing past the new frame count.
+    frame_switch(0);
+
+    // Clear dirty + reset history of the active frame so the first
+    // post-load edit starts a fresh branch. Ring zeroing of other
+    // frames is deferred — they will be overwritten on next commit.
+    g_dirty = 0;
+    history_commit();
+
+    print_err_msg("modulab: '");
+    print_err_msg(path);
+    print_err_msg("': loaded ");
+    print_err_int(frames_len);
+    print_err_msg(" frame(s)\n");
+    return 0;
+}
+
+// ── Import: PNG ──────────────────────────────────────────
+
+// Quantize an (R, G, B) triple to the nearest non-zero palette
+// index using squared-RGB distance. Index 0 (transparent) is
+// reserved for the α==0 path, so this helper never returns it.
+static _quantize_rgb(r, g, b) : base {
+    auto best_i, best_d, i, c, pr, pg, pb, dr, dg, db, d;
+    best_i = 1;
+    best_d = 0 - 1;
+    for (i = 1; i < g_pal_n; i = i + 1) {
+        c = *(g_palette + i * 8);
+        pr = (c >> 16) & 0xFF;
+        pg = (c >> 8)  & 0xFF;
+        pb =  c        & 0xFF;
+        dr = r - pr;
+        dg = g - pg;
+        db = b - pb;
+        d = dr * dr + dg * dg + db * db;
+        if (best_d < 0 || d < best_d) {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    return best_i;
+}
+
+// Read a PNG at `path` and quantize it to the current palette,
+// overwriting the active frame. Dimensions must match g_canvas_n —
+// Phase 4 adds resize-on-import when universes ship. Returns 0 on
+// success, -1 on any failure. Prints a stderr diagnostic for each.
+mlab_import_png(path) : io {
+    auto pixels, w, h, x, y, rgba_off, r, g, b, a, idx, rc;
+
+    pixels = img_load(path);
+    if (pixels == 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': PNG load failed\n");
+        return 0 - 1;
+    }
+    w = img_w();
+    h = img_h();
+    if (w != g_canvas_n || h != g_canvas_n) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': dimensions ");
+        print_err_int(w); print_err_msg("x"); print_err_int(h);
+        print_err_msg(" != canvas ");
+        print_err_int(g_canvas_n); print_err_msg("x"); print_err_int(g_canvas_n);
+        print_err_msg("\n");
+        img_free(pixels);
+        return 0 - 1;
+    }
+
+    rc = 0;
+    for (y = 0; y < h; y = y + 1) {
+        for (x = 0; x < w; x = x + 1) {
+            rgba_off = (y * w + x) * 4;
+            r = peek(pixels + rgba_off);
+            g = peek(pixels + rgba_off + 1);
+            b = peek(pixels + rgba_off + 2);
+            a = peek(pixels + rgba_off + 3);
+            if (a < 128) { idx = 0; }
+            else         { idx = _quantize_rgb(r, g, b); }
+            pix_set(x, y, idx);
+        }
+    }
+
+    img_free(pixels);
+    history_commit();
+    print_err_msg("modulab: '");
+    print_err_msg(path);
+    print_err_msg("': PNG imported, ");
+    print_err_int(w); print_err_msg("x"); print_err_int(h);
+    print_err_msg(" quantized to MCU-8\n");
+    return rc;
+}
+
+// ── Spritesheet JSON metadata ────────────────────────────
+
+// Write a <base>.sheet.json metadata file describing the logical
+// grid layout of every frame. Phase 4 pairs this with a PNG grid
+// composited via img_save_png. Returns 0 on success, -1 on write
+// failure.
+mlab_export_spritesheet_json(path, cols) : io {
+    auto sb, rows, rc;
+
+    if (cols <= 0) { cols = 8; }
+    rows = (g_frame_count + cols - 1) / cols;
+
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "modulab-sheet");
+    sb = json_write_int_field(sb, "frame_w", g_canvas_n);
+    sb = json_write_int_field(sb, "frame_h", g_canvas_n);
+    sb = json_write_int_field(sb, "cols", cols);
+    sb = json_write_int_field(sb, "rows", rows);
+    sb = json_write_int_field(sb, "count", g_frame_count);
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("modulab: '");
+        print_err_msg(path);
+        print_err_msg("': sheet-json write failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// ── Spritesheet PNG export ───────────────────────────────
+
+// Compose every frame into an RGBA grid and write it out as PNG.
+// Layout: `cols` columns wide, enough rows to fit g_frame_count.
+// Empty trailing cells (when frame count isn't a multiple of
+// cols) stay transparent. Returns 0 on success, -1 on failure.
+mlab_export_spritesheet_png(path, cols) : io {
+    auto rows, sheet_w, sheet_h, rgba, f, col, row, fbase;
+    auto x, y, idx, color, out_off, rc;
+
+    if (cols <= 0) { cols = 8; }
+    rows = (g_frame_count + cols - 1) / cols;
+    sheet_w = cols * g_canvas_n;
+    sheet_h = rows * g_canvas_n;
+
+    rgba = malloc(sheet_w * sheet_h * 4);
+    // Zero-init keeps empty cells transparent (A=0) at idx==0.
+    for (f = 0; f < sheet_w * sheet_h * 4; f = f + 1) {
+        poke(rgba + f, 0);
+    }
+
+    for (f = 0; f < g_frame_count; f = f + 1) {
+        col = f % cols;
+        row = f / cols;
+        fbase = frame_get(f);
+        for (y = 0; y < g_canvas_n; y = y + 1) {
+            for (x = 0; x < g_canvas_n; x = x + 1) {
+                idx = peek(fbase + y * g_canvas_n + x);
+                out_off = ((row * g_canvas_n + y) * sheet_w
+                         + (col * g_canvas_n + x)) * 4;
+                if (idx == 0) {
+                    poke(rgba + out_off,     0);
+                    poke(rgba + out_off + 1, 0);
+                    poke(rgba + out_off + 2, 0);
+                    poke(rgba + out_off + 3, 0);
+                } else {
+                    color = *(g_palette + idx * 8);
+                    poke(rgba + out_off,     (color >> 16) & 0xFF);
+                    poke(rgba + out_off + 1, (color >> 8)  & 0xFF);
+                    poke(rgba + out_off + 2,  color        & 0xFF);
+                    poke(rgba + out_off + 3, (color >> 24) & 0xFF);
+                }
+            }
+        }
+    }
+
+    rc = img_save_png(path, rgba, sheet_w, sheet_h);
+    free(rgba);
+    if (rc != 0) { return 0 - 1; }
+
+    print_err_msg("modulab: '");
+    print_err_msg(path);
+    print_err_msg("': sheet PNG saved (");
+    print_err_int(sheet_w); print_err_msg("x"); print_err_int(sheet_h);
+    print_err_msg(", ");
+    print_err_int(g_frame_count); print_err_msg(" frames)\n");
+    return 0;
+}
+
+// ── Dialog wrappers ──────────────────────────────────────
+
+// Show a native Save As dialog, strip any trailing .json /
+// .modulab.json extension the user typed, then write both sidecars
+// at the resulting prefix. Returns 0 on success, -1 on cancel or
+// write failure.
+mlab_save_dialog() : io {
+    auto picked, base, rc;
+
+    picked = window_save_dialog("Save sprite", "hero.json");
+    if (picked == 0) { return 0 - 1; }
+
+    base = _strip_known_suffix(picked);
+    rc = mlab_save_both(base);
+
+    if (base != picked) { free(base); }
+    free(picked);
+    return rc;
+}
+
+// Show a native Open dialog and dispatch by the chosen file's
+// extension: .modulab.json → canonical load, .png → PNG import,
+// .json → nothing yet (would require a ModuLab-owned parser for
+// sprite16 — deferred). Returns 0 on success, -1 on cancel or
+// load failure.
+mlab_open_dialog() : io {
+    auto picked, rc, len;
+
+    picked = window_open_dialog("Open sprite");
+    if (picked == 0) { return 0 - 1; }
+
+    if (_ends_with(picked, ".modulab.json") != 0) {
+        rc = mlab_load_canonical(picked);
+    } else if (_ends_with(picked, ".png") != 0) {
+        rc = mlab_import_png(picked);
+    } else {
+        print_err_msg("modulab: '");
+        print_err_msg(picked);
+        print_err_msg("': unsupported extension (expected .modulab.json or .png)\n");
+        rc = 0 - 1;
+    }
+
+    free(picked);
+    return rc;
+}
+
+// ── String helpers ───────────────────────────────────────
+
+// Return 1 if `s` ends with `suffix`. C-strings, null-terminated.
+static _ends_with(s, suffix) : base {
+    auto sl, xl, i;
+    sl = str_len(s);
+    xl = str_len(suffix);
+    if (xl > sl) { return 0; }
+    for (i = 0; i < xl; i = i + 1) {
+        if (peek(s + sl - xl + i) != peek(suffix + i)) { return 0; }
+    }
+    return 1;
+}
+
+// If `path` ends with ".json" or ".modulab.json", return a newly
+// allocated copy with that suffix removed. Otherwise return `path`
+// unchanged (caller checks pointer equality to decide whether the
+// result needs freeing).
+static _strip_known_suffix(path) {
+    auto sl, xl, out, i;
+
+    if (_ends_with(path, ".modulab.json") != 0) {
+        xl = str_len(".modulab.json");
+    } else if (_ends_with(path, ".json") != 0) {
+        xl = str_len(".json");
+    } else {
+        return path;
+    }
+    sl = str_len(path);
+    out = malloc(sl - xl + 1);
+    for (i = 0; i < sl - xl; i = i + 1) { poke(out + i, peek(path + i)); }
+    poke(out + sl - xl, 0);
+    return out;
+}

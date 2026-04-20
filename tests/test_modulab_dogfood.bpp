@@ -1,0 +1,115 @@
+// test_modulab_dogfood.bpp — end-to-end Phase 5 integration.
+//
+// Proves the whole dogfood loop closes: paint a 16x16 sprite in
+// ModuLab's state using its own tools, save as a sprite-compat
+// JSON, reload through the engine's stbsprite.load_sprite, and
+// assert pixel-perfect equality. If this passes, any sprite
+// painted by hand in the interactive editor is guaranteed to
+// drop into pathfind / platformer / any game that uses
+// load_sprite without translation.
+
+import "stbgame.bsm";
+load "../tools/modulab/core.bsm";
+load "../tools/modulab/canvas.bsm";
+load "../tools/modulab/io.bsm";
+
+main() {
+    auto i, x, y, rc, n, total, reloaded, mismatch;
+
+    init_str();
+    state_init(16);
+
+    n = g_canvas_n;
+    total = n * n;
+
+    // Paint a simple character using ModuLab's own tools. Mixes
+    // every palette color so a reload that drops any index fails
+    // loud. Layout: outline frame, filled body, accent dots.
+
+    g_sel_color = 1;       // black
+    tool_rect(0, 0, 15, 15, 0);  // outline
+
+    g_sel_color = 3;       // gray
+    tool_rect(4, 2, 11, 4, 1);   // head
+
+    g_sel_color = 2;       // dark red
+    tool_fill(8, 3);             // head interior becomes red via fill
+
+    g_sel_color = 4;       // orange
+    tool_oval(2, 6, 13, 11, 1);  // filled oval body
+
+    g_sel_color = 5;       // green
+    tool_line(3, 13, 12, 13);    // shoes
+
+    g_sel_color = 6;       // purple
+    pix_set(6, 7, 6);            // eyes
+    pix_set(9, 7, 6);
+
+    g_sel_color = 7;       // yellow
+    pix_set(7, 9, 7);            // mouth
+    pix_set(8, 9, 7);
+
+    history_commit();
+
+    // Save both sidecars to /tmp so the test doesn't leave
+    // artefacts in the repo.
+    rc = mlab_save_both("/tmp/test_modulab_dogfood");
+    if (rc != 0) {
+        print_msg("FAIL: mlab_save_both returned non-zero");
+        return 1;
+    }
+
+    // Reload through the engine reader — this is the contract the
+    // games depend on. Any divergence between mlab_save_sprite_compat
+    // and stbsprite.load_sprite would show up here.
+    reloaded = malloc(total);
+    for (i = 0; i < total; i = i + 1) { poke(reloaded + i, 255); }
+    rc = load_sprite("/tmp/test_modulab_dogfood.json", reloaded, n, n);
+    if (rc == 0) {
+        print_msg("FAIL: load_sprite could not re-read the dogfood JSON");
+        free(reloaded);
+        return 1;
+    }
+
+    // Byte-compare every cell.
+    mismatch = 0;
+    for (y = 0; y < n; y = y + 1) {
+        for (x = 0; x < n; x = x + 1) {
+            if (peek(reloaded + y * n + x) != pix_get(x, y)) {
+                print_msg("FAIL: cell mismatch at (x,y)=(");
+                print_int(x); print_msg(","); print_int(y);
+                print_msg(") painted="); print_int(pix_get(x, y));
+                print_msg(" reloaded="); print_int(peek(reloaded + y * n + x));
+                print_ln();
+                mismatch = 1;
+            }
+        }
+    }
+
+    if (mismatch != 0) {
+        free(reloaded);
+        return 1;
+    }
+
+    // Print the reloaded canvas as ASCII art for a visual sanity
+    // check — handy when a human eye scans the test log. Empty
+    // cells show as '.', painted cells show their palette index
+    // so the silhouette is legible in one glance.
+    print_msg("Painted sprite (reloaded from saved JSON):");
+    for (y = 0; y < n; y = y + 1) {
+        for (x = 0; x < n; x = x + 1) {
+            auto idx;
+            idx = peek(reloaded + y * n + x);
+            if (idx == 0) { print_char('.'); }
+            else          { print_char('0' + idx); }
+            print_char(' ');
+        }
+        print_ln();
+    }
+
+    free(reloaded);
+    state_free();
+
+    print_msg("OK");
+    return 0;
+}

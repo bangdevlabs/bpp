@@ -1,0 +1,105 @@
+// test_modulab_composite_perf.bpp — Risk B stress measurement.
+//
+// Builds the worst-case layer stack (n=128, 16 layers all visible
+// with non-zero content throughout) and times 100 back-to-back
+// calls to layer_composite_indexed across every layer. Reports
+// average and worst single-frame composite cost.
+//
+// Budget (per review gate): under 12 ms worst case means we ship
+// as-is. Over that triggers the dirty-flag optimisation before
+// Item 3 (selection).
+//
+// Isolation: we measure ONLY the composite pass (not the per-cell
+// blit in canvas_draw), since composite is the O(n²·layers)
+// term and the suspected bottleneck. The blit adds constant
+// factor but scales the same way, so measurements here predict
+// real canvas_draw cost within ~20%.
+
+import "stbgame.bsm";
+load "../tools/modulab/core.bsm";
+
+main() {
+    auto i, k, n, total, scratch, nbytes, lp, l: Layer;
+    auto iters, t0, t1, elapsed, sum_us, worst_us, lc;
+
+    init_str();
+    init_beat();
+    state_init(128);
+
+    n = g_canvas_n;
+    total = n * n;
+
+    // Fill layer 0 + add 15 more. Each layer gets a distinctive
+    // checker so no cell composites to transparent early.
+    lp = layer_at(0, 0);
+    l = lp;
+    for (i = 0; i < total; i = i + 1) {
+        poke(l.fb + i, 1 + ((i + 0) & 7));
+    }
+    for (k = 1; k < 16; k = k + 1) {
+        layer_add();
+        lp = layer_at(0, k);
+        l = lp;
+        for (i = 0; i < total; i = i + 1) {
+            poke(l.fb + i, 1 + ((i + k) & 7));
+        }
+        // Alpha 192 on upper layers so blend math runs (255 would
+        // take a fast path on some implementations).
+        l.alpha = k < 8 ? 255 : 192;
+    }
+    lc = layer_count();
+    if (lc != 16) {
+        print_msg("FAIL: layer_add did not reach 16");
+        print_int(lc); print_ln();
+        return 1;
+    }
+
+    nbytes  = total * 4;
+    scratch = malloc(nbytes);
+
+    iters    = 100;
+    sum_us   = 0;
+    worst_us = 0;
+
+    for (i = 0; i < iters; i = i + 1) {
+        // Match canvas_draw: clear scratch + composite all layers.
+        auto j;
+        for (j = 0; j < nbytes; j = j + 1) { poke(scratch + j, 0); }
+
+        t0 = beat_now_us();
+        for (k = 0; k < lc; k = k + 1) {
+            lp = layer_at(0, k);
+            if (lp == 0) { continue; }
+            layer_composite_indexed(scratch, n, n, lp, 0, 0, g_palette);
+        }
+        t1 = beat_now_us();
+
+        elapsed = t1 - t0;
+        sum_us = sum_us + elapsed;
+        if (elapsed > worst_us) { worst_us = elapsed; }
+    }
+
+    print_msg("composite perf @ n=128, 16 layers, 100 iters");
+    print_msg("  avg:   ");
+    print_int(sum_us / iters);
+    print_msg(" us (");
+    print_int(sum_us / iters / 1000);
+    print_msg("+ ms)");
+    print_ln();
+    print_msg("  worst: ");
+    print_int(worst_us);
+    print_msg(" us (");
+    print_int(worst_us / 1000);
+    print_msg("+ ms)");
+    print_ln();
+
+    if (worst_us > 12000) {
+        print_msg("GATE: worst case > 12 ms — dirty-flag required");
+        free(scratch);
+        return 2;   // distinct exit code signals gate trip
+    }
+
+    free(scratch);
+    print_msg("OK");
+    return 0;
+}

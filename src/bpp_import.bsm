@@ -499,24 +499,6 @@ static check_file_import(loff, llen) {
 // Forward declaration.
 void process_file(path_off, path_len) { return; }
 
-// Returns 1 if the path's tail matches "stbgame.bsm". Used to trigger
-// the implicit _stb_platform import — programs that depend on stbgame
-// always need the platform layer for _stb_init_window etc., and we'd
-// rather inject that here than leave a magic import inside stbgame's
-// own source.
-static _path_is_stbgame(path_off, path_len) {
-    auto suffix_len, i, c, target;
-    suffix_len = 11;
-    if (path_len < suffix_len) { return 0; }
-    // Compare the last 11 bytes against "stbgame.bsm".
-    target = "stbgame.bsm";
-    for (i = 0; i < suffix_len; i = i + 1) {
-        c = peek(path_off + path_len - suffix_len + i);
-        if (c != peek(target + i)) { return 0; }
-    }
-    return 1;
-}
-
 void process_file(path_off, path_len) {
     auto fd, nread, fsize, pos, line_start, ch;
     auto fname_len, plen, i;
@@ -584,33 +566,6 @@ void process_file(path_off, path_len) {
     // Hash the file content for cache invalidation.
     mod_hashes = arr_push(mod_hashes, fnv1a(fbuf + my_file, fsize));
     my_mod_idx = arr_len(diag_file_starts) - 1;
-
-    // ── Auto-import platform layer when stbgame is brought in ──
-    // The game-engine entry point used to carry an explicit
-    // `import "_stb_platform.bsm"` line so that find_file's target-suffix
-    // fallback would pull in the per-target platform module. That import
-    // is now injected here instead, which keeps stbgame's source clean
-    // and centralizes the platform indirection at the compiler level.
-    if (_path_is_stbgame(fbuf + my_path, path_len)) {
-        auto pp_len, pi;
-        // Build "_stb_platform.bsm" in linebuf for find_file (it expects
-        // the import name in linebuf, same as check_file_import would
-        // produce). Length is 17 bytes including the .bsm extension.
-        auto pname;
-        pname = "_stb_platform.bsm";
-        for (pi = 0; pi < 17; pi = pi + 1) {
-            poke(linebuf + pi, peek(pname + pi));
-        }
-        pp_len = find_file(fbuf + my_path, path_len, linebuf, 17);
-        if (pp_len > 0) {
-            // Process the platform module before stbgame's own line scan
-            // so its symbols are available by the time anything that
-            // imports stbgame gets validated. No dep edge is recorded:
-            // the platform layer has no incoming edges from stbgame's
-            // perspective and topo sort tolerates orphan modules.
-            process_file(pathbuf, pp_len);
-        }
-    }
 
     // ── Auto-inject core utilities and runtime for the entry .bpp ──
     //
@@ -809,6 +764,30 @@ void process_file(path_off, path_len) {
             fbuf_top = _ai_sp;
         }
 
+        // _stb_platform.bsm  (17 bytes) — resolves via target-suffix to
+        // _stb_platform_macos.bsm or _stb_platform_linux.bsm. Every
+        // program runs on some chip + OS, and the platform is that
+        // runtime layer. CLI programs that never open a window / call
+        // _stb_gpu_* have their references stripped by DCE, so the
+        // cost is zero for programs that don't use the GUI surface.
+        // Deduping with was_imported() means the compiler's self-host
+        // (bpp.bpp) still works even though it never touches Cocoa.
+        _ai_pname = "_stb_platform.bsm";
+        for (_ai_i = 0; _ai_i < 17; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 17);
+        if (_ai_plen > 0) {
+            auto _ai_sp, _ai_si;
+            _ai_sp = fbuf_top;
+            for (_ai_si = 0; _ai_si < _ai_plen; _ai_si = _ai_si + 1) {
+                poke(fbuf + _ai_sp + _ai_si, peek(pathbuf + _ai_si));
+            }
+            fbuf_top = fbuf_top + _ai_plen;
+            process_file(pathbuf, _ai_plen);
+            dep_from = arr_push(dep_from, my_mod_idx);
+            dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
+            fbuf_top = _ai_sp;
+        }
+
         // bpp_beat.bsm  (12 bytes)
         _ai_pname = "bpp_beat.bsm";
         for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
@@ -888,6 +867,30 @@ void process_file(path_off, path_len) {
         // that never touch the function, so the zero-use cost is
         // nil.
         _ai_pname = "bpp_path.bsm";
+        for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) {
+            auto _ai_sp, _ai_si;
+            _ai_sp = fbuf_top;
+            for (_ai_si = 0; _ai_si < _ai_plen; _ai_si = _ai_si + 1) {
+                poke(fbuf + _ai_sp + _ai_si, peek(pathbuf + _ai_si));
+            }
+            fbuf_top = fbuf_top + _ai_plen;
+            process_file(pathbuf, _ai_plen);
+            dep_from = arr_push(dep_from, my_mod_idx);
+            dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
+            fbuf_top = _ai_sp;
+        }
+
+        // bpp_json.bsm  (12 bytes) — JSON reader + writer. Auto-
+        // injected so apps get save/load + config parsing for free,
+        // which enforces the rule that only stb* is explicitly
+        // imported by user code. Previously modulab had a leaky
+        // `import "bpp_json.bsm"` that exposed an install.sh gap;
+        // auto-injection closes that hole by construction. DCE
+        // strips the code from binaries that never call any
+        // json_* symbol.
+        _ai_pname = "bpp_json.bsm";
         for (_ai_i = 0; _ai_i < 12; _ai_i = _ai_i + 1) { poke(linebuf + _ai_i, peek(_ai_pname + _ai_i)); }
         _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
         if (_ai_plen > 0) {

@@ -99,16 +99,18 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 #   bpp_io      — putchar/getchar and basic I/O
 #   bpp_math    — numeric helpers and math primitives
 #   bpp_file    — file read/write shims over the OS syscalls
+#   bpp_json    — JSON reader/writer (explicit import, not auto-injected)
 #   bpp_beat    — universal monotonic clock
 #   bpp_job     — N×SPSC worker pool
 #   bpp_maestro — solo / base / render bandleader
 #   bpp_arena   — bump allocator (auto-injected since 0.75)
 #   bpp_path    — argv[0]-relative asset resolution (auto-injected since 0.75)
-# Every module in this list is auto-injected by bpp_import.bsm for
-# any user main() program — so missing one here breaks every user
-# compile with a confusing "malloc never defined" cascade. When
-# bpp_import gains a new auto-injected module, add it to this list
-# at the same time.
+# Auto-injected entries are pulled in by bpp_import.bsm for every user
+# main() program — missing one breaks every compile with a confusing
+# "malloc never defined" cascade. Explicit-import entries ship here so
+# `import "bpp_json.bsm"` resolves from a standalone project directory.
+# When a new user-facing src/ module ships, add it to this list at the
+# same time.
 sudo cp src/bpp_defs.bsm "$LIB_DIR/"
 sudo cp src/bpp_mem.bsm "$LIB_DIR/"
 sudo cp src/bpp_array.bsm "$LIB_DIR/"
@@ -118,6 +120,7 @@ sudo cp src/bpp_hash.bsm "$LIB_DIR/"
 sudo cp src/bpp_io.bsm "$LIB_DIR/"
 sudo cp src/bpp_math.bsm "$LIB_DIR/"
 sudo cp src/bpp_file.bsm "$LIB_DIR/"
+sudo cp src/bpp_json.bsm "$LIB_DIR/"
 sudo cp src/bpp_beat.bsm "$LIB_DIR/"
 sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"

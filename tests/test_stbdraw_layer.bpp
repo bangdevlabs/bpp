@@ -1,0 +1,102 @@
+// test_stbdraw_layer.bpp — Layer compositor behaviour.
+//
+// Builds a tiny palette, creates two 4×4 layers, composites them
+// with BLEND_NORMAL then BLEND_MULTIPLY, and asserts pixel values
+// at known cells.
+
+import "stbgame.bsm";
+
+main() {
+    auto i, palette, dst, la, lb, ca: Layer, cb: Layer;
+    auto off, r, g, b, a;
+
+    init_str();
+    init_color();
+    init_layer_blends();
+
+    // 8-byte-stride palette, 4 slots. Slot 0 transparent as always.
+    palette = malloc(4 * 8);
+    *(palette + 0 * 8) = 0x00000000;  // transparent
+    *(palette + 1 * 8) = 0xFFFF0000;  // opaque red
+    *(palette + 2 * 8) = 0xFF00FF00;  // opaque green
+    *(palette + 3 * 8) = 0xFF808080;  // opaque gray
+
+    // Destination 4×4 ARGB buffer, zero-filled.
+    dst = malloc(4 * 4 * 4);
+    for (i = 0; i < 4 * 4 * 4; i = i + 1) { poke(dst + i, 0); }
+
+    // Layer A — full of color 1 (red).
+    la = layer_new(4, 4, BLEND_NORMAL);
+    ca = la;
+    for (i = 0; i < 16; i = i + 1) { poke(ca.fb + i, 1); }
+
+    // Layer B — full of color 3 (gray) at half alpha.
+    lb = layer_new(4, 4, BLEND_NORMAL);
+    cb = lb;
+    for (i = 0; i < 16; i = i + 1) { poke(cb.fb + i, 3); }
+    layer_set_alpha(lb, 128);
+
+    // Composite A then B (bottom-up).
+    layer_composite_indexed(dst, 4, 4, la, 0, 0, palette);
+    layer_composite_indexed(dst, 4, 4, lb, 0, 0, palette);
+
+    // Pixel (0,0): red fully covered, then gray at α=128 on top.
+    // Expected blend: out_r = 0x80*128/255 + 0xFF*127/255 ≈ 191.
+    //                 out_g = 0x80*128/255 + 0x00*127/255 ≈ 64.
+    //                 out_b = 0x80*128/255 + 0x00*127/255 ≈ 64.
+    // We tolerate ±2 rounding slop.
+    off = 0;
+    b = peek(dst + off);
+    g = peek(dst + off + 1);
+    r = peek(dst + off + 2);
+    a = peek(dst + off + 3);
+    if (r < 185 || r > 195) {
+        print_msg("FAIL: NORMAL blend red channel wrong: ");
+        print_int(r); print_ln();
+        return 1;
+    }
+    if (g < 60 || g > 70) {
+        print_msg("FAIL: NORMAL blend green channel wrong: ");
+        print_int(g); print_ln();
+        return 1;
+    }
+    if (a != 255) {
+        print_msg("FAIL: alpha coverage not 255: ");
+        print_int(a); print_ln();
+        return 1;
+    }
+
+    // Reset dst + redo B as MULTIPLY.
+    for (i = 0; i < 4 * 4 * 4; i = i + 1) { poke(dst + i, 0); }
+    layer_composite_indexed(dst, 4, 4, la, 0, 0, palette);
+    layer_set_blend(lb, BLEND_MULTIPLY);
+    layer_set_alpha(lb, 255);
+    layer_composite_indexed(dst, 4, 4, lb, 0, 0, palette);
+
+    // MULTIPLY at full α: channel = src_channel * dst_channel / 255.
+    // src=0x80, dst=0xFF (red), product = 128.
+    off = 0;
+    r = peek(dst + off + 2);
+    if (r < 126 || r > 130) {
+        print_msg("FAIL: MULTIPLY red wrong: ");
+        print_int(r); print_ln();
+        return 1;
+    }
+
+    // Visibility gate — hidden layers don't touch dst.
+    for (i = 0; i < 4 * 4 * 4; i = i + 1) { poke(dst + i, 0); }
+    layer_set_visible(la, 0);
+    layer_composite_indexed(dst, 4, 4, la, 0, 0, palette);
+    if (peek(dst + 0) != 0 || peek(dst + 1) != 0 || peek(dst + 2) != 0) {
+        print_msg("FAIL: hidden layer still wrote pixels");
+        return 1;
+    }
+
+    layer_free(la);
+    layer_free(lb);
+    free(palette);
+    free(dst);
+
+    print_msg("OK");
+    return 0;
+}

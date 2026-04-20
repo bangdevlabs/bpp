@@ -166,3 +166,172 @@ mouse_released(btn) {
 point_in_rect(px, py, x, y, w, h) : base {
     return px >= x && px < x + w && py >= y && py < y + h;
 }
+
+// ── Actions (named key + modifier bindings) ──────────────
+//
+// An Action is a named (key, modifier) pair. Callers register
+// actions at setup ("paint" → KEY_B, mod=0; "save" → KEY_S,
+// mod=CTRL) and query them every frame via action_pressed /
+// action_down. Lookup is fnv1a-32 hash + optional str_eq
+// tiebreaker on collision — safe across compilation units where
+// string-literal deduplication is not guaranteed (see plan
+// Decision #10).
+//
+// Modifier mask bits match the KEY_* held-down state ANDed at
+// query time — we do not dispatch on press-edge of modifiers;
+// the modifier bits are a filter over the primary key's edge.
+
+const ACTION_MOD_CTRL  = 1;
+const ACTION_MOD_SHIFT = 2;
+const ACTION_MOD_ALT   = 4;
+const ACTION_MOD_META  = 8;
+
+const _ACTION_MAX = 32;
+
+struct Action { hash, name_ptr, key, mod }
+
+static extrn _actions;
+static extrn _action_count;
+
+// FNV-1a 32-bit over a null-terminated C-string. Standard prime
+// 0x01000193, offset 0x811c9dc5. Truncation to 32 bits matches
+// the usual contract; collisions are vanishingly rare at
+// _ACTION_MAX=32 names but we still fall back to str_eq below.
+static _fnv1a(s) : base {
+    auto h, i, ch;
+    h = 0x811c9dc5;
+    i = 0;
+    while (1) {
+        ch = peek(s + i);
+        if (ch == 0) { break; }
+        h = (h ^ ch) * 0x01000193;
+        h = h & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Linear scan for an action matching `hash`. On collision the
+// optional str_eq confirms the name before accepting. Returns an
+// index into _actions or -1 on miss.
+static _action_find(name, hash) {
+    auto i, a: Action, ap;
+    for (i = 0; i < _action_count; i = i + 1) {
+        ap = _actions + i * sizeof(Action);
+        a = ap;
+        if (a.hash != hash) { continue; }
+        if (str_eq(a.name_ptr, name) != 0) { return i; }
+    }
+    return 0 - 1;
+}
+
+// Initialise the action table. Called once by init_input.
+static void _action_init() {
+    _actions      = malloc(_ACTION_MAX * sizeof(Action));
+    _action_count = 0;
+}
+
+// Register a new action. Silently drops if the table is full.
+// Re-registering an existing name updates its binding (same as
+// action_rebind — convenient for "defaults then prefs_load
+// overrides" startup sequences).
+void action_define(name, key, mod) {
+    auto hash, idx, a: Action, ap;
+    if (_actions == 0) { _action_init(); }
+    hash = _fnv1a(name);
+    idx = _action_find(name, hash);
+    if (idx < 0) {
+        if (_action_count >= _ACTION_MAX) { return; }
+        idx = _action_count;
+        _action_count = _action_count + 1;
+    }
+    ap = _actions + idx * sizeof(Action);
+    a = ap;
+    a.hash     = hash;
+    a.name_ptr = name;
+    a.key      = key;
+    a.mod      = mod;
+}
+
+// Update an existing action's binding. If the name isn't
+// registered yet this acts as action_define.
+void action_rebind(name, key, mod) {
+    action_define(name, key, mod);
+}
+
+// Return the current modifier bitmask composed from held-down
+// KEY_CTRL / KEY_SHIFT / KEY_ALT / KEY_META.
+static _mod_state() : base {
+    auto m;
+    m = 0;
+    if (key_down(KEY_CTRL)  != 0) { m = m | ACTION_MOD_CTRL; }
+    if (key_down(KEY_SHIFT) != 0) { m = m | ACTION_MOD_SHIFT; }
+    if (key_down(KEY_ALT)   != 0) { m = m | ACTION_MOD_ALT; }
+    if (key_down(KEY_META)  != 0) { m = m | ACTION_MOD_META; }
+    return m;
+}
+
+// 1 if `name`'s action was triggered (primary key press-edge +
+// modifier match) on the current frame.
+action_pressed(name) {
+    auto hash, idx, a: Action, ap, mods;
+    if (_actions == 0) { return 0; }
+    hash = _fnv1a(name);
+    idx = _action_find(name, hash);
+    if (idx < 0) { return 0; }
+    ap = _actions + idx * sizeof(Action);
+    a = ap;
+    mods = _mod_state();
+    if ((mods & a.mod) != a.mod) { return 0; }
+    return key_pressed(a.key);
+}
+
+// 1 if the action's primary key is currently held (with matching
+// modifier state). Useful for "hold to pan" style input.
+action_down(name) {
+    auto hash, idx, a: Action, ap, mods;
+    if (_actions == 0) { return 0; }
+    hash = _fnv1a(name);
+    idx = _action_find(name, hash);
+    if (idx < 0) { return 0; }
+    ap = _actions + idx * sizeof(Action);
+    a = ap;
+    mods = _mod_state();
+    if ((mods & a.mod) != a.mod) { return 0; }
+    return key_down(a.key);
+}
+
+// Number of actions currently registered. Used by prefs
+// serialisation to iterate all bindings.
+action_count() : base {
+    return _action_count;
+}
+
+// Name pointer for the i-th action. Callers read via str_eq or
+// copy into their own buffer — the returned pointer is the
+// caller's own literal from action_define, not a strdup.
+action_name_at(i) : base {
+    auto a: Action, ap;
+    if (i < 0 || i >= _action_count) { return 0; }
+    ap = _actions + i * sizeof(Action);
+    a = ap;
+    return a.name_ptr;
+}
+
+// Key slot for the i-th action.
+action_key_at(i) : base {
+    auto a: Action, ap;
+    if (i < 0 || i >= _action_count) { return 0; }
+    ap = _actions + i * sizeof(Action);
+    a = ap;
+    return a.key;
+}
+
+// Modifier mask for the i-th action.
+action_mod_at(i) : base {
+    auto a: Action, ap;
+    if (i < 0 || i >= _action_count) { return 0; }
+    ap = _actions + i * sizeof(Action);
+    a = ap;
+    return a.mod;
+}

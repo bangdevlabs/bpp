@@ -1,0 +1,519 @@
+// ui.bsm — ModuLab Phase 3 chrome.
+//
+// Draws the four pieces of UI that surround the canvas:
+//
+//   ui_topbar        — Save / Open / Import buttons + filename field
+//   ui_tool_sidebar  — 7 tool buttons stacked on the left
+//   ui_palette_row   — delegates to gui_palette, adds brush-size +/-
+//   ui_frame_strip   — horizontal frame thumbnails + add/dup/del
+//
+// Every widget returns a compact action code so modulab.bpp can
+// drive the state transition (open/save/import, tool pick, frame
+// nav, etc.) from a single place instead of sprinkling mutations
+// across the draw path.
+//
+// The filename field is owned here. ui_filename_active() lets the
+// main loop gate tool hotkeys on focus so typing a filename doesn't
+// toggle the brush mid-word.
+
+import "stbdraw.bsm";
+import "stbinput.bsm";
+import "stbui.bsm";
+
+extrn g_canvas_n, g_palette, g_pal_n;
+extrn g_sel_color, g_brush_size, g_tool;
+extrn g_frame_count, g_frame_data;
+extrn g_universe, g_dither_mode, g_dither_alt;
+extrn g_stencil_on, g_stencil_color;
+extrn TOOL_BRUSH, TOOL_ERASER, TOOL_FILL;
+extrn TOOL_LINE, TOOL_RECT, TOOL_OVAL, TOOL_EYEDROP, TOOL_SELECT;
+extrn UNIVERSE_MCU, UNIVERSE_NKOTC, UNIVERSE_CB;
+extrn MAX_LAYERS;
+
+// Layer panel action codes — modulab.bpp inspects the return of
+// ui_layer_panel to decide which mutating call to run.
+extrn UI_LAYER_NONE;
+extrn UI_LAYER_ADD;
+extrn UI_LAYER_DEL;
+
+// ── Module globals ───────────────────────────────────────
+
+// Filename text-input state. Allocated by ui_init, freed by ui_free.
+static extrn _ui_filename_ti;
+static extrn _ui_filename_buf;
+
+// Default max filename length. Large enough for
+// "games/pathfind/assets/sprites/hero.modulab.json" plus a few
+// extra segments a user might paste in.
+static extrn _UI_PATH_MAX;
+
+// Byte-sized state slots for widgets that read via peek/poke
+// (gui_dropdown, gui_checkbox). These live separately from the
+// integer globals in core.bsm because the widgets write 1 byte
+// and would corrupt neighbouring memory in a word-sized slot.
+static extrn _ui_universe_open;   // 0 = collapsed, 1 = expanded
+static extrn _ui_universe_sel;    // mirror of g_universe
+static extrn _ui_stencil_on;      // mirror of g_stencil_on
+
+// Flag returned by ui_phase4_sidebar when the user requested a
+// universe switch. modulab.bpp inspects it after the frame and
+// triggers a confirm dialog when g_dirty is set.
+extrn UI_UNIVERSE_REQUEST_NONE;
+extrn UI_UNIVERSE_REQUEST_MCU;
+extrn UI_UNIVERSE_REQUEST_NKOTC;
+extrn UI_UNIVERSE_REQUEST_CB;
+
+// Action codes returned by ui_topbar.
+extrn UI_ACT_NONE;
+extrn UI_ACT_SAVE;
+extrn UI_ACT_OPEN;
+extrn UI_ACT_IMPORT;
+extrn UI_ACT_SHEET;
+
+// Frame-strip action codes. Positive returns are a target frame
+// index; negative codes signal "add new", "dup current", "delete
+// current".
+extrn UI_FRAME_NONE;
+extrn UI_FRAME_ADD;
+extrn UI_FRAME_DUP;
+extrn UI_FRAME_DEL;
+
+// ── Lifecycle ────────────────────────────────────────────
+
+void ui_init(default_name) {
+    _UI_PATH_MAX = 256;
+
+    _ui_filename_buf = malloc(_UI_PATH_MAX + 1);
+    _ui_filename_ti  = malloc(sizeof(TextInput));
+    text_input_new(_ui_filename_ti, _ui_filename_buf, _UI_PATH_MAX);
+    if (default_name != 0) { text_input_set(_ui_filename_ti, default_name); }
+
+    UI_ACT_NONE   = 0;
+    UI_ACT_SAVE   = 1;
+    UI_ACT_OPEN   = 2;
+    UI_ACT_IMPORT = 3;
+    UI_ACT_SHEET  = 4;
+
+    UI_FRAME_NONE = 0;
+    UI_FRAME_ADD  = 0 - 1;
+    UI_FRAME_DUP  = 0 - 2;
+    UI_FRAME_DEL  = 0 - 3;
+
+    UI_UNIVERSE_REQUEST_NONE  = 0;
+    UI_UNIVERSE_REQUEST_MCU   = 1;
+    UI_UNIVERSE_REQUEST_NKOTC = 2;
+    UI_UNIVERSE_REQUEST_CB    = 3;
+
+    UI_LAYER_NONE = 0;
+    UI_LAYER_ADD  = 0 - 1;
+    UI_LAYER_DEL  = 0 - 2;
+
+    _ui_universe_open = malloc(1); poke(_ui_universe_open, 0);
+    _ui_universe_sel  = malloc(1); poke(_ui_universe_sel, 0);
+    _ui_stencil_on    = malloc(1); poke(_ui_stencil_on, 0);
+}
+
+void ui_free() {
+    if (_ui_filename_ti  != 0) { free(_ui_filename_ti);  _ui_filename_ti  = 0; }
+    if (_ui_filename_buf != 0) { free(_ui_filename_buf); _ui_filename_buf = 0; }
+    if (_ui_universe_open != 0) { free(_ui_universe_open); _ui_universe_open = 0; }
+    if (_ui_universe_sel  != 0) { free(_ui_universe_sel);  _ui_universe_sel  = 0; }
+    if (_ui_stencil_on    != 0) { free(_ui_stencil_on);    _ui_stencil_on    = 0; }
+}
+
+// ── Filename field accessors ────────────────────────────
+
+// Pointer to the null-terminated filename buffer. The buffer is
+// reused every frame — callers that need to persist the value
+// across frames (e.g. to use as a save prefix) must copy it.
+ui_filename() : base { return _ui_filename_buf; }
+
+// 1 if the filename text-input currently holds keyboard focus. The
+// main loop gates tool hotkeys on this so typing stays inside the
+// field.
+ui_filename_active() : base {
+    auto t: TextInput;
+    if (_ui_filename_ti == 0) { return 0; }
+    t = _ui_filename_ti;
+    return t.focused;
+}
+
+// Replace the filename buffer contents. Used by the save/open
+// dialogs to reflect the path the user picked.
+void ui_filename_set(s) {
+    if (_ui_filename_ti != 0) { text_input_set(_ui_filename_ti, s); }
+}
+
+// ── Topbar ───────────────────────────────────────────────
+
+// Draw the top strip with Save / Open / Import / Sheet buttons and
+// the filename field. Returns one of UI_ACT_*. The Enter key in
+// the filename field also fires UI_ACT_SAVE so users can save via
+// keyboard without reaching for a button.
+ui_topbar() {
+    auto y, bx, bw, act, enter_commit;
+
+    y  = 6;
+    // Each button must fit its label at UI_FONT_SZ (16 px tall,
+    // 16 px per char in the bitmap fallback). "Import" is 6 chars
+    // → 96 px of glyphs, and we want centred text with margin, so
+    // 110 keeps every label inside its button.
+    bw = 110;
+    act = UI_ACT_NONE;
+
+    draw_text("ModuLab 0.3", 12, y + 2, 8, rgba(97, 218, 251, 255));
+
+    bx = 110;
+    if (gui_button(bx, y, bw, 22, "Save"))   { act = UI_ACT_SAVE; }
+    bx = bx + bw + 6;
+    if (gui_button(bx, y, bw, 22, "Open"))   { act = UI_ACT_OPEN; }
+    bx = bx + bw + 6;
+    if (gui_button(bx, y, bw, 22, "Import")) { act = UI_ACT_IMPORT; }
+    bx = bx + bw + 6;
+    if (gui_button(bx, y, bw, 22, "Sheet"))  { act = UI_ACT_SHEET; }
+
+    // Filename text input — fills the remainder of the topbar.
+    bx = bx + bw + 12;
+    enter_commit = gui_text_input(_ui_filename_ti, bx, y, 210, 22);
+    if (enter_commit != 0 && act == UI_ACT_NONE) { act = UI_ACT_SAVE; }
+
+    return act;
+}
+
+// ── Tool sidebar ─────────────────────────────────────────
+
+// Draw a vertical column of 7 tool buttons at (x, y). Clicking a
+// button sets g_tool directly — caller does not need to translate
+// the return.
+void ui_tool_sidebar(x, y) {
+    auto i, bw, bh, names, tools, picked;
+
+    // "Eyedrop" is the longest label (7 chars → 112 px of glyphs at
+    // UI_FONT_SZ=16 bitmap). 120 leaves 4 px margin on each side
+    // once centred. "Eraser" also fits with room to breathe.
+    bw = 120;
+    bh = 28;
+
+    // Pair arrays — keeps the tool <-> label mapping in one place
+    // and leaves the drawing loop unbranched.
+    names = malloc(8 * 8);
+    tools = malloc(8 * 8);
+    names[0] = "Brush";    tools[0] = TOOL_BRUSH;
+    names[1] = "Eraser";   tools[1] = TOOL_ERASER;
+    names[2] = "Fill";     tools[2] = TOOL_FILL;
+    names[3] = "Line";     tools[3] = TOOL_LINE;
+    names[4] = "Rect";     tools[4] = TOOL_RECT;
+    names[5] = "Oval";     tools[5] = TOOL_OVAL;
+    names[6] = "Eyedrop";  tools[6] = TOOL_EYEDROP;
+    names[7] = "Select";   tools[7] = TOOL_SELECT;
+
+    for (i = 0; i < 8; i = i + 1) {
+        picked = gui_button(x, y + i * (bh + 4), bw, bh, names[i]);
+        if (picked != 0) { g_tool = tools[i]; }
+
+        // Accent bar on the left edge of the active tool so the
+        // user can see selection at a glance.
+        if (g_tool == tools[i]) {
+            draw_rect(x, y + i * (bh + 4), 3, bh, rgba(97, 218, 251, 255));
+        }
+    }
+
+    free(names);
+    free(tools);
+}
+
+// ── Palette row + brush size ─────────────────────────────
+
+// Draws the palette swatch picker, plus two small ± buttons that
+// adjust g_brush_size in the 1..8 range. Returns 1 if the click
+// this frame landed inside any of the widgets (used by the mouse
+// handler to suppress a canvas paint on the same edge).
+ui_palette_row(x, y) {
+    auto clicked, size_y, consumed;
+
+    consumed = 0;
+    clicked = gui_palette(x, y, g_palette, g_pal_n, g_pal_n, 32,
+                          g_sel_color);
+    if (clicked >= 0) { g_sel_color = clicked; consumed = 1; }
+
+    // Brush size ± buttons to the right of the swatches.
+    size_y = y;
+    if (gui_button(x + g_pal_n * 32 + 12, size_y, 26, 26, "-")) {
+        g_brush_size = g_brush_size - 1;
+        if (g_brush_size < 1) { g_brush_size = 1; }
+        consumed = 1;
+    }
+    draw_number(x + g_pal_n * 32 + 44, size_y + 9, 8, WHITE, g_brush_size);
+    if (gui_button(x + g_pal_n * 32 + 60, size_y, 26, 26, "+")) {
+        g_brush_size = g_brush_size + 1;
+        if (g_brush_size > 8) { g_brush_size = 8; }
+        consumed = 1;
+    }
+    return consumed;
+}
+
+// ── Frame strip ──────────────────────────────────────────
+
+// Render a frame thumbnail by drawing every cell as a 2x2 block of
+// the palette color. Keeps the thumbnail readable down to 8x8
+// canvas sizes while staying small enough to row out along the
+// bottom of the window.
+static void _draw_frame_thumb(x, y, frame_idx, thumb_zoom, active) {
+    auto n, fbase, cx, cy, idx, color;
+
+    n = g_canvas_n;
+    fbase = frame_get(frame_idx);
+    if (fbase == 0) { return; }
+
+    for (cy = 0; cy < n; cy = cy + 1) {
+        for (cx = 0; cx < n; cx = cx + 1) {
+            idx = peek(fbase + cy * n + cx);
+            if (idx == 0) {
+                color = rgba(30, 34, 44, 255);
+            } else {
+                color = *(g_palette + idx * 8);
+            }
+            draw_rect(x + cx * thumb_zoom, y + cy * thumb_zoom,
+                      thumb_zoom, thumb_zoom, color);
+        }
+    }
+
+    // Active-frame accent.
+    auto border;
+    border = active != 0 ? rgba(97, 218, 251, 255) : rgba(60, 68, 88, 255);
+    draw_rect(x,                   y,                   n * thumb_zoom, 1, border);
+    draw_rect(x,                   y + n * thumb_zoom - 1, n * thumb_zoom, 1, border);
+    draw_rect(x,                   y,                   1, n * thumb_zoom, border);
+    draw_rect(x + n * thumb_zoom - 1, y,                   1, n * thumb_zoom, border);
+}
+
+// Draw the horizontal frame strip. Returns UI_FRAME_NONE, a target
+// frame index (>= 0) when a thumbnail is clicked, or UI_FRAME_ADD /
+// _DUP / _DEL when the corresponding control fires.
+ui_frame_strip(x, y) {
+    auto i, fsize, thumb_zoom, bx, mx, my, hover, click, ret;
+
+    // Thumbnail cell side length. 2 px works down to 8x8 canvases
+    // (16 px wide) and keeps 16x16 thumbnails at 32 px — the bar
+    // fits at most ~20 of them across an 800 px window.
+    thumb_zoom = 2;
+    fsize = g_canvas_n * thumb_zoom;
+
+    ret = UI_FRAME_NONE;
+    mx = mouse_x();
+    my = mouse_y();
+    click = mouse_pressed(MOUSE_LEFT);
+
+    for (i = 0; i < g_frame_count; i = i + 1) {
+        bx = x + i * (fsize + 6);
+        _draw_frame_thumb(bx, y, i, thumb_zoom, i == g_frame_idx);
+
+        // Thumbnail index label below the picture.
+        draw_number(bx + 2, y + fsize + 2, 8, rgba(160, 170, 190, 255), i);
+
+        hover = point_in_rect(mx, my, bx, y, fsize, fsize);
+        if (hover != 0 && click != 0) { ret = i; }
+    }
+
+    // + / dup / del buttons to the right of the strip. Widths
+    // fit each label centred at UI_FONT_SZ=16 (bitmap: 16 px per
+    // char) with ~8 px of margin on each side.
+    bx = x + g_frame_count * (fsize + 6) + 16;
+    if (gui_button(bx,           y,  32, 26, "+"))    { ret = UI_FRAME_ADD; }
+    if (gui_button(bx + 36,      y,  64, 26, "Dup"))  { ret = UI_FRAME_DUP; }
+    if (gui_button(bx + 104,     y,  60, 26, "Del"))  { ret = UI_FRAME_DEL; }
+
+    return ret;
+}
+
+// ── Phase 4 sidebar (universe / dither / stencil) ───────
+
+// Mini palette-swatch picker for a single byte-sized colour index.
+// Draws `n` coloured cells from the active palette and returns the
+// clicked index (or -1). Renders on a narrow strip so it fits in
+// a sidebar column without wrapping.
+static _mini_swatch_picker(x, y, cell_size, selected) {
+    auto i, cx, clicked, hover;
+    auto mx, my, color;
+    mx = mouse_x();
+    my = mouse_y();
+    clicked = 0 - 1;
+    for (i = 0; i < g_pal_n; i = i + 1) {
+        cx = x + i * cell_size;
+        color = *(g_palette + i * 8);
+        draw_rect(cx, y, cell_size, cell_size, color);
+        draw_rect(cx, y, cell_size, 8, rgba(0, 0, 0, 180));
+        draw_rect(cx, y + cell_size - 1, cell_size, 8, rgba(0, 0, 0, 180));
+        if (i == selected) {
+            draw_rect(cx, y - 1, cell_size, 8, _theme.accent);
+            draw_rect(cx, y + cell_size, cell_size, 8, _theme.accent);
+        }
+        hover = point_in_rect(mx, my, cx, y, cell_size, cell_size);
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) { clicked = i; }
+    }
+    return clicked;
+}
+
+// Phase 4 sidebar — universe dropdown + dither radio + stencil
+// toggle and color picker. Returns one of UI_UNIVERSE_REQUEST_* so
+// modulab.bpp can confirm-before-apply when the canvas is dirty.
+ui_phase4_sidebar(x, y) {
+    auto labels, request, new_sel, dither_opts, new_dither;
+    auto yc, picked;
+
+    request = UI_UNIVERSE_REQUEST_NONE;
+    yc = y;
+
+    // Universe label + dropdown.
+    draw_text("universe", x, yc, 8, _theme.text_muted);
+    yc = yc + 14;
+
+    // Sync mirror <-> g_universe. The dropdown writes via peek/poke
+    // so we stage the current universe in the byte slot, read the
+    // post-click value, and forward the request if it changed.
+    poke(_ui_universe_sel, g_universe);
+    labels = malloc(3 * 8);
+    *(labels + 0 * 8) = "MCU";
+    *(labels + 1 * 8) = "NKOTC";
+    *(labels + 2 * 8) = "CB";
+    new_sel = gui_dropdown(x, yc, 120, labels, 3,
+                            _ui_universe_sel, _ui_universe_open);
+    free(labels);
+
+    if (new_sel != g_universe) {
+        if (new_sel == UNIVERSE_MCU)   { request = UI_UNIVERSE_REQUEST_MCU; }
+        if (new_sel == UNIVERSE_NKOTC) { request = UI_UNIVERSE_REQUEST_NKOTC; }
+        if (new_sel == UNIVERSE_CB)    { request = UI_UNIVERSE_REQUEST_CB; }
+    }
+
+    // Dropdown eats vertical space when open. Advance past its
+    // bounding rect so the dither controls stay below.
+    if (peek(_ui_universe_open) != 0) {
+        yc = yc + 22 + 2 + 3 * 22 + 14;
+    } else {
+        yc = yc + 22 + 14;
+    }
+
+    // Dither label + 3-option radio.
+    draw_text("dither", x, yc, 8, _theme.text_muted);
+    yc = yc + 14;
+    dither_opts = malloc(3 * 8);
+    *(dither_opts + 0 * 8) = "Off";
+    *(dither_opts + 1 * 8) = "2x2";
+    *(dither_opts + 2 * 8) = "4x4";
+    new_dither = gui_radio(x, yc, g_dither_mode, dither_opts, 3);
+    if (new_dither != g_dither_mode) { g_dither_mode = new_dither; }
+    free(dither_opts);
+    yc = yc + 3 * 20 + 6;
+
+    // Dither alt colour picker. Small cells so every palette
+    // entry fits across the sidebar without wrapping.
+    draw_text("alt", x, yc, 8, _theme.text_muted);
+    picked = _mini_swatch_picker(x + 36, yc - 2, 10, g_dither_alt);
+    if (picked >= 0) { g_dither_alt = picked; }
+    yc = yc + 18;
+
+    // Stencil section.
+    draw_text("stencil", x, yc, 8, _theme.text_muted);
+    yc = yc + 14;
+
+    poke(_ui_stencil_on, g_stencil_on);
+    gui_checkbox(x, yc, _ui_stencil_on, "protect");
+    g_stencil_on = peek(_ui_stencil_on);
+    yc = yc + 22;
+
+    draw_text("color", x, yc, 8, _theme.text_muted);
+    picked = _mini_swatch_picker(x + 36, yc - 2, 10, g_stencil_color);
+    if (picked >= 0) { g_stencil_color = picked; }
+
+    return request;
+}
+
+// ── Layer panel ──────────────────────────────────────────
+
+// Vertical list of layers in the active frame, top-down (layer 0
+// is drawn at the BOTTOM of the list to match "painter's order"
+// where topmost layer in the UI = topmost in composite). Each row
+// has a visibility dot, "L" + index, active highlight. Buttons
+// above the list: +Add, -Del. Returns UI_LAYER_ADD / UI_LAYER_DEL
+// for actions the caller must invoke (we stay side-effect-light
+// in the draw call), or a >=0 layer index to switch active.
+ui_layer_panel(x, y) {
+    auto lc, k, display_k, row_y, row_h, panel_w;
+    auto mx, my, hover, clicked, ret, lp, l: Layer;
+    auto active, label, bg, vis_x, vis_color;
+    auto idx_buf;
+
+    ret = UI_LAYER_NONE;
+    lc = layer_count();
+    if (lc < 1) { return ret; }
+
+    panel_w = 120;
+    row_h   = 18;
+    mx = mouse_x();
+    my = mouse_y();
+
+    // Header: "layers" label + Add / Del buttons.
+    draw_text("layers", x, y, 8, _theme.text_muted);
+    if (gui_button(x + panel_w - 56, y - 6, 26, 20, "+")) {
+        ret = UI_LAYER_ADD;
+    }
+    if (gui_button(x + panel_w - 28, y - 6, 26, 20, "-")) {
+        ret = UI_LAYER_DEL;
+    }
+
+    active = layer_active_idx();
+
+    // Draw top-down: the painter's-order top (highest index) is
+    // drawn at the top of the list, lowest index at the bottom.
+    for (display_k = 0; display_k < lc; display_k = display_k + 1) {
+        k = lc - 1 - display_k;
+        row_y = y + 18 + display_k * (row_h + 2);
+
+        lp = layer_at(g_frame_idx, k);
+        if (lp == 0) { continue; }
+        l = lp;
+
+        // Row background — accent when active.
+        bg = k == active ? _theme.surface_alt : _theme.surface_dim;
+        hover = point_in_rect(mx, my, x, row_y, panel_w, row_h);
+        if (hover != 0) { bg = _theme.surface_alt; }
+        draw_rounded_rect(x, row_y, panel_w, row_h,
+                          _theme.radius_sm, bg);
+        if (k == active) {
+            draw_rect(x, row_y, 2, row_h, _theme.accent);
+        }
+
+        // Visibility dot — clickable toggle.
+        vis_x = x + 6;
+        vis_color = l.visible != 0 ? _theme.accent : _theme.border;
+        draw_rounded_rect(vis_x, row_y + row_h / 2 - 4, 8, 8, 4,
+                          vis_color);
+        if (point_in_rect(mx, my, vis_x, row_y + row_h / 2 - 4,
+                          8, 8) != 0
+         && mouse_pressed(MOUSE_LEFT) != 0) {
+            layer_set_visible(lp, l.visible != 0 ? 0 : 1);
+            ret = 0 - 100;   // consume click, no further action
+        }
+
+        // Label "L<k>" + alpha value.
+        draw_text("L", x + 22, row_y + row_h / 2 - 4, 8, _theme.text);
+        draw_number(x + 30, row_y + row_h / 2 - 4, 8, _theme.text, k);
+
+        draw_text("a", x + 52, row_y + row_h / 2 - 4, 8,
+                  _theme.text_muted);
+        draw_number(x + 62, row_y + row_h / 2 - 4, 8,
+                    _theme.text_muted, l.alpha);
+
+        // Clicking anywhere else on the row activates that layer.
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0
+         && ret == UI_LAYER_NONE) {
+            if (point_in_rect(mx, my, vis_x, row_y + row_h / 2 - 4,
+                              8, 8) == 0) {
+                ret = k;
+            }
+        }
+    }
+
+    return ret;
+}

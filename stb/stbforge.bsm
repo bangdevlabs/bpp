@@ -1,0 +1,1310 @@
+// stbforge.bsm — dev tooling for character design + playtest IDEs.
+//
+// Absorbed from ModuLab's local modules when level_editor became the
+// second client of the same machinery. Four sub-systems live here:
+//
+//   Character  — schema + load/save/accessors for .character.json
+//                (pivot, hitbox, physics, animations, controls).
+//   Testbed    — mini platformer runtime that drives a Character
+//                against a hand-authored world; handles gravity,
+//                collision, input (with recorder override).
+//   Inspector  — debug overlay for the testbed (hitbox color-coded
+//                by grounded state, velocity vector, label).
+//   Recorder   — deterministic input log + snapshot ring so a
+//                painting session can replay the same physics and
+//                expose nondeterminism as stderr desync diagnostics.
+//
+// Any dev tool that needs "paint art → playtest with physics →
+// debug overlays" shares this pillar. When a future editor
+// (cutscene_editor, particle_editor) outgrows the shared pieces,
+// split the relevant sub-system out into its own stb/ file.
+//
+// All dependencies listed here at the top so the resulting import
+// graph stays flat and cycle-free.
+
+import "stbdraw.bsm";
+import "stbinput.bsm";
+import "bpp_file.bsm";
+
+// Host-provided canvas accessors used by testbed_draw when it
+// blits the character sprite. ModuLab's core.bsm supplies them;
+// any other tool that wires the testbed rendering path must
+// provide the same surface (g_canvas_n cell side, g_palette
+// ARGB word-array, g_frame_idx + layer_count/layer_at for
+// pulling layers). Tools that only touch Character / Recorder
+// at load time don't drive testbed_draw and can link a stub
+// or avoid the call path entirely.
+extrn g_canvas_n;
+extrn g_palette;
+extrn g_frame_idx;
+extrn layer_count;
+extrn layer_at;
+
+// ═════════════════════════════════════════════════════════════
+// CHARACTER — format + load/save
+// ═════════════════════════════════════════════════════════════
+
+// ── Animation storage ────────────────────────────────────
+
+struct Animation {
+    name_ptr,    // null-terminated C-string (strdup'd)
+    frames,     // malloc'd int array of frame indices
+    frame_count,
+    fps,
+    loop,
+}
+
+// ── Character state ──────────────────────────────────────
+
+struct Character {
+    sprite_path,        // null-terminated string (strdup'd)
+    pivot_x, pivot_y,
+    hit_x, hit_y, hit_w, hit_h,
+    gravity,            // pixels / s² (positive pulls down)
+    max_speed,          // pixels / s
+    jump_velocity,      // pixels / s on jump press while grounded
+    animations,         // malloc'd array of Animation structs
+    anim_count,
+    ctrl_left,
+    ctrl_right,
+    ctrl_jump,
+}
+
+// ── Construction / destruction ───────────────────────────
+
+// Allocate a character with sensible defaults. A 16x16 sprite with
+// 14x14 hitbox centered on the canvas, Earth-ish gravity, and the
+// default MCU-8 keyboard bindings (Left=A/Right=D/Jump=Space via
+// their KEY_* scancodes — see stbinput's Key enum).
+character_new() {
+    auto c: Character, cp;
+    cp = malloc(sizeof(Character));
+    c = cp;
+    c.sprite_path   = 0;
+    c.pivot_x       = 8;
+    c.pivot_y       = 15;
+    c.hit_x         = 2;
+    c.hit_y         = 4;
+    c.hit_w         = 12;
+    c.hit_h         = 10;
+    c.gravity       = 800;
+    c.max_speed     = 120;
+    c.jump_velocity = 300;
+    c.animations    = 0;
+    c.anim_count    = 0;
+    // Default controls: KEY_A, KEY_D, KEY_SPACE.
+    c.ctrl_left     = KEY_A;
+    c.ctrl_right    = KEY_D;
+    c.ctrl_jump     = KEY_SPACE;
+    return cp;
+}
+
+// Copy a C-string into a fresh malloc and return the pointer.
+// Caller owns the result. Safe on 0 (returns 0).
+static _strdup(s) {
+    auto len, buf, i;
+    if (s == 0) { return 0; }
+    len = str_len(s);
+    buf = malloc(len + 1);
+    for (i = 0; i < len; i = i + 1) { poke(buf + i, peek(s + i)); }
+    poke(buf + len, 0);
+    return buf;
+}
+
+// Free a character + all owned sub-allocations (sprite path,
+// animation names + frames + struct). Safe on 0.
+void character_free(cp) {
+    auto c: Character, a: Animation, ap, i;
+    if (cp == 0) { return; }
+    c = cp;
+    if (c.sprite_path != 0) { free(c.sprite_path); }
+    if (c.animations != 0) {
+        for (i = 0; i < c.anim_count; i = i + 1) {
+            ap = c.animations + i * sizeof(Animation);
+            a = ap;
+            if (a.name_ptr != 0) { free(a.name_ptr); }
+            if (a.frames   != 0) { free(a.frames); }
+        }
+        free(c.animations);
+    }
+    free(cp);
+}
+
+// ── Mutators ─────────────────────────────────────────────
+
+void character_set_sprite(cp, path) {
+    auto c: Character;
+    c = cp;
+    if (c.sprite_path != 0) { free(c.sprite_path); }
+    c.sprite_path = _strdup(path);
+}
+
+// Free every animation on the character and reset anim_count to
+// zero. Used by editors that rebuild their animation list at
+// interaction time (e.g. modulab re-deriving an "all frames"
+// animation from the current frame count whenever Tab re-enters
+// the testbed).
+void character_clear_animations(cp) {
+    auto c: Character, a: Animation, ap, i;
+    c = cp;
+    if (c.animations != 0) {
+        for (i = 0; i < c.anim_count; i = i + 1) {
+            ap = c.animations + i * sizeof(Animation);
+            a = ap;
+            if (a.name_ptr != 0) { free(a.name_ptr); }
+            if (a.frames   != 0) { free(a.frames); }
+        }
+        free(c.animations);
+        c.animations = 0;
+    }
+    c.anim_count = 0;
+}
+
+// Grow the animations array by one slot and return a pointer to
+// the new Animation entry (ready for the caller to populate).
+character_add_animation(cp, name, fps, loop) {
+    auto c: Character, a: Animation, ap, new_arr, i;
+    c = cp;
+    new_arr = malloc((c.anim_count + 1) * sizeof(Animation));
+    if (c.animations != 0) {
+        for (i = 0; i < c.anim_count * sizeof(Animation); i = i + 1) {
+            poke(new_arr + i, peek(c.animations + i));
+        }
+        free(c.animations);
+    }
+    c.animations = new_arr;
+    ap = c.animations + c.anim_count * sizeof(Animation);
+    a = ap;
+    a.name_ptr    = _strdup(name);
+    a.frames      = 0;
+    a.frame_count = 0;
+    a.fps         = fps;
+    a.loop        = loop;
+    c.anim_count = c.anim_count + 1;
+    return ap;
+}
+
+// Set the frame list on an Animation. `arr` is a word array of
+// frame indices (length n). A copy is made — caller retains
+// ownership of `arr`.
+void character_set_frames(ap, arr, n) {
+    auto a: Animation, i;
+    a = ap;
+    if (a.frames != 0) { free(a.frames); }
+    a.frames = malloc(n * 8);
+    for (i = 0; i < n; i = i + 1) {
+        *(a.frames + i * 8) = *(arr + i * 8);
+    }
+    a.frame_count = n;
+}
+
+// ── Save ─────────────────────────────────────────────────
+
+character_save(cp, path) : io {
+    auto c: Character, a: Animation, ap;
+    auto sb, i, j, rc;
+    c = cp;
+
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_int_field(sb, "version", 1);
+    if (c.sprite_path != 0) {
+        sb = json_write_string_field(sb, "sprite", c.sprite_path);
+    } else {
+        sb = json_write_string_field(sb, "sprite", "");
+    }
+
+    sb = json_write_object_field_begin(sb, "pivot");
+    sb = json_write_int_field(sb, "x", c.pivot_x);
+    sb = json_write_int_field(sb, "y", c.pivot_y);
+    sb = json_write_object_end(sb);
+
+    sb = json_write_object_field_begin(sb, "hitbox");
+    sb = json_write_int_field(sb, "x", c.hit_x);
+    sb = json_write_int_field(sb, "y", c.hit_y);
+    sb = json_write_int_field(sb, "w", c.hit_w);
+    sb = json_write_int_field(sb, "h", c.hit_h);
+    sb = json_write_object_end(sb);
+
+    sb = json_write_object_field_begin(sb, "physics");
+    sb = json_write_int_field(sb, "gravity",       c.gravity);
+    sb = json_write_int_field(sb, "max_speed",     c.max_speed);
+    sb = json_write_int_field(sb, "jump_velocity", c.jump_velocity);
+    sb = json_write_object_end(sb);
+
+    sb = json_write_array_field_begin(sb, "animations");
+    for (i = 0; i < c.anim_count; i = i + 1) {
+        ap = c.animations + i * sizeof(Animation);
+        a = ap;
+        sb = json_write_object_begin(sb);
+        sb = json_write_string_field(sb, "name", a.name_ptr);
+        sb = json_write_array_field_begin(sb, "frames");
+        for (j = 0; j < a.frame_count; j = j + 1) {
+            sb = json_write_int(sb, *(a.frames + j * 8));
+        }
+        sb = json_write_array_end(sb);
+        sb = json_write_int_field(sb, "fps",  a.fps);
+        sb = json_write_int_field(sb, "loop", a.loop);
+        sb = json_write_object_end(sb);
+    }
+    sb = json_write_array_end(sb);
+
+    sb = json_write_object_field_begin(sb, "controls");
+    sb = json_write_int_field(sb, "left",  c.ctrl_left);
+    sb = json_write_int_field(sb, "right", c.ctrl_right);
+    sb = json_write_int_field(sb, "jump",  c.ctrl_jump);
+    sb = json_write_object_end(sb);
+
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("character: '");
+        print_err_msg(path);
+        print_err_msg("': write failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// ── Load ─────────────────────────────────────────────────
+
+// Helper: read an int field from a JSON object; return default
+// when missing.
+static _jint_or(doc, obj, key, fallback) {
+    auto idx;
+    idx = json_object_get(doc, obj, key);
+    if (idx < 0) { return fallback; }
+    return json_int(doc, idx);
+}
+
+// Parse a .character.json from disk and return a fresh Character
+// pointer. 0 on read or parse error (stderr diagnostic printed).
+character_load(path) : io {
+    auto buf, size_out, doc, root, cp, c: Character;
+    auto sprite_idx, sprite_s;
+    auto pivot_idx, hit_idx, phys_idx, ctrl_idx, anim_idx;
+    auto i, j, anim_len, an_obj, an_name_idx, an_name;
+    auto fr_idx, fr_len, ap, a: Animation, farr;
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        print_err_msg("character: '");
+        print_err_msg(path);
+        print_err_msg("': read failed\n");
+        free(size_out);
+        return 0;
+    }
+
+    doc = json_parse(buf, *(size_out));
+    free(size_out);
+    free(buf);
+    if (doc == 0) {
+        print_err_msg("character: '");
+        print_err_msg(path);
+        print_err_msg("': JSON parse failed\n");
+        return 0;
+    }
+
+    cp = character_new();
+    c  = cp;
+    root = json_root(doc);
+
+    sprite_idx = json_object_get(doc, root, "sprite");
+    if (sprite_idx >= 0) {
+        sprite_s = json_string(doc, sprite_idx);
+        if (sprite_s != 0 && peek(sprite_s) != 0) {
+            character_set_sprite(cp, sprite_s);
+        }
+    }
+
+    pivot_idx = json_object_get(doc, root, "pivot");
+    if (pivot_idx >= 0) {
+        c.pivot_x = _jint_or(doc, pivot_idx, "x", c.pivot_x);
+        c.pivot_y = _jint_or(doc, pivot_idx, "y", c.pivot_y);
+    }
+
+    hit_idx = json_object_get(doc, root, "hitbox");
+    if (hit_idx >= 0) {
+        c.hit_x = _jint_or(doc, hit_idx, "x", c.hit_x);
+        c.hit_y = _jint_or(doc, hit_idx, "y", c.hit_y);
+        c.hit_w = _jint_or(doc, hit_idx, "w", c.hit_w);
+        c.hit_h = _jint_or(doc, hit_idx, "h", c.hit_h);
+    }
+
+    phys_idx = json_object_get(doc, root, "physics");
+    if (phys_idx >= 0) {
+        c.gravity       = _jint_or(doc, phys_idx, "gravity",       c.gravity);
+        c.max_speed     = _jint_or(doc, phys_idx, "max_speed",     c.max_speed);
+        c.jump_velocity = _jint_or(doc, phys_idx, "jump_velocity", c.jump_velocity);
+    }
+
+    ctrl_idx = json_object_get(doc, root, "controls");
+    if (ctrl_idx >= 0) {
+        c.ctrl_left  = _jint_or(doc, ctrl_idx, "left",  c.ctrl_left);
+        c.ctrl_right = _jint_or(doc, ctrl_idx, "right", c.ctrl_right);
+        c.ctrl_jump  = _jint_or(doc, ctrl_idx, "jump",  c.ctrl_jump);
+    }
+
+    anim_idx = json_object_get(doc, root, "animations");
+    if (anim_idx >= 0) {
+        anim_len = json_length(doc, anim_idx);
+        for (i = 0; i < anim_len; i = i + 1) {
+            an_obj = json_child(doc, anim_idx, i);
+            an_name_idx = json_object_get(doc, an_obj, "name");
+            an_name = an_name_idx >= 0 ? json_string(doc, an_name_idx) : "unnamed";
+            ap = character_add_animation(cp, an_name,
+                                         _jint_or(doc, an_obj, "fps",  8),
+                                         _jint_or(doc, an_obj, "loop", 1));
+            a = ap;
+            fr_idx = json_object_get(doc, an_obj, "frames");
+            if (fr_idx >= 0) {
+                fr_len = json_length(doc, fr_idx);
+                farr = malloc(fr_len * 8);
+                for (j = 0; j < fr_len; j = j + 1) {
+                    *(farr + j * 8) = json_int(doc, json_child(doc, fr_idx, j));
+                }
+                character_set_frames(ap, farr, fr_len);
+                free(farr);
+            }
+        }
+    }
+
+    json_free(doc);
+    return cp;
+}
+
+// ═════════════════════════════════════════════════════════════
+// RECORDER — deterministic input log
+// ═════════════════════════════════════════════════════════════
+
+
+// ── Packed input frame ───────────────────────────────────
+// Byte layout:
+//   bit 0 — left
+//   bit 1 — right
+//   bit 2 — jump (press edge, NOT held)
+//   bit 3 — jump_down (held, complements the press edge)
+
+const REC_BIT_LEFT      = 1;
+const REC_BIT_RIGHT     = 2;
+const REC_BIT_JUMP_EDGE = 4;
+const REC_BIT_JUMP_DOWN = 8;
+
+// Snapshot layout — 16 bytes per checkpoint:
+//   int pos_x, int pos_y, int vel_x, int vel_y  (packed u32 each).
+const REC_SNAP_EVERY = 60;  // frames between checkpoints
+
+const REC_MAX_FRAMES = 3600;  // 60 seconds @ 60 fps
+
+// State
+static extrn _rec_buf;          // MAX_FRAMES bytes of packed input
+static extrn _rec_len;          // valid frame count (0..MAX_FRAMES)
+static extrn _rec_snapshots;    // malloc'd array of 4-byte * 4 fields
+static extrn _rec_snap_count;
+static extrn _rec_mode;         // 0 idle, 1 recording, 2 playing
+static extrn _rec_cursor;       // playhead during replay
+
+// Lifecycle ─────────────────────────────────────────────
+
+void recorder_init() {
+    if (_rec_buf != 0) { return; }
+    _rec_buf       = malloc(REC_MAX_FRAMES);
+    _rec_snapshots = malloc((REC_MAX_FRAMES / REC_SNAP_EVERY + 1) * 16);
+    _rec_len       = 0;
+    _rec_snap_count = 0;
+    _rec_mode      = 0;
+    _rec_cursor    = 0;
+}
+
+void recorder_free() {
+    if (_rec_buf       != 0) { free(_rec_buf);       _rec_buf       = 0; }
+    if (_rec_snapshots != 0) { free(_rec_snapshots); _rec_snapshots = 0; }
+    _rec_len = 0;
+    _rec_snap_count = 0;
+    _rec_mode = 0;
+    _rec_cursor = 0;
+}
+
+recorder_mode() : base { return _rec_mode; }
+recorder_len() : base { return _rec_len; }
+recorder_cursor() : base { return _rec_cursor; }
+
+// Start recording fresh. Drops any existing log.
+void recorder_start() {
+    if (_rec_buf == 0) { recorder_init(); }
+    _rec_len        = 0;
+    _rec_snap_count = 0;
+    _rec_cursor     = 0;
+    _rec_mode       = 1;
+}
+
+// Stop recording. The log survives so the user can press play.
+void recorder_stop() {
+    if (_rec_mode == 1) { _rec_mode = 0; }
+}
+
+// Rewind and start replaying. No-op if there's nothing recorded.
+void recorder_play() {
+    if (_rec_len == 0) { return; }
+    _rec_cursor = 0;
+    _rec_mode   = 2;
+}
+
+// ── Sample recording ─────────────────────────────────────
+
+// Called once per testbed update while recording. `left`, `right`,
+// `jump_edge`, `jump_down` are 0/1. Returns 1 while still within
+// the ring, 0 once the cap is hit (caller can stop gracefully).
+recorder_sample_input(left, right, jump_edge, jump_down) {
+    auto packed;
+    if (_rec_mode != 1) { return 0; }
+    if (_rec_len >= REC_MAX_FRAMES) {
+        _rec_mode = 0;  // auto-stop at cap
+        return 0;
+    }
+    packed = 0;
+    if (left      != 0) { packed = packed | REC_BIT_LEFT; }
+    if (right     != 0) { packed = packed | REC_BIT_RIGHT; }
+    if (jump_edge != 0) { packed = packed | REC_BIT_JUMP_EDGE; }
+    if (jump_down != 0) { packed = packed | REC_BIT_JUMP_DOWN; }
+    poke(_rec_buf + _rec_len, packed);
+    _rec_len = _rec_len + 1;
+    return 1;
+}
+
+// Store a checkpoint. Called by the testbed every N frames.
+void recorder_sample_checkpoint(pos_x, pos_y, vel_x, vel_y) {
+    auto off;
+    if (_rec_mode != 1) { return; }
+    if (_rec_snap_count >= REC_MAX_FRAMES / REC_SNAP_EVERY + 1) { return; }
+    off = _rec_snap_count * 16;
+    write_u32(_rec_snapshots, off + 0,  pos_x);
+    write_u32(_rec_snapshots, off + 4,  pos_y);
+    write_u32(_rec_snapshots, off + 8,  vel_x);
+    write_u32(_rec_snapshots, off + 12, vel_y);
+    _rec_snap_count = _rec_snap_count + 1;
+}
+
+// ── Playback ─────────────────────────────────────────────
+
+// Returns 1 if the recorded frame at the current cursor had the
+// given bit set. Advances cursor via recorder_tick.
+recorder_bit(mask) : base {
+    auto slot;
+    if (_rec_mode != 2) { return 0; }
+    if (_rec_cursor >= _rec_len) { return 0; }
+    slot = peek(_rec_buf + _rec_cursor);
+    return (slot & mask) != 0 ? 1 : 0;
+}
+
+// Convenience probes that match the physics update's expected
+// key-state readers.
+recorder_left()      : base { return recorder_bit(REC_BIT_LEFT); }
+recorder_right()     : base { return recorder_bit(REC_BIT_RIGHT); }
+recorder_jump_edge() : base { return recorder_bit(REC_BIT_JUMP_EDGE); }
+recorder_jump_down() : base { return recorder_bit(REC_BIT_JUMP_DOWN); }
+
+// Called by testbed at the end of each update during playback.
+// Advances the cursor and terminates playback when the log runs
+// out. Also verifies the checkpoint snapshot matches the current
+// testbed state when on a checkpoint frame.
+recorder_tick(pos_x, pos_y, vel_x, vel_y) {
+    auto snap_idx, off;
+    auto snap_px, snap_py, snap_vx, snap_vy;
+    if (_rec_mode != 2) { return 0; }
+    _rec_cursor = _rec_cursor + 1;
+    if (_rec_cursor >= _rec_len) {
+        _rec_mode = 0;   // playback ended
+        return 0;
+    }
+    // Checkpoint comparison every REC_SNAP_EVERY frames.
+    if (_rec_cursor % REC_SNAP_EVERY == 0) {
+        snap_idx = _rec_cursor / REC_SNAP_EVERY;
+        if (snap_idx >= _rec_snap_count) { return 1; }
+        off = snap_idx * 16;
+        snap_px = read_u32(_rec_snapshots, off + 0);
+        snap_py = read_u32(_rec_snapshots, off + 4);
+        snap_vx = read_u32(_rec_snapshots, off + 8);
+        snap_vy = read_u32(_rec_snapshots, off + 12);
+        if (pos_x != snap_px || pos_y != snap_py
+         || vel_x != snap_vx || vel_y != snap_vy) {
+            print_err_msg("recorder: desync at frame ");
+            print_err_int(_rec_cursor);
+            print_err_msg(" — expected pos=(");
+            print_err_int(snap_px); print_err_msg(",");
+            print_err_int(snap_py); print_err_msg(") got (");
+            print_err_int(pos_x);   print_err_msg(",");
+            print_err_int(pos_y);   print_err_msg(")\n");
+        }
+    }
+    return 1;
+}
+
+// ── Disk I/O ─────────────────────────────────────────────
+
+// Write the current log (inputs + snapshots) to a JSON file.
+// Schema v1 keeps numbers-only to avoid string escaping cost at
+// the ~3600-frame scale.
+recorder_save(path) : io {
+    auto sb, i, rc;
+
+    if (_rec_len == 0) { return 0 - 1; }
+
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_int_field(sb, "version",    1);
+    sb = json_write_int_field(sb, "snap_every", REC_SNAP_EVERY);
+    sb = json_write_int_field(sb, "frames",     _rec_len);
+    sb = json_write_array_field_begin(sb, "inputs");
+    for (i = 0; i < _rec_len; i = i + 1) {
+        sb = json_write_int(sb, peek(_rec_buf + i));
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_array_field_begin(sb, "snapshots");
+    for (i = 0; i < _rec_snap_count * 4; i = i + 1) {
+        sb = json_write_int(sb, read_u32(_rec_snapshots, i * 4));
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("recorder: '");
+        print_err_msg(path);
+        print_err_msg("': save failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+// Read a replay file and prime the in-memory buffers for playback.
+// Caller should recorder_play() to actually start.
+recorder_load(path) : io {
+    auto buf, size_out, doc, root, idx, n, i;
+    if (_rec_buf == 0) { recorder_init(); }
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        print_err_msg("recorder: '");
+        print_err_msg(path);
+        print_err_msg("': read failed\n");
+        free(size_out);
+        return 0 - 1;
+    }
+    doc = json_parse(buf, *(size_out));
+    free(buf);
+    free(size_out);
+    if (doc == 0) {
+        print_err_msg("recorder: '");
+        print_err_msg(path);
+        print_err_msg("': parse failed\n");
+        return 0 - 1;
+    }
+
+    root = json_root(doc);
+    idx = json_object_get(doc, root, "inputs");
+    if (idx < 0) { json_free(doc); return 0 - 1; }
+    n = json_length(doc, idx);
+    if (n > REC_MAX_FRAMES) { n = REC_MAX_FRAMES; }
+    for (i = 0; i < n; i = i + 1) {
+        poke(_rec_buf + i, json_int(doc, json_child(doc, idx, i)) & 0xFF);
+    }
+    _rec_len = n;
+
+    idx = json_object_get(doc, root, "snapshots");
+    if (idx >= 0) {
+        n = json_length(doc, idx);
+        for (i = 0; i < n; i = i + 1) {
+            write_u32(_rec_snapshots, i * 4, json_int(doc, json_child(doc, idx, i)));
+        }
+        _rec_snap_count = n / 4;
+    }
+
+    json_free(doc);
+    _rec_cursor = 0;
+    _rec_mode   = 0;
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════
+// TESTBED — mini platformer runtime
+// ═════════════════════════════════════════════════════════════
+
+
+extrn g_canvas_n, g_palette;
+
+// ── Constants ────────────────────────────────────────────
+
+extrn TB_W, TB_H;         // world size in cells
+extrn TB_CELL;            // screen pixels per cell in draw path
+
+// ── State ────────────────────────────────────────────────
+
+static extrn _tb_world;           // byte grid, TB_W * TB_H bytes
+
+static extrn _tb_char;            // Character* being tested (borrowed)
+
+static extrn _tb_pos_x;           // milli-pixels
+static extrn _tb_pos_y;
+static extrn _tb_vel_x;           // pixels / second
+static extrn _tb_vel_y;
+static extrn _tb_grounded;        // 1 when standing on solid cell
+
+static extrn _tb_spawn_x;         // in milli-pixels
+static extrn _tb_spawn_y;
+
+static extrn _tb_running;         // 1 when Mode 3 is active
+
+// Composite scratch for rendering the character. Cached and
+// realloc'd when canvas_n changes.
+static extrn _tb_sprite_argb;
+static extrn _tb_sprite_argb_n;
+
+// Animation playback state.
+//   _tb_anim_idx  — index into the character's animations array,
+//                   or -1 when no animation is playing (testbed
+//                   falls back to rendering g_frame_idx, i.e. the
+//                   editor's active frame — matches the
+//                   pre-animation testbed).
+//   _tb_anim_f    — current position inside the animation's
+//                   frame list (0..frame_count-1).
+//   _tb_anim_acc  — ms accumulator; when it crosses 1000/fps the
+//                   animation advances one frame.
+static extrn _tb_anim_idx;
+static extrn _tb_anim_f;
+static extrn _tb_anim_acc;
+
+// ── Init ─────────────────────────────────────────────────
+
+// Set up a default platformer layout: a flat floor at the bottom,
+// plus three ledges in the middle of the world. Future work
+// loads this from a .level.json file instead of hand-drawing.
+static void _tb_build_default_world() {
+    auto i, x, y;
+    for (i = 0; i < TB_W * TB_H; i = i + 1) { poke(_tb_world + i, 0); }
+    // Ground — the bottom two rows are solid.
+    for (y = TB_H - 2; y < TB_H; y = y + 1) {
+        for (x = 0; x < TB_W; x = x + 1) { poke(_tb_world + y * TB_W + x, 1); }
+    }
+    // Three floating ledges.
+    for (x = 4; x <= 8; x = x + 1)  { poke(_tb_world + 14 * TB_W + x, 1); }
+    for (x = 12; x <= 16; x = x + 1) { poke(_tb_world + 11 * TB_W + x, 1); }
+    for (x = 20; x <= 24; x = x + 1) { poke(_tb_world + 8  * TB_W + x, 1); }
+}
+
+void testbed_init(character_ptr) {
+    if (_tb_world == 0) {
+        TB_W    = 32;
+        TB_H    = 18;
+        TB_CELL = 16;
+        _tb_world = malloc(TB_W * TB_H);
+    }
+    _tb_char = character_ptr;
+    _tb_build_default_world();
+
+    // Spawn in the middle of the world, one cell above the floor.
+    _tb_spawn_x = (TB_W / 2) * 1000;
+    _tb_spawn_y = (TB_H - 3) * 1000;
+    _tb_pos_x = _tb_spawn_x;
+    _tb_pos_y = _tb_spawn_y;
+    _tb_vel_x = 0;
+    _tb_vel_y = 0;
+    _tb_grounded = 0;
+    _tb_running  = 1;
+
+    // No animation selected on entry — the testbed renders the
+    // editor's active frame until the host calls
+    // testbed_play_animation.
+    _tb_anim_idx = 0 - 1;
+    _tb_anim_f   = 0;
+    _tb_anim_acc = 0;
+}
+
+void testbed_free() {
+    if (_tb_world != 0) { free(_tb_world); _tb_world = 0; }
+    if (_tb_sprite_argb != 0) {
+        free(_tb_sprite_argb);
+        _tb_sprite_argb = 0;
+    }
+    _tb_sprite_argb_n = 0;
+    _tb_running = 0;
+}
+
+void testbed_reset() {
+    _tb_pos_x = _tb_spawn_x;
+    _tb_pos_y = _tb_spawn_y;
+    _tb_vel_x = 0;
+    _tb_vel_y = 0;
+    _tb_grounded = 0;
+}
+
+testbed_running() : base { return _tb_running; }
+
+// ── Animation playback ──────────────────────────────────
+//
+// An animation is a list of frame indices + fps. testbed_update
+// drives it by accumulating dt and stepping when enough time has
+// passed. The rendered source frame is picked up by testbed_draw
+// (via tb_current_frame_idx) so the same call path works for
+// both "animation playing" and "editor frame only".
+
+// Start playback of animation `anim_idx` from the first frame.
+// Pass -1 to stop playback and fall back to the editor's active
+// frame. Out-of-range indices silently stop playback.
+void testbed_play_animation(anim_idx) {
+    auto c: Character;
+    _tb_anim_f   = 0;
+    _tb_anim_acc = 0;
+    if (anim_idx < 0 || _tb_char == 0) {
+        _tb_anim_idx = 0 - 1;
+        return;
+    }
+    c = _tb_char;
+    if (anim_idx >= c.anim_count) {
+        _tb_anim_idx = 0 - 1;
+        return;
+    }
+    _tb_anim_idx = anim_idx;
+}
+
+// Look up a playing animation by name. Returns its index or -1
+// when no match. A thin helper over the array scan so callers
+// don't have to walk characters.animations themselves.
+testbed_find_animation(name) : base {
+    auto c: Character, a: Animation, ap, i;
+    if (_tb_char == 0 || name == 0) { return 0 - 1; }
+    c = _tb_char;
+    for (i = 0; i < c.anim_count; i = i + 1) {
+        ap = c.animations + i * sizeof(Animation);
+        a = ap;
+        if (a.name_ptr != 0 && str_eq(a.name_ptr, name) != 0) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+// Resolve the source frame index the testbed should render THIS
+// tick. When an animation is playing, returns the frame indexed
+// by _tb_anim_f inside the animation's frame list. When no
+// animation is playing, returns the editor's active frame so
+// testbed_draw stays backwards-compatible with the pre-animation
+// era.
+tb_current_frame_idx() : base {
+    auto c: Character, a: Animation, ap;
+    if (_tb_anim_idx < 0 || _tb_char == 0) { return g_frame_idx; }
+    c = _tb_char;
+    if (_tb_anim_idx >= c.anim_count) { return g_frame_idx; }
+    ap = c.animations + _tb_anim_idx * sizeof(Animation);
+    a = ap;
+    if (a.frame_count <= 0) { return g_frame_idx; }
+    if (_tb_anim_f < 0 || _tb_anim_f >= a.frame_count) {
+        return g_frame_idx;
+    }
+    return *(a.frames + _tb_anim_f * 8);
+}
+
+// Advance the current animation by `dt_ms`. Called internally by
+// testbed_update; exposed so tests can drive playback without
+// running the physics loop. No-op when no animation is playing
+// or the animation has fps <= 0.
+void testbed_anim_tick(dt_ms) {
+    auto c: Character, a: Animation, ap, period_ms;
+    if (_tb_anim_idx < 0 || _tb_char == 0) { return; }
+    c = _tb_char;
+    if (_tb_anim_idx >= c.anim_count) { return; }
+    ap = c.animations + _tb_anim_idx * sizeof(Animation);
+    a = ap;
+    if (a.fps <= 0 || a.frame_count <= 0) { return; }
+    period_ms = 1000 / a.fps;
+    if (period_ms <= 0) { period_ms = 1; }
+    _tb_anim_acc = _tb_anim_acc + dt_ms;
+    // Step the frame counter once per accumulated period. Looping
+    // animations wrap; one-shot animations clamp at the last
+    // frame and freeze there until the caller picks a new one.
+    while (_tb_anim_acc >= period_ms) {
+        _tb_anim_acc = _tb_anim_acc - period_ms;
+        _tb_anim_f = _tb_anim_f + 1;
+        if (_tb_anim_f >= a.frame_count) {
+            if (a.loop != 0) {
+                _tb_anim_f = 0;
+            } else {
+                _tb_anim_f = a.frame_count - 1;
+                _tb_anim_acc = 0;
+                return;
+            }
+        }
+    }
+}
+
+tb_anim_idx() : base { return _tb_anim_idx; }
+tb_anim_frame() : base { return _tb_anim_f; }
+
+// Load a .level.json file (as written by tools/level_editor)
+// into the testbed's collision world. Any palette index > 0 is
+// treated as solid ground; index 0 is air. The world is
+// resized to match the level's dimensions so a 40x22 level
+// overrides the 32x18 default hand-drawn layout. The spawn
+// point is recentred in the loaded world.
+// Returns 0 on success, -1 on read / parse / schema failure.
+testbed_load_world(path) : io {
+    auto buf, size_out, doc, root, idx;
+    auto w, h, tiles_idx, row, cell;
+    auto x, y, total;
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        // Silent failure — caller probes optional paths and
+        // needs to distinguish "file absent" (keep default
+        // world) from "file present but malformed" (loud,
+        // below).
+        free(size_out);
+        return 0 - 1;
+    }
+    doc = json_parse(buf, *(size_out));
+    free(buf);
+    free(size_out);
+    if (doc == 0) {
+        print_err_msg("testbed_load_world: parse failed '");
+        print_err_msg(path);
+        print_err_msg("'\n");
+        return 0 - 1;
+    }
+    root = json_root(doc);
+    idx = json_object_get(doc, root, "width");
+    if (idx < 0) { json_free(doc); return 0 - 1; }
+    w = json_int(doc, idx);
+    idx = json_object_get(doc, root, "height");
+    if (idx < 0) { json_free(doc); return 0 - 1; }
+    h = json_int(doc, idx);
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (tiles_idx < 0 || w <= 0 || h <= 0) {
+        json_free(doc);
+        return 0 - 1;
+    }
+
+    // Resize the world grid if the incoming dims don't match the
+    // existing allocation.
+    if (_tb_world != 0 && (w != TB_W || h != TB_H)) {
+        free(_tb_world);
+        _tb_world = 0;
+    }
+    if (_tb_world == 0) {
+        _tb_world = malloc(w * h);
+    }
+    TB_W = w;
+    TB_H = h;
+    if (TB_CELL == 0) { TB_CELL = 16; }
+
+    total = w * h;
+    for (y = 0; y < h; y = y + 1) {
+        row = json_child(doc, tiles_idx, y);
+        for (x = 0; x < w; x = x + 1) {
+            cell = json_int(doc, json_child(doc, row, x));
+            // Any painted tile (index > 0) is solid. A future
+            // schema can carry per-index collision flags.
+            poke(_tb_world + y * w + x, cell > 0 ? 1 : 0);
+        }
+    }
+    json_free(doc);
+
+    // Re-centre the spawn in the newly loaded world. Place the
+    // character a couple of cells above the vertical midpoint so
+    // gravity has room to settle them onto the first ground
+    // they meet.
+    _tb_spawn_x = (w / 2) * 1000;
+    _tb_spawn_y = (h / 3) * 1000;
+    _tb_pos_x = _tb_spawn_x;
+    _tb_pos_y = _tb_spawn_y;
+    _tb_vel_x = 0;
+    _tb_vel_y = 0;
+    _tb_grounded = 0;
+    return 0;
+}
+
+// ── Collision ────────────────────────────────────────────
+
+// Convert milli-pixel (mx, my) to cell coordinates and return
+// the byte at that cell. Out-of-world is always solid so the
+// player can't walk off the edge.
+static _tb_cell_solid(mx, my) : base {
+    auto cx, cy;
+    cx = mx / 1000;
+    cy = my / 1000;
+    if (cx < 0 || cy < 0)       { return 1; }
+    if (cx >= TB_W || cy >= TB_H) { return 1; }
+    return peek(_tb_world + cy * TB_W + cx);
+}
+
+// Test whether a hitbox rect placed at world milli-pixel (mx, my)
+// intersects any solid cell. Uses the active character's hitbox
+// dimensions.
+static _tb_hits(mx, my) {
+    auto c: Character, x0, y0, x1, y1, x, y;
+    c = _tb_char;
+    x0 = mx + c.hit_x * 1000;
+    y0 = my + c.hit_y * 1000;
+    x1 = x0 + (c.hit_w - 1) * 1000;
+    y1 = y0 + (c.hit_h - 1) * 1000;
+    // Sample the four corners plus midpoints of each edge —
+    // enough resolution for cell-sized hitboxes since any tile
+    // big enough to block the player shows up on at least one
+    // corner.
+    if (_tb_cell_solid(x0, y0) != 0) { return 1; }
+    if (_tb_cell_solid(x1, y0) != 0) { return 1; }
+    if (_tb_cell_solid(x0, y1) != 0) { return 1; }
+    if (_tb_cell_solid(x1, y1) != 0) { return 1; }
+    if (_tb_cell_solid((x0 + x1) / 2, y0) != 0) { return 1; }
+    if (_tb_cell_solid((x0 + x1) / 2, y1) != 0) { return 1; }
+    if (_tb_cell_solid(x0, (y0 + y1) / 2) != 0) { return 1; }
+    if (_tb_cell_solid(x1, (y0 + y1) / 2) != 0) { return 1; }
+    return 0;
+}
+
+// ── Update ───────────────────────────────────────────────
+
+// Read a button from either the live keyboard or the recorder
+// playback stream. When the recorder is actively playing, it
+// replaces the OS key state; otherwise we fall through to
+// stbinput as normal.
+static _tb_read_left() {
+    auto c: Character;
+    if (recorder_mode() == 2) { return recorder_left(); }
+    c = _tb_char;
+    return key_down(c.ctrl_left);
+}
+
+static _tb_read_right() {
+    auto c: Character;
+    if (recorder_mode() == 2) { return recorder_right(); }
+    c = _tb_char;
+    return key_down(c.ctrl_right);
+}
+
+static _tb_read_jump_edge() {
+    auto c: Character;
+    if (recorder_mode() == 2) { return recorder_jump_edge(); }
+    c = _tb_char;
+    return key_pressed(c.ctrl_jump);
+}
+
+static _tb_read_jump_down() {
+    auto c: Character;
+    if (recorder_mode() == 2) { return recorder_jump_down(); }
+    c = _tb_char;
+    return key_down(c.ctrl_jump);
+}
+
+void testbed_update(dt_ms) {
+    auto c: Character, accel, step_x, step_y, i;
+    auto want_left, want_right, want_jump;
+    auto checkpoint_idx;
+    if (_tb_running == 0 || _tb_char == 0) { return; }
+    c = _tb_char;
+
+    // Advance the current animation (no-op if nothing's playing).
+    // Runs unconditionally alongside physics so a paused /
+    // stationary character still shows its idle animation.
+    testbed_anim_tick(dt_ms);
+
+    // Refresh grounded flag at the top of the tick via a
+    // one-pixel (1000 mp) downward probe. Without this the flag
+    // would only be set in the exact frame a downward step
+    // terminates on ground — a stationary character would read
+    // as airborne on subsequent frames and jump input would
+    // silently no-op. While moving upward we skip the probe; a
+    // jumping character must NOT register as grounded until it
+    // actually lands.
+    if (_tb_vel_y >= 0) {
+        _tb_pos_y = _tb_pos_y + 1000;
+        _tb_grounded = _tb_hits(_tb_pos_x, _tb_pos_y) != 0 ? 1 : 0;
+        _tb_pos_y = _tb_pos_y - 1000;
+    } else {
+        _tb_grounded = 0;
+    }
+
+    // Horizontal input → instant target velocity. No
+    // acceleration curve for MVP; keeps the handling
+    // predictable for the playtester. The _tb_read_* helpers
+    // route through the recorder when a replay is active.
+    want_left  = _tb_read_left()  != 0;
+    want_right = _tb_read_right() != 0;
+    if (want_left && want_right == 0) {
+        _tb_vel_x = 0 - c.max_speed;
+    } else if (want_right && want_left == 0) {
+        _tb_vel_x = c.max_speed;
+    } else {
+        _tb_vel_x = 0;
+    }
+
+    // Jump: impulse only when the button is pressed this frame
+    // AND the player is grounded. Holding the key does not
+    // produce repeated jumps.
+    want_jump = _tb_read_jump_edge() != 0;
+    if (want_jump != 0 && _tb_grounded != 0) {
+        _tb_vel_y    = 0 - c.jump_velocity;
+        _tb_grounded = 0;
+    }
+
+    // Sample inputs for the recorder before the physics step —
+    // the snapshot below captures the POST-step state, so the
+    // replay input at frame N pairs with the snapshot that was
+    // written at frame N+1 boundary.
+    if (recorder_mode() == 1) {
+        recorder_sample_input(want_left, want_right, want_jump,
+                               _tb_read_jump_down());
+    }
+
+    // Gravity integration.
+    _tb_vel_y = _tb_vel_y + c.gravity * dt_ms / 1000;
+    if (_tb_vel_y > 800)  { _tb_vel_y = 800; }    // terminal velocity cap
+
+    // Integrate velocity in milli-pixel units — `vel * dt_ms`
+    // already has the right scale. We move in 1-pixel chunks
+    // when crossing pixel boundaries so collision rejection can
+    // back out by at most one pixel without overshooting.
+    step_x = _tb_vel_x * dt_ms;   // milli-pixels this frame
+    step_y = _tb_vel_y * dt_ms;
+
+    // Horizontal resolution.
+    if (step_x != 0) {
+        auto dir_x, abs_x, advance;
+        dir_x = step_x > 0 ? 1 : 0 - 1;
+        abs_x = step_x > 0 ? step_x : 0 - step_x;
+        i = 0;
+        while (i < abs_x) {
+            advance = abs_x - i < 1000 ? abs_x - i : 1000;
+            _tb_pos_x = _tb_pos_x + dir_x * advance;
+            if (_tb_hits(_tb_pos_x, _tb_pos_y) != 0) {
+                _tb_pos_x = _tb_pos_x - dir_x * advance;
+                _tb_vel_x = 0;
+                break;
+            }
+            i = i + advance;
+        }
+    }
+
+    // Vertical resolution. The grounded flag was set by the
+    // 1-pixel probe at the top of the tick; we leave it alone
+    // here except to set it when a downward step lands on
+    // ground mid-fall.
+    if (step_y != 0) {
+        auto dir_y, abs_y, advance;
+        dir_y = step_y > 0 ? 1 : 0 - 1;
+        abs_y = step_y > 0 ? step_y : 0 - step_y;
+        i = 0;
+        while (i < abs_y) {
+            advance = abs_y - i < 1000 ? abs_y - i : 1000;
+            _tb_pos_y = _tb_pos_y + dir_y * advance;
+            if (_tb_hits(_tb_pos_x, _tb_pos_y) != 0) {
+                _tb_pos_y = _tb_pos_y - dir_y * advance;
+                if (dir_y > 0) { _tb_grounded = 1; }
+                _tb_vel_y = 0;
+                break;
+            }
+            i = i + advance;
+        }
+    }
+
+    // Recorder bookkeeping. Recording: capture a checkpoint
+    // snapshot every REC_SNAP_EVERY frames so replay has
+    // something to compare against. Playing: advance the
+    // replay cursor with the post-step state; mismatch vs
+    // stored snapshot emits a desync diagnostic.
+    checkpoint_idx = recorder_len();
+    if (recorder_mode() == 1 && checkpoint_idx % REC_SNAP_EVERY == 0) {
+        recorder_sample_checkpoint(_tb_pos_x, _tb_pos_y,
+                                    _tb_vel_x, _tb_vel_y);
+    }
+    if (recorder_mode() == 2) {
+        recorder_tick(_tb_pos_x, _tb_pos_y, _tb_vel_x, _tb_vel_y);
+    }
+}
+
+// ── Accessors (for inspector overlay) ───────────────────
+
+// Milli-pixel world coord of the character's top-left corner.
+tb_pos_mx() : base { return _tb_pos_x; }
+tb_pos_my() : base { return _tb_pos_y; }
+tb_vel_x()  : base { return _tb_vel_x; }
+tb_vel_y()  : base { return _tb_vel_y; }
+tb_grounded() : base { return _tb_grounded; }
+tb_character() : base { return _tb_char; }
+tb_world_w() : base { return TB_W; }
+tb_world_h() : base { return TB_H; }
+tb_cell_at(x, y) : base {
+    if (x < 0 || y < 0 || x >= TB_W || y >= TB_H) { return 0; }
+    return peek(_tb_world + y * TB_W + x);
+}
+
+// ── Draw ─────────────────────────────────────────────────
+
+// Render the world + player at the given screen-space origin.
+// `cell_px` sets the per-cell pixel size; default 16 looks good
+// in a 640x360 viewport.
+//
+// Sprite sizing: the character is rendered at a fixed
+// `display_px` of 2 world cells, so its art scale is
+// `pixel_per_src_cell = (display_px) / g_canvas_n`. Character
+// position (_tb_pos_x, _tb_pos_y) is the anchor in world
+// milli-pixels; the sprite's pivot cell is translated to that
+// anchor and the rest of the sprite hangs off accordingly.
+void testbed_draw(x0, y0, cell_px) {
+    auto y, x, sv, px, py, idx, color;
+    auto c: Character, lp, k, lc, nbytes;
+    auto display_px, src_px, anchor_x, anchor_y, origin_x, origin_y;
+
+    // Background sky.
+    draw_rect(x0, y0, TB_W * cell_px, TB_H * cell_px,
+              rgba(28, 34, 58, 255));
+
+    // Walls.
+    for (y = 0; y < TB_H; y = y + 1) {
+        for (x = 0; x < TB_W; x = x + 1) {
+            sv = peek(_tb_world + y * TB_W + x);
+            if (sv == 0) { continue; }
+            px = x0 + x * cell_px;
+            py = y0 + y * cell_px;
+            draw_rect(px, py, cell_px, cell_px, rgba(80, 70, 60, 255));
+            draw_rect(px, py, cell_px, 1, rgba(140, 120, 100, 255));
+        }
+    }
+
+    if (_tb_char == 0) { return; }
+    c = _tb_char;
+
+    // Composite the live canvas into an ARGB scratch the same
+    // way canvas_draw does. One composite pass per frame.
+    nbytes = g_canvas_n * g_canvas_n * 4;
+    if (_tb_sprite_argb_n < nbytes) {
+        if (_tb_sprite_argb != 0) { free(_tb_sprite_argb); }
+        _tb_sprite_argb   = malloc(nbytes);
+        _tb_sprite_argb_n = nbytes;
+    }
+    for (k = 0; k < nbytes; k = k + 1) { poke(_tb_sprite_argb + k, 0); }
+    lc = layer_count();
+    // Animation-aware source frame. tb_current_frame_idx falls
+    // back to g_frame_idx when no animation is playing so the
+    // pre-animation flow (the testbed mirroring the editor's
+    // active frame) still works unchanged.
+    auto source_frame;
+    source_frame = tb_current_frame_idx();
+    for (k = 0; k < lc; k = k + 1) {
+        lp = layer_at(source_frame, k);
+        if (lp == 0) { continue; }
+        layer_composite_indexed(_tb_sprite_argb, g_canvas_n, g_canvas_n,
+                                 lp, 0, 0, g_palette);
+    }
+
+    // Character occupies `display_px` pixels on screen. Each
+    // source cell therefore renders at `src_px` = display_px / n.
+    // src_px must be at least 1 to stay visible; the max(1, …)
+    // covers the degenerate case of a 32² canvas inside tiny
+    // world tiles.
+    display_px = cell_px * 2;
+    src_px = display_px / g_canvas_n;
+    if (src_px < 1) { src_px = 1; }
+
+    // Anchor position in screen pixels. _tb_pos_x/y are the
+    // pivot's world milli-pixels; convert to pixels at the
+    // testbed's world scale.
+    anchor_x = x0 + _tb_pos_x * cell_px / 1000;
+    anchor_y = y0 + _tb_pos_y * cell_px / 1000;
+    origin_x = anchor_x - c.pivot_x * src_px;
+    origin_y = anchor_y - c.pivot_y * src_px;
+
+    for (y = 0; y < g_canvas_n; y = y + 1) {
+        for (x = 0; x < g_canvas_n; x = x + 1) {
+            idx = (y * g_canvas_n + x) * 4;
+            if (peek(_tb_sprite_argb + idx + 3) == 0) { continue; }
+            color = rgba(peek(_tb_sprite_argb + idx + 2),
+                         peek(_tb_sprite_argb + idx + 1),
+                         peek(_tb_sprite_argb + idx),
+                         peek(_tb_sprite_argb + idx + 3));
+            draw_rect(origin_x + x * src_px,
+                      origin_y + y * src_px,
+                      src_px, src_px, color);
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════
+// INSPECTOR — debug overlays for the testbed
+// ═════════════════════════════════════════════════════════════
+
+extrn g_canvas_n;
+
+static extrn _ins_visible;
+
+void inspector_toggle() { _ins_visible = _ins_visible == 0 ? 1 : 0; }
+void inspector_set_visible(v) { _ins_visible = v != 0 ? 1 : 0; }
+inspector_visible() : base { return _ins_visible; }
+
+// Render debug overlays on top of the testbed scene. (x0, y0) is
+// the same screen-space origin passed to testbed_draw; cell_px
+// must match the testbed's current world-cell pixel size.
+void inspector_draw(x0, y0, cell_px) {
+    auto c: Character, cp;
+    auto display_px, src_px, anchor_x, anchor_y, origin_x, origin_y;
+    auto hit_x, hit_y, hit_w, hit_h;
+    auto hit_color, state_text, vel_x_screen, vel_y_screen, len;
+
+    if (_ins_visible == 0) { return; }
+    cp = tb_character();
+    if (cp == 0) { return; }
+    c = cp;
+
+    // Mirror the testbed's sprite layout so the hitbox drawn
+    // here overlays exactly where the character renders.
+    display_px = cell_px * 2;
+    src_px = display_px / g_canvas_n;
+    if (src_px < 1) { src_px = 1; }
+
+    anchor_x = x0 + tb_pos_mx() * cell_px / 1000;
+    anchor_y = y0 + tb_pos_my() * cell_px / 1000;
+    origin_x = anchor_x - c.pivot_x * src_px;
+    origin_y = anchor_y - c.pivot_y * src_px;
+
+    // Hitbox rectangle.
+    hit_x = origin_x + c.hit_x * src_px;
+    hit_y = origin_y + c.hit_y * src_px;
+    hit_w = c.hit_w * src_px;
+    hit_h = c.hit_h * src_px;
+    if (tb_grounded() != 0) {
+        hit_color = rgba(240, 80, 200, 220);    // magenta when on ground
+        state_text = "GROUND";
+    } else {
+        hit_color = rgba(97, 218, 251, 220);    // cyan while airborne
+        state_text = "AIR";
+    }
+    draw_border(hit_x, hit_y, hit_w, hit_h, hit_color, 1);
+
+    // Velocity vector — scaled down so high speeds don't spam
+    // the screen. 1 pixel per 4 velocity units is a readable
+    // scale for the 100-500 range the character typically uses.
+    vel_x_screen = tb_vel_x() / 4;
+    vel_y_screen = tb_vel_y() / 4;
+    len = vel_x_screen;
+    if (len < 0) { len = 0 - len; }
+    // Quick magnitude guard — no arrow when the vector is trivial.
+    if (len + (vel_y_screen > 0 ? vel_y_screen : 0 - vel_y_screen) > 3) {
+        draw_line(anchor_x, anchor_y,
+                  anchor_x + vel_x_screen, anchor_y + vel_y_screen,
+                  rgba(255, 230, 80, 240));
+    }
+
+    // State label just above the hitbox.
+    draw_text(state_text, hit_x, hit_y - 12, 8,
+              rgba(255, 255, 255, 240));
+}

@@ -1,0 +1,79 @@
+// gpu_palette_cycle.bpp — Amiga-style palette cycling on GPU.
+//
+// Paints a single 64x64 palette-indexed sprite made of 4-pixel
+// horizontal bands, each band using one of the Game Boy DMG
+// palette's four green tones. A palette cycle rotates those
+// four indices every 150 ms, so the bands appear to flow down
+// the sprite without any sprite texture re-upload — the only
+// per-frame work is a 1 KB palette texture refresh.
+//
+// Controls:
+//   ESC  quit
+//
+// This is the minimum viable demonstration of the full
+// stbpal + stbrender indexed pipeline: one palette_gpu_upload
+// at startup, one palette_cycle_tick + palette_gpu_update per
+// frame, one sprite_draw_indexed. Everything else is identical
+// to a classic GPU sprite game.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbpal.bsm";
+
+const SPRITE_N = 64;
+const SCREEN_W_LOCAL = 320;
+const SCREEN_H_LOCAL = 180;
+
+main() {
+    auto pal, pal_gpu, bytes, i, y, x, band, tex;
+    auto draw_x, draw_y, dt;
+
+    game_init(SCREEN_W_LOCAL, SCREEN_H_LOCAL, "Palette Cycling (B++)", 60);
+    render_init();
+    init_palette();
+
+    // Clone GB-4 so cycling doesn't mutate the shared built-in
+    // — the catalog pointer is borrowed; each app owns its copy.
+    pal = palette_clone(palette_builtin(PAL_GB_4));
+    pal_gpu = palette_gpu_upload(pal);
+
+    // Build the sprite: 64x64 palette-indexed bytes. Bands of
+    // 4 pixels high, stepping through indices 1..4 (the four
+    // greens) so every band uses a distinct palette slot.
+    bytes = malloc(SPRITE_N * SPRITE_N);
+    for (y = 0; y < SPRITE_N; y = y + 1) {
+        band = 1 + ((y / 4) % 4);
+        for (x = 0; x < SPRITE_N; x = x + 1) {
+            poke(bytes + y * SPRITE_N + x, band);
+        }
+    }
+    tex = sprite_create_indexed(bytes, SPRITE_N, SPRITE_N);
+
+    // Register the cycle: rotate indices 1..4 every 150 ms.
+    // palette_gpu_update after each tick re-uploads the new
+    // color order to the GPU texture.
+    palette_cycle_begin(pal, 1, 4, 150);
+
+    draw_x = (SCREEN_W_LOCAL - SPRITE_N * 2) / 2;
+    draw_y = (SCREEN_H_LOCAL - SPRITE_N * 2) / 2;
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        dt = game_dt_ms();
+        palette_cycle_tick(pal, dt);
+        palette_gpu_update(pal_gpu, pal);
+
+        render_begin();
+        render_clear(rgba(15, 20, 25, 255));
+        sprite_draw_indexed(tex, pal_gpu, draw_x, draw_y,
+                            SPRITE_N, SPRITE_N, 2);
+        render_end();
+    }
+
+    free(bytes);
+    palette_free(pal);
+    game_end();
+    return 0;
+}

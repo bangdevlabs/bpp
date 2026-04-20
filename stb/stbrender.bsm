@@ -6,6 +6,16 @@
 // Usage:
 //   import "stbgame.bsm";
 //   import "stbrender.bsm";
+
+// stbdraw owns color constants (BLACK, WHITE, ...) and the 8x8 font
+// glyph table (`_stb_font`) used by render_text. Declaring the dep
+// here keeps stbrender self-contained.
+import "stbdraw.bsm";
+// stbpal supplies the Palette struct consumed by the indexed
+// sprite path. Importing here (rather than forcing each caller to
+// import) means any client already using stbrender gets the whole
+// palette pipeline for free.
+import "stbpal.bsm";
 //
 //   game_init(320, 180, "My Game", 60);
 //   render_init();
@@ -16,8 +26,6 @@
 //       render_end();
 //   }
 
-import "stbcolor.bsm";
-import "stbfont.bsm";
 
 // Initialize the GPU renderer. Call once after game_init().
 // Left un-annotated: the inferred effect is SOLO because init prints
@@ -286,6 +294,54 @@ render_measure(text, sz) : base {
     i = 0;
     while (peek(text + i) != 0) { i = i + 1; }
     return i * 8 * sz;
+}
+
+// ── Palette-indexed sprite pipeline ──────────────────────
+//
+// Amiga / SNES-style drawing: sprite bytes hold palette indices
+// (not RGBA), a shared 1x256 palette texture holds the colors,
+// and a single per-frame palette re-upload animates every sprite
+// using the palette in lockstep. The result: cycling, LUTs,
+// and smooth lerps cost ~1 KB of GPU bandwidth per frame per
+// palette, regardless of how many sprites share it.
+
+// Upload a Palette struct to a 1x256 GPU texture. Returns a
+// handle passed to render_sprite_indexed + palette_gpu_update.
+// Caller retains ownership of `pal` — this function does not
+// copy the palette struct; it copies the current color data.
+palette_gpu_upload(pal) : gpu {
+    auto p: Palette;
+    p = pal;
+    return _stb_gpu_create_palette_texture(p.data, p.count);
+}
+
+// Re-upload a palette after the CPU-side colors changed (cycle,
+// LUT, lerp). The GPU handle is stable — the sprite/palette
+// texture identity stays the same across draws. Only the pixel
+// contents change.
+void palette_gpu_update(handle, pal) : gpu {
+    auto p: Palette;
+    p = pal;
+    _stb_gpu_update_palette_texture(handle, p.data, p.count);
+}
+
+// Upload a palette-indexed sprite. `indices` is a w*h byte buffer
+// where each byte is a palette index (0 = transparent by
+// convention). Returns an R8 texture handle for
+// render_sprite_indexed.
+sprite_create_indexed(indices, w, h) : gpu {
+    return _stb_gpu_create_texture_r8(indices, w, h);
+}
+
+// Draw a palette-indexed sprite. `sprite_tex` + `pal_tex` are
+// handles returned by sprite_create_indexed / palette_gpu_upload.
+// `w,h` are the sprite's native pixel dimensions; `sz` scales
+// the quad by an integer multiplier (1 = 1:1, 2 = double). The
+// palette is sampled per-pixel in the fragment shader — changing
+// pal_tex's contents (palette_gpu_update) makes this sprite
+// animate without any sprite texture re-upload.
+void sprite_draw_indexed(sprite_tex, pal_tex, x, y, w, h, sz) : gpu {
+    _stb_gpu_sprite_indexed(sprite_tex, pal_tex, x, y, w * sz, h * sz, w, h);
 }
 
 // End the GPU render frame — flush batch, present, wait for frame budget, poll input.

@@ -1,0 +1,787 @@
+// modulab.bpp — ModuLab Phase 3: full UI + dialogs + import.
+//
+// Dog-food pixel editor for B++. Paints a sprite, saves
+// <base>.json that stbsprite's load_sprite() reads without change,
+// plus <base>.modulab.json for multi-frame round-trip load.
+//
+// Usage:
+//   ./modulab                   → opens with ./hero as default
+//   ./modulab <base-path>       → opens with <base-path> pre-filled
+//
+// Controls:
+//   LMB / drag                   apply current tool
+//   Tool sidebar click          change tool
+//   Palette swatch click        select color
+//   1..7                         Brush / Eraser / Fill / Line / Rect / Oval / Eyedrop
+//   [ / ]                        previous / next palette color
+//   - / +                        shrink / grow brush diamond (1..8)
+//   X                            toggle filled outline for rect / oval
+//   Z / Y                        undo / redo
+//   N                            new blank frame
+//   M                            duplicate current frame
+//   , / .                        previous / next frame
+//   C                            clear active frame
+//   S                            save (both sidecars at filename field)
+//   ESC                          quit
+//
+// Tool hotkeys are suppressed while the filename field has focus
+// so the user can type "hero.json" without toggling brush / eraser
+// mid-word. Save, Open, Import, and Sheet buttons are always
+// available via the topbar.
+
+import "stbgame.bsm";
+import "stbdraw.bsm";
+import "stbui.bsm";
+import "stbinput.bsm";
+import "stbforge.bsm";
+
+load "core.bsm";
+load "canvas.bsm";
+load "io.bsm";
+load "ui.bsm";
+load "select.bsm";
+load "prefs.bsm";
+
+extrn SCREEN_W, SCREEN_H;
+
+extrn g_canvas_n, g_sel_color, g_tool, g_dirty, g_brush_size;
+extrn g_palette, g_pal_n, g_frame_count;
+extrn TOOL_BRUSH, TOOL_ERASER, TOOL_FILL;
+extrn TOOL_LINE, TOOL_RECT, TOOL_OVAL, TOOL_EYEDROP, TOOL_SELECT;
+extrn UI_ACT_SAVE, UI_ACT_OPEN, UI_ACT_IMPORT, UI_ACT_SHEET;
+extrn UI_FRAME_ADD, UI_FRAME_DUP, UI_FRAME_DEL;
+extrn UI_UNIVERSE_REQUEST_MCU, UI_UNIVERSE_REQUEST_NKOTC, UI_UNIVERSE_REQUEST_CB;
+extrn UNIVERSE_MCU, UNIVERSE_NKOTC, UNIVERSE_CB;
+extrn UI_LAYER_ADD, UI_LAYER_DEL;
+
+// Canvas screen placement.
+static extrn _cvs_x, _cvs_y, _cvs_zoom;
+
+// Accessors exposed to prefs.bsm so the prefs module can persist
+// window zoom without reaching into modulab.bpp's private state
+// via extrn directly. prefs.bsm declares these as extrn and calls
+// them during load/save.
+modulab_prefs_zoom_get() : base { return _cvs_zoom; }
+void modulab_prefs_zoom_set(v) {
+    if (v < 1)  { v = 1; }
+    if (v > 64) { v = 64; }
+    _cvs_zoom = v;
+}
+
+// Zoom around the cursor: keep the cell under the mouse locked in
+// place while the zoom changes. New_zoom is clamped to [1, 64].
+static void _zoom_around_cursor(new_zoom) {
+    auto mx, my, cell_x, cell_y;
+    if (new_zoom < 1)  { new_zoom = 1; }
+    if (new_zoom > 64) { new_zoom = 64; }
+    if (new_zoom == _cvs_zoom) { return; }
+    mx = mouse_x();
+    my = mouse_y();
+    // Cell under the cursor at the old zoom.
+    cell_x = (mx - _cvs_x) / _cvs_zoom;
+    cell_y = (my - _cvs_y) / _cvs_zoom;
+    _cvs_zoom = new_zoom;
+    // Re-anchor origin so the same cell still lands under (mx, my).
+    _cvs_x = mx - cell_x * _cvs_zoom;
+    _cvs_y = my - cell_y * _cvs_zoom;
+}
+
+// Lazy-create the testbed character the first time the user
+// enters Mode 3. Subsequent toggles reuse the same instance.
+static void _ensure_testbed_character() {
+    if (_testbed_character != 0) { return; }
+    _testbed_character = character_new();
+    // Sensible defaults — pivot at bottom-centre of a 16² sprite,
+    // hitbox 14x14 slightly inset. Works for the MCU universe; CB
+    // and NKOTC would want different values but users can tune
+    // them per-project once the Character editor UI lands.
+    auto c: Character;
+    c = _testbed_character;
+    c.pivot_x = g_canvas_n / 2;
+    c.pivot_y = g_canvas_n - 1;
+    c.hit_x   = 1;
+    c.hit_y   = 1;
+    c.hit_w   = g_canvas_n - 2;
+    c.hit_h   = g_canvas_n - 2;
+}
+
+// Build (or rebuild) an "all frames" animation on the testbed
+// character covering every frame the user has painted. Runs on
+// every Tab-into-testbed so adding, duplicating, or removing
+// frames between playtests re-derives the animation fresh.
+// Default speed is 8 fps with looping — matches the classic
+// retro "walk cycle at a quarter-second pace" feel. When only
+// one frame exists (nothing to animate) we leave anim_count at
+// zero so the testbed falls back to static editor-frame rendering.
+static void _rebuild_testbed_animation() {
+    auto ap, frames, i;
+    if (_testbed_character == 0) { return; }
+    character_clear_animations(_testbed_character);
+    if (g_frame_count < 2) { return; }
+    ap = character_add_animation(_testbed_character, "all", 8, 1);
+    frames = malloc(g_frame_count * 8);
+    for (i = 0; i < g_frame_count; i = i + 1) {
+        *(frames + i * 8) = i;
+    }
+    character_set_frames(ap, frames, g_frame_count);
+    free(frames);
+}
+
+// Cycle to the next mode. Tab goes editor → testbed → editor.
+static void _cycle_mode() {
+    auto level_path, c: Character;
+    _modulab_mode = _modulab_mode == 2 ? 0 : 2;
+    if (_modulab_mode == 2) {
+        _ensure_testbed_character();
+        testbed_init(_testbed_character);
+        // Opportunistically load an authored level if one lives
+        // next to the binary. `testbed.level.json` is the
+        // convention — level_editor writes .level.json files,
+        // so a user can paint a level once with `level_editor`,
+        // save it as `testbed.level.json` in the modulab binary's
+        // directory, and every Tab-into-testbed picks it up.
+        // Missing file is silent; the hand-drawn default world
+        // stays in place.
+        level_path = path_asset("testbed.level.json");
+        testbed_load_world(level_path);
+        free(level_path);
+        // Derive an animation from whatever the user currently
+        // has painted — every frame, in order, at 8 fps looping.
+        // Auto-play it if multi-frame. Single-frame projects fall
+        // through to static rendering (the legacy behaviour).
+        _rebuild_testbed_animation();
+        c = _testbed_character;
+        if (c.anim_count > 0) {
+            testbed_play_animation(0);
+        }
+    } else {
+        testbed_free();
+    }
+}
+
+// Middle-mouse drag. Tracks previous mouse position and adds the
+// per-frame delta to the canvas origin. Starts / ends by tracking
+// the MMB button edge so the drag is continuous across frames.
+static void _handle_view_pan() {
+    auto mx, my, dx, dy, mmb;
+    mx = mouse_x();
+    my = mouse_y();
+    mmb = mouse_down(MOUSE_MIDDLE);
+    if (mmb != 0 && _mmb_down_prev != 0) {
+        dx = mx - _mmb_last_mx;
+        dy = my - _mmb_last_my;
+        _cvs_x = _cvs_x + dx;
+        _cvs_y = _cvs_y + dy;
+    }
+    _mmb_last_mx = mx;
+    _mmb_last_my = my;
+    _mmb_down_prev = mmb;
+}
+
+// Drag state (Phase 2 semantics unchanged).
+static extrn _drag_mode, _drag_ax, _drag_ay, _drag_lx, _drag_ly;
+static extrn _drag_snapshot, _drag_filled;
+static extrn _prev_mouse_down;
+
+// View state — pan offset + zoom. Middle-mouse drag updates the
+// canvas origin; +/- keys scale the zoom around the cursor so
+// the cell under the mouse stays put.
+static extrn _mmb_down_prev, _mmb_last_mx, _mmb_last_my;
+static extrn _cvs_zoom_default;
+
+// Mode selector. 0 = editor (pixel painting), 1 = timeline
+// (reserved — currently treated the same as editor), 2 = testbed
+// (playtest mode). Tab cycles. The testbed owns its own
+// character instance that it keeps across mode toggles; the
+// character is created lazily on the first entry to mode 2.
+static extrn _modulab_mode;
+static extrn _testbed_character;
+
+// Draw the status line above the canvas — current tool, color,
+// brush size, frame index, and an "unsaved" pip when the dirty
+// flag is up.
+static void _draw_status() {
+    auto tool_name, y, c;
+
+    y = 42;
+    c = rgba(140, 160, 200, 255);
+
+    if      (g_tool == TOOL_BRUSH)   { tool_name = "BRUSH"; }
+    else if (g_tool == TOOL_ERASER)  { tool_name = "ERASER"; }
+    else if (g_tool == TOOL_FILL)    { tool_name = "FILL"; }
+    else if (g_tool == TOOL_LINE)    { tool_name = "LINE"; }
+    else if (g_tool == TOOL_RECT)    { tool_name = _drag_filled != 0 ? "RECT*" : "RECT"; }
+    else if (g_tool == TOOL_OVAL)    { tool_name = _drag_filled != 0 ? "OVAL*" : "OVAL"; }
+    else if (g_tool == TOOL_EYEDROP) { tool_name = "EYEDROP"; }
+    else if (g_tool == TOOL_SELECT)  { tool_name = "SELECT"; }
+    else                              { tool_name = "?"; }
+
+    auto bx;
+    bx = 120;
+    draw_text(tool_name, bx, y, 8, WHITE);
+    bx = bx + 70;
+    draw_text("color", bx, y, 8, c);
+    draw_number(bx + 40, y, 8, WHITE, g_sel_color);
+    bx = bx + 72;
+    draw_text("size", bx, y, 8, c);
+    draw_number(bx + 34, y, 8, WHITE, g_brush_size);
+    bx = bx + 60;
+    draw_text("frame", bx, y, 8, c);
+    draw_number(bx + 42, y, 8, WHITE, frame_idx());
+    draw_text("/", bx + 58, y, 8, c);
+    draw_number(bx + 66, y, 8, WHITE, g_frame_count);
+
+    if (g_dirty != 0) {
+        draw_text("[unsaved]", SCREEN_W - 96, y, 8, rgba(255, 180, 80, 255));
+    }
+}
+
+static void _draw_help() {
+    auto y, c;
+    y = SCREEN_H - 18;
+    c = rgba(120, 130, 150, 255);
+    draw_text("tools 1-7  [ ]=color  -+=size  ZY=undo/redo  NM=new/dup frame  ,.=nav  X=fill outline  ESC=quit",
+              12, y, 8, c);
+}
+
+// Extract a path's directory + base name (without trailing .json
+// or .modulab.json) into a malloc'd buffer the caller owns. Used
+// by the S keyboard shortcut so it behaves exactly like clicking
+// Save (invoking mlab_save_both on a clean prefix).
+static _prefix_from_filename() {
+    auto name, len, out, i, cut;
+    name = ui_filename();
+    len = str_len(name);
+    // Strip .modulab.json (longer suffix first so we don't leave
+    // ".modulab" dangling) then .json.
+    cut = len;
+    if (len >= 13
+     && peek(name + len - 13) == '.'
+     && peek(name + len - 12) == 'm'
+     && peek(name + len - 11) == 'o'
+     && peek(name + len - 10) == 'd'
+     && peek(name + len -  9) == 'u'
+     && peek(name + len -  8) == 'l'
+     && peek(name + len -  7) == 'a'
+     && peek(name + len -  6) == 'b'
+     && peek(name + len -  5) == '.'
+     && peek(name + len -  4) == 'j'
+     && peek(name + len -  3) == 's'
+     && peek(name + len -  2) == 'o'
+     && peek(name + len -  1) == 'n') { cut = len - 13; }
+    else if (len >= 5
+     && peek(name + len - 5) == '.'
+     && peek(name + len - 4) == 'j'
+     && peek(name + len - 3) == 's'
+     && peek(name + len - 2) == 'o'
+     && peek(name + len - 1) == 'n') { cut = len - 5; }
+    out = malloc(cut + 1);
+    for (i = 0; i < cut; i = i + 1) { poke(out + i, peek(name + i)); }
+    poke(out + cut, 0);
+    return out;
+}
+
+// Commit the current canvas to disk using the filename field as a
+// base path. Strips any .json / .modulab.json extension the user
+// might have typed so both sidecars land at a clean prefix.
+static void _do_save() {
+    auto prefix;
+    prefix = _prefix_from_filename();
+    mlab_save_both(prefix);
+    g_dirty = 0;
+    free(prefix);
+    // Piggyback prefs save so user intent (universe + zoom + any
+    // future rebinding) persists across sessions without needing
+    // a dedicated "save prefs" button.
+    prefs_save();
+}
+
+// Keyboard handler. Returns 1 on a quit request. Gates tool +
+// frame + color hotkeys on the filename field's focus bit so
+// typing never steals a tool.
+static _handle_keys() {
+    auto k, edit_held, px, py;
+    if (key_pressed(KEY_ESC)) { return 1; }
+
+    if (ui_filename_active() != 0) { return 0; }
+
+    // Tab → cycle between editor and testbed (Mode 3). Goes
+    // here (not deeper in the tool section) so the Tab press is
+    // available regardless of current tool or mode.
+    if (key_pressed(KEY_TAB)) {
+        _cycle_mode();
+        return 0;
+    }
+
+    // In testbed mode the tool hotkeys + drawing shortcuts are
+    // irrelevant — the character's control keys take precedence.
+    // R resets the character to spawn, H toggles the inspector,
+    // `.` toggles recording, `,` plays back the last recording.
+    if (_modulab_mode == 2) {
+        if (key_pressed(KEY_R)) { testbed_reset(); }
+        if (key_pressed(KEY_H)) { inspector_toggle(); }
+        if (key_pressed(KEY_PERIOD)) {
+            if (recorder_mode() == 1) { recorder_stop(); }
+            else                       { recorder_start(); }
+        }
+        if (key_pressed(KEY_COMMA)) {
+            testbed_reset();
+            recorder_play();
+        }
+        return 0;
+    }
+
+    if (key_pressed(KEY_1) || key_pressed(KEY_B)) { g_tool = TOOL_BRUSH; }
+    if (key_pressed(KEY_2))                        { g_tool = TOOL_ERASER; }
+    if (key_pressed(KEY_3) || key_pressed(KEY_F)) { g_tool = TOOL_FILL; }
+    if (key_pressed(KEY_4) || key_pressed(KEY_L)) { g_tool = TOOL_LINE; }
+    if (key_pressed(KEY_5) || key_pressed(KEY_R)) { g_tool = TOOL_RECT; }
+    if (key_pressed(KEY_6) || key_pressed(KEY_O)) { g_tool = TOOL_OVAL; }
+    if (key_pressed(KEY_7) || key_pressed(KEY_I)) { g_tool = TOOL_EYEDROP; }
+    if (key_pressed(KEY_8))                        { g_tool = TOOL_SELECT; }
+
+    // Clipboard shortcuts. macOS meta + Linux ctrl both resolve
+    // because we treat either as "the edit key." If the user holds
+    // neither, C/X/V fall through to their plain-key roles (clear
+    // canvas / fill toggle / unused).
+    edit_held = key_down(KEY_META) != 0 || key_down(KEY_CTRL) != 0;
+    if (edit_held != 0 && key_pressed(KEY_C)) { select_copy(); return 0; }
+    if (edit_held != 0 && key_pressed(KEY_X)) { select_cut();  return 0; }
+    if (edit_held != 0 && key_pressed(KEY_V)) {
+        if (select_has_clip() != 0) {
+            if (select_active() != 0) {
+                // Paste at the selection's top-left.
+                px = g_sel_x0 < g_sel_x1 ? g_sel_x0 : g_sel_x1;
+                py = g_sel_y0 < g_sel_y1 ? g_sel_y0 : g_sel_y1;
+                select_paste(px, py);
+            } else {
+                select_paste(0, 0);
+            }
+        }
+        return 0;
+    }
+
+    if (key_pressed(KEY_LBRACKET)) {
+        g_sel_color = g_sel_color - 1;
+        if (g_sel_color < 0) { g_sel_color = g_pal_n - 1; }
+    }
+    if (key_pressed(KEY_RBRACKET)) {
+        g_sel_color = g_sel_color + 1;
+        if (g_sel_color >= g_pal_n) { g_sel_color = 0; }
+    }
+
+    if (key_pressed(KEY_MINUS)) {
+        if (key_down(KEY_SHIFT) != 0) {
+            // Shift + minus → zoom out.
+            _zoom_around_cursor(_cvs_zoom - 2);
+        } else {
+            g_brush_size = g_brush_size - 1;
+            if (g_brush_size < 1) { g_brush_size = 1; }
+        }
+    }
+    if (key_pressed(KEY_EQUAL)) {
+        if (key_down(KEY_SHIFT) != 0) {
+            _zoom_around_cursor(_cvs_zoom + 2);
+        } else {
+            g_brush_size = g_brush_size + 1;
+            if (g_brush_size > 8) { g_brush_size = 8; }
+        }
+    }
+    if (key_pressed(KEY_0) && key_down(KEY_SHIFT) != 0) {
+        // Reset to default zoom + origin.
+        _cvs_zoom = _cvs_zoom_default;
+        _cvs_x    = 144;
+        _cvs_y    = 60;
+    }
+
+    if (key_pressed(KEY_X)) { _drag_filled = _drag_filled == 0 ? 1 : 0; }
+
+    // Onion skin toggle. Backtick (grave) is an unused slot and
+    // sits next to the number row where the tool + frame nav
+    // keys cluster, which makes it an easy reach while painting
+    // a walk cycle.
+    if (key_pressed(KEY_GRAVE)) {
+        g_onion_on = g_onion_on == 0 ? 1 : 0;
+    }
+
+    if (key_pressed(KEY_Z)) { history_undo(); }
+    if (key_pressed(KEY_Y)) { history_redo(); }
+
+    if (key_pressed(KEY_N)) { frame_add(); }
+    if (key_pressed(KEY_M)) { frame_dup(); }
+    if (key_pressed(KEY_COMMA)) {
+        if (frame_idx() > 0) { frame_switch(frame_idx() - 1); }
+    }
+    if (key_pressed(KEY_PERIOD)) {
+        if (frame_idx() < g_frame_count - 1) { frame_switch(frame_idx() + 1); }
+    }
+
+    // Layer navigation: Page-Down = next layer up, Page-Up = prev
+    // layer down (matches the "painter's order" in the layer panel
+    // where higher-index layers sit on top).
+    if (key_pressed(KEY_PGDOWN)) {
+        k = layer_active_idx() + 1;
+        if (k < layer_count()) { layer_active_set(k); }
+    }
+    if (key_pressed(KEY_PGUP)) {
+        k = layer_active_idx() - 1;
+        if (k >= 0) { layer_active_set(k); }
+    }
+
+    if (key_pressed(KEY_C)) { canvas_clear(); }
+    if (key_pressed(KEY_S)) { _do_save(); }
+
+    return 0;
+}
+
+// Drag state machine (unchanged from Phase 2 — stroke semantics
+// did not change; the UI just sits around it).
+static _cursor_cell() : base {
+    return canvas_hit(mouse_x(), mouse_y(), _cvs_x, _cvs_y, _cvs_zoom);
+}
+
+static void _begin_stroke(cell) {
+    auto x, y, n;
+    if (cell < 0) { return; }
+    n = g_canvas_n;
+    x = cell % n;
+    y = cell / n;
+
+    // Eyedrop reads — no mutation, no stroke.
+    if (g_tool == TOOL_EYEDROP) { tool_eyedrop(x, y); return; }
+
+    // Selection — drag the rect, don't touch pixels.
+    if (g_tool == TOOL_SELECT) {
+        _drag_mode = 3;
+        select_begin(x, y);
+        return;
+    }
+
+    // Fill is a one-shot stroke: begin + apply + commit happens
+    // in one frame. The soft-cap promotion inside history_commit
+    // will flip the accumulated delta list into a snapshot when
+    // the fill crosses the size threshold (roughly: any canvas-
+    // wide fill on n > 16).
+    if (g_tool == TOOL_FILL) {
+        history_begin_stroke();
+        tool_fill(x, y);
+        history_commit();
+        return;
+    }
+
+    if (g_tool == TOOL_BRUSH || g_tool == TOOL_ERASER) {
+        history_begin_stroke();
+        _drag_mode = 1;
+        _drag_ax = x; _drag_ay = y;
+        _drag_lx = x; _drag_ly = y;
+        if (g_tool == TOOL_BRUSH) { tool_brush_apply(x, y); }
+        else                       { tool_eraser_apply(x, y); }
+        return;
+    }
+
+    // Shape tools — mode 2. Each frame during drag the canvas is
+    // restored to the pre-stroke snapshot and the shape is
+    // re-applied. That produces more delta entries than strictly
+    // needed (intermediate shape cells all recorded), but the
+    // committed stroke is semantically correct either way, and
+    // soft-cap promotion collapses it into one snapshot.
+    history_begin_stroke();
+    _drag_mode = 2;
+    _drag_ax = x; _drag_ay = y;
+    _drag_snapshot = malloc(n * n);
+    canvas_snapshot(_drag_snapshot);
+    _replay_shape(x, y);
+}
+
+static void _replay_shape(cx, cy) {
+    canvas_restore(_drag_snapshot);
+    if      (g_tool == TOOL_LINE) { tool_line(_drag_ax, _drag_ay, cx, cy); }
+    else if (g_tool == TOOL_RECT) { tool_rect(_drag_ax, _drag_ay, cx, cy, _drag_filled); }
+    else if (g_tool == TOOL_OVAL) { tool_oval(_drag_ax, _drag_ay, cx, cy, _drag_filled); }
+}
+
+static void _update_stroke(cell) {
+    auto x, y, n;
+    if (cell < 0) { return; }
+    n = g_canvas_n;
+    x = cell % n;
+    y = cell / n;
+
+    if (_drag_mode == 1) {
+        if (x == _drag_lx && y == _drag_ly) { return; }
+        if (g_tool == TOOL_BRUSH) { tool_brush_segment(_drag_lx, _drag_ly, x, y); }
+        else                       { tool_eraser_segment(_drag_lx, _drag_ly, x, y); }
+        _drag_lx = x; _drag_ly = y;
+        return;
+    }
+    if (_drag_mode == 2) { _replay_shape(x, y); }
+    if (_drag_mode == 3) { select_update(x, y); }
+}
+
+static void _end_stroke() {
+    if (_drag_mode == 0) { return; }
+    if (_drag_mode == 3) {
+        // Selection — no pixels mutated, no commit needed.
+        select_end();
+        _drag_mode = 0;
+        return;
+    }
+    history_commit();
+    if (_drag_mode == 2 && _drag_snapshot != 0) {
+        free(_drag_snapshot);
+        _drag_snapshot = 0;
+    }
+    _drag_mode = 0;
+}
+
+// Mouse handler — drives strokes from LMB edges. A "suppress" flag
+// tells it the click this frame was consumed by a UI widget (a
+// button, a palette swatch) so the canvas should not also paint.
+static void _handle_mouse(suppress) {
+    auto now_down, press, release, cell;
+
+    now_down = mouse_down(MOUSE_LEFT);
+    press    = now_down != 0 && _prev_mouse_down == 0;
+    release  = now_down == 0 && _prev_mouse_down != 0;
+    _prev_mouse_down = now_down;
+
+    cell = _cursor_cell();
+
+    if (suppress != 0) {
+        if (release) { _end_stroke(); }
+        return;
+    }
+
+    if (press)             { _begin_stroke(cell); return; }
+    if (now_down != 0)     { _update_stroke(cell); return; }
+    if (release)           { _end_stroke(); }
+}
+
+// Dispatch the topbar's action code to the right IO handler.
+static void _handle_topbar(act) {
+    auto sheet_path, prefix;
+
+    if (act == UI_ACT_SAVE) {
+        _do_save();
+        return;
+    }
+    if (act == UI_ACT_OPEN) {
+        if (mlab_open_dialog() == 0) {
+            // Success — sync the filename field to the loaded
+            // path. We reach back into the file buffer by
+            // computing the canonical path from the ModuLab
+            // prefix convention — Phase 3 keeps it simple and
+            // just leaves the field as-is.
+        }
+        g_dirty = 0;
+        return;
+    }
+    if (act == UI_ACT_IMPORT) {
+        mlab_open_dialog();  // same entry, extension routes it
+        return;
+    }
+    if (act == UI_ACT_SHEET) {
+        prefix = _prefix_from_filename();
+        sheet_path = sb_new();
+        sheet_path = sb_cat(sheet_path, prefix);
+        sheet_path = sb_cat(sheet_path, ".sheet.json");
+        mlab_export_spritesheet_json(sheet_path, 8);
+        sheet_path = sb_free(sheet_path);
+        free(prefix);
+        return;
+    }
+}
+
+// Dispatch frame-strip action codes.
+static void _handle_frame_strip(ret) {
+    if (ret == 0) { return; }
+    if (ret == UI_FRAME_ADD) { frame_add(); return; }
+    if (ret == UI_FRAME_DUP) { frame_dup(); return; }
+    if (ret == UI_FRAME_DEL) { frame_del(frame_idx()); return; }
+    if (ret >= 0)            { frame_switch(ret); }
+}
+
+// Map a UI_UNIVERSE_REQUEST_* code to the matching UNIVERSE_* id.
+// Returns -1 when the request is NONE so the caller can short-circuit.
+static _request_to_universe(req) : base {
+    if (req == UI_UNIVERSE_REQUEST_MCU)   { return UNIVERSE_MCU; }
+    if (req == UI_UNIVERSE_REQUEST_NKOTC) { return UNIVERSE_NKOTC; }
+    if (req == UI_UNIVERSE_REQUEST_CB)    { return UNIVERSE_CB; }
+    return 0 - 1;
+}
+
+// Handle a pending universe-switch request. When the canvas has
+// unsaved edits, show a native confirm dialog so the user can
+// back out; otherwise apply immediately. Called once per frame
+// right after ui_phase4_sidebar.
+static void _handle_universe_request(req) {
+    auto target, ok;
+    target = _request_to_universe(req);
+    if (target < 0) { return; }
+    if (g_dirty != 0) {
+        ok = window_confirm("Switch universe?",
+                            "The current canvas will be cleared. Continue?");
+        if (ok == 0) { return; }
+    }
+    universe_apply(target);
+}
+
+// Handle the layer-panel action code returned by ui_layer_panel.
+// Negative codes are control actions (add/delete); non-negative
+// codes are target layer indices.
+static void _handle_layer_action(code) {
+    if (code == UI_LAYER_ADD)  { layer_add(); return; }
+    if (code == UI_LAYER_DEL)  { layer_delete(layer_active_idx()); return; }
+    if (code >= 0)             { layer_active_set(code); }
+}
+
+main() {
+    auto quit, act, frame_ret, palette_consumed, uni_req, layer_ret;
+    auto initial_name, mx, suppress;
+
+    if (argc_get() >= 2) { initial_name = argv_get(1); }
+    else                 { initial_name = "hero"; }
+
+    game_init(800, 600, "ModuLab", 60);
+
+    state_init(16);
+    ui_init(initial_name);
+
+    _cvs_zoom = 24;
+    _cvs_x    = 144;
+    _cvs_y    = 60;
+    _cvs_zoom_default = 24;
+    _mmb_down_prev = 0;
+    _mmb_last_mx   = 0;
+    _mmb_last_my   = 0;
+    _modulab_mode      = 0;
+    _testbed_character = 0;
+    recorder_init();
+
+    // Default actions — prefs_load may override with saved bindings.
+    action_define("paint",     KEY_B,         0);
+    action_define("eraser",    KEY_2,         0);
+    action_define("fill",      KEY_F,         0);
+    action_define("line",      KEY_L,         0);
+    action_define("rect",      KEY_R,         0);
+    action_define("oval",      KEY_O,         0);
+    action_define("eyedrop",   KEY_I,         0);
+    action_define("select",    KEY_8,         0);
+    action_define("undo",      KEY_Z,         0);
+    action_define("redo",      KEY_Y,         0);
+    action_define("save",      KEY_S,         0);
+    action_define("clear",     KEY_C,         0);
+    action_define("copy",      KEY_C, ACTION_MOD_META);
+    action_define("cut",       KEY_X, ACTION_MOD_META);
+    action_define("paste",     KEY_V, ACTION_MOD_META);
+
+    prefs_load();
+
+    _drag_mode = 0;
+    _drag_filled = 0;
+    _drag_snapshot = 0;
+    _prev_mouse_down = 0;
+
+    quit = 0;
+    while (game_should_quit() == 0 && quit == 0) {
+        game_frame_begin();
+
+        quit = _handle_keys();
+        if (_modulab_mode != 2) { _handle_view_pan(); }
+
+        clear(rgba(14, 16, 22, 255));
+
+        // Mode 3 — testbed playtest. Replaces the full editor
+        // view with a platformer loop driving the current
+        // character. Tab returns to editor. R resets spawn.
+        // H toggles the inspector overlay. `.` starts / stops
+        // an input recording; `,` replays the last recording.
+        if (_modulab_mode == 2) {
+            auto rec_label, rec_col;
+            testbed_update(game_dt_ms());
+            testbed_draw(40, 40, 16);
+            inspector_draw(40, 40, 16);
+            draw_text("TESTBED  — Tab:editor R:reset H:inspect .:rec ,:play",
+                      12, SCREEN_H - 18, 8, rgba(200, 200, 220, 255));
+            if (recorder_mode() == 1) {
+                rec_label = "REC";
+                rec_col   = rgba(240,  80,  80, 255);
+            } else if (recorder_mode() == 2) {
+                rec_label = "PLAY";
+                rec_col   = rgba(255, 200, 100, 255);
+            } else {
+                rec_label = 0;
+                rec_col   = 0;
+            }
+            if (rec_label != 0) {
+                draw_rect(SCREEN_W - 60, 8, 52, 22, rec_col);
+                draw_text(rec_label, SCREEN_W - 54, 14, 8,
+                          rgba(20, 20, 30, 255));
+            }
+            draw_end();
+            continue;
+        }
+
+        // Topbar first — buttons fire here, filename captures focus.
+        act = ui_topbar();
+        _handle_topbar(act);
+
+        _draw_status();
+
+        // Left sidebar of tools.
+        ui_tool_sidebar(12, 64);
+
+        // Canvas in the middle.
+        canvas_draw(_cvs_x, _cvs_y, _cvs_zoom);
+
+        // Selection marching-ants overlay on top of the composite.
+        if (select_active() != 0) {
+            select_draw_overlay(_cvs_x, _cvs_y, _cvs_zoom);
+        }
+
+        // Palette row directly under the canvas.
+        palette_consumed = ui_palette_row(_cvs_x,
+                                           _cvs_y + g_canvas_n * _cvs_zoom + 12);
+
+        // Frame strip along the bottom.
+        frame_ret = ui_frame_strip(12, 500);
+        _handle_frame_strip(frame_ret);
+
+        // Right sidebar upper half: universe / dither / stencil.
+        uni_req = ui_phase4_sidebar(620, 64);
+        _handle_universe_request(uni_req);
+
+        // Right sidebar lower half: layer panel.
+        layer_ret = ui_layer_panel(620, 290);
+        _handle_layer_action(layer_ret);
+
+        // Any topbar / sidebar / palette / frame-strip / phase4-
+        // sidebar / layer-panel click this frame counts as "UI
+        // consumed the click" so the canvas handler doesn't also
+        // paint on the same edge. Tool sidebar is to the left of
+        // the canvas (x < _cvs_x); right-hand sidebar spans
+        // x >= 610.
+        mx = mouse_x();
+        suppress = act != 0 || palette_consumed != 0
+                || frame_ret != 0 || uni_req != 0
+                || layer_ret != 0
+                || mx < _cvs_x || mx > 610;
+
+        _handle_mouse(suppress);
+
+        _draw_help();
+
+        draw_end();
+    }
+
+    if (_drag_snapshot != 0) { free(_drag_snapshot); }
+    prefs_save();
+    recorder_free();
+    testbed_free();
+    if (_testbed_character != 0) { character_free(_testbed_character); }
+    ui_free();
+    select_free();
+    state_free();
+    game_end();
+    return 0;
+}

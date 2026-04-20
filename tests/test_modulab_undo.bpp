@@ -1,0 +1,142 @@
+// test_modulab_undo.bpp — history ring behaviour (delta-undo era).
+//
+// Delta-undo semantics:
+//   Pristine: len=0, cursor=0. No initial "blank snapshot" slot.
+//   Each stroke = history_begin_stroke + pix_set(s) + history_commit.
+//   After N strokes: len=N, cursor=N (tip of history).
+//   Undo: cursor--, reverse-applies slots[cursor].
+//   Ring full: the oldest stroke is evicted; the new one lands
+//   at slot MAX_UNDO-1 with cursor/len both saturated there.
+
+import "stbgame.bsm";
+load "../tools/modulab/core.bsm";
+
+// Commit one stroke that paints a single cell. Keeps the test
+// body clean — every stroke in this test is one pix_set bracketed
+// by begin/commit.
+static void _one_stroke(x, y, idx) {
+    history_begin_stroke();
+    pix_set(x, y, idx);
+    history_commit();
+}
+
+main() {
+    auto i, c;
+
+    init_str();
+    state_init(16);
+
+    // Pristine — no strokes recorded yet.
+    if (history_len() != 0 || history_cursor() != 0) {
+        print_msg("FAIL: initial history not (len=0, cursor=0)");
+        print_int(history_len()); print_msg(","); print_int(history_cursor());
+        print_ln();
+        return 1;
+    }
+
+    // undo on pristine is a no-op.
+    if (history_undo() != 0) {
+        print_msg("FAIL: undo on pristine did not return 0");
+        return 1;
+    }
+
+    // Commit 10 strokes on distinct cells.
+    for (i = 0; i < 10; i = i + 1) {
+        _one_stroke(i, 0, 1 + (i % 7));
+    }
+    if (history_len() != 10 || history_cursor() != 10) {
+        print_msg("FAIL: after 10 commits expected len=10 cursor=10");
+        print_int(history_len()); print_msg(","); print_int(history_cursor());
+        print_ln();
+        return 1;
+    }
+
+    // Undo twice — cursor moves back, pixels revert.
+    if (history_undo() == 0) { print_msg("FAIL: undo returned 0"); return 1; }
+    if (history_undo() == 0) { print_msg("FAIL: second undo returned 0"); return 1; }
+    if (pix_get(9, 0) != 0 || pix_get(8, 0) != 0) {
+        print_msg("FAIL: undo did not clear cells (8,0) / (9,0)");
+        return 1;
+    }
+    if (pix_get(7, 0) == 0) {
+        print_msg("FAIL: undo removed a cell it should have left");
+        return 1;
+    }
+
+    // Redo once — cell 8 comes back.
+    if (history_redo() == 0) { print_msg("FAIL: redo returned 0"); return 1; }
+    if (pix_get(8, 0) == 0) {
+        print_msg("FAIL: redo did not repaint cell (8,0)");
+        return 1;
+    }
+
+    // New commit after partial undo — redo branch is discarded.
+    _one_stroke(0, 1, 5);
+    if (history_cursor() != history_len()) {
+        print_msg("FAIL: new commit did not place cursor at tip");
+        return 1;
+    }
+    if (history_redo() != 0) {
+        print_msg("FAIL: redo succeeded after new commit (should be empty)");
+        return 1;
+    }
+
+    // Stress the ring past MAX_UNDO to exercise shift-on-full.
+    // MAX_UNDO=256, so push enough extra strokes to overflow.
+    for (i = 0; i < 300; i = i + 1) {
+        _one_stroke(i % 16, (i / 16) % 16, 1 + (i % 7));
+    }
+    if (history_len() != 256) {
+        print_msg("FAIL: ring did not saturate at MAX_UNDO=256, got ");
+        print_int(history_len()); print_ln();
+        return 1;
+    }
+    if (history_cursor() != 256) {
+        print_msg("FAIL: cursor not at tip after saturation, got ");
+        print_int(history_cursor()); print_ln();
+        return 1;
+    }
+
+    // After shift-on-full, every undo still works down to cursor 0,
+    // but the oldest strokes have been dropped. Undo 256 times,
+    // confirm each returns 1.
+    for (i = 0; i < 256; i = i + 1) {
+        if (history_undo() == 0) {
+            print_msg("FAIL: undo returned 0 before reaching pristine at iter ");
+            print_int(i); print_ln();
+            return 1;
+        }
+    }
+    if (history_undo() != 0) {
+        print_msg("FAIL: 257th undo did not return 0 (should be at pristine)");
+        return 1;
+    }
+
+    // Redo all 256 back.
+    for (i = 0; i < 256; i = i + 1) {
+        if (history_redo() == 0) {
+            print_msg("FAIL: redo returned 0 before reaching tip at iter ");
+            print_int(i); print_ln();
+            return 1;
+        }
+    }
+
+    // Per-frame rings — switching frames leaves the current frame's
+    // cursor untouched when the other frame commits.
+    c = history_cursor();
+    if (frame_add() < 0) { print_msg("FAIL: frame_add refused"); return 1; }
+    if (history_len() != 0) {
+        print_msg("FAIL: new frame did not start with empty history");
+        return 1;
+    }
+    _one_stroke(0, 0, 3);
+    frame_switch(0);
+    if (history_cursor() != c) {
+        print_msg("FAIL: frame 0 cursor moved when frame 1 committed");
+        return 1;
+    }
+
+    state_free();
+    print_msg("OK");
+    return 0;
+}
