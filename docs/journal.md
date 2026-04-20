@@ -1,8 +1,8 @@
 # B++ Bootstrap Journal
 
-## 2026-04-20 — Phase 3.4 first half: Waves 1-6 of chip_primitives migration
+## 2026-04-20 — Phase 3.4 first half: Waves 1-7 of chip_primitives migration
 
-Six waves shipped, all byte-identical against the jedi handoff
+Seven waves shipped, all byte-identical against the jedi handoff
 hashes (pathfind 50caa64b, rhythm 3d4f424b, bang9 7a76c3b8). The
 Forth-style portable spine + per-chip `_primitives.bsm` pattern
 is fully bootstrapped — every commit kept the suite of three
@@ -11,6 +11,7 @@ canary programs hash-stable.
 **Commits (newest first)**
 
 ```
+80e3355 Wave 7  — T_IF / T_WHILE / T_TERNARY / T_RET / T_BREAK / T_CONTINUE (8 primitives)
 0de1d29 Wave 6  — T_BINOP comparisons (cmp_int / cmp_flt with portable cond_id)
 e388d07 Wave 5  — T_BINOP arith + bitwise + shift (14 primitives)
 70f3a45 Wave 4  — T_UNARY ~ / int -- / float --
@@ -19,6 +20,18 @@ d4b4b17 Wave 3  — T_VAR local + global
 b7495f3 Wave 1  — nd == 0 dispatch
 698fc61 Foundation — Phases 1-3.3 baseline (jedi pit stop)
 ```
+
+**Wave 7 highlight: first real chip-code shrink**
+
+Net **−198 LOC** in chip codegens (vs. previous waves which
+were near-flat because each `enc_X` → `call(p.X, ...)`
+substitution was 1:1 in line count). Wave 7's control-flow
+cases were dense `if (a64_bin_mode) { enc_*_label(...); } else
+{ out("..."); a64_print_dec(lbl); ... }` blocks — collapsing
+each into a `call(p.emit_jump, lbl)` reclaims the bin/asm
+duplication. The same shrink pattern will repeat at Waves
+9 (T_CALL) + 12 (emit_stmt) + 13-19 (emit_func), where
+inline branches dominate.
 
 **Chip_primitives table state**
 
@@ -39,9 +52,12 @@ memory      emit_load_local  emit_load_global  emit_load_str_addr
 float-extra emit_fneg
 ```
 
-23 of 49 slots in use. Waves 7-12 will fill emit_jump,
-emit_label, emit_branch_*, emit_load, emit_store, emit_call,
-emit_push/pop, plus the metadata slots arg_reg / return_reg etc.
+23 of 49 slots in use after Wave 6; Wave 7 added 8 more
+(emit_new_label, emit_label, emit_jump, emit_branch_if_zero,
+emit_fcond_to_int_truth, emit_promote/demote, emit_jump_to_epilogue).
+Total wired: 31 of 56 slots. Waves 8-12 will fill emit_load /
+store, emit_call + ABI metadata (arg_reg, return_reg, etc.),
+emit_push/pop, plus T_ASSIGN dispatch.
 
 **Init-order bug found and fixed (Wave 2 surface)**
 
@@ -106,12 +122,11 @@ Wave 12 when `emit_node` itself becomes a thin tail-call to
 
 **Open for next session**
 
-Waves 7-12 in order:
+Waves 8-12 in order:
 
 ```
-Wave 7   T_IF / T_WHILE / T_TERNARY / T_RET  (label management)
-Wave 8   T_MEMLD / T_MEMST / T_ADDR
-Wave 9   T_CALL  (HARD — ABI divergence; budget 2-3 h)
+Wave 8   T_MEMLD / T_MEMST / T_ADDR    (sub-word + bit-packed dispatch — needs chip-side helper extraction first)
+Wave 9   T_CALL                        (HARD — ABI divergence; budget 2-3 h)
 Wave 10  T_ASSIGN
 Wave 11  T_SUBSCRIPT / T_FIELD
 Wave 12  emit_stmt migration
@@ -119,22 +134,31 @@ Wave 12  emit_stmt migration
 
 Then Waves 13-19 for emit_func + epilogues. Then Phase 4 dedup,
 Phase 5 RISC-V validation, Phase 6 install.sh chameleon. The
-chip_primitives infrastructure is fully proven by Wave 6 — the
-remaining waves have no architectural risk, only volume.
+chip_primitives infrastructure is fully proven by Wave 7 (the
+control-flow primitives went green on first try) — remaining
+waves have no architectural risk, only volume.
+
+**Why stop at Wave 7 today**: Wave 8 cases (T_MEMLD bit-packed
+fields, T_MEMST struct copies, T_ADDR global addressing) carry
+4-way dispatch matrices INLINE that need chip-side helper
+extraction before they can be wrapped as primitives. That's
+the same pre-work the doc's own pitfall #5 implies for the
+remaining cases. Mid-session attempt at Wave 8 with diminishing
+context risks introducing a byte-identity break that forces a
+rollback. Better to ship 7 clean than 8.5 with a bug.
 
 End-of-session canary hashes (use as next-session baseline):
 
 ```
-bpp        2035655bea7bc9e163c68f742a9963492d89f473
+bpp        regenerated each wave — re-bootstrap from src first
 pathfind   50caa64bfa7f4476d0780c5857304db66176d852
 rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009
 bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
 ```
 
-Note: `bpp` hash drifts each wave (the bootstrap binary
-embeds the new spine + primitives), but the three canaries —
-the actual byte-identity contract — are pinned to the original
-handoff values.
+The three canaries — the actual byte-identity contract — are
+pinned to the original handoff values. Any future wave that
+breaks one of these three hashes must roll back.
 
 ## 2026-03-18 — Stage 2 Complete: Self-Hosting Parser
 

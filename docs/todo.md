@@ -58,7 +58,7 @@ about the language it was written in.
 
 ### Shipped 2026-04-20 (afternoon) — Phase 3.4 first half
 
-Six waves of `chip_primitives` migration, all byte-identical
+Seven waves of `chip_primitives` migration, all byte-identical
 against the jedi handoff canaries. Full write-up in
 `docs/journal.md`.
 
@@ -72,11 +72,15 @@ against the jedi handoff canaries. Full write-up in
 - ✅ Wave 4 — `T_UNARY` ~ / int negate / float negate
 - ✅ Wave 5 — `T_BINOP` arith + bitwise + shift (14 primitives)
 - ✅ Wave 6 — `T_BINOP` comparisons (portable cond_id mapping)
+- ✅ Wave 7 — `T_IF / T_WHILE / T_TERNARY / T_RET / T_BREAK / T_CONTINUE`
+  (8 control-flow primitives — first wave with real chip-code
+  shrink, **−198 LOC net**)
 
-**Phase 3.4 — pending Waves 7-12 (next session)**
+**Phase 3.4 — pending Waves 8-12 (next session)**
 
-- Wave 7   `T_IF` / `T_WHILE` / `T_TERNARY` / `T_RET` — label management
-- Wave 8   `T_MEMLD` / `T_MEMST` / `T_ADDR`
+- Wave 8   `T_MEMLD` / `T_MEMST` / `T_ADDR` — needs chip-side
+  helper extraction first (bit-packed + sub-word dispatch
+  matrix is inline today)
 - Wave 9   `T_CALL` — ABI divergence, budget 2-3 h, may need 9b split
 - Wave 10  `T_ASSIGN`
 - Wave 11  `T_SUBSCRIPT` / `T_FIELD`
