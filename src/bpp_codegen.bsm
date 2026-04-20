@@ -89,6 +89,111 @@ static bpp_codegen_version() : base {
     return 0;
 }
 
+// ── Phase 3.4: chip_primitives fn_ptr dispatch table ─────────
+//
+// Every chip implements the 45-slot primitives contract. The
+// portable spine in this file calls into the active chip via
+// `call(cg_prim.<slot>, ...)`. Init for each chip
+// (`init_codegen_arm64()` / `init_codegen_x86_64()`) populates
+// the slots with `fn_ptr(_<chip>_emit_<name>)` after allocating
+// the struct on first call.
+//
+// All 45 slots are declared up front so the layout is stable
+// across the wave migration. A wave that hasn't migrated a case
+// yet leaves its slot at zero (valid in the struct — the chip's
+// inline emission still runs for that case, so the slot is never
+// read until the spine takes over).
+//
+// Categories (per docs/phase_3_4_chip_primitives.md §contract):
+//   Arithmetic (8), Logical (6), Move/compare (5), Memory (5),
+//   Control flow (7), Stack/ABI (6), Syscall (1), Float (2),
+//   Register-file metadata (5).
+
+struct ChipPrimitives {
+    // ── Arithmetic (8) ──
+    emit_add,           // (rd, rs1, rs2, size)
+    emit_sub,           // (rd, rs1, rs2, size)
+    emit_mul,           // (rd, rs1, rs2, size)
+    emit_div,           // (rd, rs1, rs2, size)
+    emit_mod,           // (rd, rs1, rs2, size)
+    emit_neg,           // (rd, rs, size)
+    emit_fadd,          // (rd, rs1, rs2)        double
+    emit_fsub,          // (rd, rs1, rs2)        double
+
+    // ── Logical (6) ──
+    emit_and,           // (rd, rs1, rs2)
+    emit_or,            // (rd, rs1, rs2)
+    emit_xor,           // (rd, rs1, rs2)
+    emit_shl,           // (rd, rs1, rs2)
+    emit_shr,           // (rd, rs1, rs2)        arithmetic shift
+    emit_not,           // (rd, rs)
+
+    // ── Move / compare (5) ──
+    emit_mov_zero,      // ()                    result reg ← 0
+    emit_mov_imm,       // (imm)                 result reg ← imm
+    emit_mov_reg,       // (rd, rs)
+    emit_cmp,           // (rs1, rs2, size)      flags-setting
+    emit_cmp_imm,       // (rs, imm, size)
+
+    // ── Memory (5) ──
+    emit_load,          // (rd, rbase, off, size, signed)
+    emit_store,         // (rsrc, rbase, off, size)
+    emit_load_global,   // (name_p, is_float)
+    emit_store_global,  // (name_p, is_float)
+    emit_load_str_addr, // (str_id)
+
+    // ── Control flow (7) ──
+    emit_branch_eq,     // (label_id)
+    emit_branch_ne,     // (label_id)
+    emit_branch_lt,     // (label_id)
+    emit_branch_ge,     // (label_id)
+    emit_jump,          // (label_id)
+    emit_label,         // (label_id)
+    emit_call,          // (target_label)
+
+    // ── Stack / ABI (6) ──
+    emit_push,          // (reg)                 GP push
+    emit_pop,           // (reg)                 GP pop
+    emit_fpush,         // (reg)                 FP push
+    emit_fpop,          // (reg)                 FP pop
+    emit_frame_setup,   // (frame_size)
+    emit_frame_teardown,// (frame_size)
+
+    // ── Syscall (1) ──
+    emit_syscall,       // (num_args)            chip's ABI
+
+    // ── Float (2) ──
+    emit_load_float_const, // (flt_id)           load const → d0
+    emit_fcmp,             // (rs1, rs2)         double compare
+
+    // ── Register file metadata (5) ──
+    arg_reg,            // (i) → reg index
+    farg_reg,           // (i) → fp reg index
+    return_reg,         // ()  → reg index
+    freturn_reg,        // ()  → fp reg index
+    word_size,          // ()  → 4 or 8
+}
+
+// Active chip's primitive table. Allocated lazily on first call
+// to `init_codegen_arm64()` or `init_codegen_x86_64()`. Read by
+// the spine via `auto p: ChipPrimitives; p = cg_prim;
+// call(p.emit_X, ...)`.
+//
+// Cross-compile note: when both inits run in the same compiler
+// process (host targets one chip, then the other), the second
+// init overwrites the first chip's slots. That's by design — the
+// active target is whatever was initialised last, and bpp.bpp
+// orders the inits to match the requested target triple.
+auto cg_prim;
+
+// Allocate cg_prim if it hasn't been yet. Idempotent — both
+// init_codegen_<chip>() functions guard their own population
+// behind this so the malloc happens exactly once per process.
+cg_prim_alloc() {
+    if (cg_prim != 0) { return; }
+    cg_prim = malloc(sizeof(ChipPrimitives));
+}
+
 // ── Phase 1: shared globals ────────────────────────────────
 //
 // These replace per-chip duplicates. Each chip codegen imports
