@@ -72,6 +72,7 @@ auto x64_fn_lbl, x64_ret_lbl;
 void cg_install_x86_64_primitives() {
     auto p: ChipPrimitives;
     cg_prim_alloc();
+    cg_init_cc();
     p = cg_prim;
     p.emit_mov_zero         = fn_ptr(_x64_emit_mov_zero);
     p.emit_mov_imm          = fn_ptr(_x64_emit_mov_imm);
@@ -96,6 +97,8 @@ void cg_install_x86_64_primitives() {
     p.emit_fsub             = fn_ptr(_x64_emit_fsub);
     p.emit_fmul             = fn_ptr(_x64_emit_fmul);
     p.emit_fdiv             = fn_ptr(_x64_emit_fdiv);
+    p.emit_cmp_int          = fn_ptr(_x64_emit_cmp_int);
+    p.emit_cmp_flt          = fn_ptr(_x64_emit_cmp_flt);
 }
 
 void init_codegen_x86_64() {
@@ -606,17 +609,16 @@ static x64_emit_node(nd) {
             if (c0 == '*' && op_l == 1) { call(pp.emit_fmul); return 1; }
             if (c0 == '/' && op_l == 1) { call(pp.emit_fdiv); return 1; }
 
-            // Float comparisons — result is integer in RAX.
-            // UCOMISD XMM1, XMM0 compares left vs right.
-            if (c0 == '=' && c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; }
-            if (c0 == '!' && c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; }
+            // Float comparisons (Phase 3.4 Wave 6).
+            if (c0 == '=' && c1 == '=') { call(pp.emit_cmp_flt, CG_CC_EQ); return 0; }
+            if (c0 == '!' && c1 == '=') { call(pp.emit_cmp_flt, CG_CC_NE); return 0; }
             if (c0 == '<') {
-                if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_BE, 0); x64_enc_movzx8(0, 0); return 0; }
-                if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_B, 0); x64_enc_movzx8(0, 0); return 0; }
+                if (c1 == '=') { call(pp.emit_cmp_flt, CG_CC_LE); return 0; }
+                if (op_l == 1) { call(pp.emit_cmp_flt, CG_CC_LT); return 0; }
             }
             if (c0 == '>') {
-                if (c1 == '=') { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_AE, 0); x64_enc_movzx8(0, 0); return 0; }
-                if (op_l == 1) { x64_enc_ucomisd(1, 0); x64_enc_setcc(CC_A, 0); x64_enc_movzx8(0, 0); return 0; }
+                if (c1 == '=') { call(pp.emit_cmp_flt, CG_CC_GE); return 0; }
+                if (op_l == 1) { call(pp.emit_cmp_flt, CG_CC_GT); return 0; }
             }
 
             // && and || removed from T_BINOP — parser lowers them to
@@ -654,16 +656,16 @@ static x64_emit_node(nd) {
         if (c0 == '>' && c1 == '>') { call(pp.emit_shr, 1); return 0; }
         if (c0 == '<' && c1 == '<') { call(pp.emit_shl, 1); return 0; }
 
-        // Comparison operators: CMP RAX, RCX then SETcc.
-        if (c0 == '=' && c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_E, 0); x64_enc_movzx8(0, 0); return 0; }
-        if (c0 == '!' && c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_NE, 0); x64_enc_movzx8(0, 0); return 0; }
+        // Integer comparisons (Phase 3.4 Wave 6).
+        if (c0 == '=' && c1 == '=') { call(pp.emit_cmp_int, CG_CC_EQ, 1); return 0; }
+        if (c0 == '!' && c1 == '=') { call(pp.emit_cmp_int, CG_CC_NE, 1); return 0; }
         if (c0 == '<') {
-            if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_LE, 0); x64_enc_movzx8(0, 0); return 0; }
-            if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_L, 0); x64_enc_movzx8(0, 0); return 0; }
+            if (c1 == '=') { call(pp.emit_cmp_int, CG_CC_LE, 1); return 0; }
+            if (op_l == 1) { call(pp.emit_cmp_int, CG_CC_LT, 1); return 0; }
         }
         if (c0 == '>') {
-            if (c1 == '=') { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_GE, 0); x64_enc_movzx8(0, 0); return 0; }
-            if (op_l == 1) { x64_enc_cmp_reg(0, 1); x64_enc_setcc(CC_G, 0); x64_enc_movzx8(0, 0); return 0; }
+            if (c1 == '=') { call(pp.emit_cmp_int, CG_CC_GE, 1); return 0; }
+            if (op_l == 1) { call(pp.emit_cmp_int, CG_CC_GT, 1); return 0; }
         }
 
         // && and || removed from T_BINOP — parser lowers them to T_TERNARY

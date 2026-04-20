@@ -94,6 +94,7 @@ static auto a64_simd_free_mask;
 void cg_install_arm64_primitives() {
     auto p: ChipPrimitives;
     cg_prim_alloc();
+    cg_init_cc();
     p = cg_prim;
     p.emit_mov_zero         = fn_ptr(_a64_emit_mov_zero);
     p.emit_mov_imm          = fn_ptr(_a64_emit_mov_imm);
@@ -118,6 +119,8 @@ void cg_install_arm64_primitives() {
     p.emit_fsub             = fn_ptr(_a64_emit_fsub);
     p.emit_fmul             = fn_ptr(_a64_emit_fmul);
     p.emit_fdiv             = fn_ptr(_a64_emit_fdiv);
+    p.emit_cmp_int          = fn_ptr(_a64_emit_cmp_int);
+    p.emit_cmp_flt          = fn_ptr(_a64_emit_cmp_flt);
 }
 
 void init_codegen_arm64() {
@@ -904,16 +907,16 @@ static a64_emit_node(nd) {
             if (c0 == '*' && op_l == 1) { call(pp.emit_fmul); return 1; }
             if (c0 == '/' && op_l == 1) { call(pp.emit_fdiv); return 1; }
 
-            // Float comparison operators — result is integer in x0.
-            if (c0 == '=' && c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,0); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; }
-            if (c0 == '!' && c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,1); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; }
+            // Float comparison operators (Phase 3.4 Wave 6).
+            if (c0 == '=' && c1 == '=') { call(pp.emit_cmp_flt, CG_CC_EQ); return 0; }
+            if (c0 == '!' && c1 == '=') { call(pp.emit_cmp_flt, CG_CC_NE); return 0; }
             if (c0 == '<') {
-                if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,9); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ls"); putchar('\n'); } return 0; }
-                if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,4); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, mi"); putchar('\n'); } return 0; }
+                if (c1 == '=') { call(pp.emit_cmp_flt, CG_CC_LE); return 0; }
+                if (op_l == 1) { call(pp.emit_cmp_flt, CG_CC_LT); return 0; }
             }
             if (c0 == '>') {
-                if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,10); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
-                if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,12); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
+                if (c1 == '=') { call(pp.emit_cmp_flt, CG_CC_GE); return 0; }
+                if (op_l == 1) { call(pp.emit_cmp_flt, CG_CC_GT); return 0; }
             }
             // && and || removed from T_BINOP — parser now lowers them to
             // T_TERNARY which carries the short-circuit contract directly.
@@ -955,16 +958,16 @@ static a64_emit_node(nd) {
         // Shift operators.
         if (c0 == '>' && c1 == '>') { call(pp.emit_shr, left_reg_int); return 0; }
         if (c0 == '<' && c1 == '<') { call(pp.emit_shl, left_reg_int); return 0; }
-        // Comparison operators.
-        if (c0 == '=' && c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,0); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; }
-        if (c0 == '!' && c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,1); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; }
+        // Integer comparisons (Phase 3.4 Wave 6).
+        if (c0 == '=' && c1 == '=') { call(pp.emit_cmp_int, CG_CC_EQ, left_reg_int); return 0; }
+        if (c0 == '!' && c1 == '=') { call(pp.emit_cmp_int, CG_CC_NE, left_reg_int); return 0; }
         if (c0 == '<') {
-            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,13); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); } return 0; }
-            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,11); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); } return 0; }
+            if (c1 == '=') { call(pp.emit_cmp_int, CG_CC_LE, left_reg_int); return 0; }
+            if (op_l == 1) { call(pp.emit_cmp_int, CG_CC_LT, left_reg_int); return 0; }
         }
         if (c0 == '>') {
-            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,10); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
-            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(left_reg_int,0); enc_cset(0,12); } else { out("  cmp x"); a64_print_dec(left_reg_int); out(", x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
+            if (c1 == '=') { call(pp.emit_cmp_int, CG_CC_GE, left_reg_int); return 0; }
+            if (op_l == 1) { call(pp.emit_cmp_int, CG_CC_GT, left_reg_int); return 0; }
         }
         // && and || removed from T_BINOP integer path — parser lowers them
         // to T_TERNARY (see parse_binops in bpp_parser.bsm).
