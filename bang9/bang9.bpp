@@ -1,0 +1,171 @@
+// bang9.bpp — Bang 9 IDE entry point.
+//
+// Bang 9 is BangDev's proprietary IDE for B++, inspired by the
+// minimalist tradition of Plan 9 (acme, sam, rio). Target audience
+// is artists and designers working on B++ games — programmers
+// hardcore stay in their own editors and use bpp directly.
+//
+// Structure of this file is deliberately thin: main() just wires
+// the pieces together. Window chrome lives in shell.bsm. Panel
+// content and dispatch live in panels.bsm. Each tool panel (when
+// implemented) lives in its own .bsm within this folder.
+//
+// Build:
+//   bpp bang_nine/bang9.bpp -o bang_nine/build/bang9
+// Run (with optional project path):
+//   ./bang_nine/build/bang9
+//   ./bang_nine/build/bang9 path/to/project
+
+import "stbgame.bsm";
+import "stbui.bsm";
+import "stbpath.bsm";
+import "stbwindow.bsm";
+
+import "shell.bsm";
+import "panels.bsm";
+import "runner.bsm";
+import "editor.bsm";
+
+// ── Global state ────────────────────────────────────────────
+
+// Project root directory. Every panel resolves its work relative
+// to this. Defaults to "." when no argv passed.
+extrn g_proj_root;
+
+// Index of the currently visible tab in the tab strip. 0 = Project,
+// 1 = Sprites, 2 = Code, 3 = Run. Panels dispatch off this.
+extrn g_active_tab;
+
+// Tab labels and how many exist. Declared here so both shell (which
+// renders the strip) and panels (which dispatches on active_tab)
+// see one source of truth.
+extrn g_tab_names;
+extrn g_tab_count;
+
+// Initial window size. The user can drag-resize any time — we
+// read window_width() / window_height() every frame for the live
+// geometry and re-layout accordingly. 1024×768 is the startup
+// default; no part of the UI hardcodes it after init.
+const BANG_INIT_W = 1024;
+const BANG_INIT_H = 768;
+
+// Heights of the three fixed chrome bars at top and bottom. The
+// panel area is whatever's left in between.
+const MENUBAR_H  = 28;
+const TABSTRIP_H = 32;
+const STATUSBAR_H = 24;
+
+main(argc, argv) {
+    if (argc >= 2) { g_proj_root = argv[1]; }
+    else           { g_proj_root = "."; }
+
+    // Tab labels — one slot per visible tab in the top strip.
+    g_tab_count = 4;
+    g_tab_names = malloc(g_tab_count * 8);
+    *(g_tab_names + 0 * 8) = "Project";
+    *(g_tab_names + 1 * 8) = "Sprites";
+    *(g_tab_names + 2 * 8) = "Code";
+    *(g_tab_names + 3 * 8) = "Run";
+
+    g_active_tab = 0;
+
+    // Boot the window. game_init brings in the UI theme, input
+    // handlers, font, and compositor. Bang 9 is just another B++
+    // program as far as stbgame is concerned.
+    game_init(BANG_INIT_W, BANG_INIT_H, "Bang 9", 60);
+    runner_init();
+
+    // ── Acme-style palette ──
+    //
+    // Bang 9's visual language pays homage to Plan 9 / acme. Pale
+    // yellow body, light cyan "tag" bars for chrome, black text,
+    // saturated brown accents. Austere and recognizable at a glance
+    // to anyone who's seen acme. Overrides the default stbui theme
+    // in place (pointer stays the same, struct fields get poked).
+    _theme.bg              = rgba(255, 255, 234, 255);   // #FFFFEA body
+    _theme.surface         = rgba(234, 255, 255, 255);   // #EAFFFF tag / chrome
+    _theme.surface_alt     = rgba(220, 240, 240, 255);   // hover tag
+    _theme.surface_dim     = rgba(246, 246, 222, 255);   // subtle fill
+    _theme.surface_pressed = rgba(255, 255, 128, 255);   // acme yellow select
+    _theme.accent          = rgba(140,  70,  30, 255);   // dark brown accent
+    _theme.accent_hover    = rgba(180, 100,  50, 255);
+    _theme.border          = rgba(120, 120, 100, 255);
+    _theme.border_strong   = rgba( 60,  60,  50, 255);
+    _theme.border_focus    = rgba(140,  70,  30, 255);
+    _theme.text            = rgba( 20,  20,  15, 255);   // near-black
+    _theme.text_muted      = rgba( 80,  80,  65, 255);
+    _theme.text_on_accent  = rgba(255, 255, 234, 255);
+    _theme.button_bg       = rgba(234, 255, 255, 255);
+    _theme.button_hover_bg = rgba(220, 240, 240, 255);
+    _theme.shadow_intensity = 0;   // acme doesn't use drop shadows
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+
+        // React to user-driven window resize. The platform polled
+        // the new size during _stb_poll_events; here we pick it up,
+        // reallocate the framebuffer to match so the UI stays
+        // crisp at any size, and then every panel call below uses
+        // live dimensions for layout. If we skipped the fb resize
+        // the NSImageView's autoresize would stretch the old
+        // framebuffer to the new window size — functional but
+        // blurry, which is the fallback for apps that don't opt
+        // into responsive layout.
+        if (window_resized() != 0) {
+            window_fb_resize();
+        }
+
+        auto win_w, win_h;
+        win_w = window_width();
+        win_h = window_height();
+
+        clear(_theme.bg);
+
+        // ── Global hotkeys ──
+        // F2 — save current file in Code panel (pre-stbaction era
+        //   without proper Ctrl+S modifier support).
+        // F7 — build the project: runs `./bpp <entry> -o <out>`
+        //   in a subprocess, captures stdout+stderr to a log file,
+        //   switches to Run tab.
+        // F8 — build then run (if build succeeded).
+        if (key_pressed(KEY_F2) != 0) {
+            if (editor_has_file() != 0) { editor_save(); }
+        }
+        if (key_pressed(KEY_F7) != 0) {
+            runner_build(g_proj_root);
+            g_active_tab = 3;   // switch to Run tab to see output
+        }
+        if (key_pressed(KEY_F8) != 0) {
+            auto rc;
+            rc = runner_build(g_proj_root);
+            g_active_tab = 3;
+            if (rc == 0) { runner_run(g_proj_root); }
+        }
+
+        // Menu-bar "Build" click — mirrors F7. Drained each frame
+        // so a single click fires exactly once even if the user
+        // holds the button down longer than one frame.
+        if (shell_take_build_request() != 0) {
+            runner_build(g_proj_root);
+            g_active_tab = 3;
+        }
+
+        // Top-to-bottom layout: menubar, tab strip, panel body,
+        // status bar. Each section knows its own height; the width
+        // and the panel body height flex with the live window.
+        shell_draw_menubar(0, 0, win_w, MENUBAR_H);
+        shell_draw_tabs(0, MENUBAR_H, win_w, TABSTRIP_H);
+
+        auto panel_y, panel_h;
+        panel_y = MENUBAR_H + TABSTRIP_H;
+        panel_h = win_h - panel_y - STATUSBAR_H;
+        panels_draw(0, panel_y, win_w, panel_h);
+
+        shell_draw_statusbar(0, win_h - STATUSBAR_H, win_w, STATUSBAR_H);
+
+        draw_end();
+    }
+
+    game_end();
+    return 0;
+}

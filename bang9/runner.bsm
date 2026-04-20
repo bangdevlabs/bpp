@@ -1,0 +1,258 @@
+// runner.bsm — Build/Run integration for Bang 9.
+//
+// Shells out to `bpp` as a child process to compile the open
+// project. Output is redirected via /bin/sh -c "... > log 2>&1" to
+// a temp file because B++ doesn't yet expose sys_pipe / sys_dup2
+// (adding them would need a compiler change; deferred).
+//
+// After the build completes, we read the log file back and cache
+// it so the Run panel can render it. Exit status is preserved.
+//
+// The Run button fires a SECOND subprocess — this one is the
+// actual game binary, fork+exec'd but NOT waited on. Bang 9
+// continues its own event loop while the game runs in its own
+// window in parallel.
+//
+// Convention for MVP: project root contains `<basename>/<basename>.bpp`
+// OR `<basename>.bpp` at the top level. For `games/pathfind`, that
+// means entry = `games/pathfind/pathfind.bpp`, binary goes to
+// `games/pathfind/build/pathfind`. When `bang.json` lands later
+// it'll override this via explicit entry/output fields.
+//
+// Public API:
+//   runner_build(proj_root) : io  — returns exit code (0 = success)
+//   runner_run(proj_root)   : io  — returns child pid, or 0 on fail
+//   runner_log()            : base — returns log buffer ptr (0-terminated)
+//   runner_log_len()        : base
+//   runner_last_status()    : base — 0 = never built, >0 = exit code
+//   runner_clear_log()             — releases + zeroes log state
+
+// Path to the tempfile used for stdout/stderr capture. Same for
+// build and run logs for simplicity — run output overwrites build
+// output. A real IDE would separate them into distinct files.
+static extrn _RUNNER_LOG;
+
+// Cached log content (read from the tempfile after waitpid).
+static extrn _runner_log_buf;
+static extrn _runner_log_len;
+static extrn _runner_last_status;
+
+void runner_init() {
+    _RUNNER_LOG = "/tmp/bang9_runner.log";
+    _runner_log_buf = 0;
+    _runner_log_len = 0;
+    _runner_last_status = 0 - 1;   // "never ran"
+}
+
+// Derive the entry .bpp file for a project root. Convention:
+// last path segment + ".bpp" → "games/pathfind" → "pathfind.bpp",
+// joined as "games/pathfind/pathfind.bpp".
+//
+// Note: B++ doesn't support `for (auto j = 0; ...)` with the
+// declaration inline — we declare j at function scope and reuse
+// it across every for loop. Inlining the decl silently produces
+// broken codegen (we learned the hard way: commands built with
+// truncated arguments).
+static _runner_entry_path(proj_root, out_cap) {
+    auto out, plen, i, j, last_slash, base, blen;
+    plen = str_len(proj_root);
+    // Find last '/' so we know the basename.
+    last_slash = 0 - 1;
+    for (i = 0; i < plen; i = i + 1) {
+        if (peek(proj_root + i) == 47) { last_slash = i; }
+    }
+    base = proj_root + last_slash + 1;
+    blen = plen - last_slash - 1;
+
+    out = malloc(out_cap);
+    i = 0;
+    while (i < plen) { poke(out + i, peek(proj_root + i)); i = i + 1; }
+    poke(out + i, 47); i = i + 1;                          // '/'
+    for (j = 0; j < blen; j = j + 1) {
+        poke(out + i, peek(base + j)); i = i + 1;
+    }
+    // ".bpp"
+    poke(out + i, 46);     i = i + 1;  // '.'
+    poke(out + i, 98);     i = i + 1;  // 'b'
+    poke(out + i, 112);    i = i + 1;  // 'p'
+    poke(out + i, 112);    i = i + 1;  // 'p'
+    poke(out + i, 0);
+    return out;
+}
+
+// Derive the output binary path: "<proj_root>/build/<basename>".
+static _runner_output_path(proj_root, out_cap) {
+    auto out, plen, i, j, last_slash, base, blen;
+    plen = str_len(proj_root);
+    last_slash = 0 - 1;
+    for (i = 0; i < plen; i = i + 1) {
+        if (peek(proj_root + i) == 47) { last_slash = i; }
+    }
+    base = proj_root + last_slash + 1;
+    blen = plen - last_slash - 1;
+
+    out = malloc(out_cap);
+    i = 0;
+    while (i < plen) { poke(out + i, peek(proj_root + i)); i = i + 1; }
+    poke(out + i, 47);     i = i + 1;  // '/'
+    poke(out + i, 98);     i = i + 1;  // 'b'
+    poke(out + i, 117);    i = i + 1;  // 'u'
+    poke(out + i, 105);    i = i + 1;  // 'i'
+    poke(out + i, 108);    i = i + 1;  // 'l'
+    poke(out + i, 100);    i = i + 1;  // 'd'
+    poke(out + i, 47);     i = i + 1;  // '/'
+    for (j = 0; j < blen; j = j + 1) {
+        poke(out + i, peek(base + j)); i = i + 1;
+    }
+    poke(out + i, 0);
+    return out;
+}
+
+// Load the log tempfile into _runner_log_buf. Called after every
+// build so the Run panel sees the latest output.
+static void _runner_reload_log() : io {
+    auto buf, size_box;
+    if (_runner_log_buf != 0) {
+        free(_runner_log_buf);
+        _runner_log_buf = 0;
+        _runner_log_len = 0;
+    }
+    size_box = malloc(8);
+    *(size_box) = 0;
+    buf = file_read_all(_RUNNER_LOG, size_box);
+    if (buf != 0) {
+        _runner_log_buf = buf;
+        _runner_log_len = *(size_box);
+    }
+    free(size_box);
+}
+
+// Shell-escape-free command builder. Produces
+//   "./bpp <entry> -o <output> > <log> 2>&1"
+// into a heap buffer. Caller frees.
+static _runner_build_cmd(entry, output, log) {
+    auto buf, cap, i, j;
+    auto elen, olen, llen;
+    elen = str_len(entry);
+    olen = str_len(output);
+    llen = str_len(log);
+
+    cap = elen + olen + llen + 64;
+    buf = malloc(cap);
+    i = 0;
+    // "./bpp " prefix
+    poke(buf + i, 46);  i = i + 1;  // '.'
+    poke(buf + i, 47);  i = i + 1;  // '/'
+    poke(buf + i, 98);  i = i + 1;  // 'b'
+    poke(buf + i, 112); i = i + 1;  // 'p'
+    poke(buf + i, 112); i = i + 1;  // 'p'
+    poke(buf + i, 32);  i = i + 1;  // ' '
+    // entry
+    for (j = 0; j < elen; j = j + 1) {
+        poke(buf + i, peek(entry + j)); i = i + 1;
+    }
+    // " -o "
+    poke(buf + i, 32);  i = i + 1;
+    poke(buf + i, 45);  i = i + 1;  // '-'
+    poke(buf + i, 111); i = i + 1;  // 'o'
+    poke(buf + i, 32);  i = i + 1;
+    // output
+    for (j = 0; j < olen; j = j + 1) {
+        poke(buf + i, peek(output + j)); i = i + 1;
+    }
+    // " > "
+    poke(buf + i, 32);  i = i + 1;
+    poke(buf + i, 62);  i = i + 1;  // '>'
+    poke(buf + i, 32);  i = i + 1;
+    // log
+    for (j = 0; j < llen; j = j + 1) {
+        poke(buf + i, peek(log + j)); i = i + 1;
+    }
+    // " 2>&1"
+    poke(buf + i, 32);  i = i + 1;
+    poke(buf + i, 50);  i = i + 1;  // '2'
+    poke(buf + i, 62);  i = i + 1;  // '>'
+    poke(buf + i, 38);  i = i + 1;  // '&'
+    poke(buf + i, 49);  i = i + 1;  // '1'
+    poke(buf + i, 0);
+    return buf;
+}
+
+// Build the project. Returns the exit status of `bpp`.
+runner_build(proj_root) {
+    auto entry, output, cmd, pid, argv, status;
+
+    entry = _runner_entry_path(proj_root, 512);
+    output = _runner_output_path(proj_root, 512);
+    cmd = _runner_build_cmd(entry, output, _RUNNER_LOG);
+
+    // argv for /bin/sh -c "<cmd>": 4 entries (/bin/sh, -c, cmd, 0).
+    argv = malloc(4 * 8);
+    *(argv + 0 * 8) = "/bin/sh";
+    *(argv + 1 * 8) = "-c";
+    *(argv + 2 * 8) = cmd;
+    *(argv + 3 * 8) = 0;
+
+    pid = sys_fork();
+    if (pid == 0) {
+        // Child: exec /bin/sh. If execve returns, it failed — exit
+        // with a sentinel code so the parent knows something went
+        // wrong.
+        sys_execve("/bin/sh", argv, 0);
+        sys_exit(127);
+    }
+    status = sys_waitpid(pid);
+
+    free(argv);
+    free(cmd);
+    free(entry);
+    free(output);
+
+    _runner_reload_log();
+    _runner_last_status = status;
+    return status;
+}
+
+// Run the already-built binary. Does NOT wait — game runs in
+// parallel. Returns the child pid, or 0 if fork failed.
+runner_run(proj_root) {
+    auto output, pid, argv;
+
+    output = _runner_output_path(proj_root, 512);
+
+    argv = malloc(2 * 8);
+    *(argv + 0 * 8) = output;
+    *(argv + 1 * 8) = 0;
+
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_execve(output, argv, 0);
+        sys_exit(127);
+    }
+
+    free(argv);
+    // Keep output alive (caller doesn't free — simpler for now).
+    // Real implementation would track children and reap them.
+    return pid;
+}
+
+runner_log() : base {
+    return _runner_log_buf;
+}
+
+runner_log_len() : base {
+    return _runner_log_len;
+}
+
+runner_last_status() : base {
+    return _runner_last_status;
+}
+
+void runner_clear_log() {
+    if (_runner_log_buf != 0) {
+        free(_runner_log_buf);
+        _runner_log_buf = 0;
+    }
+    _runner_log_len = 0;
+    _runner_last_status = 0 - 1;
+}

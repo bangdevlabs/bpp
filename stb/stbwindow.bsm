@@ -73,3 +73,74 @@ window_confirm(title, message) : io {
 void window_error(title, message) : io {
     _stb_alert_error(title, message);
 }
+
+// ── Live window geometry ────────────────────────────────────
+//
+// Apps that want to react to user-driven window resizes (IDEs,
+// level editors, anything with a laid-out UI) read the current
+// dimensions via window_width / window_height and check
+// window_resized() once per frame to know when to recompute
+// layout. The framebuffer size is a SEPARATE concern: if the app
+// wants crisp pixels at the new size (vs the platform layer's
+// default stretch-to-fit), it calls window_fb_resize() to
+// reallocate _stb_fb to match. Apps that don't care can ignore
+// the whole API — the platform keeps drawing the old framebuffer
+// stretched into the new window, matching the legacy behaviour.
+//
+// Platform contract (why the getters are trivial here):
+//   - Backends maintain _stb_win_w / _stb_win_h live globals each
+//     frame from whatever native mechanism they have (Cocoa KVC
+//     poll on macOS, X11 ConfigureNotify on Linux, etc.)
+//   - _stb_win_resize_flag latches on change, clears on read.
+//   - window_fb_resize delegates to _stb_fb_resize_to which each
+//     backend implements to free/realloc the framebuffer and
+//     update the NSImageView / XImage backing.
+//
+// No struct-returning Obj-C methods cross the B++ ABI, no C
+// shims — each backend exposes scalars only.
+
+extrn _stb_win_w, _stb_win_h, _stb_win_resize_flag;
+extrn _stb_w, _stb_h, _stb_fb;
+
+// Current window content width in pixels. Updated once per
+// _stb_poll_events call; reads cost a single memory load.
+window_width() : base {
+    return _stb_win_w;
+}
+
+// Current window content height in pixels. Same cadence as
+// window_width.
+window_height() : base {
+    return _stb_win_h;
+}
+
+// Edge-triggered resize notifier. Returns 1 if the window size
+// has changed since the last call, 0 otherwise. Always clears the
+// internal flag on read, so only ONE caller per frame should
+// consume it (typically the main loop — panels reading the flag
+// directly would race each other).
+window_resized() {
+    auto r;
+    r = _stb_win_resize_flag;
+    _stb_win_resize_flag = 0;
+    return r;
+}
+
+// Reallocate the shared framebuffer (_stb_fb, _stb_w, _stb_h) to
+// match the current window size. Call from the main loop after
+// window_resized() returns 1. The platform's presentation layer
+// (NSImageView on macOS, XPutImage on Linux) picks the new
+// dimensions up on the next _stb_present() automatically because
+// it reads _stb_w / _stb_h each frame.
+//
+// Contents of the old framebuffer are DISCARDED — callers expect
+// to redraw the whole frame after a resize anyway.
+void window_fb_resize() {
+    auto new_sz;
+    if (_stb_win_w <= 0 || _stb_win_h <= 0) { return; }
+    if (_stb_fb != 0) { free(_stb_fb); }
+    new_sz = _stb_win_w * _stb_win_h * 4;
+    _stb_fb = malloc(new_sz);
+    _stb_w = _stb_win_w;
+    _stb_h = _stb_win_h;
+}

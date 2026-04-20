@@ -1,0 +1,182 @@
+// dir.bsm — directory listing for Bang 9's Project panel.
+//
+// Implementation: shells out to /bin/ls because parsing macOS
+// dirent64 records directly from sys_getdents turned out flaky
+// (returned 0 entries even on valid directories on first try).
+// ls is everywhere on Unix, ships with the OS, and gives us
+// exactly one entry per line in a single pass. Trade-off is
+// one subprocess per refresh — negligible for UI-scale rates.
+//
+// Entry format on disk (one line per entry from `ls -1aF`):
+//   "file.txt"          → file
+//   "subdir/"           → directory (trailing slash thanks to -F)
+//   "link@"             → symlink
+//   "exec*"             → executable
+//
+// We parse the trailing char to determine type and strip it.
+//
+// Public API unchanged — dir_list / dir_count / dir_name /
+// dir_is_dir / dir_free. Existing callers (panels.bsm) don't
+// change.
+
+const DIR_TYPE_FILE   = 8;
+const DIR_TYPE_DIR    = 4;
+const DIR_TYPE_LINK   = 10;
+const DIR_TYPE_OTHER  = 0;
+
+const _DIR_CAP      = 1024;
+// (log path is inlined at use sites — const string literals don't
+// work reliably in B++ today)
+
+// Copy a null-terminated slice into a fresh malloc'd buffer.
+static _dir_strdup(src, len) {
+    auto buf, i;
+    buf = malloc(len + 1);
+    for (i = 0; i < len; i = i + 1) {
+        poke(buf + i, peek(src + i));
+    }
+    poke(buf + len, 0);
+    return buf;
+}
+
+// Build the shell command: `ls -1aF <path> > /tmp/bang9_dir.out 2>&1`
+static _dir_build_cmd(path) {
+    auto cmd, cap, i, plen;
+    plen = str_len(path);
+    cap = plen + 64;
+    cmd = malloc(cap);
+    i = 0;
+    auto prefix;
+    prefix = "ls -1aF ";
+    auto j;
+    for (j = 0; j < 8; j = j + 1) { poke(cmd + i, peek(prefix + j)); i = i + 1; }
+    for (j = 0; j < plen; j = j + 1) { poke(cmd + i, peek(path + j)); i = i + 1; }
+    auto suffix;
+    suffix = " > /tmp/bang9_dir.out 2>&1";
+    for (j = 0; j < 26; j = j + 1) { poke(cmd + i, peek(suffix + j)); i = i + 1; }
+    poke(cmd + i, 0);
+    return cmd;
+}
+
+// List a directory via shell subprocess. Returns DirList handle
+// (same format as the old sys_getdents impl) or 0 on failure.
+dir_list(path) {
+    auto cmd, argv, pid, status;
+    auto handle, count, names_base, types_base;
+    auto buf, size_box, blen;
+    auto i, line_start, name_len, last_ch, type_byte, name_dup;
+
+    cmd = _dir_build_cmd(path);
+    argv = malloc(4 * 8);
+    *(argv + 0 * 8) = "/bin/sh";
+    *(argv + 1 * 8) = "-c";
+    *(argv + 2 * 8) = cmd;
+    *(argv + 3 * 8) = 0;
+
+    pid = sys_fork();
+    if (pid == 0) {
+        sys_execve("/bin/sh", argv, 0);
+        sys_exit(127);
+    }
+    status = sys_waitpid(pid);
+
+    free(argv);
+    free(cmd);
+
+    size_box = malloc(8);
+    *(size_box) = 0;
+    buf = file_read_all("/tmp/bang9_dir.out", size_box);
+    if (buf == 0) {
+        free(size_box);
+        return 0;
+    }
+    blen = *(size_box);
+    free(size_box);
+
+    handle = malloc(8 + _DIR_CAP * 8 + _DIR_CAP);
+    count = 0;
+    names_base = handle + 8;
+    types_base = handle + 8 + _DIR_CAP * 8;
+
+    i = 0;
+    line_start = 0;
+    while (i < blen && count < _DIR_CAP) {
+        if (peek(buf + i) == 10) {
+            // End of line.
+            name_len = i - line_start;
+            if (name_len > 0) {
+                // Strip trailing indicator from -F: /, @, *, =, |, >.
+                last_ch = peek(buf + line_start + name_len - 1);
+                type_byte = DIR_TYPE_FILE;
+                if (last_ch == 47) {
+                    type_byte = DIR_TYPE_DIR;       // '/'
+                    name_len = name_len - 1;
+                } else if (last_ch == 64) {
+                    type_byte = DIR_TYPE_LINK;      // '@'
+                    name_len = name_len - 1;
+                } else if (last_ch == 42 || last_ch == 61
+                        || last_ch == 124 || last_ch == 62) {
+                    // Executable or other non-file indicator.
+                    name_len = name_len - 1;
+                }
+
+                // Skip "." and "..".
+                auto is_dot;
+                is_dot = 0;
+                if (name_len == 1 && peek(buf + line_start) == 46) {
+                    is_dot = 1;
+                }
+                if (name_len == 2
+                    && peek(buf + line_start) == 46
+                    && peek(buf + line_start + 1) == 46) {
+                    is_dot = 1;
+                }
+
+                if (is_dot == 0 && name_len > 0) {
+                    name_dup = _dir_strdup(buf + line_start, name_len);
+                    *(names_base + count * 8) = name_dup;
+                    poke(types_base + count, type_byte);
+                    count = count + 1;
+                }
+            }
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+
+    free(buf);
+    *(handle) = count;
+    return handle;
+}
+
+dir_count(handle) : base {
+    if (handle == 0) { return 0; }
+    return *(handle);
+}
+
+dir_name(handle, idx) : base {
+    if (handle == 0) { return 0; }
+    if (idx < 0 || idx >= *(handle)) { return 0; }
+    return *(handle + 8 + idx * 8);
+}
+
+dir_type(handle, idx) : base {
+    if (handle == 0) { return DIR_TYPE_OTHER; }
+    if (idx < 0 || idx >= *(handle)) { return DIR_TYPE_OTHER; }
+    return peek(handle + 8 + _DIR_CAP * 8 + idx);
+}
+
+dir_is_dir(handle, idx) : base {
+    return dir_type(handle, idx) == DIR_TYPE_DIR;
+}
+
+void dir_free(handle) {
+    auto i, n, name_ptr;
+    if (handle == 0) { return; }
+    n = *(handle);
+    for (i = 0; i < n; i = i + 1) {
+        name_ptr = *(handle + 8 + i * 8);
+        if (name_ptr != 0) { free(name_ptr); }
+    }
+    free(handle);
+}

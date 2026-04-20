@@ -1,0 +1,371 @@
+// txt_to_modulab.bpp — Convert a B++ ASCII-art font file into a
+// ModuLab sprite project so each glyph can be opened and refined
+// visually in the editor.
+//
+// Input format (see assets/fonts/b++_font.txt):
+//   - Lines starting with '#' are comments (ignored).
+//   - Lines starting with ';;; <ascii_code>' begin a new glyph.
+//   - Next 16 non-comment lines are the glyph bitmap: 8 chars of
+//     '#' (ink) / '.' (empty) per line.
+//   - Blank lines inside a file are ignored.
+//
+// Output: a ModuLab v2 JSON with:
+//   - 16x16 canvas (glyph lives in cols 0-7, cols 8-15 stay blank).
+//   - Binary palette (index 0 = transparent, index 1 = black ink).
+//   - 96 frames, one per ASCII 32-127, in order.
+//   - Frame N corresponds to ASCII codepoint 32+N.
+//
+// Usage:
+//   bpp tools/font_forge/txt_to_modulab.bpp               \
+//       assets/fonts/b++_font.txt                          \
+//       assets/fonts/b++_font.modulab.json
+//
+// Round trip: edit the .txt by hand (fast, text editor) OR open the
+// .modulab.json in ModuLab (visual tweaks on individual glyphs).
+// Either direction is canonical; the .txt is just the bootstrap
+// seed. Once refined in ModuLab, that's the source of truth and
+// the export_fnt tool consumes it.
+
+// Canvas side length. Each glyph is 8 wide x 16 tall, but ModuLab's
+// canvas is square (n x n), so we pad into 16x16 and leave cols 8-15
+// empty. Parser reads only the left 8 cols of input; writer pads the
+// right 8 cols with zeros.
+const CANVAS_N = 16;
+
+// ASCII range we cover: codepoint 32 (space) through 127 inclusive.
+const ASCII_FIRST = 32;
+const ASCII_LAST  = 127;
+const GLYPH_COUNT = 96;
+
+// Each glyph is 16 rows of 8 bits. We store the parsed bitmap as
+// a flat pixbyte buffer: glyph_bits[N * 16 + row] with bit 7 = leftmost
+// pixel. This matches stbdraw's font format so bake_fnt can dump
+// the same memory region to disk later.
+static extrn _glyphs;
+
+// Track which glyphs were actually set by the input file. Any glyph
+// left at 0 after parsing gets flagged in the output so the user
+// knows there's a hole.
+static extrn _glyph_seen;
+
+// Character classification helpers. All predicates are : base so they
+// can be inlined inside tight parser loops without pulling the IO
+// phase along.
+static _is_digit(c) : base {
+    return c >= 48 && c <= 57;
+}
+
+static _is_space(c) : base {
+    return c == 32 || c == 9;
+}
+
+// Parse a decimal integer out of a line starting at offset i. Returns
+// the value; advances i past the number via the out pointer.
+static _parse_int(line, i_ptr) {
+    auto n, c, i;
+    i = *(i_ptr);
+    n = 0;
+    while (1) {
+        c = peek(line + i);
+        if (c == 0) { break; }
+        if (_is_digit(c) == 0) { break; }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    *(i_ptr) = i;
+    return n;
+}
+
+// Skip leading whitespace in a line. Updates *i_ptr in place.
+static void _skip_ws(line, i_ptr) {
+    auto i, c;
+    i = *(i_ptr);
+    while (1) {
+        c = peek(line + i);
+        if (c == 0) { break; }
+        if (_is_space(c) == 0) { break; }
+        i = i + 1;
+    }
+    *(i_ptr) = i;
+}
+
+// Does `line` start with the prefix `;;;` (glyph header marker)?
+static _is_header_line(line) : base {
+    return peek(line + 0) == 59
+        && peek(line + 1) == 59
+        && peek(line + 2) == 59;
+}
+
+// Is this line a comment or blank? Returns 1 if the parser should
+// skip it.
+static _is_skippable(line, len) : base {
+    if (len == 0) { return 1; }
+    if (peek(line) == 35) { return 1; }   // '#'
+    auto i, c;
+    i = 0;
+    while (i < len) {
+        c = peek(line + i);
+        if (_is_space(c) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Parse one 8-char bitmap row. On hit, writes a pixbyte into
+// _glyphs[glyph_idx * 16 + row] with bit 7 = col 0. Returns 1 if the
+// line was a valid bitmap row, 0 if it looked like anything else (so
+// the caller can dispatch).
+static _parse_bitmap_row(line, len, glyph_idx, row) {
+    auto pixbyte, col, c, off;
+    if (len < 8) { return 0; }
+    pixbyte = 0;
+    col = 0;
+    while (col < 8) {
+        c = peek(line + col);
+        if (c == 35) {              // '#' = ink
+            pixbyte = pixbyte | (1 << (7 - col));
+        } else if (c != 46) {      // '.' = empty; anything else = reject
+            return 0;
+        }
+        col = col + 1;
+    }
+    off = glyph_idx * 16 + row;
+    poke(_glyphs + off, pixbyte);
+    return 1;
+}
+
+// Read one line from `buf` starting at *pos_ptr. Writes the line
+// into `out` (null-terminated) and returns its length, or -1 if EOF.
+// Updates *pos_ptr past the trailing newline.
+static _read_line(buf, buf_len, pos_ptr, out, out_cap) {
+    auto pos, n, c;
+    pos = *(pos_ptr);
+    if (pos >= buf_len) { return 0 - 1; }
+    n = 0;
+    while (pos < buf_len && n < out_cap - 1) {
+        c = peek(buf + pos);
+        pos = pos + 1;
+        if (c == 10) { break; }     // '\n' terminates line
+        poke(out + n, c);
+        n = n + 1;
+    }
+    poke(out + n, 0);
+    *(pos_ptr) = pos;
+    return n;
+}
+
+// Emit the full ModuLab v2 JSON into sb. The data is read out of the
+// _glyphs flat buffer, one pixbyte per row, and each pixel expanded
+// into its palette index (0 or 1) as a 16-wide row (cols 8-15 stay 0).
+static _emit_json(sb) {
+    auto g, row, col, pixbyte, pixbit, idx;
+
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "modulab");
+    sb = json_write_int_field(sb, "version", 2);
+    sb = json_write_int_field(sb, "size", CANVAS_N);
+
+    // Binary palette: index 0 = fully transparent (rgba 0), index 1 =
+    // opaque black. Enough for monochrome glyphs; ModuLab will let
+    // the user layer colour after import if they want accent glyphs.
+    sb = json_write_array_field_begin(sb, "palette");
+    sb = json_write_int(sb, 0);                      // transparent
+    sb = json_write_int(sb, 0 - 16777216);          // 0xFF000000, ARGB black
+    sb = json_write_array_end(sb);
+
+    sb = json_write_array_field_begin(sb, "frames");
+    g = 0;
+    while (g < GLYPH_COUNT) {
+        sb = json_write_object_begin(sb);
+        sb = json_write_int_field(sb, "active_idx", 0);
+
+        sb = json_write_array_field_begin(sb, "layers");
+        sb = json_write_object_begin(sb);
+        sb = json_write_int_field(sb, "alpha",   255);
+        sb = json_write_int_field(sb, "blend",   0);
+        sb = json_write_int_field(sb, "visible", 1);
+
+        sb = json_write_array_field_begin(sb, "data");
+        row = 0;
+        while (row < CANVAS_N) {
+            sb = json_write_array_begin(sb);
+            if (row < 16) {
+                pixbyte = peek(_glyphs + g * 16 + row);
+            } else {
+                pixbyte = 0;
+            }
+            col = 0;
+            while (col < CANVAS_N) {
+                if (col < 8) {
+                    pixbit =(pixbyte >> (7 - col)) & 1;
+                } else {
+                    pixbit =0;
+                }
+                sb = json_write_int(sb, pixbit);
+                col = col + 1;
+            }
+            sb = json_write_array_end(sb);
+            row = row + 1;
+        }
+        sb = json_write_array_end(sb);
+        sb = json_write_object_end(sb);
+        sb = json_write_array_end(sb);
+
+        sb = json_write_object_end(sb);
+        g = g + 1;
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+    return sb;
+}
+
+// Walk the input buffer line-by-line, dispatching headers and bitmap
+// rows. Returns 0 on success, non-zero on parse failure (after
+// printing a diagnostic to stderr).
+static _parse_input(buf, buf_len) {
+    auto pos, line, line_cap, line_len, ptr;
+    auto current_glyph, rows_read, ascii_code;
+
+    line_cap = 256;
+    line = malloc(line_cap);
+
+    pos = 0;
+    current_glyph = 0 - 1;
+    rows_read = 0;
+
+    while (1) {
+        line_len = _read_line(buf, buf_len, &pos, line, line_cap);
+        if (line_len < 0) { break; }
+
+        if (_is_skippable(line, line_len)) {
+            continue;
+        }
+
+        if (_is_header_line(line)) {
+            // Header: ";;; <ascii_code>"
+            auto i;
+            i = 3;
+            _skip_ws(line, &i);
+            ascii_code = _parse_int(line, &i);
+            if (ascii_code < ASCII_FIRST || ascii_code > ASCII_LAST) {
+                print_err_msg("font_forge: header with out-of-range ascii ");
+                print_err_int(ascii_code);
+                print_err_ln();
+                free(line);
+                return 1;
+            }
+            current_glyph = ascii_code - ASCII_FIRST;
+            poke(_glyph_seen + current_glyph, 1);
+            rows_read = 0;
+            continue;
+        }
+
+        // Else expect a bitmap row for the currently-open glyph.
+        if (current_glyph < 0) {
+            print_err_msg("font_forge: bitmap row before any header\n");
+            free(line);
+            return 1;
+        }
+        if (rows_read >= 16) {
+            // Extra rows past the 16-row grid — flag and skip.
+            print_err_msg("font_forge: extra row in glyph ");
+            print_err_int(current_glyph + ASCII_FIRST);
+            print_err_ln();
+            continue;
+        }
+        if (_parse_bitmap_row(line, line_len, current_glyph, rows_read) == 0) {
+            print_err_msg("font_forge: malformed row at glyph ");
+            print_err_int(current_glyph + ASCII_FIRST);
+            print_err_msg(" row ");
+            print_err_int(rows_read);
+            print_err_ln();
+            free(line);
+            return 1;
+        }
+        rows_read = rows_read + 1;
+    }
+
+    free(line);
+    return 0;
+}
+
+// Report which ASCII codes had no glyph defined (holes in the source
+// file). Useful while iterating — you can tell at a glance what's
+// left to design.
+static void _report_missing() {
+    auto g, count;
+    count = 0;
+    g = 0;
+    while (g < GLYPH_COUNT) {
+        if (peek(_glyph_seen + g) == 0) {
+            if (count == 0) {
+                print_err_msg("font_forge: missing glyphs for ascii: ");
+            } else {
+                print_err_msg(", ");
+            }
+            print_err_int(g + ASCII_FIRST);
+            count = count + 1;
+        }
+        g = g + 1;
+    }
+    if (count > 0) {
+        print_err_msg(" (");
+        print_err_int(count);
+        print_err_msg(" holes — ModuLab will show blank frames)\n");
+    }
+}
+
+main(argc, argv) {
+    auto in_path, out_path, buf, size_box, buf_len, rc, sb;
+
+    if (argc < 3) {
+        print_err_msg("usage: txt_to_modulab <input.txt> <output.modulab.json>\n");
+        return 1;
+    }
+    in_path  = argv[1];
+    out_path = argv[2];
+
+    _glyphs     = malloc(GLYPH_COUNT * 16);
+    _glyph_seen = malloc(GLYPH_COUNT);
+    auto i;
+    i = 0;
+    while (i < GLYPH_COUNT * 16) { poke(_glyphs + i, 0); i = i + 1; }
+    i = 0;
+    while (i < GLYPH_COUNT) { poke(_glyph_seen + i, 0); i = i + 1; }
+
+    size_box = malloc(8);
+    *(size_box) = 0;
+    buf = file_read_all(in_path, size_box);
+    if (buf == 0) {
+        print_err_msg("font_forge: cannot read '");
+        print_err_msg(in_path);
+        print_err_msg("'\n");
+        free(size_box);
+        return 1;
+    }
+    buf_len = *(size_box);
+    free(size_box);
+
+    rc = _parse_input(buf, buf_len);
+    free(buf);
+    if (rc != 0) { return rc; }
+
+    _report_missing();
+
+    sb = sb_new();
+    sb = _emit_json(sb);
+    rc = file_write_all(out_path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("font_forge: cannot write '");
+        print_err_msg(out_path);
+        print_err_msg("'\n");
+        return 1;
+    }
+
+    print_msg("font_forge: wrote ");
+    print_msg(out_path);
+    print_msg(" (96 frames, 16x16 canvas)\n");
+    return 0;
+}

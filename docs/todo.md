@@ -40,9 +40,7 @@ about the language it was written in.
  ─────────────────────────────────────────────────────────────────────
      ↓ WE ARE HERE ↓
  ─────────────────────────────────────────────────────────────────────
-     stbwindow — lightweight window + native file dialogs (NSSavePanel)
-     snake with audio sample (mixer one-shot + stbsound load)
-     rhythm — Rhythm Teacher demo                      (first 1.0 game)
+     (first 1.0 game)
      Dev Loop 3 — profiler (bench + sampling)
      Wolf3D Phase 1  — CPU raycaster, 1 level
      Wolf3D Phase 2  — hybrid CPU + GPU
@@ -140,9 +138,8 @@ Candidate directions:
 
 Full write-up in `docs/journal.md` entry 2026-04-16/17.
 
-### 1. `stbwindow` — lightweight window + native file dialogs
 
-### 2. Dev Loop 3: Profiler (minimal + sampling)
+### 1. Dev Loop 3: Profiler (minimal + sampling)
 
 Two tiers:
 
@@ -154,7 +151,7 @@ Two tiers:
 
 Ships before Wolf3D Phase 1.
 
-### 3. `stbwindow` — lightweight window + native dialogs
+### 2. `stbwindow` — lightweight window + native dialogs
 
 Side quest born from synthkey: opening a window + getting key
 events currently requires the full stbgame stack (GPU, framebuffer,
@@ -173,14 +170,7 @@ This is frontend-agnostic — stbgame can build on top of stbwindow
 (adding GPU, framebuffer, game loop) while standalone tools use
 stbwindow directly.
 
-### 4. Snake with audio sample
-
-Load a WAV recorded from synthkey via `sound_load_wav()`. Play it
-as a one-shot when the snake eats an apple via a new mixer API:
-`mixer_play_once(buf, n_frames)`. The "cobra comendo o próprio
-rabo" demo — B++ tools producing content for B++ games.
-
-### 5. Rhythm Teacher demo (`games/rhythm`)
+### 3. Rhythm Teacher demo (`games/rhythm`)
 
 **Game** (`docs/games_roadtrip.md` Game 1): 320×180 window, 4 lanes,
 notes scroll down, timing graded PERFECT/GOOD/OK/MISS, 3 songs,
@@ -198,7 +188,7 @@ difficulty, core loop complete.
 - Streaming background music — looped voice slot
 - Audio platform layer: CoreAudio AudioQueue on macOS; ALSA on Linux
   deferred until ELF dynamic linking (see P1).
-
+sa
 Uses the maestro pattern: audio callback on an OS-owned thread, main
 thread produces samples through an SPSC ring buffer with `mem_barrier()`.
 Uses `malloc_aligned(size, 16)` for sample buffers and the B4 `vec_*`
@@ -213,7 +203,7 @@ finish. If this hits 60 fps on Apple Silicon, B++ is proven for real
 game work. Depends on Dev Loops 1-3. Assets: shareware Wolfenstein 3D
 Episode 1 files. ~4-6 weeks.
 
-### 5. Wolf3D Phase 2 — hybrid CPU + GPU
+### 5 Wolf3D Phase 2 — hybrid CPU + GPU
 
 CPU does math (raycaster, projection, sort); GPU handles texture
 sampling + blending via `_stb_gpu_vertex` quads. Same pattern as Doom 64.

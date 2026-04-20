@@ -6,7 +6,7 @@ A self-hosting compiled language with **games that hear themselves**. Snake now 
 
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
-> **Version 0.78**: 78 passing tests. B++ ships **1.0** when a complete indie retro game ships end to end in pure B++. The version number tracks fractional capability — each passing test is a proven feature.
+> **Version 0.78**: 78+ passing tests. B++ ships **1.0** when `games/pathfind/` ships as a complete indie game — intro scene, 3 levels designed in the ecosystem's own level editor, looping music, score system, end cutscene — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark). The version number tracks fractional capability; each passing test is a proven feature. **Wolf3D** returns as a post-1.0 prestige project: our own game in the retro FPS tradition, authored in Bang 9 with modern production quality and deliberately retro aesthetic.
 
 ---
 
@@ -610,29 +610,40 @@ B++ is open source and we want your help. The language is young and there's a lo
 
 No bureaucracy. No code of conduct longer than the compiler. Just build cool stuff.
 
-## License
+## License & Governance
 
-MIT License
+B++ is distributed under the **Apache License, Version 2.0** — see
+[`LICENSE`](LICENSE) for the full text.
 
-Copyright (c) 2026 Daniel Obino
+Three additional documents cover the full legal and organizational
+picture:
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+- [`LICENSE`](LICENSE) — Apache 2.0. You may use, modify, and
+  redistribute B++ freely, including for commercial purposes.
+  Patent grant and attribution requirements apply.
+- [`TRADEMARK.md`](TRADEMARK.md) — the names **B++**, **Bang**,
+  and **BangDev** are trademarks. Code is open; names are
+  protected. Fair use allowed (write tutorials, say "Built with
+  B++"), but you can't name your fork "B++".
+- [`GOVERNANCE.md`](GOVERNANCE.md) — project direction is set
+  by the BDFL (Daniel Obino). Contributions welcome via the RFC
+  process. The model may evolve toward a committee as the project
+  grows, but that is aspirational, not scheduled.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to submit patches,
+  coding conventions, testing discipline.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Copyright 2026 Daniel Obino / BangDev.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+### Note on Bang 9
+
+**Bang 9** is BangDev's acme-inspired IDE for B++ — an editor +
+project host that embeds the open tools (ModuLab, level editor,
+mini_synth, font forge) as plugin panels so artists and designers
+can ship a complete B++ game without leaving a single window.
+Lives at [`bang9/`](bang9/) in this repo and is distributed under
+the same Apache 2.0 + trademark umbrella as the rest of the
+project. **Code is open. The name "Bang 9" is reserved for the
+canonical distribution** — forks welcome, just rename your fork.
 
 ---
 

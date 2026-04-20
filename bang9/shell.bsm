@@ -1,0 +1,194 @@
+// shell.bsm — Bang 9 window chrome.
+//
+// Everything that isn't a panel: the menu bar at the top, the tab
+// strip below it, and the status bar at the bottom. Minimal, flat,
+// keyboard-friendly-eventually — acme-inspired.
+//
+// Functions exported:
+//   shell_draw_menubar(x, y, w, h)
+//   shell_draw_tabs(x, y, w, h)
+//   shell_draw_statusbar(x, y, w, h)
+
+// stbui gives us UI_FONT_SZ (glyph pixel height passed to
+// draw_text), the theme struct _theme.*, and draw_text /
+// measure_text themselves. Without this import, UI_FONT_SZ
+// resolves to 0 at compile time (const visibility is per-module),
+// and every draw_text(..., 0, ...) call renders a zero-size font —
+// invisible. That was the "blank menu / tab labels" bug we fought.
+//
+// Contract note: UI_FONT_SZ is PIXEL HEIGHT under the current
+// stbdraw ABI, not a multiplier. So vertical centring uses
+// (h - UI_FONT_SZ) / 2, not (h - UI_FONT_SZ * 8) / 2. Treating
+// it as a multiplier puts text ~112 px outside its container.
+import "stbui.bsm";
+
+extrn g_proj_root, g_active_tab, g_tab_names, g_tab_count;
+
+// One-shot flag: menu bar "Build" clicked. bang9.bpp polls it every
+// frame via shell_take_build_request(). We don't import runner.bsm
+// here to keep shell.bsm self-contained — the main loop owns the
+// wiring between UI events and the runner. Same idiom as
+// editor_take_build_request().
+static extrn _menu_build_req;
+
+shell_take_build_request() {
+    auto r;
+    r = _menu_build_req;
+    _menu_build_req = 0;
+    return r;
+}
+
+// ── Menu bar ────────────────────────────────────────────────
+//
+// Top strip with application-level commands. Clickable; for v0.1
+// only "Build" dispatches a real action (triggers a project build
+// and switches to the Run tab via shell_take_build_request). The
+// remaining items are visual-only until proper dropdown menus
+// land. The plan is for the acme-style "right-click on text to
+// plumb" gesture to eventually replace most pull-downs, leaving
+// the menu bar mostly as a landing pad for discoverability.
+
+static void _menubar_draw_item(label, x, y, hover) {
+    auto color;
+    color = hover != 0 ? _theme.text : _theme.text_muted;
+    draw_text(label, x, y, UI_FONT_SZ, color);
+}
+
+void shell_draw_menubar(x, y, w, h) {
+    auto items, n_items, i, ix, label, mx, my;
+    auto label_w, hover;
+
+    // Background + 1px bottom rule separates chrome from tab strip.
+    draw_rect(x, y, w, h, _theme.surface);
+    draw_rect(x, y + h - 1, w, 1, _theme.border);
+
+    n_items = 5;
+    items = malloc(n_items * 8);
+    *(items + 0 * 8) = "File";
+    *(items + 1 * 8) = "Edit";
+    *(items + 2 * 8) = "View";
+    *(items + 3 * 8) = "Build";
+    *(items + 4 * 8) = "Help";
+
+    mx = mouse_x();
+    my = mouse_y();
+
+    ix = x + 12;
+    for (i = 0; i < n_items; i = i + 1) {
+        label = *(items + i * 8);
+        label_w = measure_text(label, UI_FONT_SZ);
+        hover = point_in_rect(mx, my, ix - 6, y, label_w + 12, h);
+        if (hover != 0) {
+            draw_rect(ix - 6, y, label_w + 12, h - 1, _theme.surface_alt);
+        }
+        _menubar_draw_item(label, ix, y + (h - UI_FONT_SZ) / 2, hover);
+
+        // Click dispatch. Only "Build" (index 3) fires a real action
+        // in v0.1; File / Edit / View / Help light up on hover for
+        // discoverability but have no bound command yet.
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0 && i == 3) {
+            _menu_build_req = 1;
+        }
+
+        ix = ix + label_w + 24;
+    }
+
+    free(items);
+}
+
+// ── Tab strip ───────────────────────────────────────────────
+//
+// Row of panel tabs. Click changes g_active_tab. Active tab gets
+// an accent underline and a brighter surface fill, hover gets a
+// subtler surface_alt fill. Plan 9 acme doesn't have tabs at all
+// — everything is a window — but for Bang 9's artist-first scope,
+// tabs are the friendlier surface.
+
+void shell_draw_tabs(x, y, w, h) {
+    auto tab_w, i, label, mx, my, tx, hover;
+    auto label_w, lx, label_color;
+
+    tab_w = 128;
+
+    // Background + bottom rule.
+    draw_rect(x, y, w, h, _theme.bg);
+    draw_rect(x, y + h - 1, w, 1, _theme.border);
+
+    mx = mouse_x();
+    my = mouse_y();
+
+    for (i = 0; i < g_tab_count; i = i + 1) {
+        tx = x + i * tab_w;
+        label = *(g_tab_names + i * 8);
+        hover = point_in_rect(mx, my, tx, y, tab_w, h);
+
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+            g_active_tab = i;
+        }
+
+        if (i == g_active_tab) {
+            draw_rect(tx, y, tab_w, h, _theme.surface);
+            // Accent underline on the active tab.
+            draw_rect(tx, y + h - 2, tab_w, 2, _theme.accent);
+            label_color = _theme.text;
+        } else if (hover != 0) {
+            draw_rect(tx, y, tab_w, h, _theme.surface_alt);
+            label_color = _theme.text;
+        } else {
+            label_color = _theme.text_muted;
+        }
+
+        // Separator between tabs (1px vertical rule).
+        if (i > 0) {
+            draw_rect(tx, y + 4, 1, h - 8, _theme.border);
+        }
+
+        label_w = measure_text(label, UI_FONT_SZ);
+        lx = tx + (tab_w - label_w) / 2;
+        draw_text(label, lx, y + (h - UI_FONT_SZ) / 2,
+                  UI_FONT_SZ, label_color);
+    }
+}
+
+// ── Status bar ──────────────────────────────────────────────
+//
+// Bottom strip showing project root and any transient build/run
+// state. Right side of the bar is reserved for modal indicators
+// ("building...", "running", error count). For now, minimal.
+
+void shell_draw_statusbar(x, y, w, h) {
+    auto msg_root, root_lbl;
+    auto vy, label_w;
+
+    draw_rect(x, y, w, h, _theme.surface_dim);
+    draw_rect(x, y, w, 1, _theme.border);
+
+    // Vertically center text inside the bar.
+    vy = y + (h - UI_FONT_SZ) / 2;
+
+    msg_root = "project: ";
+    draw_text(msg_root, x + 12, vy, UI_FONT_SZ, _theme.text_muted);
+    label_w = measure_text(msg_root, UI_FONT_SZ);
+    draw_text(g_proj_root, x + 12 + label_w, vy,
+              UI_FONT_SZ, _theme.text);
+
+    // Right-side: version + "Bang 9" brand.
+    auto brand, brand_w;
+    brand = "Bang 9 v0.1";
+    brand_w = measure_text(brand, UI_FONT_SZ);
+    draw_text(brand, x + w - brand_w - 12, vy,
+              UI_FONT_SZ, _theme.text_muted);
+
+    // Middle: keyboard hint reminder. Sits between the project path
+    // on the left and the brand on the right. Hidden if the window
+    // is too narrow for both to fit comfortably — better to drop the
+    // hint than let labels collide.
+    auto hint, hint_w, path_w;
+    hint = "F2 save  F7 build  F8 run  F3/F4 zoom";
+    hint_w = measure_text(hint, UI_FONT_SZ);
+    path_w = measure_text(g_proj_root, UI_FONT_SZ);
+    if (x + 12 + label_w + path_w + 20 + hint_w + 20 + brand_w + 12 < x + w) {
+        draw_text(hint, x + w - brand_w - 24 - hint_w, vy,
+                  UI_FONT_SZ, _theme.text_muted);
+    }
+}

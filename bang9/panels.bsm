@@ -1,0 +1,336 @@
+// panels.bsm — Bang 9 panel dispatcher.
+//
+// The panel body occupies the big middle region between tab strip
+// and status bar. Its contents swap depending on g_active_tab.
+// Each panel function takes (x, y, w, h) of the available area and
+// draws whatever it wants inside.
+//
+// For v0.1 everything is placeholder — the panel signatures and
+// dispatch are real, the content is "coming soon" stubs. Real
+// panels wire in across v0.2 (Project tree), v0.3 (Code editor),
+// v0.4 (Sprites via ModuLab embed), v0.5 (Music/Level/Font).
+
+import "dir.bsm";
+import "editor.bsm";
+import "runner.bsm";
+
+extrn g_active_tab, g_proj_root;
+
+// When the user clicks a file in Project tab, we stage the path
+// here. The Code panel (next frame after switch) calls
+// editor_open on this path.
+static auto _g_pending_open_path;
+
+// Cached directory listing for the Project panel. Loaded lazily
+// on first draw of the Project tab (or after F5 refresh). Null
+// until loaded — _panel_project allocates and caches.
+static auto _g_proj_entries;
+static auto _g_proj_scroll;       // y offset for scrolling
+
+// Invalidate and reload the project listing. Call when the user
+// presses F5 or changes the project root at runtime.
+static void _project_refresh() {
+    if (_g_proj_entries != 0) { dir_free(_g_proj_entries); }
+    _g_proj_entries = dir_list(g_proj_root);
+    _g_proj_scroll = 0;
+}
+
+// ── Entry point ─────────────────────────────────────────────
+
+void panels_draw(x, y, w, h) {
+    // Panel background — slightly darker than tab strip so there's
+    // a visible "content area" contrast.
+    draw_rect(x, y, w, h, _theme.surface_dim);
+
+    if (g_active_tab == 0) {
+        _panel_project(x, y, w, h);
+    } else if (g_active_tab == 1) {
+        _panel_sprites(x, y, w, h);
+    } else if (g_active_tab == 2) {
+        _panel_code(x, y, w, h);
+    } else if (g_active_tab == 3) {
+        _panel_run(x, y, w, h);
+    }
+}
+
+// ── Placeholder helpers ─────────────────────────────────────
+
+// Draws a centered "coming soon" block for panels that are not
+// yet implemented. Bigger heading, smaller subtitle.
+static void _placeholder(x, y, w, h, title, subtitle) {
+    auto cx, cy, title_w, sub_w;
+
+    cx = x + w / 2;
+    cy = y + h / 2;
+
+    title_w = measure_text(title, UI_FONT_SZ);
+    draw_text(title, cx - title_w / 2, cy - UI_FONT_SZ / 2,
+              UI_FONT_SZ, _theme.text);
+
+    sub_w = measure_text(subtitle, UI_FONT_SZ);
+    draw_text(subtitle, cx - sub_w / 2, cy + UI_FONT_SZ / 2,
+              UI_FONT_SZ, _theme.text_muted);
+}
+
+// ── Project panel ──────────────────────────────────────────
+//
+// Will list files/folders relative to g_proj_root, clickable to
+// open files in the Code panel. v0.2 work.
+
+static void _panel_project(x, y, w, h) {
+    auto margin, hy;
+    margin = 24;
+    hy = y + margin;
+
+    // Header — path, with F5 hint.
+    auto header_lbl, hlbl_w;
+    header_lbl = "Project: ";
+    hlbl_w = measure_text(header_lbl, UI_FONT_SZ);
+    draw_text(header_lbl, x + margin, hy, UI_FONT_SZ, _theme.text_muted);
+    draw_text(g_proj_root, x + margin + hlbl_w, hy,
+              UI_FONT_SZ, _theme.accent);
+
+    // "Press F5 to refresh" indicator on the right.
+    auto refresh_lbl, rw;
+    refresh_lbl = "[F5 refresh]";
+    rw = measure_text(refresh_lbl, UI_FONT_SZ);
+    draw_text(refresh_lbl, x + w - margin - rw, hy,
+              UI_FONT_SZ, _theme.text_muted);
+
+    hy = hy + UI_FONT_SZ + 16;
+
+    // Separator line.
+    draw_rect(x + margin, hy, w - margin * 2, 1, _theme.border);
+    hy = hy + 8;
+
+    // Lazy-load the listing on first draw.
+    if (_g_proj_entries == 0) {
+        _project_refresh();
+    }
+
+    // F5 refreshes.
+    if (key_pressed(KEY_F5) != 0) {
+        _project_refresh();
+    }
+
+    // Render entries.
+    if (_g_proj_entries == 0) {
+        draw_text("(cannot read directory)",
+                  x + margin, hy,
+                  UI_FONT_SZ, _theme.text_muted);
+        return;
+    }
+
+    auto n, i, name, is_dir, row_h;
+    auto ly, mx, my, hover, row_color;
+    n = dir_count(_g_proj_entries);
+    row_h = UI_FONT_SZ + 4;
+
+    if (n == 0) {
+        draw_text("(empty directory)",
+                  x + margin, hy,
+                  UI_FONT_SZ, _theme.text_muted);
+        return;
+    }
+
+    mx = mouse_x();
+    my = mouse_y();
+
+    for (i = 0; i < n; i = i + 1) {
+        ly = hy + i * row_h - _g_proj_scroll;
+        // Skip rows that would draw outside the panel's bounds.
+        if (ly + row_h < y) { continue; }
+        if (ly > y + h) { break; }
+
+        name = dir_name(_g_proj_entries, i);
+        is_dir = dir_is_dir(_g_proj_entries, i);
+
+        hover = point_in_rect(mx, my, x + margin, ly,
+                              w - margin * 2, row_h);
+        if (hover != 0) {
+            draw_rect(x + margin, ly, w - margin * 2, row_h,
+                      _theme.surface_alt);
+        }
+
+        // Directory vs file coloring + prefix glyph.
+        auto prefix;
+        if (is_dir != 0) {
+            prefix = "[d] ";
+            row_color = _theme.accent;
+        } else {
+            prefix = "    ";
+            row_color = _theme.text;
+        }
+        auto pw;
+        pw = measure_text(prefix, UI_FONT_SZ);
+        draw_text(prefix, x + margin + 4, ly + 2,
+                  UI_FONT_SZ, _theme.text_muted);
+        draw_text(name, x + margin + 4 + pw, ly + 2,
+                  UI_FONT_SZ, row_color);
+
+        // Click on a file (not dir) stages it for opening in the
+        // Code panel. We build the full path as g_proj_root + "/"
+        // + name and hand it to the editor via _g_pending_open_path.
+        // Directories are left as click-targets for future
+        // sub-tree navigation.
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0
+            && is_dir == 0) {
+            auto root_len, name_len, full_path, j;
+            root_len = str_len(g_proj_root);
+            name_len = str_len(name);
+            full_path = malloc(root_len + 1 + name_len + 1);
+            for (j = 0; j < root_len; j = j + 1) {
+                poke(full_path + j, peek(g_proj_root + j));
+            }
+            poke(full_path + root_len, 47);  // '/'
+            for (j = 0; j < name_len; j = j + 1) {
+                poke(full_path + root_len + 1 + j, peek(name + j));
+            }
+            poke(full_path + root_len + 1 + name_len, 0);
+            if (_g_pending_open_path != 0) { free(_g_pending_open_path); }
+            _g_pending_open_path = full_path;
+            g_active_tab = 2;   // switch to Code tab
+        }
+    }
+}
+
+// ── Sprites panel ──────────────────────────────────────────
+//
+// Will embed tools/modulab/ — either by composition (linking its
+// source) or child process (launching binary, sharing framebuffer).
+// v0.4 decision.
+
+static void _panel_sprites(x, y, w, h) {
+    _placeholder(x, y, w, h,
+                 "Sprites",
+                 "ModuLab integration — v0.4");
+}
+
+// ── Code panel ─────────────────────────────────────────────
+//
+// Acme-style text editor. Opens .bsm/.bpp files from the project
+// tree. Minimal: text buffer, cursor, save, build/run hotkeys.
+// v0.3 work.
+
+static void _panel_code(x, y, w, h) {
+    // Lazy init the editor the first time the tab is activated.
+    editor_init();
+
+    // If the user staged a file open (via Project panel click),
+    // consume the pending path now.
+    if (_g_pending_open_path != 0) {
+        editor_open(_g_pending_open_path);
+        free(_g_pending_open_path);
+        _g_pending_open_path = 0;
+    }
+
+    editor_draw(x, y, w, h);
+
+    // Bridge the editor's tag-bar [Build] and [Run] buttons into
+    // the runner. The editor cannot call runner_* directly without
+    // importing the whole shell state, so it sets one-shot flags
+    // that we read + clear here. Both actions also switch to the
+    // Run tab so the user sees the log immediately.
+    if (editor_take_build_request() != 0) {
+        runner_build(g_proj_root);
+        g_active_tab = 3;
+    }
+    if (editor_take_run_request() != 0) {
+        auto rc;
+        rc = runner_build(g_proj_root);
+        g_active_tab = 3;
+        if (rc == 0) { runner_run(g_proj_root); }
+    }
+}
+
+// ── Run panel ──────────────────────────────────────────────
+//
+// Build + run output. Invokes bpp on the project, captures
+// stdout/stderr, renders as scrollable log. Clickable error
+// lines jump to Code panel at the offending line.
+// v0.3+ work.
+
+// ── Run panel — displays build/run log ─────────────────────
+
+static void _panel_run(x, y, w, h) {
+    auto margin, hy, line_h;
+    auto buf, blen, i, line_start, ch, lx, ly;
+    auto status, status_msg, status_color;
+
+    margin = 16;
+    line_h = UI_FONT_SZ + 2;
+    hy = y + margin;
+
+    // Header — last build status.
+    status = runner_last_status();
+    if (status == 0 - 1) {
+        status_msg = "No build yet. Press Ctrl+B to build, Ctrl+R to run.";
+        status_color = _theme.text_muted;
+    } else if (status == 0) {
+        status_msg = "Last build: OK.";
+        status_color = _theme.accent;
+    } else {
+        status_msg = "Last build: FAILED. See output below.";
+        status_color = rgba(230, 80, 80, 255);
+    }
+    draw_text(status_msg, x + margin, hy, UI_FONT_SZ, status_color);
+    hy = hy + line_h + 4;
+
+    // Separator.
+    draw_rect(x + margin, hy, w - margin * 2, 1, _theme.border);
+    hy = hy + 6;
+
+    // Render the log buffer, line by line.
+    buf = runner_log();
+    blen = runner_log_len();
+    if (buf == 0 || blen == 0) {
+        draw_text("(log empty)",
+                  x + margin, hy,
+                  UI_FONT_SZ, _theme.text_muted);
+        return;
+    }
+
+    i = 0;
+    ly = hy;
+    while (i < blen && ly < y + h - line_h) {
+        // Find end of line.
+        line_start = i;
+        while (i < blen && peek(buf + i) != 10) { i = i + 1; }
+
+        // Copy line into a local null-terminated buffer.
+        auto line_len, tmp, j;
+        line_len = i - line_start;
+        if (line_len > 256) { line_len = 256; }
+        tmp = malloc(line_len + 1);
+        for (j = 0; j < line_len; j = j + 1) {
+            ch = peek(buf + line_start + j);
+            // Filter control chars to spaces.
+            if (ch < 32 || ch >= 127) { ch = 32; }
+            poke(tmp + j, ch);
+        }
+        poke(tmp + line_len, 0);
+
+        // Color: lines containing "error" stand out in red.
+        auto color;
+        color = _theme.text_muted;
+        // Quick contains("error") scan.
+        auto has_error, k;
+        has_error = 0;
+        if (line_len >= 5) {
+            for (k = 0; k < line_len - 4; k = k + 1) {
+                if (peek(tmp + k)     == 101
+                 && peek(tmp + k + 1) == 114
+                 && peek(tmp + k + 2) == 114
+                 && peek(tmp + k + 3) == 111
+                 && peek(tmp + k + 4) == 114) { has_error = 1; }
+            }
+        }
+        if (has_error != 0) { color = rgba(230, 80, 80, 255); }
+
+        draw_text(tmp, x + margin, ly, UI_FONT_SZ, color);
+        free(tmp);
+
+        ly = ly + line_h;
+        if (i < blen) { i = i + 1; }   // skip the newline itself
+    }
+}
