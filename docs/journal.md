@@ -1,5 +1,141 @@
 # B++ Bootstrap Journal
 
+## 2026-04-20 — Phase 3.4 first half: Waves 1-6 of chip_primitives migration
+
+Six waves shipped, all byte-identical against the jedi handoff
+hashes (pathfind 50caa64b, rhythm 3d4f424b, bang9 7a76c3b8). The
+Forth-style portable spine + per-chip `_primitives.bsm` pattern
+is fully bootstrapped — every commit kept the suite of three
+canary programs hash-stable.
+
+**Commits (newest first)**
+
+```
+0de1d29 Wave 6  — T_BINOP comparisons (cmp_int / cmp_flt with portable cond_id)
+e388d07 Wave 5  — T_BINOP arith + bitwise + shift (14 primitives)
+70f3a45 Wave 4  — T_UNARY ~ / int -- / float --
+d4b4b17 Wave 3  — T_VAR local + global
+365b896 Wave 2  — T_LIT int / string / float
+b7495f3 Wave 1  — nd == 0 dispatch
+698fc61 Foundation — Phases 1-3.3 baseline (jedi pit stop)
+```
+
+**Chip_primitives table state**
+
+`struct ChipPrimitives` declared with all 49 contract slots up
+front (44 originally + 5 added across waves). `cg_prim` is a
+single global pointer allocated lazily. Wired this session:
+
+```
+arith       emit_add  emit_sub  emit_mul  emit_div  emit_mod
+            emit_neg
+            emit_fadd emit_fsub emit_fmul emit_fdiv
+logical     emit_and  emit_or   emit_xor  emit_shl  emit_shr
+            emit_not
+move/cmp    emit_mov_zero  emit_mov_imm
+            emit_cmp_int   emit_cmp_flt
+memory      emit_load_local  emit_load_global  emit_load_str_addr
+            emit_load_float_const
+float-extra emit_fneg
+```
+
+23 of 49 slots in use. Waves 7-12 will fill emit_jump,
+emit_label, emit_branch_*, emit_load, emit_store, emit_call,
+emit_push/pop, plus the metadata slots arg_reg / return_reg etc.
+
+**Init-order bug found and fixed (Wave 2 surface)**
+
+Critical infra bug uncovered when Wave 2 tested byte-identity:
+`init_codegen_arm64()` and `init_codegen_x86_64()` both run
+unconditionally at startup, last-init-wins on the shared
+`cg_prim` table. With x86_64 init at line 66 of `bpp.bpp`
+running after arm64's at line 63, the table always carried x64
+fn_ptrs — arm64 emission then called x64 primitives that wrote
+into `x64_enc_buf` (unused by arm64 mode), silently dropping
+the instruction from arm64 output. Wave 1 masked the bug
+because `nd == 0` is rare; Wave 2 (every literal) surfaced it
+as a 33 KB pathfind size delta.
+
+**Fix**: extracted `cg_install_arm64_primitives()` and
+`cg_install_x86_64_primitives()` helpers, called both from
+`init_codegen_<chip>` AND from the top of `emit_module_<chip>`.
+Per-module re-install costs a handful of word stores and
+guarantees the active chip owns `cg_prim` during emission.
+
+**T_SIZEOF doesn't exist**
+
+Plan listed `T_SIZEOF` for Wave 1 but `bpp_defs.bsm` has no
+such constant — parser lowers `sizeof(X)` to a `T_LIT` with
+the size baked in. Wave 1 collapsed to the `nd == 0` case
+alone. Documented in commit message.
+
+**B3 promoted-locals interaction (Wave 3) honoured**
+
+Per the plan's Anticipated Surprise #8, the B3 promoted-register
+short-circuit lives in the chip's existing `<chip>_emit_load_var`
+function. Wave 3's `emit_load_local` primitive is a thin wrapper
+that delegates — the spine never sees the promotion table. Same
+for the SL_DOUBLE / SL_HALF / SL_QUARTER sub-word dispatch
+matrix.
+
+**Visibility changes**
+
+Several previously-`static` chip helpers became public so the
+primitives in `_primitives.bsm` can delegate to the existing
+implementations: `a64_print_dec`, `a64_print_p`, `a64_emit_mov`,
+`a64_emit_load_var`, `x64_emit_load_var`. None of them changed
+behaviour.
+
+**Line counts (end of session)**
+
+```
+src/bpp_codegen.bsm                              823  (+225 since handoff)
+src/backend/chip/aarch64/a64_codegen.bsm        2854  (+2 — net wash, primitives extracted offset by spine wiring)
+src/backend/chip/aarch64/a64_primitives.bsm      288  (new, Wave 1)
+src/backend/chip/x86_64/x64_codegen.bsm         2010  (+6)
+src/backend/chip/x86_64/x64_primitives.bsm       181  (new, Wave 1)
+```
+
+The chip codegens haven't shrunk yet because Waves 1-6 mostly
+added one-line `call(p.X, ...)` replacements where the original
+was a multi-line `if (a64_bin_mode) { enc_X(...); } else { out("..."); }`.
+Net per-case savings show up as those calls collapse multi-line
+bodies into single-line dispatches. Bigger shrink expected at
+Wave 12 when `emit_node` itself becomes a thin tail-call to
+`cg_emit_node`.
+
+**Open for next session**
+
+Waves 7-12 in order:
+
+```
+Wave 7   T_IF / T_WHILE / T_TERNARY / T_RET  (label management)
+Wave 8   T_MEMLD / T_MEMST / T_ADDR
+Wave 9   T_CALL  (HARD — ABI divergence; budget 2-3 h)
+Wave 10  T_ASSIGN
+Wave 11  T_SUBSCRIPT / T_FIELD
+Wave 12  emit_stmt migration
+```
+
+Then Waves 13-19 for emit_func + epilogues. Then Phase 4 dedup,
+Phase 5 RISC-V validation, Phase 6 install.sh chameleon. The
+chip_primitives infrastructure is fully proven by Wave 6 — the
+remaining waves have no architectural risk, only volume.
+
+End-of-session canary hashes (use as next-session baseline):
+
+```
+bpp        2035655bea7bc9e163c68f742a9963492d89f473
+pathfind   50caa64bfa7f4476d0780c5857304db66176d852
+rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009
+bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
+```
+
+Note: `bpp` hash drifts each wave (the bootstrap binary
+embeds the new spine + primitives), but the three canaries —
+the actual byte-identity contract — are pinned to the original
+handoff values.
+
 ## 2026-03-18 — Stage 2 Complete: Self-Hosting Parser
 
 ### Milestone

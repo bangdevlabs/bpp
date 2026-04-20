@@ -56,7 +56,47 @@ about the language it was written in.
 
 ## Active — in commit order
 
-### Shipped 2026-04-20 — moved to journal
+### Shipped 2026-04-20 (afternoon) — Phase 3.4 first half
+
+Six waves of `chip_primitives` migration, all byte-identical
+against the jedi handoff canaries. Full write-up in
+`docs/journal.md`.
+
+- ✅ Foundation commit (Phases 1-3.3 from jedi pit stop)
+- ✅ Wave 1 — `nd == 0` dispatch (proves fn_ptr-in-struct works)
+- ✅ Wave 2 — `T_LIT` int / string / float (uncovered + fixed
+  the init-order bug where last-init-wins on `cg_prim` made
+  arm64 emission silently call x64 primitives)
+- ✅ Wave 3 — `T_VAR` local + global (B3 promoted-reg
+  short-circuit preserved chip-side per plan surprise #8)
+- ✅ Wave 4 — `T_UNARY` ~ / int negate / float negate
+- ✅ Wave 5 — `T_BINOP` arith + bitwise + shift (14 primitives)
+- ✅ Wave 6 — `T_BINOP` comparisons (portable cond_id mapping)
+
+**Phase 3.4 — pending Waves 7-12 (next session)**
+
+- Wave 7   `T_IF` / `T_WHILE` / `T_TERNARY` / `T_RET` — label management
+- Wave 8   `T_MEMLD` / `T_MEMST` / `T_ADDR`
+- Wave 9   `T_CALL` — ABI divergence, budget 2-3 h, may need 9b split
+- Wave 10  `T_ASSIGN`
+- Wave 11  `T_SUBSCRIPT` / `T_FIELD`
+- Wave 12  `emit_stmt` migration
+
+Then Waves 13-19 (emit_func + epilogues), then Phase 4 dedup,
+Phase 5 RISC-V backend, Phase 6 install.sh chameleon. The
+infrastructure (struct, install seam, cond codes) is fully
+battle-tested by Wave 6 — remaining waves have no
+architectural risk, only volume.
+
+Use these as next-session baseline canaries:
+```
+bpp        2035655bea7bc9e163c68f742a9963492d89f473  (regenerated each wave)
+pathfind   50caa64bfa7f4476d0780c5857304db66176d852  (must stay)
+rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009  (must stay)
+bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02  (must stay)
+```
+
+### Shipped 2026-04-20 (morning) — moved to journal
 
 - ✅ `stbpal` — Palette struct + 7 built-in catalogs (MCU-8, NKOTC-4,
   CB-32, DB-32, PICO-8, GB-4, NES-54). Cycling (phase-correct),
