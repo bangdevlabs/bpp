@@ -84,14 +84,25 @@ static auto a64_simd_free_mask;
 
 // ── Initialization ─────────────────────────────────────────
 
-void init_codegen_arm64() {
+// Phase 3.4 — install this chip's primitives into the spine's
+// fn_ptr dispatch table. Called both at startup (init_codegen_arm64)
+// AND at the top of emit_module_arm64 to guarantee the right chip
+// owns cg_prim regardless of init order in bpp.bpp (the x86_64
+// init runs after arm64's at startup, so without the per-module
+// re-install the table would always carry x64 fn_ptrs and arm64
+// emission would write into the wrong encoder buffer).
+void cg_install_arm64_primitives() {
     auto p: ChipPrimitives;
-    // Phase 3.4: install AArch64 primitives into the spine's
-    // dispatch table. Idempotent — alloc-on-first-call, then
-    // overwrite slots so a later switch to x86_64 is also safe.
     cg_prim_alloc();
     p = cg_prim;
-    p.emit_mov_zero = fn_ptr(_a64_emit_mov_zero);
+    p.emit_mov_zero         = fn_ptr(_a64_emit_mov_zero);
+    p.emit_mov_imm          = fn_ptr(_a64_emit_mov_imm);
+    p.emit_load_str_addr    = fn_ptr(_a64_emit_load_str_addr);
+    p.emit_load_float_const = fn_ptr(_a64_emit_load_float_const);
+}
+
+void init_codegen_arm64() {
+    cg_install_arm64_primitives();
 
     cg_fn_name = arr_new(); cg_fn_par = arr_new();
     cg_fn_pcnt = arr_new(); cg_fn_body = arr_new();
@@ -248,7 +259,9 @@ static void a64_print_p(p) {
 // ── Helper functions ───────────────────────────────────────
 
 // Print a decimal integer to stdout. Used for assembly immediates.
-static void a64_print_dec(n) {
+// Public so a64_primitives.bsm can reuse the same decimal printer
+// when emitting asm-mode operands.
+void a64_print_dec(n) {
     auto buf, len, i;
     if (n < 0) { putchar('-'); n = 0 - n; }
     if (n == 0) { putchar('0'); return; }
@@ -511,7 +524,12 @@ static void a64_emit_store_var(vi, off, rty) {
 // cg_new_lbl lives in bpp_codegen.bsm.
 
 // Load a 64-bit immediate into x0 using movz/movk sequence.
-static void a64_emit_mov(val) {
+// Public — Phase 3.4 Wave 2 wraps this as `_a64_emit_mov_imm`
+// inside a64_primitives.bsm, while existing inline callers in this
+// file keep using a64_emit_mov directly until those sites migrate
+// in their own waves (cf. switch jump-table emission in
+// a64_emit_switch_jtbl).
+void a64_emit_mov(val) {
     auto lo, hi;
     if (a64_bin_mode) { enc_mov_wide(0, val); return 0; }
     if (val >= 0) {
@@ -734,38 +752,9 @@ static a64_emit_node(nd) {
     n = nd; t = n.ntype;
 
     if (t == T_LIT) {
-        // Check if this literal is a string (starts with double-quote).
-        lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
-        if (peek(cg_sbuf + lit_s) == '"') {
-            // String literal: strip quotes, store in string table, emit address load.
-            sid = arr_len(cg_str_tbl);
-            str_p = pack(lit_s + 1, lit_l - 2);
-            cg_str_tbl = arr_push(cg_str_tbl, str_p);
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, sid, 1);
-                enc_adrp(0); enc_add_imm(0, 0, 0);
-            } else {
-                out("  adrp x0, _str_"); a64_print_dec(sid); out("@PAGE"); putchar('\n');
-                out("  add x0, x0, _str_"); a64_print_dec(sid); out("@PAGEOFF"); putchar('\n');
-            }
-            return 0;
-        }
-        // Check if float literal (contains a decimal point).
-        if (cg_is_float_lit(n.a) == 1) {
-            fid = arr_len(cg_flt_tbl);
-            cg_flt_tbl = arr_push(cg_flt_tbl, n.a);
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, fid, 2);
-                enc_adrp(8); enc_add_imm(8, 8, 0);
-                enc_ldr_d_uoff(0, 8, 0);
-            } else {
-                out("  adrp x8, _flt_"); a64_print_dec(fid); out("@PAGE"); putchar('\n');
-                out("  add x8, x8, _flt_"); a64_print_dec(fid); out("@PAGEOFF"); putchar('\n');
-                out("  ldr d0, [x8]"); putchar('\n');
-            }
-            return 1;
-        }
-        a64_emit_mov(cg_parse_int(n.a)); return 0;
+        // Phase 3.4 Wave 2: dispatch through cg_emit_lit (spine
+        // helper) which routes to chip primitives.
+        return cg_emit_lit(n.a);
     }
 
     if (t == T_VAR) {
@@ -2678,6 +2667,11 @@ void a64_mod_init() {
 // Returns the byte offset where this module's code starts in enc_buf.
 void emit_module_arm64(mi) {
     auto fn_start, code_start, i, rec, name_p, idx, j;
+
+    // Phase 3.4: re-install this chip's primitives so emission
+    // dispatches through the correct fn_ptrs even when both
+    // chips' init_codegen_<chip> ran at startup.
+    cg_install_arm64_primitives();
 
     // Record where new functions will start in the accumulated table.
     fn_start = arr_len(cg_fn_name);

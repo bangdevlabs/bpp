@@ -21,6 +21,15 @@ import "a64_enc.bsm";
 import "bpp_internal.bsm";
 
 extrn a64_bin_mode;
+extrn enc_pos;
+
+// Forward decls of public a64_codegen helpers reused for asm-mode
+// emission (a64_print_dec) and the multi-step movz/movk lowering
+// (a64_emit_mov). They were `static` in earlier phases; Phase 3.4
+// makes them visible here so primitives can keep delegating to the
+// already-tested implementations.
+extrn a64_emit_mov;
+extrn a64_print_dec;
 
 // ── Move / compare ──
 
@@ -29,4 +38,41 @@ extrn a64_bin_mode;
 void _a64_emit_mov_zero() {
     if (a64_bin_mode) { enc_movz(0, 0, 0); }
     else { out("  mov x0, #0"); putchar('\n'); }
+}
+
+// Set the result register (x0) to a 64-bit immediate. Reuses the
+// existing multi-step lowering in a64_codegen.bsm (movz +
+// movk × 3 for values that span more than 16 bits).
+void _a64_emit_mov_imm(val) {
+    a64_emit_mov(val);
+}
+
+// Load the address of a string literal (`_str_<sid>`) into x0.
+// Uses adrp+add (PAGE/PAGEOFF pair) in both binary and asm
+// modes; the relocation table records the (position, sid, type=1)
+// triple for the linker to fix up.
+void _a64_emit_load_str_addr(sid) {
+    if (a64_bin_mode) {
+        enc_add_reloc(enc_pos, sid, 1);
+        enc_adrp(0); enc_add_imm(0, 0, 0);
+    } else {
+        out("  adrp x0, _str_"); a64_print_dec(sid); out("@PAGE"); putchar('\n');
+        out("  add x0, x0, _str_"); a64_print_dec(sid); out("@PAGEOFF"); putchar('\n');
+    }
+}
+
+// Load a float constant from the const pool (`_flt_<fid>`) into d0.
+// Uses x8 as a scratch register for the address computation, then
+// `ldr d0, [x8]`. Relocation type 2 (float) so the linker resolves
+// to the right pool entry.
+void _a64_emit_load_float_const(fid) {
+    if (a64_bin_mode) {
+        enc_add_reloc(enc_pos, fid, 2);
+        enc_adrp(8); enc_add_imm(8, 8, 0);
+        enc_ldr_d_uoff(0, 8, 0);
+    } else {
+        out("  adrp x8, _flt_"); a64_print_dec(fid); out("@PAGE"); putchar('\n');
+        out("  add x8, x8, _flt_"); a64_print_dec(fid); out("@PAGEOFF"); putchar('\n');
+        out("  ldr d0, [x8]"); putchar('\n');
+    }
 }

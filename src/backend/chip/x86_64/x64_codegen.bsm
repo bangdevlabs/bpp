@@ -65,14 +65,22 @@ auto x64_fn_lbl, x64_ret_lbl;
 
 // ── Initialization ─────────────────────────────────────────
 
-void init_codegen_x86_64() {
+// Phase 3.4 — see cg_install_arm64_primitives for the rationale;
+// emit_module_x86_64 also calls this at its top for the same
+// reason. Both chips' inits run at startup, last-wins on cg_prim,
+// so per-module re-install is the byte-identity guarantee.
+void cg_install_x86_64_primitives() {
     auto p: ChipPrimitives;
-    // Phase 3.4: install x86_64 primitives into the spine's
-    // dispatch table. Idempotent — alloc-on-first-call, then
-    // overwrite slots so a later switch to arm64 is also safe.
     cg_prim_alloc();
     p = cg_prim;
-    p.emit_mov_zero = fn_ptr(_x64_emit_mov_zero);
+    p.emit_mov_zero         = fn_ptr(_x64_emit_mov_zero);
+    p.emit_mov_imm          = fn_ptr(_x64_emit_mov_imm);
+    p.emit_load_str_addr    = fn_ptr(_x64_emit_load_str_addr);
+    p.emit_load_float_const = fn_ptr(_x64_emit_load_float_const);
+}
+
+void init_codegen_x86_64() {
+    cg_install_x86_64_primitives();
 
     cg_fn_name = arr_new(); cg_fn_par = arr_new();
     cg_fn_pcnt = arr_new(); cg_fn_body = arr_new();
@@ -485,31 +493,9 @@ static x64_emit_node(nd) {
 
     // ── Integer/string/float literal ──
     if (t == T_LIT) {
-        lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
-        // String literal.
-        if (peek(cg_sbuf + lit_s) == '"') {
-            sid = arr_len(cg_str_tbl);
-            str_p = pack(lit_s + 1, lit_l - 2);
-            cg_str_tbl = arr_push(cg_str_tbl, str_p);
-            // LEA RAX, [RIP + string_addr]. Relocation type 1 (string).
-            auto dpos;
-            dpos = x64_enc_lea_rip(0);
-            x64_enc_add_reloc(dpos, sid, 1);
-            return 0;
-        }
-        // Float literal.
-        if (cg_is_float_lit(n.a) == 1) {
-            fid = arr_len(cg_flt_tbl);
-            cg_flt_tbl = arr_push(cg_flt_tbl, n.a);
-            // MOVSD XMM0, [RIP + float_addr]. Relocation type 2 (float).
-            auto dpos;
-            dpos = x64_enc_load_sd_rip(0);
-            x64_enc_add_reloc(dpos, fid, 2);
-            return 1;
-        }
-        // Integer literal.
-        x64_enc_mov_wide(0, cg_parse_int(n.a));
-        return 0;
+        // Phase 3.4 Wave 2: dispatch through cg_emit_lit (spine
+        // helper) which routes to chip primitives.
+        return cg_emit_lit(n.a);
     }
 
     // ── Variable reference ──
@@ -1860,6 +1846,10 @@ void x64_mod_init() {
 // Emit code for one module. Returns code_start offset in x64_enc_buf.
 void emit_module_x86_64(mi) {
     auto fn_start, code_start, i, rec, name_p, idx, j;
+
+    // Phase 3.4: re-install this chip's primitives (see
+    // cg_install_x86_64_primitives header for why this matters).
+    cg_install_x86_64_primitives();
 
     fn_start = arr_len(cg_fn_name);
 
