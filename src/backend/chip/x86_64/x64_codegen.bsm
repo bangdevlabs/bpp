@@ -77,6 +77,8 @@ void cg_install_x86_64_primitives() {
     p.emit_mov_imm          = fn_ptr(_x64_emit_mov_imm);
     p.emit_load_str_addr    = fn_ptr(_x64_emit_load_str_addr);
     p.emit_load_float_const = fn_ptr(_x64_emit_load_float_const);
+    p.emit_load_local       = fn_ptr(_x64_emit_load_local);
+    p.emit_load_global      = fn_ptr(_x64_emit_load_global);
 }
 
 void init_codegen_x86_64() {
@@ -212,7 +214,10 @@ static void x64_pre_reg_vars(arr, cnt) {
 
 // Emit a sized load from [rbp - off] into rax/xmm0 based on forced type.
 // Returns 1 if float, 0 if integer.
-static x64_emit_load_var(vi, off) {
+// Public — Phase 3.4 Wave 3 wraps this as `_x64_emit_load_local`
+// inside x64_primitives.bsm. Mirror of a64_emit_load_var; B3
+// short-circuit + sub-word matrix stay chip-private.
+x64_emit_load_var(vi, off) {
     auto fty, _preg;
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
@@ -501,29 +506,16 @@ static x64_emit_node(nd) {
     // ── Variable reference ──
     if (t == T_VAR) {
         vi = cg_var_idx(n.a);
-        if (vi >= 0) {
+        // Stack struct: address-of stays inline (chip-specific
+        // lea, atypical case). See a64 counterpart.
+        if (vi >= 0 && arr_get(cg_var_stack, vi)) {
             off = arr_get(cg_var_off, vi);
-            // Stack struct: return address of the struct on the stack.
-            if (arr_get(cg_var_stack, vi)) {
-                x64_enc_lea(0, 5, off);
-                return 0;
-            }
-            // Type-aware load: uses the correct instruction for the variable's size.
-            return x64_emit_load_var(vi, off);
+            x64_enc_lea(0, 5, off);
+            return 0;
         }
-        // Global variable.
-        if (is_float_type(ty_get_global_type(n.a))) {
-            auto dpos;
-            dpos = x64_enc_lea_rip(10);
-            x64_enc_add_reloc(dpos, n.a, 0);
-            x64_enc_load_sd(0, 10, 0);
-            return 1;
-        }
-        auto dpos;
-        dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, n.a, 0);
-        x64_enc_load(0, 10, 0);
-        return 0;
+        // Phase 3.4 Wave 3: non-stack local + global handled by
+        // the spine helper.
+        return cg_emit_var(n.a);
     }
 
     // Conditional expression `cond ? then : else`. Short-circuit by contract:

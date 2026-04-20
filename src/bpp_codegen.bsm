@@ -135,9 +135,11 @@ struct ChipPrimitives {
     emit_cmp,           // (rs1, rs2, size)      flags-setting
     emit_cmp_imm,       // (rs, imm, size)
 
-    // ── Memory (5) ──
+    // ── Memory (6) ──
     emit_load,          // (rd, rbase, off, size, signed)
     emit_store,         // (rsrc, rbase, off, size)
+    emit_load_local,    // (vi, off) — wraps chip's emit_load_var
+                        //              with B3 promoted-reg + sub-word matrix
     emit_load_global,   // (name_p, is_float)
     emit_store_global,  // (name_p, is_float)
     emit_load_str_addr, // (str_id)
@@ -228,6 +230,36 @@ cg_emit_lit(packed) {
         return 1;
     }
     call(p.emit_mov_imm, cg_parse_int(packed));
+    return 0;
+}
+
+// T_VAR (Wave 3): variable reference. Three sub-cases:
+//   1. Local var with cg_var_stack[vi] true: stack-allocated
+//      struct; the address-of path is left INLINE in the chip's
+//      emit_node body (chip-specific add-immediate, rare case)
+//      and this helper is not called for it.
+//   2. Local var (non-stack): delegates to the chip's load_local
+//      primitive which carries the B3 promoted-register
+//      short-circuit and the sub-word dispatch matrix.
+//   3. Global var: dispatches via load_global with an is_float
+//      flag picked from the inferred global type.
+cg_emit_var(packed) {
+    auto p: ChipPrimitives, vi, off;
+    p = cg_prim;
+    vi = cg_var_idx(packed);
+    if (vi >= 0) {
+        off = arr_get(cg_var_off, vi);
+        // Caller must have peeled the stack-struct sub-case
+        // before calling us — reaching here with cg_var_stack[vi]
+        // set means the chip-side code didn't honour the protocol.
+        return call(p.emit_load_local, vi, off);
+    }
+    // Else: global var. Inferred type drives the float vs int dispatch.
+    if (is_float_type(ty_get_global_type(packed))) {
+        call(p.emit_load_global, packed, 1);
+        return 1;
+    }
+    call(p.emit_load_global, packed, 0);
     return 0;
 }
 

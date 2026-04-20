@@ -99,6 +99,8 @@ void cg_install_arm64_primitives() {
     p.emit_mov_imm          = fn_ptr(_a64_emit_mov_imm);
     p.emit_load_str_addr    = fn_ptr(_a64_emit_load_str_addr);
     p.emit_load_float_const = fn_ptr(_a64_emit_load_float_const);
+    p.emit_load_local       = fn_ptr(_a64_emit_load_local);
+    p.emit_load_global      = fn_ptr(_a64_emit_load_global);
 }
 
 void init_codegen_arm64() {
@@ -252,7 +254,9 @@ static _a64_has_call(nd) : base {
 // cg_str_eq, cg_str_eq_packed live in bpp_codegen.bsm.
 
 // Print a packed string to stdout.
-static void a64_print_p(p) {
+// Public so a64_primitives.bsm can use the same packed-name
+// printer when emitting global-relocation operands in asm mode.
+void a64_print_p(p) {
     print_buf(cg_sbuf + unpack_s(p), unpack_l(p));
 }
 
@@ -371,7 +375,11 @@ static void a64_pre_reg_vars(arr, cnt) {
 // explicit type annotation. Only uses sub-word ops when the programmer
 // declared a type hint. Inferred types always use 64-bit load.
 // Returns 1 if result is in d0 (float), 0 if in x0 (integer).
-static a64_emit_load_var(vi, off) {
+// Public — Phase 3.4 Wave 3 wraps this as `_a64_emit_load_local`
+// inside a64_primitives.bsm. Keeps the B3 promoted-reg
+// short-circuit and the SL_DOUBLE/HALF/QUARTER + sub-word
+// dispatch chip-private; the spine just calls through.
+a64_emit_load_var(vi, off) {
     auto fty, sl, _preg;
     // Phase B3: promoted local — emit register move, skip stack load.
     _preg = arr_get(cg_var_promote, vi);
@@ -759,41 +767,19 @@ static a64_emit_node(nd) {
 
     if (t == T_VAR) {
         vi = cg_var_idx(n.a);
-        if (vi >= 0) {
+        // Stack struct: address-of stays inline (chip-specific add
+        // immediate, atypical case — Phase 3.4 leaves it here so
+        // Wave 3 can ship without expanding the contract for one
+        // edge case).
+        if (vi >= 0 && arr_get(cg_var_stack, vi)) {
             off = arr_get(cg_var_off, vi);
-            // Stack struct: return the address of the struct on the stack.
-            if (arr_get(cg_var_stack, vi)) {
-                if (a64_bin_mode) { enc_add_imm(0, 29, off); }
-                else { out("  add x0, x29, #"); a64_print_dec(off); putchar('\n'); }
-                return 0;
-            }
-            // Type-aware load: uses the correct instruction for the variable's size.
-            return a64_emit_load_var(vi, off);
+            if (a64_bin_mode) { enc_add_imm(0, 29, off); }
+            else { out("  add x0, x29, #"); a64_print_dec(off); putchar('\n'); }
+            return 0;
         }
-        // Global variable: load address then load value.
-        // Check if the global was inferred as float across all functions.
-        if (is_float_type(ty_get_global_type(n.a))) {
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, n.a, 0);
-                enc_adrp(8); enc_add_imm(8, 8, 0);
-                enc_ldr_d_uoff(0, 8, 0);
-            } else {
-                out("  adrp x8, _"); a64_print_p(n.a); out("@PAGE"); putchar('\n');
-                out("  add x8, x8, _"); a64_print_p(n.a); out("@PAGEOFF"); putchar('\n');
-                out("  ldr d0, [x8]"); putchar('\n');
-            }
-            return 1;
-        }
-        if (a64_bin_mode) {
-            enc_add_reloc(enc_pos, n.a, 0);
-            enc_adrp(8); enc_add_imm(8, 8, 0);
-            enc_ldr_uoff(0, 8, 0);
-        } else {
-            out("  adrp x8, _"); a64_print_p(n.a); out("@PAGE"); putchar('\n');
-            out("  add x8, x8, _"); a64_print_p(n.a); out("@PAGEOFF"); putchar('\n');
-            out("  ldr x0, [x8]"); putchar('\n');
-        }
-        return 0;
+        // Phase 3.4 Wave 3: non-stack local + global handled by
+        // the spine helper, which dispatches via cg_prim.
+        return cg_emit_var(n.a);
     }
 
     // Conditional expression `cond ? then : else`. Short-circuit by contract:
