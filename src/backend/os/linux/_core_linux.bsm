@@ -1,0 +1,160 @@
+// _core_linux.bsm — Linux x86_64 core runtime.
+//
+// Consolidates what used to be three separate files
+// (_brt0_linux, _bmem_linux, _stb_core_linux) into a single
+// ~200-line module. Kept separate: `_bsys_linux.bsm` holds the
+// BSYS_* syscall-number constants (pulled into the compiler for
+// cross-compile, while this runtime file is only auto-injected
+// for programs TARGETING Linux). Mirrors the _core_macos.bsm
+// layout so bpp_beat, bpp_job, and bpp_maestro can import
+// "_core.bsm" generically and target-suffix resolution picks the
+// right platform.
+//
+//   Section 1 — Runtime startup globals (_bpp_argc/argv/envp)
+//   Section 2 — Heap (malloc / free / realloc / memcpy)
+//   Section 3 — Time + threads
+
+// ── Section 1: Runtime startup globals ────────────────────────
+//
+// The _start stub (emitted by x64_elf.bsm) extracts argc from
+// the kernel stack, computes argv and envp, then calls
+// main(argc, argv, envp). main()'s prologue saves RDI/RSI/RDX
+// to these globals. Accessor builtins (argc_get, argv_get,
+// envp_get) read from here.
+//
+// The _start machine code stays in x64_elf.bsm because it's raw
+// bytes emitted into the text segment, not a B++ function.
+
+global _bpp_argc;
+global _bpp_argv;
+global _bpp_envp;
+
+// ── Section 2: Heap ───────────────────────────────────────────
+//
+// Each allocation maps a private, anonymous region via sys_mmap.
+// A 16-byte header sits immediately before the user pointer:
+//   user_ptr - 16: original raw mmap base
+//   user_ptr -  8: total mmap size in bytes
+//
+// Static ELF binaries have no libc available, so this module IS
+// the allocator — not a wrapper. Deliberately simple: one mmap
+// per allocation, no free list.
+
+// mmap protection: PROT_READ | PROT_WRITE.
+const _BMEM_PROT_RW = 3;
+
+// mmap flags on Linux: MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20).
+const _BMEM_FLAGS = 0x22;
+
+// Header size — 8 bytes for the raw mmap pointer plus 8 bytes
+// for the total mmap size.
+const _BMEM_HEADER = 16;
+
+// Error return from sys_mmap (and the "no fd" sentinel for anon).
+const _BMEM_FAIL = 0 - 1;
+
+malloc(size) {
+    auto raw, total;
+    total = size + _BMEM_HEADER;
+    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    *raw = raw;
+    *(raw + 8) = total;
+    return raw + _BMEM_HEADER;
+}
+
+malloc_aligned(size, alignment) {
+    auto raw, total, user;
+    total = size + alignment + _BMEM_HEADER;
+    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    user = (raw + _BMEM_HEADER + alignment - 1) / alignment * alignment;
+    *(user - _BMEM_HEADER) = raw;
+    *(user - 8) = total;
+    return user;
+}
+
+void free(p) {
+    auto raw, total;
+    if (p == 0) { return; }
+    raw = *(p - _BMEM_HEADER);
+    total = *(p - 8);
+    sys_munmap(raw, total);
+}
+
+realloc(p, new_size) {
+    auto new_p, old_size, raw, total, limit;
+    if (p == 0) { return malloc(new_size); }
+    raw = *(p - _BMEM_HEADER);
+    total = *(p - 8);
+    old_size = total - (p - raw);
+    new_p = malloc(new_size);
+    if (new_p == 0) { return 0; }
+    limit = old_size;
+    if (new_size < limit) { limit = new_size; }
+    memcpy(new_p, p, limit);
+    free(p);
+    return new_p;
+}
+
+memcpy(dst, src, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + i, peek(src + i));
+    }
+    return dst;
+}
+
+// ── Section 3: Time + threads ─────────────────────────────────
+//
+// Time uses the clock_gettime syscall directly (no shared lib).
+// Threads are STUBS until ELF dynamic linking lands — pthread
+// lives in libpthread.so which requires PLT/GOT support that
+// x64_elf.bsm does not yet provide. Programs that call job_init
+// on Linux will get 0 (failure) from _stb_thread_create and the
+// worker pool will be empty.
+
+// Lazy-initialized on first _stb_get_time call.
+static auto _plt_time_base;
+static auto _plt_time_inited;
+
+// Read the monotonic clock via syscall. Returns ms since boot.
+// clock_gettime(CLOCK_MONOTONIC=1, &timespec) → syscall 228.
+// timespec is 16 bytes: tv_sec (8) + tv_nsec (8).
+static _plt_now_ms() {
+    auto ts, sec, nsec;
+    ts = malloc(16);
+    sys_clock_gettime(1, ts);
+    sec = *(ts);
+    nsec = *(ts + 8);
+    free(ts);
+    return sec * 1000 + nsec / 1000000;
+}
+
+// Current time in ms since first call. Lazy-initialized so any
+// program can use the clock without _stb_init_window setup.
+_stb_get_time() {
+    if (_plt_time_inited == 0) {
+        _plt_time_base = _plt_now_ms();
+        _plt_time_inited = 1;
+    }
+    return _plt_now_ms() - _plt_time_base;
+}
+
+// pthread_create lives in libpthread.so (or libc.so on modern
+// glibc). B++'s x64_elf.bsm writes static ELF — no PLT, no GOT,
+// no DT_NEEDED. Until ELF dynamic linking ships, these stubs
+// return failure so that job_init gracefully falls back to zero
+// workers (all work runs on the main thread, correct but
+// sequential).
+//
+// When ELF dynlink lands, these stubs will be replaced with real
+// pthread_create/pthread_join calls, mirroring _core_macos.bsm.
+
+_stb_thread_create(start_fn, arg) {
+    return 0;  // 0 = failure (no thread created)
+}
+
+_stb_thread_join(tid) {
+    return 0;  // no-op (no thread to join)
+}

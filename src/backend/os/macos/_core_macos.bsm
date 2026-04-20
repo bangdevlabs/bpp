@@ -1,0 +1,230 @@
+// _core_macos.bsm — macOS ARM64 core runtime.
+//
+// Consolidates what used to be three separate files
+// (_brt0_macos, _bmem_macos, _stb_core_macos) into a single
+// ~220-line module. The libc-style three-way split (crt0 /
+// malloc / time+threads) made sense at libc scale; at B++ scale
+// it was fragmentation without purpose. B++ isn't C — we can
+// ship tight cohesive OS adapters and move on.
+//
+// Kept separate: `_bsys_macos.bsm`, which holds the BSYS_*
+// syscall-number constants. Those constants are pulled into the
+// compiler itself so codegen can cross-compile (macOS host
+// needs Linux syscall numbers too), while this runtime file is
+// only auto-injected for programs TARGETING macOS. Merging the
+// two would cause Linux's malloc to land in a macOS compiler
+// build — duplicate-symbol hell.
+//
+// This file ships:
+//   Section 1 — Runtime startup globals (_bpp_argc/argv/envp)
+//   Section 2 — Heap (malloc / free / realloc / memcpy)
+//   Section 3 — Time + threads (_stb_get_time / threads)
+//
+// Auto-injected for every macOS program via the compiler's
+// `_core.bsm` import block. User programs that want more (audio,
+// window, GPU) pull in the bigger stb modules on top.
+
+import "System.B" {
+    long mach_absolute_time();
+    int mach_timebase_info(ptr);
+    // pthread is part of libSystem on macOS — already linked, no
+    // additional flag needed. The third argument to pthread_create
+    // is the entry function pointer; the calling-convention bridge
+    // (B++ long long(long long) <-> pthread void*(void*)) is verified
+    // by tests/test_thread.bpp.
+    int pthread_create(ptr, ptr, ptr, ptr);
+    int pthread_join(long, ptr);
+}
+
+// ── Section 1: Runtime startup globals ────────────────────────
+//
+// macOS uses LC_MAIN, so dyld calls main(argc, argv, envp) with
+// standard calling convention. The codegen emits a save sequence
+// at the top of main() that stores x0/x1/x2 to these globals.
+// Accessor builtins (argc_get, argv_get, envp_get) read from here.
+//
+// Worker-safe: written once in main()'s prologue, read anywhere.
+// Marked `global` so smart dispatch treats reads from any thread
+// as safe.
+
+global _bpp_argc;
+global _bpp_argv;
+global _bpp_envp;
+
+// ── Section 2: Heap ───────────────────────────────────────────
+//
+// Each allocation maps a private, anonymous region via sys_mmap.
+// A 16-byte header sits immediately before the user pointer:
+//   user_ptr - 16: original raw mmap base (so free finds the page)
+//   user_ptr -  8: total mmap size in bytes (so free knows to unmap)
+//
+// Regular malloc(size) lays out: raw → [raw_ptr | total | user].
+// malloc_aligned(size, align) over-allocates and slides the user
+// pointer to land on an `align`-byte boundary, writing the same
+// header into the preceding 16 bytes. free() handles both.
+//
+// Deliberately simple: one mmap per allocation, no free list.
+// A real free-list allocator replaces this module eventually.
+
+// mmap protection: PROT_READ | PROT_WRITE.
+const _BMEM_PROT_RW = 3;
+
+// mmap flags on macOS: MAP_PRIVATE (0x0002) | MAP_ANON (0x1000).
+const _BMEM_FLAGS = 0x1002;
+
+// Header size — 8 bytes for the raw mmap pointer plus 8 bytes
+// for the total mmap size. Sits immediately before user pointer.
+const _BMEM_HEADER = 16;
+
+// Error return from sys_mmap (and the "no fd" sentinel for anon).
+const _BMEM_FAIL = 0 - 1;
+
+// Allocate `size` bytes. Returns a pointer the caller can write
+// through, or 0 if the kernel refused the mapping.
+malloc(size) {
+    auto raw, total;
+    total = size + _BMEM_HEADER;
+    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    *raw = raw;
+    *(raw + 8) = total;
+    return raw + _BMEM_HEADER;
+}
+
+// Allocate `size` bytes whose user pointer is a multiple of
+// `alignment`. `alignment` must be a power of two. Callers wanting
+// SIMD-friendly buffers typically pass 16 (NEON/SSE) or 32 (AVX).
+malloc_aligned(size, alignment) {
+    auto raw, total, user;
+    total = size + alignment + _BMEM_HEADER;
+    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
+    if (raw == _BMEM_FAIL) { return 0; }
+    // Slide the user pointer forward so it sits on an alignment
+    // boundary and leaves at least _BMEM_HEADER bytes between the
+    // mmap base and the user region for the back-pointer header.
+    user = (raw + _BMEM_HEADER + alignment - 1) / alignment * alignment;
+    *(user - _BMEM_HEADER) = raw;
+    *(user - 8) = total;
+    return user;
+}
+
+// Release memory previously returned by malloc or malloc_aligned.
+// Safe to call with 0. Reads the back-pointer and total size from
+// the header.
+void free(p) {
+    auto raw, total;
+    if (p == 0) { return; }
+    raw = *(p - _BMEM_HEADER);
+    total = *(p - 8);
+    sys_munmap(raw, total);
+}
+
+// Resize an existing allocation. On success returns the new
+// pointer (may differ from the old one). On failure returns 0 and
+// leaves the old block alive so the caller can recover.
+realloc(p, new_size) {
+    auto new_p, old_size, raw, total, limit;
+    if (p == 0) { return malloc(new_size); }
+    raw = *(p - _BMEM_HEADER);
+    total = *(p - 8);
+    // The user region runs from p up to the end of the mmap'd page.
+    old_size = total - (p - raw);
+    new_p = malloc(new_size);
+    if (new_p == 0) { return 0; }
+    limit = old_size;
+    if (new_size < limit) { limit = new_size; }
+    memcpy(new_p, p, limit);
+    free(p);
+    return new_p;
+}
+
+// Copy `n` bytes from `src` to `dst`. Returns `dst` for chaining.
+// Byte-by-byte loop — simple and portable; future optimization
+// can use word-sized copies when both pointers are 8-byte aligned.
+memcpy(dst, src, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) {
+        poke(dst + i, peek(src + i));
+    }
+    return dst;
+}
+
+// ── Section 3: Time + threads ─────────────────────────────────
+//
+// Auto-injected for ANY user main() program — not just games.
+// CLI tools, audio plugins, batch processors, network servers,
+// any B++ program that wants a clock or worker pool gets this
+// without having to import stbgame.
+//
+// The "core" platform layer is the universal substrate. The
+// companion _stb_platform_macos.bsm adds window/input/GPU/draw on
+// top of it for programs that import stbgame.
+
+// Timing globals — lazy-initialized on first _stb_get_time call.
+// _plt_time_denom doubles as the init sentinel: it starts at 0
+// (BSS) and becomes a non-zero timebase ratio after init, so
+// checking `_plt_time_denom == 0` reliably detects "not yet
+// initialized" without an extra boolean flag.
+// Rule 1: set once in lazy init, never written again.
+// Rule 2: only this file reads/writes them.
+static extrn _plt_time_base, _plt_time_numer, _plt_time_denom;
+
+// Return current time in milliseconds since first call. Lazy-
+// initializes the mach timebase on first call so this function
+// works in any program — no _stb_init_window or other setup
+// required.
+//
+// The two reads of mach_timebase_info are inlined byte-by-byte
+// instead of using bpp_buf::read_u32 so this file has zero .bsm
+// dependencies. The struct returned by mach_timebase_info is two
+// u32 fields packed in 8 bytes (numer at offset 0, denom at
+// offset 4), little-endian.
+_stb_get_time() {
+    auto info, now, ticks, ns;
+    if (_plt_time_denom == 0) {
+        info = malloc(8);
+        mach_timebase_info(info);
+        _plt_time_numer = peek(info) + peek(info + 1) * 256
+                        + peek(info + 2) * 65536 + peek(info + 3) * 16777216;
+        _plt_time_denom = peek(info + 4) + peek(info + 5) * 256
+                        + peek(info + 6) * 65536 + peek(info + 7) * 16777216;
+        free(info);
+        _plt_time_base = mach_absolute_time();
+    }
+    now = mach_absolute_time();
+    ticks = now - _plt_time_base;
+    ns = ticks * _plt_time_numer / _plt_time_denom;
+    return ns / 1000000;
+}
+
+// stbjob and stbmaestro use these wrappers instead of calling
+// pthread directly so the rest of the runtime stays platform-
+// agnostic. When ELF dynamic linking lands on Linux,
+// _core_linux.bsm will gain matching wrappers and bpp_job inherits
+// Linux support with no library changes.
+//
+// _stb_thread_create takes a B++ function pointer and an argument,
+// allocates a slot for the pthread_t handle, calls pthread_create,
+// and returns the handle (or 0 on failure). The entry function
+// must have the B++ signature `long long(long long)` — the bridge
+// to pthread's `void*(void*)` is bit-compatible because both ABIs
+// pass the first argument in x0/rdi and the return in x0/rax for
+// one-arg/one-return functions. Validated by tests/test_thread.bpp.
+_stb_thread_create(start_fn, arg) {
+    auto tid_buf, rc, tid;
+    tid_buf = malloc(8);
+    *tid_buf = 0;
+    rc = pthread_create(tid_buf, 0, start_fn, arg);
+    if (rc != 0) { free(tid_buf); return 0; }
+    tid = *tid_buf;
+    free(tid_buf);
+    return tid;
+}
+
+// Block until the given thread exits and reap its resources.
+// Returns 0 on success, non-zero on error. The retval slot is
+// passed as NULL because B++ thread entry points return through
+// the B++ ABI (long long), not via pthread's void* slot.
+_stb_thread_join(tid) {
+    return pthread_join(tid, 0);
+}

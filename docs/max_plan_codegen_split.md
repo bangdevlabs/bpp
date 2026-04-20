@@ -3,21 +3,56 @@
 **Goal.** Extract all portable code from
 `src/backend/chip/aarch64/a64_codegen.bsm` (3189 lines) and
 `src/backend/chip/x86_64/x64_codegen.bsm` (2308 lines) into a
-single shared `src/backend/codegen_core.bsm`. Each chip backend
+single shared `src/backend/bpp_codegen.bsm`. Each chip backend
 shrinks to a thin `chip_primitives` layer (~300 lines), making
 B++ "Forth-portable": port to a new ISA by writing ~30 primitive
 emit functions.
 
-**Invariant.** The `bpp` binary shasum does not change across the
-entire refactor. This is a pure reorganization: same AST in, same
-bytes out. Any hash divergence means a semantic change slipped
+**Invariant (revised).** The `bpp` binary's OWN shasum shifts
+harmlessly across the refactor — moving globals between source
+files changes the data-section layout of the self-hosted
+compiler, even when the emitted code is semantically identical.
+The stronger and more useful invariant is:
+
+> **Compiling any user program with the refactored `bpp` produces
+> byte-identical output to the baseline `bpp`.**
+
+This is what users actually care about: their games, their tools,
+their IDE all compile to the exact same bytes before and after
+the refactor. Any divergence here means a semantic change slipped
 in — roll back immediately.
 
-**Baseline shasum** (captured before any edit to `src/backend/`):
+**Validation method** — after any Phase 1+ change:
+
+```sh
+# Baseline (captured before the refactor started):
+./bpp games/pathfind/pathfind.bpp -o /tmp/pathfind_baseline
+./bpp games/rhythm/rhythm.bpp    -o /tmp/rhythm_baseline
+./bpp bang9/bang9.bpp            -o /tmp/bang9_baseline
+
+# After the change, recompile bpp from source:
+./bpp src/bpp.bpp -o /tmp/bpp_refactor
+
+# Compile the same programs with the refactored bpp:
+/tmp/bpp_refactor games/pathfind/pathfind.bpp -o /tmp/pathfind_refactor
+/tmp/bpp_refactor games/rhythm/rhythm.bpp    -o /tmp/rhythm_refactor
+/tmp/bpp_refactor bang9/bang9.bpp            -o /tmp/bang9_refactor
+
+# All three pairs must hash-match:
+shasum /tmp/pathfind_{baseline,refactor}
+shasum /tmp/rhythm_{baseline,refactor}
+shasum /tmp/bang9_{baseline,refactor}
+```
+
+**Phase 1 sub-step 1 validation** (switch globals `cg_sw_min/max/total`):
 
 ```
-8c272d4a01e751ee92d98c19285ef89981684c6a  /tmp/bpp_baseline
+✓ games/pathfind/pathfind.bpp  d5124354cd40cc7673379a5772a7087940bf1671
+✓ games/rhythm/rhythm.bpp      585e6de9643e8a3291f35e340514a6611d1d864d
+✓ bang9/bang9.bpp              6703fc7cb5ff3fc7e826f2d8e386fdbfda25a194
 ```
+
+All three byte-identical. The mechanism works.
 
 ---
 
@@ -29,7 +64,7 @@ in — roll back immediately.
 | `chip/aarch64/a64_enc.bsm`     |  864 | encoder (chip-specific — stays) |
 | `chip/x86_64/x64_codegen.bsm`  | 2308 | 40 |
 | `chip/x86_64/x64_enc.bsm`      |  991 | encoder (chip-specific — stays) |
-| `codegen_core.bsm`             |   ~20 | empty scaffold (ready) |
+| `bpp_codegen.bsm`             |   ~20 | empty scaffold (ready) |
 
 ---
 
@@ -39,7 +74,7 @@ Each function in the two `_codegen.bsm` files classifies as one
 of three kinds:
 
 - **[P] Portable** — no chip-specific emission. Moves to
-  `codegen_core.bsm` with the prefix dropped.
+  `bpp_codegen.bsm` with the prefix dropped.
 - **[C] Chip-specific** — emits instruction bytes or asm text.
   Stays in the chip file, renamed to `chip_emit_*`.
 - **[M] Mixed** — mostly portable but calls chip emitters mid-way.
@@ -137,12 +172,12 @@ don't deduplicate during extraction.
 
 | Kind | a64 | x64 | Total | Disposition |
 |------|-----|-----|-------|-------------|
-| [P] Portable | 23 | 18 | 41 (deduplicates to ~22) | moves to `codegen_core.bsm` |
+| [P] Portable | 23 | 18 | 41 (deduplicates to ~22) | moves to `bpp_codegen.bsm` |
 | [C] Chip-only | 17 | 16 | 33 | renamed `chip_emit_*`, stays |
 | [M] Mixed | 14 | 6 | 20 | split — spine to core, emit to chip |
 
 After the split:
-- `codegen_core.bsm`: ~2000 lines (20 P functions + spines of 20 M functions)
+- `bpp_codegen.bsm`: ~2000 lines (20 P functions + spines of 20 M functions)
 - `a64_primitives.bsm`: ~400 lines (17 C + chip halves of 14 M)
 - `x64_primitives.bsm`: ~350 lines (16 C + chip halves of 6 M)
 - Total backend reduction: ~2000 lines of duplicated logic deleted.
@@ -152,12 +187,12 @@ After the split:
 ## Shared globals that need to move
 
 These are declared as `auto` in each `_codegen.bsm` but are
-structurally identical — moving them to `codegen_core.bsm` with
+structurally identical — moving them to `bpp_codegen.bsm` with
 a single name is the other half of the refactor.
 
 | Current names | Shared name | Owner |
 |---|---|---|
-| `a64_sbuf` / `x64_sbuf` | `cg_sbuf` | codegen_core |
+| `a64_sbuf` / `x64_sbuf` | `cg_sbuf` | bpp_codegen |
 | `a64_vars` / `x64_vars` | `cg_vars` | |
 | `a64_var_stack` / `x64_var_stack` | `cg_var_stack` | |
 | `a64_var_struct_idx` / `x64_var_struct_idx` | `cg_var_struct_idx` | |
@@ -203,36 +238,86 @@ allocated even though only one chip is active at a time.
 Done. This document captures what moves, what stays, and the
 shared-global rename table.
 
-### Phase 1 — Extract globals first (next session)
+### Phase 1.A / 1.B / 2 / 3.1 / 3.3 — COMPLETE (this session)
+
+Done in sequence, byte-identity validated after each sub-step:
+
+**Phase 1.A** — `os/` consolidation: `_core_<os>.bsm` replaces
+the libc-style split (`_bsys`, `_brt0`, `_bmem`, `_stb_core`).
+macOS: 7 → 5 files. Linux: 6 → 4 files.
+
+**Phase 2 Blocks A-F** — Portable utilities extracted to
+`bpp_codegen.bsm`:
+- Block A: `cg_sbuf` + string helpers (str_eq, str_eq_packed,
+  parse_int, is_float_lit)
+- Block B: variable table (8 globals + var_add/idx/find)
+- Block C: function/extern tables (11 globals + 5 helpers)
+- Block D: switch_is_dense + cg_sw_* globals
+- Block E: B3 optimisation (b3_eligible, b3_walk)
+- Block F: counters/loop state + var_type, var_is_float, new_lbl
+
+**Phase 3.1** — `cg_bridge_data` (parser → codegen state).
+**Phase 3.3** — `cg_bind_startup_syms` + cg_argc/argv/envp_sym.
+
+Line counts at end of session:
+
+| file | start | after 3.3 | delta |
+|------|-------|-----------|-------|
+| a64_codegen.bsm | 3189 | 2852 | **−337** |
+| x64_codegen.bsm | 2308 | 2004 | **−304** |
+| bpp_codegen.bsm | 0 | 598 | +598 |
+
+**Phase 3.4 — DESIGN COMPLETE, EXECUTION PENDING.**
+See `docs/phase_3_4_chip_primitives.md` for the full contract
+and 12-wave migration plan. Handed off to the Emacs-side agent.
+
+---
+
+### Phase 1 — Extract globals (in progress)
 
 Strategy: rename all `a64_*` globals in `a64_codegen.bsm` to
-`cg_*`, move their declarations to `codegen_core.bsm`, import
-`codegen_core.bsm` from `a64_codegen.bsm`. Same for x64.
+`cg_*`, move their declarations to `src/bpp_codegen.bsm`, import
+`bpp_codegen.bsm` from `a64_codegen.bsm`. Same for x64.
 
 Each global rename is mechanical:
-1. Add `auto cg_X;` in `codegen_core.bsm`
+1. Add `auto cg_X;` in `bpp_codegen.bsm`
 2. Replace `a64_X` with `cg_X` in `a64_codegen.bsm` (globals only,
    not function names)
 3. Replace `x64_X` with `cg_X` in `x64_codegen.bsm`
 4. Delete the `auto a64_X;` and `auto x64_X;` declarations
-5. Bootstrap + check shasum
+5. Bootstrap + verify user-program byte-identity
 
-Byte-identity holds because: the `auto x;` name is internal to
-the compiler; the emitted output bytes don't depend on the source
-identifier. **We verify after every global rename.**
+**Phase 1 sub-step 1 complete.** Globals `cg_sw_min`, `cg_sw_max`,
+`cg_sw_total` (switch-analysis state) moved to bpp_codegen.
+a64's 23 references renamed in one pass. Byte-identity confirmed
+for pathfind, rhythm, bang9.
 
-Expected effort: ~1 session (there are ~40 globals, each rename
-is 5 minutes of mechanical work + bootstrap).
+Remaining subgroups (each is one sub-step with its own validation):
+- `cg_sbuf` — the AST string buffer (both chips reference)
+- `cg_vars`, `cg_var_*` — variable table (10 parallel arrays)
+- `cg_fn_name/par/pcnt/body/bcnt/fidx` — function table
+- `cg_gl_name` — global variable list
+- `cg_ex_name/ret/args/acnt` — extern table
+- `cg_flt_tbl`, `cg_str_tbl` — literal pools
+- `cg_lbl_cnt`, `cg_depth` — counters
+- `cg_break_stack`, `cg_continue_stack` — loop stacks
+- `cg_cur_fn_name/idx` — current function context
+- `cg_bin_mode` — a64 only (x64 always binary)
+- `cg_fn_lbl`, `cg_ret_lbl` — function label ids
+- `cg_promoted_regs` — B3 promotion (different per chip?)
+
+Expected effort: ~1 session for remaining globals. Each sub-step
+bootstraps and validates before moving to the next.
 
 ### Phase 2 — Move [P] functions (next sessions)
 
 For each portable function (in priority order, smallest first):
-1. Copy function body to `codegen_core.bsm` with prefix dropped
+1. Copy function body to `bpp_codegen.bsm` with prefix dropped
 2. In `a64_codegen.bsm` + `x64_codegen.bsm`, replace the body
    with a single forward call to the shared version
 3. Bootstrap, check shasum
 4. Once both chips compile against it, **delete** the chip-local
-   forwarders. Body now lives only in codegen_core.
+   forwarders. Body now lives only in bpp_codegen.
 
 Candidate order (smallest + lowest-dependency first):
 1. `str_eq_packed` (~10 lines, no deps)
@@ -261,7 +346,7 @@ and replace the emission code with a call to `chip_emit_*`. The
 `chip_emit_*` functions go into `a64_primitives.bsm` /
 `x64_primitives.bsm` (new files).
 
-The chip_primitives contract (see header of `codegen_core.bsm`
+The chip_primitives contract (see header of `bpp_codegen.bsm`
 for the 39-function list) is locked in Phase 3 — adding a new
 primitive forces updating all chips. Design discipline matters.
 
@@ -271,7 +356,7 @@ Expected effort: ~5 sessions (the heavy lifting).
 
 After Phase 3, `a64_codegen.bsm` has `emit_node` with the same
 tree-walk dispatch as `x64_codegen.bsm`'s `emit_node`. Move the
-shared spine to `codegen_core.bsm`, leaving only
+shared spine to `bpp_codegen.bsm`, leaving only
 `chip_primitives` in the chip files.
 
 Expected effort: ~2 sessions.
@@ -311,7 +396,7 @@ Expected effort: ~1 session.
 ## Open questions
 
 1. **Asm mode in x64.** a64 has `out("...")` asm mode; x64 is
-   binary-only. Does codegen_core carry an `IF bin_mode` fork
+   binary-only. Does bpp_codegen carry an `IF bin_mode` fork
    throughout, or is asm mode a chip-specific concern that
    doesn't even make it into core? Recommendation: **keep asm
    mode chip-local to a64**. Core emits via abstract primitives;

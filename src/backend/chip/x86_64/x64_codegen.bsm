@@ -30,291 +30,88 @@ import "x64_enc.bsm";
 // x86_64 codegen always targets Linux (the chip+OS coupling B++ has today).
 // Import the Linux syscall table directly, not via target-suffix.
 import "_bsys_linux.bsm";
+// bpp_codegen holds the cross-chip globals and (eventually) the
+// portable passes shared with a64. See src/bpp_codegen.bsm and
+// docs/max_plan_codegen_split.md.
+import "bpp_codegen.bsm";
 
-auto x64_sbuf;
+// String buffer (cg_sbuf) now lives in bpp_codegen.bsm — shared
+// with a64. Set once by cg_bridge_data below.
 
-// Function table (parallel arrays, deduplicated from parser).
-auto x64_fn_name, x64_fn_par, x64_fn_pcnt, x64_fn_body, x64_fn_bcnt, x64_fn_fidx;
+// Function table (cg_fn_*), global-variable list (cg_gl_name),
+// and extern table (cg_ex_*) all live in bpp_codegen.bsm.
 
-// Global variable list.
-auto x64_gl_name;
+// Variable-table globals (cg_vars, cg_var_stack, cg_var_struct_idx,
+// cg_var_off, cg_var_forced_ty, cg_var_refs, cg_var_addr_taken,
+// cg_var_promote) + var_add/var_idx/var_find helpers live in
+// bpp_codegen.bsm — shared with a64.
 
-// FFI extern table (for future dynamic linking support).
-auto x64_ex_name, x64_ex_ret, x64_ex_args, x64_ex_acnt;
-
-// Current function's variable scope.
-auto x64_vars;
-
-// Stack struct tracking.
-auto x64_var_stack, x64_var_struct_idx, x64_var_off, x64_var_forced_ty;
-
-// Phase B3 — local register allocation (mirror of the ARM64 path).
-auto x64_var_refs;
-auto x64_var_addr_taken;
-auto x64_var_promote;
+// Phase B3 — local register allocation. x64_promoted_regs holds
+// x86 register numbers (chip-specific). x64_b3_spill_off is the
+// x86-specific spill base offset.
 auto x64_promoted_regs;
 auto x64_b3_spill_off;
 
-// Float literal table.
-auto x64_flt_tbl;
-
-// String literal table.
-auto x64_str_tbl;
-
-// Label counter and evaluation stack depth.
-auto x64_lbl_cnt, x64_depth;
-
-// Break label stack for while loops.
-auto x64_break_stack;
-
-// Continue label stack for while loops.
-// Plain while: lands just before the back-branch to top.
-// For-loops: lands just before the step expression.
-auto x64_continue_stack;
-
-// Current function context.
-auto x64_cur_fn_name, x64_cur_fn_idx;
+// Shared per-function state (cg_flt_tbl, cg_str_tbl, cg_lbl_cnt,
+// cg_depth, cg_break_stack, cg_continue_stack, cg_cur_fn_name,
+// cg_cur_fn_idx) lives in bpp_codegen.bsm.
 
 // Function entry labels and current return label.
 auto x64_fn_lbl, x64_ret_lbl;
 
 // Sentinel packed names for hidden argc/argv/envp globals.
-auto x64_argc_sym, x64_argv_sym, x64_envp_sym;
+// cg_argc_sym, cg_argv_sym, cg_envp_sym live in bpp_codegen.bsm.
 
 // ── Initialization ─────────────────────────────────────────
 
 void init_codegen_x86_64() {
-    x64_fn_name = arr_new(); x64_fn_par = arr_new();
-    x64_fn_pcnt = arr_new(); x64_fn_body = arr_new();
-    x64_fn_bcnt = arr_new(); x64_fn_fidx = arr_new();
-    x64_gl_name = arr_new();
-    x64_ex_name = arr_new(); x64_ex_ret = arr_new();
-    x64_ex_args = arr_new(); x64_ex_acnt = arr_new();
-    x64_vars = arr_new();
-    x64_var_stack = arr_new();
-    x64_var_struct_idx = arr_new();
-    x64_var_off = arr_new();
-    x64_var_forced_ty = arr_new();
-    x64_var_refs = arr_new();
-    x64_var_addr_taken = arr_new();
-    x64_var_promote = arr_new();
+    cg_fn_name = arr_new(); cg_fn_par = arr_new();
+    cg_fn_pcnt = arr_new(); cg_fn_body = arr_new();
+    cg_fn_bcnt = arr_new(); cg_fn_fidx = arr_new();
+    cg_gl_name = arr_new();
+    cg_ex_name = arr_new(); cg_ex_ret = arr_new();
+    cg_ex_args = arr_new(); cg_ex_acnt = arr_new();
+    cg_vars = arr_new();
+    cg_var_stack = arr_new();
+    cg_var_struct_idx = arr_new();
+    cg_var_off = arr_new();
+    cg_var_forced_ty = arr_new();
+    cg_var_refs = arr_new();
+    cg_var_addr_taken = arr_new();
+    cg_var_promote = arr_new();
     x64_promoted_regs = arr_new();
-    x64_flt_tbl = arr_new();
-    x64_str_tbl = arr_new();
-    x64_lbl_cnt = 0; x64_depth = 0;
-    x64_break_stack = arr_new();
-    x64_continue_stack = arr_new();
+    cg_flt_tbl = arr_new();
+    cg_str_tbl = arr_new();
+    cg_lbl_cnt = 0; cg_depth = 0;
+    cg_break_stack = arr_new();
+    cg_continue_stack = arr_new();
     x64_fn_lbl = arr_new();
     x64_ret_lbl = 0;
     // Initialized to 0 (invalid packed name). Real values are assigned
-    // by x64_bind_startup_syms() once brt0.bsm has been parsed.
-    x64_argc_sym = 0;
-    x64_argv_sym = 0;
-    x64_envp_sym = 0;
+    // by cg_bind_startup_syms() once brt0.bsm has been parsed.
+    cg_argc_sym = 0;
+    cg_argv_sym = 0;
+    cg_envp_sym = 0;
 }
 
 // Look up the packed names of brt0's hidden globals. See ARM64 codegen
 // for the full explanation. Must be called AFTER brt0.bsm is parsed.
-void x64_bind_startup_syms() {
-    auto i, name_p;
-    for (i = 0; i < glob_cnt; i = i + 1) {
-        name_p = *(globals + i * 8);
-        switch {
-            x64_str_eq(name_p, "_bpp_argc", 9) { x64_argc_sym = name_p; }
-            x64_str_eq(name_p, "_bpp_argv", 9) { x64_argv_sym = name_p; }
-            x64_str_eq(name_p, "_bpp_envp", 9) { x64_envp_sym = name_p; }
-            else { }
-        }
-    }
-    return;
-}
+// cg_bind_startup_syms lives in bpp_codegen.bsm.
 
 // ── Bridge: copy parser data into emitter parallel arrays ──
 
-static void bridge_data_x86_64() {
-    auto i, rec, name_p, idx, j;
-    x64_sbuf = vbuf;
-
-    // Copy reachable functions, handling forward declarations.
-    arr_clear(x64_fn_name); arr_clear(x64_fn_par); arr_clear(x64_fn_pcnt);
-    arr_clear(x64_fn_body); arr_clear(x64_fn_bcnt); arr_clear(x64_fn_fidx);
-    i = 0;
-    while (i < func_cnt) {
-        // Lazy emit: skip unreachable functions.
-        if (_lazy_emit_ready) {
-            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
-        }
-        rec = *(funcs + i * 8);
-        name_p = *(rec + FN_NAME);
-        idx = -1;
-        j = 0;
-        while (j < arr_len(x64_fn_name)) {
-            if (x64_str_eq_packed(name_p, arr_get(x64_fn_name, j))) { idx = j; }
-            j = j + 1;
-        }
-        if (idx < 0) {
-            idx = arr_len(x64_fn_name);
-            x64_fn_name = arr_push(x64_fn_name, name_p);
-            x64_fn_par  = arr_push(x64_fn_par,  *(rec + FN_PARS));
-            x64_fn_pcnt = arr_push(x64_fn_pcnt, *(rec + FN_PCNT));
-            x64_fn_body = arr_push(x64_fn_body, *(rec + FN_BODY));
-            x64_fn_bcnt = arr_push(x64_fn_bcnt, *(rec + FN_BCNT));
-            x64_fn_fidx = arr_push(x64_fn_fidx, i);
-        } else {
-            arr_set(x64_fn_name, idx, name_p);
-            arr_set(x64_fn_par,  idx, *(rec + FN_PARS));
-            arr_set(x64_fn_pcnt, idx, *(rec + FN_PCNT));
-            arr_set(x64_fn_body, idx, *(rec + FN_BODY));
-            arr_set(x64_fn_bcnt, idx, *(rec + FN_BCNT));
-            arr_set(x64_fn_fidx, idx, i);
-        }
-        i = i + 1;
-    }
-
-    // Copy globals, deduplicating.
-    arr_clear(x64_gl_name);
-    i = 0;
-    while (i < glob_cnt) {
-        name_p = *(globals + i * 8);
-        idx = -1;
-        j = 0;
-        while (j < arr_len(x64_gl_name)) {
-            if (x64_str_eq_packed(name_p, arr_get(x64_gl_name, j))) { idx = j; }
-            j = j + 1;
-        }
-        if (idx < 0) {
-            x64_gl_name = arr_push(x64_gl_name, name_p);
-        }
-        i = i + 1;
-    }
-
-    // Copy externs.
-    arr_clear(x64_ex_name); arr_clear(x64_ex_ret);
-    arr_clear(x64_ex_args); arr_clear(x64_ex_acnt);
-    for (i = 0; i < ext_cnt; i = i + 1) {
-        rec = *(externs + i * 8);
-        x64_ex_name = arr_push(x64_ex_name, *(rec + EX_NAME));
-        x64_ex_ret  = arr_push(x64_ex_ret,  *(rec + EX_RET));
-        x64_ex_args = arr_push(x64_ex_args, *(rec + EX_ARGS));
-        x64_ex_acnt = arr_push(x64_ex_acnt, *(rec + EX_ACNT));
-    }
-}
+// cg_bridge_data lives in bpp_codegen.bsm.
 
 // ── String utilities ───────────────────────────────────────
-
-static x64_str_eq(p, lit, litlen) {
-    if (unpack_l(p) != litlen) { return 0; }
-    return buf_eq(x64_sbuf + unpack_s(p), lit, litlen);
-}
-
-x64_str_eq_packed(a, b) {
-    auto as, al, bs, bl, i;
-    al = unpack_l(a); bl = unpack_l(b);
-    if (al != bl) { return 0; }
-    as = unpack_s(a); bs = unpack_s(b);
-    for (i = 0; i < al; i = i + 1) {
-        if (peek(x64_sbuf + as + i) != peek(x64_sbuf + bs + i)) { return 0; }
-    }
-    return 1;
-}
+// cg_str_eq, cg_str_eq_packed live in bpp_codegen.bsm.
 
 // ── Variable tracking ──────────────────────────────────────
 
-static x64_var_add(name_p) {
-    auto idx; idx = arr_len(x64_vars);
-    x64_vars = arr_push(x64_vars, name_p);
-    x64_var_stack = arr_push(x64_var_stack, 0);
-    x64_var_struct_idx = arr_push(x64_var_struct_idx, 0 - 1);
-    x64_var_off = arr_push(x64_var_off, 0);
-    x64_var_forced_ty = arr_push(x64_var_forced_ty, 0);
-    x64_var_refs = arr_push(x64_var_refs, 0);
-    x64_var_addr_taken = arr_push(x64_var_addr_taken, 0);
-    x64_var_promote = arr_push(x64_var_promote, 0 - 1);
-    return idx;
-}
-
-static x64_var_idx(name_p) {
-    auto i; i = 0;
-    while (i < arr_len(x64_vars)) {
-        if (x64_str_eq_packed(name_p, arr_get(x64_vars, i))) { return i; }
-        i = i + 1;
-    }
-    return -1;
-}
-
-static x64_var_find(name_p) {
-    auto i;
-    i = x64_var_idx(name_p);
-    if (i >= 0) { return arr_get(x64_var_off, i); }
-    return -1;
-}
+// cg_var_add, cg_var_idx, cg_var_find live in bpp_codegen.bsm.
 
 // ── Phase B3 — local register allocation ──────────────────
 
-static _x64_b3_eligible(vi) : base {
-    auto fty;
-    if (arr_get(x64_var_stack, vi)) { return 0; }
-    if (arr_get(x64_var_addr_taken, vi)) { return 0; }
-    fty = arr_get(x64_var_forced_ty, vi);
-    if (is_float_type(fty)) { return 0; }
-    if (ty_slice(fty) != SL_FULL) { return 0; }
-    return 1;
-}
-
-static _x64_b3_walk(nd) {
-    auto n: Node, t, vi, child: Node, arr, cnt, i;
-    if (nd == 0) { return 0; }
-    n = nd;
-    t = n.ntype;
-    if (t == T_VAR) {
-        vi = x64_var_idx(n.a);
-        if (vi >= 0) { arr_set(x64_var_refs, vi, arr_get(x64_var_refs, vi) + 1); }
-        return 0;
-    }
-    if (t == T_ADDR) {
-        child = n.a;
-        if (child != 0 && child.ntype == T_VAR) {
-            vi = x64_var_idx(child.a);
-            if (vi >= 0) { arr_set(x64_var_addr_taken, vi, 1); }
-            return 0;
-        }
-        _x64_b3_walk(child);
-        return 0;
-    }
-    switch (t) {
-    T_BINOP    { _x64_b3_walk(n.b); _x64_b3_walk(n.c); }
-    T_ASSIGN   { _x64_b3_walk(n.a); _x64_b3_walk(n.b); }
-    T_MEMST    { _x64_b3_walk(n.a); _x64_b3_walk(n.b); }
-    T_UNARY    { _x64_b3_walk(n.b); }
-    T_MEMLD    { _x64_b3_walk(n.a); }
-    T_RET      { _x64_b3_walk(n.a); }
-    T_TERNARY  { _x64_b3_walk(n.a); _x64_b3_walk(n.b); _x64_b3_walk(n.c); }
-    T_CALL {
-        arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
-    }
-    T_IF {
-        _x64_b3_walk(n.a);
-        arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
-        if (n.e > 0) {
-            arr = n.d; cnt = n.e;
-            for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
-        }
-    }
-    T_WHILE {
-        _x64_b3_walk(n.a);
-        arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
-        if (n.e != 0) { _x64_b3_walk(n.e); }
-    }
-    T_BLOCK {
-        arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { _x64_b3_walk(arr[i]); }
-    }
-    else { }
-    }
-}
+// cg_b3_eligible, cg_b3_walk live in bpp_codegen.bsm.
 
 // SysV callee-saved pool: rbx (3), r14 (14), r15 (15).
 static void _x64_b3_select() {
@@ -323,23 +120,23 @@ static void _x64_b3_select() {
     pool = malloc(3 * 8);
     pool[0] = 3; pool[1] = 14; pool[2] = 15;
     budget = 3;
-    n = arr_len(x64_vars);
+    n = arr_len(cg_vars);
     arr_clear(x64_promoted_regs);
     used = 0;
     while (used < budget) {
         best_vi = 0 - 1;
         best_refs = 1;
         for (vi = 0; vi < n; vi = vi + 1) {
-            if (arr_get(x64_var_promote, vi) >= 0) { continue; }
-            if (_x64_b3_eligible(vi) == 0) { continue; }
-            if (arr_get(x64_var_refs, vi) > best_refs) {
-                best_refs = arr_get(x64_var_refs, vi);
+            if (arr_get(cg_var_promote, vi) >= 0) { continue; }
+            if (cg_b3_eligible(vi) == 0) { continue; }
+            if (arr_get(cg_var_refs, vi) > best_refs) {
+                best_refs = arr_get(cg_var_refs, vi);
                 best_vi = vi;
             }
         }
         if (best_vi < 0) { free(pool); return; }
         reg = pool[used];
-        arr_set(x64_var_promote, best_vi, reg);
+        arr_set(cg_var_promote, best_vi, reg);
         x64_promoted_regs = arr_push(x64_promoted_regs, reg);
         used = used + 1;
     }
@@ -358,13 +155,13 @@ static void x64_pre_reg_vars(arr, cnt) {
                 j = 0;
                 while (j < n.b) {
                     auto vi;
-                    vi = x64_var_add(*(n.a + j * 8));
+                    vi = cg_var_add(*(n.a + j * 8));
                     if (n.d == 1) {
-                        arr_set(x64_var_stack, vi, 1);
-                        arr_set(x64_var_struct_idx, vi, get_var_type(*(n.a + j * 8)));
+                        arr_set(cg_var_stack, vi, 1);
+                        arr_set(cg_var_struct_idx, vi, get_var_type(*(n.a + j * 8)));
                     }
                     // Record explicit primitive type hint.
-                    if (n.c > 0) { arr_set(x64_var_forced_ty, vi, n.c); }
+                    if (n.c > 0) { arr_set(cg_var_forced_ty, vi, n.c); }
                     j = j + 1;
                 }
             }
@@ -390,68 +187,29 @@ static void x64_pre_reg_vars(arr, cnt) {
 }
 
 // ── Literal helpers ────────────────────────────────────────
-
-static x64_parse_int(p) {
-    auto s, l, i, ch, val;
-    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
-    if (l > 2) {
-        if (peek(x64_sbuf + s) == '0') {
-            if (peek(x64_sbuf + s + 1) == 'x' | peek(x64_sbuf + s + 1) == 'X') {
-                i = 2;
-                while (i < l) {
-                    ch = peek(x64_sbuf + s + i); val = val * 16;
-                    if (ch >= '0' && ch <= '9') { val = val + ch - '0'; }
-                    if (ch >= 'A' && ch <= 'F') { val = val + ch - 55; }
-                    if (ch >= 'a' && ch <= 'f') { val = val + ch - 87; }
-                    i = i + 1;
-                }
-                return val;
-            }
-        }
-    }
-    while (i < l) { ch = peek(x64_sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
-    return val;
-}
-
-static x64_is_float_lit(p) {
-    auto s, l, i;
-    s = unpack_s(p); l = unpack_l(p);
-    for (i = 0; i < l; i = i + 1) {
-        if (peek(x64_sbuf + s + i) == '.') { return 1; }
-    }
-}
+// cg_parse_int, cg_is_float_lit live in bpp_codegen.bsm.
 
 
 // ── Type query helpers ─────────────────────────────────────
-
-// An explicit integer type hint (: word, : byte, : half, : quarter) overrides
-// float inference — the programmer's annotation wins.
-static x64_var_is_float(vi) : base {
-    auto fty;
-    fty = arr_get(x64_var_forced_ty, vi);
-    if (fty > 0) {
-        return is_float_type(fty);
-    }
-    return is_float_type(get_fn_var_type(x64_cur_fn_idx, arr_get(x64_vars, vi)));
-}
+// cg_var_type and cg_var_is_float live in bpp_codegen.bsm.
 
 // Emit a sized load from [rbp - off] into rax/xmm0 based on forced type.
 // Returns 1 if float, 0 if integer.
 static x64_emit_load_var(vi, off) {
     auto fty, _preg;
-    _preg = arr_get(x64_var_promote, vi);
+    _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
         x64_enc_mov_reg(0, _preg);
         return 0;
     }
-    fty = arr_get(x64_var_forced_ty, vi);
+    fty = arr_get(cg_var_forced_ty, vi);
     // `: double` — 128-bit SIMD local. MOVUPS pulls the 16-byte slot
     // straight into xmm0. Unaligned form is safe for any stack offset.
     if (ty_slice(fty) == SL_DOUBLE) {
         x64_enc_movups_load(0, 5, off);
         return 2;
     }
-    if (x64_var_is_float(vi)) {
+    if (cg_var_is_float(vi)) {
         x64_enc_load_sd(0, 5, off);
         return 1;
     }
@@ -465,13 +223,13 @@ static x64_emit_load_var(vi, off) {
 // rty: 0 = integer in rax, 1 = float in xmm0.
 static void x64_emit_store_var(vi, off, rty) {
     auto fty, _preg;
-    _preg = arr_get(x64_var_promote, vi);
+    _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
         if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
         x64_enc_mov_reg(_preg, 0);
         return 0;
     }
-    fty = arr_get(x64_var_forced_ty, vi);
+    fty = arr_get(cg_var_forced_ty, vi);
     // `: double` — 128-bit SIMD. Expected incoming value is xmm0 (rty=2);
     // MOVUPS writes the whole 16-byte slot back to the stack.
     if (ty_slice(fty) == SL_DOUBLE) {
@@ -489,7 +247,7 @@ static void x64_emit_store_var(vi, off, rty) {
         diag_str("cannot assign SIMD value to non-':double' local (declare it ': double')");
         diag_newline();
     }
-    if (x64_var_is_float(vi)) {
+    if (cg_var_is_float(vi)) {
         if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
         x64_enc_store_sd(0, 5, off);
         return 0;
@@ -501,37 +259,7 @@ static void x64_emit_store_var(vi, off, rty) {
     x64_enc_store(0, 5, off);
 }
 
-static x64_find_fn(name_p) {
-    auto i;
-    i = 0;
-    while (i < arr_len(x64_fn_name)) {
-        if (x64_str_eq_packed(name_p, arr_get(x64_fn_name, i))) { return i; }
-        i = i + 1;
-    }
-    return -1;
-}
-
-static x64_find_ext(name_p) {
-    auto i;
-    i = 0;
-    while (i < arr_len(x64_ex_name)) {
-        if (x64_str_eq_packed(name_p, arr_get(x64_ex_name, i))) { return i; }
-        i = i + 1;
-    }
-    return -1;
-}
-
-static x64_find_ext_by_argc(name_p, argc) {
-    auto i;
-    i = 0;
-    while (i < arr_len(x64_ex_name)) {
-        if (x64_str_eq_packed(name_p, arr_get(x64_ex_name, i))) {
-            if (arr_get(x64_ex_acnt, i) == argc) { return i; }
-        }
-        i = i + 1;
-    }
-    return x64_find_ext(name_p);
-}
+// cg_find_fn, cg_find_ext, cg_find_ext_by_argc live in bpp_codegen.bsm.
 
 // Return the System V ABI register for argument position i (0-based).
 // RDI=7, RSI=6, RDX=2, RCX=1, R8=8, R9=9.
@@ -552,42 +280,10 @@ static x64_arg_reg(i) : base {
 // arm value is a compile-time integer literal and emit a branch table
 // instead of the per-arm comparison chain.
 
-auto x64_sw_min;
-auto x64_sw_max;
-auto x64_sw_total;
+// Switch-analysis globals moved to src/bpp_codegen.bsm
+// (cg_sw_min, cg_sw_max, cg_sw_total) — shared with a64.
 
-static x64_switch_is_dense(sw_arms, sw_cnt) {
-    auto si, sk, sv_arr, sv_cnt, val, first, range;
-    auto node: Node;
-    first = 1;
-    x64_sw_min = 0;
-    x64_sw_max = 0;
-    x64_sw_total = 0;
-    for (si = 0; si < sw_cnt; si = si + 1) {
-        sv_arr = sw_arms[si * 2];
-        sv_cnt = sw_arms[si * 2 + 1];
-        for (sk = 0; sk < sv_cnt; sk = sk + 1) {
-            node = sv_arr[sk];
-            if (node.ntype != T_LIT) { return 0; }
-            val = x64_parse_int(node.a);
-            if (first) {
-                x64_sw_min = val;
-                x64_sw_max = val;
-                first = 0;
-            } else {
-                if (val < x64_sw_min) { x64_sw_min = val; }
-                if (val > x64_sw_max) { x64_sw_max = val; }
-            }
-            x64_sw_total = x64_sw_total + 1;
-        }
-    }
-    if (x64_sw_total < 3) { return 0; }
-    range = x64_sw_max - x64_sw_min;
-    if (range < 0) { return 0; }
-    if (range > 512) { return 0; }
-    if (range >= 2 * x64_sw_total) { return 0; }
-    return 1;
-}
+// cg_switch_is_dense lives in bpp_codegen.bsm.
 
 // Emit a Linux x86_64 jump table for a dense Form-1 switch.
 // Layout:
@@ -615,7 +311,7 @@ static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     sw_arms = n.b;
     sw_bodies = n.src_tok;
     sw_cnt = n.c;
-    range = x64_sw_max - x64_sw_min;
+    range = cg_sw_max - cg_sw_min;
 
     arm_labels = malloc(sw_cnt * 8);
     for (si = 0; si < sw_cnt; si = si + 1) {
@@ -628,7 +324,7 @@ static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     x64_emit_node(n.a);
 
     // Normalize index: rax -= min.
-    if (x64_sw_min != 0) { x64_enc_sub_imm(0, x64_sw_min); }
+    if (cg_sw_min != 0) { x64_enc_sub_imm(0, cg_sw_min); }
 
     // Bounds check: JA (unsigned higher) jumps to else if rax > range.
     x64_enc_cmp_imm(0, range);
@@ -650,8 +346,8 @@ static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
             sv_cnt = sw_arms[si * 2 + 1];
             for (sk = 0; sk < sv_cnt; sk = sk + 1) {
                 node = sv_arr[sk];
-                val = x64_parse_int(node.a);
-                if (val == x64_sw_min + i) { target = arm_labels[si]; }
+                val = cg_parse_int(node.a);
+                if (val == cg_sw_min + i) { target = arm_labels[si]; }
             }
         }
         x64_enc_jmp_label(target);
@@ -682,28 +378,28 @@ static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
 // Push RAX onto the stack.
 static void x64_emit_push() {
     x64_enc_push(0);
-    x64_depth = x64_depth + 1;
+    cg_depth = cg_depth + 1;
 }
 
 // Pop from the stack into a general-purpose register.
 static void x64_emit_pop(r) {
     x64_enc_pop(r);
-    x64_depth = x64_depth - 1;
+    cg_depth = cg_depth - 1;
 }
 
 // Push XMM0 onto the stack as a 16-byte SIMD value (Phase B4).
-// x64_depth tracks 8-byte slots so a SIMD value counts as two.
+// cg_depth tracks 8-byte slots so a SIMD value counts as two.
 static void x64_emit_vpush() {
     x64_enc_sub_imm(4, 16);
     x64_enc_movups_store(0, 4, 0);
-    x64_depth = x64_depth + 2;
+    cg_depth = cg_depth + 2;
 }
 
 // Pop a 16-byte SIMD value from the stack into the given XMM register.
 static void x64_emit_vpop(xr) {
     x64_enc_movups_load(xr, 4, 0);
     x64_enc_add_imm(4, 16);
-    x64_depth = x64_depth - 2;
+    cg_depth = cg_depth - 2;
 }
 
 // Phase B4: emit a two-operand SIMD builtin (vec_add4, vec_sub4, …).
@@ -734,20 +430,20 @@ static void _x64_vec_binop(n: Node, opcode, commutative) {
 static void x64_emit_fpush() {
     x64_enc_sub_imm(4, 8);
     x64_enc_store_sd(0, 4, 0);
-    x64_depth = x64_depth + 1;
+    cg_depth = cg_depth + 1;
 }
 
 // Pop from the stack into an XMM register.
 static void x64_emit_fpop(xr) {
     x64_enc_load_sd(xr, 4, 0);
     x64_enc_add_imm(4, 8);
-    x64_depth = x64_depth - 1;
+    cg_depth = cg_depth - 1;
 }
 
 // Align the stack to 16 bytes before a CALL if needed.
 // Returns 1 if padding was added, 0 otherwise.
 static x64_align_call() {
-    if (x64_depth % 2 != 0) {
+    if (cg_depth % 2 != 0) {
         x64_enc_sub_imm(4, 8);
         return 1;
     }
@@ -775,10 +471,10 @@ static x64_emit_node(nd) {
     if (t == T_LIT) {
         lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
         // String literal.
-        if (peek(x64_sbuf + lit_s) == '"') {
-            sid = arr_len(x64_str_tbl);
+        if (peek(cg_sbuf + lit_s) == '"') {
+            sid = arr_len(cg_str_tbl);
             str_p = pack(lit_s + 1, lit_l - 2);
-            x64_str_tbl = arr_push(x64_str_tbl, str_p);
+            cg_str_tbl = arr_push(cg_str_tbl, str_p);
             // LEA RAX, [RIP + string_addr]. Relocation type 1 (string).
             auto dpos;
             dpos = x64_enc_lea_rip(0);
@@ -786,9 +482,9 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Float literal.
-        if (x64_is_float_lit(n.a) == 1) {
-            fid = arr_len(x64_flt_tbl);
-            x64_flt_tbl = arr_push(x64_flt_tbl, n.a);
+        if (cg_is_float_lit(n.a) == 1) {
+            fid = arr_len(cg_flt_tbl);
+            cg_flt_tbl = arr_push(cg_flt_tbl, n.a);
             // MOVSD XMM0, [RIP + float_addr]. Relocation type 2 (float).
             auto dpos;
             dpos = x64_enc_load_sd_rip(0);
@@ -796,17 +492,17 @@ static x64_emit_node(nd) {
             return 1;
         }
         // Integer literal.
-        x64_enc_mov_wide(0, x64_parse_int(n.a));
+        x64_enc_mov_wide(0, cg_parse_int(n.a));
         return 0;
     }
 
     // ── Variable reference ──
     if (t == T_VAR) {
-        vi = x64_var_idx(n.a);
+        vi = cg_var_idx(n.a);
         if (vi >= 0) {
-            off = arr_get(x64_var_off, vi);
+            off = arr_get(cg_var_off, vi);
             // Stack struct: return address of the struct on the stack.
-            if (arr_get(x64_var_stack, vi)) {
+            if (arr_get(cg_var_stack, vi)) {
                 x64_enc_lea(0, 5, off);
                 return 0;
             }
@@ -857,8 +553,8 @@ static x64_emit_node(nd) {
     // ── Binary operation ──
     if (t == T_BINOP) {
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
-        c0 = peek(x64_sbuf + op_s);
-        c1 = 0; if (op_l > 1) { c1 = peek(x64_sbuf + op_s + 1); }
+        c0 = peek(cg_sbuf + op_s);
+        c1 = 0; if (op_l > 1) { c1 = peek(cg_sbuf + op_s + 1); }
 
         // Constant folding lives in the parser — by the time a T_BINOP
         // reaches codegen, at least one operand is guaranteed non-literal.
@@ -967,7 +663,7 @@ static x64_emit_node(nd) {
         uty = x64_emit_node(n.b);
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         // Bitwise NOT.
-        if (op_l == 1 && peek(x64_sbuf + op_s) == '~') {
+        if (op_l == 1 && peek(cg_sbuf + op_s) == '~') {
             x64_enc_not(0);
             return 0;
         }
@@ -991,14 +687,14 @@ static x64_emit_node(nd) {
         // in backend/os/<target>/_bmem_<target>.bsm as B++ functions
         // that call sys_mmap/sys_munmap directly.)
         // Built-in: peek — load one byte from a pointer.
-        if (x64_str_eq(n.a, "peek", 4)) {
+        if (cg_str_eq(n.a, "peek", 4)) {
             arr = n.b; ety = x64_emit_node(*(arr + 0));
             if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
             x64_enc_loadb(0, 0, 0);
             return 0;
         }
         // Built-in: poke — store one byte to a pointer.
-        if (x64_str_eq(n.a, "poke", 4)) {
+        if (cg_str_eq(n.a, "poke", 4)) {
             arr = n.b;
             ety = x64_emit_node(*(arr + 8));
             if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
@@ -1011,19 +707,19 @@ static x64_emit_node(nd) {
         }
         // Built-in: float_ret() — read the first float return value saved after the last extern call.
         // Loads xmm0 from the hidden xmm0_save slot at [rbp - 16].
-        if (x64_str_eq(n.a, "float_ret", 9)) {
+        if (cg_str_eq(n.a, "float_ret", 9)) {
             x64_enc_load_sd(0, 5, 0 - 16);
             return 1;
         }
         // Built-in: float_ret2() — read the second float return value saved after the last extern call.
         // Loads xmm0 from the hidden xmm1_save slot at [rbp - 24].
-        if (x64_str_eq(n.a, "float_ret2", 10)) {
+        if (cg_str_eq(n.a, "float_ret2", 10)) {
             x64_enc_load_sd(0, 5, 0 - 24);
             return 1;
         }
         // Built-in: shr(value, shift) — logical right shift (unsigned, fills with zeros).
         // x86_64 SHR uses CL (low byte of RCX=reg 1) as shift amount.
-        if (x64_str_eq(n.a, "shr", 3)) {
+        if (cg_str_eq(n.a, "shr", 3)) {
             arr = n.b;
             x64_emit_node(*(arr + 8));
             x64_emit_push();
@@ -1033,7 +729,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: assert(cond) — abort with INT3 trap if condition is zero.
-        if (x64_str_eq(n.a, "assert", 6)) {
+        if (cg_str_eq(n.a, "assert", 6)) {
             arr = n.b;
             ety = x64_emit_node(*(arr + 0));
             if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
@@ -1046,7 +742,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: str_peek — byte read from string pointer with index.
-        if (x64_str_eq(n.a, "str_peek", 8)) {
+        if (cg_str_eq(n.a, "str_peek", 8)) {
             arr = n.b;
             ety = x64_emit_node(*(arr + 8));
             if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
@@ -1059,7 +755,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_write(fd, buf, len).
-        if (x64_str_eq(n.a, "sys_write", 9)) {
+        if (cg_str_eq(n.a, "sys_write", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 16)); x64_emit_push();
             x64_emit_node(*(arr + 8));  x64_emit_push();
@@ -1073,7 +769,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_read(fd, buf, len).
-        if (x64_str_eq(n.a, "sys_read", 8)) {
+        if (cg_str_eq(n.a, "sys_read", 8)) {
             arr = n.b;
             x64_emit_node(*(arr + 16)); x64_emit_push();
             x64_emit_node(*(arr + 8));  x64_emit_push();
@@ -1086,7 +782,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_open(path, flags).
-        if (x64_str_eq(n.a, "sys_open", 8)) {
+        if (cg_str_eq(n.a, "sys_open", 8)) {
             arr = n.b;
             x64_emit_node(*(arr + 8)); x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1098,7 +794,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_close(fd).
-        if (x64_str_eq(n.a, "sys_close", 9)) {
+        if (cg_str_eq(n.a, "sys_close", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_enc_mov_reg(7, 0);
@@ -1107,7 +803,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_exit(code).
-        if (x64_str_eq(n.a, "sys_exit", 8)) {
+        if (cg_str_eq(n.a, "sys_exit", 8)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_enc_mov_reg(7, 0);
@@ -1116,7 +812,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_mkdir(path, mode) — create directory. Linux syscall 83.
-        if (x64_str_eq(n.a, "sys_mkdir", 9)) {
+        if (cg_str_eq(n.a, "sys_mkdir", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 8)); x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1128,7 +824,7 @@ static x64_emit_node(nd) {
         }
         // Built-in: sys_getdents(fd, buf, bufsize) — read directory entries.
         // Linux: getdents64 (syscall 217). Returns bytes read, 0 at end.
-        if (x64_str_eq(n.a, "sys_getdents", 12)) {
+        if (cg_str_eq(n.a, "sys_getdents", 12)) {
             arr = n.b;
             x64_emit_node(*(arr + 0)); x64_emit_push();
             x64_emit_node(*(arr + 8)); x64_emit_push();
@@ -1142,7 +838,7 @@ static x64_emit_node(nd) {
         }
         // Built-in: sys_lseek(fd, offset, whence) — reposition file offset.
         // Linux syscall 8. Returns new offset or -1 on error.
-        if (x64_str_eq(n.a, "sys_lseek", 9)) {
+        if (cg_str_eq(n.a, "sys_lseek", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 0)); x64_emit_push();
             x64_emit_node(*(arr + 8)); x64_emit_push();
@@ -1156,7 +852,7 @@ static x64_emit_node(nd) {
         }
         // Built-in: sys_fchmod(fd, mode) — change file permissions.
         // Linux syscall 91. Returns 0 on success.
-        if (x64_str_eq(n.a, "sys_fchmod", 10)) {
+        if (cg_str_eq(n.a, "sys_fchmod", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 8)); x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1167,7 +863,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_unlink(path) — delete a file. Linux syscall 87.
-        if (x64_str_eq(n.a, "sys_unlink", 10)) {
+        if (cg_str_eq(n.a, "sys_unlink", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_enc_mov_reg(7, 0);
@@ -1176,13 +872,13 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_fork().
-        if (x64_str_eq(n.a, "sys_fork", 8)) {
+        if (cg_str_eq(n.a, "sys_fork", 8)) {
             x64_enc_mov_wide(0, BSYS_FORK);
             x64_enc_syscall();
             return 0;
         }
         // Built-in: sys_execve(path, argv, envp).
-        if (x64_str_eq(n.a, "sys_execve", 10)) {
+        if (cg_str_eq(n.a, "sys_execve", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 0)); x64_emit_push();
             x64_emit_node(*(arr + 8)); x64_emit_push();
@@ -1195,7 +891,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_waitpid(pid).
-        if (x64_str_eq(n.a, "sys_waitpid", 11)) {
+        if (cg_str_eq(n.a, "sys_waitpid", 11)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_enc_mov_reg(7, 0);
@@ -1207,7 +903,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_ptrace(request, pid, addr, data) — Linux syscall 101. 4 args.
-        if (x64_str_eq(n.a, "sys_ptrace", 10)) {
+        if (cg_str_eq(n.a, "sys_ptrace", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 24)); x64_emit_push();
             x64_emit_node(*(arr + 16)); x64_emit_push();
@@ -1223,7 +919,7 @@ static x64_emit_node(nd) {
         }
         // Built-in: sys_mmap(addr, len, prot, flags, fd, offset) — 6 args.
         // Linux calling convention: RDI, RSI, RDX, R10, R8, R9.
-        if (x64_str_eq(n.a, "sys_mmap", 8)) {
+        if (cg_str_eq(n.a, "sys_mmap", 8)) {
             arr = n.b;
             x64_emit_node(*(arr + 40)); x64_emit_push();
             x64_emit_node(*(arr + 32)); x64_emit_push();
@@ -1242,7 +938,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_munmap(addr, len) — 2 args. Returns 0 on success.
-        if (x64_str_eq(n.a, "sys_munmap", 10)) {
+        if (cg_str_eq(n.a, "sys_munmap", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 8)); x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1253,7 +949,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_wait4(pid, status, options, rusage) — Linux syscall 61. 4 args.
-        if (x64_str_eq(n.a, "sys_wait4", 9)) {
+        if (cg_str_eq(n.a, "sys_wait4", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 24)); x64_emit_push();
             x64_emit_node(*(arr + 16)); x64_emit_push();
@@ -1269,7 +965,7 @@ static x64_emit_node(nd) {
         }
         // Built-in: sys_usleep(us) — sleep for N microseconds.
         // Uses poll(NULL, 0, ms) — Linux syscall 7. Converts us→ms via >>10 (~÷1024).
-        if (x64_str_eq(n.a, "sys_usleep", 10)) {
+        if (cg_str_eq(n.a, "sys_usleep", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             // rax = microseconds. Convert to ms for poll timeout.
@@ -1288,7 +984,7 @@ static x64_emit_node(nd) {
         // full fence ordering loads and stores in both directions.
         // Used by stbjob to order producer writes against consumer
         // reads on the SPSC queues. Returns 0 by convention.
-        if (x64_str_eq(n.a, "mem_barrier", 11)) {
+        if (cg_str_eq(n.a, "mem_barrier", 11)) {
             x64_enc_emit8(0x0F);
             x64_enc_emit8(0xAE);
             x64_enc_emit8(0xF0);
@@ -1296,7 +992,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_socket(domain, type, protocol) — Linux syscall 41. 3 args.
-        if (x64_str_eq(n.a, "sys_socket", 10)) {
+        if (cg_str_eq(n.a, "sys_socket", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 16)); x64_emit_push();
             x64_emit_node(*(arr + 8)); x64_emit_push();
@@ -1309,7 +1005,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_connect(fd, addr, addrlen) — Linux syscall 42. 3 args.
-        if (x64_str_eq(n.a, "sys_connect", 11)) {
+        if (cg_str_eq(n.a, "sys_connect", 11)) {
             arr = n.b;
             x64_emit_node(*(arr + 16)); x64_emit_push();
             x64_emit_node(*(arr + 8)); x64_emit_push();
@@ -1322,7 +1018,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_ioctl(fd, request, arg) — Linux syscall 16.
-        if (x64_str_eq(n.a, "sys_ioctl", 9)) {
+        if (cg_str_eq(n.a, "sys_ioctl", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 16)); x64_emit_push();
             x64_emit_node(*(arr + 8));  x64_emit_push();
@@ -1335,7 +1031,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_nanosleep(req, rem) — Linux syscall 35.
-        if (x64_str_eq(n.a, "sys_nanosleep", 13)) {
+        if (cg_str_eq(n.a, "sys_nanosleep", 13)) {
             arr = n.b;
             x64_emit_node(*(arr + 8));  x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1346,7 +1042,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: sys_clock_gettime(clk_id, tp) — Linux syscall 228.
-        if (x64_str_eq(n.a, "sys_clock_gettime", 17)) {
+        if (cg_str_eq(n.a, "sys_clock_gettime", 17)) {
             arr = n.b;
             x64_emit_node(*(arr + 8));  x64_emit_push();
             x64_emit_node(*(arr + 0));
@@ -1357,20 +1053,20 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: argc_get().
-        if (x64_str_eq(n.a, "argc_get", 8)) {
+        if (cg_str_eq(n.a, "argc_get", 8)) {
             auto dpos;
             dpos = x64_enc_lea_rip(10);
-            x64_enc_add_reloc(dpos, x64_argc_sym, 0);
+            x64_enc_add_reloc(dpos, cg_argc_sym, 0);
             x64_enc_load(0, 10, 0);
             return 0;
         }
         // Built-in: argv_get(i).
-        if (x64_str_eq(n.a, "argv_get", 8)) {
+        if (cg_str_eq(n.a, "argv_get", 8)) {
             x64_emit_node(*(n.b));
             x64_emit_push();
             auto dpos;
             dpos = x64_enc_lea_rip(10);
-            x64_enc_add_reloc(dpos, x64_argv_sym, 0);
+            x64_enc_add_reloc(dpos, cg_argv_sym, 0);
             x64_enc_load(0, 10, 0);
             x64_emit_pop(1);
             x64_enc_shl_imm(1, 3);
@@ -1381,12 +1077,12 @@ static x64_emit_node(nd) {
         // Built-in: envp_get(i) — read i-th environment string pointer.
         // Returns 0 once i passes the NULL terminator. Used by getenv()
         // in bpp_io.bsm to walk the env vars.
-        if (x64_str_eq(n.a, "envp_get", 8)) {
+        if (cg_str_eq(n.a, "envp_get", 8)) {
             x64_emit_node(*(n.b));
             x64_emit_push();
             auto dpos;
             dpos = x64_enc_lea_rip(10);
-            x64_enc_add_reloc(dpos, x64_envp_sym, 0);
+            x64_enc_add_reloc(dpos, cg_envp_sym, 0);
             x64_enc_load(0, 10, 0);
             x64_emit_pop(1);
             x64_enc_shl_imm(1, 3);
@@ -1395,10 +1091,10 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: fn_ptr(name).
-        if (x64_str_eq(n.a, "fn_ptr", 6)) {
+        if (cg_str_eq(n.a, "fn_ptr", 6)) {
             arr = n.b;
             fn_name = *(arr + 0);
-            fi = x64_find_fn(fn_name.a);
+            fi = cg_find_fn(fn_name.a);
             if (fi < 0) { return 0; }
             // LEA RAX, [RIP + fn_label]. Use a call-like fixup.
             auto dpos;
@@ -1419,7 +1115,7 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Built-in: call(fn_ptr, arg0, arg1, ...) — indirect call.
-        if (x64_str_eq(n.a, "call", 4)) {
+        if (cg_str_eq(n.a, "call", 4)) {
             arr = n.b; cnt = n.c;
             i = 0;
             while (i < cnt) {
@@ -1448,13 +1144,13 @@ static x64_emit_node(nd) {
         // factor through a single helper so add/sub/mul/div/min/max read
         // as "opcode byte + commutative flag" rather than six copies of
         // the same spill/reload choreography.
-        if (x64_str_eq(n.a, "vec_load4", 9)) {
+        if (cg_str_eq(n.a, "vec_load4", 9)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_enc_movups_load(0, 0, 0);
             return 2;
         }
-        if (x64_str_eq(n.a, "vec_store4", 10)) {
+        if (cg_str_eq(n.a, "vec_store4", 10)) {
             arr = n.b;
             x64_emit_node(*(arr + 8));  // value → xmm0
             x64_emit_vpush();
@@ -1464,13 +1160,13 @@ static x64_emit_node(nd) {
             return 0;
         }
         // Binary ops dispatch through _x64_vec_binop.
-        if (x64_str_eq(n.a, "vec_add4", 8)) { _x64_vec_binop(n, 0x58, 1); return 2; }
-        if (x64_str_eq(n.a, "vec_mul4", 8)) { _x64_vec_binop(n, 0x59, 1); return 2; }
-        if (x64_str_eq(n.a, "vec_min4", 8)) { _x64_vec_binop(n, 0x5D, 1); return 2; }
-        if (x64_str_eq(n.a, "vec_max4", 8)) { _x64_vec_binop(n, 0x5F, 1); return 2; }
-        if (x64_str_eq(n.a, "vec_sub4", 8)) { _x64_vec_binop(n, 0x5C, 0); return 2; }
-        if (x64_str_eq(n.a, "vec_div4", 8)) { _x64_vec_binop(n, 0x5E, 0); return 2; }
-        if (x64_str_eq(n.a, "vec_splat4", 10)) {
+        if (cg_str_eq(n.a, "vec_add4", 8)) { _x64_vec_binop(n, 0x58, 1); return 2; }
+        if (cg_str_eq(n.a, "vec_mul4", 8)) { _x64_vec_binop(n, 0x59, 1); return 2; }
+        if (cg_str_eq(n.a, "vec_min4", 8)) { _x64_vec_binop(n, 0x5D, 1); return 2; }
+        if (cg_str_eq(n.a, "vec_max4", 8)) { _x64_vec_binop(n, 0x5F, 1); return 2; }
+        if (cg_str_eq(n.a, "vec_sub4", 8)) { _x64_vec_binop(n, 0x5C, 0); return 2; }
+        if (cg_str_eq(n.a, "vec_div4", 8)) { _x64_vec_binop(n, 0x5E, 0); return 2; }
+        if (cg_str_eq(n.a, "vec_splat4", 10)) {
             arr = n.b;
             ety = x64_emit_node(*(arr + 0));
             if (ety == 1) {
@@ -1485,7 +1181,7 @@ static x64_emit_node(nd) {
             x64_enc_shufps(0, 0, 0x00);
             return 2;
         }
-        if (x64_str_eq(n.a, "vec_dot4", 8)) {
+        if (cg_str_eq(n.a, "vec_dot4", 8)) {
             arr = n.b;
             x64_emit_node(*(arr + 0));
             x64_emit_vpush();
@@ -1506,7 +1202,7 @@ static x64_emit_node(nd) {
             x64_enc_cvtss2sd(0, 0);
             return 1;
         }
-        if (x64_str_eq(n.a, "vec_get4", 8)) {
+        if (cg_str_eq(n.a, "vec_get4", 8)) {
             // Lane index must be a compile-time literal (0..3). PSHUFD
             // moves the chosen lane to position 0; a stack-round-trip
             // reloads those bits as a scalar single; CVTSS2SD widens.
@@ -1514,7 +1210,7 @@ static x64_emit_node(nd) {
             x64_emit_node(*(arr + 0));
             auto lane_nd: Node, lane_v, lane_mask;
             lane_nd = *(arr + 8);
-            lane_v = x64_parse_int(lane_nd.a);
+            lane_v = cg_parse_int(lane_nd.a);
             lane_mask = lane_v | (lane_v << 2) | (lane_v << 4) | (lane_v << 6);
             x64_enc_pshufd(0, 0, lane_mask);
             x64_enc_sub_imm(4, 16);
@@ -1573,7 +1269,7 @@ static x64_emit_node(nd) {
         while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i = i - 1; }
 
         // Call the function.
-        fi = x64_find_fn(n.a);
+        fi = cg_find_fn(n.a);
         padded = x64_align_call();
         if (fi >= 0) {
             x64_enc_call_label(arr_get(x64_fn_lbl, fi));
@@ -1584,7 +1280,7 @@ static x64_emit_node(nd) {
             x64_enc_emit32(0);
         }
         // Save float return registers after extern calls for float_ret() / float_ret2().
-        if (x64_find_ext(n.a) >= 0) {
+        if (cg_find_ext(n.a) >= 0) {
             x64_enc_store_sd(0, 5, 0 - 16);
             x64_enc_store_sd(1, 5, 0 - 24);
         }
@@ -1637,9 +1333,9 @@ static x64_emit_node(nd) {
         child = n.a;
         if (child != 0) {
             if (child.ntype == T_VAR) {
-                vi = x64_var_idx(child.a);
+                vi = cg_var_idx(child.a);
                 if (vi >= 0) {
-                    off = arr_get(x64_var_off, vi);
+                    off = arr_get(cg_var_off, vi);
                     x64_enc_lea(0, 5, off);
                     return 0;
                 }
@@ -1680,14 +1376,14 @@ static void x64_emit_stmt(nd) {
     if (t == T_ASSIGN) {
         lhs = n.a;
         if (lhs.ntype == T_VAR) {
-            vi = x64_var_idx(lhs.a);
+            vi = cg_var_idx(lhs.a);
             if (vi >= 0) {
                 // Stack struct copy.
-                if (arr_get(x64_var_stack, vi)) {
+                if (arr_get(cg_var_stack, vi)) {
                     x64_emit_node(n.b);
-                    off = arr_get(x64_var_off, vi);
+                    off = arr_get(cg_var_off, vi);
                     auto fc, j, sidx;
-                    sidx = arr_get(x64_var_struct_idx, vi);
+                    sidx = arr_get(cg_var_struct_idx, vi);
                     fc = (get_struct_size(sidx) + 7) / 8;
                     j = 0;
                     while (j < fc) {
@@ -1701,9 +1397,9 @@ static void x64_emit_stmt(nd) {
         }
         rty = x64_emit_node(n.b);
         if (lhs.ntype == T_VAR) {
-            vi = x64_var_idx(lhs.a);
+            vi = cg_var_idx(lhs.a);
             if (vi >= 0) {
-                off = arr_get(x64_var_off, vi);
+                off = arr_get(cg_var_off, vi);
                 // Type-aware store: uses the correct instruction for the variable's size.
                 x64_emit_store_var(vi, off, rty);
             } else {
@@ -1799,18 +1495,18 @@ static void x64_emit_stmt(nd) {
     }
 
     if (t == T_BREAK) {
-        if (arr_len(x64_break_stack) > 0) {
+        if (arr_len(cg_break_stack) > 0) {
             auto brk_lbl;
-            brk_lbl = arr_last(x64_break_stack);
+            brk_lbl = arr_last(cg_break_stack);
             x64_enc_jmp_label(brk_lbl);
         }
         return 0;
     }
 
     if (t == T_CONTINUE) {
-        if (arr_len(x64_continue_stack) > 0) {
+        if (arr_len(cg_continue_stack) > 0) {
             auto cnt_lbl;
-            cnt_lbl = arr_last(x64_continue_stack);
+            cnt_lbl = arr_last(cg_continue_stack);
             x64_enc_jmp_label(cnt_lbl);
         }
         return 0;
@@ -1825,8 +1521,8 @@ static void x64_emit_stmt(nd) {
         lbl = x64_enc_new_label();
         lbl2 = x64_enc_new_label();
         lbl3 = x64_enc_new_label();
-        x64_break_stack = arr_push(x64_break_stack, lbl2);
-        x64_continue_stack = arr_push(x64_continue_stack, lbl3);
+        cg_break_stack = arr_push(cg_break_stack, lbl2);
+        cg_continue_stack = arr_push(cg_continue_stack, lbl3);
         x64_enc_def_label(lbl);
         ety = x64_emit_node(n.a);
         if (ety == 1) {
@@ -1842,14 +1538,14 @@ static void x64_emit_stmt(nd) {
         if (step_node != 0) { x64_emit_stmt(step_node); }
         x64_enc_jmp_label(lbl);
         x64_enc_def_label(lbl2);
-        arr_pop(x64_break_stack);
-        arr_pop(x64_continue_stack);
+        arr_pop(cg_break_stack);
+        arr_pop(cg_continue_stack);
         return 0;
     }
 
     if (t == T_RET) {
         rty = x64_emit_node(n.a);
-        if (is_float_type(get_fn_ret_type(x64_cur_fn_idx))) {
+        if (is_float_type(get_fn_ret_type(cg_cur_fn_idx))) {
             if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
         } else {
             if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
@@ -1872,7 +1568,7 @@ static void x64_emit_stmt(nd) {
 
         // Form 1 dense switches go through the jump-table path.
         if (n.a != 0) {
-            if (x64_switch_is_dense(sw_arms, sw_cnt)) {
+            if (cg_switch_is_dense(sw_arms, sw_cnt)) {
                 x64_emit_switch_jtbl(n, sw_end_lbl);
                 return 0;
             }
@@ -1946,28 +1642,28 @@ static void x64_emit_stmt(nd) {
 static void x64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i, total, sz;
-    name_p = arr_get(x64_fn_name, fi);
-    par_arr = arr_get(x64_fn_par, fi); par_cnt = arr_get(x64_fn_pcnt, fi);
-    body_arr = arr_get(x64_fn_body, fi); body_cnt = arr_get(x64_fn_bcnt, fi);
+    name_p = arr_get(cg_fn_name, fi);
+    par_arr = arr_get(cg_fn_par, fi); par_cnt = arr_get(cg_fn_pcnt, fi);
+    body_arr = arr_get(cg_fn_body, fi); body_cnt = arr_get(cg_fn_bcnt, fi);
 
-    arr_clear(x64_vars); arr_clear(x64_var_stack);
-    arr_clear(x64_var_struct_idx); arr_clear(x64_var_off); arr_clear(x64_var_forced_ty);
-    arr_clear(x64_var_refs); arr_clear(x64_var_addr_taken);
-    arr_clear(x64_var_promote); arr_clear(x64_promoted_regs);
-    x64_cur_fn_name = name_p;
-    x64_cur_fn_idx = arr_get(x64_fn_fidx, fi);
+    arr_clear(cg_vars); arr_clear(cg_var_stack);
+    arr_clear(cg_var_struct_idx); arr_clear(cg_var_off); arr_clear(cg_var_forced_ty);
+    arr_clear(cg_var_refs); arr_clear(cg_var_addr_taken);
+    arr_clear(cg_var_promote); arr_clear(x64_promoted_regs);
+    cg_cur_fn_name = name_p;
+    cg_cur_fn_idx = arr_get(cg_fn_fidx, fi);
 
     // Register params as variables with optional type hints.
     auto fn_rec, hints, ph;
-    fn_rec = arr_get(funcs, x64_cur_fn_idx);
+    fn_rec = arr_get(funcs, cg_cur_fn_idx);
     hints = *(fn_rec + 48);
     i = 0;
     while (i < par_cnt) {
         auto pvi;
-        pvi = x64_var_add(*(par_arr + i * 8));
+        pvi = cg_var_add(*(par_arr + i * 8));
         if (hints != 0) {
             ph = *(hints + i * 8);
-            if (ph > 0) { arr_set(x64_var_forced_ty, pvi, ph); }
+            if (ph > 0) { arr_set(cg_var_forced_ty, pvi, ph); }
         }
         i = i + 1;
     }
@@ -1984,20 +1680,20 @@ static void x64_emit_func(fi) {
     // `24 + total` (the absolute magnitude), not `total` alone.
     auto _fty, abs_mag;
     total = 0;
-    for (i = 0; i < arr_len(x64_vars); i = i + 1) {
-        _fty = arr_get(x64_var_forced_ty, i);
+    for (i = 0; i < arr_len(cg_vars); i = i + 1) {
+        _fty = arr_get(cg_var_forced_ty, i);
         abs_mag = 24 + total;
         if (slice_width(ty_slice(_fty)) == 128) {
             abs_mag = (abs_mag + 15) / 16 * 16;
             total = abs_mag - 24 + 16;
-            arr_set(x64_var_off, i, 0 - abs_mag - 16);
-        } else if (arr_get(x64_var_stack, i)) {
-            sz = (get_struct_size(arr_get(x64_var_struct_idx, i)) + 7) / 8 * 8;
+            arr_set(cg_var_off, i, 0 - abs_mag - 16);
+        } else if (arr_get(cg_var_stack, i)) {
+            sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
             total = total + sz;
-            arr_set(x64_var_off, i, 0 - (24 + total));
+            arr_set(cg_var_off, i, 0 - (24 + total));
         } else {
             total = total + 8;
-            arr_set(x64_var_off, i, 0 - (24 + total));
+            arr_set(cg_var_off, i, 0 - (24 + total));
         }
     }
     // Phase B3: walk body, count refs, select promotions. Done before
@@ -2005,7 +1701,7 @@ static void x64_emit_func(fi) {
     auto stmt_i: Node;
     for (i = 0; i < body_cnt; i = i + 1) {
         stmt_i = body_arr[i];
-        if (stmt_i != 0) { _x64_b3_walk(stmt_i); }
+        if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
     _x64_b3_select();
     x64_b3_spill_off = 0 - (24 + total);
@@ -2039,16 +1735,16 @@ static void x64_emit_func(fi) {
     // globals. The _start stub below sets up RDI/RSI/RDX from the kernel
     // stack so that main sees the standard `(int argc, char**argv, char**envp)`
     // signature even though Linux passes these via the stack at process entry.
-    if (x64_str_eq(name_p, "main", 4)) {
+    if (cg_str_eq(name_p, "main", 4)) {
         auto dpos;
         dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, x64_argc_sym, 0);
+        x64_enc_add_reloc(dpos, cg_argc_sym, 0);
         x64_enc_store(7, 10, 0);
         dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, x64_argv_sym, 0);
+        x64_enc_add_reloc(dpos, cg_argv_sym, 0);
         x64_enc_store(6, 10, 0);
         dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, x64_envp_sym, 0);
+        x64_enc_add_reloc(dpos, cg_envp_sym, 0);
         x64_enc_store(2, 10, 0);
     }
 
@@ -2057,25 +1753,25 @@ static void x64_emit_func(fi) {
     auto _p_preg;
     i = 0;
     while (i < par_cnt) {
-        _p_preg = arr_get(x64_var_promote, i);
+        _p_preg = arr_get(cg_var_promote, i);
         if (_p_preg >= 0) {
             x64_enc_mov_reg(_p_preg, x64_arg_reg(i));
         } else {
-            x64_enc_store(x64_arg_reg(i), 5, arr_get(x64_var_off, i));
+            x64_enc_store(x64_arg_reg(i), 5, arr_get(cg_var_off, i));
         }
         i = i + 1;
     }
 
     // Phase B3: zero any promoted local that is NOT a parameter.
     auto _z_vi, _z_n, _z_preg;
-    _z_n = arr_len(x64_vars);
+    _z_n = arr_len(cg_vars);
     for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
-        _z_preg = arr_get(x64_var_promote, _z_vi);
+        _z_preg = arr_get(cg_var_promote, _z_vi);
         if (_z_preg >= 0) { x64_enc_xor_zero(_z_preg); }
     }
 
     // Emit function body.
-    x64_depth = 0;
+    cg_depth = 0;
     x64_emit_body(body_arr, body_cnt);
 
     // Implicit return 0: set rax = 0 for functions without explicit return.
@@ -2103,7 +1799,7 @@ static void x64_emit_func(fi) {
 // Call once before the per-module loop.
 void x64_mod_init() {
     auto i, rec, name_p, idx, j;
-    x64_sbuf = vbuf;
+    cg_sbuf = vbuf;
 
     // Reset encoder state.
     x64_enc_pos = 0;
@@ -2112,35 +1808,35 @@ void x64_mod_init() {
     arr_clear(x64_enc_rel_pos); arr_clear(x64_enc_rel_sym); arr_clear(x64_enc_rel_ty);
 
     // Clear function tables.
-    arr_clear(x64_fn_name); arr_clear(x64_fn_par); arr_clear(x64_fn_pcnt);
-    arr_clear(x64_fn_body); arr_clear(x64_fn_bcnt); arr_clear(x64_fn_fidx);
+    arr_clear(cg_fn_name); arr_clear(cg_fn_par); arr_clear(cg_fn_pcnt);
+    arr_clear(cg_fn_body); arr_clear(cg_fn_bcnt); arr_clear(cg_fn_fidx);
     arr_clear(x64_fn_lbl);
 
     // Copy ALL globals with deduplication.
-    arr_clear(x64_gl_name);
+    arr_clear(cg_gl_name);
     i = 0;
     while (i < glob_cnt) {
         name_p = *(globals + i * 8);
         idx = -1;
         j = 0;
-        while (j < arr_len(x64_gl_name)) {
-            if (x64_str_eq_packed(name_p, arr_get(x64_gl_name, j))) { idx = j; }
+        while (j < arr_len(cg_gl_name)) {
+            if (cg_str_eq_packed(name_p, arr_get(cg_gl_name, j))) { idx = j; }
             j = j + 1;
         }
-        if (idx < 0) { x64_gl_name = arr_push(x64_gl_name, name_p); }
+        if (idx < 0) { cg_gl_name = arr_push(cg_gl_name, name_p); }
         i = i + 1;
     }
     // Hidden runtime globals come in via brt0.bsm (auto-injected).
 
     // Copy ALL externs.
-    arr_clear(x64_ex_name); arr_clear(x64_ex_ret);
-    arr_clear(x64_ex_args); arr_clear(x64_ex_acnt);
+    arr_clear(cg_ex_name); arr_clear(cg_ex_ret);
+    arr_clear(cg_ex_args); arr_clear(cg_ex_acnt);
     for (i = 0; i < ext_cnt; i = i + 1) {
         rec = *(externs + i * 8);
-        x64_ex_name = arr_push(x64_ex_name, *(rec + EX_NAME));
-        x64_ex_ret  = arr_push(x64_ex_ret,  *(rec + EX_RET));
-        x64_ex_args = arr_push(x64_ex_args, *(rec + EX_ARGS));
-        x64_ex_acnt = arr_push(x64_ex_acnt, *(rec + EX_ACNT));
+        cg_ex_name = arr_push(cg_ex_name, *(rec + EX_NAME));
+        cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
+        cg_ex_args = arr_push(cg_ex_args, *(rec + EX_ARGS));
+        cg_ex_acnt = arr_push(cg_ex_acnt, *(rec + EX_ACNT));
     }
 
 }
@@ -2149,7 +1845,7 @@ void x64_mod_init() {
 void emit_module_x86_64(mi) {
     auto fn_start, code_start, i, rec, name_p, idx, j;
 
-    fn_start = arr_len(x64_fn_name);
+    fn_start = arr_len(cg_fn_name);
 
     // Add functions from this module only.
     i = 0;
@@ -2159,25 +1855,25 @@ void emit_module_x86_64(mi) {
             name_p = *(rec + FN_NAME);
             idx = -1;
             j = 0;
-            while (j < arr_len(x64_fn_name)) {
-                if (x64_str_eq_packed(name_p, arr_get(x64_fn_name, j))) { idx = j; }
+            while (j < arr_len(cg_fn_name)) {
+                if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, j))) { idx = j; }
                 j = j + 1;
             }
             if (idx < 0) {
-                idx = arr_len(x64_fn_name);
-                x64_fn_name = arr_push(x64_fn_name, name_p);
-                x64_fn_par  = arr_push(x64_fn_par,  *(rec + FN_PARS));
-                x64_fn_pcnt = arr_push(x64_fn_pcnt, *(rec + FN_PCNT));
-                x64_fn_body = arr_push(x64_fn_body, *(rec + FN_BODY));
-                x64_fn_bcnt = arr_push(x64_fn_bcnt, *(rec + FN_BCNT));
-                x64_fn_fidx = arr_push(x64_fn_fidx, i);
+                idx = arr_len(cg_fn_name);
+                cg_fn_name = arr_push(cg_fn_name, name_p);
+                cg_fn_par  = arr_push(cg_fn_par,  *(rec + FN_PARS));
+                cg_fn_pcnt = arr_push(cg_fn_pcnt, *(rec + FN_PCNT));
+                cg_fn_body = arr_push(cg_fn_body, *(rec + FN_BODY));
+                cg_fn_bcnt = arr_push(cg_fn_bcnt, *(rec + FN_BCNT));
+                cg_fn_fidx = arr_push(cg_fn_fidx, i);
             } else {
-                arr_set(x64_fn_name, idx, name_p);
-                arr_set(x64_fn_par,  idx, *(rec + FN_PARS));
-                arr_set(x64_fn_pcnt, idx, *(rec + FN_PCNT));
-                arr_set(x64_fn_body, idx, *(rec + FN_BODY));
-                arr_set(x64_fn_bcnt, idx, *(rec + FN_BCNT));
-                arr_set(x64_fn_fidx, idx, i);
+                arr_set(cg_fn_name, idx, name_p);
+                arr_set(cg_fn_par,  idx, *(rec + FN_PARS));
+                arr_set(cg_fn_pcnt, idx, *(rec + FN_PCNT));
+                arr_set(cg_fn_body, idx, *(rec + FN_BODY));
+                arr_set(cg_fn_bcnt, idx, *(rec + FN_BCNT));
+                arr_set(cg_fn_fidx, idx, i);
             }
         }
         i = i + 1;
@@ -2185,7 +1881,7 @@ void emit_module_x86_64(mi) {
 
     // Assign labels for new functions only.
     i = fn_start;
-    while (i < arr_len(x64_fn_name)) {
+    while (i < arr_len(cg_fn_name)) {
         x64_fn_lbl = arr_push(x64_fn_lbl, x64_enc_new_label());
         i = i + 1;
     }
@@ -2196,7 +1892,7 @@ void emit_module_x86_64(mi) {
     // Emit new functions only.
     code_start = x64_enc_pos;
     i = fn_start;
-    while (i < arr_len(x64_fn_name)) {
+    while (i < arr_len(cg_fn_name)) {
         x64_emit_func(i);
         i = i + 1;
     }
@@ -2206,7 +1902,7 @@ void emit_module_x86_64(mi) {
 }
 
 // Emit the _start entry point stub after all modules have been emitted.
-// Finds main in x64_fn_name, emits argc/argv/envp setup, calls main, exits.
+// Finds main in cg_fn_name, emits argc/argv/envp setup, calls main, exits.
 // Returns the _start label ID.
 x64_emit_start_stub() {
     auto start_lbl, main_fi, i;
@@ -2223,8 +1919,8 @@ x64_emit_start_stub() {
     x64_enc_and_imm(4, 0 - 16);      // align stack
     main_fi = 0 - 1;
     i = 0;
-    while (i < arr_len(x64_fn_name)) {
-        if (x64_str_eq(arr_get(x64_fn_name, i), "main", 4)) { main_fi = i; }
+    while (i < arr_len(cg_fn_name)) {
+        if (cg_str_eq(arr_get(cg_fn_name, i), "main", 4)) { main_fi = i; }
         i = i + 1;
     }
     if (main_fi >= 0) {
@@ -2242,7 +1938,7 @@ x64_emit_start_stub() {
 void emit_all_x86_64() {
     auto i, sp, ss, sl, j, fp, fs, fl, main_fi, main_lbl, start_lbl;
 
-    bridge_data_x86_64();
+    cg_bridge_data();
 
     // Hidden runtime globals come in via brt0.bsm (auto-injected).
 
@@ -2258,7 +1954,7 @@ void emit_all_x86_64() {
     // Allocate a label for each function.
     arr_clear(x64_fn_lbl);
     i = 0;
-    while (i < arr_len(x64_fn_name)) {
+    while (i < arr_len(cg_fn_name)) {
         x64_fn_lbl = arr_push(x64_fn_lbl, x64_enc_new_label());
         i = i + 1;
     }
@@ -2280,10 +1976,10 @@ void emit_all_x86_64() {
     // Align stack to 16 bytes before calling main.
     x64_enc_and_imm(4, 0 - 16);
     // Call main(argc, argv, envp). RDI=argc, RSI=argv, RDX=envp now set.
-    main_fi = x64_find_fn(pack(0, 0));  // Will be found by name below.
+    main_fi = cg_find_fn(pack(0, 0));  // Will be found by name below.
     i = 0;
-    while (i < arr_len(x64_fn_name)) {
-        if (x64_str_eq(arr_get(x64_fn_name, i), "main", 4)) { main_fi = i; }
+    while (i < arr_len(cg_fn_name)) {
+        if (cg_str_eq(arr_get(cg_fn_name, i), "main", 4)) { main_fi = i; }
         i = i + 1;
     }
     if (main_fi >= 0) {
@@ -2296,7 +1992,7 @@ void emit_all_x86_64() {
 
     // Emit all functions into the code buffer.
     i = 0;
-    while (i < arr_len(x64_fn_name)) { x64_emit_func(i); i = i + 1; }
+    while (i < arr_len(cg_fn_name)) { x64_emit_func(i); i = i + 1; }
 
     // Resolve all forward branch fixups.
     x64_enc_resolve_fixups();

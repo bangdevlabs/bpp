@@ -1,0 +1,598 @@
+// bpp_codegen.bsm — portable codegen logic shared across chip backends.
+//
+// This file is the target of the MAX-plan bpp_codegen extraction.
+// Everything in here is pure AST-level / register-allocation /
+// ABI-layout / tree-walking code — no chip-specific instruction
+// emission. Each chip backend (a64 / x64 / future riscv / wasm)
+// imports this file and implements a small set of `chip_emit_*`
+// primitives that bpp_codegen calls.
+//
+// ── Contract: `chip_primitives` ──
+//
+// Each chip implements this fixed interface. The numbers next to
+// each function are the "slot" in the conceptual Forth-style
+// primitives table — a minimal set that any new chip needs to
+// provide to receive the full power of the portable passes.
+//
+//   ─ Arithmetic ─
+//    1  chip_emit_add(rd, rs1, rs2, size)
+//    2  chip_emit_sub(rd, rs1, rs2, size)
+//    3  chip_emit_mul(rd, rs1, rs2, size)
+//    4  chip_emit_div(rd, rs1, rs2, size)
+//    5  chip_emit_mod(rd, rs1, rs2, size)
+//    6  chip_emit_neg(rd, rs, size)
+//
+//   ─ Logical / bitwise ─
+//    7  chip_emit_and(rd, rs1, rs2)
+//    8  chip_emit_or (rd, rs1, rs2)
+//    9  chip_emit_xor(rd, rs1, rs2)
+//   10  chip_emit_shl(rd, rs1, rs2)
+//   11  chip_emit_shr(rd, rs1, rs2)
+//   12  chip_emit_not(rd, rs)
+//
+//   ─ Move / compare ─
+//   13  chip_emit_mov_imm(rd, imm)
+//   14  chip_emit_mov_reg(rd, rs)
+//   15  chip_emit_cmp(rs1, rs2, size)
+//
+//   ─ Memory ─
+//   16  chip_emit_load(rd, rbase, off, size, signed)
+//   17  chip_emit_store(rsrc, rbase, off, size)
+//
+//   ─ Control flow ─
+//   18  chip_emit_branch_eq(label_id)
+//   19  chip_emit_branch_ne(label_id)
+//   20  chip_emit_branch_lt(label_id)
+//   21  chip_emit_branch_ge(label_id)
+//   22  chip_emit_jump(label_id)
+//   23  chip_emit_label(label_id)
+//   24  chip_emit_call(target_label)
+//   25  chip_emit_ret()
+//
+//   ─ Stack ─
+//   26  chip_emit_push(reg)
+//   27  chip_emit_pop(reg)
+//   28  chip_emit_frame_setup(frame_size)
+//   29  chip_emit_frame_teardown(frame_size)
+//
+//   ─ Syscall ─
+//   30  chip_emit_syscall(num_args)
+//
+//   ─ Register file metadata ─
+//   31  chip_reg_count()              → how many GP registers
+//   32  chip_arg_reg(i)               → i-th argument register
+//   33  chip_arg_reg_count()          → args-in-regs limit
+//   34  chip_return_reg()             → return-value register
+//   35  chip_sp_reg()                 → stack pointer
+//   36  chip_fp_reg()                 → frame pointer
+//   37  chip_caller_saved_mask()      → bitmask
+//   38  chip_callee_saved_mask()      → bitmask
+//   39  chip_word_size()              → 4 or 8
+//
+// ── Status ──
+//
+// This module is intentionally empty during Phase 0 (audit).
+// See `docs/max_plan_codegen_split.md` for the audit report and
+// the per-function migration table.
+//
+// Subsequent phases move portable logic out of
+// `src/backend/chip/<arch>/<arch>_codegen.bsm` into this file,
+// function by function, validating byte-identity of the `bpp`
+// binary after each move. When extraction is complete, each
+// `<arch>_codegen.bsm` shrinks to ~300 lines of pure
+// `chip_primitives` implementations.
+
+// Placeholder sentinel so the file is not "empty" and gets
+// touched by the linker. Will be replaced with real code during
+// Phase 2 of the MAX-plan bpp_codegen extraction.
+static bpp_codegen_version() : base {
+    return 0;
+}
+
+// ── Phase 1: shared globals ────────────────────────────────
+//
+// These replace per-chip duplicates. Each chip codegen imports
+// this file and references the `cg_*` names directly. During
+// Phase 1 the renames are applied one subgroup at a time with
+// byte-identity validation after each.
+//
+// Switch-analysis state used by the dense jump-table pass. Set
+// by `switch_is_dense` (portable analysis, moves in Phase 2),
+// consumed by the chip-specific `emit_switch_jtbl`.
+auto cg_sw_min;     // Lowest arm value seen (signed 64-bit).
+auto cg_sw_max;     // Highest arm value seen.
+auto cg_sw_total;   // Total count of arm values.
+
+// Parser's string buffer — every identifier and literal lives as
+// a packed (offset, length) into this buffer. Shared across chips
+// so the source-reading helpers below (cg_str_eq, cg_parse_int,
+// etc.) don't need the chip prefix. Set once by bridge_data at
+// codegen entry, read-only thereafter.
+auto cg_sbuf;
+
+// ── Portable helpers: packed-string utilities ────────────────
+//
+// The parser packs identifiers, literals, and other tokens as a
+// 64-bit (offset, length) pair via `pack()` + `unpack_s/l()`. The
+// following helpers read that representation against `cg_sbuf`
+// and work identically on every chip because they don't emit any
+// instruction bytes — they just parse text the parser produced.
+
+// Compare a packed source range against a C string literal.
+// Returns 1 if the bytes match and the lengths are equal,
+// 0 otherwise.
+cg_str_eq(p, lit, litlen) {
+    if (unpack_l(p) != litlen) { return 0; }
+    return buf_eq(cg_sbuf + unpack_s(p), lit, litlen);
+}
+
+// Compare two packed source ranges byte by byte. Faster than
+// materialising both to C strings since both already live in the
+// same sbuf and the comparison is index-based.
+cg_str_eq_packed(a, b) {
+    auto as, al, bs, bl, i;
+    al = unpack_l(a); bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    as = unpack_s(a); bs = unpack_s(b);
+    i = 0;
+    while (i < al) {
+        if (peek(cg_sbuf + as + i) != peek(cg_sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Parse a packed numeric literal to a 64-bit integer. Handles
+// hex (0x... / 0X...) and decimal. Invalid characters produce
+// garbage upstream — the lexer is expected to have validated the
+// literal's shape before this helper runs.
+cg_parse_int(p) {
+    auto s, l, i, ch, val;
+    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
+    // Hex: 0x...
+    if (l > 2) {
+        if (peek(cg_sbuf + s) == '0') {
+            if (peek(cg_sbuf + s + 1) == 'x' | peek(cg_sbuf + s + 1) == 'X') {
+                i = 2;
+                while (i < l) {
+                    ch = peek(cg_sbuf + s + i); val = val * 16;
+                    if (ch >= '0' && ch <= '9') { val = val + ch - '0'; }
+                    if (ch >= 'A' && ch <= 'F') { val = val + ch - 55; }
+                    if (ch >= 'a' && ch <= 'f') { val = val + ch - 87; }
+                    i = i + 1;
+                }
+                return val;
+            }
+        }
+    }
+    // Decimal.
+    while (i < l) { ch = peek(cg_sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
+    return val;
+}
+
+// Quick check: does the packed literal contain a '.'? Used by
+// codegens to decide between emitting an integer constant load
+// and a floating-point constant load.
+cg_is_float_lit(p) {
+    auto s, l, i;
+    s = unpack_s(p); l = unpack_l(p);
+    i = 0;
+    while (i < l) {
+        if (peek(cg_sbuf + s + i) == '.') { return 1; }
+        i = i + 1;
+    }
+}
+
+// ── Variable table ───────────────────────────────────────────
+//
+// Parallel dynamic arrays indexed by variable slot. Each function
+// that a codegen emits has its own pass that walks locals, adds
+// them here, and later queries their slot to emit loads/stores.
+// Reset per function (arr_clear at the start of emit_func).
+//
+//   cg_vars              packed names
+//   cg_var_stack         1 if struct-on-stack (vs reg-resident)
+//   cg_var_struct_idx    struct definition index, or -1
+//   cg_var_off           byte offset from frame pointer
+//   cg_var_forced_ty     explicit type hint from `: word` etc, or 0
+//   cg_var_refs          reference count (for B3 register promotion)
+//   cg_var_addr_taken    1 if address-of operator applied
+//   cg_var_promote       register assigned by B3, or -1
+
+auto cg_vars;
+auto cg_var_stack, cg_var_struct_idx, cg_var_off, cg_var_forced_ty;
+auto cg_var_refs;
+auto cg_var_addr_taken;
+auto cg_var_promote;
+
+// Add a variable to the current scope. Initialises all parallel
+// arrays to their defaults and returns the fresh slot index.
+cg_var_add(name_p) {
+    auto idx; idx = arr_len(cg_vars);
+    cg_vars = arr_push(cg_vars, name_p);
+    cg_var_stack = arr_push(cg_var_stack, 0);
+    cg_var_struct_idx = arr_push(cg_var_struct_idx, 0 - 1);
+    cg_var_off = arr_push(cg_var_off, 0);
+    cg_var_forced_ty = arr_push(cg_var_forced_ty, 0);
+    cg_var_refs = arr_push(cg_var_refs, 0);
+    cg_var_addr_taken = arr_push(cg_var_addr_taken, 0);
+    cg_var_promote = arr_push(cg_var_promote, 0 - 1);
+    return idx;
+}
+
+// Find a variable index by packed name. Returns slot index or -1.
+cg_var_idx(name_p) {
+    auto i; i = 0;
+    while (i < arr_len(cg_vars)) {
+        if (cg_str_eq_packed(name_p, arr_get(cg_vars, i))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find a variable's frame offset by packed name. Thin shortcut
+// for code that only cares about where the slot lives, not its
+// index. Returns -1 if the name doesn't resolve.
+cg_var_find(name_p) {
+    auto i;
+    i = cg_var_idx(name_p);
+    if (i >= 0) { return arr_get(cg_var_off, i); }
+    return -1;
+}
+
+// ── Function / global / extern tables ───────────────────────
+//
+// Populated by bridge_data at codegen entry (one entry per
+// function/global/extern the parser saw). The codegen walks these
+// to find declaration metadata during emission.
+//
+//   cg_fn_name    packed function names
+//   cg_fn_par     parameter-name arrays (one array per function)
+//   cg_fn_pcnt    parameter counts
+//   cg_fn_body    AST-root pointers
+//   cg_fn_bcnt    body statement counts
+//   cg_fn_fidx    parser func_cnt index (for type queries)
+//   cg_gl_name    global-variable names
+//   cg_ex_name    extern function names (FFI declarations)
+//   cg_ex_ret     extern return-type packed strings
+//   cg_ex_args    extern arg-type arrays
+//   cg_ex_acnt    extern arg counts
+
+auto cg_fn_name, cg_fn_par, cg_fn_pcnt, cg_fn_body, cg_fn_bcnt, cg_fn_fidx;
+auto cg_gl_name;
+auto cg_ex_name, cg_ex_ret, cg_ex_args, cg_ex_acnt;
+
+// Find a B++ function's emitter index by packed name.
+// Returns -1 if not declared.
+cg_find_fn(name_p) {
+    auto i; i = 0;
+    while (i < arr_len(cg_fn_name)) {
+        if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, i))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find an extern declaration by packed name alone. Returns the
+// first match; for multi-signature scenarios see cg_find_ext_by_argc.
+cg_find_ext(name_p) {
+    auto i; i = 0;
+    while (i < arr_len(cg_ex_name)) {
+        if (cg_str_eq_packed(name_p, arr_get(cg_ex_name, i))) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Find an extern declaration by packed name AND argument count.
+// Allows multiple declarations of the same name with different
+// signatures (`objc_msgSend` is the canonical example). Falls back
+// to name-only match when no signature matches.
+cg_find_ext_by_argc(name_p, argc) {
+    auto i; i = 0;
+    while (i < arr_len(cg_ex_name)) {
+        if (cg_str_eq_packed(name_p, arr_get(cg_ex_name, i))) {
+            if (arr_get(cg_ex_acnt, i) == argc) { return i; }
+        }
+        i = i + 1;
+    }
+    return cg_find_ext(name_p);
+}
+
+// Is the i-th parameter of extern `exi` declared `double`?
+cg_ext_par_is_float(exi, par_idx) {
+    auto arr, tp;
+    arr = arr_get(cg_ex_args, exi);
+    tp = *(arr + par_idx * 8);
+    return cg_str_eq(tp, "double", 6);
+}
+
+// Does extern `exi` return `double`?
+cg_ext_ret_is_float(exi) {
+    auto tp;
+    tp = arr_get(cg_ex_ret, exi);
+    return cg_str_eq(tp, "double", 6);
+}
+
+// ── B3: reference-count walk + eligibility ──────────────────
+//
+// Phase B3 promotes hot locals into registers across the function
+// body. The work splits in three:
+//   - cg_b3_eligible: pure portable check (excludes stack structs,
+//     address-taken vars, floats, and sub-word slices).
+//   - cg_b3_walk: recursive AST walker that tallies var_refs and
+//     flags address-taken vars. Portable — no register choice.
+//   - chip_b3_select (a64_b3_select / x64_b3_select): the one
+//     chip-specific piece. Picks actual register numbers from the
+//     host's callee-saved pool and records them in the chip's
+//     promoted_regs list.
+
+cg_b3_eligible(vi) : base {
+    auto fty;
+    if (arr_get(cg_var_stack, vi)) { return 0; }
+    if (arr_get(cg_var_addr_taken, vi)) { return 0; }
+    fty = arr_get(cg_var_forced_ty, vi);
+    if (is_float_type(fty)) { return 0; }
+    if (ty_slice(fty) != SL_FULL) { return 0; }
+    return 1;
+}
+
+cg_b3_walk(nd) {
+    auto n: Node, t, vi, child: Node, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        vi = cg_var_idx(n.a);
+        if (vi >= 0) { arr_set(cg_var_refs, vi, arr_get(cg_var_refs, vi) + 1); }
+        return 0;
+    }
+    if (t == T_ADDR) {
+        child = n.a;
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = cg_var_idx(child.a);
+            if (vi >= 0) { arr_set(cg_var_addr_taken, vi, 1); }
+            return 0;
+        }
+        cg_b3_walk(child);
+        return 0;
+    }
+    switch (t) {
+    T_BINOP    { cg_b3_walk(n.b); cg_b3_walk(n.c); }
+    T_ASSIGN   { cg_b3_walk(n.a); cg_b3_walk(n.b); }
+    T_MEMST    { cg_b3_walk(n.a); cg_b3_walk(n.b); }
+    T_UNARY    { cg_b3_walk(n.b); }
+    T_MEMLD    { cg_b3_walk(n.a); }
+    T_RET      { cg_b3_walk(n.a); }
+    T_TERNARY  { cg_b3_walk(n.a); cg_b3_walk(n.b); cg_b3_walk(n.c); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+    }
+    T_IF {
+        cg_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        }
+    }
+    T_WHILE {
+        cg_b3_walk(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        if (n.e != 0) { cg_b3_walk(n.e); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+    }
+    else { }
+    }
+}
+
+// ── Switch-jump-table eligibility analysis ───────────────────
+//
+// Walks the arm values of a switch node and decides whether a
+// dense jump-table lowering is worthwhile. Fills cg_sw_min /
+// cg_sw_max / cg_sw_total as a side effect so the chip-specific
+// emit_switch_jtbl can use them without re-scanning.
+//
+// Gate conditions:
+//   - All arm values must be integer literals
+//   - At least 3 distinct values (fewer → plain compare chain)
+//   - Range ≤ 512 (keeps worst-case table ≤ 2 KB of code)
+//   - Density ≥ 50% (range < 2 × total)
+//
+// ── Per-function + loop state ────────────────────────────────
+//
+// All portable state that survives a single function's emit pass:
+// counters, literal pools, nested-loop tracking, current-function
+// context. Reset per function (or per module for literal pools)
+// by the chip codegen's init sequence.
+//
+//   cg_flt_tbl           float literal entries (dynamic array)
+//   cg_str_tbl           string literal entries (dynamic array)
+//   cg_lbl_cnt           monotonic label-ID counter
+//   cg_depth             current nesting level (for scope tracking)
+//   cg_break_stack       stack of break-target label IDs
+//   cg_continue_stack    stack of continue-target label IDs
+//   cg_cur_fn_name       packed name of the function being emitted
+//   cg_cur_fn_idx        parser funcs[] index for type queries
+
+auto cg_flt_tbl;
+auto cg_str_tbl;
+auto cg_lbl_cnt, cg_depth;
+auto cg_break_stack;
+auto cg_continue_stack;
+auto cg_cur_fn_name, cg_cur_fn_idx;
+
+// Allocate a fresh label ID. Monotonic across the whole codegen
+// pass — each call returns a distinct integer.
+cg_new_lbl() { auto l; l = cg_lbl_cnt; cg_lbl_cnt = cg_lbl_cnt + 1; return l; }
+
+// Inferred type code of a local variable. Looks up the slot's
+// packed name in the parser's per-function type map.
+cg_var_type(vi) {
+    return get_fn_var_type(cg_cur_fn_idx, arr_get(cg_vars, vi));
+}
+
+// Is the variable at slot `vi` a float in the current function?
+// Explicit integer type hints (: word / byte / half / quarter)
+// override float inference — the programmer's annotation wins.
+cg_var_is_float(vi) {
+    auto fty;
+    fty = arr_get(cg_var_forced_ty, vi);
+    if (fty > 0) {
+        return is_float_type(fty);
+    }
+    return is_float_type(cg_var_type(vi));
+}
+
+// ── Bridge: parser state → codegen state ────────────────────
+//
+// Called once at codegen entry. Copies the parser's function /
+// global / extern records into the cg_* parallel arrays that the
+// rest of the codegen consumes. Handles forward-declaration
+// overwrite (a function seen as `import` gets its body filled in
+// later when the real definition is encountered) and global
+// deduplication (the same name from different modules folds to
+// one slot).
+//
+// The parser's dense record format (FN_NAME, FN_PARS, etc. in
+// bpp_defs.bsm) is decoded here so the codegen can walk the
+// arrays without knowing the record layout. When the parser
+// changes its record shape, only this function needs updating.
+void cg_bridge_data() {
+    auto i, rec, name_p, idx, j;
+    cg_sbuf = vbuf;
+
+    // Functions — copy reachable, dedup against forward decls.
+    arr_clear(cg_fn_name); arr_clear(cg_fn_par); arr_clear(cg_fn_pcnt);
+    arr_clear(cg_fn_body); arr_clear(cg_fn_bcnt); arr_clear(cg_fn_fidx);
+    i = 0;
+    while (i < func_cnt) {
+        // Lazy emit: skip functions not reachable from main.
+        if (_lazy_emit_ready) {
+            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+        }
+        rec = *(funcs + i * 8);
+        name_p = *(rec + FN_NAME);
+        idx = -1;
+        j = 0;
+        while (j < arr_len(cg_fn_name)) {
+            if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, j))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            idx = arr_len(cg_fn_name);
+            cg_fn_name = arr_push(cg_fn_name, name_p);
+            cg_fn_par  = arr_push(cg_fn_par,  *(rec + FN_PARS));
+            cg_fn_pcnt = arr_push(cg_fn_pcnt, *(rec + FN_PCNT));
+            cg_fn_body = arr_push(cg_fn_body, *(rec + FN_BODY));
+            cg_fn_bcnt = arr_push(cg_fn_bcnt, *(rec + FN_BCNT));
+            cg_fn_fidx = arr_push(cg_fn_fidx, i);
+        } else {
+            // Forward declaration overwrite.
+            arr_set(cg_fn_name, idx, name_p);
+            arr_set(cg_fn_par,  idx, *(rec + FN_PARS));
+            arr_set(cg_fn_pcnt, idx, *(rec + FN_PCNT));
+            arr_set(cg_fn_body, idx, *(rec + FN_BODY));
+            arr_set(cg_fn_bcnt, idx, *(rec + FN_BCNT));
+            arr_set(cg_fn_fidx, idx, i);
+        }
+        i = i + 1;
+    }
+
+    // Globals — dedup by name; each unique name gets one data slot.
+    arr_clear(cg_gl_name);
+    i = 0;
+    while (i < glob_cnt) {
+        name_p = *(globals + i * 8);
+        idx = -1;
+        j = 0;
+        while (j < arr_len(cg_gl_name)) {
+            if (cg_str_eq_packed(name_p, arr_get(cg_gl_name, j))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            cg_gl_name = arr_push(cg_gl_name, name_p);
+        }
+        i = i + 1;
+    }
+
+    // Externs — FFI declarations. No dedup (multiple signatures
+    // with the same name are legal; the codegen picks by argc).
+    arr_clear(cg_ex_name); arr_clear(cg_ex_ret);
+    arr_clear(cg_ex_args); arr_clear(cg_ex_acnt);
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        cg_ex_name = arr_push(cg_ex_name, *(rec + EX_NAME));
+        cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
+        cg_ex_args = arr_push(cg_ex_args, *(rec + EX_ARGS));
+        cg_ex_acnt = arr_push(cg_ex_acnt, *(rec + EX_ACNT));
+        i = i + 1;
+    }
+}
+
+// ── Hidden argc/argv/envp symbols ────────────────────────────
+//
+// brt0 declares three globals (_bpp_argc/argv/envp) that main()'s
+// prologue fills in and argc_get/argv_get/envp_get read back out.
+// The codegen needs the packed-name pointers to emit relocations
+// against those slots. Shared across chips because the names come
+// from the parser's globals array, which is chip-agnostic.
+
+auto cg_argc_sym, cg_argv_sym, cg_envp_sym;
+
+// Scan the parser's globals table for the three brt0-declared
+// names and record their packed pointers. Called once after
+// cg_bridge_data() during the codegen init sequence.
+void cg_bind_startup_syms() {
+    auto i, name_p;
+    for (i = 0; i < glob_cnt; i = i + 1) {
+        name_p = *(globals + i * 8);
+        switch {
+            cg_str_eq(name_p, "_bpp_argc", 9) { cg_argc_sym = name_p; }
+            cg_str_eq(name_p, "_bpp_argv", 9) { cg_argv_sym = name_p; }
+            cg_str_eq(name_p, "_bpp_envp", 9) { cg_envp_sym = name_p; }
+            else { }
+        }
+    }
+}
+
+// Returns 1 if the switch qualifies, 0 otherwise.
+cg_switch_is_dense(sw_arms, sw_cnt) {
+    auto si, sk, sv_arr, sv_cnt, val, first, range;
+    auto node: Node;
+    first = 1;
+    cg_sw_min = 0;
+    cg_sw_max = 0;
+    cg_sw_total = 0;
+    for (si = 0; si < sw_cnt; si = si + 1) {
+        sv_arr = sw_arms[si * 2];
+        sv_cnt = sw_arms[si * 2 + 1];
+        for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+            node = sv_arr[sk];
+            if (node.ntype != T_LIT) { return 0; }
+            val = cg_parse_int(node.a);
+            if (first) {
+                cg_sw_min = val;
+                cg_sw_max = val;
+                first = 0;
+            } else {
+                if (val < cg_sw_min) { cg_sw_min = val; }
+                if (val > cg_sw_max) { cg_sw_max = val; }
+            }
+            cg_sw_total = cg_sw_total + 1;
+        }
+    }
+    if (cg_sw_total < 3) { return 0; }
+    range = cg_sw_max - cg_sw_min;
+    if (range < 0) { return 0; }
+    if (range > 512) { return 0; }
+    if (range >= 2 * cg_sw_total) { return 0; }
+    return 1;
+}

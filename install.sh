@@ -91,7 +91,6 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 # Install the runtime modules that every user program either imports
 # explicitly or receives via auto-injection. bpp_defs is the constants
 # table injected at codegen time. The rest are high-level APIs:
-#   bpp_mem     — malloc/free/realloc/memcpy (wraps _bmem_<os>)
 #   bpp_array   — dynamic arrays with shadow header
 #   bpp_buf     — raw buffer access for multi-byte reads/writes
 #   bpp_str     — null-terminated and dynamic string utilities
@@ -112,7 +111,6 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 # When a new user-facing src/ module ships, add it to this list at the
 # same time.
 sudo cp src/bpp_defs.bsm "$LIB_DIR/"
-sudo cp src/bpp_mem.bsm "$LIB_DIR/"
 sudo cp src/bpp_array.bsm "$LIB_DIR/"
 sudo cp src/bpp_buf.bsm "$LIB_DIR/"
 sudo cp src/bpp_str.bsm "$LIB_DIR/"
@@ -126,6 +124,7 @@ sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 sudo cp src/bpp_arena.bsm "$LIB_DIR/"
 sudo cp src/bpp_path.bsm "$LIB_DIR/"
+sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
@@ -135,12 +134,13 @@ sudo cp drivers/*.bsm "$DRV_DIR/"
 
 # Install the four-layer backend. Matches the src/backend/ reorg from
 # the 0.23.x cache-removal sprint and the find_file lookup list in
-# bpp_import.bsm. On macOS the OS layer's _bmem, _brt0, _bsys, _stb_core,
-# _stb_platform, and bug_observe files are auto-injected whenever a
-# user program pulls stbgame, so the OS subdirectories must ship even
-# if the user never cross-compiles. The chip/ and target/ trees are
-# compiler internals — installed for completeness so an installed bpp
-# can be re-bootstrapped from this tree without the source checkout.
+# bpp_import.bsm. On macOS the OS layer's _core, _stb_platform,
+# _stb_audio, and bug_observe files are auto-injected whenever a
+# user program pulls stbgame, so the OS subdirectories must ship
+# even if the user never cross-compiles. The chip/ and target/
+# trees are compiler internals — installed for completeness so an
+# installed bpp can be re-bootstrapped from this tree without the
+# source checkout.
 sudo cp src/backend/chip/aarch64/*.bsm "$CHIP_ARM64_DIR/"
 sudo cp src/backend/chip/x86_64/*.bsm "$CHIP_X64_DIR/"
 sudo cp src/backend/os/macos/*.bsm "$OS_MACOS_DIR/"
