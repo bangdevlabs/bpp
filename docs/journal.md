@@ -1,5 +1,26 @@
 # B++ Bootstrap Journal
 
+## 2026-04-20 — Phase 3.4 closeout: Waves 1-12 of chip_primitives migration
+
+12 waves walked through to completion — 8 with substantive
+migration, 1 carried forward (Wave 9 / T_CALL — too coupled
+with chip-side scheduling for wave-style call-site
+replacement), 1 N/A (Wave 11 — no T_SUBSCRIPT/T_FIELD AST
+node types; subscript+field both lower to T_MEMLD), 2
+collateral (Wave 12's emit_stmt cases were migrated
+alongside Wave 7's emit_node cases because the inline bodies
+were identical).
+
+**Final tally**: 35 of 60 contract slots wired, ~250 LOC
+shrunk in chip codegens cumulative, 9 commits in this
+session, all byte-identical against the jedi handoff
+canaries.
+
+**Wave 9 deferred** — see commit 0d38cb0 message. T_CALL
+needs its own session; the wave-style call-site replacement
+applied to Waves 1-8/10 doesn't fit the 770-line interleaved
+ABI dispatch.
+
 ## 2026-04-20 — Phase 3.4 first half: Waves 1-7 of chip_primitives migration
 
 Seven waves shipped, all byte-identical against the jedi handoff

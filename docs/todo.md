@@ -76,15 +76,23 @@ against the jedi handoff canaries. Full write-up in
   (8 control-flow primitives — first wave with real chip-code
   shrink, **−198 LOC net**)
 
-**Phase 3.4 — pending Waves 8-12 (next session)**
+**Phase 3.4 — Waves 8/10 shipped, 9 deferred, 11 N/A, 12 collateral**
 
-- Wave 8   `T_MEMLD` / `T_MEMST` / `T_ADDR` — needs chip-side
-  helper extraction first (bit-packed + sub-word dispatch
-  matrix is inline today)
-- Wave 9   `T_CALL` — ABI divergence, budget 2-3 h, may need 9b split
-- Wave 10  `T_ASSIGN`
-- Wave 11  `T_SUBSCRIPT` / `T_FIELD`
-- Wave 12  `emit_stmt` migration
+- ✅ Wave 8 — `T_MEMLD / T_MEMST (int path) / T_ADDR` via
+  fat-primitive (chip owns sub-word + bit-packed dispatch
+  internally)
+- 📌 Wave 9 — `T_CALL` deferred. Needs dedicated session:
+  770 lines per chip with ABI scheduling that doesn't fit
+  call-site replacement
+- ✅ Wave 10 — `T_ASSIGN` global stores via emit_store_global
+- 🚫 Wave 11 — `T_SUBSCRIPT / T_FIELD` N/A. Parser lowers both
+  to T_MEMLD (handled in Wave 8)
+- ✅ Wave 12 — `emit_stmt` cases were collateral on Wave 7's
+  emit_node migration (identical bodies)
+
+**Phase 3.4 next session**: Wave 9 (T_CALL) standalone.
+Then Waves 13-19 (emit_func + epilogues), then Phase 4 dedup,
+Phase 5 RISC-V, Phase 6 install chameleon.
 
 Then Waves 13-19 (emit_func + epilogues), then Phase 4 dedup,
 Phase 5 RISC-V backend, Phase 6 install.sh chameleon. The
