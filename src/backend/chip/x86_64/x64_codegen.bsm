@@ -107,6 +107,10 @@ void cg_install_x86_64_primitives() {
     p.emit_promote_int_to_flt = fn_ptr(_x64_emit_promote_int_to_flt);
     p.emit_demote_flt_to_int  = fn_ptr(_x64_emit_demote_flt_to_int);
     p.emit_jump_to_epilogue   = fn_ptr(_x64_emit_jump_to_epilogue);
+    p.emit_memld_load         = fn_ptr(_x64_emit_memld_load);
+    p.emit_memst_store        = fn_ptr(_x64_emit_memst_store);
+    p.emit_addr_local         = fn_ptr(_x64_emit_addr_local);
+    p.emit_addr_global        = fn_ptr(_x64_emit_addr_global);
 }
 
 void init_codegen_x86_64() {
@@ -1301,55 +1305,28 @@ static x64_emit_node(nd) {
     // ── Memory load: *(ptr) ──
     // mem_load: *(ptr) — n.b holds field type hint for packed structs.
     if (t == T_MEMLD) {
-        auto fh, sl, bo, bw, mask;
-        fh = n.b;
+        // Phase 3.4 Wave 8.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         ety = x64_emit_node(n.a);
-        if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
-        sl = ty_slice(fh);
-        // `: double` field (128-bit SIMD) — MOVUPS into xmm0 and return
-        // type 2 (SIMD) so chained vec_* ops receive the right-width reg.
-        if (sl == SL_DOUBLE) {
-            x64_enc_movups_load(0, 0, 0);
-            return 2;
-        }
-        // Bit-packed fields: load the containing byte, shift the field down to
-        // bit 0, mask off the high bits. The bit offset within the byte is
-        // encoded in bits 8-10 of the hint by resolve_dot.
-        if (sl >= SL_BIT && sl <= SL_BIT7) {
-            bo = (fh / 256) & 7;
-            bw = sl - 3;
-            mask = (1 << bw) - 1;
-            x64_enc_loadb(0, 0, 0);
-            if (bo > 0) { x64_enc_shr_imm(0, bo); }
-            x64_enc_and_imm(0, mask);
-            return 0;
-        }
-        if (sl == SL_BYTE) { x64_enc_loadb(0, 0, 0); }
-        else if (sl == SL_QUARTER) { x64_enc_loadh(0, 0, 0); }
-        else if (sl == SL_HALF) { x64_enc_load_sw(0, 0, 0); }
-        else { x64_enc_load(0, 0, 0); }
-        return 0;
+        if (ety == 1) { call(pp.emit_demote_flt_to_int); }
+        return call(pp.emit_memld_load, n.b);
     }
 
-    // ── Address-of: &x ──
-    // Computes the memory address of a variable without loading its value.
+    // ── Address-of: &x ── Phase 3.4 Wave 8.
     if (t == T_ADDR) {
         auto child: Node;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         child = n.a;
-        if (child != 0) {
-            if (child.ntype == T_VAR) {
-                vi = cg_var_idx(child.a);
-                if (vi >= 0) {
-                    off = arr_get(cg_var_off, vi);
-                    x64_enc_lea(0, 5, off);
-                    return 0;
-                }
-                // Global variable: compute address without loading.
-                auto dpos;
-                dpos = x64_enc_lea_rip(0);
-                x64_enc_add_reloc(dpos, child.a, 0);
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = cg_var_idx(child.a);
+            if (vi >= 0) {
+                call(pp.emit_addr_local, arr_get(cg_var_off, vi));
                 return 0;
             }
+            call(pp.emit_addr_global, child.a);
+            return 0;
         }
         return 0;
     }
@@ -1452,27 +1429,10 @@ static void x64_emit_stmt(nd) {
         x64_emit_push();
         x64_emit_node(n.a);
         x64_emit_pop(1);
-        // Bit-packed field stores: load the containing byte into rdx, clear
-        // the destination field bits, shift the source value into position,
-        // OR them together, store the byte back. rax holds the pointer and
-        // rcx holds the source value after the pop.
-        if (sl >= SL_BIT && sl <= SL_BIT7) {
-            bo = (fh / 256) & 7;
-            bw = sl - 3;
-            mask = (1 << bw) - 1;
-            clear_mask = 255 ^ (mask << bo);
-            x64_enc_loadb(2, 0, 0);
-            x64_enc_and_imm(2, clear_mask);
-            x64_enc_and_imm(1, mask);
-            if (bo > 0) { x64_enc_shl_imm(1, bo); }
-            x64_enc_or_reg(2, 1);
-            x64_enc_storeb(2, 0, 0);
-            return 0;
-        }
-        if (sl == SL_BYTE) { x64_enc_storeb(1, 0, 0); }
-        else if (sl == SL_QUARTER) { x64_enc_storeh(1, 0, 0); }
-        else if (sl == SL_HALF) { x64_enc_store_w(1, 0, 0); }
-        else { x64_enc_store(1, 0, 0); }
+        // Phase 3.4 Wave 8. rax = ptr, rcx = val.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
+        call(pp.emit_memst_store, fh, 1);
         return 0;
     }
 

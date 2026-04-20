@@ -323,6 +323,174 @@ void _a64_emit_jump_to_epilogue() {
     else { out("  b .L"); a64_print_dec(a64_ret_lbl); putchar('\n'); }
 }
 
+// ── Memory access (Wave 8) ──
+//
+// Convention: at entry the address is in x0. For T_MEMST the
+// caller has also placed the value-to-store in x1 (via
+// eval+push+eval+pop). field_hint encodes the slice and (for
+// bit-packed) the bit offset within the byte.
+
+// Load *(x0) into x0 (or d0/v0 for float subwords / SIMD).
+// Returns: 0=int, 1=double, 2=SIMD.
+_a64_emit_memld_load(fh) {
+    auto sl, bo, bw;
+    if (is_float_type(fh)) {
+        sl = ty_slice(fh);
+        if (sl == SL_DOUBLE) {
+            if (a64_bin_mode) { enc_ldr_q_uoff(0, 0, 0); }
+            else { out("  ldr q0, [x0]"); putchar('\n'); }
+            return 2;
+        }
+        if (sl == SL_HALF) {
+            if (a64_bin_mode) { enc_ldr_s_uoff(0, 0, 0); enc_fcvt_d_s(0, 0); }
+            else {
+                out("  ldr s0, [x0]"); putchar('\n');
+                out("  fcvt d0, s0"); putchar('\n');
+            }
+            return 1;
+        }
+        if (sl == SL_QUARTER) {
+            if (a64_bin_mode) { enc_ldr_h_uoff(0, 0, 0); enc_fcvt_d_h(0, 0); }
+            else {
+                out("  ldr h0, [x0]"); putchar('\n');
+                out("  fcvt d0, h0"); putchar('\n');
+            }
+            return 1;
+        }
+        if (a64_bin_mode) { enc_ldr_d_uoff(0, 0, 0); }
+        else { out("  ldr d0, [x0]"); putchar('\n'); }
+        return 1;
+    }
+    sl = ty_slice(fh);
+    if (sl >= SL_BIT && sl <= SL_BIT7) {
+        bo = (fh / 256) & 7;
+        bw = sl - 3;
+        if (a64_bin_mode) {
+            enc_ldrb_uoff(0, 0, 0);
+            enc_ubfx_w(0, 0, bo, bw);
+        } else {
+            out("  ldrb w0, [x0]"); putchar('\n');
+            out("  ubfx w0, w0, #"); a64_print_dec(bo);
+            out(", #"); a64_print_dec(bw); putchar('\n');
+        }
+        return 0;
+    }
+    if (sl == SL_BYTE) {
+        if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); }
+        else { out("  ldrb w0, [x0]"); putchar('\n'); }
+    } else if (sl == SL_QUARTER) {
+        if (a64_bin_mode) { enc_ldrh_uoff(0, 0, 0); }
+        else { out("  ldrh w0, [x0]"); putchar('\n'); }
+    } else if (sl == SL_HALF) {
+        if (a64_bin_mode) { enc_ldrsw_uoff(0, 0, 0); }
+        else { out("  ldrsw x0, [x0]"); putchar('\n'); }
+    } else {
+        if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); }
+        else { out("  ldr x0, [x0]"); putchar('\n'); }
+    }
+    return 0;
+}
+
+// Store x{val_reg} → *(x0). val_reg varies because the chip's
+// T_MEMST scheduler may have stashed the value in either the
+// freelist alloc reg or x1 (push/pop fallback). For bit-packed
+// fields a64 uses `bfi` (bit-field-insert) — single
+// instruction does the mask+shift+merge that x64 needs four
+// instructions for.
+void _a64_emit_memst_store(fh, val_reg) {
+    auto sl, bo, bw;
+    sl = ty_slice(fh);
+    if (sl == SL_DOUBLE) {
+        if (a64_bin_mode) { enc_str_q_uoff(val_reg, 0, 0); }
+        else {
+            out("  str q"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+        return;
+    }
+    if (sl >= SL_BIT && sl <= SL_BIT7) {
+        bo = (fh / 256) & 7;
+        bw = sl - 3;
+        if (a64_bin_mode) {
+            enc_ldrb_uoff(2, 0, 0);
+            enc_bfi_w(2, val_reg, bo, bw);
+            enc_strb_uoff(2, 0, 0);
+        } else {
+            out("  ldrb w2, [x0]"); putchar('\n');
+            out("  bfi w2, w"); a64_print_dec(val_reg);
+            out(", #"); a64_print_dec(bo);
+            out(", #"); a64_print_dec(bw); putchar('\n');
+            out("  strb w2, [x0]"); putchar('\n');
+        }
+        return;
+    }
+    if (sl == SL_BYTE) {
+        if (a64_bin_mode) { enc_strb_uoff(val_reg, 0, 0); }
+        else {
+            out("  strb w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+    } else if (sl == SL_QUARTER) {
+        if (a64_bin_mode) { enc_strh_uoff(val_reg, 0, 0); }
+        else {
+            out("  strh w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+    } else if (sl == SL_HALF) {
+        if (a64_bin_mode) { enc_str_w_uoff(val_reg, 0, 0); }
+        else {
+            out("  str w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+    } else {
+        if (a64_bin_mode) { enc_str_uoff(val_reg, 0, 0); }
+        else {
+            out("  str x"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+    }
+}
+
+// Float scalar store (post-narrow). The chip handles scvtf and
+// the spill/reload; primitive emits just the final str s/h/d.
+// fh_sl ∈ {SL_HALF, SL_QUARTER, SL_FULL}, val_reg is the
+// d-register holding the scalar (0 or 1 typically).
+void _a64_emit_memst_store_float_scalar(fh_sl, val_reg) {
+    if (fh_sl == SL_HALF) {
+        if (a64_bin_mode) { enc_fcvt_s_d(val_reg, val_reg); enc_str_s_uoff(val_reg, 0, 0); }
+        else {
+            out("  fcvt s"); a64_print_dec(val_reg); out(", d"); a64_print_dec(val_reg); putchar('\n');
+            out("  str s"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+        return;
+    }
+    if (fh_sl == SL_QUARTER) {
+        if (a64_bin_mode) { enc_fcvt_h_d(val_reg, val_reg); enc_str_h_uoff(val_reg, 0, 0); }
+        else {
+            out("  fcvt h"); a64_print_dec(val_reg); out(", d"); a64_print_dec(val_reg); putchar('\n');
+            out("  str h"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+        }
+        return;
+    }
+    // SL_FULL — straight str d.
+    if (a64_bin_mode) { enc_str_d_uoff(val_reg, 0, 0); }
+    else {
+        out("  str d"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n');
+    }
+}
+
+// Address-of a stack-frame local: x0 ← x29 + off.
+void _a64_emit_addr_local(off) {
+    if (a64_bin_mode) { enc_add_imm(0, 29, off); }
+    else { out("  add x0, x29, #"); a64_print_dec(off); putchar('\n'); }
+}
+
+// Address-of a global: x0 ← &<name>. adrp + add with reloc 0.
+void _a64_emit_addr_global(packed_name) {
+    if (a64_bin_mode) {
+        enc_add_reloc(enc_pos, packed_name, 0);
+        enc_adrp(0); enc_add_imm(0, 0, 0);
+    } else {
+        out("  adrp x0, _"); a64_print_p(packed_name); out("@PAGE"); putchar('\n');
+        out("  add x0, x0, _"); a64_print_p(packed_name); out("@PAGEOFF"); putchar('\n');
+    }
+}
+
 // ── Memory ──
 
 // Load a local variable into x0 (or d0/v0 for floats and SIMD).

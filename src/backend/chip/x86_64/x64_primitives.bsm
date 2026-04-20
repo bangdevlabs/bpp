@@ -180,6 +180,70 @@ void _x64_emit_promote_int_to_flt() { x64_enc_cvtsi2sd(0, 0); }
 void _x64_emit_demote_flt_to_int() { x64_enc_cvttsd2si(0, 0); }
 void _x64_emit_jump_to_epilogue() { x64_enc_jmp_label(x64_ret_lbl); }
 
+// ── Memory access (Wave 8) ──
+// Convention: addr in rax. For T_MEMST, value already pre-staged
+// in rcx by the chip's eval+push+eval+pop sequence. fh encodes
+// slice + (for bit-packed) bit offset.
+
+_x64_emit_memld_load(fh) {
+    auto sl, bo, bw, mask;
+    sl = ty_slice(fh);
+    if (sl == SL_DOUBLE) {
+        // 128-bit SIMD field — movups load. Returns SIMD type 2.
+        x64_enc_movups_load(0, 0, 0);
+        return 2;
+    }
+    if (sl >= SL_BIT && sl <= SL_BIT7) {
+        bo = (fh / 256) & 7;
+        bw = sl - 3;
+        mask = (1 << bw) - 1;
+        x64_enc_loadb(0, 0, 0);
+        if (bo > 0) { x64_enc_shr_imm(0, bo); }
+        x64_enc_and_imm(0, mask);
+        return 0;
+    }
+    if (sl == SL_BYTE)         { x64_enc_loadb(0, 0, 0);  }
+    else if (sl == SL_QUARTER) { x64_enc_loadh(0, 0, 0);  }
+    else if (sl == SL_HALF)    { x64_enc_load_sw(0, 0, 0); }
+    else                       { x64_enc_load(0, 0, 0);    }
+    return 0;
+}
+
+// x64 has no freelist for the store-side value reg, so val_reg
+// is always 1 (rcx). Keeping the parameter in the signature
+// for cross-chip uniformity at the spine call site.
+void _x64_emit_memst_store(fh, val_reg) {
+    auto sl, bo, bw, mask, clear_mask;
+    sl = ty_slice(fh);
+    if (sl >= SL_BIT && sl <= SL_BIT7) {
+        bo = (fh / 256) & 7;
+        bw = sl - 3;
+        mask = (1 << bw) - 1;
+        clear_mask = 255 ^ (mask << bo);
+        x64_enc_loadb(2, 0, 0);
+        x64_enc_and_imm(2, clear_mask);
+        x64_enc_and_imm(val_reg, mask);
+        if (bo > 0) { x64_enc_shl_imm(val_reg, bo); }
+        x64_enc_or_reg(2, val_reg);
+        x64_enc_storeb(2, 0, 0);
+        return;
+    }
+    if (sl == SL_BYTE)         { x64_enc_storeb(val_reg, 0, 0); }
+    else if (sl == SL_QUARTER) { x64_enc_storeh(val_reg, 0, 0); }
+    else if (sl == SL_HALF)    { x64_enc_store_w(val_reg, 0, 0); }
+    else                       { x64_enc_store(val_reg, 0, 0); }
+}
+
+// Address-of a stack-frame local. rbp = reg 5 on x64.
+void _x64_emit_addr_local(off) { x64_enc_lea(0, 5, off); }
+
+// Address-of a global. lea_rip + reloc 0 (global symbol).
+void _x64_emit_addr_global(packed_name) {
+    auto dpos;
+    dpos = x64_enc_lea_rip(0);
+    x64_enc_add_reloc(dpos, packed_name, 0);
+}
+
 // ── Memory ──
 
 // Load a local variable into rax (or xmm0 for floats / wider

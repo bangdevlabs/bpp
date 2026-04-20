@@ -129,6 +129,10 @@ void cg_install_arm64_primitives() {
     p.emit_promote_int_to_flt = fn_ptr(_a64_emit_promote_int_to_flt);
     p.emit_demote_flt_to_int  = fn_ptr(_a64_emit_demote_flt_to_int);
     p.emit_jump_to_epilogue   = fn_ptr(_a64_emit_jump_to_epilogue);
+    p.emit_memld_load         = fn_ptr(_a64_emit_memld_load);
+    p.emit_memst_store        = fn_ptr(_a64_emit_memst_store);
+    p.emit_addr_local         = fn_ptr(_a64_emit_addr_local);
+    p.emit_addr_global        = fn_ptr(_a64_emit_addr_global);
 }
 
 void init_codegen_arm64() {
@@ -1753,96 +1757,29 @@ static a64_emit_node(nd) {
     // mem_load: *(ptr) — load from real pointer.
     // n.b holds the field type hint for packed structs (0 = default 8-byte load).
     if (t == T_MEMLD) {
-        auto fh;
-        fh = n.b;
+        // Phase 3.4 Wave 8.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         ety = a64_emit_node(n.a);
-        if (ety == 1) {
-            if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
-        }
-        // Float field types: load to float register and widen to double.
-        // SIMD (`: double`, 128 bits) stays in V0 as a SIMD value; the
-        // narrower forms load + widen to D0 per the scalar convention.
-        if (is_float_type(fh)) {
-            if (ty_slice(fh) == SL_DOUBLE) {
-                if (a64_bin_mode) { enc_ldr_q_uoff(0, 0, 0); }
-                else { out("  ldr q0, [x0]"); putchar('\n'); }
-                return 2;
-            }
-            if (ty_slice(fh) == SL_HALF) {
-                if (a64_bin_mode) { enc_ldr_s_uoff(0, 0, 0); enc_fcvt_d_s(0, 0); }
-                else {
-                    out("  ldr s0, [x0]"); putchar('\n');
-                    out("  fcvt d0, s0"); putchar('\n');
-                }
-                return 1;
-            }
-            if (ty_slice(fh) == SL_QUARTER) {
-                if (a64_bin_mode) { enc_ldr_h_uoff(0, 0, 0); enc_fcvt_d_h(0, 0); }
-                else {
-                    out("  ldr h0, [x0]"); putchar('\n');
-                    out("  fcvt d0, h0"); putchar('\n');
-                }
-                return 1;
-            }
-            if (a64_bin_mode) { enc_ldr_d_uoff(0, 0, 0); }
-            else { out("  ldr d0, [x0]"); putchar('\n'); }
-            return 1;
-        }
-        // Bit-packed field types: load the containing byte, extract the
-        // requested bit slice with UBFX. The bit offset within the byte
-        // travels in bits 8-10 of the hint word (encoded by resolve_dot).
-        auto sl, bo, bw;
-        sl = ty_slice(fh);
-        if (sl >= SL_BIT && sl <= SL_BIT7) {
-            bo = (fh / 256) & 7;
-            bw = sl - 3;
-            if (a64_bin_mode) {
-                enc_ldrb_uoff(0, 0, 0);
-                enc_ubfx_w(0, 0, bo, bw);
-            } else {
-                out("  ldrb w0, [x0]"); putchar('\n');
-                out("  ubfx w0, w0, #"); a64_print_dec(bo);
-                out(", #"); a64_print_dec(bw); putchar('\n');
-            }
-            return 0;
-        }
-        // Integer field types: load to integer register.
-        if (sl == SL_BYTE) {
-            if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); } else { out("  ldrb w0, [x0]"); putchar('\n'); }
-        } else if (sl == SL_QUARTER) {
-            if (a64_bin_mode) { enc_ldrh_uoff(0, 0, 0); } else { out("  ldrh w0, [x0]"); putchar('\n'); }
-        } else if (sl == SL_HALF) {
-            if (a64_bin_mode) { enc_ldrsw_uoff(0, 0, 0); } else { out("  ldrsw x0, [x0]"); putchar('\n'); }
-        } else {
-            if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); } else { out("  ldr x0, [x0]"); putchar('\n'); }
-        }
-        return 0;
+        if (ety == 1) { call(pp.emit_demote_flt_to_int); }
+        return call(pp.emit_memld_load, n.b);
     }
 
     // ── Address-of: &x ──
-    // Computes the memory address of a variable without loading its value.
+    // Phase 3.4 Wave 8.
     if (t == T_ADDR) {
         auto child: Node;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         child = n.a;
-        if (child != 0) {
-            if (child.ntype == T_VAR) {
-                vi = cg_var_idx(child.a);
-                if (vi >= 0) {
-                    off = arr_get(cg_var_off, vi);
-                    if (a64_bin_mode) { enc_add_imm(0, 29, off); }
-                    else { out("  add x0, x29, #"); a64_print_dec(off); putchar('\n'); }
-                    return 0;
-                }
-                // Global variable: compute address without loading.
-                if (a64_bin_mode) {
-                    enc_add_reloc(enc_pos, child.a, 0);
-                    enc_adrp(0); enc_add_imm(0, 0, 0);
-                } else {
-                    out("  adrp x0, _"); a64_print_p(child.a); out("@PAGE"); putchar('\n');
-                    out("  add x0, x0, _"); a64_print_p(child.a); out("@PAGEOFF"); putchar('\n');
-                }
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = cg_var_idx(child.a);
+            if (vi >= 0) {
+                call(pp.emit_addr_local, arr_get(cg_var_off, vi));
                 return 0;
             }
+            call(pp.emit_addr_global, child.a);
+            return 0;
         }
         return 0;
     }
@@ -2034,36 +1971,10 @@ static void a64_emit_stmt(nd) {
             a64_emit_pop(1);
         }
         // x0 = pointer, x{val_reg} = source value.
-        auto sl, bo, bw;
-        sl = ty_slice(fh);
-        if (sl >= SL_BIT && sl <= SL_BIT7) {
-            bo = (fh / 256) & 7;
-            bw = sl - 3;
-            if (a64_bin_mode) {
-                enc_ldrb_uoff(2, 0, 0);
-                enc_bfi_w(2, val_reg, bo, bw);
-                enc_strb_uoff(2, 0, 0);
-            } else {
-                out("  ldrb w2, [x0]"); putchar('\n');
-                out("  bfi w2, w"); a64_print_dec(val_reg); out(", #"); a64_print_dec(bo);
-                out(", #"); a64_print_dec(bw); putchar('\n');
-                out("  strb w2, [x0]"); putchar('\n');
-            }
-            return 0;
-        }
-        if (sl == SL_BYTE) {
-            if (a64_bin_mode) { enc_strb_uoff(val_reg, 0, 0); }
-            else { out("  strb w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
-        } else if (sl == SL_QUARTER) {
-            if (a64_bin_mode) { enc_strh_uoff(val_reg, 0, 0); }
-            else { out("  strh w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
-        } else if (sl == SL_HALF) {
-            if (a64_bin_mode) { enc_str_w_uoff(val_reg, 0, 0); }
-            else { out("  str w"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
-        } else {
-            if (a64_bin_mode) { enc_str_uoff(val_reg, 0, 0); }
-            else { out("  str x"); a64_print_dec(val_reg); out(", [x0]"); putchar('\n'); }
-        }
+        // Phase 3.4 Wave 8.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
+        call(pp.emit_memst_store, fh, val_reg);
         return 0;
     }
 
