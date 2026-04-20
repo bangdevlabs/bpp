@@ -32,6 +32,8 @@ extrn a64_emit_mov;
 extrn a64_emit_load_var;
 extrn a64_print_dec;
 extrn a64_print_p;
+extrn a64_ret_lbl;
+extrn cg_new_lbl;
 
 // ── Move / compare ──
 
@@ -246,6 +248,79 @@ void _a64_emit_cmp_flt(cond_id) {
         if (cc == 10) { out("ge"); }
         putchar('\n');
     }
+}
+
+// ── Control flow (Wave 7) ──
+//
+// The asm-mode label prefix is unified to ".L<id>" for every
+// usage (was ".Lelse", ".Lendif", ".Lloop", etc. in the original
+// inline code). Bin-mode is unaffected since it consumes label
+// IDs directly via enc_*_label primitives. Asm output is debug-
+// only and not part of the byte-identity contract.
+
+// Allocate a fresh label ID. Bin mode pulls from the encoder's
+// label table; asm mode uses the spine's cg_new_lbl counter.
+_a64_emit_new_label() {
+    if (a64_bin_mode) { return enc_new_label(); }
+    return cg_new_lbl();
+}
+
+// Define a label at the current emission position.
+void _a64_emit_label(id) {
+    if (a64_bin_mode) { enc_def_label(id); }
+    else { out(".L"); a64_print_dec(id); out(":"); putchar('\n'); }
+}
+
+// Unconditional branch to label.
+void _a64_emit_jump(id) {
+    if (a64_bin_mode) { enc_b_label(id); }
+    else { out("  b .L"); a64_print_dec(id); putchar('\n'); }
+}
+
+// Branch to label if x0 is zero. Used for if-condition false +
+// while-condition false + ternary-condition false branches.
+void _a64_emit_branch_if_zero(id) {
+    if (a64_bin_mode) { enc_cbz_label(0, id); }
+    else { out("  cbz x0, .L"); a64_print_dec(id); putchar('\n'); }
+}
+
+// Normalize a float result in d0 to an integer truth value in
+// x0 (1 if d0 != 0, else 0). Used by T_IF / T_WHILE / T_TERNARY
+// when the condition expression evaluated to a float.
+void _a64_emit_fcond_to_int_truth() {
+    if (a64_bin_mode) {
+        enc_fcmp_zero(0);
+        enc_cset(0, 1);
+    } else {
+        out("  fcmp d0, #0.0"); putchar('\n');
+        out("  cset x0, ne"); putchar('\n');
+    }
+}
+
+// Convert int result (x0) to float result (d0). Used at T_RET
+// when the function's declared return type is float but the
+// expression evaluated to int, and inside T_BINOP for mixed
+// operand promotion.
+void _a64_emit_promote_int_to_flt() {
+    if (a64_bin_mode) { enc_scvtf(0, 0); }
+    else { out("  scvtf d0, x0"); putchar('\n'); }
+}
+
+// Convert float result (d0) to int result (x0). Inverse of the
+// above; used at T_RET when declared return is int but
+// expression was float, and inside T_BINOP for the integer-only
+// op path when one operand is float.
+void _a64_emit_demote_flt_to_int() {
+    if (a64_bin_mode) { enc_fcvtzs(0, 0); }
+    else { out("  fcvtzs x0, d0"); putchar('\n'); }
+}
+
+// Jump to the current function's epilogue label. T_RET emits
+// this after the return-value conversions; the epilogue
+// restores callee-saved regs, deallocs the frame, and returns.
+void _a64_emit_jump_to_epilogue() {
+    if (a64_bin_mode) { enc_b_label(a64_ret_lbl); }
+    else { out("  b .L"); a64_print_dec(a64_ret_lbl); putchar('\n'); }
 }
 
 // ── Memory ──

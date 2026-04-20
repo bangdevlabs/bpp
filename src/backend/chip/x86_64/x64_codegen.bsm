@@ -99,6 +99,14 @@ void cg_install_x86_64_primitives() {
     p.emit_fdiv             = fn_ptr(_x64_emit_fdiv);
     p.emit_cmp_int          = fn_ptr(_x64_emit_cmp_int);
     p.emit_cmp_flt          = fn_ptr(_x64_emit_cmp_flt);
+    p.emit_new_label        = fn_ptr(_x64_emit_new_label);
+    p.emit_label            = fn_ptr(_x64_emit_label);
+    p.emit_jump             = fn_ptr(_x64_emit_jump);
+    p.emit_branch_if_zero   = fn_ptr(_x64_emit_branch_if_zero);
+    p.emit_fcond_to_int_truth = fn_ptr(_x64_emit_fcond_to_int_truth);
+    p.emit_promote_int_to_flt = fn_ptr(_x64_emit_promote_int_to_flt);
+    p.emit_demote_flt_to_int  = fn_ptr(_x64_emit_demote_flt_to_int);
+    p.emit_jump_to_epilogue   = fn_ptr(_x64_emit_jump_to_epilogue);
 }
 
 void init_codegen_x86_64() {
@@ -542,25 +550,20 @@ static x64_emit_node(nd) {
     // ONLY the selected branch evaluates. Also the lowering target for `&&`
     // and `||` (parser rewrites them so backends never see those operators).
     if (t == T_TERNARY) {
+        // Phase 3.4 Wave 7.
         auto lbl_else, lbl_done, ety_then;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         ety = x64_emit_node(n.a);
-        // Normalize float condition to an integer truth value so jz works.
-        if (ety == 1) {
-            x64_enc_xorpd(1, 1);
-            x64_enc_ucomisd(0, 1);
-            x64_enc_setcc(CC_NE, 0);
-            x64_enc_movzx8(0, 0);
-        }
-        lbl_else = x64_enc_new_label();
-        lbl_done = x64_enc_new_label();
-        x64_enc_test_reg(0, 0);
-        x64_enc_jcc_label(CC_E, lbl_else);
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        lbl_else = call(pp.emit_new_label);
+        lbl_done = call(pp.emit_new_label);
+        call(pp.emit_branch_if_zero, lbl_else);
         ety_then = x64_emit_node(n.b);
-        x64_enc_jmp_label(lbl_done);
-        x64_enc_def_label(lbl_else);
+        call(pp.emit_jump, lbl_done);
+        call(pp.emit_label, lbl_else);
         x64_emit_node(n.c);
-        x64_enc_def_label(lbl_done);
-        // Branches must agree on result type; trust the parser to enforce.
+        call(pp.emit_label, lbl_done);
         return ety_then;
     }
 
@@ -1474,85 +1477,79 @@ static void x64_emit_stmt(nd) {
     }
 
     if (t == T_IF) {
-        // Literal-condition DCE lives in the parser (parse_if rewrites
-        // `if (literal)` to T_BLOCK of the taken branch) — by the time a
-        // T_IF reaches here, the condition is a runtime value.
-        lbl = x64_enc_new_label();
-        lbl2 = x64_enc_new_label();
+        // Phase 3.4 Wave 7. Parser DCE has already eliminated
+        // literal-condition cases.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
+        lbl  = call(pp.emit_new_label);
+        lbl2 = call(pp.emit_new_label);
         ety = x64_emit_node(n.a);
-        if (ety == 1) {
-            x64_enc_xorpd(1, 1);
-            x64_enc_ucomisd(0, 1);
-            x64_enc_setcc(CC_NE, 0);
-            x64_enc_movzx8(0, 0);
-        }
-        x64_enc_test_reg(0, 0);
-        x64_enc_jcc_label(CC_E, lbl);
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        call(pp.emit_branch_if_zero, lbl);
         x64_emit_body(n.b, n.c);
-        x64_enc_jmp_label(lbl2);
-        x64_enc_def_label(lbl);
+        call(pp.emit_jump, lbl2);
+        call(pp.emit_label, lbl);
         if (n.e > 0) { x64_emit_body(n.d, n.e); }
-        x64_enc_def_label(lbl2);
+        call(pp.emit_label, lbl2);
         return 0;
     }
 
     if (t == T_BREAK) {
         if (arr_len(cg_break_stack) > 0) {
-            auto brk_lbl;
-            brk_lbl = arr_last(cg_break_stack);
-            x64_enc_jmp_label(brk_lbl);
+            auto pp: ChipPrimitives;
+            pp = cg_prim;
+            call(pp.emit_jump, arr_last(cg_break_stack));
         }
         return 0;
     }
 
     if (t == T_CONTINUE) {
         if (arr_len(cg_continue_stack) > 0) {
-            auto cnt_lbl;
-            cnt_lbl = arr_last(cg_continue_stack);
-            x64_enc_jmp_label(cnt_lbl);
+            auto pp: ChipPrimitives;
+            pp = cg_prim;
+            call(pp.emit_jump, arr_last(cg_continue_stack));
         }
         return 0;
     }
 
     if (t == T_WHILE) {
-        // n.e (offset 40) holds the for-loop step expression, or 0 for plain while.
-        // The continue label is emitted between body and step so continue runs the
-        // step before re-testing the condition.
+        // Phase 3.4 Wave 7. n.e holds the for-loop step (or 0
+        // for plain while). Continue label sits between body and
+        // step so `continue` runs the step.
         auto step_node, lbl3;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         step_node = n.e;
-        lbl = x64_enc_new_label();
-        lbl2 = x64_enc_new_label();
-        lbl3 = x64_enc_new_label();
+        lbl  = call(pp.emit_new_label);
+        lbl2 = call(pp.emit_new_label);
+        lbl3 = call(pp.emit_new_label);
         cg_break_stack = arr_push(cg_break_stack, lbl2);
         cg_continue_stack = arr_push(cg_continue_stack, lbl3);
-        x64_enc_def_label(lbl);
+        call(pp.emit_label, lbl);
         ety = x64_emit_node(n.a);
-        if (ety == 1) {
-            x64_enc_xorpd(1, 1);
-            x64_enc_ucomisd(0, 1);
-            x64_enc_setcc(CC_NE, 0);
-            x64_enc_movzx8(0, 0);
-        }
-        x64_enc_test_reg(0, 0);
-        x64_enc_jcc_label(CC_E, lbl2);
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        call(pp.emit_branch_if_zero, lbl2);
         x64_emit_body(n.b, n.c);
-        x64_enc_def_label(lbl3);
+        call(pp.emit_label, lbl3);
         if (step_node != 0) { x64_emit_stmt(step_node); }
-        x64_enc_jmp_label(lbl);
-        x64_enc_def_label(lbl2);
+        call(pp.emit_jump, lbl);
+        call(pp.emit_label, lbl2);
         arr_pop(cg_break_stack);
         arr_pop(cg_continue_stack);
         return 0;
     }
 
     if (t == T_RET) {
+        // Phase 3.4 Wave 7.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         rty = x64_emit_node(n.a);
         if (is_float_type(get_fn_ret_type(cg_cur_fn_idx))) {
-            if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
+            if (rty == 0) { call(pp.emit_promote_int_to_flt); }
         } else {
-            if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
+            if (rty == 1) { call(pp.emit_demote_flt_to_int); }
         }
-        x64_enc_jmp_label(x64_ret_lbl);
+        call(pp.emit_jump_to_epilogue);
         return 0;
     }
 

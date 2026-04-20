@@ -121,6 +121,14 @@ void cg_install_arm64_primitives() {
     p.emit_fdiv             = fn_ptr(_a64_emit_fdiv);
     p.emit_cmp_int          = fn_ptr(_a64_emit_cmp_int);
     p.emit_cmp_flt          = fn_ptr(_a64_emit_cmp_flt);
+    p.emit_new_label        = fn_ptr(_a64_emit_new_label);
+    p.emit_label            = fn_ptr(_a64_emit_label);
+    p.emit_jump             = fn_ptr(_a64_emit_jump);
+    p.emit_branch_if_zero   = fn_ptr(_a64_emit_branch_if_zero);
+    p.emit_fcond_to_int_truth = fn_ptr(_a64_emit_fcond_to_int_truth);
+    p.emit_promote_int_to_flt = fn_ptr(_a64_emit_promote_int_to_flt);
+    p.emit_demote_flt_to_int  = fn_ptr(_a64_emit_demote_flt_to_int);
+    p.emit_jump_to_epilogue   = fn_ptr(_a64_emit_jump_to_epilogue);
 }
 
 void init_codegen_arm64() {
@@ -808,33 +816,20 @@ static a64_emit_node(nd) {
     // operators). The result type is whichever branch ran (returned in x0
     // for integers, d0 for floats); both branches are expected to agree.
     if (t == T_TERNARY) {
+        // Phase 3.4 Wave 7. Spine-portable control-flow primitives.
         auto lbl_else, lbl_done, ety_then, ety_else;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         ety = a64_emit_node(n.a);
-        // Normalize float condition to an integer truth value so cbz can branch.
-        if (ety == 1) {
-            if (a64_bin_mode) { enc_fcmp_zero(0); enc_cset(0, 1); }
-            else { out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); }
-        }
-        if (a64_bin_mode) {
-            lbl_else = enc_new_label();
-            lbl_done = enc_new_label();
-            enc_cbz_label(0, lbl_else);
-            ety_then = a64_emit_node(n.b);
-            enc_b_label(lbl_done);
-            enc_def_label(lbl_else);
-            ety_else = a64_emit_node(n.c);
-            enc_def_label(lbl_done);
-        } else {
-            lbl_else = cg_new_lbl();
-            lbl_done = cg_new_lbl();
-            out("  cbz x0, .Lter"); a64_print_dec(lbl_else); putchar('\n');
-            ety_then = a64_emit_node(n.b);
-            out("  b .Lter"); a64_print_dec(lbl_done); putchar('\n');
-            out(".Lter"); a64_print_dec(lbl_else); out(":"); putchar('\n');
-            ety_else = a64_emit_node(n.c);
-            out(".Lter"); a64_print_dec(lbl_done); out(":"); putchar('\n');
-        }
-        // Branches must agree on result type; trust the parser to enforce.
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        lbl_else = call(pp.emit_new_label);
+        lbl_done = call(pp.emit_new_label);
+        call(pp.emit_branch_if_zero, lbl_else);
+        ety_then = a64_emit_node(n.b);
+        call(pp.emit_jump, lbl_done);
+        call(pp.emit_label, lbl_else);
+        ety_else = a64_emit_node(n.c);
+        call(pp.emit_label, lbl_done);
         return ety_then;
     }
 
@@ -2073,139 +2068,82 @@ static void a64_emit_stmt(nd) {
     }
 
     if (t == T_IF) {
-        // Literal-condition DCE lives in the parser (parse_if rewrites
-        // `if (literal)` to T_BLOCK of the taken branch) — by the time a
-        // T_IF reaches here, the condition is a runtime value.
-        if (a64_bin_mode) {
-            lbl = enc_new_label();
-            lbl2 = enc_new_label();
-            ety = a64_emit_node(n.a);
-            if (ety == 1) {
-                enc_fcmp_zero(0);
-                enc_cset(0, 1);
-            }
-            enc_cbz_label(0, lbl);
-            a64_emit_body(n.b, n.c);
-            enc_b_label(lbl2);
-            enc_def_label(lbl);
-            if (n.e > 0) { a64_emit_body(n.d, n.e); }
-            enc_def_label(lbl2);
-        } else {
-            lbl = cg_new_lbl();
-            ety = a64_emit_node(n.a);
-            if (ety == 1) {
-                out("  fcmp d0, #0.0"); putchar('\n');
-                out("  cset x0, ne"); putchar('\n');
-            }
-            out("  cbz x0, .Lelse"); a64_print_dec(lbl); putchar('\n');
-            a64_emit_body(n.b, n.c);
-            out("  b .Lendif"); a64_print_dec(lbl); putchar('\n');
-            out(".Lelse"); a64_print_dec(lbl); out(":"); putchar('\n');
-            if (n.e > 0) { a64_emit_body(n.d, n.e); }
-            out(".Lendif"); a64_print_dec(lbl); out(":"); putchar('\n');
-        }
+        // Phase 3.4 Wave 7. The literal-condition DCE pass already
+        // ran in the parser, so by here the condition is runtime.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
+        lbl  = call(pp.emit_new_label);
+        lbl2 = call(pp.emit_new_label);
+        ety = a64_emit_node(n.a);
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        call(pp.emit_branch_if_zero, lbl);
+        a64_emit_body(n.b, n.c);
+        call(pp.emit_jump, lbl2);
+        call(pp.emit_label, lbl);
+        if (n.e > 0) { a64_emit_body(n.d, n.e); }
+        call(pp.emit_label, lbl2);
         return 0;
     }
 
     if (t == T_BREAK) {
-        // Jump to the exit label of the innermost while loop.
         if (arr_len(cg_break_stack) > 0) {
-            auto brk_lbl;
-            brk_lbl = arr_last(cg_break_stack);
-            if (a64_bin_mode) {
-                enc_b_label(brk_lbl);
-            } else {
-                out("  b .Lend"); a64_print_dec(brk_lbl); putchar('\n');
-            }
+            auto pp: ChipPrimitives;
+            pp = cg_prim;
+            call(pp.emit_jump, arr_last(cg_break_stack));
         }
         return 0;
     }
 
     if (t == T_CONTINUE) {
-        // Jump to the continue label of the innermost while loop. For
-        // plain while this lands just before the back-branch to top; for
-        // for-loops it lands just before the step expression so the step
-        // still runs before the next condition test.
         if (arr_len(cg_continue_stack) > 0) {
-            auto cnt_lbl;
-            cnt_lbl = arr_last(cg_continue_stack);
-            if (a64_bin_mode) {
-                enc_b_label(cnt_lbl);
-            } else {
-                out("  b .Lcont"); a64_print_dec(cnt_lbl); putchar('\n');
-            }
+            auto pp: ChipPrimitives;
+            pp = cg_prim;
+            call(pp.emit_jump, arr_last(cg_continue_stack));
         }
         return 0;
     }
 
     if (t == T_WHILE) {
-        // n.e (offset 40) holds the for-loop step expression, or 0 for plain while.
-        // The continue label is emitted between the body and the step so that
-        // `continue` runs the step before re-testing the condition.
-        // The step is a statement (T_ASSIGN typically), so it must be emitted
-        // via a64_emit_stmt — a64_emit_node doesn't handle T_ASSIGN.
+        // n.e holds the for-loop step expression, or 0 for plain
+        // while. The continue label is emitted between the body
+        // and the step so `continue` runs the step before
+        // re-testing the condition. Step is a statement (T_ASSIGN
+        // typically) so it goes through a64_emit_stmt.
         auto step_node, lbl3;
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         step_node = n.e;
-        if (a64_bin_mode) {
-            lbl = enc_new_label();
-            lbl2 = enc_new_label();
-            lbl3 = enc_new_label();
-            cg_break_stack = arr_push(cg_break_stack, lbl2);
-            cg_continue_stack = arr_push(cg_continue_stack, lbl3);
-            enc_def_label(lbl);
-            ety = a64_emit_node(n.a);
-            if (ety == 1) {
-                enc_fcmp_zero(0);
-                enc_cset(0, 1);
-            }
-            enc_cbz_label(0, lbl2);
-            a64_emit_body(n.b, n.c);
-            enc_def_label(lbl3);
-            if (step_node != 0) { a64_emit_stmt(step_node); }
-            enc_b_label(lbl);
-            enc_def_label(lbl2);
-            arr_pop(cg_break_stack);
-            arr_pop(cg_continue_stack);
-        } else {
-            lbl = cg_new_lbl();
-            lbl3 = cg_new_lbl();
-            cg_break_stack = arr_push(cg_break_stack, lbl);
-            cg_continue_stack = arr_push(cg_continue_stack, lbl3);
-            out(".Lloop"); a64_print_dec(lbl); out(":"); putchar('\n');
-            ety = a64_emit_node(n.a);
-            if (ety == 1) {
-                out("  fcmp d0, #0.0"); putchar('\n');
-                out("  cset x0, ne"); putchar('\n');
-            }
-            out("  cbz x0, .Lend"); a64_print_dec(lbl); putchar('\n');
-            a64_emit_body(n.b, n.c);
-            out(".Lcont"); a64_print_dec(lbl3); out(":"); putchar('\n');
-            if (step_node != 0) { a64_emit_stmt(step_node); }
-            out("  b .Lloop"); a64_print_dec(lbl); putchar('\n');
-            out(".Lend"); a64_print_dec(lbl); out(":"); putchar('\n');
-            arr_pop(cg_break_stack);
-            arr_pop(cg_continue_stack);
-        }
+        lbl  = call(pp.emit_new_label);
+        lbl2 = call(pp.emit_new_label);
+        lbl3 = call(pp.emit_new_label);
+        cg_break_stack = arr_push(cg_break_stack, lbl2);
+        cg_continue_stack = arr_push(cg_continue_stack, lbl3);
+        call(pp.emit_label, lbl);
+        ety = a64_emit_node(n.a);
+        if (ety == 1) { call(pp.emit_fcond_to_int_truth); }
+        call(pp.emit_branch_if_zero, lbl2);
+        a64_emit_body(n.b, n.c);
+        call(pp.emit_label, lbl3);
+        if (step_node != 0) { a64_emit_stmt(step_node); }
+        call(pp.emit_jump, lbl);
+        call(pp.emit_label, lbl2);
+        arr_pop(cg_break_stack);
+        arr_pop(cg_continue_stack);
         return 0;
     }
 
     if (t == T_RET) {
+        // Phase 3.4 Wave 7. Promotion / demotion + epilogue jump
+        // dispatched through cg_prim.
+        auto pp: ChipPrimitives;
+        pp = cg_prim;
         rty = a64_emit_node(n.a);
-        // Ensure return value matches function's declared return type.
         if (is_float_type(get_fn_ret_type(cg_cur_fn_idx))) {
-            if (rty == 0) {
-                if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
-            }
+            if (rty == 0) { call(pp.emit_promote_int_to_flt); }
         } else {
-            if (rty == 1) {
-                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
-            }
+            if (rty == 1) { call(pp.emit_demote_flt_to_int); }
         }
-        if (a64_bin_mode) {
-            enc_b_label(a64_ret_lbl);
-        } else {
-            out("  b .Lret_"); a64_print_p(cg_cur_fn_name); putchar('\n');
-        }
+        call(pp.emit_jump_to_epilogue);
         return 0;
     }
 
