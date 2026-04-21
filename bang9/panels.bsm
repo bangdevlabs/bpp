@@ -198,16 +198,23 @@ static void _panel_project(x, y, w, h) {
     at_root = 0;
     if (str_len(g_proj_root) <= 1) { at_root = 1; }
     if (at_root == 0) {
-        auto up_hover;
+        auto up_hover, up_prefix, up_prefix_w;
         up_hover = point_in_rect(mx, my, x + margin, hy,
                                  w - margin * 2, row_h);
         if (up_hover != 0) {
             draw_rect(x + margin, hy, w - margin * 2, row_h,
                       _theme.surface_alt);
         }
-        draw_text("[..]", x + margin + 4, hy + 2,
+        // Measure the "[..] " prefix so the label lands exactly
+        // after it instead of at a magic-number offset. Previously
+        // "+48" underestimated the rendered width of "[..]" and
+        // caused the two strings to bleed into each other visually.
+        up_prefix   = "[..] ";
+        up_prefix_w = measure_text(up_prefix, UI_FONT_SZ);
+        draw_text(up_prefix, x + margin + 4, hy + 2,
                   UI_FONT_SZ, _theme.text_muted);
-        draw_text("parent directory", x + margin + 4 + 48, hy + 2,
+        draw_text("parent directory",
+                  x + margin + 4 + up_prefix_w, hy + 2,
                   UI_FONT_SZ, _theme.accent);
         if (up_hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
             new_root = _project_parent();
@@ -305,6 +312,85 @@ static void _panel_project(x, y, w, h) {
 // canvas + layers + prefs when they bounce between tabs.
 static auto _sprites_initialized;
 
+// Build a candidate asset path "<g_proj_root>/<sub>/<base><ext>"
+// as a fresh null-terminated heap buffer. Caller frees. Used to
+// guess where a project's sprite / level files live on first tab
+// activation so we can auto-load them into the embedded editors.
+static _assets_path(sub, base, ext) {
+    auto rlen, slen, blen, elen, total, p, i, j;
+    rlen = str_len(g_proj_root);
+    slen = str_len(sub);
+    blen = str_len(base);
+    elen = str_len(ext);
+    total = rlen + 1 + slen + 1 + blen + elen + 1;
+    p = malloc(total);
+    i = 0;
+    for (j = 0; j < rlen; j = j + 1) {
+        poke(p + i, peek(g_proj_root + j)); i = i + 1;
+    }
+    poke(p + i, 47); i = i + 1;   // '/'
+    for (j = 0; j < slen; j = j + 1) {
+        poke(p + i, peek(sub + j)); i = i + 1;
+    }
+    poke(p + i, 47); i = i + 1;   // '/'
+    for (j = 0; j < blen; j = j + 1) {
+        poke(p + i, peek(base + j)); i = i + 1;
+    }
+    for (j = 0; j < elen; j = j + 1) {
+        poke(p + i, peek(ext + j)); i = i + 1;
+    }
+    poke(p + i, 0);
+    return p;
+}
+
+// Scan a directory for a file matching a given suffix. Returns
+// a fresh heap-allocated full path to the first match, or 0 if
+// nothing matches or the directory can't be read. Used by the
+// Sprites / Levels panels to discover the project's canonical
+// asset files so they pre-load automatically on first tab
+// activation (e.g. rat_sprite.json in pathfind/assets/sprites/).
+static _find_first_with_suffix(dir_path, suffix) {
+    auto listing, n, i, name, slen, nlen, match, j, p;
+    listing = dir_list(dir_path);
+    if (listing == 0) { return 0; }
+
+    n = dir_count(listing);
+    slen = str_len(suffix);
+    for (i = 0; i < n; i = i + 1) {
+        name = dir_name(listing, i);
+        if (dir_is_dir(listing, i) == 0) {
+            nlen = str_len(name);
+            if (nlen >= slen) {
+                match = 1;
+                for (j = 0; j < slen; j = j + 1) {
+                    if (peek(name + nlen - slen + j) != peek(suffix + j)) {
+                        match = 0;
+                    }
+                }
+                if (match != 0) {
+                    // Build "dir_path/name".
+                    auto dlen, total;
+                    dlen = str_len(dir_path);
+                    total = dlen + 1 + nlen + 1;
+                    p = malloc(total);
+                    for (j = 0; j < dlen; j = j + 1) {
+                        poke(p + j, peek(dir_path + j));
+                    }
+                    poke(p + dlen, 47);   // '/'
+                    for (j = 0; j < nlen; j = j + 1) {
+                        poke(p + dlen + 1 + j, peek(name + j));
+                    }
+                    poke(p + dlen + 1 + nlen, 0);
+                    dir_free(listing);
+                    return p;
+                }
+            }
+        }
+    }
+    dir_free(listing);
+    return 0;
+}
+
 static void _panel_sprites(x, y, w, h) {
     // Modulab's layout needs at least an 800×600 area to render
     // every widget (sidebars, frame strip, topbar). If the
@@ -318,12 +404,40 @@ static void _panel_sprites(x, y, w, h) {
         return;
     }
     if (_sprites_initialized == 0) {
-        // Default to "hero" — the same convention modulab
-        // standalone uses when no argv[1] is given. A future
-        // enhancement can scan g_proj_root/assets/sprites for
-        // the first sprite and auto-open that.
         modulab_lib_init("hero", 16);
         _sprites_initialized = 1;
+
+        // Auto-discover a sprite to pre-load from the project's
+        // conventional assets folder. We prefer the canonical
+        // ".modulab.json" format (round-trips through modulab
+        // losslessly). Pattern:
+        //   <proj_root>/assets/sprites/<first>.modulab.json
+        //
+        // If nothing matches, fall back to a default empty canvas
+        // with the path "<proj_root>/assets/sprites/hero" pre-
+        // filled — that way Save writes to the expected spot on
+        // the user's very first click instead of the cwd.
+        // _assets_path("assets", "sprites", "") yields
+        //   <proj_root>/assets/sprites
+        // which is the directory to scan. We prefer the canonical
+        // ".modulab.json" format (round-trips full editor state) but
+        // fall through to plain ".json" (stbsprite format, what every
+        // legacy B++ game consumes via load_sprite). That way the
+        // artist can open Bang 9 on ANY existing project and see
+        // real art in the canvas on first Sprites tab click instead
+        // of a blank default.
+        auto sprite_dir, found;
+        sprite_dir = _assets_path("assets", "sprites", "");
+
+        found = _find_first_with_suffix(sprite_dir, ".modulab.json");
+        if (found == 0) {
+            found = _find_first_with_suffix(sprite_dir, ".json");
+        }
+        if (found != 0) {
+            modulab_lib_try_load(found);
+            free(found);
+        }
+        free(sprite_dir);
     }
     // Render modulab within our panel rect. Return value is
     // the "ESC pressed" signal — in Bang 9 we let ESC reach
@@ -352,11 +466,28 @@ static void _panel_levels(x, y, w, h) {
         return;
     }
     if (_levels_initialized == 0) {
-        // Default name "level1" mirrors the standalone launcher.
-        // A future enhancement can scan g_proj_root/assets/levels
-        // and auto-open the first one found.
-        level_editor_lib_init("level1");
+        // Start with legacy defaults (40×22 @ 16px). If auto-load
+        // finds a .level.json, level_editor_lib_try_load will
+        // trigger _resize_grid internally to match the file's
+        // actual shape — the host doesn't need to pre-probe.
+        level_editor_lib_init("level1", 40, 22, 16);
         _levels_initialized = 1;
+
+        // Auto-discover the first .level.json under
+        // <g_proj_root>/assets/levels/ and load it. This is the
+        // complement to the sprite auto-load in _panel_sprites —
+        // one convention so the user can land in Bang 9 on an
+        // existing project and see their real assets instead of
+        // a blank default.
+        auto level_dir, found;
+        level_dir = _assets_path("assets", "levels", "");
+
+        found = _find_first_with_suffix(level_dir, ".level.json");
+        if (found != 0) {
+            level_editor_lib_try_load(found);
+            free(found);
+        }
+        free(level_dir);
     }
     // ESC return value ignored — Bang 9 owns global quit handling
     // and doesn't want this panel to swallow the key.
@@ -418,10 +549,61 @@ static void _panel_run(x, y, w, h) {
     line_h = UI_FONT_SZ + 2;
     hy = y + margin;
 
+    // ── Action buttons ──
+    // Big discoverable entry points so the user isn't forced to
+    // memorize F7/F8.
+    //
+    //   Build       — compile only. Use when you changed code in the
+    //                 Code tab and want to see errors before running.
+    //   Build + Run — compile then launch. The common "I changed code
+    //                 AND want to test it" button.
+    //   Re-run      — relaunch last build WITHOUT recompiling. This
+    //                 is the button for "I only touched assets
+    //                 (sprites, levels) — the binary is fine, just
+    //                 load fresh data." Matches the workflow where
+    //                 you edit a sprite in the Sprites tab, save,
+    //                 and want to see it in-game immediately without
+    //                 paying for a compile.
+    //
+    // Button widths come from measure_text on the widest label
+    // ("Build + Run") with generous padding so the text always fits
+    // regardless of font bitmap metrics. Previously a magic 140 px
+    // still clipped "Build + Run" on some systems.
+    auto bx, by, bw, bh, gap, label_w;
+    label_w = measure_text("Build + Run", UI_FONT_SZ);
+    bw = label_w + 32;          // 16 px padding each side
+    if (bw < 120) { bw = 120; } // don't let super-narrow fonts shrink
+    bx = x + margin;
+    by = hy;
+    bh = 28;
+    gap = 8;
+
+    if (gui_button(bx, by, bw, bh, "Build")) {
+        if (editor_has_file() != 0) { editor_save(); }
+        runner_build(g_proj_root);
+    }
+    bx = bx + bw + gap;
+    if (gui_button(bx, by, bw, bh, "Build + Run")) {
+        auto rc;
+        if (editor_has_file() != 0) { editor_save(); }
+        rc = runner_build(g_proj_root);
+        if (rc == 0) { runner_run(g_proj_root); }
+    }
+    bx = bx + bw + gap;
+    if (gui_button(bx, by, bw, bh, "Re-run")) {
+        // Relaunch the already-built binary. DOES NOT compile.
+        // Useful when only assets changed (sprite edits, level
+        // edits) — the binary re-reads from disk on startup so
+        // a plain re-run picks up the new art or tilemap.
+        runner_run(g_proj_root);
+    }
+
+    hy = by + bh + 10;
+
     // Header — last build status.
     status = runner_last_status();
     if (status == 0 - 1) {
-        status_msg = "No build yet. Press Ctrl+B to build, Ctrl+R to run.";
+        status_msg = "No build yet. Click Build or Build + Run above (or F7/F8).";
         status_color = _theme.text_muted;
     } else if (status == 0) {
         status_msg = "Last build: OK.";

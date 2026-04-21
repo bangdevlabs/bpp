@@ -253,26 +253,71 @@ runner_build(proj_root) {
     return status;
 }
 
+// Build the shell command for runner_run:
+//   "cd <proj_root> && <output>"
+//
+// Critical: without the `cd`, the child inherits Bang 9's working
+// directory. If the game reads assets via relative paths like
+// "assets/sprites/rat.json" (as pathfind does through load_sprite)
+// it reads from Bang 9's cwd — the wrong folder — and silently
+// renders with missing art. Wrapping the exec in the shell so the
+// cwd is the project root fixes this without needing a sys_chdir
+// syscall in B++.
+static _runner_run_cmd(proj_root, output) {
+    auto buf, cap, i, j, plen, olen;
+    plen = str_len(proj_root);
+    olen = str_len(output);
+    cap = plen + olen + 32;
+    buf = malloc(cap);
+    i = 0;
+    // "cd " prefix
+    poke(buf + i, 99);  i = i + 1;  // 'c'
+    poke(buf + i, 100); i = i + 1;  // 'd'
+    poke(buf + i, 32);  i = i + 1;  // ' '
+    // proj_root
+    for (j = 0; j < plen; j = j + 1) {
+        poke(buf + i, peek(proj_root + j)); i = i + 1;
+    }
+    // " && "
+    poke(buf + i, 32);  i = i + 1;
+    poke(buf + i, 38);  i = i + 1;  // '&'
+    poke(buf + i, 38);  i = i + 1;  // '&'
+    poke(buf + i, 32);  i = i + 1;
+    // output (absolute path, so it runs regardless of cwd resolution)
+    for (j = 0; j < olen; j = j + 1) {
+        poke(buf + i, peek(output + j)); i = i + 1;
+    }
+    poke(buf + i, 0);
+    return buf;
+}
+
 // Run the already-built binary. Does NOT wait — game runs in
 // parallel. Returns the child pid, or 0 if fork failed.
+//
+// We exec via `/bin/sh -c "cd <proj_root> && <output>"` instead
+// of direct execve so the game process has the right working
+// directory for relative asset paths (assets/sprites/*.json).
 runner_run(proj_root) {
-    auto output, pid, argv;
+    auto output, cmd, pid, argv;
 
     output = _runner_output_path(proj_root, 512);
+    cmd    = _runner_run_cmd(proj_root, output);
 
-    argv = malloc(2 * 8);
-    *(argv + 0 * 8) = output;
-    *(argv + 1 * 8) = 0;
+    argv = malloc(4 * 8);
+    *(argv + 0 * 8) = "/bin/sh";
+    *(argv + 1 * 8) = "-c";
+    *(argv + 2 * 8) = cmd;
+    *(argv + 3 * 8) = 0;
 
     pid = sys_fork();
     if (pid == 0) {
-        sys_execve(output, argv, 0);
+        sys_execve("/bin/sh", argv, 0);
         sys_exit(127);
     }
 
     free(argv);
-    // Keep output alive (caller doesn't free — simpler for now).
-    // Real implementation would track children and reap them.
+    free(cmd);
+    free(output);
     return pid;
 }
 

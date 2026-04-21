@@ -35,9 +35,21 @@
 // (px, py, pw, ph) through every signature.
 static extrn _le_ox, _le_oy, _le_pw, _le_ph;
 
-const LVL_W = 40;
-const LVL_H = 22;
-const LVL_CELL = 16;
+// Level dimensions — RUNTIME configurable so different games can
+// edit levels of different shapes. Previously these were `const
+// _lvl_w = 40, _lvl_h = 22, _lvl_cell = 16` hardcoded, which meant
+// every game had to conform to a 40×22 grid of 16 px tiles — a
+// universal-engine-killer. Now the host (standalone launcher or
+// Bang 9) passes the grid shape at init time, and _load auto-
+// detects the shape of whatever .level.json it's opening.
+//
+// Conventional values:
+//   pathfind — 20 × 11, 16 px tiles (fits 320 × 176)
+//   default  — 40 × 22, 16 px tiles (fits 640 × 352, legacy)
+//   platformer — whatever the game declares
+static extrn _lvl_w;               // level width in tiles
+static extrn _lvl_h;               // level height in tiles
+static extrn _lvl_cell;            // pixel size of a single tile
 
 static extrn _lvl_tiles;           // Layer* — palette-indexed byte grid
                                     // exposed by stbdraw. Level editor
@@ -51,10 +63,11 @@ static extrn _lvl_sel;             // selected palette index (1..7)
 static extrn _lvl_tool;            // 0 paint, 1 erase, 2 fill
 static extrn _lvl_dirty;
 
-// Undo ring — classical snapshot (cheap at LVL_W*LVL_H = 880
-// bytes per slot, 32 slots = 28 KB). Delta would be overkill.
+// Undo ring — classical snapshot. With a 40×22 grid each slot is
+// 880 bytes (32 slots = 28 KB). With runtime-configured sizes the
+// ring is reallocated whenever dimensions change (see _resize_grid).
 const LVL_UNDO_MAX = 32;
-static extrn _lvl_undo_ring;       // LVL_UNDO_MAX * LVL_W * LVL_H bytes
+static extrn _lvl_undo_ring;       // LVL_UNDO_MAX * _lvl_w * _lvl_h bytes
 static extrn _lvl_undo_len;
 static extrn _lvl_undo_cursor;
 
@@ -81,13 +94,22 @@ static void _init_palette() {
 
 // ── State ────────────────────────────────────────────────
 
-static void _state_init() {
+// Full state bring-up. Called once from level_editor_lib_init.
+// Takes the initial level shape so Bang 9 can pre-configure the
+// editor to match a project's convention (20×11 for pathfind,
+// 40×22 for the legacy default, etc). The shape can still change
+// later via _resize_grid — but this gives a valid starting size.
+static void _state_init(w, h, cell) {
     auto total;
-    total = LVL_W * LVL_H;
+    _lvl_w    = w;
+    _lvl_h    = h;
+    _lvl_cell = cell;
+    total     = _lvl_w * _lvl_h;
+
     // Layer is the palette-indexed byte grid stbdraw exports for
     // both the compositor and this editor. Zero-fill is implicit
     // inside layer_new.
-    _lvl_tiles = layer_new(LVL_W, LVL_H, 0);
+    _lvl_tiles = layer_new(_lvl_w, _lvl_h, 0);
     _init_palette();
     _lvl_sel   = 1;
     _lvl_tool  = 0;
@@ -106,6 +128,37 @@ static void _state_init() {
     _lvl_cvs_y = 48;
 }
 
+// Resize the editor's grid to new dimensions. Called from _load
+// when the file on disk has different dimensions than the current
+// in-memory state (common when switching between projects in
+// Bang 9, or loading a foreign-shaped file into a fresh session).
+//
+// Frees the old Layer + undo ring, allocates fresh ones at the
+// new dimensions. The caller is responsible for repopulating the
+// tile grid afterwards — we don't touch the contents here.
+//
+// If the new dimensions match the old ones exactly, this is a
+// no-op (saves a pointless malloc/free pair).
+static void _resize_grid(w, h, cell) {
+    auto total;
+    if (w == _lvl_w && h == _lvl_h && cell == _lvl_cell) {
+        return;
+    }
+    if (_lvl_tiles != 0)     { layer_free(_lvl_tiles);     _lvl_tiles = 0; }
+    if (_lvl_undo_ring != 0) { free(_lvl_undo_ring);        _lvl_undo_ring = 0; }
+
+    _lvl_w    = w;
+    _lvl_h    = h;
+    _lvl_cell = cell;
+    total     = _lvl_w * _lvl_h;
+
+    _lvl_tiles       = layer_new(_lvl_w, _lvl_h, 0);
+    _lvl_undo_ring   = malloc(LVL_UNDO_MAX * total);
+    _lvl_undo_len    = 0;
+    _lvl_undo_cursor = 0;
+    _lvl_dirty       = 0;
+}
+
 static void _state_free() {
     if (_lvl_tiles != 0)   { layer_free(_lvl_tiles); _lvl_tiles = 0; }
     if (_lvl_palette != 0) { free(_lvl_palette); _lvl_palette = 0; }
@@ -120,7 +173,7 @@ static void _undo_commit() {
     auto total, src_off, dst_off, i, k;
     auto t: Layer;
     t = _lvl_tiles;
-    total = LVL_W * LVL_H;
+    total = _lvl_w * _lvl_h;
     // Truncate redo tail.
     _lvl_undo_len = _lvl_undo_cursor;
     // Shift out oldest on full.
@@ -151,7 +204,7 @@ static _undo_apply() {
     if (_lvl_undo_cursor <= 1) { return 0; }
     t = _lvl_tiles;
     _lvl_undo_cursor = _lvl_undo_cursor - 1;
-    total = LVL_W * LVL_H;
+    total = _lvl_w * _lvl_h;
     src_off = (_lvl_undo_cursor - 1) * total;
     for (i = 0; i < total; i = i + 1) {
         poke(t.fb + i, peek(_lvl_undo_ring + src_off + i));
@@ -165,7 +218,7 @@ static _redo_apply() {
     auto t: Layer;
     if (_lvl_undo_cursor >= _lvl_undo_len) { return 0; }
     t = _lvl_tiles;
-    total = LVL_W * LVL_H;
+    total = _lvl_w * _lvl_h;
     src_off = _lvl_undo_cursor * total;
     for (i = 0; i < total; i = i + 1) {
         poke(t.fb + i, peek(_lvl_undo_ring + src_off + i));
@@ -181,7 +234,7 @@ static void _paint_cell(cx, cy, idx) {
     // layer_set bounds-checks + no-ops on OOB, but we still want
     // the dirty flag only when a real change happened, so we peek
     // first.
-    if (cx < 0 || cy < 0 || cx >= LVL_W || cy >= LVL_H) { return; }
+    if (cx < 0 || cy < 0 || cx >= _lvl_w || cy >= _lvl_h) { return; }
     if (layer_get(_lvl_tiles, cx, cy) == idx) { return; }
     layer_set(_lvl_tiles, cx, cy, idx);
     _lvl_dirty = 1;
@@ -204,13 +257,13 @@ static _save(path) : io {
     sb = json_write_object_begin(sb);
     sb = json_write_string_field(sb, "type", "level");
     sb = json_write_int_field(sb, "version", 1);
-    sb = json_write_int_field(sb, "width",  LVL_W);
-    sb = json_write_int_field(sb, "height", LVL_H);
+    sb = json_write_int_field(sb, "width",  _lvl_w);
+    sb = json_write_int_field(sb, "height", _lvl_h);
     sb = json_write_string_field(sb, "palette", "MCU-8");
     sb = json_write_array_field_begin(sb, "tiles");
-    for (y = 0; y < LVL_H; y = y + 1) {
+    for (y = 0; y < _lvl_h; y = y + 1) {
         sb = json_write_array_begin(sb);
-        for (x = 0; x < LVL_W; x = x + 1) {
+        for (x = 0; x < _lvl_w; x = x + 1) {
             idx = layer_get(_lvl_tiles, x, y);
             sb = json_write_int(sb, idx);
         }
@@ -254,16 +307,31 @@ static _load(path) : io {
     w = json_int(doc, idx);
     idx = json_object_get(doc, root, "height");
     h = json_int(doc, idx);
-    if (w != LVL_W || h != LVL_H) {
-        print_err_msg("level: size mismatch (MVP only loads LVL_W x LVL_H)\n");
+
+    // Sanity check: the file must declare positive dimensions.
+    // A 0 or negative width means the JSON is malformed or this
+    // isn't a level file at all — bail before we malloc garbage.
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+        print_err_msg("level: invalid dimensions ");
+        print_err_int(w); print_err_msg("x"); print_err_int(h); print_err_msg("\n");
         json_free(doc);
         return 0 - 1;
     }
+
+    // Size-flex: if the file's dimensions differ from the current
+    // in-memory grid, resize to match. The old "size mismatch =
+    // error" behaviour made the editor useless for anything other
+    // than the default 40×22 shape. Now it adapts to whatever the
+    // project's level convention is, which is the whole point of
+    // the runtime-dimension refactor.
+    if (w != _lvl_w || h != _lvl_h) {
+        _resize_grid(w, h, _lvl_cell);
+    }
     tiles_idx = json_object_get(doc, root, "tiles");
     if (tiles_idx < 0) { json_free(doc); return 0 - 1; }
-    for (y = 0; y < LVL_H; y = y + 1) {
+    for (y = 0; y < _lvl_h; y = y + 1) {
         row = json_child(doc, tiles_idx, y);
-        for (x = 0; x < LVL_W; x = x + 1) {
+        for (x = 0; x < _lvl_w; x = x + 1) {
             cell = json_int(doc, json_child(doc, row, x));
             if (cell < 0) { cell = 0; }
             if (cell > 7) { cell = 7; }
@@ -279,15 +347,15 @@ static _load(path) : io {
 
 static void _render_grid() {
     auto y, x, idx, color, px, py, side_w, side_h;
-    side_w = LVL_W * LVL_CELL;
-    side_h = LVL_H * LVL_CELL;
+    side_w = _lvl_w * _lvl_cell;
+    side_h = _lvl_h * _lvl_cell;
     draw_rect(_lvl_cvs_x, _lvl_cvs_y, side_w, side_h,
               rgba(14, 16, 22, 255));
-    for (y = 0; y < LVL_H; y = y + 1) {
-        for (x = 0; x < LVL_W; x = x + 1) {
+    for (y = 0; y < _lvl_h; y = y + 1) {
+        for (x = 0; x < _lvl_w; x = x + 1) {
             idx = layer_get(_lvl_tiles, x, y);
-            px = _lvl_cvs_x + x * LVL_CELL;
-            py = _lvl_cvs_y + y * LVL_CELL;
+            px = _lvl_cvs_x + x * _lvl_cell;
+            py = _lvl_cvs_y + y * _lvl_cell;
             if (idx == 0) {
                 // Transparent cell — 2x2 checker.
                 color = ((x + y) & 1) != 0
@@ -296,18 +364,18 @@ static void _render_grid() {
             } else {
                 color = *(_lvl_palette + idx * 8);
             }
-            draw_rect(px, py, LVL_CELL, LVL_CELL, color);
+            draw_rect(px, py, _lvl_cell, _lvl_cell, color);
         }
     }
     // Grid lines every 4 cells — helps with visual alignment
     // without the noise of one line per cell.
     color = rgba(30, 34, 44, 180);
-    for (y = 0; y <= LVL_H; y = y + 4) {
-        draw_rect(_lvl_cvs_x, _lvl_cvs_y + y * LVL_CELL,
+    for (y = 0; y <= _lvl_h; y = y + 4) {
+        draw_rect(_lvl_cvs_x, _lvl_cvs_y + y * _lvl_cell,
                   side_w + 1, 1, color);
     }
-    for (x = 0; x <= LVL_W; x = x + 4) {
-        draw_rect(_lvl_cvs_x + x * LVL_CELL, _lvl_cvs_y,
+    for (x = 0; x <= _lvl_w; x = x + 4) {
+        draw_rect(_lvl_cvs_x + x * _lvl_cell, _lvl_cvs_y,
                   1, side_h + 1, color);
     }
 }
@@ -318,10 +386,10 @@ static _le_cursor_cell() : base {
     mx = mouse_x();
     my = mouse_y();
     if (mx < _lvl_cvs_x || my < _lvl_cvs_y) { return 0 - 1; }
-    cx = (mx - _lvl_cvs_x) / LVL_CELL;
-    cy = (my - _lvl_cvs_y) / LVL_CELL;
-    if (cx >= LVL_W || cy >= LVL_H) { return 0 - 1; }
-    return cy * LVL_W + cx;
+    cx = (mx - _lvl_cvs_x) / _lvl_cell;
+    cy = (my - _lvl_cvs_y) / _lvl_cell;
+    if (cx >= _lvl_w || cy >= _lvl_h) { return 0 - 1; }
+    return cy * _lvl_w + cx;
 }
 
 // ── Embed API ────────────────────────────────────────────
@@ -344,9 +412,26 @@ static extrn _le_initialized;
 // undo ring. Caller MUST have already called game_init() — the
 // host owns the window. `initial_name` (may be 0) pre-fills the
 // filename input the same way modulab_lib_init does.
-void level_editor_lib_init(initial_name) {
+// One-time bring-up. Host passes the initial grid shape the editor
+// should start with; this becomes the "empty canvas" dimensions
+// until the user loads a file (which may resize via _resize_grid).
+//
+// Conventions:
+//   standalone launcher — (name, 40, 22, 16)  [legacy default]
+//   Bang 9 pathfind     — (name, 20, 11, 16)  [from game's GRID_W/H]
+//   Bang 9 fallback     — (name, 40, 22, 16)  [when no project info]
+//
+// name may be 0 to use the editor's default ("level1").
+void level_editor_lib_init(initial_name, w, h, cell) {
     if (_le_initialized != 0) { return; }
-    _state_init();
+    // Defensive defaults: if the host passes 0 or negative, fall
+    // back to the legacy 40×22×16 so we never end up with a
+    // zero-sized grid that would divide-by-zero in coord math.
+    if (w <= 0)    { w = 40; }
+    if (h <= 0)    { h = 22; }
+    if (cell <= 0) { cell = 16; }
+
+    _state_init(w, h, cell);
     if (initial_name != 0) {
         text_input_set(_lvl_name_ti, initial_name);
     }
@@ -354,6 +439,58 @@ void level_editor_lib_init(initial_name) {
     _le_prev_lmb_down = 0;
     _le_prev_rmb_down = 0;
     _le_initialized   = 1;
+}
+
+// Silently try to load a .level.json file and point the filename
+// field at it. Used by embed hosts (Bang 9) to pre-populate the
+// editor with a project's asset on first tab activation so the
+// user doesn't have to hunt for the right Open path.
+//
+// full_path: cwd-relative or absolute path WITH extension
+// (e.g. "games/pathfind/assets/levels/level1.level.json").
+//
+// Returns 1 on successful load, 0 if the file was missing or
+// unreadable. We probe first with file_read_all so a missing
+// project asset stays silent — no stderr spam on fresh projects.
+level_editor_lib_try_load(full_path) : io {
+    auto size_out, buf, i, plen, stripped, base, suffix;
+    if (full_path == 0) { return 0; }
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(full_path, size_out);
+    free(size_out);
+    if (buf == 0) { return 0; }   // missing file — silent
+    free(buf);
+
+    if (_load(full_path) != 0) { return 0; }
+    _undo_commit();
+
+    // Filename field stores BASE (no extension) — _save re-appends
+    // ".level.json" when the user saves. Strip the 11-char suffix
+    // so a subsequent save doesn't double-extension.
+    plen = str_len(full_path);
+    if (plen > 11) {
+        stripped = 1;
+        suffix = ".level.json";
+        for (i = 0; i < 11; i = i + 1) {
+            if (peek(full_path + plen - 11 + i) != peek(suffix + i)) {
+                stripped = 0;
+            }
+        }
+        if (stripped != 0) {
+            base = malloc(plen - 11 + 1);
+            for (i = 0; i < plen - 11; i = i + 1) {
+                poke(base + i, peek(full_path + i));
+            }
+            poke(base + plen - 11, 0);
+            text_input_set(_lvl_name_ti, base);
+            free(base);
+            return 1;
+        }
+    }
+    text_input_set(_lvl_name_ti, full_path);
+    return 1;
 }
 
 // Render + handle one frame inside the rect (px, py, pw, ph).
@@ -368,16 +505,47 @@ level_editor_lib_frame(px, py, pw, ph) {
     _le_ox = px; _le_oy = py; _le_pw = pw; _le_ph = ph;
 
     // Lazy init guard: if the host forgot to call _init, bring
-    // the editor up with its default name so the first frame
-    // doesn't dereference null state.
+    // the editor up with legacy defaults (40×22×16) so the first
+    // frame doesn't dereference null state. Hosts that care about
+    // matching their game's actual grid should call _init
+    // explicitly with the right dimensions BEFORE drawing.
     if (_le_initialized == 0) {
-        level_editor_lib_init("level1");
+        level_editor_lib_init("level1", 40, 22, 16);
     }
 
     // Canvas origin recalculated every frame so the editor tracks
     // the host's panel rect even if the host reflows on resize.
     _lvl_cvs_x = px + 40;
     _lvl_cvs_y = py + 48;
+
+    // Auto-scale the cell size to fill the panel. Without this, a
+    // 20×11 level (pathfind) inside Bang 9's full-width Levels
+    // panel would render as a tiny 320×176 area with 700 px of
+    // wasted space on the right. We derive a cell size that
+    // maximizes the canvas within the available space while
+    // keeping cells square and on integer pixel boundaries.
+    //
+    // Reserved chrome:
+    //   left edge  — canvas origin is px + 40
+    //   right edge — palette column eats ~80 px
+    //   top        — topbar + padding ≈ 48 px (canvas origin)
+    //   bottom     — help bar ≈ 40 px + some breathing room
+    //
+    // We never shrink below 8 px (readable floor) and never grow
+    // past 48 px (past that, zoom becomes comical). Clamping at
+    // both ends also prevents divide-by-zero weirdness if the
+    // panel is freakishly small.
+    auto avail_w, avail_h, cell_w_fit, cell_h_fit, new_cell;
+    avail_w = pw - 40 - 80;   // left margin + palette column
+    avail_h = ph - 48 - 48;   // topbar + help bar
+    if (avail_w < 64) { avail_w = 64; }
+    if (avail_h < 64) { avail_h = 64; }
+    cell_w_fit = avail_w / _lvl_w;
+    cell_h_fit = avail_h / _lvl_h;
+    new_cell   = cell_w_fit < cell_h_fit ? cell_w_fit : cell_h_fit;
+    if (new_cell < 8)  { new_cell = 8;  }
+    if (new_cell > 48) { new_cell = 48; }
+    _lvl_cell = new_cell;
 
     quit = 0;
     if (key_pressed(KEY_ESC)) { quit = 1; }
@@ -457,8 +625,8 @@ level_editor_lib_frame(px, py, pw, ph) {
         cell = _le_cursor_cell();
         if (cell >= 0) {
             auto cx, cy, press;
-            cx = cell % LVL_W;
-            cy = cell / LVL_W;
+            cx = cell % _lvl_w;
+            cy = cell / _lvl_w;
             press = lmb_down != 0 && _le_prev_lmb_down == 0;
             if (lmb_down != 0) {
                 if (_lvl_tool == 2) {

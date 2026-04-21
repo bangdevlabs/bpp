@@ -265,6 +265,18 @@ struct ChipPrimitives {
     return_reg,         // ()  → reg index
     freturn_reg,        // ()  → fp reg index
     word_size,          // ()  → 4 or 8
+
+    // ── Wave 18 inline builtin dispatch (3) ──
+    // Consumed by cg_builtin_dispatch for peek / poke / str_peek /
+    // sys_* lifts. The spine evaluates arguments through emit_node
+    // (the chip's tree walker exposed as a primitive), invokes
+    // emit_coerce_float_to_int if the arg came out in a float
+    // register, then calls emit_mem_read / emit_mem_write for the
+    // final instruction. See Cap 23 (Battalions) in the book for
+    // the full recipe and a worked peek example.
+    emit_node,          // (node)  → ety (0 int, 1 float)
+    emit_mem_read,      // (width) — load `width` bytes at [acc] into acc
+    emit_coerce_float_to_int, // () — truncate float accumulator to int
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -918,8 +930,47 @@ cg_switch_is_dense(sw_arms, sw_cnt) {
 // and each chip implements its own alloc rules. That's a
 // separate session with its own byte-identity gate.
 
+// Wave 18 — inline builtin dispatch in the spine.
+//
+// Called from cg_emit_call before the chip's fat emit_call_full
+// fallthrough. If the node's name matches a lifted builtin, spine
+// handles argument evaluation + push/pop + coerce + final primitive
+// emission, and returns 1 to signal "handled". If no match, returns
+// 0 and cg_emit_call falls through to the chip's emit_call_full
+// (which still owns the ~42 builtins not yet lifted).
+//
+// Each lifted builtin follows the recipe in Cap 23 (Battalions):
+// spine evaluates args via cg_emit_node, coerces float to int via
+// cg_prim.emit_coerce_float_to_int when the arg was float-valued,
+// optionally orchestrates push/pop for multi-arg patterns, then
+// calls the chip primitive (emit_mem_read, emit_mem_write,
+// emit_syscall, etc.) for the ISA-specific final instruction.
+//
+// C emitter target: this function is not reached during C
+// emission. C code goes through bpp_emitter.bsm's own emit_node
+// path, which keeps its own 43-branch ladder until a separate
+// future session unifies the C emitter pattern.
+cg_builtin_dispatch(n) {
+    auto p: ChipPrimitives, arr, ety;
+    p = cg_prim;
+
+    // Built-in: peek(addr) — load one byte from [addr].
+    // Spine-lifted (Wave 18). See Cap 23 recipe §"peek as worked
+    // example" for the step-by-step.
+    if (cg_str_eq(n.a, "peek", 4)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_mem_read, 1);
+        return 1;
+    }
+
+    return 0;
+}
+
 cg_emit_call(n) {
     auto p: ChipPrimitives;
+    if (cg_builtin_dispatch(n)) { return 0; }
     p = cg_prim;
     return call(p.emit_call_full, n);
 }

@@ -18,6 +18,10 @@ import "stbpool.bsm";
 import "stbtile.bsm";
 import "stbpath.bsm";
 import "stbpal.bsm";
+import "bpp_json.bsm";   // json_parse/json_root for loading level files
+                         // (bpp_json is the standalone JSON lib; stbforge
+                         //  wraps it but pulls in modulab-specific helpers
+                         //  we don't need here)
 
 // ── Constants ────────────────────────────────────────────
 
@@ -112,7 +116,11 @@ auto path_len;
 
 // Lay out a small arena: a few walls that force the cat to go around.
 // The walls are tile_type 1 (T_WALL); empty cells are 0.
-void build_arena() {
+// Fallback arena — used when no level file is present. This is the
+// original hand-coded geometry; leaving it here lets the game boot
+// "offline" from the repo without a level1.level.json sidecar.
+// Production path goes through load_arena_from_file below.
+void build_arena_fallback() {
     auto gx, gy;
 
     // Outer top/bottom rows are open. We use the inner area for walls.
@@ -132,6 +140,72 @@ void build_arena() {
     // A couple of single-block obstacles for variety
     tile_set(tm, 3, 9, T_WALL);
     tile_set(tm, 17, 2, T_WALL);
+}
+
+// Load the arena geometry from assets/levels/level1.level.json —
+// the level_editor format shipped by Bang 9. This is the path the
+// game takes when edits made in Bang 9's Levels tab should
+// round-trip into the running game.
+//
+// Returns 0 on success, -1 on any read/parse/dimension error. The
+// caller falls back to build_arena_fallback() on -1 so the game
+// still boots if the file is absent or corrupted.
+load_arena_from_file(path) : io {
+    auto buf, fsize, doc, root;
+    auto w_idx, h_idx, tiles_idx, w, h;
+    auto x, y, row_idx, cell;
+
+    buf = file_read_all(path, &fsize);
+    if (buf == 0) { return 0 - 1; }
+
+    doc = json_parse(buf, fsize);
+    free(buf);
+    if (doc == 0) { return 0 - 1; }
+
+    root     = json_root(doc);
+    w_idx    = json_object_get(doc, root, "width");
+    h_idx    = json_object_get(doc, root, "height");
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (w_idx < 0 || h_idx < 0 || tiles_idx < 0) {
+        json_free(doc);
+        return 0 - 1;
+    }
+
+    w = json_int(doc, w_idx);
+    h = json_int(doc, h_idx);
+    // Size must match the game's compile-time constants. If the
+    // user edits level1 in Bang 9 with a different grid shape,
+    // that's a real mismatch and we fail loudly (the fallback will
+    // catch it and the game runs in default mode).
+    if (w != GRID_W || h != GRID_H) {
+        json_free(doc);
+        return 0 - 1;
+    }
+
+    for (y = 0; y < h; y = y + 1) {
+        row_idx = json_child(doc, tiles_idx, y);
+        for (x = 0; x < w; x = x + 1) {
+            cell = json_int(doc, json_child(doc, row_idx, x));
+            // Any non-zero tile counts as a wall. The level_editor
+            // supports 8 palette indices but pathfind only cares
+            // about "solid vs empty"; 1..7 all become T_WALL.
+            if (cell != 0) { tile_set(tm, x, y, T_WALL); }
+        }
+    }
+
+    json_free(doc);
+    return 0;
+}
+
+// Try the file path first; fall back to the hand-coded arena if
+// the file is missing or malformed. This means: edits in Bang 9
+// Levels tab take effect on the next launch, and the game still
+// works when someone clones the repo fresh and hasn't opened the
+// Levels tab yet.
+void build_arena() {
+    if (load_arena_from_file("assets/levels/level1.level.json") != 0) {
+        build_arena_fallback();
+    }
 }
 
 // Mirror the tilemap's solid mask into the PathFinder. Inline 8-line
