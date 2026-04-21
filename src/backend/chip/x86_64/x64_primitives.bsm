@@ -317,10 +317,57 @@ void _x64_emit_restore_caller_saved_int() { }
 void _x64_emit_fn_entry_label(name_p, fn_lbl_id) { }
 void _x64_emit_frame_setup(frame_size) { }
 void _x64_emit_save_callee_saved(regs_arr, count, base_off) { }
+
+// Fat prologue: entry label + ret_lbl alloc + push rbp / mov rbp,rsp
+// + sub rsp, frame + spill promoted regs. Reads x64_promoted_regs
+// and x64_b3_spill_off (set by caller before this invocation).
+void _x64_emit_prologue(name_p, fn_lbl_id, frame_size) {
+    auto i, n, reg, off;
+    x64_enc_def_label(fn_lbl_id);
+    x64_ret_lbl = x64_enc_new_label();
+    x64_enc_push(5);
+    x64_enc_mov_reg(5, 4);
+    if (frame_size > 0) { x64_enc_sub_imm(4, frame_size); }
+    n = arr_len(x64_promoted_regs);
+    for (i = 0; i < n; i = i + 1) {
+        reg = arr_get(x64_promoted_regs, i);
+        off = x64_b3_spill_off - (i + 1) * 8;
+        x64_enc_store(reg, 5, off);
+    }
+}
 void _x64_b3_select_prim() { }
-void _x64_emit_arg_copy_int(param_idx, frame_off) { }
+// Copy incoming int arg from System V ABI reg to frame slot (or
+// directly into B3-promoted callee-saved reg). Args come in
+// rdi/rsi/rdx/rcx/r8/r9 by slot index — x64_arg_reg maps this.
+void _x64_emit_arg_copy_int(param_idx, frame_off) {
+    auto preg, abi_reg;
+    preg = arr_get(cg_var_promote, param_idx);
+    abi_reg = x64_arg_reg(param_idx);
+    if (preg >= 0) {
+        x64_enc_mov_reg(preg, abi_reg);
+    } else {
+        x64_enc_store(abi_reg, 5, frame_off);
+    }
+}
 void _x64_emit_arg_copy_flt(param_idx, frame_off) { }
-void _x64_emit_frame_teardown(frame_size, regs_arr, count, base_off) { }
+// Epilogue: define return label, restore promoted regs from
+// frame spill slots (negative offsets from x64_b3_spill_off),
+// restore rbp, ret. Reads x64_promoted_regs and
+// x64_b3_spill_off directly; caller only passes frame_size
+// (unused currently but kept for signature consistency with a64).
+void _x64_emit_frame_teardown(frame_size) {
+    auto i, n, reg, off;
+    x64_enc_def_label(x64_ret_lbl);
+    n = arr_len(x64_promoted_regs);
+    for (i = 0; i < n; i = i + 1) {
+        reg = arr_get(x64_promoted_regs, i);
+        off = x64_b3_spill_off - (i + 1) * 8;
+        x64_enc_load(reg, 5, off);
+    }
+    x64_enc_mov_reg(4, 5);   // mov rsp, rbp
+    x64_enc_pop(5);          // pop rbp
+    x64_enc_ret();
+}
 void _x64_emit_module_setup() { }
 void _x64_emit_module_finalize() { }
 void _x64_alloc_fn_labels() { }

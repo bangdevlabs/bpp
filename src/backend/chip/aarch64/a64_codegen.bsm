@@ -2257,31 +2257,9 @@ static void a64_emit_func(fi) {
     frame = (frame + 15) / 16 * 16;
 
     if (a64_bin_mode) {
-        // Define the label for this function's entry point.
-        enc_def_label(arr_get(a64_fn_lbl, fi));
-
-        // Allocate a return label for this function.
-        a64_ret_lbl = enc_new_label();
-
-        // Prologue: save frame pointer and return address, allocate frame.
-        // stp pre-index caps at ±504 in its 7-bit immediate — split for larger frames.
-        if (frame <= 504) {
-            enc_stp_pre(29, 30, 31, 0 - frame);
-        } else {
-            enc_sub_imm(31, 31, frame);
-            enc_str_uoff(29, 31, 0);
-            enc_str_uoff(30, 31, 8);
-        }
-        enc_add_imm(29, 31, 0);
-
-        // Phase B3: spill chosen callee-saved registers.
-        auto _b3_i, _b3_n, _b3_reg, _b3_off;
-        _b3_n = arr_len(a64_promoted_regs);
-        for (_b3_i = 0; _b3_i < _b3_n; _b3_i = _b3_i + 1) {
-            _b3_reg = arr_get(a64_promoted_regs, _b3_i);
-            _b3_off = a64_b3_spill_base + _b3_i * 8;
-            enc_str_uoff(_b3_reg, 29, _b3_off);
-        }
+        // Prologue via primitive (Wave 13 activation — fat body in
+        // a64_primitives.bsm::_a64_emit_prologue).
+        _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
 
         // In main(), save x0 (argc), x1 (argv), and x2 (envp) to hidden globals.
         if (cg_str_eq(name_p, "main", 4)) {
@@ -2296,17 +2274,10 @@ static void a64_emit_func(fi) {
             enc_str_uoff(2, 8, 0);
         }
 
-        // Store incoming register arguments. Promoted params go straight into
-        // their callee-saved register.
-        auto _p_preg;
+        // Incoming int args → frame slots or promoted regs (Wave 14).
         i = 0;
         while (i < par_cnt) {
-            _p_preg = arr_get(cg_var_promote, i);
-            if (_p_preg >= 0) {
-                enc_add_imm(_p_preg, i, 0);
-            } else {
-                enc_str_uoff(i, 29, arr_get(cg_var_off, i));
-            }
+            _a64_emit_arg_copy_int(i, arr_get(cg_var_off, i));
             i = i + 1;
         }
 
@@ -2344,51 +2315,12 @@ static void a64_emit_func(fi) {
         // code in that case — the branch jumps over it.
         enc_mov_wide(0, 0);
 
-        // Epilogue. Centralized restore of spilled callee-saved regs.
-        enc_def_label(a64_ret_lbl);
-        auto _e_i, _e_n, _e_reg, _e_off;
-        _e_n = arr_len(a64_promoted_regs);
-        for (_e_i = 0; _e_i < _e_n; _e_i = _e_i + 1) {
-            _e_reg = arr_get(a64_promoted_regs, _e_i);
-            _e_off = a64_b3_spill_base + _e_i * 8;
-            enc_ldr_uoff(_e_reg, 29, _e_off);
-        }
-        if (frame <= 504) {
-            enc_ldp_post(29, 30, 31, frame);
-        } else {
-            enc_ldr_uoff(29, 31, 0);
-            enc_ldr_uoff(30, 31, 8);
-            enc_add_imm(31, 31, frame);
-        }
-        enc_ret();
+        // Epilogue via primitive (Wave 15 activation — real body
+        // lives in a64_primitives.bsm::_a64_emit_frame_teardown).
+        _a64_emit_frame_teardown(frame);
     } else {
-        // Emit function header.
-        out(".p2align 2"); putchar('\n');
-        if (cg_str_eq(name_p, "main", 4)) {
-            out(".globl _main"); putchar('\n');
-            out("_main:"); putchar('\n');
-        } else {
-            out("_"); a64_print_p(name_p); out(":"); putchar('\n');
-        }
-
-        // Prologue: save frame pointer and return address, allocate frame.
-        if (frame <= 504) {
-            out("  stp x29, x30, [sp, #-"); a64_print_dec(frame); out("]!"); putchar('\n');
-        } else {
-            out("  sub sp, sp, #"); a64_print_dec(frame); putchar('\n');
-            out("  str x29, [sp]"); putchar('\n');
-            out("  str x30, [sp, #8]"); putchar('\n');
-        }
-        out("  mov x29, sp"); putchar('\n');
-
-        // Phase B3: spill chosen callee-saved registers.
-        auto _b3_i, _b3_n, _b3_reg, _b3_off;
-        _b3_n = arr_len(a64_promoted_regs);
-        for (_b3_i = 0; _b3_i < _b3_n; _b3_i = _b3_i + 1) {
-            _b3_reg = arr_get(a64_promoted_regs, _b3_i);
-            _b3_off = a64_b3_spill_base + _b3_i * 8;
-            out("  str x"); a64_print_dec(_b3_reg); out(", [x29, #"); a64_print_dec(_b3_off); out("]"); putchar('\n');
-        }
+        // Prologue via primitive (Wave 13 activation).
+        _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
 
         // In main(), save x0 (argc), x1 (argv), and x2 (envp) to globals.
         if (cg_str_eq(name_p, "main", 4)) {
@@ -2403,16 +2335,10 @@ static void a64_emit_func(fi) {
             out("  str x2, [x8]"); putchar('\n');
         }
 
-        // Store incoming register arguments. Promoted params go to their reg.
-        auto _p_preg;
+        // Incoming int args → frame slots or promoted regs (Wave 14).
         i = 0;
         while (i < par_cnt) {
-            _p_preg = arr_get(cg_var_promote, i);
-            if (_p_preg >= 0) {
-                out("  mov x"); a64_print_dec(_p_preg); out(", x"); a64_print_dec(i); putchar('\n');
-            } else {
-                out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(arr_get(cg_var_off, i)); out("]"); putchar('\n');
-            }
+            _a64_emit_arg_copy_int(i, arr_get(cg_var_off, i));
             i = i + 1;
         }
 
@@ -2449,23 +2375,8 @@ static void a64_emit_func(fi) {
         // Implicit return 0 for functions without explicit return.
         out("  mov x0, #0"); putchar('\n');
 
-        // Epilogue. Centralized restore of spilled callee-saved regs.
-        out(".Lret_"); a64_print_p(name_p); out(":"); putchar('\n');
-        auto _e_i, _e_n, _e_reg, _e_off;
-        _e_n = arr_len(a64_promoted_regs);
-        for (_e_i = 0; _e_i < _e_n; _e_i = _e_i + 1) {
-            _e_reg = arr_get(a64_promoted_regs, _e_i);
-            _e_off = a64_b3_spill_base + _e_i * 8;
-            out("  ldr x"); a64_print_dec(_e_reg); out(", [x29, #"); a64_print_dec(_e_off); out("]"); putchar('\n');
-        }
-        if (frame <= 504) {
-            out("  ldp x29, x30, [sp], #"); a64_print_dec(frame); putchar('\n');
-        } else {
-            out("  ldr x29, [sp]"); putchar('\n');
-            out("  ldr x30, [sp, #8]"); putchar('\n');
-            out("  add sp, sp, #"); a64_print_dec(frame); putchar('\n');
-        }
-        out("  ret"); putchar('\n');
+        // Epilogue via primitive (Wave 15 activation).
+        _a64_emit_frame_teardown(frame);
         putchar('\n');
     }
 }

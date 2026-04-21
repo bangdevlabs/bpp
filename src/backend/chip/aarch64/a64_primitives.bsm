@@ -584,15 +584,142 @@ void _a64_emit_restore_caller_saved_int() {
 // dispatches. Until then these functions are wired into
 // cg_prim but unreachable from the production path.
 
-void _a64_emit_fn_entry_label(name_p, fn_lbl_id) { }
-void _a64_emit_frame_setup(frame_size) { }
-void _a64_emit_save_callee_saved(regs_arr, count, base_off) { }
+// Prologue: emit entry label, allocate return label, save fp/lr,
+// allocate frame, set up x29, and spill B3-promoted callee-saved
+// regs. Fat primitive — handles the whole prologue in one shot.
+// Reads a64_fn_lbl (for fn_lbl_id lookup), a64_promoted_regs,
+// a64_b3_spill_base. name_p is used in asm mode for the textual
+// symbol name; fn_lbl_id is used in bin mode for enc_def_label.
+void _a64_emit_frame_setup(frame_size) { }  // superseded by emit_fn_entry_label below (fat)
+
+void _a64_emit_fn_entry_label(name_p, fn_lbl_id) {
+    // Stub kept for contract surface — actual prologue emission
+    // happens via _a64_emit_prologue below (fat primitive).
+}
+
+void _a64_emit_save_callee_saved(regs_arr, count, base_off) {
+    // Stub kept for contract surface — folded into fat prologue.
+}
+
+// Fat prologue: label + ret_lbl alloc + frame setup + callee-saved
+// spill. Not on the original 45-slot contract but named in local
+// scope to match the Wave 13/15 symmetry with emit_frame_teardown.
+void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
+    auto i, n, reg, off;
+    if (a64_bin_mode) {
+        enc_def_label(fn_lbl_id);
+        a64_ret_lbl = enc_new_label();
+        if (frame_size <= 504) {
+            enc_stp_pre(29, 30, 31, 0 - frame_size);
+        } else {
+            enc_sub_imm(31, 31, frame_size);
+            enc_str_uoff(29, 31, 0);
+            enc_str_uoff(30, 31, 8);
+        }
+        enc_add_imm(29, 31, 0);
+        n = arr_len(a64_promoted_regs);
+        for (i = 0; i < n; i = i + 1) {
+            reg = arr_get(a64_promoted_regs, i);
+            off = a64_b3_spill_base + i * 8;
+            enc_str_uoff(reg, 29, off);
+        }
+    } else {
+        a64_ret_lbl = enc_new_label();
+        out(".p2align 2"); putchar('\n');
+        if (cg_str_eq(name_p, "main", 4)) {
+            out(".globl _main"); putchar('\n');
+            out("_main:"); putchar('\n');
+        } else {
+            out("_"); a64_print_p(name_p); out(":"); putchar('\n');
+        }
+        if (frame_size <= 504) {
+            out("  stp x29, x30, [sp, #-"); a64_print_dec(frame_size); out("]!"); putchar('\n');
+        } else {
+            out("  sub sp, sp, #"); a64_print_dec(frame_size); putchar('\n');
+            out("  str x29, [sp]"); putchar('\n');
+            out("  str x30, [sp, #8]"); putchar('\n');
+        }
+        out("  mov x29, sp"); putchar('\n');
+        n = arr_len(a64_promoted_regs);
+        for (i = 0; i < n; i = i + 1) {
+            reg = arr_get(a64_promoted_regs, i);
+            off = a64_b3_spill_base + i * 8;
+            out("  str x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+        }
+    }
+}
 // Wrapper around chip's existing _a64_b3_select static (extant
 // in a64_codegen.bsm). Public name avoided to dodge collision.
 void _a64_b3_select_prim() { }
-void _a64_emit_arg_copy_int(param_idx, frame_off) { }
+// Copy incoming int arg from ABI reg to frame slot (or directly
+// into B3-promoted callee-saved reg if hot local). AAPCS64: args
+// come in x0..x7 by slot index. Reads cg_var_promote for the
+// promotion decision.
+void _a64_emit_arg_copy_int(param_idx, frame_off) {
+    auto preg;
+    preg = arr_get(cg_var_promote, param_idx);
+    if (a64_bin_mode) {
+        if (preg >= 0) {
+            enc_add_imm(preg, param_idx, 0);   // mov preg, xN
+        } else {
+            enc_str_uoff(param_idx, 29, frame_off);
+        }
+    } else {
+        if (preg >= 0) {
+            out("  mov x"); a64_print_dec(preg);
+            out(", x"); a64_print_dec(param_idx); putchar('\n');
+        } else {
+            out("  str x"); a64_print_dec(param_idx);
+            out(", [x29, #"); a64_print_dec(frame_off); out("]"); putchar('\n');
+        }
+    }
+}
+
+// Float arg copy unused today in a64 — floats come in d0..d7 but
+// the existing path handles them inline via the sub-width narrowing
+// loop. Kept as a stub for contract parity; a RISC-V port wanting
+// a unified interface can implement this without touching the
+// narrowing path.
 void _a64_emit_arg_copy_flt(param_idx, frame_off) { }
-void _a64_emit_frame_teardown(frame_size, regs_arr, count, base_off) { }
+// Epilogue: define return label, restore B3-promoted callee-saved
+// regs from frame spill slots, deallocate frame, restore fp/lr,
+// ret. Reads a64_promoted_regs and a64_b3_spill_base directly so
+// the caller only passes frame_size. Dual-mode (asm / bin).
+void _a64_emit_frame_teardown(frame_size) {
+    auto i, n, reg, off;
+    n = arr_len(a64_promoted_regs);
+    if (a64_bin_mode) {
+        enc_def_label(a64_ret_lbl);
+        for (i = 0; i < n; i = i + 1) {
+            reg = arr_get(a64_promoted_regs, i);
+            off = a64_b3_spill_base + i * 8;
+            enc_ldr_uoff(reg, 29, off);
+        }
+        if (frame_size <= 504) {
+            enc_ldp_post(29, 30, 31, frame_size);
+        } else {
+            enc_ldr_uoff(29, 31, 0);
+            enc_ldr_uoff(30, 31, 8);
+            enc_add_imm(31, 31, frame_size);
+        }
+        enc_ret();
+    } else {
+        out(".Lret_"); a64_print_p(cg_cur_fn_name); out(":"); putchar('\n');
+        for (i = 0; i < n; i = i + 1) {
+            reg = arr_get(a64_promoted_regs, i);
+            off = a64_b3_spill_base + i * 8;
+            out("  ldr x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+        }
+        if (frame_size <= 504) {
+            out("  ldp x29, x30, [sp], #"); a64_print_dec(frame_size); putchar('\n');
+        } else {
+            out("  ldr x29, [sp]"); putchar('\n');
+            out("  ldr x30, [sp, #8]"); putchar('\n');
+            out("  add sp, sp, #"); a64_print_dec(frame_size); putchar('\n');
+        }
+        out("  ret"); putchar('\n');
+    }
+}
 void _a64_emit_module_setup() { }
 void _a64_emit_module_finalize() { }
 void _a64_alloc_fn_labels() { }
