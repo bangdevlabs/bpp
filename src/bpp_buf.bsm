@@ -1,6 +1,29 @@
-// bpp_buf.bsm — Raw buffer access for multi-byte reads and writes.
-// Provides little-endian helpers for 8, 16, 32, and 64-bit values.
-// Built on peek/poke. No external dependencies.
+// bpp_buf.bsm — Static Raw Array home (user-facing, auto-injected).
+//
+// This module is the canonical API for B++'s zero-overhead array
+// shape (see Cap 6 §6.0 for strings, Cap 7 for arrays, Cap 15
+// fourth tier for compiler-internal analogs).
+//
+// What lives here:
+//   buf_new(n)           allocate n raw bytes
+//   buf_new_w(n)         allocate n words (n * 8 bytes)
+//   buf_free(buf)        free, returns 0
+//   buf_fill(buf, byte, n)   bulk set
+//   buf_copy(dst, src, n)    bulk copy
+//   read_u8/u16/u32/u64  typed LE load
+//   write_u8/u16/u32/u64 typed LE store
+//   read_u16be/u32be/u64be  typed BE load (PNG, network byte order)
+//   write_u16be/u32be/u64be  typed BE store
+//
+// Byte access (peek/poke) and word-stride arithmetic (*(buf + i * 8))
+// are inline compiler builtins — not wrapped here, because wrapping
+// inline instructions with function calls would add overhead without
+// capability. See Cap 23 (Battalions) for how peek/poke map to ISA
+// opcodes.
+//
+// For dynamic growable arrays (arr_new / arr_push / arr_get), see
+// bpp_array.bsm. For compile-time compiler-internal byte comparisons,
+// see bpp_internal.bsm (buf_eq, packed_eq).
 
 // Read an unsigned 8-bit value from buf at byte offset off.
 read_u8(buf, off) {
@@ -63,4 +86,87 @@ void write_u32(buf, off, val) {
 void write_u64(buf, off, val) {
     write_u32(buf, off, val & 4294967295);
     write_u32(buf, off + 4, (val >> 32) & 4294967295);
+}
+
+// ── Big-endian writes (symmetric with reads) ──
+//
+// PNG and network byte order are BE. We had reads (read_u16be,
+// read_u32be) without matching writes, forcing callers that want
+// to EMIT those formats to do the byte-swap by hand. Adding the
+// writes closes the asymmetry.
+
+void write_u16be(buf, off, val) {
+    poke(buf + off,     (val >> 8) & 255);
+    poke(buf + off + 1,  val       & 255);
+}
+
+void write_u32be(buf, off, val) {
+    poke(buf + off,     (val >> 24) & 255);
+    poke(buf + off + 1, (val >> 16) & 255);
+    poke(buf + off + 2, (val >> 8)  & 255);
+    poke(buf + off + 3,  val        & 255);
+}
+
+void write_u64be(buf, off, val) {
+    write_u32be(buf, off,     (val >> 32) & 4294967295);
+    write_u32be(buf, off + 4,  val        & 4294967295);
+}
+
+// Missing BE 64-bit read for completeness.
+read_u64be(buf, off) {
+    auto hi, lo;
+    hi = read_u32be(buf, off);
+    lo = read_u32be(buf, off + 4);
+    return hi * 4294967296 + lo;
+}
+
+// ── Static Raw Array — allocation and bulk ops ──
+//
+// Named wrappers over malloc / free / memset / memcpy so the caller
+// communicates intent via the `buf_*` prefix. The compiler inlines
+// these tiny helpers when it promotes them (feedback_codegen_discipline
+// inline of small `: base` helpers), so there is no runtime cost vs
+// calling malloc/free directly.
+
+// Allocate n raw bytes. Equivalent to malloc(n). Used when the
+// caller wants byte-level access (peek/poke) over a known-size region.
+// Canonical callers: pixel framebuffers, keyboard state, palette
+// buffers.
+buf_new(n) {
+    return malloc(n);
+}
+
+// Allocate n words (n * 8 bytes). Convenience for arrays of word-
+// sized elements where the caller uses *(buf + i * 8) for access.
+// Canonical callers: fixed-capacity pools, pointer arrays, entity
+// lists that never grow after init.
+buf_new_w(n) {
+    return malloc(n * 8);
+}
+
+// Free a buffer previously returned by buf_new or buf_new_w. Safe
+// on 0 (no-op). Returns 0 so callers can follow the canonical
+// "x = buf_free(x)" pattern that mirrors sb_free and arr_free.
+buf_free(buf) {
+    if (buf != 0) { free(buf); }
+    return 0;
+}
+
+// Fill n bytes starting at buf with a constant value. Inline byte
+// loop today — memset is not yet provided by the runtime (see
+// bpp_runtime.bsm; Phase D future). When memset lands in
+// _core_<os>.bsm, this body becomes a 1-line wrapper over it.
+// Parameter name is `val` (not `byte`) because `byte` is a reserved
+// B++ keyword (sub-word type annotation).
+void buf_fill(buf, val, n) {
+    auto i;
+    for (i = 0; i < n; i = i + 1) { poke(buf + i, val & 255); }
+}
+
+// Copy n bytes from src to dst. Wraps memcpy (which IS provided by
+// _core_<os>.bsm). Behavior is undefined if the regions overlap —
+// use buf_move for that (not yet provided; add when a real caller
+// needs it).
+void buf_copy(dst, src, n) {
+    memcpy(dst, src, n);
 }
