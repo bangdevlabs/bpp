@@ -552,16 +552,259 @@ Frontend, spine, battalions, runtime. How `src/` fits together.
 ## Cap 22 — Spine (bpp_codegen, dispatch)
 
 *Depends on: Cap 21*
-*Source: legacy_docs/phase_backend_closeout.md*
-*Status: PENDING*
+*Source: legacy_docs/phase_backend_closeout.md + new architectural content*
+*Status: DRAFT — conceptual body complete, recipe section pending*
+
+### The spine in one sentence
+
+**`src/bpp_codegen.bsm` is the portable tree-walker that turns the AST into a sequence of primitive operations. It decides WHAT needs to happen. Backends (Cap 23) decide HOW to encode it for a specific chip.**
+
+### Why a spine exists
+
+A naive compiler has one codegen file per target (x86, ARM, RISC-V, C emitter). Each one re-implements the complete recipe of how to walk an AST: visit literals, visit binary operators, visit calls, handle control flow, emit stack frames, evaluate arguments in the right order, push and pop, coerce types.
+
+The recipe is **95% identical across targets**. Only the final instruction at each leaf changes. Duplicating the recipe three or four times (as B++ did for most of its first year) means:
+
+- Every bug fix is triplicated — and two of the three copies drift out of sync over time.
+- Every new language feature (a new AST node, a new effect lattice edge) must be added in every backend.
+- Porting to a new chip is 2000+ lines of "rebuild the recipe."
+
+A spine consolidates the recipe. The spine in `src/bpp_codegen.bsm` walks the AST, builds up the argument-evaluation sequence, handles push/pop bookkeeping, tracks register state, and then calls a **chip primitive** for the single final instruction. Each chip implements ~50 primitives (add, sub, load, store, compare, branch, syscall, ...) and nothing more. Port RISC-V = implement 50 primitives. Not 2000 lines of rewritten recipe.
+
+### What the spine currently owns
+
+After Phase 3.4 (closed 2026-04-20), the spine owns every AST node type:
+
+- **Literals** — `T_LIT` (integer, string, float) dispatches through `cg_prim.emit_lit_int` / `emit_lit_str` / `emit_lit_float`.
+- **Variables** — `T_VAR`, `T_AUTO`, `T_STATIC`, `T_EXTRN`, `T_GLOBAL`. Dispatches through `cg_prim.emit_var_load` / `emit_var_store` / `emit_var_addr`.
+- **Operators** — `T_BINOP` and `T_UNARY`. Spine evaluates operands in canonical order (second first, push, first, pop), chip emits the final add/sub/shl/etc.
+- **Memory** — `T_MEMLD`, `T_MEMST`, `T_ADDR`. Typed loads and stores, chip emits the final ldr/str of the right width.
+- **Control flow** — `T_IF`, `T_WHILE`, `T_FOR`, `T_TERNARY`, `T_BREAK`, `T_CONTINUE`, `T_RET`. Spine emits the label plumbing; chip emits the branch instruction.
+- **Function calls** — `T_CALL`. Spine evaluates arguments, arranges them in ABI slots, calls the chip's `emit_call_full` to land the actual call instruction.
+- **Function definitions** — `cg_emit_func`. Spine emits prologue/arg-copy/body/teardown through chip primitives.
+
+### What the spine does NOT yet own (and needs to)
+
+**Inline builtin dispatch** — today, when the spine processes `T_CALL(peek, [addr])`, it passes the whole node to `emit_call_full` in each chip. Each chip then re-detects "oh, this is peek" by name, and emits the inline instruction instead of a real call. The detection logic is triplicated (Cap 23 shows the three copies).
+
+The correct architecture: the spine detects the builtin name, orchestrates argument evaluation, and then calls a chip primitive for just the final instruction. This is **Wave 18**, described in detail in Cap 23.
+
+### The full dispatch path for a simple call (pre-Wave 18)
+
+```
+parser: "peek(0x1000)" is parsed as T_CALL node with .a = "peek", .b = [lit_0x1000]
+          │
+          ▼
+spine cg_emit_node sees T_CALL
+          │
+          ▼
+delegates to chip's emit_call_full(node)
+          │
+          ▼
+chip's emit_call_full checks: "is n.a == 'peek'? 'poke'? 'sys_write'? ..."
+          │           (43 branches — one per builtin)
+          ▼
+chip emits inline load/store/syscall instruction
+```
+
+Three chips, three copies of that 43-branch ladder. Each branch duplicates "evaluate arg, push, evaluate next, pop, emit final instruction."
+
+### The Wave 18 architecture (target)
+
+```
+parser: same T_CALL node
+          │
+          ▼
+spine cg_emit_node sees T_CALL
+          │
+          ▼
+spine's cg_builtin_dispatch(n) checks name against central table (43 entries)
+          │      If match: spine evaluates args through cg_emit_node,
+          │      push/pops via cg_prim, calls primitive for final instruction
+          ▼
+chip's emit_mem_read(width=1) emits ONE instruction: ldrb w0, [x0]   (or x86's mov al, [rax], or C's *(uint8_t*)...)
+```
+
+One dispatch table. ~10 chip primitives. Bug fixes, new builtins, and new backends all consolidated.
+
+### The contract
+
+Every chip backend exposes a struct of function pointers (`ChipPrimitives` in `bpp_codegen.bsm`). The spine calls through the struct; the chip provides the implementations. Adding a new chip = fill in the struct. Removing a chip = delete the file. The spine never changes.
 
 ---
 
 ## Cap 23 — Battalions (chip backends)
 
 *Depends on: Cap 22*
-*Source: legacy_docs/max_plan_codegen_split.md*
-*Status: PENDING*
+*Source: legacy_docs/max_plan_codegen_split.md + new architectural content (Wave 18 recipe)*
+*Status: DRAFT — body complete through Wave 18 recipe, legacy historical context pending absorption*
+
+### Battalions in one sentence
+
+**Each chip backend (`src/backend/chip/<chip>/`) translates the spine's abstract primitive operations into the actual byte sequences the chip's ISA understands. They do ONE thing: encode instructions.**
+
+### The current state (pre-Wave 18)
+
+Three battalions exist:
+
+| Battalion | Files | Targets |
+|-----------|-------|---------|
+| `aarch64` | `a64_codegen.bsm`, `a64_primitives.bsm`, `a64_enc.bsm` | ARM64 native (macOS M-series, Linux ARM servers) |
+| `x86_64`  | `x64_codegen.bsm`, `x64_primitives.bsm`, `x64_enc.bsm` | x86_64 Linux |
+| `c`       | `bpp_emitter.bsm` | Emits C source (compiled by clang/gcc for any target the host C compiler supports) |
+
+### The inline builtin duplication problem
+
+Every backend has a ladder inside its `emit_call_full` (or equivalent) that looks like this:
+
+```c
+// Copy 1 of 3 (aarch64) — src/backend/chip/aarch64/a64_codegen.bsm:832
+if (cg_str_eq(n.a, "peek", 4)) {
+    arr = n.b;
+    ety = a64_emit_node(*(arr + 0));
+    if (ety == 1) { enc_fcvtzs(0, 0); }
+    enc_ldrb_uoff(0, 0, 0);               // ← THE ONLY CHIP-SPECIFIC BIT
+    return 0;
+}
+
+// Copy 2 of 3 (x86_64) — src/backend/chip/x86_64/x64_codegen.bsm:566
+if (cg_str_eq(n.a, "peek", 4)) {
+    arr = n.b;
+    ety = x64_emit_node(*(arr + 0));
+    if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
+    x64_enc_loadb(0, 0, 0);               // ← THE ONLY CHIP-SPECIFIC BIT
+    return 0;
+}
+
+// Copy 3 of 3 (C emitter) — src/backend/c/bpp_emitter.bsm:675
+if (emit_name_eq(name_p, "peek", 4)) {
+    out("((long long)(*(uint8_t*)((uintptr_t)(");
+    if (cnt > 0) { emit_node(arr[0]); }
+    out("))))");                          // ← THE ONLY C-SPECIFIC BIT
+    return;
+}
+```
+
+The detection logic ("is this peek?"), argument evaluation, float-to-int coercion, push/pop, and stack management are **structurally identical across all three**. Only the final line (the `enc_ldrb`, `x64_enc_loadb`, or `out("((uint8_t*)...)")`) actually differs. 43 builtins × 3 backends = **~130 near-duplicate code blocks**.
+
+This is the single largest architectural wart in B++'s current compiler. Every bug fix or new builtin has to touch three files. New backend port costs 2000+ lines of rebuilt recipe.
+
+### Wave 18 — the lift
+
+The fix is conceptually simple: move the detection + argument orchestration into the spine (Cap 22), leave only the chip-specific instruction at each leaf.
+
+**Before Wave 18** — `emit_call_full` is a 43-branch ladder, triplicated:
+
+```c
+// a64_codegen.bsm::emit_call_full
+if (is_peek) { eval args, push/pop, enc_ldrb; return; }
+if (is_poke) { eval args, push/pop, enc_strb; return; }
+if (is_sys_write) { eval x3, enc_svc; return; }
+// ... 40 more ...
+// real function call
+enc_bl(...);
+```
+
+**After Wave 18** — `emit_call_full` is a 2-line router, each chip has a ~10-function primitive IR:
+
+```c
+// spine bpp_codegen.bsm::cg_emit_call
+cg_emit_call(n) {
+    if (cg_builtin_dispatch(n)) { return; }
+    return cg_prim.emit_call_full(n);     // real call path
+}
+
+// spine bpp_codegen.bsm::cg_builtin_dispatch
+cg_builtin_dispatch(n) {
+    if (cg_str_eq(n.a, "peek", 4)) {
+        cg_emit_node(n.b[0]);
+        cg_coerce_float_to_int();
+        cg_prim.emit_mem_read(1);         // chip emits ldrb / loadb / *uint8_t*
+        return 1;
+    }
+    if (cg_str_eq(n.a, "poke", 4)) {
+        cg_emit_node(n.b[1]);             // val
+        cg_coerce_float_to_int();
+        cg_emit_push();
+        cg_emit_node(n.b[0]);             // addr
+        cg_coerce_float_to_int();
+        cg_emit_pop_scratch();
+        cg_prim.emit_mem_write(1);        // chip emits strb / storeb / *uint8_t*= 
+        return 1;
+    }
+    // ... 41 more names, each one handler ...
+    return 0;
+}
+
+// a64_primitives.bsm — only the ISA-specific instructions
+void a64_emit_mem_read(width) {
+    if (width == 1) { enc_ldrb_uoff(0, 0, 0); }
+    if (width == 2) { enc_ldrh_uoff(0, 0, 0); }
+    if (width == 4) { enc_ldr_w_uoff(0, 0, 0); }
+    if (width == 8) { enc_ldr_uoff(0, 0, 0); }
+}
+// (and 9 more primitives — emit_mem_write, emit_syscall, emit_shift_right, ...)
+```
+
+### The 10-primitive surface every battalion exposes
+
+Wave 18's proof set identifies the minimum primitive IR that covers the 43 builtins:
+
+| Primitive | Purpose | Example instructions |
+|-----------|---------|---------------------|
+| `emit_load_imm(slot, imm)` | Load an integer literal into a register slot | `mov rax, imm` / `movz x0, imm` |
+| `emit_push_acc()` | Push accumulator (slot 0) onto stack | `push rax` / `str x0, [sp, -16]!` |
+| `emit_pop_scratch()` | Pop top of stack into scratch (slot 1) | `pop rcx` / `ldr x1, [sp], 16` |
+| `emit_mem_read(width)` | Load `width` bytes from `[acc]` into acc | `mov al, [rax]` (w=1) / `ldrb w0, [x0]` |
+| `emit_mem_write(width)` | Store `width` bytes from scratch into `[acc]` | `mov [rax], cl` (w=1) / `strb w1, [x0]` |
+| `emit_shift_right()` | `acc = acc >> scratch` | `shr rax, cl` / `lsr x0, x0, x1` |
+| `emit_barrier()` | Memory barrier | `mfence` / `dmb ish` |
+| `emit_syscall(argc)` | Issue syscall with argc args | `syscall` / `svc 0x80` |
+| `emit_assert(kind)` | Crash with diagnostic | `int3` / `brk 0` |
+| `emit_fn_ptr(name_packed)` | Load function address into acc | `lea rax, [rip + sym]` / `adrp x0, sym` |
+| `emit_argv_slot(which)` | Load argc/argv/envp from saved slot | `mov rax, [rbp - N]` / `ldr x0, [x29, N]` |
+
+Most builtins map to 1 or 2 of these primitives. `peek` is `emit_mem_read(1)` after arg eval. `poke` is `emit_mem_write(1)` after eval+push+eval+pop. `sys_write` is three arg evals + `emit_syscall(3)`.
+
+### Recipe: how to lift a builtin (`peek` as worked example)
+
+Every builtin lift follows the same 8 steps. First time through takes ~30 minutes; subsequent builtins ~10 minutes. All intermediate steps must preserve byte-identity of the compiled `bpp` binary.
+
+**Step 1 — Extract the chip-specific piece as a named primitive.**
+In `a64_primitives.bsm`, add `void a64_emit_mem_read(width) { if (width == 1) { enc_ldrb_uoff(0, 0, 0); } ... }`. Still unused. Bootstrap. `gen1 == gen2` expected (pure addition, no caller). ✓
+
+**Step 2 — Same for x64.**
+In `x64_primitives.bsm`, add `void x64_emit_mem_read(width) { if (width == 1) { x64_enc_loadb(0, 0, 0); } ... }`. Bootstrap + Docker (x86 backend change). ✓
+
+**Step 3 — Same for C emitter.**
+In `bpp_emitter.bsm`, add `void c_emit_mem_read(width) { if (width == 1) { out("((long long)(*(uint8_t*)((uintptr_t)("); } ... }`. Bootstrap. ✓
+
+**Step 4 — Wire the primitive into ChipPrimitives struct.**
+Add `emit_mem_read` field to `ChipPrimitives` in `bpp_codegen.bsm`. Each chip binds it in `cg_bind_chip_primitives`. Bootstrap. `gen1 == gen2` (still unused). ✓
+
+**Step 5 — Add `cg_builtin_dispatch` to spine with empty table.**
+In `bpp_codegen.bsm`, add the function. Call it from `cg_emit_call` before the chip's `emit_call_full`. Empty table — every call still falls through to the chip's own ladder. Bootstrap. `gen1 == gen2`. ✓
+
+**Step 6 — Add `peek` entry to the spine dispatch table.**
+Spine now handles `peek` itself. The chip's old `peek` branch becomes dead code (unreachable because spine caught the name first). Bootstrap. `gen1 == gen2` expected — the EMITTED bytes are identical; only which codepath produced them changed. ✓
+
+**Step 7 — Delete the chip-specific `peek` branches.**
+In `a64_codegen.bsm`, `x64_codegen.bsm`, `bpp_emitter.bsm` — remove the `if (cg_str_eq(n.a, "peek", 4)) { ... }` block. Three deletions in three commits, one bootstrap each. `gen1 == gen2`. ✓
+
+**Step 8 — Write the test.**
+`tests/test_builtin_peek_lifted.bpp` — a program that exercises `peek` across types (int, float-coerced, nested expressions) and asserts expected bytes. This becomes the regression guard for the lifted dispatch.
+
+### Abort conditions specific to Wave 18
+
+- **`gen1 != gen2` at any lift step** — the dispatch reordering accidentally changed emitted bytes. Bug in the spine's push/pop ordering or float coercion. Revert, investigate with `bug --dump-str` on both binaries to locate where the byte streams diverge.
+- **Docker x86_64 diverges from macOS ARM** — primitive IR is inconsistent between chips (one chip expects acc-in-slot-0, another expects stack-top). Stop all lifts, reconcile the primitive contract first.
+- **A builtin does not fit the 10-primitive surface** — some syscalls need more arguments than `emit_syscall(argc)` handles cleanly. Allow chip-local dispatch for that specific builtin; document it as a "divergent" builtin in this chapter with justification. Not every lift has to succeed.
+
+### Why this chapter matters more than any other
+
+The whole book describes B++'s architecture. This chapter describes **the piece that was built ad-hoc first and rearchitected last**. Every other part of the compiler landed reasonably clean from the start. The builtin dispatch accumulated 43 near-duplicate code paths across three backends before anyone had the vocabulary to name why that was a problem.
+
+"Make it work, make it right" — this chapter is the "make it right" arc for the most-reviewed and most-touched code in the entire compiler. If B++ ships 1.0 with the dispatch still triplicated, that wart outlives the language. Wave 18 closes it.
 
 ---
 
