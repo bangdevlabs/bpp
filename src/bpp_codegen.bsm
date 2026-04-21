@@ -276,6 +276,10 @@ struct ChipPrimitives {
     // the full recipe and a worked peek example.
     emit_node,          // (node)  → ety (0 int, 1 float)
     emit_mem_read,      // (width) — load `width` bytes at [acc] into acc
+    emit_mem_read_indexed, // (width) — load `width` bytes at [acc + scratch] into acc
+    emit_mem_write,     // (val_reg, width) — store `width` bytes from val_reg into [acc]
+    emit_push_acc,      // () — push accumulator onto stack
+    emit_pop_scratch,   // () — pop stack top into scratch reg (x1/rcx)
     emit_coerce_float_to_int, // () — truncate float accumulator to int
 }
 
@@ -962,6 +966,37 @@ cg_builtin_dispatch(n) {
         ety = call(p.emit_node, *(arr + 0));
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_mem_read, 1);
+        return 1;
+    }
+
+    // Built-in: poke(addr, val) — store one byte at [addr].
+    // Eval order: val → push → addr → pop val into scratch (x1/rcx) → store.
+    // Same sequence as the chip ladders preserved verbatim.
+    if (cg_str_eq(n.a, "poke", 4)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // val
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));  // addr
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);
+        call(p.emit_mem_write, 1, 1);          // val_reg=1 (scratch) width=1
+        return 1;
+    }
+
+    // Built-in: str_peek(s, i) — byte at s[i]. Same semantic as
+    // peek(s + i) but carries the pure-effect annotation the smart
+    // dispatcher uses for parallel-for eligibility.
+    // Eval: idx → push → base → pop idx into scratch → indexed read.
+    if (cg_str_eq(n.a, "str_peek", 8)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // idx
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));  // base
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);
+        call(p.emit_mem_read_indexed, 1);
         return 1;
     }
 
