@@ -76,6 +76,39 @@ against the jedi handoff canaries. Full write-up in
   (8 control-flow primitives — first wave with real chip-code
   shrink, **−198 LOC net**)
 
+### Shipped 2026-04-20 (night) — Wave 9b steps A.1 + A.2
+
+Third session picked up `docs/phase_final_activation.md` and
+shipped the first two safe steps of Wave 9b's 4-step plan.
+Full write-up in `docs/journal.md`.
+
+- ✅ A.1 (commit fda6dac) — T_CALL extracted to chip-local
+  helpers `a64_emit_call(n)` / `x64_emit_call(n)`. Pure
+  refactor, byte-identity trivially preserved.
+- ✅ A.2 (commit 258b5e5) — real bodies for
+  `_a64_emit_call_extern` + `_x64_emit_call_extern`. Caller-
+  saved primitives stay as stubs (doc's prediction: no-op).
+
+**Next session (final activation)** — 4-5h budget:
+
+- A.3 — Write `cg_emit_call(n)` in `bpp_codegen.bsm` per doc's
+  50-line pseudo-code. Uses the 14 Wave 9 primitives already
+  wired.
+- A.4 — Flip chip T_CALL dispatch. Split extracted helpers
+  into builtin-first path (peek, poke, sizeof, float_ret[2],
+  shr, assert, str_peek, sys_*) + non-builtin through spine.
+- Commit B — Mirror the pattern for emit_func (spine flip
+  `cg_emit_func`). Decide frame-math unification vs
+  `chip_compute_frame` primitive.
+- Commit C (optional) — Waves 16/17 cg_emit_module + cg_emit_all.
+
+Canary hashes locked for 16 commits straight:
+```
+pathfind  50caa64bfa7f4476d0780c5857304db66176d852
+rhythm    3d4f424b2ae7071110d8962750aaa700f2c57009
+bang9     7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
+```
+
 ### Shipped 2026-04-20 (evening) — Backend closeout scaffolding
 
 Following the Phase 3.4 close, the user pointed at

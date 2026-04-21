@@ -1,5 +1,98 @@
 # B++ Bootstrap Journal
 
+## 2026-04-20 — Wave 9b steps A.1 + A.2 (T_CALL extraction + extern bodies)
+
+Third session of the 2026-04-20 backend push. After the jedi's
+Phase 3.5 activation at 914ebf6, this session picked up the
+final activation doc (phase_final_activation.md) and shipped
+the two lowest-risk steps of Wave 9b's 4-step plan.
+
+**Commits**
+
+```
+258b5e5  Wave 9b step A.2 — real call_extern primitive bodies
+fda6dac  Wave 9b step A.1 — T_CALL extracted to chip-local helper
+```
+
+**A.1 — T_CALL extracted to chip-local helper** (pure refactor).
+The 770-line T_CALL body in a64_emit_node and the 615-line
+equivalent in x64_emit_node were moved into new static
+functions `a64_emit_call(n)` and `x64_emit_call(n)`. The
+emit_node case became a one-line delegate. Byte-identity
+trivially preserved — pure function extraction, no logic
+change. Done via `sed` surgery (extract body lines + assemble
+new file with forward decl + function block) to avoid manually
+moving 770+615 lines through Read/Edit turns.
+
+**A.2 — Real bodies for call_extern primitives.** Filled the
+stubbed `_a64_emit_call_extern` + `_x64_emit_call_extern`
+with the exact patterns from the extracted helpers. a64 uses
+GOT-anchored FFI via adrp+ldr+blr with reloc type 3; x64 uses
+call-rel32 with reloc type 4. Both save xmm0/xmm1 to rbp-
+relative scratch slots so float_ret()/float_ret2() builtins
+can recover FFI float returns.
+
+The save_caller_saved_int + restore_caller_saved_int
+primitives stay as empty stubs. The doc's risk #3 predicts
+these are no-ops in the current B++ register model (B3-
+promoted regs are callee-saved via prologue/epilogue;
+freelist manages scratch; nothing is live across a call
+that needs explicit save). Next session's Step A.3 will
+verify empirically when cg_emit_call activates the primitives.
+
+**What remains for the final activation session**
+
+Steps A.3, A.4, and Commit B:
+
+- **A.3** — Write `cg_emit_call(n)` in `bpp_codegen.bsm`.
+  The doc has a 50-line pseudo-code in §COMMIT A Step A.3.
+  Walks args, dispatches through `cg_prim.arg_reg_int` +
+  `emit_push_arg_int` + `emit_call_direct/extern` + pre/post
+  alignment + save/restore_caller_saved.
+
+- **A.4** — Flip chip dispatch. Currently each chip's T_CALL
+  case delegates to the extracted `<chip>_emit_call(n)` helper.
+  Need to split that helper into two paths: builtins
+  (~10 names: peek, poke, sizeof, float_ret[2], shr, assert,
+  str_peek, sys_write, sys_read, possibly more) stay chip-
+  local; everything else routes through `cg_emit_call(n)` in
+  the spine. Budget the builtin catalog ~30m per doc's
+  surprise #1.
+
+- **Commit B** — Spine flip `cg_emit_func`. After T_CALL is
+  activated, mirror the pattern for emit_func: portable
+  cg_emit_func in spine + one-line delegate in chip. Frame
+  math divergence (surprise #2) is the decision point.
+
+- **Commit C** — Optional Waves 16/17 cleanup.
+
+**Why stop here**
+
+A.1 + A.2 are byte-identity-trivial. A.3 + A.4 require
+careful integration (builtin catalog preserving semantics,
+arg-eval-order edge cases, caller-saved empirical check).
+Attempting those in remaining session context risks a bad
+ship. Stopping at a proven-stable checkpoint lets the next
+session pick up the extracted helper functions (which are
+now chip-local + well-typed) and write the spine + flip
+dispatch in one focused pass.
+
+**End-of-session state**
+
+```
+HEAD                    258b5e5  Wave 9b step A.2
+bpp_codegen.bsm            885   (unchanged — A.3 will add cg_emit_call)
+a64_codegen.bsm           2635   (+11: T_CALL body moved to chip helper)
+a64_primitives.bsm         807   (+13: call_extern real body)
+x64_codegen.bsm           1972   (+11: T_CALL body moved)
+x64_primitives.bsm         423   (+9: call_extern real body)
+
+Canary hashes (immutable for 16 commits now):
+  pathfind  50caa64bfa7f4476d0780c5857304db66176d852
+  rhythm    3d4f424b2ae7071110d8962750aaa700f2c57009
+  bang9     7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
+```
+
 ## 2026-04-20 — Backend closeout scaffolding: Wave 9 + Phase 3.5/4 contract surface
 
 Continuation of the same day. After the 12-wave Phase 3.4
