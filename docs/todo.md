@@ -76,6 +76,30 @@ against the jedi handoff canaries. Full write-up in
   (8 control-flow primitives — first wave with real chip-code
   shrink, **−198 LOC net**)
 
+### 🏁 Shipped 2026-04-20 (late night) — Backend Forth-portable
+
+Final activation session closed Wave 9b (T_CALL) + Commit B
+(cg_emit_func) via the fat-primitive pattern. `cg_emit_node`
+and `cg_emit_func` both live in `bpp_codegen.bsm` and dispatch
+through `cg_prim` to chip implementations. Backend is now
+truly portable. Full celebratory write-up in `docs/journal.md`.
+
+- ✅ Wave 9b A.1 (fda6dac) — T_CALL extracted to chip-local helper
+- ✅ Wave 9b A.2 (258b5e5) — call_extern real body
+- ✅ Wave 9b A.3+A.4 (46a2702) — cg_emit_call spine + T_CALL dispatch flip
+- ✅ Commit B (be275f8) — cg_emit_func spine flip
+- 📌 Commit C (Waves 16/17) — skipped per doc's "low marginal value"
+
+**Status: Phase 3.4 arc complete.** RISC-V port unblocked as
+leaf task. Install chameleon leaf task. Alien-parasite vision
+foundation laid.
+
+**Next session targets** (separate session each):
+- Phase 5 — RISC-V port: `riscv_enc.bsm` + `riscv_primitives.bsm`
+- Phase 6 — `install.sh` chameleon: auto-detect host chip + cross-compile
+- Fine-grained T_CALL primitive activation (future optimization)
+- Waves 16/17 spine flip (if bpp.bpp's caller dispatch ever unfreezes)
+
 ### Shipped 2026-04-20 (night) — Wave 9b steps A.1 + A.2
 
 Third session picked up `docs/phase_final_activation.md` and

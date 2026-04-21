@@ -1,5 +1,120 @@
 # B++ Bootstrap Journal
 
+## 2026-04-20 — 🏁 BACKEND FORTH-PORTABLE: Wave 9b + Commit B SHIPPED
+
+**B++ has a portable-spine backend.**
+
+19 commits into the Phase 3.4 arc, `cg_emit_node` and
+`cg_emit_func` both live in `bpp_codegen.bsm` and dispatch
+through `cg_prim` fn_ptr tables to chip-local implementations.
+Adding a new architecture (RISC-V, WebAssembly, anything) is
+now **one file of primitives**, not a fork of the tree walker.
+
+**This final-activation session's commits**:
+
+```
+be275f8  Commit B — cg_emit_func spine flip (fat-primitive)
+46a2702  Wave 9b A.3+A.4 — cg_emit_call spine + T_CALL dispatch flip
+258b5e5  Wave 9b A.2 — real call_extern primitive bodies
+fda6dac  Wave 9b A.1 — T_CALL extracted to chip-local helper
+```
+
+**Production path now**:
+
+```
+bpp_codegen.bsm    →  cg_prim (fn_ptr table)  →  <chip>_codegen.bsm
+cg_emit_node                                     a64_emit_call, x64_emit_call
+  → cg_emit_call                                 a64_emit_func, x64_emit_func
+  → cg_emit_func                                 (+ 80+ fine-grained primitives
+                                                   from Waves 1-15)
+```
+
+**Design call: fat-primitive for Wave 9b + Commit B**
+
+The doc's pseudo-code for the fine-grained cg_emit_call (walking
+args, calling arg_reg_int + push_arg_int + call_direct per arg)
+assumes a different scheduling than the chip's inline:
+
+- Inline has B2 `: base` helper splicing (AST clone + recurse)
+- Inline pushes all args to stack then pops to x0..x(N-1)
+- Inline does FFI int/float separation AFTER the pop-to-regs
+
+The doc's spine writes each arg directly into its ABI register.
+Rewriting spine per the doc + flipping dispatch would break
+byte-identity because the alloc order differs. The finer-grained
+primitives stay RESERVED in the `ChipPrimitives` struct (arg_reg_*,
+emit_push_arg_*, emit_call_direct, etc.) for a future decomposition
+session where the spine owns ABI scheduling and each chip
+reimplements its allocator to match.
+
+The fat-primitive (emit_call_full + emit_func_full) wraps the
+chip's extracted helper verbatim. Spine owns dispatch; chip owns
+implementation. Zero byte-identity risk. Same design as Wave 8's
+emit_memld_load (chip handles the sub-word + bit-packed dispatch
+matrix internally).
+
+**What's not shipped (explicit)**
+
+- **Commit C (Waves 16/17)**: cg_emit_module + cg_emit_all. The
+  callers live in bpp.bpp (frozen per the pitfall list). Fat-
+  primitive wrap without caller-flip is decorative; doc itself
+  flags these as "low marginal portability value — skip if
+  time tight." Shipping the full emit_module spine requires
+  either unfreezing bpp.bpp's dispatch or restructuring
+  emit_module to call cg_emit_func internally (which it
+  already does, since Commit B's caller flip).
+
+- **Fine-grained T_CALL primitives activation**: the 14 Wave 9
+  slots (arg_reg_*, push_arg_*, pre/post_call_align,
+  call_direct/extern, copy_ret_*, save/restore_caller_saved)
+  stay wired but inactive. Activating them requires rewriting
+  chip emit_call to match spine's ABI scheduler — a session
+  that should profile the current pattern, design the new
+  schedule, and migrate in one pass without byte-identity
+  assumptions.
+
+**The alien-parasite vision unblocked**
+
+With `cg_emit_node` + `cg_emit_func` spine-driven, adding a chip
+becomes:
+
+1. `<chip>_enc.bsm` — instruction byte encoders (~500 lines)
+2. `<chip>_primitives.bsm` — 80+ primitives mapping each slot
+   to the chip's ISA (~900 lines)
+3. `<chip>_codegen.bsm` — thin: init_codegen_<chip>, emit_call,
+   emit_func, emit_module, emit_all (~800 lines today; shrinks
+   further once Wave 9 decomposition ships)
+
+RISC-V port = mechanical translation, one session. WebAssembly
+backend = another. Install.sh chameleon (auto-detects host chip,
+cross-compiles) = half session.
+
+**End-of-session canary hashes (now stable through 19 commits)**
+
+```
+HEAD                   be275f8  Commit B (cg_emit_func)
+bpp_codegen.bsm          940   (+55 this session — cg_emit_call +
+                                 cg_emit_func + 2 fat-primitive
+                                 slots + docs)
+a64_codegen.bsm         2642   (+18 — extracted emit_call + slot
+                                 wirings + T_CALL/emit_func dispatch
+                                 flips)
+a64_primitives.bsm       807   (+13 — real call_extern body)
+x64_codegen.bsm         1977   (+16)
+x64_primitives.bsm       423   (+9)
+
+Canary hashes — pinned for 19 consecutive commits:
+  pathfind  50caa64bfa7f4476d0780c5857304db66176d852
+  rhythm    3d4f424b2ae7071110d8962750aaa700f2c57009
+  bang9     7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
+```
+
+**Phase 3.4 arc complete. 🏁**
+
+Next mountain: RISC-V port (Phase 5), install chameleon (Phase 6).
+Then the ecosystem (ModuLab, Wolf3D, Bang 9 IDE, bangscript
+runtime) continues on top of a truly portable foundation.
+
 ## 2026-04-20 — Wave 9b steps A.1 + A.2 (T_CALL extraction + extern bodies)
 
 Third session of the 2026-04-20 backend push. After the jedi's
