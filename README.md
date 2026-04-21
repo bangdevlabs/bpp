@@ -1,5 +1,9 @@
 # B++
 
+> **Read the book**: [`docs/how_to_dev_b++.md`](docs/how_to_dev_b++.md) — single unified manual, 28 chapters, 6 parts.
+> Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
+> Everything you need in one file. No other canonical doc.
+
 ### B++ 0.78 — Tool Infra Lands: Dialogs, Alerts, Text Input, JSON, UI Widgets — 19 April 2026
 
 A self-hosting compiled language with **games that hear themselves**. Snake now plays a drum loop recorded live inside mini_synth — the polyphonic synthesizer built in the same language — while a fresh in-code 880 Hz SFX fires every time it eats an apple. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and the industry-standard text-file beat-map format.
@@ -534,7 +538,8 @@ b++/
 ├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/                    — Backend drivers (SDL2, raylib — optional)
 ├── tests/                      — Compiler and library tests (74 passing)
-├── docs/                       — The book (the_b++_programming_language.md), dev guide (how_to_dev_b++.md), journal, TODO, debug_with_bug
+├── docs/                       — The unified book (how_to_dev_b++.md, 28 chapters) + journal + TODO
+├── legacy_docs/                — Source material being absorbed into the book. Read-only during consolidation faxina. Deleted when absorption is complete.
 ├── bpp                         — The compiler binary
 └── bug                         — The debugger binary
 ```
@@ -682,7 +687,7 @@ B++ is 30 days old. The following are the milestones, in order:
 | **Apr 18** | **`bpp_path` + auto-inject promotion + the dog-food loop closed**. New `src/bpp_path.bsm` resolves asset paths relative to `argv[0]` with upward filesystem probe — games run from any directory without breaking relative paths. `bpp_arena` + `bpp_path` promoted to auto-inject (every user program gets them for free). `sound_load_wav` rewritten into a proper chunk scanner: PCM 8/16/24/32, IEEE float 32, mono-to-stereo auto-expand, skips LIST/INFO chunks. `stbsound`/`stbimage`/`stbfont` now emit stderr diagnostics on asset load failure (format code, bit depth, missing chunks, not-a-PNG) — programmer no longer cegos quando um asset some. `games/rhythm/` ships as a real rhythm-genre prototype: beat_map text loader, menu + play (demo/transition/play phases) + results scenes, teacher character drawn in primitives, hit windows ±20ms perfect / ±60ms ok. `games/snake/snake_maestro.bpp` loads `snake_loop.wav` (recorded in mini_synth) as background music and fires an in-code 880 Hz square-wave burst on apple-eat — **a cobra comeu o próprio rabo**: B++ producing content for B++ games, end to end. |
 | **Apr 19** | **Tool infrastructure — the ModuLab-ready bundle**. Four modules land in one day as pre-work for the ModuLab pixel-editor port: **`stbwindow`** (new, 150 lines) — native `NSSavePanel` / `NSOpenPanel` save/open dialogs + `NSAlert` info/confirm/error dialogs, all blocking `runModal` calls wrapped as `window_*` public API. **`stbinput`** extension — per-frame printable-character ring (64-byte capacity, cleared each frame) populated from `-[NSEvent characters]` and consumed via `input_text_len()` / `input_text_char(i)`. **`src/bpp_json.bsm`** (new, ~800 lines) — full JSON reader + writer with chunk-scanning parser, objects, arrays, strings (with escape sequences + \uXXXX → UTF-8), ints, bools, null, typed accessor convenience (`json_object_get_int/string/bool` with defaults), explicit per-container child-index lists (no contiguous-node assumption). Two internal bugs caught along the way: null-terminator accounting in the string intern (`"name"` lookup failed because next intern overwrote the terminator) and non-contiguous children layout (recursive-descent interleaves descendants between siblings, so containers need explicit child-index arrays). **`stbui`** extensions — `gui_text_input` with click-to-focus + backspace + Enter commit, `gui_grid` cell picker with hover highlight + click dispatch, `gui_palette` swatch selector. New `TextInput` struct with `text_input_new` / `text_input_set` / `text_input_clear` lifecycle. Window positioning bug fixed (games spawned bottom-left; added `-[NSWindow center]` before show). Suite 75 → 78 passing. |
 
-B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into `docs/how_to_dev_b++.md` as canonical rule, and the language itself is documented K&R-style in `docs/the_b++_programming_language.md`. Adding a new chip, OS, or feature follows the same pattern the existing code does.
+B++ went from "parser that parses itself" to "musical instrument you can play" in thirty days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into [`docs/how_to_dev_b++.md`](docs/how_to_dev_b++.md), the unified book that absorbs the previously fragmented programming-language reference, dev guide, and Bang 9 design docs into a single 28-chapter manual. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 
 The version number is the test count. When the test count reaches the point where a complete indie retro game ships end-to-end in pure B++, that's 1.0.
 

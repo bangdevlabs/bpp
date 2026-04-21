@@ -49,10 +49,7 @@ with `bpp --c src/bpp.bpp > bootstrap.c`.
 ### 1.2 Hello World
 
     main() {
-        putchar('H');
-        putchar('i');
-        putchar('\n');
-        return 0;
+        print_msg("Hello, World");
     }
 
 Compile and run:
@@ -60,9 +57,31 @@ Compile and run:
     bpp hello.bpp -o hello
     ./hello
 
-This prints `Hi` followed by a newline. `putchar` writes one byte
-to standard output. There are no format strings and no `printf` —
-you build what you need from bytes.
+Three lines. No `import`, no `return 0`. B++ auto-injects the
+`bpp_io` module into every program, so `print_msg` (write a string
++ newline to stdout), `print_int` (write a signed integer), and
+`print_ln` (just a newline) are always in scope. `main` returns 0
+implicitly when you omit the `return`.
+
+If you need byte-level output, `putchar(c)` writes a single byte
+to stdout and is equally always-available:
+
+    main() {
+        putchar('H');
+        putchar('i');
+        putchar('\n');
+    }
+
+There are no format strings and no `printf`. To interpolate a
+number, chain the helpers:
+
+    print_msg("score: ");
+    print_int(score);
+    print_ln();
+
+Verbose on purpose — you see exactly which bytes leave the
+program. Format strings are a convenience layer B++ deliberately
+skips in favour of composable primitives.
 
 ### 1.3 A First Game
 
