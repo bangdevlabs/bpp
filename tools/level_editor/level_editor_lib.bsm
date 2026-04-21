@@ -1,0 +1,493 @@
+// level_editor_lib.bsm — embeddable level editor library.
+//
+// Tilemap painter companion to ModuLab, factored as a panel
+// library so Bang 9 (and any other host) can render the editor
+// inside its own window without spawning a subprocess.
+//
+// Public API (mirrors modulab_lib's three-function shape):
+//
+//   level_editor_lib_init(initial_name)
+//       Allocate state. Host owns the window — caller MUST have
+//       already done game_init().
+//
+//   level_editor_lib_frame(px, py, pw, ph)
+//       Draw + handle input for one frame inside the rect
+//       (px, py, pw, ph). Returns 1 if the embedded editor
+//       requested quit (ESC), 0 otherwise.
+//
+//   level_editor_lib_shutdown()
+//       Free state. Idempotent.
+//
+// All hardcoded coordinates inside the frame body are shifted
+// by the panel origin so the editor renders correctly in any
+// rectangular region the host carves out for it. Mouse coords
+// stay window-absolute because the canvas origin globals
+// (_lvl_cvs_x / _lvl_cvs_y) are also window-absolute after the
+// shift, keeping the cursor → cell math identical to the
+// standalone version.
+//
+// See docs/bang9_tool_embed.md for the embed contract.
+
+// ── Globals ──────────────────────────────────────────────
+
+// Panel rect captured at the top of every level_editor_lib_frame
+// call. Helpers read these so they don't need to thread
+// (px, py, pw, ph) through every signature.
+static extrn _le_ox, _le_oy, _le_pw, _le_ph;
+
+const LVL_W = 40;
+const LVL_H = 22;
+const LVL_CELL = 16;
+
+static extrn _lvl_tiles;           // Layer* — palette-indexed byte grid
+                                    // exposed by stbdraw. Level editor
+                                    // uses only the canvas surface
+                                    // (layer_get / layer_set / layer_fill /
+                                    // layer_clear) plus raw .fb access
+                                    // when copying whole-grid snapshots
+                                    // in / out of the undo ring.
+static extrn _lvl_palette;         // 8 ARGB ints (8-byte stride)
+static extrn _lvl_sel;             // selected palette index (1..7)
+static extrn _lvl_tool;            // 0 paint, 1 erase, 2 fill
+static extrn _lvl_dirty;
+
+// Undo ring — classical snapshot (cheap at LVL_W*LVL_H = 880
+// bytes per slot, 32 slots = 28 KB). Delta would be overkill.
+const LVL_UNDO_MAX = 32;
+static extrn _lvl_undo_ring;       // LVL_UNDO_MAX * LVL_W * LVL_H bytes
+static extrn _lvl_undo_len;
+static extrn _lvl_undo_cursor;
+
+// Filename — TextInput widget from stbui + backing buffer.
+static extrn _lvl_name_ti;
+static extrn _lvl_name_buf;
+
+// Canvas origin (for future zoom/pan; kept simple for MVP).
+static extrn _lvl_cvs_x, _lvl_cvs_y;
+
+// ── Palette ──────────────────────────────────────────────
+
+static void _init_palette() {
+    _lvl_palette = malloc(8 * 8);
+    *(_lvl_palette + 0 * 8) = 0x00000000;
+    *(_lvl_palette + 1 * 8) = 0xFF000000;
+    *(_lvl_palette + 2 * 8) = 0xFF8C1A1A;
+    *(_lvl_palette + 3 * 8) = 0xFF808080;
+    *(_lvl_palette + 4 * 8) = 0xFFFFA500;
+    *(_lvl_palette + 5 * 8) = 0xFF008000;
+    *(_lvl_palette + 6 * 8) = 0xFF800080;
+    *(_lvl_palette + 7 * 8) = 0xFFFFFF00;
+}
+
+// ── State ────────────────────────────────────────────────
+
+static void _state_init() {
+    auto total;
+    total = LVL_W * LVL_H;
+    // Layer is the palette-indexed byte grid stbdraw exports for
+    // both the compositor and this editor. Zero-fill is implicit
+    // inside layer_new.
+    _lvl_tiles = layer_new(LVL_W, LVL_H, 0);
+    _init_palette();
+    _lvl_sel   = 1;
+    _lvl_tool  = 0;
+    _lvl_dirty = 0;
+
+    _lvl_undo_ring   = malloc(LVL_UNDO_MAX * total);
+    _lvl_undo_len    = 0;
+    _lvl_undo_cursor = 0;
+
+    _lvl_name_buf = malloc(257);
+    _lvl_name_ti  = malloc(sizeof(TextInput));
+    text_input_new(_lvl_name_ti, _lvl_name_buf, 256);
+    text_input_set(_lvl_name_ti, "level1");
+
+    _lvl_cvs_x = 40;
+    _lvl_cvs_y = 48;
+}
+
+static void _state_free() {
+    if (_lvl_tiles != 0)   { layer_free(_lvl_tiles); _lvl_tiles = 0; }
+    if (_lvl_palette != 0) { free(_lvl_palette); _lvl_palette = 0; }
+    if (_lvl_undo_ring != 0) { free(_lvl_undo_ring); _lvl_undo_ring = 0; }
+    if (_lvl_name_ti != 0) { free(_lvl_name_ti); _lvl_name_ti = 0; }
+    if (_lvl_name_buf != 0) { free(_lvl_name_buf); _lvl_name_buf = 0; }
+}
+
+// ── Undo ─────────────────────────────────────────────────
+
+static void _undo_commit() {
+    auto total, src_off, dst_off, i, k;
+    auto t: Layer;
+    t = _lvl_tiles;
+    total = LVL_W * LVL_H;
+    // Truncate redo tail.
+    _lvl_undo_len = _lvl_undo_cursor;
+    // Shift out oldest on full.
+    if (_lvl_undo_len == LVL_UNDO_MAX) {
+        for (k = 0; k < LVL_UNDO_MAX - 1; k = k + 1) {
+            src_off = (k + 1) * total;
+            dst_off = k * total;
+            for (i = 0; i < total; i = i + 1) {
+                poke(_lvl_undo_ring + dst_off + i,
+                     peek(_lvl_undo_ring + src_off + i));
+            }
+        }
+        _lvl_undo_len = LVL_UNDO_MAX - 1;
+        _lvl_undo_cursor = LVL_UNDO_MAX - 1;
+    }
+    // Snapshot.
+    dst_off = _lvl_undo_len * total;
+    for (i = 0; i < total; i = i + 1) {
+        poke(_lvl_undo_ring + dst_off + i, peek(t.fb + i));
+    }
+    _lvl_undo_cursor = _lvl_undo_len + 1;
+    _lvl_undo_len    = _lvl_undo_cursor;
+}
+
+static _undo_apply() {
+    auto total, src_off, i;
+    auto t: Layer;
+    if (_lvl_undo_cursor <= 1) { return 0; }
+    t = _lvl_tiles;
+    _lvl_undo_cursor = _lvl_undo_cursor - 1;
+    total = LVL_W * LVL_H;
+    src_off = (_lvl_undo_cursor - 1) * total;
+    for (i = 0; i < total; i = i + 1) {
+        poke(t.fb + i, peek(_lvl_undo_ring + src_off + i));
+    }
+    _lvl_dirty = 1;
+    return 1;
+}
+
+static _redo_apply() {
+    auto total, src_off, i;
+    auto t: Layer;
+    if (_lvl_undo_cursor >= _lvl_undo_len) { return 0; }
+    t = _lvl_tiles;
+    total = LVL_W * LVL_H;
+    src_off = _lvl_undo_cursor * total;
+    for (i = 0; i < total; i = i + 1) {
+        poke(t.fb + i, peek(_lvl_undo_ring + src_off + i));
+    }
+    _lvl_undo_cursor = _lvl_undo_cursor + 1;
+    _lvl_dirty = 1;
+    return 1;
+}
+
+// ── Tools ────────────────────────────────────────────────
+
+static void _paint_cell(cx, cy, idx) {
+    // layer_set bounds-checks + no-ops on OOB, but we still want
+    // the dirty flag only when a real change happened, so we peek
+    // first.
+    if (cx < 0 || cy < 0 || cx >= LVL_W || cy >= LVL_H) { return; }
+    if (layer_get(_lvl_tiles, cx, cy) == idx) { return; }
+    layer_set(_lvl_tiles, cx, cy, idx);
+    _lvl_dirty = 1;
+}
+
+// 4-connected flood fill — delegates to the shared layer_fill in
+// stbdraw, which uses the same BFS pattern level_editor carried
+// locally before the extraction.
+static void _flood_fill(cx, cy, idx) {
+    layer_fill(_lvl_tiles, cx, cy, idx);
+    _lvl_dirty = 1;
+}
+
+// ── Save / load ──────────────────────────────────────────
+
+static _save(path) : io {
+    auto sb, y, x, idx, rc;
+    sb = sb_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "level");
+    sb = json_write_int_field(sb, "version", 1);
+    sb = json_write_int_field(sb, "width",  LVL_W);
+    sb = json_write_int_field(sb, "height", LVL_H);
+    sb = json_write_string_field(sb, "palette", "MCU-8");
+    sb = json_write_array_field_begin(sb, "tiles");
+    for (y = 0; y < LVL_H; y = y + 1) {
+        sb = json_write_array_begin(sb);
+        for (x = 0; x < LVL_W; x = x + 1) {
+            idx = layer_get(_lvl_tiles, x, y);
+            sb = json_write_int(sb, idx);
+        }
+        sb = json_write_array_end(sb);
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("level: '");
+        print_err_msg(path);
+        print_err_msg("': write failed\n");
+        return 0 - 1;
+    }
+    return 0;
+}
+
+static _load(path) : io {
+    auto buf, size_out, doc, root, idx, w, h, tiles_idx;
+    auto y, x, row, cell;
+
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        print_err_msg("level: '");
+        print_err_msg(path);
+        print_err_msg("': read failed\n");
+        free(size_out); return 0 - 1;
+    }
+    doc = json_parse(buf, *(size_out));
+    free(buf); free(size_out);
+    if (doc == 0) {
+        print_err_msg("level: parse failed\n");
+        return 0 - 1;
+    }
+    root = json_root(doc);
+    idx = json_object_get(doc, root, "width");
+    if (idx < 0) { json_free(doc); return 0 - 1; }
+    w = json_int(doc, idx);
+    idx = json_object_get(doc, root, "height");
+    h = json_int(doc, idx);
+    if (w != LVL_W || h != LVL_H) {
+        print_err_msg("level: size mismatch (MVP only loads LVL_W x LVL_H)\n");
+        json_free(doc);
+        return 0 - 1;
+    }
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (tiles_idx < 0) { json_free(doc); return 0 - 1; }
+    for (y = 0; y < LVL_H; y = y + 1) {
+        row = json_child(doc, tiles_idx, y);
+        for (x = 0; x < LVL_W; x = x + 1) {
+            cell = json_int(doc, json_child(doc, row, x));
+            if (cell < 0) { cell = 0; }
+            if (cell > 7) { cell = 7; }
+            layer_set(_lvl_tiles, x, y, cell);
+        }
+    }
+    json_free(doc);
+    _lvl_dirty = 0;
+    return 0;
+}
+
+// ── Rendering ────────────────────────────────────────────
+
+static void _render_grid() {
+    auto y, x, idx, color, px, py, side_w, side_h;
+    side_w = LVL_W * LVL_CELL;
+    side_h = LVL_H * LVL_CELL;
+    draw_rect(_lvl_cvs_x, _lvl_cvs_y, side_w, side_h,
+              rgba(14, 16, 22, 255));
+    for (y = 0; y < LVL_H; y = y + 1) {
+        for (x = 0; x < LVL_W; x = x + 1) {
+            idx = layer_get(_lvl_tiles, x, y);
+            px = _lvl_cvs_x + x * LVL_CELL;
+            py = _lvl_cvs_y + y * LVL_CELL;
+            if (idx == 0) {
+                // Transparent cell — 2x2 checker.
+                color = ((x + y) & 1) != 0
+                    ? rgba(40, 40, 50, 255)
+                    : rgba(60, 60, 75, 255);
+            } else {
+                color = *(_lvl_palette + idx * 8);
+            }
+            draw_rect(px, py, LVL_CELL, LVL_CELL, color);
+        }
+    }
+    // Grid lines every 4 cells — helps with visual alignment
+    // without the noise of one line per cell.
+    color = rgba(30, 34, 44, 180);
+    for (y = 0; y <= LVL_H; y = y + 4) {
+        draw_rect(_lvl_cvs_x, _lvl_cvs_y + y * LVL_CELL,
+                  side_w + 1, 1, color);
+    }
+    for (x = 0; x <= LVL_W; x = x + 4) {
+        draw_rect(_lvl_cvs_x + x * LVL_CELL, _lvl_cvs_y,
+                  1, side_h + 1, color);
+    }
+}
+
+// Screen-space → cell coords. -1 on miss.
+static _le_cursor_cell() : base {
+    auto mx, my, cx, cy;
+    mx = mouse_x();
+    my = mouse_y();
+    if (mx < _lvl_cvs_x || my < _lvl_cvs_y) { return 0 - 1; }
+    cx = (mx - _lvl_cvs_x) / LVL_CELL;
+    cy = (my - _lvl_cvs_y) / LVL_CELL;
+    if (cx >= LVL_W || cy >= LVL_H) { return 0 - 1; }
+    return cy * LVL_W + cx;
+}
+
+// ── Embed API ────────────────────────────────────────────
+
+// Per-frame mouse edge state. Held in globals so it survives
+// across level_editor_lib_frame calls — the standalone version
+// kept these as locals inside its main loop, but in the embed
+// flow each frame is a fresh call so locals would lose their
+// "last frame" value and break click-release snapshot commits.
+static extrn _le_prev_lmb_down, _le_prev_rmb_down;
+
+// Tracks whether _state_init has run. Hosts may call init / frame
+// in surprising orders (e.g. lazy init the first time the panel
+// becomes active in an IDE), so the flag lets shutdown be safely
+// idempotent and lets the first frame self-bootstrap if needed.
+static extrn _le_initialized;
+
+// Initialize editor state. Allocates the tile layer, undo ring,
+// palette, and filename text input, then seeds slot 0 of the
+// undo ring. Caller MUST have already called game_init() — the
+// host owns the window. `initial_name` (may be 0) pre-fills the
+// filename input the same way modulab_lib_init does.
+void level_editor_lib_init(initial_name) {
+    if (_le_initialized != 0) { return; }
+    _state_init();
+    if (initial_name != 0) {
+        text_input_set(_lvl_name_ti, initial_name);
+    }
+    _undo_commit();
+    _le_prev_lmb_down = 0;
+    _le_prev_rmb_down = 0;
+    _le_initialized   = 1;
+}
+
+// Render + handle one frame inside the rect (px, py, pw, ph).
+// Returns 1 if the user pressed ESC inside the editor (host can
+// honour that as a quit, ignore it, or pop back to a higher tab),
+// 0 otherwise. Host owns clear() — this routine paints over the
+// panel rect but does NOT fill the host's background first.
+level_editor_lib_frame(px, py, pw, ph) {
+    auto cell, mx, my, clicked, path_sb;
+    auto edit_held, lmb_down, rmb_down, quit;
+
+    _le_ox = px; _le_oy = py; _le_pw = pw; _le_ph = ph;
+
+    // Lazy init guard: if the host forgot to call _init, bring
+    // the editor up with its default name so the first frame
+    // doesn't dereference null state.
+    if (_le_initialized == 0) {
+        level_editor_lib_init("level1");
+    }
+
+    // Canvas origin recalculated every frame so the editor tracks
+    // the host's panel rect even if the host reflows on resize.
+    _lvl_cvs_x = px + 40;
+    _lvl_cvs_y = py + 48;
+
+    quit = 0;
+    if (key_pressed(KEY_ESC)) { quit = 1; }
+
+    // Hotkeys.
+    edit_held = key_down(KEY_META) != 0 || key_down(KEY_CTRL) != 0;
+    if (edit_held != 0 && key_pressed(KEY_Z)) { _undo_apply(); }
+    if (edit_held != 0 && key_pressed(KEY_Y)) { _redo_apply(); }
+    if (key_pressed(KEY_E)) { _lvl_tool = 1; }
+    if (key_pressed(KEY_F)) { _lvl_tool = 2; }
+    if (key_pressed(KEY_B)) { _lvl_tool = 0; }
+    if (key_pressed(KEY_LBRACKET)) {
+        _lvl_sel = _lvl_sel - 1;
+        if (_lvl_sel < 1) { _lvl_sel = 7; }
+    }
+    if (key_pressed(KEY_RBRACKET)) {
+        _lvl_sel = _lvl_sel + 1;
+        if (_lvl_sel > 7) { _lvl_sel = 1; }
+    }
+    if (key_pressed(KEY_S)) {
+        path_sb = sb_new();
+        path_sb = sb_cat(path_sb, _lvl_name_buf);
+        path_sb = sb_cat(path_sb, ".level.json");
+        if (_save(path_sb) == 0) { _lvl_dirty = 0; }
+        path_sb = sb_free(path_sb);
+    }
+
+    // Top bar.
+    draw_text("Level Editor 0.1", px + 12, py + 8, 8,
+              rgba(97, 218, 251, 255));
+    if (gui_button(px + 180, py + 6, 72, 22, "Save")) {
+        path_sb = sb_new();
+        path_sb = sb_cat(path_sb, _lvl_name_buf);
+        path_sb = sb_cat(path_sb, ".level.json");
+        _save(path_sb);
+        path_sb = sb_free(path_sb);
+        _lvl_dirty = 0;
+    }
+    if (gui_button(px + 256, py + 6, 72, 22, "Open")) {
+        auto picked;
+        picked = window_open_dialog("Open level");
+        if (picked != 0) {
+            _load(picked);
+            free(picked);
+        }
+    }
+    gui_text_input(_lvl_name_ti, px + 336, py + 6, 244, 22);
+    if (_lvl_dirty != 0) {
+        draw_text("[unsaved]", px + 600, py + 12, 8,
+                  rgba(255, 180, 80, 255));
+    }
+
+    // Grid (already px/py-shifted via _lvl_cvs_x/_lvl_cvs_y above).
+    _render_grid();
+
+    // Palette picker at panel's right edge of the canvas band.
+    clicked = gui_palette(px + 700, _lvl_cvs_y,
+                          _lvl_palette, 8, 1, 24, _lvl_sel);
+    if (clicked >= 1) { _lvl_sel = clicked; }
+
+    auto tool_name;
+    if      (_lvl_tool == 0) { tool_name = "PAINT"; }
+    else if (_lvl_tool == 1) { tool_name = "ERASE"; }
+    else                     { tool_name = "FILL"; }
+    draw_text(tool_name, px + 700, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
+
+    // Mouse painting.
+    mx = mouse_x();
+    my = mouse_y();
+    lmb_down = mouse_down(MOUSE_LEFT);
+    rmb_down = mouse_down(MOUSE_RIGHT);
+
+    // Only act when the cursor is inside the canvas band (left of
+    // the palette picker) and the palette didn't consume the
+    // click on this frame.
+    if (mx < px + 700 && clicked < 0) {
+        cell = _le_cursor_cell();
+        if (cell >= 0) {
+            auto cx, cy, press;
+            cx = cell % LVL_W;
+            cy = cell / LVL_W;
+            press = lmb_down != 0 && _le_prev_lmb_down == 0;
+            if (lmb_down != 0) {
+                if (_lvl_tool == 2) {
+                    if (press) { _flood_fill(cx, cy, _lvl_sel); }
+                } else if (_lvl_tool == 1) {
+                    _paint_cell(cx, cy, 0);
+                } else {
+                    _paint_cell(cx, cy, _lvl_sel);
+                }
+            }
+            if (rmb_down != 0) { _paint_cell(cx, cy, 0); }
+            if (_le_prev_lmb_down != 0 && lmb_down == 0) { _undo_commit(); }
+            if (_le_prev_rmb_down != 0 && rmb_down == 0) { _undo_commit(); }
+        }
+    }
+    _le_prev_lmb_down = lmb_down;
+    _le_prev_rmb_down = rmb_down;
+
+    // Help bar pinned to the bottom of the panel rect.
+    draw_text("LMB:paint  RMB:erase  B:brush  E:eraser  F:fill  [ ]:color  Cmd+Z:undo  S:save",
+              px + 12, py + ph - 20, 8, rgba(120, 130, 150, 255));
+
+    return quit;
+}
+
+// Free editor state. Idempotent — safe to call before init or
+// twice in a row.
+void level_editor_lib_shutdown() {
+    if (_le_initialized == 0) { return; }
+    _state_free();
+    _le_initialized = 0;
+}
