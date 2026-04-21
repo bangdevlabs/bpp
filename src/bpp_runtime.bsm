@@ -1,0 +1,140 @@
+// bpp_runtime.bsm — Runtime ABI contract.
+//
+// This file is DECLARATIVE, not compiled. It names and documents
+// every symbol that every OS-runtime layer (src/backend/os/<os>/
+// _core_<os>.bsm) MUST provide. Writing a new OS backend? Open this
+// file, implement everything declared here, and B++ programs
+// compiled for your OS will link.
+//
+// The file is not currently imported by the compiler — it exists as
+// a contract reference and an auditable listing of the runtime
+// surface. Grep for function names here to find the per-OS
+// implementations that must satisfy the contract.
+//
+// See Cap 15 (Disciplina QG) second tier: "Runtime functions live
+// under a contract in src/ and implementation in src/backend/os/".
+
+// ═══════════════════════════════════════════════════════════════
+// Memory allocator
+// ═══════════════════════════════════════════════════════════════
+//
+// Implementations:
+//   src/backend/os/macos/_core_macos.bsm
+//   src/backend/os/linux/_core_linux.bsm
+//
+// Strategy today: one mmap per allocation, 16-byte header with the
+// raw mmap base and total size, user pointer skips the header.
+// malloc_aligned over-allocates and slides the user pointer to land
+// on the requested boundary. free() handles both cases.
+//
+// A real free-list allocator replaces this eventually. The contract
+// below does not change: allocators emit pointers the user can write
+// through, respect alignment constraints, and survive round-trip
+// through free/realloc.
+
+// Allocate `size` bytes. Returns a pointer the caller may write to,
+// or 0 if the kernel refused the mapping.
+extrn malloc;
+
+// Allocate `size` bytes on an `alignment`-byte boundary. Alignment
+// must be a power of two; 16, 64, 4096 are the common values. The
+// returned pointer is caller-owned; free(ptr) reclaims whatever
+// malloc_aligned handed out.
+extrn malloc_aligned;
+
+// Free a block previously returned by malloc or malloc_aligned.
+// Safe on 0 (no-op). Double-free is undefined behavior.
+extrn free;
+
+// Resize an existing allocation. Returns the new pointer (may move).
+// If the pointer moved, the old one is invalid — callers MUST
+// reassign.  Passing 0 as ptr behaves like malloc(new_size). Passing
+// 0 as new_size behaves like free(ptr) and returns 0.
+extrn realloc;
+
+// Copy `len` bytes from `src` to `dst`. Behavior is undefined if
+// the regions overlap.
+extrn memcpy;
+
+// Fill `len` bytes at `addr` with byte value `byte` (low 8 bits).
+extrn memset;
+
+// ═══════════════════════════════════════════════════════════════
+// Static Raw Array — the lowest-level array shape
+// ═══════════════════════════════════════════════════════════════
+//
+// B++ programs carry three array shapes (see Cap 6 §6.0 for
+// strings, Cap 7 for arrays). The static raw array is the zero-
+// overhead shape: caller-owned, no header, fixed size. Composed
+// from four HQ-controlled primitives:
+//
+//   allocation   : malloc(N * stride) / free(addr)  (this file)
+//   byte access  : peek(addr) / poke(addr, val)      (compiler builtin, Cap 23)
+//   word access  : *(addr + i * 8) = val             (parser + codegen)
+//   bulk ops     : memcpy / memset                   (this file)
+//
+// Canonical idiom:
+//
+//   auto buf;
+//   buf = malloc(N * 8);         // N words, 8 bytes each
+//   *(buf + i * 8) = val;        // write by index
+//   val = *(buf + i * 8);        // read by index
+//   memset(buf, 0, N * 8);       // bulk clear
+//   free(buf);                    // reclaim
+//
+// When to use: size known and fixed, byte/word access is enough,
+// hot-path critical (no per-access header indirection). Typical
+// callers: pixel framebuffers, keyboard state, palette data, fixed-
+// capacity entity pools.
+//
+// When NOT to use: size grows during program life — use bpp_array
+// (arr_new / arr_push / arr_get) instead. Bang 9 tooling and stb
+// audit (Phase D) help classify which sites in a codebase belong
+// to which shape.
+//
+// bpp_buf.bsm (user-facing, auto-injected) carries named convenience
+// wrappers (buf_new, buf_free, buf_fill, buf_copy) over this shape
+// for readability. The primitives declared above remain the canonical
+// operations; buf_* aliases them for consistency with other arsenal
+// modules (arr_*, sb_*, str_*).
+
+// ═══════════════════════════════════════════════════════════════
+// Time
+// ═══════════════════════════════════════════════════════════════
+//
+// Platform-provided clock. Used by stbgame.game_frame_begin and
+// by every game loop's dt computation. Units are milliseconds
+// since some monotonic epoch (start of process on most OSes). Not
+// wall-clock time — never run backwards, not affected by system
+// clock changes.
+extrn _stb_get_time;
+
+// ═══════════════════════════════════════════════════════════════
+// Threads (optional — not every OS implements)
+// ═══════════════════════════════════════════════════════════════
+//
+// Used by bpp_job.bsm to stand up the worker pool for smart
+// dispatch. OSes that lack thread support declare these as
+// "not provided" and smart dispatch degrades to single-thread
+// execution. macOS and Linux ship threads via pthread.
+
+// thread_spawn(entry_fn, arg) — start a worker thread, returns
+// opaque handle. Worker runs entry_fn(arg) and exits when the
+// function returns.
+// (Not declared here yet; adding when bpp_job.bsm formalizes the
+// surface.)
+
+// ═══════════════════════════════════════════════════════════════
+// Audit / maintenance
+// ═══════════════════════════════════════════════════════════════
+//
+// When adding a symbol to _core_<os>.bsm that every OS must provide,
+// add the extrn declaration to this file too. When writing a new
+// OS backend, this file is your checklist — every extrn above must
+// have a matching body in your _core_<newos>.bsm.
+//
+// Phase D2 future work: compiler gains --emit-meta flag that dumps
+// struct and enum info from bpp_internal's registries into a sidecar
+// JSON. Bang 9 reads the sidecar to power inspector panels. Does
+// NOT add anything to this runtime contract — metadata is build-
+// time, not runtime.
