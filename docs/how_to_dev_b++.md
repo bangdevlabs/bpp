@@ -23,8 +23,8 @@ No other canonical document. Everything that used to live in separate markdown f
 | 7 | Arrays (bpp_array) | II | PENDING | legacy §5 | 4 |
 | 8 | Hash tables (bpp_hash) | II | PENDING | legacy §5 | 7 |
 | 9 | Buffers (bpp_buf) | II | PENDING | legacy §5 | — |
-| 10 | Structs (bpp_struct) | II | PENDING | legacy §4.5 | 4 |
-| 11 | Enums (bpp_enum) | II | PENDING | legacy §4.6 | 4 |
+| 10 | Structs (language feature) | II | PENDING | legacy §4.5 | 4 |
+| 11 | Enums (language feature) | II | PENDING | legacy §4.6 | 4 |
 | 12 | I/O (bpp_io) | II | PENDING | legacy §4.1 | — |
 | 13 | Runtime ABI (bpp_runtime) | II | PENDING | new | 9 |
 | 14 | Tonify (the style rules) | III — Writing Pro | PENDING | legacy_docs/how_to_dev_b++.md Part 2 | — |
@@ -190,7 +190,16 @@ main() {
 
 *Depends on: Cap 3*
 *Source: legacy_docs/the_b++_programming_language.md §3*
-*Status: PENDING*
+*Status: PENDING — body to be absorbed from legacy §3 in Phase C*
+
+Note on scope: this chapter documents TYPES AS LANGUAGE FEATURE —
+the syntax `auto x: word`, `auto x: float`, `auto c: Character`, the
+sub-word hints (`: half`, `: bit3`), and how they interact with the
+effect lattice. The internal type-inference engine
+(`src/bpp_types.bsm`) is compiler-only (fourth tier, see Cap 15) and
+is documented in Cap 21 (Frontend) as part of the parser/analysis
+pipeline. User programs interact with types via annotations; they
+never import `bpp_types.bsm`.
 
 ---
 
@@ -422,17 +431,20 @@ B++ is a compiler. It takes high-level programs and produces machine-specific bi
 
 The second mode is what B++ aspires to. The first is what it often falls into. This chapter names the discipline that keeps (2) from decaying into (1).
 
-### The three tiers of HQ
+### The four tiers of HQ
 
-The "general / battalion" mental model applies at THREE layers of B++, each with its own canonical location:
+The "general / battalion" mental model applies at FOUR layers of B++, each with its own canonical location. Three are user-facing; one is compiler-internal.
 
-| Tier | General (HQ) | Battalion | Concrete example |
-|------|--------------|-----------|------------------|
-| **Data primitives** | `src/bpp_*.bsm` auto-injected (strings, arrays, hash, buf, struct, enum) | Every program, tool, game, stb module | `arr_push` canonical in `bpp_array.bsm` — consumers call it, do not reimplement |
-| **Runtime functions** | `src/bpp_runtime.bsm` declares the ABI contract; `src/backend/os/<os>/_core_<os>.bsm` implements it | Consumers call `malloc(n)` as a normal function | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
-| **Inline builtins (codegen dispatch)** | `src/bpp_codegen.bsm` `cg_builtin_dispatch` | `src/backend/chip/<chip>/<chip>_primitives.bsm` | `peek`, `poke`, `str_peek`, `sys_write`, `argc_get` — dispatch in spine, final instruction per chip |
+| Tier | General (HQ) | Battalion | Audience | Concrete example |
+|------|--------------|-----------|----------|------------------|
+| **Data primitives** | `src/bpp_*.bsm` auto-injected (strings, arrays, hash, buf) | Every program, tool, game, stb module | User | `arr_push` canonical in `bpp_array.bsm` — consumers call it, do not reimplement |
+| **Runtime functions** | `src/bpp_runtime.bsm` declares the ABI contract; `src/backend/os/<os>/_core_<os>.bsm` implements it | Consumers call `malloc(n)` as a normal function | User + compiler | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
+| **Inline builtins (codegen dispatch)** | `src/bpp_codegen.bsm` `cg_builtin_dispatch` | `src/backend/chip/<chip>/<chip>_primitives.bsm` | User (transparently) | `peek`, `poke`, `str_peek`, `sys_write`, `argc_get` — dispatch in spine, final instruction per chip |
+| **Compiler-internal libraries** | `src/bpp_internal.bsm`, `src/bpp_struct.bsm`, `src/bpp_enum.bsm` | Parser, validator, codegen, dispatch | Compiler only (not auto-injected) | `buf_eq(a, b, len)` operates on raw byte ranges; `packed_eq(a, b)` on source-buffer slices; `struct_register(name)` on the metadata table |
 
-Three tiers, three canonical homes in `src/`. Every consumer (games, tools, stb, backends) downstream is a battalion.
+Four tiers, four canonical homes in `src/`. The fourth tier is where B++'s compiler-internal vocabulary lives — shapes and operations the compiler needs for its own work that user programs never see. Like the third tier (inline builtins), the fourth tier is HQ-controlled; unlike the third tier, it is not transparently available to user code.
+
+**Why not fold the fourth tier into the first?** Because the data shapes are different. `bpp_str` operates on null-terminated C-strings (user programs hold strings that way). `bpp_internal.buf_eq` operates on raw address + length (the parser holds slices of the source buffer without allocating). Forcing one API to serve both audiences means either the user-facing API carries compiler internals (pollution) or the compiler pays allocation cost for packed refs (defeats the point). Cap 6 §6.0 walks through this with three-shapes-of-string as the canonical example.
 
 ### The three rules of the QG
 
