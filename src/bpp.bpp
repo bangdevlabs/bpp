@@ -45,6 +45,13 @@ main() {
     flag_show_dispatch = 0;
     auto flag_stats;
     flag_stats = 0;
+    // --emit-meta <path>: after compilation, write struct + enum
+    // registry to JSON sidecar. Consumed by Bang 9's future inspector
+    // panel without touching the runtime binary. See Cap 23 §Phase D2.
+    auto flag_emit_meta;
+    auto meta_out_path;
+    flag_emit_meta = 0;
+    meta_out_path = 0;
 
     // Initialize all subsystems.
     init_array();
@@ -132,6 +139,15 @@ main() {
                 if (str_peek(a, 2) == 'p') {
                     if (str_peek(a, 3) == 'e') {
                         if (str_peek(a, 4) == 'r') { flag_permod = 1; }
+                    }
+                }
+                // --emit-meta <path>: write struct + enum registry
+                // as JSON sidecar. Next arg is the output path.
+                if (str_peek(a, 2) == 'e') {
+                    if (str_peek(a, 3) == 'm') {
+                        argi = argi + 1;
+                        meta_out_path = argv_get(argi);
+                        flag_emit_meta = 1;
                     }
                 }
                 // --monolithic (force single-pass pipeline)
@@ -490,6 +506,108 @@ main() {
         diag_newline();
     }
 
+    // --emit-meta: write struct + enum registry as JSON sidecar.
+    // Consumed by Bang 9 for property inspectors / tooltips without
+    // embedding runtime metadata in the compiled binary.
+    // Phase D2 — "Bang 9 as game factory" discipline per Cap 23.
+    if (flag_emit_meta) {
+        if (meta_out_path != 0) {
+            emit_meta_sidecar(meta_out_path);
+        }
+    }
+
     diag_summary();
     return 0;
+}
+
+// Write struct + enum metadata as JSON sidecar at the given path.
+// Uses bpp_str's sb_* builder (auto-injected) + bpp_internal's
+// struct_*/enum_* APIs (fourth-tier HQ).
+//
+// Format is intentionally minimal — Bang 9 reads it to render
+// property panels. Schema can grow as consumers need more info
+// (source location, type names, doc comments).
+void emit_meta_sidecar(path) : io {
+    auto sb, sid, fidx, eid, n, f, rc, name_p;
+
+    sb = sb_new();
+    sb = sb_cat(sb, "{\n");
+    sb = sb_cat(sb, "  \"structs\": [\n");
+
+    n = struct_count();
+    for (sid = 0; sid < n; sid = sid + 1) {
+        if (sid > 0) { sb = sb_cat(sb, ",\n"); }
+        sb = sb_cat(sb, "    {\"id\": ");
+        sb = sb_int(sb, sid);
+        sb = sb_cat(sb, ", \"name\": \"");
+        sb = _sb_append_packed(sb, struct_name(sid));
+        sb = sb_cat(sb, "\", \"size\": ");
+        sb = sb_int(sb, struct_size(sid));
+        sb = sb_cat(sb, ", \"fields\": [");
+        f = struct_field_count(sid);
+        for (fidx = 0; fidx < f; fidx = fidx + 1) {
+            if (fidx > 0) { sb = sb_cat(sb, ", "); }
+            sb = sb_cat(sb, "{\"name\": \"");
+            sb = _sb_append_packed(sb, struct_field_name(sid, fidx));
+            sb = sb_cat(sb, "\", \"offset\": ");
+            sb = sb_int(sb, _struct_field_offset_by_idx(sid, fidx));
+            sb = sb_cat(sb, ", \"hint\": ");
+            sb = sb_int(sb, struct_field_hint(sid, fidx));
+            sb = sb_cat(sb, "}");
+        }
+        sb = sb_cat(sb, "]}");
+    }
+    sb = sb_cat(sb, "\n  ],\n");
+
+    sb = sb_cat(sb, "  \"enums\": [\n");
+    n = enum_count();
+    for (eid = 0; eid < n; eid = eid + 1) {
+        if (eid > 0) { sb = sb_cat(sb, ",\n"); }
+        sb = sb_cat(sb, "    {\"name\": \"");
+        sb = _sb_append_packed(sb, enum_name(eid));
+        sb = sb_cat(sb, "\", \"value\": ");
+        sb = sb_int(sb, enum_value(eid));
+        sb = sb_cat(sb, "}");
+    }
+    sb = sb_cat(sb, "\n  ]\n");
+    sb = sb_cat(sb, "}\n");
+
+    rc = file_write_all(path, sb, sb_len(sb));
+    sb = sb_free(sb);
+    if (rc != 0) {
+        print_err_msg("bpp: --emit-meta write failed for '");
+        print_err_msg(path);
+        print_err_msg("'\n");
+    }
+}
+
+// Append the bytes of a packed name (offset, length in vbuf) onto
+// a string builder. Used by emit_meta_sidecar to emit struct/
+// field/enum names as JSON strings. Assumes ASCII (no escape
+// handling); struct/enum identifiers in B++ source are always
+// ASCII by language constraint.
+extrn vbuf;
+_sb_append_packed(sb, name_p) {
+    auto s, l, i;
+    if (name_p == 0) { return sb; }
+    s = unpack_s(name_p);
+    l = unpack_l(name_p);
+    for (i = 0; i < l; i = i + 1) {
+        sb = sb_ch(sb, peek(vbuf + s + i));
+    }
+    return sb;
+}
+
+// Helper: field byte offset by (sid, fidx). Reads the parser's
+// sd_byte_offs table. Used by emit_meta_sidecar to enumerate
+// fields in registration order (struct_field_offset takes a
+// field name, this takes an index).
+extrn sd_byte_offs, sd_fcounts;
+_struct_field_offset_by_idx(sid, fidx) {
+    auto byte_offs, fc;
+    if (sid < 0) { return 0 - 1; }
+    fc = arr_get(sd_fcounts, sid);
+    if (fidx < 0 || fidx >= fc) { return 0 - 1; }
+    byte_offs = arr_get(sd_byte_offs, sid);
+    return *(byte_offs + fidx * 8);
 }
