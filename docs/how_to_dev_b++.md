@@ -211,8 +211,123 @@ The stdlib. Every function listed in Cap 2's prelude table, expanded here with s
 ## Cap 6 — Strings (bpp_str + sb_)
 
 *Depends on: Cap 4*
-*Source: legacy_docs/the_b++_programming_language.md §4*
-*Status: PENDING*
+*Source: legacy_docs/the_b++_programming_language.md §4 + new content for §6.0 (three shapes rationale)*
+*Status: DRAFT — §6.0 complete; §6.1-§6.5 pending API expansion*
+
+### §6.0 — Three shapes of string in B++ (and why)
+
+Before any API, understand the vocabulary: B++ represents strings in **three different shapes**, each for a different job. They are not interchangeable, and the choice of which to use is the first question every string-handling function answers.
+
+#### The three shapes at a glance
+
+| Shape | What it is | Where memory lives | API module | Who uses it |
+|-------|-----------|-------------------|-----------|-------------|
+| **Static C-string** | byte array terminated by `\0` | allocated by caller (literal, stack, or heap) | `bpp_str.str_*` | Every user program — the everyday string |
+| **Dynamic builder** | `{length, capacity}` header + byte array that grows | heap, managed by builder, realloc on grow | `bpp_str.sb_*` | Programs that build strings from pieces |
+| **Packed ref (slice)** | `(offset, length)` packed into 64 bits | no memory of its own — points INTO another buffer | `bpp_internal.buf_eq` / `packed_eq` (compiler-only) | The compiler's parser / codegen |
+
+A physical analogy: a library.
+- **Static C-string** = a book you bought. Has a cover (the NUL terminator), lives on your shelf, is yours.
+- **Dynamic builder** = an empty notebook you fill in. Starts small, grows as you write. You throw it away when done.
+- **Packed ref** = a bookmark saying "page 47, lines 3-15 of Dom Casmurro." You do not own the book; you only know where to find the passage.
+
+#### Why three shapes
+
+Three shapes exist because three use cases have genuinely different optimal representations:
+
+1. **User programs handle existing strings.** You get a string (argv parameter, file content, config value) and you want to read it. The NUL terminator convention from C is the right shape — caller already has the memory, function just walks bytes until zero. `bpp_str` operates here.
+
+2. **Programs build strings from pieces.** Logging, JSON serialization, formatted messages. You do not know the final size in advance; the string grows as you append. A builder with header `{len, cap}` is the right shape — it manages its own memory, reallocates on grow, and gives you amortized O(1) append. `sb_*` operates here.
+
+3. **The compiler processes 10 MB of source and produces 100 000 tokens.** If every token allocated a C-string copy, the parser would burn 100 000 mallocs per compilation. A packed ref `(offset, length)` into the source buffer costs zero allocation — the token IS a pointer-and-length pair, not a string copy. `bpp_internal.buf_eq`, `packed_eq` operate here. User programs never see this shape.
+
+#### This is not novelty
+
+The packed ref concept is standard in modern systems languages:
+
+| Language | Name |
+|----------|------|
+| C++ (C++17+) | `std::string_view` |
+| Rust | `&str` / `&[u8]` |
+| Go | slice (`[]byte`) |
+| Zig | slice (`[]const u8`) |
+| Swift | `Substring` / `StringProtocol` |
+| **B++** | "packed ref" (internal name) |
+
+B++'s only particularity is *packing* the (offset, length) into a single 64-bit word (32 + 32 bits) instead of two separate words — a minor storage win that limits strings to 4 GB (irrelevant for source code). The concept itself is identical.
+
+#### A builder is also a C-string
+
+Because a dynamic builder stores its bytes contiguously and terminates them with `\0` after the last byte, you can pass a builder to any `str_*` function for reading:
+
+```c
+auto msg;
+msg = sb_new();
+msg = sb_cat(msg, "hello");
+print_int(str_len(msg));       // → 5, works
+if (str_eq(msg, "hello")) {}   // → 1, works
+msg = sb_free(msg);
+```
+
+What does NOT work: writing into a builder via `str_cpy` or `str_cat_raw`. Those functions ignore the builder's header and corrupt the `{len, cap}` bookkeeping. Always use `sb_cat` / `sb_ch` / `sb_int` to extend a builder.
+
+#### What a function actually returns
+
+An orthogonal clarification many programmers need. **Every B++ function returns ONE WORD (64 bits).** Not "a string", not "an array", not "a struct" — a word. What that word *means* is a contract between function and caller, documented in comments:
+
+```c
+// Returns the byte count — pure scalar, no pointer
+str_len(s) { ... }              // → 5
+
+// Returns a pointer to a freshly malloc'd NUL-terminated byte sequence.
+// Caller is responsible for free(). This is a C-string shape.
+str_dup(s) { ... }              // → 0x600000...
+
+// Returns a pointer past the header of a builder. Caller uses sb_* only.
+sb_new() { ... }                // → raw + 16
+
+// Returns a packed ref (offset, length encoded into one word).
+// Caller uses unpack_s / unpack_l to read. Compiler-internal only.
+make_packed_tok(s, l) { ... }   // → 0x0000000A_00000014
+```
+
+A "string" is not a language-level type — it is a **layout convention**. The caller knows which API module to use based on which function produced the pointer. This is why the prelude lists the modules (Cap 2) separately from the shapes they manipulate (Cap 6, Cap 7, Cap 10, ...) — modules operate on shapes, not types.
+
+The same rule applies to arrays (Cap 7): a pointer returned by `arr_new()` is shaped as `{len, cap}` + elements, and `arr_*` functions are the only correct way to read or modify it.
+
+#### When to use which shape — the decision table
+
+| You are doing | Use |
+|---------------|-----|
+| Checking a file extension or config key | `str_ends`, `str_starts`, `str_eq` |
+| Measuring a string you received | `str_len` |
+| Copying a string to a stable location | `str_dup` (allocates heap) |
+| Writing into a fixed-size buffer you own | `str_cpy`, `str_cat_raw`, `str_from_int` |
+| Building a message from pieces, size unknown | `sb_new` + `sb_cat` + `sb_int` + `sb_free` |
+| Accumulating a log or serializing JSON | `sb_*` |
+| Parser-internal work on source-buffer slices | packed refs (`buf_eq`, `packed_eq`) — compiler only |
+
+One-sentence rule: **`str_*` reads or writes memory you already own. `sb_*` builds memory that grows. Packed refs view memory someone else owns.** Use the one whose story matches your job.
+
+### §6.1 — `str_*` — Static C-string operations
+
+*PENDING — API reference with one example per function.*
+
+### §6.2 — `sb_*` — Dynamic string builder
+
+*PENDING — API reference with one example per function.*
+
+### §6.3 — `str_peek` is a compiler builtin
+
+*PENDING — document that `str_peek(s, i)` is emitted inline by codegen (a byte load at s+i), not a bpp_str function. Used interchangeably with `peek(s + i)` but carries pure-effect semantic for smart dispatch.*
+
+### §6.4 — Packed refs for compiler writers
+
+*PENDING — for developers hacking on the parser / codegen, document `buf_eq(a, b, len)`, `packed_eq(a, b)` in `bpp_internal.bsm`, and `unpack_s` / `unpack_l` to read the packed representation. User programs never import `bpp_internal` and never see this API.*
+
+### §6.5 — Common patterns
+
+*PENDING — snippets for the five most common string-handling idioms (file-path testing, score interpolation, log accumulation, parse-a-line, safe copy).*
 
 ---
 
@@ -349,6 +464,20 @@ Not every duplication is a violation. Legitimate reasons to keep specialized var
 - **Emit-time vs call-time**: `malloc` (runtime function, called) and `peek` (inline builtin, emitted) are both HQ-controlled but via different mechanisms. Both are correct; they are not duplicates of each other.
 
 Document each legitimate divergence with a comment in both modules saying "see the other; why we have both".
+
+### The canonical example of legitimate divergence: three string shapes
+
+B++ carries three string representations (Cap 6 §6.0): static C-strings (`bpp_str.str_*`), dynamic builders (`bpp_str.sb_*`), and packed refs (`bpp_internal.buf_eq` / `packed_eq`). These are **not** a discipline failure — they are three genuinely different data shapes for three genuinely different jobs:
+
+- Static C-strings serve user programs that handle strings they already own (argv, file content, config).
+- Dynamic builders serve programs that build strings from pieces without knowing final size.
+- Packed refs serve the compiler's parser, which turns 10 MB of source into 100 000 tokens without 100 000 mallocs.
+
+Each shape carries its own `_eq` / `_len` / etc. because the data they operate on is structurally different. Unifying them would cost either allocation (packed ref → C-string) or NUL terminator bookkeeping (C-string → packed ref) — taxes that defeat the purpose of having separate shapes.
+
+**The discipline still applies within each shape**: `str_eq` is the ONE canonical C-string comparison; if something in the codebase reimplements it (like the old `cg_str_eq` did), that is a violation and gets merged. Divergence across shapes is allowed; divergence within a shape is not.
+
+**Rule of thumb for reviewers**: when you see what looks like duplication, ask "are these operating on the same data shape?" If yes, merge. If no, ensure both carry a header comment cross-referencing the other.
 
 ### One rule, repeated
 
