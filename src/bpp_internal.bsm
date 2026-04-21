@@ -85,6 +85,132 @@ packed_eq(a, b) {
     return 1;
 }
 
+// ── Struct registry (compiler-internal, fourth-tier HQ) ──────
+//
+// Named API over the struct-metadata tables populated by the parser
+// during parse_struct. Gives compiler modules (validator, codegen,
+// dispatcher) a documented vocabulary to query struct layouts instead
+// of reaching into sd_* parallel arrays directly.
+//
+// Shape:
+//   sd_names[sid]        packed ref into vbuf      (struct name)
+//   sd_fields[sid][fi]   packed ref into vbuf      (field name)
+//   sd_fcounts[sid]      int                       (field count)
+//   sd_sizes[sid]        int                       (total size in bytes)
+//   sd_fhints[sid][fi]   int                       (type hint TY_*)
+//   sd_byte_offs[sid][fi] int                      (byte offset of field)
+//   sd_bit_offs[sid][fi]  int                      (bit offset within byte, for bit-packed fields)
+//   struct_mods[sid]     int                       (source module index)
+//
+// The tables themselves are declared and allocated in bpp_parser.bsm;
+// this section references them via extrn. Callers of this API never
+// touch the sd_* arrays — they go through the named functions below.
+//
+// NOT auto-injected into user programs. Only compiler source files
+// that explicitly import bpp_internal.bsm see these functions.
+// User-facing struct reflection (if ever needed) would live in a
+// separate bpp_reflect.bsm module with a runtime metadata backend,
+// not here. See Cap 15 §Four Tiers of HQ.
+
+extrn sd_names, sd_fields, sd_fcounts, sd_sizes;
+extrn sd_fhints, sd_byte_offs, sd_bit_offs;
+extrn struct_mods;
+extrn add_struct_def, add_struct_field, find_struct;
+extrn get_struct_size, get_field_bit_off, get_field_bit_width;
+
+// Register a new struct definition. name_packed is the packed (offset,
+// length) reference into vbuf. Returns the newly assigned sid. Updates
+// the parser's struct-name hash so subsequent struct_find calls land in
+// O(1). Delegates to the parser's internal add_struct_def today; Phase
+// B.1 moves the body here and parser's wrapper becomes extrn.
+struct_register(name_packed) {
+    return add_struct_def(name_packed);
+}
+
+// Add a field to struct `sid`. hint is the primitive-type hint (TY_WORD,
+// TY_FLOAT, TY_WORD_H, bit-slice codes). Recomputes full layout so bit-
+// packed fields stay coherent with byte-aligned ones.
+void struct_add_field(sid, field_name_packed, hint) {
+    add_struct_field(sid, field_name_packed, hint);
+}
+
+// Look up struct by packed name. Returns sid >= 0 if found, -1 if not.
+// O(1) via the parser's struct-name hash.
+struct_find(name_packed) {
+    return find_struct(name_packed);
+}
+
+// Total size in bytes. Undefined for invalid sid.
+struct_size(sid) {
+    return get_struct_size(sid);
+}
+
+// Byte offset of a named field. Returns -1 if the field is not present.
+// For bit-packed fields, this is the byte containing the bits; use
+// struct_field_bit_offset for the position within that byte.
+struct_field_offset(sid, field_name_packed) {
+    auto fields, byte_offs, fc, i;
+    fields    = arr_get(sd_fields,    sid);
+    byte_offs = arr_get(sd_byte_offs, sid);
+    fc        = arr_get(sd_fcounts,   sid);
+    for (i = 0; i < fc; i = i + 1) {
+        if (packed_eq(*(fields + i * 8), field_name_packed)) {
+            return *(byte_offs + i * 8);
+        }
+    }
+    return 0 - 1;
+}
+
+// Bit offset within the byte for bit-packed fields. Returns 0 for
+// byte-aligned or unknown fields. Codegen consults this only when
+// the field's type slice is SL_BIT..SL_BIT7.
+struct_field_bit_offset(sid, field_name_packed) {
+    return get_field_bit_off(sid, field_name_packed);
+}
+
+// Bit width (1..7) of a bit-packed field, 0 for byte+ fields.
+struct_field_bit_width(sid, field_name_packed) {
+    return get_field_bit_width(sid, field_name_packed);
+}
+
+// Number of fields in a struct.
+struct_field_count(sid) {
+    return arr_get(sd_fcounts, sid);
+}
+
+// Packed name ref of a specific field by index (0-based).
+// Returns 0 if sid or fidx is out of range.
+struct_field_name(sid, fidx) {
+    auto fields, fc;
+    if (sid < 0) { return 0; }
+    fc = arr_get(sd_fcounts, sid);
+    if (fidx < 0 || fidx >= fc) { return 0; }
+    fields = arr_get(sd_fields, sid);
+    return *(fields + fidx * 8);
+}
+
+// Type hint (TY_*) of a specific field by index. 0 for untyped.
+struct_field_hint(sid, fidx) {
+    auto hints, fc;
+    if (sid < 0) { return 0; }
+    fc = arr_get(sd_fcounts, sid);
+    if (fidx < 0 || fidx >= fc) { return 0; }
+    hints = arr_get(sd_fhints, sid);
+    return *(hints + fidx * 8);
+}
+
+// Total count of registered structs.
+struct_count() {
+    return arr_len(sd_names);
+}
+
+// Packed name of a struct by sid.
+struct_name(sid) {
+    if (sid < 0) { return 0; }
+    if (sid >= arr_len(sd_names)) { return 0; }
+    return arr_get(sd_names, sid);
+}
+
 // ── AST node creation ──────────────────────────────────────
 
 // Allocate a new AST node of the given type from the AST arena.
