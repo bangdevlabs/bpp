@@ -76,6 +76,45 @@ against the jedi handoff canaries. Full write-up in
   (8 control-flow primitives — first wave with real chip-code
   shrink, **−198 LOC net**)
 
+### Shipped 2026-04-20 (evening) — Backend closeout scaffolding
+
+Following the Phase 3.4 close, the user pointed at
+`docs/phase_backend_closeout.md` (Wave 9 + Phase 3.5 + Phase 4
+spec). This session shipped scaffolding for ALL 6 remaining
+waves: contract slots declared, primitive functions in
+chip files (real bodies for trivial ones, stubs for complex),
+cg_install_<chip>_primitives wires every slot. Spine
+cg_emit_func/_module/_all NOT activated — chip's existing
+inline emit_func/module/all keeps producing identical output.
+Byte-identity verified.
+
+- ✅ Wave 9 scaffolding (commit 9ccf082) — 14 T_CALL primitives,
+  bodies real where trivial (arg_reg_*, push_arg_int, pre/post
+  align, call_direct, copy_ret_*) + stubs where complex
+  (call_extern, save/restore_caller_saved, push_arg_flt)
+- ✅ Phase 3.5+4 scaffolding (commit 315b896) — 13 primitives
+  for emit_func + emit_module + emit_all, all stub bodies
+
+**Followup session work (Wave 9b + activation)**
+
+Documented in `docs/phase_backend_closeout.md` and the
+2026-04-20 evening journal entry. The followup session:
+1. Writes real bodies for stubbed primitives
+2. Writes cg_emit_func / _module / _all in spine
+3. Flips dispatch: chip's emit_func/etc. becomes thin delegate
+4. Validates byte-identity per wave activation
+
+After followup ships, B++ backend is fully Forth-portable.
+RISC-V port unblocked.
+
+End-of-session canary hashes (next session's baseline):
+```
+HEAD       315b896  Phase 3.5+4 scaffolding
+pathfind   50caa64bfa7f4476d0780c5857304db66176d852  (must stay)
+rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009  (must stay)
+bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02  (must stay)
+```
+
 **Phase 3.4 — Waves 8/10 shipped, 9 deferred, 11 N/A, 12 collateral**
 
 - ✅ Wave 8 — `T_MEMLD / T_MEMST (int path) / T_ADDR` via
