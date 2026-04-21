@@ -38,6 +38,14 @@ static extrn _menu_build_req;
 // items can fire independently.
 static extrn _menu_open_root_req;
 
+// Persistent flag: Help menu toggles a cheatsheet overlay. Unlike
+// the one-shot request flags above, this one stays set until the
+// user clicks Help again or presses ESC, so the overlay is drawn
+// every frame it's visible. Kept in shell.bsm because the overlay
+// is window chrome, not a panel — it floats over whichever tab is
+// currently active.
+static extrn _menu_help_visible;
+
 shell_take_build_request() {
     auto r;
     r = _menu_build_req;
@@ -52,6 +60,98 @@ shell_take_open_root_request() {
     return r;
 }
 
+// Draw the Help overlay if it's currently toggled on. A semi-
+// transparent dimmer behind a framed cheatsheet of every hotkey
+// and menu action Bang 9 understands. Called from bang9.bpp after
+// the panel body so the overlay floats above everything else.
+// ESC or a second Help click dismisses it.
+void shell_draw_help_overlay(win_w, win_h) {
+    auto cx, cy, bx, by, bw, bh, ly;
+    if (_menu_help_visible == 0) { return; }
+
+    // Dimmer across the entire window.
+    draw_rect(0, 0, win_w, win_h, rgba(0, 0, 0, 160));
+
+    bw = 480;
+    bh = 340;
+    bx = (win_w - bw) / 2;
+    by = (win_h - bh) / 2;
+
+    // Card.
+    draw_rect(bx, by, bw, bh, _theme.surface);
+    draw_rect(bx, by, bw, 1, _theme.accent);
+    draw_rect(bx, by + bh - 1, bw, 1, _theme.accent);
+    draw_rect(bx, by, 1, bh, _theme.accent);
+    draw_rect(bx + bw - 1, by, 1, bh, _theme.accent);
+
+    // Title bar.
+    draw_rect(bx, by, bw, 28, _theme.surface_alt);
+    draw_text("Bang 9 — Help", bx + 12, by + 6,
+              UI_FONT_SZ, _theme.text);
+    draw_text("[ESC to close]", bx + bw - 120, by + 6,
+              UI_FONT_SZ, _theme.text_muted);
+
+    ly = by + 44;
+    draw_text("Hotkeys", bx + 16, ly, UI_FONT_SZ, _theme.accent);
+    ly = ly + UI_FONT_SZ + 6;
+    draw_text("  F2  save current file", bx + 16, ly,
+              UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  F5  refresh project tree", bx + 16, ly,
+              UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  F7  build project", bx + 16, ly,
+              UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  F8  build + run", bx + 16, ly,
+              UI_FONT_SZ, _theme.text);
+
+    ly = ly + UI_FONT_SZ + 10;
+    draw_text("Tabs", bx + 16, ly, UI_FONT_SZ, _theme.accent);
+    ly = ly + UI_FONT_SZ + 6;
+    draw_text("  Project  browse files, click [d] to descend,",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("            [..] to go up, click a file to open",
+              bx + 16, ly, UI_FONT_SZ, _theme.text_muted);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Sprites  ModuLab pixel editor (embedded)",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Levels   Tilemap editor (embedded)",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Code     Read-only source viewer",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Run      Build log + exit status",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+
+    ly = ly + UI_FONT_SZ + 10;
+    draw_text("Menu", bx + 16, ly, UI_FONT_SZ, _theme.accent);
+    ly = ly + UI_FONT_SZ + 6;
+    draw_text("  File   pick a new project folder",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Build  compile current project",
+              bx + 16, ly, UI_FONT_SZ, _theme.text);
+    ly = ly + UI_FONT_SZ + 2;
+    draw_text("  Edit / View  stubs (coming soon)",
+              bx + 16, ly, UI_FONT_SZ, _theme.text_muted);
+
+    // Note: we don't bind ESC here because ESC is already the
+    // global Bang 9 quit key via game_should_quit(). F1 toggle
+    // happens in the main loop (bang9.bpp), or the user can click
+    // Help in the menu bar again to dismiss.
+}
+
+// Exposed toggle for the main loop's F1 hotkey. Inline flip so we
+// don't have to expose the flag itself across the module boundary.
+void shell_help_toggle() {
+    if (_menu_help_visible != 0) { _menu_help_visible = 0; }
+    else                          { _menu_help_visible = 1; }
+}
+
 // ── Menu bar ────────────────────────────────────────────────
 //
 // Top strip with application-level commands. Clickable; for v0.1
@@ -62,15 +162,27 @@ shell_take_open_root_request() {
 // plumb" gesture to eventually replace most pull-downs, leaving
 // the menu bar mostly as a landing pad for discoverability.
 
-static void _menubar_draw_item(label, x, y, hover) {
+// Draw a single menu item. Live items (File / Build / Help) take
+// the normal text color; stub items (Edit / View) render in a
+// dimmed greyish tone so the user can see at a glance that they
+// aren't wired to anything yet. Hover only lights up for live
+// items — stubs stay flat so the cursor doesn't promise a reaction
+// the menu can't deliver.
+static void _menubar_draw_item(label, x, y, hover, live) {
     auto color;
-    color = hover != 0 ? _theme.text : _theme.text_muted;
-    draw_text(label, x, y, UI_FONT_SZ, color);
+    if (live == 0) {
+        // Stub: dim and never highlights.
+        draw_text(label, x, y, UI_FONT_SZ,
+                  rgba(160, 160, 140, 255));
+    } else {
+        color = hover != 0 ? _theme.text : _theme.text_muted;
+        draw_text(label, x, y, UI_FONT_SZ, color);
+    }
 }
 
 void shell_draw_menubar(x, y, w, h) {
-    auto items, n_items, i, ix, label, mx, my;
-    auto label_w, hover;
+    auto items, lives, n_items, i, ix, label, mx, my;
+    auto label_w, hover, live;
 
     // Background + 1px bottom rule separates chrome from tab strip.
     draw_rect(x, y, w, h, _theme.surface);
@@ -78,11 +190,12 @@ void shell_draw_menubar(x, y, w, h) {
 
     n_items = 5;
     items = malloc(n_items * 8);
-    *(items + 0 * 8) = "File";
-    *(items + 1 * 8) = "Edit";
-    *(items + 2 * 8) = "View";
-    *(items + 3 * 8) = "Build";
-    *(items + 4 * 8) = "Help";
+    lives = malloc(n_items * 8);
+    *(items + 0 * 8) = "File";   *(lives + 0 * 8) = 1;
+    *(items + 1 * 8) = "Edit";   *(lives + 1 * 8) = 0;
+    *(items + 2 * 8) = "View";   *(lives + 2 * 8) = 0;
+    *(items + 3 * 8) = "Build";  *(lives + 3 * 8) = 1;
+    *(items + 4 * 8) = "Help";   *(lives + 4 * 8) = 1;
 
     mx = mouse_x();
     my = mouse_y();
@@ -90,26 +203,43 @@ void shell_draw_menubar(x, y, w, h) {
     ix = x + 12;
     for (i = 0; i < n_items; i = i + 1) {
         label = *(items + i * 8);
+        live  = *(lives + i * 8);
         label_w = measure_text(label, UI_FONT_SZ);
         hover = point_in_rect(mx, my, ix - 6, y, label_w + 12, h);
-        if (hover != 0) {
+        // Only highlight the hover background for live items. Stubs
+        // stay flat so the user's cursor doesn't get a false "yes I
+        // do something" signal.
+        if (hover != 0 && live != 0) {
             draw_rect(ix - 6, y, label_w + 12, h - 1, _theme.surface_alt);
         }
-        _menubar_draw_item(label, ix, y + (h - UI_FONT_SZ) / 2, hover);
+        _menubar_draw_item(label, ix, y + (h - UI_FONT_SZ) / 2,
+                           hover, live);
 
-        // Click dispatch. "File" (index 0) opens the native folder
-        // picker so the user can switch the project root at runtime.
-        // "Build" (index 3) mirrors the F7 hotkey. Edit / View / Help
-        // still light up on hover but have no bound command yet.
-        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+        // Click dispatch.
+        //   File  (0) — open native folder picker to repoint project
+        //               root.
+        //   Build (3) — mirrors F7: build current project + switch
+        //               to Run tab.
+        //   Help  (4) — toggle the floating cheatsheet overlay.
+        //   Edit/View — visual stubs, intentionally no-op.
+        if (hover != 0 && live != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
             if      (i == 0) { _menu_open_root_req = 1; }
             else if (i == 3) { _menu_build_req     = 1; }
+            else if (i == 4) {
+                // Toggle help overlay. We flip visibility inline
+                // (not a one-shot request) because the overlay is
+                // drawn by shell_draw_help_overlay every frame it's
+                // visible — no main-loop plumbing needed.
+                if (_menu_help_visible != 0) { _menu_help_visible = 0; }
+                else                          { _menu_help_visible = 1; }
+            }
         }
 
         ix = ix + label_w + 24;
     }
 
     free(items);
+    free(lives);
 }
 
 // ── Tab strip ───────────────────────────────────────────────

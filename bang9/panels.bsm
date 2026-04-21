@@ -97,6 +97,58 @@ static void _placeholder(x, y, w, h, title, subtitle) {
 // Will list files/folders relative to g_proj_root, clickable to
 // open files in the Code panel. v0.2 work.
 
+// Append "/<name>" to g_proj_root and return the new heap-allocated
+// path. Used when the user clicks a [d] entry to descend into a
+// subdirectory. Caller takes ownership.
+static _project_join(name) {
+    auto root_len, name_len, p, j;
+    root_len = str_len(g_proj_root);
+    name_len = str_len(name);
+    p = malloc(root_len + 1 + name_len + 1);
+    for (j = 0; j < root_len; j = j + 1) {
+        poke(p + j, peek(g_proj_root + j));
+    }
+    poke(p + root_len, 47);   // '/'
+    for (j = 0; j < name_len; j = j + 1) {
+        poke(p + root_len + 1 + j, peek(name + j));
+    }
+    poke(p + root_len + 1 + name_len, 0);
+    return p;
+}
+
+// Return a heap-allocated copy of g_proj_root with the trailing
+// path segment removed. Used by the ".." row. If we're already at
+// "/" we stay put (returns a copy of "/").
+static _project_parent() {
+    auto plen, i, last_slash, p;
+    plen = str_len(g_proj_root);
+    if (plen <= 1) {
+        // Already at "/" or "" — give back a fresh copy of "/".
+        p = malloc(2);
+        poke(p + 0, 47);   // '/'
+        poke(p + 1, 0);
+        return p;
+    }
+    last_slash = 0;
+    // Scan for the LAST '/' that is not the trailing byte.
+    for (i = 0; i < plen; i = i + 1) {
+        if (peek(g_proj_root + i) == 47) { last_slash = i; }
+    }
+    if (last_slash == 0) {
+        // Root-level segment like "pathfind" — parent is "/".
+        p = malloc(2);
+        poke(p + 0, 47);
+        poke(p + 1, 0);
+        return p;
+    }
+    p = malloc(last_slash + 1);
+    for (i = 0; i < last_slash; i = i + 1) {
+        poke(p + i, peek(g_proj_root + i));
+    }
+    poke(p + last_slash, 0);
+    return p;
+}
+
 static void _panel_project(x, y, w, h) {
     auto margin, hy;
     margin = 24;
@@ -133,6 +185,39 @@ static void _panel_project(x, y, w, h) {
         _project_refresh();
     }
 
+    auto row_h, mx, my, new_root;
+    row_h = UI_FONT_SZ + 4;
+    mx = mouse_x();
+    my = mouse_y();
+
+    // ── ".." row ──
+    // Always drawn first so the user has a way back up the tree.
+    // Hidden only at the filesystem root ("/") where there's
+    // nowhere further to ascend.
+    auto at_root;
+    at_root = 0;
+    if (str_len(g_proj_root) <= 1) { at_root = 1; }
+    if (at_root == 0) {
+        auto up_hover;
+        up_hover = point_in_rect(mx, my, x + margin, hy,
+                                 w - margin * 2, row_h);
+        if (up_hover != 0) {
+            draw_rect(x + margin, hy, w - margin * 2, row_h,
+                      _theme.surface_alt);
+        }
+        draw_text("[..]", x + margin + 4, hy + 2,
+                  UI_FONT_SZ, _theme.text_muted);
+        draw_text("parent directory", x + margin + 4 + 48, hy + 2,
+                  UI_FONT_SZ, _theme.accent);
+        if (up_hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+            new_root = _project_parent();
+            g_proj_root = new_root;
+            _project_refresh();
+            return;
+        }
+        hy = hy + row_h;
+    }
+
     // Render entries.
     if (_g_proj_entries == 0) {
         draw_text("(cannot read directory)",
@@ -141,10 +226,9 @@ static void _panel_project(x, y, w, h) {
         return;
     }
 
-    auto n, i, name, is_dir, row_h;
-    auto ly, mx, my, hover, row_color;
+    auto n, i, name, is_dir;
+    auto ly, hover, row_color;
     n = dir_count(_g_proj_entries);
-    row_h = UI_FONT_SZ + 4;
 
     if (n == 0) {
         draw_text("(empty directory)",
@@ -152,9 +236,6 @@ static void _panel_project(x, y, w, h) {
                   UI_FONT_SZ, _theme.text_muted);
         return;
     }
-
-    mx = mouse_x();
-    my = mouse_y();
 
     for (i = 0; i < n; i = i + 1) {
         ly = hy + i * row_h - _g_proj_scroll;
@@ -188,28 +269,25 @@ static void _panel_project(x, y, w, h) {
         draw_text(name, x + margin + 4 + pw, ly + 2,
                   UI_FONT_SZ, row_color);
 
-        // Click on a file (not dir) stages it for opening in the
-        // Code panel. We build the full path as g_proj_root + "/"
-        // + name and hand it to the editor via _g_pending_open_path.
-        // Directories are left as click-targets for future
-        // sub-tree navigation.
-        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0
-            && is_dir == 0) {
-            auto root_len, name_len, full_path, j;
-            root_len = str_len(g_proj_root);
-            name_len = str_len(name);
-            full_path = malloc(root_len + 1 + name_len + 1);
-            for (j = 0; j < root_len; j = j + 1) {
-                poke(full_path + j, peek(g_proj_root + j));
+        // Click dispatch depends on entry type:
+        //   [d] directory → descend (replace g_proj_root, refresh).
+        //   file          → open in Code panel and jump to Code tab.
+        // Either way we consume exactly one click per frame.
+        if (hover != 0 && mouse_pressed(MOUSE_LEFT) != 0) {
+            if (is_dir != 0) {
+                new_root = _project_join(name);
+                g_proj_root = new_root;
+                _project_refresh();
+                return;   // listing invalidated — bail out of the loop
+            } else {
+                auto full_path;
+                full_path = _project_join(name);
+                if (_g_pending_open_path != 0) {
+                    free(_g_pending_open_path);
+                }
+                _g_pending_open_path = full_path;
+                g_active_tab = 3;   // switch to Code tab
             }
-            poke(full_path + root_len, 47);  // '/'
-            for (j = 0; j < name_len; j = j + 1) {
-                poke(full_path + root_len + 1 + j, peek(name + j));
-            }
-            poke(full_path + root_len + 1 + name_len, 0);
-            if (_g_pending_open_path != 0) { free(_g_pending_open_path); }
-            _g_pending_open_path = full_path;
-            g_active_tab = 2;   // switch to Code tab
         }
     }
 }
@@ -312,12 +390,12 @@ static void _panel_code(x, y, w, h) {
     // Run tab so the user sees the log immediately.
     if (editor_take_build_request() != 0) {
         runner_build(g_proj_root);
-        g_active_tab = 3;
+        g_active_tab = 4;
     }
     if (editor_take_run_request() != 0) {
         auto rc;
         rc = runner_build(g_proj_root);
-        g_active_tab = 3;
+        g_active_tab = 4;
         if (rc == 0) { runner_run(g_proj_root); }
     }
 }

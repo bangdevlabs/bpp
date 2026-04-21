@@ -37,11 +37,50 @@ static extrn _runner_log_buf;
 static extrn _runner_log_len;
 static extrn _runner_last_status;
 
+// Resolved path to the bpp compiler binary. Picked once at init by
+// probing common install locations in order of preference:
+//
+//   1. /usr/local/bin/bpp           (install.sh default)
+//   2. ./bpp                        (dev: Bang 9 launched from repo)
+//   3. bpp                          (PATH fallback — let /bin/sh find it)
+//
+// Storing the resolved path means every build command embeds the
+// full absolute location, so the shell doesn't have to re-probe
+// each time and the user doesn't care which working directory the
+// IDE happens to inherit.
+static extrn _BPP_EXE;
+
+// Probe a candidate path to see if it's a readable file. Returns 1
+// if file_read_all can open it (even an empty file counts), 0 else.
+// We use file_read_all + free instead of a dedicated stat call
+// because B++ doesn't yet expose sys_access.
+static _path_exists(path) : io {
+    auto sz, buf;
+    sz = malloc(8);
+    *(sz) = 0;
+    buf = file_read_all(path, sz);
+    free(sz);
+    if (buf == 0) { return 0; }
+    free(buf);
+    return 1;
+}
+
 void runner_init() {
     _RUNNER_LOG = "/tmp/bang9_runner.log";
     _runner_log_buf = 0;
     _runner_log_len = 0;
     _runner_last_status = 0 - 1;   // "never ran"
+
+    // Resolve bpp location now so the user gets an immediate error
+    // at startup if the compiler is missing, not a confusing
+    // "./bpp: No such file or directory" on their first build.
+    if (_path_exists("/usr/local/bin/bpp") != 0) {
+        _BPP_EXE = "/usr/local/bin/bpp";
+    } else if (_path_exists("./bpp") != 0) {
+        _BPP_EXE = "./bpp";
+    } else {
+        _BPP_EXE = "bpp";   // trust PATH as a last resort
+    }
 }
 
 // Derive the entry .bpp file for a project root. Convention:
@@ -128,24 +167,25 @@ static void _runner_reload_log() : io {
 }
 
 // Shell-escape-free command builder. Produces
-//   "./bpp <entry> -o <output> > <log> 2>&1"
-// into a heap buffer. Caller frees.
+//   "<_BPP_EXE> <entry> -o <output> > <log> 2>&1"
+// into a heap buffer. Caller frees. _BPP_EXE was resolved at
+// runner_init() to the first bpp binary found on disk (usually
+// /usr/local/bin/bpp after a global install).
 static _runner_build_cmd(entry, output, log) {
     auto buf, cap, i, j;
-    auto elen, olen, llen;
+    auto elen, olen, llen, bpplen;
     elen = str_len(entry);
     olen = str_len(output);
     llen = str_len(log);
+    bpplen = str_len(_BPP_EXE);
 
-    cap = elen + olen + llen + 64;
+    cap = bpplen + elen + olen + llen + 64;
     buf = malloc(cap);
     i = 0;
-    // "./bpp " prefix
-    poke(buf + i, 46);  i = i + 1;  // '.'
-    poke(buf + i, 47);  i = i + 1;  // '/'
-    poke(buf + i, 98);  i = i + 1;  // 'b'
-    poke(buf + i, 112); i = i + 1;  // 'p'
-    poke(buf + i, 112); i = i + 1;  // 'p'
+    // bpp executable path (resolved once at init)
+    for (j = 0; j < bpplen; j = j + 1) {
+        poke(buf + i, peek(_BPP_EXE + j)); i = i + 1;
+    }
     poke(buf + i, 32);  i = i + 1;  // ' '
     // entry
     for (j = 0; j < elen; j = j + 1) {
