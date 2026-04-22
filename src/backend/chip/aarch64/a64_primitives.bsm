@@ -749,9 +749,61 @@ void _a64_emit_pop_discard() {
     cg_depth = cg_depth - 1;
 }
 
-void _a64_emit_binop_save_left(has_call_right, left_reg_hint) { }
+// Save the left operand of a T_BINOP. Returns save_token:
+//   -1 → pushed on float stack, -2 → on GP stack, >=0 → freelist reg.
+_a64_emit_binop_save_left(has_call_right, lty) {
+    auto alloc_reg;
+    if (lty == 1) { a64_emit_fpush(); return 0 - 1; }
+    if (has_call_right) { a64_emit_push(); return 0 - 2; }
+    alloc_reg = a64_gp_alloc();
+    if (alloc_reg >= 0) {
+        if (a64_bin_mode) { enc_mov_reg(alloc_reg, 0); }
+        else { out("  mov x"); a64_print_dec(alloc_reg); out(", x0"); putchar('\n'); }
+        return alloc_reg;
+    }
+    a64_emit_push();
+    return 0 - 2;
+}
 
-_a64_emit_binop_retrieve_left(has_call_right, saved_reg) { return saved_reg; }
+// Coerce right, retrieve left into the correct register, and return
+// left_reg_int for the integer op primitive. On float path, return
+// value is ignored (d1 = left, d0 = right).
+_a64_emit_binop_resolve(save_token, use_flt, lty, rty) {
+    if (use_flt) {
+        if (rty == 0) {
+            if (a64_bin_mode) { enc_scvtf(0, 0); }
+            else { out("  scvtf d0, x0"); putchar('\n'); }
+        }
+        if (save_token == 0 - 1) {
+            a64_emit_fpop(1);
+        } else if (save_token >= 0) {
+            if (a64_bin_mode) { enc_scvtf(1, save_token); }
+            else { out("  scvtf d1, x"); a64_print_dec(save_token); putchar('\n'); }
+            a64_gp_free(save_token);
+        } else {
+            a64_emit_pop(1);
+            if (a64_bin_mode) { enc_scvtf(1, 1); }
+            else { out("  scvtf d1, x1"); putchar('\n'); }
+        }
+        return 0;
+    }
+    if (rty == 1) {
+        if (a64_bin_mode) { enc_fcvtzs(0, 0); }
+        else { out("  fcvtzs x0, d0"); putchar('\n'); }
+    }
+    if (save_token == 0 - 1) {
+        a64_emit_fpop(0);
+        if (a64_bin_mode) { enc_fcvtzs(1, 0); }
+        else { out("  fcvtzs x1, d0"); putchar('\n'); }
+        return 1;
+    }
+    if (save_token >= 0) {
+        a64_gp_free(save_token);
+        return save_token;
+    }
+    a64_emit_pop(1);
+    return 1;
+}
 
 void _a64_emit_addr_stack_struct(frame_off) {
     if (a64_bin_mode) { enc_add_imm(0, 29, frame_off); }

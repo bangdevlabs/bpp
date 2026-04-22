@@ -330,8 +330,8 @@ struct ChipPrimitives {
     // stay unwired for now — the chip's emit_node still handles
     // these cases inline — but the slots exist so the follow-up
     // session that decomposes the tree walker has a target surface.
-    emit_binop_save_left,     // (has_call_right, left_reg_hint) — save left operand
-    emit_binop_retrieve_left, // (has_call_right, saved_reg) → reg holding left
+    emit_binop_save_left,     // (has_call_right, lty) → save_token
+    emit_binop_resolve,       // (save_token, use_flt, lty, rty) → left_reg_int
     emit_addr_stack_struct,   // (frame_off) — acc ← fp + frame_off (stack-struct addr-of)
 
     // Wave 20 stage 2: T_ASSIGN type-aware store into a local variable
@@ -1669,10 +1669,11 @@ cg_emit_node(nd) {
     if (t == T_LIT) { return cg_emit_lit(n.a); }
     if (t == T_VAR) {
         vi = cg_var_idx(n.a);
-        // Stack-struct address-of still falls back to the chip walker
-        // until the emit_addr_stack_struct primitive is wired live.
+        // Stack-struct address-of uses the chip's emit_addr_stack_struct
+        // primitive (add-imm on aarch64, lea on x86_64).
         if (vi >= 0 && arr_get(cg_var_stack, vi)) {
-            return call(p.emit_node, nd);
+            call(p.emit_addr_stack_struct, arr_get(cg_var_off, vi));
+            return 0;
         }
         return cg_emit_var(n.a);
     }
@@ -1729,8 +1730,76 @@ cg_emit_node(nd) {
         return 0;
     }
 
-    // T_BINOP stays with the chip walker until the save_left /
-    // retrieve_left primitives ship.
+    // T_BINOP: evaluate left, save via chip primitive (picks freelist
+    // on aarch64 / stack on x86_64), evaluate right, resolve via
+    // chip primitive (which handles sub-word coercion + retrieves
+    // left into the correct register). Operator dispatch lands on
+    // the existing arithmetic / comparison primitives.
+    if (t == T_BINOP) {
+        auto op_s, op_l, c0, c1, is_io, lty, rty, use_flt;
+        auto save_token, left_reg_int;
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        c0 = peek(cg_sbuf + op_s);
+        c1 = 0; if (op_l > 1) { c1 = peek(cg_sbuf + op_s + 1); }
+
+        is_io = 0;
+        if (c0 == '%' || c0 == '^') { is_io = 1; }
+        if ((c0 == '&' || c0 == '|') && op_l == 1) { is_io = 1; }
+        if ((c0 == '<' && c1 == '<') || (c0 == '>' && c1 == '>')) { is_io = 1; }
+
+        lty = call(p.emit_node, n.b);
+        save_token = call(p.emit_binop_save_left, cg_has_call(n.c), lty);
+
+        rty = call(p.emit_node, n.c);
+
+        use_flt = 0;
+        if (is_io == 0) {
+            if (lty == 1 || rty == 1) { use_flt = 1; }
+        }
+
+        left_reg_int = call(p.emit_binop_resolve, save_token, use_flt, lty, rty);
+
+        if (use_flt == 1) {
+            if (c0 == '+' && op_l == 1) { call(p.emit_fadd); return 1; }
+            if (c0 == '-' && op_l == 1) { call(p.emit_fsub); return 1; }
+            if (c0 == '*' && op_l == 1) { call(p.emit_fmul); return 1; }
+            if (c0 == '/' && op_l == 1) { call(p.emit_fdiv); return 1; }
+            if (c0 == '=' && c1 == '=') { call(p.emit_cmp_flt, CG_CC_EQ); return 0; }
+            if (c0 == '!' && c1 == '=') { call(p.emit_cmp_flt, CG_CC_NE); return 0; }
+            if (c0 == '<') {
+                if (c1 == '=') { call(p.emit_cmp_flt, CG_CC_LE); return 0; }
+                if (op_l == 1) { call(p.emit_cmp_flt, CG_CC_LT); return 0; }
+            }
+            if (c0 == '>') {
+                if (c1 == '=') { call(p.emit_cmp_flt, CG_CC_GE); return 0; }
+                if (op_l == 1) { call(p.emit_cmp_flt, CG_CC_GT); return 0; }
+            }
+            return 1;
+        }
+        if (c0 == '+' && op_l == 1) { call(p.emit_add, left_reg_int); return 0; }
+        if (c0 == '-' && op_l == 1) { call(p.emit_sub, left_reg_int); return 0; }
+        if (c0 == '*' && op_l == 1) { call(p.emit_mul, left_reg_int); return 0; }
+        if (c0 == '/' && op_l == 1) { call(p.emit_div, left_reg_int); return 0; }
+        if (c0 == '%' && op_l == 1) { call(p.emit_mod, left_reg_int); return 0; }
+        if (c0 == '&' && op_l == 1) { call(p.emit_and, left_reg_int); return 0; }
+        if (c0 == '|' && op_l == 1) { call(p.emit_or,  left_reg_int); return 0; }
+        if (c0 == '^' && op_l == 1) { call(p.emit_xor, left_reg_int); return 0; }
+        if (c0 == '>' && c1 == '>') { call(p.emit_shr, left_reg_int); return 0; }
+        if (c0 == '<' && c1 == '<') { call(p.emit_shl, left_reg_int); return 0; }
+        if (c0 == '=' && c1 == '=') { call(p.emit_cmp_int, CG_CC_EQ, left_reg_int); return 0; }
+        if (c0 == '!' && c1 == '=') { call(p.emit_cmp_int, CG_CC_NE, left_reg_int); return 0; }
+        if (c0 == '<') {
+            if (c1 == '=') { call(p.emit_cmp_int, CG_CC_LE, left_reg_int); return 0; }
+            if (op_l == 1) { call(p.emit_cmp_int, CG_CC_LT, left_reg_int); return 0; }
+        }
+        if (c0 == '>') {
+            if (c1 == '=') { call(p.emit_cmp_int, CG_CC_GE, left_reg_int); return 0; }
+            if (op_l == 1) { call(p.emit_cmp_int, CG_CC_GT, left_reg_int); return 0; }
+        }
+        return 0;
+    }
+
+    // Unreached after validate; chip walker as safety net.
     return call(p.emit_node, nd);
 }
 
