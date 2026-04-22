@@ -334,6 +334,11 @@ struct ChipPrimitives {
     emit_binop_retrieve_left, // (has_call_right, saved_reg) → reg holding left
     emit_addr_stack_struct,   // (frame_off) — acc ← fp + frame_off (stack-struct addr-of)
 
+    // Wave 20 stage 2: T_ASSIGN type-aware store into a local variable
+    // (sub-word hints resolve here — `: half` / `: quarter` / struct
+    // byte widths). rty is the RHS emit_node result (0=int, 1=float).
+    emit_store_var_typed,     // (vi, off, rty)
+
     // ── Wave 19: function-frame orchestration primitives ──
     // The eight slots below are consumed by the portable cg_emit_func
     // (bpp_codegen.bsm) once it takes over from a64_emit_func /
@@ -1594,6 +1599,38 @@ void cg_emit_func(fi) {
     call(p.emit_frame_teardown, frame);
 }
 
+// Portable "does this AST subtree contain a T_CALL?" walker. Used by
+// the T_MEMST path to decide between a freelist save (safe only if
+// the right-hand pointer computation does not clobber caller-saved
+// registers) and a stack push / pop (always safe, costlier). Lifted
+// from the chip-local _a64_has_call / _x64_has_call which had two
+// byte-identical copies.
+cg_has_call(nd) {
+    auto n: Node, t;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    switch (t) {
+    T_CALL { return 1; }
+    T_BINOP {
+        if (cg_has_call(n.b)) { return 1; }
+        return cg_has_call(n.c);
+    }
+    T_TERNARY {
+        if (cg_has_call(n.a)) { return 1; }
+        if (cg_has_call(n.b)) { return 1; }
+        return cg_has_call(n.c);
+    }
+    T_ASSIGN, T_MEMST {
+        if (cg_has_call(n.a)) { return 1; }
+        return cg_has_call(n.b);
+    }
+    T_UNARY { return cg_has_call(n.b); }
+    T_MEMLD, T_ADDR, T_RET { return cg_has_call(n.a); }
+    else { return 0; }
+    }
+}
+
 // Wave 21 takeover: the spine dispatches expression emission through
 // the existing emit_node ChipPrimitives slot. The chip's tree walker
 // continues to own the T_BINOP / T_UNARY / T_CALL / T_MEMLD / T_ADDR
@@ -1702,11 +1739,53 @@ void cg_emit_stmt(nd) {
         return 0;
     }
 
-    // The three tangled cases stay chip-local until their supporting
-    // primitives (store_var_typed / memst_float_narrow / memst_simd /
-    // switch_jtbl / pop_discard) land. emit_stmt_full is still bound
-    // to the chip walker; let it handle these paths verbatim.
-    if (t == T_ASSIGN) { call(p.emit_stmt_full, nd); return 0; }
+    // T_ASSIGN: stack struct copy takes a dedicated path (source
+    // address in acc, emit per-word load/store via primitive); every
+    // other shape evaluates the RHS then stores into a local (typed
+    // primitive) or a global (primitive with float coercion).
+    if (t == T_ASSIGN) {
+        auto lhs: Node, vi, off;
+        lhs = n.a;
+        if (lhs.ntype == T_VAR) {
+            vi = cg_var_idx(lhs.a);
+            if (vi >= 0) {
+                if (arr_get(cg_var_stack, vi)) {
+                    auto sidx, fc, j;
+                    call(p.emit_node, n.b);
+                    off = arr_get(cg_var_off, vi);
+                    sidx = arr_get(cg_var_struct_idx, vi);
+                    fc = (get_struct_size(sidx) + 7) / 8;
+                    j = 0;
+                    while (j < fc) {
+                        call(p.emit_struct_copy_word, j * 8, off + j * 8);
+                        j = j + 1;
+                    }
+                    return 0;
+                }
+            }
+        }
+        rty = call(p.emit_node, n.b);
+        if (lhs.ntype == T_VAR) {
+            vi = cg_var_idx(lhs.a);
+            if (vi >= 0) {
+                off = arr_get(cg_var_off, vi);
+                call(p.emit_store_var_typed, vi, off, rty);
+            } else {
+                if (is_float_type(ty_get_global_type(lhs.a))) {
+                    if (rty == 0) { call(p.emit_promote_int_to_flt); }
+                    call(p.emit_store_global, lhs.a, 1);
+                } else {
+                    if (rty == 1) { call(p.emit_demote_flt_to_int); }
+                    call(p.emit_store_global, lhs.a, 0);
+                }
+            }
+        }
+        return 0;
+    }
+
+    // T_MEMST and T_SWITCH still fall through to the chip walker
+    // while the float-narrow-store, SIMD-store, and switch-jtbl
+    // primitives await their stage-3 lift.
     if (t == T_MEMST)  { call(p.emit_stmt_full, nd); return 0; }
     if (t == T_SWITCH) { call(p.emit_stmt_full, nd); return 0; }
 
