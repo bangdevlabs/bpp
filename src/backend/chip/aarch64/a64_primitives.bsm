@@ -662,6 +662,43 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
         }
     }
 }
+// Pre-register every variable declared in the function body (walks
+// nested blocks, if-then-else, while bodies, switch cases) so the
+// aarch64 layout pass sees the complete variable set before
+// assigning frame offsets. Thin wrapper around the chip's
+// a64_pre_reg_vars helper defined in a64_codegen.bsm.
+void _a64_fn_pre_reg_vars(body_arr, body_cnt) {
+    a64_pre_reg_vars(body_arr, body_cnt);
+}
+
+// Compute per-variable frame offsets for the aarch64 frame layout
+// and fill cg_var_off. Returns total variable bytes (excluding the
+// hidden fp/lr + d0/d1 scratch area covered by fn_scratch_base).
+// aarch64 uses POSITIVE offsets from fp, crescendo up; SIMD locals
+// need their absolute offset rounded to 16 for STR Q / LDR Q.
+_a64_fn_compute_offsets() {
+    auto i, n_vars, total, _fty, abs_off, sz;
+    total = 0;
+    n_vars = arr_len(cg_vars);
+    for (i = 0; i < n_vars; i = i + 1) {
+        _fty = arr_get(cg_var_forced_ty, i);
+        abs_off = 40 + total;
+        if (slice_width(ty_slice(_fty)) == 128) {
+            abs_off = (abs_off + 15) / 16 * 16;
+            arr_set(cg_var_off, i, abs_off);
+            total = abs_off - 40 + 16;
+        } else if (arr_get(cg_var_stack, i)) {
+            arr_set(cg_var_off, i, abs_off);
+            sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
+            total = total + sz;
+        } else {
+            arr_set(cg_var_off, i, abs_off);
+            total = total + 8;
+        }
+    }
+    return total;
+}
+
 // Narrow float-param precision after the prologue. aarch64 packs
 // the incoming double (passed in d0..d7 per AAPCS64) back down to
 // single / half precision when the declared parameter type is

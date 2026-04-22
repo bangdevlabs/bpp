@@ -197,6 +197,8 @@ void cg_install_arm64_primitives() {
     p.emit_body                  = fn_ptr(_a64_emit_body_prim);
     p.save_main_runtime_globals  = fn_ptr(_a64_save_main_runtime_globals);
     p.emit_narrow_float_params   = fn_ptr(_a64_emit_narrow_float_params);
+    p.fn_pre_reg_vars            = fn_ptr(_a64_fn_pre_reg_vars);
+    p.fn_compute_offsets         = fn_ptr(_a64_fn_compute_offsets);
 }
 
 void init_codegen_arm64() {
@@ -1887,34 +1889,10 @@ void a64_emit_func(fi) {
         i = i + 1;
     }
 
-    // Pre-register all declared variables from body (including nested blocks).
-    a64_pre_reg_vars(body_arr, body_cnt);
-
-    // Compute per-variable frame offsets. Slots start after the 40-byte
-    // hidden area (fp/lr + scratch). `: double` (SIMD) locals need 16
-    // bytes AND a 16-byte aligned absolute address so STR Q / LDR Q get
-    // natural alignment — rounding `total` alone is not enough, since
-    // 40 itself is only 8-aligned; we round `abs_off = 40 + total`.
-    // Stack structs round their size up to 8 so the 8-byte chunked
-    // struct-copy path never spills into the next slot.
-    auto total, sz, _fty, abs_off;
-    total = 0;
-    for (i = 0; i < arr_len(cg_vars); i = i + 1) {
-        _fty = arr_get(cg_var_forced_ty, i);
-        abs_off = 40 + total;
-        if (slice_width(ty_slice(_fty)) == 128) {
-            abs_off = (abs_off + 15) / 16 * 16;
-            arr_set(cg_var_off, i, abs_off);
-            total = abs_off - 40 + 16;
-        } else if (arr_get(cg_var_stack, i)) {
-            arr_set(cg_var_off, i, abs_off);
-            sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
-            total = total + sz;
-        } else {
-            arr_set(cg_var_off, i, abs_off);
-            total = total + 8;
-        }
-    }
+    // Pre-register and compute per-variable frame offsets via primitives.
+    auto total;
+    call(p_func.fn_pre_reg_vars, body_arr, body_cnt);
+    total = call(p_func.fn_compute_offsets);
 
     // Phase B3: walk body, count refs, select promotions.
     auto stmt_i: Node;

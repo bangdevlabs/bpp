@@ -173,6 +173,8 @@ void cg_install_x86_64_primitives() {
     p.emit_body                  = fn_ptr(_x64_emit_body_prim);
     p.save_main_runtime_globals  = fn_ptr(_x64_save_main_runtime_globals);
     p.emit_narrow_float_params   = fn_ptr(_x64_emit_narrow_float_params);
+    p.fn_pre_reg_vars            = fn_ptr(_x64_fn_pre_reg_vars);
+    p.fn_compute_offsets         = fn_ptr(_x64_fn_compute_offsets);
 }
 
 void init_codegen_x86_64() {
@@ -1407,34 +1409,9 @@ void x64_emit_func(fi) {
         i = i + 1;
     }
 
-    // Pre-register all declared variables.
-    x64_pre_reg_vars(body_arr, body_cnt);
-
-    // Compute per-variable frame offsets (negative from rbp).
-    // [rbp - 8]  = scratch, [rbp - 16] = xmm0 save, [rbp - 24] = xmm1
-    // save. First variable at rbp - 32 and so on. `: double` locals
-    // need the absolute offset from rbp to be a multiple of 16 so
-    // MOVUPS / MOVAPS see natural alignment. The scratch area is 24
-    // bytes so `total` starts 8 mod 16 — rounding needs to happen on
-    // `24 + total` (the absolute magnitude), not `total` alone.
-    auto _fty, abs_mag;
-    total = 0;
-    for (i = 0; i < arr_len(cg_vars); i = i + 1) {
-        _fty = arr_get(cg_var_forced_ty, i);
-        abs_mag = 24 + total;
-        if (slice_width(ty_slice(_fty)) == 128) {
-            abs_mag = (abs_mag + 15) / 16 * 16;
-            total = abs_mag - 24 + 16;
-            arr_set(cg_var_off, i, 0 - abs_mag - 16);
-        } else if (arr_get(cg_var_stack, i)) {
-            sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
-            total = total + sz;
-            arr_set(cg_var_off, i, 0 - (24 + total));
-        } else {
-            total = total + 8;
-            arr_set(cg_var_off, i, 0 - (24 + total));
-        }
-    }
+    // Pre-register and compute per-variable frame offsets via primitives.
+    call(p_func.fn_pre_reg_vars, body_arr, body_cnt);
+    total = call(p_func.fn_compute_offsets);
     // Phase B3: walk body, count refs, select promotions. Done before
     // frame size is finalized so the spill area shares the allocation.
     auto stmt_i: Node;
