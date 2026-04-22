@@ -48,8 +48,13 @@ static extrn _aud_queue;
 // start time (samples per half-cycle of the tone); `_aud_phase` is
 // advanced only by the callback thread, so only one writer and one
 // reader touch it from a single thread's point of view. Still declared
-// global to make cross-thread intent explicit. `_aud_amplitude` is
-// fixed by init, read by callback. Rule 1.
+// global to make cross-thread intent explicit.
+//
+// `_aud_amplitude` is the peak sample value written to the stereo
+// s16 output — valid range 0..32767 (negative means muted, clamped
+// to 0 on write). Runtime-settable via `_stb_audio_set_amplitude`;
+// the tone_start path seeds a default of 8000 only when the user
+// has not already chosen a value. Rule 1.
 static extrn _aud_half_period;
 static extrn _aud_amplitude;
 global _aud_phase;
@@ -339,9 +344,13 @@ _stb_audio_tone_start(freq_hz) : io {
     if (rc != 0) { return 2; }
 
     // Seed the oscillator state before any callback fires.
+    // Amplitude defaults to 8000 (~24% of s16 peak, ~-12 dB) only when
+    // the user has not set a volume via audio_set_amplitude or
+    // audio_set_volume beforehand. This preserves pre-session volume
+    // choices while still giving every caller a sane default.
     _aud_queue       = queue;
     _aud_phase       = 0;
-    _aud_amplitude   = 8000;
+    if (_aud_amplitude == 0) { _aud_amplitude = 8000; }
     _aud_half_period = 44100 / freq_hz / 2;
     if (_aud_half_period < 1) { _aud_half_period = 1; }
 
@@ -380,6 +389,35 @@ void _stb_audio_tone_stop() : io {
 // free of syscall surface — only this file touches System.B.
 void _stb_audio_sleep_ms(ms) : io {
     usleep(ms * 1000);
+}
+
+// ── Volume control ───────────────────────────────────────────────
+//
+// The callback reads `_aud_amplitude` every sample to produce the
+// square wave; writing here takes effect on the next sample boundary.
+// No locking: `_aud_amplitude` is a single 64-bit word and the
+// callback reads it with relaxed ordering, so a non-atomic write
+// from the main thread is safe on x86_64 and AArch64 (both guarantee
+// naturally-aligned word stores are atomic). The only hazard would
+// be inter-sample clicks if the delta is huge — a future
+// `audio_fade_to(amp, ms)` helper would smooth that; callers that
+// care can step the value themselves in short frames.
+
+// Set the peak sample amplitude for generated audio (tone + any
+// future oscillators). Input is clamped to 0..32767 so negative
+// values become silent rather than wrap around. Rule 3: side-effect
+// only, returns void.
+void _stb_audio_set_amplitude(amp) : io {
+    if (amp < 0)      { amp = 0; }
+    if (amp > 32767)  { amp = 32767; }
+    _aud_amplitude = amp;
+}
+
+// Read the current peak amplitude. Valid after any set or after
+// tone_start has seeded the default. Returns 0 if nothing has
+// configured the amplitude yet.
+_stb_audio_get_amplitude() : io {
+    return _aud_amplitude;
 }
 
 // ── Iteration 4 public API — SPSC-driven streaming ───────────────

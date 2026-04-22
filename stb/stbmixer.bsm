@@ -74,6 +74,21 @@ static extrn _MX_BUS_COUNT;
 // Bus volumes: 0..100. master is at index MX_BUS_MASTER, etc.
 static extrn _mx_bus_vol;
 
+// Mute state arrays, one pair per bus. `_mx_bus_muted[bus]` is 0
+// or 1; `_mx_bus_saved_vol[bus]` holds the pre-mute volume so
+// unmute restores the exact prior level. Using two words per bus
+// lets a user legitimately mute-from-zero without the toggle
+// getting confused about state (same pattern as stbaudio's mute).
+static extrn _mx_bus_muted;
+static extrn _mx_bus_saved_vol;
+
+// Master mute bookkeeping. Separate from bus mute because the
+// master gain is its own knob (scales AFTER the MASTER bus
+// multiplier) and callers might want to mute everything at once
+// without losing the per-bus balance.
+static extrn _mx_master_muted;
+static extrn _mx_master_saved_vol;
+
 // Waveform fader — blends across four waveforms from clean to dirty.
 //   0   = pure sine (cleanest)
 //   256 = pure triangle
@@ -115,39 +130,55 @@ void mixer_init() {
     _MX_SAMPLE_RATE  = 44100;
     _MX_VOICE_AMP    = 8000;
     _MX_FILL_BUF_FRAMES = 512;
-    _MX_FILL_BUF     = malloc(_MX_FILL_BUF_FRAMES * 4);
+    _MX_FILL_BUF     = buf_new(_MX_FILL_BUF_FRAMES * 4);
 
-    _mx_voice_active = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_kind   = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_key    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_hp     = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_amp    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_phase  = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_buf    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_pos    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_frames = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_bus    = malloc(_MX_MAX_VOICES * 8);
-    _mx_voice_loop   = malloc(_MX_MAX_VOICES * 8);
+    // Phase D dogfood (2026-04-22): voice pool is 11 parallel arrays of
+    // 10 word-slots each. Using buf_new_w + buf_fill instead of malloc
+    // + manual loop makes the intent explicit and drops ~15 lines. Kind
+    // and bus start at MX_KIND_NONE (=0) and MX_BUS_SFX respectively —
+    // both happen to be zero, so a single bulk fill covers them; any
+    // future non-zero default needs an explicit poke after.
+    _mx_voice_active = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_kind   = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_key    = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_hp     = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_amp    = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_phase  = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_buf    = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_pos    = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_frames = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_bus    = buf_new_w(_MX_MAX_VOICES);
+    _mx_voice_loop   = buf_new_w(_MX_MAX_VOICES);
 
-    auto i;
-    for (i = 0; i < _MX_MAX_VOICES; i = i + 1) {
-        _mx_voice_active[i] = 0;
-        _mx_voice_kind[i]   = MX_KIND_NONE;
-        _mx_voice_key[i]    = 0;
-        _mx_voice_hp[i]     = 0;
-        _mx_voice_amp[i]    = 0;
-        _mx_voice_phase[i]  = 0;
-        _mx_voice_buf[i]    = 0;
-        _mx_voice_pos[i]    = 0;
-        _mx_voice_frames[i] = 0;
-        _mx_voice_bus[i]    = MX_BUS_SFX;
-        _mx_voice_loop[i]   = 0;
-    }
+    buf_fill(_mx_voice_active, 0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_kind,   0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_key,    0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_hp,     0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_amp,    0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_phase,  0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_buf,    0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_pos,    0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_frames, 0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_bus,    0, _MX_MAX_VOICES * 8);
+    buf_fill(_mx_voice_loop,   0, _MX_MAX_VOICES * 8);
 
-    _mx_bus_vol = malloc(_MX_BUS_COUNT * 8);
+    _mx_bus_vol = buf_new_w(_MX_BUS_COUNT);
     _mx_bus_vol[MX_BUS_MASTER] = 100;
     _mx_bus_vol[MX_BUS_MUSIC]  = 80;
     _mx_bus_vol[MX_BUS_SFX]    = 100;
+
+    // Bus mute state starts clear — no bus is muted at init. Saved
+    // volumes default to the bus's initial volume so a mute-without-
+    // prior-set-call has something sane to restore to.
+    _mx_bus_muted     = buf_new_w(_MX_BUS_COUNT);
+    _mx_bus_saved_vol = buf_new_w(_MX_BUS_COUNT);
+    buf_fill(_mx_bus_muted, 0, _MX_BUS_COUNT * 8);
+    auto i;
+    for (i = 0; i < _MX_BUS_COUNT; i = i + 1) {
+        _mx_bus_saved_vol[i] = _mx_bus_vol[i];
+    }
+    _mx_master_muted     = 0;
+    _mx_master_saved_vol = 80;
 
     _mx_fader         = 768;
     _mx_master_vol    = 80;
@@ -155,6 +186,62 @@ void mixer_init() {
     _mx_decim_counter = 0;
     _mx_held_sample   = 0;
     _mx_inited        = 1;
+}
+
+// ── dB ↔ percent conversion ───────────────────────────────────
+// Internal helpers shared by all mixer_*_volume_db functions.
+// Same halving + remainder-table trick as stbaudio.audio_set_
+// volume_db, scaled to the mixer's 0..100 percent domain instead
+// of 0..32767 amplitude. See how_to_dev_b++.md Cap 29 §29.3 for
+// the algorithm reference.
+//
+// Precision caveat: percent storage is integer 0..100, so values
+// below ~-40 dB lose to rounding. For plugin-grade precision
+// (< 0.1 dB error across the full range) store per-voice or per-
+// bus gain as raw amplitude instead of percent — a future
+// refactor if a real DAW use case surfaces.
+
+static _mx_db_to_pct(db) : base {
+    auto neg_db, halvings, remainder, base_pct, pct;
+    if (db >= 0)        { return 100; }
+    if (db <= 0 - 60)   { return 0; }
+    neg_db = 0 - db;
+    halvings = neg_db / 6;
+    remainder = neg_db - halvings * 6;
+    base_pct = 100 >> halvings;
+    // 6-entry table: 10^(-n/20) * 1000 for n = 0..5.
+    if (remainder == 0)      { pct = base_pct; }
+    else if (remainder == 1) { pct = base_pct * 891 / 1000; }
+    else if (remainder == 2) { pct = base_pct * 794 / 1000; }
+    else if (remainder == 3) { pct = base_pct * 708 / 1000; }
+    else if (remainder == 4) { pct = base_pct * 631 / 1000; }
+    else                     { pct = base_pct * 562 / 1000; }
+    return pct;
+}
+
+static _mx_pct_to_db(pct) : base {
+    auto halvings, base, ratio;
+    if (pct <= 0)  { return 0 - 60; }
+    if (pct >= 100) { return 0; }
+    // Count halvings to bring the value into the [50..100) top
+    // bracket, then interpolate within using the same table
+    // thresholds as stbaudio (scaled from 32700 → 100).
+    halvings = 0;
+    base = pct;
+    while (base < 50 && halvings < 10) {
+        base = base * 2;
+        halvings = halvings + 1;
+    }
+    // Thresholds at 100-base scale, each is midpoint between
+    // adjacent table values: 100 / 89 / 79 / 71 / 63 / 56 / 50.
+    if      (base >= 95) { ratio = 0; }
+    else if (base >= 84) { ratio = 1; }
+    else if (base >= 75) { ratio = 2; }
+    else if (base >= 67) { ratio = 3; }
+    else if (base >= 60) { ratio = 4; }
+    else if (base >= 53) { ratio = 5; }
+    else                 { ratio = 6; }
+    return 0 - (halvings * 6 + ratio);
 }
 
 // Start a note with unique `key_id` at `freq_hz`. If a voice is
@@ -274,6 +361,50 @@ mixer_get_bus_volume(bus: word) : base {
     return _mx_bus_vol[bus];
 }
 
+// Set a bus volume in decibels (typical range 0..-60). Wraps
+// mixer_set_bus_volume with integer dB → percent conversion. 0 dB
+// maps to 100%, -6 dB halves (≈50%), -60 dB goes to 0. Useful
+// for plugin-UI knobs that think in dB and for scripted mixing
+// where percent is unintuitive.
+void mixer_set_bus_volume_db(bus: word, db: word) {
+    mixer_set_bus_volume(bus, _mx_db_to_pct(db));
+}
+
+// Read the bus volume as decibels. Inverse of set_bus_volume_db
+// modulo integer percent storage rounding (see conversion caveat).
+mixer_get_bus_volume_db(bus: word) : base {
+    return _mx_pct_to_db(mixer_get_bus_volume(bus));
+}
+
+// Mute a specific bus. Remembers the pre-mute volume so
+// mixer_unmute_bus restores it exactly. Calling mute on a
+// currently-muted bus is a no-op — state stays consistent even
+// on double-fire.
+void mixer_mute_bus(bus: word) {
+    if (bus < 0) { return; }
+    if (bus >= _MX_BUS_COUNT) { return; }
+    if (_mx_bus_muted[bus] != 0) { return; }
+    _mx_bus_saved_vol[bus] = _mx_bus_vol[bus];
+    _mx_bus_muted[bus]     = 1;
+    _mx_bus_vol[bus]       = 0;
+}
+
+// Restore the pre-mute volume on a bus. No-op if the bus is not
+// currently muted. Safe to call repeatedly.
+void mixer_unmute_bus(bus: word) {
+    if (bus < 0) { return; }
+    if (bus >= _MX_BUS_COUNT) { return; }
+    if (_mx_bus_muted[bus] == 0) { return; }
+    _mx_bus_vol[bus]   = _mx_bus_saved_vol[bus];
+    _mx_bus_muted[bus] = 0;
+}
+
+mixer_bus_is_muted(bus: word) : base {
+    if (bus < 0) { return 0; }
+    if (bus >= _MX_BUS_COUNT) { return 0; }
+    return _mx_bus_muted[bus];
+}
+
 // Release every voice currently playing the given key_id. No-op
 // when the key is not active. Rule 3: void because it only mutates
 // global state.
@@ -322,6 +453,87 @@ void mixer_set_master_volume(vol: word) {
 }
 
 mixer_get_master_volume() : base { return _mx_master_vol; }
+
+// Master volume in decibels. Same conversion as the bus dB
+// helpers — wraps the percent setter with a dB → pct lookup.
+// 0 dB = 100%, -6 = 50%, -12 = 25%, etc.
+void mixer_set_master_volume_db(db: word) {
+    mixer_set_master_volume(_mx_db_to_pct(db));
+}
+
+mixer_get_master_volume_db() : base {
+    return _mx_pct_to_db(_mx_master_vol);
+}
+
+// Mute the master output. Remembers the pre-mute level so unmute
+// restores it. Bus mutes are independent — muting master does not
+// clear individual bus mutes. Effectively kills audio without
+// altering the mixing ratios.
+void mixer_mute_master() {
+    if (_mx_master_muted != 0) { return; }
+    _mx_master_saved_vol = _mx_master_vol;
+    _mx_master_muted     = 1;
+    _mx_master_vol       = 0;
+}
+
+void mixer_unmute_master() {
+    if (_mx_master_muted == 0) { return; }
+    _mx_master_vol   = _mx_master_saved_vol;
+    _mx_master_muted = 0;
+}
+
+mixer_master_is_muted() : base { return _mx_master_muted; }
+
+// ── Per-voice volume ────────────────────────────────────────────
+// Each active voice stores its own amplitude. Normally set to
+// _MX_VOICE_AMP (8000) when the voice lights up, but callers can
+// re-tune individual voices at runtime — useful for fade-ins,
+// ducking, or modulating a sustained note without touching the
+// bus/master chain. Out-of-range slot IDs are ignored silently so
+// callers can blindly apply volume changes from a key-handler.
+
+// Set raw s16 peak amplitude for a specific voice slot. Clamped
+// to 0..32767. The voice keeps this value until note_off or a
+// subsequent set call — it does NOT reset to _MX_VOICE_AMP on
+// the next note_on of a different key.
+void mixer_set_voice_volume(slot: word, amp: word) {
+    if (slot < 0) { return; }
+    if (slot >= _MX_MAX_VOICES) { return; }
+    if (amp < 0)     { amp = 0; }
+    if (amp > 32767) { amp = 32767; }
+    _mx_voice_amp[slot] = amp;
+}
+
+// Read the current amplitude of a voice slot. Returns 0 if the
+// slot is out of range.
+mixer_get_voice_volume(slot: word) : base {
+    if (slot < 0) { return 0; }
+    if (slot >= _MX_MAX_VOICES) { return 0; }
+    return _mx_voice_amp[slot];
+}
+
+// Set per-voice volume in decibels relative to full-scale (8000
+// is roughly -12 dB of s16 peak). 0 dB maps to 32700 amp. Plugin-
+// friendly override for voice-level fade curves.
+void mixer_set_voice_volume_db(slot: word, db: word) {
+    auto pct, amp;
+    pct = _mx_db_to_pct(db);
+    // Mirror stbaudio's 0 dB = 32700 convention so percent and
+    // dB math agree with the platform-level set_amplitude.
+    amp = pct * 327;
+    mixer_set_voice_volume(slot, amp);
+}
+
+mixer_get_voice_volume_db(slot: word) : base {
+    auto amp, pct;
+    amp = mixer_get_voice_volume(slot);
+    // Inverse of the setter: amp / 327 ≈ percent, then percent
+    // → dB via the shared converter. The rounding means the
+    // getter may differ from what the setter saw by ±1 dB at the
+    // quiet end.
+    pct = (amp + 163) / 327;
+    return _mx_pct_to_db(pct);
+}
 
 // Dirt level (0..256). 0 = pristine clean, 256 = maximum crunch.
 // Two effects stack: bitcrush (reduce bit depth of the final sum)

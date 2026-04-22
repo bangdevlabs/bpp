@@ -104,13 +104,66 @@ arr_cap(arr): base {
     return *(arr - 8);
 }
 
-// Read the element at index i.
+// Read the element at index i. UNCHECKED — compiles to a single
+// load. This is the status-quo accessor used throughout the
+// compiler and every stb module: fast, trivial to inline, and
+// tolerant of both shapes (arr_new dynamic arrays AND raw word
+// buffers from malloc / buf_new_w).
+//
+// CALLER CONTRACT: `i` must be a valid index. No null check, no
+// range check. If you want safety, use arr_at below. If in doubt,
+// arr_get is the default — that's why it's named the short way.
 // Rule 4: pure read → : base.
 arr_get(arr, i): base {
     return *(arr + i * _ARR_ELEM);
 }
 
-// Write a value at index i.
+// Bounds-checked element read with diagnostic logging. Returns 0
+// for a null array, a negative index, or an index past the array
+// length — AND prints an error to stderr naming the violation so
+// callers get a loud signal instead of a silent zero.
+//
+// Intended use is BOUNDARY-LAYER code: deserialisers, file
+// loaders, parsers of external input (WAV headers, PNG chunks,
+// JSON indices). Anywhere the index could come from untrusted
+// data and you want "fail with context" over "segfault in a
+// library call three frames down". In hot inner loops, keep
+// arr_get — arr_at's branches plus potential I/O would destroy
+// real-time budgets.
+//
+// CALLER CONTRACT: arr must be NULL or an arr_new-created array.
+// Passing a raw buf_new / malloc'd pointer triggers undefined
+// behaviour — the length read *(arr - 16) would return garbage.
+//
+// Log format (subject to change, grep-stable):
+//   "arr_at: null array\n"
+//   "arr_at: index <i> out of range [0, <len>)\n"
+//
+// Rule 4: pure-ish read (the logging is observable but the
+// returned value is a function of inputs). Tagged : io because
+// print_err_msg touches stderr.
+arr_at(arr, i): io {
+    auto len;
+    if (arr == 0) {
+        print_err_msg("arr_at: null array\n");
+        return 0;
+    }
+    if (i < 0) {
+        print_err_msg("arr_at: negative index\n");
+        return 0;
+    }
+    len = *(arr - 16);
+    if (i >= len) {
+        print_err_msg("arr_at: index out of range\n");
+        return 0;
+    }
+    return *(arr + i * _ARR_ELEM);
+}
+
+// Write a value at index i. UNCHECKED — same contract as arr_get:
+// caller guarantees i is in range. Works on both arr_new arrays
+// and raw word buffers. A future arr_set_checked can wrap this
+// with bounds + null validation when a real call site asks for it.
 // Rule 3: side-effect only → void + implicit return.
 void arr_set(arr, i, val) {
     *(arr + i * _ARR_ELEM) = val;

@@ -38,29 +38,13 @@ void init_sound() {
 }
 
 // ── Helpers ────────────────────────────────────────────────────
-
-static void _snd_w16(buf, off, val) {
-    poke(buf + off,     val & 0xFF);
-    poke(buf + off + 1, (val >> 8) & 0xFF);
-}
-
-static void _snd_w32(buf, off, val) {
-    poke(buf + off,     val & 0xFF);
-    poke(buf + off + 1, (val >> 8) & 0xFF);
-    poke(buf + off + 2, (val >> 16) & 0xFF);
-    poke(buf + off + 3, (val >> 24) & 0xFF);
-}
-
-static _snd_r16(buf, off) : base {
-    return peek(buf + off) + peek(buf + off + 1) * 256;
-}
-
-static _snd_r32(buf, off) : base {
-    return peek(buf + off)
-         + peek(buf + off + 1) * 256
-         + peek(buf + off + 2) * 65536
-         + peek(buf + off + 3) * 16777216;
-}
+//
+// Phase D dogfood (2026-04-22): the hand-rolled LE byte readers
+// and writers were byte-for-byte identical to bpp_buf's read_u16 /
+// read_u32 / write_u16 / write_u32. Deleted the locals and
+// migrated every call site — one less place to keep in sync if
+// the format contract ever changes (wider types, endian flips,
+// alignment tweaks). See bpp_buf.bsm for the canonical impls.
 
 // ── Save ──────────────────────────────────────────────────────
 
@@ -77,25 +61,25 @@ sound_save_wav(path, buf, n_frames) : io {
     // RIFF header.
     poke(hdr + 0, 'R'); poke(hdr + 1, 'I');
     poke(hdr + 2, 'F'); poke(hdr + 3, 'F');
-    _snd_w32(hdr, 4, 36 + data_bytes);
+    write_u32(hdr, 4, 36 + data_bytes);
     poke(hdr + 8, 'W'); poke(hdr + 9, 'A');
     poke(hdr + 10, 'V'); poke(hdr + 11, 'E');
 
     // fmt sub-chunk (16 bytes, PCM).
     poke(hdr + 12, 'f'); poke(hdr + 13, 'm');
     poke(hdr + 14, 't'); poke(hdr + 15, ' ');
-    _snd_w32(hdr, 16, 16);
-    _snd_w16(hdr, 20, 1);
-    _snd_w16(hdr, 22, _SND_CHANNELS);
-    _snd_w32(hdr, 24, _SND_RATE);
-    _snd_w32(hdr, 28, _SND_BYTE_RATE);
-    _snd_w16(hdr, 32, _SND_BLOCK_ALIGN);
-    _snd_w16(hdr, 34, _SND_BPS);
+    write_u32(hdr, 16, 16);
+    write_u16(hdr, 20, 1);
+    write_u16(hdr, 22, _SND_CHANNELS);
+    write_u32(hdr, 24, _SND_RATE);
+    write_u32(hdr, 28, _SND_BYTE_RATE);
+    write_u16(hdr, 32, _SND_BLOCK_ALIGN);
+    write_u16(hdr, 34, _SND_BPS);
 
     // data sub-chunk.
     poke(hdr + 36, 'd'); poke(hdr + 37, 'a');
     poke(hdr + 38, 't'); poke(hdr + 39, 'a');
-    _snd_w32(hdr, 40, data_bytes);
+    write_u32(hdr, 40, data_bytes);
 
     // O_WRONLY | O_CREAT | O_TRUNC = 0x601 on macOS.
     fd = sys_open(path, 0x601);
@@ -193,7 +177,7 @@ sound_load_wav(path) : io {
     data_off = 0; data_size = 0;
 
     while (pos + 8 <= size) {
-        chunk_size = _snd_r32(buf, pos + 4);
+        chunk_size = read_u32(buf, pos + 4);
 
         // Match chunk id by its four bytes directly. Comparing a
         // packed 32-bit value via read_u32 would need knowing the
@@ -204,10 +188,10 @@ sound_load_wav(path) : io {
          && peek(buf + pos + 2) == 't'
          && peek(buf + pos + 3) == ' ') {
             if (pos + 8 + 16 <= size) {
-                fmt_code    = _snd_r16(buf, pos +  8);
-                channels    = _snd_r16(buf, pos + 10);
-                sample_rate = _snd_r32(buf, pos + 12);
-                bits        = _snd_r16(buf, pos + 22);
+                fmt_code    = read_u16(buf, pos +  8);
+                channels    = read_u16(buf, pos + 10);
+                sample_rate = read_u32(buf, pos + 12);
+                bits        = read_u16(buf, pos + 22);
                 found_fmt   = 1;
             }
         }
@@ -293,12 +277,12 @@ sound_load_wav(path) : io {
         if (is_float == 0) {
             // --- PCM integer path ---------------------------------
             if (bits == 16) {
-                left_s = _snd_r16(buf, src);
+                left_s = read_u16(buf, src);
                 if (left_s >= 32768) { left_s = left_s - 65536; }
                 if (mono != 0) {
                     right_s = left_s;
                 } else {
-                    right_s = _snd_r16(buf, src + 2);
+                    right_s = read_u16(buf, src + 2);
                     if (right_s >= 32768) { right_s = right_s - 65536; }
                 }
             } else if (bits == 8) {
@@ -336,13 +320,13 @@ sound_load_wav(path) : io {
                 }
             } else {
                 // 32-bit PCM int: shift down 16 bits, preserve sign.
-                v = _snd_r32(buf, src);
+                v = read_u32(buf, src);
                 if (v >= 2147483648) { v = v - 4294967296; }
                 left_s = v / 65536;
                 if (mono != 0) {
                     right_s = left_s;
                 } else {
-                    v = _snd_r32(buf, src + 4);
+                    v = read_u32(buf, src + 4);
                     if (v >= 2147483648) { v = v - 4294967296; }
                     right_s = v / 65536;
                 }
@@ -378,8 +362,8 @@ sound_load_wav(path) : io {
         }
 
         // Write the normalized frame: little-endian stereo s16.
-        _snd_w16(out, i * 4 + 0, left_s  & 0xFFFF);
-        _snd_w16(out, i * 4 + 2, right_s & 0xFFFF);
+        write_u16(out, i * 4 + 0, left_s  & 0xFFFF);
+        write_u16(out, i * 4 + 2, right_s & 0xFFFF);
     }
 
     free(buf);

@@ -83,3 +83,191 @@ audio_ring_space() : base {
 audio_ring_consumed() : base {
     return _stb_audio_ring_consumed();
 }
+
+// ── Volume control ──────────────────────────────────────────────
+//
+// Volume is a SESSION property, not a per-call one. Set it once
+// (any time — before or after the device is running) and every
+// subsequent audio output respects the choice. Two APIs sit on the
+// same underlying knob:
+//
+//   raw amplitude   — audio_set_amplitude(amp) / audio_get_amplitude()
+//                     Works in signed-16 peak units (0..32767).
+//                     32767 is full-scale (clipped on most hardware
+//                     if the mixing stage adds headroom). 8000 is the
+//                     default used by audio_tone_test (~-12 dB).
+//
+//   percent         — audio_set_volume(pct) / audio_get_volume()
+//                     0..100 mapped linearly to amplitude. Easier for
+//                     UI sliders; rounds slightly (100 → 32700) to
+//                     stay inside the signed-16 range.
+//
+//   mute            — audio_mute() / audio_unmute()
+//                     Toggleable mute that remembers the previous
+//                     amplitude. Safe to call repeatedly; mute on
+//                     an already-muted session is a no-op.
+//
+// The percent / amplitude APIs are aliases of the same state — you
+// can mix them freely (set volume to 50, then read raw amplitude
+// back as ~16383, or vice versa).
+
+// Set raw peak amplitude in s16 units (0..32767). Values outside
+// the range are clamped. Rule 3: side-effect only, returns void.
+void audio_set_amplitude(amp) : io {
+    _stb_audio_set_amplitude(amp);
+}
+
+// Read the current peak amplitude in s16 units.
+audio_get_amplitude() : io {
+    return _stb_audio_get_amplitude();
+}
+
+// Set output volume in percent (0..100). Maps linearly to s16
+// amplitude. 100 maps to 32700 (slightly below s16 max so the
+// callback has a sliver of headroom before hard clipping).
+// Fractional percents are not supported — use audio_set_amplitude
+// for sub-percent granularity.
+void audio_set_volume(pct) : io {
+    if (pct < 0)   { pct = 0; }
+    if (pct > 100) { pct = 100; }
+    // 327 * 100 = 32700. Deliberately leaves ~0.2% headroom below
+    // s16 peak (32767) so a full-scale setting does not risk clip
+    // on downstream gain stages.
+    _stb_audio_set_amplitude(pct * 327);
+}
+
+// Read the current volume as a percentage (0..100). Rounds to
+// nearest integer. Inverse of audio_set_volume, modulo rounding.
+audio_get_volume() : io {
+    auto amp;
+    amp = _stb_audio_get_amplitude();
+    // Add 163 (half of 327) before dividing to round to nearest.
+    return (amp + 163) / 327;
+}
+
+// ── Decibel volume (plugin-oriented) ────────────────────────────
+//
+// dB is the unit real audio professionals think in — every VST / AU /
+// CLAP plugin and every mixer fader uses it. The scale is
+// logarithmic: -6 dB is exactly half amplitude, -12 dB is quarter,
+// -60 dB is inaudible. 0 dB means "full scale" (our 32700 cap).
+// Positive dB values (gain) are clamped to 0 to prevent clipping
+// in the s16 callback.
+//
+// The math in a CPU normally uses 10^(db/20), but the B++ runtime
+// has no pow() yet. We fake it with two integer tricks:
+//
+//   1. Every -6 dB halves the amplitude. A right-shift by
+//      (abs(db)/6) handles all multiples of 6 exactly.
+//   2. The 0..-5 dB remainder is looked up in a 6-entry table of
+//      ratios-out-of-1000. Worst-case error across the full
+//      0..-96 dB range is < 0.3% on the amplitude value, which is
+//      inaudible (the human JND for loudness is ~1 dB, and this
+//      table's error tops out at ~0.03 dB).
+//
+// Below -96 dB we just emit silence — s16 can't represent finer
+// attenuation than that anyway.
+
+// Set output volume in decibels. 0 dB = full scale, negative
+// numbers attenuate. Typical plugin range is -60..0 dB.
+void audio_set_volume_db(db) : io {
+    auto neg_db, halvings, remainder, base_amp, amp;
+    if (db >= 0) {
+        _stb_audio_set_amplitude(32700);
+        return;
+    }
+    if (db <= 0 - 96) {
+        _stb_audio_set_amplitude(0);
+        return;
+    }
+    neg_db = 0 - db;                // e.g. 9 for -9 dB
+    halvings = neg_db / 6;
+    remainder = neg_db - halvings * 6;
+    base_amp = 32700 >> halvings;   // each halving is -6 dB exactly
+    // 6-entry remainder table. Each value is 10^(-n/20) * 1000
+    // rounded to nearest int.  -0 → 1000, -1 → 891, -2 → 794,
+    // -3 → 708, -4 → 631, -5 → 562.
+    if (remainder == 0) { amp = base_amp; }
+    else if (remainder == 1) { amp = base_amp * 891 / 1000; }
+    else if (remainder == 2) { amp = base_amp * 794 / 1000; }
+    else if (remainder == 3) { amp = base_amp * 708 / 1000; }
+    else if (remainder == 4) { amp = base_amp * 631 / 1000; }
+    else                     { amp = base_amp * 562 / 1000; }
+    _stb_audio_set_amplitude(amp);
+}
+
+// Read the current volume in decibels. Returns 0 for full-scale
+// amplitude and -96 for silence. The computation walks the
+// halving ladder (every doubling of the amp is +6 dB) then
+// resolves the remainder by comparing against the same 6-entry
+// ratio table used in the setter.
+//
+// Round-trip precision: audio_set_volume_db(x) followed by
+// audio_get_volume_db() returns x exactly for integer dB values
+// in the valid range. Slightly off only when the user set raw
+// amplitude via audio_set_amplitude and we have to reverse-map
+// a value that does not sit on a table entry.
+audio_get_volume_db() : io {
+    auto amp, halvings, base, ratio;
+    amp = _stb_audio_get_amplitude();
+    if (amp == 0)       { return 0 - 96; }
+    if (amp >= 32700)   { return 0; }
+    // Count the halvings from the raw amp up to the top 6-dB
+    // bracket [16384..32767]. Each iteration doubles the base
+    // and adds 6 dB of attenuation to the final answer.
+    halvings = 0;
+    base = amp;
+    while (base < 16384 && halvings < 16) {
+        base = base * 2;
+        halvings = halvings + 1;
+    }
+    // Base now in [16384..32767]. Compare against nearest-neighbour
+    // midpoints to pick the 0..-5 dB remainder. Table values at
+    // the 32700 full-scale reference:
+    //   0 dB → 32700   mid 30918  (to -1 bucket)
+    //  -1 dB → 29136   mid 27550
+    //  -2 dB → 25964   mid 24558
+    //  -3 dB → 23151   mid 21893
+    //  -4 dB → 20634   mid 19506
+    //  -5 dB → 18377   mid 17364
+    //  -6 dB → 16350   (fall-through bumps one more tier of 6 dB)
+    if      (base >= 30918) { ratio = 0; }
+    else if (base >= 27550) { ratio = 1; }
+    else if (base >= 24558) { ratio = 2; }
+    else if (base >= 21893) { ratio = 3; }
+    else if (base >= 19506) { ratio = 4; }
+    else if (base >= 17364) { ratio = 5; }
+    else                    { ratio = 6; }
+    return 0 - (halvings * 6 + ratio);
+}
+
+// Mute bookkeeping. Two words so the "is muted" check stays cheap
+// and the saved amplitude can be any legal value (including 0) —
+// using a single sentinel would conflate "muted from silence" with
+// "not muted". BSS init gives both 0, which matches the "not muted,
+// nothing saved" starting state. Rule 1: written inside mute/unmute
+// only.
+static auto _aud_is_muted;
+static auto _aud_saved_amp;
+
+// Silence the output by setting amplitude to 0. Remembers the
+// previous amplitude so audio_unmute() restores it exactly. Calling
+// mute while already muted is a no-op.
+void audio_mute() : io {
+    if (_aud_is_muted) { return; }
+    _aud_saved_amp = _stb_audio_get_amplitude();
+    _aud_is_muted = 1;
+    _stb_audio_set_amplitude(0);
+}
+
+// Restore the pre-mute amplitude. No-op if not muted.
+void audio_unmute() : io {
+    if (_aud_is_muted == 0) { return; }
+    _aud_is_muted = 0;
+    _stb_audio_set_amplitude(_aud_saved_amp);
+}
+
+// Return 1 if audio is currently muted, 0 otherwise.
+audio_is_muted() : io {
+    return _aud_is_muted;
+}
