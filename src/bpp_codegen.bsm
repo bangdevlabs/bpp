@@ -1647,18 +1647,90 @@ cg_has_call(nd) {
     }
 }
 
-// Wave 21 takeover: the spine dispatches expression emission through
-// the existing emit_node ChipPrimitives slot. The chip's tree walker
-// continues to own the T_BINOP / T_UNARY / T_CALL / T_MEMLD / T_ADDR
-// cases inline while the three Wave 21 scaffolding slots
-// (emit_binop_save_left, emit_binop_retrieve_left,
-// emit_addr_stack_struct) wait for the decomposition pass that
-// moves them into portable spine helpers. Making cg_emit_node the
-// canonical entry point standardises the call surface so the chip
-// layer is the sole implementer, not an extra caller path.
+// Wave 21 takeover: the spine owns expression emission for every
+// AST case that routes through existing portable helpers. T_BINOP
+// and the T_VAR stack-struct address-of still fall back through
+// the emit_node primitive slot (chip walker) while their
+// supporting primitives (emit_binop_save_left, emit_binop_retrieve_left,
+// emit_addr_stack_struct) await body wiring.
 cg_emit_node(nd) {
     auto p: ChipPrimitives;
+    auto n: Node;
+    auto t, vi, ety, ety_then, lbl_else, lbl_done;
     p = cg_prim;
+    if (nd == 0) {
+        call(p.emit_mov_zero);
+        return 0;
+    }
+    n = nd; t = n.ntype;
+
+    // T_LIT / T_VAR (non-stack) / T_UNARY all have established
+    // portable helpers that route to cg_prim.
+    if (t == T_LIT) { return cg_emit_lit(n.a); }
+    if (t == T_VAR) {
+        vi = cg_var_idx(n.a);
+        // Stack-struct address-of still falls back to the chip walker
+        // until the emit_addr_stack_struct primitive is wired live.
+        if (vi >= 0 && arr_get(cg_var_stack, vi)) {
+            return call(p.emit_node, nd);
+        }
+        return cg_emit_var(n.a);
+    }
+
+    // T_TERNARY: short-circuited conditional expression. The parser
+    // lowers `&&` / `||` to this so codegen sees exactly one branch
+    // evaluated per call. Both arms are expected to agree on type.
+    if (t == T_TERNARY) {
+        ety = call(p.emit_node, n.a);
+        if (ety == 1) { call(p.emit_fcond_to_int_truth); }
+        lbl_else = call(p.emit_new_label);
+        lbl_done = call(p.emit_new_label);
+        call(p.emit_branch_if_zero, lbl_else);
+        ety_then = call(p.emit_node, n.b);
+        call(p.emit_jump, lbl_done);
+        call(p.emit_label, lbl_else);
+        call(p.emit_node, n.c);
+        call(p.emit_label, lbl_done);
+        return ety_then;
+    }
+
+    // T_UNARY: walk operand, dispatch operator.
+    if (t == T_UNARY) {
+        auto uty;
+        uty = call(p.emit_node, n.b);
+        return cg_emit_unary(n.a, uty);
+    }
+
+    // T_CALL delegates to the existing spine orchestrator.
+    if (t == T_CALL) { return cg_emit_call(n); }
+
+    // T_MEMLD: *(ptr) — load with sub-word dispatch via field hint.
+    if (t == T_MEMLD) {
+        ety = call(p.emit_node, n.a);
+        if (ety == 1) { call(p.emit_demote_flt_to_int); }
+        return call(p.emit_memld_load, n.b);
+    }
+
+    // T_ADDR: &x. Locals / globals take straight primitive paths;
+    // the stack-struct case arrives here via the T_VAR branch above
+    // which already falls back to the chip walker.
+    if (t == T_ADDR) {
+        auto child: Node;
+        child = n.a;
+        if (child != 0 && child.ntype == T_VAR) {
+            vi = cg_var_idx(child.a);
+            if (vi >= 0) {
+                call(p.emit_addr_local, arr_get(cg_var_off, vi));
+                return 0;
+            }
+            call(p.emit_addr_global, child.a);
+            return 0;
+        }
+        return 0;
+    }
+
+    // T_BINOP stays with the chip walker until the save_left /
+    // retrieve_left primitives ship.
     return call(p.emit_node, nd);
 }
 
