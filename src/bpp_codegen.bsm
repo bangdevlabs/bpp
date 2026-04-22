@@ -283,6 +283,7 @@ struct ChipPrimitives {
     emit_coerce_float_to_int, // () — truncate float accumulator to int
     emit_mem_barrier,   // () — full memory barrier + zero acc
     emit_shift_right_logical, // () — acc >>= scratch (unsigned)
+    emit_load_float_ret, // (slot) — load float return save slot (0 or 1)
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -1024,12 +1025,32 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: float_ret() / float_ret2() — read the saved float
+    // return value from the frame slot set after an extern call.
+    // Return 2 means "handled and result is float (ety=1)" — chip
+    // branches returned 1 inline; spine needs a way to signal
+    // that plus handled. Use return value 2 → cg_emit_call treats
+    // anything truthy as handled and maps to ety=1 for floats.
+    if (cg_str_eq(n.a, "float_ret", 9)) {
+        call(p.emit_load_float_ret, 0);
+        return 2;   // handled, float ety
+    }
+    if (cg_str_eq(n.a, "float_ret2", 10)) {
+        call(p.emit_load_float_ret, 1);
+        return 2;
+    }
+
     return 0;
 }
 
 cg_emit_call(n) {
-    auto p: ChipPrimitives;
-    if (cg_builtin_dispatch(n)) { return 0; }
+    auto p: ChipPrimitives, r;
+    // cg_builtin_dispatch returns 0 (not handled, fall through) or
+    // ety+1 (handled, caller's result ety is r - 1). Lets float-
+    // returning builtins (float_ret) report ety=1 while int-
+    // returning builtins (peek/poke/shr) report ety=0.
+    r = cg_builtin_dispatch(n);
+    if (r > 0) { return r - 1; }
     p = cg_prim;
     return call(p.emit_call_full, n);
 }
