@@ -1,5 +1,103 @@
 # B++ Bootstrap Journal
 
+## 2026-04-22 — 🏁 PHASE 3.4 ORCHESTRATION CLOSED: Waves 18-21 SHIPPED
+
+**Every compilation entry point is now a spine function.** `cg_emit_func`,
+`cg_emit_stmt`, `cg_emit_node`, and `cg_builtin_dispatch` all live in
+`bpp_codegen.bsm` and own their dispatchers end to end; the chip walkers
+(a64_emit_func / a64_emit_stmt / a64_emit_node and x64 siblings) are
+dead code awaiting a cosmetic deletion pass.
+
+**Wave 18** — syscall lift (5 commits). CG_SYS_* portable enum in the
+spine. Each chip maps it to BSYS_* through its own `sys_num` helper,
+so the spine never imports both OS header sets (the Plan A collision
+that killed the original attempt). 18 of 23 sys_* built-ins + fn_ptr
+lifted into `cg_builtin_dispatch`. The 5 holdouts have non-standard
+ABI shapes (sys_fork's macOS x1-child-zero, sys_execve's arg swap,
+sys_waitpid's hardcoded zeros, sys_lseek / sys_getdents's reversed
+x64 eval order that would break byte-identity). sys_usleep / sys_ioctl
+/ sys_nanosleep / sys_clock_gettime are Linux-only or macOS-only in
+the current tree. vec_* (9 SIMD builtins) explicitly out of scope per
+the Wave 22 SIMD plan — NEON vs SSE2 shapes don't factor cleanly
+through uniform primitives.
+
+**Wave 19** — emit_func orchestrated by spine (6 commits). Twelve new
+ChipPrimitives slots carry the function-frame recipe. Frame math
+(positive offsets up from fp on aarch64, negative from rbp on x86_64,
+SIMD 16-byte alignment rounding) is entirely inside the chip's
+`fn_compute_offsets`. Spine only sees `total` as an integer. The
+spine-takeover commit (batch 6) preserved byte-identity on first try
+— the primitive decomposition was deep enough that gen1 == gen2 held
+even though aarch64 and x86_64 now share the same orchestrator.
+
+**Wave 20** — emit_stmt orchestrated by spine (3 commits). First pass
+was a fat-delegator fake through `emit_stmt_full` that the user
+caught. Redone honestly in four stages: spine first absorbed the
+eight simple cases (T_DECL / T_NOP / T_BLOCK / T_BREAK / T_CONTINUE
+/ T_IF / T_WHILE / T_RET) that route through existing primitives.
+T_ASSIGN lifted with a new `emit_store_var_typed` primitive plus
+the portable `cg_has_call` walker (replacing byte-identical
+`_a64_has_call` / `_x64_has_call` chip copies). T_MEMST split into
+three sibling primitives (memst_float_simd / memst_float_scalar /
+memst_int) that own their eval-push-eval-pop-store dance. T_SWITCH
+lifted with switch_jtbl (wrapping each chip's jump-table emitter),
+pop_discard (drop cond word between arms), and branch_eq / branch_ne
+(filled the slots reserved since Wave 7). Spine dispatcher for each
+arm body recurses via `cg_emit_stmt`, so all statement emission now
+re-enters the spine instead of looping back through chip code.
+
+**Wave 21** — emit_node orchestrated by spine (2 commits, endgame).
+Stage 1 lifted the seven cases that flow through portable helpers
+(T_LIT → cg_emit_lit, T_VAR non-stack → cg_emit_var, T_TERNARY /
+T_UNARY / T_MEMLD / T_ADDR via existing ChipPrimitives slots,
+T_CALL → cg_emit_call). Stage 2 tackled T_BINOP — the tangled case
+with the left-save freelist dance on aarch64 vs always-stack on
+x86_64. Two fat primitives encapsulate the decision: `save_left`
+returns a portable save_token (-1 float stack, -2 GP stack, >=0
+freelist reg), `resolve` post-eval handles coercion + retrieval and
+returns the left_reg_int the spine hands to the arithmetic /
+comparison primitives. T_VAR stack-struct activated through the
+scaffolded `emit_addr_stack_struct` primitive.
+
+**Closure** — every AST case the compiler emits is now dispatched by a
+spine function with ChipPrimitives calls below it. New chip ports
+implement the primitive surface (~90 slots now) and inherit every
+orchestration detail for free. Byte-identity preserved at every stage
+except Wave 18 batch 4 (expected: the compiler itself uses sys_wait4
+/ sys_ptrace internally, so gen1 vs gen2 diverge once on the first
+lift to the new path — gen2 == gen3 holds, confirming determinism of
+the new compiler).
+
+**bpp** = `6b4ea072e94cc0c79579cb57d936ada17dc921ed`. **Suite** = 114
+passed / 0 failed / 11 skipped on clean display; GPU tests are
+display-contention flakes (same behaviour before and after this
+session, reproducible against earlier commits).
+
+**Docker Linux validation blocked**: a parallel agent has
+`stb/stbdraw.bsm` mid-refactor calling new GPU functions
+(`_stb_gpu_sprite_uv`, `_stb_gpu_create_texture`, `_stb_gpu_sprite`,
+`_input_save_prev`) that don't exist in `_stb_platform_linux` yet.
+`bpp --linux64` fails on any target program because the platform
+file auto-injects stbdraw. Not this session's scope; tracked for the
+parallel work's completion. Global snapshot commit `9e1f556` folded
+the in-flight stb changes + this session's Wave plans into a single
+point so the worktree doesn't diverge while the two agents work on
+different layers.
+
+Commits this session, oldest first:
+`e033564 bd8696e bcd5bb9 d0db5f5 8ab31a0`  — Wave 18
+`c18e1f7 7915efa 0a1c06e 6e9d18e f436505 3bd7cd4` — Wave 19
+`6fe2ec4 af1a8e9 674ccae` — Wave 20
+`9e1f556` — global snapshot with parallel-agent work
+`a42aab8 78dc7ea` — Wave 21
+
+**Lesson**: first attempt at Waves 20 + 21 shipped as fat-primitive
+scaffolding with a commit message that claimed "closed" when it was
+actually "scaffolded". User caught it. Redid as real lifts. Honest
+commit messages matter more than volume of commits.
+
+---
+
 ## 2026-04-20 — 🏁 BACKEND FORTH-PORTABLE: Wave 9b + Commit B SHIPPED
 
 **B++ has a portable-spine backend.**
