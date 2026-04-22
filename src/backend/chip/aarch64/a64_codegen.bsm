@@ -199,6 +199,10 @@ void cg_install_arm64_primitives() {
     p.emit_narrow_float_params   = fn_ptr(_a64_emit_narrow_float_params);
     p.fn_pre_reg_vars            = fn_ptr(_a64_fn_pre_reg_vars);
     p.fn_compute_offsets         = fn_ptr(_a64_fn_compute_offsets);
+    p.fn_reset_chip_state        = fn_ptr(_a64_fn_reset_chip_state);
+    p.fn_reserve_spill           = fn_ptr(_a64_fn_reserve_spill);
+    p.fn_label_for               = fn_ptr(_a64_fn_label_for);
+    p.emit_prologue_full         = fn_ptr(_a64_emit_prologue_full);
 }
 
 void init_codegen_arm64() {
@@ -1850,152 +1854,13 @@ static void a64_emit_stmt(nd) {
 
 // ── Function emission ──────────────────────────────────────
 
+// Wave 19 takeover: thin wrapper delegating to the portable spine
+// orchestrator. The wrapper survives for a release cycle so any
+// caller still holding a direct reference to a64_emit_func keeps
+// working; a follow-up cleanup pass deletes it and wires the
+// emit_func_full slot straight to cg_emit_func.
 void a64_emit_func(fi) {
-    auto name_p, par_arr, par_cnt, body_arr, body_cnt;
-    auto frame, i;
-    auto p_func: ChipPrimitives;
-    p_func = cg_prim;
-    name_p = arr_get(cg_fn_name, fi);
-    par_arr = arr_get(cg_fn_par, fi); par_cnt = arr_get(cg_fn_pcnt, fi);
-    body_arr = arr_get(cg_fn_body, fi); body_cnt = arr_get(cg_fn_bcnt, fi);
-
-    // Reset variable tracking for this function.
-    arr_clear(cg_vars);
-    arr_clear(cg_var_stack);
-    arr_clear(cg_var_struct_idx);
-    arr_clear(cg_var_off);
-    arr_clear(cg_var_forced_ty);
-    arr_clear(cg_var_refs);
-    arr_clear(cg_var_addr_taken);
-    arr_clear(cg_var_promote);
-    arr_clear(a64_promoted_regs);
-    a64_freelist_reset();
-    cg_cur_fn_name = name_p;
-    cg_cur_fn_idx = arr_get(cg_fn_fidx, fi);
-
-    // Register params as variables (slots 0..par_cnt-1).
-    // If the function has explicit type hints for params, record them.
-    auto hints, ph, fn_rec;
-    fn_rec = arr_get(funcs, cg_cur_fn_idx);
-    hints = *(fn_rec + 48);
-    i = 0;
-    while (i < par_cnt) {
-        auto pvi;
-        pvi = cg_var_add(*(par_arr + i * 8));
-        if (hints != 0) {
-            ph = *(hints + i * 8);
-            if (ph > 0) { arr_set(cg_var_forced_ty, pvi, ph); }
-        }
-        i = i + 1;
-    }
-
-    // Pre-register and compute per-variable frame offsets via primitives.
-    auto total;
-    call(p_func.fn_pre_reg_vars, body_arr, body_cnt);
-    total = call(p_func.fn_compute_offsets);
-
-    // Phase B3: walk body, count refs, select promotions.
-    auto stmt_i: Node;
-    for (i = 0; i < body_cnt; i = i + 1) {
-        stmt_i = body_arr[i];
-        if (stmt_i != 0) { cg_b3_walk(stmt_i); }
-    }
-    call(p_func.b3_select);
-    a64_b3_spill_base = 40 + total;
-    total = total + arr_len(a64_promoted_regs) * 8;
-
-    frame = 40 + total;
-    frame = (frame + 15) / 16 * 16;
-
-    if (a64_bin_mode) {
-        // Prologue via primitive (Wave 13 activation — fat body in
-        // a64_primitives.bsm::_a64_emit_prologue).
-        _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
-
-        // In main(), save argc / argv / envp to hidden globals via primitive.
-        if (cg_str_eq(name_p, "main", 4)) {
-            call(p_func.save_main_runtime_globals);
-        }
-
-        // Incoming int args → frame slots or promoted regs (Wave 14).
-        i = 0;
-        while (i < par_cnt) {
-            _a64_emit_arg_copy_int(i, arr_get(cg_var_off, i));
-            i = i + 1;
-        }
-
-        // Phase B3: zero non-parameter promoted locals (via primitive).
-        auto _z_vi, _z_n, _z_preg;
-        _z_n = arr_len(cg_vars);
-        for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
-            _z_preg = arr_get(cg_var_promote, _z_vi);
-            if (_z_preg >= 0) { call(p_func.emit_zero_reg, _z_preg); }
-        }
-
-        // Narrow float sub-type params from double to their declared precision (via primitive).
-        call(p_func.emit_narrow_float_params, par_cnt);
-
-        // Emit function body (via primitive).
-        cg_depth = 0;
-        call(p_func.emit_body, body_arr, body_cnt);
-
-        // Implicit return 0 (via primitive).
-        call(p_func.emit_implicit_ret_zero);
-
-        // Epilogue via primitive (Wave 15 activation — real body
-        // lives in a64_primitives.bsm::_a64_emit_frame_teardown).
-        _a64_emit_frame_teardown(frame);
-    } else {
-        // Prologue via primitive (Wave 13 activation).
-        _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
-
-        // In main(), save argc / argv / envp to hidden globals via primitive.
-        if (cg_str_eq(name_p, "main", 4)) {
-            call(p_func.save_main_runtime_globals);
-        }
-
-        // Incoming int args → frame slots or promoted regs (Wave 14).
-        i = 0;
-        while (i < par_cnt) {
-            _a64_emit_arg_copy_int(i, arr_get(cg_var_off, i));
-            i = i + 1;
-        }
-
-        // Phase B3: zero non-parameter promoted locals (via primitive).
-        auto _z_vi, _z_n, _z_preg;
-        _z_n = arr_len(cg_vars);
-        for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
-            _z_preg = arr_get(cg_var_promote, _z_vi);
-            if (_z_preg >= 0) { call(p_func.emit_zero_reg, _z_preg); }
-        }
-
-        // Narrow float sub-type params from double to their declared precision.
-        i = 0;
-        while (i < par_cnt) {
-            auto fty_p;
-            fty_p = arr_get(cg_var_forced_ty, i);
-            if (is_float_type(fty_p)) {
-                if (ty_slice(fty_p) == SL_HALF) { out("  ldr d0, [x29, #"); a64_print_dec(arr_get(cg_var_off, i)); out("]"); putchar('\n'); }
-                if (ty_slice(fty_p) == SL_HALF) { out("  fcvt s0, d0"); putchar('\n'); }
-                if (ty_slice(fty_p) == SL_HALF) { out("  str s0, [x29, #"); a64_print_dec(arr_get(cg_var_off, i)); out("]"); putchar('\n'); }
-                if (ty_slice(fty_p) == SL_QUARTER) { out("  ldr d0, [x29, #"); a64_print_dec(arr_get(cg_var_off, i)); out("]"); putchar('\n'); }
-                if (ty_slice(fty_p) == SL_QUARTER) { out("  fcvt h0, d0"); putchar('\n'); }
-                if (ty_slice(fty_p) == SL_QUARTER) { out("  str h0, [x29, #"); a64_print_dec(arr_get(cg_var_off, i)); out("]"); putchar('\n'); }
-            }
-            i = i + 1;
-        }
-
-        // Emit function body (via primitive).
-        cg_depth = 0;
-        call(p_func.emit_body, body_arr, body_cnt);
-
-        // Implicit return 0 (via primitive).
-        call(p_func.emit_implicit_ret_zero);
-
-        // Epilogue via primitive (Wave 15 activation).
-        _a64_emit_frame_teardown(frame);
-        putchar('\n');
-    }
+    cg_emit_func(fi);
 }
 
 // ── Per-module emission (for incremental compilation) ──────

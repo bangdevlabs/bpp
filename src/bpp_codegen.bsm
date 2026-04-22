@@ -303,6 +303,16 @@ struct ChipPrimitives {
     // and records any link-time relocation the target needs.
     emit_fn_ptr,              // (fn_idx) — acc ← address of function fn_idx
 
+    // Wave 19 extras for spine takeover (batch 6): reset chip-specific
+    // state at the start of emit_func (freelist, promoted-reg array),
+    // and reserve the B3 spill area after b3_select runs so the chip
+    // records its spill-base offset and reports how much to grow the
+    // total variable bytes. Spine stays ignorant of the sign/layout.
+    fn_reset_chip_state,      // () — clear promoted_regs + reset freelist
+    fn_reserve_spill,         // (total) → new_total (total + promoted*8)
+    fn_label_for,             // (fi) → chip-local label id for function fi
+    emit_prologue_full,       // (name_p, fn_lbl_id, frame_size) — fat prologue
+
     // ── Wave 19: function-frame orchestration primitives ──
     // The eight slots below are consumed by the portable cg_emit_func
     // (bpp_codegen.bsm) once it takes over from a64_emit_func /
@@ -1456,8 +1466,109 @@ cg_emit_call(n) {
 // implementation. Future decomposition into cg_emit_func_prologue
 // / body / epilogue with finer primitives is a separate session.
 
+// Wave 19 takeover: spine orchestrates the function emission end to
+// end, calling chip primitives for every ISA-specific instruction.
+// Replaces the pre-Wave-19 fat-primitive delegation that had each
+// chip implement the whole recipe (prologue / arg copy / body /
+// epilogue) on its own. Each step below is either portable (array
+// management, metadata extraction, B3 walk) or a primitive call
+// that wraps a single chip responsibility (prologue, register zero,
+// syscall trap, etc.).
 void cg_emit_func(fi) {
     auto p: ChipPrimitives;
+    auto name_p, par_arr, par_cnt, body_arr, body_cnt;
+    auto frame, i, total;
+    auto hints, ph, fn_rec, pvi;
+    auto stmt_i: Node;
+    auto vi, n_vars, preg;
+
     p = cg_prim;
-    call(p.emit_func_full, fi);
+
+    // 1. Metadata extraction.
+    name_p = arr_get(cg_fn_name, fi);
+    par_arr = arr_get(cg_fn_par, fi);
+    par_cnt = arr_get(cg_fn_pcnt, fi);
+    body_arr = arr_get(cg_fn_body, fi);
+    body_cnt = arr_get(cg_fn_bcnt, fi);
+
+    // 2. Reset portable variable-tracking arrays.
+    arr_clear(cg_vars);
+    arr_clear(cg_var_stack);
+    arr_clear(cg_var_struct_idx);
+    arr_clear(cg_var_off);
+    arr_clear(cg_var_forced_ty);
+    arr_clear(cg_var_refs);
+    arr_clear(cg_var_addr_taken);
+    arr_clear(cg_var_promote);
+
+    // 3. Reset chip-specific state (freelist, promoted-reg array).
+    call(p.fn_reset_chip_state);
+
+    // 4. Install current function identity for downstream lookups.
+    cg_cur_fn_name = name_p;
+    cg_cur_fn_idx = arr_get(cg_fn_fidx, fi);
+
+    // 5. Register parameters as variables and apply type hints if any.
+    fn_rec = arr_get(funcs, cg_cur_fn_idx);
+    hints = *(fn_rec + 48);
+    i = 0;
+    while (i < par_cnt) {
+        pvi = cg_var_add(*(par_arr + i * 8));
+        if (hints != 0) {
+            ph = *(hints + i * 8);
+            if (ph > 0) { arr_set(cg_var_forced_ty, pvi, ph); }
+        }
+        i = i + 1;
+    }
+
+    // 6. Pre-register body-declared variables and compute offsets.
+    call(p.fn_pre_reg_vars, body_arr, body_cnt);
+    total = call(p.fn_compute_offsets);
+
+    // 7. B3 reference walk and register-promotion selection.
+    for (i = 0; i < body_cnt; i = i + 1) {
+        stmt_i = body_arr[i];
+        if (stmt_i != 0) { cg_b3_walk(stmt_i); }
+    }
+    call(p.b3_select);
+
+    // 8. Reserve the spill area and compute final frame size.
+    total = call(p.fn_reserve_spill, total);
+    frame = call(p.fn_scratch_base) + total;
+    frame = (frame + 15) / 16 * 16;
+
+    // 9. Prologue.
+    call(p.emit_prologue_full, name_p, call(p.fn_label_for, fi), frame);
+
+    // 10. main() — save argc / argv / envp to the runtime globals.
+    if (cg_str_eq(name_p, "main", 4)) {
+        call(p.save_main_runtime_globals);
+    }
+
+    // 11. Incoming integer args → frame slots or promoted regs.
+    i = 0;
+    while (i < par_cnt) {
+        call(p.emit_arg_copy_int, i, arr_get(cg_var_off, i));
+        i = i + 1;
+    }
+
+    // 12. Zero any promoted local that is not also a parameter.
+    n_vars = arr_len(cg_vars);
+    for (vi = par_cnt; vi < n_vars; vi = vi + 1) {
+        preg = arr_get(cg_var_promote, vi);
+        if (preg >= 0) { call(p.emit_zero_reg, preg); }
+    }
+
+    // 13. Narrow float params (aarch64 SL_HALF/SL_QUARTER; x64 no-op).
+    call(p.emit_narrow_float_params, par_cnt);
+
+    // 14. Body walk.
+    cg_depth = 0;
+    call(p.emit_body, body_arr, body_cnt);
+
+    // 15. Implicit fallthrough return 0.
+    call(p.emit_implicit_ret_zero);
+
+    // 16. Epilogue.
+    call(p.emit_frame_teardown, frame);
 }
