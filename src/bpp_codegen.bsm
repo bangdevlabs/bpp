@@ -1609,16 +1609,107 @@ cg_emit_node(nd) {
     return call(p.emit_node, nd);
 }
 
-// Wave 20 takeover: the spine delegates statement emission through
-// the emit_stmt_full primitive while the underlying walker stays
-// chip-local. The four new primitives (emit_struct_copy_word,
-// emit_peek_cond, emit_cmp_scratch_acc, emit_branch_if_nonzero) are
-// wired and ready for the fine-grained decomposition that will move
-// T_ASSIGN stack-struct-copy and T_SWITCH compare-chain fully into
-// the spine. Until that session, the fat delegation preserves
-// behaviour and byte-identity exactly.
+// Wave 20 takeover: spine now owns the statement dispatcher for
+// every AST case that uses only portable state + ChipPrimitives
+// slots. The three tangled cases (T_ASSIGN, T_MEMST, T_SWITCH)
+// still fall back to the chip walker through emit_stmt_full until
+// their final primitives (store_var_typed, memst_float_narrow,
+// memst_simd, switch_jtbl, pop_discard) land. Once those ship, the
+// fall-back disappears and the chip's emit_stmt becomes dead code.
 void cg_emit_stmt(nd) {
     auto p: ChipPrimitives;
+    auto n: Node;
+    auto t, lbl, lbl2, ety, rty;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
     p = cg_prim;
-    call(p.emit_stmt_full, nd);
+
+    // Variables already pre-registered in emit_func — nothing to emit.
+    if (t == T_DECL) { return 0; }
+    if (t == T_NOP) { return 0; }
+
+    // Parser-level DCE can collapse a constant-true if-branch into a
+    // T_BLOCK wrapping the surviving statements; just walk them.
+    if (t == T_BLOCK) { call(p.emit_body, n.b, n.c); return 0; }
+
+    // Control-flow break / continue patch through the current label
+    // stacks. Empty stacks just drop the statement (the parser would
+    // have rejected an illegal break, so this is defensive).
+    if (t == T_BREAK) {
+        if (arr_len(cg_break_stack) > 0) {
+            call(p.emit_jump, arr_last(cg_break_stack));
+        }
+        return 0;
+    }
+    if (t == T_CONTINUE) {
+        if (arr_len(cg_continue_stack) > 0) {
+            call(p.emit_jump, arr_last(cg_continue_stack));
+        }
+        return 0;
+    }
+
+    // T_IF: evaluate condition, branch around the taken arm if zero,
+    // jump past the else arm after the taken arm emits.
+    if (t == T_IF) {
+        lbl  = call(p.emit_new_label);
+        lbl2 = call(p.emit_new_label);
+        ety = call(p.emit_node, n.a);
+        if (ety == 1) { call(p.emit_fcond_to_int_truth); }
+        call(p.emit_branch_if_zero, lbl);
+        call(p.emit_body, n.b, n.c);
+        call(p.emit_jump, lbl2);
+        call(p.emit_label, lbl);
+        if (n.e > 0) { call(p.emit_body, n.d, n.e); }
+        call(p.emit_label, lbl2);
+        return 0;
+    }
+
+    // T_WHILE: n.e carries the for-loop step expression (0 for plain
+    // `while`). Continue label sits between body and step so `continue`
+    // runs the step before re-testing.
+    if (t == T_WHILE) {
+        auto step_node, lbl3;
+        step_node = n.e;
+        lbl  = call(p.emit_new_label);
+        lbl2 = call(p.emit_new_label);
+        lbl3 = call(p.emit_new_label);
+        cg_break_stack = arr_push(cg_break_stack, lbl2);
+        cg_continue_stack = arr_push(cg_continue_stack, lbl3);
+        call(p.emit_label, lbl);
+        ety = call(p.emit_node, n.a);
+        if (ety == 1) { call(p.emit_fcond_to_int_truth); }
+        call(p.emit_branch_if_zero, lbl2);
+        call(p.emit_body, n.b, n.c);
+        call(p.emit_label, lbl3);
+        if (step_node != 0) { cg_emit_stmt(step_node); }
+        call(p.emit_jump, lbl);
+        call(p.emit_label, lbl2);
+        arr_pop(cg_break_stack);
+        arr_pop(cg_continue_stack);
+        return 0;
+    }
+
+    // T_RET: evaluate return expression, coerce to the function's
+    // declared return type, jump to the epilogue.
+    if (t == T_RET) {
+        rty = call(p.emit_node, n.a);
+        if (is_float_type(get_fn_ret_type(cg_cur_fn_idx))) {
+            if (rty == 0) { call(p.emit_promote_int_to_flt); }
+        } else {
+            if (rty == 1) { call(p.emit_demote_flt_to_int); }
+        }
+        call(p.emit_jump_to_epilogue);
+        return 0;
+    }
+
+    // The three tangled cases stay chip-local until their supporting
+    // primitives (store_var_typed / memst_float_narrow / memst_simd /
+    // switch_jtbl / pop_discard) land. emit_stmt_full is still bound
+    // to the chip walker; let it handle these paths verbatim.
+    if (t == T_ASSIGN) { call(p.emit_stmt_full, nd); return 0; }
+    if (t == T_MEMST)  { call(p.emit_stmt_full, nd); return 0; }
+    if (t == T_SWITCH) { call(p.emit_stmt_full, nd); return 0; }
+
+    // Expression statement (e.g., bare function call). Walk as node.
+    call(p.emit_node, nd);
 }
