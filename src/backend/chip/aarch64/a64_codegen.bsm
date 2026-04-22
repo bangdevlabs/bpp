@@ -195,6 +195,7 @@ void cg_install_arm64_primitives() {
     p.emit_zero_reg              = fn_ptr(_a64_emit_zero_reg);
     p.emit_implicit_ret_zero     = fn_ptr(_a64_emit_implicit_ret_zero);
     p.emit_body                  = fn_ptr(_a64_emit_body_prim);
+    p.save_main_runtime_globals  = fn_ptr(_a64_save_main_runtime_globals);
 }
 
 void init_codegen_arm64() {
@@ -384,7 +385,7 @@ void a64_print_dec(n) {
 // cg_b3_eligible, cg_b3_walk live in bpp_codegen.bsm.
 
 // ARM64 callee-saved pool: x19..x24 (6 regs).
-static void _a64_b3_select() {
+void _a64_b3_select() {
     auto budget, used, vi, n, best_vi, best_refs, reg;
     budget = 6;
     n = arr_len(cg_vars);
@@ -413,7 +414,7 @@ static void _a64_b3_select() {
 // cg_var_find lives in bpp_codegen.bsm.
 
 // Walk a function body and register all declared variables (for frame sizing).
-static void a64_pre_reg_vars(arr, cnt) {
+void a64_pre_reg_vars(arr, cnt) {
     auto i, j;
     auto n: Node;
     i = 0;
@@ -1849,6 +1850,8 @@ static void a64_emit_stmt(nd) {
 void a64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i;
+    auto p_func: ChipPrimitives;
+    p_func = cg_prim;
     name_p = arr_get(cg_fn_name, fi);
     par_arr = arr_get(cg_fn_par, fi); par_cnt = arr_get(cg_fn_pcnt, fi);
     body_arr = arr_get(cg_fn_body, fi); body_cnt = arr_get(cg_fn_bcnt, fi);
@@ -1918,7 +1921,7 @@ void a64_emit_func(fi) {
         stmt_i = body_arr[i];
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
-    _a64_b3_select();
+    call(p_func.b3_select);
     a64_b3_spill_base = 40 + total;
     total = total + arr_len(a64_promoted_regs) * 8;
 
@@ -1930,17 +1933,9 @@ void a64_emit_func(fi) {
         // a64_primitives.bsm::_a64_emit_prologue).
         _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
 
-        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to hidden globals.
+        // In main(), save argc / argv / envp to hidden globals via primitive.
         if (cg_str_eq(name_p, "main", 4)) {
-            enc_add_reloc(enc_pos, cg_argc_sym, 0);
-            enc_adrp(8); enc_add_imm(8, 8, 0);
-            enc_str_uoff(0, 8, 0);
-            enc_add_reloc(enc_pos, cg_argv_sym, 0);
-            enc_adrp(8); enc_add_imm(8, 8, 0);
-            enc_str_uoff(1, 8, 0);
-            enc_add_reloc(enc_pos, cg_envp_sym, 0);
-            enc_adrp(8); enc_add_imm(8, 8, 0);
-            enc_str_uoff(2, 8, 0);
+            call(p_func.save_main_runtime_globals);
         }
 
         // Incoming int args → frame slots or promoted regs (Wave 14).
@@ -1952,12 +1947,10 @@ void a64_emit_func(fi) {
 
         // Phase B3: zero non-parameter promoted locals (via primitive).
         auto _z_vi, _z_n, _z_preg;
-        auto p_local: ChipPrimitives;
-        p_local = cg_prim;
         _z_n = arr_len(cg_vars);
         for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
             _z_preg = arr_get(cg_var_promote, _z_vi);
-            if (_z_preg >= 0) { call(p_local.emit_zero_reg, _z_preg); }
+            if (_z_preg >= 0) { call(p_func.emit_zero_reg, _z_preg); }
         }
 
         // Narrow float sub-type params from double to their declared precision.
@@ -1978,10 +1971,10 @@ void a64_emit_func(fi) {
 
         // Emit function body (via primitive).
         cg_depth = 0;
-        call(p_local.emit_body, body_arr, body_cnt);
+        call(p_func.emit_body, body_arr, body_cnt);
 
         // Implicit return 0 (via primitive).
-        call(p_local.emit_implicit_ret_zero);
+        call(p_func.emit_implicit_ret_zero);
 
         // Epilogue via primitive (Wave 15 activation — real body
         // lives in a64_primitives.bsm::_a64_emit_frame_teardown).
@@ -1990,17 +1983,9 @@ void a64_emit_func(fi) {
         // Prologue via primitive (Wave 13 activation).
         _a64_emit_prologue(name_p, arr_get(a64_fn_lbl, fi), frame);
 
-        // In main(), save x0 (argc), x1 (argv), and x2 (envp) to globals.
+        // In main(), save argc / argv / envp to hidden globals via primitive.
         if (cg_str_eq(name_p, "main", 4)) {
-            out("  adrp x8, _bpp_argc@PAGE"); putchar('\n');
-            out("  add x8, x8, _bpp_argc@PAGEOFF"); putchar('\n');
-            out("  str x0, [x8]"); putchar('\n');
-            out("  adrp x8, _bpp_argv@PAGE"); putchar('\n');
-            out("  add x8, x8, _bpp_argv@PAGEOFF"); putchar('\n');
-            out("  str x1, [x8]"); putchar('\n');
-            out("  adrp x8, _bpp_envp@PAGE"); putchar('\n');
-            out("  add x8, x8, _bpp_envp@PAGEOFF"); putchar('\n');
-            out("  str x2, [x8]"); putchar('\n');
+            call(p_func.save_main_runtime_globals);
         }
 
         // Incoming int args → frame slots or promoted regs (Wave 14).
@@ -2012,12 +1997,10 @@ void a64_emit_func(fi) {
 
         // Phase B3: zero non-parameter promoted locals (via primitive).
         auto _z_vi, _z_n, _z_preg;
-        auto p_local: ChipPrimitives;
-        p_local = cg_prim;
         _z_n = arr_len(cg_vars);
         for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
             _z_preg = arr_get(cg_var_promote, _z_vi);
-            if (_z_preg >= 0) { call(p_local.emit_zero_reg, _z_preg); }
+            if (_z_preg >= 0) { call(p_func.emit_zero_reg, _z_preg); }
         }
 
         // Narrow float sub-type params from double to their declared precision.
@@ -2038,10 +2021,10 @@ void a64_emit_func(fi) {
 
         // Emit function body (via primitive).
         cg_depth = 0;
-        call(p_local.emit_body, body_arr, body_cnt);
+        call(p_func.emit_body, body_arr, body_cnt);
 
         // Implicit return 0 (via primitive).
-        call(p_local.emit_implicit_ret_zero);
+        call(p_func.emit_implicit_ret_zero);
 
         // Epilogue via primitive (Wave 15 activation).
         _a64_emit_frame_teardown(frame);

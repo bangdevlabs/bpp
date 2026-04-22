@@ -171,6 +171,7 @@ void cg_install_x86_64_primitives() {
     p.emit_zero_reg              = fn_ptr(_x64_emit_zero_reg);
     p.emit_implicit_ret_zero     = fn_ptr(_x64_emit_implicit_ret_zero);
     p.emit_body                  = fn_ptr(_x64_emit_body_prim);
+    p.save_main_runtime_globals  = fn_ptr(_x64_save_main_runtime_globals);
 }
 
 void init_codegen_x86_64() {
@@ -225,7 +226,7 @@ void init_codegen_x86_64() {
 // cg_b3_eligible, cg_b3_walk live in bpp_codegen.bsm.
 
 // SysV callee-saved pool: rbx (3), r14 (14), r15 (15).
-static void _x64_b3_select() {
+void _x64_b3_select() {
     auto budget, used, vi, n, best_vi, best_refs, reg;
     auto pool;
     pool = malloc(3 * 8);
@@ -255,7 +256,7 @@ static void _x64_b3_select() {
 }
 
 // Walk a function body and register all declared variables.
-static void x64_pre_reg_vars(arr, cnt) {
+void x64_pre_reg_vars(arr, cnt) {
     auto i, j;
     auto n: Node;
     i = 0;
@@ -1377,6 +1378,8 @@ static void x64_emit_stmt(nd) {
 void x64_emit_func(fi) {
     auto name_p, par_arr, par_cnt, body_arr, body_cnt;
     auto frame, i, total, sz;
+    auto p_func: ChipPrimitives;
+    p_func = cg_prim;
     name_p = arr_get(cg_fn_name, fi);
     par_arr = arr_get(cg_fn_par, fi); par_cnt = arr_get(cg_fn_pcnt, fi);
     body_arr = arr_get(cg_fn_body, fi); body_cnt = arr_get(cg_fn_bcnt, fi);
@@ -1438,7 +1441,7 @@ void x64_emit_func(fi) {
         stmt_i = body_arr[i];
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
-    _x64_b3_select();
+    call(p_func.b3_select);
     x64_b3_spill_off = 0 - (24 + total);
     total = total + arr_len(x64_promoted_regs) * 8;
 
@@ -1450,21 +1453,9 @@ void x64_emit_func(fi) {
     // x64_primitives.bsm::_x64_emit_prologue).
     _x64_emit_prologue(name_p, arr_get(x64_fn_lbl, fi), frame);
 
-    // In main(), save argc (RDI), argv (RSI), and envp (RDX) to hidden
-    // globals. The _start stub below sets up RDI/RSI/RDX from the kernel
-    // stack so that main sees the standard `(int argc, char**argv, char**envp)`
-    // signature even though Linux passes these via the stack at process entry.
+    // In main(), save argc / argv / envp to hidden globals via primitive.
     if (cg_str_eq(name_p, "main", 4)) {
-        auto dpos;
-        dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, cg_argc_sym, 0);
-        x64_enc_store(7, 10, 0);
-        dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, cg_argv_sym, 0);
-        x64_enc_store(6, 10, 0);
-        dpos = x64_enc_lea_rip(10);
-        x64_enc_add_reloc(dpos, cg_envp_sym, 0);
-        x64_enc_store(2, 10, 0);
+        call(p_func.save_main_runtime_globals);
     }
 
     // Incoming int args → frame slots or promoted regs (Wave 14).
@@ -1476,20 +1467,18 @@ void x64_emit_func(fi) {
 
     // Phase B3: zero any promoted local that is NOT a parameter (via primitive).
     auto _z_vi, _z_n, _z_preg;
-    auto p_local: ChipPrimitives;
-    p_local = cg_prim;
     _z_n = arr_len(cg_vars);
     for (_z_vi = par_cnt; _z_vi < _z_n; _z_vi = _z_vi + 1) {
         _z_preg = arr_get(cg_var_promote, _z_vi);
-        if (_z_preg >= 0) { call(p_local.emit_zero_reg, _z_preg); }
+        if (_z_preg >= 0) { call(p_func.emit_zero_reg, _z_preg); }
     }
 
     // Emit function body (via primitive).
     cg_depth = 0;
-    call(p_local.emit_body, body_arr, body_cnt);
+    call(p_func.emit_body, body_arr, body_cnt);
 
     // Implicit return 0 (via primitive).
-    call(p_local.emit_implicit_ret_zero);
+    call(p_func.emit_implicit_ret_zero);
 
     // Epilogue via primitive (Wave 15 activation — real body
     // lives in x64_primitives.bsm::_x64_emit_frame_teardown).
