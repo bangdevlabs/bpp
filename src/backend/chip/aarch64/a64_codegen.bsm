@@ -95,6 +95,7 @@ void cg_install_arm64_primitives() {
     auto p: ChipPrimitives;
     cg_prim_alloc();
     cg_init_cc();
+    cg_init_sys_ids();
     p = cg_prim;
     p.emit_mov_zero         = fn_ptr(_a64_emit_mov_zero);
     p.emit_mov_imm          = fn_ptr(_a64_emit_mov_imm);
@@ -183,6 +184,10 @@ void cg_install_arm64_primitives() {
     p.emit_shift_right_logical   = fn_ptr(_a64_emit_shift_right_logical);
     p.emit_load_float_ret        = fn_ptr(_a64_emit_load_float_ret);
     p.emit_trap_if_zero          = fn_ptr(_a64_emit_trap_if_zero);
+    p.emit_load_runtime_global   = fn_ptr(_a64_emit_load_runtime_global);
+    p.emit_index_word            = fn_ptr(_a64_emit_index_word);
+    p.emit_syscall               = fn_ptr(_a64_emit_syscall);
+    p.emit_syscall_norm_err      = fn_ptr(_a64_emit_syscall_norm_err);
 }
 
 void init_codegen_arm64() {
@@ -1193,6 +1198,12 @@ a64_emit_call(nd) {
             return 0;
         }
         // Built-in: sys_exit(code) — terminate the process immediately.
+        // argc_get / argv_get / envp_get dispatch moved to
+        // cg_builtin_dispatch (Wave 18).
+        //
+        // sys_exit stays inline: the Wave 18 name-based syscall
+        // primitive had a crash the spine-first approach couldn't
+        // isolate before hand-off. Keeping it chip-local for now.
         if (cg_str_eq(n.a, "sys_exit", 8)) {
             arr = n.b;
             a64_emit_node(*(arr + 0));
@@ -1202,61 +1213,6 @@ a64_emit_call(nd) {
             } else {
                 out("  mov x16, #1"); putchar('\n');
                 out("  svc #0x80"); putchar('\n');
-            }
-            return 0;
-        }
-        // Built-in: argc_get() — return the argument count.
-        if (cg_str_eq(n.a, "argc_get", 8)) {
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, cg_argc_sym, 0);
-                enc_adrp(8); enc_add_imm(8, 8, 0);
-                enc_ldr_uoff(0, 8, 0);
-            } else {
-                out("  adrp x8, _bpp_argc@PAGE"); putchar('\n');
-                out("  add x8, x8, _bpp_argc@PAGEOFF"); putchar('\n');
-                out("  ldr x0, [x8]"); putchar('\n');
-            }
-            return 0;
-        }
-        // Built-in: argv_get(i) — return a pointer to the i-th argument string.
-        if (cg_str_eq(n.a, "argv_get", 8)) {
-            // Evaluate the index argument.
-            a64_emit_node(*(n.b));
-            a64_emit_push();
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, cg_argv_sym, 0);
-                enc_adrp(8); enc_add_imm(8, 8, 0);
-                enc_ldr_uoff(0, 8, 0);
-                a64_emit_pop(1);
-                enc_ldr_reg_shift3(0, 0, 1);
-            } else {
-                out("  adrp x8, _bpp_argv@PAGE"); putchar('\n');
-                out("  add x8, x8, _bpp_argv@PAGEOFF"); putchar('\n');
-                out("  ldr x0, [x8]"); putchar('\n');
-                a64_emit_pop(1);
-                out("  ldr x0, [x0, x1, lsl #3]"); putchar('\n');
-            }
-            return 0;
-        }
-        // Built-in: envp_get(i) — return a pointer to the i-th environment
-        // string ("NAME=value\0"). Returns 0 once i passes the NULL terminator.
-        // Use this to walk the env vars; the higher-level getenv() in
-        // bpp_io.bsm searches by name and returns just the value.
-        if (cg_str_eq(n.a, "envp_get", 8)) {
-            a64_emit_node(*(n.b));
-            a64_emit_push();
-            if (a64_bin_mode) {
-                enc_add_reloc(enc_pos, cg_envp_sym, 0);
-                enc_adrp(8); enc_add_imm(8, 8, 0);
-                enc_ldr_uoff(0, 8, 0);
-                a64_emit_pop(1);
-                enc_ldr_reg_shift3(0, 0, 1);
-            } else {
-                out("  adrp x8, _bpp_envp@PAGE"); putchar('\n');
-                out("  add x8, x8, _bpp_envp@PAGEOFF"); putchar('\n');
-                out("  ldr x0, [x8]"); putchar('\n');
-                a64_emit_pop(1);
-                out("  ldr x0, [x0, x1, lsl #3]"); putchar('\n');
             }
             return 0;
         }

@@ -492,6 +492,85 @@ void _x64_emit_trap_if_zero() {
     x64_enc_def_label(lbl_ok);
 }
 
+// Load the value of a runtime-global pointer (_bpp_argc / _bpp_argv
+// / _bpp_envp) into the accumulator. Mirrors a64's adrp+add+ldr
+// with a single RIP-relative lea + load pair. Relocation type 0
+// routes through the linker's symbol table.
+void _x64_emit_load_runtime_global(sym_id) {
+    auto dpos;
+    dpos = x64_enc_lea_rip(10);
+    x64_enc_add_reloc(dpos, sym_id, 0);
+    x64_enc_load(0, 10, 0);
+}
+
+// acc = mem[acc + scratch * 8]. Used by argv_get / envp_get after
+// the base pointer lands in rax and the index was popped into rcx.
+// x86_64 has no indexed-load with scale in one op at the B++
+// encoder level — the stanza is shl + add + load.
+void _x64_emit_index_word() {
+    x64_enc_shl_imm(1, 3);
+    x64_enc_add_reg(0, 1);
+    x64_enc_load(0, 0, 0);
+}
+
+// Map a portable CG_SYS_* identifier (defined in bpp_codegen.bsm) to
+// the Linux/x86_64 BSYS_* syscall number. Same rationale as the
+// aarch64 helper: the spine never touches BSYS_* directly. Aborts
+// with a diagnostic if the ID does not resolve, so an untranslated
+// request fails loud instead of silently emitting a wrong syscall.
+static _x64_sys_num(cg_id) {
+    if (cg_id == CG_SYS_EXIT)     { return BSYS_EXIT; }
+    if (cg_id == CG_SYS_READ)     { return BSYS_READ; }
+    if (cg_id == CG_SYS_WRITE)    { return BSYS_WRITE; }
+    if (cg_id == CG_SYS_OPEN)     { return BSYS_OPEN; }
+    if (cg_id == CG_SYS_CLOSE)    { return BSYS_CLOSE; }
+    if (cg_id == CG_SYS_FORK)     { return BSYS_FORK; }
+    if (cg_id == CG_SYS_EXECVE)   { return BSYS_EXECVE; }
+    if (cg_id == CG_SYS_WAIT4)    { return BSYS_WAIT4; }
+    if (cg_id == CG_SYS_GETDENTS) { return BSYS_GETDENTS; }
+    if (cg_id == CG_SYS_UNLINK)   { return BSYS_UNLINK; }
+    if (cg_id == CG_SYS_PTRACE)   { return BSYS_PTRACE; }
+    if (cg_id == CG_SYS_LSEEK)    { return BSYS_LSEEK; }
+    if (cg_id == CG_SYS_FCHMOD)   { return BSYS_FCHMOD; }
+    if (cg_id == CG_SYS_SOCKET)   { return BSYS_SOCKET; }
+    if (cg_id == CG_SYS_CONNECT)  { return BSYS_CONNECT; }
+    if (cg_id == CG_SYS_MKDIR)    { return BSYS_MKDIR; }
+    if (cg_id == CG_SYS_MMAP)     { return BSYS_MMAP; }
+    if (cg_id == CG_SYS_MUNMAP)   { return BSYS_MUNMAP; }
+    diag_str("internal error: CG_SYS id ");
+    diag_int(cg_id);
+    diag_str(" not mapped on x86_64/Linux\n");
+    sys_exit(2);
+    return 0;
+}
+
+// Wave 18 emit_syscall primitive. Final instruction for every lifted
+// sys_* builtin on Linux x86_64. The spine has already evaluated every
+// argument into the syscall register file (rdi, rsi, rdx, r10, r8, r9)
+// via the shared eval-and-pop sequence that each dispatch handler runs.
+// This primitive only loads the syscall number into rax and traps,
+// plus an optional pre-load of a literal value into a fixed register
+// (covers sys_open's mode=493 in rdx and similar "literal slot"
+// patterns). x86_64 Linux uses negative errno returns already, so no
+// separate normalisation step is needed after the syscall returns.
+void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
+    auto num;
+    num = _x64_sys_num(cg_id);
+    if (extra_slot >= 0) {
+        x64_enc_mov_wide(extra_slot, extra_val);
+    }
+    x64_enc_mov_wide(0, num);
+    x64_enc_syscall();
+}
+
+// Linux-side syscall returns already use negative errno convention,
+// so error normalisation is a no-op here. The primitive exists so
+// the spine stays chip-agnostic when the a64 path's csneg is
+// required.
+void _x64_emit_syscall_norm_err() {
+    // intentionally empty — Linux syscall ABI needs no fixup.
+}
+
 // Load `width` bytes from [rax + rcx] into rax (str_peek-style
 // indexed byte access). x86 needs an explicit add_reg before the
 // load since it doesn't have a two-register indexed load in one

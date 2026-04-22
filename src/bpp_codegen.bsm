@@ -285,6 +285,16 @@ struct ChipPrimitives {
     emit_shift_right_logical, // () — acc >>= scratch (unsigned)
     emit_load_float_ret, // (slot) — load float return save slot (0 or 1)
     emit_trap_if_zero,  // () — if acc == 0, trap (brk/INT3)
+
+    // ── Wave 18 runtime access (4) ──
+    // Runtime globals (_bpp_argc / _bpp_argv / _bpp_envp) are
+    // populated by the platform's crt0 at program entry. The
+    // spine consumes them through these primitives so argc_get /
+    // argv_get / envp_get / syscalls stay ABI-agnostic.
+    emit_load_runtime_global, // (sym_id) — acc ← *sym
+    emit_index_word,          // () — acc ← mem[acc + scratch*8]
+    emit_syscall,             // (num, argc, extra_slot, extra_val) — invoke syscall
+    emit_syscall_norm_err,    // () — normalise syscall error convention
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -318,6 +328,45 @@ void cg_init_cc() {
     CG_CC_LE = 3;
     CG_CC_GT = 4;
     CG_CC_GE = 5;
+}
+
+// Portable syscall identifiers consumed by emit_syscall. The spine
+// dispatches every lifted sys_* builtin through `cg_builtin_dispatch`
+// passing one of these IDs; the chip's `_<chip>_sys_num` helper maps
+// CG_SYS_* to BSYS_* on the active target so no OS-specific constant
+// ever leaks into the portable dispatch table. A syscall that is not
+// available on the running chip makes the chip's sys_num helper abort
+// with a diagnostic instead of emitting a bogus syscall number.
+//
+// Only syscalls with a simple "args in regs, trap, optional csneg"
+// shape are lifted here. Specials that build timevals on the stack
+// (sys_usleep), fabricate extra zeros (sys_waitpid → wait4 with
+// hardcoded status/options/rusage), or exist on only one OS
+// (sys_ioctl / sys_nanosleep / sys_clock_gettime — all Linux-only
+// in this tree) stay chip-local and are not listed here.
+extrn CG_SYS_EXIT, CG_SYS_READ, CG_SYS_WRITE, CG_SYS_OPEN, CG_SYS_CLOSE,
+      CG_SYS_FORK, CG_SYS_EXECVE, CG_SYS_WAIT4, CG_SYS_GETDENTS,
+      CG_SYS_UNLINK, CG_SYS_PTRACE, CG_SYS_LSEEK, CG_SYS_FCHMOD,
+      CG_SYS_SOCKET, CG_SYS_CONNECT, CG_SYS_MKDIR, CG_SYS_MMAP, CG_SYS_MUNMAP;
+void cg_init_sys_ids() {
+    CG_SYS_EXIT     = 0;
+    CG_SYS_READ     = 1;
+    CG_SYS_WRITE    = 2;
+    CG_SYS_OPEN     = 3;
+    CG_SYS_CLOSE    = 4;
+    CG_SYS_FORK     = 5;
+    CG_SYS_EXECVE   = 6;
+    CG_SYS_WAIT4    = 7;
+    CG_SYS_GETDENTS = 8;
+    CG_SYS_UNLINK   = 9;
+    CG_SYS_PTRACE   = 10;
+    CG_SYS_LSEEK    = 11;
+    CG_SYS_FCHMOD   = 12;
+    CG_SYS_SOCKET   = 13;
+    CG_SYS_CONNECT  = 14;
+    CG_SYS_MKDIR    = 15;
+    CG_SYS_MMAP     = 16;
+    CG_SYS_MUNMAP   = 17;
 }
 
 // ── Phase 3.4 portable helpers (called from chip emit_node) ──
@@ -1055,6 +1104,48 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: argc_get() — number of command-line arguments.
+    // Reads the runtime global _bpp_argc which crt0 populates at
+    // entry. No args, no coerce — just a single load.
+    if (cg_str_eq(n.a, "argc_get", 8)) {
+        call(p.emit_load_runtime_global, cg_argc_sym);
+        return 1;
+    }
+
+    // Built-in: argv_get(i) — pointer to the i-th argument string.
+    // Evaluates the index, saves it, loads _bpp_argv's value
+    // (pointer to the argv array), then indexes by i*8.
+    if (cg_str_eq(n.a, "argv_get", 8)) {
+        auto arr;
+        arr = n.b;
+        call(p.emit_node, *(arr + 0));
+        call(p.emit_push_acc);
+        call(p.emit_load_runtime_global, cg_argv_sym);
+        call(p.emit_pop_scratch);
+        call(p.emit_index_word);
+        return 1;
+    }
+
+    // Built-in: envp_get(i) — pointer to the i-th env-string
+    // ("NAME=value\0"). Returns 0 once i walks past the NULL
+    // terminator. Same shape as argv_get, different runtime sym.
+    if (cg_str_eq(n.a, "envp_get", 8)) {
+        auto arr;
+        arr = n.b;
+        call(p.emit_node, *(arr + 0));
+        call(p.emit_push_acc);
+        call(p.emit_load_runtime_global, cg_envp_sym);
+        call(p.emit_pop_scratch);
+        call(p.emit_index_word);
+        return 1;
+    }
+
+    // Wave 18 syscall lifts: reverted. The BSYS_* constants
+    // collide between _bsys_macos.bsm and _bsys_linux.bsm (every
+    // shared name has a different number per OS), so the spine
+    // cannot reference BSYS_* without disambiguating at the chip
+    // level. Keeping syscall dispatch chip-local until a proper
+    // portable syscall ID enum is introduced.
     return 0;
 }
 

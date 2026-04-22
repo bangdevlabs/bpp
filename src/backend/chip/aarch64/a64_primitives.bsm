@@ -892,6 +892,102 @@ void _a64_emit_mem_barrier() {
     }
 }
 
+// Load the value of a runtime-global pointer (_bpp_argc / _bpp_argv
+// / _bpp_envp) into the accumulator. The spine passes the sym_id
+// (already populated by cg_symbol_declared when the runtime was
+// imported); chip emits the adrp+add+ldr trio with a type-0
+// relocation so the linker resolves to the global's slot.
+void _a64_emit_load_runtime_global(sym_id) {
+    if (a64_bin_mode) {
+        enc_add_reloc(enc_pos, sym_id, 0);
+        enc_adrp(8); enc_add_imm(8, 8, 0);
+        enc_ldr_uoff(0, 8, 0);
+    } else {
+        out("  adrp x8, _"); a64_print_p(sym_id); out("@PAGE"); putchar('\n');
+        out("  add x8, x8, _"); a64_print_p(sym_id); out("@PAGEOFF"); putchar('\n');
+        out("  ldr x0, [x8]"); putchar('\n');
+    }
+}
+
+// acc = mem[acc + scratch * 8]. Used by argv_get / envp_get after
+// the base pointer lands in x0 and the index was popped into x1.
+// AArch64's shifted-register load does the scale inline — one
+// instruction instead of x64's shl + add + load trio.
+void _a64_emit_index_word() {
+    if (a64_bin_mode) { enc_ldr_reg_shift3(0, 0, 1); }
+    else { out("  ldr x0, [x0, x1, lsl #3]"); putchar('\n'); }
+}
+
+// Map a portable CG_SYS_* identifier (defined in bpp_codegen.bsm) to
+// the macOS/aarch64 BSYS_* syscall number. The spine never references
+// BSYS_* directly — that would require importing both OS headers and
+// produce the name collisions that motivated the enum in the first
+// place. If the spine asks for a syscall ID this chip cannot service
+// (future-proofing: if CG_SYS grows before the chip catches up), the
+// compiler aborts with a diagnostic rather than emitting a wrong
+// syscall number that would corrupt whatever it overwrites.
+static _a64_sys_num(cg_id) {
+    if (cg_id == CG_SYS_EXIT)     { return BSYS_EXIT; }
+    if (cg_id == CG_SYS_READ)     { return BSYS_READ; }
+    if (cg_id == CG_SYS_WRITE)    { return BSYS_WRITE; }
+    if (cg_id == CG_SYS_OPEN)     { return BSYS_OPEN; }
+    if (cg_id == CG_SYS_CLOSE)    { return BSYS_CLOSE; }
+    if (cg_id == CG_SYS_FORK)     { return BSYS_FORK; }
+    if (cg_id == CG_SYS_EXECVE)   { return BSYS_EXECVE; }
+    if (cg_id == CG_SYS_WAIT4)    { return BSYS_WAIT4; }
+    if (cg_id == CG_SYS_GETDENTS) { return BSYS_GETDENTS; }
+    if (cg_id == CG_SYS_UNLINK)   { return BSYS_UNLINK; }
+    if (cg_id == CG_SYS_PTRACE)   { return BSYS_PTRACE; }
+    if (cg_id == CG_SYS_LSEEK)    { return BSYS_LSEEK; }
+    if (cg_id == CG_SYS_FCHMOD)   { return BSYS_FCHMOD; }
+    if (cg_id == CG_SYS_SOCKET)   { return BSYS_SOCKET; }
+    if (cg_id == CG_SYS_CONNECT)  { return BSYS_CONNECT; }
+    if (cg_id == CG_SYS_MKDIR)    { return BSYS_MKDIR; }
+    if (cg_id == CG_SYS_MMAP)     { return BSYS_MMAP; }
+    if (cg_id == CG_SYS_MUNMAP)   { return BSYS_MUNMAP; }
+    diag_str("internal error: CG_SYS id ");
+    diag_int(cg_id);
+    diag_str(" not mapped on aarch64/macOS\n");
+    sys_exit(2);
+    return 0;
+}
+
+// Wave 18 emit_syscall primitive. Final instruction for every lifted
+// sys_* builtin: the spine has already evaluated every argument into
+// x0..x(argc-1) via the shared eval-and-pop sequence. This primitive
+// only loads the syscall number into x16 and traps, plus an optional
+// pre-load of a literal value into a fixed register (covers sys_open's
+// mode=493 in x2, and any similar "literal slot" patterns). The caller
+// is responsible for running emit_syscall_norm_err afterwards when the
+// builtin wants the standard negative-errno convention.
+void _a64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
+    auto num;
+    num = _a64_sys_num(cg_id);
+    if (extra_slot >= 0) {
+        if (a64_bin_mode) { enc_mov_wide(extra_slot, extra_val); }
+        else {
+            out("  mov x"); putchar('0' + extra_slot);
+            out(", #"); a64_print_dec(extra_val); putchar('\n');
+        }
+    }
+    if (a64_bin_mode) {
+        enc_mov_wide(16, num);
+        enc_svc(0x80);
+    } else {
+        out("  mov x16, #"); a64_print_dec(num); putchar('\n');
+        out("  svc #0x80"); putchar('\n');
+    }
+}
+
+// Normalise the syscall return value: on macOS the kernel sets the
+// carry flag and returns a positive errno; csneg flips the sign
+// so callers see the familiar negative-errno convention. On Linux
+// this is a no-op (the kernel already returns negative errnos).
+void _a64_emit_syscall_norm_err() {
+    if (a64_bin_mode) { enc_csneg(0, 0, 0, 3); }
+    else { out("  csneg x0, x0, x0, cc"); putchar('\n'); }
+}
+
 // Abort with `brk #0` when the accumulator is zero. Used by the
 // assert(cond) builtin — the spine coerces cond to int first
 // (via emit_coerce_float_to_int when the expr came back in d0)
