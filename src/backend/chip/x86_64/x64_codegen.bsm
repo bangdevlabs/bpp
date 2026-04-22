@@ -190,6 +190,13 @@ void cg_install_x86_64_primitives() {
     p.emit_binop_retrieve_left   = fn_ptr(_x64_emit_binop_retrieve_left);
     p.emit_addr_stack_struct     = fn_ptr(_x64_emit_addr_stack_struct);
     p.emit_store_var_typed       = fn_ptr(_x64_emit_store_var_typed);
+    p.emit_memst_float_simd      = fn_ptr(_x64_emit_memst_float_simd);
+    p.emit_memst_float_scalar    = fn_ptr(_x64_emit_memst_float_scalar);
+    p.emit_memst_int             = fn_ptr(_x64_emit_memst_int);
+    p.emit_switch_jtbl           = fn_ptr(_x64_emit_switch_jtbl);
+    p.emit_pop_discard           = fn_ptr(_x64_emit_pop_discard);
+    p.emit_branch_eq             = fn_ptr(_x64_emit_branch_eq);
+    p.emit_branch_ne             = fn_ptr(_x64_emit_branch_ne);
 }
 
 void init_codegen_x86_64() {
@@ -433,7 +440,7 @@ static x64_arg_reg(i) : base {
 //   ...
 //   else: body
 //   sw_end:
-static void x64_emit_switch_jtbl(nd, sw_end_lbl) {
+void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     auto n: Node;
     auto node: Node;
     auto sw_arms, sw_bodies, sw_cnt, range;
@@ -1395,6 +1402,50 @@ void x64_emit_stmt(nd) {
 
 // x64_emit_func was deleted after Wave 19 batch 6 — see comment on
 // p.emit_func_full above.
+
+// ── Wave 20 stage 3: T_MEMST per-path primitives ──
+//
+// Mirror of the aarch64 siblings. x86_64 does not encode sub-word
+// scalar float stores today, so `emit_memst_float_scalar` simply
+// delegates to the generic int path (the scalar value gets bitcast
+// through movq_from_xmm during emit_node and follows the same push
+// / pop / memst_store recipe as an integer store).
+
+void _x64_emit_memst_float_simd(nd) {
+    auto n: Node, ety;
+    n = nd;
+    ety = x64_emit_node(n.b);
+    if (ety != 2) {
+        diag_error(231);
+        diag_str("cannot store non-SIMD value through a ': double' field");
+        diag_newline();
+    }
+    x64_emit_vpush();
+    x64_emit_node(n.a);
+    x64_emit_vpop(1);
+    x64_enc_movups_store(1, 0, 0);
+}
+
+void _x64_emit_memst_int(nd, fh) {
+    auto n: Node, ety;
+    auto pp: ChipPrimitives;
+    n = nd;
+    ety = x64_emit_node(n.b);
+    if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
+    x64_emit_push();
+    x64_emit_node(n.a);
+    x64_emit_pop(1);
+    pp = cg_prim;
+    call(pp.emit_memst_store, fh, 1);
+}
+
+// x86_64 does not split scalar float stores by sub-word width today;
+// the int path already handles the value correctly after movq_from_xmm.
+void _x64_emit_memst_float_scalar(nd, fh_sl) {
+    auto n: Node;
+    n = nd;
+    _x64_emit_memst_int(nd, n.c);
+}
 
 // ── Per-module emission (for incremental compilation) ──────
 

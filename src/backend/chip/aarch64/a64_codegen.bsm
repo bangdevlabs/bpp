@@ -214,6 +214,13 @@ void cg_install_arm64_primitives() {
     p.emit_binop_retrieve_left   = fn_ptr(_a64_emit_binop_retrieve_left);
     p.emit_addr_stack_struct     = fn_ptr(_a64_emit_addr_stack_struct);
     p.emit_store_var_typed       = fn_ptr(_a64_emit_store_var_typed);
+    p.emit_memst_float_simd      = fn_ptr(_a64_emit_memst_float_simd);
+    p.emit_memst_float_scalar    = fn_ptr(_a64_emit_memst_float_scalar);
+    p.emit_memst_int             = fn_ptr(_a64_emit_memst_int);
+    p.emit_switch_jtbl           = fn_ptr(_a64_emit_switch_jtbl);
+    p.emit_pop_discard           = fn_ptr(_a64_emit_pop_discard);
+    p.emit_branch_eq             = fn_ptr(_a64_emit_branch_eq);
+    p.emit_branch_ne             = fn_ptr(_a64_emit_branch_ne);
 }
 
 void init_codegen_arm64() {
@@ -703,7 +710,7 @@ void a64_emit_mov(val) {
 //
 // Saves O(N) comparison instructions per switch execution at the cost
 // of a single indirect branch plus (range+1) words of branch-table code.
-static void a64_emit_switch_jtbl(nd, sw_end_lbl) {
+void a64_emit_switch_jtbl(nd, sw_end_lbl) {
     auto n: Node;
     auto node: Node;
     auto sw_arms, sw_bodies, sw_cnt, range;
@@ -1868,6 +1875,106 @@ void a64_emit_stmt(nd) {
 // a64_emit_func was deleted after Wave 19 batch 6 — the spine's
 // cg_emit_func is now the sole entry point, wired straight into
 // p.emit_func_full above.
+
+// ── Wave 20 stage 3: T_MEMST per-path primitives ──
+//
+// Three sibling primitives cover the three shapes a `*(ptr) = val`
+// store can take. The spine picks one based on the field-type hint
+// stored in n.c (SIMD / scalar-float / int) and passes the T_MEMST
+// node to the matching primitive, which runs the full eval-push-
+// eval-pop-store sequence with the chip's register file.
+
+// `: double` (SIMD, 128-bit). Evaluates value into v0, spills to
+// the SIMD push slot, evaluates the pointer into x0, reloads into
+// v1, stores 16 bytes.
+void _a64_emit_memst_float_simd(nd) {
+    auto n: Node, ety;
+    n = nd;
+    ety = a64_emit_node(n.b);
+    if (ety != 2) {
+        diag_error(231);
+        diag_str("cannot store non-SIMD value through a ': double' field");
+        diag_newline();
+    }
+    a64_emit_vpush();
+    a64_emit_node(n.a);
+    a64_emit_vpop(1);
+    if (a64_bin_mode) { enc_str_q_uoff(1, 0, 0); }
+    else { out("  str q1, [x0]"); putchar('\n'); }
+}
+
+// `: half` / `: quarter` / `: full` scalar float. Coerces int→double
+// first if the RHS came back as int. Pushes the scalar via the FP
+// stack, evaluates pointer, pops into d1, narrows per slice width,
+// and stores the narrowed half/single/double at [x0].
+void _a64_emit_memst_float_scalar(nd, fh_sl) {
+    auto n: Node, ety;
+    n = nd;
+    ety = a64_emit_node(n.b);
+    if (ety == 0) {
+        if (a64_bin_mode) { enc_scvtf(0, 0); }
+        else { out("  scvtf d0, x0"); putchar('\n'); }
+    }
+    a64_emit_fpush();
+    a64_emit_node(n.a);
+    a64_emit_fpop(1);
+    if (fh_sl == SL_HALF) {
+        if (a64_bin_mode) { enc_fcvt_s_d(1, 1); enc_str_s_uoff(1, 0, 0); }
+        else {
+            out("  fcvt s1, d1"); putchar('\n');
+            out("  str s1, [x0]"); putchar('\n');
+        }
+    }
+    if (fh_sl == SL_QUARTER) {
+        if (a64_bin_mode) { enc_fcvt_h_d(1, 1); enc_str_h_uoff(1, 0, 0); }
+        else {
+            out("  fcvt h1, d1"); putchar('\n');
+            out("  str h1, [x0]"); putchar('\n');
+        }
+    }
+    if (fh_sl == SL_FULL) {
+        if (a64_bin_mode) { enc_str_d_uoff(1, 0, 0); }
+        else { out("  str d1, [x0]"); putchar('\n'); }
+    }
+}
+
+// Integer stores. Evaluates the value, coerces float-to-int if
+// needed, then saves the value — in a freelist register when the
+// pointer expression is call-free, or on the stack otherwise.
+// Evaluates the pointer, retrieves the value, and hands both to the
+// chip's emit_memst_store primitive which owns the sub-word dispatch.
+void _a64_emit_memst_int(nd, fh) {
+    auto n: Node, ety, alloc_reg_st, val_reg;
+    auto pp: ChipPrimitives;
+    n = nd;
+    alloc_reg_st = 0 - 1;
+    val_reg = 1;
+    ety = a64_emit_node(n.b);
+    if (ety == 1) {
+        if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); }
+        else { out("  fmov x0, d0"); putchar('\n'); }
+    }
+    if (cg_has_call(n.a)) {
+        a64_emit_push();
+    } else {
+        alloc_reg_st = a64_gp_alloc();
+        if (alloc_reg_st >= 0) {
+            if (a64_bin_mode) { enc_mov_reg(alloc_reg_st, 0); }
+            else { out("  mov x"); a64_print_dec(alloc_reg_st); out(", x0"); putchar('\n'); }
+        } else {
+            a64_emit_push();
+        }
+    }
+    a64_emit_node(n.a);
+    if (alloc_reg_st >= 0) {
+        val_reg = alloc_reg_st;
+        a64_gp_free(alloc_reg_st);
+    } else {
+        a64_emit_pop(1);
+    }
+    pp = cg_prim;
+    call(pp.emit_memst_store, fh, val_reg);
+}
 
 // ── Per-module emission (for incremental compilation) ──────
 

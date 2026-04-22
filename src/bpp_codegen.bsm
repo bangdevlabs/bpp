@@ -339,6 +339,22 @@ struct ChipPrimitives {
     // byte widths). rty is the RHS emit_node result (0=int, 1=float).
     emit_store_var_typed,     // (vi, off, rty)
 
+    // T_MEMST paths. The spine makes the type-based decision (SIMD
+    // vs scalar-float vs int) and delegates to the matching primitive;
+    // each owns its own eval-push-eval-pop-store sequence because the
+    // register file involved differs per shape.
+    emit_memst_float_simd,    // (nd)          — `: double` 128-bit store
+    emit_memst_float_scalar,  // (nd, fh_sl)   — `: half/quarter/full` scalar
+    emit_memst_int,           // (nd, fh)      — int store, freelist-aware
+
+    // T_SWITCH helpers. jtbl primitive delegates to the chip-local
+    // dense-jump-table emitter (aarch64 only — x86_64 builds a jump
+    // table in a different shape). pop_discard drops the saved cond
+    // word between arms / on fall-through; aarch64 pops into x9
+    // (freelist reg, guaranteed scratch), x86_64 pops into rcx.
+    emit_switch_jtbl,         // (nd, end_lbl) — Form 1 dense dispatch
+    emit_pop_discard,         // ()            — drop one word from stack top
+
     // ── Wave 19: function-frame orchestration primitives ──
     // The eight slots below are consumed by the portable cg_emit_func
     // (bpp_codegen.bsm) once it takes over from a64_emit_func /
@@ -1783,11 +1799,102 @@ void cg_emit_stmt(nd) {
         return 0;
     }
 
-    // T_MEMST and T_SWITCH still fall through to the chip walker
-    // while the float-narrow-store, SIMD-store, and switch-jtbl
-    // primitives await their stage-3 lift.
-    if (t == T_MEMST)  { call(p.emit_stmt_full, nd); return 0; }
-    if (t == T_SWITCH) { call(p.emit_stmt_full, nd); return 0; }
+    // T_MEMST: `*(ptr) = val`. n.c carries the field-type hint; the
+    // spine splits SIMD from scalar-float from int and delegates to
+    // the per-path primitive that owns the exact register-file dance
+    // (SIMD lives in v0/xmm0 with a vpush stack slot; scalar float
+    // uses d0/xmm0 with the FP stack; int uses x0/rax with a freelist
+    // save on aarch64, a plain push/pop on x86_64).
+    if (t == T_MEMST) {
+        auto fh, fh_sl;
+        fh = n.c;
+        if (is_float_type(fh)) {
+            fh_sl = ty_slice(fh);
+            if (fh_sl == SL_DOUBLE) {
+                call(p.emit_memst_float_simd, nd);
+                return 0;
+            }
+            call(p.emit_memst_float_scalar, nd, fh_sl);
+            return 0;
+        }
+        call(p.emit_memst_int, nd, fh);
+        return 0;
+    }
+
+    // T_SWITCH: two forms.
+    //   Form 1 (n.a != 0): value dispatch. Evaluate the condition
+    //     once, push it, then for each arm value compare against the
+    //     saved copy on the stack. A dense-value arm set short-
+    //     circuits through the chip's jump-table primitive.
+    //   Form 2 (n.a == 0): condition dispatch. Each arm expression
+    //     is evaluated in sequence; truthy enters the body.
+    // Bodies and the else fallthrough pop the saved cond (when
+    // present) before running.
+    if (t == T_SWITCH) {
+        auto sw_arms, sw_bodies, sw_cnt, sw_end_lbl;
+        auto si, sv_arr, sv_cnt, sb_arr, sb_cnt, snext_lbl;
+        auto smatch_lbl, sk;
+        sw_arms = n.b;
+        sw_bodies = n.src_tok;
+        sw_cnt = n.c;
+        sw_end_lbl = call(p.emit_new_label);
+
+        // Form 1 dense switches use the chip's jump-table emitter.
+        if (n.a != 0) {
+            if (cg_switch_is_dense(sw_arms, sw_cnt)) {
+                call(p.emit_switch_jtbl, nd, sw_end_lbl);
+                return 0;
+            }
+        }
+
+        // Form 1: evaluate the condition once and push for later peeks.
+        if (n.a != 0) {
+            call(p.emit_node, n.a);
+            call(p.emit_push_acc);
+        }
+
+        for (si = 0; si < sw_cnt; si = si + 1) {
+            sv_arr = sw_arms[si * 2];
+            sv_cnt = sw_arms[si * 2 + 1];
+            sb_arr = sw_bodies[si * 2];
+            sb_cnt = sw_bodies[si * 2 + 1];
+            snext_lbl = call(p.emit_new_label);
+            smatch_lbl = call(p.emit_new_label);
+
+            if (n.a == 0) {
+                // Form 2: condition dispatch.
+                call(p.emit_node, sv_arr[0]);
+                call(p.emit_branch_if_nonzero, smatch_lbl);
+            } else {
+                // Form 1: compare saved cond against each arm value.
+                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                    call(p.emit_node, sv_arr[sk]);
+                    call(p.emit_peek_cond);
+                    call(p.emit_cmp_scratch_acc);
+                    call(p.emit_branch_eq, smatch_lbl);
+                }
+            }
+            call(p.emit_jump, snext_lbl);
+
+            call(p.emit_label, smatch_lbl);
+            if (n.a != 0) { call(p.emit_pop_discard); }
+            for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+            call(p.emit_jump, sw_end_lbl);
+
+            call(p.emit_label, snext_lbl);
+        }
+
+        // Fell through all arms — pop saved cond before else body or end.
+        if (n.a != 0) { call(p.emit_pop_discard); }
+
+        if (n.d != 0) {
+            auto ek;
+            for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+        }
+
+        call(p.emit_label, sw_end_lbl);
+        return 0;
+    }
 
     // Expression statement (e.g., bare function call). Walk as node.
     call(p.emit_node, nd);
