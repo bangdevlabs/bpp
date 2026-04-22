@@ -545,22 +545,46 @@ static _x64_sys_num(cg_id) {
 }
 
 // Wave 18 emit_syscall primitive. Final instruction for every lifted
-// sys_* builtin on Linux x86_64. The spine has already evaluated every
-// argument into the syscall register file (rdi, rsi, rdx, r10, r8, r9)
-// via the shared eval-and-pop sequence that each dispatch handler runs.
-// This primitive only loads the syscall number into rax and traps,
-// plus an optional pre-load of a literal value into a fixed register
-// (covers sys_open's mode=493 in rdx and similar "literal slot"
-// patterns). x86_64 Linux uses negative errno returns already, so no
-// separate normalisation step is needed after the syscall returns.
+// sys_* builtin on Linux x86_64. The spine has already evaluated the
+// last argument into rax and pushed any earlier arguments onto the
+// stack in REVERSE order (so the top of the stack is arg 1). This
+// primitive moves rax into rdi (the x86_64 Linux syscall ABI's first
+// argument register — the tree walker's own convention is rax), pops
+// subsequent arguments into rsi / rdx / r10 / r8 / r9 per the ABI,
+// optionally pre-loads a literal value into a fixed register (covers
+// sys_open's mode=493 in rdx), loads the syscall number into rax,
+// and traps. Linux returns negative errnos directly, so no csneg
+// normalisation is required after the syscall returns.
 void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     auto num;
-    num = _x64_sys_num(cg_id);
+    // Move arg 0 from rax (tree walker convention) into rdi (syscall ABI).
+    if (arg_count >= 1) { x64_enc_mov_reg(7, 0); }
+    // Pop remaining args from the stack into rsi, rdx, r10, r8, r9.
+    if (arg_count >= 2) { x64_enc_pop(6);  cg_depth = cg_depth - 1; }
+    if (arg_count >= 3) { x64_enc_pop(2);  cg_depth = cg_depth - 1; }
+    if (arg_count >= 4) { x64_enc_pop(10); cg_depth = cg_depth - 1; }
+    if (arg_count >= 5) { x64_enc_pop(8);  cg_depth = cg_depth - 1; }
+    if (arg_count >= 6) { x64_enc_pop(9);  cg_depth = cg_depth - 1; }
     if (extra_slot >= 0) {
         x64_enc_mov_wide(extra_slot, extra_val);
     }
+    num = _x64_sys_num(cg_id);
     x64_enc_mov_wide(0, num);
     x64_enc_syscall();
+}
+
+// Load the runtime address of function index `fi` into rax. LEA
+// RIP-relative with a disp32=0 placeholder that the linker patches
+// using the function's emitter label id from x64_fn_lbl. The fixup
+// slot recording is identical to the pre-lift chip-local behaviour
+// verbatim — resolve-time fixup uses the dpos from lea_rip, not
+// x64_enc_pos (which has moved past the disp32 by the time the
+// patch would apply).
+void _x64_emit_fn_ptr(fi) {
+    auto dpos;
+    dpos = x64_enc_lea_rip(0);
+    x64_enc_add_fixup(arr_get(x64_fn_lbl, fi));
+    arr_set(x64_enc_fix_pos, arr_len(x64_enc_fix_pos) - 1, dpos);
 }
 
 // Linux-side syscall returns already use negative errno convention,

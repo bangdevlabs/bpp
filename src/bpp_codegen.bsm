@@ -295,6 +295,13 @@ struct ChipPrimitives {
     emit_index_word,          // () — acc ← mem[acc + scratch*8]
     emit_syscall,             // (num, argc, extra_slot, extra_val) — invoke syscall
     emit_syscall_norm_err,    // () — normalise syscall error convention
+
+    // Wave 18 batch 5: fn_ptr(name) address loader. The spine resolves
+    // the function name to its index via cg_find_fn and hands the index
+    // to this primitive, which emits the chip-specific "load code
+    // address" instruction (ADR on aarch64, LEA RIP-relative on x86_64)
+    // and records any link-time relocation the target needs.
+    emit_fn_ptr,              // (fn_idx) — acc ← address of function fn_idx
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -1273,6 +1280,24 @@ cg_builtin_dispatch(n) {
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_syscall, CG_SYS_MUNMAP, 2, -1, 0);
         call(p.emit_syscall_norm_err);
+        return 1;
+    }
+
+    // Built-in: fn_ptr(name) — load the address of a B++ function.
+    // Spine resolves the name to its table index (portable logic);
+    // the chip primitive emits the ADR / LEA-RIP that computes the
+    // runtime address. Validate runs first so the name is guaranteed
+    // to exist; cg_find_fn returning -1 is therefore an internal bug.
+    if (cg_str_eq(n.a, "fn_ptr", 6)) {
+        auto arr, fn_name: Node, fi;
+        arr = n.b;
+        fn_name = *(arr + 0);
+        fi = cg_find_fn(fn_name.a);
+        if (fi < 0) {
+            diag_str("internal error: fn_ptr target not found after validate\n");
+            sys_exit(2);
+        }
+        call(p.emit_fn_ptr, fi);
         return 1;
     }
 
