@@ -313,6 +313,27 @@ struct ChipPrimitives {
     fn_label_for,             // (fi) → chip-local label id for function fi
     emit_prologue_full,       // (name_p, fn_lbl_id, frame_size) — fat prologue
 
+    // Wave 20: emit_stmt orchestration. Fat delegator to the chip's
+    // statement walker — the spine's cg_emit_stmt bounces straight
+    // through this slot until the 11 AST cases inside split into
+    // individual primitives. Four supporting slots cover the pieces
+    // of T_ASSIGN and T_SWITCH that are cleanly chip-uniform today.
+    emit_stmt_full,           // (nd) — fat walker, full statement recipe
+    emit_struct_copy_word,    // (src_word_off, dst_frame_off_bytes) — 8B load+store
+    emit_peek_cond,           // () — load saved cond from [sp] into scratch
+    emit_cmp_scratch_acc,     // () — flags ← compare(scratch, acc)
+    emit_branch_if_nonzero,   // (label_id) — branch when acc != 0
+
+    // Wave 21: emit_node orchestration (endgame). Three primitives
+    // support the T_BINOP left-save dance (freelist on aarch64 /
+    // stack on x86_64) and T_VAR stack-struct address-of. Bodies
+    // stay unwired for now — the chip's emit_node still handles
+    // these cases inline — but the slots exist so the follow-up
+    // session that decomposes the tree walker has a target surface.
+    emit_binop_save_left,     // (has_call_right, left_reg_hint) — save left operand
+    emit_binop_retrieve_left, // (has_call_right, saved_reg) → reg holding left
+    emit_addr_stack_struct,   // (frame_off) — acc ← fp + frame_off (stack-struct addr-of)
+
     // ── Wave 19: function-frame orchestration primitives ──
     // The eight slots below are consumed by the portable cg_emit_func
     // (bpp_codegen.bsm) once it takes over from a64_emit_func /
@@ -1571,4 +1592,33 @@ void cg_emit_func(fi) {
 
     // 16. Epilogue.
     call(p.emit_frame_teardown, frame);
+}
+
+// Wave 21 takeover: the spine dispatches expression emission through
+// the existing emit_node ChipPrimitives slot. The chip's tree walker
+// continues to own the T_BINOP / T_UNARY / T_CALL / T_MEMLD / T_ADDR
+// cases inline while the three Wave 21 scaffolding slots
+// (emit_binop_save_left, emit_binop_retrieve_left,
+// emit_addr_stack_struct) wait for the decomposition pass that
+// moves them into portable spine helpers. Making cg_emit_node the
+// canonical entry point standardises the call surface so the chip
+// layer is the sole implementer, not an extra caller path.
+cg_emit_node(nd) {
+    auto p: ChipPrimitives;
+    p = cg_prim;
+    return call(p.emit_node, nd);
+}
+
+// Wave 20 takeover: the spine delegates statement emission through
+// the emit_stmt_full primitive while the underlying walker stays
+// chip-local. The four new primitives (emit_struct_copy_word,
+// emit_peek_cond, emit_cmp_scratch_acc, emit_branch_if_nonzero) are
+// wired and ready for the fine-grained decomposition that will move
+// T_ASSIGN stack-struct-copy and T_SWITCH compare-chain fully into
+// the spine. Until that session, the fat delegation preserves
+// behaviour and byte-identity exactly.
+void cg_emit_stmt(nd) {
+    auto p: ChipPrimitives;
+    p = cg_prim;
+    call(p.emit_stmt_full, nd);
 }

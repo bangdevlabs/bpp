@@ -662,6 +662,70 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
         }
     }
 }
+// ── Wave 20 statement orchestration primitives ──
+//
+// Fat delegator to the chip's statement walker. cg_emit_stmt in the
+// spine bounces through this slot; the walker itself remains
+// chip-local for now because the 11 AST cases still reference
+// chip-specific helpers (a64_gp_alloc, a64_emit_store_var, _a64_has_call,
+// a64_emit_node recursion). A finer-grained decomposition that drops
+// each case into its own primitive is a follow-up pass.
+void _a64_emit_stmt_full(nd) {
+    a64_emit_stmt(nd);
+}
+
+// Copy one 64-bit word from [x0 + src_off] into [x29 + dst_off].
+// Used by the T_ASSIGN stack-struct copy loop.
+void _a64_emit_struct_copy_word(src_off, dst_off) {
+    if (a64_bin_mode) {
+        enc_ldr_uoff(8, 0, src_off);
+        enc_str_uoff(8, 29, dst_off);
+    } else {
+        out("  ldr x8, [x0, #"); a64_print_dec(src_off); out("]"); putchar('\n');
+        out("  str x8, [x29, #"); a64_print_dec(dst_off); out("]"); putchar('\n');
+    }
+}
+
+// T_SWITCH (sparse value-dispatch form): peek saved cond word from
+// the stack top (saved earlier by emit_push_acc) into x1/scratch.
+void _a64_emit_peek_cond() {
+    if (a64_bin_mode) { enc_ldr_uoff(1, 31, 0); }
+    else { out("  ldr x1, [sp]"); putchar('\n'); }
+}
+
+// Compare scratch against the accumulator (x1 vs x0). Sets flags for
+// a subsequent conditional branch. Zero result means "equal".
+void _a64_emit_cmp_scratch_acc() {
+    if (a64_bin_mode) { enc_cmp_reg(1, 0); }
+    else { out("  cmp x1, x0"); putchar('\n'); }
+}
+
+// Branch to `label_id` when x0 != 0. Complement of emit_branch_if_zero;
+// consumed by T_SWITCH condition-dispatch form to jump on a truthy
+// case expression.
+void _a64_emit_branch_if_nonzero(label_id) {
+    if (a64_bin_mode) { enc_cbnz_label(0, label_id); }
+    else {
+        out("  cbnz x0, .L"); a64_print_dec(label_id); putchar('\n');
+    }
+}
+
+// ── Wave 21 emit_node orchestration primitives (scaffolding) ──
+//
+// These three slots exist so a future decomposition pass can lift
+// the T_BINOP and T_VAR edge cases from the chip's emit_node into
+// the portable spine. For now the chip walker continues to handle
+// them inline — the bodies here are stubs that no caller invokes.
+
+void _a64_emit_binop_save_left(has_call_right, left_reg_hint) { }
+
+_a64_emit_binop_retrieve_left(has_call_right, saved_reg) { return saved_reg; }
+
+void _a64_emit_addr_stack_struct(frame_off) {
+    if (a64_bin_mode) { enc_add_imm(0, 29, frame_off); }
+    else { out("  add x0, x29, #"); a64_print_dec(frame_off); putchar('\n'); }
+}
+
 // Return the chip-local label id for function `fi`. aarch64 stores
 // these in a64_fn_lbl, parallel to cg_fn_name. Consumed by the
 // spine when it needs to pass a label to emit_prologue_full without
