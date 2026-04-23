@@ -1,6 +1,106 @@
 # B++ Bootstrap Journal
 
-## 2026-04-22 — 🏁 PHASE 3.4 ORCHESTRATION CLOSED: Waves 18-21 SHIPPED
+## 2026-04-23 — 📚 DOC BACKFILL: every chapter shipped
+
+Short doc-maintenance session. Three files updated:
+
+**`docs/todo.md`** — status date updated to 2026-04-23, version to
+0.111, suite to 111/0 (non-GPU). The 1.0 path gained four new ✅
+milestones (GPU palette + ModuLab 1.0, Waves 18-21 portable backend,
+Phase D). The stale wave-by-wave Active section replaced with a
+clean post-D summary + next targets (Phase 5 RISC-V, Phase 6
+install chameleon). `stbaudio` row in the game modules table
+updated from "next" to ✅.
+
+**`README.md`** — insignia bumped to B++ 0.111. Module count 21 →
+22 (stbpal). Test count 78 → 111. Timeline table gained four
+entries: Apr 20 GPU palette, Apr 20-22 Waves 18-21, Apr 22
+Phase D, Apr 23 this session. Closing paragraph updated.
+
+**`docs/journal.md`** — this entry.
+
+---
+
+## 2026-04-22 — 🧹 PHASE D: STB FAXINA + CAPS 35-47 + PARSER OPTS
+
+**Stb library fully dogfooded**. Every hand-rolled pattern that
+duplicated an auto-injected `bpp_*` tool migrated to the canonical
+API. Thirteen modules touched: stbgame (scene manager), stbmixer
+(11 voice arrays), stbasset (slot init), stbforge (character frames
++ testbed world), stbsound (byte readers/writers), stbimage (BE
+stream readers), stbpal (palette alloc + clone + LUT flash),
+stbdraw (font atlas + layers + rasterizer), stbrender (text
+measure), stbecs (ecs_new), stbpath (path_new), stbtile (tile_new),
+stbui (arena migrated to bpp_arena).
+
+The grep-audit missed-item sweep at session end caught five
+residuals that the first pass skipped: stbdraw lines 525 + 672
+(font atlas + baked bitmap zero loops), stbdraw `_ttf_u16` /
+`_ttf_u32` (BE readers now delegate to bpp_buf's `read_u*be`),
+stbforge line 1189 (sprite argb clear), stbinput line 87
+(keys_prev snapshot copy).
+
+**Caps 35-47 shipped** — thirteen book chapters, one per stb
+module in `docs/how_to_dev_b++.md`. Pattern matches the earlier
+Caps 29-34: intent / scope / API / decision points / caveats /
+verification / "what this chapter does NOT cover". Book grew
+from ~2800 lines to 3276 lines.
+
+**`arr_at` added to bpp_array** — bounds-checked + stderr-logged
+variant for boundary-layer callers (PNG chunk readers, WAV header
+parsers, asset ID lookups from untrusted input). `arr_get` stays
+unchecked (status-quo for every current caller inside `for (i=0;
+i<arr_len; i++)` loops — bounds check would be dead code in hot
+paths). The split captures the design intent: `arr_get` for
+already-validated indices, `arr_at` when the index came from
+outside.
+
+**Phase D compiler optimizations** — three passes landed in
+`bpp_parser.bsm`, all parser-level (no spine / chip changes):
+
+- **D.1 strength reduction** — `x * 2^k` → `x << k`, `x % 2^k` →
+  `x & (2^k - 1)`. Pattern-matched on the post-fold T_BINOP branch.
+  Signed division deliberately NOT reduced (signed ASR vs integer
+  divide differ on negatives; B++ ints are signed).
+- **D.2 identity peephole** — `x + 0`, `x * 1`, `x | 0`, `x ^ 0`,
+  `x & -1` → `x`; `x * 0`, `x & 0` → `0`. Both left-literal and
+  right-literal sides where commutative. Emitted when exactly one
+  operand is a T_LIT (both-lit is handled by the existing constant
+  folder above).
+- **D.4 inline trivials (narrow whitelist)** — `buf_new(n)` →
+  `malloc(n)`, `buf_new_w(n)` → `malloc(n << 3)`. Pure T_CALL
+  rename (and BINOP insertion for buf_new_w). Eliminates the
+  bl/ret pair in 32+ hot-path sites across stbmixer (16),
+  stbecs (8), stbpath (8). Explicit whitelist was the user's
+  gating recommendation — expand case-by-case when profile
+  data justifies each addition, don't auto-detect everything.
+
+Skipped with honest reasons (per user calibration):
+- **D.3 builtin const-fold** — cosmetic; `len("foo") → 3` matters
+  for generated code, not real game code.
+- **E.1 tail-call** — benefits parser recursion, zero game impact.
+- **E.2 hot loop unroll (N≤8)** — game loops have N=64..1920
+  (audio fill, pixel blit). Won't fire.
+- **E.3 inline non-trivial wrappers** — needs alpha-renaming
+  infrastructure for functions with locals; genuine 1-2 week
+  project.
+
+**Tier F design doc** at `docs/tier_f_roadmap.md` — scopes CSE
+(2-3 weeks), register allocator v2 (3-4 weeks), auto-vectorization
+(2-3 months). Gated behind profile data from a real plugin.
+
+**bpp** = `72e1b793e28b0a6af8b15bc492a946ce1f8e62cf`. **Suite** = 111
+passed / 3 GPU-sandbox-flakes / 11 skipped, gen2 == gen3 across
+the whole chain. Zero non-GPU regressions.
+
+Commits planned for the next consolidation push: Phase D work +
+Caps 35-47 + new chapters (filled today on the 23rd) + parser
+optimizations + tier F roadmap + stb dogfood fixes all land
+together once the doc backfill completes.
+
+---
+
+
 
 **Every compilation entry point is now a spine function.** `cg_emit_func`,
 `cg_emit_stmt`, `cg_emit_node`, and `cg_builtin_dispatch` all live in

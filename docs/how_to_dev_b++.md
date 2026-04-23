@@ -19,7 +19,7 @@ No other canonical document. Everything that used to live in separate markdown f
 | 3 | Syntax | I | PENDING | legacy_docs/the_b++_programming_language.md §2 | 1 |
 | 4 | Types | I | PENDING | legacy §3 | 3 |
 | 5 | Functions and Effects | I | PENDING | legacy §2.5 | 3, 4 |
-| 6 | Strings (bpp_str + sb_) | II — Arsenal | PENDING | legacy §4 | 4 |
+tun| 6 | Strings (bpp_str + sb_) | II — Arsenal | PENDING | legacy §4 | 4 |
 | 7 | Arrays (bpp_array) | II | PENDING | legacy §5 | 4 |
 | 8 | Hash tables (bpp_hash) | II | PENDING | legacy §5 | 7 |
 | 9 | Buffers (bpp_buf) | II | PENDING | legacy §5 | — |
@@ -48,6 +48,19 @@ No other canonical document. Everything that used to live in separate markdown f
 | 32 | Input (stbinput) | VI | COMPLETE | new | 2 |
 | 33 | Window (stbwindow) | VI | COMPLETE | new | 2 |
 | 34 | Game loop (stbgame) | VI | COMPLETE | new | 32, 33 |
+| 35 | Drawing (stbdraw) | VI | COMPLETE | new | 34 |
+| 36 | UI widgets (stbui) | VI | COMPLETE | new | 35 |
+| 37 | Image decode (stbimage) | VI | COMPLETE | new | 2 |
+| 38 | Palette (stbpal) | VI | COMPLETE | new | 35 |
+| 39 | Tilemap (stbtile) | VI | COMPLETE | new | 38, 42 |
+| 40 | ECS (stbecs) | VI | COMPLETE | new | 2 |
+| 41 | Physics (stbphys) | VI | COMPLETE | new | 2 |
+| 42 | Pathfinding (stbpath) | VI | COMPLETE | new | 2 |
+| 43 | Pool allocator (stbpool) | VI | COMPLETE | new | 2 |
+| 44 | Color math (stbcol) | VI | COMPLETE | new | 2 |
+| 45 | Asset hub (stbasset) | VI | COMPLETE | new | 37, 31, 38 |
+| 46 | Level forge (stbforge) | VI | COMPLETE | new | 45 |
+| 47 | GPU render (stbrender) | VI | COMPLETE | new | 38 |
 
 Each chapter header repeats `Source:` / `Status:` / `Depends on:` so grep-based audits work. Status legend: `PENDING` (scaffolded, no content) / `DRAFT` (partial content migrated, needs review) / `COMPLETE` (content fully here, legacy source marked ABSORBED in `legacy_docs/README.md`).
 
@@ -187,33 +200,417 @@ main() {
 ## Cap 3 — Syntax
 
 *Depends on: Cap 1*
-*Source: legacy_docs/the_b++_programming_language.md §2*
-*Status: PENDING*
+*Source: legacy_docs/the_b++_programming_language.md §4-§7*
+*Status: COMPLETE — 2026-04-23*
+
+B++ syntax is deliberately small — C-family without the C footguns
+that stopped mattering 40 years ago. Every construct you'll use in a
+game is covered here.
+
+### §3.1 — Control flow
+
+**Conditionals:**
+
+```c
+if (x > 0) {
+    y = x;
+} else if (x == 0) {
+    y = 1;
+} else {
+    y = 0 - x;   // no unary minus; use 0 - x
+}
+
+// Single-statement body may omit braces:
+if (x < 0) x = 0 - x;
+```
+
+**Loops:**
+
+```c
+while (i < n) {
+    if (i == 5) { break; }
+    sum = sum + i;
+    i = i + 1;
+}
+
+for (i = 0; i < 10; i = i + 1) {
+    putchar('0' + i);
+}
+```
+
+`for` desugars to `while` internally. `break` exits the innermost
+loop; `continue` skips to the next iteration (re-running the step
+expression in a `for`).
+
+**Switch — two forms, no fallthrough, no `break`, no `case`:**
+
+```c
+// Value dispatch
+switch (dir) {
+    UP    { dy = 0 - 1; }
+    DOWN  { dy = 1; }
+    LEFT, RIGHT { dx = 0; }   // comma for multi-value
+    else  { /* default */ }
+}
+
+// Condition dispatch
+switch {
+    hp <= 0        { die(); }
+    hp < hp_max/4  { flash_red(); }
+    else           { /* healthy */ }
+}
+```
+
+The compiler emits **W021** if a value switch has no `else`.
+Inherited from B (1969), corrected.
+
+**Short-circuit `&&` and `||`:** the parser rewrites `a && b` to
+`a ? b : 0` and `a || b` to `a ? 1 : b` before codegen, so every
+backend honours C-style short-circuit semantics:
+
+```c
+if (p != 0 && p.field > 0) { ... }   // memory-safe everywhere
+```
+
+**Ternary:** `cond ? a : b` — only the selected branch evaluates.
+Right-associative: `a ? b : c ? d : e` parses as
+`a ? b : (c ? d : e)`.
+
+**Compile-time folding:** integer-literal expressions fold at parse
+time (`3 + 5` becomes `8` in the AST). `if (0) { ... }` drops its
+body; `if (1) { x } else { y }` keeps only `x`. See also Cap 48
+for the Phase D parser-level optimizations (strength reduction,
+identity peephole, inline trivials) that layer on top of folding.
+
+### §3.2 — Operators
+
+**Arithmetic:**
+
+```
+*  /  %       multiply, divide, remainder
++  -          add, subtract
+-x            unary negate (note: `-literal` must be `0 - literal`)
+~x            bitwise NOT
+!x            logical NOT (1 if x == 0, else 0)
+```
+
+**Shift:** `<<` and `>>`. Shift amount is taken modulo the word width.
+
+**Relational and equality:** `<  >  <=  >=  ==  !=`. Signed on
+integers, IEEE on floats. Comparisons return `0` or `1` as 64-bit
+words.
+
+**Bitwise and logical:**
+
+```
+&  |  ^       bitwise AND, OR, XOR (binary only)
+&&            logical AND (short-circuit)
+||            logical OR  (short-circuit)
+```
+
+Unary `&x` is address-of, not bitwise AND.
+
+**Memory:**
+
+```
+*p            dereference: read/write the word (or slice) at p
+&x            address-of: take address of a local / global / field
+a[i]          indexed load: *(a + i * stride)
+s.f           struct field access on a typed local
+```
+
+**Assignment:** `=` plain. `+=  -=  *=  /=  %=` compound arithmetic.
+`&=  |=  ^=  <<=  >>=` compound bitwise. Compound assignments
+evaluate the left operand once.
+
+### §3.3 — Literals
+
+**Integers:** decimal (`42`), hex (`0x1F`, `0xFF00AA55`), octal
+(`0755` — leading zero), character (`'A'` = 65). All 64-bit words.
+
+**Floats:** with fractional part (`1.0`, `3.14159`) or scientific
+(`1.5e3`, `2.0e-7`). 64-bit doubles.
+
+**Float warning:** float literals retain IEEE bits only when
+assigned to a `: float`, `: half float`, or `: quarter float`
+local. An un-annotated `auto x = 44100.0;` **silently truncates
+to int** and produces diagnostic **E232** — always annotate float
+locals.
+
+**Strings:** null-terminated byte sequences. Escapes: `\n` `\r`
+`\t` `\\` `\"` `\0` `\xHH`. String literals are immutable; the
+compiler deduplicates identical literals into the same data-section
+slot.
+
+**Character literals:** `'A'` = 65, `'\n'` = 10, `'\t'` = 9,
+`'\\'` = 92, `'\''` = 39.
+
+### §3.4 — Comments
+
+```c
+// Line comment — extends to end of line.
+/* Block comment — does NOT nest. */
+```
+
+Tonify Rule 9 (Cap 14) requires one blank comment line between a
+function's intro comment and its first body statement, for clean
+generated documentation.
+
+### §3.5 — What this chapter does NOT cover
+
+- **Type annotations** (`: word`, `: half`, etc.) — Cap 4
+- **Function syntax** (signatures, effect annotations) — Cap 5
+- **Struct / enum declarations** — Caps 10 / 11
+- **Import system** — Cap 13
 
 ---
 
 ## Cap 4 — Types
 
 *Depends on: Cap 3*
-*Source: legacy_docs/the_b++_programming_language.md §3*
-*Status: PENDING — body to be absorbed from legacy §3 in Phase C*
+*Source: legacy_docs/the_b++_programming_language.md §8*
+*Status: COMPLETE — 2026-04-23*
 
-Note on scope: this chapter documents TYPES AS LANGUAGE FEATURE —
-the syntax `auto x: word`, `auto x: float`, `auto c: Character`, the
-sub-word hints (`: half`, `: bit3`), and how they interact with the
-effect lattice. The internal type-inference engine
-(`src/bpp_types.bsm`) is compiler-only (fourth tier, see Cap 15) and
-is documented in Cap 21 (Frontend) as part of the parser/analysis
-pipeline. User programs interact with types via annotations; they
-never import `bpp_types.bsm`.
+B++'s type system is a **hint layer** on top of a fundamentally
+untyped 64-bit word machine. Every value is a word; annotations
+(`: word`, `: half`, `: float`, `: Character`) tell the compiler
+how to interpret that word for load/store/arithmetic. No runtime
+type tags, no boxed values, no dynamic dispatch — the hints exist
+only to drive sub-word instructions and ABI layout.
+
+### §4.1 — Base types
+
+| Type | Slice | Size | Notes |
+|------|-------|------|-------|
+| `word` | SL_WORD | 8 bytes | Default; an un-annotated `auto` is a word |
+| `half` | SL_HALF | 4 bytes | 32-bit integer (sub-word load/store) |
+| `quarter` | SL_QUARTER | 2 bytes | 16-bit integer |
+| `byte` | SL_BYTE | 1 byte | 8-bit integer |
+| `bit1..bit7` | SL_BIT..SL_BIT7 | 1-7 bits | For bit-packed struct fields |
+| `float` | SL_WORD | 8 bytes | IEEE 754 double; lives in FP registers |
+| `half float` | SL_HALF | 4 bytes | IEEE single-precision |
+| `quarter float` | SL_QUARTER | 2 bytes | IEEE half-precision |
+| `double` | SL_DOUBLE | 16 bytes | 128-bit SIMD vector |
+| `<struct name>` | SL_STRUCT | as-declared | User-defined record type |
+
+### §4.2 — Slice annotations
+
+Attach `:` + type name to any local, field, or parameter:
+
+```c
+auto hp: word;              // 64-bit int (same as un-annotated)
+auto tile: byte;            // 8-bit — compiler emits strb/ldrb
+auto health_ratio: float;   // 64-bit double — FP register
+auto c: Character;          // struct — sized to struct_size(Character)
+```
+
+For struct fields, slice annotations control packing:
+
+```c
+struct Entity {
+    hp: half,              // offset 0, 4 bytes
+    level: byte,           // offset 4, 1 byte
+    flags: bit4,           // offset 5, 4 bits (packed with next)
+    team: bit2,            // offset 5, 2 bits (same byte as flags)
+    pos_x, pos_y,          // offset 8, 16 — plain words
+    vel: double            // offset 24, 16-byte SIMD
+}
+```
+
+### §4.3 — How hints drive codegen
+
+The compiler emits the NARROWEST instruction that fits:
+
+- `poke(buf + i)` byte-level write — always 1 byte
+- `*(p + i) = val` with `p: byte` — `strb` on aarch64
+- `*(p + i) = val` with `p: half` — `strh` on aarch64
+- `auto f: float; f = 3.14;` — materializes in `d0` (FP reg)
+
+Without annotations, everything defaults to word (8 bytes). Hints
+are opt-in performance tuning, never auto-inferred — an un-hinted
+`auto` NEVER becomes a sub-word type even if the assigned value
+fits in a byte.
+
+### §4.4 — Type propagation
+
+The compiler tracks types through assignments + function calls in
+one pass (see Cap 21). Forward-declared variables inherit the
+hint from their first use:
+
+```c
+auto x;             // untyped (word)
+x = pixel & 0xFF;   // result fits in byte, but x stays word
+// To make x a byte, annotate:
+auto x: byte;
+x = pixel & 0xFF;   // compiler emits byte-sized arithmetic
+```
+
+**Sliced struct access** works via typed locals — see Cap 10 for
+the critical rule that `*(ptr + 8)` does NOT work for sliced
+struct fields (must use `auto n: Node; n.a` pattern).
+
+### §4.5 — What this chapter does NOT cover
+
+- **Type inference engine internals** — `src/bpp_types.bsm`, covered
+  in Cap 21 as part of parser/analysis pipeline.
+- **Struct / enum declaration syntax** — Caps 10 / 11.
+- **Runtime type representation** — there isn't one. All values are
+  just 64-bit words; hints live only in the compile-time symbol
+  table.
 
 ---
 
 ## Cap 5 — Functions and Effects
 
 *Depends on: Cap 3, Cap 4*
-*Source: legacy_docs/the_b++_programming_language.md §2.5*
-*Status: PENDING*
+*Source: legacy_docs/the_b++_programming_language.md §3 + §12*
+*Status: COMPLETE — 2026-04-23*
+
+Functions are the unit of scheduling in B++. Every function has
+a signature, optional effect annotation, and a body. The effect
+annotation is the lever that drives smart dispatch (Cap 22) and
+the maestro concurrency pattern (Cap 24).
+
+### §5.1 — Declaration syntax
+
+```c
+// Simplest form — returns a word:
+add(a, b) { return a + b; }
+
+// With void return — side effect only:
+void print_greeting() {
+    print_msg("Hello\n");
+}
+
+// With typed parameters:
+physics_tick(world, dt: float) { ... }
+
+// With effect annotation (see §5.3):
+pure_hash(s) : base { ... }
+```
+
+Functions return a word by default. The `void` keyword makes the
+return type explicit as "no value" — typically used for
+side-effect functions.
+
+**Implicit return:** a function body that falls through the end
+without `return` yields 0 for non-void functions. Cap 48 documents
+the parser-level implicit-return-zero emission.
+
+### §5.2 — Forward declarations and stubs
+
+If function A needs to call function B that's defined later in the
+file (or lives in another module yet to be parsed), declare a stub:
+
+```c
+stub B(x);   // forward declaration — B's body lives elsewhere
+
+A() {
+    B(42);   // legal because B is stubbed
+}
+```
+
+`stub` without a body resolves at link time. A stub for a function
+that has an annotation must repeat the annotation:
+
+```c
+stub compute(x) : base;   // stub must carry the effect signature
+```
+
+### §5.3 — Visibility
+
+Top-level functions are visible across all modules that import the
+defining file. Mark a function `static` to scope it to the current
+module:
+
+```c
+static _private_helper(x) { return x * 2; }
+public_api(x) { return _private_helper(x); }
+```
+
+Convention: prefix private helpers with an underscore. The compiler
+does not enforce this, but every stdlib module follows it.
+
+### §5.4 — Effect annotations (the four phases)
+
+Functions carry one of four **phase annotations** that describe
+what kind of work they do:
+
+```c
+solo     // runs on main thread, drives real-time side effects
+base     // pure computation, parallelizable on worker threads
+io       // blocking I/O — stdin/stdout, files, sockets, syscalls
+heap     // allocates memory (malloc, arr_push, buf_new)
+```
+
+The effects form a lattice — a function inherits the WORST effect
+of any function it calls. A `: base` function that calls a `: io`
+function is itself `: io`. The compiler tracks this automatically
+and emits errors if annotations don't match the actual call graph.
+
+**Phase :base = the parallelizable phase.** Anything marked
+`: base` can run on a worker thread during smart dispatch. The
+compiler rejects side-effect-causing operations inside a `: base`
+function (no writes to shared globals, no I/O, no allocation) —
+the annotation is a contract the compiler enforces.
+
+```c
+// Pure function — parallelizable:
+static _dist(ax, ay, bx, by) : base {
+    auto dx, dy;
+    dx = bx - ax; dy = by - ay;
+    return sqrt(dx * dx + dy * dy);
+}
+
+// Game loop — drives presentation, stays on main thread:
+void tick(w, dt) : solo {
+    update_positions(w, dt);    // inherits :solo through call
+    render_sprites(w);
+}
+```
+
+### §5.5 — Function pointers
+
+Functions have addresses. Take one with `fn_ptr(name)` and call
+through it with `call(fp, args...)`:
+
+```c
+auto cb;
+cb = fn_ptr(my_handler);
+call(cb, 42, "hello");   // invokes my_handler(42, "hello")
+```
+
+Function pointers are 64-bit words stored in regular variables.
+Pass them through arrays (event handlers, scene registries — see
+Cap 34 `scene_register`), struct fields (ChipPrimitives — Cap 23),
+or returned from builder functions.
+
+### §5.6 — The Maestro pattern (introduction)
+
+For games that want structured concurrency (main thread does I/O
++ render, worker threads do pure compute), `bpp_maestro.bsm`
+provides a callback registration API:
+
+```c
+main() {
+    maestro_register_init(fn_ptr(my_init));
+    maestro_register_solo(fn_ptr(my_solo));      // every frame, main
+    maestro_register_base(fn_ptr(my_physics));   // every frame, worker
+    maestro_register_render(fn_ptr(my_render));
+    maestro_run();
+    return 0;
+}
+```
+
+Full details in Cap 24. Effect annotations are the mechanism that
+lets maestro dispatch to the right thread.
+
+### §5.7 — What this chapter does NOT cover
+
+- **Struct / enum parameters** — Caps 10 / 11.
+- **Maestro scheduling internals** — Cap 24.
+- **Type system interactions** (hint propagation through calls) —
+  Cap 21.
 
 ---
 
@@ -227,7 +624,7 @@ The stdlib. Every function listed in Cap 2's prelude table, expanded here with s
 
 *Depends on: Cap 4*
 *Source: legacy_docs/the_b++_programming_language.md §4 + new content for §6.0 (three shapes rationale)*
-*Status: DRAFT — §6.0 complete; §6.1-§6.5 pending API expansion*
+*Status: COMPLETE — 2026-04-23*
 
 ### §6.0 — Three shapes of string in B++ (and why)
 
@@ -326,23 +723,178 @@ One-sentence rule: **`str_*` reads or writes memory you already own. `sb_*` buil
 
 ### §6.1 — `str_*` — Static C-string operations
 
-*PENDING — API reference with one example per function.*
+Functions in `src/bpp_str.bsm` that operate on null-terminated C-strings you already own. No allocation: they read or write memory the caller provides.
+
+| Function | Description |
+|----------|-------------|
+| `str_len(s)` | Return the number of bytes before the null terminator. |
+| `str_eq(a, b)` | Return 1 if the two null-terminated strings are byte-for-byte equal, 0 otherwise. |
+| `str_starts(s, prefix)` | Return 1 if `s` begins with `prefix`. |
+| `str_ends(s, suffix)` | Return 1 if `s` ends with `suffix`. |
+| `str_dup(s)` | Allocate a copy of `s` on the heap. The caller must `free` the result. |
+| `str_cpy(dst, src)` | Copy `src` into `dst` (no bounds check — caller ensures room). |
+| `str_cat(dst, src)` | Append `src` to the null-terminated content of `dst`. |
+| `str_from_int(buf, n)` | Write the decimal representation of `n` into `buf`. `buf` must be at least 22 bytes for any 64-bit integer. |
+
+Quick examples:
+
+```c
+// Testing extension
+if (str_ends(path, ".bpp")) { print_msg("B++ source"); }
+
+// Safe copy into fixed buffer
+auto name_buf;
+name_buf = malloc(64);
+str_cpy(name_buf, argv_get(1));
+
+// Length
+auto n;
+n = str_len("hello");   // 5
+```
 
 ### §6.2 — `sb_*` — Dynamic string builder
 
-*PENDING — API reference with one example per function.*
+The `sb_*` family in `src/bpp_str.bsm` builds strings from pieces when you do not know the final length up front. The builder allocates a heap-backed buffer and doubles it as needed.
+
+| Function | Description |
+|----------|-------------|
+| `sb_new()` | Allocate a fresh builder. Returns an opaque pointer. Must be freed with `sb_free`. |
+| `sb_cat(b, s)` | Append the null-terminated string `s` to the builder. |
+| `sb_ch(b, c)` | Append a single byte `c` to the builder. |
+| `sb_int(b, n)` | Append the decimal representation of integer `n`. |
+| `sb_float(b, v)` | Append a float value formatted as a decimal string. |
+| `sb_free(b)` | Release the builder and return the finished null-terminated string as a heap allocation. The caller owns the returned pointer and must `free` it. |
+
+Lifecycle example — build a log line, print it, free it:
+
+```c
+auto b, result;
+b = sb_new();
+sb_cat(b, "wave ");
+sb_int(b, wave_num);
+sb_cat(b, " closed: ");
+sb_int(b, tests_passed);
+sb_cat(b, " passed");
+result = sb_free(b);    // b is now gone; result is a fresh heap string
+print_msg(result);
+free(result);
+```
+
+The builder is not reusable after `sb_free`. If you need a second string, call `sb_new` again.
 
 ### §6.3 — `str_peek` is a compiler builtin
 
-*PENDING — document that `str_peek(s, i)` is emitted inline by codegen (a byte load at s+i), not a bpp_str function. Used interchangeably with `peek(s + i)` but carries pure-effect semantic for smart dispatch.*
+`str_peek(s, i)` reads byte `i` of the string pointer `s`. It is NOT a function in `bpp_str.bsm` — the compiler emits it inline as a single byte-load instruction (LDRB on ARM64, MOVZX on x86_64). This makes it equivalent to `peek(s + i)` in speed.
+
+The semantic difference is effect classification: `str_peek` carries a `: base` effect (pure read, no side effects), which the smart-dispatch system uses to decide scheduling. `peek(s + i)` is also base but the name is less specific. Use `str_peek` when you are reading character-by-character through a string; use `peek` for raw byte addresses.
+
+```c
+// Walk a string one byte at a time
+auto i, c;
+i = 0;
+while (1) {
+    c = str_peek(s, i);
+    if (c == 0) { break; }
+    putchar(c);
+    i = i + 1;
+}
+```
+
+`str_peek` is always in scope — no import needed.
 
 ### §6.4 — Packed refs for compiler writers
 
-*PENDING — for developers hacking on the parser / codegen, document `buf_eq(a, b, len)`, `packed_eq(a, b)` in `bpp_internal.bsm`, and `unpack_s` / `unpack_l` to read the packed representation. User programs never import `bpp_internal` and never see this API.*
+Users never see these. They are used inside the B++ parser and lexer, which hold large slices of the source buffer without copying or null-terminating.
+
+All three reside in `src/bpp_internal.bsm`. Import it only when hacking on the compiler itself.
+
+| Function | Description |
+|----------|-------------|
+| `buf_eq(a, b, len)` | Return 1 if the `len` bytes at address `a` equal the `len` bytes at address `b`. Used for comparing source-buffer slices directly. |
+| `packed_eq(a, b)` | Unpack both `a` and `b` as packed refs, compare the byte ranges they describe. Returns 1 if they refer to equal content. |
+| `unpack_s(packed)` | Extract the start (byte offset) from a packed ref word. |
+| `unpack_l(packed)` | Extract the length from a packed ref word. |
+
+A "packed ref" is a single 64-bit word encoding `(offset << 32) | length`. The parser creates them with `make_packed_tok(s, l)`. They let the tokenizer identify thousands of tokens with zero heap allocation.
+
+User programs import `bpp_str` for string work. The packed-ref API exists purely for the tokenizer's inner loop. Cap 21 describes where in the pipeline this API is consumed.
 
 ### §6.5 — Common patterns
 
-*PENDING — snippets for the five most common string-handling idioms (file-path testing, score interpolation, log accumulation, parse-a-line, safe copy).*
+Five idioms that cover the majority of real string handling in B++ programs:
+
+**1. File-path extension test**
+
+```c
+if (str_ends(path, ".bpp") || str_ends(path, ".bsm")) {
+    // handle source file
+}
+```
+
+**2. Score interpolation (no format strings)**
+
+```c
+// Print "score: 1234" using explicit chaining
+print_msg("score: ");
+print_int(score);
+print_ln();
+
+// Or build it for display in a UI widget
+auto b, label;
+b = sb_new();
+sb_cat(b, "score: ");
+sb_int(b, score);
+label = sb_free(b);
+draw_text(label, hud_x, hud_y, 1, WHITE);
+free(label);
+```
+
+**3. Log accumulation**
+
+```c
+auto log;
+log = sb_new();
+sb_cat(log, "[init] ");
+sb_int(log, step);
+sb_cat(log, " done\n");
+// ... more sb_cat calls ...
+auto text;
+text = sb_free(log);
+file_write_all("run.log", text, str_len(text));
+free(text);
+```
+
+**4. Parse-a-line (tokenize by delimiter)**
+
+```c
+// Split a colon-separated key:value line
+auto colon_pos, key_len, val_start;
+colon_pos = 0;
+while (str_peek(line, colon_pos) != ':' && str_peek(line, colon_pos) != 0) {
+    colon_pos = colon_pos + 1;
+}
+key_len = colon_pos;
+val_start = line + colon_pos + 1;
+// key = line..line+key_len, value starts at val_start
+```
+
+**5. Safe copy into a fixed buffer**
+
+```c
+auto buf;
+buf = malloc(256);
+str_cpy(buf, source);      // source must fit in 255 bytes + null
+// Use buf here, free when done
+free(buf);
+```
+
+When the maximum length is unknown, use `str_dup` instead:
+
+```c
+auto copy;
+copy = str_dup(source);    // allocates exactly str_len(source) + 1
+// Use copy, then:
+free(copy);
 
 ---
 
@@ -2122,6 +2674,1117 @@ correctly.
 - **Multiplayer networking**. No networking in stbgame. The
   sockets syscalls exist (Cap 18 / Wave 18), but a game-ready
   networking module would be its own `stbnet`.
+
+---
+
+## Cap 35 — Drawing (stbdraw)
+
+*Depends on: Cap 34 (stbgame)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbdraw.bsm` is the 2D software rasterizer — every `draw_*`, `clear`,
+`layer_*`, and text rendering call lives here. It writes into the
+framebuffer `_stb_fb` (RGBA, `_stb_w * _stb_h` pixels), which the
+platform layer blits to the window each frame via `_stb_present`.
+
+### §35.1 — Color and framebuffer
+
+Colors are 32-bit packed ARGB integers (alpha high, blue low). Every
+`draw_*` call takes one color arg.
+
+```c
+rgba(r, g, b, a);                // build a color from 0..255 channels
+clear(color);                    // fill the whole framebuffer
+```
+
+Constants available: `BLACK`, `WHITE`, `RED`, `GREEN`, `BLUE`, `YELLOW`,
+`CYAN`, `MAGENTA`, `GRAY`, `PURPLE`, `ORANGE`, plus a full 16-color
+palette declared in `init_color()` (called by `game_init`).
+
+### §35.2 — Shapes
+
+```c
+void draw_rect(x, y, w, h, color);
+void draw_rect_v(pos, w, h, color);   // pos as packed (x<<32)|y (future)
+void draw_circle(cx, cy, r, color);
+void draw_line(x1, y1, x2, y2, color);
+void draw_border(x, y, w, h, color, thickness);
+void draw_rounded_rect(x, y, w, h, r, color);
+void draw_gradient(x, y, w, h, c_top, c_bot);
+void draw_shadow(x, y, w, h, intensity);
+void draw_shadow_rounded(x, y, w, h, r, intensity);
+void draw_bar(x, y, w, h, val, max_val, color);   // HP bar style
+```
+
+Bounds are clipped — writes outside `_stb_w / _stb_h` are silently
+dropped, so games don't have to guard every call.
+
+### §35.3 — Sprites
+
+```c
+void draw_sprite(data, x, y, w, h);          // raw ARGB buffer
+void draw_sprite16(spr, pal, x0, y0);        // 16-color indexed sprite
+```
+
+`draw_sprite` blits an RGBA buffer; `draw_sprite16` takes a palette
+(see Cap 38) and an indexed sprite — each byte is a 4-bit palette
+index. Transparent pixels (index 0) are preserved.
+
+### §35.4 — Text
+
+```c
+void draw_text(text, x, y, sz, color);
+void draw_number(x, y, sz, color, val);
+```
+
+Uses an 8x8 bitmap font baked into `_font_table`. `sz` is a pixel
+multiplier (1 = 8x8 per glyph, 2 = 16x16, etc.). Text clips to
+framebuffer bounds. Each character is rendered as a scaled box of
+set/clear pixels.
+
+`draw_text` uses `render_measure(text, sz)` (Cap 47) to pre-compute
+widths when needed.
+
+### §35.5 — Draw lifecycle
+
+```c
+void draw_begin();   // currently a no-op (reserved for future batching)
+void draw_end();     // present + sleep for frame budget + poll input
+```
+
+`draw_end` is the loop terminator — it presents the framebuffer to
+the window, waits out the frame budget (`_stb_frame_ms`), and polls
+the next frame's input. Don't call `_stb_poll_events` manually —
+`draw_end` handles it.
+
+### §35.6 — Layers (indexed byte grids)
+
+For palette-indexed games (Captain Buddy, pathfind), layers hold
+8-bit indices that compose via a final palette. Faster than RGBA
+for NES-era visuals.
+
+```c
+layer_new(w, h, blend);                       // BLEND_NORMAL or BLEND_MULTIPLY
+void layer_free(layer);
+void layer_set_alpha(layer, a);               // 0..255
+void layer_set_visible(layer, v);
+void layer_set_blend(layer, mode);
+layer_get(layer, x, y);                       // byte at (x,y) or 0 OOB
+void layer_set(layer, x, y, idx);             // write byte, OOB-safe
+void layer_clear(layer, idx);                 // fill with one index
+void layer_fill(layer, x, y, idx);            // 4-connected flood fill
+void layer_composite_indexed(dst, dw, dh,
+                             layers, n,
+                             palette);        // composite N layers
+```
+
+Typical use: game entities draw into one layer, background into
+another, compose both into the main RGBA framebuffer via
+`layer_composite_indexed` once per frame.
+
+### §35.7 — TrueType rasterizer
+
+For custom fonts beyond the baked 8x8 table, stbdraw includes a
+runtime TTF rasterizer. Load a .ttf buffer, build a glyph atlas at a
+target pixel size, blit glyphs by codepoint.
+
+The rasterizer is ~400 lines of scanline-based edge rasterization
+with 4x vertical oversampling — matches quality that game fonts
+expect, much slower than bitmap fonts but run once at atlas-build
+time. Game loop reads the atlas, not the rasterizer.
+
+### §35.8 — What this chapter does NOT cover
+
+- **GPU rendering** — `draw_*` is CPU-only. GPU primitives live in
+  `stbrender.bsm` (Cap 47).
+- **Image loading** — PNGs/sprites come from `stbimage.bsm` (Cap 37)
+  or `stbasset.bsm` (Cap 45).
+- **Animation** — `stbforge` owns animation playback (Cap 46).
+
+---
+
+## Cap 36 — UI widgets (stbui)
+
+*Depends on: Cap 35 (stbdraw)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbui.bsm` is an immediate-mode UI toolkit — widgets compute
+geometry, dispatch input, and draw themselves in a single function
+call. No retained tree, no register/deregister, no IDs beyond what
+your layout provides.
+
+### §36.1 — Immediate-mode philosophy
+
+Every frame, you declare the UI you want:
+
+```c
+game_frame_begin();
+// ... game logic ...
+if (gui_button(100, 50, 80, 24, "Save")) { save_game(); }
+if (gui_button(100, 80, 80, 24, "Quit")) { quit = 1; }
+gui_label(10, 10, "Score: ", score);
+draw_end();
+```
+
+No state persists between frames unless you store it. The widget
+returns 1 the frame it's clicked, 0 otherwise. This means your game
+logic flows top-to-bottom every frame, free of callbacks.
+
+The UI arena (32 KiB per-frame, wraps `bpp_arena`) holds transient
+allocations — style overrides, layout frames, hover-fade states —
+and resets every frame. A leaking widget only leaks for one frame.
+
+### §36.2 — Themes
+
+```c
+void theme_dark();        // default — text light, bg dark
+void theme_light();       // text dark, bg light
+void theme_retro();       // NES-palette-inspired
+void theme_set(theme);    // custom theme pointer
+```
+
+A theme is a `Theme` struct with fields for background, surface,
+text, accent, button_bg, and corner radii. Widgets reference the
+active theme — changing themes mid-frame updates every subsequent
+widget.
+
+### §36.3 — Basic widgets
+
+```c
+gui_button(x, y, w, h, label);        // → 1 on click, 0 otherwise
+gui_label(x, y, text, ...);           // static text
+gui_panel(x, y, w, h);                // framed card backdrop
+gui_line(x1, y1, x2, y2);             // decorative rule
+gui_progress(x, y, w, h, val, max);
+gui_checkbox(x, y, label, checked);   // → new checked state
+gui_slider(x, y, w, val, min, max);   // → new val
+gui_dropdown(x, y, w, labels, n, selected);  // → new index
+gui_text_input(x, y, w, buf, max);   // → new length
+```
+
+All widgets are stateless from the UI's perspective — you pass in
+the current state and get the new state back. The widget internals
+handle hover animations, click detection, and drawing.
+
+### §36.4 — Layout helpers
+
+Absolute positioning gets tedious for multi-row forms. The layout
+stack provides a minimal flex-style system:
+
+```c
+layout_begin(x, y, w, h, direction);   // LAYOUT_ROW or LAYOUT_COL
+  layout_push(width);                   // allocate space for next widget
+  gui_button(0, 0, 0, 0, "A");         // uses current layout slot
+  layout_push(width);
+  gui_button(0, 0, 0, 0, "B");
+layout_end();
+```
+
+Stack depth is 8 (fixed). Nested row-inside-column compositions
+handle most game HUDs. For complex layouts (popups with arbitrary
+positioning), fall back to absolute coordinates.
+
+### §36.5 — Hover and press state
+
+Cross-frame state is keyed by a `(x << 16) | y` hash of the widget's
+top-left corner. The same button at the same position is recognized
+between frames without explicit IDs. Collision is possible but rare
+(two widgets at identical coordinates would share state).
+
+The hover fade takes ~120 ms to complete — if the mouse leaves and
+returns within the fade window, the animation resumes smoothly
+instead of snapping.
+
+### §36.6 — What this chapter does NOT cover
+
+- **Custom widget authoring** — the public API covers the shipped
+  widgets. Adding a new one requires understanding the theme +
+  layout internals (source reference: lines 700+).
+- **Accessibility** (screen readers, keyboard-only nav). Minimal
+  keyboard support via `gui_text_input`; no broader a11y framework.
+- **Retained-mode UI** — this is strictly immediate. If you want a
+  retained tree, build your own on top.
+
+---
+
+## Cap 37 — Image decode (stbimage)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbimage.bsm` decodes image files to RGBA pixel buffers. Today:
+**PNG only** (RIFF-style chunked format, zlib DEFLATE compressed).
+Other formats (JPG, BMP, TGA) would land as sibling modules
+(`stbjpg`, `stbbmp`) rather than extending stbimage.
+
+### §37.1 — Public API
+
+```c
+img_load(path) : io;   // returns pixel buffer or 0
+img_w();               // width of last loaded image
+img_h();               // height of last loaded image
+void img_free(pixels); // release a buffer from img_load
+```
+
+State is singleton: the last loaded image's dimensions live in
+`img_w()` / `img_h()`. Typical pattern:
+
+```c
+auto pixels, w, h;
+pixels = img_load("assets/player.png");
+if (pixels == 0) { return 1; }   // load failed
+w = img_w();
+h = img_h();
+// ... use pixels (w*h*4 bytes of RGBA) ...
+img_free(pixels);
+```
+
+### §37.2 — What's supported
+
+- **Color types**: RGB (3-byte), RGBA (4-byte), grayscale (1-byte
+  widened to RGB), grayscale+alpha, indexed (via PLTE + tRNS).
+- **Bit depths**: 8 per channel (16-bit PNG is clipped to 8).
+- **Filters**: all five PNG filters (None / Sub / Up / Average / Paeth).
+- **Interlacing**: NOT supported. Adam7-interlaced PNGs return 0 with a
+  stderr warning. Typical asset pipelines (Aseprite, Figma export) don't
+  interlace — it's a feature for progressive-download web images.
+- **tRNS chunk**: palette alpha is honored; RGB-key transparency is
+  discarded (fully-opaque output).
+
+### §37.3 — Internal structure
+
+Three layered decoders:
+1. **Bit reader** (`_zr_read`) — DEFLATE bit-level unpacking, 1 bit
+   at a time into a 32-bit window.
+2. **Huffman decoder** (`_zh_build`, `_inf_decode`) — canonical
+   Huffman tables reconstructed per deflate block.
+3. **PNG chunk scanner** (`img_load` body) — walks IHDR, PLTE, IDAT,
+   tRNS, IEND. Non-critical chunks (tEXt, gAMA, sRGB) are skipped.
+
+The zlib / DEFLATE layer is a faithful port of `stb_image.h`'s
+implementation. ~400 lines, no compromises on correctness — passes
+every shipped test PNG including 3-byte RGB, 4-byte RGBA, indexed
+palette, and grayscale+alpha variants.
+
+### §37.4 — Performance notes
+
+PNG decode is NOT hot path. Games call `img_load` once per asset
+at boot, the decoded pixels live in memory for the session. Decode
+time for a 256×256 sprite: ~5-10 ms on Apple Silicon, mostly
+Huffman + filter work. If the pipeline ever needs faster decode,
+candidates are (a) SIMD filters for large images, (b) single-pass
+Huffman for tiny textures.
+
+### §37.5 — What this chapter does NOT cover
+
+- **Writing PNGs**. `stbimage_write.bsm` (if ever shipped) would live
+  next door. Today, use `sound_save_wav` for audio and raw RGBA buffer
+  writes for pixel captures.
+- **Animated formats** (APNG, GIF). Out of scope — use per-frame PNGs.
+- **Streaming decode** (for textures > RAM). Out of scope — assume
+  images fit.
+
+---
+
+## Cap 38 — Palette (stbpal)
+
+*Depends on: Cap 35 (stbdraw)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbpal.bsm` is the palette type plus a catalog of named built-in
+palettes. Games that draw indexed sprites (like Captain Buddy, the
+NES-era mode) pick a palette at boot and reference colors by index
+thereafter — 4-bit or 8-bit indices replace 32-bit ARGB everywhere.
+
+### §38.1 — The Palette type
+
+```c
+struct Palette { count, data }   // count entries, each 8-byte ARGB
+```
+
+Each entry is a full 32-bit ARGB color. Index 0 is conventionally
+transparent (alpha = 0).
+
+```c
+palette_new(n);                       // allocate zero-filled palette
+void palette_free(pal);
+palette_clone(pal);                   // deep copy
+palette_count(pal);                   // number of entries
+palette_get(pal, i);                  // read color at index i (checked)
+void palette_set(pal, i, argb);       // write color at index i
+palette_data(pal);                    // raw data pointer (hot loops)
+```
+
+### §38.2 — Built-in catalog
+
+Eight presets, accessed by name:
+
+| Name | Size | Purpose |
+|------|------|---------|
+| `"mcu-8"` | 8 | ModuLab default — vivid Nintendo-era spread |
+| `"nkotc-4"` | 4 | NES minimalist — 3 colors + transparent |
+| `"cb-32"` | 32 | Captain Buddy — 4-row grid (gray/red/green/blue) |
+| `"gameboy-4"` | 4 | Original Game Boy shades |
+| `"pico8-16"` | 16 | PICO-8 fantasy console |
+| `"c64-16"` | 16 | Commodore 64 spread |
+| `"ega-16"` | 16 | EGA PC palette |
+| `"cga-4"` | 4 | CGA magenta/cyan/white/black |
+
+```c
+palette_builtin(name);      // → Palette pointer (clone it if mutating)
+void init_palette();        // seeds the catalog (called by game_init)
+```
+
+The catalog is shared — `palette_builtin("mcu-8")` returns the same
+pointer across calls. To mutate one slot without affecting other
+callers, `palette_clone` first.
+
+### §38.3 — Palette cycling (animated shimmer)
+
+Classic NES-era effect: rotate a subset of palette entries to
+create water, fire, lava animations without re-rendering sprites.
+
+```c
+palette_cycle_begin(pal, start, count, period_ms);
+void palette_cycle_stop(pal, start);
+void palette_cycle_tick(pal, dt_ms);   // call once per frame
+```
+
+A cycle shifts `count` entries starting at `start` by one slot every
+`period_ms / count` frames. Looks like flowing water at 400 ms
+period with 4 entries. Multiple cycles can run simultaneously on
+different slot ranges.
+
+### §38.4 — Palette LUTs (global swap)
+
+A `PaletteLUT` remaps indices — useful for damage flashes (every
+pixel → white for 2 frames), day/night fades, or character-specific
+color shifts.
+
+```c
+palette_lut_new(count);                     // identity map
+void palette_lut_free(lut);
+void palette_lut_set(lut, from_idx, to_idx);
+palette_lut_flash(count, to_idx);           // all → to_idx
+void palette_lut_apply(src, lut, dst);      // dst[i] = src[lut[i]]
+```
+
+### §38.5 — Palette interpolation
+
+```c
+palette_lerp(a, b, t, out);   // out[i] = lerp(a[i], b[i], t), t=0..255
+```
+
+Per-channel linear interpolation. Useful for smooth palette
+transitions (level changes, time of day).
+
+### §38.6 — Save / load
+
+```c
+palette_save(pal, path, name) : io;   // JSON format, human-editable
+palette_load(path) : io;              // → Palette pointer or 0
+```
+
+The JSON format stores each entry as a hex string (`"#FF2020"`). Uses
+`bpp_json` writer + parser underneath (Phase D dogfood — no hand-
+rolled JSON structure anywhere in stb).
+
+### §38.7 — What this chapter does NOT cover
+
+- **GPU-side palette upload** — that's `stbrender` (Cap 47) territory.
+  The `palette_data` pointer lands directly in a uniform buffer.
+- **Dithering** between palettes. Out of scope.
+- **Automatic palette reduction** (color quantization from RGBA →
+  indexed). Pre-process sprites offline.
+
+---
+
+## Cap 39 — Tilemap (stbtile)
+
+*Depends on: Cap 38 (stbpal), Cap 42 (stbpath)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbtile.bsm` is the indexed-byte tilemap — each cell stores a
+single-byte tile index (0..255), which looks up into a tileset
+(sprite atlas) and optional solid-mask table. The backing buffer
+is dense (1 byte per cell), so a 128×128 tilemap is 16 KiB.
+
+### §39.1 — The Tilemap type
+
+```c
+struct Tilemap { w, h, tw, th, data, solid_mask, tileset, tile_count, remap }
+```
+
+`w × h` cells of `tw × th` pixels each. `data` is the tile index
+grid. `solid_mask` is a 256-entry byte array marking which tile
+indices are walls (for physics queries). `tileset` is the decoded
+sprite atlas (from `stbimage`). `remap` translates game-logic tile
+types into tileset sprite indices — decouples code from artwork.
+
+### §39.2 — Creating and populating
+
+```c
+tile_new(w, h, tw, th);             // empty map, all cells = 0
+void tile_free(tm);
+void tile_set(tm, x, y, idx);       // write a cell
+tile_get(tm, x, y);                 // read a cell (0 OOB)
+void tile_load_tileset(tm, path) : io;   // load PNG + auto-slice
+void tile_set_solid(tm, idx, is_solid);
+tile_is_solid(tm, idx);
+```
+
+`tile_load_tileset` takes a PNG arranged in a `tw × th` grid (e.g.,
+a 16×16-sprite atlas of 8×8 cells = 128×128 PNG). It slices into
+64 sprite frames automatically.
+
+### §39.3 — Rendering
+
+```c
+void tile_draw(tm, cam_x, cam_y);   // blit visible cells
+```
+
+`tile_draw` computes which cells overlap the viewport (given
+camera offset), then draws each via indexed sprite blit. Only
+visible cells are rendered — a 1024×1024 map at 8×8 per cell
+with a 320×180 viewport draws ~1000 cells, not a million.
+
+### §39.4 — Physics integration
+
+The `solid_mask` array feeds `stbphys` (Cap 41) for collision.
+
+```c
+if (tile_is_solid(tm, tile_get(tm, gx, gy))) { block_movement(); }
+```
+
+A tile index of 3 could be "grass" (not solid) while 4 is "wall"
+(solid). Solid mask flips independently of the rendering — the same
+tileset art can be recycled with different collision semantics.
+
+### §39.5 — Save / load
+
+```c
+void tile_save(tm, path) : io;       // JSON
+tile_load(path) : io;                 // → Tilemap
+```
+
+JSON format stores dimensions, tile size, and the raw byte grid
+(base64-ish hex). Small enough for git to diff cleanly. Level
+editors (ModuLab) read/write this.
+
+### §39.6 — What this chapter does NOT cover
+
+- **Infinite worlds / chunks** — tilemaps are bounded. For
+  streaming terrain, split into multiple Tilemaps and load on
+  demand.
+- **Multi-layer tilemaps** (separate foreground / background /
+  decoration) — compose by creating N tilemaps and drawing them
+  in order. The module doesn't wrap that for you.
+- **Auto-tiling** (bitmask-based tile selection from neighbors).
+  Tilemap editors handle this at authoring time; no runtime support.
+
+---
+
+## Cap 40 — ECS (stbecs)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbecs.bsm` is a minimal entity-component system — fixed-capacity,
+structure-of-arrays (SoA), parallel-array layout. No queries, no
+iteration kernels, no bitmask masks per component. Just flat arrays
+indexed by entity ID.
+
+### §40.1 — The World type
+
+```c
+struct World {
+    capacity, count,          // max entities, current live count
+    alive,                    // 1 byte per ID: 0 = dead, 1 = live
+    free_ids, free_count,     // reusable ID stack
+    pos_x, pos_y,             // position components (all entities have these)
+    vel_x, vel_y,             // velocity
+    flags                     // per-entity bit flags
+}
+```
+
+All arrays are `capacity`-sized. Dead slots stay allocated, just
+flagged `alive[id] = 0`.
+
+### §40.2 — Lifecycle
+
+```c
+ecs_new(capacity);            // create world with N entity slots
+void ecs_free(w);
+ecs_spawn(w);                 // → new entity ID, or -1 if full
+void ecs_despawn(w, id);      // mark dead, recycle ID
+ecs_alive(w, id);             // 1 or 0
+```
+
+ID recycling uses a LIFO stack — `despawn` pushes the freed ID back,
+`spawn` pops the most recent. Gives good cache locality when many
+entities come and go.
+
+### §40.3 — Component access
+
+No getters/setters — just index the arrays:
+
+```c
+w.pos_x[id] = 100;
+w.vel_y[id] = -5;
+// flags use bit ops
+w.flags[id] = w.flags[id] | FLAG_JUMPING;
+```
+
+Raw array access is FAST — single load/store, no function call,
+no bounds check in release mode. The tradeoff: you must validate
+IDs yourself where they come from untrusted sources (save games,
+network messages). Inside the game loop, loops over `0..count`
+with alive checks are safe by construction.
+
+### §40.4 — Typical game loop usage
+
+```c
+// Physics pass: update position from velocity.
+auto id;
+for (id = 0; id < w.count; id = id + 1) {
+    if (peek(w.alive + id) == 0) { continue; }
+    w.pos_x[id] = w.pos_x[id] + w.vel_x[id];
+    w.pos_y[id] = w.pos_y[id] + w.vel_y[id];
+}
+
+// Render pass: draw each live entity.
+for (id = 0; id < w.count; id = id + 1) {
+    if (peek(w.alive + id) == 0) { continue; }
+    draw_sprite(...);
+}
+```
+
+The SoA layout is cache-friendly: the position loop touches only
+pos_x + pos_y arrays, never pulling velocity/flags into cache. At
+10k entities, this is measurably faster than AoS struct-per-entity.
+
+### §40.5 — Adding components
+
+No dynamic component registration. To add a new field (say, `hp`),
+edit the `World` struct + allocation + init pattern. This is
+deliberately static — matches B++'s "no reflection, no dynamic
+layout" philosophy.
+
+For variable-per-entity data (inventory, dialogue choice history),
+store an index into a side table: `w.inventory_idx[id]` points into
+a global `inventory_pool`.
+
+### §40.6 — What this chapter does NOT cover
+
+- **Queries / filters** (give me all entities with FLAG_ENEMY and
+  health < 10). Loop manually with the flag check.
+- **Parallel iteration** across components (SIMD over pos_x array).
+  Use `vec_*` intrinsics (Cap 23 / Wave 18) if your loop is
+  profile-hot.
+- **Archetypes** (grouping entities by component set). Not shipped —
+  flat arrays for everyone.
+
+---
+
+## Cap 41 — Physics (stbphys)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbphys.bsm` is a minimalist AABB physics integrator. Point-on-tile
+collision via `tile_is_solid`, gravity as a constant, velocity +
+acceleration integrated per frame. Think Celeste-style platformer
+physics, not Box2D.
+
+### §41.1 — The Body type
+
+```c
+struct Body {
+    x, y,           // position (center, integer pixels)
+    vx, vy,         // velocity (pixels per second, integer)
+    w, h,           // collision box (width, height)
+    grounded,       // 1 if standing on solid this frame
+    facing          // -1 or 1, last non-zero horizontal input
+}
+```
+
+### §41.2 — API
+
+```c
+body_new(x, y, w, h);         // allocate a Body at (x,y) with bbox
+void body_free(body);
+void body_step(body, tm, dt_ms);   // one physics tick
+```
+
+`body_step` does:
+1. Apply gravity: `vy += gravity * dt`
+2. Apply drag: `vx *= drag_factor` (integer approximation)
+3. Integrate position: `x += vx * dt`, `y += vy * dt`
+4. Resolve collision against the tilemap (checks 4 corners + edges)
+5. Update `grounded` flag based on downward collision
+
+### §41.3 — Tuning constants
+
+Globals set by `init_phys`:
+- `_phys_gravity` — 800 (px/s²)
+- `_phys_max_speed` — 600 (px/s horizontal cap)
+- `_phys_jump_velocity` — -350 (initial vy on jump)
+- `_phys_drag_ground` — 220/256
+- `_phys_drag_air` — 245/256
+
+Override before `init_phys` or tweak directly for per-character feel.
+
+### §41.4 — Typical platformer loop
+
+```c
+body_step(player, tilemap, dt);
+if (key_down(KEY_LEFT))  { player.vx = -200; }
+if (key_down(KEY_RIGHT)) { player.vx = 200; }
+if (key_pressed(KEY_SPACE) && player.grounded) {
+    player.vy = _phys_jump_velocity;
+}
+```
+
+### §41.5 — What this chapter does NOT cover
+
+- **Rotation** (bodies are axis-aligned rectangles only).
+- **Joints / constraints** (pin, spring, etc.). Not shipped — static
+  physics.
+- **Dynamic vs kinematic split** — every body is dynamic.
+- **Continuous collision** (tunneling prevention for high-velocity
+  small objects). Use `body_step_sub(n)` to divide into sub-steps
+  manually if needed.
+
+---
+
+## Cap 42 — Pathfinding (stbpath)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbpath.bsm` is an A* pathfinder on grid maps. 4-connected
+neighborhood (up/down/left/right), Manhattan heuristic, unit edge
+costs. Optimized for small-to-medium grids (up to ~256×256);
+beyond that, flow fields or HPA* would beat it.
+
+### §42.1 — The PathFinder type
+
+```c
+struct PathFinder {
+    w, h,                     // grid dimensions
+    cells,                    // byte grid: 0 = walkable, 1+ = blocked
+    g_score, f_score,         // A* scores per cell
+    came_from,                // parent cell for path reconstruction
+    heap, heap_pos, heap_cnt, // open-set binary heap
+    closed                    // closed-set bitmask
+}
+```
+
+One PathFinder per search context — reuse across queries (same
+dimensions) to avoid re-allocation.
+
+### §42.2 — API
+
+```c
+path_new(w, h);                               // create finder
+void path_free(pf);
+void path_set_blocked(pf, gx, gy, blocked);
+path_is_blocked(pf, gx, gy);
+path_find(pf, sx, sy, tx, ty, out_xs, out_ys, max_len);   // → path length
+```
+
+`path_find` returns the path length (number of cells) or 0 if no
+path. The cells are written to `out_xs[0..len-1]` and
+`out_ys[0..len-1]`. Order: start → ... → target.
+
+`max_len` is the caller-supplied output buffer size. Paths longer
+than `max_len` truncate — cheap safeguard against infinite
+backtracking bugs.
+
+### §42.3 — Heuristic and constants
+
+```c
+const PATH_INF = 2000000000;   // represents unreachable
+```
+
+Manhattan distance: `|dx| + |dy|`. Admissible + consistent for
+4-connected unit-cost grids.
+
+### §42.4 — Performance
+
+A 100×100 grid with ~50% obstacles computes a full cross-map path
+in ~2-5 ms on Apple Silicon. Dominated by heap operations. The
+heap is a classic binary-heap priority queue with decrease-key
+via an inverse map (`heap_pos`).
+
+For very large maps or real-time reactive pathing, consider:
+- **Reusing scores** across queries when obstacles don't change
+- **Jump-point search** (JPS) variant — 8-connected only, not
+  shipped
+- **Flow fields** for many-to-one targeting (hordes chasing player)
+
+### §42.5 — What this chapter does NOT cover
+
+- **8-connected movement / diagonals** — 4-connected only. For
+  diagonals, add 4 neighbor offsets + adjust heuristic to
+  Chebyshev distance.
+- **Variable costs** (sand costs 2, water costs 5). Expand
+  `g_score` delta per cell type.
+- **Multi-agent pathing** (cooperative, traffic-avoidant). Out of
+  scope — compute per-agent serially.
+
+---
+
+## Cap 43 — Pool allocator (stbpool)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbpool.bsm` is a fixed-element-size pool allocator. Pre-allocate
+N slots of size B, hand out pointers from a free list, return
+pointers by adding back to the free list. O(1) alloc/free, zero
+fragmentation, trivial to reset.
+
+### §43.1 — API
+
+```c
+pool_new(elem_size, capacity);
+void pool_free(pool);
+pool_alloc(pool);                  // → pointer to a slot, or 0 if full
+void pool_release(pool, ptr);      // return a slot to the free list
+pool_reset(pool);                  // return all slots
+```
+
+### §43.2 — Typical use
+
+Bullet pools, particle systems, damage-number pop-ups. Anything
+where:
+- Element size is uniform
+- Max concurrent count is known (or a reasonable cap exists)
+- Allocation speed matters more than memory overhead
+
+```c
+auto pool;
+pool = pool_new(sizeof(Bullet), 256);
+
+// Shoot
+auto b: Bullet;
+b = pool_alloc(pool);
+if (b != 0) { b.x = 0; b.y = 0; b.vx = 10; /* ... */ }
+
+// Despawn (off-screen, expired)
+pool_release(pool, b);
+```
+
+### §43.3 — Memory layout
+
+A single malloc block holds `elem_size * capacity` bytes. The free
+list is a pointer chain through the first 8 bytes of each free
+slot — no separate index table, no header per slot.
+
+### §43.4 — What this chapter does NOT cover
+
+- **Variable-size allocations** — use `bpp_arena` for those.
+- **Thread safety** — single-threaded. For SPSC, pair with a ring.
+- **Generation counters** — no ABA protection on free-list. If a
+  caller holds a stale pointer across a release + realloc, undefined
+  behavior. Pair with `stbasset`-style generation handles if that
+  matters.
+
+---
+
+## Cap 44 — Color math (stbcol)
+
+*Depends on: Cap 2 (auto-injected prelude)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbcol.bsm` is pure color math — no allocations, no state, just
+functions. RGBA packing / unpacking, blending, HSV conversion.
+
+### §44.1 — Packing
+
+```c
+rgba_of(r, g, b, a);       // pack 4 bytes into a single ARGB word
+rgba_r(color);             // extract channel
+rgba_g(color);
+rgba_b(color);
+rgba_a(color);
+```
+
+### §44.2 — Blending
+
+```c
+rgba_blend(dst, src);                 // standard over-compositing
+rgba_lerp(a, b, t);                   // 0..255 interpolation
+rgba_multiply(a, b);                  // modulation
+rgba_mix(a, b, ratio_of_256);
+```
+
+`rgba_blend` implements the Porter-Duff `over` operator using the
+src's alpha: `out = src.rgb + dst.rgb * (1 - src.a)`. Integer
+arithmetic throughout.
+
+### §44.3 — HSV
+
+```c
+hsv_to_rgba(h, s, v, a);        // hue 0..360, sat/val 0..255
+rgba_to_hsv(color, out_h, out_s, out_v);
+```
+
+Useful for color pickers, hue shifting, rainbow effects.
+
+### §44.4 — Predefined constants
+
+```c
+BLACK, WHITE, RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, GRAY
+PURPLE, ORANGE, PINK, LIME, NAVY, TEAL, MAROON
+TRANSPARENT            // = 0
+```
+
+Declared in `init_color()` (called by `game_init`).
+
+### §44.5 — What this chapter does NOT cover
+
+- **sRGB gamma correction** — all math is linear in integer space.
+- **Color space conversions** (LAB, XYZ, OKLCH). Out of scope.
+- **HDR / wide-gamut** colors. 32-bit integer ARGB only.
+
+---
+
+## Cap 45 — Asset hub (stbasset)
+
+*Depends on: Cap 37 (stbimage), Cap 31 (stbsound), Cap 38 (stbpal)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbasset.bsm` is the game-wide asset registry — sprites, sounds,
+music, fonts are loaded once, assigned a handle, and looked up by
+path. Duplicates are de-duped automatically; reloads are cheap.
+
+### §45.1 — The AssetSlot type and handle shape
+
+```c
+struct AssetSlot { kind, generation, ptr, w, h, mtime }
+```
+
+Handles are packed 32-bit integers: `(generation << 16) | slot`.
+The generation counter increments on reuse, so stale handles
+from a replaced asset return 0 from lookups instead of aliasing.
+
+```c
+ASSET_NONE = 0;           // empty slot
+ASSET_SPRITE = 1;         // GPU texture handle
+ASSET_SOUND = 2;          // stereo s16 PCM buffer
+ASSET_MUSIC = 3;          // looping BGM buffer
+ASSET_FONT = 4;           // font atlas + metrics
+```
+
+### §45.2 — Public API
+
+```c
+void init_asset();                           // called by game_init
+asset_load_sprite(path) : io;                // → handle or 0
+asset_load_sound(path) : io;                 // → handle
+asset_load_music(path) : io;                 // → handle
+asset_load_font(path, size) : io;            // → handle
+void asset_release(handle);                  // explicit cleanup
+
+asset_sprite(handle);                        // → GPU texture
+asset_sound_buf(handle);                     // → PCM buffer
+asset_sound_frames(handle);                  // → frame count
+asset_music_buf(handle);
+asset_music_frames(handle);
+asset_font(handle);
+asset_w(handle); asset_h(handle);
+```
+
+Path dedup: `asset_load_sprite("assets/player.png")` called twice
+returns the same handle — the internal `hash_str_new(512)` table
+keeps path → slot mapping.
+
+### §45.3 — Hot reload
+
+```c
+void asset_check_reload();   // call once per frame (dev builds)
+```
+
+Walks every loaded asset, compares file mtime against the recorded
+mtime. Changed files get re-loaded in place — the sprite's GPU
+texture gets re-uploaded, the sound's buffer swapped, etc. Handles
+stay valid across reload (same slot, same generation).
+
+This is the backbone of ModuLab's "edit sprite → see in game" loop.
+Expect ~5-10 ms cost per frame with 256 assets — trivial for dev
+builds, skip the call in release.
+
+### §45.4 — What this chapter does NOT cover
+
+- **Async loading** — every load blocks. For giant asset packs,
+  split into initial + streaming tiers manually.
+- **Compression / archive formats** (ZIP, custom bundles). Assets
+  are loose files on disk.
+- **Content hashing / integrity**. No checksum verification — a
+  corrupt PNG trips `stbimage`'s decode error, other formats may
+  misbehave silently.
+
+---
+
+## Cap 46 — Level forge (stbforge)
+
+*Depends on: Cap 45 (stbasset)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbforge.bsm` is the level-editor and character-editor substrate
+that powers ModuLab's testbed. Holds the data model for characters
+(sprites + pivots + hitbox + animations + controls), records
+gameplay for replay, and renders the testbed world.
+
+### §46.1 — The Character type
+
+```c
+struct Character {
+    sprite_path,              // PNG asset path
+    pivot_x, pivot_y,
+    hit_x, hit_y, hit_w, hit_h,
+    gravity, max_speed, jump_velocity,
+    ctrl_left, ctrl_right, ctrl_jump,   // KEY_* enum IDs
+    animations, anim_count              // Animation array + length
+}
+
+struct Animation { name_ptr, frames, frame_count, fps, loop }
+```
+
+One Character per editable in-game actor. Animations each hold a
+sequence of sprite frame indices + playback parameters.
+
+### §46.2 — Public API
+
+```c
+character_new();
+void character_free(cp);
+void character_set_sprite(cp, path);
+void character_set_pivot(cp, x, y);
+void character_set_hitbox(cp, x, y, w, h);
+void character_set_physics(cp, gravity, max_speed, jump_vel);
+void character_set_control(cp, ctrl_left, ctrl_right, ctrl_jump);
+
+character_add_animation(cp, name);          // → animation pointer
+void character_set_frames(ap, frames, n);   // copy frames into animation
+character_animation_count(cp);
+character_animation_at(cp, idx);
+```
+
+### §46.3 — Save / load (JSON)
+
+```c
+character_save(cp, path) : io;     // → 0 on success, -1 on fail
+character_load(path) : io;         // → Character or 0
+```
+
+JSON format via `bpp_json` writer (Phase D — no hand-rolled
+serialization). Deterministic field order, line-oriented, git-
+diffable.
+
+### §46.4 — Testbed runtime
+
+The testbed is the "play the character you just edited" loop.
+Fixed 32×18 tile world with a ground plus three ledges — lets the
+user verify gravity, jump height, collision in a repeatable scene.
+
+```c
+void testbed_init(character_ptr);
+void testbed_tick(dt_ms);
+void testbed_draw();
+void testbed_end();
+```
+
+### §46.5 — Recorder / replay
+
+For Rhythm Teacher and deterministic-testing flows, stbforge
+records per-frame input + position so a level can be replayed
+byte-identically.
+
+```c
+void rec_start();
+void rec_tick(...);
+void rec_stop();
+rec_save(path);
+rec_load(path);
+```
+
+### §46.6 — What this chapter does NOT cover
+
+- **Animation preview UI** — stbforge holds the data, ModuLab does
+  the editor UI (Cap 27 — Tools).
+- **Tween / easing curves**. Frame-indexed animation only, no
+  inter-frame interpolation.
+
+---
+
+## Cap 47 — GPU render (stbrender)
+
+*Depends on: Cap 38 (stbpal)*
+*Source: new*
+*Status: COMPLETE — 2026-04-22*
+
+`stbrender.bsm` is the GPU-side rendering layer — where supported
+by the platform (Metal on macOS today; Vulkan on Linux deferred).
+Enables indexed-sprite GPU upload, 3D-coordinate quads, and
+per-frame vertex streaming for particle / UI systems that want to
+skip the CPU rasterizer.
+
+### §47.1 — Public API
+
+```c
+void render_init();
+void render_begin();
+void render_end();
+void render_clear(color);
+void render_rect(x, y, w, h, color);
+void render_circle(cx, cy, r, color);
+void render_line(x1, y1, x2, y2, color);
+void render_circle_outline(cx, cy, r, color);
+void render_rect_outline(x, y, w, h, color);
+void render_sprite(handle, x, y, w, h);
+void render_sprite_indexed(handle, pal, x, y, w, h);
+void render_text(text, x, y, sz, color);
+render_measure(text, sz);    // measure width in pixels
+```
+
+Parallel to `stbdraw`'s CPU API, but dispatched to GPU when
+available. Fall back: if no GPU backend is installed,
+`render_init` is a no-op and every `render_*` call routes to the
+matching `draw_*` equivalent (so games compile and run either way).
+
+### §47.2 — Indexed sprites on the GPU
+
+The indexed rendering path uploads the palette once as a small
+texture (256×1 ARGB), the sprite as an 8-bit texture, and the
+shader samples `palette[sprite[uv]]` per fragment. This matches
+how Doom64 / SNES emulators draw: one 8-bit fetch + one palette
+lookup per pixel, zero CPU cost.
+
+### §47.3 — What this chapter does NOT cover
+
+- **Custom shaders / post-processing**. The current pipeline is
+  fixed: textured quads with palette LUT. Post effects would be
+  an extension.
+- **3D rendering**. The coordinate system is 2D-only today.
+- **Compute shaders**. Out of scope.
+- **Batch rendering of many small sprites** (particle system). For
+  < 1000 sprites per frame the per-call overhead is fine; beyond
+  that, a proper instanced-quad pipeline would help.
 
 ---
 

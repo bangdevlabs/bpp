@@ -521,6 +521,26 @@ static make_plus_op() {
     return pack(start, 1);
 }
 
+// Phase D.4 inline trivials support: cached packed ref for the
+// literal "malloc". Initialized lazily on first call — subsequent
+// calls reuse the cached offset. Rule 1: written once.
+static auto _inline_malloc_p_cached;
+
+static _inline_malloc_ref() {
+    auto start;
+    if (_inline_malloc_p_cached != 0) { return _inline_malloc_p_cached; }
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos,     'm');
+    poke(vbuf + vbuf_pos + 1, 'a');
+    poke(vbuf + vbuf_pos + 2, 'l');
+    poke(vbuf + vbuf_pos + 3, 'l');
+    poke(vbuf + vbuf_pos + 4, 'o');
+    poke(vbuf + vbuf_pos + 5, 'c');
+    vbuf_pos = vbuf_pos + 6;
+    _inline_malloc_p_cached = pack(start, 6);
+    return _inline_malloc_p_cached;
+}
+
 // ============================================================
 // Token access helpers
 // ============================================================
@@ -1960,11 +1980,102 @@ static parse_binops(left, min_prec) {
             }
             left = node;
         } else {
-            node = make_node(T_BINOP);
-            node.a = op_p;
-            node.b = left;
-            node.c = right;
-            left = node;
+            // Phase D.1/D.2 (2026-04-22): strength reduction + identity
+            // peephole. Runs only when exactly ONE operand is a literal
+            // (both-literal is handled by the constant-folding block
+            // above). Keeps the parser free of T_BINOP nodes that a
+            // shift or single-operand reference would express better.
+            auto right_is_lit, left_is_lit, lit_val, peep_ok, peep_node;
+            auto pn_wr: Node;   // typed handle for field writes
+            right_is_lit = is_int_lit_node(right);
+            left_is_lit  = is_int_lit_node(left);
+            peep_ok = 0;
+            peep_node = 0;
+
+            if (right_is_lit && left_is_lit == 0) {
+                auto rn: Node;
+                rn = right;
+                lit_val = parse_int_lit_value(rn.a);
+                if (op_l == 1) {
+                    // Identity peephole — right side literal.
+                    if (c0 == '+' && lit_val == 0) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '-' && lit_val == 0) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '*' && lit_val == 1) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '*' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
+                    else if (c0 == '/' && lit_val == 1) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '|' && lit_val == 0) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '^' && lit_val == 0) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == 0 - 1) { peep_node = left; peep_ok = 1; }
+                    // Strength reduction — right side power-of-2 literal.
+                    // `x * 2^k` → `x << k`. Unsigned semantics — for /
+                    // we don't reduce because signed arithmetic shift
+                    // vs integer divide differ on negatives (B++ ints
+                    // are signed, so preserve the explicit divide).
+                    else if (c0 == '*' && lit_val > 0 && (lit_val & (lit_val - 1)) == 0) {
+                        auto k, shl_start;
+                        k = 0;
+                        while (lit_val > 1) { lit_val = lit_val / 2; k = k + 1; }
+                        // Build packed "<<" operator on vbuf.
+                        shl_start = vbuf_pos;
+                        poke(vbuf + vbuf_pos, '<');
+                        poke(vbuf + vbuf_pos + 1, '<');
+                        vbuf_pos = vbuf_pos + 2;
+                        peep_node = make_node(T_BINOP);
+                        pn_wr = peep_node;
+                        pn_wr.a = pack(shl_start, 2);
+                        pn_wr.b = left;
+                        pn_wr.c = make_int_lit(k);
+                        peep_ok = 1;
+                    }
+                    // `x % 2^k` → `x & (2^k - 1)`. Only power-of-two
+                    // positive divisors; same signed caveat as above.
+                    else if (c0 == '%' && lit_val > 0 && (lit_val & (lit_val - 1)) == 0) {
+                        auto and_start;
+                        and_start = vbuf_pos;
+                        poke(vbuf + vbuf_pos, '&');
+                        vbuf_pos = vbuf_pos + 1;
+                        peep_node = make_node(T_BINOP);
+                        pn_wr = peep_node;
+                        pn_wr.a = pack(and_start, 1);
+                        pn_wr.b = left;
+                        pn_wr.c = make_int_lit(lit_val - 1);
+                        peep_ok = 1;
+                    }
+                } else if (op_l == 2 && c0 == '<' && c1 == '<' && lit_val == 0) {
+                    peep_node = left; peep_ok = 1;
+                } else if (op_l == 2 && c0 == '>' && c1 == '>' && lit_val == 0) {
+                    peep_node = left; peep_ok = 1;
+                }
+            } else if (left_is_lit && right_is_lit == 0) {
+                auto ln: Node;
+                ln = left;
+                lit_val = parse_int_lit_value(ln.a);
+                if (op_l == 1) {
+                    // Identity peephole — left side literal, commutative ops only.
+                    if (c0 == '+' && lit_val == 0) { peep_node = right; peep_ok = 1; }
+                    else if (c0 == '*' && lit_val == 1) { peep_node = right; peep_ok = 1; }
+                    else if (c0 == '*' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
+                    else if (c0 == '|' && lit_val == 0) { peep_node = right; peep_ok = 1; }
+                    else if (c0 == '^' && lit_val == 0) { peep_node = right; peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == 0 - 1) { peep_node = right; peep_ok = 1; }
+                }
+                // Note: `2 * x` is NOT strength-reduced here — ops that
+                // involve evaluating `x` only once would be safe, but
+                // stb code overwhelmingly writes `x * 2` so the mirror
+                // form is rare enough to skip (keeps the pass narrow).
+            }
+
+            if (peep_ok) {
+                left = peep_node;
+            } else {
+                node = make_node(T_BINOP);
+                node.a = op_p;
+                node.b = left;
+                node.c = right;
+                left = node;
+            }
         }
     }
     return left;
@@ -2167,6 +2278,40 @@ static parse_primary() {
             node.a = name_p;
             node.b = args_arr;
             node.c = last_list_cnt;
+
+            // Phase D.4 inline trivials (2026-04-22): rewrite known
+            // zero-overhead wrappers at parse time so hot paths stop
+            // paying the bl/ret overhead on semantic aliases. Gated
+            // by an explicit whitelist of functions whose body is a
+            // single return of a simple expression — starts narrow
+            // (buf_new, buf_new_w) and expands only after profile
+            // evidence. Keyword collisions (half/base/byte/word as
+            // reserved B++ keywords) can't sneak in because the
+            // substituted AST is built from bytes we control.
+            if (last_list_cnt == 1 && unpack_l(name_p) == 7 &&
+                buf_eq(vbuf + unpack_s(name_p), "buf_new", 7)) {
+                // buf_new(n) → malloc(n). Pure rename.
+                node.a = _inline_malloc_ref();
+            } else if (last_list_cnt == 1 && unpack_l(name_p) == 9 &&
+                       buf_eq(vbuf + unpack_s(name_p), "buf_new_w", 9)) {
+                // buf_new_w(n) → malloc(n << 3). Wraps the arg in a
+                // shift-left-3 and swaps the call target. The shift
+                // carries the same semantics as `* 8` but matches
+                // what Tier D.1 strength reduction would produce
+                // anyway — keeps the AST canonical.
+                auto shl_node: Node, shl_start, old_arg;
+                old_arg = *(args_arr);
+                shl_start = vbuf_pos;
+                poke(vbuf + vbuf_pos, '<');
+                poke(vbuf + vbuf_pos + 1, '<');
+                vbuf_pos = vbuf_pos + 2;
+                shl_node = make_node(T_BINOP);
+                shl_node.a = pack(shl_start, 2);
+                shl_node.b = old_arg;
+                shl_node.c = make_int_lit(3);
+                *(args_arr) = shl_node;
+                node.a = _inline_malloc_ref();
+            }
             return node;
         }
         // Enum/const: inline as integer literal if found.

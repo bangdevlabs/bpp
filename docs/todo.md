@@ -1,12 +1,13 @@
 # B++ Roadmap
 
-## Status — 2026-04-15
+## Status — 2026-04-23
 
-Version 0.23.x. Self-hosting, dual-backend (ARM64 native macOS + x86_64
-cross-compile Linux), C emitter in parity. **Mini Cooper shipped** (all
-seven phases: A + B0 + B1 + B2 + B3 + C + B4). 128-bit SIMD (`: double`
-+ eleven `vec_*` builtins) landed in B4. Suite at **65 passed / 0 failed
-/ 11 skipped**.
+Version 0.111. Self-hosting, dual-backend (ARM64 native macOS + x86_64
+cross-compile Linux), C emitter in parity. **Compiler backend fully
+portable**: all dispatchers (`cg_emit_func`, `cg_emit_stmt`,
+`cg_emit_node`, `cg_builtin_dispatch`) live in the spine
+(`bpp_codegen.bsm`); both chip backends delegate through `cg_prim`.
+Suite at **111 passed / 3 GPU-flakes / 11 skipped**. bpp = `72e1b793`.
 
 For the story of how we got here, see `docs/journal.md`. This file is
 forward-looking only.
@@ -29,14 +30,15 @@ about the language it was written in.
  ✅  Mini Cooper — bitfields, aligned malloc, constfold + DCE,
            ternary, short-circuit, Sethi-Ullman freelist, inline
            : base helpers, hot-local RA, batch 6 tonify, : double SIMD
- ─────────────────────────────────────────────────────────────────────
-     ↓ WE ARE HERE ↓
- ─────────────────────────────────────────────────────────────────────
   ✅ Dev Loop 2 — `bug --break`, `--dump-str`, observer fixes
   ✅ Type defense L1-L4 — W025/W026, effect lattice (HEAP/PANIC)
-  ✅ stbaudio Day 1-3 — SPSC ring, mixer, stbsound WAV
+  ✅ stbaudio + stbmixer + stbsound — audio stack shipped
   ✅ stbinput full keyboard (77 keys, macOS + Linux)
   ✅ synthkey — 4-octave polyphonic synth with WAV recording
+  ✅ GPU palette pipeline — stbpal, indexed Metal shader, O(1) remap
+  ✅ ModuLab 1.0 — pixel editor, 5 phases
+  ✅ Waves 18-21 — portable compiler (spine owns all dispatchers)
+  ✅ Phase D — stb faxina + parser opts + book Caps 29-47 COMPLETE
  ─────────────────────────────────────────────────────────────────────
      ↓ WE ARE HERE ↓
  ─────────────────────────────────────────────────────────────────────
@@ -54,238 +56,16 @@ about the language it was written in.
 
 ---
 
-## Active — in commit order
+## Active — post-Phase-D baseline (2026-04-23)
 
-### Shipped 2026-04-20 (afternoon) — Phase 3.4 first half
+Full history of what shipped is in `docs/journal.md`. What follows
+is the current state and what comes next.
 
-Seven waves of `chip_primitives` migration, all byte-identical
-against the jedi handoff canaries. Full write-up in
-`docs/journal.md`.
+### Next session targets
 
-- ✅ Foundation commit (Phases 1-3.3 from jedi pit stop)
-- ✅ Wave 1 — `nd == 0` dispatch (proves fn_ptr-in-struct works)
-- ✅ Wave 2 — `T_LIT` int / string / float (uncovered + fixed
-  the init-order bug where last-init-wins on `cg_prim` made
-  arm64 emission silently call x64 primitives)
-- ✅ Wave 3 — `T_VAR` local + global (B3 promoted-reg
-  short-circuit preserved chip-side per plan surprise #8)
-- ✅ Wave 4 — `T_UNARY` ~ / int negate / float negate
-- ✅ Wave 5 — `T_BINOP` arith + bitwise + shift (14 primitives)
-- ✅ Wave 6 — `T_BINOP` comparisons (portable cond_id mapping)
-- ✅ Wave 7 — `T_IF / T_WHILE / T_TERNARY / T_RET / T_BREAK / T_CONTINUE`
-  (8 control-flow primitives — first wave with real chip-code
-  shrink, **−198 LOC net**)
-
-### 🏁 Shipped 2026-04-20 (late night) — Backend Forth-portable
-
-Final activation session closed Wave 9b (T_CALL) + Commit B
-(cg_emit_func) via the fat-primitive pattern. `cg_emit_node`
-and `cg_emit_func` both live in `bpp_codegen.bsm` and dispatch
-through `cg_prim` to chip implementations. Backend is now
-truly portable. Full celebratory write-up in `docs/journal.md`.
-
-- ✅ Wave 9b A.1 (fda6dac) — T_CALL extracted to chip-local helper
-- ✅ Wave 9b A.2 (258b5e5) — call_extern real body
-- ✅ Wave 9b A.3+A.4 (46a2702) — cg_emit_call spine + T_CALL dispatch flip
-- ✅ Commit B (be275f8) — cg_emit_func spine flip
-- 📌 Commit C (Waves 16/17) — skipped per doc's "low marginal value"
-
-**Status: Phase 3.4 arc complete.** RISC-V port unblocked as
-leaf task. Install chameleon leaf task. Alien-parasite vision
-foundation laid.
-
-**Next session targets** (separate session each):
 - Phase 5 — RISC-V port: `riscv_enc.bsm` + `riscv_primitives.bsm`
 - Phase 6 — `install.sh` chameleon: auto-detect host chip + cross-compile
-- Fine-grained T_CALL primitive activation (future optimization)
-- Waves 16/17 spine flip (if bpp.bpp's caller dispatch ever unfreezes)
-
-### Shipped 2026-04-20 (night) — Wave 9b steps A.1 + A.2
-
-Third session picked up `docs/phase_final_activation.md` and
-shipped the first two safe steps of Wave 9b's 4-step plan.
-Full write-up in `docs/journal.md`.
-
-- ✅ A.1 (commit fda6dac) — T_CALL extracted to chip-local
-  helpers `a64_emit_call(n)` / `x64_emit_call(n)`. Pure
-  refactor, byte-identity trivially preserved.
-- ✅ A.2 (commit 258b5e5) — real bodies for
-  `_a64_emit_call_extern` + `_x64_emit_call_extern`. Caller-
-  saved primitives stay as stubs (doc's prediction: no-op).
-
-**Next session (final activation)** — 4-5h budget:
-
-- A.3 — Write `cg_emit_call(n)` in `bpp_codegen.bsm` per doc's
-  50-line pseudo-code. Uses the 14 Wave 9 primitives already
-  wired.
-- A.4 — Flip chip T_CALL dispatch. Split extracted helpers
-  into builtin-first path (peek, poke, sizeof, float_ret[2],
-  shr, assert, str_peek, sys_*) + non-builtin through spine.
-- Commit B — Mirror the pattern for emit_func (spine flip
-  `cg_emit_func`). Decide frame-math unification vs
-  `chip_compute_frame` primitive.
-- Commit C (optional) — Waves 16/17 cg_emit_module + cg_emit_all.
-
-Canary hashes locked for 16 commits straight:
-```
-pathfind  50caa64bfa7f4476d0780c5857304db66176d852
-rhythm    3d4f424b2ae7071110d8962750aaa700f2c57009
-bang9     7a76c3b8f6d9cb7021cb4a221f5c9980accdee02
-```
-
-### Shipped 2026-04-20 (evening) — Backend closeout scaffolding
-
-Following the Phase 3.4 close, the user pointed at
-`docs/phase_backend_closeout.md` (Wave 9 + Phase 3.5 + Phase 4
-spec). This session shipped scaffolding for ALL 6 remaining
-waves: contract slots declared, primitive functions in
-chip files (real bodies for trivial ones, stubs for complex),
-cg_install_<chip>_primitives wires every slot. Spine
-cg_emit_func/_module/_all NOT activated — chip's existing
-inline emit_func/module/all keeps producing identical output.
-Byte-identity verified.
-
-- ✅ Wave 9 scaffolding (commit 9ccf082) — 14 T_CALL primitives,
-  bodies real where trivial (arg_reg_*, push_arg_int, pre/post
-  align, call_direct, copy_ret_*) + stubs where complex
-  (call_extern, save/restore_caller_saved, push_arg_flt)
-- ✅ Phase 3.5+4 scaffolding (commit 315b896) — 13 primitives
-  for emit_func + emit_module + emit_all, all stub bodies
-
-**Followup session work (Wave 9b + activation)**
-
-Documented in `docs/phase_backend_closeout.md` and the
-2026-04-20 evening journal entry. The followup session:
-1. Writes real bodies for stubbed primitives
-2. Writes cg_emit_func / _module / _all in spine
-3. Flips dispatch: chip's emit_func/etc. becomes thin delegate
-4. Validates byte-identity per wave activation
-
-After followup ships, B++ backend is fully Forth-portable.
-RISC-V port unblocked.
-
-End-of-session canary hashes (next session's baseline):
-```
-HEAD       315b896  Phase 3.5+4 scaffolding
-pathfind   50caa64bfa7f4476d0780c5857304db66176d852  (must stay)
-rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009  (must stay)
-bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02  (must stay)
-```
-
-**Phase 3.4 — Waves 8/10 shipped, 9 deferred, 11 N/A, 12 collateral**
-
-- ✅ Wave 8 — `T_MEMLD / T_MEMST (int path) / T_ADDR` via
-  fat-primitive (chip owns sub-word + bit-packed dispatch
-  internally)
-- 📌 Wave 9 — `T_CALL` deferred. Needs dedicated session:
-  770 lines per chip with ABI scheduling that doesn't fit
-  call-site replacement
-- ✅ Wave 10 — `T_ASSIGN` global stores via emit_store_global
-- 🚫 Wave 11 — `T_SUBSCRIPT / T_FIELD` N/A. Parser lowers both
-  to T_MEMLD (handled in Wave 8)
-- ✅ Wave 12 — `emit_stmt` cases were collateral on Wave 7's
-  emit_node migration (identical bodies)
-
-**Phase 3.4 next session**: Wave 9 (T_CALL) standalone.
-Then Waves 13-19 (emit_func + epilogues), then Phase 4 dedup,
-Phase 5 RISC-V, Phase 6 install chameleon.
-
-Then Waves 13-19 (emit_func + epilogues), then Phase 4 dedup,
-Phase 5 RISC-V backend, Phase 6 install.sh chameleon. The
-infrastructure (struct, install seam, cond codes) is fully
-battle-tested by Wave 6 — remaining waves have no
-architectural risk, only volume.
-
-Use these as next-session baseline canaries:
-```
-bpp        2035655bea7bc9e163c68f742a9963492d89f473  (regenerated each wave)
-pathfind   50caa64bfa7f4476d0780c5857304db66176d852  (must stay)
-rhythm     3d4f424b2ae7071110d8962750aaa700f2c57009  (must stay)
-bang9      7a76c3b8f6d9cb7021cb4a221f5c9980accdee02  (must stay)
-```
-
-### Shipped 2026-04-20 (morning) — moved to journal
-
-- ✅ `stbpal` — Palette struct + 7 built-in catalogs (MCU-8, NKOTC-4,
-  CB-32, DB-32, PICO-8, GB-4, NES-54). Cycling (phase-correct),
-  LUT remap (+ flash convenience), palette lerp, `.pal.json` load/
-  save. Three tests green.
-- ✅ GPU indexed rendering path — Metal shader 4th branch (marker
-  192), R8 sprite texture + 1×256 BGRA palette texture, palette
-  re-upload ≈ 1 KB / frame per palette. `palette_gpu_upload` +
-  `palette_gpu_update` + `sprite_create_indexed` +
-  `sprite_draw_indexed` in stbrender.
-- ✅ pathfind migrated to indexed path — damage flash via
-  `palette_gpu_update(pal_gpu, pal_flash)` on hit (every sprite
-  flashes white in a single 1 KB upload).
-- ✅ `examples/gpu_palette_cycle` demo — 64×64 GB-4 bands flowing
-  down at 150 ms/step.
-- ✅ stbdraw Layer byte-grid ops — `layer_get/set/clear/fill`
-  (flood 4-connected). level_editor migrated from raw malloc to
-  `Layer*`; 40 LOC of duplicated grid logic deleted.
-- ✅ stbforge testbed level loader — consumes level_editor's
-  `.level.json`; ModuLab auto-loads `testbed.level.json` on Tab.
-- ✅ stbforge animation runtime — `testbed_play_animation`,
-  `testbed_find_animation`, `testbed_anim_tick`,
-  `tb_current_frame_idx`. Loop + one-shot. ModuLab rebuilds an
-  "all frames" animation at 8 fps on every Tab-into-testbed.
-- ✅ macOS window-sizing fix — `_stb_init_window` now probes
-  CGDisplayPixels[Wide/High] and picks the max scale that fits
-  with menu-bar + title-bar reserve. Mouse divisor stays in sync
-  via `_plt_scale`.
-- ✅ UI button audit — `gui_button` centres labels, widths
-  adjusted in ModuLab + level_editor for TTF-era 16 px glyphs.
-- ✅ sprite_viewer default asset path routed through `path_asset`
-  (works from any cwd) + last `sz=1` warning fixed.
-
-### Tomorrow (2026-04-21) — dialog_editor
-
-Third dev tool. Whatever it ends up being (branching dialog
-state machine? animation timeline editor? scene composer?) the
-motivation is to become the second/third client of something
-currently modulab-local — that's what triggers the next
-extraction. Scope decision at start of session.
-
-Candidate directions:
-- **Dialog / cutscene editor** — node graph of lines + choices,
-  character portraits pulled from ModuLab sprite JSON, saves a
-  `.dialog.json` loadable at runtime by games.
-- **Animation editor** — explicit UI for building animations
-  (right now ModuLab auto-derives "all frames at 8 fps"). Scrub
-  timeline, per-anim fps, loop toggle, event markers.
-- **Scene composer** — wire level_editor tilemaps + ModuLab
-  sprites + character animations into a `.scene.json` the
-  testbed consumes.
-
-### Low-priority follow-ups
-
-- Testbed controls (A/D/Space) not firing from ModuLab editor.
-  Possibly upstream key interception. Investigate when dialog_editor
-  surfaces similar issues, or sooner if it blocks playtest flow.
-- Recorder `.` / `,` hotkeys bug (carried from earlier session —
-  keys map correctly in stbinput but UI doesn't fire them).
-- 3 flaky GPU tests (`test_gpu_circle/clear/shapes`) — exit 137
-  SIGKILL on macOS codesign cache, oscillate run-to-run. Not
-  regressions; the cache clears after a few runs.
-
-### Shipped this sprint (2026-04-16/17) — moved to journal
-
-- ✅ Bug #1 (W025 regression) + Bug #2 (16-seed) — root cause was
-  page_count=1 in Mach-O chained fixups. Fixed.
-- ✅ Bug #3 + #3b (diag line numbers off) — scan_comment not ticking
-  cur_line. Fixed, .bug source map 1-for-1 with source.
-- ✅ W025 — Rule 13 nudge shipped.
-- ✅ Dev Loop 2 MVP — `bug --break`, `--dump-str`, observer fixes.
-- ✅ Type defense L1-L4 — effect lattice with PHASE_HEAP + PHASE_PANIC.
-  W025 + W026. 33 extern seeds. 25 diagnostics total.
-- ✅ stbaudio Day 1-3 — CoreAudio + SPSC ring + bulk push.
-- ✅ stbmixer — 8-voice polyphonic, 4-way waveform fader, dirt, volume.
-- ✅ stbsound — WAV save/load.
-- ✅ stbinput full keyboard — 77 keys, macOS + Linux.
-- ✅ synthkey — 4-octave poly synth with WAV recording.
-
-Full write-up in `docs/journal.md` entry 2026-04-16/17.
-
+- Open bugs: 3 GPU-flake tests (exit 137 codesign cache), x86_64 B1/B2 regression
 
 ### 1. Dev Loop 3: Profiler (minimal + sampling)
 
@@ -526,7 +306,7 @@ Linux x86_64, `bpp game.bpp` produces a Linux ELF with no flag.
 | `stbphys.bsm` | ✅ | Physics with milli-units |
 | `stbpath.bsm` | ✅ | A* pathfinding |
 | `bpp_hash.bsm` | ✅ | Hash maps (used by compiler) |
-| `stbaudio.bsm` | next | Rhythm Teacher |
+| `stbaudio.bsm` | ✅ | CoreAudio + SPSC ring, 111 tests |
 | `stbdialogue.bsm` | P0 | RPG (dialogue boxes, choices) |
 | `stbinventory.bsm` | P0 | RPG (item slots) |
 | `stbmenu.bsm` | P0 | RPG (nested menus) |
