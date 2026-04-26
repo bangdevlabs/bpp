@@ -89,6 +89,27 @@ for src in "$TESTS_DIR"/test_*.bpp; do
         continue
     fi
 
+    # Check for expected-failure marker on the first line: // xfail: EYYY
+    # If present, the test PASSES when the compiler emits that error code and
+    # FAILS when it compiles cleanly (the expected error did not fire).
+    xfail_code="$(head -1 "$src" | sed -n 's|.*// xfail: \(E[0-9]*\).*|\1|p')"
+    if [ -n "$xfail_code" ]; then
+        if "$BPP" "$src" -o "$out" >/dev/null 2>"$BUILD_DIR/$base.compile.err"; then
+            printf "  FAIL  %-32s (xfail: compiled cleanly, expected %s)\n" "$base" "$xfail_code"
+            FAIL=$((FAIL + 1))
+            FAIL_NAMES="$FAIL_NAMES $base"
+        elif grep -q "$xfail_code" "$BUILD_DIR/$base.compile.err"; then
+            printf "  PASS  %s\n" "$base"
+            PASS=$((PASS + 1))
+        else
+            printf "  FAIL  %-32s (xfail: expected %s, got different error)\n" "$base" "$xfail_code"
+            sed 's/^/        /' "$BUILD_DIR/$base.compile.err"
+            FAIL=$((FAIL + 1))
+            FAIL_NAMES="$FAIL_NAMES $base"
+        fi
+        continue
+    fi
+
     # Compile. Bury normal output, surface compile failures only.
     if ! "$BPP" "$src" -o "$out" >/dev/null 2>"$BUILD_DIR/$base.compile.err"; then
         printf "  FAIL  %-32s (compile)\n" "$base"
