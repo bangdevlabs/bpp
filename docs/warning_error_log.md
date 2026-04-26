@@ -43,6 +43,7 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | E242 | shift count out of range | bpp_validate.bsm | 558 | ✅ | shift count > 63 — hardware masks to 6 bits, value silently wrong |
 | E243 | pointer compared to non-zero literal | bpp_validate.bsm | 600 | ✅ | `if (ptr == 42)` is almost always a bug; only 0 is the canonical null check |
 | E244 | float literal in int context | bpp_parser.bsm + bpp_validate.bsm | 2122 + 583 | ✅ | array index or shift count cannot be a float literal |
+| E245 | array element type conflict | bpp_types.bsm | ty_set_elem | ✅ | Two different element types inferred for the same TY_ARR variable — arrays are always homogeneous |
 
 ## Runtime asset-load diagnostics (stderr, not compile-time)
 

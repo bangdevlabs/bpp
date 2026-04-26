@@ -23,7 +23,9 @@ import "bpp_parser.bsm";
 
 // ── Symbol table ───────────────────────────────────────────
 // Dynamic parallel arrays of packed name and type code.
-auto ty_vt_names, ty_vt_types, ty_vt_locked;
+// ty_vt_elem tracks the inferred element type of TY_ARR variables.
+// Default is TY_WORD (word array). Set by writes and str_* call inference.
+auto ty_vt_names, ty_vt_types, ty_vt_locked, ty_vt_elem;
 
 // Known function return types: dynamic parallel arrays.
 auto ft_names, ft_types;
@@ -46,6 +48,7 @@ void init_types() {
     ty_vt_names  = arr_new();
     ty_vt_types  = arr_new();
     ty_vt_locked = arr_new();
+    ty_vt_elem   = arr_new();
     ft_names = arr_new();
     ft_types = arr_new();
     fn_vt_data = arr_new();
@@ -86,6 +89,7 @@ void ty_reset_scope() {
     arr_clear(ty_vt_names);
     arr_clear(ty_vt_types);
     arr_clear(ty_vt_locked);
+    arr_clear(ty_vt_elem);
 }
 
 // Look up a variable's inferred type by packed name. Returns TY_UNK if not found.
@@ -115,10 +119,11 @@ void ty_set_var_type(name_p, ty) {
             return;
         }
     }
-    // New variable: append to table, unlocked by default.
+    // New variable: append to table, unlocked, word element by default.
     ty_vt_names  = arr_push(ty_vt_names,  name_p);
     ty_vt_types  = arr_push(ty_vt_types,  ty);
     ty_vt_locked = arr_push(ty_vt_locked, 0);
+    ty_vt_elem   = arr_push(ty_vt_elem,   TY_WORD);
 }
 
 // Lock a variable's type. Subsequent ty_set_var_type calls become no-ops, so
@@ -132,6 +137,63 @@ void ty_lock_var(name_p) {
             return;
         }
     }
+}
+
+// Set the element type of a TY_ARR variable. If the variable already has a
+// non-word element type that disagrees with elem_ty, emit E245 — arrays are
+// always homogeneous, so two different element types in the same array is a
+// programmer bug, not an inference ambiguity.
+void ty_set_elem(name_p, elem_ty, src_tok) {
+    auto i, cur;
+    for (i = 0; i < arr_len(ty_vt_names); i = i + 1) {
+        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            cur = arr_get(ty_vt_elem, i);
+            if (cur != TY_WORD && cur != elem_ty) {
+                diag_error(245);
+                diag_str("array element type conflict: array '");
+                diag_packed(name_p);
+                diag_str("' has mixed element types");
+                diag_newline();
+                diag_loc(src_tok);
+                diag_show_line(src_tok);
+                return;
+            }
+            arr_set(ty_vt_elem, i, elem_ty);
+            return;
+        }
+    }
+}
+
+// Return the inferred element type of a TY_ARR variable.
+ty_get_elem(name_p): base {
+    auto i;
+    for (i = 0; i < arr_len(ty_vt_names); i = i + 1) {
+        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
+            return arr_get(ty_vt_elem, i);
+        }
+    }
+    return TY_WORD;
+}
+
+// Walk a pointer expression and return the packed name of the TY_ARR base
+// variable, or 0 if the pattern is not recognised. Only handles T_VAR and
+// T_BINOP — struct-field arrays (e.g. state.buffer[i]) are not covered and
+// silently return 0 (no inference, no error).
+static _arr_base_var(nd) {
+    auto n: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype == T_VAR) {
+        if (ty_var_type(n.a) == TY_ARR) { return n.a; }
+        return 0;
+    }
+    if (n.ntype == T_BINOP) {
+        auto v;
+        v = _arr_base_var(n.b);
+        if (v != 0) { return v; }
+        return _arr_base_var(n.c);
+    }
+    return 0;
 }
 
 // Register or update a known function return type.
@@ -315,19 +377,38 @@ add_type(nd) {
         return TY_WORD;
     }
 
-    // Memory store: process both pointer and value.
+    // Memory store: process both pointer and value, then infer element type.
+    // If a float value is stored into a TY_ARR variable, mark its element float.
     if (t == T_MEMST) {
+        auto val_ty, base_var;
         add_type(n.a);
-        add_type(n.b);
+        val_ty = add_type(n.b);
+        if (is_float_type(val_ty)) {
+            base_var = _arr_base_var(n.a);
+            if (base_var != 0) { ty_set_elem(base_var, TY_FLOAT, n.src_tok); }
+        }
         n.itype = TY_UNK;
         return TY_UNK;
     }
 
     // Function call: return type from known function table.
+    // str_* calls with a TY_ARR argument mark the element type as byte/char.
+    // Whitelist: str_len, str_eq, str_ends, str_starts. Other str_* enter Fase 4.
     if (t == T_CALL) {
-        // Process arguments first.
+        auto fn_s, fn_l;
         add_type_list(n.b, n.c);
         ty = func_type(n.a);
+        fn_s = unpack_s(n.a); fn_l = unpack_l(n.a);
+        if (n.c >= 1) {
+            auto arg0: Node;
+            arg0 = n.b[0];
+            if (arg0.ntype == T_VAR && arg0.itype == TY_ARR) {
+                if (fn_l == 7 && buf_eq(vbuf + fn_s, "str_len",    7)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
+                if (fn_l == 6 && buf_eq(vbuf + fn_s, "str_eq",     6)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
+                if (fn_l == 8 && buf_eq(vbuf + fn_s, "str_ends",   8)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
+                if (fn_l == 10 && buf_eq(vbuf + fn_s, "str_starts", 10)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
+            }
+        }
         n.itype = ty;
         return ty;
     }
@@ -397,14 +478,16 @@ add_type(nd) {
 // ── Persistence ───────────────────────────────────────────
 
 // Save the current function's variable types to persistent storage.
+// Layout per entry: [name:8][type:8][elem:8] = 24 bytes.
 // Called after inference completes for each function.
 void save_fn_types(func_idx) {
     auto block, i, cnt;
     cnt = arr_len(ty_vt_names);
-    block = malloc(cnt * 16);
+    block = arr_byte(cnt * 24);
     for (i = 0; i < cnt; i = i + 1) {
-        *(block + i * 16) = arr_get(ty_vt_names, i);
-        *(block + i * 16 + 8) = arr_get(ty_vt_types, i);
+        *(block + i * 24)      = arr_get(ty_vt_names, i);
+        *(block + i * 24 + 8)  = arr_get(ty_vt_types, i);
+        *(block + i * 24 + 16) = arr_get(ty_vt_elem,  i);
     }
     arr_set(fn_vt_data, func_idx, block);
     arr_set(fn_vt_cnts, func_idx, cnt);
@@ -429,8 +512,22 @@ get_fn_var_type(func_idx, name_p) {
     block = arr_get(fn_vt_data, func_idx);
     cnt = arr_get(fn_vt_cnts, func_idx);
     for (i = 0; i < cnt; i = i + 1) {
-        if (packed_eq(*(block + i * 16), name_p)) {
-            return *(block + i * 16 + 8);
+        if (packed_eq(*(block + i * 24), name_p)) {
+            return *(block + i * 24 + 8);
+        }
+    }
+    return TY_WORD;
+}
+
+// Query the element type of a TY_ARR variable for a given function index.
+// Returns TY_WORD if not found or not an array.
+get_fn_elem_type(func_idx, name_p) {
+    auto block, cnt, i;
+    block = arr_get(fn_vt_data, func_idx);
+    cnt = arr_get(fn_vt_cnts, func_idx);
+    for (i = 0; i < cnt; i = i + 1) {
+        if (packed_eq(*(block + i * 24), name_p)) {
+            return *(block + i * 24 + 16);
         }
     }
     return TY_WORD;

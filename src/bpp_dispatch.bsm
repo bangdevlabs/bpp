@@ -96,6 +96,11 @@ auto stride_vars;
 // Local variable set for the current function scope.
 auto dsp_local_vars;
 
+// Index of the function currently being analysed. Set by run_dispatch()
+// before calling analyze_body so that classify_loop can query element types
+// from the persistent fn_vt_data store without a signature change.
+auto _dsp_cur_func_idx;
+
 // Initialize the dispatch engine. Call once at startup.
 void init_dispatch() {
     DSP_SEQ = 0;
@@ -596,9 +601,21 @@ classify_loop(wh) {
     }
 
     // Step 5: classify.
+    // For pure loops with strided variables: GPU if the strided array holds
+    // float elements (SIMD-friendly), PAR otherwise (word/byte arrays).
     dsp = DSP_SEQ;
     if (impure_cnt == 0) {
-        dsp = arr_len(stride_vars) > 0 ? DSP_GPU : DSP_PAR;
+        if (arr_len(stride_vars) > 0) {
+            auto sv_elem;
+            sv_elem = get_fn_elem_type(_dsp_cur_func_idx, arr_get(stride_vars, 0));
+            if (is_float_type(sv_elem)) {
+                dsp = DSP_GPU;
+            } else {
+                dsp = DSP_PAR;
+            }
+        } else {
+            dsp = DSP_PAR;
+        }
     } else {
         if (arr_len(stride_vars) > 0) {
             if (pure_cnt > 0) {
@@ -2488,6 +2505,7 @@ run_dispatch() {
         // cross-module purity stays intact even with this skip.
         if (body_arr != 0) {
 
+        _dsp_cur_func_idx = i;
         dsp_reset_locals();
 
         // Register function parameters as local variables.
