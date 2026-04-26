@@ -1,0 +1,224 @@
+// tablah_opt.bpp — Hand-optimized benchmark proving inline + unroll impact.
+//
+// Changes vs tablah.bpp:
+//   1. xorshift64 body inlined at every call site (no function call overhead)
+//   2. Inner 9-iteration loop fully unrolled (no branch overhead)
+//   3. Strength-reduced bit position (bit_pos constant per unrolled step)
+//
+// Compile and run:
+//   bpp tablah_opt.bpp -o tablah_opt && ./tablah_opt
+
+import "bpp_hash.bsm";
+import "bpp_job.bsm";
+import "bpp_beat.bsm";
+import "bpp_io.bsm";
+
+const N = 1000000;
+const NUM_WORKERS = 8;
+
+// Per-worker RNG state — shared array, each worker touches only its slot.
+auto rng_states;
+
+// Shared buffers
+auto vdk;   // U64 keys
+auto vdi;   // U32 values
+
+// ── Worker: gen U64 keys (INLINED xorshift + UNROLLED inner loop) ───
+
+static gen_u64_worker(worker_id) {
+    auto chunk, start, end, i, key, s, char_idx;
+
+    chunk = N / NUM_WORKERS;
+    start = worker_id * chunk;
+    if (worker_id == NUM_WORKERS - 1) {
+        end = N;
+    } else {
+        end = start + chunk;
+    }
+
+    // Seed
+    rng_states[worker_id] = (worker_id + 1) * 11400714819323198485;
+    if (rng_states[worker_id] == 0) {
+        rng_states[worker_id] = 11400714819323198485;
+    }
+
+    for (i = start; i < end; i = i + 1) {
+        key = 0;
+
+        // ── Unrolled iteration 0 (bit offset 0) ──
+        s = rng_states[worker_id];
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = ((s & 0x7FFFFFFFFFFFFFFF) % 62);
+
+        // ── Unrolled iteration 1 (bit offset 6) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 6);
+
+        // ── Unrolled iteration 2 (bit offset 12) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 12);
+
+        // ── Unrolled iteration 3 (bit offset 18) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 18);
+
+        // ── Unrolled iteration 4 (bit offset 24) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 24);
+
+        // ── Unrolled iteration 5 (bit offset 30) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 30);
+
+        // ── Unrolled iteration 6 (bit offset 36) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 36);
+
+        // ── Unrolled iteration 7 (bit offset 42) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 42);
+
+        // ── Unrolled iteration 8 (bit offset 48) ──
+        s = s ^ (s << 13); s = s ^ (s >> 7); s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        key = key | (((s & 0x7FFFFFFFFFFFFFFF) % 62) << 48);
+
+        vdk[i] = key;
+    }
+    return 0;
+}
+
+// ── Worker: gen U32 values (INLINED xorshift) ───────────────
+
+static gen_u32_worker(worker_id) {
+    auto chunk, start, end, i, s;
+
+    chunk = N / NUM_WORKERS;
+    start = worker_id * chunk;
+    if (worker_id == NUM_WORKERS - 1) {
+        end = N;
+    } else {
+        end = start + chunk;
+    }
+
+    rng_states[worker_id] = (worker_id + 10) * 73244475;
+    if (rng_states[worker_id] == 0) {
+        rng_states[worker_id] = 73244475;
+    }
+
+    for (i = start; i < end; i = i + 1) {
+        // Inline xorshift64 — no function call
+        s = rng_states[worker_id];
+        s = s ^ (s << 13);
+        s = s ^ (s >> 7);
+        s = s ^ (s << 17);
+        rng_states[worker_id] = s;
+        vdi[i] = s & 0xFFFFFFFF;
+    }
+    return 0;
+}
+
+// ── Print helpers ───────────────────────────────────────────
+
+static void print_timing(label, us) {
+    auto ms, frac;
+    ms = us / 1000;
+    frac = us % 1000;
+
+    print_str(label);
+    putchar(' ');
+    print_int(ms);
+    putchar('.');
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    print_int(frac);
+    print_msg(" ms");
+}
+
+// ── Main ────────────────────────────────────────────────────
+
+main() {
+    auto t0, elapsed;
+    auto hm, hmf;
+    auto i, m: Hash, slot, u, key, val, first_char;
+    auto hm_count, hmf_count;
+
+    print_msg("--- BENCHMARK B++ OPTIMIZED (inline + unroll) ---");
+
+    rng_states = malloc(NUM_WORKERS * 8);
+    vdk = malloc(N * 8);
+    vdi = malloc(N * 8);
+
+    job_init(NUM_WORKERS);
+
+    // ── 1. Geração U64 (inlined + unrolled) ────────────────
+    t0 = beat_now_us();
+    job_parallel_for(NUM_WORKERS, fn_ptr(gen_u64_worker));
+    elapsed = beat_now_us() - t0;
+    print_timing("GERACAO VETOR U64:", elapsed);
+
+    // ── 2. Geração U32 (inlined) ────────────────────────────
+    t0 = beat_now_us();
+    job_parallel_for(NUM_WORKERS, fn_ptr(gen_u32_worker));
+    elapsed = beat_now_us() - t0;
+    print_timing("GERACAO VETOR U32:", elapsed);
+
+    // ── 3. Criação Hashmap ──────────────────────────────────
+    hm = hash_new(N * 4);
+
+    t0 = beat_now_us();
+    for (i = 0; i < N; i = i + 1) {
+        hash_set(hm, vdk[i], vdi[i]);
+    }
+    elapsed = beat_now_us() - t0;
+    print_timing("CRIACAO HASHMAP:  ", elapsed);
+
+    // ── 4. Filtragem ────────────────────────────────────────
+    hmf = hash_new(1024);
+
+    t0 = beat_now_us();
+    m = hm;
+    for (slot = 0; slot < m.cap; slot = slot + 1) {
+        u = peek(m.used + slot);
+        if (u == HASH_LIVE) {
+            key = m.keys[slot];
+            val = m.vals[slot];
+            first_char = key & 0x3F;
+            if ((first_char == 14 || first_char == 19) && val >= 1000000000) {
+                hash_set(hmf, key, val);
+            }
+        }
+    }
+    elapsed = beat_now_us() - t0;
+    print_timing("FILTRAGEM HASHMAP:", elapsed);
+
+    // ── Estatísticas ────────────────────────────────────────
+    print_msg("--- ESTATISTICAS ---");
+    hm_count = hash_count(hm);
+    hmf_count = hash_count(hmf);
+
+    print_str("ITENS NO HASHMAP: ");
+    print_int(hm_count);
+    print_ln();
+
+    print_str("ITENS FILTRADOS: ");
+    print_int(hmf_count);
+    print_ln();
+
+    hash_free(hm);
+    hash_free(hmf);
+    free(vdk);
+    free(vdi);
+    free(rng_states);
+    job_shutdown();
+
+    return 0;
+}

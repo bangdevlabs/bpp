@@ -113,7 +113,7 @@ Interpolate:
 main() {
     auto score;
     score = 150;
-    print_msg("score: ");
+    print_str("score: ");
     print_int(score);
     print_ln();
 }
@@ -152,7 +152,7 @@ Every B++ program starts with nine modules already in scope. You do not need to 
 | Module | What it gives you | Examples |
 |--------|-------------------|----------|
 | `_core.bsm` (per-OS: `_core_macos.bsm` / `_core_linux.bsm`) | Memory allocator + runtime base | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
-| `bpp_io.bsm` | stdout / stderr helpers | `print_msg`, `print_int`, `print_ln`, `putchar`, `putchar_err`, `getchar` |
+| `bpp_io.bsm` | stdout / stderr helpers | `print_msg`, `print_str`, `print_int`, `print_ln`, `putchar`, `putchar_err`, `getchar` |
 | `bpp_str.bsm` | strings, both static and builder | `str_len`, `str_eq`, `str_starts`, `str_ends`, `str_dup`, `sb_new`, `sb_cat`, `sb_int` |
 | `bpp_array.bsm` | dynamic arrays with shadow header | `arr_new`, `arr_push`, `arr_get`, `arr_set`, `arr_len`, `arr_free` |
 | `bpp_hash.bsm` | hash tables (word keys + string keys) | `hash_new`, `hash_set`, `hash_get`, `hash_str_new`, `hash_str_set` |
@@ -784,11 +784,35 @@ The builder is not reusable after `sb_free`. If you need a second string, call `
 
 ### §6.3 — `str_peek` is a compiler builtin
 
-`str_peek(s, i)` reads byte `i` of the string pointer `s`. It is NOT a function in `bpp_str.bsm` — the compiler emits it inline as a single byte-load instruction (LDRB on ARM64, MOVZX on x86_64). This makes it equivalent to `peek(s + i)` in speed.
+`str_peek(s, i)` reads byte `i` of the string pointer `s`. It is NOT a function in `bpp_str.bsm` — it lives in `cg_builtin_dispatch` (`src/bpp_codegen.bsm`) and is intercepted before any function call is emitted.
 
-The semantic difference is effect classification: `str_peek` carries a `: base` effect (pure read, no side effects), which the smart-dispatch system uses to decide scheduling. `peek(s + i)` is also base but the name is less specific. Use `str_peek` when you are reading character-by-character through a string; use `peek` for raw byte addresses.
+#### Why a separate builtin and not just `peek(s + i)`?
 
-```c
+`peek` is a raw memory primitive. When the compiler sees `peek(s + i)`, it pattern-matches the `+` expression at the call site and emits an indexed load:
+
+```
+peek(s + i)  →  LDRB w0, [x0, x1]   // ARM64 — only when + is visible at the call site
+```
+
+But if the address is pre-computed, the pattern is gone:
+
+```
+auto addr;
+addr = s + i;
+peek(addr)   →  LDRB w0, [x0]        // simple load — + already consumed
+```
+
+`str_peek` avoids this by accepting base and index as **separate parameters**. The compiler always has both values, so the indexed load is unconditional regardless of how `s` and `i` were derived:
+
+```
+str_peek(s, i)  →  LDRB w0, [x0, x1]   // ARM64 — always, without exception
+```
+
+On x86_64 both forms emit the same two instructions (`ADD rax, rcx` + `MOVZX`), so the distinction only matters on ARM64. Use `str_peek` when you need a guaranteed indexed load; use `peek(s + i)` when the `+` is always visible at the call site and the opportunistic optimization is enough.
+
+Both are pure (`PHASE_BASE`) — the smart-dispatch system treats them identically for `job_parallel_for` eligibility.
+
+```
 // Walk a string one byte at a time
 auto i, c;
 i = 0;
@@ -835,7 +859,7 @@ if (str_ends(path, ".bpp") || str_ends(path, ".bsm")) {
 
 ```c
 // Print "score: 1234" using explicit chaining
-print_msg("score: ");
+print_str("score: ");
 print_int(score);
 print_ln();
 

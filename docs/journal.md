@@ -1,5 +1,39 @@
 # B++ Bootstrap Journal
 
+## 2026-04-24 — 🧪 TABLAH: EXTERNAL BENCHMARK + HASH ITERATION API
+
+First external stress-test of B++. A software engineer ported **tablah** — a
+Swift hashmap benchmark — to B++ to validate the language as a general-purpose
+systems tool. The benchmark exercises four phases in sequence: parallel
+generation of 1M U64 keys (Xorshift64, 8 workers via `job_parallel_for`),
+parallel generation of 1M U32 values, hashmap creation (1M inserts at 25% load
+factor), and a filter pass (first 6-bit char index == 'E' or 'J' and value ≥
+1 billion).
+
+Two variants shipped. **`examples/tablah.bpp`** uses the clean public API
+throughout. **`examples/tablah_opt.bpp`** is hand-optimized: `xorshift64`
+inlined at every call site and the 9-iteration inner loop fully unrolled —
+submitted as a companion to show the gap between clean-code and zero-overhead
+B++.
+
+Two stdlib additions were needed to support the port:
+
+**`print_str` added to `bpp_io.bsm`** — `sys_write`-backed string printer with
+no trailing newline. Required by `tablah`'s `print_timing` helper, which
+composes label + integer + unit on one line. Now auto-injected alongside
+`print_msg`.
+
+**Hash iteration API added to `bpp_hash.bsm`** — four new functions
+(`hash_cap`, `hash_slot_live`, `hash_key_at`, `hash_val_at`) let callers
+iterate all live entries without touching `Hash` struct internals. `tablah.bpp`
+filter phase uses these; `tablah_opt.bpp` deliberately bypasses them (direct
+struct access) to shave per-slot indirection and demonstrate the trade-off.
+
+Minor: `games/pathfind/pathfind.bpp` updated to load
+`cat_sprite.modulab.json` (ModuLab-exported asset path).
+
+---
+
 ## 2026-04-23 — 📚 DOC BACKFILL: every chapter shipped
 
 Short doc-maintenance session. Three files updated:

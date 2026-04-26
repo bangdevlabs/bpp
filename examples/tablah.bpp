@@ -1,0 +1,206 @@
+// tablah.bpp — Swift benchmark ported to B++.
+//
+// Measures:
+//   1. Geração de 1M chaves U64 (9 chars × 6 bits) — parallel, 8 workers
+//   2. Geração de 1M valores U32 — parallel, 8 workers
+//   3. Criação de hashmap (1M inserções)
+//   4. Filtragem (primeiro char == E|J && valor >= 1 bilhão)
+//
+// Compile and run:
+//   bpp tablah.bpp -o tablah && ./tablah
+
+import "bpp_hash.bsm";
+import "bpp_job.bsm";
+import "bpp_beat.bsm";
+import "bpp_io.bsm";
+
+const N = 1000000;
+const NUM_WORKERS = 8;
+
+// ── Xorshift64 (matches the Swift FastRNG) ──────────────────
+
+// Per-worker RNG state lives in a shared array so each worker
+// can read/write its own slot without racing.
+auto rng_states;
+
+// B++ words are signed 64-bit. The xorshift produces negative values
+// ~50% of the time. Callers must mask before modulo to avoid negative
+// indices (signed % gives negative results in B++).
+static xorshift64(worker_id) {
+    auto s;
+    s = rng_states[worker_id];
+    s = s ^ (s << 13);
+    s = s ^ (s >> 7);
+    s = s ^ (s << 17);
+    rng_states[worker_id] = s;
+    return s;
+}
+
+// ── Shared buffers (word arrays = 64-bit slots) ─────────────
+
+auto vdk;   // U64 keys   — N words
+auto vdi;   // U32 values — N words (only low 32 bits meaningful)
+
+// ── Worker functions (called by job_parallel_for) ───────────
+
+// Each worker gets its index (0..7). It computes its chunk
+// [start..end) and fills vdk with packed 9×6-bit keys.
+static gen_u64_worker(worker_id) {
+    auto chunk, start, end, i, j, key, char_idx;
+
+    chunk = N / NUM_WORKERS;
+    start = worker_id * chunk;
+    if (worker_id == NUM_WORKERS - 1) {
+        end = N;
+    } else {
+        end = start + chunk;
+    }
+
+    // Seed this worker's RNG (matches Swift: (workerId + 1) * golden)
+    rng_states[worker_id] = (worker_id + 1) * 11400714819323198485;
+    // Ensure nonzero
+    if (rng_states[worker_id] == 0) {
+        rng_states[worker_id] = 11400714819323198485;
+    }
+
+    for (i = start; i < end; i = i + 1) {
+        key = 0;
+        for (j = 0; j < 9; j = j + 1) {
+            // Mask to unsigned before modulo — signed % gives negative results
+            char_idx = (xorshift64(worker_id) & 0x7FFFFFFFFFFFFFFF) % 62;
+            key = key | (char_idx << (6 * j));
+        }
+        vdk[i] = key;
+    }
+    return 0;
+}
+
+// Each worker fills its chunk of vdi with pseudo-random U32 values.
+static gen_u32_worker(worker_id) {
+    auto chunk, start, end, i;
+
+    chunk = N / NUM_WORKERS;
+    start = worker_id * chunk;
+    if (worker_id == NUM_WORKERS - 1) {
+        end = N;
+    } else {
+        end = start + chunk;
+    }
+
+    // Different seed (matches Swift: (workerId + 10) * 0x45D9F3B)
+    rng_states[worker_id] = (worker_id + 10) * 73244475;
+    if (rng_states[worker_id] == 0) {
+        rng_states[worker_id] = 73244475;
+    }
+
+    for (i = start; i < end; i = i + 1) {
+        vdi[i] = xorshift64(worker_id) & 0xFFFFFFFF;
+    }
+    return 0;
+}
+
+// ── Print helpers ───────────────────────────────────────────
+// print_str (no-newline) is provided by bpp_io.bsm.
+
+// Print a label followed by elapsed microseconds converted to
+// a simple "X.YYY ms" display (integer ms + fractional µs).
+static void print_timing(label, us) {
+    auto ms, frac;
+    ms = us / 1000;
+    frac = us % 1000;
+
+    print_str(label);
+    putchar(' ');
+    print_int(ms);
+    putchar('.');
+    // Zero-pad the fractional part to 3 digits
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    print_int(frac);
+    print_msg(" ms");
+}
+
+// ── Main ────────────────────────────────────────────────────
+
+main() {
+    auto t0, elapsed;
+    auto hm, hmf;
+    auto i, cap, key, val, first_char;
+    auto hm_count, hmf_count;
+
+    print_msg("--- BENCHMARK B++ (port do Swift tablah) ---");
+
+    // Allocate shared state
+    rng_states = malloc(NUM_WORKERS * 8);
+    vdk = malloc(N * 8);
+    vdi = malloc(N * 8);
+
+    // Initialize worker pool
+    job_init(NUM_WORKERS);
+
+    // ── 1. Geração U64 ─────────────────────────────────────
+    t0 = beat_now_us();
+    job_parallel_for(NUM_WORKERS, fn_ptr(gen_u64_worker));
+    elapsed = beat_now_us() - t0;
+    print_timing("GERACAO VETOR U64:", elapsed);
+
+    // ── 2. Geração U32 ─────────────────────────────────────
+    t0 = beat_now_us();
+    job_parallel_for(NUM_WORKERS, fn_ptr(gen_u32_worker));
+    elapsed = beat_now_us() - t0;
+    print_timing("GERACAO VETOR U32:", elapsed);
+
+    // ── 3. Criação Hashmap ──────────────────────────────────
+    hm = hash_new(N * 4);   // pre-size: 1M entries / 4M slots = 25% load factor
+
+    t0 = beat_now_us();
+    for (i = 0; i < N; i = i + 1) {
+        hash_set(hm, vdk[i], vdi[i]);
+    }
+    elapsed = beat_now_us() - t0;
+    print_timing("CRIACAO HASHMAP:  ", elapsed);
+
+    // ── 4. Filtragem ────────────────────────────────────────
+    // Uses the new hash iteration API (hash_cap, hash_slot_live,
+    // hash_key_at, hash_val_at) — no struct internals needed.
+    hmf = hash_new(1024);
+
+    t0 = beat_now_us();
+    cap = hash_cap(hm);
+    for (i = 0; i < cap; i = i + 1) {
+        if (hash_slot_live(hm, i)) {
+            key = hash_key_at(hm, i);
+            val = hash_val_at(hm, i);
+            first_char = key & 0x3F;    // extract first 6 bits
+            // 14 = 'E' index, 19 = 'J' index in the charset
+            if ((first_char == 14 || first_char == 19) && val >= 1000000000) {
+                hash_set(hmf, key, val);
+            }
+        }
+    }
+    elapsed = beat_now_us() - t0;
+    print_timing("FILTRAGEM HASHMAP:", elapsed);
+
+    // ── Estatisticas ────────────────────────────────────────
+    print_msg("--- ESTATISTICAS ---");
+    hm_count = hash_count(hm);
+    hmf_count = hash_count(hmf);
+
+    print_str("ITENS NO HASHMAP: ");
+    print_int(hm_count);
+    print_ln();
+
+    print_str("ITENS FILTRADOS: ");
+    print_int(hmf_count);
+    print_ln();
+
+    // Cleanup
+    hash_free(hm);
+    hash_free(hmf);
+    free(vdk);
+    free(vdi);
+    free(rng_states);
+    job_shutdown();
+
+    return 0;
+}
