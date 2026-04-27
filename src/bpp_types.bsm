@@ -175,6 +175,19 @@ ty_get_elem(name_p): base {
     return TY_WORD;
 }
 
+// Find a function's packed name by scanning funcs[]. Used by put/put_err
+// dispatch to locate putstr/putnum/putfloat without hardcoding vbuf offsets.
+static _put_target(str, len) {
+    auto i, func, np, ns, nl;
+    for (i = 0; i < func_cnt; i = i + 1) {
+        func = funcs[i];
+        np = *(func + FN_NAME);
+        ns = unpack_s(np); nl = unpack_l(np);
+        if (nl == len && buf_eq(vbuf + ns, str, len)) { return np; }
+    }
+    return 0;
+}
+
 // Walk a pointer expression and return the packed name of the TY_ARR base
 // variable, or 0 if the pattern is not recognised. Only handles T_VAR and
 // T_BINOP — struct-field arrays (e.g. state.buffer[i]) are not covered and
@@ -407,6 +420,33 @@ add_type(nd) {
                 if (fn_l == 6 && buf_eq(vbuf + fn_s, "str_eq",     6)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
                 if (fn_l == 8 && buf_eq(vbuf + fn_s, "str_ends",   8)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
                 if (fn_l == 10 && buf_eq(vbuf + fn_s, "str_starts", 10)) { ty_set_elem(arg0.a, TY_WORD_B, n.src_tok); }
+            }
+            // Smart dispatch: rewrite put(x)/put_err(x) to the right output
+            // function before codegen sees the call. TY_PTR → putstr,
+            // TY_FLOAT → putfloat, anything else → putnum.
+            auto target;
+            target = 0;
+            if (fn_l == 3 && buf_eq(vbuf + fn_s, "put", 3)) {
+                if (is_float_type(arg0.itype)) {
+                    target = _put_target("putfloat", 8);
+                } else if (arg0.itype == TY_PTR) {
+                    target = _put_target("putstr", 6);
+                } else {
+                    target = _put_target("putnum", 6);
+                }
+            }
+            if (fn_l == 7 && buf_eq(vbuf + fn_s, "put_err", 7)) {
+                if (is_float_type(arg0.itype)) {
+                    target = _put_target("putfloat_err", 12);
+                } else if (arg0.itype == TY_PTR) {
+                    target = _put_target("putstr_err", 10);
+                } else {
+                    target = _put_target("putnum_err", 10);
+                }
+            }
+            if (target != 0) {
+                n.a = target;
+                ty = func_type(n.a);
             }
         }
         n.itype = ty;
