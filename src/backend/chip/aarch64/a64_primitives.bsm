@@ -474,6 +474,19 @@ void _a64_emit_memst_store_float_scalar(fh_sl, val_reg) {
     }
 }
 
+// Convert integer accumulator (x0) to float accumulator (d0).
+// Used by pokefloat/pokefloat_h when the value argument evaluates as integer.
+void _a64_emit_coerce_int_to_float() {
+    if (a64_bin_mode) { enc_scvtf(0, 0); }
+    else { out("  scvtf d0, x0"); putchar('\n'); }
+}
+
+// Store float register val_reg at [x0]. Thin wrapper over
+// _a64_emit_memst_store_float_scalar for use by builtin dispatch.
+void _a64_emit_float_store_scalar(fh_sl, val_reg) {
+    _a64_emit_memst_store_float_scalar(fh_sl, val_reg);
+}
+
 // Address-of a stack-frame local: x0 ← x29 + off.
 void _a64_emit_addr_local(off) {
     if (a64_bin_mode) { enc_add_imm(0, 29, off); }
@@ -499,8 +512,8 @@ void _a64_emit_addr_global(packed_name) {
 // every call. These primitives become live in Wave 9b.
 
 // AAPCS64: x0..x7 for int + d0..d7 for float, 8 each.
-_a64_arg_reg_int(i) : base { if (i < 8) { return i; } return 0 - 1; }
-_a64_arg_reg_flt(i) : base { if (i < 8) { return i; } return 0 - 1; }
+_a64_arg_reg_int(i) : base { if (i < 8) { return i; } return -1; }
+_a64_arg_reg_flt(i) : base { if (i < 8) { return i; } return -1; }
 _a64_arg_reg_count_int() : base { return 8; }
 _a64_arg_reg_count_flt() : base { return 8; }
 
@@ -534,7 +547,7 @@ void _a64_emit_push_arg_flt(dst_or_off, is_spill) {
 _a64_emit_pre_call_align(stack_args) {
     auto pad;
     pad = stack_args * 8;
-    if (pad % 16 != 0) { pad = pad + 8; }
+    if (pad % 16 != 0) { pad += 8; }
     if (pad > 0) {
         if (a64_bin_mode) { enc_sub_imm(31, 31, pad); }
         else { out("  sub sp, sp, #"); a64_print_dec(pad); putchar('\n'); }
@@ -632,7 +645,7 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
         }
         enc_add_imm(29, 31, 0);
         n = arr_len(a64_promoted_regs);
-        for (i = 0; i < n; i = i + 1) {
+        for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             enc_str_uoff(reg, 29, off);
@@ -655,7 +668,7 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
         }
         out("  mov x29, sp"); putchar('\n');
         n = arr_len(a64_promoted_regs);
-        for (i = 0; i < n; i = i + 1) {
+        for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             out("  str x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
@@ -746,14 +759,14 @@ void _a64_emit_branch_ne(label_id) {
 void _a64_emit_pop_discard() {
     if (a64_bin_mode) { enc_ldr_post(9, 31, 16); }
     else { out("  ldr x9, [sp], #16"); putchar('\n'); }
-    cg_depth = cg_depth - 1;
+    cg_depth--;
 }
 
 // Save the left operand of a T_BINOP. Returns save_token:
 //   -1 → pushed on float stack, -2 → on GP stack, >=0 → freelist reg.
 _a64_emit_binop_save_left(has_call_right, lty) {
     auto alloc_reg;
-    if (lty == 1) { a64_emit_fpush(); return 0 - 1; }
+    if (lty == 1) { a64_emit_fpush(); return -1; }
     if (has_call_right) { a64_emit_push(); return 0 - 2; }
     alloc_reg = a64_gp_alloc();
     if (alloc_reg >= 0) {
@@ -774,7 +787,7 @@ _a64_emit_binop_resolve(save_token, use_flt, lty, rty) {
             if (a64_bin_mode) { enc_scvtf(0, 0); }
             else { out("  scvtf d0, x0"); putchar('\n'); }
         }
-        if (save_token == 0 - 1) {
+        if (save_token == -1) {
             a64_emit_fpop(1);
         } else if (save_token >= 0) {
             if (a64_bin_mode) { enc_scvtf(1, save_token); }
@@ -791,7 +804,7 @@ _a64_emit_binop_resolve(save_token, use_flt, lty, rty) {
         if (a64_bin_mode) { enc_fcvtzs(0, 0); }
         else { out("  fcvtzs x0, d0"); putchar('\n'); }
     }
-    if (save_token == 0 - 1) {
+    if (save_token == -1) {
         a64_emit_fpop(0);
         if (a64_bin_mode) { enc_fcvtzs(1, 0); }
         else { out("  fcvtzs x1, d0"); putchar('\n'); }
@@ -861,7 +874,7 @@ _a64_fn_compute_offsets() {
     auto i, n_vars, total, _fty, abs_off, sz;
     total = 0;
     n_vars = arr_len(cg_vars);
-    for (i = 0; i < n_vars; i = i + 1) {
+    for (i = 0; i < n_vars; i++) {
         _fty = arr_get(cg_var_forced_ty, i);
         abs_off = 40 + total;
         if (slice_width(ty_slice(_fty)) == 128) {
@@ -871,10 +884,10 @@ _a64_fn_compute_offsets() {
         } else if (arr_get(cg_var_stack, i)) {
             arr_set(cg_var_off, i, abs_off);
             sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
-            total = total + sz;
+            total += sz;
         } else {
             arr_set(cg_var_off, i, abs_off);
-            total = total + 8;
+            total += 8;
         }
     }
     return total;
@@ -917,7 +930,7 @@ void _a64_emit_narrow_float_params(par_cnt) {
                 }
             }
         }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -994,7 +1007,7 @@ void _a64_emit_frame_teardown(frame_size) {
     n = arr_len(a64_promoted_regs);
     if (a64_bin_mode) {
         enc_def_label(a64_ret_lbl);
-        for (i = 0; i < n; i = i + 1) {
+        for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             enc_ldr_uoff(reg, 29, off);
@@ -1009,7 +1022,7 @@ void _a64_emit_frame_teardown(frame_size) {
         enc_ret();
     } else {
         out(".Lret_"); a64_print_p(cg_cur_fn_name); out(":"); putchar('\n');
-        for (i = 0; i < n; i = i + 1) {
+        for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             out("  ldr x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
@@ -1259,23 +1272,23 @@ void _a64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     // shuffle needed beyond the pops.
     if (arg_count >= 2) {
         if (a64_bin_mode) { enc_ldr_post(1, 31, 16); } else { out("  ldr x1, [sp], #16"); putchar('\n'); }
-        cg_depth = cg_depth - 1;
+        cg_depth--;
     }
     if (arg_count >= 3) {
         if (a64_bin_mode) { enc_ldr_post(2, 31, 16); } else { out("  ldr x2, [sp], #16"); putchar('\n'); }
-        cg_depth = cg_depth - 1;
+        cg_depth--;
     }
     if (arg_count >= 4) {
         if (a64_bin_mode) { enc_ldr_post(3, 31, 16); } else { out("  ldr x3, [sp], #16"); putchar('\n'); }
-        cg_depth = cg_depth - 1;
+        cg_depth--;
     }
     if (arg_count >= 5) {
         if (a64_bin_mode) { enc_ldr_post(4, 31, 16); } else { out("  ldr x4, [sp], #16"); putchar('\n'); }
-        cg_depth = cg_depth - 1;
+        cg_depth--;
     }
     if (arg_count >= 6) {
         if (a64_bin_mode) { enc_ldr_post(5, 31, 16); } else { out("  ldr x5, [sp], #16"); putchar('\n'); }
-        cg_depth = cg_depth - 1;
+        cg_depth--;
     }
     if (extra_slot >= 0) {
         if (a64_bin_mode) { enc_mov_wide(extra_slot, extra_val); }

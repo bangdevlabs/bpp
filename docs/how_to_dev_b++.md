@@ -19,29 +19,30 @@ No other canonical document. Everything that used to live in separate markdown f
 | 3 | Syntax | I | PENDING | legacy_docs/the_b++_programming_language.md §2 | 1 |
 | 4 | Types | I | PENDING | legacy §3 | 3 |
 | 5 | Functions and Effects | I | PENDING | legacy §2.5 | 3, 4 |
-tun| 6 | Strings (bpp_str + sb_) | II — Arsenal | PENDING | legacy §4 | 4 |
-| 7 | Arrays (bpp_array) | II | PENDING | legacy §5 | 4 |
+tun| 6 | Strings (bpp_str + strbuf_) | II — Arsenal | PENDING | legacy §4 | 4 |
+| 7 | Arrays (bpp_array + bpp_buf) | II | COMPLETE | new | 4 |
 | 8 | Hash tables (bpp_hash) | II | PENDING | legacy §5 | 7 |
 | 9 | Buffers (bpp_buf) | II | PENDING | legacy §5 | — |
 | 10 | Structs (language feature) | II | PENDING | legacy §4.5 | 4 |
 | 11 | Enums (language feature) | II | PENDING | legacy §4.6 | 4 |
 | 12 | I/O (bpp_io) | II | PENDING | legacy §4.1 | — |
 | 13 | Runtime ABI (bpp_runtime) | II | PENDING | new | 9 |
-| 14 | Tonify (the style rules) | III — Writing Pro | PENDING | legacy_docs/how_to_dev_b++.md Part 2 | — |
+| 14 | Tonify (the style rules) | III — Writing Pro | COMPLETE | legacy_docs/how_to_dev_b++.md Part 2 | — |
 | 15 | Disciplina QG (general vs battalion) | III | COMPLETE | new | 2 |
-| 16 | Idioms | III | PENDING | legacy how_to_dev Part 4 | 14, 15 |
-| 17 | Anti-patterns | III | PENDING | legacy how_to_dev Part 5 | 14, 15 |
-| 18 | Bootstrap procedure | IV — Building the Compiler | PENDING | legacy how_to_dev Part 1 | — |
-| 19 | Canary discipline | IV | PENDING | legacy how_to_dev Part 5 | 18 |
-| 20 | Testing | IV | PENDING | legacy how_to_dev Part 6 | 18 |
-| 21 | Frontend (parser, lexer) | V — Compiler Architecture | PENDING | legacy the_b++ §7 | — |
-| 22 | Spine (bpp_codegen, dispatch) | V | PENDING | legacy phase_backend_closeout | 21 |
-| 23 | Battalions (chip backends) | V | PENDING | legacy max_plan_codegen_split | 22 |
-| 24 | Runtime primitives (malloc, syscalls) | V | PENDING | legacy the_b++ §7 | 13, 23 |
-| 25 | Adding a new backend | V | PENDING | legacy how_to_dev Part 7 | 22, 23, 24 |
-| 26 | Bang 9 IDE | VI — Ecosystem | PENDING | legacy_docs/bang9_vision.md | — |
-| 27 | Tools (modulab, level_editor, mini_synth) | VI | PENDING | legacy_docs/bang9_*embed/factory*.md | 26 |
-| 28 | Roadmap and Current Status | VI | PENDING | legacy_docs/roadmap_to_1_0.md | — |
+| 16 | Idioms | III | COMPLETE | legacy how_to_dev Part 4 | 14, 15 |
+| 17 | Anti-patterns | III | COMPLETE | legacy how_to_dev Part 5 | 14, 15 |
+| 18 | Bootstrap procedure | IV — Building the Compiler | COMPLETE | legacy how_to_dev Part 1 | — |
+| 19 | Canary discipline | IV | COMPLETE | legacy how_to_dev Part 9 | 18 |
+| 20 | Testing | IV | COMPLETE | legacy how_to_dev Part 6 | 18 |
+| 21 | Frontend (parser, lexer) | V — Compiler Architecture | COMPLETE | legacy the_b++ §7 | — |
+| 22 | Spine (bpp_codegen, dispatch) | V | COMPLETE | legacy phase_backend_closeout | 21 |
+| 23 | Battalions (chip backends) | V | COMPLETE | legacy max_plan_codegen_split | 22 |
+| 24 | Runtime primitives (malloc, syscalls) | V | COMPLETE | legacy the_b++ §13 | 13, 23 |
+| 25 | Adding a new backend | V | COMPLETE | legacy how_to_dev Part 7 | 22, 23, 24 |
+| 26 | Bang 9 IDE | VI — Ecosystem | COMPLETE | legacy_docs/bang9_vision.md | — |
+| 27 | Tools (modulab, level_editor, mini_synth) | VI | COMPLETE | legacy_docs/bang9_*embed/factory*.md | 26 |
+| 28 | Diagnostics (warnings + errors) | VI | COMPLETE | docs/warning_error_log.md | — |
+| 48 | Compiler Flags Reference | IV — Building the Compiler | COMPLETE | legacy_docs/how_to_dev_b++.md Part 8 | 18 |
 | 29 | Audio output (stbaudio) | VI | COMPLETE | new | 2, 15 |
 | 30 | Audio mixer (stbmixer) | VI | COMPLETE | new | 29 |
 | 31 | Sound files (stbsound) | VI | COMPLETE | new | 30 |
@@ -82,7 +83,7 @@ The minimum B++ program is three lines. No headers, no imports, no return statem
 
 ```c
 main() {
-    print_msg("Hello, World");
+    put("Hello, World\n");
 }
 ```
 
@@ -94,7 +95,7 @@ bpp hello.bpp -o hello
 # Hello, World
 ```
 
-That is everything. `print_msg` writes a string to stdout followed by a newline. `main` returns 0 implicitly when no explicit return. No `#include`, no `import`. How that works is Cap 2.
+That is everything. `put(x)` dispatches at compile time by the type of `x` — string, integer, or float. `main` returns 0 implicitly when no explicit return. No `#include`, no `import`. How that works is Cap 2.
 
 ### Variations
 
@@ -102,8 +103,8 @@ Print an integer:
 
 ```c
 main() {
-    print_int(42);
-    print_ln();
+    put(42);
+    putchar('\n');
 }
 ```
 
@@ -113,13 +114,13 @@ Interpolate:
 main() {
     auto score;
     score = 150;
-    print_str("score: ");
-    print_int(score);
-    print_ln();
+    put("score: ");
+    put(score);
+    putchar('\n');
 }
 ```
 
-B++ has no `printf` format strings. Composition is explicit — chain `print_*` calls or build a string with `sb_*` (Cap 6).
+B++ has no `printf` format strings. You compose output with `put` calls — the compiler routes each call to `putstr`, `putnum`, or `putfloat` based on the argument type. For newlines, use `putchar('\n')` or `putmsg(s)` (which appends `\n` automatically). Build multi-part strings with `strbuf_*` (Cap 6).
 
 Byte-level output when you need it:
 
@@ -152,11 +153,11 @@ Every B++ program starts with nine modules already in scope. You do not need to 
 | Module | What it gives you | Examples |
 |--------|-------------------|----------|
 | `_core.bsm` (per-OS: `_core_macos.bsm` / `_core_linux.bsm`) | Memory allocator + runtime base | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
-| `bpp_io.bsm` | stdout / stderr helpers | `print_msg`, `print_str`, `print_int`, `print_ln`, `putchar`, `putchar_err`, `getchar` |
-| `bpp_str.bsm` | strings, both static and builder | `str_len`, `str_eq`, `str_starts`, `str_ends`, `str_dup`, `sb_new`, `sb_cat`, `sb_int` |
-| `bpp_array.bsm` | dynamic arrays with shadow header | `arr_new`, `arr_push`, `arr_get`, `arr_set`, `arr_len`, `arr_free` |
+| `bpp_io.bsm` | stdout / stderr output, stdin input | `put`, `put_err`, `putchar`, `putchar_err`, `putstr`, `putnum`, `putfloat`, `putline`, `putmsg`, `getchar`, `getenv` |
+| `bpp_str.bsm` | C-string operations + dynamic string builder | `str_len`, `str_eq`, `str_cpy`, `str_ends`, `str_starts`, `str_dup`, `strbuf_new`, `strbuf_cat`, `strbuf_ch`, `strbuf_num`, `strbuf_len`, `strbuf_free` |
+| `bpp_array.bsm` | Dynamic arrays with 16-byte shadow header | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_free`, `arr_clear`, `arr_last` |
+| `bpp_buf.bsm` | Raw byte/word buffers + typed LE/BE read/write | `buf_byte`, `buf_word`, `buf_fill`, `buf_copy`, `read_u8/16/32/64`, `write_u8/16/32/64`, `read_u16be/u32be`, `write_u16be/u32be` |
 | `bpp_hash.bsm` | hash tables (word keys + string keys) | `hash_new`, `hash_set`, `hash_get`, `hash_str_new`, `hash_str_set` |
-| `bpp_buf.bsm` | byte buffers + LE/BE multi-byte read/write | `read_u8/16/32/64`, `write_u8/16/32/64`, `read_u16be`, `write_u16be` |
 | `bpp_math.bsm` | pure B++ sqrt, sin, cos | `sqrt`, `sin`, `cos`, `abs`, `min`, `max` |
 | `bpp_file.bsm` | file I/O | `file_read_all`, `file_write_all` |
 | `_stb_platform.bsm` (per-OS) | window, clock, input primitives | `_stb_init_window`, `_stb_get_time`, `_stb_poll_events`, `_stb_frame_wait`, `_stb_should_close` |
@@ -172,9 +173,9 @@ Two groups of functions are NOT in this prelude and need `import`:
 
 ### Consequence for Hello World
 
-The three-line `main() { print_msg("Hello, World"); }` works because:
+The three-line `main() { put("Hello, World\n"); }` works because:
 - `main` is the standard entry point the compiler looks for
-- `print_msg` is a function in `bpp_io.bsm`, which was auto-injected
+- `put` is a function in `bpp_io.bsm`, which was auto-injected
 - The return value defaults to 0 when you do not write `return`
 
 That is the entire reason the minimum program is three lines instead of the seven or eight a non-prelude language would need. The prelude is B++'s productivity floor.
@@ -479,7 +480,7 @@ add(a, b) { return a + b; }
 
 // With void return — side effect only:
 void print_greeting() {
-    print_msg("Hello\n");
+    put("Hello\n");
 }
 
 // With typed parameters:
@@ -540,7 +541,7 @@ what kind of work they do:
 solo     // runs on main thread, drives real-time side effects
 base     // pure computation, parallelizable on worker threads
 io       // blocking I/O — stdin/stdout, files, sockets, syscalls
-heap     // allocates memory (malloc, arr_push, buf_new)
+heap     // allocates memory (malloc, arr_push, buf_byte, buf_word)
 ```
 
 The effects form a lattice — a function inherits the WORST effect
@@ -620,7 +621,7 @@ The stdlib. Every function listed in Cap 2's prelude table, expanded here with s
 
 ---
 
-## Cap 6 — Strings (bpp_str + sb_)
+## Cap 6 — Strings (bpp_str + strbuf_)
 
 *Depends on: Cap 4*
 *Source: legacy_docs/the_b++_programming_language.md §4 + new content for §6.0 (three shapes rationale)*
@@ -635,7 +636,7 @@ Before any API, understand the vocabulary: B++ represents strings in **three dif
 | Shape | What it is | Where memory lives | API module | Who uses it |
 |-------|-----------|-------------------|-----------|-------------|
 | **Static C-string** | byte array terminated by `\0` | allocated by caller (literal, stack, or heap) | `bpp_str.str_*` | Every user program — the everyday string |
-| **Dynamic builder** | `{length, capacity}` header + byte array that grows | heap, managed by builder, realloc on grow | `bpp_str.sb_*` | Programs that build strings from pieces |
+| **Dynamic builder** | `{length, capacity}` header + byte array that grows | heap, managed by builder, realloc on grow | `bpp_str.strbuf_*` | Programs that build strings from pieces |
 | **Packed ref (slice)** | `(offset, length)` packed into 64 bits | no memory of its own — points INTO another buffer | `bpp_internal.buf_eq` / `packed_eq` (compiler-only) | The compiler's parser / codegen |
 
 A physical analogy: a library.
@@ -649,7 +650,7 @@ Three shapes exist because three use cases have genuinely different optimal repr
 
 1. **User programs handle existing strings.** You get a string (argv parameter, file content, config value) and you want to read it. The NUL terminator convention from C is the right shape — caller already has the memory, function just walks bytes until zero. `bpp_str` operates here.
 
-2. **Programs build strings from pieces.** Logging, JSON serialization, formatted messages. You do not know the final size in advance; the string grows as you append. A builder with header `{len, cap}` is the right shape — it manages its own memory, reallocates on grow, and gives you amortized O(1) append. `sb_*` operates here.
+2. **Programs build strings from pieces.** Logging, JSON serialization, formatted messages. You do not know the final size in advance; the string grows as you append. A builder with header `{len, cap}` is the right shape — it manages its own memory, reallocates on grow, and gives you amortized O(1) append. `strbuf_*` operates here.
 
 3. **The compiler processes 10 MB of source and produces 100 000 tokens.** If every token allocated a C-string copy, the parser would burn 100 000 mallocs per compilation. A packed ref `(offset, length)` into the source buffer costs zero allocation — the token IS a pointer-and-length pair, not a string copy. `bpp_internal.buf_eq`, `packed_eq` operate here. User programs never see this shape.
 
@@ -674,14 +675,15 @@ Because a dynamic builder stores its bytes contiguously and terminates them with
 
 ```c
 auto msg;
-msg = sb_new();
-msg = sb_cat(msg, "hello");
-print_int(str_len(msg));       // → 5, works
+msg = strbuf_new();
+msg = strbuf_cat(msg, "hello");
+put(str_len(msg));             // → 5, works
 if (str_eq(msg, "hello")) {}   // → 1, works
-msg = sb_free(msg);
+strbuf_free(msg);
+msg = 0;
 ```
 
-What does NOT work: writing into a builder via `str_cpy` or `str_cat_raw`. Those functions ignore the builder's header and corrupt the `{len, cap}` bookkeeping. Always use `sb_cat` / `sb_ch` / `sb_int` to extend a builder.
+What does NOT work: writing into a builder via `str_cpy` or `str_cat_raw`. Those functions ignore the builder's header and corrupt the `{len, cap}` bookkeeping. Always use `strbuf_cat` / `strbuf_ch` / `strbuf_num` to extend a builder.
 
 #### What a function actually returns
 
@@ -695,8 +697,8 @@ str_len(s) { ... }              // → 5
 // Caller is responsible for free(). This is a C-string shape.
 str_dup(s) { ... }              // → 0x600000...
 
-// Returns a pointer past the header of a builder. Caller uses sb_* only.
-sb_new() { ... }                // → raw + 16
+// Returns a pointer past the header of a builder. Caller uses strbuf_* only.
+strbuf_new() { ... }            // → raw + 16
 
 // Returns a packed ref (offset, length encoded into one word).
 // Caller uses unpack_s / unpack_l to read. Compiler-internal only.
@@ -715,11 +717,11 @@ The same rule applies to arrays (Cap 7): a pointer returned by `arr_new()` is sh
 | Measuring a string you received | `str_len` |
 | Copying a string to a stable location | `str_dup` (allocates heap) |
 | Writing into a fixed-size buffer you own | `str_cpy`, `str_cat_raw`, `str_from_int` |
-| Building a message from pieces, size unknown | `sb_new` + `sb_cat` + `sb_int` + `sb_free` |
-| Accumulating a log or serializing JSON | `sb_*` |
+| Building a message from pieces, size unknown | `strbuf_new` + `strbuf_cat` + `strbuf_num` + `strbuf_free` |
+| Accumulating a log or serializing JSON | `strbuf_*` |
 | Parser-internal work on source-buffer slices | packed refs (`buf_eq`, `packed_eq`) — compiler only |
 
-One-sentence rule: **`str_*` reads or writes memory you already own. `sb_*` builds memory that grows. Packed refs view memory someone else owns.** Use the one whose story matches your job.
+One-sentence rule: **`str_*` reads or writes memory you already own. `strbuf_*` builds memory that grows. Packed refs view memory someone else owns.** Use the one whose story matches your job.
 
 ### §6.1 — `str_*` — Static C-string operations
 
@@ -740,7 +742,7 @@ Quick examples:
 
 ```c
 // Testing extension
-if (str_ends(path, ".bpp")) { print_msg("B++ source"); }
+if (str_ends(path, ".bpp")) { put("B++ source\n"); }
 
 // Safe copy into fixed buffer
 auto name_buf;
@@ -752,35 +754,34 @@ auto n;
 n = str_len("hello");   // 5
 ```
 
-### §6.2 — `sb_*` — Dynamic string builder
+### §6.2 — `strbuf_*` — Dynamic string builder
 
-The `sb_*` family in `src/bpp_str.bsm` builds strings from pieces when you do not know the final length up front. The builder allocates a heap-backed buffer and doubles it as needed.
+The `strbuf_*` family in `src/bpp_str.bsm` builds strings from pieces when you do not know the final length up front. The builder allocates a heap-backed buffer and doubles it as needed.
 
 | Function | Description |
 |----------|-------------|
-| `sb_new()` | Allocate a fresh builder. Returns an opaque pointer. Must be freed with `sb_free`. |
-| `sb_cat(b, s)` | Append the null-terminated string `s` to the builder. |
-| `sb_ch(b, c)` | Append a single byte `c` to the builder. |
-| `sb_int(b, n)` | Append the decimal representation of integer `n`. |
-| `sb_float(b, v)` | Append a float value formatted as a decimal string. |
-| `sb_free(b)` | Release the builder and return the finished null-terminated string as a heap allocation. The caller owns the returned pointer and must `free` it. |
+| `strbuf_new()` | Allocate a fresh builder. Returns an opaque pointer. Must be freed with `strbuf_free`. |
+| `strbuf_cat(b, s)` | Append the null-terminated string `s` to the builder. |
+| `strbuf_ch(b, c)` | Append a single byte `c` to the builder. |
+| `strbuf_num(b, n)` | Append the decimal representation of integer `n`. |
+| `strbuf_free(b)` | Free the builder. Returns 0 — use the builder pointer directly before calling free. |
 
-Lifecycle example — build a log line, print it, free it:
+Lifecycle example — build a log line and print it:
 
 ```c
-auto b, result;
-b = sb_new();
-sb_cat(b, "wave ");
-sb_int(b, wave_num);
-sb_cat(b, " closed: ");
-sb_int(b, tests_passed);
-sb_cat(b, " passed");
-result = sb_free(b);    // b is now gone; result is a fresh heap string
-print_msg(result);
-free(result);
+auto b;
+b = strbuf_new();
+strbuf_cat(b, "wave ");
+strbuf_num(b, wave_num);
+strbuf_cat(b, " closed: ");
+strbuf_num(b, tests_passed);
+strbuf_cat(b, " passed");
+put(b);             // use b directly — it is already a null-terminated string
+strbuf_free(b);     // returns 0, not the string
+b = 0;
 ```
 
-The builder is not reusable after `sb_free`. If you need a second string, call `sb_new` again.
+The builder pointer `b` is a valid null-terminated string at any point. Call `strbuf_free` when done; it frees the underlying allocation. If you need to keep the string after freeing the builder, copy it first with `str_dup(b)`.
 
 ### §6.3 — `str_peek` is a compiler builtin
 
@@ -858,34 +859,33 @@ if (str_ends(path, ".bpp") || str_ends(path, ".bsm")) {
 **2. Score interpolation (no format strings)**
 
 ```c
-// Print "score: 1234" using explicit chaining
-print_str("score: ");
-print_int(score);
-print_ln();
+// Print "score: 1234" — put dispatches by type
+put("score: ");
+put(score);
+putchar('\n');
 
 // Or build it for display in a UI widget
-auto b, label;
-b = sb_new();
-sb_cat(b, "score: ");
-sb_int(b, score);
-label = sb_free(b);
-draw_text(label, hud_x, hud_y, 1, WHITE);
-free(label);
+auto b;
+b = strbuf_new();
+strbuf_cat(b, "score: ");
+strbuf_num(b, score);
+draw_text(b, hud_x, hud_y, 1, WHITE);  // use b directly
+strbuf_free(b);
+b = 0;
 ```
 
 **3. Log accumulation**
 
 ```c
 auto log;
-log = sb_new();
-sb_cat(log, "[init] ");
-sb_int(log, step);
-sb_cat(log, " done\n");
-// ... more sb_cat calls ...
-auto text;
-text = sb_free(log);
-file_write_all("run.log", text, str_len(text));
-free(text);
+log = strbuf_new();
+strbuf_cat(log, "[init] ");
+strbuf_num(log, step);
+strbuf_cat(log, " done\n");
+// ... more strbuf_cat calls ...
+file_write_all("run.log", log, strbuf_len(log));  // use log directly
+strbuf_free(log);
+log = 0;
 ```
 
 **4. Parse-a-line (tokenize by delimiter)**
@@ -922,11 +922,44 @@ free(copy);
 
 ---
 
-## Cap 7 — Arrays (bpp_array)
+## Cap 7 — Arrays (bpp_array + bpp_buf)
 
 *Depends on: Cap 4*
 *Source: legacy_docs/the_b++_programming_language.md §5*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-26*
+
+B++ has two distinct array shapes:
+
+**Dynamic arrays** (`arr_new` — TY_ARR): 16-byte shadow header holds length and capacity. Use `arr_push`/`arr_pop`/`arr_len`. Pointer returned points at element 0; header lives at `ptr - 16`. Free with `arr_free`.
+
+```
+auto a: array;
+a = arr_new();
+a = arr_push(a, 42);     // always reassign — may realloc
+a = arr_push(a, 99);
+if (arr_len(a) != 2) { ... }
+arr_get(a, 0);            // → 42
+a = arr_free(a);          // returns 0
+```
+
+**Raw buffers** (`buf_word`/`buf_byte` — TY_PTR): no header. Size is known at allocation. Access via `buf[i]` (word) or `poke`/`peek` (byte). Free with `free(buf)` directly, not `arr_free`.
+
+```
+auto w;
+w = buf_word(256);    // 256 × 8 bytes, no header
+w[0] = 42;            // word-indexed
+free(w);
+
+auto b;
+b = buf_byte(1024);   // 1024 bytes, no header
+poke(b + i, val);     // byte-indexed
+free(b);
+```
+
+**Which to use:**
+- Size unknown at allocation, grows dynamically → `arr_new`
+- Size known at allocation (Huffman tables, pixel buffers, audio PCM, vertex buffers, game entity pools) → `buf_word` or `buf_byte`
+- In practice: compiler internals use `arr_new`; every stb module and game uses `buf_word`/`buf_byte`
 
 ---
 
@@ -934,15 +967,105 @@ free(copy);
 
 *Depends on: Cap 7*
 *Source: legacy_docs/the_b++_programming_language.md §5*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+Two hash table families: word→word and string→word.
+
+**Word hash** — integer keys mapped to word values:
+
+```c
+auto h;
+h = hash_new(64);          // initial capacity (grows automatically)
+hash_set(h, key, value);
+hash_get(h, key);          // → value, or 0 if absent
+hash_has(h, key);          // → 1 or 0
+hash_del(h, key);
+hash_clear(h);
+hash_free(h);
+```
+
+**String hash** — byte-string keys (pointer + length) mapped to word values:
+
+```c
+auto h;
+h = hash_str_new(64);
+hash_str_set(h, ptr, len, value);
+hash_str_get(h, ptr, len);   // → value, or 0 if absent
+hash_str_clear(h);
+hash_str_free(h);
+```
+
+**Iteration** — walk all live entries:
+
+```c
+auto i, cap, k, v;
+cap = hash_cap(h);
+for (i = 0; i < cap; i = i + 1) {
+    if (hash_slot_live(h, i)) {
+        k = hash_key_at(h, i);
+        v = hash_val_at(h, i);
+    }
+}
+```
+
+The hash table is open-addressing with linear probing. Capacity doubles automatically when the load exceeds 75%. The zero value (key=0 or value=0) is the tombstone — do not use 0 as a meaningful key or value in a word hash. Use 1-based indexing or offset by 1 if you need to store zero.
+
+For `hash_str_*`, the string bytes are hashed by content — two different pointers to the same bytes resolve to the same slot. Keys are NOT copied; the pointer must remain valid for the lifetime of the hash.
 
 ---
 
 ## Cap 9 — Buffers (bpp_buf)
 
 *Depends on: —*
-*Source: legacy_docs/the_b++_programming_language.md §5*
-*Status: PENDING*
+*Source: bpp_buf.bsm current state*
+*Status: COMPLETE — 2026-04-27*
+
+`bpp_buf.bsm` provides raw memory allocation and typed byte-level I/O. All functions operate on TY_PTR buffers — no header, no push/pop semantics.
+
+**Allocation:**
+
+```c
+auto b, w;
+b = buf_byte(1024);    // allocate 1024 bytes, access via poke/peek
+w = buf_word(256);     // allocate 256 × 8-byte words, access via w[i]
+free(b);               // free directly — no arr_free
+free(w);
+```
+
+**Bulk operations:**
+
+```c
+buf_fill(buf, 0, n);          // set n bytes to 0 (memset equivalent)
+buf_copy(dst, src, n);        // copy n bytes src→dst (memcpy, no overlap)
+```
+
+**Typed little-endian reads (binary file parsing, network, audio):**
+
+```c
+read_u8(buf, off)    // 1 byte unsigned
+read_u16(buf, off)   // 2 bytes LE unsigned
+read_u32(buf, off)   // 4 bytes LE unsigned
+read_u64(buf, off)   // 8 bytes LE unsigned
+```
+
+**Typed little-endian writes:**
+
+```c
+write_u8(buf, off, val)
+write_u16(buf, off, val)
+write_u32(buf, off, val)
+write_u64(buf, off, val)
+```
+
+**Big-endian variants (PNG, network byte order):**
+
+```c
+read_u16be(buf, off)   write_u16be(buf, off, val)
+read_u32be(buf, off)   write_u32be(buf, off, val)
+read_u64be(buf, off)   write_u64be(buf, off, val)
+```
+
+For single-byte access at any offset, use the inline builtins `peek(ptr)` / `poke(ptr, val)` directly — they compile to a single load/store instruction with no function call overhead.
 
 ---
 
@@ -965,8 +1088,69 @@ free(copy);
 ## Cap 12 — I/O (bpp_io)
 
 *Depends on: —*
-*Source: legacy_docs/the_b++_programming_language.md §4.1*
-*Status: PENDING*
+*Source: bpp_io.bsm current state*
+*Status: COMPLETE — 2026-04-27*
+
+### Output
+
+`put(x)` is the primary output function. The compiler rewrites it at compile time based on the inferred type of `x` — same philosophy as `auto x = 3.14`:
+
+```c
+put("hello\n")    // TY_PTR   → putstr("hello\n")
+put(42)           // TY_WORD  → putnum(42)
+put(3.14)         // TY_FLOAT → putfloat(3.14) — 4 decimal places
+```
+
+For stderr: `put_err(x)` with the same dispatch.
+
+Full function family:
+
+| Function | Effect |
+|----------|--------|
+| `put(x)` | stdout, type-dispatched |
+| `put_err(x)` | stderr, type-dispatched |
+| `putchar(c)` | one byte to stdout |
+| `putchar_err(c)` | one byte to stderr |
+| `putstr(s)` | null-terminated string to stdout, no newline |
+| `putstr_err(s)` | null-terminated string to stderr, no newline |
+| `putnum(n)` | decimal integer to stdout |
+| `putnum_err(n)` | decimal integer to stderr |
+| `putfloat(f)` | float to stdout, 4 decimal places |
+| `putfloat_err(f)` | float to stderr, 4 decimal places |
+| `putline()` | newline to stdout |
+| `putline_err()` | newline to stderr |
+| `putmsg(s)` | `putstr(s)` + newline to stdout |
+| `puthex_err(n)` | pointer in `0x<hex>` form to stderr (debug) |
+
+`putchar` is the primitive — every other helper builds on it. For debugging pointer values or suspected string corruption, `puthex_err(ptr)` prints the raw address.
+
+### Input
+
+```c
+getchar()       // read one byte from stdin, returns 0-255 or -1 on EOF
+getenv(name)    // look up environment variable by name, returns pointer or 0
+```
+
+### Pattern: composing output
+
+```c
+// Single value — use put
+put(score);
+putchar('\n');
+
+// Multiple values on one line — chain put calls
+put("wave "); put(wave); put(" passed\n");
+
+// Multi-part string for storage/UI — use strbuf_*
+auto b;
+b = strbuf_new();
+strbuf_cat(b, "score: ");
+strbuf_num(b, score);
+// use b directly — it is a valid null-terminated string
+draw_text(b, x, y, 1, WHITE);
+strbuf_free(b);
+b = 0;
+```
 
 ---
 
@@ -988,7 +1172,265 @@ The rules, patterns, and anti-patterns that separate a first program from a ship
 
 *Depends on: —*
 *Source: legacy_docs/how_to_dev_b++.md Part 2*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+Tonify is the name of the production code style. Every `.bsm` and `.bpp` file in `src/`, `stb/`, `games/`, and `tests/` follows the same thirteen rules. "Tonification" means sweeping a file against the checklist and bringing it up to standard. When you write new code, write it tonified from the start.
+
+The philosophy: **simple by default, explicit when needed.** A beginner can write `auto x;` and the compiler figures it out. An expert writes `extrn x: float;` and the compiler verifies it. The same progression runs through every dimension of the language.
+
+### Per-file procedure
+
+1. Read the entire file before touching anything.
+2. Apply each rule below in order (they compose cleanly top to bottom).
+3. Bootstrap: `./bpp src/bpp.bpp -o /tmp/bpp_verify`.
+4. If the bootstrap breaks, revert the last change and investigate before continuing.
+5. Move to the next file.
+
+### Rule 0 — Module discipline (`load` vs `import`, `stub`)
+
+For every import in a game file (`.bpp` or game-local `.bsm`):
+
+| Pattern | Action |
+|---------|--------|
+| Imported file lives in the SAME directory as the entry `.bpp` | Change to `load` |
+| Imported file is from `stb/`, `src/`, or an installed path | Keep `import` |
+
+For every callback function in engine modules (e.g. `stbgame.bsm`):
+
+| Pattern | Action |
+|---------|--------|
+| Function exists to be overridden by the entry `.bpp` | Add `stub`: `stub game_init() { }` |
+| Function is a real implementation | Keep as-is |
+
+Applies to game files (batches 4 and 7 below). Compiler internals always use `import`.
+
+### Rule 1 — Storage classes
+
+For every `auto x;` at file scope:
+
+| Pattern | Change to | Example |
+|---------|-----------|---------|
+| Set once in init, never written again | `extrn x;` | `extrn _ARR_HDR;` |
+| Read/written by worker functions | `global x;` | `global _last_dt;` |
+| Compile-time literal | `const X = value;` | `const CELL = 10;` |
+| Intentionally serial, don't promote | `auto x: serial;` | `auto _temp: serial;` |
+| Mutable per-frame state | `auto x;` (keep) | `auto head_x;` |
+
+### Rule 2 — Visibility (`static`)
+
+For every function and variable — not just `_`-prefixed ones:
+
+| Pattern | Action |
+|---------|--------|
+| Function called only within this file | Add `static` |
+| Function called cross-module | Keep public |
+| Function is public API by design (even if currently uncalled) | Keep public |
+| Variable used only in this file | Add `static` |
+| Variable used cross-module | Keep public |
+
+The `_` prefix is a convention, not the rule. A function named `helper()` that is only called inside its own file is just as private as `_helper()`. Conversely, `_stb_get_time()` is called cross-module despite the prefix — grep decides, not naming.
+
+Check every function via grep: `grep -rn "function_name" src/ stb/ games/ tests/` to verify whether any cross-module caller exists. Do not skip non-`_` names.
+
+### Rule 3 — Return type (`void` + implicit return + bare `return;`)
+
+For every function:
+
+| Pattern | Action |
+|---------|--------|
+| Returns meaningful value (`return x + y;`) | Keep as-is |
+| Only `return 0;` at the end (side-effect function) | Remove `return 0;` + add `void` |
+| `void` function with early-exit `return 0;` in the middle | Change to bare `return;` |
+| Mixed: some paths return value, some don't | Keep explicit returns, no `void` |
+| `return 0;` is the ONLY statement | Remove it (implicit return handles it) |
+
+Bare `return;` (no expression) is supported and produces an implicit `return 0`. Use it in `void` functions for early-exit guards.
+
+### Rule 4 — Phase annotations
+
+For functions where the intent is clear:
+
+| Pattern | Action |
+|---------|--------|
+| Pure function: reads args, computes, returns value. No global writes. | Add `: base` |
+| Side-effect function: writes globals, calls impure functions | `: solo` (optional — inferred) |
+| Audio callback / realtime path: no malloc, no IO, bounded time | Add `: realtime` |
+| Touches files / network / stdout / syscalls | Add `: io` |
+| Touches GPU resources (calls `_stb_gpu_*`) | Add `: gpu` |
+| Unclear / mixed | Leave unannotated (compiler auto-classifies) |
+
+**Only annotate when the intent is OBVIOUS.** Don't guess. The compiler classifies automatically for unannotated functions.
+
+**Do NOT mark `: base` on functions that call builtins** (malloc, free, putchar, sys_*). The classifier treats every builtin as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len). W013 catches mistakes.
+
+Effect annotations form a strict-to-loose ladder:
+
+```
+realtime  (most strict — can only call base or other realtime)
+   ↓
+io / gpu  (sibling categories — can call base or own kind)
+   ↓
+base      (pure, callable by everyone)
+   ↓
+solo      (catch-all — most permissive)
+```
+
+The killer use case: an audio callback annotated `: realtime` is verified by the compiler never to call `malloc`, `putchar`, or anything `: io` / `: gpu` — eliminating an entire class of audible glitches by proof rather than testing.
+
+### Rule 5 — Control flow (`switch`, `for`, `continue`)
+
+For if-chains that test one variable against multiple constants:
+
+| Pattern | Action |
+|---------|--------|
+| 3+ sequential `if (t == X)`  against the same variable | `switch (t) { X { } Y { } else { } }` |
+| 3+ `if (cond1)` `else if (cond2)` with different conditions | `switch { cond1 { } cond2 { } else { } }` |
+| 2-branch `if/else` | Keep `if/else` — switch is overkill |
+
+Two switch forms:
+
+```bpp
+// Value dispatch — tests expr against constants.
+switch (state) {
+    IDLE, PATROL { move(); }
+    ATTACK       { fire(); }
+    else         { }
+}
+
+// Condition dispatch — first truthy arm wins.
+switch {
+    can_attack(e)  { attack(e); }
+    can_see(p)     { chase(p); }
+    else           { idle(); }
+}
+```
+
+W021 fires if no `else` arm (exhaustiveness hint).
+
+Loop cleanup:
+
+| Pattern | Action |
+|---------|--------|
+| `while` with manual counter (`i = 0; while (i < n) { ... i = i + 1; }`) | Convert to `for` |
+| `if (skip) { i = i + 1; } else { ... }` | `if (skip) { continue; } ...` |
+| Deeply nested if/else that could be flattened | Refactor with `continue` |
+
+### Rule 6 — Slice types on struct fields
+
+| Field range | Annotation | Example |
+|-------------|-----------|---------|
+| 0-1 | `: bit` | `alive: bit` |
+| 0-3 | `: bit2` | `tier: bit2` |
+| 0-7 | `: bit3` | `direction: bit3` |
+| 0-15 | `: bit4` | `level: bit4` |
+| 0-31 | `: bit5` | `quality: bit5` |
+| 0-63 | `: bit6` | `slot: bit6` |
+| 0-127 | `: bit7` | `score: bit7` |
+| 0-255 | `: byte` | `on_ground: byte` |
+| 0-65535 | `: quarter` | `w: quarter, h: quarter` |
+| Signed 32-bit | `: half` | `gravity: half` |
+| Full 64-bit | (none) | `x, y` |
+| 128-bit SIMD (4× float32) | `: double` | `velocity: double` |
+
+Bit-sliced fields pack LSB-first into the current byte. When a bit field would overflow the current byte, a new byte starts. Non-bit fields terminate bit-packing (remaining bits in the last byte are padding).
+
+### Rule 7 — Comments
+
+| Pattern | Action |
+|---------|--------|
+| Comment says `return 0` after removal | Delete the comment too |
+| Comment mentions a renamed module (stbarena, stbio) | Update to new name (bpp_arena, bpp_io) |
+| Comment is accurate | Keep |
+
+### Rule 8 — Typed struct access for sliced types
+
+Raw offset access `*(ptr + N)` does NOT respect sliced struct layouts. B++ packs sliced fields without alignment padding, so the offset you would guess from declaration order is wrong. Use typed access:
+
+| Pattern | Action |
+|---------|--------|
+| `*(node + 8)` with hardcoded offset on sliced Node | `auto n: Node; n = node; n.a` |
+| `auto p;` where p points to a struct | Annotate: `auto p: StructName;` |
+| Stale offset constants from pre-slicing era | Delete if unused |
+
+Why: raw `*(ptr + N)` emits a blind 8-byte load at `ptr + N`. Typed access calls `get_field_offset` at codegen time to compute the real packed offset. Example: in Node, `.a` lives at byte offset 1 (not 8) because `ntype: byte` consumes 1 byte with no padding after. Code that hardcodes `*(node + 8)` reads bytes straddling `.a` and `.b` — garbage.
+
+**Escape hatch.** Manual records (`RECORD_SZ`, token slots, function records) are unsliced by design and use named offset constants like `FN_NAME = 8`. Those are word-aligned layouts independent of the sliced-struct system. Rule 8 applies only to sliced structs.
+
+### Rule 9 — Local struct allocation (`var` vs `auto x: T`)
+
+Two ways to declare a struct-typed local look similar but allocate different things. Picking the wrong one is silent — the program compiles and then segfaults at the first field write.
+
+| Pattern | Allocates | Use when |
+|---------|-----------|----------|
+| `var x: T;` | `sizeof(T)` bytes on the stack, in place. `x` IS the struct. | Short-lived struct used only inside the function. No pointer to `x` escapes. |
+| `auto x: T; x = malloc(sizeof(T));` | 1 word slot, then heap allocation. `x` holds the pointer. | Struct outlives the function, is returned, or stored elsewhere. |
+| `auto x: T;` alone | 1 word slot, **uninitialized (== 0)**. `x` is null. | Only when `x` will be assigned a real pointer before any field access. |
+
+**The pitfall.** `auto x: T; x.field = v;` looks like a stack-struct declaration but is silently broken — `x` is null until you assign a pointer to it, so the field write goes to address 0 and SIGBUSes. The compiler does not warn because the type hint is legal; only the missing initialization is the bug.
+
+Rule of thumb: if the struct lives entirely within the function and you do not need a pointer to it elsewhere, use `var`. If it crosses function boundaries, use `auto x: T;` plus `malloc`.
+
+### Rule 10 — Portable builtins (cross-platform first)
+
+When adding functionality user programs will call from any platform (macOS, Linux, C transpilation), expose it as a B++ builtin. Don't push platform conditionals onto user code. Users should never write `if (platform == macos) { } else { }`.
+
+The pattern (worked examples: `malloc`, `malloc_aligned`, `memcpy`, `putchar`, `getchar`):
+
+| Layer | File | Purpose |
+|-------|------|---------|
+| Public API | `src/bpp_<area>.bsm` | Declares the function; imports the per-OS implementation. |
+| OS implementation | `src/backend/os/<os>/_<area>_<os>.bsm` | Uses `sys_*` syscalls and OS-specific constants. One file per OS. |
+| C transpiler mapping | `src/backend/c/bpp_emitter.bsm` | Maps the call to a libc equivalent so `bpp --c` produces working C. |
+
+**Decision rule.** If a user program would need to write `if (platform == macos) { ... } else { ... }` to do this on multiple platforms, the thing is a missing builtin. Add it.
+
+**Don't expose as user-facing API:** `sys_mmap`, `sys_open`, `sys_lseek`, `MAP_PRIVATE`, file mode bits, anything in `src/backend/os/<os>/` directly. These exist so the builtins above can use them.
+
+### Rule 11 — Ternary and short-circuit
+
+Use ternary for value-selecting `if/else`:
+
+| Before | After |
+|--------|-------|
+| `if (cond) { x = a; } else { x = b; }` | `x = cond ? a : b;` |
+| `auto val; if (hp < 20) { val = 99; } else { val = 0; }` | `auto val = hp < 20 ? 99 : 0;` |
+
+Use `&&` / `||` for null guards and combined conditions. B++ short-circuits: the right operand only runs if the left is truthy, so `if (ptr != 0 && ptr.field > 0)` is memory-safe — the dereference never executes on a null pointer.
+
+| Before | After |
+|--------|-------|
+| `if (p != 0) { if (p.field > 0) { ... } }` | `if (p != 0 && p.field > 0) { ... }` |
+| `if (a) { if (b) { if (c) { ... } } }` | `if (a && b && c) { ... }` |
+
+**When not to use.** Multi-statement else branches → keep `if/else`. Ternary nesting beyond two levels → use explicit control flow. Right operand of `&&` with observable side effects you want unconditionally → split.
+
+Both forms desugar to `T_TERNARY` in the AST. Adding the idiom costs zero runtime overhead.
+
+### Rule 12 — Float bits need `: float`
+
+Storing a float value into a bare `auto` local converts it to int via FCVTZS — the IEEE 754 bit pattern is gone. E232 and E233 catch this at compile time. Practical rule: when a local needs to hold a float, annotate it.
+
+| Pattern | Action |
+|---------|--------|
+| `auto sr; sr = 44100.0;` | `auto sr: float;` |
+| `auto pi; pi = 3.14159;` | `auto pi: float;` |
+| `auto x; x = some_float_func();` | Annotate `x: float` |
+| Truncation IS the intent | Drop the decimal: `auto x; x = 3;` |
+
+The explicit conversion path (`FCVTZS` on ARM64, `CVTTSD2SI` on x86_64) fires for int-annotated destinations (`: word`, `: byte`, `: half`, `: quarter`). `: int` synonym was removed in 0.23.x — `: word` is the canonical name.
+
+### Rule 13 — Public API parameters use explicit hints
+
+Functions declared without `static` form the module's public API. Parameters that expect non-word types (float, byte, struct pointer, small enum) should carry an explicit hint.
+
+| Pattern | Action |
+|---------|--------|
+| `audio_play(rate, buf, len)` where `rate` is float | `audio_play(rate: float, buf, len: word)` |
+| `static helper(tmp)` where `tmp` is internal | Keep as-is — `static` is implementation detail |
+| `pos_set(x, y)` where both are word | Keep as-is — word is the default |
+| `set_color(r, g, b, a)` where all are float | `set_color(r: float, g: float, b: float, a: float)` |
+
+W025 nudges when a non-`static` function uses an un-hinted parameter in float arithmetic — the exact shape where a caller cannot tell from the signature whether the param wants an int or a float.
 
 ---
 
@@ -1061,7 +1503,7 @@ Document each legitimate divergence with a comment in both modules saying "see t
 
 ### The canonical example of legitimate divergence: three string shapes
 
-B++ carries three string representations (Cap 6 §6.0): static C-strings (`bpp_str.str_*`), dynamic builders (`bpp_str.sb_*`), and packed refs (`bpp_internal.buf_eq` / `packed_eq`). These are **not** a discipline failure — they are three genuinely different data shapes for three genuinely different jobs:
+B++ carries three string representations (Cap 6 §6.0): static C-strings (`bpp_str.str_*`), dynamic builders (`bpp_str.strbuf_*`), and packed refs (`bpp_internal.buf_eq` / `packed_eq`). These are **not** a discipline failure — they are three genuinely different data shapes for three genuinely different jobs:
 
 - Static C-strings serve user programs that handle strings they already own (argv, file content, config).
 - Dynamic builders serve programs that build strings from pieces without knowing final size.
@@ -1087,7 +1529,84 @@ When in doubt:
 
 *Depends on: Cap 14, Cap 15*
 *Source: legacy_docs/how_to_dev_b++.md Part 4*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+### stb module conventions
+
+- File name: `stb<name>.bsm`. `.bsm` marks "B-Single-Module".
+- Function prefix: every public function starts with the module's name. `path_new`, `hash_set`, `tile_collides`. Private helpers start with underscore: `_path_heap_swap`.
+- Header comment: a paragraph describing what the module does, the intended use, and a code snippet showing the canonical pattern. Plan 9 / Bell Labs man pages, not marketing.
+- Init function: `init_<name>()` that performs any one-time setup. Even if the body is `return 0;`, define it for symmetry.
+- All comments in English, full sentences, user-manual style.
+
+### Leaf vs coupled
+
+A leaf module has zero `import` statements pointing at other stb files. It only depends on compiler builtins and auto-injected core modules. Leaf modules are testable in isolation.
+
+Examples of leaf modules today: `stbcol`, `stbcolor`, `stbecs`, `stbinput`, `stbpath`, `stbpool`, `stbscene`, `stbsound`.
+
+Couple a module only when the **purpose** demands it. `stbphys` imports `stbtile` because "platformer physics for tilemaps" is its purpose. `stbtile` imports `stbimage` because loading a tileset PNG needs a decoder. Those couplings are honest.
+
+`stbpath` could have imported `stbtile` for a `path_load_from_tilemap` helper, but A* on a grid is not inherently a tilemap operation — it works on puzzles, AI planners, network topology, anything with cells. The bridge to a tilemap lives in the calling game as a 5-line loop, documented in `stbpath`'s header. The result: `stbpath` is a leaf, the compiler's own test suite can import it without GPU init.
+
+**Acoplamento por propósito, não por conveniência.**
+
+### Public structs and memory ownership
+
+If the module exposes a struct, define it at the top of the file with `struct Name { field1, field2, field3 }`. Document each field on its own line. Callers create instances via `name_new(...)` returning a pointer. Field access uses dot notation; the compiler emits the right load/store size from the type hint.
+
+State the memory contract in the header:
+
+- "Returns a pointer the caller must free with `name_free`."
+- "Copies the input bytes — the caller's buffer can be reused immediately."
+- "Returns a pointer into a per-call scratch buffer; do not free."
+
+Anything ending in `_new` returns owned memory and pairs with `_free`.
+
+### Adding a new compiler module
+
+1. Create `src/bpp_mymodule.bsm`.
+2. Add explicit imports at the top for everything it uses:
+   ```
+   import "bpp_defs.bsm";
+   import "bpp_array.bsm";
+   import "bpp_internal.bsm";  // if you use buf_eq, packed_eq, etc.
+   ```
+3. Add `import "bpp_mymodule.bsm";` to `src/bpp.bpp`.
+4. Add `init_mymodule();` to the init block in `main()`.
+5. Wire the module's entry point into the pipeline.
+6. Run the full bootstrap cycle.
+7. Add a test in `tests/` if the module has behavior worth locking in.
+
+### Available infrastructure
+
+Before inventing a data structure, check whether one already exists:
+
+| Need | Module | Functions |
+|------|--------|-----------|
+| Dynamic array | `bpp_array` | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_clear`, `arr_free` |
+| Hash map word→word | `bpp_hash` | `hash_new`, `hash_set`, `hash_get`, `hash_has`, `hash_del`, `hash_clear`, `hash_count`, `hash_free` |
+| Hash map bytes→word | `bpp_hash` | `hash_str_new`, `hash_str_set`, `hash_str_get`, ... |
+| Bump allocator (frame scope) | `bpp_arena` | `arena_new`, `arena_alloc`, `arena_reset`, `arena_free` |
+| Fixed-size object pool | `stbpool` | `pool_new`, `pool_get`, `pool_put`, `pool_free` |
+| Entity-component system | `stbecs` | `ecs_new`, `ecs_spawn`, `ecs_kill`, ... |
+| Growable string builder | `bpp_str` | `strbuf_new`, `strbuf_cat`, `strbuf_num`, `strbuf_ch`, `strbuf_free` |
+| Raw byte buffer | `bpp_buf` | `read_u8/u16/u32/u64`, `write_u8/u16/u32/u64` |
+| File I/O | `bpp_file` | `file_read_all`, `file_write_all` |
+
+The compiler itself uses several directly: `arr_*` for function/extern/global tables, `hash_str_*` for symbol-lookup hashes, `buf_eq` from `bpp_internal.bsm` for byte comparison.
+
+### Symbol-table lookup strategies
+
+When adding a new lookup site, pick one of three strategies depending on the access pattern:
+
+**Eager rebuild.** Caller invokes `_rebuild_hash()` at the start of every phase that does lookups. Rebuild is O(n) once per phase. Lookups are pure O(1). Use when lookups are concentrated inside named phases with clear entry points. Failure mode: caller forgets to rebuild; lookups return wrong results silently. Example: `val_find_func` in `bpp_validate`.
+
+**Lazy rebuild on stale.** The lookup function carries a `_hash_cnt` snapshot. Every lookup checks `if (_hash_cnt != arr_cnt) rebuild();` before querying. Use when the lookup function is the only entry point that matters and the array is mostly stable. Worst case O(n²) if inserts and lookups alternate. Example: `find_extern` in the C emitter (cold path).
+
+**Incremental update at insertion sites.** Wherever the underlying array is pushed to, immediately call `register_in_hash(name, idx)`. Use when insertion sites are few and well-known. Failure mode: **silent and dangerous** — if you miss an insertion site, missing entries are invisible to lookups. Example: `find_struct` (parser and bo loader both call `register_struct_hash`).
+
+When unsure, **eager is the safest**. It tolerates missed insertion sites because it rebuilds from the live state every phase. Lazy self-corrects. Only incremental can break silently.
 
 ---
 
@@ -1095,7 +1614,111 @@ When in doubt:
 
 *Depends on: Cap 14, Cap 15*
 *Source: legacy_docs/how_to_dev_b++.md Part 5*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+When tonifying existing code (or adding a rule that affects the whole codebase), process files in dependency order — leaves first, complex last. A broken leaf cascades; a broken root breaks in isolation and is easier to revert.
+
+```
+Batch 1 — Core utilities (leaf, no deps):
+  src/bpp_io.bsm
+  src/bpp_array.bsm
+  src/bpp_buf.bsm
+  src/bpp_str.bsm
+  src/bpp_math.bsm
+  src/bpp_file.bsm
+  src/bpp_hash.bsm
+  src/bpp_arena.bsm
+
+Batch 2 — Runtime modules:
+  src/bpp_beat.bsm
+  src/bpp_job.bsm
+  src/bpp_maestro.bsm
+  src/bpp_mem.bsm
+
+Batch 3 — Platform layers:
+  src/backend/os/macos/_stb_core_macos.bsm
+  src/backend/os/macos/_stb_platform_macos.bsm
+  src/backend/os/macos/_stb_audio_macos.bsm
+  src/backend/os/linux/_stb_core_linux.bsm
+  src/backend/os/linux/_stb_platform_linux.bsm
+
+Batch 4 — Game cartridges (stb/):
+  stb/stbgame.bsm
+  stb/stbrender.bsm
+  stb/stbecs.bsm
+  stb/stbphys.bsm
+  stb/stbtile.bsm
+  stb/stbsprite.bsm
+  stb/stbfont.bsm
+  stb/stbimage.bsm
+  stb/stbinput.bsm
+  stb/stbcolor.bsm
+  stb/stbdraw.bsm
+  stb/stbpath.bsm
+  stb/stbcol.bsm
+  stb/stbpool.bsm
+  stb/stbui.bsm
+  stb/stbaudio.bsm
+  stb/stbmixer.bsm
+  stb/stbsound.bsm
+  stb/stbasset.bsm
+  stb/stbscene.bsm
+
+Batch 5 — Compiler internals:
+  src/bpp_defs.bsm
+  src/bpp_internal.bsm
+  src/bpp_diag.bsm
+  src/bpp_lexer.bsm
+  src/bpp_parser.bsm
+  src/bpp_types.bsm
+  src/bpp_dispatch.bsm
+  src/bpp_validate.bsm
+  src/bpp_import.bsm
+  src/bpp_bo.bsm
+  src/bpp_bug.bsm
+
+Batch 6 — Codegens:
+  src/backend/chip/aarch64/a64_enc.bsm
+  src/backend/chip/aarch64/a64_codegen.bsm
+  src/backend/target/aarch64_macos/a64_macho.bsm
+  src/backend/chip/x86_64/x64_enc.bsm
+  src/backend/chip/x86_64/x64_codegen.bsm
+  src/backend/target/x86_64_linux/x64_elf.bsm
+  src/backend/c/bpp_emitter.bsm
+
+Batch 7 — Entry points + games:
+  src/bpp.bpp
+  src/bug.bpp
+  games/snake/snake_maestro.bpp
+  games/snake/snake_particles.bsm
+  games/snake/snake_gpu.bpp
+  games/pathfind/pathfind.bpp
+  games/platformer/platformer.bpp
+  tools/mini_synth/mini_synth.bpp
+```
+
+### Recheck after each batch
+
+Before bootstrapping, verify:
+
+- Zero bare `auto` at file scope (should be `extrn`/`global`/`const`/`static auto`).
+- Zero functions used only in their own file without `static` (grep every function, not just `_`-prefixed).
+- Zero trailing `return 0;` in `void` functions.
+- Zero side-effect functions missing `void`.
+- Zero `import` in game files where `load` applies (batch 4 + 7 only).
+- Zero override callbacks in engine modules without `stub` (batch 4 only).
+- All relevant tests pass individually.
+- Zero unexpected warnings during compilation.
+
+### Bootstrap after each batch
+
+```bash
+./bpp src/bpp.bpp -o /tmp/bpp_verify
+/tmp/bpp_verify src/bpp.bpp -o /tmp/bpp_verify2
+shasum /tmp/bpp_verify /tmp/bpp_verify2   # must match
+cp /tmp/bpp_verify2 ./bpp
+./tests/run_all.sh                         # must be green
+```
 
 ---
 
@@ -1109,15 +1732,178 @@ Bootstrap, canary, testing. The mechanics of changing B++ itself.
 
 *Depends on: —*
 *Source: legacy_docs/how_to_dev_b++.md Part 1*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+### The Golden Rule
+
+**Never overwrite `./bpp` with an untested binary.** The repo binary is the only tool that can build the compiler. If it gets corrupted, you must recover it from git:
+
+```bash
+git show HEAD:bpp > ./bpp && chmod +x ./bpp
+```
+
+### What earns a bootstrap / full suite?
+
+Token-cost awareness: don't bootstrap + run all tests after every touch. Rebuild only what you actually affected.
+
+| What you changed | Minimum verification |
+|------------------|----------------------|
+| A game file (`games/<game>/*.bpp` or `.bsm`) | Compile just that game: `./bpp games/<game>/<game>.bpp -o /tmp/out` |
+| A tool (`tools/<tool>/*.bpp` / `.bsm`)       | Compile just that tool |
+| An `stb/*.bsm` module                         | Full suite (`./tests/run_all.sh`) — tests import stb |
+| A `src/bpp_*.bsm` runtime module              | Full suite — every program auto-imports them |
+| The compiler (`src/bpp.bpp`, parser, lexer, codegen, validate, dispatch, import, types, bug, bo, internal, defs) | Full **bootstrap cycle** + full suite |
+| Platform layer (`src/backend/os/<os>/*`)      | Compile at least one game that uses it (stbgame) |
+| Chip / target backend (`src/backend/chip/...`, `target/...`) | Bootstrap + full suite (the compiler itself re-emits through them) |
+| Docs (`docs/*.md`, `README.md`)               | Nothing to verify — read-only |
+
+The most common mistake is running `./bpp src/bpp.bpp -o /tmp/bpp_bt` + `./tests/run_all.sh` after touching a game. That's a 2-second rebuild of the entire compiler + 70 tests just to verify the game compiles. Compile the game alone instead.
+
+### Bootstrap cycle
+
+Every change to the compiler source runs through this:
+
+```bash
+# 1. Build gen1 with the current repo compiler.
+./bpp src/bpp.bpp -o /tmp/bpp_gen1
+
+# 2. Use gen1 to recompile the source.
+/tmp/bpp_gen1 src/bpp.bpp -o /tmp/bpp_gen2
+
+# 3. Verify the two binaries are byte-identical.
+shasum /tmp/bpp_gen1 /tmp/bpp_gen2
+# or: diff <(xxd /tmp/bpp_gen1) <(xxd /tmp/bpp_gen2)
+
+# 4. Run the suite against the new compiler.
+cp /tmp/bpp_gen2 ./bpp
+./tests/run_all.sh
+
+# 5. Install globally if you want other projects to see the change.
+sh install.sh --skip
+```
+
+If `./tests/run_all.sh` shows regressions, `./bpp` is still the old one — you have not installed gen2 yet. Revert your source change, recover the repo binary from git if needed, and investigate.
+
+### When gen1 differs from gen2
+
+Changing how the compiler emits code for a feature the compiler itself uses (register allocation, calling convention, etc.) produces a one-cycle oscillation: gen1 has old codegen + new source, so it emits the *old* pattern; gen1 recompiling itself produces gen2 with the *new* pattern; gen2 and gen3 then match because both were compiled by a new-pattern compiler.
+
+```bash
+# If gen1 != gen2, check convergence with gen3.
+/tmp/bpp_gen2 src/bpp.bpp -o /tmp/bpp_gen3
+shasum /tmp/bpp_gen2 /tmp/bpp_gen3
+# gen2 == gen3 means stable (1-cycle oscillation was expected); install gen3.
+```
+
+If **gen2 != gen3**, the compiler output depends on which binary compiled it — that is a real codegen bug, not oscillation. Diagnose with `bug --dump-str` on both binaries to find the divergence, or with `--show-deps` and `--stats` to see the module graph and symbol counts.
+
+The `.bo` cache was removed in 0.23.x, so stale-cache is no longer a suspect. Every compile rebuilds from source in ~0.1 seconds.
+
+### Debugging with `bug`
+
+The native B++ debugger is always available, no flags required. Every compile already writes a `.bug` file alongside the binary:
+
+```bash
+bpp hello.bpp -o hello         # produces ./hello and ./hello.bug
+
+# Dump mode — inspect the debug map.
+bug hello.bug                  # prints functions, structs, globals, externs
+
+# Observe mode — run and trace.
+bug ./hello                    # call tree, crash backtrace, local variables
+bug --break main ./hello       # stop at function entry, print frame, continue
+```
+
+`bug` reads the `.bug` format directly and drives the target through `debugserver` (macOS) or `gdbserver` (Linux) via the GDB remote serial protocol. No DWARF, no LLDB, no codesign dance. See `docs/debug_with_bug.md` for the complete feature list.
+
+**`bug --dump-str` is the fast path for string-corruption bugs.** It shows exactly what bytes the data section contains at each string literal site. When a Mach-O writer bug corrupted `"break"` into nonsense during the Apr 16 session, `--dump-str` located the bad page in under a minute, versus three days of blind archaeology.
+
+### Smoke tests
+
+```bash
+# Quickest possible check the compiler still works.
+echo 'main() { putchar(72); putchar(10); return 0; }' > /tmp/test.bpp
+./bpp /tmp/test.bpp -o /tmp/test_out && /tmp/test_out
+# Should print: H
+
+# Test both pipelines.
+./bpp /tmp/test.bpp -o /tmp/test_mod               # modular (default)
+./bpp --monolithic /tmp/test.bpp -o /tmp/test_mono # monolithic (forced)
+
+# Full test suite.
+./tests/run_all.sh
+```
+
+### Platform gotchas
+
+**Exit 137 (SIGKILL) on macOS.** The kernel's code signature cache kills a binary based on the previous binary at the same path. Always compile to a fresh path (`/tmp/bpp_genN`), never overwrite and re-run in place.
+
+**Exit 138 (SIGBUS) on ARM64.** Usually misaligned memory access. Check for unicode in string literals (not supported), or pointer arithmetic that lands on an unaligned address.
+
+**Exit 139 (SIGSEGV).** Null pointer dereference — often a struct pointer that was never initialized. See Rule 9 in Cap 14 for the `auto x: T` pitfall that causes this silently.
+
+**Raw offset access on sliced structs returns garbage.** `*(node + 8)` does not respect slice packing. Always use typed access: `auto n: Node; n = node_ptr; n.a`. See Rule 8 in Cap 14.
+
+### What to never do
+
+- Do NOT run `codesign` on `./bpp` — it changes bytes and breaks bootstrap reproducibility.
+- Do NOT leave `bpp` processes running in the background.
+- Do NOT create intermediate binaries in the repo (`bpp_new`, `bpp_check`, etc.) — use `/tmp/`.
+- Do NOT test with binaries from `build/` or any stale path.
+- Do NOT write code comments in Portuguese. English, user-manual style.
 
 ---
 
 ## Cap 19 — Canary discipline
 
 *Depends on: Cap 18*
-*Source: legacy_docs/how_to_dev_b++.md Part 5*
-*Status: PENDING*
+*Source: legacy_docs/how_to_dev_b++.md Part 9*
+*Status: COMPLETE — 2026-04-27*
+
+### Recovering from a broken `./bpp`
+
+```bash
+git show HEAD:bpp > ./bpp
+chmod +x ./bpp
+```
+
+This restores the last committed working binary.
+
+### Recovering from bootstrap divergence
+
+If gen1 != gen2 after a source change, follow the decision tree:
+
+1. Run gen3: `/tmp/bpp_gen2 src/bpp.bpp -o /tmp/bpp_gen3`.
+2. If gen2 == gen3, it was a 1-cycle oscillation (normal after codegen changes). Install gen3.
+3. If gen2 != gen3, the codegen output depends on the binary that compiled it — real bug. Diagnose:
+   - `bug --dump-str /tmp/bpp_gen2` and `bug --dump-str /tmp/bpp_gen3` to compare data sections.
+   - `./bpp --show-deps src/bpp.bpp` to see module graph.
+   - `./bpp --stats src/bpp.bpp` to see symbol counts.
+4. Revert the source change. Debug in isolation with a smaller test case.
+
+Historical cause of 2-cycle oscillation: `static` on file-scope variables in auto-injected modules changed the global table between generations. The fix was to be consistent about storage class on auto-injected modules — sparse inconsistencies in batch 1 vs batch 2 produced compilations that differed between the old and new compiler.
+
+### Recovering from a failing test suite
+
+If `./tests/run_all.sh` shows failures that were not there before your change:
+
+1. Check `shasum ./bpp /tmp/bpp_gen2` — are you still running the old binary? Copy gen2 into `./bpp`.
+2. Run the failing test in isolation: `./bpp tests/test_<name>.bpp -o /tmp/t && /tmp/t`.
+3. If it compiles but fails at runtime, use `bug`: `bug /tmp/t`.
+4. If it fails to compile, check whether the test depends on a builtin or module that your change affected.
+
+### The panic button
+
+When nothing else works:
+
+```bash
+git stash
+git show HEAD:bpp > ./bpp && chmod +x ./bpp
+./tests/run_all.sh      # confirm the committed state is green
+git stash pop           # bring your changes back
+```
+
+If the committed state is not green, something broke between commits — `git bisect` is the next move.
 
 ---
 
@@ -1125,7 +1911,60 @@ Bootstrap, canary, testing. The mechanics of changing B++ itself.
 
 *Depends on: Cap 18*
 *Source: legacy_docs/how_to_dev_b++.md Part 6*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+Every stb module or compiler pass that gets created or significantly changed should have a `tests/test_<module>.bpp` file. Tests are how you lock in behavior across compiler refactors.
+
+### Test file layout
+
+```bpp
+// test_<module>.bpp — Smoke test for <module>.
+// One-paragraph description of what the test exercises.
+
+import "<module>.bsm";
+
+main() {
+    auto h;
+
+    // ── Section 1: empty state ────
+    h = something_new();
+    if (something_count(h) != 0) { put("FAIL section1: empty\n"); return 1; }
+
+    // ── Section 2: basic operations ────
+    something_set(h, 42);
+    if (something_get(h, 42) != ...) { put("FAIL section2: basic\n"); return 4; }
+
+    something_free(h);
+    put("test_<module>: all PASS\n");
+    putchar('\n');
+    return 0;
+}
+```
+
+### Rules
+
+- **Unique return code per assertion.** `return 1`, `return 2`, ... so a failed run traces to the exact assertion without printing noise.
+- **Print only on failure.** No output on success. The final `"test_<module>: all PASS"` line is the only success output.
+- **Cover the API surface.** Every public function exercised at least once. Edge cases (empty, full, resize, clear) get their own sections.
+- **Run from `tests/`.** The test runner walks `tests/test_*.bpp` and compiles each. Failed compile and non-zero exit both count as failures.
+
+### xfail tests — testing expected compiler errors
+
+A test file may carry `// xfail: EYYY` on its very first line. When `run_all.sh` encounters this marker, it expects the compiler to emit error code `EYYY` instead of producing a working binary. The test **passes** when that error code is emitted and **fails** if the compiler succeeds or emits a different error.
+
+```bpp
+// xfail: E201
+// This test verifies that calling an undefined function is rejected.
+main() {
+    undefined_function();
+}
+```
+
+Use xfail tests to lock in error detection. They prevent regressions where a previously-rejected program accidentally starts compiling.
+
+### Target
+
+100% pass on every commit. If a test breaks, fix the test (API drift) or fix the module (regression). Do not let stale tests accumulate — that is how the suite rotted from 71 tests to 20 broken ones before the 0.21 cleanup.
 
 ---
 
@@ -1138,8 +1977,85 @@ Frontend, spine, battalions, runtime. How `src/` fits together.
 ## Cap 21 — Frontend (parser, lexer)
 
 *Depends on: —*
-*Source: legacy_docs/the_b++_programming_language.md §7*
-*Status: PENDING*
+*Source: legacy_docs/the_b++_programming_language.md §15*
+*Status: COMPLETE — 2026-04-27*
+
+### Pipeline overview
+
+```
+Source text
+  → bpp_import.bsm   — module graph resolution, auto-injection
+  → bpp_lexer.bsm    — tokenization (TK_KW, TK_ID, TK_NUM, TK_STR, TK_OP, TK_PUNCT)
+  → bpp_parser.bsm   — recursive-descent AST builder
+  → bpp_types.bsm    — bottom-up type inference, elem type inference
+  → bpp_dispatch.bsm — effect classification, loop dispatch (SEQ/PAR/GPU/SPLIT)
+  → bpp_validate.bsm — semantic checks, E/W diagnostics
+  → bpp_codegen.bsm  — spine: builtin dispatch, codegen orchestration
+  → chip backend     — instruction encoding (a64_codegen / x64_codegen)
+  → target backend   — binary format (a64_macho / x64_elf)
+```
+
+### Source layout
+
+`src/` contains the compiler proper:
+- `bpp.bpp` — driver: wires all passes together
+- `bpp_import.bsm` — module resolution, auto-injection, dependency graph
+- `bpp_lexer.bsm` — tokenizer; turns source bytes into token stream
+- `bpp_parser.bsm` — recursive-descent parser; builds AST nodes (T_*)
+- `bpp_types.bsm` — type inference; annotates each AST node with `.itype`
+- `bpp_dispatch.bsm` — effect lattice (BASE/SOLO/IO/GPU/REALTIME/HEAP/PANIC), loop classification (DSP_SEQ/PAR/GPU/SPLIT), global promotion
+- `bpp_validate.bsm` — semantic errors (E*) and warnings (W*)
+- `bpp_diag.bsm` — diagnostic formatting with source location
+- `bpp_codegen.bsm` — spine: builtin dispatch, delegates to chip primitives via `cg_prim`
+- `bpp_defs.bsm` — AST constants (T_*, TY_*, TK_*, NODE_SZ, etc.)
+- `bpp_internal.bsm` — compiler-only data utilities (buf_eq, packed_eq, list_begin/push/end)
+- `bpp_bo.bsm` — object file serialization (`.bo` format)
+- `bpp_bug.bsm` — debug map writer (`.bug` format)
+
+### The auto-injection system
+
+`bpp_import.bsm` injects a fixed set of modules into every compilation unit before the user's own imports are processed. The programmer never writes `import "bpp_str.bsm"` or `import "bpp_array.bsm"` — they are already in scope. This is how `put("hello")`, `arr_new()`, `malloc(n)` work without any import line.
+
+Target-suffix fallback: when a module name cannot be resolved, the importer retries with `_<target>` inserted before `.bsm` (e.g. `_stb_platform.bsm` → `_stb_platform_macos.bsm`). This is how `stbgame.bsm` transparently pulls the right platform layer.
+
+### AST node layout
+
+Every AST node is a fixed-size struct (`sizeof(Node)` bytes, currently 35 bytes with sliced fields):
+
+```
+struct Node {
+    ntype: byte,   // T_LIT, T_VAR, T_BINOP, T_ASSIGN, T_CALL, ...
+    a, b, c, d, e, // field meaning depends on ntype (see bpp_defs.bsm)
+    dispatch: byte, // DSP_SEQ/PAR/GPU/SPLIT (loops only)
+    itype: byte,   // inferred type code (TY_WORD, TY_FLOAT, TY_ARR, ...)
+    src_tok        // token position for diagnostics
+}
+```
+
+The full layout table is in `src/bpp_defs.bsm` (the comment at the top). Key fields by node type:
+- `T_LIT` — `.a` = packed string ref (offset+len in vbuf) of the literal text
+- `T_VAR` — `.a` = packed string ref of the variable name
+- `T_BINOP` — `.a` = packed op string, `.b` = left node, `.c` = right node
+- `T_CALL` — `.a` = packed function name, `.b` = args array, `.c` = arg count
+- `T_IF` — `.a` = cond, `.b` = body arr, `.c` = body cnt, `.d` = else arr, `.e` = else cnt
+- `T_WHILE` — `.a` = cond, `.b` = body arr, `.c` = body cnt, `.d` = hint (0-3), `.dispatch` = DSP_*
+
+### Type inference
+
+`bpp_types.bsm` walks the AST bottom-up and writes the inferred type to each node's `.itype` field. The pass runs to fixed-point — callee parameter types propagate across call sites. Key rules:
+- Integer literals → `TY_WORD`; float literals (contain `.`) → `TY_FLOAT`; string literals → `TY_PTR`
+- `arr_new()` → `TY_ARR`; `buf_word()`/`buf_byte()` → `TY_PTR`
+- Assignments propagate type from right-hand side to the left-hand variable
+- `promote(a, b)` — PTR wins, ARR wins over numeric, FLOAT wins INT, wider slice wins
+- Float writes into TY_ARR variables mark `elem_type = TY_FLOAT` → `DSP_GPU` in loops
+- `put(x)` is rewritten to `putstr`/`putnum`/`putfloat` at this pass based on `x.itype`
+
+### Dispatch classification
+
+`bpp_dispatch.bsm` classifies every function and loop:
+- Effect lattice: `BASE < REALTIME < HEAP < {IO, GPU} < SOLO` — propagated across call graphs
+- Loop dispatch: pure loops with strided float arrays → `DSP_GPU`; pure non-float → `DSP_PAR`; impure → `DSP_SEQ`; mixed → `DSP_SPLIT`
+- Global promotion: `auto` file-scope variables are reclassified as `extrn`/`global` based on observed access patterns
 
 ---
 
@@ -1147,7 +2063,7 @@ Frontend, spine, battalions, runtime. How `src/` fits together.
 
 *Depends on: Cap 21*
 *Source: legacy_docs/phase_backend_closeout.md + new architectural content*
-*Status: DRAFT — conceptual body complete, recipe section pending*
+*Status: COMPLETE — 2026-04-27*
 
 ### The spine in one sentence
 
@@ -1225,13 +2141,40 @@ One dispatch table. ~10 chip primitives. Bug fixes, new builtins, and new backen
 
 Every chip backend exposes a struct of function pointers (`ChipPrimitives` in `bpp_codegen.bsm`). The spine calls through the struct; the chip provides the implementations. Adding a new chip = fill in the struct. Removing a chip = delete the file. The spine never changes.
 
+### Recipe: adding a new AST node type to the spine
+
+Every new language construct that reaches codegen follows the same 7-step migration. Gate every step on byte-identity before proceeding.
+
+**Step 1 — Identify the chip-specific emissions.**
+Grep the new node's `T_KIND` handler in `a64_codegen.bsm` and `x64_codegen.bsm`. List every `enc_*` / `x64_enc_*` call — those are the chip-specific atoms. Everything else (tree walking, push/pop, condition evaluation, label plumbing) is portable.
+
+**Step 2 — Design the primitive slots.**
+For each distinct chip-specific atom, name a new `ChipPrimitives` slot. Aim for the minimal surface: one primitive per distinguishable instruction shape, not one per builtin. Add the slots to the `ChipPrimitives` struct in `bpp_codegen.bsm`. Bootstrap. `gen1 == gen2` (pure struct extension, no callers yet).
+
+**Step 3 — Implement the primitives in each chip.**
+Add the functions to `a64_primitives.bsm` and `x64_primitives.bsm`. Wire them into `init_codegen_arm64` / `init_codegen_x86_64`. Bootstrap both. `gen1 == gen2` (still unused). If you changed the x64 backend, also Docker-test.
+
+**Step 4 — Write the portable spine case in `bpp_codegen.bsm`.**
+Add the `if (t == T_KIND) { ... }` block to `cg_emit_node` (or `cg_emit_stmt` / `cg_emit_func` as appropriate). The spine calls `cg_emit_node` recursively for sub-expressions, `cg_prim.*` for the leaf instructions. Do NOT call the old chip function — replace it entirely.
+
+**Step 5 — Delete the chip-local handlers.**
+Remove the `T_KIND` block from `a64_emit_node` and `x64_emit_node`. Bootstrap both chips. Verify `gen1 == gen2` — the emitted bytes must be identical to pre-step-5 since the spine now produces the same sequence the chip used to.
+
+**Step 6 — Write the regression test.**
+Add `tests/test_<node_name>.bpp` that exercises the new construct across its edge cases (zero values, negatives, floats, chained expressions). This test becomes the permanent guard.
+
+**Step 7 — Record in journal + update chapter.**
+Write a one-paragraph journal entry. If this node type has a dedicated section in this book, update its status.
+
+**Abort condition:** if `gen1 != gen2` at any step, roll back to the last good state and use `bug --dump-str` on both binaries to find where the byte stream first diverges. The divergence point is almost always an incorrect push/pop pairing or a float-coercion order mismatch.
+
 ---
 
 ## Cap 23 — Battalions (chip backends)
 
 *Depends on: Cap 22*
 *Source: legacy_docs/max_plan_codegen_split.md + new architectural content (Wave 18 recipe)*
-*Status: DRAFT — body complete through Wave 18 recipe, legacy historical context pending absorption*
+*Status: COMPLETE — 2026-04-27*
 
 ### Battalions in one sentence
 
@@ -1400,13 +2343,113 @@ The whole book describes B++'s architecture. This chapter describes **the piece 
 
 "Make it work, make it right" — this chapter is the "make it right" arc for the most-reviewed and most-touched code in the entire compiler. If B++ ships 1.0 with the dispatch still triplicated, that wart outlives the language. Wave 18 closes it.
 
+### How we got here — the MAX Plan origin story
+
+The spine did not exist on day one. Understanding how it came to be explains why the architecture is shaped the way it is.
+
+**Before the refactor (early 2026):** the compiler had two monolithic codegen files — `a64_codegen.bsm` (3189 lines) and `x64_codegen.bsm` (2308 lines). Each contained a complete copy of every compiler pass: variable tables, B3 register allocation, switch analysis, literal pool management, AST walking, and instruction emission — all interleaved in the same file. `bpp_codegen.bsm` did not exist.
+
+Every bug fix required touching two files. Every new language feature had to be added twice. The only way to add a RISC-V backend was to write a third 2000+ line copy of the same recipe. The builtin dispatch was the worst: 43 near-identical branches replicated across three backends (a64, x64, C emitter).
+
+**The MAX Plan (first design, 2026-04-20):** the audit document classified every function in both chips as [P]ortable, [C]hip-specific, or [M]ixed. Result: 41 functions were structurally identical across chips; 33 were chip-only instruction emitters; 20 were mixed (portable tree-walk spine + chip-specific emission leaves). The plan was to move the 41 [P] functions and the [M] spines to a new `bpp_codegen.bsm`, leaving the chips as thin primitive layers.
+
+The refactor used one invariant throughout: **compiling any user program with the refactored `bpp` must produce byte-identical output to the baseline `bpp`**. Not the compiler binary's own hash (which shifts when globals move between source files), but the user programs' hashes. Any divergence means a semantic change leaked in — roll back immediately.
+
+**Phase 1 — globals (2026-04-20):** ~40 duplicate global arrays (`a64_sbuf`/`x64_sbuf` → `cg_sbuf`, etc.) moved to `bpp_codegen.bsm`. First sub-step: `cg_sw_min/max/total`. Byte-identity confirmed for pathfind, rhythm, bang9.
+
+**Phases 2–3.3 (same session):** portable utility functions extracted in dependency order (string helpers, variable table, function/extern tables, switch analysis, B3 optimizer, startup symbols). `bpp_codegen.bsm` grew from 0 to 598 lines; each chip shrank ~300 lines.
+
+**Phase 3.4 — the ChipPrimitives contract (2026-04-20 through 2026-04-22, 21 waves):** the main lift. Each wave extracted one family of AST node handlers into the spine, replacing chip-local emission with `cg_prim.*` calls. Waves 18-21 closed `cg_emit_func`, `cg_emit_stmt`, and `cg_emit_node`. At the end of Wave 21, the chip walkers (`a64_emit_stmt`, `a64_emit_node`, and their x64 counterparts) were dead code — all dispatch had moved to the spine.
+
+**End state:** `bpp_codegen.bsm` at ~1500 lines owns all portable dispatch. Each chip file is an instruction encoder plus ~60 primitive functions. Adding RISC-V = write one `riscv_primitives.bsm` file and populate the struct. The recipe runs once, not three times.
+
 ---
 
 ## Cap 24 — Runtime primitives (malloc, syscalls)
 
 *Depends on: Cap 13, Cap 23*
-*Source: legacy_docs/the_b++_programming_language.md §7*
-*Status: PENDING*
+*Source: legacy_docs/the_b++_programming_language.md §13*
+*Status: COMPLETE — 2026-04-27*
+
+Every B++ program gets a set of built-in names without importing anything. These are not library functions — they are **inline emissions** that the codegen recognizes by name and handles directly, producing a handful of instructions at the call site instead of a real function call.
+
+### Memory builtins
+
+```c
+peek(p)                // read one byte at address p → integer
+poke(p, v)             // write byte v at address p
+str_peek(p, i)         // read byte i of a string pointer
+malloc(n)              // allocate n bytes, 16-byte aligned → pointer
+malloc_aligned(n, a)   // allocate with explicit alignment
+realloc(p, n)          // resize; may move
+realloc(p, old, new)   // resize with explicit copy of `old` bytes
+free(p)                // release
+memcpy(d, s, n)        // copy n bytes, returns d
+mem_barrier()          // compiler-level memory barrier
+fn_ptr(name)           // load function address by symbol name → pointer
+call(fp, args...)      // indirect call through a function pointer
+```
+
+`peek` and `poke` are the raw memory window — one byte at a time, zero abstraction. They are how B++ programs talk to hardware registers, inspect struct layouts, or read OS structures at known offsets.
+
+`malloc` / `realloc` / `free` map directly to the platform allocator: `malloc_zone_malloc` on macOS, `mmap` + arena on Linux. There is no hidden bookkeeping layer. The effect annotation is `heap`, meaning a function that calls malloc cannot be annotated `: base` (see Cap 5).
+
+`fn_ptr(name)` takes a **string literal** as its argument — evaluated at compile time to a label reference. `call(fp, ...)` is the only way to make an indirect call through a function pointer in B++. The spine handles both: `fn_ptr` emits an `adrp + add` pair (a64) or `lea` (x64); `call` emits `blr x0` / `call rax`.
+
+### I/O builtins
+
+```c
+putchar(c)       // write byte to stdout, no buffering
+putchar_err(c)   // write byte to stderr
+getchar()        // read one byte from stdin; -1 on EOF
+```
+
+These three are the primitives behind `print_msg`, `print_int`, and all other I/O in `bpp_io.bsm`. Each compiles to a single syscall: `sys_write(1, &c, 1)` for `putchar`, `sys_read(0, &c, 1)` for `getchar`. No libc, no buffering at this layer.
+
+### Command-line access
+
+```c
+argc_get()     // number of command-line arguments
+argv_get(i)    // argument i as a null-terminated pointer
+```
+
+On entry, the OS places `argc` and `argv` in registers (x0/x1 on a64, rdi/rsi on x64). The runtime's `_start` stub stores them in `cg_argc_sym` / `cg_argv_sym` frame slots. `argc_get` and `argv_get` emit loads from those slots.
+
+### Raw syscalls
+
+Every platform syscall is available by name. The spine maps each name to its syscall number for the current target:
+
+```
+sys_open    sys_close    sys_read    sys_write
+sys_lseek   sys_mmap     sys_munmap  sys_ioctl
+sys_mkdir   sys_unlink   sys_fchmod  sys_getdents
+sys_fork    sys_execve   sys_wait4   sys_waitpid
+sys_exit    sys_ptrace   sys_socket  sys_connect
+sys_clock_gettime  sys_nanosleep  sys_usleep
+```
+
+Syscall ABI: arguments go in the first N registers (x0-x5 on a64, rdi/rsi/rdx/r10/r8/r9 on x64). Return value in x0/rax. Error: negative return from the kernel; B++ does not map errno. If a syscall has non-standard ABI shapes on some platforms (Wave 18 documented five such cases for `sys_fork`, `sys_execve`, `sys_waitpid`, `sys_lseek`, `sys_getdents`), those remain chip-local dispatch in the backend.
+
+### Float helpers
+
+```c
+float_ret()    // read d0 (a64) / xmm0 (x64) saved after last extern call
+float_ret2()   // read d1 / xmm1
+shr(v, n)      // logical right shift (unsigned, zero-fills) — differs from >> which sign-extends
+assert(cond)   // trap (BRK/INT3) if cond == 0; zero overhead when true
+```
+
+`float_ret()` is needed because extern calls go through the ABI and place float returns in SIMD registers. B++ cannot express a float-returning extern directly (type system limitation in early versions), so the pattern is: call the extern, immediately call `float_ret()` to recover the value. The codegen saves d0/xmm0 after every extern call specifically to enable this.
+
+`shr` is required because B++ `>>` is arithmetic (sign-extending for signed integers). Bit-manipulation code that needs a logical shift uses `shr` explicitly.
+
+### SIMD
+
+`vec_splat4`, `vec_load4`, `vec_store4`, `vec_add4`, `vec_sub4`, `vec_mul4`, `vec_div4`, `vec_min4`, `vec_max4`, `vec_dot4`, `vec_get4` — four-lane SIMD operations backed by NEON on a64 and SSE/AVX on x64. The vec_* family is intentionally outside the spine's portable dispatch (Wave 18 noted: "NEON vs SSE2 don't factor uniformly") and remains chip-local.
+
+### What this chapter does NOT cover
+
+Cap 24 describes the compiler's built-in name table. The `bpp_*` standard library modules (bpp_array, bpp_hash, bpp_str, etc.) are regular B++ code that uses these primitives internally — they are covered in Part II. The platform OS layer (`src/backend/os/`) that implements `malloc` and syscall glue is covered in Cap 23 (Battalions).
 
 ---
 
@@ -1414,7 +2457,81 @@ The whole book describes B++'s architecture. This chapter describes **the piece 
 
 *Depends on: Cap 22, Cap 23, Cap 24*
 *Source: legacy_docs/how_to_dev_b++.md Part 7*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+### Native Linux from macOS
+
+```bash
+# Static ELF, no dependencies.
+bpp --linux64 games/snake/snake_gpu.bpp -o /tmp/snake_linux
+```
+
+If `DISPLAY` is set, the game opens an X11 window. Without it, falls back to ANSI terminal rendering.
+
+### Linux via Docker + XQuartz (for testing on macOS)
+
+One-time setup on macOS:
+
+```bash
+brew install --cask xquartz
+defaults write org.xquartz.X11 nolisten_tcp 0
+killall XQuartz 2>/dev/null
+open -a XQuartz
+xhost +localhost
+```
+
+Then cross-compile and run:
+
+```bash
+bpp --linux64 games/snake/snake_gpu.bpp -o /tmp/snake_linux
+docker run --rm \
+  --add-host host.docker.internal:host-gateway \
+  -e DISPLAY=host.docker.internal:0 \
+  -v /tmp:/tmp \
+  ubuntu:22.04 \
+  /tmp/snake_linux
+```
+
+The window appears on the macOS host via XQuartz. Works for any game using `draw_*` (CPU framebuffer). GPU games (`render_*`) need Vulkan, which is not yet implemented.
+
+### C emitter (universal escape hatch)
+
+The C emitter (`bpp --c`) translates B++ to portable C99 on stdout. It is the fallback for any platform B++ does not have a native backend for. Recommended pattern: use `drv_raylib.bsm` or `drv_sdl.bsm` instead of `stbgame.bsm` so the generated C calls regular C functions and avoids the Objective-C calling-convention pitfalls of `objc_msgSend`.
+
+```bash
+bpp --c examples/snake_raylib.bpp > /tmp/snake_raylib.c
+
+# macOS
+gcc -Wno-implicit-function-declaration -Wno-parentheses-equality \
+    -I/opt/homebrew/include -L/opt/homebrew/lib \
+    /tmp/snake_raylib.c -o /tmp/snake_raylib_c \
+    -lraylib -lobjc
+
+# Linux
+gcc -Wno-implicit-function-declaration -Wno-parentheses-equality \
+    /tmp/snake_raylib.c -o /tmp/snake_raylib_c \
+    -lraylib -lm
+```
+
+The same `.c` compiles on any platform with raylib: macOS, Linux, Windows (MSYS2 / MSVC), BSDs, Emscripten.
+
+**Why not use the C emitter with `stbgame.bsm` directly?** `stbgame.bsm` ultimately calls Cocoa via `objc_msgSend`, which on arm64-darwin requires an exact calling convention per call site. The C emitter dedupes overloaded externs by emitting a single varargs declaration (`void* objc_msgSend(void*, void*, ...)`), which works as a forward declaration but fails at runtime because the varargs ABI passes args on the stack, not in registers. For native Cocoa/Metal use the native backend; for portable C use a raylib or SDL driver.
+
+### Adding a new builtin
+
+A builtin is a function name the compiler recognizes specially and emits machine code for, instead of treating it as a regular function call. `malloc`, `peek`, `sys_write`, `mem_barrier` are all builtins.
+
+Four places to touch:
+
+1. **`src/backend/chip/aarch64/a64_codegen.bsm`** — emit ARM64 machine code. Find the handler block (search for `"sys_write"`) and add your case using the `a64_str_eq(n.a, "name", len)` pattern. For syscalls, import the BSYS_* constant from `_bsys_macos.bsm`.
+
+2. **`src/backend/chip/x86_64/x64_codegen.bsm`** — emit x86_64 machine code. Same structure. Syscall numbers come from `_bsys_linux.bsm`.
+
+3. **`src/bpp_validate.bsm`** — add to `val_is_builtin()` so the validator doesn't reject it as `E201: undefined function`. Always add to all three at the same time.
+
+4. **`src/backend/c/bpp_emitter.bsm`** — if the builtin should work through `bpp --c`, add a handler in the call emission code. Map to the libc/POSIX equivalent or inline a C expression. Add any new header to `emit_runtime()`. If the builtin is native-only, skip this step but document why in the validator entry.
+
+After all four edits, bootstrap.
 
 ---
 
@@ -1428,7 +2545,98 @@ Bang 9, tools, game scripting, roadmap.
 
 *Depends on: —*
 *Source: legacy_docs/bang9_vision.md*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+Bang 9 is a DAW for game development — an integrated environment built in B++ that hosts creative tools as panels inside a single project window, the same way Ableton Live hosts synthesizer plugins.
+
+### The mental model
+
+```
+Ableton Live (the host)             Bang 9 (the host)
+├─ project + timeline               ├─ project + file tree
+├─ MIDI editor (native)             ├─ code editor (native, acme-style)
+├─ transport: play/stop/record      ├─ transport: build/run/debug
+└─ hosts VST/AU plugins             └─ hosts tools/ as panels
+
+Serum, Kontakt (the plugins)        modulab, mini_synth, level_editor (tools)
+├─ runs STANDALONE (own window)     ├─ runs STANDALONE (own window)
+└─ runs INSIDE the DAW (as plugin)  └─ runs INSIDE Bang 9 (as panel)
+```
+
+This is not decoration — it is the architectural commitment. Every tool in `tools/` must satisfy the dual-mode contract: run standalone, embed cleanly in Bang 9.
+
+### Window layout
+
+```
+┌──────────────────────────────────────────────────────┐
+│ File  Edit  View  Build  Run  Help                   │  ← Menu bar
+├──────────────────────────────────────────────────────┤
+│ [Project] [Sprites] [Music] [Levels] [Code] [Run]    │  ← Tab strip
+├──────────────────────────────────────────────────────┤
+│                                                       │
+│                   ACTIVE PANEL                        │  ← Panel body
+│                                                       │
+├──────────────────────────────────────────────────────┤
+│ project: games/pathfind       Bang 9 v0.3            │  ← Status bar
+└──────────────────────────────────────────────────────┘
+```
+
+| Tab | Role | Source |
+|-----|------|--------|
+| Project | File tree + asset overview | native to Bang 9 |
+| Sprites | Pixel art editing | embeds `tools/modulab/` |
+| Music | Audio synthesis | embeds `tools/mini_synth/` |
+| Levels | Tilemap editing | embeds `tools/level_editor/` |
+| Code | Acme-style text editor | native to Bang 9 |
+| Run | Build output + running game | native to Bang 9 |
+
+### Who Bang 9 is for
+
+**Primary — artists and designers.** The target user never opens a terminal. They download Bang 9 as a single installer, edit sprites in the Sprites panel, compose music in the Music panel, paint levels in Levels, and hit Run. No compiler invocation, no test suite, no dependency graph.
+
+**Secondary — programmers working with artists.** They use `bpp` directly from their own editors (Emacs, VSCode, Vim) and commit to the same repo the artist's Bang 9 writes to. Bang 9 is optional for them — useful for inspecting the visual state of the project.
+
+### Relationship to B++ (open vs. proprietary)
+
+B++ (the compiler, stdlib, tools, debugger, docs) is open source, Apache 2.0. Bang 9 is a proprietary commercial product built on top. This mirrors the audio world: Audio Unit / VST are open standards; Ableton and Logic are proprietary products that implement those standards.
+
+Three non-negotiable guardrails:
+1. **Standalone tools stay viable forever.** An artist who runs `./modulab` directly gets a fully functional sprite editor. Bang 9's value is integration, not exclusivity.
+2. **B++ is not a hostage.** No language feature is introduced solely for Bang 9. All changes go through the public process in `GOVERNANCE.md`.
+3. **Transparency.** Users who download B++ see that Bang 9 exists and is commercial. No dark patterns.
+
+### Build + run
+
+When the user hits **Build** (Ctrl+B), Bang 9 invokes `bpp` as a subprocess, captures stdout/stderr, and renders output in the Run panel. Compiler errors are clickable — they jump to the Code panel at the offending line (using the E/W source location system from Cap 28).
+
+When the user hits **Run** (Ctrl+R), Bang 9 builds if needed, then executes the resulting binary. The game runs in a separate window. **Ctrl+F5** launches under `bug` (the debugger, Cap 49).
+
+### Project layout convention
+
+```
+games/<game_name>/
+├── <game_name>.bpp              ← game entry point
+├── assets/
+│   ├── sprites/
+│   │   ├── hero.modulab.json    ← modulab canonical (editor round-trip)
+│   │   └── hero.json            ← stbsprite format (game loads this)
+│   ├── levels/
+│   │   └── level1.level.json    ← level_editor format
+│   └── sounds/
+│       └── coin.synth.json
+└── build/
+    └── <game_name>              ← binary output
+```
+
+Bang 9 reads and writes this layout; games read it at runtime through the stb modules. The same files power both.
+
+### The 1.0 milestone
+
+Bang 9's first major milestone is a **complete, shippable game produced entirely within the ecosystem** — the `games/pathfind/` project, with intro scene, 3 levels authored in level_editor, background music from mini_synth, and sprites polished in modulab. Every step of production inside Bang 9, zero external tools.
+
+### What this chapter does NOT cover
+
+The embed protocol (how tools expose their three-function API so Bang 9 can host them) is Cap 27. The diagnostic display system that powers clickable compiler errors is Cap 28.
 
 ---
 
@@ -1436,15 +2644,212 @@ Bang 9, tools, game scripting, roadmap.
 
 *Depends on: Cap 26*
 *Source: legacy_docs/bang9_tool_embed.md + legacy_docs/bang9_factory.md + legacy_docs/bang9_live_preview.md*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
+
+Every tool in `tools/` satisfies a three-function contract that lets it run both standalone (its own window) and embedded inside Bang 9 (as a panel drawing into a sub-rect).
+
+### The three-function contract
+
+```c
+// One-time setup. Called once when the panel is mounted.
+void <tool>_lib_init(initial_arg, canvas_n);
+
+// One frame. Called by the host every frame after game_frame_begin().
+// px/py/pw/ph is the panel rect in window-absolute coordinates.
+// Returns 1 if the tool requested quit (e.g. ESC), 0 otherwise.
+<tool>_lib_frame(px, py, pw, ph);
+
+// Cleanup. Called when the panel is unmounted or Bang 9 exits.
+void <tool>_lib_shutdown();
+```
+
+Standalone wrappers call the same three functions from their own `game_init` / game loop, passing `(0, 0, SCREEN_W, SCREEN_H)` as the rect.
+
+### Layout adaptation
+
+Every tool has hardcoded layout coordinates that assume `origin = (0, 0)`. The embed refactor adds four panel-rect globals to the `_lib.bsm` file:
+
+```c
+static extrn _ml_ox, _ml_oy, _ml_pw, _ml_ph;
+```
+
+`*_lib_frame` sets these from its arguments at frame top. Every hardcoded position in the frame body shifts:
+
+| Before | After |
+|--------|-------|
+| `draw_rect(12, 64, ...)` | `draw_rect(_ml_ox + 12, _ml_oy + 64, ...)` |
+| `SCREEN_W - 96` | `_ml_ox + _ml_pw - 96` |
+| `SCREEN_H - 18` | `_ml_oy + _ml_ph - 18` |
+
+Mouse coordinates **do not need translation** — `mouse_x()` / `mouse_y()` return window-absolute values, and after the shift the tool's internal comparison coordinates are also window-absolute.
+
+### Panel size guard
+
+Each panel function checks whether the host rect is large enough for the tool's layout. If not, it renders a placeholder:
+
+```c
+static void _panel_sprites(x, y, w, h) {
+    if (w < 800 || h < 600) {
+        _placeholder(x, y, w, h, "Sprites (ModuLab)",
+                     "Resize Bang 9 to at least 1024×768");
+        return;
+    }
+    if (_sprites_initialized == 0) {
+        modulab_lib_init(_find_first_sprite_in_project(), 16);
+        _sprites_initialized = 1;
+    }
+    modulab_lib_frame(x, y, w, h);
+}
+```
+
+### Lazy init + lazy audio
+
+Each tool tracks its own `_initialized` flag. The host calls `*_lib_init` on first panel activation, not at Bang 9 startup. This keeps Bang 9's cold-start fast even when multiple heavy tools are registered.
+
+For mini_synth (the audio tool): `stbaudio` streams open on first activation of the Music tab. The tool exposes `mini_synth_lib_pause()` / `mini_synth_lib_resume()` so the host can mute it when switching to another tab.
+
+### Bang 9 import chain
+
+After all three tools are embedded, `bang9.bpp` imports:
+
+```c
+import "../tools/modulab/modulab_lib.bsm";
+import "../tools/level_editor/level_editor_lib.bsm";
+import "../tools/mini_synth/mini_synth_lib.bsm";
+```
+
+Each tool's global state lives in its own `.bsm` file — no shared namespace. Collision check: `grep -h '^auto\|^extrn' tools/{modulab,level_editor,mini_synth}/*.bsm | sort | uniq -d` should return nothing.
+
+### The project convention (game factory)
+
+Bang 9 is also a **game factory** — it enforces a consistent project layout so that tools, the IDE, and the game runtime all refer to the same files:
+
+- Sprites: `assets/sprites/<name>.json` — modulab writes this on Save via `mlab_save_both` (writes both `.modulab.json` for round-tripping and `.json` for the game).
+- Levels: `assets/levels/<name>.level.json` — level_editor format, read at runtime via `json_parse`.
+- Sounds: `assets/sounds/<name>.synth.json` — mini_synth output (future).
+
+The game code loads these paths at runtime through the stb modules, never hardcodes asset data. This is what makes the edit-compile-run loop work inside Bang 9 without the game having any knowledge of the IDE.
+
+### Phase 4 — live preview (design, not yet shipped)
+
+The final UX piece is seeing the game running **inside** Bang 9 while editing — edit a sprite, tab to preview, see it move. The design: Bang 9 embeds the game as a subprocess, the game renders to a shared memory region, Bang 9 blits that region into the Run panel every frame. Edits to asset files trigger an incremental reload (the asset is already a file; the game's next `load_sprite` call picks it up). Design doc at `legacy_docs/bang9_live_preview.md`; implementation gated on Phase 1-3 stability.
+
+### What this chapter does NOT cover
+
+The `bug` debugger's embed in a future Debug tab is a separate design. This chapter covers the three creative tools only.
 
 ---
 
-## Cap 28 — Roadmap and Current Status
+## Cap 28 — Diagnostics (warnings + errors)
 
 *Depends on: —*
-*Source: legacy_docs/roadmap_to_1_0.md*
-*Status: PENDING*
+*Source: docs/warning_error_log.md*
+*Status: COMPLETE — 2026-04-27*
+
+The compiler emits two kinds of diagnostics: **errors** (fatal — compilation stops) and **warnings** (non-fatal — compilation continues with a caution). All codes are numeric: `EXXX` for errors, `WXXX` for warnings. The canonical reference lives at `docs/warning_error_log.md`; this chapter explains the system design and the most important codes.
+
+### How diagnostics are emitted
+
+Every diagnostic goes through `bpp_diag.bsm`, which formats the message with source location: file path, line number, the source line itself, and a caret under the offending token. The rule is: **every new error or warning must show source location**. No naked message strings.
+
+```
+src/game.bpp:42:15: E232 — silent float→int at assignment
+    auto x;
+    x = 3.14;
+              ^
+  Hint: annotate `: float` or use an integer literal.
+```
+
+Three pre-lexer errors (`E001`, `E002`, `E222`) can only show a filename because the lexer has not yet run; all other diagnostics carry a full `tok_pos`.
+
+The active diagnostic count and location status:
+
+```
+Total diagnostics:  25 active + 2 reserved
+With source location: 19  ✅  (file:line + source + caret)
+With filename only:    3  ⚠️  (import resolver — pre-lexer)
+Reserved:              2  (W017, W014)
+```
+
+### Errors (fatal)
+
+| Code | Trigger | Notes |
+|------|---------|-------|
+| E001 | Module imports itself | Recursive import detected |
+| E002 | File not found in search paths | Import or load path missing |
+| E050 | Struct field type mismatch | Field assigned wrong type |
+| E053 | Invalid type annotation | Bad `: Type` suffix |
+| E101 | Unknown type in annotation | `: UnknownType` |
+| E102 | Invalid start of expression | Parser primary fallthrough |
+| E103 | Keyword used as expression | e.g. `auto` as value |
+| E104 | Unexpected token (generic) | Parser fallthrough |
+| E105 | `main()` defined in `.bsm` | Entry point must be in `.bpp` |
+| E120 | General parse failure | Syntax error with location |
+| E201 | Call to undeclared function | Forward reference missing |
+| E221 | Duplicate function definition | Same name in two modules |
+| E222 | Circular import dependency | Import cycle detected |
+| E230 | `static const` at file scope | Produces silent 0 at runtime |
+| E232 | Silent float→int at assignment | `auto x; x = 3.14;` drops IEEE bits; annotate `: float` |
+| E233 | Float arg passed to int param | Promoted from W002 in 0.23 |
+| E240 | Int passed to float param | Annotate source `: float` or use float literal |
+| E242 | Shift count out of range | Count > 63; hardware masks to 6 bits |
+| E243 | Pointer compared to non-zero literal | `if (ptr == 42)` is almost always a bug |
+| E244 | Float literal in int context | Array index or shift count cannot be a float |
+| E245 | Array element type conflict | Two different inferred elem types for same `TY_ARR` |
+
+### Warnings (non-fatal)
+
+| Code | Trigger | Notes |
+|------|---------|-------|
+| W002 | ~~Implicit float-to-int~~ | **RETIRED** — promoted to E233 in 0.23 |
+| W003 | Wrong argument count | Call with mismatched arg count |
+| W005 | Unreachable code | Code after `return` statement |
+| W010 | Narrowing conversion | Float narrowed to half/quarter |
+| W011 | Precision loss | Word to half float |
+| W012 | `&` in FFI argument | Address-of passed to extern/call |
+| W013 | `: base` mismatch | Function annotated base but impure |
+| W020 | Static cross-module call | Calling `: static` function from another module |
+| W021 | Switch not exhaustive | Value switch without `else` arm |
+| W025 | Public param without hint in float arithmetic | Annotate `: float` or `: word` — see Rule 13 |
+| W026 | Phase annotation violated | Function annotated `: realtime` reaches a HEAP call, etc. |
+
+### W026 — the effect lattice guard
+
+W026 fires when a function's explicit phase annotation is violated by its transitive call graph. The lattice is:
+
+```
+BASE < REALTIME < HEAP < {IO, GPU} < SOLO
+```
+
+A function annotated `: realtime` must not call anything that reaches HEAP (i.e., no malloc). A function annotated `: io` permits HEAP (allocation is ubiquitous in I/O scaffolding) but must not be called from a `: realtime` context.
+
+Unknown externs default to `PHASE_AUTO`, so only **known-to-be-incompatible** paths fire W026. This makes the check gradual: new extern calls are safe by default and opt into classification over time.
+
+### Runtime asset-load diagnostics
+
+These are **not compiler diagnostics** — they are printed by stb loaders at runtime when an asset fails to load. They follow the format `<module>: '<path>': <reason>` so missing or malformed assets are visible immediately.
+
+```
+stbsound: 'assets/sounds/coin.wav': unsupported PCM bit depth 24 (need 8, 16, 24, or 32)
+stbimage: 'assets/sprites/hero.png': not a valid PNG or unsupported chunk layout
+stbfont:  'assets/fonts/ui.ttf': no 'head' table (not a valid TTF)
+```
+
+The loader prints to stderr and returns 0 (null handle). Callers in `stbasset.bsm` propagate the null handle; the stb modules never wrap or re-log.
+
+### Adding a new diagnostic
+
+1. Pick the next available code in `docs/warning_error_log.md`.
+2. Add the emission call in the appropriate pass file (`bpp_parser.bsm`, `bpp_validate.bsm`, or `bpp_dispatch.bsm`).
+3. Use `diag_error(tok_pos, EXXX, message)` or `diag_warn(tok_pos, WXXX, message)` — never bare `print_msg`.
+4. Add an xfail test: `// xfail: EXXX` on line 1 of a new `tests/test_EXXX.bpp`.
+5. Update `docs/warning_error_log.md` with the new row.
+
+The rule is firm: **no new diagnostic ships without a source location and an xfail test**.
+
+### What this chapter does NOT cover
+
+The diagnostic formatting internals (column calculation, caret alignment, ANSI color codes) live in `bpp_diag.bsm` and are not user-facing. The xfail test mechanism is explained in Cap 20 (Testing).
 
 ---
 
@@ -2047,7 +3452,7 @@ a convenience for the common "load then immediately play" pattern:
 ```c
 // Load an SFX.
 if (sound_load_wav("assets/apple_crunch.wav") != 0) {
-    print_msg("failed to load apple_crunch\n");
+    put("failed to load apple_crunch\n");
     return 1;
 }
 auto apple_buf, apple_frames;
@@ -3817,12 +5222,110 @@ lookup per pixel, zero CPU cost.
 ## Appendix A — Compiler Flags Reference
 
 *Source: legacy_docs/how_to_dev_b++.md Part 8*
-*Status: PENDING*
+*Status: COMPLETE — 2026-04-27*
 
-## Appendix B — Recovery
+| Flag | Effect |
+|------|--------|
+| (default) | Native Mach-O ARM64 binary, modular pipeline |
+| `--linux64` | Cross-compile to Linux x86_64 ELF |
+| `--c` | Emit C code to stdout |
+| `--asm` | Emit ARM64 assembly to stdout |
+| `--bug` | Emit `.bug` debug map alongside the binary |
+| `--monolithic` | Force single-pass pipeline (all modules at once) |
+| `--show-deps` | Print module dependency graph and exit |
+| `--show-promotions` | Print `auto → extrn/global` promotions |
+| `--show-phases` | Print per-function phase classification |
+| `--stats` | Print module/function/token counts to stderr |
+| `--clean-cache` | No-op, kept for backward compat with scripts |
+| `-o <name>` | Output filename |
 
-*Source: legacy_docs/how_to_dev_b++.md Part 9*
-*Status: PENDING*
+## Appendix B — xfail test convention
+
+*Status: COMPLETE — 2026-04-27*
+
+Place `// xfail: EYYY` on the **first line** of a test file to declare that the test expects the compiler to emit error code `EYYY` rather than producing a successful binary.
+
+`run_all.sh` treats the test as **passing** when the compiler emits exactly that error code, and **failing** if the compiler succeeds or emits a different error.
+
+```bpp
+// xfail: E201
+// Verifies that calling an undefined function is rejected.
+main() {
+    undefined_function();
+}
+```
+
+Use xfail tests to lock in rejection behavior: they catch regressions where a previously-invalid program starts compiling silently.
+
+---
+
+## Cap 48 — Compiler Flags Reference
+
+*Depends on: Cap 18*
+*Source: legacy_docs/how_to_dev_b++.md Part 8*
+*Status: COMPLETE — 2026-04-27*
+
+All flags are passed to `bpp` on the command line before the source file.
+
+### Output targets
+
+| Flag | Effect |
+|------|--------|
+| *(default)* | Native Mach-O ARM64 binary for the host machine |
+| `--linux64` | Cross-compile to Linux x86_64 static ELF (no libc dependency) |
+| `--c` | Emit C99 source to stdout (use `clang` or `gcc` to compile) |
+| `--asm` | Emit ARM64 assembly to stdout (monolithic pipeline) |
+| `--bug` | Emit `.bug` debug map alongside the binary (required for the `bug` debugger) |
+| `-o <name>` | Output filename; defaults to `a.out` |
+
+### Pipeline control
+
+| Flag | Effect |
+|------|--------|
+| `--monolithic` | Force single-pass pipeline — all modules compiled at once, no caching |
+
+Monolithic mode is used by `--asm` and `--c` automatically. For native builds, modular mode (default) is faster because unchanged modules load from `~/.bpp/cache/`.
+
+### Inspection and debugging
+
+| Flag | Effect |
+|------|--------|
+| `--show-deps` | Print the module dependency graph and exit |
+| `--show-promotions` | Print `auto → extrn/global` promotion decisions |
+| `--show-phases` | Print per-function phase classification (BASE/REALTIME/HEAP/IO/GPU/SOLO) |
+| `--stats` | Print module/function/token counts to stderr |
+
+These flags exit after printing — they do not produce a binary.
+
+### Compatibility
+
+| Flag | Effect |
+|------|--------|
+| `--clean-cache` | No-op; kept for backward compatibility with scripts that used the old cache |
+
+The cache was removed entirely in 2026-04-13. This flag is accepted silently.
+
+### Quick reference for common workflows
+
+```bash
+# Default: native ARM64 binary on macOS
+bpp games/pathfind/pathfind.bpp -o /tmp/pathfind
+
+# Cross-compile for Linux, test in Docker
+bpp --linux64 games/pathfind/pathfind.bpp -o /tmp/pathfind_linux
+
+# Debug build (required for bug debugger)
+bpp --bug games/pathfind/pathfind.bpp -o /tmp/pathfind
+
+# Inspect module graph
+bpp --show-deps src/bpp.bpp
+
+# Inspect phase annotations
+bpp --show-phases src/bpp.bpp | grep REALTIME
+
+# Emit C for portability analysis
+bpp --c src/bpp.bpp > /tmp/bpp.c
+```
 
 ---
 

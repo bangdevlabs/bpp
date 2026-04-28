@@ -48,8 +48,8 @@ import "a64_primitives.bsm";
 // actual ARM register numbers assigned by the B3 pass; it stays
 // chip-specific. a64_b3_spill_base is an ARM-specific frame
 // offset.
-auto a64_promoted_regs;
-auto a64_b3_spill_base;
+extrn a64_promoted_regs;  // Array pointer stable; contents cleared by a64_primitives.
+global a64_b3_spill_base; // Assigned by a64_primitives (a64_emit_func_prologue).
 
 // Shared per-function state (cg_flt_tbl, cg_str_tbl, cg_lbl_cnt,
 // cg_depth, cg_break_stack, cg_continue_stack, cg_cur_fn_name,
@@ -57,13 +57,13 @@ auto a64_b3_spill_base;
 
 // Binary mode: 0 = text assembly (default), 1 = binary encoding
 // via bpp_enc_arm64.bsm. a64-only because x64 is always binary.
-auto a64_bin_mode;
+global a64_bin_mode; // Set from bpp.bpp (command-line mode selection).
 
 // Binary mode: function entry labels (dynamic array mapping fn index → label ID).
-auto a64_fn_lbl;
+extrn a64_fn_lbl; // Array pointer stable; read from bpp.bpp, bpp_bo.bsm, bpp_bug.bsm.
 
 // Binary mode: return label for the current function (set in a64_emit_func).
-auto a64_ret_lbl;
+global a64_ret_lbl; // Assigned each function by a64_primitives prologue.
 
 // Sentinel packed names for hidden argc/argv/envp globals.
 // These use negative values that can never collide with real packed names.
@@ -221,6 +221,10 @@ void cg_install_arm64_primitives() {
     p.emit_pop_discard           = fn_ptr(_a64_emit_pop_discard);
     p.emit_branch_eq             = fn_ptr(_a64_emit_branch_eq);
     p.emit_branch_ne             = fn_ptr(_a64_emit_branch_ne);
+    p.emit_coerce_int_to_float   = fn_ptr(_a64_emit_coerce_int_to_float);
+    p.emit_float_store_scalar    = fn_ptr(_a64_emit_float_store_scalar);
+    p.emit_fpush                 = fn_ptr(a64_emit_fpush);
+    p.emit_fpop                  = fn_ptr(a64_emit_fpop);
 }
 
 void init_codegen_arm64() {
@@ -276,14 +280,14 @@ static void a64_freelist_reset() {
 // a64_emit_push / a64_emit_pop on -1.
 static a64_gp_alloc() {
     auto i, m;
-    for (i = 0; i < 7; i = i + 1) {
+    for (i = 0; i < 7; i++) {
         m = 1 << i;
         if (a64_gp_free_mask & m) {
             a64_gp_free_mask = a64_gp_free_mask & ~m;
             return 9 + i;
         }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Return a previously-allocated GP reg to the pool. No-op if reg is
@@ -301,14 +305,14 @@ static void a64_gp_free(reg) {
 // so its existence does not become a B1-B3 refactor later.
 static a64_simd_alloc() {
     auto i, m;
-    for (i = 0; i < 16; i = i + 1) {
+    for (i = 0; i < 16; i++) {
         m = 1 << i;
         if (a64_simd_free_mask & m) {
             a64_simd_free_mask = a64_simd_free_mask & ~m;
             return i;
         }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Return a SIMD reg to the pool. Bounds-checked the same way as GP.
@@ -392,10 +396,10 @@ void a64_print_dec(n) {
     buf = malloc(20); len = 0;
     while (n > 0) {
         poke(buf + len, '0' + n % 10);
-        len = len + 1;
-        n = n / 10;
+        len++;
+        n /= 10;
     }
-    for (i = len - 1; i >= 0; i = i - 1) {
+    for (i = len - 1; i >= 0; i--) {
         putchar(peek(buf + i));
     }
 }
@@ -417,9 +421,9 @@ void _a64_b3_select() {
     arr_clear(a64_promoted_regs);
     used = 0;
     while (used < budget) {
-        best_vi = 0 - 1;
+        best_vi = -1;
         best_refs = 1;
-        for (vi = 0; vi < n; vi = vi + 1) {
+        for (vi = 0; vi < n; vi++) {
             if (arr_get(cg_var_promote, vi) >= 0) { continue; }
             if (cg_b3_eligible(vi) == 0) { continue; }
             if (arr_get(cg_var_refs, vi) > best_refs) {
@@ -431,7 +435,7 @@ void _a64_b3_select() {
         reg = 19 + used;
         arr_set(cg_var_promote, best_vi, reg);
         a64_promoted_regs = arr_push(a64_promoted_regs, reg);
-        used = used + 1;
+        used++;
     }
 }
 
@@ -460,7 +464,7 @@ void a64_pre_reg_vars(arr, cnt) {
                     if (n.c > 0) {
                         arr_set(cg_var_forced_ty, vi, n.c);
                     }
-                    j = j + 1;
+                    j++;
                 }
             }
             if (n.ntype == T_IF) {
@@ -473,7 +477,7 @@ void a64_pre_reg_vars(arr, cnt) {
                 auto sw_bodies, sw_cnt2, si2, sb_arr2, sb_cnt2;
                 sw_bodies = n.src_tok;
                 sw_cnt2 = n.c;
-                for (si2 = 0; si2 < sw_cnt2; si2 = si2 + 1) {
+                for (si2 = 0; si2 < sw_cnt2; si2++) {
                     sb_arr2 = sw_bodies[si2 * 2];
                     sb_cnt2 = sw_bodies[si2 * 2 + 1];
                     a64_pre_reg_vars(sb_arr2, sb_cnt2);
@@ -481,7 +485,7 @@ void a64_pre_reg_vars(arr, cnt) {
                 if (n.d != 0) { a64_pre_reg_vars(n.d, n.e); }
             }
         }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -725,7 +729,7 @@ void a64_emit_switch_jtbl(nd, sw_end_lbl) {
 
     // Allocate one match label per arm plus the else label.
     arm_labels = buf_word(sw_cnt);
-    for (si = 0; si < sw_cnt; si = si + 1) {
+    for (si = 0; si < sw_cnt; si++) {
         arm_labels[si] = enc_new_label();
     }
     else_lbl = enc_new_label();
@@ -766,12 +770,12 @@ void a64_emit_switch_jtbl(nd, sw_end_lbl) {
 
     // Emit the branch table: one `b` instruction per slot in [min..max].
     enc_def_label(table_lbl);
-    for (i = 0; i <= range; i = i + 1) {
+    for (i = 0; i <= range; i++) {
         target = else_lbl;
-        for (si = 0; si < sw_cnt; si = si + 1) {
+        for (si = 0; si < sw_cnt; si++) {
             sv_arr = sw_arms[si * 2];
             sv_cnt = sw_arms[si * 2 + 1];
-            for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+            for (sk = 0; sk < sv_cnt; sk++) {
                 node = sv_arr[sk];
                 val = cg_parse_int(node.a);
                 if (val == cg_sw_min + i) { target = arm_labels[si]; }
@@ -781,11 +785,11 @@ void a64_emit_switch_jtbl(nd, sw_end_lbl) {
     }
 
     // Emit arm bodies. Each body ends with a branch to sw_end.
-    for (si = 0; si < sw_cnt; si = si + 1) {
+    for (si = 0; si < sw_cnt; si++) {
         enc_def_label(arm_labels[si]);
         sb_arr = sw_bodies[si * 2];
         sb_cnt = sw_bodies[si * 2 + 1];
-        for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+        for (sk = 0; sk < sb_cnt; sk++) { cg_emit_stmt(sb_arr[sk]); }
         enc_b_label(sw_end_lbl);
     }
 
@@ -793,7 +797,7 @@ void a64_emit_switch_jtbl(nd, sw_end_lbl) {
     enc_def_label(else_lbl);
     if (n.d != 0) {
         auto ek;
-        for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+        for (ek = 0; ek < n.e; ek++) { cg_emit_stmt(n.d[ek]); }
     }
 
     enc_def_label(sw_end_lbl);
@@ -804,25 +808,25 @@ void a64_emit_switch_jtbl(nd, sw_end_lbl) {
 // Push x0 onto the stack. Maintains 16-byte alignment.
 static void a64_emit_push() {
     if (a64_bin_mode) { enc_str_pre(0, 31, -16); } else { out("  str x0, [sp, #-16]!"); putchar('\n'); }
-    cg_depth = cg_depth + 1; return 0;
+    cg_depth++; return 0;
 }
 
 // Pop from the stack into a register (0=x0, 1=x1, etc.).
 static void a64_emit_pop(r) {
     if (a64_bin_mode) { enc_ldr_post(r, 31, 16); } else { out("  ldr x"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
-    cg_depth = cg_depth - 1; return 0;
+    cg_depth--; return 0;
 }
 
 // Push d0 onto the stack (float value).
 static void a64_emit_fpush() {
     if (a64_bin_mode) { enc_str_d_pre(0, 31, -16); } else { out("  str d0, [sp, #-16]!"); putchar('\n'); }
-    cg_depth = cg_depth + 1; return 0;
+    cg_depth++; return 0;
 }
 
 // Pop from the stack into a float register (0=d0, 1=d1, etc.).
 static void a64_emit_fpop(r) {
     if (a64_bin_mode) { enc_ldr_d_post(r, 31, 16); } else { out("  ldr d"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
-    cg_depth = cg_depth - 1; return 0;
+    cg_depth--; return 0;
 }
 
 // Push v0 onto the stack as a 16-byte SIMD value (Phase B4). cg_depth
@@ -831,14 +835,14 @@ static void a64_emit_fpop(r) {
 static void a64_emit_vpush() {
     if (a64_bin_mode) { enc_str_q_pre(0, 31, 0 - 16); }
     else { out("  str q0, [sp, #-16]!"); putchar('\n'); }
-    cg_depth = cg_depth + 1;
+    cg_depth++;
 }
 
 // Pop a 16-byte SIMD value from the stack into the given V register.
 static void a64_emit_vpop(r) {
     if (a64_bin_mode) { enc_ldr_q_post(r, 31, 16); }
     else { out("  ldr q"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
-    cg_depth = cg_depth - 1;
+    cg_depth--;
 }
 
 // Phase B4: emit a two-operand SIMD builtin through a single helper.
@@ -1036,11 +1040,11 @@ a64_emit_call(nd) {
             while (i < cnt) {
                 a64_emit_node(*(arr + i * 8));
                 a64_emit_push();
-                i = i + 1;
+                i++;
             }
             // Pop real args into x0..x(cnt-2).
             i = cnt - 2;
-            while (i >= 0) { a64_emit_pop(i); i = i - 1; }
+            while (i >= 0) { a64_emit_pop(i); i--; }
             // Pop function pointer into x9 (it was pushed first, so it's last to pop).
             a64_emit_pop(9);
             // Indirect call. Save d0/d1 for float_ret() / float_ret2().
@@ -1195,11 +1199,11 @@ a64_emit_call(nd) {
                 }
             }
             a64_emit_push();
-            i = i + 1;
+            i++;
         }
         // Pop args into x0..x(cnt-1) in reverse order.
         i = cnt - 1;
-        while (i >= 0) { a64_emit_pop(i); i = i - 1; }
+        while (i >= 0) { a64_emit_pop(i); i--; }
 
         // For FFI calls: rearrange args per ARM64 ABI.
         // Int and float args use SEPARATE register counters:
@@ -1218,16 +1222,16 @@ a64_emit_call(nd) {
                     // Move bit pattern from x[i] → d[flt_idx].
                     if (a64_bin_mode) { enc_fmov_from_gpr(flt_idx, i); }
                     else { out("  fmov d"); a64_print_dec(flt_idx); out(", x"); a64_print_dec(i); putchar('\n'); }
-                    flt_idx = flt_idx + 1;
+                    flt_idx++;
                 } else {
                     // Compact int args: x[i] → x[int_idx].
                     if (int_idx != i) {
                         if (a64_bin_mode) { enc_add_imm(int_idx, i, 0); }
                         else { out("  mov x"); a64_print_dec(int_idx); out(", x"); a64_print_dec(i); putchar('\n'); }
                     }
-                    int_idx = int_idx + 1;
+                    int_idx++;
                 }
-                i = i + 1;
+                i++;
             }
         }
 
@@ -1346,7 +1350,7 @@ static a64_emit_node(nd) {
         // mov beats two memory accesses through the stack. Float operands
         // always use the float stack because the freelist is integer-only.
         auto alloc_reg, left_reg_int;
-        alloc_reg = 0 - 1;
+        alloc_reg = -1;
         lty = a64_emit_node(n.b);
         if (lty == 1) {
             a64_emit_fpush();
@@ -1381,7 +1385,7 @@ static a64_emit_node(nd) {
                 if (a64_bin_mode) { enc_scvtf(1, alloc_reg); }
                 else { out("  scvtf d1, x"); a64_print_dec(alloc_reg); putchar('\n'); }
                 a64_gp_free(alloc_reg);
-                alloc_reg = 0 - 1;
+                alloc_reg = -1;
             } else {
                 a64_emit_pop(1);
                 if (a64_bin_mode) { enc_scvtf(1, 1); } else { out("  scvtf d1, x1"); putchar('\n'); }
@@ -1427,7 +1431,7 @@ static a64_emit_node(nd) {
             // the register until the single op instruction below reads
             // it, so bookkeeping can run ahead of the actual read.
             a64_gp_free(alloc_reg);
-            alloc_reg = 0 - 1;
+            alloc_reg = -1;
         } else {
             a64_emit_pop(1);
             left_reg_int = 1;
@@ -1520,7 +1524,7 @@ static void a64_emit_body(arr, cnt) {
     while (i < cnt) {
         n = *(arr + i * 8);
         if (n != 0) { cg_emit_stmt(n); }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -1558,7 +1562,7 @@ void a64_emit_stmt(nd) {
                             out("  ldr x8, [x0, #"); a64_print_dec(j * 8); out("]"); putchar('\n');
                             out("  str x8, [x29, #"); a64_print_dec(off + j * 8); out("]"); putchar('\n');
                         }
-                        j = j + 1;
+                        j++;
                     }
                     return 0;
                 }
@@ -1651,7 +1655,7 @@ void a64_emit_stmt(nd) {
         // expression in n.a might trigger a BL (caller-saved clobber),
         // in which case we keep the push/pop fallback.
         auto alloc_reg_st, val_reg;
-        alloc_reg_st = 0 - 1;
+        alloc_reg_st = -1;
         val_reg = 1;
         ety = a64_emit_node(n.b);
         if (ety == 1) {
@@ -1799,7 +1803,7 @@ void a64_emit_stmt(nd) {
             a64_emit_push();
         }
 
-        for (si = 0; si < sw_cnt; si = si + 1) {
+        for (si = 0; si < sw_cnt; si++) {
             sv_arr = sw_arms[si * 2];
             sv_cnt = sw_arms[si * 2 + 1];
             sb_arr = sw_bodies[si * 2];
@@ -1819,7 +1823,7 @@ void a64_emit_stmt(nd) {
                 else { out("  cbnz x0, .L"); a64_print_dec(smatch_lbl); putchar('\n'); }
             } else {
                 // Form 1: compare condition (peeked from [sp]) against each value.
-                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                for (sk = 0; sk < sv_cnt; sk++) {
                     a64_emit_node(sv_arr[sk]);
                     if (a64_bin_mode) {
                         enc_ldr_uoff(1, 31, 0);
@@ -1838,7 +1842,7 @@ void a64_emit_stmt(nd) {
             else { out(".L"); a64_print_dec(smatch_lbl); out(":"); putchar('\n'); }
             // Pop saved cond before running the body (stack rebalance).
             if (n.a != 0) { a64_emit_pop(9); }
-            for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+            for (sk = 0; sk < sb_cnt; sk++) { cg_emit_stmt(sb_arr[sk]); }
             if (a64_bin_mode) { enc_b_label(sw_end_lbl); }
             else { out("  b .L"); a64_print_dec(sw_end_lbl); putchar('\n'); }
 
@@ -1851,7 +1855,7 @@ void a64_emit_stmt(nd) {
 
         if (n.d != 0) {
             auto ek;
-            for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+            for (ek = 0; ek < n.e; ek++) { cg_emit_stmt(n.d[ek]); }
         }
 
         if (a64_bin_mode) { enc_def_label(sw_end_lbl); }
@@ -1947,7 +1951,7 @@ void _a64_emit_memst_int(nd, fh) {
     auto n: Node, ety, alloc_reg_st, val_reg;
     auto pp: ChipPrimitives;
     n = nd;
-    alloc_reg_st = 0 - 1;
+    alloc_reg_st = -1;
     val_reg = 1;
     ety = a64_emit_node(n.b);
     if (ety == 1) {
@@ -2007,10 +2011,10 @@ void a64_mod_init() {
         j = 0;
         while (j < arr_len(cg_gl_name)) {
             if (cg_str_eq_packed(name_p, arr_get(cg_gl_name, j))) { idx = j; }
-            j = j + 1;
+            j++;
         }
         if (idx < 0) { cg_gl_name = arr_push(cg_gl_name, name_p); }
-        i = i + 1;
+        i++;
     }
     // Hidden runtime globals (_bpp_argc/argv/envp) come in via brt0.bsm
     // as regular entries in globals[], so the loop above already includes them.
@@ -2041,7 +2045,7 @@ void emit_module_arm64(mi) {
     i = 0;
     while (i < func_cnt) {
         if (_lazy_emit_ready) {
-            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+            if (arr_get(fn_reachable, i) == 0) { i++; continue; }
         }
         if (arr_get(func_mods, i) == mi) {
             rec = *(funcs + i * 8);
@@ -2050,7 +2054,7 @@ void emit_module_arm64(mi) {
             j = 0;
             while (j < arr_len(cg_fn_name)) {
                 if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, j))) { idx = j; }
-                j = j + 1;
+                j++;
             }
             if (idx < 0) {
                 idx = arr_len(cg_fn_name);
@@ -2069,14 +2073,14 @@ void emit_module_arm64(mi) {
                 arr_set(cg_fn_fidx, idx, i);
             }
         }
-        i = i + 1;
+        i++;
     }
 
     // Assign labels for new functions only.
     i = fn_start;
     while (i < arr_len(cg_fn_name)) {
         a64_fn_lbl = arr_push(a64_fn_lbl, enc_new_label());
-        i = i + 1;
+        i++;
     }
 
     // Refresh externs from parser state (may have grown from previous modules).
@@ -2089,7 +2093,7 @@ void emit_module_arm64(mi) {
         cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
         cg_ex_args = arr_push(cg_ex_args, *(rec + EX_ARGS));
         cg_ex_acnt = arr_push(cg_ex_acnt, *(rec + EX_ACNT));
-        i = i + 1;
+        i++;
     }
 
     // Clear per-module fixups. Labels and relocations accumulate.
@@ -2101,7 +2105,7 @@ void emit_module_arm64(mi) {
     i = fn_start;
     while (i < arr_len(cg_fn_name)) {
         cg_emit_func(i);
-        i = i + 1;
+        i++;
     }
 
     // Resolve internal branch fixups for this module.
@@ -2135,12 +2139,12 @@ void emit_all_arm64() {
         i = 0;
         while (i < arr_len(cg_fn_name)) {
             a64_fn_lbl = arr_push(a64_fn_lbl, enc_new_label());
-            i = i + 1;
+            i++;
         }
 
         // Emit all functions into the code buffer.
         i = 0;
-        while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i = i + 1; }
+        while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i++; }
 
         // Resolve all forward branch fixups.
         enc_resolve_fixups();
@@ -2154,7 +2158,7 @@ void emit_all_arm64() {
 
         // Emit all functions.
         i = 0;
-        while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i = i + 1; }
+        while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i++; }
 
         // Emit global variables in data section.
         out(".section __DATA,__data"); putchar('\n');
@@ -2169,7 +2173,7 @@ void emit_all_arm64() {
             out(".p2align 3"); putchar('\n');
             out("_"); a64_print_p(arr_get(cg_gl_name, i)); out(":"); putchar('\n');
             out("  .quad 0"); putchar('\n');
-            i = i + 1;
+            i++;
         }
         putchar('\n');
 
@@ -2189,10 +2193,10 @@ void emit_all_arm64() {
                     else { if (ch == '"') { putchar('\\'); putchar('"'); }
                     else { if (ch == '\\') { putchar('\\'); putchar('\\'); }
                     else { putchar(ch); } } }
-                    j = j + 1;
+                    j++;
                 }
                 putchar('"'); putchar('\n');
-                i = i + 1;
+                i++;
             }
             putchar('\n');
         }
@@ -2208,9 +2212,9 @@ void emit_all_arm64() {
                 out("_flt_"); a64_print_dec(i); out(":"); putchar('\n');
                 out("  .double ");
                 j = 0;
-                while (j < fl) { putchar(peek(cg_sbuf + fs + j)); j = j + 1; }
+                while (j < fl) { putchar(peek(cg_sbuf + fs + j)); j++; }
                 putchar('\n');
-                i = i + 1;
+                i++;
             }
             putchar('\n');
         }

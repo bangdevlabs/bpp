@@ -1,0 +1,403 @@
+// dispatch.bpp — Dispatch analysis engine for the B++ compiler.
+// Analyzes loops and functions to decide how code should execute:
+// CPU sequential, CPU parallel, GPU compute, or split (update/draw separation).
+//
+// Dispatch codes:
+//   DSP_SEQ    = 0   Sequential execution (side effects, dependencies)
+//   DSP_PAR    = 1   CPU parallel (independent iterations, no side effects)
+//   DSP_GPU    = 2   GPU candidate (strided memory, no side effects)
+//   DSP_SPLIT  = 3   Split candidate (mix of pure and impure — separate update from draw)
+//
+// How it works:
+//   1. Identify loop induction variable (i = i + 1 at end of body)
+//   2. Find strided variables (ptr = base + i * stride)
+//   3. Check each statement for side effects (extern calls, global writes, non-strided stores)
+//   4. Classify: no effects + strided = GPU, no effects = parallel, mixed = split, else sequential
+//
+// Usage: call classify_loop(while_node) on each while-loop AST node.
+// The result is written to the dispatch field of the while node.
+
+import "defs.bpp";
+
+// Dispatch result codes
+auto DSP_SEQ, DSP_PAR, DSP_GPU, DSP_SPLIT;
+
+// Extern purity table: packed names of known-pure extern functions.
+// Any extern not in this table is assumed to have side effects.
+auto pure_ext, pure_ext_cnt;
+
+// Strided variable set for current loop analysis.
+auto stride_vars, stride_cnt;
+
+// Local variable set for current function scope.
+auto local_vars, local_cnt;
+
+// Initialize the dispatch engine. Call once at startup.
+init_dispatch() {
+    DSP_SEQ = 0;
+    DSP_PAR = 1;
+    DSP_GPU = 2;
+    DSP_SPLIT = 3;
+    pure_ext = malloc(512);
+    pure_ext_cnt = 0;
+    stride_vars = malloc(512);
+    stride_cnt = 0;
+    local_vars = malloc(2048);
+    local_cnt = 0;
+    return 0;
+}
+
+// Register a pure extern function (no side effects). Call during setup.
+add_pure_extern(name_p) {
+    *(pure_ext + pure_ext_cnt * 8) = name_p;
+    pure_ext_cnt = pure_ext_cnt + 1;
+    return 0;
+}
+
+// Check if a packed name is a known-pure extern.
+is_pure_extern(name_p) {
+    auto i;
+    i = 0;
+    while (i < pure_ext_cnt) {
+        if (*(pure_ext + i * 8) == name_p) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Register a local variable for the current function scope.
+add_local(name_p) {
+    *(local_vars + local_cnt * 8) = name_p;
+    local_cnt = local_cnt + 1;
+    return 0;
+}
+
+// Reset local variables for a new function scope.
+reset_locals() {
+    local_cnt = 0;
+    return 0;
+}
+
+// Check if a packed name is a local variable.
+is_local(name_p) {
+    auto i;
+    i = 0;
+    while (i < local_cnt) {
+        if (*(local_vars + i * 8) == name_p) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Check if a packed name is a strided variable in the current loop.
+is_strided(name_p) {
+    auto i;
+    i = 0;
+    while (i < stride_cnt) {
+        if (*(stride_vars + i * 8) == name_p) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Check if an expression tree contains a reference to a specific variable.
+contains_var(nd, name_p) {
+    auto n: Node;
+    auto t, i, arr, cnt;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        if (n.a == name_p) { return 1; }
+        return 0;
+    }
+    if (t == T_BINOP) {
+        if (contains_var(n.b, name_p)) { return 1; }
+        return contains_var(n.c, name_p);
+    }
+    if (t == T_UNARY) { return contains_var(n.b, name_p); }
+    if (t == T_CALL) {
+        // Check arguments for variable reference.
+        arr = n.b;
+        cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            if (contains_var(*(arr + i * 8), name_p)) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if (t == T_MEMLD) { return contains_var(n.a, name_p); }
+    if (t == T_ASSIGN) {
+        if (contains_var(n.a, name_p)) { return 1; }
+        return contains_var(n.b, name_p);
+    }
+    return 0;
+}
+
+// Find the loop induction variable from the body.
+// Looks for "i = i + N" as the last assignment in the body.
+// Returns packed name, or 0 if not found.
+find_loop_var(body_arr, body_cnt) {
+    auto i;
+    auto stmt: Node, left: Node, right: Node, binop_left: Node;
+    i = body_cnt - 1;
+    while (i >= 0) {
+        stmt = *(body_arr + i * 8);
+        if (stmt != 0) {
+            if (stmt.ntype == T_ASSIGN) {
+                left = stmt.a;
+                right = stmt.b;
+                // Check pattern: var = var + N
+                if (left.ntype == T_VAR) {
+                    if (right.ntype == T_BINOP) {
+                        if (right.a == pack(43, 1)) {
+                            // op is "+" (ASCII 43, length 1) — packed
+                            binop_left = right.b;
+                            if (binop_left.ntype == T_VAR) {
+                                if (binop_left.a == left.a) {
+                                    return left.a;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Find strided variables in the loop body.
+// Pattern: var = base + (loop_var * stride)
+// Populates the stride_vars table.
+find_strided(body_arr, body_cnt, loop_var_p) {
+    auto i;
+    auto stmt: Node, left: Node, right: Node;
+    auto r_right: Node;
+    stride_cnt = 0;
+    if (loop_var_p == 0) { return 0; }
+    i = 0;
+    while (i < body_cnt) {
+        stmt = *(body_arr + i * 8);
+        if (stmt != 0) {
+            if (stmt.ntype == T_ASSIGN) {
+                left = stmt.a;
+                right = stmt.b;
+                if (left.ntype == T_VAR) {
+                    // Check: right is binop "+" with right child containing loop_var * N
+                    if (right.ntype == T_BINOP) {
+                        r_right = right.c;
+                        if (r_right != 0) {
+                            if (r_right.ntype == T_BINOP) {
+                                if (contains_var(r_right, loop_var_p)) {
+                                    *(stride_vars + stride_cnt * 8) = left.a;
+                                    stride_cnt = stride_cnt + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Forward declaration.
+has_side_effects(nd) { return 0; }
+
+// Check if an AST node has observable side effects.
+// Side effects: impure extern calls, writes to globals, non-strided memory stores.
+has_side_effects(nd) {
+    auto n: Node, p: Node, base: Node;
+    auto t, i, arr, cnt, name_p;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+
+    // Function call: side effect if the target is not pure.
+    if (t == T_CALL) {
+        name_p = n.a;
+        if (is_pure_extern(name_p) == 0) { return 1; }
+        // Check arguments recursively.
+        arr = n.b;
+        cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            if (has_side_effects(*(arr + i * 8))) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    // Assignment to a non-local variable is a global write.
+    if (t == T_ASSIGN) {
+        p = n.a;
+        if (p.ntype == T_VAR) {
+            name_p = p.a;
+            if (is_local(name_p) == 0) {
+                if (is_strided(name_p) == 0) {
+                    return 1;
+                }
+            }
+        }
+        return has_side_effects(n.b);
+    }
+
+    // Memory store: safe only if pointer base is a strided variable.
+    if (t == T_MEMST) {
+        p = n.a;
+        if (p.ntype == T_BINOP) {
+            base = p.b;
+            if (base.ntype == T_VAR) {
+                if (is_strided(base.a)) {
+                    // Strided store — safe for parallelism.
+                    return has_side_effects(n.b);
+                }
+            }
+        }
+        return 1;
+    }
+
+    // Recurse into child nodes.
+    if (t == T_BINOP) {
+        if (has_side_effects(n.b)) { return 1; }
+        return has_side_effects(n.c);
+    }
+    if (t == T_UNARY) { return has_side_effects(n.b); }
+    if (t == T_MEMLD) { return has_side_effects(n.a); }
+    if (t == T_RET) { return has_side_effects(n.a); }
+
+    if (t == T_IF) {
+        if (has_side_effects(n.a)) { return 1; }
+        arr = n.b;
+        cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            if (has_side_effects(*(arr + i * 8))) { return 1; }
+            i = i + 1;
+        }
+        if (n.e > 0) {
+            arr = n.d;
+            cnt = n.e;
+            i = 0;
+            while (i < cnt) {
+                if (has_side_effects(*(arr + i * 8))) { return 1; }
+                i = i + 1;
+            }
+        }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        if (has_side_effects(n.a)) { return 1; }
+        arr = n.b;
+        cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            if (has_side_effects(*(arr + i * 8))) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+// Classify a while-loop node for dispatch.
+// Writes the dispatch code to the dispatch field of the while node.
+// Returns the dispatch code.
+// If the programmer provided a @seq, @par, or @gpu hint, use it directly.
+classify_loop(wh) {
+    auto w: Node;
+    auto body_arr, body_cnt, loop_var_p;
+    auto i, pure_cnt, impure_cnt, dsp;
+    w = wh;
+
+    // Check for programmer dispatch hint (stored as integer code in d field).
+    // 1 = seq, 2 = par, 3 = gpu. 0 = no hint.
+    if (w.d > 0) {
+        if (w.d == 1) { w.dispatch = DSP_SEQ; return DSP_SEQ; }
+        if (w.d == 2) { w.dispatch = DSP_PAR; return DSP_PAR; }
+        if (w.d == 3) { w.dispatch = DSP_GPU; return DSP_GPU; }
+    }
+
+    body_arr = w.b;
+    body_cnt = w.c;
+
+    // Step 1: find the induction variable.
+    loop_var_p = find_loop_var(body_arr, body_cnt);
+
+    // Step 2: find strided variables.
+    find_strided(body_arr, body_cnt, loop_var_p);
+
+    // Step 3: add strided vars and loop var to local scope for side effect checks.
+    if (loop_var_p != 0) { add_local(loop_var_p); }
+    i = 0;
+    while (i < stride_cnt) {
+        add_local(*(stride_vars + i * 8));
+        i = i + 1;
+    }
+
+    // Step 4: count pure and impure statements.
+    pure_cnt = 0;
+    impure_cnt = 0;
+    i = 0;
+    while (i < body_cnt) {
+        if (has_side_effects(*(body_arr + i * 8))) {
+            impure_cnt = impure_cnt + 1;
+        } else {
+            pure_cnt = pure_cnt + 1;
+        }
+        i = i + 1;
+    }
+
+    // Step 5: classify.
+    dsp = DSP_SEQ;
+    if (impure_cnt == 0) {
+        if (stride_cnt > 0) {
+            dsp = DSP_GPU;
+        } else {
+            dsp = DSP_PAR;
+        }
+    } else {
+        if (stride_cnt > 0) {
+            if (pure_cnt > 0) {
+                dsp = DSP_SPLIT;
+            }
+        }
+    }
+
+    // Write dispatch result to the while node's dispatch field.
+    w.dispatch = dsp;
+    return dsp;
+}
+
+// Analyze all loops in a function body.
+// Call after setting up local variables with add_local().
+analyze_body(body_arr, body_cnt) {
+    auto i;
+    auto stmt: Node;
+    i = 0;
+    while (i < body_cnt) {
+        stmt = *(body_arr + i * 8);
+        if (stmt != 0) {
+            if (stmt.ntype == T_WHILE) {
+                classify_loop(stmt);
+                // Recurse into loop body for nested loops.
+                analyze_body(stmt.b, stmt.c);
+            }
+            if (stmt.ntype == T_IF) {
+                analyze_body(stmt.b, stmt.c);
+                if (stmt.e > 0) {
+                    analyze_body(stmt.d, stmt.e);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}

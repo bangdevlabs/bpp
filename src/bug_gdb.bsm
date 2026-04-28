@@ -7,21 +7,20 @@ import "bpp_str.bsm";
 
 // -- Constants ---------------------------------------------------
 
-auto AF_INET, SOCK_STREAM;
-auto _gdb_sock;       // TCP socket fd to debug server.
-auto _gdb_buf;        // Scratch buffer for packet assembly.
-auto _gdb_rbuf;       // Receive buffer.
-auto _gdb_noack;      // 1 after QStartNoAckMode accepted.
-auto _gdb_linux;      // 1 on Linux (affects sockaddr layout + register numbers).
-auto _gdb_pc_reg;     // GDB register number for the program counter.
+const AF_INET     = 2;
+const SOCK_STREAM = 1;
+static auto _gdb_sock;       // TCP socket fd to debug server.
+static auto _gdb_buf;        // Scratch buffer for packet assembly.
+static auto _gdb_rbuf;       // Receive buffer.
+static auto _gdb_noack;      // 1 after QStartNoAckMode accepted.
+static auto _gdb_linux;      // 1 on Linux (affects sockaddr layout + register numbers).
+static auto _gdb_pc_reg;     // GDB register number for the program counter.
 
 // -- Init --------------------------------------------------------
 
 // Call with is_linux=1 on Linux, 0 on macOS.
 init_gdb(is_linux) {
-    AF_INET = 2;
-    SOCK_STREAM = 1;
-    _gdb_sock = 0 - 1;
+    _gdb_sock = -1;
     _gdb_buf = malloc(16384);
     _gdb_rbuf = malloc(16384);
     _gdb_noack = 0;
@@ -38,7 +37,7 @@ init_gdb(is_linux) {
 gdb_connect(port) {
     auto sock, addr, ret;
     sock = sys_socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) { return 0 - 1; }
+    if (sock < 0) { return -1; }
 
     // Build struct sockaddr_in (16 bytes). Layout differs by platform.
     addr = malloc(16);
@@ -61,7 +60,7 @@ gdb_connect(port) {
 
     ret = sys_connect(sock, addr, 16);
     free(addr);
-    if (ret < 0) { sys_close(sock); return 0 - 1; }
+    if (ret < 0) { sys_close(sock); return -1; }
 
     _gdb_sock = sock;
     return 0;
@@ -69,7 +68,7 @@ gdb_connect(port) {
 
 // Close the connection to the debug server.
 gdb_disconnect() {
-    if (_gdb_sock >= 0) { sys_close(_gdb_sock); _gdb_sock = 0 - 1; }
+    if (_gdb_sock >= 0) { sys_close(_gdb_sock); _gdb_sock = -1; }
     return 0;
 }
 
@@ -79,7 +78,7 @@ gdb_disconnect() {
 _gdb_checksum(buf, len) {
     auto i, sum;
     sum = 0;
-    for (i = 0; i < len; i = i + 1) {
+    for (i = 0; i < len; i++) {
         sum = sum + (peek(buf + i) & 0xFF);
     }
     return sum & 0xFF;
@@ -96,7 +95,7 @@ _hex_val(ch) {
     if (ch >= '0') { if (ch <= '9') { return ch - '0'; } }
     if (ch >= 'a') { if (ch <= 'f') { return ch - 'a' + 10; } }
     if (ch >= 'A') { if (ch <= 'F') { return ch - 'A' + 10; } }
-    return 0 - 1;
+    return -1;
 }
 
 // Write a 64-bit address as hex into buf (skip leading zeros). Returns length written.
@@ -104,15 +103,15 @@ _hex_addr(buf, addr) {
     auto pos, i, nibble, started;
     pos = 0;
     started = 0;
-    for (i = 60; i >= 0; i = i - 4) {
+    for (i = 60; i >= 0; i -= 4) {
         nibble = (addr >> i) & 0xF;
         if (nibble != 0) { started = 1; }
         if (started) {
             poke(buf + pos, _hex_char(nibble));
-            pos = pos + 1;
+            pos++;
         }
     }
-    if (started == 0) { poke(buf + pos, '0'); pos = pos + 1; }
+    if (started == 0) { poke(buf + pos, '0'); pos++; }
     return pos;
 }
 
@@ -121,9 +120,7 @@ gdb_send_raw(buf, len) {
     auto pkt, cs, sent, i;
     pkt = _gdb_buf;
     poke(pkt, '$');
-    for (i = 0; i < len; i = i + 1) {
-        poke(pkt + 1 + i, peek(buf + i));
-    }
+    buf_copy(pkt + 1, buf, len);
     cs = _gdb_checksum(buf, len);
     poke(pkt + 1 + len, '#');
     poke(pkt + 2 + len, _hex_char((cs >> 4) & 0xF));
@@ -152,14 +149,14 @@ gdb_recv_pkt() {
 
     while (state < 3) {
         nr = sys_read(_gdb_sock, tmp, 1);
-        if (nr <= 0) { free(tmp); return 0 - 1; }
+        if (nr <= 0) { free(tmp); return -1; }
         ch = peek(tmp) & 0xFF;
 
         if (state == 0) {
             if (ch == '$') { state = 1; plen = 0; }
         } else if (state == 1) {
             if (ch == '#') { state = 2; }
-            else { poke(_gdb_rbuf + plen, ch); plen = plen + 1; }
+            else { poke(_gdb_rbuf + plen, ch); plen++; }
         } else if (state == 2) {
             // Read second checksum digit and finish.
             nr = sys_read(_gdb_sock, tmp, 1);
@@ -202,7 +199,7 @@ static _emit_output_packet(len) {
         ch = hi * 16 + lo;
         poke(buf, ch);
         sys_write(1, buf, 1);
-        i = i + 2;
+        i += 2;
     }
     free(buf);
 }
@@ -221,7 +218,7 @@ gdb_recv_stop() {
         // so without this the debug run runs blind.
         _emit_output_packet(nr);
     }
-    return 0 - 1;
+    return -1;
 }
 
 // -- High-level protocol -----------------------------------------
@@ -258,14 +255,14 @@ gdb_query_stop() {
     auto nr;
     gdb_send_cmd("?");
     nr = gdb_recv_pkt();
-    if (nr < 1) { return 0 - 1; }
+    if (nr < 1) { return -1; }
     if (peek(_gdb_rbuf) == 'T') {
         auto hi, lo;
         hi = _hex_val(peek(_gdb_rbuf + 1));
         lo = _hex_val(peek(_gdb_rbuf + 2));
         if (hi >= 0) { if (lo >= 0) { return hi * 16 + lo; } }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Query ASLR slide by asking debugserver for loaded library info.
@@ -293,10 +290,10 @@ gdb_query_slide(file_text_base) {
     tlen = 14;
 
     found = 0;
-    for (i = 0; i < nr - tlen; i = i + 1) {
+    for (i = 0; i < nr - tlen; i++) {
         if (found == 0) {
             match = 1;
-            for (j = 0; j < tlen; j = j + 1) {
+            for (j = 0; j < tlen; j++) {
                 if ((peek(_gdb_rbuf + i + j) & 0xFF) != str_peek(target, j)) {
                     match = 0;
                 }
@@ -310,7 +307,7 @@ gdb_query_slide(file_text_base) {
                     if (digit >= '0') {
                         if (digit <= '9') {
                             load_addr = load_addr * 10 + (digit - '0');
-                            j = j + 1;
+                            j++;
                         } else { j = nr; }
                     } else { j = nr; }
                 }
@@ -343,7 +340,7 @@ gdb_set_bp(addr) {
             if (peek(_gdb_rbuf + 1) == 'K') { return 0; }
         }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Remove a software breakpoint at the given address. Returns 0 on success.
@@ -365,7 +362,7 @@ gdb_remove_bp(addr) {
             if (peek(_gdb_rbuf + 1) == 'K') { return 0; }
         }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Single-step one instruction. Returns signal number or -1.
@@ -373,26 +370,26 @@ gdb_step() {
     auto nr;
     gdb_send_cmd("s");
     nr = gdb_recv_stop();
-    if (nr < 1) { return 0 - 1; }
+    if (nr < 1) { return -1; }
     if (peek(_gdb_rbuf) == 'T') {
         auto hi, lo;
         hi = _hex_val(peek(_gdb_rbuf + 1));
         lo = _hex_val(peek(_gdb_rbuf + 2));
         if (hi >= 0) { if (lo >= 0) { return hi * 16 + lo; } }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Continue execution. Skips output packets and returns on stop or exit.
 // Returns: signal number (>0), 0 for exit, -2 for killed, -1 for error.
-auto _gdb_exit_code;
-auto _gdb_stop_sig;
+extrn _gdb_exit_code; // Read by bug_observe_*.bsm after gdb_continue returns.
+extrn _gdb_stop_sig;  // Read by bug_observe_*.bsm after gdb_continue returns.
 
 gdb_continue() {
     auto nr, first, hi, lo;
     gdb_send_cmd("c");
     nr = gdb_recv_stop();
-    if (nr < 1) { return 0 - 1; }
+    if (nr < 1) { return -1; }
 
     first = peek(_gdb_rbuf);
 
@@ -400,7 +397,7 @@ gdb_continue() {
         hi = _hex_val(peek(_gdb_rbuf + 1));
         lo = _hex_val(peek(_gdb_rbuf + 2));
         if (hi >= 0) { if (lo >= 0) { _gdb_stop_sig = hi * 16 + lo; return _gdb_stop_sig; } }
-        return 0 - 1;
+        return -1;
     }
     if (first == 'W') {
         hi = _hex_val(peek(_gdb_rbuf + 1));
@@ -414,7 +411,7 @@ gdb_continue() {
         _gdb_stop_sig = hi * 16 + lo;
         return 0 - 2;
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Read a specific register by number. Returns the 64-bit value.
@@ -426,10 +423,10 @@ gdb_read_reg(regnum) {
     pos = 1;
     if (regnum >= 16) {
         poke(cmd + pos, _hex_char((regnum >> 4) & 0xF));
-        pos = pos + 1;
+        pos++;
     }
     poke(cmd + pos, _hex_char(regnum & 0xF));
-    pos = pos + 1;
+    pos++;
     gdb_send_raw(cmd, pos);
     nr = gdb_recv_pkt();
     free(cmd);
@@ -438,7 +435,7 @@ gdb_read_reg(regnum) {
 
     // Hex-encoded little-endian: 8 bytes = 16 hex chars.
     val = 0;
-    for (i = 0; i < 8; i = i + 1) {
+    for (i = 0; i < 8; i++) {
         if (i * 2 + 1 < nr) {
             hi = _hex_val(peek(_gdb_rbuf + i * 2));
             lo = _hex_val(peek(_gdb_rbuf + i * 2 + 1));
@@ -464,16 +461,16 @@ gdb_read_mem(addr, size) {
     poke(cmd, 'm');
     pos = 1 + _hex_addr(cmd + 1, addr);
     poke(cmd + pos, ',');
-    pos = pos + 1;
+    pos++;
     poke(cmd + pos, _hex_char(size & 0xF));
-    pos = pos + 1;
+    pos++;
     gdb_send_raw(cmd, pos);
     nr = gdb_recv_pkt();
     free(cmd);
     if (nr < 2) { return 0; }
     // Response is hex-encoded bytes in target byte order (little-endian).
     val = 0;
-    for (i = 0; i < size; i = i + 1) {
+    for (i = 0; i < size; i++) {
         if (i * 2 + 1 < nr) {
             hi = _hex_val(peek(_gdb_rbuf + i * 2));
             lo = _hex_val(peek(_gdb_rbuf + i * 2 + 1));

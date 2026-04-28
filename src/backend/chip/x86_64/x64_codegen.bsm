@@ -50,15 +50,16 @@ import "x64_primitives.bsm";
 // Phase B3 — local register allocation. x64_promoted_regs holds
 // x86 register numbers (chip-specific). x64_b3_spill_off is the
 // x86-specific spill base offset.
-auto x64_promoted_regs;
-auto x64_b3_spill_off;
+extrn x64_promoted_regs;  // Array pointer stable; contents cleared by x64_primitives.
+global x64_b3_spill_off;  // Assigned by x64_primitives (x64_emit_func_prologue).
 
 // Shared per-function state (cg_flt_tbl, cg_str_tbl, cg_lbl_cnt,
 // cg_depth, cg_break_stack, cg_continue_stack, cg_cur_fn_name,
 // cg_cur_fn_idx) lives in bpp_codegen.bsm.
 
 // Function entry labels and current return label.
-auto x64_fn_lbl, x64_ret_lbl;
+extrn x64_fn_lbl;   // Array pointer stable; read from bpp_bo.bsm, bpp_bug.bsm.
+global x64_ret_lbl; // Assigned each function by x64_primitives prologue.
 
 // Sentinel packed names for hidden argc/argv/envp globals.
 // cg_argc_sym, cg_argv_sym, cg_envp_sym live in bpp_codegen.bsm.
@@ -197,6 +198,10 @@ void cg_install_x86_64_primitives() {
     p.emit_pop_discard           = fn_ptr(_x64_emit_pop_discard);
     p.emit_branch_eq             = fn_ptr(_x64_emit_branch_eq);
     p.emit_branch_ne             = fn_ptr(_x64_emit_branch_ne);
+    p.emit_coerce_int_to_float   = fn_ptr(_x64_emit_coerce_int_to_float);
+    p.emit_float_store_scalar    = fn_ptr(_x64_emit_float_store_scalar);
+    p.emit_fpush                 = fn_ptr(x64_emit_fpush);
+    p.emit_fpop                  = fn_ptr(x64_emit_fpop);
 }
 
 void init_codegen_x86_64() {
@@ -261,9 +266,9 @@ void _x64_b3_select() {
     arr_clear(x64_promoted_regs);
     used = 0;
     while (used < budget) {
-        best_vi = 0 - 1;
+        best_vi = -1;
         best_refs = 1;
-        for (vi = 0; vi < n; vi = vi + 1) {
+        for (vi = 0; vi < n; vi++) {
             if (arr_get(cg_var_promote, vi) >= 0) { continue; }
             if (cg_b3_eligible(vi) == 0) { continue; }
             if (arr_get(cg_var_refs, vi) > best_refs) {
@@ -275,7 +280,7 @@ void _x64_b3_select() {
         reg = pool[used];
         arr_set(cg_var_promote, best_vi, reg);
         x64_promoted_regs = arr_push(x64_promoted_regs, reg);
-        used = used + 1;
+        used++;
     }
     free(pool);
 }
@@ -299,7 +304,7 @@ void x64_pre_reg_vars(arr, cnt) {
                     }
                     // Record explicit primitive type hint.
                     if (n.c > 0) { arr_set(cg_var_forced_ty, vi, n.c); }
-                    j = j + 1;
+                    j++;
                 }
             }
             if (n.ntype == T_IF) {
@@ -311,7 +316,7 @@ void x64_pre_reg_vars(arr, cnt) {
                 auto sw_bodies, sw_cnt2, si2, sb_arr2, sb_cnt2;
                 sw_bodies = n.src_tok;
                 sw_cnt2 = n.c;
-                for (si2 = 0; si2 < sw_cnt2; si2 = si2 + 1) {
+                for (si2 = 0; si2 < sw_cnt2; si2++) {
                     sb_arr2 = sw_bodies[si2 * 2];
                     sb_cnt2 = sw_bodies[si2 * 2 + 1];
                     x64_pre_reg_vars(sb_arr2, sb_cnt2);
@@ -319,7 +324,7 @@ void x64_pre_reg_vars(arr, cnt) {
                 if (n.d != 0) { x64_pre_reg_vars(n.d, n.e); }
             }
         }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -454,7 +459,7 @@ void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     range = cg_sw_max - cg_sw_min;
 
     arm_labels = buf_word(sw_cnt);
-    for (si = 0; si < sw_cnt; si = si + 1) {
+    for (si = 0; si < sw_cnt; si++) {
         arm_labels[si] = x64_enc_new_label();
     }
     else_lbl = x64_enc_new_label();
@@ -479,27 +484,27 @@ void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     // Branch table: one 8-byte slot per index in [min..max].
     // Slot layout: jmp rel32 (5 bytes) + 3 nops.
     x64_enc_def_label(table_lbl);
-    for (i = 0; i <= range; i = i + 1) {
+    for (i = 0; i <= range; i++) {
         target = else_lbl;
-        for (si = 0; si < sw_cnt; si = si + 1) {
+        for (si = 0; si < sw_cnt; si++) {
             sv_arr = sw_arms[si * 2];
             sv_cnt = sw_arms[si * 2 + 1];
-            for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+            for (sk = 0; sk < sv_cnt; sk++) {
                 node = sv_arr[sk];
                 val = cg_parse_int(node.a);
                 if (val == cg_sw_min + i) { target = arm_labels[si]; }
             }
         }
         x64_enc_jmp_label(target);
-        for (pad = 0; pad < 3; pad = pad + 1) { x64_enc_nop(); }
+        for (pad = 0; pad < 3; pad++) { x64_enc_nop(); }
     }
 
     // Arm bodies.
-    for (si = 0; si < sw_cnt; si = si + 1) {
+    for (si = 0; si < sw_cnt; si++) {
         x64_enc_def_label(arm_labels[si]);
         sb_arr = sw_bodies[si * 2];
         sb_cnt = sw_bodies[si * 2 + 1];
-        for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+        for (sk = 0; sk < sb_cnt; sk++) { cg_emit_stmt(sb_arr[sk]); }
         x64_enc_jmp_label(sw_end_lbl);
     }
 
@@ -507,7 +512,7 @@ void x64_emit_switch_jtbl(nd, sw_end_lbl) {
     x64_enc_def_label(else_lbl);
     if (n.d != 0) {
         auto ek;
-        for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+        for (ek = 0; ek < n.e; ek++) { cg_emit_stmt(n.d[ek]); }
     }
 
     x64_enc_def_label(sw_end_lbl);
@@ -518,13 +523,13 @@ void x64_emit_switch_jtbl(nd, sw_end_lbl) {
 // Push RAX onto the stack.
 static void x64_emit_push() {
     x64_enc_push(0);
-    cg_depth = cg_depth + 1;
+    cg_depth++;
 }
 
 // Pop from the stack into a general-purpose register.
 static void x64_emit_pop(r) {
     x64_enc_pop(r);
-    cg_depth = cg_depth - 1;
+    cg_depth--;
 }
 
 // Push XMM0 onto the stack as a 16-byte SIMD value (Phase B4).
@@ -532,14 +537,14 @@ static void x64_emit_pop(r) {
 static void x64_emit_vpush() {
     x64_enc_sub_imm(4, 16);
     x64_enc_movups_store(0, 4, 0);
-    cg_depth = cg_depth + 2;
+    cg_depth += 2;
 }
 
 // Pop a 16-byte SIMD value from the stack into the given XMM register.
 static void x64_emit_vpop(xr) {
     x64_enc_movups_load(xr, 4, 0);
     x64_enc_add_imm(4, 16);
-    cg_depth = cg_depth - 2;
+    cg_depth -= 2;
 }
 
 // Phase B4: emit a two-operand SIMD builtin (vec_add4, vec_sub4, …).
@@ -570,14 +575,14 @@ static void _x64_vec_binop(n: Node, opcode, commutative) {
 static void x64_emit_fpush() {
     x64_enc_sub_imm(4, 8);
     x64_enc_store_sd(0, 4, 0);
-    cg_depth = cg_depth + 1;
+    cg_depth++;
 }
 
 // Pop from the stack into an XMM register.
 static void x64_emit_fpop(xr) {
     x64_enc_load_sd(xr, 4, 0);
     x64_enc_add_imm(4, 8);
-    cg_depth = cg_depth - 1;
+    cg_depth--;
 }
 
 // Align the stack to 16 bytes before a CALL if needed.
@@ -757,11 +762,11 @@ x64_emit_call(nd) {
                 // Bit-transfer float values to GPR for uniform stack push.
                 if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
                 x64_emit_push();
-                i = i + 1;
+                i++;
             }
             // Pop real args into System V registers.
             i = cnt - 2;
-            while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i = i - 1; }
+            while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i--; }
             // Pop function pointer into R11.
             x64_emit_pop(11);
             padded = x64_align_call();
@@ -896,11 +901,11 @@ x64_emit_call(nd) {
                 }
             }
             x64_emit_push();
-            i = i + 1;
+            i++;
         }
         // Pop into System V argument registers.
         i = cnt - 1;
-        while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i = i - 1; }
+        while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i--; }
 
         // Call the function.
         fi = cg_find_fn(n.a);
@@ -1147,7 +1152,7 @@ static void x64_emit_body(arr, cnt) {
     while (i < cnt) {
         n = *(arr + i * 8);
         if (n != 0) { cg_emit_stmt(n); }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -1176,7 +1181,7 @@ void x64_emit_stmt(nd) {
                     while (j < fc) {
                         x64_enc_load(10, 0, j * 8);
                         x64_enc_store(10, 5, off + j * 8);
-                        j = j + 1;
+                        j++;
                     }
                     return 0;
                 }
@@ -1341,7 +1346,7 @@ void x64_emit_stmt(nd) {
             x64_emit_push();
         }
 
-        for (si = 0; si < sw_cnt; si = si + 1) {
+        for (si = 0; si < sw_cnt; si++) {
             sv_arr = sw_arms[si * 2];
             sv_cnt = sw_arms[si * 2 + 1];
             sb_arr = sw_bodies[si * 2];
@@ -1357,7 +1362,7 @@ void x64_emit_stmt(nd) {
                 x64_enc_jcc_label(5, smatch_lbl);   // JNE = 5 (nonzero)
             } else {
                 // Form 1: compare each value against cond peeked from [rsp].
-                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                for (sk = 0; sk < sv_cnt; sk++) {
                     x64_emit_node(sv_arr[sk]);
                     x64_enc_load(1, 4, 0);           // rcx = [rsp]
                     x64_enc_cmp_reg(1, 0);
@@ -1369,7 +1374,7 @@ void x64_emit_stmt(nd) {
             x64_enc_def_label(smatch_lbl);
             // Pop saved cond before running the body (stack rebalance).
             if (n.a != 0) { x64_emit_pop(1); }
-            for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+            for (sk = 0; sk < sb_cnt; sk++) { cg_emit_stmt(sb_arr[sk]); }
             x64_enc_jmp_label(sw_end_lbl);
 
             x64_enc_def_label(snext_lbl);
@@ -1380,7 +1385,7 @@ void x64_emit_stmt(nd) {
 
         if (n.d != 0) {
             auto ek;
-            for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+            for (ek = 0; ek < n.e; ek++) { cg_emit_stmt(n.d[ek]); }
         }
 
         x64_enc_def_label(sw_end_lbl);
@@ -1475,17 +1480,17 @@ void x64_mod_init() {
         j = 0;
         while (j < arr_len(cg_gl_name)) {
             if (cg_str_eq_packed(name_p, arr_get(cg_gl_name, j))) { idx = j; }
-            j = j + 1;
+            j++;
         }
         if (idx < 0) { cg_gl_name = arr_push(cg_gl_name, name_p); }
-        i = i + 1;
+        i++;
     }
     // Hidden runtime globals come in via brt0.bsm (auto-injected).
 
     // Copy ALL externs.
     arr_clear(cg_ex_name); arr_clear(cg_ex_ret);
     arr_clear(cg_ex_args); arr_clear(cg_ex_acnt);
-    for (i = 0; i < ext_cnt; i = i + 1) {
+    for (i = 0; i < ext_cnt; i++) {
         rec = *(externs + i * 8);
         cg_ex_name = arr_push(cg_ex_name, *(rec + EX_NAME));
         cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
@@ -1515,7 +1520,7 @@ void emit_module_x86_64(mi) {
             j = 0;
             while (j < arr_len(cg_fn_name)) {
                 if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, j))) { idx = j; }
-                j = j + 1;
+                j++;
             }
             if (idx < 0) {
                 idx = arr_len(cg_fn_name);
@@ -1534,14 +1539,14 @@ void emit_module_x86_64(mi) {
                 arr_set(cg_fn_fidx, idx, i);
             }
         }
-        i = i + 1;
+        i++;
     }
 
     // Assign labels for new functions only.
     i = fn_start;
     while (i < arr_len(cg_fn_name)) {
         x64_fn_lbl = arr_push(x64_fn_lbl, x64_enc_new_label());
-        i = i + 1;
+        i++;
     }
 
     // Clear per-module fixups.
@@ -1552,7 +1557,7 @@ void emit_module_x86_64(mi) {
     i = fn_start;
     while (i < arr_len(cg_fn_name)) {
         cg_emit_func(i);
-        i = i + 1;
+        i++;
     }
 
     x64_enc_resolve_fixups();
@@ -1575,11 +1580,11 @@ x64_emit_start_stub() {
     x64_enc_add_reg(2, 6);           // RDX = &argv[argc]
     x64_enc_add_imm(2, 8);           // RDX = &argv[argc+1] = envp[0]
     x64_enc_and_imm(4, 0 - 16);      // align stack
-    main_fi = 0 - 1;
+    main_fi = -1;
     i = 0;
     while (i < arr_len(cg_fn_name)) {
         if (cg_str_eq(arr_get(cg_fn_name, i), "main", 4)) { main_fi = i; }
-        i = i + 1;
+        i++;
     }
     if (main_fi >= 0) {
         x64_enc_call_label(arr_get(x64_fn_lbl, main_fi));
@@ -1614,7 +1619,7 @@ void emit_all_x86_64() {
     i = 0;
     while (i < arr_len(cg_fn_name)) {
         x64_fn_lbl = arr_push(x64_fn_lbl, x64_enc_new_label());
-        i = i + 1;
+        i++;
     }
 
     // Emit _start stub: extracts argc/argv/envp from stack, calls main, then exits.
@@ -1638,7 +1643,7 @@ void emit_all_x86_64() {
     i = 0;
     while (i < arr_len(cg_fn_name)) {
         if (cg_str_eq(arr_get(cg_fn_name, i), "main", 4)) { main_fi = i; }
-        i = i + 1;
+        i++;
     }
     if (main_fi >= 0) {
         x64_enc_call_label(arr_get(x64_fn_lbl, main_fi));
@@ -1650,7 +1655,7 @@ void emit_all_x86_64() {
 
     // Emit all functions into the code buffer.
     i = 0;
-    while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i = i + 1; }
+    while (i < arr_len(cg_fn_name)) { cg_emit_func(i); i++; }
 
     // Resolve all forward branch fixups.
     x64_enc_resolve_fixups();

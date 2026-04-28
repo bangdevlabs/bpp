@@ -1,0 +1,1215 @@
+// B++ Bootstrap Parser (Stage 2)
+// Reads tokens from stdin (lexer output), outputs JSON IR to stdout.
+// Pipeline: source.bpp | bpp_lexer | bpp_parser
+// No external dependencies — uses only B++ built-in I/O.
+
+// --- Constants ---
+auto NODE_SZ;
+auto T_LIT, T_VAR, T_BINOP, T_UNARY, T_ASSIGN;
+auto T_MEMLD, T_MEMST, T_CALL, T_IF, T_WHILE, T_RET, T_DECL, T_NOP;
+auto TK_KW, TK_IMP, TK_ID, TK_NUM, TK_HEX, TK_STR, TK_OP, TK_PUNCT, TK_FLOAT;
+
+// --- Token storage ---
+auto toks, tok_cnt, tok_pos;
+auto vbuf, vbuf_pos;
+
+// --- Program structure ---
+auto globals, glob_cnt;
+auto externs, ext_cnt;
+auto funcs, func_cnt;
+
+// --- Struct registry ---
+// Each struct entry is 32 bytes: name(packed), fields(ptr), field_count, size.
+auto struct_defs, struct_cnt;
+
+// --- Variable type map ---
+// Each entry is 16 bytes: var_name(packed), struct_index.
+auto var_types, vtype_cnt;
+
+// --- List builder ---
+auto tmp_arr, list_stack, list_sp, list_depth, last_list_cnt;
+
+// ============================================================
+// Built-in String Helpers
+// ============================================================
+
+// Compare len bytes at mem_base offset a with string b (may be a literal).
+buf_eq(a, b, len) {
+    auto i;
+    i = 0;
+    while (i < len) {
+        if (peek(a + i) != str_peek(b, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Print a null-terminated string to stdout.
+print_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        putchar(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// Compare two packed strings (both in vbuf).
+packed_eq(p1, p2) {
+    auto s1, l1, s2, l2, i;
+    s1 = p1 % 0x100000000;
+    l1 = p1 / 0x100000000;
+    s2 = p2 % 0x100000000;
+    l2 = p2 / 0x100000000;
+    if (l1 != l2) { return 0; }
+    i = 0;
+    while (i < l1) {
+        if (peek(vbuf + s1 + i) != peek(vbuf + s2 + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// Initialization
+// ============================================================
+
+init() {
+    NODE_SZ = 64;
+    T_LIT = 0; T_VAR = 1; T_BINOP = 2; T_UNARY = 3; T_ASSIGN = 4;
+    T_MEMLD = 5; T_MEMST = 6; T_CALL = 7; T_IF = 8; T_WHILE = 9;
+    T_RET = 10; T_DECL = 11; T_NOP = 12;
+    TK_KW = 0; TK_IMP = 1; TK_ID = 2; TK_NUM = 3;
+    TK_HEX = 4; TK_STR = 5; TK_OP = 6; TK_PUNCT = 7; TK_FLOAT = 8;
+    toks = malloc(262144);
+    vbuf = malloc(131072);
+    vbuf_pos = 0;
+    tok_cnt = 0;
+    tok_pos = 0;
+    globals = malloc(4096);
+    glob_cnt = 0;
+    externs = malloc(4096);
+    ext_cnt = 0;
+    funcs = malloc(4096);
+    func_cnt = 0;
+    tmp_arr = malloc(16384);
+    list_stack = malloc(512);
+    list_sp = 0;
+    list_depth = 0;
+    last_list_cnt = 0;
+    // Struct registry: up to 64 structs, 32 bytes each.
+    struct_defs = malloc(64 * 32);
+    struct_cnt = 0;
+    // Variable type map: up to 512 typed variables, 16 bytes each.
+    var_types = malloc(512 * 16);
+    vtype_cnt = 0;
+    return 0;
+}
+
+// ============================================================
+// Pack/unpack: store (start, len) pair in one long long
+// ============================================================
+
+pack(s, l) { return s + l * 0x100000000; }
+unpack_s(p) { return p % 0x100000000; }
+unpack_l(p) { return p / 0x100000000; }
+
+// ============================================================
+// Struct support
+// ============================================================
+
+// Register a new struct. Returns its index.
+add_struct_def(name_p) {
+    auto entry;
+    entry = struct_defs + struct_cnt * 32;
+    *(entry + 0) = name_p;
+    *(entry + 8) = malloc(64 * 8);
+    *(entry + 16) = 0;
+    *(entry + 24) = 0;
+    struct_cnt = struct_cnt + 1;
+    return struct_cnt - 1;
+}
+
+// Add a field to a struct. Fields are stored as packed strings.
+add_struct_field(idx, field_p) {
+    auto entry, fields, fc;
+    entry = struct_defs + idx * 32;
+    fields = *(entry + 8);
+    fc = *(entry + 16);
+    *(fields + fc * 8) = field_p;
+    fc = fc + 1;
+    *(entry + 16) = fc;
+    *(entry + 24) = fc * 8;
+    return 0;
+}
+
+// Find a struct by name. Returns index or -1.
+find_struct(name_p) {
+    auto i, entry;
+    i = 0;
+    while (i < struct_cnt) {
+        entry = struct_defs + i * 32;
+        if (packed_eq(*(entry + 0), name_p)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get byte offset of a field within a struct. Returns -1 if not found.
+get_field_offset(idx, field_p) {
+    auto entry, fields, fc, i;
+    entry = struct_defs + idx * 32;
+    fields = *(entry + 8);
+    fc = *(entry + 16);
+    i = 0;
+    while (i < fc) {
+        if (packed_eq(*(fields + i * 8), field_p)) { return i * 8; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Get the total size in bytes of a struct.
+get_struct_size(idx) {
+    return *(struct_defs + idx * 32 + 24);
+}
+
+// Record a variable's struct type.
+set_var_type(var_p, idx) {
+    auto entry;
+    entry = var_types + vtype_cnt * 16;
+    *(entry + 0) = var_p;
+    *(entry + 8) = idx;
+    vtype_cnt = vtype_cnt + 1;
+    return 0;
+}
+
+// Look up a variable's struct type. Returns struct index or -1.
+get_var_type(var_p) {
+    auto i, entry;
+    i = vtype_cnt - 1;
+    while (i >= 0) {
+        entry = var_types + i * 16;
+        if (packed_eq(*(entry + 0), var_p)) { return *(entry + 8); }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// Create a literal AST node holding an integer value.
+make_int_lit(val) {
+    auto start, node, tmp, digit, i, j, t;
+    start = vbuf_pos;
+    if (val == 0) {
+        poke(vbuf + vbuf_pos, '0');
+        vbuf_pos = vbuf_pos + 1;
+    } else {
+        tmp = val;
+        while (tmp > 0) {
+            digit = tmp % 10;
+            poke(vbuf + vbuf_pos, 48 + digit);
+            vbuf_pos = vbuf_pos + 1;
+            tmp = tmp / 10;
+        }
+        // Reverse the digits.
+        i = start;
+        j = vbuf_pos - 1;
+        while (i < j) {
+            t = peek(vbuf + i);
+            poke(vbuf + i, peek(vbuf + j));
+            poke(vbuf + j, t);
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+    node = make_node(T_LIT);
+    *(node + 8) = pack(start, vbuf_pos - start);
+    return node;
+}
+
+// Create a packed string containing a single "+" character.
+make_plus_op() {
+    auto start;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '+');
+    vbuf_pos = vbuf_pos + 1;
+    return pack(start, 1);
+}
+
+// ============================================================
+// Token reader
+// ============================================================
+
+classify_type(buf, len) {
+    if (len == 2) {
+        if (buf_eq(buf, "ID", 2)) { return 2; }
+        if (buf_eq(buf, "OP", 2)) { return 6; }
+    }
+    if (len == 3) {
+        if (buf_eq(buf, "HEX", 3)) { return 4; }
+    }
+    if (len == 5) {
+        if (buf_eq(buf, "PUNCT", 5)) { return 7; }
+        if (buf_eq(buf, "FLOAT", 5)) { return 8; }
+    }
+    if (len == 6) {
+        if (buf_eq(buf, "NUMBER", 6)) { return 3; }
+        if (buf_eq(buf, "STRING", 6)) { return 5; }
+        if (buf_eq(buf, "IMPORT", 6)) { return 1; }
+    }
+    if (len == 7) {
+        if (buf_eq(buf, "KEYWORD", 7)) { return 0; }
+    }
+    return -1;
+}
+
+read_tokens() {
+    auto ch, lbuf, llen, i, space, tcode, vs, vl, addr;
+    lbuf = malloc(1024);
+    while (1) {
+        llen = 0;
+        ch = getchar();
+        if (ch == -1) { return 0; }
+        while (ch != 10) {
+            if (ch == -1) {
+                if (llen == 0) { return 0; }
+                i = llen;
+                ch = 10;
+            } else {
+                poke(lbuf + llen, ch);
+                llen = llen + 1;
+                ch = getchar();
+            }
+        }
+        if (llen == 0) { return 0; }
+        // Find space between TYPE and value.
+        space = 0;
+        i = 0;
+        while (i < llen) {
+            if (peek(lbuf + i) == ' ') { space = i; i = llen; }
+            i = i + 1;
+        }
+        if (space == 0) { return 0; }
+        tcode = classify_type(lbuf, space);
+        // Copy value to vbuf.
+        vs = vbuf_pos;
+        vl = llen - space - 1;
+        i = 0;
+        while (i < vl) {
+            poke(vbuf + vbuf_pos, peek(lbuf + space + 1 + i));
+            vbuf_pos = vbuf_pos + 1;
+            i = i + 1;
+        }
+        addr = toks + tok_cnt * 24;
+        *(addr + 0) = tcode;
+        *(addr + 8) = vs;
+        *(addr + 16) = vl;
+        tok_cnt = tok_cnt + 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Token access helpers
+// ============================================================
+
+peek_type() {
+    if (tok_pos >= tok_cnt) { return -1; }
+    return *(toks + tok_pos * 24);
+}
+
+peek_type_at(off) {
+    if (tok_pos + off >= tok_cnt) { return -1; }
+    return *(toks + (tok_pos + off) * 24);
+}
+
+peek_vstart() { return *(toks + tok_pos * 24 + 8); }
+peek_vlen() { return *(toks + tok_pos * 24 + 16); }
+
+cur_packed() { return pack(peek_vstart(), peek_vlen()); }
+
+consume() { tok_pos = tok_pos + 1; return 0; }
+
+val_is_ch(c) {
+    auto addr;
+    if (tok_pos >= tok_cnt) { return 0; }
+    addr = toks + tok_pos * 24;
+    if (*(addr + 16) != 1) { return 0; }
+    return peek(vbuf + *(addr + 8)) == c;
+}
+
+val_is(s, slen) {
+    auto addr, vs, vl;
+    if (tok_pos >= tok_cnt) { return 0; }
+    addr = toks + tok_pos * 24;
+    vs = *(addr + 8);
+    vl = *(addr + 16);
+    if (vl != slen) { return 0; }
+    return buf_eq(vbuf + vs, s, slen);
+}
+
+val_at_ch(off, c) {
+    auto addr;
+    if (tok_pos + off >= tok_cnt) { return 0; }
+    addr = toks + (tok_pos + off) * 24;
+    if (*(addr + 16) != 1) { return 0; }
+    return peek(vbuf + *(addr + 8)) == c;
+}
+
+// ============================================================
+// List builder (stack-based for nesting)
+// ============================================================
+
+list_begin() {
+    *(list_stack + list_depth * 8) = list_sp;
+    list_depth = list_depth + 1;
+    return 0;
+}
+
+list_push(val) {
+    *(tmp_arr + list_sp * 8) = val;
+    list_sp = list_sp + 1;
+    return 0;
+}
+
+list_end() {
+    auto saved, cnt, arr, i;
+    list_depth = list_depth - 1;
+    saved = *(list_stack + list_depth * 8);
+    cnt = list_sp - saved;
+    if (cnt == 0) { last_list_cnt = 0; list_sp = saved; return 0; }
+    arr = malloc(cnt * 8);
+    i = 0;
+    while (i < cnt) {
+        *(arr + i * 8) = *(tmp_arr + (saved + i) * 8);
+        i = i + 1;
+    }
+    list_sp = saved;
+    last_list_cnt = cnt;
+    return arr;
+}
+
+// ============================================================
+// AST node creation
+// ============================================================
+
+make_node(type) {
+    auto n, i;
+    n = malloc(NODE_SZ);
+    i = 0;
+    while (i < NODE_SZ) { *(n + i) = 0; i = i + 8; }
+    *(n + 0) = type;
+    return n;
+}
+
+// ============================================================
+// Parser: top-level structures
+// ============================================================
+
+add_global(p) {
+    *(globals + glob_cnt * 8) = p;
+    glob_cnt = glob_cnt + 1;
+    return 0;
+}
+
+// Skip an optional ": TypeName" annotation after a variable name.
+// If present, records the type for the variable.
+try_type_annotation(var_p) {
+    auto type_p, idx;
+    if (val_is_ch(58)) {
+        consume();
+        type_p = cur_packed();
+        idx = find_struct(type_p);
+        if (idx >= 0) {
+            set_var_type(var_p, idx);
+        }
+        consume();
+    }
+    return 0;
+}
+
+parse_global() {
+    auto var_p;
+    consume();
+    var_p = cur_packed();
+    add_global(var_p);
+    consume();
+    try_type_annotation(var_p);
+    while (val_is_ch(59) == 0) {
+        if (val_is_ch(44)) { consume(); }
+        var_p = cur_packed();
+        add_global(var_p);
+        consume();
+        try_type_annotation(var_p);
+    }
+    consume();
+    return 0;
+}
+
+parse_global_simple() {
+    add_global(cur_packed());
+    consume();
+    if (val_is_ch(59)) { consume(); }
+    return 0;
+}
+
+parse_import() {
+    auto lib_p, ret_p, name_p, args_arr, ext;
+    auto tp, ts, tl, pi;
+    consume();
+    // Check if this is a file import (just a string followed by ;).
+    if (peek_type() == TK_STR) {
+        if (val_at_ch(1, 59)) {
+            // File import: skip for now (handled by Python compiler).
+            consume();
+            consume();
+            return 0;
+        }
+    }
+    // Library import: import "lib" { ... }
+    lib_p = pack(peek_vstart() + 1, peek_vlen() - 2);
+    consume();
+    consume();
+    while (val_is_ch(125) == 0) {
+        // Read the return type. Merge "type" + "*" into "type*".
+        tp = cur_packed();
+        consume();
+        if (val_is_ch(42)) {
+            ts = vbuf_pos;
+            tl = unpack_l(tp);
+            pi = 0;
+            while (pi < tl) {
+                poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
+                vbuf_pos = vbuf_pos + 1;
+                pi = pi + 1;
+            }
+            poke(vbuf + vbuf_pos, '*');
+            vbuf_pos = vbuf_pos + 1;
+            tp = pack(ts, tl + 1);
+            consume();
+        }
+        ret_p = tp;
+        name_p = cur_packed();
+        consume();
+        consume();
+        list_begin();
+        while (val_is_ch(41) == 0) {
+            // Read the argument type. Merge "type" + "*" into "type*".
+            tp = cur_packed();
+            consume();
+            if (val_is_ch(42)) {
+                ts = vbuf_pos;
+                tl = unpack_l(tp);
+                pi = 0;
+                while (pi < tl) {
+                    poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
+                    vbuf_pos = vbuf_pos + 1;
+                    pi = pi + 1;
+                }
+                poke(vbuf + vbuf_pos, '*');
+                vbuf_pos = vbuf_pos + 1;
+                tp = pack(ts, tl + 1);
+                consume();
+            }
+            list_push(tp);
+            if (val_is_ch(44)) { consume(); }
+        }
+        consume();
+        consume();
+        args_arr = list_end();
+        ext = malloc(NODE_SZ);
+        *(ext + 0) = 21;
+        *(ext + 8) = name_p;
+        *(ext + 16) = lib_p;
+        *(ext + 24) = ret_p;
+        *(ext + 32) = args_arr;
+        *(ext + 40) = last_list_cnt;
+        *(externs + ext_cnt * 8) = ext;
+        ext_cnt = ext_cnt + 1;
+    }
+    consume();
+    return 0;
+}
+
+// Parse a struct definition: struct Name { field1, field2 }
+parse_struct() {
+    auto name_p, idx;
+    consume();
+    name_p = cur_packed();
+    consume();
+    consume();
+    idx = add_struct_def(name_p);
+    while (val_is_ch(125) == 0) {
+        add_struct_field(idx, cur_packed());
+        consume();
+        // Skip optional type annotation on fields.
+        if (val_is_ch(58)) {
+            consume();
+            consume();
+        }
+        if (val_is_ch(44)) { consume(); }
+    }
+    consume();
+    return 0;
+}
+
+// Forward declarations handled by the emitter.
+parse_statement() { return 0; }
+parse_expr() { return 0; }
+parse_primary() { return 0; }
+parse_unary() { return 0; }
+
+parse_function() {
+    auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p;
+    name_p = cur_packed();
+    consume();
+    consume();
+    list_begin();
+    while (val_is_ch(41) == 0) {
+        var_p = cur_packed();
+        list_push(var_p);
+        consume();
+        try_type_annotation(var_p);
+        if (val_is_ch(44)) { consume(); }
+    }
+    consume();
+    params_arr = list_end();
+    param_cnt = last_list_cnt;
+    consume();
+    list_begin();
+    while (val_is_ch(125) == 0) {
+        list_push(parse_statement());
+    }
+    consume();
+    body_arr = list_end();
+    body_cnt = last_list_cnt;
+    func = malloc(NODE_SZ);
+    *(func + 0) = 22;
+    *(func + 8) = name_p;
+    *(func + 16) = params_arr;
+    *(func + 24) = param_cnt;
+    *(func + 32) = body_arr;
+    *(func + 40) = body_cnt;
+    *(funcs + func_cnt * 8) = func;
+    func_cnt = func_cnt + 1;
+    return 0;
+}
+
+parse_program() {
+    while (tok_pos < tok_cnt) {
+        if (peek_type() == TK_IMP) {
+            parse_import();
+        } else if (peek_type() == TK_KW) {
+            if (val_is("auto", 4)) {
+                parse_global();
+            } else if (val_is("struct", 6)) {
+                parse_struct();
+            } else {
+                consume();
+            }
+        } else if (peek_type() == TK_ID) {
+            if (val_at_ch(1, 40)) {
+                parse_function();
+            } else {
+                parse_global_simple();
+            }
+        } else {
+            consume();
+        }
+    }
+    return 0;
+}
+
+// ============================================================
+// Parser: statements
+// ============================================================
+
+parse_body() {
+    list_begin();
+    if (val_is_ch(123)) {
+        consume();
+        while (val_is_ch(125) == 0) { list_push(parse_statement()); }
+        consume();
+    } else {
+        list_push(parse_statement());
+    }
+    return list_end();
+}
+
+parse_if() {
+    auto cond, body_arr, body_cnt, else_arr, else_cnt, node;
+    consume();
+    consume();
+    cond = parse_expr();
+    consume();
+    body_arr = parse_body();
+    body_cnt = last_list_cnt;
+    else_arr = 0;
+    else_cnt = 0;
+    if (peek_type() == TK_KW) {
+        if (val_is("else", 4)) {
+            consume();
+            else_arr = parse_body();
+            else_cnt = last_list_cnt;
+        }
+    }
+    node = make_node(T_IF);
+    *(node + 8) = cond;
+    *(node + 16) = body_arr;
+    *(node + 24) = body_cnt;
+    *(node + 32) = else_arr;
+    *(node + 40) = else_cnt;
+    return node;
+}
+
+parse_while(hint_p) {
+    auto cond, body_arr, node;
+    consume();
+    consume();
+    cond = parse_expr();
+    consume();
+    body_arr = parse_body();
+    node = make_node(T_WHILE);
+    *(node + 8) = cond;
+    *(node + 16) = body_arr;
+    *(node + 24) = last_list_cnt;
+    *(node + 32) = hint_p;
+    return node;
+}
+
+parse_return() {
+    auto node;
+    consume();
+    node = make_node(T_RET);
+    *(node + 8) = parse_expr();
+    if (val_is_ch(59)) { consume(); }
+    return node;
+}
+
+parse_statement() {
+    auto node, var_p, hint_p;
+    // Dispatch hint: @seq, @par, @gpu before while.
+    hint_p = 0;
+    if (peek_type() == TK_PUNCT) {
+        if (val_is_ch(64)) {
+            consume();
+            hint_p = cur_packed();
+            consume();
+        }
+    }
+    if (peek_type() == TK_KW) {
+        if (val_is("auto", 4)) {
+            consume();
+            list_begin();
+            var_p = cur_packed();
+            list_push(var_p);
+            consume();
+            try_type_annotation(var_p);
+            while (val_is_ch(59) == 0) {
+                if (val_is_ch(44)) { consume(); }
+                var_p = cur_packed();
+                list_push(var_p);
+                consume();
+                try_type_annotation(var_p);
+            }
+            consume();
+            node = make_node(T_DECL);
+            *(node + 8) = list_end();
+            *(node + 16) = last_list_cnt;
+            return node;
+        }
+        if (val_is("if", 2)) { return parse_if(); }
+        if (val_is("while", 5)) { return parse_while(hint_p); }
+        if (val_is("return", 6)) { return parse_return(); }
+    }
+    node = parse_expr();
+    if (val_is_ch(59)) { consume(); }
+    return node;
+}
+
+// ============================================================
+// Parser: expressions with precedence climbing
+// ============================================================
+
+get_op_prec() {
+    auto vs, vl, c0, c1;
+    if (peek_type() != TK_OP) { return -1; }
+    vs = peek_vstart();
+    vl = peek_vlen();
+    if (vl == 1) {
+        c0 = peek(vbuf + vs);
+        if (c0 == '|') { return 3; }
+        if (c0 == '^') { return 4; }
+        if (c0 == '&') { return 5; }
+        if (c0 == '<') { return 7; }
+        if (c0 == '>') { return 7; }
+        if (c0 == '+') { return 9; }
+        if (c0 == '-') { return 9; }
+        if (c0 == '*') { return 10; }
+        if (c0 == '/') { return 10; }
+        if (c0 == '%') { return 10; }
+        return -1;
+    }
+    if (vl == 2) {
+        c0 = peek(vbuf + vs);
+        c1 = peek(vbuf + vs + 1);
+        if (c0 == '|') { if (c1 == '|') { return 1; } }
+        if (c0 == '&') { if (c1 == '&') { return 2; } }
+        if (c0 == '=') { if (c1 == '=') { return 6; } }
+        if (c0 == '!') { if (c1 == '=') { return 6; } }
+        if (c0 == '<') { if (c1 == '=') { return 7; } }
+        if (c0 == '>') { if (c1 == '=') { return 7; } }
+        if (c0 == '<') { if (c1 == '<') { return 8; } }
+        if (c0 == '>') { if (c1 == '>') { return 8; } }
+    }
+    return -1;
+}
+
+parse_binops(left, min_prec) {
+    auto prec, op_p, right, node;
+    while (get_op_prec() >= min_prec) {
+        prec = get_op_prec();
+        op_p = cur_packed();
+        consume();
+        right = parse_unary();
+        while (get_op_prec() > prec) {
+            right = parse_binops(right, get_op_prec());
+        }
+        node = make_node(T_BINOP);
+        *(node + 8) = op_p;
+        *(node + 16) = left;
+        *(node + 24) = right;
+        left = node;
+    }
+    return left;
+}
+
+parse_unary() {
+    auto node, op_p;
+    if (peek_type() == TK_OP) {
+        if (val_is_ch(42)) {
+            consume();
+            node = make_node(T_MEMLD);
+            *(node + 8) = parse_primary();
+            return node;
+        }
+        if (val_is_ch(45)) {
+            op_p = cur_packed();
+            consume();
+            node = make_node(T_UNARY);
+            *(node + 8) = op_p;
+            *(node + 16) = parse_unary();
+            return node;
+        }
+    }
+    return parse_primary();
+}
+
+// Resolve chained .field access on a variable node.
+// Returns a mem_load node with computed offset.
+resolve_dot(base_node, name_p) {
+    auto vtype, field_p, offset, ptr_node, plus_op, off_node;
+    vtype = get_var_type(name_p);
+    while (val_is_ch(46)) {
+        if (vtype < 0) { return base_node; }
+        consume();
+        field_p = cur_packed();
+        consume();
+        offset = get_field_offset(vtype, field_p);
+        // Build: mem_load(ptr: binop(base + offset))
+        plus_op = make_plus_op();
+        off_node = make_int_lit(offset);
+        ptr_node = make_node(T_BINOP);
+        *(ptr_node + 8) = plus_op;
+        *(ptr_node + 16) = base_node;
+        *(ptr_node + 24) = off_node;
+        base_node = make_node(T_MEMLD);
+        *(base_node + 8) = ptr_node;
+        // TODO: update vtype for nested struct fields.
+    }
+    return base_node;
+}
+
+parse_expr() {
+    auto left, deref, node;
+    // Dereference store: *(deref) = val
+    if (peek_type() == TK_OP) {
+        if (val_is_ch(42)) {
+            consume();
+            deref = parse_primary();
+            if (val_is_ch(61)) {
+                consume();
+                node = make_node(T_MEMST);
+                *(node + 8) = deref;
+                *(node + 16) = parse_expr();
+                return node;
+            }
+            left = make_node(T_MEMLD);
+            *(left + 8) = deref;
+            return parse_binops(left, 0);
+        }
+        // Unary minus at expression start.
+        if (val_is_ch(45)) {
+            left = parse_unary();
+            return parse_binops(left, 0);
+        }
+    }
+    left = parse_primary();
+    // Assignment: var = expr or var.field = expr
+    if (val_is_ch(61)) {
+        consume();
+        // If left is a mem_load (from dot access), convert to mem_store.
+        if (*(left + 0) == T_MEMLD) {
+            node = make_node(T_MEMST);
+            *(node + 8) = *(left + 8);
+            *(node + 16) = parse_expr();
+            return node;
+        }
+        node = make_node(T_ASSIGN);
+        *(node + 8) = left;
+        *(node + 16) = parse_expr();
+        return node;
+    }
+    return parse_binops(left, 0);
+}
+
+parse_primary() {
+    auto t, node, name_p, args_arr, type_p, sidx;
+    t = peek_type();
+
+    // sizeof(TypeName) — resolve at parse time.
+    if (t == TK_KW) {
+        if (val_is("sizeof", 6)) {
+            consume();
+            consume();
+            type_p = cur_packed();
+            consume();
+            consume();
+            sidx = find_struct(type_p);
+            if (sidx >= 0) {
+                return make_int_lit(get_struct_size(sidx));
+            }
+            return make_int_lit(8);
+        }
+    }
+
+    if (t == TK_NUM | t == TK_HEX | t == TK_STR | t == TK_FLOAT) {
+        node = make_node(T_LIT);
+        *(node + 8) = cur_packed();
+        consume();
+        return node;
+    }
+    if (t == TK_ID) {
+        name_p = cur_packed();
+        consume();
+        if (val_is_ch(40)) {
+            consume();
+            list_begin();
+            while (val_is_ch(41) == 0) {
+                list_push(parse_expr());
+                if (val_is_ch(44)) { consume(); }
+            }
+            consume();
+            args_arr = list_end();
+            node = make_node(T_CALL);
+            *(node + 8) = name_p;
+            *(node + 16) = args_arr;
+            *(node + 24) = last_list_cnt;
+            return node;
+        }
+        node = make_node(T_VAR);
+        *(node + 8) = name_p;
+        // Handle .field access if this variable has a struct type.
+        if (val_is_ch(46)) {
+            node = resolve_dot(node, name_p);
+        }
+        return node;
+    }
+    if (val_is_ch(40)) {
+        consume();
+        node = parse_expr();
+        consume();
+        return node;
+    }
+    consume();
+    return make_node(T_NOP);
+}
+
+// ============================================================
+// JSON emitter
+// ============================================================
+
+// Emit packed string with JSON escaping, wrapped in quotes.
+emit_jp(p) {
+    auto s, l, i, ch;
+    s = unpack_s(p);
+    l = unpack_l(p);
+    putchar('"');
+    i = 0;
+    while (i < l) {
+        ch = peek(vbuf + s + i);
+        if (ch == '"') { putchar('\\'); putchar('"'); }
+        else if (ch == '\\') { putchar('\\'); putchar('\\'); }
+        else { putchar(ch); }
+        i = i + 1;
+    }
+    putchar('"');
+    return 0;
+}
+
+// JSON output helpers. Output JSON fragments using putchar for the
+// double-quote character (34) which cannot appear in B++ string literals.
+
+// Open a JSON object with a "type" key: {"type": "t"
+jot(t) {
+    putchar('{'); putchar('"');
+    print_str("type");
+    putchar('"');
+    print_str(": ");
+    putchar('"');
+    print_str(t);
+    putchar('"');
+    return 0;
+}
+
+// Output a JSON key-value separator: , "k":
+jkp(k) {
+    print_str(", ");
+    putchar('"');
+    print_str(k);
+    putchar('"');
+    print_str(": ");
+    return 0;
+}
+
+// Open a JSON object with a named key: {"k":
+jopen(k) {
+    putchar('{');
+    putchar('"');
+    print_str(k);
+    putchar('"');
+    print_str(": ");
+    return 0;
+}
+
+// Emit an AST node as JSON.
+emit_node(n) {
+    auto t, i, arr, cnt;
+    if (n == 0) { print_str("null"); return 0; }
+    t = *(n + 0);
+    if (t == T_LIT) {
+        jot("lit"); jkp("val"); emit_jp(*(n + 8)); putchar('}');
+        return 0;
+    }
+    if (t == T_VAR) {
+        jot("var"); jkp("name"); emit_jp(*(n + 8)); putchar('}');
+        return 0;
+    }
+    if (t == T_BINOP) {
+        jot("binop"); jkp("op"); emit_jp(*(n + 8));
+        jkp("left"); emit_node(*(n + 16));
+        jkp("right"); emit_node(*(n + 24));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_UNARY) {
+        jot("unary_op"); jkp("op"); emit_jp(*(n + 8));
+        jkp("right"); emit_node(*(n + 16));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_ASSIGN) {
+        jot("assign"); jkp("left"); emit_node(*(n + 8));
+        jkp("right"); emit_node(*(n + 16));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_MEMLD) {
+        jot("mem_load"); jkp("ptr"); emit_node(*(n + 8));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_MEMST) {
+        jot("mem_store"); jkp("ptr"); emit_node(*(n + 8));
+        jkp("val"); emit_node(*(n + 16));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_CALL) {
+        jot("call"); jkp("name"); emit_jp(*(n + 8));
+        jkp("args"); putchar('[');
+        arr = *(n + 16);
+        cnt = *(n + 24);
+        i = 0;
+        while (i < cnt) {
+            if (i > 0) { print_str(", "); }
+            emit_node(*(arr + i * 8));
+            i = i + 1;
+        }
+        putchar(']'); putchar('}');
+        return 0;
+    }
+    if (t == T_IF) {
+        jot("if"); jkp("cond"); emit_node(*(n + 8));
+        jkp("body"); putchar('[');
+        arr = *(n + 16);
+        cnt = *(n + 24);
+        i = 0;
+        while (i < cnt) {
+            if (i > 0) { print_str(", "); }
+            emit_node(*(arr + i * 8));
+            i = i + 1;
+        }
+        putchar(']');
+        if (*(n + 40) > 0) {
+            jkp("else_body"); putchar('[');
+            arr = *(n + 32);
+            cnt = *(n + 40);
+            i = 0;
+            while (i < cnt) {
+                if (i > 0) { print_str(", "); }
+                emit_node(*(arr + i * 8));
+                i = i + 1;
+            }
+            putchar(']');
+        }
+        putchar('}');
+        return 0;
+    }
+    if (t == T_WHILE) {
+        jot("while"); jkp("cond"); emit_node(*(n + 8));
+        jkp("body"); putchar('[');
+        arr = *(n + 16);
+        cnt = *(n + 24);
+        i = 0;
+        while (i < cnt) {
+            if (i > 0) { print_str(", "); }
+            emit_node(*(arr + i * 8));
+            i = i + 1;
+        }
+        putchar(']');
+        // Emit dispatch hint if present.
+        if (*(n + 32) != 0) {
+            jkp("dispatch_hint"); emit_jp(*(n + 32));
+        }
+        putchar('}');
+        return 0;
+    }
+    if (t == T_RET) {
+        jot("return"); jkp("val"); emit_node(*(n + 8));
+        putchar('}');
+        return 0;
+    }
+    if (t == T_DECL) {
+        jot("decl"); jkp("vars"); putchar('[');
+        arr = *(n + 8);
+        cnt = *(n + 16);
+        i = 0;
+        while (i < cnt) {
+            if (i > 0) { print_str(", "); }
+            emit_jp(*(arr + i * 8));
+            i = i + 1;
+        }
+        putchar(']'); putchar('}');
+        return 0;
+    }
+    if (t == T_NOP) {
+        jot("nop"); putchar('}');
+        return 0;
+    }
+    print_str("null");
+    return 0;
+}
+
+// Emit a single extern function entry.
+emit_extern(ext) {
+    auto i, arr, cnt;
+    emit_jp(*(ext + 8));
+    print_str(": ");
+    jopen("lib"); emit_jp(*(ext + 16));
+    jkp("ret"); emit_jp(*(ext + 24));
+    jkp("args"); putchar('[');
+    arr = *(ext + 32);
+    cnt = *(ext + 40);
+    i = 0;
+    while (i < cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_jp(*(arr + i * 8));
+        i = i + 1;
+    }
+    putchar(']'); putchar('}');
+    return 0;
+}
+
+// Emit a single function entry.
+emit_func(func) {
+    auto i, arr, cnt;
+    emit_jp(*(func + 8));
+    print_str(": ");
+    jopen("params"); putchar('[');
+    arr = *(func + 16);
+    cnt = *(func + 24);
+    i = 0;
+    while (i < cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_jp(*(arr + i * 8));
+        i = i + 1;
+    }
+    putchar(']');
+    jkp("body"); putchar('[');
+    arr = *(func + 32);
+    cnt = *(func + 40);
+    i = 0;
+    while (i < cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_node(*(arr + i * 8));
+        i = i + 1;
+    }
+    putchar(']'); putchar('}');
+    return 0;
+}
+
+// Emit the complete program IR as JSON.
+emit_program() {
+    auto i;
+    jopen("extern_functions"); putchar('{');
+    i = 0;
+    while (i < ext_cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_extern(*(externs + i * 8));
+        i = i + 1;
+    }
+    putchar('}');
+    jkp("functions"); putchar('{');
+    i = 0;
+    while (i < func_cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_func(*(funcs + i * 8));
+        i = i + 1;
+    }
+    putchar('}');
+    jkp("globals"); putchar('[');
+    i = 0;
+    while (i < glob_cnt) {
+        if (i > 0) { print_str(", "); }
+        emit_jp(*(globals + i * 8));
+        i = i + 1;
+    }
+    putchar(']'); putchar('}'); putchar('\n');
+    return 0;
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+main() {
+    init();
+    read_tokens();
+    parse_program();
+    emit_program();
+    return 0;
+}

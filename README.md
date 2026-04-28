@@ -4,13 +4,13 @@
 > Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
 > Everything you need in one file. No other canonical doc.
 
-### B++ 0.111 — Portable Compiler + 47-Chapter Book — 23 April 2026
+### B++ 0.222 — Compound Operators + Pointer Primitives + Tonify Complete — 28 April 2026
 
 A self-hosting compiled language with **games that hear themselves**. Snake now plays a drum loop recorded live inside mini_synth — the polyphonic synthesizer built in the same language — while a fresh in-code 880 Hz SFX fires every time it eats an apple. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and the industry-standard text-file beat-map format.
 
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
-> **Version 0.111*: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark)..
+> **Version 0.222**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark).
 
 ---
 
@@ -83,7 +83,7 @@ The compiler now understands effects. Every function carries a classification �
 
 The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
 
-25 compiler modules in `src/`. 22 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 111 tests, zero failures.
+25 compiler modules in `src/`. 22 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 120 tests, zero failures.
 
 The version number is the test count.
 
@@ -139,7 +139,8 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Structs with dot access** — `struct Vec2 { x, y }`, `p.x = 10`, field-packing with bit slices
 - **Enums** — `enum State { MENU, PLAY, OVER }` resolved at compile time
 - **Constants and compile-time functions** — `const W = 320;` and `const abs(x) { ... }` with dead-code elimination lifted to the parser
-- **Pointers** — `*(ptr)` dereference, `&var` address-of, `buf[i]` array, `obj.field` struct access
+- **Pointers** — `*(ptr)` dereference, `&var` address-of, `buf[i]` array, `obj.field` struct access. Width-typed reads/writes: `peek_q/h/w` (16/32/64-bit LE), `peekfloat`/`peekfloat_h` (double/float), matching `poke_*` variants
+- **Compound operators** — `x++`, `x--`, `x += e`, `x -= e`, `x *= e`, `x /= e`, `x %= e` — desugared in the parser, inherited by all backends
 - **Storage classes** — `auto` (default), `static` (module-private), `extrn` (frozen post-init), `global` (worker-shared), `const` (compile-time)
 - **Phase annotations** — `: base` (pure), `: solo` (main-thread), `: realtime` (no malloc, no blocking), `: io`, `: gpu`. Compiler infers; programmer overrides
 - **Ternary and short-circuit** — `x = a ? b : c;`, `if (p != 0 && p.field > 0)` both lowered in the parser (one implementation, every backend inherits)
@@ -693,6 +694,8 @@ B++ is 30 days old. The following are the milestones, in order:
 | **Apr 22** | **Phase D — STB faxina + parser opts** — 13 stb modules dogfooded to `bpp_*` APIs. Three parser passes: strength reduction (`x * 2^k → x << k`), identity peephole (`x + 0 → x`), inline trivials (`buf_new → malloc`). `arr_at` bounds-checked accessor. Tier F roadmap (`docs/tier_f_roadmap.md`) scopes CSE / RA v2 / auto-vec — gated on profile data. Suite 108 → 111 passing. |
 | **Apr 23** | **The book** — `docs/how_to_dev_b++.md` Caps 29-47 COMPLETE. All 47 chapters in the unified manual. Roadmap and todo refreshed to post-Phase-D baseline. |
 | **Apr 24** | **Tablah benchmark** — Swift hashmap benchmark ported to B++ by an external software engineer. 1M parallel key/value generation (8 workers), 1M hashmap inserts, filter pass (char + value threshold). Two variants: clean public-API (`tablah.bpp`) and hand-optimized with inlined xorshift + unrolled 9-step loop (`tablah_opt.bpp`). Drove two stdlib additions: `print_str` in `bpp_io` and the hash iteration API (`hash_cap` / `hash_slot_live` / `hash_key_at` / `hash_val_at`) in `bpp_hash`. |
+| **Apr 26-27** | **Stdlib design faxina** — Major array/string/IO design resolution. `TY_ARR` = only `arr_new()` (dynamic, 16-byte header); `buf_byte`/`buf_word` moved to `bpp_buf` as raw TY_PTR buffers — honest separation confirmed by grep: `arr_new` lives only in compiler src, never in stb/games/tools. `put(x)` smart dispatch added: compiler rewrites `put(x)` → `putstr`/`putnum`/`putfloat` by inferred type — same philosophy as `auto x = 3.14`. Fase 3 array element inference: float writes → `elem TY_FLOAT` → `DSP_GPU`; `E245` conflict error when same array receives mixed types. xfail test convention (`// xfail: EYYY`). 47 manual-loop sites replaced with canonical `str_len`/`str_cpy`/`buf_copy`/`buf_fill` calls across 11 files. Suite 117 passing. |
+| **Apr 28** | **Operators + pointer primitives + Tonify v1+v2** — `++`/`--`/`+=`/`-=`/`*=`/`/=`/`%=` desugared in parser (no new AST nodes, inherited by both backends). Ten `peek_q/h/w`/`poke_q/h/w`/`peekfloat`/`pokefloat` pointer-width primitives. Full repo tonify: R0–R20 applied across compiler src, all 22 stb modules, games, tools, Bang 9. `static auto`/`global`/`extrn`/`const` storage classes now correct on every file-scope declaration in the repo. All byte-copy loops replaced with `buf_copy`. All multi-peek LE reads replaced with `peek_h`/`peek_q`.Bang9 fix. Suite 120 passing. |
 
 B++ went from "parser that parses itself" to "musical instrument you can play" in thirty-five days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into [`docs/how_to_dev_b++.md`](docs/how_to_dev_b++.md), the unified 47-chapter book that absorbs the previously fragmented programming-language reference, dev guide, and Bang 9 design docs. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 

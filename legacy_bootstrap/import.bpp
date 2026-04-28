@@ -1,0 +1,341 @@
+// import.bpp — B++ import resolver (Stage 0).
+// Reads a B++ source file, recursively resolves import "file.bpp" directives,
+// and outputs the merged source to stdout with all imports inlined.
+//
+// Usage: bpp_import source.bpp
+// Pipeline: bpp_import source.bpp | bpp_lexer | bpp_parser | bpp_emitter > out.c
+
+// ── State ────────────────────────────────────────────────────
+
+auto fbuf;          // File read buffer (256KB), used as a stack.
+auto fbuf_top;      // Stack pointer within fbuf for nested imports.
+auto imp_hashes;    // Hash table for tracking imported files.
+auto imp_cnt;       // Number of imported files.
+auto pathbuf;       // Scratch buffer for path resolution.
+auto linebuf;       // Current line being processed.
+
+// ── String helpers ───────────────────────────────────────────
+
+print_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        putchar(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// Copy a C string (from argv pointer) into mem_base at dest. Returns length.
+copy_cstr(dest, src) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(src, i);
+    while (ch != 0) {
+        poke(dest + i, ch);
+        i = i + 1;
+        ch = str_peek(src, i);
+    }
+    return i;
+}
+
+// Simple hash of len bytes at mem_base offset.
+hash_mem(off, len) {
+    auto h, i;
+    h = 5381;
+    i = 0;
+    while (i < len) {
+        h = h * 33 + peek(off + i);
+        i = i + 1;
+    }
+    return h;
+}
+
+// Find last '/' in mem_base string. Returns offset or -1.
+last_slash(off, len) {
+    auto i, r;
+    r = -1;
+    i = 0;
+    while (i < len) {
+        if (peek(off + i) == '/') { r = i; }
+        i = i + 1;
+    }
+    return r;
+}
+
+// ── Import tracking ──────────────────────────────────────────
+
+was_imported(path_off, path_len) {
+    auto h, i;
+    h = hash_mem(path_off, path_len);
+    i = 0;
+    while (i < imp_cnt) {
+        if (*(imp_hashes + i * 8) == h) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+mark_imported(path_off, path_len) {
+    *(imp_hashes + imp_cnt * 8) = hash_mem(path_off, path_len);
+    imp_cnt = imp_cnt + 1;
+    return 0;
+}
+
+// ── Path resolution ──────────────────────────────────────────
+
+// Build: dirname(base) + "/" + name → pathbuf. Returns length.
+resolve_path(base_off, base_len, name_off, name_len) {
+    auto sl, out, i;
+    sl = last_slash(base_off, base_len);
+    out = 0;
+    if (sl >= 0) {
+        i = 0;
+        while (i <= sl) {
+            poke(pathbuf + out, peek(base_off + i));
+            out = out + 1;
+            i = i + 1;
+        }
+    }
+    i = 0;
+    while (i < name_len) {
+        poke(pathbuf + out, peek(name_off + i));
+        out = out + 1;
+        i = i + 1;
+    }
+    poke(pathbuf + out, 0);
+    return out;
+}
+
+// Try to find a file: relative to base, then in stb/ directory.
+// Returns resolved path length in pathbuf, or 0 on failure.
+find_file(base_off, base_len, name_off, name_len) {
+    auto plen, fd, i;
+
+    // Try relative to the importing file.
+    plen = resolve_path(base_off, base_len, name_off, name_len);
+    fd = sys_open(pathbuf, 0);
+    if (fd >= 0) { sys_close(fd); return plen; }
+
+    // Try in stb/ directory.
+    poke(pathbuf + 0, 's'); poke(pathbuf + 1, 't');
+    poke(pathbuf + 2, 'b'); poke(pathbuf + 3, '/');
+    i = 0;
+    while (i < name_len) {
+        poke(pathbuf + 4 + i, peek(name_off + i));
+        i = i + 1;
+    }
+    poke(pathbuf + 4 + name_len, 0);
+    fd = sys_open(pathbuf, 0);
+    if (fd >= 0) { sys_close(fd); return 4 + name_len; }
+
+    return 0;
+}
+
+// ── Line checker ─────────────────────────────────────────────
+
+// Check if a line (at loff, llen bytes in mem_base) is a file import.
+// If so, extract the filename into linebuf and return its length.
+// Returns 0 if not a file import.
+check_file_import(loff, llen) {
+    auto p, q, ch, name_start, name_len;
+    p = 0;
+
+    // Skip leading whitespace.
+    while (p < llen) {
+        ch = peek(loff + p);
+        if (ch != 32) { if (ch != 9) { ch = 0; } }
+        if (ch != 0) { p = p + 1; }
+        if (ch == 0) { p = llen + p; }
+    }
+    if (p >= llen) { p = p - llen; }
+
+    // Check for "import" (6 chars).
+    if (p + 6 > llen) { return 0; }
+    if (peek(loff + p) != 105) { return 0; }     // i
+    if (peek(loff + p + 1) != 109) { return 0; }  // m
+    if (peek(loff + p + 2) != 112) { return 0; }  // p
+    if (peek(loff + p + 3) != 111) { return 0; }  // o
+    if (peek(loff + p + 4) != 114) { return 0; }  // r
+    if (peek(loff + p + 5) != 116) { return 0; }  // t
+    p = p + 6;
+
+    // Must be followed by whitespace.
+    if (p >= llen) { return 0; }
+    ch = peek(loff + p);
+    if (ch != 32) { if (ch != 9) { return 0; } }
+
+    // Skip whitespace.
+    while (p < llen) {
+        ch = peek(loff + p);
+        if (ch != 32) { if (ch != 9) { ch = 0; } }
+        if (ch != 0) { p = p + 1; }
+        if (ch == 0) { p = llen + p; }
+    }
+    if (p >= llen) { p = p - llen; }
+
+    // Must start with a double-quote.
+    if (p >= llen) { return 0; }
+    if (peek(loff + p) != 34) { return 0; }
+    p = p + 1;
+
+    // Read filename until closing quote.
+    name_start = p;
+    while (p < llen) {
+        if (peek(loff + p) == '"') {
+            name_len = p - name_start;
+            p = p + 1;
+
+            // Skip whitespace after closing quote.
+            while (p < llen) {
+                ch = peek(loff + p);
+                if (ch != 32) { if (ch != 9) { ch = 0; } }
+                if (ch != 0) { p = p + 1; }
+                if (ch == 0) { p = llen + p; }
+            }
+            if (p >= llen) { p = p - llen; }
+
+            // Must end with ';' (not '{' which is FFI import).
+            if (p >= llen) { return 0; }
+            if (peek(loff + p) != 59) { return 0; }
+
+            // Copy filename to linebuf.
+            q = 0;
+            while (q < name_len) {
+                poke(linebuf + q, peek(loff + name_start + q));
+                q = q + 1;
+            }
+            return name_len;
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+// ── Core: process a file ─────────────────────────────────────
+
+// Forward declaration.
+process_file(path_off, path_len) { return 0; }
+
+process_file(path_off, path_len) {
+    auto fd, nread, fsize, pos, line_start, ch;
+    auto fname_len, plen, i;
+    auto saved_top, my_path, my_file;
+
+    if (was_imported(path_off, path_len)) { return 0; }
+    mark_imported(path_off, path_len);
+
+    // Save fbuf stack position so we can restore it on return.
+    saved_top = fbuf_top;
+
+    // Copy our path into the fbuf stack so it survives child recursion
+    // (pathbuf gets overwritten by find_file in nested imports).
+    my_path = fbuf_top;
+    i = 0;
+    while (i < path_len) {
+        poke(fbuf + my_path + i, peek(path_off + i));
+        i = i + 1;
+    }
+    fbuf_top = fbuf_top + path_len;
+
+    // File content will be read starting here.
+    my_file = fbuf_top;
+
+    // Copy path to pathbuf for sys_open (null-terminated).
+    i = 0;
+    while (i < path_len) {
+        poke(pathbuf + i, peek(fbuf + my_path + i));
+        i = i + 1;
+    }
+    poke(pathbuf + path_len, 0);
+
+    fd = sys_open(pathbuf, 0);
+    if (fd < 0) {
+        print_str("// IMPORT ERROR: ");
+        i = 0;
+        while (i < path_len) { putchar(peek(fbuf + my_path + i)); i = i + 1; }
+        putchar('\n');
+        fbuf_top = saved_top;
+        return 0;
+    }
+
+    // Read file contents into fbuf at our stack frame.
+    fsize = 0;
+    nread = sys_read(fd, fbuf + my_file + fsize, 65536);
+    while (nread > 0) {
+        fsize = fsize + nread;
+        nread = sys_read(fd, fbuf + my_file + fsize, 65536);
+    }
+    sys_close(fd);
+
+    // Advance fbuf_top past our data so child imports get their own space.
+    fbuf_top = my_file + fsize;
+
+    // Process line by line.
+    pos = 0;
+    while (pos < fsize) {
+        // Find end of current line.
+        line_start = pos;
+        while (pos < fsize) {
+            if (peek(fbuf + my_file + pos) == '\n') {
+                pos = pos + 1;
+                pos = fsize + pos;
+            }
+            if (pos <= fsize) { pos = pos + 1; }
+        }
+        if (pos > fsize) { pos = pos - fsize; }
+
+        // Check if this line is a file import.
+        fname_len = check_file_import(fbuf + my_file + line_start, pos - line_start);
+        if (fname_len > 0) {
+            // Use my_path (saved in fbuf stack) for dirname resolution.
+            plen = find_file(fbuf + my_path, path_len, linebuf, fname_len);
+            if (plen > 0) {
+                process_file(pathbuf, plen);
+            } else {
+                print_str("// IMPORT NOT FOUND: ");
+                i = 0;
+                while (i < fname_len) { putchar(peek(linebuf + i)); i = i + 1; }
+                putchar('\n');
+            }
+        } else {
+            // Output the line as-is.
+            i = line_start;
+            while (i < pos) {
+                putchar(peek(fbuf + my_file + i));
+                i = i + 1;
+            }
+        }
+    }
+
+    // Restore fbuf stack position.
+    fbuf_top = saved_top;
+    return 0;
+}
+
+// ── Main ─────────────────────────────────────────────────────
+
+main() {
+    auto argc, arg_ptr, arg_len;
+
+    fbuf = malloc(262144);
+    fbuf_top = 0;
+    imp_hashes = malloc(2048);
+    imp_cnt = 0;
+    pathbuf = malloc(4096);
+    linebuf = malloc(4096);
+
+    argc = argc_get();
+    if (argc < 2) {
+        print_str("Usage: bpp_import source.bpp");
+        putchar('\n');
+        return 1;
+    }
+
+    arg_ptr = argv_get(1);
+    arg_len = copy_cstr(pathbuf, arg_ptr);
+    process_file(pathbuf, arg_len);
+    return 0;
+}

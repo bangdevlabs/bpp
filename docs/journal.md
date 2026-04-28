@@ -1,5 +1,95 @@
 # B++ Bootstrap Journal
 
+## 2026-04-28 — 🧹 TONIFY V1+V2: FULL REPO FAXINA + OPERATORS + POINTER PRIMITIVES
+
+Two-session sweep that brought the entire B++ codebase — compiler, stdlib, games,
+tools, IDE — to expert-state quality per the `docs/tonify_checklist.md` playbook,
+and shipped two language features that had been in the backlog.
+
+**New language features**
+
+Seven compound-assignment and increment operators desugared in the parser:
+`++`, `--`, `+=`, `-=`, `*=`, `/=`, `%=`. All lower to `T_ASSIGN(lhs, T_BINOP(op,
+lhs, rhs))` — no new AST nodes, no backend changes, every existing backend
+inherits automatically. Prefix `++x` and postfix `x++` both supported.
+
+Ten pointer-width read primitives added to `bpp_codegen.bsm` and wired into
+`bpp_buf.bsm`:
+
+| Builtin | Width | Description |
+|---------|-------|-------------|
+| `peek_q(p)` | 16-bit | Zero-extending little-endian half-word read |
+| `peek_h(p)` | 32-bit | Zero-extending little-endian word read |
+| `peek_w(p)` | 64-bit | 64-bit read (full word) |
+| `poke_q(p,v)` / `poke_h(p,v)` / `poke_w(p,v)` | 16/32/64-bit | Corresponding writes |
+| `peekfloat(p)` | 64-bit IEEE 754 | Double read |
+| `peekfloat_h(p)` | 32-bit IEEE 754 | Float read with FCVT→double |
+| `pokefloat(p,v)` / `pokefloat_h(p,v)` | 64/32-bit | Corresponding float writes |
+
+Fixed two bugs uncovered during wiring: `peek_q/h/w` returned 0 instead of 1
+(dispatch convention error — `cg_builtin_dispatch` uses `ety+1` encoding);
+`pokefloat` caused SIGSEGV because `emit_fpush`/`emit_fpop` function pointers
+were never installed in `ChipPrimitives`. Both fixed in `a64_codegen.bsm` and
+`x64_codegen.bsm`.
+
+**Tonify v1 — Phases 1–4 (full repo, all rules)**
+
+The `tonify_checklist.md` was first extended with Rules 14–19:
+- R14: `x = x + 1` → `x++` / `x = x - 1` → `x--`
+- R15: `x = x op expr` → `x op= expr` (for `+=`, `-=` only; `*=`/`/=`/`%=`
+  require a single-term RHS to avoid precedence breakage)
+- R16: manual `poke` fill loops → `buf_fill`
+- R17: `putstr`/`putnum`/`putfloat` → `put()`; `putstr_err`/`putnum_err` → `put_err()`
+- R18: multi-byte `peek` concat → `peek_q`/`peek_h`/`peek_w`/`peekfloat`
+- R19: `malloc(n*8)` word-indexed → `buf_word(n)`;  `malloc(n)` byte buffer → `buf_byte(n)`
+- R20: byte-by-byte `poke`/`peek` copy loops → `buf_copy`/`buf_move`
+
+Pitfall 4 added: `return 0 - 1` → `return -1` (B++ supports unary minus on literals).
+
+Phase 1 (mechanical sweeps — stb/, games/, tools/, bang9/): R0 (`import` →
+`load` for same-dir modules in bang9/), R14 residual, R17, Pitfall 4.
+
+Phase 2 (stb/ + games/ R1 storage classes): `extrn`/`global`/`static auto`/`const`
+applied across all 20 stb modules. Key changes: `stbimage` Huffman tables →
+`static auto`; `stbinput` mouse state → `global`; `stbui` helpers → `static`;
+`stbforge` poke fill loops → `buf_fill`.
+
+Phase 3 (src/ compiler internals R1): Per-file bootstrap after each group.
+`bpp_dispatch` DSP_*/PHASE_* constants → `const`; `bpp_parser` and `bpp_codegen`
+large global maps → `global`/`extrn`/`static auto` as appropriate.
+
+Phase 4 (backend + tools/ + bang9/ R1): All chip encoders (`a64_enc`, `x64_enc`),
+codegens, Mach-O and ELF writers, both platform layers, C emitter, debugger
+reader/GDB/observe modules. `MO_PAGE_SIZE`/`CC_O..CC_G`/`SIGTRAP` etc. → `const`.
+`_stb_last_time` → `global` (written by stbgame each frame). `ModuLab` core/canvas/
+select state → appropriate classes. Bang9 modules already clean.
+
+Bootstrap verified (`gen1 == gen2`) after each phase. Test suite 120/0/11 throughout.
+
+**Tonify v2 — Phase 5 (R18 + R19 + R20)**
+
+Triggered immediately since pointer primitives and `buf_copy`/`buf_move`/`buf_cmp`
+were already landed.
+
+R18 (multi-peek → peek_h/peek_q): `enc_read32` in `a64_enc` and `x64_enc` collapsed
+from 4-line peek-shift-or to single `peek_h` call. `_rd32` in both `bug_observe`
+files likewise. Three `peek_q` (2-byte LE) reads in `bug_observe_linux` ELF parser.
+Skipped: SHA-256 big-endian block load (a64_macho), stbimage bit accumulator
+(variable shift), platform_macos X11 setup loop (big-endian).
+
+R19 (malloc(n\*8) → buf_word): `bug.bpp` bp_names, `bpp_internal` AST fallback,
+all bang9/ argv/button/tab/keyword arrays (7 sites).
+
+R20 (byte loops → buf_copy): `canvas_restore`/`canvas_snapshot` (modulab),
+`_undo_apply`/snapshot in level_editor, `stbforge` animation array grow,
+`stbimage` `_put_bytes` helper and inflate stored-block copy, `bug_gdb` packet
+assembly, `bpp_import` 21 sites (16 auto-inject path copies + 5 path/filename
+copies), `bpp.bpp` ELF string data builder.
+
+Final suite: **120 passed, 0 failed, 11 skipped**.
+
+---
+
 ## 2026-04-24 — 🧪 TABLAH: EXTERNAL BENCHMARK + HASH ITERATION API
 
 First external stress-test of B++. A software engineer ported **tablah** — a
@@ -4623,3 +4713,93 @@ modules (`stbpal` added). New tests: `test_modulab_testbed_level`,
 - Testbed world defaults to hand-drawn platformer layout —
   documented in response but worth documenting here: drop a
   `testbed.level.json` next to the binary to override.
+
+## 2026-04-26/27 — Stdlib design faxina: arrays, IO dispatch, canonical API sweep
+
+**The array question resolved.** A long design discussion settled the
+three-tier array model that had been implicit but never documented:
+
+| Constructor | Returns | Header | API |
+|---|---|---|---|
+| `arr_new()` | TY_ARR | yes (16 bytes) | arr_push/pop/len/get/set/free |
+| `buf_word(n)` | TY_PTR | no | buf[i] direct |
+| `buf_byte(n)` | TY_PTR | no | poke/peek |
+
+`arr_new` is the only true dynamic array. `buf_word`/`buf_byte` are
+stride sugar over malloc — naming them `arr_*` was a lie of type.
+Confirmed by grep: `arr_new` appears only in `src/` (compiler) and
+tests. Every stb module and game uses fixed-size allocations because
+game worlds are bounded. `buf_word`/`buf_byte` moved to `bpp_buf.bsm`
+(36 files, 164 call sites renamed).
+
+**Opção A rationale.** The alternative (add 16-byte headers to
+`buf_word`/`buf_byte` so they work with arr_len) would silently add
+overhead to every Huffman table, pixel buffer, and audio PCM
+allocation in the codebase without any benefit — the programmer who
+writes `buf_word(256)` already knows the size and never calls arr_len.
+
+**TY_ARR type system (Fase 2, already shipped).** `BASE_ARR = 0x06`
+(not 0x05 — bit 0 of 0x05 is set, making `is_float_type` return 1 for
+all arrays). `arr_new` returns TY_ARR; `buf_word`/`buf_byte` return
+TY_PTR. The type distinction enables dispatch analysis without any
+runtime overhead.
+
+**Fase 3: element type inference.** `add_type()` in `bpp_types.bsm`
+infers the element type of TY_ARR variables:
+- Float write `a[i] = 3.14` → marks elem TY_FLOAT → classify_loop
+  dispatches DSP_GPU (SIMD-friendly).
+- `str_len(a)` where a:TY_ARR → marks elem TY_WORD_B (byte/char).
+- Conflict: if same array receives two incompatible element types →
+  E245 `array element type conflict` with source location.
+- `save_fn_types()` expanded to 24-byte triplets `[name][type][elem]`
+  to persist elem_type across functions.
+
+**xfail test convention.** `tests/run_all.sh` now reads the first line
+of each test file for `// xfail: EYYY`. If present, the test passes
+when the compiler emits that error code and fails when it compiles
+cleanly. First user: `test_array_elem_conflict.bpp` verifies E245.
+
+**`put(x)` smart dispatch.** The programmer writes `put(x)` for any
+type — same philosophy as `auto x = 3.14`:
+
+```
+put("hello")  → TY_PTR   → putstr("hello")
+put(42)       → TY_WORD  → putnum(42)
+put(3.14)     → TY_FLOAT → putfloat(3.14)
+```
+
+Implemented as an AST rewrite in `add_type()` T_CALL: before codegen
+sees the call, `n.a` (function name) is replaced with the target. No
+new codegen needed. `put_err(x)` mirrors for stderr. `putfloat` and
+`putfloat_err` added to `bpp_io.bsm` (4-decimal float printer via
+float→word truncation + iterative digit extraction).
+
+**Canonical API faxina.** Explore agent found 47 manual
+reimplementations across 11 files; all replaced:
+- 3 manual null-terminator walks → `str_len`
+- 7 manual str_peek/poke copy loops → `str_cpy`
+- 27 manual poke-per-byte copy loops → `buf_copy`
+  (includes 16 filename copies in bpp_import, 4 direct memcpy FFI
+  calls in bpp_path)
+- 10 manual poke-zero loops → `buf_fill`
+
+Files: bug_gdb, bpp_import, bug_observe_macos/linux,
+_stb_platform_linux, _stb_platform_macos, a64_macho,
+modulab/core, modulab/io, modulab_lib, bpp_path.
+
+**strbuf audit.** `strbuf_*` (dynamic string builder) is actively used
+in modulab, level_editor, stbforge, stbpal (15 new / 12 cat / 16 free
+/ 9 len calls). `str_chr`, `str_neq`, `str_cat_raw`, `str_from_int`,
+`strbuf_num` are dead code from the user-facing perspective — only
+called internally within bpp_str or by src/ compiler code.
+
+**Emacs bpp-mode.el updated.** Added `static`, `global`, `void`
+keywords; fixed function-definition pattern to handle all prefix
+combinations (`static void fn(`, `static fn(`, `void fn(`, `fn(`);
+added type hint patterns for effect annotations (`: base`, `: solo`,
+`: io`, `: realtime`, `: gpu`); updated all constants to current
+naming (`TY_ARR`, `T_SWITCH`, `T_TERNARY`, `DSP_*`, `PHASE_*`,
+`GLOB_*`); removed stale names (`TY_UNKNOWN`, `TY_BYTE`, `TY_LONG`).
+
+**Suite.** 117 passed, 0 failed, 11 skipped (128 total). Bootstrap
+g2 == g3.

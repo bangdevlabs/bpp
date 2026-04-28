@@ -1,13 +1,14 @@
 # B++ Roadmap
 
-## Status — 2026-04-23
+## Status — 2026-04-28
 
-Version 0.111. Self-hosting, dual-backend (ARM64 native macOS + x86_64
+Version 0.120. Self-hosting, dual-backend (ARM64 native macOS + x86_64
 cross-compile Linux), C emitter in parity. **Compiler backend fully
-portable**: all dispatchers (`cg_emit_func`, `cg_emit_stmt`,
-`cg_emit_node`, `cg_builtin_dispatch`) live in the spine
-(`bpp_codegen.bsm`); both chip backends delegate through `cg_prim`.
-Suite at **111 passed / 3 GPU-flakes / 11 skipped**. bpp = `72e1b793`.
+portable**: spine owns all dispatchers, both chip backends delegate through
+`cg_prim`. Compound operators (`++`/`--`/`+=`/`-=`/`*=`/`/=`/`%=`).
+Pointer-width primitives (`peek_q/h/w`, `poke_q/h/w`, `peekfloat*`/`pokefloat*`).
+Tonify v1+v2 complete — full repo in expert state (R0–R20).
+Suite at **120 passed / 0 failed / 11 skipped**.
 
 For the story of how we got here, see `docs/journal.md`. This file is
 forward-looking only.
@@ -39,13 +40,19 @@ about the language it was written in.
   ✅ ModuLab 1.0 — pixel editor, 5 phases
   ✅ Waves 18-21 — portable compiler (spine owns all dispatchers)
   ✅ Phase D — stb faxina + parser opts + book Caps 29-47 COMPLETE
+  ✅ Tonify v1+v2 — full repo expert state + operators + pointer primitives
  ─────────────────────────────────────────────────────────────────────
      ↓ WE ARE HERE ↓
  ─────────────────────────────────────────────────────────────────────
-     (first 1.0 game)
-     Dev Loop 3 — profiler (bench + sampling)
+     bug Phase 1 — watch list at breakpoints (~1 session, mostly wiring)
+     bug Phase 2 — type-aware display: struct/array/string tree (~2 sessions)
+     bug Phase 3 — expression evaluator: name.field, ptr[i], arithmetic (~2 sessions)
+     bug Phase 4 — interactive TUI: watch window REPL, step/continue (~2 sessions)
+  ── debugger ready ────────────────────────────────────────────────────
      Wolf3D Phase 1  — CPU raycaster, 1 level
+     bug Phase 5 — graphical visualizers: @viz: hints, framebuffer as image
      Wolf3D Phase 2  — hybrid CPU + GPU
+     Dev Loop 3  — profiler (reuses bug Phase 1 infrastructure)
      Dev Loop 4 — hot reload watch mode
      RPG Dungeon demo
      Dev Loop 5 — metaprogramming (`$T` + reflection)
@@ -56,16 +63,43 @@ about the language it was written in.
 
 ---
 
-## Active — post-Phase-D baseline (2026-04-23)
+## Active — post-Tonify baseline (2026-04-28)
 
 Full history of what shipped is in `docs/journal.md`. What follows
 is the current state and what comes next.
 
 ### Next session targets
 
-- Phase 5 — RISC-V port: `riscv_enc.bsm` + `riscv_primitives.bsm`
-- Phase 6 — `install.sh` chameleon: auto-detect host chip + cross-compile
-- Open bugs: 3 GPU-flake tests (exit 137 codesign cache), x86_64 B1/B2 regression
+- **bug Phase 1** — live variable read. See `docs/bug_viz_plan.md` for full
+  architecture (RAD Debugger visualization model applied to B++).
+- Open bugs: x86_64 B1/B2 register allocation regression
+
+### 0. bug Visualization — Phase 1: watch list at breakpoints
+
+See `docs/bug_viz_plan.md` for the full 5-phase plan and audit (inspired by Ryan
+Fleury's BSC 2025 RAD Debugger talk). **Phases 1-4 before Wolf3D** — debugging
+a complex 3D scene graph without visualization is archaeology.
+
+**Audit finding**: `_print_crash_locals` in `bug_observe_macos.bsm:445` already
+reads locals via `gdb_read_mem(fp + voffs[vi], 8)` and prints name+value. Phase 1
+is mostly wiring, not new infrastructure.
+
+**Phase 1 scope** (~50 lines new code, no new module):
+
+- **`bug_observe_macos.bsm`** (~10 lines): In the SIGTRAP handler, call
+  `_print_crash_locals(fi, text_base)` on every breakpoint hit — currently only
+  called on crash. Optional filter: if watch list non-empty, skip non-watched names.
+
+- **`bug.bpp`** (~20 lines): Parse `--watch name[,name2,...]`. Pass watch list
+  into `bug_run`.
+
+- **`bpp_bug.bsm`** + **`bug_reader.bsm`** (~20 lines): Emit `u32 data_offset`
+  per global in the `.bug` globals section. Currently globals have name/type/class
+  but no address. Resolve in `bug_observe_macos.bsm` using `data_base = text_base
+  + text_filesz` from the Mach-O parse already done at startup.
+
+Deliverable: `bug --watch player,score ./platformer` prints watched variable
+values on every breakpoint hit. Globals (like `score`) readable alongside locals.
 
 ### 1. Dev Loop 3: Profiler (minimal + sampling)
 

@@ -21,76 +21,76 @@ import "a64_enc.bsm";
 
 // ── Constants ───────────────────────────────────────────────
 
-auto MO_PAGE_SIZE;      // 4096
-auto MO_VM_BASE;        // 0x100000000 (low 32 bits = 0, high = 1)
-auto MO_VM_BASE_HI;     // High 32 bits of VM base address (1).
+const MO_PAGE_SIZE  = 16384; // macOS ARM64 page size.
+const MO_VM_BASE    = 0;     // Low 32 bits of __TEXT base (0x100000000).
+const MO_VM_BASE_HI = 1;     // High 32 bits of __TEXT base.
 
 // ── Output buffer ───────────────────────────────────────────
 
-auto mo_buf;            // Output buffer (up to 16 MB).
-auto mo_pos;            // Current write position.
+static auto mo_buf;            // Output buffer (up to 16 MB).
+static auto mo_pos;            // Current write position.
 
 // ── Computed layout values (set by mo_compute_layout) ───────
 
-auto mo_ncmds;          // Number of load commands.
-auto mo_sizeofcmds;     // Total size of load commands.
-auto mo_code_off;       // File offset of __text section.
-auto mo_text_vmsize;    // __TEXT segment VM/file size (page-aligned).
-auto mo_data_off;       // File offset of __DATA segment.
-auto mo_data_size;      // Raw data size (globals + strings + floats).
-auto mo_data_vmsize;    // __DATA segment VM size (page-aligned).
-auto mo_link_off;       // File offset of __LINKEDIT segment.
-auto mo_link_size;      // __LINKEDIT content size.
-auto mo_link_vmsize;    // __LINKEDIT VM size (page-aligned).
-auto mo_main_off;       // Entry point offset from start of __TEXT.
-auto mo_data_vmaddr_lo; // Low 32 bits of __DATA VM address.
-auto mo_data_vmaddr_hi; // High 32 bits of __DATA VM address.
-auto mo_link_vmaddr_lo; // Low 32 bits of __LINKEDIT VM address.
-auto mo_link_vmaddr_hi; // High 32 bits of __LINKEDIT VM address.
+static auto mo_ncmds;          // Number of load commands.
+static auto mo_sizeofcmds;     // Total size of load commands.
+static auto mo_code_off;       // File offset of __text section.
+static auto mo_text_vmsize;    // __TEXT segment VM/file size (page-aligned).
+static auto mo_data_off;       // File offset of __DATA segment.
+static auto mo_data_size;      // Raw data size (globals + strings + floats).
+static auto mo_data_vmsize;    // __DATA segment VM size (page-aligned).
+static auto mo_link_off;       // File offset of __LINKEDIT segment.
+static auto mo_link_size;      // __LINKEDIT content size.
+static auto mo_link_vmsize;    // __LINKEDIT VM size (page-aligned).
+static auto mo_main_off;       // Entry point offset from start of __TEXT.
+static auto mo_data_vmaddr_lo; // Low 32 bits of __DATA VM address.
+static auto mo_data_vmaddr_hi; // High 32 bits of __DATA VM address.
+static auto mo_link_vmaddr_lo; // Low 32 bits of __LINKEDIT VM address.
+static auto mo_link_vmaddr_hi; // High 32 bits of __LINKEDIT VM address.
 
 // Code signature layout.
-auto mo_cs_off;          // File offset of code signature blob (16-byte aligned).
-auto mo_cs_size;         // Size of code signature blob.
+static auto mo_cs_off;          // File offset of code signature blob (16-byte aligned).
+static auto mo_cs_size;         // Size of code signature blob.
 
 // __LINKEDIT sub-offsets (relative to mo_link_off).
-auto mo_cf_off;         // Chained fixups data file offset.
-auto mo_cf_size;        // Chained fixups data size.
-auto mo_et_off;         // Exports trie file offset.
-auto mo_et_size;        // Exports trie data size.
-auto mo_sym_off;        // Symbol table file offset.
-auto mo_sym_cnt;        // Number of symbol table entries.
-auto mo_str_off;        // String table file offset.
-auto mo_str_size;       // String table size.
+static auto mo_cf_off;         // Chained fixups data file offset.
+static auto mo_cf_size;        // Chained fixups data size.
+static auto mo_et_off;         // Exports trie file offset.
+static auto mo_et_size;        // Exports trie data size.
+static auto mo_sym_off;        // Symbol table file offset.
+static auto mo_sym_cnt;        // Number of symbol table entries.
+static auto mo_str_off;        // String table file offset.
+static auto mo_str_size;       // String table size.
 
-// Function symbol info: populated by the codegen before mo_finalize.
-auto mo_fn_names;       // Dynamic array of packed function names.
-auto mo_fn_offsets;     // Dynamic array of code offsets for each function.
-auto mo_fn_count;       // Number of function symbols to emit.
+// Function symbol info: populated by bpp.bpp before mo_finalize.
+global mo_fn_names;       // Dynamic array of packed function names.
+global mo_fn_offsets;     // Dynamic array of code offsets for each function.
+global mo_fn_count;       // Number of function symbols to emit.
 // Slack: 32 bytes reserved after load commands for codesign to insert
 // LC_CODE_SIGNATURE without overwriting code bytes.
 
 // ── Float literal data ────────────────────────────────────────
 
-auto mo_flt_data;       // Dynamic array: 8-byte IEEE 754 doubles.
+static auto mo_flt_data;       // Dynamic array: 8-byte IEEE 754 doubles.
 
 // ── String literal data ──────────────────────────────────────
 
-auto mo_sdata;          // Buffer holding all string bytes (content + null terminators).
-auto mo_sdata_size;     // Total bytes used in mo_sdata.
-auto mo_sdata_off;      // Dynamic array: byte offset of each string within mo_sdata.
+static auto mo_sdata;          // Buffer holding all string bytes (content + null terminators).
+static auto mo_sdata_size;     // Total bytes used in mo_sdata.
+static auto mo_sdata_off;      // Dynamic array: byte offset of each string within mo_sdata.
 
 // ── GOT (Global Offset Table) for FFI ───────────────────────
 
-auto mo_got_syms;       // Dynamic array: packed function names (one per GOT slot).
-auto mo_got_libs;       // Dynamic array: packed library names (one per GOT slot).
-auto mo_got_data_off;   // Byte offset of GOT within __DATA (8-byte aligned).
+static auto mo_got_syms;       // Dynamic array: packed function names (one per GOT slot).
+static auto mo_got_libs;       // Dynamic array: packed library names (one per GOT slot).
+static auto mo_got_data_off;   // Byte offset of GOT within __DATA (8-byte aligned).
 
-auto mo_ext_libs;       // Dynamic array: unique library name packed values.
+static auto mo_ext_libs;       // Dynamic array: unique library name packed values.
 
 // ── SHA-256 (pure integer, no external dependencies) ────────
 
-auto sha_k;     // 64 round constants (32-bit values stored in 8-byte slots).
-auto sha_w;     // Message schedule workspace (64 × 8 bytes).
+static auto sha_k;     // 64 round constants (32-bit values stored in 8-byte slots).
+static auto sha_w;     // Message schedule workspace (64 × 8 bytes).
 
 // Mask to 32-bit unsigned.
 u32(x) { return x & 0xFFFFFFFF; }
@@ -131,14 +131,14 @@ void sha_transform(blk, h) {
             | (peek(blk + i * 4 + 1) << 16)
             | (peek(blk + i * 4 + 2) << 8)
             | peek(blk + i * 4 + 3);
-        i = i + 1;
+        i++;
     }
     // Expand to 64 words.
     while (i < 64) {
         s0 = sha_rotr(*(sha_w + (i-15)*8), 7) ^ sha_rotr(*(sha_w + (i-15)*8), 18) ^ (*(sha_w + (i-15)*8) >> 3);
         s1 = sha_rotr(*(sha_w + (i-2)*8), 17) ^ sha_rotr(*(sha_w + (i-2)*8), 19) ^ (*(sha_w + (i-2)*8) >> 10);
         *(sha_w + i*8) = u32(*(sha_w + (i-16)*8) + s0 + *(sha_w + (i-7)*8) + s1);
-        i = i + 1;
+        i++;
     }
     // Initialize working variables.
     a = *(h+0); b = *(h+8); c = *(h+16); d = *(h+24);
@@ -154,7 +154,7 @@ void sha_transform(blk, h) {
         t2 = u32(s0 + maj);
         hh = g; g = f; f = e; e = u32(d + t1);
         d = c; c = b; b = a; a = u32(t1 + t2);
-        i = i + 1;
+        i++;
     }
     // Add to hash state.
     *(h+0) = u32(*(h+0)+a); *(h+8) = u32(*(h+8)+b);
@@ -174,7 +174,7 @@ void sha256(data, len, out) {
     // Padded length must be a multiple of 64.
     bitlen = len * 8;
     padlen = len + 1;
-    while (padlen % 64 != 56) { padlen = padlen + 1; }
+    while (padlen % 64 != 56) { padlen++; }
     total = padlen + 8;
     pad = malloc(total);
     // Copy data.
@@ -183,7 +183,7 @@ void sha256(data, len, out) {
     poke(pad + len, 0x80);
     // Zero fill.
     i = len + 1;
-    while (i < padlen) { poke(pad + i, 0); i = i + 1; }
+    while (i < padlen) { poke(pad + i, 0); i++; }
     // Append bit length as big-endian 64-bit.
     poke(pad + padlen, (bitlen >> 56) & 0xFF);
     poke(pad + padlen + 1, (bitlen >> 48) & 0xFF);
@@ -197,7 +197,7 @@ void sha256(data, len, out) {
     off = 0;
     while (off < total) {
         sha_transform(pad + off, h);
-        off = off + 64;
+        off += 64;
     }
     // Write digest as 8 big-endian 32-bit words.
     i = 0;
@@ -207,7 +207,7 @@ void sha256(data, len, out) {
         poke(out + i * 4 + 1, (v >> 16) & 0xFF);
         poke(out + i * 4 + 2, (v >> 8) & 0xFF);
         poke(out + i * 4 + 3, v & 0xFF);
-        i = i + 1;
+        i++;
     }
     free(h);
     free(pad);
@@ -217,9 +217,6 @@ void sha256(data, len, out) {
 
 void init_macho() {
     sha_init();
-    MO_PAGE_SIZE = 16384;
-    MO_VM_BASE = 0;
-    MO_VM_BASE_HI = 1;
     mo_buf = malloc(16777216);
     mo_pos = 0;
     mo_flt_data = arr_new();
@@ -250,7 +247,7 @@ mo_packed_eq(a, b) {
     if (al != bl) { return 0; }
     as = a % 0x100000000;
     bs = b % 0x100000000;
-    for (i = 0; i < al; i = i + 1) {
+    for (i = 0; i < al; i++) {
         if (peek(cg_sbuf + as + i) != peek(cg_sbuf + bs + i)) { return 0; }
     }
     return 1;
@@ -268,7 +265,7 @@ mo_atof(s) {
     neg = 0;
     i = 0;
     ch = peek(s);
-    if (ch == 45) { neg = 1; i = i + 1; }
+    if (ch == 45) { neg = 1; i++; }
 
     // Parse integer part.
     int_part = 0;
@@ -276,7 +273,7 @@ mo_atof(s) {
     while (ch >= 48) {
         if (ch <= 57) {
             int_part = int_part * 10 + ch - 48;
-            i = i + 1;
+            i++;
             ch = peek(s + i);
         } else {
             ch = 0;
@@ -287,13 +284,13 @@ mo_atof(s) {
     frac_val = 0;
     frac_scale = 1;
     if (peek(s + i) == 46) {
-        i = i + 1;
+        i++;
         ch = peek(s + i);
         while (ch >= 48) {
             if (ch <= 57) {
                 frac_val = frac_val * 10 + ch - 48;
-                frac_scale = frac_scale * 10;
-                i = i + 1;
+                frac_scale *= 10;
+                i++;
                 ch = peek(s + i);
             } else {
                 ch = 0;
@@ -314,19 +311,19 @@ mo_atof(s) {
         scaled_den = den;
         p = 0;
         while (scaled_den + scaled_den <= num) {
-            scaled_den = scaled_den + scaled_den;
-            p = p + 1;
+            scaled_den += scaled_den;
+            p++;
         }
-        num = num - scaled_den;
+        num -= scaled_den;
     } else {
         // Value < 1.0: scale num up until it reaches den.
-        p = 0 - 1;
-        num = num + num;
+        p = -1;
+        num += num;
         while (num < den) {
-            num = num + num;
-            p = p - 1;
+            num += num;
+            p--;
         }
-        num = num - den;
+        num -= den;
         scaled_den = den;
     }
 
@@ -334,23 +331,23 @@ mo_atof(s) {
     mantissa = 0;
     bit_idx = 0;
     while (bit_idx < 52) {
-        num = num + num;
-        mantissa = mantissa + mantissa;
+        num += num;
+        mantissa += mantissa;
         if (num >= scaled_den) {
-            mantissa = mantissa + 1;
-            num = num - scaled_den;
+            mantissa++;
+            num -= scaled_den;
         }
-        bit_idx = bit_idx + 1;
+        bit_idx++;
     }
 
     // Round to nearest: check the 53rd bit.
-    num = num + num;
-    if (num >= scaled_den) { mantissa = mantissa + 1; }
+    num += num;
+    if (num >= scaled_den) { mantissa++; }
 
     // Assemble IEEE 754 double: sign(1) | exponent(11) | mantissa(52).
     // Adding 2048 to exp_bits sets bit 63 (sign) after the shift.
     exp_bits = p + 1023;
-    if (neg) { exp_bits = exp_bits + 2048; }
+    if (neg) { exp_bits += 2048; }
     return (exp_bits << 52) + mantissa;
 }
 
@@ -370,12 +367,12 @@ mo_add_string(src, len) {
     i = 0;
     while (i < len) {
         poke(mo_sdata + mo_sdata_size, peek(src + i));
-        mo_sdata_size = mo_sdata_size + 1;
-        i = i + 1;
+        mo_sdata_size++;
+        i++;
     }
     // Null terminator.
     poke(mo_sdata + mo_sdata_size, 0);
-    mo_sdata_size = mo_sdata_size + 1;
+    mo_sdata_size++;
 }
 
 // Check if a library name is the built-in System library (ordinal 1).
@@ -405,7 +402,7 @@ mo_add_got(fn_name, lib_name) {
     i = 0;
     while (i < arr_len(mo_ext_libs)) {
         if (mo_packed_eq(arr_get(mo_ext_libs, i), lib_name)) { found = 1; }
-        i = i + 1;
+        i++;
     }
     if (found == 0) {
         mo_ext_libs = arr_push(mo_ext_libs, lib_name);
@@ -418,7 +415,7 @@ mo_find_got(fn_name) {
     i = 0;
     while (i < arr_len(mo_got_syms)) {
         if (mo_packed_eq(arr_get(mo_got_syms, i), fn_name)) { return i; }
-        i = i + 1;
+        i++;
     }
     return -1;
 }
@@ -431,7 +428,7 @@ mo_find_lib_ordinal(lib_name) {
     i = 0;
     while (i < arr_len(mo_ext_libs)) {
         if (mo_packed_eq(arr_get(mo_ext_libs, i), lib_name)) { return i + 2; }
-        i = i + 1;
+        i++;
     }
     return 1;
 }
@@ -441,7 +438,7 @@ mo_find_lib_ordinal(lib_name) {
 // Write a single byte to the output buffer.
 void mo_w8(v) {
     poke(mo_buf + mo_pos, v & 0xFF);
-    mo_pos = mo_pos + 1;
+    mo_pos++;
 }
 
 // Write a 32-bit value in little-endian format.
@@ -450,7 +447,7 @@ void mo_w32(v) {
     poke(mo_buf + mo_pos + 1, (v >> 8) & 0xFF);
     poke(mo_buf + mo_pos + 2, (v >> 16) & 0xFF);
     poke(mo_buf + mo_pos + 3, (v >> 24) & 0xFF);
-    mo_pos = mo_pos + 4;
+    mo_pos += 4;
 }
 
 // Write a 64-bit value in little-endian format.
@@ -479,12 +476,12 @@ void mo_write_uleb128(val) {
 void mo_pad(n) {
     auto i;
     i = 0;
-    while (i < n) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; i = i + 1; }
+    while (i < n) { poke(mo_buf + mo_pos, 0); mo_pos++; i++; }
 }
 
 // Pad with zeros until mo_pos is aligned to 'a' bytes.
 void mo_align(a) {
-    while (mo_pos % a != 0) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; }
+    while (mo_pos % a != 0) { poke(mo_buf + mo_pos, 0); mo_pos++; }
 }
 
 // Write a fixed-width string (exactly 'n' bytes, zero-padded).
@@ -494,8 +491,8 @@ void mo_wstr(s, slen, n) {
     while (i < n) {
         if (i < slen) { poke(mo_buf + mo_pos, peek(s + i)); }
         else { poke(mo_buf + mo_pos, 0); }
-        mo_pos = mo_pos + 1;
-        i = i + 1;
+        mo_pos++;
+        i++;
     }
 }
 
@@ -504,7 +501,7 @@ void mo_wstr(s, slen, n) {
 void mo_wcstr(s, n) {
     auto i;
     i = 0;
-    while (i < n) { poke(mo_buf + mo_pos, str_peek(s, i)); mo_pos = mo_pos + 1; i = i + 1; }
+    while (i < n) { poke(mo_buf + mo_pos, str_peek(s, i)); mo_pos++; i++; }
 }
 
 // Round up 'v' to the next multiple of MO_PAGE_SIZE.
@@ -651,7 +648,7 @@ void mo_write_chained_fixups(nseg) {
     // dyld_chained_starts_in_image
     mo_w32(nseg);                   // seg_count
     i = 0;
-    while (i < nseg) { mo_w32(0); i = i + 1; }  // seg_info_offset (all 0 = no chains)
+    while (i < nseg) { mo_w32(0); i++; }  // seg_info_offset (all 0 = no chains)
     // Sentinel padding (8 bytes) so imports_offset/symbols_offset land inside buffer.
     mo_pad(8);
 }
@@ -713,7 +710,7 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
         } else {
             mo_w32(0);                  // no fixups in this segment
         }
-        i = i + 1;
+        i++;
     }
 
     // ── dyld_chained_starts_in_segment (for __DATA) ──
@@ -746,12 +743,12 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
         } else {
             mo_w8(0xFF); mo_w8(0xFF);
         }
-        _pg = _pg + 1;
+        _pg++;
     }
     // Pad up to declared header size.
     while (22 + _pc * 2 < _hdr_size) {
         mo_w8(0);
-        _hdr_size = _hdr_size - 1;
+        _hdr_size--;
     }
 
     // ── Imports table (4 bytes each) ──
@@ -765,8 +762,8 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
         mo_w32(imp_val);
         // Advance sym_pos past "_name\0".
         sl = unpack_l(arr_get(mo_got_syms, i));
-        sym_pos = sym_pos + 1 + sl + 1;  // underscore + name + null
-        i = i + 1;
+        sym_pos += sl + 2;  // underscore + name + null
+        i++;
     }
 
     // ── Symbol strings pool ──
@@ -780,10 +777,10 @@ void mo_write_chained_fixups_real(nseg, gl_count) {
         j = 0;
         while (j < sl) {
             mo_w8(peek(cg_sbuf + ss + j));
-            j = j + 1;
+            j++;
         }
         mo_w8(0);                       // null terminator
-        i = i + 1;
+        i++;
     }
     // Pad to 4-byte alignment.
     while ((mo_pos - start) % 4 != 0) { mo_w8(0); }
@@ -811,7 +808,7 @@ void mo_write_lc_load_dylib_named(lib_name) {
     // Write path: /opt/homebrew/lib/lib + name + .dylib
     mo_wcstr("/opt/homebrew/lib/lib", 21);
     i = 0;
-    while (i < sl) { mo_w8(peek(cg_sbuf + ss + i)); i = i + 1; }
+    while (i < sl) { mo_w8(peek(cg_sbuf + ss + i)); i++; }
     mo_wcstr(".dylib", 6);
     mo_w8(0);                           // null terminator
     // Pad remaining space to reach 80 bytes total.
@@ -928,7 +925,7 @@ void mo_compute_layout(code_size, data_count) {
         mo_data_vmaddr_hi = MO_VM_BASE_HI;
         // Handle overflow from low 32 bits.
         if (mo_data_vmaddr_lo < mo_text_vmsize) {
-            mo_data_vmaddr_hi = mo_data_vmaddr_hi + 1;
+            mo_data_vmaddr_hi++;
         }
     } else {
         mo_data_off = mo_text_vmsize;
@@ -943,7 +940,7 @@ void mo_compute_layout(code_size, data_count) {
     mo_link_vmaddr_lo = MO_VM_BASE + mo_link_off;
     mo_link_vmaddr_hi = MO_VM_BASE_HI;
     if (mo_link_vmaddr_lo < mo_link_off) {
-        mo_link_vmaddr_hi = mo_link_vmaddr_hi + 1;
+        mo_link_vmaddr_hi++;
     }
 
     // __LINKEDIT content: chained fixups + exports trie + symtab + strtab.
@@ -955,8 +952,8 @@ void mo_compute_layout(code_size, data_count) {
         sym_str_size = 1;
         si = 0;
         while (si < arr_len(mo_got_syms)) {
-            sym_str_size = sym_str_size + 1 + unpack_l(arr_get(mo_got_syms, si)) + 1;
-            si = si + 1;
+            sym_str_size += unpack_l(arr_get(mo_got_syms, si)) + 2;
+            si++;
         }
         cf_data_size = 32 + 4 + nseg * 4 + 24 + arr_len(mo_got_syms) * 4 + sym_str_size;
         cf_data_size = (cf_data_size + 7) / 8 * 8;
@@ -984,8 +981,8 @@ void mo_compute_layout(code_size, data_count) {
     //   + for each function: "_" + name + "\0"
     auto fn_str_sz, fi;
     fn_str_sz = 0;
-    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
-        fn_str_sz = fn_str_sz + 1 + unpack_l(arr_get(mo_fn_names, fi)) + 1;
+    for (fi = 0; fi < mo_fn_count; fi++) {
+        fn_str_sz += unpack_l(arr_get(mo_fn_names, fi)) + 2;
     }
     mo_str_size = 2 + 20 + 6 + fn_str_sz;
     mo_str_size = (mo_str_size + 7) / 8 * 8;  // 8-byte align
@@ -1045,7 +1042,7 @@ void mo_resolve_relocations(gl_names, gl_count) {
             j = 0;
             while (j < gl_count) {
                 if (mo_packed_eq(*(gl_names + j * 8), sym)) { gl_idx = j; }
-                j = j + 1;
+                j++;
             }
             if (gl_idx >= 0) {
                 // Target address (within __DATA): data_off + gl_idx * 8.
@@ -1106,7 +1103,7 @@ void mo_resolve_relocations(gl_names, gl_count) {
         instr = instr | (imm12 << 10);
         enc_patch32(pos + 4, instr);
 
-        i = i + 1;
+        i++;
     }
 }
 
@@ -1211,7 +1208,7 @@ void write_macho(filename, main_label, gl_names, gl_count) {
     i = 0;
     while (i < arr_len(mo_ext_libs)) {
         mo_write_lc_load_dylib_named(arr_get(mo_ext_libs, i));
-        i = i + 1;
+        i++;
     }
 
     // LC_CODE_SIGNATURE
@@ -1229,8 +1226,8 @@ void write_macho(filename, main_label, gl_names, gl_count) {
     i = 0;
     while (i < code_size) {
         poke(mo_buf + mo_pos, peek(enc_buf + i));
-        mo_pos = mo_pos + 1;
-        i = i + 1;
+        mo_pos++;
+        i++;
     }
 
     // ── Write __DATA section ──
@@ -1246,17 +1243,17 @@ void write_macho(filename, main_label, gl_names, gl_count) {
             flt_bits = arr_get(mo_flt_data, i);
             mo_w32(flt_bits & 0xFFFFFFFF);
             mo_w32((flt_bits >> 32) & 0xFFFFFFFF);
-            i = i + 1;
+            i++;
         }
         // Write string literal data (raw bytes copied from mo_sdata).
         i = 0;
         while (i < mo_sdata_size) {
             poke(mo_buf + mo_pos, peek(mo_sdata + i));
-            mo_pos = mo_pos + 1;
-            i = i + 1;
+            mo_pos++;
+            i++;
         }
         // Align to 8 bytes before GOT entries.
-        while ((mo_pos - mo_data_off) % 8 != 0) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; }
+        while ((mo_pos - mo_data_off) % 8 != 0) { poke(mo_buf + mo_pos, 0); mo_pos++; }
         // Write GOT entries as dyld_chained_ptr_64_bind values.
         // Each 8-byte slot: ordinal(24)|addend(8)|reserved(19)|next(12)|bind(1).
         // Low 32 bits = ordinal (= import index).
@@ -1271,7 +1268,7 @@ void write_macho(filename, main_label, gl_names, gl_count) {
             } else {
                 mo_w32(0x80000000);
             }
-            i = i + 1;
+            i++;
         }
     }
 
@@ -1304,20 +1301,20 @@ void write_macho(filename, main_label, gl_names, gl_count) {
     // Write nlist entries for all user functions.
     auto fi, fn_strx, fn_name_p, fn_name_len, fn_off, fn_addr_lo, fn_addr_hi;
     fn_strx = 28;  // Start after " \0" + "__mh_execute_header\0" + "_main\0"
-    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
+    for (fi = 0; fi < mo_fn_count; fi++) {
         // Skip main — already emitted as the global _main above.
         if (arr_get(mo_fn_offsets, fi) == main_code_off) {
             fn_name_len = unpack_l(arr_get(mo_fn_names, fi));
-            fn_strx = fn_strx + 1 + fn_name_len + 1;
+            fn_strx += fn_name_len + 2;
         } else {
         fn_off = mo_code_off + arr_get(mo_fn_offsets, fi);
         fn_addr_lo = MO_VM_BASE + fn_off;
         fn_addr_hi = MO_VM_BASE_HI;
-        if (fn_addr_lo < fn_off) { fn_addr_hi = fn_addr_hi + 1; }
+        if (fn_addr_lo < fn_off) { fn_addr_hi++; }
         // type 0x0E = N_SECT | N_EXT (defined external), sect 1 = __text.
         mo_write_nlist(fn_strx, 0x0E, 1, 0x0000, fn_addr_lo, fn_addr_hi);
         fn_name_len = unpack_l(arr_get(mo_fn_names, fi));
-        fn_strx = fn_strx + 1 + fn_name_len + 1;  // "_" + name + "\0"
+        fn_strx += fn_name_len + 2;  // "_" + name + "\0"
         }
     }
 
@@ -1330,14 +1327,14 @@ void write_macho(filename, main_label, gl_names, gl_count) {
     mo_wcstr("_main", 5); mo_w8(0);
 
     // Write each function name as "_<name>\0".
-    for (fi = 0; fi < mo_fn_count; fi = fi + 1) {
+    for (fi = 0; fi < mo_fn_count; fi++) {
         fn_name_p = arr_get(mo_fn_names, fi);
         fn_name_len = unpack_l(fn_name_p);
         auto fn_name_off;
         fn_name_off = unpack_s(fn_name_p);
         mo_w8('_');  // C symbol prefix
         auto ci;
-        for (ci = 0; ci < fn_name_len; ci = ci + 1) {
+        for (ci = 0; ci < fn_name_len; ci++) {
             mo_w8(peek(cg_sbuf + fn_name_off + ci));
         }
         mo_w8(0);
@@ -1427,7 +1424,7 @@ void mo_write_code_signature() {
     // Slot -2: requirements hash (all zeros = no requirements).
     // Slot -1: info plist hash (all zeros = no plist).
     j = 0;
-    while (j < n_special * 32) { mo_w8(0); j = j + 1; }
+    while (j < n_special * 32) { mo_w8(0); j++; }
 
     // ── Code slot hashes (SHA-256 of each 4096-byte page) ──
     digest = malloc(32);
@@ -1442,9 +1439,9 @@ void mo_write_code_signature() {
         j = 0;
         while (j < 32) {
             mo_w8(peek(digest + j));
-            j = j + 1;
+            j++;
         }
-        i = i + 1;
+        i++;
     }
     free(digest);
 }
@@ -1455,7 +1452,7 @@ void mo_w32be(v) {
     poke(mo_buf + mo_pos + 1, (v >> 16) & 0xFF);
     poke(mo_buf + mo_pos + 2, (v >> 8) & 0xFF);
     poke(mo_buf + mo_pos + 3, v & 0xFF);
-    mo_pos = mo_pos + 4;
+    mo_pos += 4;
 }
 
 // Write a 64-bit value in big-endian format.

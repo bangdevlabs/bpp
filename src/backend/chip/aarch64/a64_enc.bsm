@@ -12,30 +12,30 @@ import "bpp_array.bsm";
 
 // ── Code buffer ──────────────────────────────────────────
 
-auto enc_buf;       // Pointer to code buffer (1 MB).
-auto enc_pos;       // Current byte offset in the code buffer.
+extrn enc_buf;       // Pointer to code buffer (1 MB). Set once; read by Mach-O writer.
+global enc_pos;      // Current byte offset in the code buffer. Written by codegen reset.
 
 // ── Label system ─────────────────────────────────────────
 // Labels map numeric IDs to code offsets. Dynamic array via stbarray.
 
-auto enc_lbl_off;   // Dynamic array: label ID -> byte offset (-1 = undefined).
-auto enc_lbl_max;   // Number of labels allocated so far.
+extrn enc_lbl_off;   // Dynamic array: label ID -> byte offset (-1 = undefined).
+global enc_lbl_max;  // Number of labels allocated so far. Reset by codegen.
 
 // ── Fixup system ─────────────────────────────────────────
 // Forward branch references that need patching once the target label is defined.
 
-auto enc_fix_pos;   // Dynamic array: byte offset of the branch instruction.
-auto enc_fix_lbl;   // Dynamic array: target label ID.
-auto enc_fix_ty;    // Dynamic array: fixup type (0=B/BL, 1=CBZ/CBNZ, 2=B.cond).
-auto enc_fix_cnt;   // Number of pending fixups.
+extrn enc_fix_pos;   // Dynamic array: byte offset of the branch instruction.
+extrn enc_fix_lbl;   // Dynamic array: target label ID.
+extrn enc_fix_ty;    // Dynamic array: fixup type (0=B/BL, 1=CBZ/CBNZ, 2=B.cond).
+global enc_fix_cnt;  // Number of pending fixups. Reset by codegen.
 
 // ── Relocation system ────────────────────────────────────
 // ADRP+ADD pairs whose page offsets are resolved in the Mach-O writer.
 
-auto enc_rel_pos;   // Dynamic array: byte offset of the ADRP instruction.
-auto enc_rel_sym;   // Dynamic array: symbol identifier (packed name or index).
-auto enc_rel_ty;    // Dynamic array: relocation type (0=global, 1=string, 2=float, 3=extern).
-auto enc_rel_cnt;   // Number of relocation entries.
+extrn enc_rel_pos;   // Dynamic array: byte offset of the ADRP instruction.
+extrn enc_rel_sym;   // Dynamic array: symbol identifier (packed name or index).
+extrn enc_rel_ty;    // Dynamic array: relocation type (0=global, 1=string, 2=float, 3=extern).
+global enc_rel_cnt;  // Number of relocation entries. Reset by codegen.
 
 // ── Initialization ───────────────────────────────────────
 
@@ -62,7 +62,7 @@ void enc_emit32(val) {
     poke(enc_buf + enc_pos + 1, (val >> 8) & 0xFF);
     poke(enc_buf + enc_pos + 2, (val >> 16) & 0xFF);
     poke(enc_buf + enc_pos + 3, (val >> 24) & 0xFF);
-    enc_pos = enc_pos + 4;
+    enc_pos += 4;
 }
 
 // Overwrite a 32-bit value at a specific byte offset (for patching branches).
@@ -75,10 +75,7 @@ void enc_patch32(off, val) {
 
 // Read a 32-bit value from the code buffer at a specific byte offset.
 enc_read32(off) {
-    return peek(enc_buf + off)
-         | (peek(enc_buf + off + 1) << 8)
-         | (peek(enc_buf + off + 2) << 16)
-         | (peek(enc_buf + off + 3) << 24);
+    return peek_h(enc_buf + off);
 }
 
 // ── Label management ─────────────────────────────────────
@@ -98,8 +95,8 @@ void enc_def_label_at(id, off) {
 enc_new_label() {
     auto id;
     id = enc_lbl_max;
-    enc_lbl_off = arr_push(enc_lbl_off, 0 - 1);
-    enc_lbl_max = enc_lbl_max + 1;
+    enc_lbl_off = arr_push(enc_lbl_off, -1);
+    enc_lbl_max++;
     return id;
 }
 
@@ -111,7 +108,7 @@ void enc_add_fixup(lbl, ty) {
     enc_fix_pos = arr_push(enc_fix_pos, enc_pos);
     enc_fix_lbl = arr_push(enc_fix_lbl, lbl);
     enc_fix_ty  = arr_push(enc_fix_ty, ty);
-    enc_fix_cnt = enc_fix_cnt + 1;
+    enc_fix_cnt++;
 }
 
 // ── Relocation management ────────────────────────────────
@@ -121,7 +118,7 @@ void enc_add_reloc(pos, sym, ty) {
     enc_rel_pos = arr_push(enc_rel_pos, pos);
     enc_rel_sym = arr_push(enc_rel_sym, sym);
     enc_rel_ty  = arr_push(enc_rel_ty, ty);
-    enc_rel_cnt = enc_rel_cnt + 1;
+    enc_rel_cnt++;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -158,7 +155,7 @@ void enc_mov_wide(rd, val) {
     // General case: MOVZ lowest half-word, then MOVK non-zero higher halves.
     lo = val & 0xFFFF;
     enc_movz(rd, lo, 0);
-    for (hw = 1; hw <= 3; hw = hw + 1) {
+    for (hw = 1; hw <= 3; hw++) {
         hi = (val >> (hw * 16)) & 0xFFFF;
         if (hi > 0) { enc_movk(rd, hi, hw); }
     }
@@ -834,7 +831,7 @@ void enc_adr_label(rd, lbl) {
 // Patch all recorded branch fixups. Call after all code has been emitted.
 void enc_resolve_fixups() {
     auto i, pos, lbl, ty, target, off, ins;
-    for (i = 0; i < enc_fix_cnt; i = i + 1) {
+    for (i = 0; i < enc_fix_cnt; i++) {
         pos    = arr_get(enc_fix_pos, i);
         lbl    = arr_get(enc_fix_lbl, i);
         ty     = arr_get(enc_fix_ty, i);

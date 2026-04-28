@@ -1,0 +1,415 @@
+// B++ Bootstrap Lexer (Stage 1)
+// Reads B++ source from stdin and outputs tokens to stdout.
+// Output format: TYPE value\n (matches the Python tokenizer output).
+// No external dependencies — uses only B++ built-in I/O.
+
+auto src, src_len, pos;
+
+// --- Built-in String Helpers ---
+
+// Compare len bytes at mem_base offset a with string b (may be a literal).
+buf_eq(a, b, len) {
+    auto i;
+    i = 0;
+    while (i < len) {
+        if (peek(a + i) != str_peek(b, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Print a null-terminated string to stdout.
+print_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        putchar(ch);
+        i = i + 1;
+        ch = str_peek(s, i);
+    }
+    return 0;
+}
+
+// --- Character Classification ---
+
+is_alpha(ch) {
+    if (ch >= 65) { if (ch <= 90) { return 1; } }
+    if (ch >= 97) { if (ch <= 122) { return 1; } }
+    return 0;
+}
+
+is_digit(ch) {
+    if (ch >= 48) { if (ch <= 57) { return 1; } }
+    return 0;
+}
+
+is_hex(ch) {
+    if (is_digit(ch)) { return 1; }
+    if (ch >= 65) { if (ch <= 70) { return 1; } }
+    if (ch >= 97) { if (ch <= 102) { return 1; } }
+    return 0;
+}
+
+is_alnum(ch) {
+    if (is_alpha(ch)) { return 1; }
+    if (is_digit(ch)) { return 1; }
+    if (ch == '_') { return 1; }
+    return 0;
+}
+
+is_space(ch) {
+    if (ch == ' ' | ch == '\t' | ch == '\n' | ch == '\r') { return 1; }
+    return 0;
+}
+
+is_op(ch) {
+    if (ch == '+' | ch == '-' | ch == '*' | ch == '/') { return 1; }
+    if (ch == '%' | ch == '=' | ch == '!') { return 1; }
+    if (ch == '<' | ch == '>' | ch == '|' | ch == '&') { return 1; }
+    if (ch == '^') { return 1; }
+    return 0;
+}
+
+is_punct(ch) {
+    if (ch == '(' | ch == ')' | ch == '{' | ch == '}') { return 1; }
+    if (ch == '[' | ch == ']' | ch == ';' | ch == ',') { return 1; }
+    if (ch == '.' | ch == ':' | ch == '@') { return 1; }
+    return 0;
+}
+
+// --- Helpers ---
+
+// Print len bytes from source buffer starting at addr.
+emit_value(start, len) {
+    auto i;
+    putchar(' ');
+    i = 0;
+    while (i < len) {
+        putchar(peek(src + start + i));
+        i = i + 1;
+    }
+    putchar('\n');
+    return 0;
+}
+
+// Advance past whitespace.
+skip_ws() {
+    while (pos < src_len) {
+        if (is_space(peek(src + pos)) == 0) { return 0; }
+        pos = pos + 1;
+    }
+    return 0;
+}
+
+// --- Keyword Detection ---
+
+check_kw(start, len) {
+    if (len == 2) {
+        if (buf_eq(src + start, "if", 2)) { return 1; }
+    }
+    if (len == 3) {
+        if (buf_eq(src + start, "int", 3)) { return 1; }
+        if (buf_eq(src + start, "ptr", 3)) { return 1; }
+    }
+    if (len == 4) {
+        if (buf_eq(src + start, "auto", 4)) { return 1; }
+        if (buf_eq(src + start, "else", 4)) { return 1; }
+        if (buf_eq(src + start, "char", 4)) { return 1; }
+        if (buf_eq(src + start, "void", 4)) { return 1; }
+        if (buf_eq(src + start, "word", 4)) { return 1; }
+        if (buf_eq(src + start, "byte", 4)) { return 1; }
+        if (buf_eq(src + start, "half", 4)) { return 1; }
+        if (buf_eq(src + start, "long", 4)) { return 1; }
+    }
+    if (len == 5) {
+        if (buf_eq(src + start, "extrn", 5)) { return 1; }
+        if (buf_eq(src + start, "while", 5)) { return 1; }
+    }
+    if (len == 6) {
+        if (buf_eq(src + start, "return", 6)) { return 1; }
+        if (buf_eq(src + start, "import", 6)) { return 2; }
+        if (buf_eq(src + start, "struct", 6)) { return 1; }
+        if (buf_eq(src + start, "sizeof", 6)) { return 1; }
+    }
+    return 0;
+}
+
+// --- Token Scanners ---
+
+// Try to scan a comment starting at pos. Returns 1 if found, 0 otherwise.
+scan_comment() {
+    auto next;
+    if (pos + 1 >= src_len) { return 0; }
+    next = peek(src + pos + 1);
+    if (next == '/') {
+        // Line comment: skip until newline.
+        pos = pos + 2;
+        while (pos < src_len) {
+            if (peek(src + pos) == '\n') { pos = pos + 1; return 1; }
+            pos = pos + 1;
+        }
+        return 1;
+    }
+    if (next == '*') {
+        // Block comment: skip until closing */.
+        pos = pos + 2;
+        while (pos + 1 < src_len) {
+            if (peek(src + pos) == '*') {
+                if (peek(src + pos + 1) == '/') { pos = pos + 2; return 1; }
+            }
+            pos = pos + 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// Scan an identifier or keyword starting at pos.
+scan_word() {
+    auto start, len, kw;
+    start = pos;
+    while (pos < src_len) {
+        if (is_alnum(peek(src + pos)) == 0) {
+            len = pos - start;
+            kw = check_kw(start, len);
+            if (kw == 2) {
+                print_str("IMPORT");
+            } else if (kw == 1) {
+                print_str("KEYWORD");
+            } else {
+                print_str("ID");
+            }
+            emit_value(start, len);
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    // Handle word at end of file.
+    len = pos - start;
+    if (len > 0) {
+        kw = check_kw(start, len);
+        if (kw == 2) {
+            print_str("IMPORT");
+        } else if (kw == 1) {
+            print_str("KEYWORD");
+        } else {
+            print_str("ID");
+        }
+        emit_value(start, len);
+    }
+    return 0;
+}
+
+// Scan a decimal or hexadecimal number.
+scan_number() {
+    auto start;
+    start = pos;
+    // Check for hex prefix 0x.
+    if (peek(src + pos) == '0') {
+        if (pos + 1 < src_len) {
+            if (peek(src + pos + 1) == 'x' | peek(src + pos + 1) == 'X') {
+                pos = pos + 2;
+                while (pos < src_len) {
+                    if (is_hex(peek(src + pos)) == 0) {
+                        print_str("HEX");
+                        emit_value(start, pos - start);
+                        return 0;
+                    }
+                    pos = pos + 1;
+                }
+                print_str("HEX");
+                emit_value(start, pos - start);
+                return 0;
+            }
+        }
+    }
+    // Decimal number (may include a decimal point for floats).
+    while (pos < src_len) {
+        if (is_digit(peek(src + pos)) == 0) {
+            // Check for decimal point followed by digit -> float literal.
+            if (peek(src + pos) == '.') {
+                if (pos + 1 < src_len) {
+                    if (is_digit(peek(src + pos + 1))) {
+                        pos = pos + 1;
+                        while (pos < src_len) {
+                            if (is_digit(peek(src + pos)) == 0) {
+                                print_str("FLOAT");
+                                emit_value(start, pos - start);
+                                return 0;
+                            }
+                            pos = pos + 1;
+                        }
+                        print_str("FLOAT");
+                        emit_value(start, pos - start);
+                        return 0;
+                    }
+                }
+            }
+            print_str("NUMBER");
+            emit_value(start, pos - start);
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    print_str("NUMBER");
+    emit_value(start, pos - start);
+    return 0;
+}
+
+// Scan a string literal enclosed in double quotes.
+scan_string() {
+    auto start;
+    start = pos;
+    pos = pos + 1;
+    while (pos < src_len) {
+        if (peek(src + pos) == '"') {
+            pos = pos + 1;
+            print_str("STRING");
+            emit_value(start, pos - start);
+            return 0;
+        }
+        pos = pos + 1;
+    }
+    print_str("STRING");
+    emit_value(start, pos - start);
+    return 0;
+}
+
+// Scan a char literal ('A', '\n', etc.) and emit as NUMBER with ASCII value.
+scan_char() {
+    auto ch, val, vbuf, vlen, tmp, digits, dcnt, j, k;
+    // Skip opening quote.
+    pos = pos + 1;
+    ch = peek(src + pos);
+    if (ch == '\\') {
+        // Escape sequence: \n \t \r \\ \'
+        pos = pos + 1;
+        ch = peek(src + pos);
+        if (ch == 'n') { val = '\n'; }
+        else if (ch == 't') { val = '\t'; }
+        else if (ch == 'r') { val = '\r'; }
+        else if (ch == '\\') { val = '\\'; }
+        else if (ch == '\'') { val = '\''; }
+        else { val = ch; }
+    } else {
+        val = ch;
+    }
+    pos = pos + 1;
+    // Skip closing quote.
+    pos = pos + 1;
+    // Convert val to decimal string and emit as NUMBER.
+    vbuf = malloc(16);
+    digits = malloc(8);
+    vlen = 0;
+    if (val == 0) {
+        poke(vbuf, '0');
+        vlen = 1;
+    } else {
+        // Build digits in reverse order.
+        tmp = val;
+        dcnt = 0;
+        while (tmp > 0) {
+            poke(digits + dcnt, '0' + tmp % 10);
+            tmp = tmp / 10;
+            dcnt = dcnt + 1;
+        }
+        // Reverse into vbuf.
+        j = dcnt - 1;
+        while (j >= 0) {
+            poke(vbuf + vlen, peek(digits + j));
+            vlen = vlen + 1;
+            j = j - 1;
+        }
+    }
+    print_str("NUMBER");
+    putchar(' ');
+    k = 0;
+    while (k < vlen) {
+        putchar(peek(vbuf + k));
+        k = k + 1;
+    }
+    putchar('\n');
+    return 0;
+}
+
+// Scan a one or two character operator.
+scan_op() {
+    auto start, ch, next;
+    start = pos;
+    ch = peek(src + pos);
+    pos = pos + 1;
+    if (pos < src_len) {
+        next = peek(src + pos);
+        // Two-char operators ending with '=': ==, !=, <=, >=, +=, -=, *=, /=, %=
+        if (next == '=') {
+            if (ch == '=' | ch == '!' | ch == '<' | ch == '>') { pos = pos + 1; }
+            if (ch == '+' | ch == '-' | ch == '*' | ch == '/' | ch == '%') { pos = pos + 1; }
+        }
+        // Two-char operators: &&, ||, >>, <<
+        if (ch == '&') { if (next == '&') { pos = pos + 1; } }
+        if (ch == '|') { if (next == '|') { pos = pos + 1; } }
+        if (ch == '>') { if (next == '>') { pos = pos + 1; } }
+        if (ch == '<') { if (next == '<') { pos = pos + 1; } }
+    }
+    print_str("OP");
+    emit_value(start, pos - start);
+    return 0;
+}
+
+// Scan a single punctuation character.
+scan_punct() {
+    print_str("PUNCT");
+    emit_value(pos, 1);
+    pos = pos + 1;
+    return 0;
+}
+
+// --- Input and Main Loop ---
+
+// Read all of stdin into the source buffer.
+read_input() {
+    auto ch;
+    src = malloc(65536);
+    src_len = 0;
+    ch = getchar();
+    while (ch != -1) {
+        poke(src + src_len, ch);
+        src_len = src_len + 1;
+        ch = getchar();
+    }
+    return 0;
+}
+
+// Identify and scan the next token at pos.
+scan_token() {
+    auto ch;
+    ch = peek(src + pos);
+    // Check for comments first (start with /).
+    if (ch == '/') {
+        if (scan_comment()) { return 0; }
+        scan_op();
+        return 0;
+    }
+    if (is_alpha(ch) | ch == '_') { scan_word(); return 0; }
+    if (is_digit(ch)) { scan_number(); return 0; }
+    if (ch == '"') { scan_string(); return 0; }
+    if (ch == '\'') { scan_char(); return 0; }
+    if (is_op(ch)) { scan_op(); return 0; }
+    if (is_punct(ch)) { scan_punct(); return 0; }
+    // Unknown character: skip it.
+    pos = pos + 1;
+    return 0;
+}
+
+main() {
+    read_input();
+    pos = 0;
+    while (pos < src_len) {
+        skip_ws();
+        if (pos < src_len) {
+            scan_token();
+        }
+    }
+    return 0;
+}

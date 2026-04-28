@@ -17,34 +17,48 @@ import "bpp_array.bsm";
 
 // ── Code buffer ──────────────────────────────────────────
 
-auto x64_enc_buf;       // Pointer to code buffer (1 MB).
-auto x64_enc_pos;       // Current byte offset in the code buffer.
+extrn x64_enc_buf;       // Pointer to code buffer (1 MB). Set once; read by ELF writer.
+global x64_enc_pos;      // Current byte offset in the code buffer. Reset by codegen.
 
 // ── Label system ─────────────────────────────────────────
 // Labels map numeric IDs to code offsets. Dynamic array via stbarray.
 
-auto x64_enc_lbl_off;   // Dynamic array: label ID -> byte offset in code buffer (-1 = undefined).
+extrn x64_enc_lbl_off;   // Dynamic array: label ID -> byte offset in code buffer (-1 = undefined).
 
 // ── Fixup system ─────────────────────────────────────────
 // Forward branch references that need patching once the target label is defined.
 // All x86_64 fixups are rel32: the 4-byte field at the fixup position
 // is patched to (target - (fixup_pos + 4)).
 
-auto x64_enc_fix_pos;   // Dynamic array: byte offset of the rel32 field to patch.
-auto x64_enc_fix_lbl;   // Dynamic array: target label ID.
+extrn x64_enc_fix_pos;   // Dynamic array: byte offset of the rel32 field to patch.
+extrn x64_enc_fix_lbl;   // Dynamic array: target label ID.
 
 // ── Relocation system ────────────────────────────────────
 // RIP-relative disp32 fields whose final values are resolved by the ELF/PE writer.
 
-auto x64_enc_rel_pos;   // Dynamic array: byte offset of the disp32 field.
-auto x64_enc_rel_sym;   // Dynamic array: symbol identifier (packed name or table index).
-auto x64_enc_rel_ty;    // Dynamic array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
+extrn x64_enc_rel_pos;   // Dynamic array: byte offset of the disp32 field.
+extrn x64_enc_rel_sym;   // Dynamic array: symbol identifier (packed name or table index).
+extrn x64_enc_rel_ty;    // Dynamic array: relocation type (0 = global var, 1 = string lit, 2 = float lit).
 
 // ── Condition code constants ─────────────────────────────
 // Used with x64_enc_jcc_label() and x64_enc_setcc().
 
-auto CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A;
-auto CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G;
+const CC_O  = 0;
+const CC_NO = 1;
+const CC_B  = 2;
+const CC_AE = 3;
+const CC_E  = 4;
+const CC_NE = 5;
+const CC_BE = 6;
+const CC_A  = 7;
+const CC_S  = 8;
+const CC_NS = 9;
+const CC_P  = 10;
+const CC_NP = 11;
+const CC_L  = 12;
+const CC_GE = 13;
+const CC_LE = 14;
+const CC_G  = 15;
 
 // ── Initialization ───────────────────────────────────────
 
@@ -57,12 +71,6 @@ init_x64_enc() {
     x64_enc_rel_pos = arr_new();
     x64_enc_rel_sym = arr_new();
     x64_enc_rel_ty  = arr_new();
-
-    CC_O = 0; CC_NO = 1; CC_B = 2; CC_AE = 3;
-    CC_E = 4; CC_NE = 5; CC_BE = 6; CC_A = 7;
-    CC_S = 8; CC_NS = 9; CC_P = 10; CC_NP = 11;
-    CC_L = 12; CC_GE = 13; CC_LE = 14; CC_G = 15;
-
 }
 
 // ── Buffer operations ────────────────────────────────────
@@ -70,7 +78,7 @@ init_x64_enc() {
 // Write a single byte to the code buffer.
 void x64_enc_emit8(val) {
     poke(x64_enc_buf + x64_enc_pos, val & 0xFF);
-    x64_enc_pos = x64_enc_pos + 1;
+    x64_enc_pos++;
 }
 
 // Write a 32-bit value to the code buffer (little-endian).
@@ -79,7 +87,7 @@ void x64_enc_emit32(val) {
     poke(x64_enc_buf + x64_enc_pos + 1, (val >> 8) & 0xFF);
     poke(x64_enc_buf + x64_enc_pos + 2, (val >> 16) & 0xFF);
     poke(x64_enc_buf + x64_enc_pos + 3, (val >> 24) & 0xFF);
-    x64_enc_pos = x64_enc_pos + 4;
+    x64_enc_pos += 4;
 }
 
 // Write a 64-bit value to the code buffer (little-endian).
@@ -98,10 +106,7 @@ void x64_enc_patch32(off, val) {
 
 // Read a 32-bit value from the code buffer at a specific byte offset.
 x64_enc_read32(off) {
-    return peek(x64_enc_buf + off)
-         | (peek(x64_enc_buf + off + 1) << 8)
-         | (peek(x64_enc_buf + off + 2) << 16)
-         | (peek(x64_enc_buf + off + 3) << 24);
+    return peek_h(x64_enc_buf + off);
 }
 
 // ── Label management ─────────────────────────────────────
@@ -120,7 +125,7 @@ void x64_enc_def_label_at(id, off) {
 x64_enc_new_label() {
     auto id;
     id = arr_len(x64_enc_lbl_off);
-    x64_enc_lbl_off = arr_push(x64_enc_lbl_off, 0 - 1);
+    x64_enc_lbl_off = arr_push(x64_enc_lbl_off, -1);
     return id;
 }
 
@@ -368,7 +373,7 @@ void x64_enc_not(rd) {
 
 // ── Multiply / divide ───────────────────────────────────
 
-// IMUL r64, r64. Two-operand form: dst = dst * src (low 64 bits).
+// IMUL r64, r64. Two-operand form: dst *= src (low 64 bits).
 void x64_enc_imul(dst, src) {
     x64_enc_rex(1, (dst >> 3) & 1, 0, (src >> 3) & 1);
     x64_enc_emit8(0x0F);
@@ -981,7 +986,7 @@ void x64_enc_movd_to_gpr(dst, src) {
 void x64_enc_resolve_fixups() {
     auto i, pos, lbl, target, off, n;
     n = arr_len(x64_enc_fix_pos);
-    for (i = 0; i < n; i = i + 1) {
+    for (i = 0; i < n; i++) {
         pos    = arr_get(x64_enc_fix_pos, i);
         lbl    = arr_get(x64_enc_fix_lbl, i);
         target = arr_get(x64_enc_lbl_off, lbl);

@@ -6,19 +6,18 @@ import "bug_gdb.bsm";
 
 // -- Constants ---------------------------------------------------
 
-auto _ds_port;       // TCP port debugserver listens on.
-auto _ds_pid;        // PID of debugserver process.
+static auto _ds_port;       // TCP port debugserver listens on.
+static auto _ds_pid;        // PID of debugserver process.
 
-auto SIGTRAP, SIGSEGV, SIGBUS, SIGABRT;
+const SIGTRAP = 5;
+const SIGSEGV = 11;
+const SIGBUS  = 10;
+const SIGABRT = 6;
 
-auto _ds_path;
-auto _ds_path_xcode;
+static auto _ds_path;
+static auto _ds_path_xcode;
 
 init_observe() {
-    SIGTRAP = 5;
-    SIGSEGV = 11;
-    SIGBUS = 10;
-    SIGABRT = 6;
     _ds_port = 0;
     _ds_pid = 0;
 
@@ -55,10 +54,10 @@ _itoa(buf, n) {
     if (n == 0) { poke(tmp, '0'); len = 1; }
     while (n > 0) {
         poke(tmp + len, '0' + (n % 10));
-        len = len + 1;
-        n = n / 10;
+        len++;
+        n /= 10;
     }
-    for (i = 0; i < len; i = i + 1) {
+    for (i = 0; i < len; i++) {
         poke(buf + i, peek(tmp + len - 1 - i));
     }
     poke(buf + len, 0);
@@ -79,7 +78,7 @@ _spawn_debugserver(target_path, start_idx, argc) {
         out_nl();
         out_str("hint: install Xcode or Command Line Tools");
         out_nl();
-        return 0 - 1;
+        return -1;
     }
 
     // Pick a port based on a short-lived fork (pseudo-random PID).
@@ -119,7 +118,7 @@ _spawn_debugserver(target_path, start_idx, argc) {
     argv[1] = host_port;
     argv[2] = target_path;
     argv[3] = "--";
-    for (i = 0; i < cnt; i = i + 1) {
+    for (i = 0; i < cnt; i++) {
         argv[4 + i] = argv_get(start_idx + 1 + i);
     }
     argv[4 + cnt] = 0;
@@ -128,7 +127,7 @@ _spawn_debugserver(target_path, start_idx, argc) {
     if (pid < 0) {
         out_str("bug: fork failed");
         out_nl();
-        return 0 - 1;
+        return -1;
     }
 
     if (pid == 0) {
@@ -150,12 +149,11 @@ _spawn_debugserver(target_path, start_idx, argc) {
 
 // -- Mach-O parsing (for __text section address) -----------------
 
-auto _mo_text_addr;
-auto _mo_text_seg_vmaddr;
+static auto _mo_text_addr;
+static auto _mo_text_seg_vmaddr;
 
 _rd32(buf, off) {
-    return (peek(buf+off) & 0xFF) | ((peek(buf+off+1) & 0xFF) << 8) |
-           ((peek(buf+off+2) & 0xFF) << 16) | ((peek(buf+off+3) & 0xFF) << 24);
+    return peek_h(buf + off);
 }
 
 _rd64(buf, off) {
@@ -172,11 +170,11 @@ parse_macho_header(path) {
 
     buf = malloc(262144);
     fd = sys_open(path, 0);
-    if (fd < 0) { free(buf); return 0 - 1; }
+    if (fd < 0) { free(buf); return -1; }
     nread = sys_read(fd, buf, 262144);
     sys_close(fd);
-    if (nread < 64) { free(buf); return 0 - 1; }
-    if (_rd32(buf, 0) != 0xFEEDFACF) { free(buf); return 0 - 1; }
+    if (nread < 64) { free(buf); return -1; }
+    if (_rd32(buf, 0) != 0xFEEDFACF) { free(buf); return -1; }
 
     ncmds = _rd32(buf, 16);
     pos = 32;
@@ -187,7 +185,7 @@ parse_macho_header(path) {
     str_off = 0;
     str_size = 0;
 
-    for (i = 0; i < ncmds; i = i + 1) {
+    for (i = 0; i < ncmds; i++) {
         if (pos + 8 > nread) { free(buf); return 0; }
         cmd = _rd32(buf, pos);
         cmdsize = _rd32(buf, pos + 4);
@@ -199,7 +197,7 @@ parse_macho_header(path) {
                     _mo_text_seg_vmaddr = _rd64(buf, pos + 24);
                     nsects = _rd32(buf, pos + 64);
                     sp = pos + 72;
-                    for (si = 0; si < nsects; si = si + 1) {
+                    for (si = 0; si < nsects; si++) {
                         if (peek(buf+sp) == '_') {
                             if (peek(buf+sp+2) == 't') {
                                 if (peek(buf+sp+3) == 'e') {
@@ -207,7 +205,7 @@ parse_macho_header(path) {
                                 }
                             }
                         }
-                        sp = sp + 80;
+                        sp += 80;
                     }
                 }
             }
@@ -221,7 +219,7 @@ parse_macho_header(path) {
             str_size = _rd32(buf, pos + 20);
         }
 
-        pos = pos + cmdsize;
+        pos += cmdsize;
     }
 
     // Read symbol table entries and build address map.
@@ -231,7 +229,7 @@ parse_macho_header(path) {
             if (str_off + str_size <= nread) {
                 auto si, n_strx, n_type, n_sect, n_value;
                 auto name_start, name_len, ch, name_packed;
-                for (si = 0; si < sym_cnt; si = si + 1) {
+                for (si = 0; si < sym_cnt; si++) {
                     sp = sym_off + si * 16;
                     n_strx = _rd32(buf, sp);
                     n_type = peek(buf + sp + 4) & 0xFF;
@@ -245,7 +243,7 @@ parse_macho_header(path) {
                             name_start = str_off + n_strx;
                             // Skip leading underscore (C symbol prefix).
                             if (peek(buf + name_start) == '_') {
-                                name_start = name_start + 1;
+                                name_start++;
                             }
                             // Skip __mh_execute_header (starts with "_mh").
                             auto skip;
@@ -262,7 +260,7 @@ parse_macho_header(path) {
                                 name_len = 0;
                                 ch = peek(buf + name_start + name_len);
                                 while (ch != 0) {
-                                    name_len = name_len + 1;
+                                    name_len++;
                                     if (name_start + name_len < nread) {
                                         ch = peek(buf + name_start + name_len);
                                     } else { ch = 0; }
@@ -273,7 +271,7 @@ parse_macho_header(path) {
                                     code_off_check = n_value - _mo_text_addr;
                                     dup = 0;
                                     auto di;
-                                    for (di = 0; di < bug_am_count; di = di + 1) {
+                                    for (di = 0; di < bug_am_count; di++) {
                                         if (arr_get(bug_am_off, di) == code_off_check) { dup = 1; }
                                     }
                                   if (dup == 0) {
@@ -281,9 +279,9 @@ parse_macho_header(path) {
                                     auto pi;
                                     auto pack_start;
                                     pack_start = _br_strbuf_pos;
-                                    for (pi = 0; pi < name_len; pi = pi + 1) {
+                                    for (pi = 0; pi < name_len; pi++) {
                                         poke(_br_strbuf + _br_strbuf_pos, peek(buf + name_start + pi));
-                                        _br_strbuf_pos = _br_strbuf_pos + 1;
+                                        _br_strbuf_pos++;
                                     }
                                     name_packed = pack_start + (name_len * 0x100000000);
                                     // Code offset = n_value - _mo_text_addr.
@@ -291,7 +289,7 @@ parse_macho_header(path) {
                                     code_off = n_value - _mo_text_addr;
                                     bug_am_name = arr_push(bug_am_name, name_packed);
                                     bug_am_off = arr_push(bug_am_off, code_off);
-                                    bug_am_count = bug_am_count + 1;
+                                    bug_am_count++;
                                   }
                                 }
                             }
@@ -310,9 +308,9 @@ parse_macho_header(path) {
 
 lookup_pc(pc, text_base) {
     auto i, off, best_idx, best_dist, dist;
-    best_idx = 0 - 1;
+    best_idx = -1;
     best_dist = 0x7FFFFFFFFFFFFFFF;
-    for (i = 0; i < bug_am_count; i = i + 1) {
+    for (i = 0; i < bug_am_count; i++) {
         off = arr_get(bug_am_off, i);
         dist = pc - (text_base + off);
         if (dist >= 0) {
@@ -348,7 +346,7 @@ _print_backtrace(text_base) {
                 } else {
                     out_str("0x");
                     auto hi;
-                    for (hi = 60; hi >= 0; hi = hi - 4) {
+                    for (hi = 60; hi >= 0; hi -= 4) {
                         auto d;
                         d = (lr >> hi) & 0xF;
                         if (d < 10) { out_ch('0' + d); }
@@ -357,7 +355,7 @@ _print_backtrace(text_base) {
                 }
                 out_nl();
                 fp = gdb_read_mem(fp, 8);
-                depth = depth + 1;
+                depth++;
             }
         }
     }
@@ -374,7 +372,7 @@ _packed_eq(a, b) {
     lb = b / 0x100000000;
     sb = b % 0x100000000;
     if (la != lb) { return 0; }
-    for (i = 0; i < la; i = i + 1) {
+    for (i = 0; i < la; i++) {
         if (peek(_br_strbuf + sa + i) != peek(_br_strbuf + sb + i)) { return 0; }
     }
     return 1;
@@ -389,7 +387,7 @@ _cstr_eq_packed(cstr, packed) {
     auto s, l, i, pch, cch;
     l = packed / 0x100000000;
     s = packed % 0x100000000;
-    for (i = 0; i < l; i = i + 1) {
+    for (i = 0; i < l; i++) {
         cch = str_peek(cstr, i);
         if (cch == 0) { return 0; }
         pch = peek(_br_strbuf + s + i);
@@ -411,15 +409,15 @@ static _dump_cstr_at(label, addr) {
     out_str(label);
     out_str("=\"");
     printed = 0;
-    for (off = 0; off < 32; off = off + 8) {
+    for (off = 0; off < 32; off += 8) {
         w = gdb_read_mem(addr + off, 8);
-        for (i = 0; i < 8; i = i + 1) {
+        for (i = 0; i < 8; i++) {
             ch = (w >> (i * 8)) & 0xFF;
             if (ch == 0) { out_ch('"'); return 0; }
             if (printed >= 32) { out_str("\u2026\""); return 0; }
             if (ch >= 32 && ch < 127) { out_ch(ch); }
             else { out_ch('.'); }
-            printed = printed + 1;
+            printed++;
         }
     }
     out_str("\"");
@@ -434,7 +432,7 @@ static _dump_cstr_at(label, addr) {
 // microseconds.
 _resolve_break_cstr(cstr, text_base) {
     auto i;
-    for (i = 0; i < bug_am_count; i = i + 1) {
+    for (i = 0; i < bug_am_count; i++) {
         if (_cstr_eq_packed(cstr, arr_get(bug_am_name, i))) {
             return text_base + arr_get(bug_am_off, i);
         }
@@ -461,7 +459,7 @@ _print_crash_locals(fi, text_base) {
 
     out_str("  locals:");
     out_nl();
-    for (vi = 0; vi < vcnt; vi = vi + 1) {
+    for (vi = 0; vi < vcnt; vi++) {
         val = gdb_read_mem(fp + voffs[vi], 8);
         out_str("    ");
         if (vnames != 0) { out_packed(vnames[vi]); }
@@ -470,7 +468,7 @@ _print_crash_locals(fi, text_base) {
         out_int(val);
         out_str(" (0x");
         auto hi;
-        for (hi = 28; hi >= 0; hi = hi - 4) {
+        for (hi = 28; hi >= 0; hi -= 4) {
             auto d;
             d = (val >> hi) & 0xF;
             if (d < 10) { out_ch('0' + d); }
@@ -502,7 +500,7 @@ _print_crash_locals(fi, text_base) {
 // breakpoint hit also prints the first ~32 bytes at [x0] and [x1]
 // as C-strings. Indispensable for tracing calls like buf_eq(src,
 // "break", 5) where the literal-address argument is the suspect.
-auto flag_dump_str;
+global flag_dump_str; // Set by bug.bpp from --dump-str CLI flag.
 
 bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     auto ret, sig, pc, fi, i;
@@ -533,12 +531,12 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
 
     // Connect (retry up to 5 seconds).
     retries = 0;
-    ret = 0 - 1;
+    ret = -1;
     while (retries < 50) {
         sys_usleep(100000);
         ret = gdb_connect(_ds_port);
         if (ret >= 0) { retries = 999; }
-        else { retries = retries + 1; }
+        else { retries++; }
     }
     if (ret < 0) {
         out_str("bug: error: cannot connect to debugserver");
@@ -567,7 +565,7 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     }
     if (_mode == 1 || _mode == 2) {
         auto _bi, _spec, _addr;
-        for (_bi = 0; _bi < bp_count; _bi = _bi + 1) {
+        for (_bi = 0; _bi < bp_count; _bi++) {
             _spec = *(bp_names + _bi * 8);
             _addr = _resolve_break_cstr(_spec, text_base);
             if (_addr == 0) {
@@ -577,23 +575,23 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                 _cch = str_peek(_spec, 0);
                 while (_cch != 0) {
                     out_ch(_cch);
-                    _ci = _ci + 1;
+                    _ci++;
                     _cch = str_peek(_spec, _ci);
                 }
                 out_str("` -- no function by that name in the binary");
                 out_nl();
             } else {
                 ret = gdb_set_bp(_addr);
-                if (ret == 0) { _set_count = _set_count + 1; }
+                if (ret == 0) { _set_count++; }
             }
         }
     }
     if (_mode == 0 || _mode == 2) {
-        for (i = 0; i < bug_am_count; i = i + 1) {
+        for (i = 0; i < bug_am_count; i++) {
             auto addr;
             addr = text_base + arr_get(bug_am_off, i);
             ret = gdb_set_bp(addr);
-            if (ret == 0) { _set_count = _set_count + 1; }
+            if (ret == 0) { _set_count++; }
         }
     }
 
@@ -628,13 +626,13 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
             if (fi >= 0) {
                 // Indentation based on call depth.
                 auto d;
-                for (d = 0; d < call_depth; d = d + 1) { out_str("  "); }
+                for (d = 0; d < call_depth; d++) { out_str("  "); }
                 out_str("-> ");
                 out_packed(arr_get(bug_am_name, fi));
                 // Show first 4 arguments (x0-x3 on ARM64).
                 out_str("(");
                 auto ai, av;
-                for (ai = 0; ai < 4; ai = ai + 1) {
+                for (ai = 0; ai < 4; ai++) {
                     if (ai > 0) { out_str(", "); }
                     av = gdb_read_reg(ai);
                     if (av == 0) { out_str("0"); }
@@ -644,7 +642,7 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                         // Print compact hex (skip leading zeros, max 12 hex digits).
                         auto hi, started;
                         started = 0;
-                        for (hi = 44; hi >= 0; hi = hi - 4) {
+                        for (hi = 44; hi >= 0; hi -= 4) {
                             auto nd;
                             nd = (av >> hi) & 0xF;
                             if (nd != 0) { started = 1; }
@@ -660,7 +658,7 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                 if (flag_dump_str) {
                     auto x0v, x1v, d2;
                     out_nl();
-                    for (d2 = 0; d2 < call_depth + 1; d2 = d2 + 1) { out_str("  "); }
+                    for (d2 = 0; d2 < call_depth + 1; d2++) { out_str("  "); }
                     out_str("   ");
                     x0v = gdb_read_reg(0);
                     x1v = gdb_read_reg(1);
@@ -669,7 +667,7 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                     _dump_cstr_at("x1", x1v);
                 }
                 out_nl();
-                call_depth = call_depth + 1;
+                call_depth++;
                 if (call_depth > 30) { call_depth = 30; }
             }
 

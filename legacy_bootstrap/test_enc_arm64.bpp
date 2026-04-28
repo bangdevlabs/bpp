@@ -1,0 +1,223 @@
+// test_enc_arm64.bpp — Validate ARM64 instruction encoders.
+// Encodes known instructions and compares against reference bytes from the assembler.
+//
+// Usage: ./bpp bootstrap/test_enc_arm64.bpp > /tmp/t.c && clang /tmp/t.c -o /tmp/t && /tmp/t
+
+import "defs.bpp";
+import "bpp_enc_arm64.bsm";
+
+// ── Test helpers ──────────────────────────────────────────
+
+auto test_pass, test_fail;
+
+// Print a null-terminated string.
+tprint(s) {
+    auto i, ch;
+    i = 0; ch = str_peek(s, i);
+    while (ch != 0) { putchar(ch); i = i + 1; ch = str_peek(s, i); }
+    return 0;
+}
+
+// Print an integer in decimal.
+tprintd(n) {
+    auto buf, len, i;
+    if (n < 0) { putchar('-'); n = 0 - n; }
+    if (n == 0) { putchar('0'); return 0; }
+    buf = malloc(20); len = 0;
+    while (n > 0) { poke(buf + len, '0' + n % 10); len = len + 1; n = n / 10; }
+    i = len - 1;
+    while (i >= 0) { putchar(peek(buf + i)); i = i - 1; }
+    return 0;
+}
+
+// Print a 32-bit value in hexadecimal (8 digits).
+tprinth(val) {
+    auto i, nibble, ch;
+    i = 7;
+    while (i >= 0) {
+        nibble = (val >> (i * 4)) & 0xF;
+        if (nibble < 10) { ch = '0' + nibble; } else { ch = 'a' + nibble - 10; }
+        putchar(ch);
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Check that the instruction at the given position matches the expected encoding.
+check(name, pos, expected) {
+    auto actual;
+    actual = enc_read32(pos);
+    if (actual == expected) {
+        tprint("PASS "); tprint(name); putchar('\n');
+        test_pass = test_pass + 1;
+    } else {
+        tprint("FAIL "); tprint(name);
+        tprint("  expected="); tprinth(expected);
+        tprint("  actual="); tprinth(actual);
+        putchar('\n');
+        test_fail = test_fail + 1;
+    }
+    return 0;
+}
+
+// Reset the code buffer position for a fresh test.
+reset() { enc_pos = 0; return 0; }
+
+// ── Tests ─────────────────────────────────────────────────
+
+main() {
+    auto pos0;
+    test_pass = 0; test_fail = 0;
+
+    init_defs();
+    init_enc_arm64();
+
+    // --- Move immediate ---
+    reset(); enc_movz(0, 0, 0);        check("movz x0, #0",           0, 0xD2800000);
+    reset(); enc_movz(0, 1, 0);        check("movz x0, #1",           0, 0xD2800020);
+    reset(); enc_movz(0, 0xFFFF, 0);   check("movz x0, #0xFFFF",      0, 0xD29FFFE0);
+    reset(); enc_movk(0, 0x1234, 1);   check("movk x0, #0x1234 lsl16", 0, 0xF2A24680);
+    reset(); enc_movn(0, 0, 0);        check("movn x0, #0 (mov #-1)",  0, 0x92800000);
+
+    // --- Register ALU ---
+    reset(); enc_add_reg(0, 1, 2);     check("add x0, x1, x2",        0, 0x8B020020);
+    reset(); enc_sub_reg(0, 1, 2);     check("sub x0, x1, x2",        0, 0xCB020020);
+    reset(); enc_and_reg(0, 1, 2);     check("and x0, x1, x2",        0, 0x8A020020);
+    reset(); enc_orr_reg(0, 1, 2);     check("orr x0, x1, x2",        0, 0xAA020020);
+    reset(); enc_eor_reg(0, 1, 2);     check("eor x0, x1, x2",        0, 0xCA020020);
+    reset(); enc_cmp_reg(0, 1);        check("cmp x0, x1",            0, 0xEB01001F);
+    reset(); enc_neg(0, 1);            check("neg x0, x1",            0, 0xCB0103E0);
+    reset(); enc_mov_reg(2, 0);        check("mov x2, x0",            0, 0xAA0003E2);
+
+    // --- Data processing 2-source ---
+    reset(); enc_mul(0, 1, 2);         check("mul x0, x1, x2",        0, 0x9B027C20);
+    reset(); enc_sdiv(0, 1, 2);        check("sdiv x0, x1, x2",       0, 0x9AC20C20);
+    reset(); enc_msub(0, 8, 0, 1);     check("msub x0, x8, x0, x1",   0, 0x9B008500);
+    reset(); enc_lslv(0, 1, 2);        check("lsl x0, x1, x2",        0, 0x9AC22020);
+    reset(); enc_asrv(0, 1, 2);        check("asr x0, x1, x2",        0, 0x9AC22820);
+    reset(); enc_lsrv(0, 1, 2);        check("lsr x0, x1, x2",        0, 0x9AC22420);
+
+    // --- Immediate ALU ---
+    reset(); enc_add_imm(0, 1, 42);    check("add x0, x1, #42",       0, 0x9100A820);
+    reset(); enc_sub_imm(0, 1, 42);    check("sub x0, x1, #42",       0, 0xD100A820);
+    reset(); enc_add_imm(31, 31, 16);  check("add sp, sp, #16",       0, 0x910043FF);
+    reset(); enc_sub_imm(31, 31, 16);  check("sub sp, sp, #16",       0, 0xD10043FF);
+    reset(); enc_add_imm(29, 31, 0);   check("mov x29, sp",           0, 0x910003FD);
+    reset(); enc_cmp_imm(0, 1);        check("cmp x0, #1",            0, 0xF100041F);
+    reset(); enc_add_imm(1, 29, 16);   check("add x1, x29, #16",      0, 0x910043A1);
+
+    // --- Conditional ---
+    reset(); enc_cset(0, 0);           check("cset x0, eq",           0, 0x9A9F17E0);
+    reset(); enc_cset(0, 1);           check("cset x0, ne",           0, 0x9A9F07E0);
+    reset(); enc_cset(0, 11);          check("cset x0, lt",           0, 0x9A9FA7E0);
+    reset(); enc_cset(0, 10);          check("cset x0, ge",           0, 0x9A9FB7E0);
+    reset(); enc_cset(0, 13);          check("cset x0, le",           0, 0x9A9FC7E0);
+    reset(); enc_cset(0, 12);          check("cset x0, gt",           0, 0x9A9FD7E0);
+    reset(); enc_csneg(0, 0, 0, 3);    check("csneg x0, x0, x0, cc",  0, 0xDA803400);
+
+    // --- Load/store 64-bit unsigned offset ---
+    reset(); enc_ldr_uoff(0, 1, 0);    check("ldr x0, [x1]",          0, 0xF9400020);
+    reset(); enc_ldr_uoff(0, 1, 8);    check("ldr x0, [x1, #8]",      0, 0xF9400420);
+    reset(); enc_str_uoff(0, 1, 0);    check("str x0, [x1]",          0, 0xF9000020);
+    reset(); enc_str_uoff(0, 1, 16);   check("str x0, [x1, #16]",     0, 0xF9000820);
+    reset(); enc_ldr_uoff(0, 0, 0);    check("ldr x0, [x0] (deref)",  0, 0xF9400000);
+    reset(); enc_str_uoff(1, 0, 0);    check("str x1, [x0]",          0, 0xF9000001);
+
+    // --- Load/store byte ---
+    reset(); enc_ldrb_uoff(0, 1, 0);   check("ldrb w0, [x1]",         0, 0x39400020);
+    reset(); enc_strb_uoff(1, 0, 0);   check("strb w1, [x0]",         0, 0x39000001);
+    reset(); enc_ldrb_reg(0, 0, 1);    check("ldrb w0, [x0, x1]",     0, 0x38616800);
+    reset(); enc_strb_uoff(0, 29, 16); check("strb w0, [x29, #16]",   0, 0x390043A0);
+    reset(); enc_strb_uoff(31, 29, 16); check("strb wzr, [x29, #16]",  0, 0x390043BF);
+    reset(); enc_ldrb_uoff(0, 29, 16); check("ldrb w0, [x29, #16]",   0, 0x394043A0);
+
+    // --- Pre/post-indexed (push/pop) ---
+    reset(); enc_str_pre(0, 31, -16);  check("str x0, [sp, #-16]!",   0, 0xF81F0FE0);
+    reset(); enc_ldr_post(0, 31, 16);  check("ldr x0, [sp], #16",     0, 0xF84107E0);
+    reset(); enc_ldr_post(1, 31, 16);  check("ldr x1, [sp], #16",     0, 0xF84107E1);
+    reset(); enc_str_d_pre(0, 31, -16); check("str d0, [sp, #-16]!",   0, 0xFC1F0FE0);
+    reset(); enc_ldr_d_post(0, 31, 16); check("ldr d0, [sp], #16",     0, 0xFC4107E0);
+    reset(); enc_ldr_d_post(1, 31, 16); check("ldr d1, [sp], #16",     0, 0xFC4107E1);
+
+    // --- STP/LDP ---
+    reset(); enc_stp_pre(29, 30, 31, -16); check("stp x29,x30,[sp,#-16]!", 0, 0xA9BF7BFD);
+    reset(); enc_ldp_post(29, 30, 31, 16); check("ldp x29,x30,[sp],#16",   0, 0xA8C17BFD);
+
+    // --- Branches (direct offset) ---
+    reset(); enc_b(4);                 check("b .+4",                  0, 0x14000001);
+    reset(); enc_bl(8);                check("bl .+8",                 0, 0x94000002);
+    reset(); enc_cbz(0, 12);           check("cbz x0, .+12",          0, 0xB4000060);
+    reset(); enc_cbnz(0, 16);          check("cbnz x0, .+16",         0, 0xB5000080);
+    reset(); enc_b_cond(0, 20);        check("b.eq .+20",             0, 0x540000A0);
+    reset(); enc_b_cond(1, 24);        check("b.ne .+24",             0, 0x540000C1);
+    reset(); enc_b_cond(11, 28);       check("b.lt .+28",             0, 0x540000EB);
+    reset(); enc_b_cond(10, 32);       check("b.ge .+32",             0, 0x5400010A);
+    reset(); enc_b_cond(13, 36);       check("b.le .+36",             0, 0x5400012D);
+    reset(); enc_b_cond(12, 40);       check("b.gt .+40",             0, 0x5400014C);
+
+    // --- System ---
+    reset(); enc_ret();                check("ret",                    0, 0xD65F03C0);
+    reset(); enc_svc(0x80);            check("svc #0x80",             0, 0xD4001001);
+    reset(); enc_nop();                check("nop",                    0, 0xD503201F);
+
+    // --- Float arithmetic ---
+    reset(); enc_fmov(0, 1);           check("fmov d0, d1",           0, 0x1E604020);
+    reset(); enc_fadd(0, 1, 2);        check("fadd d0, d1, d2",       0, 0x1E622820);
+    reset(); enc_fsub(0, 1, 2);        check("fsub d0, d1, d2",       0, 0x1E623820);
+    reset(); enc_fmul(0, 1, 2);        check("fmul d0, d1, d2",       0, 0x1E620820);
+    reset(); enc_fdiv(0, 1, 2);        check("fdiv d0, d1, d2",       0, 0x1E621820);
+    reset(); enc_fcmp(0, 1);           check("fcmp d0, d1",           0, 0x1E612000);
+    reset(); enc_fcmp_zero(0);         check("fcmp d0, #0.0",         0, 0x1E602008);
+    reset(); enc_fcmp_zero(1);         check("fcmp d1, #0.0",         0, 0x1E602028);
+    reset(); enc_fneg(0, 1);           check("fneg d0, d1",           0, 0x1E614020);
+
+    // --- Float/integer conversion ---
+    reset(); enc_scvtf(0, 0);          check("scvtf d0, x0",          0, 0x9E620000);
+    reset(); enc_fcvtzs(0, 0);         check("fcvtzs x0, d0",         0, 0x9E780000);
+    reset(); enc_fmov_from_gpr(0, 0);  check("fmov d0, x0",           0, 0x9E670000);
+    reset(); enc_fmov_to_gpr(0, 0);    check("fmov x0, d0",           0, 0x9E660000);
+
+    // --- Float load/store ---
+    reset(); enc_str_d_uoff(0, 31, 0); check("str d0, [sp]",          0, 0xFD0003E0);
+    reset(); enc_ldr_d_uoff(0, 31, 8); check("ldr d0, [sp, #8]",      0, 0xFD4007E0);
+
+    // --- ADRP ---
+    reset(); enc_adrp(0);              check("adrp x0, 0",            0, 0x90000000);
+    reset(); enc_adrp(8);              check("adrp x8, 0",            0, 0x90000008);
+
+    // --- Label/fixup: forward CBZ ---
+    // Emit cbz (offset 0), nop (offset 4), then label at offset 8.
+    // cbz should be patched to offset +8 (2 instructions forward).
+    reset();
+    enc_lbl_max = 0;
+    enc_fix_cnt = 0;
+    pos0 = enc_pos;
+    enc_cbz_label(0, enc_new_label());
+    enc_nop();
+    enc_def_label(0);
+    enc_resolve_fixups();
+    check("cbz fwd fixup +8", pos0, 0xB4000040);
+
+    // --- Label/fixup: backward B ---
+    // Label at offset 0, nop at offset 0 (enc_pos=4), b at offset 4 → offset = -4.
+    reset();
+    enc_lbl_max = 0;
+    enc_fix_cnt = 0;
+    enc_def_label(enc_new_label());
+    enc_nop();
+    enc_b_label(0);
+    check("b backward -4", 4, 0x17FFFFFF);
+
+    // --- enc_mov_wide ---
+    reset(); enc_mov_wide(0, 0);       check("mov_wide x0, #0",       0, 0xD2800000);
+    reset(); enc_mov_wide(0, 1);       check("mov_wide x0, #1",       0, 0xD2800020);
+    reset(); enc_mov_wide(0, -1);      check("mov_wide x0, #-1",      0, 0x92800000);
+
+    // --- Summary ---
+    putchar('\n');
+    tprintd(test_pass); tprint(" passed, ");
+    tprintd(test_fail); tprint(" failed\n");
+    if (test_fail > 0) { return 1; }
+
+    return 0;
+}

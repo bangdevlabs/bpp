@@ -259,9 +259,9 @@ _x64_arg_reg_int(i) : base {
     if (i == 3) { return 1; }   // rcx
     if (i == 4) { return 8; }   // r8
     if (i == 5) { return 9; }   // r9
-    return 0 - 1;
+    return -1;
 }
-_x64_arg_reg_flt(i) : base { if (i < 8) { return i; } return 0 - 1; }
+_x64_arg_reg_flt(i) : base { if (i < 8) { return i; } return -1; }
 _x64_arg_reg_count_int() : base { return 6; }
 _x64_arg_reg_count_flt() : base { return 8; }
 
@@ -286,7 +286,7 @@ void _x64_emit_push_arg_flt(dst_or_off, is_spill) {
 _x64_emit_pre_call_align(stack_args) {
     auto pad;
     pad = stack_args * 8;
-    if (pad % 16 != 0) { pad = pad + 8; }
+    if (pad % 16 != 0) { pad += 8; }
     if (pad > 0) { x64_enc_sub_imm(4, pad); }
     return pad;
 }
@@ -339,7 +339,7 @@ void _x64_emit_prologue(name_p, fn_lbl_id, frame_size) {
     x64_enc_mov_reg(5, 4);
     if (frame_size > 0) { x64_enc_sub_imm(4, frame_size); }
     n = arr_len(x64_promoted_regs);
-    for (i = 0; i < n; i = i + 1) {
+    for (i = 0; i < n; i++) {
         reg = arr_get(x64_promoted_regs, i);
         off = x64_b3_spill_off - (i + 1) * 8;
         x64_enc_store(reg, 5, off);
@@ -400,13 +400,13 @@ void _x64_emit_branch_ne(label_id) {
 // matching the pre-lift chip-local emission.
 void _x64_emit_pop_discard() {
     x64_enc_pop(1);
-    cg_depth = cg_depth - 1;
+    cg_depth--;
 }
 
 // x86_64 has no int freelist; always stack. Returns -1 / -2 matching
 // the aarch64 token encoding.
 _x64_emit_binop_save_left(has_call_right, lty) {
-    if (lty == 1) { x64_emit_fpush(); return 0 - 1; }
+    if (lty == 1) { x64_emit_fpush(); return -1; }
     x64_emit_push();
     return 0 - 2;
 }
@@ -414,7 +414,7 @@ _x64_emit_binop_save_left(has_call_right, lty) {
 _x64_emit_binop_resolve(save_token, use_flt, lty, rty) {
     if (use_flt) {
         if (rty == 0) { x64_enc_cvtsi2sd(0, 0); }
-        if (save_token == 0 - 1) {
+        if (save_token == -1) {
             x64_emit_fpop(1);
         } else {
             x64_emit_pop(0);
@@ -423,7 +423,7 @@ _x64_emit_binop_resolve(save_token, use_flt, lty, rty) {
         return 0;
     }
     if (rty == 1) { x64_enc_cvttsd2si(0, 0); }
-    if (save_token == 0 - 1) {
+    if (save_token == -1) {
         x64_enc_mov_reg(1, 0);
         x64_emit_fpop(0);
         x64_enc_cvttsd2si(0, 0);
@@ -480,7 +480,7 @@ _x64_fn_compute_offsets() {
     auto i, n_vars, total, _fty, abs_mag, sz;
     total = 0;
     n_vars = arr_len(cg_vars);
-    for (i = 0; i < n_vars; i = i + 1) {
+    for (i = 0; i < n_vars; i++) {
         _fty = arr_get(cg_var_forced_ty, i);
         abs_mag = 24 + total;
         if (slice_width(ty_slice(_fty)) == 128) {
@@ -489,10 +489,10 @@ _x64_fn_compute_offsets() {
             arr_set(cg_var_off, i, 0 - abs_mag - 16);
         } else if (arr_get(cg_var_stack, i)) {
             sz = (get_struct_size(arr_get(cg_var_struct_idx, i)) + 7) / 8 * 8;
-            total = total + sz;
+            total += sz;
             arr_set(cg_var_off, i, 0 - (24 + total));
         } else {
-            total = total + 8;
+            total += 8;
             arr_set(cg_var_off, i, 0 - (24 + total));
         }
     }
@@ -545,7 +545,7 @@ void _x64_emit_frame_teardown(frame_size) {
     auto i, n, reg, off;
     x64_enc_def_label(x64_ret_lbl);
     n = arr_len(x64_promoted_regs);
-    for (i = 0; i < n; i = i + 1) {
+    for (i = 0; i < n; i++) {
         reg = arr_get(x64_promoted_regs, i);
         off = x64_b3_spill_off - (i + 1) * 8;
         x64_enc_load(reg, 5, off);
@@ -617,6 +617,24 @@ void _x64_emit_mem_read(width) {
 // B++ int-from-float semantic expects.
 void _x64_emit_coerce_float_to_int() {
     x64_enc_cvttsd2si(0, 0);
+}
+
+// Convert integer accumulator (rax) to float accumulator (xmm0).
+void _x64_emit_coerce_int_to_float() {
+    x64_enc_cvtsi2sd(0, 0);
+}
+
+// Store float register val_reg at [rax].
+// x86_64 limitation: sub-word float (SL_HALF) bitcasts 64-bit double bits through
+// movq, then stores the low 32 bits. This is correct for SL_FULL (64-bit double).
+// For SL_HALF (32-bit single), a proper fix needs cvtsd2ss + movss.
+void _x64_emit_float_store_scalar(fh_sl, val_reg) {
+    x64_enc_movq_from_xmm(val_reg, val_reg);   // bitcast xmm{val_reg} → r{val_reg}
+    if (fh_sl == SL_HALF) {
+        x64_enc_store_w(val_reg, 0, 0);         // mov dword [rax], r{val_reg}d
+        return;
+    }
+    x64_enc_store(val_reg, 0, 0);               // mov qword [rax], r{val_reg}
 }
 
 // Push rax onto the stack (Wave 18 dispatch helper).
@@ -736,11 +754,11 @@ void _x64_emit_syscall(cg_id, arg_count, extra_slot, extra_val) {
     // Move arg 0 from rax (tree walker convention) into rdi (syscall ABI).
     if (arg_count >= 1) { x64_enc_mov_reg(7, 0); }
     // Pop remaining args from the stack into rsi, rdx, r10, r8, r9.
-    if (arg_count >= 2) { x64_enc_pop(6);  cg_depth = cg_depth - 1; }
-    if (arg_count >= 3) { x64_enc_pop(2);  cg_depth = cg_depth - 1; }
-    if (arg_count >= 4) { x64_enc_pop(10); cg_depth = cg_depth - 1; }
-    if (arg_count >= 5) { x64_enc_pop(8);  cg_depth = cg_depth - 1; }
-    if (arg_count >= 6) { x64_enc_pop(9);  cg_depth = cg_depth - 1; }
+    if (arg_count >= 2) { x64_enc_pop(6);  cg_depth--; }
+    if (arg_count >= 3) { x64_enc_pop(2);  cg_depth--; }
+    if (arg_count >= 4) { x64_enc_pop(10); cg_depth--; }
+    if (arg_count >= 5) { x64_enc_pop(8);  cg_depth--; }
+    if (arg_count >= 6) { x64_enc_pop(9);  cg_depth--; }
     if (extra_slot >= 0) {
         x64_enc_mov_wide(extra_slot, extra_val);
     }

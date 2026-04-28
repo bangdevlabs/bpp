@@ -5,25 +5,37 @@
 // fourth tier for compiler-internal analogs).
 //
 // What lives here:
-//   buf_new(n)           allocate n raw bytes
-//   buf_new_w(n)         allocate n words (n * 8 bytes)
-//   buf_free(buf)        free, returns 0
-//   buf_fill(buf, byte, n)   bulk set
-//   buf_copy(dst, src, n)    bulk copy
-//   read_u8/u16/u32/u64  typed LE load
-//   write_u8/u16/u32/u64 typed LE store
-//   read_u16be/u32be/u64be  typed BE load (PNG, network byte order)
-//   write_u16be/u32be/u64be  typed BE store
+//   buf_byte(n)              allocate n raw bytes
+//   buf_word(n)              allocate n words (n * 8 bytes)
+//   buf_free(buf)            free, returns 0
+//   buf_fill(buf, val, n)    bulk set (loop; becomes memset wrapper when bpp_runtime lands)
+//   buf_copy(dst, src, n)    bulk copy (wraps memcpy — no overlap guarantee)
+//   buf_move(dst, src, n)    overlap-safe copy (memmove semantics)
+//   buf_cmp(a, b, n)         memory compare, returns -1/0/1
 //
-// Byte access (peek/poke) and word-stride arithmetic (*(buf + i * 8))
-// are inline compiler builtins — not wrapped here, because wrapping
-// inline instructions with function calls would add overhead without
-// capability. See Cap 23 (Battalions) for how peek/poke map to ISA
-// opcodes.
+//   read_u8/u16/u32/u64      unsigned integer LE load
+//   write_u8/u16/u32/u64     unsigned integer LE store
+//   read_u16be/u32be/u64be   unsigned integer BE load  (PNG, network byte order)
+//   write_u16be/u32be/u64be  unsigned integer BE store
+//   read_f32 / write_f32     32-bit float (half float) load/store
+//   read_f64 / write_f64     64-bit float load/store
 //
-// For dynamic growable arrays (arr_new / arr_push / arr_get), see
-// bpp_array.bsm. For compile-time compiler-internal byte comparisons,
-// see bpp_internal.bsm (buf_eq, packed_eq).
+// Implementation note — sub-word reads/writes delegate to the peek_*/poke_* builtins.
+// Each builtin emits a single typed load/store instruction:
+//   peek_q → LDRH / MOVZX ax, word;  poke_q → STRH / MOV [ptr], ax
+//   peek_h → LDR W / MOV eax, [];    poke_h → STR W / MOV [ptr], eax
+//   peek_w → LDR X / MOV rax, [];    poke_w → STR X / MOV [ptr], rax
+//   peekfloat_h → LDR S + FCVT D;    pokefloat_h → FCVT + STR S
+//   peekfloat   → LDR D / MOVSD;     pokefloat   → STR D / MOVSD
+//
+// Alignment: LE reads use struct field access that emits LDRH/LDR W/LDR S/LDR D.
+// These prefer natural alignment but Apple Silicon + x86_64 tolerate unaligned
+// loads silently (small penalty). Strict-alignment ARM would need fallback paths.
+//
+// BE variants: DO NOT replace with struct trick or slice — both emit native-endian
+// (LE on all B++ targets). Byte-by-byte construction is intentional for BE formats.
+
+// ── LE integer reads ───────────────────────────────────────────────────────────
 
 // Read an unsigned 8-bit value from buf at byte offset off.
 read_u8(buf, off) {
@@ -31,69 +43,72 @@ read_u8(buf, off) {
 }
 
 // Read an unsigned 16-bit value (little-endian) from buf at byte offset off.
+// Emits a single LDRH (ARM64) / MOVZX ax, word [ptr] (x86_64). Zero-extends.
 read_u16(buf, off) {
-    return peek(buf + off) + peek(buf + off + 1) * 256;
+    return peek_q(buf + off);
 }
 
 // Read an unsigned 32-bit value (little-endian) from buf at byte offset off.
+// Emits LDR W (ARM64) / MOV eax, [ptr] (x86_64). Zero-extends to 64-bit.
 read_u32(buf, off) {
-    return peek(buf + off)
-         + peek(buf + off + 1) * 256
-         + peek(buf + off + 2) * 65536
-         + peek(buf + off + 3) * 16777216;
+    return peek_h(buf + off);
 }
 
 // Read an unsigned 64-bit value (little-endian) from buf at byte offset off.
+// Emits a single LDR X (ARM64) / MOV rax, [ptr] (x86_64).
 read_u64(buf, off) {
-    auto lo, hi;
-    lo = read_u32(buf, off);
-    hi = read_u32(buf, off + 4);
-    return lo + hi * 4294967296;
+    return peek_w(buf + off);
 }
 
+// ── LE integer writes ──────────────────────────────────────────────────────────
+
+// Write an unsigned 8-bit value to buf at byte offset off.
+void write_u8(buf, off, val) {
+    poke(buf + off, val & 255);
+}
+
+// Write an unsigned 16-bit value (little-endian) to buf at byte offset off.
+// Emits a single STRH / MOV [ptr], ax. Only the low 16 bits of val are written.
+void write_u16(buf, off, val) {
+    poke_q(buf + off, val);
+}
+
+// Write an unsigned 32-bit value (little-endian) to buf at byte offset off.
+// Emits a single STR W / MOV [ptr], eax. Only the low 32 bits of val are written.
+void write_u32(buf, off, val) {
+    poke_h(buf + off, val);
+}
+
+// Write an unsigned 64-bit value (little-endian) to buf at byte offset off.
+// Emits a single STR X / MOV [ptr], rax.
+void write_u64(buf, off, val) {
+    poke_w(buf + off, val);
+}
+
+// ── BE integer reads/writes ────────────────────────────────────────────────────
+// DO NOT replace with struct trick or slice — both emit native-endian (LE).
+// Byte-by-byte construction is required for big-endian binary formats.
+
 // Read an unsigned 16-bit value (big-endian) from buf at byte offset off.
-// Used by PNG format (network byte order).
 read_u16be(buf, off) {
     return peek(buf + off) * 256 + peek(buf + off + 1);
 }
 
 // Read an unsigned 32-bit value (big-endian) from buf at byte offset off.
-// Used by PNG chunk headers and image dimensions.
 read_u32be(buf, off) {
-    return peek(buf + off) * 16777216
+    return peek(buf + off)     * 16777216
          + peek(buf + off + 1) * 65536
          + peek(buf + off + 2) * 256
          + peek(buf + off + 3);
 }
 
-// Rule 3: side-effect only → void + implicit return.
-void write_u8(buf, off, val) {
-    poke(buf + off, val & 255);
+// Read an unsigned 64-bit value (big-endian) from buf at byte offset off.
+read_u64be(buf, off) {
+    auto hi, lo;
+    hi = read_u32be(buf, off);
+    lo = read_u32be(buf, off + 4);
+    return hi * 4294967296 + lo;
 }
-
-void write_u16(buf, off, val) {
-    poke(buf + off,     val & 255);
-    poke(buf + off + 1, (val >> 8) & 255);
-}
-
-void write_u32(buf, off, val) {
-    poke(buf + off,     val & 255);
-    poke(buf + off + 1, (val >> 8) & 255);
-    poke(buf + off + 2, (val >> 16) & 255);
-    poke(buf + off + 3, (val >> 24) & 255);
-}
-
-void write_u64(buf, off, val) {
-    write_u32(buf, off, val & 4294967295);
-    write_u32(buf, off + 4, (val >> 32) & 4294967295);
-}
-
-// ── Big-endian writes (symmetric with reads) ──
-//
-// PNG and network byte order are BE. We had reads (read_u16be,
-// read_u32be) without matching writes, forcing callers that want
-// to EMIT those formats to do the byte-swap by hand. Adding the
-// writes closes the asymmetry.
 
 void write_u16be(buf, off, val) {
     poke(buf + off,     (val >> 8) & 255);
@@ -108,45 +123,95 @@ void write_u32be(buf, off, val) {
 }
 
 void write_u64be(buf, off, val) {
-    write_u32be(buf, off,     (val >> 32) & 4294967295);
-    write_u32be(buf, off + 4,  val        & 4294967295);
+    write_u32be(buf, off,      shr(val, 32) & 4294967295);
+    write_u32be(buf, off + 4,  val          & 4294967295);
 }
 
-// Missing BE 64-bit read for completeness.
-read_u64be(buf, off) {
-    auto hi, lo;
-    hi = read_u32be(buf, off);
-    lo = read_u32be(buf, off + 4);
-    return hi * 4294967296 + lo;
+// ── Float reads/writes (LE, native-endian) ────────────────────────────────────
+// Use struct trick for the same reason as integer sub-word reads: struct-typed
+// locals are pointer-sized; slice-annotated locals truncate the address.
+// ARM64: LDR S + FCVT D (read), FCVT S + STR S (write). x86_64: MOVSS/MOVSD.
+
+// Read a 32-bit float from buf at byte offset off.
+// Emits LDR S + FCVT D (ARM64) — widens to double in d0.
+read_f32(buf, off) {
+    return peekfloat_h(buf + off);
 }
 
-// Fill n bytes starting at buf with a constant value. Inline byte
-// loop today — memset is not yet provided by the runtime (see
-// bpp_runtime.bsm; Phase D future). When memset lands in
-// _core_<os>.bsm, this body becomes a 1-line wrapper over it.
-// Parameter name is `val` (not `byte`) because `byte` is a reserved
-// B++ keyword (sub-word type annotation).
+// Write a 32-bit float to buf at byte offset off.
+// val must be annotated `: half float` at the call site to avoid W011.
+void write_f32(buf, off, val: half float) {
+    pokefloat_h(buf + off, val);
+}
+
+// Read a 64-bit float from buf at byte offset off.
+// Emits LDR D (ARM64) / MOVSD xmm0, [ptr] (x86_64).
+read_f64(buf, off) {
+    return peekfloat(buf + off);
+}
+
+// Write a 64-bit float to buf at byte offset off.
+void write_f64(buf, off, val: float) {
+    pokefloat(buf + off, val);
+}
+
+// ── Bulk operations ────────────────────────────────────────────────────────────
+
+// Fill n bytes starting at buf with a constant value (val & 255).
+// Uses a byte loop today. When bpp_runtime.bsm lands, becomes a memset wrapper.
+// Parameter is `val` (not `byte`) because `byte` is a reserved keyword.
 void buf_fill(buf, val, n) {
     auto i;
-    for (i = 0; i < n; i = i + 1) { poke(buf + i, val & 255); }
+    for (i = 0; i < n; i++) { poke(buf + i, val & 255); }
 }
 
-// Copy n bytes from src to dst. Wraps memcpy (which IS provided by
-// _core_<os>.bsm). Behavior is undefined if the regions overlap —
-// use buf_move for that (not yet provided; add when a real caller
-// needs it).
+// Copy n bytes from src to dst. Wraps memcpy (builtin). Undefined if regions overlap.
 void buf_copy(dst, src, n) {
     memcpy(dst, src, n);
 }
 
-// Allocate n bytes. Returns TY_PTR — no header, no push/pop/len.
-// Use poke/peek for byte-level access. Free with free(buf).
+// Copy n bytes from src to dst with overlap safety (memmove semantics).
+// Copies forward when dst < src (no clobber risk), backward when dst > src.
+void buf_move(dst, src, n) {
+    auto i;
+    if (dst == src) { return; }
+    if (dst < src) {
+        for (i = 0; i < n; i++) { poke(dst + i, peek(src + i)); }
+    } else {
+        i = n - 1;
+        while (i >= 0) { poke(dst + i, peek(src + i)); i--; }
+    }
+}
+
+// Compare n bytes starting at a and b.
+// Returns 0 if equal, -1 if a < b at the first differing byte, 1 if a > b.
+buf_cmp(a, b, n) {
+    auto i, ca, cb;
+    for (i = 0; i < n; i++) {
+        ca = peek(a + i);
+        cb = peek(b + i);
+        if (ca < cb) { return 0 - 1; }
+        if (ca > cb) { return 1; }
+    }
+    return 0;
+}
+
+// ── Allocation helpers ─────────────────────────────────────────────────────────
+
+// Allocate n bytes. Returns a raw pointer — no header, no length.
+// Use poke/peek or read_u*/write_u* for access. Free with buf_free or free().
 buf_byte(n) {
     return malloc(n);
 }
 
-// Allocate n words (n * 8 bytes). Returns TY_PTR — no header.
-// Use buf[i] for word-indexed access. Free with free(buf).
+// Allocate n words (n * 8 bytes). Returns a raw pointer — no header.
+// Use buf[i] for word-indexed access. Free with buf_free or free().
 buf_word(n) {
     return malloc(n * 8);
+}
+
+// Free a buffer. Returns 0 for chaining: buf = buf_free(buf).
+buf_free(buf) {
+    free(buf);
+    return 0;
 }

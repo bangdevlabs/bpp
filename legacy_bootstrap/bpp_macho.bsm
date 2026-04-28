@@ -1,0 +1,1368 @@
+// bpp_macho.bsm — Mach-O ARM64 executable writer.
+// Builds a complete Mach-O binary from the code buffer (enc_buf/enc_pos)
+// and data tables (globals, strings, floats) produced by the ARM64 codegen.
+//
+// The generated binary links against libSystem.B.dylib (required by dyld
+// on macOS ARM64) but uses raw syscalls for all I/O. After generating the
+// file, run `codesign -s -` to ad-hoc sign it.
+//
+// Virtual memory layout (standard macOS ARM64):
+//   0x000000000 - 0x100000000  __PAGEZERO (4 GB, no file backing)
+//   0x100000000 - ...          __TEXT     (header + load commands + code)
+//   next page   - ...          __DATA     (globals + strings + floats)
+//   next page   - ...          __LINKEDIT (symbol table, exports trie)
+
+// ── Constants ───────────────────────────────────────────────
+
+auto MO_PAGE_SIZE;      // 4096
+auto MO_VM_BASE;        // 0x100000000 (low 32 bits = 0, high = 1)
+auto MO_VM_BASE_HI;     // High 32 bits of VM base address (1).
+
+// ── Output buffer ───────────────────────────────────────────
+
+auto mo_buf;            // Output buffer (up to 16 MB).
+auto mo_pos;            // Current write position.
+
+// ── Computed layout values (set by mo_compute_layout) ───────
+
+auto mo_ncmds;          // Number of load commands.
+auto mo_sizeofcmds;     // Total size of load commands.
+auto mo_code_off;       // File offset of __text section.
+auto mo_text_vmsize;    // __TEXT segment VM/file size (page-aligned).
+auto mo_data_off;       // File offset of __DATA segment.
+auto mo_data_size;      // Raw data size (globals + strings + floats).
+auto mo_data_vmsize;    // __DATA segment VM size (page-aligned).
+auto mo_link_off;       // File offset of __LINKEDIT segment.
+auto mo_link_size;      // __LINKEDIT content size.
+auto mo_link_vmsize;    // __LINKEDIT VM size (page-aligned).
+auto mo_main_off;       // Entry point offset from start of __TEXT.
+auto mo_data_vmaddr_lo; // Low 32 bits of __DATA VM address.
+auto mo_data_vmaddr_hi; // High 32 bits of __DATA VM address.
+auto mo_link_vmaddr_lo; // Low 32 bits of __LINKEDIT VM address.
+auto mo_link_vmaddr_hi; // High 32 bits of __LINKEDIT VM address.
+
+// Code signature layout.
+auto mo_cs_off;          // File offset of code signature blob (16-byte aligned).
+auto mo_cs_size;         // Size of code signature blob.
+
+// __LINKEDIT sub-offsets (relative to mo_link_off).
+auto mo_cf_off;         // Chained fixups data file offset.
+auto mo_cf_size;        // Chained fixups data size.
+auto mo_et_off;         // Exports trie file offset.
+auto mo_et_size;        // Exports trie data size.
+auto mo_sym_off;        // Symbol table file offset.
+auto mo_sym_cnt;        // Number of symbol table entries.
+auto mo_str_off;        // String table file offset.
+auto mo_str_size;       // String table size.
+// Slack: 32 bytes reserved after load commands for codesign to insert
+// LC_CODE_SIGNATURE without overwriting code bytes.
+
+// ── Float literal data ────────────────────────────────────────
+
+auto mo_flt_data;       // Buffer of 8-byte IEEE 754 doubles.
+auto mo_flt_cnt;        // Number of float literals.
+
+// ── String literal data ──────────────────────────────────────
+
+auto mo_sdata;          // Buffer holding all string bytes (content + null terminators).
+auto mo_sdata_size;     // Total bytes used in mo_sdata.
+auto mo_sdata_off;      // Array: byte offset of each string within mo_sdata.
+auto mo_sdata_cnt;      // Number of string literals stored.
+
+// ── GOT (Global Offset Table) for FFI ───────────────────────
+
+auto mo_got_syms;       // Array: packed function names (one per GOT slot).
+auto mo_got_libs;       // Array: packed library names (one per GOT slot).
+auto mo_got_cnt;        // Number of GOT entries.
+auto mo_got_data_off;   // Byte offset of GOT within __DATA (8-byte aligned).
+
+auto mo_ext_libs;       // Array: unique library name packed values.
+auto mo_ext_lib_cnt;    // Number of unique external libraries.
+
+// ── SHA-256 (pure integer, no external dependencies) ────────
+
+auto sha_k;     // 64 round constants (32-bit values stored in 8-byte slots).
+auto sha_w;     // Message schedule workspace (64 × 8 bytes).
+
+// Mask to 32-bit unsigned.
+u32(x) { return x & 0xFFFFFFFF; }
+
+// 32-bit right rotate.
+sha_rotr(x, n) { return u32((x >> n) | ((x & 0xFFFFFFFF) << (32 - n))); }
+
+// Initialize SHA-256 round constants.
+sha_init() {
+    sha_k = malloc(512);
+    sha_w = malloc(512);
+    *(sha_k+0)=0x428a2f98; *(sha_k+8)=0x71374491; *(sha_k+16)=0xb5c0fbcf; *(sha_k+24)=0xe9b5dba5;
+    *(sha_k+32)=0x3956c25b; *(sha_k+40)=0x59f111f1; *(sha_k+48)=0x923f82a4; *(sha_k+56)=0xab1c5ed5;
+    *(sha_k+64)=0xd807aa98; *(sha_k+72)=0x12835b01; *(sha_k+80)=0x243185be; *(sha_k+88)=0x550c7dc3;
+    *(sha_k+96)=0x72be5d74; *(sha_k+104)=0x80deb1fe; *(sha_k+112)=0x9bdc06a7; *(sha_k+120)=0xc19bf174;
+    *(sha_k+128)=0xe49b69c1; *(sha_k+136)=0xefbe4786; *(sha_k+144)=0x0fc19dc6; *(sha_k+152)=0x240ca1cc;
+    *(sha_k+160)=0x2de92c6f; *(sha_k+168)=0x4a7484aa; *(sha_k+176)=0x5cb0a9dc; *(sha_k+184)=0x76f988da;
+    *(sha_k+192)=0x983e5152; *(sha_k+200)=0xa831c66d; *(sha_k+208)=0xb00327c8; *(sha_k+216)=0xbf597fc7;
+    *(sha_k+224)=0xc6e00bf3; *(sha_k+232)=0xd5a79147; *(sha_k+240)=0x06ca6351; *(sha_k+248)=0x14292967;
+    *(sha_k+256)=0x27b70a85; *(sha_k+264)=0x2e1b2138; *(sha_k+272)=0x4d2c6dfc; *(sha_k+280)=0x53380d13;
+    *(sha_k+288)=0x650a7354; *(sha_k+296)=0x766a0abb; *(sha_k+304)=0x81c2c92e; *(sha_k+312)=0x92722c85;
+    *(sha_k+320)=0xa2bfe8a1; *(sha_k+328)=0xa81a664b; *(sha_k+336)=0xc24b8b70; *(sha_k+344)=0xc76c51a3;
+    *(sha_k+352)=0xd192e819; *(sha_k+360)=0xd6990624; *(sha_k+368)=0xf40e3585; *(sha_k+376)=0x106aa070;
+    *(sha_k+384)=0x19a4c116; *(sha_k+392)=0x1e376c08; *(sha_k+400)=0x2748774c; *(sha_k+408)=0x34b0bcb5;
+    *(sha_k+416)=0x391c0cb3; *(sha_k+424)=0x4ed8aa4a; *(sha_k+432)=0x5b9cca4f; *(sha_k+440)=0x682e6ff3;
+    *(sha_k+448)=0x748f82ee; *(sha_k+456)=0x78a5636f; *(sha_k+464)=0x84c87814; *(sha_k+472)=0x8cc70208;
+    *(sha_k+480)=0x90befffa; *(sha_k+488)=0xa4506ceb; *(sha_k+496)=0xbef9a3f7; *(sha_k+504)=0xc67178f2;
+    return 0;
+}
+
+// Process one 64-byte block into the running hash state h[0..7].
+sha_transform(blk, h) {
+    auto i, s0, s1, ch, maj, t1, t2;
+    auto a, b, c, d, e, f, g, hh;
+    // Load 16 big-endian 32-bit words from the block.
+    i = 0;
+    while (i < 16) {
+        *(sha_w + i * 8) = (peek(blk + i * 4) << 24)
+            | (peek(blk + i * 4 + 1) << 16)
+            | (peek(blk + i * 4 + 2) << 8)
+            | peek(blk + i * 4 + 3);
+        i = i + 1;
+    }
+    // Expand to 64 words.
+    while (i < 64) {
+        s0 = sha_rotr(*(sha_w + (i-15)*8), 7) ^ sha_rotr(*(sha_w + (i-15)*8), 18) ^ (*(sha_w + (i-15)*8) >> 3);
+        s1 = sha_rotr(*(sha_w + (i-2)*8), 17) ^ sha_rotr(*(sha_w + (i-2)*8), 19) ^ (*(sha_w + (i-2)*8) >> 10);
+        *(sha_w + i*8) = u32(*(sha_w + (i-16)*8) + s0 + *(sha_w + (i-7)*8) + s1);
+        i = i + 1;
+    }
+    // Initialize working variables.
+    a = *(h+0); b = *(h+8); c = *(h+16); d = *(h+24);
+    e = *(h+32); f = *(h+40); g = *(h+48); hh = *(h+56);
+    // 64 compression rounds.
+    i = 0;
+    while (i < 64) {
+        s1 = sha_rotr(e,6) ^ sha_rotr(e,11) ^ sha_rotr(e,25);
+        ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
+        t1 = u32(hh + s1 + ch + *(sha_k + i*8) + *(sha_w + i*8));
+        s0 = sha_rotr(a,2) ^ sha_rotr(a,13) ^ sha_rotr(a,22);
+        maj = (a & b) ^ (a & c) ^ (b & c);
+        t2 = u32(s0 + maj);
+        hh = g; g = f; f = e; e = u32(d + t1);
+        d = c; c = b; b = a; a = u32(t1 + t2);
+        i = i + 1;
+    }
+    // Add to hash state.
+    *(h+0) = u32(*(h+0)+a); *(h+8) = u32(*(h+8)+b);
+    *(h+16) = u32(*(h+16)+c); *(h+24) = u32(*(h+24)+d);
+    *(h+32) = u32(*(h+32)+e); *(h+40) = u32(*(h+40)+f);
+    *(h+48) = u32(*(h+48)+g); *(h+56) = u32(*(h+56)+hh);
+    return 0;
+}
+
+// Compute SHA-256 of data[0..len-1]. Write 32-byte digest to 'out'.
+sha256(data, len, out) {
+    auto h, pad, padlen, bitlen, total, off, i, v;
+    // Initialize hash state.
+    h = malloc(64);
+    *(h+0)=0x6a09e667; *(h+8)=0xbb67ae85; *(h+16)=0x3c6ef372; *(h+24)=0xa54ff53a;
+    *(h+32)=0x510e527f; *(h+40)=0x9b05688c; *(h+48)=0x1f83d9ab; *(h+56)=0x5be0cd19;
+    // Build padded message: data + 0x80 + zeros + 8-byte big-endian bit length.
+    // Padded length must be a multiple of 64.
+    bitlen = len * 8;
+    padlen = len + 1;
+    while (padlen % 64 != 56) { padlen = padlen + 1; }
+    total = padlen + 8;
+    pad = malloc(total);
+    // Copy data.
+    i = 0;
+    while (i < len) { poke(pad + i, peek(data + i)); i = i + 1; }
+    // Append 0x80.
+    poke(pad + len, 0x80);
+    // Zero fill.
+    i = len + 1;
+    while (i < padlen) { poke(pad + i, 0); i = i + 1; }
+    // Append bit length as big-endian 64-bit.
+    poke(pad + padlen, (bitlen >> 56) & 0xFF);
+    poke(pad + padlen + 1, (bitlen >> 48) & 0xFF);
+    poke(pad + padlen + 2, (bitlen >> 40) & 0xFF);
+    poke(pad + padlen + 3, (bitlen >> 32) & 0xFF);
+    poke(pad + padlen + 4, (bitlen >> 24) & 0xFF);
+    poke(pad + padlen + 5, (bitlen >> 16) & 0xFF);
+    poke(pad + padlen + 6, (bitlen >> 8) & 0xFF);
+    poke(pad + padlen + 7, bitlen & 0xFF);
+    // Process each 64-byte block.
+    off = 0;
+    while (off < total) {
+        sha_transform(pad + off, h);
+        off = off + 64;
+    }
+    // Write digest as 8 big-endian 32-bit words.
+    i = 0;
+    while (i < 8) {
+        v = *(h + i * 8);
+        poke(out + i * 4, (v >> 24) & 0xFF);
+        poke(out + i * 4 + 1, (v >> 16) & 0xFF);
+        poke(out + i * 4 + 2, (v >> 8) & 0xFF);
+        poke(out + i * 4 + 3, v & 0xFF);
+        i = i + 1;
+    }
+    free(h);
+    free(pad);
+    return 0;
+}
+
+// ── Initialization ──────────────────────────────────────────
+
+init_macho() {
+    sha_init();
+    MO_PAGE_SIZE = 16384;
+    MO_VM_BASE = 0;
+    MO_VM_BASE_HI = 1;
+    mo_buf = malloc(16777216);
+    mo_pos = 0;
+    mo_flt_data = malloc(8192);
+    mo_flt_cnt = 0;
+    mo_sdata = malloc(1048576);
+    mo_sdata_size = 0;
+    mo_sdata_off = malloc(65536);
+    mo_sdata_cnt = 0;
+    mo_got_syms = malloc(4096);
+    mo_got_libs = malloc(4096);
+    mo_got_cnt = 0;
+    mo_ext_libs = malloc(512);
+    mo_ext_lib_cnt = 0;
+    return 0;
+}
+
+// ── Packed string comparison ─────────────────────────────────────
+
+// Compare two packed string references by their textual content.
+// Uses a64_sbuf as the underlying string buffer.
+// Returns 1 if the strings are equal, 0 otherwise.
+mo_packed_eq(a, b) {
+    auto as, al, bs, bl, i;
+    if (a == b) { return 1; }
+    // Negative values are sentinel identifiers (e.g., -1 = argc, -2 = argv).
+    // They only match themselves, never each other or regular packed strings.
+    if (a < 0) { return 0; }
+    if (b < 0) { return 0; }
+    al = a / 0x100000000;
+    bl = b / 0x100000000;
+    if (al != bl) { return 0; }
+    as = a % 0x100000000;
+    bs = b % 0x100000000;
+    i = 0;
+    while (i < al) {
+        if (peek(a64_sbuf + as + i) != peek(a64_sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── Float literal parsing ─────────────────────────────────────
+
+// Parse a decimal float string (e.g., "3.14") and return its IEEE 754 bits.
+// Uses pure integer arithmetic to compute the 64-bit double bit pattern.
+// This avoids the C backend's double-to-long-long conversion problem.
+mo_atof(s) {
+    auto ch, i, neg, int_part, frac_val, frac_scale;
+    auto num, den, p, scaled_den, mantissa, bit, exp_bits;
+
+    neg = 0;
+    i = 0;
+    ch = peek(s);
+    if (ch == 45) { neg = 1; i = i + 1; }
+
+    // Parse integer part.
+    int_part = 0;
+    ch = peek(s + i);
+    while (ch >= 48) {
+        if (ch <= 57) {
+            int_part = int_part * 10 + ch - 48;
+            i = i + 1;
+            ch = peek(s + i);
+        } else {
+            ch = 0;
+        }
+    }
+
+    // Parse fractional part.
+    frac_val = 0;
+    frac_scale = 1;
+    if (peek(s + i) == 46) {
+        i = i + 1;
+        ch = peek(s + i);
+        while (ch >= 48) {
+            if (ch <= 57) {
+                frac_val = frac_val * 10 + ch - 48;
+                frac_scale = frac_scale * 10;
+                i = i + 1;
+                ch = peek(s + i);
+            } else {
+                ch = 0;
+            }
+        }
+    }
+
+    // Combine into rational num/den.
+    num = int_part * frac_scale + frac_val;
+    den = frac_scale;
+
+    // Special case: zero.
+    if (num == 0) { return 0; }
+
+    // Find exponent p such that 2^p <= num/den < 2^(p+1).
+    if (num >= den) {
+        // Value >= 1.0: scale den up until it matches num's magnitude.
+        scaled_den = den;
+        p = 0;
+        while (scaled_den + scaled_den <= num) {
+            scaled_den = scaled_den + scaled_den;
+            p = p + 1;
+        }
+        num = num - scaled_den;
+    } else {
+        // Value < 1.0: scale num up until it reaches den.
+        p = 0 - 1;
+        num = num + num;
+        while (num < den) {
+            num = num + num;
+            p = p - 1;
+        }
+        num = num - den;
+        scaled_den = den;
+    }
+
+    // Extract 52 mantissa bits by successive doubling (MSB first).
+    mantissa = 0;
+    bit = 0;
+    while (bit < 52) {
+        num = num + num;
+        mantissa = mantissa + mantissa;
+        if (num >= scaled_den) {
+            mantissa = mantissa + 1;
+            num = num - scaled_den;
+        }
+        bit = bit + 1;
+    }
+
+    // Round to nearest: check the 53rd bit.
+    num = num + num;
+    if (num >= scaled_den) { mantissa = mantissa + 1; }
+
+    // Assemble IEEE 754 double: sign(1) | exponent(11) | mantissa(52).
+    // Adding 2048 to exp_bits sets bit 63 (sign) after the shift.
+    exp_bits = p + 1023;
+    if (neg) { exp_bits = exp_bits + 2048; }
+    return (exp_bits << 52) + mantissa;
+}
+
+// Store a float literal's raw IEEE 754 bits in the float data buffer.
+mo_add_float(str_ptr) {
+    auto bits;
+    bits = mo_atof(str_ptr);
+    *(mo_flt_data + mo_flt_cnt * 8) = bits;
+    mo_flt_cnt = mo_flt_cnt + 1;
+    return 0;
+}
+
+// Store a string literal in the binary string data buffer.
+// Copies 'len' bytes from 'src' into mo_sdata and appends a null terminator.
+// Records the byte offset so the relocation resolver can find it.
+mo_add_string(src, len) {
+    auto i;
+    *(mo_sdata_off + mo_sdata_cnt * 8) = mo_sdata_size;
+    i = 0;
+    while (i < len) {
+        poke(mo_sdata + mo_sdata_size, peek(src + i));
+        mo_sdata_size = mo_sdata_size + 1;
+        i = i + 1;
+    }
+    // Null terminator.
+    poke(mo_sdata + mo_sdata_size, 0);
+    mo_sdata_size = mo_sdata_size + 1;
+    mo_sdata_cnt = mo_sdata_cnt + 1;
+    return 0;
+}
+
+// Check if a library name is the built-in System library (ordinal 1).
+mo_is_system_lib(lib_name) {
+    auto ss, sl;
+    ss = unpack_s(lib_name);
+    sl = unpack_l(lib_name);
+    if (sl == 6) {
+        if (peek(a64_sbuf + ss) == 'S') {
+            if (peek(a64_sbuf + ss + 1) == 'y') {
+                if (peek(a64_sbuf + ss + 2) == 's') { return 1; }
+            }
+        }
+    }
+    return 0;
+}
+
+// Register an external function for GOT linking.
+// Also tracks unique library names for LC_LOAD_DYLIB commands.
+// "System" is built-in (ordinal 1) and does not add a new LC_LOAD_DYLIB.
+mo_add_got(fn_name, lib_name) {
+    auto i, found;
+    *(mo_got_syms + mo_got_cnt * 8) = fn_name;
+    *(mo_got_libs + mo_got_cnt * 8) = lib_name;
+    mo_got_cnt = mo_got_cnt + 1;
+    // Track unique external libraries (skip System which is always ordinal 1).
+    if (mo_is_system_lib(lib_name)) { return 0; }
+    found = 0;
+    i = 0;
+    while (i < mo_ext_lib_cnt) {
+        if (mo_packed_eq(*(mo_ext_libs + i * 8), lib_name)) { found = 1; }
+        i = i + 1;
+    }
+    if (found == 0) {
+        *(mo_ext_libs + mo_ext_lib_cnt * 8) = lib_name;
+        mo_ext_lib_cnt = mo_ext_lib_cnt + 1;
+    }
+    return 0;
+}
+
+// Find the GOT index for a function by packed name. Returns -1 if not found.
+mo_find_got(fn_name) {
+    auto i;
+    i = 0;
+    while (i < mo_got_cnt) {
+        if (mo_packed_eq(*(mo_got_syms + i * 8), fn_name)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find the 1-based library ordinal for a library name.
+// libSystem.B.dylib is always ordinal 1. User libraries start at 2.
+mo_find_lib_ordinal(lib_name) {
+    auto i;
+    if (mo_is_system_lib(lib_name)) { return 1; }
+    i = 0;
+    while (i < mo_ext_lib_cnt) {
+        if (mo_packed_eq(*(mo_ext_libs + i * 8), lib_name)) { return i + 2; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── Write helpers ───────────────────────────────────────────
+
+// Write a single byte to the output buffer.
+mo_w8(v) {
+    poke(mo_buf + mo_pos, v & 0xFF);
+    mo_pos = mo_pos + 1;
+    return 0;
+}
+
+// Write a 32-bit value in little-endian format.
+mo_w32(v) {
+    poke(mo_buf + mo_pos,     v & 0xFF);
+    poke(mo_buf + mo_pos + 1, (v >> 8) & 0xFF);
+    poke(mo_buf + mo_pos + 2, (v >> 16) & 0xFF);
+    poke(mo_buf + mo_pos + 3, (v >> 24) & 0xFF);
+    mo_pos = mo_pos + 4;
+    return 0;
+}
+
+// Write a 64-bit value in little-endian format.
+// Takes low and high 32-bit halves separately to avoid 64-bit overflow.
+mo_w64(lo, hi) {
+    mo_w32(lo);
+    mo_w32(hi);
+    return 0;
+}
+
+// Write n zero bytes.
+mo_pad(n) {
+    auto i;
+    i = 0;
+    while (i < n) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; i = i + 1; }
+    return 0;
+}
+
+// Pad with zeros until mo_pos is aligned to 'a' bytes.
+mo_align(a) {
+    while (mo_pos % a != 0) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; }
+    return 0;
+}
+
+// Write a fixed-width string (exactly 'n' bytes, zero-padded).
+mo_wstr(s, slen, n) {
+    auto i;
+    i = 0;
+    while (i < n) {
+        if (i < slen) { poke(mo_buf + mo_pos, peek(s + i)); }
+        else { poke(mo_buf + mo_pos, 0); }
+        mo_pos = mo_pos + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Write a C string literal (from program text) into the buffer.
+// The string pointer 's' is a B++ string literal address.
+mo_wcstr(s, n) {
+    auto i;
+    i = 0;
+    while (i < n) { poke(mo_buf + mo_pos, str_peek(s, i)); mo_pos = mo_pos + 1; i = i + 1; }
+    return 0;
+}
+
+// Round up 'v' to the next multiple of MO_PAGE_SIZE.
+mo_page_align(v) {
+    return (v + MO_PAGE_SIZE - 1) / MO_PAGE_SIZE * MO_PAGE_SIZE;
+}
+
+// ── Mach-O header ───────────────────────────────────────────
+
+mo_write_header() {
+    mo_w32(0xFEEDFACF);             // magic (MH_MAGIC_64)
+    mo_w32(0x0100000C);             // cputype (CPU_TYPE_ARM64)
+    mo_w32(0x00000000);             // cpusubtype (CPU_SUBTYPE_ALL)
+    mo_w32(0x00000002);             // filetype (MH_EXECUTE)
+    mo_w32(mo_ncmds);               // ncmds
+    mo_w32(mo_sizeofcmds);          // sizeofcmds
+    mo_w32(0x00200085);             // flags (NOUNDEFS|DYLDLINK|TWOLEVEL|PIE)
+    mo_w32(0x00000000);             // reserved
+    return 0;
+}
+
+// ── Segment and section writers ─────────────────────────────
+
+// Write LC_SEGMENT_64 header (72 bytes).
+mo_write_segment(name, nlen, vmaddr_lo, vmaddr_hi, vmsize, fileoff, filesize, maxprot, initprot, nsects) {
+    mo_w32(0x19);                   // cmd (LC_SEGMENT_64)
+    mo_w32(72 + nsects * 80);       // cmdsize
+    mo_wcstr(name, nlen);           // segname (16 bytes, zero-padded)
+    mo_pad(16 - nlen);
+    mo_w64(vmaddr_lo, vmaddr_hi);   // vmaddr
+    mo_w64(vmsize, 0);              // vmsize
+    mo_w64(fileoff, 0);             // fileoff
+    mo_w64(filesize, 0);            // filesize
+    mo_w32(maxprot);                // maxprot
+    mo_w32(initprot);               // initprot
+    mo_w32(nsects);                 // nsects
+    mo_w32(0);                      // flags
+    return 0;
+}
+
+// Write a section_64 header (80 bytes).
+mo_write_section(sectname, snlen, segname, sgnlen, addr_lo, addr_hi, size, offset, al, flags) {
+    mo_wcstr(sectname, snlen);      // sectname (16 bytes)
+    mo_pad(16 - snlen);
+    mo_wcstr(segname, sgnlen);      // segname (16 bytes)
+    mo_pad(16 - sgnlen);
+    mo_w64(addr_lo, addr_hi);       // addr
+    mo_w64(size, 0);                // size
+    mo_w32(offset);                 // offset
+    mo_w32(al);                     // align (power of 2)
+    mo_w32(0);                      // reloff
+    mo_w32(0);                      // nreloc
+    mo_w32(flags);                  // flags
+    mo_w32(0);                      // reserved1
+    mo_w32(0);                      // reserved2
+    mo_w32(0);                      // reserved3
+    return 0;
+}
+
+// ── Load command writers ────────────────────────────────────
+
+// LC_DYLD_CHAINED_FIXUPS (16 bytes).
+mo_write_lc_chained_fixups() {
+    mo_w32(0x80000034);             // cmd (LC_DYLD_CHAINED_FIXUPS)
+    mo_w32(16);                     // cmdsize
+    mo_w32(mo_cf_off);              // dataoff
+    mo_w32(mo_cf_size);             // datasize
+    return 0;
+}
+
+// LC_DYLD_EXPORTS_TRIE (16 bytes).
+mo_write_lc_exports_trie() {
+    mo_w32(0x80000033);             // cmd (LC_DYLD_EXPORTS_TRIE)
+    mo_w32(16);                     // cmdsize
+    mo_w32(mo_et_off);              // dataoff
+    mo_w32(mo_et_size);             // datasize
+    return 0;
+}
+
+// LC_SYMTAB (24 bytes).
+mo_write_lc_symtab() {
+    mo_w32(0x02);                   // cmd (LC_SYMTAB)
+    mo_w32(24);                     // cmdsize
+    mo_w32(mo_sym_off);             // symoff
+    mo_w32(mo_sym_cnt);             // nsyms
+    mo_w32(mo_str_off);             // stroff
+    mo_w32(mo_str_size);            // strsize
+    return 0;
+}
+
+// LC_DYSYMTAB (80 bytes). Minimal: all zeros except nextdefsym.
+mo_write_lc_dysymtab() {
+    mo_w32(0x0B);                   // cmd (LC_DYSYMTAB)
+    mo_w32(80);                     // cmdsize
+    mo_w32(0);                      // ilocalsym
+    mo_w32(0);                      // nlocalsym
+    mo_w32(0);                      // iextdefsym
+    mo_w32(mo_sym_cnt);             // nextdefsym
+    mo_w32(mo_sym_cnt);             // iundefsym
+    mo_w32(0);                      // nundefsym
+    mo_pad(48);                     // remaining fields all zero
+    return 0;
+}
+
+// LC_LOAD_DYLINKER (32 bytes): "/usr/lib/dyld".
+mo_write_lc_dylinker() {
+    mo_w32(0x0E);                   // cmd (LC_LOAD_DYLINKER)
+    mo_w32(32);                     // cmdsize
+    mo_w32(12);                     // name offset (from start of this cmd)
+    mo_wcstr("/usr/lib/dyld", 13);  // path (13 bytes)
+    mo_pad(7);                      // pad to 32 total
+    return 0;
+}
+
+// LC_MAIN (24 bytes): entry point offset.
+mo_write_lc_main() {
+    mo_w32(0x80000028);             // cmd (LC_MAIN)
+    mo_w32(24);                     // cmdsize
+    mo_w64(mo_main_off, 0);         // entryoff
+    mo_w64(0, 0);                   // stacksize (0 = default)
+    return 0;
+}
+
+// LC_LOAD_DYLIB (56 bytes): "/usr/lib/libSystem.B.dylib".
+mo_write_lc_load_dylib() {
+    mo_w32(0x0C);                   // cmd (LC_LOAD_DYLIB)
+    mo_w32(56);                     // cmdsize
+    mo_w32(24);                     // name offset (from start of this cmd)
+    mo_w32(2);                      // timestamp
+    mo_w32(0x05470000);             // current_version (1351.0.0)
+    mo_w32(0x00010000);             // compat_version (1.0.0)
+    // Path: "/usr/lib/libSystem.B.dylib" = 26 chars + null + padding
+    mo_wcstr("/usr/lib/libSystem.B.dylib", 26);
+    mo_pad(6);                      // pad to 56 total
+    return 0;
+}
+
+// ── __LINKEDIT data builders ────────────────────────────────
+
+// Write the chained fixups data (empty — no fixups needed).
+// Structure: dyld_chained_fixups_header + dyld_chained_starts_in_image.
+mo_write_chained_fixups(nseg) {
+    auto i;
+    // dyld_chained_fixups_header (32 bytes)
+    mo_w32(0);                      // fixups_version
+    mo_w32(32);                     // starts_offset (offset to starts_in_image)
+    mo_w32(32 + 4 + nseg * 4);     // imports_offset (after starts struct)
+    mo_w32(32 + 4 + nseg * 4);     // symbols_offset (same, no symbols)
+    mo_w32(0);                      // imports_count
+    mo_w32(1);                      // imports_format (DYLD_CHAINED_IMPORT)
+    mo_w32(0);                      // symbols_format
+    mo_pad(4);                      // padding
+
+    // dyld_chained_starts_in_image
+    mo_w32(nseg);                   // seg_count
+    i = 0;
+    while (i < nseg) { mo_w32(0); i = i + 1; }  // seg_info_offset (all 0 = no chains)
+    // Sentinel padding (8 bytes) so imports_offset/symbols_offset land inside buffer.
+    mo_pad(8);
+    return 0;
+}
+
+// Write real chained fixups data for GOT entries.
+// The __DATA segment (segment index = nseg-2 when LINKEDIT is last)
+// contains GOT slots that dyld fills with resolved function pointers.
+mo_write_chained_fixups_real(nseg, gl_count) {
+    auto i, start, data_seg_idx;
+    auto starts_off, starts_in_seg_off, imports_off, symbols_off;
+    auto got_off_in_seg, got_page, got_page_off;
+    auto lib_ord, name_off, sym_pos, ss, sl, j, imp_val;
+
+    start = mo_pos;
+
+    // __DATA is the segment before __LINKEDIT.
+    data_seg_idx = nseg - 2;
+
+    // GOT byte offset within the __DATA segment (8-byte aligned).
+    got_off_in_seg = mo_got_data_off;
+    got_page = got_off_in_seg / MO_PAGE_SIZE;
+    got_page_off = got_off_in_seg % MO_PAGE_SIZE;
+
+    // Precompute sub-structure offsets (relative to start of chained fixups data).
+    // Header = 32 bytes (padded from 28).
+    // starts_in_image: 4 + 4*nseg bytes.
+    // starts_in_segment: 28 bytes (24 header + 2*1 page_start + 2 pad).
+    starts_off = 32;
+    starts_in_seg_off = starts_off + 4 + data_seg_idx * 4;
+    imports_off = starts_off + 4 + nseg * 4 + 24;
+    symbols_off = imports_off + mo_got_cnt * 4;
+
+    // ── dyld_chained_fixups_header (28 bytes, padded to 32) ──
+    mo_w32(0);                          // fixups_version
+    mo_w32(starts_off);                 // starts_offset
+    mo_w32(imports_off);                // imports_offset
+    mo_w32(symbols_off);                // symbols_offset
+    mo_w32(mo_got_cnt);                 // imports_count
+    mo_w32(1);                          // imports_format (DYLD_CHAINED_IMPORT)
+    mo_w32(0);                          // symbols_format (uncompressed)
+    mo_pad(4);                          // pad to 32
+
+    // ── dyld_chained_starts_in_image ──
+    mo_w32(nseg);                       // seg_count
+    i = 0;
+    while (i < nseg) {
+        if (i == data_seg_idx) {
+            // Byte offset from start of starts_in_image to starts_in_segment.
+            mo_w32(4 + nseg * 4);
+        } else {
+            mo_w32(0);                  // no fixups in this segment
+        }
+        i = i + 1;
+    }
+
+    // ── dyld_chained_starts_in_segment (for __DATA) ──
+    mo_w32(24);                         // size (22 fixed + 2*page_count)
+    mo_w8(0); mo_w8(0x40);             // page_size = 0x4000 (16384) as uint16
+    mo_w8(6); mo_w8(0);                // pointer_format = 6 (DYLD_CHAINED_PTR_64_OFFSET) as uint16
+    mo_w64(mo_text_vmsize, 0);          // segment_offset (VM offset of __DATA from image base)
+    mo_w32(0);                          // max_valid_pointer
+    mo_w8(1); mo_w8(0);                // page_count = 1 as uint16
+    mo_w8(got_page_off & 0xFF);        // page_start[0] = byte offset within page
+    mo_w8((got_page_off >> 8) & 0xFF);
+
+    // ── Imports table (4 bytes each) ──
+    // Each import: lib_ordinal(8) | weak_import(1) | name_offset(23).
+    sym_pos = 1;                        // symbol string pool offset (skip initial null)
+    i = 0;
+    while (i < mo_got_cnt) {
+        lib_ord = mo_find_lib_ordinal(*(mo_got_libs + i * 8));
+        // name_offset points into symbol string pool.
+        imp_val = (lib_ord & 0xFF) | ((sym_pos & 0x7FFFFF) << 9);
+        mo_w32(imp_val);
+        // Advance sym_pos past "_name\0".
+        sl = unpack_l(*(mo_got_syms + i * 8));
+        sym_pos = sym_pos + 1 + sl + 1;  // underscore + name + null
+        i = i + 1;
+    }
+
+    // ── Symbol strings pool ──
+    // Starts with a null byte, then "_FunctionName\0" for each import.
+    mo_w8(0);                           // initial null byte
+    i = 0;
+    while (i < mo_got_cnt) {
+        ss = unpack_s(*(mo_got_syms + i * 8));
+        sl = unpack_l(*(mo_got_syms + i * 8));
+        mo_w8(0x5F);                    // underscore prefix
+        j = 0;
+        while (j < sl) {
+            mo_w8(peek(a64_sbuf + ss + j));
+            j = j + 1;
+        }
+        mo_w8(0);                       // null terminator
+        i = i + 1;
+    }
+    // Pad to 4-byte alignment.
+    while ((mo_pos - start) % 4 != 0) { mo_w8(0); }
+
+    // Update mo_cf_size to actual written size.
+    mo_cf_size = mo_pos - start;
+    return 0;
+}
+
+// Write LC_LOAD_DYLIB for an external library by packed name.
+// Constructs path: /opt/homebrew/lib/lib{name}.dylib
+// Fixed cmdsize of 80 bytes to match layout computation.
+mo_write_lc_load_dylib_named(lib_name) {
+    auto ss, sl, i, pathlen;
+    ss = unpack_s(lib_name);
+    sl = unpack_l(lib_name);
+    // Path: "/opt/homebrew/lib/lib" (21) + name + ".dylib" (6) = 27 + sl.
+    pathlen = 27 + sl;
+
+    mo_w32(0x0C);                       // cmd (LC_LOAD_DYLIB)
+    mo_w32(80);                         // cmdsize (fixed)
+    mo_w32(24);                         // name offset
+    mo_w32(2);                          // timestamp
+    mo_w32(0x00010000);                 // current_version (1.0.0)
+    mo_w32(0x00010000);                 // compat_version (1.0.0)
+    // Write path: /opt/homebrew/lib/lib + name + .dylib
+    mo_wcstr("/opt/homebrew/lib/lib", 21);
+    i = 0;
+    while (i < sl) { mo_w8(peek(a64_sbuf + ss + i)); i = i + 1; }
+    mo_wcstr(".dylib", 6);
+    mo_w8(0);                           // null terminator
+    // Pad remaining space to reach 80 bytes total.
+    mo_pad(80 - 24 - pathlen - 1);
+    return 0;
+}
+
+// Write the exports trie containing just "_main".
+// Returns the size written.
+mo_write_exports_trie(main_file_offset) {
+    auto start, lo, hi;
+    start = mo_pos;
+
+    // Root node: one child with edge "_main".
+    mo_w8(0);                       // terminal_size = 0 (not a terminal)
+    mo_w8(1);                       // children_count = 1
+    mo_wcstr("_main", 5);           // edge label
+    mo_w8(0);                       // null terminator for edge
+    mo_w8(9);                       // child node offset from trie start
+
+    // Child node at offset 9: _main export info.
+    mo_w8(3);                       // terminal_size = 3 bytes
+    mo_w8(0);                       // flags = EXPORT_SYMBOL_FLAGS_KIND_REGULAR
+    // ULEB128 encode main_file_offset (offset from __TEXT segment start).
+    lo = main_file_offset & 0x7F;
+    hi = (main_file_offset >> 7) & 0x7F;
+    if (hi > 0) {
+        mo_w8(lo | 0x80);
+        mo_w8(hi);
+    } else {
+        mo_w8(lo);
+    }
+    mo_w8(0);                       // children_count = 0
+
+    // Pad to 4-byte alignment relative to trie start (not absolute position).
+    while ((mo_pos - start) % 4 != 0) { mo_w8(0); }
+    return mo_pos - start;
+}
+
+// Write nlist_64 symbol table entry (16 bytes).
+mo_write_nlist(n_strx, n_type, n_sect, n_desc, n_value_lo, n_value_hi) {
+    mo_w32(n_strx);                 // n_un.n_strx
+    mo_w8(n_type);                  // n_type
+    mo_w8(n_sect);                  // n_sect
+    mo_w8(n_desc & 0xFF);           // n_desc low
+    mo_w8((n_desc >> 8) & 0xFF);    // n_desc high
+    mo_w64(n_value_lo, n_value_hi); // n_value
+    return 0;
+}
+
+// ── Layout computation ──────────────────────────────────────
+
+// Compute all file offsets and sizes for the Mach-O layout.
+// Must be called before writing any data.
+//   code_size:  number of bytes in enc_buf
+//   data_count: number of 8-byte global slots
+//   has_data:   1 if __DATA segment is needed, 0 otherwise
+mo_compute_layout(code_size, data_count) {
+    auto has_data, nseg, cf_data_size;
+
+    // __DATA is needed if there are globals, float literals, string literals, or GOT entries.
+    has_data = 0;
+    if (data_count > 0) { has_data = 1; }
+    if (mo_flt_cnt > 0) { has_data = 1; }
+    if (mo_sdata_size > 0) { has_data = 1; }
+    if (mo_got_cnt > 0) { has_data = 1; }
+
+    // Number of segments: PAGEZERO + TEXT + LINKEDIT [+ DATA].
+    nseg = 3;
+    if (has_data) { nseg = 4; }
+
+    // Load commands: segments + chained_fixups + exports + symtab + dysymtab
+    //   + dylinker + main + dylib(libSystem) + extra dylibs + code_signature.
+    mo_ncmds = 11 + has_data + mo_ext_lib_cnt;
+
+    mo_sizeofcmds = 72              // __PAGEZERO
+        + 152                       // __TEXT + __text section
+        + has_data * 152            // __DATA + __data section (if present)
+        + 72                        // __LINKEDIT
+        + 16                        // LC_DYLD_CHAINED_FIXUPS
+        + 16                        // LC_DYLD_EXPORTS_TRIE
+        + 24                        // LC_SYMTAB
+        + 80                        // LC_DYSYMTAB
+        + 32                        // LC_LOAD_DYLINKER
+        + 24                        // LC_MAIN
+        + 56                        // LC_LOAD_DYLIB (libSystem)
+        + mo_ext_lib_cnt * 80       // LC_LOAD_DYLIB (extra, 80 bytes each, padded)
+        + 16;                       // LC_CODE_SIGNATURE
+
+    // Code starts after header + load commands + 16 bytes of slack.
+    mo_code_off = 32 + mo_sizeofcmds + 16;
+
+    // __TEXT segment covers everything from file start through code.
+    mo_text_vmsize = mo_page_align(mo_code_off + code_size);
+
+    // Entry point: offset of _main from __TEXT segment start.
+    // _main is the first function emitted (or we find it via label).
+    mo_main_off = mo_code_off;
+
+    // __DATA segment follows __TEXT (page-aligned).
+    // Layout: globals (data_count * 8) + float literals (mo_flt_cnt * 8).
+    if (has_data) {
+        mo_data_off = mo_text_vmsize;
+        // GOT entries must be 8-byte aligned (LDR requires it).
+        mo_got_data_off = data_count * 8 + mo_flt_cnt * 8 + mo_sdata_size;
+        mo_got_data_off = (mo_got_data_off + 7) / 8 * 8;
+        mo_data_size = mo_got_data_off + mo_got_cnt * 8;
+        mo_data_vmsize = mo_page_align(mo_data_size);
+        mo_data_vmaddr_lo = MO_VM_BASE + mo_text_vmsize;
+        mo_data_vmaddr_hi = MO_VM_BASE_HI;
+        // Handle overflow from low 32 bits.
+        if (mo_data_vmaddr_lo < mo_text_vmsize) {
+            mo_data_vmaddr_hi = mo_data_vmaddr_hi + 1;
+        }
+    } else {
+        mo_data_off = mo_text_vmsize;
+        mo_data_size = 0;
+        mo_data_vmsize = 0;
+        mo_data_vmaddr_lo = 0;
+        mo_data_vmaddr_hi = 0;
+    }
+
+    // __LINKEDIT segment follows __DATA.
+    mo_link_off = mo_text_vmsize + mo_data_vmsize;
+    mo_link_vmaddr_lo = MO_VM_BASE + mo_link_off;
+    mo_link_vmaddr_hi = MO_VM_BASE_HI;
+    if (mo_link_vmaddr_lo < mo_link_off) {
+        mo_link_vmaddr_hi = mo_link_vmaddr_hi + 1;
+    }
+
+    // __LINKEDIT content: chained fixups + exports trie + symtab + strtab.
+    if (mo_got_cnt > 0) {
+        // Real chained fixups: header(32) + starts_in_image(4+4*nseg)
+        //   + starts_in_segment(24) + imports(4*got_cnt) + symbol strings.
+        // Compute exact symbol strings size: 1 (null) + sum("_" + name + "\0").
+        auto sym_str_size, si;
+        sym_str_size = 1;
+        si = 0;
+        while (si < mo_got_cnt) {
+            sym_str_size = sym_str_size + 1 + unpack_l(*(mo_got_syms + si * 8)) + 1;
+            si = si + 1;
+        }
+        cf_data_size = 32 + 4 + nseg * 4 + 24 + mo_got_cnt * 4 + sym_str_size;
+        cf_data_size = (cf_data_size + 3) / 4 * 4;
+    } else {
+        // Empty chained fixups: header + starts struct + sentinel.
+        cf_data_size = 32 + 4 + nseg * 4 + 8;
+    }
+    mo_cf_off = mo_link_off;
+    mo_cf_size = cf_data_size;
+
+    mo_et_off = mo_cf_off + mo_cf_size;
+    mo_et_size = 16;                // exports trie (estimated, will be exact after writing)
+
+    mo_sym_cnt = 2;                 // __mh_execute_header + _main
+    mo_sym_off = mo_et_off + mo_et_size;
+    // nlist_64 is 16 bytes each.
+
+    mo_str_off = mo_sym_off + mo_sym_cnt * 16;
+    // String table: " \0" + "__mh_execute_header\0" + "_main\0" = 2 + 20 + 6 = 28, padded to 32.
+    mo_str_size = 32;
+
+    auto linkedit_content, n_code_slots, id_len;
+    linkedit_content = mo_cf_size + mo_et_size + mo_sym_cnt * 16 + mo_str_size;
+
+    // Code signature: placed at end of __LINKEDIT, 16-byte aligned.
+    mo_cs_off = mo_link_off + linkedit_content;
+    mo_cs_off = (mo_cs_off + 15) / 16 * 16;
+
+    // Signature size: SuperBlob(12) + BlobIndex(8) + CodeDirectory(88) + id + hashes.
+    id_len = 6;  // "a.out\0" (default identifier, 5 chars + null)
+    n_code_slots = (mo_cs_off + 4095) / 4096;
+    mo_cs_size = 20 + 88 + id_len + n_code_slots * 32;
+
+    mo_link_size = (mo_cs_off - mo_link_off) + mo_cs_size;
+    mo_link_vmsize = mo_page_align(mo_link_size);
+
+    return 0;
+}
+
+// ── Relocation resolver ─────────────────────────────────────
+
+// Patch ADRP+ADD relocation pairs in the code buffer.
+// Called after layout is computed so we know the VM addresses of all symbols.
+//
+// Relocation types (from bpp_enc_arm64.bsm):
+//   0 = global variable (ADRP+ADD, target in __DATA)
+//   1 = string literal  (ADRP+ADD, target in __DATA after globals)
+//   2 = BL to external function (unused for now)
+//   3 = reserved
+//
+// ADRP encoding: bits [23:5] = immhi (19 bits), bits [30:29] = immlo (2 bits)
+//   page_diff = (target_page - pc_page) >> 12
+//   immlo = page_diff & 3, immhi = (page_diff >> 2) & 0x7FFFF
+//
+// ADD immediate: bits [21:10] = imm12
+//   page_offset = target_addr & 0xFFF
+mo_resolve_relocations(gl_names, gl_count) {
+    auto i, pos, sym, ty, pc_addr, target_addr;
+    auto page_diff, immlo, immhi, instr, imm12;
+    auto gl_idx, j;
+
+    i = 0;
+    while (i < enc_rel_cnt) {
+        pos = *(enc_rel_pos + i * 8);
+        sym = *(enc_rel_sym + i * 8);
+        ty  = *(enc_rel_ty  + i * 8);
+
+        // PC virtual address of this instruction.
+        pc_addr = mo_code_off + pos;
+
+        if (ty == 0) {
+            // Global variable: find its index in the globals table.
+            gl_idx = -1;
+            j = 0;
+            while (j < gl_count) {
+                if (mo_packed_eq(*(gl_names + j * 8), sym)) { gl_idx = j; }
+                j = j + 1;
+            }
+            if (gl_idx >= 0) {
+                // Target address (within __DATA): data_off + gl_idx * 8.
+                target_addr = mo_data_off + gl_idx * 8;
+            } else {
+                target_addr = mo_data_off;  // Fallback.
+            }
+        }
+        if (ty == 1) {
+            // String literal: sym is the string index in mo_sdata_off.
+            // Strings are stored after globals + floats in __DATA.
+            target_addr = mo_data_off + gl_count * 8 + mo_flt_cnt * 8 + *(mo_sdata_off + sym * 8);
+        }
+        if (ty == 2) {
+            // Float literal: sym is the float ID (index into mo_flt_data).
+            // Floats are stored after globals in __DATA.
+            target_addr = mo_data_off + gl_count * 8 + sym * 8;
+        }
+        if (ty == 3) {
+            // External function: sym is the packed function name.
+            // GOT entries are at mo_got_data_off within __DATA (8-byte aligned).
+            gl_idx = mo_find_got(sym);
+            if (gl_idx >= 0) {
+                target_addr = mo_data_off + mo_got_data_off + gl_idx * 8;
+            } else {
+                target_addr = mo_data_off;
+            }
+        }
+
+        // Patch ADRP instruction at 'pos'.
+        // ADRP always uses 4 KB pages in the ARM64 encoding (2^12), regardless
+        // of the OS page size used for segment alignment.
+        page_diff = (target_addr / 4096) - (pc_addr / 4096);
+        immlo = page_diff & 3;
+        immhi = (page_diff >> 2) & 0x7FFFF;
+
+        instr = enc_read32(pos);
+        // Clear old immediate bits and set new ones.
+        instr = instr & 0x9F00001F;  // Keep opcode + Rd, clear immlo + immhi
+        instr = instr | (immlo << 29) | (immhi << 5);
+        enc_patch32(pos, instr);
+
+        if (ty == 3) {
+            // GOT: patch LDR instruction at pos+4 (scaled page offset, divided by 8).
+            imm12 = (target_addr & 0xFFF) / 8;
+        } else {
+            // Data: patch ADD instruction at pos+4 (raw page offset).
+            imm12 = target_addr & 0xFFF;
+        }
+        instr = enc_read32(pos + 4);
+        instr = instr & 0xFFC003FF;  // Clear imm12 bits [21:10]
+        instr = instr | (imm12 << 10);
+        enc_patch32(pos + 4, instr);
+
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Top-level Mach-O writer ─────────────────────────────────
+
+// Build the complete Mach-O binary and write it to a file.
+// Parameters:
+//   filename   — output file path (C string pointer)
+//   main_label — label ID of the _main function entry point
+//   gl_names   — array of packed global variable names
+//   gl_count   — number of global variables
+write_macho(filename, main_label, gl_names, gl_count) {
+    auto fd, written, code_size, main_code_off;
+    auto nseg, has_data, i, et_actual, flt_bits;
+
+    code_size = enc_pos;
+
+    // Find the byte offset of _main within the code buffer.
+    main_code_off = *(enc_lbl_off + main_label * 8);
+
+    // Compute layout.
+    mo_compute_layout(code_size, gl_count);
+
+    // Update mo_main_off to point to the actual _main function.
+    mo_main_off = mo_code_off + main_code_off;
+
+    // Resolve relocations now that we know the layout.
+    mo_resolve_relocations(gl_names, gl_count);
+
+    // Determine segment count. Must match mo_compute_layout's logic.
+    has_data = 0;
+    if (gl_count > 0) { has_data = 1; }
+    if (mo_flt_cnt > 0) { has_data = 1; }
+    if (mo_sdata_size > 0) { has_data = 1; }
+    if (mo_got_cnt > 0) { has_data = 1; }
+    nseg = 3 + has_data;
+
+    // Reset output buffer.
+    mo_pos = 0;
+
+    // ── Write Mach-O header ──
+    mo_write_header();
+
+    // ── Write load commands ──
+
+    // LC_SEGMENT_64 __PAGEZERO
+    mo_write_segment("__PAGEZERO", 10, 0, 0, 0, 0, 0, 0, 0, 0);
+    // Fix vmsize to 0x100000000 (4 GB). We wrote vmsize as 0 above. Patch it.
+    // vmsize is at offset -72+32 = segment_start + 40.
+    // Actually, let me just write it correctly inline.
+    // Rewind and rewrite. No, that's ugly. Let me fix the write_segment to handle this.
+    // The issue is vmsize = 0x100000000 which needs hi=1, lo=0.
+    // But we passed vmsize as 0. Let me patch it directly.
+    // __PAGEZERO vmsize is at file offset 32 (header) + 4+4+16+8 = 64 = 0x40.
+    // Actually it's at: header(32) + cmd(4) + cmdsize(4) + segname(16) + vmaddr(8) = 64.
+    poke(mo_buf + 64, 0); poke(mo_buf + 65, 0); poke(mo_buf + 66, 0); poke(mo_buf + 67, 0);
+    poke(mo_buf + 68, 1); poke(mo_buf + 69, 0); poke(mo_buf + 70, 0); poke(mo_buf + 71, 0);
+
+    // LC_SEGMENT_64 __TEXT + __text section
+    mo_write_segment("__TEXT", 6, MO_VM_BASE, MO_VM_BASE_HI, mo_text_vmsize, 0, mo_text_vmsize, 5, 5, 1);
+    mo_write_section("__text", 6, "__TEXT", 6,
+        MO_VM_BASE + mo_code_off, MO_VM_BASE_HI,
+        code_size, mo_code_off, 2, 0x80000400);
+
+    // LC_SEGMENT_64 __DATA + __data section (if present).
+    if (has_data) {
+        mo_write_segment("__DATA", 6,
+            mo_data_vmaddr_lo, mo_data_vmaddr_hi,
+            mo_data_vmsize, mo_data_off, mo_data_vmsize, 3, 3, 1);
+        mo_write_section("__data", 6, "__DATA", 6,
+            mo_data_vmaddr_lo, mo_data_vmaddr_hi,
+            mo_data_size, mo_data_off, 3, 0);
+    }
+
+    // LC_SEGMENT_64 __LINKEDIT
+    mo_write_segment("__LINKEDIT", 10,
+        mo_link_vmaddr_lo, mo_link_vmaddr_hi,
+        mo_link_vmsize, mo_link_off, mo_link_size, 1, 1, 0);
+
+    // LC_DYLD_CHAINED_FIXUPS
+    mo_write_lc_chained_fixups();
+
+    // LC_DYLD_EXPORTS_TRIE
+    mo_write_lc_exports_trie();
+
+    // LC_SYMTAB
+    mo_write_lc_symtab();
+
+    // LC_DYSYMTAB
+    mo_write_lc_dysymtab();
+
+    // LC_LOAD_DYLINKER
+    mo_write_lc_dylinker();
+
+    // LC_MAIN
+    mo_write_lc_main();
+
+    // LC_LOAD_DYLIB (libSystem.B.dylib)
+    mo_write_lc_load_dylib();
+
+    // LC_LOAD_DYLIB for each additional external library.
+    i = 0;
+    while (i < mo_ext_lib_cnt) {
+        mo_write_lc_load_dylib_named(*(mo_ext_libs + i * 8));
+        i = i + 1;
+    }
+
+    // LC_CODE_SIGNATURE
+    mo_w32(0x1D);                   // cmd (LC_CODE_SIGNATURE)
+    mo_w32(16);                     // cmdsize
+    mo_w32(mo_cs_off);              // dataoff
+    mo_w32(mo_cs_size);             // datasize
+
+    // ── Write code section ──
+    // Slack space after load commands (16 bytes for future use).
+    // Pad from current position to mo_code_off.
+    mo_pad(mo_code_off - mo_pos);
+
+    // Copy code from enc_buf.
+    i = 0;
+    while (i < code_size) {
+        poke(mo_buf + mo_pos, peek(enc_buf + i));
+        mo_pos = mo_pos + 1;
+        i = i + 1;
+    }
+
+    // ── Write __DATA section ──
+    // Layout: globals (zero-initialized) + float literals (raw IEEE 754 bytes).
+    if (has_data) {
+        mo_pad(mo_data_off - mo_pos);
+        // Write globals as zero-initialized 8-byte slots.
+        mo_pad(gl_count * 8);
+        // Write float literals as 8-byte IEEE 754 doubles.
+        // Each entry in mo_flt_data is a raw 64-bit IEEE 754 value.
+        i = 0;
+        while (i < mo_flt_cnt) {
+            flt_bits = *(mo_flt_data + i * 8);
+            mo_w32(flt_bits & 0xFFFFFFFF);
+            mo_w32((flt_bits >> 32) & 0xFFFFFFFF);
+            i = i + 1;
+        }
+        // Write string literal data (raw bytes copied from mo_sdata).
+        i = 0;
+        while (i < mo_sdata_size) {
+            poke(mo_buf + mo_pos, peek(mo_sdata + i));
+            mo_pos = mo_pos + 1;
+            i = i + 1;
+        }
+        // Align to 8 bytes before GOT entries.
+        while ((mo_pos - mo_data_off) % 8 != 0) { poke(mo_buf + mo_pos, 0); mo_pos = mo_pos + 1; }
+        // Write GOT entries as dyld_chained_ptr_64_bind values.
+        // Each 8-byte slot: ordinal(24)|addend(8)|reserved(19)|next(12)|bind(1).
+        // Low 32 bits = ordinal (= import index).
+        // High 32 bits = (next << 19) | (bind << 31).
+        //   next=2 means stride of 8 bytes to next entry. next=0 = end of chain.
+        //   bind=1 marks this as a bind entry (not a rebase).
+        i = 0;
+        while (i < mo_got_cnt) {
+            mo_w32(i);
+            if (i < mo_got_cnt - 1) {
+                mo_w32(0x80100000);
+            } else {
+                mo_w32(0x80000000);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── Write __LINKEDIT ──
+    // Pad to __LINKEDIT offset.
+    mo_pad(mo_link_off - mo_pos);
+
+    // Chained fixups data.
+    if (mo_got_cnt > 0) {
+        mo_write_chained_fixups_real(nseg, gl_count);
+    } else {
+        mo_write_chained_fixups(nseg);
+    }
+
+    // Exports trie.
+    et_actual = mo_write_exports_trie(mo_main_off);
+
+    // Pad if exports trie was smaller than estimated.
+    if (et_actual < mo_et_size) {
+        mo_pad(mo_et_size - et_actual);
+    }
+
+    // Symbol table: __mh_execute_header + _main.
+    // __mh_execute_header: strx=2, type=0x0F, sect=1, desc=0x0010
+    mo_write_nlist(2, 0x0F, 1, 0x0010, MO_VM_BASE, MO_VM_BASE_HI);
+    // _main: strx=22, type=0x0F, sect=1, desc=0x0000
+    mo_write_nlist(22, 0x0F, 1, 0x0000,
+        MO_VM_BASE + mo_main_off, MO_VM_BASE_HI);
+
+    // String table: " \0__mh_execute_header\0_main\0" padded to 32.
+    mo_w8(0x20); mo_w8(0);                          // " \0" (2 bytes, index 0-1)
+    mo_wcstr("__mh_execute_header", 19); mo_w8(0);  // 20 bytes (index 2-21)
+    mo_wcstr("_main", 5); mo_w8(0);                 // 6 bytes (index 22-27)
+    mo_pad(4);                                       // pad to 32 bytes
+
+    // ── Write code signature ──
+    // Pad to mo_cs_off (16-byte aligned).
+    mo_pad(mo_cs_off - mo_pos);
+
+    // Write ad-hoc code signature: SuperBlob + CodeDirectory + page hashes.
+    mo_write_code_signature();
+
+    // ── Write file ──
+    fd = sys_open(filename, 0x601);
+    written = sys_write(fd, mo_buf, mo_pos);
+    sys_close(fd);
+
+    return 0;
+}
+
+// Write ad-hoc code signature at the current position in mo_buf.
+// Computes SHA-256 page hashes over everything before mo_cs_off.
+mo_write_code_signature() {
+    auto n_slots, id_len, hash_off, cd_len, sb_len;
+    auto i, page_start, page_len, digest;
+    auto cs_start;
+
+    cs_start = mo_pos;
+    n_slots = (mo_cs_off + 4095) / 4096;
+    id_len = 6;  // "a.out\0"
+    hash_off = 88 + id_len;
+    cd_len = hash_off + n_slots * 32;
+    sb_len = 20 + cd_len;
+
+    // ── SuperBlob header (12 bytes, big-endian) ──
+    mo_w32be(0xFADE0CC0);           // magic (CSMAGIC_EMBEDDED_SIGNATURE)
+    mo_w32be(sb_len);               // length
+    mo_w32be(1);                    // count (1 blob)
+
+    // ── BlobIndex[0] (8 bytes, big-endian) ──
+    mo_w32be(0);                    // type (CSSLOT_CODEDIRECTORY)
+    mo_w32be(20);                   // offset from SuperBlob start
+
+    // ── CodeDirectory (88 bytes header, big-endian) ──
+    mo_w32be(0xFADE0C02);           // magic (CSMAGIC_CODEDIRECTORY)
+    mo_w32be(cd_len);               // length
+    mo_w32be(0x00020400);           // version
+    mo_w32be(0x00020002);           // flags (CS_ADHOC | CS_LINKER_SIGNED)
+    mo_w32be(hash_off);             // hashOffset
+    mo_w32be(88);                   // identOffset (right after header)
+    mo_w32be(0);                    // nSpecialSlots
+    mo_w32be(n_slots);              // nCodeSlots
+    mo_w32be(mo_cs_off);            // codeLimit
+    mo_w8(32);                      // hashSize (SHA-256 = 32 bytes)
+    mo_w8(2);                       // hashType (CS_HASHTYPE_SHA256)
+    mo_w8(0);                       // platform
+    mo_w8(12);                      // pageSize (log2(4096) = 12)
+    mo_w32be(0);                    // spare2
+    mo_w32be(0);                    // scatterOffset
+    mo_w32be(0);                    // teamOffset
+    mo_w32be(0);                    // spare3
+    mo_w64be(0);                    // codeLimit64
+    mo_w64be(0);                    // execSegBase
+    mo_w64be(mo_text_vmsize);       // execSegLimit
+    mo_w64be(1);                    // execSegFlags (CS_EXECSEG_MAIN_BINARY)
+
+    // ── Identifier string ──
+    mo_wcstr("a.out", 5);
+    mo_w8(0);
+
+    // ── Page hashes (SHA-256 of each 4096-byte page) ──
+    digest = malloc(32);
+    i = 0;
+    while (i < n_slots) {
+        page_start = i * 4096;
+        page_len = 4096;
+        if (page_start + page_len > mo_cs_off) {
+            page_len = mo_cs_off - page_start;
+        }
+        sha256(mo_buf + page_start, page_len, digest);
+        // Write 32-byte hash.
+        auto j;
+        j = 0;
+        while (j < 32) {
+            mo_w8(peek(digest + j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    free(digest);
+    return 0;
+}
+
+// Write a 32-bit value in big-endian format.
+mo_w32be(v) {
+    poke(mo_buf + mo_pos, (v >> 24) & 0xFF);
+    poke(mo_buf + mo_pos + 1, (v >> 16) & 0xFF);
+    poke(mo_buf + mo_pos + 2, (v >> 8) & 0xFF);
+    poke(mo_buf + mo_pos + 3, v & 0xFF);
+    mo_pos = mo_pos + 4;
+    return 0;
+}
+
+// Write a 64-bit value in big-endian format.
+mo_w64be(v) {
+    mo_w32be((v >> 32) & 0xFFFFFFFF);
+    mo_w32be(v & 0xFFFFFFFF);
+    return 0;
+}

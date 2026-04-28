@@ -1,0 +1,176 @@
+// bpp.bpp — Unified B++ compiler.
+// Single process: source file → merged source → tokens → AST → types → dispatch → output.
+// No JSON between stages. All data stays in memory.
+//
+// Usage: ./bpp source.bpp > output.c          (C backend, default)
+//        ./bpp --asm source.bpp > output.s    (ARM64 assembly backend)
+//        ./bpp --bin source.bpp               (native Mach-O ARM64 binary → a.out)
+
+import "defs.bsm";
+import "stbarray.bsm";
+import "bpp_internal.bsm";
+import "bpp_import.bsm";
+import "bpp_parser.bsm";
+import "bpp_lexer.bsm";
+import "bpp_types.bsm";
+import "bpp_dispatch.bsm";
+import "bpp_emitter.bsm";
+import "bpp_enc_arm64.bsm";
+import "bpp_codegen_arm64.bsm";
+import "bpp_macho.bsm";
+
+main() {
+    auto arg_len, arg_ptr, mode, c0, c1, out_name, argi, nargs;
+    auto main_fi, main_lbl, i, fp, fs, fl;
+
+    // mode: 0 = C, 1 = ARM64 assembly, 2 = native Mach-O binary (default).
+    mode = 2;
+    out_name = 0;
+
+    // Initialize all subsystems.
+    init_array();
+    init_defs();
+    init_internal();
+    init_import();
+    init_parser();
+    init_lexer();
+    init_types();
+    init_dispatch();
+    init_emitter();
+    init_enc_arm64();
+    init_codegen_arm64();
+    init_macho();
+
+    // Parse command-line arguments.
+    // Supported flags: --asm, --bin, -o <name>
+    // Usage: bpp [--asm|--bin] [-o output] source.bpp
+    auto a;
+    nargs = argc_get();
+    argi = 1;
+    arg_ptr = 0;
+    while (argi < nargs) {
+        a = argv_get(argi);
+        if (a == 0) { argi = argi + 1; }
+        if (a == 0) { return 1; }
+        c0 = str_peek(a, 0);
+        c1 = str_peek(a, 1);
+        if (c0 == '-') {
+            if (c1 == '-') {
+                // --asm
+                if (str_peek(a, 2) == 'a') {
+                    if (str_peek(a, 3) == 's') {
+                        if (str_peek(a, 4) == 'm') { mode = 1; }
+                    }
+                }
+                // --bin (explicit, same as default)
+                if (str_peek(a, 2) == 'b') {
+                    if (str_peek(a, 3) == 'i') {
+                        if (str_peek(a, 4) == 'n') { mode = 2; }
+                    }
+                }
+                // --c (emit C to stdout)
+                if (str_peek(a, 2) == 'c') {
+                    mode = 0;
+                }
+            }
+            if (c1 == 'o') {
+                // -o <name>: next argument is the output filename.
+                argi = argi + 1;
+                out_name = argv_get(argi);
+            }
+        } else {
+            // Positional argument: source file.
+            arg_ptr = a;
+        }
+        argi = argi + 1;
+    }
+
+    // 1. Import: resolve files, build merged source in outbuf.
+    arg_len = copy_cstr(pathbuf, arg_ptr);
+    process_file(pathbuf, arg_len);
+
+    // 2. Lex: scan outbuf into toks/vbuf arrays.
+    src = outbuf;
+    src_len = outbuf_len;
+    lex_all();
+
+    // 3. Parse: consume toks, build AST.
+    parse_program();
+
+    // 4. Types: annotate AST itype fields.
+    run_types();
+
+    // 5. Dispatch: annotate loop dispatch fields.
+    run_dispatch();
+
+    // 6. Emit output based on selected backend.
+    if (mode == 2) {
+        // Native binary mode: ARM64 binary codegen + Mach-O writer.
+        a64_bin_mode = 1;
+        emit_all_arm64();
+
+        // Find the "main" function in the function table.
+        main_fi = -1;
+        i = 0;
+        while (i < a64_fn_cnt) {
+            if (a64_str_eq(*(a64_fn_name + i * 8), "main", 4)) {
+                main_fi = i;
+            }
+            i = i + 1;
+        }
+        main_lbl = *(a64_fn_lbl + main_fi * 8);
+
+        // Precompute float literal IEEE 754 data.
+        i = 0;
+        while (i < a64_flt_cnt) {
+            fp = *(a64_flt_tbl + i * 8);
+            fs = unpack_s(fp);
+            mo_add_float(a64_sbuf + fs);
+            i = i + 1;
+        }
+
+        // Copy string literal data into the Mach-O string buffer.
+        i = 0;
+        while (i < a64_str_cnt) {
+            fp = *(a64_str_tbl + i * 8);
+            fs = unpack_s(fp);
+            fl = unpack_l(fp);
+            mo_add_string(a64_sbuf + fs, fl);
+            i = i + 1;
+        }
+
+        // Register external functions for GOT linking.
+        auto ext_rec, ext_name, ext_lib;
+        i = 0;
+        while (i < ext_cnt) {
+            ext_rec = *(externs + i * 8);
+            ext_name = *(ext_rec + 8);
+            ext_lib = *(ext_rec + 16);
+            mo_add_got(ext_name, ext_lib);
+            i = i + 1;
+        }
+
+        // Write the Mach-O binary. Default name is "a.out" unless -o was given.
+        if (out_name != 0) {
+            auto ol;
+            ol = copy_cstr(pathbuf, out_name);
+            poke(pathbuf + ol, 0);
+        } else {
+            poke(pathbuf, 'a');
+            poke(pathbuf + 1, '.');
+            poke(pathbuf + 2, 'o');
+            poke(pathbuf + 3, 'u');
+            poke(pathbuf + 4, 't');
+            poke(pathbuf + 5, 0);
+        }
+        write_macho(pathbuf, main_lbl, a64_gl_name, a64_gl_cnt);
+    } else {
+        if (mode == 1) {
+            emit_all_arm64();
+        } else {
+            emit_all();
+        }
+    }
+
+    return 0;
+}

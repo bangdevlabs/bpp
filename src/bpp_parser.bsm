@@ -11,12 +11,12 @@ import "bpp_diag.bsm";
 
 // Token storage (filled by the lexer before parsing begins).
 extrn toks;
-auto tok_cnt, tok_pos;
+global tok_cnt, tok_pos;
 extrn vbuf;
-auto vbuf_pos;
+global vbuf_pos;
 
 // Program structure collected during parsing.
-auto globals, glob_cnt;
+extrn globals, glob_cnt;
 // 1 if the global was declared with the `global` keyword (shared with
 // worker threads, dispatchable from auto-parallelized loops); 0 if it
 // was declared with `auto` at file scope (legacy / main-thread-only,
@@ -27,24 +27,24 @@ auto globals, glob_cnt;
 // Per-global storage class (parallel to globals[]). One of GLOB_AUTO,
 // GLOB_GLOBAL, or GLOB_EXTRN. Codegen and the smart-dispatch pass read
 // this to decide whether a loop touching the variable is safe to fan out.
-auto glob_class;
+global glob_class;
 
 // Set to 1 by the orchestrator (bpp.bpp) when parsing the entry file's
 // content (module 0). Used by Fix 2 to enforce "main() only in entry file"
 // without relying on tok_mod() which returns incorrect module attribution
 // for module 0 (its content sits at mod0_real_start, past all auto-injected
 // modules, but diag_file_starts[0] points to position 0 in outbuf).
-auto _parser_is_entry;
-auto externs, ext_cnt;
-auto funcs, func_cnt;
-auto fn_static;   // parallel to funcs[]: 1 if static (private to module)
-auto fn_void;     // parallel to funcs[]: 1 if void (no useful return)
+global _parser_is_entry;
+extrn externs, ext_cnt;
+extrn funcs, func_cnt;
+global fn_static;   // parallel to funcs[]: 1 if static (private to module)
+global fn_void;     // parallel to funcs[]: 1 if void (no useful return)
 
 // Struct registry: 7 parallel dynamic arrays (name, fields ptr, field count, size, hints, byte offs, bit offs).
 // sd_byte_offs[i][j] = byte offset of field j in struct i (precomputed by add_struct_field).
 // sd_bit_offs[i][j]  = bit offset within that byte for bit-packed fields; 0 for byte+ fields.
-auto sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
-auto sd_byte_offs, sd_bit_offs;
+extrn sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
+extrn sd_byte_offs, sd_bit_offs;
 
 // Struct lookup acceleration. _parser_struct_hash maps a struct
 // name's byte sequence to (struct_idx + 1). Updated incrementally by
@@ -52,30 +52,30 @@ auto sd_byte_offs, sd_bit_offs;
 // to rebuild. Inserts and lookups happen interleaved during parsing,
 // so eager/lazy strategies would cost O(n) per insertion; incremental
 // is the only correct fit here.
-auto _parser_struct_hash;
+static auto _parser_struct_hash;
 
 // Variable type map: 2 parallel dynamic arrays (var_name packed, struct_index).
-auto vt_names, vt_sidx;
+static auto vt_names, vt_sidx;
 
 // Stack struct flag: tracks which variables are stack-allocated (via var keyword).
-auto var_stack_names;
+static auto var_stack_names;
 
 // Enum constant registry: 2 parallel dynamic arrays (packed_name, int_value).
-auto ev_names, ev_values;
+extrn ev_names, ev_values;
 
 // Const function registry: name, params array, param count, body array, body count.
-auto cf_names, cf_params, cf_pcnts, cf_bodies, cf_bcnts, cf_count;
+static auto cf_names, cf_params, cf_pcnts, cf_bodies, cf_bcnts, cf_count;
 
 // TK_FLOAT is not declared in defs.bpp, so the parser owns it.
 extrn TK_FLOAT;
 
 // Primitive type hint set by try_type_annotation(). 0 = no hint,
 // TY_FLOAT or TY_WORD when the annotation is a primitive name.
-auto _prim_hint;
+static auto _prim_hint;
 
 // Block nesting depth. 0 = function top level. Incremented by parse_body
 // when called from if/while/for. Used to warn about auto inside blocks.
-auto _block_depth;
+static auto _block_depth;
 
 // ============================================================
 // Initialization
@@ -189,12 +189,12 @@ void add_struct_field(idx, field_p, hint) {
     fc = arr_get(sd_fcounts, idx);
     fields[fc] = field_p;
     hints[fc] = hint;
-    fc = fc + 1;
+    fc++;
 
     // Layout pass: walk every field and assign (byte, bit) offsets.
     byte_cur = 0;
     bit_cur = 0;
-    for (j = 0; j < fc; j = j + 1) {
+    for (j = 0; j < fc; j++) {
         h = hints[j];
         sl = ty_slice(h);
         if (sl >= SL_BIT && sl <= SL_BIT7) {
@@ -202,31 +202,31 @@ void add_struct_field(idx, field_p, hint) {
             // otherwise rolls onto a fresh one. Width is encoded as sl - 3.
             bw = sl - 3;
             if (bit_cur + bw > 8) {
-                byte_cur = byte_cur + 1;
+                byte_cur++;
                 bit_cur = 0;
             }
             byte_offs[j] = byte_cur;
             bit_offs[j] = bit_cur;
-            bit_cur = bit_cur + bw;
+            bit_cur += bw;
             if (bit_cur == 8) {
-                byte_cur = byte_cur + 1;
+                byte_cur++;
                 bit_cur = 0;
             }
         } else {
             // Byte+ field (including future SL_DOUBLE) — flush any in-flight
             // bit packing first so this field starts on a fresh byte.
             if (bit_cur > 0) {
-                byte_cur = byte_cur + 1;
+                byte_cur++;
                 bit_cur = 0;
             }
             byte_offs[j] = byte_cur;
             bit_offs[j] = 0;
-            byte_cur = byte_cur + slice_width(sl) / 8;
+            byte_cur += slice_width(sl) / 8;
         }
     }
     // Total size: round up if any bit packing is still in flight.
     total = byte_cur;
-    if (bit_cur > 0) { total = total + 1; }
+    if (bit_cur > 0) { total++; }
 
     arr_set(sd_fcounts, idx, fc);
     arr_set(sd_sizes, idx, total);
@@ -236,10 +236,10 @@ void add_struct_field(idx, field_p, hint) {
 // by add_struct_def so no rebuild is ever needed.
 find_struct(name_p) {
     auto v;
-    if (_parser_struct_hash == 0) { return 0 - 1; }
+    if (_parser_struct_hash == 0) { return -1; }
     v = hash_str_get(_parser_struct_hash,
                      vbuf + unpack_s(name_p), unpack_l(name_p));
-    if (v == 0) { return 0 - 1; }
+    if (v == 0) { return -1; }
     return v - 1;
 }
 
@@ -250,7 +250,7 @@ static get_field_offset(idx, field_p) {
     fields = arr_get(sd_fields, idx);
     byte_offs = arr_get(sd_byte_offs, idx);
     fc = arr_get(sd_fcounts, idx);
-    for (i = 0; i < fc; i = i + 1) {
+    for (i = 0; i < fc; i++) {
         if (packed_eq(fields[i], field_p)) { return byte_offs[i]; }
     }
     return -1;
@@ -264,7 +264,7 @@ get_field_bit_off(idx, field_p) {
     fields = arr_get(sd_fields, idx);
     bit_offs = arr_get(sd_bit_offs, idx);
     fc = arr_get(sd_fcounts, idx);
-    for (i = 0; i < fc; i = i + 1) {
+    for (i = 0; i < fc; i++) {
         if (packed_eq(fields[i], field_p)) { return bit_offs[i]; }
     }
     return 0;
@@ -278,7 +278,7 @@ get_field_bit_width(idx, field_p) {
     fields = arr_get(sd_fields, idx);
     hints = arr_get(sd_fhints, idx);
     fc = arr_get(sd_fcounts, idx);
-    for (i = 0; i < fc; i = i + 1) {
+    for (i = 0; i < fc; i++) {
         if (packed_eq(fields[i], field_p)) {
             sl = ty_slice(hints[i]);
             if (sl >= SL_BIT && sl <= SL_BIT7) { return sl - 3; }
@@ -300,7 +300,7 @@ static get_field_index(idx, field_p) {
     auto fields, fc, i;
     fields = arr_get(sd_fields, idx);
     fc = arr_get(sd_fcounts, idx);
-    for (i = 0; i < fc; i = i + 1) {
+    for (i = 0; i < fc; i++) {
         if (packed_eq(fields[i], field_p)) { return i; }
     }
     return -1;
@@ -320,7 +320,7 @@ void set_var_type(var_p, idx) {
 // Look up a variable's struct type. Returns struct index or -1.
 get_var_type(var_p) {
     auto i;
-    for (i = arr_len(vt_names) - 1; i >= 0; i = i - 1) {
+    for (i = arr_len(vt_names) - 1; i >= 0; i--) {
         if (packed_eq(arr_get(vt_names, i), var_p)) { return arr_get(vt_sidx, i); }
     }
     return -1;
@@ -334,7 +334,7 @@ static void set_var_stack(var_p) {
 // Check if a variable is stack-allocated. Returns 1 if yes, 0 otherwise.
 is_var_stack(var_p) {
     auto i;
-    for (i = arr_len(var_stack_names) - 1; i >= 0; i = i - 1) {
+    for (i = arr_len(var_stack_names) - 1; i >= 0; i--) {
         if (packed_eq(arr_get(var_stack_names, i), var_p)) { return 1; }
     }
     return 0;
@@ -354,10 +354,10 @@ void add_enum_val(name_p, val) {
 // not found. Non-static for the same reason as add_enum_val.
 find_enum_idx(name_p) {
     auto i;
-    for (i = arr_len(ev_names) - 1; i >= 0; i = i - 1) {
+    for (i = arr_len(ev_names) - 1; i >= 0; i--) {
         if (packed_eq(arr_get(ev_names, i), name_p)) { return i; }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Look up an enum constant by packed name. Returns the value or -1
@@ -368,7 +368,7 @@ find_enum_val(name_p) {
     auto i;
     i = find_enum_idx(name_p);
     if (i >= 0) { return arr_get(ev_values, i); }
-    return 0 - 1;
+    return -1;
 }
 
 // Parse the current token as a decimal or hex integer literal.
@@ -381,15 +381,15 @@ static parse_lit_int() {
     val = 0;
     if (t == TK_HEX) {
         // Skip "0x" prefix.
-        for (i = 2; i < vl; i = i + 1) {
+        for (i = 2; i < vl; i++) {
             ch = peek(vbuf + vs + i);
-            val = val * 16;
-            if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
-            if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
-            if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
+            val *= 16;
+            if (ch >= 48) { if (ch <= 57) { val += ch - 48; } }
+            if (ch >= 65) { if (ch <= 70) { val += ch - 55; } }
+            if (ch >= 97) { if (ch <= 102) { val += ch - 87; } }
         }
     } else {
-        for (i = 0; i < vl; i = i + 1) {
+        for (i = 0; i < vl; i++) {
             ch = peek(vbuf + vs + i);
             val = val * 10 + ch - 48;
         }
@@ -419,13 +419,13 @@ parse_int_lit_value(p) {
             if (ch >= '0' && ch <= '9') { val = val * 16 + ch - '0'; }
             else if (ch >= 'a' && ch <= 'f') { val = val * 16 + ch - 'a' + 10; }
             else if (ch >= 'A' && ch <= 'F') { val = val * 16 + ch - 'A' + 10; }
-            i = i + 1;
+            i++;
         }
     } else {
         while (i < l) {
             ch = peek(vbuf + s + i);
             if (ch >= '0' && ch <= '9') { val = val * 10 + ch - '0'; }
-            i = i + 1;
+            i++;
         }
     }
     return val;
@@ -445,7 +445,7 @@ is_int_lit_node(node_p) {
     i = 0;
     while (i < l) {
         if (peek(vbuf + s + i) == '.') { return 0; }
-        i = i + 1;
+        i++;
     }
     return 1;
 }
@@ -465,7 +465,7 @@ is_float_lit_node(node_p) {
     i = 0;
     while (i < l) {
         if (peek(vbuf + s + i) == '.') { return 1; }
-        i = i + 1;
+        i++;
     }
     return 0;
 }
@@ -478,7 +478,7 @@ static make_int_lit(val) {
         inner = make_int_lit(0 - val);
         neg_op = pack(vbuf_pos, 1);
         poke(vbuf + vbuf_pos, 45);
-        vbuf_pos = vbuf_pos + 1;
+        vbuf_pos++;
         neg_node = make_node(T_UNARY);
         neg_node.a = neg_op;
         neg_node.b = inner;
@@ -487,14 +487,14 @@ static make_int_lit(val) {
     start = vbuf_pos;
     if (val == 0) {
         poke(vbuf + vbuf_pos, 48);
-        vbuf_pos = vbuf_pos + 1;
+        vbuf_pos++;
     } else {
         tmp = val;
         while (tmp > 0) {
             digit = tmp % 10;
             poke(vbuf + vbuf_pos, 48 + digit);
-            vbuf_pos = vbuf_pos + 1;
-            tmp = tmp / 10;
+            vbuf_pos++;
+            tmp /= 10;
         }
         // Reverse the digits.
         i = start;
@@ -503,8 +503,8 @@ static make_int_lit(val) {
             t = peek(vbuf + i);
             poke(vbuf + i, peek(vbuf + j));
             poke(vbuf + j, t);
-            i = i + 1;
-            j = j - 1;
+            i++;
+            j--;
         }
     }
     node = make_node(T_LIT);
@@ -517,8 +517,54 @@ static make_plus_op() {
     auto start;
     start = vbuf_pos;
     poke(vbuf + vbuf_pos, 43);
-    vbuf_pos = vbuf_pos + 1;
+    vbuf_pos++;
     return pack(start, 1);
+}
+
+// Intern a single operator character into vbuf and return a packed ref.
+// Used by compound-assignment and increment desugaring to build T_BINOP nodes.
+static _make_op_char(ch) {
+    auto p;
+    p = pack(vbuf_pos, 1);
+    poke(vbuf + vbuf_pos, ch);
+    vbuf_pos++;
+    return p;
+}
+
+// Desugar x++ / ++x / x-- / --x → T_ASSIGN(lhs, T_BINOP(op_ch, lhs, 1)).
+// op_ch: '+' for increment, '-' for decrement.
+static _make_inc_assign(lhs, op_ch) {
+    auto binop: Node, node: Node;
+    binop = make_node(T_BINOP);
+    binop.a = _make_op_char(op_ch);
+    binop.b = lhs;
+    binop.c = make_int_lit(1);
+    node = make_node(T_ASSIGN);
+    node.a = lhs;
+    node.b = binop;
+    return node;
+}
+
+// Desugar x += rhs → T_ASSIGN(lhs, T_BINOP(op_ch, lhs, rhs)).
+// Also handles T_MEMLD on lhs: mirrors the T_MEMST path of plain '='.
+static _make_compound_assign(op_ch, lhs, rhs) {
+    auto binop: Node, node: Node, ln: Node;
+    binop = make_node(T_BINOP);
+    binop.a = _make_op_char(op_ch);
+    binop.b = lhs;
+    binop.c = rhs;
+    ln = lhs;
+    if (ln.ntype == T_MEMLD) {
+        node = make_node(T_MEMST);
+        node.a = ln.a;
+        node.b = binop;
+        node.c = ln.b;
+        return node;
+    }
+    node = make_node(T_ASSIGN);
+    node.a = lhs;
+    node.b = binop;
+    return node;
 }
 
 // Phase D.4 inline trivials support: cached packed ref for the
@@ -536,7 +582,7 @@ static _inline_malloc_ref() {
     poke(vbuf + vbuf_pos + 3, 'l');
     poke(vbuf + vbuf_pos + 4, 'o');
     poke(vbuf + vbuf_pos + 5, 'c');
-    vbuf_pos = vbuf_pos + 6;
+    vbuf_pos += 6;
     _inline_malloc_p_cached = pack(start, 6);
     return _inline_malloc_p_cached;
 }
@@ -570,7 +616,7 @@ static cur_packed() { return pack(peek_vstart(), peek_vlen()); }
 static cur_type() { return peek_type(); }
 
 // Advance past the current token.
-static void consume() { tok_pos = tok_pos + 1; }
+static void consume() { tok_pos++; }
 
 // Check if the current token's value is a single character c.
 static val_is_ch(c) {
@@ -605,11 +651,11 @@ static val_at_ch(off, c) {
 // ── Module tracking ───────────────────────────────────────────
 // Each function and global records which module it was defined in.
 
-auto func_mods;     // Module index for each parsed function.
-auto glob_mods;     // Module index for each parsed global.
-auto struct_mods;   // Module index for each struct definition.
-auto enum_mods;     // Module index for each enum constant.
-auto extern_mods;   // Module index for each extern declaration.
+global func_mods;     // Module index for each parsed function.
+static auto glob_mods;     // Module index for each parsed global.
+extrn struct_mods;   // Module index for each struct definition.
+extrn enum_mods;     // Module index for each enum constant.
+extrn extern_mods;   // Module index for each extern declaration.
 
 // Return the module index that a given token belongs to.
 tok_mod(tidx) { return mod_idx(tok_src_off[tidx]); }
@@ -639,7 +685,7 @@ static void add_global(p, gclass) {
 // Read by parse_global to mark the variable as promotion-pinned
 // (glob_pinned[i] = 1). Prevents auto smart promotion from changing
 // the storage class. Only meaningful at file scope; ignored in functions.
-auto _serial_hint;
+static auto _serial_hint;
 
 // Parse an optional ": TypeName" annotation after a variable name.
 // Recognizes primitive types and struct types. Supports compound annotations:
@@ -831,12 +877,12 @@ static void parse_import() {
         if (val_is_ch('*')) {
             ts = vbuf_pos;
             tl = unpack_l(tp);
-            for (pi = 0; pi < tl; pi = pi + 1) {
+            for (pi = 0; pi < tl; pi++) {
                 poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
-                vbuf_pos = vbuf_pos + 1;
+                vbuf_pos++;
             }
             poke(vbuf + vbuf_pos, 42);
-            vbuf_pos = vbuf_pos + 1;
+            vbuf_pos++;
             tp = pack(ts, tl + 1);
             consume();
         }
@@ -852,12 +898,12 @@ static void parse_import() {
             if (val_is_ch('*')) {
                 ts = vbuf_pos;
                 tl = unpack_l(tp);
-                for (pi = 0; pi < tl; pi = pi + 1) {
+                for (pi = 0; pi < tl; pi++) {
                     poke(vbuf + vbuf_pos, peek(vbuf + unpack_s(tp) + pi));
-                    vbuf_pos = vbuf_pos + 1;
+                    vbuf_pos++;
                 }
                 poke(vbuf + vbuf_pos, 42);
-                vbuf_pos = vbuf_pos + 1;
+                vbuf_pos++;
                 tp = pack(ts, tl + 1);
                 consume();
             }
@@ -930,12 +976,12 @@ static const_eval_node(node) {
         if (vl > 2) {
             if (peek(vbuf + vs) == 48) {
                 if (peek(vbuf + vs + 1) == 120) {
-                    for (i = 2; i < vl; i = i + 1) {
+                    for (i = 2; i < vl; i++) {
                         ch = peek(vbuf + vs + i);
-                        val = val * 16;
-                        if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
-                        if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
-                        if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
+                        val *= 16;
+                        if (ch >= 48) { if (ch <= 57) { val += ch - 48; } }
+                        if (ch >= 65) { if (ch <= 70) { val += ch - 55; } }
+                        if (ch >= 97) { if (ch <= 102) { val += ch - 87; } }
                     }
                     return val;
                 }
@@ -946,7 +992,7 @@ static const_eval_node(node) {
             return peek(vbuf + vs + 1);
         }
         // Decimal integer.
-        for (i = 0; i < vl; i = i + 1) {
+        for (i = 0; i < vl; i++) {
             ch = peek(vbuf + vs + i);
             val = val * 10 + ch - 48;
         }
@@ -1033,7 +1079,7 @@ static const_eval_call(node) {
     args_arr = nd.b;
     acnt = nd.c;
     save = arr_len(ev_names);
-    for (j = 0; j < cpcnt; j = j + 1) {
+    for (j = 0; j < cpcnt; j++) {
         arg_val = const_eval_node(args_arr[j]);
         enum_register(cparams[j], arg_val);
     }
@@ -1047,18 +1093,18 @@ static const_eval_call(node) {
 // Look up a const function by packed name. Returns index or -1.
 static const_find_fn(name_p) {
     auto i, b;
-    for (i = 0; i < cf_count; i = i + 1) {
+    for (i = 0; i < cf_count; i++) {
         b = arr_get(cf_names, i);
         if (packed_eq(b, name_p)) { return i; }
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Evaluate the body of a const function. Walks statements looking for
 // T_RET (returns its value) and T_IF (evaluates condition, walks branch).
 static const_eval_body(body, bcnt) {
     auto i, stmt: Node, t, cond;
-    for (i = 0; i < bcnt; i = i + 1) {
+    for (i = 0; i < bcnt; i++) {
         stmt = body[i];
         t = stmt.ntype;
         if (t == T_RET) {
@@ -1111,7 +1157,7 @@ static void parse_const() {
         cf_pcnts = arr_push(cf_pcnts, pcnt);
         cf_bodies = arr_push(cf_bodies, body);
         cf_bcnts = arr_push(cf_bcnts, bcnt);
-        cf_count = cf_count + 1;
+        cf_count++;
         return;
     }
 
@@ -1148,7 +1194,7 @@ static void parse_enum() {
         // Semantically identical today — enum_register delegates to
         // add_enum_val until Phase B.2 moves the body.
         enum_register(member_p, val);
-        val = val + 1;
+        val++;
         if (val_is_ch(',')) { consume(); }
     }
     consume();
@@ -1188,7 +1234,7 @@ static void parse_function(is_stub, is_static, is_void) {
         try_type_annotation(var_p);
         ph_arr[ph_cnt] = _prim_hint;
         if (_prim_hint > 0) { has_hints = 1; }
-        ph_cnt = ph_cnt + 1;
+        ph_cnt++;
         if (val_is_ch(',')) { consume(); }
     }
     consume();
@@ -1292,7 +1338,7 @@ static void parse_function(is_stub, is_static, is_void) {
     //    with real bodies. This is likely a bug. Emit W015.
     auto _dup_idx, _dup_found;
     _dup_found = 0;
-    for (_dup_idx = 0; _dup_idx < func_cnt; _dup_idx = _dup_idx + 1) {
+    for (_dup_idx = 0; _dup_idx < func_cnt; _dup_idx++) {
         if (packed_eq(*(funcs[_dup_idx] + FN_NAME), name_p)) {
             auto _existing_body;
             _existing_body = *(funcs[_dup_idx] + FN_BODY);
@@ -1500,11 +1546,11 @@ void parse_module(tok_end) {
 // Parse a brace-enclosed or single-statement body.
 // Stash for 'for' loop desugar: parse_for sets this to the init statement,
 // and parse_body inserts it before the while node.
-auto _for_init;
+static auto _for_init;
 
 static parse_body() {
     auto stmt;
-    _block_depth = _block_depth + 1;
+    _block_depth++;
     list_begin();
     if (val_is_ch('{')) {
         consume();
@@ -1521,7 +1567,7 @@ static parse_body() {
         if (_for_init != 0) { list_push(_for_init); }
         list_push(stmt);
     }
-    _block_depth = _block_depth - 1;
+    _block_depth--;
     return list_end();
 }
 
@@ -1716,7 +1762,7 @@ static parse_switch() {
             arm_values[arm_count * 2 + 1] = vcnt;
             arm_bodies[arm_count * 2] = body;
             arm_bodies[arm_count * 2 + 1] = bcnt;
-            arm_count = arm_count + 1;
+            arm_count++;
         }
     }
     consume();   // eat '}'
@@ -1768,7 +1814,7 @@ static parse_statement() {
             try_type_annotation(var_p);
             dh_arr[dh_cnt] = _prim_hint;
             if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
-            dh_cnt = dh_cnt + 1;
+            dh_cnt++;
             while (val_is_ch(';') == 0) {
                 if (val_is_ch(',')) { consume(); }
                 var_p = cur_packed();
@@ -1777,7 +1823,7 @@ static parse_statement() {
                 try_type_annotation(var_p);
                 dh_arr[dh_cnt] = _prim_hint;
                 if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
-                dh_cnt = dh_cnt + 1;
+                dh_cnt++;
             }
             consume();
             node = make_node(T_DECL);
@@ -2009,7 +2055,7 @@ static parse_binops(left, min_prec) {
                     else if (c0 == '|' && lit_val == 0) { peep_node = left; peep_ok = 1; }
                     else if (c0 == '^' && lit_val == 0) { peep_node = left; peep_ok = 1; }
                     else if (c0 == '&' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
-                    else if (c0 == '&' && lit_val == 0 - 1) { peep_node = left; peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == -1) { peep_node = left; peep_ok = 1; }
                     // Strength reduction — right side power-of-2 literal.
                     // `x * 2^k` → `x << k`. Unsigned semantics — for /
                     // we don't reduce because signed arithmetic shift
@@ -2018,12 +2064,12 @@ static parse_binops(left, min_prec) {
                     else if (c0 == '*' && lit_val > 0 && (lit_val & (lit_val - 1)) == 0) {
                         auto k, shl_start;
                         k = 0;
-                        while (lit_val > 1) { lit_val = lit_val / 2; k = k + 1; }
+                        while (lit_val > 1) { lit_val /= 2; k++; }
                         // Build packed "<<" operator on vbuf.
                         shl_start = vbuf_pos;
                         poke(vbuf + vbuf_pos, '<');
                         poke(vbuf + vbuf_pos + 1, '<');
-                        vbuf_pos = vbuf_pos + 2;
+                        vbuf_pos += 2;
                         peep_node = make_node(T_BINOP);
                         pn_wr = peep_node;
                         pn_wr.a = pack(shl_start, 2);
@@ -2037,7 +2083,7 @@ static parse_binops(left, min_prec) {
                         auto and_start;
                         and_start = vbuf_pos;
                         poke(vbuf + vbuf_pos, '&');
-                        vbuf_pos = vbuf_pos + 1;
+                        vbuf_pos++;
                         peep_node = make_node(T_BINOP);
                         pn_wr = peep_node;
                         pn_wr.a = pack(and_start, 1);
@@ -2062,7 +2108,7 @@ static parse_binops(left, min_prec) {
                     else if (c0 == '|' && lit_val == 0) { peep_node = right; peep_ok = 1; }
                     else if (c0 == '^' && lit_val == 0) { peep_node = right; peep_ok = 1; }
                     else if (c0 == '&' && lit_val == 0) { peep_node = make_int_lit(0); peep_ok = 1; }
-                    else if (c0 == '&' && lit_val == 0 - 1) { peep_node = right; peep_ok = 1; }
+                    else if (c0 == '&' && lit_val == -1) { peep_node = right; peep_ok = 1; }
                 }
                 // Note: `2 * x` is NOT strength-reduced here — ops that
                 // involve evaluating `x` only once would be safe, but
@@ -2155,7 +2201,7 @@ static resolve_dot(base_node, name_p) {
         fsl = ty_slice(fhint);
         if (fsl >= SL_BIT && fsl <= SL_BIT7) {
             fbo = get_field_bit_off(vtype, field_p);
-            fhint = fhint + fbo * 256;
+            fhint += fbo * 256;
         }
         // Build: mem_load(ptr: binop(base + offset), hint: fhint)
         plus_op = make_plus_op();
@@ -2207,8 +2253,20 @@ static parse_expr() {
             left = parse_unary();
             return maybe_ternary(parse_binops(left, 0));
         }
+        // Prefix increment / decrement: ++x → x++, --x → x--.
+        if (val_is("++", 2)) { consume(); return _make_inc_assign(parse_primary(), '+'); }
+        if (val_is("--", 2)) { consume(); return _make_inc_assign(parse_primary(), '-'); }
     }
     left = parse_primary();
+    // Postfix increment / decrement: x++ / x--.
+    if (val_is("++", 2)) { consume(); return _make_inc_assign(left, '+'); }
+    if (val_is("--", 2)) { consume(); return _make_inc_assign(left, '-'); }
+    // Compound assignment: x += e, x -= e, x *= e, x /= e, x %= e.
+    if (val_is("+=", 2)) { consume(); return _make_compound_assign('+', left, parse_expr()); }
+    if (val_is("-=", 2)) { consume(); return _make_compound_assign('-', left, parse_expr()); }
+    if (val_is("*=", 2)) { consume(); return _make_compound_assign('*', left, parse_expr()); }
+    if (val_is("/=", 2)) { consume(); return _make_compound_assign('/', left, parse_expr()); }
+    if (val_is("%=", 2)) { consume(); return _make_compound_assign('%', left, parse_expr()); }
     // Assignment: var = expr or var.field = expr
     if (val_is_ch('=')) {
         consume();
@@ -2307,7 +2365,7 @@ static parse_primary() {
                 shl_start = vbuf_pos;
                 poke(vbuf + vbuf_pos, '<');
                 poke(vbuf + vbuf_pos + 1, '<');
-                vbuf_pos = vbuf_pos + 2;
+                vbuf_pos += 2;
                 shl_node = make_node(T_BINOP);
                 shl_node.a = pack(shl_start, 2);
                 shl_node.b = old_arg;
@@ -2346,8 +2404,8 @@ static parse_primary() {
                 diag_newline();
             }
             // Create packed operator strings by writing to vbuf.
-            poke(vbuf + vbuf_pos, 42); op_mul = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;
-            poke(vbuf + vbuf_pos, 43); op_add = pack(vbuf_pos, 1); vbuf_pos = vbuf_pos + 1;
+            poke(vbuf + vbuf_pos, 42); op_mul = pack(vbuf_pos, 1); vbuf_pos++;
+            poke(vbuf + vbuf_pos, 43); op_add = pack(vbuf_pos, 1); vbuf_pos++;
             // Build: *(node + idx_node * 8)
             mul_node = make_node(T_BINOP);
             mul_node.a = op_mul;

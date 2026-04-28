@@ -1,0 +1,281 @@
+// types.bpp — Type inference engine for the B++ compiler.
+// Walks the AST bottom-up and annotates each node's itype field
+// with the smallest type that fits the value.
+//
+// Type codes (from defs.bpp):
+//   TY_UNKNOWN=0  TY_BYTE=1  TY_HALF=2  TY_WORD=3  TY_LONG=4  TY_PTR=5
+//
+// Rules:
+//   - Literals: sized by value (0-255=byte, 0-65535=half, 0-4G=word, else long)
+//   - Strings: always ptr
+//   - Variables: largest type seen across all assignments
+//   - Binary ops: promote to larger operand (ptr wins everything)
+//   - Assignments: right-hand side determines variable type
+//   - mem_load: returns long (all B++ memory slots are 64-bit)
+//   - Calls: return type from known table (malloc=ptr, peek=byte, etc.)
+//   - Explicit type hints (word x): override inference
+//
+// Usage: call add_type(node) on every statement in a function body.
+// The symbol table (var_types) tracks variable types across statements.
+
+import "defs.bpp";
+
+// Symbol table: parallel arrays of packed name and type code.
+// Supports up to 256 variables per function scope.
+auto vt_names, vt_types, vt_count;
+
+// Known function return types: parallel arrays of packed name and type code.
+// Populated before inference runs, from extern declarations and first pass.
+auto ft_names, ft_types, ft_count;
+
+// Initialize the type inference engine. Call once at startup.
+init_types() {
+    vt_names = malloc(2048);
+    vt_types = malloc(2048);
+    vt_count = 0;
+    ft_names = malloc(2048);
+    ft_types = malloc(2048);
+    ft_count = 0;
+    return 0;
+}
+
+// Reset the variable table for a new function scope.
+reset_scope() {
+    vt_count = 0;
+    return 0;
+}
+
+// Look up a variable's type by packed name. Returns TY_UNKNOWN if not found.
+var_type(name_p) {
+    auto i;
+    i = 0;
+    while (i < vt_count) {
+        if (*(vt_names + i * 8) == name_p) {
+            return *(vt_types + i * 8);
+        }
+        i = i + 1;
+    }
+    return TY_UNKNOWN;
+}
+
+// Set a variable's type. If the variable exists, promote to the larger type.
+set_var_type(name_p, ty) {
+    auto i, old;
+    i = 0;
+    while (i < vt_count) {
+        if (*(vt_names + i * 8) == name_p) {
+            old = *(vt_types + i * 8);
+            if (ty > old) { *(vt_types + i * 8) = ty; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    // New variable: append to table.
+    *(vt_names + vt_count * 8) = name_p;
+    *(vt_types + vt_count * 8) = ty;
+    vt_count = vt_count + 1;
+    return 0;
+}
+
+// Register a known function return type (call before inference).
+set_func_type(name_p, ty) {
+    *(ft_names + ft_count * 8) = name_p;
+    *(ft_types + ft_count * 8) = ty;
+    ft_count = ft_count + 1;
+    return 0;
+}
+
+// Look up a function return type by packed name. Returns TY_LONG if not found.
+func_type(name_p) {
+    auto i;
+    i = 0;
+    while (i < ft_count) {
+        if (*(ft_names + i * 8) == name_p) {
+            return *(ft_types + i * 8);
+        }
+        i = i + 1;
+    }
+    return TY_LONG;
+}
+
+// Return the larger of two type codes. Ptr wins over everything.
+promote(a, b) {
+    if (a == TY_PTR) { return TY_PTR; }
+    if (b == TY_PTR) { return TY_PTR; }
+    if (a > b) { return a; }
+    return b;
+}
+
+// Infer the type of a literal value string at (start, len) in vbuf.
+// Parses the numeric value and returns the smallest fitting type.
+type_of_lit(vstart, vlen) {
+    auto ch, val, i, is_hex;
+    // String literal: always a pointer.
+    ch = peek(vstart);
+    if (ch == '"') { return TY_PTR; }
+    // Hex literal: parse after 0x prefix.
+    val = 0;
+    is_hex = 0;
+    if (vlen > 2) {
+        if (peek(vstart) == '0') {
+            if (peek(vstart + 1) == 'x') { is_hex = 1; }
+        }
+    }
+    if (is_hex) {
+        i = 2;
+        while (i < vlen) {
+            ch = peek(vstart + i);
+            val = val * 16;
+            if (ch >= 48) { if (ch <= 57) { val = val + ch - 48; } }
+            if (ch >= 65) { if (ch <= 70) { val = val + ch - 55; } }
+            if (ch >= 97) { if (ch <= 102) { val = val + ch - 87; } }
+            i = i + 1;
+        }
+    } else {
+        i = 0;
+        while (i < vlen) {
+            val = val * 10 + peek(vstart + i) - 48;
+            i = i + 1;
+        }
+    }
+    if (val <= 255) { return TY_BYTE; }
+    if (val <= 65535) { return TY_HALF; }
+    if (val <= 0xFFFFFFFF) { return TY_WORD; }
+    return TY_LONG;
+}
+
+// Forward declaration for mutual recursion.
+add_type(nd) { return 0; }
+
+// Infer types for a list of statements (function body or block).
+add_type_list(arr, cnt) {
+    auto i;
+    i = 0;
+    while (i < cnt) {
+        add_type(*(arr + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Walk an AST node bottom-up and write inferred type to the itype field.
+// Returns the inferred type code.
+add_type(nd) {
+    auto t, ty, lt, rt, name_p, arr, cnt, hint, i;
+    auto n: Node, lhs: Node;
+    if (nd == 0) { return TY_UNKNOWN; }
+    n = nd;
+    t = n.ntype;
+
+    // Literal: type depends on value magnitude.
+    if (t == T_LIT) {
+        ty = type_of_lit(unpack_s(n.a), unpack_l(n.a));
+        n.itype = ty;
+        return ty;
+    }
+
+    // Variable: look up from symbol table.
+    if (t == T_VAR) {
+        ty = var_type(n.a);
+        n.itype = ty;
+        return ty;
+    }
+
+    // Binary operator: promote to larger operand type.
+    if (t == T_BINOP) {
+        lt = add_type(n.b);
+        rt = add_type(n.c);
+        ty = promote(lt, rt);
+        n.itype = ty;
+        return ty;
+    }
+
+    // Unary operator: same type as operand.
+    if (t == T_UNARY) {
+        ty = add_type(n.b);
+        n.itype = ty;
+        return ty;
+    }
+
+    // Assignment: right-hand side sets variable type.
+    if (t == T_ASSIGN) {
+        rt = add_type(n.b);
+        add_type(n.a);
+        // Update variable type if left side is a var node.
+        lhs = n.a;
+        if (lhs.ntype == T_VAR) {
+            set_var_type(lhs.a, rt);
+        }
+        n.itype = rt;
+        return rt;
+    }
+
+    // Memory load: dereference always returns long (64-bit slots).
+    if (t == T_MEMLD) {
+        add_type(n.a);
+        n.itype = TY_LONG;
+        return TY_LONG;
+    }
+
+    // Memory store: process both pointer and value.
+    if (t == T_MEMST) {
+        add_type(n.a);
+        add_type(n.b);
+        n.itype = TY_UNKNOWN;
+        return TY_UNKNOWN;
+    }
+
+    // Function call: return type from known function table.
+    if (t == T_CALL) {
+        // Process arguments first.
+        add_type_list(n.b, n.c);
+        ty = func_type(n.a);
+        n.itype = ty;
+        return ty;
+    }
+
+    // Return statement: type of the returned expression.
+    if (t == T_RET) {
+        ty = add_type(n.a);
+        n.itype = ty;
+        return ty;
+    }
+
+    // Declaration with optional type hint.
+    if (t == T_DECL) {
+        hint = n.c;
+        if (hint > 0) {
+            arr = n.a;
+            cnt = n.b;
+            i = 0;
+            while (i < cnt) {
+                set_var_type(*(arr + i * 8), hint);
+                i = i + 1;
+            }
+        }
+        n.itype = TY_UNKNOWN;
+        return TY_UNKNOWN;
+    }
+
+    // If statement: process condition, body, and optional else body.
+    if (t == T_IF) {
+        add_type(n.a);
+        add_type_list(n.b, n.c);
+        if (n.e > 0) {
+            add_type_list(n.d, n.e);
+        }
+        n.itype = TY_UNKNOWN;
+        return TY_UNKNOWN;
+    }
+
+    // While loop: process condition and body.
+    if (t == T_WHILE) {
+        add_type(n.a);
+        add_type_list(n.b, n.c);
+        n.itype = TY_UNKNOWN;
+        return TY_UNKNOWN;
+    }
+
+    n.itype = TY_UNKNOWN;
+    return TY_UNKNOWN;
+}

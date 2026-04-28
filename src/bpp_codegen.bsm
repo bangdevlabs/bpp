@@ -369,6 +369,13 @@ struct ChipPrimitives {
     emit_narrow_float_params, // (par_cnt) — a64 half/quarter fcvt pass, no-op on x64
     emit_implicit_ret_zero,   // () — mov return_reg, 0 for fallthrough return
     emit_body,                // (body_arr, body_cnt) — chip's body walker delegation
+
+    // Float pointer builtins (pokefloat / pokefloat_h).
+    emit_coerce_int_to_float, // () — x0/rax → d0/xmm0. Used when val arg is an integer.
+    emit_float_store_scalar,  // (fh_sl, val_reg) — store float reg val_reg at [acc].
+                              //   fh_sl ∈ {SL_HALF=32-bit, SL_FULL=64-bit}.
+                              //   x86_64 limitation: SL_HALF stores bitcast bits (wrong for
+                              //   sub-word float); full fix needs cvtsd2ss + movss.
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -381,7 +388,7 @@ struct ChipPrimitives {
 // init overwrites the first chip's slots. That's by design — the
 // active target is whatever was initialised last, and bpp.bpp
 // orders the inits to match the requested target triple.
-auto cg_prim;
+extrn cg_prim;
 
 // Allocate cg_prim if it hasn't been yet. Idempotent — both
 // init_codegen_<chip>() functions guard their own population
@@ -545,16 +552,16 @@ cg_emit_unary(op_packed, operand_ty) {
 // Switch-analysis state used by the dense jump-table pass. Set
 // by `switch_is_dense` (portable analysis, moves in Phase 2),
 // consumed by the chip-specific `emit_switch_jtbl`.
-auto cg_sw_min;     // Lowest arm value seen (signed 64-bit).
-auto cg_sw_max;     // Highest arm value seen.
-auto cg_sw_total;   // Total count of arm values.
+extrn cg_sw_min;     // Lowest arm value seen (signed 64-bit).
+extrn cg_sw_max;     // Highest arm value seen.
+extrn cg_sw_total;   // Total count of arm values.
 
 // Parser's string buffer — every identifier and literal lives as
 // a packed (offset, length) into this buffer. Shared across chips
 // so the source-reading helpers below (cg_str_eq, cg_parse_int,
 // etc.) don't need the chip prefix. Set once by bridge_data at
 // codegen entry, read-only thereafter.
-auto cg_sbuf;
+global cg_sbuf;
 
 // ── Portable helpers: packed-string utilities ────────────────
 //
@@ -583,7 +590,7 @@ cg_str_eq_packed(a, b) {
     i = 0;
     while (i < al) {
         if (peek(cg_sbuf + as + i) != peek(cg_sbuf + bs + i)) { return 0; }
-        i = i + 1;
+        i++;
     }
     return 1;
 }
@@ -601,18 +608,18 @@ cg_parse_int(p) {
             if (peek(cg_sbuf + s + 1) == 'x' | peek(cg_sbuf + s + 1) == 'X') {
                 i = 2;
                 while (i < l) {
-                    ch = peek(cg_sbuf + s + i); val = val * 16;
-                    if (ch >= '0' && ch <= '9') { val = val + ch - '0'; }
-                    if (ch >= 'A' && ch <= 'F') { val = val + ch - 55; }
-                    if (ch >= 'a' && ch <= 'f') { val = val + ch - 87; }
-                    i = i + 1;
+                    ch = peek(cg_sbuf + s + i); val *= 16;
+                    if (ch >= '0' && ch <= '9') { val += ch - '0'; }
+                    if (ch >= 'A' && ch <= 'F') { val += ch - 55; }
+                    if (ch >= 'a' && ch <= 'f') { val += ch - 87; }
+                    i++;
                 }
                 return val;
             }
         }
     }
     // Decimal.
-    while (i < l) { ch = peek(cg_sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
+    while (i < l) { ch = peek(cg_sbuf + s + i); val = val * 10 + ch - '0'; i++; }
     return val;
 }
 
@@ -625,7 +632,7 @@ cg_is_float_lit(p) {
     i = 0;
     while (i < l) {
         if (peek(cg_sbuf + s + i) == '.') { return 1; }
-        i = i + 1;
+        i++;
     }
 }
 
@@ -645,11 +652,11 @@ cg_is_float_lit(p) {
 //   cg_var_addr_taken    1 if address-of operator applied
 //   cg_var_promote       register assigned by B3, or -1
 
-auto cg_vars;
-auto cg_var_stack, cg_var_struct_idx, cg_var_off, cg_var_forced_ty;
-auto cg_var_refs;
-auto cg_var_addr_taken;
-auto cg_var_promote;
+global cg_vars;
+global cg_var_stack, cg_var_struct_idx, cg_var_off, cg_var_forced_ty;
+global cg_var_refs;
+global cg_var_addr_taken;
+global cg_var_promote;
 
 // Add a variable to the current scope. Initialises all parallel
 // arrays to their defaults and returns the fresh slot index.
@@ -657,12 +664,12 @@ cg_var_add(name_p) {
     auto idx; idx = arr_len(cg_vars);
     cg_vars = arr_push(cg_vars, name_p);
     cg_var_stack = arr_push(cg_var_stack, 0);
-    cg_var_struct_idx = arr_push(cg_var_struct_idx, 0 - 1);
+    cg_var_struct_idx = arr_push(cg_var_struct_idx, -1);
     cg_var_off = arr_push(cg_var_off, 0);
     cg_var_forced_ty = arr_push(cg_var_forced_ty, 0);
     cg_var_refs = arr_push(cg_var_refs, 0);
     cg_var_addr_taken = arr_push(cg_var_addr_taken, 0);
-    cg_var_promote = arr_push(cg_var_promote, 0 - 1);
+    cg_var_promote = arr_push(cg_var_promote, -1);
     return idx;
 }
 
@@ -671,7 +678,7 @@ cg_var_idx(name_p) {
     auto i; i = 0;
     while (i < arr_len(cg_vars)) {
         if (cg_str_eq_packed(name_p, arr_get(cg_vars, i))) { return i; }
-        i = i + 1;
+        i++;
     }
     return -1;
 }
@@ -704,9 +711,9 @@ cg_var_find(name_p) {
 //   cg_ex_args    extern arg-type arrays
 //   cg_ex_acnt    extern arg counts
 
-auto cg_fn_name, cg_fn_par, cg_fn_pcnt, cg_fn_body, cg_fn_bcnt, cg_fn_fidx;
-auto cg_gl_name;
-auto cg_ex_name, cg_ex_ret, cg_ex_args, cg_ex_acnt;
+global cg_fn_name, cg_fn_par, cg_fn_pcnt, cg_fn_body, cg_fn_bcnt, cg_fn_fidx;
+global cg_gl_name;
+global cg_ex_name, cg_ex_ret, cg_ex_args, cg_ex_acnt;
 
 // Find a B++ function's emitter index by packed name.
 // Returns -1 if not declared.
@@ -714,7 +721,7 @@ cg_find_fn(name_p) {
     auto i; i = 0;
     while (i < arr_len(cg_fn_name)) {
         if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, i))) { return i; }
-        i = i + 1;
+        i++;
     }
     return -1;
 }
@@ -725,9 +732,9 @@ cg_find_ext(name_p) {
     auto i; i = 0;
     while (i < arr_len(cg_ex_name)) {
         if (cg_str_eq_packed(name_p, arr_get(cg_ex_name, i))) { return i; }
-        i = i + 1;
+        i++;
     }
-    return 0 - 1;
+    return -1;
 }
 
 // Find an extern declaration by packed name AND argument count.
@@ -740,7 +747,7 @@ cg_find_ext_by_argc(name_p, argc) {
         if (cg_str_eq_packed(name_p, arr_get(cg_ex_name, i))) {
             if (arr_get(cg_ex_acnt, i) == argc) { return i; }
         }
-        i = i + 1;
+        i++;
     }
     return cg_find_ext(name_p);
 }
@@ -813,26 +820,26 @@ cg_b3_walk(nd) {
     T_TERNARY  { cg_b3_walk(n.a); cg_b3_walk(n.b); cg_b3_walk(n.c); }
     T_CALL {
         arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
     T_IF {
         cg_b3_walk(n.a);
         arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
         if (n.e > 0) {
             arr = n.d; cnt = n.e;
-            for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+            for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
         }
     }
     T_WHILE {
         cg_b3_walk(n.a);
         arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
         if (n.e != 0) { cg_b3_walk(n.e); }
     }
     T_BLOCK {
         arr = n.b; cnt = n.c;
-        for (i = 0; i < cnt; i = i + 1) { cg_b3_walk(arr[i]); }
+        for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
     }
     else { }
     }
@@ -867,16 +874,16 @@ cg_b3_walk(nd) {
 //   cg_cur_fn_name       packed name of the function being emitted
 //   cg_cur_fn_idx        parser funcs[] index for type queries
 
-auto cg_flt_tbl;
-auto cg_str_tbl;
-auto cg_lbl_cnt, cg_depth;
-auto cg_break_stack;
-auto cg_continue_stack;
-auto cg_cur_fn_name, cg_cur_fn_idx;
+global cg_flt_tbl;
+global cg_str_tbl;
+global cg_lbl_cnt, cg_depth;
+global cg_break_stack;
+global cg_continue_stack;
+extrn cg_cur_fn_name, cg_cur_fn_idx;
 
 // Allocate a fresh label ID. Monotonic across the whole codegen
 // pass — each call returns a distinct integer.
-cg_new_lbl() { auto l; l = cg_lbl_cnt; cg_lbl_cnt = cg_lbl_cnt + 1; return l; }
+cg_new_lbl() { auto l; l = cg_lbl_cnt; cg_lbl_cnt++; return l; }
 
 // Inferred type code of a local variable. Looks up the slot's
 // packed name in the parser's per-function type map.
@@ -921,7 +928,7 @@ void cg_bridge_data() {
     while (i < func_cnt) {
         // Lazy emit: skip functions not reachable from main.
         if (_lazy_emit_ready) {
-            if (arr_get(fn_reachable, i) == 0) { i = i + 1; continue; }
+            if (arr_get(fn_reachable, i) == 0) { i++; continue; }
         }
         rec = *(funcs + i * 8);
         name_p = *(rec + FN_NAME);
@@ -929,7 +936,7 @@ void cg_bridge_data() {
         j = 0;
         while (j < arr_len(cg_fn_name)) {
             if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, j))) { idx = j; }
-            j = j + 1;
+            j++;
         }
         if (idx < 0) {
             idx = arr_len(cg_fn_name);
@@ -948,7 +955,7 @@ void cg_bridge_data() {
             arr_set(cg_fn_bcnt, idx, *(rec + FN_BCNT));
             arr_set(cg_fn_fidx, idx, i);
         }
-        i = i + 1;
+        i++;
     }
 
     // Globals — dedup by name; each unique name gets one data slot.
@@ -960,12 +967,12 @@ void cg_bridge_data() {
         j = 0;
         while (j < arr_len(cg_gl_name)) {
             if (cg_str_eq_packed(name_p, arr_get(cg_gl_name, j))) { idx = j; }
-            j = j + 1;
+            j++;
         }
         if (idx < 0) {
             cg_gl_name = arr_push(cg_gl_name, name_p);
         }
-        i = i + 1;
+        i++;
     }
 
     // Externs — FFI declarations. No dedup (multiple signatures
@@ -979,7 +986,7 @@ void cg_bridge_data() {
         cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
         cg_ex_args = arr_push(cg_ex_args, *(rec + EX_ARGS));
         cg_ex_acnt = arr_push(cg_ex_acnt, *(rec + EX_ACNT));
-        i = i + 1;
+        i++;
     }
 }
 
@@ -991,14 +998,14 @@ void cg_bridge_data() {
 // against those slots. Shared across chips because the names come
 // from the parser's globals array, which is chip-agnostic.
 
-auto cg_argc_sym, cg_argv_sym, cg_envp_sym;
+global cg_argc_sym, cg_argv_sym, cg_envp_sym;
 
 // Scan the parser's globals table for the three brt0-declared
 // names and record their packed pointers. Called once after
 // cg_bridge_data() during the codegen init sequence.
 void cg_bind_startup_syms() {
     auto i, name_p;
-    for (i = 0; i < glob_cnt; i = i + 1) {
+    for (i = 0; i < glob_cnt; i++) {
         name_p = *(globals + i * 8);
         switch {
             cg_str_eq(name_p, "_bpp_argc", 9) { cg_argc_sym = name_p; }
@@ -1017,10 +1024,10 @@ cg_switch_is_dense(sw_arms, sw_cnt) {
     cg_sw_min = 0;
     cg_sw_max = 0;
     cg_sw_total = 0;
-    for (si = 0; si < sw_cnt; si = si + 1) {
+    for (si = 0; si < sw_cnt; si++) {
         sv_arr = sw_arms[si * 2];
         sv_cnt = sw_arms[si * 2 + 1];
-        for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+        for (sk = 0; sk < sv_cnt; sk++) {
             node = sv_arr[sk];
             if (node.ntype != T_LIT) { return 0; }
             val = cg_parse_int(node.a);
@@ -1032,7 +1039,7 @@ cg_switch_is_dense(sw_arms, sw_cnt) {
                 if (val < cg_sw_min) { cg_sw_min = val; }
                 if (val > cg_sw_max) { cg_sw_max = val; }
             }
-            cg_sw_total = cg_sw_total + 1;
+            cg_sw_total++;
         }
     }
     if (cg_sw_total < 3) { return 0; }
@@ -1109,6 +1116,128 @@ cg_builtin_dispatch(n) {
         call(p.emit_pop_scratch);
         call(p.emit_mem_write, 1, 1);          // val_reg=1 (scratch) width=1
         return 1;
+    }
+
+    // Built-in: peek_q(addr) — load 2 bytes (quarter-word, 16-bit) from [addr].
+    // Emits LDRH (ARM64) / MOVZX ax, word [ptr] (x86_64). Zero-extends to 64-bit.
+    if (cg_str_eq(n.a, "peek_q", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_mem_read, 2);
+        return 1;
+    }
+
+    // Built-in: peek_h(addr) — load 4 bytes (half-word, 32-bit) from [addr].
+    // Emits LDR W (ARM64) / MOV eax, [ptr] (x86_64). Zero-extends to 64-bit.
+    if (cg_str_eq(n.a, "peek_h", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_mem_read, 4);
+        return 1;
+    }
+
+    // Built-in: peek_w(addr) — load 8 bytes (word, 64-bit) from [addr].
+    // Emits LDR X (ARM64) / MOV rax, [ptr] (x86_64).
+    if (cg_str_eq(n.a, "peek_w", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_mem_read, 8);
+        return 1;
+    }
+
+    // Built-in: poke_q(addr, val) — store 2 bytes (quarter-word, 16-bit) at [addr].
+    // Emits STRH (ARM64). Only the low 16 bits of val are written.
+    if (cg_str_eq(n.a, "poke_q", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // val
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));  // addr
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);
+        call(p.emit_mem_write, 1, 2);
+        return 1;
+    }
+
+    // Built-in: poke_h(addr, val) — store 4 bytes (half-word, 32-bit) at [addr].
+    // Emits STR W (ARM64). Only the low 32 bits of val are written.
+    if (cg_str_eq(n.a, "poke_h", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // val
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));  // addr
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);
+        call(p.emit_mem_write, 1, 4);
+        return 1;
+    }
+
+    // Built-in: poke_w(addr, val) — store 8 bytes (word, 64-bit) at [addr].
+    // Emits STR X (ARM64).
+    if (cg_str_eq(n.a, "poke_w", 6)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // val
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));  // addr
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);
+        call(p.emit_mem_write, 1, 8);
+        return 1;
+    }
+
+    // Built-in: pokefloat(addr, val) — store 64-bit float (double) at [addr].
+    // val must evaluate as float. Emits STR D (ARM64) / MOVSD [rax] (x86_64).
+    if (cg_str_eq(n.a, "pokefloat", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));   // val → d0/xmm0
+        if (ety == 0) { call(p.emit_coerce_int_to_float); }
+        call(p.emit_fpush, 0);
+        ety = call(p.emit_node, *(arr + 0));   // addr → x0/rax
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_fpop, 1);
+        call(p.emit_float_store_scalar, SL_FULL, 1);
+        return 1;
+    }
+
+    // Built-in: pokefloat_h(addr, val) — store 32-bit float (half float) at [addr].
+    // ARM64: FCVT s1, d1 + STR S (correct). x86_64: bitcast limitation (stores
+    // 64-bit double bits, not 32-bit float bits). Fix when cvtsd2ss is available.
+    if (cg_str_eq(n.a, "pokefloat_h", 11)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));   // val → d0/xmm0
+        if (ety == 0) { call(p.emit_coerce_int_to_float); }
+        call(p.emit_fpush, 0);
+        ety = call(p.emit_node, *(arr + 0));   // addr → x0/rax
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_fpop, 1);
+        call(p.emit_float_store_scalar, SL_HALF, 1);
+        return 1;
+    }
+
+    // Built-in: peekfloat(addr) — load 8 bytes as 64-bit float (double) from [addr].
+    // Emits LDR D (ARM64) / MOVSD xmm0, [ptr] (x86_64). Result in float reg (d0/xmm0).
+    // Native-endian (LE). For BE float data, load with peek_w and reinterpret bits.
+    if (cg_str_eq(n.a, "peekfloat", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        return call(p.emit_memld_load, TY_FLOAT) + 1;    // +1: ety (0=int,1=float) → dispatch ret (1=int,2=float)
+    }
+
+    // Built-in: peekfloat_h(addr) — load 4 bytes as 32-bit float (half float) from [addr].
+    // Emits LDR S + FCVT D (ARM64) — loads single, widens to double in d0.
+    // x86_64: MOVSS xmm0 + CVTSS2SD. Result in float reg.
+    // Native-endian (LE). For BE float data, load with peek_h, apply byteswap, then cast.
+    if (cg_str_eq(n.a, "peekfloat_h", 11)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        return call(p.emit_memld_load, TY_FLOAT_H) + 1;  // +1: same ety→dispatch convention
     }
 
     // Built-in: str_peek(s, i) — byte at s[i]. Same semantic as
@@ -1560,7 +1689,7 @@ void cg_emit_func(fi) {
             ph = *(hints + i * 8);
             if (ph > 0) { arr_set(cg_var_forced_ty, pvi, ph); }
         }
-        i = i + 1;
+        i++;
     }
 
     // 6. Pre-register body-declared variables and compute offsets.
@@ -1568,7 +1697,7 @@ void cg_emit_func(fi) {
     total = call(p.fn_compute_offsets);
 
     // 7. B3 reference walk and register-promotion selection.
-    for (i = 0; i < body_cnt; i = i + 1) {
+    for (i = 0; i < body_cnt; i++) {
         stmt_i = body_arr[i];
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
     }
@@ -1591,12 +1720,12 @@ void cg_emit_func(fi) {
     i = 0;
     while (i < par_cnt) {
         call(p.emit_arg_copy_int, i, arr_get(cg_var_off, i));
-        i = i + 1;
+        i++;
     }
 
     // 12. Zero any promoted local that is not also a parameter.
     n_vars = arr_len(cg_vars);
-    for (vi = par_cnt; vi < n_vars; vi = vi + 1) {
+    for (vi = par_cnt; vi < n_vars; vi++) {
         preg = arr_get(cg_var_promote, vi);
         if (preg >= 0) { call(p.emit_zero_reg, preg); }
     }
@@ -1915,7 +2044,7 @@ void cg_emit_stmt(nd) {
                     j = 0;
                     while (j < fc) {
                         call(p.emit_struct_copy_word, j * 8, off + j * 8);
-                        j = j + 1;
+                        j++;
                     }
                     return 0;
                 }
@@ -1994,7 +2123,7 @@ void cg_emit_stmt(nd) {
             call(p.emit_push_acc);
         }
 
-        for (si = 0; si < sw_cnt; si = si + 1) {
+        for (si = 0; si < sw_cnt; si++) {
             sv_arr = sw_arms[si * 2];
             sv_cnt = sw_arms[si * 2 + 1];
             sb_arr = sw_bodies[si * 2];
@@ -2008,7 +2137,7 @@ void cg_emit_stmt(nd) {
                 call(p.emit_branch_if_nonzero, smatch_lbl);
             } else {
                 // Form 1: compare saved cond against each arm value.
-                for (sk = 0; sk < sv_cnt; sk = sk + 1) {
+                for (sk = 0; sk < sv_cnt; sk++) {
                     call(p.emit_node, sv_arr[sk]);
                     call(p.emit_peek_cond);
                     call(p.emit_cmp_scratch_acc);
@@ -2019,7 +2148,7 @@ void cg_emit_stmt(nd) {
 
             call(p.emit_label, smatch_lbl);
             if (n.a != 0) { call(p.emit_pop_discard); }
-            for (sk = 0; sk < sb_cnt; sk = sk + 1) { cg_emit_stmt(sb_arr[sk]); }
+            for (sk = 0; sk < sb_cnt; sk++) { cg_emit_stmt(sb_arr[sk]); }
             call(p.emit_jump, sw_end_lbl);
 
             call(p.emit_label, snext_lbl);
@@ -2030,7 +2159,7 @@ void cg_emit_stmt(nd) {
 
         if (n.d != 0) {
             auto ek;
-            for (ek = 0; ek < n.e; ek = ek + 1) { cg_emit_stmt(n.d[ek]); }
+            for (ek = 0; ek < n.e; ek++) { cg_emit_stmt(n.d[ek]); }
         }
 
         call(p.emit_label, sw_end_lbl);

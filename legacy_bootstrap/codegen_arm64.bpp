@@ -1,0 +1,1397 @@
+// codegen.bpp — ARM64 code generator for B++ (macOS Apple Silicon).
+// Reads JSON IR from stdin (bpp_parser output), writes ARM64 assembly to stdout.
+// Pipeline: source.bpp | bpp_import | bpp_lexer | bpp_parser | bpp_codegen > out.s
+
+struct Node { ntype, a, b, c, d, e, f, g }
+
+auto T_LIT, T_VAR, T_BINOP, T_UNARY, T_ASSIGN;
+auto T_MEMLD, T_MEMST, T_CALL, T_IF, T_WHILE, T_RET, T_DECL, T_NOP;
+
+pack(s, l) { return s + (l * 0x100000000); }
+unpack_s(p) { return p % 0x100000000; }
+unpack_l(p) { return p / 0x100000000; }
+
+// ── String helpers ──
+
+out(s) {
+    auto i, ch;
+    i = 0; ch = str_peek(s, i);
+    while (ch != 0) { putchar(ch); i = i + 1; ch = str_peek(s, i); }
+    return 0;
+}
+
+buf_eq(a, b, len) {
+    auto i; i = 0;
+    while (i < len) {
+        if (peek(a + i) != str_peek(b, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+print_buf(start, len) {
+    auto i; i = 0;
+    while (i < len) { putchar(peek(start + i)); i = i + 1; }
+    return 0;
+}
+
+// Print a decimal integer to stdout.
+print_dec(n) {
+    auto buf, len, i;
+    if (n < 0) { putchar('-'); n = 0 - n; }
+    if (n == 0) { putchar('0'); return 0; }
+    buf = malloc(20); len = 0;
+    while (n > 0) { poke(buf + len, '0' + n % 10); len = len + 1; n = n / 10; }
+    i = len - 1;
+    while (i >= 0) { putchar(peek(buf + i)); i = i - 1; }
+    return 0;
+}
+
+// ── String buffer and packed string ops ──
+
+auto sbuf, sbuf_top;
+
+str_eq(p, lit, litlen) {
+    if (unpack_l(p) != litlen) { return 0; }
+    return buf_eq(sbuf + unpack_s(p), lit, litlen);
+}
+
+str_eq_packed(a, b) {
+    auto as, al, bs, bl, i;
+    al = unpack_l(a); bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    as = unpack_s(a); bs = unpack_s(b);
+    i = 0;
+    while (i < al) {
+        if (peek(sbuf + as + i) != peek(sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+print_p(p) { print_buf(sbuf + unpack_s(p), unpack_l(p)); return 0; }
+
+// ── JSON reader (same as emitter.bpp) ──
+
+auto jch;
+
+jnext() { jch = getchar(); return jch; }
+
+jskip() {
+    while (jch == ' ' | jch == '\n' | jch == '\r' | jch == '\t') { jnext(); }
+    return 0;
+}
+
+jexpect(c) {
+    jskip();
+    if (jch == c) { jnext(); return 1; }
+    return 0;
+}
+
+jread_str() {
+    auto start, len;
+    jnext(); start = sbuf_top; len = 0;
+    while (jch != '"') {
+        if (jch == -1) { return 0; }
+        if (jch == '\\') { jnext(); if (jch == 'n') { poke(sbuf + sbuf_top, '\n'); } else { poke(sbuf + sbuf_top, jch); } }
+        else { poke(sbuf + sbuf_top, jch); }
+        sbuf_top = sbuf_top + 1; len = len + 1; jnext();
+    }
+    jnext(); return pack(start, len);
+}
+
+jskip_str() {
+    jnext();
+    while (jch != '"') { if (jch == -1) { return 0; } if (jch == '\\') { jnext(); } jnext(); }
+    jnext(); return 0;
+}
+
+jskip_val() {
+    auto depth, stop;
+    jskip();
+    if (jch == '"') { jskip_str(); return 0; }
+    if (jch == '{' | jch == '[') {
+        depth = 1; jnext();
+        while (depth > 0) {
+            if (jch == '{' | jch == '[') { depth = depth + 1; }
+            if (jch == '}' | jch == ']') { depth = depth - 1; }
+            if (jch == '"') { jskip_str(); } else { jnext(); }
+        }
+        return 0;
+    }
+    stop = 0;
+    while (stop == 0) {
+        if (jch == ',' | jch == '}' | jch == ']' | jch == -1) { stop = 1; }
+        if (stop == 0) { jnext(); }
+    }
+    return 0;
+}
+
+jnext_key() {
+    jskip();
+    if (jch == ',') { jnext(); jskip(); }
+    jskip_str(); jskip(); jexpect(':'); jskip();
+    return 0;
+}
+
+// ── List builder ──
+
+auto tmp_arr, list_stack, list_sp, list_depth, last_list_cnt;
+
+list_begin() { *(list_stack + list_depth * 8) = list_sp; list_depth = list_depth + 1; return 0; }
+list_push(val) { *(tmp_arr + list_sp * 8) = val; list_sp = list_sp + 1; return 0; }
+
+list_end() {
+    auto saved, cnt, arr, i;
+    list_depth = list_depth - 1;
+    saved = *(list_stack + list_depth * 8);
+    cnt = list_sp - saved;
+    if (cnt == 0) { last_list_cnt = 0; list_sp = saved; return 0; }
+    arr = malloc(cnt * 8); i = 0;
+    while (i < cnt) { *(arr + i * 8) = *(tmp_arr + (saved + i) * 8); i = i + 1; }
+    list_sp = saved; last_list_cnt = cnt; return arr;
+}
+
+// ── AST node creation and IR parsing (same as emitter.bpp) ──
+
+make_node(type) {
+    auto nd: Node;
+    nd = malloc(sizeof(Node));
+    nd.ntype = type; nd.a = 0; nd.b = 0; nd.c = 0;
+    nd.d = 0; nd.e = 0; nd.f = 0; nd.g = 0;
+    return nd;
+}
+
+parse_node() { return 0; }
+
+parse_node_arr() {
+    auto arr; jexpect('['); list_begin(); jskip();
+    while (jch != 93) { list_push(parse_node()); jskip(); if (jch == ',') { jnext(); } jskip(); }
+    jnext(); arr = list_end(); return arr;
+}
+
+parse_str_arr() {
+    auto arr; jexpect('['); list_begin(); jskip();
+    while (jch != 93) { list_push(jread_str()); jskip(); if (jch == ',') { jnext(); } jskip(); }
+    jnext(); arr = list_end(); return arr;
+}
+
+parse_node() {
+    auto typ_p;
+    auto n: Node;
+    jskip();
+    if (jch == 'n') { jnext(); jnext(); jnext(); jnext(); return 0; }
+    jexpect('{'); jskip(); jskip_str(); jskip(); jexpect(':'); jskip();
+    typ_p = jread_str();
+
+    if (str_eq(typ_p, "lit", 3)) {
+        n = make_node(T_LIT); jnext_key(); n.a = jread_str();
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "var", 3)) {
+        n = make_node(T_VAR); jnext_key(); n.a = jread_str();
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "binop", 5)) {
+        n = make_node(T_BINOP); jnext_key(); n.a = jread_str();
+        jnext_key(); n.b = parse_node(); jnext_key(); n.c = parse_node();
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "unary_op", 8)) {
+        n = make_node(T_UNARY); jnext_key(); n.a = jread_str();
+        jnext_key(); n.b = parse_node(); jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "assign", 6)) {
+        n = make_node(T_ASSIGN); jnext_key(); n.a = parse_node();
+        jnext_key(); n.b = parse_node(); jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "mem_load", 8)) {
+        n = make_node(T_MEMLD); jnext_key(); n.a = parse_node();
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "mem_store", 9)) {
+        n = make_node(T_MEMST); jnext_key(); n.a = parse_node();
+        jnext_key(); n.b = parse_node(); jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "call", 4)) {
+        n = make_node(T_CALL); jnext_key(); n.a = jread_str();
+        jnext_key(); n.b = parse_node_arr(); n.c = last_list_cnt;
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "if", 2)) {
+        n = make_node(T_IF); jnext_key(); n.a = parse_node();
+        jnext_key(); n.b = parse_node_arr(); n.c = last_list_cnt;
+        jskip();
+        if (jch == ',') { jnext_key(); n.d = parse_node_arr(); n.e = last_list_cnt; }
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "while", 5)) {
+        n = make_node(T_WHILE); jnext_key(); n.a = parse_node();
+        jnext_key(); n.b = parse_node_arr(); n.c = last_list_cnt;
+        jskip();
+        while (jch == ',') { jnext(); jskip(); jskip_str(); jskip(); jexpect(':'); jskip(); jskip_val(); jskip(); }
+        jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "return", 6)) {
+        n = make_node(T_RET); jnext_key(); n.a = parse_node();
+        jskip(); jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "decl", 4)) {
+        n = make_node(T_DECL); jnext_key(); n.a = parse_str_arr(); n.b = last_list_cnt;
+        jskip();
+        while (jch == ',') { jnext(); jskip(); jskip_str(); jskip(); jexpect(':'); jskip(); jskip_val(); jskip(); }
+        jexpect('}'); return n;
+    }
+    if (str_eq(typ_p, "nop", 3)) { jskip(); jexpect('}'); return make_node(T_NOP); }
+    // Unknown: skip.
+    jskip();
+    while (jch != 125) { if (jch == '"') { jskip_str(); } else { jnext(); } }
+    jnext(); return make_node(T_NOP);
+}
+
+// ── IR top-level parser ──
+
+auto fn_name, fn_par, fn_pcnt, fn_body, fn_bcnt, fn_cnt;
+auto gl_name, gl_cnt;
+
+find_func(name_p) {
+    auto i; i = 0;
+    while (i < fn_cnt) {
+        if (str_eq_packed(name_p, *(fn_name + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+parse_one_func() {
+    auto name_p, idx;
+    jskip(); name_p = jread_str();
+    jskip(); jexpect(':'); jskip(); jexpect('{');
+    idx = find_func(name_p);
+    if (idx < 0) { idx = fn_cnt; fn_cnt = fn_cnt + 1; }
+    *(fn_name + idx * 8) = name_p;
+    jnext_key(); *(fn_par + idx * 8) = parse_str_arr(); *(fn_pcnt + idx * 8) = last_list_cnt;
+    jnext_key(); *(fn_body + idx * 8) = parse_node_arr(); *(fn_bcnt + idx * 8) = last_list_cnt;
+    jskip(); jexpect('}'); return 0;
+}
+
+parse_ir() {
+    jnext(); jskip(); jexpect('{');
+    // Skip extern_functions.
+    jnext_key(); jskip_val();
+    // Parse functions.
+    jnext_key(); jexpect('{'); jskip();
+    while (jch != 125) { parse_one_func(); jskip(); if (jch == ',') { jnext(); } jskip(); }
+    jnext();
+    // Parse globals.
+    jnext_key(); jexpect('['); jskip();
+    while (jch != 93) {
+        *(gl_name + gl_cnt * 8) = jread_str();
+        gl_cnt = gl_cnt + 1; jskip(); if (jch == ',') { jnext(); } jskip();
+    }
+    jnext(); jskip(); return 0;
+}
+
+// ── Variable tracking for current function ──
+
+auto vars, var_cnt;
+auto var_is_flt;
+
+// Float literal data table: stores packed string refs for .double emission.
+auto flt_tbl, flt_cnt;
+
+// Per-function type analysis results.
+auto fn_par_flt, fn_ret_flt, fn_var_flt;
+auto cur_fn_idx;
+
+// Add a variable to the current scope. Returns its slot index.
+var_add(name_p) {
+    auto idx; idx = var_cnt;
+    *(vars + idx * 8) = name_p;
+    *(var_is_flt + idx * 8) = 0;
+    var_cnt = var_cnt + 1;
+    return idx;
+}
+
+// Find a variable index by name. Returns index or -1 if not found.
+var_idx(name_p) {
+    auto i; i = 0;
+    while (i < var_cnt) {
+        if (str_eq_packed(name_p, *(vars + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find a variable by name. Returns stack offset from x29, or -1 if not found.
+var_find(name_p) {
+    auto i;
+    i = var_idx(name_p);
+    if (i >= 0) { return 24 + i * 8; }
+    return -1;
+}
+
+// Walk a function body and register all declared variables (for frame sizing).
+pre_reg_vars(arr, cnt) {
+    auto i, j;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) {
+            if (n.ntype == T_DECL) {
+                j = 0;
+                while (j < n.b) { var_add(*(n.a + j * 8)); j = j + 1; }
+            }
+            if (n.ntype == T_IF) {
+                pre_reg_vars(n.b, n.c);
+                if (n.e > 0) { pre_reg_vars(n.d, n.e); }
+            }
+            if (n.ntype == T_WHILE) { pre_reg_vars(n.b, n.c); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Parse packed integer literal ──
+
+parse_int(p) {
+    auto s, l, i, ch, val;
+    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
+    // Hex: 0x...
+    if (l > 2) {
+        if (peek(sbuf + s) == '0') {
+            if (peek(sbuf + s + 1) == 'x' | peek(sbuf + s + 1) == 'X') {
+                i = 2;
+                while (i < l) {
+                    ch = peek(sbuf + s + i); val = val * 16;
+                    if (ch >= '0') { if (ch <= '9') { val = val + ch - '0'; } }
+                    if (ch >= 'A') { if (ch <= 'F') { val = val + ch - 55; } }
+                    if (ch >= 'a') { if (ch <= 'f') { val = val + ch - 87; } }
+                    i = i + 1;
+                }
+                return val;
+            }
+        }
+    }
+    // Decimal.
+    while (i < l) { ch = peek(sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
+    return val;
+}
+
+// Check if a packed literal contains a decimal point (float literal).
+is_float_lit(p) {
+    auto s, l, i;
+    s = unpack_s(p); l = unpack_l(p);
+    i = 0;
+    while (i < l) {
+        if (peek(sbuf + s + i) == '.') { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── ARM64 emission ──
+
+auto lbl_cnt, depth;
+auto cur_fn_name;
+
+// String literal table: each entry stores the packed string content.
+auto str_tbl, str_cnt;
+
+// Emit a label with a unique numeric suffix.
+new_lbl() { auto l; l = lbl_cnt; lbl_cnt = lbl_cnt + 1; return l; }
+
+// Load a 64-bit immediate into x0.
+emit_mov(val) {
+    auto lo, hi;
+    if (val >= 0) {
+        if (val < 65536) {
+            out("  mov x0, #"); print_dec(val); putchar('\n');
+            return 0;
+        }
+    }
+    // Use movz/movk for larger values.
+    lo = val & 0xFFFF;
+    out("  movz x0, #"); print_dec(lo); putchar('\n');
+    hi = (val >> 16) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); print_dec(hi); out(", lsl #16"); putchar('\n'); }
+    hi = (val >> 32) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); print_dec(hi); out(", lsl #32"); putchar('\n'); }
+    hi = (val >> 48) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); print_dec(hi); out(", lsl #48"); putchar('\n'); }
+    return 0;
+}
+
+// Push x0 onto the stack. Maintains 16-byte alignment.
+emit_push() { out("  str x0, [sp, #-16]!"); putchar('\n'); depth = depth + 1; return 0; }
+
+// Pop from the stack into a register (0=x0, 1=x1, etc.).
+emit_pop(r) {
+    out("  ldr x"); print_dec(r); out(", [sp], #16"); putchar('\n');
+    depth = depth - 1; return 0;
+}
+
+// Push d0 onto the stack (float value).
+emit_fpush() { out("  str d0, [sp, #-16]!"); putchar('\n'); depth = depth + 1; return 0; }
+
+// Pop from the stack into a float register (0=d0, 1=d1, etc.).
+emit_fpop(r) {
+    out("  ldr d"); print_dec(r); out(", [sp], #16"); putchar('\n');
+    depth = depth - 1; return 0;
+}
+
+// ── Float type analysis pass ──
+// Determines which variables are float and which functions return float.
+// Runs before code emission so emit_node can choose int vs float instructions.
+
+// Check if a binary operator is integer-only (%, &, |, ^, <<, >>).
+is_int_only_op(op_p) {
+    auto s, l, c0, c1;
+    s = unpack_s(op_p); l = unpack_l(op_p);
+    c0 = peek(sbuf + s);
+    c1 = 0; if (l > 1) { c1 = peek(sbuf + s + 1); }
+    if (c0 == '%') { return 1; }
+    if (c0 == '^') { return 1; }
+    if (c0 == '&') { if (l == 1) { return 1; } }
+    if (c0 == '|') { if (l == 1) { return 1; } }
+    if (c0 == '<') { if (c1 == '<') { return 1; } }
+    if (c0 == '>') { if (c1 == '>') { return 1; } }
+    return 0;
+}
+
+// Determine the type of an expression without emitting code.
+// Returns 0 (int) or 1 (float).
+ana_type(nd) {
+    auto n: Node;
+    auto t, lt, rt, vi, fidx;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_LIT) { return is_float_lit(n.a); }
+
+    if (t == T_VAR) {
+        vi = var_idx(n.a);
+        if (vi >= 0) { return *(var_is_flt + vi * 8); }
+        return 0;
+    }
+
+    if (t == T_BINOP) {
+        if (is_int_only_op(n.a) == 1) { return 0; }
+        lt = ana_type(n.b); rt = ana_type(n.c);
+        if (lt == 1 | rt == 1) { return 1; }
+        return 0;
+    }
+
+    if (t == T_UNARY) { return ana_type(n.b); }
+
+    if (t == T_CALL) {
+        fidx = find_func(n.a);
+        if (fidx >= 0) { return *(fn_ret_flt + fidx * 8); }
+        return 0;
+    }
+
+    return 0;
+}
+
+// Walk an expression tree and propagate call argument types to callee params.
+ana_calls(nd) {
+    auto n: Node;
+    auto t, fidx, arr, cnt, i, pfl, aty;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_BINOP) { ana_calls(n.b); ana_calls(n.c); return 0; }
+    if (t == T_UNARY) { ana_calls(n.b); return 0; }
+    if (t == T_ASSIGN) { ana_calls(n.a); ana_calls(n.b); return 0; }
+    if (t == T_MEMLD) { ana_calls(n.a); return 0; }
+    if (t == T_MEMST) { ana_calls(n.a); ana_calls(n.b); return 0; }
+
+    if (t == T_CALL) {
+        fidx = find_func(n.a);
+        if (fidx >= 0) {
+            arr = n.b; cnt = n.c;
+            pfl = *(fn_par_flt + fidx * 8);
+            i = 0;
+            while (i < cnt) {
+                aty = ana_type(*(arr + i * 8));
+                if (aty == 1) { *(pfl + i * 8) = 1; }
+                i = i + 1;
+            }
+        }
+        // Recurse into call args for nested calls.
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { ana_calls(*(arr + i * 8)); i = i + 1; }
+        return 0;
+    }
+
+    return 0;
+}
+
+// Forward declaration for mutual recursion with ana_stmt.
+ana_body(arr, cnt, fi) { return 0; }
+
+// Analyze a single statement, updating var_is_flt and fn_ret_flt.
+ana_stmt(nd, fi) {
+    auto n: Node;
+    auto lhs: Node;
+    auto t, rty, vi, darr, dcnt, j;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_DECL) {
+        darr = n.a; dcnt = n.b; j = 0;
+        while (j < dcnt) { var_add(*(darr + j * 8)); j = j + 1; }
+        return 0;
+    }
+
+    if (t == T_ASSIGN) {
+        lhs = n.a;
+        rty = ana_type(n.b);
+        if (lhs.ntype == T_VAR) {
+            vi = var_idx(lhs.a);
+            if (vi >= 0) { if (rty == 1) { *(var_is_flt + vi * 8) = 1; } }
+        }
+        ana_calls(n.b);
+        return 0;
+    }
+
+    if (t == T_RET) {
+        rty = ana_type(n.a);
+        if (rty == 1) { *(fn_ret_flt + fi * 8) = 1; }
+        ana_calls(n.a);
+        return 0;
+    }
+
+    if (t == T_IF) {
+        ana_calls(n.a);
+        ana_body(n.b, n.c, fi);
+        if (n.e > 0) { ana_body(n.d, n.e, fi); }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        ana_calls(n.a);
+        ana_body(n.b, n.c, fi);
+        return 0;
+    }
+
+    // Expression statement (e.g., function call as statement).
+    ana_calls(nd);
+    return 0;
+}
+
+// Real definition: walk a body array and analyze each statement.
+ana_body(arr, cnt, fi) {
+    auto i;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) { ana_stmt(n, fi); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Walk an expression and demote any variable used as an operand
+// of an integer-only operator (%, &, |, ^, <<, >>).
+demote_expr(nd) {
+    auto n: Node;
+    auto t, vi, arr, cnt, i;
+    auto lv: Node;
+    auto rv: Node;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_BINOP) {
+        if (is_int_only_op(n.a)) {
+            lv = n.b;
+            if (lv != 0) { if (lv.ntype == T_VAR) {
+                vi = var_idx(lv.a); if (vi >= 0) { *(var_is_flt + vi * 8) = 0; }
+            } }
+            rv = n.c;
+            if (rv != 0) { if (rv.ntype == T_VAR) {
+                vi = var_idx(rv.a); if (vi >= 0) { *(var_is_flt + vi * 8) = 0; }
+            } }
+        }
+        demote_expr(n.b); demote_expr(n.c);
+        return 0;
+    }
+    if (t == T_UNARY) { demote_expr(n.b); return 0; }
+    if (t == T_ASSIGN) { demote_expr(n.b); return 0; }
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c; i = 0;
+        while (i < cnt) { demote_expr(*(arr + i * 8)); i = i + 1; }
+        return 0;
+    }
+    if (t == T_MEMLD) { demote_expr(n.a); return 0; }
+    if (t == T_MEMST) { demote_expr(n.a); demote_expr(n.b); return 0; }
+    return 0;
+}
+
+// Walk a body array and demote variables used in integer-only operations.
+demote_body(arr, cnt) {
+    auto i;
+    auto n: Node;
+    auto t;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) {
+            t = n.ntype;
+            if (t == T_ASSIGN) { demote_expr(n.b); }
+            if (t == T_RET) { demote_expr(n.a); }
+            if (t == T_IF) {
+                demote_expr(n.a);
+                demote_body(n.b, n.c);
+                if (n.e > 0) { demote_body(n.d, n.e); }
+            }
+            if (t == T_WHILE) {
+                demote_expr(n.a);
+                demote_body(n.b, n.c);
+            }
+            if (t == T_CALL) { demote_expr(n); }
+            if (t == T_MEMST) { demote_expr(n.a); demote_expr(n.b); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Analyze a single function: register params, walk body, save results.
+ana_func(fi) {
+    auto par_arr, par_cnt, body_arr, body_cnt, i, pfl, vf_save;
+    par_arr = *(fn_par + fi * 8); par_cnt = *(fn_pcnt + fi * 8);
+    body_arr = *(fn_body + fi * 8); body_cnt = *(fn_bcnt + fi * 8);
+
+    // Reset variable tracking.
+    var_cnt = 0;
+
+    // Register params with their known float flags.
+    pfl = *(fn_par_flt + fi * 8);
+    i = 0;
+    while (i < par_cnt) {
+        var_add(*(par_arr + i * 8));
+        *(var_is_flt + i * 8) = *(pfl + i * 8);
+        i = i + 1;
+    }
+
+    // Walk body to discover local variable types.
+    ana_body(body_arr, body_cnt, fi);
+
+    // Save var_is_flt for use during emission.
+    vf_save = *(fn_var_flt + fi * 8);
+    if (vf_save == 0) { vf_save = malloc(512); *(fn_var_flt + fi * 8) = vf_save; }
+    i = 0;
+    while (i < var_cnt) { *(vf_save + i * 8) = *(var_is_flt + i * 8); i = i + 1; }
+
+    return 0;
+}
+
+// Run type analysis on all functions. Fixed-point iteration handles
+// cross-function float propagation (e.g., calling a float-returning function).
+ana_all() {
+    auto i, pass, pcnt, pfl, j;
+
+    // Initialize per-function analysis data.
+    i = 0;
+    while (i < fn_cnt) {
+        pcnt = *(fn_pcnt + i * 8);
+        pfl = malloc(pcnt * 8 + 8);
+        j = 0;
+        while (j < pcnt) { *(pfl + j * 8) = 0; j = j + 1; }
+        *(fn_par_flt + i * 8) = pfl;
+        *(fn_ret_flt + i * 8) = 0;
+        *(fn_var_flt + i * 8) = 0;
+        i = i + 1;
+    }
+
+    // Fixed-point: 5 passes is enough for any practical call depth.
+    pass = 0;
+    while (pass < 5) {
+        i = 0;
+        while (i < fn_cnt) { ana_func(i); i = i + 1; }
+        pass = pass + 1;
+    }
+
+    // Final demotion pass: for each function, demote any variable (including
+    // params) that is used in an integer-only operation. This runs AFTER
+    // fixed-point iteration so it can't be overridden by ana_calls propagation.
+    i = 0;
+    while (i < fn_cnt) {
+        // Rebuild var table for this function.
+        var_cnt = 0;
+        pcnt = *(fn_pcnt + i * 8);
+        j = 0;
+        while (j < pcnt) {
+            var_add(*(*(fn_par + i * 8) + j * 8));
+            *(var_is_flt + j * 8) = *(*(fn_par_flt + i * 8) + j * 8);
+            j = j + 1;
+        }
+        // Re-register body-declared vars with their saved flags.
+        pre_reg_vars(*(fn_body + i * 8), *(fn_bcnt + i * 8));
+        pfl = *(fn_var_flt + i * 8);
+        if (pfl != 0) {
+            j = 0;
+            while (j < var_cnt) { *(var_is_flt + j * 8) = *(pfl + j * 8); j = j + 1; }
+        }
+        // Demote variables used in int-only ops.
+        demote_body(*(fn_body + i * 8), *(fn_bcnt + i * 8));
+        // Write back demoted flags to fn_par_flt and fn_var_flt.
+        pfl = *(fn_par_flt + i * 8);
+        j = 0;
+        while (j < pcnt) { *(pfl + j * 8) = *(var_is_flt + j * 8); j = j + 1; }
+        pfl = *(fn_var_flt + i * 8);
+        if (pfl != 0) {
+            j = 0;
+            while (j < var_cnt) { *(pfl + j * 8) = *(var_is_flt + j * 8); j = j + 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Expression emission: result in x0 (int) or d0 (float) ──
+// Returns 0 if result is integer (in x0), 1 if float (in d0).
+
+emit_node(n) { return 0; }
+
+emit_node(nd) {
+    auto n: Node;
+    auto t, op_s, op_l, c0, c1, arr, cnt, i, off, lbl, vi, lty, rty;
+    auto lit_s, lit_l, sid, str_p, fid, use_flt, is_io, uty, ety, fidx_c;
+    if (nd == 0) { out("  mov x0, #0"); putchar('\n'); return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_LIT) {
+        // Check if this literal is a string (starts with double-quote in the sbuf).
+        lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
+        if (peek(sbuf + lit_s) == '"') {
+            // String literal: strip quotes, store in string table, emit address load.
+            sid = str_cnt;
+            str_p = pack(lit_s + 1, lit_l - 2);
+            *(str_tbl + sid * 8) = str_p;
+            str_cnt = str_cnt + 1;
+            out("  adrp x0, _str_"); print_dec(sid); out("@PAGE"); putchar('\n');
+            out("  add x0, x0, _str_"); print_dec(sid); out("@PAGEOFF"); putchar('\n');
+            return 0;
+        }
+        // Check if float literal (contains a decimal point).
+        if (is_float_lit(n.a) == 1) {
+            fid = flt_cnt;
+            *(flt_tbl + fid * 8) = n.a;
+            flt_cnt = flt_cnt + 1;
+            out("  adrp x8, _flt_"); print_dec(fid); out("@PAGE"); putchar('\n');
+            out("  add x8, x8, _flt_"); print_dec(fid); out("@PAGEOFF"); putchar('\n');
+            out("  ldr d0, [x8]"); putchar('\n');
+            return 1;
+        }
+        emit_mov(parse_int(n.a)); return 0;
+    }
+
+    if (t == T_VAR) {
+        vi = var_idx(n.a);
+        if (vi >= 0) {
+            off = 24 + vi * 8;
+            if (*(var_is_flt + vi * 8) == 1) {
+                out("  ldr d0, [x29, #"); print_dec(off); out("]"); putchar('\n');
+                return 1;
+            }
+            out("  ldr x0, [x29, #"); print_dec(off); out("]"); putchar('\n');
+            return 0;
+        }
+        // Global variable: load address then load value.
+        out("  adrp x8, _"); print_p(n.a); out("@PAGE"); putchar('\n');
+        out("  add x8, x8, _"); print_p(n.a); out("@PAGEOFF"); putchar('\n');
+        out("  ldr x0, [x8]"); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_BINOP) {
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        c0 = peek(sbuf + op_s);
+        c1 = 0; if (op_l > 1) { c1 = peek(sbuf + op_s + 1); }
+
+        is_io = is_int_only_op(n.a);
+
+        // Evaluate left operand, push onto stack.
+        lty = emit_node(n.b);
+        if (lty == 1) { emit_fpush(); } else { emit_push(); }
+
+        // Evaluate right operand.
+        rty = emit_node(n.c);
+
+        // Determine if we use float arithmetic.
+        use_flt = 0;
+        if (is_io == 0) { if (lty == 1 | rty == 1) { use_flt = 1; } }
+
+        if (use_flt == 1) {
+            // Ensure right operand is in d0.
+            if (rty == 0) { out("  scvtf d0, x0"); putchar('\n'); }
+            // Pop left operand into d1.
+            if (lty == 1) { emit_fpop(1); }
+            else { emit_pop(1); out("  scvtf d1, x1"); putchar('\n'); }
+            // d1 = left, d0 = right.
+
+            // Float arithmetic operators.
+            if (c0 == '+') { if (op_l == 1) { out("  fadd d0, d1, d0"); putchar('\n'); return 1; } }
+            if (c0 == '-') { if (op_l == 1) { out("  fsub d0, d1, d0"); putchar('\n'); return 1; } }
+            if (c0 == '*') { if (op_l == 1) { out("  fmul d0, d1, d0"); putchar('\n'); return 1; } }
+            if (c0 == '/') { if (op_l == 1) { out("  fdiv d0, d1, d0"); putchar('\n'); return 1; } }
+
+            // Float comparison operators — result is integer in x0.
+            if (c0 == '=') { if (c1 == '=') { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); return 0; } }
+            if (c0 == '!') { if (c1 == '=') { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); return 0; } }
+            if (c0 == '<') {
+                if (c1 == '=') { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ls"); putchar('\n'); return 0; }
+                if (op_l == 1) { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, mi"); putchar('\n'); return 0; }
+            }
+            if (c0 == '>') {
+                if (c1 == '=') { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); return 0; }
+                if (op_l == 1) { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); return 0; }
+            }
+            // Float logical operators: compare each side against zero.
+            if (c0 == '&') { if (c1 == '&') {
+                out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n');
+                out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n');
+                out("  and x0, x1, x0"); putchar('\n'); return 0;
+            } }
+            if (c0 == '|') { if (c1 == '|') {
+                out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n');
+                out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n');
+                out("  orr x0, x1, x0"); putchar('\n'); return 0;
+            } }
+            return 1;
+        }
+
+        // Integer path. Convert float operands to int if needed.
+        if (rty == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+        if (lty == 1) {
+            emit_fpop(0);
+            out("  fcvtzs x1, d0"); putchar('\n');
+        } else {
+            emit_pop(1);
+        }
+        // x1 = left, x0 = right.
+        if (c0 == '+') { if (op_l == 1) { out("  add x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '-') { if (op_l == 1) { out("  sub x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '*') { if (op_l == 1) { out("  mul x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '/') { if (op_l == 1) { out("  sdiv x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '%') { if (op_l == 1) {
+            out("  sdiv x8, x1, x0"); putchar('\n');
+            out("  msub x0, x8, x0, x1"); putchar('\n'); return 0;
+        } }
+        // Bitwise operators.
+        if (c0 == '&') { if (op_l == 1) { out("  and x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '|') { if (op_l == 1) { out("  orr x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '^') { if (op_l == 1) { out("  eor x0, x1, x0"); putchar('\n'); return 0; } }
+        // Shift operators.
+        if (c0 == '>') { if (c1 == '>') { out("  asr x0, x1, x0"); putchar('\n'); return 0; } }
+        if (c0 == '<') { if (c1 == '<') { out("  lsl x0, x1, x0"); putchar('\n'); return 0; } }
+        // Comparison operators.
+        if (c0 == '=') { if (c1 == '=') { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); return 0; } }
+        if (c0 == '!') { if (c1 == '=') { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); return 0; } }
+        if (c0 == '<') {
+            if (c1 == '=') { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); return 0; }
+            if (op_l == 1) { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); return 0; }
+        }
+        if (c0 == '>') {
+            if (c1 == '=') { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); return 0; }
+            if (op_l == 1) { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); return 0; }
+        }
+        // Logical operators: convert to boolean first.
+        if (c0 == '&') { if (c1 == '&') {
+            out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n');
+            out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n');
+            out("  and x0, x1, x0"); putchar('\n'); return 0;
+        } }
+        if (c0 == '|') { if (c1 == '|') {
+            out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n');
+            out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n');
+            out("  orr x0, x1, x0"); putchar('\n'); return 0;
+        } }
+        return 0;
+    }
+
+    if (t == T_UNARY) {
+        uty = emit_node(n.b);
+        if (uty == 1) { out("  fneg d0, d0"); putchar('\n'); return 1; }
+        out("  neg x0, x0"); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_CALL) {
+        // Built-in: putchar.
+        if (str_eq(n.a, "putchar", 7)) {
+            arr = n.b; ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            out("  strb w0, [x29, #16]"); putchar('\n');
+            out("  mov x0, #1"); putchar('\n');
+            out("  add x1, x29, #16"); putchar('\n');
+            out("  mov x2, #1"); putchar('\n');
+            out("  mov x16, #4"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: getchar.
+        if (str_eq(n.a, "getchar", 7)) {
+            lbl = new_lbl();
+            out("  strb wzr, [x29, #16]"); putchar('\n');
+            out("  mov x0, #0"); putchar('\n');
+            out("  add x1, x29, #16"); putchar('\n');
+            out("  mov x2, #1"); putchar('\n');
+            out("  mov x16, #3"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            out("  cmp x0, #1"); putchar('\n');
+            out("  b.lt .Leof"); print_dec(lbl); putchar('\n');
+            out("  ldrb w0, [x29, #16]"); putchar('\n');
+            out("  b .Leofend"); print_dec(lbl); putchar('\n');
+            out(".Leof"); print_dec(lbl); out(":"); putchar('\n');
+            out("  mov x0, #-1"); putchar('\n');
+            out(".Leofend"); print_dec(lbl); out(":"); putchar('\n');
+            return 0;
+        }
+        // Built-in: malloc -> call real malloc from libSystem.
+        if (str_eq(n.a, "malloc", 6)) {
+            arr = n.b; ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            out("  bl _malloc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: peek -> byte read from real pointer.
+        if (str_eq(n.a, "peek", 4)) {
+            arr = n.b; ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            out("  ldrb w0, [x0]"); putchar('\n');
+            return 0;
+        }
+        // Built-in: poke -> byte write to real pointer.
+        if (str_eq(n.a, "poke", 4)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 8));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_pop(1);
+            out("  strb w1, [x0]"); putchar('\n');
+            return 0;
+        }
+        // Built-in: str_peek -> byte read from real string pointer.
+        if (str_eq(n.a, "str_peek", 8)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 8));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_pop(1);
+            out("  ldrb w0, [x0, x1]"); putchar('\n');
+            return 0;
+        }
+        // Built-in: sys_write(fd, buf, len) — buf is a real pointer.
+        if (str_eq(n.a, "sys_write", 9)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 16));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 8));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_pop(1); emit_pop(2);
+            out("  mov x16, #4"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: sys_read(fd, buf, len) — buf is a real pointer.
+        if (str_eq(n.a, "sys_read", 8)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 16));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 8));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_pop(1); emit_pop(2);
+            out("  mov x16, #3"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: sys_open(path, flags) — path is a real pointer.
+        if (str_eq(n.a, "sys_open", 8)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 8));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_push();
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            emit_pop(1);
+            out("  mov x2, #0"); putchar('\n');
+            out("  mov x16, #5"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: sys_close(fd).
+        if (str_eq(n.a, "sys_close", 9)) {
+            arr = n.b;
+            ety = emit_node(*(arr + 0));
+            if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+            out("  mov x16, #6"); putchar('\n');
+            out("  svc #0x80"); putchar('\n');
+            out("  csneg x0, x0, x0, cc"); putchar('\n');
+            return 0;
+        }
+        // Built-in: argc_get() / argv_get() — stubs.
+        if (str_eq(n.a, "argc_get", 8)) {
+            out("  mov x0, #0"); putchar('\n');
+            return 0;
+        }
+        if (str_eq(n.a, "argv_get", 8)) {
+            out("  mov x0, #0"); putchar('\n');
+            return 0;
+        }
+        // Regular B++ function call.
+        // Float args: if callee param is float, bit-transfer with fmov.
+        // If callee param is int, truncate with fcvtzs.
+        // Int args to float params: promote with scvtf + fmov.
+        fidx_c = find_func(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            ety = emit_node(*(arr + i * 8));
+            if (fidx_c >= 0) {
+                vi = *(*(fn_par_flt + fidx_c * 8) + i * 8);
+                if (ety == 1) {
+                    if (vi == 1) {
+                        // Float arg → float param: bit-transfer.
+                        out("  fmov x0, d0"); putchar('\n');
+                    } else {
+                        // Float arg → int param: truncate to integer.
+                        out("  fcvtzs x0, d0"); putchar('\n');
+                    }
+                } else {
+                    if (vi == 1) {
+                        // Int arg → float param: promote to float, bit-transfer.
+                        out("  scvtf d0, x0"); putchar('\n');
+                        out("  fmov x0, d0"); putchar('\n');
+                    }
+                }
+            } else {
+                // Unknown function: just bit-transfer float args.
+                if (ety == 1) { out("  fmov x0, d0"); putchar('\n'); }
+            }
+            emit_push();
+            i = i + 1;
+        }
+        // Pop args into x0..x(cnt-1) in reverse order.
+        i = cnt - 1;
+        while (i >= 0) { emit_pop(i); i = i - 1; }
+        out("  bl _"); print_p(n.a); putchar('\n');
+        // Check if callee returns float.
+        if (fidx_c >= 0) {
+            if (*(fn_ret_flt + fidx_c * 8) == 1) { return 1; }
+        }
+        return 0;
+    }
+
+    // mem_load: *(ptr) — load 8 bytes from real pointer.
+    if (t == T_MEMLD) {
+        ety = emit_node(n.a);
+        if (ety == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+        out("  ldr x0, [x0]"); putchar('\n');
+        return 0;
+    }
+
+    return 0;
+}
+
+// ── Statement emission ──
+
+emit_body(arr, cnt) {
+    auto i;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) { emit_stmt(n); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+emit_stmt(nd) {
+    auto n: Node;
+    auto lhs: Node;
+    auto t, off, lbl, arr, cnt, i, rty, vi, ety;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_DECL) {
+        // Variables already pre-registered in emit_func. No-op.
+        return 0;
+    }
+
+    if (t == T_ASSIGN) {
+        lhs = n.a;
+        rty = emit_node(n.b);
+        if (lhs.ntype == T_VAR) {
+            vi = var_idx(lhs.a);
+            if (vi >= 0) {
+                off = 24 + vi * 8;
+                if (*(var_is_flt + vi * 8) == 1) {
+                    // Float variable: convert int to float if needed, store as double.
+                    if (rty == 0) { out("  scvtf d0, x0"); putchar('\n'); }
+                    out("  str d0, [x29, #"); print_dec(off); out("]"); putchar('\n');
+                } else {
+                    // Int variable: convert float to int if needed, store as long.
+                    if (rty == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+                    out("  str x0, [x29, #"); print_dec(off); out("]"); putchar('\n');
+                }
+            } else {
+                // Global variable store.
+                if (rty == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+                out("  adrp x8, _"); print_p(lhs.a); out("@PAGE"); putchar('\n');
+                out("  add x8, x8, _"); print_p(lhs.a); out("@PAGEOFF"); putchar('\n');
+                out("  str x0, [x8]"); putchar('\n');
+            }
+        }
+        return 0;
+    }
+
+    // mem_store: *(ptr) = val — store 8 bytes to real pointer.
+    if (t == T_MEMST) {
+        ety = emit_node(n.b);
+        // Bit-transfer float to x-register for memory store.
+        if (ety == 1) { out("  fmov x0, d0"); putchar('\n'); }
+        emit_push();
+        emit_node(n.a);
+        emit_pop(1);
+        out("  str x1, [x0]"); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_IF) {
+        lbl = new_lbl();
+        ety = emit_node(n.a);
+        // Float condition: compare against zero to produce an integer flag.
+        if (ety == 1) {
+            out("  fcmp d0, #0.0"); putchar('\n');
+            out("  cset x0, ne"); putchar('\n');
+        }
+        out("  cbz x0, .Lelse"); print_dec(lbl); putchar('\n');
+        emit_body(n.b, n.c);
+        out("  b .Lendif"); print_dec(lbl); putchar('\n');
+        out(".Lelse"); print_dec(lbl); out(":"); putchar('\n');
+        if (n.e > 0) { emit_body(n.d, n.e); }
+        out(".Lendif"); print_dec(lbl); out(":"); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        lbl = new_lbl();
+        out(".Lloop"); print_dec(lbl); out(":"); putchar('\n');
+        ety = emit_node(n.a);
+        if (ety == 1) {
+            out("  fcmp d0, #0.0"); putchar('\n');
+            out("  cset x0, ne"); putchar('\n');
+        }
+        out("  cbz x0, .Lend"); print_dec(lbl); putchar('\n');
+        emit_body(n.b, n.c);
+        out("  b .Lloop"); print_dec(lbl); putchar('\n');
+        out(".Lend"); print_dec(lbl); out(":"); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_RET) {
+        rty = emit_node(n.a);
+        // Ensure return value matches function's declared return type.
+        if (*(fn_ret_flt + cur_fn_idx * 8) == 1) {
+            if (rty == 0) { out("  scvtf d0, x0"); putchar('\n'); }
+        } else {
+            if (rty == 1) { out("  fcvtzs x0, d0"); putchar('\n'); }
+        }
+        out("  b .Lret_"); print_p(cur_fn_name); putchar('\n');
+        return 0;
+    }
+
+    if (t == T_NOP) { return 0; }
+
+    // Expression statement (e.g., function call as statement).
+    emit_node(nd);
+    return 0;
+}
+
+// ── Function emission ──
+
+emit_func(fi) {
+    auto name_p, par_arr, par_cnt, body_arr, body_cnt;
+    auto frame, i, vf_load;
+    name_p = *(fn_name + fi * 8);
+    par_arr = *(fn_par + fi * 8); par_cnt = *(fn_pcnt + fi * 8);
+    body_arr = *(fn_body + fi * 8); body_cnt = *(fn_bcnt + fi * 8);
+
+    // Reset variable tracking for this function.
+    var_cnt = 0;
+    cur_fn_name = name_p;
+    cur_fn_idx = fi;
+
+    // Register params as variables (slots 0..par_cnt-1).
+    i = 0;
+    while (i < par_cnt) { var_add(*(par_arr + i * 8)); i = i + 1; }
+
+    // Pre-register all declared variables from body (including nested blocks).
+    pre_reg_vars(body_arr, body_cnt);
+
+    // Load float flags from analysis pass.
+    vf_load = *(fn_var_flt + fi * 8);
+    if (vf_load != 0) {
+        i = 0;
+        while (i < var_cnt) { *(var_is_flt + i * 8) = *(vf_load + i * 8); i = i + 1; }
+    }
+
+    // Calculate frame size: 16 (saved regs) + 8 (scratch) + all_vars * 8, aligned to 16.
+    frame = 24 + var_cnt * 8;
+    frame = (frame + 15) / 16 * 16;
+
+    // Emit function header.
+    out(".p2align 2"); putchar('\n');
+    if (str_eq(name_p, "main", 4)) {
+        out(".globl _main"); putchar('\n');
+        out("_main:"); putchar('\n');
+    } else {
+        out("_"); print_p(name_p); out(":"); putchar('\n');
+    }
+
+    // Prologue: save frame pointer and return address, allocate frame.
+    out("  stp x29, x30, [sp, #-"); print_dec(frame); out("]!"); putchar('\n');
+    out("  mov x29, sp"); putchar('\n');
+
+    // Store incoming register arguments to their stack slots.
+    // All args arrive in x-registers (float args via fmov bit-transfer from caller).
+    i = 0;
+    while (i < par_cnt) {
+        out("  str x"); print_dec(i); out(", [x29, #"); print_dec(24 + i * 8); out("]"); putchar('\n');
+        i = i + 1;
+    }
+
+    // Emit function body.
+    depth = 0;
+    emit_body(body_arr, body_cnt);
+
+    // Epilogue.
+    out(".Lret_"); print_p(name_p); out(":"); putchar('\n');
+    out("  ldp x29, x30, [sp], #"); print_dec(frame); putchar('\n');
+    out("  ret"); putchar('\n');
+    putchar('\n');
+    return 0;
+}
+
+// ── Top-level emission ──
+
+emit_all() {
+    auto i, sp, ss, sl, j, ch, fp, fs, fl;
+    out(".section __TEXT,__text,regular,pure_instructions"); putchar('\n');
+    putchar('\n');
+    // Emit all functions.
+    i = 0;
+    while (i < fn_cnt) { emit_func(i); i = i + 1; }
+
+    // Emit global variables in data section.
+    if (gl_cnt > 0) {
+        out(".section __DATA,__data"); putchar('\n');
+        i = 0;
+        while (i < gl_cnt) {
+            out(".globl _"); print_p(*(gl_name + i * 8)); putchar('\n');
+            out(".p2align 3"); putchar('\n');
+            out("_"); print_p(*(gl_name + i * 8)); out(":"); putchar('\n');
+            out("  .quad 0"); putchar('\n');
+            i = i + 1;
+        }
+        putchar('\n');
+    }
+
+    // Emit string literals in a read-only data section.
+    if (str_cnt > 0) {
+        out(".section __TEXT,__cstring,cstring_literals"); putchar('\n');
+        i = 0;
+        while (i < str_cnt) {
+            sp = *(str_tbl + i * 8);
+            ss = unpack_s(sp); sl = unpack_l(sp);
+            out("_str_"); print_dec(i); out(":"); putchar('\n');
+            out("  .asciz "); putchar('"');
+            j = 0;
+            while (j < sl) {
+                ch = peek(sbuf + ss + j);
+                if (ch == '\n') { putchar('\\'); putchar('n'); }
+                else { if (ch == '"') { putchar('\\'); putchar('"'); }
+                else { if (ch == '\\') { putchar('\\'); putchar('\\'); }
+                else { putchar(ch); } } }
+                j = j + 1;
+            }
+            putchar('"'); putchar('\n');
+            i = i + 1;
+        }
+        putchar('\n');
+    }
+
+    // Emit float literal constants in a read-only data section.
+    if (flt_cnt > 0) {
+        out(".section __DATA,__const"); putchar('\n');
+        i = 0;
+        while (i < flt_cnt) {
+            fp = *(flt_tbl + i * 8);
+            fs = unpack_s(fp); fl = unpack_l(fp);
+            out(".p2align 3"); putchar('\n');
+            out("_flt_"); print_dec(i); out(":"); putchar('\n');
+            out("  .double ");
+            j = 0;
+            while (j < fl) { putchar(peek(sbuf + fs + j)); j = j + 1; }
+            putchar('\n');
+            i = i + 1;
+        }
+        putchar('\n');
+    }
+
+    return 0;
+}
+
+// ── Main ──
+
+main() {
+    T_LIT = 0; T_VAR = 1; T_BINOP = 2; T_UNARY = 3; T_ASSIGN = 4;
+    T_MEMLD = 5; T_MEMST = 6; T_CALL = 7; T_IF = 8; T_WHILE = 9;
+    T_RET = 10; T_DECL = 11; T_NOP = 12;
+
+    sbuf = malloc(524288); sbuf_top = 0;
+    fn_name = malloc(4096); fn_par = malloc(4096); fn_pcnt = malloc(4096);
+    fn_body = malloc(4096); fn_bcnt = malloc(4096); fn_cnt = 0;
+    gl_name = malloc(4096); gl_cnt = 0;
+    vars = malloc(4096); var_cnt = 0;
+    var_is_flt = malloc(4096);
+    tmp_arr = malloc(16384); list_stack = malloc(512);
+    list_sp = 0; list_depth = 0; last_list_cnt = 0;
+    str_tbl = malloc(8192); str_cnt = 0;
+    flt_tbl = malloc(8192); flt_cnt = 0;
+    fn_par_flt = malloc(4096); fn_ret_flt = malloc(4096);
+    fn_var_flt = malloc(4096);
+    cur_fn_idx = 0;
+    lbl_cnt = 0; depth = 0;
+    jch = ' ';
+
+    parse_ir();
+    ana_all();
+    emit_all();
+    return 0;
+}

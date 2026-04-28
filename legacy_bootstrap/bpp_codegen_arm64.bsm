@@ -1,0 +1,1399 @@
+// bpp_codegen_arm64.bsm — ARM64 code generator for the unified B++ compiler.
+// Reads AST data from the parser's in-memory structures (no JSON).
+// Writes ARM64 assembly (macOS Apple Silicon) to stdout.
+//
+// Usage: import this module into bpp.bpp, then call emit_all_arm64()
+// after run_types()/run_dispatch() to emit assembly instead of C.
+
+// ── Emitter-owned globals ──────────────────────────────────
+
+// String buffer alias: points to vbuf (set by bridge_data_arm64).
+auto a64_sbuf;
+
+// Function table (parallel arrays, deduplicated from parser).
+// a64_fn_fidx maps emitter index → parser func_cnt index for type queries.
+auto a64_fn_name, a64_fn_par, a64_fn_pcnt, a64_fn_body, a64_fn_bcnt, a64_fn_cnt, a64_fn_fidx;
+
+// Global variable list.
+auto a64_gl_name, a64_gl_cnt;
+
+// Current function's variable scope (for stack frame layout).
+auto a64_vars, a64_var_cnt;
+
+// Float literal data table: stores packed string refs for .double emission.
+auto a64_flt_tbl, a64_flt_cnt;
+
+// String literal table: each entry stores the packed string content.
+auto a64_str_tbl, a64_str_cnt;
+
+// Label counter and stack depth tracking.
+auto a64_lbl_cnt, a64_depth;
+
+// Current function being emitted.
+auto a64_cur_fn_name, a64_cur_fn_idx;
+
+// Binary mode: 0 = text assembly (default), 1 = binary encoding via bpp_enc_arm64.bsm.
+auto a64_bin_mode;
+
+// Binary mode: function entry labels (array mapping fn index → label ID).
+auto a64_fn_lbl;
+
+// Binary mode: return label for the current function (set in a64_emit_func).
+auto a64_ret_lbl;
+
+// Sentinel packed names for hidden argc/argv globals.
+// These use negative values that can never collide with real packed names.
+auto a64_argc_sym, a64_argv_sym;
+
+// ── Initialization ─────────────────────────────────────────
+
+init_codegen_arm64() {
+    a64_fn_name = malloc(65536); a64_fn_par = malloc(65536);
+    a64_fn_pcnt = malloc(65536); a64_fn_body = malloc(65536);
+    a64_fn_bcnt = malloc(65536); a64_fn_fidx = malloc(65536); a64_fn_cnt = 0;
+    a64_gl_name = malloc(65536); a64_gl_cnt = 0;
+    a64_vars = malloc(65536); a64_var_cnt = 0;
+    a64_flt_tbl = malloc(65536); a64_flt_cnt = 0;
+    a64_str_tbl = malloc(65536); a64_str_cnt = 0;
+    a64_lbl_cnt = 0; a64_depth = 0;
+    a64_bin_mode = 0;
+    a64_fn_lbl = malloc(65536);
+    a64_ret_lbl = 0;
+    a64_argc_sym = 0 - 1;
+    a64_argv_sym = 0 - 2;
+    return 0;
+}
+
+// ── Bridge: copy parser data into emitter parallel arrays ──
+// Same pattern as bpp_emitter.bsm:bridge_data().
+
+bridge_data_arm64() {
+    auto i, rec, name_p, idx, j;
+
+    // Point string buffer at the parser's vbuf.
+    a64_sbuf = vbuf;
+
+    // Copy functions from parser's 64-byte records into parallel arrays.
+    // Handle forward declarations: if a function name already exists,
+    // overwrite it with the later (real) definition.
+    a64_fn_cnt = 0;
+    i = 0;
+    while (i < func_cnt) {
+        rec = *(funcs + i * 8);
+        name_p = *(rec + 8);
+        // Check if this function was already added (forward declaration).
+        idx = -1;
+        j = 0;
+        while (j < a64_fn_cnt) {
+            if (a64_str_eq_packed(name_p, *(a64_fn_name + j * 8))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            idx = a64_fn_cnt;
+            a64_fn_cnt = a64_fn_cnt + 1;
+        }
+        *(a64_fn_name + idx * 8) = name_p;
+        *(a64_fn_par  + idx * 8) = *(rec + 16);
+        *(a64_fn_pcnt + idx * 8) = *(rec + 24);
+        *(a64_fn_body + idx * 8) = *(rec + 32);
+        *(a64_fn_bcnt + idx * 8) = *(rec + 40);
+        *(a64_fn_fidx + idx * 8) = i;
+        i = i + 1;
+    }
+
+    // Copy globals, deduplicating by string content.
+    // The parser may add the same name multiple times (from different modules).
+    // Each must map to a single __DATA slot in the binary.
+    a64_gl_cnt = 0;
+    i = 0;
+    while (i < glob_cnt) {
+        name_p = *(globals + i * 8);
+        idx = -1;
+        j = 0;
+        while (j < a64_gl_cnt) {
+            if (a64_str_eq_packed(name_p, *(a64_gl_name + j * 8))) { idx = j; }
+            j = j + 1;
+        }
+        if (idx < 0) {
+            *(a64_gl_name + a64_gl_cnt * 8) = name_p;
+            a64_gl_cnt = a64_gl_cnt + 1;
+        }
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+// ── String utilities ───────────────────────────────────────
+
+// Compare a packed string against a C literal. Returns 1 if equal.
+a64_str_eq(p, lit, litlen) {
+    if (unpack_l(p) != litlen) { return 0; }
+    return buf_eq(a64_sbuf + unpack_s(p), lit, litlen);
+}
+
+// Compare two packed strings byte by byte.
+a64_str_eq_packed(a, b) {
+    auto as, al, bs, bl, i;
+    al = unpack_l(a); bl = unpack_l(b);
+    if (al != bl) { return 0; }
+    as = unpack_s(a); bs = unpack_s(b);
+    i = 0;
+    while (i < al) {
+        if (peek(a64_sbuf + as + i) != peek(a64_sbuf + bs + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Print a packed string to stdout.
+a64_print_p(p) {
+    print_buf(a64_sbuf + unpack_s(p), unpack_l(p));
+    return 0;
+}
+
+// ── Helper functions ───────────────────────────────────────
+
+// Print a decimal integer to stdout. Used for assembly immediates.
+a64_print_dec(n) {
+    auto buf, len, i;
+    if (n < 0) { putchar('-'); n = 0 - n; }
+    if (n == 0) { putchar('0'); return 0; }
+    buf = malloc(20); len = 0;
+    while (n > 0) { poke(buf + len, '0' + n % 10); len = len + 1; n = n / 10; }
+    i = len - 1;
+    while (i >= 0) { putchar(peek(buf + i)); i = i - 1; }
+    return 0;
+}
+
+// ── Variable tracking for current function ─────────────────
+
+// Add a variable to the current scope. Returns its slot index.
+a64_var_add(name_p) {
+    auto idx; idx = a64_var_cnt;
+    *(a64_vars + idx * 8) = name_p;
+    a64_var_cnt = a64_var_cnt + 1;
+    return idx;
+}
+
+// Find a variable index by name. Returns index or -1 if not found.
+a64_var_idx(name_p) {
+    auto i; i = 0;
+    while (i < a64_var_cnt) {
+        if (a64_str_eq_packed(name_p, *(a64_vars + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Find a variable by name. Returns stack offset from x29, or -1 if not found.
+a64_var_find(name_p) {
+    auto i;
+    i = a64_var_idx(name_p);
+    if (i >= 0) { return 24 + i * 8; }
+    return -1;
+}
+
+// Walk a function body and register all declared variables (for frame sizing).
+a64_pre_reg_vars(arr, cnt) {
+    auto i, j;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) {
+            if (n.ntype == T_DECL) {
+                j = 0;
+                while (j < n.b) { a64_var_add(*(n.a + j * 8)); j = j + 1; }
+            }
+            if (n.ntype == T_IF) {
+                a64_pre_reg_vars(n.b, n.c);
+                if (n.e > 0) { a64_pre_reg_vars(n.d, n.e); }
+            }
+            if (n.ntype == T_WHILE) { a64_pre_reg_vars(n.b, n.c); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Literal helpers ────────────────────────────────────────
+
+// Parse a packed integer literal (decimal or hex). Returns the numeric value.
+a64_parse_int(p) {
+    auto s, l, i, ch, val;
+    s = unpack_s(p); l = unpack_l(p); val = 0; i = 0;
+    // Hex: 0x...
+    if (l > 2) {
+        if (peek(a64_sbuf + s) == '0') {
+            if (peek(a64_sbuf + s + 1) == 'x' | peek(a64_sbuf + s + 1) == 'X') {
+                i = 2;
+                while (i < l) {
+                    ch = peek(a64_sbuf + s + i); val = val * 16;
+                    if (ch >= '0') { if (ch <= '9') { val = val + ch - '0'; } }
+                    if (ch >= 'A') { if (ch <= 'F') { val = val + ch - 55; } }
+                    if (ch >= 'a') { if (ch <= 'f') { val = val + ch - 87; } }
+                    i = i + 1;
+                }
+                return val;
+            }
+        }
+    }
+    // Decimal.
+    while (i < l) { ch = peek(a64_sbuf + s + i); val = val * 10 + ch - '0'; i = i + 1; }
+    return val;
+}
+
+// Check if a packed literal contains a decimal point (float literal).
+a64_is_float_lit(p) {
+    auto s, l, i;
+    s = unpack_s(p); l = unpack_l(p);
+    i = 0;
+    while (i < l) {
+        if (peek(a64_sbuf + s + i) == '.') { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── Type query helpers ─────────────────────────────────────
+// Wrap bpp_types.bsm queries for cleaner code in emit_node/emit_stmt.
+
+// Check if a variable (by slot index) is float in the current function.
+a64_var_is_float(vi) {
+    return get_fn_var_type(a64_cur_fn_idx, *(a64_vars + vi * 8)) == TY_FLOAT;
+}
+
+// Find a B++ function's emitter index by packed name. Returns -1 if not found.
+a64_find_fn(name_p) {
+    auto i;
+    i = 0;
+    while (i < a64_fn_cnt) {
+        if (a64_str_eq_packed(name_p, *(a64_fn_name + i * 8))) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ── ARM64 emission primitives ──────────────────────────────
+
+// Generate a unique label number.
+a64_new_lbl() { auto l; l = a64_lbl_cnt; a64_lbl_cnt = a64_lbl_cnt + 1; return l; }
+
+// Load a 64-bit immediate into x0 using movz/movk sequence.
+a64_emit_mov(val) {
+    auto lo, hi;
+    if (a64_bin_mode) { enc_mov_wide(0, val); return 0; }
+    if (val >= 0) {
+        if (val < 65536) {
+            out("  mov x0, #"); a64_print_dec(val); putchar('\n');
+            return 0;
+        }
+    }
+    // Use movz/movk for larger values.
+    lo = val & 0xFFFF;
+    out("  movz x0, #"); a64_print_dec(lo); putchar('\n');
+    hi = (val >> 16) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); a64_print_dec(hi); out(", lsl #16"); putchar('\n'); }
+    hi = (val >> 32) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); a64_print_dec(hi); out(", lsl #32"); putchar('\n'); }
+    hi = (val >> 48) & 0xFFFF;
+    if (hi > 0) { out("  movk x0, #"); a64_print_dec(hi); out(", lsl #48"); putchar('\n'); }
+    return 0;
+}
+
+// Push x0 onto the stack. Maintains 16-byte alignment.
+a64_emit_push() {
+    if (a64_bin_mode) { enc_str_pre(0, 31, -16); } else { out("  str x0, [sp, #-16]!"); putchar('\n'); }
+    a64_depth = a64_depth + 1; return 0;
+}
+
+// Pop from the stack into a register (0=x0, 1=x1, etc.).
+a64_emit_pop(r) {
+    if (a64_bin_mode) { enc_ldr_post(r, 31, 16); } else { out("  ldr x"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
+    a64_depth = a64_depth - 1; return 0;
+}
+
+// Push d0 onto the stack (float value).
+a64_emit_fpush() {
+    if (a64_bin_mode) { enc_str_d_pre(0, 31, -16); } else { out("  str d0, [sp, #-16]!"); putchar('\n'); }
+    a64_depth = a64_depth + 1; return 0;
+}
+
+// Pop from the stack into a float register (0=d0, 1=d1, etc.).
+a64_emit_fpop(r) {
+    if (a64_bin_mode) { enc_ldr_d_post(r, 31, 16); } else { out("  ldr d"); a64_print_dec(r); out(", [sp], #16"); putchar('\n'); }
+    a64_depth = a64_depth - 1; return 0;
+}
+
+// ── Expression emission ────────────────────────────────────
+// Emits ARM64 code for an expression node.
+// Returns 0 if result is integer (in x0), 1 if float (in d0).
+
+a64_emit_node(n) { return 0; }
+
+a64_emit_node(nd) {
+    auto n: Node;
+    auto t, op_s, op_l, c0, c1, arr, cnt, i, off, lbl, lbl2, vi, lty, rty;
+    auto lit_s, lit_l, sid, str_p, fid, use_flt, is_io, uty, ety, fidx_c, fi, fn_name: Node;
+    if (nd == 0) {
+        if (a64_bin_mode) { enc_movz(0, 0, 0); } else { out("  mov x0, #0"); putchar('\n'); }
+        return 0;
+    }
+    n = nd; t = n.ntype;
+
+    if (t == T_LIT) {
+        // Check if this literal is a string (starts with double-quote).
+        lit_s = unpack_s(n.a); lit_l = unpack_l(n.a);
+        if (peek(a64_sbuf + lit_s) == '"') {
+            // String literal: strip quotes, store in string table, emit address load.
+            sid = a64_str_cnt;
+            str_p = pack(lit_s + 1, lit_l - 2);
+            *(a64_str_tbl + sid * 8) = str_p;
+            a64_str_cnt = a64_str_cnt + 1;
+            if (a64_bin_mode) {
+                enc_add_reloc(enc_pos, sid, 1);
+                enc_adrp(0); enc_add_imm(0, 0, 0);
+            } else {
+                out("  adrp x0, _str_"); a64_print_dec(sid); out("@PAGE"); putchar('\n');
+                out("  add x0, x0, _str_"); a64_print_dec(sid); out("@PAGEOFF"); putchar('\n');
+            }
+            return 0;
+        }
+        // Check if float literal (contains a decimal point).
+        if (a64_is_float_lit(n.a) == 1) {
+            fid = a64_flt_cnt;
+            *(a64_flt_tbl + fid * 8) = n.a;
+            a64_flt_cnt = a64_flt_cnt + 1;
+            if (a64_bin_mode) {
+                enc_add_reloc(enc_pos, fid, 2);
+                enc_adrp(8); enc_add_imm(8, 8, 0);
+                enc_ldr_d_uoff(0, 8, 0);
+            } else {
+                out("  adrp x8, _flt_"); a64_print_dec(fid); out("@PAGE"); putchar('\n');
+                out("  add x8, x8, _flt_"); a64_print_dec(fid); out("@PAGEOFF"); putchar('\n');
+                out("  ldr d0, [x8]"); putchar('\n');
+            }
+            return 1;
+        }
+        a64_emit_mov(a64_parse_int(n.a)); return 0;
+    }
+
+    if (t == T_VAR) {
+        vi = a64_var_idx(n.a);
+        if (vi >= 0) {
+            off = 24 + vi * 8;
+            if (a64_var_is_float(vi)) {
+                if (a64_bin_mode) { enc_ldr_d_uoff(0, 29, off); }
+                else { out("  ldr d0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n'); }
+                return 1;
+            }
+            if (a64_bin_mode) { enc_ldr_uoff(0, 29, off); }
+            else { out("  ldr x0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n'); }
+            return 0;
+        }
+        // Global variable: load address then load value.
+        if (a64_bin_mode) {
+            vi = a64_find_fn(n.a);
+            enc_add_reloc(enc_pos, n.a, 0);
+            enc_adrp(8); enc_add_imm(8, 8, 0);
+            enc_ldr_uoff(0, 8, 0);
+        } else {
+            out("  adrp x8, _"); a64_print_p(n.a); out("@PAGE"); putchar('\n');
+            out("  add x8, x8, _"); a64_print_p(n.a); out("@PAGEOFF"); putchar('\n');
+            out("  ldr x0, [x8]"); putchar('\n');
+        }
+        return 0;
+    }
+
+    if (t == T_BINOP) {
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        c0 = peek(a64_sbuf + op_s);
+        c1 = 0; if (op_l > 1) { c1 = peek(a64_sbuf + op_s + 1); }
+
+        // Check if this is an integer-only operator (%, &, |, ^, <<, >>).
+        is_io = 0;
+        if (c0 == '%') { is_io = 1; }
+        if (c0 == '^') { is_io = 1; }
+        if (c0 == '&') { if (op_l == 1) { is_io = 1; } }
+        if (c0 == '|') { if (op_l == 1) { is_io = 1; } }
+        if (c0 == '<') { if (c1 == '<') { is_io = 1; } }
+        if (c0 == '>') { if (c1 == '>') { is_io = 1; } }
+
+        // Evaluate left operand, push onto stack.
+        lty = a64_emit_node(n.b);
+        if (lty == 1) { a64_emit_fpush(); } else { a64_emit_push(); }
+
+        // Evaluate right operand.
+        rty = a64_emit_node(n.c);
+
+        // Determine if we use float arithmetic.
+        use_flt = 0;
+        if (is_io == 0) { if (lty == 1 | rty == 1) { use_flt = 1; } }
+
+        if (use_flt == 1) {
+            // Ensure right operand is in d0.
+            if (rty == 0) { if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); } }
+            // Pop left operand into d1.
+            if (lty == 1) { a64_emit_fpop(1); }
+            else { a64_emit_pop(1); if (a64_bin_mode) { enc_scvtf(1, 1); } else { out("  scvtf d1, x1"); putchar('\n'); } }
+            // d1 = left, d0 = right.
+
+            // Float arithmetic operators.
+            if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_fadd(0,1,0); } else { out("  fadd d0, d1, d0"); putchar('\n'); } return 1; } }
+            if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_fsub(0,1,0); } else { out("  fsub d0, d1, d0"); putchar('\n'); } return 1; } }
+            if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_fmul(0,1,0); } else { out("  fmul d0, d1, d0"); putchar('\n'); } return 1; } }
+            if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_fdiv(0,1,0); } else { out("  fdiv d0, d1, d0"); putchar('\n'); } return 1; } }
+
+            // Float comparison operators — result is integer in x0.
+            if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,0); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
+            if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,1); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
+            if (c0 == '<') {
+                if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,9); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ls"); putchar('\n'); } return 0; }
+                if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,4); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, mi"); putchar('\n'); } return 0; }
+            }
+            if (c0 == '>') {
+                if (c1 == '=') { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,10); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
+                if (op_l == 1) { if (a64_bin_mode) { enc_fcmp(1,0); enc_cset(0,12); } else { out("  fcmp d1, d0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
+            }
+            // Float logical operators: compare each side against zero.
+            if (c0 == '&') { if (c1 == '&') {
+                if (a64_bin_mode) { enc_fcmp_zero(1); enc_cset(1,1); enc_fcmp_zero(0); enc_cset(0,1); enc_and_reg(0,1,0); }
+                else { out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  and x0, x1, x0"); putchar('\n'); }
+                return 0;
+            } }
+            if (c0 == '|') { if (c1 == '|') {
+                if (a64_bin_mode) { enc_fcmp_zero(1); enc_cset(1,1); enc_fcmp_zero(0); enc_cset(0,1); enc_orr_reg(0,1,0); }
+                else { out("  fcmp d1, #0.0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  fcmp d0, #0.0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  orr x0, x1, x0"); putchar('\n'); }
+                return 0;
+            } }
+            return 1;
+        }
+
+        // Integer path. Convert float operands to int if needed.
+        if (rty == 1) { if (a64_bin_mode) { enc_fcvtzs(0,0); } else { out("  fcvtzs x0, d0"); putchar('\n'); } }
+        if (lty == 1) {
+            a64_emit_fpop(0);
+            if (a64_bin_mode) { enc_fcvtzs(1,0); } else { out("  fcvtzs x1, d0"); putchar('\n'); }
+        } else {
+            a64_emit_pop(1);
+        }
+        // x1 = left, x0 = right.
+        if (c0 == '+') { if (op_l == 1) { if (a64_bin_mode) { enc_add_reg(0,1,0); } else { out("  add x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '-') { if (op_l == 1) { if (a64_bin_mode) { enc_sub_reg(0,1,0); } else { out("  sub x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '*') { if (op_l == 1) { if (a64_bin_mode) { enc_mul(0,1,0); } else { out("  mul x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '/') { if (op_l == 1) { if (a64_bin_mode) { enc_sdiv(0,1,0); } else { out("  sdiv x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '%') { if (op_l == 1) {
+            if (a64_bin_mode) { enc_sdiv(8,1,0); enc_msub(0,8,0,1); }
+            else { out("  sdiv x8, x1, x0"); putchar('\n'); out("  msub x0, x8, x0, x1"); putchar('\n'); }
+            return 0;
+        } }
+        // Bitwise operators.
+        if (c0 == '&') { if (op_l == 1) { if (a64_bin_mode) { enc_and_reg(0,1,0); } else { out("  and x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '|') { if (op_l == 1) { if (a64_bin_mode) { enc_orr_reg(0,1,0); } else { out("  orr x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '^') { if (op_l == 1) { if (a64_bin_mode) { enc_eor_reg(0,1,0); } else { out("  eor x0, x1, x0"); putchar('\n'); } return 0; } }
+        // Shift operators.
+        if (c0 == '>') { if (c1 == '>') { if (a64_bin_mode) { enc_asrv(0,1,0); } else { out("  asr x0, x1, x0"); putchar('\n'); } return 0; } }
+        if (c0 == '<') { if (c1 == '<') { if (a64_bin_mode) { enc_lslv(0,1,0); } else { out("  lsl x0, x1, x0"); putchar('\n'); } return 0; } }
+        // Comparison operators.
+        if (c0 == '=') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,0); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, eq"); putchar('\n'); } return 0; } }
+        if (c0 == '!') { if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,1); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); } return 0; } }
+        if (c0 == '<') {
+            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,13); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, le"); putchar('\n'); } return 0; }
+            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,11); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, lt"); putchar('\n'); } return 0; }
+        }
+        if (c0 == '>') {
+            if (c1 == '=') { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,10); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, ge"); putchar('\n'); } return 0; }
+            if (op_l == 1) { if (a64_bin_mode) { enc_cmp_reg(1,0); enc_cset(0,12); } else { out("  cmp x1, x0"); putchar('\n'); out("  cset x0, gt"); putchar('\n'); } return 0; }
+        }
+        // Logical operators: convert to boolean first.
+        if (c0 == '&') { if (c1 == '&') {
+            if (a64_bin_mode) { enc_cmp_imm(1,0); enc_cset(1,1); enc_cmp_imm(0,0); enc_cset(0,1); enc_and_reg(0,1,0); }
+            else { out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  and x0, x1, x0"); putchar('\n'); }
+            return 0;
+        } }
+        if (c0 == '|') { if (c1 == '|') {
+            if (a64_bin_mode) { enc_cmp_imm(1,0); enc_cset(1,1); enc_cmp_imm(0,0); enc_cset(0,1); enc_orr_reg(0,1,0); }
+            else { out("  cmp x1, #0"); putchar('\n'); out("  cset x1, ne"); putchar('\n'); out("  cmp x0, #0"); putchar('\n'); out("  cset x0, ne"); putchar('\n'); out("  orr x0, x1, x0"); putchar('\n'); }
+            return 0;
+        } }
+        return 0;
+    }
+
+    if (t == T_UNARY) {
+        uty = a64_emit_node(n.b);
+        // Check if operator is '~' (bitwise NOT) or '-' (negate).
+        op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+        if (op_l == 1) { if (peek(a64_sbuf + op_s) == '~') {
+            // Bitwise NOT: MVN Xd, Xn
+            if (a64_bin_mode) { enc_mvn(0, 0); } else { out("  mvn x0, x0"); putchar('\n'); }
+            return 0;
+        } }
+        if (uty == 1) {
+            if (a64_bin_mode) { enc_fneg(0, 0); } else { out("  fneg d0, d0"); putchar('\n'); }
+            return 1;
+        }
+        if (a64_bin_mode) { enc_neg(0, 0); } else { out("  neg x0, x0"); putchar('\n'); }
+        return 0;
+    }
+
+    if (t == T_CALL) {
+        // Built-in: putchar — write 1 byte to stdout via syscall.
+        if (a64_str_eq(n.a, "putchar", 7)) {
+            arr = n.b; ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            if (a64_bin_mode) {
+                enc_strb_uoff(0, 29, 16);
+                enc_mov_wide(0, 1);
+                enc_add_imm(1, 29, 16);
+                enc_mov_wide(2, 1);
+                enc_mov_wide(16, 4);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  strb w0, [x29, #16]"); putchar('\n');
+                out("  mov x0, #1"); putchar('\n');
+                out("  add x1, x29, #16"); putchar('\n');
+                out("  mov x2, #1"); putchar('\n');
+                out("  mov x16, #4"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: getchar — read 1 byte from stdin via syscall.
+        if (a64_str_eq(n.a, "getchar", 7)) {
+            if (a64_bin_mode) {
+                lbl = enc_new_label();
+                lbl2 = enc_new_label();
+                enc_strb_uoff(31, 29, 16);
+                enc_mov_wide(0, 0);
+                enc_add_imm(1, 29, 16);
+                enc_mov_wide(2, 1);
+                enc_mov_wide(16, 3);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+                enc_cmp_imm(0, 1);
+                enc_b_cond_label(11, lbl);
+                enc_ldrb_uoff(0, 29, 16);
+                enc_b_label(lbl2);
+                enc_def_label(lbl);
+                enc_mov_wide(0, -1);
+                enc_def_label(lbl2);
+            } else {
+                lbl = a64_new_lbl();
+                out("  strb wzr, [x29, #16]"); putchar('\n');
+                out("  mov x0, #0"); putchar('\n');
+                out("  add x1, x29, #16"); putchar('\n');
+                out("  mov x2, #1"); putchar('\n');
+                out("  mov x16, #3"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+                out("  cmp x0, #1"); putchar('\n');
+                out("  b.lt .Leof"); a64_print_dec(lbl); putchar('\n');
+                out("  ldrb w0, [x29, #16]"); putchar('\n');
+                out("  b .Leofend"); a64_print_dec(lbl); putchar('\n');
+                out(".Leof"); a64_print_dec(lbl); out(":"); putchar('\n');
+                out("  mov x0, #-1"); putchar('\n');
+                out(".Leofend"); a64_print_dec(lbl); out(":"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: malloc — allocate memory.
+        // In binary mode, each call does an mmap syscall directly.
+        // In asm mode, calls libSystem's malloc.
+        if (a64_str_eq(n.a, "malloc", 6)) {
+            arr = n.b; ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            if (a64_bin_mode) {
+                // mmap(0, size, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0)
+                // x0 = size (already in x0 from arg eval)
+                enc_mov_reg(1, 0);          // x1 = length (from x0)
+                enc_mov_wide(0, 0);         // x0 = addr = 0
+                enc_mov_wide(2, 3);         // x2 = prot = PROT_READ|PROT_WRITE
+                enc_mov_wide(3, 0x1002);    // x3 = flags = MAP_PRIVATE|MAP_ANON
+                enc_movn(4, 0, 0);          // x4 = -1 (fd, for MAP_ANON)
+                enc_mov_wide(5, 0);         // x5 = offset = 0
+                enc_mov_wide(16, 197);      // x16 = SYS_mmap
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);      // negate on carry (error)
+            } else { out("  bl _malloc"); putchar('\n'); }
+            return 0;
+        }
+        // Built-in: free — release memory. No-op with bump allocator.
+        if (a64_str_eq(n.a, "free", 4)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            if (a64_bin_mode) { enc_mov_wide(0, 0); } else { out("  mov x0, #0"); putchar('\n'); }
+            return 0;
+        }
+        // Built-in: realloc(ptr, size) — resize memory. With bump allocator, always allocates new block.
+        if (a64_str_eq(n.a, "realloc", 7)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0)); a64_emit_push();  // push old ptr
+            a64_emit_node(*(arr + 8));                     // x0 = new size
+            // Allocate new block (mmap).
+            if (a64_bin_mode) {
+                enc_mov_reg(1, 0);
+                enc_mov_wide(0, 0);
+                enc_mov_wide(2, 3);
+                enc_mov_wide(3, 0x1002);
+                enc_movn(4, 0, 0);
+                enc_mov_wide(5, 0);
+                enc_mov_wide(16, 197);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else { out("  bl _malloc"); putchar('\n'); }
+            // x0 = new ptr. Old ptr is on stack. Return new ptr.
+            // NOTE: caller must copy data themselves. realloc here is just malloc.
+            a64_emit_pop(1);  // discard old ptr
+            return 0;
+        }
+        // Built-in: peek — byte read from real pointer.
+        if (a64_str_eq(n.a, "peek", 4)) {
+            arr = n.b; ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            if (a64_bin_mode) { enc_ldrb_uoff(0, 0, 0); } else { out("  ldrb w0, [x0]"); putchar('\n'); }
+            return 0;
+        }
+        // Built-in: poke — byte write to real pointer.
+        if (a64_str_eq(n.a, "poke", 4)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 8));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_pop(1);
+            if (a64_bin_mode) { enc_strb_uoff(1, 0, 0); } else { out("  strb w1, [x0]"); putchar('\n'); }
+            return 0;
+        }
+        // Built-in: str_peek — byte read from real string pointer.
+        if (a64_str_eq(n.a, "str_peek", 8)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 8));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_pop(1);
+            if (a64_bin_mode) { enc_ldrb_reg(0, 0, 1); } else { out("  ldrb w0, [x0, x1]"); putchar('\n'); }
+            return 0;
+        }
+        // Built-in: sys_write(fd, buf, len) — raw write syscall.
+        if (a64_str_eq(n.a, "sys_write", 9)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 16));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 8));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_pop(1); a64_emit_pop(2);
+            if (a64_bin_mode) {
+                enc_mov_wide(16, 4);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x16, #4"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_read(fd, buf, len) — raw read syscall.
+        if (a64_str_eq(n.a, "sys_read", 8)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 16));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 8));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_pop(1); a64_emit_pop(2);
+            if (a64_bin_mode) {
+                enc_mov_wide(16, 3);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x16, #3"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_open(path, flags) — raw open syscall.
+        if (a64_str_eq(n.a, "sys_open", 8)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 8));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_push();
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            a64_emit_pop(1);
+            if (a64_bin_mode) {
+                enc_mov_wide(2, 493);
+                enc_mov_wide(16, 5);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x2, #493"); putchar('\n');
+                out("  mov x16, #5"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_close(fd) — raw close syscall.
+        if (a64_str_eq(n.a, "sys_close", 9)) {
+            arr = n.b;
+            ety = a64_emit_node(*(arr + 0));
+            if (ety == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+            if (a64_bin_mode) {
+                enc_mov_wide(16, 6);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x16, #6"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_fork() — fork the process. Returns child pid to parent, 0 to child.
+        if (a64_str_eq(n.a, "sys_fork", 8)) {
+            if (a64_bin_mode) {
+                enc_mov_wide(16, 2);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x16, #2"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_execve(path, argv, envp) — replace process image.
+        if (a64_str_eq(n.a, "sys_execve", 10)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0)); a64_emit_push();
+            a64_emit_node(*(arr + 8)); a64_emit_push();
+            a64_emit_node(*(arr + 16));
+            a64_emit_pop(1);
+            a64_emit_pop(2);
+            // Swap: x0=path(was x2), x1=argv(was x1), x2=envp(was x0)
+            // Actually after pops: x2=path, x1=argv, x0=envp. Need x0=path, x1=argv, x2=envp.
+            if (a64_bin_mode) {
+                enc_mov_reg(3, 0);  // x3 = envp
+                enc_mov_reg(0, 2);  // x0 = path
+                enc_mov_reg(2, 3);  // x2 = envp
+                enc_mov_wide(16, 59);
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x3, x0"); putchar('\n');
+                out("  mov x0, x2"); putchar('\n');
+                out("  mov x2, x3"); putchar('\n');
+                out("  mov x16, #59"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_waitpid(pid) — wait for child process to exit.
+        if (a64_str_eq(n.a, "sys_waitpid", 11)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            if (a64_bin_mode) {
+                enc_mov_wide(1, 0);  // status = NULL
+                enc_mov_wide(2, 0);  // options = 0
+                enc_mov_wide(3, 0);  // rusage = NULL
+                enc_mov_wide(16, 7); // wait4
+                enc_svc(0x80);
+                enc_csneg(0, 0, 0, 3);
+            } else {
+                out("  mov x1, #0"); putchar('\n');
+                out("  mov x2, #0"); putchar('\n');
+                out("  mov x3, #0"); putchar('\n');
+                out("  mov x16, #7"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+                out("  csneg x0, x0, x0, cc"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: sys_exit(code) — terminate the process immediately.
+        if (a64_str_eq(n.a, "sys_exit", 8)) {
+            arr = n.b;
+            a64_emit_node(*(arr + 0));
+            if (a64_bin_mode) {
+                enc_mov_wide(16, 1);
+                enc_svc(0x80);
+            } else {
+                out("  mov x16, #1"); putchar('\n');
+                out("  svc #0x80"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: argc_get() — return the argument count.
+        if (a64_str_eq(n.a, "argc_get", 8)) {
+            if (a64_bin_mode) {
+                enc_add_reloc(enc_pos, a64_argc_sym, 0);
+                enc_adrp(8); enc_add_imm(8, 8, 0);
+                enc_ldr_uoff(0, 8, 0);
+            } else {
+                out("  adrp x8, _bpp_argc@PAGE"); putchar('\n');
+                out("  add x8, x8, _bpp_argc@PAGEOFF"); putchar('\n');
+                out("  ldr x0, [x8]"); putchar('\n');
+            }
+            return 0;
+        }
+        // Built-in: argv_get(i) — return a pointer to the i-th argument string.
+        if (a64_str_eq(n.a, "argv_get", 8)) {
+            // Evaluate the index argument.
+            a64_emit_node(*(n.b));
+            a64_emit_push();
+            if (a64_bin_mode) {
+                enc_add_reloc(enc_pos, a64_argv_sym, 0);
+                enc_adrp(8); enc_add_imm(8, 8, 0);
+                enc_ldr_uoff(0, 8, 0);
+                a64_emit_pop(1);
+                enc_ldr_reg_shift3(0, 0, 1);
+            } else {
+                out("  adrp x8, _bpp_argv@PAGE"); putchar('\n');
+                out("  add x8, x8, _bpp_argv@PAGEOFF"); putchar('\n');
+                out("  ldr x0, [x8]"); putchar('\n');
+                a64_emit_pop(1);
+                out("  ldr x0, [x0, x1, lsl #3]"); putchar('\n');
+            }
+            return 0;
+        }
+
+        // Built-in: fn_ptr(name) — return the code address of a B++ function.
+        if (a64_str_eq(n.a, "fn_ptr", 6)) {
+            arr = n.b;
+            fn_name = *(arr + 0);
+            fi = a64_find_fn(fn_name.a);
+            if (a64_bin_mode) {
+                enc_adr_label(0, *(a64_fn_lbl + fi * 8));
+            } else {
+                out("  adrp x0, _"); a64_print_p(fn_name.a); out("@PAGE"); putchar('\n');
+                out("  add x0, x0, _"); a64_print_p(fn_name.a); out("@PAGEOFF"); putchar('\n');
+            }
+            return 0;
+        }
+
+        // Built-in: call(fn_ptr, arg0, arg1, ...) — indirect function call.
+        // First argument is the function address, remaining are passed to it.
+        if (a64_str_eq(n.a, "call", 4)) {
+            arr = n.b; cnt = n.c;
+            // Evaluate all arguments (fn_ptr + real args) and push.
+            i = 0;
+            while (i < cnt) {
+                a64_emit_node(*(arr + i * 8));
+                a64_emit_push();
+                i = i + 1;
+            }
+            // Pop real args into x0..x(cnt-2).
+            i = cnt - 2;
+            while (i >= 0) { a64_emit_pop(i); i = i - 1; }
+            // Pop function pointer into x9 (it was pushed first, so it's last to pop).
+            a64_emit_pop(9);
+            // Indirect call.
+            if (a64_bin_mode) { enc_blr(9); } else { out("  blr x9"); putchar('\n'); }
+            return 0;
+        }
+
+        // Regular B++ function call.
+        // Query bpp_types.bsm for callee's parameter and return types.
+        fidx_c = find_func_idx(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            ety = a64_emit_node(*(arr + i * 8));
+            if (fidx_c >= 0) {
+                vi = get_fn_par_type(fidx_c, i) == TY_FLOAT;
+                if (ety == 1) {
+                    if (vi == 1) {
+                        if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
+                    } else {
+                        if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+                    }
+                } else {
+                    if (vi == 1) {
+                        if (a64_bin_mode) {
+                            enc_scvtf(0, 0);
+                            enc_fmov_to_gpr(0, 0);
+                        } else {
+                            out("  scvtf d0, x0"); putchar('\n');
+                            out("  fmov x0, d0"); putchar('\n');
+                        }
+                    }
+                }
+            } else {
+                if (ety == 1) {
+                    if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
+                }
+            }
+            a64_emit_push();
+            i = i + 1;
+        }
+        // Pop args into x0..x(cnt-1) in reverse order.
+        i = cnt - 1;
+        while (i >= 0) { a64_emit_pop(i); i = i - 1; }
+        if (a64_bin_mode) {
+            fi = a64_find_fn(n.a);
+            if (fi >= 0) {
+                enc_bl_label(*(a64_fn_lbl + fi * 8));
+            } else {
+                // External function: load address from GOT and call indirectly.
+                // x16 (IP0) is the standard scratch register for stubs.
+                enc_add_reloc(enc_pos, n.a, 3);
+                enc_adrp(16);
+                enc_ldr_uoff(16, 16, 0);
+                enc_blr(16);
+            }
+        } else {
+            out("  bl _"); a64_print_p(n.a); putchar('\n');
+        }
+        // Check if callee returns float.
+        if (fidx_c >= 0) {
+            if (get_fn_ret_type(fidx_c) == TY_FLOAT) { return 1; }
+        }
+        return 0;
+    }
+
+    // mem_load: *(ptr) — load 8 bytes from real pointer.
+    if (t == T_MEMLD) {
+        ety = a64_emit_node(n.a);
+        if (ety == 1) {
+            if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+        }
+        if (a64_bin_mode) { enc_ldr_uoff(0, 0, 0); } else { out("  ldr x0, [x0]"); putchar('\n'); }
+        return 0;
+    }
+
+    return 0;
+}
+
+// ── Statement emission ─────────────────────────────────────
+
+a64_emit_body(arr, cnt) {
+    auto i;
+    auto n: Node;
+    i = 0;
+    while (i < cnt) {
+        n = *(arr + i * 8);
+        if (n != 0) { a64_emit_stmt(n); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+a64_emit_stmt(nd) {
+    auto n: Node;
+    auto lhs: Node;
+    auto t, off, lbl, lbl2, arr, cnt, i, rty, vi, ety;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+
+    if (t == T_DECL) {
+        // Variables already pre-registered in emit_func. No-op.
+        return 0;
+    }
+
+    if (t == T_ASSIGN) {
+        lhs = n.a;
+        rty = a64_emit_node(n.b);
+        if (lhs.ntype == T_VAR) {
+            vi = a64_var_idx(lhs.a);
+            if (vi >= 0) {
+                off = 24 + vi * 8;
+                if (a64_var_is_float(vi)) {
+                    // Float variable: convert int to float if needed, store as double.
+                    if (rty == 0) {
+                        if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
+                    }
+                    if (a64_bin_mode) { enc_str_d_uoff(0, 29, off); } else {
+                        out("  str d0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+                    }
+                } else {
+                    // Int variable: convert float to int if needed, store as long.
+                    if (rty == 1) {
+                        if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+                    }
+                    if (a64_bin_mode) { enc_str_uoff(0, 29, off); } else {
+                        out("  str x0, [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+                    }
+                }
+            } else {
+                // Global variable store.
+                if (rty == 1) {
+                    if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+                }
+                if (a64_bin_mode) {
+                    enc_add_reloc(enc_pos, lhs.a, 0);
+                    enc_adrp(8);
+                    enc_add_imm(8, 8, 0);
+                    enc_str_uoff(0, 8, 0);
+                } else {
+                    out("  adrp x8, _"); a64_print_p(lhs.a); out("@PAGE"); putchar('\n');
+                    out("  add x8, x8, _"); a64_print_p(lhs.a); out("@PAGEOFF"); putchar('\n');
+                    out("  str x0, [x8]"); putchar('\n');
+                }
+            }
+        }
+        return 0;
+    }
+
+    // mem_store: *(ptr) = val — store 8 bytes to real pointer.
+    if (t == T_MEMST) {
+        ety = a64_emit_node(n.b);
+        if (ety == 1) {
+            if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
+        }
+        a64_emit_push();
+        a64_emit_node(n.a);
+        a64_emit_pop(1);
+        if (a64_bin_mode) { enc_str_uoff(1, 0, 0); } else { out("  str x1, [x0]"); putchar('\n'); }
+        return 0;
+    }
+
+    if (t == T_IF) {
+        if (a64_bin_mode) {
+            lbl = enc_new_label();
+            lbl2 = enc_new_label();
+            ety = a64_emit_node(n.a);
+            if (ety == 1) {
+                enc_fcmp_zero(0);
+                enc_cset(0, 1);
+            }
+            enc_cbz_label(0, lbl);
+            a64_emit_body(n.b, n.c);
+            enc_b_label(lbl2);
+            enc_def_label(lbl);
+            if (n.e > 0) { a64_emit_body(n.d, n.e); }
+            enc_def_label(lbl2);
+        } else {
+            lbl = a64_new_lbl();
+            ety = a64_emit_node(n.a);
+            if (ety == 1) {
+                out("  fcmp d0, #0.0"); putchar('\n');
+                out("  cset x0, ne"); putchar('\n');
+            }
+            out("  cbz x0, .Lelse"); a64_print_dec(lbl); putchar('\n');
+            a64_emit_body(n.b, n.c);
+            out("  b .Lendif"); a64_print_dec(lbl); putchar('\n');
+            out(".Lelse"); a64_print_dec(lbl); out(":"); putchar('\n');
+            if (n.e > 0) { a64_emit_body(n.d, n.e); }
+            out(".Lendif"); a64_print_dec(lbl); out(":"); putchar('\n');
+        }
+        return 0;
+    }
+
+    if (t == T_WHILE) {
+        if (a64_bin_mode) {
+            lbl = enc_new_label();
+            lbl2 = enc_new_label();
+            enc_def_label(lbl);
+            ety = a64_emit_node(n.a);
+            if (ety == 1) {
+                enc_fcmp_zero(0);
+                enc_cset(0, 1);
+            }
+            enc_cbz_label(0, lbl2);
+            a64_emit_body(n.b, n.c);
+            enc_b_label(lbl);
+            enc_def_label(lbl2);
+        } else {
+            lbl = a64_new_lbl();
+            out(".Lloop"); a64_print_dec(lbl); out(":"); putchar('\n');
+            ety = a64_emit_node(n.a);
+            if (ety == 1) {
+                out("  fcmp d0, #0.0"); putchar('\n');
+                out("  cset x0, ne"); putchar('\n');
+            }
+            out("  cbz x0, .Lend"); a64_print_dec(lbl); putchar('\n');
+            a64_emit_body(n.b, n.c);
+            out("  b .Lloop"); a64_print_dec(lbl); putchar('\n');
+            out(".Lend"); a64_print_dec(lbl); out(":"); putchar('\n');
+        }
+        return 0;
+    }
+
+    if (t == T_RET) {
+        rty = a64_emit_node(n.a);
+        // Ensure return value matches function's declared return type.
+        if (get_fn_ret_type(a64_cur_fn_idx) == TY_FLOAT) {
+            if (rty == 0) {
+                if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
+            }
+        } else {
+            if (rty == 1) {
+                if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
+            }
+        }
+        if (a64_bin_mode) {
+            enc_b_label(a64_ret_lbl);
+        } else {
+            out("  b .Lret_"); a64_print_p(a64_cur_fn_name); putchar('\n');
+        }
+        return 0;
+    }
+
+    if (t == T_NOP) { return 0; }
+
+    // Expression statement (e.g., function call as statement).
+    a64_emit_node(nd);
+    return 0;
+}
+
+// ── Function emission ──────────────────────────────────────
+
+a64_emit_func(fi) {
+    auto name_p, par_arr, par_cnt, body_arr, body_cnt;
+    auto frame, i;
+    name_p = *(a64_fn_name + fi * 8);
+    par_arr = *(a64_fn_par + fi * 8); par_cnt = *(a64_fn_pcnt + fi * 8);
+    body_arr = *(a64_fn_body + fi * 8); body_cnt = *(a64_fn_bcnt + fi * 8);
+
+    // Reset variable tracking for this function.
+    a64_var_cnt = 0;
+    a64_cur_fn_name = name_p;
+    a64_cur_fn_idx = *(a64_fn_fidx + fi * 8);
+
+    // Register params as variables (slots 0..par_cnt-1).
+    i = 0;
+    while (i < par_cnt) { a64_var_add(*(par_arr + i * 8)); i = i + 1; }
+
+    // Pre-register all declared variables from body (including nested blocks).
+    a64_pre_reg_vars(body_arr, body_cnt);
+
+    // Calculate frame size: 16 (saved regs) + 8 (scratch) + all_vars * 8, aligned to 16.
+    frame = 24 + a64_var_cnt * 8;
+    frame = (frame + 15) / 16 * 16;
+
+    if (a64_bin_mode) {
+        // Define the label for this function's entry point.
+        enc_def_label(*(a64_fn_lbl + fi * 8));
+
+        // Allocate a return label for this function.
+        a64_ret_lbl = enc_new_label();
+
+        // Prologue: save frame pointer and return address, allocate frame.
+        enc_stp_pre(29, 30, 31, 0 - frame);
+        enc_add_imm(29, 31, 0);
+
+        // In main(), save x0 (argc) and x1 (argv) to hidden globals
+        // before anything else clobbers them. dyld passes these via
+        // the standard calling convention when using LC_MAIN.
+        if (a64_str_eq(name_p, "main", 4)) {
+            enc_add_reloc(enc_pos, a64_argc_sym, 0);
+            enc_adrp(8); enc_add_imm(8, 8, 0);
+            enc_str_uoff(0, 8, 0);
+            enc_add_reloc(enc_pos, a64_argv_sym, 0);
+            enc_adrp(8); enc_add_imm(8, 8, 0);
+            enc_str_uoff(1, 8, 0);
+        }
+
+        // Store incoming register arguments to their stack slots.
+        i = 0;
+        while (i < par_cnt) {
+            enc_str_uoff(i, 29, 24 + i * 8);
+            i = i + 1;
+        }
+
+        // Emit function body.
+        a64_depth = 0;
+        a64_emit_body(body_arr, body_cnt);
+
+        // Epilogue.
+        enc_def_label(a64_ret_lbl);
+        enc_ldp_post(29, 30, 31, frame);
+        enc_ret();
+    } else {
+        // Emit function header.
+        out(".p2align 2"); putchar('\n');
+        if (a64_str_eq(name_p, "main", 4)) {
+            out(".globl _main"); putchar('\n');
+            out("_main:"); putchar('\n');
+        } else {
+            out("_"); a64_print_p(name_p); out(":"); putchar('\n');
+        }
+
+        // Prologue: save frame pointer and return address, allocate frame.
+        out("  stp x29, x30, [sp, #-"); a64_print_dec(frame); out("]!"); putchar('\n');
+        out("  mov x29, sp"); putchar('\n');
+
+        // In main(), save x0 (argc) and x1 (argv) to globals.
+        if (a64_str_eq(name_p, "main", 4)) {
+            out("  adrp x8, _bpp_argc@PAGE"); putchar('\n');
+            out("  add x8, x8, _bpp_argc@PAGEOFF"); putchar('\n');
+            out("  str x0, [x8]"); putchar('\n');
+            out("  adrp x8, _bpp_argv@PAGE"); putchar('\n');
+            out("  add x8, x8, _bpp_argv@PAGEOFF"); putchar('\n');
+            out("  str x1, [x8]"); putchar('\n');
+        }
+
+        // Store incoming register arguments to their stack slots.
+        i = 0;
+        while (i < par_cnt) {
+            out("  str x"); a64_print_dec(i); out(", [x29, #"); a64_print_dec(24 + i * 8); out("]"); putchar('\n');
+            i = i + 1;
+        }
+
+        // Emit function body.
+        a64_depth = 0;
+        a64_emit_body(body_arr, body_cnt);
+
+        // Epilogue.
+        out(".Lret_"); a64_print_p(name_p); out(":"); putchar('\n');
+        out("  ldp x29, x30, [sp], #"); a64_print_dec(frame); putchar('\n');
+        out("  ret"); putchar('\n');
+        putchar('\n');
+    }
+    return 0;
+}
+
+// ── Top-level emission ─────────────────────────────────────
+
+// Run all ARM64 emission stages in order.
+emit_all_arm64() {
+    auto i, sp, ss, sl, j, ch, fp, fs, fl;
+
+    bridge_data_arm64();
+
+    if (a64_bin_mode) {
+        // Add hidden globals for argc/argv access in native binaries.
+        *(a64_gl_name + a64_gl_cnt * 8) = a64_argc_sym;
+        a64_gl_cnt = a64_gl_cnt + 1;
+        *(a64_gl_name + a64_gl_cnt * 8) = a64_argv_sym;
+        a64_gl_cnt = a64_gl_cnt + 1;
+
+        // Binary mode: allocate a label for each function, emit code, resolve fixups.
+        enc_pos = 0;
+        enc_lbl_max = 0;
+        enc_fix_cnt = 0;
+        enc_rel_cnt = 0;
+
+        // Allocate a label for each function.
+        i = 0;
+        while (i < a64_fn_cnt) {
+            *(a64_fn_lbl + i * 8) = enc_new_label();
+            i = i + 1;
+        }
+
+        // Emit all functions into the code buffer.
+        i = 0;
+        while (i < a64_fn_cnt) { a64_emit_func(i); i = i + 1; }
+
+        // Resolve all forward branch fixups.
+        enc_resolve_fixups();
+
+        // Code is now in enc_buf[0..enc_pos). The caller decides whether
+        // to write it to stdout or pass it to the Mach-O writer.
+    } else {
+        // Text assembly mode.
+        out(".section __TEXT,__text,regular,pure_instructions"); putchar('\n');
+        putchar('\n');
+
+        // Emit all functions.
+        i = 0;
+        while (i < a64_fn_cnt) { a64_emit_func(i); i = i + 1; }
+
+        // Emit global variables in data section.
+        out(".section __DATA,__data"); putchar('\n');
+        // Hidden globals for argc/argv access.
+        out(".p2align 3"); putchar('\n');
+        out("_bpp_argc: .quad 0"); putchar('\n');
+        out("_bpp_argv: .quad 0"); putchar('\n');
+        i = 0;
+        while (i < a64_gl_cnt) {
+            out(".globl _"); a64_print_p(*(a64_gl_name + i * 8)); putchar('\n');
+            out(".p2align 3"); putchar('\n');
+            out("_"); a64_print_p(*(a64_gl_name + i * 8)); out(":"); putchar('\n');
+            out("  .quad 0"); putchar('\n');
+            i = i + 1;
+        }
+        putchar('\n');
+
+        // Emit string literals in a read-only data section.
+        if (a64_str_cnt > 0) {
+            out(".section __TEXT,__cstring,cstring_literals"); putchar('\n');
+            i = 0;
+            while (i < a64_str_cnt) {
+                sp = *(a64_str_tbl + i * 8);
+                ss = unpack_s(sp); sl = unpack_l(sp);
+                out("_str_"); a64_print_dec(i); out(":"); putchar('\n');
+                out("  .asciz "); putchar('"');
+                j = 0;
+                while (j < sl) {
+                    ch = peek(a64_sbuf + ss + j);
+                    if (ch == '\n') { putchar('\\'); putchar('n'); }
+                    else { if (ch == '"') { putchar('\\'); putchar('"'); }
+                    else { if (ch == '\\') { putchar('\\'); putchar('\\'); }
+                    else { putchar(ch); } } }
+                    j = j + 1;
+                }
+                putchar('"'); putchar('\n');
+                i = i + 1;
+            }
+            putchar('\n');
+        }
+
+        // Emit float literal constants in a read-only data section.
+        if (a64_flt_cnt > 0) {
+            out(".section __DATA,__const"); putchar('\n');
+            i = 0;
+            while (i < a64_flt_cnt) {
+                fp = *(a64_flt_tbl + i * 8);
+                fs = unpack_s(fp); fl = unpack_l(fp);
+                out(".p2align 3"); putchar('\n');
+                out("_flt_"); a64_print_dec(i); out(":"); putchar('\n');
+                out("  .double ");
+                j = 0;
+                while (j < fl) { putchar(peek(a64_sbuf + fs + j)); j = j + 1; }
+                putchar('\n');
+                i = i + 1;
+            }
+            putchar('\n');
+        }
+    }
+
+    return 0;
+}
