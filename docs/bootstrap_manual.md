@@ -244,11 +244,31 @@ brew install --cask xquartz
 defaults write org.xquartz.X11 nolisten_tcp 0
 killall XQuartz 2>/dev/null
 open -a XQuartz
-xhost +localhost
 
-# Cross-compile and run
+# Authorize the X server. The Docker container connects from the
+# Docker bridge IP (192.168.65.x), not from localhost, so `+localhost`
+# is not enough on its own — open the door fully for local testing.
+# This is the minimum friction setting; tighten it if XQuartz is
+# exposed beyond the dev machine.
+xhost +
+
+# Cross-compile and run. Two flags make this work and are both
+# load-bearing — without either one the X11 connection fails and
+# the binary silently falls back to ANSI terminal rendering.
+#
+#   --add-host host.docker.internal:host-gateway
+#       Stock ubuntu:22.04 has no host.docker.internal entry in
+#       /etc/hosts. Docker Desktop resolves the name via embedded
+#       DNS only when the host is added explicitly. _x11_resolve_hosts
+#       in _stb_platform_linux.bsm reads /etc/hosts directly, so the
+#       `--add-host` line is what makes the lookup succeed.
+#
+#   --platform linux/amd64
+#       Required on Apple Silicon hosts so the x86_64 ELF binary runs
+#       under Rosetta inside the container.
 bpp --linux64 examples/snake_cpu.bpp -o /tmp/snake_linux
 docker run --rm \
+  --platform linux/amd64 \
   --add-host host.docker.internal:host-gateway \
   -e DISPLAY=host.docker.internal:0 \
   -v /tmp:/tmp \
@@ -258,9 +278,17 @@ docker run --rm \
 
 The window appears in XQuartz on the macOS host. This works for any game using `draw_*` (CPU framebuffer). GPU games (`render_*`) require Vulkan, which is not yet implemented (see `docs/todo.md` P0 / P4).
 
-### C Emitter (portable C output via raylib or SDL)
+**How to tell if X11 actually connected.** The platform layer falls back to ANSI rendering whenever the X server is unreachable, and the fallback also exits cleanly with `rc=0` — a successful run on its own does not prove X11 is active. The signal is the binary's stdout: if it floods the terminal with ANSI escape codes (`[?25l[2J[H[38;5;...m▀▀▀...`), the X11 path failed and the renderer is drawing block characters into the terminal. If stdout is empty and a window appears in XQuartz, X11 is wired correctly.
 
-The C emitter (`--c`) translates B++ to C99 source code on stdout. It is the universal escape hatch for any platform B++ does not have a native backend for. The recommended pattern is to write the game using `drv_raylib.bsm` (or `drv_sdl.bsm`) instead of `stbgame.bsm`, so the generated C calls regular C functions and avoids the Objective-C calling-convention pitfalls of dlopen + objc_msgSend.
+### C Emitter (portable C output)
+
+The C emitter (`--c`) translates B++ to C99 source code on stdout. It is the universal escape hatch for any platform B++ does not have a native backend for, and it is also a second independent codegen path that catches a different class of bugs than the native pipeline — the C compiler refuses what the native backend silently accepted. Two situations where this has paid off recently:
+
+- **Integer division precedence in compound assignment.** `sample *= bus_vol / 100` parses as `sample * (bus_vol / 100)`, which silently drops to zero whenever `bus_vol < 100`. The native backend ran the multiplication and division in the same pass and the bug only surfaced as inaudible voices in the mixer; the C emitter produced the same wrong output but it was easier to spot at the C level when reasoning about the desugared expression. Lesson: when reaching for `*=` or `/=`, only apply if the right-hand side is a single literal/identifier — see the tonify checklist Rule 14.
+
+- **`extrn` declarations colliding with function definitions.** B++'s native backend resolves cross-module function calls through the function table, so a leftover `extrn fn_name;` is harmless on the native path. The C emitter, however, emits the extrn as a C `extern long long fn_name;` — and C has a single namespace where a symbol cannot be both a variable and a function. The first sweep through `tests/run_all_c.sh` produced cascades of `error: redefinition of 'fn_name' as different kind of symbol` for primitives like `a64_emit_mov`, `x64_emit_load_var`, `layer_count`, and `modulab_prefs_zoom_get`. The fix is in `bpp_validate.bsm` (E223) plus the source-side cleanup of stale extrn lines.
+
+The recommended pattern for portable applications is to write the game using `drv_raylib.bsm` (or `drv_sdl.bsm`) instead of `stbgame.bsm`, so the generated C calls regular C functions and avoids the Objective-C calling-convention pitfalls of dlopen + objc_msgSend.
 
 ```bash
 # 1. Write the game using the raylib driver
@@ -833,19 +861,65 @@ main() {
 
 ### Running the suite
 
+There are three canonical runners. A change that touches the compiler,
+stdlib, or platform layer should be green in all three before commit.
+The reason for three is that each one exercises a different codegen
+path and a different class of bugs surfaces in each.
+
 ```bash
-for t in tests/test_*.bpp; do
-    name=$(basename $t .bpp)
-    ./bpp $t -o /tmp/$name 2>/dev/null || { echo "FAIL compile: $name"; continue; }
-    /tmp/$name > /dev/null 2>&1 || echo "FAIL exit: $name"
-    rm -f /tmp/$name
+# 1. Native ARM64 macOS (Mach-O). The everyday loop — fast, runs
+#    every test including GPU/Cocoa/audio paths that the other two
+#    cannot reach.
+sh tests/run_all.sh
+# Expected: 121 passed, 0 failed, 11 skipped (Linux/X11 tests).
+
+# 2. C backend (--c → clang → run). Catches what the native pipeline
+#    silently tolerates: integer division precedence, namespace
+#    collisions between extrn globals and functions, missing builtin
+#    handlers in the C emitter. Workers run in parallel so the wall
+#    time is ~6-8 s instead of ~38 s.
+sh tests/run_all_c.sh
+# Expected: 103 passed, 0 failed, 29 skipped.
+# The skip-list is documented at the top of run_all_c.sh — Cocoa/Metal
+# (objc_msgSend varargs), SIMD vec_*, threads (pthread FFI is macOS
+# Phase 1 only), and the macho-specific tests are intentionally out
+# of scope for the C path.
+
+# 3. Linux ELF in Docker (with XQuartz for X11). Catches cross-compile
+#    breakage and platform-layer regressions in _stb_platform_linux.bsm.
+#    See "Running Linux Builds in Docker" above for the docker-run flags;
+#    the loop below applies them to every Linux/X11 test.
+xhost +   # one-time, until XQuartz restarts
+mkdir -p /tmp/bpp_linux_run
+for src in tests/test_linux_*.bpp tests/test_x11_*.bpp; do
+    name=$(basename "$src" .bpp)
+    out="/tmp/bpp_linux_run/$name"
+    ./bpp --linux64 "$src" -o "$out" >/dev/null 2>&1 \
+        || { echo "FAIL compile: $name"; continue; }
+    docker run --rm --platform linux/amd64 \
+        --add-host host.docker.internal:host-gateway \
+        -e DISPLAY=host.docker.internal:0 \
+        -v /tmp:/tmp \
+        ubuntu:22.04 "$out" >/dev/null 2>&1 \
+        && echo "  PASS  $name" \
+        || echo "  FAIL  $name"
 done
+# Expected: 5 headless (test_linux_*) + 5 X11 (test_x11_*) = 10/10.
 ```
 
-Target: 100% pass on every commit. If a test breaks, either fix the
-test (API drift) or fix the module (regression). Do not let stale
-tests accumulate — that is how the suite rotted from 71 tests to 20
-broken ones before the 0.21 cleanup.
+Target: 100% pass on every commit, all three runners. If a test
+breaks, either fix the test (API drift) or fix the module
+(regression). Do not let stale tests accumulate — that is how the
+suite rotted from 71 tests to 20 broken ones before the 0.21
+cleanup.
+
+**A test that fails only on the C backend is still a real bug.** The
+native pipeline silently accepts a few classes of source code that C
+will reject, so a C-backend regression typically points at a real
+issue in the source (precedence, namespace collision, missing builtin
+handler) that the native pipeline merely happened to tolerate. Fix
+the source, not the C emitter, unless the bug truly belongs to the
+emitter (a missing inline handler for a B++ builtin, for example).
 
 ## Recovering from a Broken bpp
 

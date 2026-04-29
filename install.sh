@@ -104,6 +104,10 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 #   bpp_maestro — solo / base / render bandleader
 #   bpp_arena   — bump allocator (auto-injected since 0.75)
 #   bpp_path    — argv[0]-relative asset resolution (auto-injected since 0.75)
+#   bpp_mem     — portable malloc/free/realloc/memcpy (auto-injected;
+#                 split out of _core_<os>.bsm by the bpp_mem refactor)
+#   bpp_time    — portable monotonic clock helpers (auto-injected)
+#   bpp_thread  — portable worker-thread API (auto-injected)
 # Auto-injected entries are pulled in by bpp_import.bsm for every user
 # main() program — missing one breaks every compile with a confusing
 # "malloc never defined" cascade. Explicit-import entries ship here so
@@ -124,6 +128,9 @@ sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 sudo cp src/bpp_arena.bsm "$LIB_DIR/"
 sudo cp src/bpp_path.bsm "$LIB_DIR/"
+sudo cp src/bpp_mem.bsm "$LIB_DIR/"
+sudo cp src/bpp_time.bsm "$LIB_DIR/"
+sudo cp src/bpp_thread.bsm "$LIB_DIR/"
 sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
 sudo cp src/bug_reader.bsm "$LIB_DIR/"
 
@@ -153,6 +160,36 @@ sudo cp src/backend/c/*.bsm "$BACKEND_C_DIR/"
 # Clear module cache so stale .bo files don't shadow the new modules.
 echo "==> Clearing module cache..."
 "$BIN_DIR/bpp" --clean-cache 2>/dev/null || rm -rf "$HOME/.bpp/cache"/*.bo 2>/dev/null || true
+
+# Sanity check the install. Compiles and runs a tiny program that
+# exercises malloc/free through bpp_array — the path that breaks first
+# when an auto-injected module (bpp_mem, bpp_time, bpp_thread) was
+# forgotten in the cp list above. Failing here is much friendlier than
+# failing later when a user tries to compile their own program.
+echo "==> Running install smoke test..."
+SMOKE_SRC="/tmp/bpp_install_smoke.bpp"
+SMOKE_BIN="/tmp/bpp_install_smoke"
+cat > "$SMOKE_SRC" <<'EOF'
+main() {
+    auto a;
+    a = arr_new();
+    arr_push(a, 42);
+    if (arr_get(a, 0) != 42) { return 1; }
+    arr_free(a);
+    put("install smoke: ok\n");
+    return 0;
+}
+EOF
+if "$BIN_DIR/bpp" "$SMOKE_SRC" -o "$SMOKE_BIN" >/dev/null 2>&1 && "$SMOKE_BIN" >/dev/null; then
+    echo "    Smoke test passed."
+else
+    echo "    *** SMOKE TEST FAILED ***"
+    echo "    Re-running with full output so the failing module is visible:"
+    "$BIN_DIR/bpp" "$SMOKE_SRC" -o "$SMOKE_BIN" 2>&1 | head -20
+    rm -f "$SMOKE_SRC" "$SMOKE_BIN"
+    exit 1
+fi
+rm -f "$SMOKE_SRC" "$SMOKE_BIN"
 
 # Update local binaries too (if not sandboxed). Remove first for fresh inode.
 rm -f ./bpp 2>/dev/null; cp "$BIN_DIR/bpp" ./bpp 2>/dev/null || true
