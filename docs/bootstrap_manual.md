@@ -611,10 +611,10 @@ src/backend/
     aarch64/         ← a64_enc.bsm, a64_codegen.bsm
     x86_64/          ← x64_enc.bsm, x64_codegen.bsm
   os/                ← pure OS — platform APIs, syscalls, runtime
-    macos/           ← _stb_core_macos, _stb_platform_macos,
-                       bug_observe_macos, _bsys_macos, _brt0_macos,
-                       _bmem_macos
-    linux/           ← mirror for Linux
+    macos/           ← _core_macos, _stb_platform_macos,
+                       _stb_audio_macos, bug_observe_macos, _bsys_macos
+    linux/           ← _core_linux, _stb_platform_linux,
+                       bug_observe_linux, _bsys_linux
   target/            ← chip + OS specific binary format writers
     aarch64_macos/   ← a64_macho.bsm (Mach-O writer)
     x86_64_linux/    ← x64_elf.bsm (ELF writer)
@@ -630,10 +630,11 @@ Each layer has a clear responsibility:
   documented in the import comment so a future Linux-ARM64 split is
   obvious.
 - **os/** files know about the OS but nothing about the CPU. Syscall
-  numbers live in `_bsys_<os>.bsm` constants. Runtime startup globals
-  (`_bpp_argc`, `_bpp_argv`, `_bpp_envp`) are declared in
-  `_brt0_<os>.bsm`. The allocator (`_bmem_<os>.bsm`) implements
-  malloc/free/realloc/memcpy over sys_mmap.
+  numbers live in `_bsys_<os>.bsm` constants. The runtime startup
+  globals (`_bpp_argc`, `_bpp_argv`, `_bpp_envp`), the heap primitives
+  (`_mem_alloc_pages` / `_mem_free_pages`), and the time primitive
+  (`_time_now_ns`) all live in `_core_<os>.bsm` — sectioned into
+  startup / heap primitives / time + threads.
 - **target/** files combine chip + OS into the final binary format
   (Mach-O on macOS, ELF on Linux). These know BOTH the chip's
   encoding rules and the OS's loader conventions.
@@ -643,6 +644,105 @@ Each layer has a clear responsibility:
 When Linux-ARM64 or Intel-macOS arrives, a new `os/<os>/` or
 `target/<chip>_<os>/` folder drops in without disturbing existing
 backends. See `docs/todo.md` for the timeline.
+
+## Portability Tiers — Where Stdlib Features Live
+
+Above the chip / os / target backend layers, the stdlib has its own
+portability decisions. Cross-OS features show up in three distinct
+shapes; recognizing the shape up front avoids applying the wrong
+refactor to the wrong layer.
+
+### Tier 1 — abstract calls a builtin directly
+
+The stdlib function is a thin shim over a syscall or instruction
+that the codegen already lowers per chip. No platform attachment
+needed; the builtin (chip × OS) IS the platform difference.
+
+```bpp
+// bpp_io.bsm — putchar is Tier 1.
+void putchar(ch) {
+    auto buf;
+    buf = ch & 0xFF;
+    sys_write(1, &buf, 1);   // sys_write is a builtin emitted per chip
+}
+```
+
+Other Tier 1 modules: `bpp_str`, `bpp_array`, `bpp_hash`, `bpp_math`,
+`bpp_file`, `bpp_buf`. They never need a `_<feature>_<os>.bsm`
+companion. **Do not refactor these.**
+
+### Tier 2 — abstract → thin attachment → builtin
+
+The lifecycle has multiple steps and a per-OS constant or syscall
+family that differs. The abstract logic (header layout, lazy init,
+state) lives portable; only the platform primitive lives in
+`_core_<os>.bsm`.
+
+| Stdlib | Abstract module | Per-OS primitive |
+|---|---|---|
+| Heap | `bpp_mem.bsm` | `_mem_alloc_pages` / `_mem_free_pages` |
+| Time | `bpp_time.bsm` | `_time_now_ns` |
+| Threads | (still in `_core_<os>.bsm`) | (split when ELF dynlink lands on Linux) |
+
+**The split rule**: if the per-OS attachment fits in **≤30 lines**
+(constants + thin syscall wrappers), it stays in
+`_core_<os>.bsm` Section 2/3 alongside the others — adding a fourth
+file family for one feature is naming overhead with no payoff. Crack
+it out into `_<feature>_<os>.bsm` only when the divergence grows
+past trivial wrappers (state machines, callbacks, multi-step
+lifecycle).
+
+### Tier 3 — abstract → fat attachment → FFI complex
+
+The platform APIs differ in shape, not just constants — different
+state machines, callback contracts, type systems. A clean abstract
+API has to be designed deliberately (no automatic translation
+works), and the per-OS attachment is hundreds of lines.
+
+| Stdlib | Status today |
+|---|---|
+| GPU | macOS uses Cocoa/Metal via `objc_msgSend`. Linux/Windows would need Vulkan/DX12. WebGPU-style abstract API needs design — plan separately. |
+| Window | macOS uses NSWindow + NSEvent. Linux uses X11 wire protocol. Different lifecycle entirely. |
+| Audio | macOS has CoreAudio (`_stb_audio_macos.bsm`). Linux audio not yet implemented; ALSA/PulseAudio when it lands. |
+
+For Tier 3, **always create separate files** (`_gpu_<os>.bsm`,
+`_window_<os>.bsm`, `_audio_<os>.bsm`). The abstract layer
+(`bpp_gpu.bsm` etc.) is its own design exercise, not a mechanical
+extraction. These refactors come at natural transition points — when
+the second backend appears, that is when the API surface gets
+designed.
+
+### When to consolidate vs separate
+
+The decision rule, learned from the 2026-04-13 consolidation that
+this manual documents reversing for memory:
+
+> Enquanto N=2 OSs e a divergência entre os arquivos
+> `_<feature>_<os>.bsm` é trivial (uma constante, dois syscalls),
+> consolide em `_core_<os>.bsm`. **A partir de N=3, separe** — a
+> duplicação cresce O(N) na cópia, mantendo única abstração custa
+> O(1) na refatoração.
+
+The 2026-04-29 memory + time refactor demonstrated the pattern: the
+N=2 consolidation was correct for its time, but the imminent
+arrival of Windows / BSD / RISC-V backends made the cost flip.
+Reopening explicit decisions when constraints change is normal —
+document the original *why*, not just the original *what*.
+
+### Decision flow for a new feature
+
+When adding a new stdlib module that needs OS hooks:
+
+1. **Tier 1?** (the abstract calls one syscall builtin directly)
+   → write only the abstract `bpp_<feature>.bsm`. Done.
+2. **Tier 2?** (lifecycle multi-step, ≤30 lines per OS)
+   → write the abstract `bpp_<feature>.bsm`. Add the primitive
+     functions to `_core_<os>.bsm` Section N. Auto-inject the
+     abstract module via `bpp_import.bsm`.
+3. **Tier 3?** (FFI complex, state machines)
+   → design the abstract API on paper first. Create
+     `_<feature>_<os>.bsm` per OS. Wire through stbgame or its
+     equivalent.
 
 ## Auto-Import System
 

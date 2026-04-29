@@ -90,65 +90,30 @@ void _mem_free_pages(raw, total) {
 // companion _stb_platform_macos.bsm adds window/input/GPU/draw on
 // top of it for programs that import stbgame.
 
-// Timing globals — lazy-initialized on first _stb_get_time call.
-// _plt_time_denom doubles as the init sentinel: it starts at 0
-// (BSS) and becomes a non-zero timebase ratio after init, so
-// checking `_plt_time_denom == 0` reliably detects "not yet
-// initialized" without an extra boolean flag.
+// Mach timebase ratio — converts mach_absolute_time ticks to
+// nanoseconds. Lazy-initialized on first `_time_now_ns` call.
+// `_time_denom` doubles as the init sentinel: starts at 0 (BSS)
+// and becomes the non-zero denominator after init.
 // Rule 1: set once in lazy init, never written again.
-// Rule 2: only this file reads/writes them.
-static extrn _plt_time_base, _plt_time_numer, _plt_time_denom;
+static extrn _time_numer, _time_denom;
 
-// Return current time in milliseconds since first call. Lazy-
-// initializes the mach timebase on first call so this function
-// works in any program — no _stb_init_window or other setup
-// required.
-//
-// The two reads of mach_timebase_info are inlined byte-by-byte
-// instead of using bpp_buf::read_u32 so this file has zero .bsm
-// dependencies. The struct returned by mach_timebase_info is two
-// u32 fields packed in 8 bytes (numer at offset 0, denom at
-// offset 4), little-endian.
-_stb_get_time() {
-    auto info, now, ticks, ns;
-    if (_plt_time_denom == 0) {
+// Return the current monotonic time in nanoseconds. Wraps Apple's
+// mach_absolute_time + mach_timebase_info; the two u32 fields of
+// the timebase struct are read byte-by-byte to keep this file
+// dependency-free.
+_time_now_ns() {
+    auto info, now;
+    if (_time_denom == 0) {
         info = malloc(8);
         mach_timebase_info(info);
-        _plt_time_numer = peek(info) + peek(info + 1) * 256
-                        + peek(info + 2) * 65536 + peek(info + 3) * 16777216;
-        _plt_time_denom = peek(info + 4) + peek(info + 5) * 256
-                        + peek(info + 6) * 65536 + peek(info + 7) * 16777216;
+        _time_numer = peek(info) + peek(info + 1) * 256
+                    + peek(info + 2) * 65536 + peek(info + 3) * 16777216;
+        _time_denom = peek(info + 4) + peek(info + 5) * 256
+                    + peek(info + 6) * 65536 + peek(info + 7) * 16777216;
         free(info);
-        _plt_time_base = mach_absolute_time();
     }
     now = mach_absolute_time();
-    ticks = now - _plt_time_base;
-    ns = ticks * _plt_time_numer / _plt_time_denom;
-    return ns / 1000000;
-}
-
-// Higher-resolution companion. Returns microseconds since the
-// same monotonic anchor used by _stb_get_time. Shares lazy init
-// so calling either function first is safe. This is what
-// bench_section and other sub-millisecond timers build on. The
-// internal arithmetic is identical to _stb_get_time except the
-// final divide drops the last three zeros.
-_stb_get_time_us() {
-    auto info, now, ticks, ns;
-    if (_plt_time_denom == 0) {
-        info = malloc(8);
-        mach_timebase_info(info);
-        _plt_time_numer = peek(info) + peek(info + 1) * 256
-                        + peek(info + 2) * 65536 + peek(info + 3) * 16777216;
-        _plt_time_denom = peek(info + 4) + peek(info + 5) * 256
-                        + peek(info + 6) * 65536 + peek(info + 7) * 16777216;
-        free(info);
-        _plt_time_base = mach_absolute_time();
-    }
-    now = mach_absolute_time();
-    ticks = now - _plt_time_base;
-    ns = ticks * _plt_time_numer / _plt_time_denom;
-    return ns / 1000;
+    return now * _time_numer / _time_denom;
 }
 
 // stbjob and stbmaestro use these wrappers instead of calling
