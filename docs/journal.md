@@ -4976,3 +4976,60 @@ the compiler is fixed: `bug_tui.bsm`, `bug_brk.bsm`,
 
 Tracked as task #12 in the active session.
 
+
+## 2026-04-29 (continued) — Phase 4 compiler bug, deeper diagnostic round
+
+Followed up on the original "wild bls in `bug_tui.bsm`" investigation
+with a structural hypothesis: silent arr_set OOB on a fresh arr_new
+(initial cap=8). The hypothesis matched the symptoms (bug fires past
+8 calls in `_tui_print_help`, exactly arr_new's initial capacity).
+
+### Tested
+
+1. **`enc_def_label` growth fix.** Added `while (arr_len(...) <= id)
+   { arr_push(..., -1); }` at the top of `enc_def_label` and
+   `enc_def_label_at` in both ARM64 and x86_64 encoders. Bug PERSISTS.
+
+2. **`arr_set` cap-based bounds check + crash.** Added
+   `if (i < 0 || i >= cap) { put_err(...); sys_exit(99); }` in front
+   of every arr_set body. One genuine OOB shows up during `bug.bpp`
+   compile: `i=8 cap=8 arr=<addr>`. Address is non-deterministic
+   across runs, suggesting a heap pointer through ASLR. Single
+   occurrence, single address, single index, exactly at initial cap.
+
+3. **Bumping `_ARR_INIT` from 8 → 32 → 1024.** With cap=32, OOB
+   shifts to `i=32 cap=32`. With cap=1024, NO arr_set OOB fires at
+   all. But bug-with-wild-bls STILL fires regardless of cap. So:
+
+   - The `arr_set` OOB is a real but DIFFERENT bug — it self-fixes
+     when cap is large enough.
+   - The wild-bls bug is independent of arr_set, persists regardless
+     of `_ARR_INIT`.
+
+### What this means
+
+The original hypothesis (silent OOB → adjacent heap clobber → wild
+bls) was elegant but wrong. The two are unrelated bugs that
+co-occurred. The wild-bls bug needs deeper investigation; previous
+notes from earlier in this journal (around `enc_emit32` writing
+correct bytes that get overwritten by something not in the recorded
+fixup or reloc lists) still represent the actionable lead.
+
+### Action items left for next session
+
+1. Wild-bls bug in `bug_tui_repl` / `_tui_print_help` is OPEN.
+   Most plausible remaining suspects: macho writer's reloc patcher
+   (a64_macho.bsm:1080 ADRP path), or some path that calls
+   `enc_patch32` not yet covered by the trace instrumentation.
+2. Single arr_set OOB at `i=cap` is OPEN. Worth fixing once
+   identified — probably a `for (i = 0; i <= N; i++)` off-by-one
+   or a code path that re-uses an arr_new without arr_push to
+   grow.
+3. Phase 4 source (bug_tui.bsm + bug_brk.bsm + integration.diff)
+   stays parked at /tmp/phase4_park/ until either the wild-bls bug
+   is fixed or a non-workaround structural fix to bug_tui.bsm is
+   found (refactor `_tui_print_help` to a sub-function under the
+   bug threshold without dropping commands, etc.).
+
+Tree state at end of this session: Phase 3 is the latest committed
+work (commit eab4107). Phase 4 is NOT shipped. Suite 121/0/11.
