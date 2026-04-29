@@ -56,6 +56,15 @@ static auto _parser_struct_hash;
 
 // Variable type map: 2 parallel dynamic arrays (var_name packed, struct_index).
 static auto vt_names, vt_sidx;
+// Parallel to funcs[]: snapshot of arr_len(vt_names) at the start
+// of each parse_function call. Lets the bug debugger ask "did THIS
+// function annotate `name` with a struct?" without picking up an
+// `auto name: T` from a different function. The codegen continues
+// to use the global vt_names walk (which deliberately bleeds, so
+// `arena_alloc(a, b)` inherits the `Arena` annotation from
+// `arena_new`'s `auto a: Arena;`); only the bug emit path narrows
+// to a single function's window.
+static auto fn_vt_starts;
 
 // Stack struct flag: tracks which variables are stack-allocated (via var keyword).
 // Two parallel arrays — name + function index — so a `var v: T` in
@@ -119,6 +128,7 @@ void init_parser() {
     sd_bit_offs = arr_new();
     vt_names = arr_new();
     vt_sidx = arr_new();
+    fn_vt_starts = arr_new();
     var_stack_names = arr_new();
     var_stack_fns = arr_new();
     ev_names = arr_new();
@@ -328,6 +338,31 @@ get_var_type(var_p) {
     auto i;
     for (i = arr_len(vt_names) - 1; i >= 0; i--) {
         if (packed_eq(arr_get(vt_names, i), var_p)) { return arr_get(vt_sidx, i); }
+    }
+    return -1;
+}
+
+// Per-function variant of get_var_type. Searches only the vt_names
+// entries added during the parse of function fn_idx — set_var_type
+// calls from other functions are ignored. Returns the struct index
+// or -1. Used by the bug debugger's `.bug` emit so the watch loop
+// reports "this is a Player" only when the user actually wrote
+// `auto p: Player;` inside this function (not because some
+// unrelated function happened to declare a same-named local with
+// a struct annotation).
+get_var_type_in_fn(var_p, fn_idx) {
+    auto start, end_pos, i;
+    if (fn_idx < 0)                       { return -1; }
+    if (fn_idx >= arr_len(fn_vt_starts))  { return -1; }
+    start = arr_get(fn_vt_starts, fn_idx);
+    end_pos = arr_len(vt_names);
+    if (fn_idx + 1 < arr_len(fn_vt_starts)) {
+        end_pos = arr_get(fn_vt_starts, fn_idx + 1);
+    }
+    for (i = end_pos - 1; i >= start; i--) {
+        if (packed_eq(arr_get(vt_names, i), var_p)) {
+            return arr_get(vt_sidx, i);
+        }
     }
     return -1;
 }
@@ -1227,6 +1262,11 @@ static void parse_function(is_stub, is_static, is_void) {
     auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p, _fs;
     auto ph_arr, ph_cnt, has_hints, my_mod, name_tok;
     my_mod = tok_mod(tok_pos);
+    // Snapshot the global vt_names cursor BEFORE this function's
+    // body adds anything. The bug debugger uses this to scope its
+    // struct-id lookup so a `auto p: Player` in one function does
+    // not leak its sid into a different function's plain `auto p`.
+    fn_vt_starts = arr_push(fn_vt_starts, arr_len(vt_names));
     // Capture the token position of the function NAME now. FN_SRC_TOK
     // used to be set from tok_pos at the very end of this routine,
     // which meant it pointed AFTER the closing `}` — every diagnostic

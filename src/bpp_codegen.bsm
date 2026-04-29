@@ -1713,29 +1713,68 @@ void cg_emit_func(fi) {
     // and the gdb_read_mem(fp + offset, 8) returns whatever the
     // prior frame happened to leave there.
     //
+    // Critical detail: the block is indexed in fn_vt_data order
+    // (the type-inference table the bug emitter walks), NOT in
+    // cg_vars order — the two indexings differ in general because
+    // type inference and codegen each maintain their own variable
+    // tables. Iterate the type-table block and look each name up
+    // in cg_vars to fetch the matching kind / detail. Names that
+    // are not found in cg_vars (e.g. globals captured into
+    // fn_vt_data via assignment side-effect) stay kind 1 / detail
+    // 0 — the watch loop's existing global-lookup path handles
+    // them.
+    //
     // Layout per local: 8-byte slot holding `kind` (1 byte at +0)
     // and `detail` (4 bytes LE at +1..+4). Kind 0 = register, kind
     // 1 = stack. For kind 0, detail is the GDB register number
     // (x19 = 19, x20 = 20, ...). For kind 1, detail is the byte
     // offset from x29 (= fp).
-    auto _loc_block, _vi, _preg, _kind, _detail, _n_vars;
-    _n_vars = arr_len(cg_vars);
-    _loc_block = buf_byte(_n_vars * 8);
+    auto _loc_block, _vi, _preg, _kind, _detail, _sid, _vt_cnt, _vt_block;
+    auto _vt_name, _cg_idx, _sidx;
+    _vt_cnt   = arr_get(fn_vt_cnts, cg_cur_fn_idx);
+    _vt_block = arr_get(fn_vt_data, cg_cur_fn_idx);
+    _loc_block = buf_byte(_vt_cnt * 8);
     _vi = 0;
-    while (_vi < _n_vars) {
-        _preg = arr_get(cg_var_promote, _vi);
-        if (_preg >= 0) {
-            _kind = 0;
-            _detail = _preg;
-        } else {
-            _kind = 1;
-            _detail = arr_get(cg_var_off, _vi);
+    while (_vi < _vt_cnt) {
+        _kind = 1;
+        _detail = 0;
+        _sid = 0;
+        if (_vt_block != 0) {
+            // Each fn_vt_data entry is 24 bytes (3 words: name,
+            // type, elem); only the name matters here.
+            _vt_name = *(_vt_block + _vi * 24);
+            _cg_idx = cg_var_idx(_vt_name);
+            if (_cg_idx >= 0) {
+                _preg = arr_get(cg_var_promote, _cg_idx);
+                if (_preg >= 0) {
+                    _kind = 0;
+                    _detail = _preg;
+                } else {
+                    _kind = 1;
+                    _detail = arr_get(cg_var_off, _cg_idx);
+                }
+                // Per-function struct id, scoped via
+                // get_var_type_in_fn so a same-named local in a
+                // different function cannot leak its sid in. The
+                // codegen-internal cg_var_struct_idx is only set
+                // for `var` declarations; this scoped lookup also
+                // covers `auto p: Player` (used by the watch loop
+                // to walk struct fields). -1 means "no annotation
+                // for this name in this function"; the +1
+                // normalises to a 1-based sentinel (0 = none).
+                _sidx = get_var_type_in_fn(_vt_name, cg_cur_fn_idx);
+                _sid = _sidx + 1;
+            }
         }
-        poke(_loc_block + _vi * 8, _kind);
+        // 8-byte slot: kind (u8) + detail (u32 LE) + sid (u16 LE)
+        // + 1 padding byte.
+        poke(_loc_block + _vi * 8,     _kind);
         poke(_loc_block + _vi * 8 + 1, _detail & 0xFF);
         poke(_loc_block + _vi * 8 + 2, (_detail >> 8)  & 0xFF);
         poke(_loc_block + _vi * 8 + 3, (_detail >> 16) & 0xFF);
         poke(_loc_block + _vi * 8 + 4, (_detail >> 24) & 0xFF);
+        poke(_loc_block + _vi * 8 + 5, _sid & 0xFF);
+        poke(_loc_block + _vi * 8 + 6, (_sid >> 8) & 0xFF);
         _vi++;
     }
     arr_set(fn_vt_locs, cg_cur_fn_idx, _loc_block);

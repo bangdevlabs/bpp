@@ -72,6 +72,12 @@ void bug_write_agnostic() {
         // after b3_select); when it is missing we still emit zeros
         // and the bug debugger falls back to its existing stack-
         // offset path.
+        //
+        // Stride note: `block` is the buffer save_fn_types in
+        // bpp_types.bsm builds with 24 bytes per entry (3 words —
+        // name, type, elem). Treating it as `block[j * 2]` (2-word
+        // stride) silently produced every-other-entry garbage in
+        // earlier .bug versions; the canonical step is `j * 3`.
         cnt = arr_get(fn_vt_cnts, i);
         block = arr_get(fn_vt_data, i);
         auto loc_block;
@@ -79,23 +85,30 @@ void bug_write_agnostic() {
         bo_write_u16(cnt);
         for (j = 0; j < cnt; j++) {
             auto _l_name, _l_sid, _l_kind, _l_detail;
-            _l_name = block[j * 2];
+            _l_name = block[j * 3];
             bo_write_str(_l_name);
-            bo_write_u8(block[j * 2 + 1]);
-            _l_sid = get_var_type(_l_name);
-            bo_write_u16(_l_sid + 1);
-            // Location descriptor: 1 byte kind + 4 bytes LE detail.
-            // The codegen-side block stores them in the same shape,
-            // so the unpack mirrors the pack.
+            bo_write_u8(block[j * 3 + 1]);
+            // The struct-id, location kind, and location detail all
+            // come from fn_vt_locs[i], which the codegen populated
+            // from cg_var_struct_idx / cg_var_promote / cg_var_off.
+            // These tables are reset at function entry, so they do
+            // not leak across functions the way the parser's
+            // global vt_names / vt_sidx pair does (which `auto p:
+            // ChipPrimitives` in one function would otherwise
+            // colour every other function's `auto p` with).
             _l_kind = 1;
             _l_detail = 0;
+            _l_sid = 0;
             if (loc_block != 0) {
                 _l_kind = peek(loc_block + j * 8) & 0xFF;
                 _l_detail = (peek(loc_block + j * 8 + 1) & 0xFF)
                           | ((peek(loc_block + j * 8 + 2) & 0xFF) << 8)
                           | ((peek(loc_block + j * 8 + 3) & 0xFF) << 16)
                           | ((peek(loc_block + j * 8 + 4) & 0xFF) << 24);
+                _l_sid = (peek(loc_block + j * 8 + 5) & 0xFF)
+                       | ((peek(loc_block + j * 8 + 6) & 0xFF) << 8);
             }
+            bo_write_u16(_l_sid);
             bo_write_u8(_l_kind);
             bo_write_u32(_l_detail);
         }

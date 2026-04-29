@@ -1,0 +1,553 @@
+// bug_eval.bsm — Expression evaluator for the bug debugger's
+// `--watch` flag.
+//
+// Phase 3 of the bug viz roadmap. Parses small expressions from
+// quoted watch entries (`bug --watch "player.vx"`,
+// `bug --watch "enc_pos - enc_buf"`, `bug --watch "*head"`) into
+// a tiny AST and evaluates that AST against the tracee's state at
+// every SIGTRAP. The result feeds straight into viz_format so the
+// rest of the watch pipeline (type-aware formatting, struct
+// expansion, string previews) keeps working.
+//
+// Grammar (recursive descent, very small):
+//
+//   expr     ::= addsub
+//   addsub   ::= unary (('+' | '-') unary)*
+//   unary    ::= '*' unary
+//              | postfix
+//   postfix  ::= atom ('.' IDENT | '[' expr ']')*
+//   atom     ::= IDENT
+//              | NUM
+//
+// Function calls are intentionally absent (per docs/bug_viz_plan.md
+// — calls in a debugger expression evaluator open the door to side
+// effects, infinite loops, and code under debug). Multiplication
+// and division also stay out of v1: the canonical use cases —
+// `player.vx`, `tokens[5]`, `*head`, `enc_pos - enc_buf` — only
+// need add / subtract / field / index / deref.
+
+import "bpp_io.bsm";
+import "bpp_str.bsm";
+
+// ── Token kinds ─────────────────────────────────────────────
+
+const TOK_EOF    = 0;
+const TOK_IDENT  = 1;
+const TOK_NUM    = 2;
+const TOK_DOT    = 3;
+const TOK_LBRACK = 4;
+const TOK_RBRACK = 5;
+const TOK_STAR   = 6;
+const TOK_PLUS   = 7;
+const TOK_MINUS  = 8;
+
+// ── AST node kinds ──────────────────────────────────────────
+
+const EXPR_VAR   = 1;  // arg1 = packed (offset, len) into _eval_strbuf
+const EXPR_NUM   = 2;  // arg1 = literal integer value
+const EXPR_FIELD = 3;  // arg1 = base node, arg2 = packed field name
+const EXPR_INDEX = 4;  // arg1 = base node, arg2 = index expr
+const EXPR_DEREF = 5;  // arg1 = inner expr
+const EXPR_ADD   = 6;  // arg1 = lhs, arg2 = rhs
+const EXPR_SUB   = 7;  // arg1 = lhs, arg2 = rhs
+
+// ── Module state ────────────────────────────────────────────
+
+// Lexer scratch — populated by _eval_lex and consumed by the
+// parser. Both kinds and data live in parallel arrays; the data
+// slot holds either a packed-name reference (for IDENT) or the
+// integer literal (for NUM).
+static auto _eval_tok_kinds;
+static auto _eval_tok_data;
+static auto _eval_tok_count;
+static auto _eval_tok_pos;
+
+// String pool for parsed identifier names. Each watch expression
+// may reference several names; copying them into this buffer lets
+// the AST hold compact (offset, length) packed references without
+// owning per-name allocations. Cleared on each parse.
+static auto _eval_strbuf;
+static auto _eval_strbuf_pos;
+
+// AST node arena. Each node is a 24-byte (3-word) record:
+//   +0 : kind
+//   +8 : arg1
+//   +16: arg2
+static auto _eval_node_pool;
+static auto _eval_node_pos;
+static auto _eval_node_cap;
+
+// Evaluator outputs. eval_run sets all four; the caller (the watch
+// loop in bug_observe_<os>.bsm) reads them after a successful
+// invocation. Returning a single 64-bit value would force packing /
+// unpacking on every call site; globals keep the call shape simple.
+global bug_eval_val;     // Evaluated value (the "thing" the user wanted to see).
+global bug_eval_ty;      // Type byte for viz_format dispatch (TY_WORD by default).
+global bug_eval_sid;     // 1-based struct id when the result points at a struct, 0 otherwise.
+global bug_eval_addr;    // Address from which `val` was read; 0 when the result is a pure value (literal, arithmetic).
+
+// ── Initialization ──────────────────────────────────────────
+//
+// The string pool and node arena PERSIST across parses — every AST
+// produced by bug_eval_parse must remain valid for the lifetime of
+// the bug session, since the watch loop evaluates them at every
+// SIGTRAP. Resetting the strbuf or node pool would invalidate the
+// (offset, length) packed names baked into earlier ASTs.
+//
+// Tokens, on the other hand, are scratch — only used during the
+// current parse — so they reset on every call.
+
+void init_bug_eval()@io {
+    if (_eval_tok_kinds == 0) {
+        _eval_tok_kinds = buf_word(64);
+        _eval_tok_data  = buf_word(64);
+        _eval_strbuf    = malloc(4096);
+        _eval_node_cap  = 64;
+        _eval_node_pool = buf_byte(_eval_node_cap * 24);
+        _eval_strbuf_pos  = 0;
+        _eval_node_pos    = 0;
+    }
+    _eval_tok_count   = 0;
+    _eval_tok_pos     = 0;
+}
+
+// ── AST node helpers ────────────────────────────────────────
+
+static _eval_alloc_node(kind, arg1, arg2)@io {
+    auto node;
+    if (_eval_node_pos >= _eval_node_cap) {
+        // The pool is fixed-size for the current parse; v1 caps at
+        // 64 nodes per expression which comfortably covers anything
+        // a human types into a watch line. If this fires the user
+        // wrote a pathologically nested expression — the diagnostic
+        // is loud rather than silent so the cap can be raised when
+        // a real use case shows up.
+        out_str("bug_eval: AST pool exhausted (raise _eval_node_cap)");
+        out_nl();
+        return 0;
+    }
+    node = _eval_node_pool + _eval_node_pos * 24;
+    *(node + 0)  = kind;
+    *(node + 8)  = arg1;
+    *(node + 16) = arg2;
+    _eval_node_pos++;
+    return node;
+}
+
+// Copy a name segment from src[start..end) into the string pool
+// and return a packed (offset, length) reference. The packed shape
+// matches what bug_reader uses elsewhere so out_packed and
+// buf_cmp from the existing helpers can consume it directly.
+static _eval_intern(src, start, end_pos)@io {
+    auto len, off, i;
+    len = end_pos - start;
+    off = _eval_strbuf_pos;
+    i = 0;
+    while (i < len) {
+        poke(_eval_strbuf + _eval_strbuf_pos, peek(src + start + i));
+        _eval_strbuf_pos++;
+        i++;
+    }
+    return off + len * 0x100000000;
+}
+
+// ── Lexer ───────────────────────────────────────────────────
+
+static _eval_is_alpha(c)@base {
+    if (c >= 'a') { if (c <= 'z') { return 1; } }
+    if (c >= 'A') { if (c <= 'Z') { return 1; } }
+    if (c == '_') { return 1; }
+    return 0;
+}
+
+static _eval_is_digit(c)@base {
+    if (c >= '0') { if (c <= '9') { return 1; } }
+    return 0;
+}
+
+static _eval_is_alnum(c)@base {
+    if (_eval_is_alpha(c)) { return 1; }
+    if (_eval_is_digit(c)) { return 1; }
+    return 0;
+}
+
+// Tokenize the whole source string into _eval_tok_*. Returns 0 on
+// success, -1 on error.
+static _eval_lex(src, len)@io {
+    auto i, c, start, val, packed;
+    i = 0;
+    _eval_tok_count = 0;
+    while (i < len) {
+        c = peek(src + i) & 0xFF;
+        // Skip whitespace.
+        if (c == ' ' || c == 9) { i++; continue; }
+        // Identifier.
+        if (_eval_is_alpha(c)) {
+            start = i;
+            while (i < len && _eval_is_alnum(peek(src + i) & 0xFF)) { i++; }
+            packed = _eval_intern(src, start, i);
+            *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_IDENT;
+            *(_eval_tok_data  + _eval_tok_count * 8) = packed;
+            _eval_tok_count++;
+            continue;
+        }
+        // Number (decimal only for v1; hex literals would be a one-
+        // line addition).
+        if (_eval_is_digit(c)) {
+            val = 0;
+            while (i < len && _eval_is_digit(peek(src + i) & 0xFF)) {
+                val = val * 10 + ((peek(src + i) & 0xFF) - '0');
+                i++;
+            }
+            *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_NUM;
+            *(_eval_tok_data  + _eval_tok_count * 8) = val;
+            _eval_tok_count++;
+            continue;
+        }
+        // Single-char punctuation.
+        if (c == '.') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_DOT;    i++; _eval_tok_count++; continue; }
+        if (c == '[') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_LBRACK; i++; _eval_tok_count++; continue; }
+        if (c == ']') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_RBRACK; i++; _eval_tok_count++; continue; }
+        if (c == '*') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_STAR;   i++; _eval_tok_count++; continue; }
+        if (c == '+') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_PLUS;   i++; _eval_tok_count++; continue; }
+        if (c == '-') { *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_MINUS;  i++; _eval_tok_count++; continue; }
+        // Anything else is a syntax error.
+        out_str("bug_eval: unexpected char '");
+        out_ch(c);
+        out_str("' in expression");
+        out_nl();
+        return -1;
+    }
+    // EOF sentinel.
+    *(_eval_tok_kinds + _eval_tok_count * 8) = TOK_EOF;
+    return 0;
+}
+
+// ── Parser ──────────────────────────────────────────────────
+
+// Forward references for mutual recursion. Cross-module function
+// calls already resolve through the function table; declarations
+// inside the same module are also fine without `extrn`.
+
+static _eval_peek_tok() {
+    return *(_eval_tok_kinds + _eval_tok_pos * 8);
+}
+
+static _eval_consume() {
+    auto k;
+    k = *(_eval_tok_kinds + _eval_tok_pos * 8);
+    _eval_tok_pos++;
+    return k;
+}
+
+static _eval_tok_data_at() {
+    return *(_eval_tok_data + (_eval_tok_pos - 1) * 8);
+}
+
+// atom ::= IDENT | NUM
+static _eval_parse_atom()@io {
+    auto k, data;
+    k = _eval_consume();
+    if (k == TOK_IDENT) {
+        data = _eval_tok_data_at();
+        return _eval_alloc_node(EXPR_VAR, data, 0);
+    }
+    if (k == TOK_NUM) {
+        data = _eval_tok_data_at();
+        return _eval_alloc_node(EXPR_NUM, data, 0);
+    }
+    out_str("bug_eval: expected identifier or number");
+    out_nl();
+    return 0;
+}
+
+// postfix ::= atom ('.' IDENT | '[' expr ']')*
+static _eval_parse_postfix()@io {
+    auto base, k, name_p, idx;
+    base = _eval_parse_atom();
+    if (base == 0) { return 0; }
+    while (1) {
+        k = _eval_peek_tok();
+        if (k == TOK_DOT) {
+            _eval_consume();   // '.'
+            if (_eval_consume() != TOK_IDENT) {
+                out_str("bug_eval: expected field name after '.'");
+                out_nl();
+                return 0;
+            }
+            name_p = _eval_tok_data_at();
+            base = _eval_alloc_node(EXPR_FIELD, base, name_p);
+        } else if (k == TOK_LBRACK) {
+            _eval_consume();   // '['
+            idx = _eval_parse_expr();
+            if (idx == 0) { return 0; }
+            if (_eval_consume() != TOK_RBRACK) {
+                out_str("bug_eval: expected ']' after index");
+                out_nl();
+                return 0;
+            }
+            base = _eval_alloc_node(EXPR_INDEX, base, idx);
+        } else {
+            return base;
+        }
+    }
+    return base;
+}
+
+// unary ::= '*' unary | postfix
+static _eval_parse_unary()@io {
+    auto inner;
+    if (_eval_peek_tok() == TOK_STAR) {
+        _eval_consume();
+        inner = _eval_parse_unary();
+        if (inner == 0) { return 0; }
+        return _eval_alloc_node(EXPR_DEREF, inner, 0);
+    }
+    return _eval_parse_postfix();
+}
+
+// addsub ::= unary (('+' | '-') unary)*
+static _eval_parse_addsub()@io {
+    auto lhs, k, rhs, kind;
+    lhs = _eval_parse_unary();
+    if (lhs == 0) { return 0; }
+    while (1) {
+        k = _eval_peek_tok();
+        if (k != TOK_PLUS && k != TOK_MINUS) { return lhs; }
+        _eval_consume();
+        rhs = _eval_parse_unary();
+        if (rhs == 0) { return 0; }
+        if (k == TOK_PLUS) { kind = EXPR_ADD; } else { kind = EXPR_SUB; }
+        lhs = _eval_alloc_node(kind, lhs, rhs);
+    }
+    return lhs;
+}
+
+// expr ::= addsub
+_eval_parse_expr()@io {
+    return _eval_parse_addsub();
+}
+
+// Top-level entry. Lexes + parses the source string and returns
+// the AST root, or 0 on any failure. The strbuf and node-pool
+// state belong to the most recent parse — re-call init_bug_eval
+// before each parse.
+bug_eval_parse(src, len)@io {
+    init_bug_eval();
+    if (_eval_lex(src, len) < 0) { return 0; }
+    _eval_tok_pos = 0;
+    auto root;
+    root = _eval_parse_expr();
+    if (root == 0) { return 0; }
+    if (_eval_peek_tok() != TOK_EOF) {
+        out_str("bug_eval: trailing tokens after expression");
+        out_nl();
+        return 0;
+    }
+    return root;
+}
+
+// ── Evaluator ───────────────────────────────────────────────
+
+// Look up a name in the current function's locals. Returns 1 on
+// hit (and sets the bug_eval_* outputs); returns 0 on miss.
+//
+// fi is the .bug function index (the one passed to
+// _print_crash_locals). fp is the captured frame pointer.
+static _eval_lookup_local(packed, fi, fp)@io {
+    auto vnames, vcnt, ltypes, lsids, lkinds, ldetails, vi;
+    auto s, l, name_s, name_l;
+    if (fi < 0)              { return 0; }
+    if (fi >= bug_fn_count)  { return 0; }
+    vcnt   = arr_get(bug_sk_vcnt, fi);
+    if (vcnt <= 0) { return 0; }
+    vnames   = arr_get(bug_fn_lnames,   fi);
+    ltypes   = arr_get(bug_fn_ltypes,   fi);
+    lsids    = arr_get(bug_fn_lsids,    fi);
+    lkinds   = arr_get(bug_fn_lkinds,   fi);
+    ldetails = arr_get(bug_fn_ldetails, fi);
+    if (vnames == 0) { return 0; }
+    s = packed % 0x100000000;
+    l = packed / 0x100000000;
+    for (vi = 0; vi < vcnt; vi++) {
+        name_s = vnames[vi] % 0x100000000;
+        name_l = vnames[vi] / 0x100000000;
+        if (name_l == l && buf_cmp(_eval_strbuf + s, _br_strbuf + name_s, l) == 0) {
+            // Hit. Pull value through the same kind/detail dispatch
+            // _print_crash_locals uses, so promoted-register locals
+            // still resolve correctly.
+            auto kind, detail;
+            kind = 1; detail = 0;
+            if (lkinds   != 0) { kind   = lkinds[vi]   & 0xFF; }
+            if (ldetails != 0) { detail = ldetails[vi] & 0xFFFFFFFF; }
+            if (kind == 0) {
+                bug_eval_val  = gdb_read_reg(detail);
+                bug_eval_addr = 0;
+            } else {
+                bug_eval_addr = fp + detail;
+                bug_eval_val  = gdb_read_mem(bug_eval_addr, 8);
+            }
+            bug_eval_ty  = 0;
+            bug_eval_sid = 0;
+            if (ltypes != 0) { bug_eval_ty  = ltypes[vi] & 0xFF; }
+            if (lsids  != 0) { bug_eval_sid = lsids[vi]  & 0xFFFF; }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Look up a name in the global table. Same shape as the local
+// lookup; uses bug_gl_data_off + data_base for the address.
+static _eval_lookup_global(packed, data_base)@io {
+    auto gi, gname, s, l, name_s, name_l;
+    s = packed % 0x100000000;
+    l = packed / 0x100000000;
+    for (gi = 0; gi < bug_gl_count; gi++) {
+        gname = arr_get(bug_gl_name, gi);
+        name_s = gname % 0x100000000;
+        name_l = gname / 0x100000000;
+        if (name_l == l && buf_cmp(_eval_strbuf + s, _br_strbuf + name_s, l) == 0) {
+            bug_eval_addr = data_base + arr_get(bug_gl_data_off, gi);
+            bug_eval_val  = gdb_read_mem(bug_eval_addr, 8);
+            bug_eval_ty   = arr_get(bug_gl_type, gi) & 0xFF;
+            bug_eval_sid  = arr_get(bug_gl_sid,  gi) & 0xFFFF;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Look up a struct field by name. Returns the byte offset into the
+// struct and writes the field's type into bug_eval_ty. Returns -1
+// if the field does not exist.
+static _eval_struct_field_offset(sid, packed)@io {
+    auto sx, fc, fnames, foffs, ftypes, fi;
+    auto s, l, name_s, name_l;
+    sx = sid - 1;
+    if (sx < 0)              { return -1; }
+    if (sx >= bug_st_count)  { return -1; }
+    fc     = arr_get(bug_st_fcnt,   sx);
+    fnames = arr_get(bug_st_fnames, sx);
+    foffs  = arr_get(bug_st_foffs,  sx);
+    ftypes = arr_get(bug_st_ftypes, sx);
+    s = packed % 0x100000000;
+    l = packed / 0x100000000;
+    for (fi = 0; fi < fc; fi++) {
+        name_s = fnames[fi] % 0x100000000;
+        name_l = fnames[fi] / 0x100000000;
+        if (name_l == l && buf_cmp(_eval_strbuf + s, _br_strbuf + name_s, l) == 0) {
+            bug_eval_ty = ftypes[fi] & 0xFF;
+            return foffs[fi];
+        }
+    }
+    return -1;
+}
+
+// Recursively evaluate an AST node. Sets bug_eval_val / addr / ty /
+// sid as a side effect. Returns 0 on success, -1 on error.
+static _eval_node(node, fi, fp, data_base)@io {
+    auto kind, a1, a2, base_addr, off, idx_val, lhs_val, rhs_val;
+    if (node == 0) { return -1; }
+    kind = *(node + 0);
+    a1   = *(node + 8);
+    a2   = *(node + 16);
+    if (kind == EXPR_NUM) {
+        bug_eval_val  = a1;
+        bug_eval_ty   = 0;
+        bug_eval_sid  = 0;
+        bug_eval_addr = 0;
+        return 0;
+    }
+    if (kind == EXPR_VAR) {
+        // Globals take priority over locals because B++'s type
+        // checker registers `g_x = malloc(...)` inside a function
+        // as both a global and a phantom local — the local entry
+        // exists in fn_vt_data but no real stack slot ever holds
+        // its value. Reading the global side gets the authoritative
+        // heap pointer; reading the phantom local would return
+        // uninitialised stack data.
+        if (_eval_lookup_global(a1, data_base)) { return 0; }
+        if (_eval_lookup_local(a1, fi, fp))     { return 0; }
+        out_str("bug_eval: unknown name ");
+        // Print from the eval strbuf.
+        auto s, l, ci;
+        s = a1 % 0x100000000;
+        l = a1 / 0x100000000;
+        for (ci = 0; ci < l; ci++) { out_ch(peek(_eval_strbuf + s + ci)); }
+        out_nl();
+        return -1;
+    }
+    if (kind == EXPR_DEREF) {
+        if (_eval_node(a1, fi, fp, data_base) < 0) { return -1; }
+        bug_eval_addr = bug_eval_val;
+        bug_eval_val  = gdb_read_mem(bug_eval_addr, 8);
+        // Type collapses to TY_WORD when we deref a generic pointer
+        // — without sub-byte tracking we cannot preserve a width
+        // across the load.
+        bug_eval_ty   = 0;
+        bug_eval_sid  = 0;
+        return 0;
+    }
+    if (kind == EXPR_FIELD) {
+        if (_eval_node(a1, fi, fp, data_base) < 0) { return -1; }
+        // The base must point at a struct. v1 follows the same
+        // model the formatter uses: base.sid is the struct id, and
+        // the base value is the runtime pointer to the struct
+        // instance.
+        if (bug_eval_sid <= 0) {
+            out_str("bug_eval: '.' on a non-struct value");
+            out_nl();
+            return -1;
+        }
+        base_addr = bug_eval_val;
+        off = _eval_struct_field_offset(bug_eval_sid, a2);
+        if (off < 0) {
+            out_str("bug_eval: unknown field");
+            out_nl();
+            return -1;
+        }
+        bug_eval_addr = base_addr + off;
+        bug_eval_val  = gdb_read_mem(bug_eval_addr, 8);
+        // _eval_struct_field_offset already wrote bug_eval_ty.
+        bug_eval_sid  = 0;
+        return 0;
+    }
+    if (kind == EXPR_INDEX) {
+        if (_eval_node(a1, fi, fp, data_base) < 0) { return -1; }
+        base_addr = bug_eval_val;
+        if (_eval_node(a2, fi, fp, data_base) < 0) { return -1; }
+        idx_val = bug_eval_val;
+        // v1 assumes word-sized elements (8 bytes) — the canonical
+        // case is `tokens[5]` on a buf_word / arr_new array. A v2
+        // could read the element type from a TY_ARR's element
+        // metadata once that lands.
+        bug_eval_addr = base_addr + idx_val * 8;
+        bug_eval_val  = gdb_read_mem(bug_eval_addr, 8);
+        bug_eval_ty   = 0;
+        bug_eval_sid  = 0;
+        return 0;
+    }
+    if (kind == EXPR_ADD || kind == EXPR_SUB) {
+        if (_eval_node(a1, fi, fp, data_base) < 0) { return -1; }
+        lhs_val = bug_eval_val;
+        if (_eval_node(a2, fi, fp, data_base) < 0) { return -1; }
+        rhs_val = bug_eval_val;
+        if (kind == EXPR_ADD) { bug_eval_val = lhs_val + rhs_val; }
+        else                  { bug_eval_val = lhs_val - rhs_val; }
+        bug_eval_addr = 0;
+        bug_eval_ty   = 0;
+        bug_eval_sid  = 0;
+        return 0;
+    }
+    out_str("bug_eval: unknown AST kind");
+    out_nl();
+    return -1;
+}
+
+// Public entry: evaluate the AST root produced by bug_eval_parse.
+// Returns 0 on success, -1 on error. Outputs land in
+// bug_eval_val / addr / ty / sid.
+bug_eval_run(root, fi, fp, data_base)@io {
+    return _eval_node(root, fi, fp, data_base);
+}
