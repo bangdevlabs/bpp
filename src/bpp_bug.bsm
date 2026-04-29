@@ -105,17 +105,22 @@ void bug_write_agnostic() {
     }
 
     // -- Section: GLOBALS --------------------------------------
-    // Each entry records the global variable name, inferred type, and
-    // storage class (GLOB_AUTO/GLOB_GLOBAL/GLOB_EXTRN). The storage
-    // class byte was added for Level 1 smart-dispatch visibility —
-    // `bug program.bug` shows [auto]/[global]/[extrn] per global so
-    // the programmer can verify the promoter classified correctly.
+    // Each entry: name + type byte + class byte + u32 data_offset.
+    // data_offset is the byte offset of this global's 8-byte slot
+    // within the __DATA segment: index_in_cg_gl_name * 8.
     bo_write_u16(glob_cnt);
 
     for (i = 0; i < glob_cnt; i++) {
-        bo_write_str(arr_get(globals, i));
-        bo_write_u8(ty_get_global_type(arr_get(globals, i)));
+        auto gname_p, gl_idx, gj;
+        gname_p = arr_get(globals, i);
+        bo_write_str(gname_p);
+        bo_write_u8(ty_get_global_type(gname_p));
         bo_write_u8(arr_get(glob_class, i));
+        gl_idx = 0;
+        for (gj = 0; gj < arr_len(cg_gl_name); gj++) {
+            if (cg_str_eq_packed(gname_p, arr_get(cg_gl_name, gj))) { gl_idx = gj; }
+        }
+        bo_write_u32(gl_idx * 8);
     }
 
     // -- Section: EXTERNS --------------------------------------
@@ -258,8 +263,10 @@ void bug_write_x64() {
 // backend-specific data. The output path is derived from the binary's
 // output path by appending ".bug".
 
-void bug_save(out_path) {
-    auto i, ch, p, target;
+// target: 0 = ARM64, 1 = x86_64. Passed explicitly by the caller
+// (bpp.bpp) which already knows the compilation mode.
+void bug_save(out_path, target) {
+    auto i, ch, p;
 
     // Build the .bug path by copying out_path and appending ".bug".
     p = 0;
@@ -276,12 +283,6 @@ void bug_save(out_path) {
     poke(_bug_pathbuf + p, 'u'); p++;
     poke(_bug_pathbuf + p, 'g'); p++;
     poke(_bug_pathbuf + p, 0);
-
-    // Determine the target code: 0 = ARM64, 1 = x86_64.
-    // The caller decides which backend-specific writer to invoke based on
-    // the compilation mode, so we check which codegen arrays are populated.
-    target = 0;
-    if (arr_len(cg_fn_name) > 0) { target = 1; }
 
     // Reset the serialization buffer and write the file header.
     bo_reset();

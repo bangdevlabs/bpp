@@ -89,11 +89,11 @@ re-log.
 | W010 | narrowing conversion | bpp_validate.bsm | 270 | ❌ | Float narrowed to half/quarter |
 | W011 | precision loss | bpp_validate.bsm | 254 | ❌ | Word to half float |
 | W012 | & in FFI argument | bpp_validate.bsm | 451 | ✅ | Address-of passed to extern/call |
-| W013 | : base mismatch | bpp_dispatch.bsm | 939 | ✅ | Function annotated base but impure |
+| W013 | @base mismatch | bpp_dispatch.bsm | 1156 | ✅ | Function annotated `@base` but the BASE/SOLO classifier marked it SOLO (impure). Seed: any direct write to a global, any call into a SOLO callee, or any builtin not in the pure-extern table. Verify with `examples/phase_lattice_bad.bpp` (`bad_base`) |
 | W020 | static cross-module | bpp_validate.bsm | 397 | ✅ | Calling static fn from other module |
 | W021 | switch not exhaustive | bpp_parser.bsm | TBD | ✅ | switch without else arm |
 | W025 | public param without hint used in float arithmetic | bpp_validate.bsm | 681 | ✅ | Non-static fn uses un-hinted param in a T_BINOP where the other side is float-typed — annotate `: float` to preserve IEEE bits or `: word` to document integer intent (Rule 13) |
-| W026 | phase annotation violated by effect lattice | bpp_dispatch.bsm | 1118 | ✅ | Function annotated `: realtime` / `: io` / `: gpu` transitively reaches an incompatible effect through its call graph — Level 4 sub-step C. Lattice: BASE < REALTIME < HEAP < {IO, GPU} < SOLO. `: realtime` forbids HEAP; `: io` / `: gpu` permit HEAP (scaffolding allocation is ubiquitous). Gradual: unknown externs default to PHASE_AUTO so only KNOWN-to-be-incompatible paths fire |
+| W026 | phase annotation violated by effect lattice | bpp_dispatch.bsm | 1228 | ✅ | Function annotated `@time` / `@io` / `@gpu` transitively reaches an incompatible effect through its call graph — Level 4 sub-step C. Lattice: BASE < TIME < HEAP < {IO, GPU} < SOLO. `@time` forbids HEAP, IO, GPU, SOLO; `@io` permits BASE, TIME, HEAP, IO (forbids GPU, SOLO); `@gpu` permits BASE, TIME, HEAP, GPU (forbids IO, SOLO). Verify with `examples/phase_lattice_bad.bpp`. Note: the `@gpu` arm is wired but not yet armed — no builtin currently carries a PHASE_GPU effect, so the cross-sibling case (`@io` reaching GPU through call graph) doesn't fire empirically |
 
 ## What "has location" means
 

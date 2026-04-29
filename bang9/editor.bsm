@@ -112,7 +112,7 @@ void editor_init() {
     // IDE/vscode/syntaxes/bpp.tmLanguage.json so all three
     // highlighters recognise the same words. Keep them in sync
     // whenever B++ gains or loses a keyword.
-    _ed_kw_list  = buf_word(24);
+    _ed_kw_list  = buf_word(25);
     _ed_kw_count = 0;
     *(_ed_kw_list + _ed_kw_count * 8) = "if";       _ed_kw_count++;
     *(_ed_kw_list + _ed_kw_count * 8) = "else";     _ed_kw_count++;
@@ -130,17 +130,18 @@ void editor_init() {
     *(_ed_kw_list + _ed_kw_count * 8) = "import";   _ed_kw_count++;
     *(_ed_kw_list + _ed_kw_count * 8) = "void";     _ed_kw_count++;
     *(_ed_kw_list + _ed_kw_count * 8) = "static";   _ed_kw_count++;
+    *(_ed_kw_list + _ed_kw_count * 8) = "stub";     _ed_kw_count++;
 }
 
-editor_has_file() : base {
+editor_has_file()@base {
     return _ed_path != 0;
 }
 
-editor_path() : base {
+editor_path()@base {
     return _ed_path;
 }
 
-editor_dirty() : base {
+editor_dirty()@base {
     return _ed_dirty;
 }
 
@@ -175,7 +176,7 @@ void editor_close() {
 
 // Reload current file from disk, discarding unsaved changes. Tag-bar
 // [Get] button — same gesture as acme's "Get" command.
-editor_reload() : io {
+editor_reload()@io {
     auto path_copy, plen, i, rc;
     if (_ed_path == 0) { return 0; }
     // Need to copy the path since editor_open frees and
@@ -210,7 +211,7 @@ static void _ed_ensure_cap(need) {
 // Count how many newlines are in the buffer from offset 0 up
 // through (but not including) offset off. Returns line number
 // (0-indexed) containing that offset.
-static _ed_line_of(off) : base {
+static _ed_line_of(off)@base {
     auto line, i;
     line = 0;
     for (i = 0; i < off; i++) {
@@ -220,7 +221,7 @@ static _ed_line_of(off) : base {
 }
 
 // Return total line count in buffer.
-editor_line_count() : base {
+editor_line_count()@base {
     auto n, i;
     if (_ed_buf == 0) { return 0; }
     n = 1;
@@ -230,12 +231,12 @@ editor_line_count() : base {
     return n;
 }
 
-editor_cursor_line() : base {
+editor_cursor_line()@base {
     return _ed_line_of(_ed_cursor);
 }
 
 // Return byte offset of the start of line `n` (0-indexed).
-static _ed_line_start(n) : base {
+static _ed_line_start(n)@base {
     auto i, line;
     line = 0;
     i = 0;
@@ -248,7 +249,7 @@ static _ed_line_start(n) : base {
 
 // Return byte offset of the end of line `n` (the newline char
 // itself, or _ed_len if it's the last line without trailing \n).
-static _ed_line_end(n) : base {
+static _ed_line_end(n)@base {
     auto i;
     i = _ed_line_start(n);
     while (i < _ed_len && peek(_ed_buf + i) != 10) {
@@ -258,7 +259,7 @@ static _ed_line_end(n) : base {
 }
 
 // Column within the current line, i.e. bytes from last newline.
-static _ed_col_of(off) : base {
+static _ed_col_of(off)@base {
     auto col, i;
     col = 0;
     i = off;
@@ -271,7 +272,7 @@ static _ed_col_of(off) : base {
 
 // ── Open / save ──────────────────────────────────────────────
 
-editor_open(path) : io {
+editor_open(path)@io {
     auto buf, size_box, fsize, i, plen;
 
     size_box = malloc(8);
@@ -306,7 +307,7 @@ editor_open(path) : io {
     return 1;
 }
 
-editor_save() : io {
+editor_save()@io {
     auto rc;
     if (_ed_path == 0) { return 0; }
     rc = file_write_all(_ed_path, _ed_buf, _ed_len);
@@ -460,6 +461,25 @@ static _ed_is_num_body(ch) {
     return 0;
 }
 
+// Returns 1 if the byte range buf[start..start+len) is a phase word
+// (@base @solo @io @time @gpu). Called after consuming the '@' sigil.
+static _ed_is_phase_word(start, len) {
+    auto s;
+    s = _ed_buf + start;
+    if (len == 2) {
+        if (peek(s) == 105 && peek(s + 1) == 111) { return 1; }   // "io"
+    }
+    if (len == 4) {
+        if (peek(s)==98 && peek(s+1)==97 && peek(s+2)==115 && peek(s+3)==101) { return 1; }  // "base"
+        if (peek(s)==115 && peek(s+1)==111 && peek(s+2)==108 && peek(s+3)==111) { return 1; } // "solo"
+        if (peek(s)==116 && peek(s+1)==105 && peek(s+2)==109 && peek(s+3)==101) { return 1; } // "time"
+    }
+    if (len == 3) {
+        if (peek(s)==103 && peek(s+1)==112 && peek(s+2)==117) { return 1; }  // "gpu"
+    }
+    return 0;
+}
+
 // Returns 1 if the byte range buf[start..start+len) matches any
 // keyword in _ed_kw_list, 0 otherwise. Short-circuits on length
 // mismatch before doing the byte compare.
@@ -532,6 +552,20 @@ static void _ed_classify(start, line_end) {
         return;
     }
 
+    // Phase annotation — @base @solo @io @time @gpu.
+    // Consume '@' plus the following word run and highlight as accent.
+    if (ch == 64) {
+        p = start + 1;
+        while (p < line_end && _ed_is_word_ch(peek(_ed_buf + p)) != 0) { p++; }
+        _ed_seg_end = p;
+        if (_ed_is_phase_word(start + 1, p - start - 1) != 0) {
+            _ed_seg_color = _theme.accent;
+        } else {
+            _ed_seg_color = _theme.text;
+        }
+        return;
+    }
+
     // Word — letter or underscore start, word-char tail.
     if (_ed_is_word_ch(ch) != 0 && (ch < 48 || ch > 57)) {
         p = start + 1;
@@ -565,7 +599,7 @@ static void _ed_classify(start, line_end) {
 // Close. Build / Run bubble up via the _ed_req_build / _ed_req_run
 // flags — the outer panel owns the runner + tab-switch logic.
 
-static void _ed_draw_tag(x, y, w, h) : io {
+static void _ed_draw_tag(x, y, w, h)@io {
     auto mx, my, bx, by;
     auto n_btn, i, label, lw, hover, clicked;
     auto buttons;
@@ -632,7 +666,7 @@ static void _ed_draw_tag(x, y, w, h) : io {
 // and mouse input while the Code tab is active. Scrolls so the
 // cursor line stays visible. Delegates the top strip to the tag
 // bar helper above.
-void editor_draw(x, y, w, h) : io {
+void editor_draw(x, y, w, h)@io {
     auto margin_l, margin_t, line_h, gutter_w;
     auto visible_lines, cursor_line;
     auto line_num, byte_pos, col, lx, ly, ch;

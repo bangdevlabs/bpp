@@ -11,7 +11,7 @@
 // right platform.
 //
 //   Section 1 — Runtime startup globals (_bpp_argc/argv/envp)
-//   Section 2 — Heap (malloc / free / realloc / memcpy)
+//   Section 2 — Heap primitives (page allocator consumed by bpp_mem)
 //   Section 3 — Time + threads
 
 // ── Section 1: Runtime startup globals ────────────────────────
@@ -29,80 +29,36 @@ global _bpp_argc;
 global _bpp_argv;
 global _bpp_envp;
 
-// ── Section 2: Heap ───────────────────────────────────────────
+// ── Section 2: Heap primitives ────────────────────────────────
 //
-// Each allocation maps a private, anonymous region via sys_mmap.
-// A 16-byte header sits immediately before the user pointer:
-//   user_ptr - 16: original raw mmap base
-//   user_ptr -  8: total mmap size in bytes
+// Page-level allocator primitives consumed by the abstract heap
+// API in `bpp_mem.bsm`. Linux-specific only via the mmap flag
+// constant; the byte-for-byte allocation logic, header layout,
+// alignment, and realloc live in the portable abstract layer.
 //
-// Static ELF binaries have no libc available, so this module IS
-// the allocator — not a wrapper. Deliberately simple: one mmap
-// per allocation, no free list.
+// Static ELF binaries have no libc available, so the abstract
+// allocator in `bpp_mem.bsm` IS the allocator — not a wrapper.
+// Deliberately simple: one mmap per allocation, no free list.
 
 // mmap protection: PROT_READ | PROT_WRITE.
-const _BMEM_PROT_RW = 3;
+const _MEM_PROT_RW = 3;
 
 // mmap flags on Linux: MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20).
-const _BMEM_FLAGS = 0x22;
+const _MEM_FLAGS = 0x22;
 
-// Header size — 8 bytes for the raw mmap pointer plus 8 bytes
-// for the total mmap size.
-const _BMEM_HEADER = 16;
-
-// Error return from sys_mmap (and the "no fd" sentinel for anon).
-const _BMEM_FAIL = 0 - 1;
-
-malloc(size) {
-    auto raw, total;
-    total = size + _BMEM_HEADER;
-    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
-    if (raw == _BMEM_FAIL) { return 0; }
-    *raw = raw;
-    *(raw + 8) = total;
-    return raw + _BMEM_HEADER;
+// Allocate `size` raw bytes from the kernel, or 0 on failure.
+// Wraps Linux sys_mmap with the right MAP flags and translates
+// MAP_FAILED (-1) to 0 for portability.
+_mem_alloc_pages(size) {
+    auto raw;
+    raw = sys_mmap(0, size, _MEM_PROT_RW, _MEM_FLAGS, 0 - 1, 0);
+    if (raw == 0 - 1) { return 0; }
+    return raw;
 }
 
-malloc_aligned(size, alignment) {
-    auto raw, total, user;
-    total = size + alignment + _BMEM_HEADER;
-    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
-    if (raw == _BMEM_FAIL) { return 0; }
-    user = (raw + _BMEM_HEADER + alignment - 1) / alignment * alignment;
-    *(user - _BMEM_HEADER) = raw;
-    *(user - 8) = total;
-    return user;
-}
-
-void free(p) {
-    auto raw, total;
-    if (p == 0) { return; }
-    raw = *(p - _BMEM_HEADER);
-    total = *(p - 8);
+// Release a region previously returned by _mem_alloc_pages.
+void _mem_free_pages(raw, total) {
     sys_munmap(raw, total);
-}
-
-realloc(p, new_size) {
-    auto new_p, old_size, raw, total, limit;
-    if (p == 0) { return malloc(new_size); }
-    raw = *(p - _BMEM_HEADER);
-    total = *(p - 8);
-    old_size = total - (p - raw);
-    new_p = malloc(new_size);
-    if (new_p == 0) { return 0; }
-    limit = old_size;
-    if (new_size < limit) { limit = new_size; }
-    memcpy(new_p, p, limit);
-    free(p);
-    return new_p;
-}
-
-memcpy(dst, src, n) {
-    auto i;
-    for (i = 0; i < n; i++) {
-        poke(dst + i, peek(src + i));
-    }
-    return dst;
 }
 
 // ── Section 3: Time + threads ─────────────────────────────────

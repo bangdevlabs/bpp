@@ -2,7 +2,7 @@
 // Parses a .bug binary file into in-memory arrays for the bug debugger.
 // Mirrors the format written by bpp_bug.bsm in the compiler.
 
-import "bpp_array.bsm";
+// bpp_array and bpp_buf are auto-injected. No imports needed.
 
 // -- File buffer (reusable read primitives) --------------------
 
@@ -11,36 +11,32 @@ static auto _br_pos;       // Current read position in the buffer.
 static auto _br_size;      // Total bytes loaded.
 
 // Read one byte from the buffer and advance.
-br_read_u8() {
+static br_read_u8() {
     auto val;
-    val = peek(_br_buf + _br_pos) & 0xFF;
+    val = read_u8(_br_buf, _br_pos);
     _br_pos++;
     return val;
 }
 
 // Read a little-endian u16 from the buffer.
-br_read_u16() {
-    auto lo, hi;
-    lo = peek(_br_buf + _br_pos) & 0xFF;
-    hi = peek(_br_buf + _br_pos + 1) & 0xFF;
+static br_read_u16() {
+    auto val;
+    val = read_u16(_br_buf, _br_pos);
     _br_pos += 2;
-    return lo | (hi << 8);
+    return val;
 }
 
 // Read a little-endian u32 from the buffer.
-br_read_u32() {
-    auto b0, b1, b2, b3;
-    b0 = peek(_br_buf + _br_pos) & 0xFF;
-    b1 = peek(_br_buf + _br_pos + 1) & 0xFF;
-    b2 = peek(_br_buf + _br_pos + 2) & 0xFF;
-    b3 = peek(_br_buf + _br_pos + 3) & 0xFF;
+static br_read_u32() {
+    auto val;
+    val = read_u32(_br_buf, _br_pos);
     _br_pos += 4;
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    return val;
 }
 
 // Read a length-prefixed string from the buffer into strbuf.
 // Returns a packed (offset, length) value.
-br_read_str() {
+static br_read_str() {
     auto l, start, i;
     l = br_read_u16();
     start = _br_strbuf_pos;
@@ -53,12 +49,14 @@ br_read_str() {
 }
 
 // String buffer for all names read from the .bug file.
-static auto _br_strbuf;
+// Not static: accessed cross-module by the_bug_lib.bsm via extrn.
+global _br_strbuf;
 static auto _br_strbuf_pos;
 
 // -- Parsed data ----------------------------------------------
-// All bug_* arrays are populated by br_load() and read by bug.bpp / bug_gdb.bsm.
-// Pointers are set once and stable; contents are read-only after load.
+// All bug_* arrays are populated by init_reader() / bug_parse() and
+// read by bug.bpp / bug_gdb.bsm / the_bug_lib.bsm. Pointers are
+// stable after a successful parse; re-parse calls init_reader() first.
 
 // Header fields.
 extrn bug_version;    // Format version (currently 1).
@@ -86,10 +84,11 @@ extrn bug_st_ftypes;  // Pointer to array of field type bytes.
 extrn bug_st_count;   // Total number of structs.
 
 // Globals: parallel arrays.
-extrn bug_gl_name;    // Packed name.
-extrn bug_gl_type;    // Type byte.
-extrn bug_gl_class;   // Storage class: 0=auto, 1=global, 2=extrn.
-extrn bug_gl_count;   // Total number of globals.
+extrn bug_gl_name;      // Packed name.
+extrn bug_gl_type;      // Type byte.
+extrn bug_gl_class;     // Storage class: 0=auto, 1=global, 2=extrn.
+extrn bug_gl_data_off;  // Byte offset of the global's slot in __DATA.
+extrn bug_gl_count;     // Total number of globals.
 
 // Externs: parallel arrays.
 extrn bug_ex_name;    // Packed name.
@@ -119,60 +118,97 @@ extrn bug_sk_count;   // Total stack map entries.
 
 // -- Initialization -------------------------------------------
 
-init_reader() {
+// Reset all parsed state. Safe to call multiple times: frees the
+// previous allocations before creating fresh ones. Called by
+// the_bug_lib_try_load on each consecutive build reload.
+void init_reader() {
+    if (_br_buf != 0)    { free(_br_buf); }
     _br_buf = malloc(262144);
     _br_pos = 0;
     _br_size = 0;
+    if (_br_strbuf != 0) { free(_br_strbuf); }
     _br_strbuf = malloc(262144);
     _br_strbuf_pos = 0;
 
-    bug_fn_name = arr_new();
-    bug_fn_pcnt = arr_new();
+    if (bug_fn_name != 0)   { arr_free(bug_fn_name); }
+    if (bug_fn_pcnt != 0)   { arr_free(bug_fn_pcnt); }
+    if (bug_fn_pnames != 0) { arr_free(bug_fn_pnames); }
+    if (bug_fn_ptypes != 0) { arr_free(bug_fn_ptypes); }
+    if (bug_fn_lcnt != 0)   { arr_free(bug_fn_lcnt); }
+    if (bug_fn_lnames != 0) { arr_free(bug_fn_lnames); }
+    if (bug_fn_ltypes != 0) { arr_free(bug_fn_ltypes); }
+    if (bug_fn_rtype != 0)  { arr_free(bug_fn_rtype); }
+    bug_fn_name   = arr_new();
+    bug_fn_pcnt   = arr_new();
     bug_fn_pnames = arr_new();
     bug_fn_ptypes = arr_new();
-    bug_fn_lcnt = arr_new();
+    bug_fn_lcnt   = arr_new();
     bug_fn_lnames = arr_new();
     bug_fn_ltypes = arr_new();
-    bug_fn_rtype = arr_new();
-    bug_fn_count = 0;
+    bug_fn_rtype  = arr_new();
+    bug_fn_count  = 0;
 
-    bug_st_name = arr_new();
-    bug_st_size = arr_new();
-    bug_st_fcnt = arr_new();
+    if (bug_st_name != 0)   { arr_free(bug_st_name); }
+    if (bug_st_size != 0)   { arr_free(bug_st_size); }
+    if (bug_st_fcnt != 0)   { arr_free(bug_st_fcnt); }
+    if (bug_st_fnames != 0) { arr_free(bug_st_fnames); }
+    if (bug_st_foffs != 0)  { arr_free(bug_st_foffs); }
+    if (bug_st_fsizes != 0) { arr_free(bug_st_fsizes); }
+    if (bug_st_ftypes != 0) { arr_free(bug_st_ftypes); }
+    bug_st_name   = arr_new();
+    bug_st_size   = arr_new();
+    bug_st_fcnt   = arr_new();
     bug_st_fnames = arr_new();
-    bug_st_foffs = arr_new();
+    bug_st_foffs  = arr_new();
     bug_st_fsizes = arr_new();
     bug_st_ftypes = arr_new();
-    bug_st_count = 0;
+    bug_st_count  = 0;
 
-    bug_gl_name = arr_new();
-    bug_gl_type = arr_new();
-    bug_gl_class = arr_new();
-    bug_gl_count = 0;
+    if (bug_gl_name != 0)     { arr_free(bug_gl_name); }
+    if (bug_gl_type != 0)     { arr_free(bug_gl_type); }
+    if (bug_gl_class != 0)    { arr_free(bug_gl_class); }
+    if (bug_gl_data_off != 0) { arr_free(bug_gl_data_off); }
+    bug_gl_name     = arr_new();
+    bug_gl_type     = arr_new();
+    bug_gl_class    = arr_new();
+    bug_gl_data_off = arr_new();
+    bug_gl_count    = 0;
 
-    bug_ex_name = arr_new();
-    bug_ex_lib = arr_new();
-    bug_ex_ret = arr_new();
-    bug_ex_acnt = arr_new();
-    bug_ex_args = arr_new();
+    if (bug_ex_name != 0)  { arr_free(bug_ex_name); }
+    if (bug_ex_lib != 0)   { arr_free(bug_ex_lib); }
+    if (bug_ex_ret != 0)   { arr_free(bug_ex_ret); }
+    if (bug_ex_acnt != 0)  { arr_free(bug_ex_acnt); }
+    if (bug_ex_args != 0)  { arr_free(bug_ex_args); }
+    bug_ex_name  = arr_new();
+    bug_ex_lib   = arr_new();
+    bug_ex_ret   = arr_new();
+    bug_ex_acnt  = arr_new();
+    bug_ex_args  = arr_new();
     bug_ex_count = 0;
 
-    bug_sm_fidx = arr_new();
-    bug_sm_midx = arr_new();
-    bug_sm_pos = arr_new();
+    if (bug_sm_fidx != 0) { arr_free(bug_sm_fidx); }
+    if (bug_sm_midx != 0) { arr_free(bug_sm_midx); }
+    if (bug_sm_pos != 0)  { arr_free(bug_sm_pos); }
+    bug_sm_fidx  = arr_new();
+    bug_sm_midx  = arr_new();
+    bug_sm_pos   = arr_new();
     bug_sm_count = 0;
 
-    bug_am_name = arr_new();
-    bug_am_off = arr_new();
+    if (bug_am_name != 0) { arr_free(bug_am_name); }
+    if (bug_am_off != 0)  { arr_free(bug_am_off); }
+    bug_am_name  = arr_new();
+    bug_am_off   = arr_new();
     bug_am_count = 0;
 
-    bug_sk_name = arr_new();
+    if (bug_sk_name != 0)  { arr_free(bug_sk_name); }
+    if (bug_sk_frame != 0) { arr_free(bug_sk_frame); }
+    if (bug_sk_vcnt != 0)  { arr_free(bug_sk_vcnt); }
+    if (bug_sk_voffs != 0) { arr_free(bug_sk_voffs); }
+    bug_sk_name  = arr_new();
     bug_sk_frame = arr_new();
-    bug_sk_vcnt = arr_new();
+    bug_sk_vcnt  = arr_new();
     bug_sk_voffs = arr_new();
     bug_sk_count = 0;
-
-    return 0;
 }
 
 // -- File loading ---------------------------------------------
@@ -193,19 +229,19 @@ bug_load(path) {
 // -- Parsing --------------------------------------------------
 
 // Parse the header. Returns 0 on success, -1 on bad magic.
-bug_parse_header() {
+static bug_parse_header() {
     auto m0, m1;
     m0 = br_read_u8();
     m1 = br_read_u8();
     if (m0 != 66) { return -1; }
     if (m1 != 71) { return -1; }
     bug_version = br_read_u8();
-    bug_target = br_read_u8();
+    bug_target  = br_read_u8();
     return 0;
 }
 
 // Parse the FUNCTIONS section.
-bug_parse_functions() {
+static void bug_parse_functions() {
     auto fc, i, j, name_p, pcnt, lcnt, rty;
     auto pnames, ptypes, lnames, ltypes;
     fc = br_read_u16();
@@ -251,11 +287,10 @@ bug_parse_functions() {
         rty = br_read_u8();
         bug_fn_rtype = arr_push(bug_fn_rtype, rty);
     }
-    return 0;
 }
 
 // Parse the STRUCTS section.
-bug_parse_structs() {
+static void bug_parse_structs() {
     auto sc, i, j, name_p, sz, fc;
     auto fnames, foffs, fsizes, ftypes;
     sc = br_read_u16();
@@ -271,51 +306,50 @@ bug_parse_structs() {
         bug_st_fcnt = arr_push(bug_st_fcnt, fc);
 
         fnames = 0;
-        foffs = 0;
+        foffs  = 0;
         fsizes = 0;
         ftypes = 0;
         if (fc > 0) {
             fnames = buf_word(fc);
-            foffs = buf_word(fc);
+            foffs  = buf_word(fc);
             fsizes = buf_word(fc);
             ftypes = buf_word(fc);
             for (j = 0; j < fc; j++) {
                 fnames[j] = br_read_str();
-                foffs[j] = br_read_u16();
+                foffs[j]  = br_read_u16();
                 fsizes[j] = br_read_u8();
                 ftypes[j] = br_read_u8();
             }
         }
         bug_st_fnames = arr_push(bug_st_fnames, fnames);
-        bug_st_foffs = arr_push(bug_st_foffs, foffs);
-        bug_st_fsizes = arr_push(bug_st_fsizes, fsizes);
-        bug_st_ftypes = arr_push(bug_st_ftypes, ftypes);
+        bug_st_foffs  = arr_push(bug_st_foffs,  foffs);
+        bug_st_fsizes = arr_push(bug_st_fsizes,  fsizes);
+        bug_st_ftypes = arr_push(bug_st_ftypes,  ftypes);
     }
-    return 0;
 }
 
-// Parse the GLOBALS section. Each entry has name + type + storage class.
-bug_parse_globals() {
+// Parse the GLOBALS section. Each entry: name + type + class + data_offset.
+static void bug_parse_globals() {
     auto gc, i;
     gc = br_read_u16();
     bug_gl_count = gc;
     for (i = 0; i < gc; i++) {
-        bug_gl_name = arr_push(bug_gl_name, br_read_str());
-        bug_gl_type = arr_push(bug_gl_type, br_read_u8());
-        bug_gl_class = arr_push(bug_gl_class, br_read_u8());
+        bug_gl_name     = arr_push(bug_gl_name,     br_read_str());
+        bug_gl_type     = arr_push(bug_gl_type,     br_read_u8());
+        bug_gl_class    = arr_push(bug_gl_class,    br_read_u8());
+        bug_gl_data_off = arr_push(bug_gl_data_off, br_read_u32());
     }
-    return 0;
 }
 
 // Parse the EXTERNS section.
-bug_parse_externs() {
+static void bug_parse_externs() {
     auto ec, i, j, acnt, args;
     ec = br_read_u16();
     bug_ex_count = ec;
     for (i = 0; i < ec; i++) {
         bug_ex_name = arr_push(bug_ex_name, br_read_str());
-        bug_ex_lib = arr_push(bug_ex_lib, br_read_str());
-        bug_ex_ret = arr_push(bug_ex_ret, br_read_str());
+        bug_ex_lib  = arr_push(bug_ex_lib,  br_read_str());
+        bug_ex_ret  = arr_push(bug_ex_ret,  br_read_str());
         acnt = br_read_u16();
         bug_ex_acnt = arr_push(bug_ex_acnt, acnt);
         args = 0;
@@ -327,44 +361,41 @@ bug_parse_externs() {
         }
         bug_ex_args = arr_push(bug_ex_args, args);
     }
-    return 0;
 }
 
 // Parse the SOURCE MAP section.
-bug_parse_srcmap() {
+static void bug_parse_srcmap() {
     auto sc, i;
     sc = br_read_u16();
     bug_sm_count = sc;
     for (i = 0; i < sc; i++) {
         bug_sm_fidx = arr_push(bug_sm_fidx, br_read_u16());
         bug_sm_midx = arr_push(bug_sm_midx, br_read_u16());
-        bug_sm_pos = arr_push(bug_sm_pos, br_read_u32());
+        bug_sm_pos  = arr_push(bug_sm_pos,  br_read_u32());
     }
-    return 0;
 }
 
 // Parse the ADDRESS MAP section.
-bug_parse_addrmap() {
+static void bug_parse_addrmap() {
     auto ac, i;
     ac = br_read_u16();
     bug_am_count = ac;
     for (i = 0; i < ac; i++) {
         bug_am_name = arr_push(bug_am_name, br_read_str());
-        bug_am_off = arr_push(bug_am_off, br_read_u32());
+        bug_am_off  = arr_push(bug_am_off,  br_read_u32());
     }
-    return 0;
 }
 
 // Parse the STACK MAP section.
-bug_parse_stackmap() {
+static void bug_parse_stackmap() {
     auto sc, i, j, vcnt, voffs;
     sc = br_read_u16();
     bug_sk_count = sc;
     for (i = 0; i < sc; i++) {
-        bug_sk_name = arr_push(bug_sk_name, br_read_str());
+        bug_sk_name  = arr_push(bug_sk_name,  br_read_str());
         bug_sk_frame = arr_push(bug_sk_frame, br_read_u16());
         vcnt = br_read_u16();
-        bug_sk_vcnt = arr_push(bug_sk_vcnt, vcnt);
+        bug_sk_vcnt  = arr_push(bug_sk_vcnt, vcnt);
         voffs = 0;
         if (vcnt > 0) {
             voffs = buf_word(vcnt);
@@ -374,7 +405,6 @@ bug_parse_stackmap() {
         }
         bug_sk_voffs = arr_push(bug_sk_voffs, voffs);
     }
-    return 0;
 }
 
 // Parse the entire .bug file. Call after bug_load().
@@ -394,19 +424,17 @@ bug_parse() {
 // -- String utilities -----------------------------------------
 
 // Print a packed string from the reader's string buffer to stderr.
-br_print(p) {
+void br_print(p) {
     auto s, l;
     s = p % 0x100000000;
     l = p / 0x100000000;
     sys_write(2, _br_strbuf + s, l);
-    return 0;
 }
 
 // Print a packed string from the reader's string buffer to stdout.
-br_print_out(p) {
+void br_print_out(p) {
     auto s, l;
     s = p % 0x100000000;
     l = p / 0x100000000;
     sys_write(1, _br_strbuf + s, l);
-    return 0;
 }

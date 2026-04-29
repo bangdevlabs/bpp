@@ -42,8 +42,9 @@
          ;; global: worker-shared mutable.
          ;; extrn:  write-once-after-init, safe to read from any worker.
          ;; void:   no return value.
+         ;; stub:   overrideable placeholder — another module may provide a real body.
          (decl '("auto" "struct" "enum" "extrn" "global" "static" "const" "void"
-                 "import" "sizeof"))
+                 "import" "sizeof" "stub"))
 
          ;; Compiler builtins — intercepts handled before codegen.
          (builtins '(;; Memory primitives
@@ -85,7 +86,7 @@
                       "DSP_SEQ" "DSP_PAR" "DSP_GPU" "DSP_SPLIT"
                       ;; Phase/effect codes
                       "PHASE_AUTO" "PHASE_BASE" "PHASE_SOLO"
-                      "PHASE_REALTIME" "PHASE_IO" "PHASE_GPU" "PHASE_HEAP" "PHASE_PANIC"
+                      "PHASE_TIME" "PHASE_IO" "PHASE_GPU" "PHASE_HEAP" "PHASE_PANIC"
                       ;; Global storage class codes
                       "GLOB_AUTO" "GLOB_GLOBAL" "GLOB_EXTRN"
                       ;; Node layout offsets
@@ -121,14 +122,15 @@
       (,co-re    . font-lock-constant-face)
 
       ;; Function definitions. Handles all prefix combinations:
-      ;;   static void fn(   static fn(   void fn(   fn(
+      ;;   static void fn(   static fn(   void fn(   fn(   stub fn(
       ;; The \\(?: ... \\) groups are non-capturing; group 1 = function name.
-      ("^\\(?:static\\s-+\\)?\\(?:void\\s-+\\)?\\([a-zA-Z_][a-zA-Z0-9_]*\\)\\s-*("
+      ("^\\(?:static\\s-+\\)?\\(?:stub\\s-+\\)?\\(?:void\\s-+\\)?\\([a-zA-Z_][a-zA-Z0-9_]*\\)\\s-*("
        1 font-lock-function-name-face)
 
-      ;; Effect / phase annotations after colon: : base, : solo, : io, etc.
-      (":\\s-*\\(base\\|solo\\|io\\|realtime\\|gpu\\|heap\\)\\b"
-       1 font-lock-preprocessor-face)
+      ;; Phase annotations: @base @solo @io @time @gpu (@ sigil + word, no space).
+      ;; Group 0 (the full match) carries the face so the @ sigil colors too.
+      ("@\\(base\\|solo\\|io\\|time\\|gpu\\)\\b"
+       0 font-lock-preprocessor-face)
 
       ;; Type annotations after colon: : word, : float, : array, : ptr,
       ;; and slice variants: : byte word, : half float, etc.

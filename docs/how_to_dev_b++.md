@@ -486,8 +486,8 @@ void print_greeting() {
 // With typed parameters:
 physics_tick(world, dt: float) { ... }
 
-// With effect annotation (see §5.3):
-pure_hash(s) : base { ... }
+// With effect annotation (see §5.4):
+pure_hash(s)@base { ... }
 ```
 
 Functions return a word by default. The `void` keyword makes the
@@ -515,7 +515,7 @@ A() {
 that has an annotation must repeat the annotation:
 
 ```c
-stub compute(x) : base;   // stub must carry the effect signature
+stub compute(x)@base;   // stub must carry the effect signature
 ```
 
 ### §5.3 — Visibility
@@ -532,43 +532,74 @@ public_api(x) { return _private_helper(x); }
 Convention: prefix private helpers with an underscore. The compiler
 does not enforce this, but every stdlib module follows it.
 
-### §5.4 — Effect annotations (the four phases)
+### §5.4 — Effect annotations (the five phases)
 
-Functions carry one of four **phase annotations** that describe
-what kind of work they do:
+Functions carry one of five **phase annotations** that describe
+what kind of work they do. The annotation is an `@` sigil glued to
+the phase word with no space, placed between the parameter list
+and the function body:
 
 ```c
-solo     // runs on main thread, drives real-time side effects
-base     // pure computation, parallelizable on worker threads
-io       // blocking I/O — stdin/stdout, files, sockets, syscalls
-heap     // allocates memory (malloc, arr_push, buf_byte, buf_word)
+@solo    // runs on main thread, drives presentation side effects
+@base    // pure computation, parallelizable on worker threads
+@io      // blocking I/O — stdin/stdout, files, sockets, syscalls
+@gpu     // touches GPU resources (palette, texture, draw calls)
+@time    // time-bounded path — audio callbacks, no malloc, no IO
 ```
 
 The effects form a lattice — a function inherits the WORST effect
-of any function it calls. A `: base` function that calls a `: io`
-function is itself `: io`. The compiler tracks this automatically
-and emits errors if annotations don't match the actual call graph.
+of any function it calls. A `@base` function that calls a `@io`
+function is itself `@io`. The compiler tracks this automatically
+and emits errors (W026) if annotations don't match the actual
+call graph.
 
-**Phase :base = the parallelizable phase.** Anything marked
-`: base` can run on a worker thread during smart dispatch. The
-compiler rejects side-effect-causing operations inside a `: base`
+```
+@time            (most strict — no malloc, no IO, no GPU)
+   ↓
+@io / @gpu       (sibling categories — can call base or own kind)
+   ↓
+@base            (pure, callable by everyone)
+   ↓
+@solo            (catch-all — most permissive, can call anything)
+```
+
+**Phase `@base` = the parallelizable phase.** Anything marked
+`@base` can run on a worker thread during smart dispatch. The
+compiler rejects side-effect-causing operations inside a `@base`
 function (no writes to shared globals, no I/O, no allocation) —
-the annotation is a contract the compiler enforces.
+the annotation is a contract the compiler enforces (W013).
+
+**Phase `@time` = the realtime phase.** Audio callbacks, frame
+deadlines, anything where a heap allocation would be a glitch.
+The compiler forbids HEAP-tagged builtins (malloc, arr_push,
+buf_byte, buf_word) inside a `@time` function.
 
 ```c
 // Pure function — parallelizable:
-static _dist(ax, ay, bx, by) : base {
+static _dist(ax, ay, bx, by)@base {
     auto dx, dy;
     dx = bx - ax; dy = by - ay;
     return sqrt(dx * dx + dy * dy);
 }
 
 // Game loop — drives presentation, stays on main thread:
-void tick(w, dt) : solo {
-    update_positions(w, dt);    // inherits :solo through call
+void tick(w, dt)@solo {
+    update_positions(w, dt);    // inherits @solo through call
     render_sprites(w);
 }
+
+// Audio callback — no malloc, no IO:
+void mixer_callback(buf, n)@time {
+    auto i;
+    for (i = 0; i < n; i++) { poke(buf + i, _next_sample()); }
+}
 ```
+
+`heap` is an internal compiler effect (PHASE_HEAP) the lattice
+uses to track allocation; user code does not write `@heap`.
+Allocation-free is implied by `@base` and `@time`; `@io` and
+`@gpu` permit allocation because scaffolding (file readers,
+texture uploaders) is allocation-heavy by nature.
 
 ### §5.5 — Function pointers
 
@@ -1252,30 +1283,30 @@ For functions where the intent is clear:
 
 | Pattern | Action |
 |---------|--------|
-| Pure function: reads args, computes, returns value. No global writes. | Add `: base` |
-| Side-effect function: writes globals, calls impure functions | `: solo` (optional — inferred) |
-| Audio callback / realtime path: no malloc, no IO, bounded time | Add `: realtime` |
-| Touches files / network / stdout / syscalls | Add `: io` |
-| Touches GPU resources (calls `_stb_gpu_*`) | Add `: gpu` |
+| Pure function: reads args, computes, returns value. No global writes. | Add `@base` |
+| Side-effect function: writes globals, calls impure functions | `@solo` (optional — inferred) |
+| Audio callback / realtime path: no malloc, no IO, bounded time | Add `@time` |
+| Touches files / network / stdout / syscalls | Add `@io` |
+| Touches GPU resources (calls `_stb_gpu_*`) | Add `@gpu` |
 | Unclear / mixed | Leave unannotated (compiler auto-classifies) |
 
 **Only annotate when the intent is OBVIOUS.** Don't guess. The compiler classifies automatically for unannotated functions.
 
-**Do NOT mark `: base` on functions that call builtins** (malloc, free, putchar, sys_*). The classifier treats every builtin as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len). W013 catches mistakes.
+**Do NOT mark `@base` on functions that call builtins** (malloc, free, putchar, sys_*). The classifier treats every builtin as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len). W013 catches mistakes.
 
 Effect annotations form a strict-to-loose ladder:
 
 ```
-realtime  (most strict — can only call base or other realtime)
+@time            (most strict — can only call base or other time)
    ↓
-io / gpu  (sibling categories — can call base or own kind)
+@io / @gpu       (sibling categories — can call base or own kind)
    ↓
-base      (pure, callable by everyone)
+@base            (pure, callable by everyone)
    ↓
-solo      (catch-all — most permissive)
+@solo            (catch-all — most permissive)
 ```
 
-The killer use case: an audio callback annotated `: realtime` is verified by the compiler never to call `malloc`, `putchar`, or anything `: io` / `: gpu` — eliminating an entire class of audible glitches by proof rather than testing.
+The killer use case: an audio callback annotated `@time` is verified by the compiler never to call `malloc`, `putchar`, or anything `@io` / `@gpu` — eliminating an entire class of audible glitches by proof rather than testing.
 
 ### Rule 5 — Control flow (`switch`, `for`, `continue`)
 
@@ -2392,7 +2423,7 @@ call(fp, args...)      // indirect call through a function pointer
 
 `peek` and `poke` are the raw memory window — one byte at a time, zero abstraction. They are how B++ programs talk to hardware registers, inspect struct layouts, or read OS structures at known offsets.
 
-`malloc` / `realloc` / `free` map directly to the platform allocator: `malloc_zone_malloc` on macOS, `mmap` + arena on Linux. There is no hidden bookkeeping layer. The effect annotation is `heap`, meaning a function that calls malloc cannot be annotated `: base` (see Cap 5).
+`malloc` / `realloc` / `free` map directly to the platform allocator: `malloc_zone_malloc` on macOS, `mmap` + arena on Linux. There is no hidden bookkeeping layer. Calls to malloc carry the internal HEAP effect, meaning a function that calls malloc cannot be annotated `@base` or `@time` (both forbid HEAP). `@io`, `@gpu`, and `@solo` permit HEAP. See Cap 5 for the full lattice.
 
 `fn_ptr(name)` takes a **string literal** as its argument — evaluated at compile time to a label reference. `call(fp, ...)` is the only way to make an indirect call through a function pointer in B++. The spine handles both: `fn_ptr` emits an `adrp + add` pair (a64) or `lea` (x64); `call` emits `blr x0` / `call rax`.
 
@@ -2807,11 +2838,11 @@ Reserved:              2  (W017, W014)
 | W010 | Narrowing conversion | Float narrowed to half/quarter |
 | W011 | Precision loss | Word to half float |
 | W012 | `&` in FFI argument | Address-of passed to extern/call |
-| W013 | `: base` mismatch | Function annotated base but impure |
+| W013 | `@base` mismatch | Function annotated base but impure |
 | W020 | Static cross-module call | Calling `: static` function from another module |
 | W021 | Switch not exhaustive | Value switch without `else` arm |
 | W025 | Public param without hint in float arithmetic | Annotate `: float` or `: word` — see Rule 13 |
-| W026 | Phase annotation violated | Function annotated `: realtime` reaches a HEAP call, etc. |
+| W026 | Phase annotation violated | Function annotated `@time` reaches a HEAP call, etc. |
 
 ### W026 — the effect lattice guard
 
@@ -2821,7 +2852,7 @@ W026 fires when a function's explicit phase annotation is violated by its transi
 BASE < REALTIME < HEAP < {IO, GPU} < SOLO
 ```
 
-A function annotated `: realtime` must not call anything that reaches HEAP (i.e., no malloc). A function annotated `: io` permits HEAP (allocation is ubiquitous in I/O scaffolding) but must not be called from a `: realtime` context.
+A function annotated `@time` must not call anything that reaches HEAP (i.e., no malloc). A function annotated `@io` permits HEAP (allocation is ubiquitous in I/O scaffolding) but must not be called from a `@time` context.
 
 Unknown externs default to `PHASE_AUTO`, so only **known-to-be-incompatible** paths fire W026. This makes the check gradual: new extern calls are safe by default and opt into classification over time.
 
@@ -2860,7 +2891,7 @@ The diagnostic formatting internals (column calculation, caret alignment, ANSI c
 *Status: COMPLETE — 2026-04-22*
 
 `stbaudio.bsm` is the bottom of the audio stack — it opens the device,
-runs the realtime callback, and exposes one session-level volume knob.
+runs the `@time` callback, and exposes one session-level volume knob.
 Polyphonic mixing, WAV loading, and multi-bus routing live one level up
 in `stbmixer.bsm` (Cap 30) and `stbsound.bsm`.
 
@@ -2919,8 +2950,8 @@ units yourself.
 ### §29.1 — `audio_set_amplitude` / `audio_get_amplitude`
 
 ```c
-void audio_set_amplitude(amp) : io;   // clamps to 0..32767
-audio_get_amplitude() : io;           // returns current peak
+void audio_set_amplitude(amp)@io;   // clamps to 0..32767
+audio_get_amplitude()@io;           // returns current peak
 ```
 
 `amp` is a **signed-16 peak value**: 0 is silent, 32767 is the s16 maximum
@@ -2937,8 +2968,8 @@ audio_set_amplitude(99999);   // clamped to 32767
 ### §29.2 — `audio_set_volume` / `audio_get_volume`
 
 ```c
-void audio_set_volume(pct) : io;   // 0..100, clamped
-audio_get_volume() : io;           // returns 0..100
+void audio_set_volume(pct)@io;   // 0..100, clamped
+audio_get_volume()@io;           // returns 0..100
 ```
 
 Linear percent-of-peak knob. 100 maps to amplitude 32700 (deliberately
@@ -2964,8 +2995,8 @@ without good reason.
 ### §29.3 — `audio_set_volume_db` / `audio_get_volume_db` (plugin-oriented)
 
 ```c
-void audio_set_volume_db(db) : io;   // typical range 0..-60
-audio_get_volume_db() : io;          // returns 0..-96
+void audio_set_volume_db(db)@io;   // typical range 0..-60
+audio_get_volume_db()@io;          // returns 0..-96
 ```
 
 Decibels map logarithmically to amplitude: each -6 dB halves the
@@ -3011,9 +3042,9 @@ to direct math without changing the API.
 ### §29.4 — Mute (`audio_mute` / `audio_unmute` / `audio_is_muted`)
 
 ```c
-void audio_mute() : io;
-void audio_unmute() : io;
-audio_is_muted() : io;           // 0 or 1
+void audio_mute()@io;
+void audio_unmute()@io;
+audio_is_muted()@io;           // 0 or 1
 ```
 
 Mute remembers the previous amplitude and restores it on unmute. Safe to
@@ -3439,9 +3470,9 @@ extending stbsound, keeping each decoder focused.
 ### §31.2 — Load a WAV
 
 ```c
-sound_load_wav(path) : io;   // returns 0 on success, -1 on failure
-sound_buf() : base;          // pointer to the loaded sample buffer
-sound_frames() : base;       // number of stereo frames in the buffer
+sound_load_wav(path)@io;   // returns 0 on success, -1 on failure
+sound_buf()@base;          // pointer to the loaded sample buffer
+sound_frames()@base;       // number of stereo frames in the buffer
 ```
 
 The load pattern is stateful — there's one "last loaded" slot shared
@@ -3480,7 +3511,7 @@ long as the sample is on an active voice, the buffer must stay alive.
 ### §31.3 — Save a WAV
 
 ```c
-sound_save_wav(path, buf, n_frames) : io;   // returns 0 on success
+sound_save_wav(path, buf, n_frames)@io;   // returns 0 on success
 ```
 
 Stateless — takes the buffer + frame count explicitly, writes the
@@ -3500,7 +3531,7 @@ free(buf);
 ```
 
 The write path uses `bpp_io.bsm`'s file API (`fopen` / `fwrite` /
-`fclose` via the `: io` effect annotation). Partial writes return
+`fclose` via the `@io` effect annotation). Partial writes return
 -1 — filesystem full, permission denied, invalid path. The
 incomplete file is left on disk; callers that want atomic writes
 should save to a temp path and rename.
@@ -3604,8 +3635,8 @@ use the enum name.
 ### §32.3 — Keyboard state
 
 ```c
-key_down(k) : base;       // 1 if currently held, 0 if not
-key_pressed(k) : base;    // 1 if just pressed this frame, 0 otherwise
+key_down(k)@base;       // 1 if currently held, 0 if not
+key_pressed(k)@base;    // 1 if just pressed this frame, 0 otherwise
 ```
 
 `key_pressed` is `(current && !prev)` — fires exactly once per
@@ -3786,9 +3817,9 @@ Callers that need cross-platform pickers should branch on `return
 ### §33.2 — File dialogs
 
 ```c
-window_save_dialog(title, default_name) : io;    // → path or 0
-window_open_dialog(title) : io;                  // → path or 0
-window_open_folder_dialog(title) : io;           // → path or 0
+window_save_dialog(title, default_name)@io;    // → path or 0
+window_open_dialog(title)@io;                  // → path or 0
+window_open_folder_dialog(title)@io;           // → path or 0
 ```
 
 All three return a **malloc'd null-terminated C-string** on success,
@@ -3811,9 +3842,9 @@ audio demo and can't tolerate the pause, don't open a dialog there.
 ### §33.3 — Alerts
 
 ```c
-void window_alert(title, message) : io;           // info + OK
-window_confirm(title, message) : io;              // OK/Cancel → 1 or 0
-void window_error(title, message) : io;           // red icon + OK
+void window_alert(title, message)@io;           // info + OK
+window_confirm(title, message)@io;              // OK/Cancel → 1 or 0
+void window_error(title, message)@io;           // red icon + OK
 ```
 
 Info and error alerts are blocking acknowledgements — the user has
@@ -3841,8 +3872,8 @@ For apps that want to react to user-driven window resizes (IDEs,
 level editors, laid-out tools):
 
 ```c
-window_width() : base;       // current content width in px
-window_height() : base;      // current content height in px
+window_width()@base;       // current content width in px
+window_height()@base;      // current content height in px
 window_resized();            // edge-triggered: 1 if changed since last call
 void window_fb_resize();     // reallocate _stb_fb to match window
 ```
@@ -4352,7 +4383,7 @@ Other formats (JPG, BMP, TGA) would land as sibling modules
 ### §37.1 — Public API
 
 ```c
-img_load(path) : io;   // returns pixel buffer or 0
+img_load(path)@io;   // returns pixel buffer or 0
 img_w();               // width of last loaded image
 img_h();               // height of last loaded image
 void img_free(pixels); // release a buffer from img_load
@@ -4514,8 +4545,8 @@ transitions (level changes, time of day).
 ### §38.6 — Save / load
 
 ```c
-palette_save(pal, path, name) : io;   // JSON format, human-editable
-palette_load(path) : io;              // → Palette pointer or 0
+palette_save(pal, path, name)@io;   // JSON format, human-editable
+palette_load(path)@io;              // → Palette pointer or 0
 ```
 
 The JSON format stores each entry as a hex string (`"#FF2020"`). Uses
@@ -4562,7 +4593,7 @@ tile_new(w, h, tw, th);             // empty map, all cells = 0
 void tile_free(tm);
 void tile_set(tm, x, y, idx);       // write a cell
 tile_get(tm, x, y);                 // read a cell (0 OOB)
-void tile_load_tileset(tm, path) : io;   // load PNG + auto-slice
+void tile_load_tileset(tm, path)@io;   // load PNG + auto-slice
 void tile_set_solid(tm, idx, is_solid);
 tile_is_solid(tm, idx);
 ```
@@ -4597,8 +4628,8 @@ tileset art can be recycled with different collision semantics.
 ### §39.5 — Save / load
 
 ```c
-void tile_save(tm, path) : io;       // JSON
-tile_load(path) : io;                 // → Tilemap
+void tile_save(tm, path)@io;       // JSON
+tile_load(path)@io;                 // → Tilemap
 ```
 
 JSON format stores dimensions, tile size, and the raw byte grid
@@ -5022,10 +5053,10 @@ ASSET_FONT = 4;           // font atlas + metrics
 
 ```c
 void init_asset();                           // called by game_init
-asset_load_sprite(path) : io;                // → handle or 0
-asset_load_sound(path) : io;                 // → handle
-asset_load_music(path) : io;                 // → handle
-asset_load_font(path, size) : io;            // → handle
+asset_load_sprite(path)@io;                // → handle or 0
+asset_load_sound(path)@io;                 // → handle
+asset_load_music(path)@io;                 // → handle
+asset_load_font(path, size)@io;            // → handle
 void asset_release(handle);                  // explicit cleanup
 
 asset_sprite(handle);                        // → GPU texture
@@ -5117,8 +5148,8 @@ character_animation_at(cp, idx);
 ### §46.3 — Save / load (JSON)
 
 ```c
-character_save(cp, path) : io;     // → 0 on success, -1 on fail
-character_load(path) : io;         // → Character or 0
+character_save(cp, path)@io;     // → 0 on success, -1 on fail
+character_load(path)@io;         // → Character or 0
 ```
 
 JSON format via `bpp_json` writer (Phase D — no hand-rolled

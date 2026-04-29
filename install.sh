@@ -125,6 +125,7 @@ sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 sudo cp src/bpp_arena.bsm "$LIB_DIR/"
 sudo cp src/bpp_path.bsm "$LIB_DIR/"
 sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
+sudo cp src/bug_reader.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"

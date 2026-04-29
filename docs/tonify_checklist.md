@@ -79,53 +79,65 @@ Bare `return;` (no expression) is supported in B++ and produces an implicit
 `return 0`. Use it in `void` functions for early-exit guards instead of
 the misleading `return 0;`.
 
-## Rule 4: Phase annotations (`: base` / `: solo` / `: realtime` / `: io` / `: gpu`)
+## Rule 4: Phase annotations (`@base` / `@solo` / `@time` / `@io` / `@gpu`)
 
 For functions where the intent is clear:
 
 | Pattern | Action |
 |---------|--------|
-| Pure function: reads args, computes, returns value. No global writes. | Add `: base` |
-| Side-effect function: writes globals, calls impure functions | Add `: solo` (optional — compiler infers) |
-| Audio callback / realtime path: no malloc, no IO, bounded time | Add `: realtime` |
-| Touches files / network / stdout / syscalls | Add `: io` |
-| Touches GPU resources (calls `_stb_gpu_*`) | Add `: gpu` |
+| Pure function: reads args, computes, returns value. No global writes. | Add `@base` |
+| Side-effect function: writes globals, calls impure functions | Add `@solo` (optional — compiler infers) |
+| Audio callback / time-bounded path: no malloc, no IO, bounded time | Add `@time` |
+| Touches files / network / stdout / syscalls | Add `@io` |
+| Touches GPU resources (calls `_stb_gpu_*`) | Add `@gpu` |
 | Unclear / mixed | Leave unannotated (compiler auto-classifies) |
+
+The annotation is an `@` sigil glued to the phase word, with no space, placed
+between the parameter list and the function body:
+
+```bpp
+static _dist(ax, ay, bx, by)@base {
+    return sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+}
+
+void mixer_callback(buf, n)@time {
+    // no malloc, no io, no gpu
+}
+```
 
 **Only annotate when the intent is OBVIOUS.** Don't guess. The compiler classifies automatically for unannotated functions.
 
-**WARNING: do NOT mark `: base` on functions that call builtins** (malloc, free, putchar, str_peek, envp_get, sys_*, etc.). The classifier treats ALL builtins as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len, etc.). W013 will catch mistakes — trust it.
+**WARNING: do NOT mark `@base` on functions that call builtins** (malloc, free, putchar, str_peek, envp_get, sys_*, etc.). The classifier treats ALL builtins as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len, etc.). W013 will catch mistakes — trust it.
 
 **Effect annotations form a strict-to-loose ladder:**
 
 ```
-realtime  (most strict — can only call base or other realtime)
+@time     (most strict — can only call base or other time)
    ↓
-io / gpu  (sibling categories — can call base or own kind)
+@io / @gpu  (sibling categories — can call base or own kind)
    ↓
-base      (pure, callable by everyone)
+@base     (pure, callable by everyone)
    ↓
-solo      (catch-all — most permissive, can call anything)
+@solo     (catch-all — most permissive, can call anything)
 ```
 
-The killer use case: an audio callback annotated `: realtime` is verified
-by the compiler to never call `malloc`, `putchar`, or anything `: io` /
-`: gpu` — eliminating an entire class of audible glitches by proof
+The killer use case: an audio callback annotated `@time` is verified
+by the compiler to never call `malloc`, `putchar`, or anything `@io` /
+`@gpu` — eliminating an entire class of audible glitches by proof
 rather than testing.
 
-**Status (2026-04-16):** parser accepts all five (Level 4 sub-step A
-landed). Propagation + enforcement (sub-steps B + C) shipping next —
-until then `: realtime` / `: io` / `: gpu` are inert documentation.
-Apply them now anyway: they document intent that won't drift, and the
-sweep that lands them survives sub-step C without source churn.
+**Status (2026-04-28):** the `@phase` sigil syntax is the canonical
+form across all 55+ stb/games/tools/bang9 files. The old `: phase`
+colon form was retired in the 2026-04-28 migration. `realtime` was
+renamed to `time` in the same sweep.
 
 | Module category | Suggested effect annotation |
 |---|---|
-| `_stb_gpu_*` primitives, `render_*`, `sprite_*`, `tile_draw` | `: gpu` |
-| `*_load`, `audio_*`, `_stb_audio_tone_*`, `_stb_init_window` | `: io` |
-| Audio callbacks (e.g. `_aud_square_cb`) | `: realtime` |
-| Pure helpers (math, string, array, hash) | `: base` |
-| Game `init` / `update` / orchestrator `main` | leave unannotated (`: solo` inferred) |
+| `_stb_gpu_*` primitives, `render_*`, `sprite_*`, `tile_draw` | `@gpu` |
+| `*_load`, `audio_*`, `_stb_audio_tone_*`, `_stb_init_window` | `@io` |
+| Audio callbacks (e.g. `_aud_square_cb`) | `@time` |
+| Pure helpers (math, string, array, hash) | `@base` |
+| Game `init` / `update` / orchestrator `main` | leave unannotated (`@solo` inferred) |
 
 ## Rule 5: Control flow (`continue` + `for` + `switch`)
 
@@ -542,11 +554,11 @@ fallback.
 | `arr_push(arr, val)` | `→ arr` | Append val; returns same arr (may realloc) |
 | `arr_pop(arr)` | `→ val` | Remove and return last element |
 | `arr_get(arr, i)` | `→ val` | Get element at index i — **unchecked, fast** |
-| `arr_at(arr, i)` | `→ val` `: io` | Bounds-checked get — logs OOB to stderr, returns 0 |
+| `arr_at(arr, i)` | `→ val` `@io` | Bounds-checked get — logs OOB to stderr, returns 0 |
 | `arr_set(arr, i, val)` | `void` | Set element at index i |
-| `arr_len(arr)` | `→ int` `: base` | Current element count |
-| `arr_cap(arr)` | `→ int` `: base` | Current allocated capacity |
-| `arr_last(arr)` | `→ val` `: base` | Peek last element without removing |
+| `arr_len(arr)` | `→ int` `@base` | Current element count |
+| `arr_cap(arr)` | `→ int` `@base` | Current allocated capacity |
+| `arr_last(arr)` | `→ val` `@base` | Peek last element without removing |
 | `arr_truncate(arr, n)` | `void` | Set length to n (no deallocation) |
 | `arr_clear(arr)` | `void` | Reset length to 0 |
 | `arr_free(arr)` | `void` | Free the array and its header |
@@ -563,7 +575,7 @@ Subscript syntax `arr[i]` desugars to `arr_get(arr, i)` for reads and
 | Code you control, inside a safe range | `arr_get` / `arr[i]` | Trust internal code |
 
 **Common anti-pattern**: using `arr_at` everywhere "for safety". `arr_at`
-tags the function `: io` (it writes to stderr), which contaminates the
+tags the function `@io` (it writes to stderr), which contaminates the
 call graph. Use it only at the actual trust boundary.
 
 ### Gotcha: `arr_push` may invalidate pointers
@@ -609,7 +621,7 @@ Use `strbuf` to build strings incrementally without manual length tracking.
 | `strbuf_cat(sb, src)` | `→ sb` | Append null-terminated string |
 | `strbuf_ch(sb, c)` | `→ sb` | Append single char |
 | `strbuf_num(sb, val)` | `→ sb` | Append decimal integer |
-| `strbuf_len(sb)` | `→ int` `: base` | Current content length (not capacity) |
+| `strbuf_len(sb)` | `→ int` `@base` | Current content length (not capacity) |
 | `strbuf_clear(sb)` | `void` | Reset length to 0 (retains allocation) |
 | `strbuf_free(sb)` | `void` | Free |
 

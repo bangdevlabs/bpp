@@ -20,12 +20,12 @@
 // it'll override this via explicit entry/output fields.
 //
 // Public API:
-//   runner_build(proj_root) : io  — returns exit code (0 = success)
-//   runner_run(proj_root)   : io  — returns child pid, or 0 on fail
-//   runner_log()            : base — returns log buffer ptr (0-terminated)
-//   runner_log_len()        : base
-//   runner_last_status()    : base — 0 = never built, >0 = exit code
-//   runner_clear_log()             — releases + zeroes log state
+//   runner_build(proj_root)@io   — returns exit code (0 = success)
+//   runner_run(proj_root)@io     — returns child pid, or 0 on fail
+//   runner_log()@base            — returns log buffer ptr (0-terminated)
+//   runner_log_len()@base
+//   runner_last_status()@base    — 0 = never built, >0 = exit code
+//   runner_clear_log()           — releases + zeroes log state
 
 // Path to the tempfile used for stdout/stderr capture. Same for
 // build and run logs for simplicity — run output overwrites build
@@ -51,11 +51,15 @@ static extrn _runner_last_status;
 // IDE happens to inherit.
 static extrn _BPP_EXE;
 
+// Owned by panels.bsm. Set to 1 after a successful build so the
+// Debug panel hot-reloads the new .bug file on its next frame.
+extrn _debug_needs_reload;
+
 // Probe a candidate path to see if it's a readable file. Returns 1
 // if file_read_all can open it (even an empty file counts), 0 else.
 // We use file_read_all + free instead of a dedicated stat call
 // because B++ doesn't yet expose sys_access.
-static _path_exists(path) : io {
+static _path_exists(path)@io {
     auto sz, buf;
     sz = malloc(8);
     *(sz) = 0;
@@ -88,42 +92,28 @@ void runner_init() {
 // Derive the entry .bpp file for a project root. Convention:
 // last path segment + ".bpp" → "games/pathfind" → "pathfind.bpp",
 // joined as "games/pathfind/pathfind.bpp".
-//
-// Note: B++ doesn't support `for (auto j = 0; ...)` with the
-// declaration inline — we declare j at function scope and reuse
-// it across every for loop. Inlining the decl silently produces
-// broken codegen (we learned the hard way: commands built with
-// truncated arguments).
-static _runner_entry_path(proj_root, out_cap) {
-    auto out, plen, i, j, last_slash, base, blen;
+static _runner_entry_path(proj_root) {
+    auto plen, i, last_slash, base, blen, sb, result;
     plen = str_len(proj_root);
-    // Find last '/' so we know the basename.
     last_slash = -1;
     for (i = 0; i < plen; i++) {
         if (peek(proj_root + i) == 47) { last_slash = i; }
     }
     base = proj_root + last_slash + 1;
     blen = plen - last_slash - 1;
-
-    out = malloc(out_cap);
-    i = 0;
-    while (i < plen) { poke(out + i, peek(proj_root + i)); i++; }
-    poke(out + i, 47); i++;                          // '/'
-    for (j = 0; j < blen; j++) {
-        poke(out + i, peek(base + j)); i++;
-    }
-    // ".bpp"
-    poke(out + i, 46);     i++;  // '.'
-    poke(out + i, 98);     i++;  // 'b'
-    poke(out + i, 112);    i++;  // 'p'
-    poke(out + i, 112);    i++;  // 'p'
-    poke(out + i, 0);
-    return out;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, proj_root);
+    sb = strbuf_ch(sb, '/');
+    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    sb = strbuf_cat(sb, ".bpp");
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
 }
 
 // Derive the output binary path: "<proj_root>/build/<basename>".
-static _runner_output_path(proj_root, out_cap) {
-    auto out, plen, i, j, last_slash, base, blen;
+static _runner_output_path(proj_root) {
+    auto plen, i, last_slash, base, blen, sb, result;
     plen = str_len(proj_root);
     last_slash = -1;
     for (i = 0; i < plen; i++) {
@@ -131,27 +121,18 @@ static _runner_output_path(proj_root, out_cap) {
     }
     base = proj_root + last_slash + 1;
     blen = plen - last_slash - 1;
-
-    out = malloc(out_cap);
-    i = 0;
-    while (i < plen) { poke(out + i, peek(proj_root + i)); i++; }
-    poke(out + i, 47);     i++;  // '/'
-    poke(out + i, 98);     i++;  // 'b'
-    poke(out + i, 117);    i++;  // 'u'
-    poke(out + i, 105);    i++;  // 'i'
-    poke(out + i, 108);    i++;  // 'l'
-    poke(out + i, 100);    i++;  // 'd'
-    poke(out + i, 47);     i++;  // '/'
-    for (j = 0; j < blen; j++) {
-        poke(out + i, peek(base + j)); i++;
-    }
-    poke(out + i, 0);
-    return out;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, proj_root);
+    sb = strbuf_cat(sb, "/build/");
+    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
 }
 
 // Load the log tempfile into _runner_log_buf. Called after every
 // build so the Run panel sees the latest output.
-static void _runner_reload_log() : io {
+static void _runner_reload_log()@io {
     auto buf, size_box;
     if (_runner_log_buf != 0) {
         free(_runner_log_buf);
@@ -178,88 +159,32 @@ static void _runner_reload_log() : io {
 // also writes a struct/enum metadata sidecar next to the binary.
 // Consumed by Bang 9's future inspector panel (D2.3). Runtime of
 // the game is unaffected.
+//
+// sys_waitpid returns the child PID, not the exit code. The
+// "; echo $? > _RUNNER_RC" suffix captures bpp's real exit code
+// in a tempfile so _runner_read_rc() can retrieve it.
 static _runner_build_cmd(entry, output, log) {
-    auto buf, cap, i, j;
-    auto elen, olen, llen, bpplen;
-    auto meta_suffix, meta_suffix_len;
-    elen = str_len(entry);
-    olen = str_len(output);
-    llen = str_len(log);
-    bpplen = str_len(_BPP_EXE);
-    meta_suffix = ".meta.json";
-    meta_suffix_len = 10;
-
-    // Extra capacity for " --emit-meta <output>.meta.json".
-    cap = bpplen + elen + olen + llen + olen + meta_suffix_len + 80;
-    buf = malloc(cap);
-    i = 0;
-    // bpp executable path (resolved once at init)
-    for (j = 0; j < bpplen; j++) {
-        poke(buf + i, peek(_BPP_EXE + j)); i++;
-    }
-    poke(buf + i, 32);  i++;  // ' '
-    // entry
-    for (j = 0; j < elen; j++) {
-        poke(buf + i, peek(entry + j)); i++;
-    }
-    // " -o "
-    poke(buf + i, 32);  i++;
-    poke(buf + i, 45);  i++;  // '-'
-    poke(buf + i, 111); i++;  // 'o'
-    poke(buf + i, 32);  i++;
-    // output
-    for (j = 0; j < olen; j++) {
-        poke(buf + i, peek(output + j)); i++;
-    }
-    // " --emit-meta <output>.meta.json"
-    poke(buf + i, 32);  i++;  // ' '
-    poke(buf + i, 45);  i++;  // '-'
-    poke(buf + i, 45);  i++;  // '-'
-    poke(buf + i, 101); i++;  // 'e'
-    poke(buf + i, 109); i++;  // 'm'
-    poke(buf + i, 105); i++;  // 'i'
-    poke(buf + i, 116); i++;  // 't'
-    poke(buf + i, 45);  i++;  // '-'
-    poke(buf + i, 109); i++;  // 'm'
-    poke(buf + i, 101); i++;  // 'e'
-    poke(buf + i, 116); i++;  // 't'
-    poke(buf + i, 97);  i++;  // 'a'
-    poke(buf + i, 32);  i++;
-    for (j = 0; j < olen; j++) {
-        poke(buf + i, peek(output + j)); i++;
-    }
-    for (j = 0; j < meta_suffix_len; j++) {
-        poke(buf + i, peek(meta_suffix + j)); i++;
-    }
-    // " > "
-    poke(buf + i, 32);  i++;
-    poke(buf + i, 62);  i++;  // '>'
-    poke(buf + i, 32);  i++;
-    // log
-    for (j = 0; j < llen; j++) {
-        poke(buf + i, peek(log + j)); i++;
-    }
-    // " 2>&1"
-    poke(buf + i, 32);  i++;
-    poke(buf + i, 50);  i++;  // '2'
-    poke(buf + i, 62);  i++;  // '>'
-    poke(buf + i, 38);  i++;  // '&'
-    poke(buf + i, 49);  i++;  // '1'
-    // "; echo $? > /tmp/bang9_rc" — captures bpp's real exit code.
-    // sys_waitpid returns the child PID (not exit code) because wait4
-    // is called with status=NULL. Reading the exit code from a file is
-    // the workaround until sys_waitpid is extended to fill a status buf.
-    auto rc_suffix;
-    rc_suffix = "; echo $? > /tmp/bang9_rc";
-    buf_copy(buf + i, rc_suffix, str_len(rc_suffix));
-    i += str_len(rc_suffix);
-    poke(buf + i, 0);
-    return buf;
+    auto sb, result;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, _BPP_EXE);
+    sb = strbuf_cat(sb, " ");
+    sb = strbuf_cat(sb, entry);
+    sb = strbuf_cat(sb, " --bug -o ");
+    sb = strbuf_cat(sb, output);
+    sb = strbuf_cat(sb, " --emit-meta ");
+    sb = strbuf_cat(sb, output);
+    sb = strbuf_cat(sb, ".meta.json > ");
+    sb = strbuf_cat(sb, log);
+    sb = strbuf_cat(sb, " 2>&1; echo $? > ");
+    sb = strbuf_cat(sb, _RUNNER_RC);
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
 }
 
 // Read the exit code written by the shell's "echo $?" into _RUNNER_RC.
 // Returns 0 on success, 1 on any error (missing file, parse fail).
-static _runner_read_rc() : io {
+static _runner_read_rc()@io {
     auto buf, sz, val, i, c;
     sz = malloc(8);
     *(sz) = 0;
@@ -280,8 +205,8 @@ static _runner_read_rc() : io {
 runner_build(proj_root) {
     auto entry, output, cmd, pid, argv, status;
 
-    entry = _runner_entry_path(proj_root, 512);
-    output = _runner_output_path(proj_root, 512);
+    entry = _runner_entry_path(proj_root);
+    output = _runner_output_path(proj_root);
     cmd = _runner_build_cmd(entry, output, _RUNNER_LOG);
 
     // argv for /bin/sh -c "<cmd>": 4 entries (/bin/sh, -c, cmd, 0).
@@ -309,6 +234,7 @@ runner_build(proj_root) {
 
     _runner_reload_log();
     _runner_last_status = status;
+    if (status == 0) { _debug_needs_reload = 1; }
     return status;
 }
 
@@ -323,31 +249,15 @@ runner_build(proj_root) {
 // cwd is the project root fixes this without needing a sys_chdir
 // syscall in B++.
 static _runner_run_cmd(proj_root, output) {
-    auto buf, cap, i, j, plen, olen;
-    plen = str_len(proj_root);
-    olen = str_len(output);
-    cap = plen + olen + 32;
-    buf = malloc(cap);
-    i = 0;
-    // "cd " prefix
-    poke(buf + i, 99);  i++;  // 'c'
-    poke(buf + i, 100); i++;  // 'd'
-    poke(buf + i, 32);  i++;  // ' '
-    // proj_root
-    for (j = 0; j < plen; j++) {
-        poke(buf + i, peek(proj_root + j)); i++;
-    }
-    // " && "
-    poke(buf + i, 32);  i++;
-    poke(buf + i, 38);  i++;  // '&'
-    poke(buf + i, 38);  i++;  // '&'
-    poke(buf + i, 32);  i++;
-    // output (absolute path, so it runs regardless of cwd resolution)
-    for (j = 0; j < olen; j++) {
-        poke(buf + i, peek(output + j)); i++;
-    }
-    poke(buf + i, 0);
-    return buf;
+    auto sb, result;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "cd ");
+    sb = strbuf_cat(sb, proj_root);
+    sb = strbuf_cat(sb, " && ");
+    sb = strbuf_cat(sb, output);
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
 }
 
 // Run the already-built binary. Does NOT wait — game runs in
@@ -359,7 +269,7 @@ static _runner_run_cmd(proj_root, output) {
 runner_run(proj_root) {
     auto output, cmd, pid, argv;
 
-    output = _runner_output_path(proj_root, 512);
+    output = _runner_output_path(proj_root);
     cmd    = _runner_run_cmd(proj_root, output);
 
     argv = buf_word(4);
@@ -380,15 +290,15 @@ runner_run(proj_root) {
     return pid;
 }
 
-runner_log() : base {
+runner_log()@base {
     return _runner_log_buf;
 }
 
-runner_log_len() : base {
+runner_log_len()@base {
     return _runner_log_len;
 }
 
-runner_last_status() : base {
+runner_last_status()@base {
     return _runner_last_status;
 }
 

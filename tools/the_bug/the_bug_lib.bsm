@@ -1,0 +1,597 @@
+// the_bug_lib.bsm — embeddable .bug debug map viewer for Bang 9.
+//
+// Panel library following the same three-function embed contract as
+// modulab_lib and level_editor_lib:
+//
+//   the_bug_lib_init()
+//       Allocate reader state. Host must have called game_init().
+//
+//   the_bug_lib_frame(px, py, pw, ph)
+//       Draw + input for one frame inside (px, py, pw, ph).
+//       Returns 1 if ESC pressed, 0 otherwise.
+//
+//   the_bug_lib_shutdown()
+//       Free state. Idempotent.
+//
+//   the_bug_lib_try_load(path)
+//       Load a .bug file by path. Returns 1 on success, 0 on failure.
+//
+// The panel renders the parsed .bug debug map sections (functions,
+// structs, globals, externs, source map, address map, stack map)
+// directly into the host's framebuffer via draw_text. Scrollable
+// with mouse wheel and Page Up / Page Down.
+//
+// See docs/debug_with_bug.md for the debugger overview and
+// docs/bug_viz_plan.md for future phases (watch list, observe
+// mode, TUI, graphical visualizers).
+
+import "stbui.bsm";
+import "stbinput.bsm";
+
+// The reader lives in src/ — shared with the standalone bug binary.
+// It is auto-injected by bpp_import.bsm so all bug_* globals are available.
+
+// ── Module state ────────────────────────────────────────────
+
+// Panel rect captured at the top of every frame call.
+static global _tb_ox, _tb_oy, _tb_pw, _tb_ph;
+
+// Whether init has run.
+static auto _tb_initialized;
+
+// Whether a .bug file is currently loaded and parsed.
+static global _tb_loaded;
+
+// Reader's string buffer — declared extrn so _tb_unpack can
+// access it. The symbol is defined inside bug_reader.bsm.
+extrn _br_strbuf;
+
+// Vertical scroll offset (in pixels). Positive = scrolled down.
+static global _tb_scroll;
+
+// Line buffer for converting packed strings to null-terminated
+// C-strings for draw_text. Reused every frame — contents are
+// ephemeral.
+static extrn _tb_line_buf;
+
+// ── Packed string → C-string ────────────────────────────────
+//
+// bug_reader stores names as packed (offset, length) values in
+// a string buffer. draw_text needs null-terminated C-strings.
+// This helper unpacks into a shared scratch buffer.
+
+static _tb_unpack(packed) {
+    auto s, l, i;
+    s = packed % 0x100000000;
+    l = packed / 0x100000000;
+    if (l > 200) { l = 200; }
+    for (i = 0; i < l; i++) {
+        poke(_tb_line_buf + i, peek(_br_strbuf + s + i));
+    }
+    poke(_tb_line_buf + l, 0);
+    return _tb_line_buf;
+}
+
+// ── Type name formatting ────────────────────────────────────
+
+static _tb_type_name(ty)@base {
+    switch (ty) {
+        0x02 { return "word"; }
+        0x12 { return "half"; }
+        0x22 { return "quarter"; }
+        0x32 { return "byte"; }
+        0x03 { return "float"; }
+        0x13 { return "float_h"; }
+        0x23 { return "float_q"; }
+        0x33 { return "float_b"; }
+        0x04 { return "ptr"; }
+        0x08 { return "struct"; }
+        0x0C { return "unknown"; }
+        0    { return "void"; }
+        else { return "ty:?"; }
+    }
+}
+
+// ── Rendering helpers ───────────────────────────────────────
+
+// Draw a text line at the current y position if it's within the
+// visible panel area. Returns the next y position (always advances
+// by line height). Uses a shared line_y check so off-screen lines
+// are skipped cheaply.
+static _tb_draw_line(text, x, y, color) {
+    auto line_h;
+    line_h = UI_FONT_SZ + 3;
+    if (y >= _tb_oy && y + line_h <= _tb_oy + _tb_ph) {
+        draw_text(text, x, y, UI_FONT_SZ, color);
+    }
+    return y + line_h;
+}
+
+// Draw a section header with accent color and a separator line.
+static _tb_draw_section(title, x, y) {
+    auto line_h, ny;
+    line_h = UI_FONT_SZ + 3;
+    ny = y;
+    if (ny >= _tb_oy && ny + line_h <= _tb_oy + _tb_ph) {
+        draw_rect(x, ny + line_h - 1, _tb_pw - 48, 1, _theme.border);
+        draw_text(title, x, ny, UI_FONT_SZ, _theme.accent);
+    }
+    return ny + line_h + 4;
+}
+
+// Format "N items" into the line buffer and return it.
+static _tb_count_label(prefix, count, suffix) {
+    auto sb;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, prefix);
+    sb = strbuf_num(sb, count);
+    sb = strbuf_cat(sb, suffix);
+    // Copy strbuf content to our line buffer for safe return.
+    auto slen;
+    slen = strbuf_len(sb);
+    if (slen > 250) { slen = 250; }
+    buf_copy(_tb_line_buf, sb, slen);
+    poke(_tb_line_buf + slen, 0);
+    strbuf_free(sb);
+    return _tb_line_buf;
+}
+
+// ── Section renderers ───────────────────────────────────────
+//
+// Each _tb_render_* function takes the current y position,
+// renders its section, and returns the y position after the
+// last line. All coordinates are panel-relative, shifted by
+// the scroll offset.
+
+static _tb_render_header(x, y) {
+    auto ny, sb;
+    ny = y;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "version: ");
+    sb = strbuf_num(sb, bug_version);
+    sb = strbuf_cat(sb, "  target: ");
+    sb = strbuf_cat(sb, bug_target == 0 ? "ARM64" : "x86_64");
+    auto slen;
+    slen = strbuf_len(sb);
+    if (slen > 250) { slen = 250; }
+    buf_copy(_tb_line_buf, sb, slen);
+    poke(_tb_line_buf + slen, 0);
+    strbuf_free(sb);
+    ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text_muted);
+    return ny + 4;
+}
+
+static _tb_render_functions(x, y) {
+    auto ny, i, j, pcnt, lcnt, pnames, ptypes, lnames, ltypes;
+    auto sb, slen;
+    ny = _tb_draw_section(
+        _tb_count_label("Functions (", bug_fn_count, ")"), x, y);
+
+    for (i = 0; i < bug_fn_count; i++) {
+        // Function signature line: name(params) -> rtype
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_fn_name, i)));
+
+        sb = strbuf_cat(sb, "(");
+        pcnt = arr_get(bug_fn_pcnt, i);
+        pnames = arr_get(bug_fn_pnames, i);
+        ptypes = arr_get(bug_fn_ptypes, i);
+        for (j = 0; j < pcnt; j++) {
+            if (j > 0) { sb = strbuf_cat(sb, ", "); }
+            sb = strbuf_cat(sb, _tb_unpack(pnames[j]));
+            sb = strbuf_cat(sb, ": ");
+            sb = strbuf_cat(sb, _tb_type_name(ptypes[j]));
+        }
+        sb = strbuf_cat(sb, ") -> ");
+        sb = strbuf_cat(sb, _tb_type_name(arr_get(bug_fn_rtype, i)));
+
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+
+        // Locals sub-line if any.
+        lcnt = arr_get(bug_fn_lcnt, i);
+        if (lcnt > 0) {
+            lnames = arr_get(bug_fn_lnames, i);
+            ltypes = arr_get(bug_fn_ltypes, i);
+            sb = strbuf_new();
+            sb = strbuf_cat(sb, "      locals: ");
+            for (j = 0; j < lcnt; j++) {
+                if (j > 0) { sb = strbuf_cat(sb, ", "); }
+                sb = strbuf_cat(sb, _tb_unpack(lnames[j]));
+                sb = strbuf_cat(sb, ": ");
+                sb = strbuf_cat(sb, _tb_type_name(ltypes[j]));
+            }
+            slen = strbuf_len(sb);
+            if (slen > 250) { slen = 250; }
+            buf_copy(_tb_line_buf, sb, slen);
+            poke(_tb_line_buf + slen, 0);
+            strbuf_free(sb);
+            ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text_muted);
+        }
+    }
+    return ny + 4;
+}
+
+static _tb_render_structs(x, y) {
+    auto ny, i, j, fc, sb, slen;
+    if (bug_st_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Structs (", bug_st_count, ")"), x, y);
+
+    for (i = 0; i < bug_st_count; i++) {
+        // Struct header: "struct Name (N bytes)"
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  struct ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_st_name, i)));
+        sb = strbuf_cat(sb, " (");
+        sb = strbuf_num(sb, arr_get(bug_st_size, i));
+        sb = strbuf_cat(sb, " bytes)");
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+
+        // Fields.
+        fc = arr_get(bug_st_fcnt, i);
+        auto fnames, foffs, fsizes, ftypes;
+        fnames = arr_get(bug_st_fnames, i);
+        foffs  = arr_get(bug_st_foffs, i);
+        fsizes = arr_get(bug_st_fsizes, i);
+        ftypes = arr_get(bug_st_ftypes, i);
+        for (j = 0; j < fc; j++) {
+            sb = strbuf_new();
+            sb = strbuf_cat(sb, "      +");
+            sb = strbuf_num(sb, foffs[j]);
+            sb = strbuf_cat(sb, "  ");
+            sb = strbuf_cat(sb, _tb_unpack(fnames[j]));
+            sb = strbuf_cat(sb, " (");
+            sb = strbuf_num(sb, fsizes[j]);
+            sb = strbuf_cat(sb, "b ");
+            sb = strbuf_cat(sb, _tb_type_name(ftypes[j]));
+            sb = strbuf_cat(sb, ")");
+            slen = strbuf_len(sb);
+            if (slen > 250) { slen = 250; }
+            buf_copy(_tb_line_buf, sb, slen);
+            poke(_tb_line_buf + slen, 0);
+            strbuf_free(sb);
+            ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text_muted);
+        }
+    }
+    return ny + 4;
+}
+
+static _tb_render_globals(x, y) {
+    auto ny, i, sb, slen, gc;
+    if (bug_gl_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Globals (", bug_gl_count, ")"), x, y);
+
+    for (i = 0; i < bug_gl_count; i++) {
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_gl_name, i)));
+        sb = strbuf_cat(sb, ": ");
+        sb = strbuf_cat(sb, _tb_type_name(arr_get(bug_gl_type, i)));
+        gc = arr_get(bug_gl_class, i);
+        switch (gc) {
+            0 { sb = strbuf_cat(sb, " [auto]"); }
+            1 { sb = strbuf_cat(sb, " [global]"); }
+            2 { sb = strbuf_cat(sb, " [extrn]"); }
+            else { }
+        }
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+    }
+    return ny + 4;
+}
+
+static _tb_render_externs(x, y) {
+    auto ny, i, j, acnt, args, sb, slen;
+    if (bug_ex_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Externs (", bug_ex_count, ")"), x, y);
+
+    for (i = 0; i < bug_ex_count; i++) {
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_ex_name, i)));
+        sb = strbuf_cat(sb, " [");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_ex_lib, i)));
+        sb = strbuf_cat(sb, "] -> ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_ex_ret, i)));
+        sb = strbuf_cat(sb, "(");
+        acnt = arr_get(bug_ex_acnt, i);
+        args = arr_get(bug_ex_args, i);
+        for (j = 0; j < acnt; j++) {
+            if (j > 0) { sb = strbuf_cat(sb, ", "); }
+            sb = strbuf_cat(sb, _tb_unpack(args[j]));
+        }
+        sb = strbuf_cat(sb, ")");
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+    }
+    return ny + 4;
+}
+
+static _tb_render_srcmap(x, y) {
+    auto ny, i, fi, mi, pos, sb, slen;
+    if (bug_sm_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Source Map (", bug_sm_count, ")"), x, y);
+
+    for (i = 0; i < bug_sm_count; i++) {
+        fi  = arr_get(bug_sm_fidx, i);
+        mi  = arr_get(bug_sm_midx, i);
+        pos = arr_get(bug_sm_pos, i);
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  fn=");
+        sb = strbuf_num(sb, fi);
+        sb = strbuf_cat(sb, "  mod=");
+        sb = strbuf_num(sb, mi);
+        sb = strbuf_cat(sb, "  line=");
+        sb = strbuf_num(sb, pos);
+        if (fi < bug_fn_count) {
+            sb = strbuf_cat(sb, "  ");
+            sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_fn_name, fi)));
+        }
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text_muted);
+    }
+    return ny + 4;
+}
+
+static _tb_render_addrmap(x, y) {
+    auto ny, i, sb, slen, off;
+    if (bug_am_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Address Map (", bug_am_count, ")"), x, y);
+
+    for (i = 0; i < bug_am_count; i++) {
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  0x");
+        // Simple hex format for the offset.
+        off = arr_get(bug_am_off, i);
+        auto hex_buf, h, d;
+        hex_buf = malloc(20);
+        h = 0;
+        if (off == 0) {
+            poke(hex_buf, 48); // '0'
+            h = 1;
+        } else {
+            // Build hex digits in reverse.
+            auto tmp;
+            tmp = off;
+            while (tmp > 0) {
+                d = tmp & 0xF;
+                poke(hex_buf + h, d < 10 ? 48 + d : 97 + d - 10);
+                h++;
+                tmp = tmp >> 4;
+            }
+            // Reverse.
+            auto lo, hi, swap;
+            lo = 0;
+            hi = h - 1;
+            while (lo < hi) {
+                swap = peek(hex_buf + lo);
+                poke(hex_buf + lo, peek(hex_buf + hi));
+                poke(hex_buf + hi, swap);
+                lo++;
+                hi--;
+            }
+        }
+        poke(hex_buf + h, 0);
+        sb = strbuf_cat(sb, hex_buf);
+        free(hex_buf);
+        sb = strbuf_cat(sb, "  ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_am_name, i)));
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+    }
+    return ny + 4;
+}
+
+static _tb_render_stackmap(x, y) {
+    auto ny, i, j, vcnt, voffs, sb, slen;
+    if (bug_sk_count == 0) { return y; }
+    ny = _tb_draw_section(
+        _tb_count_label("Stack Map (", bug_sk_count, ")"), x, y);
+
+    for (i = 0; i < bug_sk_count; i++) {
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, "  ");
+        sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_sk_name, i)));
+        sb = strbuf_cat(sb, "  frame=");
+        sb = strbuf_num(sb, arr_get(bug_sk_frame, i));
+        vcnt = arr_get(bug_sk_vcnt, i);
+        if (vcnt > 0) {
+            sb = strbuf_cat(sb, "  vars=[");
+            voffs = arr_get(bug_sk_voffs, i);
+            for (j = 0; j < vcnt; j++) {
+                if (j > 0) { sb = strbuf_cat(sb, ","); }
+                sb = strbuf_num(sb, voffs[j]);
+            }
+            sb = strbuf_cat(sb, "]");
+        }
+        slen = strbuf_len(sb);
+        if (slen > 250) { slen = 250; }
+        buf_copy(_tb_line_buf, sb, slen);
+        poke(_tb_line_buf + slen, 0);
+        strbuf_free(sb);
+        ny = _tb_draw_line(_tb_line_buf, x, ny, _theme.text);
+    }
+    return ny + 4;
+}
+
+// ── Public embed API ────────────────────────────────────────
+
+void the_bug_lib_init() {
+    if (_tb_initialized != 0) { return; }
+
+    _tb_line_buf = malloc(256);
+    _tb_loaded   = 0;
+    _tb_scroll   = 0;
+
+    _tb_initialized = 1;
+}
+
+// Try to load a .bug file by path. Returns 1 on success, 0 on failure.
+the_bug_lib_try_load(path)@io {
+    auto loaded;
+    if (path == 0) { return 0; }
+
+    // Re-init the reader arrays for a fresh parse.
+    init_reader();
+
+    loaded = bug_load(path);
+    if (loaded < 0) { return 0; }
+    if (bug_parse() < 0) { return 0; }
+
+    _tb_loaded = 1;
+    _tb_scroll = 0;
+    return 1;
+}
+
+// Render one frame of the debug map viewer. Returns 1 if ESC pressed.
+the_bug_lib_frame(px, py, pw, ph) {
+    auto quit, margin, hy, content_y, content_h;
+
+    _tb_ox = px; _tb_oy = py; _tb_pw = pw; _tb_ph = ph;
+
+    if (_tb_initialized == 0) {
+        the_bug_lib_init();
+    }
+
+    quit = 0;
+    if (key_pressed(KEY_ESC)) { quit = 1; }
+
+    margin = 16;
+
+    // ── Top bar ──
+    auto bar_y;
+    bar_y = py + 8;
+    draw_text("The Bug — Debug Map Viewer", px + margin, bar_y,
+              UI_FONT_SZ, _theme.accent);
+
+    // Load button.
+    if (gui_button(px + pw - margin - 120, bar_y - 2, 112, 22, "Load .bug")) {
+        auto picked;
+        picked = window_open_dialog("Open .bug file");
+        if (picked != 0) {
+            the_bug_lib_try_load(picked);
+            free(picked);
+        }
+    }
+
+    bar_y += UI_FONT_SZ + 8;
+    draw_rect(px + margin, bar_y, pw - margin * 2, 1, _theme.border);
+    bar_y += 6;
+
+    // ── Content area ──
+    content_y = bar_y;
+    content_h = ph - (content_y - py) - 24;
+
+    if (_tb_loaded == 0) {
+        // Placeholder when no .bug is loaded.
+        auto msg, msg_w;
+        msg = "No debug map loaded";
+        msg_w = measure_text(msg, UI_FONT_SZ);
+        draw_text(msg, px + (pw - msg_w) / 2,
+                  py + ph / 2 - UI_FONT_SZ,
+                  UI_FONT_SZ, _theme.text_muted);
+
+        msg = "Build your project (F7) or click Load .bug";
+        msg_w = measure_text(msg, UI_FONT_SZ);
+        draw_text(msg, px + (pw - msg_w) / 2,
+                  py + ph / 2 + 4,
+                  UI_FONT_SZ, _theme.text_muted);
+        return quit;
+    }
+
+    // ── Scroll handling ──
+    // Mouse wheel scrolls the debug map.
+    auto scroll_speed;
+    scroll_speed = (UI_FONT_SZ + 3) * 3;
+    if (key_pressed(KEY_PGDOWN)) { _tb_scroll += scroll_speed * 5; }
+    if (key_pressed(KEY_PGUP))   { _tb_scroll -= scroll_speed * 5; }
+    // Mouse wheel (arrow keys as fallback).
+    if (key_pressed(KEY_DOWN))  { _tb_scroll += scroll_speed; }
+    if (key_pressed(KEY_UP))    { _tb_scroll -= scroll_speed; }
+    if (_tb_scroll < 0) { _tb_scroll = 0; }
+
+    // Clip the content area.
+    auto lx, ly;
+    lx = px + margin;
+    ly = content_y - _tb_scroll;
+
+    // Render all sections sequentially.
+    ly = _tb_render_header(lx, ly);
+    ly = _tb_render_functions(lx, ly);
+    ly = _tb_render_structs(lx, ly);
+    ly = _tb_render_globals(lx, ly);
+    ly = _tb_render_externs(lx, ly);
+    ly = _tb_render_srcmap(lx, ly);
+    ly = _tb_render_addrmap(lx, ly);
+    ly = _tb_render_stackmap(lx, ly);
+
+    // Clamp scroll so we don't scroll past the end.
+    auto total_content;
+    total_content = ly + _tb_scroll - content_y;
+    if (total_content > content_h) {
+        if (_tb_scroll > total_content - content_h) {
+            _tb_scroll = total_content - content_h;
+        }
+    } else {
+        _tb_scroll = 0;
+    }
+
+    // ── Bottom status ──
+    auto status_y, status_sb, status_len;
+    status_y = py + ph - 20;
+    status_sb = strbuf_new();
+    status_sb = strbuf_num(status_sb, bug_fn_count);
+    status_sb = strbuf_cat(status_sb, " functions  ");
+    status_sb = strbuf_num(status_sb, bug_st_count);
+    status_sb = strbuf_cat(status_sb, " structs  ");
+    status_sb = strbuf_num(status_sb, bug_gl_count);
+    status_sb = strbuf_cat(status_sb, " globals  ");
+    status_sb = strbuf_num(status_sb, bug_am_count);
+    status_sb = strbuf_cat(status_sb, " symbols  PgUp/PgDn:scroll");
+    status_len = strbuf_len(status_sb);
+    if (status_len > 250) { status_len = 250; }
+    buf_copy(_tb_line_buf, status_sb, status_len);
+    poke(_tb_line_buf + status_len, 0);
+    strbuf_free(status_sb);
+    draw_text(_tb_line_buf, px + margin, status_y,
+              UI_FONT_SZ, _theme.text_muted);
+
+    return quit;
+}
+
+void the_bug_lib_shutdown() {
+    if (_tb_initialized == 0) { return; }
+    if (_tb_line_buf != 0) { free(_tb_line_buf); _tb_line_buf = 0; }
+    _tb_initialized = 0;
+}

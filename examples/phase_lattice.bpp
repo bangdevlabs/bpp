@@ -1,0 +1,72 @@
+// phase_lattice.bpp — Canonical demonstration of the @phase lattice.
+//
+// Every @phase annotation below matches its actual call graph, so the
+// compiler accepts this program without W013 or W026 diagnostics.
+//
+//   ./bpp examples/phase_lattice.bpp -o /tmp/phase_lattice
+//   /tmp/phase_lattice
+//
+// To see what each violation looks like, compile examples/phase_lattice_bad.bpp
+// instead and observe the warnings.
+//
+// Lattice (top = most side effects):
+//
+//           @solo
+//           /    \
+//         @io    @gpu     siblings; cannot call each other
+//           \    /
+//           @time          realtime: arg-writes only
+//             |
+//           @base          pure
+//
+// A function can CALL anything at its level or below.
+// A function can BE CALLED from its level or above.
+// @base is callable by everyone; @solo can call anything.
+
+// ── @base — pure compute. No globals, no malloc, no I/O. ──────
+static add(a, b)@base { return a + b; }
+
+// ── @time — realtime path. Reads / writes through pointer args.
+//    Forbidden: heap, I/O, GPU. Audio callbacks live here.
+static dsp_zero(buf, n)@time {
+    auto i;
+    for (i = 0; i < n; i++) { poke(buf + i, 0); }
+}
+
+static dsp_mix(buf, n)@time {
+    auto s;
+    dsp_zero(buf, n);              // OK: @time may call @time
+    s = add(1, 2);                 // OK: @time may call @base
+    return s;
+}
+
+// ── @io — touches stdout. Permits HEAP. ───────────────────────
+static greet()@io {
+    auto p;
+    p = malloc(8);                 // HEAP allowed in @io
+    putchar('h'); putchar('i'); putchar(10);
+    free(p);
+}
+
+// ── @gpu — touches GPU resources. Permits HEAP, NOT I/O. ──────
+static fake_upload()@gpu {
+    auto buf;
+    buf = malloc(16);              // HEAP allowed in @gpu
+    free(buf);
+}
+
+// ── @solo — catch-all. Absorbs everything. ────────────────────
+static frame()@solo {
+    auto buf, sum;
+    buf = malloc(64);
+    dsp_mix(buf, 64);              // OK: @solo absorbs @time
+    greet();                       // OK: @solo absorbs @io
+    fake_upload();                 // OK: @solo absorbs @gpu
+    sum = add(2, 3);               // OK: @solo absorbs @base
+    free(buf);
+}
+
+main() {
+    frame();
+    return 0;
+}

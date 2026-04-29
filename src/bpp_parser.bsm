@@ -168,7 +168,7 @@ add_struct_def(name_p) {
 // Return the byte cost of a field given its type hint.
 // Bit-sliced fields return 0 because they share a byte with neighbours;
 // the actual byte placement is computed by add_struct_field's layout pass.
-field_hint_size(hint) : base {
+field_hint_size(hint)@base {
     auto sl;
     sl = ty_slice(hint);
     if (sl >= SL_BIT && sl <= SL_BIT7) { return 0; }
@@ -1240,50 +1240,28 @@ static void parse_function(is_stub, is_static, is_void) {
     consume();
     params_arr = list_end();
     param_cnt = last_list_cnt;
-    // Check for optional phase annotation between ) and {.
-    // `: base` = function is pure (worker-safe), compiler verifies.
-    // `: solo` = function is sequential (main-thread), programmer override.
-    // Peek at the token AFTER `:` to avoid consuming `:` when it's a
-    // return type hint (e.g., `: half float`) instead of a phase annotation.
-    auto phase_hint, _nxt_s, _nxt_l;
+    // @phase — annotation sigil between ) and {.
+    // @ is unambiguous: never starts a type hint, no peek-ahead needed.
+    // Phase codes (PHASE_* in bpp_dispatch.bsm):
+    //   1 = base   pure — worker-safe, compiler verifies via W013
+    //   2 = solo   catch-all side effect — escape hatch, rarely needed
+    //   3 = time   audio callback — no malloc, no IO, bounded time (W026)
+    //   4 = io     touches files / network / stdout (W026)
+    //   5 = gpu    touches GPU resources (W026)
+    auto phase_hint;
     phase_hint = 0;
-    if (val_is_ch(':')) {
-        if (tok_pos + 1 < tok_cnt) {
-            _nxt_s = *(toks + (tok_pos + 1) * 24 + 8);
-            _nxt_l = *(toks + (tok_pos + 1) * 24 + 16);
-            // Length-keyed dispatch over the supported annotation names.
-            // Codes match PHASE_* constants in bpp_dispatch.bsm:
-            //   1 = base       worker-safe pure
-            //   2 = solo       any side effect (catch-all)
-            //   3 = realtime   audio callback safe — no malloc, no IO,
-            //                  bounded time
-            //   4 = io         touches files / network / stdout
-            //   5 = gpu        touches GPU resources (render thread only)
-            // Sub-step A: parser accepts all five; sub-step B+C bring
-            // propagation and call-site enforcement.
-            if (_nxt_l == 2) {
-                if (buf_eq(vbuf + _nxt_s, "io", 2)) {
-                    consume(); phase_hint = 4; consume();
-                }
-            }
-            if (_nxt_l == 3) {
-                if (buf_eq(vbuf + _nxt_s, "gpu", 3)) {
-                    consume(); phase_hint = 5; consume();
-                }
-            }
-            if (_nxt_l == 4) {
-                if (buf_eq(vbuf + _nxt_s, "base", 4)) {
-                    consume(); phase_hint = 1; consume();
-                }
-                if (buf_eq(vbuf + _nxt_s, "solo", 4)) {
-                    consume(); phase_hint = 2; consume();
-                }
-            }
-            if (_nxt_l == 8) {
-                if (buf_eq(vbuf + _nxt_s, "realtime", 8)) {
-                    consume(); phase_hint = 3; consume();
-                }
-            }
+    if (val_is_ch('@')) {
+        consume();
+        auto _pp, _ps, _pl;
+        _pp = cur_packed();
+        _pl = unpack_l(_pp);
+        _ps = vbuf + unpack_s(_pp);
+        if (_pl == 2) { if (buf_eq(_ps, "io",   2)) { phase_hint = 4; consume(); } }
+        if (_pl == 3) { if (buf_eq(_ps, "gpu",  3)) { phase_hint = 5; consume(); } }
+        if (_pl == 4) {
+            if (buf_eq(_ps, "base", 4)) { phase_hint = 1; consume(); }
+            if (buf_eq(_ps, "solo", 4)) { phase_hint = 2; consume(); }
+            if (buf_eq(_ps, "time", 4)) { phase_hint = 3; consume(); }
         }
     }
     consume();
@@ -2345,16 +2323,16 @@ static parse_primary() {
             // paying the bl/ret overhead on semantic aliases. Gated
             // by an explicit whitelist of functions whose body is a
             // single return of a simple expression — starts narrow
-            // (arr_byte, arr_word) and expands only after profile
-            // evidence. Keyword collisions (half/base/byte/word as
-            // reserved B++ keywords) can't sneak in because the
-            // substituted AST is built from bytes we control.
-            if (last_list_cnt == 1 && unpack_l(name_p) == 7 &&
-                buf_eq(vbuf + unpack_s(name_p), "arr_byte", 7)) {
+            // (buf_byte, buf_word in bpp_buf) and expands only after
+            // profile evidence. Keyword collisions (half/base/byte/
+            // word as reserved B++ keywords) can't sneak in because
+            // the substituted AST is built from bytes we control.
+            if (last_list_cnt == 1 && unpack_l(name_p) == 8 &&
+                buf_eq(vbuf + unpack_s(name_p), "buf_byte", 8)) {
                 // buf_byte(n) → malloc(n). Pure rename.
                 node.a = _inline_malloc_ref();
-            } else if (last_list_cnt == 1 && unpack_l(name_p) == 9 &&
-                       buf_eq(vbuf + unpack_s(name_p), "arr_word", 9)) {
+            } else if (last_list_cnt == 1 && unpack_l(name_p) == 8 &&
+                       buf_eq(vbuf + unpack_s(name_p), "buf_word", 8)) {
                 // buf_word(n) → malloc(n << 3). Wraps the arg in a
                 // shift-left-3 and swaps the call target. The shift
                 // carries the same semantics as `* 8` but matches

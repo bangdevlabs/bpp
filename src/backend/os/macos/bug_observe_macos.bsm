@@ -151,6 +151,7 @@ _spawn_debugserver(target_path, start_idx, argc) {
 
 static auto _mo_text_addr;
 static auto _mo_text_seg_vmaddr;
+static auto _mo_data_seg_vmaddr;  // __DATA segment base vmaddr for data_base.
 
 _rd32(buf, off) {
     return peek_h(buf + off);
@@ -207,6 +208,9 @@ parse_macho_header(path) {
                         }
                         sp += 80;
                     }
+                }
+                if (peek(buf+pos+10) == 'D') {
+                    _mo_data_seg_vmaddr = _rd64(buf, pos + 24);
                 }
             }
         }
@@ -440,44 +444,85 @@ _resolve_break_cstr(cstr, text_base) {
     return 0;
 }
 
-// -- Crash locals: read variables from stack frame ---------------
+// -- Watch list --------------------------------------------------
 
-_print_crash_locals(fi, text_base) {
-    auto fp, vcnt, voffs, vnames, vi, val;
+// Populated by bug.bpp from --watch <csv>. Zero = no filter (show all).
+global watch_names;  // buf_word(N) of null-terminated name C-strings.
+global watch_count;  // Number of entries in watch_names.
 
-    // Use fi as index into stack map and function table.
-    // The .bug file stores these in the same order as the address map.
-    if (fi >= bug_sk_count) { return 0; }
-    if (fi >= bug_fn_count) { return 0; }
-
-    vcnt = arr_get(bug_sk_vcnt, fi);
-    if (vcnt <= 0) { return 0; }
-
-    fp = gdb_read_fp();
-    voffs = arr_get(bug_sk_voffs, fi);
-    vnames = arr_get(bug_fn_lnames, fi);
-
-    out_str("  locals:");
-    out_nl();
-    for (vi = 0; vi < vcnt; vi++) {
-        val = gdb_read_mem(fp + voffs[vi], 8);
-        out_str("    ");
-        if (vnames != 0) { out_packed(vnames[vi]); }
-        else { out_str("var"); out_int(vi); }
-        out_str(" = ");
-        out_int(val);
-        out_str(" (0x");
-        auto hi;
-        for (hi = 28; hi >= 0; hi -= 4) {
-            auto d;
-            d = (val >> hi) & 0xF;
-            if (d < 10) { out_ch('0' + d); }
-            else { out_ch('a' + d - 10); }
-        }
-        out_str(")");
-        out_nl();
+// Return 1 if the packed name matches any entry in watch_names.
+// When watch_count == 0 (no filter), always returns 1.
+static _watch_match(packed)@base {
+    auto s, l, wi, wname, wlen;
+    if (watch_count == 0) { return 1; }
+    s = packed % 0x100000000;
+    l = packed / 0x100000000;
+    for (wi = 0; wi < watch_count; wi++) {
+        wname = *(watch_names + wi * 8);
+        wlen  = str_len(wname);
+        if (wlen == l && buf_cmp(_br_strbuf + s, wname, l) == 0) { return 1; }
     }
     return 0;
+}
+
+// -- Stack-frame locals and watched globals ----------------------
+
+// Print locals for function fi, filtered by watch_names if active.
+// If watch_count > 0, also checks globals by name and reads from __DATA.
+// data_base = __DATA segment runtime address (__DATA vmaddr + ASLR slide).
+static void _print_crash_locals(fi, text_base, data_base) {
+    auto fp, vcnt, voffs, vnames, vi, val;
+    auto printed;
+
+    if (fi >= bug_sk_count) { return; }
+    if (fi >= bug_fn_count) { return; }
+
+    vcnt   = arr_get(bug_sk_vcnt, fi);
+    fp     = gdb_read_fp();
+    voffs  = arr_get(bug_sk_voffs, fi);
+    vnames = arr_get(bug_fn_lnames, fi);
+
+    // Locals: print all (watch_count == 0) or only watched names.
+    printed = 0;
+    if (vcnt > 0 && vnames != 0) {
+        for (vi = 0; vi < vcnt; vi++) {
+            if (_watch_match(vnames[vi]) == 0) { continue; }
+            if (printed == 0) { out_str("  locals:"); out_nl(); }
+            printed = 1;
+            val = gdb_read_mem(fp + voffs[vi], 8);
+            out_str("    ");
+            out_packed(vnames[vi]);
+            out_str(" = ");
+            out_int(val);
+            out_str(" (0x");
+            auto hi;
+            for (hi = 28; hi >= 0; hi -= 4) {
+                auto d;
+                d = (val >> hi) & 0xF;
+                if (d < 10) { out_ch('0' + d); }
+                else { out_ch('a' + d - 10); }
+            }
+            out_str(")");
+            out_nl();
+        }
+    }
+
+    // Globals: only when watch list is active and data_base is known.
+    if (watch_count > 0 && data_base != 0 && bug_gl_count > 0) {
+        auto gi;
+        printed = 0;
+        for (gi = 0; gi < bug_gl_count; gi++) {
+            if (_watch_match(arr_get(bug_gl_name, gi)) == 0) { continue; }
+            if (printed == 0) { out_str("  globals:"); out_nl(); }
+            printed = 1;
+            val = gdb_read_mem(data_base + arr_get(bug_gl_data_off, gi), 8);
+            out_str("    ");
+            out_packed(arr_get(bug_gl_name, gi));
+            out_str(" = ");
+            out_int(val);
+            out_nl();
+        }
+    }
 }
 
 // -- Main runner -------------------------------------------------
@@ -504,7 +549,7 @@ global flag_dump_str; // Set by bug.bpp from --dump-str CLI flag.
 
 bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     auto ret, sig, pc, fi, i;
-    auto slide, text_base, retries;
+    auto slide, text_base, data_base, retries;
     auto call_depth, has_bug;
 
     // Check if .bug file was loaded (enhanced mode with locals + filtered trace).
@@ -547,8 +592,9 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     // Handshake and get ASLR slide.
     gdb_handshake();
     gdb_query_stop();
-    slide = gdb_query_slide(_mo_text_seg_vmaddr);
+    slide     = gdb_query_slide(_mo_text_seg_vmaddr);
     text_base = _mo_text_addr + slide;
+    data_base = _mo_data_seg_vmaddr + slide;
 
     // Set breakpoints. Three modes:
     //   1. --break <fn> given (bp_count > 0, flag_break_all == 0):
@@ -667,6 +713,10 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                     _dump_cstr_at("x1", x1v);
                 }
                 out_nl();
+                // Print watched variables on every breakpoint hit.
+                if (has_bug && watch_count > 0) {
+                    _print_crash_locals(fi, text_base, data_base);
+                }
                 call_depth++;
                 if (call_depth > 30) { call_depth = 30; }
             }
@@ -702,7 +752,7 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                     out_nl();
 
                     // Print local variables if .bug file was loaded.
-                    if (has_bug) { _print_crash_locals(fi, text_base); }
+                    if (has_bug) { _print_crash_locals(fi, text_base, data_base); }
                 }
 
                 // Walk the frame pointer chain for a full backtrace.

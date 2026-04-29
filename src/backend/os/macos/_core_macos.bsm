@@ -17,7 +17,7 @@
 //
 // This file ships:
 //   Section 1 — Runtime startup globals (_bpp_argc/argv/envp)
-//   Section 2 — Heap (malloc / free / realloc / memcpy)
+//   Section 2 — Heap primitives (page allocator consumed by bpp_mem)
 //   Section 3 — Time + threads (_stb_get_time / threads)
 //
 // Auto-injected for every macOS program via the compiler's
@@ -51,102 +51,32 @@ global _bpp_argc;
 global _bpp_argv;
 global _bpp_envp;
 
-// ── Section 2: Heap ───────────────────────────────────────────
+// ── Section 2: Heap primitives ────────────────────────────────
 //
-// Each allocation maps a private, anonymous region via sys_mmap.
-// A 16-byte header sits immediately before the user pointer:
-//   user_ptr - 16: original raw mmap base (so free finds the page)
-//   user_ptr -  8: total mmap size in bytes (so free knows to unmap)
-//
-// Regular malloc(size) lays out: raw → [raw_ptr | total | user].
-// malloc_aligned(size, align) over-allocates and slides the user
-// pointer to land on an `align`-byte boundary, writing the same
-// header into the preceding 16 bytes. free() handles both.
-//
-// Deliberately simple: one mmap per allocation, no free list.
-// A real free-list allocator replaces this module eventually.
+// Page-level allocator primitives consumed by the abstract heap
+// API in `bpp_mem.bsm`. macOS-specific only via the mmap flag
+// constant; the byte-for-byte allocation logic, header layout,
+// alignment, and realloc live in the portable abstract layer.
 
 // mmap protection: PROT_READ | PROT_WRITE.
-const _BMEM_PROT_RW = 3;
+const _MEM_PROT_RW = 3;
 
 // mmap flags on macOS: MAP_PRIVATE (0x0002) | MAP_ANON (0x1000).
-const _BMEM_FLAGS = 0x1002;
+const _MEM_FLAGS = 0x1002;
 
-// Header size — 8 bytes for the raw mmap pointer plus 8 bytes
-// for the total mmap size. Sits immediately before user pointer.
-const _BMEM_HEADER = 16;
-
-// Error return from sys_mmap (and the "no fd" sentinel for anon).
-const _BMEM_FAIL = 0 - 1;
-
-// Allocate `size` bytes. Returns a pointer the caller can write
-// through, or 0 if the kernel refused the mapping.
-malloc(size) {
-    auto raw, total;
-    total = size + _BMEM_HEADER;
-    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
-    if (raw == _BMEM_FAIL) { return 0; }
-    *raw = raw;
-    *(raw + 8) = total;
-    return raw + _BMEM_HEADER;
+// Allocate `size` raw bytes from the kernel, or 0 on failure.
+// Wraps macOS sys_mmap with the right MAP flags and translates
+// MAP_FAILED (-1) to 0 for portability.
+_mem_alloc_pages(size) {
+    auto raw;
+    raw = sys_mmap(0, size, _MEM_PROT_RW, _MEM_FLAGS, 0 - 1, 0);
+    if (raw == 0 - 1) { return 0; }
+    return raw;
 }
 
-// Allocate `size` bytes whose user pointer is a multiple of
-// `alignment`. `alignment` must be a power of two. Callers wanting
-// SIMD-friendly buffers typically pass 16 (NEON/SSE) or 32 (AVX).
-malloc_aligned(size, alignment) {
-    auto raw, total, user;
-    total = size + alignment + _BMEM_HEADER;
-    raw = sys_mmap(0, total, _BMEM_PROT_RW, _BMEM_FLAGS, _BMEM_FAIL, 0);
-    if (raw == _BMEM_FAIL) { return 0; }
-    // Slide the user pointer forward so it sits on an alignment
-    // boundary and leaves at least _BMEM_HEADER bytes between the
-    // mmap base and the user region for the back-pointer header.
-    user = (raw + _BMEM_HEADER + alignment - 1) / alignment * alignment;
-    *(user - _BMEM_HEADER) = raw;
-    *(user - 8) = total;
-    return user;
-}
-
-// Release memory previously returned by malloc or malloc_aligned.
-// Safe to call with 0. Reads the back-pointer and total size from
-// the header.
-void free(p) {
-    auto raw, total;
-    if (p == 0) { return; }
-    raw = *(p - _BMEM_HEADER);
-    total = *(p - 8);
+// Release a region previously returned by _mem_alloc_pages.
+void _mem_free_pages(raw, total) {
     sys_munmap(raw, total);
-}
-
-// Resize an existing allocation. On success returns the new
-// pointer (may differ from the old one). On failure returns 0 and
-// leaves the old block alive so the caller can recover.
-realloc(p, new_size) {
-    auto new_p, old_size, raw, total, limit;
-    if (p == 0) { return malloc(new_size); }
-    raw = *(p - _BMEM_HEADER);
-    total = *(p - 8);
-    // The user region runs from p up to the end of the mmap'd page.
-    old_size = total - (p - raw);
-    new_p = malloc(new_size);
-    if (new_p == 0) { return 0; }
-    limit = old_size;
-    if (new_size < limit) { limit = new_size; }
-    memcpy(new_p, p, limit);
-    free(p);
-    return new_p;
-}
-
-// Copy `n` bytes from `src` to `dst`. Returns `dst` for chaining.
-// Byte-by-byte loop — simple and portable; future optimization
-// can use word-sized copies when both pointers are 8-byte aligned.
-memcpy(dst, src, n) {
-    auto i;
-    for (i = 0; i < n; i++) {
-        poke(dst + i, peek(src + i));
-    }
-    return dst;
 }
 
 // ── Section 3: Time + threads ─────────────────────────────────

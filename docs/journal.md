@@ -4803,3 +4803,73 @@ naming (`TY_ARR`, `T_SWITCH`, `T_TERNARY`, `DSP_*`, `PHASE_*`,
 
 **Suite.** 117 passed, 0 failed, 11 skipped (128 total). Bootstrap
 g2 == g3.
+
+---
+
+## 2026-04-28 — bug Phase 1 + @phase migration + syntax highlights
+
+**Gemini audit.** Reviewed work from a Google Gemini Pro agent on the
+`the_bug` debugger and Bang 9 IDE. Found and fixed five critical bugs:
+
+- `_br_strbuf` declared `static` in `bug_reader.bsm` but `extrn` in
+  `the_bug_lib.bsm` — cross-module access broken. Fixed: `global`.
+- `init_reader()` leaking 512 KB per call (no free guards). Fixed:
+  added null-checks before every `malloc`.
+- `bug_target` always defaulted to x86_64 via a heuristic that was
+  always true. Fixed: explicit `target` parameter in `bug_save`.
+- `_debug_needs_reload` never set after successful build. Fixed: wired
+  in `runner.bsm` after `sys_waitpid` returns `status == 0`.
+- Wrong compiler flag `-g` instead of `--bug` in build command. Fixed.
+
+**`tools/the_bug/the_bug_lib.bsm`** created — panel library that
+renders `.bug` file contents (functions, structs, globals, stack maps)
+with scroll support. Used by the Debug tab in Bang 9.
+
+**bug viz Phase 1 shipped.** `bug --watch name[,name2,...]` CLI flag:
+- Parses comma-separated watch list into `watch_names` buf_word array.
+- `_watch_match(packed)` filters locals and globals by name prefix.
+- `_print_crash_locals(fi, text_base, data_base)` called at every
+  SIGTRAP hit when `watch_count > 0`.
+- `data_base = _mo_data_seg_vmaddr + slide` wired through
+  `parse_macho_header` → `bug_run` → crash handler.
+- `bug_gl_data_off` array in the `.bug` format: one u32 `__DATA`
+  offset per global (index = cg_gl_name_index × 8).
+
+**`@phase` annotation migration.** Parser now accepts `@base`,
+`@solo`, `@io`, `@time`, `@gpu` (@ sigil attached to identifier, no
+space). Old `: phase` colon syntax removed. `realtime` renamed to
+`time` everywhere. Swept ~55 files including `tests/`. Key parser
+change in `bpp_parser.bsm:1243-1293`.
+
+**modulab test regression fixed.** Seven tests (`test_modulab_dogfood`
+and six others) were failing with E201 on `ui_filename_set`. Root
+cause: headless tests don't load `ui.bsm`. Fix: `stub
+ui_filename_set(s) { }` in `tools/modulab/io.bsm` line 29. Note:
+`stub` does NOT accept the `void` keyword — parser reads `void` as the
+function name.
+
+**Bootstrap.** `bpp_new` removed from repo root (intermediate binaries
+not allowed per bootprod_manual). Bootstrap gen1 == gen2 (byte-stable),
+`./bpp` updated.
+
+**Syntax highlights updated — all three IDEs.**
+
+`IDE/bpp-mode.el` (Emacs — primary):
+- `stub` added to declaration keywords.
+- `PHASE_REALTIME` → `PHASE_TIME`.
+- Phase annotation regex changed to `@\(base|solo|io|time|gpu\)`.
+- Function-definition regex: `stub fn(` added as valid prefix.
+
+`bang9/editor.bsm` (Bang9):
+- `stub` added to keyword table (buf_word 24→25).
+- `_ed_is_phase_word(start, len)` — inline check for 5 phase words.
+- `@` case in `_ed_classify`: consumes `@word`, highlights as
+  `_theme.accent` if a phase word; otherwise plain text.
+
+`IDE/vscode/syntaxes/bpp.tmLanguage.json` (VS Code): same changes
+mirrored.
+
+**Suite.** 120 passed, 0 failed, 11 skipped (131 total). `test_gpu_circle`
+and `test_gpu_clear` both confirmed working — they open a Metal window
+and pass interactively. `run_all.sh` shows 118+2 only because the
+interactive GPU tests require user input to quit. Bootstrap gen1 == gen2.
