@@ -4873,3 +4873,106 @@ mirrored.
 and `test_gpu_clear` both confirmed working — they open a Metal window
 and pass interactively. `run_all.sh` shows 118+2 only because the
 interactive GPU tests require user input to quit. Bootstrap gen1 == gen2.
+
+## 2026-04-29 — Compiler bug: bl encoding wrong target in bug_tui (parked)
+
+Phase 4 of the bug viz roadmap (interactive `--tui` REPL plus
+breakpoint table) is blocked behind a B++ codegen bug discovered
+while bringing it up. Source files for Phase 4 are parked at
+`/tmp/phase4_park/` (not in tree) until the compiler bug lands.
+
+### Symptom
+
+When `bug_tui_repl` and `_tui_print_help` in `src/bug_tui.bsm`
+call `out_str` (defined in `src/bug.bpp`), some of the emitted
+`bl` instructions resolve to addresses inside the calling function
+itself, or to wild addresses outside the binary entirely. otool
+shows e.g. `_bug_tui_repl: bl 0x1000368ac` where the actual
+`_out_str` lives at `0x100036f2c`. Other modules (`bug_eval.bsm`,
+the observers) call `out_str` cleanly. Same source pattern, same
+function-table lookup, same encoder path — but only certain call
+sites in this one module break.
+
+### Threshold
+
+Bisecting `bug_tui.bsm` against the bug binary, the trigger is
+sensitive to the count of `out_str` calls in `_tui_print_help`:
+
+  - 7 `out_str + out_nl` pairs: clean.
+  - 8 pairs: at least one bl in `_bug_tui_repl` resolves wrong.
+
+The 8th call doesn't have to be in `_bug_tui_repl` — putting it in
+`_tui_print_help` (a different function in the same module) still
+triggers a wrong bl in `_bug_tui_repl`. So the issue accumulates
+across functions, not within a single emit.
+
+### Diagnostic walk
+
+Instrumented every relevant point in `a64_enc.bsm` and
+`bpp_bo.bsm` and proved each of the suspected paths is fine:
+
+  - `enc_resolve_fixups` patches each fixup with target in `[0,
+    enc_pos]`. Asserted; never fired.
+  - `bo_resolve_calls_arm64` resolves every type-4 reloc to a
+    valid `target`. Asserted; never fired.
+  - `enc_bl_label` always sees `lbl` in `[0, enc_lbl_max)`.
+    Asserted; never fired.
+  - `enc_add_fixup` always gets a valid `lbl` likewise. Never
+    fired.
+  - No duplicate type-4 relocations at the same `pos`. Never
+    fired.
+  - No range-violation in `enc_bl(off)`. Never fired.
+
+Reverting the Phase 1 register-aware metadata write (the
+`fn_vt_locs` population in `bpp_codegen.bsm`) does NOT fix the
+bug — so it is not the trigger.
+
+### What WAS observed under instrumentation
+
+Every `bl` at the broken positions ALSO has the correct earlier
+write into `enc_buf`. Adding traces around `enc_emit32` for
+`enc_pos == BROKEN_POS` shows the WRITE happens with a sane value
+(e.g., `0xF8400FE0`, an LDR), not the eventual `0x97D6EFB5` (a
+bl-shaped word). In other words, the broken bytes appear AFTER
+the initial write — somebody is overwriting them later — but
+neither the recorded fixups nor the recorded type-4 relocations
+patch that exact `enc_pos`. The closest patch is +4 bytes away
+(STR-side instruction). The byte at the BROKEN position is being
+clobbered by something the instrumentation has not caught yet.
+
+### Synthetic minimum reproducer
+
+`/tmp/bltest_main.bpp` (a stripped-down `bug_tui.bsm` linked with
+stubs for the deps) does NOT reproduce. So the bug needs the
+full `bug.bpp` import graph or some other ambient state. Possibly
+sensitive to total label count, number of cross-module relocs,
+or interaction with the macho writer's reloc patcher
+(`a64_macho.bsm:1080` ADRP/ADD path).
+
+### Next session bisect plan
+
+  1. Extend instrumentation to every `enc_emit32` and `enc_patch32`
+     call, log everything in a 32-byte window around the broken
+     `enc_pos`. The clobber must come from one of those.
+  2. Compare the instrumentation log to the post-build binary
+     bytes — find the LAST writer at the broken position. That
+     reveals whether the macho writer's reloc patcher is
+     misfiring on a non-bl instruction.
+  3. If the macho writer is the culprit, look for cross-talk
+     between reloc entries (e.g., a stale entry whose `pos`
+     was clobbered by a later push).
+  4. Otherwise, broaden the search: instrument `arr_set` calls
+     across all the relocation-related arrays (`enc_rel_pos`,
+     `enc_fix_pos`, etc.) for index >= length, since arr_set
+     does no bounds checking and an OOB write would produce
+     exactly this kind of "phantom byte" symptom.
+
+### Files
+
+Phase 4 source lives at `/tmp/phase4_park/` for restoration once
+the compiler is fixed: `bug_tui.bsm`, `bug_brk.bsm`,
+`integration.diff` (changes to `bug.bpp` and
+`bug_observe_macos.bsm`).
+
+Tracked as task #12 in the active session.
+
