@@ -471,7 +471,8 @@ static _watch_match(packed)@base {
 // If watch_count > 0, also checks globals by name and reads from __DATA.
 // data_base = __DATA segment runtime address (__DATA vmaddr + ASLR slide).
 static void _print_crash_locals(fi, text_base, data_base) {
-    auto fp, vcnt, voffs, vnames, ltypes, lsids, vi, val, ty, sid;
+    auto fp, vcnt, voffs, vnames, ltypes, lsids, lkinds, ldetails;
+    auto vi, val, ty, sid, kind, detail, addr;
     auto printed;
 
     if (fi >= bug_sk_count) { return; }
@@ -481,11 +482,18 @@ static void _print_crash_locals(fi, text_base, data_base) {
     fp     = gdb_read_fp();
     voffs  = arr_get(bug_sk_voffs, fi);
     vnames = arr_get(bug_fn_lnames, fi);
-    // Type + struct-id tables parallel to vnames. The .bug format v2
-    // emits a 1-based struct id alongside each local's type byte;
-    // viz_format walks struct fields when that id is non-zero.
-    ltypes = arr_get(bug_fn_ltypes, fi);
-    lsids  = arr_get(bug_fn_lsids,  fi);
+    // Type + struct-id + location tables, all parallel to vnames.
+    // The location pair (lkinds + ldetails) was added in .bug
+    // format v3. Without it, the watch loop reads from fp + voffs
+    // for every local — but the codegen promotes most locals into
+    // callee-saved registers (x19..x28 on ARM64) and never touches
+    // their stack slot, so the read returns the prior frame's
+    // residual data. v3 lets the loop dispatch register reads via
+    // gdb_read_reg(reg_num) when the location kind is 0.
+    ltypes   = arr_get(bug_fn_ltypes,   fi);
+    lsids    = arr_get(bug_fn_lsids,    fi);
+    lkinds   = arr_get(bug_fn_lkinds,   fi);
+    ldetails = arr_get(bug_fn_ldetails, fi);
 
     // Locals: print all (watch_count == 0) or only watched names.
     printed = 0;
@@ -494,7 +502,27 @@ static void _print_crash_locals(fi, text_base, data_base) {
             if (_watch_match(vnames[vi]) == 0) { continue; }
             if (printed == 0) { out_str("  locals:"); out_nl(); }
             printed = 1;
-            val = gdb_read_mem(fp + voffs[vi], 8);
+            // Default to the legacy stack-offset read when the .bug
+            // file did not carry per-local location info. The fp +
+            // voffs path matches what older bug binaries did and
+            // remains correct for non-promoted locals.
+            kind   = 1;
+            detail = voffs[vi];
+            if (lkinds   != 0) { kind   = lkinds[vi]   & 0xFF; }
+            if (ldetails != 0) { detail = ldetails[vi] & 0xFFFFFFFF; }
+            if (kind == 0) {
+                // Register read. The detail is the GDB register
+                // index (x19 = 19, x20 = 20, ...) the codegen's
+                // b3 pass promoted this local into. The stack slot
+                // for this local would hold uninitialised junk.
+                val  = gdb_read_reg(detail);
+                addr = 0;
+            } else {
+                // Stack read. The detail is the byte offset from
+                // the frame pointer.
+                addr = fp + detail;
+                val  = gdb_read_mem(addr, 8);
+            }
             ty  = 0;
             sid = 0;
             if (ltypes != 0) { ty  = ltypes[vi] & 0xFF; }
@@ -502,7 +530,7 @@ static void _print_crash_locals(fi, text_base, data_base) {
             out_str("    ");
             out_packed(vnames[vi]);
             out_str(" = ");
-            viz_format(val, ty, sid, 0, fp + voffs[vi]);
+            viz_format(val, ty, sid, 0, addr);
             out_nl();
         }
     }

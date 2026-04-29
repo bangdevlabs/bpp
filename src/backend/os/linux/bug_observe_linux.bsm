@@ -318,7 +318,8 @@ _print_backtrace(text_base) {
 // -- Crash locals ------------------------------------------------
 
 _print_crash_locals(fi, text_base) {
-    auto fp, vcnt, voffs, vnames, ltypes, lsids, vi, val, ty, sid;
+    auto fp, vcnt, voffs, vnames, ltypes, lsids, lkinds, ldetails;
+    auto vi, val, ty, sid, kind, detail, addr;
 
     if (fi >= bug_sk_count) { return 0; }
     if (fi >= bug_fn_count) { return 0; }
@@ -327,18 +328,35 @@ _print_crash_locals(fi, text_base) {
     if (vcnt <= 0) { return 0; }
 
     fp = gdb_read_fp();
-    voffs = arr_get(bug_sk_voffs, fi);
+    voffs  = arr_get(bug_sk_voffs, fi);
     vnames = arr_get(bug_fn_lnames, fi);
-    // Type + struct-id tables parallel to vnames. viz_format walks
-    // struct fields when sid is non-zero (1-based index into
-    // bug_st_*); otherwise it dispatches on the type byte.
-    ltypes = arr_get(bug_fn_ltypes, fi);
-    lsids  = arr_get(bug_fn_lsids,  fi);
+    // Type + struct-id + location tables, all parallel to vnames.
+    // The location pair (kind + detail) added in .bug format v3
+    // tells the watch loop whether to read a value from a register
+    // (kind 0) or the stack (kind 1). Without it, locals promoted
+    // into callee-saved registers come back as uninitialised stack
+    // garbage.
+    ltypes   = arr_get(bug_fn_ltypes,   fi);
+    lsids    = arr_get(bug_fn_lsids,    fi);
+    lkinds   = arr_get(bug_fn_lkinds,   fi);
+    ldetails = arr_get(bug_fn_ldetails, fi);
 
     out_str("  locals:");
     out_nl();
     for (vi = 0; vi < vcnt; vi++) {
-        val = gdb_read_mem(fp + voffs[vi], 8);
+        // Default to the legacy stack-offset read so older .bug
+        // files (without v3 location data) still work.
+        kind   = 1;
+        detail = voffs[vi];
+        if (lkinds   != 0) { kind   = lkinds[vi]   & 0xFF; }
+        if (ldetails != 0) { detail = ldetails[vi] & 0xFFFFFFFF; }
+        if (kind == 0) {
+            val  = gdb_read_reg(detail);
+            addr = 0;
+        } else {
+            addr = fp + detail;
+            val  = gdb_read_mem(addr, 8);
+        }
         ty  = 0;
         sid = 0;
         if (ltypes != 0) { ty  = ltypes[vi] & 0xFF; }
@@ -347,7 +365,7 @@ _print_crash_locals(fi, text_base) {
         if (vnames != 0) { out_packed(vnames[vi]); }
         else { out_str("var"); out_int(vi); }
         out_str(" = ");
-        viz_format(val, ty, sid, 0, fp + voffs[vi]);
+        viz_format(val, ty, sid, 0, addr);
         out_nl();
     }
     return 0;

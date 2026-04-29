@@ -62,21 +62,42 @@ void bug_write_agnostic() {
             bo_write_u8(get_fn_par_type(i, j));
         }
 
-        // Locals: count, then (name, type, struct_sid) tuples. The
-        // struct-id slot is 1-based (0 = no struct annotation) so the
-        // bug viz can dispatch struct expansion only when it has
-        // metadata. Lookup goes through get_var_type, which returns
-        // -1 for non-struct vars; the +1 normalises the sentinel.
+        // Locals: count, then (name, type, struct_sid, loc_kind,
+        // loc_detail) tuples. Both struct-id and the location pair
+        // are 1-based / 0-default sentinels: struct-id 0 means "no
+        // struct annotation"; loc_kind 1 with loc_detail = stack
+        // offset is the safe fallback when the location table has
+        // no entry for this slot. The location pair comes from
+        // fn_vt_locs[i] (populated by the codegen's emit_func right
+        // after b3_select); when it is missing we still emit zeros
+        // and the bug debugger falls back to its existing stack-
+        // offset path.
         cnt = arr_get(fn_vt_cnts, i);
         block = arr_get(fn_vt_data, i);
+        auto loc_block;
+        loc_block = arr_get(fn_vt_locs, i);
         bo_write_u16(cnt);
         for (j = 0; j < cnt; j++) {
-            auto _l_name, _l_sid;
+            auto _l_name, _l_sid, _l_kind, _l_detail;
             _l_name = block[j * 2];
             bo_write_str(_l_name);
             bo_write_u8(block[j * 2 + 1]);
             _l_sid = get_var_type(_l_name);
             bo_write_u16(_l_sid + 1);
+            // Location descriptor: 1 byte kind + 4 bytes LE detail.
+            // The codegen-side block stores them in the same shape,
+            // so the unpack mirrors the pack.
+            _l_kind = 1;
+            _l_detail = 0;
+            if (loc_block != 0) {
+                _l_kind = peek(loc_block + j * 8) & 0xFF;
+                _l_detail = (peek(loc_block + j * 8 + 1) & 0xFF)
+                          | ((peek(loc_block + j * 8 + 2) & 0xFF) << 8)
+                          | ((peek(loc_block + j * 8 + 3) & 0xFF) << 16)
+                          | ((peek(loc_block + j * 8 + 4) & 0xFF) << 24);
+            }
+            bo_write_u8(_l_kind);
+            bo_write_u32(_l_detail);
         }
 
         // Return type.
@@ -301,19 +322,27 @@ void bug_save(out_path, target) {
     // Reset the serialization buffer and write the file header.
     bo_reset();
 
-    // Header: magic "BG" + version 2 + target architecture.
+    // Header: magic "BG" + version 3 + target architecture.
     //
-    // Version 2 (2026-04-29) extends every local and global record
-    // with a u16 struct-id slot (0 = not a struct, otherwise the
-    // 1-based sid into the STRUCTS section). Bug viz Phase 2 walks
-    // struct-typed fields when the slot is non-zero. Older readers
-    // that expect version 1 will mis-parse the locals section after
-    // the first record because the layout grew by 2 bytes per local.
-    // .bug files are rebuilt from source on every compile, so no
-    // migration path is needed.
+    // Version 3 (2026-04-29) extends every local with a 5-byte
+    // location descriptor — `kind` (u8) plus `detail` (u32). Kind 0
+    // means the variable lives in a GPU register and `detail` is
+    // the GDB register number (x19 = 19, x20 = 20, ...). Kind 1
+    // means it lives on the stack at `fp + detail`. The bug
+    // debugger uses this to dispatch register reads vs stack reads
+    // at watch time — without it, locals that the codegen promoted
+    // into callee-saved registers leave their stack slots
+    // uninitialised, and the watch loop reads garbage.
+    //
+    // Version 2 added a u16 struct-id slot to each local and global
+    // (0 = not a struct, otherwise 1-based index into STRUCTS).
+    //
+    // .bug files are rebuilt from source on every compile so no
+    // migration path is needed; older readers will mis-parse the
+    // expanded locals layout.
     bo_write_u8(66);
     bo_write_u8(71);
-    bo_write_u8(2);
+    bo_write_u8(3);
     bo_write_u8(target);
 
     // Part 1: platform-agnostic data (functions, structs, globals, externs, source map).

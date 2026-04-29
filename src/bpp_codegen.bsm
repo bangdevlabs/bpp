@@ -1703,6 +1703,43 @@ void cg_emit_func(fi) {
     }
     call(p.b3_select);
 
+    // 7b. Persist per-variable location info for the bug debugger.
+    // After b3_select, cg_var_promote is settled: >= 0 for register-
+    // promoted locals, -1 for stack-resident locals. The bug
+    // debugger reads this from fn_vt_locs[func_idx] at SIGTRAP time
+    // and dispatches register reads vs stack reads. Without this
+    // the watch loop can only see globals correctly — locals that
+    // got promoted into x19..x28 leave their stack slot uninitialised
+    // and the gdb_read_mem(fp + offset, 8) returns whatever the
+    // prior frame happened to leave there.
+    //
+    // Layout per local: 8-byte slot holding `kind` (1 byte at +0)
+    // and `detail` (4 bytes LE at +1..+4). Kind 0 = register, kind
+    // 1 = stack. For kind 0, detail is the GDB register number
+    // (x19 = 19, x20 = 20, ...). For kind 1, detail is the byte
+    // offset from x29 (= fp).
+    auto _loc_block, _vi, _preg, _kind, _detail, _n_vars;
+    _n_vars = arr_len(cg_vars);
+    _loc_block = buf_byte(_n_vars * 8);
+    _vi = 0;
+    while (_vi < _n_vars) {
+        _preg = arr_get(cg_var_promote, _vi);
+        if (_preg >= 0) {
+            _kind = 0;
+            _detail = _preg;
+        } else {
+            _kind = 1;
+            _detail = arr_get(cg_var_off, _vi);
+        }
+        poke(_loc_block + _vi * 8, _kind);
+        poke(_loc_block + _vi * 8 + 1, _detail & 0xFF);
+        poke(_loc_block + _vi * 8 + 2, (_detail >> 8)  & 0xFF);
+        poke(_loc_block + _vi * 8 + 3, (_detail >> 16) & 0xFF);
+        poke(_loc_block + _vi * 8 + 4, (_detail >> 24) & 0xFF);
+        _vi++;
+    }
+    arr_set(fn_vt_locs, cg_cur_fn_idx, _loc_block);
+
     // 8. Reserve the spill area and compute final frame size.
     total = call(p.fn_reserve_spill, total);
     frame = call(p.fn_scratch_base) + total;

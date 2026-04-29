@@ -40,6 +40,17 @@ static auto fn_locally_impure;   // arr<int>: 1 if body has non-call side effect
 extrn fn_reachable;        // arr<int>: 1 if reachable from main() via call graph
 global fn_phase_hint;       // arr<int>: 0=auto, 1=base, 2=solo, 3=realtime, 4=io, 5=gpu (from annotation)
 global fn_ret_hint;         // arr<int>: TY_* code per function from explicit `: type` annotation between `)` and `{`. 0 = no hint, type checker infers.
+// Per-function location table for the bug debugger. Entry `i` is a
+// pointer to a buf_byte block of `fn_vt_cnts[i] * 8` bytes, with
+// each 8-byte slot holding `kind` (1 byte) + `detail` (4 bytes LE)
+// for one variable. Kind 0 = "value lives in GDB register `detail`"
+// (the codegen promoted this local into a callee-saved register).
+// Kind 1 = "value lives at fp + detail" (a real stack slot). Without
+// this, the bug reads stack for every local — only correct for the
+// minority that did not get promoted. The codegen populates the
+// block at the end of emit_func, after the b3 register-allocation
+// pass has settled cg_var_promote.
+global fn_vt_locs;
 static auto fn_effect;           // arr<int>: PHASE_* per function — finest-grained classification (Level 4 sub-step B)
 static auto fn_effect_next;      // arr<int>: double-buffer for the effect fixpoint pass
 extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place (Phase B2)
@@ -134,6 +145,7 @@ void init_dispatch() {
     fn_reachable = arr_new();
     fn_phase_hint = arr_new();
     fn_ret_hint   = arr_new();
+    fn_vt_locs    = arr_new();
     fn_effect = arr_new();
     fn_effect_next = arr_new();
     fn_inlineable = arr_new();
@@ -867,6 +879,7 @@ call_graph_build() {
         fn_reachable = arr_push(fn_reachable, 0);
         fn_phase_hint = arr_push(fn_phase_hint, 0);
         fn_ret_hint   = arr_push(fn_ret_hint, 0);
+        fn_vt_locs    = arr_push(fn_vt_locs, 0);
         fn_effect = arr_push(fn_effect, PHASE_AUTO);
         fn_effect_next = arr_push(fn_effect_next, PHASE_AUTO);
     }
@@ -2014,6 +2027,7 @@ void synthesize_loop_fn() {
         fn_void = arr_push(fn_void, 1);
         fn_phase_hint = arr_push(fn_phase_hint, 0);
         fn_ret_hint   = arr_push(fn_ret_hint, 0);
+        fn_vt_locs    = arr_push(fn_vt_locs, 0);
 
         // Extend the dispatch-analysis arrays too. These were sized
         // to the pre-synthesis func_cnt by call_graph_build, so every
