@@ -1,0 +1,94 @@
+// test_audio_pipe.bpp — Minimal SPSC-ring diagnostic.
+//
+// Bypasses stbmixer and stbsound entirely: synthesizes a 440 Hz square
+// wave directly into a stack-local buffer, pushes it to the audio
+// ring, sleeps long enough for the consumer callback to drain it,
+// then prints diagnostic counters.
+//
+// What the output proves:
+//   total_pushed should equal the frame count we tried to push.
+//     If less, audio_push_frames is failing (ring full, never drains).
+//   cb_count should be > 3 (3 priming + at least one post-Start hit).
+//     If exactly 3, the consumer callback never ran after AudioQueueStart.
+//   consumed should be roughly total_pushed (give or take a buffer).
+//     If 0, the callback fires but never advances _aud_ring_read.
+//
+// This separates four layers that snake's silent path lumps together:
+//   audio_open  → AudioQueue setup        (works iff cb_count > 0)
+//   audio_push  → producer-side ring      (works iff total_pushed > 0)
+//   _aud_stream_cb → consumer-side ring   (works iff consumed > 0)
+//   actual audible output                 (sound through the speakers)
+//
+// The first three are observable from the program. The fourth needs
+// the human ear — if the first three all pass and there is still no
+// sound, the bug is in AudioQueue config (sample rate, byte order,
+// channel layout) or the FFI handoff to AudioQueueEnqueueBuffer.
+
+import "bpp_io.bsm";
+import "stbaudio.bsm";
+import "_stb_audio.bsm";
+
+main() {
+    auto rc, buf, n_frames, hp, amp, i, sample, phase;
+    auto pushed, total_pushed, space, chunk, attempts;
+
+    // 1 second of 440 Hz square at ~3% amplitude (-30 dB below s16
+    // full scale). Loud enough to confirm by ear, quiet enough that
+    // running the suite next to someone else's headphones is fine.
+    n_frames = 44100;
+    hp       = 44100 / 440 / 2;
+    amp      = 1000;
+
+    rc = audio_open(8192);
+    putmsg("audio_open rc=");
+    putnum(rc);
+    putline();
+    if (rc != 0) { return rc; }
+
+    // Synthesize the whole second up front. Stereo s16 LE, 4 bytes/frame.
+    buf   = malloc(n_frames * 4);
+    phase = 0;
+    for (i = 0; i < n_frames; i++) {
+        if (phase < hp) { sample = amp; } else { sample = 0 - amp; }
+        poke(buf + i * 4 + 0, sample        & 0xff);
+        poke(buf + i * 4 + 1, (sample >> 8) & 0xff);
+        poke(buf + i * 4 + 2, sample        & 0xff);
+        poke(buf + i * 4 + 3, (sample >> 8) & 0xff);
+        phase++;
+        if (phase >= hp + hp) { phase = 0; }
+    }
+
+    // Pump the buffer into the ring, sleeping between attempts so the
+    // consumer can drain. Cap the loop so a stuck consumer cannot hang
+    // the program.
+    total_pushed = 0;
+    attempts     = 0;
+    while (total_pushed < n_frames && attempts < 500) {
+        space = audio_ring_space();
+        if (space > 0) {
+            chunk = n_frames - total_pushed;
+            if (chunk > space) { chunk = space; }
+            pushed = audio_push_frames(buf + total_pushed * 4, chunk);
+            total_pushed = total_pushed + pushed;
+        }
+        _stb_audio_sleep_ms(10);
+        attempts++;
+    }
+
+    // Give the consumer a final 100 ms to finish draining anything
+    // still in the ring before we read the counters.
+    _stb_audio_sleep_ms(100);
+
+    putmsg("attempts=");
+    putnum(attempts);
+    putmsg(" total_pushed=");
+    putnum(total_pushed);
+    putmsg(" cb_count=");
+    putnum(_stb_audio_cb_count());
+    putmsg(" consumed=");
+    putnum(audio_ring_consumed());
+    putline();
+
+    free(buf);
+    return 0;
+}

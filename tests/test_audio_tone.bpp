@@ -1,53 +1,71 @@
-// test_audio_tone.bpp — Proof-of-life for the stbaudio bring-up.
+// test_audio_tone.bpp — Proof-of-life for the stbaudio direct-tone path.
 //
-// Diagnostic version. Runs the 440 Hz tone for two seconds, then dumps
-// (a) every resolved FFI pointer (index 0 = framework handle, 1-6 =
-// AudioQueue function pointers), and (b) the callback invocation
-// count. A healthy run shows seven non-zero pointers and a non-zero
-// callback count (roughly 86 for 2s at 1024 frames / 44100 Hz) and
-// plays an audible square wave. Zero callback count with a successful
-// rc means CoreAudio accepted the setup but never invoked the
-// callback — the bug is in the queue configuration or the function
-// pointer handed to AudioQueueNewOutput.
+// Verifies end-to-end that the AudioQueue setup, the FFI symbol resolver,
+// and the realtime callback wiring all work, while emitting a brief
+// audible blip so a human listening can confirm by ear. Programmatic
+// assertions catch the failure modes that ear cannot:
+//
+//   1. audio_tone_test returns rc == 0 (CoreAudio accepted the queue)
+//   2. _stb_audio_fn_probe(0..6) all resolve non-zero (every FFI symbol
+//      bound; framework loaded; callback function pointer captured)
+//   3. _stb_audio_cb_count() > 0 (the realtime thread actually invoked
+//      the callback after AudioQueueStart, not just during priming)
+//
+// The tone path is the mixer-free siblings of test_audio_pipe (which
+// covers the mixer + SPSC ring layer). Together they pin both paths
+// the audio stack supports.
+//
+// Audible — but quiet. Raw amplitude 1000 is ~3% of s16 full scale
+// (about -30 dB below peak). Long enough at 250 ms to perceive the
+// pitch, short enough that a startled engineer can shrug it off, and
+// quiet enough on a system at moderate volume to sound like a tap on
+// a cup rather than a buzz. To run an interactive audible version,
+// raise TEST_AMP towards 8000 (~ -12 dB) and TEST_MS to 2000 ms.
 
 import "bpp_io.bsm";
 import "stbaudio.bsm";
 
+const TEST_AMP = 1000;
+const TEST_MS  = 250;
+
 main() {
-    auto i, p, rc;
+    auto i, p, rc, cb;
 
-    // Lower the volume before the tone plays. dB scale matches how
-    // plugin UIs and mixers think — each -6 dB halves the amplitude,
-    // so values stack intuitively:
-    //   0 dB   = full scale (loud)
-    //   -12 dB = quarter amplitude (the old 8000 default)
-    //   -24 dB = 1/16 amp (comfortable background)
-    //   -36 dB = 1/64 amp (quiet)
-    //   -48 dB = 1/256 amp (very quiet)
-    // Swap to audio_set_volume(N) for a linear percent knob, or
-    // audio_set_amplitude(N) for raw s16 amplitude.
-    audio_set_volume_db(0 - 36);
+    audio_set_amplitude(TEST_AMP);
 
-    putmsg("starting tone...\n");
-    rc = audio_tone_test(440, 2000);
-    putmsg("audio_tone_test rc = ");
-    putnum(rc);
-    putline();
-
-    putmsg("ffi probes:\n");
-    for (i = 0; i < 7; i++) {
-        p = _stb_audio_fn_probe(i);
-        putmsg("  [");
-        putnum(i);
-        putmsg("] = ");
-        if (p == 0) { putmsg("NULL (unresolved)"); }
-        else { putnum(p); }
+    rc = audio_tone_test(440, TEST_MS);
+    if (rc != 0) {
+        putmsg("FAIL: audio_tone_test rc = ");
+        putnum(rc);
         putline();
+        return rc;
     }
 
-    putmsg("callback invocations = ");
-    putnum(_stb_audio_cb_count());
-    putline();
+    // Every FFI probe must be non-zero. Index 0 is the framework
+    // handle, 1..6 are the AudioQueue function pointers.
+    for (i = 0; i < 7; i++) {
+        p = _stb_audio_fn_probe(i);
+        if (p == 0) {
+            putmsg("FAIL: ffi probe ");
+            putnum(i);
+            putmsg(" unresolved");
+            putline();
+            return 10 + i;
+        }
+    }
 
-    return rc;
+    // The callback fires once per buffer; with 1024-frame buffers at
+    // 44100 Hz the rate is ~43 Hz, so 250 ms of runtime should yield
+    // at least 8 invocations. Anything less means CoreAudio took the
+    // queue but never drained from it.
+    cb = _stb_audio_cb_count();
+    if (cb < 8) {
+        putmsg("FAIL: cb_count = ");
+        putnum(cb);
+        putmsg(" (expected >= 8)");
+        putline();
+        return 20;
+    }
+
+    return 0;
 }
