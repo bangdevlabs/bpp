@@ -58,7 +58,12 @@ static auto _parser_struct_hash;
 static auto vt_names, vt_sidx;
 
 // Stack struct flag: tracks which variables are stack-allocated (via var keyword).
+// Two parallel arrays — name + function index — so a `var v: T` in
+// function A doesn't make a same-named `auto v` in function B look
+// stack-allocated. Function index is taken from `arr_len(funcs)` at
+// the moment the var is registered.
 static auto var_stack_names;
+static auto var_stack_fns;
 
 // Enum constant registry: 2 parallel dynamic arrays (packed_name, int_value).
 extrn ev_names, ev_values;
@@ -115,6 +120,7 @@ void init_parser() {
     vt_names = arr_new();
     vt_sidx = arr_new();
     var_stack_names = arr_new();
+    var_stack_fns = arr_new();
     ev_names = arr_new();
     ev_values = arr_new();
     cf_names = arr_new();
@@ -329,12 +335,21 @@ get_var_type(var_p) {
 // Mark a variable as stack-allocated (declared with var keyword).
 static void set_var_stack(var_p) {
     var_stack_names = arr_push(var_stack_names, var_p);
+    // Tag with the function currently being parsed so a same-named local
+    // in a different function doesn't get misclassified as stack.
+    // `func_cnt` is the index THIS function will receive — `funcs` is
+    // appended only after the body finishes parsing (parse_function
+    // line 1367), so during body parsing func_cnt is the upcoming index.
+    var_stack_fns = arr_push(var_stack_fns, func_cnt);
 }
 
-// Check if a variable is stack-allocated. Returns 1 if yes, 0 otherwise.
-is_var_stack(var_p) {
+// Check if a variable is stack-allocated within the given function index.
+// Returns 1 if yes, 0 otherwise. Function-scoped so `var v: T` in fn A
+// does not trigger memcpy semantics for an `auto v` in fn B.
+is_var_stack(var_p, fn_idx) {
     auto i;
     for (i = arr_len(var_stack_names) - 1; i >= 0; i--) {
+        if (arr_get(var_stack_fns, i) != fn_idx) { continue; }
         if (packed_eq(arr_get(var_stack_names, i), var_p)) { return 1; }
     }
     return 0;

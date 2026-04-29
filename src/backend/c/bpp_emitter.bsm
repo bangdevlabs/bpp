@@ -467,7 +467,7 @@ void emit_node(nd) {
 
     if (t == T_VAR) {
         // Stack struct: emit address of the local array.
-        if (is_var_stack(n.a)) {
+        if (is_var_stack(n.a, cur_fn_idx)) {
             out("((long long)(");
             print_p(n.a);
             out("))");
@@ -515,7 +515,7 @@ void emit_node(nd) {
         // Stack struct copy: b = a becomes memcpy(b, a, sizeof_struct).
         an = n.a;
         if (an.ntype == T_VAR) {
-            if (is_var_stack(an.a)) {
+            if (is_var_stack(an.a, cur_fn_idx)) {
                 auto _sidx, _fc;
                 _sidx = get_var_type(an.a);
                 _fc = (get_struct_size(_sidx) + 7) / 8;
@@ -776,6 +776,30 @@ void emit_node(nd) {
             out(")) = (float)(");
             if (cnt > 1) { emit_node(arr[1]); }
             out("))");
+            return;
+        }
+
+        // Built-in: getenv -> delegate to libc's getenv with casts.
+        // B++'s getenv signature is `getenv(name) -> long long`; libc's
+        // is `char* getenv(const char*)`. Cast at the call site so the
+        // type system stays clean. B++'s own bpp_io.bsm getenv that
+        // walks envp manually is shadowed in the C path because libc
+        // already does the same lookup natively.
+        if (emit_name_eq(name_p, "getenv", 6)) {
+            out("((long long)getenv((const char*)((uintptr_t)(");
+            if (cnt > 0) { emit_node(arr[0]); }
+            out("))))");
+            return;
+        }
+
+        // Built-in: envp_get(i) -> read i-th entry from environ.
+        // POSIX exposes the environment via `extern char** environ`,
+        // not a direct accessor. B++ programs use envp_get to walk
+        // entries; in the C path we emit the equivalent indexed read.
+        if (emit_name_eq(name_p, "envp_get", 8)) {
+            out("((long long)environ[(");
+            if (cnt > 0) { emit_node(arr[0]); }
+            out(")])");
             return;
         }
 
@@ -1448,6 +1472,13 @@ void emit_reg(reg, val) {
 // Emit the syscall runtime: bpp_sys_write, bpp_sys_read, bpp_sys_open, bpp_sys_close.
 void emit_runtime() {
     out("// B++ I/O runtime — raw syscalls."); putchar('\n');
+
+    // POSIX `environ` global — used by the envp_get builtin handler.
+    // Declared explicitly so the binding resolves regardless of which
+    // header the host pulls in (Linux exposes it via unistd.h, macOS via
+    // crt_externs.h or _NSGetEnviron — straight extern works on both).
+    out("extern char** environ;"); putchar('\n');
+
 
     // Use libc wrappers instead of inline asm. The C emitter already links libc
     // (malloc, free, fork, etc.), and inline asm syscalls break under -O2 because
