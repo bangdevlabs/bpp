@@ -1,0 +1,48 @@
+// bpp_thread.bsm — Portable worker-thread API.
+//
+// Abstract layer around per-OS thread spawn / join primitives.
+// `bpp_job.bsm` and `bpp_maestro.bsm` build their worker pool on top
+// of these — they never call pthread / clone / CreateThread directly,
+// so the rest of the runtime stays platform-agnostic.
+//
+// The abstract layer owns:
+//   - the `tid` buffer alloc / free dance (so the platform call only
+//     gets a `tid_buf` pointer it can write into)
+//   - the "0 on failure" return convention (per platform translates
+//     its native error code into 0)
+//
+// The platform primitives (in `_core_<os>.bsm` Section 3) own:
+//   - `_thread_spawn(tid_buf, start_fn, arg)` — kicks off the thread,
+//     returns 0 on success, non-zero on failure. macOS uses
+//     pthread_create through libSystem; Linux is currently a stub
+//     until ELF dynamic linking lands and we can link libpthread.
+//   - `_thread_wait(tid)` — blocks until the thread exits. Returns 0
+//     on success.
+//
+// The B++ thread entry point must have the `long long(long long)`
+// signature — the bridge to pthread's `void*(void*)` is bit-compatible
+// because both ABIs pass the first argument in x0 / rdi and return in
+// x0 / rax for one-arg / one-return functions. Validated by
+// `tests/test_thread.bpp`.
+//
+// Auto-injected by the compiler. Programs do not need to import.
+
+// Spawn a new worker thread. `start_fn` is a B++ function pointer;
+// `arg` is the single 64-bit value passed to it. Returns the platform
+// thread handle on success, or 0 on failure.
+_stb_thread_create(start_fn, arg) {
+    auto tid_buf, rc, tid;
+    tid_buf = malloc(8);
+    *tid_buf = 0;
+    rc = _thread_spawn(tid_buf, start_fn, arg);
+    if (rc != 0) { free(tid_buf); return 0; }
+    tid = *tid_buf;
+    free(tid_buf);
+    return tid;
+}
+
+// Block until the given thread exits and reap its resources.
+// Returns 0 on success, non-zero on error.
+_stb_thread_join(tid) {
+    return _thread_wait(tid);
+}
