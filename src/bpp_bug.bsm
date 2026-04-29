@@ -62,14 +62,21 @@ void bug_write_agnostic() {
             bo_write_u8(get_fn_par_type(i, j));
         }
 
-        // Locals: count, then (name, type) pairs from the persistent
-        // variable table built by the type inference pass.
+        // Locals: count, then (name, type, struct_sid) tuples. The
+        // struct-id slot is 1-based (0 = no struct annotation) so the
+        // bug viz can dispatch struct expansion only when it has
+        // metadata. Lookup goes through get_var_type, which returns
+        // -1 for non-struct vars; the +1 normalises the sentinel.
         cnt = arr_get(fn_vt_cnts, i);
         block = arr_get(fn_vt_data, i);
         bo_write_u16(cnt);
         for (j = 0; j < cnt; j++) {
-            bo_write_str(block[j * 2]);
+            auto _l_name, _l_sid;
+            _l_name = block[j * 2];
+            bo_write_str(_l_name);
             bo_write_u8(block[j * 2 + 1]);
+            _l_sid = get_var_type(_l_name);
+            bo_write_u16(_l_sid + 1);
         }
 
         // Return type.
@@ -111,7 +118,7 @@ void bug_write_agnostic() {
     bo_write_u16(glob_cnt);
 
     for (i = 0; i < glob_cnt; i++) {
-        auto gname_p, gl_idx, gj;
+        auto gname_p, gl_idx, gj, gsid;
         gname_p = arr_get(globals, i);
         bo_write_str(gname_p);
         bo_write_u8(ty_get_global_type(gname_p));
@@ -121,6 +128,13 @@ void bug_write_agnostic() {
             if (cg_str_eq_packed(gname_p, arr_get(cg_gl_name, gj))) { gl_idx = gj; }
         }
         bo_write_u32(gl_idx * 8);
+        // Struct-id slot. 1-based so 0 reads as "no struct annotation".
+        // The same lookup that backs `auto p: Player; p.field` also
+        // backs `global g: Player`; both paths funnel through
+        // get_var_type, which returns -1 when the name has no struct
+        // annotation.
+        gsid = get_var_type(gname_p);
+        bo_write_u16(gsid + 1);
     }
 
     // -- Section: EXTERNS --------------------------------------
@@ -287,10 +301,19 @@ void bug_save(out_path, target) {
     // Reset the serialization buffer and write the file header.
     bo_reset();
 
-    // Header: magic "BG" + version 1 + target architecture.
+    // Header: magic "BG" + version 2 + target architecture.
+    //
+    // Version 2 (2026-04-29) extends every local and global record
+    // with a u16 struct-id slot (0 = not a struct, otherwise the
+    // 1-based sid into the STRUCTS section). Bug viz Phase 2 walks
+    // struct-typed fields when the slot is non-zero. Older readers
+    // that expect version 1 will mis-parse the locals section after
+    // the first record because the layout grew by 2 bytes per local.
+    // .bug files are rebuilt from source on every compile, so no
+    // migration path is needed.
     bo_write_u8(66);
     bo_write_u8(71);
-    bo_write_u8(1);
+    bo_write_u8(2);
     bo_write_u8(target);
 
     // Part 1: platform-agnostic data (functions, structs, globals, externs, source map).

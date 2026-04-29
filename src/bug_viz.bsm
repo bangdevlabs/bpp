@@ -135,6 +135,54 @@ static _viz_emit_float(val)@io {
     out_ch(')');
 }
 
+// Walk a struct pointer's fields and emit each on its own indented
+// line. `val` is the runtime pointer (heap or stack address) inside
+// the tracee; the walker reads each field at `val + field_offset`
+// via gdb_read_mem and recurses with viz_format on the field value
+// so nested structs / pointers / floats render through the same
+// dispatch.
+//
+// Arguments:
+//   val   — pointer to the struct instance in tracee memory.
+//   sid   — 1-based struct id (from bug_fn_lsids / bug_gl_sid). The
+//           caller must guard sid > 0 before invoking; this helper
+//           does not check.
+//   depth — recursion depth at the call site. Each field emits at
+//           depth + 1 so VIZ_DEPTH_MAX caps runaway expansion.
+static _viz_struct(val, sid, depth)@io {
+    auto sx, fc, fnames, foffs, ftypes;
+    auto fi, fname, foff, fty, fval;
+    sx     = sid - 1;
+    if (sx < 0)              { out_hex(val); return; }
+    if (sx >= bug_st_count)  { out_hex(val); return; }
+    if (val == 0) {
+        out_str("(null) ");
+        out_hex(val);
+        return;
+    }
+    fc     = arr_get(bug_st_fcnt,   sx);
+    fnames = arr_get(bug_st_fnames, sx);
+    foffs  = arr_get(bug_st_foffs,  sx);
+    ftypes = arr_get(bug_st_ftypes, sx);
+    out_hex(val);
+    for (fi = 0; fi < fc; fi++) {
+        fname = fnames[fi];
+        foff  = foffs[fi];
+        fty   = ftypes[fi];
+        fval  = gdb_read_mem(val + foff, 8);
+        out_nl();
+        // Indent two extra spaces per recursion level so nested
+        // structs read as a tree.
+        out_str("      ");
+        auto di;
+        for (di = 0; di < depth; di++) { out_str("  "); }
+        out_str(".");
+        out_packed(fname);
+        out_str(" = ");
+        viz_format(fval, fty, 0, depth + 1, val + foff);
+    }
+}
+
 // Top-level type-aware formatter. Replaces the inline integer +
 // manual-hex block at the watch-loop call sites in
 // bug_observe_<os>.bsm.
@@ -144,17 +192,29 @@ static _viz_emit_float(val)@io {
 //   ty        — type byte from bug_fn_ltypes / bug_gl_type. Pass 0
 //               or TY_UNK (0x0C) when the type is unknown; the
 //               formatter falls back to primitive int + hex output.
+//   sid       — 1-based struct id when the watched local / global
+//               carries a `: StructName` annotation; 0 otherwise.
+//               Non-zero takes priority over `ty`: the formatter
+//               walks fields instead of dispatching on the type
+//               byte. Pass 0 from call sites that have no struct
+//               metadata.
 //   depth     — current recursion depth at the call site (start at 0).
-//               Reserved for v2 struct / array expansion; the v1
-//               formatter does not recurse but accepts the parameter
-//               so the call shape stays stable across versions.
-//   base_addr — address from which `val` was read. Reserved for v2;
-//               struct expansion will compute field locations as
-//               base_addr + field_offset. Pass 0 when not applicable.
-viz_format(val, ty, depth, base_addr: word)@io {
+//               Bumped by `_viz_struct` when expanding fields.
+//   base_addr — address from which `val` was read. Reserved for
+//               future expansion paths (heap-array dereferencing,
+//               pointer-to-struct flattening). Pass 0 when not
+//               applicable.
+viz_format(val, ty, sid, depth, base_addr: word)@io {
     auto bt;
     if (depth > VIZ_DEPTH_MAX) {
         out_str("...");
+        return;
+    }
+    // Struct-id wins over type-byte dispatch when present. The
+    // struct walker emits the address inline and then drops into
+    // a per-field listing on the following lines.
+    if (sid > 0) {
+        _viz_struct(val, sid, depth);
         return;
     }
     // is_float_type from bpp_defs.bsm: bit 0 of the type byte. Kept
