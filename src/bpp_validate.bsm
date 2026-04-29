@@ -226,6 +226,38 @@ static void _val_build_extern_hash() {
     }
 }
 
+// E223: a name cannot serve as both an `extrn`-declared global and a
+// defined function. The native backend tolerates the duplicate because
+// it resolves call sites through the function table and ignores the
+// extrn entry, but C — the language B++ targets through the C emitter
+// and exposes through FFI — has a single namespace where a symbol is
+// either a variable or a function, never both. Catching the conflict
+// here keeps B++'s symbol surface compatible with C/Unix linker rules.
+//
+// The fix at the source side is almost always to delete the stale
+// `extrn X;` declaration: cross-module function calls in B++ resolve
+// through the function table, so the forward declaration was never
+// load-bearing.
+static void _val_check_extrn_func_collision() {
+    auto i, name_p;
+    for (i = 0; i < glob_cnt; i++) {
+        if (arr_get(glob_class, i) == GLOB_EXTRN) {
+            name_p = globals[i];
+            if (val_find_func(name_p) >= 0) {
+                diag_error(223);
+                diag_str("'");
+                diag_packed(name_p);
+                diag_str("' is declared as `extrn` (global) but also defined as a function — a symbol cannot occupy both namespaces in C/FFI builds");
+                diag_newline();
+                diag_help("delete the `extrn ");
+                diag_packed(name_p);
+                diag_str(";` declaration; cross-module function calls resolve through the function table without a forward declaration");
+                diag_newline();
+            }
+        }
+    }
+}
+
 // Look up a function by packed name. O(1) via the hash; falls back to
 // returning -1 if absent. The +1/-1 dance compensates for hash_str_get
 // returning 0 for absent keys.
@@ -756,6 +788,7 @@ void run_validate() {
     auto i, rec, body_arr, body_cnt, hints, h, j, params_arr, param_cnt;
     _val_build_func_hash();
     _val_build_extern_hash();
+    _val_check_extrn_func_collision();
     for (i = 0; i < func_cnt; i++) {
         rec = funcs[i];
         body_arr = *(rec + FN_BODY);
