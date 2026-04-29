@@ -223,9 +223,31 @@ void set_func_type(name_p, ty) {
     ft_types = arr_push(ft_types, ty);
 }
 
+// Return the inferred type for a known builtin call, or 0 when the name
+// is not one of the builtins handled here. The codegen lowers each of
+// these inline (see `bpp_codegen.bsm` and the chip primitives), so they
+// never appear in the regular function table — without this lookup the
+// type checker would see TY_WORD for every call and silently corrupt
+// any expression that expects a float result.
+static _builtin_ret_type(name_p)@base {
+    auto fn_s, fn_l;
+    fn_s = unpack_s(name_p);
+    fn_l = unpack_l(name_p);
+    // Floating-point pointer reads. peekfloat returns a 64-bit IEEE
+    // double, peekfloat_h widens a 32-bit float load (LDR S + FCVT D
+    // on ARM64) into the same arithmetic-friendly double slot.
+    if (fn_l == 9  && buf_eq(vbuf + fn_s, "peekfloat",   9))  { return TY_FLOAT; }
+    if (fn_l == 11 && buf_eq(vbuf + fn_s, "peekfloat_h", 11)) { return TY_FLOAT_H; }
+    return 0;
+}
+
 // Look up a function return type by packed name. Returns TY_WORD if not found.
+// Builtins are checked first so a missing or stale entry in `ft_names`
+// cannot mask a known float-returning builtin as an integer.
 func_type(name_p) {
-    auto i;
+    auto i, bt;
+    bt = _builtin_ret_type(name_p);
+    if (bt != 0) { return bt; }
     for (i = 0; i < arr_len(ft_names); i++) {
         if (packed_eq(arr_get(ft_names, i), name_p)) {
             return arr_get(ft_types, i);
@@ -603,6 +625,17 @@ infer_one_func(func_idx) {
 
     ty_reset_scope();
     ty_cur_ret = TY_UNK;
+
+    // Honor explicit return-type annotation: `fn(): half float { ... }`
+    // sets fn_ret_hint[func_idx] in the parser. When present, seed
+    // ty_cur_ret with the hint so the type checker doesn't widen
+    // float-half returns to plain float (which silently truncates the
+    // 32-bit IEEE bits to 64-bit on the way out).
+    auto _rh;
+    _rh = arr_get(fn_ret_hint, func_idx);
+    if (_rh != 0 && _rh != TY_UNK) {
+        ty_cur_ret = _rh;
+    }
 
     // Register parameters with their current known types.
     // Explicit primitive type hints from the programmer always take priority,
