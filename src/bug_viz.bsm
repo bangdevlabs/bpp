@@ -1,0 +1,200 @@
+// bug_viz.bsm — Type-aware value formatter for the bug debugger.
+//
+// Replaces phase-1's raw "name = <decimal> (0x<hex>)" output in
+// _print_crash_locals with type-aware formatting:
+//
+//   - Float types (TY_FLOAT family) print the IEEE-754 bit pattern
+//     instead of the int reinterpretation, so the user sees the
+//     actual value the program stored.
+//   - Pointer types (TY_PTR) hex-print the address and probe the
+//     first four bytes; printable ASCII renders as a string preview
+//     alongside the address.
+//   - Primitive ints fall through to the existing decimal + hex
+//     companion shape that phase 1 already emitted.
+//
+// Struct expansion (TY_STRUCT) and dynamic-array unpacking
+// (TY_ARR) are reserved for v2 — they require a `.bug` format
+// extension that records layout metadata. The depth_max guard
+// here is in place for that future expansion path.
+//
+// All output flows through the bug binary's `out_*` family
+// (defined in bug.bpp) so the formatter shares the crash
+// handler's stdout pipe and indentation conventions.
+
+// Cross-module function calls resolve through B++'s function table
+// without `extrn` declarations — the names below (`out_str`,
+// `out_int`, `out_ch`, `out_nl`, `out_hex` from bug.bpp;
+// `gdb_read_mem` from bug_observe_<os>.bsm) are linked at validate
+// time. Adding `extrn` declarations here would trigger E223 (a
+// symbol cannot be both an `extrn` global and a defined function in
+// the C/FFI namespace).
+
+// String detection threshold. Pointers below this address are almost
+// always small integers that happen to land in the low memory range,
+// not real string targets. Probing them would segfault the debugger.
+const VIZ_PTR_MIN = 0x1000;
+
+// String preview cap. When a value looks like a pointer to a
+// printable string, render at most this many characters before
+// truncating with "...".
+const VIZ_STR_PREVIEW = 32;
+
+// Maximum recursion depth for struct / array expansion (v2). Guards
+// against pathological nested types or accidental string detection
+// on a pointer that lives inside a struct field. Phase 2 v1 only
+// recurses on container types it does not yet know how to walk, so
+// this cap is dormant until v2.
+const VIZ_DEPTH_MAX = 2;
+
+// Heuristic: the first four bytes at `addr` look like a printable
+// ASCII string. Returns 1 when every byte is in [0x20, 0x7E].
+// Returns 0 when addr is below VIZ_PTR_MIN or any byte is outside
+// the printable range.
+//
+// Known false positive: an integer like 0x20202020 (four spaces) or
+// any value where each byte happens to land in the printable range
+// will render as a "→ \"....\"" preview. v2 should bias this on
+// `ty == TY_PTR` before invoking — the v1 caller already does the
+// type check, so the false positive is only reachable via raw
+// numeric values that incidentally pass the byte filter.
+static _viz_looks_like_string(addr)@io {
+    auto b0, b1, b2, b3;
+    if (addr < VIZ_PTR_MIN) { return 0; }
+    b0 = gdb_read_mem(addr,     1) & 0xFF;
+    b1 = gdb_read_mem(addr + 1, 1) & 0xFF;
+    b2 = gdb_read_mem(addr + 2, 1) & 0xFF;
+    b3 = gdb_read_mem(addr + 3, 1) & 0xFF;
+    if (b0 < 0x20) { return 0; }
+    if (b0 >= 0x7F) { return 0; }
+    if (b1 < 0x20) { return 0; }
+    if (b1 >= 0x7F) { return 0; }
+    if (b2 < 0x20) { return 0; }
+    if (b2 >= 0x7F) { return 0; }
+    if (b3 < 0x20) { return 0; }
+    if (b3 >= 0x7F) { return 0; }
+    return 1;
+}
+
+// Append a single hex nybble to stdout. Helper for the inline
+// escape path below.
+static _viz_emit_nybble(d)@io {
+    if (d < 10) { out_ch('0' + d); }
+    else        { out_ch('a' + d - 10); }
+}
+
+// Print a string preview after the address. Stops at the first null
+// byte or after VIZ_STR_PREVIEW characters, whichever comes first.
+// Non-printable bytes inside the preview window are escaped as
+// "\xNN" so the output stays on one line.
+static _viz_emit_string(addr)@io {
+    auto i, ch, hit_null;
+    out_str(" -> \"");
+    hit_null = 0;
+    for (i = 0; i < VIZ_STR_PREVIEW; i++) {
+        ch = gdb_read_mem(addr + i, 1) & 0xFF;
+        if (ch == 0) { hit_null = 1; break; }
+        if (ch >= 0x20 && ch < 0x7F) {
+            out_ch(ch);
+        } else {
+            out_str("\\x");
+            _viz_emit_nybble((ch >> 4) & 0xF);
+            _viz_emit_nybble(ch & 0xF);
+        }
+    }
+    out_ch('"');
+    if (hit_null == 0) { out_str("..."); }
+}
+
+// Scratch slot for bit-cast reinterpretation. The 8-byte value read
+// from the tracee arrives as a `word`; B++ has no direct
+// bits-to-float operator, so the formatter pokes the integer bytes
+// into this fixed buffer and peekfloats them back as a double.
+static auto _viz_float_scratch;
+
+// Format a float as a decimal number. Reinterprets `val`'s bit
+// pattern as an IEEE-754 double — going through the integer with
+// `auto f: float; f = val;` would lose the pattern through B++'s
+// implicit FCVTZS int-to-float coercion at the assignment.
+//
+// Output shape: `<decimal> (ieee 0x<hex>)` so the reader sees both
+// the human-friendly value and the exact bit pattern in case
+// rounding hides something interesting (NaNs, denormals, sign of
+// zero).
+static _viz_emit_float(val)@io {
+    auto i, d;
+    auto f: float;
+    if (_viz_float_scratch == 0) { _viz_float_scratch = malloc(8); }
+    poke_w(_viz_float_scratch, val);
+    f = peekfloat(_viz_float_scratch);
+    putfloat(f);
+    out_str(" (ieee 0x");
+    for (i = 60; i >= 0; i -= 4) {
+        d = (val >> i) & 0xF;
+        _viz_emit_nybble(d);
+    }
+    out_ch(')');
+}
+
+// Top-level type-aware formatter. Replaces the inline integer +
+// manual-hex block at the watch-loop call sites in
+// bug_observe_<os>.bsm.
+//
+// Arguments:
+//   val       — raw 8-byte value read from the watched location.
+//   ty        — type byte from bug_fn_ltypes / bug_gl_type. Pass 0
+//               or TY_UNK (0x0C) when the type is unknown; the
+//               formatter falls back to primitive int + hex output.
+//   depth     — current recursion depth at the call site (start at 0).
+//               Reserved for v2 struct / array expansion; the v1
+//               formatter does not recurse but accepts the parameter
+//               so the call shape stays stable across versions.
+//   base_addr — address from which `val` was read. Reserved for v2;
+//               struct expansion will compute field locations as
+//               base_addr + field_offset. Pass 0 when not applicable.
+viz_format(val, ty, depth, base_addr: word)@io {
+    auto bt;
+    if (depth > VIZ_DEPTH_MAX) {
+        out_str("...");
+        return;
+    }
+    // is_float_type from bpp_defs.bsm: bit 0 of the type byte. Kept
+    // inline so this module does not depend on the compiler's type
+    // table import chain.
+    if ((ty & 1) != 0) {
+        _viz_emit_float(val);
+        return;
+    }
+    bt = ty & 0xF;
+    if (bt == 0x4) {
+        // Explicit pointer type — hex address plus the string preview
+        // when the bytes at the target look printable.
+        out_hex(val);
+        if (_viz_looks_like_string(val)) {
+            _viz_emit_string(val);
+        }
+        return;
+    }
+    // Primitive fallback: signed decimal + companion hex. Same shape
+    // as phase 1's locals path, kept consistent so the watch list
+    // for non-typed values reads identically before and after the
+    // upgrade.
+    out_int(val);
+    out_str(" (");
+    out_hex(val);
+    out_str(")");
+    // Opportunistic string preview for un-annotated globals. When a
+    // TY_WORD / TY_UNK slot holds a value that looks like a real
+    // high address (>= 0x100000000 — covers macOS __TEXT/__cstring
+    // and Linux ELF .rodata mappings) AND the first four bytes are
+    // printable ASCII, render the preview. Skips when the value
+    // could plausibly be a small positive integer or any negative
+    // number, where the address heuristic is unsafe.
+    //
+    // The same false-positive caveat as the explicit-pointer path
+    // applies: a numeric value of 0x20202020 prints as "→ \"    \"".
+    // The high-address gate above filters most accidents because real
+    // small-int locals rarely store values that high.
+    if (val >= 0x100000000 && _viz_looks_like_string(val)) {
+        _viz_emit_string(val);
+    }
+}
