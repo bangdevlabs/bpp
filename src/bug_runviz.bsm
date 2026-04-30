@@ -1,0 +1,478 @@
+// bug_runviz.bsm — Runtime visualizers for the bug debugger.
+//
+// Phase 5 of the bug viz roadmap. Where bug_viz.bsm renders a
+// single value as one line of text (decimal + hex + string preview),
+// bug_runviz takes a value plus a `kind` hint and renders it as a
+// multi-line ASCII picture: a bar chart, a 2D dot map, eventually
+// an image preview.
+//
+// The user types `v <expr> <kind> [params]` at the TUI prompt to
+// add a visualizer. The entry persists across breakpoint hits, the
+// same way watches do, so each stop re-renders the picture against
+// the latest tracee state.
+//
+// Why runtime instead of `// @viz:` source annotations: tu pausa,
+// vê o nome no watch list, decide na hora "isso é uma série
+// temporal — desenha como gráfico". No recompile cycle, no source
+// pollution, no need to predict ahead of time which buffers are
+// worth visualizing. A future v2 can add `@viz:` comments as a
+// "save my preference" mechanism on top of the runtime API; the
+// runtime path is the primary surface.
+//
+// Commands wired in by bug_tui.bsm:
+//
+//   v <expr> graph <N>     — render N consecutive floats at &expr
+//                            as a single-row Unicode bar chart
+//   v <expr> vec2          — render two floats at &expr as a dot
+//                            on a small ASCII grid
+//   lv                     — list active visualizers
+//   uv <idx>               — remove visualizer at index
+//
+// Out of scope for v1 (runs ASCII only, no GPU panel):
+//   - rgba(w,h) image preview   — needs framebuffer downsampling
+//   - Bang 9 panel rendering    — needs the_bug_lib integration
+//
+// Both land in v2; the runtime command vocabulary stays the same so
+// existing `v` entries keep working when the GPU renderer attaches.
+
+import "bpp_io.bsm";
+
+// ── Visualizer kinds ──────────────────────────────────────────
+
+const VIZ_KIND_GRAPH = 1;   // bar chart of N floats
+const VIZ_KIND_VEC2  = 2;   // 2D point in a small ASCII grid
+const VIZ_KIND_RGBA  = 3;   // RGBA bitmap downsampled to ANSI true-color
+
+// Render-time caps. Larger values still parse, but the renderer
+// truncates to keep the terminal output readable.
+const VIZ_GRAPH_MAX = 64;   // max bars per graph row
+const VIZ_VEC2_W    = 21;   // grid width  (odd number for centering)
+const VIZ_VEC2_H    = 9;    // grid height (odd number for centering)
+const VIZ_RGBA_OUT_W = 48;  // downsample width in terminal cells
+const VIZ_RGBA_OUT_H = 24;  // downsample height in terminal rows
+
+// Scratch buffer for the integer→float bit reinterpretation. B++
+// has no `bits_to_float` operator: storing an int into a float
+// local fires FCVTZS and converts the value (22 becomes 22.0,
+// not the IEEE bits of 22.5). The fix is the same pattern used by
+// bug_viz._viz_emit_float — poke the 8 bytes into memory, then
+// peekfloat them back.
+static auto _viz_float_scratch;
+
+// ── Visualizer table ──────────────────────────────────────────
+// Parallel arrays the same way the watch list does it; entries
+// are appended by the TUI and re-rendered before each prompt.
+
+const VIZ_MAX = 16;
+
+global viz_texts;   // buf_word(VIZ_MAX) — original C-string typed at the prompt
+global viz_asts;    // buf_word(VIZ_MAX) — parsed AST root from bug_eval_parse
+global viz_kinds;   // buf_word(VIZ_MAX) — VIZ_KIND_* code
+global viz_p1;      // buf_word(VIZ_MAX) — first kind parameter (graph: count)
+global viz_p2;      // buf_word(VIZ_MAX) — second kind parameter (reserved)
+global viz_count;   // number of active entries
+
+void init_bug_runviz()@io {
+    viz_texts = buf_word(VIZ_MAX);
+    viz_asts  = buf_word(VIZ_MAX);
+    viz_kinds = buf_word(VIZ_MAX);
+    viz_p1    = buf_word(VIZ_MAX);
+    viz_p2    = buf_word(VIZ_MAX);
+    viz_count = 0;
+    _viz_float_scratch = malloc(8);
+}
+
+// Replay every `// @viz <text>` annotation captured in the .bug
+// file as if the user had typed it at the TUI prompt. Called from
+// bug.bpp once the .bug map has been parsed and the runtime viz
+// table is initialised. Each hint goes through the same parser
+// (_tui_handle_v) the runtime command uses so source and
+// interactive paths share the same grammar.
+void viz_replay_hints()@io {
+    auto i, txt;
+    if (bug_vh_count == 0) { return; }
+    for (i = 0; i < bug_vh_count; i++) {
+        txt = arr_get(bug_vh_texts, i);
+        // _tui_handle_v expects a NUL-terminated C-string and
+        // tolerates leading whitespace. The reader already
+        // null-terminates each payload, so this is direct.
+        _tui_handle_v(txt);
+    }
+}
+
+// Reinterpret an 8-byte integer as an IEEE-754 double WITHOUT
+// FCVTZS. The path is mandatory anywhere we read float bits from
+// gdb_read_mem (or any int-typed source) and want to preserve the
+// pattern — direct `auto f: float; f = int_val;` triggers
+// int-to-float conversion at the assignment. Returning a float
+// across a function boundary has the same hazard (the return
+// value is type-coerced), so this helper is inlined at each call
+// site by writing into _viz_float_scratch and reading via
+// peekfloat in the caller's scope.
+
+// ── Helpers ────────────────────────────────────────────────────
+
+// Decode a 64-bit IEEE-754 double into its two integer components
+// for downstream comparisons. Returns 1 if the bit pattern is a
+// finite, non-NaN double; 0 otherwise. The returned `f` is a
+// B++ float local — the callers feed it straight into the put_err
+// formatter or arithmetic-on-floats path.
+//
+// Used by the graph and vec2 renderers to detect bogus reads
+// (uninitialised memory often shows up as 0xFFFFFFFFFFFFFFFF, a
+// quiet NaN) so the picture degrades gracefully instead of
+// printing "NaN NaN NaN" forever.
+static _viz_is_finite(bits)@base {
+    auto exp;
+    exp = (bits >> 52) & 0x7FF;
+    if (exp == 0x7FF) { return 0; }  // inf or NaN
+    return 1;
+}
+
+// Convert a float to an integer index in [0, n) by linear remap
+// from [lo, hi]. Clamps to the endpoints. Returns -1 when lo == hi
+// (caller falls back to mid-grid). Param hints carry the float
+// representation across the call boundary so the bit pattern
+// survives without an int reinterpretation.
+static _viz_remap(f: float, lo: float, hi: float, n: word)@base {
+    auto idx: word;
+    if (hi == lo) { return -1; }
+    // Float→int truncation is intentional here: we want a clamped
+    // integer slot for the renderer's bar / cell index. The `: word`
+    // hint opts in to FCVTZS so E232 doesn't fire.
+    idx = ((f - lo) * (n - 1)) / (hi - lo);
+    if (idx < 0)      { return 0; }
+    if (idx >= n)     { return n - 1; }
+    return idx;
+}
+
+// ── Graph renderer ────────────────────────────────────────────
+
+// Render `count` consecutive 8-byte float slots starting at `addr`
+// as a single-row bar chart using Unicode block characters.
+// Auto-scales: lowest sample becomes the empty space, highest
+// sample becomes the full block. Skips silently when `addr` is
+// zero, when count is invalid, or when no samples are finite
+// (uninitialised memory degrades to a "[--]" placeholder rather
+// than a row of NaN bars).
+void viz_render_graph(addr, count)@io {
+    auto i, bits;
+    auto lo: float;
+    auto hi: float;
+    auto sample: float;
+    auto seen, finite;
+    auto level: word;
+    if (addr == 0)       { out_str("    [no addr]"); out_nl(); return; }
+    if (count <= 0)      { out_str("    [count <= 0]"); out_nl(); return; }
+    if (count > VIZ_GRAPH_MAX) { count = VIZ_GRAPH_MAX; }
+
+    seen = 0;
+    lo = 0.0;
+    hi = 0.0;
+    for (i = 0; i < count; i++) {
+        bits   = gdb_read_mem(addr + i * 8, 8);
+        finite = _viz_is_finite(bits);
+        if (finite) {
+            // Reinterpret int bits as IEEE-754 double via memory.
+            // Direct `sample = bits` would FCVTZS-convert.
+            poke_w(_viz_float_scratch, bits);
+            sample = peekfloat(_viz_float_scratch);
+            if (seen == 0) {
+                lo = sample;
+                hi = sample;
+                seen = 1;
+            } else {
+                if (sample < lo) { lo = sample; }
+                if (sample > hi) { hi = sample; }
+            }
+        }
+    }
+    if (seen == 0) { out_str("    [no finite samples]"); out_nl(); return; }
+
+    out_str("    ");
+    for (i = 0; i < count; i++) {
+        bits   = gdb_read_mem(addr + i * 8, 8);
+        finite = _viz_is_finite(bits);
+        if (finite == 0) {
+            out_ch('?');
+        } else {
+            poke_w(_viz_float_scratch, bits);
+            sample = peekfloat(_viz_float_scratch);
+            level  = _viz_remap(sample, lo, hi, 8);
+            if (level < 0) { level = 4; }
+            // Eight Unicode bar levels: ▁ ▂ ▃ ▄ ▅ ▆ ▇ █.
+            // Each codepoint is three bytes in UTF-8, all sharing
+            // the prefix 0xE2 0x96, with the third byte indexing
+            // the level. The terminal renders them as ascending
+            // partial blocks, so the row reads as a tiny histogram.
+            out_ch(0xE2);
+            out_ch(0x96);
+            out_ch(0x81 + level);
+        }
+    }
+    out_nl();
+
+    // Range footer so the user can read absolute values, not just
+    // the relative shape.
+    out_str("    range: ");
+    putfloat(lo);
+    out_str(" .. ");
+    putfloat(hi);
+    out_str("  (n=");
+    out_int(count);
+    out_str(")");
+    out_nl();
+}
+
+// ── Vec2 renderer ─────────────────────────────────────────────
+
+// Render two consecutive 8-byte floats at `addr` as a dot on a
+// small ASCII grid. The grid auto-fits both values: the dot lands
+// at the centre when both are zero, near the corner when both
+// max out. Useful for tracking a player position, a velocity
+// vector, anywhere the (x, y) shape carries debugging meaning.
+void viz_render_vec2(addr)@io {
+    auto bits_x, bits_y;
+    auto x: float;
+    auto y: float;
+    auto magx: float;
+    auto magy: float;
+    auto m: float;
+    auto col: word;
+    auto row: word;
+    auto r, c;
+    if (addr == 0) { out_str("    [no addr]"); out_nl(); return; }
+
+    bits_x = gdb_read_mem(addr,     8);
+    bits_y = gdb_read_mem(addr + 8, 8);
+    if (_viz_is_finite(bits_x) == 0) { out_str("    [x not finite]"); out_nl(); return; }
+    if (_viz_is_finite(bits_y) == 0) { out_str("    [y not finite]"); out_nl(); return; }
+
+    // Reinterpret int bits as IEEE-754 doubles (direct assignment
+    // would FCVTZS-convert).
+    poke_w(_viz_float_scratch, bits_x);
+    x = peekfloat(_viz_float_scratch);
+    poke_w(_viz_float_scratch, bits_y);
+    y = peekfloat(_viz_float_scratch);
+
+    // Pick a magnitude floor so a (0, 0) value still renders the
+    // origin dot rather than dividing by zero. The choice of 1.0
+    // keeps small values (|x|, |y| < 1) glued to centre — exactly
+    // what makes a "drift away from origin" visualization legible.
+    magx = x;
+    if (magx < 0) { magx = 0 - x; }
+    magy = y;
+    if (magy < 0) { magy = 0 - y; }
+    m = magx;
+    if (magy > m) { m = magy; }
+    if (m < 1.0)  { m = 1.0; }
+
+    // Map x → column, y → row. Y axis is inverted so positive y
+    // points UP (matching screen-space mental model). Half-width /
+    // half-height pinned to float-typed locals so the binop stays
+    // in the float lane the whole way through — mixing int with
+    // float in the same expression silently zeroes the float side
+    // in B++ when the int term is the dominant operand.
+    auto half_w: float;
+    auto half_h: float;
+    half_w = VIZ_VEC2_W / 2;
+    half_h = VIZ_VEC2_H / 2;
+    col = ((x / m) * half_w) + half_w;
+    row = half_h - ((y / m) * half_h);
+    if (col < 0)            { col = 0; }
+    if (col >= VIZ_VEC2_W)  { col = VIZ_VEC2_W - 1; }
+    if (row < 0)            { row = 0; }
+    if (row >= VIZ_VEC2_H)  { row = VIZ_VEC2_H - 1; }
+
+    for (r = 0; r < VIZ_VEC2_H; r++) {
+        out_str("    ");
+        for (c = 0; c < VIZ_VEC2_W; c++) {
+            if (r == row && c == col)                { out_ch('*'); }
+            else if (r == VIZ_VEC2_H / 2 && c == VIZ_VEC2_W / 2) { out_ch('+'); }
+            else if (r == VIZ_VEC2_H / 2)            { out_ch('-'); }
+            else if (c == VIZ_VEC2_W / 2)            { out_ch('|'); }
+            else                                     { out_ch('.'); }
+        }
+        out_nl();
+    }
+    out_str("    x=");
+    putfloat(x);
+    out_str("  y=");
+    putfloat(y);
+    out_str("  scale=");
+    putfloat(m);
+    out_nl();
+}
+
+// ── RGBA renderer ─────────────────────────────────────────────
+
+// Print a 1..3-digit decimal integer to stdout via the bug binary's
+// out_ch. Avoids re-importing bpp_io's putnum (which targets the
+// compiler's diag stream) and keeps the ANSI escape sequence
+// assembled byte-by-byte through one consistent output channel.
+static _viz_emit_dec(n)@io {
+    if (n < 0)   { out_ch('-'); n = 0 - n; }
+    if (n >= 10) { _viz_emit_dec(n / 10); }
+    out_ch('0' + (n % 10));
+}
+
+// Emit a "set background to 24-bit RGB + two spaces + reset" cell.
+// Two spaces because most monospace terminal cells are taller than
+// wide; doubling the width gives roughly square pixels. This is the
+// canonical "ANSI true-colour pixel" idiom used by image-preview
+// tools (catimg, viu, hiptext). Requires a terminal with 24-bit
+// colour support — iTerm2, kitty, alacritty, modern xterm, modern
+// Terminal.app all qualify.
+static _viz_emit_rgb_cell(r, g, b)@io {
+    out_ch(0x1B);
+    out_ch('[');
+    out_ch('4');
+    out_ch('8');
+    out_ch(';');
+    out_ch('2');
+    out_ch(';');
+    _viz_emit_dec(r & 0xFF);
+    out_ch(';');
+    _viz_emit_dec(g & 0xFF);
+    out_ch(';');
+    _viz_emit_dec(b & 0xFF);
+    out_ch('m');
+    out_ch(' ');
+    out_ch(' ');
+    // Reset attributes so the trailing newline doesn't leave the
+    // user's terminal painted with the last pixel's colour.
+    out_ch(0x1B);
+    out_ch('[');
+    out_ch('0');
+    out_ch('m');
+}
+
+// Render a w×h RGBA bitmap stored as `w*h*4` bytes at `addr`,
+// downsampled to a VIZ_RGBA_OUT_W × VIZ_RGBA_OUT_H grid of ANSI
+// true-colour cells. Each output cell averages the source pixels
+// inside its block, so a 320×180 framebuffer condenses to a 48×24
+// preview that fits in any reasonable terminal.
+//
+// Bytes per source pixel: 4 (R, G, B, A — alpha currently ignored,
+// rendered as straight RGB so a debugger preview always shows
+// SOMETHING even when the program forgot to write alpha=255).
+//
+// The block-averaging walks the source w×h; calling cost is
+// O(w*h) regardless of output size — the viz fires once per
+// breakpoint hit, so the fixed cost is fine for w*h up to a few
+// hundred thousand pixels (≈ 720p).
+void viz_render_rgba(addr, w, h)@io {
+    auto out_x, out_y;
+    auto sx: word;
+    auto sy: word;
+    auto src_x_start: word;
+    auto src_x_end: word;
+    auto src_y_start: word;
+    auto src_y_end: word;
+    auto sr, sg, sb, n;
+    auto px: word;
+    auto block_w: float;
+    auto block_h: float;
+    auto out_x_f: float;
+    auto out_y_f: float;
+    if (addr == 0) { out_str("    [no addr]"); out_nl(); return; }
+    if (w <= 0)    { out_str("    [w <= 0]"); out_nl(); return; }
+    if (h <= 0)    { out_str("    [h <= 0]"); out_nl(); return; }
+
+    block_w = w;
+    block_w = block_w / VIZ_RGBA_OUT_W;
+    block_h = h;
+    block_h = block_h / VIZ_RGBA_OUT_H;
+
+    for (out_y = 0; out_y < VIZ_RGBA_OUT_H; out_y++) {
+        out_y_f = out_y;
+        src_y_start = out_y_f * block_h;
+        out_y_f     = out_y + 1;
+        src_y_end   = out_y_f * block_h;
+        if (src_y_end <= src_y_start) { src_y_end = src_y_start + 1; }
+        if (src_y_end > h)            { src_y_end = h; }
+
+        out_str("    ");
+        for (out_x = 0; out_x < VIZ_RGBA_OUT_W; out_x++) {
+            out_x_f = out_x;
+            src_x_start = out_x_f * block_w;
+            out_x_f     = out_x + 1;
+            src_x_end   = out_x_f * block_w;
+            if (src_x_end <= src_x_start) { src_x_end = src_x_start + 1; }
+            if (src_x_end > w)            { src_x_end = w; }
+
+            // Average RGB over the source block. Each source pixel
+            // is 4 bytes (R, G, B, A) read individually so we don't
+            // have to assume tracee endianness.
+            sr = 0;
+            sg = 0;
+            sb = 0;
+            n  = 0;
+            for (sy = src_y_start; sy < src_y_end; sy++) {
+                for (sx = src_x_start; sx < src_x_end; sx++) {
+                    px = addr + (sy * w + sx) * 4;
+                    sr = sr + (gdb_read_mem(px,     1) & 0xFF);
+                    sg = sg + (gdb_read_mem(px + 1, 1) & 0xFF);
+                    sb = sb + (gdb_read_mem(px + 2, 1) & 0xFF);
+                    n++;
+                }
+            }
+            if (n == 0) { n = 1; }
+            _viz_emit_rgb_cell(sr / n, sg / n, sb / n);
+        }
+        out_nl();
+    }
+    out_str("    rgba "); out_int(w); out_str("x"); out_int(h);
+    out_str("  preview "); out_int(VIZ_RGBA_OUT_W); out_str("x"); out_int(VIZ_RGBA_OUT_H);
+    out_nl();
+}
+
+// ── Top-level dispatch ────────────────────────────────────────
+
+// Render every active visualizer. Called from the breakpoint hit
+// handler immediately after the watch list, so each prompt cycle
+// shows: the watches (single-line values) + the visualizers
+// (multi-line pictures). Returns silently when no entries are
+// active.
+void viz_render_all(fp, data_base, fi)@io {
+    auto i, ast, kind, addr;
+    if (viz_count == 0) { return; }
+    out_str("visualizers:"); out_nl();
+    for (i = 0; i < viz_count; i++) {
+        ast  = *(viz_asts  + i * 8);
+        kind = *(viz_kinds + i * 8);
+        out_str("  [");
+        out_int(i);
+        out_str("] ");
+        out_str(*(viz_texts + i * 8));
+        out_nl();
+
+        // Re-evaluate the AST every hit so the picture reflects the
+        // latest tracee state. The renderer needs a pointer to where
+        // the data lives in tracee memory; we treat the eval VALUE
+        // (not the eval ADDR) as that pointer. For `v buf graph 16`,
+        // `buf` is a pointer variable holding a heap address — the
+        // value IS the address of the float run. For struct locals,
+        // the user can write `v *(&pos) vec2` once `&` lands; until
+        // then, vec2 expects a pointer-typed variable too. Falling
+        // back to `addr` when `val == 0` keeps non-pointer locals
+        // semi-renderable (the slot address itself becomes the
+        // target — useful when the local IS the data, e.g. a struct
+        // assigned by value).
+        if (bug_eval_run(ast, fi, fp, data_base) < 0) {
+            out_str("    [eval error]"); out_nl();
+        } else {
+            addr = bug_eval_val;
+            if (addr == 0) { addr = bug_eval_addr; }
+            if (kind == VIZ_KIND_GRAPH) {
+                viz_render_graph(addr, *(viz_p1 + i * 8));
+            }
+            if (kind == VIZ_KIND_VEC2) {
+                viz_render_vec2(addr);
+            }
+            if (kind == VIZ_KIND_RGBA) {
+                viz_render_rgba(addr, *(viz_p1 + i * 8), *(viz_p2 + i * 8));
+            }
+        }
+    }
+}

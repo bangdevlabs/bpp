@@ -782,14 +782,40 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
                 if (has_bug && watch_count > 0) {
                     _print_crash_locals(fi, text_base, data_base);
                 }
+                // Render any active runtime visualizers. Multi-line
+                // pictures (graph, vec2) follow the single-line watch
+                // dump so the prompt redraws in the right order.
+                if (has_bug && viz_count > 0) {
+                    viz_render_all(gdb_read_fp(), data_base, fi);
+                }
                 call_depth++;
                 if (call_depth > 30) { call_depth = 30; }
             }
 
+            // Optional REPL: when --tui is on, drop into an
+            // interactive prompt where the user can add or list
+            // watches, set or clear breakpoints, single-step, or
+            // continue. The REPL returns one of TUI_CONT / TUI_STEP
+            // / TUI_QUIT and we honour the choice; TUI_QUIT cleanly
+            // tears down the debug session.
+            auto _tui_action;
+            _tui_action = 0;
+            if (flag_tui) {
+                _tui_action = bug_tui_repl(gdb_read_fp(), data_base, fi, text_base);
+                if (_tui_action == 0 - 1) {
+                    // User typed `q` — kill the tracee and exit
+                    // the debug loop.
+                    gdb_kill();
+                    running = 0;
+                }
+            }
+
             // Step past breakpoint.
-            gdb_remove_bp(pc);
-            gdb_step();
-            gdb_set_bp(pc);
+            if (running) {
+                gdb_remove_bp(pc);
+                gdb_step();
+                gdb_set_bp(pc);
+            }
 
         } else if (sig > 0) {
             // Fatal signal — crash report with backtrace and locals.
@@ -818,6 +844,12 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
 
                     // Print local variables if .bug file was loaded.
                     if (has_bug) { _print_crash_locals(fi, text_base, data_base); }
+                    // Render any active runtime visualizers so the
+                    // crash report shows the picture, not just the
+                    // raw value list.
+                    if (has_bug && viz_count > 0) {
+                        viz_render_all(gdb_read_fp(), data_base, fi);
+                    }
                 }
 
                 // Walk the frame pointer chain for a full backtrace.

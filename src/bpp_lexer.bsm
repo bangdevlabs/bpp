@@ -15,6 +15,18 @@ global src, src_len, pos;
 extrn tok_lines; global cur_line;
 extrn tok_src_off;   // Source buffer offset (outbuf position) for each token.
 
+// --- @viz: source annotations ---
+// Comment-time visualizer hints: `// @viz <expr> <kind> [params]`
+// captured by scan_comment, packed into a single buffer with a
+// parallel offset array, and emitted into the .bug file's
+// VIZ_HINTS section. The bug debugger replays them at startup as
+// runtime `v` commands so the user sees their picture without
+// retyping. Source-side persistence over the runtime API.
+global viz_hints_buf;       // raw text buffer (concatenated, NUL-separated)
+global viz_hints_pos;       // write head in viz_hints_buf
+global viz_hints_off;       // arr of offsets into viz_hints_buf, one per hint
+global viz_hints_count;     // number of hints captured
+
 // --- Shared globals (declared in bpp_parser.bsm) ---
 // toks     — token array, 262144 bytes, 24-byte records
 // tok_cnt  — number of tokens stored so far
@@ -192,7 +204,57 @@ static scan_comment() {
         // map stay aligned with the source file. Without the tick, a
         // file with N line comments reports every subsequent token as
         // N lines earlier than it really is.
+        //
+        // While we're here, sniff for an `@viz <text>` directive in
+        // the comment body. Format (after `// `): `@viz <expr> <kind>
+        // [params]`, e.g. `@viz framebuffer rgba 320 180`. The
+        // payload is captured verbatim and replayed by the bug
+        // debugger at startup, so the same parser the runtime `v`
+        // command uses also handles source-annotated hints.
         pos += 2;
+        // Skip leading spaces / tabs so `// @viz ...` and
+        // `//@viz ...` and `//  @viz ...` all match.
+        auto _ws_p;
+        _ws_p = pos;
+        while (_ws_p < src_len) {
+            auto _c;
+            _c = peek(src + _ws_p);
+            if (_c != ' ' && _c != 9) { break; }
+            _ws_p++;
+        }
+        if (_ws_p + 4 < src_len) {
+            if (peek(src + _ws_p)     == '@')
+            { if (peek(src + _ws_p + 1) == 'v')
+            { if (peek(src + _ws_p + 2) == 'i')
+            { if (peek(src + _ws_p + 3) == 'z')
+            {
+                auto _payload, _scan, _payload_end;
+                _payload = _ws_p + 4;
+                // Optional whitespace after `@viz` before the body.
+                while (_payload < src_len) {
+                    auto _pc;
+                    _pc = peek(src + _payload);
+                    if (_pc != ' ' && _pc != 9) { break; }
+                    _payload++;
+                }
+                _scan = _payload;
+                while (_scan < src_len) {
+                    if (peek(src + _scan) == 10) { break; }
+                    _scan++;
+                }
+                _payload_end = _scan;
+                // Trim trailing spaces / tabs.
+                while (_payload_end > _payload) {
+                    auto _tc;
+                    _tc = peek(src + _payload_end - 1);
+                    if (_tc != ' ' && _tc != 9) { break; }
+                    _payload_end--;
+                }
+                if (_payload_end > _payload) {
+                    _capture_viz_hint(_payload, _payload_end);
+                }
+            } } } }
+        }
         while (pos < src_len) {
             if (peek(src + pos) == 10) {
                 cur_line++;
@@ -517,6 +579,36 @@ void init_lexer() {
     // over a million tokens.
     tok_lines = malloc(8388608);
     tok_src_off = malloc(8388608);
+    // @viz hint table. 64 KB raw text + a small offsets array is
+    // enough for hundreds of hints across a typical compilation
+    // unit; programs hitting the cap can grow it as a one-line edit.
+    viz_hints_buf   = malloc(65536);
+    viz_hints_pos   = 0;
+    viz_hints_off   = arr_new();
+    viz_hints_count = 0;
+}
+
+// Scan a single `@viz <text>` payload starting just past the
+// magic prefix in a line comment. Copies the text up to (but not
+// including) the trailing newline into viz_hints_buf, NUL-
+// terminates, and records the start offset. Returns silently when
+// the buffer is full — viz hints are an opt-in nicety, never a
+// hard error.
+static _capture_viz_hint(start_pos, end_pos) {
+    auto i, ch, hint_start;
+    auto len;
+    len = end_pos - start_pos;
+    if (viz_hints_pos + len + 1 > 65536) { return; }
+    hint_start = viz_hints_pos;
+    for (i = 0; i < len; i++) {
+        ch = peek(src + start_pos + i);
+        poke(viz_hints_buf + viz_hints_pos, ch);
+        viz_hints_pos++;
+    }
+    poke(viz_hints_buf + viz_hints_pos, 0);
+    viz_hints_pos++;
+    viz_hints_off = arr_push(viz_hints_off, hint_start);
+    viz_hints_count++;
 }
 
 // Scan the entire source buffer and populate the token arrays.

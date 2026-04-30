@@ -1,0 +1,534 @@
+// bug_tui.bsm — Interactive REPL for the bug debugger.
+//
+// Phase 4 of the bug viz roadmap. When `bug --tui <prog>` is
+// active, every breakpoint hit and crash drops into a line-
+// buffered prompt instead of immediately resuming. The user can
+// add or list watches, set or list breakpoints, single-step,
+// continue, or quit. The watch list re-renders before the prompt
+// on every stop, giving a poor-man's watch pane without needing
+// raw-mode termios or signal handlers.
+//
+// Why line-buffered (and not full ANSI raw-mode TUI):
+//
+//   - The UX win of a real watch pane is mostly the persistent
+//     watch list at the top of the screen. Re-printing it before
+//     each prompt achieves the same effect with zero risk of
+//     leaving the user's terminal in a busted state when bug
+//     itself crashes.
+//   - No tcsetattr means no signal handler is needed to restore
+//     it on SIGINT / SIGSEGV / SIGABRT. The cost of a real TUI is
+//     high (sigaction + sa_mask + signal-safe restore + cursor
+//     positioning + screen-region accounting); v1 trades the
+//     fancier rendering for "Ctrl-C just works".
+//   - A v2 can layer raw-mode ANSI on top of the same command
+//     dispatch table.
+//
+// Commands (a `?` at the prompt prints this list):
+//
+//   c              continue
+//   s              single-step
+//   q              quit
+//   w <expr>       add watch (re-renders on every stop)
+//   uw <idx>       remove watch at the given index
+//   lw             list active watches
+//   p <expr>       print expression once (does not persist)
+//   b <fn>         set breakpoint at function entry
+//   cb <fn>        clear breakpoint by function name
+//   lb             list active breakpoints
+//   ?              show this help
+//
+// Expressions follow bug_eval.bsm's grammar: name, name.field,
+// name[i], *name, name + name, name - name. Function calls and
+// multiplication / division are deliberately excluded.
+
+import "bpp_io.bsm";
+import "bpp_str.bsm";
+
+// ── Return codes for the REPL loop ────────────────────────────
+
+const TUI_CONT = 0;   // user typed `c` — resume execution
+const TUI_STEP = 1;   // user typed `s` — single-step one instruction
+const TUI_QUIT = -1;  // user typed `q` — exit bug
+
+// Set by bug.bpp main() when the --tui flag is passed.
+global flag_tui;
+
+// ── Line buffer ───────────────────────────────────────────────
+
+const TUI_LINE_MAX = 256;
+static auto _tui_line_buf;
+
+static _tui_init()@io {
+    if (_tui_line_buf == 0) {
+        _tui_line_buf = malloc(TUI_LINE_MAX);
+    }
+}
+
+// Read one line from stdin into _tui_line_buf and null-terminate.
+// Returns the byte length (excluding the newline and terminator).
+// On EOF returns -1 so the REPL can exit cleanly.
+static _tui_read_line()@io {
+    auto i, n, ch;
+    _tui_init();
+    i = 0;
+    while (i < TUI_LINE_MAX - 1) {
+        n = sys_read(0, _tui_line_buf + i, 1);
+        if (n <= 0) {
+            if (i == 0) { return -1; }
+            break;
+        }
+        ch = peek(_tui_line_buf + i) & 0xFF;
+        if (ch == 10) { break; }
+        i++;
+    }
+    poke(_tui_line_buf + i, 0);
+    return i;
+}
+
+// Skip leading spaces / tabs and return the new pointer.
+static _tui_skip_ws(p)@base {
+    auto c;
+    while (1) {
+        c = peek(p) & 0xFF;
+        if (c != ' ' && c != 9) { return p; }
+        p++;
+    }
+    return p;
+}
+
+// Compare a buffer of length `len` to a C-string keyword. Returns
+// 1 when both have the same content and the same length.
+static _tui_kw_eq(buf, len, kw, kw_len)@base {
+    if (len != kw_len) { return 0; }
+    auto i;
+    for (i = 0; i < len; i++) {
+        if ((peek(buf + i) & 0xFF) != (peek(kw + i) & 0xFF)) { return 0; }
+    }
+    return 1;
+}
+
+// Find the length of the leading word (stops at first space, tab,
+// or NUL).
+static _tui_word_len(p)@base {
+    auto i, c;
+    i = 0;
+    while (1) {
+        c = peek(p + i) & 0xFF;
+        if (c == 0)  { return i; }
+        if (c == ' ') { return i; }
+        if (c == 9)  { return i; }
+        i++;
+    }
+    return i;
+}
+
+// ── Watch-list helpers ────────────────────────────────────────
+
+// Append a new expression-watch entry. Parses the source through
+// bug_eval_parse and stores both the original text and the AST in
+// the watch_* arrays the existing crash-handler loop already
+// consumes. Returns 0 on success, -1 on parse error or capacity.
+static _tui_add_watch(text, len)@io {
+    auto dup, ast;
+    if (watch_count >= 32) {
+        out_str("bug: watch list full (max 32)"); out_nl();
+        return -1;
+    }
+    // Copy the text into a heap C-string so the watch survives
+    // beyond the line buffer's next read.
+    dup = malloc(len + 1);
+    auto i;
+    for (i = 0; i < len; i++) { poke(dup + i, peek(text + i)); }
+    poke(dup + len, 0);
+    ast = bug_eval_parse(text, len);
+    if (ast == 0) {
+        free(dup);
+        return -1;
+    }
+    *(watch_names + watch_count * 8) = dup;
+    *(watch_asts  + watch_count * 8) = ast;
+    watch_count++;
+    return 0;
+}
+
+// Print one-shot evaluation of an expression. Used by the `p`
+// command — does not modify the persistent watch list.
+static _tui_print_expr(text, len, fp, data_base, fi)@io {
+    auto ast;
+    ast = bug_eval_parse(text, len);
+    if (ast == 0) { return; }
+    out_str("  = ");
+    if (bug_eval_run(ast, fi, fp, data_base) < 0) {
+        out_str("<eval error>");
+    } else {
+        viz_format(bug_eval_val, bug_eval_ty, bug_eval_sid, 0, bug_eval_addr);
+    }
+    out_nl();
+}
+
+// List currently-active watches. The same `(idx) text` shape `lb`
+// uses for breakpoints, so the user can pair `uw 3` with what
+// `lw` showed.
+static _tui_list_watches()@io {
+    auto i;
+    if (watch_count == 0) {
+        out_str("  (no watches)"); out_nl();
+        return;
+    }
+    for (i = 0; i < watch_count; i++) {
+        out_str("  [");
+        out_int(i);
+        out_str("] ");
+        out_str(*(watch_names + i * 8));
+        out_nl();
+    }
+}
+
+// Remove a watch entry by index. Compacts the list so subsequent
+// indices stay contiguous from 0.
+static _tui_remove_watch(idx)@io {
+    auto j;
+    if (idx < 0)            { out_str("bug: bad watch index"); out_nl(); return; }
+    if (idx >= watch_count) { out_str("bug: bad watch index"); out_nl(); return; }
+    j = idx;
+    while (j < watch_count - 1) {
+        *(watch_names + j * 8) = *(watch_names + (j + 1) * 8);
+        *(watch_asts  + j * 8) = *(watch_asts  + (j + 1) * 8);
+        j++;
+    }
+    watch_count--;
+}
+
+// ── Help text ─────────────────────────────────────────────────
+
+static _tui_print_help()@io {
+    out_str("commands:"); out_nl();
+    out_str("  c           continue"); out_nl();
+    out_str("  s           single-step"); out_nl();
+    out_str("  q           quit"); out_nl();
+    out_str("  w <expr>    add watch"); out_nl();
+    out_str("  uw <idx>    remove watch by index"); out_nl();
+    out_str("  lw          list watches"); out_nl();
+    out_str("  p <expr>    print expression once"); out_nl();
+    out_str("  b <fn>      set breakpoint at function entry"); out_nl();
+    out_str("  cb <fn>     clear breakpoint by function name"); out_nl();
+    out_str("  lb          list breakpoints"); out_nl();
+    out_str("  v <expr> graph <N>     visualize N floats as bar chart"); out_nl();
+    out_str("  v <expr> vec2          visualize two floats as 2D dot"); out_nl();
+    out_str("  v <expr> rgba <w> <h>  visualize w*h*4 bytes as image"); out_nl();
+    out_str("  uv <idx>    remove visualizer by index"); out_nl();
+    out_str("  lv          list visualizers"); out_nl();
+    out_str("  ?           show this help"); out_nl();
+}
+
+// ── Visualizer helpers ────────────────────────────────────────
+
+// Append a runtime visualizer entry. `expr_text` / `expr_len` is
+// the source the user typed for the address (anything bug_eval
+// can parse). `kind` is one of VIZ_KIND_* and `p1` / `p2` are the
+// kind-specific parameters. Returns 0 on success, -1 on parse
+// failure or capacity overflow.
+static _tui_add_viz(expr_text, expr_len, kind, p1, p2)@io {
+    auto dup, ast, i;
+    if (viz_count >= VIZ_MAX) {
+        out_str("bug: visualizer list full (max "); out_int(VIZ_MAX); out_str(")"); out_nl();
+        return -1;
+    }
+    ast = bug_eval_parse(expr_text, expr_len);
+    if (ast == 0) { return -1; }
+
+    // Heap copy of the original text so the listing survives across
+    // line-buffer reuse, mirroring _tui_add_watch.
+    dup = malloc(expr_len + 1);
+    for (i = 0; i < expr_len; i++) { poke(dup + i, peek(expr_text + i)); }
+    poke(dup + expr_len, 0);
+
+    *(viz_texts + viz_count * 8) = dup;
+    *(viz_asts  + viz_count * 8) = ast;
+    *(viz_kinds + viz_count * 8) = kind;
+    *(viz_p1    + viz_count * 8) = p1;
+    *(viz_p2    + viz_count * 8) = p2;
+    viz_count++;
+    return 0;
+}
+
+static _tui_list_viz()@io {
+    auto i;
+    if (viz_count == 0) { out_str("  (no visualizers)"); out_nl(); return; }
+    for (i = 0; i < viz_count; i++) {
+        out_str("  [");
+        out_int(i);
+        out_str("] ");
+        out_str(*(viz_texts + i * 8));
+        out_str("  (");
+        if (*(viz_kinds + i * 8) == VIZ_KIND_GRAPH) {
+            out_str("graph n=");
+            out_int(*(viz_p1 + i * 8));
+        }
+        if (*(viz_kinds + i * 8) == VIZ_KIND_VEC2) {
+            out_str("vec2");
+        }
+        if (*(viz_kinds + i * 8) == VIZ_KIND_RGBA) {
+            out_str("rgba ");
+            out_int(*(viz_p1 + i * 8));
+            out_str("x");
+            out_int(*(viz_p2 + i * 8));
+        }
+        out_str(")");
+        out_nl();
+    }
+}
+
+static _tui_remove_viz(idx)@io {
+    auto j;
+    if (idx < 0 || idx >= viz_count) {
+        out_str("bug: bad viz index"); out_nl(); return;
+    }
+    j = idx;
+    while (j < viz_count - 1) {
+        *(viz_texts + j * 8) = *(viz_texts + (j + 1) * 8);
+        *(viz_asts  + j * 8) = *(viz_asts  + (j + 1) * 8);
+        *(viz_kinds + j * 8) = *(viz_kinds + (j + 1) * 8);
+        *(viz_p1    + j * 8) = *(viz_p1    + (j + 1) * 8);
+        *(viz_p2    + j * 8) = *(viz_p2    + (j + 1) * 8);
+        j++;
+    }
+    viz_count--;
+}
+
+// Parse the rest of a `v <expr> <kind> [params]` command line.
+// Splits the buffer in place (writes a NUL after the expression),
+// then matches the kind keyword and parses any decimal params.
+// Returns 0 on success, -1 on syntax error. Public so the @viz
+// hint replay path in bug_runviz can reuse the same grammar.
+_tui_handle_v(rest)@io {
+    auto p, expr_start, expr_end, kw_start, kw_end, kw_len;
+    auto kind, p1, p2, num_start, num_len;
+    p = _tui_skip_ws(rest);
+    if (peek(p) == 0) { out_str("bug: v needs an expression"); out_nl(); return -1; }
+
+    // Lex one or more "tokens" separated by whitespace. The
+    // expression token can contain `.`, `[`, `*`, `+`, `-` (handled
+    // by bug_eval_parse) but cannot contain spaces — the user
+    // writes `v p.x graph 16`, not `v p . x graph 16`.
+    expr_start = p;
+    while (peek(p) != 0 && peek(p) != ' ' && peek(p) != 9) { p++; }
+    expr_end = p;
+    if (peek(p) == 0) { out_str("bug: v needs a kind (graph|vec2)"); out_nl(); return -1; }
+
+    p = _tui_skip_ws(p);
+    kw_start = p;
+    while (peek(p) != 0 && peek(p) != ' ' && peek(p) != 9) { p++; }
+    kw_end = p;
+    kw_len = kw_end - kw_start;
+
+    kind = 0;
+    if (_tui_kw_eq(kw_start, kw_len, "graph", 5)) { kind = VIZ_KIND_GRAPH; }
+    if (_tui_kw_eq(kw_start, kw_len, "vec2",  4)) { kind = VIZ_KIND_VEC2;  }
+    if (_tui_kw_eq(kw_start, kw_len, "rgba",  4)) { kind = VIZ_KIND_RGBA;  }
+    if (kind == 0) {
+        out_str("bug: unknown viz kind (use graph, vec2, or rgba)"); out_nl();
+        return -1;
+    }
+
+    p1 = 0;
+    p2 = 0;
+    if (kind == VIZ_KIND_GRAPH) {
+        // Need the count.
+        p = _tui_skip_ws(p);
+        if (peek(p) == 0) {
+            out_str("bug: graph needs a sample count"); out_nl();
+            return -1;
+        }
+        num_start = p;
+        while (peek(p) != 0 && peek(p) != ' ' && peek(p) != 9) { p++; }
+        num_len = p - num_start;
+        p1 = _tui_parse_dec(num_start, num_len);
+        if (p1 <= 0) { out_str("bug: graph count must be > 0"); out_nl(); return -1; }
+    }
+    if (kind == VIZ_KIND_RGBA) {
+        // Need width and height.
+        p = _tui_skip_ws(p);
+        if (peek(p) == 0) {
+            out_str("bug: rgba needs <w> <h>"); out_nl(); return -1;
+        }
+        num_start = p;
+        while (peek(p) != 0 && peek(p) != ' ' && peek(p) != 9) { p++; }
+        num_len = p - num_start;
+        p1 = _tui_parse_dec(num_start, num_len);
+        if (p1 <= 0) { out_str("bug: rgba w must be > 0"); out_nl(); return -1; }
+
+        p = _tui_skip_ws(p);
+        if (peek(p) == 0) {
+            out_str("bug: rgba needs <w> <h> (height missing)"); out_nl(); return -1;
+        }
+        num_start = p;
+        while (peek(p) != 0 && peek(p) != ' ' && peek(p) != 9) { p++; }
+        num_len = p - num_start;
+        p2 = _tui_parse_dec(num_start, num_len);
+        if (p2 <= 0) { out_str("bug: rgba h must be > 0"); out_nl(); return -1; }
+    }
+
+    return _tui_add_viz(expr_start, expr_end - expr_start, kind, p1, p2);
+}
+
+// ── Decimal integer parser (for `uw <idx>`) ───────────────────
+
+static _tui_parse_dec(p, len)@base {
+    auto i, val, c;
+    val = 0;
+    for (i = 0; i < len; i++) {
+        c = peek(p + i) & 0xFF;
+        if (c < '0') { return -1; }
+        if (c > '9') { return -1; }
+        val = val * 10 + (c - '0');
+    }
+    return val;
+}
+
+// ── REPL loop ─────────────────────────────────────────────────
+
+// Drop into the prompt loop. Returns one of TUI_CONT / TUI_STEP /
+// TUI_QUIT to tell the caller how to resume the tracee.
+//
+// Args:
+//   fp        — current frame pointer (captured by the caller via
+//               gdb_read_fp) for use in expression evaluation.
+//   data_base — runtime address of the __DATA segment (for global
+//               lookups in the evaluator).
+//   fi        — current function index in the .bug map, or -1 if
+//               we stopped outside a known function. Used so
+//               local-name lookups in `p`/`w` resolve relative to
+//               the right frame.
+//   text_base — runtime address of __TEXT (for `b funcname`
+//               address resolution).
+bug_tui_repl(fp, data_base, fi, text_base) {
+    auto len, op, op2, rest, word, wlen;
+    auto sub;
+    while (1) {
+        out_str("(bug) ");
+        len = _tui_read_line();
+        if (len < 0)  { return TUI_QUIT; }   // EOF
+        if (len == 0) { continue; }          // empty line — re-prompt
+
+        // Skip leading whitespace before classifying the command.
+        sub = _tui_skip_ws(_tui_line_buf);
+        op = peek(sub) & 0xFF;
+        op2 = peek(sub + 1) & 0xFF;
+        rest = _tui_skip_ws(sub + 1);
+
+        if (op == 'c' && op2 == 0)  { return TUI_CONT; }
+        if (op == 's' && op2 == 0)  { return TUI_STEP; }
+        if (op == 'q')              { return TUI_QUIT; }
+        if (op == '?')              { _tui_print_help(); continue; }
+
+        // Two-letter commands take precedence over the single-
+        // letter `c` / `s` / `b` so `cb foo`, `lb`, `lw`, `uw 3`
+        // dispatch correctly.
+        if (op == 'l' && op2 == 'b') { bug_brk_list(); continue; }
+        if (op == 'l' && op2 == 'w') { _tui_list_watches(); continue; }
+        if (op == 'l' && op2 == 'v') { _tui_list_viz(); continue; }
+        if (op == 'c' && op2 == 'b') {
+            rest = _tui_skip_ws(sub + 2);
+            if (peek(rest) == 0) {
+                out_str("bug: cb needs a function name"); out_nl();
+                continue;
+            }
+            if (bug_brk_clear_name(rest) < 0) {
+                out_str("bug: no breakpoint named '");
+                out_str(rest);
+                out_str("'");
+                out_nl();
+            }
+            continue;
+        }
+        if (op == 'u' && op2 == 'w') {
+            rest = _tui_skip_ws(sub + 2);
+            wlen = _tui_word_len(rest);
+            auto idx;
+            idx = _tui_parse_dec(rest, wlen);
+            _tui_remove_watch(idx);
+            continue;
+        }
+        if (op == 'u' && op2 == 'v') {
+            rest = _tui_skip_ws(sub + 2);
+            wlen = _tui_word_len(rest);
+            auto vidx;
+            vidx = _tui_parse_dec(rest, wlen);
+            _tui_remove_viz(vidx);
+            continue;
+        }
+        if (op == 'v' && (op2 == ' ' || op2 == 9)) {
+            // `v <expr> <kind> [params]` — add a runtime visualizer.
+            rest = _tui_skip_ws(sub + 1);
+            _tui_handle_v(rest);
+            continue;
+        }
+
+        if (op == 'w') {
+            // `w <expr>` — add a watch.
+            // Compute remaining text length up to NUL.
+            auto rl;
+            rl = str_len(rest);
+            if (rl == 0) {
+                out_str("bug: w needs an expression"); out_nl();
+                continue;
+            }
+            if (_tui_add_watch(rest, rl) < 0) {
+                out_str("bug: failed to add watch"); out_nl();
+            }
+            continue;
+        }
+
+        if (op == 'p') {
+            // `p <expr>` — one-shot evaluate + print.
+            auto rl;
+            rl = str_len(rest);
+            if (rl == 0) {
+                out_str("bug: p needs an expression"); out_nl();
+                continue;
+            }
+            _tui_print_expr(rest, rl, fp, data_base, fi);
+            continue;
+        }
+
+        if (op == 'b') {
+            // `b <fn>` — set breakpoint at function entry.
+            rest = _tui_skip_ws(sub + 1);
+            wlen = _tui_word_len(rest);
+            if (wlen == 0) {
+                out_str("bug: b needs a function name"); out_nl();
+                continue;
+            }
+            // Null-terminate the word for the addr lookup. The
+            // line buffer is mutable scratch — clobber the byte
+            // after the function name and restore it after the
+            // lookup so subsequent rest parsing still works.
+            auto saved;
+            saved = peek(rest + wlen);
+            poke(rest + wlen, 0);
+            auto addr;
+            addr = bug_brk_lookup_addr(rest, text_base);
+            if (addr == 0) {
+                out_str("bug: function '");
+                out_str(rest);
+                out_str("' not found in .bug map");
+                out_nl();
+            } else {
+                // The label must outlive the line buffer, so dup
+                // the C-string into the heap.
+                auto label;
+                label = str_dup(rest);
+                bug_brk_set(addr, label);
+            }
+            poke(rest + wlen, saved);
+            continue;
+        }
+
+        out_str("bug: unknown command '");
+        out_ch(op);
+        out_str("' — try ? for help");
+        out_nl();
+    }
+    return TUI_CONT;
+}

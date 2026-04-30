@@ -1,0 +1,162 @@
+// bug_brk.bsm — Breakpoint table for the bug debugger's REPL.
+//
+// The actual byte-patching, instruction-cache flushing, and hit
+// detection live in debugserver, reachable via the GDB Z0 / z0
+// packets that bug_gdb.bsm already wraps as gdb_set_bp /
+// gdb_remove_bp. This module sits one level up: it tracks which
+// breakpoints the REPL set so the user can list (`lb`), clear
+// (`cb funcname`), and the runtime can recognise hits as user-
+// installed (vs the auto-installed function-entry traps the
+// existing bug_run loop sets).
+//
+// Capacity is fixed (BRK_MAX = 32). A real session usually has
+// fewer than ten active breakpoints; if a workflow demands more
+// the cap is one constant edit away.
+
+import "bpp_io.bsm";
+import "bpp_str.bsm";
+
+const BRK_MAX = 32;
+
+// Active breakpoints. Each slot pairs an address with the name the
+// user typed at the `b` prompt (kept around so `lb` can show what
+// the user wrote, not just a hex address).
+static auto _brk_addrs;       // buf_word(BRK_MAX) — addr per slot
+static auto _brk_names;       // buf_word(BRK_MAX) — C-string label per slot, or 0
+static auto _brk_count;
+
+// Initialize the breakpoint table. Safe to call multiple times.
+void init_bug_brk()@io {
+    if (_brk_addrs == 0) {
+        _brk_addrs = buf_word(BRK_MAX);
+        _brk_names = buf_word(BRK_MAX);
+    }
+    _brk_count = 0;
+}
+
+// Resolve a function name to its text-segment address by walking
+// the .bug map's address-map section. text_base is the runtime
+// __TEXT slide. Returns 0 when the name is not in the map.
+//
+// The lookup is linear over bug_am_count; the table is small
+// enough that a hash would be premature optimisation.
+bug_brk_lookup_addr(name, text_base) {
+    auto i, packed, name_s, name_l, my_l;
+    my_l = str_len(name);
+    for (i = 0; i < bug_am_count; i++) {
+        packed = arr_get(bug_am_name, i);
+        name_s = packed % 0x100000000;
+        name_l = packed / 0x100000000;
+        if (name_l == my_l) {
+            if (buf_cmp(_br_strbuf + name_s, name, my_l) == 0) {
+                return text_base + arr_get(bug_am_off, i);
+            }
+        }
+    }
+    return 0;
+}
+
+// Set a breakpoint at the given address. `label` is an optional
+// C-string for human-friendly listing (typically the function
+// name the user typed). Returns 0 on success, -1 on capacity
+// overflow or GDB protocol failure.
+bug_brk_set(addr, label)@io {
+    auto i;
+    // De-dup: if a breakpoint already exists at this address, just
+    // update its label so `lb` shows the most recent name.
+    for (i = 0; i < _brk_count; i++) {
+        if (*(_brk_addrs + i * 8) == addr) {
+            *(_brk_names + i * 8) = label;
+            return 0;
+        }
+    }
+    if (_brk_count >= BRK_MAX) {
+        out_str("bug: breakpoint table full (max ");
+        out_int(BRK_MAX);
+        out_str(")");
+        out_nl();
+        return -1;
+    }
+    if (gdb_set_bp(addr) < 0) {
+        out_str("bug: debugserver rejected breakpoint at 0x");
+        out_hex(addr);
+        out_nl();
+        return -1;
+    }
+    *(_brk_addrs + _brk_count * 8) = addr;
+    *(_brk_names + _brk_count * 8) = label;
+    _brk_count++;
+    return 0;
+}
+
+// Clear a breakpoint by address. Returns 0 on success, -1 if no
+// active breakpoint matches.
+bug_brk_clear_addr(addr)@io {
+    auto i, found, j;
+    found = -1;
+    for (i = 0; i < _brk_count; i++) {
+        if (*(_brk_addrs + i * 8) == addr) { found = i; }
+    }
+    if (found < 0) { return -1; }
+    if (gdb_remove_bp(addr) < 0) {
+        out_str("bug: debugserver rejected breakpoint clear at 0x");
+        out_hex(addr);
+        out_nl();
+        return -1;
+    }
+    // Compact the array — slots are kept dense so `lb` indices stay
+    // contiguous from 0.
+    j = found;
+    while (j < _brk_count - 1) {
+        *(_brk_addrs + j * 8) = *(_brk_addrs + (j + 1) * 8);
+        *(_brk_names + j * 8) = *(_brk_names + (j + 1) * 8);
+        j++;
+    }
+    _brk_count--;
+    return 0;
+}
+
+// Clear a breakpoint by the name the user typed. Returns 0 on
+// success, -1 when no breakpoint with that label is active.
+bug_brk_clear_name(name)@io {
+    auto i, n;
+    for (i = 0; i < _brk_count; i++) {
+        n = *(_brk_names + i * 8);
+        if (n != 0) {
+            if (str_eq(n, name)) {
+                return bug_brk_clear_addr(*(_brk_addrs + i * 8));
+            }
+        }
+    }
+    return -1;
+}
+
+// Print the active breakpoints. Format: index, address, label.
+void bug_brk_list()@io {
+    auto i, addr, name;
+    if (_brk_count == 0) {
+        out_str("  (no breakpoints)"); out_nl();
+        return;
+    }
+    for (i = 0; i < _brk_count; i++) {
+        addr = *(_brk_addrs + i * 8);
+        name = *(_brk_names + i * 8);
+        out_str("  [");
+        out_int(i);
+        out_str("] ");
+        out_hex(addr);
+        if (name != 0) {
+            out_str("  ");
+            out_str(name);
+        }
+        out_nl();
+    }
+}
+
+// Number of active breakpoints (for callers that want to show a
+// summary line). Read-only accessor — the REPL writes through the
+// set / clear API so external callers do not need direct access
+// to _brk_count.
+bug_brk_count()@base {
+    return _brk_count;
+}

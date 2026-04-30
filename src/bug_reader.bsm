@@ -116,6 +116,13 @@ extrn bug_sm_midx;    // Module index.
 extrn bug_sm_pos;     // Source position.
 extrn bug_sm_count;   // Total source map entries.
 
+// Viz hints: raw text payloads of `// @viz <text>` comments
+// captured by the lexer. The bug debugger replays each hint as a
+// runtime `v` command at session start. Each entry is a malloc'd
+// NUL-terminated C-string.
+extrn bug_vh_texts;
+extrn bug_vh_count;
+
 // Address map: parallel arrays indexed by codegen function index.
 extrn bug_am_name;    // Parser-level function index.
 extrn bug_am_off;     // Code offset in the binary.
@@ -213,6 +220,10 @@ void init_reader() {
     bug_sm_midx  = arr_new();
     bug_sm_pos   = arr_new();
     bug_sm_count = 0;
+
+    if (bug_vh_texts != 0) { arr_free(bug_vh_texts); }
+    bug_vh_texts = arr_new();
+    bug_vh_count = 0;
 
     if (bug_am_name != 0) { arr_free(bug_am_name); }
     if (bug_am_off != 0)  { arr_free(bug_am_off); }
@@ -451,6 +462,27 @@ static void bug_parse_stackmap() {
     }
 }
 
+// Parse the VIZ HINTS section. Each entry is u16 length + raw
+// bytes; we malloc a NUL-terminated C-string per entry so the
+// debugger can hand the pointer straight to the runtime `v`
+// command parser.
+static void bug_parse_viz_hints() {
+    auto vc, i, vlen, vp, dup, vc_byte;
+    vc = br_read_u16();
+    bug_vh_count = vc;
+    for (i = 0; i < vc; i++) {
+        vlen = br_read_u16();
+        dup  = malloc(vlen + 1);
+        for (vp = 0; vp < vlen; vp++) {
+            vc_byte = peek(_br_buf + _br_pos);
+            _br_pos++;
+            poke(dup + vp, vc_byte);
+        }
+        poke(dup + vlen, 0);
+        bug_vh_texts = arr_push(bug_vh_texts, dup);
+    }
+}
+
 // Parse the entire .bug file. Call after bug_load().
 // Returns 0 on success, -1 on error.
 bug_parse() {
@@ -460,6 +492,7 @@ bug_parse() {
     bug_parse_globals();
     bug_parse_externs();
     bug_parse_srcmap();
+    bug_parse_viz_hints();
     bug_parse_addrmap();
     bug_parse_stackmap();
     return 0;
