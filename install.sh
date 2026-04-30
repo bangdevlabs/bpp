@@ -41,7 +41,7 @@ else
 fi
 
 echo "==> Compiling debugger..."
-./bpp src/bug.bpp -o /tmp/bug_install
+./bpp tools/the_bug/the_bug.bpp -o /tmp/bug_install
 
 echo "==> Installing to $PREFIX (requires sudo)..."
 
