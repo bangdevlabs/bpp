@@ -59,6 +59,11 @@ static global _tb_run_pid;
 static global _tb_last_status;
 static global _tb_run_started;   // 1 once at least one Run has been launched
 
+// Last-load error message shown in the placeholder when the user
+// picks a file the_bug cannot parse. Heap C-string, freed and
+// replaced on every try_load attempt. 0 = no error to display.
+static auto _tb_load_err;
+
 // Reader's string buffer — declared extrn so _tb_unpack can
 // access it. The symbol is defined inside bug_reader.bsm.
 extrn _br_strbuf;
@@ -502,28 +507,74 @@ void the_bug_lib_init() {
     _tb_run_pid     = 0;
     _tb_last_status = 0;
     _tb_run_started = 0;
+    _tb_load_err    = 0;
 
     _tb_initialized = 1;
 }
 
-// Try to load a .bug file by path. Returns 1 on success, 0 on failure.
-// On success, `path` is heap-duplicated so the Run button can derive
-// the target binary by stripping the ".bug" suffix.
+// Try to load a .bug file by path. Returns 1 on success, 0 on
+// failure. On success, `path` is heap-duplicated so the Run button
+// can derive the target binary by stripping the ".bug" suffix.
+// On failure, _tb_load_err is set to a human-readable message the
+// placeholder displays so the user sees WHY the file did not load.
 the_bug_lib_try_load(path)@io {
-    auto loaded, dup, plen, i;
+    auto loaded, dup, plen, i, err_msg;
     if (path == 0) { return 0; }
+
+    // Clear any previous error message.
+    if (_tb_load_err != 0) { free(_tb_load_err); _tb_load_err = 0; }
+
+    plen = str_len(path);
+
+    // Reject files that obviously are not .bug debug maps. The
+    // dialog accepts any file (the platform layer's NSOpenPanel
+    // wrapper is type-agnostic), so the user can hand us a .bpp,
+    // a binary, anything. Catch the common mistakes here so the
+    // panel reads "wrong file type" instead of going dark.
+    if (plen < 5 || peek(path + plen - 4) != '.'
+                  || peek(path + plen - 3) != 'b'
+                  || peek(path + plen - 2) != 'u'
+                  || peek(path + plen - 1) != 'g') {
+        err_msg = malloc(256);
+        // Format: "expected .bug, got <path>". Keeps the user-facing
+        // hint precise — they should re-pick a `.bug` file.
+        auto pos;
+        pos = 0;
+        auto prefix;
+        prefix = "expected a .bug file, got: ";
+        for (i = 0; i < str_len(prefix); i++) { poke(err_msg + pos, peek(prefix + i)); pos++; }
+        for (i = 0; i < plen && pos < 250; i++) { poke(err_msg + pos, peek(path + i)); pos++; }
+        poke(err_msg + pos, 0);
+        _tb_load_err = err_msg;
+        return 0;
+    }
 
     // Re-init the reader arrays for a fresh parse.
     init_reader();
 
     loaded = bug_load(path);
-    if (loaded < 0) { return 0; }
-    if (bug_parse() < 0) { return 0; }
+    if (loaded < 0) {
+        err_msg = malloc(64);
+        auto m;
+        m = "cannot open file (read failed)";
+        for (i = 0; i < str_len(m); i++) { poke(err_msg + i, peek(m + i)); }
+        poke(err_msg + str_len(m), 0);
+        _tb_load_err = err_msg;
+        return 0;
+    }
+    if (bug_parse() < 0) {
+        err_msg = malloc(64);
+        auto m2;
+        m2 = "invalid .bug format (bad magic / truncated)";
+        for (i = 0; i < str_len(m2); i++) { poke(err_msg + i, peek(m2 + i)); }
+        poke(err_msg + str_len(m2), 0);
+        _tb_load_err = err_msg;
+        return 0;
+    }
 
     // Snapshot the path. Caller may free the original after the
     // call so we own a private copy.
     if (_tb_bug_path != 0) { free(_tb_bug_path); }
-    plen = str_len(path);
     dup = malloc(plen + 1);
     for (i = 0; i < plen; i++) { poke(dup + i, peek(path + i)); }
     poke(dup + plen, 0);
@@ -703,19 +754,36 @@ the_bug_lib_frame(px, py, pw, ph) {
     content_h = ph - (content_y - py) - 24;
 
     if (_tb_loaded == 0) {
-        // Placeholder when no .bug is loaded.
-        auto msg, msg_w;
+        // Placeholder when no .bug is loaded. Three lines:
+        //   1. headline ("No debug map loaded")
+        //   2. instruction ("Click 'Load .bug' to open ...")
+        //   3. error from the last try_load attempt, if any
+        auto msg, msg_w, line_y;
+        line_y = py + ph / 2 - UI_FONT_SZ * 2;
+
         msg = "No debug map loaded";
         msg_w = measure_text(msg, UI_FONT_SZ);
-        draw_text(msg, px + (pw - msg_w) / 2,
-                  py + ph / 2 - UI_FONT_SZ,
+        draw_text(msg, px + (pw - msg_w) / 2, line_y,
+                  UI_FONT_SZ, _theme.text);
+        line_y += UI_FONT_SZ + 6;
+
+        msg = "Click 'Load .bug' to open a debug map file";
+        msg_w = measure_text(msg, UI_FONT_SZ);
+        draw_text(msg, px + (pw - msg_w) / 2, line_y,
+                  UI_FONT_SZ, _theme.text_muted);
+        line_y += UI_FONT_SZ + 6;
+
+        msg = "(.bug files are written by `bpp --bug` next to the binary)";
+        msg_w = measure_text(msg, UI_FONT_SZ);
+        draw_text(msg, px + (pw - msg_w) / 2, line_y,
                   UI_FONT_SZ, _theme.text_muted);
 
-        msg = "Build your project (F7) or click Load .bug";
-        msg_w = measure_text(msg, UI_FONT_SZ);
-        draw_text(msg, px + (pw - msg_w) / 2,
-                  py + ph / 2 + 4,
-                  UI_FONT_SZ, _theme.text_muted);
+        if (_tb_load_err != 0) {
+            line_y += UI_FONT_SZ * 2;
+            msg_w = measure_text(_tb_load_err, UI_FONT_SZ);
+            draw_text(_tb_load_err, px + (pw - msg_w) / 2, line_y,
+                      UI_FONT_SZ, _theme.accent);
+        }
         return quit;
     }
 
