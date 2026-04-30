@@ -47,6 +47,18 @@ static auto _tb_initialized;
 // Whether a .bug file is currently loaded and parsed.
 static global _tb_loaded;
 
+// Path of the currently loaded .bug file (heap-owned C-string), or
+// 0 if no file is loaded. Kept around so the Run button can derive
+// the target binary path by stripping the trailing ".bug".
+static auto _tb_bug_path;
+
+// PID of the currently running target. 0 = nothing running. The
+// frame loop poll-reaps this with a non-blocking waitpid so the
+// GUI never freezes waiting for the child.
+static global _tb_run_pid;
+static global _tb_last_status;
+static global _tb_run_started;   // 1 once at least one Run has been launched
+
 // Reader's string buffer — declared extrn so _tb_unpack can
 // access it. The symbol is defined inside bug_reader.bsm.
 extrn _br_strbuf;
@@ -483,16 +495,22 @@ static _tb_render_stackmap(x, y) {
 void the_bug_lib_init() {
     if (_tb_initialized != 0) { return; }
 
-    _tb_line_buf = malloc(256);
-    _tb_loaded   = 0;
-    _tb_scroll   = 0;
+    _tb_line_buf    = malloc(256);
+    _tb_loaded      = 0;
+    _tb_scroll      = 0;
+    _tb_bug_path    = 0;
+    _tb_run_pid     = 0;
+    _tb_last_status = 0;
+    _tb_run_started = 0;
 
     _tb_initialized = 1;
 }
 
 // Try to load a .bug file by path. Returns 1 on success, 0 on failure.
+// On success, `path` is heap-duplicated so the Run button can derive
+// the target binary by stripping the ".bug" suffix.
 the_bug_lib_try_load(path)@io {
-    auto loaded;
+    auto loaded, dup, plen, i;
     if (path == 0) { return 0; }
 
     // Re-init the reader arrays for a fresh parse.
@@ -502,9 +520,91 @@ the_bug_lib_try_load(path)@io {
     if (loaded < 0) { return 0; }
     if (bug_parse() < 0) { return 0; }
 
+    // Snapshot the path. Caller may free the original after the
+    // call so we own a private copy.
+    if (_tb_bug_path != 0) { free(_tb_bug_path); }
+    plen = str_len(path);
+    dup = malloc(plen + 1);
+    for (i = 0; i < plen; i++) { poke(dup + i, peek(path + i)); }
+    poke(dup + plen, 0);
+    _tb_bug_path = dup;
+
     _tb_loaded = 1;
     _tb_scroll = 0;
     return 1;
+}
+
+// Spawn the target binary derived from the loaded .bug path. Drops
+// the ".bug" suffix to find the executable next to the debug map.
+// The child is detached from the GUI's stdin/stdout so it can drive
+// its own window or terminal without fighting for the parent's TTY.
+// Returns the child PID on success, 0 on failure.
+//
+// Phase A2 minimum: fire-and-forget. Phase C will route the child
+// through debugserver and surface watches / visualizers in panels.
+static _tb_run_target()@solo {
+    auto plen, target_path, i, pid, argv_buf;
+    if (_tb_bug_path == 0) { return 0; }
+
+    // Strip the ".bug" suffix (4 bytes). the_bug_lib_try_load only
+    // accepts files whose name matches *.bug, so the cut is safe.
+    plen = str_len(_tb_bug_path);
+    if (plen <= 4) { return 0; }
+    target_path = malloc(plen - 4 + 1);
+    for (i = 0; i < plen - 4; i++) { poke(target_path + i, peek(_tb_bug_path + i)); }
+    poke(target_path + (plen - 4), 0);
+
+    pid = sys_fork();
+    if (pid < 0) {
+        free(target_path);
+        return 0;
+    }
+    if (pid == 0) {
+        // Child: argv = [target_path, NULL]. envp = NULL — the
+        // target inherits the parent's environment via execve's
+        // default behaviour on macOS when envp is omitted from
+        // the syscall, but we pass an empty terminator anyway.
+        argv_buf = malloc(16);
+        *(argv_buf)     = target_path;
+        *(argv_buf + 8) = 0;
+        sys_execve(target_path, argv_buf, 0);
+        // execve only returns on failure. Exit so the parent's
+        // waitpid sees the child gone instead of hanging on a
+        // ghost process.
+        sys_exit(127);
+    }
+
+    // Parent stores the pid for the frame-loop reaper. The path
+    // hangs around in _tb_bug_path; target_path is a transient
+    // copy we can release after the fork completes successfully.
+    free(target_path);
+    _tb_run_pid     = pid;
+    _tb_last_status = 0;
+    _tb_run_started = 1;
+    return pid;
+}
+
+// Poll-reap the running target without blocking. Called from the
+// frame loop so the GUI keeps responding while the child runs.
+// When the child exits, status is captured for display.
+//
+// sys_wait4(pid, status, options=1=WNOHANG, rusage=0) returns:
+//   0   — child still alive
+//   pid — child exited (status filled in)
+//  -1   — error (treat as exited so we don't poll forever)
+static _tb_run_poll()@solo {
+    auto reaped, status_word;
+    if (_tb_run_pid == 0) { return; }
+    status_word = 0;
+    reaped = sys_wait4(_tb_run_pid, &status_word, 1, 0);
+    if (reaped == _tb_run_pid) {
+        _tb_last_status = status_word;
+        _tb_run_pid     = 0;
+    }
+    if (reaped < 0) {
+        _tb_last_status = -1;
+        _tb_run_pid     = 0;
+    }
 }
 
 // Render one frame of the debug map viewer. Returns 1 if ESC pressed.
@@ -528,8 +628,13 @@ the_bug_lib_frame(px, py, pw, ph) {
     draw_text("The Bug — Debug Map Viewer", px + margin, bar_y,
               UI_FONT_SZ, _theme.accent);
 
-    // Load button.
-    if (gui_button(px + pw - margin - 120, bar_y - 2, 112, 22, "Load .bug")) {
+    // Buttons on the right side of the top bar.
+    auto btn_x;
+    btn_x = px + pw - margin;
+
+    // Load button (always present).
+    btn_x -= 112;
+    if (gui_button(btn_x, bar_y - 2, 112, 22, "Load .bug")) {
         auto picked;
         picked = window_open_dialog("Open .bug file");
         if (picked != 0) {
@@ -537,6 +642,57 @@ the_bug_lib_frame(px, py, pw, ph) {
             free(picked);
         }
     }
+
+    // Run button (only meaningful when a .bug is loaded). Spawns
+    // the target binary derived from the loaded path. The button
+    // is disabled (still drawn but the click is ignored) while a
+    // child is alive — Phase A2 keeps the spawn fire-and-forget;
+    // a Stop button needs sys_kill which is not a builtin yet
+    // (could land later via libc FFI when the Run flow grows
+    // tracee control).
+    if (_tb_loaded != 0) {
+        btn_x -= 8 + 112;
+        auto run_label;
+        run_label = _tb_run_pid != 0 ? "running..." : "Run target";
+        if (gui_button(btn_x, bar_y - 2, 112, 22, run_label)) {
+            if (_tb_run_pid == 0) {
+                _tb_run_target();
+            }
+        }
+    }
+
+    // Run-status indicator below the buttons. Renders only after
+    // the user has launched something at least once so first-time
+    // viewers don't see noise.
+    if (_tb_run_started != 0) {
+        auto status_str, sx, sy;
+        sx = px + margin;
+        sy = bar_y + UI_FONT_SZ + 4;
+        if (_tb_run_pid != 0) {
+            auto sb;
+            sb = strbuf_new();
+            sb = strbuf_cat(sb, "running [pid ");
+            sb = strbuf_num(sb, _tb_run_pid);
+            sb = strbuf_cat(sb, "]");
+            buf_copy(_tb_line_buf, sb, strbuf_len(sb));
+            poke(_tb_line_buf + strbuf_len(sb), 0);
+            strbuf_free(sb);
+            draw_text(_tb_line_buf, sx, sy, UI_FONT_SZ, _theme.accent);
+        } else {
+            auto sb2;
+            sb2 = strbuf_new();
+            sb2 = strbuf_cat(sb2, "last run exit=");
+            sb2 = strbuf_num(sb2, _tb_last_status);
+            buf_copy(_tb_line_buf, sb2, strbuf_len(sb2));
+            poke(_tb_line_buf + strbuf_len(sb2), 0);
+            strbuf_free(sb2);
+            draw_text(_tb_line_buf, sx, sy, UI_FONT_SZ, _theme.text_muted);
+        }
+    }
+
+    // Reap any finished child so the next frame's button label is
+    // accurate without needing the user to click again.
+    _tb_run_poll();
 
     bar_y += UI_FONT_SZ + 8;
     draw_rect(px + margin, bar_y, pw - margin * 2, 1, _theme.border);

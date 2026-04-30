@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the standalone bug debugger from this directory.
+# Build the_bug GUI debugger from this directory.
 #
 # B++'s import resolver expects stb/ + src/ to exist relative to cwd
 # (or via a global install at /usr/local/lib/bpp/). To keep the
@@ -16,7 +16,7 @@ set -e
 
 # Walk up from this script's directory until we find ./bpp (the
 # project-root marker). Two levels up is the typical case
-# (tools/the_bug/ → repo root) but any depth works.
+# (tools/the_bug/ -> repo root) but any depth works.
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$SCRIPT_DIR
 while [ "$ROOT" != "/" ] && [ ! -x "$ROOT/bpp" ]; do

@@ -1,9 +1,17 @@
-// bug.bpp -- B++ native debugger.
-// Reads .bug debug maps and observes running programs.
+// the_bug.bpp -- B++ native debugger.
+// Reads .bug debug maps, observes running programs, opens a windowed
+// debug-map viewer for offline inspection.
 //
 // Usage:
-//   ./bug file.bug              Dump debug info from a .bug file
-//   ./bug ./program [args...]   Run program and observe (requires .bug alongside)
+//   ./bug                       Open GUI; pop file dialog for a .bug
+//   ./bug file.bug              Open GUI; load this .bug at startup
+//   ./bug --dump file.bug       Dump debug info to stdout (text mode)
+//   ./bug ./program [args...]   Run program and observe (CLI trace mode)
+//   ./bug --tui ./program       Interactive REPL on every breakpoint
+//
+// Mode is inferred from the first non-flag argument: ".bug" suffix
+// means inspect, anything else means run. `--dump` and `--tui` are
+// the explicit overrides for the inspect / run sides respectively.
 
 import "bpp_array.bsm";
 import "bug_reader.bsm";
@@ -13,6 +21,17 @@ import "bug_eval.bsm";
 import "bug_brk.bsm";
 import "bug_runviz.bsm";
 import "bug_tui.bsm";
+
+// GUI mode imports — the windowed inspector reuses the same panel
+// component Bang 9 embeds. window_open / window_close / etc. come
+// from stbwindow, the_bug_lib_frame from the_bug_lib.bsm in this
+// same directory.
+import "stbwindow.bsm";
+import "stbinput.bsm";
+import "stbdraw.bsm";
+import "stbui.bsm";
+
+load "the_bug_lib.bsm";
 
 // -- Output helpers -------------------------------------------
 // All output goes to stdout (fd=1). Diagnostics go to stderr (fd=2).
@@ -394,10 +413,62 @@ static _cstr_has(s, ch) {
     return 0;
 }
 
+// -- GUI mode --------------------------------------------------
+//
+// Open a stbwindow, hand over to the_bug_lib's panel renderer.
+// `initial_path` may be 0 to pop a file dialog at startup, or a
+// C-string path to load that .bug immediately. Returns when the
+// user closes the window (Cmd-Q, ESC, red X).
+
+static _run_gui(initial_path)@solo {
+    auto picked;
+
+    init_input();
+    init_color();
+    init_draw();
+    init_font();
+    init_ui();
+
+    window_open(720, 540, "the bug");
+    the_bug_lib_init();
+
+    if (initial_path != 0) {
+        the_bug_lib_try_load(initial_path);
+    } else {
+        picked = window_open_dialog("Open .bug file");
+        if (picked != 0) {
+            the_bug_lib_try_load(picked);
+            free(picked);
+        }
+    }
+
+    while (window_should_close() == 0) {
+        window_poll_events();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        // Track live window size so dragging the edges keeps the
+        // panel filling the content area.
+        auto cur_w, cur_h;
+        cur_w = window_width();
+        cur_h = window_height();
+        if (cur_w <= 0) { cur_w = 720; }
+        if (cur_h <= 0) { cur_h = 540; }
+
+        draw_begin();
+        draw_rect(0, 0, cur_w, cur_h, rgba(20, 24, 32, 255));
+        if (the_bug_lib_frame(0, 0, cur_w, cur_h)) { break; }
+        draw_end();
+    }
+
+    the_bug_lib_shutdown();
+    window_close();
+}
+
 // -- Main -----------------------------------------------------
 
 main() {
     auto nargs, arg, len, loaded, target_idx, i;
+    auto flag_dump;
 
     _out_buf = malloc(16);
     pathbuf = malloc(4096);
@@ -409,6 +480,7 @@ main() {
     watch_asts     = buf_word(32);
     watch_count    = 0;
     flag_tui       = 0;
+    flag_dump      = 0;
 
     init_array();
     init_reader();
@@ -417,17 +489,13 @@ main() {
     init_bug_runviz();
 
     nargs = argc_get();
+    // Bare `./bug` with no args lands in GUI mode and pops a file
+    // dialog so the user can browse to whatever .bug they want to
+    // inspect. The dump-to-stdout text mode lives on as `--dump`
+    // for scripts, and the TUI run mode is unchanged.
     if (nargs < 2) {
-        out_str("usage: bug [flags] <program> [args]"); out_nl();
-        out_str("       bug <file.bug>   dump debug map"); out_nl();
-        out_str(""); out_nl();
-        out_str("flags:"); out_nl();
-        out_str("  --break <fn>         stop at entry of function <fn>"); out_nl();
-        out_str("  --break-all          also trace every function (default when no --break given)"); out_nl();
-        out_str("  --dump-str           at each BP hit, print [x0] and [x1] as C-strings"); out_nl();
-        out_str("  --watch name[,name2] print named locals/globals at every breakpoint hit"); out_nl();
-        out_str("  --tui                drop into an interactive REPL on every breakpoint and crash"); out_nl();
-        return 1;
+        _run_gui(0);
+        return 0;
     }
 
     // Parse --break / --break-all flags. Target program is the first
@@ -463,6 +531,11 @@ main() {
                 target_idx++;
             } else if (_cstr_eq(arg, "--tui")) {
                 flag_tui = 1;
+                target_idx++;
+            } else if (_cstr_eq(arg, "--dump")) {
+                // Force the legacy text dump even when the positional
+                // argument is a .bug file (default for .bug is now GUI).
+                flag_dump = 1;
                 target_idx++;
             } else if (_cstr_eq(arg, "--dump-str")) {
                 flag_dump_str = 1;
@@ -526,15 +599,43 @@ main() {
         }
     }
 
+    // Dispatch: positional argument decides mode.
+    //
+    //   no positional      -> GUI, pop file dialog
+    //   .bug file          -> GUI, auto-load that file
+    //   anything else      -> only valid with --tui (run/observe mode)
+    //
+    // The --tui path stays as the back-door used by tests/scripts.
+    // It is intentionally absent from the GUI's help flow because
+    // the windowed inspector subsumes the daily UX.
     if (target_idx >= nargs) {
-        out_str("bug: missing target program"); out_nl();
-        return 1;
+        // No positional argument. Flags-only invocation lands here.
+        // Default action: GUI with no preloaded file.
+        _run_gui(0);
+        return 0;
     }
 
     arg = argv_get(target_idx);
 
+    if (ends_with_bug(arg) && flag_tui == 0) {
+        // .bug file -> GUI window with that file loaded.
+        _run_gui(arg);
+        return 0;
+    }
+
+    if (flag_tui == 0) {
+        // Non-.bug argument without --tui: bail out rather than
+        // silently launching trace mode. Users who want trace
+        // mode pass --tui explicitly; everyone else lands in GUI.
+        out_str("the_bug: '");
+        out_str(arg);
+        out_str("' is not a .bug file. Use --tui to debug a program from the CLI.");
+        out_nl();
+        return 1;
+    }
+
     if (ends_with_bug(arg)) {
-        // Dump mode: read and display .bug file contents.
+        // --tui plus a .bug file: legacy text dump path.
         len = copy_cstr(pathbuf, arg);
         loaded = bug_load(pathbuf);
         if (loaded < 0) {
