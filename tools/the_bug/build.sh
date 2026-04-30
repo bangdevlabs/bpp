@@ -29,5 +29,7 @@ if [ ! -x "$ROOT/bpp" ]; then
 fi
 
 cd "$ROOT"
-./bpp tools/the_bug/the_bug.bpp -o tools/the_bug/the_bug
-echo "built tools/the_bug/the_bug"
+./bpp tools/the_bug/the_bug.bpp -o tools/the_bug/bug
+# Mirror to the project root for the developer convenience binary.
+cp tools/the_bug/bug ./bug
+echo "built tools/the_bug/bug + ./bug"
