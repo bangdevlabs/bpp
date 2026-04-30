@@ -133,6 +133,16 @@ sudo cp src/bpp_time.bsm "$LIB_DIR/"
 sudo cp src/bpp_thread.bsm "$LIB_DIR/"
 sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
 sudo cp src/bug_reader.bsm "$LIB_DIR/"
+# The remaining bug_*.bsm modules complete the standalone debugger
+# build chain — without these, compiling tools/the_bug/the_bug.bpp
+# from any cwd outside the project root fails with E002 because
+# the local search path (./, stb/) does not see src/.
+sudo cp src/bug_gdb.bsm "$LIB_DIR/"
+sudo cp src/bug_viz.bsm "$LIB_DIR/"
+sudo cp src/bug_eval.bsm "$LIB_DIR/"
+sudo cp src/bug_brk.bsm "$LIB_DIR/"
+sudo cp src/bug_runviz.bsm "$LIB_DIR/"
+sudo cp src/bug_tui.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
