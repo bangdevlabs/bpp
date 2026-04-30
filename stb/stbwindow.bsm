@@ -1,37 +1,110 @@
-// stbwindow.bsm — Native window utilities: file dialogs, alerts,
-// and (eventually) event-driven window management for tools that
-// don't want stbgame's 60 FPS game loop.
+// stbwindow.bsm — Native window utilities: lifecycle, events,
+// dialogs, and live geometry. Stand-alone alternative to stbgame
+// for tools that want a window without the 60 FPS game loop —
+// editors, debuggers, panel-based UIs (modulab, mini_synth, the
+// bug debugger, future Bang 9 panels).
 //
-// Right now the module ships as a thin facade over the macOS
-// platform layer's NSSavePanel / NSOpenPanel / NSAlert wrappers.
-// On Linux these become no-ops with a stderr warning — desktop
-// Linux file dialogs are a moving target (Zenity vs kdialog vs
-// native portals) and ModuLab ships macOS first. The API returns
-// 0 on Linux as if the user cancelled, so callers can branch on
-// the return and fall back to CLI prompts / fixed paths.
+// Two usage patterns:
 //
-// Usage (ModuLab's save flow):
+// 1. Tools (your own loop, your own pacing):
 //
-//   auto path;
-//   path = window_save_dialog("Save sprite sheet", "sprite.json");
-//   if (path == 0) { return; }             // user cancelled
-//   file_write_all(path, buf, len);
-//   free(path);                             // caller owns the path
+//   import "stbwindow.bsm";
+//   import "stbinput.bsm";
+//   import "stbdraw.bsm";
 //
-// Dialogs block the main thread until dismissed. The game loop
-// pauses, which is the expected behaviour for a save/open flow.
-// If you need non-blocking file pickers (e.g. streaming preview
-// in an editor) that's a future extension — none of the shipping
-// tools want it today.
-
-// Platform-layer externs provided by _stb_platform_macos.bsm. The
-// platform file is auto-injected whenever a program imports
-// stbgame, and these symbols resolve against that same injection.
-// Programs that want just dialogs without a game window still need
-// `import "stbgame.bsm"` because the platform layer owns the NSApp
-// lifecycle those dialogs depend on.
+//   main() {
+//       init_input(); init_draw(); init_font(); init_ui();
+//       window_open(640, 480, "MyTool");
+//       while (window_should_close() == 0) {
+//           window_poll_events();
+//           // draw via stbdraw
+//           window_present();
+//       }
+//       window_close();
+//   }
+//
+// 2. Games (stbgame still drives the loop):
+//
+//   import "stbgame.bsm";
+//   game_init(...); while (...) { game_frame_begin(); ... }
+//
+// stbgame internally calls the same `_stb_*` primitives, so the
+// two paths share the platform layer — they just differ in who
+// owns the loop and the timing.
+//
+// File dialogs and alerts (window_save_dialog, window_alert, ...)
+// are platform-native: NSSavePanel / NSAlert on macOS; on Linux
+// they are no-ops returning 0 (cancel) until a portable Linux
+// file picker lands.
+//
+// All `_stb_*` symbols are auto-injected via _stb_platform_<os>.bsm
+// (resolved by target-suffix), so tools don't need to import the
+// platform layer explicitly.
 
 // ── Public API ──────────────────────────────────────────────
+
+// ── Window lifecycle ────────────────────────────────────────
+
+// Open a native window of the given dimensions and title. Allocates
+// the platform's window object plus a software framebuffer so apps
+// using stbdraw / stbrender / stbui have a backing store ready.
+// `title` is a NUL-terminated C-string (string literal works).
+//
+// MUST be called from the main thread. On macOS the Cocoa NSApp
+// lifecycle requires it; on Linux the X11 connection is set up
+// from this call too. Calling twice without an intervening
+// window_close is undefined behaviour.
+void window_open(w, h, title)@io {
+    // Allocate the software framebuffer the platform layer's
+    // present path expects. stbdraw and stbrender both write
+    // through `_stb_fb` at `_stb_w × _stb_h × 4 bytes`.
+    _stb_w = w;
+    _stb_h = h;
+    if (_stb_fb != 0) { free(_stb_fb); }
+    _stb_fb = malloc(w * h * 4);
+    _stb_init_window(w, h, title);
+}
+
+// Pump the OS event queue once. Call near the top of every frame
+// (or whenever the tool wants to honour close requests, key state
+// changes, mouse events, and resize notifications). Cheap — does
+// not block.
+void window_poll_events()@io {
+    _stb_poll_events();
+}
+
+// Returns 1 when the user has asked to close the window (red X
+// button, Cmd-Q on macOS, WM_DELETE_WINDOW on Linux). The flag
+// stays sticky once set, so a `while (window_should_close() == 0)`
+// loop works even if the close arrives mid-frame.
+window_should_close()@io {
+    return _stb_should_close();
+}
+
+// Flip the back buffer to screen. Tools call this once per frame
+// after drawing through stbdraw / stbrender. Equivalent to
+// game_frame_end's present step but without the FPS-cap sleep.
+void window_present()@io {
+    _stb_present();
+}
+
+// Tear down the window and release platform resources. After this
+// returns, _stb_fb is freed and any further window_* call (other
+// than another window_open) is undefined.
+void window_close()@io {
+    _stb_shutdown();
+    if (_stb_fb != 0) { free(_stb_fb); _stb_fb = 0; }
+}
+
+// ── Externs the lifecycle helpers above need ────────────────
+//
+// `_stb_w / _stb_h / _stb_fb` are the shared framebuffer triple
+// that stbdraw and stbrender both read; window_open allocates,
+// window_close frees. The `_stb_*` functions live in
+// `_stb_platform_<os>.bsm` (auto-injected by bpp_import.bsm).
+extrn _stb_w, _stb_h, _stb_fb;
+
+// ── Dialog API ──────────────────────────────────────────────
 
 // Open a native Save As dialog. `title` appears in the title bar,
 // `default_name` pre-fills the name field. Either may be 0 to omit.
