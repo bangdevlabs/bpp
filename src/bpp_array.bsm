@@ -162,10 +162,52 @@ arr_at(arr, i)@io {
 
 // Write a value at index i. UNCHECKED — same contract as arr_get:
 // caller guarantees i is in range. Works on both arr_new arrays
-// and raw word buffers. A future arr_set_checked can wrap this
-// with bounds + null validation when a real call site asks for it.
+// and raw word buffers. The fast path used everywhere in the
+// compiler hot loops; pair with arr_set_at below for boundary code.
 // Rule 3: side-effect only → void + implicit return.
 void arr_set(arr, i, val) {
+    *(arr + i * _ARR_ELEM) = val;
+}
+
+// Bounds-checked element write with diagnostic logging. Mirrors
+// std::vector::at() on the write side the same way arr_at mirrors
+// it on the read side. Returns silently on a null array, a negative
+// index, or an index past the array length — AND prints an error
+// to stderr naming the violation so callers get a loud signal
+// instead of a corrupted buffer.
+//
+// Intended use is BOUNDARY-LAYER code: deserialisers, file
+// loaders, parsers of external input, anywhere the index could
+// come from untrusted data. In hot inner loops, keep arr_set —
+// arr_set_at's branches plus potential I/O would destroy real-time
+// budgets.
+//
+// CALLER CONTRACT: arr must be NULL or an arr_new-created array.
+// Passing a raw arr_byte / malloc'd pointer triggers undefined
+// behaviour — the length read *(arr - 16) would return garbage.
+//
+// Log format (subject to change, grep-stable):
+//   "arr_set_at: null array\n"
+//   "arr_set_at: negative index\n"
+//   "arr_set_at: index out of range\n"
+//
+// Rule 4: side effect on the array AND on stderr. Tagged @io
+// because putstr_err touches stderr.
+void arr_set_at(arr, i, val)@io {
+    auto len;
+    if (arr == 0) {
+        putstr_err("arr_set_at: null array\n");
+        return;
+    }
+    if (i < 0) {
+        putstr_err("arr_set_at: negative index\n");
+        return;
+    }
+    len = *(arr - 16);
+    if (i >= len) {
+        putstr_err("arr_set_at: index out of range\n");
+        return;
+    }
     *(arr + i * _ARR_ELEM) = val;
 }
 
