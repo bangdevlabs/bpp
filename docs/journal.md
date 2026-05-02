@@ -5566,3 +5566,181 @@ PASS regardless of which logic is wrong.
 
 Commit: `36f7e46` — `c-emitter: width-aware slice struct fields +
 main_bpp rc forward + dispatch cleanup`.
+
+## 2026-05-02 (later) — bug Phase 6.3 panic + 6.4.1 cooperative profiler
+
+Phase 6.3 and 6.4.1 land back-to-back, closing the user-visible
+half of the Phase 6 roadmap. Phase 6.5 (caller(n) sugar) and
+Phase 6.4.2 (SIGPROF supplement) remain — see "Deferred" below.
+
+### Phase 6.3 — `panic(msg)` with stack trace
+
+User-facing crash that ties the Phase 6.2 runtime symbolication
+into a deliberate exit path. `panic("oops")` writes the message
+to stderr, walks the FP chain via the existing `caller_pc`
+primitive, prints `  at <name>` per frame, exits 134.
+
+The walk uses the existing chip primitive, but `caller_pc`
+needed a one-instruction patch on each chip: the FP-walk
+iteration now guards every load with a null check (`cbz x9` on
+ARM64, `test rcx, rcx + jz` on x86_64) and routes to a new
+`.Lwalk_off` label that returns 0 instead of dereferencing a
+null saved FP. Without this, a panic from a 5-deep call chain
+SIGSEGVs on the 6th iteration of the walk; with it, the loop
+terminates cleanly when the chain ends. The two extra
+instructions cost nothing on the cooperative path that already
+walks valid frames.
+
+`panic` itself is a regular B++ function in `bpp_runtime.bsm`
+(no chip primitive needed — the work is portable). The C path
+gets a special-case at the call site that emits
+`(fprintf(stderr, "panic: %s\n", msg), abort(), 0LL)`. SIGABRT's
+exit code matches the native `sys_exit(134)`, so test runners
+agnostic to the backend stay happy. The C-path fallback drops
+the stack trace because there is no minisym section and no
+portable FP walker — documented as a known limitation.
+
+`@io` annotation on `panic` flows through the effect classifier
+naturally, so any `@time` audio callback that reaches `panic`
+lights up W026 at compile time. Realtime-IO violation is
+caught by the existing lattice — no new diagnostic was needed.
+
+Test: `tests/test_panic.bpp` + `tests/test_panic.sh` wrapper.
+The wrapper expects rc=134 and greps stderr for the message
+plus each expected frame name. Skipped from the rc=0 loops in
+both `run_all.sh` and `run_all_c.sh`; runs standalone like
+`test_bug_tui.sh`.
+
+Commit: `98f650a` — `bug Phase 6.3: panic(msg) with stack trace`.
+
+### Determinism for the GPU smoke tests
+
+The user observed (and confirmed across multiple runs) that
+`test_gpu_circle`, `test_gpu_clear`, and `test_gpu_shapes` flake
+under `run_all.sh`. Diagnosis: the tests' `while
+(game_should_quit() == 0)` loop only ends when Cocoa's
+`isVisible` flips to 0, and the runner's 10 s SIGKILL provides
+the eventual termination. When the test window does not gain
+focus, isVisible never flips, and the SIGKILL produces rc=137
+(failure). When the window briefly loses focus, isVisible
+flips early, the loop exits, rc=0 (pass).
+
+Fix: replace the unbounded loop with a fixed `TEST_FRAMES`
+counter (30) + an explicit `sys_exit(0)` at the end. Five
+consecutive `run_all.sh` runs now report 124/0/12 deterministically.
+
+Commit: `ca95cba` — `tests: deterministic gpu_clear + gpu_shapes
+(frame counter + sys_exit)`. The earlier `test_gpu_circle` fix
+shipped in the same wave.
+
+### Phase 6.4.1 — cooperative sampling profiler
+
+`profile_start(rate_hz, depth)` → run workload →
+`profile_stop()` → `profile_dump(buf, cap)` returns a top-K
+table of `(name_packed, count)` pairs sorted by count. The
+implementation lives in `bpp_runtime.bsm` (auto-injected) so
+no import is required.
+
+Sampling fires at cooperative boundaries: between tasks in
+`_job_worker_main` (after `call(fn, job_arg)` returns) and at
+the entry to each maestro phase (solo / base / render). The
+captured stack starts at the calling function — the user sees
+their `_job_worker_main` / `maestro_solo` etc. frame at depth 0.
+
+Per-thread state: each thread owns a 1024-slot ring of stacks
+(8 PCs each by default, configurable to 32). Thread index 0 is
+the main thread; workers fill 1..N via the new `Worker.worker_idx`
+field set in `job_init`. Different `t` ⇒ different ring slot ⇒
+no cross-thread races on the writes; the only shared state is
+the `_prof_active` flag (one writer in main, many readers in
+workers, separated by the natural memory-barrier in
+`job_submit`/`job_wait_all`).
+
+Aggregator: linear tally + partial selection sort. Synth
+re-attribution is the B++-specific concern that justifies
+capturing stacks instead of bare PCs: when the innermost frame
+resolves to a name starting with `__synth_` (Sprint 2b's
+auto-dispatched worker name pattern), the tally credits the
+next frame up — so the user sees their loop-containing
+function in the table, not the anonymous worker the rewriter
+created.
+
+Test (`tests/test_profile_cooperative.bpp`): 1000 jobs × 4
+workers, asserts the dump has at least one entry with positive
+count and a resolved name. The test's `work_fn` body uses a
+non-additive step (`x = x * 3 + i`) on purpose — the additive
+shape `x = x + i` would auto-promote under Sprint 2b into a
+recursive `job_parallel_reduce` call from inside a worker,
+which deadlocks bpp_job (workers running the body cannot also
+drive new dispatch). This recursion-inside-worker case is
+flagged in code comments as a known Sprint 2b limitation.
+
+Tonify discipline: write-once-after-init globals declared
+`extrn`; `_prof_lazy_init` and similar declared `void` with
+no return; user-facing builtins named `profile_*` (not
+`sys_profile_*`) per Rule 10's reservation of `sys_` for
+syscall wrappers; `_prof_is_synth` left unannotated because
+`peek` triggers the W013 false positive on `@base`.
+
+Commit: `6171d73` — `bug Phase 6.4.1: cooperative sampling
+profiler`.
+
+### Deferred
+
+**Phase 6.4.2 — SIGPROF supplement.** Catches hotspots inside
+job bodies (the cooperative build cannot — sampling fires
+between jobs). Requires:
+
+1. New extern declarations for `setitimer(2)` and
+   `sigaction(2)`, or the syscall numbers piped through
+   `_bsys_macos.bsm`.
+2. A signal handler running on the user stack that captures
+   the interrupted code's PC. Two paths:
+   - **Trampoline-skip**: handler calls `_prof_capture` with
+     a higher base offset (e.g. `caller_pc(3 + i)` to skip
+     the handler frame plus the `__sigtramp` frame macOS
+     pushes). Brittle — the trampoline frame layout is not
+     a stable API.
+   - **mcontext read**: handler accesses `ucontext_t->uc_mcontext->__ss.__fp/__pc`
+     directly. Stable but requires struct-layout knowledge in
+     B++ (offsets baked into the source).
+3. Async-signal-safety: `_prof_capture` already avoids malloc
+   and only writes to pre-allocated rings, but the FP walk
+   uses `caller_pc` which dereferences memory — needs a
+   `_walk_safe` variant that bounds-checks against
+   `(_main_stack_lo, _main_stack_hi)` so a wild FP at signal
+   time produces a graceful early-stop instead of SIGSEGV
+   inside the handler.
+4. Linux backend: stays a stub until ELF dynlink + thread
+   parity ship. The macOS implementation is enough to ship
+   as the v1 of Phase 6.4.2.
+
+Phase 6.4.2 is its own session — the design considerations
+above are not safe to compress into "ship before sleep" mode.
+Plan and review before code.
+
+**Phase 6.5 — `caller(n)` sugar.** Trivial wrapper over
+`caller_pc(n) + caller_name(...)`. Lands when a real consumer
+in user code wants it (per `feedback_no_fallback.md`'s YAGNI
+rule). No design issues.
+
+**Sprint 2b auto-promote inside workers.** `for (i; i<N; i++)
+x = x + body(i)` inside a worker body recurses through
+`job_parallel_reduce`, deadlocking bpp_job. Two clean fixes:
+mark synth functions so the dispatch scanner skips loops
+inside them, or make `job_parallel_reduce` detect "I am a
+worker" and fall back to serial. The second is more
+defensive; the first is more efficient. Tracked but not
+blocking the v1 ship.
+
+**`profile_export_folded(path)`** — Brendan-Gregg folded-stacks
+export for flamegraph.pl. Format is `frameA;frameB;... <count>`
+per line. Plumbing exists (the aggregator already produces
+the data); deferred until the dump format proves insufficient.
+
+### Tree state
+
+Suites: 125/0/12 native + 105/0/32 C + test_panic.sh PASS.
+Bootstrap byte-stable. Phase 6.3 + 6.4.1 ship in two clean
+commits + the GPU determinism fix. Roadmap on track for
+6.4.2 in a fresh session.
