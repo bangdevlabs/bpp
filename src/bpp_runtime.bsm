@@ -560,12 +560,31 @@ void _prof_capture(t)@io {
 // slots. Async-signal-safe: pre-allocated rings, no malloc, no
 // syscalls.
 void _prof_sigprof_handler(sig, info, uctx)@io {
-    auto mctx, pc, fp;
+    auto mctx, pc, fp, idx;
     if (_prof_active == 0) { return; }
     mctx = peek_w(uctx + 48);
     pc   = peek_w(mctx + 272);
     fp   = peek_w(mctx + 248);
-    _prof_capture_at(0, pc, fp);
+    // Per-thread routing: the kernel may deliver SIGPROF to any
+    // thread that does not have it blocked. Without this lookup
+    // a worker's sample would corrupt main's ring. _job_thread_idx
+    // returns 0 when the pool is not running or when the caller
+    // is the original main thread.
+    idx = _job_thread_idx();
+    _prof_capture_at(idx, pc, fp);
+
+    // Fan-out from main: ask each worker to sample its own
+    // mcontext on the same tick. Without this, SIGPROF tends to
+    // land on whichever thread the kernel scheduled into the user
+    // CPU window — typically just one — and the profile misses
+    // the others entirely on each tick. pthread_kill is on the
+    // async-signal-safe list, so this is safe to call from inside
+    // a signal handler. Workers are deliberately exempt from
+    // fan-out to avoid a feedback storm where worker-handlers
+    // re-fan to main and back.
+    if (idx == 0) {
+        _job_fanout_sigprof();
+    }
 }
 
 // Capture into ring `t`, seeding the innermost frame with the

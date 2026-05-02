@@ -94,7 +94,42 @@ static auto _job_inited;
 // keeps producing the right answer, just without the inner
 // dispatch parallelism. Auto-promoted reductions inside worker
 // bodies are the most common way to land here.
-static extrn _job_main_tid;
+extrn _job_main_tid;
+
+// Map the calling thread's pthread_t to a profiler ring slot
+// index: 0 for main, 1..N for workers. Used by the SIGPROF
+// handler so a sample lands in the correct per-thread ring
+// regardless of which thread the kernel chose to deliver the
+// timer to. Returns 0 (main) when the pool is not initialised
+// or when the caller cannot be matched against any worker.
+_job_thread_idx() {
+    auto self_tid, i;
+    auto w: Worker;
+    if (_job_inited == 0) { return 0; }
+    self_tid = _thread_id();
+    if (self_tid == _job_main_tid) { return 0; }
+    for (i = 0; i < _job_n_workers; i++) {
+        w = _job_workers[i];
+        if (w.tid == self_tid) { return i + 1; }
+    }
+    return 0;
+}
+
+// Send SIGPROF (signal 27) to every worker so each captures
+// its own mcontext on the same timer tick. Called from the
+// SIGPROF handler when running on main. AS-safe: pthread_kill
+// is on the POSIX async-signal-safe list, no malloc, no syscall
+// allocation. Workers are the producers of their own ring slots,
+// so per-tick fan-out scales linearly with worker count.
+void _job_fanout_sigprof() {
+    auto i;
+    auto w: Worker;
+    if (_job_inited == 0) { return; }
+    for (i = 0; i < _job_n_workers; i++) {
+        w = _job_workers[i];
+        pthread_kill(w.tid, 27);
+    }
+}
 
 // Worker thread entry point. Receives a Worker* in arg and runs the
 // pop-execute-advance loop forever, until it sees a shutdown sentinel
