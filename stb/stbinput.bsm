@@ -243,6 +243,22 @@ static void _action_init() {
 // Re-registering an existing name updates its binding (same as
 // action_rebind — convenient for "defaults then prefs_load
 // overrides" startup sequences).
+//
+// The action table OWNS its name strings via str_dup on first
+// registration. Earlier the contract was "callers must pass a
+// literal whose lifetime outlives the table"; that contract was
+// quietly broken by `prefs_load`, which passes pointers into a
+// json document buffer freed at the end of the function. The
+// next `prefs_save` then dereferenced the dangling pointer and
+// crashed inside _json_emit_escaped. Owning the bytes makes the
+// table immune to the caller's storage discipline at the cost
+// of one strdup per action — there are typically a dozen of
+// these per program, so the cost is invisible.
+//
+// On rebind (existing name), `name_ptr` is left untouched
+// because the stored copy already matches; updating key/mod is
+// the entire job. Avoids both an unnecessary strdup churn AND a
+// leak of the previously-owned name copy.
 void action_define(name, key, mod) {
     auto hash, idx, a: Action, ap;
     if (_actions == 0) { _action_init(); }
@@ -252,13 +268,16 @@ void action_define(name, key, mod) {
         if (_action_count >= _ACTION_MAX) { return; }
         idx = _action_count;
         _action_count++;
+        ap = _actions + idx * sizeof(Action);
+        a = ap;
+        a.hash     = hash;
+        a.name_ptr = str_dup(name);
+    } else {
+        ap = _actions + idx * sizeof(Action);
+        a = ap;
     }
-    ap = _actions + idx * sizeof(Action);
-    a = ap;
-    a.hash     = hash;
-    a.name_ptr = name;
-    a.key      = key;
-    a.mod      = mod;
+    a.key = key;
+    a.mod = mod;
 }
 
 // Update an existing action's binding. If the name isn't
