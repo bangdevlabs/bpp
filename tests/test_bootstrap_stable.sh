@@ -28,39 +28,16 @@ fi
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
-# Helper: retry up to N times for a successful bpp invocation.
-# Compiling `src/bpp.bpp` itself currently has a transient
-# ASLR-correlated failure mode that produces garbled diagnostics
-# on ~20% of runs without affecting the output byte-shape on
-# successful runs. Tracked separately from the byte-stability
-# invariant this test enforces; the retry just lets the test
-# verify the deterministic property without false negatives
-# from the unrelated transient. Logged in journal and todo.
-try_build() {
-    out=$1; src=$2; bpp=$3
-    n=0
-    while [ $n -lt 8 ]; do
-        n=$((n + 1))
-        "$bpp" "$src" -o "$out" </dev/null >/dev/null 2>/dev/null
-        if [ -s "$out" ]; then return 0; fi
-    done
-    return 1
-}
-
 # Triple-bootstrap. gen1 may differ from gen0 (the installed bpp)
 # whenever the codegen has changed, so the comparison runs
 # starting at gen1 onwards — gen1 is the first build emitted by
 # a NEW-pattern compiler. Streams are fully detached from the
 # parent shell so a piped or closed inherited stdin does not
 # upset the bpp diag emitter.
-try_build "$TMP/gen1" src/bpp.bpp ./bpp \
-    || { echo "FAIL: cannot build gen1 (8 attempts)"; exit 1; }
-try_build "$TMP/gen2" src/bpp.bpp "$TMP/gen1" \
-    || { echo "FAIL: cannot build gen2 (8 attempts)"; exit 1; }
-try_build "$TMP/gen3" src/bpp.bpp "$TMP/gen2" \
-    || { echo "FAIL: cannot build gen3 (8 attempts)"; exit 1; }
-try_build "$TMP/gen4" src/bpp.bpp "$TMP/gen3" \
-    || { echo "FAIL: cannot build gen4 (8 attempts)"; exit 1; }
+./bpp        src/bpp.bpp -o "$TMP/gen1" </dev/null >/dev/null 2>/dev/null
+"$TMP/gen1"  src/bpp.bpp -o "$TMP/gen2" </dev/null >/dev/null 2>/dev/null
+"$TMP/gen2"  src/bpp.bpp -o "$TMP/gen3" </dev/null >/dev/null 2>/dev/null
+"$TMP/gen3"  src/bpp.bpp -o "$TMP/gen4" </dev/null >/dev/null 2>/dev/null
 
 # gen2 onwards must be byte-stable. gen1 may differ when the
 # installed compiler emits a different pattern from what the
@@ -73,10 +50,8 @@ cmp "$TMP/gen3" "$TMP/gen4" \
 # Same compiler binary applied to the same source twice in a row
 # must produce byte-identical output. This catches in-process
 # nondeterminism that the fixpoint check above could mask.
-try_build "$TMP/run_a" src/bpp.bpp "$TMP/gen2" \
-    || { echo "FAIL: cannot build run_a (8 attempts)"; exit 1; }
-try_build "$TMP/run_b" src/bpp.bpp "$TMP/gen2" \
-    || { echo "FAIL: cannot build run_b (8 attempts)"; exit 1; }
+"$TMP/gen2" src/bpp.bpp -o "$TMP/run_a" </dev/null >/dev/null 2>/dev/null
+"$TMP/gen2" src/bpp.bpp -o "$TMP/run_b" </dev/null >/dev/null 2>/dev/null
 cmp "$TMP/run_a" "$TMP/run_b" \
     || { echo "FAIL: same-compiler same-source produced different output"; exit 1; }
 
