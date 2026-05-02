@@ -2246,35 +2246,6 @@ static _dsp_make_memst(addr_node, val_node) {
     return n;
 }
 
-// Build a T_DECL node declaring a single packed name as an auto local.
-// Mirrors the parser's `auto x;` shape: list_arr is a 1-slot pointer
-// array containing the packed name, count is 1, no type hint.
-static _dsp_make_decl1(name_p) {
-    auto n: Node, arr;
-    arr = malloc(8);
-    *arr = name_p;
-    n = make_node(T_DECL);
-    n.a = arr;
-    n.b = 1;
-    n.c = 0;
-    n.d = 0;
-    n.e = 0;
-    return n;
-}
-
-// Build a T_BLOCK node wrapping a heap array of `cnt` statement
-// pointers. Caller owns the array allocation lifetime. Used to
-// splice multi-statement sequences into a slot that can hold only
-// a single Node*.
-static _dsp_make_block(stmts_arr, cnt) {
-    auto n: Node;
-    n = make_node(T_BLOCK);
-    n.a = 0;
-    n.b = stmts_arr;
-    n.c = cnt;
-    return n;
-}
-
 // Walk an AST subtree and replace every T_VAR with a.packed == old_p
 // by a T_VAR with a.packed == new_p. Used to retarget the user's
 // accumulator name to a fresh local inside the synthesised worker.
@@ -2357,15 +2328,15 @@ static void _dsp_rename_var(nd, old_p, new_p) {
 // for bitwise-and. Sprint 2b parallelises the additive case end-to-end;
 // non-additive ops still detect but stay serial until the synthesiser
 // learns their shape (tree-reduce shifts, in particular, need extra
-// bookkeeping). Returns sentinel `-1` for unsupported ops so the
-// caller can fall back gracefully.
-static _dsp_red_identity_for(op_ch) {
+// bookkeeping). Returns sentinel `-2` for unsupported ops so the
+// caller can fall back gracefully. Pure helper — no side effects.
+static _dsp_red_identity_for(op_ch)@base {
     if (op_ch == '+') { return 0; }
     if (op_ch == '|') { return 0; }
     if (op_ch == '^') { return 0; }
     if (op_ch == '*') { return 1; }
     if (op_ch == '&') { return 0 - 1; }
-    return 0 - 2;   // unsupported sentinel
+    return 0 - 2;
 }
 
 // Materialise a fresh packed name in vbuf. Used for the synthetic
@@ -2389,22 +2360,23 @@ static auto _synth_counter;
 // partial-result buffer that live in bpp_job.bsm. The synth bodies
 // reference these by name; resolved once per compilation so the
 // vbuf does not balloon when many reductions land in one program.
-static auto _dsp_disp_chunk_start_p;
-static auto _dsp_disp_chunk_end_p;
-static auto _dsp_disp_partials_p;
-static auto _dsp_jpr_name_p;
-static auto _dsp_red_locals_inited;
+// Written exactly once by `_dsp_red_lazy_init` — write-once-after-init
+// matches Rule 1's `extrn` storage class.
+static extrn _dsp_disp_chunk_start_p;
+static extrn _dsp_disp_chunk_end_p;
+static extrn _dsp_disp_partials_p;
+static extrn _dsp_jpr_name_p;
+static extrn _dsp_red_locals_inited;
 
 // Initialise the cached packed names. Called once on the first
 // reduction candidate the synthesiser actually parallelises.
-static _dsp_red_lazy_init() {
-    if (_dsp_red_locals_inited != 0) { return 0; }
+static void _dsp_red_lazy_init() {
+    if (_dsp_red_locals_inited != 0) { return; }
     _dsp_disp_chunk_start_p = _dsp_pack_local("_disp_chunk_start", 17);
     _dsp_disp_chunk_end_p   = _dsp_pack_local("_disp_chunk_end",   15);
     _dsp_disp_partials_p    = _dsp_pack_local("_disp_partials",    14);
     _dsp_jpr_name_p         = _dsp_pack_local("job_parallel_reduce", 19);
     _dsp_red_locals_inited = 1;
-    return 0;
 }
 
 // Build `*(buf_p + idx_var_p * 8)` as a T_MEMLD over a synthesised
@@ -2772,9 +2744,9 @@ static _dsp_pack_cstr(s) {
 // Cached packed names for the combine-loop scratch globals declared
 // in bpp_job.bsm. The rewriter reuses one shared (k, ci) pair across
 // every reduction in the program — reductions never overlap on main
-// so a single slot is safe.
-static auto _dsp_red_k_p;
-static auto _dsp_red_ci_p;
+// so a single slot is safe. Set once at first call site.
+static extrn _dsp_red_k_p;
+static extrn _dsp_red_ci_p;
 
 // Transform every candidate loop into a call to job_parallel_for and
 // wire the new edges so mark_reachable sees the synth function and

@@ -63,9 +63,12 @@ should_skip() {
             [ "$OS" != "Darwin" ] && echo "skip:phase1-macos-only" && return
             ;;
         test_gpu_*|test_stbgame_native|test_gameinfra)
-            # GPU + window smoke tests. They open a real window and run
-            # for a fixed number of frames before auto-exiting (30 frames
-            # ≈ 0.5 s). On a host with no display the runner skips them.
+            # GPU + window smoke tests. They open a real window, run a
+            # fixed loop, and call sys_exit(0) explicitly. The exit is
+            # required because relying on the platform's auto-exit path
+            # (window-close detection or the runner's SIGKILL) flaked
+            # depending on whether the Cocoa window won focus that run.
+            # On a host with no display the runner skips them.
             [ "$HAS_DISPLAY" -eq 0 ] && echo "skip:no-display" && return
             ;;
         test_native_debug)

@@ -173,6 +173,18 @@ for src in "$TESTS_DIR"/test_*.bpp; do
         continue
     fi
 
+    # skip-c: tests whose first three lines carry `// skip-c: <reason>`
+    # are intentionally exempt from the C backend. Used when the test
+    # asserts native-only behaviour (e.g. caller_pc relies on the
+    # minisym section the C path does not emit, so the test would
+    # always return non-zero in the C suite by design).
+    if head -3 "$src" | grep -q '^// skip-c:'; then
+        reason=$(head -3 "$src" | sed -n 's|^// skip-c: \(.*\)|\1|p' | head -1)
+        printf "  SKIP  %-40s (%s)\n" "$name" "$reason"
+        SKIP=$((SKIP + 1))
+        continue
+    fi
+
     skip=$(should_skip "$name")
     if [ -n "$skip" ]; then
         printf "  SKIP  %-40s (%s)\n" "$name" "${skip#skip:}"

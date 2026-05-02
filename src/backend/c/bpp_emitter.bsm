@@ -538,9 +538,16 @@ void emit_node(nd) {
     }
 
     if (t == T_MEMLD) {
-        // Bit-packed field reads: load the containing byte, shift the field
-        // down to bit 0, mask off the high bits. The pointer expression
-        // built by resolve_dot is pure, so evaluating it once is enough.
+        // Sub-word and float-typed field reads. The field hint `n.b`
+        // packs both base type (int vs float) and slice width
+        // (FULL/HALF/QUARTER/BYTE/BIT*). Without a width-aware load,
+        // every field read used `long long*` (8 bytes), which clobbered
+        // adjacent fields and silently lost sign extension on signed
+        // sub-word slices. test_signed_half exposed this once the C
+        // shim started forwarding main_bpp's return code.
+        //
+        // Bit-packed field reads: load the containing byte, shift the
+        // field down to bit 0, mask off the high bits.
         auto ld_sl, ld_bo, ld_bw, ld_mask;
         ld_sl = ty_slice(n.b);
         if (ld_sl >= SL_BIT && ld_sl <= SL_BIT7) {
@@ -556,6 +563,46 @@ void emit_node(nd) {
             out("))");
             return;
         }
+        // Float reads: pick float (32-bit) or double (64-bit) based on slice.
+        // The C result is implicitly promoted to double when stored into a
+        // `long long`-typed local, so cast through (double).
+        if (is_float_type(n.b)) {
+            if (ld_sl == SL_HALF) {
+                out("((double)(*(float*)((uintptr_t)(");
+                emit_node(n.a);
+                out("))))");
+                return;
+            }
+            // SL_FULL float = double.
+            out("(*(double*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")))");
+            return;
+        }
+        // Integer reads. Byte and quarter are UNSIGNED in B++
+        // (matching LDRB/LDRH zero-extend on ARM64). Half is SIGNED
+        // (matching LDRSW). The native codegen uses these exact
+        // widths/signs; the C path mirrors them via the matching
+        // pointer cast so round-trip matches the native suite.
+        if (ld_sl == SL_BYTE) {
+            out("((long long)(*(uint8_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out("))))");
+            return;
+        }
+        if (ld_sl == SL_QUARTER) {
+            out("((long long)(*(uint16_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out("))))");
+            return;
+        }
+        if (ld_sl == SL_HALF) {
+            out("((long long)(*(int32_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out("))))");
+            return;
+        }
+        // SL_FULL int (or unhinted): full 64-bit load.
         out("(*(long long*)((uintptr_t)(");
         emit_node(n.a);
         out(")))");
@@ -570,6 +617,12 @@ void emit_node(nd) {
     }
 
     if (t == T_MEMST) {
+        // Sub-word and float-typed field writes. Field hint `n.c`
+        // carries the same base+slice packing as T_MEMLD's `n.b`.
+        // Without a width-aware store, every field write used
+        // `*(long long*) = ...`, which wrote 8 bytes and corrupted
+        // adjacent fields in any sub-word struct.
+        //
         // Bit-packed field writes: read-modify-write the containing byte.
         // The pointer expression is pure (built by resolve_dot from a base
         // var plus a constant offset), so evaluating it twice is safe and
@@ -596,6 +649,52 @@ void emit_node(nd) {
             out("))))");
             return;
         }
+        // Float writes at the matching width. SL_HALF stores as 32-bit
+        // float (narrowing); SL_FULL stores as double.
+        if (is_float_type(n.c)) {
+            if (st_sl == SL_HALF) {
+                out("(*(float*)((uintptr_t)(");
+                emit_node(n.a);
+                out(")) = (float)(");
+                emit_node(n.b);
+                out("))");
+                return;
+            }
+            out("(*(double*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) = (double)(");
+            emit_node(n.b);
+            out("))");
+            return;
+        }
+        // Integer writes at the matching width. The cast on the RHS
+        // truncates the source `long long` to the destination width,
+        // matching ARM64 STRB/STRH/STR W semantics.
+        if (st_sl == SL_BYTE) {
+            out("(*(int8_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) = (int8_t)(");
+            emit_node(n.b);
+            out("))");
+            return;
+        }
+        if (st_sl == SL_QUARTER) {
+            out("(*(int16_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) = (int16_t)(");
+            emit_node(n.b);
+            out("))");
+            return;
+        }
+        if (st_sl == SL_HALF) {
+            out("(*(int32_t*)((uintptr_t)(");
+            emit_node(n.a);
+            out(")) = (int32_t)(");
+            emit_node(n.b);
+            out("))");
+            return;
+        }
+        // SL_FULL int (or unhinted): full 64-bit store.
         out("*(long long*)((uintptr_t)(");
         emit_node(n.a);
         out(")) = ");
@@ -1734,6 +1833,13 @@ void emit_functions() {
 }
 
 // Emit the C main() entry point with argv/argc storage.
+//
+// Forwards `main_bpp`'s return value to the process exit code so a
+// failing test (which signals failure with `return N;`) shows up via
+// the OS exit status. A previous version dropped the return and
+// always exited 0, which silently masked logic failures in the C
+// transpilation suite — every `return N;` from a B++ test was
+// reported as PASS as long as the program did not crash.
 void emit_main_entry() {
     auto i, has_main;
     has_main = 0;
@@ -1744,8 +1850,11 @@ void emit_main_entry() {
     out("  _bpp_argc = (long long)argc;"); putchar('\n');
     out("  _bpp_argv = (long long)(uintptr_t)argv;"); putchar('\n');
     out("  _bpp_envp = (long long)(uintptr_t)envp;"); putchar('\n');
-    if (has_main) { out("  main_bpp();"); putchar('\n'); }
-    out("  return 0;"); putchar('\n');
+    if (has_main) {
+        out("  return (int)main_bpp();"); putchar('\n');
+    } else {
+        out("  return 0;"); putchar('\n');
+    }
     out("}"); putchar('\n');
 }
 
