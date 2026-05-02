@@ -85,6 +85,17 @@ static auto _job_workers;       // array of Worker pointers, length _job_n_worke
 static auto _job_next;          // round-robin submit counter
 static auto _job_inited;
 
+// Identity of the thread that called `job_init`. Used by the
+// parallel-for / parallel-reduce drivers to detect "I am being
+// called from a worker, not from main" — a worker that submits
+// new jobs and then blocks on `job_wait_all` deadlocks the pool
+// (the consumer it is waiting for is itself). The fix is a
+// transparent serial fallback in that case; the user's program
+// keeps producing the right answer, just without the inner
+// dispatch parallelism. Auto-promoted reductions inside worker
+// bodies are the most common way to land here.
+static extrn _job_main_tid;
+
 // Worker thread entry point. Receives a Worker* in arg and runs the
 // pop-execute-advance loop forever, until it sees a shutdown sentinel
 // (fn_ptr = 0) at which point it returns.
@@ -159,6 +170,12 @@ job_init(n_workers) {
     _job_n_workers = n_workers;
     _job_workers = buf_word(n_workers);
     _job_next = 0;
+
+    // Snapshot the calling thread's identity. Anything that submits
+    // jobs from a different thread (i.e. a worker) will be detected
+    // by the parallel-for / parallel-reduce drivers and serviced
+    // serially.
+    _job_main_tid = _thread_id();
 
     for (i = 0; i < n_workers; i++) {
         w = malloc(sizeof(Worker));
@@ -257,6 +274,16 @@ job_parallel_for(n, fn) {
         }
         return 0;
     }
+    // Worker-recursion guard: submitting from a worker and then
+    // blocking on `job_wait_all` would deadlock the pool. Detect
+    // and fall back to serial. Same answer, no parallelism, but
+    // the program still terminates.
+    if (_thread_id() != _job_main_tid) {
+        for (i = 0; i < n; i++) {
+            call(fn, i);
+        }
+        return 0;
+    }
     for (i = 0; i < n; i++) {
         job_submit(fn, i);
     }
@@ -345,6 +372,18 @@ job_parallel_reduce(n, fn) {
         *(_disp_chunk_start)     = 0;
         *(_disp_chunk_end)       = n;
         *(_disp_partials)        = 0;
+        call(fn, 0);
+        return 1;
+    }
+
+    // Worker-recursion guard: the same deadlock prevention as
+    // job_parallel_for. Workers calling reduce would submit to
+    // queues whose only consumers are the workers themselves.
+    // Serial single-chunk fallback keeps the math correct.
+    if (_thread_id() != _job_main_tid) {
+        *(_disp_chunk_start) = 0;
+        *(_disp_chunk_end)   = n;
+        *(_disp_partials)    = 0;
         call(fn, 0);
         return 1;
     }
