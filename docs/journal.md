@@ -5833,6 +5833,142 @@ Commit: `a1e2b32` — `bug Phase 6.4.2: SIGPROF supplement
 Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS.
 Bootstrap byte-stable. Phase 6 closes its primary user-visible
 roadmap with 6.3 (panic) + 6.4.1 (cooperative) + 6.4.2 (signal)
-shipped. Phase 6.5 (`caller(n)` sugar) and worker-thread
-SIGPROF supplement remain — both deferred until a real
-consumer asks.
+shipped.
+
+## 2026-05-02 (final) — Track A: recursive deadlock + worker SIGPROF
+
+Two follow-up items the user flagged as "you keep deferring
+these — they should ship in the same Phase 6 window." They were
+right: both turned out to be small, both correctness-relevant.
+No reason to leave them in the deferred bucket.
+
+### Item 1 — Recursive-dispatch deadlock guard
+
+Scenario: a function `f` runs as a worker job (submitted via
+`job_submit(fn_ptr(f), ...)`) and contains an additive reduction
+loop. Sprint 2b auto-promotes the inner loop into a recursive
+`job_parallel_reduce` call. The reducer submits N chunk jobs
+back to the pool and blocks on `job_wait_all` — but the workers
+the queue needs to drain are the same workers stuck in the
+inner reducer. Hard hang.
+
+The fix is at the dispatch driver, not the synthesiser: snapshot
+the calling thread's pthread_t as `_job_main_tid` at `job_init`,
+then have `job_parallel_for` and `job_parallel_reduce` compare
+against `_thread_id()` at entry. Mismatch → serial fallback.
+Same correct answer, no parallelism on the inner level — but
+the program completes instead of deadlocking.
+
+Per-OS hook lives in `_core_<os>.bsm`:
+- macOS: `_thread_id()` returns `pthread_self()`. The opaque
+  `pthread_t` pointer stays stable across the thread's
+  lifetime, so direct equality is enough — no `pthread_equal`.
+- Linux: `_thread_id()` returns `1`. No real pthread support
+  yet (waits on ELF dynlink), so the guard collapses to a
+  trivial no-op until Linux thread parity ships.
+
+Tested by reverting `tests/test_profile_cooperative.bpp` to the
+original additive `x = x + i` body inside `work_fn`. Earlier
+that body was the workaround target — `x = x * 3 + i` to dodge
+the deadlock. With the guard in place, the additive shape is
+the right expression to test against, and 1000 jobs × 4 workers
+complete in milliseconds.
+
+Commit: `14bcdde` — `multicore Sprint 2b: worker-recursion
+guard for parallel_for/reduce`.
+
+### Item 2 — Worker-thread SIGPROF via pthread_kill
+
+Phase 6.4.2 shipped with the SIGPROF handler always writing
+into ring 0 regardless of which thread the kernel chose to
+deliver the timer signal to. Workers' samples were silently
+mislabelled as main-thread samples — and worse, when ITIMER_PROF
+naturally favoured a busy thread (the kernel often does), the
+"main" tally became a confusing mix of main + every busy
+worker, with the actual hot work invisible. Garbage-in,
+garbage-out: the profile output looked dominated by `main`
+no matter what the program did.
+
+Routing fix
+- `_job_thread_idx()` in `bpp_job.bsm`: maps the calling
+  pthread_t to a profiler ring slot. 0 = main, 1..N = workers
+  by linear scan against `_job_workers[i].tid`. Returns 0 for
+  unknown / pre-init threads.
+- The handler reads the index once per tick and feeds it to
+  `_prof_capture_at(idx, pc, fp)`. No change to the capture
+  primitive — just routing.
+
+Fan-out
+- `_job_fanout_sigprof()` calls `pthread_kill(worker.tid, SIGPROF)`
+  for every worker. The handler invokes fan-out only when
+  running on main — feedback storms otherwise.
+- Without fan-out, a single SIGPROF tick samples one thread.
+  With fan-out, every worker captures its own mcontext on
+  the same tick, so an N-worker program produces N samples
+  per tick instead of one.
+- pthread_kill is on the POSIX async-signal-safe list, so the
+  call is legal from inside the SIGPROF handler.
+
+C-path bridge
+- `bpp_emitter.bsm`: special-case `pthread_self` and
+  `pthread_kill` to bridge B++'s `long` type to POSIX's
+  opaque `pthread_t` via a `(uintptr_t)` round-trip. Both
+  names also flagged in `is_libc_symbol` so the emitter
+  skips its forward decl that would clash with the strict
+  POSIX prototypes.
+
+Verification
+- Manual run of `/tmp/test_worker_profile.bpp`: 200 jobs ×
+  4 workers, each spinning 5M iters of `x * 31 + i`. Dump:
+  ```
+  272  work_fn
+  202  _job_worker_main
+    1  job_wait_all
+    1  _prof_capture_n
+  ```
+  Pre-fix, `work_fn` did not appear at all and every sample
+  resolved to whatever main was doing. Now 272/476 = 57% of
+  samples land in the actual hot body — exactly the answer a
+  user asks the profiler.
+- Native suite 126/0/12, C suite 105/0/33, test_panic.sh PASS.
+
+Commit: `b673e20` — `bug Phase 6.4.2 follow-up: worker-thread
+SIGPROF via pthread_kill`.
+
+### What's left in the deferred bucket
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Recursive-dispatch deadlock guard | ✅ shipped |
+| 2 | Worker-thread SIGPROF | ✅ shipped |
+| 3 | `profile_export_folded` (flamegraph) | YAGNI — defer |
+| 4 | Phase 6.5 `caller(n)` sugar | YAGNI — defer |
+| 5 | Linux SIGPROF | blocked on ELF dynlink + thread parity (3-5 sessions, separate epic) |
+
+Items 3 and 4 stay deferred per `feedback_no_fallback.md`'s
+YAGNI rule — no consumer in user code asks for them yet. Item
+5 is its own multi-session project that depends on Linux
+thread parity, which itself depends on ELF dynlink. Tracked
+in `docs/multicore_state_report.md`.
+
+### Lesson
+
+When a workaround in a test deflects a real bug into a comment
+("known issue"), the next session should re-evaluate before
+closing — not let it inherit "deferred" status by default.
+Sprint 2b's deadlock got papered over with `x * 3 + i` in the
+test body the same session it surfaced; flagging it as
+"~30 LOC, ½ session" the user could see directly was the
+right move, but I dropped it. The user calling it out
+("porque vocês insistem em não fazer o sprint 2b") was the
+correct prompt. Saved as feedback memory pattern: workaround-
+in-test → revisit-before-EOD checklist.
+
+### Tree state
+
+Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS.
+Bootstrap byte-stable. Phase 6 fully closed: panic + cooperative
+profiler + signal supplement + worker fan-out + recursion
+guard. Next decision is Wolf3D (use the new profiler to
+optimize ray casting) vs multicore Sprint 5 (ELF dynlink →
+Linux first-class) vs Tier F (CSE, register allocator v2).

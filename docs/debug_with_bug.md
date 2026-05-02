@@ -527,9 +527,64 @@ investigation.
 | Phase 5.2  | `viz_render_rgba` (TUI 24-bit colour) | shipped |
 | Phase 5.4  | `@viz` source annotations | shipped |
 | Phase 5.3  | GUI live debugger (`the_bug` Run / Continue / Stop, watch + viz panels) | shipped |
-| Phase 6    | Profiler + runtime symbolication + `panic()` + `caller(n)` | planned |
+| Phase 6.1  | Minisym section emission (Mach-O `__minisym`, ELF PT_NOTE `BPPMINI`) | shipped |
+| Phase 6.2  | Runtime PC resolution (`_runtime_resolve_pc`) + `caller_pc` / `caller_name` builtins | shipped |
+| Phase 6.3  | `panic(msg)` with stack trace via FP walk + `_runtime_resolve_pc` | shipped |
+| Phase 6.4.1 | Cooperative sampling profiler (boundaries in `bpp_job` workers + maestro phases) | shipped |
+| Phase 6.4.2 | SIGPROF supplement (macOS): per-thread mcontext capture + pthread_kill fan-out | shipped |
+| Phase 6.5  | `caller(n)` sugar wrapper over `caller_pc` + `caller_name` | deferred (YAGNI — no consumer yet) |
 
 Phase 6 detail: see `docs/bug_phase6_plan.md`.
+
+---
+
+## Phase 6 user-facing API
+
+A program built with `bpp` automatically links the runtime
+profiler and panic primitives — no import required (the
+`bpp_runtime.bsm` module is auto-injected, same path as
+`bpp_io.bsm`).
+
+```bpp
+// Crash with a stack trace and exit 134 (SIGABRT convention).
+// The trace lists every frame from the panic site up to main.
+panic("invariant broken: cap < 0");
+
+// Sampling profiler. profile_start arms a 1 kHz ITIMER_PROF
+// + cooperative boundary hooks; profile_stop disarms; dump
+// returns top-N (packed_name, count) pairs sorted by count.
+profile_start(1000, 8);   // rate_hz, max stack depth
+... user workload ...
+profile_stop();
+
+auto buf;
+buf = buf_word(16 * 2);             // 16 entries × 2 words
+auto n;
+n = profile_dump(buf, 16);
+auto i, packed, name_addr, name_len;
+for (i = 0; i < n; i++) {
+    packed = *(buf + i * 16);
+    putnum(*(buf + i * 16 + 8)); putchar(' ');
+    name_addr = _runtime_name_addr(packed);
+    name_len  = _runtime_name_len(packed);
+    sys_write(1, name_addr, name_len);
+    putchar('\n');
+}
+
+// Caller introspection. caller_pc(n) walks n frames up the FP
+// chain; caller_name(pc) resolves via the embedded minisym.
+caller_pc(0)               // current function's body PC
+caller_pc(1)               // caller's PC
+caller_name(caller_pc(0))  // packed name of the current function
+```
+
+The profiler captures samples from every worker thread when
+SIGPROF fires on main: the handler reads its own
+`ucontext.uc_mcontext.__ss.__pc` and then `pthread_kill`s each
+worker so each captures its own state on the same tick. The
+synth-name re-attribution (`__synth_K` → caller frame) keeps
+auto-dispatched loop bodies from appearing as anonymous workers
+in the profile output.
 
 ---
 
@@ -542,15 +597,13 @@ Phase 6 detail: see `docs/bug_phase6_plan.md`.
 - **Linux GUI not wired.** `bug_observe_linux.bsm` speaks the
   GDB protocol but the GUI wrapper depends on the macOS Cocoa
   platform layer. Waits for Linux X11 GUI maturity.
-- **No `panic()` builtin.** Programs can't deliberately abort
-  with a stack trace yet — Phase 6.3 lands that.
-- **No sampling profiler.** No `sys_profile_*` API yet —
-  Phase 6.4 lands that, with cooperative sampling at
-  `bpp_job` / `maestro` boundaries plus a signal-based
-  supplement for audio / main thread.
-- **No runtime caller introspection.** `caller(n)` lives in
-  Phase 6.5 once minisym + `_runtime_resolve_pc` ship in
-  Phase 6.1+6.2.
+- **Linux SIGPROF profiling.** Stubbed in `_core_linux.bsm`
+  until ELF dynlink + thread parity ship — Linux runs single-
+  threaded today, so the cooperative path covers it without
+  the supplement.
+- **No flamegraph export.** `profile_dump` returns the top-N
+  table; folded-stacks export for `flamegraph.pl` lands when a
+  consumer asks (YAGNI).
 
 For the broader roadmap (Wolf3D, multicore Sprints, etc.), see
 `docs/bug_viz_plan.md` and `docs/multicore_state_report.md`.

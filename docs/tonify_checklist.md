@@ -503,8 +503,9 @@ serializers.
 ## Rule 16: `bpp_buf` bulk operations replace manual loops
 
 For byte-level bulk operations, prefer the `bpp_buf` API over hand-rolled
-loops. The intent is clearer, and the implementations will upgrade to
-`memset`/`memmove` syscall wrappers when `bpp_runtime` ships.
+loops. The intent is clearer, and the implementations are free to upgrade
+to `memset`/`memmove` syscall wrappers as the runtime grows
+(`bpp_runtime.bsm` shipped in Phase 6.1).
 
 | Before | After | Notes |
 |--------|-------|-------|

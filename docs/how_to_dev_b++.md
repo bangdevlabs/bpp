@@ -1173,8 +1173,188 @@ b = 0;
 ## Cap 13 — Runtime ABI (bpp_runtime)
 
 *Depends on: Cap 9*
-*Source: new module bpp_runtime.bsm*
-*Status: PENDING — module bpp_runtime.bsm does not exist yet; Fase 1.4 creates it*
+*Source: `src/bpp_runtime.bsm` (auto-injected)*
+
+`bpp_runtime.bsm` is the contract between every B++ program and
+the OS-specific core (`_core_macos.bsm` / `_core_linux.bsm`).
+Auto-injected: no import needed. Three user-facing capabilities
+ship in the module today, all built on top of the embedded
+`__minisym` section every native binary carries.
+
+### §13.1 — `panic(msg)` — abort with a stack trace
+
+`panic(msg)` writes `panic: <msg>\n` to stderr, walks the FP
+chain up to 32 frames printing `at <name>` per resolved frame,
+and exits with code 134 (128 + SIGABRT). Use it when an
+internal invariant has broken and the user has no recovery
+path:
+
+```bpp
+if (cap < 0) {
+    panic("buf_alloc: negative capacity");
+}
+```
+
+Output:
+
+```
+panic: buf_alloc: negative capacity
+  at buf_alloc
+  at strbuf_grow
+  at strbuf_cat
+  at main
+```
+
+The classifier sees `panic` as `@io` (it writes to stderr), so
+any `@time` audio callback that reaches `panic` lights up W026
+at compile time. This catches realtime-IO violations before
+production hits an audible glitch.
+
+C-path fallback: `bpp --c` rewrites the call to
+`(fprintf(stderr, "panic: %s\n", msg), abort(), 0LL)`. No stack
+trace there (no minisym, no portable FP walker), but the exit
+code stays consistent.
+
+### §13.2 — `caller_pc(n)` / `caller_name(pc)` — introspection
+
+`caller_pc(n)` returns the PC at depth `n` of the FP chain
+counted from the calling function. `caller_pc(0)` is the
+current function's own body PC; `caller_pc(1)` is the immediate
+caller; and so on. Walking off the end returns 0 (the chip
+primitive guards every iteration with a null-FP check).
+
+`caller_name(pc)` resolves a PC to a packed name reference via
+`_runtime_resolve_pc`. The result is `(strtab_off << 32) |
+name_len`; unpack with the helpers from §13.3.
+
+```bpp
+// Where am I right now?
+log_who(level) {
+    auto packed, addr, len;
+    packed = caller_name(caller_pc(1));   // 1 = log_who's caller
+    if (packed != 0) {
+        addr = _runtime_name_addr(packed);
+        len  = _runtime_name_len(packed);
+        sys_write(1, addr, len);
+        putchar(' ');
+    }
+    putnum(level);
+    putchar('\n');
+}
+```
+
+Useful for ad-hoc tracing without breakpoints. For systematic
+profiling, use the sampling profiler in §13.4 instead.
+
+### §13.3 — Packed name unpack helpers
+
+The minisym lookup returns names as packed `(strtab_offset,
+length)` pairs so a single 8-byte slot carries both fields.
+`_runtime_name_addr(packed)` resolves the offset to a real
+byte pointer; `_runtime_name_len(packed)` returns the length.
+Both return 0 when `packed` is 0 (the "PC not in any minisym
+entry" sentinel).
+
+```bpp
+auto packed, addr, len;
+packed = caller_name(some_pc);
+if (packed != 0) {
+    addr = _runtime_name_addr(packed);
+    len  = _runtime_name_len(packed);
+    sys_write(1, addr, len);
+}
+```
+
+### §13.4 — `profile_start` / `profile_stop` / `profile_dump`
+
+A sampling profiler. `profile_start(rate_hz, depth)` arms an
+ITIMER_PROF at `rate_hz` (target — actual rate is bounded by
+the dispatch rate of the workload) and a per-thread cooperative
+hook in `bpp_job` and `bpp_maestro`. `depth` caps the captured
+stack frames per sample — 8 is a good default; up to 32 max.
+
+`profile_stop()` disarms the timer and freezes the rings for
+the aggregator.
+
+`profile_dump(out_buf, cap)` walks the rings, resolves each
+sample's innermost PC via `_runtime_resolve_pc`, runs the
+synth-name re-attribution, tallies, partial-sorts the top
+`cap` entries by count descending, and writes them to
+`out_buf`. Each entry is 16 bytes: 8 = packed name reference,
+8 = sample count. Returns the number of entries written.
+
+```bpp
+import "bpp_job.bsm";
+
+work_fn(idx)  { /* per-job work */ }
+
+main() {
+    auto buf, n, i, packed, addr, len;
+    job_init(4);
+    profile_start(1000, 8);
+
+    auto k;
+    for (k = 0; k < 1000; k++) {
+        job_submit(fn_ptr(work_fn), k);
+    }
+    job_wait_all();
+
+    profile_stop();
+
+    buf = buf_word(16 * 2);
+    n = profile_dump(buf, 16);
+    for (i = 0; i < n; i++) {
+        packed = *(buf + i * 16);
+        putnum(*(buf + i * 16 + 8)); putchar(' ');
+        addr = _runtime_name_addr(packed);
+        len  = _runtime_name_len(packed);
+        sys_write(1, addr, len);
+        putchar('\n');
+    }
+
+    job_shutdown();
+    return 0;
+}
+```
+
+Sample output for a CPU-heavy worker pool:
+
+```
+272 work_fn
+202 _job_worker_main
+1 job_wait_all
+```
+
+The SIGPROF supplement (macOS) covers worker threads via
+`pthread_kill` fan-out: when the timer fires on main, the
+handler signals every worker so each captures its own
+mcontext on the same tick. Without that, samples concentrate
+on whichever thread the kernel schedules and miss the others
+entirely.
+
+### §13.5 — Recursive dispatch guard
+
+`job_parallel_for` and `job_parallel_reduce` detect when they
+are called from a worker thread (via `_thread_id()` matched
+against `_job_main_tid` and the worker table) and fall back to
+a serial run. Without the guard, an additive reduction inside
+a function that runs on workers would deadlock the pool — the
+worker submitting chunks back to the queue is the same worker
+the queue needs to drain. Sprint 2b's auto-promote firing on
+nested loops is the most common way to land on this path; the
+guard makes it transparent.
+
+### §13.6 — What this chapter does NOT cover
+
+- Worker-thread pthread_kill fan-out for SIGPROF on Linux —
+  blocked on ELF dynlink + thread parity. Cooperative path
+  covers single-threaded Linux today.
+- Folded-stacks export (`flamegraph.pl` format) — the
+  aggregator already produces the data, but the export sugar
+  is YAGNI until a consumer asks.
+- `caller(n)` short-form — Phase 6.5 sugar over
+  `caller_pc(n) + caller_name(...)`. Lands when a real user
+  consumer wants it.
 
 ---
 
