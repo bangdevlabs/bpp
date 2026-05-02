@@ -248,6 +248,107 @@ job_parallel_for(n, fn) {
     return 0;
 }
 
+// ── Reduction support (multicore Sprint 2b) ──────────────────
+//
+// Parallel reduction works in two halves:
+//
+// 1. job_parallel_reduce splits [0, n) into K equal-sized chunks
+//    (K = number of worker threads, capped at n). Per-chunk start
+//    and end indices live in two static buffers indexed by the
+//    chunk id. The driver submits one task per chunk, passing
+//    chunk_id as the worker's argument.
+//
+// 2. The synthesised worker function reads its own chunk_start
+//    and chunk_end from those buffers, accumulates the body's
+//    reduction expression locally, and writes the partial result
+//    into _disp_partials[chunk_id].
+//
+// 3. After job_wait_all, the rewriter-emitted combine loop folds
+//    the K partials into the user-visible accumulator using the
+//    same operator the loop body used. Single-producer pattern
+//    matches the rest of bpp_job — only main calls reduce, only
+//    workers write to their own partial slot.
+//
+// The driver returns K so the caller knows how many partials to
+// fold. The buffers are allocated lazily on first call and reused
+// across every reduce in the program — reductions never overlap
+// from main, so a single set is safe.
+
+const _DISP_K_MAX = 32;
+auto _disp_chunk_start;     // buf_word[K_MAX] — start index per chunk
+auto _disp_chunk_end;       // buf_word[K_MAX] — exclusive end per chunk
+auto _disp_partials;        // buf_word[K_MAX] — partial result per chunk
+static auto _disp_inited;
+
+// Combine-loop scratch slots for Sprint 2b reduction rewrites. The
+// rewriter emits a fold of the K partials back into the user's
+// accumulator using these two globals as counter and induction
+// variable. Globals avoid having to inject new T_DECL nodes into
+// nested blocks, which the existing per-function local scan does
+// not pick up. Only the main thread touches them, so a single set
+// is safe across every reduction in the program — reductions never
+// overlap from main.
+auto _disp_red_k;
+auto _disp_red_ci;
+
+// One-time allocation of the chunk metadata + partial buffers.
+// Idempotent so reductions can run before job_init (serial path).
+static _disp_lazy_init() {
+    if (_disp_inited != 0) { return 0; }
+    _disp_chunk_start = buf_word(_DISP_K_MAX);
+    _disp_chunk_end   = buf_word(_DISP_K_MAX);
+    _disp_partials    = buf_word(_DISP_K_MAX);
+    _disp_inited = 1;
+    return 0;
+}
+
+// Drive a parallel reduction over the half-open range [0, n).
+// fn is the synthesised chunk worker; it takes one argument
+// (chunk_id), reads its slice from _disp_chunk_start[chunk_id]
+// and _disp_chunk_end[chunk_id], and writes its partial to
+// _disp_partials[chunk_id]. Returns the number of chunks K so
+// the caller can fold _disp_partials[0..K-1].
+//
+// When no worker pool is up, falls back to a serial sweep of K=1
+// — preserving the auto-dispatch graceful-fallback contract used
+// by job_parallel_for above.
+job_parallel_reduce(n, fn) {
+    auto i, k, chunk_size, start, end;
+
+    _disp_lazy_init();
+
+    if (n <= 0) { return 0; }
+
+    if (_job_inited == 0) {
+        // No worker pool — serial single-chunk run.
+        *(_disp_chunk_start)     = 0;
+        *(_disp_chunk_end)       = n;
+        *(_disp_partials)        = 0;
+        call(fn, 0);
+        return 1;
+    }
+
+    // Split [0, n) into K = min(workers, n) chunks of ceil(n/K)
+    // entries; the last chunk is shorter when n is not a multiple
+    // of K. Cap K_MAX so the static buffers cannot overrun.
+    k = _job_n_workers;
+    if (k > n) { k = n; }
+    if (k > _DISP_K_MAX) { k = _DISP_K_MAX; }
+
+    chunk_size = (n + k - 1) / k;
+    for (i = 0; i < k; i++) {
+        start = i * chunk_size;
+        end   = start + chunk_size;
+        if (end > n) { end = n; }
+        *(_disp_chunk_start + i * 8) = start;
+        *(_disp_chunk_end   + i * 8) = end;
+        *(_disp_partials    + i * 8) = 0;
+        job_submit(fn, i);
+    }
+    job_wait_all();
+    return k;
+}
+
 // Send the shutdown sentinel to every worker and join their threads.
 // After this returns, the worker pool is gone — call job_init again
 // before submitting more jobs.

@@ -1,0 +1,71 @@
+// test_reduce_runtime.bpp — Sprint 2b runtime verification.
+//
+// Validates job_parallel_reduce by hand-writing the chunk worker
+// the synthesiser will eventually generate. The worker walks its
+// assigned slice, sums into a local accumulator, and writes the
+// partial into _disp_partials[chunk_id]. Main combines the K
+// partials by folding with `+` and compares against the closed-form
+// expected value n*(n-1)/2.
+
+import "bpp_job.bsm";
+
+// Test data shared across worker invocations. Scaled to be large
+// enough that K > 1 is meaningful but small enough that the test
+// stays under one second on every host.
+extrn _arr;
+extrn _arr_n;
+
+// Hand-written chunk worker matching the synth shape Sprint 2b
+// will emit automatically. Reads its slice bounds from the chunk
+// metadata buffers, accumulates a local sum, writes the partial.
+sum_chunk(chunk_id) {
+    auto start, end, acc, i;
+    start = *(_disp_chunk_start + chunk_id * 8);
+    end   = *(_disp_chunk_end   + chunk_id * 8);
+    acc = 0;
+    for (i = start; i < end; i++) {
+        acc = acc + *(_arr + i * 8);
+    }
+    *(_disp_partials + chunk_id * 8) = acc;
+    return 0;
+}
+
+main() {
+    auto i, k, sum, expected;
+
+    _arr_n = 10000;
+    _arr = buf_word(_arr_n);
+    for (i = 0; i < _arr_n; i++) {
+        *(_arr + i * 8) = i;
+    }
+
+    // Closed-form reference: 0 + 1 + ... + (n-1) = n*(n-1)/2.
+    expected = _arr_n * (_arr_n - 1) / 2;
+
+    // Serial path first: no worker pool means K=1, full range on
+    // main thread. Catches bugs in the chunk metadata + worker shape
+    // before threads enter the picture.
+    k = job_parallel_reduce(_arr_n, fn_ptr(sum_chunk));
+    if (k != 1) { return 10; }
+    sum = 0;
+    for (i = 0; i < k; i++) {
+        sum = sum + *(_disp_partials + i * 8);
+    }
+    if (sum != expected) { return 11; }
+
+    // Parallel path: 4 workers split the array. Each chunk contributes
+    // a partial; the combine loop folds them back into the user-visible
+    // sum using the same operator the original loop body used.
+    job_init(4);
+    k = job_parallel_reduce(_arr_n, fn_ptr(sum_chunk));
+    if (k <= 1) { return 20; }
+    if (k > 4) { return 21; }
+    sum = 0;
+    for (i = 0; i < k; i++) {
+        sum = sum + *(_disp_partials + i * 8);
+    }
+    if (sum != expected) { return 22; }
+
+    job_shutdown();
+    return 0;
+}

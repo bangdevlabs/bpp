@@ -1,0 +1,51 @@
+// test_reduction_sum.bpp — Sprint 2b end-to-end auto-promotion test.
+//
+// The plain `for` loop below has the canonical reduction shape
+// `sum = sum + arr[i]`. Sprint 2b's scanner detects it, the
+// synthesiser produces a chunk worker, and the rewriter rewires
+// the loop into job_parallel_reduce with a combine fold. The user
+// program does nothing special — the parallel speed-up is implicit.
+
+import "bpp_job.bsm";
+
+// The candidate scanner only auto-promotes loops whose bound is a
+// literal or a worker-safe global. A function-local would be unsafe
+// for the worker thread, so we keep the array length as an extrn.
+extrn _arr;
+extrn _arr_n;
+
+const N = 50000;
+
+main() {
+    auto i, sum, expected;
+
+    _arr_n = N;
+    _arr = buf_word(_arr_n);
+    for (i = 0; i < N; i++) {
+        *(_arr + i * 8) = i;
+    }
+    expected = N * (N - 1) / 2;
+
+    // Serial-pool path: with no workers initialised, the reduction
+    // runtime falls back to a single-chunk run on the main thread.
+    // Auto-promote still kicks in (the rewriter does not check the
+    // pool state) but the runtime fold collapses to a single partial.
+    sum = 0;
+    for (i = 0; i < N; i++) {
+        sum = sum + *(_arr + i * 8);
+    }
+    if (sum != expected) { return 1; }
+
+    // Parallel path: 4 workers split the array. Each chunk produces
+    // a partial that the rewriter-emitted combine loop folds back
+    // into `sum` via `+`. Result must match the closed-form value.
+    job_init(4);
+    sum = 0;
+    for (i = 0; i < N; i++) {
+        sum = sum + *(_arr + i * 8);
+    }
+    if (sum != expected) { return 2; }
+
+    job_shutdown();
+    return 0;
+}

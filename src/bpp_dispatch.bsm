@@ -2084,11 +2084,21 @@ void show_dispatch_candidates() {
         rv  = arr_get(dispatch_cand_reduce_var, i);
         rop = arr_get(dispatch_cand_reduce_op,  i);
         if (rv != 0) {
+            // Sprint 2b parallelises the additive op end-to-end via
+            // job_parallel_reduce; non-additive ops detect but stay
+            // serial until the synthesiser learns their identity element.
+            auto rop_l, rop_ch;
+            rop_l = unpack_l(rop);
+            rop_ch = peek(vbuf + unpack_s(rop));
             diag_str("  [REDUCTION acc=");
             diag_packed(rv);
             diag_str(" op=");
             diag_packed(rop);
-            diag_str(" — serial: tree-reduce runtime pending]");
+            if (rop_l == 1 && rop_ch == '+') {
+                diag_str(" — parallel: tree-reduce via job_parallel_reduce]");
+            } else {
+                diag_str(" — serial: only `+` parallelises in Sprint 2b]");
+            }
         } else if (sv != 0 || st != 1) {
             diag_str("  [serial: runtime stride/start support pending]");
         }
@@ -2126,9 +2136,419 @@ void show_dispatch_candidates() {
 // stack slot at codegen time, regardless of any `auto i;` sitting in
 // the enclosing function.
 
+// ── AST helpers for reduction synthesis (Sprint 2b) ──────────
+//
+// The reduction synthesiser builds a chunk-worker function from
+// scratch, and the rewriter replaces the candidate T_WHILE with a
+// reduce-and-combine block. Both jobs need raw AST construction
+// helpers that the parser keeps file-local. Reproduced here so
+// the dispatch module stays self-contained.
+
+// Pack a one-character operator into vbuf and return its packed
+// reference. Mirrors `_make_op_char` in bpp_parser.bsm.
+static _dsp_op_char(ch) {
+    auto p;
+    p = pack(vbuf_pos, 1);
+    poke(vbuf + vbuf_pos, ch);
+    vbuf_pos++;
+    return p;
+}
+
+// Build a T_VAR node referencing the packed identifier `name_p`.
+static _dsp_make_var(name_p) {
+    auto n: Node;
+    n = make_node(T_VAR);
+    n.a = name_p;
+    return n;
+}
+
+// Build a T_LIT node holding the decimal integer `val`. Negative
+// values are wrapped in T_UNARY('-') over the absolute literal,
+// matching the parser's `make_int_lit` shape.
+static _dsp_make_int_lit(val) {
+    auto n: Node, u: Node, start, v, digits, tmp, i;
+    if (val < 0) {
+        u = make_node(T_UNARY);
+        u.a = _dsp_op_char('-');
+        u.b = _dsp_make_int_lit(0 - val);
+        return u;
+    }
+    start = vbuf_pos;
+    if (val == 0) {
+        poke(vbuf + vbuf_pos, '0');
+        vbuf_pos++;
+    } else {
+        v = val;
+        digits = 0;
+        tmp = v;
+        while (tmp > 0) { digits++; tmp /= 10; }
+        vbuf_pos += digits;
+        tmp = v;
+        for (i = 0; i < digits; i++) {
+            poke(vbuf + vbuf_pos - 1 - i, '0' + tmp % 10);
+            tmp /= 10;
+        }
+    }
+    n = make_node(T_LIT);
+    n.a = pack(start, vbuf_pos - start);
+    return n;
+}
+
+// Build a T_BINOP node with single-character operator `op_ch`.
+static _dsp_make_binop(op_ch, lhs, rhs) {
+    auto n: Node;
+    n = make_node(T_BINOP);
+    n.a = _dsp_op_char(op_ch);
+    n.b = lhs;
+    n.c = rhs;
+    return n;
+}
+
+// Build a T_BINOP node from an arbitrary packed operator (used to
+// preserve the original reduction op verbatim, including `<<`/`>>`).
+static _dsp_make_binop_p(op_p, lhs, rhs) {
+    auto n: Node;
+    n = make_node(T_BINOP);
+    n.a = op_p;
+    n.b = lhs;
+    n.c = rhs;
+    return n;
+}
+
+// Build a T_ASSIGN node for `lhs_p_or_node = rhs_node`. The lhs
+// argument is taken as a Node*, matching the parser convention so
+// callers can pass either a fresh T_VAR or a deeper memory store
+// expression. For T_MEMST callers should construct that directly.
+static _dsp_make_assign(lhs_node, rhs_node) {
+    auto n: Node;
+    n = make_node(T_ASSIGN);
+    n.a = lhs_node;
+    n.b = rhs_node;
+    return n;
+}
+
+// Build a T_MEMLD node for `*(addr_node)`, with no field hint.
+static _dsp_make_memld(addr_node) {
+    auto n: Node;
+    n = make_node(T_MEMLD);
+    n.a = addr_node;
+    n.b = 0;
+    return n;
+}
+
+// Build a T_MEMST node for `*(addr_node) = val_node`, no field hint.
+static _dsp_make_memst(addr_node, val_node) {
+    auto n: Node;
+    n = make_node(T_MEMST);
+    n.a = addr_node;
+    n.b = val_node;
+    n.c = 0;
+    return n;
+}
+
+// Build a T_DECL node declaring a single packed name as an auto local.
+// Mirrors the parser's `auto x;` shape: list_arr is a 1-slot pointer
+// array containing the packed name, count is 1, no type hint.
+static _dsp_make_decl1(name_p) {
+    auto n: Node, arr;
+    arr = malloc(8);
+    *arr = name_p;
+    n = make_node(T_DECL);
+    n.a = arr;
+    n.b = 1;
+    n.c = 0;
+    n.d = 0;
+    n.e = 0;
+    return n;
+}
+
+// Build a T_BLOCK node wrapping a heap array of `cnt` statement
+// pointers. Caller owns the array allocation lifetime. Used to
+// splice multi-statement sequences into a slot that can hold only
+// a single Node*.
+static _dsp_make_block(stmts_arr, cnt) {
+    auto n: Node;
+    n = make_node(T_BLOCK);
+    n.a = 0;
+    n.b = stmts_arr;
+    n.c = cnt;
+    return n;
+}
+
+// Walk an AST subtree and replace every T_VAR with a.packed == old_p
+// by a T_VAR with a.packed == new_p. Used to retarget the user's
+// accumulator name to a fresh local inside the synthesised worker.
+// Mutates in place — the caller must own the subtree (which is true
+// for the original loop body once the rewriter detaches it).
+static void _dsp_rename_var(nd, old_p, new_p) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        if (n.a == old_p || packed_eq(n.a, old_p)) {
+            n.a = new_p;
+        }
+        return;
+    }
+    if (t == T_LIT || t == T_NOP || t == T_BREAK || t == T_CONTINUE) { return; }
+    if (t == T_DECL) {
+        // Loop-locals inside the body. Renaming the declared name
+        // would corrupt the symbol table for shadowed cases. The
+        // detector already guarantees the accumulator is not declared
+        // here (it lives in the enclosing scope), so this branch is
+        // a no-op — leave the declared names alone.
+        return;
+    }
+    if (t == T_ASSIGN || t == T_MEMST) {
+        _dsp_rename_var(n.a, old_p, new_p);
+        _dsp_rename_var(n.b, old_p, new_p);
+        return;
+    }
+    if (t == T_MEMLD || t == T_ADDR || t == T_UNARY) {
+        _dsp_rename_var(n.a, old_p, new_p);
+        if (t == T_UNARY) { _dsp_rename_var(n.b, old_p, new_p); }
+        return;
+    }
+    if (t == T_BINOP) {
+        _dsp_rename_var(n.b, old_p, new_p);
+        _dsp_rename_var(n.c, old_p, new_p);
+        return;
+    }
+    if (t == T_TERNARY) {
+        _dsp_rename_var(n.a, old_p, new_p);
+        _dsp_rename_var(n.b, old_p, new_p);
+        _dsp_rename_var(n.c, old_p, new_p);
+        return;
+    }
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            _dsp_rename_var(arr[i], old_p, new_p);
+        }
+        return;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            _dsp_rename_var(arr[i], old_p, new_p);
+        }
+        return;
+    }
+    if (t == T_IF) {
+        _dsp_rename_var(n.a, old_p, new_p);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _dsp_rename_var(arr[i], old_p, new_p); }
+        arr = n.d; cnt = n.e;
+        for (i = 0; i < cnt; i++) { _dsp_rename_var(arr[i], old_p, new_p); }
+        return;
+    }
+    if (t == T_WHILE) {
+        _dsp_rename_var(n.a, old_p, new_p);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { _dsp_rename_var(arr[i], old_p, new_p); }
+        if (n.e != 0) { _dsp_rename_var(n.e, old_p, new_p); }
+        return;
+    }
+}
+
+// Identity element for the supported reduction operators. Returns 0
+// for sums and bitwise-or/xor, 1 for products, and -1 (all bits set)
+// for bitwise-and. Sprint 2b parallelises the additive case end-to-end;
+// non-additive ops still detect but stay serial until the synthesiser
+// learns their shape (tree-reduce shifts, in particular, need extra
+// bookkeeping). Returns sentinel `-1` for unsupported ops so the
+// caller can fall back gracefully.
+static _dsp_red_identity_for(op_ch) {
+    if (op_ch == '+') { return 0; }
+    if (op_ch == '|') { return 0; }
+    if (op_ch == '^') { return 0; }
+    if (op_ch == '*') { return 1; }
+    if (op_ch == '&') { return 0 - 1; }
+    return 0 - 2;   // unsupported sentinel
+}
+
+// Materialise a fresh packed name in vbuf. Used for the synthetic
+// locals introduced by the reduction synthesiser (`__racc`, `__rstart`,
+// `__rend`, `__rk`, `__cid`). Caller owns the C-string literal.
+static _dsp_pack_local(s, l) {
+    auto start, i;
+    start = vbuf_pos;
+    for (i = 0; i < l; i++) {
+        poke(vbuf + vbuf_pos, str_peek(s, i));
+        vbuf_pos++;
+    }
+    return pack(start, l);
+}
+
 // Monotonic counter used to produce unique synthetic names across all
 // candidates discovered in a single compilation.
 static auto _synth_counter;
+
+// Lazy-cached packed names for the chunk metadata buffers and the
+// partial-result buffer that live in bpp_job.bsm. The synth bodies
+// reference these by name; resolved once per compilation so the
+// vbuf does not balloon when many reductions land in one program.
+static auto _dsp_disp_chunk_start_p;
+static auto _dsp_disp_chunk_end_p;
+static auto _dsp_disp_partials_p;
+static auto _dsp_jpr_name_p;
+static auto _dsp_red_locals_inited;
+
+// Initialise the cached packed names. Called once on the first
+// reduction candidate the synthesiser actually parallelises.
+static _dsp_red_lazy_init() {
+    if (_dsp_red_locals_inited != 0) { return 0; }
+    _dsp_disp_chunk_start_p = _dsp_pack_local("_disp_chunk_start", 17);
+    _dsp_disp_chunk_end_p   = _dsp_pack_local("_disp_chunk_end",   15);
+    _dsp_disp_partials_p    = _dsp_pack_local("_disp_partials",    14);
+    _dsp_jpr_name_p         = _dsp_pack_local("job_parallel_reduce", 19);
+    _dsp_red_locals_inited = 1;
+    return 0;
+}
+
+// Build `*(buf_p + idx_var_p * 8)` as a T_MEMLD over a synthesised
+// address expression. Used by the reduction synthesiser to read its
+// chunk's start / end indices from the metadata buffers.
+static _dsp_make_indexed_load(buf_p, idx_var_p) {
+    auto addr;
+    addr = _dsp_make_binop('+',
+        _dsp_make_var(buf_p),
+        _dsp_make_binop('*',
+            _dsp_make_var(idx_var_p),
+            _dsp_make_int_lit(8)));
+    return _dsp_make_memld(addr);
+}
+
+// Build `*(buf_p + idx_var_p * 8) = val_node` as a T_MEMST. Used by
+// the reduction synthesiser to write its partial back to the global
+// partials buffer at the slot keyed by the chunk id.
+static _dsp_make_indexed_store(buf_p, idx_var_p, val_node) {
+    auto addr;
+    addr = _dsp_make_binop('+',
+        _dsp_make_var(buf_p),
+        _dsp_make_binop('*',
+            _dsp_make_var(idx_var_p),
+            _dsp_make_int_lit(8)));
+    return _dsp_make_memst(addr, val_node);
+}
+
+// Construct the synth-worker body for an additive reduction. Returns
+// a freshly-allocated array of statement Node*s of length `out_cnt`,
+// caller stores it as the synth function's body. The original loop
+// body is detached from `wh.b` and embedded as the inner T_WHILE's
+// body — every reference to `acc_p` inside it is renamed to a fresh
+// local accumulator so the worker writes into per-chunk state, not
+// the user-visible accumulator.
+//
+// Layout produced (acc=`__racc`, cid=`__cid`, lv=original loop var):
+//
+//   T_DECL [__racc, __rstart, __rend, lv]
+//   __rstart = *(_disp_chunk_start + __cid * 8)
+//   __rend   = *(_disp_chunk_end   + __cid * 8)
+//   __racc   = identity_for(op)
+//   lv       = __rstart
+//   while (lv < __rend) { <renamed body>; lv = lv + 1; }
+//   *(_disp_partials + __cid * 8) = __racc
+//
+// `out_cnt` receives the produced statement count via a small bridge
+// global because B++ has no out-parameters; the caller reads it
+// immediately after invocation.
+static auto _dsp_red_body_cnt;
+static _dsp_build_red_body(wh_p, loop_var_p, acc_p, op_ch, cid_p) {
+    auto wh: Node, body_arr;
+    auto racc_p, rstart_p, rend_p;
+    auto decl: Node, decl_arr;
+    auto rstart_assign: Node, rend_assign: Node;
+    auto racc_assign: Node, lv_assign: Node;
+    auto cond: Node, step: Node, inner_while: Node;
+    auto write_partial: Node;
+    auto stmts;
+
+    wh = wh_p;
+    body_arr = wh.b;
+
+    // Rename the user accumulator to a fresh local so worker writes
+    // never touch the main thread's variable. Mutates the original
+    // body in place — safe because the rewriter is about to replace
+    // the source T_WHILE entirely.
+    racc_p   = _dsp_pack_local("__racc",   6);
+    rstart_p = _dsp_pack_local("__rstart", 8);
+    rend_p   = _dsp_pack_local("__rend",   6);
+    auto bc, j;
+    bc = wh.c;
+    for (j = 0; j < bc; j++) {
+        _dsp_rename_var(body_arr[j], acc_p, racc_p);
+    }
+
+    // T_DECL [__racc, __rstart, __rend, loop_var]. The loop variable
+    // is included here even though the source function already
+    // declares it — the synth function is its own scope, so the
+    // induction var is a fresh local for this body.
+    decl_arr = malloc(32);
+    *(decl_arr     ) = racc_p;
+    *(decl_arr +  8) = rstart_p;
+    *(decl_arr + 16) = rend_p;
+    *(decl_arr + 24) = loop_var_p;
+    decl = make_node(T_DECL);
+    decl.a = decl_arr;
+    decl.b = 4;
+    decl.c = 0;
+    decl.d = 0;
+    decl.e = 0;
+
+    // __rstart = *(_disp_chunk_start + __cid * 8)
+    rstart_assign = _dsp_make_assign(
+        _dsp_make_var(rstart_p),
+        _dsp_make_indexed_load(_dsp_disp_chunk_start_p, cid_p));
+
+    // __rend = *(_disp_chunk_end + __cid * 8)
+    rend_assign = _dsp_make_assign(
+        _dsp_make_var(rend_p),
+        _dsp_make_indexed_load(_dsp_disp_chunk_end_p, cid_p));
+
+    // __racc = identity_for(op)
+    racc_assign = _dsp_make_assign(
+        _dsp_make_var(racc_p),
+        _dsp_make_int_lit(_dsp_red_identity_for(op_ch)));
+
+    // loop_var = __rstart
+    lv_assign = _dsp_make_assign(
+        _dsp_make_var(loop_var_p),
+        _dsp_make_var(rstart_p));
+
+    // while (loop_var < __rend) { <renamed body>; loop_var = loop_var + 1; }
+    cond = _dsp_make_binop('<',
+        _dsp_make_var(loop_var_p),
+        _dsp_make_var(rend_p));
+    step = _dsp_make_assign(
+        _dsp_make_var(loop_var_p),
+        _dsp_make_binop('+', _dsp_make_var(loop_var_p), _dsp_make_int_lit(1)));
+    inner_while = make_node(T_WHILE);
+    inner_while.a = cond;
+    inner_while.b = body_arr;
+    inner_while.c = wh.c;
+    inner_while.d = 0;
+    inner_while.e = step;
+
+    // *(_disp_partials + __cid * 8) = __racc
+    write_partial = _dsp_make_indexed_store(
+        _dsp_disp_partials_p, cid_p, _dsp_make_var(racc_p));
+
+    // Pack the seven top-level statements into a heap array the
+    // function record can hold via FN_BODY / FN_BCNT.
+    stmts = malloc(7 * 8);
+    *(stmts     ) = decl;
+    *(stmts +  8) = rstart_assign;
+    *(stmts + 16) = rend_assign;
+    *(stmts + 24) = racc_assign;
+    *(stmts + 32) = lv_assign;
+    *(stmts + 40) = inner_while;
+    *(stmts + 48) = write_partial;
+
+    _dsp_red_body_cnt = 7;
+    return stmts;
+}
 
 // Build a packed synthetic function name of the form `__synth_N`,
 // with N being a monotonic counter. The double-underscore prefix
@@ -2192,6 +2612,8 @@ static _synth_make_name() {
 void synthesize_loop_fn() {
     auto n, i, wh: Node, src_fi, loop_var_p, src_mod;
     auto fname, params_arr, record, src_tok;
+    auto body_ptr, body_cnt, param_p;
+    auto sv, st, rv, op_p, op_ch, op_l, identity_val, cid_p;
 
     _synth_counter = 0;
     n = arr_len(dispatch_candidates);
@@ -2202,35 +2624,61 @@ void synthesize_loop_fn() {
         src_mod = arr_get(func_mods, src_fi);
         src_tok = wh.src_tok;
 
-        // Sprints 1 + 2a: only synthesise the legacy [0, N) stride-1
-        // MAP case today. Non-default start / stride or REDUCTION
-        // candidates ride along in the metadata arrays for
-        // --dispatch visibility but do not get a worker function and
-        // stay serial at runtime. Placeholder pushes keep the
-        // parallel arrays aligned with dispatch_candidates so
-        // subsequent indexing stays sane.
-        auto sv, st, rv;
         sv = arr_get(dispatch_cand_start,      i);
         st = arr_get(dispatch_cand_stride,     i);
         rv = arr_get(dispatch_cand_reduce_var, i);
-        if (sv != 0 || st != 1 || rv != 0) {
+
+        // Sprint 1 (non-zero start / non-unit stride) still skipped:
+        // job_parallel_for has no chunked variant yet. Sprint 2b
+        // parallelises additive reductions end-to-end; non-additive
+        // reduction ops (shifts, *, &, |, ^) remain serial until the
+        // synthesiser learns their identity element.
+        if (sv != 0 || st != 1) {
             dispatch_cand_synth_idx  = arr_push(dispatch_cand_synth_idx,  -1);
             dispatch_cand_synth_name = arr_push(dispatch_cand_synth_name,  0);
             continue;
+        }
+
+        if (rv != 0) {
+            // REDUCTION path. Only the additive op `+` ships in this
+            // sprint. Skip everything else with a placeholder so the
+            // candidate stays visible to --dispatch but the loop runs
+            // serially at runtime.
+            op_p = arr_get(dispatch_cand_reduce_op, i);
+            op_l = unpack_l(op_p);
+            op_ch = peek(vbuf + unpack_s(op_p));
+            identity_val = _dsp_red_identity_for(op_ch);
+            if (op_l != 1 || op_ch != '+') {
+                dispatch_cand_synth_idx  = arr_push(dispatch_cand_synth_idx,  -1);
+                dispatch_cand_synth_name = arr_push(dispatch_cand_synth_name,  0);
+                continue;
+            }
+            _dsp_red_lazy_init();
+            cid_p = _dsp_pack_local("__cid", 5);
+            param_p = cid_p;
+            body_ptr = _dsp_build_red_body(wh, loop_var_p, rv, op_ch, cid_p);
+            body_cnt = _dsp_red_body_cnt;
+        } else {
+            // MAP path — original behaviour. Reuse the loop body
+            // verbatim and bind the induction variable as the
+            // worker's single parameter.
+            param_p  = loop_var_p;
+            body_ptr = wh.b;
+            body_cnt = wh.c;
         }
 
         // Build the function record. Fields match parse_function's
         // registration path so downstream passes see a regular entry.
         fname = _synth_make_name();
         params_arr = malloc(8);
-        *(params_arr) = loop_var_p;
+        *(params_arr) = param_p;
         record = malloc(RECORD_SZ);
         *(record + FN_TYPE) = 22;
         *(record + FN_NAME) = fname;
         *(record + FN_PARS) = params_arr;
         *(record + FN_PCNT) = 1;
-        *(record + FN_BODY) = wh.b;
-        *(record + FN_BCNT) = wh.c;
+        *(record + FN_BODY) = body_ptr;
+        *(record + FN_BCNT) = body_cnt;
         *(record + FN_HINTS) = 0;
         *(record + FN_STUB) = 0;
         *(record + FN_SRC_TOK) = src_tok;
@@ -2321,12 +2769,19 @@ static _dsp_pack_cstr(s) {
     return pack(start, i);
 }
 
+// Cached packed names for the combine-loop scratch globals declared
+// in bpp_job.bsm. The rewriter reuses one shared (k, ci) pair across
+// every reduction in the program — reductions never overlap on main
+// so a single slot is safe.
+static auto _dsp_red_k_p;
+static auto _dsp_red_ci_p;
+
 // Transform every candidate loop into a call to job_parallel_for and
 // wire the new edges so mark_reachable sees the synth function and
 // the job runtime as reachable. Runs after synthesize_loop_fn.
 void rewrite_dispatch_loops() {
     auto n, i, wh: Node, src_fi, bound_n, synth_idx, synth_name;
-    auto jpf_name, fnptr_name, jpf_idx;
+    auto jpf_name, fnptr_name, jpf_idx, jpr_idx, runtime_idx;
     auto fnptr_call: Node, synth_var: Node, args_arr, inner_args_arr;
     auto callees;
 
@@ -2344,59 +2799,182 @@ void rewrite_dispatch_loops() {
     jpf_idx = _dsp_find_func_idx(jpf_name);
     if (jpf_idx < 0) { return; }
 
+    // Reduction rewrites need job_parallel_reduce instead. It lives in
+    // the same module, so its presence implies the user has the runtime
+    // available. If absent, fall back to leaving reduction candidates
+    // serial (skip the rewrite) without aborting the map-rewrite path.
+    _dsp_red_lazy_init();
+    jpr_idx = _dsp_find_func_idx(_dsp_jpr_name_p);
+
+    // Lazy-pack the combine-loop scratch global names. Both live in
+    // bpp_job.bsm; the rewriter only references them through the
+    // packed handles cached here.
+    if (_dsp_red_k_p == 0) {
+        _dsp_red_k_p  = _dsp_pack_local("_disp_red_k",  11);
+        _dsp_red_ci_p = _dsp_pack_local("_disp_red_ci", 12);
+    }
+
     for (i = 0; i < n; i++) {
-        // Sprints 1 + 2a: skip non-default start / stride and
-        // REDUCTION candidates. The synthesiser left their
-        // synth_idx as -1; rewriting the T_WHILE into a
-        // job_parallel_for(N) call would silently miscompile.
-        auto sv, st, rv;
+        // Sprint 1 (non-zero start / non-unit stride) still skipped:
+        // job_parallel_for has no chunked variant yet.
+        auto sv, st, rv, op_p, op_l, op_ch;
         sv = arr_get(dispatch_cand_start,      i);
         st = arr_get(dispatch_cand_stride,     i);
         rv = arr_get(dispatch_cand_reduce_var, i);
-        if (sv != 0 || st != 1 || rv != 0) { continue; }
+        if (sv != 0 || st != 1) { continue; }
+
+        synth_idx = arr_get(dispatch_cand_synth_idx, i);
+        synth_name = arr_get(dispatch_cand_synth_name, i);
+
+        // Synthesiser leaves synth_idx as -1 for any candidate it
+        // declined to materialise (non-additive reduction op, etc.).
+        // No worker = nothing to call, so leave the loop serial.
+        if (synth_idx < 0) { continue; }
 
         wh = arr_get(dispatch_candidates, i);
         src_fi = arr_get(dispatch_cand_fn_idx, i);
         bound_n = arr_get(dispatch_cand_bound, i);
-        synth_idx = arr_get(dispatch_cand_synth_idx, i);
-        synth_name = arr_get(dispatch_cand_synth_name, i);
 
-        // Build fn_ptr(synth_name). Inner T_CALL with one T_VAR arg.
-        synth_var = make_node(T_VAR);
-        synth_var.a = synth_name;
-        inner_args_arr = malloc(8);
-        *(inner_args_arr) = synth_var;
-        fnptr_call = make_node(T_CALL);
-        fnptr_call.a = fnptr_name;
-        fnptr_call.b = inner_args_arr;
-        fnptr_call.c = 1;
+        if (rv != 0) {
+            // ── REDUCTION rewrite ────────────────────────────────
+            //
+            // Replace the T_WHILE with a T_BLOCK that drives the
+            // chunked workers and folds the K partials back into
+            // the user-visible accumulator using the same operator
+            // the source loop used.
+            //
+            //   {
+            //     _disp_red_k = job_parallel_reduce(bound, fn_ptr(synth));
+            //     _disp_red_ci = 0;
+            //     while (_disp_red_ci < _disp_red_k) {
+            //         acc = acc OP *(_disp_partials + _disp_red_ci * 8);
+            //         _disp_red_ci = _disp_red_ci + 1;
+            //     }
+            //   }
+            //
+            // The two scratch globals live in bpp_job.bsm so no
+            // T_DECL has to be threaded into the enclosing function;
+            // run_dispatch's per-function local scan only walks the
+            // top-level body, and a nested T_DECL would be invisible
+            // to it. Reductions never overlap from main, so a single
+            // shared (k, ci) pair across the whole program is safe.
+            if (jpr_idx < 0) { continue; }
 
-        // Build the outer args array: [bound, fn_ptr_call].
-        args_arr = malloc(16);
-        *(args_arr) = bound_n;
-        *(args_arr + 8) = fnptr_call;
+            op_p  = arr_get(dispatch_cand_reduce_op, i);
+            op_l  = unpack_l(op_p);
+            op_ch = peek(vbuf + unpack_s(op_p));
 
-        // Mutate the T_WHILE node in place into a T_CALL to
-        // job_parallel_for. Fields .d and .e were the for-hint and
-        // step expression; both become dead once this is no longer
-        // a while loop, so clear them to keep downstream code from
-        // tripping on stale payloads.
-        wh.ntype = T_CALL;
-        wh.a = jpf_name;
-        wh.b = args_arr;
-        wh.c = 2;
-        wh.d = 0;
-        wh.e = 0;
-        wh.dispatch = 0;
+            auto reduce_call: Node, reduce_args;
+            auto rk_assign: Node, rci_init: Node;
+            auto cond: Node, body_arr2, body_step: Node;
+            auto combine_while: Node, partials_load: Node;
+            auto fold_expr: Node, fold_assign: Node;
+            auto block_stmts;
 
-        // Record the new edge from the enclosing function to
-        // job_parallel_for so mark_reachable follows it on re-run.
+            // job_parallel_reduce(bound, fn_ptr(synth_name))
+            synth_var = _dsp_make_var(synth_name);
+            inner_args_arr = malloc(8);
+            *(inner_args_arr) = synth_var;
+            fnptr_call = make_node(T_CALL);
+            fnptr_call.a = fnptr_name;
+            fnptr_call.b = inner_args_arr;
+            fnptr_call.c = 1;
+
+            reduce_args = malloc(16);
+            *(reduce_args     ) = bound_n;
+            *(reduce_args +  8) = fnptr_call;
+            reduce_call = make_node(T_CALL);
+            reduce_call.a = _dsp_jpr_name_p;
+            reduce_call.b = reduce_args;
+            reduce_call.c = 2;
+
+            // _disp_red_k = job_parallel_reduce(...)
+            rk_assign = _dsp_make_assign(_dsp_make_var(_dsp_red_k_p), reduce_call);
+
+            // _disp_red_ci = 0
+            rci_init = _dsp_make_assign(_dsp_make_var(_dsp_red_ci_p), _dsp_make_int_lit(0));
+
+            // acc = acc OP *(_disp_partials + _disp_red_ci * 8)
+            partials_load = _dsp_make_indexed_load(_dsp_disp_partials_p, _dsp_red_ci_p);
+            fold_expr = _dsp_make_binop_p(op_p, _dsp_make_var(rv), partials_load);
+            fold_assign = _dsp_make_assign(_dsp_make_var(rv), fold_expr);
+
+            body_arr2 = malloc(8);
+            *(body_arr2) = fold_assign;
+
+            // _disp_red_ci = _disp_red_ci + 1
+            body_step = _dsp_make_assign(
+                _dsp_make_var(_dsp_red_ci_p),
+                _dsp_make_binop('+', _dsp_make_var(_dsp_red_ci_p), _dsp_make_int_lit(1)));
+
+            // while (_disp_red_ci < _disp_red_k) { fold; ci = ci + 1; }
+            cond = _dsp_make_binop('<',
+                _dsp_make_var(_dsp_red_ci_p),
+                _dsp_make_var(_dsp_red_k_p));
+            combine_while = make_node(T_WHILE);
+            combine_while.a = cond;
+            combine_while.b = body_arr2;
+            combine_while.c = 1;
+            combine_while.d = 0;
+            combine_while.e = body_step;
+
+            // Splice the three top-level statements into the block.
+            block_stmts = malloc(3 * 8);
+            *(block_stmts     ) = rk_assign;
+            *(block_stmts +  8) = rci_init;
+            *(block_stmts + 16) = combine_while;
+
+            // Mutate the source T_WHILE in place into the new block.
+            wh.ntype = T_BLOCK;
+            wh.a = 0;
+            wh.b = block_stmts;
+            wh.c = 3;
+            wh.d = 0;
+            wh.e = 0;
+            wh.dispatch = 0;
+
+            runtime_idx = jpr_idx;
+        } else {
+            // ── MAP rewrite ──────────────────────────────────────
+            // Build fn_ptr(synth_name). Inner T_CALL with one T_VAR arg.
+            synth_var = make_node(T_VAR);
+            synth_var.a = synth_name;
+            inner_args_arr = malloc(8);
+            *(inner_args_arr) = synth_var;
+            fnptr_call = make_node(T_CALL);
+            fnptr_call.a = fnptr_name;
+            fnptr_call.b = inner_args_arr;
+            fnptr_call.c = 1;
+
+            // Build the outer args array: [bound, fn_ptr_call].
+            args_arr = malloc(16);
+            *(args_arr) = bound_n;
+            *(args_arr + 8) = fnptr_call;
+
+            // Mutate the T_WHILE node in place into a T_CALL to
+            // job_parallel_for.
+            wh.ntype = T_CALL;
+            wh.a = jpf_name;
+            wh.b = args_arr;
+            wh.c = 2;
+            wh.d = 0;
+            wh.e = 0;
+            wh.dispatch = 0;
+
+            runtime_idx = jpf_idx;
+        }
+
+        // Record the new edge from the enclosing function to the
+        // runtime helper that the rewrite injected (job_parallel_for
+        // for map, job_parallel_reduce for reduction). mark_reachable
+        // follows the edge on re-run to pick the helper up even when
+        // the user did not call it directly.
         callees = arr_get(fn_calls, src_fi);
         if (callees == 0) {
             callees = arr_new();
             arr_set(fn_calls, src_fi, callees);
         }
-        callees = arr_push(callees, jpf_idx);
+        callees = arr_push(callees, runtime_idx);
         arr_set(fn_calls, src_fi, callees);
     }
 
