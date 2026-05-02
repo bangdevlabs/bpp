@@ -319,3 +319,58 @@ _runtime_name_len(packed) {
 caller_name(pc) {
     return _runtime_resolve_pc(pc);
 }
+
+// ── Phase 6.3 — panic with stack trace ───────────────────────
+//
+// `panic(msg)` aborts the program with a human-readable failure
+// message and a stack trace built from the runtime symbolication
+// machinery the rest of Phase 6 already shipped. Use it from
+// internal invariants the user cannot recover from:
+//
+//   if (cap < 0) { panic("buf_alloc: negative capacity"); }
+//
+// The message goes to stderr verbatim, prefixed with `panic: `.
+// Each frame of the chain renders as `  at <name>` when the PC
+// resolves through the embedded minisym section, or
+// `  at <unresolved> 0x...` when the PC sits outside any tracked
+// function (rare — typically only in dynamically linked code).
+//
+// The walk uses the Phase 6.2c caller_pc primitive in a loop;
+// both chip implementations were patched in Phase 6.3 to return 0
+// when the FP chain ends, so the walk terminates gracefully on
+// the first 0 instead of dereferencing a null saved FP. A 32-frame
+// depth cap bounds runaway walks regardless.
+//
+// Exit code 134 = 128 + SIGABRT. Shells, CI runners, and the test
+// harness already distinguish this from a regular non-zero return.
+//
+// `@io` because writing to stderr violates `@time` purity. The
+// effect classifier propagates this back through every caller, so
+// any `@time` audio callback that reaches `panic` lights up W026
+// at compile time — surfacing the realtime-IO violation before
+// production hits an audible glitch.
+void panic(msg)@io {
+    auto i, pc, packed, name_addr, name_len;
+
+    putstr_err("panic: ");
+    putstr_err(msg);
+    putline_err();
+
+    for (i = 1; i <= 32; i++) {
+        pc = caller_pc(i);
+        if (pc == 0) { sys_exit(134); }
+        packed = _runtime_resolve_pc(pc);
+        putstr_err("  at ");
+        if (packed != 0) {
+            name_addr = _runtime_name_addr(packed);
+            name_len  = _runtime_name_len(packed);
+            sys_write(2, name_addr, name_len);
+        } else {
+            putstr_err("<unresolved> ");
+            puthex_err(pc);
+        }
+        putline_err();
+    }
+
+    sys_exit(134);
+}

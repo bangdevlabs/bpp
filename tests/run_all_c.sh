@@ -137,6 +137,11 @@ should_skip() {
         test_native_debug)
             echo "skip:interactive" && return
             ;;
+        test_panic)
+            # Phase 6.3 panic — expected rc=134, not 0. The wrapper
+            # tests/test_panic.sh covers it; skip from the rc=0 loop.
+            echo "skip:shell-wrapped" && return
+            ;;
         test_vec_*)
             echo "skip:simd-deferred" && return
             ;;

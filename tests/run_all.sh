@@ -77,6 +77,14 @@ should_skip() {
             echo "skip:interactive"
             return
             ;;
+        test_panic)
+            # Phase 6.3 panic test — expected rc is 134, not 0. The
+            # accompanying tests/test_panic.sh wrapper handles that
+            # plus the stderr grep. Skip the .bpp from the rc=0 loop
+            # so the wrapper stays the single source of truth.
+            echo "skip:shell-wrapped"
+            return
+            ;;
     esac
     echo ""
 }

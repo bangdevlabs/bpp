@@ -1413,17 +1413,22 @@ void _a64_emit_mem_write(val_reg, width) {
 
 
 // Phase 6.2c — caller_pc(n). On entry, n is in x0. On exit, the
-// chosen frame's PC is in x0.
+// chosen frame's PC is in x0, or 0 when the FP chain ended before
+// depth n was reached. The null-FP check at the top of the walk
+// loop makes the primitive safe to drive from a panic-style loop
+// that walks the chain incrementally and stops on the first 0.
 //
 // Layout:
 //   n == 0 → ADR x0, . (current PC, inside the caller's body)
 //   n >= 1 → walk (n-1) frames up the FP chain, then LDR x0, [x9, #8]
+//   walked off → return 0
 //
 // Asm shape (binary mode):
 //
 //     cbz   x0, .Lzero          ; n==0 → current PC path
 //     mov   x9, x29              ; start FP
 //   .Lwalk:
+//     cbz   x9, .Lwalk_off       ; null FP at any step → 0
 //     subs  x0, x0, #1           ; n -= 1
 //     b.eq  .Ltake_lr            ; reached chosen frame
 //     ldr   x9, [x9]             ; previous FP
@@ -1433,17 +1438,21 @@ void _a64_emit_mem_write(val_reg, width) {
 //     b     .Ldone
 //   .Lzero:
 //     adr   x0, .                ; encode 0x10000000 | rd
+//     b     .Ldone
+//   .Lwalk_off:
+//     movz  x0, #0
 //   .Ldone:
 //
-// 9 instructions emitted at runtime, depth N = ~3+2*N cycles.
+// 11 instructions emitted at runtime, depth N = ~3+2*N cycles.
 // Frame-pointer preservation is required (B++ codegen always
 // preserves x29 in callee prologue, so this is safe).
 void _a64_emit_caller_pc() {
-    auto walk_lbl, take_lbl, zero_lbl, done_lbl;
-    walk_lbl = enc_new_label();
-    take_lbl = enc_new_label();
-    zero_lbl = enc_new_label();
-    done_lbl = enc_new_label();
+    auto walk_lbl, take_lbl, zero_lbl, done_lbl, walkoff_lbl;
+    walk_lbl    = enc_new_label();
+    take_lbl    = enc_new_label();
+    zero_lbl    = enc_new_label();
+    done_lbl    = enc_new_label();
+    walkoff_lbl = enc_new_label();
 
     if (a64_bin_mode) {
         // cbz x0, .Lzero
@@ -1452,9 +1461,10 @@ void _a64_emit_caller_pc() {
         enc_mov_reg(9, 29);
         // .Lwalk:
         enc_def_label(walk_lbl);
-        // subs x0, x0, #1  (use enc_sub_imm — it's the same
-        // encoding without flags-set; we use cbz on the result so
-        // an explicit subs is not required).
+        // cbz x9, .Lwalk_off  — guard every walk iteration so a null
+        // saved FP terminates the walk gracefully instead of faulting.
+        enc_cbz_label(9, walkoff_lbl);
+        // subs x0, x0, #1
         enc_sub_imm(0, 0, 1);
         // cbz x0, .Ltake_lr
         enc_cbz_label(0, take_lbl);
@@ -1472,12 +1482,19 @@ void _a64_emit_caller_pc() {
         enc_def_label(zero_lbl);
         // adr x0, . (encode offset 0)
         enc_emit32(0x10000000);
+        // b .Ldone
+        enc_b_label(done_lbl);
+        // .Lwalk_off:
+        enc_def_label(walkoff_lbl);
+        // movz x0, #0  — encode `MOVZ Xd, #imm16` with rd=0, imm=0.
+        enc_emit32(0xD2800000);
         // .Ldone:
         enc_def_label(done_lbl);
     } else {
         out("  cbz x0, .Lcpc_zero_"); a64_print_dec(zero_lbl); putchar('\n');
         out("  mov x9, x29"); putchar('\n');
         out(".Lcpc_walk_"); a64_print_dec(walk_lbl); out(":"); putchar('\n');
+        out("  cbz x9, .Lcpc_walkoff_"); a64_print_dec(walkoff_lbl); putchar('\n');
         out("  sub x0, x0, #1"); putchar('\n');
         out("  cbz x0, .Lcpc_take_"); a64_print_dec(take_lbl); putchar('\n');
         out("  ldr x9, [x9]"); putchar('\n');
