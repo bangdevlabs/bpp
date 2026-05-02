@@ -5445,3 +5445,124 @@ Suite at end: 121/0/11 native + 103/0/29 C + bug_tui PASS.
 Bootstrap byte-stable. Roadmap on track for Phase 6.3 (~1 session)
 + Sprint 4 atomics (~½ session) + Phase 6.4.1 cooperative profiler
 (~1-2 sessions) per the consolidated execution plan.
+
+## 2026-05-02 — C transpiler width-aware slice struct fields (5 latent bugs killed)
+
+The `int main()` shim fix shipped in the previous session (which
+forwards `main_bpp()`'s return code to the process exit status)
+exposed five C-suite tests that were silently passing despite real
+logic failures. The canonical failure pattern surfaced when the
+runner started honoring rc:
+
+```
+test_signed_half: rc=10
+test_slice_struct: rc=1
+test_ecs_component: rc=1
+test_asset_wav: rc=1
+test_stbasset_hotreload: rc=1
+```
+
+All five passed the native suite. The asymmetry pointed at a
+C-emitter-specific codepath. Initial reaction was "5 separate bugs;
+queue them as follow-up." Empirical inspection of the generated C
+showed all five shared one root cause.
+
+### Root cause
+
+`emit_node` for `T_MEMLD` and `T_MEMST` (the loaded / stored slice
+struct field operations) was always emitting `*(long long*)`,
+ignoring the slice annotation that the AST node carried in `n.b` /
+`n.c`. Source like:
+
+```bpp
+struct Phys {
+    gravity: half,    // 32-bit signed
+    accel_x: half,    // 32-bit signed
+    accel_y: half,
+    flags: byte
+}
+
+p.gravity = 980;
+```
+
+was lowered as:
+
+```c
+*(long long*)((uintptr_t)((p + 0))) = 980;   // 8 bytes!
+*(long long*)((uintptr_t)((p + 4))) = 50;    // 8 bytes!
+```
+
+The first store wrote 8 bytes at offset 0, clobbering both
+`gravity` and `accel_x`. The second store at offset 4 then clobbered
+`accel_x`, `accel_y`, AND `flags`. The reads back came out as
+whatever happened to be on the stack — the cascade made even the
+positive-value round-trip (which doesn't need sign extension) fail.
+
+ARM64 native codegen was already width-correct (uses LDRB / LDRH /
+LDRSW / LDR + matching STRB / STRH / STR W / STR for the four
+slice widths), so the native suite passed. Only the C path lied.
+
+### The slice semantic distinction
+
+Resolving the fix needed a clear answer to "is `:byte` signed or
+unsigned?" The answer is **mixed by design**, mirroring ARM64
+default-instruction conventions plus one explicit B++ override:
+
+| Slice | LOAD width | LOAD sign | Reason |
+|---|---|---|---|
+| `:byte`    (8-bit)  | uint8_t  | UNSIGNED (zero-extend) | LDRB default; fits flags / channels / IDs |
+| `:quarter` (16-bit) | uint16_t | UNSIGNED (zero-extend) | LDRH default; fits counters / IDs |
+| `:half`    (32-bit) | int32_t  | SIGNED (sign-extend) | LDRSW; fits signed coords / deltas (B++ override on LDR W default) |
+| `:full`    (64-bit) | long long | n/a (full word) | LDR X |
+
+For STORE the sign doesn't matter — writing 200 as int8_t vs
+uint8_t emits the same byte. The asymmetry only affects LOAD.
+
+Float slices are a parallel family:
+
+| Slice | LOAD | STORE |
+|---|---|---|
+| `:half float`  (32-bit IEEE) | `*(float*)`, cast to double | `*(float*)`, cast from double |
+| `:full float`  / `: double`  (64-bit IEEE) | `*(double*)` | `*(double*)` |
+
+The `:bit` family (sub-byte fields) was already correct — bit ops
+via shift+mask, not pointer cast.
+
+### Fix
+
+`src/backend/c/bpp_emitter.bsm` `emit_node` for both T_MEMLD and
+T_MEMST gained a slice-aware dispatch. Each width gets its own
+typed pointer cast; the existing 64-bit `long long` path stays as
+the fallthrough for SL_FULL and unhinted nodes.
+
+### Resolution
+
+5/5 tests went from FAIL to PASS in the C suite with one fix:
+
+```
+test_signed_half:        FAIL → PASS
+test_slice_struct:       FAIL → PASS
+test_ecs_component:      FAIL → PASS  (cascade — uses slice struct)
+test_asset_wav:          FAIL → PASS  (WAV header parses sub-word fields)
+test_stbasset_hotreload: FAIL → PASS  (cascade — depends on asset_wav)
+```
+
+Suite at end:
+- Native:    124 passed, 0 failed, 11 skipped
+- C backend: 105 passed, 0 failed, 30 skipped
+- Bootstrap: gen1 == gen2 byte-stable (BPP_BUILD_ID=0)
+
+### Lesson
+
+Five test failures looked like five bugs; the root cause was one
+shared codegen issue with five different surface symptoms. The
+"hunt vs defer" decision was made cheaper because the fix was
+local (single emitter file) and the false-positive count exposed
+by the shim fix was bounded (only 5). When false positives are
+masked by a runner that swallows rc, the actual bug count tends
+to be smaller than the symptom count — the masked failures
+converge on shared codepaths because the runner uniformly reports
+PASS regardless of which logic is wrong.
+
+Commit: `36f7e46` — `c-emitter: width-aware slice struct fields +
+main_bpp rc forward + dispatch cleanup`.

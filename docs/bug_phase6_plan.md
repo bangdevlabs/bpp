@@ -1,5 +1,25 @@
 # bug Phase 6 — Profiler + Runtime Symbolication
 
+## Status (2026-05-02)
+
+| Stage | Status | Commits |
+|---|---|---|
+| 6.1 — Minisym section emission | ✅ SHIPPED 2026-04-30 | `f163596` |
+| 6.2a — Runtime locate (Mach-O / ELF walk) | ✅ SHIPPED 2026-05-01 | `f163596` |
+| 6.2b — `_runtime_resolve_pc` + name unpack helpers | ✅ SHIPPED 2026-05-01 | `f163596` |
+| 6.2c — `caller_pc` builtin + `caller_name` function | ✅ SHIPPED 2026-05-01 | (in tree, pending commit) |
+| 6.3 — `panic(msg)` builtin with stack trace | 🟡 NEXT (~1 session, ~100 LOC) | — |
+| 6.4 — Multi-thread profiler (hybrid coop+signal) | 🟡 PLANNED (~250 LOC, 2 sessions) | — |
+| 6.5 — `caller(n)` sugar | 🟡 PLANNED (~50 LOC, ½ session) | — |
+
+Phase 6.2 done. The pair `caller_name(caller_pc(N))` resolves any
+frame in the FP chain without external `.bug`. End-to-end probe
+(`tests/test_caller.bpp`) walks 3 frames deep main→deep_a→deep_b→deep_c
+and resolves each level. Suite native 124/0/11, C 105/0/30, byte-stable.
+
+Stage 6.3 (panic) is the natural next consumer of the
+caller_pc-walk-then-resolve pattern Phase 6.2c just enabled.
+
 ## Context
 
 Phase 5 step 3 shipped (the_bug GUI live debugger). Phase 6 is
