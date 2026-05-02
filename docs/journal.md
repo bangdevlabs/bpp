@@ -6080,3 +6080,87 @@ Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS +
 test_bootstrap_stable.sh PASS (5/5 with retry workaround).
 Bootstrap genuinely byte-stable per documented procedure with
 no env coordination.
+
+## 2026-05-02 (still later still) — Compiler self-compile flake: real fix
+
+User pushed back on documenting the ~20% self-compile flake as
+a deferred 1-day investigation: *"a gente tem que fazer o fix
+real pelo amor de deus"*. Right call. Took less than an hour
+once the trap was in place.
+
+### Diagnosis
+
+Added a sanity check inside `diag_packed`: when the decoded
+identifier bytes are not all printable ASCII, abort with the
+raw bytes and offset. Trapped on the third run. Output:
+
+```
+[diag_packed: vbuf trashed at s=1505 l=10
+ bytes=0 0 0 0 0 0 0 34 215 7 ]
+```
+
+So the packed reference was fine (s=1505, l=10 are valid for an
+identifier interned early in the import chain), but the bytes
+*at vbuf[1505..1514]* had been overwritten between when
+`_ms_u32_le` was interned and when the diagnostic phase
+re-read them. Pattern: 7 zeros + 3 small bytes (`0x07d722` ≈
+513826). Looked like an 8-byte word write of a small integer
+value landing on top of the interned name — exactly the shape a
+parser writing `tok_lines[]` / `tok_src_off[]` / `toks[]` would
+produce.
+
+`init_parser` allocates `toks = malloc(4194304)` (4 MB). Each
+token slot is 24 bytes wide → capacity ~174762 tokens. The
+self-compile workload (`bpp.bpp` + all imports = ~40k source
+lines, average 5-10 tokens per line) trips the ceiling and the
+overflow writes land wherever the heap allocator placed the
+next buffer. ASLR layout decided whether that neighbour was
+vbuf or some harmless region — explaining the ~20% rate: a
+heap layout where vbuf sat right above toks corrupted vbuf;
+other layouts left vbuf alone.
+
+`init_lexer` had already shipped 8 MB caps on tok_lines /
+tok_src_off years ago for the same class of bug (the "global
+'break' not found" regression, per the comment in init_lexer
+itself). Same headroom logic applies to `toks` — the 4 MB cap
+was the only one left at the old size.
+
+### Fix
+
+`toks = malloc(16777216)` (16 MB → ~700k token slots). Plenty
+of headroom for any compilation workload that fits in a single
+import tree.
+
+Verification
+- 10/10 successive `./bpp src/bpp.bpp` runs produce the same
+  sha256 with no retries.
+- Triple bootstrap gen1 == gen2 == gen3 with no env
+  coordination.
+- `tests/test_bootstrap_stable.sh` simplified back to a plain
+  triple-bootstrap with no retry loop; 5/5 PASS.
+
+Commit: `c59f728` — `parser: bump toks buffer 4 MB → 16 MB
+(fix self-compile flake)`.
+
+### Lesson
+
+When a flake correlates with input volume but resists vbuf-
+sizing experiments, the next thing to suspect is a SIBLING
+buffer that overflows into the structure being read. The trap
+that pinned this down was 30 LOC of "decoded identifier should
+be printable ASCII" — three minutes to write, immediate
+root cause from the offset and the byte pattern. The lesson
+saved as a memory: when an identifier appears garbled, check
+that the bytes at vbuf[s..s+l] are still ASCII before
+investigating the packed reference itself. Garbage in the
+referenced bytes ≠ corruption of the reference; it means
+something OTHER than the lexer wrote into vbuf, and the
+"something other" is almost always an adjacent overflowing
+buffer.
+
+### Tree state
+
+Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS +
+test_bootstrap_stable.sh PASS (5/5, no retry). Bootstrap
+genuinely byte-stable per documented procedure with no env
+coordination, and self-compile no longer flakes.
