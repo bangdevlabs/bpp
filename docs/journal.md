@@ -5972,3 +5972,111 @@ profiler + signal supplement + worker fan-out + recursion
 guard. Next decision is Wolf3D (use the new profiler to
 optimize ray casting) vs multicore Sprint 5 (ELF dynlink →
 Linux first-class) vs Tier F (CSE, register allocator v2).
+
+## 2026-05-02 (later still) — Bootstrap byte-stability: real fix, not workaround
+
+Wolf3D handoff session reported "gen2 ≠ gen3 by ~64 bytes in
+segment vmsize" when running the documented bootstrap check.
+Initial diagnosis was sloppy: chalked it up to the previous
+agent forgetting to set `BPP_BUILD_ID=00...` (the env-var seed
+the test runner uses). The user pushed back — the bootstrap
+manual documents the check as a plain `diff <(xxd gen1) <(xxd
+gen2)` with no env-var requirement, and shifting that
+requirement onto the user retroactively is a workaround, not
+a fix.
+
+They were right. The real bug was in `bug_init_build_id`: it
+generated the 16-byte build_id from `_time_now_ns()` xor'd
+with a stack address (ASLR-randomised) xor'd with an in-process
+counter. Two `bpp` invocations on the same source produced
+different ids — every time, by design. The env-var override
+existed only because the runtime determinism never did.
+
+### Fix: content-hash build_id
+
+`bpp_bug.bsm` now splits initialisation into two stages:
+
+- `bug_init_build_id()` runs at startup, reads `BPP_BUILD_ID`
+  from the environment if set (preserves the explicit override
+  path), otherwise leaves the slots at 0. The dead
+  `_bug_build_seq` counter went away with the time-based
+  generator.
+- `bug_finalize_build_id(src, src_len)` runs after import
+  resolution and hashes the merged source bytes when no env
+  override fired. Two independent FNV-1a 64-bit streams with
+  splitmix64 finalisers on each give 128 bits of identity that
+  avalanche cleanly across adjacent inputs.
+
+`bpp.bpp` calls `bug_finalize_build_id(outbuf, outbuf_len)`
+right after the lexer source buffer is set, before any binary
+writer or `bug_save` consumer reads the id. Same source bytes
+in → same id out, deterministic by construction. The
+`BPP_BUILD_ID` env var still works for tests that pin to a
+specific id; nothing forces it.
+
+Manual now matches reality: `./bpp src/bpp.bpp -o gen1;
+gen1 src/bpp.bpp -o gen2; cmp gen1 gen2` succeeds with no env
+coordination.
+
+Verification
+- 10 successive bootstraps with no env produce the same sha256.
+- Wolf3D 10 builds produce the same sha256.
+- Native suite 126/0/12, C suite 105/0/33.
+
+Commit: `255beae` — `bpp_bug: deterministic build_id from
+merged source content hash`.
+
+### Regression test
+
+`tests/test_bootstrap_stable.sh` (`32bc450`) triple-bootstraps
+`src/bpp.bpp` with all streams detached from the parent shell
+and asserts gen2 == gen3 == gen4 plus same-compiler-same-source
+determinism. Runs standalone like `test_panic.sh` /
+`test_bug_tui.sh`.
+
+### Discovered: compiler self-compile transient failure
+
+While building the regression test, surfaced a separate bug
+that was masked by the user's normal workflow: roughly 1 in 5
+invocations of `./bpp src/bpp.bpp -o ...` fails — either with
+SIGSEGV (`rc=139`), or with `rc=1` and W013/E223 diagnostics
+whose function names are garbled bytes
+(`'       ��' annotated '@base'`). Successful runs are
+deterministic (10/10 same hash), so it is a binary success-vs-
+crash flake, not a determinism gradient.
+
+Triggered only by the volume of source bytes the parser
+processes — tiny programs and wolf3d / test_array all clean
+10/10. Bumping vbuf from 1 MB to 4 MB or 16 MB does not change
+the rate, ruling out vbuf overflow as the cause. The garbled
+names point at packed-name reads landing in a region whose
+contents differ from what was written: corruption between
+parse and validate, or an ASLR-correlated dereference of
+uninitialised memory.
+
+The regression test wraps each `bpp` invocation in an 8-retry
+loop so the byte-stability invariant it enforces stays
+checkable around the orthogonal flake. The fix is its own
+session — likely 1 day of `arr_push` retained-pointer
+instrumentation. Logged in `docs/todo.md` under "Open:
+compiler self-compile transient failure" with the symptoms,
+the workaround, and the most likely investigation surface so
+the next session does not re-derive the diagnosis.
+
+### Lesson
+
+When a bug's symptom can be ducked with "set this env var
+correctly," check whether the env var should be required at
+all. If the documented procedure is meant to work without it,
+the env var is a workaround pretending to be a feature. The
+real fix often lives one level deeper, and shipping the
+workaround calcifies a doc lie. The user's pushback ("isso ta
+com cara de workaround") was the right prompt — saved as a
+feedback memory pattern.
+
+### Tree state
+
+Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS +
+test_bootstrap_stable.sh PASS (5/5 with retry workaround).
+Bootstrap genuinely byte-stable per documented procedure with
+no env coordination.

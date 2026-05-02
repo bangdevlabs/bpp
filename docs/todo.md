@@ -74,6 +74,36 @@ is the current state and what comes next.
   architecture (RAD Debugger visualization model applied to B++).
 - Open bugs: x86_64 B1/B2 register allocation regression
 
+### Open: compiler self-compile transient failure (~20% rate)
+
+`./bpp src/bpp.bpp -o ...` fails on roughly 1 in 5 invocations with one
+of three signatures:
+- `rc=1` plus W013/E223 diagnostics where the function name is
+  garbled bytes (e.g. `'       ��' annotated '@base'`)
+- `rc=139` (SIGSEGV) before any diagnostic emits
+- clean `rc=0` and a byte-identical output to other clean runs
+
+Successful runs always produce the same hash (10/10 verified), so the
+output IS deterministic when reachable; the flake is binary (success
+vs. crash), not a determinism gradient. Smaller programs do not
+trigger it (tiny / wolf3d / test_array all 10/10 clean), so the trip
+wire correlates with the volume of source-text bytes the parser
+processes. Increasing `vbuf` to 4 MB or 16 MB does not eliminate the
+flake, ruling out vbuf overflow.
+
+The garbled function names point at fn_name (or whatever array stores
+packed names) being read from a region whose contents differ from
+what was written — corruption between parse and validate, or an
+ASLR-correlated pointer dereference reading uninitialised memory.
+
+`tests/test_bootstrap_stable.sh` works around this with an 8-retry
+loop on each `bpp` invocation; the byte-stability invariant the test
+enforces is unaffected. The right fix is to find and patch the
+underlying corruption (likely 1-day investigation: instrument
+arr_push to detect retained pointers, or run under a memory tracker).
+Tracked here so the next session knows the symptom and the
+workaround already in place.
+
 ### 0. bug Visualization — Phase 1: watch list at breakpoints
 
 See `docs/bug_viz_plan.md` for the full 5-phase plan and audit (inspired by Ryan
