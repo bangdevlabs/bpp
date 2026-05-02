@@ -452,12 +452,25 @@ void profile_start(rate_hz, depth)@io {
         *(_prof_count + t * 8) = 0;
     }
     _prof_active = 1;
+
+    // Phase 6.4.2 supplement. Arming SIGPROF after `_prof_active`
+    // is set guarantees the first signal lands on a fully
+    // initialised state. macOS implementation lives in
+    // `_core_macos.bsm`; Linux is a stub until ELF dynlink
+    // + thread parity ship. The handler address is taken here
+    // (same module as the handler definition) to keep
+    // reachability analysis honest.
+    _runtime_install_profiler(rate_hz, fn_ptr(_prof_sigprof_handler));
 }
 
 // Halt sampling. After this returns, `_prof_capture` is a no-op
 // and the rings are frozen for `profile_dump` to walk.
 void profile_stop()@io {
+    // Disable the active flag first so any in-flight SIGPROF
+    // delivery returns immediately rather than racing with the
+    // timer disable below.
     _prof_active = 0;
+    _runtime_uninstall_profiler();
 }
 
 // Cooperative boundary hook. Called from `_job_worker_main`
@@ -468,7 +481,14 @@ void profile_stop()@io {
 // `maestro_base` / `maestro_render` frame at depth 0. The
 // `caller_pc` primitive's null-FP guard from Phase 6.3 is what
 // keeps the walk from faulting when the FP chain ends mid-depth.
-void _prof_capture(t)@io {
+// Variable-skip capture used by both the cooperative wrapper and
+// the SIGPROF handler. `base_skip` is the depth at which the
+// captured chain should start, counted from this function's own
+// frame. Cooperative path passes 2 (skip self + the cooperative
+// wrapper). Signal path passes 3 (skip self + handler + the
+// macOS signal trampoline) so the captured chain begins at the
+// interrupted user code.
+void _prof_capture_n(t, base_skip)@io {
     auto ring, slot, base, i, j, pc, walked;
 
     if (_prof_active == 0)             { return; }
@@ -478,12 +498,9 @@ void _prof_capture(t)@io {
     slot = *(_prof_head  + t * 8) % _PROF_RING_SLOTS;
     base = ring + slot * _PROF_MAX_DEPTH * 8;
 
-    // caller_pc(1+i) skips this function's own frame, so depth 0
-    // is the immediate caller (the cooperative wrapper). A null
-    // PC marks the end of the resolvable chain.
     walked = _prof_depth;
     for (i = 0; i < _prof_depth; i++) {
-        pc = caller_pc(i + 1);
+        pc = caller_pc(base_skip + i);
         if (pc == 0) {
             walked = i;
             i = _prof_depth;
@@ -494,6 +511,95 @@ void _prof_capture(t)@io {
 
     // Pad the rest of the slot with zero sentinels so the
     // aggregator stops at the first 0 it encounters.
+    for (j = walked; j < _PROF_MAX_DEPTH; j++) {
+        *(base + j * 8) = 0;
+    }
+
+    *(_prof_head  + t * 8) = (*(_prof_head + t * 8) + 1) % _PROF_RING_SLOTS;
+    *(_prof_count + t * 8) = *(_prof_count + t * 8) + 1;
+}
+
+// Cooperative boundary hook. Called from `_job_worker_main`
+// between jobs and from maestro phase entry points; thread index
+// 0 is reserved for the main thread, 1..N-1 for workers. Calls
+// `_prof_capture_n(t, 2)` so the captured chain skips this
+// wrapper and the bpp_job/bpp_maestro frame above it.
+void _prof_capture(t)@io {
+    _prof_capture_n(t, 2);
+}
+
+// Phase 6.4.2 SIGPROF handler. Runs on the main thread when
+// ITIMER_PROF fires. Reads the interrupted PC and FP directly
+// from ucontext.uc_mcontext so the captured chain begins at the
+// exact instruction the program was executing when the timer
+// interrupted it — no FP-walk approximation through macOS's
+// __sigtramp.
+//
+// SA_SIGINFO at install time promotes the signature to
+// (sig, siginfo*, ucontext*). On macOS arm64 the ucontext layout
+// is:
+//
+//   offset 0   uc_onstack  (int, 4 bytes)
+//   offset 4   uc_sigmask  (uint32, 4 bytes)
+//   offset 8   uc_stack    (struct sigaltstack, 24 bytes)
+//   offset 32  uc_link     (pointer, 8 bytes)
+//   offset 40  uc_mcsize   (size_t, 8 bytes)
+//   offset 48  uc_mcontext (pointer, 8 bytes)  ← we want this
+//
+// The mcontext layout (after the 16-byte arm_exception_state64)
+// is arm_thread_state64:
+//
+//   offset 16   __x[0..28]  (29 × 8 = 232 bytes)
+//   offset 248  __fp        (FP register at signal time)
+//   offset 256  __lr
+//   offset 264  __sp
+//   offset 272  __pc        (interrupted instruction pointer)
+//
+// `_prof_capture_at` writes the interrupted PC at depth 0 and
+// then walks the supplied FP chain for the remaining depth-1
+// slots. Async-signal-safe: pre-allocated rings, no malloc, no
+// syscalls.
+void _prof_sigprof_handler(sig, info, uctx)@io {
+    auto mctx, pc, fp;
+    if (_prof_active == 0) { return; }
+    mctx = peek_w(uctx + 48);
+    pc   = peek_w(mctx + 272);
+    fp   = peek_w(mctx + 248);
+    _prof_capture_at(0, pc, fp);
+}
+
+// Capture into ring `t`, seeding the innermost frame with the
+// supplied (pc, fp) pair (typically read from a signal context)
+// and walking the FP chain for the remaining depth-1 frames.
+// Used exclusively by the SIGPROF handler today; the cooperative
+// path goes through `_prof_capture_n` which derives the chain
+// entirely from caller_pc.
+void _prof_capture_at(t, first_pc, first_fp)@io {
+    auto ring, slot, base, i, j, pc, fp, walked;
+
+    if (_prof_active == 0)             { return; }
+    if (t < 0 || t >= _PROF_MAX_THREADS) { return; }
+    if (first_pc == 0)                  { return; }
+
+    ring = *(_prof_rings + t * 8);
+    slot = *(_prof_head  + t * 8) % _PROF_RING_SLOTS;
+    base = ring + slot * _PROF_MAX_DEPTH * 8;
+
+    *(base) = first_pc;
+    walked = 1;
+    fp = first_fp;
+    for (i = 1; i < _prof_depth; i++) {
+        if (fp == 0) {
+            walked = i;
+            i = _prof_depth;
+        } else {
+            pc = peek_w(fp + 8);
+            *(base + i * 8) = pc;
+            walked++;
+            fp = peek_w(fp);
+        }
+    }
+
     for (j = walked; j < _PROF_MAX_DEPTH; j++) {
         *(base + j * 8) = 0;
     }

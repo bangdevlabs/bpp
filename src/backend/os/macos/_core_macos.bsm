@@ -34,6 +34,13 @@ import "System.B" {
     // by tests/test_thread.bpp.
     int pthread_create(ptr, ptr, ptr, ptr);
     int pthread_join(long, ptr);
+    // Phase 6.4.2 — SIGPROF supplement uses libSystem's sigaction
+    // and setitimer instead of going through bare syscall wiring.
+    // Both are stable POSIX calls; the kernel copies the struct
+    // arguments, so the caller can free its temporary buffers
+    // immediately after the call returns.
+    int sigaction(int, ptr, ptr);
+    int setitimer(int, ptr, ptr);
 }
 
 // ── Section 1: Runtime startup globals ────────────────────────
@@ -291,4 +298,93 @@ void _runtime_locate_minisym() {
         lc_off = lc_off + cmdsize;
         ncmds--;
     }
+}
+
+// ── Section 4: Phase 6.4.2 — SIGPROF supplement (macOS) ───────
+//
+// The signal-based profiler installs a SIGPROF handler that
+// captures the interrupted code's stack on a periodic timer. The
+// handler runs on the main thread (POSIX timer-by-default
+// behaviour). Worker-thread coverage via per-thread `pthread_kill`
+// is post-6.4.2; the cooperative path in bpp_runtime already
+// catches worker boundaries, so the v1 build is "main thread plus
+// boundaries elsewhere".
+//
+// Struct layouts the syscalls expect (macOS arm64):
+//
+//   struct sigaction {           // 16 bytes total
+//     u8[8] sa_handler;          // function pointer
+//     u32   sa_mask;             // signal mask (0 = none)
+//     u32   sa_flags;            // 0 = default behaviour
+//   };
+//
+//   struct itimerval {           // 32 bytes total
+//     long  it_interval.tv_sec;  // 8 bytes
+//     long  it_interval.tv_usec; // 8 bytes (4 signed + 4 pad)
+//     long  it_value.tv_sec;     // 8 bytes
+//     long  it_value.tv_usec;    // 8 bytes
+//   };
+//
+// SIGPROF = 27, ITIMER_PROF = 2 on macOS.
+// _prof_sigprof_handler is declared in src/bpp_runtime.bsm and
+// referenced here via fn_ptr at install time.
+
+const _SIGPROF     = 27;
+const _ITIMER_PROF = 2;
+const _SA_SIGINFO  = 0x40;
+
+// Install the SIGPROF handler and arm ITIMER_PROF at `rate_hz`.
+// rate_hz <= 0 is a no-op so callers can pass through whatever
+// their config says without guarding at the call site. The
+// kernel copies both struct arguments, so the temporary buffers
+// can be freed immediately after each syscall. `handler_ptr` is
+// the result of `fn_ptr(_prof_sigprof_handler)` taken in
+// bpp_runtime.bsm, where the handler itself is defined — keeping
+// the address-of operator in the same module avoids tripping the
+// reachability analyser, which only seeds fn_ptr targets it
+// observes inside the importing module's own AST.
+void _runtime_install_profiler(rate_hz, handler_ptr) {
+    auto sa, tv, period_us;
+    if (rate_hz <= 0) { return; }
+
+    // SA_SIGINFO promotes the handler signature to
+    // (sig, siginfo*, ucontext*) so the runtime can read the
+    // interrupted PC and FP from ucontext.uc_mcontext directly,
+    // rather than approximating them by walking the FP chain
+    // through macOS's __sigtramp frame.
+    //
+    // Struct layout: bytes 0-7 = sa_handler, bytes 8-11 =
+    // sa_mask (u32, 0 = no signals masked during handler),
+    // bytes 12-15 = sa_flags (u32). The single 8-byte store at
+    // offset 8 writes both fields at once: low 32 = mask, high
+    // 32 = flags, so packing `(SA_SIGINFO << 32) | 0` gives
+    // mask=0 and flags=SA_SIGINFO without needing a 32-bit poke.
+    sa = malloc(16);
+    *(sa)     = handler_ptr;
+    *(sa + 8) = _SA_SIGINFO * 0x100000000;
+    sigaction(_SIGPROF, sa, 0);
+    free(sa);
+
+    period_us = 1000000 / rate_hz;
+    tv = malloc(32);
+    *(tv)      = 0;
+    *(tv + 8)  = period_us;
+    *(tv + 16) = 0;
+    *(tv + 24) = period_us;
+    setitimer(_ITIMER_PROF, tv, 0);
+    free(tv);
+}
+
+// Disarm ITIMER_PROF. Leaves the handler installed — restoring the
+// default action would require a second sigaction call with
+// SIG_DFL, but a stale handler with no firing timer is harmless.
+void _runtime_uninstall_profiler() {
+    auto tv;
+    tv = malloc(32);
+    *(tv)      = 0;
+    *(tv + 8)  = 0;
+    *(tv + 16) = 0;
+    *(tv + 24) = 0;
+    setitimer(_ITIMER_PROF, tv, 0);
+    free(tv);
 }
