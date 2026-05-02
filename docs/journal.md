@@ -5742,5 +5742,97 @@ the data); deferred until the dump format proves insufficient.
 
 Suites: 125/0/12 native + 105/0/32 C + test_panic.sh PASS.
 Bootstrap byte-stable. Phase 6.3 + 6.4.1 ship in two clean
-commits + the GPU determinism fix. Roadmap on track for
-6.4.2 in a fresh session.
+commits + the GPU determinism fix.
+
+## 2026-05-02 (still later) — bug Phase 6.4.2 SIGPROF supplement (macOS)
+
+The "deferred to a fresh session" line above was over-cautious.
+Phase 6.4.2 turned out to be tractable in the same window once
+the right design pieces clicked:
+
+1. **Skip the syscall plumbing.** The original plan called for
+   `sys_setitimer` / `sys_sigaction` builtins with full 4-layer
+   wiring (spine + a64 + x64 + validate + C emitter). That
+   work was unnecessary — `_core_macos.bsm` already imports
+   libSystem via `import "System.B" { ... }`, and adding
+   `int sigaction(int, ptr, ptr)` and `int setitimer(int, ptr, ptr)`
+   to that block exposed both functions to the runtime with no
+   codegen changes at all.
+
+2. **Read the interrupted PC from mcontext, not from FP-walk.**
+   The cooperative build's caller_pc loop captures the FP chain
+   from the handler's frame, but on macOS arm64 the
+   `__sigtramp` trampoline does not reconstruct the interrupted
+   function's PC into the saved-LR slot. Walking only gets the
+   CALLER chain — the function that owned the CPU at signal
+   time appears nowhere. Reading
+   `ucontext.uc_mcontext.__ss.__pc` lifts that limitation and
+   gives a precise hot-spot capture. Empirical confirmation:
+   500 M iterations of `x = x*31 + i` inside `hot_loop()` →
+   103 samples at 1 kHz, all attributed to `hot_loop`.
+
+3. **SA_SIGINFO + 3-arg handler.** Promoting the handler
+   signature to `(sig, siginfo*, ucontext*)` was the only way
+   to reach `ucontext`. The flag byte goes in
+   `sa_flags = 0x40`, packed into the 8-byte store at offset 8
+   alongside `sa_mask = 0`: `(SA_SIGINFO << 32) | 0` = 0x4000000000.
+
+4. **fn_ptr taken in the SAME module as the target function.**
+   Initial implementation took `fn_ptr(_prof_sigprof_handler)`
+   inside `_core_macos.bsm`. Bootstrap then died with `internal
+   error: fn_ptr target not found after validate` — the
+   reachability analyser only seeds the address-taken set from
+   fn_ptr expressions it observes inside the importing module's
+   own AST, and the handler in `bpp_runtime.bsm` was unreachable
+   from the compiler binary's call graph. The fix was to take
+   the address inside `bpp_runtime.bsm` itself (where the
+   handler is defined) and pass it as a parameter to
+   `_runtime_install_profiler(rate_hz, handler_ptr)`. Same
+   semantics, no reachability surprise.
+
+### Memory-layout offsets (macOS arm64)
+
+The handler relies on three hardcoded offsets that future macOS
+versions could reshuffle:
+
+| Field | Offset | Source |
+|---|---|---|
+| ucontext.uc_mcontext | +48 | `<sys/ucontext.h>` |
+| mcontext.__ss.__fp | +248 | `<mach/arm/_structs.h>` |
+| mcontext.__ss.__pc | +272 | `<mach/arm/_structs.h>` |
+
+The comment block in `_prof_sigprof_handler` documents each
+offset explicitly so a future header-shape change is grep-able.
+
+### C-path compatibility
+
+The C emitter now ships `<signal.h>` and `<sys/time.h>` in the
+default include set so `sigaction` / `setitimer` come from the
+real POSIX prototypes; both names are also flagged in
+`is_libc_symbol` so the emitter skips its B++ forward decl
+that would conflict with the strict-pointer signatures Apple
+ships. Test_profile_signal carries `// skip-c:` because the
+SIGPROF supplement depends on the minisym section the C path
+does not emit.
+
+### Test
+
+`tests/test_profile_signal.bpp` arms a 1 kHz timer, spins in
+`hot_loop`, asserts the dump returned at least one entry with
+positive count and a resolved name. Loose threshold by
+design — sampling is stochastic and a strict percentage on
+`hot_loop` would flake on a loaded CI host. The smoke test
+plus the manual visual-output run (during development) cover
+the success path.
+
+Commit: `a1e2b32` — `bug Phase 6.4.2: SIGPROF supplement
+(macOS) for hotspot profiling`.
+
+### Tree state
+
+Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS.
+Bootstrap byte-stable. Phase 6 closes its primary user-visible
+roadmap with 6.3 (panic) + 6.4.1 (cooperative) + 6.4.2 (signal)
+shipped. Phase 6.5 (`caller(n)` sugar) and worker-thread
+SIGPROF supplement remain — both deferred until a real
+consumer asks.
