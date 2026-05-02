@@ -13,6 +13,69 @@
 
 import "bpp_io.bsm";
 
+// ── stdout helpers shared by every bug_* consumer ─────────────
+//
+// The bug debugger writes its watch / viz / panel output to
+// stdout via a single 1-byte syscall buffer. These helpers used
+// to live in `tools/the_bug/the_bug.bpp` (the standalone
+// debugger entry point), but `bug_viz.bsm`, `bug_gdb.bsm`,
+// `bug_observe_*.bsm`, and other library files reference them —
+// any consumer that wired up the bug library other than
+// `the_bug.bpp` (e.g. `bang9/panels.bsm` via `the_bug_lib.bsm`)
+// would link-error against the missing names.
+//
+// Lazy allocation in `out_ch` keeps callers from needing to
+// initialise the buffer up front. `_out_buf` is a single byte
+// of scratch reused across every `sys_write(1, ...)`; the
+// debugger output is sequential and small, so optimising past
+// per-character writes has not been worthwhile.
+
+static auto _out_buf;
+
+void out_ch(c) {
+    if (_out_buf == 0) { _out_buf = malloc(16); }
+    poke(_out_buf, c);
+    sys_write(1, _out_buf, 1);
+}
+
+void out_str(s) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(s, i);
+    while (ch != 0) {
+        out_ch(ch);
+        i++;
+        ch = str_peek(s, i);
+    }
+}
+
+void out_int(n) {
+    if (n < 0) { out_ch('-'); n = 0 - n; }
+    if (n >= 10) { out_int(n / 10); }
+    out_ch('0' + (n % 10));
+}
+
+void out_hex(n) {
+    auto i, d;
+    out_str("0x");
+    for (i = 60; i >= 0; i -= 4) {
+        d = (n >> i) & 0xF;
+        if (d < 10) { out_ch('0' + d); }
+        else        { out_ch('a' + d - 10); }
+    }
+}
+
+void out_nl() { out_ch(10); }
+
+// `br_print_out` lives in `bug_reader.bsm` and unpacks the
+// (offset, length) reference into `bug_str_buf` bytes. Wrapping
+// it as `out_packed` here keeps the call sites in bug_viz /
+// bug_observe / bug_eval reading naturally next to the other
+// `out_*` helpers.
+void out_packed(p) {
+    br_print_out(p);
+}
+
 // ── Status codes ───────────────────────────────────────────────
 
 // Tracee lifecycle states. The observer transitions the status
