@@ -374,3 +374,243 @@ void panic(msg)@io {
 
     sys_exit(134);
 }
+
+// ── Phase 6.4.1 — cooperative sampling profiler ───────────────
+//
+// Captures call-stack samples at natural cooperative boundaries
+// (between bpp_job tasks, at maestro phase entry) and aggregates
+// them into a top-N table the user reads through `profile_dump`.
+//
+// "Cooperative" means the sample fires only at the boundary, not
+// inside the body of an executing job. So this build does not
+// reveal hotspots inside a single tight loop — `profile_dump`
+// will attribute every sample to the function that called the
+// runtime hook (`_job_worker_main` for workers, the maestro
+// phase for main). Phase 6.4.2 adds the SIGPROF supplement that
+// fires inside job bodies for the audio / main thread.
+//
+// The sample rate field on `profile_start` is advisory: the
+// effective rate equals min(rate_hz, dispatch_rate). Cooperative
+// sampling cannot exceed the rate at which workers reach a
+// boundary. The signal supplement removes that ceiling.
+//
+// Storage budget at default depth = 8:
+//   _PROF_MAX_THREADS × _PROF_RING_SLOTS × _PROF_MAX_DEPTH × 8
+//   = 8 × 1024 × 32 × 8 ≈ 2 MB total.
+// Allocated lazily on first `profile_start`; subsequent starts
+// reuse the buffers and only reset the per-thread heads.
+
+const _PROF_MAX_THREADS    = 8;
+const _PROF_RING_SLOTS     = 1024;
+const _PROF_DEFAULT_DEPTH  = 8;
+const _PROF_MAX_DEPTH      = 32;
+
+// Per-thread ring of captured stacks. `_prof_rings` holds one
+// pointer per thread; each pointer addresses a buffer of
+// `_PROF_RING_SLOTS * _PROF_MAX_DEPTH * 8` bytes containing a
+// flat array of slots. Slot layout: `_PROF_MAX_DEPTH` 8-byte PCs,
+// terminated by a 0 entry when the captured chain was shorter
+// than the configured depth. Heads, sample counts, and the
+// active flag live in their own buffers so writes never alias.
+extrn _prof_rings;
+extrn _prof_head;
+extrn _prof_count;
+extrn _prof_active;
+extrn _prof_depth;
+static extrn _prof_inited;
+
+// One-time allocation of every ring buffer plus the per-thread
+// scratch arrays. Subsequent calls are no-ops so `profile_start`
+// can run repeatedly without leaking.
+static void _prof_lazy_init() {
+    auto t;
+    if (_prof_inited != 0) { return; }
+    _prof_rings = buf_word(_PROF_MAX_THREADS);
+    _prof_head  = buf_word(_PROF_MAX_THREADS);
+    _prof_count = buf_word(_PROF_MAX_THREADS);
+    for (t = 0; t < _PROF_MAX_THREADS; t++) {
+        *(_prof_rings + t * 8) = buf_word(_PROF_RING_SLOTS * _PROF_MAX_DEPTH);
+    }
+    _prof_depth  = _PROF_DEFAULT_DEPTH;
+    _prof_inited = 1;
+}
+
+// Begin sampling. `rate_hz` is target advisory in cooperative
+// builds (effective rate is bounded by the dispatch rate of the
+// workload; see header above). `depth` clamps the captured stack
+// frames per sample — pass 0 to use the default of 8.
+void profile_start(rate_hz, depth)@io {
+    auto t;
+    _prof_lazy_init();
+
+    if (depth <= 0)                  { _prof_depth = _PROF_DEFAULT_DEPTH; }
+    else if (depth > _PROF_MAX_DEPTH) { _prof_depth = _PROF_MAX_DEPTH; }
+    else                              { _prof_depth = depth; }
+
+    for (t = 0; t < _PROF_MAX_THREADS; t++) {
+        *(_prof_head  + t * 8) = 0;
+        *(_prof_count + t * 8) = 0;
+    }
+    _prof_active = 1;
+}
+
+// Halt sampling. After this returns, `_prof_capture` is a no-op
+// and the rings are frozen for `profile_dump` to walk.
+void profile_stop()@io {
+    _prof_active = 0;
+}
+
+// Cooperative boundary hook. Called from `_job_worker_main`
+// between jobs and from maestro phase entry points; thread index
+// 0 is reserved for the main thread, 1..N-1 for workers. The
+// captured chain begins at the function that called this hook,
+// so the user sees their `worker_main` / `maestro_solo` /
+// `maestro_base` / `maestro_render` frame at depth 0. The
+// `caller_pc` primitive's null-FP guard from Phase 6.3 is what
+// keeps the walk from faulting when the FP chain ends mid-depth.
+void _prof_capture(t)@io {
+    auto ring, slot, base, i, j, pc, walked;
+
+    if (_prof_active == 0)             { return; }
+    if (t < 0 || t >= _PROF_MAX_THREADS) { return; }
+
+    ring = *(_prof_rings + t * 8);
+    slot = *(_prof_head  + t * 8) % _PROF_RING_SLOTS;
+    base = ring + slot * _PROF_MAX_DEPTH * 8;
+
+    // caller_pc(1+i) skips this function's own frame, so depth 0
+    // is the immediate caller (the cooperative wrapper). A null
+    // PC marks the end of the resolvable chain.
+    walked = _prof_depth;
+    for (i = 0; i < _prof_depth; i++) {
+        pc = caller_pc(i + 1);
+        if (pc == 0) {
+            walked = i;
+            i = _prof_depth;
+        } else {
+            *(base + i * 8) = pc;
+        }
+    }
+
+    // Pad the rest of the slot with zero sentinels so the
+    // aggregator stops at the first 0 it encounters.
+    for (j = walked; j < _PROF_MAX_DEPTH; j++) {
+        *(base + j * 8) = 0;
+    }
+
+    *(_prof_head  + t * 8) = (*(_prof_head + t * 8) + 1) % _PROF_RING_SLOTS;
+    *(_prof_count + t * 8) = *(_prof_count + t * 8) + 1;
+}
+
+// Returns 1 when `name_addr/name_len` starts with the literal
+// `__synth_`. Used by the aggregator to re-attribute auto-
+// dispatched worker samples to the loop-containing caller.
+// Not @base because the classifier treats `peek` as impure;
+// keeping it unannotated lets the classifier infer correctly.
+static _prof_is_synth(name_addr, name_len) {
+    if (name_len < 8) { return 0; }
+    if (peek(name_addr    ) != '_') { return 0; }
+    if (peek(name_addr + 1) != '_') { return 0; }
+    if (peek(name_addr + 2) != 's') { return 0; }
+    if (peek(name_addr + 3) != 'y') { return 0; }
+    if (peek(name_addr + 4) != 'n') { return 0; }
+    if (peek(name_addr + 5) != 't') { return 0; }
+    if (peek(name_addr + 6) != 'h') { return 0; }
+    if (peek(name_addr + 7) != '_') { return 0; }
+    return 1;
+}
+
+// Aggregate every captured sample into a top-`cap` table sorted
+// by descending count. Each output entry is 16 bytes: an 8-byte
+// packed name reference (the same encoding `caller_name` returns)
+// followed by an 8-byte sample count. Returns the number of
+// entries written.
+//
+// Synth re-attribution (Refinement 5 of the Phase 6.4 plan):
+// when the innermost frame resolves to a name beginning with
+// `__synth_`, the aggregator walks one frame up in the captured
+// stack so the tally credits the function that contained the
+// auto-dispatched loop instead of the synthetic worker that
+// nobody hand-named.
+//
+// Aggregation strategy: linear tally array sized to the number
+// of unique resolved names seen, then partial selection-sort
+// for the top `cap`. Quadratic in unique-name count but typical
+// programs have 100-500 functions; binary-search dedup or heap
+// extraction become worthwhile only at >10 kHz aggregate rates
+// across hundreds of threads, well past the cooperative ceiling.
+profile_dump(out_buf, cap)@io {
+    auto t, samples, i, j, k, slot, base, found;
+    auto pc, packed, name_addr, name_len, pc_up, packed_up;
+    auto name_buf, count_buf, unique_count;
+    auto best_idx, best_count;
+
+    if (_prof_inited == 0) { return 0; }
+
+    name_buf  = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
+    count_buf = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
+    unique_count = 0;
+
+    for (t = 0; t < _PROF_MAX_THREADS; t++) {
+        samples = *(_prof_count + t * 8);
+        if (samples > _PROF_RING_SLOTS) { samples = _PROF_RING_SLOTS; }
+        for (i = 0; i < samples; i++) {
+            slot = i % _PROF_RING_SLOTS;
+            base = *(_prof_rings + t * 8) + slot * _PROF_MAX_DEPTH * 8;
+
+            pc = *(base);
+            if (pc == 0) { continue; }
+            packed = _runtime_resolve_pc(pc);
+            if (packed == 0) { continue; }
+
+            // Synth re-attribution: peek the second frame up
+            // when the innermost name is an anonymous worker.
+            name_addr = _runtime_name_addr(packed);
+            name_len  = _runtime_name_len(packed);
+            if (_prof_is_synth(name_addr, name_len)) {
+                pc_up = *(base + 8);
+                if (pc_up != 0) {
+                    packed_up = _runtime_resolve_pc(pc_up);
+                    if (packed_up != 0) { packed = packed_up; }
+                }
+            }
+
+            // Linear tally: increment if seen, else append.
+            found = 0;
+            for (j = 0; j < unique_count; j++) {
+                if (*(name_buf + j * 8) == packed) {
+                    *(count_buf + j * 8) = *(count_buf + j * 8) + 1;
+                    found = 1;
+                    j = unique_count;
+                }
+            }
+            if (found == 0) {
+                *(name_buf  + unique_count * 8) = packed;
+                *(count_buf + unique_count * 8) = 1;
+                unique_count++;
+            }
+        }
+    }
+
+    // Top-K via partial selection sort. Marks consumed entries
+    // by zeroing their count so the next pass picks the new max.
+    if (cap > unique_count) { cap = unique_count; }
+    for (k = 0; k < cap; k++) {
+        best_count = 0;
+        best_idx   = 0 - 1;
+        for (j = 0; j < unique_count; j++) {
+            if (*(count_buf + j * 8) > best_count) {
+                best_count = *(count_buf + j * 8);
+                best_idx   = j;
+            }
+        }
+        if (best_idx < 0) { k = cap; }
+        else {
+            *(out_buf + k * 16    ) = *(name_buf  + best_idx * 8);
+            *(out_buf + k * 16 + 8) = best_count;
+            *(count_buf + best_idx * 8) = 0;
+        }
+    }
+
+    return cap;
+}

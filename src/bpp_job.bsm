@@ -59,6 +59,11 @@ import "_core.bsm";
 // job_wait_all uses to know when every submitted job has finished
 // executing — submit_count is only written by main, done_count is
 // only written by the worker, so neither has multi-writer races.
+// `worker_idx` is the 1-based slot the worker owns inside the
+// profiler ring buffers. Index 0 is reserved for the main thread,
+// so the first worker is index 1, second is 2, and so on. The
+// profiler reads it during `_prof_capture(t)` to write into the
+// correct per-thread ring without a thread-local lookup.
 struct Worker {
     tid,
     queue_buf,
@@ -66,7 +71,8 @@ struct Worker {
     tail,
     capacity,
     submit_count,
-    done_count
+    done_count,
+    worker_idx
 }
 
 // Set once in job_init, never changes after.
@@ -124,6 +130,12 @@ static _job_worker_main(arg) {
         // main thread.
         call(fn, job_arg);
 
+        // Cooperative profiler hook (Phase 6.4.1). Capture the FP
+        // chain right after the job returns — natural pause point
+        // for sampling, zero AS-safety risk because we are back in
+        // ordinary user-code context. No-op when profiling is off.
+        _prof_capture(w.worker_idx);
+
         // Mark complete. Advance tail (so the producer can reuse the
         // slot) and bump done_count (so wait_all knows progress).
         next_tail = (tail + 1) % w.capacity;
@@ -156,6 +168,10 @@ job_init(n_workers) {
         w.capacity = _JOB_DEFAULT_CAPACITY;
         w.submit_count = 0;
         w.done_count = 0;
+        // Worker index 0 belongs to the main thread; workers fill
+        // 1..N. The profiler keys per-thread state by this slot,
+        // so it must stay distinct across all live threads.
+        w.worker_idx = i + 1;
         _job_workers[i] = w;
         // Spawn the OS thread last so the worker's struct is fully
         // initialized before the worker can read it.

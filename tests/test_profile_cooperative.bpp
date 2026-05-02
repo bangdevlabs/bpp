@@ -1,0 +1,57 @@
+// skip-c: cooperative profiler relies on minisym section + FP-walk;
+// test_profile_cooperative.bpp — Phase 6.4.1 smoke test.
+//
+// Cooperative sampling fires at job boundaries (between tasks in
+// `_job_worker_main`). It cannot see inside a tight loop running
+// in a single job — that visibility belongs to Phase 6.4.2's
+// SIGPROF supplement. So this test verifies the infra works
+// (samples accumulate, names resolve, top-N table is non-empty)
+// rather than asserting on a specific hot path.
+//
+// Workload: 1000 small jobs, four workers. Each job runs `work_fn`
+// briefly to give the FP chain something to walk. After
+// `profile_stop` the test asks for the top 16 entries and checks:
+//   1. The dump returned at least one entry.
+//   2. The first entry has a positive sample count.
+//   3. The first entry resolves to a non-zero packed name.
+
+import "bpp_job.bsm";
+
+// `work_fn` body must NOT contain an additive reduction shape —
+// Sprint 2b would auto-promote it into a recursive call to
+// `job_parallel_reduce`, which deadlocks bpp_job because workers
+// running this body cannot also drive new submissions. Use a
+// non-reducible body (multiplicative / non-associative steps work
+// because they detect but do not parallelise in Sprint 2b).
+work_fn(idx) {
+    auto i, x;
+    x = 0;
+    for (i = 0; i < 100; i++) {
+        x = x * 3 + i;
+    }
+}
+
+main() {
+    auto buf, n, i, top_name, top_count;
+
+    job_init(4);
+
+    profile_start(1000, 8);
+    for (i = 0; i < 1000; i++) {
+        job_submit(fn_ptr(work_fn), i);
+    }
+    job_wait_all();
+    profile_stop();
+
+    buf = buf_word(16 * 2);
+    n = profile_dump(buf, 16);
+    if (n == 0) { return 1; }
+
+    top_name  = *(buf);
+    top_count = *(buf + 8);
+    if (top_count <= 0) { return 2; }
+    if (top_name == 0)  { return 3; }
+
+    job_shutdown();
+    return 0;
+}
