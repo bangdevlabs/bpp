@@ -23,18 +23,15 @@ global flag_bug;
 // Scratch buffer for constructing the .bug output path.
 static auto _bug_pathbuf;
 
-// 16-byte build identity. Generated once per compile by
-// bug_init_build_id, written to BOTH the binary metadata
-// (Mach-O LC_UUID / ELF PT_NOTE NT_GNU_BUILD_ID) and the .bug
-// header. The bug debugger checks them on load and refuses to use
-// a .bug whose id does not match the binary it claims to describe.
+// 16-byte build identity. Filled in two stages: `bug_init_build_id`
+// runs at startup and reads `BPP_BUILD_ID` from the env if set;
+// `bug_finalize_build_id` runs after import resolution and hashes
+// the merged source bytes when no env override was supplied. The
+// id is written to BOTH the binary metadata (Mach-O LC_UUID / ELF
+// PT_NOTE NT_GNU_BUILD_ID) and the .bug header. The bug debugger
+// checks them on load and refuses to use a .bug whose id does not
+// match the binary it claims to describe.
 global _bug_build_id_lo, _bug_build_id_hi;
-
-// Anti-collision counter. Incremented every call to
-// bug_init_build_id so back-to-back builds within the same process
-// always produce distinct ids even if the OS clock returned the
-// same nanosecond reading.
-static auto _bug_build_seq;
 
 // -- Initialization --------------------------------------------
 
@@ -44,7 +41,6 @@ void init_bug() {
     _bug_pathbuf = malloc(4096);
     _bug_build_id_lo = 0;
     _bug_build_id_hi = 0;
-    _bug_build_seq   = 0;
 }
 
 // Parse 16 hex chars from `s + off` into a u64. Returns 0 on
@@ -64,37 +60,75 @@ static parse_hex_u64(s, off)@base {
     return val;
 }
 
-// Generate the 16-byte build_id for the current compilation. Sources
-// of entropy: monotonic ns clock, stack address (varies per process
-// via ASLR), and an in-process counter. The two outputs are
-// independent splitmix64-style hashes, so each bit of the 128-bit
-// result is statistically independent of the others.
+// Initialise the 16-byte build_id slots. Two paths:
 //
-// `BPP_BUILD_ID` env var (32 hex chars) overrides for reproducible
-// bootstraps. `tests/run_all.sh` exports
-// BPP_BUILD_ID=00000000000000000000000000000000 so gen1 and gen2
-// stay byte-stable.
+//   1. `BPP_BUILD_ID` env var present (32 hex chars) — parse and
+//      use directly. This is the explicit-override path: tools
+//      that want a specific id (e.g. tests pinning to all-zero
+//      for byte-stable comparisons) set the env var.
 //
-// Call once per `bpp` invocation, before any binary writer or
-// `bug_save` runs, so all consumers see the same value.
+//   2. No env var — leave the slots at 0 here. `bug_finalize_build_id`
+//      runs after import resolution and hashes the merged source
+//      bytes to derive a deterministic id. Same source → same id,
+//      different source → different id (128 bits, FNV + splitmix
+//      finaliser).
+//
+// The split exists because `outbuf` is empty at module-init time;
+// the content hash needs the parsed source which isn't available
+// until after `process_file` runs. Anything before that observes a
+// zero build_id, which is benign — the binary writers and
+// `bug_save` consumers all run after finalise.
 void bug_init_build_id() {
-    auto t, stk, env_id;
+    auto env_id;
+
+    _bug_build_id_lo = 0;
+    _bug_build_id_hi = 0;
 
     env_id = getenv("BPP_BUILD_ID");
     if (env_id != 0) {
         _bug_build_id_lo = parse_hex_u64(env_id, 0);
         _bug_build_id_hi = parse_hex_u64(env_id, 16);
-        return;
     }
+}
 
-    t = _time_now_ns();
-    stk = &t;                          // ASLR-randomized stack address.
-    _bug_build_seq = _bug_build_seq + 1;
+// Hash the merged source bytes into the build_id slots once
+// import resolution has populated `outbuf`. Skipped when the env
+// var override already filled the slots so the explicit-pin path
+// stays untouched. Same source bytes in → same id, different
+// source → different id (128 bits split across two streams).
+//
+// Two independent FNV-1a streams give us the 128-bit output
+// without correlating the halves. A splitmix64 finaliser
+// scrambles the residual structure of FNV so adjacent ids look
+// statistically random — the build_id check in `bug_reader.bsm`
+// uses byte-level equality, so any avalanching is enough.
+//
+// `bpp` calls this from `main` right after `outbuf_len` is
+// finalised. Anything before that observed a zero id; the only
+// consumers that fire that early are the per-module init
+// routines, none of which read build_id.
+void bug_finalize_build_id(src, src_len) {
+    auto h_lo, h_hi, i, c, env_id;
 
-    _bug_build_id_lo = (t ^ (stk * 0x9E3779B97F4A7C15)) ^ _bug_build_seq;
-    _bug_build_id_hi = (t * 0xBF58476D1CE4E5B9)
-                       ^ (stk << 16)
-                       ^ (_bug_build_seq * 0x94D049BB133111EB);
+    env_id = getenv("BPP_BUILD_ID");
+    if (env_id != 0) { return; }
+
+    h_lo = 0xCBF29CE484222325;     // FNV-1a 64 offset basis.
+    h_hi = 0x100000001B3;          // FNV-1a 64 prime, used as h_hi seed.
+    for (i = 0; i < src_len; i++) {
+        c = peek(src + i);
+        h_lo = (h_lo ^ c) * 0x100000001B3;
+        h_hi = (h_hi ^ c) * 0xBF58476D1CE4E5B9;
+    }
+    h_lo = (h_lo ^ (h_lo >> 30)) * 0xBF58476D1CE4E5B9;
+    h_lo = (h_lo ^ (h_lo >> 27)) * 0x94D049BB133111EB;
+    h_lo =  h_lo ^ (h_lo >> 31);
+    h_hi = (h_hi ^ (h_hi >> 30)) * 0xBF58476D1CE4E5B9;
+    h_hi = (h_hi ^ (h_hi >> 27)) * 0x94D049BB133111EB;
+    h_hi =  h_hi ^ (h_hi >> 31);
+
+    _bug_build_id_lo = h_lo;
+    _bug_build_id_hi = h_hi;
 }
 
 // -- Part 1: Platform-agnostic debug data ----------------------
