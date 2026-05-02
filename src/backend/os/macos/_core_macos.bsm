@@ -128,3 +128,167 @@ _thread_spawn(tid_buf, start_fn, arg) {
 _thread_wait(tid) {
     return pthread_join(tid, 0);
 }
+
+// ── Section 4: Runtime symbol resolution ──────────────────────
+//
+// Locate the minisym blob a64_macho.bsm embedded in __DATA at
+// compile time. Caches the table address, entry count, and
+// strtab address in globals owned by `bpp_runtime.bsm`. The
+// resolver in `bpp_runtime.bsm` calls this lazily on the first
+// PC lookup, so every program — even one that never asks for a
+// caller_name — pays zero startup cost for symbolication.
+//
+// macOS PIE binaries are loaded at an ASLR-randomized address,
+// so the runtime cannot know mh_execute_header at compile time.
+// Instead we take the address of any function that lives in
+// __TEXT (this one), page-align it down, and walk backwards by
+// 16384-byte pages until the mach_header_64 magic (0xFEEDFACF
+// in little-endian: CF FA ED FE) shows up. The header is
+// always the first byte of the executable mapping, so this walk
+// is bounded by the binary's __TEXT vmsize. Cap at 4096 pages
+// (= 64 MB) so a corrupted process state cannot loop forever.
+
+extrn _minisym_loaded;       // 0 = first call has not run yet, 1 = loaded
+extrn _minisym_image_base;   // mh_execute_header at runtime
+extrn _minisym_table_addr;   // start of the MSYM blob
+extrn _minisym_count;        // entry_count from the MSYM header
+extrn _minisym_strtab;       // first byte of the packed strtab
+
+// Literal name buffers built once on first locate. File scope so
+// they survive across calls and stay zero-initialized in BSS
+// before init. Two regions: 8 bytes for "__DATA\0\0" and 16 bytes
+// for "__minisym\0..." matched against the Mach-O 16-byte sectname
+// field. The build_once branch in `_runtime_locate_minisym`
+// fills them on first invocation.
+static auto _ms_data_seg_buf;
+static auto _ms_minisym_sect_buf;
+
+// Read a little-endian u32 from a byte-aligned address. The
+// Mach-O header fields we walk land at varied alignments
+// depending on cmdsize chains, so a byte-by-byte read is the
+// safe portable form.
+static _ms_u32_le(p)@base {
+    return peek(p) | (peek(p+1) << 8) | (peek(p+2) << 16) | (peek(p+3) << 24);
+}
+
+// Compare a fixed-length region against a C-style literal name
+// up to `n` bytes. Mach-O segname / sectname fields are 16-byte
+// zero-padded, so we additionally require a NUL (or end-of-
+// field) right after the literal so that "__DATA" does not
+// match "__DATAxxx".
+static _ms_name_eq(p, lit, n)@base {
+    auto i;
+    for (i = 0; i < n; i++) {
+        if (peek(p + i) != peek(lit + i)) { return 0; }
+    }
+    if (n < 16) {
+        if (peek(p + n) != 0) { return 0; }
+    }
+    return 1;
+}
+
+// Walk back from a known __TEXT address to the start of the
+// loaded Mach-O image. Returns the header address, or 0 if the
+// magic is not found within the search budget.
+static _ms_find_macho_header() {
+    auto p, limit;
+    p = fn_ptr(_runtime_locate_minisym);
+    p = p & 0xFFFFFFFFFFFFC000;     // align down to 16384-byte page
+    limit = 4096;
+    while (limit > 0) {
+        if (peek(p) == 0xCF) {
+            if (peek(p+1) == 0xFA & peek(p+2) == 0xED & peek(p+3) == 0xFE) {
+                return p;
+            }
+        }
+        if (p <= 16384) { return 0; }
+        p = p - 16384;
+        limit--;
+    }
+    return 0;
+}
+
+// Lazy-init the minisym cache. Idempotent: subsequent calls
+// after the first successful load short-circuit on
+// _minisym_loaded.
+//
+// Called by `_runtime_resolve_pc` (in bpp_runtime.bsm) on the
+// first lookup. If anything goes wrong (header not found, no
+// __DATA segment, no __minisym section), the globals stay zero
+// and the resolver returns the "unknown" sentinel — no panic.
+void _runtime_locate_minisym() {
+    auto hdr, ncmds, lc_off, cmd, cmdsize, nsects, sect_off, i;
+    auto data_seg, minisym_sect, sect_addr;
+
+    if (_minisym_loaded != 0) { return; }
+
+    hdr = _ms_find_macho_header();
+    if (hdr == 0) { return; }
+
+    _minisym_image_base = hdr;
+
+    // Build the literal name buffers once. Using inline character
+    // sequences keeps this routine self-contained and avoids any
+    // dependency on string-literal addressing conventions, which
+    // change subtly between codegens (packed refs vs C strings).
+    if (_ms_data_seg_buf == 0) {
+        _ms_data_seg_buf = malloc(8);
+        poke(_ms_data_seg_buf,     '_'); poke(_ms_data_seg_buf + 1, '_');
+        poke(_ms_data_seg_buf + 2, 'D'); poke(_ms_data_seg_buf + 3, 'A');
+        poke(_ms_data_seg_buf + 4, 'T'); poke(_ms_data_seg_buf + 5, 'A');
+        poke(_ms_data_seg_buf + 6,  0);  poke(_ms_data_seg_buf + 7, 0);
+        _ms_minisym_sect_buf = malloc(16);
+        poke(_ms_minisym_sect_buf,     '_'); poke(_ms_minisym_sect_buf +  1, '_');
+        poke(_ms_minisym_sect_buf + 2, 'm'); poke(_ms_minisym_sect_buf +  3, 'i');
+        poke(_ms_minisym_sect_buf + 4, 'n'); poke(_ms_minisym_sect_buf +  5, 'i');
+        poke(_ms_minisym_sect_buf + 6, 's'); poke(_ms_minisym_sect_buf +  7, 'y');
+        poke(_ms_minisym_sect_buf + 8, 'm'); poke(_ms_minisym_sect_buf +  9, 0);
+    }
+    data_seg     = _ms_data_seg_buf;
+    minisym_sect = _ms_minisym_sect_buf;
+
+    // mach_header_64 layout: magic(4) cputype(4) cpusubtype(4)
+    //   filetype(4) ncmds(4) sizeofcmds(4) flags(4) reserved(4) = 32 bytes.
+    ncmds = _ms_u32_le(hdr + 16);
+    lc_off = 32;
+
+    while (ncmds > 0) {
+        cmd     = _ms_u32_le(hdr + lc_off);
+        cmdsize = _ms_u32_le(hdr + lc_off + 4);
+
+        // LC_SEGMENT_64 = 0x19. Layout after cmd/cmdsize:
+        //   segname[16] vmaddr(8) vmsize(8) fileoff(8) filesize(8)
+        //   maxprot(4) initprot(4) nsects(4) flags(4)
+        // followed by nsects × section_64 (80 bytes each).
+        if (cmd == 0x19) {
+            if (_ms_name_eq(hdr + lc_off + 8, data_seg, 6)) {
+                nsects = _ms_u32_le(hdr + lc_off + 64);
+                sect_off = lc_off + 72;
+                for (i = 0; i < nsects; i++) {
+                    // section_64 layout: sectname[16] segname[16]
+                    //   addr(8) size(8) offset(4) align(4) ...
+                    if (_ms_name_eq(hdr + sect_off, minisym_sect, 9)) {
+                        // The `addr` field (offset 32) is the link-
+                        // time vmaddr — useless for a PIE binary at
+                        // runtime. Use the `offset` field (offset 48,
+                        // u32) which is the file offset of the
+                        // section. Since dyld maps file byte 0 at
+                        // hdr, runtime addr = hdr + offset.
+                        sect_addr = hdr + _ms_u32_le(hdr + sect_off + 48);
+                        _minisym_table_addr = sect_addr;
+                        // MSYM header: magic(4) entry_count(4)
+                        //   strtab_size(4) build_id_check(4)
+                        _minisym_count = _ms_u32_le(sect_addr + 4);
+                        _minisym_strtab = sect_addr + 16 + 8 * _minisym_count;
+                        _minisym_loaded = 1;
+                        return;
+                    }
+                    sect_off = sect_off + 80;
+                }
+            }
+        }
+
+        lc_off = lc_off + cmdsize;
+        ncmds--;
+    }
+}

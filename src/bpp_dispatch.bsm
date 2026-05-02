@@ -1593,6 +1593,37 @@ static auto dispatch_cand_loop_var;   // arr<int>:    packed name of induction v
 static auto dispatch_cand_bound;      // arr<Node*>:  the cond RHS (the N expr)
 static auto dispatch_cand_synth_idx;  // arr<int>:    funcs[] slot of the synth fn
 static auto dispatch_cand_synth_name; // arr<int>:    packed name of the synth fn
+// Sprint 1 (multicore Gap 3 + Gap 4): non-zero start and stride.
+// Each candidate records the loop's literal start value (from the
+// `i = K` init that immediately precedes the T_WHILE) and stride
+// (from the step `i = i + K`). Candidates with start != 0 OR
+// stride != 1 are recognised by the scanner and listed by
+// --dispatch but stay serial — the synthesiser and rewriter skip
+// them because runtime job_parallel_for_range support is a
+// separate sprint. Detection-only here unlocks pathfind / platform
+// for visibility today; the parallelisation lands when the
+// runtime helper does.
+static auto dispatch_cand_start;      // arr<int>:    loop start value
+static auto dispatch_cand_stride;     // arr<int>:    step stride value
+
+// Sprint 2a (multicore Gap 2): reduction detection. When a loop
+// rejects under the MAP rules but contains exactly one
+// `acc = acc OP val` shape with an associative OP (+, *, &, |, ^),
+// the scanner records (acc_packed_name, op_char) so --dispatch
+// reports the loop as a REDUCTION candidate. Sprint 2b adds the
+// synthesiser + runtime to actually parallelise it via tree
+// reduction; until then the rewriter skips reduction candidates
+// the same way it skips non-default start / stride.
+static auto dispatch_cand_reduce_var; // arr<packed>: 0 = map, else acc name
+static auto dispatch_cand_reduce_op;  // arr<packed>: op name (`+`, `*`, `<<`, ...)
+// Scratch outputs for _fdc_find_reduction; module-level globals
+// because B++ lacks struct-by-value returns and threading two
+// outputs through an out-parameter pair would clutter the call
+// site. _fdc_red_op carries the full packed operator (the literal
+// op string from vbuf) so the display can print `<<` / `>>` as
+// well as the single-character ops.
+static auto _fdc_red_acc;
+static auto _fdc_red_op;
 
 // Scratch set of packed names declared via `auto` at the top level of
 // the candidate body. Rebuilt per candidate by _fdc_try_candidate.
@@ -1736,15 +1767,89 @@ static _fdc_subtree_safe(nd, loop_var_p) {
     return 0;
 }
 
+// Sprint 2a: scan a body for a single `acc = acc OP val` reduction
+// shape. Returns 1 on success and writes (_fdc_red_acc, _fdc_red_op);
+// returns 0 when no reduction shape is present, the accumulator
+// would be the loop variable, or more than one accumulator updates
+// inside the body. The function does NOT verify the rest of the
+// body — the caller temporarily admits the accumulator into the
+// loop-locals set and re-runs `_fdc_subtree_safe` so the standard
+// purity rules apply to everything except the accumulator's read /
+// write.
+//
+// Recognised operators include `<<` and `>>` because the parser's
+// Phase D strength reduction rewrites `acc * 2^k` into `acc << k`
+// before this scanner runs — without admitting the shift form,
+// `prod = prod * 2` would silently fall off the reduction radar.
+// Sprint 2b's tree-reduce will translate the shift back to its
+// multiplicative semantics when synthesising the worker.
+static _fdc_find_reduction(body_arr, body_cnt, loop_var_p) {
+    auto i, stmt: Node, lhs: Node, rhs: Node, rl: Node;
+    auto op_ch, op_l, op_s, op_c1, found_count;
+    found_count = 0;
+    _fdc_red_acc = 0;
+    _fdc_red_op  = 0;
+    for (i = 0; i < body_cnt; i++) {
+        stmt = body_arr[i];
+        if (stmt == 0) { continue; }
+        if (stmt.ntype != T_ASSIGN) { continue; }
+        lhs = stmt.a;
+        if (lhs.ntype != T_VAR) { continue; }
+        rhs = stmt.b;
+        if (rhs.ntype != T_BINOP) { continue; }
+        // Accept single-char associative ops AND the two-char
+        // shifts produced by the parser's strength-reduction pass.
+        op_l  = unpack_l(rhs.a);
+        op_s  = unpack_s(rhs.a);
+        op_ch = peek(vbuf + op_s);
+        if (op_l == 1) {
+            if (op_ch != '+' && op_ch != '*' && op_ch != '&'
+                && op_ch != '|' && op_ch != '^') { continue; }
+        } else if (op_l == 2) {
+            op_c1 = peek(vbuf + op_s + 1);
+            if ((op_ch != '<' || op_c1 != '<')
+                && (op_ch != '>' || op_c1 != '>')) { continue; }
+        } else {
+            continue;
+        }
+        rl = rhs.b;
+        if (rl.ntype != T_VAR) { continue; }
+        // The accumulator must appear on both sides of the assign
+        // and must NOT be the loop induction variable.
+        if (lhs.a != rl.a) {
+            if (packed_eq(lhs.a, rl.a) == 0) { continue; }
+        }
+        if (lhs.a == loop_var_p) { continue; }
+        if (packed_eq(lhs.a, loop_var_p)) { continue; }
+        // Multiple accumulators reject — Sprint 2b's tree-reduce
+        // runtime takes one identity per call.
+        if (found_count > 0) {
+            if (lhs.a != _fdc_red_acc) {
+                if (packed_eq(lhs.a, _fdc_red_acc) == 0) { return 0; }
+            }
+        }
+        _fdc_red_acc = lhs.a;
+        _fdc_red_op  = rhs.a;
+        found_count++;
+    }
+    return found_count > 0 ? 1 : 0;
+}
+
 // Evaluate a single T_WHILE node against every candidacy criterion.
 // If every check passes, push the loop into the dispatch_candidates[]
 // arrays. Side-effect only — caller treats it as void.
-static void _fdc_try_candidate(wh_p, fn_idx) {
+//
+// `prev_stmt` is the statement immediately preceding the T_WHILE in
+// its enclosing block; the scanner uses it to recover the for-loop
+// init `i = K` and capture a non-zero start value (Gap 4). Pass 0
+// when the T_WHILE is the first statement of the block.
+static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     auto wh: Node, cond: Node, step: Node;
     auto cond_lhs: Node, cond_rhs: Node;
     auto step_lhs: Node, step_rhs: Node, step_rhs_l: Node, step_rhs_r: Node;
     auto body_arr, body_cnt, i, loop_var_p, bound_n;
     auto stmt: Node, darr, dcnt, k;
+    auto start_val, stride_val;
 
     wh = wh_p;
 
@@ -1753,7 +1858,11 @@ static void _fdc_try_candidate(wh_p, fn_idx) {
     step = wh.e;
     if (step.ntype != T_ASSIGN) { return; }
 
-    // B. Step shape: i++.
+    // B. Step shape: i = i + K with K an integer literal. K = 1 is
+    // the legacy fast path that the synthesiser actually parallelises
+    // today; K > 1 lands in dispatch_candidates for visibility but
+    // the rewriter / synthesiser skip them until job_parallel_for
+    // grows a stride parameter.
     step_lhs = step.a;
     if (step_lhs.ntype != T_VAR) { return; }
     loop_var_p = step_lhs.a;
@@ -1766,11 +1875,10 @@ static void _fdc_try_candidate(wh_p, fn_idx) {
     if (step_rhs_l.a != loop_var_p) {
         if (packed_eq(step_rhs_l.a, loop_var_p) == 0) { return; }
     }
-    // Stride must be the literal character '1'. Direct character match
-    // avoids a dependency on parser's static int-literal decoder.
     if (step_rhs_r.ntype != T_LIT) { return; }
-    if (unpack_l(step_rhs_r.a) != 1) { return; }
-    if (peek(vbuf + unpack_s(step_rhs_r.a)) != '1') { return; }
+    if (_fdc_is_int_lit(step_rhs_r.a) == 0) { return; }
+    stride_val = parse_int_lit_value(step_rhs_r.a);
+    if (stride_val <= 0) { return; }
 
     // C. Condition shape: i < N with a safe N.
     cond = wh.a;
@@ -1809,8 +1917,69 @@ static void _fdc_try_candidate(wh_p, fn_idx) {
             }
         }
     }
+    // First trial: MAP candidate — every statement must be
+    // dispatch-safe under the standard purity rules.
+    auto is_map_safe;
+    is_map_safe = 1;
     for (i = 0; i < body_cnt; i++) {
-        if (_fdc_subtree_safe(body_arr[i], loop_var_p) == 0) { return; }
+        if (_fdc_subtree_safe(body_arr[i], loop_var_p) == 0) {
+            is_map_safe = 0;
+            i = body_cnt;
+        }
+    }
+
+    auto reduce_var, reduce_op_ch;
+    reduce_var   = 0;
+    reduce_op_ch = 0;
+
+    if (is_map_safe == 0) {
+        // Second trial: REDUCTION. Find the accumulator, admit it
+        // to the loop-locals set, and re-run the safety check so
+        // the rest of the body is held to the same rules. Pop the
+        // accumulator off the set whether or not the trial passes,
+        // so the next candidate scan starts clean.
+        if (_fdc_find_reduction(body_arr, body_cnt, loop_var_p) == 0) { return; }
+        _fdc_loop_locals = arr_push(_fdc_loop_locals, _fdc_red_acc);
+        auto red_safe;
+        red_safe = 1;
+        for (i = 0; i < body_cnt; i++) {
+            if (_fdc_subtree_safe(body_arr[i], loop_var_p) == 0) {
+                red_safe = 0;
+                i = body_cnt;
+            }
+        }
+        // Pop the accumulator back off so subsequent candidates do
+        // not inherit it as a "safe" name.
+        arr_pop(_fdc_loop_locals);
+        if (red_safe == 0) { return; }
+        reduce_var   = _fdc_red_acc;
+        reduce_op_ch = _fdc_red_op;
+    }
+
+    // Recover the loop's start value from the init that preceded
+    // the T_WHILE: `i = K`. Default 0 when the init is missing,
+    // non-literal, or assigns to a different variable. Storing the
+    // start lets --dispatch tell the user the loop is recognised
+    // even if the rewriter has to pass on the actual parallel
+    // promotion until runtime support lands.
+    start_val = 0;
+    if (prev_stmt != 0) {
+        auto init: Node, init_lhs: Node, init_rhs: Node;
+        init = prev_stmt;
+        if (init.ntype == T_ASSIGN) {
+            init_lhs = init.a;
+            init_rhs = init.b;
+            if (init_lhs.ntype == T_VAR) {
+                if (init_lhs.a == loop_var_p
+                    || packed_eq(init_lhs.a, loop_var_p)) {
+                    if (init_rhs.ntype == T_LIT) {
+                        if (_fdc_is_int_lit(init_rhs.a)) {
+                            start_val = parse_int_lit_value(init_rhs.a);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // All criteria met — record the candidate.
@@ -1818,6 +1987,10 @@ static void _fdc_try_candidate(wh_p, fn_idx) {
     dispatch_cand_fn_idx = arr_push(dispatch_cand_fn_idx, fn_idx);
     dispatch_cand_loop_var = arr_push(dispatch_cand_loop_var, loop_var_p);
     dispatch_cand_bound = arr_push(dispatch_cand_bound, bound_n);
+    dispatch_cand_start = arr_push(dispatch_cand_start, start_val);
+    dispatch_cand_stride = arr_push(dispatch_cand_stride, stride_val);
+    dispatch_cand_reduce_var = arr_push(dispatch_cand_reduce_var, reduce_var);
+    dispatch_cand_reduce_op  = arr_push(dispatch_cand_reduce_op,  reduce_op_ch);
 }
 
 // Scan every parsed function body and record every top-level for-loop
@@ -1839,6 +2012,14 @@ void find_dispatch_candidates() {
     else { arr_clear(dispatch_cand_synth_idx); }
     if (dispatch_cand_synth_name == 0) { dispatch_cand_synth_name = arr_new(); }
     else { arr_clear(dispatch_cand_synth_name); }
+    if (dispatch_cand_start == 0) { dispatch_cand_start = arr_new(); }
+    else { arr_clear(dispatch_cand_start); }
+    if (dispatch_cand_stride == 0) { dispatch_cand_stride = arr_new(); }
+    else { arr_clear(dispatch_cand_stride); }
+    if (dispatch_cand_reduce_var == 0) { dispatch_cand_reduce_var = arr_new(); }
+    else { arr_clear(dispatch_cand_reduce_var); }
+    if (dispatch_cand_reduce_op == 0) { dispatch_cand_reduce_op = arr_new(); }
+    else { arr_clear(dispatch_cand_reduce_op); }
     if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
 
     for (i = 0; i < func_cnt; i++) {
@@ -1854,7 +2035,9 @@ void find_dispatch_candidates() {
             stmt = body_arr[j];
             if (stmt != 0) {
                 if (stmt.ntype == T_WHILE) {
-                    _fdc_try_candidate(stmt, i);
+                    auto prev;
+                    prev = j > 0 ? body_arr[j - 1] : 0;
+                    _fdc_try_candidate(stmt, i, prev);
                 }
             }
         }
@@ -1879,11 +2062,14 @@ void show_dispatch_candidates() {
         fi = arr_get(dispatch_cand_fn_idx, i);
         fname = *(funcs[fi] + FN_NAME);
         bound = arr_get(dispatch_cand_bound, i);
+        auto sv, st;
+        sv = arr_get(dispatch_cand_start,  i);
+        st = arr_get(dispatch_cand_stride, i);
         diag_str("  ");
         diag_packed(fname);
         diag_str(": for (");
         diag_packed(arr_get(dispatch_cand_loop_var, i));
-        diag_str(" = 0; ");
+        diag_str(" = "); diag_int(sv); diag_str("; ");
         diag_packed(arr_get(dispatch_cand_loop_var, i));
         diag_str(" < ");
         diag_packed(bound.a);
@@ -1891,7 +2077,21 @@ void show_dispatch_candidates() {
         diag_packed(arr_get(dispatch_cand_loop_var, i));
         diag_str(" = ");
         diag_packed(arr_get(dispatch_cand_loop_var, i));
-        diag_str(" + 1)");
+        diag_str(" + "); diag_int(st); diag_str(")");
+        // Note when the candidate is detection-only — runtime
+        // job_parallel_for handles the [0, N) stride-1 MAP case today.
+        auto rv, rop;
+        rv  = arr_get(dispatch_cand_reduce_var, i);
+        rop = arr_get(dispatch_cand_reduce_op,  i);
+        if (rv != 0) {
+            diag_str("  [REDUCTION acc=");
+            diag_packed(rv);
+            diag_str(" op=");
+            diag_packed(rop);
+            diag_str(" — serial: tree-reduce runtime pending]");
+        } else if (sv != 0 || st != 1) {
+            diag_str("  [serial: runtime stride/start support pending]");
+        }
         diag_newline();
     }
 }
@@ -2001,6 +2201,23 @@ void synthesize_loop_fn() {
         loop_var_p = arr_get(dispatch_cand_loop_var, i);
         src_mod = arr_get(func_mods, src_fi);
         src_tok = wh.src_tok;
+
+        // Sprints 1 + 2a: only synthesise the legacy [0, N) stride-1
+        // MAP case today. Non-default start / stride or REDUCTION
+        // candidates ride along in the metadata arrays for
+        // --dispatch visibility but do not get a worker function and
+        // stay serial at runtime. Placeholder pushes keep the
+        // parallel arrays aligned with dispatch_candidates so
+        // subsequent indexing stays sane.
+        auto sv, st, rv;
+        sv = arr_get(dispatch_cand_start,      i);
+        st = arr_get(dispatch_cand_stride,     i);
+        rv = arr_get(dispatch_cand_reduce_var, i);
+        if (sv != 0 || st != 1 || rv != 0) {
+            dispatch_cand_synth_idx  = arr_push(dispatch_cand_synth_idx,  -1);
+            dispatch_cand_synth_name = arr_push(dispatch_cand_synth_name,  0);
+            continue;
+        }
 
         // Build the function record. Fields match parse_function's
         // registration path so downstream passes see a regular entry.
@@ -2128,6 +2345,16 @@ void rewrite_dispatch_loops() {
     if (jpf_idx < 0) { return; }
 
     for (i = 0; i < n; i++) {
+        // Sprints 1 + 2a: skip non-default start / stride and
+        // REDUCTION candidates. The synthesiser left their
+        // synth_idx as -1; rewriting the T_WHILE into a
+        // job_parallel_for(N) call would silently miscompile.
+        auto sv, st, rv;
+        sv = arr_get(dispatch_cand_start,      i);
+        st = arr_get(dispatch_cand_stride,     i);
+        rv = arr_get(dispatch_cand_reduce_var, i);
+        if (sv != 0 || st != 1 || rv != 0) { continue; }
+
         wh = arr_get(dispatch_candidates, i);
         src_fi = arr_get(dispatch_cand_fn_idx, i);
         bound_n = arr_get(dispatch_cand_bound, i);

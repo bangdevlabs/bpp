@@ -15,11 +15,26 @@ import "bpp_bo.bsm";
 
 // -- Module state ----------------------------------------------
 
-// Flag: set to 1 by the --bug command-line option to enable .bug emission.
+// Flag: set to 1 by the --bug command-line option. Now deprecated;
+// .bug emission is unconditional for native compiles. The flag still
+// exists so legacy scripts that pass --bug do not break.
 global flag_bug;
 
 // Scratch buffer for constructing the .bug output path.
 static auto _bug_pathbuf;
+
+// 16-byte build identity. Generated once per compile by
+// bug_init_build_id, written to BOTH the binary metadata
+// (Mach-O LC_UUID / ELF PT_NOTE NT_GNU_BUILD_ID) and the .bug
+// header. The bug debugger checks them on load and refuses to use
+// a .bug whose id does not match the binary it claims to describe.
+global _bug_build_id_lo, _bug_build_id_hi;
+
+// Anti-collision counter. Incremented every call to
+// bug_init_build_id so back-to-back builds within the same process
+// always produce distinct ids even if the OS clock returned the
+// same nanosecond reading.
+static auto _bug_build_seq;
 
 // -- Initialization --------------------------------------------
 
@@ -27,6 +42,59 @@ static auto _bug_pathbuf;
 void init_bug() {
     flag_bug = 0;
     _bug_pathbuf = malloc(4096);
+    _bug_build_id_lo = 0;
+    _bug_build_id_hi = 0;
+    _bug_build_seq   = 0;
+}
+
+// Parse 16 hex chars from `s + off` into a u64. Returns 0 on
+// malformed input; the deterministic-bootstrap path
+// (BPP_BUILD_ID=00...) relies on this falling silently to zero.
+static parse_hex_u64(s, off)@base {
+    auto i, c, val;
+    val = 0;
+    for (i = 0; i < 16; i++) {
+        c = peek(s + off + i);
+        val = val << 4;
+        if (c >= '0' & c <= '9')      { val = val | (c - '0'); }
+        else if (c >= 'a' & c <= 'f') { val = val | (c - 'a' + 10); }
+        else if (c >= 'A' & c <= 'F') { val = val | (c - 'A' + 10); }
+        else { return 0; }
+    }
+    return val;
+}
+
+// Generate the 16-byte build_id for the current compilation. Sources
+// of entropy: monotonic ns clock, stack address (varies per process
+// via ASLR), and an in-process counter. The two outputs are
+// independent splitmix64-style hashes, so each bit of the 128-bit
+// result is statistically independent of the others.
+//
+// `BPP_BUILD_ID` env var (32 hex chars) overrides for reproducible
+// bootstraps. `tests/run_all.sh` exports
+// BPP_BUILD_ID=00000000000000000000000000000000 so gen1 and gen2
+// stay byte-stable.
+//
+// Call once per `bpp` invocation, before any binary writer or
+// `bug_save` runs, so all consumers see the same value.
+void bug_init_build_id() {
+    auto t, stk, env_id;
+
+    env_id = getenv("BPP_BUILD_ID");
+    if (env_id != 0) {
+        _bug_build_id_lo = parse_hex_u64(env_id, 0);
+        _bug_build_id_hi = parse_hex_u64(env_id, 16);
+        return;
+    }
+
+    t = _time_now_ns();
+    stk = &t;                          // ASLR-randomized stack address.
+    _bug_build_seq = _bug_build_seq + 1;
+
+    _bug_build_id_lo = (t ^ (stk * 0x9E3779B97F4A7C15)) ^ _bug_build_seq;
+    _bug_build_id_hi = (t * 0xBF58476D1CE4E5B9)
+                       ^ (stk << 16)
+                       ^ (_bug_build_seq * 0x94D049BB133111EB);
 }
 
 // -- Part 1: Platform-agnostic debug data ----------------------
@@ -361,9 +429,15 @@ void bug_save(out_path, target) {
     // Reset the serialization buffer and write the file header.
     bo_reset();
 
-    // Header: magic "BG" + version 3 + target architecture.
+    // Header: magic "BG" + version 4 + target architecture + 16-byte build_id.
     //
-    // Version 3 (2026-04-29) extends every local with a 5-byte
+    // Version 4 (2026-04-30) adds a 16-byte build_id immediately
+    // after the target byte. Same value lives in the binary
+    // (Mach-O LC_UUID / ELF PT_NOTE NT_GNU_BUILD_ID) so the bug
+    // debugger can reject stale .bug files on load instead of
+    // silently producing wrong analysis.
+    //
+    // Version 3 (2026-04-29) extended every local with a 5-byte
     // location descriptor — `kind` (u8) plus `detail` (u32). Kind 0
     // means the variable lives in a GPU register and `detail` is
     // the GDB register number (x19 = 19, x20 = 20, ...). Kind 1
@@ -381,8 +455,14 @@ void bug_save(out_path, target) {
     // expanded locals layout.
     bo_write_u8(66);
     bo_write_u8(71);
-    bo_write_u8(3);
+    bo_write_u8(4);
     bo_write_u8(target);
+
+    // Build_id: 16 bytes, low half then high half, little-endian.
+    bo_write_u32(_bug_build_id_lo & 0xFFFFFFFF);
+    bo_write_u32((_bug_build_id_lo >> 32) & 0xFFFFFFFF);
+    bo_write_u32(_bug_build_id_hi & 0xFFFFFFFF);
+    bo_write_u32((_bug_build_id_hi >> 32) & 0xFFFFFFFF);
 
     // Part 1: platform-agnostic data (functions, structs, globals, externs, source map).
     bug_write_agnostic();

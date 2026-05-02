@@ -1,0 +1,165 @@
+// bug_shared.bsm — Snapshot of tracee state shared between the
+// async observer and the GUI panel renderers.
+//
+// The async observer (bug_observe_<os>.bsm) populates this module's
+// globals on every SIGTRAP / stop event. The GUI panel renderers
+// (the_bug_lib.bsm + bug_runviz_panel functions, Stage 2 onward)
+// read them on every frame.
+//
+// Single-threaded by design: observer poll and panel render run on
+// the same thread, so bare globals are sufficient — no atomics, no
+// locks. The status field is the synchronising word: panels only
+// trust the watch / viz snapshots when status == BUG_SHARED_STOPPED.
+
+import "bpp_io.bsm";
+
+// ── Status codes ───────────────────────────────────────────────
+
+// Tracee lifecycle states. The observer transitions the status
+// word through these as the async polling loop advances.
+const BUG_SHARED_IDLE    = 0;  // not started or torn down cleanly
+const BUG_SHARED_RUNNING = 1;  // tracee live, no event this poll
+const BUG_SHARED_STOPPED = 2;  // hit a breakpoint — snapshots valid
+const BUG_SHARED_EXITED  = 3;  // tracee exited normally
+const BUG_SHARED_CRASHED = 4;  // tracee killed by a fatal signal
+
+// ── Capacities ─────────────────────────────────────────────────
+// Match the existing watch list (32 entries) and runtime visualizer
+// table (16 entries) limits. Going past these would force the user
+// to thin out their picks before the snapshot can hold them.
+const BUG_SHARED_WATCH_MAX = 32;
+const BUG_SHARED_VIZ_MAX   = 16;
+
+// ── Visualizer kinds ──────────────────────────────────────────
+// Shared between the runtime visualizer table (bug_runviz.bsm) and
+// the async observer that copies tracee bytes into the panel
+// snapshot. Defined here because const declarations only fold for
+// modules parsed after the definition — bug_observe imports before
+// bug_runviz, so keeping the constants in bug_runviz used to fail
+// the observer's parse.
+const VIZ_KIND_GRAPH = 1;   // bar chart of N floats
+const VIZ_KIND_VEC2  = 2;   // 2D point in a small ASCII grid
+const VIZ_KIND_RGBA  = 3;   // RGBA bitmap downsampled to a preview
+
+// ── Globals ────────────────────────────────────────────────────
+
+// Tracee status — see BUG_SHARED_* constants above.
+global bug_shared_status;
+
+// Last-stop coordinates. PC and FP let the GUI label panels with
+// the function name and walk locals; signal / exit_code carry the
+// reason when status is CRASHED / EXITED.
+global bug_shared_pc;
+global bug_shared_fp;
+global bug_shared_signal;
+global bug_shared_exit_code;
+global bug_shared_func_idx;   // index into bug_am_name / bug_am_off
+
+// Watch snapshot: parallel buf_word arrays.
+//
+//   names   — packed (offset, length) refs into _br_strbuf, the
+//             same packing the rest of bug uses for symbol names.
+//   values  — 64-bit read from a register, stack slot, or global.
+//   types   — packed (ty << 16 | sid) so panel renderers can call
+//             viz_format with the right slice + struct kind.
+//   addrs   — original target-memory address, 0 for register-only
+//             reads. Useful for "click to follow pointer" UX later.
+global bug_shared_watch_count;
+global bug_shared_watch_names;
+global bug_shared_watch_values;
+global bug_shared_watch_types;
+global bug_shared_watch_addrs;
+
+// Viz buffer snapshots: each entry holds the kind plus a
+// heap-allocated copy of the bytes the renderer needs (graph: N
+// doubles; vec2: two doubles; rgba: w*h*4 bytes). The observer
+// reads tracee memory once per stop and writes the bytes into
+// `data`, so panel renderers never touch the tracee — they just
+// pull from `data` at frame rate.
+global bug_shared_viz_count;
+global bug_shared_viz_kind;
+global bug_shared_viz_addr;
+global bug_shared_viz_w;
+global bug_shared_viz_h;
+global bug_shared_viz_data;
+global bug_shared_viz_data_len;
+
+// ── Init + lifecycle ───────────────────────────────────────────
+
+// One-time setup. Allocates the parallel buf_word arrays once;
+// individual entries are reset per stop via bug_shared_clear_*.
+void init_bug_shared()@io {
+    bug_shared_status     = BUG_SHARED_IDLE;
+    bug_shared_pc         = 0;
+    bug_shared_fp         = 0;
+    bug_shared_signal     = 0;
+    bug_shared_exit_code  = 0;
+    bug_shared_func_idx   = -1;
+
+    bug_shared_watch_count  = 0;
+    bug_shared_watch_names  = buf_word(BUG_SHARED_WATCH_MAX);
+    bug_shared_watch_values = buf_word(BUG_SHARED_WATCH_MAX);
+    bug_shared_watch_types  = buf_word(BUG_SHARED_WATCH_MAX);
+    bug_shared_watch_addrs  = buf_word(BUG_SHARED_WATCH_MAX);
+
+    bug_shared_viz_count    = 0;
+    bug_shared_viz_kind     = buf_word(BUG_SHARED_VIZ_MAX);
+    bug_shared_viz_addr     = buf_word(BUG_SHARED_VIZ_MAX);
+    bug_shared_viz_w        = buf_word(BUG_SHARED_VIZ_MAX);
+    bug_shared_viz_h        = buf_word(BUG_SHARED_VIZ_MAX);
+    bug_shared_viz_data     = buf_word(BUG_SHARED_VIZ_MAX);
+    bug_shared_viz_data_len = buf_word(BUG_SHARED_VIZ_MAX);
+}
+
+// Drop the watch list back to empty before populating fresh values
+// for the next stop event.
+void bug_shared_clear_watch() {
+    bug_shared_watch_count = 0;
+}
+
+// Free the heap-allocated viz byte copies from the previous stop
+// and reset the count. Called by the observer before writing the
+// next snapshot so panel renderers always read live data.
+void bug_shared_clear_viz()@io {
+    auto i, p;
+    for (i = 0; i < bug_shared_viz_count; i++) {
+        p = *(bug_shared_viz_data + i * 8);
+        if (p != 0) { free(p); }
+    }
+    bug_shared_viz_count = 0;
+}
+
+// ── Producer-side helpers (called by the observer) ─────────────
+
+// Append a watch entry to the current snapshot. Returns 1 on
+// success, 0 when the table is already full.
+bug_shared_push_watch(name_packed, value, ty_sid, addr) {
+    auto i;
+    i = bug_shared_watch_count;
+    if (i >= BUG_SHARED_WATCH_MAX) { return 0; }
+    *(bug_shared_watch_names  + i * 8) = name_packed;
+    *(bug_shared_watch_values + i * 8) = value;
+    *(bug_shared_watch_types  + i * 8) = ty_sid;
+    *(bug_shared_watch_addrs  + i * 8) = addr;
+    bug_shared_watch_count = i + 1;
+    return 1;
+}
+
+// Append a viz snapshot. `data` must point at a heap allocation
+// the caller hands over to bug_shared — the next bug_shared_clear_viz
+// call frees it. `addr` is the original tracee address kept for
+// labelling; panel renderers read bytes from `data`. Returns 1 on
+// success, 0 when the table is full.
+bug_shared_push_viz(kind, addr, w, h, data, data_len) {
+    auto i;
+    i = bug_shared_viz_count;
+    if (i >= BUG_SHARED_VIZ_MAX) { return 0; }
+    *(bug_shared_viz_kind     + i * 8) = kind;
+    *(bug_shared_viz_addr     + i * 8) = addr;
+    *(bug_shared_viz_w        + i * 8) = w;
+    *(bug_shared_viz_h        + i * 8) = h;
+    *(bug_shared_viz_data     + i * 8) = data;
+    *(bug_shared_viz_data_len + i * 8) = data_len;
+    bug_shared_viz_count = i + 1;
+    return 1;
+}

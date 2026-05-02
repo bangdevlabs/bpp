@@ -15,6 +15,7 @@
 
 import "bpp_array.bsm";
 import "bug_reader.bsm";
+import "bug_shared.bsm";
 import "bug_observe.bsm";
 import "bug_viz.bsm";
 import "bug_eval.bsm";
@@ -477,10 +478,139 @@ static _run_gui(initial_path)@solo {
     window_close();
 }
 
+// -- Dump mode ------------------------------------------------
+//
+// Read a `.bug` file and print every section to stdout in the legacy
+// text format. Useful for scripts, CI logs, and quick eyeballing of
+// what the compiler emitted. GUI mode (the default) replaces this
+// for daily use; `--dump` is the explicit fallback.
+//
+// Returns 0 on success, 1 on load/parse failure.
+
+static _run_dump(bug_path)@io {
+    auto loaded, parsed;
+
+    copy_cstr(pathbuf, bug_path);
+    loaded = bug_load(pathbuf);
+    if (loaded < 0) {
+        out_str("error: cannot open ");
+        out_str(bug_path);
+        out_nl();
+        return 1;
+    }
+    parsed = bug_parse();
+    if (parsed == -1) {
+        out_str("error: invalid .bug file (bad magic)");
+        out_nl();
+        return 1;
+    }
+    if (parsed == -2) {
+        out_str("error: ");
+        out_str(bug_path);
+        out_str(" is an older .bug format; recompile with current bpp");
+        out_nl();
+        return 1;
+    }
+    if (parsed < 0) {
+        out_str("error: failed to parse ");
+        out_str(bug_path);
+        out_nl();
+        return 1;
+    }
+    out_str("loaded ");
+    out_int(loaded);
+    out_str(" bytes from ");
+    out_str(bug_path);
+    out_nl();
+    out_nl();
+    dump_all();
+    return 0;
+}
+
+// -- TUI / observe mode ---------------------------------------
+//
+// Launch the target binary under debugserver and observe it. Loads
+// `<target>.bug` for enhanced debug info (locals, types, viz hints)
+// when present; falls back to Mach-O/ELF symbol table otherwise.
+// Replays any `// @viz <text>` source-side hints as runtime
+// visualizers before handing control to `bug_run`.
+//
+// `target_idx` points at the target binary in argv; everything after
+// it is forwarded to the target. `bp_names` / `bp_count` /
+// `flag_break_all` are populated by the --break flag parser in main().
+
+static _run_tui(target_path_arg, target_idx, nargs)@solo {
+    auto len, loaded, target_path;
+
+    // Build "<target>.bug" in pathbuf and try to load.
+    len = copy_cstr(pathbuf, target_path_arg);
+    poke(pathbuf + len,     '.');
+    poke(pathbuf + len + 1, 'b');
+    poke(pathbuf + len + 2, 'u');
+    poke(pathbuf + len + 3, 'g');
+    poke(pathbuf + len + 4, 0);
+
+    loaded = bug_load(pathbuf);
+    if (loaded >= 0) {
+        if (bug_parse() >= 0) {
+            // Verify the .bug describes the binary we are about to
+            // run. Mismatch is a recipe for chasing ghosts — locals
+            // at the wrong fp offsets, function names from a
+            // different build. Better to fail loud than analyse a
+            // stale map.
+            auto _match;
+            _match = bug_reader_match_binary(target_path_arg);
+            if (_match == 0) {
+                out_str("bug: stale .bug for "); out_str(target_path_arg); out_nl();
+                out_str("     expected build_id ");
+                out_hex(bug_build_id_lo); out_ch(' ');
+                out_hex(bug_build_id_hi); out_nl();
+                out_str("     binary has    ");
+                out_hex(bug_bin_build_id_lo); out_ch(' ');
+                out_hex(bug_bin_build_id_hi); out_nl();
+                out_str("     recompile to regenerate."); out_nl();
+                return 1;
+            }
+            if (_match == -2) {
+                out_str("bug: binary lacks build_id metadata; recompile with current bpp.");
+                out_nl();
+                return 1;
+            }
+            // -1 (binary not found) and -3 (unknown format) fall
+            // through to bug_run, which produces its own diagnostic.
+
+            out_str("bug: loaded .bug debug map (");
+            out_int(bug_fn_count);
+            out_str(" functions)");
+            out_nl();
+            // Replay source-side `// @viz <text>` hints so live
+            // visualizers fire on the first BP / crash without the
+            // user typing anything at the prompt.
+            viz_replay_hints();
+            if (bug_vh_count > 0) {
+                out_str("bug: loaded ");
+                out_int(bug_vh_count);
+                out_str(" @viz hint(s)");
+                out_nl();
+            }
+        }
+    }
+
+    // Build a stable, NUL-terminated copy of the target path for execve.
+    target_path = malloc(4096);
+    copy_cstr(target_path, target_path_arg);
+
+    // Hand off to the observer. start_idx is target_idx — the observer
+    // forwards argv[start_idx+1..nargs-1] to the target.
+    bug_run(target_path, target_idx, nargs,
+            bp_names, bp_count, flag_break_all);
+    return 0;
+}
+
 // -- Main -----------------------------------------------------
 
 main() {
-    auto nargs, arg, len, loaded, target_idx, i;
+    auto nargs, arg, target_idx;
     auto flag_dump;
 
     _out_buf = malloc(16);
@@ -497,6 +627,7 @@ main() {
 
     init_array();
     init_reader();
+    init_bug_shared();
     init_observe();
     init_bug_brk();
     init_bug_runviz();
@@ -612,34 +743,41 @@ main() {
         }
     }
 
-    // Dispatch: positional argument decides mode.
+    // Dispatch: positional argument + flags decide the mode.
     //
-    //   no positional      -> GUI, pop file dialog
-    //   .bug file          -> GUI, auto-load that file
-    //   anything else      -> only valid with --tui (run/observe mode)
-    //
-    // The --tui path stays as the back-door used by tests/scripts.
-    // It is intentionally absent from the GUI's help flow because
-    // the windowed inspector subsumes the daily UX.
+    //   (no positional)         -> _run_gui(0)        (file dialog)
+    //   foo.bug   (no --tui)    -> _run_gui(foo.bug)
+    //   foo.bug   --dump        -> _run_dump          (text to stdout)
+    //   foo.bug   --tui         -> _run_dump          (legacy alias for --dump)
+    //   ./binary  --tui         -> _run_tui           (REPL + observe)
+    //   ./binary  (no --tui)    -> error
+    //   ./binary  --dump        -> error              (--dump expects .bug)
     if (target_idx >= nargs) {
-        // No positional argument. Flags-only invocation lands here.
-        // Default action: GUI with no preloaded file.
         _run_gui(0);
         return 0;
     }
 
     arg = argv_get(target_idx);
 
-    if (ends_with_bug(arg) && flag_tui == 0) {
-        // .bug file -> GUI window with that file loaded.
+    if (ends_with_bug(arg)) {
+        if (flag_dump || flag_tui) {
+            return _run_dump(arg);
+        }
         _run_gui(arg);
         return 0;
     }
 
+    // Non-.bug positional argument. Only valid with --tui; --dump on a
+    // non-.bug file is a misuse, and absent --tui we refuse rather than
+    // launching trace mode silently.
+    if (flag_dump) {
+        out_str("the_bug: --dump expects a .bug file, got '");
+        out_str(arg);
+        out_str("'");
+        out_nl();
+        return 1;
+    }
     if (flag_tui == 0) {
-        // Non-.bug argument without --tui: bail out rather than
-        // silently launching trace mode. Users who want trace
-        // mode pass --tui explicitly; everyone else lands in GUI.
         out_str("the_bug: '");
         out_str(arg);
         out_str("' is not a .bug file. Use --tui to debug a program from the CLI.");
@@ -647,77 +785,5 @@ main() {
         return 1;
     }
 
-    if (ends_with_bug(arg)) {
-        // --tui plus a .bug file: legacy text dump path.
-        len = copy_cstr(pathbuf, arg);
-        loaded = bug_load(pathbuf);
-        if (loaded < 0) {
-            out_str("error: cannot open ");
-            out_str(arg);
-            out_nl();
-            return 1;
-        }
-        if (bug_parse() < 0) {
-            out_str("error: invalid .bug file (bad magic)");
-            out_nl();
-            return 1;
-        }
-        out_str("loaded ");
-        out_int(loaded);
-        out_str(" bytes from ");
-        out_str(arg);
-        out_nl();
-        out_nl();
-        dump_all();
-    } else {
-        // Run mode: launch target and observe.
-        // Try loading .bug file for enhanced debug info (locals, types).
-        // If not found, the observer reads the Mach-O/ELF symbol table instead.
-        len = copy_cstr(pathbuf, arg);
-        poke(pathbuf + len, '.');
-        poke(pathbuf + len + 1, 'b');
-        poke(pathbuf + len + 2, 'u');
-        poke(pathbuf + len + 3, 'g');
-        poke(pathbuf + len + 4, 0);
-
-        loaded = bug_load(pathbuf);
-        if (loaded >= 0) {
-            if (bug_parse() >= 0) {
-                out_str("bug: loaded .bug debug map (");
-                out_int(bug_fn_count);
-                out_str(" functions)");
-                out_nl();
-                // Replay any source-side `// @viz <text>` hints as
-                // runtime visualizers. Each hint goes through the
-                // same parser as the interactive `v` command, so
-                // the picture pops up at every BP / crash without
-                // the user retyping anything.
-                viz_replay_hints();
-                if (bug_vh_count > 0) {
-                    out_str("bug: loaded ");
-                    out_int(bug_vh_count);
-                    out_str(" @viz hint(s)");
-                    out_nl();
-                }
-            }
-        }
-
-        // Build target path for execve (null-terminated).
-        auto target_path;
-        target_path = malloc(4096);
-        copy_cstr(target_path, arg);
-
-        // Run and observe the target process. start_idx is the argv
-        // position of the target program itself — the observer passes
-        // argv[start_idx+1 .. nargs-1] through to the target as its
-        // own argument list. bp_names / bp_count / flag_break_all come
-        // from the --break flags parsed earlier; when bp_count == 0
-        // and flag_break_all == 0 the observer falls back to legacy
-        // "trace every function" mode (sub-step 3 wires the selective
-        // path in).
-        bug_run(target_path, target_idx, nargs,
-                bp_names, bp_count, flag_break_all);
-    }
-
-    return 0;
+    return _run_tui(arg, target_idx, nargs);
 }

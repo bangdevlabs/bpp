@@ -728,6 +728,7 @@ static _x64_sys_num(cg_id) {
     if (cg_id == CG_SYS_MKDIR)    { return BSYS_MKDIR; }
     if (cg_id == CG_SYS_MMAP)     { return BSYS_MMAP; }
     if (cg_id == CG_SYS_MUNMAP)   { return BSYS_MUNMAP; }
+    if (cg_id == CG_SYS_SELECT)   { return BSYS_SELECT; }
     diag_str("internal error: CG_SYS id ");
     diag_int(cg_id);
     diag_str(" not mapped on x86_64/Linux\n");
@@ -830,4 +831,73 @@ void _x64_emit_mem_write(val_reg, width) {
     if (width == 2) { x64_enc_storeh(val_reg, 0, 0); return; }
     if (width == 4) { x64_enc_store_w(val_reg, 0, 0); return; }
     if (width == 8) { x64_enc_store(val_reg, 0, 0); return; }
+}
+
+
+// Phase 6.2c — caller_pc(n). On entry, n is in rax. On exit, the
+// chosen frame's PC is in rax.
+//
+// Layout:
+//   n == 0 → LEA rax, [RIP + 0] (rax = address right after the LEA)
+//   n >= 1 → walk (n-1) frames up the FP chain via [rbp], then
+//            mov rax, [rcx + 8] for that frame's saved return address
+//
+// Asm shape (binary mode):
+//
+//     test rax, rax
+//     jz   .Lzero            ; n==0 → current PC path
+//     mov  rcx, rbp           ; walk start
+//   .Lwalk:
+//     sub  rax, 1
+//     test rax, rax
+//     jz   .Ltake_lr          ; reached chosen frame
+//     mov  rcx, [rcx]         ; previous rbp
+//     jmp  .Lwalk
+//   .Ltake_lr:
+//     mov  rax, [rcx + 8]     ; return address at that frame
+//     jmp  .Ldone
+//   .Lzero:
+//     lea  rax, [rip]         ; rax = address right after the lea
+//   .Ldone:
+//
+// RBP preservation is guaranteed by B++ x64 codegen prologue.
+void _x64_emit_caller_pc() {
+    auto walk_lbl, take_lbl, zero_lbl, done_lbl;
+    walk_lbl = x64_enc_new_label();
+    take_lbl = x64_enc_new_label();
+    zero_lbl = x64_enc_new_label();
+    done_lbl = x64_enc_new_label();
+
+    // test rax, rax
+    x64_enc_test_reg(0, 0);
+    // jz .Lzero
+    x64_enc_jcc_label(CC_E, zero_lbl);
+    // mov rcx, rbp  (rcx=1, rbp=5)
+    x64_enc_mov_reg(1, 5);
+    // .Lwalk:
+    x64_enc_def_label(walk_lbl);
+    // sub rax, 1
+    x64_enc_sub_imm(0, 1);
+    // test rax, rax
+    x64_enc_test_reg(0, 0);
+    // jz .Ltake_lr
+    x64_enc_jcc_label(CC_E, take_lbl);
+    // mov rcx, [rcx]  (load 8 bytes from [rcx + 0])
+    x64_enc_load(1, 1, 0);
+    // jmp .Lwalk
+    x64_enc_jmp_label(walk_lbl);
+    // .Ltake_lr:
+    x64_enc_def_label(take_lbl);
+    // mov rax, [rcx + 8]
+    x64_enc_load(0, 1, 8);
+    // jmp .Ldone
+    x64_enc_jmp_label(done_lbl);
+    // .Lzero:
+    x64_enc_def_label(zero_lbl);
+    // lea rax, [rip + 0] (return value is disp_pos; we ignore it
+    // because no relocation is needed — the disp32 stays 0 and the
+    // CPU computes rax = next_instruction_address at runtime).
+    x64_enc_lea_rip(0);
+    // .Ldone:
+    x64_enc_def_label(done_lbl);
 }

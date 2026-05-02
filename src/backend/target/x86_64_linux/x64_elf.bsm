@@ -5,6 +5,24 @@ import "bpp_array.bsm";
 import "bpp_internal.bsm";
 import "bpp_parser.bsm";
 import "x64_enc.bsm";
+// Runtime minisym writer (bug_emit_minisym /
+// bug_minisym_size_for_target). The BPPMINI PT_NOTE record below
+// carries that blob, so write_elf needs direct visibility into
+// these helpers — even when this file is imported in isolation.
+// bpp_minisym is intentionally lighter than bpp_bug and avoids
+// pulling in the .bug-file emitter's bpp_bo dependency.
+import "bpp_minisym.bsm";
+
+// 16-byte build identity. Generated once per compile by
+// bug_init_build_id in bpp_bug.bsm, written into the
+// .note.gnu.build-id PT_NOTE so the bug debugger can match the
+// binary against its sibling .bug file.
+extrn _bug_build_id_lo, _bug_build_id_hi;
+
+// Note: bug_minisym_size_for_target and bug_emit_minisym are
+// defined in bpp_bug.bsm and resolve at link time without
+// needing an extrn declaration (same convention as sys_open,
+// arr_get, etc. used elsewhere in this file).
 
 // Builds a complete static ELF binary from the code buffer (x64_enc_buf/x64_enc_pos)
 // and data tables (globals, strings, floats) produced by the x86_64 codegen.
@@ -47,16 +65,19 @@ static auto elf_pos;       // Current write position.
 
 // ── Computed layout values (set by elf_compute_layout) ──────
 
-static auto elf_code_off;     // File offset where code begins (after headers).
-static auto elf_text_filesz;  // Text segment file size (headers + code).
+static auto elf_code_off;     // File offset where code begins (after headers + note).
+static auto elf_text_filesz;  // Text segment file size (headers + note + code).
 static auto elf_text_memsz;   // Text segment memory size (same as filesz).
 static auto elf_data_off;     // File offset of data segment (page-aligned).
 static auto elf_data_vaddr;   // Virtual address of data segment.
 static auto elf_data_filesz;  // Data segment file size.
 static auto elf_data_memsz;   // Data segment memory size.
 static auto elf_entry;        // Entry point virtual address.
-static auto elf_phnum;        // Number of program headers (1 or 2).
+static auto elf_phnum;        // Number of program headers (2 or 3 — note is always present).
 static auto elf_has_data;     // 1 if data segment is needed, 0 otherwise.
+static auto elf_note_off;     // File offset of the start of the PT_NOTE region.
+static auto elf_note_size;    // Total bytes in the PT_NOTE region (NT_GNU_BUILD_ID + BPPMINI).
+static auto elf_minisym_size; // Bytes in the minisym blob carried by the BPPMINI note.
 
 // ── Float literal data ──────────────────────────────────────
 // Written by bpp.bpp before write_elf runs, so these stay public.
@@ -198,7 +219,7 @@ static void elf_write_phdr(p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz
 //   code_size:  number of bytes in the code buffer (x64_enc_pos)
 //   gl_count:   number of 8-byte global variable slots
 static void elf_compute_layout(code_size, gl_count) {
-    auto raw_data_size;
+    auto raw_data_size, minisym_pad, bppmini_record_size;
 
     // A data segment is only emitted when the program actually needs
     // one — either it declares globals, uses a float literal, or holds
@@ -206,12 +227,37 @@ static void elf_compute_layout(code_size, gl_count) {
     // segment and no second PT_LOAD.
     elf_has_data = (gl_count > 0 || arr_len(elf_flt_data) > 0 || elf_sdata_size > 0) ? 1 : 0;
 
-    // Number of program headers: text + data (if present).
-    elf_phnum = elf_has_data ? 2 : 1;
+    // Number of program headers: text + data (if present) + note (always).
+    // PT_NOTE carries both the 16-byte NT_GNU_BUILD_ID payload and the
+    // BPPMINI minisym record. Both notes live in the same single
+    // PT_NOTE region — adding minisym does not change elf_phnum.
+    elf_phnum = (elf_has_data ? 2 : 1) + 1;
 
-    // Code starts immediately after the ELF header and all program headers.
-    // ELF header = 64 bytes, each program header = 56 bytes.
-    elf_code_off = ELF_HDRSZ + elf_phnum * ELF_PHSZ;
+    // Compute the size of the PT_NOTE region. It contains two notes:
+    //
+    //   1. NT_GNU_BUILD_ID (32 bytes): standard 16-byte build_id
+    //      identical to the value in the .bug header. Recognised by
+    //      readelf -n / debuginfod / strip --build-id.
+    //
+    //   2. BPPMINI (variable size): 12-byte note header + 8-byte
+    //      "BPPMINI\0" name + minisym blob + pad to 4 bytes. Holds
+    //      the (function address → name) table the runtime resolver
+    //      reads to symbolicate PCs without the .bug file.
+    //
+    // The BPPMINI record's name is exactly 8 bytes including the NUL
+    // and is naturally 4-aligned. The minisym blob's strtab can have
+    // any byte length, so we pad the blob to a 4-byte multiple to
+    // keep the whole region aligned for any future third record.
+    elf_minisym_size = bug_minisym_size_for_target(1);
+    minisym_pad = (4 - (elf_minisym_size % 4)) % 4;
+    bppmini_record_size = 12 + 8 + elf_minisym_size + minisym_pad;
+    elf_note_size = 32 + bppmini_record_size;
+
+    // Layout: ELF header + all program headers, then the note region,
+    // then the code. The note sits inside the text PT_LOAD mapping
+    // (read-only), so no extra mapping is needed.
+    elf_note_off = ELF_HDRSZ + elf_phnum * ELF_PHSZ;
+    elf_code_off = elf_note_off + elf_note_size;
 
     // Text segment: maps file bytes [0, text_end) to virtual memory at ELF_BASE.
     // Includes the headers and the code.
@@ -342,7 +388,7 @@ void write_elf(filename, main_label, gl_names, gl_count) {
 
     // ── Write program headers ──
 
-    // PT_LOAD for text segment (headers + code, readable + executable).
+    // PT_LOAD for text segment (headers + note + code, readable + executable).
     elf_write_phdr(1, 5, 0, ELF_BASE, elf_text_filesz, elf_text_memsz, ELF_PAGE);
 
     // PT_LOAD for data segment (globals + floats + strings, readable + writable).
@@ -351,8 +397,59 @@ void write_elf(filename, main_label, gl_names, gl_count) {
             elf_data_filesz, elf_data_memsz, ELF_PAGE);
     }
 
+    // PT_NOTE for the build-id + BPPMINI region, readable.
+    // p_align = 4 satisfies the Elf64_Nhdr alignment requirement.
+    // p_filesz / p_memsz cover both records (NT_GNU_BUILD_ID and
+    // BPPMINI) — see elf_compute_layout for the size breakdown.
+    elf_write_phdr(4, 4, elf_note_off, ELF_BASE + elf_note_off,
+        elf_note_size, elf_note_size, 4);
+
+    // ── Note 1: .note.gnu.build-id (32 bytes) ──
+    // Standard NT_GNU_BUILD_ID note recognised by readelf -n, gdb,
+    // strip --build-id, debuginfod, and friends. Mirrors the same
+    // 16-byte build identity that bug_save writes into the .bug
+    // header so the bug debugger can match the two on load.
+    elf_w32(4);                        // n_namesz (includes trailing NUL)
+    elf_w32(16);                       // n_descsz (16-byte build_id)
+    elf_w32(3);                        // n_type = NT_GNU_BUILD_ID
+    elf_w8('G'); elf_w8('N'); elf_w8('U'); elf_w8(0);   // name "GNU\0"
+    elf_w32(_bug_build_id_lo & 0xFFFFFFFF);            // desc[0..4]
+    elf_w32((_bug_build_id_lo >> 32) & 0xFFFFFFFF);    // desc[4..8]
+    elf_w32(_bug_build_id_hi & 0xFFFFFFFF);            // desc[8..12]
+    elf_w32((_bug_build_id_hi >> 32) & 0xFFFFFFFF);    // desc[12..16]
+
+    // ── Note 2: BPPMINI minisym blob ──
+    // Custom note holding the runtime symbol table (function
+    // address → name). The 32-bit n_type uses an arbitrary value
+    // outside the GNU n_type range; readers identify the record by
+    // matching the "BPPMINI\0" name. _runtime_locate_minisym in
+    // _core_linux.bsm walks all PT_NOTE records looking for this
+    // name and caches the descriptor address + size.
+    elf_w32(8);                        // n_namesz ("BPPMINI" + NUL)
+    elf_w32(elf_minisym_size);         // n_descsz (raw minisym blob bytes)
+    elf_w32(0x42504D49);               // n_type = "BPMI" (arbitrary, B++-specific)
+    elf_w8('B'); elf_w8('P'); elf_w8('P'); elf_w8('M');
+    elf_w8('I'); elf_w8('N'); elf_w8('I'); elf_w8(0);  // name "BPPMINI\0" (8 bytes, 4-aligned)
+
+    // Emit the minisym blob directly into elf_buf at the current
+    // write position. The blob's func_addr_off entries are computed
+    // relative to elf_code_off, which we already finalised in
+    // elf_compute_layout — at runtime, pc - ELF_BASE will equal
+    // elf_code_off + enc_lbl_off for any function, matching the
+    // table contents. Passing x64_fn_lbl / x64_enc_lbl_off here
+    // keeps the writer self-contained: bpp_minisym never has to
+    // reference the ARM64 codegen's globals.
+    bug_emit_minisym(elf_buf, elf_pos, x64_fn_lbl, x64_enc_lbl_off, elf_code_off);
+    elf_pos = elf_pos + elf_minisym_size;
+
+    // Pad the BPPMINI descriptor to the next 4-byte boundary so the
+    // PT_NOTE region size matches what elf_compute_layout reserved.
+    // elf_align does the work; nothing follows in the region today,
+    // but the alignment keeps room for a future third record.
+    elf_align(4);
+
     // ── Write code section ──
-    // Code starts right after program headers (no padding needed, elf_code_off is exact).
+    // Code starts right after the note (no padding needed, elf_code_off is exact).
     for (i = 0; i < code_size; i++) {
         poke(elf_buf + elf_pos, peek(x64_enc_buf + i));
         elf_pos++;

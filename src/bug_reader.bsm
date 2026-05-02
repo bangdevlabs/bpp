@@ -59,8 +59,16 @@ static auto _br_strbuf_pos;
 // stable after a successful parse; re-parse calls init_reader() first.
 
 // Header fields.
-extrn bug_version;    // Format version (currently 1).
+extrn bug_version;    // Format version (currently 4).
 extrn bug_target;     // Target arch: 0 = ARM64, 1 = x86_64.
+extrn bug_build_id_lo; // Low 8 bytes of the build identity (v4+).
+extrn bug_build_id_hi; // High 8 bytes of the build identity (v4+).
+
+// Filled in by bug_reader_match_binary on a successful read of the
+// binary's build_id. Even on mismatch these get populated so callers
+// can format a "expected X, found Y" diagnostic.
+extrn bug_bin_build_id_lo;
+extrn bug_bin_build_id_hi;
 
 // Functions: parallel arrays indexed by function index.
 extrn bug_fn_name;    // Packed name.
@@ -259,16 +267,132 @@ bug_load(path) {
 
 // -- Parsing --------------------------------------------------
 
-// Parse the header. Returns 0 on success, -1 on bad magic.
+// Parse the header. Returns 0 on success, -1 on bad magic, -2 on
+// unsupported format version. Version 4 (current) embeds a 16-byte
+// build_id immediately after the target byte.
 static bug_parse_header() {
-    auto m0, m1;
+    auto m0, m1, lo_a, lo_b, hi_a, hi_b;
     m0 = br_read_u8();
     m1 = br_read_u8();
     if (m0 != 66) { return -1; }
     if (m1 != 71) { return -1; }
     bug_version = br_read_u8();
     bug_target  = br_read_u8();
+    if (bug_version != 4) { return -2; }
+    // 16-byte build_id, low half then high half, little-endian.
+    lo_a = br_read_u32();
+    lo_b = br_read_u32();
+    hi_a = br_read_u32();
+    hi_b = br_read_u32();
+    bug_build_id_lo = (lo_b << 32) | (lo_a & 0xFFFFFFFF);
+    bug_build_id_hi = (hi_b << 32) | (hi_a & 0xFFFFFFFF);
     return 0;
+}
+
+// Open `bin_path` and extract its 16-byte build_id from the platform
+// metadata (Mach-O LC_UUID on macOS, ELF PT_NOTE NT_GNU_BUILD_ID on
+// Linux). Populates `bug_bin_build_id_lo/hi` even on mismatch so the
+// caller can format an "expected X, found Y" diagnostic.
+//
+// Returns:
+//   1 = match (binary has same build_id as the loaded .bug)
+//   0 = mismatch (lo/hi differ)
+//  -1 = binary cannot be opened
+//  -2 = binary lacks build_id metadata (compiled by an old bpp)
+//  -3 = binary format is not Mach-O nor ELF
+//
+// Must be called AFTER bug_parse() has populated bug_build_id_lo/hi.
+bug_reader_match_binary(bin_path)@io {
+    auto fd, n, hdr, magic, ok;
+    bug_bin_build_id_lo = 0;
+    bug_bin_build_id_hi = 0;
+    fd = sys_open(bin_path, 0);
+    if (fd < 0) { return -1; }
+
+    // Pull a generous slice — Mach-O load commands and ELF program
+    // headers both fit comfortably inside the first 64 KB on the
+    // shapes bpp emits today.
+    hdr = malloc(65536);
+    n = sys_read(fd, hdr, 65536);
+    sys_close(fd);
+    if (n < 64) { free(hdr); return -3; }
+
+    magic = read_u32(hdr, 0);
+    ok = -3;
+    if (magic == 0xfeedfacf) {
+        ok = _br_read_macho_uuid(hdr, n);
+    } else if (magic == 0x464C457F) {
+        // ELF: 0x7F 'E' 'L' 'F' = 0x464C457F little-endian.
+        ok = _br_read_elf_buildid(hdr, n);
+    }
+    free(hdr);
+    if (ok != 0) { return ok; }
+
+    if (bug_bin_build_id_lo == bug_build_id_lo
+            & bug_bin_build_id_hi == bug_build_id_hi) {
+        return 1;
+    }
+    return 0;
+}
+
+// Walk Mach-O load commands looking for LC_UUID (cmd 0x1B). Returns
+// 0 on success (build_id read into bug_bin_build_id_lo/hi), -2 if
+// the binary has no LC_UUID (older bpp output).
+static _br_read_macho_uuid(hdr, n) {
+    auto ncmds, sizeofcmds, off, cmd, sz, i;
+    // Mach-O 64-bit header: magic(4) cputype(4) cpusubtype(4) filetype(4)
+    //                       ncmds(4) sizeofcmds(4) flags(4) reserved(4)
+    ncmds      = read_u32(hdr, 16);
+    sizeofcmds = read_u32(hdr, 20);
+    off = 32;
+    for (i = 0; i < ncmds; i++) {
+        if (off + 8 > n) { return -2; }
+        cmd = read_u32(hdr, off);
+        sz  = read_u32(hdr, off + 4);
+        if (cmd == 0x1B) {
+            if (off + 24 > n) { return -2; }
+            bug_bin_build_id_lo = read_u64(hdr, off + 8);
+            bug_bin_build_id_hi = read_u64(hdr, off + 16);
+            return 0;
+        }
+        off = off + sz;
+    }
+    return -2;
+}
+
+// Walk ELF program headers looking for PT_NOTE with NT_GNU_BUILD_ID.
+// Returns 0 on success, -2 if no matching note exists.
+static _br_read_elf_buildid(hdr, n) {
+    auto phoff, phentsz, phnum, off, p_type, p_offset, p_filesz, i;
+    auto note_off, n_namesz, n_descsz, n_type;
+    // Elf64_Ehdr: e_ident(16) e_type(2) e_machine(2) e_version(4)
+    //             e_entry(8) e_phoff(8) e_shoff(8) e_flags(4)
+    //             e_ehsize(2) e_phentsize(2) e_phnum(2) ...
+    phoff    = read_u64(hdr, 32);
+    phentsz  = read_u16(hdr, 54);
+    phnum    = read_u16(hdr, 56);
+    for (i = 0; i < phnum; i++) {
+        off = phoff + i * phentsz;
+        if (off + 32 > n) { return -2; }
+        p_type    = read_u32(hdr, off);
+        p_offset  = read_u64(hdr, off + 8);
+        p_filesz  = read_u64(hdr, off + 32);
+        if (p_type != 4) { continue; }   // 4 = PT_NOTE
+        // Walk note records inside the segment.
+        note_off = p_offset;
+        if (note_off + 12 > n) { return -2; }
+        n_namesz = read_u32(hdr, note_off);
+        n_descsz = read_u32(hdr, note_off + 4);
+        n_type   = read_u32(hdr, note_off + 8);
+        if (n_type == 3 & n_descsz == 16 & n_namesz == 4) {
+            // name "GNU\0" + 16-byte desc, name occupies 4 bytes.
+            if (note_off + 12 + 4 + 16 > n) { return -2; }
+            bug_bin_build_id_lo = read_u64(hdr, note_off + 16);
+            bug_bin_build_id_hi = read_u64(hdr, note_off + 24);
+            return 0;
+        }
+    }
+    return -2;
 }
 
 // Parse the FUNCTIONS section. Format version 3 (current) extends
@@ -486,7 +610,9 @@ static void bug_parse_viz_hints() {
 // Parse the entire .bug file. Call after bug_load().
 // Returns 0 on success, -1 on error.
 bug_parse() {
-    if (bug_parse_header() < 0) { return -1; }
+    auto h;
+    h = bug_parse_header();
+    if (h < 0) { return h; }
     bug_parse_functions();
     bug_parse_structs();
     bug_parse_globals();

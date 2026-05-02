@@ -1,18 +1,27 @@
-// bpp_runtime.bsm — Runtime ABI contract.
+// bpp_runtime.bsm — Runtime ABI contract + portable resolver.
 //
-// This file is DECLARATIVE, not compiled. It names and documents
-// every symbol that every OS-runtime layer (src/backend/os/<os>/
-// _core_<os>.bsm) MUST provide. Writing a new OS backend? Open this
-// file, implement everything declared here, and B++ programs
-// compiled for your OS will link.
+// This file plays two roles:
 //
-// The file is not currently imported by the compiler — it exists as
-// a contract reference and an auditable listing of the runtime
-// surface. Grep for function names here to find the per-OS
-// implementations that must satisfy the contract.
+//   1. Contract reference. The first part documents every symbol
+//      that every OS-runtime layer (src/backend/os/<os>/
+//      _core_<os>.bsm) MUST provide. Writing a new OS backend?
+//      Implement everything declared here and B++ programs
+//      compiled for your OS will link.
+//
+//   2. Portable runtime code. The second part (Section: Runtime
+//      symbol resolution, below) is auto-injected into every
+//      user program. It owns the cache state populated lazily by
+//      the per-OS `_runtime_locate_minisym` and exposes
+//      `_runtime_resolve_pc(pc)` plus its unpack helpers — the
+//      foundation for `panic()`, the sampling profiler, and the
+//      `caller_name(pc)` builtin that ships in Stage 6.2c.
 //
 // See Cap 15 (Disciplina QG) second tier: "Runtime functions live
 // under a contract in src/ and implementation in src/backend/os/".
+//
+// No imports here on purpose. The resolver uses peek + arithmetic
+// only. Pulling in bpp_defs.bsm would re-export its dormant
+// buf_eq reference into every user program, breaking link.
 
 // ═══════════════════════════════════════════════════════════════
 // Memory allocator
@@ -32,29 +41,27 @@
 // through, respect alignment constraints, and survive round-trip
 // through free/realloc.
 
-// Allocate `size` bytes. Returns a pointer the caller may write to,
-// or 0 if the kernel refused the mapping.
-extrn malloc;
-
-// Allocate `size` bytes on an `alignment`-byte boundary. Alignment
-// must be a power of two; 16, 64, 4096 are the common values. The
-// returned pointer is caller-owned; free(ptr) reclaims whatever
-// malloc_aligned handed out.
-extrn malloc_aligned;
-
-// Free a block previously returned by malloc or malloc_aligned.
-// Safe on 0 (no-op). Double-free is undefined behavior.
-extrn free;
-
-// Resize an existing allocation. Returns the new pointer (may move).
-// If the pointer moved, the old one is invalid — callers MUST
-// reassign.  Passing 0 as ptr behaves like malloc(new_size). Passing
-// 0 as new_size behaves like free(ptr) and returns 0.
-extrn realloc;
-
-// Copy `len` bytes from `src` to `dst`. Behavior is undefined if
-// the regions overlap.
-extrn memcpy;
+// malloc(size) — allocate `size` bytes. Returns a pointer the
+// caller may write to, or 0 if the kernel refused the mapping.
+//
+// malloc_aligned(size, alignment) — allocate `size` bytes on an
+// `alignment`-byte boundary. Alignment must be a power of two;
+// 16, 64, 4096 are the common values. The returned pointer is
+// caller-owned; free(ptr) reclaims whatever malloc_aligned handed
+// out.
+//
+// free(ptr) — free a block previously returned by malloc or
+// malloc_aligned. Safe on 0 (no-op). Double-free is undefined
+// behavior.
+//
+// realloc(ptr, new_size) — resize an existing allocation. Returns
+// the new pointer (may move). If the pointer moved, the old one
+// is invalid — callers MUST reassign. Passing 0 as ptr behaves
+// like malloc(new_size). Passing 0 as new_size behaves like
+// free(ptr) and returns 0.
+//
+// memcpy(dst, src, len) — copy `len` bytes from `src` to `dst`.
+// Behavior is undefined if the regions overlap.
 
 // Fill `len` bytes at `addr` with a constant byte (low 8 bits).
 // TODO: not yet implemented in _core_<os>.bsm — buf_fill in bpp_buf
@@ -106,19 +113,17 @@ extrn memcpy;
 // Time
 // ═══════════════════════════════════════════════════════════════
 //
-// Platform-provided clock. Used by stbgame.game_frame_begin and
-// by every game loop's dt computation. Units are milliseconds
-// since some monotonic epoch (start of process on most OSes). Not
-// wall-clock time — never run backwards, not affected by system
-// clock changes.
-extrn _stb_get_time;
-
-// Higher-resolution companion to _stb_get_time. Units are
+// _stb_get_time() — platform-provided monotonic clock used by
+// stbgame.game_frame_begin and by every game loop's dt
+// computation. Units are milliseconds since some monotonic epoch
+// (start of process on most OSes). Not wall-clock time — never
+// runs backwards, not affected by system clock changes.
+//
+// _stb_get_time_us() — higher-resolution companion. Units are
 // microseconds, same monotonic epoch. Shares lazy init with
-// _stb_get_time (calling either one initializes both). Exposed so
-// bpp_beat.bsm can implement real µs precision for bench_section
-// and related helpers.
-extrn _stb_get_time_us;
+// _stb_get_time (calling either one initializes both). Exposed
+// so bpp_beat.bsm can implement real µs precision for
+// bench_section and related helpers.
 
 // ═══════════════════════════════════════════════════════════════
 // Threads (optional — not every OS implements)
@@ -149,3 +154,168 @@ extrn _stb_get_time_us;
 // JSON. Bang 9 reads the sidecar to power inspector panels. Does
 // NOT add anything to this runtime contract — metadata is build-
 // time, not runtime.
+
+// ═══════════════════════════════════════════════════════════════
+// Section: Runtime symbol resolution (Stage 6.2)
+// ═══════════════════════════════════════════════════════════════
+//
+// Every native binary carries a small (function address → name)
+// table written by `bpp_minisym.bsm` at compile time and embedded
+// in __DATA __minisym (Mach-O) or PT_NOTE BPPMINI (ELF). This
+// section is the consumer side: it asks the per-OS locate helper
+// (defined in `_core_<os>.bsm` Section 4) to find that blob in the
+// live process, then resolves a runtime PC to the function it
+// sits in.
+//
+// Shipped today:
+//   - Cache state populated lazily by `_runtime_locate_minisym`
+//   - `_runtime_resolve_pc(pc)` linear scan, returns a packed
+//     (offset_in_strtab << 32) | name_len ref, or 0 when the PC
+//     does not match any entry
+//   - `_runtime_name_addr(packed)` / `_runtime_name_len(packed)`
+//     unpack helpers so callers can hand the name straight to
+//     `print_buf` without touching the bit layout
+//
+// Not yet shipped:
+//   - `caller_pc(n)` / `caller_name(pc)` builtins — Stage 6.2c
+//     adds the four-layer wiring (codegen spine, chip emitters,
+//     validate, C fallback). Until then this section's only
+//     consumers are direct callers — `_runtime_resolve_pc(
+//     fn_ptr(name))` works fine for testing the path end-to-end.
+
+// ── Per-OS contract ─────────────────────────────────────────────
+//
+// Each OS runtime layer (`src/backend/os/<os>/_core_<os>.bsm`
+// Section 4) implements a `_runtime_locate_minisym()` that walks
+// the live binary's headers — Mach-O magic walk on macOS, ELF
+// program-header walk on Linux — and populates the cache globals
+// below. The function is idempotent: calling it after the first
+// successful load is a no-op.
+//
+// Failure modes (header not found, no __minisym section, no
+// BPPMINI note) leave the cache zeroed; the resolver then returns
+// 0 ("unknown") and the caller can format its trace line however
+// it wants without crashing.
+
+// ── Cache state populated by _runtime_locate_minisym ────────────
+//
+// All globals start at zero (BSS) and stay zero until the first
+// successful locate. The resolver re-calls locate every time the
+// cache is empty, so a partial failure (e.g. magic walk hit the
+// search budget) auto-retries on the next lookup.
+
+global _minisym_loaded;        // 0 = not loaded, 1 = ready
+global _minisym_image_base;    // mh_execute_header on macOS, ELF_BASE on Linux
+global _minisym_table_addr;    // start of the MSYM blob (header byte 0)
+global _minisym_count;         // entry_count from the MSYM header
+global _minisym_strtab;        // first byte of the packed strtab
+
+// Resolve a runtime PC to a packed name ref. Returns 0 when the
+// minisym blob cannot be located, when the PC lies outside any
+// entry's range, or when the table is empty.
+//
+// The packed layout is `(offset_in_strtab << 32) | name_len`,
+// chosen so the unpack helpers below stay one-line and so a 0
+// result is unambiguously "unknown" (offset 0 with length 0).
+//
+// Linear scan is fine for the typical 100–500 functions a B++
+// program ships — the resolver is called at panic time or
+// post-stop in the profiler aggregator, not in any hot loop.
+// A binary search becomes worth it only when something samples
+// at >10 kHz across hundreds of threads simultaneously.
+_runtime_resolve_pc(pc) {
+    auto rel, i, ep, addr_off, name_off, name_len;
+    auto best_off, best_idx, entries_off;
+
+    // Lazy init. The per-OS function does the platform-specific
+    // header walk (Mach-O on macOS, ELF on Linux). Both are
+    // no-ops after the first successful run.
+    if (_minisym_loaded == 0) {
+        _runtime_locate_minisym();
+        if (_minisym_loaded == 0) { return 0; }
+    }
+    if (_minisym_count == 0) { return 0; }
+
+    // Translate the absolute runtime PC into the offset-from-
+    // image-base form the table stores.
+    rel = pc - _minisym_image_base;
+    if (rel < 0) { return 0; }
+
+    // Entries start at byte 16 (after the MSYM header). Each
+    // entry is 8 bytes: u32 func_addr_off, u16 name_off, u16 name_len.
+    entries_off = _minisym_table_addr + 16;
+
+    // Linear scan with running-greatest-not-exceeding rule. The
+    // entry whose addr_off is the largest value still ≤ rel is
+    // the function the PC sits in (functions are non-overlapping
+    // and span up to the next entry's addr_off). The blob does
+    // not pre-sort entries, so we keep the best candidate as we
+    // walk and return it once the loop ends.
+    best_off = 0;
+    best_idx = 0 - 1;
+    for (i = 0; i < _minisym_count; i++) {
+        ep = entries_off + i * 8;
+        addr_off = peek(ep) | (peek(ep + 1) << 8)
+                 | (peek(ep + 2) << 16) | (peek(ep + 3) << 24);
+        if (addr_off <= rel) {
+            if (best_idx < 0 | addr_off > best_off) {
+                best_off = addr_off;
+                best_idx = i;
+            }
+        }
+    }
+
+    if (best_idx < 0) { return 0; }
+
+    // Read the matching entry's name_off and name_len, pack into
+    // the return form. name_off and name_len are u16 fields at
+    // entry offsets 4 and 6 respectively.
+    ep = entries_off + best_idx * 8;
+    name_off = peek(ep + 4) | (peek(ep + 5) << 8);
+    name_len = peek(ep + 6) | (peek(ep + 7) << 8);
+    if (name_len == 0) { return 0; }
+
+    // Pack: high 32 = strtab offset, low 32 = length.
+    return (name_off << 32) | (name_len & 0xFFFFFFFF);
+}
+
+// Return the runtime byte address of the resolved name, suitable
+// for `print_buf(addr, len)`. Returns 0 if `packed` is 0.
+_runtime_name_addr(packed) {
+    if (packed == 0) { return 0; }
+    return _minisym_strtab + (packed >> 32);
+}
+
+// Return the byte length of the resolved name. Returns 0 if
+// `packed` is 0.
+_runtime_name_len(packed) {
+    if (packed == 0) { return 0; }
+    return packed & 0xFFFFFFFF;
+}
+
+// ── Phase 6.2c — caller introspection helpers ────────────────
+//
+// caller_name(pc) is a thin wrapper over _runtime_resolve_pc so
+// that the user-facing surface stays consistent with caller_pc(n)
+// (a builtin in the codegen layer). Defined here as a regular B++
+// function rather than a builtin because the lookup is pure B++ —
+// no chip-specific assembly is required, and keeping it in the
+// auto-injected runtime means every program gets it without an
+// explicit import.
+//
+// The companion `caller_pc(n)` IS a builtin (see
+// _a64_emit_caller_pc / _x64_emit_caller_pc) because reading the
+// frame pointer and walking it requires chip-specific instructions.
+//
+// Composed use:
+//   caller_name(caller_pc(0)) — name of the current function
+//   caller_name(caller_pc(1)) — name of the caller
+//   caller_name(caller_pc(N)) — name of the function N frames up
+//
+// Returns the same packed (strtab_off << 32) | name_len encoding
+// as _runtime_resolve_pc, or 0 when the PC is not in any
+// minisym entry. Use _runtime_name_addr / _runtime_name_len to
+// unpack into a (byte address, length) pair suitable for I/O.
+caller_name(pc) {
+    return _runtime_resolve_pc(pc);
+}

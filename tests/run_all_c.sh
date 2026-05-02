@@ -29,6 +29,11 @@
 
 set -u
 
+# .bug emission is skipped for the --c path (no native offsets yet),
+# but pinning the build_id keeps any future shared infrastructure
+# byte-stable across runs.
+export BPP_BUILD_ID=00000000000000000000000000000000
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BPP="$REPO_ROOT/bpp"
 TESTS_DIR="$REPO_ROOT/tests"

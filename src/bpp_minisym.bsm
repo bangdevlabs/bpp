@@ -1,0 +1,185 @@
+// bpp_minisym.bsm — Compile-time emitter of the runtime minisym blob.
+//
+// Every native binary embeds a tiny `(addr → name)` table the
+// runtime can consult to symbolicate its own PCs without depending
+// on the external `.bug` file. That table is what powers
+// `panic()` stack traces, the sampling profiler, and
+// `caller_name()` introspection.
+//
+// This module is split out from `bpp_bug.bsm` on purpose: the
+// .bug-file emitter pulls in `bpp_bo.bsm`, which in turn references
+// x86_64-specific encoder helpers. Anything that imports a single
+// platform's writer (e.g. `tests/test_macho_only.bpp` only pulls
+// in `a64_macho.bsm`) must therefore avoid that dependency chain.
+// Keeping the minisym writer here, with imports limited to the
+// plain primitives, lets either binary writer pull it in safely.
+//
+// Format (caller-allocated buffer; writer produces a contiguous
+// blob whose total size matches `bug_minisym_size_for_target`):
+//
+//   offset  field             size  meaning
+//   0       magic             u32   "MSYM" (0x4D53594D)
+//   4       entry_count       u32   number of (addr,name) entries
+//   8       strtab_size       u32   bytes in packed string table
+//   12      build_id_check    u32   first 4 bytes of build_id_lo,
+//                                   so a stale runtime/binary pair
+//                                   surfaces as a zero match
+//   16      entries[entry_count × 8 bytes]
+//             u32 func_addr_off  byte offset of function entry,
+//                                relative to the loaded image base
+//                                (mh_execute_header on macOS, ELF
+//                                vmaddr on Linux). The runtime
+//                                resolver does pc - image_base and
+//                                compares against this offset.
+//             u16 name_off       offset into the strtab below
+//             u16 name_len       length of the name in bytes
+//   16+8N   strtab[strtab_size]   packed names (no NUL terminators)
+//
+// The Mach-O writer stores this blob in a `__DATA __minisym`
+// section. The ELF writer stores it as a second PT_NOTE record
+// named `BPPMINI\0` inside the existing note region.
+
+import "bpp_defs.bsm";
+import "bpp_array.bsm";
+import "bpp_internal.bsm";
+
+// Build identity owned by bpp_bug.bsm. We only read it to populate
+// the build_id_check field. Declared extrn so this module compiles
+// even when the .bug-file emitter is not in the import chain (the
+// reference is dormant unless `bug_emit_minisym` is actually
+// called, and every binary writer that calls it also pulls in
+// bpp_bug.bsm via the full compiler build).
+extrn _bug_build_id_lo;
+
+// Compute the byte size of the minisym blob for the given target.
+// Called by the Mach-O / ELF writers during layout planning so
+// they can size the __DATA segment / PT_NOTE region before the
+// blob itself is emitted. Walks `cg_fn_name` only — does not need
+// any code-offset information, so it is safe to call before the
+// final code layout is known.
+//
+// `target` is unused today (the size depends on `cg_fn_name`,
+// which is target-independent at this stage of the compile) but
+// kept in the signature so future targets that omit some
+// functions from minisym can plug in here.
+bug_minisym_size_for_target(target) {
+    auto fn_cnt, total_name_len, i, name_p;
+
+    fn_cnt = arr_len(cg_fn_name);
+    total_name_len = 0;
+    for (i = 0; i < fn_cnt; i++) {
+        name_p = arr_get(cg_fn_name, i);
+        total_name_len = total_name_len + unpack_l(name_p);
+    }
+    // 16-byte header + 8 bytes/entry + packed strtab.
+    return 16 + 8 * fn_cnt + total_name_len;
+}
+
+// Write the minisym blob into out_buf starting at byte out_off.
+// Returns the number of bytes written, which always matches the
+// value `bug_minisym_size_for_target` reported earlier.
+//
+//   out_buf:       caller-owned buffer (mo_buf or elf_buf today)
+//   out_off:       byte offset within out_buf to start writing
+//   lbl_arr:       per-target function-label array. Pass
+//                  a64_fn_lbl on ARM64 / Mach-O and x64_fn_lbl on
+//                  x86_64 / ELF. Required as a parameter (rather
+//                  than dispatched on a `target` flag) so this
+//                  module never references the other backend's
+//                  globals — a writer compiled for one target
+//                  alone (e.g. tests/test_macho_only.bpp) does
+//                  not pull in unused codegen globals.
+//   off_arr:       per-target label-offset array. Pass
+//                  enc_lbl_off on ARM64 and x64_enc_lbl_off on
+//                  x86_64. Same separation rationale as lbl_arr.
+//   code_base_off: file offset of the start of the code section
+//                  (mo_code_off on Mach-O, elf_code_off on ELF).
+//                  Each entry's func_addr_off is computed as
+//                  (code_base_off + off_arr[lbl_arr[fn]]) so it
+//                  equals the byte offset of the function entry
+//                  from the loaded image base at runtime.
+bug_emit_minisym(out_buf, out_off, lbl_arr, off_arr, code_base_off) {
+    auto fn_cnt, i, j, name_p, name_off_in_vbuf, name_len;
+    auto p, entry_off, strtab_off, strtab_pos;
+    auto lbl, addr, ep, bid, strtab_size_pos;
+
+    fn_cnt = arr_len(cg_fn_name);
+
+    p = out_off;
+
+    // Header bytes 0..3: magic "MSYM" (little-endian 0x4D53594D).
+    poke(out_buf + p,     'M');
+    poke(out_buf + p + 1, 'S');
+    poke(out_buf + p + 2, 'Y');
+    poke(out_buf + p + 3, 'M');
+    p = p + 4;
+
+    // Header bytes 4..7: entry_count (u32 LE).
+    poke(out_buf + p,     fn_cnt & 0xFF);
+    poke(out_buf + p + 1, (fn_cnt >> 8) & 0xFF);
+    poke(out_buf + p + 2, (fn_cnt >> 16) & 0xFF);
+    poke(out_buf + p + 3, (fn_cnt >> 24) & 0xFF);
+    p = p + 4;
+
+    // Header bytes 8..11: strtab_size. Back-patched at the end of
+    // this function once the running total is known.
+    strtab_size_pos = p;
+    p = p + 4;
+
+    // Header bytes 12..15: build_id_check. The bug debugger and
+    // any future "is this minisym from the right binary?" check
+    // can compare these four bytes to the binary's full build_id
+    // recorded in LC_UUID / PT_NOTE.
+    bid = _bug_build_id_lo & 0xFFFFFFFF;
+    poke(out_buf + p,     bid & 0xFF);
+    poke(out_buf + p + 1, (bid >> 8) & 0xFF);
+    poke(out_buf + p + 2, (bid >> 16) & 0xFF);
+    poke(out_buf + p + 3, (bid >> 24) & 0xFF);
+    p = p + 4;
+
+    // Entry table starts at p; strtab follows immediately after
+    // the last entry. We append name bytes to the strtab as we
+    // go, tracking the running offset for each entry.
+    entry_off = p;
+    strtab_off = entry_off + 8 * fn_cnt;
+    strtab_pos = 0;
+
+    for (i = 0; i < fn_cnt; i++) {
+        name_p = arr_get(cg_fn_name, i);
+        name_off_in_vbuf = unpack_s(name_p);
+        name_len = unpack_l(name_p);
+
+        lbl = arr_get(lbl_arr, i);
+        addr = code_base_off + arr_get(off_arr, lbl);
+
+        ep = entry_off + i * 8;
+        // u32 func_addr_off (LE).
+        poke(out_buf + ep,     addr & 0xFF);
+        poke(out_buf + ep + 1, (addr >> 8) & 0xFF);
+        poke(out_buf + ep + 2, (addr >> 16) & 0xFF);
+        poke(out_buf + ep + 3, (addr >> 24) & 0xFF);
+        // u16 name_off (offset within strtab).
+        poke(out_buf + ep + 4, strtab_pos & 0xFF);
+        poke(out_buf + ep + 5, (strtab_pos >> 8) & 0xFF);
+        // u16 name_len.
+        poke(out_buf + ep + 6, name_len & 0xFF);
+        poke(out_buf + ep + 7, (name_len >> 8) & 0xFF);
+
+        // Append the raw name bytes to the strtab. No NUL — the
+        // entry's name_len is the only delimiter.
+        for (j = 0; j < name_len; j++) {
+            poke(out_buf + strtab_off + strtab_pos + j,
+                 peek(vbuf + name_off_in_vbuf + j));
+        }
+        strtab_pos = strtab_pos + name_len;
+    }
+
+    // Back-patch the strtab_size header field now that we have
+    // the final byte count.
+    poke(out_buf + strtab_size_pos,     strtab_pos & 0xFF);
+    poke(out_buf + strtab_size_pos + 1, (strtab_pos >> 8) & 0xFF);
+    poke(out_buf + strtab_size_pos + 2, (strtab_pos >> 16) & 0xFF);
+    poke(out_buf + strtab_size_pos + 3, (strtab_pos >> 24) & 0xFF);
+
+    return 16 + 8 * fn_cnt + strtab_pos;
+}

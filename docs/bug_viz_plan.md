@@ -188,26 +188,119 @@ debugger panel running in the terminal.
 
 ---
 
-## Phase 5 — Graphical visualizers in Bang 9 (~400 lines, new `bug_gui.bsm`)
+## Phase 5 — Graphical visualizers (status real)
 
-**What changes:**
+Originalmente desenhada como uma fase única de ~400 LOC no
+`bug_gui.bsm`. Na execução, virou quatro sub-passos. Status real
+em 2026-04-30:
 
-`bug --gui` opens a stbgame window alongside the watched process. Each watch
-item renders according to its graphical kind:
+### Step 1 — graph + vec2 renderers (TUI) — ✅ SHIPPED 2026-04-29
 
-- `@viz:rgba(w,h)` on a `buf_byte(w*h*4)` — live pixel buffer as image.
-- `@viz:vec2` on a struct with `x,y` — dot on a 2D grid.
-- `@viz:graph` on a float array — live bar/line chart.
+- `viz_render_graph(addr, n)`: lê N doubles consecutivos, pinta uma
+  linha Unicode `▁▂▃▄▅▆▇█` com range numérico embaixo.
+- `viz_render_vec2(addr)`: lê dois doubles, plota `*` num grid 21×9
+  ASCII com crosshairs.
+- Comando runtime `v <expr> graph <N>` / `v <expr> vec2` no TUI;
+  visualizadores persistem entre breakpoints.
+- Files: novo `src/bug_runviz.bsm` (~280 LOC), comando `v / lv / uv`
+  em `src/bug_tui.bsm`.
 
-Visualization hints come from source comments: `// @viz:rgba(320,180)`. The
-compiler copies these into the `.bug` file as optional hint records. Zero-cost
-when `bug` isn't in `--gui` mode.
+### Step 2 — rgba renderer (TUI) — ✅ SHIPPED 2026-04-29
 
-Trigger: Wolf3D has a framebuffer `buf_byte(320*180*4)` — you can watch the
-raycast result update in real time.
+- `viz_render_rgba(addr, w, h)`: lê `w*h*4` bytes, downsampla pra
+  preview 48×24 cells, pinta com ANSI 24-bit colour
+  (`\x1B[48;2;R;G;Bm  \x1B[0m`).
+- Wire format: `v <expr> rgba <w> <h>` no prompt.
+- Custo O(w*h) por frame (downsample por block-average), aguenta
+  até ~720p.
 
-**Files**: new `bug_gui.bsm`, `.bug` format extended with viz hint section,
-`bpp_bug.bsm` extended to capture `@viz:` comments.
+### Step 3 — Engine unificada GUI+TUI — ✅ SHIPPED 2026-04-30
+
+**Three stages** delivered the engine convergence:
+
+**Stage 1** — Async observer (`bug_run_async_start` /
+`bug_run_poll` / `bug_run_resume` / `bug_run_async_stop`) in
+`src/backend/os/macos/bug_observe_macos.bsm`. Non-blocking GDB
+primitives (`gdb_socket_has_data` via `sys_select`,
+`gdb_continue_send`, `gdb_try_recv_stop`) in `src/bug_gdb.bsm`.
+Shared snapshot module `src/bug_shared.bsm` (status / watch
+arrays / viz arrays) populated on every stop. New portable
+builtin `sys_select` (CG_SYS_SELECT enum + a64/x64/macos/linux
+wiring + validator + C emitter).
+
+**Stage 2** — `gdb_read_mem_chunk(addr, len, dst)` in
+`src/bug_gdb.bsm` (4 KB chunks, multi-digit hex size). Observer
+populates RGBA snapshots via the chunked reader. Panel renderers
+in `src/bug_runviz.bsm`: `viz_render_graph_panel` /
+`viz_render_vec2_panel` / `viz_render_rgba_panel` /
+`viz_render_all_panel`, all reading from `bug_shared_viz_*` and
+drawing through `stbdraw` (CPU framebuffer). RGBA uses nearest-
+neighbour scaling with aspect-fit, no GPU sprite needed.
+
+**Stage 3** — GUI wire-up in `tools/the_bug/the_bug_lib.bsm`.
+Replaced fork+execve in Run button with `bug_run_async_start`,
+frame loop calls `bug_run_poll` instead of `sys_wait4`. Added
+Continue / Stop buttons gated on `bug_shared_status`. Live panel
+area appears below the button bar when STOPPED, splits content
+into watch list (top) + viz panels (bottom) with a fixed 240 px
+height (or half the content area). Static `.bug` map continues
+below the live area. Status indicator under the buttons reads
+"running... / stopped at <fn>() / exited rc=N / crashed sig=N".
+`viz_format_panel` in `src/bug_viz.bsm` provides type-aware
+strbuf formatting (decimal + IEEE float with 3-digit fraction +
+hex pointer + "@0x<addr>" struct) so the watch panel mirrors
+TUI's `viz_format` without touching the tracee.
+
+Decisions ratified:
+- Polling-based observer, not threading. `select(timeout=0)`
+  before each read keeps the GUI at 60 fps.
+- Shared state in plain globals (single producer, single
+  consumer, same thread).
+- TUI path untouched — `bug_run` in observer kept the original
+  blocking flow; zero regression on `tests/test_bug_tui.sh`.
+- macOS-only first cut. Linux observer GUI waits for ELF
+  dynlink + GUI stabilisation.
+
+Ship state: gen-stable, suite 121/0/11, C 103/0/29, bug TUI
+PASS, the_bug builds clean.
+
+### Step 4 — `@viz` source annotation — ✅ SHIPPED 2026-04-29
+
+- Source `// @viz framebuffer rgba 320 180` → captura no lexer
+  (`scan_comment` chama `_capture_viz_hint` em `src/bpp_lexer.bsm`).
+- `.bug` carrega seção VIZ_HINTS após SOURCE MAP (formato: u16
+  count + per-entry u16 length + raw bytes).
+- `viz_replay_hints()` em `src/bug_runviz.bsm` walka `bug_vh_texts`
+  e alimenta cada um pelo `_tui_handle_v` (mesmo parser do `v`
+  runtime).
+- User não digita nada — visualizers ficam ativos no primeiro BP
+  hit.
+
+---
+
+## Phase 6 — Profiler + Runtime Symbolication
+
+**Plano detalhado movido para [`docs/bug_phase6_plan.md`](bug_phase6_plan.md).**
+
+Resumo: minisym subset embutido no binário (Mach-O `__minisym`
+section / ELF PT_NOTE `BPPMINI` record) permite o runtime
+resolver PCs sem depender do `.bug` separado. Habilita três
+features (panic com stack trace, `caller(n)` introspection,
+sampling profiler).
+
+Profiler é **multi-thread aware desde v1** — programa B++
+típico já roda múltiplas threads (audio callback + bpp_job
+workers). Single-thread profiler vê só ~20% do programa.
+Solução: cooperative sampling em bpp_job/maestro (zero
+async-signal-safety risk) + signal-based supplement pra audio
+callback e main thread quando granularidade fina importa.
+
+5 stages, ~700 LOC, 4-5 sessões. Foundation (6.1 + 6.2) ship
+juntas; depois 6.3 (panic) → 6.4 cooperative → 6.4 signal →
+6.5 caller sugar.
+
+Cross-version safety: build_id v4 (já shipado em Phase 5)
+permite profiler refusar `.bug` stale.
 
 ---
 
@@ -226,32 +319,35 @@ unknown sections.
 
 ---
 
-## Priority and sequencing
-
-The user's instinct is correct: Wolf3D and RTS **without** a visualization-capable
-debugger is an archaeology expedition. Complex scene graphs, allocation patterns,
-raycast state — you need to see it, not infer it.
-
-Revised priority (phases 1-4 before Wolf3D, Phase 5 during Wolf3D):
+## Priority and sequencing (atualizado 2026-04-30)
 
 ```
   ✅ Dev Loop 2 — bug --break, --dump-str, crash locals
-     bug Phase 1 — watch list at breakpoints (~1 session)
-     bug Phase 2 — type-aware display: struct/array/string (~1-2 sessions)
-     bug Phase 3 — expression evaluator (~2 sessions)
-     bug Phase 4 — interactive TUI: watch window REPL (~2 sessions)
+  ✅ bug Phase 1 — watch list at breakpoints
+  ✅ bug Phase 2 — type-aware display: struct/array/string
+  ✅ bug Phase 3 — expression evaluator
+  ✅ bug Phase 4 — interactive TUI: watch window REPL
+  ✅ bug Phase 5 step 1 — graph + vec2 renderers (TUI)
+  ✅ bug Phase 5 step 2 — rgba renderer (TUI, ANSI 24-bit)
+  ✅ bug Phase 5 step 4 — @viz source annotation
+  ✅ Faxinada the_bug — main() refactor + .bug sempre-ligado +
+     build_id (16 bytes Mach-O LC_UUID / ELF PT_NOTE GNU)
+  ✅ bug Phase 5 step 3 — Engine unificada GUI+TUI
   ──────────────────────────────────────────────────────────────
-     Wolf3D Phase 1  — CPU raycaster (debugger will earn its keep here)
-     bug Phase 5 — graphical visualizers (@viz: in Bang 9)
-     Wolf3D Phase 2  — hybrid CPU + GPU
+     ESTAMOS AQUI. Phase 5 fully shipped.
   ──────────────────────────────────────────────────────────────
-     Dev Loop 3 — profiler (reuses bug Phase 1 infrastructure)
+     Wolf3D Phase 1 — CPU raycaster
+     Wolf3D Phase 2 — hybrid CPU + GPU
+     Multicore Sprints 1-2 (start_idx / stride / reduction)
+  ──────────────────────────────────────────────────────────────
+     bug Phase 6 — Profiler + Caminho C (subset embutido)
      Dev Loop 4 — hot reload watch mode
      RPG / RTS demos
 ```
 
-Dev Loop 3 (profiler) moves after Phase 1 since the sampling profiler reuses the
-stack-walk and variable-read infrastructure being built.
+Dev Loop 3 (profiler) virou Phase 6 desta linha — depende do
+caminho hybrid (.bug separado + minisym embutido) que casa com a
+arquitetura já desenhada.
 
-Total estimated effort for Phases 1-4: ~4-6 sessions.
-Phase 5: 2-3 sessions, ideally during Wolf3D when there's a real framebuffer to visualize.
+Total entregue: **Phases 1-4 + Phase 5 (steps 1, 2, 3, 4)**.
+Próximas opções: Wolf3D, multicore Sprints, bug Phase 6.

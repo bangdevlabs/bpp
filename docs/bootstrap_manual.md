@@ -69,6 +69,257 @@ invocation. Full rebuilds take ~0.27s for the compiler, too fast to
 benefit from caching. Any bootstrap divergence is a real codegen issue,
 not staleness.
 
+## Architecture — The Six-Layer Cake
+
+B++ is structured as a layer cake. Each layer depends on layers below
+it, never the reverse. Knowing which layer you're touching is the
+single best predictor of how risky a change is, what skill it
+requires, and who can review it.
+
+```
+┌─────────────────────────────────────────────────────┐
+│ -1  HOST       — CPU + OS + drivers   (immutable)   │
+│  0  META       — bootstrap.c, install.sh   (rare)   │
+│  1  PROGRAMS   — games, examples, tools  (daily)    │
+│  2  STB        — auto-injected stdlib    (weekly)   │
+│  3  COMPILER   — frontend + runtime     (monthly)   │
+│  4  BACKEND    — chip + os + target  (quarterly)    │
+└─────────────────────────────────────────────────────┘
+
+Stability: top changes daily, bottom changes quarterly.
+Risk: top breaks one program, bottom breaks everything.
+Skill: top needs a week, bottom needs a year.
+```
+
+### Layer -1 — Host (we don't control this)
+
+ARM64 / x86_64 hardware. macOS / Linux kernel. GPU drivers, page
+size, calling conventions, ABI. We **adapt** to it; we never modify
+it. Decisions here (Apple Silicon's 16 KB pages, W^X enforcement,
+AAPCS64 calling convention) constrain everything above.
+
+### Layer 0 — Meta (bootstrap and infrastructure)
+
+```
+bootstrap.c            — the only C file in the system
+install.sh             — install + smoke test
+tests/run_all.sh       — suite verification
+docs/bootstrap_manual.md — this file
+```
+
+`bootstrap.c` is the seed: a C compiler that compiles `bpp.bpp` once
+to materialize the first `bpp` binary. After that, B++ is
+self-hosting and bootstrap.c is regenerated periodically. This layer
+changes once or twice a year. Touch it only when bootstrap is
+genuinely broken.
+
+### Layer 1 — Programs (where users live)
+
+```
+games/        — pathfind, platformer, snake, rhythm, ...
+examples/     — small demos and tests
+tools/        — modulab, mini_synth, sprite_viewer, font_forge, the_bug
+```
+
+A program in B++ looks like this:
+
+```bpp
+import "stbgame.bsm";
+
+init() { /* world setup */ }
+step(dt) { /* physics + AI */ }
+render(alpha) { /* draw */ }
+
+main() {
+    stbgame_run(init, step, render);
+}
+```
+
+That's it. Window, GL/Metal context, audio, input, timing — all
+auto-injected by the compiler via stb. The programmer focuses on
+features, not glue code. **A new contributor can be productive at
+this layer within a week** — they only need to learn B++ syntax and
+the public stb API.
+
+This is also where most B++ adoption will happen: a developer wants
+to ship a game or tool, writes ~500-2000 lines at this layer, never
+needs to touch the layers below.
+
+### Layer 2 — STB (the standard library, auto-injected)
+
+```
+stb/stbgame, stbdraw, stbmath, stbinput, stbaudio, stbmixer,
+stbsound, stbimage, stbpath, stbpal, stbtile, stbforge,
+stbecs, stbpool, stbasset, stbrender, stbui, stbwindow
+```
+
+The killer feature of B++ vs C: **stb modules are tight-bound, share
+the same idioms, and ship as a coherent universe.** A C developer
+spends ~50% of dev time integrating SDL + OpenGL + OpenAL + freetype +
+libpng — each library with different memory model, different naming,
+different error reporting. A B++ developer imports `stbgame` and gets
+all of that, in one consistent style, with zero impedance mismatch.
+
+Each stb module is a self-contained chunk of feature-specific code:
+
+- `stbgame` — main loop + window + input + audio orchestration
+- `stbdraw` — software rendering primitives (line, rect, blit, layer)
+- `stbmath` — sqrt, sin, cos, vec2/vec3/vec4 ops
+- `stbecs` — entity-component-system for game state
+- `stbsound` — WAV/AIFF/Ogg decode
+- `stbmixer` — multi-voice audio mixer
+- `stbimage` — PNG/JPG decode
+
+A new stb module is a single `.bsm` file with file-scope `extrn`
+state, public functions, and (optionally) per-OS attachment via
+`_stb_<feature>_<os>.bsm` for platform hooks.
+
+**Anyone who knows B++ can write a new stb module.** Picture
+`stbnetwork`, `stbphysics`, `stbgui`, `stbserialize`, `stbcrypto` —
+the contributor writes the module, ensures auto-injection, and ships
+it. The community grows by accumulating well-bounded stbs.
+
+A user can also write project-specific libs that follow the same
+pattern but live in their own repo: import them by relative path,
+share idioms with the canonical stb. The "tight-bound stdlib"
+philosophy scales to user code naturally.
+
+### Layer 3 — Compiler frontend + runtime
+
+```
+src/bpp_lexer.bsm        — tokenization
+src/bpp_parser.bsm       — AST construction
+src/bpp_types.bsm        — type inference
+src/bpp_dispatch.bsm     — phase + effect classification
+src/bpp_codegen.bsm      — chip-agnostic walker (orchestration)
+src/bpp_validate.bsm     — diagnostics (E*, W*)
+src/bpp_diag.bsm         — error reporting
+src/bpp_internal.bsm     — shared compiler structs
+src/bpp_import.bsm       — module dependency graph
+src/bpp.bpp              — compiler entry point
+src/bug.bpp              — debugger entry point
+
+Plus runtime auto-injected into every program:
+src/bpp_array, bpp_buf, bpp_hash, bpp_io, bpp_math, bpp_mem,
+bpp_path, bpp_str, bpp_json, bpp_time, bpp_file, bpp_thread,
+bpp_arena, bpp_job, bpp_beat, bpp_maestro
+```
+
+This is where the **language itself** lives. Touching layer 3 means
+modifying how B++ parses, type-checks, dispatches, or emits code.
+
+A contributor at this layer needs:
+- B++ fluency (obvious)
+- Compiler theory basics (lexer, parser, AST, codegen)
+- Understanding of the existing dispatch model (phases: base, io, gpu,
+  time, solo)
+- Patience: every layer 3 change forces a bootstrap, gen1==gen2 is
+  mandatory
+
+Layer 3 changes happen every 2-4 weeks during active development.
+Examples: adding `peekfloat_h` builtin, splitting heap into
+`bpp_mem.bsm`, adding `:bool` type hint, fixing E223 collision
+diagnostic.
+
+### Layer 4 — Backend (chip + os + target)
+
+```
+src/backend/chip/aarch64/  — ARM64 instruction encoding (a64_*)
+src/backend/chip/x86_64/   — x86_64 instruction encoding (x64_*)
+src/backend/os/macos/      — macOS attachments (_core, _stb_audio, ...)
+src/backend/os/linux/      — Linux attachments (_core, _stb_platform, ...)
+src/backend/target/        — Mach-O writer, ELF writer
+src/backend/c/             — C emitter (--c flag)
+```
+
+The hardest layer. A contributor here needs:
+- ARM64 / x86_64 ISA fluency (memorized encoding, register allocation)
+- ABI mastery (AAPCS64 / SysV x86_64, calling conventions)
+- Binary format knowledge (Mach-O load commands, ELF program headers)
+- Knowledge of OS-specific syscalls (Mach traps vs Linux syscalls)
+
+Layer 4 changes are quarterly. Examples: adding LDADD ARMv8.1
+instruction, adding LC_UUID load command (build_id work), splitting
+heap primitives into per-OS `_core_<os>.bsm`.
+
+**A bug in layer 4 breaks every program in the universe at once.**
+Bootstrap discipline (gen1==gen2 byte-stable, suite green) is
+non-negotiable. Cross-compile (`--linux64`) must continue to work.
+This is where senior compiler engineering happens.
+
+### The dependency rule (always top → bottom)
+
+```
+PROGRAMS → STB → COMPILER → BACKEND → HOST
+
+A program imports stb modules.
+A stb module imports runtime (bpp_array, bpp_io, ...).
+The runtime is compiled by the frontend.
+The frontend emits via the backend.
+The backend lands on the host.
+
+A backend file MUST NOT import a program.
+A compiler module MUST NOT import a stb module.
+A stb module MAY NOT import a compiler internal.
+```
+
+If you find yourself importing upward, the architecture is broken.
+The dependency graph is enforced by topological import resolution
+in `bpp_import.bsm`. Cycles fail the build.
+
+### Where to put a new feature (decision flow)
+
+| What you're adding | Layer | Example |
+|---|---|---|
+| Game logic, level design, asset loading | 1 | new game in `games/` |
+| Generic helper (path manipulation, json, hash) | 2 | new `stb<feature>.bsm` |
+| New language syntax or operator | 3 | parser + types + codegen |
+| New builtin (vec_add, peek_h) | 3+4 | dispatch + per-chip emit |
+| Cross-OS feature (window, audio, threads) | 4 | per-OS attachments |
+| Performance-critical instruction | 4 | new chip primitive |
+
+When unsure, ask: **does this depend on a specific chip / OS / binary
+format?** If yes, it's layer 4. Does it depend on language semantics
+(parser, types)? Layer 3. Does it serve programs broadly? Layer 2.
+Otherwise, it's a one-off, layer 1.
+
+### Risk and skill gradient summary
+
+| Layer | Edit risk | Skill level | Bootstrap impact | Review burden |
+|---|---|---|---|---|
+| 1 Programs | one program | beginner | none | low |
+| 2 Stb | many programs | intermediate | none | medium |
+| 3 Compiler | every program | advanced | mandatory | high |
+| 4 Backend | every binary | expert | mandatory + smoke tests | very high |
+
+Project culture: senior reviewers focus on layer 3-4 changes.
+Layer 1-2 reviews are about correctness and idiom; layer 3-4 reviews
+are about ISA correctness, ABI compliance, byte-stability of
+bootstrap.
+
+### Why this matters for community growth
+
+The cake structure makes B++ approachable in stages:
+
+1. **Day 1**: write a program at layer 1. Already useful.
+2. **Week 2**: contribute a small fix to an stb module at layer 2.
+3. **Month 2**: write your own stb module for a domain you care
+   about (your own game's networking, your own physics).
+4. **Month 6**: optionally dive into layer 3 if you want to evolve
+   the language itself.
+5. **Year 1+**: optionally dive into layer 4 if you want to add a
+   new chip / OS / binary format target.
+
+A contributor who only ever stays at layer 1 is **valuable**, not
+junior. A contributor who specializes in layer 4 is rare and
+critical. Both ends of the spectrum keep the cake nourished.
+
+Each developer can publish their own libraries (effectively their
+own stb modules) under the same auto-injection pattern, and they
+share idioms with the canonical stb because everyone speaks the
+same B++. There's no "framework lock-in" — anyone can fork the
+auto-import list locally and roll their own canonical layer 2.
+
 ## macOS Gotchas
 
 ### Exit 137 (SIGKILL) — Code Signing Cache
@@ -771,6 +1022,167 @@ When adding a new stdlib module that needs OS hooks:
    → design the abstract API on paper first. Create
      `_<feature>_<os>.bsm` per OS. Wire through stbgame or its
      equivalent.
+
+## Memory Access Model — Two Levels
+
+B++ has two parallel mental models for memory and they coexist
+deliberately. Confusing them is the source of most "why does
+peek/poke exist when I can just dereference?" questions.
+
+### Level 1 — Language (variables, values)
+
+At this level, **everything is word**. A `word` in B++ is 64 bits
+(8 bytes), and:
+
+- `auto x` allocates an 8-byte slot
+- `auto p` is an 8-byte pointer (64-bit address)
+- Function args, locals, globals, return values — all word
+- Integer literals, packed (offset, length) entries — word
+- Even `:byte` / `:half` / `:quarter` slice annotations only narrow
+  on **load/store boundaries**; the storage slot itself is always
+  8 bytes
+
+`*p` operates here: "treat the address `p` as the start of a word
+and read 8 bytes." It is the natural, default access form for
+scalar variables.
+
+### Level 2 — Memory (addresses, raw bytes)
+
+Hardware is **byte-addressable**. Every address points to exactly
+one byte. ARM64 has no concept of "word number 100" — only "byte
+800" (which by convention is the start of a word). x86_64 same.
+The CPU's load/store instructions take a width parameter (LDRB /
+LDRH / LDR W / LDR X), and all addresses are byte offsets.
+
+`peek(addr)` and `poke(addr, val)` operate here: "read/write the
+byte at this exact address." They are the close-to-metal primitive,
+mapping directly to LDRB/STRB. They do not know the layout of
+what they're touching — caller is responsible.
+
+### Why both levels?
+
+Real workloads in B++ (games, audio, graphics) split roughly
+50/50 between the two models:
+
+| Data | Natural granularity | Primitive |
+|---|---|---|
+| Scalar `auto x` | word | `*p`, direct load |
+| Array of words | word | `*(p + i*8)`, `arr_get` |
+| String / char buffer | byte | `peek`, `poke` |
+| Pixel ARGB | byte (4 channels) | `peek`, `peek_q` |
+| Audio PCM 16-bit | half | `peek_h` |
+| Audio float32 | quarter (4-byte float) | `peekfloat_h` |
+| PNG chunk header | mixed 1/2/4 byte fields | `peek_*`, byteswap |
+| File I/O | byte stream | `peek`, `poke` |
+| Network packet | byte stream with mixed fields | `peek_*` |
+
+If the language exposed only word access, byte-stream code would
+have to mask and shift on every read. If it exposed only byte
+access, scalar code would be 8 separate loads per variable. Both
+exist because both use cases are common.
+
+### The primitive families
+
+Three orthogonal axes: **width**, **signedness/type**, and
+**endianness**.
+
+```
+Read primitives          Width    Maps to (ARM64)
+─────────────────────────────────────────────────
+peek(p)         peek_b   1 byte   LDRB
+peek_h(p)                2 bytes  LDRH
+peek_q(p)                4 bytes  LDR W
+peek_w(p)       *p       8 bytes  LDR X
+peekfloat_h(p)           4 bytes  LDR S (then FCVT to D)
+peekfloat(p)             8 bytes  LDR D
+```
+
+`poke_*` is the symmetric write side. The `*p` form is sugar for
+`peek_w(p)` — the language-level shortcut for "read this address as
+a word." Big-endian variants (`read_u16_be`, `read_u32_be` in
+`bpp_buf.bsm`) are NOT slice-loaded; they compose from byte ops or
+byteswap explicitly because slice loads are native-endian.
+
+### malloc / peek are orthogonal, not alternatives
+
+A common confusion: "should I use peek or malloc?" The answer is
+both, for different things:
+
+- `malloc(N)` answers **"where does my data live?"** — returns an
+  address that is yours for `N` bytes until you `free` it.
+- `peek(addr)` answers **"what's at this address?"** — reads the
+  byte at `addr`, with no knowledge of who owns it.
+
+You almost always use both:
+
+```bpp
+auto p;
+p = malloc(64);              // got an address for 64 bytes
+poke(p, 65);                 // wrote 'A' at the first byte
+*(p + 8) = 0xDEADBEEF;       // wrote a word at offset 8
+free(p);                     // released the address
+```
+
+Removing either family breaks the model. malloc without peek/poke
+gives you addresses with no way to use them. peek/poke without
+malloc gives you no safe addresses to write to.
+
+### The defaults rule
+
+When a primitive has multiple width variants, the **default**
+(unsuffixed name) targets the most common use case at that level:
+
+| Layer | Default | Why |
+|---|---|---|
+| `peek` / `poke` (no suffix) | **byte** | Hardware is byte-addressable; byte-stream data is half the workload |
+| `malloc(N)` | **byte** | Kernel page allocators, FFI to C, file I/O are all byte-counted |
+| `*p` (deref sugar) | **word** | Variables and pointers are word; this is the language-level form |
+| `arr_new(N)` | **word slots** | Array elements are word by default; byte arrays use `arr_byte` explicitly |
+| `buf_word(N)` / `buf_byte(N)` | **explicit** | Caller declares stride at allocation time |
+
+The pattern: **low-level primitives default to byte** (close-to-metal),
+**language sugar defaults to word** (close-to-language), **typed
+APIs are explicit** (close-to-intent).
+
+This is intentional. Switching `peek` to default-word would create
+two redundant ways to read words (`peek` and `*p`) and force
+byte-stream code to type `peek_b` everywhere — wrong trade-off
+for a language that targets games/audio/graphics.
+
+### What B++ does NOT have (yet, intentionally)
+
+- **Atomic peek/poke** — single-threaded today; multi-thread
+  needs sync primitives (locks, atomics) which are not yet on the
+  roadmap.
+- **Bounds-checked peek/poke** — caller is responsible. `arr_get`
+  / `arr_set` are the bounds-checked layer above.
+- **Bit-level peek/poke** — bit fields are accessed via shift +
+  mask on a byte read. A `peek_bit(addr, n)` could exist but
+  no caller has needed it.
+- **Cross-endian peek** — the `_be` variants in `bpp_buf` compose
+  manually; no native big-endian primitive because targets are
+  all little-endian.
+
+### Decision flow for memory access
+
+When writing code that touches memory, ask in order:
+
+1. **Is it a scalar variable?** (declared with `auto x`)
+   → use `*p` for read, `*p = val` for write. Word default is right.
+2. **Is it a typed array element?** (`arr_new`, `arr_word`, `arr_byte`)
+   → use `arr_get` / `arr_set`. They handle width and bounds.
+3. **Is it a sub-word field in a buffer?** (image pixel, audio sample,
+   protocol field)
+   → use `peek_h` / `peek_q` / `peekfloat_h` for the matching width.
+4. **Is it a byte stream?** (string char, raw file data)
+   → use `peek` / `poke`. Default byte is right.
+5. **Is the address dynamically allocated?**
+   → `malloc` first, then access via the rule above. `free` when done.
+
+When in doubt, prefer the **typed** API (Tier 4 in the layering
+above — `arr_*`, `buf_*`, `str_*`) before reaching for raw
+peek/poke. The typed APIs cover ~80% of memory work; the remaining
+20% (codec parsing, custom layouts, FFI) needs the primitives.
 
 ## Auto-Import System
 

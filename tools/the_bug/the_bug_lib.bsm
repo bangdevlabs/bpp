@@ -120,11 +120,18 @@ static _tb_type_name(ty)@base {
 // visible panel area. Returns the next y position (always advances
 // by line height). Uses a shared line_y check so off-screen lines
 // are skipped cheaply.
+// Body text font is one bitmap multiplier smaller than the headline
+// font (UI_FONT_SZ=16 → mult 2 = 16 px per char; we use 8 = mult 1 =
+// 8 px per char for body lines so long function signatures and locals
+// fit in a 720 px window). Section titles still use UI_FONT_SZ for
+// hierarchy; only the body lines downsize.
+const _TB_BODY_FONT_SZ = 8;
+
 static _tb_draw_line(text, x, y, color) {
     auto line_h;
-    line_h = UI_FONT_SZ + 3;
+    line_h = _TB_BODY_FONT_SZ + 3;
     if (y >= _tb_oy && y + line_h <= _tb_oy + _tb_ph) {
-        draw_text(text, x, y, UI_FONT_SZ, color);
+        draw_text(text, x, y, _TB_BODY_FONT_SZ, color);
     }
     return y + line_h;
 }
@@ -565,7 +572,7 @@ the_bug_lib_try_load(path)@io {
     if (bug_parse() < 0) {
         err_msg = malloc(64);
         auto m2;
-        m2 = "invalid .bug format (bad magic / truncated)";
+        m2 = "invalid or stale .bug — regenerate with bpp --bug";
         for (i = 0; i < str_len(m2); i++) { poke(err_msg + i, peek(m2 + i)); }
         poke(err_msg + str_len(m2), 0);
         _tb_load_err = err_msg;
@@ -585,17 +592,19 @@ the_bug_lib_try_load(path)@io {
     return 1;
 }
 
-// Spawn the target binary derived from the loaded .bug path. Drops
-// the ".bug" suffix to find the executable next to the debug map.
-// The child is detached from the GUI's stdin/stdout so it can drive
-// its own window or terminal without fighting for the parent's TTY.
-// Returns the child PID on success, 0 on failure.
+// Launch the target binary derived from the loaded .bug path
+// under the async observer. The observer (bug_observe_<os>.bsm)
+// spawns debugserver, sets a breakpoint at every function entry,
+// and returns immediately so the GUI's frame loop stays at 60 fps.
+// Returns 1 on success, 0 on failure.
 //
-// Phase A2 minimum: fire-and-forget. Phase C will route the child
-// through debugserver and surface watches / visualizers in panels.
+// Stage 3 wire-up: replaces the prior fork+execve fire-and-forget
+// path with the same pipeline the TUI uses, so the GUI gains live
+// watch + viz panels at every breakpoint hit.
 static _tb_run_target()@solo {
-    auto plen, target_path, i, pid, argv_buf;
+    auto plen, target_path, i, ret;
     if (_tb_bug_path == 0) { return 0; }
+    if (bug_shared_status != BUG_SHARED_IDLE) { return 0; }
 
     // Strip the ".bug" suffix (4 bytes). the_bug_lib_try_load only
     // accepts files whose name matches *.bug, so the cut is safe.
@@ -605,64 +614,171 @@ static _tb_run_target()@solo {
     for (i = 0; i < plen - 4; i++) { poke(target_path + i, peek(_tb_bug_path + i)); }
     poke(target_path + (plen - 4), 0);
 
-    pid = sys_fork();
-    if (pid < 0) {
-        free(target_path);
-        return 0;
-    }
-    if (pid == 0) {
-        // Child: argv = [target_path, NULL]. envp = NULL — the
-        // target inherits the parent's environment via execve's
-        // default behaviour on macOS when envp is omitted from
-        // the syscall, but we pass an empty terminator anyway.
-        argv_buf = malloc(16);
-        *(argv_buf)     = target_path;
-        *(argv_buf + 8) = 0;
-        sys_execve(target_path, argv_buf, 0);
-        // execve only returns on failure. Exit so the parent's
-        // waitpid sees the child gone instead of hanging on a
-        // ghost process.
-        sys_exit(127);
-    }
-
-    // Parent stores the pid for the frame-loop reaper. The path
-    // hangs around in _tb_bug_path; target_path is a transient
-    // copy we can release after the fork completes successfully.
+    // start_idx=0 / argc=0: target receives no arguments. The
+    // observer's spawn helper handles the no-args path. bp_count=0
+    // and flag_break_all=0 fall through to "trace every function"
+    // mode — every entry stops the tracee, which is a chatty but
+    // honest default for "I just want to see what runs". Future UX
+    // can let the user pin specific functions before running.
+    ret = bug_run_async_start(target_path, 0, 0, 0, 0, 0);
     free(target_path);
-    _tb_run_pid     = pid;
-    _tb_last_status = 0;
+    if (ret < 0) { return 0; }
+
     _tb_run_started = 1;
-    return pid;
+    return 1;
 }
 
-// Poll-reap the running target without blocking. Called from the
-// frame loop so the GUI keeps responding while the child runs.
-// When the child exits, status is captured for display.
-//
-// sys_wait4(pid, status, options=1=WNOHANG, rusage=0) returns:
-//   0   — child still alive
-//   pid — child exited (status filled in)
-//  -1   — error (treat as exited so we don't poll forever)
+// Resume the tracee past the current breakpoint. Wired to the
+// Continue button.
+static _tb_run_resume_action()@solo {
+    if (bug_shared_status == BUG_SHARED_STOPPED) {
+        bug_run_resume();
+    }
+}
+
+// Kill the tracee and tear down the observer. Wired to the Stop
+// button. Safe at any state.
+static _tb_run_stop_action()@solo {
+    if (bug_shared_status == BUG_SHARED_RUNNING ||
+        bug_shared_status == BUG_SHARED_STOPPED) {
+        bug_run_async_stop();
+    }
+}
+
+// Drain any queued events from the observer. Called once per
+// frame before the panels render so a SIGTRAP that arrived since
+// the last frame flips the status to STOPPED before the next
+// draw — the user sees the stop within one frame.
 static _tb_run_poll()@solo {
-    auto reaped, status_word;
-    if (_tb_run_pid == 0) { return; }
-    status_word = 0;
-    reaped = sys_wait4(_tb_run_pid, &status_word, 1, 0);
-    if (reaped == _tb_run_pid) {
-        _tb_last_status = status_word;
-        _tb_run_pid     = 0;
+    if (bug_shared_status == BUG_SHARED_RUNNING) {
+        bug_run_poll();
     }
-    if (reaped < 0) {
-        _tb_last_status = -1;
-        _tb_run_pid     = 0;
+}
+
+// ── Live panel renderers (Stage 3) ─────────────────────────────
+
+// Render the watch snapshot as a list of "name = value" rows
+// inside (x, y, w, h). Returns the y position after the last row.
+// Reads from bug_shared_watch_* directly; type-aware formatting
+// flows through viz_format_panel.
+static _tb_render_watch_panel(x, y, w, h) {
+    auto i, name_packed, val, ty_sid, addr;
+    auto ty, sid, sb, line_h;
+    auto y_cur, max_y;
+
+    line_h = UI_FONT_SZ + 3;
+    y_cur  = y;
+    max_y  = y + h;
+
+    draw_text("watches", x, y_cur, UI_FONT_SZ, _theme.accent);
+    y_cur += line_h + 2;
+
+    if (bug_shared_watch_count == 0) {
+        draw_text("(none)", x + 16, y_cur, UI_FONT_SZ, _theme.text_muted);
+        y_cur += line_h;
+        return y_cur;
     }
+
+    for (i = 0; i < bug_shared_watch_count; i++) {
+        if (y_cur + line_h > max_y) { break; }
+        name_packed = *(bug_shared_watch_names  + i * 8);
+        val         = *(bug_shared_watch_values + i * 8);
+        ty_sid      = *(bug_shared_watch_types  + i * 8);
+        addr        = *(bug_shared_watch_addrs  + i * 8);
+        ty  = (ty_sid >> 16) & 0xFF;
+        sid = ty_sid & 0xFFFF;
+
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, _tb_unpack(name_packed));
+        sb = strbuf_cat(sb, " = ");
+        sb = viz_format_panel(sb, val, ty, sid);
+        draw_text(sb, x + 16, y_cur, UI_FONT_SZ, _theme.text);
+        strbuf_free(sb);
+        y_cur += line_h;
+    }
+    return y_cur;
+}
+
+// Render watch + viz live panels stacked vertically inside
+// (x, y, w, h). Visible only when status is STOPPED — when the
+// tracee is RUNNING the snapshots are stale by definition. Returns
+// the y position after the last drawn pixel.
+static _tb_render_live_panels(x, y, w, h) {
+    auto y_cur, max_y, watch_h, viz_h;
+    y_cur = y;
+    max_y = y + h;
+
+    // Frame the live area with a subtle border so the user can
+    // tell at a glance that this region is the live snapshot, not
+    // the static .bug map below.
+    draw_border(x - 4, y - 4, w + 8, h + 8, _theme.border, 1);
+
+    // Watch list takes up to 40% of the live area, leaving the
+    // rest for visualizers. When there are no visualizers the
+    // watch list grows naturally.
+    if (bug_shared_viz_count == 0) {
+        watch_h = h;
+    } else {
+        watch_h = h * 4 / 10;
+        if (watch_h < 80) { watch_h = 80; }
+    }
+    y_cur = _tb_render_watch_panel(x, y_cur, w, watch_h);
+
+    if (bug_shared_viz_count > 0 && y_cur < max_y) {
+        viz_h = max_y - y_cur;
+        viz_render_all_panel(x, y_cur, w, viz_h);
+        y_cur = max_y;
+    }
+    return y_cur;
+}
+
+// Compose the user-facing status string for the indicator under
+// the button bar. Reads bug_shared_status and a few related
+// globals; sb is reused so the caller can copy + free the same
+// way other indicators do.
+static _tb_status_strbuf() {
+    auto sb;
+    auto fi;
+    sb = strbuf_new();
+    if (bug_shared_status == BUG_SHARED_RUNNING) {
+        sb = strbuf_cat(sb, "running...");
+        return sb;
+    }
+    if (bug_shared_status == BUG_SHARED_STOPPED) {
+        sb = strbuf_cat(sb, "stopped at ");
+        fi = bug_shared_func_idx;
+        if (fi >= 0 && fi < bug_am_count) {
+            sb = strbuf_cat(sb, _tb_unpack(arr_get(bug_am_name, fi)));
+            sb = strbuf_cat(sb, "()");
+        } else {
+            sb = strbuf_cat(sb, "<unknown>");
+        }
+        return sb;
+    }
+    if (bug_shared_status == BUG_SHARED_EXITED) {
+        sb = strbuf_cat(sb, "exited rc=");
+        sb = strbuf_num(sb, bug_shared_exit_code);
+        return sb;
+    }
+    if (bug_shared_status == BUG_SHARED_CRASHED) {
+        sb = strbuf_cat(sb, "crashed sig=");
+        sb = strbuf_num(sb, bug_shared_signal);
+        return sb;
+    }
+    sb = strbuf_cat(sb, "idle");
+    return sb;
 }
 
 // Render one frame of the debug map viewer. Returns 1 if ESC pressed.
 the_bug_lib_frame(px, py, pw, ph) {
     auto quit, margin, hy, content_y, content_h;
 
-    _tb_ox = px; _tb_oy = py; _tb_pw = pw; _tb_ph = ph;
+    // Reserve 24 px at the bottom for the status bar (drawn at
+    // py + ph - 20 in UI_FONT_SZ=16). Without this, the function /
+    // struct / global lists scroll past the status row and the two
+    // overlap visibly. The clip region in _tb_draw_line / _tb_draw_section
+    // honours _tb_ph, so shrinking it here is the single chokepoint.
+    _tb_ox = px; _tb_oy = py; _tb_pw = pw; _tb_ph = ph - 24;
 
     if (_tb_initialized == 0) {
         the_bug_lib_init();
@@ -683,9 +799,18 @@ the_bug_lib_frame(px, py, pw, ph) {
     auto btn_x;
     btn_x = px + pw - margin;
 
+    // Button widths sized for UI_FONT_SZ=16 bitmap (16 px per char):
+    //   "Load .bug"  =  9 chars * 16 = 144 + 16 padding = 160
+    //   "Run target" = 10 chars * 16 = 160 + 16 padding = 176
+    //   "Continue"   =  8 chars * 16 = 128 + 16 padding = 144
+    //   "Stop"       =  4 chars * 16 =  64 + 16 padding =  80
+    // Without these, text overflows the button frame and adjacent
+    // buttons render on top of each other (visible as garbled
+    // "Run targatad .bu" overlap in the top bar).
+
     // Load button (always present).
-    btn_x -= 112;
-    if (gui_button(btn_x, bar_y - 2, 112, 22, "Load .bug")) {
+    btn_x -= 160;
+    if (gui_button(btn_x, bar_y - 2, 160, 22, "Load .bug")) {
         auto picked;
         picked = window_open_dialog("Open .bug file");
         if (picked != 0) {
@@ -694,56 +819,59 @@ the_bug_lib_frame(px, py, pw, ph) {
         }
     }
 
-    // Run button (only meaningful when a .bug is loaded). Spawns
-    // the target binary derived from the loaded path. The button
-    // is disabled (still drawn but the click is ignored) while a
-    // child is alive — Phase A2 keeps the spawn fire-and-forget;
-    // a Stop button needs sys_kill which is not a builtin yet
-    // (could land later via libc FFI when the Run flow grows
-    // tracee control).
-    if (_tb_loaded != 0) {
-        btn_x -= 8 + 112;
-        auto run_label;
-        run_label = _tb_run_pid != 0 ? "running..." : "Run target";
-        if (gui_button(btn_x, bar_y - 2, 112, 22, run_label)) {
-            if (_tb_run_pid == 0) {
-                _tb_run_target();
-            }
+    // Drain any pending stop event BEFORE we choose the button
+    // labels and the layout split, so a SIGTRAP that arrived this
+    // frame flips the status to STOPPED before the buttons render.
+    _tb_run_poll();
+
+    // Run button (only meaningful when a .bug is loaded and the
+    // observer is idle). Stop / Continue buttons appear once the
+    // tracee is live.
+    if (_tb_loaded != 0 && bug_shared_status == BUG_SHARED_IDLE) {
+        btn_x -= 8 + 176;
+        if (gui_button(btn_x, bar_y - 2, 176, 22, "Run target")) {
+            _tb_run_target();
         }
     }
 
-    // Run-status indicator below the buttons. Renders only after
-    // the user has launched something at least once so first-time
-    // viewers don't see noise.
+    // Continue: visible only when the tracee is STOPPED at a
+    // breakpoint. Resumes execution past the current BP.
+    if (bug_shared_status == BUG_SHARED_STOPPED) {
+        btn_x -= 8 + 144;
+        if (gui_button(btn_x, bar_y - 2, 144, 22, "Continue")) {
+            _tb_run_resume_action();
+        }
+    }
+
+    // Stop: visible while the tracee is alive in any state. Kills
+    // the target and tears the observer down.
+    if (bug_shared_status == BUG_SHARED_RUNNING ||
+        bug_shared_status == BUG_SHARED_STOPPED) {
+        btn_x -= 8 + 80;
+        if (gui_button(btn_x, bar_y - 2, 80, 22, "Stop")) {
+            _tb_run_stop_action();
+        }
+    }
+
+    // Status indicator below the button bar. Renders only after
+    // the user has launched at least once so first-time viewers
+    // don't see noise. The shared status word drives the colour:
+    // running = accent, stopped = text, exited / crashed = muted.
     if (_tb_run_started != 0) {
-        auto status_str, sx, sy;
+        auto sx, sy, sb_status, status_color;
         sx = px + margin;
         sy = bar_y + UI_FONT_SZ + 4;
-        if (_tb_run_pid != 0) {
-            auto sb;
-            sb = strbuf_new();
-            sb = strbuf_cat(sb, "running [pid ");
-            sb = strbuf_num(sb, _tb_run_pid);
-            sb = strbuf_cat(sb, "]");
-            buf_copy(_tb_line_buf, sb, strbuf_len(sb));
-            poke(_tb_line_buf + strbuf_len(sb), 0);
-            strbuf_free(sb);
-            draw_text(_tb_line_buf, sx, sy, UI_FONT_SZ, _theme.accent);
+        sb_status = _tb_status_strbuf();
+        if (bug_shared_status == BUG_SHARED_RUNNING) {
+            status_color = _theme.accent;
+        } else if (bug_shared_status == BUG_SHARED_STOPPED) {
+            status_color = _theme.text;
         } else {
-            auto sb2;
-            sb2 = strbuf_new();
-            sb2 = strbuf_cat(sb2, "last run exit=");
-            sb2 = strbuf_num(sb2, _tb_last_status);
-            buf_copy(_tb_line_buf, sb2, strbuf_len(sb2));
-            poke(_tb_line_buf + strbuf_len(sb2), 0);
-            strbuf_free(sb2);
-            draw_text(_tb_line_buf, sx, sy, UI_FONT_SZ, _theme.text_muted);
+            status_color = _theme.text_muted;
         }
+        draw_text(sb_status, sx, sy, UI_FONT_SZ, status_color);
+        strbuf_free(sb_status);
     }
-
-    // Reap any finished child so the next frame's button label is
-    // accurate without needing the user to click again.
-    _tb_run_poll();
 
     bar_y += UI_FONT_SZ + 8;
     draw_rect(px + margin, bar_y, pw - margin * 2, 1, _theme.border);
@@ -752,6 +880,25 @@ the_bug_lib_frame(px, py, pw, ph) {
     // ── Content area ──
     content_y = bar_y;
     content_h = ph - (content_y - py) - 24;
+
+    // When the tracee is paused at a breakpoint, take the top
+    // portion of the content area for the live watch + viz panels
+    // and push the static .bug map below them. The split is fixed
+    // (240 px or half the area, whichever is smaller) so the
+    // static map stays scrollable in the bottom half. Visible
+    // exclusively in STOPPED state — RUNNING / EXITED / CRASHED
+    // hide the panels because the snapshot is either stale or
+    // never captured.
+    if (bug_shared_status == BUG_SHARED_STOPPED) {
+        auto live_h;
+        live_h = 240;
+        if (live_h > content_h / 2) { live_h = content_h / 2; }
+        if (live_h < 120)            { live_h = 120; }
+        _tb_render_live_panels(px + margin, content_y,
+                               pw - margin * 2, live_h);
+        content_y += live_h + 12;
+        content_h  = ph - (content_y - py) - 24;
+    }
 
     if (_tb_loaded == 0) {
         // Placeholder when no .bug is loaded. Three lines:
@@ -773,7 +920,7 @@ the_bug_lib_frame(px, py, pw, ph) {
                   UI_FONT_SZ, _theme.text_muted);
         line_y += UI_FONT_SZ + 6;
 
-        msg = "(.bug files are written by `bpp --bug` next to the binary)";
+        msg = "compile with bpp --bug to emit one";
         msg_w = measure_text(msg, UI_FONT_SZ);
         draw_text(msg, px + (pw - msg_w) / 2, line_y,
                   UI_FONT_SZ, _theme.text_muted);
@@ -850,6 +997,13 @@ the_bug_lib_frame(px, py, pw, ph) {
 
 void the_bug_lib_shutdown() {
     if (_tb_initialized == 0) { return; }
+    // Tear the observer down if a tracee is still alive so we don't
+    // leak debugserver / target processes when the host panel
+    // closes mid-session.
+    if (bug_shared_status == BUG_SHARED_RUNNING ||
+        bug_shared_status == BUG_SHARED_STOPPED) {
+        bug_run_async_stop();
+    }
     if (_tb_line_buf != 0) { free(_tb_line_buf); _tb_line_buf = 0; }
     _tb_initialized = 0;
 }

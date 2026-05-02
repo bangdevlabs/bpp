@@ -3,6 +3,7 @@
 // No entitlements, no codesign, no ptrace, no Mach APIs needed on bug itself.
 
 import "bug_gdb.bsm";
+import "bug_shared.bsm";
 
 // -- Constants ---------------------------------------------------
 
@@ -880,5 +881,348 @@ bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
         sys_wait4(_ds_pid, &status, 0, 0);
     }
 
+    return 0;
+}
+
+// ── Async observer (Phase 5 step 3) ────────────────────────────
+//
+// The TUI debug loop above blocks on every gdb_continue while it
+// waits for the next SIGTRAP, which is fine when bug owns the
+// terminal but unusable from inside the GUI's 60 fps frame loop.
+// The async path below splits the work across three calls a frame
+// loop can interleave:
+//
+//   bug_run_async_start  — same setup as bug_run, then sends the
+//                          first 'c' and returns immediately.
+//   bug_run_poll         — drains queued GDB packets without
+//                          blocking. Returns 1 when a stop event
+//                          was captured and the snapshots in
+//                          bug_shared are ready for the GUI to
+//                          render; 0 when the tracee is still
+//                          running this frame.
+//   bug_run_resume       — single-step past the current breakpoint
+//                          and send another 'c'. Called by the
+//                          GUI from a "continue" button.
+//   bug_run_async_stop   — kill the tracee and tear everything
+//                          down. Safe to call from any state.
+//
+// Static state below mirrors the locals that the blocking
+// bug_run holds in its own stack frame: text_base / data_base
+// for address resolution, has_bug for whether the .bug map was
+// loaded, call_depth for indentation labels.
+
+static auto _async_text_base;
+static auto _async_data_base;
+static auto _async_has_bug;
+static auto _async_call_depth;
+static auto _async_ds_started;
+static auto _async_at_bp_pc;       // PC of the BP we're paused at
+
+// Populate bug_shared watch snapshot. Mirrors the locals + globals
+// branches of _print_crash_locals but writes into the producer
+// buffers in bug_shared instead of the terminal so the GUI panel
+// renderers can pull straight from memory at frame rate.
+static _populate_watch_snapshot()@io {
+    auto fi, fp, data_base;
+    auto vcnt, voffs, vnames, ltypes, lsids, lkinds, ldetails;
+    auto vi, val, ty, sid, kind, detail, addr, ty_sid;
+
+    bug_shared_clear_watch();
+    fi        = bug_shared_func_idx;
+    fp        = bug_shared_fp;
+    data_base = _async_data_base;
+    if (fi < 0)             { return; }
+    if (fi >= bug_sk_count) { return; }
+    if (fi >= bug_fn_count) { return; }
+
+    vcnt     = arr_get(bug_sk_vcnt,     fi);
+    voffs    = arr_get(bug_sk_voffs,    fi);
+    vnames   = arr_get(bug_fn_lnames,   fi);
+    ltypes   = arr_get(bug_fn_ltypes,   fi);
+    lsids    = arr_get(bug_fn_lsids,    fi);
+    lkinds   = arr_get(bug_fn_lkinds,   fi);
+    ldetails = arr_get(bug_fn_ldetails, fi);
+
+    if (vcnt > 0 && vnames != 0) {
+        for (vi = 0; vi < vcnt; vi++) {
+            if (_watch_match(vnames[vi]) == 0) { continue; }
+            kind   = 1;
+            detail = voffs[vi];
+            if (lkinds   != 0) { kind   = lkinds[vi]   & 0xFF; }
+            if (ldetails != 0) { detail = ldetails[vi] & 0xFFFFFFFF; }
+            if (kind == 0) {
+                val  = gdb_read_reg(detail);
+                addr = 0;
+            } else {
+                addr = fp + detail;
+                val  = gdb_read_mem(addr, 8);
+            }
+            ty  = 0;
+            sid = 0;
+            if (ltypes != 0) { ty  = ltypes[vi] & 0xFF; }
+            if (lsids  != 0) { sid = lsids[vi]  & 0xFFFF; }
+            ty_sid = (ty << 16) | sid;
+            bug_shared_push_watch(vnames[vi], val, ty_sid, addr);
+        }
+    }
+
+    if (watch_count > 0 && data_base != 0 && bug_gl_count > 0) {
+        auto gi, gaddr, gname;
+        for (gi = 0; gi < bug_gl_count; gi++) {
+            gname = arr_get(bug_gl_name, gi);
+            if (_watch_match(gname) == 0) { continue; }
+            gaddr  = data_base + arr_get(bug_gl_data_off, gi);
+            val    = gdb_read_mem(gaddr, 8);
+            ty     = arr_get(bug_gl_type, gi) & 0xFF;
+            sid    = arr_get(bug_gl_sid,  gi) & 0xFFFF;
+            ty_sid = (ty << 16) | sid;
+            bug_shared_push_watch(gname, val, ty_sid, gaddr);
+        }
+    }
+}
+
+// Populate bug_shared viz snapshots. Each active visualizer's
+// AST is evaluated against the current frame, then the bytes the
+// renderer needs are pulled from the tracee into a heap copy that
+// outlives the poll call. The panel renderers in Stage 2 will
+// consume these copies without touching the tracee.
+//
+// RGBA visualizers are skipped here because gdb_read_mem only
+// supports up to 15 bytes per round-trip — a 320×180 framebuffer
+// would take 230 000 round-trips per stop event. A chunked
+// "M<addr>,<len>" read primitive lands with Stage 2; until then
+// the GUI shows the kind label without a picture.
+static _populate_viz_snapshots()@io {
+    auto i, ast, kind, addr, w, h, data, data_len;
+    auto fp, fi, data_base, count;
+
+    bug_shared_clear_viz();
+    if (viz_count == 0) { return; }
+
+    fp        = bug_shared_fp;
+    fi        = bug_shared_func_idx;
+    data_base = _async_data_base;
+
+    for (i = 0; i < viz_count; i++) {
+        ast  = *(viz_asts  + i * 8);
+        kind = *(viz_kinds + i * 8);
+        if (bug_eval_run(ast, fi, fp, data_base) < 0) { continue; }
+        addr = bug_eval_val;
+        if (addr == 0) { addr = bug_eval_addr; }
+        if (addr == 0) { continue; }
+
+        w = 0;
+        h = 0;
+        data_len = 0;
+        data = 0;
+
+        if (kind == VIZ_KIND_GRAPH) {
+            count    = *(viz_p1 + i * 8);
+            data_len = count * 8;
+            data     = malloc(data_len);
+            // Chunked transfer: one network round-trip pulls the whole
+            // float run, no matter how many samples (up to 4 KB worth).
+            gdb_read_mem_chunk(addr, data_len, data);
+            w = count;
+        } else if (kind == VIZ_KIND_VEC2) {
+            data_len = 16;
+            data     = malloc(16);
+            gdb_read_mem_chunk(addr, 16, data);
+        } else if (kind == VIZ_KIND_RGBA) {
+            w = *(viz_p1 + i * 8);
+            h = *(viz_p2 + i * 8);
+            // 4 bytes per pixel (RGBA). For 320×180 the snapshot is
+            // 230 KB transferred via ~58 chunked round-trips, each
+            // 4 KB — comparable to a single-digit millisecond per
+            // stop event on localhost.
+            data_len = w * h * 4;
+            data     = malloc(data_len);
+            gdb_read_mem_chunk(addr, data_len, data);
+        }
+
+        if (data != 0) {
+            bug_shared_push_viz(kind, addr, w, h, data, data_len);
+        }
+    }
+}
+
+// Set the breakpoints for the async observer. Same three-mode
+// logic as bug_run's setup; pulled out so both entry points stay
+// readable and so the breakpoint count goes to bug_shared instead
+// of straight to stdout.
+static _async_set_breakpoints(bp_names, bp_count, flag_break_all) {
+    auto _set_count, _mode, ret, i;
+    _set_count = 0;
+    _mode = 0;
+    if (bp_count > 0) {
+        if (flag_break_all) { _mode = 2; }
+        else                { _mode = 1; }
+    }
+    if (_mode == 1 || _mode == 2) {
+        auto _bi, _spec, _addr;
+        for (_bi = 0; _bi < bp_count; _bi++) {
+            _spec = *(bp_names + _bi * 8);
+            _addr = _resolve_break_cstr(_spec, _async_text_base);
+            if (_addr != 0) {
+                ret = gdb_set_bp(_addr);
+                if (ret == 0) { _set_count++; }
+            }
+        }
+    }
+    if (_mode == 0 || _mode == 2) {
+        for (i = 0; i < bug_am_count; i++) {
+            auto addr;
+            addr = _async_text_base + arr_get(bug_am_off, i);
+            ret = gdb_set_bp(addr);
+            if (ret == 0) { _set_count++; }
+        }
+    }
+    return _set_count;
+}
+
+// Spawn debugserver, connect, set breakpoints, and resume the
+// tracee — then return immediately. The GUI calls bug_run_poll
+// each frame to learn when a SIGTRAP arrives. Returns 0 on
+// success, -1 on error (status left as IDLE so the caller can
+// distinguish "never started" from "running").
+bug_run_async_start(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
+    auto ret, slide, retries;
+
+    bug_shared_status   = BUG_SHARED_IDLE;
+    bug_shared_pc       = 0;
+    bug_shared_fp       = 0;
+    bug_shared_signal   = 0;
+    bug_shared_func_idx = -1;
+    _async_call_depth   = 0;
+    _async_at_bp_pc     = 0;
+    _async_ds_started   = 0;
+
+    _async_has_bug = 0;
+    if (bug_fn_count > 0) { _async_has_bug = 1; }
+
+    if (_async_has_bug) {
+        auto save_count;
+        save_count = bug_am_count;
+        parse_macho_header(target_path);
+        bug_am_count = save_count;
+    } else {
+        parse_macho_header(target_path);
+    }
+
+    ret = _spawn_debugserver(target_path, start_idx, argc);
+    if (ret < 0) { return -1; }
+    _async_ds_started = 1;
+
+    retries = 0;
+    ret = -1;
+    while (retries < 50) {
+        sys_usleep(100000);
+        ret = gdb_connect(_ds_port);
+        if (ret >= 0) { retries = 999; }
+        else { retries++; }
+    }
+    if (ret < 0) { return -1; }
+
+    gdb_handshake();
+    gdb_query_stop();
+    slide = gdb_query_slide(_mo_text_seg_vmaddr);
+    _async_text_base = _mo_text_addr      + slide;
+    _async_data_base = _mo_data_seg_vmaddr + slide;
+
+    _async_set_breakpoints(bp_names, bp_count, flag_break_all);
+
+    if (gdb_continue_send() < 0) { return -1; }
+    bug_shared_status = BUG_SHARED_RUNNING;
+    return 0;
+}
+
+// Drain any queued GDB events. Returns 1 when a stop event is
+// captured and bug_shared snapshots are ready; 0 when the tracee
+// is still running this frame.
+bug_run_poll() {
+    auto sig, pc, fi;
+    if (bug_shared_status != BUG_SHARED_RUNNING) { return 0; }
+
+    sig = gdb_try_recv_stop();
+    if (sig == -3) { return 0; }      // no event this frame
+    if (sig == -1) {
+        bug_shared_status = BUG_SHARED_CRASHED;
+        return 1;
+    }
+    if (sig == 0) {
+        bug_shared_status = BUG_SHARED_EXITED;
+        return 1;
+    }
+    if (sig == -2) {
+        bug_shared_status = BUG_SHARED_CRASHED;
+        return 1;
+    }
+
+    bug_shared_signal = sig;
+
+    if (sig == SIGTRAP) {
+        pc = gdb_read_pc();
+        fi = lookup_pc(pc, _async_text_base);
+        bug_shared_pc        = pc;
+        bug_shared_fp        = gdb_read_fp();
+        bug_shared_func_idx  = fi;
+        _async_at_bp_pc      = pc;
+        if (_async_has_bug) {
+            _populate_watch_snapshot();
+            _populate_viz_snapshots();
+        }
+        if (_async_call_depth < 30) { _async_call_depth++; }
+        bug_shared_status = BUG_SHARED_STOPPED;
+        return 1;
+    }
+
+    // Fatal signal — capture pc + frame so the GUI can render the
+    // crash report from the snapshot exactly like the TUI's crash
+    // panel does from live state.
+    pc = gdb_read_pc();
+    fi = lookup_pc(pc, _async_text_base);
+    bug_shared_pc       = pc;
+    bug_shared_fp       = gdb_read_fp();
+    bug_shared_func_idx = fi;
+    if (_async_has_bug) {
+        _populate_watch_snapshot();
+        _populate_viz_snapshots();
+    }
+    bug_shared_status = BUG_SHARED_CRASHED;
+    return 1;
+}
+
+// Step past the current breakpoint and resume the tracee. Called
+// by the GUI when the user clicks "continue" after inspecting a
+// stop event. Returns 0 on success, -1 if the connection died.
+bug_run_resume() {
+    if (bug_shared_status != BUG_SHARED_STOPPED) { return -1; }
+    if (_async_at_bp_pc != 0) {
+        gdb_remove_bp(_async_at_bp_pc);
+        gdb_step();
+        gdb_set_bp(_async_at_bp_pc);
+        _async_at_bp_pc = 0;
+    }
+    if (gdb_continue_send() < 0) {
+        bug_shared_status = BUG_SHARED_CRASHED;
+        return -1;
+    }
+    bug_shared_status = BUG_SHARED_RUNNING;
+    return 0;
+}
+
+// Tear down the async observer cleanly. Safe at any status.
+bug_run_async_stop() {
+    if (bug_shared_status == BUG_SHARED_RUNNING ||
+        bug_shared_status == BUG_SHARED_STOPPED) {
+        gdb_kill();
+    }
+    gdb_disconnect();
+    if (_async_ds_started && _ds_pid > 0) {
+        auto status;
+        sys_wait4(_ds_pid, &status, 0, 0);
+        _async_ds_started = 0;
+    }
+    bug_shared_status = BUG_SHARED_IDLE;
     return 0;
 }

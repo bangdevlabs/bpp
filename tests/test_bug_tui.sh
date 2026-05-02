@@ -19,6 +19,10 @@
 
 set -e
 
+# Pin build_id so the .bug file produced by `./bpp` is byte-stable,
+# letting this test compare bytes if it ever needs to.
+export BPP_BUILD_ID=00000000000000000000000000000000
+
 cd "$(dirname "$0")/.."
 
 BPP=./bpp

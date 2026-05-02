@@ -5,6 +5,19 @@ import "bpp_array.bsm";
 import "bpp_internal.bsm";
 import "bpp_parser.bsm";
 import "a64_enc.bsm";
+// Runtime minisym writer (bug_emit_minisym /
+// bug_minisym_size_for_target). The minisym blob is embedded in
+// __DATA so the writer must see those symbols even when only
+// this file is imported (e.g. by targeted Mach-O tests under
+// tests/). bpp_minisym is intentionally lighter than bpp_bug and
+// avoids pulling in the .bug-file emitter's bpp_bo dependency,
+// which references x86_64-only encoder helpers.
+import "bpp_minisym.bsm";
+
+// Build identity. Generated once per compile by bug_init_build_id in
+// bpp_bug.bsm, written into LC_UUID below so the bug debugger can
+// match the binary against its sibling .bug file.
+extrn _bug_build_id_lo, _bug_build_id_hi;
 
 // Builds a complete Mach-O binary from the code buffer (enc_buf/enc_pos)
 // and data tables (globals, strings, floats) produced by the ARM64 codegen.
@@ -37,8 +50,11 @@ static auto mo_sizeofcmds;     // Total size of load commands.
 static auto mo_code_off;       // File offset of __text section.
 static auto mo_text_vmsize;    // __TEXT segment VM/file size (page-aligned).
 static auto mo_data_off;       // File offset of __DATA segment.
-static auto mo_data_size;      // Raw data size (globals + strings + floats).
+static auto mo_data_size;      // Raw data size of __DATA (everything up to and including minisym).
 static auto mo_data_vmsize;    // __DATA segment VM size (page-aligned).
+static auto mo_data_section_size; // Size of the __data section alone (globals + floats + strings + GOT). Excludes minisym.
+static auto mo_minisym_off;    // Byte offset of __minisym section within __DATA (8-byte aligned).
+static auto mo_minisym_size;   // Bytes in the minisym blob carried by __minisym.
 static auto mo_link_off;       // File offset of __LINKEDIT segment.
 static auto mo_link_size;      // __LINKEDIT content size.
 static auto mo_link_vmsize;    // __LINKEDIT VM size (page-aligned).
@@ -616,6 +632,20 @@ void mo_write_lc_main() {
     mo_w64(0, 0);                   // stacksize (0 = default)
 }
 
+// LC_UUID (24 bytes): 16-byte build identity, matched against the
+// .bug file's header by the bug debugger so a stale .bug never
+// silently produces wrong analysis. Values come from
+// `_bug_build_id_lo` / `_bug_build_id_hi`, populated once per
+// compile by `bug_init_build_id` in bpp_bug.bsm.
+void mo_write_lc_uuid() {
+    mo_w32(0x1B);                   // cmd (LC_UUID)
+    mo_w32(24);                     // cmdsize
+    mo_w64(_bug_build_id_lo & 0xFFFFFFFF,
+           (_bug_build_id_lo >> 32) & 0xFFFFFFFF);
+    mo_w64(_bug_build_id_hi & 0xFFFFFFFF,
+           (_bug_build_id_hi >> 32) & 0xFFFFFFFF);
+}
+
 // LC_LOAD_DYLIB (56 bytes): "/usr/lib/libSystem.B.dylib".
 void mo_write_lc_load_dylib() {
     mo_w32(0x0C);                   // cmd (LC_LOAD_DYLIB)
@@ -871,26 +901,42 @@ void mo_write_nlist(n_strx, n_type, n_sect, n_desc, n_value_lo, n_value_hi) {
 //   data_count: number of 8-byte global slots
 //   has_data:   1 if __DATA segment is needed, 0 otherwise
 void mo_compute_layout(code_size, data_count) {
-    auto has_data, nseg, cf_data_size;
+    auto has_data, nseg, cf_data_size, pre_minisym_end;
 
-    // __DATA is needed if there are globals, float literals, string literals, or GOT entries.
+    // Compute the runtime minisym blob size up front. The blob
+    // carries the (function address → name) table that
+    // _runtime_resolve_pc reads for panic / profiler / caller_name.
+    // It always lives in __DATA, so its presence forces has_data = 1
+    // for every program that has at least one function (essentially
+    // always, since main() must exist). The target argument is
+    // ignored today (size depends only on cg_fn_name); 0 = ARM64.
+    mo_minisym_size = bug_minisym_size_for_target(0);
+
+    // __DATA is needed if there are globals, float literals, string
+    // literals, GOT entries, OR a non-empty minisym blob.
     has_data = 0;
     if (data_count > 0) { has_data = 1; }
     if (arr_len(mo_flt_data) > 0) { has_data = 1; }
     if (mo_sdata_size > 0) { has_data = 1; }
     if (arr_len(mo_got_syms) > 0) { has_data = 1; }
+    if (mo_minisym_size > 0) { has_data = 1; }
 
     // Number of segments: PAGEZERO + TEXT + LINKEDIT [+ DATA].
     nseg = 3;
     if (has_data) { nseg = 4; }
 
     // Load commands: segments + chained_fixups + exports + symtab + dysymtab
-    //   + dylinker + main + dylib(libSystem) + extra dylibs + code_signature.
-    mo_ncmds = 11 + has_data + arr_len(mo_ext_libs);
+    //   + dylinker + main + uuid + dylib(libSystem) + extra dylibs + code_signature.
+    mo_ncmds = 12 + has_data + arr_len(mo_ext_libs);
 
+    // __DATA load command size: 72-byte segment header + 80 bytes per
+    // section. Today __DATA carries two sections — __data (globals,
+    // floats, strings, GOT) and __minisym (runtime symbol table) —
+    // for a total of 72 + 2 * 80 = 232 bytes. Programs without a
+    // __DATA segment skip this entirely.
     mo_sizeofcmds = 72              // __PAGEZERO
         + 152                       // __TEXT + __text section
-        + has_data * 152            // __DATA + __data section (if present)
+        + has_data * 232            // __DATA + __data + __minisym (if present)
         + 72                        // __LINKEDIT
         + 16                        // LC_DYLD_CHAINED_FIXUPS
         + 16                        // LC_DYLD_EXPORTS_TRIE
@@ -898,6 +944,7 @@ void mo_compute_layout(code_size, data_count) {
         + 80                        // LC_DYSYMTAB
         + 32                        // LC_LOAD_DYLINKER
         + 24                        // LC_MAIN
+        + 24                        // LC_UUID (build identity)
         + 56                        // LC_LOAD_DYLIB (libSystem)
         + arr_len(mo_ext_libs) * 80 // LC_LOAD_DYLIB (extra, 80 bytes each, padded)
         + 16;                       // LC_CODE_SIGNATURE
@@ -913,13 +960,34 @@ void mo_compute_layout(code_size, data_count) {
     mo_main_off = mo_code_off;
 
     // __DATA segment follows __TEXT (page-aligned).
-    // Layout: globals (data_count * 8) + float literals (flt_cnt * 8).
+    //
+    // Sub-layout within __DATA:
+    //   globals  (data_count * 8)
+    //   floats   (flt_cnt * 8)
+    //   strings  (mo_sdata_size bytes)
+    //   pad      (to 8-byte alignment)
+    //   GOT      (got_count * 8 bytes)
+    //   pad      (to 8-byte alignment)
+    //   minisym  (mo_minisym_size bytes)   <- new in 6.1
+    //
+    // The __data section covers everything up to and including the
+    // GOT. The __minisym section sits immediately after __data and
+    // holds the runtime symbol blob. Putting minisym AFTER the GOT
+    // keeps the chained-fixups page_start computation untouched —
+    // it still points dyld at the GOT page, and the additional
+    // minisym pages are marked DYLD_CHAINED_PTR_START_NONE.
     if (has_data) {
         mo_data_off = mo_text_vmsize;
         // GOT entries must be 8-byte aligned (LDR requires it).
         mo_got_data_off = data_count * 8 + arr_len(mo_flt_data) * 8 + mo_sdata_size;
         mo_got_data_off = (mo_got_data_off + 7) / 8 * 8;
-        mo_data_size = mo_got_data_off + arr_len(mo_got_syms) * 8;
+        // __data section ends after the last GOT entry. mo_minisym_off
+        // is 8-byte aligned to keep the minisym header aligned even
+        // when no GOT bytes exist.
+        pre_minisym_end = mo_got_data_off + arr_len(mo_got_syms) * 8;
+        mo_data_section_size = pre_minisym_end;
+        mo_minisym_off = (pre_minisym_end + 7) / 8 * 8;
+        mo_data_size = mo_minisym_off + mo_minisym_size;
         mo_data_vmsize = mo_page_align(mo_data_size);
         mo_data_vmaddr_lo = MO_VM_BASE + mo_text_vmsize;
         mo_data_vmaddr_hi = MO_VM_BASE_HI;
@@ -930,6 +998,8 @@ void mo_compute_layout(code_size, data_count) {
     } else {
         mo_data_off = mo_text_vmsize;
         mo_data_size = 0;
+        mo_data_section_size = 0;
+        mo_minisym_off = 0;
         mo_data_vmsize = 0;
         mo_data_vmaddr_lo = 0;
         mo_data_vmaddr_hi = 0;
@@ -1184,14 +1254,35 @@ void write_macho(filename, main_label, gl_names, gl_count) {
         MO_VM_BASE + mo_code_off, MO_VM_BASE_HI,
         code_size, mo_code_off, 2, 0x80000400);
 
-    // LC_SEGMENT_64 __DATA + __data section (if present).
+    // LC_SEGMENT_64 __DATA + __data + __minisym sections (if present).
+    //
+    // The segment carries two sections:
+    //   __data    — globals + floats + strings + GOT (mutable data)
+    //   __minisym — runtime symbol blob (read by _runtime_resolve_pc)
+    //
+    // Both share the same initprot/maxprot (rw- = 3) because the
+    // segment-level protection applies to every section. The
+    // minisym blob is logically read-only, but emitting it as a
+    // separate read-only segment would complicate the chained-fixups
+    // page_count math; sharing __DATA keeps fixup logic untouched.
     if (has_data) {
+        auto minisym_vmaddr_lo, minisym_vmaddr_hi;
+        minisym_vmaddr_lo = mo_data_vmaddr_lo + mo_minisym_off;
+        minisym_vmaddr_hi = mo_data_vmaddr_hi;
+        if (minisym_vmaddr_lo < mo_data_vmaddr_lo) { minisym_vmaddr_hi++; }
         mo_write_segment("__DATA", 6,
             mo_data_vmaddr_lo, mo_data_vmaddr_hi,
-            mo_data_vmsize, mo_data_off, mo_data_vmsize, 3, 3, 1);
+            mo_data_vmsize, mo_data_off, mo_data_vmsize, 3, 3, 2);
         mo_write_section("__data", 6, "__DATA", 6,
             mo_data_vmaddr_lo, mo_data_vmaddr_hi,
-            mo_data_size, mo_data_off, 3, 0);
+            mo_data_section_size, mo_data_off, 3, 0);
+        // __minisym section: positioned immediately after __data
+        // within the same segment. flags=0 (S_REGULAR); align=3
+        // (8-byte) keeps the MSYM header aligned for cheap u32
+        // reads in _runtime_locate_minisym.
+        mo_write_section("__minisym", 9, "__DATA", 6,
+            minisym_vmaddr_lo, minisym_vmaddr_hi,
+            mo_minisym_size, mo_data_off + mo_minisym_off, 3, 0);
     }
 
     // LC_SEGMENT_64 __LINKEDIT
@@ -1216,6 +1307,9 @@ void write_macho(filename, main_label, gl_names, gl_count) {
 
     // LC_MAIN
     mo_write_lc_main();
+
+    // LC_UUID (16-byte build_id, matched by bug debugger).
+    mo_write_lc_uuid();
 
     // LC_LOAD_DYLIB (libSystem.B.dylib)
     mo_write_lc_load_dylib();
@@ -1286,6 +1380,25 @@ void write_macho(filename, main_label, gl_names, gl_count) {
             }
             i++;
         }
+
+        // Pad from end of __data section to start of __minisym section.
+        // mo_minisym_off is 8-byte aligned and lies immediately after
+        // the GOT entries; the gap is at most 7 bytes of zero padding.
+        mo_pad((mo_data_off + mo_minisym_off) - mo_pos);
+
+        // Emit the minisym blob. Functions are addressed by their
+        // file offset relative to the loaded image base, which on
+        // macOS equals mh_execute_header's runtime address. At
+        // compile time that base is byte 0 of the binary, so each
+        // function's "image offset" is mo_code_off + enc_lbl_off —
+        // exactly what bug_emit_minisym computes from the per-fn
+        // label / offset arrays we pass as the third and fourth
+        // arguments. Passing a64_fn_lbl / enc_lbl_off here keeps
+        // the writer module self-contained: it never references
+        // the x86_64 codegen's globals, so a target-specific test
+        // build that only imports a64_macho.bsm still links.
+        bug_emit_minisym(mo_buf, mo_pos, a64_fn_lbl, enc_lbl_off, mo_code_off);
+        mo_pos = mo_pos + mo_minisym_size;
     }
 
     // ── Write __LINKEDIT ──

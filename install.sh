@@ -131,17 +131,34 @@ sudo cp src/bpp_path.bsm "$LIB_DIR/"
 sudo cp src/bpp_mem.bsm "$LIB_DIR/"
 sudo cp src/bpp_time.bsm "$LIB_DIR/"
 sudo cp src/bpp_thread.bsm "$LIB_DIR/"
+# bpp_runtime.bsm holds the runtime PC resolver (`_runtime_resolve_pc`)
+# that reads the embedded minisym blob the binary writers ship in
+# every native binary. Auto-injected by bpp_import.bsm into every
+# user program — missing it here breaks compiles from a clean cwd
+# with `error[E201]: function '_runtime_resolve_pc' called but never
+# defined`.
+sudo cp src/bpp_runtime.bsm "$LIB_DIR/"
+# bpp_minisym.bsm is the COMPILE-TIME emitter (writes the MSYM blob
+# into Mach-O __minisym / ELF BPPMINI). Imported by the binary
+# writers in src/backend/target/<*>/. Shipped here so a fresh
+# install can re-bootstrap bpp from source without the project tree.
+sudo cp src/bpp_minisym.bsm "$LIB_DIR/"
 sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
 sudo cp src/bug_reader.bsm "$LIB_DIR/"
 # The remaining bug_*.bsm modules complete the standalone debugger
 # build chain — without these, compiling tools/the_bug/the_bug.bpp
 # from any cwd outside the project root fails with E002 because
 # the local search path (./, stb/) does not see src/.
+# bug_shared.bsm holds the cross-thread snapshot globals (status,
+# pc, watch list, viz buffers) consumed by both the_bug.bpp and
+# bug_runviz.bsm; it is imported explicitly by the_bug, so it must
+# live next to the other bug_*.bsm modules in $LIB_DIR.
 sudo cp src/bug_gdb.bsm "$LIB_DIR/"
 sudo cp src/bug_viz.bsm "$LIB_DIR/"
 sudo cp src/bug_eval.bsm "$LIB_DIR/"
 sudo cp src/bug_brk.bsm "$LIB_DIR/"
 sudo cp src/bug_runviz.bsm "$LIB_DIR/"
+sudo cp src/bug_shared.bsm "$LIB_DIR/"
 sudo cp src/bug_tui.bsm "$LIB_DIR/"
 
 # Install standard library.
@@ -200,6 +217,29 @@ else
     exit 1
 fi
 rm -f "$SMOKE_SRC" "$SMOKE_BIN"
+
+# Second sanity check: every bug_*.bsm and every bpp_*.bsm that
+# tools/the_bug/the_bug.bpp imports must be present in $LIB_DIR.
+# This catches forgotten cp lines above before a user ever tries
+# to recompile the debugger from a clean cwd. We list the files
+# explicitly so a typo here is loud (rather than checking shell
+# globs that could quietly match nothing).
+echo "==> Verifying debugger module install set..."
+BUG_REQUIRED="bug_reader.bsm bug_shared.bsm bug_viz.bsm bug_eval.bsm \
+              bug_brk.bsm bug_runviz.bsm bug_tui.bsm bug_gdb.bsm"
+BUG_MISSING=""
+for m in $BUG_REQUIRED; do
+    if [ ! -f "$LIB_DIR/$m" ]; then
+        BUG_MISSING="$BUG_MISSING $m"
+    fi
+done
+if [ -z "$BUG_MISSING" ]; then
+    echo "    All debugger modules present."
+else
+    echo "    *** MISSING DEBUGGER MODULES:$BUG_MISSING ***"
+    echo "    Add the corresponding 'sudo cp src/<name>' line above."
+    exit 1
+fi
 
 # Update local binaries too (if not sandboxed). Remove first for fresh inode.
 rm -f ./bpp 2>/dev/null; cp "$BIN_DIR/bpp" ./bpp 2>/dev/null || true

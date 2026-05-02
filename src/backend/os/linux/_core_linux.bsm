@@ -103,3 +103,115 @@ _thread_spawn(tid_buf, start_fn, arg) {
 _thread_wait(tid) {
     return 0;  // no-op (no thread to join)
 }
+
+// ── Section 4: Runtime symbol resolution ──────────────────────
+//
+// Locate the minisym blob x64_elf.bsm embedded in the BPPMINI
+// PT_NOTE record at compile time. Caches the table address,
+// entry count, and strtab address in globals owned by
+// `bpp_runtime.bsm`. The resolver in `bpp_runtime.bsm` calls
+// this lazily on the first PC lookup.
+//
+// Linux x86_64 static ELF binaries from B++ are non-PIE and
+// load at the fixed ELF_BASE (0x400000) virtual address — the
+// kernel maps file byte 0 to VA 0x400000. So we can read the
+// ELF header directly from that base, walk the program headers
+// to find PT_NOTE, then scan note records for the "BPPMINI"
+// name to find our descriptor.
+
+extrn _minisym_loaded;       // 0 = first call has not run yet, 1 = loaded
+extrn _minisym_image_base;   // ELF_BASE at runtime
+extrn _minisym_table_addr;   // start of the MSYM blob
+extrn _minisym_count;        // entry_count from the MSYM header
+extrn _minisym_strtab;       // first byte of the packed strtab
+
+// Read a little-endian u32 from a byte-aligned address. Note
+// records are 4-byte aligned but the n_descsz field at offset
+// 4 lands on a non-8-aligned boundary, and the descriptor bytes
+// can have arbitrary alignment, so byte-by-byte composition is
+// the safe portable form.
+static _ms_u32_le(p)@base {
+    return peek(p) | (peek(p+1) << 8) | (peek(p+2) << 16) | (peek(p+3) << 24);
+}
+
+// Read a little-endian u64 from a byte-aligned address. Used
+// for ELF64 program-header offsets (p_offset, p_filesz) which
+// land at 8-byte-aligned positions but are composed for safety.
+static _ms_u64_le(p)@base {
+    auto lo, hi;
+    lo = peek(p) | (peek(p+1) << 8) | (peek(p+2) << 16) | (peek(p+3) << 24);
+    hi = peek(p+4) | (peek(p+5) << 8) | (peek(p+6) << 16) | (peek(p+7) << 24);
+    return lo | (hi << 32);
+}
+
+// Lazy-init the minisym cache. Idempotent. Failure modes (no
+// PT_NOTE, no BPPMINI record) leave the globals at zero and the
+// resolver falls back to "unknown".
+void _runtime_locate_minisym() {
+    auto base, e_phoff, e_phnum, ph, p_type, p_offset, p_filesz;
+    auto note_addr, note_end, n_namesz, n_descsz, name_off, desc_off;
+    auto i, namesz_padded, descsz_padded;
+
+    if (_minisym_loaded != 0) { return; }
+
+    base = 0x400000;
+    _minisym_image_base = base;
+
+    // ELF64 header field offsets we need:
+    //   e_phoff   at offset 32 (u64)
+    //   e_phnum   at offset 56 (u16)
+    e_phoff = _ms_u64_le(base + 32);
+    e_phnum = peek(base + 56) | (peek(base + 57) << 8);
+
+    ph = base + e_phoff;
+
+    for (i = 0; i < e_phnum; i++) {
+        // Elf64_Phdr layout:
+        //   p_type   u32  offset 0
+        //   p_flags  u32  offset 4
+        //   p_offset u64  offset 8
+        //   p_vaddr  u64  offset 16
+        //   p_paddr  u64  offset 24
+        //   p_filesz u64  offset 32
+        //   p_memsz  u64  offset 40
+        //   p_align  u64  offset 48
+        p_type = _ms_u32_le(ph);
+        // PT_NOTE = 4
+        if (p_type == 4) {
+            p_offset = _ms_u64_le(ph + 8);
+            p_filesz = _ms_u64_le(ph + 32);
+            note_addr = base + p_offset;
+            note_end  = note_addr + p_filesz;
+
+            while (note_addr < note_end) {
+                // Elf64_Nhdr: n_namesz(u32) n_descsz(u32) n_type(u32)
+                //   name[n_namesz padded to 4] desc[n_descsz padded to 4]
+                n_namesz = _ms_u32_le(note_addr);
+                n_descsz = _ms_u32_le(note_addr + 4);
+                name_off = note_addr + 12;
+                namesz_padded = (n_namesz + 3) & 0xFFFFFFFC;
+                desc_off = name_off + namesz_padded;
+
+                // Match "BPPMINI\0" (8 bytes including the NUL).
+                if (n_namesz == 8) {
+                    if (peek(name_off)     == 'B' & peek(name_off + 1) == 'P' &
+                        peek(name_off + 2) == 'P' & peek(name_off + 3) == 'M' &
+                        peek(name_off + 4) == 'I' & peek(name_off + 5) == 'N' &
+                        peek(name_off + 6) == 'I' & peek(name_off + 7) == 0) {
+                        _minisym_table_addr = desc_off;
+                        // MSYM header entry_count at offset 4 (u32 LE).
+                        _minisym_count = _ms_u32_le(desc_off + 4);
+                        _minisym_strtab = _minisym_table_addr + 16 + 8 * _minisym_count;
+                        _minisym_loaded = 1;
+                        return;
+                    }
+                }
+
+                descsz_padded = (n_descsz + 3) & 0xFFFFFFFC;
+                note_addr = desc_off + descsz_padded;
+            }
+        }
+
+        ph = ph + 56;       // sizeof(Elf64_Phdr)
+    }
+}

@@ -5033,3 +5033,415 @@ fixup or reloc lists) still represent the actionable lead.
 
 Tree state at end of this session: Phase 3 is the latest committed
 work (commit eab4107). Phase 4 is NOT shipped. Suite 121/0/11.
+
+## 2026-04-29 (later) — Wild-bls bug ROOT-CAUSED and FIXED
+
+Picked up the deep diagnostic from earlier in the day with fresh
+focus. The bug that had `bug_tui_repl` jumping to a wild address 9 MB
+below the binary base on the first `bl` was a phantom relocation in
+`bo_resolve_calls_arm64`.
+
+### Root cause
+
+`bo_resolve_calls_arm64` Pass 2 filtered out type-4 cross-module BL
+relocations from `enc_rel_pos / enc_rel_sym / enc_rel_ty` via
+`arr_pop`, but never updated the parallel scalar `enc_rel_cnt`. The
+code treated `enc_rel_cnt` and `arr_len(enc_rel_pos)` as
+interchangeable, but they diverged after the filter pass.
+
+`mo_resolve_relocations` in `a64_macho.bsm` then iterated
+`while (i < enc_rel_cnt)`, walked past the new `arr_len()`, and hit
+phantom type-4 entries that fell through every `if (ty == 0/1/2/3)`
+branch without setting `target_addr` or `imm12`. The patch step
+reused leftover values from the previous (legitimate) ty=1 ADRP+ADD
+patch — which is why the wild address looked plausible (it was a
+real address from earlier in the loop, just for the wrong call site
+and the wrong relocation type).
+
+The threshold of 8-9 calls in `_tui_print_help` was the threshold
+where `enc_rel_cnt` and `arr_len(enc_rel_pos)` first diverged enough
+for a phantom entry to land on a critical site. Any function with
+more than ~7 cross-module BL calls would have eventually tripped it.
+
+### Fix
+
+`bo_resolve_calls_arm64` Pass 2 now compacts via `arr_set` plus
+`arr_pop` and assigns `enc_rel_cnt = arr_len(enc_rel_pos)` after the
+filter. Single line, but the bug had eaten weeks of diagnostic time
+and was the canonical "scalar counter alongside dynamic array" trap
+the project memory `feedback_phantom_relocs.md` now records as a
+permanent rule.
+
+Bonus: the same diagnostic round also identified a missing
+`arr_set_at` builtin opportunity in stb code that was duplicating
+the `arr_set + bounds` pattern across call sites; added it to
+bpp_array as a future-proof fold.
+
+Commit: **fdcb256** — `compiler: phantom relocation fix + arr_set_at`.
+Suite: 121/0/11. Bootstrap byte-stable. Phase 4 unblocked.
+
+## 2026-04-29 (continued) — Phase 4 TUI + Phase 5 visualizers shipped
+
+With the wild-bls bug fixed, the parked Phase 4 + 5 source got
+restored, integrated, and shipped. Single commit because both
+phases share the same observer+watch+viz infrastructure and the
+diff is more bisect-friendly as one atomic step.
+
+Phase 4 — interactive REPL on every breakpoint:
+
+```
+c   continue       s   single-step
+q   quit           ?   help
+w / lw / uw        watch list (add / list / remove)
+p <expr>           one-shot evaluate + print
+b / cb / lb        breakpoint set / clear by name / list
+v / lv / uv        visualizer add / list / remove (Phase 5)
+```
+
+Watch list and visualizer list both persist across hits and survive
+through `c` resume. ESC at the prompt is equivalent to `q`. Terminal
+restoration via signal-handlers (SIGINT/SIGTERM/SIGSEGV/SIGABRT/SIGQUIT)
+that re-raise the original signal after `tcsetattr` so the user's
+shell sees a clean exit code.
+
+Phase 5 — graphical visualizers wired through `@viz:` annotations
+in source comments. The lexer captures `// @viz:rgba(W,H)` style
+hints and emits them as a `VIZ_HINTS` section in the .bug file.
+the_bug's panel renderer reads the hints and dispatches per kind:
+rgba shows live image, vec2 plots a dot, graph renders a line chart.
+Three kinds wired; more can land as needed without recompiling
+the_bug itself (data-driven dispatch).
+
+Commit: **454fd25** — `bug: Phase 4 TUI REPL + Phase 5 visualizers + @viz: source annotation`.
+Suite: 121/0/11.
+
+## 2026-04-30 — the_bug standalone tool consolidation
+
+Phase 5 step 3 (the_bug as a standalone GUI debugger) wrapped up
+across a series of tightly-coupled commits:
+
+- `40c70b9` — `stbwindow`: standalone API for tools that don't want
+  a full `stbgame` runtime. Lets the_bug open its own window without
+  importing the maestro/job/beat trio.
+- `d12966e` — moved the_bug's standalone source to
+  `tools/the_bug/the_bug.bpp` so it lives next to its build script
+  and doesn't pollute `bug.bpp` (the canonical CLI debugger).
+- `3d48efe` — build script + Viz Hints panel section (the_bug now
+  shows a "Visualizers" section in the map viewer panel listing
+  every `@viz:` annotation found in the loaded .bug).
+- `2b4b489` — `install.sh` ships all `bug_*.bsm` libs to `$LIB_DIR`
+  so building from any subdirectory works (previously needed manual
+  cp).
+- `4e5abea` — GUI is the default; the Run button spawns the target
+  via the async observer (no more `--gui` flag).
+- `7884b16` — fix blank window + add wrong-file feedback when user
+  drops a non-.bug file on the open dialog.
+- `6a90b2a` / `a04cf58` — `build.sh` rename to canonical `bug`,
+  drop the wrapper.
+- `6f1de5d` — Retina blank panel fix: use `_stb_w` (logical pixels)
+  not `window_width` (physical pixels). The_bug renders into a
+  layer that uses logical pixels but was sizing the panel against
+  physical, leaving a blank zone on Retina displays.
+
+Tree state at end: the_bug is a standalone GUI tool that loads .bug
+files via dialog, runs targets via the Run button, and renders
+locals + globals + structs + functions + visualizer hints in
+scrollable panels. Suite 121/0/11.
+
+## 2026-04-30 (later) — the_bug GUI visual fixes (5 issues)
+
+Hands-on user testing of the_bug surfaced five overlapping visual
+issues that were not caught by smoke tests because they only show
+when an actual .bug file is loaded and rendered to real Retina
+pixels:
+
+1. **`pathfind.bug` was version 3** while the reader expects v4
+   (after the .bug build_id work). Old artifact in
+   `games/pathfind/build/`. Reader rejected with "invalid .bug
+   format (bad magic / truncated)" — confusing because the file
+   was none of those things. Fixed by:
+   - regenerating `games/pathfind/build/pathfind.bug` (v4 now)
+   - rewording the error to
+     `"invalid or stale .bug — regenerate with bpp --bug"`.
+
+2. **Empty-state long message clipped** at both window edges. Line
+   `"(.bug files are written by 'bpp --bug' next to the binary)"`
+   measures wider than the panel; centering math gave a negative x
+   offset and the leading "(.bug f" + trailing "binary)" went off-
+   screen. Replaced with a shorter
+   `"compile with bpp --bug to emit one"` that fits in any window
+   width >= 720.
+
+3. **Top-bar buttons overlapping** ("Run targatad .bu"). Buttons
+   were 112 / 96 / 64 px wide but the bitmap font at `UI_FONT_SZ=16`
+   renders 16 px per char, so "Load .bug" (9 chars × 16 = 144 px)
+   overflowed the 112 px frame and bled into the adjacent "Run
+   target" frame. Resized buttons to 160 / 176 / 144 / 80 px,
+   matching the actual rendered text width plus 16 px padding.
+
+4. **Function signatures clipped at right edge** when the body uses
+   the same `UI_FONT_SZ=16` as the title. Added a separate
+   `_TB_BODY_FONT_SZ = 8` constant inside the_bug, used by
+   `_tb_draw_line` only. Section titles still use 16 (hierarchy);
+   body lines use 8 (density). Long signatures like
+   `_thread_spawn(tid_buf: word, start_fn: word) - unknown` now fit.
+
+5. **Bottom status bar overlapping with the function list** on
+   long programs. The clip region `_tb_ph` was set to the full
+   panel height, so list lines could be drawn over the status row
+   at `py + ph - 20`. Shrank `_tb_ph` to `ph - 24` so the list
+   stops 4 px above the status row. Single chokepoint; both
+   `_tb_draw_line` and `_tb_draw_section` honor `_tb_ph`.
+
+Files: `tools/the_bug/the_bug_lib.bsm` (5 small edits) +
+`games/pathfind/build/pathfind.bug` regenerated.
+
+The structural cause behind several of these — text wider than panel
+not handled by `draw_text` — is documented as a known limitation in
+the source comment. Future fix would be wrap or ellipsis truncate
+in `draw_text`; not worth doing reactively until another long
+message hits the same pattern.
+
+## 2026-04-30 (evening) — bug Phase 6.1 — minisym section emission
+
+Started Phase 6 of the bug roadmap (runtime symbolication path).
+Stage 6.1 lands the binary side: every native binary now carries a
+small `(addr, name)` table next to its code so future runtime code
+can resolve PCs to function names without touching the .bug file.
+
+Format (compact, ~10-20 KB for typical programs):
+
+```
+u32 minisym_magic = 0x4D53594D ("MSYM")
+u32 entry_count
+u32 strtab_size
+u32 reserved (first 4 bytes of build_id, sanity check)
+[entry_count × 8 bytes]:
+    u32 func_addr_off  (offset from text_base)
+    u16 name_off       (offset into strtab)
+    u16 name_len
+[strtab_size bytes]    (packed names, no terminators)
+```
+
+Files added:
+
+- `src/bpp_minisym.bsm` (new) — `bug_emit_minisym(out_buf)` walks
+  `bug_fn_*` tables and writes the format above. Sorted by addr at
+  emit time so future binary search is trivial.
+
+Files modified:
+
+- `src/backend/target/aarch64_macos/a64_macho.bsm` — emit `__minisym`
+  section in `__DATA` segment. `mo_ncmds` and `mo_sizeofcmds` updated;
+  `mo_code_off` recomputed for the larger `__DATA`. Page count math
+  (the 2026-04-13 landmine) was already correct for arbitrary
+  `__DATA` sizes thanks to the `(mo_data_size + 16383) / 16384`
+  formula in `mo_write_lc_segment_data`.
+- `src/backend/target/x86_64_linux/x64_elf.bsm` — emit a second
+  note record inside the existing `PT_NOTE` (name `"BPPMINI\0"`,
+  `n_type = 0x42504d49`). Avoids bumping `elf_phnum`. The note
+  shares the program header with the GNU build_id note, walking
+  is sequential.
+
+Companion side quest: `install.sh` now copies `bug_shared.bsm`
+to `$LIB_DIR` with a presence sanity check (logs a clear error if
+any of the bug_* libs are missing post-install — was a pain point
+for users running the_bug from sub-directories).
+
+Verification:
+- `xxd ./bpp | grep MSYM` finds the magic.
+- `otool -l ./bpp | grep __minisym` shows the section.
+- `readelf -n ./bpp_lin | grep BPPMINI` shows the note.
+- Suite 118/3/11 (3 GPU codesign flakes preexisting).
+- C suite 103/0/29.
+- `bug_tui.sh` PASS.
+- Bootstrap byte-stable.
+
+Stage 6.2 (runtime locate + resolver + caller_pc / caller_name
+builtins) deferred to the next session for fresh focus on the
+PIE-aware Mach-O walk and the C-emitter graceful-fallback wiring.
+
+## 2026-04-30 (docs) — multicore state report + bootstrap manual additions
+
+Two doc-only artifacts shipped this evening, both born from the
+"if C/C++ knew about multi-core in 1972, what would they have done
+differently" design discussion.
+
+- `docs/multicore_state_report.md` (new, 670 lines) — empirical
+  audit of B++'s existing parallelism. Confirmed the auto-dispatch
+  pipeline (`find_dispatch_candidates` → `synthesize_loop_fn` →
+  `rewrite_dispatch_loops`) actually rewrites for-loops into
+  `job_parallel_for(N, fn_ptr(synth))` calls in the default
+  pipeline. Disassembly of `test_smart_dispatch.bpp` shows
+  `bl _job_parallel_for` instead of an inline loop — proof that
+  effect-driven auto-parallelization is shipping today, not
+  roadmap. Doc includes priority-ordered gap list (Linux thread
+  parity, reduction support, stride != 1, channels, atomics, CPU
+  detection) with LOC estimates and Sprint plan.
+
+- `docs/bootstrap_manual.md` — gained two new conceptual sections
+  (placed between existing structural sections to teach
+  fundamentals before specifics):
+  - **Architecture — The Six-Layer Cake** (line 72) — diagram of
+    the host / meta / programs / stb / compiler / backend stack,
+    with stability gradient (top changes daily, bottom changes
+    quarterly), risk gradient (top breaks one program, bottom
+    breaks every binary), skill gradient (top is beginner, bottom
+    is compiler engineer), dependency rule (top → bottom only),
+    and a community-growth pathway (day 1 to year 1+ contributor
+    progression).
+  - **Memory Access Model — Two Levels** (line 1026) — explanation
+    of why peek/poke default to byte while `*p` defaults to word.
+    Hardware is byte-addressable (Level 2); language-level
+    variables are word-shaped (Level 1). The `*p` syntax bridges
+    Level 1 to memory; peek/poke are the close-to-metal Level 2
+    primitives. Tables show the full primitive family
+    (peek_b/h/q/w + peekfloat/peekfloat_h) with their ARM64 / x86_64
+    instruction mappings, plus the rule that low-level primitives
+    default to byte (close-to-metal), language sugar defaults to
+    word (close-to-language), and typed APIs (arr_*, buf_*,
+    str_*) make it explicit (close-to-intent).
+
+Both sections directly answer the recurring "but isn't B++ behind
+on multi-core?" question: the answer is "no, B++ already has
+auto-parallelization more sophisticated than C/C++ with OpenMP,
+and the gaps are small incremental work, not architectural
+re-design." Source-cited and empirically verified, so future
+agents can stop re-deriving this every cold session.
+
+## 2026-05-01 — bug Phase 6.2a + 6.2b — runtime symbolication shipped
+
+Phase 6.2 lifts symbolication out of the .bug file dependency: a
+running B++ program can now resolve any PC to a function name by
+walking its own minisym section, without touching disk. Two stages
+land together because they're tightly coupled (resolver is useless
+without a locate primitive, locate is useless without a consumer).
+
+### Stage 6.2a — runtime locate minisym
+
+- **macOS** (`_core_macos.bsm` Section 4): walk back from
+  `fn_ptr(_runtime_locate_minisym)` page-aligned to find the Mach-O
+  magic, parse load commands, find `LC_SEGMENT_64 __DATA __minisym`,
+  cache `(addr, count, strtab)` in static globals.
+
+  Critical PIE bug surfaced and fixed during testing: under ASLR,
+  `section_64.addr` is the *link-time* virtual address (e.g.
+  `0x100020000`), not the runtime address. The runtime address
+  must be computed as `mach_header_load_addr + section_64.offset`
+  (the file offset). Reading `.addr` directly produced an
+  `EXC_BAD_ACCESS` on macOS 14+ where ASLR gives a randomized
+  base that's tens of MB away from `0x100000000`. The 4 bytes of
+  reserved build_id in the minisym header serve as a sanity check —
+  if they don't match the ones in `LC_UUID`, the lookup bails.
+
+- **Linux** (`_core_linux.bsm` Section 4): walk ELF program
+  headers from a fixed base of `0x400000` (B++'s static-link entry
+  point). Scan `PT_NOTE` entries for `BPPMINI\0` name; the
+  descriptor pointer is the start of the minisym blob. Same
+  caching strategy.
+
+### Stage 6.2b — `_runtime_resolve_pc` + name unpack helpers
+
+`src/bpp_runtime.bsm` (new contract file, auto-injected via
+`bpp_import.bsm` right after `bpp_thread.bsm`):
+
+```bpp
+_runtime_resolve_pc(pc) {
+    // Linear scan of minisym entries with running
+    // greatest-not-exceeding match. Returns packed
+    // (strtab_off << 32) | name_len, or 0 if not found.
+}
+
+_runtime_name_addr(packed) {
+    // Returns the runtime byte address of the resolved name,
+    // suitable for sys_write or buf_copy. 0 if packed == 0.
+}
+
+_runtime_name_len(packed) {
+    // Returns the byte length. 0 if packed == 0.
+}
+```
+
+`install.sh` ships `bpp_runtime.bsm` and `bpp_minisym.bsm` to the
+auto-inject lib directory.
+
+### Verification
+
+- gen2 == gen3 byte-stable (`BPP_BUILD_ID=0`).
+- Native suite 118/3/11 (3 GPU codesign flakes preexisting).
+- C suite 103/0/29.
+- `test_bug_tui.sh` PASS.
+- Linux ELF cross-compile: BPPMINI section at offset 276, MSYM
+  magic at offset 284 (sequential within `PT_NOTE`).
+- End-to-end probe: `_runtime_resolve_pc(fn_ptr(foo))` →
+  packed → unpack → `"foo"` (3 bytes). Same for `bar`, `main`.
+
+Stage 6.2c (`caller_pc` / `caller_name` builtins) paused for the
+same-day fresh-context session.
+
+## 2026-05-01 (later) — bug Phase 6.2c — caller_pc + caller_name (Phase 6.2 done)
+
+Closes Phase 6.2 with the user-facing builtins that compose into
+"name of the function I'm in" or "name of who called me."
+
+### Design split
+
+- `caller_pc(n)` is a **builtin** because reading the frame pointer
+  and walking it requires chip-specific assembly. ARM64 reads x29;
+  x86_64 reads rbp.
+- `caller_name(pc)` is a **regular B++ function** in
+  `bpp_runtime.bsm` — a one-line wrapper over
+  `_runtime_resolve_pc(pc)`. No chip-specific code, so making it a
+  builtin would only add 4-layer wiring with no benefit.
+
+### Semantic
+
+- `caller_pc(0)` → current PC inside the calling function (via
+  `ADR x0, .` on ARM64, `LEA rax, [rip]` on x86_64).
+- `caller_pc(n)` for `n >= 1` → walk `n - 1` frames up the FP chain,
+  then read saved LR (return address) at `[FP + 8]`.
+
+So `caller_name(caller_pc(0))` names the current function;
+`caller_name(caller_pc(1))` names its direct caller; and so on.
+
+### Implementation (~150 LOC across 8 files)
+
+| File | Change |
+|---|---|
+| `src/bpp_codegen.bsm` | new `emit_caller_pc` slot in ChipPrimitives; `caller_pc` arm in `cg_builtin_dispatch` |
+| `src/backend/chip/aarch64/a64_primitives.bsm` | `_a64_emit_caller_pc` — 9-instruction inline FP walk with cbz fast path for n=0 |
+| `src/backend/chip/x86_64/x64_primitives.bsm` | `_x64_emit_caller_pc` — equivalent walk via rbp + LEA RIP for the n=0 case |
+| `src/backend/chip/aarch64/a64_codegen.bsm` | wire `p.emit_caller_pc = fn_ptr(_a64_emit_caller_pc)` |
+| `src/backend/chip/x86_64/x64_codegen.bsm` | wire `p.emit_caller_pc = fn_ptr(_x64_emit_caller_pc)` |
+| `src/bpp_validate.bsm` | accept `caller_pc` in `val_is_builtin` |
+| `src/backend/c/bpp_emitter.bsm` | graceful fallback `caller_pc(n)` → `((void)(n), 0LL)` (no minisym in --c builds) |
+| `src/bpp_runtime.bsm` | add `caller_name(pc)` regular function = wrapper over `_runtime_resolve_pc` |
+
+### Verification
+
+- gen1 == gen2 == gen3 byte-stable.
+- Native suite 121/0/11 (GPU flakes recovered between sessions).
+- C suite 103/0/29.
+- `test_bug_tui.sh` PASS.
+- ARM64 native end-to-end:
+  ```
+  fn_a says my name is: fn_a    (caller_pc(0) inside fn_a → "fn_a")
+  main says my name is: main    (caller_pc(0) inside main → "main")
+  ```
+- Linux ELF cross-compile: `caller_name` symbol present in
+  minisym strtab; BPPMINI + GNU build_id notes intact.
+- C emitter graceful: empty strings returned (sys_write of 0
+  bytes), no crash, exit 0.
+
+### Tree state
+
+Phase 6.2 done. The `caller_pc` / `caller_name` pair gives any
+B++ program built-in introspection of its own call stack, no
+external observer needed. Phase 6.3 (panic with stack trace) is
+the natural next stage — it's the first user of the
+caller_pc-walk-then-resolve pattern this stage just enabled.
+
+Suite at end: 121/0/11 native + 103/0/29 C + bug_tui PASS.
+Bootstrap byte-stable. Roadmap on track for Phase 6.3 (~1 session)
++ Sprint 4 atomics (~½ session) + Phase 6.4.1 cooperative profiler
+(~1-2 sessions) per the consolidated execution plan.

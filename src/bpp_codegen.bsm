@@ -376,6 +376,17 @@ struct ChipPrimitives {
                               //   fh_sl ∈ {SL_HALF=32-bit, SL_FULL=64-bit}.
                               //   x86_64 limitation: SL_HALF stores bitcast bits (wrong for
                               //   sub-word float); full fix needs cvtsd2ss + movss.
+
+    // Phase 6.2c — caller_pc(n). On entry, n is in result reg
+    // (x0/rax). On exit, the chosen frame's PC is in result reg.
+    // Semantics:
+    //   n == 0 → current PC (a PC inside the calling function),
+    //            obtained via ADR x0, . on ARM64 or LEA rax, [rip] on x86_64
+    //   n >= 1 → walk (n-1) frames up the FP chain, then read the
+    //            saved LR / return address at FP+8 of that frame.
+    // So caller_name(caller_pc(0)) names the current function,
+    // caller_name(caller_pc(1)) names its direct caller, etc.
+    emit_caller_pc,           // () — n in result reg, PC out in result reg
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -428,7 +439,8 @@ void cg_init_cc() {
 extrn CG_SYS_EXIT, CG_SYS_READ, CG_SYS_WRITE, CG_SYS_OPEN, CG_SYS_CLOSE,
       CG_SYS_FORK, CG_SYS_EXECVE, CG_SYS_WAIT4, CG_SYS_GETDENTS,
       CG_SYS_UNLINK, CG_SYS_PTRACE, CG_SYS_LSEEK, CG_SYS_FCHMOD,
-      CG_SYS_SOCKET, CG_SYS_CONNECT, CG_SYS_MKDIR, CG_SYS_MMAP, CG_SYS_MUNMAP;
+      CG_SYS_SOCKET, CG_SYS_CONNECT, CG_SYS_MKDIR, CG_SYS_MMAP, CG_SYS_MUNMAP,
+      CG_SYS_SELECT;
 void cg_init_sys_ids() {
     CG_SYS_EXIT     = 0;
     CG_SYS_READ     = 1;
@@ -448,6 +460,7 @@ void cg_init_sys_ids() {
     CG_SYS_MKDIR    = 15;
     CG_SYS_MMAP     = 16;
     CG_SYS_MUNMAP   = 17;
+    CG_SYS_SELECT   = 18;
 }
 
 // ── Phase 3.4 portable helpers (called from chip emit_node) ──
@@ -1264,6 +1277,22 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: caller_pc(n) — PC at depth n on the FP chain.
+    // n == 0 returns the current PC (a PC inside the calling
+    // function); n >= 1 walks (n-1) frames up and returns that
+    // frame's saved return address. Pairs with the regular
+    // B++ function `caller_name(pc)` defined in bpp_runtime.bsm
+    // so callers can render their own backtraces without the
+    // runtime observer. Phase 6.2c — see _a64_emit_caller_pc /
+    // _x64_emit_caller_pc for the inlined FP walk shape.
+    if (cg_str_eq(n.a, "caller_pc", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_caller_pc);
+        return 1;
+    }
+
     // Built-in: shr(value, shift) — logical right shift (unsigned,
     // fills with zeros). Distinct from `>>` operator which is
     // arithmetic (sign-extending). Spine preserves the chip's
@@ -1604,6 +1633,34 @@ cg_builtin_dispatch(n) {
         ety = call(p.emit_node, *(arr + 0));
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_syscall, CG_SYS_MMAP, 6, -1, 0);
+        return 1;
+    }
+
+    // Built-in: sys_select(nfds, rfds, wfds, efds, tv) — wait for
+    // file descriptors to become ready. 5 args. Returns the number
+    // of ready descriptors, 0 on timeout, -1 on error. Used by the
+    // bug debugger's async observer to peek the GDB socket without
+    // blocking the GUI frame loop: select(nfds, &rfds, 0, 0, &{0,0})
+    // polls instantly and reports whether the next read can proceed.
+    if (cg_str_eq(n.a, "sys_select", 10)) {
+        auto arr, ety;
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 32));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 24));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 16));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 8));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_syscall, CG_SYS_SELECT, 5, -1, 0);
+        call(p.emit_syscall_norm_err);
         return 1;
     }
 

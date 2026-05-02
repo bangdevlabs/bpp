@@ -19,6 +19,12 @@
 
 set -u
 
+# Pin the build_id to all-zero so .bug files and binary metadata are
+# byte-stable across runs. Without this every test run produces a
+# different .bug header (and a different LC_UUID / NT_GNU_BUILD_ID),
+# making byte-comparison tests flaky and bootstrap diff misleading.
+export BPP_BUILD_ID=00000000000000000000000000000000
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BPP="$REPO_ROOT/bpp"
 TESTS_DIR="$REPO_ROOT/tests"
