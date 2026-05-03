@@ -1,5 +1,83 @@
 # B++ Bootstrap Journal
 
+## 2026-05-03 — Float field type propagates through T_MEMLD
+
+The Wolf3D handoff documented a "small workaround" for `auto p:
+FPSBody; p.x` patterns: passing `p.x` to a float-param function
+emitted E240 ("argument is int but param is float"), so the
+previous agent introduced typed-local copies (`auto px: float;
+px = p.x;`) before each call. The note asked future agents not
+to strip the workaround.
+
+Investigated and found a 4-line bug in `bpp_types.bsm`. The
+parser's `resolve_dot` (line 2274) builds T_MEMLD nodes and
+stores the field's packed type in `n.b` — exactly so codegen
+can emit the right LDR/LDRH/LDR-d0 for the field width and
+base. The codegen reads `n.b` correctly. The type-checker did
+not: `add_type` for T_MEMLD hard-coded `n.itype = TY_WORD`
+regardless of the field's annotation. So the bits were loaded
+correctly into d0 at the LDR site, but the expression's
+visible type was always int — and the call-site argument
+checker (which compares expression type to param type) raised
+E240 even though the field was annotated `: float`.
+
+This is **not** the same dor as the Mar-2026 `put(x)` smart-
+dispatch story. There the user genuinely could not tell the
+compiler what they meant; the cure was the `: float`
+annotation system + W/E codes. Here the user already said
+`: float` in two places (struct field + function param) and
+the compiler dropped that information on the floor going
+through `T_MEMLD`. Adding a third annotation surface would be
+asking the user to repeat themselves.
+
+Fix: read the field hint when present.
+
+```
+if (t == T_MEMLD) {
+    auto fty;
+    add_type(n.a);
+    if (n.b != 0) {
+        fty = ty_make(ty_base(n.b), ty_slice(n.b));
+        n.itype = fty;
+        return fty;
+    }
+    n.itype = TY_WORD;
+    return TY_WORD;
+}
+```
+
+The `ty_make(ty_base, ty_slice)` round-trip strips the bit-
+offset bits that `resolve_dot` packs into the upper byte for
+SL_BIT..SL_BIT7 fields, so we recover just the type. Bare
+`*(ptr)` dereferences leave `n.b == 0` and fall through to
+TY_WORD as before.
+
+**Side discovery**: the C emitter has a separate latent bug
+where `&local_struct` (a `var: T` declaration) emits
+`&((long long)(stk))` — `&` on an rvalue cast — because the C
+emitter models `var T` as a pointer-by-value rather than a
+stack slot. Native codegen hides the asymmetry by emitting
+`add x0, fp, #-offset`. The C path forces the design tension
+into view. Not a blocker (the wolf3d real path uses heap
+allocation via `fps_body()`) but worth flagging as C-emitter
+tech debt: `var T` semantics need to be uniform across
+backends, or `&var_struct` should be a documented native-only
+pattern. Tracked here, not fixed.
+
+**Wolf3D**: typed-local workaround in `wolf3d_render_phase`
+removed; `cast_ray(hit, col, SCREEN_W, p.x, p.y, p.angle, FOV,
+world_map)` now compiles directly. Session 1 starts without
+the dívida.
+
+**Verification**:
+- New regression test `test_struct_field_float_propagation.bpp`
+  (heap-pointer pattern; uses malloc to dodge the C-emitter
+  `&var` issue noted above).
+- Native suite: 127 passed, 0 failed, 12 skipped.
+- C suite: 106 passed, 0 failed, 33 skipped.
+- Bootstrap byte-stable: gen1 == gen2 == gen3 ==
+  `d11d4153eb201289eacff76fe86d538359c1d2ff`.
+
 ## 2026-04-28 — 🧹 TONIFY V1+V2: FULL REPO FAXINA + OPERATORS + POINTER PRIMITIVES
 
 Two-session sweep that brought the entire B++ codebase — compiler, stdlib, games,
