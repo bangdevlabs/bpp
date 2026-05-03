@@ -7,19 +7,18 @@ through the platform's remote stub (`debugserver` on macOS,
 a B++ program reading a B++-defined format and speaking the GDB
 remote serial protocol directly.
 
-The debugger ships in two binaries:
+The debugger ships as a single binary, **`bug`**, built from
+`tools/the_bug/the_bug.bpp`. The same engine drives three modes
+chosen at the command line. The earlier split into a CLI-only
+`src/bug.bpp` and a separate GUI `the_bug` was retired during
+0.23.x — `bug` now does both. The build still installs the
+binary as `./bug` at the repo root for convenience; the source
+lives in `tools/the_bug/`.
 
-- **`bug`** — the legacy CLI in `src/bug.bpp`. Pure terminal
-  experience. Best for "I'm in the shell, run this under bug".
-- **`the_bug`** in `tools/the_bug/` — same engine wrapped with a
-  GUI. Open `.bug` files, browse the debug map visually, run the
-  target under live observation with watch + viz panels updating
-  on every breakpoint. Best for "I want to see what's happening
-  inside the program as it runs."
-
-Both link the same observer module (`bug_observe_<os>.bsm`) and
-debug-map reader, so any feature documented here works in both.
-The GUI panels are layered on top.
+The observer module (`bug_observe_<os>.bsm`) and debug-map
+reader are shared across modes, so any feature documented here
+works regardless of how you launched the debugger. The GUI
+panels are layered on top of the same engine.
 
 This document covers every feature the debugger exposes today.
 
@@ -27,20 +26,26 @@ This document covers every feature the debugger exposes today.
 
 ## Three modes
 
-The CLI dispatches on the first non-flag argument:
+The CLI dispatches on the first non-flag argument and the
+explicit `--dump` / `--tui` overrides:
 
 ```
-bug hello.bug                       # dump mode (legacy `bug --dump`)
+bug                                 # GUI: file picker, browse a .bug
+bug hello.bug                       # GUI: open with .bug pre-loaded
+bug --dump hello.bug                # dump the .bug map to stdout (text)
 bug --tui ./hello                   # TUI live observation + REPL
-the_bug                             # GUI: file picker, browse, run
-the_bug hello.bug                   # GUI: open with .bug pre-loaded
 ```
 
-| Mode  | Binary    | What you get |
+| Mode  | Invocation | What you get |
 |-------|-----------|--------------|
-| Dump  | `bug` / `the_bug --dump file.bug` | Static text dump of the `.bug` map |
-| TUI   | `bug --tui ./prog` | Live trace + REPL in the terminal |
-| GUI   | `the_bug [file.bug]` | Window with map browser + live panels |
+| GUI   | `bug` or `bug file.bug` | Window with map browser + live panels |
+| Dump  | `bug --dump file.bug`  | Static text dump of the `.bug` map (~2 k lines for the compiler) |
+| TUI   | `bug --tui ./prog`     | Live trace + REPL in the terminal |
+
+**Heads up — `bug file.bug` opens the GUI, not the dump.** A
+`.bug` file argument without `--dump` launches the windowed
+inspector. From a headless shell or CI that hangs waiting for an
+event loop. Always pass `--dump` when you want text on stdout.
 
 ### Building a target with debug info
 
@@ -91,11 +96,14 @@ future release.
 
 ## Dump mode — inspecting the debug map
 
-`bug file.bug` (or `the_bug --dump file.bug`) parses a `.bug`
-file and prints every section the compiler emitted. Useful for
-confirming functions, structs, globals, externs, and source
-positions landed where you expected before touching the program
-at all.
+`bug --dump file.bug` parses a `.bug` file and prints every
+section the compiler emitted to stdout. Useful for confirming
+functions, structs, globals, externs, and source positions
+landed where you expected before touching the program at all.
+
+Plain `bug file.bug` (no `--dump`) opens the GUI inspector
+instead — same data, different surface. Pick the mode by
+context: dump for grep-friendly text, GUI for click-to-explore.
 
 Output sections, in order:
 

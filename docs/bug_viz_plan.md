@@ -23,7 +23,7 @@ Phase 1 infrastructure is already in place:
 | SIGTRAP handler (breakpoint hit) | `bug_observe_macos.bsm:622` | ✅ done |
 | Global name + type + storage class | `bug_gl_name/type/class` in `.bug` | ✅ done |
 | **Global variable address** (offset in __DATA) | not in `.bug` format | ❌ missing |
-| `--watch` CLI flag | not in `bug.bpp` | ❌ missing |
+| `--watch` CLI flag | landed in `tools/the_bug/the_bug.bpp` | ✅ done |
 | Type-aware display (struct tree, array, string) | none | ❌ missing |
 | Expression evaluator | none | ❌ missing |
 | Interactive TUI | none | ❌ missing |
@@ -88,7 +88,7 @@ and prints the function name. Add one call to `_print_crash_locals(fi, text_base
 right after printing the function entry. Currently `_print_crash_locals` only runs
 on fatal signals; it works identically on breakpoints.
 
-**In `bug.bpp`**: Parse `--watch name[,name2,...]`. Store watched names in an
+**In `tools/the_bug/the_bug.bpp`**: Parse `--watch name[,name2,...]`. Store watched names in an
 array. Pass it into `bug_run`. In the SIGTRAP handler, if the watch list is
 non-empty, filter `_print_crash_locals` to only the named variables instead of
 all locals.
@@ -102,7 +102,7 @@ a `u32 data_offset` per entry. In `bug_observe_macos.bsm`, compute
 **Deliverable**: `bug --watch player,score ./platformer` prints current local
 values every time execution stops. Globals (like `score`) readable by name.
 
-**Files touched**: `bug.bpp` (~20 lines), `bug_observe_macos.bsm` (~10 lines),
+**Files touched**: `tools/the_bug/the_bug.bpp` (~20 lines), `bug_observe_macos.bsm` (~10 lines),
 `bpp_bug.bsm` (~15 lines for data offset emit), `bug_reader.bsm` (~5 lines).
 
 **No new module needed.** The plan initially proposed `bug_eval.bsm` but the
@@ -184,7 +184,7 @@ Terminal: raw ANSI escape sequences, cursor positioning.
 **Deliverable**: interactive debugging session. Equivalent to a basic IDE
 debugger panel running in the terminal.
 
-**Files**: new `bug_tui.bsm`, `bug.bpp` gains the REPL main loop.
+**Files**: new `bug_tui.bsm`, `tools/the_bug/the_bug.bpp` gains the REPL main loop.
 
 ---
 
@@ -288,7 +288,7 @@ resolver PCs sem depender do `.bug` separado. Habilita três
 features (panic com stack trace, `caller(n)` introspection,
 sampling profiler).
 
-Profiler é **multi-thread aware desde v1** — programa B++
+testProfiler é **multi-thread aware desde v1** — programa B++
 típico já roda múltiplas threads (audio callback + bpp_job
 workers). Single-thread profiler vê só ~20% do programa.
 Solução: cooperative sampling em bpp_job/maestro (zero
