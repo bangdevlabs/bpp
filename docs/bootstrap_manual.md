@@ -389,6 +389,24 @@ my_func() {
 
 All code comments must be in English, written like a user manual.
 
+### Dot notation is prose-only, not syntax
+
+B++ has a **single flat namespace**. Every imported symbol — structs,
+functions, constants from any `import "stbX.bsm"` — lives in one
+global pool with no per-file qualification. To call `palette_get`
+from `stbpal.bsm` you just write `palette_get(...)`, never
+`stbpal.palette_get(...)`. The same goes for struct names: you
+write `Palette`, not `stbpal.Palette`.
+
+In documentation and code comments it's often useful to spell out
+which cartridge a symbol comes from for cross-file traceability —
+e.g. "the `Palette` struct (from `stbpal.bsm`)" or "calls
+`palette_get` (defined in stbpal)". Some older docs used a
+shorthand `stbpal.Palette` for the same intent. **That shorthand
+is prose only**: it never appears in real B++ source. New docs
+should prefer the parenthetical "from stbX" form to avoid
+suggesting it's callable syntax.
+
 ## Testing Changes
 
 ### Simple Smoke Test

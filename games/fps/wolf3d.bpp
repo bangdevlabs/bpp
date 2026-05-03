@@ -1,0 +1,239 @@
+// wolf3d.bpp — Wolfenstein 3D-style ray caster, Phase 1 entry point.
+//
+// Goal of Phase 1: ray cast a small grid map and render textured
+// vertical wall strips to the screen, with player movement (WASD +
+// rotate). No sprites, no enemies, no audio, no doors — that's
+// Phase 2+. This Phase 1 alone is the "you can walk through a textured
+// maze" milestone that proves B++ can ship a classic 3D game.
+//
+// Architecture is maestro-driven (matches snake_maestro.bpp pattern):
+//   solo phase   — input handling + player state mutation
+//   base phase   — per-column ray cast (worker-parallelisable when
+//                  sprite list grows; Phase 1 main-thread is fine)
+//   render phase — flush column strips to GPU layer
+//
+// Why ray casting (not full 3D): Wolfenstein 3D used 2D grid + ray
+// casting precisely because it ran on 1992 hardware. The algorithm
+// is mathematically clean (DDA traversal, ~30 ops per ray), maps
+// perfectly onto column-parallel work (each screen column is
+// independent), and has a well-documented implementation tutorial
+// (Lode Vandevenne's raycasting tutorial — lodev.org/cgtutor/raycasting).
+// Modern hardware runs 640 columns × 60fps × ~30 ops = ~1.2M float
+// ops/sec which is ~0.04% of an M4 P-core. The whole game is
+// trivially within budget; the work is in writing it cleanly, not in
+// hitting performance.
+//
+// Phase 1 deliverable: open window, see textured walls, walk around.
+// Phase 1 stretch goal: 60fps confirmed via the Phase 6 profiler,
+// which is THE point of doing this — close the ouroboros loop where
+// the profiler gets used on a real game and reveals what (if
+// anything) needs Tier F compiler optimization.
+
+// stbgame auto-injects: stb_core, bpp_io, bpp_array, bpp_buf,
+// bpp_str, bpp_math, bpp_beat, bpp_job, bpp_maestro, _stb_platform.
+// Explicit imports below cover stb cartridges this game opts into.
+//
+// stbraycast is the new (with this project) generic 2.5D ray cast
+// cartridge — the DDA algorithm + projection math live there
+// because they're not Wolf3D-specific. Any future B++ game that
+// wants 2.5D walls imports the same module.
+//
+// Composition: stbraycast pulls in stbtile (map representation) and
+// stbpal (palette lookup) transitively; we import them explicitly
+// here too so the dependency is visible in this file (not hidden in
+// stbraycast). stbgame auto-injects core runtime; stbasset is for
+// Phase 2 texture loading.
+import "stbgame.bsm";
+import "stbtile.bsm";      // Tilemap struct (replaces hand-rolled byte grid)
+import "stbpal.bsm";       // Palette + built-ins (PAL_DB_32, PAL_PICO_8...)
+import "stbphys.bsm";      // FPSBody from Chapter FPS — player state
+import "stbrender.bsm";    // Layer + framebuffer + draw primitives
+import "stbasset.bsm";     // PNG loading for wall textures (Phase 2)
+import "stbraycast.bsm";   // cast_ray + raycast_draw_column
+
+// ── Compile-time constants ─────────────────────────────────
+
+const SCREEN_W = 640;
+const SCREEN_H = 480;
+const FPS = 60;
+const N_WORKERS = 4;       // Phase 2 sprite/enemy parallelism
+
+// Map is 16x16 cells, 1.0 unit per cell. Float coordinates within
+// cells; integer cell index is floor(x), floor(y).
+const MAP_W = 16;
+const MAP_H = 16;
+
+// ── Game state (read by all phases, mutated by solo) ───────
+
+// Field of view in radians. 60° is the Wolf3D classic.
+// 60 * π / 180 ≈ 1.0472. Held as a global so init can compute it
+// once at startup; B++ doesn't fold transcendental constants at
+// compile time, so const is not the right shape.
+global FOV: float;
+
+// Player body — FPSBody from stbphys's Chapter FPS. Holds position,
+// angle, hitbox radius, and movement tuning together so the solo
+// phase (Session 3) can call fps_walk / fps_turn against it. For
+// Session 1 the body is allocated once in init and stays static
+// (no input handling yet).
+extrn player;
+
+// ── World state (read-only after init) ─────────────────────
+
+// Tilemap holding the level. Created via stbtile.tile_new in init,
+// populated by _wolf3d_init_map. Walls = solid cells (set via
+// tile_solid). The raycaster walks `world_map.data` and stops on
+// any cell where tile_is_solid returns true.
+extrn world_map;
+
+// Wall-colour palette. Phase 1 picks one of stbpal's built-ins
+// (PAL_DB_32 has 32 distinct tones — plenty of headroom for the
+// Wolf3D-style 4-6 wall types). Phase 2 will keep the palette for
+// tinting textured walls; the texture pixels override colour but
+// the palette stays for HUD / minimap etc.
+extrn wall_palette;
+
+// Single RayHit buffer reused across every column of every frame.
+// Allocated once in init. Passing the same pointer to cast_ray each
+// column avoids ~38400 mallocs/sec at SCREEN_W × FPS, which would
+// dominate the frame budget.
+extrn ray_hit;
+
+// ── Maestro phase callbacks ────────────────────────────────
+
+// One-shot init phase: allocate Tilemap, palette, RayHit buffer,
+// player FPSBody. Loads wall textures (Phase 2). The map layout
+// is hardcoded for Phase 1 Session 1; Session 4 will replace
+// _wolf3d_init_map with an ASCII-file loader.
+static wolf3d_init_phase() @io {
+    FOV = 1.0472;            // 60° in radians
+
+    // Player FPSBody. Session 1: starts at the middle of the map
+    // facing east (+x). Session 3 will start handling input via
+    // fps_walk / fps_turn; for now the body is static. Tuning:
+    //   radius 0.3   — fits comfortably inside a 1.0 cell with margin
+    //   move_spd 3.0 — 3 cells/sec ≈ Wolf3D's classic walking speed
+    //   turn_spd 2.0 — 2 rad/sec ≈ a full rotation in ~3 seconds
+    player = fps_body(8.0, 8.0, 0.0, 0.3, 3.0, 2.0);
+
+    // Tilemap: 16x16 grid, tile pixel size irrelevant for raycast
+    // (we treat cells as 1.0×1.0 world units, not pixels), pass 1,1
+    // to satisfy tile_new's signature.
+    world_map = tile_new(MAP_W, MAP_H, 1, 1);
+    _wolf3d_init_map();      // populates cells via tile_set + tile_solid
+
+    // Pick a palette. PAL_DB_32 (DawnBringer 32) has good wall-tone
+    // variety; we'll index with hit.wall_type. Phase 2 may switch to
+    // a custom palette tuned for the wall textures.
+    wall_palette = PAL_DB_32;
+
+    // RayHit buffer for the per-column dispatch loop.
+    ray_hit = malloc(16);    // sizeof(RayHit) padded — 4+4+1+1bit + slack
+
+    _wolf3d_load_textures();
+    return 0;
+}
+
+// Solo phase: input + player state. Phase 1 stub — Session 3 fills
+// this in. For Session 1, keep player static so the ray caster's
+// output is reproducible frame-to-frame (easier debugging).
+static wolf3d_solo_phase(dt: float) @solo {
+    // TODO Session 3: WASD strafe/walk, arrow keys turn.
+    // For now: no-op so initial position renders identically every frame.
+    return 0;
+}
+
+// Base phase: parallelisable work. Phase 1 is empty (per-column ray
+// cast happens in render because it produces pixels). Phase 2 will
+// push sprite sort + enemy AI here.
+static wolf3d_base_phase(dt: float) @base {
+    // No parallel base work in Phase 1.
+    return 0;
+}
+
+// Render phase: one ray per screen column, draw vertical wall strip.
+// Session 1 ships this with flat colour (no textures); Session 2 adds
+// texture sampling. The actual cast + draw lives in stbraycast — the
+// game-side loop just iterates columns and feeds player state +
+// Tilemap + Palette in.
+//
+// `ray_hit` is the shared buffer allocated in init. cast_ray fills
+// it from the Tilemap; raycast_draw_column reads it and looks up
+// the column colour in `wall_palette`. Reusing the same buffer per
+// column avoids per-ray malloc.
+static wolf3d_render_phase(alpha) @gpu {
+    auto col;
+    auto hit: RayHit;
+    auto p: FPSBody;
+    hit = ray_hit;
+    p = player;
+    for (col = 0; col < SCREEN_W; col++) {
+        cast_ray(hit, col, SCREEN_W,
+                 p.x, p.y, p.angle, FOV,
+                 world_map);
+        raycast_draw_column(hit, col, SCREEN_W, SCREEN_H, wall_palette);
+    }
+    return 0;
+}
+
+// Quit phase: cleanup. Phase 1 has nothing to free yet (textures
+// will be Phase 2; map_data is small enough to leak at process exit).
+static wolf3d_quit_phase() @io {
+    return 0;
+}
+
+main() {
+    maestro_set_workers(N_WORKERS);
+    maestro_register_init(fn_ptr(wolf3d_init_phase));
+    maestro_register_solo(fn_ptr(wolf3d_solo_phase));
+    maestro_register_base(fn_ptr(wolf3d_base_phase));
+    maestro_register_render(fn_ptr(wolf3d_render_phase));
+    maestro_register_quit(fn_ptr(wolf3d_quit_phase));
+    game_run(SCREEN_W, SCREEN_H, "B++ Wolf3D", FPS);
+    return 0;
+}
+
+// ── Internal helpers ───────────────────────────────────────
+
+// Populates `world_map` with a small test maze so Session 1 has
+// visible walls. Marks wall types as solid via tile_solid so the
+// raycaster's tile_is_solid check stops on walls but lets the
+// player walk through cell value 0 (empty).
+//
+// Layout (1 = wall, 0 = empty):
+//   ################
+//   #..............#
+//   #..#####.......#
+//   #..#...#.......#
+//   #..#...#.......#
+//   #..#####.......#
+//   #..............#
+//   #......##......#
+//   #......##......#
+//   #..............#
+//   #.......######.#
+//   #..............#
+//   #....##.....##.#
+//   #....##........#
+//   #..............#
+//   ################
+//
+// TODO Session 1: walk the layout above; for each '#' character call
+//   tile_set(world_map, x, y, 1)
+// then mark wall type 1 as solid:
+//   tile_solid(world_map, 1)
+//
+// TODO Session 4: replace with an ASCII-file loader (still using
+// stbtile primitives, just reading the layout from
+// games/fps/assets/maps/level1.txt). Multiple wall types ('#', '@',
+// '%') map to type ids 1, 2, 3 with tile_solid called on each.
+static void _wolf3d_init_map() {
+    // Stub — Session 1 fills in the loop over the layout above.
+}
+
+// Phase 2 will load textures from assets/wolf3d/walls/*.png via
+// stbasset. Phase 1 Session 1 keeps walls flat-coloured (no texture
+// sampling); Session 2 wires textures in.
+static void _wolf3d_load_textures() {
+    // TODO Session 2: load wall_brick.png, wall_stone.png, wall_wood.png.
+}

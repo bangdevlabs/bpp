@@ -1,0 +1,147 @@
+// stbraycast.bsm — DDA ray casting for 2.5D wall renderers.
+//
+// Generic implementation of the algorithm Wolfenstein 3D, ROTT,
+// Catacomb 3-D, and many indie revivals share: each screen column
+// becomes one ray, the ray walks the integer grid via Digital
+// Differential Analyzer (DDA) until it hits a solid cell in a
+// Tilemap, and the perpendicular wall distance projects to a
+// vertical strip whose height is inverse-proportional to that
+// distance. Algorithm reference: lodev.org/cgtutor/raycasting.
+//
+// ── Composition with existing stb cartridges ───────────────
+//
+// stbraycast is intentionally minimal. It composes with cartridges
+// that already exist rather than reinventing them:
+//
+//   stbtile.Tilemap   — the map (cell data, dimensions, solid mask).
+//                       cast_ray walks `tm.data` via tile_get and
+//                       stops on tile_is_solid(tm, cell). Future
+//                       games loading levels with tile_new + the
+//                       Session 4 ASCII map loader plug straight in.
+//   stbpal.Palette    — colours for flat-fill (Phase 1) and tinting
+//                       (any phase). raycast_draw_column reads
+//                       palette_get(pal, hit.wall_type) for the
+//                       column's colour. Built-in palettes
+//                       (PAL_DB_32, PAL_PICO_8, etc.) work out of
+//                       the box.
+//   stbrender         — the actual pixel writes (render_vertical_strip
+//                       for Phase 1 flat fill, render_textured_strip
+//                       for Phase 2 textured walls).
+//
+// What stbraycast OWNS exclusively:
+//   - the DDA + projection math
+//   - the RayHit struct (compact, sub-word slices)
+//   - the per-column draw helper that ties cast_ray output to
+//     stbrender + stbpal lookups
+//
+// What stays in the calling game (NOT in stbraycast):
+//   - level layout (tile_set calls in init)
+//   - palette choice (which built-in or custom palette to use)
+//   - player state (position, angle, FOV — too FPS-specific for stb)
+//   - input mapping (WASD vs arrow keys vs gamepad)
+//   - assets (texture file paths)
+//
+// Why no `stbfps.bsm` for player state: FPS movement (no gravity,
+// no jump, rotation as primary input axis) is structurally different
+// from stbphys.Body (platformer-oriented). Promoting player state
+// to stb would either overspecialise stbphys or create a near-empty
+// stbfps. YAGNI until two games share the same FPS player shape.
+
+import "bpp_math.bsm";       // sqrt, sin, cos, abs
+import "stbtile.bsm";        // Tilemap, tile_get, tile_is_solid
+import "stbpal.bsm";         // Palette, palette_get
+import "stbrender.bsm";      // render_vertical_strip / render_textured_strip
+
+// ── Ray hit result ─────────────────────────────────────────
+
+// Compact result of one cast. Sub-word slices keep the struct in a
+// single cache line (~10 bytes payload, padded to 16). Fields:
+//
+//   distance:  half float (4 bytes) — perpendicular distance to wall
+//   tex_x:     half      (4 bytes) — 0..tex_width-1 column in texture
+//   wall_type: byte      (1 byte)  — 0 = miss, 1+ = Tilemap cell value
+//   side:      bit       (1 bit)   — 0 = NS-facing wall, 1 = EW-facing
+//
+// The bug debugger auto-expands struct fields when a programmer does
+// `bug --watch hit`, so debugging the ray cast hot loop in Phase 2
+// (when texture sampling involves fractional `tex_x`) shows
+// `.distance = 4.7, .tex_x = 47, .wall_type = 2, .side = 1` directly
+// rather than as opaque hex. That convenience is the reason RayHit
+// is a struct rather than a packed word.
+struct RayHit {
+    distance: half float,
+    tex_x: half,
+    wall_type: byte,
+    side: bit
+}
+
+// ── Public API ─────────────────────────────────────────────
+
+// Cast a single ray for the given screen column. The map argument
+// is a Tilemap (from stbtile); cells with `tile_is_solid(tm, val)`
+// true count as walls. Cells with value 0 (the default) and any
+// non-solid type are walkable.
+//
+// `hit` MUST be a caller-allocated RayHit buffer (see notes below).
+// On miss (ray escapes map without hitting a solid cell), the
+// function fills hit.wall_type = 0 and hit.distance with a sentinel
+// large value the caller can detect.
+//
+// Why caller-allocated buffer (not return-by-value):
+//   B++ doesn't return structs by value cleanly; the idiomatic
+//   pattern is "function fills caller-allocated buffer." Same model
+//   as `make_node` in the parser, `arr_new` in the array runtime,
+//   etc. A single 16-byte buffer reused across 38400 casts per
+//   second (640 cols × 60fps) keeps allocator pressure at zero.
+//
+// Performance: ~20-50 float ops per call (sin/cos for direction,
+// division for delta_dist, multiplication in the DDA loop). At
+// 640 columns × 60fps × ~30 ops average = ~1.2M float ops/sec,
+// well within budget on any modern CPU. Profile in Wolf3D Phase 1
+// Session 5 to confirm float ops actually use FPR registers
+// rather than degrading via missing `:float` annotations.
+//
+// TODO Session 1: implement DDA loop body. Reference:
+// lodev.org/cgtutor/raycasting Part 1 "Raycasting".
+void cast_ray(hit: RayHit, col: half, screen_w: half,
+              px: float, py: float, pang: float, fov: float,
+              tm) @io {
+    hit.distance = 1000.0;
+    hit.tex_x = 0;
+    hit.wall_type = 0;
+    hit.side = 0;
+}
+
+// Draw the vertical wall strip for one screen column, given the
+// ray hit result. Phase 1 ships flat-colour fill via
+// `render_vertical_strip(col, y_start, y_end, color)` where
+// `color = palette_get(pal, hit.wall_type)` (so wall type 1 might
+// be a brown palette entry, type 2 grey, etc.). Phase 2 swaps the
+// flat fill for `render_textured_strip(col, y_start, y_end, tex,
+// hit.tex_x, tex_y_step)` and the palette argument becomes
+// optional (texture pixels override palette).
+//
+// Projection math:
+//   line_height = screen_h / hit.distance       (clamped to screen_h)
+//   draw_start  = (screen_h - line_height) / 2
+//   draw_end    = draw_start + line_height
+//
+// `pal` is a Palette pointer from stbpal. The caller picks which
+// built-in (PAL_DB_32, PAL_PICO_8, ...) or custom palette fits the
+// art direction. A palette with at least N+1 entries (where N is
+// the highest wall_type value used in the map) is required.
+//
+// `hit.side` bit 0 = NS wall, 1 = EW wall. The body should darken
+// the EW colour by ~30% (classic Wolf3D look) so adjacent walls of
+// the same type read as distinct surfaces under perspective. The
+// darkening is colour-channel arithmetic, doesn't need extra
+// palette entries.
+//
+// TODO Session 1: implement projection + flat fill via
+// render_vertical_strip + palette_get.
+// TODO Session 2: switch to render_textured_strip with hit.tex_x.
+void raycast_draw_column(hit: RayHit, col: half,
+                         screen_w: half, screen_h: half, pal) @gpu {
+    // Stub — Session 1 fills this in. Compiles + links so the
+    // calling game's render loop can invoke it from day 1.
+}
