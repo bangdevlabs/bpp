@@ -16,6 +16,14 @@ the same.
 only tool that can build the compiler. If it gets corrupted, you must recover
 it from git (`git show HEAD:bpp > bpp && chmod +x bpp`).
 
+**When to run the bootstrap cycle (and when to skip it).** The cycle below
+exists to verify that a change to the compiler/runtime/backends still
+produces a byte-stable, suite-green binary. If your change touches none of
+those — pure documentation edits (`docs/**.md`), comment-only tweaks,
+README updates, journal entries — you do **not** need to bootstrap or run
+the suite. Doc edits cannot affect codegen. Save the ~2 minutes for the
+next real change.
+
 ## Quick Reference
 
 ```bash
@@ -556,6 +564,8 @@ The C emitter (`--c`) translates B++ to C99 source code on stdout. It is the uni
 - **Integer division precedence in compound assignment.** `sample *= bus_vol / 100` parses as `sample * (bus_vol / 100)`, which silently drops to zero whenever `bus_vol < 100`. The native backend ran the multiplication and division in the same pass and the bug only surfaced as inaudible voices in the mixer; the C emitter produced the same wrong output but it was easier to spot at the C level when reasoning about the desugared expression. Lesson: when reaching for `*=` or `/=`, only apply if the right-hand side is a single literal/identifier — see the tonify checklist Rule 14.
 
 - **`extrn` declarations colliding with function definitions.** B++'s native backend resolves cross-module function calls through the function table, so a leftover `extrn fn_name;` is harmless on the native path. The C emitter, however, emits the extrn as a C `extern long long fn_name;` — and C has a single namespace where a symbol cannot be both a variable and a function. The first sweep through `tests/run_all_c.sh` produced cascades of `error: redefinition of 'fn_name' as different kind of symbol` for primitives like `a64_emit_mov`, `x64_emit_load_var`, `layer_count`, and `modulab_prefs_zoom_get`. The fix is in `bpp_validate.bsm` (E223) plus the source-side cleanup of stale extrn lines.
+
+- **`var T` storage location is implicit in the native path, explicit in C.** A local declared as `var s: Pt` allocates space for the struct on the stack in the native backend, so `&s` becomes a single `add x0, fp, #-offset` and `s.field` reads/writes via the same FP-relative pointer. The C emitter has no such "address of a value-typed local" — it lowers `var s: Pt` to `long long s[N]` (an array large enough to cover `sizeof(Pt)`), so writing `s` already produces the array's address as it decays, and `&s` would have to special-case the cast. Both paths read the field at the right place because the `T_MEMLD` field-hint covers the load width; the divergence shows up only when source code takes the address of the local and passes it around. **For now, the rule of thumb when writing code that must compile through `--c`: prefer heap allocation (`auto p: Pt; p = malloc(sizeof_struct);`) over `var p: Pt` when you intend to pass `p` (or `&p`) to another function.** The two backends agree on the heap pattern. The Wolf3D player FPSBody uses `fps_body()`, the audio plugin state pattern should follow suit. If a future workload needs `var T` semantics in the C path, the path forward is documenting `var T` as a single uniform allocation strategy in both backends — likely "always heap-backed" — rather than papering over the C side with more special-cases. Tracked in `docs/todo.md` under "C-emitter `var T` parity".
 
 The recommended pattern for portable applications is to write the game using `drv_raylib.bsm` (or `drv_sdl.bsm`) instead of `stbgame.bsm`, so the generated C calls regular C functions and avoids the Objective-C calling-convention pitfalls of dlopen + objc_msgSend.
 

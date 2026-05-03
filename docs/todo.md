@@ -275,6 +275,50 @@ correctness gap — emitted code is valid x86_64, just not as tight.
    diffs against ARM64's emission.
 4. Re-enable B2 inline.
 
+### C-emitter `var T` parity
+
+Native and C disagree on the storage location of `var s: Pt` locals.
+Native allocates a stack slot and `&s` is FP-relative. C lowers `var s`
+to `long long s[N]` (array decay-as-pointer), and `&s` had to be
+special-cased in the T_ADDR emitter so it doesn't apply `&` to an rvalue
+cast (commit `87b5746`). The fix patched the symptom; the underlying
+asymmetry remains and will resurface the next time someone passes
+`&local_struct` between functions in code that must compile through `--c`.
+
+Forward path (when a real consumer hits this — currently no game
+needs it):
+
+1. Pick one storage strategy for `var T` and document it across both
+   backends. Most likely "always heap-backed" — uniform, predictable,
+   and `var p: Pt` becomes literal sugar for `auto p: Pt; p = malloc(sizeof(Pt));`
+   with a matching `free` at scope exit.
+2. Update native `_a64_emit_addr_local` and the C T_VAR/T_ADDR emit
+   paths to share the same address calculation rule.
+3. Add a regression test that takes `&local_struct`, passes it to
+   another function, and reads a field both directions — must pass on
+   native + C + cross-compile.
+
+Workaround until then: prefer `auto p: Pt; p = malloc(...);` (heap)
+over `var p: Pt` (stack-on-native, array-decay-on-C) when source must
+compile through `--c` and the address is taken. See
+`bootstrap_manual.md` "C Emitter (portable C output)" section for the
+full discussion.
+
+### `bug` headless detection
+
+`bug file.bug` (no `--dump`) routes to the GUI viewer. In a headless
+environment (CI, piped invocation, no DISPLAY/WindowServer), Cocoa
+opens the window and waits for the event loop with no human to drive
+it — the process appears to hang. Today the only signal is a one-line
+stderr hint we print at GUI launch ("opening GUI; pass --dump for text
+output"); when stdin/stdout is verifiably not a TTY, we should
+auto-fallback to `--dump` instead. Needs an `isatty(0)` helper either
+via `sys_ioctl(0, TIOCGETA, &termios)` or `sys_fstat(0)` checking
+`S_IFCHR`. ~30 LOC including the 4-layer plumbing for whichever syscall
+we lift to a builtin.
+
+Defer until: someone files an actual issue or runs `bug` in CI again.
+
 ### ELF dynamic linking
 
 B++ x86_64 emits only static ELF today. Adding PLT/GOT, `DT_NEEDED`,

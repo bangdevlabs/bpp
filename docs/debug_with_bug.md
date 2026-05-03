@@ -542,7 +542,10 @@ investigation.
 | Phase 6.4.2 | SIGPROF supplement (macOS): per-thread mcontext capture + pthread_kill fan-out | shipped |
 | Phase 6.5  | `caller(n)` sugar wrapper over `caller_pc` + `caller_name` | deferred (YAGNI — no consumer yet) |
 
-Phase 6 detail: see `docs/bug_phase6_plan.md`.
+Phase 6 detail: see the planning doc archived at
+`legacy_bootstrap/legacy_docs/bug_phase6_plan.md` (kept for
+historical context — every stage shipped except 6.5, deferred
+YAGNI).
 
 ---
 

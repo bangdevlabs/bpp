@@ -4,13 +4,15 @@
 > Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
 > Everything you need in one file. No other canonical doc.
 
-### B++ 0.222 — Compound Operators + Pointer Primitives + Tonify Complete — 28 April 2026
+### B++ 0.23x — Phase 6 Closed (Profiler + Panic + Runtime Symbolication) + Wolf3D Scaffold — 3 May 2026
 
 A self-hosting compiled language with **games that hear themselves**. Snake now plays a drum loop recorded live inside mini_synth — the polyphonic synthesizer built in the same language — while a fresh in-code 880 Hz SFX fires every time it eats an apple. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and the industry-standard text-file beat-map format.
 
+**Recently shipped:** every binary now embeds a minisym table so a running B++ program resolves its own PCs without the external `.bug` file — which unlocks `panic("msg")` with full stack traces and a `profile_start`/`profile_stop`/`profile_dump` sampling profiler that covers worker threads via SIGPROF. The Wolf3D scaffold landed under `games/fps/`, ready for Session 1 to fill in the DDA cast.
+
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
-> **Version 0.222**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark).
+> **Version 0.23x**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark).
 
 ---
 
@@ -34,9 +36,9 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 
 ---
 
-## Three Games, One Engine
+## Five Games, One Engine
 
-B++ ships with four demo games in `games/`, all GPU-accelerated on Metal:
+B++ ships with five games in `games/`, all GPU-accelerated on Metal (the FPS is a scaffold ready for its first implementation session):
 
 | Game | Folder | What it is |
 |------|--------|-----------|
@@ -44,6 +46,7 @@ B++ ships with four demo games in `games/`, all GPU-accelerated on Metal:
 | **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. |
 | **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
 | **Rhythm** | `games/rhythm/` | Rhythm-genre prototype. Menu → demo (auto-play) → transition countdown → play (snare on F or SPACE). Hit-windows: ±20 ms perfect, ±60 ms ok. Uses stbscene / stbasset / stbmixer music+SFX buses / beat_map text parser. |
+| **Wolf3D (FPS)** | `games/fps/` | Phase 1 scaffold: ray-cast 2.5D shooter built on the new `stbraycast` cartridge + FPSBody chapter in `stbphys`. Compiles to a black window today; Session 1 fills in the DDA loop and projection. See `games/fps/HANDOFF.md`. |
 
 ---
 
@@ -83,7 +86,7 @@ The compiler now understands effects. Every function carries a classification �
 
 The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
 
-25 compiler modules in `src/`. 22 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 120 tests, zero failures.
+39 compiler modules in `src/`. 20 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 128 native + 107 C-emitter tests, zero failures.
 
 The version number is the test count.
 
@@ -160,11 +163,14 @@ No SDL. No raylib. No dependencies. One file in, one native binary out.
 - **Self-compile speed** — ~0.1 seconds from scratch, no cache
 
 **Debugger (`bug`):**
-- **Zero-flag** — `./bug ./program` reads the symbol table and runs
+- **Three modes** — `bug --dump file.bug` (text dump), `bug --tui ./prog` (live REPL + watch), plain `bug` (GUI inspector with map browser + watch + viz panels)
 - **GDB remote protocol** — debugserver (macOS) + gdbserver (Linux), no entitlements, no codesign dance
-- **Function tracing** — call depth indentation on every entry
-- **Crash backtrace** — frame pointer chain with full call stack
-- **Local variables** — stack frame dump on crash when compiled with `--bug`
+- **Always-on debug info** — every native compile writes a `.bug` map next to the binary; no `-g` flag, the compiler always emits it
+- **Function tracing** — call depth indentation on every entry; `--break <fn>` for selective stops
+- **Watch list + expression evaluator** — `--watch "player.vx,score,*head"` evaluates B++ expressions at every stop (struct fields, array indexing, dereference)
+- **Type-aware display** — structs render as field trees, arrays as lists, pointers as addresses + target, floats with full precision
+- **Runtime visualizers** — `viz_render_graph` / `viz_render_rgba` etc. for in-target panel rendering, GUI mirrors the same panels live
+- **Phase 6 runtime symbolication** — `panic("msg")` writes a stack trace to stderr and exits 134; `profile_start(rate_hz, depth)` samples FP chains via SIGPROF + cooperative hooks across worker threads, `profile_dump` returns the top-N hot frames. No external `.bug` required at runtime — the binary embeds a minisym table
 
 **Audio stack:**
 - **stbaudio** — CoreAudio AudioQueue FFI, SPSC ring buffer, realtime callback annotated `: realtime`
@@ -520,29 +526,35 @@ bpp mygame.bpp -o mygame && ./mygame
 
 ```
 b++/
-├── src/                        — Compiler core + universal runtime (23 B++ modules)
+├── src/                        — Compiler core + universal runtime (39 B++ modules)
 │   ├── bpp_*.bsm               — Core utilities (array, hash, buf, str, io, math, file, arena)
 │   ├── bpp_beat/job/maestro    — Clock, worker pool, game loop orchestrator
+│   ├── bpp_runtime.bsm         — panic + sampling profiler + runtime PC resolution (Phase 6)
+│   ├── bug_*.bsm               — Debugger engine (reader, gdb, observe, viz, tui, eval, brk, runviz)
 │   └── backend/
 │       ├── chip/aarch64/       — ARM64 encoder + codegen
 │       ├── chip/x86_64/        — x86_64 encoder + codegen
 │       ├── os/macos/           — libSystem FFI, platform layer, audio
 │       ├── os/linux/           — X11 wire protocol, syscalls
-│       ├── target/aarch64_macos/ — Mach-O writer
-│       ├── target/x86_64_linux/  — ELF writer
+│       ├── target/aarch64_macos/ — Mach-O writer (LC_UUID + __minisym section)
+│       ├── target/x86_64_linux/  — ELF writer (PT_NOTE GNU build_id + BPPMINI)
 │       └── c/                  — C transpiler (portable escape hatch)
 ├── stb/                        — Standard B Library (20 modules, game engine)
 ├── tools/mini_synth/           — Polyphonic synthesizer (300 lines)
+├── tools/the_bug/              — `bug` debugger (CLI + GUI, single binary)
+├── tools/modulab/              — Pixel sprite editor (Save / Save As / Open + frame strip + palette)
 ├── games/                      — Complete playable games
 │   ├── snake/                  — Snake + ECS particles + ranking + music + SFX
 │   ├── pathfind/               — Rat-and-cat chase with AI pursuit
 │   ├── platformer/             — Side-scrolling platformer with Kenney assets
-│   └── rhythm/                 — Rhythm-genre prototype (menu → demo → play)
+│   ├── rhythm/                 — Rhythm-genre prototype (menu → demo → play)
+│   └── fps/                    — Wolf3D scaffold (Phase 1 in-flight, see HANDOFF.md)
+├── bang9/                      — Acme-inspired IDE that hosts the open tools as panels
 ├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/                    — Backend drivers (SDL2, raylib — optional)
-├── tests/                      — Compiler and library tests (74 passing)
+├── tests/                      — Compiler and library tests (128 native + 107 C, 0 failures)
 ├── docs/                       — The unified book (how_to_dev_b++.md, 28 chapters) + journal + TODO
-├── legacy_docs/                — Source material being absorbed into the book. Read-only during consolidation faxina. Deleted when absorption is complete.
+├── legacy_bootstrap/           — Earlier compiler bootstrap + archived planning docs. Read-only.
 ├── bpp                         — The compiler binary
 └── bug                         — The debugger binary
 ```
@@ -575,25 +587,27 @@ The B++ compiler is written in B++ and compiles itself. It produces
 native ARM64 Mach-O binaries with built-in SHA-256 codesigning.
 
 ```
-bpp source.bpp -o binary       # native ARM64 macOS (default)
+bpp source.bpp -o binary       # native ARM64 macOS (default; .bug map is always written)
 bpp --linux64 src.bpp -o bin   # cross-compile to x86_64 Linux ELF
-bpp --bug source.bpp -o bin    # emit .bug debug map (enhanced debugging)
-bpp --c source.bpp              # emit C (for debugging)
+bpp --c source.bpp              # emit portable C (no .bug — instruction layout decided downstream)
 bpp --asm source.bpp            # emit ARM64 assembly
 bpp --show-deps source.bpp     # print module dependency graph
-bpp --clean-cache              # delete all cached .bo files
 ```
 
-23 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 20 stb library modules, ~20,000 lines of B++. Self-hosting verified at every commit (`shasum gen1 == gen2`). Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
+39 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 20 stb library modules. Self-hosting verified at every commit (`shasum gen1 == gen2`). The `.bo` module cache was retired in 0.23.x — every compile runs from source, ~0.27 s for the whole compiler. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
 
 ### The Debugger
 
 ```
-./bug ./program                  # trace + crash report (reads symbol table)
-./bug ./program                  # + locals if .bug file present
+bug                              # GUI: pop a file picker, browse a .bug map
+bug file.bug                     # GUI: open with .bug pre-loaded
+bug --dump file.bug              # text dump of every section the .bug carries
+bug --tui ./program              # live REPL on every breakpoint (watch + step + locals)
+bug --tui --break update_enemy ./program     # selective breakpoints
+bug --tui --watch "player.vx,score" ./game   # live expression watch on every stop
 ```
 
-`bug` is a B++ program that uses the GDB remote protocol to communicate with Apple's debugserver (macOS) or gdbserver (Linux). No entitlements, no codesign, no special flags needed. Function names come from the Mach-O/ELF symbol table automatically.
+`bug` is a B++ program that uses the GDB remote protocol to communicate with Apple's debugserver (macOS) or gdbserver (Linux). No entitlements, no codesign, no special flags needed. Function names come from the Mach-O/ELF symbol table automatically; the `.bug` map adds locals, struct layouts, source positions, viz hints, and the embedded minisym table the runtime uses for `panic`/`profile_*`. See `docs/debug_with_bug.md` for the full feature tour.
 
 ## Contributing
 

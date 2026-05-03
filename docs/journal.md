@@ -1,82 +1,140 @@
 # B++ Bootstrap Journal
 
-## 2026-05-03 — Float field type propagates through T_MEMLD
+## 2026-05-03 — Wolf3D scaffold + float field types + C emitter `&var` + doc faxina
 
-The Wolf3D handoff documented a "small workaround" for `auto p:
-FPSBody; p.x` patterns: passing `p.x` to a float-param function
-emitted E240 ("argument is int but param is float"), so the
-previous agent introduced typed-local copies (`auto px: float;
-px = p.x;`) before each call. The note asked future agents not
-to strip the workaround.
+A long maintenance day that ended with the tree clean and ready
+for someone else to start Wolf3D Session 1 cold. Five deliverables
+landed across one big session, each its own commit:
 
-Investigated and found a 4-line bug in `bpp_types.bsm`. The
-parser's `resolve_dot` (line 2274) builds T_MEMLD nodes and
-stores the field's packed type in `n.b` — exactly so codegen
-can emit the right LDR/LDRH/LDR-d0 for the field width and
-base. The codegen reads `n.b` correctly. The type-checker did
-not: `add_type` for T_MEMLD hard-coded `n.itype = TY_WORD`
-regardless of the field's annotation. So the bits were loaded
-correctly into d0 at the LDR site, but the expression's
-visible type was always int — and the call-site argument
-checker (which compares expression type to param type) raised
-E240 even though the field was annotated `: float`.
+1. **modulab Save As** (`687720d`) — adds `UI_ACT_SAVE_AS` button
+   in the topbar, routes to `mlab_save_dialog` which now seeds
+   the dialog with the current filename and syncs
+   `_ui_filename_ti` on success so subsequent plain Save calls
+   write back to the picked path. Persists prefs after Save As
+   so the new path survives across sessions.
 
-This is **not** the same dor as the Mar-2026 `put(x)` smart-
-dispatch story. There the user genuinely could not tell the
-compiler what they meant; the cure was the `: float`
-annotation system + W/E codes. Here the user already said
-`: float` in two places (struct field + function param) and
-the compiler dropped that information on the floor going
-through `T_MEMLD`. Adding a third annotation surface would be
-asking the user to repeat themselves.
+2. **Wolf3D scaffold + FPSBody chapter + raycast cartridge**
+   (`3a43e91`) — three new files in stb (`stbraycast.bsm` for
+   the DDA + projection primitives; FPS chapter added to
+   `stbphys.bsm` with `FPSBody` + `fps_body()` allocator + grid
+   collision; vertical-strip helpers added to `stbrender.bsm`).
+   Game-side: `games/fps/wolf3d.bpp` wires the maestro phases,
+   reserves a hardcoded 16×16 test map, and uses an FPSBody
+   player. Compiles to a black window today; stays black until
+   Session 1 fills in the three TODO bodies. The `flat namespace
+   is prose-only` convention also lands in `bootstrap_manual.md`.
 
-Fix: read the field hint when present.
+3. **Float field type propagates through T_MEMLD** (`5569c7a`) —
+   the in-flight Wolf3D code carried a typed-local workaround
+   (`auto px: float; px = p.x;`) because passing `p.x` straight
+   into a float param raised E240. Root cause was four lines in
+   `bpp_types.bsm:402` that hardcoded `T_MEMLD → TY_WORD`,
+   ignoring the field hint the parser already stored in `n.b`.
+   Fix reads the hint via `ty_make(ty_base(n.b), ty_slice(n.b))`
+   so float / sub-word / pointer field types flow through to
+   call-site checks. Workaround in `wolf3d.bpp` removed.
 
-```
-if (t == T_MEMLD) {
-    auto fty;
-    add_type(n.a);
-    if (n.b != 0) {
-        fty = ty_make(ty_base(n.b), ty_slice(n.b));
-        n.itype = fty;
-        return fty;
-    }
-    n.itype = TY_WORD;
-    return TY_WORD;
-}
-```
+   Not the same dor as the Mar 2026 `: float` annotation system
+   — there the user genuinely could not tell the compiler the
+   type. Here the user said `: float` on both the field and the
+   param and the compiler dropped that info on the floor.
 
-The `ty_make(ty_base, ty_slice)` round-trip strips the bit-
-offset bits that `resolve_dot` packs into the upper byte for
-SL_BIT..SL_BIT7 fields, so we recover just the type. Bare
-`*(ptr)` dereferences leave `n.b == 0` and fall through to
-TY_WORD as before.
+4. **C emitter T_ADDR on stack-struct** (`87b5746`) — the C
+   path emitted `&((long long)(stk))` for `&var_struct`
+   (invalid `&` on rvalue cast) because the T_VAR branch
+   already returned the array decay as the address. Detect the
+   stack-struct child in T_ADDR and delegate to T_VAR directly.
+   Native already hid this with FP-relative addressing; the C
+   path forced the design tension into view. Side-quest discovered
+   while testing the float fix.
 
-**Side discovery**: the C emitter has a separate latent bug
-where `&local_struct` (a `var: T` declaration) emits
-`&((long long)(stk))` — `&` on an rvalue cast — because the C
-emitter models `var T` as a pointer-by-value rather than a
-stack slot. Native codegen hides the asymmetry by emitting
-`add x0, fp, #-offset`. The C path forces the design tension
-into view. Not a blocker (the wolf3d real path uses heap
-allocation via `fps_body()`) but worth flagging as C-emitter
-tech debt: `var T` semantics need to be uniform across
-backends, or `&var_struct` should be a documented native-only
-pattern. Tracked here, not fixed.
+5. **Bug docs faxina** (`9504352`) — `debug_with_bug.md` taught
+   `bug file.bug` as dump mode, but the dispatcher routes that
+   to the GUI (Cocoa event loop, hangs in headless shells).
+   Rewrote the modes section to describe the real binary (single
+   tool from `tools/the_bug/the_bug.bpp` since 0.23.x) and
+   fixed the broken pointer to the moved Phase 6 plan. Updated
+   `bug_viz_plan.md` Phase 6 section to "Status: shipped" since
+   6.1 → 6.4.2 all landed last session.
 
-**Wolf3D**: typed-local workaround in `wolf3d_render_phase`
-removed; `cast_ray(hit, col, SCREEN_W, p.x, p.y, p.angle, FOV,
-world_map)` now compiles directly. Session 1 starts without
-the dívida.
+6. **Bug GUI launch hint** (follow-up to #5) — `bug file.bug`
+   now prints one line to stderr before opening the window:
+   `bug: opening GUI viewer for 'X' (use 'bug --dump X' for
+   text output)`. CI scripts, agents, and humans who expected
+   text dump now see the fix immediately instead of watching
+   the process silently spin in the event loop. Full
+   `isatty(0)` auto-fallback would be nicer but needs new
+   syscall plumbing — tracked in `docs/todo.md` under "`bug`
+   headless detection".
 
-**Verification**:
-- New regression test `test_struct_field_float_propagation.bpp`
-  (heap-pointer pattern; uses malloc to dodge the C-emitter
-  `&var` issue noted above).
-- Native suite: 127 passed, 0 failed, 12 skipped.
-- C suite: 106 passed, 0 failed, 33 skipped.
-- Bootstrap byte-stable: gen1 == gen2 == gen3 ==
-  `d11d4153eb201289eacff76fe86d538359c1d2ff`.
+7. **C-emitter `var T` parity doc** (follow-up to #4) — fixing
+   the `&var_struct` symptom didn't close the underlying
+   asymmetry: `var T` allocates a stack slot in native and an
+   array-decay-as-pointer in C. The two paths agree on field
+   reads but diverge on address-taking. Documented the rule of
+   thumb in `bootstrap_manual.md` ("when source must compile
+   through `--c` and the address is taken, prefer heap
+   allocation") and tracked the unification path in
+   `docs/todo.md` under "C-emitter `var T` parity". Reactive
+   protection against the next agent re-discovering the same
+   gap in 6 months.
+
+**Discoveries that became memory:**
+
+- `feedback_no_bootstrap_for_docs.md` — doc-only edits
+  (`docs/**.md`, READMEs, comments, journal) skip the bootstrap
+  cycle and the test suite. Codified at the top of
+  `bootstrap_manual.md`.
+- `feedback_fix_problems_dont_assign_blame.md` — sidequests get
+  attacked the moment they appear (the C emitter bug was found
+  during the float fix and shipped that same day, not "tracked
+  as tech debt").
+
+**State at end of day:**
+
+- Native suite: **128 passed, 0 failed, 12 skipped**.
+- C suite: **107 passed, 0 failed, 33 skipped**.
+- Bootstrap byte-stable: gen1 == gen2 == gen3.
+- Wolf3D compiles clean (365 KB), opens a black window.
+- New tests: `test_struct_field_float_propagation.bpp`,
+  `test_addr_var_struct.bpp`.
+
+### Wolf3D Session 1 — handoff state
+
+Tree is ready for someone else to pick up tomorrow. Three
+function bodies to fill in, all stubs today:
+
+1. **`cast_ray()` in `stb/stbraycast.bsm`** — the DDA loop
+   itself (lodev.org/cgtutor/raycasting Part 1). Inputs: column
+   index + screen width + player x/y/angle/FOV + map pointer +
+   map dimensions. Output: fills a `RayHit` struct with
+   `distance` (perpendicular wall distance), `tex_x` (0..63
+   texture column), `wall_type` (cell value from the map, 0 =
+   miss), `side` (0 = NS wall, 1 = EW wall). Type signature
+   already locked in.
+
+2. **`raycast_draw_column()` in `stb/stbraycast.bsm`** — given
+   the `RayHit`, project to a vertical strip:
+   `line_height = screen_h / hit.distance` (clamped),
+   `draw_start = (screen_h - line_height) / 2`, then call
+   `render_vertical_strip` with a colour picked from the
+   wall-type palette. Texture sampling waits for Session 2.
+
+3. **`_wolf3d_init_map()` in `games/fps/wolf3d.bpp`** —
+   populate `world_map` (currently `0`) with the 16×16 test
+   maze hardcoded in the comment block. Use `buf_byte(MAP_W *
+   MAP_H)`. Layout already drawn in the source as ASCII.
+
+The maestro wiring + render loop already iterate every column
+and call both functions, so the moment the bodies fill in the
+window paints walls. Profile-target Session 5 will run
+`profile_start(1000, 8)` around the render phase to measure ray
+cost — primary motivation for shipping the profiler.
+
+The pre-Wolf3D handoff doc lives at `games/fps/HANDOFF.md`
+with full session breakdown (Sessions 1–6 detailed). Memory
+`feedback_fix_problems_dont_assign_blame.md` and
+`feedback_no_bootstrap_for_docs.md` apply.
 
 ## 2026-04-28 — 🧹 TONIFY V1+V2: FULL REPO FAXINA + OPERATORS + POINTER PRIMITIVES
 

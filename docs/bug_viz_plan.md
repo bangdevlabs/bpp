@@ -280,13 +280,22 @@ PASS, the_bug builds clean.
 
 ## Phase 6 — Profiler + Runtime Symbolication
 
-**Plano detalhado movido para [`docs/bug_phase6_plan.md`](bug_phase6_plan.md).**
+**Status: shipped.** Stages 6.1, 6.2, 6.3, 6.4.1, 6.4.2 all
+landed (panic with stack trace, cooperative + SIGPROF
+profiler, runtime PC resolution via embedded minisym). User-
+facing API is documented in `docs/debug_with_bug.md` under
+"Phase 6 user-facing API". The planning doc lives at
+`legacy_bootstrap/legacy_docs/bug_phase6_plan.md` for
+historical reference.
+
+Stage 6.5 (`caller(n)` sugar wrapper) is the only piece
+deferred — YAGNI until a real consumer in user code asks for
+it. The compose `caller_name(caller_pc(n))` already works
+today.
 
 Resumo: minisym subset embutido no binário (Mach-O `__minisym`
 section / ELF PT_NOTE `BPPMINI` record) permite o runtime
-resolver PCs sem depender do `.bug` separado. Habilita três
-features (panic com stack trace, `caller(n)` introspection,
-sampling profiler).
+resolver PCs sem depender do `.bug` separado.
 
 testProfiler é **multi-thread aware desde v1** — programa B++
 típico já roda múltiplas threads (audio callback + bpp_job
