@@ -306,6 +306,40 @@ static void scan_word() {
     }
 }
 
+// Consume an optional scientific-notation exponent suffix attached to
+// a float literal already lexed up to its post-decimal digits. Accepts
+// `e` or `E`, an optional `+` / `-`, then one or more decimal digits.
+// Leaves `pos` unchanged when the suffix does not parse cleanly so the
+// outer scanner can hand the trailing characters back as a separate
+// token (preserves backward compat for code like `1.0eFoo`).
+//
+// Full acceptance/rejection table for float literals — including why
+// `1e10`, `1.e10`, and `.5e10` are NOT floats — lives in
+// `docs/how_to_dev_b++.md` Cap 3 §3.3. Read that before touching the
+// state machine here; the table doubles as a contract spec.
+static void _scan_float_exp() {
+    auto save, ch;
+    if (pos >= src_len) { return; }
+    ch = peek(src + pos);
+    if (ch != 'e') {
+        if (ch != 'E') { return; }
+    }
+    save = pos;
+    pos++;                                            // consume e/E
+    if (pos < src_len) {
+        ch = peek(src + pos);
+        if (ch == '+' | ch == '-') { pos++; }         // optional sign
+    }
+    // Require at least one digit after the e/E (and optional sign);
+    // otherwise rewind to the e/E so the float ends at the prior digit.
+    if (pos >= src_len) { pos = save; return; }
+    if (is_digit(peek(src + pos)) == 0) { pos = save; return; }
+    while (pos < src_len) {
+        if (is_digit(peek(src + pos)) == 0) { return; }
+        pos++;
+    }
+}
+
 // Scan a decimal or hexadecimal number.
 static void scan_number() {
     auto start;
@@ -327,7 +361,8 @@ static void scan_number() {
             }
         }
     }
-    // Decimal number (may include a decimal point for floats).
+    // Decimal number (may include a decimal point for floats, with an
+    // optional scientific-notation exponent suffix).
     while (pos < src_len) {
         if (is_digit(peek(src + pos)) == 0) {
             // Check for decimal point followed by digit -> float literal.
@@ -337,11 +372,13 @@ static void scan_number() {
                         pos++;
                         while (pos < src_len) {
                             if (is_digit(peek(src + pos)) == 0) {
+                                _scan_float_exp();
                                 add_token(8, start, pos - start);
                                 return;
                             }
                             pos++;
                         }
+                        _scan_float_exp();
                         add_token(8, start, pos - start);
                         return;
                     }

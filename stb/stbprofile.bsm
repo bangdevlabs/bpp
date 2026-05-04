@@ -1,0 +1,310 @@
+// stbprofile.bsm — Runtime profiler with HUD overlay.
+//
+// Wraps the auto-injected `bpp_runtime` profiler primitives
+// (`profile_start`, `profile_stop`, `profile_dump`) with the UX
+// most game / interactive profilers ship today (Tracy, Optick,
+// Unreal stat, Unity profiler):
+//
+//   - hotkey toggle starts / stops sampling
+//   - while sampling, a "REC •" badge with elapsed seconds renders
+//     on the game's HUD
+//   - on stop, top-N hottest functions dump to stderr
+//
+// The cartridge is render-engine-agnostic apart from `render_text`
+// + `render_number` from `stbrender`, which every B++ game already
+// uses. Single-state — meant for the local dev profiling loop, not
+// concurrent profile sessions.
+//
+// Composition (what stbprofile OWNS):
+//   - the active flag + elapsed-time tracking
+//   - the HUD geometry (text "REC •", blinking dot, mm:ss timer)
+//   - the dump format
+//
+// Composition (what the GAME owns):
+//   - the hotkey binding (call `action_define` with whatever key)
+//   - the HUD position (x, y, size, colour passed to draw)
+//   - WHEN to call draw (typically once per render phase)
+//
+// Usage:
+//   load "stbprofile.bsm";   // or import for shared usage
+//
+//   // init:
+//   init_profile();
+//   action_define("profile_toggle", KEY_P, 0);
+//
+//   // solo:
+//   if (action_pressed("profile_toggle")) { profile_hud_toggle(); }
+//
+//   // render:
+//   profile_hud_draw(SCREEN_W - 80, 8, 1, 0xFFFF3333);
+//
+// The profile primitives in bpp_runtime are auto-injected, so this
+// cartridge only needs stbrender for the HUD.
+import "stbrender.bsm";
+
+// ── Sampling tuning (defaults; see profile_hud_set_rate) ──
+
+const _PROFILE_DEFAULT_RATE  = 1000;   // SIGPROF target Hz
+const _PROFILE_DEFAULT_DEPTH = 8;      // captured stack frames per sample
+const _PROFILE_TOP_N         = 20;     // final-dump cap (stderr)
+
+// Live overlay tuning. profile_dump allocates working memory on
+// each call; if the HUD invoked it every frame at 60 fps, mmap
+// pressure would dominate the very profile being measured. Cache
+// the top-N for 500 ms — visually indistinguishable from per-frame
+// updates and matches the refresh rate every mainstream live
+// profiler ships with (Tracy, Optick, Unity profiler, Unreal stat).
+const _PROFILE_LIVE_TOP_N    = 3;
+const _PROFILE_LIVE_REFRESH_MS = 500;
+const _PROFILE_NAME_BUF_SZ   = 48;
+
+// Frame time ring window — 32 frames at 60 fps ≈ half a second,
+// enough to smooth out per-frame jitter without over-averaging
+// real spikes. Same window every modern game-dev profiler ships.
+const _PROFILE_FRAME_BUF_N   = 32;
+
+// ── State ────────────────────────────────────────────────────
+
+// 0 = idle, 1 = sampling. Edge-toggled by `profile_hud_toggle`.
+global _profile_hud_active;
+
+// Wall-clock ms at start. Used for the HUD's elapsed timer and the
+// blinking dot's phase. Reset every time toggle flips off→on.
+global _profile_hud_start_ms;
+
+// Sampling tuning, captured at toggle time so a runtime change to
+// the global doesn't disturb a session in progress.
+global _profile_hud_rate;
+global _profile_hud_depth;
+
+// Live HUD scratch — top-N buffer (16 bytes per entry: packed name
+// + count) and a null-terminated name scratch render_text consumes.
+// Pre-allocated in init_profile so the per-frame draw path costs
+// zero malloc.
+extrn _profile_dump_buf;
+extrn _profile_name_buf;
+global _profile_dump_count;
+global _profile_dump_last_ms;
+
+// Frame time tracking — always running, even when the HUD is idle,
+// so the FPS / frame-time readout has accurate data the moment the
+// user toggles profiling on. Stored in microseconds for sub-ms
+// precision: a 16.667 ms frame at 60 FPS rounds to 17 ms, but its
+// real µs value is 16667, which makes the smoothed FPS read 60.00
+// instead of the 62 (= 1000 / 16) the ms-resolution path produced.
+// Cost per frame: ~5 instructions plus one ring slot write.
+extrn _profile_frame_buf;
+global _profile_frame_idx;
+global _profile_frame_count;
+global _profile_last_draw_us;
+
+// ── Init ─────────────────────────────────────────────────────
+
+// Reset all state to idle / defaults and pre-allocate the live HUD
+// scratch buffers. Calling this from game_init is recommended.
+void init_profile() {
+    _profile_hud_active     = 0;
+    _profile_hud_start_ms   = 0;
+    _profile_hud_rate       = _PROFILE_DEFAULT_RATE;
+    _profile_hud_depth      = _PROFILE_DEFAULT_DEPTH;
+    _profile_dump_buf       = buf_byte(_PROFILE_LIVE_TOP_N * 16);
+    _profile_name_buf       = buf_byte(_PROFILE_NAME_BUF_SZ);
+    _profile_dump_count     = 0;
+    _profile_dump_last_ms   = 0;
+    _profile_frame_buf      = buf_word(_PROFILE_FRAME_BUF_N);
+    buf_fill(_profile_frame_buf, 0, _PROFILE_FRAME_BUF_N * 8);
+    _profile_frame_idx      = 0;
+    _profile_frame_count    = 0;
+    _profile_last_draw_us   = 0;
+}
+
+// Override the sampling rate (Hz) and per-sample stack depth that
+// the next toggle-on will hand to `profile_start`. Has no effect on
+// a session already running. Pass 0 for either to keep the default.
+void profile_hud_set_rate(rate_hz, depth) {
+    if (rate_hz > 0) { _profile_hud_rate  = rate_hz; }
+    if (depth   > 0) { _profile_hud_depth = depth; }
+}
+
+// 1 if profiling is currently sampling, 0 otherwise.
+profile_hud_active()@base { return _profile_hud_active; }
+
+// ── Toggle ───────────────────────────────────────────────────
+
+// Flip state. Off → on arms the runtime profiler at the configured
+// rate + depth. On → off disarms, dumps top-N to stderr, returns to
+// idle. Edge-triggered by the caller — typically wired through
+// `action_pressed` so a held key fires exactly once.
+void profile_hud_toggle() {
+    if (_profile_hud_rate  == 0) { _profile_hud_rate  = _PROFILE_DEFAULT_RATE; }
+    if (_profile_hud_depth == 0) { _profile_hud_depth = _PROFILE_DEFAULT_DEPTH; }
+
+    if (_profile_hud_active) {
+        profile_stop();
+        _profile_hud_dump();
+        _profile_hud_active = 0;
+        _profile_dump_count = 0;       // hide stale live overlay
+        return;
+    }
+    profile_start(_profile_hud_rate, _profile_hud_depth);
+    _profile_hud_start_ms   = _stb_get_time();
+    _profile_dump_last_ms   = 0;       // force first refresh on next draw
+    _profile_dump_count     = 0;
+    _profile_hud_active     = 1;
+    put_err("profile: started\n");
+}
+
+// ── HUD ──────────────────────────────────────────────────────
+
+// Draw the recording indicator at (x, y). Renders "REC •" with a
+// blinking dot every 500 ms while active, the elapsed seconds, and
+// a live top-N tally of the hottest functions captured so far.
+// Idle → renders nothing.
+//
+// `sz` is the text scale (1 = native bitmap font). `color` is an
+// ARGB packed value matching `render_text` / `render_number`. The
+// cartridge does NOT clear behind the HUD — the game's render
+// phase paints walls / floors first; the HUD layers on top.
+//
+// Layout:
+//     REC •      ← line 0 (blinks)
+//     <secs>     ← line 1
+//                ← blank
+//     <fn>  <n>  ← line 3..2+_PROFILE_LIVE_TOP_N
+//
+// Cost: a single `profile_dump` per refresh window (every 500 ms),
+// plus one `render_text` + `render_number` per visible row at 60
+// fps. The dump is kept rare on purpose — see _PROFILE_LIVE_REFRESH_MS.
+void profile_hud_draw(x, y, sz, color) @gpu {
+    auto now_ms, now_us, elapsed_ms, elapsed_s, blink;
+    auto i, packed, count, name_addr, name_len, row_y;
+    auto dt, sum_us, max_us, avg_us, frame_ms_avg, max_ms, fps_avg;
+
+    now_ms = _stb_get_time();
+    now_us = beat_now_us();
+
+    // Always-on frame-time accounting. Runs whether or not the HUD
+    // is visible so FPS data is ready the instant the user toggles
+    // profile mode. Skip the first call (no prior timestamp to diff).
+    if (_profile_last_draw_us > 0) {
+        dt = now_us - _profile_last_draw_us;
+        _profile_frame_buf[_profile_frame_idx] = dt;
+        _profile_frame_idx = (_profile_frame_idx + 1) % _PROFILE_FRAME_BUF_N;
+        if (_profile_frame_count < _PROFILE_FRAME_BUF_N) {
+            _profile_frame_count++;
+        }
+    }
+    _profile_last_draw_us = now_us;
+
+    if (_profile_hud_active == 0) { return; }
+
+    elapsed_ms = now_ms - _profile_hud_start_ms;
+    elapsed_s  = elapsed_ms / 1000;
+
+    // Blink the dot every 500 ms — same convention every recording
+    // UI uses (camcorders, OBS, Discord screenshare, ...).
+    blink = (elapsed_ms / 500) & 1;
+    if (blink) {
+        render_text("REC \xE2\x80\xA2", x, y, sz, color);  // "REC •" with U+2022
+    } else {
+        render_text("REC", x, y, sz, color);
+    }
+    render_number(x, y + 10 * sz, sz, color, elapsed_s);
+
+    // FPS / frame time line. Smoothed over the ring window so a
+    // single jittery frame doesn't dominate the readout, but `max`
+    // (worst frame in the window) preserves spike visibility — the
+    // metric that actually matters for game-feel diagnostics.
+    //
+    // FPS is computed from the µs-precision sum so the readout is
+    // accurate to integer FPS (60 FPS reads as 60, not 62 from the
+    // ms-truncation path). ms display rounds to nearest so the
+    // 16.667 → 17 ms convention every dev expects holds.
+    sum_us = 0;
+    max_us = 0;
+    for (i = 0; i < _profile_frame_count; i++) {
+        dt = _profile_frame_buf[i];
+        sum_us = sum_us + dt;
+        if (dt > max_us) { max_us = dt; }
+    }
+    frame_ms_avg = 0;
+    max_ms       = 0;
+    fps_avg      = 0;
+    if (_profile_frame_count > 0) {
+        avg_us = sum_us / _profile_frame_count;
+        if (avg_us > 0) { fps_avg = 1000000 / avg_us; }
+        // Round-to-nearest ms — adds 500 µs before integer division.
+        frame_ms_avg = (avg_us + 500) / 1000;
+        max_ms       = (max_us + 500) / 1000;
+    }
+    render_text("FPS:",   x,                  y + 22 * sz, sz, color);
+    render_number(        x +  5 *  8 * sz,   y + 22 * sz, sz, color, fps_avg);
+    render_text("ms:",    x +  9 *  8 * sz,   y + 22 * sz, sz, color);
+    render_number(        x + 12 *  8 * sz,   y + 22 * sz, sz, color, frame_ms_avg);
+    render_text("max:",   x + 17 *  8 * sz,   y + 22 * sz, sz, color);
+    render_number(        x + 21 *  8 * sz,   y + 22 * sz, sz, color, max_ms);
+
+    // Refresh the live top-N every _PROFILE_LIVE_REFRESH_MS ms.
+    // profile_dump's internal mallocs make per-frame calls a
+    // self-fulfilling profile (allocator dominates the hot list).
+    if (now_ms - _profile_dump_last_ms >= _PROFILE_LIVE_REFRESH_MS) {
+        _profile_dump_count   = profile_dump(_profile_dump_buf, _PROFILE_LIVE_TOP_N);
+        _profile_dump_last_ms = now_ms;
+    }
+
+    // Render the cached top-N below the FPS line. Each row shows
+    // "<function_name>  <sample_count>" — function name from the
+    // minisym table copied into the null-terminated scratch the
+    // bitmap font expects, count rendered as a decimal integer.
+    row_y = y + 38 * sz;
+    for (i = 0; i < _profile_dump_count; i++) {
+        packed    = *(_profile_dump_buf + i * 16);
+        count     = *(_profile_dump_buf + i * 16 + 8);
+        name_addr = _runtime_name_addr(packed);
+        name_len  = _runtime_name_len(packed);
+        if (name_addr == 0) { continue; }
+        if (name_len == 0)  { continue; }
+        if (name_len >= _PROFILE_NAME_BUF_SZ) {
+            name_len = _PROFILE_NAME_BUF_SZ - 1;
+        }
+        buf_copy(_profile_name_buf, name_addr, name_len);
+        poke(_profile_name_buf + name_len, 0);
+        render_text(_profile_name_buf, x, row_y, sz, color);
+        // Place the count one column past the longest plausible
+        // name. A fixed offset keeps the column tidy even when
+        // names vary in length frame-to-frame.
+        render_number(x + 22 * 8 * sz, row_y, sz, color, count);
+        row_y = row_y + 10 * sz;
+    }
+}
+
+// ── Dump ─────────────────────────────────────────────────────
+
+// Walk profile_dump's top-N output and print each as
+// `<count> <function_name>` to stderr. Caller is responsible for
+// having already armed + stopped the profiler — `profile_hud_toggle`
+// does the right sequencing.
+static void _profile_hud_dump() {
+    auto buf, n, i, packed, name_addr, name_len, count;
+    buf = buf_word(_PROFILE_TOP_N * 2);
+    n   = profile_dump(buf, _PROFILE_TOP_N);
+
+    put_err("\n──── profile (top ");
+    put_err(n);
+    put_err(") ────\n");
+    for (i = 0; i < n; i++) {
+        packed = *(buf + i * 16);
+        count  = *(buf + i * 16 + 8);
+        put_err(count);
+        putchar_err(' ');
+        name_addr = _runtime_name_addr(packed);
+        name_len  = _runtime_name_len(packed);
+        if (name_addr != 0 && name_len > 0) {
+            sys_write(2, name_addr, name_len);
+        } else {
+            put_err("<unresolved>");
+        }
+        putchar_err('\n');
+    }
+    put_err("─────────────────────────────────────────────\n");
+}

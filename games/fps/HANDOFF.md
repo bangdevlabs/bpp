@@ -1,606 +1,263 @@
-# Wolf3D — Handoff Report for Phase 1 Implementation
+# Wolf3D — Phase 2 Prep Doc
 
-**Date:** 2026-05-02
-**Author:** Claude (preceding session)
-**Recipient:** Emacs agent picking up Phase 1 implementation
-**Tree state at handoff:** Phase 6 (panic + profiler) closed, suite native 126/0/12 + C 105/0/33, byte-stable bootstrap.
+**Phase 1 closed:** 2026-05-04. `games/fps/fps_3d.bpp` walks at 60 FPS
+through a textured 2.5D maze. See `docs/journal.md` entry
+`2026-05-04` for the full Phase 1 retrospective.
 
----
-
-## TL;DR
-
-Phase 1 of B++'s Wolf3D port is now scaffolded but not implemented.
-This handoff gives the next agent everything needed to start Session 1
-without re-deriving context. Three skeleton files are in place; a
-detailed 6-session plan covers Phase 1 from blank screen to playable
-textured maze with WASD movement.
-
-The strategic value: Wolf3D is the **first real workload** for the
-Phase 6 profiler. Everything before this (snake, rhythm teacher) was
-too simple to surface optimization questions. Wolf3D's ray caster has
-a genuine hot loop (38400 rays/sec × ~30 float ops each), texture
-sampling that stresses cache behaviour, and column-parallel work that
-exercises the auto-dispatch. Implementing it answers the deferred
-question "does B++ need Tier F compiler optimization, and if so where?"
+This file is the entry brief for the agent picking up Phase 2.
+Phase 2 = Wolfenstein-3D Minimum: 1 enemy type, 1 weapon, 1 door
+type, 1 level, ASCII map loader v2 with entity grammar. Authentic
+features (3-4 enemies, 4 weapons, key + door pairs, multi-level,
+secret walls, voice acting) are independent add-ons in Phase 3+.
 
 ---
 
-## Architectural decision: stbraycast composes existing stb cartridges
+## Phase 1 → Phase 2 file migration plan
 
-The first scaffold drafts went through three iterations before the
-right shape emerged:
+When Phase 2 ships content-rich Wolf3D, `games/fps/fps_3d.bpp`
+migrates to `examples/fps_3d.bpp` as the canonical 2.5D raycasting
+template every future B++ raycaster forks from. The file that
+replaces it in `games/fps/` becomes the actual Wolf3D game with
+sprites + enemies + levels + audio.
 
-**Draft 1**: `raycast.bsm` and `render.bsm` inside `games/wolf3d/`.
-WRONG — DDA algorithm is generic, belongs in stb (Layer 2).
+That migration happens at the END of Phase 2. Until then,
+`games/fps/fps_3d.bpp` keeps growing as the Phase 2 development
+target.
 
-**Draft 2**: `stb/stbraycast.bsm` reinventing map storage + colour
-palette internally. WRONG — duplicates the `Tilemap` struct (from
-`stbtile.bsm`) and the `Palette` struct (from `stbpal.bsm`), both of
-which already exist and are reusable.
+---
 
-> **Notation note for new agents:** B++ has a single flat namespace —
-> all imported symbols live in one global pool, no per-file
-> qualification. When this document mentions something like "the
-> `Palette` struct (from `stbpal.bsm`)", that parenthetical is
-> documentation prose for cross-file traceability, NOT syntax. In
-> code you just write `Palette`, never `stbpal.Palette`.
+## What's already in place from Phase 1
 
-**Draft 3 (current)**: `stb/stbraycast.bsm` is minimal and composes
-existing cartridges:
+- `games/fps/fps_3d.bpp` — entry point (~360 LOC). Walks, turns,
+  collides, profiles. Spawn point (3.5, 8.5) facing east in a 16×16
+  test maze with four wall types ('#' brick, '@' stone, '%' wood,
+  '!' solid magenta debug).
+- `stb/stbtexture.bsm` — procedural materials. New patterns
+  (e.g. tile checkerboard, gradient, perlin) drop in as additional
+  `texture_X_to_buf` + factory pairs.
+- `stb/stbraycast.bsm` — DDA + RayHit + projection. Wall_type
+  dispatch is owned by the game; cartridge stays content-blind.
+- `stb/stbprofile.bsm` — Tier 1 profile HUD. Tier 2/3 (sparkline,
+  per-thread, GPU timing, scoped zones) is the pre-Phase-2 polish
+  sidequest if appetite holds.
+- `stb/stbphys.bsm` Chapter FPS — FPSBody + fps_walk + fps_turn.
+- `bpp_math.bsm` — sin_f / cos_f / abs_f / floor_f public,
+  auto-injected.
 
-| Cartridge | Role in raycast | Pre-existing |
-|---|---|---|
-| `stbtile.bsm` | Map storage (Tilemap struct, tile_set/get, solid_mask) | yes |
-| `stbpal.bsm` | Wall colour palette (PAL_DB_32, PAL_PICO_8, etc.) | yes |
-| `stbasset.bsm` | PNG texture loading (Phase 2) | yes |
-| `stbrender.bsm` | Pixel writes via render_vertical_strip / render_textured_strip | yes (extended this session) |
-| `stbraycast.bsm` | DDA + RayHit + projection (~150 LOC final) | NEW |
+Suite at Phase 1 close: **131 / 0 / 12 native + 110 / 0 / 33 C**.
+Bootstrap byte-stable at `bpp = 20e75f653dabf309bcfdef7a9d738756815b2682`.
 
-What stbraycast OWNS exclusively:
-- DDA loop math (cast_ray)
-- RayHit struct (compact, sub-word slices)
-- Projection math (raycast_draw_column)
+---
 
-What stbraycast DELEGATES:
-- Map → `Tilemap` (from stbtile); cast_ray accepts a Tilemap pointer
-- Colours → `Palette` (from stbpal); raycast_draw_column accepts a
-  Palette pointer
-- Pixel writes → `render_vertical_strip` / `render_textured_strip`
-  (from stbrender)
-- Textures → stbasset (Phase 2)
+## Phase 2 — Three decisions to register before Session 0
 
-What stays in `games/fps/wolf3d.bpp`:
-- Maestro phase wiring (init/solo/base/render/quit)
-- Tilemap content (which cells are walls — the level layout)
-- Palette choice (which built-in or custom palette)
-- Player state (position, angle, FOV — too FPS-specific for stb)
-- Input mapping (Session 3)
-- Asset paths (Phase 2)
+These were aligned in the Phase 1 close meta-planning round.
+Re-confirm with the user before deviating.
 
-### Player state strategy: stbphys grows a chapter, not a sibling file
+### D1 — Entity storage
 
-Today's `stbphys.bsm` has a single `Body` struct that's
-**platformer-oriented**: gravity, jump, on_ground flag, axis-aligned
-hitbox. That doesn't fit the FPS player (rotation as primary input,
-no gravity, no jump, circular hitbox for wall sliding).
+**Decision: new cartridge `stb/stbentity.bsm`.**
 
-Two ways to evolve:
+Game-local `entities.bsm` was option (a), extending `stbphys` with
+an EntityList chapter was option (c). The two-consumer rule fires
+in advance: Wolf3D + future DOOM-clone-or-similar = two consumers
+expected, justifying the promotion to stb without waiting.
 
-- **Multiple files**: `stbphys_platformer.bsm`, `stbphys_fps.bsm`,
-  `stbphys_topdown.bsm`. Cleaner per-file but more imports and a
-  naming convention that doesn't exist yet.
-- **Chapters in one file**: keep `stbphys.bsm`, add sectioned
-  bodies (PlatformerBody / FPSBody / TopdownBody) with shared
-  primitives at the top. Single mental model, easy to find, splits
-  organically when the file passes ~1500 LOC.
-
-**Decision: chapters in one file, until size dictates a split.**
-
-For Phase 1 Session 3 (player movement), the right move is to add
-a Chapter to stbphys:
+**Cartridge surface (proposed):**
 
 ```bpp
-// stbphys.bsm — append after the existing platformer Body section.
-
-// ── Chapter: FPS (rotation + grid collision) ────────────────
-struct FPSBody {
-    x: float, y: float,         // world position in cell units
-    angle: float,               // facing radians
-    radius: float,              // circular hitbox for wall sliding
-    move_spd: float,            // forward/strafe speed
-    turn_spd: float             // angular speed
+struct Entity {
+    kind: byte,           // 1=enemy, 2=item, 3=projectile, 4=...
+    state: byte,          // FSM state index, kind-specific
+    flags: byte,          // alive bit + flags
+    sprite_id: byte,      // index into game's sprite atlas
+    x: float, y: float,   // world position
+    vx: float, vy: float, // velocity
+    hp: half,             // health if applicable
+    cooldown: half        // generic countdown timer (frames)
 }
 
-void fps_step(body: FPSBody, dt: float, tm) { ... }
-void fps_walk(body: FPSBody, forward: float, strafe: float, dt: float, tm) { ... }
-void fps_turn(body: FPSBody, da: float) { ... }
+ent_pool_new(cap)            // EntityPool with cap slots
+ent_spawn(pool, kind, x, y)  // returns entity handle or 0
+ent_kill(pool, handle)
+ent_alive(pool, handle)@base
+ent_at(pool, handle): Entity ptr
+ent_count(pool)@base
+ent_each(pool, fn_ptr)       // iterate alive entities, call fn(handle)
+ent_sort_by_depth(pool, px, py) // for sprite z-sort against player
 ```
 
-**Status:** the FPS chapter is already in place. `stb/stbphys.bsm`
-ships `FPSBody` + `fps_body` (constructor) + `fps_walk` / `fps_turn`
-stubs (Session 3 fills the bodies). `games/fps/wolf3d.bpp` already
-declares `extrn player;`, allocates it via `fps_body(8.0, 8.0, 0.0,
-0.3, 3.0, 2.0)` in the init phase, and reads `p.x` / `p.y` /
-`p.angle` in the render phase. Session 3 just wires input keys into
-`fps_walk` / `fps_turn`.
-
-The shared physics primitives (`rect_overlap` from `stbcol`,
-integrate_position) stay in stbphys's core chapter; each
-game-shape chapter consumes them.
-
-### Why the line count drops
-
-With reuse instead of reinvention, wolf3d.bpp drops from the original
-700-1000 LOC estimate to ~400-600 LOC final. Reuse kills 30-40% of
-the code Phase 1 would have written from scratch. This is the
-killer-feature payoff of tight-bound stb cartridges — every new
-game pays back the investment of the previous ones.
-
-## Files already in place
-
-```
-stb/stbrender.bsm            — EXTENDED this session.
-                               Two new generic primitives any
-                               column-based renderer can use:
-                               render_vertical_strip(col, y_start, y_end, color)
-                               render_textured_strip(col, y_start, y_end,
-                                                     tex, tex_x, tex_y_step)
-
-stb/stbraycast.bsm           — NEW Layer 2 cartridge.
-                               RayHit struct (distance:half float, tex_x:half,
-                               wall_type:byte, side:bit).
-                               cast_ray(hit, col, screen_w, px, py, pang, fov, tm)
-                                 — fills caller-allocated RayHit. Reads tm via
-                                   tile_get / tile_is_solid. DDA TODO Session 1.
-                               raycast_draw_column(hit, col, sw, sh, pal)
-                                 — projects + flat-fills via render_vertical_strip,
-                                   colour from palette_get(pal, hit.wall_type).
-                                   Body TODO Session 1, textured swap Session 2.
-
-games/fps/
-  wolf3d.bpp       — Entry point. Imports stbgame + stbtile + stbpal +
-                     stbrender + stbasset + stbraycast. maestro_register_*
-                     bindings + game_run() open the window.
-
-                     Phases:
-                       wolf3d_init_phase (@io)    — allocate Tilemap,
-                                                    pick palette, alloc
-                                                    RayHit buffer, set
-                                                    player position
-                       wolf3d_solo_phase (@solo)  — input → player
-                                                    (Session 3 TODO)
-                       wolf3d_base_phase (@base)  — parallel work (Phase 2)
-                       wolf3d_render_phase (@gpu) — per-column dispatch
-                                                    into stbraycast
-                       wolf3d_quit_phase (@io)    — cleanup
-
-                     Globals:
-                       FOV (float, ≈1.0472 = 60°)
-                       player (FPSBody*, allocated by fps_body in init)
-                       world_map (Tilemap*)
-                       wall_palette (Palette*)
-                       ray_hit (RayHit buffer, allocated once at init)
-
-                     Stubs:
-                       _wolf3d_init_map  — Session 1 implements with
-                                           tile_set + tile_solid loop
-                                           over the layout in the comment
-                       _wolf3d_load_textures — Phase 2
-
-  assets/          — Empty. Reserved for Phase 2 wall textures.
-  HANDOFF.md       — This file.
+Hitscan helper:
+```bpp
+ent_hitscan_ray(pool, x0, y0, dir_x, dir_y, max_dist) // returns hit handle or 0
 ```
 
-The smoke test passes: `./bpp games/fps/wolf3d.bpp -o /tmp/wolf3d`
-compiles cleanly with one pre-existing W026 warning from
-`stb/stbsound.bsm` (unrelated, ours-untouched). The binary opens a
-window and runs the maestro loop with empty render — black screen.
-Session 1 is the first session that produces visual output.
+### D2 — AI substrate
 
-Each file follows tonify discipline from line 1:
-- `global` for cross-callback mutable state, annotated `: float`
-  where they hold floats (FOV, plus the float fields inside FPSBody)
-- `extrn` for write-once-after-init data (`player`, `world_map`,
-  `wall_palette`, `ray_hit`)
-- `const` for compile-time literals (SCREEN_W, FPS, N_WORKERS)
-- `static` on every callback (file-private — only `main` calls them)
-- All callbacks have phase annotations matching their semantics:
-  init/quit @io, solo @solo, base @base, render @gpu
-- Cast_ray is `@io` (reads map via peek); cast_and_draw_column is
-  `@gpu` (writes pixels)
-- `: float` on float locals/parameters everywhere
-- `: half` / `: byte` slice annotations on RayHit struct fields for
-  compact storage
-- TODO markers calling out which session implements each piece
+**Decision: hand-rolled FSM per enemy type for Phase 2 Minimum.**
 
-### Maestro API used (matches snake_maestro.bpp pattern)
+Phase 2 ships ONE enemy type. A generic `stbfsm.bsm` is overkill at
+N=1; the cost flips at N=3+. When enemy variety grows (Phase 3
+Authentic), reopen with profile data showing the FSM pattern is
+real shared infrastructure.
 
+For now, the enemy AI lives game-local in
+`games/fps/wolf3d.bpp` (or a sibling `games/fps/ai.bsm` if it
+grows past ~150 LOC).
+
+### D3 — Door / per-cell state
+
+**Decision: extend `stbtile.Tilemap` with a per-cell state slot of
+WORD width.**
+
+Word, not byte. Open/closed is a bit; open/closing/closed/opening
++ timer is byte; physics state (lift Y-offset, rotating wall angle,
+animated wall phase) is word. Word future-proofs for free at
+2 KB extra per 16×16 map (negligible).
+
+**Tilemap struct addition:**
+
+```bpp
+struct Tilemap {
+    w, h, tw, th,
+    data,           // existing: type-id byte per cell
+    solid_mask,
+    tileset, tile_count, remap,
+    state           // NEW: word per cell, all uses (door anim, lift y, etc.)
+}
 ```
-maestro_set_workers(N)               // worker thread count
-maestro_register_init(fn_ptr(...))   // one-shot
-maestro_register_solo(fn_ptr(...))   // each tick, main thread
-maestro_register_base(fn_ptr(...))   // each tick, parallelisable
-maestro_register_render(fn_ptr(...)) // each frame, GPU
-maestro_register_quit(fn_ptr(...))   // shutdown
-game_run(W, H, "Title", FPS)         // opens window + runs loop
+
+API:
+```bpp
+tile_state_get(tm, gx, gy)@base
+tile_state_set(tm, gx, gy, val)
 ```
 
-Do NOT use the `stbgame_run(init, step, render)` shape — that signature
-doesn't exist in the current stbgame. The maestro_register_* / game_run
-combo is the canonical entry point.
+Doors then use the state slot for animation phase (0=closed, 1000=fully
+open, intermediate=animating). The renderer reads state to offset the
+column projection or skip the wall entirely while open.
 
 ---
 
-## Session-by-session plan
+## Phase 2 sessions (~7 sessions, ~780 LOC)
 
-### Session 1 — DDA + flat walls (no textures, no movement)
+| # | Session | Ships | stb impact | LOC |
+|---|---------|-------|------------|-----|
+| 0 | Map loader v2 | ASCII → tilemap + entity list (`# @ % ! e d k`) | extend stbtile (entity grammar parsing) | ~80 |
+| 1 | Sprites + depth buffer | Billboard sprite renders, walls occlude correctly | extend stbraycast (depth buf + draw_sprite) | ~200 |
+| 2 | Enemies (visible + AI) | Enemy sprite walks toward player via LoS raycast | new stbentity (D1) | ~150 |
+| 3 | Combat | Fire action, hitscan, damage, death | extend stbphys FPS (hitscan_ray) | ~100 |
+| 4 | Audio | Gunfire / scream / footsteps; volume by distance | uses existing stbsound + stbmixer | ~80 |
+| 5 | Doors + use | Tilemap state slot (D3), use action, slide-open animation | extend stbtile (per-cell state) | ~120 |
+| 6 | Polish + profile | Full level, profile under enemy load, tonify sweep | none | ~50 |
 
-**Goal:** open window, see flat-coloured walls in correct 3D
-projection. Player static. ~250 LOC.
+---
 
-**Files to fill in:**
-- `stb/stbraycast.bsm` — `cast_ray()` body. Lode tutorial section
-  "DDA" is the exact algorithm. Walk integer grid steps until the
-  map cell at `peek(map + map_y * map_w + map_x)` is non-zero.
-  Compute perpendicular distance (avoid fish-eye effect by
-  projecting onto view direction, not raw ray length). Return
-  RayHit populated.
-- `stb/stbraycast.bsm` — `raycast_draw_column()` body. Compute
-  `line_height = screen_h / hit.distance`, clamp to screen_h,
-  derive `draw_start = (screen_h - line_height) / 2`, paint vertical
-  span with a colour keyed off `hit.wall_type` (e.g. type 1 = light
-  grey, type 2 = mid grey). Use `render_rect(col, y, 1, height,
-  color)` for the column — it's the simplest stbrender primitive
-  that works (Phase 1 doesn't need a dedicated vertical-strip
-  primitive yet).
-- `games/fps/wolf3d.bpp::_wolf3d_init_map` — populate `world_map`
-  via `tile_set` + `tile_solid` calls following the hardcoded
-  layout in the file's comment (16x16 maze).
+## Sidequest queue (between Phase 1 close and Phase 2 attack)
 
-**Verification:**
-```bash
-./bpp games/fps/wolf3d.bpp -o /tmp/wolf3d
-/tmp/wolf3d
-# Expected: window opens, see grey walls in foreshortened 3D from
-# player position (8.0, 8.0) looking +x. Player doesn't move.
-# 60fps rock-solid (workload is tiny).
-```
+**Hold these until appetite returns; none block Session 0.**
 
-**Profile pass:**
-```bash
-# Modify wolf3d.bpp briefly to call sys_profile_start at frame 0,
-# stop at frame 600 (10 sec), dump top-N. Expected dominant samples:
-#   - cast_ray (or whatever its codegen synth name is)
-#   - cast_and_draw_column
-#   - layer_set / draw primitives
-# If sin/cos appear in top 5, plan native sin/cos primitive for
-# Session 5 optimization pass. If sqrt appears, same.
-```
+### 1. Profile HUD Tier 2/3
 
-### Session 2 — Texture mapping
+- **Tier 2 sparkline** — last N frames as a bar chart underneath
+  the FPS line. ~30 LOC of `render_rect` calls in stbprofile,
+  driven from the existing frame ring.
+- **Tier 3a per-thread breakdown** — bucketize profile_dump samples
+  by `_job_thread_idx` so the top-N shows main vs each worker.
+  Needs ~20 LOC in stbprofile + `_prof_capture_at` already
+  records the thread index.
+- **Tier 3b GPU timing** — Metal `MTLCommandBuffer.GPUStartTime`
+  + `GPUEndTime` events. Layer 4 territory; depends on what the
+  Metal driver exposes through `objc_msgSend`. Skip until profile
+  shows GPU-side bottleneck.
+- **Tier 3c scoped zones** — `@profile_zone("name") { ... }`
+  parser annotation that injects zone enter / exit calls. Real
+  compiler work (~50 LOC parser + codegen + ~30 LOC stbprofile).
+  Phase 7 polish stretch.
 
-**Goal:** walls show 64×64 textures sampled per column. Same maze,
-recognisable wall surfaces. ~150 LOC.
+### 2. `_to_buf` API split sweep across other stb cartridges
 
-**Files added/modified:**
-- `stb/stbrender.bsm` — extend with two generic column-drawing
-  primitives that benefit any column-based renderer (not just
-  raycasters):
-    `render_vertical_strip(col, y_start, y_end, color) @gpu`
-    `render_textured_strip(col, y_start, y_end, tex, tex_x, tex_y_step: float) @gpu`
-  These are GENERIC (per the Six-Layer Cake rule — useful for many
-  programs → Layer 2). 2D parallax scrollers, heatmaps, custom
-  column visualizers all benefit. Adding them to stbrender keeps
-  the surface area honest: any future ray-cast game (DOOM clone,
-  maze explorer) imports the same primitives, no copy-paste.
-- `stb/stbraycast.bsm` — `raycast_draw_column()` body switches
-  from `render_rect(col, y, 1, h, color)` (Phase 1 flat fill) to
-  `render_textured_strip(col, y_start, y_end, tex, hit.tex_x, step)`
-  (Phase 2 textured).
-- `games/fps/textures.bsm` (new, game-local) — load 4-8 PNG textures
-  via stbasset, store as 64×64 RGBA layers. Game-specific because
-  the texture set IS the game's identity. Public API
-  `texture_sample(tex_id, tex_x, tex_y)` returns RGBA pixel.
-- `games/fps/wolf3d.bpp::_wolf3d_load_textures` — wire textures.bsm
-  calls.
+Candidates (same architectural gain as stbtexture got — testable
+headless API + reusable CPU-side path):
 
-**Asset sourcing:** download free wall textures from kenney.nl
-(opengameart.org also works) sized 64×64. Place under
-`games/fps/assets/` as `wall_brick.png`, `wall_stone.png`,
-`wall_wood.png`, etc. Or hand-paint in any image editor — 64×64
-RGBA is small enough that 5 minutes per texture is fine.
+- `stbpal._fill_*` (currently private static helpers — promote)
+- `stbimage` PNG decode (`png_decode_to_buf` separate from upload)
+- `stbsound` WAV decode (`wav_decode_to_buf` separate from
+  audio upload)
 
-The id Software original Wolf3D shareware textures (VSWAP.WL1) are
-gratis-redistributable but require a parser for the 1992 disk
-format. Use modern PNGs for Session 2 simplicity. Authentic id
-textures can be a Phase 2 stretch goal ("retro mode").
+~30 min audit + ~1 h implementation.
 
-### Session 3 — Player movement + input (fill stbphys FPS chapter)
+### 3. SIGPROF dump-noise residual
 
-**Goal:** WASD walks, arrow keys turn, collision detection prevents
-walking through walls. ~100 LOC, but ~60 of those land in `stbphys`
-(reusable) and ~40 in `wolf3d.bpp` (game-specific input wiring).
+The 64 KB resolver guard from Phase 1 covers most cases. If any
+phantom samples persist in profile_dump output (e.g. attributing
+to dump_profile or profile_dump itself), add a sample-time filter:
+reject any captured PC whose resolved name is `profile_dump` /
+`_runtime_resolve_pc` / similar before tallying. Can also harden
+profile_stop to fence outstanding signals before returning.
 
-The FPS chapter scaffold is already in `stb/stbphys.bsm` (struct
-`FPSBody`, constructor `fps_body`, stubs for `fps_walk` and
-`fps_turn`). Session 3 fills the stub bodies and wires input.
+### 4. Maestro callback dt — pass µs instead of ms
 
-**Files modified:**
-- `stb/stbphys.bsm` — implement `fps_walk` and `fps_turn`:
-  ```bpp
-  void fps_walk(body, forward: float, strafe: float,
-                dt: float, tm) @base { ... }
-  void fps_turn(body, da: float, dt: float) @base { ... }
-  ```
-  Reuse `rect_overlap` from `stbcol` for collision (or implement
-  circle-vs-grid sliding directly — circle-on-axis-aligned-cell is
-  a 4-line check).
+Phase 1 fix kept the callback contract at ms (every existing caller
+expects ms). When refactoring callers en masse, switch `solo` /
+`base` callbacks to receive `dt` in µs and update fps_walk /
+fps_turn / similar to do `dt / 1_000_000` instead of
+`dt / 1_000`. Eliminates the 1 ms truncation residual that makes
+each physics step nominally 16 ms when the real value is 16.667 ms.
 
-- `games/fps/wolf3d.bpp` — solo phase reads input (`key_pressed` for
-  WASD + arrows) and calls `fps_walk` / `fps_turn` against the
-  already-allocated `player`. Tilemap is passed for collision.
+### 5. Diagnostic for `stat fps`-style HUD outside profile mode
 
-**Collision (inside fps_walk):**
-- Compute candidate (new_x, new_y) from forward + strafe + angle.
-- For each axis independently: check `tile_is_solid(tm,
-  tile_get(tm, floor(new_x), floor(player.y)))`. If solid, reject
-  X movement only. Same for Y. Sliding falls out naturally.
-- Optional: subtract `body.radius` from movement to keep the
-  player out of corners.
+A standalone "always-on FPS counter" via
+`profile_hud_draw_fps_only(x, y, sz, color)` that renders just the
+FPS line independent of the profile toggle. Useful for shipping
+games that want a permanent overlay without the recording UX.
 
-**Why stbphys gets a chapter (not a sibling file or game-local code):**
-See "Player state strategy: stbphys grows a chapter, not a sibling
-file" section above. Bottom line: when the second 2.5D shooter
-appears, it imports stbphys, gets fps_walk + fps_turn for free,
-zero copy-paste.
+---
 
-### Session 4 — Multi-wall map + ASCII map loader
+## Phase 2 Session 0 starting checklist
 
-**Goal:** load level from `assets/wolf3d/maps/level1.txt` instead
-of hardcoded layout. Multiple wall types per map. ~100 LOC.
+When the next agent picks up:
 
-**Files added/modified:**
-- `map.bsm` (new) — `load_map(path)` reads ASCII grid, parses
-  characters to wall type ids. `'#'` = type 1, `'@'` = type 2, etc.
-  Spaces / dots = empty.
-- `wolf3d.bpp::_wolf3d_init_map` — call `load_map("assets/wolf3d/maps/level1.txt")`.
-- `assets/wolf3d/maps/level1.txt` (new) — 16×16 ASCII map.
+1. Read `docs/journal.md` entry `2026-05-04` (Phase 1 close).
+2. Read this file (you are here).
+3. Read D1/D2/D3 above. Confirm with the user before deviating.
+4. Open `stb/stbtile.bsm` — add the `state` field + accessors.
+5. Write `tests/test_stbtile_state.bpp` to lock the contract.
+6. Update `games/fps/fps_3d.bpp` ASCII map to use entity glyphs
+   (`#@%! e d k`), and add the loader.
+7. After Session 0: `games/fps/fps_3d.bpp` should still build +
+   walk + profile, plus the loader handles the entity glyphs even
+   if Phase 2 hasn't placed any yet.
 
-### Session 5 — Profile + optimize
+Commit cadence: **one commit per session**, message format
+`fps3d phase2 sN: <one-line summary>`.
 
-**Goal:** confirm 60fps in M4, identify bottlenecks if any. ~50 LOC
-optimization + report. Decision point for opening Tier F.
+---
 
-**Approach:**
-- Run Phase 6 cooperative profiler around 600 frames of gameplay
-  (player auto-walks via test harness or manual play).
-- Dump top-20 functions by sample count.
-- If `cast_ray` is dominant and float math is hot path, consider:
-  - SIMD parallelism via `vec_*` primitives (4 rays at once)
-  - Native sin/cos primitives if Taylor series shows up high
-  - Loop CSE if same expression recomputed per ray (Tier F start)
-- If GPU upload dominates, that's stbrender / Cocoa territory, not
-  compiler.
-- If the profile is flat (no clear dominant), Phase 1 is shipped —
-  no optimization needed, move to Phase 2 or Sprint 5.
+## What NOT to do at Session 0
 
-**Output:** journal entry summarising findings + decision on whether
-Tier F gets opened next.
-
-### Session 6 (optional) — Polish + tonify pass
-
-**Goal:** apply tonify_checklist to all wolf3d/ files, doc updates,
-thematic commit series. ~50 LOC cleanup.
+- Don't pre-commit to the entity rendering shape. Session 1 owns
+  sprite + depth buffer; Session 0 just parses entity glyphs into
+  an array of `{kind, x, y}` records that Session 1 picks up.
+- Don't move `fps_3d.bpp` to `examples/` yet. The migration
+  happens at end of Phase 2 once content-rich Wolf3D replaces it
+  in `games/fps/`.
+- Don't open Tier F based on the Session 5 profile — explicitly
+  decided NOT to (CPU is mostly vsync idle; gargalo is GPU
+  presentation, not compute).
 
 ---
 
 ## Reference materials
 
-### Algorithm
+- Lode Vandevenne raycasting tutorial: lodev.org/cgtutor/raycasting
+  — Part 1 (DDA, already shipped), Part 3 (sprites, Session 1
+  reference).
+- `docs/journal.md` 2026-05-04 — Phase 1 retrospective.
+- `docs/how_to_dev_b++.md` "2.5D engine + textures + profiler" —
+  cartridge tour.
+- `docs/tonify_checklist.md` Rule 20 — promote-on-second-consumer.
+- `docs/warning_error_log.md` Known compiler diagnostic gaps —
+  W027 + diagnostic candidates.
 
-**Lode Vandevenne's raycasting tutorial — lodev.org/cgtutor/raycasting.html**
-
-Sections needed for Phase 1:
-- Part 1 "Raycasting" — DDA explained step by step, ~30 lines of
-  pseudocode that translate directly to B++.
-- Part 2 "Textured raycaster" — texture x derivation from wall hit
-  point, vertical scaling math.
-
-Skip for Phase 1 (Phase 2+):
-- Part 3 "Sprites" — billboarding, depth sort.
-- Part 4 "Doors" — animated map cells.
-- Part 5 "Floor + ceiling" — two extra ray passes; Phase 2 stretch.
-
-### Original source (historical reference, NOT for line-by-line port)
-
-**github.com/id-Software/wolf3d** — id Software's 1995 GPL release.
-30K+ lines of C with 1992 DOS-isms (segmented memory, soft blitting,
-hand-tuned x86 asm). Useful for understanding decisions but NOT the
-right reference for a clean modern port. Lode's tutorial is the
-canonical source for that.
-
-### Assets
-
-- **Free game-ready textures:** kenney.nl (CC0 license, no
-  attribution required), opengameart.org (mixed licenses, check each).
-- **Wolf3D shareware files:** legally redistributable but need a
-  decoder for VSWAP.WL1. Skip for Phase 1; consider for "retro
-  authenticity" Phase 2 mode.
-
----
-
-## Architectural risks to watch
-
-### 1. Float annotation discipline (Tonify Rule 12)
-
-Ray casting is float-heavy. Every local that holds a float MUST be
-annotated `: float` or it silently degrades to int. The pattern:
-
-```bpp
-// WRONG — silent truncation, ray cast produces garbage:
-auto distance;
-distance = sqrt(dx * dx + dy * dy);
-
-// RIGHT — keeps IEEE bits:
-auto distance: float;
-distance = sqrt(dx * dx + dy * dy);
-```
-
-This is the #1 silent failure mode of ray cast in B++. Every helper
-in `raycast.bsm` and `render.bsm` should be reviewed for float
-annotations on every local.
-
-### 2. sin/cos cost (probably non-issue, profile to confirm)
-
-`bpp_math.bsm` provides `sin` and `cos` via Taylor series approx
-(no FPU sin/cos in ARM64). Each call is ~50 cycles vs ~5 for a
-native primitive. Per ray = 1 sin + 1 cos call → 38400 × 2 × 50 =
-3.84M cycles/sec = ~0.1% on M4. Negligible.
-
-If it shows up dominant in profile (unlikely), the fix is a
-chip primitive `_a64_emit_fsin` / `_a64_emit_fcos` that emits a
-direct FPU instruction. ARM64 doesn't have FSIN, so the actual
-fallback is a precomputed lookup table or higher-order polynomial.
-Either way, post-Phase 1 work, only if profile demands.
-
-### 3. Worker auto-promote inside ray cast
-
-Phase 6 closed the recursive deadlock guard, so calling
-`job_parallel_for` inside a ray cast won't deadlock — it'll just
-run serial. But the per-column ray cast IS the natural worker
-parallelism. If Phase 1 wraps the column loop in
-`job_parallel_for(SCREEN_W, fn_ptr(cast_and_draw_column))`,
-columns dispatch to workers automatically. Worth profiling
-serial vs parallel in Session 5 to see if 4 workers matters at
-this workload.
-
-Caveat: drawing into a shared layer from multiple threads needs
-either per-worker scratch buffers or atomic pixel writes (which
-B++ doesn't have for sub-word). Probably easier to keep the loop
-serial in Phase 1; revisit for Phase 2 when sprite + enemy work
-makes parallelism worth the bookkeeping.
-
-### 4. Profiler integration from Session 1
-
-DON'T wait for Phase 1 completion to use the profiler. From
-Session 1's first frame, the workflow should be:
-
-```bash
-./bpp games/fps/wolf3d.bpp -o /tmp/wolf3d
-/tmp/wolf3d  # runs interactively, prints profile summary on exit
-```
-
-Profile reveals architectural surprises early — if `peek` /
-`buf_word_at` / similar primitive shows dominant on a "should be
-float math" workload, something is off in codegen. Catching that
-in Session 1 is easier than after 6 sessions of accumulated code.
-
----
-
-## Decision point at end of Phase 1
-
-After Session 5's profile pass, three branches:
-
-1. **60fps confirmed, no clear bottleneck** → ship Phase 1, open
-   Sprint 5 (Linux dynlink) or start Phase 2 (sprites + enemies).
-2. **Clear hot path in B++ codegen** (e.g. CSE opportunity in ray
-   loop) → open Tier F with concrete justification.
-3. **Bottleneck in stbrender / GPU upload** → optimization is in
-   stb cartridge land, not compiler — stash Tier F, fix stb and
-   continue.
-
-The profile data IS the deliverable of Session 5. Don't ship
-Phase 1 without that report.
-
----
-
-## Tonify checklist reminder
-
-Every new function in this project MUST follow `docs/tonify_checklist.md`.
-The skeleton files already do. Pattern reminders:
-
-- File-scope vars: `extrn` (set-once) | `global` (cross-module) |
-  `const` (literal) | `static auto` (file-private). No bare `auto`.
-- Functions called only inside their file: `static`.
-- Side-effect helpers (no return value): `void` + bare `return`.
-- Phase annotation on every function: `@io` / `@base` / `@gpu` /
-  `@time` / `@solo`.
-- Float locals: `: float` annotation always.
-- Public API params: full type hints, `(x: float, n: half)` not
-  `(x, n)`.
-- Use `peek_h/q/w` / `peekfloat_h/peekfloat` — never byte-assemble.
-- Use `buf_fill` / `buf_copy` / `buf_cmp` instead of hand-rolled loops.
-- Output via `put` / `put_err` (smart dispatch), not legacy
-  `putstr`/`putnum`.
-- String building via `strbuf_*`, not manual malloc.
-
-If you find yourself bare-`auto`-ing a file-scope variable or
-omitting `:float` on a float local, stop and re-read Rules 1, 2, 12.
-
----
-
-## Next session entry point
-
-Open `stb/stbraycast.bsm` and start with Session 1:
-
-1. Read Lode's raycasting tutorial Part 1 (~10 minutes).
-2. Translate the DDA pseudocode into the `cast_ray` body.
-3. Fill in `_wolf3d_init_map` with the 16x16 layout.
-4. Implement `cast_and_draw_column` flat-fill version.
-5. Compile, run, take screenshot of the first textureless walls.
-6. Profile a 600-frame run, save top-N to journal.
-7. Commit: `wolf3d Phase 1 Session 1: DDA + flat walls`.
-
-Estimated session length: 1.5–2 hours including profile pass.
-
-Bootstrap byte-stable check after the commit:
-```bash
-BPP_BUILD_ID=00000000000000000000000000000000 ./bpp src/bpp.bpp -o /tmp/g1
-BPP_BUILD_ID=00000000000000000000000000000000 /tmp/g1 src/bpp.bpp -o /tmp/g2
-diff <(xxd /tmp/g1) <(xxd /tmp/g2)   # must be silent
-```
-
-(Bootstrap shouldn't change just from adding a game source — but
-verify because the wolf3d.bpp `import` of `stbasset` etc. exercises
-auto-injection paths.)
-
-Suite check after commit:
-```bash
-bash tests/run_all.sh        # expect 126/0/12 (no new tests yet)
-bash tests/run_all_c.sh      # expect 105/0/33
-```
-
----
-
-## Memory file to write at end of Session 1
-
-After Session 1 ships, write a memory note at
-`~/.claude/projects/-Users-Codes-b--/memory/project_wolf3d_session_<N>.md`:
-
-```
-# project_wolf3d_session_1.md
-
-Wolf3D Phase 1 Session 1 SHIPPED. Flat walls + DDA render correctly,
-player static at (8.0, 8.0). 60fps confirmed in M4 (~98% idle).
-Profile top-3: cast_ray, cast_and_draw_column, layer_set_pixel.
-Float annotation discipline held — no silent int degradation.
-Next: Session 2 = texture mapping. Files: <list>. Commit: <sha>.
-```
-
-Each subsequent session gets its own memory file, so the project
-stays cold-context-resumable.
-
----
-
-## Closing note
-
-Wolf3D is the deliverable that converts B++ from "well-engineered
-language with games" to "language that ships Wolfenstein". Phase 6's
-profiler exists exactly to make this profile-driven. Don't optimize
-anything in Phase 1 without profile data. Don't open Tier F before
-Phase 1 ships. Don't open Sprint 5 (Linux) until Phase 1 is on macOS.
-
-The ouroboros closes another full turn here: profiler → game → profile
-data → compiler decision. That sequence is the project's identity.
-
-Boa caçada.
+Boa caçada na Phase 2.

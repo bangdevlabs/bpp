@@ -13,30 +13,31 @@
 // stbraycast is intentionally minimal. It composes with cartridges
 // that already exist rather than reinventing them:
 //
-//   stbtile.Tilemap   — the map (cell data, dimensions, solid mask).
-//                       cast_ray walks `tm.data` via tile_get and
-//                       stops on tile_is_solid(tm, cell). Future
-//                       games loading levels with tile_new + the
-//                       Session 4 ASCII map loader plug straight in.
-//   stbpal.Palette    — colours for flat-fill (Phase 1) and tinting
-//                       (any phase). raycast_draw_column reads
-//                       palette_get(pal, hit.wall_type) for the
-//                       column's colour. Built-in palettes
-//                       (PAL_DB_32, PAL_PICO_8, etc.) work out of
-//                       the box.
-//   stbrender         — the actual pixel writes (render_vertical_strip
-//                       for Phase 1 flat fill, render_textured_strip
-//                       for Phase 2 textured walls).
+//   stbtile.Tilemap  — the map (cell data, dimensions, solid mask).
+//                      cast_ray walks `tm.data` via tile_get and
+//                      stops on tile_is_solid(tm, cell). Future
+//                      games loading levels with tile_new + the
+//                      Session 4 ASCII map loader plug straight in.
+//   stbtexture       — the wall surfaces. Caller picks textures via
+//                      `texture_brick`, `texture_stone`, `texture_wood`,
+//                      `texture_solid` (flat-fill via texture, no
+//                      special-case path), or any future generator,
+//                      then dispatches per `hit.wall_type` to the
+//                      right handle.
+//   stbrender        — the actual pixel writes
+//                      (`render_textured_strip` does the per-column
+//                      sampling + tint).
 //
 // What stbraycast OWNS exclusively:
 //   - the DDA + projection math
 //   - the RayHit struct (compact, sub-word slices)
 //   - the per-column draw helper that ties cast_ray output to
-//     stbrender + stbpal lookups
+//     stbrender + caller-supplied textures
 //
 // What stays in the calling game (NOT in stbraycast):
 //   - level layout (tile_set calls in init)
-//   - palette choice (which built-in or custom palette to use)
+//   - texture choice (which generator, which colours, which dimensions)
+//   - the wall_type → texture handle dispatch table
 //   - player state (position, angle, FOV — too FPS-specific for stb)
 //   - input mapping (WASD vs arrow keys vs gamepad)
 //   - assets (texture file paths)
@@ -49,8 +50,7 @@
 
 import "bpp_math.bsm";       // sqrt, sin, cos, abs
 import "stbtile.bsm";        // Tilemap, tile_get, tile_is_solid
-import "stbpal.bsm";         // Palette, palette_get
-import "stbrender.bsm";      // render_vertical_strip / render_textured_strip
+import "stbrender.bsm";      // render_textured_strip
 
 // ── Ray hit result ─────────────────────────────────────────
 
@@ -74,6 +74,11 @@ struct RayHit {
     wall_type: byte,
     side: bit
 }
+
+// Float trig + abs + floor moved to `bpp_math.bsm` (auto-injected)
+// when stbphys grew an FPSBody walker that also needs them. Two
+// consumers met the "promote up" threshold; private `_rc_*` helpers
+// are gone — call `sin_f`, `cos_f`, `abs_f`, `floor_f` directly.
 
 // ── Public API ─────────────────────────────────────────────
 
@@ -101,47 +106,201 @@ struct RayHit {
 // Session 5 to confirm float ops actually use FPR registers
 // rather than degrading via missing `:float` annotations.
 //
-// TODO Session 1: implement DDA loop body. Reference:
-// lodev.org/cgtutor/raycasting Part 1 "Raycasting".
+// Algorithm: Lode Vandevenne's DDA — start at the player cell, walk
+// integer grid steps along whichever axis has the closer next-side
+// distance, stop when the cell is solid. Perpendicular distance is
+// projected onto the view direction so flat walls render as flat
+// (no fish-eye); raw ray length would curve them.
 void cast_ray(hit: RayHit, col: half, screen_w: half,
               px: float, py: float, pang: float, fov: float,
               tm) @io {
-    hit.distance = 1000.0;
-    hit.tex_x = 0;
-    hit.wall_type = 0;
-    hit.side = 0;
+    auto t: Tilemap;
+    auto dir_x: float, dir_y: float;
+    auto plane_x: float, plane_y: float;
+    auto half_fov: float, plane_len: float;
+    auto camera_x: float;
+    auto ray_dx: float, ray_dy: float;
+    auto delta_x: float, delta_y: float;
+    auto side_x: float, side_y: float;
+    auto map_x: word, map_y: word;
+    auto step_x: word, step_y: word;
+    auto side: word, hit_cell: word;
+    auto perp: float, wall_x: float;
+    auto cell_val: word;
+
+    t = tm;
+
+    // Direction vector — unit length because dir = (cos, sin).
+    dir_x = cos_f(pang);
+    dir_y = sin_f(pang);
+
+    // Camera plane vector — perpendicular to dir, scaled by tan(fov/2)
+    // so a column at the screen edge maps to a ray at ±fov/2 from dir.
+    half_fov = fov * 0.5;
+    plane_len = sin_f(half_fov) / cos_f(half_fov);    // tan(fov/2)
+    plane_x = 0.0 - dir_y * plane_len;
+    plane_y = dir_x * plane_len;
+
+    // Camera-space x: maps screen column [0..screen_w-1] to [-1..+1].
+    camera_x = 2.0 * col / screen_w - 1.0;
+    ray_dx = dir_x + plane_x * camera_x;
+    ray_dy = dir_y + plane_y * camera_x;
+
+    // Initial map cell. FCVTZS truncates toward zero — fine while
+    // px, py stay non-negative (Phase 1 maps + FPSBody clamps).
+    map_x = px;
+    map_y = py;
+
+    // Distance the ray travels to cross one full cell along each axis.
+    // 1e30 stands in for "infinite" when the ray is axis-aligned.
+    if (ray_dx == 0.0) { delta_x = 1.0e30; }
+    else               { delta_x = abs_f(1.0 / ray_dx); }
+    if (ray_dy == 0.0) { delta_y = 1.0e30; }
+    else               { delta_y = abs_f(1.0 / ray_dy); }
+
+    // Step direction and initial side distance — distance from the
+    // player position to the first vertical / horizontal grid line.
+    if (ray_dx < 0.0) {
+        step_x = 0 - 1;
+        side_x = (px - map_x) * delta_x;
+    } else {
+        step_x = 1;
+        side_x = (map_x + 1.0 - px) * delta_x;
+    }
+    if (ray_dy < 0.0) {
+        step_y = 0 - 1;
+        side_y = (py - map_y) * delta_y;
+    } else {
+        step_y = 1;
+        side_y = (map_y + 1.0 - py) * delta_y;
+    }
+
+    // DDA — advance along the axis whose next gridline is closer,
+    // then re-test. Loop terminates either at a solid cell or when
+    // the ray escapes the map.
+    hit_cell = 0;
+    side = 0;
+    while (hit_cell == 0) {
+        if (side_x < side_y) {
+            side_x = side_x + delta_x;
+            map_x = map_x + step_x;
+            side = 0;
+        } else {
+            side_y = side_y + delta_y;
+            map_y = map_y + step_y;
+            side = 1;
+        }
+        if (map_x < 0 || map_y < 0 || map_x >= t.w || map_y >= t.h) {
+            hit.distance = 1000.0;
+            hit.tex_x = 0;
+            hit.wall_type = 0;
+            hit.side = 0;
+            return;
+        }
+        cell_val = tile_get(tm, map_x, map_y);
+        if (tile_is_solid(tm, cell_val)) {
+            hit_cell = cell_val;
+        }
+    }
+
+    // Perpendicular distance — projects the ray onto view direction
+    // so all rays at the same depth produce equal line heights.
+    if (side == 0) { perp = side_x - delta_x; }
+    else           { perp = side_y - delta_y; }
+
+    // Texture column — fractional position along the wall the ray
+    // hit. Phase 1 ignores this; Phase 2 multiplies by texture width
+    // before sampling. Stored as 0..63 here assuming 64-wide textures.
+    if (side == 0) { wall_x = py + perp * ray_dy; }
+    else           { wall_x = px + perp * ray_dx; }
+    wall_x = wall_x - floor_f(wall_x);
+
+    hit.distance = perp;
+    hit.tex_x = wall_x * 64.0;
+    hit.wall_type = hit_cell;
+    hit.side = side;
 }
 
-// Draw the vertical wall strip for one screen column, given the
-// ray hit result. Phase 1 ships flat-colour fill via
-// `render_vertical_strip(col, y_start, y_end, color)` where
-// `color = palette_get(pal, hit.wall_type)` (so wall type 1 might
-// be a brown palette entry, type 2 grey, etc.). Phase 2 swaps the
-// flat fill for `render_textured_strip(col, y_start, y_end, tex,
-// hit.tex_x, tex_y_step)` and the palette argument becomes
-// optional (texture pixels override palette).
+// Draw the vertical wall strip for one screen column, given the ray
+// hit result. Samples a 1-pixel-wide column of `tex` at the texture
+// column `hit.tex_x` and stretches it to the projected wall height.
 //
 // Projection math:
 //   line_height = screen_h / hit.distance       (clamped to screen_h)
 //   draw_start  = (screen_h - line_height) / 2
 //   draw_end    = draw_start + line_height
 //
-// `pal` is a Palette pointer from stbpal. The caller picks which
-// built-in (PAL_DB_32, PAL_PICO_8, ...) or custom palette fits the
-// art direction. A palette with at least N+1 entries (where N is
-// the highest wall_type value used in the map) is required.
+// `tex` is a GPU texture handle the caller looks up from
+// `hit.wall_type` — the cartridge is wall-type-blind on purpose so a
+// game can drive the texture choice without wiring a callback. A
+// typical caller dispatches via a switch:
 //
-// `hit.side` bit 0 = NS wall, 1 = EW wall. The body should darken
-// the EW colour by ~30% (classic Wolf3D look) so adjacent walls of
-// the same type read as distinct surfaces under perspective. The
-// darkening is colour-channel arithmetic, doesn't need extra
-// palette entries.
+//     switch (hit.wall_type) {
+//         1 { tex = TEX_BRICK; }
+//         2 { tex = TEX_STONE; }
+//         3 { tex = TEX_WOOD;  }
+//         else { return; }
+//     }
 //
-// TODO Session 1: implement projection + flat fill via
-// render_vertical_strip + palette_get.
-// TODO Session 2: switch to render_textured_strip with hit.tex_x.
+// `tex_w` is the texture's width in pixels (needed for u-coord
+// normalisation). All Wolf3D-class wall sets share a power-of-two
+// width (typically 64).
+//
+// `hit.side` bit 0 = NS wall, 1 = EW wall. EW walls render with a
+// 70% grey tint so adjacent cells of the same type read as distinct
+// surfaces under perspective — the classic Wolfenstein 3D look.
 void raycast_draw_column(hit: RayHit, col: half,
-                         screen_w: half, screen_h: half, pal) @gpu {
-    // Stub — Session 1 fills this in. Compiles + links so the
-    // calling game's render loop can invoke it from day 1.
+                         screen_w: half, screen_h: half,
+                         tex, tex_w: half) @gpu {
+    auto h: RayHit;
+    auto sh: float, dist: float, line_height: float;
+    auto draw_start: word, draw_end: word;
+    auto tint: word;
+    auto tex_x: word;
+
+    h = hit;
+
+    // Wall_type 0 means the ray escaped the map. Leave the column to
+    // whatever the frame clear / floor pass painted earlier.
+    if (h.wall_type == 0) { return; }
+    if (tex == 0)         { return; }   // game hasn't loaded textures yet
+
+    sh = screen_h;
+    dist = h.distance;
+    // Guard against zero-distance hits (player standing inside a
+    // wall) to keep the projection finite.
+    if (dist < 0.001) { dist = 0.001; }
+
+    line_height = sh / dist;
+    // FCVTZS truncates the float midpoint toward zero; that is what
+    // we want for a centered strip — a one-row asymmetry is invisible.
+    draw_start = (sh - line_height) * 0.5;
+    draw_end = draw_start + line_height;
+
+    if (draw_start < 0) { draw_start = 0; }
+    if (draw_end > screen_h) { draw_end = screen_h; }
+
+    // EW walls darken to ~70% — keeps neighbouring same-type walls
+    // visually distinct under perspective. NS walls render at full
+    // brightness (white tint = no modulation in the fragment shader).
+    if (h.side == 1) { tint = 0xFFB0B0B0; }
+    else             { tint = 0xFFFFFFFF; }
+
+    // hit.tex_x was scaled to the [0, 64) assumed texture width by
+    // cast_ray. Re-scale to the caller-supplied tex_w when the wall
+    // set uses a different size.
+    //
+    // Forward-compat: today every caller in this repo uses 64-pixel
+    // textures so the conditional never fires. The branch is kept
+    // explicit (rather than baked into cast_ray's tex_x output) so
+    // future wall sets at 32 / 128 / non-power-of-two sizes drop in
+    // by passing a different tex_w — no cast_ray rework needed. Do
+    // not "clean up" as dead code.
+    tex_x = h.tex_x;
+    if (tex_w != 64) {
+        tex_x = tex_x * tex_w / 64;
+    }
+
+    render_textured_strip(col, draw_start, draw_end,
+                          tex, tex_x, tex_w, tint);
 }

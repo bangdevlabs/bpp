@@ -112,6 +112,56 @@ static _val_name_eq(name_p, lit, len)@base {
     return buf_eq(vbuf + unpack_s(name_p), lit, len);
 }
 
+// W027 — fire when the call site is `fn_ptr(callee)` and `callee`
+// declares any parameter with a `: float` annotation. The dynamic
+// `call(fp, args...)` dispatch passes integer args via GP registers
+// only and never emits FCVT, so a callee reading the param from FP
+// register `d0` lands stale data (typically zero). Catch the trap
+// at the fn_ptr site so the warning is close to the unsafe
+// pointer's birthplace.
+//
+// Returns silently when this is not an `fn_ptr(...)` call, when the
+// arg is not a plain identifier, or when the callee has no float
+// params. Only fires once per fn_ptr — the first float param is
+// enough to surface the issue.
+static void _val_check_fn_ptr(name_p, nd) {
+    auto n: Node, an: Node;
+    auto fp_arg, fp_target_p, fp_fi, fp_func, fp_hints, fp_pcnt, fp_j;
+
+    if (nd == 0)                        { return; }
+    if (unpack_l(name_p) != 6)          { return; }
+    if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", 6) == 0) { return; }
+    n = nd;
+    if (n.c != 1)                       { return; }
+
+    fp_arg = n.b[0];
+    if (fp_arg == 0)                    { return; }
+    an = fp_arg;
+    if (an.ntype != T_VAR)              { return; }
+
+    fp_target_p = an.a;
+    fp_fi = val_find_func(fp_target_p);
+    if (fp_fi < 0)                      { return; }
+
+    fp_func = funcs[fp_fi];
+    fp_hints = *(fp_func + FN_HINTS);
+    if (fp_hints == 0)                  { return; }
+
+    fp_pcnt = *(fp_func + FN_PCNT);
+    for (fp_j = 0; fp_j < fp_pcnt; fp_j++) {
+        if (is_float_type(fp_hints[fp_j]) == 0) { continue; }
+        diag_warn(27);
+        diag_str("fn_ptr to '");
+        diag_packed(fp_target_p);
+        diag_str("' which declares a `: float` parameter — `call()` passes args via GP registers only and the float param will read garbage from a stale FP register");
+        diag_newline();
+        _val_show_context_at(n.src_tok);
+        diag_help("drop the `: float` annotation on the callee's parameter and convert internally: `auto x_f: float; x_f = x; x_f = x_f / 1000.0;`");
+        diag_newline();
+        return;
+    }
+}
+
 // Return 1 if `name_p` refers to a compiler-emitted builtin. The set is
 // closed — any call to a name not listed here and not declared by the
 // user's source falls through to E201. Grouped by family so a future
@@ -624,6 +674,10 @@ val_check_node(nd) {
             }
         }
         if (val_is_builtin(name_p)) {
+            // W027 — fn_ptr targeting a function with a `: float`
+            // parameter. Body factored out into `_val_check_fn_ptr`
+            // so the nesting here stays at one line.
+            _val_check_fn_ptr(name_p, nd);
             if (buf_eq(vbuf + unpack_s(name_p), "call", unpack_l(name_p))) { if (unpack_l(name_p) == 4) {
                 for (ai = 0; ai < n.c; ai++) {
                     arg_nd = n.b[ai];
@@ -776,6 +830,10 @@ val_check_node(nd) {
         val_check_node(n.a);
         val_check_list(n.b, n.c);
         if (n.e != 0) { val_check_node(n.e); }
+        return 0;
+    }
+    T_BLOCK {
+        val_check_list(n.b, n.c);
         return 0;
     }
     T_MEMLD { val_check_node(n.a); return 0; }

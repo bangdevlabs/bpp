@@ -270,108 +270,17 @@ mo_packed_eq(a, b) {
 }
 
 // ── Float literal parsing ─────────────────────────────────────
+//
+// String-to-IEEE-bits parsing lives in `cg_parse_float_bits`
+// (`src/bpp_codegen.bsm`) — it is pure compute, chip- and
+// OS-agnostic, and shared with the ELF writer. This file only owns
+// the Mach-O `mo_flt_data` table.
 
-// Parse a decimal float string (e.g., "3.14") and return its IEEE 754 bits.
-// Uses pure integer arithmetic to compute the 64-bit double bit pattern.
-// This avoids the C backend's double-to-long-long conversion problem.
-mo_atof(s) {
-    auto ch, i, neg, int_part, frac_val, frac_scale;
-    auto num, den, p, scaled_den, mantissa, bit_idx, exp_bits;
-
-    neg = 0;
-    i = 0;
-    ch = peek(s);
-    if (ch == 45) { neg = 1; i++; }
-
-    // Parse integer part.
-    int_part = 0;
-    ch = peek(s + i);
-    while (ch >= 48) {
-        if (ch <= 57) {
-            int_part = int_part * 10 + ch - 48;
-            i++;
-            ch = peek(s + i);
-        } else {
-            ch = 0;
-        }
-    }
-
-    // Parse fractional part.
-    frac_val = 0;
-    frac_scale = 1;
-    if (peek(s + i) == 46) {
-        i++;
-        ch = peek(s + i);
-        while (ch >= 48) {
-            if (ch <= 57) {
-                frac_val = frac_val * 10 + ch - 48;
-                frac_scale *= 10;
-                i++;
-                ch = peek(s + i);
-            } else {
-                ch = 0;
-            }
-        }
-    }
-
-    // Combine into rational num/den.
-    num = int_part * frac_scale + frac_val;
-    den = frac_scale;
-
-    // Special case: zero.
-    if (num == 0) { return 0; }
-
-    // Find exponent p such that 2^p <= num/den < 2^(p+1).
-    if (num >= den) {
-        // Value >= 1.0: scale den up until it matches num's magnitude.
-        scaled_den = den;
-        p = 0;
-        while (scaled_den + scaled_den <= num) {
-            scaled_den += scaled_den;
-            p++;
-        }
-        num -= scaled_den;
-    } else {
-        // Value < 1.0: scale num up until it reaches den.
-        p = -1;
-        num += num;
-        while (num < den) {
-            num += num;
-            p--;
-        }
-        num -= den;
-        scaled_den = den;
-    }
-
-    // Extract 52 mantissa bits by successive doubling (MSB first).
-    mantissa = 0;
-    bit_idx = 0;
-    while (bit_idx < 52) {
-        num += num;
-        mantissa += mantissa;
-        if (num >= scaled_den) {
-            mantissa++;
-            num -= scaled_den;
-        }
-        bit_idx++;
-    }
-
-    // Round to nearest: check the 53rd bit.
-    num += num;
-    if (num >= scaled_den) { mantissa++; }
-
-    // Assemble IEEE 754 double: sign(1) | exponent(11) | mantissa(52).
-    // Adding 2048 to exp_bits sets bit 63 (sign) after the shift.
-    exp_bits = p + 1023;
-    if (neg) { exp_bits += 2048; }
-    return (exp_bits << 52) + mantissa;
-}
-
-// Store a float literal's raw IEEE 754 bits in the float data buffer.
-mo_add_float(str_ptr) {
-    auto bits;
-    bits = mo_atof(str_ptr);
-    mo_flt_data = arr_push(mo_flt_data, bits);
+// Store a float literal's IEEE 754 bits in the float data buffer.
+// `p` is the packed (offset, length) into `cg_sbuf` produced by
+// `cg_emit_lit` when it registers a float literal.
+mo_add_float(p) {
+    mo_flt_data = arr_push(mo_flt_data, cg_parse_float_bits(p));
 }
 
 // Store a string literal in the binary string data buffer.

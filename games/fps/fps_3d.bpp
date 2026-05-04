@@ -1,0 +1,421 @@
+// fps_3d.bpp — Generic 2.5D ray-cast FPS skeleton, Phase 1 deliverable.
+//
+// The file's working name was "wolf3d.bpp" since Phase 2+ ships a
+// Wolfenstein-3D-style game on top of this engine (sprites, enemies,
+// weapons, levels — id-Software-class content). What lives here is
+// the GENERIC engine: ray casting + textured walls + FPS movement +
+// runtime profile HUD, with placeholder procedural textures and no
+// content beyond a single test maze. When Phase 2+ Wolf3D ships
+// proper, this file migrates to `examples/fps_3d.bpp` as the
+// reference 2.5D raycasting template every future B++ game (DOOM
+// clone, dungeon crawler, maze explorer) can fork from.
+//
+// Goal of Phase 1: ray cast a small grid map and render textured
+// vertical wall strips to the screen, with player movement (WASD +
+// rotate). No sprites, no enemies, no audio, no doors — that's
+// Phase 2+. This Phase 1 alone is the "you can walk through a
+// textured maze in pure B++" milestone — proof that the engine,
+// stb cartridges, and runtime profiler all hold together end to
+// end.
+//
+// Architecture is maestro-driven (matches snake_maestro.bpp pattern):
+//   solo phase   — input handling + player state mutation
+//   base phase   — per-column ray cast (worker-parallelisable when
+//                  sprite list grows; Phase 1 main-thread is fine)
+//   render phase — flush column strips to GPU layer
+//
+// Why ray casting (not full 3D): Wolfenstein 3D used 2D grid + ray
+// casting precisely because it ran on 1992 hardware. The algorithm
+// is mathematically clean (DDA traversal, ~30 ops per ray), maps
+// perfectly onto column-parallel work (each screen column is
+// independent), and has a well-documented implementation tutorial
+// (Lode Vandevenne's raycasting tutorial — lodev.org/cgtutor/raycasting).
+// Modern hardware runs 640 columns × 60fps × ~30 ops = ~1.2M float
+// ops/sec which is ~0.04% of an M4 P-core. The whole game is
+// trivially within budget; the work is in writing it cleanly, not in
+// hitting performance.
+//
+// Phase 1 deliverable: open window, see textured walls, walk around.
+// Phase 1 stretch goal: 60fps confirmed via the Phase 6 profiler,
+// which is THE point of doing this — close the ouroboros loop where
+// the profiler gets used on a real game and reveals what (if
+// anything) needs Tier F compiler optimization.
+
+// stbgame auto-injects: stb_core, bpp_io, bpp_array, bpp_buf,
+// bpp_str, bpp_math, bpp_beat, bpp_job, bpp_maestro, _stb_platform.
+// Explicit imports below cover stb cartridges this game opts into.
+//
+// stbraycast is the new (with this project) generic 2.5D ray cast
+// cartridge — the DDA algorithm + projection math live there
+// because they're not Wolf3D-specific. Any future B++ game that
+// wants 2.5D walls imports the same module.
+//
+// Composition: stbraycast pulls in stbtile (map representation) and
+// stbpal (palette lookup) transitively; we import them explicitly
+// here too so the dependency is visible in this file (not hidden in
+// stbraycast). stbgame auto-injects core runtime; stbasset is for
+// Phase 2 texture loading.
+import "stbgame.bsm";
+import "stbtile.bsm";      // Tilemap struct (replaces hand-rolled byte grid)
+import "stbphys.bsm";      // FPSBody from Chapter FPS — player state
+import "stbrender.bsm";    // GPU draw primitives + render_textured_strip
+import "stbtexture.bsm";   // texture_brick / texture_stone / texture_wood / texture_solid
+import "stbraycast.bsm";   // cast_ray + raycast_draw_column
+import "stbprofile.bsm";   // runtime profiler + REC HUD overlay
+
+// ── Compile-time constants ─────────────────────────────────
+
+const SCREEN_W = 640;
+const SCREEN_H = 480;
+const FPS = 60;
+const N_WORKERS = 4;       // Phase 2 sprite/enemy parallelism
+
+// Map is 16x16 cells, 1.0 unit per cell. Float coordinates within
+// cells; integer cell index is floor(x), floor(y).
+const MAP_W = 16;
+const MAP_H = 16;
+
+// Wall texture dimensions. All four wall types share the same width
+// + height so raycast_draw_column can pass the same tex_w to
+// render_textured_strip regardless of which texture got dispatched.
+const TEX_SIZE = 64;
+
+// ── Game state (read by all phases, mutated by solo) ───────
+
+// Field of view in radians. 60° is the Wolf3D classic.
+// 60 * π / 180 ≈ 1.0472. Held as a global so init can compute it
+// once at startup; B++ doesn't fold transcendental constants at
+// compile time, so const is not the right shape.
+global FOV: float;
+
+// Player body — FPSBody from stbphys's Chapter FPS. Holds position,
+// angle, hitbox radius, and movement tuning together so the solo
+// phase (Session 3) can call fps_walk / fps_turn against it. For
+// Session 1 the body is allocated once in init and stays static
+// (no input handling yet).
+extrn player;
+
+// ── World state (read-only after init) ─────────────────────
+
+// Tilemap holding the level. Created via stbtile.tile_new in init,
+// populated by _wolf3d_init_map. Walls = solid cells (set via
+// tile_solid). The raycaster walks `world_map.data` and stops on
+// any cell where tile_is_solid returns true.
+extrn world_map;
+
+// Wall texture handles, one per wall_type id used in the map.
+// _wolf3d_load_textures populates them from stbtexture's procedural
+// generators; the render phase dispatches by hit.wall_type.
+extrn TEX_BRICK;          // wall_type 1 — running-bond red brick
+extrn TEX_STONE;          // wall_type 2 — noisy grey stone
+extrn TEX_WOOD;           // wall_type 3 — vertical wood planks
+extrn TEX_SOLID;          // wall_type 4 — flat magenta (debug / accent)
+
+// Single RayHit buffer reused across every column of every frame.
+// Allocated once in init. Passing the same pointer to cast_ray each
+// column avoids ~38400 mallocs/sec at SCREEN_W × FPS, which would
+// dominate the frame budget.
+extrn ray_hit;
+
+// ── Maestro phase callbacks ────────────────────────────────
+
+// One-shot init phase: allocate Tilemap, palette, RayHit buffer,
+// player FPSBody. Loads wall textures (Phase 2). The map layout
+// is hardcoded for Phase 1 Session 1; Session 4 will replace
+// _wolf3d_init_map with an ASCII-file loader.
+// Init phase intentionally unannotated — it allocates (heap/IO),
+// uploads textures (GPU), and writes globals; that crosses the
+// IO/GPU sibling categories so the classifier infers @solo, which
+// is the right home for the lifecycle entry point.
+static wolf3d_init_phase() {
+    // Bring up the GPU pipeline before any texture upload. game_init
+    // opens the window but does NOT call _stb_gpu_init — that is
+    // intentional (programs that don't need GPU rendering pay no
+    // setup cost). Texture loading below would crash inside
+    // _stb_gpu_create_texture without this — the snake_maestro
+    // template lands the same call here for the same reason.
+    render_init();
+
+    FOV = 1.0472;            // 60° in radians
+
+    // Player FPSBody. Spawn near the western edge of the open
+    // corridor at row 8, facing east — the magenta `!!` block is
+    // straight ahead, the green-grey `@@@@@` stone room is up and
+    // to the right, the wood `%%%%%%` corridor is south-east. Lots
+    // of texture variety on the opening view.
+    //
+    // The original "(8, 8) middle of map" spawn lived in a wall
+    // since the Session 2 layout grew the `!!` block — hidden
+    // because Session 1 had no movement to expose it. Always pick
+    // a cell whose layout char is `.`.
+    //
+    // Tuning:
+    //   radius 0.3   — fits comfortably inside a 1.0 cell with margin
+    //   move_spd 3.0 — 3 cells/sec ≈ Wolf3D's classic walking speed
+    //   turn_spd 2.0 — 2 rad/sec ≈ a full rotation in ~3 seconds
+    player = fps_body(3.5, 8.5, 0.0, 0.3, 3.0, 2.0);
+
+    // Keybindings: register named actions so the solo phase reads
+    // intent ("walk forward") instead of raw keycodes. Wolf3D's
+    // bind table is game-specific (the names live here) but the
+    // input infrastructure (action_down lookup, edge detection,
+    // modifier filtering) lives in stbinput where every game
+    // shares it.
+    action_define("fps_forward",  KEY_W,     0);
+    action_define("fps_back",     KEY_S,     0);
+    action_define("fps_strafe_l", KEY_A,     0);
+    action_define("fps_strafe_r", KEY_D,     0);
+    action_define("fps_turn_l",   KEY_LEFT,  0);
+    action_define("fps_turn_r",   KEY_RIGHT, 0);
+    // Profiler hotkey — press P once to start sampling, press again
+    // to stop + dump. stbprofile owns the state + HUD render; we
+    // own the keybind table and the trigger wiring.
+    action_define("profile_toggle", KEY_P, 0);
+    init_profile();
+
+    // Tilemap: 16x16 grid, tile pixel size irrelevant for raycast
+    // (we treat cells as 1.0×1.0 world units, not pixels), pass 1,1
+    // to satisfy tile_new's signature.
+    world_map = tile_new(MAP_W, MAP_H, 1, 1);
+    _wolf3d_init_map();      // populates cells via tile_set + tile_solid
+
+    // RayHit buffer for the per-column dispatch loop.
+    ray_hit = malloc(16);    // sizeof(RayHit) padded — 4+4+1+1bit + slack
+
+    _wolf3d_load_textures();
+    return 0;
+}
+
+// Solo phase: input → player state. WASD walks, arrow keys turn.
+// All bindings go through stbinput's action layer (see init phase
+// for the registration). action_down returns 0/1; subtracting
+// opposing actions yields a [-1, 0, 1] axis value the FPS body
+// helpers consume directly.
+// dt is intentionally untyped (word/int): maestro_run dispatches the
+// solo callback via fn_ptr `call`, which passes args through GP
+// registers. Declaring `dt: float` here would mean the callee reads
+// d0 (FP register) while the caller wrote x-register — a silent FFI
+// mismatch that lands `dt` as garbage. Convention in this codebase
+// is dt-in-milliseconds; downstream helpers (fps_walk, fps_turn)
+// handle the conversion to float seconds where they need it.
+static wolf3d_solo_phase(dt) @solo {
+    auto forward: float, strafe: float, turn: float;
+
+    // ESC quits the game cleanly. Without this the maestro loop
+    // runs forever and the user has to force-kill the binary from
+    // the shell.
+    if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
+
+    // Profiler hotkey toggle — edge-triggered so a single press
+    // flips the state exactly once.
+    if (action_pressed("profile_toggle")) {
+        profile_hud_toggle();
+    }
+
+    forward = action_down("fps_forward")  - action_down("fps_back");
+    strafe  = action_down("fps_strafe_r") - action_down("fps_strafe_l");
+    // Turn sign convention: increasing `body.angle` rotates the view
+    // CCW in math-space, which (with the tilemap's Y-down screen
+    // convention used by the Lode raycaster) reads as "turning right"
+    // on screen. So pressing the LEFT arrow must DECREASE angle, i.e.
+    // contribute negative to `turn`. Hence right-minus-left here.
+    turn    = action_down("fps_turn_r")   - action_down("fps_turn_l");
+
+    fps_turn(player, turn,    dt);
+    fps_walk(player, forward, strafe, dt, world_map);
+    return 0;
+}
+
+// Base phase: parallelisable work. Phase 1 is empty (per-column ray
+// cast happens in render because it produces pixels). Phase 2 will
+// push sprite sort + enemy AI here.
+//
+// `dt` is intentionally untyped — same FFI rationale as
+// `wolf3d_solo_phase` above. Maestro dispatches via `call()` which
+// passes int args through GP registers only.
+static wolf3d_base_phase(dt) @base {
+    // No parallel base work in Phase 1.
+    return 0;
+}
+
+// Render phase: one ray per screen column, draw vertical wall strip.
+// Session 1 ships this with flat colour (no textures); Session 2 adds
+// texture sampling. The actual cast + draw lives in stbraycast — the
+// game-side loop just iterates columns and feeds player state +
+// Tilemap + Palette in.
+//
+// `ray_hit` is the shared buffer allocated in init. cast_ray fills
+// it from the Tilemap; raycast_draw_column reads it and looks up
+// the column colour in `wall_palette`. Reusing the same buffer per
+// column avoids per-ray malloc.
+static wolf3d_render_phase(alpha) @gpu {
+    auto col;
+    auto hit: RayHit;
+    auto p: FPSBody;
+    auto tex;
+
+    render_begin();
+    // Background split — top half "sky" (mid-blue), bottom half
+    // "floor" (dark brown). Wolf3D used solid bars per row; rendering
+    // them as two rects under the wall column pass is cheaper than a
+    // per-column ceiling/floor scan and reads identically at this
+    // screen size.
+    render_clear(0xFF202830);
+    render_rect(0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2, 0xFF382820);
+
+    hit = ray_hit;
+    p = player;
+    for (col = 0; col < SCREEN_W; col++) {
+        cast_ray(hit, col, SCREEN_W,
+                 p.x, p.y, p.angle, FOV,
+                 world_map);
+        // Dispatch wall texture by hit type. The cartridge stays
+        // wall-type-blind on purpose — game owns the table.
+        tex = _wolf3d_tex_for(hit.wall_type);
+        raycast_draw_column(hit, col, SCREEN_W, SCREEN_H,
+                            tex, TEX_SIZE);
+    }
+
+    // Profile HUD overlay — top-left corner, bright red, scale 1.
+    // stbprofile renders nothing when idle; while sampling, shows
+    // a "REC •" badge, elapsed seconds, and a live top-N tally of
+    // the hottest functions (refreshed every 500 ms).
+    profile_hud_draw(8, 8, 1, 0xFFFF3333);
+
+    render_end();
+    return 0;
+}
+
+// Quit phase: cleanup. Phase 1 has nothing to free yet (textures
+// will be Phase 2; map_data is small enough to leak at process exit).
+static wolf3d_quit_phase() @io {
+    return 0;
+}
+
+main() {
+    maestro_set_workers(N_WORKERS);
+    maestro_register_init(fn_ptr(wolf3d_init_phase));
+    maestro_register_solo(fn_ptr(wolf3d_solo_phase));
+    maestro_register_base(fn_ptr(wolf3d_base_phase));
+    maestro_register_render(fn_ptr(wolf3d_render_phase));
+    maestro_register_quit(fn_ptr(wolf3d_quit_phase));
+    game_run(SCREEN_W, SCREEN_H, "B++ Wolf3D", FPS);
+    return 0;
+}
+
+// ── Internal helpers ───────────────────────────────────────
+
+// Populates `world_map` with a small test maze so Session 1 has
+// visible walls. Marks wall types as solid via tile_solid so the
+// raycaster's tile_is_solid check stops on walls but lets the
+// player walk through cell value 0 (empty).
+//
+// Layout (1 = wall, 0 = empty):
+//   ################
+//   #..............#
+//   #..#####.......#
+//   #..#...#.......#
+//   #..#...#.......#
+//   #..#####.......#
+//   #..............#
+//   #......##......#
+//   #......##......#
+//   #..............#
+//   #.......######.#
+//   #..............#
+//   #....##.....##.#
+//   #....##........#
+//   #..............#
+//   ################
+//
+// TODO Session 1: walk the layout above; for each '#' character call
+//   tile_set(world_map, x, y, 1)
+// then mark wall type 1 as solid:
+//   tile_solid(world_map, 1)
+//
+// TODO Session 4: replace with an ASCII-file loader (still using
+// stbtile primitives, just reading the layout from
+// games/fps/assets/maps/level1.txt). Multiple wall types ('#', '@',
+// '%') map to type ids 1, 2, 3 with tile_solid called on each.
+static void _wolf3d_init_map() {
+    auto rows;
+    auto x, y, ch;
+    rows = buf_word(MAP_H);
+    // Layout legend:
+    //   '#' = brick   (type 1)   — outer perimeter + general walls
+    //   '@' = stone   (type 2)   — inner block (the small room)
+    //   '%' = wood    (type 3)   — the corridor wall
+    //   '!' = solid   (type 4)   — debug accent / standout block
+    rows[0]  = "################";
+    rows[1]  = "#..............#";
+    rows[2]  = "#..@@@@@.......#";
+    rows[3]  = "#..@...@.......#";
+    rows[4]  = "#..@...@.......#";
+    rows[5]  = "#..@@@@@.......#";
+    rows[6]  = "#..............#";
+    rows[7]  = "#......!!......#";
+    rows[8]  = "#......!!......#";
+    rows[9]  = "#..............#";
+    rows[10] = "#.......%%%%%%.#";
+    rows[11] = "#..............#";
+    rows[12] = "#....##.....##.#";
+    rows[13] = "#....##........#";
+    rows[14] = "#..............#";
+    rows[15] = "################";
+
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            ch = peek(rows[y] + x);
+            switch (ch) {
+                '#' { tile_set(world_map, x, y, 1); }
+                '@' { tile_set(world_map, x, y, 2); }
+                '%' { tile_set(world_map, x, y, 3); }
+                '!' { tile_set(world_map, x, y, 4); }
+                else { }
+            }
+        }
+    }
+    free(rows);
+
+    // Every wall type the layout uses must be marked solid so the
+    // raycaster's tile_is_solid check terminates the DDA on hit.
+    tile_solid(world_map, 1);
+    tile_solid(world_map, 2);
+    tile_solid(world_map, 3);
+    tile_solid(world_map, 4);
+}
+
+// Build the wall texture set procedurally via stbtexture. No PNG /
+// asset I/O — the cartridge's parameterised generators give us
+// distinct surfaces with deterministic byte-stable output. Future
+// session can swap any handle here for a stbasset PNG load without
+// touching the render loop or raycast cartridge.
+static void _wolf3d_load_textures() {
+    TEX_BRICK = texture_brick(TEX_SIZE, TEX_SIZE,
+                              0xFFB5390F,    // saturated red brick
+                              0xFF2D1F18,    // dark mortar
+                              16, 8);        // 16x8 brick units
+    TEX_STONE = texture_stone(TEX_SIZE, TEX_SIZE,
+                              0xFF8C8C8C,    // mid grey base
+                              0xFF4A4A4A);   // darker speckle
+    TEX_WOOD  = texture_wood(TEX_SIZE, TEX_SIZE,
+                             0xFF8B5A2B,     // saddle wood
+                             0xFF4F2F18,     // dark plank seam
+                             8);             // 8px plank width
+    TEX_SOLID = texture_solid(TEX_SIZE, TEX_SIZE,
+                              0xFFFF00FF);   // magenta debug accent
+}
+
+// Game-local dispatch from wall_type id (stored in the Tilemap byte
+// at each cell) to the matching texture handle. raycast_draw_column
+// stays cartridge-generic by leaving this table to the game.
+static _wolf3d_tex_for(wall_type)@base {
+    switch (wall_type) {
+        1    { return TEX_BRICK; }
+        2    { return TEX_STONE; }
+        3    { return TEX_WOOD;  }
+        4    { return TEX_SOLID; }
+        else { return 0; }
+    }
+}
+

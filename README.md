@@ -4,11 +4,20 @@
 > Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
 > Everything you need in one file. No other canonical doc.
 
-### B++ 0.23x — Phase 6 Closed (Profiler + Panic + Runtime Symbolication) + Wolf3D Scaffold — 3 May 2026
+### B++ 0.23x — Wolf3D Phase 1 CLOSED — `fps_3d.bpp` walks at 60 FPS — 4 May 2026
 
-A self-hosting compiled language with **games that hear themselves**. Snake now plays a drum loop recorded live inside mini_synth — the polyphonic synthesizer built in the same language — while a fresh in-code 880 Hz SFX fires every time it eats an apple. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and the industry-standard text-file beat-map format.
+A self-hosting compiled language that now **renders and walks through a textured 2.5D maze in pure B++ at honest 60 FPS** — DDA ray casting, per-column textured wall blits, FPS-style WASD + arrow-key movement, runtime profiler HUD with live FPS / frame-time / top-N readout, all toggled by a hotkey while the game runs. `games/fps/fps_3d.bpp` is the Phase 1 deliverable; Wolfenstein-3D-style content (sprites, enemies, levels, weapons) is Phase 2+, and this file migrates to `examples/fps_3d.bpp` once that ships, becoming the reference 2.5D raycasting template every future B++ raycaster forks from.
 
-**Recently shipped:** every binary now embeds a minisym table so a running B++ program resolves its own PCs without the external `.bug` file — which unlocks `panic("msg")` with full stack traces and a `profile_start`/`profile_stop`/`profile_dump` sampling profiler that covers worker threads via SIGPROF. The Wolf3D scaffold landed under `games/fps/`, ready for Session 1 to fill in the DDA cast.
+**Phase 1 shipped four new stb cartridges + nine compiler-level wins as side-effects** — see [`docs/journal.md`](docs/journal.md) entry `2026-05-04` for the full list. Highlights:
+
+- `stb/stbtexture.bsm` — programmatic texture creation (brick / stone / wood / solid) with an `_to_buf` headless-testable API split.
+- `stb/stbraycast.bsm` — DDA + RayHit + per-column projection. Cartridge stays content-blind so any future raycaster forks it.
+- `stb/stbprofile.bsm` — runtime profiler HUD (REC indicator, FPS smoothed, frame-time avg / max, live top-N tally refreshed every 500 ms, final stderr dump). Tier 1 of the industry-standard profiler UX in ~250 LOC.
+- `stb/stbphys.bsm` Chapter FPS — `FPSBody` + `fps_walk` + `fps_turn` with per-axis collision-and-slide.
+
+**Compiler fixes that fell out of Phase 1:** lexer scientific-notation literals (`1.0e30`), T_BLOCK type-inference recursion fix (smart-dispatch inside const-folded `if`), W027 FFI float-param diagnostic, minisym PC resolver bound check (64 KB guard, eliminates phantom samples on the last function), µs-precision maestro with hybrid sleep + busy-wait (real 60.0 FPS instead of the ms-truncation 62.5 drift), `sin_f` / `cos_f` / `abs_f` / `floor_f` promoted from private into `bpp_math` under the new **Tonify Rule 20** ("two-consumer rule"). Full list and rationale in the journal.
+
+**Snake remains the audio showcase** — drum loop recorded inside mini_synth (the polyphonic synthesizer in the same language) plays during gameplay, with an 880 Hz apple-eat SFX. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and a text-file beat-map format. Phase 6's runtime profiler + minisym + panic / stack-trace / `caller_pc` infrastructure powers the Phase 1 HUD.
 
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
@@ -38,7 +47,7 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 
 ## Five Games, One Engine
 
-B++ ships with five games in `games/`, all GPU-accelerated on Metal (the FPS is a scaffold ready for its first implementation session):
+B++ ships with five games in `games/`, all GPU-accelerated on Metal:
 
 | Game | Folder | What it is |
 |------|--------|-----------|
@@ -46,7 +55,7 @@ B++ ships with five games in `games/`, all GPU-accelerated on Metal (the FPS is 
 | **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. |
 | **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
 | **Rhythm** | `games/rhythm/` | Rhythm-genre prototype. Menu → demo (auto-play) → transition countdown → play (snare on F or SPACE). Hit-windows: ±20 ms perfect, ±60 ms ok. Uses stbscene / stbasset / stbmixer music+SFX buses / beat_map text parser. |
-| **Wolf3D (FPS)** | `games/fps/` | Phase 1 scaffold: ray-cast 2.5D shooter built on the new `stbraycast` cartridge + FPSBody chapter in `stbphys`. Compiles to a black window today; Session 1 fills in the DDA loop and projection. See `games/fps/HANDOFF.md`. |
+| **FPS3D (Wolf3D Phase 1)** | `games/fps/fps_3d.bpp` | **Walks at 60 FPS** through a textured 2.5D maze built on the new `stbraycast` + `stbtexture` cartridges and the `FPSBody` chapter of `stbphys`. WASD moves, ←/→ turns, P toggles the runtime profiler HUD (REC + FPS / frame-time / live top-N), ESC quits. Wolfenstein-3D-style content (sprites, enemies, levels, weapons) is Phase 2+; this file migrates to `examples/fps_3d.bpp` once that ships, becoming the reference 2.5D raycasting template every future B++ raycaster forks from. See `games/fps/HANDOFF.md` for the Phase 2 prep doc. |
 
 ---
 

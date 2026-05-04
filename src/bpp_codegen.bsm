@@ -649,6 +649,166 @@ cg_is_float_lit(p) {
     }
 }
 
+// Read the byte at packed-string offset `i`, or -1 when `i` has
+// walked past the literal's length. Lets the float parser below stop
+// cleanly without depending on the caller-supplied buffer being
+// null-terminated past the literal — `cg_sbuf` packs many tokens
+// contiguously and the byte after a literal is whatever the lexer
+// happened to emit next.
+static _cg_flt_ch(s, l, i)@base {
+    if (i >= l) { return 0 - 1; }
+    return peek(cg_sbuf + s + i);
+}
+
+// Parse a packed float literal (e.g. "3.14", "1.5e3", "2.0e-7") and
+// return its IEEE 754 64-bit pattern. Pure integer arithmetic — no
+// libc dependency, no FP register use, identical results on every
+// chip. Both the Mach-O and ELF binary writers consume IEEE bits in
+// their `__DATA` section, and the conversion is chip- and OS-agnostic
+// — the function lives in the spine so a new chip / target backend
+// inherits the right answer for free.
+//
+// Algorithm: parse `[-]int_part [. frac_part] [e[+/-]exp]` into a
+// rational `num / den` and a decimal exponent. Each factor of 10 in
+// the exponent splits as 5 * 2 — the factor-of-2 part folds into a
+// binary exponent adjustment we add to `exp_bits` at the end, which
+// lets us cover the full IEEE 754 range without overflowing the 64-bit
+// rational. Factor-of-5 multiplications can still overflow `num` /
+// `den`; we pre-shrink both by 1 bit when that risk appears. Halving
+// both preserves the ratio (the value) up to a single low-bit
+// truncation per shrink — well below the double's 52-bit mantissa
+// precision floor.
+cg_parse_float_bits(p)@base {
+    auto s, l, i, ch, neg;
+    auto int_part, frac_val, frac_scale;
+    auto dec_exp, exp_neg;
+    auto num, den, bin_adjust;
+    auto px, scaled_den, mantissa, bit_idx, exp_bits;
+
+    s = unpack_s(p); l = unpack_l(p);
+
+    neg = 0;
+    i = 0;
+    ch = _cg_flt_ch(s, l, i);
+    if (ch == '-') { neg = 1; i++; ch = _cg_flt_ch(s, l, i); }
+
+    // Integer part.
+    int_part = 0;
+    while (ch >= '0' && ch <= '9') {
+        int_part = int_part * 10 + ch - '0';
+        i++;
+        ch = _cg_flt_ch(s, l, i);
+    }
+
+    // Fractional part.
+    frac_val = 0;
+    frac_scale = 1;
+    if (ch == '.') {
+        i++;
+        ch = _cg_flt_ch(s, l, i);
+        while (ch >= '0' && ch <= '9') {
+            frac_val = frac_val * 10 + ch - '0';
+            frac_scale *= 10;
+            i++;
+            ch = _cg_flt_ch(s, l, i);
+        }
+    }
+
+    // Optional scientific exponent suffix. The lexer guarantees a
+    // literal here is well-formed — any e/E is followed by at least
+    // one digit (with an optional sign in between).
+    dec_exp = 0;
+    if (ch == 'e' || ch == 'E') {
+        i++;
+        ch = _cg_flt_ch(s, l, i);
+        exp_neg = 0;
+        if (ch == '+') { i++; ch = _cg_flt_ch(s, l, i); }
+        if (ch == '-') { exp_neg = 1; i++; ch = _cg_flt_ch(s, l, i); }
+        while (ch >= '0' && ch <= '9') {
+            dec_exp = dec_exp * 10 + ch - '0';
+            i++;
+            ch = _cg_flt_ch(s, l, i);
+        }
+        if (exp_neg) { dec_exp = 0 - dec_exp; }
+    }
+
+    // Combine mantissa decimal into rational num / den.
+    num = int_part * frac_scale + frac_val;
+    den = frac_scale;
+
+    // Special case: zero. Returning early skips the bit-extraction
+    // loop, which would otherwise spin forever on num == 0.
+    if (num == 0) { return 0; }
+
+    // Apply decimal exponent via 5-multiplication + binary adjust.
+    bin_adjust = 0;
+    while (dec_exp > 0) {
+        // Pre-shrink num so num * 5 stays within 63 bits, leaving
+        // headroom for the doubling inside the bit-extraction loop.
+        while (num > 0x1FFFFFFFFFFFFFFF) {
+            num = num >> 1;
+            den = den >> 1;
+            if (den == 0) { den = 1; }
+        }
+        num = num * 5;
+        bin_adjust++;
+        dec_exp--;
+    }
+    while (dec_exp < 0) {
+        while (den > 0x1FFFFFFFFFFFFFFF) {
+            num = num >> 1;
+            den = den >> 1;
+            if (num == 0) { num = 1; }
+        }
+        den = den * 5;
+        bin_adjust--;
+        dec_exp++;
+    }
+
+    // Find binary exponent px such that 2^px <= num/den < 2^(px+1).
+    if (num >= den) {
+        scaled_den = den;
+        px = 0;
+        while (scaled_den + scaled_den <= num) {
+            scaled_den += scaled_den;
+            px++;
+        }
+        num -= scaled_den;
+    } else {
+        px = 0 - 1;
+        num += num;
+        while (num < den) {
+            num += num;
+            px--;
+        }
+        num -= den;
+        scaled_den = den;
+    }
+
+    // Extract 52 mantissa bits by successive doubling (MSB first).
+    mantissa = 0;
+    bit_idx = 0;
+    while (bit_idx < 52) {
+        num += num;
+        mantissa += mantissa;
+        if (num >= scaled_den) {
+            mantissa++;
+            num -= scaled_den;
+        }
+        bit_idx++;
+    }
+
+    // Round to nearest: check the 53rd bit.
+    num += num;
+    if (num >= scaled_den) { mantissa++; }
+
+    // Assemble IEEE 754 double: sign(1) | exponent(11) | mantissa(52).
+    // Adding 2048 to exp_bits sets bit 63 (sign) after the shift.
+    exp_bits = px + 1023 + bin_adjust;
+    if (neg) { exp_bits += 2048; }
+    return (exp_bits << 52) + mantissa;
+}
+
 // ── Variable table ───────────────────────────────────────────
 //
 // Parallel dynamic arrays indexed by variable slot. Each function

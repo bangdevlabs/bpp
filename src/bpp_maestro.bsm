@@ -153,7 +153,8 @@ void maestro_register_quit(fn) { _ms_cb_quit = fn; }
 // draining, render receives alpha (0-1000): how far between the
 // last physics tick and the next, for position interpolation.
 maestro_run() {
-    auto now, dt, last_time, accumulator, fixed_dt, frame_ms, elapsed, alpha;
+    auto now, dt, last_time, accumulator, fixed_dt_us, frame_us, elapsed, alpha;
+    auto cb_dt_ms;
 
     if (_ms_configured == 0) { return 1; }
 
@@ -172,20 +173,27 @@ maestro_run() {
     // 3. User init callback.
     if (_ms_cb_init != 0) { call(_ms_cb_init); }
 
-    // 4. Compute timing constants. Physics tick rate defaults to the
-    // render frame rate when not explicitly set via maestro_set_physics_hz.
+    // 4. Compute timing constants — microseconds internally so the
+    // sleep precision matches the target frame rate exactly. The
+    // earlier ms-resolution path computed `frame_ms = 1000 / 60 = 16`,
+    // which truncated 16.67 ms down to 16 ms and made every game run
+    // ~3% faster than its declared FPS (60 → 62 visible). Keeping
+    // accumulator + sleep in µs eliminates that drift; callbacks
+    // still receive their `dt` in the historical milliseconds (the
+    // convention every caller of `solo` / `base` expects).
     if (_ms_physics_hz == 0) { _ms_physics_hz = _ms_fps; }
-    fixed_dt = 1000 / _ms_physics_hz;
-    frame_ms = 1000 / _ms_fps;
+    fixed_dt_us = 1000000 / _ms_physics_hz;
+    frame_us    = 1000000 / _ms_fps;
+    cb_dt_ms    = fixed_dt_us / 1000;
     // Pre-seed so the first frame runs one physics step immediately
     // instead of rendering an empty frame while waiting for time to
     // accumulate. Standard practice in fixed-timestep game loops.
-    accumulator = fixed_dt;
-    last_time = beat_now_ms();
+    accumulator = fixed_dt_us;
+    last_time   = beat_now_us();
 
     // 5. Accumulator loop. Drain physics in fixed steps, then render.
     while (_ms_quit_flag == 0) {
-        now = beat_now_ms();
+        now = beat_now_us();
         dt = now - last_time;
         // Clamp to at most 5 physics ticks per iteration to prevent the
         // spiral of death after a real stall (debug pause, system sleep,
@@ -195,7 +203,7 @@ maestro_run() {
         // rate. At 5× fixed_dt, a game at any refresh rate absorbs up
         // to five backed-up ticks before starting to drop them.
         auto max_dt;
-        max_dt = fixed_dt * 5;
+        max_dt = fixed_dt_us * 5;
         if (dt > max_dt) { dt = max_dt; }
         last_time = now;
         accumulator += dt;
@@ -206,15 +214,15 @@ maestro_run() {
         // profiler hooks fire on thread index 0 (main) at every phase
         // boundary so single-threaded programs without bpp_job still
         // collect samples.
-        while (accumulator >= fixed_dt) {
+        while (accumulator >= fixed_dt_us) {
             _prof_capture(0);
-            if (_ms_cb_solo != 0) { call(_ms_cb_solo, fixed_dt); }
+            if (_ms_cb_solo != 0) { call(_ms_cb_solo, cb_dt_ms); }
             _prof_capture(0);
-            if (_ms_cb_base != 0) { call(_ms_cb_base, fixed_dt); }
+            if (_ms_cb_base != 0) { call(_ms_cb_base, cb_dt_ms); }
             // Drain all worker queues so the next physics step (or
             // render) sees the results of any parallel work.
             job_wait_all();
-            accumulator -= fixed_dt;
+            accumulator -= fixed_dt_us;
         }
 
         // Alpha is the interpolation factor (0-1000) telling the
@@ -223,14 +231,32 @@ maestro_run() {
         // For grid games like snake where physics_hz == fps, alpha is
         // always 0 and render just draws the current state.
         alpha = 0;
-        if (fixed_dt > 0) { alpha = accumulator * 1000 / fixed_dt; }
+        if (fixed_dt_us > 0) { alpha = accumulator * 1000 / fixed_dt_us; }
         _prof_capture(0);
         if (_ms_cb_render != 0) { call(_ms_cb_render, alpha); }
 
-        // Sleep to fit the render frame budget. sys_usleep takes microseconds.
-        elapsed = beat_now_ms() - now;
-        if (elapsed < frame_ms) {
-            sys_usleep((frame_ms - elapsed) * 1000);
+        // Sleep to fit the render frame budget — sys_usleep takes
+        // microseconds, so no scaling here. At 60 FPS the target is
+        // 16666 µs per frame.
+        //
+        // Hybrid sleep + busy-wait: macOS sys_usleep typically
+        // oversleeps by ~300-500 µs (kernel scheduler latency).
+        // Sleeping the full remaining budget made real frames run
+        // 17 ms → 58 FPS instead of 60. Sleeping a hair under the
+        // budget and spinning the last ~500 µs costs negligible
+        // CPU (≈0.003 % at 60 FPS) and lands the frame on the
+        // exact µs target. Skip the sleep entirely when the
+        // remaining budget is already inside the spin window —
+        // sys_usleep on a sub-millisecond ask just adds latency
+        // without sleeping anything useful.
+        elapsed = beat_now_us() - now;
+        if (elapsed < frame_us) {
+            auto budget_us;
+            budget_us = frame_us - elapsed;
+            if (budget_us > 1000) {
+                sys_usleep(budget_us - 500);
+            }
+            while (beat_now_us() - now < frame_us) { }
         }
     }
 

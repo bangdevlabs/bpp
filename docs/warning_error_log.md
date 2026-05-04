@@ -210,3 +210,109 @@ finally caught it" — belongs next to the diagnostics we do have.
   a literal the compiler definitely emitted, the first check is
   always "do the runtime bytes match the file bytes." Everything
   else is plumbing around that one question.
+
+---
+
+## Known compiler diagnostic gaps
+
+Real foot-guns that have caused bugs in shipped code. No W-code
+fires for them today — each is a candidate sidequest with the
+right shape (small, locks a contract permanently).
+
+### FFI float-param trap (W027 — SHIPPED 2026-05-04)
+
+**Diagnostic.** W027 fires at the `fn_ptr(callee)` site whenever
+`callee` declares any parameter with a `: float` annotation. Lives
+in `bpp_validate.bsm::_val_check_fn_ptr`. Walks `funcs[fp_fi].FN_HINTS`
+checking `is_float_type` on each entry.
+
+**Trigger.** A function declared with a `: float` parameter is
+invoked through `call(fn_ptr_var, args...)` instead of a direct
+call. `call` passes args via GP registers only; the callee reads
+the float param from FP register `d0` which contains stale data,
+not the caller's int value.
+
+**Symptom.** Silent zero (or garbage) for the affected param.
+Usually presents as "this code path runs but does nothing" — the
+function executes, but every multiplication-by-dt collapses to
+zero. Wolf3D Phase 1 Session 3 hit this when the maestro solo
+callback declared `dt: float` and movement multiplied by `dt`
+always produced 0 — player rotated (turn doesn't depend on dt
+arithmetic in a way that exposes zero) but never walked.
+
+**Diagnostic candidate.** Warn at `fn_ptr(name)` when `name`'s
+parameter list contains any `: float` annotation. `call()` on the
+resulting pointer is the trap site, but the simpler check fires
+at the construction site. A more thorough version would also
+flag the `call(fp, arg)` site when arg's static type is integer
+and the fp's source declared float; that needs tracking the
+fn_ptr's origin through the AST (more flow analysis), so start
+with the construction-site warning.
+
+**Workaround until the warning ships.** Drop `: float` from
+parameters of functions registered as fn_ptr callbacks. Convert
+internally:
+
+```bpp
+void my_solo(dt) {
+    auto dt_s: float;
+    dt_s = dt;
+    dt_s = dt_s / 1000.0;
+    // ... use dt_s ...
+}
+```
+
+**Cross-reference.** `tonify_checklist.md` Pitfall 5 documents
+the same trap from the contributor angle.
+
+### T_BLOCK skipped by type-inference traversals (FIXED 2026-05-04)
+
+**Trigger.** Parser-level dead-code elimination wraps the surviving
+branch of `if (CONST_TRUTHY) { body }` (and `if (CONST_FALSEY) {} else { body }`)
+in a `T_BLOCK` node. Three traversals in `bpp_types.bsm`
+(`add_type`, `propagate_in_node`, `uses_int_ops_node`) and one
+in `bpp_validate.bsm` (`val_check_node`) had no T_BLOCK case —
+they fell through silently and never recursed into the body.
+
+**Symptom.** Type inference never ran on calls inside the const-
+folded block, so `arg.itype` stayed `TY_UNK` and any smart-
+dispatch rewrite (notably `put` / `put_err`) routed wrong. With
+a string literal arg, `put_err("...")` ended up calling
+`putnum_err(addr_of_literal)`, printing the pointer address
+instead of the string content.
+
+**Fix.** Added T_BLOCK cases to all four traversals — each
+recurses via `add_type_list` / `propagate_in_body` /
+`uses_int_ops_list` / `val_check_list`. Bootstrap stayed
+byte-stable. Locked by `tests/test_const_fold_block_dispatch.bpp`.
+
+**Lesson recorded.** When the parser introduces a new AST node
+shape (T_BLOCK was added during the if-fold work), every
+recursive traversal in the compiler needs a case for it — not
+just the codegen passes. The fact that codegen handled T_BLOCK
+correctly hid the gap in type inference for months.
+
+### SIGPROF firing during profile_dump (175-sample noise)
+
+**Trigger.** After `profile_stop()` disarms ITIMER_PROF, the
+subsequent `profile_dump` walk attributes a chunk of samples
+(observed: ~175 in a 600-frame Wolf3D run) to whichever function
+the dump itself was running in. Real signal:noise ratio in the
+output drops correspondingly.
+
+**Symptom.** A function that ran once at end-of-run shows up
+high in the top-N table. In Wolf3D Phase 1 Session 5's profile,
+`_wolf3d_dump_profile` ranked third with 175 samples despite
+executing exactly once.
+
+**Hypothesis.** PC resolution uses "largest-not-exceeding"
+matching against the minisym table; if the timer has any
+in-flight signal at disarm, OR if some samples in the ring
+resolve to functions adjacent in the binary layout to
+dump_profile, those samples land in the wrong bucket.
+Investigation needed.
+
+**Diagnostic candidate.** Either hardening of `profile_stop`
+(sync on outstanding signals before returning), or filtering of
+samples whose PC falls within `_wolf3d_dump_profile` /
+`profile_dump` / `_runtime_resolve_pc` themselves.

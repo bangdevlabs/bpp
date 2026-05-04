@@ -224,30 +224,86 @@ void fps_free(b) {
     free(b);
 }
 
-// Walk the body. forward and strafe are in [-1, 1]; the body moves
-// in the direction of its current angle (forward) plus perpendicular
-// (strafe). Collision against the Tilemap is per-axis so the player
-// slides along walls cleanly.
+// Walk the body. `forward` and `strafe` are in [-1, 1] — typically
+// driven by `key_down(KEY_W) - key_down(KEY_S)` and similar at the
+// game level. `dt` is in MILLISECONDS (the maestro convention) and
+// gets converted to seconds internally so `move_spd` reads as
+// "cells per second" at the call site. The body moves in the
+// direction of its current angle (forward) plus the perpendicular
+// (strafe). Collision against the Tilemap is per-axis so the
+// player slides along walls cleanly instead of sticking on
+// corners.
 //
-// TODO Session 3: implement movement + collision. Phase 1 Session 1
-// keeps the player static so this stub never runs.
-void fps_walk(b, forward: float, strafe: float, dt: float, tm) @base {
-    // TODO Session 3:
-    //   1. Compute candidate dx, dy from forward + strafe + b.angle.
-    //   2. Apply b.move_spd × dt scaling.
-    //   3. For each axis independently:
-    //        - check tile_is_solid(tm, tile_get(tm, floor(new_x), floor(b.y)))
-    //        - if solid, reject X movement only. Same logic for Y.
-    //   4. Slide naturally falls out of per-axis rejection.
-    //   5. Optional: subtract b.radius from candidate to keep the
-    //      player out of corners.
+// `dt` is intentionally untyped (not `: float`): maestro dispatches
+// solo callbacks via fn_ptr `call`, which passes int args through
+// GP registers. A `: float` annotation would land dt as garbage
+// from a stale FP register. Same lesson holds for `fps_turn`
+// below.
+//
+// Effect annotation: the body writes `b.x` / `b.y` (heap fields) and
+// reads from the Tilemap, so the classifier won't accept `@base`.
+// Leaving it unannotated lets it infer something compatible with
+// caller phases (typically `@solo` for game solo loops).
+void fps_walk(b, forward: float, strafe: float, dt, tm) {
+    auto body: FPSBody;
+    auto dir_x: float, dir_y: float;
+    auto dx: float, dy: float;
+    auto step: float, dt_s: float;
+    auto new_x: float, new_y: float;
+    auto cell_x: word, cell_y: word;
+
+    body = b;
+    dt_s = dt;
+    dt_s = dt_s / 1000.0;     // ms → seconds
+
+    // Direction vector (unit length) for the player's current heading.
+    // Strafe moves perpendicular: rotated 90° clockwise from forward.
+    dir_x = cos_f(body.angle);
+    dir_y = sin_f(body.angle);
+    step = body.move_spd * dt_s;
+    dx = (forward * dir_x + strafe * dir_y) * step;
+    dy = (forward * dir_y - strafe * dir_x) * step;
+
+    // Per-axis collision: check each candidate axis separately so a
+    // diagonal move into a corner slides along whichever axis is
+    // free. The radius offset keeps the body's edge — not its
+    // centre — outside the wall tile.
+    new_x = body.x + dx;
+    if (dx > 0.0) { new_x = new_x + body.radius; }
+    if (dx < 0.0) { new_x = new_x - body.radius; }
+    cell_x = floor_f(new_x);
+    cell_y = floor_f(body.y);
+    if (tile_is_solid(tm, tile_get(tm, cell_x, cell_y)) == 0) {
+        body.x = body.x + dx;
+    }
+
+    new_y = body.y + dy;
+    if (dy > 0.0) { new_y = new_y + body.radius; }
+    if (dy < 0.0) { new_y = new_y - body.radius; }
+    cell_x = floor_f(body.x);
+    cell_y = floor_f(new_y);
+    if (tile_is_solid(tm, tile_get(tm, cell_x, cell_y)) == 0) {
+        body.y = body.y + dy;
+    }
 }
 
-// Rotate the body. da is in [-1, 1] (or whatever the input system
-// produces). turn_spd × dt gives the actual delta angle.
+// Rotate the body. `da` is in [-1, 1] — typically driven by
+// `key_down(KEY_LEFT) - key_down(KEY_RIGHT)` (negate signs to taste).
+// `dt` is in MILLISECONDS (maestro convention) — converted internally
+// so `turn_spd` reads as "radians per second" at the call site.
 //
-// TODO Session 3.
-void fps_turn(b, da: float, dt: float) @base {
-    // TODO Session 3: b.angle = b.angle + da * b.turn_spd * dt;
-    //                  optional: normalize to [0, 2π) to avoid drift.
+// `dt` is intentionally untyped (see `fps_walk` for the FFI rationale).
+//
+// Range-reduction is delegated to `sin_f` / `cos_f` (they reduce
+// internally), so we don't bother normalising `b.angle` here. Float
+// precision is plenty for hours of play before the angle drifts
+// noticeably; if a future session profiles drift as a real issue,
+// add a wrap-to-[0, 2π) check at the bottom.
+void fps_turn(b, da: float, dt) {
+    auto body: FPSBody;
+    auto dt_s: float;
+    body = b;
+    dt_s = dt;
+    dt_s = dt_s / 1000.0;
+    body.angle = body.angle + da * body.turn_spd * dt_s;
 }

@@ -1,0 +1,65 @@
+// Smoke test for stbtexture's determinism contract: every generator
+// produces byte-identical output for identical parameters, and
+// different parameters produce different output (so the params
+// actually drive the algorithm — not silently ignored). Plus anchor
+// pixels at known offsets to catch silent algorithm drift that
+// "two calls match" alone would miss.
+//
+// Tests use the `_to_buf` variants so no GPU init is needed; the
+// pixel logic is exercised on the heap directly.
+
+import "stbgame.bsm";       // platform layer + bpp_buf + stb base
+import "stbtexture.bsm";
+
+main() {
+    auto buf1, buf2, buf3, n;
+    n = 64 * 64 * 4;
+    buf1 = buf_byte(n);
+    buf2 = buf_byte(n);
+    buf3 = buf_byte(n);
+
+    // ── Brick: determinism + anchor + param-sensitivity ────
+    texture_brick_to_buf(buf1, 64, 64, 0xFFB5390F, 0xFF2D1F18, 16, 8);
+    texture_brick_to_buf(buf2, 64, 64, 0xFFB5390F, 0xFF2D1F18, 16, 8);
+    if (buf_cmp(buf1, buf2, n) != 0) { return 1; }
+
+    // Pixel (0, 0) sits on the top mortar row (y=0 → on_mortar).
+    // R byte of mortar 0xFF2D1F18 is 0x2D.
+    if (peek(buf1) != 0x2D) { return 2; }
+    // A byte of any opaque pixel is 0xFF.
+    if (peek(buf1 + 3) != 0xFF) { return 3; }
+
+    // Different brick dimensions must produce a different bitmap —
+    // otherwise the brick_w/brick_h params are dead arguments.
+    texture_brick_to_buf(buf3, 64, 64, 0xFFB5390F, 0xFF2D1F18, 8, 4);
+    if (buf_cmp(buf1, buf3, n) == 0) { return 4; }
+
+    // ── Solid: every pixel is the requested colour ────────
+    texture_solid_to_buf(buf1, 64, 64, 0xFF112233);
+    texture_solid_to_buf(buf2, 64, 64, 0xFF112233);
+    if (buf_cmp(buf1, buf2, n) != 0) { return 5; }
+
+    // Anchor: pixel (0, 0) RGBA = 0x11 0x22 0x33 0xFF.
+    if (peek(buf1)     != 0x11) { return 6; }
+    if (peek(buf1 + 1) != 0x22) { return 7; }
+    if (peek(buf1 + 2) != 0x33) { return 8; }
+    if (peek(buf1 + 3) != 0xFF) { return 9; }
+
+    // ── Stone: determinism ───────────────────────────────
+    texture_stone_to_buf(buf1, 64, 64, 0xFF8C8C8C, 0xFF4A4A4A);
+    texture_stone_to_buf(buf2, 64, 64, 0xFF8C8C8C, 0xFF4A4A4A);
+    if (buf_cmp(buf1, buf2, n) != 0) { return 10; }
+
+    // ── Wood: determinism ────────────────────────────────
+    texture_wood_to_buf(buf1, 64, 64, 0xFF8B5A2B, 0xFF4F2F18, 8);
+    texture_wood_to_buf(buf2, 64, 64, 0xFF8B5A2B, 0xFF4F2F18, 8);
+    if (buf_cmp(buf1, buf2, n) != 0) { return 11; }
+
+    // Anchor: pixel (7, 0) is on the seam (x % plank_w == plank_w - 1).
+    // Seam color is dark_color 0xFF4F2F18 → R = 0x4F (before grain dim).
+    // Grain dims by 0x080604 when (y*7 + plank_idx*11) & 7 < 2.
+    // At (7, 0): plank_idx=0, grain = 0 → dim applies. R = 0x4F - 0x08 = 0x47.
+    if (peek(buf1 + 7 * 4) != 0x47) { return 12; }
+
+    return 0;
+}

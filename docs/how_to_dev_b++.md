@@ -315,7 +315,41 @@ evaluate the left operand once.
 (`0755` — leading zero), character (`'A'` = 65). All 64-bit words.
 
 **Floats:** with fractional part (`1.0`, `3.14159`) or scientific
-(`1.5e3`, `2.0e-7`). 64-bit doubles.
+(`1.5e3`, `2.0e-7`, `2.5E+2`). 64-bit doubles.
+
+The scientific form requires `digits.digits` before the optional
+`e`/`E` exponent — both an integer and a fractional part are
+mandatory. The exponent itself is one or more decimal digits with
+an optional leading `+` or `-`. The acceptance table:
+
+| Source | Lexed as | Why |
+|---|---|---|
+| `1.0e10` | float | digits.digits + e + digits |
+| `1.0E10` | float | E uppercase equivalent |
+| `1.0e+10` | float | explicit `+` sign |
+| `1.0e-10` | float | explicit `-` sign |
+| `2.5E2` | float | E without sign |
+| `1.5E+3` | float | uppercase E + explicit sign |
+| `1e10` | int `1` + identifier `e10` | no `.`, never enters float path |
+| `1.e10` | int `1` + `.` + identifier `e10` | `.` requires a digit immediately after |
+| `.5e10` | `.` + int `5` + identifier `e10` | leading `.` is punctuation, not a digit |
+| `1.0eFoo` | float `1.0` + identifier `eFoo` | exponent rewinds when no digit follows |
+
+The two reasons this form is restricted, smaller to bigger:
+
+1. **Lexer stays single-pass with one-char lookahead.** After
+   consuming the integer digits and seeing a `.`, the lexer needs
+   to decide *now* whether the `.` continues a float or terminates
+   the integer (separator before slice annotation `: byte`,
+   parameter list, or future `struct.field` access). Requiring a
+   digit immediately after the `.` answers the question with
+   exactly one peek.
+2. **Leaves `1.field` syntax open for future extensions.** Even
+   though B++ does not have method dispatch on numeric literals
+   today, reserving the `digit . non_digit` shape for future
+   struct/method access avoids the C/JavaScript trap where
+   `1.toFixed()` is ambiguous and the parser has to special-case
+   it.
 
 **Float warning:** float literals retain IEEE bits only when
 assigned to a `: float`, `: half float`, or `: quarter float`
@@ -1836,7 +1870,47 @@ on unload so stale handles fail safely.
 **stbrender** — Metal-backed sprite + palette LUT rendering on
 macOS. R8 sprite + 1×256 BGRA palette texture, indexed sprites,
 GPU-side palette swap for damage flash / cycling. Vulkan/DX12 backends
-land when those targets ship.
+land when those targets ship. Phase 1 of the Wolf3D arc added
+`render_textured_strip` (column-wide UV-mapped blit with per-vertex
+tint, used by raycasters for wall slices) and the marker-128 shader
+fix that makes vertex tint multiplicative against the sampled texel.
+
+## 2.5D engine + textures + profiler (Wolf3D Phase 1)
+
+**stbtexture** — programmatic texture creation. Brick (running-bond),
+stone (deterministic noise), wood (vertical planks), solid (flat
+fill — replaces "do we keep a flat-shading raycast mode" with a
+one-line texture choice). Each generator ships as both
+`texture_X(w, h, ...)` (GPU factory) and `texture_X_to_buf(buf, w, h, ...)`
+(pure-compute, headless-testable). The factory wraps the `_to_buf`
+helper plus `_stb_gpu_create_texture` upload; the `_to_buf` form is
+what the determinism test exercises and what CPU-only renderers
+(future TUI / ANSI fallback) consume.
+
+**stbraycast** — DDA + RayHit + per-column projection. The
+cartridge stays content-blind on purpose: the caller dispatches
+`hit.wall_type` to a texture handle, so a future game with
+different wall types (DOOM clone, dungeon crawler) drops in
+without forking the ray cast logic. Composes with stbtile for map
+storage and stbrender for the per-column blit.
+
+**stbprofile** — runtime profiler HUD overlay. Wraps the
+auto-injected `bpp_runtime` profile primitives (`profile_start`,
+`profile_stop`, `profile_dump`) with the UX every modern game-dev
+profiler ships: hotkey toggle, REC indicator with elapsed timer,
+FPS smoothed + frame-time avg / max, live top-N tally refreshed
+every 500 ms (so the dump's internal allocations don't dominate
+the hot list), final stderr dump on stop. Tier 1 of the
+industry-standard profiler look in ~250 LOC. Tier 2 (sparkline,
+per-thread) and Tier 3 (GPU timing, scoped zones) are sidequest
+territory — start with the Tier 1 surface, escalate if a real
+workload demands it.
+
+`stbphys` also gained a **Chapter FPS** (separate from the existing
+PlatformerBody section): `FPSBody` struct + `fps_walk` /
+`fps_turn` with per-axis collision-and-slide. The chapter promotion
+followed the existing convention (one cartridge, multiple body
+shapes; one chapter per shape).
 
 ## Cap 48 — Compiler Flags Reference
 

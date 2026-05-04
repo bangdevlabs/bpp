@@ -1,5 +1,218 @@
 # B++ Bootstrap Journal
 
+## 2026-05-04 — Wolf3D Phase 1 CLOSED — fps_3d.bpp ships at 59-60 FPS
+
+**bpp = `20e75f653dabf309bcfdef7a9d738756815b2682`. Suite = 131/0/12 native + 110/0/33 C.**
+
+The "you can walk through a textured maze in pure B++ at honest 60 FPS"
+milestone is in. The deliverable is `games/fps/fps_3d.bpp` — a generic
+2.5D ray-cast FPS skeleton with WASD movement, arrow-key turn, ESC
+quit, and a runtime profiler HUD. Wolf3D-specific content (sprites,
+enemies, levels, weapons) is Phase 2+; this file migrates to
+`examples/fps_3d.bpp` once that ships, becoming the reference template
+every future B++ raycaster forks from.
+
+### What landed across Phase 1
+
+**Sessions 1–3 + Session 5 (profile run + Tier F decision)** —
+Sessions 4 (ASCII map loader) and 6 (polish) absorbed into Phase 2:
+the loader is reborn as Phase 2 Session 0 with entity grammar
+(`# @ % ! e d k`) baked in from the first keystroke; polish folds
+into Phase 2 Session 6.
+
+**Four new stb cartridges:**
+
+- `stb/stbtexture.bsm` — programmatic texture creation. Every generator
+  ships as both `texture_X(w, h, ...)` (GPU factory) and
+  `texture_X_to_buf(buf, w, h, ...)` (pure-compute, headless-testable).
+  Patterns: brick (running-bond), stone (deterministic noise), wood
+  (vertical planks), solid (flat fill — replaces "do we keep a
+  flat-shading mode" with a one-line entry in the dispatch table).
+  Locked by `tests/test_stbtexture_determinism.bpp` (12 anchor
+  assertions across the four generators).
+- `stb/stbraycast.bsm` — DDA + RayHit + projection. Cartridge stays
+  game-content-blind: caller passes the wall-type → texture handle
+  table. Composes with stbtile for map storage and stbrender for
+  the per-column blit.
+- `stb/stbprofile.bsm` — runtime profiler HUD. `init_profile`,
+  `profile_hud_toggle`, `profile_hud_draw` — caller picks the
+  hotkey + HUD position; cartridge owns the REC indicator, FPS /
+  frame-time avg / max readout, top-N live tally (refreshed every
+  500 ms so `profile_dump`'s internal mallocs don't dominate the
+  thing being measured), and the final-stop stderr dump. Tier 1 of
+  the industry-standard profiler UX in ~250 LOC.
+- `stb/stbphys.bsm` Chapter FPS — `FPSBody` struct + `fps_walk` /
+  `fps_turn` with per-axis collision-and-slide. The chapter
+  promotion (vs a sibling cartridge) followed the existing
+  Body/PlatformerBody convention.
+
+**Compiler-level wins forced by the Phase 1 work:**
+
+- **Lexer scientific notation** — `1.0e30` parses and `cg_parse_float_bits`
+  (promoted from `mo_atof` in the Mach-O writer to the spine, where the
+  ELF writer also reaches it) handles the exponent via 5-multiplication
+  + binary-exponent adjust. Doc + acceptance table in `how_to_dev_b++.md`
+  Cap 3 §3.3.
+- **T_BLOCK fix in 4 traversals** — parser-level `if (CONST_TRUTHY) {body}`
+  DCE wraps the body in `T_BLOCK`. `add_type`, `propagate_in_node`,
+  `uses_int_ops_node`, and `val_check_node` had no T_BLOCK case,
+  silently skipping the body. Smart-dispatch on `put_err("string")`
+  inside any const-folded block routed wrong → printed pointer
+  addresses. Locked by `tests/test_const_fold_block_dispatch.bpp`.
+- **W027 — FFI float-param diagnostic** — fires at `fn_ptr(callee)`
+  when `callee` declares any `: float` parameter, since `call(fp, args...)`
+  passes args via GP registers only and never emits FCVT to promote
+  int → float for callees reading from `d0`. Symptom that prompted
+  the diagnostic: Wolf3D Session 3's `wolf3d_solo_phase(dt: float)`
+  silently received zero, player rotated but never walked. Helper
+  `_val_check_fn_ptr` lives in `bpp_validate.bsm`.
+- **Resolver bound-check** — minisym PC resolver was attributing any
+  out-of-binary sample (kernel / libsystem_pthread addresses captured
+  during worker SIGPROF fan-out) to the LAST function in `__text` via
+  the "largest-not-exceeding" rule. Fix: reject `rel - best_off > 64KB`.
+  Eliminated 175 spurious samples on `_wolf3d_dump_profile` in the
+  Session 5 profile run.
+- **µs-precision maestro** — `maestro_run` now tracks accumulator +
+  frame budget in microseconds; sleep uses a hybrid `sys_usleep`
+  (frame_budget − 500 µs) + busy-wait spin to land within ~50 µs of
+  the target. Real 60 FPS instead of the int-truncation 62.5 FPS the
+  ms-resolution path produced. Callbacks still receive `dt` in ms
+  (the convention every existing caller depends on).
+- **`sin_f` / `cos_f` / `abs_f` / `floor_f` promotion** — were private
+  `_rc_*` helpers in stbraycast through Session 1; Session 3's
+  `fps_walk` in stbphys needed the same trig, two consumers, promote.
+  Now public auto-injected in `bpp_math.bsm`. Two-consumer rule
+  codified as **Tonify Rule 20** in the same pass.
+- **C emitter T_ADDR on stack-struct** + **T_MEMLD field-type
+  propagation** — caught in earlier Session 1 work, ride along.
+
+**Tonify discipline gravada in `tonify_checklist.md`:**
+
+- **Rule 20** — Two-consumer rule. Promote on the second consumer,
+  not the third. Worked example references the `_rc_sin` → `sin_f`
+  promotion that landed in the same pass.
+- **Pitfall 5** — FFI float-param trap. Documents the bug class W027
+  catches and the workaround for code shipping while the diagnostic
+  is still rolling out.
+
+### Phase 1 architectural shape
+
+```
+games/fps/fps_3d.bpp                          (~360 LOC, was wolf3d.bpp)
+   ├── stbgame                                (window, maestro)
+   ├── stbtile      (Tilemap)
+   ├── stbphys      (FPSBody chapter)        ← new chapter
+   ├── stbrender    (render_textured_strip)
+   ├── stbtexture   (texture_*)              ← NEW cartridge
+   ├── stbraycast   (cast_ray, RayHit)       ← NEW cartridge
+   ├── stbprofile   (profile_hud_*)          ← NEW cartridge
+   └── stbinput     (action_define, KEY_*)
+```
+
+### Profile pass — Tier F decision
+
+Session 5 ran the profiler against a representative gameplay session
+(P toggle on, walk through brick / stone / wood / magenta debug,
+P toggle off). Top consumers, post-resolver-fix:
+
+```
+4054  _job_worker_main           ← workers parked / idle
+ 826  maestro_run                ← main thread idle (vsync sleep)
+ 171  _mem_alloc_pages           ← profile_dump's per-frame allocs
+   9  _runtime_resolve_pc
+   3  _stb_gpu_vertex
+   2  malloc
+   2  sin_f
+   1  raycast_draw_column
+   1  cast_ray
+   1  tile_get
+   1  abs_f
+```
+
+Verdict: **Tier F does NOT open.** The CPU is overwhelmingly idle,
+waiting on GPU vsync. The "real work" (cast_ray + raycast_draw_column +
+sin_f + tile_get) is barely visible in the sample distribution. There
+is no compute hot path to optimize at the compiler level; the
+bottleneck is GPU presentation. If a future workload (multi-light
+software shading, sprite Z-sort against many enemies) shifts the
+profile, Tier F reopens with concrete justification.
+
+### What Phase 1 moved that nobody planned for
+
+- `stbtexture` exists. Started as a `games/fps/textures.bsm` until
+  the user pushed back: "isso não vira stb?" Promoted in the same
+  session. Rename `stbtexgen` → `stbtexture` halfway through after
+  the user pushed back on the name (texgen too narrow, texture more
+  honest).
+- The `_to_buf` split came from the user proposing the determinism
+  test, then asking "the contract argument against the texture-only
+  raycast is what?" — and answering it himself with `texture_solid`.
+  Result: cleaner architecture (texture-only raycast, no flat-fill
+  branch) AND a testable headless API.
+- The two-consumer rule got written down BECAUSE the `_rc_sin` →
+  `sin_f` promotion happened in front of the user, demonstrating
+  the "promote on the second consumer" heuristic in action. Rule
+  20 is the artefact.
+
+### Diff summary against the Phase 1 plan
+
+| Original HANDOFF.md | Reality |
+|---|---|
+| Session 4 = ASCII loader | Absorbed into Phase 2 Session 0 (entity grammar from start) |
+| Session 6 = polish | Folded into Phase 2 Session 6 |
+| Phase 1 = walls + walking | + 3 cartridges + 5 compiler bugs + W027 + 1 tonify rule + 1 pitfall |
+| HANDOFF said player at (8,8) | Was inside a wall — caught + fixed when movement landed |
+| Author dt as `: float` | FFI mismatch with maestro's `call(fp, dt_int)` — caught + diagnosed + W027'd |
+
+### Phase 2 prep
+
+`games/fps/HANDOFF.md` will be rewritten as the Phase 2 entry doc.
+Three decisions from the meta planning round (D1: stbentity new
+cartridge, D2: hand-rolled FSM for one enemy type, D3: Tilemap
+extends with per-cell state slot of word width) get registered
+there.
+
+### Sidequest queue (pre-Phase 2 polish)
+
+- Tier 2/3 profile features (sparkline graph, per-thread breakdown,
+  scoped zones with parser support) — explicitly held back per user
+  call: do these between Phase 1 close and Phase 2 attack, not as a
+  blocker.
+- `_to_buf` split sweep across stbpal `_fill_*`, stbimage decode,
+  stbsound WAV — same architectural pattern, separate session.
+- Profile dump SIGPROF residual 175-sample noise: largely fixed by
+  the 64 KB resolver guard. If any residue persists, profile_stop
+  should fence outstanding signals before returning.
+
+### Files touched during Phase 1
+
+- New: `games/fps/fps_3d.bpp`, `stb/stbtexture.bsm`, `stb/stbraycast.bsm`,
+  `stb/stbprofile.bsm`, `tests/test_stbtexture_determinism.bpp`,
+  `tests/test_const_fold_block_dispatch.bpp`,
+  `tests/test_float_scientific.bpp`
+- Extended: `stb/stbphys.bsm` (FPS chapter),
+  `stb/stbrender.bsm` (`render_textured_strip` + `render_vertical_strip`),
+  `src/bpp_math.bsm` (sin_f / cos_f / abs_f / floor_f),
+  `src/bpp_lexer.bsm` (scientific notation),
+  `src/bpp_codegen.bsm` (cg_parse_float_bits),
+  `src/bpp_types.bsm` (T_BLOCK case × 3),
+  `src/bpp_validate.bsm` (T_BLOCK case + W027 helper),
+  `src/bpp_runtime.bsm` (resolver 64 KB guard),
+  `src/bpp_maestro.bsm` (µs precision + hybrid sleep),
+  `src/backend/os/macos/_stb_platform_macos.bsm` (sprite_uv_tint
+  primitive + shader marker-128 fix),
+  `src/backend/os/linux/_stb_platform_linux.bsm` (sprite_uv_tint
+  stub for parity),
+  `src/backend/target/aarch64_macos/a64_macho.bsm` (mo_atof →
+  cg_parse_float_bits delegation)
+- Docs: `docs/journal.md` (this entry), `docs/how_to_dev_b++.md`
+  (Cap 3 §3.3 scientific notation table), `docs/tonify_checklist.md`
+  (Rule 20 + Pitfall 5), `docs/warning_error_log.md` (W027 +
+  T_BLOCK fix entry + diagnostic gaps section), `README.md`
+  (Phase 1 closure header), `games/fps/HANDOFF.md` (Phase 2 prep)
+
+---
+
 ## 2026-05-03 — Wolf3D scaffold + float field types + C emitter `&var` + doc faxina
 
 A long maintenance day that ended with the tree clean and ready

@@ -1,0 +1,261 @@
+// stbtexture.bsm — Programmatic texture creation for placeholder
+// art, debug rendering, and pure-code games.
+//
+// Three layers cooperate on the texture pipeline in the standard
+// library, and `stbtexture` owns the middle one:
+//
+//   filesystem  → texture   (PNG decoding, asset slots) — `stbasset`
+//   programmatic → texture  (procedural materials)      — `stbtexture`  ← this
+//   texture     → screen    (sampling, drawing)         — `stbrender`
+//
+// Today the module ships parameterised builders for common
+// materials (brick, stone, wood, solid) that fill an RGBA byte
+// buffer in pure B++. Each material exposes two entry points:
+//
+//   `texture_<name>_to_buf(buf, w, h, ...)` writes the pattern into a
+//      caller-supplied buffer. No GPU, no allocation. The pixel
+//      algorithm is the deliverable; ideal for tests, CPU-only
+//      renderers (TUI fallback, ANSI mode), or any caller that
+//      wants the bytes without GPU side effects.
+//
+//   `texture_<name>(w, h, ...)` is the GPU factory. It allocates a
+//      buffer, calls `_to_buf`, uploads via `_stb_gpu_create_texture`
+//      and returns a handle. Use this from game init / load steps.
+//
+// Future room: atlas builders, format conversions (palette → RGBA),
+// blit/copy operations, sub-region helpers. The naming reserves the
+// `texture_*` prefix so those land here without churn.
+//
+// Why stb-level instead of per-game:
+//   The patterns (running-bond brick, noisy stone, vertical planks)
+//   are universal materials — a 2.5D raycaster, a dungeon crawler,
+//   a top-down RPG, a tile editor preview, or a Phase 1 Wolf3D
+//   placeholder all want the same shapes. Each game picks its own
+//   colour palette and dimensions; the cartridge owns the geometry.
+//
+// Composition:
+//   No imports needed beyond the auto-injected `_stb_gpu_*` and
+//   `bpp_buf` (for `buf_byte`). Pure leaf module.
+//
+// Memory contract:
+//   Each `texture_*` GPU factory returns a handle the caller treats
+//   as opaque. The pixel buffer is intentionally NOT freed — Apple
+//   Silicon's unified memory may not have finished the upload at
+//   the moment of return; the per-texture cost (16 KB for a 64x64
+//   RGBA) is negligible against the lifetime of a wall set. The
+//   `_to_buf` variants do not allocate at all — caller owns the
+//   buffer's lifetime.
+//
+// Phase note:
+//   The GPU factories are `@solo` (the classifier infers it from
+//   the heap-alloc + GPU-upload combination, which crosses the
+//   IO/GPU sibling categories of the effect lattice). Call them
+//   from a dedicated init / load step — never from a `@time`
+//   audio callback or a `@gpu` per-frame render. The `_to_buf`
+//   variants write into a caller-supplied buffer via `poke`, so
+//   the classifier infers `@solo` for them as well — they are NOT
+//   `@base`. Practically the same advice applies: build the buffer
+//   during init, then read from it (or upload) in the hot phases.
+//
+// Usage:
+//   load "stbtexture.bsm";
+//
+//   auto tex_brick;
+//   tex_brick = texture_brick(64, 64,
+//                             0xFF8B4513,   // brick color (saddle brown)
+//                             0xFF302820,   // mortar color (dark grey)
+//                             16, 8);       // brick width, height in pixels
+//   render_sprite(tex_brick, 0, 0, 1);
+
+// Module init — currently a no-op. Defined for symmetry with other
+// stb modules so any program calling `init_texture()` from its
+// game_init pipeline doesn't have to special-case this one.
+void init_texture() {
+}
+
+// Pack ARGB bytes into a destination RGBA pixel slot. Pixel layout
+// in memory is R, G, B, A (matches `_stb_gpu_create_texture` and
+// the precedent set by `render_create_sprite16`).
+static void _texture_put_rgba(buf, off, color) {
+    poke(buf + off,     (color >> 16) & 0xFF);   // R
+    poke(buf + off + 1, (color >> 8)  & 0xFF);   // G
+    poke(buf + off + 2,  color        & 0xFF);   // B
+    poke(buf + off + 3, (color >> 24) & 0xFF);   // A
+}
+
+// ── Solid colour ─────────────────────────────────────────────
+
+// Fill `buf` (must be at least w*h*4 bytes) with a single ARGB
+// colour repeated for every pixel. The texture-only counterpart to
+// flat-fill rendering: a raycaster that wants a flat-shaded wall
+// builds its dispatch table with `texture_solid(64, 64, color)` and
+// the rest of the pipeline (sampling, tint, projection) flows
+// unchanged. Mixing solid and patterned wall types in the same
+// map costs no special-case rendering — both are textures from the
+// GPU's perspective.
+void texture_solid_to_buf(buf, w, h, color) {
+    auto off, n;
+    n = w * h * 4;
+    for (off = 0; off < n; off += 4) {
+        _texture_put_rgba(buf, off, color);
+    }
+}
+
+// GPU factory: allocate, fill, upload, return handle. See header
+// "Phase note" for why this lacks an effect annotation.
+texture_solid(w, h, color) {
+    auto buf;
+    buf = buf_byte(w * h * 4);
+    texture_solid_to_buf(buf, w, h, color);
+    return _stb_gpu_create_texture(buf, w, h);
+}
+
+// ── Running-bond brick ───────────────────────────────────────
+
+// Fill `buf` with a running-bond brick wall pattern. Bricks of
+// size `brick_w` x `brick_h` are laid in horizontal rows; every
+// other row offsets by half a brick width so the seams interleave
+// (the "running bond" masonry pattern). Mortar lines (1-pixel) sit
+// on the row tops and the brick-column edges.
+//
+// Parameters:
+//   buf          — caller-allocated RGBA buffer of at least w*h*4 bytes.
+//   w, h         — buffer dimensions in pixels (typically 64x64).
+//   brick_color  — ARGB packed colour for the brick faces.
+//   mortar_color — ARGB packed colour for the mortar lines.
+//   brick_w      — brick width in pixels (16 is the classic default).
+//   brick_h      — brick height in pixels (8 is the classic default).
+void texture_brick_to_buf(buf, w, h, brick_color, mortar_color,
+                          brick_w, brick_h) {
+    auto x, y, off, bx;
+    auto on_mortar;
+    auto rng: word;
+    auto color: word;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            // Running bond: alternate rows shift by half a brick
+            // so vertical seams stagger across courses.
+            if ((y / brick_h) & 1) {
+                bx = (x + brick_w / 2) % brick_w;
+            } else {
+                bx = x % brick_w;
+            }
+
+            // Mortar: top edge of each row + left edge of each brick.
+            on_mortar = 0;
+            if (y % brick_h == 0) { on_mortar = 1; }
+            if (bx == 0)          { on_mortar = 1; }
+
+            if (on_mortar) {
+                color = mortar_color;
+            } else {
+                // Tiny deterministic per-pixel jitter so neighbouring
+                // bricks read as distinct surfaces under perspective.
+                rng = (x * 13 + y * 29) & 0x0F;
+                color = brick_color - rng * 0x00040201;
+            }
+
+            off = (y * w + x) * 4;
+            _texture_put_rgba(buf, off, color);
+        }
+    }
+}
+
+// GPU factory.
+texture_brick(w, h, brick_color, mortar_color, brick_w, brick_h) {
+    auto buf;
+    buf = buf_byte(w * h * 4);
+    texture_brick_to_buf(buf, w, h, brick_color, mortar_color,
+                         brick_w, brick_h);
+    return _stb_gpu_create_texture(buf, w, h);
+}
+
+// ── Noisy stone ──────────────────────────────────────────────
+
+// Fill `buf` with a noisy stone pattern: every pixel picks one of
+// two colours based on a deterministic hash of (x, y), producing a
+// rough chunky pattern that reads as "stone" without committing to
+// any specific period.
+//
+// Parameters:
+//   buf           — caller-allocated RGBA buffer.
+//   w, h          — buffer dimensions in pixels.
+//   base_color    — ARGB packed colour for the dominant tone.
+//   accent_color  — ARGB packed colour for darker speckles.
+void texture_stone_to_buf(buf, w, h, base_color, accent_color) {
+    auto x, y, off, hashv: word, color: word;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            // Cheap deterministic hash — good enough to look chaotic,
+            // bad enough to stay byte-identical across builds.
+            hashv = (x * 73 + y * 137) ^ (x * y);
+            hashv = hashv ^ (hashv >> 5);
+            if ((hashv & 0x07) == 0)      { color = accent_color; }
+            else if ((hashv & 0x1F) == 1) { color = accent_color; }
+            else                          { color = base_color; }
+
+            off = (y * w + x) * 4;
+            _texture_put_rgba(buf, off, color);
+        }
+    }
+}
+
+// GPU factory.
+texture_stone(w, h, base_color, accent_color) {
+    auto buf;
+    buf = buf_byte(w * h * 4);
+    texture_stone_to_buf(buf, w, h, base_color, accent_color);
+    return _stb_gpu_create_texture(buf, w, h);
+}
+
+// ── Vertical wood planks ─────────────────────────────────────
+
+// Fill `buf` with vertical wood-plank texture: alternating planks
+// of width `plank_w` in two shades, with a 1-pixel dark seam
+// between neighbours. Within each plank a faint horizontal grain
+// modulates the colour to suggest wood fibre.
+//
+// Parameters:
+//   buf          — caller-allocated RGBA buffer.
+//   w, h         — buffer dimensions in pixels.
+//   base_color   — lighter plank colour.
+//   dark_color   — darker plank + seam colour.
+//   plank_w      — plank width in pixels (8-16 typical).
+void texture_wood_to_buf(buf, w, h, base_color, dark_color,
+                         plank_w) {
+    auto x, y, off, plank_idx: word, color: word, grain: word;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            plank_idx = x / plank_w;
+
+            // Seam between planks: 1-pixel dark line at the right
+            // edge of every plank.
+            if ((x % plank_w) == plank_w - 1) {
+                color = dark_color;
+            } else if (plank_idx & 1) {
+                // Alternate plank: slightly darker base.
+                color = dark_color;
+            } else {
+                color = base_color;
+            }
+
+            // Horizontal grain — every few rows, dim by a notch.
+            grain = (y * 7 + plank_idx * 11) & 0x07;
+            if (grain < 2) { color = color - 0x00080604; }
+
+            off = (y * w + x) * 4;
+            _texture_put_rgba(buf, off, color);
+        }
+    }
+}
+
+// GPU factory.
+texture_wood(w, h, base_color, dark_color, plank_w) {
+    auto buf;
+    buf = buf_byte(w * h * 4);
+    texture_wood_to_buf(buf, w, h, base_color, dark_color, plank_w);
+    return _stb_gpu_create_texture(buf, w, h);
+}

@@ -640,6 +640,65 @@ To pass the result to a function expecting `char*`, read that pointer.
 
 ---
 
+## Rule 20: Two-consumer rule — promote on the second consumer
+
+**The moment a second caller appears for a private helper, promote
+it to its canonical home.** Do not wait for the third.
+
+The trigger is the *second* consumer because:
+
+- One consumer is local optimisation. The function lives where it
+  was written, and that is the right call.
+- Two consumers is **shared infrastructure pretending to be
+  private**. Every additional caller after the second pays the cost
+  of duplicated logic, divergent fixes, and the eventual "which
+  copy is canonical?" archaeology. By the third consumer, the
+  divergence is already there.
+- The second consumer is also when the *interface* gets its first
+  honest stress test — one caller can rationalise any signature; a
+  second caller forces the API to be more general than convenient.
+
+**Where to promote:**
+
+| Helper kind | Canonical home |
+|---|---|
+| Pure compute (`sin_f`, `floor_f`, hashing, bit-tricks) | `src/bpp_math.bsm` (Layer 3, auto-injected) |
+| Data structure / collection | `src/bpp_<shape>.bsm` (auto-injected) |
+| Game-class generic (procedural generators, pathfinding, sprites) | `stb/<feature>.bsm` (Layer 2, opt-in import) |
+| Compiler-internal (parser/codegen helpers) | `src/bpp_internal.bsm` |
+| OS/platform primitive | `src/backend/os/<os>/_*_<os>.bsm` (per OS) |
+
+**Worked example (2026-05-04):** `_rc_sin` / `_rc_cos` / `_rc_abs_f`
+/ `_rc_floor_f` lived as private helpers in `stb/stbraycast.bsm`
+through Wolf3D Session 1. When Session 3's `fps_walk` /
+`fps_turn` in `stbphys.bsm` needed the same trig, the rule fired:
+two consumers, promote up. They moved to `src/bpp_math.bsm` as
+public `sin_f` / `cos_f` / `abs_f` / `floor_f` (auto-injected) in
+the same commit that wired `fps_walk`. Bootstrap stayed
+byte-stable; both consumers call the public API; future trig
+needs in any program use the same names.
+
+**The discipline that fails this rule:**
+
+- "I'll keep my private copy and we'll consolidate later." Later
+  never comes; the third consumer fork-bombs the duplication.
+- "Promotion needs a refactor session of its own." It does not.
+  Promote in the same commit as the second use; the diff is one
+  delete + one move + N call-site renames.
+- "The interface might still change — let's wait." If the
+  interface needs to change, the second consumer is the one
+  forcing the change. Wait, and the first consumer hardens around
+  a wrong interface.
+
+**The discipline that follows the rule:** when adding a new
+function, check whether *any* existing helper does the same job.
+If yes, use it. If no, write the new function in its canonical
+home from the first keystroke — even if you only have one caller
+today. The cost of "lives in the right place since day 1" is zero;
+the cost of late promotion compounds.
+
+---
+
 ## Known pitfalls (discovered during batch 2)
 
 These are compiler bugs or limitations that affect tonification. They are
@@ -711,6 +770,41 @@ an unusual expression). Verify with grep before bulk replace.
 
 **Do NOT replace**: `0 - x` (variable), `arr[len - 1]`, `n - 1` (not
 zero-based). The pattern to target is literally `0 - 1` (zero minus one).
+
+### Pitfall 5: `: float` parameters on functions called via fn_ptr `call()`
+
+Functions invoked through `call(fn_ptr_var, args...)` receive their
+arguments via dynamic dispatch. The dispatch passes args through
+**general-purpose registers only** — it does not look at the
+callee's declared param types and does not emit FCVT to promote int
+args to float. If the callee declares `dt: float` while the caller
+passes an int, the callee reads `d0` (an FP register) which contains
+whatever was left over from the previous FP operation — usually
+garbage, often zero.
+
+**Symptom shape**: a parameter that was supposed to receive a useful
+value is silently zero (or garbage), producing "stuck"-looking
+behaviour. Wolf3D Phase 1 Session 3 hit this when the maestro solo
+callback declared `dt: float` and movement multiplied by `dt` always
+produced zero — player never moved. The visible output rendered fine
+(rendering doesn't depend on dt), but input → motion was a no-op.
+
+| Pattern | Action |
+|---------|--------|
+| Callback registered via `maestro_register_*` / `fn_ptr` with `: float` param | **Drop the `: float` annotation.** Take the int value and convert internally. |
+| Direct call `name(arg)` to a function declared `: float` | Safe — direct calls DO promote at the call boundary. |
+| Internal helper that wants float math | Convert at top of body: `auto x_f: float; x_f = x; x_f = x_f / 1000.0;` (or whatever scaling fits). |
+
+**Convention used by maestro**: solo / base / render callbacks
+receive `dt` in **milliseconds** as an integer. Helpers that want
+seconds (e.g. position += velocity × dt_seconds) divide by 1000.0
+explicitly inside their body. Never declare the maestro callback's
+param as `: float` — the FFI is GP-register only.
+
+**Cross-reference**: `warning_error_log.md` "FFI float-param trap" —
+listed as a known compiler diagnostic gap (no W-code fires today;
+candidate sidequest is to add one that warns at `fn_ptr(name)` when
+`name` has any `: float` parameter).
 
 ---
 
