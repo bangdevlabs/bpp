@@ -142,6 +142,8 @@ void cg_install_arm64_primitives() {
     p.arg_reg_count_flt            = fn_ptr(_a64_arg_reg_count_flt);
     p.emit_push_arg_int            = fn_ptr(_a64_emit_push_arg_int);
     p.emit_push_arg_flt            = fn_ptr(_a64_emit_push_arg_flt);
+    p.emit_arg_compact_int         = fn_ptr(_a64_emit_arg_compact_int);
+    p.emit_arg_int_to_flt          = fn_ptr(_a64_emit_arg_int_to_flt);
     p.emit_pre_call_align          = fn_ptr(_a64_emit_pre_call_align);
     p.emit_post_call_unalign       = fn_ptr(_a64_emit_post_call_unalign);
     p.emit_call_direct             = fn_ptr(_a64_emit_call_direct);
@@ -1035,20 +1037,43 @@ a64_emit_call(nd) {
 
         // Built-in: call(fn_ptr, arg0, arg1, ...) — indirect function call.
         // First argument is the function address, remaining are passed to it.
+        //
+        // True AAPCS64: integer and float args occupy independent
+        // register banks (x0..x7 and d0..d7), each with its own counter.
+        // `(int, float, int)` lands at (x0, d0, x1) — float sits in
+        // its own d-reg sequence regardless of the int args around it.
+        //
+        // First pass: emit each arg, capture its compile-time return
+        // type (0 = int, 1 = float) into a per-arg buffer, push onto
+        // its typed half of the stack (a64_emit_push for int / fpush
+        // for float — both 16-byte slots). Second pass: pop in LIFO
+        // order, routing each arg to its AAPCS64 register slot using
+        // separate int_seq / flt_seq counters walked over the recorded
+        // types.
         if (cg_str_eq(n.a, "call", 4)) {
+            auto types_buf, t;
             arr = n.b; cnt = n.c;
-            // Evaluate all arguments (fn_ptr + real args) and push.
+            types_buf = buf_byte(cnt);
             i = 0;
             while (i < cnt) {
-                a64_emit_node(*(arr + i * 8));
-                a64_emit_push();
+                t = a64_emit_node(*(arr + i * 8));
+                poke(types_buf + i, t);
+                if (t == 1) { a64_emit_fpush(); }
+                else        { a64_emit_push();  }
                 i++;
             }
-            // Pop real args into x0..x(cnt-2).
-            i = cnt - 2;
-            while (i >= 0) { a64_emit_pop(i); i--; }
-            // Pop function pointer into x9 (it was pushed first, so it's last to pop).
+            // Pop real args (indices 1..cnt-1). Each arg's destination
+            // register slot is the count of same-type args preceding
+            // it in [1, i) — see cg_count_tags in the spine.
+            i = cnt - 1;
+            while (i >= 1) {
+                t = peek(types_buf + i);
+                if (t == 1) { a64_emit_fpop(cg_count_tags(types_buf, 1, i, 1)); }
+                else        { a64_emit_pop(cg_count_tags(types_buf, 1, i, 0));  }
+                i--;
+            }
             a64_emit_pop(9);
+            free(types_buf);
             // Indirect call. Save d0/d1 for float_ret() / float_ret2().
             if (a64_bin_mode) {
                 enc_blr(9);
@@ -1207,34 +1232,14 @@ a64_emit_call(nd) {
         i = cnt - 1;
         while (i >= 0) { a64_emit_pop(i); i--; }
 
-        // For FFI calls: rearrange args per ARM64 ABI.
-        // Int and float args use SEPARATE register counters:
-        //   int args  → x0, x1, x2, ...  (int_idx)
-        //   float args → d0, d1, d2, ... (flt_idx)
-        // After pop, all args sit in x0..x(N-1). Rearrange in one pass.
-        // Invariant: int_idx <= i, so compacting ints never clobbers unread values.
+        // Rearrange args from "all in int regs" to AAPCS64
+        // (separate int / float banks). Spine helper walks both FFI
+        // externs and B++-internal calls uniformly via two chip
+        // primitives; see `cg_emit_call_arg_rearrange`.
         auto exi;
         exi = cg_find_ext_by_argc(n.a, cnt);
-        if (exi >= 0) {
-            auto int_idx, flt_idx;
-            int_idx = 0; flt_idx = 0;
-            i = 0;
-            while (i < cnt) {
-                if (cg_ext_par_is_float(exi, i)) {
-                    // Move bit pattern from x[i] → d[flt_idx].
-                    if (a64_bin_mode) { enc_fmov_from_gpr(flt_idx, i); }
-                    else { out("  fmov d"); a64_print_dec(flt_idx); out(", x"); a64_print_dec(i); putchar('\n'); }
-                    flt_idx++;
-                } else {
-                    // Compact int args: x[i] → x[int_idx].
-                    if (int_idx != i) {
-                        if (a64_bin_mode) { enc_add_imm(int_idx, i, 0); }
-                        else { out("  mov x"); a64_print_dec(int_idx); out(", x"); a64_print_dec(i); putchar('\n'); }
-                    }
-                    int_idx++;
-                }
-                i++;
-            }
+        if (exi >= 0 || fidx_c >= 0) {
+            cg_emit_call_arg_rearrange(cnt, exi, fidx_c);
         }
 
         if (a64_bin_mode) {

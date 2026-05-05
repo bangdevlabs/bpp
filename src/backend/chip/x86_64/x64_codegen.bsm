@@ -136,6 +136,8 @@ void cg_install_x86_64_primitives() {
     p.b3_select              = fn_ptr(_x64_b3_select_prim);
     p.emit_arg_copy_int      = fn_ptr(_x64_emit_arg_copy_int);
     p.emit_arg_copy_flt      = fn_ptr(_x64_emit_arg_copy_flt);
+    p.emit_arg_compact_int   = fn_ptr(_x64_emit_arg_compact_int);
+    p.emit_arg_int_to_flt    = fn_ptr(_x64_emit_arg_int_to_flt);
     p.emit_frame_teardown    = fn_ptr(_x64_emit_frame_teardown);
     p.emit_module_setup      = fn_ptr(_x64_emit_module_setup);
     p.emit_module_finalize   = fn_ptr(_x64_emit_module_finalize);
@@ -756,21 +758,38 @@ x64_emit_call(nd) {
         // cg_builtin_dispatch (Wave 18).
         // fn_ptr dispatch moved to cg_builtin_dispatch (Wave 18 batch 5).
         // Built-in: call(fn_ptr, arg0, arg1, ...) — indirect call.
+        //
+        // System V x86_64 mirror of the AAPCS64 path: int args use
+        // rdi rsi rdx rcx r8 r9 (via x64_arg_reg), float args use
+        // xmm0..xmm7. Counters advance independently — `(int, float,
+        // int)` lands at (rdi, xmm0, rsi). Capture each arg's
+        // compile-time return type, push to typed half of the stack
+        // (emit_push for int / emit_fpush for float), pop in LIFO
+        // order routing by recorded type.
         if (cg_str_eq(n.a, "call", 4)) {
+            auto types_buf, t;
             arr = n.b; cnt = n.c;
+            types_buf = buf_byte(cnt);
             i = 0;
             while (i < cnt) {
-                ety = x64_emit_node(*(arr + i * 8));
-                // Bit-transfer float values to GPR for uniform stack push.
-                if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
-                x64_emit_push();
+                t = x64_emit_node(*(arr + i * 8));
+                poke(types_buf + i, t);
+                if (t == 1) { x64_emit_fpush(); }
+                else        { x64_emit_push();  }
                 i++;
             }
-            // Pop real args into System V registers.
-            i = cnt - 2;
-            while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i--; }
-            // Pop function pointer into R11.
+            // Pop real args (indices 1..cnt-1). Each arg's destination
+            // register slot is the count of same-type args preceding
+            // it in [1, i) — shared cg_count_tags helper in the spine.
+            i = cnt - 1;
+            while (i >= 1) {
+                t = peek(types_buf + i);
+                if (t == 1) { x64_emit_fpop(cg_count_tags(types_buf, 1, i, 1));            }
+                else        { x64_emit_pop(x64_arg_reg(cg_count_tags(types_buf, 1, i, 0))); }
+                i--;
+            }
             x64_emit_pop(11);
+            free(types_buf);
             padded = x64_align_call();
             x64_enc_call_reg(11);
             // Save float return registers for float_ret() / float_ret2().
@@ -908,6 +927,16 @@ x64_emit_call(nd) {
         // Pop into System V argument registers.
         i = cnt - 1;
         while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i--; }
+
+        // Rearrange args from "all in int regs" to System V
+        // (separate int / float banks). Spine helper walks both FFI
+        // externs and B++-internal calls uniformly via two chip
+        // primitives; see `cg_emit_call_arg_rearrange`.
+        auto exi;
+        exi = cg_find_ext_by_argc(n.a, cnt);
+        if (exi >= 0 || fidx_c >= 0) {
+            cg_emit_call_arg_rearrange(cnt, exi, fidx_c);
+        }
 
         // Call the function.
         fi = cg_find_fn(n.a);

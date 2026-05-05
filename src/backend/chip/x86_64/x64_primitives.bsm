@@ -524,17 +524,49 @@ void _x64_save_main_runtime_globals() {
 // Copy incoming int arg from System V ABI reg to frame slot (or
 // directly into B3-promoted callee-saved reg). Args come in
 // rdi/rsi/rdx/rcx/r8/r9 by slot index — x64_arg_reg maps this.
-void _x64_emit_arg_copy_int(param_idx, frame_off) {
+// Copy incoming int arg from its System V source register to its
+// frame slot (or directly into a B3-promoted callee-saved reg if
+// hot). `var_idx` selects the variable for the promotion lookup;
+// `abi_seq_idx` is the position in the int register sequence
+// (rdi rsi rdx rcx r8 r9) — independent from `var_idx` because
+// float params advance their own xmm counter without consuming an
+// int slot.
+void _x64_emit_arg_copy_int(var_idx, abi_seq_idx, frame_off) {
     auto preg, abi_reg;
-    preg = arr_get(cg_var_promote, param_idx);
-    abi_reg = x64_arg_reg(param_idx);
+    preg = arr_get(cg_var_promote, var_idx);
+    abi_reg = x64_arg_reg(abi_seq_idx);
     if (preg >= 0) {
         x64_enc_mov_reg(preg, abi_reg);
     } else {
         x64_enc_store(abi_reg, 5, frame_off);
     }
 }
-void _x64_emit_arg_copy_flt(param_idx, frame_off) { }
+
+// Compact int args within the System V GP bank. `dst_seq` and
+// `src_seq` are positions in `x64_arg_reg` (rdi rsi rdx rcx r8 r9).
+// Emits `mov dst, src`. Invoked by `cg_emit_call_arg_rearrange` to
+// collapse positions that floats vacated; dst < src always.
+void _x64_emit_arg_compact_int(dst_seq, src_seq) {
+    if (dst_seq == src_seq) { return; }
+    x64_enc_mov_reg(x64_arg_reg(dst_seq), x64_arg_reg(src_seq));
+}
+
+// Bit-transfer the float bits sitting in `x64_arg_reg(src_int_seq)`
+// (a System V GP arg register) into `xmm<flt_seq>` via MOVQ. The
+// caller has already bit-cast XMM0→RAX before push, so the value
+// rides as IEEE 754 bits in the GP register.
+void _x64_emit_arg_int_to_flt(flt_seq, src_int_seq) {
+    x64_enc_movq_to_xmm(flt_seq, x64_arg_reg(src_int_seq));
+}
+
+// Copy incoming float arg from System V xmm source register to its
+// frame slot. xmm0..xmm7 carry the first eight float args under
+// SysV; abi_seq_idx is the float-bank position. B3 promotion of
+// float params into callee-saved regs is not yet supported on
+// x86_64 either — falls through to frame-slot storage.
+void _x64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
+    x64_enc_store_sd(abi_seq_idx, 5, frame_off);
+}
 // Epilogue: define return label, restore promoted regs from
 // frame spill slots (negative offsets from x64_b3_spill_off),
 // restore rbp, ret. Reads x64_promoted_regs and

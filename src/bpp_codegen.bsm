@@ -191,6 +191,8 @@ struct ChipPrimitives {
     arg_reg_count_flt,  // ()          → 8 (a64) or 8 (x64)
     emit_push_arg_int,  // (dst_or_off, is_spill)
     emit_push_arg_flt,  // (dst_or_off, is_spill)
+    emit_arg_compact_int,    // (dst_int_seq, src_int_seq) — mov within int bank to compact
+    emit_arg_int_to_flt,     // (flt_seq, src_int_seq) — bit-cast int reg → flt reg
     emit_pre_call_align,    // (stack_args) → bytes of padding
     emit_post_call_unalign, // (pad_bytes)
     emit_call_direct,   // (target_lbl)
@@ -224,8 +226,8 @@ struct ChipPrimitives {
     emit_frame_setup,       // (frame_size)        Wave 13
     emit_save_callee_saved, // (regs_arr, count, base_off) Wave 13
     b3_select,              // ()                  Wave 13
-    emit_arg_copy_int,      // (param_idx, frame_off) Wave 14
-    emit_arg_copy_flt,      // (param_idx, frame_off) Wave 14
+    emit_arg_copy_int,      // (var_idx, abi_seq_idx, frame_off) — int param from x_<seq> / rdi-class to slot
+    emit_arg_copy_flt,      // (var_idx, abi_seq_idx, frame_off) — float param from d_<seq> / xmm to slot
     emit_frame_teardown,    // (frame_size, regs_arr, count, base_off) Wave 15
 
     // ── Phase 4: emit_module + emit_all (Waves 16-17 scaffolding) ──
@@ -583,6 +585,63 @@ global cg_sbuf;
 // following helpers read that representation against `cg_sbuf`
 // and work identically on every chip because they don't emit any
 // instruction bytes — they just parse text the parser produced.
+
+// Count how many entries in a 1-byte type-tag buffer between
+// indices [lo, hi) match `match_val`. Used by the call() builtin's
+// AAPCS64 / SysV register-routing pass: types_buf holds 0 (int) or
+// 1 (float) per arg, and the count of each preceding the current
+// arg is its destination register slot in the matching ABI bank.
+// Pure index-based read, lives in the spine so both chips share it.
+cg_count_tags(buf, lo, hi, match_val)@base {
+    auto i, n;
+    n = 0;
+    for (i = lo; i < hi; i++) {
+        if (peek(buf + i) == match_val) { n++; }
+    }
+    return n;
+}
+
+// Rearrange direct-call args from "all int regs" to AAPCS64 / SysV
+// (separate int / float register banks). After the chip's pop loop
+// has put every arg in the int register sequence (x0..xN on
+// aarch64, rdi/rsi/... on x86_64), walk the args once and route
+// each to its correct ABI slot via two chip primitives:
+//
+//   emit_arg_compact_int(dst_int_seq, src_int_seq) — `mov` within
+//     the int bank, compacting toward index 0 so float-skipped
+//     positions collapse.
+//   emit_arg_int_to_flt(flt_seq, src_int_seq) — bit-cast the int
+//     register holding the float bits into the matching FP register.
+//
+// `is_ffi` decides which type-source to consult: external param
+// table (`cg_ext_par_is_float(exi, i)`) for FFI calls, B++ function
+// table (`is_float_type(get_fn_par_type(fidx_c, i))`) for internal
+// calls. Both targets coexist when the symbol matches both — FFI
+// table wins because the external ABI is the binding contract for
+// off-binary calls.
+//
+// Invariant: `int_idx <= i` at every step, so compaction never
+// clobbers an unread arg's register.
+void cg_emit_call_arg_rearrange(cnt, exi, fidx_c) {
+    auto p: ChipPrimitives;
+    auto is_ffi, int_idx, flt_idx, i, is_flt;
+    p = cg_prim;
+    is_ffi = exi >= 0;
+    int_idx = 0; flt_idx = 0;
+    for (i = 0; i < cnt; i++) {
+        if (is_ffi) { is_flt = cg_ext_par_is_float(exi, i); }
+        else        { is_flt = is_float_type(get_fn_par_type(fidx_c, i)); }
+        if (is_flt) {
+            call(p.emit_arg_int_to_flt, flt_idx, i);
+            flt_idx++;
+        } else {
+            if (int_idx != i) {
+                call(p.emit_arg_compact_int, int_idx, i);
+            }
+            int_idx++;
+        }
+    }
+}
 
 // Compare a packed source range against a C string literal.
 // Returns 1 if the bytes match and the lengths are equal,
@@ -2009,10 +2068,26 @@ void cg_emit_func(fi) {
         call(p.save_main_runtime_globals);
     }
 
-    // 11. Incoming integer args → frame slots or promoted regs.
+    // 11. Incoming args → frame slots or promoted regs. AAPCS64 /
+    // System V x86_64 use independent register banks for int and
+    // float args — each tracked by its own counter, advancing only
+    // when an arg of that class consumes a slot. `(int, float, int)`
+    // pulls from x0 / d0 / x1 (aarch64) or rdi / xmm0 / rsi (x86_64).
+    // The chip primitives receive the per-class sequence index and
+    // turn it into the right `str x_<n>` / `str d_<n>` instruction.
+    auto int_seq, flt_seq, ph_i, par_hint;
+    int_seq = 0; flt_seq = 0;
     i = 0;
     while (i < par_cnt) {
-        call(p.emit_arg_copy_int, i, arr_get(cg_var_off, i));
+        ph_i = 0;
+        if (hints != 0) { ph_i = *(hints + i * 8); }
+        if (is_float_type(ph_i)) {
+            call(p.emit_arg_copy_flt, i, flt_seq, arr_get(cg_var_off, i));
+            flt_seq++;
+        } else {
+            call(p.emit_arg_copy_int, i, int_seq, arr_get(cg_var_off, i));
+            int_seq++;
+        }
         i++;
     }
 

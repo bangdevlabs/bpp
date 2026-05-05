@@ -963,36 +963,73 @@ void _a64_save_main_runtime_globals() {
         out("  str x2, [x8]"); putchar('\n');
     }
 }
-// Copy incoming int arg from ABI reg to frame slot (or directly
-// into B3-promoted callee-saved reg if hot local). AAPCS64: args
-// come in x0..x7 by slot index. Reads cg_var_promote for the
-// promotion decision.
-void _a64_emit_arg_copy_int(param_idx, frame_off) {
+// Copy incoming int arg from its AAPCS64 source register to its
+// frame slot (or directly into a B3-promoted callee-saved reg if
+// the local is hot). `var_idx` indexes the per-function variable
+// table for the promotion lookup; `abi_seq_idx` is the position in
+// the int register sequence (x0..x7) — different from `var_idx`
+// because float params advance their own d-reg counter without
+// consuming an int slot.
+void _a64_emit_arg_copy_int(var_idx, abi_seq_idx, frame_off) {
     auto preg;
-    preg = arr_get(cg_var_promote, param_idx);
+    preg = arr_get(cg_var_promote, var_idx);
     if (a64_bin_mode) {
         if (preg >= 0) {
-            enc_add_imm(preg, param_idx, 0);   // mov preg, xN
+            enc_add_imm(preg, abi_seq_idx, 0);   // mov preg, x_<seq>
         } else {
-            enc_str_uoff(param_idx, 29, frame_off);
+            enc_str_uoff(abi_seq_idx, 29, frame_off);
         }
     } else {
         if (preg >= 0) {
             out("  mov x"); a64_print_dec(preg);
-            out(", x"); a64_print_dec(param_idx); putchar('\n');
+            out(", x"); a64_print_dec(abi_seq_idx); putchar('\n');
         } else {
-            out("  str x"); a64_print_dec(param_idx);
+            out("  str x"); a64_print_dec(abi_seq_idx);
             out(", [x29, #"); a64_print_dec(frame_off); out("]"); putchar('\n');
         }
     }
 }
 
-// Float arg copy unused today in a64 — floats come in d0..d7 but
-// the existing path handles them inline via the sub-width narrowing
-// loop. Kept as a stub for contract parity; a RISC-V port wanting
-// a unified interface can implement this without touching the
-// narrowing path.
-void _a64_emit_arg_copy_flt(param_idx, frame_off) { }
+// Compact int args within the AAPCS64 GP bank — `mov x_<dst>, x_<src>`.
+// Invoked by `cg_emit_call_arg_rearrange` to collapse positions that
+// floats vacated. dst < src always (compaction toward x0).
+void _a64_emit_arg_compact_int(dst_seq, src_seq) {
+    if (dst_seq == src_seq) { return; }
+    if (a64_bin_mode) { enc_add_imm(dst_seq, src_seq, 0); }
+    else {
+        out("  mov x"); a64_print_dec(dst_seq);
+        out(", x"); a64_print_dec(src_seq); putchar('\n');
+    }
+}
+
+// Bit-transfer the float bits sitting in `x_<src_int_seq>` into the
+// matching `d_<flt_seq>` register so the callee reads its float
+// param from the FP bank as AAPCS64 specifies. The caller has
+// already bit-cast (fmov x, d) before push, so `x_<src>` holds the
+// IEEE 754 bits.
+void _a64_emit_arg_int_to_flt(flt_seq, src_int_seq) {
+    if (a64_bin_mode) { enc_fmov_from_gpr(flt_seq, src_int_seq); }
+    else {
+        out("  fmov d"); a64_print_dec(flt_seq);
+        out(", x"); a64_print_dec(src_int_seq); putchar('\n');
+    }
+}
+
+// Copy incoming float arg from AAPCS64 source d-reg to its frame
+// slot. Mirrors _a64_emit_arg_copy_int but routes through the FP
+// register bank (d0..d7) — independent counter per AAPCS64. The
+// narrowing pass after this handles SL_HALF / SL_QUARTER float
+// types by reloading d0 from the slot, fcvt-ing, and storing back.
+// B3 promotion of float params into callee-saved regs is not yet
+// supported (preg >= 0 path falls back to frame-slot storage).
+void _a64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
+    if (a64_bin_mode) {
+        enc_str_d_uoff(abi_seq_idx, 29, frame_off);
+    } else {
+        out("  str d"); a64_print_dec(abi_seq_idx);
+        out(", [x29, #"); a64_print_dec(frame_off); out("]"); putchar('\n');
+    }
+}
 // Epilogue: define return label, restore B3-promoted callee-saved
 // regs from frame spill slots, deallocate frame, restore fp/lr,
 // ret. Reads a64_promoted_regs and a64_b3_spill_base directly so
