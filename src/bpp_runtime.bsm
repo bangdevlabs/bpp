@@ -662,6 +662,89 @@ static _prof_is_synth(name_addr, name_len) {
     return 1;
 }
 
+// Returns 1 when the resolved frame name belongs to the profiler's
+// own dump path. Any sample landing here was attributed to the
+// dispatch + tally code itself (typically because SIGPROF fired during
+// `profile_stop` cleanup or during a partially-disarmed window). The
+// 64 KB resolver guard from Phase 1 catches most phantoms; this
+// sample-time filter mops up the residue without affecting legitimate
+// hot-path readings — `_runtime_name_addr` / `_runtime_name_len` have
+// other callers (symbol-aware diagnostics) and stay unfiltered.
+//
+// Byte-by-byte compare — bpp_runtime intentionally has no imports
+// (see the file header) so buf_eq / str_eq are unavailable. Same
+// pattern as `_prof_is_synth` above. Sieved by length first so the
+// inner peek chain runs only on plausible candidates.
+static _prof_is_dump_internal(name_addr, name_len) {
+    if (name_len == 12) {
+        // "profile_dump"
+        if (peek(name_addr     ) != 'p') { return 0; }
+        if (peek(name_addr +  1) != 'r') { return 0; }
+        if (peek(name_addr +  2) != 'o') { return 0; }
+        if (peek(name_addr +  3) != 'f') { return 0; }
+        if (peek(name_addr +  4) != 'i') { return 0; }
+        if (peek(name_addr +  5) != 'l') { return 0; }
+        if (peek(name_addr +  6) != 'e') { return 0; }
+        if (peek(name_addr +  7) != '_') { return 0; }
+        if (peek(name_addr +  8) != 'd') { return 0; }
+        if (peek(name_addr +  9) != 'u') { return 0; }
+        if (peek(name_addr + 10) != 'm') { return 0; }
+        if (peek(name_addr + 11) != 'p') { return 0; }
+        return 1;
+    }
+    if (name_len == 19) {
+        // Both "_profile_dump_inner" and "_runtime_resolve_pc" share
+        // length 19; disambiguate on the second byte ('p' vs 'r').
+        if (peek(name_addr) != '_') { return 0; }
+        auto c2;
+        c2 = peek(name_addr + 1);
+        if (c2 == 'p') {
+            // "_profile_dump_inner"
+            if (peek(name_addr +  2) != 'r') { return 0; }
+            if (peek(name_addr +  3) != 'o') { return 0; }
+            if (peek(name_addr +  4) != 'f') { return 0; }
+            if (peek(name_addr +  5) != 'i') { return 0; }
+            if (peek(name_addr +  6) != 'l') { return 0; }
+            if (peek(name_addr +  7) != 'e') { return 0; }
+            if (peek(name_addr +  8) != '_') { return 0; }
+            if (peek(name_addr +  9) != 'd') { return 0; }
+            if (peek(name_addr + 10) != 'u') { return 0; }
+            if (peek(name_addr + 11) != 'm') { return 0; }
+            if (peek(name_addr + 12) != 'p') { return 0; }
+            if (peek(name_addr + 13) != '_') { return 0; }
+            if (peek(name_addr + 14) != 'i') { return 0; }
+            if (peek(name_addr + 15) != 'n') { return 0; }
+            if (peek(name_addr + 16) != 'n') { return 0; }
+            if (peek(name_addr + 17) != 'e') { return 0; }
+            if (peek(name_addr + 18) != 'r') { return 0; }
+            return 1;
+        }
+        if (c2 == 'r') {
+            // "_runtime_resolve_pc"
+            if (peek(name_addr +  2) != 'u') { return 0; }
+            if (peek(name_addr +  3) != 'n') { return 0; }
+            if (peek(name_addr +  4) != 't') { return 0; }
+            if (peek(name_addr +  5) != 'i') { return 0; }
+            if (peek(name_addr +  6) != 'm') { return 0; }
+            if (peek(name_addr +  7) != 'e') { return 0; }
+            if (peek(name_addr +  8) != '_') { return 0; }
+            if (peek(name_addr +  9) != 'r') { return 0; }
+            if (peek(name_addr + 10) != 'e') { return 0; }
+            if (peek(name_addr + 11) != 's') { return 0; }
+            if (peek(name_addr + 12) != 'o') { return 0; }
+            if (peek(name_addr + 13) != 'l') { return 0; }
+            if (peek(name_addr + 14) != 'v') { return 0; }
+            if (peek(name_addr + 15) != 'e') { return 0; }
+            if (peek(name_addr + 16) != '_') { return 0; }
+            if (peek(name_addr + 17) != 'p') { return 0; }
+            if (peek(name_addr + 18) != 'c') { return 0; }
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 // Aggregate every captured sample into a top-`cap` table sorted
 // by descending count. Each output entry is 16 bytes: an 8-byte
 // packed name reference (the same encoding `caller_name` returns)
@@ -681,8 +764,13 @@ static _prof_is_synth(name_addr, name_len) {
 // programs have 100-500 functions; binary-search dedup or heap
 // extraction become worthwhile only at >10 kHz aggregate rates
 // across hundreds of threads, well past the cooperative ceiling.
-profile_dump(out_buf, cap)@io {
-    auto t, samples, i, j, k, slot, base, found;
+// Inner aggregation pass shared by `profile_dump` (all threads) and
+// `profile_dump_thread` (single thread). `target_thread` is -1 to
+// walk every thread or 0..N-1 to pick one. Tier 3a per-thread
+// breakdown rides on top: callers can iterate thread indices and
+// render each ring's top-N independently — main vs each worker.
+static _profile_dump_inner(out_buf, cap, target_thread)@io {
+    auto t, t_start, t_end, samples, i, j, k, slot, base, found;
     auto pc, packed, name_addr, name_len, pc_up, packed_up;
     auto name_buf, count_buf, unique_count;
     auto best_idx, best_count;
@@ -693,7 +781,16 @@ profile_dump(out_buf, cap)@io {
     count_buf = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
     unique_count = 0;
 
-    for (t = 0; t < _PROF_MAX_THREADS; t++) {
+    if (target_thread < 0) {
+        t_start = 0;
+        t_end   = _PROF_MAX_THREADS;
+    } else {
+        t_start = target_thread;
+        t_end   = target_thread + 1;
+        if (t_end > _PROF_MAX_THREADS) { t_end = _PROF_MAX_THREADS; }
+    }
+
+    for (t = t_start; t < t_end; t++) {
         samples = *(_prof_count + t * 8);
         if (samples > _PROF_RING_SLOTS) { samples = _PROF_RING_SLOTS; }
         for (i = 0; i < samples; i++) {
@@ -705,10 +802,17 @@ profile_dump(out_buf, cap)@io {
             packed = _runtime_resolve_pc(pc);
             if (packed == 0) { continue; }
 
-            // Synth re-attribution: peek the second frame up
-            // when the innermost name is an anonymous worker.
             name_addr = _runtime_name_addr(packed);
             name_len  = _runtime_name_len(packed);
+
+            // Drop samples that resolved to the profiler's own dump
+            // code — they are SIGPROF residue, not signal about the
+            // user's hot path. See `_prof_is_dump_internal` for the
+            // exhaustive name list.
+            if (_prof_is_dump_internal(name_addr, name_len)) { continue; }
+
+            // Synth re-attribution: peek the second frame up
+            // when the innermost name is an anonymous worker.
             if (_prof_is_synth(name_addr, name_len)) {
                 pc_up = *(base + 8);
                 if (pc_up != 0) {
@@ -755,4 +859,23 @@ profile_dump(out_buf, cap)@io {
     }
 
     return cap;
+}
+
+// Aggregate top-N hottest functions across ALL threads. Target shape
+// for the existing live HUD that shows a single combined leaderboard.
+// Backwards-compatible — the original entry point unchanged in
+// signature and behaviour.
+profile_dump(out_buf, cap)@io {
+    return _profile_dump_inner(out_buf, cap, -1);
+}
+
+// Tier 3a (V2 of the profiler HUD) — top-N for a single thread,
+// indexed 0..(_PROF_MAX_THREADS - 1). Returns 0 when the index is
+// out of range or no samples landed in that ring. Caller iterates
+// thread indices to render a per-thread breakdown alongside the
+// existing combined view.
+profile_dump_thread(out_buf, cap, thread_idx)@io {
+    if (thread_idx < 0)                  { return 0; }
+    if (thread_idx >= _PROF_MAX_THREADS) { return 0; }
+    return _profile_dump_inner(out_buf, cap, thread_idx);
 }

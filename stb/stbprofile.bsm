@@ -63,6 +63,17 @@ const _PROFILE_NAME_BUF_SZ   = 48;
 // real spikes. Same window every modern game-dev profiler ships.
 const _PROFILE_FRAME_BUF_N   = 32;
 
+// Tier 2 sparkline — vertical bar chart of the last N frame times
+// rendered just below the FPS / ms / max line. Heights normalize to
+// the window's max so the worst frame draws full-height and a
+// 60-FPS-stable run shows a flat row at the same height (because
+// max == avg). Each bar is _PROFILE_SPARK_W pixels wide; the row's
+// max pixel height pre-scale is _PROFILE_SPARK_H. `sz` from the HUD
+// caller scales both. No spacing between bars — adjacent bars form
+// a histogram-style readout that reads spikes at a glance.
+const _PROFILE_SPARK_W       = 2;
+const _PROFILE_SPARK_H       = 10;
+
 // ── State ────────────────────────────────────────────────────
 
 // 0 = idle, 1 = sampling. Edge-toggled by `profile_hud_toggle`.
@@ -243,6 +254,29 @@ void profile_hud_draw(x, y, sz, color) @gpu {
     render_number(        x + 12 *  8 * sz,   y + 22 * sz, sz, color, frame_ms_avg);
     render_text("max:",   x + 17 *  8 * sz,   y + 22 * sz, sz, color);
     render_number(        x + 21 *  8 * sz,   y + 22 * sz, sz, color, max_ms);
+
+    // Tier 2 sparkline. Walks the ring in chronological order
+    // (oldest → newest) so a left-to-right read tracks recent frame
+    // history naturally. Bar height = (frame_us / max_us) * H * sz,
+    // anchored to a baseline so taller bars grow upward — the
+    // histogram convention every profiler UI uses.
+    if (max_us > 0) {
+        auto spark_baseline, slot, start_slot, frame_dt, bar_h, bar_x, bar_w;
+        spark_baseline = y + 36 * sz;
+        bar_w = _PROFILE_SPARK_W * sz;
+        // _profile_frame_idx points at the next write slot; the
+        // oldest live slot sits frame_count steps behind it.
+        start_slot = (_profile_frame_idx - _profile_frame_count
+                      + _PROFILE_FRAME_BUF_N) % _PROFILE_FRAME_BUF_N;
+        for (i = 0; i < _profile_frame_count; i++) {
+            slot = (start_slot + i) % _PROFILE_FRAME_BUF_N;
+            frame_dt = _profile_frame_buf[slot];
+            bar_h = (frame_dt * _PROFILE_SPARK_H * sz) / max_us;
+            if (bar_h < 1) { bar_h = 1; }
+            bar_x = x + i * bar_w;
+            render_rect(bar_x, spark_baseline - bar_h, bar_w, bar_h, color);
+        }
+    }
 
     // Refresh the live top-N every _PROFILE_LIVE_REFRESH_MS ms.
     // profile_dump's internal mallocs make per-frame calls a
