@@ -44,6 +44,10 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | E243 | pointer compared to non-zero literal | bpp_validate.bsm | 600 | ✅ | `if (ptr == 42)` is almost always a bug; only 0 is the canonical null check |
 | E244 | float literal in int context | bpp_parser.bsm + bpp_validate.bsm | 2122 + 583 | ✅ | array index or shift count cannot be a float literal |
 | E245 | array element type conflict | bpp_types.bsm | ty_set_elem | ✅ | Two different element types inferred for the same TY_ARR variable — arrays are always homogeneous |
+| E246 | incompatible func-types | bpp_validate.bsm | 416/590 | ✅ | Annotation contract violated: assignment between two `func(...)` types with mismatched shape, or `call(fp, args)` where fp's annotated signature disagrees with the call site arg types (V3 Session 3 — shipped 2026-05-05) |
+| E247 | func-type cannot exceed 8 args | bpp_parser.bsm | parse_fn_type | ✅ | A `func(arg1, ..., arg9)` declaration exceeds the AAPCS64/SysV register-pass ceiling (V3 Session 1 — shipped 2026-05-04) |
+| E248 | func-type nesting exceeds maximum depth | bpp_parser.bsm | parse_fn_type | ✅ | Higher-order `func` types deeper than 16 levels — almost always a typo (V3 Session 1) |
+| E249 | malformed func-type | bpp_parser.bsm | parse_fn_type | ✅ | Missing `(` after `func` or missing `->` after argument list (V3 Session 1) |
 
 ## Runtime asset-load diagnostics (stderr, not compile-time)
 
@@ -94,6 +98,7 @@ re-log.
 | W021 | switch not exhaustive | bpp_parser.bsm | TBD | ✅ | switch without else arm |
 | W025 | public param without hint used in float arithmetic | bpp_validate.bsm | 681 | ✅ | Non-static fn uses un-hinted param in a T_BINOP where the other side is float-typed — annotate `: float` to preserve IEEE bits or `: word` to document integer intent (Rule 13) |
 | W026 | phase annotation violated by effect lattice | bpp_dispatch.bsm | 1228 | ✅ | Function annotated `@time` / `@io` / `@gpu` transitively reaches an incompatible effect through its call graph — Level 4 sub-step C. Lattice: BASE < TIME < HEAP < {IO, GPU} < SOLO. `@time` forbids HEAP, IO, GPU, SOLO; `@io` permits BASE, TIME, HEAP, IO (forbids GPU, SOLO); `@gpu` permits BASE, TIME, HEAP, GPU (forbids IO, SOLO). `@gpu` enforcement is armed via annotation-driven seed (Option B in `call_graph_build`): the annotation IS the source of truth for GPU effect, propagated through the fixpoint. Verify with `examples/phase_lattice_bad.bpp` (5/5 violations fire) |
+| W028 | call() arg-type mismatch via flow analysis | bpp_validate.bsm | 165 | ✅ | `call(fp, args)` where fp's resolved target (intra-function origin tracking, Session 2; or cross-function via registration helper, Session 4) declares a parameter whose float/int polarity does not match the supplied arg. Estrita conflict resolution for multi-origin: any registered target with a mismatching signature fires. Diagnostic-shipped 2026-05-05 — closes Pitfall 6 from `tonify_checklist.md` |
 
 ## What "has location" means
 
@@ -219,18 +224,37 @@ Real foot-guns that have caused bugs in shipped code. No W-code
 fires for them today — each is a candidate sidequest with the
 right shape (small, locks a contract permanently).
 
-### FFI float-param trap (W027 — SHIPPED 2026-05-04)
+### FFI float-param trap (W027 — RESOLVED 2026-05-04 by AAPCS64 refactor)
 
-**Diagnostic.** W027 fires at the `fn_ptr(callee)` site whenever
-`callee` declares any parameter with a `: float` annotation. Lives
-in `bpp_validate.bsm::_val_check_fn_ptr`. Walks `funcs[fp_fi].FN_HINTS`
-checking `is_float_type` on each entry.
+**Status: closed.** The underlying gap — `call(fp, args...)` passing
+all args through GP registers regardless of type — is fixed. Both
+chip backends now do compile-time type-aware arg routing:
 
-**Trigger.** A function declared with a `: float` parameter is
-invoked through `call(fn_ptr_var, args...)` instead of a direct
-call. `call` passes args via GP registers only; the callee reads
-the float param from FP register `d0` which contains stale data,
-not the caller's int value.
+- `a64_codegen.bsm`'s `call()` builtin emits `fpush` for float args
+  and routes float args to `d_<flt_seq>` per AAPCS64 (independent
+  counter from `x_<int_seq>` int args).
+- `x64_codegen.bsm`'s `call()` does the same with `fpush` plus a
+  post-pop rearrange that moves float bits via `MOVQ xmm, gpr` into
+  the SysV xmm register bank.
+- The callee prologue (`cg_emit_func` in the spine + chip
+  `_emit_arg_copy_int` / `_emit_arg_copy_flt` primitives) reads
+  float params from the FP bank instead of bit-casting through
+  memory from a GP slot.
+- The shared spine helper `cg_emit_call_arg_rearrange` extends the
+  same logic to direct B++ function calls so the AAPCS64 separate-
+  bank convention applies uniformly to indirect (`call()`),
+  external (`cg_find_ext_by_argc`), and internal (`fidx_c >= 0`)
+  call paths.
+
+W027's diagnostic helper in `bpp_validate.bsm::_val_check_fn_ptr`
+is now a no-op stub; the W-code is reserved (do not reuse) and
+documented here for archaeology only.
+
+**Trigger (historical).** A function declared with a `: float`
+parameter was invoked through `call(fn_ptr_var, args...)` instead
+of a direct call. The dispatch passed args via GP registers only;
+the callee read the float param from FP register `d0` which
+contained stale data, not the caller's value.
 
 **Symptom.** Silent zero (or garbage) for the affected param.
 Usually presents as "this code path runs but does nothing" — the
@@ -264,6 +288,55 @@ void my_solo(dt) {
 
 **Cross-reference.** `tonify_checklist.md` Pitfall 5 documents
 the same trap from the contributor angle.
+
+### `call(fp, ...)` arg-type mismatch with callee param type (NEW GAP after AAPCS64 refactor)
+
+**Status: open — diagnostic candidate.**
+
+**Trigger.** After the AAPCS64 / System V refactor that closed
+W027, the `call()` builtin routes args by their compile-time
+expression type into the matching ABI register bank (int → x/r
+regs, float → d/xmm regs). The callee reads each param from the
+bank dictated by its DECLARED type. When the two disagree —
+arg's static type ≠ param's declared type — the callee reads
+garbage from a stale ABI register.
+
+**Symptom shape.** Same "stuck-looking, silent-zero" presentation
+as historical W027, just inverted: callee declared `dt` (int)
+receiving a float arg (caller's value lands in `d0`, callee reads
+`x0`), or callee declared `dt: float` receiving an int arg
+(caller's int lands in `x0`, callee reads `d0`).
+
+**Diagnostic candidate.** Warn at the `call(fp, args...)` site
+when `fp` can be statically traced back to a specific
+`fn_ptr(name)` call AND any arg's compile-time type doesn't match
+the corresponding declared param type of `name`. Requires light
+flow analysis (track fn_ptr origin through local assignments and
+extrn / global writes). Not yet implemented — assign W028 when
+shipped.
+
+**Workaround until the warning ships.** Make the caller's arg
+type match the callee's declared param type:
+
+```bpp
+// Callee:
+void my_solo(dt: float) { ... }
+
+// Caller — declare local as float so SCVTF promotes int → float
+// during assignment:
+auto dt: float;
+dt = 16;
+call(fp, dt);
+```
+
+Direct calls (`my_solo(dt)` — not through `call(fp, ...)`) are
+already type-aware via the existing per-call-site arg-conversion
+emit in `a64_emit_node` / `x64_emit_node` (look for
+`is_float_type(get_fn_par_type(fidx_c, i))` branches). The gap
+exists only on the indirect `call()` path because the builtin
+dispatch can't know the callee's signature without flow analysis.
+
+**Cross-reference.** `tonify_checklist.md` Pitfall 6.
 
 ### T_BLOCK skipped by type-inference traversals (FIXED 2026-05-04)
 

@@ -112,53 +112,92 @@ static _val_name_eq(name_p, lit, len)@base {
     return buf_eq(vbuf + unpack_s(name_p), lit, len);
 }
 
-// W027 — fire when the call site is `fn_ptr(callee)` and `callee`
-// declares any parameter with a `: float` annotation. The dynamic
-// `call(fp, args...)` dispatch passes integer args via GP registers
-// only and never emits FCVT, so a callee reading the param from FP
-// register `d0` lands stale data (typically zero). Catch the trap
-// at the fn_ptr site so the warning is close to the unsafe
-// pointer's birthplace.
-//
-// Returns silently when this is not an `fn_ptr(...)` call, when the
-// arg is not a plain identifier, or when the callee has no float
-// params. Only fires once per fn_ptr — the first float param is
-// enough to surface the issue.
+// W027 — RESOLVED 2026-05-04 by the AAPCS64 / System V refactor.
+// `call(fp, args...)` now routes float args to d0..d7 / xmm0..xmm7
+// per ABI (independent counters, separate from int regs), and the
+// callee prologue reads float params from those FP registers
+// directly. The trap the diagnostic flagged no longer exists; the
+// helper is kept as a no-op stub so the call site in T_CALL
+// doesn't need a code change beyond the `diag_warn(27)` deletion.
+// See `docs/warning_error_log.md` "FFI float-param trap" entry for
+// the historical context.
 static void _val_check_fn_ptr(name_p, nd) {
-    auto n: Node, an: Node;
-    auto fp_arg, fp_target_p, fp_fi, fp_func, fp_hints, fp_pcnt, fp_j;
+    return;
+}
 
-    if (nd == 0)                        { return; }
-    if (unpack_l(name_p) != 6)          { return; }
-    if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", 6) == 0) { return; }
-    n = nd;
-    if (n.c != 1)                       { return; }
+// V3 Session 3 — when `call(fp, ...)` is invoked through a local that
+// carries an explicit `: func(...)` annotation, the annotation is the
+// contract. Validate each arg against the annotated signature; mismatch
+// is E246 hard error. Skips slots where either side is TY_UNK.
+static void _val_check_call_args_against_fntype(fp_ty, args_arr, arg_cnt, src_tok)@io {
+    auto ai, arg_nd, arg: Node, arg_ty, par_ty, expected_arg_count;
+    expected_arg_count = fn_type_arg_count(fp_ty);
+    for (ai = 0; ai < arg_cnt; ai++) {
+        if (ai >= expected_arg_count) { break; }
+        arg_nd = args_arr[ai];
+        if (arg_nd == 0) { continue; }
+        arg = arg_nd;
+        arg_ty = arg.itype;
+        par_ty = fn_type_arg(fp_ty, ai);
+        if (arg_ty == TY_UNK || par_ty == TY_UNK) { continue; }
+        if (is_fn_type(arg_ty) || is_fn_type(par_ty)) { continue; }
+        if (is_float_type(arg_ty) != is_float_type(par_ty)) {
+            diag_error(246);
+            diag_str("argument ");
+            diag_int(ai + 1);
+            diag_str(" of call() is ");
+            diag_str(val_type_name(arg_ty));
+            diag_str(", but the func-type annotation declares parameter ");
+            diag_int(ai + 1);
+            diag_str(" as ");
+            diag_str(val_type_name(par_ty));
+            diag_newline();
+            _val_show_context_at(src_tok);
+            diag_str("  = help: the annotation '");
+            diag_str(val_type_name(fp_ty));
+            diag_str("' is the contract — change the caller to pass the matching type, or update the annotation");
+            diag_newline();
+        }
+    }
+}
 
-    fp_arg = n.b[0];
-    if (fp_arg == 0)                    { return; }
-    an = fp_arg;
-    if (an.ntype != T_VAR)              { return; }
-
-    fp_target_p = an.a;
-    fp_fi = val_find_func(fp_target_p);
-    if (fp_fi < 0)                      { return; }
-
-    fp_func = funcs[fp_fi];
-    fp_hints = *(fp_func + FN_HINTS);
-    if (fp_hints == 0)                  { return; }
-
-    fp_pcnt = *(fp_func + FN_PCNT);
-    for (fp_j = 0; fp_j < fp_pcnt; fp_j++) {
-        if (is_float_type(fp_hints[fp_j]) == 0) { continue; }
-        diag_warn(27);
-        diag_str("fn_ptr to '");
-        diag_packed(fp_target_p);
-        diag_str("' which declares a `: float` parameter — `call()` passes args via GP registers only and the float param will read garbage from a stale FP register");
-        diag_newline();
-        _val_show_context_at(n.src_tok);
-        diag_help("drop the `: float` annotation on the callee's parameter and convert internally: `auto x_f: float; x_f = x; x_f = x_f / 1000.0;`");
-        diag_newline();
-        return;
+// V3 Session 2 — for a resolved target function fidx, validate each
+// arg's compile-time type against the callee's declared param type.
+// Mismatch on float/int polarity emits W028. Skips slots where either
+// side is TY_UNK (no information → no diagnostic).
+static void _val_check_call_args_against(target_fi, args_arr, arg_cnt, target_name_p, src_tok)@io {
+    auto ai, arg_nd, arg: Node, arg_ty, par_ty;
+    for (ai = 0; ai < arg_cnt; ai++) {
+        arg_nd = args_arr[ai];
+        if (arg_nd == 0) { continue; }
+        arg = arg_nd;
+        arg_ty = arg.itype;
+        par_ty = get_fn_par_type(target_fi, ai);
+        if (arg_ty == TY_UNK || par_ty == TY_UNK) { continue; }
+        if (is_fn_type(arg_ty) || is_fn_type(par_ty)) { continue; }
+        // Mismatch only when one side is float and the other is not —
+        // call() routes through register banks, so the bit pattern
+        // ends up in the wrong bank and silently corrupts.
+        if (is_float_type(arg_ty) != is_float_type(par_ty)) {
+            diag_warn(28);
+            diag_str("argument ");
+            diag_int(ai + 1);
+            diag_str(" of call() is ");
+            diag_str(val_type_name(arg_ty));
+            diag_str(", but the resolved target '");
+            diag_packed(target_name_p);
+            diag_str("' declares parameter ");
+            diag_int(ai + 1);
+            diag_str(" as ");
+            diag_str(val_type_name(par_ty));
+            diag_str(" — call() routes args by AAPCS64/SysV register bank, so this mismatch will silently corrupt the value at runtime");
+            diag_newline();
+            _val_show_context_at(src_tok);
+            diag_str("  = help: declare the local as ': ");
+            diag_str(val_type_name(par_ty));
+            diag_str("' so its bits flow unchanged, OR change the callee's parameter type to match");
+            diag_newline();
+        }
     }
 }
 
@@ -337,7 +376,68 @@ val_find_extern(name_p) {
 
 // ── Type name helper (for diagnostics) ──────────────────────
 
+// Shared scratch buffer for fn-type pretty printing. Reused across
+// every val_type_name call that hits a fn-type — diag_str copies the
+// content out before the next val_type_name fires, so a single buffer
+// suffices.
+static auto _val_fntype_buf;
+
+const VAL_FNTYPE_MAX_DEPTH = 8;
+
+// Recursively format a fn-type into the strbuf. Caller passes the
+// current buf; this returns the (possibly relocated) buf so chained
+// strbuf_cat calls stay correct.
+static _val_fntype_format(buf, ty, depth)@io {
+    auto rec: FnTypeRec, i;
+    if (depth >= VAL_FNTYPE_MAX_DEPTH) {
+        buf = strbuf_cat(buf, "func(<too deep>)");
+        return buf;
+    }
+    if (is_fn_type(ty) == 0) {
+        buf = strbuf_cat(buf, val_type_name(ty));
+        return buf;
+    }
+    rec = fn_type_get_record(ty);
+    buf = strbuf_cat(buf, "func(");
+    for (i = 0; i < rec.arg_count; i++) {
+        if (i > 0) { buf = strbuf_cat(buf, ", "); }
+        buf = _val_fntype_format(buf, rec.args[i], depth + 1);
+    }
+    buf = strbuf_cat(buf, ") -> ");
+    if (rec.ret_type == TY_UNK) {
+        buf = strbuf_cat(buf, "void");
+    } else {
+        buf = _val_fntype_format(buf, rec.ret_type, depth + 1);
+    }
+    return buf;
+}
+
+// V3 Session 3 — structural compat check between two func-types.
+// Hash-cons interning makes equal-id imply equal-shape, so the
+// short-circuit catches every legitimately-compatible pair. The
+// fallback loop is defensive: if a future intern bug ever produced
+// two distinct ids for the same shape, we still answer truthfully
+// instead of falsely rejecting.
+static _val_fn_types_compat(a_ty, b_ty)@base {
+    auto a: FnTypeRec, b: FnTypeRec, i;
+    if (a_ty == b_ty) { return 1; }
+    a = fn_type_get_record(a_ty);
+    b = fn_type_get_record(b_ty);
+    if (a.arg_count != b.arg_count) { return 0; }
+    if (a.ret_type != b.ret_type) { return 0; }
+    for (i = 0; i < a.arg_count; i++) {
+        if (a.args[i] != b.args[i]) { return 0; }
+    }
+    return 1;
+}
+
 val_type_name(ty) {
+    if (is_fn_type(ty)) {
+        if (_val_fntype_buf == 0) { _val_fntype_buf = strbuf_new(); }
+        strbuf_clear(_val_fntype_buf);
+        _val_fntype_buf = _val_fntype_format(_val_fntype_buf, ty, 0);
+        return _val_fntype_buf;
+    }
     if (ty == TY_WORD)    { return "word"; }
     if (ty == TY_WORD_H)  { return "half"; }
     if (ty == TY_WORD_Q)  { return "quarter"; }
@@ -364,6 +464,27 @@ val_type_name(ty) {
 val_check_assign_compat(hint_ty, val_ty, var_name_p) {
     auto hb, vb, hs, vs;
     if (val_ty == TY_UNK) { return 0; }
+    // V3 Session 3: when both sides carry func-type annotations, do
+    // a structural shape match. Mismatch is E246 hard error — the
+    // annotation is the contract. One-sided fn-typed assignments
+    // still skip (rude-first preserved); flow analysis (W028) covers
+    // the runtime risk for those.
+    if (is_fn_type(hint_ty) && is_fn_type(val_ty)) {
+        if (_val_fn_types_compat(hint_ty, val_ty) == 0) {
+            diag_error(246);
+            diag_str("incompatible func-types: cannot assign ");
+            diag_str(val_type_name(val_ty));
+            diag_str(" to '");
+            diag_packed(var_name_p);
+            diag_str("' (declared as ");
+            diag_str(val_type_name(hint_ty));
+            diag_str(")");
+            diag_newline();
+            _val_show_context_at(_val_src_tok);
+        }
+        return 0;
+    }
+    if (is_fn_type(hint_ty) || is_fn_type(val_ty)) { return 0; }
 
     hb = ty_base(hint_ty);
     vb = ty_base(val_ty);
@@ -498,12 +619,24 @@ val_check_node(nd) {
         return 0;
     }
     T_ASSIGN {
-        auto lhs: Node, hint_ty, val_ty, lhs_ty;
+        auto lhs: Node, rhs: Node, hint_ty, val_ty, lhs_ty;
         lhs = n.a;
         if (lhs != 0) {
             if (lhs.ntype == T_VAR) {
                 hint_ty = _val_get_hint(lhs.a);
                 val_ty  = n.itype;
+                // Node.itype is byte-sliced; func-type ids (BASE_FN +
+                // table_idx in upper bits) overflow to BASE_FN alone.
+                // For VAR-to-VAR assignments the recorded hint is the
+                // authoritative full-word id, so consult it.
+                if (n.b != 0) {
+                    rhs = n.b;
+                    if (rhs.ntype == T_VAR) {
+                        auto _rhs_hint;
+                        _rhs_hint = _val_get_hint(rhs.a);
+                        if (_rhs_hint > 0) { val_ty = _rhs_hint; }
+                    }
+                }
                 lhs_ty  = lhs.itype;
                 if (hint_ty > 0) {
                     val_check_assign_compat(hint_ty, val_ty, lhs.a);
@@ -605,6 +738,10 @@ val_check_node(nd) {
                     an = arg_nd;
                     arg_ty = an.itype;
                     par_ty = get_fn_par_type(fi, ai);
+                    // V3 Session 1: skip int/float diagnostics when either
+                    // side is a fn-type — Session 2 will check Fn-vs-Fn
+                    // signature compatibility once flow analysis lands.
+                    if (is_fn_type(arg_ty) || is_fn_type(par_ty)) { continue; }
                     if (is_float_type(arg_ty)) {
                         if (is_float_type(par_ty) == 0) {
                             // E233: passing a float-typed value to a parameter
@@ -688,6 +825,67 @@ val_check_node(nd) {
                             diag_str("'&' used as argument to call() — may crash at runtime (use malloc for FFI out-params)");
                             diag_newline();
                             _val_show_context_at(n.src_tok);
+                        }
+                    }
+                }
+                // V3 Sessions 2 + 3 — call() arg validation.
+                //
+                // Session 3 first: if fp is a local with an explicit
+                // `: func(...)` annotation, the annotation is the
+                // contract. Hard-error E246 on mismatch.
+                //
+                // Session 2 fallback: read the dispatch walker's
+                // pre-resolved target snapshot stashed in `n.e`
+                // (`target_fi + 1`, 0 = unresolved). Soft-warn W028.
+                //
+                // Annotation wins over flow analysis to keep the
+                // contract authoritative even when both could fire.
+                if (n.c >= 1) {
+                    auto _fp_node: Node, _fp_hint, _annotation_used;
+                    _annotation_used = 0;
+                    _fp_node = n.b[0];
+                    if (_fp_node.ntype == T_VAR) {
+                        _fp_hint = _val_get_hint(_fp_node.a);
+                        if (_fp_hint > 0) {
+                            if (is_fn_type(_fp_hint)) {
+                                _val_check_call_args_against_fntype(
+                                    _fp_hint, n.b + 8, n.c - 1, n.src_tok);
+                                _annotation_used = 1;
+                            }
+                        }
+                    }
+                    if (_annotation_used == 0) {
+                        if (n.e > 0) {
+                            auto _fp_target_fi, _target_name_p, _target_rec;
+                            _fp_target_fi = n.e - 1;
+                            _target_rec = funcs[_fp_target_fi];
+                            _target_name_p = *(_target_rec + FN_NAME);
+                            _val_check_call_args_against(_fp_target_fi,
+                                                         n.b + 8, n.c - 1,
+                                                         _target_name_p, n.src_tok);
+                        } else {
+                            // V3 Session 4 — multi-origin via registration
+                            // pattern. Walker did not resolve a single
+                            // intra-function target; consult the global
+                            // origin map populated by Pass B. Estrita:
+                            // every origin checked independently — any
+                            // mismatch fires W028 for that origin.
+                            if (_fp_node.ntype == T_VAR) {
+                                auto _origins, _on, _o, _t_fi, _t_name_p, _t_rec;
+                                _origins = dsp_glob_origins(_fp_node.a);
+                                if (_origins != 0) {
+                                    _on = arr_len(_origins);
+                                    for (_o = 0; _o < _on; _o++) {
+                                        _t_fi = arr_get(_origins, _o);
+                                        if (_t_fi < 0) { continue; }
+                                        _t_rec = funcs[_t_fi];
+                                        _t_name_p = *(_t_rec + FN_NAME);
+                                        _val_check_call_args_against(_t_fi,
+                                                                     n.b + 8, n.c - 1,
+                                                                     _t_name_p, n.src_tok);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

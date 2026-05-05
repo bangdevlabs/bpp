@@ -114,8 +114,12 @@ void maestro_register_init(fn) { _ms_cb_init = fn; }
 // Register the solo callback. Called every fixed-timestep tick on
 // the main thread before the base phase. Reads input, updates state,
 // decides whether to call maestro_quit().
-// Argument: fixed_dt (fixed physics timestep in milliseconds).
-void maestro_register_solo(fn) { _ms_cb_solo = fn; }
+// Argument: fixed_dt (float seconds; the dt convention is industry
+// standard since 2026-05-04). The `func(float) -> void` annotation is
+// the V3 Session 5 contract — flow analysis already catches mismatches
+// via W028 even when the caller does not annotate, but annotating the
+// param documents the intent and keeps the typed-overload door open.
+void maestro_register_solo(fn: func(float) -> void) { _ms_cb_solo = fn; }
 
 // Register the base callback. Called every fixed-timestep tick on
 // the main thread after solo. Inside this callback, dispatch parallel
@@ -153,8 +157,8 @@ void maestro_register_quit(fn) { _ms_cb_quit = fn; }
 // draining, render receives alpha (0-1000): how far between the
 // last physics tick and the next, for position interpolation.
 maestro_run() {
-    auto now, dt, last_time, accumulator, fixed_dt_us, frame_us, elapsed, alpha;
-    auto cb_dt_ms;
+    auto now, dt, last_time, accumulator, fixed_dt_us, frame_us, elapsed;
+    auto alpha: float, cb_dt_s: float;
 
     if (_ms_configured == 0) { return 1; }
 
@@ -184,7 +188,17 @@ maestro_run() {
     if (_ms_physics_hz == 0) { _ms_physics_hz = _ms_fps; }
     fixed_dt_us = 1000000 / _ms_physics_hz;
     frame_us    = 1000000 / _ms_fps;
-    cb_dt_ms    = fixed_dt_us / 1000;
+    cb_dt_s     = fixed_dt_us / 1000000.0;
+    // Convention shift (2026-05-04): callbacks now receive dt as
+    // FLOAT SECONDS (industry standard — Unity Time.deltaTime,
+    // Unreal FApp::GetDeltaTime, Bevy Res<Time>.delta_seconds).
+    // Direct multiplication `pos += vel * dt` reads as the physics
+    // formula. Older int-millisecond convention required `pos +=
+    // vel * dt / 1000` at every callsite plus dropped sub-ms
+    // precision (1000/60 truncated to 16ms → 4% drift). The
+    // AAPCS64 / System V refactor that landed alongside this
+    // change made float args via fn_ptr `call()` work
+    // out-of-the-box, which unblocked the migration.
     // Pre-seed so the first frame runs one physics step immediately
     // instead of rendering an empty frame while waiting for time to
     // accumulate. Standard practice in fixed-timestep game loops.
@@ -216,22 +230,29 @@ maestro_run() {
         // collect samples.
         while (accumulator >= fixed_dt_us) {
             _prof_capture(0);
-            if (_ms_cb_solo != 0) { call(_ms_cb_solo, cb_dt_ms); }
+            if (_ms_cb_solo != 0) { call(_ms_cb_solo, cb_dt_s); }
             _prof_capture(0);
-            if (_ms_cb_base != 0) { call(_ms_cb_base, cb_dt_ms); }
+            if (_ms_cb_base != 0) { call(_ms_cb_base, cb_dt_s); }
             // Drain all worker queues so the next physics step (or
             // render) sees the results of any parallel work.
             job_wait_all();
             accumulator -= fixed_dt_us;
         }
 
-        // Alpha is the interpolation factor (0-1000) telling the
-        // renderer how far between the last physics tick and the next.
-        // A renderer can lerp positions: draw_x = prev_x + (cur_x - prev_x) * alpha / 1000.
-        // For grid games like snake where physics_hz == fps, alpha is
-        // always 0 and render just draws the current state.
-        alpha = 0;
-        if (fixed_dt_us > 0) { alpha = accumulator * 1000 / fixed_dt_us; }
+        // Alpha is the interpolation factor in [0.0, 1.0] telling the
+        // renderer how far between the last physics tick and the
+        // next. A renderer can lerp positions: `draw_x = prev_x +
+        // (cur_x - prev_x) * alpha`. For grid games (snake) where
+        // physics_hz == fps, alpha is always 0.0 and render just
+        // draws the current state. Float convention matches every
+        // mainstream game engine; the previous per-mille int form
+        // forced every consumer to divide by 1000.
+        alpha = 0.0;
+        if (fixed_dt_us > 0) {
+            auto acc_f: float;
+            acc_f = accumulator;
+            alpha = acc_f / fixed_dt_us;
+        }
         _prof_capture(0);
         if (_ms_cb_render != 0) { call(_ms_cb_render, alpha); }
 

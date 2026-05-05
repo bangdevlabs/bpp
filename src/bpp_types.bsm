@@ -58,6 +58,7 @@ void init_types() {
     ty_cur_ret = TY_UNK;
     ty_gl_names = arr_new();
     ty_gl_types = arr_new();
+    init_fn_types();
 }
 
 // Record or update a global variable's type.
@@ -178,10 +179,10 @@ ty_get_elem(name_p)@base {
 // Find a function's packed name by scanning funcs[]. Used by put/put_err
 // dispatch to locate putstr/putnum/putfloat without hardcoding vbuf offsets.
 static _put_target(str, len) {
-    auto i, func, np, ns, nl;
+    auto i, fn_rec, np, ns, nl;
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        np = *(func + FN_NAME);
+        fn_rec = funcs[i];
+        np = *(fn_rec + FN_NAME);
         ns = unpack_s(np); nl = unpack_l(np);
         if (nl == len && buf_eq(vbuf + ns, str, len)) { return np; }
     }
@@ -637,15 +638,15 @@ get_fn_par_type(func_idx, par_idx) {
 // Infer one function's body: reset scope, register params, walk AST.
 // Returns the inferred return type.
 infer_one_func(func_idx) {
-    auto func, name_p, params_arr, param_cnt, body_arr, body_cnt, j, pt;
+    auto fn_rec, name_p, params_arr, param_cnt, body_arr, body_cnt, j, pt;
     auto hints, h;
-    func = funcs[func_idx];
-    name_p = *(func + FN_NAME);
-    params_arr = *(func + FN_PARS);
-    param_cnt = *(func + FN_PCNT);
-    body_arr = *(func + FN_BODY);
-    body_cnt = *(func + FN_BCNT);
-    hints = *(func + FN_HINTS);
+    fn_rec = funcs[func_idx];
+    name_p = *(fn_rec + FN_NAME);
+    params_arr = *(fn_rec + FN_PARS);
+    param_cnt = *(fn_rec + FN_PCNT);
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    hints = *(fn_rec + FN_HINTS);
 
     ty_reset_scope();
     ty_cur_ret = TY_UNK;
@@ -692,12 +693,12 @@ infer_one_func(func_idx) {
 // If function F calls G(x) and x is float, then G's param is float.
 // Returns 1 if any param type changed (needs another iteration).
 propagate_call_params() {
-    auto changed, i, func, body_arr, body_cnt;
+    auto changed, i, fn_rec, body_arr, body_cnt;
     changed = 0;
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
         changed += propagate_in_body(body_arr, body_cnt, i);
     }
     return changed;
@@ -933,15 +934,15 @@ static auto _ty_func_hash;
 // Called from run_types and infer_module before any find_func_idx
 // queries fire. Lazy allocation on first call.
 static void _ty_rebuild_func_hash() {
-    auto i, func, name_p;
+    auto i, fn_rec, name_p;
     if (_ty_func_hash == 0) {
         _ty_func_hash = hash_str_new(256);
     } else {
         hash_str_clear(_ty_func_hash);
     }
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        name_p = *(func + FN_NAME);
+        fn_rec = funcs[i];
+        name_p = *(fn_rec + FN_NAME);
         hash_str_set(_ty_func_hash,
                      vbuf + unpack_s(name_p), unpack_l(name_p),
                      i + 1);
@@ -961,11 +962,11 @@ find_func_idx(name_p) {
 
 // Set a parameter type in the persistent par_types array.
 void propagate_set_par_type(func_idx, par_idx, ty) {
-    auto block, pcnt, func, k;
+    auto block, pcnt, fn_rec, k;
     block = arr_get(fn_par_types, func_idx);
     if (block == 0) {
-        func = arr_get(funcs, func_idx);
-        pcnt = *(func + FN_PCNT);
+        fn_rec = arr_get(funcs, func_idx);
+        pcnt = *(fn_rec + FN_PCNT);
         block = buf_word(pcnt);
         arr_set(fn_par_types, func_idx, block);
         // Initialize all params to TY_WORD.
@@ -978,7 +979,7 @@ void propagate_set_par_type(func_idx, par_idx, ty) {
 // Expects func_mods to be populated. Dependencies' types must already
 // be available in ft_names/ft_types (from .bo export or prior inference).
 infer_module(mi) {
-    auto i, func, name_p, ret_ty;
+    auto i, fn_rec, name_p, ret_ty;
 
     // Refresh the function-name hash before any find_func_idx queries
     // run inside the body walks below. funcs[] is stable for the rest
@@ -989,9 +990,9 @@ infer_module(mi) {
     for (i = 0; i < ext_cnt; i++) {
         if (arr_get(extern_mods, i) == mi) {
             auto ret_p, rlen;
-            func = externs[i];
-            name_p = *(func + EX_NAME);
-            ret_p = *(func + EX_RET);
+            fn_rec = externs[i];
+            name_p = *(fn_rec + EX_NAME);
+            ret_p = *(fn_rec + EX_RET);
             rlen = unpack_l(ret_p);
             auto ret_ty_ext;
             ret_ty_ext = TY_WORD;
@@ -1004,8 +1005,8 @@ infer_module(mi) {
     // Register array constructor return types (same as run_types).
     for (i = 0; i < func_cnt; i++) {
         auto fn_np, fn_s, fn_l;
-        func = funcs[i];
-        fn_np = *(func + FN_NAME);
+        fn_rec = funcs[i];
+        fn_np = *(fn_rec + FN_NAME);
         fn_s  = unpack_s(fn_np);
         fn_l  = unpack_l(fn_np);
         if (fn_l == 7 && buf_eq(vbuf + fn_s, "arr_new",  7)) { set_func_type(fn_np, TY_ARR); }
@@ -1027,8 +1028,8 @@ infer_module(mi) {
     for (i = 0; i < func_cnt; i++) {
         if (arr_get(func_mods, i) == mi) {
             ret_ty = infer_one_func(i);
-            func = funcs[i];
-            name_p = *(func + FN_NAME);
+            fn_rec = funcs[i];
+            name_p = *(fn_rec + FN_NAME);
             if (ret_ty == TY_UNK) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
         }
@@ -1040,7 +1041,7 @@ infer_module(mi) {
 // Pass 1: infer all functions. Pass 2+: propagate float across call sites,
 // update function return types, re-infer until stable.
 run_types() {
-    auto i, func, name_p, ret_ty, changed, pass;
+    auto i, fn_rec, name_p, ret_ty, changed, pass;
 
     // Refresh the function-name hash before any find_func_idx queries
     // run inside the body walks below. funcs[] is stable for the
@@ -1051,9 +1052,9 @@ run_types() {
     // Check declared return type: "double" → TY_FLOAT, "float" → TY_FLOAT_H.
     for (i = 0; i < ext_cnt; i++) {
         auto ret_p, rlen;
-        func = externs[i];
-        name_p = *(func + EX_NAME);
-        ret_p = *(func + EX_RET);
+        fn_rec = externs[i];
+        name_p = *(fn_rec + EX_NAME);
+        ret_p = *(fn_rec + EX_RET);
         rlen = unpack_l(ret_p);
         auto ret_ty_ext;
         ret_ty_ext = TY_WORD;
@@ -1068,8 +1069,8 @@ run_types() {
     // a generic pointer. Matches by name against the parsed function table.
     for (i = 0; i < func_cnt; i++) {
         auto fn_np, fn_s, fn_l;
-        func = funcs[i];
-        fn_np = *(func + FN_NAME);
+        fn_rec = funcs[i];
+        fn_np = *(fn_rec + FN_NAME);
         fn_s  = unpack_s(fn_np);
         fn_l  = unpack_l(fn_np);
         if (fn_l == 7 && buf_eq(vbuf + fn_s, "arr_new",  7)) { set_func_type(fn_np, TY_ARR); }
@@ -1102,8 +1103,8 @@ run_types() {
             ret_ty = infer_one_func(i);
 
             // Update function return type in the lookup table.
-            func = funcs[i];
-            name_p = *(func + FN_NAME);
+            fn_rec = funcs[i];
+            name_p = *(fn_rec + FN_NAME);
             if (ret_ty == TY_UNK) { ret_ty = TY_WORD; }
             set_func_type(name_p, ret_ty);
         }
@@ -1119,4 +1120,98 @@ run_types() {
     }
 
     return 0;
+}
+
+// ============================================================
+// Fn-type table — V3 Session 1
+// ============================================================
+// First-class function-pointer types are interned via hash-cons.
+// Each unique signature (arg_count, ret_type, arg_types[]) is stored
+// once in _fn_type_arr; the type id encodes the array index in the
+// upper bits of a word (see make_fn_type / fn_type_idx in bpp_defs).
+//
+// FnTypeRec is a flat record with the args stored in a separately
+// allocated 8-word buffer. Trailing arg slots stay zero; they are
+// not read past arg_count by any accessor.
+struct FnTypeRec {
+    arg_count,    // 0..8 (E247 caps at 8)
+    ret_type,     // word: B++ type code (TY_UNK for void return)
+    args          // pointer to buf_word(8) holding arg type codes
+}
+
+// File-scope state. Initialized by init_fn_types().
+static auto _fn_type_arr;     // dynamic array of FnTypeRec pointers
+static auto _fn_type_hash;    // signature-key → (idx + 1) lookup; 0 = absent
+
+// Hash key layout (80 bytes, fixed):
+//   byte 0      : arg_count (1 byte; bytes 1..7 padded zero)
+//   bytes 8..15 : ret_type  (u64)
+//   bytes 16..79: arg_types (8 × u64, trailing slots zero for shorter sigs)
+// The fixed 80-byte width guarantees identical signatures hash to the
+// same key — without zero-init garbage padding would silently break
+// hash-cons dedup.
+const FN_KEY_SIZE = 80;
+
+// Allocate the table and hash. Must run before any fn_type_intern call.
+// init_types() chains this in so callers do not need to remember.
+static void init_fn_types()@io {
+    _fn_type_arr  = arr_new();
+    _fn_type_hash = hash_str_new(64);
+}
+
+// Intern a signature into the table. Returns a fully-formed fn-type id
+// (BASE_FN | (idx << 8)). Identical signatures resolve to the same id —
+// hash-cons guarantees structural equivalence by reference equality.
+//
+// arg_types is a word buffer with arg_count entries; values past
+// arg_count are not read. The intern copies what it needs.
+fn_type_intern(arg_types, arg_count, ret_type)@io {
+    auto key, i, idx, rec: FnTypeRec, args_buf, hit;
+    key = buf_byte(FN_KEY_SIZE);
+    buf_fill(key, 0, FN_KEY_SIZE);
+    poke(key, arg_count);
+    write_u64(key, 8, ret_type);
+    for (i = 0; i < arg_count; i++) {
+        write_u64(key, 16 + i * 8, *(arg_types + i * 8));
+    }
+    hit = hash_str_get(_fn_type_hash, key, FN_KEY_SIZE);
+    if (hit != 0) {
+        return make_fn_type(hit - 1);
+    }
+    args_buf = buf_word(8);
+    buf_fill(args_buf, 0, 64);
+    for (i = 0; i < arg_count; i++) {
+        args_buf[i] = *(arg_types + i * 8);
+    }
+    rec = malloc(sizeof(FnTypeRec));
+    rec.arg_count = arg_count;
+    rec.ret_type = ret_type;
+    rec.args = args_buf;
+    idx = arr_len(_fn_type_arr);
+    _fn_type_arr = arr_push(_fn_type_arr, rec);
+    hash_str_set(_fn_type_hash, key, FN_KEY_SIZE, idx + 1);
+    return make_fn_type(idx);
+}
+
+// Pure accessors. ty must satisfy is_fn_type(ty).
+fn_type_get_record(ty)@base {
+    return arr_get(_fn_type_arr, fn_type_idx(ty));
+}
+
+fn_type_arg_count(ty)@base {
+    auto rec: FnTypeRec;
+    rec = arr_get(_fn_type_arr, fn_type_idx(ty));
+    return rec.arg_count;
+}
+
+fn_type_arg(ty, i)@base {
+    auto rec: FnTypeRec;
+    rec = arr_get(_fn_type_arr, fn_type_idx(ty));
+    return rec.args[i];
+}
+
+fn_type_ret(ty)@base {
+    auto rec: FnTypeRec;
+    rec = arr_get(_fn_type_arr, fn_type_idx(ty));
+    return rec.ret_type;
 }

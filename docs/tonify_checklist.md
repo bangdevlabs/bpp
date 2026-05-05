@@ -699,6 +699,53 @@ the cost of late promotion compounds.
 
 ---
 
+## Rule 21: `func`-types are opt-in (V3 — shipped 2026-05-05)
+
+`func(args) -> ret` is a first-class type. Like `:float` / `:half` /
+`:byte`, the annotation is opt-in: untyped function-pointer code keeps
+compiling. Annotate when the type matters for correctness — registries
+where the wrong shape silently corrupts arg routing through register
+banks.
+
+| Pattern | Action |
+|---------|--------|
+| Public registry param: `maestro_register_solo(fn)` | Annotate: `maestro_register_solo(fn: func(float) -> void)` |
+| Callback param inside event/action handler | Annotate the param with the expected signature |
+| Local fn-pointer used in `call(fp, ...)` | Annotate when the type pins down the contract; else flow analysis handles it |
+| Untyped public callback (no annotation) | Leave it — flow analysis (W028) catches mismatches at the call site |
+
+**Without annotation**, V3 still catches mismatches:
+
+- **W028 (intra-function flow analysis, Session 2):** when the
+  fn-pointer's origin can be resolved within the current function
+  (`auto fp = fn_ptr(target); call(fp, args)`), the validator
+  checks each arg against the resolved target's declared params.
+- **W028 (cross-function via registration helper, Session 4):**
+  when a helper function stores a param into a global (the
+  registration pattern), V3 walks every caller of that helper and
+  records the registered targets. Subsequent `call(global, args)`
+  sites validate against ALL registered targets — Estrita conflict
+  resolution: any origin mismatching the call site's args fires
+  W028.
+- **E246 (annotation contract, Session 3):** when both sides of an
+  assignment carry explicit `func(...)` annotations, mismatched
+  shapes are a hard error. The annotation is the contract.
+
+**Estrita conflict resolution**: a registry that receives callbacks
+of multiple incompatible signatures is a bug, not a feature. B++
+follows data-oriented design conventions (Acton/Blow/Muratori): use
+typed overloads (`maestro_register_solo_int(...)` +
+`maestro_register_solo_float(...)`), tagged unions, or context-struct
+patterns instead of polymorphic registries. If a future
+plugin/scripting system genuinely needs polymorphic dispatch, an
+opt-in `@poly` annotation will silence W028 — not yet implemented.
+
+Pitfall 6 below is now diagnostic-shipped: the pattern that
+historically corrupted `dt` between `maestro_register_solo` and
+`call(_ms_cb_solo, dt)` fires W028 today, regardless of annotations.
+
+---
+
 ## Known pitfalls (discovered during batch 2)
 
 These are compiler bugs or limitations that affect tonification. They are
@@ -771,40 +818,97 @@ an unusual expression). Verify with grep before bulk replace.
 **Do NOT replace**: `0 - x` (variable), `arr[len - 1]`, `n - 1` (not
 zero-based). The pattern to target is literally `0 - 1` (zero minus one).
 
-### Pitfall 5: `: float` parameters on functions called via fn_ptr `call()`
+### Pitfall 5: `: float` parameters on functions called via fn_ptr `call()` — RESOLVED 2026-05-04
 
-Functions invoked through `call(fn_ptr_var, args...)` receive their
-arguments via dynamic dispatch. The dispatch passes args through
-**general-purpose registers only** — it does not look at the
-callee's declared param types and does not emit FCVT to promote int
-args to float. If the callee declares `dt: float` while the caller
-passes an int, the callee reads `d0` (an FP register) which contains
-whatever was left over from the previous FP operation — usually
-garbage, often zero.
+**Status: HISTORICAL.** The compiler now routes float args through
+the proper FP register bank under both AAPCS64 (aarch64) and System V
+x86_64. Direct calls AND indirect `call(fp, args...)` dispatch emit
+the bit-cast / movq / fmov dance automatically based on the
+compile-time return type of each arg expression. Callbacks declared
+with `: float` parameters work as expected.
 
-**Symptom shape**: a parameter that was supposed to receive a useful
-value is silently zero (or garbage), producing "stuck"-looking
-behaviour. Wolf3D Phase 1 Session 3 hit this when the maestro solo
-callback declared `dt: float` and movement multiplied by `dt` always
-produced zero — player never moved. The visible output rendered fine
-(rendering doesn't depend on dt), but input → motion was a no-op.
+What the historical workaround required (drop the `: float`
+annotation, convert internally via `dt_s = dt / 1000.0`) was a hack
+around the gap; the gap is closed. Any code still using that
+workaround can be cleaned up — `: float` on the parameter is the
+canonical form again.
+
+**Convention shift recorded:** maestro_run now passes `dt` as
+**float seconds** (industry standard — Unity `Time.deltaTime`,
+Unreal `FApp::GetDeltaTime`, Bevy `Res<Time>.delta_seconds`,
+Godot `_process(delta)`). `pos += vel * dt` reads as the physics
+formula directly; the older int-millisecond convention forced
+every callsite to write `pos += vel * dt / 1000` and dropped sub-ms
+precision (1000/60 truncated to 16ms produced visible 4% drift).
+
+**Cross-reference**: `warning_error_log.md` "FFI float-param trap"
+(W027) is marked RESOLVED. The new gotcha — Pitfall 6 below —
+covers the inverse direction.
+
+---
+
+### Pitfall 6: `call(fp, ...)` arg types must match the callee's param types — DIAGNOSTIC SHIPPED 2026-05-05
+
+**Status: COVERED.** V3 ships W028 (flow analysis, intra- and
+cross-function via registration pattern) and E246 (annotation
+contract). The trapping behavior below is now caught by the compiler
+in every shape that B++ programs encounter today — see Rule 21 above
+for the diagnostic ladder.
+
+After the AAPCS64 / System V refactor, the `call()` builtin routes
+each arg into the correct register bank based on its **compile-time
+expression type**:
+
+- arg returns `int` (`ety == 0`) → pushed via int stack, popped into
+  `x_<int_seq>` / `rdi rsi rdx rcx r8 r9` (System V).
+- arg returns `float` (`ety == 1`) → pushed via FP stack, popped into
+  `d_<flt_seq>` / `xmm<flt_seq>`.
+
+The callee then reads each parameter from the matching ABI bank
+(via the prologue's `emit_arg_copy_int` or `emit_arg_copy_flt`).
+The two banks have independent sequence counters: `(int, float, int)`
+lands at `(x0, d0, x1)`, NOT `(x0, d1, x2)`.
+
+**The new wrong way** is to declare a param with one type and pass
+an arg of the other type through `call()`:
+
+```bpp
+// Callee:
+void my_solo(dt: float) { ... }       // reads d0
+
+// Caller (dt as int):
+auto dt;
+dt = 16;                                // int
+fp = fn_ptr(my_solo);
+call(fp, dt);                           // BUG: arg goes to x0, callee reads d0 → garbage
+```
+
+The fix is symmetric to the Pitfall 5 historical case but inverted:
+**make the caller's arg type match the callee's param type.** Either
+declare the local as `: float` and assign a float value, or change
+the callee to take int.
 
 | Pattern | Action |
 |---------|--------|
-| Callback registered via `maestro_register_*` / `fn_ptr` with `: float` param | **Drop the `: float` annotation.** Take the int value and convert internally. |
-| Direct call `name(arg)` to a function declared `: float` | Safe — direct calls DO promote at the call boundary. |
-| Internal helper that wants float math | Convert at top of body: `auto x_f: float; x_f = x; x_f = x_f / 1000.0;` (or whatever scaling fits). |
+| Callee declares `dt: float`, caller computes int `dt` | Annotate caller local: `auto dt: float;` — assignment from int converts via SCVTF. |
+| Callee declares `dt` (int), caller has float value | Either annotate callee `dt: float` (preferred) or cast at caller via `: word` truncation. |
+| Direct call `name(arg)` (not via `call()`) | Safe — direct call sites are already type-aware: compiler emits `scvtf` / `fcvtzs` per declared param type. |
 
-**Convention used by maestro**: solo / base / render callbacks
-receive `dt` in **milliseconds** as an integer. Helpers that want
-seconds (e.g. position += velocity × dt_seconds) divide by 1000.0
-explicitly inside their body. Never declare the maestro callback's
-param as `: float` — the FFI is GP-register only.
+**Diagnostic candidate.** Warn at `call(fp, args...)` when `fp` can
+be statically traced back to a `fn_ptr(name)` call AND any arg's
+compile-time type doesn't match the corresponding param type of
+`name`. Requires light flow analysis (track fn_ptr origin through
+local assignments). Not yet implemented — sidequest opportunity.
 
-**Cross-reference**: `warning_error_log.md` "FFI float-param trap" —
-listed as a known compiler diagnostic gap (no W-code fires today;
-candidate sidequest is to add one that warns at `fn_ptr(name)` when
-`name` has any `: float` parameter).
+**Direct calls are exempt.** When the caller writes `my_solo(dt)`
+naming the function directly (not through a `fn_ptr` indirection),
+the compiler knows the callee's declared types and emits the
+appropriate conversion: `scvtf` (int → float bits via SCVTF) for
+int-arg-to-float-param, `fcvtzs` (float-truncate-to-int) for the
+inverse. The pitfall fires only on the indirect `call()` path.
+
+**Cross-reference**: `warning_error_log.md` "Known compiler
+diagnostic gaps" section.
 
 ---
 

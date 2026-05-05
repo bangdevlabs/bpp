@@ -760,116 +760,234 @@ static auto _serial_hint;
 //   quarter float → TY_FLOAT_Q  (16-bit float)
 //   byte          → TY_WORD_B   (8-bit integer)
 // Sets _prim_hint to the packed type code, or 0 if no primitive match.
-static void try_type_annotation(var_p) {
+// Tracks func-type recursion depth across parse_fn_type calls. Reset to 0
+// at the start of each top-level try_type_annotation. Pathological nesting
+// beyond MAX_FN_DEPTH triggers E248 and a TY_UNK fallback for recovery.
+static auto _fn_type_depth;
+const MAX_FN_DEPTH = 16;
+
+// Parse a type expression at the current token (no leading ':'). Result
+// goes to _prim_hint for primitives, func-types, void, and structs. For
+// struct types the var slot is also tagged via set_var_type when var_p
+// is non-zero. Used by try_type_annotation (top-level) and parse_fn_type
+// (recursive arg/return positions).
+static void parse_type_expr(var_p) {
     auto type_p, idx, tl, ts;
-    _prim_hint = 0;
-    _serial_hint = 0;
-    if (val_is_ch(':')) {
+
+    // func-type — first-class function pointer (V3 Session 1).
+    if (val_is("func", 4)) {
+        _prim_hint = parse_fn_type();
+        return;
+    }
+    // void in type-expression position encodes as TY_UNK. The function
+    // declaration parser already accepts `void f(...)`; this branch lets
+    // `func() -> void` and any future void-typed expression-position uses
+    // share the same encoding.
+    if (val_is("void", 4)) {
+        _prim_hint = TY_UNK;
         consume();
-        type_p = cur_packed();
-        tl = unpack_l(type_p);
-        ts = vbuf + unpack_s(type_p);
+        return;
+    }
 
-        // Storage class hint: `: serial` prevents auto smart promotion.
-        // Only meaningful at file scope (parse_global reads _serial_hint).
-        if (tl == 6) {
-            if (buf_eq(ts, "serial", 6)) {
-                _serial_hint = 1;
-                consume();
-                return;
-            }
-        }
+    type_p = cur_packed();
+    tl = unpack_l(type_p);
+    ts = vbuf + unpack_s(type_p);
 
-        // Check primitive type names before struct lookup.
-        if (tl == 5) {
-            if (buf_eq(ts, "float", 5)) {
-                _prim_hint = TY_FLOAT;
-                consume();
-                return;
-            }
-        }
-        if (tl == 3) {
-            // `: int` was a parser synonym for `: word` inherited from the
-            // pre-slice era. Removed in 0.23.x — the language has exactly one
-            // canonical name for the 64-bit integer slot, and that name is
-            // `word`. Programmers wanting an explicit-int annotation use it
-            // (e.g. to suppress E232 by marking a float→int truncation as
-            // intentional). The single in-tree user (mouse coord conversion in
-            // `_stb_platform_macos.bsm`) was migrated alongside the removal.
-
-            // Single-bit field hint: `: bit`.
-            if (buf_eq(ts, "bit", 3)) {
-                _prim_hint = TY_WORD_BIT;
-                consume();
-                return;
-            }
-        }
-        if (tl == 4) {
-            if (buf_eq(ts, "half", 4)) {
-                consume();
-                _prim_hint = TY_WORD_H;
-                if (cur_type() == TK_ID) {
-                    _prim_hint = TY_FLOAT_H;
-                    consume();
-                }
-                return;
-            }
-            if (buf_eq(ts, "byte", 4)) {
-                _prim_hint = TY_WORD_B;
-                consume();
-                return;
-            }
-            if (buf_eq(ts, "word", 4)) {
-                _prim_hint = TY_WORD;
-                consume();
-                return;
-            }
-            // Multi-bit field hints: `: bit2` .. `: bit7`.
-            if (buf_eq(ts, "bit2", 4)) { _prim_hint = TY_WORD_BIT2; consume(); return; }
-            if (buf_eq(ts, "bit3", 4)) { _prim_hint = TY_WORD_BIT3; consume(); return; }
-            if (buf_eq(ts, "bit4", 4)) { _prim_hint = TY_WORD_BIT4; consume(); return; }
-            if (buf_eq(ts, "bit5", 4)) { _prim_hint = TY_WORD_BIT5; consume(); return; }
-            if (buf_eq(ts, "bit6", 4)) { _prim_hint = TY_WORD_BIT6; consume(); return; }
-            if (buf_eq(ts, "bit7", 4)) { _prim_hint = TY_WORD_BIT7; consume(); return; }
-        }
-        // `: double` — 128-bit SIMD (4 × float32). Phase B4. Always
-        // resolves to TY_FLOAT_D; integer 128-bit SIMD is out of scope.
-        if (tl == 6 && buf_eq(ts, "double", 6)) {
+    // Check primitive type names before struct lookup.
+    if (tl == 5) {
+        if (buf_eq(ts, "float", 5)) {
+            _prim_hint = TY_FLOAT;
             consume();
-            _prim_hint = TY_FLOAT_D;
             return;
         }
-        if (tl == 7) {
-            if (buf_eq(ts, "quarter", 7)) {
-                consume();
-                _prim_hint = TY_WORD_Q;
-                if (cur_type() == TK_ID) {
-                    _prim_hint = TY_FLOAT_Q;
-                    consume();
-                }
-                return;
-            }
+    }
+    if (tl == 3) {
+        // `: int` was a parser synonym for `: word` inherited from the
+        // pre-slice era. Removed in 0.23.x — the language has exactly one
+        // canonical name for the 64-bit integer slot, and that name is
+        // `word`. Programmers wanting an explicit-int annotation use it
+        // (e.g. to suppress E232 by marking a float→int truncation as
+        // intentional). The single in-tree user (mouse coord conversion in
+        // `_stb_platform_macos.bsm`) was migrated alongside the removal.
+
+        // Single-bit field hint: `: bit`.
+        if (buf_eq(ts, "bit", 3)) {
+            _prim_hint = TY_WORD_BIT;
+            consume();
+            return;
         }
+    }
+    if (tl == 4) {
+        if (buf_eq(ts, "half", 4)) {
+            consume();
+            _prim_hint = TY_WORD_H;
+            if (cur_type() == TK_ID) {
+                _prim_hint = TY_FLOAT_H;
+                consume();
+            }
+            return;
+        }
+        if (buf_eq(ts, "byte", 4)) {
+            _prim_hint = TY_WORD_B;
+            consume();
+            return;
+        }
+        if (buf_eq(ts, "word", 4)) {
+            _prim_hint = TY_WORD;
+            consume();
+            return;
+        }
+        // Multi-bit field hints: `: bit2` .. `: bit7`.
+        if (buf_eq(ts, "bit2", 4)) { _prim_hint = TY_WORD_BIT2; consume(); return; }
+        if (buf_eq(ts, "bit3", 4)) { _prim_hint = TY_WORD_BIT3; consume(); return; }
+        if (buf_eq(ts, "bit4", 4)) { _prim_hint = TY_WORD_BIT4; consume(); return; }
+        if (buf_eq(ts, "bit5", 4)) { _prim_hint = TY_WORD_BIT5; consume(); return; }
+        if (buf_eq(ts, "bit6", 4)) { _prim_hint = TY_WORD_BIT6; consume(); return; }
+        if (buf_eq(ts, "bit7", 4)) { _prim_hint = TY_WORD_BIT7; consume(); return; }
+    }
+    // `: double` — 128-bit SIMD (4 × float32). Phase B4. Always
+    // resolves to TY_FLOAT_D; integer 128-bit SIMD is out of scope.
+    if (tl == 6 && buf_eq(ts, "double", 6)) {
+        consume();
+        _prim_hint = TY_FLOAT_D;
+        return;
+    }
+    if (tl == 7) {
+        if (buf_eq(ts, "quarter", 7)) {
+            consume();
+            _prim_hint = TY_WORD_Q;
+            if (cur_type() == TK_ID) {
+                _prim_hint = TY_FLOAT_Q;
+                consume();
+            }
+            return;
+        }
+    }
 
-        // Array type annotation — opt-in, element type inferred by usage.
-        if (tl == 5 && buf_eq(ts, "array", 5)) { _prim_hint = TY_ARR; consume(); return; }
+    // Array type annotation — opt-in, element type inferred by usage.
+    if (tl == 5 && buf_eq(ts, "array", 5)) { _prim_hint = TY_ARR; consume(); return; }
 
-        // Struct type lookup.
-        idx = struct_find(type_p);
-        if (idx >= 0) {
-            set_var_type(var_p, idx);
-        } else {
-            diag_error(101);
-            diag_str("unknown type '");
-            diag_packed(type_p);
-            diag_str("' -- define it with 'struct'");
+    // Struct type lookup.
+    idx = struct_find(type_p);
+    if (idx >= 0) {
+        if (var_p != 0) { set_var_type(var_p, idx); }
+        // Lossy encoding for struct types inside func-type recursion:
+        // Session 1 has no checking, so collapsing to TY_STRUCT loses no
+        // safety. Session 2 will extend the fn-type record to preserve
+        // the specific struct id when typing checks come online.
+        _prim_hint = TY_STRUCT;
+    } else {
+        diag_error(101);
+        diag_str("unknown type '");
+        diag_packed(type_p);
+        diag_str("' -- define it with 'struct'");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_help("declare the type with 'struct <name> { ... };' before using it");
+    }
+    consume();
+}
+
+// Parse `Fn(arg_types) -> return_type`. Called with the `Fn` token as
+// the current token. Returns a fn-type id from fn_type_intern; emits
+// E247 (>8 args), E248 (>16 nesting), or E249 (malformed) on errors.
+// On error the recursion still returns a TY_UNK fallback so the caller
+// can keep parsing without cascading failures.
+static parse_fn_type() {
+    auto args_buf, arg_count, ret_type, i;
+
+    _fn_type_depth++;
+    if (_fn_type_depth > MAX_FN_DEPTH) {
+        diag_error(248);
+        diag_str("func-type nesting exceeds maximum depth (");
+        diag_int(MAX_FN_DEPTH);
+        diag_str(")");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_help("higher-order Fn types beyond this depth are almost always a typo; if genuinely needed, refactor via a named type alias");
+        _fn_type_depth--;
+        return TY_UNK;
+    }
+
+    consume();  // 'Fn'
+
+    if (val_is_ch('(') == 0) {
+        diag_error(249);
+        diag_str("func-type expects '(' after 'func'");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_help("syntax: Fn(arg_types) -> return_type");
+        _fn_type_depth--;
+        return TY_UNK;
+    }
+    consume();
+
+    args_buf = buf_word(8);
+    buf_fill(args_buf, 0, 64);
+    arg_count = 0;
+
+    while (val_is_ch(')') == 0) {
+        if (arg_count >= 8) {
+            diag_error(247);
+            diag_str("func-type cannot exceed 8 arguments");
             diag_newline();
             diag_loc(tok_pos);
             diag_show_line(tok_pos);
-            diag_help("declare the type with 'struct <name> { ... };' before using it");
+            diag_help("B++ V3 fn-types route args via the AAPCS64/SysV register banks (8 int / 8 float); stack-arg routing for typed fn-pointers is not yet implemented. Reduce to <=8 args, or pass extra data via a bundle struct: Fn(*Bundle) -> word.");
+            while (val_is_ch(')') == 0 && tok_pos < tok_cnt) { consume(); }
+            break;
         }
-        consume();
+        parse_type_expr(0);
+        args_buf[arg_count] = _prim_hint;
+        arg_count++;
+        if (val_is_ch(',')) { consume(); }
     }
+    consume();  // ')'
+
+    if (val_is("->", 2) == 0) {
+        diag_error(249);
+        diag_str("func-type expects '->' after argument list");
+        diag_newline();
+        diag_loc(tok_pos);
+        diag_show_line(tok_pos);
+        diag_help("syntax: Fn(arg_types) -> return_type");
+        _fn_type_depth--;
+        return TY_UNK;
+    }
+    consume();  // '->'
+
+    parse_type_expr(0);
+    ret_type = _prim_hint;
+
+    _fn_type_depth--;
+    return fn_type_intern(args_buf, arg_count, ret_type);
+}
+
+static void try_type_annotation(var_p) {
+    auto tl, ts, type_p;
+    _prim_hint = 0;
+    _serial_hint = 0;
+    if (val_is_ch(':') == 0) { return; }
+    consume();
+
+    // Storage class hint: `: serial` prevents auto smart promotion.
+    // Only meaningful at file scope (parse_global reads _serial_hint).
+    // Lives outside parse_type_expr because it is not a type expression
+    // and must not appear inside func-type recursion.
+    type_p = cur_packed();
+    tl = unpack_l(type_p);
+    ts = vbuf + unpack_s(type_p);
+    if (tl == 6 && buf_eq(ts, "serial", 6)) {
+        _serial_hint = 1;
+        consume();
+        return;
+    }
+
+    _fn_type_depth = 0;
+    parse_type_expr(var_p);
 }
 
 // Parse a top-level "auto x, y, z;", "global x, y, z;", or "extrn x, y, z;"
@@ -1271,7 +1389,7 @@ static parse_unary() { return 0; }
 // Parse a function definition: name(params) { body }
 // Collects primitive type hints for parameters and stores them in offset 48.
 static void parse_function(is_stub, is_static, is_void) {
-    auto name_p, params_arr, param_cnt, body_arr, body_cnt, func, var_p, _fs;
+    auto name_p, params_arr, param_cnt, body_arr, body_cnt, fn_rec, var_p, _fs;
     auto ph_arr, ph_cnt, has_hints, my_mod, name_tok;
     my_mod = tok_mod(tok_pos);
     // Snapshot the global vt_names cursor BEFORE this function's
@@ -1357,27 +1475,27 @@ static void parse_function(is_stub, is_static, is_void) {
     consume();
     body_arr = list_end();
     body_cnt = last_list_cnt;
-    func = malloc(RECORD_SZ);
-    *(func + FN_TYPE) = 22;
-    *(func + FN_NAME) = name_p;
-    *(func + FN_PARS) = params_arr;
-    *(func + FN_PCNT) = param_cnt;
-    *(func + FN_BODY) = body_arr;
-    *(func + FN_BCNT) = body_cnt;
+    fn_rec = malloc(RECORD_SZ);
+    *(fn_rec + FN_TYPE) = 22;
+    *(fn_rec + FN_NAME) = name_p;
+    *(fn_rec + FN_PARS) = params_arr;
+    *(fn_rec + FN_PCNT) = param_cnt;
+    *(fn_rec + FN_BODY) = body_arr;
+    *(fn_rec + FN_BCNT) = body_cnt;
     // Store parameter hint array in the hints field.
-    if (has_hints) { *(func + FN_HINTS) = ph_arr; }
-    else { *(func + FN_HINTS) = 0; free(ph_arr); }
+    if (has_hints) { *(fn_rec + FN_HINTS) = ph_arr; }
+    else { *(fn_rec + FN_HINTS) = 0; free(ph_arr); }
     // Mark as stub if declared with the `stub` keyword. Stubs are
     // intentional placeholders that can be silently overridden by a
     // real definition in any module without triggering W015.
-    *(func + FN_STUB) = is_stub;
+    *(fn_rec + FN_STUB) = is_stub;
     // Store the defining token position. Dispatch's W013 reads this
     // back through FN_SRC_TOK to show the originating source line, and
     // bpp_bug writes it into the .bug source map so the debugger can
     // resolve `--break name:line`. `name_tok` was saved at function
     // entry (before name was consumed) so the value points at the
     // signature, not at whatever tok_pos has advanced to by the end.
-    *(func + FN_SRC_TOK) = name_tok;
+    *(fn_rec + FN_SRC_TOK) = name_tok;
     // Dedup: check if a function with this name already exists in funcs[].
     // Three cases produce duplicates, each handled differently:
     //
@@ -1422,7 +1540,7 @@ static void parse_function(is_stub, is_static, is_void) {
                 }
             }
             // Replace the existing entry with the new one.
-            arr_set(funcs, _dup_idx, func);
+            arr_set(funcs, _dup_idx, fn_rec);
             arr_set(func_mods, _dup_idx, my_mod);
             arr_set(fn_static, _dup_idx, is_static);
             arr_set(fn_void, _dup_idx, is_void);
@@ -1433,7 +1551,7 @@ static void parse_function(is_stub, is_static, is_void) {
         }
     }
     if (_dup_found == 0) {
-        funcs = arr_push(funcs, func);
+        funcs = arr_push(funcs, fn_rec);
         func_cnt = arr_len(funcs);
         func_mods = arr_push(func_mods, my_mod);
         fn_static = arr_push(fn_static, is_static);

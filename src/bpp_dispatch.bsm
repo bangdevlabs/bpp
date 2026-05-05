@@ -53,6 +53,40 @@ global fn_ret_hint;         // arr<int>: TY_* code per function from explicit `:
 global fn_vt_locs;
 static auto fn_effect;           // arr<int>: PHASE_* per function — finest-grained classification (Level 4 sub-step B)
 static auto fn_effect_next;      // arr<int>: double-buffer for the effect fixpoint pass
+
+// Per-function fn_ptr origin tracking (V3 Session 2). Parallel arrays
+// keyed by packed local-name; resolved target function index (-1 =
+// poison: a non-fn_ptr value overwrote a prior origin). Last-write in
+// TEXTUAL source order wins — `_cgb_walk` is linear, so branchy
+// assignments resolve to "last position in the source" rather than last
+// in execution order. Acceptable v1 trade-off; fixed-point refinement
+// is future work.
+static auto _fn_origin_names;    // arr<arr<packed>>: per-fi list of var names
+static auto _fn_origin_targets;  // arr<arr<int>>:    per-fi parallel list of target fidx
+
+// Registration helper detection (V3 Session 4 Pass A). A function fi
+// is a "registration helper" when one of its params flows directly
+// into a global via `_global = param;`. Per-fi parallel arrays:
+//   _fn_reg_param[fi][k]  = parameter index that flows
+//   _fn_reg_global[fi][k] = packed name of the destination global
+// The maestro_register_solo(name, cb) pattern is the canonical case.
+static auto _fn_reg_param;       // arr<arr<int>>:    per-fi list of param indices
+static auto _fn_reg_global;      // arr<arr<packed>>: per-fi parallel list of globals
+
+// Inverse call graph (V3 Session 4 Pass B). Built by `_dsp_build_callers`
+// from `fn_calls[]` AFTER Pass A finishes. `_fn_callers[fi]` is the
+// list of function indices that call fi directly. Used to walk caller
+// sites of registration helpers without requiring callers to register
+// themselves explicitly during Pass A.
+static auto _fn_callers;         // arr<arr<int>>: callers per callee
+
+// Per-global registered origins (V3 Session 4 Pass B). Captures every
+// `fn_ptr(name)` literal that any caller passes to a registration
+// helper at the corresponding param_idx. `_glob_origin_names` is a
+// flat list of globals that have at least one entry; `_glob_origin_targets`
+// is the parallel list of target_fidx arrays.
+static auto _glob_origin_names;   // arr<packed>:    globals with recorded origins
+static auto _glob_origin_targets; // arr<arr<int>>:  parallel, target_fidx lists
 extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place (Phase B2)
 extrn _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
@@ -149,6 +183,9 @@ void init_dispatch() {
     fn_effect = arr_new();
     fn_effect_next = arr_new();
     fn_inlineable = arr_new();
+    init_fn_origins();
+    init_fn_reg();
+    init_glob_origins();
     _lazy_emit_ready = 0;
     glob_writers = arr_new();
     glob_readers = arr_new();
@@ -699,6 +736,426 @@ static auto _cgb_addr_taken_set;    // arr<int>: function indices whose address 
 static auto _cgb_current_fn_idx;    // function index currently being walked (so the
                              // walker can attribute global accesses to it)
 
+// V3 Session 2 — fn_ptr origin tracking lifecycle.
+//
+// Allocate the outer arrays. Called once from init_dispatch (same
+// file → Rule 2 static). Inner per-function slots are lazily
+// allocated on first record.
+static void init_fn_origins()@io {
+    _fn_origin_names   = arr_new();
+    _fn_origin_targets = arr_new();
+}
+
+// Ensure the per-function origin slots exist for index fi.
+static void _fn_origin_grow(fi)@io {
+    while (arr_len(_fn_origin_names) <= fi) {
+        _fn_origin_names   = arr_push(_fn_origin_names,   0);
+        _fn_origin_targets = arr_push(_fn_origin_targets, 0);
+    }
+    if (arr_get(_fn_origin_names, fi) == 0) {
+        arr_set(_fn_origin_names,   fi, arr_new());
+        arr_set(_fn_origin_targets, fi, arr_new());
+    }
+}
+
+// Reset origin tracking for a single function. Called at the start of
+// each function walk so re-runs do not see stale entries.
+static void _fn_origin_clear_for(fi)@io {
+    auto names_arr, targets_arr;
+    if (arr_len(_fn_origin_names) <= fi) { return; }
+    names_arr   = arr_get(_fn_origin_names,   fi);
+    targets_arr = arr_get(_fn_origin_targets, fi);
+    if (names_arr   != 0) { arr_clear(names_arr); }
+    if (targets_arr != 0) { arr_clear(targets_arr); }
+}
+
+// Record (or overwrite) a fn_ptr origin for variable `name_p` inside
+// function fi. target_fidx is the resolved callee index, or -1 to
+// poison the slot (a non-fn_ptr value clobbered any prior origin).
+// Last-write-in-source-order wins.
+//
+// arr_push may relocate; the canonical B++ idiom is
+// `arr_set(outer, idx, arr_push(arr_get(outer, idx), val))` so the
+// outer slot keeps pointing at the live buffer after relocation.
+static void _fn_origin_record(fi, name_p, target_fidx)@io {
+    auto names_arr, targets_arr, n, i;
+    _fn_origin_grow(fi);
+    names_arr   = arr_get(_fn_origin_names,   fi);
+    targets_arr = arr_get(_fn_origin_targets, fi);
+    n = arr_len(names_arr);
+    for (i = 0; i < n; i++) {
+        if (packed_eq(arr_get(names_arr, i), name_p)) {
+            arr_set(targets_arr, i, target_fidx);
+            return;
+        }
+    }
+    arr_set(_fn_origin_names,   fi, arr_push(names_arr,   name_p));
+    arr_set(_fn_origin_targets, fi, arr_push(targets_arr, target_fidx));
+}
+
+// Resolve the first arg of a `call(fp, ...)` site to a target function
+// index, using whatever fn_ptr origin information is available at the
+// moment of the walk. Two paths:
+//   - Direct: `call(fn_ptr(name), ...)` — find name in funcs[].
+//   - Indirect: `call(local, ...)` — look up local's recorded origin
+//     in `_fn_origin_*`. The walker runs in textual source order so
+//     the most recent assignment up to this point wins.
+// Returns target_fidx (>= 0) or -1 (unresolved).
+static _cgb_resolve_call_target(fp_nd)@base {
+    auto fp: Node, name_p, args_arr, target_node: Node;
+    if (fp_nd == 0) { return -1; }
+    fp = fp_nd;
+    if (fp.ntype == T_CALL) {
+        name_p = fp.a;
+        if (unpack_l(name_p) != 6) { return -1; }
+        if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", 6) == 0) { return -1; }
+        if (fp.c < 1) { return -1; }
+        args_arr = fp.b;
+        target_node = args_arr[0];
+        if (target_node.ntype != T_VAR) { return -1; }
+        return _dsp_find_func_idx(target_node.a);
+    }
+    if (fp.ntype == T_VAR) {
+        return dsp_fn_origin_get(_cgb_current_fn_idx, fp.a);
+    }
+    return -1;
+}
+
+// Inspect an AST node and extract the target function index when the
+// node is a `fn_ptr(name)` call referring to a known user function.
+// Returns target_fidx (>= 0) on success, -1 otherwise — used as the
+// "poison" marker by `_fn_origin_record` so any non-fn_ptr RHS clears
+// a previously-recorded origin slot.
+static _cgb_extract_fn_ptr_target(rhs_nd)@base {
+    auto rhs: Node, name_p, args_arr, arg0: Node;
+    if (rhs_nd == 0) { return -1; }
+    rhs = rhs_nd;
+    if (rhs.ntype != T_CALL) { return -1; }
+    name_p = rhs.a;
+    if (unpack_l(name_p) != 6) { return -1; }
+    if (buf_eq(vbuf + unpack_s(name_p), "fn_ptr", 6) == 0) { return -1; }
+    if (rhs.c < 1) { return -1; }
+    args_arr = rhs.b;
+    arg0 = args_arr[0];
+    if (arg0.ntype != T_VAR) { return -1; }
+    return _dsp_find_func_idx(arg0.a);
+}
+
+// V3 Session 4 — registration-helper bookkeeping lifecycle.
+//
+// Allocate the outer arrays. Called once from init_dispatch (same
+// file → Rule 2 static). Inner per-function slots are lazily
+// allocated on first record.
+static void init_fn_reg()@io {
+    _fn_reg_param  = arr_new();
+    _fn_reg_global = arr_new();
+}
+
+// Ensure the per-function slot for fi exists.
+static void _fn_reg_grow(fi)@io {
+    while (arr_len(_fn_reg_param) <= fi) {
+        _fn_reg_param  = arr_push(_fn_reg_param,  0);
+        _fn_reg_global = arr_push(_fn_reg_global, 0);
+    }
+    if (arr_get(_fn_reg_param, fi) == 0) {
+        arr_set(_fn_reg_param,  fi, arr_new());
+        arr_set(_fn_reg_global, fi, arr_new());
+    }
+}
+
+// Reset registration entries for a single function, called at the
+// start of each function walk so re-walks do not see stale data.
+static void _fn_reg_clear_for(fi)@io {
+    auto p_arr, g_arr;
+    if (arr_len(_fn_reg_param) <= fi) { return; }
+    p_arr = arr_get(_fn_reg_param,  fi);
+    g_arr = arr_get(_fn_reg_global, fi);
+    if (p_arr != 0) { arr_clear(p_arr); }
+    if (g_arr != 0) { arr_clear(g_arr); }
+}
+
+// Record a (param_idx, global_name) registration pair for function fi.
+// Called from `_cgb_walk` when it spots `T_ASSIGN(global, T_VAR(param))`.
+// Multiple distinct (param_idx, global) pairs per function are allowed —
+// useful for helpers that store more than one callback into more than
+// one global slot.
+static void _fn_reg_record_pair(fi, param_idx, global_p)@io {
+    auto p_arr, g_arr, n, i;
+    _fn_reg_grow(fi);
+    p_arr = arr_get(_fn_reg_param,  fi);
+    g_arr = arr_get(_fn_reg_global, fi);
+    // Dedupe — exact pair already known.
+    n = arr_len(p_arr);
+    for (i = 0; i < n; i++) {
+        if (arr_get(p_arr, i) == param_idx) {
+            if (packed_eq(arr_get(g_arr, i), global_p)) { return; }
+        }
+    }
+    arr_set(_fn_reg_param,  fi, arr_push(p_arr, param_idx));
+    arr_set(_fn_reg_global, fi, arr_push(g_arr, global_p));
+}
+
+// Public — returns 1 if function fi has at least one registered pair.
+dsp_is_reg_helper(fi)@base {
+    auto p_arr;
+    if (arr_len(_fn_reg_param) <= fi) { return 0; }
+    p_arr = arr_get(_fn_reg_param, fi);
+    if (p_arr == 0) { return 0; }
+    if (arr_len(p_arr) == 0) { return 0; }
+    return 1;
+}
+
+// Public — number of registration entries for function fi.
+dsp_reg_helper_count(fi)@base {
+    auto p_arr;
+    if (arr_len(_fn_reg_param) <= fi) { return 0; }
+    p_arr = arr_get(_fn_reg_param, fi);
+    if (p_arr == 0) { return 0; }
+    return arr_len(p_arr);
+}
+
+// Public — k-th param index registered by function fi.
+dsp_reg_helper_param_at(fi, k)@base {
+    return arr_get(arr_get(_fn_reg_param, fi), k);
+}
+
+// Public — packed name of the global at slot k of function fi.
+dsp_reg_helper_global_at(fi, k)@base {
+    return arr_get(arr_get(_fn_reg_global, fi), k);
+}
+
+// V3 Session 4 — Pass B lifecycle.
+//
+// Allocate the global-origin tables. Called once from init_dispatch
+// (same file → static).
+static void init_glob_origins()@io {
+    _glob_origin_names   = arr_new();
+    _glob_origin_targets = arr_new();
+    _fn_callers          = arr_new();
+}
+
+// Find the slot index for a given global packed name. Returns the
+// index when present, -1 otherwise. Linear scan — Sessions 2-5 keep
+// the global registry size small (handful of registries per program).
+static _glob_origins_find(global_p)@base {
+    auto i, n;
+    n = arr_len(_glob_origin_names);
+    for (i = 0; i < n; i++) {
+        if (packed_eq(arr_get(_glob_origin_names, i), global_p)) { return i; }
+    }
+    return -1;
+}
+
+// Append a target_fidx to the origin list for `global_p`, creating
+// the slot if needed. Dedupes — repeated identical registrations of
+// the same target through the same global are recorded once.
+static void _glob_origins_record(global_p, target_fidx)@io {
+    auto idx, targets, n, i;
+    idx = _glob_origins_find(global_p);
+    if (idx < 0) {
+        _glob_origin_names = arr_push(_glob_origin_names, global_p);
+        targets = arr_new();
+        targets = arr_push(targets, target_fidx);
+        _glob_origin_targets = arr_push(_glob_origin_targets, targets);
+        return;
+    }
+    targets = arr_get(_glob_origin_targets, idx);
+    n = arr_len(targets);
+    for (i = 0; i < n; i++) {
+        if (arr_get(targets, i) == target_fidx) { return; }
+    }
+    arr_set(_glob_origin_targets, idx, arr_push(targets, target_fidx));
+}
+
+// Public — list of target_fidx values registered into `global_p`, or
+// 0 when no caller has registered anything (silent: validator falls
+// through to other resolution paths).
+dsp_glob_origins(global_p)@base {
+    auto idx;
+    idx = _glob_origins_find(global_p);
+    if (idx < 0) { return 0; }
+    return arr_get(_glob_origin_targets, idx);
+}
+
+// Build `_fn_callers` from `fn_calls[]`. Linear inversion — each
+// element of `fn_calls[fi]` becomes an entry in `_fn_callers[callee]`.
+// Runs in `call_graph_build` after Pass A is fully complete. Cleans
+// stale state from previous bootstrap rounds.
+static void _dsp_build_callers()@io {
+    auto i, j, callees, callee_idx, n, m;
+    while (arr_len(_fn_callers) < func_cnt) {
+        _fn_callers = arr_push(_fn_callers, arr_new());
+    }
+    for (i = 0; i < func_cnt; i++) {
+        arr_clear(arr_get(_fn_callers, i));
+    }
+    for (i = 0; i < func_cnt; i++) {
+        callees = arr_get(fn_calls, i);
+        if (callees == 0) { continue; }
+        n = arr_len(callees);
+        for (j = 0; j < n; j++) {
+            callee_idx = arr_get(callees, j);
+            if (callee_idx < 0) { continue; }
+            if (callee_idx >= func_cnt) { continue; }
+            arr_set(_fn_callers, callee_idx,
+                    arr_push(arr_get(_fn_callers, callee_idx), i));
+        }
+    }
+}
+
+// Recursively scan an AST node for direct calls to `helper_fi` and
+// record every fn_ptr literal at `param_idx` of those calls into the
+// origin slot for `global_p`. The walker is targeted: it only
+// recurses through control-flow nodes, never re-entering function
+// bodies it should not.
+static void _glob_origins_walk_node(nd, helper_fi, param_idx, global_p)@io {
+    auto n: Node, t, name_p, args_arr, arg_at: Node, target_fi, i, cnt, sub_arr;
+    if (nd == 0) { return; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        name_p = n.a;
+        target_fi = _dsp_find_func_idx(name_p);
+        if (target_fi == helper_fi) {
+            if (n.c > param_idx) {
+                args_arr = n.b;
+                arg_at = args_arr[param_idx];
+                if (arg_at != 0) {
+                    auto cap_target;
+                    cap_target = _cgb_extract_fn_ptr_target(arg_at);
+                    if (cap_target >= 0) {
+                        _glob_origins_record(global_p, cap_target);
+                    }
+                }
+            }
+        }
+        // Recurse into args anyway — nested calls might still match.
+        cnt = n.c;
+        args_arr = n.b;
+        for (i = 0; i < cnt; i++) {
+            _glob_origins_walk_node(args_arr[i], helper_fi, param_idx, global_p);
+        }
+        return;
+    }
+    if (t == T_ASSIGN) {
+        _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p);
+        _glob_origins_walk_node(n.b, helper_fi, param_idx, global_p);
+        return;
+    }
+    if (t == T_BINOP) {
+        _glob_origins_walk_node(n.b, helper_fi, param_idx, global_p);
+        _glob_origins_walk_node(n.c, helper_fi, param_idx, global_p);
+        return;
+    }
+    if (t == T_TERNARY) {
+        _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p);
+        _glob_origins_walk_node(n.b, helper_fi, param_idx, global_p);
+        _glob_origins_walk_node(n.c, helper_fi, param_idx, global_p);
+        return;
+    }
+    if (t == T_BLOCK) {
+        sub_arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            _glob_origins_walk_node(sub_arr[i], helper_fi, param_idx, global_p);
+        }
+        return;
+    }
+    if (t == T_UNARY) { _glob_origins_walk_node(n.b, helper_fi, param_idx, global_p); return; }
+    if (t == T_MEMLD) { _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p); return; }
+    if (t == T_MEMST) {
+        _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p);
+        _glob_origins_walk_node(n.b, helper_fi, param_idx, global_p);
+        return;
+    }
+    if (t == T_ADDR) { _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p); return; }
+    if (t == T_RET)  { _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p); return; }
+    if (t == T_IF) {
+        _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p);
+        sub_arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            _glob_origins_walk_node(sub_arr[i], helper_fi, param_idx, global_p);
+        }
+        if (n.e > 0) {
+            sub_arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                _glob_origins_walk_node(sub_arr[i], helper_fi, param_idx, global_p);
+            }
+        }
+        return;
+    }
+    if (t == T_WHILE) {
+        _glob_origins_walk_node(n.a, helper_fi, param_idx, global_p);
+        sub_arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            _glob_origins_walk_node(sub_arr[i], helper_fi, param_idx, global_p);
+        }
+        if (n.e != 0) { _glob_origins_walk_node(n.e, helper_fi, param_idx, global_p); }
+        return;
+    }
+}
+
+// Capture all fn_ptr origins flowing through registration helper fi.
+// For each (param_idx, global_p) pair fi has registered, walk every
+// caller's body looking for `T_CALL fi(args)` and record args[param_idx]
+// when it is a fn_ptr literal. Strict policy: every distinct origin
+// gets recorded; later validation against `dsp_glob_origins` checks
+// args against ALL origins (Estrita conflict resolution).
+static void _glob_origins_capture(fi)@io {
+    auto k, n, callers, m, c, caller_fi, fn_rec, body_arr, body_cnt, j;
+    auto param_idx, global_p;
+    n = dsp_reg_helper_count(fi);
+    if (n == 0) { return; }
+    if (arr_len(_fn_callers) <= fi) { return; }
+    callers = arr_get(_fn_callers, fi);
+    if (callers == 0) { return; }
+    m = arr_len(callers);
+    for (k = 0; k < n; k++) {
+        param_idx = dsp_reg_helper_param_at(fi, k);
+        global_p  = dsp_reg_helper_global_at(fi, k);
+        for (c = 0; c < m; c++) {
+            caller_fi = arr_get(callers, c);
+            if (caller_fi < 0 || caller_fi >= func_cnt) { continue; }
+            fn_rec = funcs[caller_fi];
+            body_arr = *(fn_rec + FN_BODY);
+            body_cnt = *(fn_rec + FN_BCNT);
+            for (j = 0; j < body_cnt; j++) {
+                _glob_origins_walk_node(body_arr[j], fi, param_idx, global_p);
+            }
+        }
+    }
+}
+
+// Find a parameter index by packed name in function fi. Pure lookup —
+// returns the index (0..param_cnt-1) or -1 if name is not a param.
+static _cgb_param_idx_of(fi, name_p)@base {
+    auto fn_rec, params_arr, param_cnt, i;
+    fn_rec = funcs[fi];
+    params_arr = *(fn_rec + FN_PARS);
+    param_cnt  = *(fn_rec + FN_PCNT);
+    for (i = 0; i < param_cnt; i++) {
+        if (packed_eq(params_arr[i], name_p)) { return i; }
+    }
+    return -1;
+}
+
+// Public lookup. Returns target_fidx (>= 0) when origin resolves to a
+// known function, -1 when the slot is poisoned or the variable was not
+// tracked at all.
+dsp_fn_origin_get(fi, name_p)@base {
+    auto names_arr, targets_arr, n, i;
+    if (arr_len(_fn_origin_names) <= fi) { return -1; }
+    names_arr   = arr_get(_fn_origin_names,   fi);
+    targets_arr = arr_get(_fn_origin_targets, fi);
+    if (names_arr == 0) { return -1; }
+    n = arr_len(names_arr);
+    for (i = 0; i < n; i++) {
+        if (packed_eq(arr_get(names_arr, i), name_p)) {
+            return arr_get(targets_arr, i);
+        }
+    }
+    return -1;
+}
+
 static _cgb_walk(nd) {
     auto n: Node, p: Node, base: Node;
     auto t, i, arr, cnt, name_p, callee_idx;
@@ -726,6 +1183,22 @@ static _cgb_walk(nd) {
                     if (callee_idx >= 0) {
                         _cgb_addr_taken_set = arr_push(_cgb_addr_taken_set, callee_idx);
                     }
+                }
+            }
+        }
+        // V3 Session 2 — for `call(fp, ...)` builtin, snapshot the
+        // resolved fp target into n.e so the validator can fire W028
+        // without re-resolving against a stale origin map. Stored as
+        // `target_fi + 1` (0 = absent / unresolved). The walk runs in
+        // textual source order, so the origin lookup here sees the
+        // most recent assignment up to this point — which is what
+        // execution sees when control reaches this call.
+        if (cnt >= 1) {
+            if (unpack_l(name_p) == 4) {
+                if (buf_eq(vbuf + unpack_s(name_p), "call", 4)) {
+                    auto _resolved;
+                    _resolved = _cgb_resolve_call_target(arr[0]);
+                    if (_resolved >= 0) { n.e = _resolved + 1; }
                 }
             }
         }
@@ -761,7 +1234,8 @@ static _cgb_walk(nd) {
         return 0;
     }
 
-    // Assignment to a non-local variable is a global write.
+    // Assignment to a non-local variable is a global write; assignment
+    // to a local with `fn_ptr(name)` RHS records the origin (V3 S2).
     if (t == T_ASSIGN) {
         p = n.a;
         if (p.ntype == T_VAR) {
@@ -778,6 +1252,26 @@ static _cgb_walk(nd) {
                     arr_set(glob_writers, _gi,
                             arr_push(arr_get(glob_writers, _gi), _cgb_current_fn_idx));
                 }
+                // V3 Session 4 Pass A — registration helper detection.
+                // Recognise `_global = some_param;` and remember (fi,
+                // param_idx, global) so Pass B can later capture the
+                // fn_ptr origins flowing through this helper's callers.
+                if (n.b != 0) {
+                    auto _rhs_node: Node, _param_idx;
+                    _rhs_node = n.b;
+                    if (_rhs_node.ntype == T_VAR) {
+                        _param_idx = _cgb_param_idx_of(_cgb_current_fn_idx, _rhs_node.a);
+                        if (_param_idx >= 0) {
+                            _fn_reg_record_pair(_cgb_current_fn_idx, _param_idx, name_p);
+                        }
+                    }
+                }
+            } else {
+                // V3 Session 2 — fn_ptr origin tracking. Either RHS is
+                // a `fn_ptr(name)` literal (record target_fidx) or
+                // anything else (poison: -1 invalidates any prior origin).
+                _fn_origin_record(_cgb_current_fn_idx, name_p,
+                                  _cgb_extract_fn_ptr_target(n.b));
             }
         }
         // Walk the RHS — its T_VAR nodes count as reads.
@@ -799,19 +1293,26 @@ static _cgb_walk(nd) {
         return 0;
     }
 
-    // Memory store: safe only if pointer base is a strided variable.
+    // Memory store: classify purity from the pointer-base shape, but
+    // ALWAYS recurse into both the pointer expression and the RHS so
+    // nested fn_ptr/fn_calls inside e.g. `h.field = fn_ptr(name)` get
+    // their address-taken bookkeeping. Skipping the RHS used to leave
+    // some_handler unseeded for mark_reachable, producing a hard
+    // "internal error: fn_ptr target not found after validate" at
+    // codegen time.
     if (t == T_MEMST) {
+        auto _strided;
+        _strided = 0;
         p = n.a;
         if (p.ntype == T_BINOP) {
             base = p.b;
             if (base.ntype == T_VAR) {
-                if (is_strided(base.a)) {
-                    _cgb_walk(n.b);
-                    return 0;
-                }
+                if (is_strided(base.a)) { _strided = 1; }
             }
         }
-        _cgb_impure = 1;
+        if (_strided == 0) { _cgb_impure = 1; }
+        _cgb_walk(n.a);
+        _cgb_walk(n.b);
         return 0;
     }
 
@@ -866,7 +1367,7 @@ static _cgb_walk(nd) {
 // Cached functions get default empty entries — their classification will
 // come from the .bo cache.
 call_graph_build() {
-    auto i, j, k, func, params_arr, param_cnt, body_arr, body_cnt;
+    auto i, j, k, fn_rec, params_arr, param_cnt, body_arr, body_cnt;
     auto stmt: Node, darr, dcnt, addr_idx, fname;
 
     // Grow per-function arrays to match func_cnt.
@@ -924,9 +1425,9 @@ call_graph_build() {
     }
 
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
 
         // Skip cached functions — they have no AST to walk. Their
         // classification will be loaded from the .bo cache.
@@ -936,8 +1437,8 @@ call_graph_build() {
             continue;
         }
 
-        params_arr = *(func + FN_PARS);
-        param_cnt = *(func + FN_PCNT);
+        params_arr = *(fn_rec + FN_PARS);
+        param_cnt = *(fn_rec + FN_PCNT);
 
         // Set up locals scope for this function: parameters + auto declarations.
         dsp_reset_locals();
@@ -962,6 +1463,8 @@ call_graph_build() {
         _cgb_impure = 0;
         _cgb_ext_eff = PHASE_BASE;
         _cgb_current_fn_idx = i;
+        _fn_origin_clear_for(i);
+        _fn_reg_clear_for(i);
 
         // Walk every statement in the body.
         for (j = 0; j < body_cnt; j++) {
@@ -999,6 +1502,19 @@ call_graph_build() {
         }
     }
 
+    // V3 Session 4 Pass B — cross-function flow capture. Pass A (the
+    // per-function `_cgb_walk` loop above) populated `_fn_reg_*` for
+    // every registration helper. Pass B inverts `fn_calls` into
+    // `_fn_callers`, then for each registration helper walks all its
+    // callers' bodies to record `fn_ptr` origins flowing through.
+    // The order is locked: Pass B never starts until Pass A finishes
+    // for ALL functions, so no helper is examined before all its
+    // own registrations have been recorded.
+    _dsp_build_callers();
+    for (i = 0; i < func_cnt; i++) {
+        if (dsp_is_reg_helper(i)) { _glob_origins_capture(i); }
+    }
+
     // Second pass: walk main()'s body sequentially to detect writes
     // before vs after the freeze point (first call to maestro_run /
     // maestro_configure / job_init). Conservative: only top-level
@@ -1024,11 +1540,11 @@ call_graph_build() {
 // without freeze position info. The promoter conservatively rejects extrn
 // promotion in those cases (any helper writer = stay auto).
 static void _dsp_walk_main_for_freeze() {
-    auto func, body_arr, body_cnt, j, stmt: Node, lhs: Node;
+    auto fn_rec, body_arr, body_cnt, j, stmt: Node, lhs: Node;
     auto frozen, gi, name_p, ts;
-    func = funcs[_dsp_main_idx];
-    body_arr = *(func + FN_BODY);
-    body_cnt = *(func + FN_BCNT);
+    fn_rec = funcs[_dsp_main_idx];
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
     frozen = 0;
     for (j = 0; j < body_cnt; j++) {
         stmt = body_arr[j];
@@ -1114,14 +1630,14 @@ static void _dsp_walk_main_for_freeze() {
 // — set elsewhere by .bo loading once that format extension lands.
 classify_all_functions() {
     auto i, j, callees, n_callees, callee_idx;
-    auto changed, iter, max_iter, func, body_arr;
+    auto changed, iter, max_iter, fn_rec, body_arr;
 
     // Init: all fresh-parsed functions start at PHASE_BASE. Cached
     // functions keep whatever fn_phase[] already holds (PHASE_AUTO if
     // the cache extension isn't live yet).
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
         if (body_arr != 0) {
             arr_set(fn_phase, i, PHASE_BASE);
         }
@@ -1140,8 +1656,8 @@ classify_all_functions() {
 
         // Pass: write to fn_phase_next based on current fn_phase.
         for (i = 0; i < func_cnt; i++) {
-            func = funcs[i];
-            body_arr = *(func + FN_BODY);
+            fn_rec = funcs[i];
+            body_arr = *(fn_rec + FN_BODY);
             // Cached function: copy through, don't touch.
             if (body_arr == 0) {
                 arr_set(fn_phase_next, i, arr_get(fn_phase, i));
@@ -1997,7 +2513,7 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
 // that qualifies for smart dispatch. Must run AFTER promote_globals()
 // so glob_class[] reflects the final storage-class decisions.
 void find_dispatch_candidates() {
-    auto i, func, body_arr, body_cnt, j;
+    auto i, fn_rec, body_arr, body_cnt, j;
     auto stmt: Node;
 
     if (dispatch_candidates == 0) { dispatch_candidates = arr_new(); }
@@ -2023,9 +2539,9 @@ void find_dispatch_candidates() {
     if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
 
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
         // Cached functions carry no AST to inspect.
         if (body_arr == 0) { continue; }
         // MVP scope: only top-level for-loops in the function body.
@@ -3082,12 +3598,12 @@ static _annot_count(nd) {
 // preference. Called last in the dispatch pipeline so synthesized
 // loop-worker bodies and rewritten loops are covered too.
 void annotate_temps() {
-    auto i, func, body_arr, body_cnt, j;
+    auto i, fn_rec, body_arr, body_cnt, j;
     auto stmt: Node;
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
         if (body_arr == 0) { continue; }
         for (j = 0; j < body_cnt; j++) {
             stmt = body_arr[j];
@@ -3184,7 +3700,7 @@ static _inline_param_refs(nd, name_p)@base {
 // criteria above. Must run after classify_all_functions so fn_phase
 // is final. Codegens read fn_inlineable when emitting T_CALL.
 void classify_inlineable() {
-    auto i, func, body_arr, body_cnt, params, pcnt, ret_stmt: Node;
+    auto i, fn_rec, body_arr, body_cnt, params, pcnt, ret_stmt: Node;
     auto ret_expr, j, ok, refs;
     // Grow the array to exactly func_cnt slots so arr_set below is safe.
     // arr_set does not bounds-check or resize; the naked indexed writes
@@ -3197,9 +3713,9 @@ void classify_inlineable() {
     for (i = 0; i < func_cnt; i++) {
         arr_set(fn_inlineable, i, 0);
         if (arr_get(fn_phase, i) != PHASE_BASE) { continue; }
-        func = funcs[i];
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
         if (body_arr == 0) { continue; }
         if (body_cnt != 1) { continue; }
         ret_stmt = body_arr[0];
@@ -3207,7 +3723,7 @@ void classify_inlineable() {
         if (ret_stmt.ntype != T_RET) { continue; }
         ret_expr = ret_stmt.a;
         if (ret_expr == 0) { continue; }
-        pcnt = *(func + FN_PCNT);
+        pcnt = *(fn_rec + FN_PCNT);
         if (pcnt > 3) { continue; }
         if (_inline_count_nodes(ret_expr) > 5) { continue; }
         if (_inline_has_tcall(ret_expr)) { continue; }
@@ -3221,7 +3737,7 @@ void classify_inlineable() {
             if (is_float_type(get_fn_par_type(i, j))) { ok = 0; }
         }
         if (ok == 0) { continue; }
-        params = *(func + FN_PARS);
+        params = *(fn_rec + FN_PARS);
         for (j = 0; j < pcnt; j++) {
             refs = _inline_param_refs(ret_expr, *(params + j * 8));
             if (refs > 1) { ok = 0; }
@@ -3287,15 +3803,15 @@ ast_clone_subst(nd, params, pcnt, args) {
 
 // Run dispatch analysis on all parsed functions.
 run_dispatch() {
-    auto i, func, params_arr, param_cnt, body_arr, body_cnt, j;
+    auto i, fn_rec, params_arr, param_cnt, body_arr, body_cnt, j;
     auto stmt: Node, darr, dcnt, k;
 
     for (i = 0; i < func_cnt; i++) {
-        func = funcs[i];
-        params_arr = *(func + FN_PARS);
-        param_cnt = *(func + FN_PCNT);
-        body_arr = *(func + FN_BODY);
-        body_cnt = *(func + FN_BCNT);
+        fn_rec = funcs[i];
+        params_arr = *(fn_rec + FN_PARS);
+        param_cnt = *(fn_rec + FN_PCNT);
+        body_arr = *(fn_rec + FN_BODY);
+        body_cnt = *(fn_rec + FN_BCNT);
 
         // Skip cached functions loaded from .bo files. They have
         // body_arr=0 because the AST is not reconstructed at load

@@ -6513,3 +6513,137 @@ Suites: 126/0/12 native + 105/0/33 C + test_panic.sh PASS +
 test_bootstrap_stable.sh PASS (5/5, no retry). Bootstrap
 genuinely byte-stable per documented procedure with no env
 coordination, and self-compile no longer flakes.
+
+## 2026-05-05 — V3 closeout: func-types ship with flow analysis + Estrita
+
+Sessions 0 + 2 + 3 + 4 + 5 of the V3 plan landed today on top of
+Session 1 from yesterday. The pattern that motivated V3 — a
+registry like `maestro_register_solo` accepting `fn_ptr(my_cb)` and
+later corrupting `dt` because the float/int signature drifted — now
+fires W028 at compile time, regardless of annotations.
+
+### What shipped
+
+**Session 0 — `Fn` → `func` retrofit.** Renamed 86 `func` identifier
+sites across `bpp_dispatch.bsm`, `bpp_types.bsm`, and `bpp_parser.bsm`
+to `fn_rec` (the variable consistently held a function record
+pointer). Then promoted `func` to keyword in the lexer and updated the
+parser/printer/Session-1 tests. Bootstrap byte-stable file by file.
+Lowercase `func` matches the built-in primitive convention; the
+Capitalized `Fn` from Session 1 was an inconsistency caught by
+review.
+
+**Session 2 — intra-function flow analysis (W028).** New
+`_fn_origin_*` arrays in `bpp_dispatch.bsm` track every local's
+recorded `fn_ptr(target)` origin in textual source order. The
+`_cgb_walk` T_ASSIGN handler records the origin at each write
+(poison-on-overwrite). At every `call(fp, args)` site the walker
+stashes the snapshot in `n.e` so the validator reads what was true
+**at that source position**, not whatever was last written across
+the whole function. Validate emits W028 for each arg whose
+compile-time type mismatches the resolved target's declared param.
+
+**Session 3 — opt-in annotations (E246).** `_val_fn_types_compat`
+does structural matching between two `func(...)` types — short-
+circuits on hash-cons identity, falls back to per-arg compare. The
+T_ASSIGN handler now consults `_val_get_hint` for both sides of a
+VAR-to-VAR assignment instead of trusting `n.itype` (which is
+byte-sliced and truncates fn-type ids). Annotation wins over flow
+analysis at `call(fp, args)` sites: hard E246 when the annotation
+contract is violated, soft W028 when the flow trace finds a target
+implicitly. The byte-truncation hazard in `Node.itype` is documented
+in the assign handler's comment so the next reader knows why we
+look up the hint table.
+
+**Session 4 — cross-function flow + Estrita.** Two-pass design in
+`call_graph_build`:
+- **Pass A** (inside `_cgb_walk`) records every function whose
+  T_ASSIGN handler sees `_global = some_param;` — the registration
+  helper pattern.
+- **Pass B** (after Pass A finishes for ALL functions) inverts
+  `fn_calls` into `_fn_callers`, then for each registration helper
+  walks every caller's body and captures `fn_ptr(target)` literals
+  passed at the registered param index.
+
+The pass ordering is locked: Pass B never starts before Pass A is
+complete, so no helper is examined before all its registrations are
+recorded. Validate at `call(global, args)` sites checks the args
+against EVERY registered origin — Estrita conflict resolution: any
+mismatch fires W028. The `@poly` opt-out for genuinely polymorphic
+registries stays a backlog item; B++'s data-oriented design culture
+(per the README and game-dev mainstream) means real registries are
+mono-typed.
+
+**Session 5 — migration sweep + docs.** Annotated
+`maestro_register_solo` with `fn: func(float) -> void`. Three real
+bugs surfaced as expected:
+
+- `stbphys.bsm::fps_walk` carried an obsolete W027 workaround (`dt`
+  intentionally untyped, then `dt_s = dt_s / 1000.0`). With AAPCS64
+  fixed, the workaround was a double conversion — int dt was
+  arriving as float seconds and getting divided by 1000 anyway.
+  Removed the workaround, annotated `dt: float`.
+- `stbphys.bsm::fps_turn` had the same comment-pasted workaround.
+  Same fix.
+- `games/fps/fps_3d.bpp::wolf3d_render_phase(alpha)` was untyped
+  but `alpha` is float. Annotated `alpha: float`.
+- `games/snake/snake_maestro.bpp::snake_solo/base/render_phase(dt)`
+  were untyped. Annotated `dt: float`. The `_last_dt` global was
+  also untyped and stored a float — annotated `: float` to match.
+
+These are the kind of latent bugs V3 exists to catch.
+
+### Diagnostics shipped
+
+- **W028** — call() arg-type mismatch via flow analysis. Fires
+  intra-function (Session 2) and cross-function via registration
+  helpers (Session 4, Estrita).
+- **E246** — `func(...)` annotation contract violated, in either
+  fn-type-to-fn-type assignment or `call(fp, args)` with annotated
+  fp.
+- **E247 / E248 / E249** — Session 1 `func`-type parser errors
+  (arg overflow, depth overflow, malformed) renamed in their
+  diagnostic strings from "Fn-type" to "func-type".
+
+### Docs updated
+
+- `tonify_checklist.md` Rule 21 (NEW) — `func`-types are opt-in;
+  flow analysis covers untyped code; Estrita motivation.
+- `tonify_checklist.md` Pitfall 6 — marked **DIAGNOSTIC SHIPPED**
+  with reference to Rule 21.
+- `warning_error_log.md` — entries for W028, E246, E247, E248, E249.
+- `journal.md` — this entry.
+
+### Tree state
+
+Suites: 140/0/12 native + 114/0/38 C. Bootstrap byte-stable
+(`./bpp` == `gen1` == `gen2`, sha `60f703aa...`). All games
+(snake, pathfind, fps_3d) compile clean of any V3-related
+diagnostic; remaining warnings are pre-existing W026 (phase
+lattice) noise unrelated to func-types. Test runner extended with
+`// xfail-warn: WYYY` marker — non-blocking compile + warning
+must appear in stderr.
+
+7 new gate tests (2 Session 2, 2 Session 3, 3 Session 4) lock the
+W028/E246 behavior in place.
+
+### Backlog
+
+- `@poly` annotation (~30 LOC) to silence W028 in genuinely
+  polymorphic registries — implement when a real plugin/scripting
+  use case surfaces.
+- Typer-aware `fn_ptr` return value: when the target callee's
+  signature is known, `fn_ptr(target)` could return a typed
+  `func(...)` value rather than opaque word. Would let `auto fp:
+  func(...) = fn_ptr(target)` fire E246 directly on shape mismatch
+  at the assignment site (today the same bug only fires at the
+  call site via flow analysis).
+- Return-value flow: `auto fp = make_handler();` where
+  `make_handler` returns `fn_ptr(...)`.
+- Struct-field flow read: `call(h.on_click, args)` where
+  `h.on_click` was set elsewhere — needs flow through memory.
+
+V3 is done. The eixo function-pointer typing matches Rust/Zig/Go/
+Swift on the rude-first-with-opt-in-discipline axis, and Pitfall 6
+went from diagnostic candidate to diagnostic shipped in three days
+(2026-05-04 Session 1 → 2026-05-05 Sessions 2-5).
