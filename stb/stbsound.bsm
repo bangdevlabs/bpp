@@ -121,8 +121,22 @@ sound_save_wav(path, buf, n_frames)@io {
 // 44-byte header layout, so LIST/INFO/fact chunks emitted by
 // Audacity, Logic, DAWs with metadata, etc. are skipped
 // transparently.
-sound_load_wav(path)@io {
-    auto buf, size_out, size;
+// Decode a WAV byte buffer already in memory into the internal
+// stereo-s16 PCM format. Returns the frame count, or -1 on failure
+// with a diagnostic written to stderr (`stbsound: '<tag>': <reason>`).
+// On success, the decoded buffer is hung off `_snd_last_buf` /
+// `_snd_last_frames` exactly like `sound_load_wav` does, so the
+// existing `sound_buf()` / `sound_frames()` accessors keep working.
+//
+// `tag` is a free-form label included in error messages for context
+// — typically the file path when called from `sound_load_wav`, but
+// any caller-provided string works (e.g. an embedded asset name or
+// "<memory>" for runtime-generated WAV bytes).
+//
+// Use this entry point when the WAV bytes are already in memory:
+// asset bundles, network downloads, embedded resources. Use
+// `sound_load_wav(path)` when the source is a file on disk.
+wav_decode_to_buf(buf, size, tag)@io {
     auto pos, chunk_id, chunk_size, chunk_pad;
     auto fmt_code, channels, sample_rate, bits;
     auto data_off, data_size;
@@ -136,25 +150,11 @@ sound_load_wav(path)@io {
 
     init_sound();
 
-    // Read the whole file — WAVs are small enough (sounds/samples
-    // up to a few MB) that streaming the parser buys nothing and
-    // complicates chunk scanning.
-    size_out = malloc(8);
-    *size_out = 0;
-    buf = file_read_all(path, size_out);
-    size = *size_out;
-    free(size_out);
-    if (buf == 0) {
-        put_err("stbsound: '"); put_err(path);
-        put_err("': file not found or unreadable"); putline_err();
-        return -1;
-    }
-
     // Need at least the 12-byte RIFF/WAVE header.
     if (size < 12) {
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': truncated (under 12 bytes)"); putline_err();
-        free(buf); return -1;
+        return -1;
     }
 
     // Validate RIFF + WAVE magic.
@@ -162,9 +162,9 @@ sound_load_wav(path)@io {
      || peek(buf + 2)  != 'F' || peek(buf + 3)  != 'F'
      || peek(buf + 8)  != 'W' || peek(buf + 9)  != 'A'
      || peek(buf + 10) != 'V' || peek(buf + 11) != 'E') {
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': not a RIFF/WAVE file"); putline_err();
-        free(buf); return -1;
+        return -1;
     }
 
     // Scan chunks starting at offset 12. Each chunk: 4-byte id,
@@ -212,14 +212,14 @@ sound_load_wav(path)@io {
     }
 
     if (found_fmt == 0) {
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': missing fmt chunk"); putline_err();
-        free(buf); return -1;
+        return -1;
     }
     if (found_data == 0) {
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': missing data chunk"); putline_err();
-        free(buf); return -1;
+        return -1;
     }
 
     // Supported format validation.
@@ -227,39 +227,39 @@ sound_load_wav(path)@io {
     if (fmt_code == 1) {
         // PCM integer — 8/16/24/32-bit.
         if (bits != 8 && bits != 16 && bits != 24 && bits != 32) {
-            put_err("stbsound: '"); put_err(path);
+            put_err("stbsound: '"); put_err(tag);
             put_err("': unsupported PCM bit depth ");
             put_err(bits);
             put_err(" (need 8, 16, 24, or 32)"); putline_err();
-            free(buf); return -1;
+            return -1;
         }
     } else if (fmt_code == 3) {
         // IEEE float — only 32-bit is practical.
         if (bits != 32) {
-            put_err("stbsound: '"); put_err(path);
+            put_err("stbsound: '"); put_err(tag);
             put_err("': IEEE float must be 32-bit, got ");
             put_err(bits);
             put_err("-bit"); putline_err();
-            free(buf); return -1;
+            return -1;
         }
         is_float = 1;
     } else {
         // A-law, µ-law, WAVE_FORMAT_EXTENSIBLE, other: unsupported.
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': format code ");
         put_err(fmt_code);
         put_err(" not supported (accepts PCM=1 or IEEE float=3)");
         putline_err();
-        free(buf); return -1;
+        return -1;
     }
 
     if (channels != 1 && channels != 2) {
-        put_err("stbsound: '"); put_err(path);
+        put_err("stbsound: '"); put_err(tag);
         put_err("': ");
         put_err(channels);
         put_err(" channels not supported (need mono or stereo)");
         putline_err();
-        free(buf); return -1;
+        return -1;
     }
     mono = 0;
     if (channels == 1) { mono = 1; }
@@ -360,12 +360,41 @@ sound_load_wav(path)@io {
         write_u16(out, i * 4 + 2, right_s & 0xFFFF);
     }
 
-    free(buf);
-
     // Caller owns `out`. We don't free the previous _snd_last_buf
-    // so any asset handle still holding it remains valid.
+    // so any asset handle still holding it remains valid. The
+    // input `buf` is owned by the caller — sound_load_wav frees the
+    // file buffer it allocated; in-memory callers manage their own.
     _snd_last_buf    = out;
     _snd_last_frames = n_frames;
+    return n_frames;
+}
+
+// Load a WAV file from disk. Returns frame count, or -1 on failure
+// with a diagnostic on stderr identifying which path failed and why
+// — game programmers see actionable signal instead of a silent
+// missing-sound bug. Thin wrapper around `wav_decode_to_buf`: read
+// the file, hand the bytes to the decoder, free the file buffer.
+sound_load_wav(path)@io {
+    auto buf, size_out, size, n_frames;
+
+    init_sound();
+
+    // Read the whole file — WAVs are small enough (sounds/samples
+    // up to a few MB) that streaming the parser buys nothing and
+    // complicates chunk scanning.
+    size_out = malloc(8);
+    *size_out = 0;
+    buf = file_read_all(path, size_out);
+    size = *size_out;
+    free(size_out);
+    if (buf == 0) {
+        put_err("stbsound: '"); put_err(path);
+        put_err("': file not found or unreadable"); putline_err();
+        return -1;
+    }
+
+    n_frames = wav_decode_to_buf(buf, size, path);
+    free(buf);
     return n_frames;
 }
 

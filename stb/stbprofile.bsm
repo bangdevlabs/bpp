@@ -63,6 +63,13 @@ const _PROFILE_NAME_BUF_SZ   = 48;
 // real spikes. Same window every modern game-dev profiler ships.
 const _PROFILE_FRAME_BUF_N   = 32;
 
+// Mirror of `_PROF_MAX_THREADS` defined in `bpp_runtime.bsm`. The
+// HUD's per-thread cycle bound must match the actual ring count or
+// `profile_dump_thread` will silently return 0 for stale indices.
+// Kept locally here because `const` values in B++ inline at parse
+// time and can't be `extrn` shared cross-module.
+const _PROFILE_MAX_THREADS   = 8;
+
 // Tier 2 sparkline — vertical bar chart of the last N frame times
 // rendered just below the FPS / ms / max line. Heights normalize to
 // the window's max so the worst frame draws full-height and a
@@ -97,6 +104,14 @@ extrn _profile_name_buf;
 global _profile_dump_count;
 global _profile_dump_last_ms;
 
+// Tier 3a — per-thread breakdown mode. 0 = combined view across all
+// threads (default, matches the legacy HUD); k > 0 = single-thread
+// view targeting thread index `k - 1`. Cycled by
+// `profile_hud_cycle_thread()` so the user can step through main +
+// each worker without recompiling. The label rendered next to "REC"
+// shows which view is active.
+global _profile_hud_thread_mode;
+
 // Frame time tracking — always running, even when the HUD is idle,
 // so the FPS / frame-time readout has accurate data the moment the
 // user toggles profiling on. Stored in microseconds for sub-ms
@@ -127,6 +142,7 @@ void init_profile() {
     _profile_frame_idx      = 0;
     _profile_frame_count    = 0;
     _profile_last_draw_us   = 0;
+    _profile_hud_thread_mode = 0;
 }
 
 // Override the sampling rate (Hz) and per-sample stack depth that
@@ -163,6 +179,18 @@ void profile_hud_toggle() {
     _profile_dump_count     = 0;
     _profile_hud_active     = 1;
     put_err("profile: started\n");
+}
+
+// Step the per-thread breakdown mode forward. Sequence:
+// 0 (combined) → 1 (thread 0 = main) → 2 (worker 0) → ... → N (worker N-1) → 0.
+// Caller wires this to a key (e.g. SHIFT+T alongside the existing
+// profile toggle). Mode persists across toggle on/off so the user
+// can switch views without re-arming the profiler.
+void profile_hud_cycle_thread() {
+    auto next;
+    next = _profile_hud_thread_mode + 1;
+    if (next > _PROFILE_MAX_THREADS) { next = 0; }
+    _profile_hud_thread_mode = next;
 }
 
 // ── HUD ──────────────────────────────────────────────────────
@@ -281,9 +309,29 @@ void profile_hud_draw(x, y, sz, color) @gpu {
     // Refresh the live top-N every _PROFILE_LIVE_REFRESH_MS ms.
     // profile_dump's internal mallocs make per-frame calls a
     // self-fulfilling profile (allocator dominates the hot list).
+    //
+    // Tier 3a — when `_profile_hud_thread_mode > 0` the dump filters
+    // to a single thread index (mode - 1) so the user can isolate
+    // main vs each worker without losing the combined-view default.
     if (now_ms - _profile_dump_last_ms >= _PROFILE_LIVE_REFRESH_MS) {
-        _profile_dump_count   = profile_dump(_profile_dump_buf, _PROFILE_LIVE_TOP_N);
+        if (_profile_hud_thread_mode == 0) {
+            _profile_dump_count = profile_dump(_profile_dump_buf, _PROFILE_LIVE_TOP_N);
+        } else {
+            _profile_dump_count = profile_dump_thread(_profile_dump_buf,
+                                                      _PROFILE_LIVE_TOP_N,
+                                                      _profile_hud_thread_mode - 1);
+        }
         _profile_dump_last_ms = now_ms;
+    }
+
+    // Tier 3a label next to "REC". "[ALL]" for combined, "[CPU N]"
+    // for single-thread (N = thread index, 0 = main).
+    if (_profile_hud_thread_mode == 0) {
+        render_text("[ALL]", x + 8 * 8 * sz, y, sz, color);
+    } else {
+        render_text("[CPU", x + 8 * 8 * sz, y, sz, color);
+        render_number(x + 13 * 8 * sz, y, sz, color, _profile_hud_thread_mode - 1);
+        render_text("]", x + 14 * 8 * sz, y, sz, color);
     }
 
     // Render the cached top-N below the FPS line. Each row shows
@@ -310,6 +358,41 @@ void profile_hud_draw(x, y, sz, color) @gpu {
         render_number(x + 22 * 8 * sz, row_y, sz, color, count);
         row_y = row_y + 10 * sz;
     }
+}
+
+// Standalone FPS counter — renders just the "FPS: <n>" line at the
+// supplied position, independent of the profile toggle. For shipped
+// games that want a permanent overlay without the recording UX or
+// the top-N noise. Does its own ring update so the overlay works in
+// programs that never call `profile_hud_draw`. Callers must use
+// EXACTLY ONE of `profile_hud_draw` and `profile_hud_draw_fps_only`
+// per frame — calling both double-counts the ring tick and halves
+// the displayed FPS.
+void profile_hud_draw_fps_only(x, y, sz, color)@gpu {
+    auto now_us, dt, sum_us, avg_us, fps_avg, i;
+
+    now_us = beat_now_us();
+    if (_profile_last_draw_us > 0) {
+        dt = now_us - _profile_last_draw_us;
+        _profile_frame_buf[_profile_frame_idx] = dt;
+        _profile_frame_idx = (_profile_frame_idx + 1) % _PROFILE_FRAME_BUF_N;
+        if (_profile_frame_count < _PROFILE_FRAME_BUF_N) {
+            _profile_frame_count++;
+        }
+    }
+    _profile_last_draw_us = now_us;
+
+    sum_us = 0;
+    for (i = 0; i < _profile_frame_count; i++) {
+        sum_us = sum_us + _profile_frame_buf[i];
+    }
+    fps_avg = 0;
+    if (_profile_frame_count > 0) {
+        avg_us = sum_us / _profile_frame_count;
+        if (avg_us > 0) { fps_avg = 1000000 / avg_us; }
+    }
+    render_text("FPS:", x, y, sz, color);
+    render_number(x + 5 * 8 * sz, y, sz, color, fps_avg);
 }
 
 // ── Dump ─────────────────────────────────────────────────────
