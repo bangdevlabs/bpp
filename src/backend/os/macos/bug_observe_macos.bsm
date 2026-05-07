@@ -15,25 +15,58 @@ const SIGSEGV = 11;
 const SIGBUS  = 10;
 const SIGABRT = 6;
 
-static auto _ds_path;
-static auto _ds_path_xcode;
+// Candidate paths searched in order during _ds_resolve. Lower
+// index wins. The CommandLineTools path is checked before Xcode
+// because the CLT bundle is the smaller install most B++ users on
+// macOS already have, while Xcode is the bigger optional add-on.
+//
+// Both standard layouts ("Versions/A/Resources/" and bare
+// "Resources/") show up across macOS versions: older releases
+// surface the framework symlink, newer ones expose the bare
+// directory directly. We try both. A user with a non-standard
+// LLDB install (Homebrew, MacPorts, custom build) overrides the
+// search by setting `BUG_DEBUGSERVER=/path/to/debugserver` in
+// their environment.
+static auto _ds_paths;     // word array of C-string paths to try
+static auto _ds_path_count;
 
 init_observe() {
     _ds_port = 0;
     _ds_pid = 0;
 
-    // Command Line Tools path.
-    _ds_path = malloc(256);
-    auto p, i;
-    p = "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver";
-    str_cpy(_ds_path, p);
-
-    // Xcode path.
-    _ds_path_xcode = malloc(256);
-    p = "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver";
-    str_cpy(_ds_path_xcode, p);
+    _ds_paths = buf_word(8);
+    _ds_path_count = 0;
+    _ds_paths[_ds_path_count] = "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver"; _ds_path_count++;
+    _ds_paths[_ds_path_count] = "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Resources/debugserver"; _ds_path_count++;
+    _ds_paths[_ds_path_count] = "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver"; _ds_path_count++;
+    _ds_paths[_ds_path_count] = "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Resources/debugserver"; _ds_path_count++;
 
     init_gdb(0);
+    return 0;
+}
+
+// Resolve the debugserver binary path, honoring user overrides and
+// falling back through the well-known macOS layouts. Returns the
+// matching path on success, 0 on failure. The returned pointer is
+// owned by the caller's environment / static table — do NOT free.
+static _ds_resolve()@io {
+    auto override, i, p;
+    // 1. Explicit override wins. Lets users with Homebrew LLDB or
+    //    a custom build point bug at the right binary without
+    //    code changes. Also useful for CI pipelines that ship
+    //    debugserver in a non-standard location.
+    override = getenv("BUG_DEBUGSERVER");
+    if (override != 0) {
+        if (_ds_exists(override)) { return override; }
+        // The user explicitly asked for this path — fall through
+        // to the standard search but leave a breadcrumb in the
+        // diagnostic later if nothing else is found.
+    }
+    // 2. Walk the well-known framework layouts.
+    for (i = 0; i < _ds_path_count; i++) {
+        p = _ds_paths[i];
+        if (_ds_exists(p)) { return p; }
+    }
     return 0;
 }
 
@@ -71,14 +104,23 @@ _itoa(buf, n) {
 _spawn_debugserver(target_path, start_idx, argc) {
     auto pid, ds_path, argv, host_port, plen, i, cnt;
 
-    // Find debugserver.
-    if (_ds_exists(_ds_path)) { ds_path = _ds_path; }
-    else if (_ds_exists(_ds_path_xcode)) { ds_path = _ds_path_xcode; }
-    else {
-        out_str("bug: error: debugserver not found");
-        out_nl();
-        out_str("hint: install Xcode or Command Line Tools");
-        out_nl();
+    ds_path = _ds_resolve();
+    if (ds_path == 0) {
+        // Tell the user exactly what we tried so they can either
+        // install one of the supported toolchains or point us at
+        // a non-standard install via the env var.
+        out_str("bug: error: debugserver not found"); out_nl();
+        out_str("  searched:"); out_nl();
+        for (i = 0; i < _ds_path_count; i++) {
+            out_str("    "); out_str(_ds_paths[i]); out_nl();
+        }
+        if (getenv("BUG_DEBUGSERVER") != 0) {
+            out_str("  BUG_DEBUGSERVER override (also missing): ");
+            out_str(getenv("BUG_DEBUGSERVER")); out_nl();
+        }
+        out_str("  hints:"); out_nl();
+        out_str("    - install Xcode Command Line Tools: xcode-select --install"); out_nl();
+        out_str("    - or set BUG_DEBUGSERVER=/path/to/debugserver"); out_nl();
         return -1;
     }
 

@@ -1,0 +1,110 @@
+// snake_sprites.bsm — Procedural sprite atlas shared between
+// `snake_gpu.bpp` and `snake_maestro.bpp`.
+//
+// Both snake variants render the same four tiles (body, head,
+// dead head, apple); the atlas image and the tile id constants
+// live here so the games share a single MTLTexture upload + a
+// single source of truth for the sprite layout. Tonify Rule 20
+// (two-consumer rule): promote at the second consumer. snake_gpu
+// is the first consumer (Phase 3.3 of the GPU pipeline roadmap),
+// snake_maestro is the second — both `load` this file.
+//
+// The atlas is 4 tiles wide × 1 tile tall, 16 px per tile. Each
+// tile is a solid colour interior with a 1-pixel contrasting
+// border so the atlas-rendered snake reads as visibly distinct
+// from the previous render_rect baseline (no border) — useful
+// for confirming at a glance that the migration is live.
+
+import "stbrender.bsm";
+import "stbimage.bsm";
+
+// Per-tile dimensions and atlas geometry.
+const SNAKE_SPR_TILE  = 16;
+const SNAKE_SPR_TEX_W = 64;     // 4 tiles × 16 px
+const SNAKE_SPR_TEX_H = 16;
+
+// Tile ids — row-major (single row in this atlas).
+const SNAKE_SPR_BODY  = 0;
+const SNAKE_SPR_HEAD  = 1;
+const SNAKE_SPR_DEAD  = 2;
+const SNAKE_SPR_APPLE = 3;
+
+// Paint one pixel into the RGBA atlas buffer at (gx, gy) with a
+// packed ARGB color. Pixel layout matches `_stb_gpu_create_texture`
+// (R, G, B, A bytes per pixel, 4 bytes per pixel). Named with the
+// `_snake_` prefix to avoid colliding with stbdraw's `put_px`
+// (different signature: stbdraw's takes a screen pixel address,
+// ours takes an offset into the atlas RGBA buffer).
+static void _snake_put_px(buf, gx, gy, color) {
+    auto off;
+    off = (gy * SNAKE_SPR_TEX_W + gx) * 4;
+    poke(buf + off,     (color >> 16) & 0xFF);
+    poke(buf + off + 1, (color >> 8)  & 0xFF);
+    poke(buf + off + 2,  color        & 0xFF);
+    poke(buf + off + 3, (color >> 24) & 0xFF);
+}
+
+// Fill the 16×16 square at column `tile_id` of the atlas with
+// `fill` interior + `border` 1-pixel ring. Border + fill is
+// enough visual signal to prove the atlas path is live — the
+// solid `render_rect` previous behaviour had no border.
+static void _snake_fill_tile_bordered(buf, tile_id, fill, border) {
+    auto i, j, base_x, c;
+    base_x = tile_id * SNAKE_SPR_TILE;
+    for (j = 0; j < SNAKE_SPR_TILE; j++) {
+        for (i = 0; i < SNAKE_SPR_TILE; i++) {
+            if (i == 0 || i == SNAKE_SPR_TILE - 1
+                || j == 0 || j == SNAKE_SPR_TILE - 1) {
+                c = border;
+            } else {
+                c = fill;
+            }
+            _snake_put_px(buf, base_x + i, j, c);
+        }
+    }
+}
+
+// Build the snake's procedural sprite atlas — single MTLTexture
+// shared across all per-segment draws so smart-bind batching
+// (Phase 3.2) coalesces the snake's 30+ image_draw calls into
+// one drawPrimitives. Allocates the source RGBA buffer; the
+// buffer is intentionally NOT freed (image_create_rgba's contract,
+// matches render_create_sprite16 in stbrender — async upload on
+// Apple Silicon's unified memory needs the source bytes alive at
+// least until the next command buffer commit).
+//
+// Annotation: un-annotated. Body allocates (heap) and uploads to
+// the GPU via image_create_rgba. IO + GPU + HEAP effects make
+// SOLO the right inferred classification, same convention as the
+// texture builders in stbtexture.
+build_snake_atlas() {
+    auto buf;
+    buf = malloc(SNAKE_SPR_TEX_W * SNAKE_SPR_TEX_H * 4);
+    // Body — green tile with darker green border.
+    _snake_fill_tile_bordered(buf, SNAKE_SPR_BODY,  GREEN,
+                              rgba(0, 100, 0, 255));
+    // Head (alive) — white tile with grey border + two black eye dots.
+    _snake_fill_tile_bordered(buf, SNAKE_SPR_HEAD,  WHITE,
+                              rgba(180, 180, 180, 255));
+    _snake_put_px(buf, SNAKE_SPR_HEAD * SNAKE_SPR_TILE +  5, 6, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_HEAD * SNAKE_SPR_TILE + 10, 6, BLACK);
+    // Head (dead) — red tile with darker red border + two X marks
+    // formed by manual diagonal pixel pokes.
+    _snake_fill_tile_bordered(buf, SNAKE_SPR_DEAD,  RED,
+                              rgba(100, 0, 0, 255));
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE +  5, 5, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE +  6, 6, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE +  7, 7, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE +  5, 7, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE +  7, 5, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE + 10, 5, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE + 11, 6, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE + 12, 7, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE + 12, 5, BLACK);
+    _snake_put_px(buf, SNAKE_SPR_DEAD * SNAKE_SPR_TILE + 10, 7, BLACK);
+    // Apple — red interior with green border (stem-feel).
+    _snake_fill_tile_bordered(buf, SNAKE_SPR_APPLE, rgba(220, 30, 30, 255),
+                              GREEN);
+    return image_create_rgba(buf, SNAKE_SPR_TEX_W, SNAKE_SPR_TEX_H,
+                             SNAKE_SPR_TILE, SNAKE_SPR_TILE);
+}

@@ -12,13 +12,13 @@
 
 import "stbgame.bsm";
 import "stbrender.bsm";
+import "stbimage.bsm";   // Phase 3.5 — sprites loaded from atlas pack
 import "stbcol.bsm";
 import "stbecs.bsm";
 import "stbpool.bsm";
 import "stbtile.bsm";
 import "stbpath.bsm";
 import "stbpal.bsm";
-import "bpp_json.bsm";   // json_parse/json_root for loading level files
                          // (bpp_json is the standalone JSON lib; stbforge
                          //  wraps it but pulls in modulab-specific helpers
                          //  we don't need here)
@@ -35,51 +35,38 @@ const SPR_SIZE     = 16;
 const PARTICLE_MAX = 100;
 const MAX_PATH     = 256;
 
-// Tile types in the tilemap.
+// Tile types in the tilemap. Pathfind preserves the level
+// editor's full MCU-8 palette so painted colours survive into
+// the running game — index 0 is empty, 1..7 are colored walls
+// (all solid). The visual mapping is: 1 black, 2 dark red, 3
+// gray, 4 orange, 5 green, 6 purple, 7 yellow (MCU-8 standard).
 const T_EMPTY = 0;
 const T_WALL  = 1;
 
-// ── Palette ──────────────────────────────────────────────
+// ── Sprite atlas (Phase 3.5.3) ───────────────────────────
 //
-// The game uses stbpal's MCU-8 built-in for the sprite look-up
-// table — same 8 colors the hand-authored assets were painted
-// against in ModuLab. Two palette copies live in parallel:
+// Sprites authored in ModuLab and exported as a single
+// `pathfind.atlas.json` pack file via Modulab's "Atlas" topbar
+// button (or the one-shot `tools/sprite16_to_atlas.sh` converter
+// for sprite16 sources). The atlas is loaded into a single MTLTexture
+// with palette decoding done once at load time — every per-frame
+// draw is one `image_draw_size` call coalesced via Phase 3.2 smart-
+// bind into a single drawPrimitives.
 //
-//   pal_normal  — the baseline MCU-8 colors.
-//   pal_flash   — every non-transparent slot collapsed to white;
-//                 applied as a 2-frame flash when the rat takes
-//                 damage (the classic hit-sparkle effect).
-//
-// pal_gpu is the single GPU handle every sprite samples from;
-// swapping its contents (palette_gpu_update) swaps the visual
-// for every sprite on screen in one 1 KB upload.
+// Damage flash mechanic (was: palette swap on the GPU side via
+// `palette_gpu_update(pal_gpu, pal_flash)`) is now per-vertex tint
+// — `image_draw_size_tinted(atlas, id, x, y, w, h, WHITE)` for the
+// flash window, plain `image_draw_size` otherwise. Visually
+// identical, simpler runtime: no palette texture, no upload-swap
+// dance, just a 4-byte tint multiplied in the fragment shader.
 
-extrn pal_normal, pal_flash, pal_gpu;
-
-static void _pathfind_init_palette() {
-    auto i;
-    init_palette();
-    // Borrow-then-clone so cycling / LUTs run against our own
-    // copy without mutating the shared MCU-8 catalog entry.
-    pal_normal = palette_clone(palette_builtin(PAL_MCU_8));
-    pal_flash  = palette_clone(pal_normal);
-    // Flash palette: every non-transparent slot → pure white so
-    // the hit sparkle reads instantly against the dark arena.
-    // Slot 0 stays transparent so hit-tests (alpha-zero pixels)
-    // are unaffected.
-    for (i = 1; i < 8; i++) {
-        palette_set(pal_flash, i, 0xFFFFFFFF);
-    }
-    pal_gpu = palette_gpu_upload(pal_normal);
-}
+extrn pf_atlas;
+extrn rat_id, cat_id;
 
 // ── Game State ───────────────────────────────────────────
 //
 // extrn: allocated or set once during main/init and never reassigned.
 // auto:  per-frame or per-collision mutable state.
-
-extrn spr_rat_data, spr_cat_data;
-extrn tex_rat, tex_cat;
 
 // Positions and velocities are in milli-pixels (pixel * 1000).
 // Speeds are in pixels/second; they are configuration, not per-frame.
@@ -93,11 +80,10 @@ extrn cat_speed;
 
 // invuln is in milliseconds remaining on the rat after a hit.
 auto invuln_ms, game_over;
-// Damage-flash timer. >0 means the palette GPU handle currently
-// holds pal_flash; when it ticks down to 0 we re-upload
-// pal_normal. A short 80 ms window matches the classic NES
-// "hit sparkle" duration — any longer and the sprite feels
-// stuck in a dead state.
+// Damage-flash timer. >0 means every sprite renders with a WHITE
+// tint via image_draw_size_tinted. A short 80 ms window matches
+// the classic NES "hit sparkle" duration — any longer and the
+// sprite feels stuck in a dead state.
 auto flash_ms;
 
 extrn frame_arena;
@@ -186,10 +172,12 @@ load_arena_from_file(path)@io {
         row_idx = json_child(doc, tiles_idx, y);
         for (x = 0; x < w; x++) {
             cell = json_int(doc, json_child(doc, row_idx, x));
-            // Any non-zero tile counts as a wall. The level_editor
-            // supports 8 palette indices but pathfind only cares
-            // about "solid vs empty"; 1..7 all become T_WALL.
-            if (cell != 0) { tile_set(tm, x, y, T_WALL); }
+            // Preserve the palette index 1..7 so each painted
+            // colour from the level editor renders identically
+            // in-game. Collision treats every non-zero entry as
+            // solid; the per-tile MCU-8 colour comes from the
+            // atlas bound at init time.
+            if (cell != 0) { tile_set(tm, x, y, cell); }
         }
     }
 
@@ -206,6 +194,72 @@ void build_arena() {
     if (load_arena_from_file("assets/levels/level1.level.json") != 0) {
         build_arena_fallback();
     }
+}
+
+// Live hot-reload callback (Phase 3.5.7). Fired by stbimage's
+// file_watch_tick when assets/levels/level1.level.json changes
+// on disk while the game is running. Clears the existing tile
+// grid back to T_EMPTY (so deleted walls actually disappear),
+// re-runs the same loader build_arena uses for cold start, and
+// re-syncs the pathfinder's solid mask so the cat re-routes
+// around the new geometry on the next frame.
+//
+// On loader failure (file deleted mid-edit, JSON broken) the
+// fallback arena layout is rebuilt instead of leaving the map
+// blank — the game keeps something walkable on screen.
+void reload_level() {
+    auto gx, gy;
+    for (gy = 0; gy < GRID_H; gy++) {
+        for (gx = 0; gx < GRID_W; gx++) {
+            tile_set(tm, gx, gy, T_EMPTY);
+        }
+    }
+    if (load_arena_from_file("assets/levels/level1.level.json") != 0) {
+        build_arena_fallback();
+    }
+    sync_path_from_tilemap();
+}
+
+// Build a procedural 8-tile atlas where each tile is a 16x16
+// solid square of the corresponding MCU-8 palette colour. Used
+// by init_game to bind a colour-per-palette-index image onto
+// the tilemap so painted level cells render with the same hue
+// the user picked in the level editor.
+//
+// Index 0 is intentionally left transparent — `tile_draw`
+// already early-exits on tile==0, so the empty cell never
+// reaches the atlas path. Indices 1..7 produce solid colour
+// tiles matching `palette_fill_mcu_8` in stbpal.
+//
+// Returns the Image* on success, 0 on allocation failure
+// (caller falls back to the engine's default debug rectangles).
+build_mcu8_tile_atlas() {
+    auto pal, count, tw, th, tex_w, tex_h, rgba_buf;
+    auto i, x, y, off, argb;
+    count = 8;
+    tw = TILE_W;
+    th = TILE_H;
+    tex_w = tw * count;
+    tex_h = th;
+    pal = palette_new(8);
+    palette_fill_mcu_8(pal);
+    rgba_buf = malloc(tex_w * tex_h * 4);
+    for (i = 0; i < tex_w * tex_h * 4; i++) { poke(rgba_buf + i, 0); }
+    // Skip slot 0 (transparent — never reached by tile_draw).
+    for (i = 1; i < count; i++) {
+        argb = palette_get(pal, i);
+        for (y = 0; y < th; y++) {
+            for (x = 0; x < tw; x++) {
+                off = (y * tex_w + i * tw + x) * 4;
+                poke(rgba_buf + off,     (argb >> 16) & 0xFF);
+                poke(rgba_buf + off + 1, (argb >> 8)  & 0xFF);
+                poke(rgba_buf + off + 2,  argb        & 0xFF);
+                poke(rgba_buf + off + 3, (argb >> 24) & 0xFF);
+            }
+        }
+    }
+    palette_free(pal);
+    return image_create_rgba(rgba_buf, tex_w, tex_h, tw, th);
 }
 
 // Mirror the tilemap's solid mask into the PathFinder. Inline 8-line
@@ -357,13 +411,14 @@ void update_mechanics(dt_ms) {
         invuln_ms -= dt_ms;
         if (invuln_ms < 0) { invuln_ms = 0; }
     }
-    // Decay the damage-flash timer. When it hits zero we re-upload
-    // the normal palette so sprites return to their painted look.
+    // Decay the damage-flash timer. When it hits zero the next
+    // frame's sprite draws revert from image_draw_size_tinted
+    // (WHITE) back to plain image_draw_size — no GPU upload, just
+    // a code-path swap that smart-bind handles transparently.
     if (flash_ms > 0) {
         flash_ms -= dt_ms;
         if (flash_ms <= 0) {
             flash_ms = 0;
-            palette_gpu_update(pal_gpu, pal_normal);
         }
     }
     // The double guard above (invuln_ms > 0 then recompute) stays
@@ -381,12 +436,13 @@ void update_mechanics(dt_ms) {
             } else {
                 invuln_ms = 600;
             }
-            // Kick off a palette flash. 80 ms on every sprite is
-            // enough to read as "hit" without masking the rat's
-            // subsequent i-frame blink. One GPU upload does all
-            // sprites at once.
+            // Kick off a damage flash. 80 ms is enough to read as
+            // "hit" without masking the rat's subsequent i-frame
+            // blink. Phase 3.5.3 — implemented via per-draw WHITE
+            // tint instead of the previous palette-texture swap;
+            // the visual matches and the runtime drops a GPU
+            // upload from the hot path.
             flash_ms = 80;
-            palette_gpu_update(pal_gpu, pal_flash);
 
             // Spawn 8 red damage particles. ECS state is already in
             // milli-units so positions go in directly.
@@ -450,19 +506,39 @@ main() {
 
     game_init(SCREEN_W, SCREEN_H, "Pathfind (B++ GPU)", 60);
     render_init();
+    init_image();
 
-    _pathfind_init_palette();
+    // Phase 3.5.3 — sprites loaded as a single atlas pack. The
+    // pack file was authored in ModuLab and exported via the
+    // topbar's "Atlas" button (or generated from the legacy
+    // sprite16 sources via tools/sprite16_to_atlas.sh). Every
+    // per-frame draw goes through image_draw_size against this
+    // one MTLTexture — smart-bind batches them into one flush.
+    pf_atlas = image_load("assets/sprites/pathfind.atlas.json");
+    if (pf_atlas != 0) {
+        // Phase 3.5.6 — opt into live hot-reload. While pathfind
+        // is running, edits saved in Modulab to cat_sprite.json /
+        // rat_sprite.json (or the manifest itself) are picked up
+        // within ~0.5 s by stbgame's auto-tick. The Image* stays
+        // valid; only the GPU texture behind it is replaced.
+        image_hot_reload_enable(pf_atlas);
+    }
 
-    // Sprite buffers and GPU textures.
-    spr_rat_data = malloc(SPR_SIZE * SPR_SIZE);
-    spr_cat_data = malloc(SPR_SIZE * SPR_SIZE);
-    load_sprite("assets/sprites/rat_sprite.json", spr_rat_data, SPR_SIZE, SPR_SIZE);
-    load_sprite("assets/sprites/cat_sprite.json", spr_cat_data, SPR_SIZE, SPR_SIZE);
-    // Indexed upload: the sprite texture is 1 byte/pixel (palette
-    // index), and the palette lives in its own GPU texture so
-    // palette swaps (damage flash) re-skin every sprite at once.
-    tex_rat = sprite_create_indexed(spr_rat_data, SPR_SIZE, SPR_SIZE);
-    tex_cat = sprite_create_indexed(spr_cat_data, SPR_SIZE, SPR_SIZE);
+    // Phase 3.5.7 — same live cycle for the level layout. Edits
+    // saved in Bang 9's level editor flow through file_watch_tick
+    // and re-run reload_level on the main thread between frames.
+    file_watch_register("assets/levels/level1.level.json",
+                        fn_ptr(reload_level));
+    if (pf_atlas == 0) {
+        put_err("pathfind: failed to load sprite atlas — exiting\n");
+        return -1;
+    }
+    rat_id = image_named_id(pf_atlas, "rat");
+    cat_id = image_named_id(pf_atlas, "cat");
+    if (rat_id < 0 || cat_id < 0) {
+        put_err("pathfind: atlas pack missing rat/cat sprite — exiting\n");
+        return -1;
+    }
 
     // World infrastructure: ECS for particles, arena for per-frame
     // scratch, tilemap for the arena geometry, A* pathfinder for the cat.
@@ -470,7 +546,19 @@ main() {
     frame_arena = arena_new(4096);
 
     tm = tile_new(GRID_W, GRID_H, TILE_W, TILE_H);
-    tile_solid(tm, T_WALL);
+    // Mark every painted MCU-8 palette index 1..7 as solid for
+    // collision. Index 0 stays empty (walkable). Same loop runs
+    // whether the level was authored by hand or loaded from JSON.
+    auto i;
+    for (i = 1; i <= 7; i++) { tile_solid(tm, i); }
+    // Build a procedural 8-tile atlas where each tile is a
+    // 16x16 solid square of the corresponding MCU-8 colour.
+    // Bound to the tilemap so tile_draw routes every cell
+    // through image_draw_size with the right colour for its
+    // palette index. tile_count auto-derives from the atlas.
+    auto tile_atlas;
+    tile_atlas = build_mcu8_tile_atlas();
+    if (tile_atlas != 0) { tile_bind_image(tm, tile_atlas); }
     build_arena();
 
     pf = path_new(GRID_W, GRID_H);
@@ -482,6 +570,12 @@ main() {
 
     while (game_should_quit() == 0) {
         game_frame_begin();
+        // Per Rule 23 (cartridge minimalism), hot-reload is opt-in:
+        // stbgame no longer auto-ticks the image hot-reload poller.
+        // Pathfind opted in via image_hot_reload_enable above and
+        // file_watch_register for the level — both share the throttle
+        // tick driven from this single per-frame call.
+        image_hot_reload_tick_throttled();
         arena_reset(frame_arena);
 
         if (key_pressed(KEY_ESC)) { break; }
@@ -503,18 +597,33 @@ main() {
         // Draw the wall tilemap (no tileset bound = colored debug rects).
         tile_draw(tm, 0, 0, SCREEN_W, SCREEN_H);
 
-        // Rat sprite. Blinks every 100 ms while the iframe is active by
-        // skipping the draw on odd timer ticks.
+        // Rat sprite. Blinks every 100 ms while the iframe is active
+        // by skipping the draw on odd timer ticks. Damage-flash
+        // window draws with a WHITE tint via the tinted variant.
         if (invuln_ms == 0 || (score_timer_ms / 100) & 1) {
-            sprite_draw_indexed(tex_rat, pal_gpu,
+            if (flash_ms > 0) {
+                image_draw_size_tinted(pf_atlas, rat_id,
+                                       rat_x / 1000, rat_y / 1000,
+                                       SPR_SIZE, SPR_SIZE, WHITE);
+            } else {
+                image_draw_size(pf_atlas, rat_id,
                                 rat_x / 1000, rat_y / 1000,
-                                SPR_SIZE, SPR_SIZE, 1);
+                                SPR_SIZE, SPR_SIZE);
+            }
         }
 
-        // Cat sprite.
-        sprite_draw_indexed(tex_cat, pal_gpu,
+        // Cat sprite. Same flash convention — both sprites flash
+        // together on rat-hit, matching the original palette-swap
+        // mechanic's "every sprite turns white" behaviour.
+        if (flash_ms > 0) {
+            image_draw_size_tinted(pf_atlas, cat_id,
+                                   cat_x / 1000, cat_y / 1000,
+                                   SPR_SIZE, SPR_SIZE, WHITE);
+        } else {
+            image_draw_size(pf_atlas, cat_id,
                             cat_x / 1000, cat_y / 1000,
-                            SPR_SIZE, SPR_SIZE, 1);
+                            SPR_SIZE, SPR_SIZE);
+        }
 
         // Particles.
         update_particles(dt_ms);
@@ -537,10 +646,7 @@ main() {
     }
 
     arena_free(frame_arena);
-    free(spr_rat_data);
-    free(spr_cat_data);
-    palette_free(pal_normal);
-    palette_free(pal_flash);
+    image_free(pf_atlas);
     free(path_buf);
     path_free(pf);
     tile_free(tm);

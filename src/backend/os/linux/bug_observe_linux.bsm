@@ -14,10 +14,49 @@ const SIGSEGV = 11;
 const SIGBUS  = 7;
 const SIGABRT = 6;
 
+// Candidate paths searched in order during _gs_resolve. Distros
+// agree on /usr/bin/gdbserver as the canonical location (Debian /
+// Ubuntu / Fedora / Arch / Alpine all ship it there when the
+// `gdbserver` package is installed). /usr/local/bin covers
+// source-built or admin-overlaid installs. A non-standard install
+// is reachable via the `BUG_GDBSERVER` env var.
+static auto _gs_paths;
+static auto _gs_path_count;
+
 init_observe() {
     _gs_port = 0;
     _gs_pid = 0;
+
+    _gs_paths = buf_word(4);
+    _gs_path_count = 0;
+    _gs_paths[_gs_path_count] = "/usr/bin/gdbserver"; _gs_path_count++;
+    _gs_paths[_gs_path_count] = "/usr/local/bin/gdbserver"; _gs_path_count++;
+
     init_gdb(1);
+    return 0;
+}
+
+// Same shape as _ds_resolve in bug_observe_macos.bsm — returns the
+// path to gdbserver or 0 if none of the well-known locations
+// yields a readable file. The caller does NOT free the returned
+// pointer.
+static _gs_exists(path) {
+    auto fd;
+    fd = sys_open(path, 0);
+    if (fd >= 0) { sys_close(fd); return 1; }
+    return 0;
+}
+
+static _gs_resolve()@io {
+    auto override, i, p;
+    override = getenv("BUG_GDBSERVER");
+    if (override != 0) {
+        if (_gs_exists(override)) { return override; }
+    }
+    for (i = 0; i < _gs_path_count; i++) {
+        p = _gs_paths[i];
+        if (_gs_exists(p)) { return p; }
+    }
     return 0;
 }
 
@@ -47,9 +86,25 @@ _spawn_gdbserver(target_path, start_idx, argc) {
     auto pid, argv, host_port, plen, i, cnt;
     auto gs_path, p;
 
-    gs_path = malloc(32);
-    p = "/usr/bin/gdbserver";
-    str_cpy(gs_path, p);
+    gs_path = _gs_resolve();
+    if (gs_path == 0) {
+        out_str("bug: error: gdbserver not found"); out_nl();
+        out_str("  searched:"); out_nl();
+        for (i = 0; i < _gs_path_count; i++) {
+            out_str("    "); out_str(_gs_paths[i]); out_nl();
+        }
+        if (getenv("BUG_GDBSERVER") != 0) {
+            out_str("  BUG_GDBSERVER override (also missing): ");
+            out_str(getenv("BUG_GDBSERVER")); out_nl();
+        }
+        out_str("  hints:"); out_nl();
+        out_str("    - Debian/Ubuntu: apt install gdbserver"); out_nl();
+        out_str("    - Fedora: dnf install gdb-gdbserver"); out_nl();
+        out_str("    - Arch: pacman -S gdb"); out_nl();
+        out_str("    - Alpine: apk add gdb"); out_nl();
+        out_str("    - or set BUG_GDBSERVER=/path/to/gdbserver"); out_nl();
+        return -1;
+    }
 
     // Pick ephemeral port.
     pid = sys_fork();

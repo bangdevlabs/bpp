@@ -553,9 +553,35 @@ static auto _gpu_atlas_w, _gpu_atlas_h;
 // Per-frame state.
 static auto _gpu_drawable, _gpu_cmdbuf, _gpu_enc;
 
+// Phase 3.2 batching — currently-bound fragment textures at slot 0
+// (sprite / font / atlas) and slot 1 (palette). The bind helpers
+// skip the flush + setFragmentTexture pair when the requested
+// texture is already current, so a stretch of `atlas_draw` calls
+// against a single atlas accumulate vertices in the shared batch
+// buffer and present as a single draw call instead of one per
+// sprite. Any state-change site (frame begin, pipeline switch,
+// real texture swap) updates the trackers itself.
+static auto _gpu_cur_slot0_tex;
+static auto _gpu_cur_slot1_tex;
+
 // Clear color (0.0 to 1.0 per component).
 static auto _gpu_clear_r: float, _gpu_clear_g: float;
 static auto _gpu_clear_b: float, _gpu_clear_a: float;
+
+// Phase 2.3 GPU timing: opt-in non-blocking measurement using
+// MTLCommandBuffer's GPUStartTime / GPUEndTime properties. Both
+// return CFTimeInterval (double seconds), recovered through the
+// existing `float_ret()` builtin which reads d0 saved by every
+// FFI extern call. Reads happen on the PREVIOUS frame's command
+// buffer at present time of the current frame — by then the
+// previous frame is overwhelmingly done (a 60 FPS loop has 16.6
+// ms between presents; typical GPU frames complete in <5 ms).
+// When the previous buffer hasn't completed yet, the property
+// reads as 0 and `_gpu_last_us` keeps its last good value. No
+// `waitUntilCompleted`, no CPU/GPU serialisation, no blocking.
+static auto _gpu_timing_enabled;
+static auto _gpu_last_us;
+static auto _gpu_prev_cmdbuf;
 
 // Build the Metal shader source string at runtime.
 // Vertex format: 16 bytes per vertex (x,y,r,g,b,a,u,v,use_tex,pad).
@@ -583,11 +609,15 @@ static _gpu_build_shader() {
     s = strbuf_cat(s, "  o.uv = float2(float(ru)/65535.0, float(rv)/65535.0);\n");
     s = strbuf_cat(s, "  o.use_tex = float(vd[b+12])/255.0;\n");
     s = strbuf_cat(s, "  return o; }\n");
-    // Two samplers: `smp` (linear) for RGBA sprites and font
-    // glyphs where filtering is fine; `smp_n` (nearest) for
-    // palette-indexed sprites where filtering would corrupt
-    // indices and for palette lookup where the texture is a
-    // 1-row LUT (exact pixel centers, never blended).
+    // Two samplers in scope: `smp` (linear) is reserved for font
+    // glyphs whose alpha mask benefits from sub-pixel smoothing;
+    // `smp_n` (nearest) is the default for everything else.
+    // Pixel-art atlases (Kenney sheets, Modulab sprites, raycaster
+    // wall textures) must sample with nearest neighbour or the
+    // bilinear filter blends the edge texel of one tile with its
+    // neighbour, producing visible black/dark grid lines around
+    // each sprite. Palette-indexed sprites and the palette LUT
+    // also use nearest because filtering an index is meaningless.
     s = strbuf_cat(s, "constexpr sampler smp(filter::linear);\n");
     s = strbuf_cat(s, "constexpr sampler smp_n(filter::nearest);\n");
     s = strbuf_cat(s, "fragment float4 frag(V in [[stage_in]],\n");
@@ -614,7 +644,7 @@ static _gpu_build_shader() {
     // grey), and a coloured tint shifts the sample without baking
     // an extra texture (damage flashes, team colours, etc.).
     s = strbuf_cat(s, "  if (in.use_tex > 0.25) {\n");
-    s = strbuf_cat(s, "    float4 t = tex.sample(smp, in.uv);\n");
+    s = strbuf_cat(s, "    float4 t = tex.sample(smp_n, in.uv);\n");
     s = strbuf_cat(s, "    if (t.a < 0.01) discard_fragment();\n");
     s = strbuf_cat(s, "    return float4(t.rgb * in.color.rgb, t.a * in.color.a); }\n");
     // Marker 0 = solid fill (color from vertex only).
@@ -647,6 +677,25 @@ _gpu_nsstr(cstr) {
 // null-terminated C string (caller frees), or 0 if the user
 // cancelled. The alert functions return void except _confirm
 // which returns 1 for OK, 0 for Cancel.
+//
+// Cosmetic warning, NOT a B++ bug. The first time NSOpenPanel
+// is instantiated, the Cocoa runtime prints:
+//
+//   The class 'NSOpenPanel' overrides the method identifier.
+//   This method is implemented by class 'NSWindow'.
+//
+// This is an Apple-internal noise message from AppKit about its
+// own class hierarchy: NSOpenPanel inherits from NSPanel/NSWindow
+// and both implement -identifier (the
+// NSUserInterfaceItemIdentification protocol method). Apple's
+// runtime detects the duplicate vtable entry and prints once per
+// process. We do not subclass NSWindow, register classes via
+// objc_allocateClassPair, or override -identifier; the message is
+// purely about Apple's own framework. Reproducible from any
+// Swift/ObjC test app that opens an NSOpenPanel. Has been present
+// across multiple macOS releases. No action required on our side —
+// silencing it would only paper over a future case where we
+// genuinely DO override a system selector.
 
 // Copy the UTF-8 bytes out of an NSString into a fresh malloc'd
 // buffer. Needed because the NSString goes away on the next
@@ -786,6 +835,98 @@ void _stb_alert_error(title, message)@io {
     objc_msgSend(alert, sel_registerName("runModal"));
 }
 
+// Compile a Metal source string and build a render pipeline state
+// referencing the named vertex+fragment functions. Returns the
+// MTLRenderPipelineState handle, or 0 if any step fails (compile,
+// missing function, or pipeline construction). On any failure the
+// Metal compiler error is printed to stderr; recovery is the
+// caller's responsibility — `_stb_gpu_init` aborts the process so
+// the default pipeline is non-negotiable, while
+// `_stb_gpu_pipeline_load` returns 0 so user cartridges can decide
+// what to do (fall back to a built-in pass, surface a message,
+// disable an effect, etc.).
+//
+// Color attachment + alpha blending are pinned to the same shape
+// the default stbrender pipeline uses (format 80 = BGRA8Unorm,
+// source-alpha over destination). Custom pipelines built through
+// this helper can therefore render to the same drawable without
+// the caller reconfiguring the encoder.
+static _gpu_compile_pipeline(ns_src, vert_name, frag_name) {
+    auto err_buf, lib, vert_fn, frag_fn, pdesc, ca, pipeline;
+
+    err_buf = malloc(8);
+    write_u64(err_buf, 0, 0);
+
+    lib = call(_gpu_msg, _gpu_device,
+               sel_registerName("newLibraryWithSource:options:error:"),
+               ns_src, 0, err_buf);
+    if (lib == 0) {
+        auto ns_err, ns_desc, cstr;
+        ns_err = read_u64(err_buf, 0);
+        if (ns_err != 0) {
+            ns_desc = objc_msgSend(ns_err, sel_registerName("localizedDescription"));
+            cstr = objc_msgSend(ns_desc, sel_registerName("UTF8String"));
+            sys_write(2, cstr, str_len(cstr));
+            putchar_err(10);
+        }
+        sys_write(2, "gpu: shader compile failed\n", 27);
+        free(err_buf);
+        return 0;
+    }
+
+    vert_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"),
+                           _gpu_nsstr(vert_name));
+    if (vert_fn == 0) {
+        sys_write(2, "gpu: missing vertex function: ", 30);
+        sys_write(2, vert_name, str_len(vert_name));
+        putchar_err(10);
+        free(err_buf);
+        return 0;
+    }
+    frag_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"),
+                           _gpu_nsstr(frag_name));
+    if (frag_fn == 0) {
+        sys_write(2, "gpu: missing fragment function: ", 32);
+        sys_write(2, frag_name, str_len(frag_name));
+        putchar_err(10);
+        free(err_buf);
+        return 0;
+    }
+
+    pdesc = objc_msgSend(objc_getClass("MTLRenderPipelineDescriptor"),
+                         sel_registerName("alloc"));
+    pdesc = objc_msgSend(pdesc, sel_registerName("init"));
+    objc_msgSend(pdesc, sel_registerName("setVertexFunction:"), vert_fn);
+    objc_msgSend(pdesc, sel_registerName("setFragmentFunction:"), frag_fn);
+
+    ca = objc_msgSend(pdesc, sel_registerName("colorAttachments"));
+    ca = objc_msgSend(ca, sel_registerName("objectAtIndexedSubscript:"), 0);
+    objc_msgSend(ca, sel_registerName("setPixelFormat:"), 80);
+    objc_msgSend(ca, sel_registerName("setBlendingEnabled:"), 1);
+    objc_msgSend(ca, sel_registerName("setSourceRGBBlendFactor:"), 4);
+    objc_msgSend(ca, sel_registerName("setDestinationRGBBlendFactor:"), 5);
+    objc_msgSend(ca, sel_registerName("setSourceAlphaBlendFactor:"), 1);
+    objc_msgSend(ca, sel_registerName("setDestinationAlphaBlendFactor:"), 5);
+
+    write_u64(err_buf, 0, 0);
+    pipeline = call(_gpu_msg, _gpu_device,
+                    sel_registerName("newRenderPipelineStateWithDescriptor:error:"),
+                    pdesc, err_buf);
+    if (pipeline == 0) {
+        auto ns_err2, ns_desc2, cstr2;
+        ns_err2 = read_u64(err_buf, 0);
+        if (ns_err2 != 0) {
+            ns_desc2 = objc_msgSend(ns_err2, sel_registerName("localizedDescription"));
+            cstr2 = objc_msgSend(ns_desc2, sel_registerName("UTF8String"));
+            sys_write(2, cstr2, str_len(cstr2));
+            putchar_err(10);
+        }
+        sys_write(2, "gpu: pipeline state failed\n", 27);
+    }
+    free(err_buf);
+    return pipeline;
+}
+
 // Initialize the Metal rendering pipeline.
 // Creates device, command queue, CAMetalLayer, shader pipeline, vertex buffer.
 // Must be called after game_init() so _plt_win exists.
@@ -827,68 +968,15 @@ void _stb_gpu_init(w, h) {
     objc_msgSend(view, sel_registerName("setWantsLayer:"), 1);
     objc_msgSend(view, sel_registerName("setLayer:"), _gpu_layer);
 
-    // Compile the shader and build the render pipeline.
-    auto src, ns_src, err_buf, lib, vert_fn, frag_fn, pdesc, ca;
+    // Compile the default shader and build the render pipeline via
+    // the shared `_gpu_compile_pipeline` helper. Failure here is
+    // fatal — the default pipeline is required for every game.
+    auto src, ns_src;
     src = _gpu_build_shader();
     ns_src = _gpu_nsstr(src);
-    err_buf = malloc(8);
-    write_u64(err_buf, 0, 0);
-
-    // [device newLibraryWithSource:options:error:] — 5 args via call().
-    lib = call(_gpu_msg, _gpu_device,
-               sel_registerName("newLibraryWithSource:options:error:"),
-               ns_src, 0, err_buf);
-
-    if (lib == 0) {
-        // Shader compilation failed. Print error and abort.
-        auto ns_err, ns_desc, cstr;
-        ns_err = read_u64(err_buf, 0);
-        if (ns_err != 0) {
-            ns_desc = objc_msgSend(ns_err, sel_registerName("localizedDescription"));
-            cstr = objc_msgSend(ns_desc, sel_registerName("UTF8String"));
-            sys_write(2, cstr, str_len(cstr));
-            putchar_err(10);
-        }
-        sys_write(2, "gpu: shader compile failed\n", 27);
-        sys_exit(1);
-    }
-
-    vert_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"), _gpu_nsstr("vert"));
-    frag_fn = objc_msgSend(lib, sel_registerName("newFunctionWithName:"), _gpu_nsstr("frag"));
-    if (vert_fn == 0) { sys_write(2, "gpu: vert_fn nil\n", 17); sys_exit(1); }
-    if (frag_fn == 0) { sys_write(2, "gpu: frag_fn nil\n", 17); sys_exit(1); }
-
-    // Build the render pipeline descriptor.
-    pdesc = objc_msgSend(objc_getClass("MTLRenderPipelineDescriptor"), sel_registerName("alloc"));
-    pdesc = objc_msgSend(pdesc, sel_registerName("init"));
-    objc_msgSend(pdesc, sel_registerName("setVertexFunction:"), vert_fn);
-    objc_msgSend(pdesc, sel_registerName("setFragmentFunction:"), frag_fn);
-
-    ca = objc_msgSend(pdesc, sel_registerName("colorAttachments"));
-    ca = objc_msgSend(ca, sel_registerName("objectAtIndexedSubscript:"), 0);
-    objc_msgSend(ca, sel_registerName("setPixelFormat:"), 80);
-    objc_msgSend(ca, sel_registerName("setBlendingEnabled:"), 1);
-    objc_msgSend(ca, sel_registerName("setSourceRGBBlendFactor:"), 4);
-    objc_msgSend(ca, sel_registerName("setDestinationRGBBlendFactor:"), 5);
-    objc_msgSend(ca, sel_registerName("setSourceAlphaBlendFactor:"), 1);
-    objc_msgSend(ca, sel_registerName("setDestinationAlphaBlendFactor:"), 5);
-
-    // [device newRenderPipelineStateWithDescriptor:error:] — 4 args via call().
-    write_u64(err_buf, 0, 0);
-    _gpu_pipeline = call(_gpu_msg, _gpu_device,
-                         sel_registerName("newRenderPipelineStateWithDescriptor:error:"),
-                         pdesc, err_buf);
-
+    _gpu_pipeline = _gpu_compile_pipeline(ns_src, "vert", "frag");
     if (_gpu_pipeline == 0) {
-        auto ns_err2, ns_desc2, cstr2;
-        ns_err2 = read_u64(err_buf, 0);
-        if (ns_err2 != 0) {
-            ns_desc2 = objc_msgSend(ns_err2, sel_registerName("localizedDescription"));
-            cstr2 = objc_msgSend(ns_desc2, sel_registerName("UTF8String"));
-            sys_write(2, cstr2, str_len(cstr2));
-            putchar_err(10);
-        }
-        sys_write(2, "gpu: pipeline failed\n", 21);
+        sys_write(2, "gpu: default pipeline init failed\n", 34);
         sys_exit(1);
     }
 
@@ -965,7 +1053,6 @@ void _stb_gpu_init(w, h) {
     free(tex_data);
 
     strbuf_free(src);
-    free(err_buf);
 }
 
 // Store the clear color for the next frame. Components are 0.0 to 1.0.
@@ -1016,6 +1103,11 @@ void _stb_gpu_begin()@gpu {
         call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
              _gpu_font_tex, 0);
     }
+    // Phase 3.2 batching trackers — frame begin always rebinds
+    // slot 0 to the font texture; slot 1 has no per-frame default
+    // (palette is bound on demand by stbpal callers).
+    _gpu_cur_slot0_tex = _gpu_font_tex;
+    _gpu_cur_slot1_tex = 0;
 
     // Reset vertex counter for this frame.
     _gpu_vert_count = 0;
@@ -1227,11 +1319,15 @@ void _stb_gpu_update_palette_texture(tex, argb_data, count)@gpu {
 // Bind the palette texture to fragment slot 1 so the indexed
 // branch in the Metal shader can look up colors from it. Flushes
 // the current vertex batch first — palette binding is a state
-// change that applies to subsequent vertices only.
+// change that applies to subsequent vertices only. Phase 3.2:
+// smart-bind skips the flush when the same palette is already
+// resident.
 void _stb_gpu_bind_palette(tex)@gpu {
+    if (tex == _gpu_cur_slot1_tex) { return; }
     _stb_gpu_flush();
     call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
          tex, 1);
+    _gpu_cur_slot1_tex = tex;
 }
 
 // Draw a palette-indexed sprite. The sprite texture (R8) + the
@@ -1252,7 +1348,6 @@ void _stb_gpu_sprite_indexed(sprite_tex, pal_tex, x, y, w, h, tw, th)@gpu {
     _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     192);
     _stb_gpu_vertex(x1, y1, 255, 255, 255, 255, 65535, 65535, 192);
     _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 192);
-    _stb_gpu_bind_font();
 }
 
 // Flush the current vertex batch mid-frame (for texture switches).
@@ -1273,15 +1368,23 @@ void _stb_gpu_flush()@gpu {
     }
 }
 
-// Bind a different texture for subsequent draw calls.
-// Flushes the current batch first so previous vertices use the old texture.
+// Bind a different texture for subsequent draw calls. Flushes the
+// current batch first so previous vertices use the old texture.
+// Phase 3.2 batching: when the requested texture is already bound
+// the call returns immediately without flushing — repeated draws
+// to the same atlas/spritesheet accumulate in one batch.
 void _stb_gpu_bind_texture(tex)@gpu {
+    if (tex == _gpu_cur_slot0_tex) { return; }
     _stb_gpu_flush();
     call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
          tex, 0);
+    _gpu_cur_slot0_tex = tex;
 }
 
-// Re-bind the font atlas texture (call after sprite rendering).
+// Re-bind the font atlas texture. Call from render_text before
+// queuing glyph quads; sprite primitives no longer auto-rebind
+// font on exit (that defeated batching across consecutive sprite
+// draws). Smart-bind: no flush if font is already current.
 void _stb_gpu_bind_font()@gpu {
     _stb_gpu_bind_texture(_gpu_font_tex);
 }
@@ -1300,7 +1403,6 @@ void _stb_gpu_sprite(tex, x, y, w, h, tw, th)@gpu {
     _stb_gpu_vertex(x1, y,  255, 255, 255, 255, 65535, 0,     128);
     _stb_gpu_vertex(x1, y1, 255, 255, 255, 255, 65535, 65535, 128);
     _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, 0,     65535, 128);
-    _stb_gpu_bind_font();
 }
 
 // Draw a sub-rectangle of a texture. Same quad shape as _stb_gpu_sprite
@@ -1317,7 +1419,6 @@ void _stb_gpu_sprite_uv(tex, x, y, w, h, u0, v0, u1, v1)@gpu {
     _stb_gpu_vertex(x1, y,  255, 255, 255, 255, u1, v0, 128);
     _stb_gpu_vertex(x1, y1, 255, 255, 255, 255, u1, v1, 128);
     _stb_gpu_vertex(x,  y1, 255, 255, 255, 255, u0, v1, 128);
-    _stb_gpu_bind_font();
 }
 
 // Draw a sub-rectangle of a texture with a per-vertex tint. Same quad
@@ -1336,10 +1437,234 @@ void _stb_gpu_sprite_uv_tint(tex, x, y, w, h, u0, v0, u1, v1, r, g, b, a)@gpu {
     _stb_gpu_vertex(x1, y,  r, g, b, a, u1, v0, 128);
     _stb_gpu_vertex(x1, y1, r, g, b, a, u1, v1, 128);
     _stb_gpu_vertex(x,  y1, r, g, b, a, u0, v1, 128);
-    _stb_gpu_bind_font();
 }
 
-// Flush the GPU vertex batch and present the drawable. Only GPU work, no timing.
+// ── Custom user pipelines (Phase 2.1, GPU pipeline roadmap) ─────
+//
+// Lets B++ programs load .metal shader source at runtime, build a
+// custom MTLRenderPipelineState that draws against the same drawable
+// and color attachment as the default stbrender pipeline, and use
+// it during a normal frame. The default pipeline (`_gpu_pipeline`)
+// stays resident — `_stb_gpu_pipeline_use_default()` rebinds it +
+// the screen uniform + the font texture so downstream `render_*`
+// calls keep working without the caller having to reset state.
+//
+// Usage shape:
+//   pipe = _stb_gpu_pipeline_load(src_cstr, "vert", "frag");
+//   _stb_gpu_begin();
+//   _stb_gpu_pipeline_use(pipe);
+//   _stb_gpu_uniform_set_frag(0, time_data, 16);
+//   _stb_gpu_draw_full();              // 3-vertex fullscreen triangle
+//   _stb_gpu_pipeline_use_default();   // resume default render_* calls
+//   ...
+//   _stb_gpu_present();
+//
+// Compile failures are treated as fatal at the cartridge level
+// today (caller checks the returned handle and aborts). Future
+// compile-time validation of bundled shaders is reserved under
+// E250 / E251 in `docs/warning_error_log.md`.
+
+// Compile a Metal source string and build a pipeline state that
+// references the named vertex + fragment functions. Returns the
+// MTLRenderPipelineState handle, or 0 on any failure (compile,
+// missing function, pipeline construction). Diagnostic text is
+// written to stderr by the shared helper on the failure path.
+// `source` must be a NUL-terminated UTF-8 buffer (file_read_all
+// already terminates). Left un-annotated for the same reason as
+// `_stb_gpu_init` — the inferred effect is SOLO due to stderr IO
+// on failure.
+_stb_gpu_pipeline_load(source, vert_name, frag_name) {
+    auto ns_src;
+    ns_src = _gpu_nsstr(source);
+    return _gpu_compile_pipeline(ns_src, vert_name, frag_name);
+}
+
+// Bind a custom pipeline for subsequent draw calls. Flushes any
+// pending vertex batch first so previous work uses the default
+// pipeline. After this call, draws go through `pipeline` until
+// `_stb_gpu_pipeline_use_default()` restores the stbrender path.
+void _stb_gpu_pipeline_use(pipeline)@gpu {
+    _stb_gpu_flush();
+    objc_msgSend(_gpu_enc, sel_registerName("setRenderPipelineState:"), pipeline);
+}
+
+// Restore the default stbrender pipeline + re-bind the screen
+// uniform buffer + font texture so following render_* calls find
+// the encoder in the same shape `_stb_gpu_begin` left it. Call
+// this after a stretch of custom-pipeline draws if you want to
+// resume using the standard primitives in the same frame.
+void _stb_gpu_pipeline_use_default()@gpu {
+    objc_msgSend(_gpu_enc, sel_registerName("setRenderPipelineState:"), _gpu_pipeline);
+    call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
+         _gpu_screen_buf, 0, 1);
+    if (_gpu_font_tex != 0) {
+        call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
+             _gpu_font_tex, 0);
+    }
+    // Phase 3.2: refresh slot trackers so subsequent atlas_draw /
+    // text-render binds compare against the right baseline. The
+    // explicit setFragmentTexture above bypasses _stb_gpu_bind_texture
+    // (and its tracker update) for performance — there's no batch to
+    // flush at a pipeline transition — so we set the tracker by hand.
+    _gpu_cur_slot0_tex = _gpu_font_tex;
+    _gpu_cur_slot1_tex = 0;
+}
+
+// Inline fragment-stage uniform write. Binds `size` bytes from
+// `data` into fragment buffer slot `slot`. Suitable for small
+// uniforms — Metal caps the inline path at 4 KB. For larger
+// payloads, allocate a persistent MTLBuffer and bind it via
+// setFragmentBuffer.
+void _stb_gpu_uniform_set_frag(slot, data, size)@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentBytes:length:atIndex:"),
+         data, size, slot);
+}
+
+// Inline vertex-stage uniform write. Same shape as the fragment
+// variant but binds into the vertex stage. Slots 0 and 1 are
+// reserved by the default stbrender pipeline (vertex batch +
+// screen uniform); custom pipelines that coexist with default
+// draws should claim slot 2 or higher.
+void _stb_gpu_uniform_set_vert(slot, data, size)@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBytes:length:atIndex:"),
+         data, size, slot);
+}
+
+// Issue a 3-vertex draw call with no vertex buffer. The bound
+// pipeline's vertex stage is expected to synthesise positions from
+// the [[vertex_id]] attribute (0, 1, 2). With a fullscreen-triangle
+// vertex stage, this draws a single oversized triangle that fully
+// covers the screen — the standard way to invoke a fullscreen
+// fragment shader.
+void _stb_gpu_draw_full()@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
+         3, 0, 3);
+}
+
+// ── Custom pipeline texture + sampler binding (Phase 2.2) ─────
+//
+// Companions to the Phase 2.1 pipeline-management primitives. A
+// custom pipeline that samples textures needs two things bound on
+// the encoder: the texture itself (via setFragmentTexture or
+// setVertexTexture) and a sampler describing how the shader reads
+// it (nearest vs linear, clamp vs repeat). Game code typically
+// creates the sampler once at init time, then binds texture +
+// sampler before each draw that needs them.
+
+// Create a Metal sampler state with the requested filter mode and
+// clamp-to-edge addressing on both axes. `filter` selects:
+//   0 = MTLSamplerMinMagFilterNearest (pixel art — no smoothing
+//       between texels, the canonical pixel-art look)
+//   1 = MTLSamplerMinMagFilterLinear  (bilinear — smooth
+//       interpolation, good for scaled photo-realistic art)
+// Returns the MTLSamplerState handle. Metal samplers are
+// immutable once built; cache the result rather than re-creating
+// every frame.
+_stb_gpu_sampler_create(filter)@gpu {
+    auto desc, sampler;
+    desc = objc_msgSend(objc_getClass("MTLSamplerDescriptor"),
+                        sel_registerName("alloc"));
+    desc = objc_msgSend(desc, sel_registerName("init"));
+    objc_msgSend(desc, sel_registerName("setMinFilter:"), filter);
+    objc_msgSend(desc, sel_registerName("setMagFilter:"), filter);
+    // Clamp-to-edge (MTLSamplerAddressModeClampToEdge = 0): UVs
+    // outside [0, 1] sample the nearest edge texel. Standard
+    // pixel-art convention — repeat or mirror would tile the
+    // texture, which fullscreen passes do not want.
+    objc_msgSend(desc, sel_registerName("setSAddressMode:"), 0);
+    objc_msgSend(desc, sel_registerName("setTAddressMode:"), 0);
+    sampler = objc_msgSend(_gpu_device,
+                           sel_registerName("newSamplerStateWithDescriptor:"),
+                           desc);
+    return sampler;
+}
+
+// Bind a texture for fragment-shader sampling at the given slot.
+// The custom pipeline's fragment stage reads it as
+// `texture2d<float> tex [[texture(slot)]]`. Slot 0 is the default
+// stbrender font texture in the default pipeline; custom pipelines
+// can reuse slot 0 (it gets rebound by `_stb_gpu_pipeline_use_default`
+// when the caller restores the default path).
+void _stb_gpu_bind_texture_frag(slot, tex)@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentTexture:atIndex:"),
+         tex, slot);
+    // Phase 3.2: keep the default-pipeline trackers in sync so a
+    // later atlas_draw / text_render after the user restores the
+    // default pipeline doesn't skip a real-needed rebind.
+    if (slot == 0) { _gpu_cur_slot0_tex = tex; }
+    if (slot == 1) { _gpu_cur_slot1_tex = tex; }
+}
+
+// Bind a texture for vertex-shader sampling at the given slot.
+// Unusual for 2D games — vertex texture access is mostly for
+// vertex pulling, displacement maps, or per-instance data sourced
+// from a texture. Provided for completeness so cartridges can opt
+// in without round-tripping through the platform layer themselves.
+void _stb_gpu_bind_texture_vert(slot, tex)@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("setVertexTexture:atIndex:"),
+         tex, slot);
+}
+
+// Bind a sampler for fragment-shader use at the given slot. Pair
+// with `_stb_gpu_bind_texture_frag` — a fragment shader that
+// reads `tex.sample(smp, uv)` needs both bound at matching slots.
+// Skipping this bind is fine when the shader declares its sampler
+// as `constexpr sampler smp(filter::nearest)` inline; CPU-side
+// binding is only required when the filter mode needs to vary at
+// runtime or when the same shader has to render with different
+// filtering depending on game state.
+void _stb_gpu_bind_sampler_frag(slot, sampler)@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("setFragmentSamplerState:atIndex:"),
+         sampler, slot);
+}
+
+// ── GPU timing (Phase 2.3, sidequest #6) ─────────────────────
+//
+// Opt-in measurement of GPU work each frame, read straight off
+// MTLCommandBuffer's own timeline via `GPUStartTime` /
+// `GPUEndTime`. Both return CFTimeInterval (double seconds); B++
+// recovers the value through the `float_ret()` builtin which
+// reads d0 from the scratch slot the FFI emit always populates
+// after a `bl objc_msgSend`. Disabled by default — games that
+// want a "gpu: X ms" HUD readout or stderr profile entry call
+// `_stb_gpu_timing_enable()` once at init.
+//
+// One-frame latency by design: we read the times off the PREVIOUS
+// frame's command buffer at present time of the current frame.
+// By then the previous frame's GPU work is overwhelmingly done
+// (16.6 ms between presents at 60 FPS; typical GPU frames complete
+// in well under 5 ms). When the previous buffer hasn't completed,
+// GPUStartTime / GPUEndTime read as 0 and `_gpu_last_us` keeps
+// its last good value. Crucially: no `waitUntilCompleted`, no
+// CPU/GPU serialisation, no blocking — the present path stays
+// fire-and-forget for the GPU pipeline.
+
+// Enable GPU timing for subsequent frames. Idempotent — safe to
+// call repeatedly. The next call to `_stb_gpu_present` records
+// the previous frame's GPU duration into `_gpu_last_us`.
+void _stb_gpu_timing_enable()@gpu {
+    _gpu_timing_enabled = 1;
+}
+
+// Disable GPU timing. Subsequent presents skip the GPUStartTime /
+// GPUEndTime reads. `_gpu_last_us` keeps its final measured value
+// — handy for a "freeze the readout" UX pattern.
+void _stb_gpu_timing_disable()@gpu {
+    _gpu_timing_enabled = 0;
+}
+
+// Return the most recent measured GPU frame time in microseconds.
+// Returns 0 before the first timed frame is read (e.g. before
+// timing was ever enabled, on the very first frame after enable,
+// or while the previous frame is still in flight).
+_stb_gpu_last_us()@base {
+    return _gpu_last_us;
+}
+
+// Flush the GPU vertex batch and present the drawable. When GPU
+// timing is enabled, also reads GPUStartTime / GPUEndTime from
+// the previous frame's command buffer (which is overwhelmingly
+// complete by now) and stores the duration in `_gpu_last_us`.
 void _stb_gpu_present()@gpu {
     if (_gpu_vert_count > 0) {
         auto byte_off;
@@ -1353,4 +1678,24 @@ void _stb_gpu_present()@gpu {
     objc_msgSend(_gpu_enc, sel_registerName("endEncoding"));
     objc_msgSend(_gpu_cmdbuf, sel_registerName("presentDrawable:"), _gpu_drawable);
     objc_msgSend(_gpu_cmdbuf, sel_registerName("commit"));
+
+    // Phase 2.3 — read PREVIOUS frame's GPU timeline, not current.
+    // GPUStartTime / GPUEndTime read as 0 before the buffer has
+    // completed; gating on `_gpu_prev_cmdbuf != 0` skips the
+    // very first frame (no prior buffer to read), and gating the
+    // store on `dur_us > 0` skips frames where the previous one
+    // isn't done yet (rare at 60 FPS, but possible under heavy
+    // load) so the readout sticks at its last good value.
+    if (_gpu_timing_enabled) {
+        if (_gpu_prev_cmdbuf != 0) {
+            auto t_start: float, t_end: float, dur_us: word;
+            objc_msgSend(_gpu_prev_cmdbuf, sel_registerName("GPUStartTime"));
+            t_start = float_ret();
+            objc_msgSend(_gpu_prev_cmdbuf, sel_registerName("GPUEndTime"));
+            t_end = float_ret();
+            dur_us = (t_end - t_start) * 1000000.0;
+            if (dur_us > 0) { _gpu_last_us = dur_us; }
+        }
+        _gpu_prev_cmdbuf = _gpu_cmdbuf;
+    }
 }

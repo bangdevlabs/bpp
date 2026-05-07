@@ -91,6 +91,38 @@ static auto _prim_hint;
 // when called from if/while/for. Used to warn about auto inside blocks.
 static auto _block_depth;
 
+// Recognise FFI driver modules by filename prefix. Drivers are
+// allowed to silently override the auto-injected `_stb_platform_<os>`
+// platform layer — the convention is the `drv_` prefix on the
+// module's basename (drv_sdl.bsm, drv_raylib.bsm, ...). Returns 1
+// when `mod_idx` resolves to a path whose basename starts with
+// `drv_`, 0 otherwise. Falls through to 0 on any lookup failure so
+// non-driver duplicates still trip E221 normally.
+extrn diag_file_names;
+extrn fname_buf;
+static _is_driver_module(mod_idx)@base {
+    auto packed, off, len, i, last_slash;
+    if (mod_idx <= 0) { return 0; }
+    if (mod_idx >= arr_len(diag_file_names)) { return 0; }
+    packed = arr_get(diag_file_names, mod_idx);
+    off = unpack_s(packed);
+    len = unpack_l(packed);
+    if (len < 4) { return 0; }   // "drv_" already 4 bytes
+    // Walk back to the last slash to find the basename. Both
+    // absolute paths and relative paths are stored verbatim in
+    // fname_buf, so this works for both.
+    last_slash = 0;
+    for (i = 0; i < len; i++) {
+        if (peek(fname_buf + off + i) == 47) { last_slash = i + 1; }
+    }
+    if (last_slash + 4 > len) { return 0; }
+    if (peek(fname_buf + off + last_slash + 0) != 100) { return 0; }   // 'd'
+    if (peek(fname_buf + off + last_slash + 1) != 114) { return 0; }   // 'r'
+    if (peek(fname_buf + off + last_slash + 2) != 118) { return 0; }   // 'v'
+    if (peek(fname_buf + off + last_slash + 3) !=  95) { return 0; }   // '_'
+    return 1;
+}
+
 // ============================================================
 // Initialization
 // ============================================================
@@ -1497,7 +1529,7 @@ static void parse_function(is_stub, is_static, is_void) {
     // signature, not at whatever tok_pos has advanced to by the end.
     *(fn_rec + FN_SRC_TOK) = name_tok;
     // Dedup: check if a function with this name already exists in funcs[].
-    // Three cases produce duplicates, each handled differently:
+    // Four cases produce duplicates, each handled differently:
     //
     // 1. Same-module replacement (forward-declaration pattern):
     //    B++ requires forward declarations for mutually recursive functions.
@@ -1510,9 +1542,19 @@ static void parse_function(is_stub, is_static, is_void) {
     //    (the entry file) is always processed last, so its definitions
     //    win. Always silent.
     //
-    // 3. Cross-module duplicate (suspicious):
+    // 3. FFI driver overrides the platform layer (driver pattern):
+    //    drv_sdl.bsm / drv_raylib.bsm / etc. ship their own
+    //    `_stb_*` implementations that replace the auto-injected
+    //    `_stb_platform_<os>.bsm` ones. The convention is the
+    //    `drv_` filename prefix. The replace-and-win logic below
+    //    silently swaps the platform definition for the driver's,
+    //    and the driver wins because it is parsed after the
+    //    auto-inject. Always silent.
+    //
+    // 4. Cross-module duplicate (suspicious):
     //    Two different non-entry modules both define the same function
-    //    with real bodies. This is likely a bug. Emit W015.
+    //    with real bodies, and neither is a driver. This is likely a
+    //    bug. Emit E221.
     auto _dup_idx, _dup_found;
     _dup_found = 0;
     for (_dup_idx = 0; _dup_idx < func_cnt; _dup_idx++) {
@@ -1527,14 +1569,24 @@ static void parse_function(is_stub, is_static, is_void) {
                 if (_existing_stub == 0) {
                     if (arr_get(func_mods, _dup_idx) != my_mod) {
                         if (my_mod != 0) {
-                            // Case 3: cross-module duplicate, both with
-                            // real bodies, neither is a stub. Suspicious.
-                            diag_error(221);
-                            diag_str("duplicate definition of '");
-                            diag_packed(name_p);
-                            diag_str("' across modules");
-                            diag_newline();
-                            diag_loc(tok_pos);
+                            // Case 3 vs 4: silence the diagnostic
+                            // when the new (replacing) module is an
+                            // FFI driver — drv_sdl.bsm, drv_raylib.bsm,
+                            // any future drv_*. The replace-and-win
+                            // logic below already swaps the platform
+                            // layer's definition for the driver's;
+                            // emitting E221 in that case is just noise.
+                            if (_is_driver_module(my_mod) == 0) {
+                                // Case 4: cross-module duplicate, both
+                                // with real bodies, neither is a stub
+                                // or a driver. Suspicious.
+                                diag_error(221);
+                                diag_str("duplicate definition of '");
+                                diag_packed(name_p);
+                                diag_str("' across modules");
+                                diag_newline();
+                                diag_loc(tok_pos);
+                            }
                         }
                     }
                 }

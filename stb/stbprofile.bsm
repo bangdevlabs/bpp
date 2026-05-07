@@ -193,6 +193,48 @@ void profile_hud_cycle_thread() {
     _profile_hud_thread_mode = next;
 }
 
+// ── GPU timing (Phase 2.3) ───────────────────────────────────
+//
+// Wrappers over the platform layer's opt-in GPU wall-clock
+// measurement. Games that want a "gpu: X ms" overlay or the
+// stderr GPU summary call `profile_gpu_enable()` once at init —
+// typically right after `render_init()` — and read the value
+// later through `profile_gpu_us` / `profile_gpu_ms`. Disable when
+// shipping: the timing path serialises CPU and GPU because
+// `waitUntilCompleted` blocks each frame, costing parallelism
+// for the convenience of an integer readout. Linux fall-through:
+// the platform stubs return 0, so the HUD silently omits the GPU
+// line and the stderr summary skips the section.
+
+// Enable per-frame GPU wall-clock measurement. Idempotent — calling
+// from multiple init paths is harmless.
+void profile_gpu_enable()@gpu {
+    _stb_gpu_timing_enable();
+}
+
+// Disable GPU measurement. Subsequent frames return to the
+// fire-and-forget present path; the last measured value sticks
+// until something resets it.
+void profile_gpu_disable()@gpu {
+    _stb_gpu_timing_disable();
+}
+
+// Last completed frame's GPU time in microseconds. Returns 0
+// before the first timed frame finishes, or on any platform
+// without a real GPU timing implementation (Linux today).
+profile_gpu_us()@base {
+    return _stb_gpu_last_us();
+}
+
+// Last completed frame's GPU time in milliseconds (rounded to
+// the nearest integer). Convenience for HUD display where
+// sub-millisecond detail isn't needed.
+profile_gpu_ms()@base {
+    auto us;
+    us = _stb_gpu_last_us();
+    return (us + 500) / 1000;
+}
+
 // ── HUD ──────────────────────────────────────────────────────
 
 // Draw the recording indicator at (x, y). Renders "REC •" with a
@@ -282,6 +324,20 @@ void profile_hud_draw(x, y, sz, color) @gpu {
     render_number(        x + 12 *  8 * sz,   y + 22 * sz, sz, color, frame_ms_avg);
     render_text("max:",   x + 17 *  8 * sz,   y + 22 * sz, sz, color);
     render_number(        x + 21 *  8 * sz,   y + 22 * sz, sz, color, max_ms);
+
+    // Phase 2.3: GPU readout to the right of "max:". Only renders
+    // when GPU timing has produced a value — leaves the slot empty
+    // on platforms without timing (Linux today) and before the
+    // first timed frame completes. Layout fits at sz=1; at larger
+    // scales the column may run past the HUD's typical 320-wide
+    // viewport, in which case the caller can move the HUD origin.
+    auto gpu_us, gpu_ms_disp;
+    gpu_us = _stb_gpu_last_us();
+    if (gpu_us > 0) {
+        gpu_ms_disp = (gpu_us + 500) / 1000;
+        render_text("gpu:",   x + 24 *  8 * sz,  y + 22 * sz, sz, color);
+        render_number(        x + 28 *  8 * sz,  y + 22 * sz, sz, color, gpu_ms_disp);
+    }
 
     // Tier 2 sparkline. Walks the ring in chronological order
     // (oldest → newest) so a left-to-right read tracks recent frame
@@ -424,4 +480,14 @@ static void _profile_hud_dump() {
         putchar_err('\n');
     }
     put_err("─────────────────────────────────────────────\n");
+    // Phase 2.3: append GPU summary if any frame was timed during
+    // this session. Skipped silently when timing was never enabled
+    // or the platform has no GPU backend (Linux today).
+    auto gpu_us;
+    gpu_us = _stb_gpu_last_us();
+    if (gpu_us > 0) {
+        put_err("GPU (last frame): ");
+        put_err(gpu_us);
+        put_err(" us\n");
+    }
 }

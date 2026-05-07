@@ -6,8 +6,8 @@
 import "stbgame.bsm";
 import "stbrender.bsm";
 import "stbtile.bsm";
+import "stbimage.bsm";   // Phase 3.5.4 — atlases for char sheet + tileset
 import "stbphys.bsm";
-import "stbimage.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
@@ -52,7 +52,13 @@ const TS_FLAG     = 89;    // row 4, col 8: flag/marker
 // ── Character sprite handles ────────────────────────────
 
 // Loaded once by load_characters, frozen for the rest of the run.
-extrn char_sprites;
+// Phase 3.5.4 — atlases for character sheet (Kenney characters
+// tilesheet) and the terrain tileset. One MTLTexture each, all
+// per-frame draws hit the same texture and coalesce via Phase 3.2
+// smart-bind. char_count and `tilemap.tile_count` mirror the
+// atlas's sprite count for backward-compat with id math elsewhere.
+extrn char_atlas;
+extrn tile_atlas;
 extrn char_count;
 
 // ── Colors (HUD only) ───────────────────────────────────
@@ -220,16 +226,13 @@ void draw_player()@gpu {
     sx -= 5;
     sy -= 6;
 
-    if (char_sprites != 0) {
-        tex = char_sprites[CHAR_PLAYER];
-        if (tex != 0) {
-            if (player_alive == 0) {
-                // Dead: flash red by drawing a red rect behind the sprite.
-                render_rect(sx, sy, CHAR_W, CHAR_H, RED);
-            }
-            _stb_gpu_sprite(tex, sx, sy, CHAR_W, CHAR_H, CHAR_W, CHAR_H);
-            return;
+    if (char_atlas != 0) {
+        if (player_alive == 0) {
+            // Dead: flash red by drawing a red rect behind the sprite.
+            render_rect(sx, sy, CHAR_W, CHAR_H, RED);
         }
+        image_draw_size(char_atlas, CHAR_PLAYER, sx, sy, CHAR_W, CHAR_H);
+        return;
     }
 
     // Fallback: colored rectangle if sprite not loaded.
@@ -271,13 +274,23 @@ void draw_hud()@gpu {
 
 // ── Init / Reset ─────────────────────────────────────────
 
-// Load character sprites from the Kenney character sheet.
-// Called once at startup (not on restart).
-void load_characters()@io {
-    char_count = tile_load_set("assets/Tilemap/tilemap-characters_packed.png", CHAR_W, CHAR_H, &char_sprites);
+// Load character sprites from the Kenney character sheet as an
+// Atlas — Phase 3.5.4 atlas pipeline. Single MTLTexture for the
+// entire spritesheet; per-frame draws coalesce via Phase 3.2
+// smart-bind into one drawPrimitives. Called once at startup.
+void load_characters() {
+    // Single-arg image_load auto-discovers the sister .json
+    // (`tilemap-characters_packed.json`) which carries the
+    // tile dimensions for the raw Kenney sheet.
+    char_atlas = image_load("assets/Tilemap/tilemap-characters_packed.png");
+    if (char_atlas != 0) { char_count = image_count(char_atlas); }
 }
 
-void init_game()@io {
+// Un-annotated — body does IO (PNG load) + GPU (atlas upload) +
+// HEAP. IO and GPU are sibling categories in the effect lattice;
+// `@io` alone trips W026 since image_load reaches GPU. Classifier
+// infers SOLO, the right home for a load+init lifecycle entry.
+void init_game() {
     CLR_SKY = rgba(100, 150, 220, 255);
     CLR_COIN = rgba(255, 220, 50, 255);
 
@@ -288,13 +301,18 @@ void init_game()@io {
     tile_solid(tilemap, T_BRICK);
     tile_solid(tilemap, T_PLATFORM);
 
-    // Load Kenney tileset and bind to tilemap.
-    auto ts, ts_count;
-    ts_count = tile_load_set("assets/Tilemap/tilemap_packed.png", 18, 18, &ts);
-    if (ts_count > 0) {
-        tile_bind_set(tilemap, ts, ts_count);
+    // Load Kenney tileset as an Atlas and bind to the tilemap.
+    // Phase 3.5.4 — single MTLTexture for the whole spritesheet;
+    // tile_draw goes through image_draw_size which smart-bind
+    // coalesces into one drawPrimitives per visible chunk.
+    tile_atlas = image_load("assets/Tilemap/tilemap_packed.png");
+    if (tile_atlas != 0) {
+        tile_bind_image(tilemap, tile_atlas);
 
-        // Map game tile types to tileset texture indices.
+        // Map game tile types to atlas sprite ids. Same `remap`
+        // table works whether the tilemap is bound to an atlas
+        // (Phase 3.5.4) or the legacy texture array — id semantics
+        // are identical, only the resolution path differs.
         tile_map_type(tilemap, T_GROUND, TS_GROUND);
         tile_map_type(tilemap, T_DIRT, TS_DIRT);
         tile_map_type(tilemap, T_BRICK, TS_BRICK);

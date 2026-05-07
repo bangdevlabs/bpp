@@ -1,5 +1,202 @@
 # B++ Bootstrap Journal
 
+## 2026-05-06 — Phase 3.5 CLOSED — Asset pipeline + live hot-reload
+
+**bpp = `b505de4a7e141d4889051ad9105251b907f485f8`. Suite = 140/0/12 native + 114/0/38 C.**
+
+The "edit any sprite or level in any tool, see it live in the running
+game without restart" milestone is in. What started as Phase 3.5.5
+(image cartridge merge) discovered the broken asset pipeline cycle
+and snowballed into four sessions that close Phase 3.5 with the
+hot-reload workflow professional engines deliver — running on B++'s
+zero-dependency runtime.
+
+The main thread of intent was the GPU pipeline roadmap. The sidequest
+crossed the whole arc because every step revealed the next gap: merge
+stbatlas → discover the bundle/manifest mismatch → break Modulab/
+runtime cycle → file watcher → level reload → adaptive throttle →
+rule that no stb cartridge imports bpp_*. Each closed cleanly, no
+half-finished ends, suites green throughout.
+
+### What landed across Phase 3.5
+
+**Session 3.5.5 — Image cartridge merge + manifest atlas pack**
+
+`stbatlas.bsm` (998 LOC) absorbed into `stbimage.bsm` (now 2099
+LOC). Single import for every image-shaped asset:
+
+- `Atlas` struct → `Image`. Every `atlas_*` function → `image_*`.
+- Raw codec API renamed: `img_load` → `pixels_load`,
+  `img_w/h/depth/channels` → `pixels_*`, `img_free` →
+  `pixels_free`, `img_save_png` → `pixels_save_png`.
+- `image_load(path)` is the universal smart-dispatch entry —
+  PNG with sister `.json`, Modulab `atlas_pack`, packed
+  `frames[]`, raw `atlas_grid`, single sprite, all routed by
+  sniffing first byte + (for JSON) inspecting `type` / `frames`.
+
+Modulab's two-file authoring (`cat_sprite.modulab.json` for state
+plus `cat_sprite.json` for runtime export) collapsed into ONE
+canonical `cat_sprite.json` carrying `type:"sprite"` v3 with full
+layer state, palette, AND a flattened composite. Runtime
+`image_load` reads through `_find_sprite_data_idx` which walks
+`frames[0].data` → `frames[0].layers[0].data` → top-level `data`.
+The legacy `type:"modulab"` and `type:"sprite16"` files keep
+loading via the same reader.
+
+`pathfind.atlas.json` swapped from bundle → manifest:
+
+```json
+{ "type":"atlas_pack", "version":2,
+  "tile_w":16, "tile_h":16,
+  "sprites":[
+    { "name":"cat", "path":"cat_sprite.json" },
+    { "name":"rat", "path":"rat_sprite.json" } ] }
+```
+
+`image_load` recursively dereferences each `sprites[].path` so
+the atlas is composed at load time from the live source files.
+**Source of truth = individual sprite files.** Bundle (v1) still
+readable for back-compat. Per-sprite mixed mode allowed during
+migrations.
+
+**Architectural cleanup** mid-session: every stb cartridge
+stripped of `import "bpp_*"`. The runtime modules
+(`bpp_array`, `bpp_str`, `bpp_io`, `bpp_buf`, `bpp_hash`,
+`bpp_file`, `bpp_math`, `bpp_arena`, `bpp_maestro`, `bpp_beat`,
+`bpp_job`) are auto-injected by `bpp_import.bsm`; explicit
+imports were noise. `bpp_json` joined the auto-inject list
+(1-cycle bootstrap oscillation, gen2 byte-stable from there).
+New tonify rule: **stb cartridges MUST NOT import bpp_* runtime
+modules** — auto-inject covers them.
+
+`stbgame` gained `import "stbimage.bsm"` so its frame_begin can
+auto-tick the hot-reload registry shipped in 3.5.6 — same
+foundation peer pattern as stbinput / stbdraw / stbui.
+
+**Session 3.5.6 — Live hot-reload (in-runtime)**
+
+```bpp
+pf_image = image_load("pathfind.atlas.json");
+image_hot_reload_enable(pf_image);
+```
+
+Each registered Image carries `src_path` + `last_hash` (FNV-1a
+combined hash over manifest + every sibling sprite file). The
+auto-tick from `game_frame_begin` rehashes registered images,
+fires `_image_reload(img)` when any hash advances, and updates
+the live struct in place — `Image*` the game holds stays valid,
+only `tex` swaps to a new MTLTexture. Old GPU memory leaks
+deliberately (stbasset pattern).
+
+Industry-aligned design: hot-reload lives in the GAME runtime,
+not the editor. Same shape as Unity (AssetDatabase), Unreal
+(Asset Manager), Godot (EditorFileSystem), Bevy (AssetServer
+with `notify`). Editor saves the file; runtime polls and
+reloads. Decouples game from any specific tool — works with
+Modulab, Aseprite, Vim, hex editor, anything that writes the
+file. No IPC, no editor-runtime protocol.
+
+**Session 3.5.7 — Generic file_watch + level reload**
+
+```bpp
+file_watch_register(path, fn_ptr(callback));
+file_watch_tick();
+```
+
+Hot-reload generalised beyond images. The same machinery exposed
+as a callback registry — pathfind wires `reload_level()` for
+`level1.level.json`, edit walls in Bang 9's level editor → game
+re-loads the arena AND re-syncs the pathfinder mask within
+~16 ms.
+
+Bug bundled in: pathfind's loader collapsed every non-zero MCU-8
+palette index to T_WALL (== 1), so colours painted in the level
+editor all rendered identical in-game. Fix preserves cell value
+1..7, marks each as solid via a `tile_solid` loop, and binds a
+procedural 8-tile MCU-8 colour atlas (`build_mcu8_tile_atlas` in
+pathfind.bpp). Level editor's MCU-8 palette now renders
+identically in-game.
+
+**Session 3.5.8 — Adaptive throttle**
+
+The original poll cadence was a fixed 30 frames (~0.5 s).
+Adaptive replacement: idle stays at 30 frames; the moment any
+reload fires, the tick switches to every-frame polling for a
+60-frame burst (~1 s). First edit: ~0.5 s cold detect; every
+subsequent save during a paint session: ~16 ms.
+
+Polling chosen over kqueue / inotify deliberately — agnostic
+over latency. Same code on every backend B++ ports to. Future
+event-driven backend slots in behind the same `file_watch_*` API
+without changing callers.
+
+### APIs added / renamed
+
+- `image_load(path)` — universal smart-dispatch (was `atlas_load`).
+- `image_hot_reload_enable(img)` / `image_hot_reload_tick()` /
+  `image_hot_reload_tick_throttled()`.
+- `file_watch_register(path, callback)` / `file_watch_tick()`.
+- `pixels_load`, `pixels_w/h/depth/channels`, `pixels_free`,
+  `pixels_save_png` (renamed from `img_*`).
+- Every `atlas_*` → `image_*` (struct-method naming convention).
+- `tile_bind_atlas` → `tile_bind_image`.
+- New auto-injected runtime: `bpp_json.bsm`.
+
+### Docs updated
+
+- `gpu_pipeline_roadmap.md` — Phase 3.5 closed with sessions
+  3.5.5 through 3.5.8 documented; next action set to Phase 4
+  (Pixel-Perfect Rendering).
+- `standard_b++_lib.md` Cap 37 — full rewrite reflecting the
+  unified cartridge: codec layer + Image layer + atlas
+  manifest/bundle + hot-reload + file_watch.
+- `journal.md` — this entry.
+
+### Tree state
+
+Suites: 140/0/12 native + 114/0/38 C — same as the start of the
+session, no regressions. Bootstrap byte-stable (`./bpp` == gen1
+== gen2, sha `b505de4a7e141d4889051ad9105251b907f485f8`).
+
+All four production games run on the unified API:
+- `snake_maestro` — procedural Image (`image_create_rgba`).
+- `fps_3d_gpu` — procedural HUD Image.
+- `pathfind` — Modulab atlas pack manifest + level hot-reload.
+- `platformer` — Kenney sheet via `atlas_grid` sister-JSON.
+
+### Workflow result
+
+End-to-end live cycle now works:
+
+1. Bang 9 opens pathfind, build + run — game starts.
+2. Bang 9 opens Modulab on `cat_sprite.json` in another panel.
+3. User paints, Ctrl+S → file rewritten.
+4. Within ~16 ms during a paint session, the running game shows
+   the new cat. No restart, no rebuild, no manual refresh.
+5. Same loop for level edits via Bang 9's level editor: paint a
+   wall, save → walls update + pathfinder re-routes the cat
+   live.
+
+The pattern professional engines (Unity, Godot, Bevy) deliver,
+running on B++'s zero-dependency runtime.
+
+### Backlog
+
+- kqueue / inotify backend for `file_watch_*` — drop the cold-
+  detect 0.5 s if profile shows polling as a hot spot.
+- Modulab atlas-pack-aware editing — open the manifest, see the
+  list of named sprites, edit any cell, save back through the
+  same path. Today Modulab edits one sprite file at a time.
+- Modulab "Import PNG" — let artists drop a raw spritesheet,
+  define grid in the editor, export the atlas_grid sister JSON.
+- Multi-frame Image animation — runtime support for cycling
+  `frames[]` from the unified sprite shape.
+
+Phase 3.5 is closed. Phase 4 (Pixel-Perfect Rendering — render-
+to-texture, integer scaling at present, multi-pass) plans next.
+
+---
+
 ## 2026-05-04 — Wolf3D Phase 1 CLOSED — fps_3d.bpp ships at 59-60 FPS
 
 **bpp = `20e75f653dabf309bcfdef7a9d738756815b2682`. Suite = 131/0/12 native + 110/0/33 C.**

@@ -9,7 +9,11 @@
 // UP/DOWN     — dirt: clean (pure wave) → dirty (bitcrush + decimation)
 // ESC         — quit
 
-import "stbgame.bsm";
+// mini_synth is a TOOL — imports stbwindow (manual loop, native
+// resolution) instead of stbgame. Per Rule 23 in
+// tonify_checklist.md: tools use stbwindow, games use stbgame.
+import "stbwindow.bsm";
+import "stbui.bsm";
 import "stbmixer.bsm";
 import "stbsound.bsm";
 
@@ -24,6 +28,14 @@ static auto _sk_rec_pos;
 static auto _sk_rec_cap;
 static auto _sk_fill_buf;
 static auto _sk_wav_path;
+
+// Sub-unit accumulators for the LEFT/RIGHT fader and UP/DOWN dirt
+// inputs. ui_dt_step carries the fractional remainder of
+// `step*dt_ms/16` between frames so the long-run sweep rate matches
+// the 60-FPS target even when the uncapped tool loop runs at
+// hundreds-to-thousands of frames per second. One slot per axis.
+static auto _sk_fader_acc;
+static auto _sk_dirt_acc;
 
 static void _sk_map(idx, key_enum, midi) {
     _sk_keys[idx] = key_enum;
@@ -164,30 +176,42 @@ main() {
     init_beat();
     audio_open(4096);
     mixer_init();
-    game_init(320, 180, "SynthKey", 60);
+    window_init_full(320, 180, "SynthKey");
 
-    while (game_should_quit() == 0) {
-        game_frame_begin();
+    while (window_should_close() == 0) {
+        auto dt_ms, fader_step, dirt_step;
+        window_frame_step();
         if (key_pressed(KEY_ESC)) { break; }
+
+        // dt-aware step sizes — mini_synth runs under stbwindow
+        // (no fps cap by design; that lives in stbgame for games),
+        // so the loop hits whatever rate the OS schedules. The
+        // ui_dt_step helper in stbui carries sub-unit remainders
+        // across frames in the per-axis accumulators so the
+        // crossfade sweep rate matches the 60-FPS calibration
+        // target regardless of how fast the loop ticks.
+        dt_ms = window_dt_ms();
+        fader_step = ui_dt_step(8, dt_ms, &_sk_fader_acc);
+        dirt_step  = ui_dt_step(4, dt_ms, &_sk_dirt_acc);
 
         // LEFT/RIGHT: waveform fader (sine → tri → saw → square).
         if (key_down(KEY_RIGHT)) {
-            mixer_set_fader(mixer_get_fader() + 8);
+            mixer_set_fader(mixer_get_fader() + fader_step);
         }
         if (key_down(KEY_LEFT)) {
             auto fv;
-            fv = mixer_get_fader() - 8;
+            fv = mixer_get_fader() - fader_step;
             if (fv < 0) { fv = 0; }
             mixer_set_fader(fv);
         }
 
         // UP/DOWN: dirt (clean → dirty).
         if (key_down(KEY_UP)) {
-            mixer_set_dirt(mixer_get_dirt() + 4);
+            mixer_set_dirt(mixer_get_dirt() + dirt_step);
         }
         if (key_down(KEY_DOWN)) {
             auto dv;
-            dv = mixer_get_dirt() - 4;
+            dv = mixer_get_dirt() - dirt_step;
             if (dv < 0) { dv = 0; }
             mixer_set_dirt(dv);
         }

@@ -36,7 +36,6 @@
 // PNG changed. The handle stays valid — only the internal pointer
 // moves.
 
-import "bpp_hash.bsm";
 import "stbimage.bsm";
 import "stbsound.bsm";
 // font_load lives in stbdraw (absorbed from stbfont). Declared here
@@ -188,7 +187,7 @@ static _asset_slot_gen(slot_idx)@base {
 // effect lattice has no compound `@io+@gpu` tag, and either single
 // annotation lies about half the work — `@io` hides the GPU upload,
 // `@gpu` hides the file read and triggers W026 because the call
-// graph reaches SOLO via img_load. Leaving the function unannotated
+// graph reaches SOLO via pixels_load. Leaving the function unannotated
 // lets the classifier infer the catch-all `@solo` phase, which is
 // honest: callers from `@time` / `@io` / `@gpu` contexts must
 // observe the asymmetry and treat sprite loading as an init-time
@@ -199,26 +198,26 @@ asset_load_sprite(path) {
     cached = _asset_lookup_path(path);
     if (cached != 0) { return cached; }
 
-    pixels = img_load(path);
+    pixels = pixels_load(path);
     if (pixels == 0) { return 0; }
 
     idx = _asset_find_free();
-    if (idx == 0) { img_free(pixels); return 0; }
+    if (idx == 0) { pixels_free(pixels); return 0; }
 
     // Upload to GPU. Keep the raw pixels — the GPU handle is what
     // render functions use, but some callers want to inspect the
     // RGBA buffer directly (collision masks, palette swap, etc).
-    tex = _stb_gpu_create_texture(pixels, img_w(), img_h());
+    tex = _stb_gpu_create_texture(pixels, pixels_w(), pixels_h());
 
     slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
     s = slot_ptr;
     s.kind = ASSET_SPRITE;
     s.ptr = tex;
-    s.w = img_w();
-    s.h = img_h();
+    s.w = pixels_w();
+    s.h = pixels_h();
     s.mtime = _file_hash(path);  // seed for hot_reload change detection
     // Free the CPU-side copy; the GPU owns the pixels now.
-    img_free(pixels);
+    pixels_free(pixels);
 
     _asset_remember_path(idx, path);
     return _asset_pack(idx, s.generation);
@@ -465,7 +464,7 @@ static _file_hash(path)@io {
 // Reload one slot in place. Keeps the handle valid (generation
 // stays the same) and replaces the internal pointer.
 //
-// Sprite: new img_load, new GPU texture. The old texture's GPU
+// Sprite: new pixels_load, new GPU texture. The old texture's GPU
 // memory leaks on this path — stb currently has no
 // _stb_gpu_destroy_texture hook; acceptable dev-time tax that
 // would become a real issue only after thousands of reloads.
@@ -474,17 +473,25 @@ static _file_hash(path)@io {
 //
 // Font: skipped — font_load rebuilds a large atlas and other
 // call sites may still reference it. Print a stderr note.
-static void _asset_reload_slot(idx, path)@io {
+//
+// Intentionally un-annotated. The body does IO (file read via
+// pixels_load / sound_load_wav) AND GPU (_stb_gpu_create_texture
+// upload) work. IO and GPU are sibling categories in the effect
+// lattice — annotating either alone triggers W026 because the
+// call graph reaches the other. Same convention as `tile_load_set`
+// in stbtile and `render_init` in stbrender: leave it to the
+// classifier to infer SOLO, the right home for a load+upload path.
+static void _asset_reload_slot(idx, path) {
     auto slot_ptr, s: AssetSlot, new_ptr, ok;
     slot_ptr = _asset_slots + idx * sizeof(AssetSlot);
     s = slot_ptr;
     if (s.kind == ASSET_SPRITE) {
-        new_ptr = img_load(path);
+        new_ptr = pixels_load(path);
         if (new_ptr == 0) { return; }
-        s.ptr = _stb_gpu_create_texture(new_ptr, img_w(), img_h());
-        s.w   = img_w();
-        s.h   = img_h();
-        img_free(new_ptr);
+        s.ptr = _stb_gpu_create_texture(new_ptr, pixels_w(), pixels_h());
+        s.w   = pixels_w();
+        s.h   = pixels_h();
+        pixels_free(new_ptr);
     } else if (s.kind == ASSET_SOUND || s.kind == ASSET_MUSIC) {
         ok = sound_load_wav(path);
         if (ok == 0) { return; }
@@ -502,8 +509,10 @@ static void _asset_reload_slot(idx, path)@io {
 // against the hash stored at load time, and reload slots whose
 // files have changed. Cheap enough to call every frame on small
 // projects; throttle to every 30 frames (~0.5 s) on larger ones.
-// Returns the number of slots that were reloaded.
-asset_hot_reload()@io {
+// Returns the number of slots that were reloaded. Un-annotated for
+// the same reason as `_asset_reload_slot` — its callee does IO +
+// GPU work and the lattice cannot represent both without SOLO.
+asset_hot_reload() {
     auto i, slot_ptr, s: AssetSlot, path, new_hash, reloaded;
     reloaded = 0;
     for (i = 1; i < _ASSET_MAX; i++) {

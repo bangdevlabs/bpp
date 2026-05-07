@@ -40,6 +40,30 @@
 // All `_stb_*` symbols are auto-injected via _stb_platform_<os>.bsm
 // (resolved by target-suffix), so tools don't need to import the
 // platform layer explicitly.
+//
+// Per Rule 23 (cartridge minimalism), stbwindow imports ONLY the
+// foundational subsystems every windowed tool needs (input + draw
+// + font; init_color lives inside stbdraw). UI widgets, image
+// hot-reload, audio, etc. are opt-in by the program — same
+// pattern as stbgame, just with manual loop and no fps cap.
+//
+// Opt-in patterns programmers compose around stbwindow:
+//
+//   UI widgets (gui_label, gui_button, themes):
+//     import "stbui.bsm";
+//     init_ui();                   // after window_init_full
+//     ui_arena_reset();            // each frame, before widgets
+//
+//   Image hot-reload:
+//     import "stbimage.bsm";
+//     image_hot_reload_enable(img);
+//     image_hot_reload_tick_throttled();   // each frame
+//
+//   Native resolution stays the contract — stbwindow never
+//   rescales. Tools paint at the pixel size they requested,
+//   no virtual surface, no integer scale.
+import "stbinput.bsm";
+import "stbdraw.bsm";
 
 // ── Public API ──────────────────────────────────────────────
 
@@ -103,6 +127,118 @@ void window_close()@io {
 // window_close frees. The `_stb_*` functions live in
 // `_stb_platform_<os>.bsm` (auto-injected by bpp_import.bsm).
 extrn _stb_w, _stb_h, _stb_fb;
+
+// Platform-owned timing primitives — both stbgame and the Phase
+// 4.0.1 convenience layer below read / advance the same clock.
+// `_stb_last_time` is declared `global` in `_stb_platform_<os>`,
+// stbwindow only references via extrn.
+extrn _stb_last_time;
+
+// Shared screen-size globals. stbrender's `render_init` reads
+// these to pass `(w, h)` to `_stb_gpu_init`, so any program that
+// calls render_init needs them defined. Declaring as `extrn`
+// here (stbwindow) AND in stbgame.bsm keeps the symbol live in
+// either import graph; programs that import only stbwindow get
+// the same `SCREEN_W = w` write below.
+extrn SCREEN_W, SCREEN_H;
+
+// ── Phase 4.0.1 — full-init convenience layer ──────────────
+//
+// Tools that need the same subsystem init `game_init` does — but
+// without the fps target, the maestro coupling, or the
+// pixel-perfect virtual resolution stbgame ships from Phase 4.1
+// onwards — call `window_init_full` instead of building up the
+// 11-step init sequence by hand. The rest of the loop (poll,
+// draw, present) still goes through the existing `window_*`
+// primitives above; `window_frame_step` is the per-frame tick.
+//
+// `stbgame` and `stbwindow` are mutually exclusive by design
+// (Rule 23): every program imports exactly one. After Phase 4.0
+// closes, `stbgame` is for games (60fps loop, maestro,
+// pixel-perfect), `stbwindow` is for tools (own loop, native
+// resolution). The shared `_stb_*` platform primitives are the
+// common floor both cartridges sit on.
+
+// Private dt counter — exposed only through `window_dt_ms` /
+// `window_dt`. Static keeps the symbol off the public surface
+// even though the function readers are public.
+static auto _stb_window_dt_ms;
+
+// Open a native window AND warm up the foundational subsystems
+// every windowed tool needs (input, color, draw, font). Mirror of
+// `game_init` minus:
+//
+//   * `fps` target — tools own their pacing, no fixed budget.
+//   * `_stb_frame_ms` write — without an fps target there is no
+//     "target frame ms" to publish.
+//   * Maestro coupling — tools own their loop directly.
+//
+// Optional cartridges (stbui, stbimage hot-reload, stbaudio) are
+// opt-in: tools that want widgets call `import "stbui.bsm"` +
+// `init_ui()` themselves. See header for the full opt-in
+// pattern table.
+//
+// The framebuffer is allocated at the exact pixel size requested
+// (no virtual resolution rescaling), the window opens at that
+// size, and the timing clock starts. `SCREEN_W / SCREEN_H` are
+// set the same way `game_init` sets them so any tool that drives
+// stbrender (GPU path) has the dimensions render_init needs.
+//
+// Un-annotated: the body covers IO (window + font load) + HEAP
+// (framebuffer) + draw subsystem warmup. The lattice classifies
+// as SOLO via the call graph; @io alone trips W026 because the
+// init reaches GPU through `init_draw`.
+void window_init_full(w, h, title) {
+    init_math();
+    math_trig_init();
+    init_input();
+    init_color();
+    init_draw();
+    init_font();
+    init_str();
+
+    SCREEN_W = w;
+    SCREEN_H = h;
+    _stb_w = w;
+    _stb_h = h;
+    if (_stb_fb != 0) { free(_stb_fb); }
+    _stb_fb = malloc(w * h * 4);
+
+    _stb_init_window(w, h, title);
+    _stb_last_time = _stb_get_time();
+    // Sane default until the first `window_frame_step` measures
+    // a real interval. Picked to match stbgame's `_stb_frame_ms`
+    // fallback so timing-sensitive tool code that reads `dt_ms`
+    // before the first frame sees a familiar value.
+    _stb_window_dt_ms = 16;
+}
+
+// Per-frame tick — poll the OS event queue once and recompute the
+// delta-time counter. Replaces `game_frame_begin` for tools. Same
+// first-frame init guard + dt clamp range as `game_frame_begin`
+// (1 ms floor against tight loops, 50 ms ceiling against debugger
+// pauses) so timing semantics match across the two cartridges.
+void window_frame_step()@io {
+    auto now;
+    _stb_poll_events();
+    if (_stb_last_time == 0) {
+        _stb_last_time = _stb_get_time();
+        return;
+    }
+    now = _stb_get_time();
+    _stb_window_dt_ms = now - _stb_last_time;
+    if (_stb_window_dt_ms > 50) { _stb_window_dt_ms = 50; }
+    if (_stb_window_dt_ms < 1)  { _stb_window_dt_ms = 1; }
+    _stb_last_time = now;
+}
+
+// Delta time in milliseconds since the previous
+// `window_frame_step`. Mirror of `game_dt_ms`.
+window_dt_ms()@base { return _stb_window_dt_ms; }
+
+// Delta time in seconds (float) since the previous
+// `window_frame_step`. Mirror of `game_dt`.
+window_dt()@base { return _stb_window_dt_ms * 0.001; }
 
 // ── Dialog API ──────────────────────────────────────────────
 

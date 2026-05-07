@@ -1,0 +1,71 @@
+// gpu_timing_smoke.bpp — Phase 2.3 smoke test.
+//
+// Loads the trivial pipeline, enables GPU timing, runs the frame
+// loop, and prints the measured GPU time to stderr every 60
+// frames. Validates the Phase 2.3 path end to end:
+//
+//   1. profile_gpu_enable flips the platform-layer timing flag.
+//   2. _stb_gpu_present (per frame) wraps commit + waitUntilCompleted
+//      with _time_now_ns deltas and stores the result in microseconds.
+//   3. profile_gpu_us reads the last frame's measurement.
+//   4. The HUD's "gpu: X ms" readout (in profile_hud_draw) reads
+//      the same value when a game wires it up — this smoke test
+//      logs to stderr instead so it doesn't depend on HUD state.
+//
+// Run with:
+//   ./bpp examples/gpu_timing_smoke.bpp -o /tmp/gtimes
+//   /tmp/gtimes        # press any key or close window to exit
+//
+// Expected stderr output every ~1 second of run time:
+//   gpu: 250 us  (typical M-series — varies by load)
+//
+// The number is wall-clock around `commit + waitUntilCompleted`,
+// so it includes the synchronisation cost; treat it as an upper
+// bound on actual GPU work, accurate enough for "is rendering
+// dominated by the GPU or the CPU" decisions.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbshader.bsm";
+import "stbprofile.bsm";
+
+main() {
+    auto pipe, frame, gpu_us;
+
+    game_init(320, 180, "GPU Timing Smoke (Phase 2.3)", 60);
+    render_init();
+
+    pipe = gpu_pipeline_load("assets/shaders/trivial.metal",
+                             "trivial_vert", "trivial_frag");
+    if (pipe == 0) {
+        return -1;
+    }
+
+    profile_gpu_enable();
+    frame = 0;
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        render_begin();
+        render_clear(BLACK);
+
+        gpu_pipeline_use(pipe);
+        gpu_draw_full();
+        gpu_pipeline_use_default();
+
+        render_end();
+
+        frame++;
+        // Log every 60 frames so a 60 FPS loop produces one line
+        // per second. Skip the very first reading: timing requires
+        // a completed frame to populate the value, and frame 0
+        // captured the pre-enable state.
+        if (frame % 60 == 0) {
+            gpu_us = profile_gpu_us();
+            put_err("gpu: ");
+            put_err(gpu_us);
+            put_err(" us\n");
+        }
+    }
+    return 0;
+}

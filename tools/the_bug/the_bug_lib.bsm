@@ -4,7 +4,9 @@
 // modulab_lib and level_editor_lib:
 //
 //   the_bug_lib_init()
-//       Allocate reader state. Host must have called game_init().
+//       Allocate reader state. Host must have called
+//       window_init_full() (or its embedding host's equivalent
+//       boot path).
 //
 //   the_bug_lib_frame(px, py, pw, ph)
 //       Draw + input for one frame inside (px, py, pw, ph).
@@ -64,8 +66,18 @@ static global _tb_loaded;
 
 // Path of the currently loaded .bug file (heap-owned C-string), or
 // 0 if no file is loaded. Kept around so the Run button can derive
-// the target binary path by stripping the trailing ".bug".
+// the target binary path by stripping the trailing ".bug" — the
+// fallback strategy used by the standalone CLI where the binary
+// always sits next to the .bug.
 static auto _tb_bug_path;
+
+// Optional explicit target binary path. Heap-owned C-string set by
+// the_bug_lib_set_target. Embedders that store the .bug file
+// somewhere other than alongside the binary (Bang 9 keeps it in
+// /tmp so the user's project tree stays clean) use this to point
+// the Run button at the real executable. When 0, _tb_run_target
+// falls back to stripping ".bug" off _tb_bug_path.
+static auto _tb_target_path;
 
 // PID of the currently running target. 0 = nothing running. The
 // frame loop poll-reaps this with a non-blocking waitpid so the
@@ -526,10 +538,28 @@ void the_bug_lib_init() {
     _tb_loaded      = 0;
     _tb_scroll      = 0;
     _tb_bug_path    = 0;
+    _tb_target_path = 0;
     _tb_run_pid     = 0;
     _tb_last_status = 0;
     _tb_run_started = 0;
     _tb_load_err    = 0;
+
+    // Mirror the standalone the_bug.bpp main() init sequence so
+    // embedders (Bang 9's Debug tab today; any future host that
+    // loads the_bug_lib.bsm) get the same observe + breakpoint +
+    // run-viz state the CLI relies on. Each of these is
+    // idempotent — calling twice from a host that already inits
+    // them itself is a no-op. Without `init_observe`, the Run
+    // button hits the "debugserver not found" path because
+    // `_ds_path` was never set: every `_ds_exists(0)` call
+    // returns 0 and the launcher prints the wrong hint about
+    // missing Xcode tooling even when Xcode is installed.
+    init_array();
+    init_reader();
+    init_bug_shared();
+    init_observe();
+    init_bug_brk();
+    init_bug_runviz();
 
     _tb_initialized = 1;
 }
@@ -617,17 +647,30 @@ the_bug_lib_try_load(path)@io {
 // path with the same pipeline the TUI uses, so the GUI gains live
 // watch + viz panels at every breakpoint hit.
 static _tb_run_target()@solo {
-    auto plen, target_path, i, ret;
-    if (_tb_bug_path == 0) { return 0; }
+    auto plen, target_path, i, ret, owned;
     if (bug_shared_status != BUG_SHARED_IDLE) { return 0; }
 
-    // Strip the ".bug" suffix (4 bytes). the_bug_lib_try_load only
-    // accepts files whose name matches *.bug, so the cut is safe.
-    plen = str_len(_tb_bug_path);
-    if (plen <= 4) { return 0; }
-    target_path = malloc(plen - 4 + 1);
-    for (i = 0; i < plen - 4; i++) { poke(target_path + i, peek(_tb_bug_path + i)); }
-    poke(target_path + (plen - 4), 0);
+    // Two paths to the binary:
+    //
+    // 1. The host explicitly told us where it is via
+    //    the_bug_lib_set_target. Used by Bang 9 because its .bug
+    //    file lives in /tmp, not next to the binary.
+    //
+    // 2. Fallback: strip the ".bug" suffix off _tb_bug_path.
+    //    Works for the standalone CLI (`bug --tui ./prog`) where
+    //    the .bug always sits beside the binary.
+    if (_tb_target_path != 0) {
+        target_path = _tb_target_path;
+        owned = 0;
+    } else {
+        if (_tb_bug_path == 0) { return 0; }
+        plen = str_len(_tb_bug_path);
+        if (plen <= 4) { return 0; }
+        target_path = malloc(plen - 4 + 1);
+        for (i = 0; i < plen - 4; i++) { poke(target_path + i, peek(_tb_bug_path + i)); }
+        poke(target_path + (plen - 4), 0);
+        owned = 1;
+    }
 
     // start_idx=0 / argc=0: target receives no arguments. The
     // observer's spawn helper handles the no-args path. bp_count=0
@@ -636,11 +679,31 @@ static _tb_run_target()@solo {
     // honest default for "I just want to see what runs". Future UX
     // can let the user pin specific functions before running.
     ret = bug_run_async_start(target_path, 0, 0, 0, 0, 0);
-    free(target_path);
+    if (owned != 0) { free(target_path); }
     if (ret < 0) { return 0; }
 
     _tb_run_started = 1;
     return 1;
+}
+
+// Tell the_bug_lib where the target binary lives. Embedders call
+// this once after the_bug_lib_init when they own a project (Bang 9
+// calls it from the Debug panel after every successful build).
+// Pass 0 to clear the override and fall back to "strip .bug off
+// the loaded map path." The string is copied; caller may free
+// `path` after the call returns.
+void the_bug_lib_set_target(path)@io {
+    auto len, dup, i;
+    if (_tb_target_path != 0) {
+        free(_tb_target_path);
+        _tb_target_path = 0;
+    }
+    if (path == 0) { return; }
+    len = str_len(path);
+    dup = malloc(len + 1);
+    for (i = 0; i < len; i++) { poke(dup + i, peek(path + i)); }
+    poke(dup + len, 0);
+    _tb_target_path = dup;
 }
 
 // Resume the tracee past the current breakpoint. Wired to the

@@ -1,0 +1,119 @@
+// atlas_batch_smoke.bpp — Phase 3.2 batching observable.
+//
+// Draws MANY sprites from a single atlas per frame to demonstrate
+// the smart-bind batching path: with the Phase 3.2 changes, the
+// platform layer's `_stb_gpu_bind_texture` skips the flush +
+// setFragmentTexture pair when the requested texture is already
+// resident, so consecutive `image_draw` calls accumulate vertices
+// in the shared batch buffer and present as ONE flush per atlas
+// per frame instead of one flush per sprite.
+//
+// What the smoke validates:
+//   1. image_create_rgba uploads one MTLTexture for the whole atlas.
+//   2. SPRITE_COUNT image_draw calls per frame all hit the same
+//      texture; smart-bind compares against `_gpu_cur_slot0_tex`
+//      and short-circuits.
+//   3. profile_gpu_enable + profile_gpu_us read the previous
+//      frame's GPUStartTime / GPUEndTime delta — pre-fix this
+//      number was dominated by N draw-call setup overhead; post-
+//      fix it reflects only the real fragment work.
+//
+// Run with:
+//   ./bpp examples/atlas_batch_smoke.bpp -o /tmp/abatch
+//   /tmp/abatch     # close window or press Cmd-Q to exit
+//
+// Expected stderr each second:
+//   gpu: <X> us — typically a small number on M-series even with
+//   1024 sprites because the entire frame is one draw call. Pre-
+//   Phase-3.2 the same workload would log ~30-50× higher numbers.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbimage.bsm";
+import "stbprofile.bsm";
+
+const TEX_W   = 64;
+const TEX_H   = 64;
+const TILE_W  = 16;
+const TILE_H  = 16;
+const COUNT   = 16;
+const SPRITES_PER_FRAME = 1024;
+const DRAW_SZ = 1;
+
+static tile_color(id)@base {
+    auto r, g, b;
+    r = (id * 17 + 100) & 0xFF;
+    g = (id * 31 + 50)  & 0xFF;
+    b = (id * 53 + 150) & 0xFF;
+    return rgba(r, g, b, 255);
+}
+
+// 4×4 grid of solid colours, identical to atlas_smoke. The test
+// is workload-shape-focused, not visually distinguishing — we
+// re-use atlas_smoke's procedural atlas so any visual regression
+// against that smoke shows up the same way here.
+static fill_atlas_rgba(buf) {
+    auto x, y, off, c, col, row, id;
+    for (y = 0; y < TEX_H; y++) {
+        row = y / TILE_H;
+        for (x = 0; x < TEX_W; x++) {
+            col = x / TILE_W;
+            id  = row * (TEX_W / TILE_W) + col;
+            c   = tile_color(id);
+            off = (y * TEX_W + x) * 4;
+            poke(buf + off,     (c >> 16) & 0xFF);
+            poke(buf + off + 1, (c >> 8)  & 0xFF);
+            poke(buf + off + 2,  c        & 0xFF);
+            poke(buf + off + 3, (c >> 24) & 0xFF);
+        }
+    }
+}
+
+main() {
+    auto rgba_buf, atlas, frame, i, sx, sy, sid, gpu_us;
+
+    game_init(640, 360, "Atlas Batch Smoke (Phase 3.2)", 60);
+    render_init();
+    init_image();
+    profile_gpu_enable();
+
+    rgba_buf = malloc(TEX_W * TEX_H * 4);
+    fill_atlas_rgba(rgba_buf);
+    atlas = image_create_rgba(rgba_buf, TEX_W, TEX_H, TILE_W, TILE_H);
+    if (atlas == 0) {
+        put_err("atlas_batch_smoke: image_create_rgba returned 0\n");
+        return -1;
+    }
+
+    frame = 0;
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        render_begin();
+        render_clear(BLACK);
+
+        // SPRITES_PER_FRAME draws against the SAME atlas — Phase 3.2
+        // batching means this is one flush regardless of count.
+        // Each sprite gets a pseudo-random position + tile id derived
+        // from its loop index so the visual reads as "lots of moving
+        // sprites" without any RNG state.
+        for (i = 0; i < SPRITES_PER_FRAME; i++) {
+            sid = (i + frame) % COUNT;
+            sx  = (i * 13 + frame) % 624;
+            sy  = (i * 7  + frame * 2) % 344;
+            image_draw(atlas, sid, sx, sy, DRAW_SZ);
+        }
+
+        render_end();
+
+        frame++;
+        if (frame % 60 == 0) {
+            gpu_us = profile_gpu_us();
+            put_err("gpu: ");
+            put_err(gpu_us);
+            put_err(" us (");
+            put_err(SPRITES_PER_FRAME);
+            put_err(" sprites/frame)\n");
+        }
+    }
+    return 0;
+}

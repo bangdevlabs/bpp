@@ -1,0 +1,101 @@
+// atlas_smoke.bpp — Phase 3.1 smoke test for stbatlas.
+//
+// Builds a 4×4 procedural atlas (16 distinct 16×16 tiles, each a
+// solid colour cycling through the rainbow) and draws every tile
+// at a separate on-screen position. Visual gate: 16 distinct
+// solid-colour squares laid out in a 4×4 grid, each unique. If
+// the UV math is wrong, tiles show the wrong colour or a blend
+// of two tiles' colours.
+//
+// Validates the Phase 3.1 deliverable end to end:
+//   1. fill_atlas_rgba builds 64×64 RGBA bytes with per-tile colours.
+//   2. image_create_rgba uploads as one MTLTexture and computes
+//      cols/rows/count from tex/tile dimensions.
+//   3. image_draw computes (u0, v0, u1, v1) per sprite_id and
+//      issues one _stb_gpu_sprite_uv per tile.
+//
+// Run with:
+//   ./bpp examples/atlas_smoke.bpp -o /tmp/atlas_smoke
+//   /tmp/atlas_smoke    # close window to exit
+//
+// Expected: 4×4 grid of solid colour swatches at top-left,
+// rainbow-cycling through 16 tones. Each swatch is 32×32 (sz=2)
+// so the whole grid is 128×128 pixels.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbimage.bsm";
+
+const TEX_W   = 64;
+const TEX_H   = 64;
+const TILE_W  = 16;
+const TILE_H  = 16;
+const COLS    = 4;
+const ROWS    = 4;
+const COUNT   = 16;
+const DRAW_SZ = 2;     // each sprite renders at 32×32 on screen
+
+// Generate a unique solid-colour tile for each id 0..15. Cycles
+// through the spectrum so adjacent tiles read as clearly distinct
+// — the wrong-UV failure mode (sampling a neighbouring tile)
+// shows up immediately as a colour mismatch.
+static tile_color(id)@base {
+    auto r, g, b;
+    r = (id * 17 + 100) & 0xFF;
+    g = (id * 31 + 50)  & 0xFF;
+    b = (id * 53 + 150) & 0xFF;
+    return rgba(r, g, b, 255);
+}
+
+// Fill a 64×64 RGBA buffer so each 16×16 cell is a solid colour
+// keyed by its row-major id. Pixel layout matches
+// `_stb_gpu_create_texture` (R, G, B, A bytes per pixel).
+static fill_atlas_rgba(buf) {
+    auto x, y, off, c, col, row, id;
+    for (y = 0; y < TEX_H; y++) {
+        row = y / TILE_H;
+        for (x = 0; x < TEX_W; x++) {
+            col = x / TILE_W;
+            id  = row * COLS + col;
+            c   = tile_color(id);
+            off = (y * TEX_W + x) * 4;
+            poke(buf + off,     (c >> 16) & 0xFF);
+            poke(buf + off + 1, (c >> 8)  & 0xFF);
+            poke(buf + off + 2,  c        & 0xFF);
+            poke(buf + off + 3, (c >> 24) & 0xFF);
+        }
+    }
+}
+
+main() {
+    auto rgba_buf, atlas, i, draw_x, draw_y;
+
+    game_init(320, 180, "Atlas Smoke (Phase 3.1)", 60);
+    render_init();
+    init_image();
+
+    rgba_buf = malloc(TEX_W * TEX_H * 4);
+    fill_atlas_rgba(rgba_buf);
+    atlas = image_create_rgba(rgba_buf, TEX_W, TEX_H, TILE_W, TILE_H);
+    if (atlas == 0) {
+        put_err("atlas_smoke: image_create_rgba returned 0\n");
+        return -1;
+    }
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        render_begin();
+        render_clear(BLACK);
+
+        // Lay out all 16 tiles in a 4×4 grid at the top-left.
+        // Each rendered tile is TILE_W*DRAW_SZ × TILE_H*DRAW_SZ.
+        for (i = 0; i < COUNT; i++) {
+            draw_x = (i % COLS) * TILE_W * DRAW_SZ;
+            draw_y = (i / COLS) * TILE_H * DRAW_SZ;
+            image_draw(atlas, i, draw_x, draw_y, DRAW_SZ);
+        }
+
+        render_end();
+    }
+    return 0;
+}

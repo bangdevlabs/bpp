@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — Install B++ compiler, standard library, and drivers.
+# install.sh — Install B++ compiler, standard library, and FFI bindings.
 # Usage: ./install.sh          (bootstrap + install)
 #        ./install.sh --skip   (install without bootstrap)
 #
@@ -11,7 +11,7 @@ PREFIX="/usr/local"
 BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/lib/bpp"
 STB_DIR="$LIB_DIR/stb"
-DRV_DIR="$LIB_DIR/drivers"
+FFI_DIR="$LIB_DIR/ffi"
 
 # Backend layout mirrors src/backend/ since the 0.23.x reorg:
 #   chip/<arch>     — instruction encoders and per-arch codegen
@@ -46,7 +46,7 @@ echo "==> Compiling debugger..."
 echo "==> Installing to $PREFIX (requires sudo)..."
 
 # Create directories.
-sudo mkdir -p "$BIN_DIR" "$LIB_DIR" "$STB_DIR" "$DRV_DIR"
+sudo mkdir -p "$BIN_DIR" "$LIB_DIR" "$STB_DIR" "$FFI_DIR"
 sudo mkdir -p "$CHIP_ARM64_DIR" "$CHIP_X64_DIR"
 sudo mkdir -p "$OS_MACOS_DIR" "$OS_LINUX_DIR"
 sudo mkdir -p "$TARGET_MAC_DIR" "$TARGET_LIN_DIR" "$BACKEND_C_DIR"
@@ -79,7 +79,7 @@ rm -f /tmp/bug_install
 # .bsm files is safe — anything legitimate gets re-copied below.
 sudo rm -f "$LIB_DIR"/*.bsm
 sudo rm -f "$STB_DIR"/*.bsm
-sudo rm -f "$DRV_DIR"/*.bsm
+sudo rm -f "$FFI_DIR"/*.bsm
 sudo rm -f "$CHIP_ARM64_DIR"/*.bsm
 sudo rm -f "$CHIP_X64_DIR"/*.bsm
 sudo rm -f "$OS_MACOS_DIR"/*.bsm
@@ -164,8 +164,8 @@ sudo cp src/bug_tui.bsm "$LIB_DIR/"
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
 
-# Install drivers.
-sudo cp drivers/*.bsm "$DRV_DIR/"
+# Install FFI bindings (raylib, SDL2 backends — proof B++ FFI works).
+sudo cp ffi/*.bsm "$FFI_DIR/"
 
 # Install the four-layer backend. Matches the src/backend/ reorg from
 # the 0.23.x cache-removal sprint and the find_file lookup list in
@@ -250,7 +250,7 @@ echo "    $BIN_DIR/bpp (compiler)"
 echo "    $BIN_DIR/bug (debugger)"
 echo "    $LIB_DIR/ ($(ls $LIB_DIR/*.bsm 2>/dev/null | wc -l | tr -d ' ') runtime modules)"
 echo "    $STB_DIR/ ($(ls stb/*.bsm | wc -l | tr -d ' ') stb modules)"
-echo "    $DRV_DIR/ ($(ls drivers/*.bsm | wc -l | tr -d ' ') drivers)"
+echo "    $FFI_DIR/ ($(ls ffi/*.bsm | wc -l | tr -d ' ') FFI bindings)"
 echo "    $CHIP_ARM64_DIR/ ($(ls src/backend/chip/aarch64/*.bsm | wc -l | tr -d ' ') modules)"
 echo "    $CHIP_X64_DIR/ ($(ls src/backend/chip/x86_64/*.bsm | wc -l | tr -d ' ') modules)"
 echo "    $OS_MACOS_DIR/ ($(ls src/backend/os/macos/*.bsm | wc -l | tr -d ' ') modules)"

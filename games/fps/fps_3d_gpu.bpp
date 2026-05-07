@@ -1,0 +1,359 @@
+// fps_3d_gpu.bpp — Phase 2.4 of the GPU pipeline roadmap (Sessão A1).
+//
+// GPU sibling of fps_3d.bpp. Same input handling, same Tilemap, same
+// FPSBody — the ray-cast itself moves from a CPU per-column loop
+// into a single fragment shader pass via stbshader's custom-pipeline
+// API. The B++ side packs camera state + the 16×16 map into uniform
+// buffers each frame and issues one fullscreen draw; the rasteriser
+// runs `assets/shaders/fps_raycast.metal` per pixel.
+//
+// Phase 2 framing: this file is the first "GPU sees walls" gate.
+// fps_3d.bpp keeps the CPU baseline alive in parallel — the two
+// programs read the same maestro callbacks, take the same WASD +
+// arrow input, walk through the same map. fps_3d_gpu adds the
+// "gpu: X ms" readout to the profile HUD via stbprofile so the
+// comparison is one-glance visible at runtime.
+//
+// What's NOT in this session yet (per gpu_pipeline_roadmap.md):
+//   - textured walls (Phase 3 sprite + texture pipeline lands them)
+//   - HUD sprite overlay (Phase 3.3)
+//   - 320×240 internal scaled to window (Phase 4 pixel-perfect)
+//   - skybox layer (Phase 5 stbscene)
+//   - CRT effect (Phase 6 stbfx)
+// Solid wall colours by type are the deliverable for 2.4 — anything
+// fancier is downstream.
+
+import "stbgame.bsm";
+import "stbtile.bsm";      // Tilemap struct shared with fps_3d.bpp
+import "stbphys.bsm";      // FPSBody, fps_walk, fps_turn
+import "stbrender.bsm";    // render_init / render_begin / render_end
+import "stbshader.bsm";    // gpu_pipeline_load + gpu_uniform_set_frag
+import "stbimage.bsm";     // Sessão A2 — HUD overlay sprite atlas
+import "stbprofile.bsm";   // profile_gpu_enable + profile_hud_draw
+
+// ── Compile-time constants ─────────────────────────────────
+
+const SCREEN_W = 640;
+const SCREEN_H = 480;
+const FPS = 60;
+const N_WORKERS = 4;
+
+// Map is 16x16 cells, 1.0 world unit per cell — same convention as
+// fps_3d.bpp so the two binaries share the test layout below.
+const MAP_W = 16;
+const MAP_H = 16;
+
+// Camera uniform buffer is 32 bytes:
+//   offset 0  : float px         (camera world x)
+//   offset 4  : float py         (camera world y)
+//   offset 8  : float angle      (facing in radians)
+//   offset 12 : float fov        (horizontal FOV in radians)
+//   offset 16 : uint  sw         (screen width pixels)
+//   offset 20 : uint  sh         (screen height pixels)
+//   offset 24 : uint  mw         (map width cells)
+//   offset 28 : uint  mh         (map height cells)
+// Layout MUST match `struct CamUniforms` in fps_raycast.metal.
+const CAM_BUF_SZ = 32;
+
+// Map uniform buffer holds one byte per cell (0 = empty, 1..4 = wall
+// type id). 16×16 = 256 bytes — well below Metal's 4 KB inline cap.
+const MAP_BUF_SZ = 256;
+
+// ── Game state (read by all phases, mutated by solo) ───────
+
+// Field of view in radians (60° = Wolf3D default). Set once in init.
+global FOV: float;
+
+// Player FPSBody — same struct, same tuning as fps_3d.bpp so the
+// two programs feel identical to the user.
+extrn player;
+
+// Tilemap holding the level — same generator (`_init_map`) as the
+// CPU baseline, just renamed without the wolf3d_ prefix because
+// this file lives next to fps_3d.bpp and the prefix would clash.
+extrn world_map;
+
+// Custom GPU pipeline + uniform scratch buffers. Allocated once in
+// init, reused every frame. The map buffer is also written once
+// (the layout never changes at runtime); cam_buf is repacked each
+// render frame from the player's current state.
+extrn ray_pipeline;
+extrn cam_buf;
+extrn map_buf;
+
+// Sessão A2 — HUD overlay atlas. Procedural 2-tile atlas painted
+// at init: tile 0 is a white crosshair, tile 1 is a red heart icon.
+// Drawn in the render phase AFTER `gpu_pipeline_use_default()`
+// restores the default stbrender pipeline, so the HUD overlays the
+// ray-cast walls without leaking the custom pipeline's state into
+// the text rendering that follows.
+extrn hud_atlas;
+const HUD_TILE = 16;
+const HUD_TEX_W = 32;     // 2 tiles × 16 px
+const HUD_TEX_H = 16;
+const HUD_CROSS = 0;
+const HUD_HEART = 1;
+
+// ── HUD atlas builder (Sessão A2) ──────────────────────────
+
+// Paint one pixel into the RGBA HUD atlas buffer at (gx, gy).
+// Pixel layout matches `_stb_gpu_create_texture` (R, G, B, A bytes
+// per pixel, 4 bytes per pixel). Local-only helper — name-prefixed
+// to avoid colliding with stbdraw's `put_px` (different signature).
+static void _fps_hud_put_px(buf, gx, gy, color) {
+    auto off;
+    off = (gy * HUD_TEX_W + gx) * 4;
+    poke(buf + off,     (color >> 16) & 0xFF);
+    poke(buf + off + 1, (color >> 8)  & 0xFF);
+    poke(buf + off + 2,  color        & 0xFF);
+    poke(buf + off + 3, (color >> 24) & 0xFF);
+}
+
+// Build the HUD overlay atlas — two 16×16 tiles painted procedurally
+// (no PNG dependency). Crosshair tile is a 1-pixel-wide white plus
+// sign; heart tile is a chunky 7×6 red shape. Both are drawn over
+// transparent backgrounds so the alpha-blended quad lets the ray-
+// cast walls show through.
+static build_hud_atlas() {
+    auto buf, i;
+    buf = malloc(HUD_TEX_W * HUD_TEX_H * 4);
+    // Zero the buffer — transparent black background everywhere.
+    for (i = 0; i < HUD_TEX_W * HUD_TEX_H * 4; i++) {
+        poke(buf + i, 0);
+    }
+    // Crosshair (tile 0) — white plus sign through center (8, 8).
+    auto base, k;
+    base = HUD_CROSS * HUD_TILE;
+    for (k = 5; k <= 11; k++) {
+        _fps_hud_put_px(buf, base + 8, k, WHITE);
+        _fps_hud_put_px(buf, base + k, 8, WHITE);
+    }
+    // Heart (tile 1) — chunky 7-wide shape centered at (8, 8).
+    base = HUD_HEART * HUD_TILE;
+    auto rr;
+    rr = rgba(220, 40, 50, 255);
+    // Top two lobes (rows 5, 6).
+    _fps_hud_put_px(buf, base + 5, 5, rr);
+    _fps_hud_put_px(buf, base + 6, 5, rr);
+    _fps_hud_put_px(buf, base + 9, 5, rr);
+    _fps_hud_put_px(buf, base + 10, 5, rr);
+    for (k = 4; k <= 11; k++) {
+        _fps_hud_put_px(buf, base + k, 6, rr);
+    }
+    // Body (rows 7-9) — 8 wide, 7 wide, 5 wide.
+    for (k = 4; k <= 11; k++) { _fps_hud_put_px(buf, base + k, 7, rr); }
+    for (k = 5; k <= 10; k++) { _fps_hud_put_px(buf, base + k, 8, rr); }
+    for (k = 6; k <=  9; k++) { _fps_hud_put_px(buf, base + k, 9, rr); }
+    // Tip (row 10) — 1 pixel.
+    _fps_hud_put_px(buf, base + 7, 10, rr);
+    _fps_hud_put_px(buf, base + 8, 10, rr);
+    return image_create_rgba(buf, HUD_TEX_W, HUD_TEX_H,
+                             HUD_TILE, HUD_TILE);
+}
+
+// ── Maestro phase callbacks ────────────────────────────────
+
+// Init phase: bring up GPU, allocate buffers, build the map, register
+// keybindings, load the ray-cast pipeline. Left unannotated because
+// it allocates (heap), opens GPU resources, and writes globals —
+// the classifier infers @solo, which is the right home for a
+// lifecycle entry point.
+static fps_init_phase() {
+    render_init();
+    init_image();
+    hud_atlas = build_hud_atlas();
+
+    // Phase 2.3 — turn on the GPU timing readout so the HUD's
+    // "gpu: X ms" column populates from frame two onward. The
+    // readout reads the previous frame's MTLCommandBuffer
+    // timeline; one-frame latency is invisible at 60 FPS.
+    profile_gpu_enable();
+
+    FOV = 1.0472;            // 60° in radians
+    player = fps_body(3.5, 8.5, 0.0, 0.3, 3.0, 2.0);
+
+    action_define("fps_forward",    KEY_W,     0);
+    action_define("fps_back",       KEY_S,     0);
+    action_define("fps_strafe_l",   KEY_A,     0);
+    action_define("fps_strafe_r",   KEY_D,     0);
+    action_define("fps_turn_l",     KEY_LEFT,  0);
+    action_define("fps_turn_r",     KEY_RIGHT, 0);
+    action_define("profile_toggle", KEY_P,     0);
+    init_profile();
+
+    world_map = tile_new(MAP_W, MAP_H, 1, 1);
+    _init_map();
+
+    cam_buf = malloc(CAM_BUF_SZ);
+    map_buf = malloc(MAP_BUF_SZ);
+
+    // Pack the static map data into the uniform buffer once. The
+    // shader walks the same flat row-major layout (map[y * mw + x]).
+    auto x, y, cell;
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            cell = tile_get(world_map, x, y);
+            poke(map_buf + y * MAP_W + x, cell);
+        }
+    }
+
+    ray_pipeline = gpu_pipeline_load("assets/shaders/fps_raycast.metal",
+                                     "fps_vert", "fps_frag");
+    if (ray_pipeline == 0) {
+        put_err("fps_3d_gpu: failed to load fps_raycast.metal — exiting\n");
+        maestro_quit();
+    }
+    return 0;
+}
+
+// Solo phase: input → player state. Identical to fps_3d.bpp's solo
+// callback (same action names, same bindings, same fps_walk /
+// fps_turn dispatch). dt is float seconds — the maestro convention
+// since the AAPCS64 / SysV refactor.
+static fps_solo_phase(dt: float) @solo {
+    auto forward: float, strafe: float, turn: float;
+
+    if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
+
+    if (action_pressed("profile_toggle")) {
+        profile_hud_toggle();
+    }
+
+    forward = action_down("fps_forward")  - action_down("fps_back");
+    strafe  = action_down("fps_strafe_r") - action_down("fps_strafe_l");
+    turn    = action_down("fps_turn_r")   - action_down("fps_turn_l");
+
+    fps_turn(player, turn,    dt);
+    fps_walk(player, forward, strafe, dt, world_map);
+    return 0;
+}
+
+// Base phase: parallelisable work. Empty in 2.4 — Phase 3+ pushes
+// sprite sort + enemy AI here. `@base` keeps the lattice tight; if
+// future content writes a global from the base phase the classifier
+// will demote it to @solo via W026.
+static fps_base_phase(dt: float) @base {
+    return 0;
+}
+
+// Render phase: pack the camera uniform from current player state,
+// switch to the custom pipeline, draw the fullscreen pass, restore
+// the default pipeline so `profile_hud_draw` (which uses the engine
+// font + render_text path) keeps working unchanged.
+static fps_render_phase(alpha: float) @gpu {
+    auto p: FPSBody;
+    p = player;
+
+    render_begin();
+    render_clear(BLACK);
+
+    // Pack camera uniforms — must match the shader's CamUniforms
+    // layout byte-for-byte. The four floats go through write_f32
+    // (which calls pokefloat_h under the hood) so the shader reads
+    // 32-bit Metal floats; the four ints go through write_u32.
+    write_f32(cam_buf,  0, p.x);
+    write_f32(cam_buf,  4, p.y);
+    write_f32(cam_buf,  8, p.angle);
+    write_f32(cam_buf, 12, FOV);
+    write_u32(cam_buf, 16, SCREEN_W);
+    write_u32(cam_buf, 20, SCREEN_H);
+    write_u32(cam_buf, 24, MAP_W);
+    write_u32(cam_buf, 28, MAP_H);
+
+    gpu_pipeline_use(ray_pipeline);
+    gpu_uniform_set_frag(0, cam_buf, CAM_BUF_SZ);
+    gpu_uniform_set_frag(1, map_buf, MAP_BUF_SZ);
+    gpu_draw_full();
+    gpu_pipeline_use_default();
+
+    // Sessão A2 — HUD overlay drawn ON TOP of the ray-cast walls.
+    // Crosshair at the screen center, heart icon at the top-left.
+    // Both use image_draw_size: pipeline is already default after
+    // gpu_pipeline_use_default above, smart-bind switches slot 0
+    // to hud_atlas's texture in one flush, then both quads go in
+    // the same batch (only changes back to font texture when
+    // profile_hud_draw below calls render_text).
+    auto cross_x, cross_y;
+    cross_x = SCREEN_W / 2 - HUD_TILE / 2;
+    cross_y = SCREEN_H / 2 - HUD_TILE / 2;
+    image_draw_size(hud_atlas, HUD_CROSS, cross_x, cross_y, HUD_TILE, HUD_TILE);
+    image_draw_size(hud_atlas, HUD_HEART, 8, SCREEN_H - 24, HUD_TILE, HUD_TILE);
+
+    profile_hud_draw(8, 8, 1, 0xFFFF3333);
+
+    render_end();
+    return 0;
+}
+
+// Quit phase: nothing to free at process exit (the OS cleans up
+// MTL pipeline state, malloc'd buffers, and the GPU device on
+// termination). `@io` matches fps_3d.bpp for symmetry; the actual
+// effect is harmless — there's no IO here yet.
+static fps_quit_phase() @io {
+    return 0;
+}
+
+main() {
+    maestro_set_workers(N_WORKERS);
+    maestro_register_init(fn_ptr(fps_init_phase));
+    maestro_register_solo(fn_ptr(fps_solo_phase));
+    maestro_register_base(fn_ptr(fps_base_phase));
+    maestro_register_render(fn_ptr(fps_render_phase));
+    maestro_register_quit(fn_ptr(fps_quit_phase));
+    game_run(SCREEN_W, SCREEN_H, "B++ FPS GPU (Phase 2.4)", FPS);
+    return 0;
+}
+
+// ── Internal helpers ───────────────────────────────────────
+
+// Populates `world_map` with the same test maze fps_3d.bpp uses, so
+// switching between binaries is a one-flag visual swap and not a
+// new layout to learn. Keeping the layout copy here (rather than
+// importing from a shared .bsm) avoids a tight cross-file coupling
+// while the GPU path is still pre-Phase-3 — when both programs
+// graduate to a real ASCII-file loader (Phase 2 Session 4 of the
+// Wolf3D content track) the duplication folds away.
+static void _init_map() {
+    auto rows, x, y, ch;
+    rows = buf_word(MAP_H);
+    rows[0]  = "################";
+    rows[1]  = "#..............#";
+    rows[2]  = "#..@@@@@.......#";
+    rows[3]  = "#..@...@.......#";
+    rows[4]  = "#..@...@.......#";
+    rows[5]  = "#..@@@@@.......#";
+    rows[6]  = "#..............#";
+    rows[7]  = "#......!!......#";
+    rows[8]  = "#......!!......#";
+    rows[9]  = "#..............#";
+    rows[10] = "#.......%%%%%%.#";
+    rows[11] = "#..............#";
+    rows[12] = "#....##.....##.#";
+    rows[13] = "#....##........#";
+    rows[14] = "#..............#";
+    rows[15] = "################";
+
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            ch = peek(rows[y] + x);
+            switch (ch) {
+                '#' { tile_set(world_map, x, y, 1); }
+                '@' { tile_set(world_map, x, y, 2); }
+                '%' { tile_set(world_map, x, y, 3); }
+                '!' { tile_set(world_map, x, y, 4); }
+                else { }
+            }
+        }
+    }
+    free(rows);
+
+    // Mark every wall-type id solid so player movement (fps_walk)
+    // collides correctly. Map data already lives in `world_map`
+    // when the shader reads it, but the solid-bit table only
+    // affects the CPU-side movement code — the shader treats any
+    // non-zero cell as a wall regardless.
+    tile_solid(world_map, 1);
+    tile_solid(world_map, 2);
+    tile_solid(world_map, 3);
+    tile_solid(world_map, 4);
+}

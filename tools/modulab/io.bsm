@@ -1,23 +1,39 @@
 // io.bsm — ModuLab save/load.
 //
-// Two sidecar formats (per plan Decision #7):
+// Phase 3.5.5 — single unified file format. Older Modulab versions
+// shipped a paired `.json` (sprite16 export) + `.modulab.json`
+// (project state) sidecar pattern; the duality created a
+// hot-reload breakage where editing a sprite in Modulab updated
+// the export but never propagated to atlas packs that referenced
+// the old data. Phase 3.5.5 collapses the two into a single
+// canonical file:
 //
-//   <name>.json           — active-frame-only payload shaped
-//                           { "type":"sprite16", "width":N, "height":N,
-//                             "palette":"MCU-8",
-//                             "data": [[idx,...], [idx,...], ...] }
-//                           Drops straight into stbsprite's
-//                           load_sprite() without engine changes.
+//   <name>.json — `{ "type":"sprite", "width":N, "height":N,
+//                    "palette":[argb,...],
+//                    "frames":[ { "active_idx":..., "layers":[...],
+//                                 "data":[[idx,...],...] } ],
+//                    "data":[[idx,...],...] }`
 //
-//   <name>.modulab.json   — full project state:
-//                           { "type":"modulab", "size":N,
-//                             "palette":[argb, argb, ...],
-//                             "frames":[[[idx,...], ...]] }
-//                           Round-trip format for Phase 3's Open
-//                           dialog; Phase 1 only writes it.
+// `frames` carries Modulab's full editable state (per-layer alpha,
+// blend mode, visibility, raw indices). Top-level `data` is the
+// flattened composite of frame 0 — what atlas-pack manifests and
+// runtime image_load read directly without traversing the layer
+// tree. Both fields are written on every save, so the same file
+// round-trips through Modulab AND drops into the runtime atlas
+// loader without conversion.
 //
-// Phase 1 load is intentionally absent — Phase 3 wires the Open
-// dialog and parse path.
+// Backward compatibility:
+//   * `.modulab.json` files with `type:"modulab"` still load via
+//     `mlab_load_canonical` (legacy path inside the loader).
+//   * `.json` files with `type:"sprite16"` (single flat frame)
+//     also load via the same canonical reader.
+//   * Saves always emit the unified `type:"sprite"` shape.
+//
+// Atlas pack export switched from bundle (data inline) to
+// manifest (per-sprite path references) so runtime atlas loads
+// re-read source sprite files on every game launch — edit any
+// sprite, build/run, see the change. Sibling sprite files are
+// written alongside the manifest by `mlab_save_atlas_pack`.
 
 import "stbimage.bsm";
 import "stbwindow.bsm";
@@ -33,12 +49,17 @@ extrn g_frame_count;
 extrn _ui_filename_ti;
 extrn _ui_filename_buf;
 
-// ── Save: stbsprite-compatible sidecar ──────────────────
+// ── Export: legacy sprite16 single-frame ────────────────
 
-// Write the active frame as a sprite16-shaped JSON at `path`.
+// Write the active frame composite as a sprite16-shaped JSON at
+// `path`. This is the export-only legacy shape — Modulab does not
+// save in this format any more (the canonical writer at
+// mlab_save_canonical produces the unified `type:"sprite"`
+// payload). Kept callable as an explicit export option for tests
+// and downstream tools that want the older minimal shape.
+//
 // Returns 0 on success, -1 on write failure. Prints a one-line
-// stderr diagnostic on every failure path so console output is
-// enough to tell what went wrong.
+// stderr diagnostic on every failure path.
 mlab_save_sprite_compat(path)@io {
     auto sb, y, x, idx, rc;
 
@@ -73,33 +94,71 @@ mlab_save_sprite_compat(path)@io {
     return 0;
 }
 
-// ── Save: canonical ModuLab sidecar (schema v2) ─────────
+// ── Save: canonical unified sprite (Phase 3.5.5) ────────
 
-// Write the full project state at `path`. Schema v2 — every
-// frame carries its layer list; each layer has alpha, blend
-// mode, visibility, and a 2D index grid. v1 files (single
-// `data` array per frame) continue to load via the v1-compat
-// path in mlab_load_canonical.
+// Helper: write a 2D palette-indexed grid `[[idx,...],[idx,...]]`
+// from a flat byte buffer. Used by both the per-layer save and
+// the top-level composite write so the JSON serialisation of a
+// pixel grid lives in exactly one place.
+static _write_index_grid(sb, fbase, n)@io {
+    auto y, x, idx;
+    for (y = 0; y < n; y++) {
+        sb = json_write_array_begin(sb);
+        for (x = 0; x < n; x++) {
+            idx = peek(fbase + y * n + x);
+            sb = json_write_int(sb, idx);
+        }
+        sb = json_write_array_end(sb);
+    }
+    return sb;
+}
+
+// Write the full Modulab project state to `path` as a unified
+// sprite file. Schema (Phase 3.5.5):
+//
+//   { "type":"sprite", "version":3,
+//     "width":N, "height":N,
+//     "palette":[argb,...],
+//     "frames":[
+//       { "active_idx":k,
+//         "layers":[
+//           { "alpha":a, "blend":b, "visible":v,
+//             "data":[[idx,...],[idx,...]] }, ... ],
+//         "data":[[idx,...],[idx,...]] } ],   (composite of layers)
+//     "data":[[idx,...],[idx,...]] }          (composite of frame 0)
+//
+// `frames[].data` and the top-level `data` are the flattened
+// composites Modulab keeps in `g_frame_data`. The runtime atlas
+// loader (image_load in stb/stbimage.bsm) reads either through
+// `_find_sprite_data_idx`, so sprite files round-trip through
+// Modulab AND drop straight into atlas-pack manifests.
+//
+// Returns 0 on success, -1 on write failure. Prints a one-line
+// stderr diagnostic on every failure path.
 mlab_save_canonical(path)@io {
-    auto sb, y, x, i, idx, rc, fi, fbase;
+    auto sb, i, rc, fi, fbase;
     auto lc, k, lp, l: Layer;
 
     sb = strbuf_new();
     sb = json_writer_begin(sb);
     sb = json_write_object_begin(sb);
-    sb = json_write_string_field(sb, "type", "modulab");
-    sb = json_write_int_field(sb, "version", 2);
-    sb = json_write_int_field(sb, "size", g_canvas_n);
+    sb = json_write_string_field(sb, "type", "sprite");
+    sb = json_write_int_field(sb, "version", 3);
+    sb = json_write_int_field(sb, "width",  g_canvas_n);
+    sb = json_write_int_field(sb, "height", g_canvas_n);
 
-    // Palette as an array of ARGB integers.
+    // Palette — array of ARGB integers. Modulab supports custom
+    // palettes; readers that only know "MCU-8" can compare the
+    // first 8 entries against the built-in to detect.
     sb = json_write_array_field_begin(sb, "palette");
     for (i = 0; i < g_pal_n; i++) {
         sb = json_write_int(sb, *(g_palette + i * 8));
     }
     sb = json_write_array_end(sb);
 
-    // Frames — each frame is an object { active_idx, layers: [...] }.
-    // Each layer is an object { alpha, blend, visible, data: [[...]] }.
+    // Frames — each frame carries its full layer state PLUS the
+    // flattened composite. The composite is what runtime consumers
+    // read; the layer state is what Modulab restores on next open.
     sb = json_write_array_field_begin(sb, "frames");
     for (fi = 0; fi < g_frame_count; fi++) {
         lc = frame_layer_count(fi);
@@ -117,19 +176,38 @@ mlab_save_canonical(path)@io {
             sb = json_write_int_field(sb, "blend",   l.blend);
             sb = json_write_int_field(sb, "visible", l.visible);
             sb = json_write_array_field_begin(sb, "data");
-            for (y = 0; y < g_canvas_n; y++) {
-                sb = json_write_array_begin(sb);
-                for (x = 0; x < g_canvas_n; x++) {
-                    idx = peek(fbase + y * g_canvas_n + x);
-                    sb = json_write_int(sb, idx);
-                }
-                sb = json_write_array_end(sb);
-            }
+            sb = _write_index_grid(sb, fbase, g_canvas_n);
             sb = json_write_array_end(sb);
             sb = json_write_object_end(sb);
         }
         sb = json_write_array_end(sb);
+
+        // Per-frame composite. For the active frame Modulab keeps
+        // `g_frame_data` live; for inactive frames we read layer 0
+        // as an approximation (Phase 3.5.5 ships the live composite
+        // for the active frame; multi-layer compositing for
+        // inactive frames lands when the timeline gains preview).
+        sb = json_write_array_field_begin(sb, "data");
+        if (fi == g_frame_idx) {
+            sb = _write_index_grid(sb, g_frame_data, g_canvas_n);
+        } else {
+            lp = layer_at(fi, 0);
+            if (lp != 0) { l = lp; sb = _write_index_grid(sb, l.fb, g_canvas_n); }
+        }
+        sb = json_write_array_end(sb);
         sb = json_write_object_end(sb);
+    }
+    sb = json_write_array_end(sb);
+
+    // Top-level shorthand `data` = composite of frame 0. Lets
+    // simple consumers (sprite16-style readers, single-frame
+    // games) skip the frames array entirely.
+    sb = json_write_array_field_begin(sb, "data");
+    if (g_frame_idx == 0) {
+        sb = _write_index_grid(sb, g_frame_data, g_canvas_n);
+    } else {
+        lp = layer_at(0, 0);
+        if (lp != 0) { l = lp; sb = _write_index_grid(sb, l.fb, g_canvas_n); }
     }
     sb = json_write_array_end(sb);
 
@@ -147,47 +225,221 @@ mlab_save_canonical(path)@io {
     return 0;
 }
 
-// ── Save: both sidecars side by side ────────────────────
+// ── Save: atlas pack (Phase 3.5.1) ──────────────────────
 
-// Save both files sharing a common base path. `base` should include
-// the desired directory + filename without any extension. This is
-// the single entry point the main loop calls on Ctrl+S.
-// Example: mlab_save_both("games/pathfind/assets/sprites/hero")
-// produces:
-//   games/pathfind/assets/sprites/hero.json
-//   games/pathfind/assets/sprites/hero.modulab.json
-// Returns 0 on success, -1 if either write failed.
+// Write the entire frame set as a single atlas pack at `path`. The
+// output JSON is the canonical "many sprites in one file" container
+// the runtime atlas loader (`image_load` in `stb/stbimage.bsm`)
+// consumes — each Modulab frame becomes one named sprite in the
+// pack, ordered row-major as it appears in the timeline.
+//
+// Schema v1:
+//   { "type":"atlas_pack", "version":1,
+//     "palette":"MCU-8", "tile_w":N, "tile_h":N,
+//     "sprites": [
+//       { "name":"frame_0", "data":[[idx,...],...] },
+//       { "name":"frame_1", "data":[[idx,...],...] },
+//       ...
+//     ] }
+//
+// Each sprite's `data` is the layer 0 pixel grid of the source
+// frame. Multi-layer compositing is intentionally NOT done in v1 —
+// games that import this file get the bottom-most layer of every
+// frame. A v2 schema can add explicit layer arrays per sprite when
+// a real consumer needs them.
+//
+// Returns 0 on success, -1 on write failure.
+// Helper: derive the directory portion of `path` (everything up
+// to and including the last '/') as a fresh allocation. Returns
+// an empty string for paths with no directory component. Caller
+// frees. Used by mlab_save_atlas_pack to write each sibling
+// sprite file alongside the manifest.
+static _path_dir(path)@io {
+    auto i, len, last, out;
+    len = str_len(path);
+    last = -1;
+    for (i = len - 1; i >= 0; i--) {
+        if (peek(path + i) == 47) { last = i; break; }   // '/'
+    }
+    if (last < 0) {
+        out = malloc(1);
+        poke(out, 0);
+        return out;
+    }
+    out = malloc(last + 2);
+    buf_copy(out, path, last + 1);
+    poke(out + last + 1, 0);
+    return out;
+}
+
+// Write the entire frame set as an atlas pack manifest at `path`,
+// PLUS one sibling sprite file per frame. Each sprite file holds
+// the canonical unified Modulab payload (full layer state +
+// flattened composite); the manifest lists per-frame name + path
+// references that the runtime atlas loader recursively dereferences.
+//
+// Schema (v2 — manifest):
+//   { "type":"atlas_pack", "version":2,
+//     "tile_w":N, "tile_h":N,
+//     "sprites":[
+//       { "name":"frame_0", "path":"<base>_frame_0.json" },
+//       { "name":"frame_1", "path":"<base>_frame_1.json" } ] }
+//
+// Sibling files: `<base>_frame_<i>.json` next to the manifest. The
+// `<base>` prefix is the manifest filename minus its `.atlas.json`
+// suffix (or `.json`, falling back to the bare filename) so a
+// manifest at `assets/sprites/pathfind.atlas.json` writes
+// `pathfind_frame_0.json`, `pathfind_frame_1.json`, etc. alongside.
+//
+// Hot-reload becomes natural: edit any sibling sprite in Modulab,
+// rebuild the consumer (no manifest rewrite required), see the
+// change. Bundle-mode authoring (everything inline in one file)
+// is still readable by the runtime — older atlas packs continue
+// to load — but Modulab no longer writes that shape.
+//
+// Returns 0 on success, -1 on any write failure (manifest or
+// any sibling). Prints a one-line stderr diagnostic per failure.
+mlab_save_atlas_pack(path)@io {
+    auto sb, fi, rc, dir, base, sib_sb;
+    auto sib_name, sib_path, name_sb;
+    auto plen, dot;
+    auto saved_frame_idx, saved_frame_data;
+
+    // Compute the manifest's containing directory and the base
+    // filename (without extension) so each sibling lands beside it.
+    dir = _path_dir(path);
+
+    plen = str_len(path);
+    dot = -1;
+    auto i;
+    for (i = str_len(dir); i < plen; i++) {
+        if (peek(path + i) == 46) { dot = i; break; }   // '.'
+    }
+    auto base_start, base_end, base_len;
+    base_start = str_len(dir);
+    base_end = (dot >= 0) ? dot : plen;
+    base_len = base_end - base_start;
+    base = malloc(base_len + 1);
+    buf_copy(base, path + base_start, base_len);
+    poke(base + base_len, 0);
+
+    // Manifest body.
+    sb = strbuf_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "atlas_pack");
+    sb = json_write_int_field(sb, "version", 2);
+    sb = json_write_int_field(sb, "tile_w", g_canvas_n);
+    sb = json_write_int_field(sb, "tile_h", g_canvas_n);
+
+    sb = json_write_array_field_begin(sb, "sprites");
+    saved_frame_idx = g_frame_idx;
+    saved_frame_data = g_frame_data;
+    for (fi = 0; fi < g_frame_count; fi++) {
+        // Auto-generated sibling name: `<base>_frame_<i>.json`.
+        // A future Modulab UI can let the user label frames and
+        // map those labels into both the manifest `name` and the
+        // sibling filename — this autogen is the floor.
+        name_sb = strbuf_new();
+        name_sb = strbuf_cat(name_sb, "frame_");
+        name_sb = strbuf_num(name_sb, fi);
+        sib_name = str_dup(name_sb);
+        name_sb = strbuf_free(name_sb);
+
+        sib_sb = strbuf_new();
+        sib_sb = strbuf_cat(sib_sb, dir);
+        sib_sb = strbuf_cat(sib_sb, base);
+        sib_sb = strbuf_cat(sib_sb, "_");
+        sib_sb = strbuf_cat(sib_sb, sib_name);
+        sib_sb = strbuf_cat(sib_sb, ".json");
+        sib_path = str_dup(sib_sb);
+        sib_sb = strbuf_free(sib_sb);
+
+        // Switch the live frame so mlab_save_canonical writes the
+        // composite for THIS frame. Restored after the loop.
+        frame_switch(fi);
+        rc = mlab_save_canonical(sib_path);
+        if (rc != 0) {
+            free(sib_name); free(sib_path);
+            free(base); free(dir);
+            sb = strbuf_free(sb);
+            frame_switch(saved_frame_idx);
+            return -1;
+        }
+
+        // Manifest entry — relative path so the pack stays
+        // location-independent (a build pipeline can copy the
+        // whole sprites directory anywhere and the manifest still
+        // resolves).
+        sb = json_write_object_begin(sb);
+        sb = json_write_string_field(sb, "name", sib_name);
+        auto rel_sb;
+        rel_sb = strbuf_new();
+        rel_sb = strbuf_cat(rel_sb, base);
+        rel_sb = strbuf_cat(rel_sb, "_");
+        rel_sb = strbuf_cat(rel_sb, sib_name);
+        rel_sb = strbuf_cat(rel_sb, ".json");
+        sb = json_write_string_field(sb, "path", rel_sb);
+        rel_sb = strbuf_free(rel_sb);
+        sb = json_write_object_end(sb);
+
+        free(sib_name);
+        free(sib_path);
+    }
+    frame_switch(saved_frame_idx);
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all(path, sb, strbuf_len(sb));
+    sb = strbuf_free(sb);
+    free(base); free(dir);
+
+    if (rc != 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': manifest write failed\n");
+        return -1;
+    }
+    put_err("modulab: '");
+    putstr_err(path);
+    put_err("' manifest saved (");
+    putnum_err(g_frame_count);
+    put_err(" sprites @ ");
+    putnum_err(g_canvas_n);
+    put_err("x");
+    putnum_err(g_canvas_n);
+    put_err(")\n");
+    return 0;
+}
+
+// ── Save: convenience wrapper ───────────────────────────
+
+// Save the active project to `<base>.json` using the unified
+// canonical format (Phase 3.5.5 — one file replaces the older
+// `.json` + `.modulab.json` pair). Kept as `mlab_save_both` for
+// caller-stability; the body is now a thin wrapper around
+// `mlab_save_canonical`.
 mlab_save_both(base)@io {
-    auto p_sprite, p_canon, sb1, sb2, rc1, rc2;
+    auto sb, p, rc;
 
-    sb1 = strbuf_new();
-    sb1 = strbuf_cat(sb1, base);
-    sb1 = strbuf_cat(sb1, ".json");
-    p_sprite = sb1;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, base);
+    sb = strbuf_cat(sb, ".json");
+    p = sb;
 
-    sb2 = strbuf_new();
-    sb2 = strbuf_cat(sb2, base);
-    sb2 = strbuf_cat(sb2, ".modulab.json");
-    p_canon = sb2;
-
-    rc1 = mlab_save_sprite_compat(p_sprite);
-    rc2 = mlab_save_canonical(p_canon);
-
-    if (rc1 == 0 && rc2 == 0) {
+    rc = mlab_save_canonical(p);
+    if (rc == 0) {
         put_err("modulab: '");
         putstr_err(base);
         put_err(".json' saved (");
         putnum_err(g_canvas_n);
         put_err("x");
         putnum_err(g_canvas_n);
-        put_err(" MCU-8)\n");
+        put_err(")\n");
     }
 
-    sb1 = strbuf_free(sb1);
-    sb2 = strbuf_free(sb2);
-
-    if (rc1 != 0 || rc2 != 0) { return -1; }
-    return 0;
+    sb = strbuf_free(sb);
+    return rc;
 }
 
 // Load one frame node from JSON into modulab state. Handles both
@@ -290,22 +542,35 @@ static void _load_frame_node(doc, frame_node, f) {
     frame_switch(saved_frame_idx);
 }
 
-// ── Load: canonical ModuLab ─────────────────────────────
+// ── Load: canonical ModuLab (universal sprite reader) ───
 
-// Parse a <name>.modulab.json file and copy its frames + palette
-// into the current state. Returns 0 on success, -1 on any parse /
-// validation failure. Prints a one-line stderr diagnostic on every
-// rejection path.
+// Parse a sprite file and copy its frames + palette into the
+// current Modulab state. Accepts every shape Phase 3.5.5 cares
+// about, picking dimensions / palette / frames defensively from
+// whichever fields the source shape provides:
 //
-// Phase 3 requirement: the file's "size" must match g_canvas_n. An
-// import that would resize the canvas is deferred to Phase 4
-// (universe switching) so open-of-wrong-size fails loudly instead
-// of silently truncating or stretching the art.
+//   type:"sprite"   — Phase 3.5.5 unified canonical (frames with
+//                      per-layer state PLUS top-level composite).
+//   type:"modulab"  — legacy v1/v2 project-state files (size +
+//                      array-only `frames`, possibly multi-layer).
+//   type:"sprite16" — single-frame export (top-level `data`, no
+//                      frames array).
+//
+// Width comes from `width` (preferred), `size` (legacy), or 16
+// (final fallback). Palette accepts the array form (ARGB ints)
+// AND the "MCU-8" string — when the field is a string we pre-fill
+// the built-in palette before letting array entries override.
+//
+// Returns 0 on success, -1 on any parse / validation failure.
+// Prints a one-line stderr diagnostic on every rejection path.
+//
+// Phase 3 requirement still holds: the file's width/size must
+// match g_canvas_n. Resizing is deferred to Phase 4.
 mlab_load_canonical(path)@io {
     auto buf, size_out, doc, root;
-    auto size_idx, pal_idx, frames_idx;
+    auto type_s, size_idx, width_idx, pal_idx, frames_idx, data_idx;
     auto size_value, pal_len, frames_len;
-    auto i, f, y, x, frame_node, row_node, cell, fbase, color_word;
+    auto i, f, frame_node, color_word, pal_type;
 
     size_out = malloc(8);
     *(size_out) = 0;
@@ -329,18 +594,22 @@ mlab_load_canonical(path)@io {
     }
 
     root = json_root(doc);
+    type_s     = json_object_get_string(doc, root, "type");
     size_idx   = json_object_get(doc, root, "size");
+    width_idx  = json_object_get(doc, root, "width");
     pal_idx    = json_object_get(doc, root, "palette");
     frames_idx = json_object_get(doc, root, "frames");
-    if (size_idx < 0 || pal_idx < 0 || frames_idx < 0) {
-        put_err("modulab: '");
-        putstr_err(path);
-        put_err("': missing required field (size/palette/frames)\n");
-        json_free(doc);
-        return -1;
-    }
+    data_idx   = json_object_get(doc, root, "data");
 
-    size_value = json_int(doc, size_idx);
+    // Width / size dispatch — width preferred (unified sprite),
+    // size as legacy fallback.
+    if (width_idx >= 0) {
+        size_value = json_int(doc, width_idx);
+    } else if (size_idx >= 0) {
+        size_value = json_int(doc, size_idx);
+    } else {
+        size_value = g_canvas_n;
+    }
     if (size_value != g_canvas_n) {
         put_err("modulab: '");
         putstr_err(path);
@@ -353,32 +622,73 @@ mlab_load_canonical(path)@io {
         return -1;
     }
 
-    // Copy palette. Any slots past g_pal_n are ignored; any slots
-    // short of g_pal_n leave the trailing entries at their current
-    // values.
-    pal_len = json_length(doc, pal_idx);
-    if (pal_len > g_pal_n) { pal_len = g_pal_n; }
-    for (i = 0; i < pal_len; i++) {
-        color_word = json_int(doc, json_child(doc, pal_idx, i));
-        *(g_palette + i * 8) = color_word;
+    // Palette — accept array (Modulab native) or "MCU-8" string
+    // (sprite16 legacy export). Any slots past g_pal_n are ignored;
+    // missing field leaves the existing palette untouched so a
+    // sprite16 file (no palette field at all) reuses whatever is
+    // currently in the editor.
+    if (pal_idx >= 0) {
+        pal_type = json_type(doc, pal_idx);
+        if (pal_type == JSON_STRING) {
+            // Pre-fill with the built-in named palette. "MCU-8" is
+            // the only one wired today; future names extend here.
+            auto pname;
+            pname = json_string(doc, pal_idx);
+            if (pname != 0 && str_eq(pname, "MCU-8")) {
+                // Modulab keeps its own palette buffer; refresh it
+                // from the canonical MCU-8 colours via stbpal.
+                auto tmp_pal;
+                tmp_pal = palette_new(8);
+                palette_fill_mcu_8(tmp_pal);
+                pal_len = 8;
+                if (pal_len > g_pal_n) { pal_len = g_pal_n; }
+                for (i = 0; i < pal_len; i++) {
+                    *(g_palette + i * 8) = palette_get(tmp_pal, i);
+                }
+                palette_free(tmp_pal);
+            }
+        } else if (pal_type == JSON_ARRAY) {
+            pal_len = json_length(doc, pal_idx);
+            if (pal_len > g_pal_n) { pal_len = g_pal_n; }
+            for (i = 0; i < pal_len; i++) {
+                color_word = json_int(doc, json_child(doc, pal_idx, i));
+                *(g_palette + i * 8) = color_word;
+            }
+        }
     }
 
-    // Copy frames. Two on-disk shapes are supported:
-    //   v1 — frames[f] is a 2D array [[idx,...], ...]. Single
-    //        implicit layer. Any existing layers on the target
-    //        frame beyond the first are dropped.
-    //   v2 — frames[f] is an object with `layers: [...]` and an
-    //        optional `active_idx`. Every layer is restored with
-    //        its alpha / blend / visible / data fields.
-    frames_len = json_length(doc, frames_idx);
-    if (frames_len < 1)          { frames_len = 1; }
-    if (frames_len > 16)         { frames_len = 16; }   // MAX_FRAMES ceiling
-    for (f = 0; f < frames_len; f++) {
-        ensure_frame(f);
-        frame_node = json_child(doc, frames_idx, f);
-        _load_frame_node(doc, frame_node, f);
+    // Frames — accept three on-disk shapes:
+    //   * frames[f] is an object with `layers:[...]` (Phase 3.5.5
+    //     unified + legacy modulab v2). _load_frame_node restores
+    //     every layer's alpha/blend/visible/data.
+    //   * frames[f] is a 2D array (modulab v1 single-implicit-layer).
+    //     Same loader handles it via the v1-compat path.
+    //   * No `frames` at all but a top-level `data` (sprite16):
+    //     synthesise one frame with one layer carrying that data.
+    if (frames_idx >= 0) {
+        frames_len = json_length(doc, frames_idx);
+        if (frames_len < 1)  { frames_len = 1; }
+        if (frames_len > 16) { frames_len = 16; }   // MAX_FRAMES ceiling
+        for (f = 0; f < frames_len; f++) {
+            ensure_frame(f);
+            frame_node = json_child(doc, frames_idx, f);
+            _load_frame_node(doc, frame_node, f);
+        }
+        g_frame_count = frames_len;
+    } else if (data_idx >= 0) {
+        // sprite16 fallback — pass the 2D data array directly to
+        // _load_frame_node, which treats non-OBJECT nodes as the
+        // legacy v1 shape (single implicit layer with raw indices).
+        ensure_frame(0);
+        _load_frame_node(doc, data_idx, 0);
+        g_frame_count = 1;
+    } else {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': missing required field (frames or data)\n");
+        json_free(doc);
+        return -1;
     }
-    g_frame_count = frames_len;
 
     json_free(doc);
 
@@ -433,15 +743,15 @@ static _quantize_rgb(r, g, b)@base {
 mlab_import_png(path)@io {
     auto pixels, w, h, x, y, rgba_off, r, g, b, a, idx, rc;
 
-    pixels = img_load(path);
+    pixels = pixels_load(path);
     if (pixels == 0) {
         put_err("modulab: '");
         putstr_err(path);
         put_err("': PNG load failed\n");
         return -1;
     }
-    w = img_w();
-    h = img_h();
+    w = pixels_w();
+    h = pixels_h();
     if (w != g_canvas_n || h != g_canvas_n) {
         put_err("modulab: '");
         putstr_err(path);
@@ -450,7 +760,7 @@ mlab_import_png(path)@io {
         put_err(" != canvas ");
         putnum_err(g_canvas_n); put_err("x"); putnum_err(g_canvas_n);
         put_err("\n");
-        img_free(pixels);
+        pixels_free(pixels);
         return -1;
     }
 
@@ -468,7 +778,7 @@ mlab_import_png(path)@io {
         }
     }
 
-    img_free(pixels);
+    pixels_free(pixels);
     history_commit();
     put_err("modulab: '");
     putstr_err(path);
@@ -482,7 +792,7 @@ mlab_import_png(path)@io {
 
 // Write a <base>.sheet.json metadata file describing the logical
 // grid layout of every frame. Phase 4 pairs this with a PNG grid
-// composited via img_save_png. Returns 0 on success, -1 on write
+// composited via pixels_save_png. Returns 0 on success, -1 on write
 // failure.
 mlab_export_spritesheet_json(path, cols)@io {
     auto sb, rows, rc;
@@ -558,7 +868,7 @@ mlab_export_spritesheet_png(path, cols)@io {
         }
     }
 
-    rc = img_save_png(path, rgba, sheet_w, sheet_h);
+    rc = pixels_save_png(path, rgba, sheet_w, sheet_h);
     free(rgba);
     if (rc != 0) { return -1; }
 
@@ -667,13 +977,17 @@ mlab_save_dialog()@io {
 
 // Load a sprite file at an explicit path (no dialog). Same dispatch
 // logic as mlab_open_dialog. Used by modulab_lib_try_load for auto-discovery.
+//
+// Phase 3.5.5: any `.json` (or legacy `.modulab.json`) routes
+// through `mlab_load_canonical`, which is now the universal
+// reader for `type:"sprite"`, `type:"sprite16"` and the legacy
+// `type:"modulab"` shape. Extension-based routing kept only to
+// distinguish JSON from PNG.
 mlab_open_dialog_from_path(picked)@io {
     auto rc, stripped;
 
-    if (str_ends(picked, ".modulab.json") != 0) {
+    if (str_ends(picked, ".json") != 0) {
         rc = mlab_load_canonical(picked);
-    } else if (str_ends(picked, ".json") != 0) {
-        rc = mlab_load_sprite_compat(picked);
     } else if (str_ends(picked, ".png") != 0) {
         rc = mlab_import_png(picked);
     } else {
@@ -690,9 +1004,8 @@ mlab_open_dialog_from_path(picked)@io {
 }
 
 // Show a native Open dialog and dispatch by extension:
-//   .modulab.json → canonical full-project load
-//   .json         → stbsprite-compat single-frame load
-//   .png          → quantize + import into active frame
+//   .json (any flavour) → canonical universal reader
+//   .png                 → quantize + import into active frame
 // On success, syncs the filename field to the loaded path prefix so
 // Save writes back to the same file rather than the last-typed name.
 mlab_open_dialog()@io {
@@ -701,10 +1014,8 @@ mlab_open_dialog()@io {
     picked = window_open_dialog("Open sprite");
     if (picked == 0) { return -1; }
 
-    if (str_ends(picked, ".modulab.json") != 0) {
+    if (str_ends(picked, ".json") != 0) {
         rc = mlab_load_canonical(picked);
-    } else if (str_ends(picked, ".json") != 0) {
-        rc = mlab_load_sprite_compat(picked);
     } else if (str_ends(picked, ".png") != 0) {
         rc = mlab_import_png(picked);
     } else {

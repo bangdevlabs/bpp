@@ -1,0 +1,185 @@
+// stbshader.bsm — Custom GPU pipelines for B++ games.
+//
+// Backend-portable contract for the BUILT-IN sprite pipeline
+// (consumed by render_sprite + every atlas_* draw):
+//
+//   - RGBA atlas sprites are sampled with NEAREST filtering by
+//     default. B++ targets pixel-art games where bilinear blur
+//     bleeds neighbouring tile texels into the sampled fragment
+//     and produces a 1-pixel dark line around every tile of a
+//     uniform-grid spritesheet (the Kenney case). Nearest is the
+//     pixel-art-correct choice and it is the macOS Metal default
+//     today — when the Linux/Vulkan or Windows/D3D backend grows
+//     a real sprite shader, it MUST honour the same default for
+//     parity. Game code that wants smooth scaling (post-process
+//     CRT, blurred portraits) loads its own pipeline through the
+//     stbshader API below and chooses its own sampler.
+//   - Font-glyph alpha masks are sampled with LINEAR for the
+//     rare case of sub-pixel glyph kerning at non-1.0 scales.
+//   - Palette-indexed sprites and the palette LUT are sampled
+//     with NEAREST because filtering an integer index is
+//     meaningless and would corrupt colour lookup.
+
+//
+// Sibling cartridge to stbrender. While stbrender owns the
+// "draw a thing" API (rect, line, sprite, text) backed by the
+// engine's default Metal pipeline, stbshader owns the
+// "build and run my own pipeline" API: load a `.metal` file,
+// compile it through MTLLibrary + MTLRenderPipelineState, swap
+// it in for a stretch of draws, then restore the default. Game
+// code that only paints with the built-ins (snake, rhythm)
+// never imports this file. Game code that needs custom shaders
+// (CRT effects, ray-cast fragment, palette quantize, scanlines)
+// imports it on top of stbrender.
+//
+// Usage:
+//   import "stbgame.bsm";
+//   import "stbrender.bsm";
+//   import "stbshader.bsm";
+//
+//   auto pipe;
+//   game_init(320, 180, "demo", 60);
+//   render_init();
+//   pipe = gpu_pipeline_load("assets/shaders/crt.metal",
+//                            "crt_vert", "crt_frag");
+//   while (game_should_quit() == 0) {
+//       game_frame_begin();
+//       render_begin();
+//       render_clear(BLACK);          // default pipeline
+//       gpu_pipeline_use(pipe);       // switch to custom
+//       gpu_uniform_set_frag(0, &time_buf, 16);
+//       gpu_draw_full();              // fullscreen-triangle pass
+//       gpu_pipeline_use_default();   // back to default
+//       render_text("hud", 4, 4, 1, WHITE);
+//       render_end();
+//   }
+//
+// The default pipeline (used by render_clear, render_rect,
+// render_text, render_sprite, etc.) stays available — call
+// gpu_pipeline_use_default() to restore it after a stretch of
+// custom-pipeline draws so subsequent render_* calls keep
+// working without manual encoder reset. See
+// `assets/shaders/trivial.metal` for a minimal vertex+fragment
+// example.
+//
+// Backend portability:
+//   The functions in this file dispatch into the platform layer's
+//   `_stb_gpu_pipeline_*` primitives, which exist as full Metal
+//   implementations under `src/backend/os/macos/` and as no-op
+//   stubs under `src/backend/os/linux/` (real Vulkan / DX12 /
+//   WebGPU backends are deferred per `gpu_pipeline_roadmap.md`'s
+//   cross-platform decision). Game code linked against this
+//   cartridge compiles on every supported OS — only execution
+//   differs until parity sidequests land.
+
+// bpp_file is needed by `gpu_pipeline_load` which reads a .metal
+// shader source from disk before handing it to the platform layer
+// for compilation.
+
+// Read a .metal source file and build a pipeline state that
+// references the named vertex and fragment entry points. Returns
+// a pipeline handle, or 0 if the file is unreadable or the shader
+// fails to compile (the platform layer prints the Metal compiler
+// error to stderr in either case). Left un-annotated for the same
+// reason as render_init: the failure path emits stderr text, so
+// the inferred effect is SOLO and an explicit `: gpu` would clash
+// with the lattice via join(GPU, IO) = SOLO.
+gpu_pipeline_load(metal_path, vert_name, frag_name) {
+    auto src, fsize, pipe;
+    fsize = 0;
+    src = file_read_all(metal_path, &fsize);
+    if (src == 0) {
+        put_err("gpu_pipeline_load: cannot read ");
+        put_err(metal_path);
+        put_err("\n");
+        return 0;
+    }
+    pipe = _stb_gpu_pipeline_load(src, vert_name, frag_name);
+    free(src);
+    return pipe;
+}
+
+// Bind a custom pipeline for subsequent draws this frame. Pair
+// with gpu_pipeline_use_default() once the custom pass is done so
+// later render_* calls find the encoder in the default state.
+void gpu_pipeline_use(pipeline)@gpu {
+    _stb_gpu_pipeline_use(pipeline);
+}
+
+// Restore the default stbrender pipeline + screen uniform + font
+// texture. Necessary after any custom gpu_pipeline_use() if the
+// caller wants to resume using render_text / render_sprite /
+// render_rect later in the same frame.
+void gpu_pipeline_use_default()@gpu {
+    _stb_gpu_pipeline_use_default();
+}
+
+// Bind a small block of bytes as a fragment-stage uniform at the
+// given buffer slot. Cap is 4 KB per Metal's inline-bytes spec —
+// for larger payloads, allocate a persistent buffer and bind it
+// directly via the platform layer.
+void gpu_uniform_set_frag(slot, data, size)@gpu {
+    _stb_gpu_uniform_set_frag(slot, data, size);
+}
+
+// Bind a small block of bytes as a vertex-stage uniform at the
+// given buffer slot. Slots 0 and 1 are reserved for the default
+// stbrender pipeline (vertex batch + screen uniform); custom
+// pipelines that coexist with the default path should claim slot
+// 2 or higher.
+void gpu_uniform_set_vert(slot, data, size)@gpu {
+    _stb_gpu_uniform_set_vert(slot, data, size);
+}
+
+// Issue a 3-vertex no-buffer draw, intended for custom pipelines
+// whose vertex stage synthesises positions from [[vertex_id]] —
+// the standard way to drive a fullscreen fragment shader.
+void gpu_draw_full()@gpu {
+    _stb_gpu_draw_full();
+}
+
+// ── Sampler + texture binding (Phase 2.2) ────────────────────
+
+// Create a sampler that reads textures with NEAREST filtering and
+// clamp-to-edge on both axes. The pixel-art canonical setting —
+// no smoothing between texels, sharp edges at any zoom level.
+// Returns the sampler handle (0 on platforms without a real GPU
+// backend yet, e.g. Linux Vulkan parity pending).
+gpu_sampler_nearest()@gpu {
+    return _stb_gpu_sampler_create(0);
+}
+
+// Create a sampler with LINEAR filtering and clamp-to-edge — the
+// "smooth bilinear" setting for non-pixel-art content. Same return
+// contract as gpu_sampler_nearest.
+gpu_sampler_linear()@gpu {
+    return _stb_gpu_sampler_create(1);
+}
+
+// Bind a texture for fragment-stage sampling at the given slot.
+// Slot 0 is reused with the default stbrender pipeline; the
+// default rebind happens automatically inside
+// gpu_pipeline_use_default(). Custom pipelines that coexist with
+// default draws and need their own texture across frames should
+// rebind after each gpu_pipeline_use() call.
+void gpu_bind_texture_frag(slot, tex)@gpu {
+    _stb_gpu_bind_texture_frag(slot, tex);
+}
+
+// Bind a texture for vertex-stage sampling. Rare in 2D — useful
+// only for shaders that pull vertex data or instance attributes
+// from a texture map.
+void gpu_bind_texture_vert(slot, tex)@gpu {
+    _stb_gpu_bind_texture_vert(slot, tex);
+}
+
+// Bind a sampler for fragment-stage sampling at the given slot.
+// Pair with gpu_bind_texture_frag — a fragment shader that reads
+// `tex.sample(smp, uv)` needs both bound at matching slots. Skip
+// this bind when the shader declares its sampler as
+// `constexpr sampler smp(filter::nearest)` inline; the CPU-side
+// bind is only required when the filter mode needs to vary at
+// runtime.
+void gpu_bind_sampler_frag(slot, sampler)@gpu {
+    _stb_gpu_bind_sampler_frag(slot, sampler);
+}

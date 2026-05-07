@@ -16,6 +16,43 @@ the same.
 only tool that can build the compiler. If it gets corrupted, you must recover
 it from git (`git show HEAD:bpp > bpp && chmod +x bpp`).
 
+## Three Disciplines on Every Change
+
+These apply to every B++ change that isn't a doc-only edit. If a change
+violates any of them, it is incomplete — fix the violation before
+declaring the work done.
+
+1. **Tonify by default.** Every new function and every touched function
+   gets the `tonify_checklist.md` rules applied (storage class,
+   visibility, return type, phase annotation, `++`/`+=`, slice types,
+   typed struct access, etc.). Tonifying as you write costs nothing;
+   tonifying afterwards as a sweep is how rules drift out of sync with
+   the code. Treat tonify as a property of the change, not a chore
+   between phases.
+
+2. **Backend agnostic, always.** B++ is intentionally portable. A change
+   that lands on macOS but breaks (or never gets stubbed for) Linux is
+   a half-change — the backend layer must keep parity even when the
+   real implementation is deferred. Add Linux no-op stubs in the same
+   commit as the macOS implementation; document them as "ships when
+   Vulkan / DX12 / WebGPU lands" so future readers know the contract
+   is intentional. Same rule applies to chip backends (a64 + x64) and
+   target containers (Mach-O + ELF).
+
+3. **Use `bpp_codegen.bsm` as the spine when the work is shape-shared
+   across chips.** The compiler runs both `a64_codegen.bsm` and
+   `x64_codegen.bsm` in the same binary; portable codegen logic that
+   would otherwise be duplicated belongs in `bpp_codegen.bsm`, with
+   the chip-specific instruction emit deferred to a primitive in
+   `cg_prim` (the chip-installed function-pointer table). Worked
+   examples: `cg_emit_call`, `cg_emit_func`, `cg_builtin_dispatch`.
+   This rule is for COMPILER work specifically; it does NOT apply to
+   runtime concerns (GPU state tracking, syscall handling, etc.) which
+   live in their respective platform / chip layers because they are
+   compile-time-target-selected (one platform per binary), not
+   runtime-dispatched. If unsure: ask "does the bpp BINARY need both
+   variants linked?" If yes, spine. If no, per-target file.
+
 **When to run the bootstrap cycle (and when to skip it).** The cycle below
 exists to verify that a change to the compiler/runtime/backends still
 produces a byte-stable, suite-green binary. If your change touches none of
@@ -492,7 +529,8 @@ Modular pipeline:
 | `--asm`         | Emit ARM64 assembly to stdout               |
 | `--c`           | Emit C code to stdout                       |
 | `--linux64`     | Cross-compile to Linux x86_64 ELF           |
-| `--bug`         | Emit `.bug` debug map alongside the binary   |
+| `--bug`         | Emit `.bug` debug map alongside the binary (opt-in, like `gcc -g`)   |
+| `--bug=<path>`  | Emit `.bug` at a custom path (Bang 9 uses `/tmp/bang9_*.bug`) |
 | `--show-deps`   | Print module dependency graph and exit       |
 | `--clean-cache` | **No-op**, kept for backward compat with scripts. |
 | `--stats`       | Print module/function/token counts to stderr |

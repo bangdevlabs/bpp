@@ -112,7 +112,10 @@ static _runner_entry_path(proj_root) {
 }
 
 // Derive the output binary path: "<proj_root>/build/<basename>".
-static _runner_output_path(proj_root) {
+// Non-static because the Debug panel needs the same value to wire
+// the_bug_lib's Run button at the actual binary (the .bug file
+// itself lives elsewhere — see runner_bug_path).
+runner_output_path(proj_root) {
     auto plen, i, last_slash, base, blen, sb, result;
     plen = str_len(proj_root);
     last_slash = -1;
@@ -125,6 +128,32 @@ static _runner_output_path(proj_root) {
     sb = strbuf_cat(sb, proj_root);
     sb = strbuf_cat(sb, "/build/");
     for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
+}
+
+// Derive the .bug path Bang 9 hands to the compiler via --bug=<path>.
+// Lives under /tmp so the user's project tree stays clean — the
+// debug map is purely internal to Bang 9 and gets unlinked on
+// shutdown. Format: "/tmp/bang9_<basename>.bug".
+//
+// Used by both the build command (to instruct the compiler where to
+// write) and the debug panel (to know where to read back from), so
+// the helper is non-static.
+runner_bug_path(proj_root) {
+    auto plen, i, last_slash, base, blen, sb, result;
+    plen = str_len(proj_root);
+    last_slash = -1;
+    for (i = 0; i < plen; i++) {
+        if (peek(proj_root + i) == 47) { last_slash = i; }
+    }
+    base = proj_root + last_slash + 1;
+    blen = plen - last_slash - 1;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "/tmp/bang9_");
+    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    sb = strbuf_cat(sb, ".bug");
     result = str_dup(sb);
     strbuf_free(sb);
     return result;
@@ -163,16 +192,18 @@ static void _runner_reload_log()@io {
 // sys_waitpid returns the child PID, not the exit code. The
 // "; echo $? > _RUNNER_RC" suffix captures bpp's real exit code
 // in a tempfile so _runner_read_rc() can retrieve it.
-static _runner_build_cmd(entry, output, log) {
+static _runner_build_cmd(entry, output, bug_path, log) {
     auto sb, result;
     sb = strbuf_new();
     sb = strbuf_cat(sb, _BPP_EXE);
     sb = strbuf_cat(sb, " ");
     sb = strbuf_cat(sb, entry);
-    // .bug emission is unconditional in current bpp; no need to pass
-    // --bug here. The flag is deprecated but harmless; we drop it
-    // from the command line so users see the new convention in
-    // their build logs.
+    // Bang 9 always wants the .bug map (the Debug tab loads it),
+    // but it should not pollute the user's project tree. We pass
+    // --bug=<path> so the compiler writes the map under /tmp.
+    // The path is shared with the debug panel via runner_bug_path.
+    sb = strbuf_cat(sb, " --bug=");
+    sb = strbuf_cat(sb, bug_path);
     sb = strbuf_cat(sb, " -o ");
     sb = strbuf_cat(sb, output);
     sb = strbuf_cat(sb, " --emit-meta ");
@@ -207,11 +238,12 @@ static _runner_read_rc()@io {
 
 // Build the project. Returns the exit status of `bpp`.
 runner_build(proj_root) {
-    auto entry, output, cmd, pid, argv, status;
+    auto entry, output, bug_path, cmd, pid, argv, status;
 
     entry = _runner_entry_path(proj_root);
-    output = _runner_output_path(proj_root);
-    cmd = _runner_build_cmd(entry, output, _RUNNER_LOG);
+    output = runner_output_path(proj_root);
+    bug_path = runner_bug_path(proj_root);
+    cmd = _runner_build_cmd(entry, output, bug_path, _RUNNER_LOG);
 
     // argv for /bin/sh -c "<cmd>": 4 entries (/bin/sh, -c, cmd, 0).
     argv = buf_word(4);
@@ -235,6 +267,7 @@ runner_build(proj_root) {
     free(cmd);
     free(entry);
     free(output);
+    free(bug_path);
 
     _runner_reload_log();
     _runner_last_status = status;
@@ -273,7 +306,7 @@ static _runner_run_cmd(proj_root, output) {
 runner_run(proj_root) {
     auto output, cmd, pid, argv;
 
-    output = _runner_output_path(proj_root);
+    output = runner_output_path(proj_root);
     cmd    = _runner_run_cmd(proj_root, output);
 
     argv = buf_word(4);

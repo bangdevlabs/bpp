@@ -49,21 +49,30 @@ event loop. Always pass `--dump` when you want text on stdout.
 
 ### Building a target with debug info
 
-Every native compile writes a `.bug` file next to the binary,
-automatically. There is no `-g` switch — it is always on, like
-Microsoft's `.pdb` files or Apple's `.dSYM` bundles. Keep the
-`.bug` alongside the binary; observe mode reads it by appending
-`.bug` to the target path.
+`.bug` emission is opt-in via the `--bug` flag — same model as
+`gcc -g`. The default compile produces only the binary; pass
+`--bug` when you want the debug map written alongside.
 
 ```
-bpp hello.bpp -o hello              # produces ./hello and ./hello.bug
+bpp hello.bpp -o hello              # produces ./hello only
+bpp --bug hello.bpp -o hello        # produces ./hello + ./hello.bug
 bug --tui ./hello                   # finds ./hello.bug automatically
+```
+
+For tooling that wants the `.bug` file off to the side (so it does
+not pollute the user's project tree), pass `--bug=<path>` and the
+compiler writes the map at the given location instead of next to
+the binary. Bang 9 uses this to keep the file under `/tmp`:
+
+```
+bpp --bug=/tmp/bang9_pathfind.bug pathfind.bpp -o build/pathfind
 ```
 
 **Exception:** `bpp --c source.bpp` (C emitter) does not emit a
 `.bug` because the binary's instruction offsets do not exist yet —
 they are decided by gcc/clang downstream. Native (`bpp source.bpp`)
-and cross-compile (`bpp --linux64 source.bpp`) both emit it.
+and cross-compile (`bpp --linux64 source.bpp`) both emit it when
+`--bug` is passed.
 
 **Build ID identity check.** Every build embeds a 16-byte
 build_id into the binary (Mach-O `LC_UUID` on macOS, ELF
@@ -86,11 +95,12 @@ analysis 30 minutes in".
 build_id to zero. The test suite (`tests/run_all.sh`) does this
 automatically.
 
-**`--bug` flag.** Historically `bpp --bug ...` was required to
-emit the `.bug` file. The flag is now deprecated — any compile
-emits `.bug` automatically. Passing `--bug` still works but
-prints a deprecation warning to stderr. Will be removed in a
-future release.
+**`--bug` flag.** `.bug` emission is opt-in. Pass `--bug` to write
+`<output>.bug`, or `--bug=<path>` to write at a custom location.
+Without the flag, only the binary is produced. Bang 9 always passes
+`--bug=/tmp/bang9_<basename>.bug` so the debugger panel works while
+the project tree stays clean; the file is unlinked on Bang 9
+shutdown.
 
 ---
 
@@ -139,6 +149,38 @@ Up/Down, with section headers in accent colour.
 `debugserver` (macOS) or `gdbserver` (Linux) and connects via the
 GDB remote serial protocol. Every function entry the program
 executes is traced by default, indented to show the call tree:
+
+### Locating the remote stub
+
+On macOS, the observer searches for `debugserver` in this order:
+
+1. `BUG_DEBUGSERVER` env var (if set and the file exists).
+2. `/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver`
+3. `/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Resources/debugserver`
+4. `/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver`
+5. `/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Resources/debugserver`
+
+The first hit wins. The CommandLineTools paths come first because
+`xcode-select --install` is the smallest install that ships
+`debugserver`; Xcode is the larger optional add-on. Two layouts
+per toolchain (`Versions/A/Resources/` vs bare `Resources/`) cover
+the framework symlink layouts that varied across macOS releases.
+
+If none is found, `bug` prints every path it tried and the
+`xcode-select --install` hint, plus the env-var override path:
+
+```
+export BUG_DEBUGSERVER=/opt/homebrew/Cellar/llvm/.../debugserver
+```
+
+On Linux, the observer searches for `gdbserver` in this order:
+
+1. `BUG_GDBSERVER` env var (if set and the file exists).
+2. `/usr/bin/gdbserver`
+3. `/usr/local/bin/gdbserver`
+
+Distro-specific install hints (`apt`, `dnf`, `pacman`, `apk`) are
+printed when nothing is found.
 
 ```
 -> main()

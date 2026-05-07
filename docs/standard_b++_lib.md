@@ -1845,83 +1845,209 @@ instead of snapping.
 
 ---
 
-## Cap 37 — Image decode (stbimage)
+## Cap 37 — Image cartridge (stbimage)
 
-*Depends on: Cap 2 (auto-injected prelude)*
-*Source: new*
-*Status: COMPLETE — 2026-04-22*
+*Depends on: Cap 2 (auto-injected prelude), bpp_json (auto-injected), stbpal*
+*Source: new (Phase 3.5.5 merge)*
+*Status: COMPLETE — 2026-05-06*
 
-`stbimage.bsm` decodes image files to RGBA pixel buffers. Today:
-**PNG only** (RIFF-style chunked format, zlib DEFLATE compressed).
-Other formats (JPG, BMP, TGA) would land as sibling modules
-(`stbjpg`, `stbbmp`) rather than extending stbimage.
+`stbimage.bsm` is **THE image cartridge** in B++. Two layers in
+the same file so game code never has to navigate between low-
+level pixel access and high-level sprite slicing:
 
-### §37.1 — Public API
+- **Layer 1 — Codec**: pure-B++ PNG decoder + writer.
+  `pixels_load` returns an RGBA buffer; `pixels_save_png` writes
+  one out. Used directly only when raw byte access matters
+  (raycaster wall textures, palette quantize, screenshot tools).
+- **Layer 2 — Image**: `image_load(path)` is the universal
+  smart-dispatch entry point for every image-shaped asset. A
+  solo PNG becomes a 1-frame `Image`; a sister-`.json` PNG
+  carries grid or packed metadata; a Modulab `atlas_pack` JSON
+  brings a palette-indexed sprite bundle. Returns an `Image*`
+  ready for `image_draw` / `image_draw_size` / `image_draw_named`.
+
+The merge collapsed the prior `stbatlas.bsm` cartridge in Phase
+3.5.5 — atlas IS the unified runtime concept (a single-frame
+"sprite" is just an atlas of one frame), and forcing two
+imports for the same domain confused every newcomer.
+
+### §37.1 — Smart-dispatch entry point: `image_load`
 
 ```c
-img_load(path)@io;   // returns pixel buffer or 0
-img_w();               // width of last loaded image
-img_h();               // height of last loaded image
-void img_free(pixels); // release a buffer from img_load
+image_load(path);                  // returns Image* or 0
+image_count(img);                  // number of frames in the atlas
+image_named_id(img, "cat");        // 0-based id of a named sprite, -1 if absent
+image_tile_w(img); image_tile_h(img);
+image_free(img);                   // release struct + name array (GPU tex retained)
+```
+
+`image_load` inspects the file's first byte and (for JSON) the
+top-level shape to dispatch:
+
+| Input shape | Routed to | Notes |
+|-------------|-----------|-------|
+| PNG header (0x89) WITH sister `.json` | recurse on the JSON | sister metadata drives slicing |
+| PNG header WITHOUT sister `.json` | 1-frame fallback | whole image becomes the only tile |
+| `{"type":"sprite", ...}` | sprite reader | Phase 3.5.5 unified Modulab native |
+| `{"type":"sprite16", ...}` | sprite reader | legacy single-flat-layer export |
+| `{"type":"modulab", ...}` | sprite reader | legacy project-state file |
+| `{"type":"atlas_pack", ...}` | atlas-pack reader | bundle (v1) or manifest (v2) |
+| `{"type":"atlas_grid", ...}` | grid reader | raw PNG + tile dimensions |
+| `{"frames":[...]}` | packed reader | TexturePacker / Aseprite Array shape |
+
+Caller usage stays trivially simple:
+
+```bpp
+var hero = image_load("hero.atlas.json");
+image_draw_size(hero, frame_id, x, y, w, h);
+```
+
+### §37.2 — Atlas pack: bundle vs manifest
+
+Two on-disk shapes share `type:"atlas_pack"`. The reader picks
+per-sprite, so a single pack may mix referenced and inline
+sprites during a migration.
+
+**v2 — Manifest** (Phase 3.5.5, current default):
+
+```json
+{ "type":"atlas_pack", "version":2,
+  "tile_w":16, "tile_h":16,
+  "sprites":[
+    { "name":"cat", "path":"cat_sprite.json" },
+    { "name":"rat", "path":"rat_sprite.json" } ] }
+```
+
+Each entry references a sibling sprite file. The runtime atlas
+loader recursively dereferences each path at every `image_load`
+call. **Sprites are the source of truth** — edit any sprite file,
+next launch picks up the change without atlas rebuild. Sprites
+are reusable across games (point a different manifest at the
+same path).
+
+**v1 — Bundle** (legacy, kept readable):
+
+```json
+{ "type":"atlas_pack", "version":1, "palette":"MCU-8",
+  "tile_w":16, "tile_h":16,
+  "sprites":[
+    { "name":"cat", "data":[[0,0,1,...]] },
+    { "name":"rat", "data":[[0,0,3,...]] } ] }
+```
+
+Self-contained — no sibling references. Editing a source sprite
+does NOT update the bundle until it's re-exported through Modulab's
+atlas function. Manifest (v2) eliminates that cycle break.
+
+### §37.3 — Drawing
+
+```c
+image_draw(img, sprite_id, x, y, sz);
+image_draw_size(img, sprite_id, x, y, w, h);
+image_draw_size_tinted(img, sprite_id, x, y, w, h, tint);
+image_draw_tinted(img, sprite_id, x, y, sz, tint);
+image_draw_named(img, "cat", x, y, sz);
+image_draw_named_size(img, "cat", x, y, w, h);
+image_draw_named_tinted(img, "cat", x, y, sz, tint);
+image_draw_named_size_tinted(img, "cat", x, y, w, h, tint);
+```
+
+Tinting multiplies the vertex colour against the sampled texel —
+`WHITE` (0xFFFFFFFF) is the no-op tint, `rgba(255,80,80,255)` for
+a damage flash, `rgba(180,180,180,255)` for the EW-wall darkening
+in the raycaster. No extra GPU upload, just a 4-byte change at
+the vertex.
+
+Smart-bind (Phase 3.2 GPU pipeline) means consecutive draws
+against the same texture coalesce into one `drawPrimitives`
+flush. A typical pathfind frame batches 30+ sprite draws into
+one GPU call.
+
+### §37.4 — Live hot-reload (Phase 3.5.6 — 3.5.8)
+
+Game opts into edit-while-running for any loaded Image:
+
+```bpp
+var pf_image = image_load("pathfind.atlas.json");
+image_hot_reload_enable(pf_image);
+```
+
+Each registered Image carries `src_path` + `last_hash` (FNV-1a
+hash combining manifest + every sibling sprite). `stbgame`'s
+`frame_begin` auto-ticks the registry; when any hash advances,
+`_image_reload` re-runs `image_load`, swaps the live struct's
+`tex` to a fresh GPU texture in place, and frees the old name
+list. The `Image*` the game holds stays valid throughout.
+
+Cadence is adaptive: idle polls every 30 frames (~0.5 s); after
+any reload fires, switches to every-frame polling for a 60-frame
+burst (~1 s of active editing) so consecutive Ctrl+S during a
+paint session land in ~16 ms each.
+
+For non-image assets (level files, audio cues, gameplay tuning
+JSON, AI scripts), the same machinery is exposed via a generic
+file-change callback registry:
+
+```bpp
+file_watch_register("assets/levels/level1.level.json",
+                    fn_ptr(reload_level));
+
+void reload_level() {
+    // ... clear + re-parse the level file ...
+}
+```
+
+Industry alignment: the file watcher lives in the GAME runtime,
+not the editor. Same pattern as Unity (AssetDatabase), Unreal
+(Asset Manager), Godot (EditorFileSystem), Bevy (AssetServer
+with `notify`). Decouples game from any specific editor — works
+with Modulab, Aseprite, Vim, hex editor, anything.
+
+Polling chosen over kqueue / inotify deliberately — agnostic
+over latency. The same code runs on every backend B++ ports to.
+A future event-driven backend can slot in behind the same
+`file_watch_*` API without changing callers.
+
+### §37.5 — Layer 1: raw pixel codec
+
+```c
+pixels_load(path);              // returns RGBA buffer or 0
+pixels_w(); pixels_h();         // dimensions of last decoded image
+pixels_depth(); pixels_channels();
+void pixels_free(buf);          // release a buffer from pixels_load
+pixels_save_png(path, rgba, w, h);  // writer
 ```
 
 State is singleton: the last loaded image's dimensions live in
-`img_w()` / `img_h()`. Typical pattern:
+`pixels_w()` / `pixels_h()`. Used internally by `image_load` and
+directly by code that needs raw RGBA access (raycaster wall
+textures via `stbtexture`, screenshot tools, palette quantize).
 
-```c
-auto pixels, w, h;
-pixels = img_load("assets/player.png");
-if (pixels == 0) { return 1; }   // load failed
-w = img_w();
-h = img_h();
-// ... use pixels (w*h*4 bytes of RGBA) ...
-img_free(pixels);
-```
+Decoder supports:
+- **Color types**: RGB (3-byte), RGBA (4-byte), grayscale,
+  grayscale+alpha, indexed (via PLTE + tRNS).
+- **Bit depths**: 8 per channel (16-bit PNG clipped to 8).
+- **Filters**: all five PNG filters (None / Sub / Up / Average /
+  Paeth).
+- **tRNS chunk**: palette alpha honoured; RGB-key transparency
+  discarded.
+- **NOT supported**: Adam7 interlacing (returns 0 with stderr
+  warning), animated formats (APNG, GIF), streaming decode.
 
-### §37.2 — What's supported
+The zlib / DEFLATE layer is a faithful port of `stb_image.h`. PNG
+decode is NOT hot path — games call once per asset at boot.
+Decode time for a 256×256 sprite: ~5-10 ms on Apple Silicon.
 
-- **Color types**: RGB (3-byte), RGBA (4-byte), grayscale (1-byte
-  widened to RGB), grayscale+alpha, indexed (via PLTE + tRNS).
-- **Bit depths**: 8 per channel (16-bit PNG is clipped to 8).
-- **Filters**: all five PNG filters (None / Sub / Up / Average / Paeth).
-- **Interlacing**: NOT supported. Adam7-interlaced PNGs return 0 with a
-  stderr warning. Typical asset pipelines (Aseprite, Figma export) don't
-  interlace — it's a feature for progressive-download web images.
-- **tRNS chunk**: palette alpha is honored; RGB-key transparency is
-  discarded (fully-opaque output).
+### §37.6 — What this chapter does NOT cover
 
-### §37.3 — Internal structure
-
-Three layered decoders:
-1. **Bit reader** (`_zr_read`) — DEFLATE bit-level unpacking, 1 bit
-   at a time into a 32-bit window.
-2. **Huffman decoder** (`_zh_build`, `_inf_decode`) — canonical
-   Huffman tables reconstructed per deflate block.
-3. **PNG chunk scanner** (`img_load` body) — walks IHDR, PLTE, IDAT,
-   tRNS, IEND. Non-critical chunks (tEXt, gAMA, sRGB) are skipped.
-
-The zlib / DEFLATE layer is a faithful port of `stb_image.h`'s
-implementation. ~400 lines, no compromises on correctness — passes
-every shipped test PNG including 3-byte RGB, 4-byte RGBA, indexed
-palette, and grayscale+alpha variants.
-
-### §37.4 — Performance notes
-
-PNG decode is NOT hot path. Games call `img_load` once per asset
-at boot, the decoded pixels live in memory for the session. Decode
-time for a 256×256 sprite: ~5-10 ms on Apple Silicon, mostly
-Huffman + filter work. If the pipeline ever needs faster decode,
-candidates are (a) SIMD filters for large images, (b) single-pass
-Huffman for tiny textures.
-
-### §37.5 — What this chapter does NOT cover
-
-- **Writing PNGs**. `stbimage_write.bsm` (if ever shipped) would live
-  next door. Today, use `sound_save_wav` for audio and raw RGBA buffer
-  writes for pixel captures.
-- **Animated formats** (APNG, GIF). Out of scope — use per-frame PNGs.
-- **Streaming decode** (for textures > RAM). Out of scope — assume
-  images fit.
+- **Animated sequences** (APNG, GIF). Out of scope — use
+  per-frame PNGs and switch sprite_id per game tick.
+- **Other codecs** (JPG, BMP, TGA). Would land as sibling
+  modules (`stbjpg`, `stbbmp`) rather than extending stbimage.
+- **Streaming decode** (for textures > RAM). Out of scope —
+  assume images fit.
+- **Editor authoring**. See Cap 27 for Modulab; the cartridge
+  here is the runtime consumer side.
 
 ---
 

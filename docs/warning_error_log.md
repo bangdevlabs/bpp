@@ -163,6 +163,13 @@ Codes reserved for planned features. Do NOT reuse these numbers for other diagno
 |------|-------------|--------|
 | W017 | void used as value (`x = void_func()`) | Reserved — ships with void keyword validation |
 | W014 | extrn written after freeze point | Reserved — needs investigation (crashed self-host) |
+| W030 | scoped zone inside `@gpu` region | Reserved — GPU pipeline roadmap Phase 6.3 (scoped zones compiler feature) |
+| E250 | shader source compile failure | Reserved — GPU pipeline roadmap Phase 2.1 (`.metal` → `MTLLibrary` failure surfaced as compiler diagnostic when build-time validated; runtime path remains stderr + exit) |
+| E251 | pipeline state creation failure | Reserved — GPU pipeline roadmap Phase 2.1 (`MTLRenderPipelineState` construction failure with named vertex/fragment functions) |
+| E252 | atlas grid metadata mismatch | Reserved — GPU pipeline roadmap Phase 3.1 (atlas declared NxM but PNG dimensions disagree) |
+| E253 | render target size mismatch | Reserved — GPU pipeline roadmap Phase 4.1 (off-screen `MTLTexture` target dimensions inconsistent with declared virtual resolution) |
+| E254 | effect chain target undefined | Reserved — GPU pipeline roadmap Phase 6.1 (effect referenced before its target was created) |
+| E255 | scoped zone unmatched enter/exit | Reserved — GPU pipeline roadmap Phase 6.3 (zone prologue without corresponding epilogue at codegen time, e.g. early return without zone cleanup) |
 
 ## Process: adding a new diagnostic
 

@@ -29,12 +29,14 @@
 // We import only the stb cartridges this game opts into.
 import "stbgame.bsm";
 import "stbrender.bsm";
+import "stbimage.bsm";
 import "stbecs.bsm";
 import "stbpool.bsm";
 import "stbasset.bsm";
 import "stbaudio.bsm";
 import "stbmixer.bsm";
 load   "particles.bsm";
+load   "snake_sprites.bsm";
 
 // ── Compile-time constants ──────────────────────────────────
 
@@ -81,6 +83,13 @@ extrn world;        // ECS handle, allocated once via ecs_new(200)
 extrn frame_arena;  // per-frame scratch arena, reset each tick (pointer fixed)
 extrn body;         // snake body cells (heap array, contents mutate)
 extrn scores;       // ranking storage (heap array, contents mutate)
+
+// Sprite atlas — body / head (alive) / head (dead) / apple. Built
+// once at init from a procedurally-painted RGBA buffer (see
+// `snake_sprites.bsm`); every per-segment draw in the render phase
+// hits this single MTLTexture so smart-bind batching (Phase 3.2)
+// coalesces the snake's 30+ image_draw calls into one drawPrimitives.
+extrn snake_atlas;
 
 // Audio state.
 //   snd_loop       — MusicHandle for the background groove. The WAV
@@ -216,6 +225,8 @@ void snake_init_phase() {
     auto loop_path, loop_ptr, loop_frames;
 
     render_init();
+    init_image();
+    snake_atlas = build_snake_atlas();
     world = ecs_new(200);
     frame_arena = arena_new(4096);
     body = buf_word(MAX_BODY * 2);
@@ -357,16 +368,25 @@ void snake_render_phase(dt: float)@gpu {
     render_begin();
     render_clear(DARKGRAY);
 
-    // Apple.
-    render_rect(apple_x, apple_y, CELL - 1, CELL - 1, RED);
+    // Apple — atlas tile, drawn at (CELL-1) on-screen size so
+    // adjacent grid cells keep their 1-pixel gap.
+    image_draw_size(snake_atlas, SNAKE_SPR_APPLE,
+                    apple_x, apple_y, CELL - 1, CELL - 1);
 
-    // Body.
+    // Body — every segment hits the same atlas tile, smart-bind
+    // batching means the whole snake is one drawPrimitives call.
     for (i = 0; i < body_len; i++) {
-        render_rect(body[i * 2], body[i * 2 + 1], CELL - 1, CELL - 1, GREEN);
+        image_draw_size(snake_atlas, SNAKE_SPR_BODY,
+                        body[i * 2], body[i * 2 + 1],
+                        CELL - 1, CELL - 1);
     }
 
-    // Head. Red while dying, white while alive.
-    render_rect(head_x, head_y, CELL - 1, CELL - 1, dead ? RED : WHITE);
+    // Head — alive uses the eye-dotted SNAKE_SPR_HEAD tile, dead
+    // uses the X-marked SNAKE_SPR_DEAD. Both share the same atlas,
+    // so the selection is just an id swap; no flush.
+    image_draw_size(snake_atlas,
+                    dead ? SNAKE_SPR_DEAD : SNAKE_SPR_HEAD,
+                    head_x, head_y, CELL - 1, CELL - 1);
 
     // Particles (results of base phase).
     draw_particles();

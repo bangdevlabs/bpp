@@ -22,6 +22,9 @@ static auto fname_pos;     // Write position in fname_buf.
 extrn diag_file_starts;  // Dynamic array: outbuf offset where each file's content begins.
 extrn diag_file_names;   // Dynamic array: packed filename for each file.
 extrn diag_file_line_starts; // Dynamic array: cumulative line count at each file boundary.
+extrn mod_bnd_off;        // Boundary list (ofs) — see _record_bnd / mod_idx.
+extrn mod_bnd_mi;         // Boundary list (mi).
+extrn mod_bnd_line_off;   // Boundary list (subtract this from tok_lines for file-relative line).
 static auto outbuf_lines;      // Running count of newline characters written to outbuf.
 
 // Module dependency graph and hashing.
@@ -104,13 +107,49 @@ static void mark_imported(path_off, path_len) {
     imp_hashes = arr_push(imp_hashes, hash_mem(path_off, path_len));
 }
 
+// Boundary tracking for diagnostic-only file + line attribution.
+// Each entry records "from this outbuf offset onwards, the source
+// is module mi, and the file-relative line for any token at offset
+// T is computed as (tok_lines[T] - line_off)" — pushed at
+// process_file entry (a child takes over) and after every
+// recursive process_file return (the parent reclaims). The line
+// offset is `outbuf_lines - _source_line` at push time, which
+// captures both the merged-source line counter and the source-
+// file's own line counter so the formula holds across the
+// interleaved-import boundaries that confuse a simple
+// `diag_file_line_starts[mi]` lookup. Consumed by
+// `diag_mod_idx` / `diag_mod_line_off` (used by `diag_loc` /
+// `diag_show_line` for accurate `file:line` reporting); the
+// SEMANTIC module attribution used by the lexer, parser, and
+// codegen still goes through `mod_idx` which keeps using
+// `diag_file_starts` to remain consistent with how `lex_module`
+// partitions the merged source buffer into per-module token
+// ranges. Decoupling diagnostic attribution from semantic
+// attribution is what lets us fix the warning-points-to-wrong
+// -file/line bug without breaking the per-module emit loop.
+static _record_bnd(mi, line_off) {
+    auto n;
+    n = arr_len(mod_bnd_off);
+    if (n > 0) {
+        if (arr_get(mod_bnd_off, n - 1) == outbuf_len) {
+            arr_set(mod_bnd_mi, n - 1, mi);
+            arr_set(mod_bnd_line_off, n - 1, line_off);
+            return;
+        }
+    }
+    mod_bnd_off = arr_push(mod_bnd_off, outbuf_len);
+    mod_bnd_mi = arr_push(mod_bnd_mi, mi);
+    mod_bnd_line_off = arr_push(mod_bnd_line_off, line_off);
+}
+
 // Find the module index for a given source buffer offset.
-// Performs binary search on diag_file_starts to find which file
-// the offset belongs to. Returns the 0-based module index.
+// SEMANTIC use only — driven by `diag_file_starts` so it stays
+// consistent with `lex_module`'s per-module partitioning. For
+// accurate diagnostic display use `diag_mod_idx` instead, which
+// follows the boundary list and tracks the interleaved-import
+// model correctly.
 mod_idx(src_off) {
     auto lo, hi, mid, ms;
-    // Module 0's content is at the end of outbuf (after all imports).
-    // The binary search below would misattribute it to the last stb module.
     if (mod0_real_start >= 0) {
         if (src_off >= mod0_real_start) { return 0; }
     }
@@ -121,6 +160,49 @@ mod_idx(src_off) {
         if (ms <= src_off) { lo = mid; } else { hi = mid - 1; }
     }
     return lo;
+}
+
+// Find the boundary index that owns a given source offset.
+// Helper for `diag_mod_idx` and `diag_mod_line_off`.
+static _diag_bnd_idx(src_off) {
+    auto lo, hi, mid, ms;
+    if (arr_len(mod_bnd_off) == 0) { return -1; }
+    lo = 0; hi = arr_len(mod_bnd_off) - 1;
+    while (lo < hi) {
+        mid = (lo + hi + 1) / 2;
+        ms = arr_get(mod_bnd_off, mid);
+        if (ms <= src_off) { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+
+// Find the module index for diagnostic display of a source offset.
+// Uses the boundary list which correctly handles interleaved
+// imports — when a parent module emits some content, recurses into
+// a child whose content ends up in the middle of the parent's
+// output, then resumes emitting more parent content, the boundary
+// list records each transition so a token offset in the parent's
+// post-recursion section resolves back to the parent's module
+// index instead of the child's. The returned index is the "right
+// file to print in `file:line`" — not necessarily the same as
+// `mod_idx` returns for the same offset.
+diag_mod_idx(src_off) {
+    auto bi;
+    bi = _diag_bnd_idx(src_off);
+    if (bi < 0) { return mod_idx(src_off); }
+    return arr_get(mod_bnd_mi, bi);
+}
+
+// Find the per-boundary line offset for a given source offset —
+// "subtract this from tok_lines[T] to get the file-relative line
+// number for a token at offset T". Falls back to
+// `diag_file_line_starts[mod_idx(off)]` when the boundary list is
+// empty (very early diagnostics, before any process_file ran).
+diag_mod_line_off(src_off) {
+    auto bi;
+    bi = _diag_bnd_idx(src_off);
+    if (bi < 0) { return arr_get(diag_file_line_starts, mod_idx(src_off)); }
+    return arr_get(mod_bnd_line_off, bi);
 }
 
 // Find the module index for a file path by searching imp_hashes (path hashes).
@@ -325,7 +407,7 @@ static find_file(base_off, base_len, name_off, name_len) {
     auto r;
     r = _try_dir("stb/", 4, name_off, name_len);
     if (r > 0) { return r; }
-    r = _try_dir("drivers/", 8, name_off, name_len);
+    r = _try_dir("ffi/", 4, name_off, name_len);
     if (r > 0) { return r; }
     r = _try_dir("src/", 4, name_off, name_len);
     if (r > 0) { return r; }
@@ -348,7 +430,7 @@ static find_file(base_off, base_len, name_off, name_len) {
     if (r > 0) { return r; }
     r = _try_dir("/usr/local/lib/bpp/stb/", 23, name_off, name_len);
     if (r > 0) { return r; }
-    r = _try_dir("/usr/local/lib/bpp/drivers/", 27, name_off, name_len);
+    r = _try_dir("/usr/local/lib/bpp/ffi/", 23, name_off, name_len);
     if (r > 0) { return r; }
     r = _try_dir("/usr/local/lib/bpp/backend/chip/aarch64/", 40, name_off, name_len);
     if (r > 0) { return r; }
@@ -549,6 +631,17 @@ void process_file(path_off, path_len) {
     // Hash the file content for cache invalidation.
     mod_hashes = arr_push(mod_hashes, fnv1a(fbuf + my_file, fsize));
     my_mod_idx = arr_len(diag_file_starts) - 1;
+    // Tracks how many SOURCE-FILE lines of THIS file have been
+    // processed so far. Increments once per iteration of the line
+    // loop below (whether the line is an import or a non-import
+    // emit) so the count reflects source-file line numbering, not
+    // emit-only line numbering. Used to compute the per-boundary
+    // line offset that `diag_mod_line_off` returns.
+    auto _source_line;
+    _source_line = 0;
+    // Entry boundary — at this point outbuf_lines is the merged
+    // source line count, _source_line is 0.
+    _record_bnd(my_mod_idx, outbuf_lines - _source_line);
 
     // ── Auto-inject core utilities and runtime for the entry .bpp ──
     //
@@ -589,6 +682,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -608,6 +702,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -626,6 +721,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -646,6 +742,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -669,6 +766,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -684,6 +782,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -699,6 +798,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -714,6 +814,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -729,6 +830,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -744,6 +846,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -759,6 +862,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -774,6 +878,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -799,6 +904,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -814,6 +920,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -829,6 +936,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -844,6 +952,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -863,6 +972,30 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
+            dep_from = arr_push(dep_from, my_mod_idx);
+            dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
+            fbuf_top = _ai_sp;
+        }
+
+        // bpp_json.bsm  (12 bytes) — JSON parser + writer. Auto-
+        // injected so stb cartridges (stbimage's atlas pack /
+        // sprite reader, level loaders, asset manifests) can
+        // consume JSON without forcing every game program to
+        // import it manually. Pathfind and other games already
+        // pull it in implicitly through stbimage; the auto-inject
+        // makes the dependency graph consistent — by B++ design
+        // no stb cartridge imports a bpp_* runtime module.
+        _ai_pname = "bpp_json.bsm";
+        buf_copy(linebuf, _ai_pname, 12);
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 12);
+        if (_ai_plen > 0) {
+            auto _ai_sp, _ai_si;
+            _ai_sp = fbuf_top;
+            buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
+            fbuf_top += _ai_plen;
+            process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -883,6 +1016,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -905,6 +1039,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -924,6 +1059,7 @@ void process_file(path_off, path_len) {
             buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
             fbuf_top += _ai_plen;
             process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
             dep_from = arr_push(dep_from, my_mod_idx);
             dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
             fbuf_top = _ai_sp;
@@ -940,6 +1076,14 @@ void process_file(path_off, path_len) {
     // Process line by line.
     pos = 0;
     while (pos < fsize) {
+        // Each iteration advances one source-file line. Increment
+        // `_source_line` up front so when an import recursion in
+        // this iteration pushes a boundary AFTER the recursion, the
+        // recorded line offset reflects the parent's progress
+        // through its OWN source file at the resume point — not
+        // the merged-source line counter, which has advanced through
+        // the children's content too.
+        _source_line++;
         // Find end of current line.
         line_start = pos;
         while (pos < fsize) {
@@ -982,6 +1126,7 @@ void process_file(path_off, path_len) {
                 fbuf_top += plen;
 
                 process_file(pathbuf, plen);
+                _record_bnd(my_mod_idx, outbuf_lines - _source_line);
 
                 // Record dependency edge: this module imports the resolved module.
                 dep_from = arr_push(dep_from, my_mod_idx);
@@ -1042,6 +1187,9 @@ void init_import() {
     diag_file_starts = arr_new();
     diag_file_names = arr_new();
     diag_file_line_starts = arr_new();
+    mod_bnd_off = arr_new();
+    mod_bnd_mi = arr_new();
+    mod_bnd_line_off = arr_new();
     outbuf_lines = 0;
     mod0_real_start = -1;
     mod_hashes = arr_new();

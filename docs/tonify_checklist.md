@@ -788,7 +788,7 @@ it without issues.
 
 ### Pitfall 3: `codesign` on `./bpp` corrupts the cache
 
-Running `codesign -s - ./bpp` changes the binary's bytes, which changes
+Rfechaunning `codesign -s - ./bpp` changes the binary's bytes, which changes
 the `compiler_hash` used in cache keys. All existing `.bo` files become
 keyed to the old hash, causing silent stale-cache bugs that manifest as
 2-cycle bootstrap oscillation. See `bootprod_manual.md` for full details.
@@ -909,6 +909,147 @@ inverse. The pitfall fires only on the indirect `call()` path.
 
 **Cross-reference**: `warning_error_log.md` "Known compiler
 diagnostic gaps" section.
+
+---
+
+## Rule 22: stb cartridges do NOT import bpp_* runtime modules
+
+The auto-inject pass in `src/bpp_import.bsm` injects every
+`bpp_*` runtime module (`bpp_array`, `bpp_str`, `bpp_io`,
+`bpp_buf`, `bpp_hash`, `bpp_file`, `bpp_math`, `bpp_arena`,
+`bpp_maestro`, `bpp_beat`, `bpp_job`, `bpp_json`) into every
+program before user code is compiled. By B++ design, no `stb*.bsm`
+cartridge ever needs an explicit `import "bpp_*.bsm"` line —
+auto-inject covers them.
+
+| Pattern | Action |
+|---------|--------|
+| `import "bpp_array.bsm";` in any stb file | Delete |
+| `import "bpp_math.bsm";` in any stb file | Delete |
+| `import "bpp_json.bsm";` in any stb file | Delete (auto-injected since 2026-05-06) |
+| Any other `import "bpp_*.bsm";` in stb | Verify it's auto-injected, then delete |
+
+**Why.** Explicit imports for auto-injected modules are noise.
+They suggest a dependency graph that the compiler doesn't actually
+respect (auto-inject runs BEFORE the dep edge from the explicit
+import is recorded). Worse, they tempt readers into thinking a
+cartridge depends on `bpp_str` more than another stb cartridge —
+in fact every stb file gets the entire bpp runtime for free.
+
+**Game files** (`*.bpp`) and **tools** (`tools/`) are different —
+they may keep explicit `import` lines for clarity even when the
+target is auto-injected. Auto-inject covers them too, but the
+extra import is harmless and signals intent to the reader.
+
+**Status (Phase 3.5.5):** all 11 stb cartridges swept; the only
+remaining `import "bpp_*"` lines anywhere are in tests + game
+files. New stb cartridges should never carry one.
+
+---
+
+## Rule 23: Cartridge minimalism — `stbgame` and `stbwindow` ship the floor only
+
+The two entry-point cartridges that open a window split by use case
+and ship only the foundational subsystems every windowed program
+needs. Everything else is opt-in via explicit `import` from the
+caller — no convenience couplings.
+
+| Cartridge | Used by | Loop | Resolution policy |
+|---|---|---|---|
+| `stbgame.bsm` | games | 60-fps loop + maestro | pixel-perfect default (Phase 4.1+) |
+| `stbwindow.bsm` | tools | manual loop, no fps cap | native resolution |
+
+**Both** include the same foundational subsystems and nothing
+beyond them:
+
+- `init_math` + `math_trig_init` — sqrt / sin / cos
+- `init_input` — keyboard + mouse + action map
+- `init_color` — palette + named colour constants
+- `init_draw` — CPU framebuffer primitives (rect, line, sprite, blit)
+- `init_font` — bitmap text
+- `init_str` — strbuf pool
+
+**Neither** pulls in:
+
+- `stbui` — widgets, theme, ui-arena. Opt in with
+  `import "stbui.bsm"; init_ui(); ... ui_arena_reset();` per frame.
+- `stbimage` — PNG decode + atlas pack + hot-reload. Opt in with
+  `import "stbimage.bsm"; image_load(...);` and, if you want live
+  reload, `image_hot_reload_enable(img); image_hot_reload_tick_throttled();` per frame.
+- `stbaudio` / `stbmixer` — audio stack. Opt in only when needed.
+- `stbecs` / `stbphys` / `stbtile` / `stbpath` — game systems.
+- `stbrender` — Metal-backed GPU pipeline. Required for sprite atlas
+  flushes; CPU-only games skip it.
+
+**Why.** Convenience couplings hide the dependency graph. A test
+that imports `stbgame` to use the loop should not magically also
+get widget-arena tracking — it inflates compile time, drags
+unused code into every binary, and tempts the cartridges to grow
+sideways instead of staying focused. Cartridges live at Layer 2
+and must respect the top-down dependency rule (a program imports
+what it uses; a cartridge does not import what its callers might
+want).
+
+**Tools that draw widgets** (Bang 9, ModuLab, Level Editor,
+the_bug) opt in like this:
+
+```bpp
+import "stbwindow.bsm";
+import "stbui.bsm";
+
+main() {
+    window_init_full(800, 600, "Tool");
+    init_ui();                              // once at boot
+    while (window_should_close() == 0) {
+        window_frame_step();
+        ui_arena_reset();                   // per frame
+        // ... render ...
+        draw_end();
+    }
+    window_close();
+    return 0;
+}
+```
+
+**Games that hot-reload assets** (pathfind today; any future game
+that wants live edits) opt in like this:
+
+```bpp
+import "stbgame.bsm";
+import "stbimage.bsm";
+
+main() {
+    game_init(W, H, "Game", 60);
+    auto atlas = image_load("assets/sprites.atlas.json");
+    image_hot_reload_enable(atlas);
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        image_hot_reload_tick_throttled(); // per frame
+        // ... update + render ...
+    }
+    return 0;
+}
+```
+
+**The discipline that fails this rule:**
+
+- "Add `init_ui()` to `stbgame` so callers don't have to remember."
+  Then every CPU game pays the ui-arena cost. Every test that uses
+  `stbgame` for the loop pulls stbui into its binary.
+- "Tick `image_hot_reload` from `stbgame` because some games want
+  it." Then every game that doesn't use atlases polls a watch list
+  every frame. The poll cost is small but the principle is what
+  matters: cartridges should not act on behalf of callers.
+
+**The discipline that follows the rule:** the cartridge ships the
+floor. The caller imports what it needs. The dependency graph
+matches what the binary actually links.
+
+**Cross-reference**: Rule 22 (stb !import bpp_*) and Rule 12
+(:float opt-in) — same minimalism principle applied to different
+layers. Auto-inject covers what every program *must* have; opt-in
+covers what programs *might* want. The two should not blur.
 
 ---
 
