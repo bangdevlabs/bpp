@@ -634,10 +634,29 @@ reset to 0 at window-pass present). See journal 2026-05-07 +
 `tonify_checklist.md` Pitfall 7.
 
 **Phase 4.1.3 — stbgame `game_init` virtual_w/h reinterpretation
-(NEXT).** The infrastructure above lets `game_init(W, H, title,
-fps)` reinterpret `(W, H)` as virtual resolution and auto-scale
-the window to monitor. The original Phase 4.1 spec below
-describes the target shape.
+(SHIPPED 2026-05-07).** `game_init(W, H, title, fps)` reinterprets
+`(W, H)` as virtual rendering resolution. Window opens at the
+largest integer scale fitting 80% of the monitor's visible frame
+(sub-1× clamp so the canvas is never bilinear-shrunk). Three
+opt-out APIs land alongside (`game_set_window_scale`,
+`game_set_window_size`, `game_set_letterbox_color`), all
+pre-`game_init`. `game_window_w / h` switched to read live
+window dims (`_stb_win_w / _h`) so multi-pass blit math stays
+correct at any non-1× scale; `SCREEN_W / H` remain the virtual
+resolution. Existing games (snake, pathfind, fps_3d, etc.)
+auto-scale with zero source change. See journal 2026-05-07.
+
+**Phase 4.1.4 — Auto-orchestrated offscreen + nearest blit
+(NEXT).** Today `game_init` opens a properly-sized window but
+software / direct-GPU games still render at the wrong dispatch
+shape: their virtual canvas gets bilinear-stretched to the
+window. Phase 4.1.4 will have stbgame auto-bind an offscreen
+target at `game_frame_begin` and auto-blit with NEAREST sampler
+at `draw_end`, so every game gets pixel-perfect upscale by
+default. The infrastructure (offscreen targets, smart-dispatch
+clear, pp_blit shader, integer-scale rect compute, letterbox
+colour) is already in place from 4.1.1 / 4.1.2 / 4.1.3 — 4.1.4
+is the orchestration glue.
 
 ---
 

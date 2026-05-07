@@ -32,8 +32,71 @@ extrn _stb_frame_ms;
 extrn _stb_last_time;
 static auto _stb_dt_ms;
 
+// Phase 4.1.3 — pixel-perfect window-sizing state.
+//
+// `_stb_force_window_scale` and `_stb_force_window_w / _h` let
+// callers override the auto-scale logic. Both default to 0 (off);
+// any non-zero value takes precedence. Set them via
+// `game_set_window_scale` / `game_set_window_size` BEFORE calling
+// `game_init`. Mid-run resize is not supported yet; rebind state
+// goes through the OS resize path.
+//
+// `_stb_letterbox_color` is the colour stbgame's auto-blit pass
+// (Phase 4.1.4) will use to fill the area outside the integer-
+// scaled virtual canvas. Today it is exposed via
+// `game_letterbox_color()` so callers doing manual multi-pass
+// rendering (see `examples/render_target_smoke.bpp`) can read it
+// for their own `render_clear` in the window pass.
+static auto _stb_force_window_scale;
+static auto _stb_force_window_w;
+static auto _stb_force_window_h;
+static auto _stb_letterbox_color;
+
+// Phase 4.1.3 opt-out APIs — call BEFORE `game_init`.
+//
+// `game_set_window_scale(s)` forces the window to open at
+// `virtual_w * s` by `virtual_h * s`. Bypasses the auto-scale
+// 80%-of-monitor heuristic entirely.
+//
+// `game_set_window_size(w, h)` forces specific window dimensions
+// regardless of virtual resolution. Useful for tools that want
+// a fixed window size while the rendering canvas stays at the
+// game's virtual resolution.
+//
+// `game_set_letterbox_color(rgba)` sets the colour stbgame uses
+// for the area outside the integer-scaled virtual canvas in the
+// window. Default is BLACK (`0xFF000000`).
+void game_set_window_scale(s) {
+    _stb_force_window_scale = s;
+}
+
+void game_set_window_size(w, h) {
+    _stb_force_window_w = w;
+    _stb_force_window_h = h;
+}
+
+void game_set_letterbox_color(rgba) {
+    _stb_letterbox_color = rgba;
+}
+
+// Read the configured letterbox colour. Defaults to BLACK
+// (`0xFF000000`) once `game_init` has run.
+game_letterbox_color()@base { return _stb_letterbox_color; }
+
 // Initialize the game window and all standard B subsystems.
-void game_init(w, h, title, fps) {
+//
+// Phase 4.1.3 reinterpretation: `virtual_w` and `virtual_h` are
+// the rendering resolution (the canvas the game thinks it is
+// drawing on). The OS window opens at the largest integer scale
+// that fits 80% of the monitor's visible frame, with a sub-1×
+// clamp so the canvas is never bilinear-shrunk. Existing games
+// pass their original window dimensions to `game_init` and
+// transparently get the auto-scale treatment — pixel-perfect
+// pixel-art is the new default.
+//
+// Override the auto-scale via `game_set_window_scale` /
+// `game_set_window_size` before calling `game_init`.
+void game_init(virtual_w, virtual_h, title, fps) {
     init_math();
     math_trig_init();
     init_input();
@@ -43,20 +106,55 @@ void game_init(w, h, title, fps) {
     init_ui();
     init_str();
 
-    SCREEN_W = w;
-    SCREEN_H = h;
-    _stb_w = w;
-    _stb_h = h;
+    SCREEN_W = virtual_w;
+    SCREEN_H = virtual_h;
+    _stb_w = virtual_w;
+    _stb_h = virtual_h;
 
-    // Allocate software framebuffer.
-    _stb_fb = malloc(w * h * 4);
+    // Allocate software framebuffer at virtual size. Software-
+    // rendered games draw into this buffer at virtual coordinates;
+    // the platform layer scales the contents to the window when
+    // presenting.
+    _stb_fb = malloc(virtual_w * virtual_h * 4);
+
+    // First-call default for letterbox: BLACK with full alpha.
+    // `game_set_letterbox_color` may have been called pre-init to
+    // override; respect that.
+    if (_stb_letterbox_color == 0) {
+        _stb_letterbox_color = 0xFF000000;
+    }
+
+    // Compute window dimensions per the 4.1.3 priority ladder:
+    //   1. game_set_window_size   (explicit dims)
+    //   2. game_set_window_scale  (explicit scale)
+    //   3. auto-scale             (max integer fitting 80% monitor)
+    auto win_w, win_h, scale;
+    auto monitor_w, monitor_h, target_w, target_h, scale_w, scale_h;
+    if (_stb_force_window_w > 0 && _stb_force_window_h > 0) {
+        win_w = _stb_force_window_w;
+        win_h = _stb_force_window_h;
+    } else if (_stb_force_window_scale > 0) {
+        win_w = virtual_w * _stb_force_window_scale;
+        win_h = virtual_h * _stb_force_window_scale;
+    } else {
+        monitor_w = _stb_get_monitor_width();
+        monitor_h = _stb_get_monitor_height();
+        target_w = monitor_w * 8 / 10;
+        target_h = monitor_h * 8 / 10;
+        scale_w = target_w / virtual_w;
+        scale_h = target_h / virtual_h;
+        scale = scale_w < scale_h ? scale_w : scale_h;
+        if (scale < 1) { scale = 1; }
+        win_w = virtual_w * scale;
+        win_h = virtual_h * scale;
+    }
 
     // Target frame time from requested fps. A non-positive fps
     // falls back to ~60 FPS so game_init never divides by zero.
     _stb_frame_ms = fps > 0 ? 1000 / fps : 16;
 
-    // Open the OS window.
-    _stb_init_window(w, h, title);
+    // Open the OS window at the resolved scaled size.
+    _stb_init_window(win_w, win_h, title);
 
     // Initialize timing.
     _stb_last_time = _stb_get_time();
@@ -306,16 +404,22 @@ scene_current()@base {
     return _scene_current;
 }
 
-// === Phase 4.1.2 — pixel-perfect helpers ===
+// === Phase 4.1.2 + 4.1.3 — pixel-perfect helpers ===
 
-// _stb_w / _stb_h are the framebuffer mirror globals shared with
-// stbwindow / the platform layer. game_init writes them; the
-// platform layer keeps them in sync on resize.
-extrn _stb_w, _stb_h;
+// `_stb_win_w / _stb_win_h` are the live window content-area
+// dimensions kept in sync by the platform layer's resize
+// callback. After Phase 4.1.3 the framebuffer mirror globals
+// `_stb_w / _stb_h` track VIRTUAL resolution (= the rendering
+// canvas), so reading them for window-pass blit math gives the
+// wrong answer at any non-1× scale. Use these accessors instead.
+extrn _stb_win_w, _stb_win_h;
 
-// Live window content size in pixels.
-game_window_w()@base { return _stb_w; }
-game_window_h()@base { return _stb_h; }
+// Live window content size in pixels (logical points on Retina).
+// Tracks the OS window's current content area — updates when the
+// user resizes. For VIRTUAL resolution (the game's drawing
+// canvas), use `SCREEN_W / SCREEN_H` instead.
+game_window_w()@base { return _stb_win_w; }
+game_window_h()@base { return _stb_win_h; }
 
 // Compute integer-scaled centered rect for pixel-perfect blit.
 // out buffer = 32 bytes, returns [x, y, w, h] as 4 word ints.

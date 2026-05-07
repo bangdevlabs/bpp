@@ -1,5 +1,103 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 4.1.3 CLOSED — `game_init` reinterpreted as virtual resolution + auto-scale window
+
+**bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
+
+The third sub-phase of GPU pipeline Phase 4.1 lands: `game_init`'s
+first two arguments are now interpreted as the game's **virtual
+rendering resolution** rather than the literal window size. The
+window opens at the largest integer scale that fits 80% of the
+monitor's visible frame, with a sub-1× clamp so the canvas is
+never bilinear-shrunk.
+
+Existing games change zero source code: `game_init(320, 180, ...)`
+in snake auto-opens at a 960×540 window (3× scale on a 1512×982
+logical M4 desktop) where it used to open at 320×180. The
+virtual canvas — what the game thinks it is drawing on — stays
+320×180. Software-rendered games keep writing into a 320×180
+framebuffer; GPU games keep emitting verts at virtual coordinates.
+
+Three opt-out APIs land alongside, all callable BEFORE
+`game_init`:
+
+- `game_set_window_scale(s)` — bypass auto-scale, force window
+  to `virtual_w * s` × `virtual_h * s`.
+- `game_set_window_size(w, h)` — bypass entirely, force specific
+  window dims regardless of virtual resolution. Useful for tools.
+- `game_set_letterbox_color(rgba)` — colour stbgame's pending
+  Phase 4.1.4 auto-blit pass will use to fill the area outside
+  the integer-scaled virtual canvas. Today exposed via
+  `game_letterbox_color()` getter so multi-pass callers
+  (smoke, custom orchestrators) can read it for their own
+  `render_clear`.
+
+`game_window_w / game_window_h` now read `_stb_win_w / _stb_win_h`
+(live window content size, OS-tracked via the resize callback)
+instead of `_stb_w / _stb_h` — those track virtual resolution
+post-4.1.3, so the window-pass blit math (see
+`render_target_smoke.bpp`) needs the live window dims to stay
+correct at any non-1× scale. `SCREEN_W / SCREEN_H` remain the
+virtual resolution, available to game logic that reasons about
+its own canvas.
+
+### Verification
+
+- `examples/render_target_smoke.bpp`: opens at 1280×720 (scale=1
+  on this M4 — virtual = 1280×720 fits exactly), renders 320×240
+  offscreen pattern, blits centered with magenta letterbox.
+  Visual output unchanged from Phase 4.1.2.
+- `games/snake/snake_maestro.bpp`: compiles unchanged. Window
+  now opens auto-scaled at 3× (960×540) where it used to open
+  at the raw `W`×`H`. The framebuffer + canvas math all stay at
+  virtual 320×180 — proper pixel-perfect upscaling for the
+  software path will land in Phase 4.1.4 (currently the
+  software framebuffer is bilinear-stretched by Cocoa's
+  NSImageView; nearest-neighbour upscale is the next step).
+- `games/pathfind/pathfind.bpp`, `games/fps/fps_3d.bpp`:
+  compile unchanged. Same semantic shift — window auto-scales,
+  game logic sees virtual resolution.
+- Suite native + C green. Bootstrap byte-stable (compiler
+  unchanged; this is an stb-only edit).
+
+### Tonify rules applied
+
+- **Rule 1**: `_stb_force_window_scale`, `_stb_force_window_w/h`,
+  `_stb_letterbox_color` are `static auto` at file scope —
+  set-once-per-process state with module-private visibility.
+- **Rule 2**: `game_set_*` setters are public API (no `static`).
+- **Rule 3**: setters are `void` (side-effect only, no return).
+- **Rule 4**: `game_letterbox_color` getter is `@base`
+  (pure read of a global). Setters and `game_init` left
+  unannotated — they write globals, the inferred classification
+  is honest. Getter could be `@base` only because it reads a
+  global word — no builtin calls.
+- **Rule 13**: parameters are word-typed by default; no
+  non-word params to annotate.
+
+### Files changed
+
+- `stb/stbgame.bsm` (~+85 LOC):
+  - Three `static auto` globals for opt-out state.
+  - `game_set_window_scale / window_size / letterbox_color`
+    setters.
+  - `game_letterbox_color` getter.
+  - `game_init` rewritten with the priority ladder
+    (size override → scale override → auto-scale 80% rule).
+  - `game_window_w / game_window_h` switched to read
+    `_stb_win_w / _stb_win_h`.
+
+### Phase 4.1.4 follow-up (next session)
+
+Phase 4.1.3 lands the window-sizing logic. The remaining piece
+for "pixel-perfect default ON" is automatic offscreen target +
+blit orchestration in `game_frame_begin` / `draw_end` so that
+existing software games and existing GPU games BOTH render at
+virtual resolution and get crisp NEAREST-filter upscale to the
+window. Today the smoke does this orchestration manually.
+
+---
+
 ## 2026-05-07 — Phase 4.1.1 + 4.1.2 CLOSED — Pixel-perfect render pipeline + multi-pass `_gpu_vbuf` race fix
 
 **bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
