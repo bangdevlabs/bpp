@@ -735,75 +735,56 @@ res, integer scaled. No blur. Letterbox where aspect doesn't match.
 
 ---
 
-### Phase 4.2 — Render target + offscreen pipeline (~200 LOC, 1 session)
+### Phase 4.2 + 4.3 — folded into Phase 4.1.x (CLOSED 2026-05-07)
 
-**Owner: `stbshader.bsm` (extends, not creates a new cartridge).**
-Render target is pipeline configuration — same domain as shader
-load/uniform binding from Phase 2.1. Adding `gpu_target_*` to a
-separate cartridge would split related concerns.
+The original spec for Phase 4.2 ("render target + offscreen pipeline")
+and Phase 4.3 ("integer scaling final pass + letterbox") was that
+2-shot plan from the cold-open. In execution both shipped under
+the Phase 4.1.x umbrella:
 
-Off-screen `MTLTexture` as render target. New API in stbshader:
-```bpp
-auto target = gpu_target_create(320, 240);  // offscreen MTLTexture
-gpu_target_bind(target);                    // route subsequent draws
-render_clear(BLACK);
-// ... game world draws ...
-gpu_target_present(target);                 // finalize for sampling
-gpu_target_bind(0);                         // back to screen
-```
+- **Render target + offscreen pipeline** → Phase 4.1.1 (`gpu_target_*`,
+  `gpu_present_target`, `gpu_draw_quad`, `pp_blit` shader).
+- **Integer scaling + letterbox** → Phase 4.1.3 (`game_compute_present_rect`,
+  `game_set_letterbox_color`) + Phase 4.1.4 (`game_render_begin / end`
+  auto-orchestration that does the letterbox + NEAREST blit per frame).
 
-Backend: macOS creates 2nd `MTLRenderPassDescriptor` pointing at the
-texture. Linux no-op stubs in `_stb_platform_linux.bsm` (sibling to
-existing GPU stubs).
-
-stbgame ties the offscreen target to virtual_w/h from Phase 4.1: every
-game frame renders to offscreen virtual surface, then final pass blits
-to window with integer scale + letterbox.
-
-**Smoke test:** `examples/render_target_smoke.bpp` — draws checkerboard
-to offscreen 320×240, blits to window, visually confirms NEAREST
-sampling at 4x scale (sharp, not blurred).
+Treat the original 4.2 / 4.3 sections as historical context. The
+shipped state is documented in the Phase 4.1.1 + 4.1.2 + 4.1.3 +
+4.1.4 closeout markers above.
 
 ---
 
-### Phase 4.3 — Integer scaling final pass + letterbox (~150 LOC, 1 session)
+### Phase 4.2 — Validation + game migration (CLOSED 2026-05-07)
 
-Final blit pass: textured fullscreen quad with nearest-neighbor
-sampling. Integer scale factor calculated in Phase 4.1's
-`game_set_window_scale` logic. Letterbox bars for non-multiple ratios
-(BLACK default, `game_set_letterbox_color(rgba)` opt-out).
+(Renumbered from original Phase 4.4; the planned 4.2 / 4.3 shipped
+as Phase 4.1.x sub-phases — see above.)
 
-stbgame's `game_frame_end` (or auto-tick from frame_begin) executes
-the offscreen→window blit pass.
+All six game files migrated from manual `render_begin / render_end`
+to the auto-orchestrated `game_render_begin / game_render_end`
+helpers from Phase 4.1.4. Two-line replacement per game; the
+helpers handle offscreen target creation, letterbox clear, and
+NEAREST-filter blit to the window automatically.
 
-**Gate:** every game's window resizes preserving pixel-perfect.
-Letterbox visible where aspect mismatches. Toggle key (debug) cycles
-scales for verification.
+Migrated:
+- `games/snake/snake_maestro.bpp` (320×180 virtual)
+- `games/pathfind/pathfind.bpp` (320×180 virtual)
+- `games/fps/fps_3d.bpp` (640×480 virtual)
+- `games/fps/fps_3d_gpu.bpp` (320×240 virtual)
+- `games/platformer/platform.bpp` (320×180 virtual)
+- `games/rhythm/rhythm.bpp` (320×180 virtual)
+
+Three render-phase functions (`snake_render_phase`,
+`wolf3d_render_phase`, `fps_render_phase`) had their `@gpu`
+annotation dropped — the new orchestration helpers reach `@io`
+transitively (via the lazy `_pp_blit_init` file_read for the
+shader source on first frame), so the strict `@gpu` claim no
+longer holds. Inferred `@solo` is the honest classification.
+
+Suite native + C green (140/0/12 + 114/0/38). Bootstrap
+byte-stable. Visual confirmed pixel-perfect at default + resized
+window with BLACK letterbox on aspect mismatch.
 
 ---
-
-### Phase 4.4 — Validation across games + journal (~50 LOC)
-
-All games confirmed pixel-perfect:
-- snake_maestro at 320×180 virtual → 4x window
-- pathfind at 320×180 virtual → 4x window
-- fps_3d_gpu at 320×240 virtual → 3x window (or 4x letterboxed)
-- platformer at 320×180 virtual → 4x window
-- rhythm at 320×180 virtual → 4x window
-
-**Dev/debug toggle in fps_3d_gpu**: `P` key cycles through 1x / 2x /
-3x / auto window scales for visual verification of pixel-perfect
-preservation across sizes.
-
-Profile HUD shows pixel-perfect overhead (one fullscreen quad blit per
-frame ≈ negligible on M4).
-
-Journal entry: Phase 4 closeout with bpp hash, suite counts, before/
-after screenshots noted, decision log entry confirming pixel-perfect
-shipped.
-
-**Gate:** every game in repo runs pixel-perfect by default. fps_3d_gpu
-demonstrates GPU pipeline + pixel-perfect together.
 
 ### Bonus capability inherited from Phase 3.5: shader hot-reload
 

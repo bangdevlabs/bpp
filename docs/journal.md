@@ -1,5 +1,78 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 4.2 CLOSED — All six games migrated to `game_render_begin / end`
+
+**bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
+
+Phase 4.1.4 shipped the `game_render_begin / game_render_end`
+auto-orchestration helpers; Phase 4.2 (renumbered from the
+roadmap's planned Phase 4.4 — the original 4.2 / 4.3 sections
+shipped as 4.1.x sub-phases) migrates every game in the repo to
+the new helpers. Two-line replacement per game.
+
+### Migrated
+
+| Game | Virtual | Migration |
+|---|---|---|
+| `games/snake/snake_maestro.bpp` | 320×180 | `render_begin / end` → `game_render_begin / end` |
+| `games/pathfind/pathfind.bpp` | 320×180 | same |
+| `games/fps/fps_3d.bpp` | 640×480 | same |
+| `games/fps/fps_3d_gpu.bpp` | 320×240 | same |
+| `games/platformer/platform.bpp` | 320×180 | same |
+| `games/rhythm/rhythm.bpp` | 320×180 | same |
+
+### Annotation fallout
+
+Three render-phase functions had their `@gpu` annotation dropped:
+
+- `snake_render_phase`
+- `wolf3d_render_phase` (in `fps_3d.bpp`)
+- `fps_render_phase` (in `fps_3d_gpu.bpp`)
+
+Reason: `game_render_begin / end` reach `@io` transitively via
+`_pp_blit_init`'s `file_read_all` of the shader source on first
+frame. The lazy-loaded path is per-process, not per-frame, but
+the compiler's effect classification doesn't model "lazy once"
+— it sees `file_read_all` reachable from the call graph and
+propagates `@io` everywhere. The strict `@gpu` claim no longer
+holds, so the inferred `@solo` is the honest classification.
+
+The other three games (`pathfind`, `platformer`, `rhythm`) had
+their render bodies inside the main loop (no annotated render
+function), so no annotation cleanup was needed there.
+
+### Roadmap consolidation
+
+The roadmap's Phase 4.2 ("render target + offscreen pipeline")
+and Phase 4.3 ("integer scaling + letterbox") sections were
+authored before Phase 4.1's split into sub-phases. In execution,
+both shipped under the 4.1.x umbrella:
+
+- **Phase 4.2 spec → Phase 4.1.1**: `gpu_target_create / bind`,
+  `gpu_present_target`, `pp_blit` shader.
+- **Phase 4.3 spec → Phase 4.1.3 + 4.1.4**: `game_compute_present_rect`,
+  `game_set_letterbox_color`, `game_render_begin / end` orchestration.
+
+The roadmap now folds those sections into the Phase 4.1.x
+closeout marker and renumbers the original Phase 4.4 (validation
++ migration) as the shipping Phase 4.2.
+
+### What's next
+
+The natural follow-ups in roadmap order:
+
+1. **Phase 4.3 (was Phase 5) — Layered backgrounds + parallax**
+   (`stbscene` cartridge, ~300 LOC, 2 sessions).
+2. **Phase 4.4 (was Phase 6) — Effect library + scoped zones**
+   (`stbfx` cartridge + `@scoped` annotation, ~550 LOC,
+   4 sessions).
+3. **Linux Vulkan/X11 GPU implementation** — closes the
+   cross-platform contract documented across Phase 4.1.x stubs.
+
+User picks the order.
+
+---
+
 ## 2026-05-07 — Phase 4.1.4 CLOSED — Auto pixel-perfect render orchestration (software + GPU)
 
 **bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
