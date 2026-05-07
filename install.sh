@@ -11,6 +11,11 @@ PREFIX="/usr/local"
 BIN_DIR="$PREFIX/bin"
 LIB_DIR="$PREFIX/lib/bpp"
 STB_DIR="$LIB_DIR/stb"
+# Shader sources that ship with stb (pp_blit for pixel-perfect upscale,
+# fps_raycast for the FPS demo, trivial/textured for tutorial smoke
+# tests). Installed alongside the .bsm modules so gpu_pipeline_load
+# can resolve them by basename from any cwd.
+SHADER_DIR="$STB_DIR/shaders"
 FFI_DIR="$LIB_DIR/ffi"
 
 # Backend layout mirrors src/backend/ since the 0.23.x reorg:
@@ -46,7 +51,7 @@ echo "==> Compiling debugger..."
 echo "==> Installing to $PREFIX (requires sudo)..."
 
 # Create directories.
-sudo mkdir -p "$BIN_DIR" "$LIB_DIR" "$STB_DIR" "$FFI_DIR"
+sudo mkdir -p "$BIN_DIR" "$LIB_DIR" "$STB_DIR" "$SHADER_DIR" "$FFI_DIR"
 sudo mkdir -p "$CHIP_ARM64_DIR" "$CHIP_X64_DIR"
 sudo mkdir -p "$OS_MACOS_DIR" "$OS_LINUX_DIR"
 sudo mkdir -p "$TARGET_MAC_DIR" "$TARGET_LIN_DIR" "$BACKEND_C_DIR"
@@ -164,6 +169,15 @@ sudo cp src/bug_tui.bsm "$LIB_DIR/"
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
 
+# Install shader sources. gpu_pipeline_load resolves a bare basename
+# (e.g. "pp_blit.metal") against this directory after a cwd-relative
+# probe fails, so games can call gpu_pipeline_load("foo.metal", ...)
+# from any working directory and the canonical stb-shipped shaders
+# always resolve. Wipe first so a renamed shader doesn't leave a
+# ghost copy behind.
+sudo rm -f "$SHADER_DIR"/*.metal
+sudo cp stb/shaders/*.metal "$SHADER_DIR/"
+
 # Install FFI bindings (raylib, SDL2 backends — proof B++ FFI works).
 sudo cp ffi/*.bsm "$FFI_DIR/"
 
@@ -250,6 +264,7 @@ echo "    $BIN_DIR/bpp (compiler)"
 echo "    $BIN_DIR/bug (debugger)"
 echo "    $LIB_DIR/ ($(ls $LIB_DIR/*.bsm 2>/dev/null | wc -l | tr -d ' ') runtime modules)"
 echo "    $STB_DIR/ ($(ls stb/*.bsm | wc -l | tr -d ' ') stb modules)"
+echo "    $SHADER_DIR/ ($(ls stb/shaders/*.metal | wc -l | tr -d ' ') shader sources)"
 echo "    $FFI_DIR/ ($(ls ffi/*.bsm | wc -l | tr -d ' ') FFI bindings)"
 echo "    $CHIP_ARM64_DIR/ ($(ls src/backend/chip/aarch64/*.bsm | wc -l | tr -d ' ') modules)"
 echo "    $CHIP_X64_DIR/ ($(ls src/backend/chip/x86_64/*.bsm | wc -l | tr -d ' ') modules)"

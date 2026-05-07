@@ -40,7 +40,7 @@
 //   auto pipe;
 //   game_init(320, 180, "demo", 60);
 //   render_init();
-//   pipe = gpu_pipeline_load("assets/shaders/crt.metal",
+//   pipe = gpu_pipeline_load("crt.metal",
 //                            "crt_vert", "crt_frag");
 //   while (game_should_quit() == 0) {
 //       game_frame_begin();
@@ -59,7 +59,7 @@
 // gpu_pipeline_use_default() to restore it after a stretch of
 // custom-pipeline draws so subsequent render_* calls keep
 // working without manual encoder reset. See
-// `assets/shaders/trivial.metal` for a minimal vertex+fragment
+// `stb/shaders/trivial.metal` for a minimal vertex+fragment
 // example.
 //
 // Backend portability:
@@ -84,10 +84,74 @@
 // reason as render_init: the failure path emits stderr text, so
 // the inferred effect is SOLO and an explicit `: gpu` would clash
 // with the lattice via join(GPU, IO) = SOLO.
+// Compose the canonical install-side path for a stb-shipped shader.
+// The install layout (see install.sh) places .metal sources under
+// `/usr/local/lib/bpp/stb/shaders/` next to the .bsm modules. The
+// caller passes a bare basename (e.g. "pp_blit.metal") and gets back
+// a freshly-malloc'd null-terminated string they own.
+static _stb_shader_install_path(basename) {
+    auto root, root_len, name_len, out;
+    root     = "/usr/local/lib/bpp/stb/shaders/";
+    root_len = str_len(root);
+    name_len = str_len(basename);
+    out      = malloc(root_len + name_len + 1);
+    buf_copy(out,            root,     root_len);
+    buf_copy(out + root_len, basename, name_len);
+    poke(out + root_len + name_len, 0);
+    return out;
+}
+
+// Return a pointer into `metal_path` past the last '/', or the
+// original pointer if none is present. Used by gpu_pipeline_load to
+// strip an "assets/shaders/" prefix before consulting the install
+// directory — callers can ship paths that work both before install
+// (cwd-relative against the repo) and after install (basename match
+// in /usr/local/lib/bpp/stb/shaders/).
+static _stb_shader_basename(metal_path) {
+    auto i, c, last_slash;
+    last_slash = -1;
+    i = 0;
+    while (1) {
+        c = peek(metal_path + i);
+        if (c == 0) { break; }
+        if (c == '/') { last_slash = i; }
+        i++;
+    }
+    if (last_slash < 0) { return metal_path; }
+    return metal_path + last_slash + 1;
+}
+
 gpu_pipeline_load(metal_path, vert_name, frag_name) {
     auto src, fsize, pipe;
     fsize = 0;
+    // Resolution order:
+    //   1. cwd-relative path as given — wins when the user runs from
+    //      a directory where the path resolves directly (notably the
+    //      repo root during development).
+    //   2. `<install_dir>/<basename>` — wins for every stb-shipped
+    //      shader (pp_blit, fps_raycast, trivial, textured) once the
+    //      compiler is installed via install.sh. Cwd-agnostic.
+    //   3. `path_asset(metal_path)` — walks up from the exe directory
+    //      looking for a prefix that makes the path readable. Lets
+    //      user games ship their own shaders under
+    //      `games/<name>/assets/shaders/foo.metal` and load them
+    //      from any cwd without code changes.
     src = file_read_all(metal_path, &fsize);
+    if (src == 0) {
+        auto basename, install_path;
+        basename     = _stb_shader_basename(metal_path);
+        install_path = _stb_shader_install_path(basename);
+        src = file_read_all(install_path, &fsize);
+        free(install_path);
+    }
+    if (src == 0) {
+        auto resolved;
+        resolved = path_asset(metal_path);
+        if (resolved != 0) {
+            src = file_read_all(resolved, &fsize);
+            free(resolved);
+        }
+    }
     if (src == 0) {
         put_err("gpu_pipeline_load: cannot read ");
         put_err(metal_path);
@@ -243,11 +307,11 @@ void gpu_target_bind(target)@gpu {
 
 // Phase 4.1.2 — Pixel-perfect blit pass.
 //
-// Lazy-loaded blit pipeline. The shader at
-// `assets/shaders/pp_blit.metal` ships with the engine and reads
-// `target` with a NEAREST sampler, drawing it as a 4-vertex quad
-// at the dst rect inside the window drawable. Loaded on first call
-// so games that never opt out of pixel-perfect pay the file-read
+// Lazy-loaded blit pipeline. The shader at `stb/shaders/pp_blit.metal`
+// ships with the engine (installed to `/usr/local/lib/bpp/stb/shaders/`)
+// and reads `target` with a NEAREST sampler, drawing it as a 4-vertex
+// quad at the dst rect inside the window drawable. Loaded on first
+// call so games that never opt out of pixel-perfect pay the file-read
 // cost once per process lifetime; games that load other custom
 // shaders are unaffected (different pipeline).
 //
@@ -257,59 +321,12 @@ void gpu_target_bind(target)@gpu {
 static auto _pp_blit_pipe;
 static auto _pp_blit_uniform;
 
-// Build the pixel-perfect blit shader source as an in-process MSL
-// string. Embedded so games can run from any working directory
-// without needing `assets/shaders/pp_blit.metal` resolvable
-// relative to cwd. The reference copy at `assets/shaders/pp_blit.metal`
-// stays in the repo for editor syntax highlighting + future
-// shader-hot-reload (Phase 3.5 inheritance) but is not required
-// at runtime.
-//
-// Vertex stage synthesises 4 corners from [[vertex_id]] into a
-// triangle strip covering the dst rect in NDC. Fragment samples
-// the bound texture with NEAREST + clamp-to-edge — the
-// pixel-perfect contract for pixel-art games.
-static _pp_blit_source() {
-    auto s;
-    s = strbuf_new();
-    s = strbuf_cat(s, "#include <metal_stdlib>\n");
-    s = strbuf_cat(s, "using namespace metal;\n");
-    s = strbuf_cat(s, "struct BlitU {\n");
-    s = strbuf_cat(s, "  float dst_x; float dst_y;\n");
-    s = strbuf_cat(s, "  float dst_w; float dst_h;\n");
-    s = strbuf_cat(s, "  float win_w; float win_h;\n");
-    s = strbuf_cat(s, "  float pad0; float pad1;\n");
-    s = strbuf_cat(s, "};\n");
-    s = strbuf_cat(s, "struct V {\n");
-    s = strbuf_cat(s, "  float4 position [[position]];\n");
-    s = strbuf_cat(s, "  float2 uv;\n");
-    s = strbuf_cat(s, "};\n");
-    s = strbuf_cat(s, "vertex V pp_blit_vert(uint vid [[vertex_id]],\n");
-    s = strbuf_cat(s, "                      constant BlitU &u [[buffer(0)]]) {\n");
-    s = strbuf_cat(s, "  float fx = ((vid & 1u) == 0u) ? 0.0 : 1.0;\n");
-    s = strbuf_cat(s, "  float fy = (vid < 2u)         ? 0.0 : 1.0;\n");
-    s = strbuf_cat(s, "  float px = u.dst_x + fx * u.dst_w;\n");
-    s = strbuf_cat(s, "  float py = u.dst_y + fy * u.dst_h;\n");
-    s = strbuf_cat(s, "  float ndc_x = (px / u.win_w) * 2.0 - 1.0;\n");
-    s = strbuf_cat(s, "  float ndc_y = 1.0 - (py / u.win_h) * 2.0;\n");
-    s = strbuf_cat(s, "  V o;\n");
-    s = strbuf_cat(s, "  o.position = float4(ndc_x, ndc_y, 0.0, 1.0);\n");
-    s = strbuf_cat(s, "  o.uv = float2(fx, fy);\n");
-    s = strbuf_cat(s, "  return o;\n");
-    s = strbuf_cat(s, "}\n");
-    s = strbuf_cat(s, "constexpr sampler smp_n(filter::nearest, address::clamp_to_edge);\n");
-    s = strbuf_cat(s, "fragment float4 pp_blit_frag(V in [[stage_in]],\n");
-    s = strbuf_cat(s, "                             texture2d<float> tex [[texture(0)]]) {\n");
-    s = strbuf_cat(s, "  return tex.sample(smp_n, in.uv);\n");
-    s = strbuf_cat(s, "}\n");
-    return s;
-}
-
-// Lazy-init the pixel-perfect blit pipeline. Source is embedded
-// (see `_pp_blit_source`) so this call is cwd-agnostic — games
-// can be run from `games/<name>/` without breaking. First call
-// builds + compiles + caches; subsequent calls return the cached
-// handle.
+// Lazy-init the pixel-perfect blit pipeline. The shader source is
+// loaded by `gpu_pipeline_load`, which resolves the basename against
+// the install directory after the cwd-relative probe fails — so this
+// call is cwd-agnostic regardless of where the game binary runs from.
+// First call reads + compiles + caches; subsequent calls return the
+// cached handle.
 //
 // Annotation deliberately omitted: the error path calls `put_err`
 // (@io) on shader compile failure, so the call-graph classification
@@ -318,9 +335,8 @@ static _pp_blit_source() {
 // pure GPU but the effect annotation has to model the worst case.
 static _pp_blit_init() {
     if (_pp_blit_pipe != 0) { return _pp_blit_pipe; }
-    auto src;
-    src = _pp_blit_source();
-    _pp_blit_pipe = _stb_gpu_pipeline_load(src, "pp_blit_vert", "pp_blit_frag");
+    _pp_blit_pipe = gpu_pipeline_load("pp_blit.metal",
+                                       "pp_blit_vert", "pp_blit_frag");
     if (_pp_blit_pipe == 0) {
         put_err("gpu_present_target: pp_blit pipeline failed to load\n");
         return 0;
