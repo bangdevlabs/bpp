@@ -553,6 +553,45 @@ static auto _gpu_atlas_w, _gpu_atlas_h;
 // Per-frame state.
 static auto _gpu_drawable, _gpu_cmdbuf, _gpu_enc;
 
+// Phase 4.1.2 — pass-state flag read by stbrender's render_clear
+// for smart-dispatch between two equivalent clear mechanisms:
+//
+//   _gpu_in_pass == 0 (between frames, before render_begin):
+//     render_clear queues the color in `_gpu_clear_*` for the
+//     next render_begin to load via Metal's setClearColor: on
+//     the render pass descriptor — tile-memory clear, free on
+//     Apple Silicon.
+//
+//   _gpu_in_pass == 1 (between render_begin and render_end):
+//     render_clear emits a fullscreen solid-color quad through
+//     the default pipeline batch — runs as a normal draw call,
+//     ~µs cost on M4. Used by multi-pass rendering (offscreen
+//     target + window blit) where a stale clear-state would land
+//     the wrong color in the wrong pass.
+//
+// Set by _stb_gpu_begin, cleared by _stb_gpu_present. Read by
+// stbrender via the extrn declaration there.
+extrn _gpu_in_pass;
+
+// Phase 4.1.1 — offscreen render target. When 0, _stb_gpu_begin
+// acquires a window drawable and renders straight to the screen
+// (legacy default). When non-zero, _stb_gpu_begin uses this MTLTexture
+// as the color attachment instead, skips drawable acquisition, and
+// _stb_gpu_present commits the command buffer without
+// presentDrawable. Set via _stb_gpu_target_bind from stbshader's
+// gpu_target_bind. Phase 4.1.3 wires stbgame to bind a per-virtual-
+// resolution offscreen target on every frame, with the final pass
+// blitting it to the window with a nearest-sampler fullscreen quad.
+static auto _gpu_offscreen_target;
+
+// Phase 4.1.1 — cached NSScreen handle and "visibleFrame" key
+// string for _stb_get_monitor_width / _stb_get_monitor_height.
+// Both are valid for the lifetime of the process; cached on first
+// query so the per-call cost is one objc_msgSend + one getValue
+// memcpy.
+static auto _plt_main_screen;
+static auto _plt_key_visible_frame;
+
 // Phase 3.2 batching — currently-bound fragment textures at slot 0
 // (sprite / font / atlas) and slot 1 (palette). The bind helpers
 // skip the flush + setFragmentTexture pair when the requested
@@ -939,6 +978,11 @@ static _gpu_compile_pipeline(ns_src, vert_name, frag_name) {
 void _stb_gpu_init(w, h) {
     auto metal, qc, fn_create, view, i;
 
+    // Default = render to the window drawable. stbgame opts into
+    // an offscreen target via gpu_target_bind once Phase 4.1.3
+    // ships virtual resolution.
+    _gpu_offscreen_target = 0;
+
     // Load Metal and QuartzCore frameworks.
     metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", 1);
     qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", 1);
@@ -1063,13 +1107,58 @@ void _stb_gpu_clear(r: float, g: float, b: float, a: float)@gpu {
     _gpu_clear_a = a;
 }
 
+// Phase 4.1.2 — inline clear via fullscreen quad. Used by
+// stbrender's render_clear when called inside an active render
+// pass (where the loadAction-based clear can no longer apply).
+//
+// Reads the current target's dimensions from `_gpu_screen_buf`
+// (which Phase 4.1.2's _stb_gpu_target_bind keeps in sync with
+// the active offscreen target or window) so the quad spans
+// exactly the target the render pass is writing to. Reuses the
+// default-pipeline rect emission path — same vertex format,
+// same shader, marker 0 = solid color from vertex.
+//
+// Cost: 6 vertices (2 triangles) + one solid-fill fragment per
+// pixel. On M4 with a typical 320×240 virtual target that's
+// ~76800 fragments at solid-color complexity — sub-microsecond.
+// Outside-pass clears still go through the free tile-memory
+// path via _stb_gpu_clear above.
+//
+// `color` is packed ARGB matching the rgba() / stbdraw convention
+// (a in bits 24-31, r 16-23, g 8-15, b 0-7). Unpacked here so
+// stbrender doesn't have to re-derive the byte channels.
+void _stb_gpu_clear_inline(color)@gpu {
+    auto sp, w, h, r, g, b, a;
+    sp = objc_msgSend(_gpu_screen_buf, sel_registerName("contents"));
+    w = read_u32(sp, 0);
+    h = read_u32(sp, 4);
+    r = (color >> 16) & 0xFF;
+    g = (color >>  8) & 0xFF;
+    b =  color        & 0xFF;
+    a = (color >> 24) & 0xFF;
+    _stb_gpu_rect(0, 0, w, h, r, g, b, a);
+}
+
 // Begin a GPU render frame.
-// Gets the next drawable, creates a command buffer, opens a render pass,
-// and binds the shader pipeline.
+// Gets the next drawable (or the bound offscreen target), creates a
+// command buffer, opens a render pass, and binds the shader pipeline.
+//
+// When an offscreen target is bound (gpu_target_bind from stbshader),
+// _gpu_drawable stays 0 for this frame and the render pass attaches
+// the offscreen MTLTexture as color attachment 0. _stb_gpu_present
+// then commits the command buffer without calling presentDrawable —
+// the user follows up with a second begin/draw/present cycle that
+// blits the offscreen texture to the window.
 void _stb_gpu_begin()@gpu {
     auto desc, attachments, att0, tex;
 
-    _gpu_drawable = objc_msgSend(_gpu_layer, sel_registerName("nextDrawable"));
+    if (_gpu_offscreen_target != 0) {
+        _gpu_drawable = 0;
+        tex = _gpu_offscreen_target;
+    } else {
+        _gpu_drawable = objc_msgSend(_gpu_layer, sel_registerName("nextDrawable"));
+        tex = objc_msgSend(_gpu_drawable, sel_registerName("texture"));
+    }
     _gpu_cmdbuf = objc_msgSend(_gpu_queue, sel_registerName("commandBuffer"));
 
     // Build the render pass descriptor with a clear operation.
@@ -1078,7 +1167,6 @@ void _stb_gpu_begin()@gpu {
     attachments = objc_msgSend(desc, sel_registerName("colorAttachments"));
     att0 = objc_msgSend(attachments, sel_registerName("objectAtIndexedSubscript:"), 0);
 
-    tex = objc_msgSend(_gpu_drawable, sel_registerName("texture"));
     objc_msgSend(att0, sel_registerName("setTexture:"), tex);
     objc_msgSend(att0, sel_registerName("setLoadAction:"), 2);
     objc_msgSend(att0, sel_registerName("setStoreAction:"), 1);
@@ -1094,9 +1182,15 @@ void _stb_gpu_begin()@gpu {
     call(_gpu_msg, _gpu_enc, sel_registerName("setVertexBuffer:offset:atIndex:"),
          _gpu_screen_buf, 0, 1);
 
-    // Reset vertex batch state for the new frame.
+    // Phase 4.1.2 — multi-pass safety: vert_count is per-pass (resets on
+    // every begin), but _gpu_flush_off accumulates ACROSS PASSES within
+    // a frame so each pass writes into a fresh region of the shared
+    // _gpu_vbuf. Without this, pass 2's CPU writes overwrite the bytes
+    // pass 1's GPU draw is still reading async, producing visible
+    // garbage (the original render_target_smoke "blue covers magenta"
+    // bug). _gpu_flush_off is reset to 0 at frame end (window-pass
+    // present, where _gpu_drawable != 0).
     _gpu_vert_count = 0;
-    _gpu_flush_off = 0;
 
     // Bind the glyph atlas texture for text rendering.
     if (_gpu_font_tex != 0) {
@@ -1111,6 +1205,11 @@ void _stb_gpu_begin()@gpu {
 
     // Reset vertex counter for this frame.
     _gpu_vert_count = 0;
+
+    // Phase 4.1.2 — flag to render_clear that we are now inside an
+    // active render pass. Subsequent render_clear calls dispatch to
+    // the inline-quad path instead of state-setting.
+    _gpu_in_pass = 1;
 }
 
 // Upload a new atlas texture to the GPU and update uniform buffer.
@@ -1285,6 +1384,131 @@ _stb_gpu_create_palette_texture(argb_data, count)@gpu {
     // Do not free scratch — Metal reads asynchronously on unified
     // memory systems. The buffer survives the frame.
     return tex;
+}
+
+// Phase 4.1.1 — create an offscreen render target. Returns an
+// MTLTexture configured for color attachment 0 + shader read so
+// the same handle can be both rendered into (via the standard
+// _stb_gpu_begin pass when bound) and sampled in a later pass
+// (the final blit to the window). Pixel format BGRA8Unorm matches
+// the default pipeline + drawable so the same MTLRenderPipelineState
+// handles both targets without a separate compile.
+//
+// Usage flag combination: render-target (4) | shader-read (1) = 5.
+// `setStorageMode: 0` (shared) keeps the texture in unified memory
+// so reads from the blit pass don't stall waiting for a GPU→CPU
+// copy. Apple Silicon has no discrete VRAM; "private" storage
+// (mode 1) is identical perf-wise but harder to debug.
+_stb_gpu_target_create(w: word, h: word)@gpu {
+    auto texdesc, tex;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 80);
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
+    objc_msgSend(texdesc, sel_registerName("setUsage:"), 5);
+    // Force "shared" storage mode (0) explicitly. Apple Silicon
+    // defaults to shared anyway (unified memory; shared and private
+    // perform identically), but Intel Macs default to "managed"
+    // (mode 2) which requires CPU-GPU sync at sample time and would
+    // stall the blit pass. Setting it explicitly future-proofs the
+    // contract: "this texture is always usable as a sampler input
+    // in the same frame it was rendered into."
+    objc_msgSend(texdesc, sel_registerName("setStorageMode:"), 0);
+    tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+    return tex;
+}
+
+// Phase 4.1.1 — bind / unbind the offscreen render target. Pass
+// the handle returned by _stb_gpu_target_create to redirect
+// subsequent _stb_gpu_begin / _stb_gpu_present cycles to that
+// texture. Pass 0 to fall back to the window drawable. Both
+// states are stable across many frames; stbgame's frame loop
+// flips between the two each frame (offscreen for game world,
+// window for the final blit pass).
+//
+// Also updates `_gpu_screen_buf` (the per-frame uniform that
+// holds screen_w / screen_h for the default vertex shader's
+// pixel→NDC conversion) so render_rect / render_text / etc.
+// drawn into the offscreen target use coordinates relative to
+// the OFFSCREEN dimensions, not the window's. Without this, a
+// 320×240 offscreen target receives draws at window-scale
+// (1280×720) coordinates and pixels destined for (20, 20, 80, 60)
+// land in an upper-left sliver instead of filling the offscreen
+// rect.
+//
+// The texture dimensions come from MTLTexture's -width / -height
+// (returned by reference, so use call() with the right arity).
+// Querying both per bind avoids tracking per-target metadata —
+// the texture itself is the source of truth.
+void _stb_gpu_target_bind(t)@gpu {
+    auto sp, w, h;
+    _gpu_offscreen_target = t;
+    sp = objc_msgSend(_gpu_screen_buf, sel_registerName("contents"));
+    if (t != 0) {
+        w = objc_msgSend(t, sel_registerName("width"));
+        h = objc_msgSend(t, sel_registerName("height"));
+    } else {
+        // Restore window dimensions from the framebuffer-mirror
+        // globals shared with stbdraw / stbwindow. Reading these
+        // directly keeps the platform layer's two views (offscreen
+        // vs window) in sync without a separate restore-state
+        // variable to maintain.
+        w = _stb_w;
+        h = _stb_h;
+    }
+    write_u32(sp, 0, w);
+    write_u32(sp, 4, h);
+}
+
+// Phase 4.1.1 — main monitor visible-frame query. Used by stbgame
+// to compute a sensible default window size from the virtual
+// resolution (Phase 4.1.3). Returns the size in LOGICAL POINTS,
+// not physical pixels — Cocoa hands us the same logical point
+// space the window dimensions use, so the scale calculation is
+// internally consistent. On Retina, the OS doubles physical
+// pixels transparently (a 1280-logical-point window paints into
+// 2560 physical pixels, but our framebuffer math stays in logical
+// space throughout). When porting to Linux/X11 or Windows the
+// equivalent query MUST also return logical units, otherwise
+// auto-scale picks the wrong factor on hi-DPI displays.
+//
+// "Visible frame" excludes the menu bar (top) and dock (bottom/
+// side) — what the user can actually fill with windows without
+// hiding chrome. `[NSScreen mainScreen]` returns the screen
+// containing the menu bar, which on a single-monitor setup is
+// always the user's primary display. Caches the screen handle
+// and the @"visibleFrame" key string on first call so the per-
+// query cost is one objc_msgSend + one getValue memcpy.
+static void _plt_monitor_init_cache()@io {
+    if (_plt_main_screen != 0) { return; }
+    _plt_main_screen = objc_msgSend(objc_getClass("NSScreen"),
+                                    sel_registerName("mainScreen"));
+    _plt_key_visible_frame = objc_msgSend(objc_getClass("NSString"),
+                                          sel_registerName("stringWithUTF8String:"),
+                                          "visibleFrame");
+}
+
+static _plt_monitor_size_axis(off)@io {
+    auto val, bits;
+    _plt_monitor_init_cache();
+    if (_plt_main_screen == 0) { return 0; }
+    val = objc_msgSend(_plt_main_screen, sel_registerName("valueForKey:"),
+                       _plt_key_visible_frame);
+    if (val == 0) { return 0; }
+    objc_msgSend(val, sel_registerName("getValue:"), _plt_rect_buf);
+    // NSRect: origin.x (0), origin.y (8), size.width (16), size.height (24).
+    bits = _plt_read_u64_le(_plt_rect_buf, off);
+    return _plt_double_to_int(bits);
+}
+
+_stb_get_monitor_width()@io {
+    return _plt_monitor_size_axis(16);
+}
+
+_stb_get_monitor_height()@io {
+    return _plt_monitor_size_axis(24);
 }
 
 // Re-upload an existing palette texture's contents in place.
@@ -1541,6 +1765,19 @@ void _stb_gpu_draw_full()@gpu {
          3, 0, 3);
 }
 
+// Issue a 4-vertex triangle-strip draw call with no vertex buffer.
+// The bound pipeline's vertex stage synthesises positions from
+// [[vertex_id]] = 0..3 (top-left, top-right, bottom-left, bottom-
+// right). Used by Phase 4.1.2's pixel-perfect blit pass: vertex
+// shader reads the dst-rect uniform and emits one quad covering
+// the integer-scaled portion of the window. Primitive type 4 is
+// MTLPrimitiveTypeTriangleStrip — 4 verts produces 2 triangles
+// covering the quad with no index buffer.
+void _stb_gpu_draw_quad()@gpu {
+    call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
+         4, 0, 4);
+}
+
 // ── Custom pipeline texture + sampler binding (Phase 2.2) ─────
 //
 // Companions to the Phase 2.1 pipeline-management primitives. A
@@ -1673,11 +1910,36 @@ void _stb_gpu_present()@gpu {
              _gpu_vbuf, byte_off, 0);
         call(_gpu_msg, _gpu_enc, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
              3, 0, _gpu_vert_count);
+        // Phase 4.1.2 — advance flush_off past these verts so the next
+        // pass within the same frame writes into a non-overlapping
+        // region of the shared _gpu_vbuf. Pass 1 owns offsets 0..N1,
+        // pass 2 owns N1..N2, etc. Reset to 0 below on the window
+        // pass to start the next frame fresh.
+        _gpu_flush_off += _gpu_vert_count;
+        _gpu_vert_count = 0;
     }
 
     objc_msgSend(_gpu_enc, sel_registerName("endEncoding"));
-    objc_msgSend(_gpu_cmdbuf, sel_registerName("presentDrawable:"), _gpu_drawable);
-    objc_msgSend(_gpu_cmdbuf, sel_registerName("commit"));
+    // Phase 4.1.2 — pass closed. render_clear back to state-setting
+    // mode (queues color for the next render_begin's setClearColor).
+    _gpu_in_pass = 0;
+    // Offscreen pass: skip presentDrawable, just commit. The caller
+    // is responsible for unbinding the target and running a second
+    // begin/draw/present cycle that targets the window drawable.
+    if (_gpu_drawable != 0) {
+        objc_msgSend(_gpu_cmdbuf, sel_registerName("presentDrawable:"), _gpu_drawable);
+        objc_msgSend(_gpu_cmdbuf, sel_registerName("commit"));
+        // Window pass = frame end. Next frame's pass 1 starts at offset 0
+        // again. By the time CPU writes there, the previous frame's GPU
+        // reads at the same offsets are reliably done (game_frame_begin
+        // + nextDrawable timing covers it; pass 1 verts are tens of
+        // microseconds of GPU work).
+        _gpu_flush_off = 0;
+    } else {
+        // Offscreen pass: keep _gpu_flush_off accumulated so pass 2
+        // writes into a non-overlapping region.
+        objc_msgSend(_gpu_cmdbuf, sel_registerName("commit"));
+    }
 
     // Phase 2.3 — read PREVIOUS frame's GPU timeline, not current.
     // GPUStartTime / GPUEndTime read as 0 before the buffer has

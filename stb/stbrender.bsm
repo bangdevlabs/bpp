@@ -43,9 +43,40 @@ void render_begin()@gpu {
     _stb_gpu_begin();
 }
 
-// Set the background clear color for the current frame.
-// Takes a packed ARGB color (same format as stbdraw: rgba()).
+// Smart-dispatch clear. The runtime knows whether we're between
+// frames or inside an active render pass (`_gpu_in_pass` flag set
+// by render_begin / cleared by render_end), so it picks the
+// correct mechanism automatically — programmer just calls
+// render_clear(color) and gets pixels of that color, regardless
+// of context.
+//
+// Tonify Rule 24 — context-aware single API:
+//
+//   OUTSIDE pass (typical: top of frame loop, before render_begin):
+//     state-set the color in `_gpu_clear_*`. The next render_begin
+//     loads it via Metal `loadAction = .clear` on the render-pass
+//     descriptor — a tile-memory clear, free on Apple Silicon.
+//
+//   INSIDE pass (between render_begin and render_end):
+//     emit a fullscreen solid-color quad through the default
+//     pipeline. Spans whatever target is active (the screen-buf
+//     uniform tracks it via _stb_gpu_target_bind). ~µs cost on M4.
+//     Used by multi-pass rendering: clearing letterbox color in
+//     the window pass after rendering game world to offscreen
+//     can't go through state-set because the window pass already
+//     opened with the previous clear color.
+//
+// Color is packed ARGB matching rgba() / stbdraw convention. The
+// inline path passes the packed value straight to the platform
+// layer (which unpacks to byte channels for vertex emission); the
+// state-set path normalises to [0, 1] floats for Metal's
+// MTLClearColor. Same input, two equivalent outputs.
+extrn _gpu_in_pass;
 void render_clear(color)@gpu {
+    if (_gpu_in_pass != 0) {
+        _stb_gpu_clear_inline(color);
+        return;
+    }
     auto r: float, g: float, b: float, a: float;
     r = ((color >> 16) & 0xFF) / 255.0;
     g = ((color >> 8) & 0xFF) / 255.0;

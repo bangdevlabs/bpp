@@ -1463,10 +1463,47 @@ void _stb_gpu_sprite_uv_tint(tex, x, y, w, h, u0, v0, u1, v1, r, g, b, a)@gpu {
 void _stb_gpu_init(w, h) {
 }
 
+// Phase 4.1.2 contract — when this stub is replaced by a real
+// Vulkan / X11 implementation, `_stb_gpu_begin` must obey the
+// multi-pass shared-buffer race contract documented in
+// `tonify_checklist.md` Pitfall 7:
+//
+//   Each render pass within a single frame writes vertex data
+//   into a NON-OVERLAPPING region of the shared vertex buffer.
+//   Pass 1 owns `[0..N1]`, Pass 2 owns `[N1..N2]`, etc. The
+//   per-frame offset cursor (the macOS impl's `_gpu_flush_off`)
+//   accumulates across passes and resets only at the window-pass
+//   present.
+//
+// Failing the contract breaks Phase 4.1.2's multi-pass rendering
+// (offscreen + window blit) with a visible race: Pass 2's CPU
+// writes overwrite bytes Pass 1's GPU is still reading async,
+// producing wrong colours / garbage. The bug is invisible to
+// suite + bootstrap (both stayed green during the macOS
+// discovery on 2026-05-07) — surfaces only as a runtime visual
+// flicker.
+//
+// Alternative race-free strategies the Linux backend may pick:
+// per-pass vertex buffers, ring buffer + semaphore (Apple's
+// triple-buffer pattern), MTLEvent-equivalent fences. Whatever
+// the choice, document it here.
 void _stb_gpu_begin()@gpu {
 }
 
 void _stb_gpu_clear(r: float, g: float, b: float, a: float)@gpu {
+}
+
+// Phase 4.1.2 — inline clear stub. CONTRACT for the future Linux
+// GPU backend (Vulkan / X11 hardware-accelerated): when called
+// inside an active render pass, MUST emit a fullscreen solid-color
+// fill spanning the active target's dimensions. The macOS impl
+// reads the target dims from the screen-uniform buffer that
+// _stb_gpu_target_bind keeps in sync with the active target;
+// Linux must do the equivalent. Failing the contract breaks
+// multi-pass rendering (offscreen + window blit) silently — the
+// render_clear smart dispatch in stbrender expects this to work
+// once _gpu_in_pass is set.
+void _stb_gpu_clear_inline(color)@gpu {
 }
 
 void _stb_gpu_present()@gpu {
@@ -1507,6 +1544,51 @@ _stb_gpu_create_texture_r8(data, w, h)@gpu {
 void _stb_gpu_upload_atlas(data, w, h)@gpu {
 }
 
+// Phase 4.1.1 — pixel-perfect render-target plumbing stubs.
+//
+// Real implementation pending: when the Linux/X11 path gains a
+// Vulkan or DX12 backend (or X11 grows a hardware-scaled present),
+// these stubs become integer-scale-aware. Today they keep the
+// build passing for any program that imports stbgame.bsm under
+// `--linux64`, returning sensible defaults so the auto-scale
+// formula in stbgame still picks a reasonable window size.
+//
+// `_stb_get_monitor_*` returns 1920×1080 — a safe fullhd default
+// that produces 4× scale for typical 320×180 virtual resolutions
+// without overshooting common Linux desktop sizes.
+//
+// `_stb_gpu_target_create` returns 0 (no offscreen texture). With
+// no offscreen target, stbgame's frame loop binds 0 (default
+// drawable) every frame, which is the legacy direct-to-window
+// path Linux already uses today. Pixel-perfect snap is OFF on
+// Linux until a real backend lands; games still run, just
+// without integer-scale enforcement.
+_stb_gpu_target_create(w: word, h: word)@gpu {
+    return 0;
+}
+
+// Phase 4.1.2 contract — when this stub is replaced with a real
+// implementation (Vulkan render-target rebind / equivalent), the
+// bind MUST also update the screen-uniform-buffer (or whatever
+// per-pass dimension state the future Linux GPU backend uses) so
+// that render_rect / render_text / render_sprite drawn into the
+// offscreen target compute pixel→NDC against the TARGET's W×H,
+// not the window's. Failure to honor this contract breaks
+// multi-pass rendering silently — pixels destined for virtual
+// coordinates land at scaled window positions instead, and
+// _stb_gpu_clear_inline picks the wrong dimensions for its
+// fullscreen quad.
+void _stb_gpu_target_bind(t)@gpu {
+}
+
+_stb_get_monitor_width()@io {
+    return 1920;
+}
+
+_stb_get_monitor_height()@io {
+    return 1080;
+}
+
 // ── Custom user pipelines (Phase 2.1) — stubs ────────────────
 //
 // Mirror the macOS pipeline-management primitives so code that
@@ -1542,6 +1624,11 @@ void _stb_gpu_uniform_set_vert(slot, data, size)@gpu {
 }
 
 void _stb_gpu_draw_full()@gpu {
+}
+
+// Phase 4.1.2 — 4-vertex triangle-strip draw. Stub no-op pending
+// real Linux GPU backend (same contract as _stb_gpu_draw_full).
+void _stb_gpu_draw_quad()@gpu {
 }
 
 // ── Phase 2.2 sampler + binding stubs ─────────────────────────
