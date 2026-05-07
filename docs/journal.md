@@ -1,5 +1,135 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 4.1.4 CLOSED — Auto pixel-perfect render orchestration (software + GPU)
+
+**bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
+
+Phase 4.1's pixel-perfect-default-on contract closes with two
+deliveries that complete the path Phase 4.1.1 / 4.1.2 / 4.1.3
+laid down. Visual confirmed in two states — default 960×540
+window (no letterbox, content fills the window) and resized
+1958×1366 window (BLACK letterbox bars top + bottom, content
+crisp at integer scale, pixel-art preserved at any size).
+
+### Software path — NEAREST upscale via CALayer (auto, macOS)
+
+`_stb_init_window` now sets the NSImageView's backing CALayer
+to `setWantsLayer:YES` and configures
+`magnificationFilter = "nearest"` (plus minificationFilter for
+the rare sub-1× case). NSImageView's default bilinear upscale
+was the blur Phase 4 exists to eliminate; nearest-neighbour
+sampling on the layer compositor delivers pixel-art crisp upscale
+for every software-rendered game without their source changing.
+
+Linux backend ships a contract comment at `_stb_present`
+documenting the same requirement: when the X11 software path
+gains real scaling (or Vulkan hardware path arrives), it MUST
+use NEAREST filtering (XRender PictFilterNearest, Vulkan
+`VK_FILTER_NEAREST`). Today's XPutImage path is correct by
+accident — the framebuffer is the same size as the X11 window —
+but Phase 4.1.3's auto-scale will start to exercise the
+contract once Linux gains a real implementation.
+
+### GPU path — `game_render_begin / end` orchestration (opt-in, cross-platform)
+
+The Phase 4.1.2 smoke validated the manual offscreen + blit
+pattern (`gpu_target_bind(target)` → render → `gpu_target_bind(0)`
+→ render_clear letterbox → `gpu_present_target` → present).
+Phase 4.1.4 abstracts this into stbgame helpers:
+
+```bpp
+// Game loop with auto pixel-perfect upscale:
+while (!quit) {
+    game_frame_begin();
+    game_render_begin();       // lazy-creates virtual target, binds it
+    render_clear(BG);          // virtual-canvas paint
+    render_rect(...);
+    game_render_end();         // commits + window pass + blit
+}
+```
+
+`game_render_begin` lazy-creates the offscreen target sized to
+`SCREEN_W × SCREEN_H` (the virtual resolution from Phase 4.1.3).
+`game_render_end` commits the virtual pass, opens a window pass,
+clears the letterbox colour from `_stb_letterbox_color`, blits
+via `gpu_present_target`, and presents. Live window dims come
+from `game_window_w / h` (which already read `_stb_win_w / _h`
+post-Phase 4.1.3) so the blit follows resize gestures.
+
+Cross-platform by construction: the helpers call the abstract
+`gpu_target_create / bind / present_target / draw_quad` API
+surface in `stbshader.bsm`. macOS implements them today; Linux
+backends ship stubs with cross-OS contract comments. The C
+emitter path skips GPU stbgame as established in 0.21.x.
+
+### `render_init` idempotent + auto-called by `game_init`
+
+Two small changes that close the ergonomic loop:
+
+- `render_init` in `stbrender.bsm` carries a `_stbrender_inited`
+  flag and returns early on the second call.
+- `game_init` calls `render_init` after `_stb_init_window` so
+  software games that opt into `game_render_begin / end` don't
+  have to remember the pre-init step. Existing games that
+  already invoke `render_init` explicitly stay correct — the
+  redundant call is a no-op.
+
+The cost: every `stbgame` consumer pays the one-time GPU device
++ queue + pipeline allocation, even pure-software games. On
+macOS this is sub-millisecond. Linux backend `_stb_gpu_init` is
+still a stub (no cost). Worth it for the contract clarity —
+"`stbgame` always has a GPU pipeline ready."
+
+### Tonify rules applied
+
+- **Rule 1**: `_stbgame_target` and `_stbrender_inited` are
+  `static auto` at file scope — module-private state.
+- **Rule 2**: `game_render_begin / end` are public API.
+- **Rule 3**: both helpers are `void` (side-effect only).
+- **Rule 4**: helpers left unannotated — they orchestrate `@gpu`
+  and `@io` effects, the inferred `@solo` is honest.
+- **Rule 13**: no non-word parameters; no annotations needed.
+- **Rule 22 / 23**: stbgame's import set grew by `stbrender` +
+  `stbshader`. Justified — pixel-perfect rendering is the new
+  default-on responsibility of stbgame, and both modules are
+  leaf cartridges that depend only on platform builtins.
+
+### Files changed
+
+- `src/backend/os/macos/_stb_platform_macos.bsm` (+15 LOC):
+  CALayer `magnificationFilter` / `minificationFilter` =
+  `"nearest"`, `setWantsLayer:YES` on the NSImageView.
+- `src/backend/os/linux/_stb_platform_linux.bsm` (+18 LOC):
+  Contract comment at `_stb_present` documenting the
+  NEAREST upscale requirement for the future Linux GPU /
+  X11 hardware path.
+- `stb/stbrender.bsm` (+10 LOC): `_stbrender_inited` flag
+  + idempotent guard at top of `render_init`.
+- `stb/stbgame.bsm` (+85 LOC): `_stbgame_target` static auto,
+  `game_render_begin / end` orchestration helpers, auto-call
+  to `render_init` from `game_init`, imports for stbrender
+  + stbshader.
+
+### What's next
+
+Phase 4.1's pixel-perfect contract is done. Possible follow-ups:
+
+1. **Migrate existing GPU games** (snake, pathfind, fps_3d) to
+   `game_render_begin / end`. Each migration is a 2-line
+   replacement (`render_begin` → `game_render_begin`,
+   `render_end` → `game_render_end`). Validate each game looks
+   right at non-1× scale.
+2. **Phase 4.2 — Sprite batching evolution** (per the roadmap
+   plan). Layered backgrounds, sprite atlases, scoped zones
+   (`@scoped` annotation) — the original Phase 4 vision before
+   it split into 4.0 / 4.1.x.
+3. **Linux GPU implementation** — Vulkan + X11 hardware path
+   that honours the multi-pass `_gpu_vbuf` race contract
+   (Pitfall 7) and the NEAREST upscale contract documented in
+   `_stb_present`.
+
+---
+
 ## 2026-05-07 — Phase 4.1.3 CLOSED — `game_init` reinterpreted as virtual resolution + auto-scale window
 
 **bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**

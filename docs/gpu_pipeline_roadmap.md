@@ -646,17 +646,37 @@ correct at any non-1× scale; `SCREEN_W / H` remain the virtual
 resolution. Existing games (snake, pathfind, fps_3d, etc.)
 auto-scale with zero source change. See journal 2026-05-07.
 
-**Phase 4.1.4 — Auto-orchestrated offscreen + nearest blit
-(NEXT).** Today `game_init` opens a properly-sized window but
-software / direct-GPU games still render at the wrong dispatch
-shape: their virtual canvas gets bilinear-stretched to the
-window. Phase 4.1.4 will have stbgame auto-bind an offscreen
-target at `game_frame_begin` and auto-blit with NEAREST sampler
-at `draw_end`, so every game gets pixel-perfect upscale by
-default. The infrastructure (offscreen targets, smart-dispatch
-clear, pp_blit shader, integer-scale rect compute, letterbox
-colour) is already in place from 4.1.1 / 4.1.2 / 4.1.3 — 4.1.4
-is the orchestration glue.
+**Phase 4.1.4 — Auto pixel-perfect render orchestration
+(SHIPPED 2026-05-07).** Two deliveries closed the pixel-perfect-
+default-on contract:
+
+1. **Software path (auto, macOS):** `_stb_init_window` configures
+   the NSImageView's backing CALayer with
+   `magnificationFilter = "nearest"` and `setWantsLayer:YES`.
+   Every software-rendered game (snake, pathfind, anything that
+   writes into `_stb_fb`) now upscales pixel-art crisp at any
+   integer scale. Linux ships a contract comment at
+   `_stb_present` documenting the same NEAREST requirement
+   for the future Vulkan / X11 hardware path.
+2. **GPU path (opt-in helpers, cross-platform):**
+   `game_render_begin` / `game_render_end` in stbgame abstract
+   the "render to virtual canvas + auto-blit to window with
+   NEAREST and letterbox" pattern that the Phase 4.1.2 smoke did
+   manually. `game_render_begin` lazy-creates the offscreen
+   target sized to `SCREEN_W × SCREEN_H`; `game_render_end`
+   commits the virtual pass, opens a window pass, clears the
+   letterbox colour, blits via `gpu_present_target`, and
+   presents. Cross-platform by construction — uses only the
+   abstract `gpu_target_*` API surface.
+
+`render_init` made idempotent. `game_init` auto-calls it after
+`_stb_init_window` so users opting into `game_render_begin / end`
+don't have to remember the pre-init step. Existing explicit
+calls in current games are no-ops.
+
+Visual confirmed at default and resized window: BLACK letterbox
+appears on aspect mismatch, pixel-art stays crisp at any
+integer scale.
 
 ---
 
