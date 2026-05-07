@@ -910,6 +910,94 @@ inverse. The pitfall fires only on the indirect `call()` path.
 **Cross-reference**: `warning_error_log.md` "Known compiler
 diagnostic gaps" section.
 
+### Pitfall 7: Multi-pass GPU rendering with shared `_gpu_vbuf` — RESOLVED 2026-05-07
+
+When a frame consists of multiple `render_begin / render_end`
+cycles (e.g., offscreen render-to-target + window blit, the
+Phase 4.1.2 contract), the shared `_gpu_vbuf` needs offset
+accumulation across passes. Resetting `_gpu_flush_off = 0` at
+every `_stb_gpu_begin` — which the original single-pass design
+did — produces a visible-only race.
+
+**The race scenario**:
+
+```bpp
+// Pass 1
+gpu_target_bind(target);        // offscreen
+render_begin();                  // _gpu_flush_off = 0 (reset)
+render_clear(BLUE);              // CPU writes bytes 0..96 of _gpu_vbuf
+render_end();                    // commit cmdbuf — GPU starts reading 0..96 async
+
+// Pass 2
+gpu_target_bind(0);              // window
+render_begin();                  // _gpu_flush_off = 0 (reset — BUG)
+render_clear(MAGENTA);           // CPU writes bytes 0..96 — overwrites Pass 1's reads
+render_end();                    // GPU reads 0..96 — sees MAGENTA bytes for Pass 1, garbage for Pass 2
+```
+
+Single-pass games never hit this because `nextDrawable` blocks
+long enough between frames for the previous GPU read to complete.
+Multi-pass within a frame has no such serialisation point —
+Pass 1's commit returns immediately and Pass 2 starts CPU writes
+before Pass 1's GPU read is done.
+
+**Fix (live in `_stb_platform_macos.bsm` since 2026-05-07)**:
+
+`_gpu_flush_off` accumulates within a frame. Each pass owns a
+non-overlapping offset region:
+
+```
+Pass 1 → offsets [0..N1]
+Pass 2 → offsets [N1..N2]
+Pass 3 → offsets [N2..N3]
+...
+```
+
+Reset to 0 happens only at the window-pass present (frame
+boundary). By the time the CPU writes those offsets next frame,
+the previous frame's GPU reads are reliably done — no
+`waitUntilCompleted`, no lost async perf, just cooperative
+buffer-region ownership across passes.
+
+**When this pitfall applies**:
+
+- Custom multi-pass rendering pipelines: yes, this is the contract.
+- Effect chains (Phase 6 `stbfx`): yes.
+- Single-pass games (snake, pathfind, fps_3d, etc.): no — only
+  one pass per frame, no race possible. The fix is a no-op for
+  them.
+- Multi-attachment within a single render pass: no — same
+  encoder, same submission, no concurrent CPU writes.
+
+**Cross-platform contract**:
+
+Linux GPU backend (when implemented via Vulkan / X11 hardware
+path) MUST honour the same offset-accumulation contract or
+implement an alternative race-free strategy (per-pass buffers,
+ring buffer, MTLEvent-equivalent fences). Failing this breaks
+multi-pass rendering silently — visible only as wrong colours
+or garbage at runtime.
+
+**Diagnostic methodology that caught this** (recorded for
+posterity):
+
+1. Suite + bootstrap stayed green — race conditions in async
+   GPU work cannot be caught by either.
+2. Visual eyeball check on `render_target_smoke.bpp` showed
+   "magenta flickers then blue overwrites" — the symptom.
+3. `bug --tui --break _stb_gpu_clear_inline` confirmed
+   smart-dispatch routing was correct (magenta arg arrived).
+4. `put_err` instrumentation in the platform layer confirmed
+   correct dimensions and colors at queue time.
+5. Isolation tests (comment Pass 1, comment blit) narrowed
+   the failure surface.
+6. `waitUntilCompleted` probe after Pass 1 commit fixed the
+   visual → race confirmed → designed proper fix without sync.
+
+The combo of "visual + isolation + sync probe" is the canonical
+recipe for narrowing async GPU race conditions that suite and
+bootstrap cannot catch.
+
 ---
 
 ## Rule 22: stb cartridges do NOT import bpp_* runtime modules
@@ -1050,6 +1138,109 @@ matches what the binary actually links.
 (:float opt-in) — same minimalism principle applied to different
 layers. Auto-inject covers what every program *must* have; opt-in
 covers what programs *might* want. The two should not blur.
+
+---
+
+## Rule 24: `render_clear` is context-smart (single API, dual mechanism)
+
+`render_clear(color)` is one function with two implementations.
+The runtime picks the optimal mechanism based on context — the
+programmer always writes `render_clear(color)` and gets pixels of
+that color, regardless of whether they call it before or inside a
+render pass.
+
+| Context | Implementation | Performance |
+|---|---|---|
+| OUTSIDE pass (before `render_begin`) | State-set `_gpu_clear_*` for the next render_begin's `loadAction = .clear` | Free (tile-memory clear on Apple Silicon) |
+| INSIDE pass (between `render_begin` / `render_end`) | Emit fullscreen solid-color quad through default pipeline | ~µs on M4 |
+
+The flag `_gpu_in_pass` (set by `_stb_gpu_begin`, cleared by
+`_stb_gpu_present`) is the runtime signal the dispatch reads.
+
+### Single-pass game (typical)
+
+```bpp
+while (!quit) {
+    game_frame_begin();
+    render_clear(BG);             // outside → free tile-memory clear
+    render_begin();
+    render_rect(...);
+    render_end();
+}
+```
+
+Identical to how every existing game (snake, pathfind, fps_3d,
+rhythm, platformer) is written today. Zero source change.
+
+### Multi-pass with intermediate clears
+
+```bpp
+while (!quit) {
+    // Offscreen pass — render the world.
+    gpu_target_bind(scene_target);
+    render_begin();
+    render_clear(SKY_BLUE);       // inside → quad-clear NOW
+    draw_world();
+    render_end();
+
+    // Window pass — letterbox + blit.
+    gpu_target_bind(0);
+    render_begin();
+    render_clear(LETTERBOX_BG);   // inside → quad-clear NOW
+    gpu_present_target(scene_target, ...);
+    render_end();
+}
+```
+
+The same call works in either context. Pass-state is implicit; the
+programmer writes intent ("pixels turn this color"), the runtime
+picks the optimal Metal verb.
+
+### Why single API (not OpenGL-style dual)
+
+OpenGL / SDL / Vulkan separate `glClearColor` (state) from
+`glClear` (action) because their runtimes don't track pass state at
+the API surface — the programmer has to disambiguate. B++ tracks
+`_gpu_in_pass` internally, so the programmer doesn't have to.
+Dispatch is decided where the information lives.
+
+This pattern follows existing B++ conventions for smart-default +
+opt-in to explicit:
+
+| Capability | Smart default | Explicit opt-in |
+|---|---|---|
+| Type assignment | `auto x = 1.5` (inferred) | `auto x: float` (precision) |
+| fn-pointer typing | `auto fp = fn_ptr(name)` | `auto fp: Fn(...) -> ret` |
+| Pixel-perfect | `game_init(W, H, ...)` (default ON) | `game_set_pixel_perfect(off)` |
+| **Render clear** | **`render_clear(color)` (smart context)** | **— (no opt-in needed yet)** |
+
+If a future caller needs explicit state-setting *while inside an
+active pass* (a niche case for delayed clears), an opt-in
+`render_set_clear_state(color)` can be added without breaking the
+smart default. None has surfaced yet — Rule 24 ships as
+single-API.
+
+### Edge case: custom pipeline active
+
+The inline-clear path uses the default pipeline's solid-fill
+emission. If the caller has switched to a custom pipeline
+(`gpu_pipeline_use(custom)`) and calls `render_clear` before
+restoring the default, the fullscreen quad goes through the
+custom pipeline — usually wrong (custom pipelines rarely render
+solid color). Rule of thumb: call `gpu_pipeline_use_default()`
+before `render_clear` if you've switched pipelines, OR move the
+clear outside the pass entirely.
+
+### Worked migration history
+
+Phase 4.1.2 introduced this rule. The earlier Phase 4.1.2 attempt
+shipped a workaround ("call render_clear BEFORE render_begin") to
+patch a multi-pass bug where clear color and pass binding got out
+of sync. The smart-dispatch redesign in this rule eliminates the
+trap structurally — both call orders produce correct output, and
+the 38 existing single-pass call sites need zero edits because
+their behavior under the smart dispatch matches the original
+state-setting semantics exactly.
 
 ---
 

@@ -1,5 +1,122 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 4.1.1 + 4.1.2 CLOSED — Pixel-perfect render pipeline + multi-pass `_gpu_vbuf` race fix
+
+**bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
+
+Phase 4.1 of the GPU pipeline roadmap split into two shippable
+sub-phases during execution. Phase 4.1.1 added the offscreen
+render-to-texture infrastructure (`gpu_target_create / bind`,
+`gpu_present_target`, `gpu_draw_quad`, `_stb_get_monitor_*` query,
+the lazy-loaded `pp_blit` shader). Phase 4.1.2 layered the
+smart-dispatch `render_clear` (Tonify Rule 24) on top — a single
+API that picks the optimal Metal verb based on `_gpu_in_pass`
+state, replacing the OpenGL/SDL idiom of separating state-setting
+from action.
+
+The visual smoke (`examples/render_target_smoke.bpp`) renders a
+recognisable pattern into a 320×240 offscreen target, then blits
+it integer-scaled into a 1280×720 window with a magenta letterbox.
+Pillar bars magenta + center blit crisp = pixel-perfect pipeline
+ships.
+
+### The bug that ate ~6 hours: multi-pass `_gpu_vbuf` race
+
+Phase 4.1.2's smoke exposed a latent buffer-management bug that
+single-pass games had silently sidestepped for the entire GPU
+pipeline lifetime.
+
+The shared `_gpu_vbuf` is one MTLBuffer reused for every
+default-pipeline draw. Original code reset `_gpu_flush_off = 0` at
+every `_stb_gpu_begin`, meaning each pass wrote into offset range
+`[0..N]`. In single-pass apps (snake, pathfind, fps_3d, every
+existing game) this was fine — one pass per frame, no concurrent
+access.
+
+In multi-pass scenarios (offscreen + window blit, the entire
+Phase 4.1.2 contract), Pass 2's CPU writes overwrote bytes Pass 1's
+GPU was still reading async. The shader read garbage at those
+offsets, so `render_clear(magenta)` in Pass 2 rendered as Pass 1's
+blue clear, blit content showed wrong colors, etc. Output flickered
+between magenta and blue depending on whether the GPU happened to
+finish Pass 1 before the CPU wrote Pass 2's data — a textbook race
+that depended on frame timing.
+
+**Fix:** `_gpu_flush_off` accumulates across passes within a
+frame. Pass 1 owns offsets `[0..N1]`, Pass 2 owns `[N1..N2]`,
+non-overlapping. Reset to 0 only at the window-pass present
+(frame boundary), where the previous frame's GPU work for those
+offsets is reliably done by the time the CPU writes them next
+frame. No `waitUntilCompleted`, no lost async perf.
+
+### Diagnostic methodology
+
+The bug surfaced as "magenta flicker, then blue overwrites" — a
+visual symptom suite/bootstrap could not catch (both stayed
+green). The path to root cause:
+
+1. Bug debugger (`bug --tui --break _stb_gpu_clear_inline`)
+   confirmed smart-dispatch routing was correct: Pass 2 received
+   `color=0xffff00ff` (magenta) every frame.
+2. `put_err` instrumentation in `_stb_gpu_clear_inline` confirmed
+   `w=1280, h=720` in Pass 2 (not stale offscreen dims).
+3. Isolation tests narrowed: comment Pass 1 → magenta works.
+   Comment blit → magenta missing. Force `waitUntilCompleted`
+   after Pass 1 commit → magenta works.
+4. Race confirmed → designed offset accumulation fix without
+   sync.
+
+`bug --tui` was useful for confirming `_gpu_in_pass` transitions
+and arg values at function boundaries, but couldn't see GPU side.
+Visual eyeball check + the `waitUntilCompleted` probe was the
+combo that confirmed the race hypothesis.
+
+### Files changed
+
+- `src/backend/os/macos/_stb_platform_macos.bsm` (~280 LOC):
+  `_gpu_in_pass` flag, `_stb_gpu_clear_inline`, `_gpu_offscreen_target`,
+  `_stb_gpu_target_bind` updates `_gpu_screen_buf`,
+  `_stb_get_monitor_width/height`, `_gpu_flush_off` accumulation in
+  begin + present.
+- `src/backend/os/linux/_stb_platform_linux.bsm` (~80 LOC):
+  Stubs for new platform builtins with cross-OS contract comments
+  documenting the multi-pass shared-buffer requirement so the
+  future Vulkan/X11 implementor cannot recreate the race.
+- `stb/stbrender.bsm` (+35 LOC): smart-dispatch `render_clear`.
+- `stb/stbgame.bsm` (+30 LOC): `game_window_w / game_window_h`
+  accessors, `game_compute_present_rect` (pure compute helper for
+  integer-scaled centered blit rect).
+- `stb/stbshader.bsm` (+135 LOC): `gpu_target_create / bind`,
+  `gpu_present_target`, `gpu_draw_quad`, lazy-loaded `pp_blit`
+  pipeline.
+- `assets/shaders/pp_blit.metal` (new, ~70 LOC): pixel-perfect
+  blit vertex + fragment shader with NEAREST sampler.
+- `examples/render_target_smoke.bpp` (new, ~95 LOC): visual
+  validator for the entire Phase 4.1.1 + 4.1.2 contract.
+- `docs/tonify_checklist.md`: Rule 24 (smart-dispatch
+  `render_clear`) + Pitfall 7 (multi-pass shared-buffer race).
+- `docs/gpu_pipeline_roadmap.md`: Phase 4.1.1 + 4.1.2 marked
+  CLOSED.
+
+### Lessons recorded
+
+1. Shared GPU buffers across passes within a frame need offset
+   accumulation, not per-pass reset. Reset only at frame
+   boundaries.
+2. CPU-GPU sync only at frame boundaries (drawable present),
+   never mid-frame — kills async perf.
+3. Race conditions in async GPU work do not show up in
+   suite/bootstrap. Visual smoke + isolation tests + a
+   `waitUntilCompleted` probe is the combo for narrowing them.
+4. Single-API smart dispatch beats dual API (state + action) when
+   the runtime knows the dispatch state — the OpenGL/SDL idiom
+   of separating them carries no advantage in B++.
+5. Phase 4.1.3 (stbgame `game_init` reinterpretation as virtual
+   resolution) is the natural follow-up; the infrastructure it
+   needs is now in place.
+
+---
+
 ## 2026-05-06 — Phase 3.5 CLOSED — Asset pipeline + live hot-reload
 
 **bpp = `b505de4a7e141d4889051ad9105251b907f485f8`. Suite = 140/0/12 native + 114/0/38 C.**

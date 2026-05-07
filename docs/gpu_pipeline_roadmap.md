@@ -122,7 +122,7 @@ Phase 2 does NOT remove `render_layer_*` API. Coexistence by design.
 Confirm via grep that all CPU-rendered games still compile after
 foundation lands.
 
-### 3. Confirm shader file load capability
+eol### 3. Confirm shader file load capability
 
 Phase 2.1 needs to load `.metal` files from `assets/shaders/`. Verify
 stbasset (or platform layer) has file read primitive that handles
@@ -605,6 +605,39 @@ Docs:
 **Gate:** Phase 4.0 closed when zero tools import stbgame, all tools
 run identically, Bang 9 + embedded tools render, suites green,
 bootstrap byte-stable.
+
+---
+
+### Phase 4.1.1 + 4.1.2 — CLOSED 2026-05-07
+
+Phase 4.1 split into shippable sub-phases during execution.
+
+**Phase 4.1.1 — Offscreen render-to-texture infrastructure (SHIPPED).**
+`gpu_target_create / bind`, `gpu_present_target`, `gpu_draw_quad`,
+`_stb_get_monitor_width / height`, the lazy-loaded `pp_blit`
+shader at `assets/shaders/pp_blit.metal`. Linux backend ships
+stubs with cross-OS contract comments. Validated end-to-end via
+`examples/render_target_smoke.bpp`.
+
+**Phase 4.1.2 — Smart-dispatch `render_clear` + multi-pass `_gpu_vbuf`
+race fix (SHIPPED).** Single `render_clear(color)` API picks
+state-set vs inline-quad based on `_gpu_in_pass` flag (Tonify
+Rule 24). Runtime knows the dispatch state — no need for the
+OpenGL/SDL idiom of separating `glClearColor` from `glClear`.
+
+The same session uncovered a latent buffer-race bug:
+`_gpu_flush_off` reset to 0 per pass instead of per frame, so
+multi-pass scenarios overwrote bytes the GPU was still reading
+async. Fixed by accumulating `_gpu_flush_off` across passes
+within a frame (Pass 1 owns `[0..N1]`, Pass 2 owns `[N1..N2]`,
+reset to 0 at window-pass present). See journal 2026-05-07 +
+`tonify_checklist.md` Pitfall 7.
+
+**Phase 4.1.3 — stbgame `game_init` virtual_w/h reinterpretation
+(NEXT).** The infrastructure above lets `game_init(W, H, title,
+fps)` reinterpret `(W, H)` as virtual resolution and auto-scale
+the window to monitor. The original Phase 4.1 spec below
+describes the target shape.
 
 ---
 
