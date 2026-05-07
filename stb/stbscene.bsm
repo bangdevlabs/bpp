@@ -1,0 +1,234 @@
+// stbscene.bsm — Layered backgrounds with parallax (Phase 4.3).
+//
+// A "scene" here is a back-to-front stack of textured fullscreen
+// quads. Each layer carries its own image plus a pair of parallax
+// factors that scale how much the global camera moves it: 0.0 stays
+// frozen, 1.0 follows the camera 1:1, anything in between scrolls
+// at a fraction of the camera speed. The classic side-scroller
+// depth illusion (sky drifts, hills move slower, foreground keeps
+// pace with the player) falls out of three layers with factors
+// roughly 0.1 / 0.4 / 1.0.
+//
+// The cartridge is opt-in. Games that never call init_scene_bg
+// pay nothing — no shader load, no frame-time cost, no allocations.
+// Once the first layer is registered the bg_layer pipeline is
+// loaded lazily on the first bg_draw_all call (same lazy pattern
+// as stbshader's pp_blit pipeline).
+//
+// Naming: the prefix is `bg_` (background). The matching state
+// machine in stbgame uses `scene_register / scene_switch / scene_*`
+// for the orthogonal "switch between menu/play/results" concern,
+// so the two namespaces co-exist without collision.
+//
+// Typical use:
+//
+//   import "stbscene.bsm";
+//
+//   auto sky, mid, fg, sky_img, mid_img, fg_img;
+//
+//   // Init phase
+//   init_scene_bg();
+//   sky_img = image_load("sky.png");
+//   mid_img = image_load("hills.png");
+//   fg_img  = image_load("trees.png");
+//   sky = bg_layer_new(sky_img, 0.1, 0.0);
+//   mid = bg_layer_new(mid_img, 0.4, 0.0);
+//   fg  = bg_layer_new(fg_img,  1.0, 0.0);
+//
+//   // Render phase (each frame)
+//   bg_set_camera(player_x, 0.0);
+//   game_render_begin();
+//   bg_draw_all();
+//   render_text("score", 4, 4, 1, WHITE);
+//   game_render_end();
+//
+// Layers draw in registration order — the first registered layer
+// goes furthest back. Re-order via bg_layer_set_z + a future
+// bg_sort_layers if you need dynamic restacking; the first cut
+// trusts insertion order to keep the API surface tiny.
+
+import "bpp_array.bsm";        // arr_new / arr_push / arr_get / arr_len
+import "bpp_buf.bsm";           // pokefloat_h
+import "stbimage.bsm";          // Image struct + image accessors
+import "stbshader.bsm";         // gpu_pipeline_load + uniform/texture binders
+import "stbgame.bsm";           // game_window_w / game_window_h
+
+// ── Layer struct ─────────────────────────────────────────────
+
+struct BgLayer {
+    image,                              // Image* (caller owns)
+    factor_x: float, factor_y: float,   // parallax multipliers
+    visible,                            // 0 or 1
+    alpha: float                        // 0.0 .. 1.0
+}
+
+// ── Module state ─────────────────────────────────────────────
+
+static extrn _bg_layers;            // arr of BgLayer*; iteration order = draw order
+static extrn _bg_cam_x: float;      // current global camera x
+static extrn _bg_cam_y: float;      // current global camera y
+static extrn _bg_pipeline;          // gpu pipeline handle (lazy)
+static extrn _bg_uniform;           // 48-byte scratch buffer (lazy)
+static extrn _bg_inited;            // 0/1 idempotency guard
+
+// ── Public API ───────────────────────────────────────────────
+
+// Initialise the layer registry. Idempotent — safe to call from a
+// game's init phase and again from per-scene setup. The pipeline
+// itself is only loaded on the first draw, so this is just a few
+// allocations and zeroed globals.
+void init_scene_bg() {
+    if (_bg_inited != 0) { return; }
+    _bg_inited   = 1;
+    _bg_layers   = arr_new();
+    _bg_cam_x    = 0.0;
+    _bg_cam_y    = 0.0;
+    _bg_pipeline = 0;
+    _bg_uniform  = 0;
+}
+
+// Register a new background layer. `image` is an Image* obtained
+// from image_load (or image_create_rgba for procedural content);
+// stbscene does not take ownership — the caller is responsible for
+// freeing the underlying image at shutdown. factor_x/y of 0.0
+// pin the layer in place; 1.0 makes it scroll 1:1 with the camera.
+// Returns the layer handle for later set_visible / set_alpha calls.
+bg_layer_new(image, factor_x: float, factor_y: float) {
+    init_scene_bg();
+    auto bg: BgLayer;
+    bg = malloc(sizeof(BgLayer));
+    bg.image    = image;
+    bg.factor_x = factor_x;
+    bg.factor_y = factor_y;
+    bg.visible  = 1;
+    bg.alpha    = 1.0;
+    arr_push(_bg_layers, bg);
+    return bg;
+}
+
+// Toggle a registered layer on/off. Hidden layers stay in the list
+// but their draw call is skipped — flipping a sky between day/night
+// variants is just two layers and a pair of set_visible calls.
+void bg_layer_set_visible(handle, v) {
+    auto bg: BgLayer;
+    bg = handle;
+    bg.visible = v;
+}
+
+// Adjust per-layer opacity. Useful for cross-fades during scene
+// transitions. The fragment shader multiplies texel alpha by this
+// value, so a partially-transparent texture stays partially
+// transparent at alpha = 1.0.
+void bg_layer_set_alpha(handle, alpha: float) {
+    auto bg: BgLayer;
+    bg = handle;
+    bg.alpha = alpha;
+}
+
+// Update the global camera position. Every layer's actual scroll
+// offset is `camera * factor` — back layers move slowly, front
+// layers move at full speed. Coordinate units are arbitrary; what
+// matters is that they match between camera and the layer's texture
+// resolution (so 1 unit of camera = 1 texel of scroll when factor =
+// 1.0 and tex_w == win_w).
+void bg_set_camera(cam_x: float, cam_y: float) {
+    _bg_cam_x = cam_x;
+    _bg_cam_y = cam_y;
+}
+
+// Lazy-init the bg_layer pipeline. Same effect-classification
+// reasoning as _pp_blit_init in stbshader: error path emits stderr
+// (@io), happy path is pure GPU, inferred classification settles on
+// SOLO. Annotation deliberately omitted to avoid W026.
+static _bg_init_pipeline() {
+    if (_bg_pipeline != 0) { return _bg_pipeline; }
+    _bg_pipeline = gpu_pipeline_load("bg_layer.metal", "bg_vert", "bg_frag");
+    if (_bg_pipeline == 0) {
+        put_err("bg_draw_all: bg_layer pipeline failed to load\n");
+        return 0;
+    }
+    _bg_uniform = malloc(48);
+    return _bg_pipeline;
+}
+
+// Draw every visible registered layer in registration order. Pair
+// with game_render_begin / end (or render_begin / render_pass_end)
+// so the active encoder is in a known state. The pipeline is
+// switched away from the default for the duration of this call and
+// restored at the end, so subsequent render_text / render_sprite
+// calls keep working without manual state management.
+//
+// The first invocation pays a one-frame cost to load the bg_layer
+// shader; subsequent calls hit the cached pipeline and burn one
+// draw call per visible layer.
+bg_draw_all() {
+    init_scene_bg();
+    auto pipe;
+    pipe = _bg_init_pipeline();
+    if (pipe == 0) { return 0; }
+
+    auto n;
+    n = arr_len(_bg_layers);
+    if (n == 0) { return 0; }
+
+    auto win_w_f: float, win_h_f: float;
+    win_w_f = game_window_w();
+    win_h_f = game_window_h();
+
+    gpu_pipeline_use(pipe);
+
+    auto i;
+    for (i = 0; i < n; i++) {
+        auto bg: BgLayer;
+        bg = arr_get(_bg_layers, i);
+        if (bg.visible == 0) { continue; }
+
+        auto img: Image;
+        img = bg.image;
+        auto tex_w_f: float, tex_h_f: float;
+        tex_w_f = img.tex_w;
+        tex_h_f = img.tex_h;
+
+        auto u;
+        u = _bg_uniform;
+        pokefloat_h(u +  0, win_w_f);
+        pokefloat_h(u +  4, win_h_f);
+        pokefloat_h(u +  8, tex_w_f);
+        pokefloat_h(u + 12, tex_h_f);
+        pokefloat_h(u + 16, _bg_cam_x);
+        pokefloat_h(u + 20, _bg_cam_y);
+        pokefloat_h(u + 24, bg.factor_x);
+        pokefloat_h(u + 28, bg.factor_y);
+        pokefloat_h(u + 32, bg.alpha);
+        pokefloat_h(u + 36, 0.0);
+        pokefloat_h(u + 40, 0.0);
+        pokefloat_h(u + 44, 0.0);
+
+        gpu_uniform_set_frag(0, u, 48);
+        gpu_bind_texture_frag(0, img.tex);
+        gpu_draw_quad();
+    }
+
+    gpu_pipeline_use_default();
+    return 0;
+}
+
+// Tear down every registered layer. Caller still owns the Image
+// pointers — bg_layers_clear frees only the BgLayer wrappers.
+// Useful before re-registering for a new scene; not required at
+// program exit since the OS reclaims everything anyway.
+void bg_layers_clear() {
+    init_scene_bg();
+    auto n, i;
+    n = arr_len(_bg_layers);
+    for (i = 0; i < n; i++) {
+        free(arr_get(_bg_layers, i));
+    }
+    arr_truncate(_bg_layers, 0);
+}
+
+// Number of currently registered layers (visible or not). Mostly a
+// debugging aid for the smoke tests.
+bg_layer_count()@base {
+    return _bg_layers == 0 ? 0 : arr_len(_bg_layers);
+}

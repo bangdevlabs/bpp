@@ -1,0 +1,134 @@
+// parallax_smoke.bpp — Phase 4.3 stbscene visual smoke.
+//
+// Three procedural backgrounds at different parallax depths plus
+// a HUD overlay. Arrow keys (or A/D) drive the camera; back
+// layers drift slowly, front layers track the input 1:1. Confirms
+// that bg_draw_all composites textured layers correctly under the
+// pixel-perfect path — the layers render into the offscreen target
+// and the standard NEAREST blit lands them in the window.
+//
+// Run from the repo root or any subdirectory; gpu_pipeline_load
+// resolves bg_layer.metal via the install path that install.sh
+// populates.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbimage.bsm";
+import "stbscene.bsm";
+
+const VIRT_W = 320;
+const VIRT_H = 180;
+const TEX_W  = 320;
+const TEX_H  = 180;
+const FPS    = 60;
+
+extrn cam_x: float;
+extrn cam_y: float;
+
+extrn sky_img;
+extrn mid_img;
+extrn fg_img;
+
+extrn sky_layer;
+extrn mid_layer;
+extrn fg_layer;
+
+// Build a band image: vertical stripes inside the y-range
+// [y_min, y_max), fully transparent (alpha = 0) outside. Each
+// parallax layer claims a distinct horizontal band so all three
+// stay visible — the back layers show through the alpha-zero gaps
+// in the front layers. The 4-pixel accent column every 40 px
+// makes horizontal scroll obvious at a glance; the band edges
+// make vertical scroll obvious.
+//
+// `band_color` and `accent_color` are RGBA bytes packed
+// little-endian (0xAABBGGRR) — same convention image_create_rgba
+// consumes.
+static _make_band_image(band_color, accent_color, y_min, y_max) {
+    auto buf, x, y, idx, c;
+    buf = malloc(TEX_W * TEX_H * 4);
+    for (y = 0; y < TEX_H; y++) {
+        auto in_band;
+        in_band = (y >= y_min) && (y < y_max);
+        for (x = 0; x < TEX_W; x++) {
+            if (in_band == 0) {
+                c = 0;  // fully transparent outside the band
+            } else if ((x % 40) < 4) {
+                c = accent_color;
+            } else if (((x / 40) & 1) == 0) {
+                c = band_color;
+            } else {
+                c = accent_color;
+            }
+            idx = (y * TEX_W + x) * 4;
+            poke(buf + idx + 0,  c        & 0xFF);
+            poke(buf + idx + 1, (c >>  8) & 0xFF);
+            poke(buf + idx + 2, (c >> 16) & 0xFF);
+            poke(buf + idx + 3, (c >> 24) & 0xFF);
+        }
+    }
+    auto img;
+    img = image_create_rgba(buf, TEX_W, TEX_H, TEX_W, TEX_H);
+    free(buf);
+    return img;
+}
+
+static parallax_init_phase() {
+    render_init();
+    init_image();
+    init_scene_bg();
+
+    // Three layers, each occupying a distinct horizontal band of
+    // the texture (top / middle / bottom third) with alpha = 0
+    // elsewhere. The bands give visible separation; the parallax
+    // factors give depth. Vertical factor non-zero so W/S also
+    // produces visible movement.
+    //
+    // RGBA bytes are 0xAABBGGRR little-endian.
+    sky_img = _make_band_image(0xFF604830, 0xFFA08868,   0,  60);  // top band — dim blue
+    mid_img = _make_band_image(0xFF206040, 0xFF308050,  60, 120);  // middle band — green
+    fg_img  = _make_band_image(0xFF2030A0, 0xFF4050D0, 120, 180);  // bottom band — red
+
+    sky_layer = bg_layer_new(sky_img, 0.1, 0.1);
+    mid_layer = bg_layer_new(mid_img, 0.4, 0.4);
+    fg_layer  = bg_layer_new(fg_img,  1.0, 1.0);
+
+    cam_x = 0.0;
+    cam_y = 0.0;
+    return 0;
+}
+
+static parallax_solo_phase(dt: float) @solo {
+    auto speed: float;
+    speed = 200.0;  // pixels per second
+    if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
+    if (key_down(KEY_LEFT)  || key_down(KEY_A)) { cam_x -= speed * dt; }
+    if (key_down(KEY_RIGHT) || key_down(KEY_D)) { cam_x += speed * dt; }
+    if (key_down(KEY_UP)    || key_down(KEY_W)) { cam_y -= speed * dt; }
+    if (key_down(KEY_DOWN)  || key_down(KEY_S)) { cam_y += speed * dt; }
+    return 0;
+}
+
+static parallax_render_phase(alpha: float) {
+    bg_set_camera(cam_x, cam_y);
+    game_render_begin();
+    bg_draw_all();
+    render_text("parallax", 4, 4, 1, 0xFFFFFFFF);
+    render_text("arrows or WASD to move camera", 4, 14, 1, 0xFFCCCCCC);
+    game_render_end();
+    return 0;
+}
+
+static parallax_quit_phase() {
+    bg_layers_clear();
+    return 0;
+}
+
+main() {
+    maestro_register_init(fn_ptr(parallax_init_phase));
+    maestro_register_solo(fn_ptr(parallax_solo_phase));
+    maestro_register_render(fn_ptr(parallax_render_phase));
+    maestro_register_quit(fn_ptr(parallax_quit_phase));
+    game_run(VIRT_W, VIRT_H, "B++ Parallax Smoke (Phase 4.3)", FPS);
+    return 0;
+}
