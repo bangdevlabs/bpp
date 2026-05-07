@@ -138,6 +138,16 @@ void gpu_draw_full()@gpu {
     _stb_gpu_draw_full();
 }
 
+// Issue a 4-vertex triangle-strip no-buffer draw. Pair with a
+// pipeline whose vertex stage reads vertex_id 0..3 and produces
+// the four corners of a quad. Phase 4.1.2's pixel-perfect blit
+// uses this to draw the offscreen content at the integer-scaled
+// dst rect; user shaders for fullscreen rectangular passes can
+// reuse the same primitive.
+void gpu_draw_quad()@gpu {
+    _stb_gpu_draw_quad();
+}
+
 // ── Sampler + texture binding (Phase 2.2) ────────────────────
 
 // Create a sampler that reads textures with NEAREST filtering and
@@ -182,4 +192,130 @@ void gpu_bind_texture_vert(slot, tex)@gpu {
 // runtime.
 void gpu_bind_sampler_frag(slot, sampler)@gpu {
     _stb_gpu_bind_sampler_frag(slot, sampler);
+}
+
+// Phase 4.1.1 — Offscreen render targets.
+//
+// Create an offscreen MTLTexture you can render INTO via the
+// regular render_begin/render_end cycle, then SAMPLE in a later
+// pass (the pixel-perfect final blit ships in Phase 4.1.2). The
+// returned handle stays valid until process exit; there is no
+// explicit free yet because targets are typically allocated once
+// per virtual resolution at game_init time.
+//
+// Pixel format matches the default render pipeline (BGRA8) so the
+// same shader pipeline can render to both the offscreen target
+// and the window without recompilation. Width/height are in
+// LOGICAL pixels — the backend uploads at hi-DPI resolution
+// transparently when the OS scales the window.
+//
+// Returns 0 if the platform has no GPU backend (Linux today; the
+// Vulkan/X11 port will fill this in).
+//
+// Usage (manual; the typical caller is stbgame in Phase 4.1.3):
+//
+//   auto target = gpu_target_create(320, 240);
+//   while (running) {
+//       gpu_target_bind(target);
+//       render_begin();
+//       render_clear(BLACK);
+//       // ... draw the game world ...
+//       render_end();
+//
+//       gpu_target_bind(0);
+//       render_begin();
+//       render_clear(LETTERBOX);
+//       gpu_present_target(target, dst_x, dst_y, dst_w, dst_h);  // 4.1.2
+//       render_end();
+//   }
+gpu_target_create(w: word, h: word)@gpu {
+    return _stb_gpu_target_create(w, h);
+}
+
+// Bind the offscreen target as the active render destination.
+// Pass 0 to fall back to the window drawable (default state at
+// startup). Both states are stable across many frames; the
+// stbgame frame loop flips between offscreen (game world draws)
+// and default (final blit) once per frame.
+void gpu_target_bind(target)@gpu {
+    _stb_gpu_target_bind(target);
+}
+
+// Phase 4.1.2 — Pixel-perfect blit pass.
+//
+// Lazy-loaded blit pipeline. The shader at
+// `assets/shaders/pp_blit.metal` ships with the engine and reads
+// `target` with a NEAREST sampler, drawing it as a 4-vertex quad
+// at the dst rect inside the window drawable. Loaded on first call
+// so games that never opt out of pixel-perfect pay the file-read
+// cost once per process lifetime; games that load other custom
+// shaders are unaffected (different pipeline).
+//
+// Bytes-aligned uniform layout matches the BlitU struct in the
+// shader: 8 floats (32 bytes), the second 16 bytes are pad to
+// satisfy Metal's 16-byte alignment rule for constant buffers.
+static auto _pp_blit_pipe;
+static auto _pp_blit_uniform;
+
+static _pp_blit_init()@io {
+    if (_pp_blit_pipe != 0) { return _pp_blit_pipe; }
+    _pp_blit_pipe = gpu_pipeline_load("assets/shaders/pp_blit.metal",
+                                      "pp_blit_vert", "pp_blit_frag");
+    if (_pp_blit_pipe == 0) {
+        put_err("gpu_present_target: pp_blit pipeline failed to load\n");
+        return 0;
+    }
+    _pp_blit_uniform = malloc(32);
+    return _pp_blit_pipe;
+}
+
+// Draw the offscreen `target` into the currently bound render
+// destination (typically the window drawable) at the rectangle
+// (dst_x, dst_y, dst_w, dst_h) measured in window pixels with
+// origin at top-left. `win_w` and `win_h` are the active drawable
+// dimensions in the same units, used by the vertex shader to
+// convert pixel coordinates to NDC. Areas of the drawable outside
+// the dst rect are left untouched — the caller is responsible for
+// clearing the window to the letterbox color before invoking this
+// helper, typically via render_clear immediately after binding the
+// window drawable.
+//
+// Sampler is NEAREST + clamp-to-edge, declared inline in the
+// shader. There is no opt-out for the filter mode; pixel-perfect
+// blit is the contract this entry point exists to enforce.
+//
+// Effect annotation deliberately omitted — the lazy
+// `_pp_blit_init` path calls `file_read_all` once, which makes
+// the first invocation @io. Subsequent calls are @gpu-only, but
+// the classifier conservatively unifies the call graph to @solo.
+// W026 fires when an explicit annotation contradicts the
+// inferred classification, so leaving it bare is the honest
+// shape.
+void gpu_present_target(target, dst_x, dst_y, dst_w, dst_h, win_w, win_h) {
+    auto u, pipe;
+    pipe = _pp_blit_init();
+    if (pipe == 0) { return; }
+    u = _pp_blit_uniform;
+    // DEBUG: confirm params arrived
+    // Convert ints to floats and write into the uniform buffer.
+    auto fx: float, fy: float, fw: float, fh: float, fww: float, fwh: float;
+    fx  = dst_x;
+    fy  = dst_y;
+    fw  = dst_w;
+    fh  = dst_h;
+    fww = win_w;
+    fwh = win_h;
+    pokefloat_h(u + 0,  fx);
+    pokefloat_h(u + 4,  fy);
+    pokefloat_h(u + 8,  fw);
+    pokefloat_h(u + 12, fh);
+    pokefloat_h(u + 16, fww);
+    pokefloat_h(u + 20, fwh);
+    pokefloat_h(u + 24, 0.0);
+    pokefloat_h(u + 28, 0.0);
+    gpu_pipeline_use(pipe);
+    gpu_uniform_set_vert(0, u, 32);
+    gpu_bind_texture_frag(0, target);
+    gpu_draw_quad();
+    gpu_pipeline_use_default();
 }

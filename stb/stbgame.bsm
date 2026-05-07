@@ -1,51 +1,25 @@
-// stbgame.bsm — Minimal 60 FPS game loop with foundational
-// input + draw + font subsystems.
-//
-// Per Rule 23 (cartridge minimalism), stbgame ships ONLY the
-// foundational set every game needs: window, fps-paced loop,
-// dt accounting, input polling, drawing primitives, default
-// font. Anything else — UI widgets, image hot-reload, audio,
-// ECS, physics — is opt-in by the program via explicit import
-// + init + per-frame tick.
-//
-// Why minimal:
-//   * Each cartridge declares its real deps. The import graph
-//     reflects what the program actually uses.
-//   * Ship builds skip dev-only ticks (hot-reload, profile)
-//     by simply not calling them.
-//   * Programmers control WHEN per-frame work happens (between
-//     game_frame_begin and draw_end), not stbgame.
-//   * No "foundational peer" creep — if a cartridge isn't used
-//     by every game, it doesn't belong in stbgame's import set.
-//
-// Opt-in patterns programmers compose around stbgame:
-//
-//   UI widgets (gui_label, gui_button, themes):
-//     import "stbui.bsm";
-//     init_ui();                  // after game_init
-//     ui_arena_reset();           // each frame, before widgets
-//
-//   Image hot-reload (live edit-while-running):
-//     import "stbimage.bsm";
-//     image_hot_reload_enable(img);
-//     image_hot_reload_tick_throttled();   // each frame
-//
-//   Pixel-perfect rendering (Phase 4.1+):
-//     stbgame's game_init reinterprets (W, H) as VIRTUAL
-//     resolution. Window auto-scales to monitor with integer
-//     scale + letterbox. Default ON for stbgame consumers.
-//
-// Uses _stb_* OS-layer primitives, which bpp_import.bsm
-// auto-injects from the appropriate platform layer. No
-// external (libc / framework) dependencies — pure B++.
+// stbgame.bsm — Standard B game loop library.
+/f/ Initializes the window, input, draw, math, UI, and font subsystems.
+// Uses _stb_* OS-layer functions, which the compiler imports
+// automatically when it sees that this module is part of the import
+// graph. The injection happens in bpp_import.bsm (process_file) so
+// stbgame's source no longer needs to mention the platform layer.
+// No external dependencies — pure B++.
 
 import "stbinput.bsm";
 import "stbdraw.bsm";
+import "stbui.bsm";
+// stbimage joins the foundation peer set so frame_begin can
+// auto-tick the hot-reload registry without per-game wiring.
+// Same coupling shape as stbdraw / stbinput / stbui — every
+// game that uses stbgame transitively gets the image cartridge,
+// matching how every game already gets the input + draw stacks.
+import "stbimage.bsm";
 
 // All bpp_* runtime modules are auto-injected by bpp_import.bsm
 // (math, str, io, array, buf, hash, file, arena, maestro, beat,
-// job, json). No explicit import needed here — they resolve
-// through the auto-inject pass before any user code is compiled.
+// job). No explicit import needed here — they resolve through
+// the auto-inject pass before any user code is compiled.
 
 // Screen dimensions. Set once in game_init, readable by game code.
 extrn SCREEN_W, SCREEN_H;
@@ -58,10 +32,7 @@ extrn _stb_frame_ms;
 extrn _stb_last_time;
 static auto _stb_dt_ms;
 
-// Initialize the game window and the foundational subsystems
-// every game needs (input, color, draw, font). Optional cartridges
-// (stbui, stbimage hot-reload, stbaudio, etc.) are opt-in — the
-// program imports + inits them explicitly after game_init.
+// Initialize the game window and all standard B subsystems.
 void game_init(w, h, title, fps) {
     init_math();
     math_trig_init();
@@ -69,6 +40,7 @@ void game_init(w, h, title, fps) {
     init_color();
     init_draw();
     init_font();
+    init_ui();
     init_str();
 
     SCREEN_W = w;
@@ -95,15 +67,6 @@ void game_init(w, h, title, fps) {
 // Input was already polled at the end of the previous frame's draw_end()
 // (right after the sleep), so it's as fresh as possible.
 // On the first frame, poll here to initialize input state.
-//
-// Optional per-frame ticks (Rule 23 — minimal stbgame):
-//
-//   ui_arena_reset();                    // if using stbui widgets
-//   image_hot_reload_tick_throttled();   // if using image_hot_reload
-//
-// The program calls these explicitly between game_frame_begin and
-// the rest of the frame so cartridges that aren't used pay
-// nothing.
 void game_frame_begin() {
     auto now;
 
@@ -119,6 +82,15 @@ void game_frame_begin() {
     if (_stb_dt_ms > 50) { _stb_dt_ms = 50; }
     if (_stb_dt_ms < 1) { _stb_dt_ms = 1; }
     _stb_last_time = now;
+
+    // Reset UI arena for this frame.
+    ui_arena_reset();
+
+    // Phase 3.5.6 — auto-tick the image hot-reload registry. The
+    // throttled tick polls every 30 frames (~0.5 s at 60 FPS) and
+    // is a no-op until something opts in via
+    // image_hot_reload_enable; idle games pay nothing.
+    image_hot_reload_tick_throttled();
 }
 
 // Return delta time in milliseconds (integer).
@@ -332,4 +304,35 @@ void scene_shutdown() {
 // Introspection: id of the currently active scene, -1 if none.
 scene_current()@base {
     return _scene_current;
+}
+
+// === Phase 4.1.2 — pixel-perfect helpers ===
+
+// _stb_w / _stb_h are the framebuffer mirror globals shared with
+// stbwindow / the platform layer. game_init writes them; the
+// platform layer keeps them in sync on resize.
+extrn _stb_w, _stb_h;
+
+// Live window content size in pixels.
+game_window_w()@base { return _stb_w; }
+game_window_h()@base { return _stb_h; }
+
+// Compute integer-scaled centered rect for pixel-perfect blit.
+// out buffer = 32 bytes, returns [x, y, w, h] as 4 word ints.
+// Sub-1× clamp: scale stays >= 1, content cropped if window
+// smaller than virtual.
+game_compute_present_rect(virtual_w, virtual_h, win_w, win_h, out) {
+    auto sx, sy, scale, w, h, x, y;
+    sx = win_w / virtual_w;
+    sy = win_h / virtual_h;
+    scale = sx < sy ? sx : sy;
+    if (scale < 1) { scale = 1; }
+    w = virtual_w * scale;
+    h = virtual_h * scale;
+    x = (win_w - w) / 2;
+    y = (win_h - h) / 2;
+    *(out + 0 * 8) = x;
+    *(out + 1 * 8) = y;
+    *(out + 2 * 8) = w;
+    *(out + 3 * 8) = h;
 }
