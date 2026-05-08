@@ -37,6 +37,18 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
+# Both bpp's import resolver (./, stb/, /usr/local/lib/bpp/stb/)
+# and any test that file_read_all's an asset under games/ or
+# tools/ are cwd-relative. Pinning cwd to REPO_ROOT regardless of
+# how the script was invoked (sh tests/run_all.sh from repo root,
+# sh run_all.sh from tests/, etc.) keeps every test's environment
+# identical and matches the convention every CI in the project
+# expects. Without this, running from tests/ failed 8 tests
+# spuriously: test_bpp_bench / test_*macho (modules in src/),
+# test_asset_wav / test_beat_map / test_modulab_handdiff (asset
+# paths under games/ and tools/).
+cd "$REPO_ROOT"
+
 OS="$(uname -s)"
 HAS_DISPLAY=0
 if [ "$OS" = "Darwin" ]; then

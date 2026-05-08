@@ -166,14 +166,20 @@ void game_init(virtual_w, virtual_h, title, fps) {
     // Open the OS window at the resolved scaled size.
     _stb_init_window(win_w, win_h, title);
 
-    // Phase 4.1.4 — auto-init the GPU renderer so pixel-perfect
-    // orchestration (game_render_begin / end) works without the
-    // caller pre-initing manually. render_init is idempotent: a
-    // legacy explicit call after game_init becomes a no-op. The
-    // GPU device + queue + pipeline allocation cost is one-time
-    // and small; software-only games pay it but never use the
-    // pipeline downstream.
-    render_init();
+    // Phase 4.1.4 originally auto-called render_init() here so
+    // game_render_begin / end worked without the caller pre-
+    // initing manually. That broke CPU-only games (the ones still
+    // using clear / draw_rect / draw_text / draw_end through the
+    // software framebuffer): _stb_gpu_init removes the NSImageView
+    // from the window's content view and replaces it with a
+    // CAMetalLayer, so subsequent _stb_present writes land on a
+    // detached imgview and the window stays white.
+    //
+    // The auto-init is now lazy via game_render_begin: GPU games
+    // call that helper (which calls render_init the first time and
+    // a no-op after), CPU games never reach it and keep the
+    // imgview live for their _stb_present calls. Symmetric: each
+    // path pays only for what it uses.
 
     // Initialize timing.
     _stb_last_time = _stb_get_time();
@@ -509,7 +515,13 @@ static auto _stbgame_target;
 // they bypass these helpers and manage `gpu_target_bind` /
 // `render_begin` / `gpu_present_target` directly.
 void game_render_begin() {
+    // Lazy-init the GPU on the first render_begin. game_init no
+    // longer auto-inits (that broke CPU-only games whose
+    // _stb_present writes through the software imgview that
+    // _stb_gpu_init removes). render_init is idempotent so
+    // sticking the call here costs nothing on subsequent frames.
     if (_stbgame_target == 0) {
+        render_init();
         _stbgame_target = gpu_target_create(SCREEN_W, SCREEN_H);
     }
     gpu_target_bind(_stbgame_target);

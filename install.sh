@@ -149,6 +149,19 @@ sudo cp src/bpp_runtime.bsm "$LIB_DIR/"
 # install can re-bootstrap bpp from source without the project tree.
 sudo cp src/bpp_minisym.bsm "$LIB_DIR/"
 sudo cp src/bpp_codegen.bsm "$LIB_DIR/"
+# bpp_internal.bsm — list builder + AST node helpers shared by every
+# compiler-stage module (bpp_parser, bpp_codegen, ...). Imported
+# transitively by bpp_import.bsm itself, so missing it breaks every
+# user compile from a non-repo cwd with `error[E002]: import
+# 'bpp_internal.bsm' not found`.
+sudo cp src/bpp_internal.bsm "$LIB_DIR/"
+# bpp_bench.bsm — bench_begin / bench_section / bench_end timing
+# helpers, AUTO-INJECTED by bpp_import.bsm into every user
+# program. Same auto-injection contract as bpp_io / bpp_math —
+# the tree must be installed even when no user code imports it
+# explicitly, otherwise tests/test_bpp_bench (and any program
+# that calls bench_*) fails E201.
+sudo cp src/bpp_bench.bsm "$LIB_DIR/"
 sudo cp src/bug_reader.bsm "$LIB_DIR/"
 # The remaining bug_*.bsm modules complete the standalone debugger
 # build chain — without these, compiling tools/the_bug/the_bug.bpp
