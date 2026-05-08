@@ -46,9 +46,22 @@ vertex VOut fps_vert(uint vid [[vertex_id]]) {
     return o;
 }
 
+// Phase 7 wall texturing — 4 textures bound at slots 0..3, one per
+// wall_type. The sampler uses linear filter + repeat on U so the
+// horizontal wrap when a ray crosses a tile boundary stays seamless;
+// V is per-column, never wraps. Texture upload happens host-side via
+// stbtexture's procedural generators (texture_brick / stone / wood /
+// solid); future Wolf3D content arc swaps the generators for PNG
+// loads through stbasset without touching this shader.
+constexpr sampler wall_smp(filter::linear, address::repeat);
+
 fragment float4 fps_frag(VOut in [[stage_in]],
                          constant CamUniforms& cam [[buffer(0)]],
-                         constant uchar*       map [[buffer(1)]]) {
+                         constant uchar*       map [[buffer(1)]],
+                         texture2d<float> tex_brick [[texture(0)]],
+                         texture2d<float> tex_stone [[texture(1)]],
+                         texture2d<float> tex_wood  [[texture(2)]],
+                         texture2d<float> tex_solid [[texture(3)]]) {
     float fx = in.position.x;
     float fy = in.position.y;
     float sw_f = float(cam.sw);
@@ -147,16 +160,42 @@ fragment float4 fps_frag(VOut in [[stage_in]],
         return float4(floor_col, 1.0);
     }
 
-    // Wall colour by tile type — matches the fps_3d.bpp legend.
+    // Texture UV — Lode's standard formulation:
+    //   u: where the ray hit on the wall in tile-local coordinates
+    //      (0..1). Derived from the perpendicular hit point on the
+    //      opposite axis from the wall's facing.
+    //   v: vertical position down the wall column, normalised to
+    //      [0..1] across the on-screen wall extent.
+    // Side-flip: walls hit from the opposite side need a mirrored u
+    // to keep the texture orientation consistent regardless of which
+    // face the ray entered from. The conditional below preserves
+    // Wolf3D-style continuity across cell boundaries.
+    float wall_x;
+    if (side == 0) {
+        wall_x = cam.py + wall_dist * dy;
+    } else {
+        wall_x = cam.px + wall_dist * dx;
+    }
+    wall_x = wall_x - floor(wall_x);
+    if ((side == 0 && dx > 0.0) || (side == 1 && dy < 0.0)) {
+        wall_x = 1.0 - wall_x;
+    }
+    float u = wall_x;
+    float v = (fy - wall_top) / line_height;
+    float2 uv = float2(u, v);
+
+    // Sample the texture matching wall_type. Metal's branch divergence
+    // cost is irrelevant here — neighbouring fragments in a single
+    // screen column always hit the same texture (one wall per column).
     float3 wall_col;
     if (wall_type == 1) {
-        wall_col = float3(0.69, 0.16, 0.21);  // brick red
+        wall_col = tex_brick.sample(wall_smp, uv).rgb;
     } else if (wall_type == 2) {
-        wall_col = float3(0.55, 0.55, 0.55);  // stone grey
+        wall_col = tex_stone.sample(wall_smp, uv).rgb;
     } else if (wall_type == 3) {
-        wall_col = float3(0.55, 0.36, 0.20);  // wood brown
+        wall_col = tex_wood.sample(wall_smp, uv).rgb;
     } else if (wall_type == 4) {
-        wall_col = float3(0.78, 0.20, 0.78);  // magenta solid
+        wall_col = tex_solid.sample(wall_smp, uv).rgb;
     } else {
         wall_col = float3(0.50, 0.50, 0.50);
     }
