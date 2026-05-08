@@ -30,6 +30,7 @@ import "stbrender.bsm";    // render_init / render_begin / render_end
 import "stbshader.bsm";    // gpu_pipeline_load + gpu_uniform_set_frag
 import "stbimage.bsm";     // Sessão A2 — HUD overlay sprite atlas
 import "stbprofile.bsm";   // profile_gpu_enable + profile_hud_draw
+import "stbfx.bsm";        // Sessão A4 — CRT post-process (Phase 6.4)
 
 // ── Compile-time constants ─────────────────────────────────
 
@@ -88,6 +89,11 @@ extrn map_buf;
 // ray-cast walls without leaking the custom pipeline's state into
 // the text rendering that follows.
 extrn hud_atlas;
+
+// Phase 6.4 — CRT post-process effect handle. Initialised in
+// fps_init_phase, applied as the only chain step in
+// fps_render_phase, freed in fps_quit_phase.
+extrn crt_fx;
 const HUD_TILE = 16;
 const HUD_TEX_W = 32;     // 2 tiles × 16 px
 const HUD_TEX_H = 16;
@@ -168,6 +174,16 @@ static fps_init_phase() {
     // readout reads the previous frame's MTLCommandBuffer
     // timeline; one-frame latency is invisible at 60 FPS.
     profile_gpu_enable();
+
+    // Phase 6.4 — register the CRT post-process. Default
+    // intensity (0.6) is the "obviously a CRT" baseline; tune
+    // via effect_crt_set_intensity if a softer look is wanted.
+    init_fx();
+    crt_fx = effect_crt();
+    if (crt_fx == 0) {
+        put_err("fps_3d_gpu: failed to load fx_crt.metal — exiting\n");
+        maestro_quit();
+    }
 
     FOV = 1.0472;            // 60° in radians
     player = fps_body(3.5, 8.5, 0.0, 0.3, 3.0, 2.0);
@@ -281,15 +297,24 @@ static fps_render_phase(alpha: float) {
 
     profile_hud_draw(8, 8, 1, 0xFFFF3333);
 
-    game_render_end();
+    // Phase 6.4 — instead of game_render_end, route through the
+    // CRT effect: chain_begin commits the offscreen pass, fx_apply
+    // runs the barrel + chromatic + scanlines fragment program,
+    // fx_present blits the post-processed result to the window
+    // with the same letterbox + NEAREST upscale game_render_end
+    // would have used.
+    fx_chain_begin();
+    fx_apply(crt_fx);
+    fx_present();
     return 0;
 }
 
-// Quit phase: nothing to free at process exit (the OS cleans up
-// MTL pipeline state, malloc'd buffers, and the GPU device on
-// termination). `@io` matches fps_3d.bpp for symmetry; the actual
-// effect is harmless — there's no IO here yet.
+// Quit phase: free the CRT effect's uniform buffer + wrapper. The
+// underlying MTL pipeline lives until the OS reclaims it on
+// termination — same pattern as the ray-cast pipeline above.
+// `@io` matches fps_3d.bpp for symmetry.
 static fps_quit_phase() @io {
+    fx_free(crt_fx);
     return 0;
 }
 

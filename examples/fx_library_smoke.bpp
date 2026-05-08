@@ -1,0 +1,121 @@
+// fx_library_smoke.bpp — Phase 6.2 effect library showcase.
+//
+// Renders one stable test scene (rectangles + text + a thin
+// gradient stripe) and lets the user cycle through the four
+// stbfx effects at runtime. Each press of TAB advances to the
+// next effect; the active label updates so it's always obvious
+// which one is on screen.
+//
+//   slot 0 : passthrough  (null effect — sanity reference)
+//   slot 1 : CRT          (barrel + chromatic + scanlines)
+//   slot 2 : scanlines    (dim alternating rows, no warp)
+//   slot 3 : chromatic    (RGB split, no scanlines)
+//   slot 4 : dither       (4×4 Bayer ordered dither)
+//
+// ESC quits.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbfx.bsm";
+
+const VIRT_W = 320;
+const VIRT_H = 180;
+const FPS    = 60;
+const N_FX   = 5;
+
+extrn fx_handles;       // word array, length N_FX
+extrn fx_names;         // word array of c-string ptrs, length N_FX
+extrn current_slot;
+
+static fx_lib_init_phase() {
+    render_init();
+    init_fx();
+
+    fx_handles = malloc(N_FX * 8);
+    fx_names   = malloc(N_FX * 8);
+
+    // Slot 0: passthrough
+    auto p;
+    p = fx_register("fx_passthrough.metal", "fx_pass_vert", "fx_pass_frag", 0);
+    poke_q(fx_handles + 0 * 8, p);
+    poke_q(fx_names   + 0 * 8, "passthrough (null effect)");
+
+    poke_q(fx_handles + 1 * 8, effect_crt());
+    poke_q(fx_names   + 1 * 8, "CRT (barrel + chromatic + scanlines)");
+
+    poke_q(fx_handles + 2 * 8, effect_scanlines());
+    poke_q(fx_names   + 2 * 8, "scanlines (dim rows only)");
+
+    poke_q(fx_handles + 3 * 8, effect_chromatic());
+    poke_q(fx_names   + 3 * 8, "chromatic (RGB split only)");
+
+    poke_q(fx_handles + 4 * 8, effect_dither());
+    poke_q(fx_names   + 4 * 8, "dither (4x4 Bayer)");
+
+    auto i;
+    for (i = 0; i < N_FX; i++) {
+        if (peek_q(fx_handles + i * 8) == 0) {
+            put_err("fx_library_smoke: failed to load effect at slot ");
+            putnum_err(i);
+            put_err("\n");
+            maestro_quit();
+            return 0;
+        }
+    }
+    current_slot = 0;
+    return 0;
+}
+
+static fx_lib_solo_phase(dt: float) @solo {
+    if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
+    if (key_pressed(KEY_TAB)) {
+        current_slot = current_slot + 1;
+        if (current_slot >= N_FX) { current_slot = 0; }
+    }
+    return 0;
+}
+
+static fx_lib_render_phase(alpha: float) {
+    game_render_begin();
+    render_clear(0xFF101030);                      // dark indigo bg
+
+    // High-contrast blocks
+    render_rect(40, 40, 80, 60, 0xFFFF4080);       // pink
+    render_rect(140, 60, 80, 60, 0xFF40FF80);      // green
+    render_rect(60, 110, 80, 40, 0xFF4080FF);      // blue
+
+    // Thin horizontal gradient stripe — exposes dither + scanline
+    // patterns more clearly than the solid blocks
+    auto x: word, c: word;
+    for (x = 220; x < 312; x++) {
+        c = 0xFF000000 | ((x - 220) * 255 / 92) | (((x - 220) * 255 / 92) << 8) | (((x - 220) * 255 / 92) << 16);
+        render_rect(x, 110, 1, 40, c);
+    }
+
+    render_text("STBFX EFFECT LIBRARY", 4, 4, 2, 0xFFFFFFFF);
+    render_text(peek_q(fx_names + current_slot * 8),
+                4, 24, 1, 0xFFFFFF80);
+    render_text("TAB to cycle effects", 4, 165, 1, 0xFFCCCCCC);
+
+    fx_chain_begin();
+    fx_apply(peek_q(fx_handles + current_slot * 8));
+    fx_present();
+    return 0;
+}
+
+static fx_lib_quit_phase() {
+    auto i;
+    for (i = 0; i < N_FX; i++) { fx_free(peek_q(fx_handles + i * 8)); }
+    free(fx_handles);
+    free(fx_names);
+    return 0;
+}
+
+main() {
+    maestro_register_init(fn_ptr(fx_lib_init_phase));
+    maestro_register_solo(fn_ptr(fx_lib_solo_phase));
+    maestro_register_render(fn_ptr(fx_lib_render_phase));
+    maestro_register_quit(fn_ptr(fx_lib_quit_phase));
+    game_run(VIRT_W, VIRT_H, "B++ stbfx Library Smoke (Phase 6.2)", FPS);
+    return 0;
+}

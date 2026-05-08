@@ -1,0 +1,331 @@
+// stbfx.bsm — Effect chain post-process pipeline (Phase 6.1).
+//
+// Stacks one or more fragment-shader passes between the game's
+// offscreen render and the final window blit. Each effect is a
+// pipeline + an optional uniform buffer; the chain ping-pongs
+// through two scratch targets so any number of effects can be
+// applied in sequence without allocating per-frame.
+//
+// Render flow with effects:
+//
+//   game_render_begin();
+//   ... user draws into the virtual canvas ...
+//   fx_chain_begin();       // commits offscreen pass; src = game target
+//   fx_apply(crt);          // game target -> scratch_a
+//   fx_apply(scanlines);    // scratch_a -> scratch_b
+//   fx_apply(chromatic);    // scratch_b -> scratch_a
+//   fx_present();           // blits result to window with letterbox;
+//                           // closes window pass (replaces game_render_end)
+//
+// Without effects the existing `game_render_end` path is the
+// simpler choice — fx_chain_begin / fx_present is mutually
+// exclusive with it (do not call both for the same frame).
+//
+// Per-effect uniform layout is up to the caller. fx_register
+// allocates an `uniform_size`-byte buffer owned by the effect; the
+// caller writes into it via `fx_uniform(handle)` each frame
+// before fx_apply, the same way stbshader's gpu_uniform_set_frag
+// works for one-shot custom pipelines.
+
+import "bpp_array.bsm";        // arr_new / arr_push (reserved for future chain caching)
+import "bpp_buf.bsm";           // pokefloat_h
+import "stbshader.bsm";         // gpu_pipeline_load + gpu_target_create + uniform/texture binders
+import "stbrender.bsm";         // render_begin / render_pass_end / render_end / render_clear
+import "stbgame.bsm";           // game_render_target / game_window_w / game_window_h /
+                                // game_letterbox_color / game_compute_present_rect
+
+// ── Effect struct ────────────────────────────────────────────
+
+struct FxEffect {
+    pipeline,                   // gpu pipeline handle
+    uniform,                    // ptr to uniform-buffer bytes (effect-owned)
+    uniform_size                // bytes; 0 means no uniform binding
+}
+
+// ── Module state ─────────────────────────────────────────────
+
+static extrn _fx_scratch_a;     // ping-pong target #1 (lazy)
+static extrn _fx_scratch_b;     // ping-pong target #2 (lazy)
+static extrn _fx_scratch_w;     // dimensions baked at first chain_begin
+static extrn _fx_scratch_h;
+static extrn _fx_current;       // target holding the latest result
+                                // (game target | scratch_a | scratch_b)
+static extrn _fx_other;          // the next destination (alternates)
+static extrn _fx_chain_active;  // 1 while between fx_chain_begin and fx_present
+static extrn _fx_inited;
+
+// ── Lifecycle ────────────────────────────────────────────────
+
+// Idempotent module init. The scratch targets stay 0 until the
+// first chain_begin actually needs them — games that register
+// effects but never run a chain pay nothing for the GPU memory.
+void init_fx() {
+    if (_fx_inited != 0) { return; }
+    _fx_inited        = 1;
+    _fx_scratch_a     = 0;
+    _fx_scratch_b     = 0;
+    _fx_scratch_w     = 0;
+    _fx_scratch_h     = 0;
+    _fx_current       = 0;
+    _fx_other         = 0;
+    _fx_chain_active  = 0;
+}
+
+// Register an effect from a Metal shader source. `metal_path`
+// resolves through the standard gpu_pipeline_load chain
+// (cwd-relative -> install dir -> path_asset). `uniform_size` is
+// the byte count of the fragment-stage uniform; pass 0 for
+// effects that take no uniform input. Returns the effect handle
+// or 0 on shader load failure.
+fx_register(metal_path, vert_name, frag_name, uniform_size) {
+    init_fx();
+    auto pipe;
+    pipe = gpu_pipeline_load(metal_path, vert_name, frag_name);
+    if (pipe == 0) { return 0; }
+    auto fx: FxEffect;
+    fx = malloc(sizeof(FxEffect));
+    fx.pipeline     = pipe;
+    fx.uniform_size = uniform_size;
+    if (uniform_size > 0) {
+        fx.uniform = malloc(uniform_size);
+        buf_fill(fx.uniform, 0, uniform_size);
+    } else {
+        fx.uniform = 0;
+    }
+    return fx;
+}
+
+// Free an effect handle. The underlying pipeline lives until
+// process exit (Metal pipelines are intentionally never freed in
+// stbshader either — registry-style pattern), so this only
+// releases the uniform buffer + the wrapper struct.
+void fx_free(handle) {
+    auto fx: FxEffect;
+    fx = handle;
+    if (fx.uniform != 0) { free(fx.uniform); }
+    free(fx);
+}
+
+// Return a writable pointer into the effect's uniform buffer.
+// Callers mutate these bytes per-frame to push fresh values
+// (intensity, time, palette indices, etc.) before fx_apply.
+fx_uniform(handle)@base {
+    auto fx: FxEffect;
+    fx = handle;
+    return fx.uniform;
+}
+
+// ── Chain orchestration ──────────────────────────────────────
+
+// Lazy-create the two scratch targets at the virtual canvas size
+// the game's offscreen target uses. Called from chain_begin so
+// games that never run effects pay nothing.
+static _fx_ensure_scratch(w, h) {
+    if (_fx_scratch_a != 0 && _fx_scratch_w == w && _fx_scratch_h == h) {
+        return;
+    }
+    _fx_scratch_a = gpu_target_create(w, h);
+    _fx_scratch_b = gpu_target_create(w, h);
+    _fx_scratch_w = w;
+    _fx_scratch_h = h;
+}
+
+// Begin a post-process chain. Closes the user's offscreen pass
+// (commits whatever they drew into the game target) and primes
+// the ping-pong with the game target as the initial source.
+// Pair with one or more fx_apply calls then fx_present.
+fx_chain_begin() {
+    init_fx();
+    auto src;
+    src = game_render_target();
+    if (src == 0) {
+        put_err("fx_chain_begin: game_render_target is null — call after game_render_begin\n");
+        return 0;
+    }
+
+    render_pass_end();
+
+    _fx_ensure_scratch(SCREEN_W, SCREEN_H);
+
+    _fx_current      = src;
+    _fx_other        = _fx_scratch_a;
+    _fx_chain_active = 1;
+    return 0;
+}
+
+// Apply one effect, ping-ponging the active target. Reads the
+// current source, writes through `handle.pipeline` into the
+// alternate scratch, then swaps so the next fx_apply consumes
+// the just-rendered output.
+fx_apply(handle) {
+    if (_fx_chain_active == 0) {
+        put_err("fx_apply: call fx_chain_begin first\n");
+        return 0;
+    }
+    auto fx: FxEffect;
+    fx = handle;
+
+    gpu_target_bind(_fx_other);
+    render_begin();
+    gpu_pipeline_use(fx.pipeline);
+    if (fx.uniform_size > 0) {
+        gpu_uniform_set_frag(0, fx.uniform, fx.uniform_size);
+    }
+    gpu_bind_texture_frag(0, _fx_current);
+    gpu_draw_quad();
+    gpu_pipeline_use_default();
+    render_pass_end();
+
+    auto next_other;
+    if (_fx_other == _fx_scratch_a) {
+        next_other = _fx_scratch_b;
+    } else {
+        next_other = _fx_scratch_a;
+    }
+    _fx_current = _fx_other;
+    _fx_other   = next_other;
+    return 0;
+}
+
+// ── Effect library — typed factories (Phase 6.2) ─────────────
+//
+// Each factory wraps `fx_register` for a stb-shipped shader and
+// pre-populates the uniform with sane defaults. The setters
+// poke specific float fields so callers don't need to remember
+// uniform offsets. Effect handles flow through fx_apply just
+// like a hand-rolled fx_register result.
+
+// CRT — barrel + chromatic aberration + scanlines.
+// Uniform layout (matches CrtU in fx_crt.metal):
+//   float intensity, aberration, scanline_density, pad
+// Defaults: intensity=0.6 (clearly visible without overpowering),
+// aberration=0.3 (tasteful colour split), scanline_density=2.0
+// (every other row dimmed at typical 320×180 virtual canvas).
+effect_crt() {
+    auto fx;
+    fx = fx_register("fx_crt.metal", "crt_vert", "crt_frag", 16);
+    if (fx == 0) { return 0; }
+    auto u;
+    u = fx_uniform(fx);
+    pokefloat_h(u +  0, 0.6);   // intensity
+    pokefloat_h(u +  4, 0.3);   // aberration
+    pokefloat_h(u +  8, 2.0);   // scanline_density
+    pokefloat_h(u + 12, 0.0);   // pad
+    return fx;
+}
+
+void effect_crt_set_intensity(handle, intensity: float) {
+    pokefloat_h(fx_uniform(handle) + 0, intensity);
+}
+
+void effect_crt_set_aberration(handle, aberration: float) {
+    pokefloat_h(fx_uniform(handle) + 4, aberration);
+}
+
+void effect_crt_set_scanline_density(handle, density: float) {
+    pokefloat_h(fx_uniform(handle) + 8, density);
+}
+
+// Scanlines — just the dimmed-row pattern, no warp / aberration.
+// Defaults: intensity=0.5 (medium dim), density=2.0.
+effect_scanlines() {
+    auto fx;
+    fx = fx_register("fx_scanlines.metal", "scan_vert", "scan_frag", 16);
+    if (fx == 0) { return 0; }
+    auto u;
+    u = fx_uniform(fx);
+    pokefloat_h(u +  0, 0.5);   // intensity
+    pokefloat_h(u +  4, 2.0);   // density
+    pokefloat_h(u +  8, 0.0);   // pad
+    pokefloat_h(u + 12, 0.0);   // pad
+    return fx;
+}
+
+void effect_scanlines_set_intensity(handle, intensity: float) {
+    pokefloat_h(fx_uniform(handle) + 0, intensity);
+}
+
+void effect_scanlines_set_density(handle, density: float) {
+    pokefloat_h(fx_uniform(handle) + 4, density);
+}
+
+// Chromatic aberration — RGB channel split, no other distortion.
+// Defaults: amount=0.5, horizontal=1.0 (full horizontal split).
+effect_chromatic() {
+    auto fx;
+    fx = fx_register("fx_chromatic.metal", "chrom_vert", "chrom_frag", 16);
+    if (fx == 0) { return 0; }
+    auto u;
+    u = fx_uniform(fx);
+    pokefloat_h(u +  0, 0.5);   // amount
+    pokefloat_h(u +  4, 1.0);   // horizontal
+    pokefloat_h(u +  8, 0.0);   // pad
+    pokefloat_h(u + 12, 0.0);   // pad
+    return fx;
+}
+
+void effect_chromatic_set_amount(handle, amount: float) {
+    pokefloat_h(fx_uniform(handle) + 0, amount);
+}
+
+void effect_chromatic_set_horizontal(handle, horizontal: float) {
+    pokefloat_h(fx_uniform(handle) + 4, horizontal);
+}
+
+// Ordered Bayer dither. Quantises each channel to a small number
+// of levels using a 4×4 Bayer matrix as the threshold map.
+// Defaults: intensity=1.0 (full dither), levels=4.0 (16 colours
+// per channel before dither, perceptually much more after).
+effect_dither() {
+    auto fx;
+    fx = fx_register("fx_dither.metal", "dither_vert", "dither_frag", 16);
+    if (fx == 0) { return 0; }
+    auto u;
+    u = fx_uniform(fx);
+    pokefloat_h(u +  0, 1.0);   // intensity
+    pokefloat_h(u +  4, 4.0);   // levels
+    pokefloat_h(u +  8, 0.0);   // pad
+    pokefloat_h(u + 12, 0.0);   // pad
+    return fx;
+}
+
+void effect_dither_set_intensity(handle, intensity: float) {
+    pokefloat_h(fx_uniform(handle) + 0, intensity);
+}
+
+void effect_dither_set_levels(handle, levels: float) {
+    pokefloat_h(fx_uniform(handle) + 4, levels);
+}
+
+// Blit the chain result to the window with the standard pixel-
+// perfect letterbox + NEAREST upscale. Replaces game_render_end
+// for frames that ran effects. Closes the window pass via
+// render_end so per-frame input + frame_wait happen exactly once
+// (same contract as game_render_end).
+fx_present() {
+    if (_fx_chain_active == 0) {
+        put_err("fx_present: call fx_chain_begin first\n");
+        return 0;
+    }
+    auto win_w, win_h, rect_buf, dst_x, dst_y, dst_w, dst_h;
+    win_w = game_window_w();
+    win_h = game_window_h();
+    rect_buf = malloc(32);
+    game_compute_present_rect(SCREEN_W, SCREEN_H, win_w, win_h, rect_buf);
+    dst_x = *(rect_buf + 0 * 8);
+    dst_y = *(rect_buf + 1 * 8);
+    dst_w = *(rect_buf + 2 * 8);
+    dst_h = *(rect_buf + 3 * 8);
+    free(rect_buf);
+
+    gpu_target_bind(0);
+    render_begin();
+    render_clear(game_letterbox_color());
+    gpu_present_target(_fx_current, dst_x, dst_y, dst_w, dst_h, win_w, win_h);
+    render_end();
+
+    _fx_chain_active = 0;
+    _fx_current      = 0;
+    _fx_other        = 0;
+    return 0;
+}
