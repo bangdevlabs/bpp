@@ -1419,8 +1419,12 @@ A two-line preview of the rules:
 - **Rule 4** — `@phase` annotations (`@base`, `@time`, `@io`, `@gpu`,
   `@solo`) on functions where intent is obvious; the classifier
   fills the rest.
+- **Rule 25** — `@profile("name") { ... }` block annotation that
+  pairs each instrumented region with a runtime aggregate visible in
+  the profile HUD. Shipped 2026-05-07 (Phase 6.3 of the GPU pipeline
+  roadmap).
 
-Twenty rules total, ~800 lines including examples and pitfalls.
+Twenty-five rules total, ~1100 lines including examples and pitfalls.
 
 ---
 
@@ -1900,17 +1904,83 @@ auto-injected `bpp_runtime` profile primitives (`profile_start`,
 profiler ships: hotkey toggle, REC indicator with elapsed timer,
 FPS smoothed + frame-time avg / max, live top-N tally refreshed
 every 500 ms (so the dump's internal allocations don't dominate
-the hot list), final stderr dump on stop. Tier 1 of the
-industry-standard profiler look in ~250 LOC. Tier 2 (sparkline,
-per-thread) and Tier 3 (GPU timing, scoped zones) are sidequest
-territory — start with the Tier 1 surface, escalate if a real
-workload demands it.
+the hot list), final stderr dump on stop. Tier 2 (sparkline
+normalised against `_PROFILE_SPARK_REF_US = 33000` so flat 60 FPS
+shows visible jitter), Tier 3a (per-thread breakdown via
+`profile_hud_cycle_thread`), Tier 3b (GPU timing readout from
+`_stb_gpu_last_us`), and Tier 3c (scoped zones via the `@profile`
+annotation, surfaced via `profile_zones_hud_draw`) all shipped
+through 2026-05-07.
 
 `stbphys` also gained a **Chapter FPS** (separate from the existing
 PlatformerBody section): `FPSBody` struct + `fps_walk` /
 `fps_turn` with per-axis collision-and-slide. The chapter promotion
 followed the existing convention (one cartridge, multiple body
 shapes; one chapter per shape).
+
+## GPU pipeline arc (Phase 4–7, closed 2026-05-07)
+
+Five cartridges layer on top of `stbrender` to give B++ a full
+indie-grade GPU pipeline. None of them are required — every game
+that doesn't import them pays nothing.
+
+**stbshader** — custom vertex+fragment pipelines.
+`gpu_pipeline_load(metal_path, vert, frag)` resolves the shader
+through three fallbacks (cwd-relative → `/usr/local/lib/bpp/stb/
+shaders/<basename>` → `path_asset(...)` walk-up), so games
+running from any cwd find their shaders without code changes.
+`gpu_target_create / gpu_target_bind / gpu_present_target` give
+off-screen render-to-texture infrastructure; `gpu_uniform_set_*`
++ `gpu_bind_texture_*` cover the standard MTLBuffer / MTLTexture
+binding surface.
+
+**stbscene** — layered backgrounds with parallax. Three function
+calls per layer for the side-scroller depth illusion:
+`bg_layer_new(image, factor_x, factor_y)` registers, `bg_set_camera(cx, cy)`
+updates the global camera, `bg_draw_all()` iterates registered
+layers in order and dispatches one textured fullscreen quad per
+visible layer. The `bg_layer.metal` shader handles the parallax
+offset + normalised UV with NEAREST + repeat sampler for infinite
+tiling.
+
+**stbfx** — post-process effect chain. Owns two scratch GPU
+targets internally and ping-pongs between them so any number of
+effects can compose without per-frame allocation.
+`fx_register(metal_path, vert, frag, uniform_size)` builds an
+effect handle; `fx_chain_begin / fx_apply(handle) / fx_present()`
+replaces the standard `game_render_end` for frames running
+effects. Four typed factories ship out of the box:
+`effect_crt(...)` (barrel + chromatic + scanlines),
+`effect_scanlines(...)`, `effect_chromatic(...)`,
+`effect_dither(...)` (4×4 Bayer). `effect_palette_quantize` is
+the planned 5th — needs stbpal integration.
+
+**`@profile("name") { ... }`** — Phase 6.3 compiler annotation
+that lowers at parse time to a synthesized `T_BLOCK` carrying
+`_prof_zone_enter("name")` / `_prof_zone_exit("name")` runtime
+calls. Each completed enter/exit pair adds to a per-zone
+aggregate (total_us + count) in stbprofile; render the panel via
+`profile_zones_hud_draw(x, y, sz, color)`. Gates on the same
+`_profile_hud_active` flag as the rest of the profile HUD so a
+single P press surfaces both panels together. Tonify Rule 25
+covers the surface + v1 caveats (early `return` inside a zone
+leaves it open, nested zones aggregate flat, panic leaks).
+
+**Pixel-perfect default in stbgame** — Phase 4.1.x reinterpreted
+`game_init(virtual_w, virtual_h, title, fps)` as a virtual
+canvas; the OS window auto-scales to ~80% of the monitor at
+integer-multiple of the virtual size with BLACK letterbox.
+`game_render_begin` / `game_render_end` give a one-line
+orchestration replacement for the legacy `render_begin` /
+`render_end` pair, taking care of the offscreen target +
+NEAREST upscale + letterbox blit. CPU-only games that never
+call `game_render_begin` keep their software framebuffer path
+intact (the GPU isn't initialised until the first GPU helper
+runs — `render_init` is lazy as of `c8c09e8`).
+
+**`@profile` smoke**: `examples/profile_zones_smoke.bpp` — three
+zones (heavy / medium / light) of measurable busy work; the
+panel sorts them by total_us within ~1 second.
 
 ## Cap 48 — Compiler Flags Reference
 

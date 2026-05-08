@@ -1244,6 +1244,74 @@ state-setting semantics exactly.
 
 ---
 
+## Rule 25: `@profile("name") { ... }` annotation for scoped zones
+
+Phase 6.3 of the GPU pipeline roadmap (shipped 2026-05-07) added
+a compiler-level zone annotation that pairs each instrumented
+block with a runtime aggregate visible in the profile HUD. Drop
+it around any expensive stretch of code where you want a
+finer-than-function-level breakdown.
+
+**Surface:**
+
+```bpp
+@profile("ray_cast") {
+    gpu_pipeline_use(ray_pipeline);
+    gpu_uniform_set_frag(0, cam_buf, CAM_BUF_SZ);
+    gpu_draw_full();
+}
+```
+
+The parser lowers this to a synthesised `T_BLOCK` with prologue
+`_prof_zone_enter("ray_cast")` and epilogue
+`_prof_zone_exit("ray_cast")`. Aggregates land in
+`stb/stbprofile.bsm`'s zone table; render the panel via
+`profile_zones_hud_draw(x, y, sz, color)` — gates on the same
+`_profile_hud_active` flag the rest of the profile HUD reads,
+so a single P press surfaces both panels together.
+
+**When to reach for it:**
+
+- Multi-stage render phases (ray_cast / hud_overlay /
+  crt_effect — exactly the fps_3d_gpu integration that
+  motivated the feature).
+- Frame-budget triage: "the function takes 1.9 ms, but where
+  inside?".
+- Cross-cutting work that doesn't decompose cleanly into
+  helper functions.
+
+**When to skip it:**
+
+- One-statement blocks; the function-level dump already covers
+  these.
+- Hot loops where the enter/exit pair would dominate the cost
+  it claims to measure (each call is ~50 ns including the
+  beat_now_us read; loops at >10 M iter/s would feel it).
+
+**v1 caveats** (track in the calling code; the runtime is
+"best-effort, never crash" rather than "correct under
+everything"):
+
+- Early `return` inside a zone leaves it open. The next
+  enter/exit pair on the SAME thread silently rebases the
+  start, so total_us undercounts.
+- Nested zones run on a runtime stack (depth 8). Aggregation
+  is FLAT — a parent's total_us includes its children's time.
+- Panic / abort similarly leak; OS reclaims the table at
+  process exit.
+
+These will tighten when scoped-cleanup epilogues land in a
+later compiler sprint. Phase 6.3 prioritised "ergonomic syntax
++ working aggregation" over "panic-safe semantics".
+
+**Naming:** the original spec called it `@profile_zone(...)`
+but `_zone` was redundant — the annotation IS the zone. Other
+`@`-annotations in the language read as adjectives on the
+following construct (`@base func`, `@gpu func`, `@seq while`);
+`@profile { ... }` reads as "profile this".
+
+---
+
 ## File order (leaves first, complex last)
 
 ```

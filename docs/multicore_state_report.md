@@ -349,58 +349,53 @@ Linux hosts.
 
 ### Gap 2 — Reduction support in scanner
 
-**Status:** scanner rejects loops where a variable escapes the body
-(e.g. `sum = sum + arr[i]`). Reduction is the most common parallel
-pattern outside map.
+**Status (2026-05-07):** PARTIALLY SHIPPED.
 
-```bpp
-// Currently rejected:
-auto sum;
-sum = 0;
-for (i = 0; i < n; i++) {
-    sum = sum + arr[i];   // escapes body — scanner rejects
-}
-```
+- **Sprint 2a** (detection) shipped 2026-04-30 — scanner now
+  recognises `var = var OP value` reduction patterns and emits
+  `[REDUCTION acc=...]` annotations under `--dispatch`.
+- **Sprint 2b** (rewrite) shipped for the additive operator `+`
+  end-to-end: the rewriter splits the loop into worker chunks
+  with per-worker accumulators and an additive merge in the
+  master. `tests/test_reduction_sum.bpp` and
+  `tests/test_reduce_runtime.bpp` exercise the path.
+- **Still serial** — reductions over `*`, `min`, `max`, `&`, `|`,
+  `^`. The synthesiser hasn't learned their identity elements
+  yet (`_dsp_red_identity_for(op_ch)` only handles `+`). Adding
+  the others is ~30 LOC of identity-element + merge-op tables
+  and ships when a real workload demands it.
 
-**Impact:** sum / avg / min / max / count are core operations.
-Rejection means programmer falls back to serial for these.
-
-**Cost:** ~100 LOC. Detect pattern `var = var OP value` where OP is in
-{+, *, min, max, &, |, ^}. Synthesize worker that returns sub-result;
-master combines via tree reduction.
-
-**Priority:** high. Common pattern, well-studied solution.
+Original Sprint 2 plan accomplished its high-priority goal.
+Closeout note kept in the doc for context; the parallel `sum`
+pattern (most common reduction case) is now auto-dispatched.
 
 ### Gap 3 — Stride != 1
 
-**Status:** scanner only accepts `i++`. Variants like `i = i + 2`,
-`i += 4`, or `for (i = 0; i < n*4; i += 4)` are rejected.
+**Status (2026-05-07):** DETECTION shipped 2026-04-30
+(`dispatch_cand_stride` array carries the parsed stride literal,
+`--dispatch` reports it). REWRITE still pending — when
+`stride != 1` the dispatch path falls through to the serial
+placeholder branch (search `if (sv != 0 || st != 1)` in
+`bpp_dispatch.bsm` for the bail-out).
 
-```bpp
-// Currently rejected:
-for (i = 0; i < n; i = i + 2) {       // chunked processing
-    pixels[i] = transform(pixels[i]);
-}
-```
+**What ships next when needed:** `job_parallel_for` gains a
+chunked variant that takes a stride parameter, and the rewriter
+stops bailing out for `st > 1`. Roughly the original 30-LOC
+estimate plus the runtime variant in `bpp_job.bsm` (~20 more).
 
-**Impact:** moderate. Needed for SIMD-aware processing, RGBA pixel
-loops, every-other-frame dispatch.
-
-**Cost:** ~30 LOC in `_fdc_op_char` + scanner. Add stride literal
-extraction; pass stride to synth function.
-
-**Priority:** medium.
+**Priority:** medium — same as before. SIMD-aware processing
+and chunked pixel loops are still the motivating use cases.
 
 ### Gap 4 — Non-zero start index
 
-**Status:** scanner currently expects `i = 0` start. `for (i = 1;
-i < n; i++)` is rejected (pathfind hits this).
+**Status (2026-05-07):** DETECTION shipped 2026-04-30 alongside
+Gap 3. The scanner records a literal start, `--dispatch` reports
+it, and the dispatch table holds the offset. REWRITE still falls
+through to serial when start ≠ 0 (same bail-out branch as Gap 3).
 
-**Impact:** moderate. Common when skipping element 0 (sentinel,
-header).
-
-**Cost:** ~10 LOC. Detect literal start, pass to synth function as
-offset.
+**What ships next when needed:** the chunked `job_parallel_for`
+variant takes both a start offset and a stride, fixing Gaps 3
+and 4 in one cut. Roughly 40 LOC combined.
 
 **Priority:** medium.
 
@@ -460,51 +455,65 @@ fix.
 
 ---
 
-## Section 5 — Total roadmap
+## Section 5 — Total roadmap (updated 2026-05-07)
+
+Sprint 1 (Gaps 3+4 detection) and Sprint 2 (Gap 2 detection +
+additive rewrite) shipped 2026-04-30. The remaining backlog and
+suggested phasing:
 
 ```
-Total LOC for full multi-core native parity: ~1090 LOC
-  Gap 1 (Linux threads):       depends on ELF dynlink (~500 LOC)
-  Gap 2 (reduction):           ~100 LOC
-  Gap 3 (stride):              ~30 LOC
-  Gap 4 (start index):         ~10 LOC
-  Gap 5 (channels):            ~80 LOC
-  Gap 6 (atomics):             ~50 LOC
-  Gap 7 (CPU detect):          ~300 LOC
-  Gap 8 (map/reduce sugar):    ~50 LOC
+Remaining LOC for full multi-core native parity: ~1010 LOC
+  Gap 1 (Linux threads):              depends on ELF dynlink (~500 LOC)
+  Gap 2 (reduction — non-additive):   ~30 LOC (identity tables)
+  Gap 3 (stride rewrite):             ~30 LOC (job_parallel_for variant)
+  Gap 4 (start index rewrite):        ~10 LOC (folds with Gap 3)
+  Gap 5 (channels):                   ~80 LOC
+  Gap 6 (atomics):                    ~50 LOC
+  Gap 7 (CPU detect):                 ~300 LOC
+  Gap 8 (map/reduce sugar):           ~50 LOC
 
-Suggested phasing:
+Already shipped:
+  ✅ Gap 3 detection            ~30 LOC (2026-04-30)
+  ✅ Gap 4 detection            ~10 LOC (2026-04-30)
+  ✅ Gap 2 reduction (additive) ~120 LOC (2026-04-30, more than the
+                                          original 100-LOC estimate
+                                          because the AST surgery
+                                          turned out to be ~50 LOC
+                                          deeper than scoped)
 
-  Sprint 1 (1 session) — Loose ends in scanner
-    - Gap 4 (start index)         ~10 LOC
-    - Gap 3 (stride)              ~30 LOC
-    Test: rerun pathfind/platform with --dispatch, expect more candidates
+Suggested phasing for what remains:
 
-  Sprint 2 (2 sessions) — Reduction
-    - Gap 2 (reduction patterns)  ~100 LOC
-    Test: sum_array benchmark, before/after timing
+  Sprint A (1 session) — Stride / start rewrite
+    - Gap 3 + Gap 4 (rewrite path)  ~40 LOC
+    Test: rerun pathfind/platform with --dispatch + measure speedup
 
-  Sprint 3 (1 session) — Channels
-    - Gap 5 (chan_*)              ~80 LOC
+  Sprint B (0.5 sessions) — Reduction op family
+    - Gap 2 non-additive (identity tables for *, min, max, &, |, ^)
+                                    ~30 LOC
+    Test: tests/test_reduction_*.bpp expanded
+
+  Sprint C (1 session) — Channels
+    - Gap 5 (chan_*)                ~80 LOC
     Test: audio/render thread comm
 
-  Sprint 4 (1 session) — Atomics minimum
-    - Gap 6 (3 atomics)           ~50 LOC
+  Sprint D (1 session) — Atomics minimum
+    - Gap 6 (3 atomics)             ~50 LOC
     Test: atomic counter across threads
 
-  Sprint 5 (when ELF dynlink) — Linux parity
-    - Gap 1 (linux pthread)       ~500 LOC after dynlink
+  Sprint E (when ELF dynlink) — Linux parity
+    - Gap 1 (linux pthread)         ~500 LOC after dynlink
     Test: run dispatch tests on Linux
 
-  Sprint 6 (1 session) — CPU detection
-    - Gap 7 (cpu_has)             ~300 LOC
+  Sprint F (1 session) — CPU detection
+    - Gap 7 (cpu_has)               ~300 LOC
     Test: SIMD fast path opt-in
 
-  Sprint 7 (0.5 sessions) — Sugar
-    - Gap 8 (map/reduce)          ~50 LOC
+  Sprint G (0.5 sessions) — Sugar
+    - Gap 8 (map/reduce)            ~50 LOC
     Test: ergonomic before/after
 
-Total: 6-8 sessions, scattered as foundation work between game features.
+Total remaining: ~5-6 sessions, scattered as foundation work
+between game features.
 ```
 
 ---

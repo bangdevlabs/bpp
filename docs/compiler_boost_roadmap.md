@@ -242,3 +242,33 @@ justify. That's the correct place to stop without profile data.
 - Phase D-1 through D-4 shipped (bootstrap stable at `72e1b793`,
   suite 111/0 non-GPU).
 - Tier F remains explicitly deferred per this document's own gating.
+
+## Updated 2026-05-07
+
+Status snapshot at end of GPU pipeline arc:
+
+- **Tier F still NOT opened** — none of the gating conditions have
+  fired. No plugin exists yet (bangscript runtime is the canonical
+  near-term plugin host, still ahead on the roadmap). No profile
+  data points at scalar-arithmetic dominance. The single biggest
+  consumer of compiler optimization wins in the last fortnight has
+  been the renderer / GPU pipeline, where Tier F doesn't apply
+  (fragment shaders run on the GPU; scalar code in `_stb_*` paths
+  is not the bottleneck).
+- **Phase D-style single-node opts continue to land opportunistically** —
+  e.g. the parser's inline-trivials family expanded for stb wrappers
+  during the V3 sprint. Anything reaching the "two-week project"
+  threshold for Tier F is still a year away.
+- **Adjacent compiler work that DID ship since 2026-04-22**:
+  - V3 function-pointer type checking (entire fixpoint pass for
+    `func(...)` type propagation across the call graph)
+  - Scoped zones `@profile("name") { ... }` annotation (parser
+    lowering + runtime + HUD)
+  - T_BLOCK pre_reg recursion fix (codegen gap surfaced by
+    Phase 6.3)
+  - `cd "$REPO_ROOT"` in tests/run_all.sh (env, not codegen)
+
+None of those share infrastructure with Tier F. The CSE / RA v2 /
+auto-vec backlog is unmoved. When a real consumer files a profile
+showing one of the three patterns, this doc is the spec to start
+from.

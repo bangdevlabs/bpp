@@ -1,5 +1,137 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 6.3 CLOSED — `@profile` scoped zones + late-day env fixes
+
+**Suite 140/0/12 native, bootstrap byte-stable. The GPU pipeline roadmap is now ENTIRELY CLOSED — Phase 6.3 was the last deferred session and shipped end-to-end. Plus a basket of regression fixes the smoke runs surfaced.**
+
+### Phase 6.3 — `@profile("name") { ... }` (commit `3dcb8e4`)
+
+Three pieces, all in one commit:
+
+- **Parser** lowers `@profile("name") { body }` at parse time
+  to a synthesised `T_BLOCK` with prologue
+  `_prof_zone_enter("name")` and epilogue
+  `_prof_zone_exit("name")`. The lowering reuses existing
+  T_LIT + T_CALL builders so codegen treats the prologue/
+  epilogue identically to hand-written calls. New helpers
+  `_intern_name`, `_zone_enter_ref`, `_zone_exit_ref` cache
+  the runtime function names in vbuf with the same lazy
+  pattern `_inline_malloc_ref` established. Falls through to
+  `@seq / @par / @gpu` dispatch hint path on any non-`profile`
+  annotation, so existing while-hint syntax keeps working.
+
+- **Runtime** (`stb/stbprofile.bsm`): flat 16-slot zone table
+  (24 B per entry — name_ptr / total_us / count) plus an
+  8-deep open-zone stack (16 B per frame). Both zero-init in
+  `init_profile`. Public surface:
+  `_prof_zone_enter / _prof_zone_exit` (called from the
+  synthesised T_CALLs), `profile_zones_reset`, and
+  `profile_zones_hud_draw(x, y, sz, color)`. The HUD panel
+  gates on `_profile_hud_active` so it surfaces / dismisses
+  with the rest of the profile HUD via the same key press.
+
+- **fps_3d_gpu integration**: render phase now wraps
+  `ray_cast / hud_overlay / crt_effect` in @profile blocks;
+  the zones panel pins to the upper-right corner via
+  `profile_zones_hud_draw(SCREEN_W - 220, 8, 1, ...)`.
+
+- **Smoke**: `examples/profile_zones_smoke.bpp` — three
+  busy-work zones at heavy / medium / light cost. After ~one
+  second the panel sorts them by total_us with avg µs and
+  call counts that match the iteration ratios.
+
+**Naming**: the spec called it `@profile_zone(...)` but `_zone`
+was redundant — the annotation IS the zone. Phase 6.3
+internal-session label kept; user-facing surface dropped a
+syllable.
+
+**Tonify Rule 25** added (`@profile` annotation usage + v1
+caveats: early-return open zones, flat aggregation under
+nesting, panic leaks).
+
+### Compiler gap surfaced — `pre_reg_vars` did not recurse into T_BLOCK (commit `7871ba3`)
+
+The first attempt at the @profile lowering errored with
+`internal error: global 'cross_x' not found in data section`
+when fps_3d_gpu wrapped its hud_overlay zone around `auto
+cross_x, cross_y; ...`. Trace: `a64_pre_reg_vars` walks T_IF /
+T_WHILE / T_SWITCH bodies to register auto-declared locals
+before emission, but did not recurse into T_BLOCK. Any code
+producing a synthetic T_BLOCK around `auto` declarations (the
+@profile lowering AND the parser's dead-code-elimination
+collapsing if/else into T_BLOCK(body)) ended up with the inner
+declarations unregistered → codegen treats them as globals →
+linker fails to allocate. Fix: one-line addition per backend
+(both aarch64 and x86_64).
+
+### Late-day env regressions (commits `c8c09e8`, `049a5f8`, `090bead`)
+
+Three bugs surfaced through the smoke runs and got bundled
+into the close-out:
+
+- **Install pipeline gap** (`c8c09e8`) — install.sh was
+  missing `bpp_internal.bsm` and `bpp_bench.bsm`. Both are
+  auto-injected by `bpp_import.bsm`, so any program compiled
+  outside the repo checkout failed E002 / E201. Five tests
+  caught this indirectly: `test_bpp_bench` and the four
+  `test_*macho` variants. Same commit also pinned
+  `tests/run_all.sh` to `cd "$REPO_ROOT"` (the runner used
+  absolute paths to compile, but bpp's own resolver was
+  cwd-relative; running `sh run_all.sh` from `tests/` failed
+  spuriously). And reverted Phase 4.1.4's auto-`render_init()`
+  inside `game_init` — that broke every CPU-only game
+  because `_stb_gpu_init` `removeFromSuperview`'s the
+  software NSImageView and replaces it with a CAMetalLayer,
+  so subsequent `_stb_present` calls write to a detached
+  imgview and the window stays white. Symptom:
+  `test_stbgame_native` (the green-square + WASD smoke)
+  rendered as a white window instead of the moving square.
+  Moved render_init to a lazy call inside `game_render_begin`
+  so GPU games still get auto-init the moment they need it
+  and CPU games keep their imgview live.
+
+- **Profiler shutdown SIGSEGV** (`049a5f8`) — `maestro_run`
+  tore down worker threads via `job_shutdown` without first
+  disarming the SIGPROF timer. SIGPROF fired during
+  `pthread_join`, the handler walked `_stb_workers` state
+  mid-deallocation, and the read landed in a freed VM region.
+  Fix: call `profile_stop()` between the user quit hook and
+  `job_shutdown`. profile_stop is auto-injected via
+  bpp_runtime; it's a no-op when sampling was never started,
+  so games that never use the profiler pay nothing.
+
+- **Inverted A/D strafe** (`090bead`) — `fps_walk` used
+  perpendicular `(+dir_y, -dir_x)`, the rotated-90°-CW vector
+  for a Y-down coordinate system. Wrong screen-side: D moved
+  the body to the player's screen-LEFT. Fixed by swapping the
+  strafe signs to `(-dir_y, +dir_x)`. Repaired in both
+  fps_3d (CPU) and fps_3d_gpu (GPU) since both consume the
+  same helper.
+
+### Sparkline budget reference (committed earlier today, `a504baa`)
+
+Mentioned for completeness — the Tier 2 sparkline normalised
+bar height against `max_us` (worst frame in the buffer), so
+flat 60 FPS rendered as a solid red horizontal stripe.
+Switched to a fixed-budget reference (`_PROFILE_SPARK_REF_US =
+33000`, the 30 FPS floor): bars at ~50% height with visible
+jitter at 60 FPS, frame-time spikes clip at the top in the
+"danger zone".
+
+### Where Phase 6.3 leaves things
+
+- `docs/gpu_pipeline_roadmap.md`: Phase 6.3 marker flipped
+  from DEFERRED → CLOSED. All seven phases of the roadmap
+  carry CLOSED markers now.
+- `docs/tonify_checklist.md`: Rule 25 covers the new
+  annotation + v1 caveats.
+- The Decision Point at the end of Phase 7 stays
+  intentionally open — content arc next is a player-side
+  call (Wolf3D content, adventure demo, RTS, or something
+  else entirely).
+
+---
+
 ## 2026-05-07 — Phase 6 + Phase 7 CLOSED — GPU pipeline arc lands
 
 **Suite = 140/0/12 native. Bootstrap byte-stable. The GPU pipeline roadmap (`docs/gpu_pipeline_roadmap.md`) closes today: Phases 4 + 5 + 6 + 7 all green. One Phase 6 sub-session (6.3 scoped zones, compiler feature) deferred to a dedicated sprint — the rest shipped.**

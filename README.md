@@ -4,18 +4,23 @@
 > Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
 > Everything you need in one file. No other canonical doc.
 
-### B++ 0.23x — Wolf3D Phase 1 CLOSED — `fps_3d.bpp` walks at 60 FPS — 4 May 2026
+### B++ 0.23x — GPU Pipeline arc CLOSED — fps_3d_gpu walks the maze with CRT post-process — 7 May 2026
 
-A self-hosting compiled language that now **renders and walks through a textured 2.5D maze in pure B++ at honest 60 FPS** — DDA ray casting, per-column textured wall blits, FPS-style WASD + arrow-key movement, runtime profiler HUD with live FPS / frame-time / top-N readout, all toggled by a hotkey while the game runs. `games/fps/fps_3d.bpp` is the Phase 1 deliverable; Wolfenstein-3D-style content (sprites, enemies, levels, weapons) is Phase 2+, and this file migrates to `examples/fps_3d.bpp` once that ships, becoming the reference 2.5D raycasting template every future B++ raycaster forks from.
+A self-hosting compiled language whose GPU pipeline arc is now **complete end-to-end**. Seven phases in one week: pixel-perfect render-to-texture with letterbox + integer-scaled blit, layered backgrounds with parallax, a post-process effect chain (CRT / scanlines / chromatic / dither), procedural wall texturing in the FPS demo, and a `@profile("name") { ... }` annotation that lowers to runtime aggregates and lights up a per-zone HUD panel. `games/fps/fps_3d_gpu.bpp` walks the same maze as the CPU baseline through textured walls + CRT distortion + per-pass timing breakdown — all in pure B++.
 
-**Phase 1 shipped four new stb cartridges + nine compiler-level wins as side-effects** — see [`docs/journal.md`](docs/journal.md) entry `2026-05-04` for the full list. Highlights:
+**The seven phases shipped (full list in [`docs/journal.md`](docs/journal.md) and [`docs/gpu_pipeline_roadmap.md`](docs/gpu_pipeline_roadmap.md)):**
 
-- `stb/stbtexture.bsm` — programmatic texture creation (brick / stone / wood / solid) with an `_to_buf` headless-testable API split.
-- `stb/stbraycast.bsm` — DDA + RayHit + per-column projection. Cartridge stays content-blind so any future raycaster forks it.
-- `stb/stbprofile.bsm` — runtime profiler HUD (REC indicator, FPS smoothed, frame-time avg / max, live top-N tally refreshed every 500 ms, final stderr dump). Tier 1 of the industry-standard profiler UX in ~250 LOC.
-- `stb/stbphys.bsm` Chapter FPS — `FPSBody` + `fps_walk` + `fps_turn` with per-axis collision-and-slide.
+- **Phase 4.1.x — Pixel-perfect default** — `gpu_target_create / bind / present_target`, smart-dispatch `render_clear` (Tonify Rule 24), `_gpu_flush_off` accumulation across multi-pass frames (Pitfall 7), `game_init` reinterpreted as virtual resolution + auto-scale window + BLACK letterbox, `game_render_begin / end` cross-platform helpers.
+- **Phase 4.2 — Game migration** — All 6 games (snake, pathfind, fps_3d, fps_3d_gpu, platformer, rhythm) on the auto-orchestration helpers.
+- **Phase 5 — Layered + parallax** — `stb/stbscene.bsm` (~165 LOC) + `bg_layer.metal` shader. Three function calls per layer for side-scroller depth.
+- **Phase 6.1 + 6.2 — Effect chain + library** — `stb/stbfx.bsm` ping-pong post-process pipeline plus four typed effect factories (`effect_crt / scanlines / chromatic / dither`).
+- **Phase 6.4 — fps_3d_gpu adopts CRT + procedural wall textures** — `fps_render_phase` routes through `fx_chain_begin / fx_apply(crt) / fx_present`; ray-cast shader samples brick / stone / wood / solid textures bound at fragment slots 0..3.
+- **Phase 6.3 — Scoped zones compiler feature** — `@profile("name") { ... }` parser annotation lowers at parse time to a synthesized `T_BLOCK` carrying `_prof_zone_enter / exit` runtime calls. New `profile_zones_hud_draw` panel surfaces the per-zone aggregate, gated by the same key as the rest of the profile HUD.
+- **Sidequests inside the arc**: shader install pipeline (`stb/shaders/` ships with the compiler, `gpu_pipeline_load` resolves through cwd → install dir → `path_asset` walk), sparkline normalised against a fixed budget so flat 60 FPS no longer renders as a solid red bar, env-fix bundle (`bpp_internal.bsm` + `bpp_bench.bsm` added to install.sh — they're auto-injected, missing them broke every external developer's compile from a non-repo cwd; suite cd-pinned to REPO_ROOT; `game_init` no longer auto-calls `render_init` — broke CPU-only games by replacing the NSImageView with a CAMetalLayer; SIGPROF disarmed before `job_shutdown` to dodge a pthread_join race; A/D strafe inversion in `fps_walk` repaired). Full account: [journal entry](docs/journal.md) "2026-05-07 — Phase 6.3 CLOSED".
 
-**Compiler fixes that fell out of Phase 1:** lexer scientific-notation literals (`1.0e30`), T_BLOCK type-inference recursion fix (smart-dispatch inside const-folded `if`), W027 FFI float-param diagnostic, minisym PC resolver bound check (64 KB guard, eliminates phantom samples on the last function), µs-precision maestro with hybrid sleep + busy-wait (real 60.0 FPS instead of the ms-truncation 62.5 drift), `sin_f` / `cos_f` / `abs_f` / `floor_f` promoted from private into `bpp_math` under the new **Tonify Rule 20** ("two-consumer rule"). Full list and rationale in the journal.
+**Compiler gap surfaced and fixed**: `pre_reg_vars` did not recurse into `T_BLOCK` in either backend, so any synthetic block carrying `auto` declarations (DCE collapse + Phase 6.3 lowering) errored with `internal error: global '<name>' not found in data section`. One-line addition per backend.
+
+**Tonify Rule 25** documents the new `@profile` annotation + v1 caveats (early-return open zones, flat aggregation under nesting, panic leaks).
 
 **Snake remains the audio showcase** — drum loop recorded inside mini_synth (the polyphonic synthesizer in the same language) plays during gameplay, with an 880 Hz apple-eat SFX. The rhythm-teacher prototype ships alongside: four drum lanes, demo/play phases, tight hit-window scoring, and a text-file beat-map format. Phase 6's runtime profiler + minisym + panic / stack-trace / `caller_pc` infrastructure powers the Phase 1 HUD.
 
@@ -95,7 +100,7 @@ The compiler now understands effects. Every function carries a classification �
 
 The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
 
-39 compiler modules in `src/`. 20 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 128 native + 107 C-emitter tests, zero failures.
+39 compiler modules in `src/`. 20 library modules in `stb/`. 3 platform layers. 25 diagnostics. 77 keyboard inputs. 140 native + 114 C-emitter tests, zero failures.
 
 The version number is the test count.
 
@@ -198,7 +203,7 @@ You write code. You compile it. You run it.
 
 The name **stb** is a tribute to [Sean Barrett's stb libraries](https://github.com/nothings/stb) — the single-header C libraries that defined a generation of small, focused, dependency-free building blocks for graphics, audio, fonts, and data. `stb_image.h`, `stb_truetype.h`, `stb_vorbis.c`, `stb_ds.h` and the rest are how a lot of indie game developers learned that "the right amount of library" is one file you can read in an afternoon. B++'s standard library is the same idea reframed as a pure-B++ collection: small modules, no headers (B++ has no headers anyway), no third-party dependencies, the minimum API surface for the maximum game.
 
-stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 20 modules, all auto-injected by the compiler when you `import "stbgame.bsm"`.
+stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 25 modules, all auto-injected by the compiler when you `import "stbgame.bsm"`.
 
 **Rendering:**
 
@@ -207,6 +212,12 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbdraw` | Software framebuffer rendering — rects, circles, lines, sprites, text |
 | `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines, text, sprites (Metal) |
 | `stbsprite` | GPU sprite loading and rendering — any w×h, palette-indexed, JSON loader |
+| `stbshader` | Custom vertex+fragment pipelines — `gpu_pipeline_load(metal_path, vert, frag)` with cwd → install dir → walk-up resolve, `gpu_target_create / present_target` for off-screen rendering |
+| `stbfx` | Post-process effect chain — `fx_register / fx_chain_begin / fx_apply / fx_present` ping-pong infrastructure + 4 typed factories (`effect_crt`, `effect_scanlines`, `effect_chromatic`, `effect_dither`) |
+| `stbpal` | GPU palette pipeline — 7 built-in catalogs, phase-correct cycling, LUT remap, lerp |
+| `stbtexture` | Procedural textures — `texture_brick / stone / wood / solid` + `_to_buf` headless variants |
+| `stbraycast` | DDA + RayHit + per-column projection — content-blind cartridge for any 2.5D raycaster |
+| `stbprofile` | Runtime profiler HUD — REC indicator, FPS smoothed, sparkline (fixed budget reference), live top-N tally, GPU timing readout, `@profile` zone aggregates |
 | `stbfont` | 8×8 bitmap font fallback + pure B++ TrueType reader (cmap, glyf, Bezier, scanline AA) |
 | `stbcolor` | Color palette — `rgba()`, named constants (BLACK, WHITE, RED, BLUE, ...) |
 
@@ -214,9 +225,11 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 
 | Module | What it does |
 |--------|-------------|
-| `stbgame` | Game loop — init, frame timing, quit |
+| `stbgame` | Game loop — init, frame timing, quit, virtual-canvas + auto-scaled window, `game_render_begin / end` pixel-perfect helpers |
+| `stbwindow` | Standalone window for tools (no game loop, no GPU init) — used by ModuLab / mini_synth / the_bug |
 | `stbinput` | Keyboard and mouse input from memory arrays |
 | `stbui` | Immediate-mode UI widgets with per-frame arena |
+| `stbscene` | Layered backgrounds with parallax — `bg_layer_new(image, factor_x, factor_y)` + `bg_set_camera` + `bg_draw_all` |
 
 **Physics, collision & AI:**
 
@@ -548,7 +561,8 @@ b++/
 │       ├── target/aarch64_macos/ — Mach-O writer (LC_UUID + __minisym section)
 │       ├── target/x86_64_linux/  — ELF writer (PT_NOTE GNU build_id + BPPMINI)
 │       └── c/                  — C transpiler (portable escape hatch)
-├── stb/                        — Standard B Library (20 modules, game engine)
+├── stb/                        — Standard B Library (25 modules, game engine)
+├── stb/shaders/                — Metal shaders shipped with stb (pp_blit, fx_*, fps_raycast, bg_layer)
 ├── tools/mini_synth/           — Polyphonic synthesizer (300 lines)
 ├── tools/the_bug/              — `bug` debugger (CLI + GUI, single binary)
 ├── tools/modulab/              — Pixel sprite editor (Save / Save As / Open + frame strip + palette)
@@ -561,7 +575,7 @@ b++/
 ├── bang9/                      — Acme-inspired IDE that hosts the open tools as panels
 ├── examples/                   — Small demos (hello, mouse, gpu_colours, raylib/sdl)
 ├── drivers/                    — Backend drivers (SDL2, raylib — optional)
-├── tests/                      — Compiler and library tests (128 native + 107 C, 0 failures)
+├── tests/                      — Compiler and library tests (140 native + 114 C, 0 failures)
 ├── docs/                       — The unified book (how_to_dev_b++.md, 28 chapters) + journal + TODO
 ├── legacy_bootstrap/           — Earlier compiler bootstrap + archived planning docs. Read-only.
 ├── bpp                         — The compiler binary
@@ -603,7 +617,7 @@ bpp --asm source.bpp            # emit ARM64 assembly
 bpp --show-deps source.bpp     # print module dependency graph
 ```
 
-39 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 20 stb library modules. Self-hosting verified at every commit (`shasum gen1 == gen2`). The `.bo` module cache was retired in 0.23.x — every compile runs from source, ~0.27 s for the whole compiler. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
+39 compiler core modules in `src/` + backend split under `src/backend/chip/<arch>/` + `os/<os>/` + `target/<arch>_<os>/` + 25 stb library modules. Self-hosting verified at every commit (`shasum gen1 == gen2`). The `.bo` module cache was retired in 0.23.x — every compile runs from source, ~0.27 s for the whole compiler. Import search paths: `./`, `stb/`, `drivers/`, `src/`, `src/backend/chip/<arch>/`, `src/backend/os/<os>/`, `src/backend/target/<arch>_<os>/`, `/usr/local/lib/bpp/` and its subfolders.
 
 ### The Debugger
 
@@ -680,7 +694,7 @@ canonical distribution** — forks welcome, just rename your fork.
 
 ## Timeline
 
-B++ is 30 days old. The following are the milestones, in order:
+B++ is ~50 days old. The following are the milestones, in order:
 
 | Date | Milestone |
 |------|-----------|
@@ -719,6 +733,9 @@ B++ is 30 days old. The following are the milestones, in order:
 | **Apr 24** | **Tablah benchmark** — Swift hashmap benchmark ported to B++ by an external software engineer. 1M parallel key/value generation (8 workers), 1M hashmap inserts, filter pass (char + value threshold). Two variants: clean public-API (`tablah.bpp`) and hand-optimized with inlined xorshift + unrolled 9-step loop (`tablah_opt.bpp`). Drove two stdlib additions: `print_str` in `bpp_io` and the hash iteration API (`hash_cap` / `hash_slot_live` / `hash_key_at` / `hash_val_at`) in `bpp_hash`. |
 | **Apr 26-27** | **Stdlib design faxina** — Major array/string/IO design resolution. `TY_ARR` = only `arr_new()` (dynamic, 16-byte header); `buf_byte`/`buf_word` moved to `bpp_buf` as raw TY_PTR buffers — honest separation confirmed by grep: `arr_new` lives only in compiler src, never in stb/games/tools. `put(x)` smart dispatch added: compiler rewrites `put(x)` → `putstr`/`putnum`/`putfloat` by inferred type — same philosophy as `auto x = 3.14`. Fase 3 array element inference: float writes → `elem TY_FLOAT` → `DSP_GPU`; `E245` conflict error when same array receives mixed types. xfail test convention (`// xfail: EYYY`). 47 manual-loop sites replaced with canonical `str_len`/`str_cpy`/`buf_copy`/`buf_fill` calls across 11 files. Suite 117 passing. |
 | **Apr 28** | **Operators + pointer primitives + Tonify v1+v2** — `++`/`--`/`+=`/`-=`/`*=`/`/=`/`%=` desugared in parser (no new AST nodes, inherited by both backends). Ten `peek_q/h/w`/`poke_q/h/w`/`peekfloat`/`pokefloat` pointer-width primitives. Full repo tonify: R0–R20 applied across compiler src, all 22 stb modules, games, tools, Bang 9. `static auto`/`global`/`extrn`/`const` storage classes now correct on every file-scope declaration in the repo. All byte-copy loops replaced with `buf_copy`. All multi-peek LE reads replaced with `peek_h`/`peek_q`.Bang9 fix. Suite 120 passing. |
+| **May 4** | **Wolf3D Phase 1 — fps_3d.bpp walks at 60 FPS** — pure CPU raycaster (DDA + per-column textured wall blit), runtime profiler HUD with hotkey toggle, four new stb cartridges (`stbtexture` / `stbraycast` / `stbprofile` + `stbphys` Chapter FPS), nine compiler wins as side-effects (lexer scientific-notation literals, T_BLOCK type-inference recursion fix, W027 FFI float-param diagnostic, minisym PC resolver bound check, µs-precision maestro hybrid sleep + busy-wait, `sin_f`/`cos_f`/`abs_f`/`floor_f` promoted to `bpp_math` under Tonify Rule 20). Suite 132 passing. |
+| **May 5** | **V3 — function-pointer type checking** — flow analysis + opt-in `func(...)` annotations + Estrita mode. Compiler proves `fn_ptr(target)` matches the resolved callee's shape; mismatches surface as W028 / E246 at the call site instead of register-bank corruption at runtime. AAPCS64 / SysV separate-bank ABI for the `call(fp, args...)` builtin. 8 of 10 sidequests landed alongside (profile sparkline, per-thread backend, PNG decode, SIGPROF filter, FPS HUD only, palette fills public, Tier 3a HUD wire-up, WAV decode split). Suite 140 passing. |
+| **May 7** | **GPU pipeline arc CLOSED — all 7 phases shipped end-of-day**. Phase 4.1.x pixel-perfect (offscreen targets + smart-dispatch `render_clear` + `_gpu_flush_off` race fix + virtual canvas + auto-orchestration). Phase 4.2 (6 games migrated). Phase 5 stbscene (layered + parallax). Phase 6 stbfx (effect chain + 4 typed factories: CRT / scanlines / chromatic / dither). Phase 6.4 (fps_3d_gpu adopts CRT + procedural wall textures, paridade visual com fps_3d CPU). Phase 6.3 scoped zones (`@profile("name") { ... }` parser annotation lowers to runtime aggregate). Sidequests in same arc: shader install pipeline (`stb/shaders/` ships with compiler + 3-tier resolve in `gpu_pipeline_load`), sparkline normalised against fixed budget, env-fix bundle (`bpp_internal` + `bpp_bench` added to install.sh — was breaking external developers; suite cd-pinned to REPO_ROOT; `game_init` no longer auto-calls `render_init` — was destroying CPU-only games' NSImageView; SIGPROF disarmed before `job_shutdown`; A/D strafe inversion in `fps_walk`). Compiler gap fixed: `pre_reg_vars` recurses into `T_BLOCK` in both backends. Tonify Rule 25 (`@profile`). 14 commits. Suite 140 passing. |
 
 B++ went from "parser that parses itself" to "musical instrument you can play" in thirty-five days. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into [`docs/how_to_dev_b++.md`](docs/how_to_dev_b++.md), the unified 47-chapter book that absorbs the previously fragmented programming-language reference, dev guide, and Bang 9 design docs. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 

@@ -1,242 +1,302 @@
-# B++ Roadmap
+# B++ Roadmap — Pending Only
 
-## Status — 2026-04-28
+Forward-looking. What shipped lives in `docs/journal.md`. The full
+back-catalogue of completed phases (Wolf3D Phase 1, V3 fn-type
+checking, GPU pipeline arc Phases 4–7) is mirrored in commit
+history.
 
-Version 0.120. Self-hosting, dual-backend (ARM64 native macOS + x86_64
-cross-compile Linux), C emitter in parity. **Compiler backend fully
-portable**: spine owns all dispatchers, both chip backends delegate through
-`cg_prim`. Compound operators (`++`/`--`/`+=`/`-=`/`*=`/`/=`/`%=`).
-Pointer-width primitives (`peek_q/h/w`, `poke_q/h/w`, `peekfloat*`/`pokefloat*`).
-Tonify v1+v2 complete — full repo in expert state (R0–R20).
-Suite at **120 passed / 0 failed / 11 skipped**.
+## Status — 2026-05-07
 
-For the story of how we got here, see `docs/journal.md`. This file is
-forward-looking only.
+Version 0.23x. Self-hosting, dual-backend (ARM64 native macOS +
+x86_64 cross-compile Linux), C emitter in parity. Suite at
+**140 passed / 0 failed / 12 skipped** (native) +
+**114 passed / 0 failed / 38 skipped** (C). Bootstrap byte-stable
+from either repo-root or `tests/` cwd (runner pinned to REPO_ROOT
+since `c8c09e8`).
 
-**Vision.** B++ makes everything that makes a game — the art, the sound,
-AND the game itself. Version 1.0 ships when the Adventure Puzzle demo
-runs end-to-end via bangscript, the five demo games are playable, the
-full dev loop works (multi-error, debugger, profiler, hot reload,
-metaprogramming), and a stranger can download and play without thinking
-about the language it was written in.
+**GPU pipeline arc CLOSED end-of-day 2026-05-07**: pixel-perfect
+default ON, layered backgrounds with parallax, post-process effect
+chain with 4 typed effects, scoped zones via `@profile("name") {
+... }` annotation, fps_3d_gpu adopts CRT + procedural wall textures.
+The Decision Point at the end of Phase 7 stays intentionally open —
+content arc next is a player-side call.
 
 ---
 
-## The 1.0 path
+## The 1.0 path (what's left)
 
 ```
  ✅  0.22 — Foundation + multi-error (Dev Loop 1)
- ✅  0.23 — Language syntax complete, extrn + smart promotion,
-           smart dispatch Phase 1+2, cache removed, backend reorg
- ✅  Mini Cooper — bitfields, aligned malloc, constfold + DCE,
-           ternary, short-circuit, Sethi-Ullman freelist, inline
-           : base helpers, hot-local RA, batch 6 tonify, : double SIMD
-  ✅ Dev Loop 2 — `bug --break`, `--dump-str`, observer fixes
-  ✅ Type defense L1-L4 — W025/W026, effect lattice (HEAP/PANIC)
-  ✅ stbaudio + stbmixer + stbsound — audio stack shipped
-  ✅ stbinput full keyboard (77 keys, macOS + Linux)
-  ✅ synthkey — 4-octave polyphonic synth with WAV recording
-  ✅ GPU palette pipeline — stbpal, indexed Metal shader, O(1) remap
-  ✅ ModuLab 1.0 — pixel editor, 5 phases
-  ✅ Waves 18-21 — portable compiler (spine owns all dispatchers)
-  ✅ Phase D — stb faxina + parser opts + book Caps 29-47 COMPLETE
-  ✅ Tonify v1+v2 — full repo expert state + operators + pointer primitives
- ─────────────────────────────────────────────────────────────────────
-     ↓ WE ARE HERE ↓
- ─────────────────────────────────────────────────────────────────────
-     bug Phase 1 — watch list at breakpoints (~1 session, mostly wiring)
-     bug Phase 2 — type-aware display: struct/array/string tree (~2 sessions)
-     bug Phase 3 — expression evaluator: name.field, ptr[i], arithmetic (~2 sessions)
-     bug Phase 4 — interactive TUI: watch window REPL, step/continue (~2 sessions)
-  ── debugger ready ────────────────────────────────────────────────────
-     Wolf3D Phase 1  — CPU raycaster, 1 level
-     bug Phase 5 — graphical visualizers: @viz: hints, framebuffer as image
-     Wolf3D Phase 2  — hybrid CPU + GPU
-     Dev Loop 3  — profiler (reuses bug Phase 1 infrastructure)
-     Dev Loop 4 — hot reload watch mode
-     RPG Dungeon demo
-     Dev Loop 5 — metaprogramming (`$T` + reflection)
-     RTS demo
-     bangscript runtime (.bang format + engine)
-     Adventure Puzzle demo  ────────────────────────────────────►  1.0
+ ✅  0.23 — Language syntax complete, smart dispatch, Tonify v1+v2
+ ✅  Wolf3D Phase 1 — fps_3d.bpp walks at 60 FPS (CPU raycaster)
+ ✅  V3 — function-pointer type checking
+ ✅  GPU pipeline arc — Phases 4-7 (pixel-perfect → effects → @profile)
+ →  Content arc — pick one: Wolf3D Phase 2 / Adventure / RPG / RTS
+ →  Dev Loop 4 — hot reload watch mode
+ →  Dev Loop 5 — metaprogramming ($T + reflection)
+ →  bangscript runtime — .bang format + engine
+ →  Adventure Puzzle demo → 1.0
 ```
+
+Order of the next four content milestones is the player's call. The
+engine doesn't gate any of them.
 
 ---
 
-## Active — post-Tonify baseline (2026-04-28)
+## Active — content arc decision point
 
-Full history of what shipped is in `docs/journal.md`. What follows
-is the current state and what comes next.
+Engine is no longer the bottleneck. Pick one to drive the next
+sprint:
 
-### Next session targets
+### A. Wolf3D Phase 2 (~7 sessions)
 
-- **bug Phase 1** — live variable read. See `docs/bug_viz_plan.md` for full
-  architecture (RAD Debugger visualization model applied to B++).
-- Open bugs: x86_64 B1/B2 register allocation regression
+Sprites + enemies + audio + doors + level files. Uses Phase 3
+sprite batching + Phase 6 CRT. Procedural wall textures from
+Phase 6.4 stay in place; PNG-loaded artwork can swap in via
+`image_load(...).tex` without touching the shader.
 
-### ~~Open: compiler self-compile transient failure~~ — RESOLVED
+Reference: `games/fps/HANDOFF.md` (last updated for Phase 1
+close-out), `docs/games_roadtrip.md` Game 2.
 
-Was: `./bpp src/bpp.bpp -o ...` failing ~20% with garbled diagnostic
-function names or SIGSEGV. Root cause: the parser's `toks` buffer
-was malloc'd at 4 MB and each token slot is 24 bytes — capacity
-~174k slots. Self-compiling bpp.bpp with all imports crosses 174k
-tokens, the writes spilled into the next malloc'd region (vbuf in
-some heap layouts), and the spill bytes overwrote interned
-identifier text. ASLR layout decided whether the spill landed
-on vbuf or somewhere harmless.
+### B. Adventure Puzzle demo (~10 sessions)
 
-Fix: bumped `toks` to 16 MB (~700k slots). Same headroom logic
-as the 8 MB bump on tok_lines / tok_src_off that resolved the
-earlier "global 'break' not found" regression — `init_lexer`'s
-own comment had been pointing at this exact failure shape for a
-while. 10/10 successive bootstraps now produce identical hashes;
-test_bootstrap_stable.sh runs without the 8-retry workaround.
+Thimbleweed-flavored. Uses Phase 5 parallax + Phase 6 effects
+(watercolor, vignette). Bangscript runtime (`stbbangs.bsm`) is
+the foundation — see Section "bangscript runtime" below.
 
-### 0. bug Visualization — Phase 1: watch list at breakpoints
+Reference: `docs/bangscript_plan.md`, `docs/games_roadtrip.md`
+Game 5.
 
-See `docs/bug_viz_plan.md` for the full 5-phase plan and audit (inspired by Ryan
-Fleury's BSC 2025 RAD Debugger talk). **Phases 1-4 before Wolf3D** — debugging
-a complex 3D scene graph without visualization is archaeology.
+### C. RPG Dungeon (~2-3 weeks)
 
-**Audit finding**: `_print_crash_locals` in `bug_observe_macos.bsm:445` already
-reads locals via `gdb_read_mem(fp + voffs[vi], 8)` and prints name+value. Phase 1
-is mostly wiring, not new infrastructure.
+Four new modules reusable by RTS and Adventure: `stbdialogue`,
+`stbinventory`, `stbmenu`, `stbsave`. The four UI modules are
+the value; gameplay is intentionally simple.
 
-**Phase 1 scope** (~50 lines new code, no new module):
+Reference: `docs/games_roadtrip.md` Game 4.
 
-- **`bug_observe_macos.bsm`** (~10 lines): In the SIGTRAP handler, call
-  `_print_crash_locals(fi, text_base)` on every breakpoint hit — currently only
-  called on crash. Optional filter: if watch list non-empty, skip non-watched names.
+### D. RTS demo (~2-4 months for vertical slice)
 
-- **`bug.bpp`** (~20 lines): Parse `--watch name[,name2,...]`. Pass watch list
-  into `bug_run`.
+Sprite batching + zoom pixel-perfect + reactive AI. New module:
+`stbanim` (~200 LOC). Everything else reuses existing
+infrastructure.
 
-- **`bpp_bug.bsm`** + **`bug_reader.bsm`** (~20 lines): Emit `u32 data_offset`
-  per global in the `.bug` globals section. Currently globals have name/type/class
-  but no address. Resolve in `bug_observe_macos.bsm` using `data_base = text_base
-  + text_filesz` from the Mach-O parse already done at startup.
+Reference: `docs/games_roadtrip.md` Game 3.
 
-Deliverable: `bug --watch player,score ./platformer` prints watched variable
-values on every breakpoint hit. Globals (like `score`) readable alongside locals.
+---
 
-### 1. Dev Loop 3: Profiler (minimal + sampling)
+## Engine-side sidequests (not blocking content arc)
 
-Two tiers:
+These tighten the engine but don't gate any content. Pick up
+opportunistically.
 
-- **`bench("label") { ... }`** builtin. Times a block via a high-res
-  timer, prints ms/cycles. ~30 lines. Manual but immediate.
-- **Sampling profiler.** Every N ms interrupt via `setitimer(ITIMER_PROF)`,
-  capture the currently-running function via the `bug` stack walker,
-  aggregate at exit. ~300 lines. Reuses the `bug` stack walker.
+### Phase 6.3 v2 — scoped-cleanup epilogues for `@profile`
 
-Ships before Wolf3D Phase 1.
+The v1 of `@profile` ships today (commit `3dcb8e4`) but leaks
+zones on early `return` and panic. v2 emits cleanup epilogues
+that close any open zone before the actual return / panic
+unwind. ~150 LOC of compiler work — touches the `T_RET` codegen
+path and the panic handler.
 
-### 2. `stbwindow` — lightweight window + native dialogs
+Tracked under Tonify Rule 25's caveat list. Land when zone
+accounting accuracy actually matters (regression where total_us
+undercounts because of an early return).
 
-Side quest born from synthkey: opening a window + getting key
-events currently requires the full stbgame stack (GPU, framebuffer,
-game loop). Audio tools, text editors, and utilities shouldn't need
-a game engine just for a window.
+### Multi-core completion — Sprints A-G
 
-**stbwindow** (new module) provides:
-- Window open/close + event loop
-- Key press/release events (same KEY_* enum from stbinput)
-- **Native file dialogs**: NSSavePanel / NSOpenPanel on macOS,
-  Zenity or kdialog on Linux. Platform-agnostic API:
-  `window_save_dialog(title, default_name)` → returns path or 0.
-  `window_open_dialog(title, filter)` → returns path or 0.
+Full spec: [`docs/multicore_state_report.md`](multicore_state_report.md).
 
-This is frontend-agnostic — stbgame can build on top of stbwindow
-(adding GPU, framebuffer, game loop) while standalone tools use
-stbwindow directly.
+Sprint 1 + Sprint 2a/2b (`+`) shipped 2026-04-30; ~1010 LOC
+remain to close the 8 gaps end-to-end. In priority order:
 
-### 3. Rhythm Teacher demo (`games/rhythm`)
+- **Sprint A** — stride / start rewrite (~40 LOC). Today the
+  scanner detects `stride != 1` and `start != 0` but the
+  rewriter bails out to serial. A chunked `job_parallel_for`
+  variant + matching dispatch path closes both at once.
+  Unblocks SIMD-aware pixel loops and partial-iteration
+  parallel maps.
+- **Sprint B** — non-additive reductions (~30 LOC). Identity-
+  element table for `*`, `min`, `max`, `&`, `|`, `^`. Scanner
+  + rewrite already exist for `+`; this just extends the
+  identity / merge tables.
+- **Sprint C** — channels (~80 LOC). `chan_send / recv /
+  try_send / try_recv / close` on top of the SPSC ring already
+  proven in `bpp_job`. Unblocks audio→main thread events,
+  worker progress reporting.
+- **Sprint D** — atomic primitives minimum (~50 LOC).
+  `atomic_load`, `atomic_store`, `atomic_fetch_add`. Per-chip
+  primitive (a64 + x64), exposed as builtin. Unblocks
+  Naughty-Dog-style job dependency counters.
+- **Sprint E** — Linux thread parity (~500 LOC). Depends on
+  ELF dynamic linking (separately tracked above). Single
+  unblock = 8-32× parallelism on Linux hosts. **Highest
+  capability priority** — until this lands, every Linux
+  program is single-threaded regardless of dispatch.
+- **Sprint F** — CPU feature detection (~300 LOC). `cpu_has`
+  builtin + per-OS detection (sysctl on macOS, /proc/cpuinfo
+  on Linux). Enables AVX2 / SVE fast-path dispatch.
+- **Sprint G** — map / reduce sugar APIs (~50 LOC). Pure
+  ergonomic wrappers (`arr_map(in, n, fn, out)`,
+  `arr_reduce(in, n, op, init)`) — capability already exists
+  via Sprints A+B.
 
-**Game** (`docs/games_roadtrip.md` Game 1): 320×180 window, 4 lanes,
-notes scroll down, timing graded PERFECT/GOOD/OK/MISS, 3 songs,
-teacher mode (next key one bar ahead). Demo scope: 3 songs, 1
-difficulty, core loop complete.
+Recommended ordering: A → B → D → C → (ELF dynlink) → E → F →
+G. Sprints A-D land as foundation work between game features;
+E waits on the dynlink prerequisite; F+G land last.
 
-**Shipped capabilities (stbaudio Day 1-3 + stbmixer + stbsound):**
-- ✅ WAV loader/saver — `stbsound.bsm`
-- ✅ Mixer with 8 voice slots — `stbmixer.bsm`
-- ✅ SPSC ring + CoreAudio AudioQueue — `stbaudio.bsm`
-- ✅ Full keyboard input — `stbinput.bsm`
+### Tier F compiler optimizations — gating still applies
 
-**Still needed:**
-- Sample-accurate timing — bpp_beat integration at mixer level
-- Streaming background music — looped voice slot
-- Audio platform layer: CoreAudio AudioQueue on macOS; ALSA on Linux
-  deferred until ELF dynamic linking (see P1).
-sa
-Uses the maestro pattern: audio callback on an OS-owned thread, main
-thread produces samples through an SPSC ring buffer with `mem_barrier()`.
-Uses `malloc_aligned(size, 16)` for sample buffers and the B4 `vec_*`
-builtins for the mixer's float lanes. ~1-2 weeks.
+Full spec: [`docs/compiler_boost_roadmap.md`](compiler_boost_roadmap.md).
 
-### 4. Wolf3D Phase 1 — CPU raycaster, 1 level
+Three multi-node optimization passes (CSE, RegAlloc v2, Auto-
+vectorization) that are intentionally DEFERRED until profile
+data justifies them. Doc gating:
 
-**Game** (`docs/games_roadtrip.md` Game 2): pure CPU raycaster, every
-pixel computed and written by B++ code. Demo scope: 1 playable level,
-1 enemy type, 1 weapon, core raycaster at 60 fps, playable start to
-finish. If this hits 60 fps on Apple Silicon, B++ is proven for real
-game work. Depends on Dev Loops 1-3. Assets: shareware Wolfenstein 3D
-Episode 1 files. ~4-6 weeks.
+> **Do not open Tier F until:**
+> 1. A real plugin exists, runs, and is profiled.
+> 2. The profile shows one of: CSE waste, register spill /
+>    reload time, scalar-inner-loop dominance.
+> 3. Someone owns the resulting project end-to-end.
 
-### 5 Wolf3D Phase 2 — hybrid CPU + GPU
+Status today (2026-05-07): none of the three conditions have
+fired. Single-node opts (Phase D-style strength reduction,
+inline trivials) continue to land opportunistically and capture
+the wins that don't need profile evidence. Tier F sits as a
+shovel-ready 2-3-week project per pass when a real consumer
+flags the bottleneck.
 
-CPU does math (raycaster, projection, sort); GPU handles texture
-sampling + blending via `_stb_gpu_vertex` quads. Same pattern as Doom 64.
-No new modules, no shader changes — mechanical translation of the CPU
-loop into GPU quad emission. ~2-3 weeks.
+### Linux Vulkan parity for the GPU pipeline
 
-### 6. Dev Loop 4: Hot reload watch mode
+`stb/_stb_gpu_linux_vulkan.bsm` (new). Mirrors the macOS Metal
+layer: device + command queue + render pipeline + texture upload
++ vertex buffer. ~1500 LOC of dedicated work. Unlocks GPU games
+on Linux end-to-end. Doesn't block any phase — Phase 4–6 ship on
+macOS today, Linux remains "cross-compiles but doesn't run GPU"
+until parity arrives.
 
-`bpp --watch game.bpp`. Detect source change, recompile to a fresh
-`/tmp` path, kill old process, restart. Not live code injection —
-full restart automation. Ships before RPG. ~200 lines (shell + compiler
-flag + process management).
+### `effect_palette_quantize` — the 5th effect
 
-### 7. RPG Dungeon demo
+Deferred from Phase 6.2. Needs real stbpal integration (palette
+uploaded as a 1D texture or constant array, per-pixel
+nearest-colour search in the fragment shader). ~100 LOC. Ships
+when an actual game asks for indexed-palette post-process.
 
-**Game** (`docs/games_roadtrip.md` Game 4): 1 dungeon room, 1 NPC with
-dialogue, 1 enemy, 1 item, pause menu with save/load.
+### `fx_playground` tool (`tools/fx_playground/`)
 
-**New modules** (reused by RTS and Adventure):
-- `stbdialogue.bsm` — dialogue boxes, word wrap, choices (~200 lines)
-- `stbinventory.bsm` — item slots, icons (~150)
-- `stbmenu.bsm` — nested menus, keyboard nav (~200)
-- `stbsave.bsm` — save/load state (~150)
+Inspired by the `fx_library_smoke`. Standalone tool that loads
+.metal files with hot-reload, exposes uniform sliders, and
+exports the rendered result. Would turn stbfx into a public
+shader playground beyond just B++ developers.
 
-~2-3 weeks. Gameplay simple; the four UI modules are the value.
+User flagged this idea during Phase 6.2 testing; not on any
+formal roadmap yet.
 
-### 8. Dev Loop 5: Metaprogramming (`$T` + reflection)
+### x86_64 perf parity on Linux — B1 freelist + B2 inline
 
-Lands during RTS, not before. Two features:
+ARM64 has the full Mini Cooper Phase B stack. x86_64 carries
+only B3 on Linux: B1 + B2 were reverted after a bisect-confirmed
+regression.
 
-- **`$T` generic parameters**: `swap($T, a, b) { auto tmp: T; ... }`.
-  Compiler instantiates one AST copy per concrete type used. ~400 lines.
-- **Compile-time struct reflection + code emission**:
-  `const generate_serializers(T) { ... }` reads field metadata at compile
-  time, emits `save_unit`, `save_building`, etc. Seed exists in
-  `const FUNC`; the leap is exposing struct field metadata and
-  `emit_function` that injects into the AST. ~1100-2000 lines.
+**Unblock path:**
+1. Ship `bug` Linux/x86_64 support (gdbserver backend) — first.
+2. Single-step through the self-host crash with the debugger.
+3. Restore B1 x64 changes one hunk at a time with
+   instruction-byte diffs against ARM64's emission.
+4. Re-enable B2 inline.
 
-Also the foundation for bangscript's `scene { }` block rewriting.
+### C-emitter `var T` parity
 
-### 9. RTS demo
+Native and C disagree on the storage location of `var s: Pt`
+locals. Native allocates a stack slot and `&s` is FP-relative.
+C lowers `var s` to `long long s[N]` (array decay-as-pointer),
+and `&s` had to be special-cased in the T_ADDR emitter.
 
-**Game** (`docs/games_roadtrip.md` Game 3): 1 map, 2 unit types, 1
-building, combat + pathfinding + audio + UI + reactive AI. New
-module: `stbanim.bsm` (sprite animation frames + direction tables,
-~200 lines). Everything else reuses existing stb infrastructure.
-~2-4 months for the vertical slice.
+Forward path (when a real consumer hits this — currently no
+game needs it):
 
-### 10. bangscript runtime (.bang format + engine)
+1. Pick one storage strategy for `var T` and document it across
+   both backends. Most likely "always heap-backed" — uniform,
+   predictable, and `var p: Pt` becomes literal sugar for
+   `auto p: Pt; p = malloc(sizeof(Pt));` with a matching
+   `free` at scope exit.
+2. Update native `_a64_emit_addr_local` and the C T_VAR/T_ADDR
+   emit paths to share the same address calculation rule.
+3. Add a regression test that takes `&local_struct`, passes it
+   to another function, and reads a field both directions.
 
-Adventure game DSL. Full spec in `docs/bangscript_plan.md`. **Zero
-compiler extensions.** `.bang` files are data parsed at runtime; the
-engine is a pure B++ module.
+### `bug` headless detection
+
+`bug file.bug` (no `--dump`) routes to the GUI viewer. In a
+headless environment (CI, piped invocation, no DISPLAY/
+WindowServer), Cocoa opens the window and waits for the event
+loop with no human to drive it. Today the only signal is a
+one-line stderr hint at GUI launch. When stdin/stdout is
+verifiably not a TTY, auto-fallback to `--dump` instead. Needs
+`isatty(0)` — `sys_ioctl(0, TIOCGETA, ...)` or
+`sys_fstat(0)` checking `S_IFCHR`. ~30 LOC.
+
+Defer until: someone files an actual issue or runs `bug` in CI.
+
+### ELF dynamic linking
+
+B++ x86_64 emits only static ELF today. Adding PLT/GOT,
+`DT_NEEDED`, `PT_INTERP`, `dlopen`/`dlsym` builtins unlocks:
+- Vulkan on Linux (libvulkan via dlopen)
+- ALSA for stbaudio Linux backend
+- Any FFI module on Linux (libpng, sqlite, curl)
+
+~2-3 days of focused work. Snake maestro and Rhythm Teacher on
+Linux both wait on this.
+
+### Host-aware compiler + install
+
+Today `bpp` defaults to macOS arm64 and cross-compiles via
+`--linux64`. Vision: detect host OS+chip at startup and default
+to that target. On Linux x86_64, `bpp game.bpp` produces a
+Linux ELF with no flag. `install.sh` mirrors it.
+Cross-compilation stays available via `--target`.
+
+### Refinements (each under 50 lines, land while touching the file)
+
+- **`--stats` compiler flag** (~40 lines): module count, function/
+  global/struct counts, peak tokens, wall-clock.
+- **Arena-backed AST in the parser** (~30-50): swap per-node
+  `malloc` for `arena_alloc(mod_arena, NODE_SZ)`. `stbarena`
+  already exists — wiring only.
+- **`mem_track` for games** (~50): `mem_alloc(size, tag)` records
+  (tag, size) in a static array; `mem_report()` prints per-tag
+  totals.
+- **Function dedup polish**:
+  - `main()` in `.bsm` = fatal error (E223). ~5 LOC.
+  - `stub` keyword marks intentional override targets; dedup
+    treats `stub → real` as always silent. ~30 LOC.
+
+### Small quality items
+
+- **FFI auto-marshalling** — compiler knows FFI param types but
+  ignores them; fixing eliminates `(long long)` casts at call
+  sites.
+- **Struct field sugar for compiler internals** —
+  `*(rec + FN_NAME)` → `rec.name` for compiler-internal structs.
+  ~20 locations.
+- **Multi-return values** — `return a, b;` + `x, y = foo();`.
+  Eliminates the `float_ret` / `float_ret2` hack.
+- **Retina support** — `contentsScale = 2.0` on CAMetalLayer.
+  Render at 2× physical pixels. Trivial once there's a reason.
+- **Test all games via the C emitter** — only `snake_gpu` and
+  `snake_raylib` have been verified end-to-end through
+  `bpp --c → gcc → run`.
+- **bootstrap.c regeneration** — currently ARM64-only, needs
+  regen with the current C emitter. Low priority until someone
+  wants to bootstrap on a platform B++ doesn't run on yet.
+
+---
+
+## bangscript runtime (.bang format + engine)
+
+Adventure game DSL. Full spec in `docs/bangscript_plan.md`.
+**Zero compiler extensions.** `.bang` files are data parsed at
+runtime; the engine is a pure B++ module.
 
 Runtime modules (~980 lines):
 - `stbbangs.bsm` (~700) — `.bang` parser + coroutine scheduler +
@@ -244,150 +304,52 @@ Runtime modules (~980 lines):
 - `stbverb.bsm` (~200) — SCUMM-style verb/interaction system
 - `stbcursor.bsm` (~80) — cursor state machine
 
-Could land as early as after RPG.
-
-### 11. Adventure Puzzle demo → 1.0
-
-**Game** (`docs/games_roadtrip.md` Game 5): 1 scene, 3-5 hotspots,
-1 multi-step puzzle, verb system, cutscene. Stretch: episode zero
-(3-4 scenes, 20-30 min). ~4-6 weeks for the prologue. When a player
-downloads it, solves the puzzle, watches the cutscene and finishes
-without thinking about the language — B++ ships as 1.0.
+Could land as early as the Adventure Puzzle demo prep.
 
 ---
 
-## Adjacent — opportunistic (not blocking 1.0)
+## Hot reload watch mode (Dev Loop 4)
 
-### x86_64 perf parity on Linux — B1 freelist + B2 inline
+`bpp --watch game.bpp`. Detect source change, recompile to a
+fresh `/tmp` path, kill old process, restart. Not live code
+injection — full restart automation. ~200 lines (shell + compiler
+flag + process management). Ships before RPG.
 
-ARM64 has the full Mini Cooper Phase B stack. x86_64 carries only B3
-on Linux: B1 + B2 were reverted after a bisect-confirmed regression
-that crashes `bpp` self-host on Linux. Narrower probes (freelist off,
-inline hoist, `_x64_has_call` always-1) did not isolate the trigger.
+---
 
-Impact: Linux self-compile ~37% slower than macOS ARM64. No
-correctness gap — emitted code is valid x86_64, just not as tight.
+## Metaprogramming (Dev Loop 5)
 
-**Unblock path:**
-1. Ship `bug` Linux/x86_64 support (gdbserver backend) — first.
-2. Single-step through the self-host crash with the debugger.
-3. Restore B1 x64 changes one hunk at a time with instruction-byte
-   diffs against ARM64's emission.
-4. Re-enable B2 inline.
+Lands during RTS, not before. Two features:
 
-### C-emitter `var T` parity
+- **`$T` generic parameters**: `swap($T, a, b) { auto tmp: T;
+  ... }`. Compiler instantiates one AST copy per concrete type
+  used. ~400 lines.
+- **Compile-time struct reflection + code emission**:
+  `const generate_serializers(T) { ... }` reads field metadata
+  at compile time, emits `save_unit`, `save_building`, etc.
+  Seed exists in `const FUNC`; the leap is exposing struct field
+  metadata and `emit_function` that injects into the AST.
+  ~1100-2000 lines.
 
-Native and C disagree on the storage location of `var s: Pt` locals.
-Native allocates a stack slot and `&s` is FP-relative. C lowers `var s`
-to `long long s[N]` (array decay-as-pointer), and `&s` had to be
-special-cased in the T_ADDR emitter so it doesn't apply `&` to an rvalue
-cast (commit `87b5746`). The fix patched the symptom; the underlying
-asymmetry remains and will resurface the next time someone passes
-`&local_struct` between functions in code that must compile through `--c`.
-
-Forward path (when a real consumer hits this — currently no game
-needs it):
-
-1. Pick one storage strategy for `var T` and document it across both
-   backends. Most likely "always heap-backed" — uniform, predictable,
-   and `var p: Pt` becomes literal sugar for `auto p: Pt; p = malloc(sizeof(Pt));`
-   with a matching `free` at scope exit.
-2. Update native `_a64_emit_addr_local` and the C T_VAR/T_ADDR emit
-   paths to share the same address calculation rule.
-3. Add a regression test that takes `&local_struct`, passes it to
-   another function, and reads a field both directions — must pass on
-   native + C + cross-compile.
-
-Workaround until then: prefer `auto p: Pt; p = malloc(...);` (heap)
-over `var p: Pt` (stack-on-native, array-decay-on-C) when source must
-compile through `--c` and the address is taken. See
-`bootstrap_manual.md` "C Emitter (portable C output)" section for the
-full discussion.
-
-### `bug` headless detection
-
-`bug file.bug` (no `--dump`) routes to the GUI viewer. In a headless
-environment (CI, piped invocation, no DISPLAY/WindowServer), Cocoa
-opens the window and waits for the event loop with no human to drive
-it — the process appears to hang. Today the only signal is a one-line
-stderr hint we print at GUI launch ("opening GUI; pass --dump for text
-output"); when stdin/stdout is verifiably not a TTY, we should
-auto-fallback to `--dump` instead. Needs an `isatty(0)` helper either
-via `sys_ioctl(0, TIOCGETA, &termios)` or `sys_fstat(0)` checking
-`S_IFCHR`. ~30 LOC including the 4-layer plumbing for whichever syscall
-we lift to a builtin.
-
-Defer until: someone files an actual issue or runs `bug` in CI again.
-
-### ELF dynamic linking
-
-B++ x86_64 emits only static ELF today. Adding PLT/GOT, `DT_NEEDED`,
-`PT_INTERP`, `dlopen`/`dlsym` builtins unlocks:
-- Vulkan on Linux (libvulkan via dlopen)
-- ALSA for stbaudio Linux backend (Rhythm Teacher on Linux)
-- Any FFI module on Linux (libpng, sqlite, curl)
-
-~2-3 days of focused work. Snake maestro and Rhythm Teacher on Linux
-both wait on this.
-
-### Host-aware compiler + install
-
-Today `bpp` defaults to macOS arm64 and cross-compiles via `--linux64`.
-Vision: detect host OS+chip at startup and default to that target. On
-Linux x86_64, `bpp game.bpp` produces a Linux ELF with no flag.
-`install.sh` mirrors it. Cross-compilation stays available via
-`--target`. Transforms B++ from "macOS tool that cross-compiles" into
-"native tool that adapts to the host."
-
-### Refinements (each under 50 lines, land while touching the file)
-
-- **`--stats` compiler flag** (~40 lines): module count (cached vs
-  stale), function/global/struct counts, peak tokens, wall-clock.
-- **Arena-backed AST in the parser** (~30-50): swap per-node `malloc`
-  for `arena_alloc(mod_arena, NODE_SZ)`. `stbarena` already exists —
-  wiring only.
-- **`mem_track` for games** (~50): `mem_alloc(size, tag)` records
-  (tag, size) in a static array; `mem_report()` prints per-tag totals.
-- **Function dedup Fix 2 + Fix 3**:
-  - Fix 2 (~5): `main()` in `.bsm` = fatal error (E223).
-  - Fix 3 (~30): `stub` keyword marks intentional override targets;
-    dedup treats `stub → real` as always silent.
-
-### Small quality items
-
-- **FFI auto-marshalling** — compiler knows FFI param types but
-  ignores them; fixing eliminates `(long long)` casts at call sites.
-- **Struct field sugar for compiler internals** — `*(rec + FN_NAME)`
-  → `rec.name` for compiler-internal structs. ~20 locations.
-- **Multi-return values** — `return a, b;` + `x, y = foo();`.
-  Eliminates the `float_ret` / `float_ret2` hack.
-- **Retina support** — `contentsScale = 2.0` on CAMetalLayer. Render
-  at 2× physical pixels. Trivial once there's a reason.
-- **Test all games via the C emitter** — only `snake_gpu` and
-  `snake_raylib` have been verified end-to-end through `bpp --c → gcc
-  → run`.
-- **bootstrap.c regeneration** — currently ARM64-only, needs
-  regen with the current C emitter. Low priority until someone wants
-  to bootstrap on a platform B++ doesn't run on yet.
+Also the foundation for bangscript's `scene { }` block
+rewriting.
 
 ---
 
 ## Deferred — tracked, revisit when demand arises
 
-- **C emitter SIMD mapping (`: double` + `vec_*`)** — native backends
-  (NEON, SSE2) emit `vec_*` as instructions. The C transpile path
-  needs `: double` locals typed as `__m128` and the eleven builtins
-  mapped to `_mm_*` intrinsics. Today the emitter uses `long long`
-  for every local unconditionally — invasive change. Zero demand
-  from `bpp --c` today. Tracked; lands when the C backend sees real
-  SIMD demand.
-- **`restrict` keyword** — useful only when the native codegen does
-  aliasing-aware optimization. Not part of Mini Cooper. For the C
-  transpile path, a parser-level no-op pass-through would let it flow
-  through to gcc. Revisit post-1.0.
+- **C emitter SIMD mapping (`: double` + `vec_*`)** — native
+  backends (NEON, SSE2) emit `vec_*` as instructions. The C
+  transpile path needs `: double` locals typed as `__m128` and
+  the eleven builtins mapped to `_mm_*` intrinsics. Today the
+  emitter uses `long long` for every local unconditionally —
+  invasive change. Zero demand from `bpp --c` today.
+- **`restrict` keyword** — useful only when the native codegen
+  does aliasing-aware optimization. Not part of Mini Cooper.
+  Revisit post-1.0.
 - **`offsetof` / field reflection** — P1 for bangscript runtime.
-  Exposes compile-time field offsets as runtime constants; enables
-  auto-generated serializers. Separate task.
+  Exposes compile-time field offsets as runtime constants;
+  enables auto-generated serializers. Separate task.
 - **Prefetch builtins (`__builtin_prefetch`)** — add when real
   profiling on RTS-sized workloads shows the win.
 - **Full aliasing-aware optimizer** — post-1.0. Not in scope.
@@ -399,10 +361,16 @@ Linux x86_64, `bpp game.bpp` produces a Linux ELF with no flag.
 | Module | Status | Notes |
 |---|---|---|
 | `stbtile.bsm` | ✅ | Tilemap engine |
-| `stbphys.bsm` | ✅ | Physics with milli-units |
+| `stbphys.bsm` | ✅ | Physics with milli-units + FPSBody chapter |
 | `stbpath.bsm` | ✅ | A* pathfinding |
+| `stbtexture.bsm` | ✅ | Procedural textures (brick / stone / wood / solid) |
+| `stbraycast.bsm` | ✅ | DDA + RayHit + per-column projection |
+| `stbprofile.bsm` | ✅ | Runtime profiler HUD + `@profile` zone aggregates |
+| `stbscene.bsm` | ✅ | Layered backgrounds with parallax (Phase 5) |
+| `stbshader.bsm` | ✅ | Custom pipelines + `gpu_target_*` (Phase 4.1.x) |
+| `stbfx.bsm` | ✅ | Effect chain + 4 typed effects (Phase 6.1+6.2) |
 | `bpp_hash.bsm` | ✅ | Hash maps (used by compiler) |
-| `stbaudio.bsm` | ✅ | CoreAudio + SPSC ring, 111 tests |
+| `stbaudio.bsm` | ✅ | CoreAudio + SPSC ring |
 | `stbdialogue.bsm` | P0 | RPG (dialogue boxes, choices) |
 | `stbinventory.bsm` | P0 | RPG (item slots) |
 | `stbmenu.bsm` | P0 | RPG (nested menus) |
@@ -419,49 +387,53 @@ Linux x86_64, `bpp game.bpp` produces a Linux ELF with no flag.
 ## Known open bugs
 
 - **`call()` float args on x86_64** — `call(fp, args...)` ignores
-  float arguments on x86_64. Doesn't affect native function calls,
-  only the indirect `call()` builtin.
-- **String dedup across modules** — duplicate strings across modules
-  create duplicate entries in the data segment. Harmless but wasteful.
-- **`bootstrap.c` is ARM64-only** — see the refinement above.
+  float arguments on x86_64. Doesn't affect native function
+  calls, only the indirect `call()` builtin.
+- **String dedup across modules** — duplicate strings across
+  modules create duplicate entries in the data segment. Harmless
+  but wasteful.
+- **`bootstrap.c` is ARM64-only** — see refinements above.
+- **`@profile` v1 leaks open zones on early return / panic** —
+  documented in Tonify Rule 25 caveats. Phase 6.3 v2 above
+  fixes via cleanup epilogues.
 
 ---
 
 ## Post-1.0 (scaling from demo to real game)
 
-The 1.0 demos prove B++ delivers each game category. Scaling from
-"1 demo level" to "full shipping game" requires the infrastructure
-below. Each item is a 2-6 week project that adds capability without
-changing the language.
+The 1.0 demos prove B++ delivers each game category. Scaling
+from "1 demo level" to "full shipping game" requires the
+infrastructure below. Each item is a 2-6 week project that adds
+capability without changing the language.
 
-- **Parallel codegen per module** — use the maestro job pool to make
-  codegen multi-threaded. Becomes worthwhile at 50K+ lines.
-- **Asset streaming (`stbasset.bsm`)** — load/unload on demand, atlas
-  packing, manifest, background loading thread. ~500-1000 lines.
-- **Memory budget system** — per-system allocation limits, warnings
-  on overshoot, defrag for long sessions.
-- **True live code reload** — preserve world state across recompile.
-  Serialize → relink changed module → deserialize. Basically a
-  second linker.
-- **Multi-error recovery across modules** — current multi-error log
-  is per-compilation. In a 200-module codebase, cross-module type
-  errors need smarter recovery (Rust/TypeScript-level).
+- **Parallel codegen per module** — use the maestro job pool to
+  make codegen multi-threaded. Becomes worthwhile at 50K+ lines.
+- **Asset streaming (`stbasset.bsm`)** — load/unload on demand,
+  atlas packing, manifest, background loading thread. ~500-1000
+  lines.
+- **Memory budget system** — per-system allocation limits,
+  warnings on overshoot, defrag for long sessions.
+- **True live code reload** — preserve world state across
+  recompile. Serialize → relink changed module → deserialize.
+  Basically a second linker.
+- **Multi-error recovery across modules** — current multi-error
+  log is per-compilation. In a 200-module codebase, cross-module
+  type errors need smarter recovery.
 - **Profiler GUI (timeline view)** — Chrome-style timeline,
-  per-frame breakdown, memory + GPU profilers. Likely a standalone
-  `stbtool` that reads a binary trace file.
+  per-frame breakdown, memory + GPU profilers. Likely a
+  standalone `stbtool` that reads a binary trace file.
 - **Networking (`stbnet.bsm`)** — TCP/UDP, state serialization,
   prediction/rollback. ~500-800 lines.
 - **Target architecture refactor** — chip vs OS split. Trigger:
   first chip+OS combo that doesn't fit today's folders
   (Linux ARM, Intel macOS, Windows x86_64).
-- **Vulkan GPU on Linux** — after ELF dynamic linking. libvulkan
-  via dlopen, `VK_KHR_xlib_surface` bridge to the existing X11 wire
-  protocol. Docker on macOS has no GPU passthrough — real testing
-  needs Linux hardware.
-- **Tools & editors** — sprite editor, tilemap editor, level
-  designer, particle editor. Thin shells over stb modules.
-- **Audio tools (CLAP plugin support)** — `--plugin` flag, `export`
-  keyword, DSP primitives.
+- **Vulkan GPU on Linux** — see "Linux Vulkan parity" sidequest
+  above. Same scope.
+- **Tools & editors** — sprite editor (ModuLab ✅), tilemap
+  editor, level designer (level_editor ✅), particle editor.
+  Thin shells over stb modules.
+- **Audio tools (CLAP plugin support)** — `--plugin` flag,
+  `export` keyword, DSP primitives.
 - **Windows / WebAssembly** — new codegen backends. Big work.
-- **EmacsOS distribution** — custom Linux distro: Emacs (EXWM) as
-  DE, B++ games in X11 windows. Vision project.
+- **EmacsOS distribution** — custom Linux distro: Emacs (EXWM)
+  as DE, B++ games in X11 windows. Vision project.
