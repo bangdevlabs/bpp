@@ -19,6 +19,13 @@ import "x64_enc.bsm";
 
 extrn x64_ret_lbl;
 
+// Phase 6.3 v2 — read by `_x64_emit_frame_teardown` to decide
+// whether to wrap the epilogue with a `_prof_save_drain` call.
+// Set per function in `cg_emit_func`.
+extrn cg_cur_fn_has_profile;
+extrn _zone_save_drain_p;
+extrn x64_fn_lbl;
+
 // ── Move / compare ──
 
 // Set the result register (rax) to zero. `xor rax, rax` is the
@@ -567,14 +574,48 @@ void _x64_emit_arg_int_to_flt(flt_seq, src_int_seq) {
 void _x64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
     x64_enc_store_sd(abi_seq_idx, 5, frame_off);
 }
-// Epilogue: define return label, restore promoted regs from
-// frame spill slots (negative offsets from x64_b3_spill_off),
-// restore rbp, ret. Reads x64_promoted_regs and
-// x64_b3_spill_off directly; caller only passes frame_size
-// (unused currently but kept for signature consistency with a64).
+// Phase 6.3 v2 — emit a call to `_prof_save_drain` while keeping
+// the function's int + float return values (rax, xmm0) intact.
+// Called from `_x64_emit_frame_teardown` between the epilogue
+// label definition and the frame restore.
+//
+// Stack discipline: at the epilogue label, rsp ≡ 8 mod 16 (push
+// rbp + frame). Reserve 24 bytes — 16 for {rax, xmm0} saves at
+// [rsp] / [rsp+8], 8 for alignment. After `sub $24, %rsp` the
+// rsp is 0 mod 16, the CALL pushes 8 of return addr making it
+// 8 mod 16 inside the callee (whose own prologue's `push rbp`
+// realigns). Standard SysV pattern.
+//
+// Skipped silently when cg_find_fn(_zone_save_drain_p) returns
+// -1: that means the user reached this primitive without
+// importing stbprofile.bsm, which would already be a link
+// failure for `_prof_zone_enter` itself. Belt-and-suspenders.
+void _x64_emit_drain_call_preserve_ret() {
+    auto fi, lbl;
+    fi = cg_find_fn(_zone_save_drain_p);
+    if (fi < 0) { return 0; }
+    lbl = arr_get(x64_fn_lbl, fi);
+    x64_enc_sub_imm(4, 24);          // sub rsp, 24
+    x64_enc_store(0, 4, 0);          // mov [rsp], rax
+    x64_enc_store_sd(0, 4, 8);       // movsd [rsp + 8], xmm0
+    x64_enc_call_label(lbl);
+    x64_enc_load(0, 4, 0);           // mov rax, [rsp]
+    x64_enc_load_sd(0, 4, 8);        // movsd xmm0, [rsp + 8]
+    x64_enc_add_imm(4, 24);          // add rsp, 24
+}
+
+// Epilogue: define return label, optionally drain open @profile
+// zones (Phase 6.3 v2), restore promoted regs from frame spill
+// slots (negative offsets from x64_b3_spill_off), restore rbp,
+// ret. Reads x64_promoted_regs and x64_b3_spill_off directly;
+// caller only passes frame_size (unused currently but kept for
+// signature consistency with a64).
 void _x64_emit_frame_teardown(frame_size) {
     auto i, n, reg, off;
     x64_enc_def_label(x64_ret_lbl);
+    if (cg_cur_fn_has_profile != 0) {
+        _x64_emit_drain_call_preserve_ret();
+    }
     n = arr_len(x64_promoted_regs);
     for (i = 0; i < n; i++) {
         reg = arr_get(x64_promoted_regs, i);

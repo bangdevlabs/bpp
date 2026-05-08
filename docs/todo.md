@@ -90,18 +90,6 @@ Reference: `docs/games_roadtrip.md` Game 3.
 These tighten the engine but don't gate any content. Pick up
 opportunistically.
 
-### Phase 6.3 v2 — scoped-cleanup epilogues for `@profile`
-
-The v1 of `@profile` ships today (commit `3dcb8e4`) but leaks
-zones on early `return` and panic. v2 emits cleanup epilogues
-that close any open zone before the actual return / panic
-unwind. ~150 LOC of compiler work — touches the `T_RET` codegen
-path and the panic handler.
-
-Tracked under Tonify Rule 25's caveat list. Land when zone
-accounting accuracy actually matters (regression where total_us
-undercounts because of an early return).
-
 ### Multi-core completion — Sprints A-G
 
 Full spec: [`docs/multicore_state_report.md`](multicore_state_report.md).
@@ -393,9 +381,10 @@ rewriting.
   modules create duplicate entries in the data segment. Harmless
   but wasteful.
 - **`bootstrap.c` is ARM64-only** — see refinements above.
-- **`@profile` v1 leaks open zones on early return / panic** —
-  documented in Tonify Rule 25 caveats. Phase 6.3 v2 above
-  fixes via cleanup epilogues.
+- **`@profile` nested zones aggregate FLAT** — parent total_us
+  includes children's time. Hierarchical breakdown deferred to
+  v3 when a real consumer needs it. (v1 leak on early-return /
+  panic CLOSED 2026-05-08 — scoped-cleanup epilogues shipped.)
 
 ---
 

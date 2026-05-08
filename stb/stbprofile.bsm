@@ -107,6 +107,14 @@ const _PROFILE_ZONE_MAX      = 16;
 const _PROFILE_ZONE_STACK    = 8;
 const _PROFILE_ZONE_HUD_TOP  = 4;
 
+// Phase 6.3 v2 — per-function depth-snapshot stack. Each profiled
+// function pushes the live `_profile_zone_stack_depth` at entry and
+// pops it at exit; the pop drains every zone above the saved depth,
+// closing the leaks v1 left open on early `return` and panic.
+// 32 frames covers any sane call depth — recursion into a profiled
+// function counts as one save per frame.
+const _PROF_SAVE_MAX         = 32;
+
 // ── State ────────────────────────────────────────────────────
 
 // 0 = idle, 1 = sampling. Edge-toggled by `profile_hud_toggle`.
@@ -158,6 +166,19 @@ global _profile_zone_count;
 extrn _profile_zone_stack;
 global _profile_zone_stack_depth;
 
+// Phase 6.3 v2 — depth-snapshot stack for early-return / panic
+// cleanup. Codegen pairs `_prof_save_enter` / `_prof_save_drain`
+// around every function that contains `@profile` blocks.
+extrn _profile_save_stack;
+global _profile_save_depth;
+
+// Cross-module hook: `bpp_runtime`'s `panic` reads this fp and,
+// if non-null, calls it before printing the trace. `init_profile`
+// installs `_prof_drain_all` here so panic-time profile dumps see
+// matched enter/exit pairs even when the abort path skipped the
+// scoped epilogue.
+extrn _prof_drain_all_fp;
+
 // ── Init ─────────────────────────────────────────────────────
 
 // Reset all state to idle / defaults and pre-allocate the live HUD
@@ -184,6 +205,15 @@ void init_profile() {
     _profile_zone_stack       = buf_byte(_PROFILE_ZONE_STACK * 16);
     _profile_zone_count       = 0;
     _profile_zone_stack_depth = 0;
+
+    // Phase 6.3 v2 — per-function depth-snapshot stack.
+    _profile_save_stack       = buf_byte(_PROF_SAVE_MAX * 8);
+    _profile_save_depth       = 0;
+
+    // Phase 6.3 v2 — register the drain hook so `panic()` can
+    // close open zones at abort time. Idempotent across repeated
+    // `init_profile` calls (same fp every time).
+    _prof_drain_all_fp        = fn_ptr(_prof_drain_all);
 }
 
 // ── Phase 6.3 scoped zones — runtime support ─────────────────
@@ -262,6 +292,95 @@ void _prof_zone_exit(name_p) {
 void profile_zones_reset() {
     buf_fill(_profile_zone_table, 0, _PROFILE_ZONE_MAX * 24);
     _profile_zone_count = 0;
+}
+
+// Phase 6.3 v2 — scoped-cleanup epilogues
+// ============================================================
+//
+// v1 left `@profile` zones open whenever control left the lexical
+// block by any path other than fall-through (early `return`,
+// `panic`, `sys_exit`). The next `_prof_zone_enter` would still
+// pop the orphan eventually, but the elapsed time was credited to
+// whichever zone happened to be on top at exit — silent
+// mis-attribution.
+//
+// v2 closes the leak by pairing every function that contains
+// `@profile` with a depth snapshot. The codegen emits
+// `_prof_save_enter` immediately after the prologue and
+// `_prof_save_drain` immediately after the epilogue label, so:
+//
+//   - fall-through:   drain finds depth == saved → no-op.
+//   - early return:   T_RET jumps to the epilogue label → drain
+//                     pops every zone the body left open.
+//   - panic:          `panic()` calls `_prof_drain_all()` itself
+//                     before sys_exit, so the zone stack matches
+//                     reality even if the user dumps the profile
+//                     between panic and process exit.
+//
+// Recursion into a profiled function pushes a separate save slot
+// per frame, so each level cleans up independently. Nesting
+// beyond `_PROF_SAVE_MAX` silently no-ops (matches the v1 zone-
+// stack overflow contract).
+//
+// Push the live zone-stack depth onto the save-stack. Codegen
+// emits a call to this right after the function prologue.
+void _prof_save_enter() {
+    if (_profile_save_depth >= _PROF_SAVE_MAX) { return 0; }
+    write_u64(_profile_save_stack, _profile_save_depth * 8,
+              _profile_zone_stack_depth);
+    _profile_save_depth++;
+}
+
+// Pop one save-stack entry and drain every zone above it,
+// crediting elapsed time to each popped zone's slot. Called from
+// the function epilogue with the return value preserved by the
+// codegen wrapper around the call. Internal accounting mirrors
+// `_prof_zone_exit` so v1 and v2 attribute time identically — the
+// only difference is v2 never relies on the body to reach the
+// matching exit call.
+void _prof_save_drain() {
+    if (_profile_save_depth <= 0) { return 0; }
+    _profile_save_depth--;
+    auto target;
+    target = read_u64(_profile_save_stack, _profile_save_depth * 8);
+    while (_profile_zone_stack_depth > target) {
+        _profile_zone_stack_depth--;
+        auto off, name_p, start_us, elapsed, slot;
+        off      = _profile_zone_stack_depth * 16;
+        name_p   = read_u64(_profile_zone_stack, off);
+        start_us = read_u64(_profile_zone_stack, off + 8);
+        elapsed  = beat_now_us() - start_us;
+        slot     = _zone_slot(name_p);
+        if (slot >= 0) {
+            write_u64(_profile_zone_table, slot +  8,
+                      read_u64(_profile_zone_table, slot +  8) + elapsed);
+            write_u64(_profile_zone_table, slot + 16,
+                      read_u64(_profile_zone_table, slot + 16) + 1);
+        }
+    }
+}
+
+// Drain every open zone, regardless of save-stack state. Called
+// by `panic()` before sys_exit so a profile dump between panic
+// and process termination reflects accurate counts. Does NOT
+// touch the save-stack itself — panic is a one-way exit, the
+// save-stack will not be consulted again.
+void _prof_drain_all() {
+    while (_profile_zone_stack_depth > 0) {
+        _profile_zone_stack_depth--;
+        auto off, name_p, start_us, elapsed, slot;
+        off      = _profile_zone_stack_depth * 16;
+        name_p   = read_u64(_profile_zone_stack, off);
+        start_us = read_u64(_profile_zone_stack, off + 8);
+        elapsed  = beat_now_us() - start_us;
+        slot     = _zone_slot(name_p);
+        if (slot >= 0) {
+            write_u64(_profile_zone_table, slot +  8,
+                      read_u64(_profile_zone_table, slot +  8) + elapsed);
+            write_u64(_profile_zone_table, slot + 16,
+                      read_u64(_profile_zone_table, slot + 16) + 1);
+        }
+    }
 }
 
 // Override the sampling rate (Hz) and per-sample stack depth that

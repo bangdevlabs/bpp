@@ -30,6 +30,13 @@ extrn enc_pos;
 // (a64_ret_lbl) need a forward declaration here.
 extrn a64_ret_lbl;
 
+// Phase 6.3 v2 — read by `_a64_emit_frame_teardown` to decide
+// whether to wrap the epilogue with a `_prof_save_drain` call.
+// Set per function in `cg_emit_func`.
+extrn cg_cur_fn_has_profile;
+extrn _zone_save_drain_p;
+extrn a64_fn_lbl;
+
 // ── Move / compare ──
 
 // Set the result register (x0) to zero. Lowered to `movz x0, #0`
@@ -1030,15 +1037,61 @@ void _a64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
         out(", [x29, #"); a64_print_dec(frame_off); out("]"); putchar('\n');
     }
 }
-// Epilogue: define return label, restore B3-promoted callee-saved
-// regs from frame spill slots, deallocate frame, restore fp/lr,
-// ret. Reads a64_promoted_regs and a64_b3_spill_base directly so
-// the caller only passes frame_size. Dual-mode (asm / bin).
+// Phase 6.3 v2 — emit a call to `_prof_save_drain` while keeping
+// the function's int + float return values (x0, d0) intact.
+// Called from `_a64_emit_frame_teardown` between the epilogue
+// label definition and the frame restore, so the drain runs after
+// every T_RET path AND after the implicit fallthrough — both
+// converge on `a64_ret_lbl` and inherit this single call.
+//
+// Stack discipline: 16-byte spill, str x0 + d0 / bl / ldr +
+// reclaim. AAPCS64 keeps sp 16-byte aligned; the spill matches.
+// The drain function follows AAPCS64 internally (saves fp/lr in
+// its own prologue), so x29 stays valid here. x30 (lr) gets
+// clobbered by the BL but the teardown's `ldp x29, x30` below
+// restores it from the saved-frame slot before `ret`.
+//
+// Skipped silently when cg_find_fn(_zone_save_drain_p) returns
+// -1: that means the user reached this primitive without
+// importing stbprofile.bsm, which would already be a link
+// failure for `_prof_zone_enter` itself. Belt-and-suspenders.
+void _a64_emit_drain_call_preserve_ret() {
+    auto fi, lbl;
+    fi = cg_find_fn(_zone_save_drain_p);
+    if (fi < 0) { return 0; }
+    lbl = arr_get(a64_fn_lbl, fi);
+    if (a64_bin_mode) {
+        enc_sub_imm(31, 31, 16);
+        enc_str_uoff(0, 31, 0);
+        enc_str_d_uoff(0, 31, 8);
+        enc_bl_label(lbl);
+        enc_ldr_uoff(0, 31, 0);
+        enc_ldr_d_uoff(0, 31, 8);
+        enc_add_imm(31, 31, 16);
+    } else {
+        out("  sub sp, sp, #16"); putchar('\n');
+        out("  str x0, [sp]"); putchar('\n');
+        out("  str d0, [sp, #8]"); putchar('\n');
+        out("  bl _"); a64_print_p(_zone_save_drain_p); putchar('\n');
+        out("  ldr x0, [sp]"); putchar('\n');
+        out("  ldr d0, [sp, #8]"); putchar('\n');
+        out("  add sp, sp, #16"); putchar('\n');
+    }
+}
+
+// Epilogue: define return label, optionally drain open @profile
+// zones (Phase 6.3 v2), restore B3-promoted callee-saved regs
+// from frame spill slots, deallocate frame, restore fp/lr, ret.
+// Reads a64_promoted_regs and a64_b3_spill_base directly so the
+// caller only passes frame_size. Dual-mode (asm / bin).
 void _a64_emit_frame_teardown(frame_size) {
     auto i, n, reg, off;
     n = arr_len(a64_promoted_regs);
     if (a64_bin_mode) {
         enc_def_label(a64_ret_lbl);
+        if (cg_cur_fn_has_profile != 0) {
+            _a64_emit_drain_call_preserve_ret();
+        }
         for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
@@ -1054,6 +1107,9 @@ void _a64_emit_frame_teardown(frame_size) {
         enc_ret();
     } else {
         out(".Lret_"); a64_print_p(cg_cur_fn_name); out(":"); putchar('\n');
+        if (cg_cur_fn_has_profile != 0) {
+            _a64_emit_drain_call_preserve_ret();
+        }
         for (i = 0; i < n; i++) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;

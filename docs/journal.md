@@ -1,5 +1,64 @@
 # B++ Bootstrap Journal
 
+## 2026-05-08 — Phase 6.3 v2 CLOSED — scoped-cleanup epilogues for `@profile`
+
+**Suite 141/0/12 native + 114/0/39 C, bootstrap byte-stable.** Phase 6.3 v2 ships the cleanup epilogues that close the v1 leak on early `return` and panic. Single commit covers runtime + parser + codegen spine + both chip primitives + panic hook + smoke test + doc closeout.
+
+### What v1 left open
+
+`@profile("name") { ... }` lowered to a `T_BLOCK` with prologue / epilogue T_CALLs. If the body returned early (or panicked) before reaching the trailing `_prof_zone_exit`, the open-zone stack stayed in a "this zone is still running" state. The next `_prof_zone_enter` on the same thread did pop it eventually, but the elapsed time was credited to whichever zone happened to be on top — silent mis-attribution that grew worse the more early returns the codebase had.
+
+### v2 architecture — depth-snapshot model
+
+Zone-stack depth is the contract. At function entry, codegen captures the live `_profile_zone_stack_depth` onto a separate save-stack (32 frames deep — same overflow philosophy as v1). At the epilogue convergence point, codegen pops the saved depth and drains every zone above it, crediting each popped frame's elapsed time + incrementing its slot's count. Result: regardless of how the function exits — fall-through, T_RET, panic — the open-zone stack returns to the depth it had at function entry.
+
+### Files touched
+
+```
+stb/stbprofile.bsm        +89  runtime: _prof_save_enter / _prof_save_drain / _prof_drain_all
+                                + storage (_PROF_SAVE_MAX = 32, _profile_save_stack)
+                                + init_profile wires _prof_drain_all_fp
+src/bpp_runtime.bsm        +9  panic() calls _prof_drain_all_fp before stderr writes;
+                                fp defaults to 0 so non-stbprofile programs link clean
+src/bpp_parser.bsm         +9  intern _prof_save_enter / _prof_save_drain names lazily
+                                inside _build_profile_zone (first @profile in a unit)
+src/bpp_codegen.bsm       +85  cg_node_has_profile + cg_body_has_profile_zones walkers
+                                + cg_cur_fn_has_profile flag
+                                + synthesised T_CALL to _prof_save_enter at step 13b
+                                  of cg_emit_func (right after narrow-float-params)
+src/backend/chip/aarch64/a64_primitives.bsm  +44  _a64_emit_drain_call_preserve_ret
+                                                   wrapped around _a64_emit_frame_teardown's
+                                                   epilogue label definition
+src/backend/chip/x86_64/x64_primitives.bsm   +37  _x64_emit_drain_call_preserve_ret
+                                                   same idea, sub $24 / save rax + xmm0 /
+                                                   call / restore / add $24
+tests/test_profile_zones_v2.bpp              +118 smoke: depth == 0 after fall-through,
+                                                   early-return, nested early-return; counts
+                                                   credited to all four zones
+docs/tonify_checklist.md                     ±33  Rule 25 v2 closed-leak section + caveats
+                                                   that survive (FLAT aggregation, C path,
+                                                   recursion overflow)
+```
+
+### Key call-site mechanics (preserving the return value)
+
+The cleanup runs at the epilogue convergence point — AFTER the function body has put its return value in x0/d0 (a64) or rax/xmm0 (x64). Calling `_prof_save_drain` from there would clobber those registers under standard ABIs. The chip primitives reserve a 16-byte spill at the start of the cleanup, save both the int and float return registers, call drain, restore both, reclaim the spill. x86_64 reserves 24 bytes instead of 16 to also pay the alignment tax (rsp is 8 mod 16 at the epilogue label per System V; the call needs 0 mod 16 just before).
+
+### Cross-module panic hook
+
+`panic()` lives in `bpp_runtime.bsm`, which intentionally has zero imports. It cannot directly reference `_prof_drain_all` from stbprofile. The fix is a function-pointer hook: `bpp_runtime` declares `global _prof_drain_all_fp;` (default 0), and `panic()` indirectly calls it if non-null. `init_profile` in stbprofile installs `fn_ptr(_prof_drain_all)`. Programs that never load stbprofile keep the hook null, so the link is clean and panic skips the cleanup.
+
+### Compiler discipline that fell out
+
+The body scan in `cg_node_has_profile` walks every statement-bearing node type — T_BLOCK / T_IF / T_WHILE / T_SWITCH — looking for a T_CALL whose target name matches `_prof_zone_enter`. The scan runs once per function inside `cg_emit_func`, before the body emit. Functions without `@profile` pay zero per-call overhead — both the prologue insertion and the epilogue drain skip on the cleared flag.
+
+### State of the v3 follow-up arc
+
+- v2 tightens early-return + panic. Nested zones still aggregate FLAT (parent counts include child time). Hierarchical breakdown is the obvious v3 feature when a real consumer needs it.
+- The C-emitter backend keeps v1 semantics — tests asserting v2 invariants now carry `// skip-c:`.
+
+---
+
 ## 2026-05-07 — Phase 6.3 CLOSED — `@profile` scoped zones + late-day env fixes
 
 **Suite 140/0/12 native, bootstrap byte-stable. The GPU pipeline roadmap is now ENTIRELY CLOSED — Phase 6.3 was the last deferred session and shipped end-to-end. Plus a basket of regression fixes the smoke runs surfaced.**

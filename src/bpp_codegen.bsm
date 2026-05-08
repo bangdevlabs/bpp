@@ -1113,6 +1113,25 @@ global cg_break_stack;
 global cg_continue_stack;
 extrn cg_cur_fn_name, cg_cur_fn_idx;
 
+// Phase 6.3 v2 — set by `cg_emit_func` per function based on
+// whether the body contains `@profile("...") { ... }` blocks.
+// Read by:
+//   - `cg_emit_func` to decide whether to emit a `_prof_save_enter`
+//     call right after the prologue.
+//   - The chip primitives' `emit_frame_teardown` to decide whether
+//     to wrap the epilogue convergence point with a `_prof_save_drain`
+//     call (preserving the return value across the call).
+// Non-profiled functions pay zero per-call overhead — the flag is
+// 0 and both injection sites no-op.
+global cg_cur_fn_has_profile;
+
+// Packed refs for the v2 save/drain helpers, interned in the parser
+// the first time a `@profile` block is seen and read here when
+// synthesising the epilogue/prologue calls. Both stay 0 until any
+// function in this compilation unit uses `@profile`.
+extrn _zone_save_enter_p;
+extrn _zone_save_drain_p;
+
 // Allocate a fresh label ID. Monotonic across the whole codegen
 // pass — each call returns a distinct integer.
 cg_new_lbl() { auto l; l = cg_lbl_cnt; cg_lbl_cnt++; return l; }
@@ -1955,6 +1974,16 @@ void cg_emit_func(fi) {
     cg_cur_fn_name = name_p;
     cg_cur_fn_idx = arr_get(cg_fn_fidx, fi);
 
+    // 4b. Phase 6.3 v2 — does this function contain `@profile`?
+    // Decided once here so the prologue insertion (step 13b) and
+    // the chip primitive's epilogue drain see the same answer.
+    // Body scan walks every statement-bearing node type via
+    // `cg_node_has_profile`, so nested @profile blocks under
+    // if / while / for / switch are all detected. The helpers'
+    // packed names must already be interned (parser side) when
+    // any function reaches this point with the flag set.
+    cg_cur_fn_has_profile = cg_body_has_profile_zones(body_arr, body_cnt);
+
     // 5. Register parameters as variables and apply type hints if any.
     fn_rec = arr_get(funcs, cg_cur_fn_idx);
     hints = *(fn_rec + 48);
@@ -2101,6 +2130,23 @@ void cg_emit_func(fi) {
     // 13. Narrow float params (aarch64 SL_HALF/SL_QUARTER; x64 no-op).
     call(p.emit_narrow_float_params, par_cnt);
 
+    // 13b. Phase 6.3 v2 — push the live zone-stack depth onto the
+    // save-stack as the very first body action of any function
+    // that contains `@profile` blocks. Pairs with the
+    // `_prof_save_drain` call that the chip primitive emits
+    // immediately after the epilogue label. Synthesised T_CALL
+    // routes through normal codegen so the call instruction,
+    // arg setup (none), and AAPCS / SysV alignment all follow
+    // the established path.
+    if (cg_cur_fn_has_profile != 0) {
+        auto save_enter_call: Node;
+        save_enter_call = make_node(T_CALL);
+        save_enter_call.a = _zone_save_enter_p;
+        save_enter_call.b = 0;
+        save_enter_call.c = 0;
+        cg_emit_node(save_enter_call);
+    }
+
     // 14. Body walk.
     cg_depth = 0;
     call(p.emit_body, body_arr, body_cnt);
@@ -2142,6 +2188,84 @@ cg_has_call(nd) {
     T_MEMLD, T_ADDR, T_RET { return cg_has_call(n.a); }
     else { return 0; }
     }
+}
+
+// Phase 6.3 v2 — does this AST subtree contain a `@profile` block?
+// Detection runs on the parser's lowered shape, which is a T_CALL
+// to `_prof_zone_enter` at the top of every synthesised T_BLOCK.
+// One match anywhere in the body is enough — `cg_emit_func` only
+// needs a yes/no answer to decide whether the function pays the
+// save_enter / save_drain overhead. Walks every statement-bearing
+// node type so the answer is the same regardless of nesting under
+// if / while / for / switch / arbitrary blocks.
+cg_node_has_profile(nd) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        if (cg_str_eq(n.a, "_prof_zone_enter", 16)) { return 1; }
+        return 0;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (cg_node_has_profile(arr[i])) { return 1; }
+        }
+        return 0;
+    }
+    if (t == T_IF) {
+        if (cg_node_has_profile(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (cg_node_has_profile(arr[i])) { return 1; }
+        }
+        if (n.d != 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (cg_node_has_profile(arr[i])) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        if (cg_node_has_profile(n.a)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (cg_node_has_profile(arr[i])) { return 1; }
+        }
+        return 0;
+    }
+    if (t == T_SWITCH) {
+        // Switch arms live in n.b (values) + n.src_tok (bodies).
+        // Walk every arm body.
+        auto sw_bodies, sb_arr, sb_cnt, sk;
+        sw_bodies = n.src_tok;
+        cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            sb_arr = sw_bodies[i * 2];
+            sb_cnt = sw_bodies[i * 2 + 1];
+            for (sk = 0; sk < sb_cnt; sk++) {
+                if (cg_node_has_profile(sb_arr[sk])) { return 1; }
+            }
+        }
+        if (n.d != 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (cg_node_has_profile(arr[i])) { return 1; }
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+cg_body_has_profile_zones(body_arr, body_cnt) {
+    auto i;
+    for (i = 0; i < body_cnt; i++) {
+        if (cg_node_has_profile(body_arr[i])) { return 1; }
+    }
+    return 0;
 }
 
 // Wave 21 takeover: the spine owns expression emission for every

@@ -1288,21 +1288,37 @@ so a single P press surfaces both panels together.
   it claims to measure (each call is ~50 ns including the
   beat_now_us read; loops at >10 M iter/s would feel it).
 
-**v1 caveats** (track in the calling code; the runtime is
-"best-effort, never crash" rather than "correct under
-everything"):
+**v2 closed early-return + panic leaks (2026-05-08).** A
+function that contains any `@profile` block now pays a
+prologue / epilogue pair: the compiler injects
+`_prof_save_enter()` right after the prologue and
+`_prof_save_drain()` at the epilogue convergence point. Drain
+pops every open zone above the depth recorded at entry and
+credits each one's `total_us` / `count`. The chip primitive
+preserves the function's int + float return value (x0 / d0 on
+aarch64, rax / xmm0 on x86_64) across the call so the cleanup
+is invisible to the caller. The native backends ship the
+epilogue drain; the C emitter keeps v1 semantics (best-effort
+leak on early return) — tests opting into v2 properties carry
+`// skip-c:` accordingly.
 
-- Early `return` inside a zone leaves it open. The next
-  enter/exit pair on the SAME thread silently rebases the
-  start, so total_us undercounts.
-- Nested zones run on a runtime stack (depth 8). Aggregation
-  is FLAT — a parent's total_us includes its children's time.
-- Panic / abort similarly leak; OS reclaims the table at
-  process exit.
+`panic()` is wired through a function-pointer hook
+(`_prof_drain_all_fp`). `init_profile` registers
+`_prof_drain_all` there so a panic that fires inside a zone
+closes every open zone before the trace prints. Programs that
+never load stbprofile keep the hook null and the call is
+skipped.
 
-These will tighten when scoped-cleanup epilogues land in a
-later compiler sprint. Phase 6.3 prioritised "ergonomic syntax
-+ working aggregation" over "panic-safe semantics".
+**Remaining v2 caveats:**
+
+- Nested zones still aggregate FLAT — a parent's `total_us`
+  includes its children's time. Hierarchical breakdown is a
+  separate v3 feature.
+- The C-emitter backend still ships v1 leak-on-early-return.
+  Use `// skip-c:` when a test asserts the v2 invariant.
+- Recursion deeper than `_PROF_SAVE_MAX` (32 frames) silently
+  no-ops the save_enter; the corresponding drain is also a
+  no-op. Same overflow contract as the v1 zone stack.
 
 **Naming:** the original spec called it `@profile_zone(...)`
 but `_zone` was redundant — the annotation IS the zone. Other
