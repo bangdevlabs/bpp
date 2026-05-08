@@ -681,6 +681,33 @@ static _inline_malloc_ref() {
     return _inline_malloc_p_cached;
 }
 
+// Phase 6.3 scoped zones — cached packed refs for the runtime
+// support functions emitted by `@profile("name") { ... }`. Same
+// lazy-intern pattern as _inline_malloc_ref above. The resolved
+// targets live in stbprofile.bsm.
+static auto _zone_enter_p_cached;
+static auto _zone_exit_p_cached;
+
+static _intern_name(name_str, name_len) {
+    auto start;
+    start = vbuf_pos;
+    buf_copy(vbuf + vbuf_pos, name_str, name_len);
+    vbuf_pos += name_len;
+    return pack(start, name_len);
+}
+
+static _zone_enter_ref() {
+    if (_zone_enter_p_cached != 0) { return _zone_enter_p_cached; }
+    _zone_enter_p_cached = _intern_name("_prof_zone_enter", 16);
+    return _zone_enter_p_cached;
+}
+
+static _zone_exit_ref() {
+    if (_zone_exit_p_cached != 0) { return _zone_exit_p_cached; }
+    _zone_exit_p_cached = _intern_name("_prof_zone_exit", 15);
+    return _zone_exit_p_cached;
+}
+
 // ============================================================
 // Token access helpers
 // ============================================================
@@ -2019,17 +2046,102 @@ static parse_switch() {
     return node;
 }
 
+// Phase 6.3 scoped zones — lower `@profile("name") { body }` to a
+// synthesized T_BLOCK shaped as:
+//
+//   T_BLOCK
+//     T_CALL _prof_zone_enter("name")
+//     ... user statements ...
+//     T_CALL _prof_zone_exit("name")
+//
+// `zone_name_p` is a packed reference to the user's string literal
+// in vbuf, including the surrounding quotes — codegen reads the
+// quote convention from `cg_emit_lit` to classify it as a string.
+// Two T_LIT nodes share the same packed ref (codegen registers the
+// string in cg_str_tbl per node, and identical content typically
+// dedupes in the linker, but we don't depend on that — the runtime
+// treats the pointer value as the zone identity, so identical
+// strings landing at different addresses just create twin zones,
+// which is acceptable for v1).
+//
+// Caveats / known gaps for v1:
+//   - Early `return` inside a zone leaves it open. The next frame's
+//     first `_prof_zone_enter` notices the open zone and warns; total
+//     time gets attributed to whatever zone was active at exit.
+//   - Nested zones work (each enter pushes onto a runtime stack)
+//     but only flat aggregation is shown in the HUD — the parent
+//     zone's total includes the children's time.
+//   - Panic / abort similarly leaks; not handled in v1.
+static _build_profile_zone(zone_name_p) {
+    auto body_arr, body_cnt, wrap_arr, wrap_cnt, i;
+    body_arr = parse_body();
+    body_cnt = last_list_cnt;
+
+    auto name_lit1: Node, name_lit2: Node;
+    name_lit1 = make_node(T_LIT);
+    name_lit1.a = zone_name_p;
+    name_lit2 = make_node(T_LIT);
+    name_lit2.a = zone_name_p;
+
+    auto enter_args, enter_call: Node;
+    enter_args = malloc(8);
+    *(enter_args) = name_lit1;
+    enter_call = make_node(T_CALL);
+    enter_call.a = _zone_enter_ref();
+    enter_call.b = enter_args;
+    enter_call.c = 1;
+
+    auto exit_args, exit_call: Node;
+    exit_args = malloc(8);
+    *(exit_args) = name_lit2;
+    exit_call = make_node(T_CALL);
+    exit_call.a = _zone_exit_ref();
+    exit_call.b = exit_args;
+    exit_call.c = 1;
+
+    wrap_cnt = body_cnt + 2;
+    wrap_arr = malloc(wrap_cnt * 8);
+    *(wrap_arr) = enter_call;
+    for (i = 0; i < body_cnt; i++) {
+        *(wrap_arr + (i + 1) * 8) = *(body_arr + i * 8);
+    }
+    *(wrap_arr + (body_cnt + 1) * 8) = exit_call;
+
+    auto wrap: Node;
+    wrap = make_node(T_BLOCK);
+    wrap.b = wrap_arr;
+    wrap.c = wrap_cnt;
+    return wrap;
+}
+
 // Parse a single statement: declaration, if, while, return, or expression.
 static parse_statement() {
     auto node: Node, var_p, hint_p, decl_hint, dh_arr, dh_cnt, dh_has, kw_hint;
-    // Dispatch hint: @seq, @par, @gpu before while.
+    // `@`-prefixed annotations come in two flavours at statement level:
+    //   1. Phase 6.3 scoped zones — `@profile("name") { ... }`. Captured
+    //      and lowered to a synthesized T_BLOCK with prologue / epilogue
+    //      calls into the stbprofile runtime.
+    //   2. Dispatch hints — `@seq` / `@par` / `@gpu` immediately
+    //      before a `while`. Captured into hint_p and consumed; the
+    //      while-parser picks the hint up.
     hint_p = 0;
-    if (peek_type() == TK_PUNCT) {
-        if (val_is_ch('@')) {
-            consume();
-            hint_p = cur_packed();
-            consume();
+    if (peek_type() == TK_PUNCT && val_is_ch('@')) {
+        consume();
+        auto annot_p, annot_l, annot_s;
+        annot_p = cur_packed();
+        annot_l = unpack_l(annot_p);
+        annot_s = vbuf + unpack_s(annot_p);
+        if (annot_l == 7 && buf_eq(annot_s, "profile", 7)) {
+            consume();              // "profile"
+            consume();              // "("
+            auto zone_name_p;
+            zone_name_p = cur_packed();
+            consume();              // string literal
+            consume();              // ")"
+            return _build_profile_zone(zone_name_p);
         }
+        hint_p = annot_p;
+        consume();
     }
     if (peek_type() == TK_KW) {
         if (val_is("auto", 4)) {

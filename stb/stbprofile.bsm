@@ -90,6 +90,23 @@ const _PROFILE_SPARK_H       = 10;
 // games treat as the lower bound for acceptable feel.
 const _PROFILE_SPARK_REF_US  = 33000;
 
+// Phase 6.3 scoped zones — flat per-zone aggregates and a small
+// stack of currently-open zones. Both are fixed-capacity buffers
+// allocated once in init_profile so the per-frame cost is just
+// pointer math + one µs read per enter/exit (no malloc, no hash).
+//
+// Zone table entry layout (24 bytes per slot):
+//   offset 0  — name_ptr   (8 bytes, value identity used as zone key)
+//   offset 8  — total_us   (8 bytes, accumulated time across calls)
+//   offset 16 — count      (8 bytes, number of completed enter/exit pairs)
+//
+// Open-zone stack entry layout (16 bytes per frame):
+//   offset 0  — name_ptr   (8 bytes)
+//   offset 8  — start_us   (8 bytes, beat_now_us at enter)
+const _PROFILE_ZONE_MAX      = 16;
+const _PROFILE_ZONE_STACK    = 8;
+const _PROFILE_ZONE_HUD_TOP  = 4;
+
 // ── State ────────────────────────────────────────────────────
 
 // 0 = idle, 1 = sampling. Edge-toggled by `profile_hud_toggle`.
@@ -133,6 +150,14 @@ global _profile_frame_idx;
 global _profile_frame_count;
 global _profile_last_draw_us;
 
+// Phase 6.3 — scoped zone state. Aggregates persist for the
+// process lifetime; the HUD reads them every frame and shows the
+// top N by total accumulated time.
+extrn _profile_zone_table;
+global _profile_zone_count;
+extrn _profile_zone_stack;
+global _profile_zone_stack_depth;
+
 // ── Init ─────────────────────────────────────────────────────
 
 // Reset all state to idle / defaults and pre-allocate the live HUD
@@ -152,6 +177,91 @@ void init_profile() {
     _profile_frame_count    = 0;
     _profile_last_draw_us   = 0;
     _profile_hud_thread_mode = 0;
+
+    // Phase 6.3 — zone aggregate + stack. buf_byte zeroes the
+    // memory, which is exactly the empty state these consume.
+    _profile_zone_table       = buf_byte(_PROFILE_ZONE_MAX * 24);
+    _profile_zone_stack       = buf_byte(_PROFILE_ZONE_STACK * 16);
+    _profile_zone_count       = 0;
+    _profile_zone_stack_depth = 0;
+}
+
+// ── Phase 6.3 scoped zones — runtime support ─────────────────
+//
+// `@profile("name") { ... }` lowers to:
+//
+//   _prof_zone_enter("name");
+//   ... body ...
+//   _prof_zone_exit("name");
+//
+// Pointer identity drives lookup — when two annotations carry
+// the exact same string literal the linker dedupes them to one
+// .data address, so they aggregate into the same zone slot. If
+// the linker keeps two copies (rare but possible) the user sees
+// two adjacent slots with the same display name. Acceptable
+// trade-off for v1; a string-hash key would solve it at the
+// cost of the per-call constant-time guarantee.
+
+// Find the zone slot for `name_p`, creating it on first miss.
+// Returns the slot's byte offset into _profile_zone_table, or -1
+// if the table is full. O(N) linear scan — N capped at 16, fine
+// at any realistic per-frame call rate.
+static _zone_slot(name_p) {
+    auto i, off, cur;
+    for (i = 0; i < _profile_zone_count; i++) {
+        off = i * 24;
+        cur = read_u64(_profile_zone_table, off);
+        if (cur == name_p) { return off; }
+    }
+    if (_profile_zone_count >= _PROFILE_ZONE_MAX) { return -1; }
+    off = _profile_zone_count * 24;
+    write_u64(_profile_zone_table, off,      name_p);
+    write_u64(_profile_zone_table, off +  8, 0);
+    write_u64(_profile_zone_table, off + 16, 0);
+    _profile_zone_count++;
+    return off;
+}
+
+// Push a new zone onto the open-zone stack. Drops silently when
+// the stack is full — nesting deeper than _PROFILE_ZONE_STACK is
+// almost certainly a runaway recursion bug, but the v1 contract
+// is "best-effort, never crash" rather than "panic on overflow".
+void _prof_zone_enter(name_p) {
+    if (_profile_zone_stack_depth >= _PROFILE_ZONE_STACK) { return 0; }
+    auto off;
+    off = _profile_zone_stack_depth * 16;
+    write_u64(_profile_zone_stack, off,     name_p);
+    write_u64(_profile_zone_stack, off + 8, beat_now_us());
+    _profile_zone_stack_depth++;
+}
+
+// Pop the top of the open-zone stack and add the elapsed µs to
+// the matching aggregate. Mismatched name_p (top-of-stack name
+// differs from the exit's name_p) is silently tolerated — the
+// stack is unwound assuming a missed exit somewhere above; the
+// alternative (no-op) would slowly leak the stack.
+void _prof_zone_exit(name_p) {
+    if (_profile_zone_stack_depth <= 0) { return 0; }
+    _profile_zone_stack_depth--;
+    auto off, start_us, elapsed, slot;
+    off      = _profile_zone_stack_depth * 16;
+    start_us = read_u64(_profile_zone_stack, off + 8);
+    elapsed  = beat_now_us() - start_us;
+    slot     = _zone_slot(name_p);
+    if (slot < 0) { return 0; }
+    write_u64(_profile_zone_table, slot +  8,
+              read_u64(_profile_zone_table, slot +  8) + elapsed);
+    write_u64(_profile_zone_table, slot + 16,
+              read_u64(_profile_zone_table, slot + 16) + 1);
+}
+
+// Reset accumulated zone time. Useful between phases of a long
+// session (e.g. clear baseline before measuring an effect's
+// impact). Does NOT clear the open stack — exits still find their
+// pushed entries.
+void profile_zones_reset() {
+    buf_fill(_profile_zone_table, 0, _PROFILE_ZONE_MAX * 24);
+    _profile_zone_count = 0;
 }
 
 // Override the sampling rate (Hz) and per-sample stack depth that
@@ -427,6 +537,72 @@ void profile_hud_draw(x, y, sz, color) @gpu {
         render_number(x + 22 * 8 * sz, row_y, sz, color, count);
         row_y = row_y + 10 * sz;
     }
+}
+
+// Phase 6.3 — render the per-zone breakdown as a small column.
+// Each row reads "<name>  <avg_us>  <count>x" — average time per
+// enter/exit pair plus total invocations. Sorted by total_us
+// (descending) so the most expensive zone always sits at the top.
+//
+// Render skipped entirely when no zones have ever closed, so the
+// caller can sprinkle the call into every game without a "ZONES:"
+// header appearing on day one. Cap at _PROFILE_ZONE_HUD_TOP rows
+// so the column stays bounded even in heavily-instrumented code.
+//
+// Layout assumes sz=1; at larger scales the column expands
+// vertically. x / y are screen pixel coordinates of the header
+// line; subsequent rows step down 10*sz pixels.
+void profile_zones_hud_draw(x, y, sz, color) @gpu {
+    // Gate on the profile HUD toggle so the zones panel appears
+    // and disappears in lockstep with `profile_hud_draw` — the
+    // user toggles both via the same key (typically P), no
+    // dangling overlay when the rest of the HUD goes away.
+    if (_profile_hud_active == 0) { return; }
+    if (_profile_zone_count == 0) { return; }
+
+    // Selection-sort top _PROFILE_ZONE_HUD_TOP entries by total_us.
+    // Tiny N (cap 16, top 4) so an O(N²) pass costs nothing.
+    auto sorted_idx, n_top, i, j, best, best_total, cand_total;
+    n_top = _profile_zone_count;
+    if (n_top > _PROFILE_ZONE_HUD_TOP) { n_top = _PROFILE_ZONE_HUD_TOP; }
+    sorted_idx = buf_word(n_top);
+    auto used;
+    used = buf_byte(_profile_zone_count);
+    buf_fill(used, 0, _profile_zone_count);
+    for (i = 0; i < n_top; i++) {
+        best = -1;
+        best_total = 0;
+        for (j = 0; j < _profile_zone_count; j++) {
+            if (peek(used + j) != 0) { continue; }
+            cand_total = read_u64(_profile_zone_table, j * 24 + 8);
+            if (best < 0 || cand_total > best_total) {
+                best = j;
+                best_total = cand_total;
+            }
+        }
+        if (best < 0) { break; }
+        sorted_idx[i] = best;
+        poke(used + best, 1);
+    }
+    free(used);
+
+    render_text("ZONES (avg us | count)", x, y, sz, color);
+    auto row_y, idx, off, name_p, total_us, cnt, avg_us;
+    row_y = y + 10 * sz;
+    for (i = 0; i < n_top; i++) {
+        idx      = sorted_idx[i];
+        off      = idx * 24;
+        name_p   = read_u64(_profile_zone_table, off);
+        total_us = read_u64(_profile_zone_table, off + 8);
+        cnt      = read_u64(_profile_zone_table, off + 16);
+        if (cnt == 0) { continue; }
+        avg_us = total_us / cnt;
+        render_text(name_p, x, row_y, sz, color);
+        render_number(x + 18 * 8 * sz, row_y, sz, color, avg_us);
+        render_number(x + 24 * 8 * sz, row_y, sz, color, cnt);
+        row_y = row_y + 10 * sz;
+    }
+    free(sorted_idx);
 }
 
 // Standalone FPS counter — renders just the "FPS: <n>" line at the

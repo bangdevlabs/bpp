@@ -301,6 +301,14 @@ static fps_base_phase(dt: float) @base {
 // switch to the custom pipeline, draw the fullscreen pass, restore
 // the default pipeline so `profile_hud_draw` (which uses the engine
 // font + render_text path) keeps working unchanged.
+//
+// Phase 6.3 — three @profile blocks split the per-frame work into
+// independently-measured chunks. The HUD's ZONES column shows the
+// breakdown so a regression in any one stage is immediately visible
+// (e.g. ray_cast suddenly doubling = shader change cost; crt_effect
+// growing = post-process pipeline drift). Zones nest under whatever
+// the maestro classifies fps_render_phase as in the function-level
+// dump.
 static fps_render_phase(alpha: float) {
     auto p: FPSBody;
     p = player;
@@ -308,56 +316,63 @@ static fps_render_phase(alpha: float) {
     game_render_begin();
     render_clear(BLACK);
 
-    // Pack camera uniforms — must match the shader's CamUniforms
-    // layout byte-for-byte. The four floats go through write_f32
-    // (which calls pokefloat_h under the hood) so the shader reads
-    // 32-bit Metal floats; the four ints go through write_u32.
-    write_f32(cam_buf,  0, p.x);
-    write_f32(cam_buf,  4, p.y);
-    write_f32(cam_buf,  8, p.angle);
-    write_f32(cam_buf, 12, FOV);
-    write_u32(cam_buf, 16, SCREEN_W);
-    write_u32(cam_buf, 20, SCREEN_H);
-    write_u32(cam_buf, 24, MAP_W);
-    write_u32(cam_buf, 28, MAP_H);
+    @profile("ray_cast") {
+        // Pack camera uniforms — must match the shader's CamUniforms
+        // layout byte-for-byte. The four floats go through write_f32
+        // (which calls pokefloat_h under the hood) so the shader
+        // reads 32-bit Metal floats; the four ints through write_u32.
+        write_f32(cam_buf,  0, p.x);
+        write_f32(cam_buf,  4, p.y);
+        write_f32(cam_buf,  8, p.angle);
+        write_f32(cam_buf, 12, FOV);
+        write_u32(cam_buf, 16, SCREEN_W);
+        write_u32(cam_buf, 20, SCREEN_H);
+        write_u32(cam_buf, 24, MAP_W);
+        write_u32(cam_buf, 28, MAP_H);
 
-    gpu_pipeline_use(ray_pipeline);
-    gpu_uniform_set_frag(0, cam_buf, CAM_BUF_SZ);
-    gpu_uniform_set_frag(1, map_buf, MAP_BUF_SZ);
-    // Phase 7 — bind the 4 wall textures to fragment slots 0..3.
-    // The shader's dispatch on wall_type picks the right sample;
-    // every column is uniform so branch divergence is irrelevant.
-    gpu_bind_texture_frag(0, TEX_BRICK);
-    gpu_bind_texture_frag(1, TEX_STONE);
-    gpu_bind_texture_frag(2, TEX_WOOD);
-    gpu_bind_texture_frag(3, TEX_SOLID);
-    gpu_draw_full();
-    gpu_pipeline_use_default();
+        gpu_pipeline_use(ray_pipeline);
+        gpu_uniform_set_frag(0, cam_buf, CAM_BUF_SZ);
+        gpu_uniform_set_frag(1, map_buf, MAP_BUF_SZ);
+        // Phase 7 — bind the 4 wall textures to fragment slots 0..3.
+        // The shader's dispatch on wall_type picks the right sample;
+        // every column is uniform so branch divergence is irrelevant.
+        gpu_bind_texture_frag(0, TEX_BRICK);
+        gpu_bind_texture_frag(1, TEX_STONE);
+        gpu_bind_texture_frag(2, TEX_WOOD);
+        gpu_bind_texture_frag(3, TEX_SOLID);
+        gpu_draw_full();
+        gpu_pipeline_use_default();
+    }
 
-    // Sessão A2 — HUD overlay drawn ON TOP of the ray-cast walls.
-    // Crosshair at the screen center, heart icon at the top-left.
-    // Both use image_draw_size: pipeline is already default after
-    // gpu_pipeline_use_default above, smart-bind switches slot 0
-    // to hud_atlas's texture in one flush, then both quads go in
-    // the same batch (only changes back to font texture when
-    // profile_hud_draw below calls render_text).
-    auto cross_x, cross_y;
-    cross_x = SCREEN_W / 2 - HUD_TILE / 2;
-    cross_y = SCREEN_H / 2 - HUD_TILE / 2;
-    image_draw_size(hud_atlas, HUD_CROSS, cross_x, cross_y, HUD_TILE, HUD_TILE);
-    image_draw_size(hud_atlas, HUD_HEART, 8, SCREEN_H - 24, HUD_TILE, HUD_TILE);
+    @profile("hud_overlay") {
+        // Sessão A2 — HUD overlay drawn ON TOP of the ray-cast walls.
+        // Crosshair at the screen center, heart icon at the top-left.
+        auto cross_x, cross_y;
+        cross_x = SCREEN_W / 2 - HUD_TILE / 2;
+        cross_y = SCREEN_H / 2 - HUD_TILE / 2;
+        image_draw_size(hud_atlas, HUD_CROSS, cross_x, cross_y, HUD_TILE, HUD_TILE);
+        image_draw_size(hud_atlas, HUD_HEART, 8, SCREEN_H - 24, HUD_TILE, HUD_TILE);
+        profile_hud_draw(8, 8, 1, 0xFFFF3333);
+        // Zone breakdown panel pinned to the upper-right corner so
+        // it doesn't collide with the function top-N column on the
+        // left. Both panels gate on the same `_profile_hud_active`
+        // flag, so a single P press (which the action_pressed block
+        // above calls profile_hud_toggle for) brings both up
+        // together and a second press dismisses both.
+        profile_zones_hud_draw(SCREEN_W - 220, 8, 1, 0xFFFFFF80);
+    }
 
-    profile_hud_draw(8, 8, 1, 0xFFFF3333);
-
-    // Phase 6.4 — instead of game_render_end, route through the
-    // CRT effect: chain_begin commits the offscreen pass, fx_apply
-    // runs the barrel + chromatic + scanlines fragment program,
-    // fx_present blits the post-processed result to the window
-    // with the same letterbox + NEAREST upscale game_render_end
-    // would have used.
-    fx_chain_begin();
-    fx_apply(crt_fx);
-    fx_present();
+    @profile("crt_effect") {
+        // Phase 6.4 — instead of game_render_end, route through the
+        // CRT effect: chain_begin commits the offscreen pass, fx_apply
+        // runs the barrel + chromatic + scanlines fragment program,
+        // fx_present blits the post-processed result to the window
+        // with the same letterbox + NEAREST upscale game_render_end
+        // would have used.
+        fx_chain_begin();
+        fx_apply(crt_fx);
+        fx_present();
+    }
     return 0;
 }
 
