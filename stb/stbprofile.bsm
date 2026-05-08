@@ -80,6 +80,15 @@ const _PROFILE_MAX_THREADS   = 8;
 // a histogram-style readout that reads spikes at a glance.
 const _PROFILE_SPARK_W       = 2;
 const _PROFILE_SPARK_H       = 10;
+// Sparkline scale reference in microseconds — bars normalise against
+// this, NOT against the max-seen frame. Fixed budget keeps a stable
+// visual baseline: at 60 FPS (~16.7 ms) bars sit at ~50 % height,
+// at 30 FPS (~33 ms) they hit the top, frame-time spikes clip
+// visibly. Using max_us as the divisor (the first cut) made flat
+// 60 FPS render as a solid horizontal bar — every bar at full height
+// because frame_dt ≈ max_us. 33 ms ≈ the "danger threshold" most
+// games treat as the lower bound for acceptable feel.
+const _PROFILE_SPARK_REF_US  = 33000;
 
 // ── State ────────────────────────────────────────────────────
 
@@ -341,10 +350,13 @@ void profile_hud_draw(x, y, sz, color) @gpu {
 
     // Tier 2 sparkline. Walks the ring in chronological order
     // (oldest → newest) so a left-to-right read tracks recent frame
-    // history naturally. Bar height = (frame_us / max_us) * H * sz,
-    // anchored to a baseline so taller bars grow upward — the
-    // histogram convention every profiler UI uses.
-    if (max_us > 0) {
+    // history naturally. Bars normalise against a fixed budget
+    // reference (_PROFILE_SPARK_REF_US, default 33 ms = 30 FPS
+    // floor) so flat 60 FPS renders as ~50 %-height bars with
+    // visible jitter, and frame-time spikes clip at the top
+    // signalling the danger zone. Using max_us would normalise
+    // every histogram against itself and erase the read.
+    if (_profile_frame_count > 0) {
         auto spark_baseline, slot, start_slot, frame_dt, bar_h, bar_x, bar_w;
         spark_baseline = y + 36 * sz;
         bar_w = _PROFILE_SPARK_W * sz;
@@ -355,8 +367,9 @@ void profile_hud_draw(x, y, sz, color) @gpu {
         for (i = 0; i < _profile_frame_count; i++) {
             slot = (start_slot + i) % _PROFILE_FRAME_BUF_N;
             frame_dt = _profile_frame_buf[slot];
-            bar_h = (frame_dt * _PROFILE_SPARK_H * sz) / max_us;
+            bar_h = (frame_dt * _PROFILE_SPARK_H * sz) / _PROFILE_SPARK_REF_US;
             if (bar_h < 1) { bar_h = 1; }
+            if (bar_h > _PROFILE_SPARK_H * sz) { bar_h = _PROFILE_SPARK_H * sz; }
             bar_x = x + i * bar_w;
             render_rect(bar_x, spark_baseline - bar_h, bar_w, bar_h, color);
         }
