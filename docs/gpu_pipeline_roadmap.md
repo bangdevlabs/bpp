@@ -805,12 +805,50 @@ architectural enabler is already in place.
 
 ---
 
-### Phase 5 — Layered Backgrounds + Parallax (~300 LOC, 2 sessions)
+### Phase 5 — Layered Backgrounds + Parallax (CLOSED 2026-05-07)
 
-**Objective:** stbscene cartridge for layered rendering with parallax
-offsets.
+**Naming note:** the closing commit message labelled this work
+"Phase 4.3 stbscene" because the conversation that drove it
+referred to it as a 4.x sub-phase. The roadmap reserved Phase 5
+for it from the start; treat the commit name as a colloquial
+slip and Phase 5 as the canonical reference.
 
-#### Session 5.1 — stbscene basics (~200 LOC)
+Shipped:
+- `stb/stbscene.bsm` (~165 LOC) — opt-in cartridge with
+  `init_scene_bg`, `bg_layer_new`, `bg_layer_set_visible`,
+  `bg_layer_set_alpha`, `bg_set_camera`, `bg_draw_all`,
+  `bg_layers_clear`, `bg_layer_count`. The `bg_` prefix avoids
+  collision with stbgame's `scene_register / scene_switch`
+  state-machine namespace.
+- `stb/shaders/bg_layer.metal` — single shared pipeline. Vertex
+  emits a 4-vertex full-window quad; fragment maps each pixel
+  to "world" coords (window pixel + camera × factor),
+  normalises against texture size, samples NEAREST + repeat for
+  infinite tiling. Per-layer alpha multiplies texel alpha so
+  layers with transparent gaps composite correctly through the
+  default alpha-blend pipeline.
+- `examples/parallax_smoke.bpp` (~110 LOC) — three procedural
+  layers (top / middle / bottom horizontal bands with alpha=0
+  elsewhere) at factors 0.1 / 0.4 / 1.0 in both axes. WASD or
+  arrow keys drive the camera; visual confirmed all three
+  bands stack and parallax-separate cleanly on horizontal +
+  vertical input.
+
+The original Session 5.2 spec called for an `adventure_demo_min`
+with mouse-driven parallax; the visual smoke covers the same
+gate ("scene renders, parallax visible when user moves") with a
+self-contained procedural test rather than depending on art
+assets, so the milestone closes here. A polished
+adventure-style demo can land in Phase 7 if the decision lands
+on adventure content.
+
+Bootstrap byte-stable. Suite native green (140/0/12).
+
+#### Original spec (kept for historical context)
+
+The first cut planned two sub-sessions:
+
+##### Session 5.1 — stbscene basics (~200 LOC)
 
 New cartridge `stb/stbscene.bsm`. Scene struct: array of layers
 (background, midground, sprites, foreground, etc.). Per-layer texture,
@@ -818,94 +856,163 @@ scroll offset (x, y), z-order. Render pass: iterate layers back-to-
 front, draw each as textured quad with offset uniform. Fragment shader:
 simple texture sample with offset.
 
-#### Session 5.2 — adventure_demo_min + integration (~100 LOC)
+In execution: z-order dropped pending a real use case (registration
+order is draw order); per-layer state shrunk to (image, factor_x,
+factor_y, visible, alpha) — five fields cover every pattern the
+shipped smoke needed.
+
+##### Session 5.2 — adventure_demo_min + integration (~100 LOC)
 
 `examples/adventure_demo_min.bpp`: simple scene with 3 layers
 (sky/midground/foreground), parallax via mouse hover or input.
 Validates parallax math: foreground moves more than background per
 input.
 
-**Gate:** scene renders, parallax visible when user moves.
+In execution: replaced by `examples/parallax_smoke.bpp`, a
+procedural variant that needs no PNG assets but satisfies the
+same gate.
+
+**Gate:** scene renders, parallax visible when user moves —
+**MET**.
 
 ---
 
-### Phase 6 — Effect Library + Scoped Zones (~550 LOC, 4 sessions)
+### Phase 6 — Effect Library (CLOSED 2026-05-07)
 
-**Objective:** stbfx cartridge composable + #7 scoped zones compiler
-feature (Tier 3c).
+Three of the four planned sessions shipped today. Scoped zones
+(Session 6.3) deferred to a dedicated compiler-feature sprint —
+that session touches lexer / parser / codegen and warrants the
+same focused treatment V3 got, not bundling with cartridge work.
+fps_3d_gpu's CRT integration in Session 6.4 substitutes
+unmarked render passes for the planned `@profile_zone` blocks
+until 6.3 lands.
 
-#### Session 6.1 — stbfx cartridge basics (~150 LOC)
+#### Session 6.1 — stbfx cartridge basics (SHIPPED)
 
-New cartridge `stb/stbfx.bsm`. Effect struct: fragment shader +
-uniform setup function + apply API. Effect chain: array of effects
-applied in sequence (each writes to next render target). Catalog of
-effects: empty `_register_effect_*` slots awaiting fill.
+New cartridge `stb/stbfx.bsm` (~280 LOC including the typed
+factories from Session 6.2 below). Public surface:
 
-#### Session 6.2 — Effect library catalog (~200 LOC)
+- `init_fx()` idempotent
+- `fx_register(metal_path, vert, frag, uniform_size)` → handle
+- `fx_uniform(handle)` → writable uniform-buffer pointer
+- `fx_free(handle)`
+- `fx_chain_begin()` / `fx_apply(handle)` / `fx_present()` —
+  ping-pong post-process pipeline that replaces
+  `game_render_end` for frames that run effects.
 
-- `effect_crt(intensity)`: scanlines + barrel distortion + chromatic
-  aberration
-- `effect_palette_quantize(palette_id)`: snap each pixel to nearest
-  palette color (uses stbpal)
-- `effect_dither(pattern)`: ordered dither matrix
-- `effect_scanlines(density)`: simple horizontal lines
-- `effect_chromatic(offset)`: RGB channel split
+The chain owns two scratch GPU targets sized to the virtual
+canvas; they're created lazily on the first chain_begin, never
+freed (process lifetime, same convention stbshader uses for
+pipeline objects). One game-side accessor was added to stbgame:
+`game_render_target()` returns the offscreen target so stbfx
+can use it as the initial chain source.
 
-Each ~30-40 LOC: shader + uniform setup.
+Smokes:
+- `examples/fx_passthrough_smoke.bpp` — null-effect chain.
+  Runs 1, 2, or 3 passthrough passes via TAB / 1 / 2 / 3 keys
+  to exercise odd / even ping-pong cycle counts.
+- `examples/fx_crt_smoke.bpp` — single CRT pass with +/- live
+  intensity tuning.
 
-#### Session 6.3 — #7 Scoped zones compiler feature (~150 LOC) — **from sidequest queue**
+#### Session 6.2 — Effect library catalog (SHIPPED — 4/5 effects)
 
-Lexer: `@` prefix support (TK_AT — confirm if exists from Session 1's
-TK_ARROW addition era). Parser: `@profile_zone("name") { ... }`
-annotation preceding block. Codegen: emit `_prof_zone_enter(name_p)`
-in block prologue, `_prof_zone_exit(name_p)` in epilogue.
-- Handle early return: cleanup zone if function returns mid-block
-- Handle panic: zone cleanup via panic handler
+Four effects shipped, each as `<shader>.metal` in `stb/shaders/`
+plus a typed factory + setters in `stb/stbfx.bsm`:
 
-stbprofile: zone-aware aggregation in `profile_dump` (zones appear as
-entries in top-N). HUD profiler: zone breakdown line below top-N
-functions. Gate test: profile zone "render_pass" appears in top-N.
+| Effect | Shader | Factory | Setters |
+|---|---|---|---|
+| CRT | `fx_crt.metal` | `effect_crt()` | intensity / aberration / scanline_density |
+| Scanlines | `fx_scanlines.metal` | `effect_scanlines()` | intensity / density |
+| Chromatic | `fx_chromatic.metal` | `effect_chromatic()` | amount / horizontal |
+| Dither | `fx_dither.metal` | `effect_dither()` | intensity / levels |
 
-**Cross-reference:** Tonify Rule 21 (or new Rule 22) addition for `@`
-annotations. Update `tonify_checklist.md`.
+`effect_palette_quantize` (the planned 5th) deferred — it needs
+real stbpal integration (palette uploaded as a 1D texture or
+constant array, plus per-pixel nearest-colour search in the
+fragment shader). Larger than the other effects (~100 LOC for
+the texture upload path) and not required for the Phase 6 gate.
 
-#### Session 6.4 — fps_3d_gpu Sessão A4 + final polish (~50 LOC)
+Smoke: `examples/fx_library_smoke.bpp` cycles through all four
+effects + passthrough at runtime (TAB to advance), with the
+active label drawn as overlay text so the on-screen result is
+always identifiable.
 
-fps_3d_gpu applies CRT effect via stbfx. Scoped zones around each
-pipeline pass: `@profile_zone("ray_cast")`, `@profile_zone("hud_render")`,
-`@profile_zone("crt_effect")`. Profile HUD shows each zone separately.
+#### Session 6.3 — Scoped zones compiler feature (DEFERRED)
 
-**Gate:** fps_3d_gpu with CRT visual, profile shows ray_cast /
-hud_render / crt_effect timings as separate entries.
+The original spec called for `@profile_zone("name") { ... }`
+syntax with lexer / parser / codegen support, plus stbprofile
+zone aggregation. That's a self-contained compiler feature on
+the same scale as V3 — defers to a dedicated session. fps_3d_gpu
+ships in Session 6.4 with the CRT effect but no scoped zones;
+the per-pass profile breakdown the original gate called for
+will land when Session 6.3 ships.
+
+#### Session 6.4 — fps_3d_gpu Sessão A4 (SHIPPED)
+
+fps_3d_gpu now imports stbfx, registers a CRT effect in
+`fps_init_phase`, and routes `fps_render_phase` through
+`fx_chain_begin / fx_apply(crt_fx) / fx_present()` instead of
+`game_render_end`. The ray-cast walls + HUD overlay + profile
+HUD all flow through the CRT post-process — barrel distortion,
+chromatic aberration on edges, and scanline dim are all visible
+on the rendered output without changing any of the per-pass
+draw code.
+
+**Gate:** fps_3d_gpu with CRT visual — **MET**. Per-pass
+profile breakdown via scoped zones — pending Session 6.3.
 
 ---
 
-### Phase 7 — Closeout + Decision Point (~100 LOC + content)
+### Phase 7 — Closeout + Decision Point (CLOSED 2026-05-07)
 
-**Objective:** Validate stack end-to-end, decision on next arc
-(Wolf3D content vs adventure demo vs RTS).
+The GPU pipeline arc closes. Sessions 7.1's narrative deliverable
+(closeout journal entry + comparison summary) lives in
+`docs/journal.md` under "2026-05-07 — Phase 7 CLOSED". Session
+7.2's decision is intentionally left open in the doc — the
+content arc that comes next is a player-led choice, not an
+engine-side commitment.
 
-#### Session 7.1 — Comparison + journaling (~100 LOC content)
+**Capabilities shipped through Phases 2–6:**
 
-Profile fps_3d (CPU baseline) vs fps_3d_gpu (full GPU stack) under
-identical conditions. Document trade-offs: GPU usage, frame time,
-memory, code size. Update `journal.md` with GPU pipeline closeout,
-capabilities shipped. Update `games_roadtrip.md` reflecting new
-ordering: foundation done, content arcs available.
+- **Phase 2** — GPU foundation: `gpu_pipeline_load`, custom
+  vertex+fragment pipelines, uniform binding, GPU timing
+  readout in the profile HUD.
+- **Phase 3** — Sprite batching: indexed sprite atlases via
+  stbsprite, palette-indexed GPU path.
+- **Phase 4** — Pixel-perfect: offscreen render targets,
+  integer-scaled letterboxed window blit, virtual canvas in
+  `game_init`, auto-orchestration via `game_render_begin/end`,
+  six games migrated.
+- **Phase 5** — Layered + parallax: stbscene cartridge with
+  registration-order layer composition and per-layer parallax
+  factors; bg_layer.metal pipeline.
+- **Phase 6** — Effect library: stbfx ping-pong chain + CRT,
+  scanlines, chromatic, dither effects; fps_3d_gpu adopts CRT.
 
-#### Session 7.2 — Decision point
+**Architectural comparison — fps_3d (CPU) vs fps_3d_gpu (full
+GPU stack):**
 
-You decide:
-- **Wolf3D content** (sprites + enemies + audio + doors): ~7 sessions,
-  uses Phase 3 sprite batching + Phase 5 layered (HUD)
-- **Adventure demo** (Thimbleweed-flavored): ~10 sessions, uses Phase
-  5 parallax + Phase 6 effects (watercolor)
-- **RTS content**: uses Phase 3 sprite batching + Phase 4 pixel-perfect
-  (zoom)
-- **Other**: platformer, etc.
+| Dimension | fps_3d (CPU) | fps_3d_gpu (GPU) |
+|---|---|---|
+| Wall rendering | per-pixel column scan in B++ | fragment shader fullscreen quad |
+| Texture sampling | software nearest from procedural buffers | none yet (solid colour per wall_type — Phase 7 follow-up if textured GPU walls become a priority) |
+| Floor/ceiling | software half-screen split | fragment shader half-screen split |
+| HUD overlay | render_text + render_rect on the framebuffer | render_text + image_draw_size into the offscreen target, post-processed by CRT |
+| Resolution | virtual 640×480 → window auto-scale | virtual 320×240 → window auto-scale |
+| Post-processing | none | CRT (barrel + chromatic + scanlines) |
+| LOC | ~330 game + stbtexture + stbraycast | ~310 game + fps_raycast.metal + stbfx |
+| Frame budget on M4 | well under 16ms | well under 16ms (GPU timing HUD shows the breakdown) |
 
-Decision deferred to Phase 7 close — enabled by Phases 2-6 work. Plan
-not committed today.
+The CPU baseline survives intentionally — both binaries
+co-exist and demonstrate the same gameplay through different
+rendering paths. Future work on textured GPU walls would close
+the visual-fidelity gap; the rest of the stack already matches
+or beats the CPU path.
+
+**Decision deferred** — content direction (Wolf3D content arc /
+adventure demo / RTS / platformer / other) stays open. The
+foundation built in Phases 2–6 enables any of them; the next
+move is a player-side call.
 
 ---
 

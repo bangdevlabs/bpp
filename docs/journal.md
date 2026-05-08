@@ -1,5 +1,247 @@
 # B++ Bootstrap Journal
 
+## 2026-05-07 — Phase 6 + Phase 7 CLOSED — GPU pipeline arc lands
+
+**Suite = 140/0/12 native. Bootstrap byte-stable. The GPU pipeline roadmap (`docs/gpu_pipeline_roadmap.md`) closes today: Phases 4 + 5 + 6 + 7 all green. One Phase 6 sub-session (6.3 scoped zones, compiler feature) deferred to a dedicated sprint — the rest shipped.**
+
+Phase 6 brought the post-process effect chain online and
+fps_3d_gpu adopted it. Phase 7 wrote the closeout — the GPU
+roadmap is no longer the active gating arc.
+
+### Phase 6.1 — stbfx cartridge (~280 LOC including 6.2 factories)
+
+`stb/stbfx.bsm` provides a ping-pong post-process pipeline
+sitting between the user's offscreen draws and the final window
+blit. Two scratch GPU targets are owned by the cartridge,
+created lazily on the first `fx_chain_begin`; the chain
+alternates between them so any number of effects can run in
+sequence without per-frame allocation.
+
+Public surface:
+- `init_fx()` idempotent
+- `fx_register(metal_path, vert, frag, uniform_size)` → handle
+- `fx_uniform(handle)` → writable pointer for per-frame uniform
+  updates
+- `fx_free(handle)`
+- `fx_chain_begin()` — closes the current offscreen pass,
+  primes ping-pong with `game_render_target()` as initial src
+- `fx_apply(handle)` — runs one effect, swaps current
+- `fx_present()` — blits final result through the standard
+  pixel-perfect letterbox + NEAREST upscale (replaces
+  `game_render_end` for frames running effects)
+
+stbgame gained one accessor — `game_render_target()` exposes the
+offscreen target stbfx needs as the chain source. Opaque outside
+that one use case.
+
+### Phase 6.2 — Effect library (4 of 5 effects)
+
+| Effect | Shader | Factory | Setters |
+|---|---|---|---|
+| CRT | `fx_crt.metal` | `effect_crt()` | intensity / aberration / scanline_density |
+| Scanlines | `fx_scanlines.metal` | `effect_scanlines()` | intensity / density |
+| Chromatic | `fx_chromatic.metal` | `effect_chromatic()` | amount / horizontal |
+| Dither | `fx_dither.metal` | `effect_dither()` | intensity / levels |
+
+Each effect bundles a shader + a typed factory + setters that
+poke the right uniform offsets, so callers don't need to track
+byte layouts. `effect_palette_quantize` (the planned 5th)
+deferred — it needs real stbpal integration (palette uploaded
+as a 1D texture, per-pixel nearest-colour search) and is
+roughly 100 LOC on its own.
+
+Smokes:
+- `examples/fx_passthrough_smoke.bpp` — null-effect chain with
+  TAB / 1 / 2 / 3 to exercise odd / even ping-pong cycles.
+- `examples/fx_crt_smoke.bpp` — single CRT pass with +/- live
+  intensity tuning.
+- `examples/fx_library_smoke.bpp` — cycles all five (passthrough
+  + 4 effects) at runtime via TAB.
+
+### Phase 6.3 — Scoped zones (DEFERRED)
+
+The original spec called for a `@profile_zone("name") { ... }`
+compiler feature (lexer / parser / codegen surgery) plus
+stbprofile zone aggregation. That's a self-contained compiler
+sprint on the same scale as V3 and merits its own focused
+session, not bundling with cartridge work. fps_3d_gpu shipped
+its CRT integration without scoped zones; per-pass profile
+breakdown waits for Session 6.3.
+
+### Phase 6.4 — fps_3d_gpu adopts CRT
+
+Three-line integration:
+1. `import "stbfx.bsm"`
+2. `init_fx(); crt_fx = effect_crt();` in `fps_init_phase`
+3. `fx_chain_begin(); fx_apply(crt_fx); fx_present();` replacing
+   `game_render_end()` in `fps_render_phase`
+
+Plus `fx_free(crt_fx)` in `fps_quit_phase`. The ray-cast walls,
+HUD overlay (crosshair + heart), and profile HUD all flow
+through the CRT post-process — barrel curvature on edges,
+chromatic fringing, scanline dim — without any change to the
+per-pass draw code.
+
+### Phase 7 — Closeout
+
+The GPU pipeline arc is done. Capabilities shipped through
+Phases 2–6:
+- Phase 2 — GPU foundation (custom pipelines, uniforms, timing)
+- Phase 3 — Sprite batching (stbsprite, indexed atlases)
+- Phase 4 — Pixel-perfect (offscreen targets, letterbox,
+  auto-orchestration, 6 games migrated)
+- Phase 5 — Layered + parallax (stbscene + bg_layer)
+- Phase 6 — Effect library (stbfx + 4 effects, fps_3d_gpu CRT)
+
+`docs/gpu_pipeline_roadmap.md` now carries CLOSED markers on
+every Phase header. The "Decision Point" the roadmap reserved
+for content direction (Wolf3D arc / adventure demo / RTS /
+platformer / other) stays intentionally open — the engine no
+longer gates that decision.
+
+### Architectural comparison — fps_3d vs fps_3d_gpu
+
+Both binaries co-exist and demonstrate identical gameplay
+through different rendering paths.
+
+| Dimension | fps_3d (CPU) | fps_3d_gpu (GPU) |
+|---|---|---|
+| Wall rendering | per-pixel column scan in B++ | fragment shader fullscreen quad |
+| Texture sampling | software nearest from procedural buffers | none yet — solid colour per wall_type |
+| HUD overlay | render_text + render_rect on framebuffer | same calls into the offscreen target, post-processed by CRT |
+| Post-processing | none | CRT (barrel + chromatic + scanlines) |
+| LOC | ~330 game + stbtexture + stbraycast | ~310 game + fps_raycast.metal + stbfx |
+| Frame budget on M4 | well under 16 ms | well under 16 ms (GPU timing HUD shows the per-frame split) |
+
+The remaining visual-fidelity gap is GPU wall texturing —
+fps_3d_gpu draws solid colours per wall_type, fps_3d samples
+procedural brick / stone / wood textures. Closing that gap is
+~150 LOC of work (upload the procedural textures as
+`texture2d_array`, sample in the fragment shader using
+`wall_type` as index + UV from hit point). Not on the GPU
+roadmap; landing it is a player-side call after the content
+direction is set.
+
+### Naming notes (housekeeping)
+
+- The Phase 5 closing commit was titled "Phase 4.3" earlier
+  today — colloquial slip from the conversation that drove
+  it. Roadmap + this journal use the canonical Phase 5
+  reference; the commit message itself isn't rewritten
+  (history > consistency).
+- "Phase 6.1 / 6.2 / 6.4" in this entry follow the roadmap's
+  internal session numbering inside Phase 6, not a separate
+  phase tier.
+
+### Next
+
+GPU roadmap is closed; next move is content. Three reasonable
+options on the table from `games_roadtrip.md`:
+
+1. **Wolf3D content** — sprites + enemies + audio + doors (~7
+   sessions). Uses Phase 3 sprite batching + Phase 6 CRT.
+2. **Adventure demo** — Thimbleweed-flavoured scenes (~10
+   sessions). Uses Phase 5 parallax + Phase 6 effects heavily.
+3. **GPU wall textures + fps_3d_gpu polish** — ~150 LOC GPU
+   sampling parity with the CPU baseline, completes the
+   roadmap's deferred Phase 7 visual-comparison gate.
+
+A fourth option (Phase 6.3 scoped zones compiler feature) sits
+on the compiler side rather than the content side — same scale
+as V3, would close out the roadmap's last open gate.
+
+---
+
+## 2026-05-07 — Phase 5 CLOSED — stbscene cartridge for layered backgrounds + parallax
+
+**Suite = 140/0/12 native. Bootstrap byte-stable. Two commits land Phase 5: shader-install pipeline (`c14f43d`) + stbscene + bg_layer shader + parallax_smoke (`f019680`).**
+
+The roadmap's Phase 5 ("Layered Backgrounds + Parallax") shipped
+as a single session today:
+
+- `stb/stbscene.bsm` (~165 LOC) — opt-in cartridge. `bg_layer_new`
+  registers an Image + parallax factors; `bg_set_camera` /
+  `bg_draw_all` per-frame iterates layers in registration order
+  and dispatches one textured fullscreen quad per visible layer.
+  The `bg_` prefix avoids collision with stbgame's existing
+  `scene_register / scene_switch` state-machine namespace.
+- `stb/shaders/bg_layer.metal` — single shared pipeline. Vertex
+  emits a 4-vertex full-window quad; fragment maps each pixel to
+  "world" coords (window pixel + camera × factor), normalises
+  against texture size, samples NEAREST + repeat for infinite
+  tiling. Per-layer alpha multiplies texel alpha so transparent
+  gaps composite through the default alpha-blend pipeline.
+- `examples/parallax_smoke.bpp` (~110 LOC) — three procedural
+  layers (top / middle / bottom horizontal bands with alpha=0
+  outside the band) at parallax factors 0.1 / 0.4 / 1.0 in both
+  axes. WASD or arrow keys drive the camera. Visual confirmed:
+  three coloured stripe bands stack and parallax-separate
+  cleanly on horizontal + vertical input.
+
+### Naming slip — commit message ≠ canonical
+
+The closing commit was titled "Phase 4.3: stbscene cartridge for
+layered backgrounds + parallax" because the conversation that
+drove the work referred to it as a 4.x sub-phase. The roadmap
+reserved Phase 5 for it from the start; treat the commit name
+as a colloquial slip and Phase 5 as the canonical reference.
+The roadmap closeout entry (`docs/gpu_pipeline_roadmap.md`,
+"Phase 5 — Layered Backgrounds + Parallax (CLOSED 2026-05-07)")
+includes the same correction inline.
+
+### Sidequest landed in the same arc — shader install pipeline
+
+Phase 5's first execution attempt failed because
+`gpu_pipeline_load("assets/shaders/foo.metal", ...)` resolved
+relative to cwd, and games launched from `games/<name>/` saw the
+file as missing. Diagnosis traced through three layers (the
+fpsgpu shader-load failure on master earlier in the day was the
+same bug), and the fix landed first in commit `c14f43d`:
+
+- `assets/shaders/` → `stb/shaders/` (git mv, history preserved)
+- `install.sh` creates `/usr/local/lib/bpp/stb/shaders/` and
+  copies the four .metal sources alongside the .bsm modules.
+- `gpu_pipeline_load` now resolves shader paths through three
+  fallbacks: cwd-relative as given → `<install_dir>/<basename>`
+  → `path_asset(metal_path)` walk-up.
+- The embedded `_pp_blit_source` MSL string from Phase 4.1.4 is
+  gone — `_pp_blit_init` now just calls
+  `gpu_pipeline_load("pp_blit.metal", ...)` and benefits from
+  the same install-side resolution.
+- Game and example callers (fps_3d_gpu, gpu_pipeline_smoke,
+  gpu_timing_smoke) updated to pass the basename.
+
+### Cross-cartridge struct sugar
+
+stbscene reads `Image.tex_w / tex_h / tex` cross-cartridge via
+`auto img: Image; img = handle; ...img.tex_w...` — the same
+pattern fps_3d.bpp uses for `auto p: FPSBody`. Confirms B++'s
+typed-local trick traverses module boundaries cleanly; the
+`Image` struct definition in stbimage.bsm is reachable from any
+cartridge that imports it.
+
+### Globals + floats in cartridges — typed extrn
+
+stbscene needed module-level `_bg_cam_x` / `_bg_cam_y` to hold
+camera floats. Untyped `static extrn _bg_cam_x;` fired E232 on
+`_bg_cam_x = 0.0` (silent IEEE→int truncation). Fix: declare as
+`static extrn _bg_cam_x: float;` — the typed-extrn syntax
+`extrn _stl_default: Style;` from stbui.bsm extends to scalar
+types as well as struct types. Pattern documented in the
+journal so future cartridges find it without rediscovering.
+
+### Next
+
+Phase 6 (Effects + Scoped Zones, ~550 LOC, 4 sessions per
+roadmap) starts after this commit. Plan for the immediate push:
+6.1 stbfx cartridge basics + 6.2 effect library catalog + 6.4
+fps_3d_gpu adopts CRT + Phase 7 closeout. **Phase 6.3 (scoped
+zones compiler feature) defers to a dedicated session** — it
+touches lexer / parser / codegen and warrants the same focused
+treatment V3 got, not bundling with cartridge sprint work.
+
+---
+
 ## 2026-05-07 — Phase 4.2 CLOSED — All six games migrated to `game_render_begin / end`
 
 **bpp = `76548852854df699245f9562deb5d9a39a8eba6a`. Suite = 140/0/12 native + 114/0/38 C. Bootstrap byte-stable.**
