@@ -367,6 +367,37 @@ The compiler emits the explicit conversion path (`FCVTZS` on ARM64,
 `: word`, `: byte`, `: half`, `: quarter`. The `: int` synonym was
 removed in 0.23.x — `: word` is the canonical name.
 
+### `const` demotes float literals just like bare `auto`
+
+`const NAME = 0.001;` stores a parsed-int 0, NOT the IEEE bits of
+0.001. The const declaration has no type annotation slot in v0.23.x,
+so a float literal at the right-hand side is silently demoted at
+parse time. Subsequent uses see zero, not the intended fraction.
+
+Discovered 2026-05-09 while writing `tests/test_json_float.bpp` —
+`const _JSON_FLOAT_TOL = 0.000000001;` was 0 at every comparison
+site, making `diff > tol` always true and the test always fail.
+Replacement: declare a local instead, with the annotation:
+
+```b++
+auto tol_floor: float;
+tol_floor = 0.000000001;
+```
+
+| Pattern | Action |
+|---------|--------|
+| `const TOL = 1e-9;` (float literal at RHS) | Use `auto tol: float;` local with the same value, OR move the literal to the only call site that needs it |
+| `const PI = 3.14159;` ditto | Same — local annotated `: float` |
+| `const N = 8;` (integer) | Fine, `const` works for ints |
+| `const NAME = "label";` (string) | Fine, `const` works for string-pool refs |
+
+This is a real B++ language gap, not a Tonify-only stylistic rule —
+the const machinery should learn float typing the same way `auto`
+did. Tracked as a future compiler sidequest; until it ships, the
+`auto` workaround is the safe pattern. W027 (the diagnostic that
+catches `auto` demotion) does NOT fire on `const`, so the pitfall
+is silent — easy to miss in code review.
+
 Cross-reference: `~/.claude/projects/-Users-Codes-b--/memory/feedback_auto_float_silent_int.md`
 for the discovery story (CoreAudio sample-rate field corruption).
 

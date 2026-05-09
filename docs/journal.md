@@ -1,5 +1,104 @@
 # B++ Bootstrap Journal
 
+## 2026-05-09 — fxlab Sessão 1.1 — bpp_json float drop fix + json_float reader
+
+**Suite 142/0/12 native + 115/0/39 C, bootstrap byte-stable.** First
+brick of the fxlab arc (3 sessions targeting Wolf3D Phase 2 tuning
+workflow). Sessão 1.1 unblocks every downstream consumer that needs
+to read float values from JSON — the parser was silently dropping
+fractional and exponent digits since the MVP shipped.
+
+### What was broken
+
+`_json_parse_number` in `src/bpp_json.bsm:347` walked past the `.`
+and the `eE[+-]?` exponent characters but only kept the integer
+part. The kind discriminator was set to `JSON_FLOAT` correctly, but
+the payload slot stored `int_val * sign` — so `"intensity": 0.6`
+parsed with payload 0, `"frame_dt": 1.5e3` parsed with payload 1.
+Every `json_int(doc, idx)` call on a float node returned the
+truncated integer; there was no `json_float` reader at all.
+
+### What landed
+
+- `_json_parse_number` now computes the float value during the parse
+  using B++ float arithmetic (`frac_val += digit * scale` with scale
+  shrinking 0.1 → 0.01 → 0.001 per digit), then applies sign and
+  exponent. The result is written via `pokefloat(out_int, val)` so
+  the existing payload slot carries IEEE 754 bits without changing
+  the JsonDoc layout.
+- New reader `json_float(doc, idx)` returns the value via
+  `peekfloat`. Symmetric to the writer — same 8 bytes, opposite
+  direction.
+- `tests/test_json_float.bpp` covers 8 float shapes (positive
+  decimal, negative decimal, integer-style `1.0`, multi-digit
+  fraction, tiny fraction, scientific positive, scientific
+  negative, scientific without fraction) + 3 integer regression
+  cases.
+
+### Caminho do fix — três aprendizados
+
+The TDD path surfaced three real B++ gotchas worth pinning:
+
+1. **`putmsg` adds a newline**, `putstr` doesn't. The test output
+   looked corrupted ("FAIL:\n0.6\n\n" instead of "FAIL: 0.6\n")
+   because every `putmsg` call ends with putchar(10). Switching to
+   `putstr` for inline tokens + `putchar(10)` for the line break is
+   the cleaner pattern.
+
+2. **Float values across function-call argument boundaries need an
+   intermediate `: float` local.** Passing `parse_float_doc("0.6")`
+   directly as an argument to `check_close(label, got: float, ...)`
+   silently demoted the bit pattern through V3 fn-type checking's
+   numeric conversion path. Storing the result in `auto got: float`
+   first preserved the IEEE bits.
+
+3. **`const NAME = 0.001;` demotes the literal to int 0.** This
+   was the actual root cause of the test failing even after the
+   parser fix landed correctly. `const` does not honour float
+   literals — graduated to Tonify Rule 12 with explicit warning
+   table. The `auto local: float; local = 0.001;` workaround is
+   the safe pattern until the const machinery grows float typing.
+
+### BON exploration note
+
+Conversation arc explored a custom B++ data format (`.bon` /
+"B++ Object Notation") to replace JSON ecosystem-wide. After
+weighing scope (~150-450 LOC parser/writer + spec + multi-session
+migration of every existing JSON in the repo) against actual
+need (4 effects × 3-4 params, easily handled by JSON +
+float-drop fix), concluded:
+
+**JSON + bpp_json float fix sufficient for current scope. Revisit
+if pain emerges post-Wolf3D Phase 2.** No tracked sidequest, no
+backlog overhead. If a real consumer ever needs comments / vec
+literals / tile-grid blocks / asset references in data files, the
+exploration thread is in this journal entry and the conversation
+log — easy to resume from cold.
+
+### Files touched
+
+```
+src/bpp_json.bsm                  +60   _json_parse_number computes float;
+                                        json_float reader added
+tests/test_json_float.bpp        +118   smoke covering 8 float shapes
+                                        + 3 int regression cases
+docs/tonify_checklist.md          +33   Rule 12 extended with `const`
+                                        float-demotion pitfall + workaround
+docs/journal.md                   +85   this entry
+```
+
+### State of the fxlab arc
+
+Sessão 1.1 (this commit) closed. Sessão 1.2 next: stbfx ganha
+`effect_from_json(path)` + `effect_set(handle, name, value)` +
+file_watch wiring. Sessão 1.3 then: 4 manifests in `stb/effects/`
++ migrate `examples/fps_3d_gpu.bpp` to use `effect_from_json` as
+the demo. Sessão 2 builds the fxlab GUI tool. Sessão 3 plugs it
+into Bang 9 as a panel. Plan canonical at
+`~/.claude/plans/groovy-munching-seahorse.md`.
+
+---
+
 ## 2026-05-08 — Phase 6.3 v2 CLOSED — scoped-cleanup epilogues for `@profile`
 
 **Suite 141/0/12 native + 114/0/39 C, bootstrap byte-stable.** Phase 6.3 v2 ships the cleanup epilogues that close the v1 leak on early `return` and panic. Single commit covers runtime + parser + codegen spine + both chip primitives + panic hook + smoke test + doc closeout.

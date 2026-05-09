@@ -5,21 +5,26 @@ back-catalogue of completed phases (Wolf3D Phase 1, V3 fn-type
 checking, GPU pipeline arc Phases 4–7) is mirrored in commit
 history.
 
-## Status — 2026-05-07
+## Status — 2026-05-09
 
 Version 0.23x. Self-hosting, dual-backend (ARM64 native macOS +
 x86_64 cross-compile Linux), C emitter in parity. Suite at
-**140 passed / 0 failed / 12 skipped** (native) +
-**114 passed / 0 failed / 38 skipped** (C). Bootstrap byte-stable
+**142 passed / 0 failed / 12 skipped** (native) +
+**115 passed / 0 failed / 39 skipped** (C). Bootstrap byte-stable
 from either repo-root or `tests/` cwd (runner pinned to REPO_ROOT
 since `c8c09e8`).
 
-**GPU pipeline arc CLOSED end-of-day 2026-05-07**: pixel-perfect
-default ON, layered backgrounds with parallax, post-process effect
-chain with 4 typed effects, scoped zones via `@profile("name") {
-... }` annotation, fps_3d_gpu adopts CRT + procedural wall textures.
-The Decision Point at the end of Phase 7 stays intentionally open —
-content arc next is a player-side call.
+**Recent landings:**
+- 2026-05-07 — GPU pipeline arc CLOSED (Phases 4-7): pixel-perfect
+  default, parallax, 4 post-process effects, `@profile` scoped zones.
+- 2026-05-08 — Phase 6.3 v2: scoped-cleanup epilogues for `@profile`
+  (early return + panic no longer leak open zones).
+- 2026-05-09 — fxlab Sessão 1.1: bpp_json float drop fix + json_float
+  reader; first brick of the fxlab arc (3 sessions, ~400 LOC total).
+
+**In flight:** fxlab arc (preset tuner for Wolf3D Phase 2). Plan
+at `~/.claude/plans/groovy-munching-seahorse.md`. Sessão 1.1 closed;
+1.2 + 1.3 + Sessão 2 GUI + Sessão 3 Bang 9 panel pending.
 
 ---
 
@@ -169,15 +174,30 @@ uploaded as a 1D texture or constant array, per-pixel
 nearest-colour search in the fragment shader). ~100 LOC. Ships
 when an actual game asks for indexed-palette post-process.
 
-### `fx_playground` tool (`tools/fx_playground/`)
+### `fxlab` tool (`tools/fxlab/`) — IN FLIGHT 2026-05-09
 
-Inspired by the `fx_library_smoke`. Standalone tool that loads
-.metal files with hot-reload, exposes uniform sliders, and
-exports the rendered result. Would turn stbfx into a public
-shader playground beyond just B++ developers.
+Renamed from the original `fx_playground` proposal. Same intent:
+preset tuner that loads effect manifests, exposes uniform sliders,
+hot-reloads to running games via file_watch. Different scope: V1
+ships JSON manifests + slider GUI; live `.metal` editor (Modelo 4
+of the original design discussion) deferred until real signal
+emerges from the V1 tuner in use.
 
-User flagged this idea during Phase 6.2 testing; not on any
-formal roadmap yet.
+**Driver:** Wolf3D Phase 2 needs to calibrate 5+ effects × 3-4
+params each. Manual edit-build-run loop is insane at that volume.
+
+**Plan:** `~/.claude/plans/groovy-munching-seahorse.md`. 3 sessions:
+- Sessão 1 — substrate (~150 LOC). 1.1 closed (bpp_json float fix +
+  json_float reader). 1.2 + 1.3 next: stbfx ganha
+  `effect_from_json` + `effect_set` + file_watch wiring; 4 manifests
+  in `stb/effects/`; migrate `examples/fps_3d_gpu.bpp` as the demo.
+- Sessão 2 — fxlab GUI (~250 LOC). Standalone + lib (extracted as
+  `fxlab_lib.bsm` for Sessão 3 reuse). Sliders auto-generated from
+  preset params[]. Cross-process hot-reload demo.
+- Sessão 3 — Bang 9 panel hookup (~50 LOC). `_panel_fx` reusing
+  fxlab_lib via the same embed contract as modulab/level_editor.
+
+Total ~400 LOC. Each sessão ship-ready independently.
 
 ### x86_64 perf parity on Linux — B1 freelist + B2 inline
 

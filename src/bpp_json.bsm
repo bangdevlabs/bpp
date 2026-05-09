@@ -338,29 +338,53 @@ static _json_parse_string(doc, src, pos, len, out_off, out_len) {
     return 0 - 1;
 }
 
-// Parse a JSON integer (or a float skipped to its end). MVP
-// implementation: integer part only; any fractional or exponent
-// digits are consumed and discarded, with is_float flagged so the
-// caller knows the value is approximate. All locals declared at
-// the top — B++ has historically preferred that pattern, nested
-// `auto` inside loops/ifs sometimes confuses stack layout.
+// Parse a JSON number — integer or float, with optional sign and
+// scientific notation. Writes the parsed value through *out_int*
+// (with `pokefloat` when the result is a float, so the caller can
+// recover it via `peekfloat` on the same slot) and the discriminator
+// through *out_kind*. Returns the position right after the last
+// consumed character.
+//
+// Float computation uses B++ float arithmetic (`frac_val += digit * scale`)
+// rather than IEEE bit construction. Precision is sufficient for game-
+// tuning values (sliders, defaults, ranges) — six to seven significant
+// digits at typical magnitudes. If a future caller needs the
+// codegen-grade accuracy `cg_parse_float_bits` provides, that helper
+// can be reused by extracting its mantissa+exponent math into a shared
+// `parse_float_bytes` primitive.
+//
+// All locals declared at the top — B++ has historically preferred that
+// pattern, nested `auto` inside loops/ifs sometimes confuses stack
+// layout.
 static _json_parse_number(src, pos, len, out_kind, out_int) {
     auto ch, sign, int_val, is_float;
+    auto frac_val: float, frac_scale: float;
+    auto exp_sign, exp_val, e_iter;
+    auto val: float, mag_step: float;
 
-    sign = 1;
-    is_float = 0;
-    int_val = 0;
+    sign       = 1;
+    is_float   = 0;
+    int_val    = 0;
+    frac_val   = 0.0;
+    frac_scale = 0.1;
+    exp_sign   = 1;
+    exp_val    = 0;
 
+    // Optional leading minus.
     if (pos < len) {
         if (peek(src + pos) == '-') { sign = 0 - 1; pos++; }
     }
+
+    // Integer part — same accumulation as before.
     while (pos < len) {
         ch = peek(src + pos);
         if (ch < '0' || ch > '9') { break; }
         int_val = int_val * 10 + (ch - '0');
         pos++;
     }
-    // Fractional digits — consume but discard for MVP.
+
+    // Fractional part — accumulate into `frac_val` so the value
+    // survives. `frac_scale` shrinks by 10 per digit (0.1, 0.01, ...).
     if (pos < len) {
         if (peek(src + pos) == '.') {
             is_float = 1;
@@ -368,11 +392,16 @@ static _json_parse_number(src, pos, len, out_kind, out_int) {
             while (pos < len) {
                 ch = peek(src + pos);
                 if (ch < '0' || ch > '9') { break; }
+                frac_val   = frac_val + (ch - '0') * frac_scale;
+                frac_scale = frac_scale * 0.1;
                 pos++;
             }
         }
     }
-    // Scientific notation — same treatment.
+
+    // Exponent — capture sign and integer magnitude. Application
+    // happens after the int+frac are combined, so a value like
+    // `1.5e3` accumulates `1.5` first, then multiplies by 1000.
     if (pos < len) {
         ch = peek(src + pos);
         if (ch == 'e' || ch == 'E') {
@@ -380,19 +409,42 @@ static _json_parse_number(src, pos, len, out_kind, out_int) {
             pos++;
             if (pos < len) {
                 ch = peek(src + pos);
-                if (ch == '+' || ch == '-') { pos++; }
+                if (ch == '-')      { exp_sign = 0 - 1; pos++; }
+                else if (ch == '+') {                   pos++; }
             }
             while (pos < len) {
                 ch = peek(src + pos);
                 if (ch < '0' || ch > '9') { break; }
+                exp_val = exp_val * 10 + (ch - '0');
                 pos++;
             }
         }
     }
 
-    if (is_float != 0) { *(out_kind) = JSON_FLOAT; }
-    else               { *(out_kind) = JSON_INT; }
-    *(out_int) = int_val * sign;
+    if (is_float != 0) {
+        *(out_kind) = JSON_FLOAT;
+        // Combine integer + fractional, then apply sign. Sign goes
+        // last so a negative value with no fractional part still
+        // negates correctly (e.g. `-0.5` → -(0 + 0.5) = -0.5).
+        val = int_val + frac_val;
+        if (sign < 0) { val = 0.0 - val; }
+        // Apply 10^exp by repeated multiply (positive exponent) or
+        // repeated divide (negative). Loop is bounded by exp_val,
+        // which JSON spec caps at sane magnitudes for game data.
+        if (exp_val > 0) {
+            if (exp_sign > 0) { mag_step = 10.0; }
+            else              { mag_step = 0.1;  }
+            e_iter = 0;
+            while (e_iter < exp_val) {
+                val = val * mag_step;
+                e_iter = e_iter + 1;
+            }
+        }
+        pokefloat(out_int, val);
+    } else {
+        *(out_kind) = JSON_INT;
+        *(out_int) = int_val * sign;
+    }
     return pos;
 }
 
@@ -631,6 +683,19 @@ json_int(doc, idx)@base {
     auto d: JsonDoc;
     d = doc;
     return *(d.payload + idx * 8);
+}
+
+// Read a JSON_FLOAT node's value as a 64-bit IEEE double. The
+// payload slot stores the same bit pattern `_json_parse_number`
+// wrote via `pokefloat`, so `peekfloat` is the symmetric reader.
+// Calling on a JSON_INT node returns the int's bits reinterpreted
+// as a double — meaningless; check `json_type` first when the
+// caller is unsure of the node kind. No `@base` annotation because
+// `peekfloat` lives outside the @base lattice.
+json_float(doc, idx) {
+    auto d: JsonDoc;
+    d = doc;
+    return peekfloat(d.payload + idx * 8);
 }
 
 json_bool(doc, idx)@base {
