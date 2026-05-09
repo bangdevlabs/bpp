@@ -16,6 +16,7 @@ STB_DIR="$LIB_DIR/stb"
 # tests). Installed alongside the .bsm modules so gpu_pipeline_load
 # can resolve them by basename from any cwd.
 SHADER_DIR="$STB_DIR/shaders"
+EFFECTS_DIR="$STB_DIR/effects"
 FFI_DIR="$LIB_DIR/ffi"
 
 # Backend layout mirrors src/backend/ since the 0.23.x reorg:
@@ -191,6 +192,14 @@ sudo cp stb/*.bsm "$STB_DIR/"
 sudo rm -f "$SHADER_DIR"/*.metal
 sudo cp stb/shaders/*.metal "$SHADER_DIR/"
 
+# Install effect manifests (Sessão 1.3 of the fxlab arc). Each .json
+# declares a shader path + uniform params; effect_from_json reads them
+# at register time and file_watch_register fires on edits so fxlab and
+# any concurrent game stay in sync. Wipe first to drop renamed effects.
+sudo mkdir -p "$EFFECTS_DIR"
+sudo rm -f "$EFFECTS_DIR"/*.json
+sudo cp stb/effects/*.json "$EFFECTS_DIR/"
+
 # Install FFI bindings (raylib, SDL2 backends — proof B++ FFI works).
 sudo cp ffi/*.bsm "$FFI_DIR/"
 
@@ -278,6 +287,7 @@ echo "    $BIN_DIR/bug (debugger)"
 echo "    $LIB_DIR/ ($(ls $LIB_DIR/*.bsm 2>/dev/null | wc -l | tr -d ' ') runtime modules)"
 echo "    $STB_DIR/ ($(ls stb/*.bsm | wc -l | tr -d ' ') stb modules)"
 echo "    $SHADER_DIR/ ($(ls stb/shaders/*.metal | wc -l | tr -d ' ') shader sources)"
+echo "    $EFFECTS_DIR/ ($(ls stb/effects/*.json | wc -l | tr -d ' ') effect manifests)"
 echo "    $FFI_DIR/ ($(ls ffi/*.bsm | wc -l | tr -d ' ') FFI bindings)"
 echo "    $CHIP_ARM64_DIR/ ($(ls src/backend/chip/aarch64/*.bsm | wc -l | tr -d ' ') modules)"
 echo "    $CHIP_X64_DIR/ ($(ls src/backend/chip/x86_64/*.bsm | wc -l | tr -d ' ') modules)"
