@@ -27,19 +27,44 @@
 // before fx_apply, the same way stbshader's gpu_uniform_set_frag
 // works for one-shot custom pipelines.
 
-import "bpp_array.bsm";        // arr_new / arr_push (reserved for future chain caching)
+import "bpp_array.bsm";        // arr_new / arr_push for the loaded-effect registry
 import "bpp_buf.bsm";           // pokefloat_h
+import "bpp_json.bsm";          // effect_from_json reads .json manifests
+import "bpp_file.bsm";          // file_read_all for the manifest body
+import "bpp_str.bsm";           // str_dup / str_eq for param name lookup
 import "stbshader.bsm";         // gpu_pipeline_load + gpu_target_create + uniform/texture binders
 import "stbrender.bsm";         // render_begin / render_pass_end / render_end / render_clear
 import "stbgame.bsm";           // game_render_target / game_window_w / game_window_h /
                                 // game_letterbox_color / game_compute_present_rect
+import "stbimage.bsm";          // file_watch_register for hot-reload of presets
 
 // ── Effect struct ────────────────────────────────────────────
 
 struct FxEffect {
     pipeline,                   // gpu pipeline handle
     uniform,                    // ptr to uniform-buffer bytes (effect-owned)
-    uniform_size                // bytes; 0 means no uniform binding
+    uniform_size,               // bytes; 0 means no uniform binding
+    params,                     // FxParam[] when registered via effect_from_json,
+                                // 0 when registered via the legacy fx_register
+    params_count                // number of FxParam entries
+}
+
+// One typed slot in the effect's parameter table. Built by
+// effect_from_json from the JSON manifest; consumed by effect_set
+// for name-keyed runtime mutation. Convention: params[i] in the
+// manifest maps to byte offset i*4 in the uniform buffer (one
+// 32-bit float per slot), matching the .metal struct field order.
+struct FxParam {
+    name,                       // str_dup'd null-terminated param name
+    offset                      // byte offset in the uniform buffer
+}
+
+// Loaded-effect registry record. file_watch fires `_fx_reload_all`
+// whenever any registered manifest changes; the callback walks
+// every entry here and re-pokes the uniform from disk.
+struct FxLoaded {
+    path,                       // str_dup'd path of the .json manifest
+    fx                          // FxEffect handle the manifest backs
 }
 
 // ── Module state ─────────────────────────────────────────────
@@ -53,6 +78,11 @@ static extrn _fx_current;       // target holding the latest result
 static extrn _fx_other;          // the next destination (alternates)
 static extrn _fx_chain_active;  // 1 while between fx_chain_begin and fx_present
 static extrn _fx_inited;
+
+// Loaded-effect registry. Lazy-initialised the first time
+// effect_from_json runs so games that never load presets pay nothing.
+static extrn _fx_loaded_list;   // arr of FxLoaded
+static extrn _fx_loaded_inited;
 
 // ── Lifecycle ────────────────────────────────────────────────
 
@@ -77,6 +107,11 @@ void init_fx() {
 // the byte count of the fragment-stage uniform; pass 0 for
 // effects that take no uniform input. Returns the effect handle
 // or 0 on shader load failure.
+//
+// Use effect_from_json instead when the effect's defaults +
+// parameter names live in a `.json` manifest the user (or fxlab)
+// will edit at runtime — that variant wires file_watch so the
+// game picks up tweaks without a recompile.
 fx_register(metal_path, vert_name, frag_name, uniform_size) {
     init_fx();
     auto pipe;
@@ -86,6 +121,8 @@ fx_register(metal_path, vert_name, frag_name, uniform_size) {
     fx = malloc(sizeof(FxEffect));
     fx.pipeline     = pipe;
     fx.uniform_size = uniform_size;
+    fx.params       = 0;
+    fx.params_count = 0;
     if (uniform_size > 0) {
         fx.uniform = malloc(uniform_size);
         buf_fill(fx.uniform, 0, uniform_size);
@@ -98,11 +135,19 @@ fx_register(metal_path, vert_name, frag_name, uniform_size) {
 // Free an effect handle. The underlying pipeline lives until
 // process exit (Metal pipelines are intentionally never freed in
 // stbshader either — registry-style pattern), so this only
-// releases the uniform buffer + the wrapper struct.
+// releases the uniform buffer + the wrapper struct + any params
+// table the JSON-manifest path may have allocated.
 void fx_free(handle) {
-    auto fx: FxEffect;
+    auto fx: FxEffect, i, fp: FxParam;
     fx = handle;
     if (fx.uniform != 0) { free(fx.uniform); }
+    if (fx.params != 0) {
+        for (i = 0; i < fx.params_count; i++) {
+            fp = fx.params + i * sizeof(FxParam);
+            if (fp.name != 0) { free(fp.name); }
+        }
+        free(fx.params);
+    }
     free(fx);
 }
 
@@ -113,6 +158,223 @@ fx_uniform(handle)@base {
     auto fx: FxEffect;
     fx = handle;
     return fx.uniform;
+}
+
+// ── JSON-driven effect loader (Sessão 1.2) ───────────────────
+//
+// Manifest shape (one file per effect):
+//
+//   {
+//     "shader": "fx_crt.metal",
+//     "vert":   "crt_vert",
+//     "frag":   "crt_frag",
+//     "params": [
+//       { "name": "intensity",        "default": 0.6, "min": 0.0, "max": 2.0 },
+//       { "name": "aberration",       "default": 0.3, "min": 0.0, "max": 1.0 },
+//       { "name": "scanline_density", "default": 2.0, "min": 1.0, "max": 8.0 }
+//     ]
+//   }
+//
+// `params[]` order MUST match the .metal struct's float field
+// order. Each param becomes one 32-bit slot in the uniform buffer
+// at byte offset i*4. fxlab and any other tool that edits the
+// JSON write back in the same shape — `min`/`max` are UI hints,
+// the runtime ignores them.
+//
+// Hot-reload: the loader registers the manifest path with
+// file_watch_register. When the file changes on disk (fxlab save,
+// editor write), `_fx_reload_all` re-reads every loaded manifest
+// and re-pokes each uniform from the new defaults. Frame-aligned
+// because file_watch_tick runs at the top of the host's frame
+// loop, between game_frame_begin and the rest of rendering.
+
+// Lazy init for the loaded-effect registry — games that never
+// call effect_from_json pay nothing.
+static void _fx_loaded_init() {
+    if (_fx_loaded_inited != 0) { return; }
+    _fx_loaded_list   = arr_new();
+    _fx_loaded_inited = 1;
+}
+
+// Re-read the manifest at `path` and poke every default into the
+// effect's uniform buffer at offset i*4. Errors short-circuit
+// silently (keep last good values) — the running game shouldn't
+// freeze because someone saved a half-edited JSON.
+static void _fx_repoke_from_json(path, fx_handle) {
+    auto src, src_size, doc, root, params_idx, n, i;
+    auto fx: FxEffect, param_obj, default_node;
+    auto val: float;
+
+    fx = fx_handle;
+    src = file_read_all(path, &src_size);
+    if (src == 0) { return; }
+    doc = json_parse(src, src_size);
+    free(src);
+    if (doc == 0) { return; }
+
+    root       = json_root(doc);
+    params_idx = json_object_get(doc, root, "params");
+    if (params_idx < 0) { json_free(doc); return; }
+
+    n = json_length(doc, params_idx);
+    if (n > fx.params_count) { n = fx.params_count; }
+    for (i = 0; i < n; i++) {
+        param_obj    = json_child(doc, params_idx, i);
+        default_node = json_object_get(doc, param_obj, "default");
+        if (default_node < 0) { continue; }
+        val = json_float(doc, default_node);
+        pokefloat_h(fx.uniform + i * 4, val);
+    }
+    json_free(doc);
+}
+
+// File-watch callback. Fires when ANY registered manifest's
+// content hash advances. We re-poke every loaded effect because
+// the watch infrastructure does not pass the firing path through
+// to callbacks. With ≤ a handful of effects in practice (4 in
+// stb/effects/ today), the over-work is hundreds of microseconds
+// per fire — invisible against the rendering frame budget.
+static void _fx_reload_all() {
+    auto i, n, loaded_ptr, loaded: FxLoaded;
+    if (_fx_loaded_inited == 0) { return; }
+    n = arr_len(_fx_loaded_list);
+    for (i = 0; i < n; i++) {
+        loaded_ptr = arr_get(_fx_loaded_list, i);
+        if (loaded_ptr == 0) { continue; }
+        loaded = loaded_ptr;
+        _fx_repoke_from_json(loaded.path, loaded.fx);
+    }
+}
+
+// Append a (path, fx) pair to the registry and arm file_watch on
+// the path. Each registration adds its own watch entry — when
+// path X changes, file_watch_tick fires _fx_reload_all once for
+// X, and _fx_reload_all reconciles every effect (cheap, see above).
+static void _fx_register_for_reload(path, fx) {
+    auto loaded: FxLoaded;
+    _fx_loaded_init();
+    loaded      = malloc(sizeof(FxLoaded));
+    loaded.path = str_dup(path);
+    loaded.fx   = fx;
+    _fx_loaded_list = arr_push(_fx_loaded_list, loaded);
+    file_watch_register(loaded.path, fn_ptr(_fx_reload_all));
+}
+
+// Load an effect from a JSON manifest. Returns the FxEffect handle
+// or 0 on any failure (file unreadable, JSON malformed, shader
+// load failure, missing required fields). Failures emit a stderr
+// diagnostic explaining what went wrong — same contract as
+// gpu_pipeline_load, so `effect_from_json` slots in identically.
+//
+// The returned handle is registered for hot-reload. Subsequent
+// edits to the manifest (via fxlab, editor, scripted touch) will
+// re-poke this effect's uniform on the next file_watch_tick.
+effect_from_json(path) {
+    auto src, src_size, doc, root;
+    auto shader, vert, frag;
+    auto params_idx, n_params, uniform_size;
+    auto fx: FxEffect, params_buf, fp: FxParam, i;
+    auto param_obj, name_node, default_node;
+    auto val: float;
+
+    init_fx();
+
+    src = file_read_all(path, &src_size);
+    if (src == 0) {
+        put_err("effect_from_json: cannot read ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+    doc = json_parse(src, src_size);
+    free(src);
+    if (doc == 0) {
+        put_err("effect_from_json: malformed JSON in ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    root       = json_root(doc);
+    shader     = json_object_get_string(doc, root, "shader");
+    vert       = json_object_get_string(doc, root, "vert");
+    frag       = json_object_get_string(doc, root, "frag");
+    params_idx = json_object_get(doc, root, "params");
+
+    if (shader == 0 || vert == 0 || frag == 0 || params_idx < 0) {
+        put_err("effect_from_json: missing shader/vert/frag/params in ");
+        put_err(path);
+        put_err("\n");
+        json_free(doc);
+        return 0;
+    }
+
+    n_params = json_length(doc, params_idx);
+    // Each param is one 32-bit float slot. Round up to the 16-byte
+    // Metal alignment minimum so the uniform buffer always satisfies
+    // MTLBuffer alignment regardless of how few params an effect has.
+    uniform_size = n_params * 4;
+    if (uniform_size < 16) { uniform_size = 16; }
+
+    fx = fx_register(shader, vert, frag, uniform_size);
+    if (fx == 0) {
+        json_free(doc);
+        return 0;
+    }
+
+    // Allocate + populate the params metadata table. Order in
+    // params[] = byte order in the uniform struct (the .metal
+    // author maintains this 1:1 mapping; it changes only when the
+    // shader struct itself changes, which is rare).
+    if (n_params > 0) {
+        params_buf      = malloc(n_params * sizeof(FxParam));
+        fx.params       = params_buf;
+        fx.params_count = n_params;
+        for (i = 0; i < n_params; i++) {
+            fp           = params_buf + i * sizeof(FxParam);
+            param_obj    = json_child(doc, params_idx, i);
+            name_node    = json_object_get(doc, param_obj, "name");
+            default_node = json_object_get(doc, param_obj, "default");
+            if (name_node < 0) { fp.name = 0; }
+            else               { fp.name = str_dup(json_string(doc, name_node)); }
+            fp.offset = i * 4;
+            if (default_node >= 0) {
+                val = json_float(doc, default_node);
+                pokefloat_h(fx.uniform + i * 4, val);
+            }
+        }
+    }
+
+    _fx_register_for_reload(path, fx);
+    json_free(doc);
+    return fx;
+}
+
+// Mutate one parameter by name. O(N) lookup over the params table
+// — N is typically ≤ 4 in practice, so the linear scan is cheaper
+// than any hash setup. Returns 1 on hit, 0 if `name` doesn't match
+// any param of `handle`. No-op for handles that did not come from
+// effect_from_json (params == 0).
+//
+// Use this for runtime animation of effect parameters — game code
+// can drive `intensity` from a beat envelope, `aberration` from a
+// damage state, etc., independent of whatever defaults the JSON
+// declares. file_watch reload clobbers per-frame writes on its
+// next fire; that's acceptable because the next frame's animation
+// pass will re-apply.
+effect_set(handle, name, val: float) {
+    auto fx: FxEffect, fp: FxParam, i;
+    fx = handle;
+    if (fx.params == 0) { return 0; }
+    for (i = 0; i < fx.params_count; i++) {
+        fp = fx.params + i * sizeof(FxParam);
+        if (fp.name == 0) { continue; }
+        if (str_eq(fp.name, name)) {
+            pokefloat_h(fx.uniform + fp.offset, val);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // ── Chain orchestration ──────────────────────────────────────
