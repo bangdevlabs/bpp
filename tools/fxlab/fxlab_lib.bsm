@@ -1,0 +1,465 @@
+// fxlab_lib.bsm — JSON editor for stbfx effect manifests.
+//
+// Embed contract matches modulab_lib / level_editor_lib:
+//
+//   void fxlab_lib_init();
+//   fxlab_lib_frame(px, py, pw, ph);   // returns 1 to request quit
+//   void fxlab_lib_shutdown();
+//
+// fxlab is a JSON editor with sliders. The user runs a target
+// game (fps_3d_gpu, fx_crt_smoke, fps_wolf3d) in a parallel
+// process; this tool rewrites stb/effects/<name>.json in place
+// when sliders move, and the running game's file_watch_tick
+// re-pokes the uniform on the next frame (~30 ms). No inline
+// viewport — the actual game IS the preview, which matches real
+// tuning workflow better than a synthetic test scene would.
+//
+// Layout:
+//
+//   +-------------+--------------------------+
+//   | preset list | active preset            |
+//   |             |                          |
+//   | crt         | path: stb/effects/...    |
+//   | scanlines   |                          |
+//   | chromatic   | <slider> intensity   0.6 |
+//   | dither      | <slider> aberration  0.3 |
+//   |             | <slider> scanline_d  2.0 |
+//   |             |                          |
+//   |             | ESC to quit              |
+//   +-------------+--------------------------+
+
+import "bpp_array.bsm";
+import "bpp_buf.bsm";
+import "bpp_file.bsm";
+import "bpp_json.bsm";
+import "bpp_math.bsm";       // floor_f for the float formatter
+import "bpp_str.bsm";
+// Note: fxlab is a pure JSON editor — it never loads the .metal
+// pipeline. The actual game/demo running in another process holds
+// the FxEffect handle and uses file_watch_tick to re-poke its
+// uniforms when this tool rewrites the JSON.
+import "stbinput.bsm";       // mouse_x, mouse_y, mouse_down, key_pressed, etc.
+import "stbdraw.bsm";        // draw_rect (background), measure_text
+import "stbui.bsm";          // gui_slider, gui_label_c, theme accessors
+
+// ── Tunables ─────────────────────────────────────────────────
+
+// Width of the preset-list sidebar. Rest of the window is the
+// param panel.
+const _FXLAB_SIDEBAR_W   = 180;
+
+// Slider magnification factor — gui_slider works in integer steps,
+// so 4-decimal precision is achieved by scaling float values up by
+// this amount on display and back down on read. Caps at int range
+// well above any reasonable param value.
+const _FXLAB_SLIDER_SCALE = 10000;
+
+// Maximum number of presets the V0 layout will show. Static
+// allocation keeps the init path malloc-free.
+const _FXLAB_MAX_PRESETS = 8;
+
+// Maximum params per preset. The 4 canonical effects use ≤ 3 each;
+// 16 leaves room for future parameter-rich shaders without
+// reallocating the table.
+const _FXLAB_MAX_PARAMS  = 16;
+
+// ── Per-param UI state ───────────────────────────────────────
+
+// One slot per slider on the right-hand panel. Built fresh from
+// the JSON manifest every time the user selects a preset.
+struct UiParam {
+    name,                // str_dup'd null-terminated identifier
+    default_val: float,  // value declared by the manifest
+    min_val:     float,  // slider lower bound (UI hint)
+    max_val:     float,  // slider upper bound (UI hint)
+    current_val: float   // what fxlab last set; mutated on slider drag
+}
+
+// ── Module state ─────────────────────────────────────────────
+
+static extrn _fxlab_inited;
+static extrn _fxlab_preset_paths;     // word array, _FXLAB_MAX_PRESETS slots
+static extrn _fxlab_preset_names;     // word array, display labels
+static extrn _fxlab_preset_count;
+static extrn _fxlab_selected;         // index in _fxlab_preset_paths
+static extrn _fxlab_ui_params;        // UiParam[] for the active preset
+static extrn _fxlab_ui_param_count;
+static extrn _fxlab_drag_dirty;       // 1 while a drag is in progress
+
+// ── Internal helpers ─────────────────────────────────────────
+
+// Format a float value into a strbuf with 4 decimal places.
+// Game-tuning values stay in 0.001..1e10 range, where 4 decimals
+// preserves slider precision without scientific notation.
+// Negative values are emitted with a leading '-'; the integer
+// part follows, then '.', then exactly 4 fractional digits with
+// leading zeros (frac=10 → ".0010").
+static _strbuf_float(sb, val: float) {
+    auto int_part: float, frac_part: float;
+    auto int_int: word, frac_int: word;
+
+    if (val < 0.0) {
+        sb = strbuf_ch(sb, '-');
+        val = 0.0 - val;
+    }
+    int_part  = floor_f(val);
+    frac_part = val - int_part;
+    int_int   = int_part;
+    sb = strbuf_num(sb, int_int);
+    sb = strbuf_ch(sb, '.');
+    frac_part = frac_part * 10000.0;
+    frac_int  = frac_part;
+    if (frac_int < 1000) { sb = strbuf_ch(sb, '0'); }
+    if (frac_int <  100) { sb = strbuf_ch(sb, '0'); }
+    if (frac_int <   10) { sb = strbuf_ch(sb, '0'); }
+    sb = strbuf_num(sb, frac_int);
+    return sb;
+}
+
+// Free the previous UI params table (each name was str_dup'd).
+// Idempotent — safe to call before a fresh selection or on shutdown.
+static void _fxlab_free_ui_params() {
+    auto i, fp: UiParam;
+    if (_fxlab_ui_params == 0) { return; }
+    for (i = 0; i < _fxlab_ui_param_count; i++) {
+        fp = _fxlab_ui_params + i * sizeof(UiParam);
+        if (fp.name != 0) { free(fp.name); }
+    }
+    _fxlab_ui_params      = 0;
+    _fxlab_ui_param_count = 0;
+}
+
+// Parse the manifest at `path` into the UI params table. Pulls
+// name/default/min/max for each entry. Falls back to (0.0, 1.0)
+// for missing min/max so a sloppy manifest still gets a usable
+// slider range.
+static _fxlab_load_ui_params(path) {
+    auto src, src_size, doc, root, params_idx, n, i;
+    auto fp: UiParam, param_obj, name_node, default_node, min_node, max_node;
+
+    _fxlab_free_ui_params();
+
+    src = file_read_all(path, &src_size);
+    if (src == 0) { return 0; }
+    doc = json_parse(src, src_size);
+    free(src);
+    if (doc == 0) { return 0; }
+
+    root       = json_root(doc);
+    params_idx = json_object_get(doc, root, "params");
+    if (params_idx < 0) { json_free(doc); return 0; }
+
+    n = json_length(doc, params_idx);
+    if (n > _FXLAB_MAX_PARAMS) { n = _FXLAB_MAX_PARAMS; }
+    _fxlab_ui_params      = malloc(n * sizeof(UiParam));
+    _fxlab_ui_param_count = n;
+
+    for (i = 0; i < n; i++) {
+        fp           = _fxlab_ui_params + i * sizeof(UiParam);
+        param_obj    = json_child(doc, params_idx, i);
+        name_node    = json_object_get(doc, param_obj, "name");
+        default_node = json_object_get(doc, param_obj, "default");
+        min_node     = json_object_get(doc, param_obj, "min");
+        max_node     = json_object_get(doc, param_obj, "max");
+
+        if (name_node < 0) { fp.name = 0; }
+        else               { fp.name = str_dup(json_string(doc, name_node)); }
+
+        if (default_node >= 0) { fp.default_val = json_float(doc, default_node); }
+        else                   { fp.default_val = 0.0; }
+
+        if (min_node >= 0) { fp.min_val = json_float(doc, min_node); }
+        else               { fp.min_val = 0.0; }
+
+        if (max_node >= 0) { fp.max_val = json_float(doc, max_node); }
+        else               { fp.max_val = 1.0; }
+
+        fp.current_val = fp.default_val;
+    }
+    json_free(doc);
+    return 1;
+}
+
+// Switch the active preset. Reads the manifest into the UI table
+// only — fxlab does not own a live FxEffect handle (the running
+// game in the other process does). Slider edits flow through the
+// JSON file, picked up by that process's file_watch_tick.
+static void _fxlab_select(idx) {
+    auto path;
+    if (idx < 0 || idx >= _fxlab_preset_count) { return; }
+    _fxlab_selected = idx;
+    path = *(_fxlab_preset_paths + idx * 8);
+    _fxlab_load_ui_params(path);
+}
+
+// Write the active preset back to disk with current_val as the
+// new defaults. Preserves shader/vert/frag/min/max — only the
+// `default` field of each param updates. The active game's
+// file_watch_tick fires on the next frame and re-pokes its
+// uniform from the new defaults.
+static void _fxlab_save_active() {
+    auto sb, doc, root, src, src_size, params_idx, n, i;
+    auto fp: UiParam, path;
+    auto shader, vert, frag, param_obj, min_node, max_node;
+    auto pname, min_val: float, max_val: float;
+
+    if (_fxlab_ui_param_count == 0) { return; }
+    path = *(_fxlab_preset_paths + _fxlab_selected * 8);
+
+    // Re-read the current JSON so we preserve the shader path,
+    // entry names, and per-param min/max — fxlab only updates
+    // the default values.
+    src = file_read_all(path, &src_size);
+    if (src == 0) { return; }
+    doc = json_parse(src, src_size);
+    free(src);
+    if (doc == 0) { return; }
+
+    root       = json_root(doc);
+    shader     = json_object_get_string(doc, root, "shader");
+    vert       = json_object_get_string(doc, root, "vert");
+    frag       = json_object_get_string(doc, root, "frag");
+    params_idx = json_object_get(doc, root, "params");
+    if (shader == 0 || vert == 0 || frag == 0 || params_idx < 0) {
+        json_free(doc);
+        return;
+    }
+
+    init_str();
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "{\n  \"shader\": \"");
+    sb = strbuf_cat(sb, shader);
+    sb = strbuf_cat(sb, "\",\n  \"vert\":   \"");
+    sb = strbuf_cat(sb, vert);
+    sb = strbuf_cat(sb, "\",\n  \"frag\":   \"");
+    sb = strbuf_cat(sb, frag);
+    sb = strbuf_cat(sb, "\",\n  \"params\": [\n");
+
+    n = json_length(doc, params_idx);
+    if (n > _fxlab_ui_param_count) { n = _fxlab_ui_param_count; }
+    for (i = 0; i < n; i++) {
+        param_obj = json_child(doc, params_idx, i);
+        min_node  = json_object_get(param_obj == 0 ? 0 : doc, param_obj, "min");
+        max_node  = json_object_get(param_obj == 0 ? 0 : doc, param_obj, "max");
+        fp        = _fxlab_ui_params + i * sizeof(UiParam);
+        pname     = fp.name == 0 ? "" : fp.name;
+
+        if (min_node >= 0) { min_val = json_float(doc, min_node); } else { min_val = fp.min_val; }
+        if (max_node >= 0) { max_val = json_float(doc, max_node); } else { max_val = fp.max_val; }
+
+        sb = strbuf_cat(sb, "    { \"name\": \"");
+        sb = strbuf_cat(sb, pname);
+        sb = strbuf_cat(sb, "\", \"default\": ");
+        sb = _strbuf_float(sb, fp.current_val);
+        sb = strbuf_cat(sb, ", \"min\": ");
+        sb = _strbuf_float(sb, min_val);
+        sb = strbuf_cat(sb, ", \"max\": ");
+        sb = _strbuf_float(sb, max_val);
+        sb = strbuf_cat(sb, " }");
+        if (i + 1 < n) { sb = strbuf_cat(sb, ","); }
+        sb = strbuf_cat(sb, "\n");
+    }
+    sb = strbuf_cat(sb, "  ]\n}\n");
+
+    file_write_all(path, sb, strbuf_len(sb));
+    strbuf_free(sb);
+    json_free(doc);
+}
+
+// Build the display label for a preset path. "stb/effects/crt.json"
+// → "crt". Caller frees.
+static _fxlab_preset_display_name(path) {
+    auto plen, last_slash, dot, name_start, name_end, len, buf, i;
+    plen = str_len(path);
+    last_slash = 0;
+    for (i = 0; i < plen; i++) {
+        if (peek(path + i) == '/') { last_slash = i + 1; }
+    }
+    name_start = last_slash;
+    name_end   = plen;
+    for (i = name_start; i < plen; i++) {
+        if (peek(path + i) == '.') { name_end = i; break; }
+    }
+    len = name_end - name_start;
+    buf = malloc(len + 1);
+    for (i = 0; i < len; i++) {
+        poke(buf + i, peek(path + name_start + i));
+    }
+    poke(buf + len, 0);
+    return buf;
+}
+
+// ── Lifecycle ────────────────────────────────────────────────
+
+// One-time setup. Hardcodes the four canonical preset paths;
+// future versions can scan stb/effects/*.json once a
+// directory-listing helper that doesn't shell out exists.
+void fxlab_lib_init() {
+    if (_fxlab_inited != 0) { return; }
+    _fxlab_inited = 1;
+
+    init_ui();
+    theme_dark();
+
+    _fxlab_preset_paths = malloc(_FXLAB_MAX_PRESETS * 8);
+    _fxlab_preset_names = malloc(_FXLAB_MAX_PRESETS * 8);
+    *(_fxlab_preset_paths + 0 * 8) = "stb/effects/crt.json";
+    *(_fxlab_preset_paths + 1 * 8) = "stb/effects/scanlines.json";
+    *(_fxlab_preset_paths + 2 * 8) = "stb/effects/chromatic.json";
+    *(_fxlab_preset_paths + 3 * 8) = "stb/effects/dither.json";
+    _fxlab_preset_count = 4;
+
+    auto i;
+    for (i = 0; i < _fxlab_preset_count; i++) {
+        *(_fxlab_preset_names + i * 8) =
+            _fxlab_preset_display_name(*(_fxlab_preset_paths + i * 8));
+    }
+
+    _fxlab_selected       = 0;
+    _fxlab_ui_params      = 0;
+    _fxlab_ui_param_count = 0;
+    _fxlab_drag_dirty     = 0;
+
+    _fxlab_select(0);
+}
+
+// Per-frame draw + input. `(px, py, pw, ph)` is the panel rect
+// the host wants fxlab to live inside; standalone passes the full
+// window rect, the Bang 9 panel will pass a smaller rect.
+// Returns 1 when the user requests quit (ESC).
+fxlab_lib_frame(px, py, pw, ph) {
+    auto i, sx, sy, sw, sh, label_y, presets_x;
+    auto bg_dim, bg_panel, accent, text, text_muted;
+    auto fp: UiParam, slider_y;
+    auto val_int_min: word, val_int_max: word, val_int_cur: word;
+    auto new_int_cur: word, new_val: float;
+    auto val_buf, val_str_x;
+    auto was_dragging, mouse_now_down;
+
+    bg_dim     = _theme.surface_dim;
+    bg_panel   = _theme.surface;
+    accent     = _theme.accent;
+    text       = _theme.text;
+    text_muted = _theme.text_muted;
+
+    // Background fills the panel rect.
+    draw_rect(px, py, pw, ph, bg_dim);
+
+    // ── Left sidebar: preset list ────────────────────────────
+    draw_rect(px, py, _FXLAB_SIDEBAR_W, ph, bg_panel);
+    gui_label_c(px + 12, py + 12, "Presets", text);
+    presets_x = px + 12;
+    label_y   = py + 36;
+    for (i = 0; i < _fxlab_preset_count; i++) {
+        auto entry_color, entry_y;
+        entry_y = label_y + i * 22;
+        // Highlight active row, muted otherwise. Click anywhere on
+        // the row selects.
+        if (i == _fxlab_selected) {
+            draw_rect(px + 6, entry_y - 2, _FXLAB_SIDEBAR_W - 12, 18, accent);
+            entry_color = WHITE;
+        } else {
+            entry_color = text;
+        }
+        gui_label_c(presets_x, entry_y, *(_fxlab_preset_names + i * 8), entry_color);
+        if (mouse_pressed(MOUSE_LEFT) != 0) {
+            auto mx, my;
+            mx = mouse_x(); my = mouse_y();
+            if (mx >= px && mx <= px + _FXLAB_SIDEBAR_W &&
+                my >= entry_y - 2 && my <= entry_y + 16) {
+                _fxlab_select(i);
+            }
+        }
+    }
+
+    // ── Right panel: active preset path + sliders ───────────
+    sx = px + _FXLAB_SIDEBAR_W + 16;
+    sy = py + 12;
+    sw = pw - _FXLAB_SIDEBAR_W - 32;
+    if (sw < 100) { sw = 100; }
+
+    if (_fxlab_ui_param_count == 0) {
+        gui_label_c(sx, sy, "(no preset loaded)", text_muted);
+    } else {
+        gui_label_c(sx, sy, *(_fxlab_preset_paths + _fxlab_selected * 8), text_muted);
+
+        slider_y = sy + 28;
+        for (i = 0; i < _fxlab_ui_param_count; i++) {
+            fp = _fxlab_ui_params + i * sizeof(UiParam);
+            if (fp.name == 0) { continue; }
+
+            // Param name above the track.
+            gui_label_c(sx, slider_y, fp.name, text);
+
+            // Slider on the row below. gui_slider works in int
+            // space; scale current/min/max up by _FXLAB_SLIDER_SCALE
+            // and convert the result back. Same scaling preserves
+            // the float bit pattern within the slider's pixel
+            // resolution.
+            val_int_min = fp.min_val * _FXLAB_SLIDER_SCALE;
+            val_int_max = fp.max_val * _FXLAB_SLIDER_SCALE;
+            val_int_cur = fp.current_val * _FXLAB_SLIDER_SCALE;
+            new_int_cur = gui_slider(sx, slider_y + 14, sw - 80,
+                                      val_int_cur, val_int_min, val_int_max);
+            if (new_int_cur != val_int_cur) {
+                new_val        = new_int_cur;
+                new_val        = new_val / 10000.0;
+                fp.current_val = new_val;
+                _fxlab_drag_dirty = 1;
+            }
+
+            // Numeric readout to the right of the slider.
+            init_str();
+            val_buf = strbuf_new();
+            val_buf = _strbuf_float(val_buf, fp.current_val);
+            val_str_x = sx + sw - 70;
+            gui_label_c(val_str_x, slider_y + 12, val_buf, text);
+            strbuf_free(val_buf);
+
+            slider_y += 36;
+        }
+    }
+
+    // ── Footer hint ─────────────────────────────────────────
+    gui_label_c(px + 12, py + ph - 18,
+                "ESC to quit  |  click a preset to switch  |  drag a slider, save on release",
+                text_muted);
+
+    // ── Save-on-release ─────────────────────────────────────
+    // _drag_dirty stays 1 until the user lets go of the mouse,
+    // then we flush a single save. Avoids hammering disk during
+    // continuous drag, while keeping the file_watch round-trip
+    // visible within ~30 ms of release.
+    was_dragging   = _fxlab_drag_dirty;
+    mouse_now_down = mouse_down(MOUSE_LEFT);
+    if (was_dragging != 0 && mouse_now_down == 0) {
+        _fxlab_save_active();
+        _fxlab_drag_dirty = 0;
+    }
+
+    if (key_pressed(KEY_ESC)) { return 1; }
+    return 0;
+}
+
+// Cleanup: free the UI table + preset paths, clear init flag so
+// a re-init starts cleanly. fxlab does not own a live FxEffect
+// handle so there is nothing GPU-side to release.
+void fxlab_lib_shutdown() {
+    auto i;
+    if (_fxlab_inited == 0) { return; }
+    _fxlab_free_ui_params();
+    if (_fxlab_preset_names != 0) {
+        for (i = 0; i < _fxlab_preset_count; i++) {
+            auto nm;
+            nm = *(_fxlab_preset_names + i * 8);
+            if (nm != 0) { free(nm); }
+        }
+        free(_fxlab_preset_names);
+        _fxlab_preset_names = 0;
+    }
+    if (_fxlab_preset_paths != 0) {
+        free(_fxlab_preset_paths);
+        _fxlab_preset_paths = 0;
+    }
+    _fxlab_inited = 0;
+}

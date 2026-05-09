@@ -19,12 +19,12 @@ since `c8c09e8`).
   default, parallax, 4 post-process effects, `@profile` scoped zones.
 - 2026-05-08 — Phase 6.3 v2: scoped-cleanup epilogues for `@profile`
   (early return + panic no longer leak open zones).
-- 2026-05-09 — fxlab Sessão 1.1: bpp_json float drop fix + json_float
-  reader; first brick of the fxlab arc (3 sessions, ~400 LOC total).
+- 2026-05-09 — fxlab arc: Sessão 1 (substrate) + Sessão 2 (GUI) shipped.
+  JSON-driven effects + file_watch hot-reload + standalone tuner with
+  preset list + auto-generated sliders + save-on-release JSON write-back.
 
-**In flight:** fxlab arc (preset tuner for Wolf3D Phase 2). Plan
-at `~/.claude/plans/groovy-munching-seahorse.md`. Sessão 1.1 closed;
-1.2 + 1.3 + Sessão 2 GUI + Sessão 3 Bang 9 panel pending.
+**In flight:** fxlab Sessão 3 (Bang 9 `_panel_fx`, ~50 LOC). Plan
+at `~/.claude/plans/groovy-munching-seahorse.md`.
 
 ---
 
@@ -174,30 +174,35 @@ uploaded as a 1D texture or constant array, per-pixel
 nearest-colour search in the fragment shader). ~100 LOC. Ships
 when an actual game asks for indexed-palette post-process.
 
-### `fxlab` tool (`tools/fxlab/`) — IN FLIGHT 2026-05-09
+### `fxlab` tool (`tools/fxlab/`) — Sessões 1 + 2 SHIPPED 2026-05-09
 
 Renamed from the original `fx_playground` proposal. Same intent:
 preset tuner that loads effect manifests, exposes uniform sliders,
-hot-reloads to running games via file_watch. Different scope: V1
-ships JSON manifests + slider GUI; live `.metal` editor (Modelo 4
-of the original design discussion) deferred until real signal
-emerges from the V1 tuner in use.
+hot-reloads to running games via file_watch. V1 ships JSON
+manifests + slider GUI; live `.metal` editor (Modelo 4 of the
+original design discussion) deferred until real signal emerges
+from the V1 tuner in use.
 
 **Driver:** Wolf3D Phase 2 needs to calibrate 5+ effects × 3-4
 params each. Manual edit-build-run loop is insane at that volume.
 
 **Plan:** `~/.claude/plans/groovy-munching-seahorse.md`. 3 sessions:
-- Sessão 1 — substrate (~150 LOC). 1.1 closed (bpp_json float fix +
-  json_float reader). 1.2 + 1.3 next: stbfx ganha
-  `effect_from_json` + `effect_set` + file_watch wiring; 4 manifests
-  in `stb/effects/`; migrate `examples/fps_3d_gpu.bpp` as the demo.
-- Sessão 2 — fxlab GUI (~250 LOC). Standalone + lib (extracted as
-  `fxlab_lib.bsm` for Sessão 3 reuse). Sliders auto-generated from
-  preset params[]. Cross-process hot-reload demo.
+- Sessão 1 — substrate (~400 LOC). SHIPPED. JSON manifests +
+  `effect_from_json` + `effect_set` + file_watch wiring; 4 effects
+  migrated; visually validated end-to-end via `fps_3d_gpu` and
+  `fx_library_smoke`.
+- Sessão 2 — fxlab GUI (~470 LOC `fxlab_lib.bsm` + ~30 LOC entry).
+  SHIPPED. Standalone tool: preset sidebar + auto-generated sliders
+  per param + save-on-release JSON write-back. **Pure JSON editor —
+  does not load shaders itself**, the running game in another
+  process holds the FxEffect handle and reacts via file_watch_tick.
 - Sessão 3 — Bang 9 panel hookup (~50 LOC). `_panel_fx` reusing
-  fxlab_lib via the same embed contract as modulab/level_editor.
+  `fxlab_lib` via the same embed contract as modulab/level_editor.
+  Pending.
 
-Total ~400 LOC. Each sessão ship-ready independently.
+Total ~900 LOC actual (vs ~400 LOC original estimate; the GUI lib
+came in larger than planned because of the JSON formatter +
+save-on-release plumbing). Each sessão ships independently.
 
 ### x86_64 perf parity on Linux — B1 freelist + B2 inline
 

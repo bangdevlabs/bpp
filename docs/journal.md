@@ -1,5 +1,204 @@
 # B++ Bootstrap Journal
 
+## 2026-05-09 — fxlab Sessão 2 CLOSED — standalone GUI tuner
+
+**Suite 142/0/12 native, bootstrap byte-stable.** GUI window
+opens, preset sidebar lists the 4 effects, sliders auto-generate
+from each manifest's `params[]`, drag updates `current_val` and
+saves the JSON on mouse release. The running game in another
+process picks up the new defaults via `file_watch_tick` within
+~30 ms — same channel used by Sessão 1's manifest reload.
+
+### Architectural pivot during the session
+
+The first cut put fxlab on top of `stbgame` + maestro
+(`init_phase` / `solo_phase` / `render_phase`). The window opened
+black: maestro's render-phase semantics aren't a fit for a tool
+UI that only needs to paint widgets each frame. Switching to the
+`stbwindow` manual-loop pattern (per **Rule 23**, the same shape
+modulab and level_editor use) was the first correction.
+
+The second cut tried to call `effect_from_json` from
+`fxlab_lib_init` so the tool could `effect_set` the live uniform
+buffer on each slider drag. That crashed at `_stb_gpu_pipeline_load`
+because `window_init_full` only brings up the CPU framebuffer +
+NSImageView path — Metal device init lives behind `render_init`,
+which `stbgame` calls lazily inside `game_render_begin` but tools
+have no equivalent.
+
+Calling `render_init()` from the tool entry "fixed" the crash but
+caused a cream-coloured blank window: per the 2026-05-07 session
+note, `render_init` swaps the NSImageView out for a Metal layer,
+breaking the CPU `_stb_present` blit that `draw_end` relies on.
+
+The right answer was reading the design comment at the top of
+`fxlab_lib.bsm` more carefully: *"the actual game IS the
+preview"*. fxlab is a **pure JSON editor** — it never owns an
+`FxEffect` handle, never touches the GPU, never calls
+`gpu_pipeline_load`. The slider drag mutates `UiParam.current_val`
+and the save-on-release path rewrites the JSON file. The other
+process running the game owns the effect, and its
+`file_watch_tick` re-pokes the uniform when the JSON changes.
+
+This is the same workflow already used by modulab → pathfind for
+sprite hot-reload — fxlab just plugs into the same wire.
+
+### What landed
+
+- `tools/fxlab/fxlab.bpp` (~30 LOC) — standalone entry, `stbwindow`
+  manual loop, `init_ui` + `fxlab_lib_init` + draw loop +
+  `fxlab_lib_shutdown`. Mirrors modulab.bpp shape.
+- `tools/fxlab/fxlab_lib.bsm` (~470 LOC) — embed contract
+  (`fxlab_lib_init` / `fxlab_lib_frame(px,py,pw,ph)` /
+  `fxlab_lib_shutdown`). Reusable from Bang 9 (Sessão 3) and any
+  other host that wants the panel.
+  - Preset sidebar (180px, click-to-switch).
+  - Auto-generated sliders from `params[]` using `min` / `max` as
+    bounds. Float values × 10000 → int for `gui_slider` (which
+    works in int space), divided back on read. 4-decimal slider
+    precision.
+  - `_strbuf_float` helper (no `json_write_float` exists yet) —
+    integer + 4 fractional digits with leading zeros.
+  - Save-on-release: `_drag_dirty` flag flips on first slider
+    change, stays 1 while mouse held, save fires once on release.
+    Avoids hammering disk during continuous drag while keeping the
+    file_watch round-trip visible within ~30 ms of release.
+
+### Bug-fix tax paid along the way
+
+Three latent bugs surfaced while debugging the fxlab launches:
+
+- `stb/stbshader.bsm:156-158` — `put_err(metal_path)` smart
+  dispatch routed unannotated word args through `putnum_err`,
+  printing the path as a decimal address (`gpu_pipeline_load:
+  cannot read 4343132271`). Replaced with explicit `putstr_err`.
+  Compiler internals + low-level stb modules where smart dispatch
+  can misinfer should prefer the typed variants.
+- `stb/stbfx.bsm:140` — `fx_free(handle)` now no-ops on
+  `handle == 0`. Callers that stash a failed `effect_from_json`
+  result no longer SIGSEGV during their own teardown.
+- `stb/shaders/` — accidentally moved to `stb/effects/shaders/`
+  during prior session work, then `install.sh`'s `cp
+  stb/shaders/*.metal` failed silently with no install of any
+  shader sources. Restored to canonical location from git
+  (`stb/effects/shaders/` left as-is for cleanup later).
+
+### Locked-in feedback memories
+
+- `feedback_cartridge_minimalism` (Rule 23) — tools use
+  `stbwindow`, games use `stbgame`. Maestro is for game pacing;
+  tools own their own loop.
+- The render_init / NSImageView hazard was already documented in
+  `project_session_20260507`. Re-applying it: tools using
+  `stbwindow` must NOT call `render_init` unless they're prepared
+  to drive Metal themselves — otherwise the CPU `_stb_present`
+  path silently breaks.
+
+### What this unblocks
+
+- Wolf3D Phase 2 calibration: open `fxlab` in one terminal, the
+  game in another, drag sliders to dial in CRT + scanlines +
+  chromatic + dither without touching code.
+- Sessão 3 (Bang 9 `_panel_fx`): trivial — same embed contract
+  as modulab. Likely ~50 LOC.
+
+---
+
+## 2026-05-09 — fxlab Sessão 1 CLOSED — substrate end-to-end
+
+**Suite 142/0/12 native + 115/0/39 C, bootstrap byte-stable.**
+Sessão 1 of the fxlab arc shipped in 3 atomic commits. The
+substrate (JSON-driven effects + hot-reload via file_watch) is
+visually validated end-to-end through `fps_3d_gpu` and
+`fx_library_smoke`. Wolf3D Phase 2 can already tune CRT /
+scanlines / chromatic / dither via direct JSON edits — no GUI
+required. fxlab GUI (Sessão 2) becomes pure ergonomics on top
+of a working substrate.
+
+### Three commits
+
+- `5a9f05d` Sessão 1.1 — `bpp_json` float drop fix + `json_float`
+  reader (see entry below for full detail).
+- `fb66047` Sessão 1.2 — `stb/stbfx.bsm` ganha `effect_from_json(path)`
+  + `effect_set(handle, name, val)` + hot-reload via
+  `file_watch_register`. Legacy `fx_register` API preserved (lib
+  smoke uses it for passthrough). +266 / -4 LOC.
+- `639a427` Sessão 1.3 — 4 manifests in
+  `stb/effects/{crt,scanlines,chromatic,dither}.json`, migrate 4
+  consumers (`fx_crt_smoke`, `fx_library_smoke`, `fps_3d_gpu`,
+  `fps_wolf3d`), drop the 4 typed factories + 9 setters from
+  stbfx. Net subtraction in stbfx (-130 LOC). `install.sh`
+  installs `stb/effects/`. +82 / -130 LOC.
+
+### Visual validation
+
+- **fps_3d_gpu**: CRT visible. Edit `stb/effects/crt.json` in
+  runtime → CRT mutates within one file_watch tick (~30ms).
+  Confirms `pokefloat_h` offset correctness + file_watch firing
+  + reload callback reconciles the uniform buffer.
+- **fx_library_smoke**: cycles passthrough + 4 effects, each
+  applies visually as before. Confirms scanlines / chromatic /
+  dither param names in JSON map to correct shader struct
+  offsets (different param names per effect: `density`, `amount`,
+  `horizontal`, `levels`).
+
+### Architectural decisions locked
+
+- **Defaults flow runtime, not compile-time** (D1 from the
+  over-engineered original plan). `.gen.bsm` codegen path dropped;
+  `effect_from_json` reads JSON at register time and on every
+  file_watch fire. Keeps "edit JSON, see in running game" as the
+  canonical workflow.
+- **`params[]` order in JSON = float field order in the `.metal`
+  struct.** Author maintains the 1:1 manually; changes only when
+  the shader struct changes (rare). No build-time MSL parser.
+  Offset within the uniform buffer = `i * 4` per param.
+- **`_fx_reload_all` walks every loaded effect on any watch
+  fire.** Over-work proportional to N effects (4 today); becomes
+  concern at 50+ but trivially fixable then by threading the
+  fired path through the callback.
+- **V1 supports float params only.** Int-valued params (e.g.
+  dither `levels` conceptually) are stored as 32-bit floats and
+  the shader truncates. Documented in the `effect_from_json`
+  comment.
+
+### What this unblocks
+
+- **Wolf3D Phase 2 tuning workflow** (canonical use case per
+  `docs/games_roadtrip.md:274`). Stack of 5+ effects, edit JSON
+  per effect, see live changes. No fxlab GUI needed for the work
+  to begin.
+- **Sessão 2 (fxlab GUI standalone)**: now a thin layer — list
+  `.json` in `stb/effects/`, render one slider per param using
+  `min`/`max` as bounds, drag → write JSON, file_watch
+  propagates to running games. ~250 LOC.
+- **Sessão 3 (Bang 9 panel)**: trivial embed contract on top of
+  the GUI lib. ~50 LOC.
+
+### Files touched (Sessões 1.2 + 1.3 combined)
+
+```
+stb/stbfx.bsm                 +137 / -134  effect_from_json + effect_set + file_watch;
+                                            drop 4 typed factories + 9 setters
+stb/effects/crt.json            +10        new manifest
+stb/effects/scanlines.json       +9        new manifest
+stb/effects/chromatic.json       +9        new manifest
+stb/effects/dither.json          +9        new manifest
+examples/fx_crt_smoke.bpp       +2 / -2    migrate to effect_from_json
+examples/fx_library_smoke.bpp   +4 / -4    migrate to effect_from_json
+examples/fps_3d_gpu.bpp         +9 / -6    migrate + extend comment
+games/fps/fps_wolf3d.bpp        +9 / -6    migrate + extend comment
+install.sh                      +10        install stb/effects/
+```
+
+### State of the fxlab arc
+
+Sessão 1 closed end-to-end. Sessão 2 (fxlab GUI standalone, ~250
+LOC) unblocked. Sessão 3 (Bang 9 panel, ~50 LOC) follows. Plan
+canonical at `~/.claude/plans/groovy-munching-seahorse.md`.
+
+---
+
 ## 2026-05-09 — fxlab Sessão 1.1 — bpp_json float drop fix + json_float reader
 
 **Suite 142/0/12 native + 115/0/39 C, bootstrap byte-stable.** First
