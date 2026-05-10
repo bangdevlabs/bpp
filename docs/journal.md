@@ -1,5 +1,92 @@
 # B++ Bootstrap Journal
 
+## 2026-05-10 — fxlab Sessão 3 CLOSED — Bang 9 `_panel_fx`. Arc done.
+
+**Suite 142/0/12 native, bootstrap byte-stable.** Bang 9 grew a
+seventh tab: **Effects**, sitting between Levels and Code. Click
+it and the same fxlab tuner that ships standalone renders inside
+the Bang 9 panel rect, sharing the host's theme + UI subsystem.
+Same hot-reload wire as the standalone — drag a slider, the JSON
+rewrites on mouse-release, any other process running an effect
+loaded from that JSON re-pokes its uniform within ~30 ms.
+
+Sessão 3 closed the fxlab arc. All three sessões shipped on the
+day they were planned (Sessão 1 + Sessão 2 + this one).
+
+### What landed
+
+- `bang9/bang9.bpp` — `g_tab_count` 6 → 7, new "Effects" label
+  inserted at index 3 (between Levels and Code per user
+  preference; visual / runtime tabs grouped before code-edit /
+  build-run tabs). All hardcoded tab indices in `bang9/` shifted:
+  Code 3 → 4, Run 4 → 5, Debug 5 → 6.
+- `bang9/panels.bsm` — `load "../tools/fxlab/fxlab_lib.bsm"`,
+  dispatcher branch for `g_active_tab == 3`, `_panel_fx(x, y, w, h)`
+  with lazy-init pattern matching `_panel_sprites` / `_panel_levels`
+  (init-once flag, 600×400 minimum-size placeholder, `fxlab_lib_frame`
+  per tick). ~25 LOC for the panel itself.
+
+### Embed contract refinement
+
+`fxlab_lib_init` originally called `init_ui()` + `theme_dark()`
+itself. That works for the standalone but stomps the host's theme
+in an embed. Lifted both calls out to the host (the standalone
+entry now calls them right after `window_init_full`, Bang 9
+already does). Same convention as `modulab_lib` and
+`level_editor_lib` — embed libs touch only their own state, the
+host owns UI subsystem boot + palette.
+
+This is the canonical embed contract going forward, worth its own
+checklist item: **embed lib `_init` MUST NOT call `init_ui` or
+`theme_*` — host responsibility.** Without this rule any panel
+calling `theme_dark` would silently flatten the Bang 9 acme
+palette to dark when its tab opens, and the user would see Bang 9
+"change colors" depending on which tab was active.
+
+### What this unblocks
+
+- Wolf3D Phase 2 calibration in a single window: open Bang 9 with
+  the project root, run the game from the Run tab (F8), switch to
+  Effects, drag sliders, switch back to Run to see the change
+  reflected — file_watch_tick handles propagation between the two
+  panels' processes (the running game is a child of Bang 9's
+  runner, but they're still independent processes that
+  communicate only through the JSON files on disk).
+- Same workflow scales to whatever new effects ship after Wolf3D —
+  drop a `stb/effects/foo.json` + `stb/shaders/foo.metal`, it
+  appears as another preset in fxlab on next launch (V1 still
+  hardcodes the 4 in `fxlab_lib_init`; auto-discover via
+  directory listing is the obvious V2 once an OS-portable
+  `dir_list` helper graduates from `bang9/dir.bsm`).
+
+### How to verify (manual smoke)
+
+Two-process workflow stays the same as Sessão 2 — Bang 9 is just
+another host:
+
+```
+# Terminal 1: run a game that loads an effect from JSON
+bpp examples/fps_3d_gpu.bpp -o /tmp/fpsgpu && /tmp/fpsgpu
+
+# Terminal 2 (or inside Bang 9 itself):
+/tmp/bang9   # click "Effects" tab, drag CRT intensity slider
+```
+
+Drag → number updates live in the readout. Release → JSON writes
+→ the `fps_3d_gpu` window picks up the new defaults within one
+file_watch tick. No restart of either process required.
+
+### Files
+
+| File | Change |
+|---|---|
+| `bang9/bang9.bpp` | `g_tab_count` 7, new "Effects" label, indices shifted |
+| `bang9/panels.bsm` | `load fxlab_lib.bsm`, dispatch branch, `_panel_fx`, indices shifted |
+| `tools/fxlab/fxlab_lib.bsm` | `init_ui` + `theme_dark` removed from `fxlab_lib_init` (host responsibility per embed contract) |
+| `tools/fxlab/fxlab.bpp` | now calls `init_ui` + `theme_dark` itself (standalone host) |
+
+---
+
 ## 2026-05-09 — fxlab Sessão 2 CLOSED — standalone GUI tuner
 
 **Suite 142/0/12 native, bootstrap byte-stable.** GUI window
