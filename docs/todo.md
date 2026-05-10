@@ -22,11 +22,23 @@ since `c8c09e8`).
 - 2026-05-09 — fxlab arc: Sessão 1 (substrate) + Sessão 2 (GUI) shipped.
   JSON-driven effects + file_watch hot-reload + standalone tuner with
   preset list + auto-generated sliders + save-on-release JSON write-back.
-- 2026-05-10 — fxlab Sessão 3: Bang 9 `_panel_fx` between Levels and
-  Code. Arc done — Wolf3D Phase 2 calibration unblocked end-to-end.
+- 2026-05-10 — fxlab Sessão 3 + polish: Bang 9 `_panel_fx` + 4 bug
+  fixes (runner entry resolution, project-sacred read-only resolver,
+  dual-watch on fallback, fps_wolf3d game_frame_begin + drop per-frame
+  effect_set). Hot-reload visually validated end-to-end: drag slider
+  in Bang 9 → fps_wolf3d responds in ~30ms. **Arc CLOSED.**
+- 2026-05-10 — Layout cleanup: `stb/effects/` → `effects/` (single
+  root). `stb/` is engine-internal only (`.bsm` + `.metal`). `effects/`
+  is the user namespace, mirrored across engine source / install /
+  user project.
 
 **In flight:** content arc decision point — Wolf3D Phase 2 / Adventure /
 RPG / RTS. Engine no longer the bottleneck.
+
+**Sidequest open:** custom shader override (`<project>/shaders/*.metal`
+with project-first / install-fallback resolution in
+`gpu_pipeline_load`, ~10 LOC stbshader). Ships when a user game wants
+a non-stb shader. Today `stb/shaders/` stays engine-internal.
 
 ---
 

@@ -92,10 +92,29 @@ extrn map_buf;
 extrn hud_atlas;
 
 // Phase 6.4 — CRT post-process effect handle. Initialised in
-// fps_init_phase, applied as the only chain step in
-// fps_render_phase, freed in fps_quit_phase.
+// fps_init_phase, applied in fps_render_phase, freed in
+// fps_quit_phase. Tuning lives entirely in effects/crt.json — fxlab
+// edits the file, file_watch_tick re-pokes the uniform within
+// ~30 ms. The game does not own a per-frame intensity override
+// anymore; that would race with fxlab on every frame.
 extrn crt_fx;
-extrn crt_intensity: float;
+
+// Companion effects loaded alongside CRT so the fxlab tuner has
+// real targets to tweak in real time. Defaults live in the JSON
+// manifests; fxlab + file_watch_tick re-pokes uniforms within
+// ~30 ms of a slider release. Chain order matters visually:
+//
+//   raycast → CRT (curvature + scanlines) →
+//   scanlines (extra horizontal lines) →
+//   chromatic (RGB shift) →
+//   dither (final colour quantization) → present
+//
+// Each effect can be tuned individually from fxlab; if you want to
+// disable one, the cheapest way is to push its `intensity`/`amount`
+// to 0 in the JSON — leaves the chain shape unchanged.
+extrn scan_fx;
+extrn chrom_fx;
+extrn dither_fx;
 
 // Phase 7 — wall texture handles, one per wall_type. Bound to
 // fragment slots 0..3 in the render phase; the shader dispatches on
@@ -189,19 +208,39 @@ static fps_init_phase() {
     profile_gpu_enable();
 
     // Phase 6.4 — register the CRT post-process via its JSON
-    // manifest. Defaults live in stb/effects/crt.json (intensity
+    // manifest. Defaults live in effects/crt.json (intensity
     // 0.6 is the "obviously a CRT" baseline); fxlab edits to the
     // JSON propagate live via file_watch — no rebuild needed for
     // tuning. Game code can still drive intensity at runtime via
     // effect_set for animation (damage flash, etc).
     init_fx();
-    crt_fx = effect_from_json("stb/effects/crt.json");
+    crt_fx = effect_from_json("effects/crt.json");
     if (crt_fx == 0) {
-        put_err("fps_wolf3d: failed to load stb/effects/crt.json — exiting\n");
+        // maestro_quit only schedules the exit — the next maestro
+        // tick is what actually unwinds. Without an explicit return
+        // we'd fall through into effect_set with a null handle and
+        // SIGSEGV before maestro ever gets a chance to honour the
+        // quit flag.
+        putstr_err("fps_wolf3d: failed to load effects/crt.json — exiting\n");
         maestro_quit();
+        return 0;
     }
-    crt_intensity = 0.6;
-    effect_set(crt_fx, "intensity", crt_intensity);
+    // No initial effect_set — defaults already applied by
+    // effect_from_json from the manifest's "default" fields.
+
+    // Companion effects for fxlab tuning (sliders for all 4 stb
+    // presets work end-to-end). Defaults come from each manifest;
+    // there is no per-frame mutation for these — they sit at their
+    // JSON values and only change when the manifest is rewritten
+    // (by fxlab or by hand). file_watch_tick handles propagation.
+    scan_fx   = effect_from_json("effects/scanlines.json");
+    chrom_fx  = effect_from_json("effects/chromatic.json");
+    dither_fx = effect_from_json("effects/dither.json");
+    if (scan_fx == 0 || chrom_fx == 0 || dither_fx == 0) {
+        putstr_err("fps_wolf3d: failed to load companion effects — exiting\n");
+        maestro_quit();
+        return 0;
+    }
 
     // Phase 7 — generate wall textures procedurally and upload to
     // GPU. Same parameters the CPU baseline (fps_3d.bpp) uses, so
@@ -265,23 +304,19 @@ static fps_init_phase() {
 static fps_solo_phase(dt: float) @solo {
     auto forward: float, strafe: float, turn: float;
 
+    // Drive the per-frame stbgame plumbing: input edge state, ui
+    // arena reset, and — critical for fxlab propagation —
+    // image_hot_reload_tick_throttled, which is what tics file_watch
+    // and re-pokes effect uniforms when fxlab rewrites the JSONs.
+    // Without this call the slider drag in fxlab never reaches the
+    // running game.
+    game_frame_begin();
+
     if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
 
     if (action_pressed("profile_toggle")) {
         profile_hud_toggle();
     }
-
-    // Phase 6.4 — CRT intensity tuning. +/- ramp the master
-    // intensity at 0.5/sec; clamp to [0, 2] so callers can push
-    // past the "tasteful" 1.0 ceiling for kitsch demos. The
-    // factory default is 0.6 (set in fps_init_phase).
-    auto crt_step: float;
-    crt_step = 0.5 * dt;
-    if (key_down(KEY_EQUAL)) { crt_intensity += crt_step; }
-    if (key_down(KEY_MINUS)) { crt_intensity -= crt_step; }
-    if (crt_intensity < 0.0) { crt_intensity = 0.0; }
-    if (crt_intensity > 2.0) { crt_intensity = 2.0; }
-    effect_set(crt_fx, "intensity", crt_intensity);
 
     forward = action_down("fps_forward")  - action_down("fps_back");
     strafe  = action_down("fps_strafe_r") - action_down("fps_strafe_l");
@@ -367,24 +402,36 @@ static fps_render_phase(alpha: float) {
 
     @profile("crt_effect") {
         // Phase 6.4 — instead of game_render_end, route through the
-        // CRT effect: chain_begin commits the offscreen pass, fx_apply
-        // runs the barrel + chromatic + scanlines fragment program,
-        // fx_present blits the post-processed result to the window
-        // with the same letterbox + NEAREST upscale game_render_end
-        // would have used.
+        // post-process chain: chain_begin commits the offscreen
+        // pass, each fx_apply runs one fragment program against the
+        // accumulator, fx_present blits the final result to the
+        // window with the same letterbox + NEAREST upscale
+        // game_render_end would have used.
+        //
+        // Chain order (fxlab can tune each):
+        //   CRT       — barrel curvature + base scanlines (heavy)
+        //   scanlines — extra horizontal lines on top
+        //   chromatic — RGB shift along edges
+        //   dither    — final colour quantization
         fx_chain_begin();
         fx_apply(crt_fx);
+        fx_apply(scan_fx);
+        fx_apply(chrom_fx);
+        fx_apply(dither_fx);
         fx_present();
     }
     return 0;
 }
 
-// Quit phase: free the CRT effect's uniform buffer + wrapper. The
-// underlying MTL pipeline lives until the OS reclaims it on
+// Quit phase: free every effect handle's uniform buffer + wrapper.
+// The underlying MTL pipelines live until the OS reclaims them on
 // termination — same pattern as the ray-cast pipeline above.
 // `@io` matches fps_3d.bpp for symmetry.
 static fps_quit_phase() @io {
     fx_free(crt_fx);
+    fx_free(scan_fx);
+    fx_free(chrom_fx);
+    fx_free(dither_fx);
     return 0;
 }
 

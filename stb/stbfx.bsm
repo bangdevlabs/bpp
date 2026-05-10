@@ -61,9 +61,11 @@ struct FxParam {
 
 // Loaded-effect registry record. file_watch fires `_fx_reload_all`
 // whenever any registered manifest changes; the callback walks
-// every entry here and re-pokes the uniform from disk.
+// every entry here, re-resolves project-first / install-fallback
+// (so customization that appears AFTER initial load propagates),
+// and re-pokes the uniform from disk.
 struct FxLoaded {
-    path,                       // str_dup'd path of the .json manifest
+    original_path,              // path the caller passed (e.g. "effects/crt.json")
     fx                          // FxEffect handle the manifest backs
 }
 
@@ -236,32 +238,55 @@ static void _fx_repoke_from_json(path, fx_handle) {
 // content hash advances. We re-poke every loaded effect because
 // the watch infrastructure does not pass the firing path through
 // to callbacks. With ≤ a handful of effects in practice (4 in
-// stb/effects/ today), the over-work is hundreds of microseconds
+// effects/ today), the over-work is hundreds of microseconds
 // per fire — invisible against the rendering frame budget.
 static void _fx_reload_all() {
-    auto i, n, loaded_ptr, loaded: FxLoaded;
+    auto i, n, loaded_ptr, loaded: FxLoaded, resolved;
     if (_fx_loaded_inited == 0) { return; }
     n = arr_len(_fx_loaded_list);
     for (i = 0; i < n; i++) {
         loaded_ptr = arr_get(_fx_loaded_list, i);
         if (loaded_ptr == 0) { continue; }
         loaded = loaded_ptr;
-        _fx_repoke_from_json(loaded.path, loaded.fx);
+        // Re-resolve every tick so customization that appears after
+        // initial load (fxlab creates the project copy on drag-
+        // release) takes over from the install template seamlessly.
+        resolved = _stb_fx_resolve_manifest(loaded.original_path);
+        if (resolved != 0) {
+            _fx_repoke_from_json(resolved, loaded.fx);
+            free(resolved);
+        }
     }
 }
 
-// Append a (path, fx) pair to the registry and arm file_watch on
-// the path. Each registration adds its own watch entry — when
-// path X changes, file_watch_tick fires _fx_reload_all once for
-// X, and _fx_reload_all reconciles every effect (cheap, see above).
-static void _fx_register_for_reload(path, fx) {
+// Append an (original_path, fx) record and arm file_watch on BOTH
+// the project-side path the caller passed AND the install-template
+// fallback (when they differ). Watching both is what lets the
+// reload chain be seamless across customization boundaries:
+//
+//   - Initial load resolves to install template (project file
+//     doesn't exist yet). Both watches register; the project watch
+//     hashes a missing file (file_watch_tick treats hash==0 as
+//     "skip until it appears"). Install watch is essentially dead —
+//     install files only change when install.sh runs.
+//   - User edits via fxlab → project file appears. Project watch
+//     fires on the next tick. Reload re-resolves project-first
+//     and reads the new content.
+//
+// Each registration adds its own watch entry — duplicates are
+// harmless because the callback is idempotent (it walks every
+// loaded effect on every fire).
+static void _fx_register_for_reload(original_path, resolved_path, fx) {
     auto loaded: FxLoaded;
     _fx_loaded_init();
-    loaded      = malloc(sizeof(FxLoaded));
-    loaded.path = str_dup(path);
-    loaded.fx   = fx;
+    loaded               = malloc(sizeof(FxLoaded));
+    loaded.original_path = str_dup(original_path);
+    loaded.fx            = fx;
     _fx_loaded_list = arr_push(_fx_loaded_list, loaded);
-    file_watch_register(loaded.path, fn_ptr(_fx_reload_all));
+    file_watch_register(loaded.original_path, fn_ptr(_fx_reload_all));
+    if (str_eq(original_path, resolved_path) == 0) {
+        file_watch_register(resolved_path, fn_ptr(_fx_reload_all));
+    }
 }
 
 // Load an effect from a JSON manifest. Returns the FxEffect handle
@@ -273,8 +298,60 @@ static void _fx_register_for_reload(path, fx) {
 // The returned handle is registered for hot-reload. Subsequent
 // edits to the manifest (via fxlab, editor, scripted touch) will
 // re-poke this effect's uniform on the next file_watch_tick.
+// "Project is sacred, install is seed" path resolution: the project
+// owns its manifests; the engine ships defaults under
+// /usr/local/lib/bpp/ that get LAZY-COPIED into the project on
+// first read. After the copy, all subsequent reads + the
+// file_watch registration target the project path — so editors
+// (fxlab) and games agree on a single source of truth without
+// CWD-dance heroics.
+//
+// Same model as Unity (Library = cache, Assets = sacred) or Cargo
+// (~/.cargo = cache, ./target = sacred). Calling the install path
+// "template" rather than "fallback" makes the asymmetry explicit:
+// engine writes defaults at install.sh time, game writes derived
+// state at first run, fxlab writes user tuning thereafter.
+
+// Resolve a manifest path to whichever copy actually exists right
+// now: project-first (CWD-relative), install-fallback. Returns a
+// fresh malloc'd path string the caller owns — the project path
+// when the project has its own copy, the install-template path
+// otherwise — or 0 if neither exists.
+//
+// READ-ONLY: this used to lazy-copy install→project on first read,
+// but that wrote project files silently behind the user's back.
+// The lazy-copy responsibility moved into fxlab where it fires on
+// explicit drag-release (user opted in by editing). Game just
+// reads, never writes — projects without customization stay clean.
+static _stb_fx_resolve_manifest(path) {
+    auto src, src_size, install_root, full_len, full;
+
+    src_size = 0;
+    src = file_read_all(path, &src_size);
+    if (src != 0) {
+        // Project copy exists. Discard bytes (effect_from_json will
+        // re-read after this returns the resolved path) and return.
+        free(src);
+        return str_dup(path);
+    }
+
+    // Project miss — try the install template.
+    install_root = "/usr/local/lib/bpp/";
+    full_len     = str_len(install_root) + str_len(path);
+    full         = malloc(full_len + 1);
+    buf_copy(full,                         install_root, str_len(install_root));
+    buf_copy(full + str_len(install_root), path,         str_len(path));
+    poke(full + full_len, 0);
+
+    src_size = 0;
+    src = file_read_all(full, &src_size);
+    if (src == 0) { free(full); return 0; }   // neither — give up
+    free(src);
+    return full;   // caller owns
+}
+
 effect_from_json(path) {
-    auto src, src_size, doc, root;
+    auto src, src_size, doc, root, project_path;
     auto shader, vert, frag;
     auto params_idx, n_params, uniform_size;
     auto fx: FxEffect, params_buf, fp: FxParam, i;
@@ -283,19 +360,39 @@ effect_from_json(path) {
 
     init_fx();
 
-    src = file_read_all(path, &src_size);
+    // Resolve to the project-side path, lazy-copying from the
+    // install template if needed. The returned path is the
+    // single source of truth — both file_read_all and
+    // file_watch_register target it, keeping the hot-reload chain
+    // self-consistent across the cross-process editor (fxlab) and
+    // the running game.
+    project_path = _stb_fx_resolve_manifest(path);
+    if (project_path == 0) {
+        // Use explicit putstr_err: smart `put_err` would route the
+        // unannotated word arg through putnum_err and print the path
+        // pointer as a decimal address.
+        putstr_err("effect_from_json: no manifest at '");
+        putstr_err(path);
+        putstr_err("' and no install template to seed from\n");
+        return 0;
+    }
+
+    src_size = 0;
+    src = file_read_all(project_path, &src_size);
     if (src == 0) {
-        put_err("effect_from_json: cannot read ");
-        put_err(path);
-        put_err("\n");
+        putstr_err("effect_from_json: cannot read ");
+        putstr_err(project_path);
+        putstr_err("\n");
+        free(project_path);
         return 0;
     }
     doc = json_parse(src, src_size);
     free(src);
     if (doc == 0) {
-        put_err("effect_from_json: malformed JSON in ");
-        put_err(path);
-        put_err("\n");
+        putstr_err("effect_from_json: malformed JSON in ");
+        putstr_err(project_path);
+        putstr_err("\n");
+        free(project_path);
         return 0;
     }
 
@@ -306,10 +403,11 @@ effect_from_json(path) {
     params_idx = json_object_get(doc, root, "params");
 
     if (shader == 0 || vert == 0 || frag == 0 || params_idx < 0) {
-        put_err("effect_from_json: missing shader/vert/frag/params in ");
-        put_err(path);
-        put_err("\n");
+        putstr_err("effect_from_json: missing shader/vert/frag/params in ");
+        putstr_err(project_path);
+        putstr_err("\n");
         json_free(doc);
+        free(project_path);
         return 0;
     }
 
@@ -323,6 +421,7 @@ effect_from_json(path) {
     fx = fx_register(shader, vert, frag, uniform_size);
     if (fx == 0) {
         json_free(doc);
+        free(project_path);
         return 0;
     }
 
@@ -349,8 +448,13 @@ effect_from_json(path) {
         }
     }
 
-    _fx_register_for_reload(path, fx);
+    // Register watches on both the path the caller asked for
+    // (where customization will appear) AND the path we actually
+    // read from this time (the install template, if project missed).
+    // See _fx_register_for_reload for the dual-watch rationale.
+    _fx_register_for_reload(path, project_path, fx);
     json_free(doc);
+    free(project_path);
     return fx;
 }
 
@@ -456,7 +560,7 @@ fx_apply(handle) {
 // The four canonical effects (CRT, scanlines, chromatic, dither)
 // previously had typed factory functions here (effect_crt() +
 // effect_crt_set_intensity() etc). Sessão 1.3 of the fxlab arc
-// migrated them to JSON manifests in stb/effects/, loaded via
+// migrated them to JSON manifests in effects/, loaded via
 // `effect_from_json` and tuned via `effect_set(handle, "name", v)`.
 // Removed because hardcoded defaults + bespoke setters per effect
 // were data masquerading as code; the JSON path generalises to any

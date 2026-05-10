@@ -8,7 +8,7 @@
 //
 // fxlab is a JSON editor with sliders. The user runs a target
 // game (fps_3d_gpu, fx_crt_smoke, fps_wolf3d) in a parallel
-// process; this tool rewrites stb/effects/<name>.json in place
+// process; this tool rewrites effects/<name>.json in place
 // when sliders move, and the running game's file_watch_tick
 // re-pokes the uniform on the next frame (~30 ms). No inline
 // viewport — the actual game IS the preview, which matches real
@@ -19,7 +19,7 @@
 //   +-------------+--------------------------+
 //   | preset list | active preset            |
 //   |             |                          |
-//   | crt         | path: stb/effects/...    |
+//   | crt         | path: effects/...    |
 //   | scanlines   |                          |
 //   | chromatic   | <slider> intensity   0.6 |
 //   | dither      | <slider> aberration  0.3 |
@@ -78,6 +78,12 @@ struct UiParam {
 // ── Module state ─────────────────────────────────────────────
 
 static extrn _fxlab_inited;
+// Absolute path to the project root the host opened. fxlab reads
+// and writes <_fxlab_proj_root>/effects/<name>.json — the
+// project owns the manifests, the install tree at
+// /usr/local/lib/bpp/ is just a seed source for new projects (the
+// game's effect_from_json lazy-copies on first read).
+static extrn _fxlab_proj_root;
 static extrn _fxlab_preset_paths;     // word array, _FXLAB_MAX_PRESETS slots
 static extrn _fxlab_preset_names;     // word array, display labels
 static extrn _fxlab_preset_count;
@@ -87,6 +93,70 @@ static extrn _fxlab_ui_param_count;
 static extrn _fxlab_drag_dirty;       // 1 while a drag is in progress
 
 // ── Internal helpers ─────────────────────────────────────────
+
+// Compose "<_fxlab_proj_root>/<rel>" into a fresh malloc'd string.
+// Caller owns. Used by fxlab_lib_init to fix every preset path to
+// an absolute project-side location at registration time, so the
+// rest of the lib never needs to think about CWD. Inference picks
+// HEAP because of the malloc — no explicit annotation needed.
+static _fxlab_proj_path(rel) {
+    auto root_len, rel_len, out;
+    root_len = str_len(_fxlab_proj_root);
+    rel_len  = str_len(rel);
+    out      = malloc(root_len + 1 + rel_len + 1);
+    buf_copy(out, _fxlab_proj_root, root_len);
+    poke(out + root_len, '/');
+    buf_copy(out + root_len + 1, rel, rel_len);
+    poke(out + root_len + 1 + rel_len, 0);
+    return out;
+}
+
+// Map a project-side absolute path back to its install-template
+// counterpart. Inverse of _fxlab_proj_path:
+//   <proj_root>/effects/crt.json → /usr/local/lib/bpp/effects/crt.json
+//
+// Used when the project doesn't have its own copy of a manifest
+// yet (fresh project, never ran the game). fxlab populates sliders
+// from the install template; the first save materializes the
+// project copy. Caller owns the returned string. Inference picks
+// HEAP because of the malloc.
+static _fxlab_install_path_for(project_path) {
+    auto root_len, install_root, install_len, rel_len, out, total;
+    root_len    = str_len(_fxlab_proj_root);
+    install_root = "/usr/local/lib/bpp/";
+    install_len = str_len(install_root);
+    // project_path layout: <_fxlab_proj_root> + "/" + <rel>
+    rel_len = str_len(project_path) - root_len - 1;
+    total   = install_len + rel_len;
+    out     = malloc(total + 1);
+    buf_copy(out,               install_root,                  install_len);
+    buf_copy(out + install_len, project_path + root_len + 1,   rel_len);
+    poke(out + total, 0);
+    return out;
+}
+
+// Walk `path`'s parent chain and sys_mkdir each missing segment.
+// Mirrors the helper stbfx uses for its lazy-copy path; reproduced
+// here so fxlab_lib stays decoupled from stbfx (the panel does not
+// link any GPU pipeline code). Tolerates "already exists" by
+// ignoring the sys_mkdir return code. `@io` because sys_mkdir is
+// a syscall.
+static _fxlab_mkdir_parents(path)@io {
+    auto n, i, segment, c;
+    n = str_len(path);
+    segment = malloc(n + 1);
+    for (i = 0; i < n; i++) {
+        c = peek(path + i);
+        poke(segment + i, c);
+        if (c == '/' && i > 0) {
+            poke(segment + i, 0);
+            // 493 = 0o755 (rwxr-xr-x). B++ has no octal literals.
+            sys_mkdir(segment, 493);
+            poke(segment + i, '/');
+        }
+    }
+    free(segment);
+}
 
 // Format a float value into a strbuf with 4 decimal places.
 // Game-tuning values stay in 0.001..1e10 range, where 4 decimals
@@ -136,10 +206,22 @@ static void _fxlab_free_ui_params() {
 static _fxlab_load_ui_params(path) {
     auto src, src_size, doc, root, params_idx, n, i;
     auto fp: UiParam, param_obj, name_node, default_node, min_node, max_node;
+    auto install_path;
 
     _fxlab_free_ui_params();
 
+    src_size = 0;
     src = file_read_all(path, &src_size);
+    if (src == 0) {
+        // Project doesn't have its own copy yet — read the install
+        // template so the panel can still show the canonical
+        // sliders. The first save-on-release will materialize the
+        // project copy at `path` (writing only ever targets the
+        // project, never the install root).
+        install_path = _fxlab_install_path_for(path);
+        src = file_read_all(install_path, &src_size);
+        free(install_path);
+    }
     if (src == 0) { return 0; }
     doc = json_parse(src, src_size);
     free(src);
@@ -208,8 +290,18 @@ static void _fxlab_save_active() {
 
     // Re-read the current JSON so we preserve the shader path,
     // entry names, and per-param min/max — fxlab only updates
-    // the default values.
+    // the default values. Same install-template fallback used by
+    // _fxlab_load_ui_params: if the project hasn't materialized
+    // its copy yet, we read the template, then write the result
+    // to the project path below (creating it first time).
+    src_size = 0;
     src = file_read_all(path, &src_size);
+    if (src == 0) {
+        auto install_path;
+        install_path = _fxlab_install_path_for(path);
+        src = file_read_all(install_path, &src_size);
+        free(install_path);
+    }
     if (src == 0) { return; }
     doc = json_parse(src, src_size);
     free(src);
@@ -261,12 +353,16 @@ static void _fxlab_save_active() {
     }
     sb = strbuf_cat(sb, "  ]\n}\n");
 
+    // Materialize the project's effects/ directory if this is
+    // the first save into a fresh project. mkdir -p is idempotent
+    // — already-exists is silent — so we don't bother caching.
+    _fxlab_mkdir_parents(path);
     file_write_all(path, sb, strbuf_len(sb));
     strbuf_free(sb);
     json_free(doc);
 }
 
-// Build the display label for a preset path. "stb/effects/crt.json"
+// Build the display label for a preset path. "effects/crt.json"
 // → "crt". Caller frees.
 static _fxlab_preset_display_name(path) {
     auto plen, last_slash, dot, name_start, name_end, len, buf, i;
@@ -291,26 +387,36 @@ static _fxlab_preset_display_name(path) {
 
 // ── Lifecycle ────────────────────────────────────────────────
 
-// One-time setup. Hardcodes the four canonical preset paths;
-// future versions can scan stb/effects/*.json once a
-// directory-listing helper that doesn't shell out exists.
+// One-time setup. `proj_root` is the absolute path to the project
+// the host opened — fxlab will read and write
+// <proj_root>/effects/<name>.json for each preset, and never
+// touches the install tree at /usr/local/lib/bpp/. The lazy-copy
+// from install→project lives in the game's effect_from_json (so
+// running the game once seeds the manifests if the project doesn't
+// have them yet); fxlab is purely a project-side editor.
+//
 // Per the embed contract (modulab_lib / level_editor_lib model),
 // the host owns init_ui() and the theme. fxlab_lib_init only sets
-// up its own state — preset paths, display names, the
-// initial selection. The standalone entry in fxlab.bpp calls
+// up its own state — preset paths, display names, initial
+// selection. The standalone entry in fxlab.bpp calls
 // init_ui()/theme_dark() before this; the Bang 9 panel host does
 // the same once at boot. Calling them here would clobber whatever
 // theme the host already configured.
-void fxlab_lib_init() {
+//
+// Future versions can scan <proj_root>/effects/*.json once a
+// directory-listing helper that doesn't shell out exists.
+void fxlab_lib_init(proj_root) {
     if (_fxlab_inited != 0) { return; }
     _fxlab_inited = 1;
 
+    _fxlab_proj_root    = str_dup(proj_root);
+
     _fxlab_preset_paths = malloc(_FXLAB_MAX_PRESETS * 8);
     _fxlab_preset_names = malloc(_FXLAB_MAX_PRESETS * 8);
-    *(_fxlab_preset_paths + 0 * 8) = "stb/effects/crt.json";
-    *(_fxlab_preset_paths + 1 * 8) = "stb/effects/scanlines.json";
-    *(_fxlab_preset_paths + 2 * 8) = "stb/effects/chromatic.json";
-    *(_fxlab_preset_paths + 3 * 8) = "stb/effects/dither.json";
+    *(_fxlab_preset_paths + 0 * 8) = _fxlab_proj_path("effects/crt.json");
+    *(_fxlab_preset_paths + 1 * 8) = _fxlab_proj_path("effects/scanlines.json");
+    *(_fxlab_preset_paths + 2 * 8) = _fxlab_proj_path("effects/chromatic.json");
+    *(_fxlab_preset_paths + 3 * 8) = _fxlab_proj_path("effects/dither.json");
     _fxlab_preset_count = 4;
 
     auto i;
@@ -462,8 +568,19 @@ void fxlab_lib_shutdown() {
         _fxlab_preset_names = 0;
     }
     if (_fxlab_preset_paths != 0) {
+        // Each slot is a heap copy from _fxlab_proj_path() — free
+        // before the parent buffer.
+        for (i = 0; i < _fxlab_preset_count; i++) {
+            auto p;
+            p = *(_fxlab_preset_paths + i * 8);
+            if (p != 0) { free(p); }
+        }
         free(_fxlab_preset_paths);
         _fxlab_preset_paths = 0;
+    }
+    if (_fxlab_proj_root != 0) {
+        free(_fxlab_proj_root);
+        _fxlab_proj_root = 0;
     }
     _fxlab_inited = 0;
 }

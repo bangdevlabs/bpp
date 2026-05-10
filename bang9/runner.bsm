@@ -27,6 +27,11 @@
 //   runner_last_status()@base    — 0 = never built, >0 = exit code
 //   runner_clear_log()           — releases + zeroes log state
 
+// Project-tree directory listing helpers. Used by the entry-file
+// fallback to discover any .bpp at the project root when the user
+// hasn't opened one in the Code panel yet.
+load "dir.bsm";
+
 // Path to the tempfile used for stdout/stderr capture. Same for
 // build and run logs for simplicity — run output overwrites build
 // output. A real IDE would separate them into distinct files.
@@ -89,11 +94,142 @@ void runner_init() {
     }
 }
 
-// Derive the entry .bpp file for a project root. Convention:
-// last path segment + ".bpp" → "games/pathfind" → "pathfind.bpp",
-// joined as "games/pathfind/pathfind.bpp".
+// Return 1 if `path` ends with ".bpp", 0 otherwise. Used to decide
+// whether the currently-open editor file is a buildable entry or
+// just an arbitrary text file the user happens to be looking at
+// (a .bsm, a .json, a README).
+static _path_ends_bpp(path) {
+    auto n;
+    n = str_len(path);
+    if (n < 4) { return 0; }
+    if (peek(path + n - 4) != '.') { return 0; }
+    if (peek(path + n - 3) != 'b') { return 0; }
+    if (peek(path + n - 2) != 'p') { return 0; }
+    if (peek(path + n - 1) != 'p') { return 0; }
+    return 1;
+}
+
+// Scan `dir` for the first .bpp file (alphabetical) and return a
+// fresh malloc'd copy of its name (e.g. "fps_wolf3d.bpp"), or 0 if
+// none exist. dir_list shells out to `ls -1aF` which already
+// returns alphabetical order, so the first match is stable.
+//
+// Used as the entry-file fallback when the user hasn't opened a
+// .bpp in the Code panel — we'd rather pick a real file in the
+// project than guess at a name that may not exist (the previous
+// "<segment>/<segment>.bpp" convention broke for any project where
+// the directory name doesn't match the entry, e.g. games/fps holds
+// fps_wolf3d.bpp not fps.bpp).
+static _runner_first_bpp_in(dir) {
+    auto handle, n, i, name, result;
+    handle = dir_list(dir);
+    if (handle == 0) { return 0; }
+    n = dir_count(handle);
+    result = 0;
+    for (i = 0; i < n; i++) {
+        if (dir_is_dir(handle, i) == 0) {
+            name = dir_name(handle, i);
+            if (name != 0 && _path_ends_bpp(name) != 0) {
+                result = str_dup(name);
+                i = n;   // break — first hit wins
+            }
+        }
+    }
+    dir_free(handle);
+    return result;
+}
+
+// Return the basename of the entry file (without ".bpp"). Used to
+// derive build output path + .bug file name. Precedence:
+//
+//   1. .bpp file open in the Code panel → its filename minus ".bpp".
+//   2. First .bpp at project root (alphabetical) → that file's name.
+//   3. Last segment of proj_root → last-resort placeholder so the
+//      Debug panel still gets a non-empty path even when the project
+//      contains no .bpp at all.
+//
+// Caller takes ownership of the returned string (str_dup'd).
+static _runner_basename(proj_root) {
+    auto path, found, n, i, last_slash, base, blen, sb, result;
+
+    if (editor_has_file() != 0) {
+        path = editor_path();
+        if (_path_ends_bpp(path) != 0) {
+            n = str_len(path);
+            last_slash = -1;
+            for (i = 0; i < n; i++) {
+                if (peek(path + i) == 47) { last_slash = i; }
+            }
+            base = path + last_slash + 1;
+            blen = n - last_slash - 1 - 4;   // strip ".bpp"
+            sb = strbuf_new();
+            for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+            result = str_dup(sb);
+            strbuf_free(sb);
+            return result;
+        }
+    }
+
+    found = _runner_first_bpp_in(proj_root);
+    if (found != 0) {
+        n = str_len(found);
+        sb = strbuf_new();
+        // Strip the trailing ".bpp" (already verified by _path_ends_bpp).
+        for (i = 0; i < n - 4; i++) { sb = strbuf_ch(sb, peek(found + i)); }
+        result = str_dup(sb);
+        strbuf_free(sb);
+        free(found);
+        return result;
+    }
+
+    // Last resort: last segment of proj_root.
+    n = str_len(proj_root);
+    last_slash = -1;
+    for (i = 0; i < n; i++) {
+        if (peek(proj_root + i) == 47) { last_slash = i; }
+    }
+    base = proj_root + last_slash + 1;
+    blen = n - last_slash - 1;
+    sb = strbuf_new();
+    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    result = str_dup(sb);
+    strbuf_free(sb);
+    return result;
+}
+
+// Derive the entry .bpp file Bang 9 hands the compiler. Same
+// precedence as _runner_basename:
+//
+//   1. .bpp file open in the Code panel → that exact path.
+//   2. First .bpp at project root (alphabetical) → joined as
+//      "<proj_root>/<file>.bpp".
+//   3. Project-root last segment + ".bpp" — last-resort placeholder
+//      that probably won't compile, but keeps the build command
+//      well-formed so the user sees a clear "no such file" error
+//      instead of a malformed command line.
 static _runner_entry_path(proj_root) {
-    auto plen, i, last_slash, base, blen, sb, result;
+    auto path, found, plen, flen, i, last_slash, base, blen, sb, result;
+
+    if (editor_has_file() != 0) {
+        path = editor_path();
+        if (_path_ends_bpp(path) != 0) {
+            return str_dup(path);
+        }
+    }
+
+    found = _runner_first_bpp_in(proj_root);
+    if (found != 0) {
+        flen = str_len(found);
+        sb = strbuf_new();
+        sb = strbuf_cat(sb, proj_root);
+        sb = strbuf_ch(sb, '/');
+        for (i = 0; i < flen; i++) { sb = strbuf_ch(sb, peek(found + i)); }
+        result = str_dup(sb);
+        strbuf_free(sb);
+        free(found);
+        return result;
+    }
+
     plen = str_len(proj_root);
     last_slash = -1;
     for (i = 0; i < plen; i++) {
@@ -112,50 +248,42 @@ static _runner_entry_path(proj_root) {
 }
 
 // Derive the output binary path: "<proj_root>/build/<basename>".
-// Non-static because the Debug panel needs the same value to wire
-// the_bug_lib's Run button at the actual binary (the .bug file
-// itself lives elsewhere — see runner_bug_path).
+// Basename comes from the editor file (when a .bpp is open) or the
+// proj_root convention (when nothing is open) — see _runner_basename
+// for the exact precedence. Non-static because the Debug panel
+// needs the same value to wire the_bug_lib's Run button at the
+// actual binary (the .bug file itself lives elsewhere — see
+// runner_bug_path).
 runner_output_path(proj_root) {
-    auto plen, i, last_slash, base, blen, sb, result;
-    plen = str_len(proj_root);
-    last_slash = -1;
-    for (i = 0; i < plen; i++) {
-        if (peek(proj_root + i) == 47) { last_slash = i; }
-    }
-    base = proj_root + last_slash + 1;
-    blen = plen - last_slash - 1;
+    auto basename, sb, result;
+    basename = _runner_basename(proj_root);
     sb = strbuf_new();
     sb = strbuf_cat(sb, proj_root);
     sb = strbuf_cat(sb, "/build/");
-    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    sb = strbuf_cat(sb, basename);
     result = str_dup(sb);
     strbuf_free(sb);
+    free(basename);
     return result;
 }
 
 // Derive the .bug path Bang 9 hands to the compiler via --bug=<path>.
 // Lives under /tmp so the user's project tree stays clean — the
 // debug map is purely internal to Bang 9 and gets unlinked on
-// shutdown. Format: "/tmp/bang9_<basename>.bug".
-//
-// Used by both the build command (to instruct the compiler where to
-// write) and the debug panel (to know where to read back from), so
-// the helper is non-static.
+// shutdown. Format: "/tmp/bang9_<basename>.bug". Same basename
+// resolution as the output binary so the build / run / debug
+// panels all stay aligned on a single concept of "the current
+// entry".
 runner_bug_path(proj_root) {
-    auto plen, i, last_slash, base, blen, sb, result;
-    plen = str_len(proj_root);
-    last_slash = -1;
-    for (i = 0; i < plen; i++) {
-        if (peek(proj_root + i) == 47) { last_slash = i; }
-    }
-    base = proj_root + last_slash + 1;
-    blen = plen - last_slash - 1;
+    auto basename, sb, result;
+    basename = _runner_basename(proj_root);
     sb = strbuf_new();
     sb = strbuf_cat(sb, "/tmp/bang9_");
-    for (i = 0; i < blen; i++) { sb = strbuf_ch(sb, peek(base + i)); }
+    sb = strbuf_cat(sb, basename);
     sb = strbuf_cat(sb, ".bug");
     result = str_dup(sb);
     strbuf_free(sb);
+    free(basename);
     return result;
 }
 
@@ -179,10 +307,15 @@ static void _runner_reload_log()@io {
 }
 
 // Shell-escape-free command builder. Produces
-//   "<_BPP_EXE> <entry> -o <output> --emit-meta <output>.meta.json > <log> 2>&1"
+//   "mkdir -p $(dirname <output>) && <_BPP_EXE> <entry> --bug=<bug_path> -o <output> --emit-meta <output>.meta.json > <log> 2>&1; echo $? > <rc>"
 // into a heap buffer. Caller frees. _BPP_EXE was resolved at
 // runner_init() to the first bpp binary found on disk (usually
 // /usr/local/bin/bpp after a global install).
+//
+// The leading `mkdir -p` ensures `<proj_root>/build/` exists before
+// bpp tries to write the binary or the meta sidecar. Without it,
+// the very first build on a fresh project tree fails noisily on
+// the --emit-meta write (and silently on the -o write).
 //
 // --emit-meta is appended automatically (D2.2): every Bang 9 build
 // also writes a struct/enum metadata sidecar next to the binary.
@@ -195,6 +328,12 @@ static void _runner_reload_log()@io {
 static _runner_build_cmd(entry, output, bug_path, log) {
     auto sb, result;
     sb = strbuf_new();
+    // mkdir -p $(dirname <output>) — create the build dir on first
+    // run. /bin/sh's $(...) is portable; dirname is a coreutils
+    // standard utility shipped on every Unix Bang 9 supports.
+    sb = strbuf_cat(sb, "mkdir -p $(dirname ");
+    sb = strbuf_cat(sb, output);
+    sb = strbuf_cat(sb, ") && ");
     sb = strbuf_cat(sb, _BPP_EXE);
     sb = strbuf_cat(sb, " ");
     sb = strbuf_cat(sb, entry);

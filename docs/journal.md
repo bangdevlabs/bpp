@@ -1,5 +1,149 @@
 # B++ Bootstrap Journal
 
+## 2026-05-10 — fxlab arc HOT-RELOAD WORKING end-to-end (Wolf3D Phase 2 unblocked)
+
+**Visually validated.** Drag a slider in Bang 9's Effects tab,
+fps_wolf3d running in parallel responds within ~30 ms. The full
+two-process workflow that the arc was built to enable is live.
+This is a project milestone — the first time the engine + IDE +
+tuning UI form a real feedback loop.
+
+The polish session uncovered four compounding bugs (each one
+masked by the others, so the visible symptom kept moving):
+
+### Bug 1 — runner picked the wrong entry file
+
+`runner_build` derived the build target by appending `.bpp` to the
+last path segment of `proj_root`. Worked for `pathfind/pathfind.bpp`
+by coincidence; broke for any project where the directory name
+differs from the entry (`games/fps/fps_wolf3d.bpp`,
+`games/snake/snake_maestro.bpp`, etc — actually 3 of 5 games in the
+repo). Fix: when the user has a `.bpp` open in the Code panel, use
+that file. Otherwise scan `proj_root` for `*.bpp` (alphabetical) and
+take the first match. Project-root segment is now last-resort
+fallback only.
+
+Also fixed: `runner_build` did not `mkdir -p` the output directory,
+so the very first build on a fresh project failed silently on
+`-o` and noisily on `--emit-meta`. Added `mkdir -p $(dirname …)` at
+the start of the shell command.
+
+### Bug 2 — `effect_from_json` silently lazy-copied install→project
+
+The first-pass design for "project sacred, install seed" put the
+lazy-copy inside the game's `effect_from_json`. Running the game
+once on a fresh project silently created `<game-cwd>/effects/`
+without the user asking. User feedback: *"porque que tu criou uma
+pasta stb dentro de games?"* The pollution made the IDE feel
+broken.
+
+Fix: stbfx resolver is now READ-ONLY. Project-first
+(CWD-relative), install-fallback (`/usr/local/lib/bpp/effects/<path>`),
+no write. The lazy-copy responsibility moved into `fxlab`'s
+`_fxlab_save_active` where it fires only on explicit drag-release —
+the user's first edit is what materializes the project copy.
+Projects without customization stay clean.
+
+### Bug 3 — file_watch armed only on the first-resolved path
+
+After the resolver became read-only, a fresh project read its
+effects from the install template. `file_watch_register` armed on
+the install path. When `fxlab` later created the project copy, the
+install path wasn't touched, so the watch never fired.
+
+Fix: dual-watch when fallback fires. `_fx_register_for_reload`
+takes both `original_path` (caller-passed, where customization will
+appear) AND `resolved_path` (where data was read from this time).
+`file_watch_register` arms on both. `FxLoaded.original_path` lets
+`_fx_reload_all` re-resolve project-first per tick, so the moment
+the project copy appears, subsequent reloads read from it.
+
+### Bug 4 — `fps_solo_phase` never called `game_frame_begin` AND had per-frame `effect_set` clobbering fxlab edits
+
+This was the longest-hiding bug. Even after Bugs 1-3 were fixed,
+the slider had no visible effect. Two causes compounded:
+
+a) `fps_solo_phase` did not call `game_frame_begin()`. That
+function ticks `image_hot_reload_tick_throttled`, which is what
+ticks `file_watch`. Without that call, the running game never
+polled for JSON changes — fxlab edits were invisible.
+
+b) `fps_solo_phase` ran `effect_set(crt_fx, "intensity",
+crt_intensity)` every frame as part of a Phase 6.4 keyboard `+/-`
+ramp. Even if `file_watch` had fired and re-poked the uniform, the
+next frame's `solo_phase` would clobber it with `crt_intensity`
+(local global stuck at 0.6).
+
+Fix: add `game_frame_begin()` at the top of `fps_solo_phase`. Drop
+the `crt_intensity` global, the `+/-` keyboard handlers, and the
+per-frame `effect_set` overwrite. Defaults come from
+`effects/crt.json` on load via `effect_from_json` — no programmatic
+override. `fxlab` is now the sole authority over per-effect tuning
+at runtime.
+
+### Layout cleanup along the way
+
+Renamed `stb/effects/` → `effects/` (single root, no redundant
+prefix). `stb/` is now strictly engine-internal (`.bsm` modules +
+`.metal` shaders). `effects/` is the user namespace, mirrored
+across:
+
+```
+<repo>/effects/*.json                    ← engine source + project default
+<install>/effects/*.json                 ← templates pro lazy-copy via install.sh
+<projeto-de-usuario>/effects/*.json      ← criados pelo fxlab no primeiro drag
+```
+
+Plus deleted leftover artifacts that earlier broken runs created
+(`stb/effects/shaders/` duplicate, `games/fps/assets/stb/effects/`
+nested mess from the path mismatch). Both untracked so git was
+clean after the cleanup.
+
+### What this enables
+
+- **Wolf3D Phase 2 calibration**: open Bang 9 on the repo, F8 the
+  game, switch to Effects, drag CRT/scanlines/chromatic/dither
+  sliders, watch the look evolve in real time. ~30 ms latency from
+  mouse-release to visual change.
+- **Cross-process tuning**: same workflow with fxlab standalone
+  pointing at any project (`fxlab ~/games/foo/`). Game running in
+  another window picks up edits identically.
+- **Bang 9 as installable IDE**: `/usr/local/bin/bang9 ~/projeto/`
+  works the same as dev-in-repo. Project layout is symmetric across
+  install and dev workflows.
+
+### Tonify lessons graduated
+
+- `@base` only on PURE functions. Helpers that `malloc` / `str_dup`
+  must NOT be `@base` — leave unannotated, the inferencer assigns
+  HEAP correctly. W013 catches the violation.
+- Refactor cycles need to verify the resolver actually returns a
+  successful sentinel: `file_write_all` returns 0/-1, NOT bytes
+  written. The earlier `if (written < src_size) { return 0; }`
+  check inverted success and failure.
+- "Stop adivinhando, lê os docs." Bootstrap manual is canonical for
+  when to bootstrap (compiler/runtime/backends only). Tonify
+  checklist for phase annotations. Skipping these costs
+  more time than reading them.
+
+### Files
+
+| File | Change |
+|---|---|
+| `stb/stbfx.bsm` | Read-only `_stb_fx_resolve_manifest`, dual-watch register, `_fx_reload_all` re-resolves per tick, `fx_free(0)` no-op, `putstr_err` for path args |
+| `stb/stbshader.bsm` | `put_err(metal_path)` → `putstr_err(metal_path)` (smart dispatch was printing pointer as decimal) |
+| `tools/fxlab/fxlab_lib.bsm` | Embed contract takes `proj_root`, paths absolute via `_fxlab_proj_path`, install fallback for read, lazy-copy on save via `_fxlab_mkdir_parents` + `_fxlab_install_path_for` |
+| `tools/fxlab/fxlab.bpp` | `argv[1]` → `proj_root` (default `.`), host owns `init_ui` + `theme_dark` |
+| `bang9/panels.bsm` | `_panel_fx` between Levels and Code, passes `g_proj_root` to fxlab init |
+| `bang9/bang9.bpp` | Tab list 7 entries, "Effects" at index 3, indices shifted |
+| `bang9/runner.bsm` | Entry-aware (editor-open file wins, alphabetical scan fallback), `mkdir -p` build dir |
+| `games/fps/fps_wolf3d.bpp` | 4-effect chain (CRT + scanlines + chromatic + dither), `game_frame_begin` in solo, dropped `+/-` keyboard ramp, return after `maestro_quit` |
+| `examples/{fps_3d_gpu,fx_crt_smoke,fx_library_smoke}.bpp` | Path rename `stb/effects/` → `effects/` |
+| `install.sh` | Install templates to `<install>/effects/` (no `assets/` prefix) |
+| `effects/{crt,scanlines,chromatic,dither}.json` | Renamed from `stb/effects/` (git mv) |
+
+---
+
 ## 2026-05-10 — fxlab Sessão 3 CLOSED — Bang 9 `_panel_fx`. Arc done.
 
 **Suite 142/0/12 native, bootstrap byte-stable.** Bang 9 grew a
