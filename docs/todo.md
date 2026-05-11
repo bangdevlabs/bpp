@@ -361,16 +361,7 @@ Could land as early as the Adventure Puzzle demo prep.
 
 ---
 
-## Hot reload watch mode (Dev Loop 4)
-
-`bpp --watch game.bpp`. Detect source change, recompile to a
-fresh `/tmp` path, kill old process, restart. Not live code
-injection — full restart automation. ~200 lines (shell + compiler
-flag + process management). Ships before RPG.
-
----
-
-## Metaprogramming (Dev Loop 5)
+## Metaprogramming (Dev Loop 4)
 
 Lands during RTS, not before. Two features:
 

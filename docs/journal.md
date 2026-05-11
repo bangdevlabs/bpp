@@ -1,5 +1,98 @@
 # B++ Bootstrap Journal
 
+## 2026-05-11 — Wolf3D Phase 2 Session 0 polish: level hot-reload end-to-end + UI overflow fix + const-string pitfall graduated
+
+The Session 0 ship landed with two paper cuts that surfaced on
+first real use: (a) the level_editor's topbar buttons overflowed
+their bounding boxes and painted over each other, and (b) saving a
+level edit didn't propagate to the running fps_wolf3d. Both fixed.
+A third bug — silent pointer corruption from `const NAME = "string
+literal"` — caught me mid-fix and graduated to a feedback memory
+so it doesn't bite again.
+
+**Hot-reload now works end-to-end**: drag a wall in Bang 9's
+Levels tab → release the mouse → fps_wolf3d running in parallel
+shows the new wall within ~30 ms. Same wire fxlab uses for effect
+manifests; same cross-process file_watch poll driven by
+`game_frame_begin`.
+
+### Three fixes in this batch
+
+**Bug A — `level_editor` topbar overflow**
+
+The `[Tiles]` / `[Objects]` mode buttons used the bracket
+characters as a "selected indicator" trick. `[Objects]` (9 chars
+at 8 px/char ≈ 72 px) overflowed the 64-px button width and
+painted over the Save / Open buttons next to it. The filename
+field also collided with the dirty-mark on narrow panels.
+
+Fix: drop the bracket trick entirely. Buttons now read just
+`Tiles` / `Objects`; the active one gets a 2-px accent bar drawn
+beneath it (browser-tab style). Filename field width derived from
+the panel width minus a fixed reserve so it flexes properly.
+Dirty mark moved to a `*unsaved` glyph past the input edge.
+
+**Bug B — fps_wolf3d hot-reload missing**
+
+`_load_level` ran once at init, then nothing watched the file. The
+editor saved `assets/levels/level1.json` to disk but the running
+game never polled.
+
+Fix: register `file_watch_register(_level_path(),
+fn_ptr(_reload_level))` after the initial load. The `_reload_level`
+callback re-reads the JSON (with `apply_spawn = 0` so the running
+player isn't teleported mid-game) and re-packs the GPU `map_buf`
+uniform — without that re-pack, the rasteriser keeps rendering
+the stale layout regardless of `world_map` updates.
+
+Extracted `_repack_map_buf()` as a helper called from both init
+and reload. `_load_level(path, apply_spawn)` gained the second
+parameter; init passes 1, callback passes 0.
+
+**Bug C — `const NAME = "string literal"` corrupts the pointer**
+
+While factoring the level path into a constant for single-source-
+of-truth, hit a SIGSEGV in `str_len + 44` with x0 equal to a
+non-canonical address (`0x0c98b026a8d32a52`). The `const` slot in
+B++ has no string-typed variant; assigning a `.rodata` literal
+demotes the pointer to int word and the high bits get truncated.
+Same bug-class as `const FOO = 0.6` silently demoting a float to
+int(0).
+
+Fix in this file: replace `const LEVEL_PATH = "..."` with
+a `static _level_path()@base { return "..."; }` helper. Pure,
+inlines well, single-source-of-truth preserved.
+
+Memory graduated to `feedback_const_string_broken.md` so the
+pattern propagates: never use `const NAME = "string literal"`
+in B++ until the const slot grows a real type. Use a helper
+function returning the literal instead.
+
+### What this enables
+
+Wolf3D Phase 2 Session 1 (sprites + depth buffer) can now be done
+with the workflow it was always meant to have:
+
+1. F8 fps_wolf3d in Bang 9
+2. Edit walls in Levels tab, watch the game respond live
+3. Drop sprites once Session 1's renderer lands; entities
+   already have positions on disk
+
+The two tabs are now in symmetric balance: Effects tunes the post-
+process (CRT, scanlines, etc.); Levels tunes the geometry. Both
+hot-reload into the running game with ~30 ms latency.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `tools/level_editor/level_editor_lib.bsm` | Topbar layout: drop bracket labels, accent bar under active mode, flex filename width, dirty mark relocated |
+| `games/fps/fps_wolf3d.bpp` | `_level_path()` helper (const-string workaround), `_repack_map_buf` extracted, `_reload_level` callback, `file_watch_register` armed in init, `_load_level(path, apply_spawn)` flag |
+| `games/fps/assets/levels/level1.json` | Validated round-trip — wall edit through editor preserved on disk |
+| `games/pathfind/assets/levels/level1.json` | Re-saved through new editor (entities `[]` field present, schema v2) |
+
+---
+
 ## 2026-05-11 — Wolf3D Phase 2 Session 0: level_editor entity layer + Bang 9 canonized as engine/IDE
 
 **Two-consumer rule fired**: editing Wolf3D maps inside Bang 9 is

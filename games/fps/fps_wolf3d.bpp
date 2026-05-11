@@ -146,6 +146,18 @@ struct WolfEntity {
 }
 extrn wolf_entities;
 extrn wolf_entity_count;
+
+// Single source of truth for the level file path. Implemented as a
+// helper (not `const LEVEL_PATH = "..."`) because B++ const slots
+// don't carry string-literal addresses correctly — the high bits of
+// the .rodata pointer get truncated when const demotes to int,
+// leading to a garbage pointer at use sites. Same bug-class as the
+// const-float-demote pitfall. Helper returns the same literal each
+// call so the three callsites (initial load, file_watch_register,
+// reload callback) stay in sync without paying that cost.
+static _level_path()@base {
+    return "assets/levels/level1.json";
+}
 const HUD_TILE = 16;
 const HUD_TEX_W = 32;     // 2 tiles × 16 px
 const HUD_TEX_H = 16;
@@ -299,7 +311,7 @@ static fps_init_phase() {
     wolf_entities     = malloc(WOLF_MAX_ENTITIES * sizeof(WolfEntity));
     wolf_entity_count = 0;
 
-    if (_load_level("assets/levels/level1.json") != 0) {
+    if (_load_level(_level_path(), 1) != 0) {
         putstr_err("fps_wolf3d: level load failed — exiting\n");
         maestro_quit();
         return 0;
@@ -307,16 +319,15 @@ static fps_init_phase() {
 
     cam_buf = malloc(CAM_BUF_SZ);
     map_buf = malloc(MAP_BUF_SZ);
+    _repack_map_buf();
 
-    // Pack the static map data into the uniform buffer once. The
-    // shader walks the same flat row-major layout (map[y * mw + x]).
-    auto x, y, cell;
-    for (y = 0; y < MAP_H; y++) {
-        for (x = 0; x < MAP_W; x++) {
-            cell = tile_get(world_map, x, y);
-            poke(map_buf + y * MAP_W + x, cell);
-        }
-    }
+    // Arm the level hot-reload. file_watch_register polls the file
+    // every image_hot_reload_tick_throttled tick (driven from
+    // fps_solo_phase via game_frame_begin) — when the editor saves
+    // a new level, _reload_level fires within ~30 ms and re-packs
+    // the GPU map buffer so the new layout shows up on the next
+    // frame. Same wire fxlab uses for effect manifests.
+    file_watch_register(_level_path(), fn_ptr(_reload_level));
 
     ray_pipeline = gpu_pipeline_load("fps_raycast.metal",
                                      "fps_vert", "fps_frag");
@@ -500,13 +511,56 @@ main() {
 // parse fail, missing required field). The caller is expected to
 // surface the error and quit — there is no fallback maze, by
 // design (don't ship dead code per Tonify spirit).
-static _load_level(path)@io {
+// Re-pack `world_map` (CPU-side tilemap) into `map_buf` (GPU
+// uniform buffer the fragment shader walks). Called once after
+// initial load and again on every hot-reload — the GPU never
+// reads world_map directly, so without this re-pack a level
+// edited on disk would never reach the rasteriser.
+static void _repack_map_buf() {
+    auto x, y, cell;
+    for (y = 0; y < MAP_H; y++) {
+        for (x = 0; x < MAP_W; x++) {
+            cell = tile_get(world_map, x, y);
+            poke(map_buf + y * MAP_W + x, cell);
+        }
+    }
+}
+
+// file_watch callback — fired by image_hot_reload_tick_throttled
+// when the level file's content hash changes (typically because
+// the editor saved). Re-reads the level (skipping player_spawn so
+// the running player doesn't teleport mid-level) and re-packs the
+// GPU map buffer so the new wall layout shows up on the next
+// render.
+static void _reload_level() {
+    if (_load_level(_level_path(), 0) != 0) {
+        putstr_err("fps_wolf3d: hot-reload failed (kept last good state)\n");
+        return;
+    }
+    _repack_map_buf();
+}
+
+// Load the level JSON. `apply_spawn` controls whether the
+// `player_spawn` entity overwrites the live player position:
+//   - 1 during initial load (player is placed at the spawn)
+//   - 0 during hot-reload (don't teleport mid-game; the editor
+//     just moved the marker for next time)
+static _load_level(path, apply_spawn)@io {
     auto buf, size_out, doc, root;
     auto idx, version, w, h, tiles_idx, ents_idx;
     auto x, y, row, cell;
     auto n_ents, ent_obj, kind_idx, x_idx, y_idx;
     auto kind_str, ex: float, ey: float;
-    auto we: WolfEntity, e_count;
+    auto we: WolfEntity, e_count, prev_we: WolfEntity, i;
+
+    // Free the previous load's str_dup'd kind strings before we
+    // overwrite the entity slots. Skipped on the very first call
+    // (wolf_entity_count starts at 0).
+    for (i = 0; i < wolf_entity_count; i++) {
+        prev_we = wolf_entities + i * sizeof(WolfEntity);
+        if (prev_we.kind != 0) { free(prev_we.kind); }
+    }
+    wolf_entity_count = 0;
 
     size_out = malloc(8);
     *(size_out) = 0;
@@ -579,13 +633,18 @@ static _load_level(path)@io {
             if (kind_str == 0) { continue; }
 
             if (str_eq(kind_str, "player_spawn") != 0) {
-                // Apply spawn to the existing player FPSBody. Angle
-                // 0 = facing east, matching Phase 1 spawn convention;
-                // a future "facing" prop on the entity can override.
-                auto p: FPSBody;
-                p   = player;
-                p.x = ex;
-                p.y = ey;
+                // Apply spawn to the existing player FPSBody only on
+                // the initial load. Hot-reloads skip this so the
+                // running player isn't teleported every time the
+                // editor saves; the new spawn position takes effect
+                // on the NEXT launch. Angle 0 = facing east; a
+                // "facing" prop on the entity can override later.
+                if (apply_spawn != 0) {
+                    auto p: FPSBody;
+                    p   = player;
+                    p.x = ex;
+                    p.y = ey;
+                }
                 continue;
             }
 
