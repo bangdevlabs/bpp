@@ -63,6 +63,26 @@ const CAM_BUF_SZ = 32;
 // type id). 16×16 = 256 bytes — well below Metal's 4 KB inline cap.
 const MAP_BUF_SZ = 256;
 
+// Sprite uniform buffer — Phase 2 Session 1 (billboard sprites).
+// Layout MUST match `SpriteList` in fps_raycast.metal:
+//   offset 0   : uint   count
+//   offset 4   : uint   _pad[3]   (12 bytes padding to 16)
+//   offset 16  : Sprite sprites[16]
+//     each Sprite (16 bytes): { float x, float y, uint kind, uint _pad }
+//
+// Cap mirrors the shader's `Sprite sprites[16]` declaration; raise
+// both halves together if later sessions need more entities visible.
+const SPRITE_MAX     = 16;
+const SPRITE_REC_SZ  = 16;
+const SPRITE_BUF_SZ  = 16 + SPRITE_MAX * SPRITE_REC_SZ;
+
+// Kind dispatch codes shared with the shader. `player_spawn`
+// entries from the level JSON have NO renderable kind — the host
+// filters them out before packing. New kinds must extend both
+// `_kind_to_shader_code` below AND the dispatch in fps_raycast.metal.
+const SPRITE_KIND_ENEMY = 1;
+const SPRITE_KIND_DOOR  = 2;
+
 // ── Game state (read by all phases, mutated by solo) ───────
 
 // Field of view in radians (60° = Wolf3D default). Set once in init.
@@ -84,6 +104,7 @@ extrn world_map;
 extrn ray_pipeline;
 extrn cam_buf;
 extrn map_buf;
+extrn sprite_buf;
 
 // Sessão A2 — HUD overlay atlas. Procedural 2-tile atlas painted
 // at init: tile 0 is a white crosshair, tile 1 is a red heart icon.
@@ -319,6 +340,7 @@ static fps_init_phase() {
 
     cam_buf = malloc(CAM_BUF_SZ);
     map_buf = malloc(MAP_BUF_SZ);
+    sprite_buf = malloc(SPRITE_BUF_SZ);
     _repack_map_buf();
 
     // Arm the level hot-reload. file_watch_register polls the file
@@ -409,9 +431,16 @@ static fps_render_phase(alpha: float) {
         write_u32(cam_buf, 24, MAP_W);
         write_u32(cam_buf, 28, MAP_H);
 
+        // Phase 2 Session 1 — repack the visible-entity list each
+        // frame. Cheap (≤32 entries, ≤16 emitted, four 4-byte writes
+        // each); putting it in the same @profile zone as the camera
+        // repack keeps the profile readout compact.
+        _pack_sprite_buf();
+
         gpu_pipeline_use(ray_pipeline);
-        gpu_uniform_set_frag(0, cam_buf, CAM_BUF_SZ);
-        gpu_uniform_set_frag(1, map_buf, MAP_BUF_SZ);
+        gpu_uniform_set_frag(0, cam_buf,    CAM_BUF_SZ);
+        gpu_uniform_set_frag(1, map_buf,    MAP_BUF_SZ);
+        gpu_uniform_set_frag(2, sprite_buf, SPRITE_BUF_SZ);
         // Phase 7 — bind the 4 wall textures to fragment slots 0..3.
         // The shader's dispatch on wall_type picks the right sample;
         // every column is uniform so branch divergence is irrelevant.
@@ -485,6 +514,7 @@ static fps_quit_phase() @io {
         wolf_entities     = 0;
         wolf_entity_count = 0;
     }
+    if (sprite_buf != 0) { free(sprite_buf); sprite_buf = 0; }
     return 0;
 }
 
@@ -524,6 +554,55 @@ static void _repack_map_buf() {
             poke(map_buf + y * MAP_W + x, cell);
         }
     }
+}
+
+// Map an entity `kind` string to the integer code the shader's
+// sprite dispatch expects. Returns 0 for kinds that should NOT
+// render as a sprite (player_spawn, unknown future kinds) — the
+// packer below filters those out before incrementing `count`.
+//
+// New entity kinds must extend this dispatch in lockstep with the
+// shader's `if (sp.kind == ...)` chain in fps_raycast.metal.
+static _kind_to_shader_code(kind_str) {
+    if (kind_str == 0) { return 0; }
+    if (str_eq(kind_str, "enemy") != 0) { return SPRITE_KIND_ENEMY; }
+    if (str_eq(kind_str, "door")  != 0) { return SPRITE_KIND_DOOR;  }
+    return 0;
+}
+
+// Pack the runtime `wolf_entities` array into the GPU sprite buffer
+// shape the shader reads (`SpriteList` in fps_raycast.metal). The
+// packer skips player_spawn entries (kind code 0) and caps at
+// SPRITE_MAX renderable entities — extras are dropped silently for
+// Phase 2 Minimum (1 enemy + 1 door means we never hit the cap).
+//
+// Layout reminder (must stay in lockstep with the shader):
+//   [0 .. 4)   count : uint
+//   [4 .. 16)  padding
+//   [16..]     Sprite records, 16 bytes each:
+//              { x: float, y: float, kind: uint, _pad: uint }
+//
+// Called per render frame (cheap — count <= 32 entities, mostly
+// pointer arithmetic + four 4-byte writes per record).
+static void _pack_sprite_buf() {
+    auto i, we: WolfEntity, code, count, base;
+    count = 0;
+    for (i = 0; i < wolf_entity_count; i++) {
+        we   = wolf_entities + i * sizeof(WolfEntity);
+        code = _kind_to_shader_code(we.kind);
+        if (code == 0) { continue; }                 // not renderable
+        if (count >= SPRITE_MAX) { break; }
+        base = sprite_buf + 16 + count * SPRITE_REC_SZ;
+        write_f32(base,  0, we.x);
+        write_f32(base,  4, we.y);
+        write_u32(base,  8, code);
+        write_u32(base, 12, 0);                      // padding slot
+        count++;
+    }
+    write_u32(sprite_buf,  0, count);
+    write_u32(sprite_buf,  4, 0);
+    write_u32(sprite_buf,  8, 0);
+    write_u32(sprite_buf, 12, 0);
 }
 
 // file_watch callback — fired by image_hot_reload_tick_throttled

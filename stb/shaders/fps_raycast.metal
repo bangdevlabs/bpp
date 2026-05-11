@@ -27,6 +27,30 @@ struct CamUniforms {
     uint  mh;     // map height in cells
 };
 
+// Sprite uniforms — Wolf3D Phase 2 Session 1 (billboard sprites).
+// One entry per visible entity (enemies, doors). Player_spawn entries
+// MUST be filtered out on the host side; this struct expects only
+// renderable entities. Cap is 16 — enough for Phase 2 Minimum (1 enemy
+// + 1 door = 2). Raise both halves of the contract (this constant +
+// SPRITE_BUF_SZ on B++ side) together when later sessions need more.
+//
+// Kind codes (must match B++ side fps_wolf3d.bpp::_pack_sprite_buf):
+//   1 = enemy (red quad)
+//   2 = door  (brown quad)
+struct Sprite {
+    float x;
+    float y;
+    uint  kind;
+    uint  _pad;   // round to 16-byte alignment so the array stride is
+                  // predictable across Metal versions
+};
+
+struct SpriteList {
+    uint count;
+    uint _pad[3];        // pad before the array starts at offset 16
+    Sprite sprites[16];
+};
+
 struct VOut {
     float4 position [[position]];
 };
@@ -56,8 +80,9 @@ vertex VOut fps_vert(uint vid [[vertex_id]]) {
 constexpr sampler wall_smp(filter::linear, address::repeat);
 
 fragment float4 fps_frag(VOut in [[stage_in]],
-                         constant CamUniforms& cam [[buffer(0)]],
-                         constant uchar*       map [[buffer(1)]],
+                         constant CamUniforms& cam     [[buffer(0)]],
+                         constant uchar*       map     [[buffer(1)]],
+                         constant SpriteList&  sprites [[buffer(2)]],
                          texture2d<float> tex_brick [[texture(0)]],
                          texture2d<float> tex_stone [[texture(1)]],
                          texture2d<float> tex_wood  [[texture(2)]],
@@ -128,82 +153,167 @@ fragment float4 fps_frag(VOut in [[stage_in]],
     }
 
     // Sky / floor for rays that escape the grid without hitting.
+    // `wall_dist` initialised to a large sentinel here so the sprite
+    // occlusion pass below still works when the ray misses every cell
+    // (sprite in front of "infinity" always passes).
     float3 sky_col   = float3(0.125, 0.157, 0.188);
     float3 floor_col = float3(0.220, 0.157, 0.125);
+    float3 base_col;
+    float  wall_dist = 1.0e6;
     if (hit == 0) {
-        return fy < half_h ? float4(sky_col, 1.0) : float4(floor_col, 1.0);
+        base_col = (fy < half_h) ? sky_col : floor_col;
     }
 
-    // Perpendicular wall distance — same formula as Lode's tutorial
-    // and the CPU-side stbraycast cartridge. Avoids fish-eye that
-    // raw ray distance would produce.
-    float wall_dist;
-    if (side == 0) {
-        wall_dist = (float(mx) - cam.px + (1.0 - float(step_x)) * 0.5) / dx;
-    } else {
-        wall_dist = (float(my) - cam.py + (1.0 - float(step_y)) * 0.5) / dy;
-    }
-    if (wall_dist < 0.0001) {
-        wall_dist = 0.0001;
+    // Perpendicular wall distance + wall sampling — only when the
+    // ray actually hit a cell. On a miss we leave `wall_dist` at the
+    // 1e6 sentinel above so sprites still occlude correctly against
+    // "infinity" (every sprite passes the depth test).
+    if (hit == 1) {
+        // Same formula as Lode's tutorial and the CPU-side
+        // stbraycast cartridge. Avoids fish-eye that raw ray
+        // distance would produce.
+        if (side == 0) {
+            wall_dist = (float(mx) - cam.px + (1.0 - float(step_x)) * 0.5) / dx;
+        } else {
+            wall_dist = (float(my) - cam.py + (1.0 - float(step_y)) * 0.5) / dy;
+        }
+        if (wall_dist < 0.0001) {
+            wall_dist = 0.0001;
+        }
+
+        // Project the wall to screen-space — line_height is the
+        // on-screen pixel extent of a 1.0-world-unit-tall wall at
+        // this distance.
+        float line_height = sh_f / wall_dist;
+        float wall_top = half_h - line_height * 0.5;
+        float wall_bot = half_h + line_height * 0.5;
+
+        if (fy < wall_top) {
+            base_col = sky_col;
+        } else if (fy > wall_bot) {
+            base_col = floor_col;
+        } else {
+            // Texture UV — Lode's standard formulation:
+            //   u: where the ray hit on the wall in tile-local
+            //      coordinates (0..1). Derived from the
+            //      perpendicular hit point on the opposite axis
+            //      from the wall's facing.
+            //   v: vertical position down the wall column,
+            //      normalised to [0..1] across the on-screen wall
+            //      extent.
+            // Side-flip: walls hit from the opposite side need a
+            // mirrored u to keep the texture orientation consistent
+            // regardless of which face the ray entered from. The
+            // conditional below preserves Wolf3D-style continuity
+            // across cell boundaries.
+            float wall_x;
+            if (side == 0) {
+                wall_x = cam.py + wall_dist * dy;
+            } else {
+                wall_x = cam.px + wall_dist * dx;
+            }
+            wall_x = wall_x - floor(wall_x);
+            if ((side == 0 && dx > 0.0) || (side == 1 && dy < 0.0)) {
+                wall_x = 1.0 - wall_x;
+            }
+            float u = wall_x;
+            float v = (fy - wall_top) / line_height;
+            float2 uv = float2(u, v);
+
+            // Sample the texture matching wall_type. Metal's branch
+            // divergence cost is irrelevant — neighbouring fragments
+            // in a column always hit the same texture.
+            float3 wall_col;
+            if (wall_type == 1) {
+                wall_col = tex_brick.sample(wall_smp, uv).rgb;
+            } else if (wall_type == 2) {
+                wall_col = tex_stone.sample(wall_smp, uv).rgb;
+            } else if (wall_type == 3) {
+                wall_col = tex_wood.sample(wall_smp, uv).rgb;
+            } else if (wall_type == 4) {
+                wall_col = tex_solid.sample(wall_smp, uv).rgb;
+            } else {
+                wall_col = float3(0.50, 0.50, 0.50);
+            }
+            // E-W walls (side == 1) read 30 % darker so adjacent
+            // faces of a wall block read as different surfaces —
+            // the standard Wolf3D shading trick.
+            if (side == 1) {
+                wall_col *= 0.7;
+            }
+            base_col = wall_col;
+        }
     }
 
-    // Project the wall to screen-space — line_height is the on-screen
-    // pixel extent of a 1.0-world-unit-tall wall at this distance.
-    float line_height = sh_f / wall_dist;
-    float wall_top = half_h - line_height * 0.5;
-    float wall_bot = half_h + line_height * 0.5;
+    // ── Sprite pass — Wolf3D Phase 2 Session 1 ────────────────
+    //
+    // Per-fragment billboard sprite occlusion. For each visible
+    // entity (host filtered to count <= 16): rotate its world
+    // position into camera space so `rx` is the forward depth and
+    // `ry` is the lateral offset, then test whether the current
+    // fragment falls inside the sprite's screen rect AND the
+    // sprite is closer than the wall behind it at this column.
+    //
+    // The closest-front-wins strategy is order-independent — no
+    // host-side sort needed. Cost is O(count) per fragment; at
+    // count<=16 and 320×180 = 57 600 fragments, that's ~922 K
+    // sprite tests per frame, trivial on Apple GPU.
+    //
+    // Sprites are 1×1 world units, drawn centered at fy = half_h.
+    // Screen size in pixels = sh / rx (same projection as walls),
+    // which yields a square footprint that scales correctly with
+    // distance.
+    float  best_dist = wall_dist;
+    float3 best_col  = base_col;
+    float  cos_a     = cos(cam.angle);
+    float  sin_a     = sin(cam.angle);
+    float  fov_half  = cam.fov * 0.5;
+    uint   ns        = sprites.count;
+    if (ns > 16u) { ns = 16u; }
+    for (uint si = 0u; si < ns; si++) {
+        Sprite sp = sprites.sprites[si];
+        float dxs = sp.x - cam.px;
+        float dys = sp.y - cam.py;
+        // Rotate (dxs, dys) by -cam.angle so rx is along the camera
+        // forward and ry is the perpendicular sideways offset.
+        float rx = dxs * cos_a + dys * sin_a;
+        float ry = -dxs * sin_a + dys * cos_a;
+        if (rx < 0.05) { continue; }                 // behind camera
+        if (rx >= best_dist) { continue; }           // occluded by wall
 
-    if (fy < wall_top) {
-        return float4(sky_col, 1.0);
-    }
-    if (fy > wall_bot) {
-        return float4(floor_col, 1.0);
+        // Lateral angle relative to the camera centerline (0 = dead
+        // ahead, ±fov/2 = screen edges). Pixels outside the FOV
+        // wedge can't see this sprite at all.
+        float ang = atan2(ry, rx);
+        if (ang < -fov_half || ang > fov_half) { continue; }
+
+        // Project sprite center to screen column. Same linear
+        // mapping the wall pass uses (column_angle linearly spans
+        // -fov/2 .. +fov/2 across 0..sw).
+        float col_center = (ang / cam.fov + 0.5) * sw_f;
+        float half_size  = sh_f / rx * 0.5;          // 1-unit sprite
+        if (fx < col_center - half_size) { continue; }
+        if (fx > col_center + half_size) { continue; }
+        if (fy < half_h    - half_size) { continue; }
+        if (fy > half_h    + half_size) { continue; }
+
+        // Inside the sprite footprint. Pick a color by kind. New
+        // kinds added later sessions must extend this dispatch in
+        // lockstep with the B++ packer.
+        float3 sp_col;
+        if (sp.kind == 1u) {
+            sp_col = float3(0.85, 0.20, 0.20);       // enemy red
+        } else if (sp.kind == 2u) {
+            sp_col = float3(0.55, 0.35, 0.18);       // door brown
+        } else {
+            sp_col = float3(1.00, 0.00, 1.00);       // unknown — magenta
+        }
+
+        // Closest-front bookkeeping. Multiple sprites overlapping
+        // the same pixel — the nearer one wins, walls bound the back.
+        best_dist = rx;
+        best_col  = sp_col;
     }
 
-    // Texture UV — Lode's standard formulation:
-    //   u: where the ray hit on the wall in tile-local coordinates
-    //      (0..1). Derived from the perpendicular hit point on the
-    //      opposite axis from the wall's facing.
-    //   v: vertical position down the wall column, normalised to
-    //      [0..1] across the on-screen wall extent.
-    // Side-flip: walls hit from the opposite side need a mirrored u
-    // to keep the texture orientation consistent regardless of which
-    // face the ray entered from. The conditional below preserves
-    // Wolf3D-style continuity across cell boundaries.
-    float wall_x;
-    if (side == 0) {
-        wall_x = cam.py + wall_dist * dy;
-    } else {
-        wall_x = cam.px + wall_dist * dx;
-    }
-    wall_x = wall_x - floor(wall_x);
-    if ((side == 0 && dx > 0.0) || (side == 1 && dy < 0.0)) {
-        wall_x = 1.0 - wall_x;
-    }
-    float u = wall_x;
-    float v = (fy - wall_top) / line_height;
-    float2 uv = float2(u, v);
-
-    // Sample the texture matching wall_type. Metal's branch divergence
-    // cost is irrelevant here — neighbouring fragments in a single
-    // screen column always hit the same texture (one wall per column).
-    float3 wall_col;
-    if (wall_type == 1) {
-        wall_col = tex_brick.sample(wall_smp, uv).rgb;
-    } else if (wall_type == 2) {
-        wall_col = tex_stone.sample(wall_smp, uv).rgb;
-    } else if (wall_type == 3) {
-        wall_col = tex_wood.sample(wall_smp, uv).rgb;
-    } else if (wall_type == 4) {
-        wall_col = tex_solid.sample(wall_smp, uv).rgb;
-    } else {
-        wall_col = float3(0.50, 0.50, 0.50);
-    }
-    // E-W walls (side == 1) read 30 % darker so adjacent faces of a
-    // wall block read as different surfaces — the standard Wolf3D
-    // shading trick.
-    if (side == 1) {
-        wall_col *= 0.7;
-    }
-    return float4(wall_col, 1.0);
+    return float4(best_col, 1.0);
 }
