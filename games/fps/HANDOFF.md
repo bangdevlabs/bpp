@@ -15,8 +15,8 @@ Tooling: Bang 9 (Levels tab + Effects tab) — see `docs/bang9_space_manual.md`.
 | # | Session | Status | LOC | Ships |
 |---|---|---|---|---|
 | 0 | Map loader + entity layer | **✅ shipped 2026-05-11** | ~240 | level_editor entity layer + JSON schema v2 + fps_wolf3d loader |
-| 1 | Sprites + depth buffer | **→ next** | ~200 | Billboard sprites render, walls occlude correctly |
-| 2 | Enemies (visible + AI) | pending | ~150 | Enemy walks toward player via LoS raycast |
+| 1 | Sprites + depth buffer | **✅ shipped 2026-05-11** | ~250 | Per-fragment depth test + colored quads for enemy/door |
+| 2 | Enemies (visible + AI) | **✅ shipped 2026-05-11** | ~430 | stbai cartridge (LoS/seek/move) + ai.bsm game module (FSM + A*) — wolf_world ECS via stbecs |
 | 3 | Combat | pending | ~100 | Fire action, hitscan, damage, death |
 | 4 | Audio | pending | ~80 | Gunfire / scream / footsteps; volume by distance |
 | 5 | Doors + use | pending | ~120 | Tilemap state slot, use action, slide-open animation |
@@ -27,71 +27,79 @@ Commit cadence: one commit per session, message format
 
 ---
 
-## Next: Session 1 — Sprites + depth buffer
+## Next: Session 3 — Combat
 
-### What Session 0 already set up
+### What Sessions 0–2 already set up
 
 Run `fps_wolf3d` and you have:
 
-- **Map loaded from JSON v2** — `assets/levels/level1.json` parsed
-  on init. Tiles populate `world_map`; entities populate the
-  `wolf_entities` array (kind / x / y per record). `player_spawn`
-  entity already applied to the player FPSBody, so the spawn point
-  comes from the level file, not hardcoded.
-- **3 entities placed in the demo level**: `player_spawn`, `enemy`
-  (one), `door` (one). Inspect with the Bang 9 Levels tab — Tab key
-  toggles between Tiles and Objects mode.
-- **No renderer for entities yet** — that's this session's job.
+- **Map loaded from JSON v2** with hot-reload from Bang 9's
+  Levels tab (`assets/levels/level1.json`).
+- **Sprites rendered as solid colored quads** — enemy red, door
+  brown. Per-fragment depth test in `fps_raycast.metal` makes them
+  occlude correctly behind walls.
+- **Enemy AI** — each enemy chases the player. LoS clear ⇒
+  straight-line seek (`stb/stbai.bsm`). LoS blocked but player
+  in sight range ⇒ A* path via `stb/stbpath.bsm`, walks toward
+  the next waypoint. Stops at melee range (0.8 cells). State
+  is IDLE / CHASE; ATTACK lands in Session 3.
+- **ECS entity storage** — `wolf_world` is an `stbecs.World`.
+  Custom component `WolfEntPayload` (defined in `games/fps/ai.bsm`)
+  holds kind / state / position / velocity / hp / cooldown per
+  entity. Spawn / iteration happens via `ecs_spawn` / `ecs_alive` /
+  `ecs_component_at`.
 
-### What this session ships
+### What Session 3 ships
 
-A billboard sprite renderer that:
+The player's side of combat:
 
-1. Walks `wolf_entities` each frame, sorts by depth (back-to-front
-   relative to the player).
-2. For each entity: project its world position into screen space
-   using the same FPSBody / FOV math `fps_render_phase` uses for
-   walls. Skip if behind the camera.
-3. Compute the column range it covers, then for each column
-   compare the sprite's depth against the wall's depth at that
-   column (the depth buffer Session 1 also introduces). Draw
-   the sprite column only where it's in front of the wall.
-4. Pick a sprite atlas by `kind`: solid colored quad is fine for
-   V1 (red square = enemy, brown square = door). Authored
-   sprites land in Session 4+ when audio + content polish hits.
+1. Fire action (mouse left or KEY_SPACE) — emits a hitscan ray
+   from the player's position along the facing vector.
+2. Ray intersects against the closest enemy via
+   `ai_los_clear`-style traversal *augmented* with entity-cell
+   hit detection (per the ECS pool).
+3. Enemy taking a hit decrements `hp` (already in payload). When
+   `hp <= 0`, `ecs_kill` removes the entity from rendering + AI
+   dispatch in the same frame.
+4. Visual feedback: muzzle flash on the HUD overlay; brief
+   colour-shift on the wounded enemy quad.
 
 ### Files this session touches
 
 | File | Change |
 |---|---|
-| `stb/stbraycast.bsm` | Extend with depth buffer + `draw_sprite` helper. ~80 LOC. |
-| `games/fps/fps_wolf3d.bpp` | Renderer walks `wolf_entities`, calls draw_sprite. ~50 LOC. |
-| `assets/shaders/fps_raycast.metal` | Depth output from the wall pass + sprite quad pass on top. ~40 LOC. |
-| `tests/test_stbraycast_sprite.bpp` | Lock the depth-comparison contract (spawn a sprite behind a wall, assert it doesn't render). ~30 LOC. |
+| `stb/stbai.bsm` | `ai_hitscan(tm, x0, y0, dx, dy, max_dist, world, payload, payload_field_offsets) → handle` returning the closest hit entity ID, or -1. ~40 LOC. |
+| `games/fps/combat.bsm` | NEW sibling module to `ai.bsm`. Owns the fire action handler + hit application + death. ~80 LOC. |
+| `games/fps/fps_wolf3d.bpp` | Wire `combat_*` calls into solo phase; add muzzle-flash atlas tile. ~20 LOC. |
 
-LOC realistic: ~200.
+LOC realistic: ~140.
 
 ### Implementation hints
 
-- Reference: Lode Vandevenne raycasting tutorial Part 3 (sprites).
-  Same DDA + projection that Phase 1 used for walls; the new piece
-  is the column-by-column depth comparison.
-- Don't pre-commit to texture atlases. Solid colored quads
-  validate the renderer in isolation; sprite art swaps in via
-  `image_load` once the geometry is correct.
-- The depth buffer is **per column**, not per pixel — it stores
-  the perpendicular wall distance for that screen column. Sprites
-  compare per column too, not per pixel.
-- Player position + facing already pull from the level via the
-  `player_spawn` entity, so changing the spawn requires only
-  editing the level JSON in Bang 9 — no rebuild.
+- Reuse `_ai_buf`-style scratch pattern for the hit result.
+- `combat.bsm` should NOT touch the GPU sprite buffer directly —
+  `_pack_sprite_buf` in fps_wolf3d.bpp keeps owning visual state.
+- Tonify checklist applies (storage class, `@solo`, slice types
+  where the struct says, comments-as-user-manual).
 
 ### What NOT to do this session
 
-- Don't add enemy AI. That's Session 2's whole job (D1 lands then).
-- Don't try to make sprites animate (idle / walk / attack frames).
-  Session 4 territory.
-- Don't add the `stbtile.state` field. That's Session 5 (Doors).
+- No enemy melee back at the player. That's Session 3.5 if
+  signal emerges; otherwise Session 6 polish.
+- No animation frames. Session 4+ territory.
+- No projectiles. Hitscan-only for V1 (matches Wolf3D's actual
+  combat model — instant pistol/MP40, no flight time).
+
+### Pitfall warnings for Session 3
+
+- `write_f32` / `peekfloat` width mismatch (Session 2's biggest
+  rabbit hole) is in `feedback_float_width_pair` memory. Use
+  `write_f64` + `peekfloat` for B++-native scratch; the GPU pack
+  path is the only consumer of `write_f32`.
+- `_load_level`'s `tile_solid()` runs only for cell types 1..4 —
+  if Session 5 (doors) introduces dynamic solidity, the
+  PathFinder's `blocked` array needs a `wolf_ai_resync_walls`
+  call when state flips.
 
 ---
 
@@ -100,42 +108,38 @@ LOC realistic: ~200.
 These are the contracts every later session inherits. Re-confirm
 with the user before deviating.
 
-### D1 — Entity storage cartridge
+### D1 — Entity storage uses existing `stb/stbecs.bsm`
 
-`stb/stbentity.bsm` lands in **Session 2** when enemies become
-runtime objects with state + AI. Session 0 produces the static
-entity list (`wolf_entities` array of `{kind, x, y}`); Session 1
-just renders them; Session 2 promotes that list into a real
-`EntityPool` with kind-specific FSM state.
+Earlier drafts of this doc proposed shipping a new `stb/stbentity.bsm`
+cartridge in Session 2. That was a verification-failure on the
+author's part: `stb/stbecs.bsm` already exists and covers the
+same shape — `ecs_new` / `ecs_spawn` / `ecs_kill` / `ecs_alive` /
+`ecs_count` / `ecs_component_new` / `ecs_component_at`. Adding a
+parallel cartridge would have been ~200 LOC of duplicate code.
 
-Cartridge surface (proposed, can drift in Session 2):
+Session 2 instead stores enemies via stbecs core (handle + alive
+bit) plus one game-local custom component for Wolf3D-specific
+fields:
 
 ```bpp
-struct Entity {
-    kind: byte,           // 1=enemy, 2=item, 3=projectile, ...
-    state: byte,          // FSM state index, kind-specific
-    flags: byte,          // alive bit + flags
-    sprite_id: byte,      // index into game's sprite atlas
-    x: float, y: float,   // world position
-    vx: float, vy: float, // velocity
-    hp: half,             // health if applicable
-    cooldown: half        // generic countdown timer (frames)
+struct WolfEntPayload {
+    kind:     byte,    // 1=enemy, 2=door, …
+    state:    byte,    // FSM state index
+    x: float, y: float,
+    vx: float, vy: float,
+    hp:       half,
+    cooldown: half
 }
 
-ent_pool_new(cap)
-ent_spawn(pool, kind, x, y) → handle
-ent_kill(pool, handle)
-ent_alive(pool, handle)@base
-ent_at(pool, handle): Entity ptr
-ent_count(pool)@base
-ent_each(pool, fn_ptr)
-ent_sort_by_depth(pool, px, py)
-ent_hitscan_ray(pool, x0, y0, dir_x, dir_y, max_dist) → handle
+wolf_world  = ecs_new(WOLF_MAX_ENTITIES);
+wolf_payload = ecs_component_new(wolf_world, sizeof(WolfEntPayload));
 ```
 
-Justified by the two-consumer rule (Wolf3D + future DOOM-clone
-expected); no need to wait for the second consumer to ship before
-promoting.
+The 16 bytes per entity that stbecs built-ins (`pos_x` /
+`pos_y` / `vel_x` / `vel_y` / `flags` in milli-units) reserve and
+Wolf3D doesn't use are negligible at our entity counts. Wolf3D's
+positions live in cell-float units (FPSBody convention), so the
+custom component owns position too — built-in pos slots stay zero.
 
 ### D2 — AI substrate
 
@@ -231,6 +235,56 @@ when the real value is 16.667 ms.
 `profile_hud_draw_fps_only(x, y, sz, color)` that renders just the
 FPS line independent of the profile toggle. Useful for shipping
 games that want a permanent overlay without the recording UX.
+
+### 6. Wolf3D visual asset ingestion (post-Phase-2)
+
+Replace procedural placeholder textures + colored quads with
+shareware visuals. Runs after Phase 2 closes (gameplay validated
+with placeholders first) — decoupling gameplay risk from binary-
+format risk.
+
+**Workflow (manual, not agent-driven):**
+
+1. User downloads Wolf3D shareware (legally free since 1992) to
+   `~/Downloads/wolf3d_shareware/`
+2. User clones + builds `HiPhish/Wolf3DExtract` once, runs it
+   against the shareware dir → PPM dumps + WAV PCM
+3. User runs `mogrify -format png` on the PPMs, picks the subset
+   that matches the demo's visual budget, drops them into
+   `games/fps/assets/wolf3d/{walls,sprites}/`
+4. Agent writes `walls.json` + `sprites.json` manifests
+   (id → human name → PNG path), swaps procedural textures in
+   `fps_wolf3d.bpp` for `image_load` of the authentic assets
+
+**Files this sidequest touches (one session, ~100 LOC):**
+
+| File | Change |
+|---|---|
+| `games/fps/assets/wolf3d/walls.json` | NEW manifest |
+| `games/fps/assets/wolf3d/sprites.json` | NEW manifest |
+| `games/fps/fps_wolf3d.bpp` | Procedural texture path → image_load |
+
+**Git policy:** `.WL1` source files live on the user's disk only,
+NEVER in the repo. Extracted PNGs go in `.gitignore` (each
+contributor extracts from their own shareware copy — same model
+ECWolf / Wolf4SDL use). Only the JSON manifests + loader code get
+committed. Avoids the copyright grey area entirely while keeping
+the authentic look reachable for personal dev.
+
+**Why we don't write our own extractor:** Wolf3DExtract exists,
+works, ~5000 LOC of someone else's solved problem. Each retro
+engine has a totally proprietary container format (Wolf3D VSWAP /
+Doom WAD / Quake PAK / Build GRP) — code reuse across them is
+~5 %. Investing in a B++-native extractor for a one-shot import
+buys nothing.
+
+**OPL2 (AdLib FM) emulator explicitly DROPPED.** Native B++ synth
+descended from `mini_synth` covers all retro audio needs for
+original games on the roadmap (Wolf3D-style FPS, Adventure-style
+puzzle, RTS, etc.). OPL2 would only pay if we committed to
+faithful DOS-era remakes — that's not the brand. Audio for
+Phase 2 Session 4 will be B++ synth + (optionally) recorded
+voice samples, no historical chip emulation.
 
 ---
 

@@ -8453,3 +8453,92 @@ V3 is done. The eixo function-pointer typing matches Rust/Zig/Go/
 Swift on the rude-first-with-opt-in-discipline axis, and Pitfall 6
 went from diagnostic candidate to diagnostic shipped in three days
 (2026-05-04 Session 1 → 2026-05-05 Sessions 2-5).
+
+## 2026-05-11 — Wolf3D Phase 2 Session 2 (Enemies + AI) shipped
+
+Closed Session 2 of the Wolf3D Phase 2 arc. Two enemies now chase
+the player through the demo level: line-of-sight when clear,
+A* path around walls when blocked, stop at melee range. ECS
+storage replaces the Session 0 flat array, and the two new
+libraries (stbai + ai.bsm) match the load-vs-import convention
+the project canonized in Session 1.
+
+### Shipped
+
+- **`stb/stbai.bsm`** (~140 LOC). Genre-agnostic primitives:
+  `ai_los_clear` (DDA-binary line-of-sight), `ai_dist` (Euclidean),
+  `ai_seek` (unit-vector velocity toward target), `ai_step_collide`
+  (move + per-axis wall slide). All operate on float cell coords
+  to match FPSBody / stbraycast.
+
+- **`games/fps/ai.bsm`** (~170 LOC, `load`ed by fps_wolf3d). FSM
+  scaffold per enemy: `_ENEMY_IDLE` ↔ `_ENEMY_CHASE`. LoS clear →
+  ai_seek straight; LoS blocked but still in sight range → A* via
+  stbpath, walk toward first waypoint. Re-query A* per frame —
+  cheap on 16×16, simpler than per-enemy waypoint state.
+  `WolfEntPayload` struct lives here (loaded into fps_wolf3d
+  scope) so both AI dispatch and sprite packer see the same layout.
+
+- **fps_wolf3d migration**. `wolf_entities` flat array → `wolf_world`
+  (stbecs.World) + `wolf_payload` (custom component). Sprite packer
+  iterates the ECS; AI dispatch by kind code. Hot-reload of the
+  level via Bang 9 re-syncs the PathFinder's blocked grid through
+  `wolf_ai_resync_walls`.
+
+### Verification-failures-then-recoveries
+
+Three structural mistakes caught in the conversation. Each
+corrected when the user spotted it.
+
+1. **Shipped `stbentity.bsm` (~200 LOC) before checking for the
+   existing cartridge.** `stb/stbecs.bsm` already covered the same
+   surface — ecs_new / spawn / kill / alive / count /
+   component_new / component_at. Memory feedback
+   `feedback_verify_before_claim` exists precisely for this.
+   Deleted stbentity, used stbecs.
+
+2. **HANDOFF "D1" decision was stale.** The earlier draft said
+   "stbentity lands in Session 2." Wrong because stbecs predated
+   the doc. Rewrote D1 to point at stbecs + the custom-component
+   pattern. Lesson: HANDOFFs decay; verify against repo state
+   even when the doc is hours old.
+
+3. **`stbai` wrote 32-bit singles via `write_f32` while `ai.bsm`
+   read 64-bit doubles via `peekfloat`.** Mismatch was silent —
+   `peekfloat` reads 8 bytes from a buffer where only the first
+   4 bytes were single-precision data. The second axis (y) read
+   bytes from the next field's slot, producing garbage like
+   `393216.0636`. Sprites packed with bogus positions ended up
+   projected outside the camera frustum or behind it, so they
+   never rendered. AI fired correctly (dispatch checks `ep.kind`
+   not position) so the bug looked like a render-side issue
+   for an hour.
+   Graduated to `feedback_float_width_pair` memory. Fix: use
+   `write_f64` + `peekfloat` for B++-internal scratch buffers.
+   Keep `write_f32` + `peekfloat_h` paired together for GPU
+   packs only.
+
+### Tooling notes
+
+`bug` (the B++ debugger) was the right tool for the AI dispatch
+verification. `bug --tui --break ecs_spawn --break _enemy_step
+--watch "id" /tmp/wolf_dbg` confirmed both enemies spawned and
+AI was being dispatched per-frame, narrowing the bug to the
+render side without further guessing.
+
+What `bug` is missing for game-debug at 60Hz emerged from this
+session and is now tracked in `docs/todo.md` "bug Phase 7" — trace
+mode (no-pause logging), `name:line` breakpoints (locals at
+function entry are uninitialised), conditional breakpoints, REPL
+hexdump, snapshot/replay. Open as a dedicated arc after the next
+content session that hits the same friction; current Phase 2 work
+stays on the gameplay critical path.
+
+### What this unblocks
+
+Session 3 (Combat) — `combat.bsm` sibling module + `ai_hitscan`
+primitive. The cartridge boundary already exists; combat lives
+game-local, shooting reuses stbai primitives, damage decrements
+the ECS payload's `hp` field. ~140 LOC estimated.
+
+Suite still 143/0/12 native + 116/0/39 C, bootstrap byte-stable.

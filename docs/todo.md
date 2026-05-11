@@ -290,6 +290,47 @@ verifiably not a TTY, auto-fallback to `--dump` instead. Needs
 
 Defer until: someone files an actual issue or runs `bug` in CI.
 
+### `bug` Phase 7 — game-debugger evolutions
+
+Captured 2026-05-11 during Wolf3D Phase 2 Session 2 debugging.
+Each item is one capability that would have cut the sprite-pack
+investigation from hours to minutes. Pick them up after content
+arcs hit the same friction; none block Phase 2.
+
+- **Trace mode (no-pause log)** — `--trace <fn>` prints entry +
+  args without stopping the target. Critical for 60 Hz games:
+  function-entry breakpoints fire so often that stop-the-world
+  starves the maestro and the window never opens. The user can
+  observe AI/render call counts alongside the running game. The
+  observe-mode `O`-packet decoder already handles tracee stdout;
+  this just adds a "continue immediately after logging" path on
+  the host side. ~100 LOC.
+
+- **`name:line` breakpoints** — break at a specific source line,
+  not function entry. Source-position scaffolding exists in
+  `.bug` (the per-function source-line map). Failing today on a
+  source-map index off-by-N. Without it, every break hits at
+  function ENTRY where locals are uninitialised stack garbage.
+  ~80 LOC.
+
+- **Conditional break** — `--break <fn> if <expr>`. Skip 999
+  hits of the same callsite when you only care about the one
+  where a local crossed a threshold. Reuses the existing
+  expression evaluator. ~60 LOC.
+
+- **Memory hexdump** — `d <addr-or-name> <bytes>` in the REPL.
+  Inspect a GPU uniform buffer, an ECS payload slot, or any
+  raw region at the moment of a break. ~40 LOC.
+
+- **Snapshot / replay** — capture full process state at a break
+  and replay deterministically. "What did the world look like
+  10 frames ago when the enemy got stuck?" Largest item, only
+  build once physics / multi-frame bugs become routine. Defer.
+
+Estimated total for items 1-4: ~280 LOC + REPL plumbing.
+Open this as a dedicated arc when the next game-debug session
+hits the same walls.
+
 ### ELF dynamic linking
 
 B++ x86_64 emits only static ELF today. Adding PLT/GOT,

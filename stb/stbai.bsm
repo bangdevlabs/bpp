@@ -1,0 +1,204 @@
+// stbai.bsm — Genre-agnostic AI primitives for grid-world games.
+//
+// What this cartridge OWNS:
+//   - Line-of-sight raycast (binary clear/blocked) — the
+//     foundation of "enemy sees player" in any 2D / 2.5D world
+//   - Steering helpers — distance, angle-to-target, seek vector
+//   - Move-with-collision — 2D position update that slides
+//     against solid Tilemap cells (re-used by both AI bodies
+//     and any future game that doesn't want an FPSBody)
+//
+// What stays in the calling game (NOT in stbai):
+//   - State machines (per-kind FSM lives in the game's module —
+//     enemy variants have wildly different state vocabularies)
+//   - Per-frame dispatch over an entity pool (the game owns the
+//     iteration shape — flat array, stbecs, or custom)
+//   - Combat / target acquisition logic (Wolf3D shoots, Adventure
+//     dispenses dialog, RTS routes orders — too different)
+//
+// Two-consumer rule (Tonify Rule): satisfied by Wolf3D Phase 2
+// Session 2 + the expected Adventure / Doom-clone follow-on.
+//
+// ── Territory split with `stb/stbpath.bsm` ─────────────────
+//
+// The two cartridges are deliberately separate — no name
+// collisions (`ai_*` vs `path_*`), no shared internals, no
+// duplicated algorithms. They occupy complementary niches:
+//
+//   stbpath = discrete grid A* — long-range route discovery,
+//             allocated once, queried a few times per second.
+//             Returns a list of (gx, gy) waypoints.
+//   stbai   = continuous-space primitives — LoS / distance /
+//             seek vector / move-with-collision. Stateless,
+//             called every frame, operates on float cell coords.
+//
+// Games that need BOTH (e.g. enemy uses LoS when player visible,
+// falls back to A* when player ducks around a corner) compose
+// them in their own ai.bsm module. Today they share one friction
+// point: stbpath maintains its own `blocked` array via
+// `path_set_blocked`, separate from the Tilemap stbai reads from
+// directly. The first consumer needing both can promote a
+// `path_sync_from_tilemap(pf, tm)` helper to stbpath — not done
+// now because the Wolf3D demo doesn't need A* yet.
+//
+// Coordinate convention: x/y in CELL FLOATS (one world unit per
+// tile, fractional within-cell offsets). Matches FPSBody and the
+// stbraycast cartridge so they all compose without scale shifts.
+
+import "stbtile.bsm";       // Tilemap, tile_get, tile_is_solid
+
+// ── Sensing — line of sight ────────────────────────────────
+
+// Step length used by the LoS DDA. Smaller is more accurate but
+// slower; 0.1 cell is plenty for the Wolf3D-tier maps Phase 2
+// ships (worst-case 16 cells diagonal = 160 steps).
+const _AI_LOS_STEP = 0.1;
+
+// Walk a straight line from (x0, y0) to (x1, y1) in the world
+// and return 1 if every cell along the way is non-solid, 0 if
+// any solid cell blocks the view. The endpoints themselves are
+// NOT tested — callers typically know both ends are walkable
+// (entity standing on a floor cell, player on another floor
+// cell) and only care about the gap.
+//
+// Pure reader of the Tilemap — `: base` so AI dispatch loops
+// can compose without phase friction.
+ai_los_clear(tm, x0: float, y0: float, x1: float, y1: float)@base {
+    auto dx: float, dy: float, dist: float;
+    auto sx: float, sy: float, fx: float, fy: float;
+    auto steps_f: float;
+    auto steps: word, i, cell_x, cell_y;
+
+    dx = x1 - x0;
+    dy = y1 - y0;
+    dist = sqrt(dx * dx + dy * dy);
+
+    // Degenerate case — same cell. Trivially "clear".
+    if (dist < _AI_LOS_STEP) { return 1; }
+
+    sx = dx / dist * _AI_LOS_STEP;
+    sy = dy / dist * _AI_LOS_STEP;
+    // Truncate the float step count to an int via a typed word
+    // slot — V3 type checker requires the explicit hop instead of
+    // an implicit float→int coercion.
+    steps_f = dist / _AI_LOS_STEP;
+    steps   = steps_f;
+
+    fx = x0;
+    fy = y0;
+    for (i = 1; i < steps; i++) {
+        fx = fx + sx;
+        fy = fy + sy;
+        cell_x = floor_f(fx);
+        cell_y = floor_f(fy);
+        if (tile_is_solid(tm, tile_get(tm, cell_x, cell_y)) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// ── Steering — distance / angle / seek ─────────────────────
+
+// Euclidean distance between two world points. Pure math —
+// `: base` so cost-comparisons (`if ai_dist < ATTACK_RANGE`)
+// compose into dispatchable AI loops.
+ai_dist(x0: float, y0: float, x1: float, y1: float)@base {
+    auto dx: float, dy: float;
+    dx = x1 - x0;
+    dy = y1 - y0;
+    return sqrt(dx * dx + dy * dy);
+}
+
+// NOTE — angle-to-target helper deliberately omitted from V1.
+// `atan2` doesn't exist in B++ math today, and Session 2 AI
+// only needs the seek-vector direction (computed via ai_seek
+// without ever materialising an angle). When a consumer needs
+// the angle explicitly (e.g. an enemy that aims a projectile),
+// add `atan2_f` to `bpp_math.bsm` first and then `ai_angle_to`
+// here in lockstep.
+
+// Write a velocity vector toward `(tx, ty)` into `out_vxy` (a
+// caller-owned 8-byte buffer holding {vx: float, vy: float}).
+// Magnitude is exactly `speed` (cells/sec) regardless of input
+// distance. Zero-length inputs produce zero output — caller can
+// detect "already arrived" via ai_dist or a follow-up check.
+//
+// Why an out-pointer instead of a packed return: B++ doesn't
+// return struct-by-value cleanly. The caller pattern is the same
+// as `stbraycast.cast_ray` — pre-allocated buffer reused per AI
+// step (zero allocator pressure per frame).
+void ai_seek(ex: float, ey: float, tx: float, ty: float,
+             speed: float, out_vxy) {
+    auto dx: float, dy: float, d: float;
+    dx = tx - ex;
+    dy = ty - ey;
+    d  = sqrt(dx * dx + dy * dy);
+    // Output buffer uses B++-native 8-byte doubles via write_f64
+    // (NOT write_f32, which is 32-bit single). write_f32 +
+    // peekfloat is the wrong width pair (32-bit write, 64-bit
+    // read) and produces sopa de bytes when the caller treats
+    // the buffer as a vec2. Callers must allocate `malloc(16)`.
+    if (d < 0.0001) {
+        write_f64(out_vxy, 0, 0.0);
+        write_f64(out_vxy, 8, 0.0);
+        return;
+    }
+    write_f64(out_vxy, 0, dx / d * speed);
+    write_f64(out_vxy, 8, dy / d * speed);
+}
+
+// ── Movement — circle vs Tilemap ───────────────────────────
+
+// Move a circular body from (x, y) by (vx * dt, vy * dt) and
+// write the resulting position into `out_xy` (a caller-owned
+// 8-byte buffer holding {x: float, y: float}). Collisions are
+// per-axis — diagonal moves into corners slide along whichever
+// axis is free, same scheme as `stbphys.fps_walk` uses for the
+// player.
+//
+// `radius` is the circle's half-extent in cells (typical AI body:
+// 0.25-0.35 — smaller than half a cell so the body slips past
+// narrow doorways). Cells whose value is registered as solid via
+// `tile_solid` are barriers.
+//
+// `@io` per Tonify Rule 4 — writes the caller's out buffer; the
+// classifier won't accept `@base` for that.
+void ai_step_collide(tm, x: float, y: float,
+                     vx: float, vy: float, radius: float,
+                     dt: float, out_xy) @io {
+    auto dx: float, dy: float;
+    auto new_x: float, new_y: float;
+    auto cell_x, cell_y;
+
+    dx = vx * dt;
+    dy = vy * dt;
+
+    // X-axis attempt — offset the leading edge by ±radius so the
+    // hitbox boundary (not the center) determines blocking.
+    new_x = x + dx;
+    if (dx > 0.0) { new_x = new_x + radius; }
+    if (dx < 0.0) { new_x = new_x - radius; }
+    cell_x = floor_f(new_x);
+    cell_y = floor_f(y);
+    if (tile_is_solid(tm, tile_get(tm, cell_x, cell_y)) == 0) {
+        x = x + dx;
+    }
+
+    // Y-axis attempt — use the (possibly updated) x for the
+    // collision probe so a diagonal move into an outside corner
+    // can still slide along the unblocked axis.
+    new_y = y + dy;
+    if (dy > 0.0) { new_y = new_y + radius; }
+    if (dy < 0.0) { new_y = new_y - radius; }
+    cell_x = floor_f(x);
+    cell_y = floor_f(new_y);
+    if (tile_is_solid(tm, tile_get(tm, cell_x, cell_y)) == 0) {
+        y = y + dy;
+    }
+
+    // Same B++-native double convention as ai_seek: caller's
+    // `out_xy` must be `malloc(16)`, not malloc(8).
+    write_f64(out_xy, 0, x);
+    write_f64(out_xy, 8, y);
+}
