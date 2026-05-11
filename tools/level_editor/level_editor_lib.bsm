@@ -42,7 +42,7 @@ static extrn _le_ox, _le_oy, _le_pw, _le_ph;
 // every game had to conform to a 40×22 grid of 16 px tiles — a
 // universal-engine-killer. Now the host (standalone launcher or
 // Bang 9) passes the grid shape at init time, and _load auto-
-// detects the shape of whatever .level.json it's opening.
+// detects the shape of whatever .json level it's opening.
 //
 // Conventional values:
 //   pathfind — 20 × 11, 16 px tiles (fits 320 × 176)
@@ -78,6 +78,128 @@ static extrn _lvl_name_buf;
 
 // Canvas origin (for future zoom/pan; kept simple for MVP).
 static extrn _lvl_cvs_x, _lvl_cvs_y;
+
+// ── Entity layer (Caminho A — Tiled-style multi-layer) ───
+//
+// Levels carry two parallel data structures: the palette-indexed
+// tile grid (above) and a list of entities (player spawns, enemies,
+// doors, items). The two layers are edited independently — the user
+// flips between Tiles mode and Objects mode via the topbar toggle.
+// JSON schema v2 stores both: `tiles[][]` (existing) plus
+// `entities[]` (new array of `{kind, x, y}` records).
+//
+// `kind` is a string (NOT enum) so Phase 3+ can introduce
+// `enemy_guard` / `enemy_dog` etc. without schema churn. Phase 2
+// ships three canonical kinds; the palette below seeds them.
+//
+// V1 of the entity layer treats positions as cell-centered: clicking
+// cell (gx, gy) places an entity at `(gx + 0.5, gy + 0.5)` in world
+// coords, which is what Wolf3D-style raycasters expect for sprite
+// origins. Stored as floats so future tools can drag for sub-cell
+// precision without changing the schema.
+const _LE_MODE_TILES   = 0;
+const _LE_MODE_OBJECTS = 1;
+
+const _LE_MAX_ENTITIES = 64;     // enough for Phase 2 single-level scope
+
+struct LvlEntity {
+    kind,         // str_dup'd null-terminated identifier
+    x: float,     // world position (default = cell center)
+    y: float
+}
+
+static extrn _le_mode;
+static extrn _lvl_entities;          // LvlEntity[] flat buffer
+static extrn _lvl_entity_count;
+
+// Available object kinds — picker in Objects mode lists these.
+// Adding a new kind = appending here + extending _entity_color_for.
+// Phase 2 ships 3; growth is per the "earn the slot" rule.
+static extrn _lvl_kinds;             // word array of C strings
+static extrn _lvl_kind_count;
+static extrn _lvl_kind_sel;          // 0..n-1 — current pick
+
+// ── Object kinds + entity helpers ────────────────────────
+
+// Seed the kind picker with the canonical Phase 2 set. New kinds
+// graduate here once they appear in two games (two-consumer rule).
+// The strings are LITERAL pointers — we never free them, so no
+// alloc/dup ceremony at shutdown.
+static void _init_kinds() {
+    _lvl_kinds = buf_word(8);
+    *(_lvl_kinds + 0 * 8) = "player_spawn";
+    *(_lvl_kinds + 1 * 8) = "enemy";
+    *(_lvl_kinds + 2 * 8) = "door";
+    _lvl_kind_count = 3;
+    _lvl_kind_sel   = 0;
+}
+
+// Pick a marker color per kind so the canvas overlay is readable
+// at a glance. Defaults fall through to neutral grey.
+static _entity_color_for(kind) {
+    if (str_eq(kind, "player_spawn") != 0) { return rgba( 80, 220, 120, 255); }
+    if (str_eq(kind, "enemy")        != 0) { return rgba(220,  80,  80, 255); }
+    if (str_eq(kind, "door")         != 0) { return rgba(180, 130,  80, 255); }
+    return rgba(180, 180, 200, 255);
+}
+
+// Append an entity at the cell-centered world position
+// (gx + 0.5, gy + 0.5). No-op when the buffer is full or the cell
+// already holds an entity (single-occupancy V1 rule — Phase 3+ may
+// relax). `kind` is str_dup'd so the caller can pass any literal
+// or transient buffer.
+static void _entity_add(kind, gx, gy) {
+    auto i, e: LvlEntity, ex: word, ey: word;
+    if (_lvl_entity_count >= _LE_MAX_ENTITIES) { return; }
+    for (i = 0; i < _lvl_entity_count; i++) {
+        e  = _lvl_entities + i * sizeof(LvlEntity);
+        ex = e.x;
+        ey = e.y;
+        if (ex == gx && ey == gy) { return; }
+    }
+    e        = _lvl_entities + _lvl_entity_count * sizeof(LvlEntity);
+    e.kind   = str_dup(kind);
+    e.x      = gx + 0.5;
+    e.y      = gy + 0.5;
+    _lvl_entity_count++;
+    _lvl_dirty = 1;
+}
+
+// Remove whichever entity occupies cell (gx, gy). Compares by
+// floor of the stored float position so sub-cell positions still
+// resolve to the cell they live in. Shifts the last record into
+// the freed slot to keep the buffer compact (order-irrelevant).
+static void _entity_remove_at(gx, gy) {
+    auto i, e: LvlEntity, last: LvlEntity, ex: word, ey: word;
+    for (i = 0; i < _lvl_entity_count; i++) {
+        e  = _lvl_entities + i * sizeof(LvlEntity);
+        ex = e.x;
+        ey = e.y;
+        if (ex == gx && ey == gy) {
+            free(e.kind);
+            if (i + 1 < _lvl_entity_count) {
+                last     = _lvl_entities + (_lvl_entity_count - 1) * sizeof(LvlEntity);
+                e.kind   = last.kind;
+                e.x      = last.x;
+                e.y      = last.y;
+            }
+            _lvl_entity_count--;
+            _lvl_dirty = 1;
+            return;
+        }
+    }
+}
+
+// Drop every entity. Called on _state_free and on _load so the new
+// level starts from a clean entity list.
+static void _entities_clear() {
+    auto i, e: LvlEntity;
+    for (i = 0; i < _lvl_entity_count; i++) {
+        e = _lvl_entities + i * sizeof(LvlEntity);
+        if (e.kind != 0) { free(e.kind); }
+    }
+    _lvl_entity_count = 0;
+}
 
 // ── Palette ──────────────────────────────────────────────
 
@@ -127,6 +249,14 @@ static void _state_init(w, h, cell) {
 
     _lvl_cvs_x = 40;
     _lvl_cvs_y = 48;
+
+    // Entity layer state — one flat buffer of LvlEntity records,
+    // grows up to _LE_MAX_ENTITIES. Mode starts in Tiles so
+    // existing muscle memory of the painter still works.
+    _le_mode           = _LE_MODE_TILES;
+    _lvl_entities      = malloc(_LE_MAX_ENTITIES * sizeof(LvlEntity));
+    _lvl_entity_count  = 0;
+    _init_kinds();
 }
 
 // Resize the editor's grid to new dimensions. Called from _load
@@ -166,6 +296,12 @@ static void _state_free() {
     if (_lvl_undo_ring != 0) { free(_lvl_undo_ring); _lvl_undo_ring = 0; }
     if (_lvl_name_ti != 0) { free(_lvl_name_ti); _lvl_name_ti = 0; }
     if (_lvl_name_buf != 0) { free(_lvl_name_buf); _lvl_name_buf = 0; }
+    if (_lvl_entities != 0) {
+        _entities_clear();
+        free(_lvl_entities);
+        _lvl_entities = 0;
+    }
+    if (_lvl_kinds != 0) { free(_lvl_kinds); _lvl_kinds = 0; }
 }
 
 // ── Undo ─────────────────────────────────────────────────
@@ -247,13 +383,19 @@ static void _flood_fill(cx, cy, idx) {
 
 // ── Save / load ──────────────────────────────────────────
 
+// Write the level as JSON schema v2 — `tiles[][]` (existing) plus
+// `entities[]` (Caminho A new). Schema v2 is the only version the
+// loader reads going forward; v1 files migrate in-place (manual
+// edit) since back-compat shims are forever-debt for a one-time
+// 5-minute migration. See `docs/journal.md` 2026-05-11 for the
+// nuance #3 rationale.
 static _save(path)@io {
-    auto sb, y, x, idx, rc;
+    auto sb, y, x, idx, rc, i, e: LvlEntity;
     sb = strbuf_new();
     sb = json_writer_begin(sb);
     sb = json_write_object_begin(sb);
     sb = json_write_string_field(sb, "type", "level");
-    sb = json_write_int_field(sb, "version", 1);
+    sb = json_write_int_field(sb, "version", 2);
     sb = json_write_int_field(sb, "width",  _lvl_w);
     sb = json_write_int_field(sb, "height", _lvl_h);
     sb = json_write_string_field(sb, "palette", "MCU-8");
@@ -267,13 +409,26 @@ static _save(path)@io {
         sb = json_write_array_end(sb);
     }
     sb = json_write_array_end(sb);
+    // Entities array — empty for files that haven't placed any
+    // objects yet, but always present so the schema stays uniform
+    // and the loader doesn't have to special-case missing fields.
+    sb = json_write_array_field_begin(sb, "entities");
+    for (i = 0; i < _lvl_entity_count; i++) {
+        e  = _lvl_entities + i * sizeof(LvlEntity);
+        sb = json_write_object_begin(sb);
+        sb = json_write_string_field(sb, "kind", e.kind);
+        sb = json_write_float_field(sb,  "x",    e.x);
+        sb = json_write_float_field(sb,  "y",    e.y);
+        sb = json_write_object_end(sb);
+    }
+    sb = json_write_array_end(sb);
     sb = json_write_object_end(sb);
     rc = file_write_all(path, sb, strbuf_len(sb));
     sb = strbuf_free(sb);
     if (rc != 0) {
-        put_err("level: '");
-        put_err(path);
-        put_err("': write failed\n");
+        putstr_err("level: '");
+        putstr_err(path);
+        putstr_err("': write failed\n");
         return -1;
     }
     return 0;
@@ -282,23 +437,49 @@ static _save(path)@io {
 static _load(path)@io {
     auto buf, size_out, doc, root, idx, w, h, tiles_idx;
     auto y, x, row, cell;
+    auto version, ents_idx, n_ents, ent_obj, kind_idx, kind_str;
+    auto x_idx, y_idx, ex: float, ey: float;
 
     size_out = malloc(8);
     *(size_out) = 0;
     buf = file_read_all(path, size_out);
     if (buf == 0) {
-        put_err("level: '");
-        put_err(path);
-        put_err("': read failed\n");
+        putstr_err("level: '");
+        putstr_err(path);
+        putstr_err("': read failed\n");
         free(size_out); return -1;
     }
     doc = json_parse(buf, *(size_out));
     free(buf); free(size_out);
     if (doc == 0) {
-        put_err("level: parse failed\n");
+        putstr_err("level: parse failed\n");
         return -1;
     }
     root = json_root(doc);
+
+    // Schema version gate. v2 is the only format the loader knows;
+    // pre-existing v1 files were migrated in-place when the entity
+    // layer landed (Caminho A nuance #3 — no back-compat shim).
+    // A v1 file showing up here means the migration was missed.
+    idx = json_object_get(doc, root, "version");
+    if (idx < 0) {
+        putstr_err("level: '");
+        putstr_err(path);
+        putstr_err("': missing version field — expected v2 schema\n");
+        json_free(doc);
+        return -1;
+    }
+    version = json_int(doc, idx);
+    if (version != 2) {
+        putstr_err("level: '");
+        putstr_err(path);
+        putstr_err("': schema v");
+        putstr_err(version);
+        putstr_err(" not supported, expected v2 (migrate by adding \"entities\":[] and bumping version)\n");
+        json_free(doc);
+        return -1;
+    }
+
     idx = json_object_get(doc, root, "width");
     if (idx < 0) { json_free(doc); return -1; }
     w = json_int(doc, idx);
@@ -309,8 +490,7 @@ static _load(path)@io {
     // A 0 or negative width means the JSON is malformed or this
     // isn't a level file at all — bail before we malloc garbage.
     if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
-        put_err("level: invalid dimensions ");
-        put_err(w); put_err("x"); put_err(h); put_err("\n");
+        putstr_err("level: invalid dimensions\n");
         json_free(doc);
         return -1;
     }
@@ -335,6 +515,36 @@ static _load(path)@io {
             layer_set(_lvl_tiles, x, y, cell);
         }
     }
+
+    // Entities array — present in every v2 file (possibly empty).
+    // Drop whatever the editor had loaded before, then re-populate
+    // from disk. Floats round-trip through json_float (added in
+    // the bpp_json float-drop fix from the fxlab arc).
+    _entities_clear();
+    ents_idx = json_object_get(doc, root, "entities");
+    if (ents_idx >= 0) {
+        n_ents = json_length(doc, ents_idx);
+        if (n_ents > _LE_MAX_ENTITIES) { n_ents = _LE_MAX_ENTITIES; }
+        for (y = 0; y < n_ents; y++) {
+            ent_obj  = json_child(doc, ents_idx, y);
+            kind_idx = json_object_get(doc, ent_obj, "kind");
+            x_idx    = json_object_get(doc, ent_obj, "x");
+            y_idx    = json_object_get(doc, ent_obj, "y");
+            if (kind_idx < 0 || x_idx < 0 || y_idx < 0) { continue; }
+            kind_str = json_string(doc, kind_idx);
+            ex       = json_float(doc, x_idx);
+            ey       = json_float(doc, y_idx);
+            // _entity_add stores cell-centered (gx + 0.5, gy + 0.5).
+            // The file already encodes the centered float, so we
+            // reverse the offset before adding so add doesn't
+            // double-apply.
+            auto gx_int: word, gy_int: word;
+            gx_int = ex - 0.5;
+            gy_int = ey - 0.5;
+            if (kind_str != 0) { _entity_add(kind_str, gx_int, gy_int); }
+        }
+    }
+
     json_free(doc);
     _lvl_dirty = 0;
     return 0;
@@ -374,6 +584,42 @@ static void _render_grid() {
     for (x = 0; x <= _lvl_w; x += 4) {
         draw_rect(_lvl_cvs_x + x * _lvl_cell, _lvl_cvs_y,
                   1, side_h + 1, color);
+    }
+}
+
+// Overlay entity markers on top of the tile grid. Each entity
+// renders as a centered colored square (3/4 of cell size) plus the
+// first letter of its kind. Visible in BOTH modes — entities are
+// always drawn so the user sees them while editing tiles too.
+static void _render_entities() {
+    auto i, e: LvlEntity, ex: word, ey: word, color, px, py;
+    auto inset, label;
+    if (_lvl_entities == 0) { return; }
+    inset = _lvl_cell / 8;
+    if (inset < 1) { inset = 1; }
+    for (i = 0; i < _lvl_entity_count; i++) {
+        e     = _lvl_entities + i * sizeof(LvlEntity);
+        ex    = e.x;
+        ey    = e.y;
+        color = _entity_color_for(e.kind);
+        px    = _lvl_cvs_x + ex * _lvl_cell + inset;
+        py    = _lvl_cvs_y + ey * _lvl_cell + inset;
+        draw_rect(px, py,
+                  _lvl_cell - inset * 2, _lvl_cell - inset * 2, color);
+        // First letter of the kind name as a glyph hint
+        // (P for player_spawn, E for enemy, D for door).
+        label = e.kind;
+        if (label != 0 && peek(label) != 0) {
+            auto ch_buf;
+            ch_buf = malloc(2);
+            poke(ch_buf,     peek(label) - 32);   // upcase ASCII
+            poke(ch_buf + 1, 0);
+            draw_text(ch_buf,
+                      px + _lvl_cell / 4,
+                      py + _lvl_cell / 4,
+                      8, BLACK);
+            free(ch_buf);
+        }
     }
 }
 
@@ -439,13 +685,13 @@ void level_editor_lib_init(initial_name, w, h, cell) {
     _le_initialized   = 1;
 }
 
-// Silently try to load a .level.json file and point the filename
+// Silently try to load a .json level file and point the filename
 // field at it. Used by embed hosts (Bang 9) to pre-populate the
 // editor with a project's asset on first tab activation so the
 // user doesn't have to hunt for the right Open path.
 //
 // full_path: cwd-relative or absolute path WITH extension
-// (e.g. "games/pathfind/assets/levels/level1.level.json").
+// (e.g. "games/pathfind/assets/levels/level1.json").
 //
 // Returns 1 on successful load, 0 if the file was missing or
 // unreadable. We probe first with file_read_all so a missing
@@ -465,23 +711,25 @@ level_editor_lib_try_load(full_path)@io {
     _undo_commit();
 
     // Filename field stores BASE (no extension) — _save re-appends
-    // ".level.json" when the user saves. Strip the 11-char suffix
-    // so a subsequent save doesn't double-extension.
+    // ".json" when the user saves. Strip the 5-char suffix so a
+    // subsequent save doesn't double-extension. Convention dropped
+    // the older .level.json double-suffix in May 2026 to match the
+    // single-extension naming sprites and effects already use.
     plen = str_len(full_path);
-    if (plen > 11) {
+    if (plen > 5) {
         stripped = 1;
-        suffix = ".level.json";
-        for (i = 0; i < 11; i++) {
-            if (peek(full_path + plen - 11 + i) != peek(suffix + i)) {
+        suffix = ".json";
+        for (i = 0; i < 5; i++) {
+            if (peek(full_path + plen - 5 + i) != peek(suffix + i)) {
                 stripped = 0;
             }
         }
         if (stripped != 0) {
-            base = malloc(plen - 11 + 1);
-            for (i = 0; i < plen - 11; i++) {
+            base = malloc(plen - 5 + 1);
+            for (i = 0; i < plen - 5; i++) {
                 poke(base + i, peek(full_path + i));
             }
-            poke(base + plen - 11, 0);
+            poke(base + plen - 5, 0);
             text_input_set(_lvl_name_ti, base);
             free(base);
             return 1;
@@ -566,23 +814,46 @@ level_editor_lib_frame(px, py, pw, ph) {
     if (key_pressed(KEY_S)) {
         path_sb = strbuf_new();
         path_sb = strbuf_cat(path_sb, _lvl_name_buf);
-        path_sb = strbuf_cat(path_sb, ".level.json");
+        path_sb = strbuf_cat(path_sb, ".json");
         if (_save(path_sb) == 0) { _lvl_dirty = 0; }
         path_sb = strbuf_free(path_sb);
     }
 
     // Top bar.
-    draw_text("Level Editor 0.1", px + 12, py + 8, 8,
+    draw_text("Level Editor 0.2", px + 12, py + 8, 8,
               rgba(97, 218, 251, 255));
-    if (gui_button(px + 180, py + 6, 72, 22, "Save")) {
+
+    // Mode toggle (Tiles | Objects). Two narrow buttons next to
+    // the title; the active mode renders accent-tinted so the user
+    // sees which layer their clicks affect. Tab key also flips.
+    if (key_pressed(KEY_TAB)) {
+        if (_le_mode == _LE_MODE_TILES) { _le_mode = _LE_MODE_OBJECTS; }
+        else                            { _le_mode = _LE_MODE_TILES; }
+    }
+    auto mode_lbl_t, mode_lbl_o;
+    if (_le_mode == _LE_MODE_TILES) {
+        mode_lbl_t = "[Tiles]";
+        mode_lbl_o = " Objects";
+    } else {
+        mode_lbl_t = " Tiles";
+        mode_lbl_o = "[Objects]";
+    }
+    if (gui_button(px + 100, py + 6, 56, 22, mode_lbl_t)) {
+        _le_mode = _LE_MODE_TILES;
+    }
+    if (gui_button(px + 158, py + 6, 64, 22, mode_lbl_o)) {
+        _le_mode = _LE_MODE_OBJECTS;
+    }
+
+    if (gui_button(px + 230, py + 6, 56, 22, "Save")) {
         path_sb = strbuf_new();
         path_sb = strbuf_cat(path_sb, _lvl_name_buf);
-        path_sb = strbuf_cat(path_sb, ".level.json");
+        path_sb = strbuf_cat(path_sb, ".json");
         _save(path_sb);
         path_sb = strbuf_free(path_sb);
         _lvl_dirty = 0;
     }
-    if (gui_button(px + 256, py + 6, 72, 22, "Open")) {
+    if (gui_button(px + 290, py + 6, 56, 22, "Open")) {
         auto picked;
         picked = window_open_dialog("Open level");
         if (picked != 0) {
@@ -590,7 +861,7 @@ level_editor_lib_frame(px, py, pw, ph) {
             free(picked);
         }
     }
-    gui_text_input(_lvl_name_ti, px + 336, py + 6, 244, 22);
+    gui_text_input(_lvl_name_ti, px + 350, py + 6, 240, 22);
     if (_lvl_dirty != 0) {
         draw_text("[unsaved]", px + 600, py + 12, 8,
                   rgba(255, 180, 80, 255));
@@ -598,54 +869,108 @@ level_editor_lib_frame(px, py, pw, ph) {
 
     // Grid (already px/py-shifted via _lvl_cvs_x/_lvl_cvs_y above).
     _render_grid();
+    // Entities always render on top so the user can see them
+    // regardless of which mode they're editing in.
+    _render_entities();
 
-    // Palette picker at panel's right edge of the canvas band.
-    clicked = gui_palette(px + 700, _lvl_cvs_y,
-                          _lvl_palette, 8, 1, 24, _lvl_sel);
-    if (clicked >= 1) { _lvl_sel = clicked; }
+    // Right side panel — palette picker in Tiles mode, kind picker
+    // in Objects mode. Same x position so the layout doesn't jump.
+    auto picker_x;
+    picker_x = px + 700;
+    clicked  = -1;
+    auto picked_kind;
+    picked_kind = -1;
+    if (_le_mode == _LE_MODE_TILES) {
+        clicked = gui_palette(picker_x, _lvl_cvs_y,
+                              _lvl_palette, 8, 1, 24, _lvl_sel);
+        if (clicked >= 1) { _lvl_sel = clicked; }
+        auto tool_name;
+        if      (_lvl_tool == 0) { tool_name = "PAINT"; }
+        else if (_lvl_tool == 1) { tool_name = "ERASE"; }
+        else                     { tool_name = "FILL"; }
+        draw_text(tool_name, picker_x, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
+    } else {
+        // Objects mode — vertical kind picker. Each kind is a
+        // labelled button; the selected one is accent-bordered.
+        auto ki, by, label, btn_h, btn_w, sel_color;
+        btn_h = 24;
+        btn_w = 80;
+        draw_text("Kinds", picker_x, _lvl_cvs_y - 14, 8, WHITE);
+        for (ki = 0; ki < _lvl_kind_count; ki++) {
+            label = *(_lvl_kinds + ki * 8);
+            by    = _lvl_cvs_y + ki * (btn_h + 4);
+            // Color swatch left of the label so the user knows
+            // which kind a marker on the canvas corresponds to.
+            sel_color = _entity_color_for(label);
+            draw_rect(picker_x, by, 12, btn_h, sel_color);
+            if (gui_button(picker_x + 16, by, btn_w - 16, btn_h, label)) {
+                _lvl_kind_sel = ki;
+                picked_kind   = ki;
+            }
+            if (ki == _lvl_kind_sel) {
+                // Accent border around selected (top + bottom strips).
+                draw_rect(picker_x, by - 1,            btn_w, 1, rgba(97, 218, 251, 255));
+                draw_rect(picker_x, by + btn_h,        btn_w, 1, rgba(97, 218, 251, 255));
+            }
+        }
+    }
 
-    auto tool_name;
-    if      (_lvl_tool == 0) { tool_name = "PAINT"; }
-    else if (_lvl_tool == 1) { tool_name = "ERASE"; }
-    else                     { tool_name = "FILL"; }
-    draw_text(tool_name, px + 700, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
-
-    // Mouse painting.
+    // Mouse interaction.
     mx = mouse_x();
     my = mouse_y();
     lmb_down = mouse_down(MOUSE_LEFT);
     rmb_down = mouse_down(MOUSE_RIGHT);
 
     // Only act when the cursor is inside the canvas band (left of
-    // the palette picker) and the palette didn't consume the
-    // click on this frame.
-    if (mx < px + 700 && clicked < 0) {
+    // the picker column) and the picker didn't consume the click.
+    if (mx < picker_x && clicked < 0 && picked_kind < 0) {
         cell = _le_cursor_cell();
         if (cell >= 0) {
             auto cx, cy, press;
-            cx = cell % _lvl_w;
-            cy = cell / _lvl_w;
+            cx    = cell % _lvl_w;
+            cy    = cell / _lvl_w;
             press = lmb_down != 0 && _le_prev_lmb_down == 0;
-            if (lmb_down != 0) {
-                if (_lvl_tool == 2) {
-                    if (press) { _flood_fill(cx, cy, _lvl_sel); }
-                } else if (_lvl_tool == 1) {
-                    _paint_cell(cx, cy, 0);
-                } else {
-                    _paint_cell(cx, cy, _lvl_sel);
+            if (_le_mode == _LE_MODE_TILES) {
+                if (lmb_down != 0) {
+                    if (_lvl_tool == 2) {
+                        if (press) { _flood_fill(cx, cy, _lvl_sel); }
+                    } else if (_lvl_tool == 1) {
+                        _paint_cell(cx, cy, 0);
+                    } else {
+                        _paint_cell(cx, cy, _lvl_sel);
+                    }
                 }
+                if (rmb_down != 0) { _paint_cell(cx, cy, 0); }
+                if (_le_prev_lmb_down != 0 && lmb_down == 0) { _undo_commit(); }
+                if (_le_prev_rmb_down != 0 && rmb_down == 0) { _undo_commit(); }
+            } else {
+                // Objects mode: LMB places selected kind on press
+                // edge (no continuous painting — entities are
+                // discrete). RMB removes whatever sits at the cell.
+                auto rmb_press;
+                rmb_press = rmb_down != 0 && _le_prev_rmb_down == 0;
+                if (press) {
+                    auto kind_str;
+                    kind_str = *(_lvl_kinds + _lvl_kind_sel * 8);
+                    _entity_add(kind_str, cx, cy);
+                }
+                if (rmb_press) { _entity_remove_at(cx, cy); }
             }
-            if (rmb_down != 0) { _paint_cell(cx, cy, 0); }
-            if (_le_prev_lmb_down != 0 && lmb_down == 0) { _undo_commit(); }
-            if (_le_prev_rmb_down != 0 && rmb_down == 0) { _undo_commit(); }
         }
     }
     _le_prev_lmb_down = lmb_down;
     _le_prev_rmb_down = rmb_down;
 
-    // Help bar pinned to the bottom of the panel rect.
-    draw_text("LMB:paint  RMB:erase  B:brush  E:eraser  F:fill  [ ]:color  Cmd+Z:undo  S:save",
-              px + 12, py + ph - 20, 8, rgba(120, 130, 150, 255));
+    // Help bar pinned to the bottom of the panel rect. Mode-aware
+    // so the bindings shown match what the LMB/RMB actually do
+    // right now.
+    auto help;
+    if (_le_mode == _LE_MODE_TILES) {
+        help = "LMB:paint RMB:erase  B:brush E:eraser F:fill  [ ]:color  TAB:Objects mode  Cmd+Z:undo  S:save";
+    } else {
+        help = "LMB:place RMB:remove  click a kind on the right to select  TAB:Tiles mode  S:save";
+    }
+    draw_text(help, px + 12, py + ph - 20, 8, rgba(120, 130, 150, 255));
 
     return quit;
 }

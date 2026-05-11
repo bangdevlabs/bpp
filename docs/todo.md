@@ -31,6 +31,14 @@ since `c8c09e8`).
   root). `stb/` is engine-internal only (`.bsm` + `.metal`). `effects/`
   is the user namespace, mirrored across engine source / install /
   user project.
+- 2026-05-11 — Wolf3D Phase 2 Session 0 (Caminho A): level_editor
+  ganha entity layer (Tiles ↔ Objects toggle, kind picker, marker
+  overlay), JSON schema v2 (`tiles[][]` + `entities[]`), pathfind
+  level migrado in-place, fps_wolf3d carrega level via JSON loader
+  (replaces hardcoded ASCII maze), `bang9_space_manual.md` canoniza
+  Bang 9 como engine/IDE da bangdev. Drop `.level.json` double-suffix
+  (now `.json` matching sprites/effects). bang9 artifacts cleaned
+  (`level1.level.json` deleted, `modulab_prefs.json` `.gitignore`d).
 
 **In flight:** content arc decision point — Wolf3D Phase 2 / Adventure /
 RPG / RTS. Engine no longer the bottleneck.
@@ -224,6 +232,22 @@ V2+ candidates if signal emerges from Wolf3D tuning:
   doesn't shell out — graduate from `bang9/dir.bsm`).
 - Live `.metal` editor (Modelo 4 from original design).
 - Effect-chain ordering UI (drag-reorder which effect runs first).
+
+### Modulab prefs path migration to user config dir
+
+`tools/modulab/prefs.bsm` writes to `<exe_dir>/modulab_prefs.json`.
+Same CWD/install path bug class fxlab arc fixed in May 2026 — prefs
+end up next to the binary instead of in user space. When Bang 9
+ships installed, this pollutes `/usr/local/bin/`.
+
+Migration: write to `~/.config/bpp/modulab_prefs.json` (XDG on
+Linux, `~/Library/Application Support/bpp/` on macOS). ~30 LOC in
+prefs.bsm: add `_user_config_path()` helper, swap `<exe_dir>` for
+it. The file is currently `.gitignore`d so accidental commits don't
+re-leak the bug.
+
+Defer until: someone hits the bug shipping Bang 9 to a non-dev
+machine.
 
 ### x86_64 perf parity on Linux — B1 freelist + B2 inline
 

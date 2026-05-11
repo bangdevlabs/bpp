@@ -261,3 +261,107 @@ Commit cadence: **one commit per session**, message format
   W027 + diagnostic candidates.
 
 Boa caçada na Phase 2.
+
+---
+
+## Update 2026-05-11 — Session 0 supersedes to Caminho A (level_editor entity layer)
+
+After the fxlab arc closed (commits `5a9f05d` → `f5fbaeb` + polish
+batch `350604f`), Bang 9 was canonized as the engine/IDE of the
+B++ ecosystem — see new `docs/bang9_space_manual.md` for the full
+architectural premise. Wolf3D Phase 2 maps now go through that
+flow, not through standalone ASCII text editing.
+
+**Session 0 shifts** from "ASCII glyph map (`#@%!edk`) + stbtile
+grammar parser" → **"level_editor extended with entity layer
+(Caminho A) + JSON schema v2 + fps_wolf3d loader walks entities[]"**.
+
+Reasoning: the two-consumer rule already fired. The user + agents
+are already editing Wolf3D maps inside Bang 9 (same flow used for
+sprites via modulab, effects via fxlab). Caminho B (Wolf3D-style
+glyph-range single-grid) would force a refactor in Phase 3 when
+"wall + entity in same cell" becomes a hard requirement. Caminho
+A is the canonical Tiled / LDtk pattern and reusable across every
+future game (RPG, RTS, Adventure all need entity layers).
+
+### Updated Session 0 scope
+
+Files touched:
+
+| File | What |
+|---|---|
+| `stb/stbtile.bsm` | NO state field yet — D3 moves to Session 5 (Doors) where it's actually consumed |
+| `tools/level_editor/level_editor_lib.bsm` | Second layer `_lvl_entities`. UI toggle `Tiles ↔ Objects`. Object palette panel. JSON v2 read+write. |
+| `assets/levels/level1.level.json` (Wolf3D) | New file with player_spawn + 1 enemy + 1 door for Phase 2 demo scope |
+| `games/pathfind/assets/levels/level1.level.json` | **Migrate in-place to v2** (add `"entities": []`). No backward compat code anywhere. |
+| `bang9/level1.level.json` | Same in-place migration if present |
+| `games/fps/fps_wolf3d.bpp` | Walk `entities[]` at init, populate internal `EntityList` (renderer is Session 1's problem) |
+| `tests/test_level_editor_v2.bpp` | Lock schema v2 contract (write + read round-trip with entities + tiles) |
+
+### Realistic LOC estimate (corrects the original ~80 LOC line)
+
+- stbtile state field: 0 (deferred to Session 5)
+- level_editor entity layer state: ~30
+- UI toggle Tiles/Objects: ~30
+- Object palette UI: ~50
+- JSON schema v2 read+write: ~50
+- v1 → v2 migration of existing 2-3 files: 0 LOC (manual edit, ~5 min)
+- fps_wolf3d entity loader: ~30
+- Tests: ~50
+- **Total: ~240 LOC**, not 80. Plan accordingly.
+
+### Four nuances locked
+
+**(1) State field deferred.** D3 (`stbtile.state` word per cell)
+is a runtime concern (door animation, lift Y-offset). It stays on
+Session 5 (Doors) where the renderer first reads it. Session 0
+keeps stbtile untouched.
+
+**(2) Object palette uses `kind` as string, not enum.** Entity
+records are `{kind: "player_spawn", x, y, props: {...}}`. Phase 2
+demo ships 3 kinds (`player_spawn`, `enemy`, `door`); Phase 3+
+adds variants (`enemy_guard`, `enemy_dog`, etc) without schema
+refactor. UI v1 shows only kind + position; advanced props edited
+via JSON until the editor earns rich UI per kind.
+
+**(3) JSON schema v2 — no backward compat.** Migrate the 2-3
+existing v1 level files in-place (add `"entities": []` field).
+Loader only knows v2 going forward. Rationale: backward compat
+shim is forever-debt for a 5-minute migration; mental tax of "is
+this v1 or v2?" compounds across every asset type the engine will
+support. Tonify spirit — don't build a shim graveyard.
+
+**(4) Bang 9 panel side already wired.** `_panel_levels` in
+`bang9/panels.bsm` already calls
+`level_editor_lib_init(g_proj_root)`. Session 0 just extends what
+the lib does; no Bang 9 surgery needed. (Same pattern fxlab arc
+established — embed contract is canonical.)
+
+### What stays unchanged from the original handoff
+
+- **D1 (`stbentity` cartridge)** — still right. Lands in Session
+  2 when enemies become real entities at runtime. Session 0 just
+  produces the entity list shape that Session 2 will consume.
+- **D2 (hand-rolled FSM for Phase 2)** — still right.
+- **D3 (per-cell state word)** — still right, but moved from
+  Session 0 to Session 5 (Doors). State field is meaningless
+  without a consumer; Session 5 is the consumer.
+- **Sidequest queue (Tier 2/3 profile, etc.)** — unchanged.
+- **Commit cadence "one commit per session"** — unchanged.
+
+### Reference for the next agent
+
+- `docs/bang9_space_manual.md` — engine/IDE convergence model,
+  embed contract, project layout convention, hot-reload backbone.
+  Read first. Establishes WHY Caminho A is the move.
+- `docs/journal.md` 2026-05-10 entry — fxlab polish milestone +
+  Tonify lessons graduated (`@base` only for PURE, dual-watch
+  pattern, project-sacred-install-seed).
+- `tools/level_editor/level_editor_lib.bsm` — current state
+  (single-layer tiles), pattern to extend from.
+- `tools/fxlab/fxlab_lib.bsm` — embed contract reference (proj_root
+  parameter, host owns UI boot, lib reads/writes
+  `<proj_root>/effects/`).
+
+Same boa caçada — agora com map editor visual no Bang 9.
+

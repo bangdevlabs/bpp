@@ -1,5 +1,141 @@
 # B++ Bootstrap Journal
 
+## 2026-05-11 — Wolf3D Phase 2 Session 0: level_editor entity layer + Bang 9 canonized as engine/IDE
+
+**Two-consumer rule fired**: editing Wolf3D maps inside Bang 9 is
+the second consumer for the level editor (after pathfind), and it
+asked for an entity layer. Caminho A (Tiled-style multi-layer)
+shipped — level_editor now paints both tiles and objects, JSON
+schema v2 stores both, fps_wolf3d loads from disk instead of
+shipping a hardcoded ASCII maze.
+
+The session also produced `docs/bang9_space_manual.md` — the
+canonical articulation of Bang 9 as the engine/IDE of the B++
+ecosystem. Not just an IDE on top of bpp, but the place where
+every game tool lands once it earns its tab. Pathfind sprites went
+through modulab there; pathfind levels through level_editor there;
+fxlab effects there; Wolf3D maps now there. The pattern is the
+product.
+
+### What landed in this batch
+
+- **`docs/bang9_space_manual.md`** (~280 LOC) — premise, what ships
+  today, hot-reload backbone, project layout convention, embed
+  contract, recipe to add a new tab, "tools as their own consumers"
+  forcing function. Anchors every future tool integration.
+
+- **`tools/level_editor/level_editor_lib.bsm`** — entity layer state
+  + 3 helpers (`_entity_add` / `_entity_remove_at` / `_entities_clear`),
+  kinds palette (`player_spawn` / `enemy` / `door`), Tiles ↔ Objects
+  mode toggle (Tab key + topbar buttons), object kind picker on
+  the right edge in Objects mode, entity marker overlay always
+  visible, JSON schema v2 read+write (no v1 backward compat).
+  ~280 LOC additions.
+
+- **`src/bpp_json.bsm`** — new public `json_write_float_field`
+  (~25 LOC). Mirrors fxlab's `_strbuf_float` precision (4 decimal
+  digits). Used by level_editor entity write; available to any
+  future asset writer that needs floats.
+
+- **`games/fps/fps_wolf3d.bpp`** — `_load_level("assets/levels/level1.json")`
+  replaces the old `_init_map()` hardcoded ASCII maze. Reads
+  tiles[][] into the world map and entities[] into a `WolfEntity[]`
+  buffer. `player_spawn` entity applies directly to the player
+  FPSBody on load; other entities (enemy, door) stash for Session 1
+  (sprite renderer). Quit phase frees the buffer.
+
+- **`games/fps/assets/levels/level1.json`** (new) — Wolf3D Phase 2
+  demo map with player_spawn at (2.5, 8.5), one enemy at (12.5, 4.5),
+  one door at (6.5, 2.5). 16×16 grid, schema v2 native.
+
+- **`games/pathfind/assets/levels/level1.json`** (renamed from
+  `.level.json`) — migrated in-place to v2 (added `"entities": []`).
+  Same content otherwise. pathfind.bpp's 5 references updated.
+
+- **`tests/test_level_v2.bpp`** — round-trip test. Writes a v2
+  JSON via the new `json_write_float_field`, reads it back via
+  `json_parse` + `json_float`, verifies tile counts + entity
+  count + entity field values survive with float precision intact.
+
+### Naming cleanup (`.level.json` → `.json`)
+
+`.level.json` double-suffix retired. Convention now matches
+sprites (`cat_sprite.json`) and effects (`crt.json`): single
+`.json` extension, folder context disambiguates type. Touched 7
+files of code + 2 level JSONs + 1 test. The May 2026 cleanup
+saves dozens of awkward double-extensions across every future
+asset type Bang 9 supports.
+
+### Bang 9 artifact cleanup
+
+- `bang9/level1.level.json` deleted. Zero refs in code — was a
+  stale artifact from when bang9 tested CWD-relative resolution.
+- `bang9/modulab_prefs.json` removed from git, added to
+  `.gitignore`. modulab writes per-user prefs there every
+  open/close — pure user state that should never have been
+  tracked. Sidequest in `docs/todo.md`: migrate the write target
+  to `~/.config/bpp/modulab_prefs.json` (XDG) — same
+  CWD/install path bug class fxlab arc fixed.
+
+### Architectural decisions locked
+
+- **Caminho A over Caminho B** (Wolf3D-original glyph ranges) and
+  **C** (ASCII text maps): two-consumer rule already fired.
+  Reusable across every future game (RPG, RTS, Adventure all need
+  entity layers). Caminho B's "wall + entity in same cell" is a
+  hard limit that Phase 3+ would force a rewrite around.
+
+- **`kind` as string, not enum**: entities are `{kind: "enemy", x,
+  y}`. Phase 3 can introduce `enemy_guard` / `enemy_dog` without
+  schema churn. UI v1 shows kind + position; advanced props go via
+  JSON until the editor earns rich UI per kind.
+
+- **JSON schema v2 — no backward compat**: 2 existing v1 level
+  files migrated in-place (~5 min manual edit). Loader only knows
+  v2. Per Tonify spirit — backward compat shims are forever-debt
+  for a one-time migration.
+
+- **stbtile.state field deferred to Session 5 (Doors)**. State is
+  a runtime concern (door animation phase, lift Y-offset). Without
+  a consumer, the field is dead weight. Session 5 is the consumer
+  — it'll add the field then.
+
+### What's unblocked for next sessions
+
+- **Session 1 (sprites + depth buffer)**: `wolf_entities[]` buffer
+  is populated and queryable. Renderer just walks it and emits
+  billboard sprites against the depth-tested wall projection.
+- **Session 2 (enemies AI)**: same buffer + spawn the
+  `stbentity` cartridge that D1 from the Phase 1 close handoff
+  proposed. AI FSM walks the entity list filtered by `kind ==
+  "enemy"`.
+- **Session 5 (doors)**: `door` kind already in the manifest +
+  position. Adds `stbtile.state` then to track open/closed/animating.
+
+### Files (concrete)
+
+| File | Change |
+|---|---|
+| `docs/bang9_space_manual.md` | NEW (~280 LOC) — engine/IDE manual |
+| `src/bpp_json.bsm` | + `json_write_float_field` public writer |
+| `tools/level_editor/level_editor_lib.bsm` | + entity layer + kinds + UI toggle + JSON v2 r/w |
+| `games/fps/fps_wolf3d.bpp` | + `_load_level` replaces `_init_map`; entity buffer; quit cleanup |
+| `games/fps/assets/levels/level1.json` | NEW — Wolf3D Phase 2 demo map |
+| `games/pathfind/assets/levels/level1.json` | RENAMED + v2 migration |
+| `games/pathfind/pathfind.bpp` | 5 path string updates |
+| `tools/modulab/modulab_lib.bsm` | testbed.level.json → testbed.json + comment |
+| `tools/level_editor/level_editor.bpp` | comments + .json suffix |
+| `tools/level_editor/level_editor_lib.bsm` | save/try_load suffix change |
+| `bang9/panels.bsm` | `_panel_levels` auto-discover suffix |
+| `stb/stbforge.bsm` | comment ref |
+| `tests/test_level_v2.bpp` | NEW — schema v2 round-trip lock |
+| `tests/test_modulab_testbed_level.bpp` | filename .json suffix |
+| `bang9/level1.level.json` | DELETED (dead artifact) |
+| `bang9/modulab_prefs.json` | git rm --cached + .gitignore |
+| `docs/todo.md` | Session 0 closure + modulab prefs sidequest |
+
+---
+
 ## 2026-05-10 — fxlab arc HOT-RELOAD WORKING end-to-end (Wolf3D Phase 2 unblocked)
 
 **Visually validated.** Drag a slider in Bang 9's Effects tab,

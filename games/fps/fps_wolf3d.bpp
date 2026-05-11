@@ -32,6 +32,8 @@ import "stbimage.bsm";     // Sessão A2 — HUD overlay sprite atlas
 import "stbprofile.bsm";   // profile_gpu_enable + profile_hud_draw
 import "stbfx.bsm";        // Sessão A4 — CRT post-process (Phase 6.4)
 import "stbtexture.bsm";   // Phase 7 — procedural wall textures
+import "bpp_json.bsm";     // Phase 2 Session 0 — level JSON v2 loader
+import "bpp_file.bsm";     // file_read_all for the level manifest
 
 // ── Compile-time constants ─────────────────────────────────
 
@@ -126,6 +128,24 @@ extrn TEX_STONE;
 extrn TEX_WOOD;
 extrn TEX_SOLID;
 const TEX_SIZE = 64;
+
+// Phase 2 Session 0 — entity list pulled from level JSON v2's
+// `entities[]`. Renderer for these lands in Session 1 (sprites +
+// depth buffer); right now the loader just stashes them so the
+// data flow is end-to-end and the next session can pick up.
+//
+// Each record is {kind ptr, x: float, y: float}. `kind` is
+// str_dup'd from the JSON string node so the entity outlives the
+// parsed JsonDoc. Capacity is small for Phase 2 Minimum (1 enemy +
+// 1 door + 1 player_spawn = 3); future levels can grow it.
+const WOLF_MAX_ENTITIES = 32;
+struct WolfEntity {
+    kind,
+    x: float,
+    y: float
+}
+extrn wolf_entities;
+extrn wolf_entity_count;
 const HUD_TILE = 16;
 const HUD_TEX_W = 32;     // 2 tiles × 16 px
 const HUD_TEX_H = 16;
@@ -273,7 +293,17 @@ static fps_init_phase() {
     init_profile();
 
     world_map = tile_new(MAP_W, MAP_H, 1, 1);
-    _init_map();
+
+    // Allocate the entity buffer BEFORE _load_level walks
+    // entities[], since the loader pokes records into it.
+    wolf_entities     = malloc(WOLF_MAX_ENTITIES * sizeof(WolfEntity));
+    wolf_entity_count = 0;
+
+    if (_load_level("assets/levels/level1.json") != 0) {
+        putstr_err("fps_wolf3d: level load failed — exiting\n");
+        maestro_quit();
+        return 0;
+    }
 
     cam_buf = malloc(CAM_BUF_SZ);
     map_buf = malloc(MAP_BUF_SZ);
@@ -432,6 +462,18 @@ static fps_quit_phase() @io {
     fx_free(scan_fx);
     fx_free(chrom_fx);
     fx_free(dither_fx);
+
+    // Free entity buffer + the str_dup'd kind strings inside.
+    if (wolf_entities != 0) {
+        auto i, we: WolfEntity;
+        for (i = 0; i < wolf_entity_count; i++) {
+            we = wolf_entities + i * sizeof(WolfEntity);
+            if (we.kind != 0) { free(we.kind); }
+        }
+        free(wolf_entities);
+        wolf_entities     = 0;
+        wolf_entity_count = 0;
+    }
     return 0;
 }
 
@@ -448,46 +490,116 @@ main() {
 
 // ── Internal helpers ───────────────────────────────────────
 
-// Populates `world_map` with the same test maze fps_3d.bpp uses, so
-// switching between binaries is a one-flag visual swap and not a
-// new layout to learn. Keeping the layout copy here (rather than
-// importing from a shared .bsm) avoids a tight cross-file coupling
-// while the GPU path is still pre-Phase-3 — when both programs
-// graduate to a real ASCII-file loader (Phase 2 Session 4 of the
-// Wolf3D content track) the duplication folds away.
-static void _init_map() {
-    auto rows, x, y, ch;
-    rows = buf_word(MAP_H);
-    rows[0]  = "################";
-    rows[1]  = "#..............#";
-    rows[2]  = "#..@@@@@.......#";
-    rows[3]  = "#..@...@.......#";
-    rows[4]  = "#..@...@.......#";
-    rows[5]  = "#..@@@@@.......#";
-    rows[6]  = "#..............#";
-    rows[7]  = "#......!!......#";
-    rows[8]  = "#......!!......#";
-    rows[9]  = "#..............#";
-    rows[10] = "#.......%%%%%%.#";
-    rows[11] = "#..............#";
-    rows[12] = "#....##.....##.#";
-    rows[13] = "#....##........#";
-    rows[14] = "#..............#";
-    rows[15] = "################";
+// Load the level from `assets/levels/level1.json` (schema v2 —
+// `tiles[][]` for the wall grid, `entities[]` for player_spawn /
+// enemies / doors). Replaces the old hardcoded ASCII maze that
+// shipped with Phase 1; the editor can now author maps visually
+// via Bang 9's Levels tab.
+//
+// Returns 0 on success, -1 if anything goes wrong (read fail,
+// parse fail, missing required field). The caller is expected to
+// surface the error and quit — there is no fallback maze, by
+// design (don't ship dead code per Tonify spirit).
+static _load_level(path)@io {
+    auto buf, size_out, doc, root;
+    auto idx, version, w, h, tiles_idx, ents_idx;
+    auto x, y, row, cell;
+    auto n_ents, ent_obj, kind_idx, x_idx, y_idx;
+    auto kind_str, ex: float, ey: float;
+    auto we: WolfEntity, e_count;
 
+    size_out = malloc(8);
+    *(size_out) = 0;
+    buf = file_read_all(path, size_out);
+    if (buf == 0) {
+        putstr_err("fps_wolf3d: cannot read '");
+        putstr_err(path);
+        putstr_err("'\n");
+        free(size_out);
+        return -1;
+    }
+    doc = json_parse(buf, *(size_out));
+    free(buf);
+    free(size_out);
+    if (doc == 0) {
+        putstr_err("fps_wolf3d: parse failed\n");
+        return -1;
+    }
+
+    root    = json_root(doc);
+    idx     = json_object_get(doc, root, "version");
+    version = idx >= 0 ? json_int(doc, idx) : 0;
+    if (version != 2) {
+        putstr_err("fps_wolf3d: unsupported schema version (need v2)\n");
+        json_free(doc);
+        return -1;
+    }
+
+    idx = json_object_get(doc, root, "width");
+    w   = json_int(doc, idx);
+    idx = json_object_get(doc, root, "height");
+    h   = json_int(doc, idx);
+    if (w != MAP_W || h != MAP_H) {
+        // Phase 2 Minimum locks the map shape to MAP_W × MAP_H so
+        // the GPU uniform buffer layout stays static. Variable
+        // shapes graduate when Phase 3 needs multi-level support.
+        putstr_err("fps_wolf3d: map dimensions must be 16x16\n");
+        json_free(doc);
+        return -1;
+    }
+
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (tiles_idx < 0) { json_free(doc); return -1; }
     for (y = 0; y < MAP_H; y++) {
+        row = json_child(doc, tiles_idx, y);
         for (x = 0; x < MAP_W; x++) {
-            ch = peek(rows[y] + x);
-            switch (ch) {
-                '#' { tile_set(world_map, x, y, 1); }
-                '@' { tile_set(world_map, x, y, 2); }
-                '%' { tile_set(world_map, x, y, 3); }
-                '!' { tile_set(world_map, x, y, 4); }
-                else { }
-            }
+            cell = json_int(doc, json_child(doc, row, x));
+            if (cell < 0) { cell = 0; }
+            tile_set(world_map, x, y, cell);
         }
     }
-    free(rows);
+
+    // Walk entities[]. Player spawn applies directly to the
+    // FPSBody; everything else stashes into wolf_entities for
+    // Session 1's renderer to pick up.
+    e_count  = 0;
+    ents_idx = json_object_get(doc, root, "entities");
+    if (ents_idx >= 0) {
+        n_ents = json_length(doc, ents_idx);
+        if (n_ents > WOLF_MAX_ENTITIES) { n_ents = WOLF_MAX_ENTITIES; }
+        for (y = 0; y < n_ents; y++) {
+            ent_obj  = json_child(doc, ents_idx, y);
+            kind_idx = json_object_get(doc, ent_obj, "kind");
+            x_idx    = json_object_get(doc, ent_obj, "x");
+            y_idx    = json_object_get(doc, ent_obj, "y");
+            if (kind_idx < 0 || x_idx < 0 || y_idx < 0) { continue; }
+            kind_str = json_string(doc, kind_idx);
+            ex       = json_float(doc, x_idx);
+            ey       = json_float(doc, y_idx);
+            if (kind_str == 0) { continue; }
+
+            if (str_eq(kind_str, "player_spawn") != 0) {
+                // Apply spawn to the existing player FPSBody. Angle
+                // 0 = facing east, matching Phase 1 spawn convention;
+                // a future "facing" prop on the entity can override.
+                auto p: FPSBody;
+                p   = player;
+                p.x = ex;
+                p.y = ey;
+                continue;
+            }
+
+            // Other kinds — enemy, door, etc — just stash for now.
+            we      = wolf_entities + e_count * sizeof(WolfEntity);
+            we.kind = str_dup(kind_str);
+            we.x    = ex;
+            we.y    = ey;
+            e_count++;
+        }
+    }
+    wolf_entity_count = e_count;
+
+    json_free(doc);
 
     // Mark every wall-type id solid so player movement (fps_walk)
     // collides correctly. Map data already lives in `world_map`
@@ -498,4 +610,5 @@ static void _init_map() {
     tile_solid(world_map, 2);
     tile_solid(world_map, 3);
     tile_solid(world_map, 4);
+    return 0;
 }

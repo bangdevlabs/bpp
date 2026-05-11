@@ -1,0 +1,157 @@
+// test_level_v2.bpp — round-trip the level schema v2 (Caminho A).
+//
+// Locks the contract by:
+//   1. Writing a level JSON via the json_write_* helpers + the new
+//      json_write_float_field that powers entity x/y emission.
+//   2. Reading it back through json_parse + json_float (the same
+//      readers level_editor and fps_wolf3d use).
+//   3. Asserting tile counts, entity count, and entity field values
+//      survive the trip with the expected precision.
+//
+// If this test fails, the entity layer wire is broken — fxlab
+// edits will silently round-trip wrong values and games loading
+// the JSON will misplace spawns / enemies / doors.
+
+import "bpp_array.bsm";
+import "bpp_buf.bsm";
+import "bpp_file.bsm";
+import "bpp_json.bsm";
+import "bpp_str.bsm";
+
+static check_int(label, got, want) {
+    if (got != want) {
+        putstr_err("FAIL: ");
+        putstr_err(label);
+        putstr_err(": got ");
+        putnum_err(got);
+        putstr_err(" want ");
+        putnum_err(want);
+        putchar_err(10);
+        return 0;
+    }
+    return 1;
+}
+
+static check_close(label, got: float, want: float) {
+    auto diff: float;
+    diff = got - want;
+    if (diff < 0.0) { diff = 0.0 - diff; }
+    if (diff > 0.001) {
+        putstr_err("FAIL: ");
+        putstr_err(label);
+        putstr_err(": float drift\n");
+        return 0;
+    }
+    return 1;
+}
+
+main() {
+    auto sb, rc, buf, size_box, doc, root;
+    auto idx, version, w, h, ents_idx, n, ent;
+    auto kind_idx, x_idx, y_idx;
+    auto kind, ex: float, ey: float;
+    auto ok;
+
+    init_str();
+
+    // ── Build a v2 level JSON in memory ──────────────────────
+    sb = strbuf_new();
+    sb = json_writer_begin(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "type", "level");
+    sb = json_write_int_field(sb,    "version", 2);
+    sb = json_write_int_field(sb,    "width", 4);
+    sb = json_write_int_field(sb,    "height", 2);
+    sb = json_write_array_field_begin(sb, "tiles");
+    auto y, x;
+    for (y = 0; y < 2; y++) {
+        sb = json_write_array_begin(sb);
+        for (x = 0; x < 4; x++) { sb = json_write_int(sb, y * 4 + x); }
+        sb = json_write_array_end(sb);
+    }
+    sb = json_write_array_end(sb);
+    sb = json_write_array_field_begin(sb, "entities");
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "kind", "player_spawn");
+    sb = json_write_float_field(sb,  "x", 1.5);
+    sb = json_write_float_field(sb,  "y", 0.5);
+    sb = json_write_object_end(sb);
+    sb = json_write_object_begin(sb);
+    sb = json_write_string_field(sb, "kind", "enemy");
+    sb = json_write_float_field(sb,  "x", 3.5);
+    sb = json_write_float_field(sb,  "y", 1.5);
+    sb = json_write_object_end(sb);
+    sb = json_write_array_end(sb);
+    sb = json_write_object_end(sb);
+
+    rc = file_write_all("/tmp/test_level_v2.json", sb, strbuf_len(sb));
+    if (rc != 0) {
+        putstr_err("FAIL: write\n");
+        return 1;
+    }
+    sb = strbuf_free(sb);
+
+    // ── Read it back ─────────────────────────────────────────
+    size_box = malloc(8);
+    *(size_box) = 0;
+    buf = file_read_all("/tmp/test_level_v2.json", size_box);
+    if (buf == 0) { putstr_err("FAIL: read\n"); return 1; }
+    doc = json_parse(buf, *(size_box));
+    free(buf);
+    free(size_box);
+    if (doc == 0) { putstr_err("FAIL: parse\n"); return 1; }
+
+    root = json_root(doc);
+    ok = 1;
+
+    idx     = json_object_get(doc, root, "version");
+    version = json_int(doc, idx);
+    if (check_int("version", version, 2)              == 0) { ok = 0; }
+
+    idx = json_object_get(doc, root, "width");
+    w   = json_int(doc, idx);
+    idx = json_object_get(doc, root, "height");
+    h   = json_int(doc, idx);
+    if (check_int("width",  w, 4) == 0) { ok = 0; }
+    if (check_int("height", h, 2) == 0) { ok = 0; }
+
+    ents_idx = json_object_get(doc, root, "entities");
+    n        = json_length(doc, ents_idx);
+    if (check_int("entity count", n, 2) == 0) { ok = 0; }
+
+    // Entity 0 — player_spawn at (1.5, 0.5).
+    ent      = json_child(doc, ents_idx, 0);
+    kind_idx = json_object_get(doc, ent, "kind");
+    x_idx    = json_object_get(doc, ent, "x");
+    y_idx    = json_object_get(doc, ent, "y");
+    kind     = json_string(doc, kind_idx);
+    ex       = json_float(doc, x_idx);
+    ey       = json_float(doc, y_idx);
+    if (str_eq(kind, "player_spawn") == 0) {
+        putstr_err("FAIL: ent0.kind\n"); ok = 0;
+    }
+    if (check_close("ent0.x", ex, 1.5) == 0) { ok = 0; }
+    if (check_close("ent0.y", ey, 0.5) == 0) { ok = 0; }
+
+    // Entity 1 — enemy at (3.5, 1.5).
+    ent      = json_child(doc, ents_idx, 1);
+    kind_idx = json_object_get(doc, ent, "kind");
+    x_idx    = json_object_get(doc, ent, "x");
+    y_idx    = json_object_get(doc, ent, "y");
+    kind     = json_string(doc, kind_idx);
+    ex       = json_float(doc, x_idx);
+    ey       = json_float(doc, y_idx);
+    if (str_eq(kind, "enemy") == 0) {
+        putstr_err("FAIL: ent1.kind\n"); ok = 0;
+    }
+    if (check_close("ent1.x", ex, 3.5) == 0) { ok = 0; }
+    if (check_close("ent1.y", ey, 1.5) == 0) { ok = 0; }
+
+    json_free(doc);
+
+    if (ok != 0) {
+        putmsg("test_level_v2: PASS");
+        return 0;
+    }
+    return 1;
+}
