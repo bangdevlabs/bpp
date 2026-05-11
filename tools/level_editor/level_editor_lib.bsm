@@ -73,8 +73,16 @@ static extrn _lvl_undo_len;
 static extrn _lvl_undo_cursor;
 
 // Filename — TextInput widget from stbui + backing buffer.
+//
+// `_lvl_name_buf` holds only the BASE name shown in the topbar
+// field (e.g. "level1"). The directory portion of the file on
+// disk lives separately in `_lvl_dir_buf` so the topbar input
+// stays compact even after opening a deeply-nested absolute path
+// via NSOpenPanel — Save reassembles `dir + base + ".json"`. An
+// empty `_lvl_dir_buf` (default) means "save to CWD".
 static extrn _lvl_name_ti;
 static extrn _lvl_name_buf;
+static extrn _lvl_dir_buf;
 
 // Canvas origin (for future zoom/pan; kept simple for MVP).
 static extrn _lvl_cvs_x, _lvl_cvs_y;
@@ -247,6 +255,12 @@ static void _state_init(w, h, cell) {
     text_input_new(_lvl_name_ti, _lvl_name_buf, 256);
     text_input_set(_lvl_name_ti, "level1");
 
+    // Directory portion (separate from displayed base name). Empty
+    // string = save to CWD; otherwise must end in '/' so the Save
+    // handler can simply concatenate `dir + base + ".json"`.
+    _lvl_dir_buf = malloc(513);
+    poke(_lvl_dir_buf, 0);
+
     _lvl_cvs_x = 40;
     _lvl_cvs_y = 48;
 
@@ -296,6 +310,7 @@ static void _state_free() {
     if (_lvl_undo_ring != 0) { free(_lvl_undo_ring); _lvl_undo_ring = 0; }
     if (_lvl_name_ti != 0) { free(_lvl_name_ti); _lvl_name_ti = 0; }
     if (_lvl_name_buf != 0) { free(_lvl_name_buf); _lvl_name_buf = 0; }
+    if (_lvl_dir_buf != 0) { free(_lvl_dir_buf); _lvl_dir_buf = 0; }
     if (_lvl_entities != 0) {
         _entities_clear();
         free(_lvl_entities);
@@ -697,7 +712,8 @@ void level_editor_lib_init(initial_name, w, h, cell) {
 // unreadable. We probe first with file_read_all so a missing
 // project asset stays silent — no stderr spam on fresh projects.
 level_editor_lib_try_load(full_path)@io {
-    auto size_out, buf, i, plen, stripped, base, suffix;
+    auto size_out, buf, i, plen, has_json, base, suffix;
+    auto last_slash, dir_end, base_start, base_end, base_len;
     if (full_path == 0) { return 0; }
 
     size_out = malloc(8);
@@ -710,32 +726,54 @@ level_editor_lib_try_load(full_path)@io {
     if (_load(full_path) != 0) { return 0; }
     _undo_commit();
 
-    // Filename field stores BASE (no extension) — _save re-appends
-    // ".json" when the user saves. Strip the 5-char suffix so a
-    // subsequent save doesn't double-extension. Convention dropped
-    // the older .level.json double-suffix in May 2026 to match the
-    // single-extension naming sprites and effects already use.
+    // Split the absolute path into directory + base name. The
+    // topbar input shows ONLY the base — keeps the field compact
+    // even after opening a deeply-nested NSOpenPanel result. Save
+    // reassembles `_lvl_dir_buf + name + ".json"`.
+    //
+    // Convention dropped the older .level.json double-suffix in
+    // May 2026 to match the single-extension naming sprites and
+    // effects already use, so we strip a trailing ".json" only.
     plen = str_len(full_path);
-    if (plen > 5) {
-        stripped = 1;
+
+    last_slash = -1;
+    for (i = 0; i < plen; i++) {
+        if (peek(full_path + i) == '/') { last_slash = i; }
+    }
+
+    if (last_slash >= 0) {
+        // Copy "dir/" (including trailing slash) into _lvl_dir_buf.
+        dir_end = last_slash + 1;
+        for (i = 0; i < dir_end; i++) {
+            poke(_lvl_dir_buf + i, peek(full_path + i));
+        }
+        poke(_lvl_dir_buf + dir_end, 0);
+        base_start = dir_end;
+    } else {
+        poke(_lvl_dir_buf, 0);
+        base_start = 0;
+    }
+
+    base_end = plen;
+    if (plen - base_start > 5) {
+        has_json = 1;
         suffix = ".json";
         for (i = 0; i < 5; i++) {
             if (peek(full_path + plen - 5 + i) != peek(suffix + i)) {
-                stripped = 0;
+                has_json = 0;
             }
         }
-        if (stripped != 0) {
-            base = malloc(plen - 5 + 1);
-            for (i = 0; i < plen - 5; i++) {
-                poke(base + i, peek(full_path + i));
-            }
-            poke(base + plen - 5, 0);
-            text_input_set(_lvl_name_ti, base);
-            free(base);
-            return 1;
-        }
+        if (has_json != 0) { base_end = plen - 5; }
     }
-    text_input_set(_lvl_name_ti, full_path);
+
+    base_len = base_end - base_start;
+    base = malloc(base_len + 1);
+    for (i = 0; i < base_len; i++) {
+        poke(base + i, peek(full_path + base_start + i));
+    }
+    poke(base + base_len, 0);
+    text_input_set(_lvl_name_ti, base);
+    free(base);
     return 1;
 }
 
@@ -813,6 +851,7 @@ level_editor_lib_frame(px, py, pw, ph) {
     }
     if (key_pressed(KEY_S)) {
         path_sb = strbuf_new();
+        path_sb = strbuf_cat(path_sb, _lvl_dir_buf);
         path_sb = strbuf_cat(path_sb, _lvl_name_buf);
         path_sb = strbuf_cat(path_sb, ".json");
         if (_save(path_sb) == 0) { _lvl_dirty = 0; }
@@ -832,55 +871,74 @@ level_editor_lib_frame(px, py, pw, ph) {
         else                            { _le_mode = _LE_MODE_TILES; }
     }
 
-    auto title_x, mode_x, save_x, open_x, name_x;
-    auto mode_w, btn_h, name_w, btn_w;
-    title_x = px + 12;
+    // Button widths derive from the actual rendered label width
+    // plus a fixed pad (8 px each side). At UI_FONT_SZ=16 the
+    // bitmap font measures 16 px per character, so "Objects" alone
+    // is ~112 px — hardcoded widths around 56-64 silently clipped
+    // the labels to "Obje"/"Tile"/"Sav"/"Ope" in earlier sessions.
+    auto title_x, mode_x, save_x, open_x, name_x, dirty_x;
+    auto btn_h, name_w, pad;
+    auto tiles_w, obj_w, save_w, open_w;
+    pad     = 16;
     btn_h   = 22;
-    btn_w   = 56;
-    mode_w  = 64;
+    title_x = px + 12;
+    tiles_w = measure_text("Tiles",   UI_FONT_SZ) + pad;
+    obj_w   = measure_text("Objects", UI_FONT_SZ) + pad;
+    save_w  = measure_text("Save",    UI_FONT_SZ) + pad;
+    open_w  = measure_text("Open",    UI_FONT_SZ) + pad;
     mode_x  = px + 140;                            // after the title text
-    save_x  = mode_x + 2 * mode_w + 12;            // gap after mode toggle
-    open_x  = save_x + btn_w + 4;
-    name_x  = open_x + btn_w + 8;
-    name_w  = pw - (name_x - px) - 90;             // flex; reserve dirty mark
+    save_x  = mode_x + tiles_w + 2 + obj_w + 12;   // gap after mode toggle
+    open_x  = save_x + save_w + 4;
+    name_x  = open_x + open_w + 8;
+    name_w  = pw - (name_x - px) - 80;             // flex; reserve dirty mark
     if (name_w < 80) { name_w = 80; }
+    dirty_x = name_x + name_w + 6;
 
     draw_text("Level Editor 0.2", title_x, py + 8, 8,
               rgba(97, 218, 251, 255));
 
-    if (gui_button(mode_x, py + 6, mode_w, btn_h, "Tiles")) {
+    if (gui_button(mode_x, py + 6, tiles_w, btn_h, "Tiles")) {
         _le_mode = _LE_MODE_TILES;
     }
-    if (gui_button(mode_x + mode_w + 2, py + 6, mode_w, btn_h, "Objects")) {
+    if (gui_button(mode_x + tiles_w + 2, py + 6, obj_w, btn_h, "Objects")) {
         _le_mode = _LE_MODE_OBJECTS;
     }
     // Active-mode accent — 2-px bar under whichever button is on,
     // using the same accent the right-edge selector uses elsewhere.
-    auto acc_x;
-    if (_le_mode == _LE_MODE_TILES) { acc_x = mode_x; }
-    else                            { acc_x = mode_x + mode_w + 2; }
-    draw_rect(acc_x, py + 6 + btn_h, mode_w, 2,
+    auto acc_x, acc_w;
+    if (_le_mode == _LE_MODE_TILES) {
+        acc_x = mode_x;
+        acc_w = tiles_w;
+    } else {
+        acc_x = mode_x + tiles_w + 2;
+        acc_w = obj_w;
+    }
+    draw_rect(acc_x, py + 6 + btn_h, acc_w, 2,
               rgba(97, 218, 251, 255));
 
-    if (gui_button(save_x, py + 6, btn_w, btn_h, "Save")) {
+    if (gui_button(save_x, py + 6, save_w, btn_h, "Save")) {
         path_sb = strbuf_new();
+        path_sb = strbuf_cat(path_sb, _lvl_dir_buf);
         path_sb = strbuf_cat(path_sb, _lvl_name_buf);
         path_sb = strbuf_cat(path_sb, ".json");
         _save(path_sb);
         path_sb = strbuf_free(path_sb);
         _lvl_dirty = 0;
     }
-    if (gui_button(open_x, py + 6, btn_w, btn_h, "Open")) {
+    if (gui_button(open_x, py + 6, open_w, btn_h, "Open")) {
         auto picked;
         picked = window_open_dialog("Open level");
         if (picked != 0) {
-            _load(picked);
+            // Route through the public try_load wrapper so the
+            // dir/base split + filename-input update happens —
+            // the bare `_load()` only parses contents.
+            level_editor_lib_try_load(picked);
             free(picked);
         }
     }
     gui_text_input(_lvl_name_ti, name_x, py + 6, name_w, btn_h);
     if (_lvl_dirty != 0) {
-        draw_text("*unsaved", name_x + name_w + 6, py + 12, 8,
+        draw_text("*unsaved", dirty_x, py + 12, 8,
                   rgba(255, 180, 80, 255));
     }
 
