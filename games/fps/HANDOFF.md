@@ -1,73 +1,118 @@
-# Wolf3D — Phase 2 Prep Doc
+# Wolf3D — Phase 2 Status
 
-**Phase 1 closed:** 2026-05-04. `games/fps/fps_3d.bpp` walks at 60 FPS
-through a textured 2.5D maze. See `docs/journal.md` entry
-`2026-05-04` for the full Phase 1 retrospective.
+**Phase 2 = Wolfenstein-3D Minimum**: 1 enemy type, 1 weapon, 1 door
+type, 1 level, edited visually inside Bang 9. Authentic features
+(3-4 enemies, 4 weapons, key + door pairs, multi-level, secret
+walls, voice acting) move to Phase 3+.
 
-This file is the entry brief for the agent picking up Phase 2.
-Phase 2 = Wolfenstein-3D Minimum: 1 enemy type, 1 weapon, 1 door
-type, 1 level, ASCII map loader v2 with entity grammar. Authentic
-features (3-4 enemies, 4 weapons, key + door pairs, multi-level,
-secret walls, voice acting) are independent add-ons in Phase 3+.
+Entry file: `games/fps/fps_wolf3d.bpp`. Map: `games/fps/assets/levels/level1.json`.
+Tooling: Bang 9 (Levels tab + Effects tab) — see `docs/bang9_space_manual.md`.
 
 ---
 
-## Phase 1 → Phase 2 file migration plan
+## Sessions
 
-When Phase 2 ships content-rich Wolf3D, `games/fps/fps_3d.bpp`
-migrates to `examples/fps_3d.bpp` as the canonical 2.5D raycasting
-template every future B++ raycaster forks from. The file that
-replaces it in `games/fps/` becomes the actual Wolf3D game with
-sprites + enemies + levels + audio.
+| # | Session | Status | LOC | Ships |
+|---|---|---|---|---|
+| 0 | Map loader + entity layer | **✅ shipped 2026-05-11** | ~240 | level_editor entity layer + JSON schema v2 + fps_wolf3d loader |
+| 1 | Sprites + depth buffer | **→ next** | ~200 | Billboard sprites render, walls occlude correctly |
+| 2 | Enemies (visible + AI) | pending | ~150 | Enemy walks toward player via LoS raycast |
+| 3 | Combat | pending | ~100 | Fire action, hitscan, damage, death |
+| 4 | Audio | pending | ~80 | Gunfire / scream / footsteps; volume by distance |
+| 5 | Doors + use | pending | ~120 | Tilemap state slot, use action, slide-open animation |
+| 6 | Polish + profile | pending | ~50 | Full level, profile under enemy load, tonify sweep |
 
-That migration happens at the END of Phase 2. Until then,
-`games/fps/fps_3d.bpp` keeps growing as the Phase 2 development
-target.
-
----
-
-## What's already in place from Phase 1
-
-- `games/fps/fps_3d.bpp` — entry point (~360 LOC). Walks, turns,
-  collides, profiles. Spawn point (3.5, 8.5) facing east in a 16×16
-  test maze with four wall types ('#' brick, '@' stone, '%' wood,
-  '!' solid magenta debug).
-- `stb/stbtexture.bsm` — procedural materials. New patterns
-  (e.g. tile checkerboard, gradient, perlin) drop in as additional
-  `texture_X_to_buf` + factory pairs.
-- `stb/stbraycast.bsm` — DDA + RayHit + projection. Wall_type
-  dispatch is owned by the game; cartridge stays content-blind.
-- `stb/stbprofile.bsm` — Tier 1 profile HUD. Tier 2/3 (sparkline,
-  per-thread, GPU timing, scoped zones) is the pre-Phase-2 polish
-  sidequest if appetite holds.
-- `stb/stbphys.bsm` Chapter FPS — FPSBody + fps_walk + fps_turn.
-- `bpp_math.bsm` — sin_f / cos_f / abs_f / floor_f public,
-  auto-injected.
-
-Suite at Phase 1 close: **131 / 0 / 12 native + 110 / 0 / 33 C**.
-Bootstrap byte-stable at `bpp = 20e75f653dabf309bcfdef7a9d738756815b2682`.
+Commit cadence: one commit per session, message format
+`wolf3d phase2 sN: <one-line summary>`.
 
 ---
 
-## Phase 2 — Three decisions to register before Session 0
+## Next: Session 1 — Sprites + depth buffer
 
-These were aligned in the Phase 1 close meta-planning round.
-Re-confirm with the user before deviating.
+### What Session 0 already set up
 
-### D1 — Entity storage
+Run `fps_wolf3d` and you have:
 
-**Decision: new cartridge `stb/stbentity.bsm`.**
+- **Map loaded from JSON v2** — `assets/levels/level1.json` parsed
+  on init. Tiles populate `world_map`; entities populate the
+  `wolf_entities` array (kind / x / y per record). `player_spawn`
+  entity already applied to the player FPSBody, so the spawn point
+  comes from the level file, not hardcoded.
+- **3 entities placed in the demo level**: `player_spawn`, `enemy`
+  (one), `door` (one). Inspect with the Bang 9 Levels tab — Tab key
+  toggles between Tiles and Objects mode.
+- **No renderer for entities yet** — that's this session's job.
 
-Game-local `entities.bsm` was option (a), extending `stbphys` with
-an EntityList chapter was option (c). The two-consumer rule fires
-in advance: Wolf3D + future DOOM-clone-or-similar = two consumers
-expected, justifying the promotion to stb without waiting.
+### What this session ships
 
-**Cartridge surface (proposed):**
+A billboard sprite renderer that:
+
+1. Walks `wolf_entities` each frame, sorts by depth (back-to-front
+   relative to the player).
+2. For each entity: project its world position into screen space
+   using the same FPSBody / FOV math `fps_render_phase` uses for
+   walls. Skip if behind the camera.
+3. Compute the column range it covers, then for each column
+   compare the sprite's depth against the wall's depth at that
+   column (the depth buffer Session 1 also introduces). Draw
+   the sprite column only where it's in front of the wall.
+4. Pick a sprite atlas by `kind`: solid colored quad is fine for
+   V1 (red square = enemy, brown square = door). Authored
+   sprites land in Session 4+ when audio + content polish hits.
+
+### Files this session touches
+
+| File | Change |
+|---|---|
+| `stb/stbraycast.bsm` | Extend with depth buffer + `draw_sprite` helper. ~80 LOC. |
+| `games/fps/fps_wolf3d.bpp` | Renderer walks `wolf_entities`, calls draw_sprite. ~50 LOC. |
+| `assets/shaders/fps_raycast.metal` | Depth output from the wall pass + sprite quad pass on top. ~40 LOC. |
+| `tests/test_stbraycast_sprite.bpp` | Lock the depth-comparison contract (spawn a sprite behind a wall, assert it doesn't render). ~30 LOC. |
+
+LOC realistic: ~200.
+
+### Implementation hints
+
+- Reference: Lode Vandevenne raycasting tutorial Part 3 (sprites).
+  Same DDA + projection that Phase 1 used for walls; the new piece
+  is the column-by-column depth comparison.
+- Don't pre-commit to texture atlases. Solid colored quads
+  validate the renderer in isolation; sprite art swaps in via
+  `image_load` once the geometry is correct.
+- The depth buffer is **per column**, not per pixel — it stores
+  the perpendicular wall distance for that screen column. Sprites
+  compare per column too, not per pixel.
+- Player position + facing already pull from the level via the
+  `player_spawn` entity, so changing the spawn requires only
+  editing the level JSON in Bang 9 — no rebuild.
+
+### What NOT to do this session
+
+- Don't add enemy AI. That's Session 2's whole job (D1 lands then).
+- Don't try to make sprites animate (idle / walk / attack frames).
+  Session 4 territory.
+- Don't add the `stbtile.state` field. That's Session 5 (Doors).
+
+---
+
+## Architectural decisions (locked)
+
+These are the contracts every later session inherits. Re-confirm
+with the user before deviating.
+
+### D1 — Entity storage cartridge
+
+`stb/stbentity.bsm` lands in **Session 2** when enemies become
+runtime objects with state + AI. Session 0 produces the static
+entity list (`wolf_entities` array of `{kind, x, y}`); Session 1
+just renders them; Session 2 promotes that list into a real
+`EntityPool` with kind-specific FSM state.
+
+Cartridge surface (proposed, can drift in Session 2):
 
 ```bpp
 struct Entity {
-    kind: byte,           // 1=enemy, 2=item, 3=projectile, 4=...
+    kind: byte,           // 1=enemy, 2=item, 3=projectile, ...
     state: byte,          // FSM state index, kind-specific
     flags: byte,          // alive bit + flags
     sprite_id: byte,      // index into game's sprite atlas
@@ -77,85 +122,67 @@ struct Entity {
     cooldown: half        // generic countdown timer (frames)
 }
 
-ent_pool_new(cap)            // EntityPool with cap slots
-ent_spawn(pool, kind, x, y)  // returns entity handle or 0
+ent_pool_new(cap)
+ent_spawn(pool, kind, x, y) → handle
 ent_kill(pool, handle)
 ent_alive(pool, handle)@base
 ent_at(pool, handle): Entity ptr
 ent_count(pool)@base
-ent_each(pool, fn_ptr)       // iterate alive entities, call fn(handle)
-ent_sort_by_depth(pool, px, py) // for sprite z-sort against player
+ent_each(pool, fn_ptr)
+ent_sort_by_depth(pool, px, py)
+ent_hitscan_ray(pool, x0, y0, dir_x, dir_y, max_dist) → handle
 ```
 
-Hitscan helper:
-```bpp
-ent_hitscan_ray(pool, x0, y0, dir_x, dir_y, max_dist) // returns hit handle or 0
-```
+Justified by the two-consumer rule (Wolf3D + future DOOM-clone
+expected); no need to wait for the second consumer to ship before
+promoting.
 
 ### D2 — AI substrate
 
-**Decision: hand-rolled FSM per enemy type for Phase 2 Minimum.**
+**Hand-rolled FSM per enemy type for Phase 2.** Phase 2 ships ONE
+enemy type — a generic `stbfsm.bsm` is overkill at N=1. AI lives
+game-local in `games/fps/fps_wolf3d.bpp` (or sibling `ai.bsm` if it
+grows past ~150 LOC). Promote to stb when N≥3 with profile data
+showing the FSM pattern is shared.
 
-Phase 2 ships ONE enemy type. A generic `stbfsm.bsm` is overkill at
-N=1; the cost flips at N=3+. When enemy variety grows (Phase 3
-Authentic), reopen with profile data showing the FSM pattern is
-real shared infrastructure.
+### D3 — Per-cell state for doors
 
-For now, the enemy AI lives game-local in
-`games/fps/wolf3d.bpp` (or a sibling `games/fps/ai.bsm` if it
-grows past ~150 LOC).
-
-### D3 — Door / per-cell state
-
-**Decision: extend `stbtile.Tilemap` with a per-cell state slot of
-WORD width.**
-
-Word, not byte. Open/closed is a bit; open/closing/closed/opening
-+ timer is byte; physics state (lift Y-offset, rotating wall angle,
-animated wall phase) is word. Word future-proofs for free at
-2 KB extra per 16×16 map (negligible).
-
-**Tilemap struct addition:**
+`stb/stbtile.Tilemap` gets a `state` field (WORD per cell) in
+**Session 5 (Doors)**, not earlier. State is a runtime concern —
+shipping it before there's a consumer is dead weight. Session 5's
+renderer reads it for door animation phase (0 = closed,
+1000 = fully open, intermediate = animating).
 
 ```bpp
 struct Tilemap {
     w, h, tw, th,
-    data,           // existing: type-id byte per cell
-    solid_mask,
+    data, solid_mask,
     tileset, tile_count, remap,
-    state           // NEW: word per cell, all uses (door anim, lift y, etc.)
+    state           // ← NEW in Session 5: word per cell
 }
-```
 
-API:
-```bpp
 tile_state_get(tm, gx, gy)@base
 tile_state_set(tm, gx, gy, val)
 ```
 
-Doors then use the state slot for animation phase (0=closed, 1000=fully
-open, intermediate=animating). The renderer reads state to offset the
-column projection or skip the wall entirely while open.
+### D4 — Entity `kind` is a string, not an enum
+
+`{kind: "player_spawn", x, y}`. Locked Session 0. Lets Phase 3+
+introduce variants (`enemy_guard`, `enemy_dog`, etc.) without
+schema churn or a central enum table to maintain. Cost is one
+string compare per entity per relevant lookup — fine at N≤32.
+
+### D5 — Level JSON schema v2 is the only format
+
+No backward compat. v1 files were migrated in-place during
+Session 0. Loader only knows v2. Per Tonify spirit — backward compat
+shims are forever-debt for a one-time migration.
 
 ---
 
-## Phase 2 sessions (~7 sessions, ~780 LOC)
+## Sidequest queue
 
-| # | Session | Ships | stb impact | LOC |
-|---|---------|-------|------------|-----|
-| 0 | Map loader v2 | ASCII → tilemap + entity list (`# @ % ! e d k`) | extend stbtile (entity grammar parsing) | ~80 |
-| 1 | Sprites + depth buffer | Billboard sprite renders, walls occlude correctly | extend stbraycast (depth buf + draw_sprite) | ~200 |
-| 2 | Enemies (visible + AI) | Enemy sprite walks toward player via LoS raycast | new stbentity (D1) | ~150 |
-| 3 | Combat | Fire action, hitscan, damage, death | extend stbphys FPS (hitscan_ray) | ~100 |
-| 4 | Audio | Gunfire / scream / footsteps; volume by distance | uses existing stbsound + stbmixer | ~80 |
-| 5 | Doors + use | Tilemap state slot (D3), use action, slide-open animation | extend stbtile (per-cell state) | ~120 |
-| 6 | Polish + profile | Full level, profile under enemy load, tonify sweep | none | ~50 |
-
----
-
-## Sidequest queue (between Phase 1 close and Phase 2 attack)
-
-**Hold these until appetite returns; none block Session 0.**
+Hold these until appetite returns; none block any session.
 
 ### 1. Profile HUD Tier 2/3
 
@@ -164,21 +191,18 @@ column projection or skip the wall entirely while open.
   driven from the existing frame ring.
 - **Tier 3a per-thread breakdown** — bucketize profile_dump samples
   by `_job_thread_idx` so the top-N shows main vs each worker.
-  Needs ~20 LOC in stbprofile + `_prof_capture_at` already
-  records the thread index.
-- **Tier 3b GPU timing** — Metal `MTLCommandBuffer.GPUStartTime`
-  + `GPUEndTime` events. Layer 4 territory; depends on what the
-  Metal driver exposes through `objc_msgSend`. Skip until profile
-  shows GPU-side bottleneck.
-- **Tier 3c scoped zones** — `@profile_zone("name") { ... }`
-  parser annotation that injects zone enter / exit calls. Real
-  compiler work (~50 LOC parser + codegen + ~30 LOC stbprofile).
-  Phase 7 polish stretch.
+  Needs ~20 LOC in stbprofile + `_prof_capture_at` already records
+  the thread index.
+- **Tier 3b GPU timing** — Metal `MTLCommandBuffer.GPUStartTime` +
+  `GPUEndTime` events. Skip until profile shows GPU-side
+  bottleneck.
+- **Tier 3c scoped zones** — already shipped as `@profile("name") { ... }`
+  in Phase 6.3 (May 2026). This entry is closed.
 
-### 2. `_to_buf` API split sweep across other stb cartridges
+### 2. `_to_buf` API split sweep
 
-Candidates (same architectural gain as stbtexture got — testable
-headless API + reusable CPU-side path):
+Same architectural gain as stbtexture got — testable headless API
++ reusable CPU-side path. Candidates:
 
 - `stbpal._fill_*` (currently private static helpers — promote)
 - `stbimage` PNG decode (`png_decode_to_buf` separate from upload)
@@ -190,178 +214,80 @@ headless API + reusable CPU-side path):
 ### 3. SIGPROF dump-noise residual
 
 The 64 KB resolver guard from Phase 1 covers most cases. If any
-phantom samples persist in profile_dump output (e.g. attributing
-to dump_profile or profile_dump itself), add a sample-time filter:
-reject any captured PC whose resolved name is `profile_dump` /
-`_runtime_resolve_pc` / similar before tallying. Can also harden
-profile_stop to fence outstanding signals before returning.
+phantom samples persist in profile_dump output, add a sample-time
+filter rejecting captured PCs whose resolved name is
+`profile_dump` / `_runtime_resolve_pc` / similar before tallying.
 
 ### 4. Maestro callback dt — pass µs instead of ms
 
-Phase 1 fix kept the callback contract at ms (every existing caller
-expects ms). When refactoring callers en masse, switch `solo` /
-`base` callbacks to receive `dt` in µs and update fps_walk /
-fps_turn / similar to do `dt / 1_000_000` instead of
-`dt / 1_000`. Eliminates the 1 ms truncation residual that makes
-each physics step nominally 16 ms when the real value is 16.667 ms.
+Current contract: ms (truncated). Switch `solo` / `base` callbacks
+to receive µs and update fps_walk / fps_turn callers to do
+`dt / 1_000_000` instead of `dt / 1_000`. Eliminates the 1 ms
+truncation residual that makes each physics step nominally 16 ms
+when the real value is 16.667 ms.
 
-### 5. Diagnostic for `stat fps`-style HUD outside profile mode
+### 5. Standalone "always-on FPS counter"
 
-A standalone "always-on FPS counter" via
 `profile_hud_draw_fps_only(x, y, sz, color)` that renders just the
 FPS line independent of the profile toggle. Useful for shipping
 games that want a permanent overlay without the recording UX.
 
 ---
 
-## Phase 2 Session 0 starting checklist
+## File layout (Wolf3D + adjacent)
 
-When the next agent picks up:
+```
+games/fps/
+├── HANDOFF.md                       ← this file
+├── fps_wolf3d.bpp                   ← entry, Session 1+ extends
+└── assets/
+    └── levels/
+        └── level1.json              ← schema v2, Bang 9 Levels tab edits
 
-1. Read `docs/journal.md` entry `2026-05-04` (Phase 1 close).
-2. Read this file (you are here).
-3. Read D1/D2/D3 above. Confirm with the user before deviating.
-4. Open `stb/stbtile.bsm` — add the `state` field + accessors.
-5. Write `tests/test_stbtile_state.bpp` to lock the contract.
-6. Update `games/fps/fps_3d.bpp` ASCII map to use entity glyphs
-   (`#@%! e d k`), and add the loader.
-7. After Session 0: `games/fps/fps_3d.bpp` should still build +
-   walk + profile, plus the loader handles the entity glyphs even
-   if Phase 2 hasn't placed any yet.
+examples/
+├── fps_3d_cpu.bpp                   ← Phase 1 CPU baseline (graduated 2026-05-08)
+└── fps_3d_gpu.bpp                   ← Phase 2.4 GPU baseline (graduated 2026-05-08)
 
-Commit cadence: **one commit per session**, message format
-`fps3d phase2 sN: <one-line summary>`.
+stb/
+├── stbraycast.bsm                   ← Session 1 extends with depth buf + sprites
+├── stbentity.bsm                    ← Session 2 NEW
+├── stbtile.bsm                      ← Session 5 adds state field
+├── stbphys.bsm Chapter FPS          ← Session 3 adds hitscan_ray
+├── stbtexture.bsm                   ← already shipped (Phase 1)
+└── stbprofile.bsm                   ← already shipped (Phase 1)
 
----
-
-## What NOT to do at Session 0
-
-- Don't pre-commit to the entity rendering shape. Session 1 owns
-  sprite + depth buffer; Session 0 just parses entity glyphs into
-  an array of `{kind, x, y}` records that Session 1 picks up.
-- Don't move `fps_3d.bpp` to `examples/` yet. The migration
-  happens at end of Phase 2 once content-rich Wolf3D replaces it
-  in `games/fps/`.
-- Don't open Tier F based on the Session 5 profile — explicitly
-  decided NOT to (CPU is mostly vsync idle; gargalo is GPU
-  presentation, not compute).
+tools/
+├── level_editor/                    ← multi-layer tilemap+objects (Session 0)
+└── fxlab/                           ← effect tuner (independent arc, May 2026)
+```
 
 ---
 
 ## Reference materials
 
-- Lode Vandevenne raycasting tutorial: lodev.org/cgtutor/raycasting
-  — Part 1 (DDA, already shipped), Part 3 (sprites, Session 1
-  reference).
-- `docs/journal.md` 2026-05-04 — Phase 1 retrospective.
+- `docs/bang9_space_manual.md` — engine/IDE premise + embed
+  contract + project layout. Read first when joining the project.
+- `docs/journal.md` — chronological context. Most relevant entries:
+  `2026-05-04` (Phase 1 close), `2026-05-10` (fxlab arc),
+  `2026-05-11` (Wolf3D Phase 2 Session 0).
 - `docs/how_to_dev_b++.md` "2.5D engine + textures + profiler" —
-  cartridge tour.
-- `docs/tonify_checklist.md` Rule 20 — promote-on-second-consumer.
-- `docs/warning_error_log.md` Known compiler diagnostic gaps —
-  W027 + diagnostic candidates.
-
-Boa caçada na Phase 2.
+  cartridge tour for the engine subsystems Wolf3D leans on.
+- `docs/tonify_checklist.md` — apply on every change (storage
+  class, visibility, return type, phase annotation, slice types,
+  comments-as-user-manual).
+- Lode Vandevenne raycasting tutorial: lodev.org/cgtutor/raycasting
+  — Part 1 (DDA, shipped Phase 1), Part 3 (sprites, Session 1
+  reference).
 
 ---
 
-## Update 2026-05-11 — Session 0 supersedes to Caminho A (level_editor entity layer)
+## Phase 1 retrospective
 
-After the fxlab arc closed (commits `5a9f05d` → `f5fbaeb` + polish
-batch `350604f`), Bang 9 was canonized as the engine/IDE of the
-B++ ecosystem — see new `docs/bang9_space_manual.md` for the full
-architectural premise. Wolf3D Phase 2 maps now go through that
-flow, not through standalone ASCII text editing.
+Phase 1 closed 2026-05-04 with `fps_3d.bpp` walking at 60 FPS
+through a textured 2.5D maze. Suite at close: 131/0/12 native +
+110/0/33 C, bootstrap byte-stable. Full retrospective in
+`docs/journal.md` 2026-05-04. The two demo files (`fps_3d.bpp`
+CPU, `fps_3d_gpu.bpp` GPU) graduated to `examples/` 2026-05-08
+when `fps_wolf3d.bpp` branched to become the Phase 2 dev target.
 
-**Session 0 shifts** from "ASCII glyph map (`#@%!edk`) + stbtile
-grammar parser" → **"level_editor extended with entity layer
-(Caminho A) + JSON schema v2 + fps_wolf3d loader walks entities[]"**.
-
-Reasoning: the two-consumer rule already fired. The user + agents
-are already editing Wolf3D maps inside Bang 9 (same flow used for
-sprites via modulab, effects via fxlab). Caminho B (Wolf3D-style
-glyph-range single-grid) would force a refactor in Phase 3 when
-"wall + entity in same cell" becomes a hard requirement. Caminho
-A is the canonical Tiled / LDtk pattern and reusable across every
-future game (RPG, RTS, Adventure all need entity layers).
-
-### Updated Session 0 scope
-
-Files touched:
-
-| File | What |
-|---|---|
-| `stb/stbtile.bsm` | NO state field yet — D3 moves to Session 5 (Doors) where it's actually consumed |
-| `tools/level_editor/level_editor_lib.bsm` | Second layer `_lvl_entities`. UI toggle `Tiles ↔ Objects`. Object palette panel. JSON v2 read+write. |
-| `assets/levels/level1.level.json` (Wolf3D) | New file with player_spawn + 1 enemy + 1 door for Phase 2 demo scope |
-| `games/pathfind/assets/levels/level1.level.json` | **Migrate in-place to v2** (add `"entities": []`). No backward compat code anywhere. |
-| `bang9/level1.level.json` | Same in-place migration if present |
-| `games/fps/fps_wolf3d.bpp` | Walk `entities[]` at init, populate internal `EntityList` (renderer is Session 1's problem) |
-| `tests/test_level_editor_v2.bpp` | Lock schema v2 contract (write + read round-trip with entities + tiles) |
-
-### Realistic LOC estimate (corrects the original ~80 LOC line)
-
-- stbtile state field: 0 (deferred to Session 5)
-- level_editor entity layer state: ~30
-- UI toggle Tiles/Objects: ~30
-- Object palette UI: ~50
-- JSON schema v2 read+write: ~50
-- v1 → v2 migration of existing 2-3 files: 0 LOC (manual edit, ~5 min)
-- fps_wolf3d entity loader: ~30
-- Tests: ~50
-- **Total: ~240 LOC**, not 80. Plan accordingly.
-
-### Four nuances locked
-
-**(1) State field deferred.** D3 (`stbtile.state` word per cell)
-is a runtime concern (door animation, lift Y-offset). It stays on
-Session 5 (Doors) where the renderer first reads it. Session 0
-keeps stbtile untouched.
-
-**(2) Object palette uses `kind` as string, not enum.** Entity
-records are `{kind: "player_spawn", x, y, props: {...}}`. Phase 2
-demo ships 3 kinds (`player_spawn`, `enemy`, `door`); Phase 3+
-adds variants (`enemy_guard`, `enemy_dog`, etc) without schema
-refactor. UI v1 shows only kind + position; advanced props edited
-via JSON until the editor earns rich UI per kind.
-
-**(3) JSON schema v2 — no backward compat.** Migrate the 2-3
-existing v1 level files in-place (add `"entities": []` field).
-Loader only knows v2 going forward. Rationale: backward compat
-shim is forever-debt for a 5-minute migration; mental tax of "is
-this v1 or v2?" compounds across every asset type the engine will
-support. Tonify spirit — don't build a shim graveyard.
-
-**(4) Bang 9 panel side already wired.** `_panel_levels` in
-`bang9/panels.bsm` already calls
-`level_editor_lib_init(g_proj_root)`. Session 0 just extends what
-the lib does; no Bang 9 surgery needed. (Same pattern fxlab arc
-established — embed contract is canonical.)
-
-### What stays unchanged from the original handoff
-
-- **D1 (`stbentity` cartridge)** — still right. Lands in Session
-  2 when enemies become real entities at runtime. Session 0 just
-  produces the entity list shape that Session 2 will consume.
-- **D2 (hand-rolled FSM for Phase 2)** — still right.
-- **D3 (per-cell state word)** — still right, but moved from
-  Session 0 to Session 5 (Doors). State field is meaningless
-  without a consumer; Session 5 is the consumer.
-- **Sidequest queue (Tier 2/3 profile, etc.)** — unchanged.
-- **Commit cadence "one commit per session"** — unchanged.
-
-### Reference for the next agent
-
-- `docs/bang9_space_manual.md` — engine/IDE convergence model,
-  embed contract, project layout convention, hot-reload backbone.
-  Read first. Establishes WHY Caminho A is the move.
-- `docs/journal.md` 2026-05-10 entry — fxlab polish milestone +
-  Tonify lessons graduated (`@base` only for PURE, dual-watch
-  pattern, project-sacred-install-seed).
-- `tools/level_editor/level_editor_lib.bsm` — current state
-  (single-layer tiles), pattern to extend from.
-- `tools/fxlab/fxlab_lib.bsm` — embed contract reference (proj_root
-  parameter, host owns UI boot, lib reads/writes
-  `<proj_root>/effects/`).
-
-Same boa caçada — agora com map editor visual no Bang 9.
-
+Boa caçada na Phase 2.
