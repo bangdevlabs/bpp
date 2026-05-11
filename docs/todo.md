@@ -233,21 +233,16 @@ V2+ candidates if signal emerges from Wolf3D tuning:
 - Live `.metal` editor (Modelo 4 from original design).
 - Effect-chain ordering UI (drag-reorder which effect runs first).
 
-### Modulab prefs path migration to user config dir
+### Modulab prefs path migration to user config dir — SHIPPED 2026-05-11
 
-`tools/modulab/prefs.bsm` writes to `<exe_dir>/modulab_prefs.json`.
-Same CWD/install path bug class fxlab arc fixed in May 2026 — prefs
-end up next to the binary instead of in user space. When Bang 9
-ships installed, this pollutes `/usr/local/bin/`.
-
-Migration: write to `~/.config/bpp/modulab_prefs.json` (XDG on
-Linux, `~/Library/Application Support/bpp/` on macOS). ~30 LOC in
-prefs.bsm: add `_user_config_path()` helper, swap `<exe_dir>` for
-it. The file is currently `.gitignore`d so accidental commits don't
-re-leak the bug.
-
-Defer until: someone hits the bug shipping Bang 9 to a non-dev
-machine.
+Closed in the same Wolf3D Phase 2 Session 0 batch where it
+surfaced. `_stb_user_config_dir(app_name)` lives in both OS
+backends now (`_core_macos.bsm` → `~/Library/Application Support/bpp/`,
+`_core_linux.bsm` → `$XDG_CONFIG_HOME/bpp/` with `~/.config/bpp/`
+fallback). Modulab's `_prefs_path()` calls it; binary can now live
+anywhere on disk and the pref file follows the user, not the
+install. Falls back to legacy `<exe_dir>` behavior only if HOME is
+unset (extremely unusual).
 
 ### x86_64 perf parity on Linux — B1 freelist + B2 inline
 
