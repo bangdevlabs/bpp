@@ -8542,3 +8542,76 @@ game-local, shooting reuses stbai primitives, damage decrements
 the ECS payload's `hp` field. ~140 LOC estimated.
 
 Suite still 143/0/12 native + 116/0/39 C, bootstrap byte-stable.
+
+## 2026-05-11 (late) — V3 return-type inference is single-pass forward-only
+
+Followed up on the typed-local thunk pattern shipped in the Vec2
+promotion arc earlier today. The earlier journal entry blamed V3
+for "not looking inside return expressions" — that diagnosis was
+wrong.
+
+### What's actually happening
+
+`add_type` in `src/bpp_types.bsm` recurses correctly through
+T_BINOP, T_MEMLD (struct field reads), T_CALL, etc. Each case
+returns the right type when it has the data:
+
+- T_MEMLD with a non-zero hint → ty_make from hint bits
+- T_BINOP → promote(lt, rt) recursively
+- T_CALL → func_type(name) lookup
+
+The gap is in T_CALL: `func_type` looks up the callee's recorded
+return type from `fn_ret_types`. That table is populated by
+`save_fn_types` AFTER processing each function body. So a function
+that calls something defined LATER in the same file sees TY_WORD
+(default) for the callee — even though by the end of the file
+the table will be correct.
+
+### The Vec2 case
+
+`vec2_distance` calls `sqrt`. Both live in `src/bpp_math.bsm`. In
+the original ordering, vec2_distance came BEFORE sqrt; at the
+moment vec2_distance's body was processed, `func_type("sqrt")`
+returned TY_WORD; vec2_distance's return type became TY_WORD;
+every consumer's call site tripped E240.
+
+Same explains why my earlier isolated repros worked — they
+defined the helper above main() (no forward ref) so sqrt was
+resolved before being referenced.
+
+### The fix
+
+Move the scalar utilities section (sqrt + iabs + min + max +
+clamp) ABOVE the Vec2 helpers in bpp_math.bsm. Now
+`func_type("sqrt")` returns TY_FLOAT when vec2_length /
+vec2_distance / vec2_normalize are processed. The typed-local
+`auto r: float; r = expr; return r;` thunks are no longer
+needed — removed from all 4 helpers.
+
+Suite still 145/0/12, bootstrap byte-stable.
+
+### Lesson for B++ contributors
+
+Within a single file, define functions in dependency order:
+leaves first, callers last. Same convention `docs/tonify_checklist.md`
+already canonises for cross-file batch ordering during a tonify
+sweep, just applied at the function level.
+
+When a forward reference is unavoidable (mutual recursion,
+import cycles), the typed-local thunk remains as a workaround
+— assign the return expression to a `: float`-typed local first,
+then return that local. Costs one line + zero runtime overhead
+(the thunk compiles to identical assembly to the direct return).
+
+### What this is NOT
+
+It is NOT a missing capability in `add_type`. The recursive
+expression typing already works for every node kind we hit. The
+limitation is in the surrounding processing order, which is
+single-pass.
+
+A two-pass inferencer (collect all func declarations + bodies
+first, then run inference) would close the forward-ref gap
+completely. ~150 LOC sidequest if mutual recursion or import
+cycles ever bite — not worth doing pre-emptively because today
+the leaves-first idiom handles every real case.

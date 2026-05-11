@@ -1359,6 +1359,72 @@ following construct (`@base func`, `@gpu func`, `@seq while`);
 
 ---
 
+## Rule 27: Define functions leaves-first within a file (V3 inference)
+
+V3 return-type inference is single-pass top-to-bottom. When function A
+calls function B, A's return type is inferred correctly only if B's
+return type is already in `fn_ret_types` at the moment A's body is
+processed — i.e. B must be defined ABOVE A in the same file.
+
+If A is processed first, `func_type("B")` returns the TY_WORD default;
+A's return type becomes TY_WORD; every downstream consumer that
+expects A to return float trips E240.
+
+```bpp
+// WRONG ordering — vec2_distance returns TY_WORD silently:
+vec2_distance(a, b)@base {
+    ...
+    return sqrt(dx * dx + dy * dy);     // sqrt undefined yet → TY_WORD
+}
+
+sqrt(x: float)@base { ... return ...; }  // defined below
+
+// caller:
+auto r: float;
+r = vec2_distance(a, b);                 // E240: int → float
+```
+
+```bpp
+// RIGHT ordering — sqrt resolved before vec2_distance reads it:
+sqrt(x: float)@base { ... return ...; }
+
+vec2_distance(a, b)@base {
+    ...
+    return sqrt(dx * dx + dy * dy);     // sqrt → TY_FLOAT, propagates
+}
+```
+
+**The rule applies WITHIN a file.** Across files, the import order
+handles dependency ordering — a cartridge that imports another sees
+the imported cartridge's functions already typed.
+
+**Workaround when reordering is impossible** (mutual recursion, etc):
+the typed-local thunk pattern.
+
+```bpp
+my_helper(x)@base {
+    auto r: float;
+    r = some_forward_ref(x);            // returns TY_WORD here
+    return r;                            // r is : float — return type becomes TY_FLOAT
+}
+```
+
+The thunk costs one line and zero runtime (compiles to identical
+assembly). The cost is real only when the forward ref is rare and
+isolated. When you find yourself adding the thunk to many helpers in
+the same file, reorder the file instead — that's the actual fix.
+
+**Discovered 2026-05-11** during the Vec2 promotion arc when 3 of
+the 4 scalar Vec2 helpers (vec2_length, vec2_distance,
+vec2_normalize — all calling sqrt) tripped E240 at every consumer
+site. Initial diagnosis blamed `add_type` for not recursing
+through struct-field expressions; the actual cause was the
+forward reference to sqrt, which lived BELOW the Vec2 helpers in
+bpp_math.bsm at the time. Reorder + thunk-removal fixed both
+symptoms cleanly.
+
+---
+
 ## Rule 26: Audit existing cartridges before creating a new one
 
 Before writing `stb/stb<X>.bsm` (or `src/bpp_<X>.bsm`, or any
