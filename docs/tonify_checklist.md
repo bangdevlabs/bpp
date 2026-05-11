@@ -1359,6 +1359,54 @@ following construct (`@base func`, `@gpu func`, `@seq while`);
 
 ---
 
+## Rule 26: Audit existing cartridges before creating a new one
+
+Before writing `stb/stb<X>.bsm` (or `src/bpp_<X>.bsm`, or any
+new module), spend two minutes verifying nothing already covers
+the shape:
+
+```sh
+ls stb/ | grep -i <area>          # name match (entity, pool, ai, …)
+grep -rln "<symbol>\|<concept>" stb/ src/ | head
+```
+
+The check is cheap; the cost of skipping it is real. Two fresh
+examples from the project's own history:
+
+- **stbentity duplicate (2026-05-11).** Wolf3D Phase 2 Session 2
+  shipped a 200-LOC `stb/stbentity.bsm` with `ent_pool_new` /
+  `ent_spawn` / `ent_kill` / `ent_alive` / `ent_count` /
+  `ent_at` — a near-1:1 duplicate of the existing `stb/stbecs.bsm`
+  (`ecs_new` / `ecs_spawn` / etc.). The HANDOFF that recommended
+  the new cartridge was itself stale. Caught only when the user
+  asked "a gente não tem um stbecs?" Deleted, used stbecs with
+  a custom `WolfEntPayload` component instead.
+- **stbpool / stbecs split (pre-existing).** Both ship today,
+  serving different niches (raw recycling vs ID-stable entity
+  storage). The split is justified, but no new "Pool"-named
+  cartridge should be added without first checking whether either
+  already does what's needed.
+
+The two-consumer rule (Rule 20) decides whether to *promote* a
+helper into a cartridge. Rule 26 decides whether the cartridge
+already exists. Rule 26 fires first — if the answer is yes, the
+question of promotion is moot.
+
+**When to skip Rule 26:** never. Even when "I'm sure nothing else
+does this," the audit is two minutes; reading 200 lines back out
+of git is twenty.
+
+**Companion stale-doc check.** A HANDOFF or planning doc
+recommending a "new cartridge X" is itself a hypothesis until
+verified against `ls stb/`. Treat HANDOFFs as decaying — the
+moment they were written, the repo started drifting away from
+them. When a doc says "ship `stb<X>`," verify `stb<X>` doesn't
+exist before opening the editor; if a sibling cartridge is close
+enough, update the HANDOFF too so the next reader doesn't repeat
+the audit.
+
+---
+
 ## File order (leaves first, complex last)
 
 ```

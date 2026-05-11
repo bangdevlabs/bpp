@@ -1602,6 +1602,60 @@ When adding a new lookup site, pick one of three strategies depending on the acc
 
 When unsure, **eager is the safest**. It tolerates missed insertion sites because it rebuilds from the live state every phase. Lazy self-corrects. Only incremental can break silently.
 
+### `load` vs `import` — struct visibility gotcha
+
+`import "foo.bsm"` and `load "foo.bsm"` look interchangeable but
+behave differently for the symbols a module exposes.
+
+- `import` queues the file for the compiler's deduplicating
+  pre-pass. The first import (in topological order) materialises
+  every public symbol into the global namespace; subsequent
+  imports are no-ops. Order is determined by the import graph,
+  not by where the import statement appears in the file.
+
+- `load` is a textual include. The contents are pasted at the
+  load-statement location. Symbols defined inside become visible
+  starting at the line after the `load`, not before.
+
+For `struct` definitions, this distinction matters:
+
+```
+// games/fps/fps_wolf3d.bpp
+import "stbecs.bsm";
+load "ai.bsm";                  // brings struct WolfEntPayload
+                                // into scope from this line on
+
+const WOLF_MAX_ENTITIES = 32;
+extrn wolf_payload;             // typed access below works because
+                                // the struct was loaded above
+
+static void _pack_sprite_buf() {
+    auto p: WolfEntPayload;     // ← struct is visible here
+    ...
+}
+```
+
+If you `load` after the consumer site, the parser fails with
+`unknown type 'WolfEntPayload'`. If you forget to `load` at all
+(and rely on `import` like a stb cartridge), the same error
+fires because game-local `.bsm` modules are not visible to the
+import-graph resolver.
+
+Rule of thumb the project uses:
+
+- **`import`** for `stb/` cartridges and `src/bpp_*` runtime
+  modules. The compiler's import-graph resolver finds them via
+  the configured search paths. Every consumer pays a single
+  copy of the symbols.
+- **`load`** for game-local sibling modules (`games/<g>/foo.bsm`)
+  and tool-local sibling modules (`bang9/foo.bsm`,
+  `tools/<t>/foo_lib.bsm`). They're conceptually part of the
+  game/tool, not infrastructure.
+
+When a `load`ed module defines a struct that the loading file
+needs, **the `load` statement must appear at the top of the
+file**, after `import`s but before any consumer site.
+
 ---
 
 ## Cap 17 — Anti-patterns

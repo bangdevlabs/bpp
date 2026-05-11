@@ -73,17 +73,18 @@ const _ENEMY_CHASE = 1;
 //   stop_dist   =  0.8   cells — close enough to player (no closer)
 //   radius      =  0.3   hitbox half-extent
 
-// Shared scratch buffers for ai_seek / ai_step_collide outputs
-// + the PathFinder + the waypoint output buffer used by the A*
-// fallback. Allocated once at module init, reused across every
-// enemy every frame — zero allocator pressure per tick.
+// Shared scratch state — Vec2 outputs from ai_seek (velocity)
+// and ai_step_collide (next position), plus the PathFinder and
+// the waypoint output buffer used by the A* fallback. All
+// allocated once at module init and reused across every enemy
+// every frame — zero allocator pressure per tick.
 //
 // `_pf_path_buf` capacity = 64 cells, plenty for a 16×16 demo
 // (worst-case diagonal path is ~22 cells); raise alongside any
 // larger map.
 const _PF_PATH_MAX = 64;
-static extrn _ai_vxy;
-static extrn _ai_xy;
+static extrn _ai_vel: Vec2;       // ai_seek output (velocity vec)
+static extrn _ai_pos: Vec2;       // ai_step_collide output (new pos)
 static extrn _pf;
 static extrn _pf_path_buf;
 
@@ -102,12 +103,12 @@ static extrn _pf_path_buf;
 // integration in the project — promote to a sibling cartridge
 // `stbpath_tilemap.bsm` when a second consumer appears.
 void wolf_ai_init(tm, w, h) {
-    // Scratch buffers each hold two B++-native 8-byte doubles —
-    // 16 bytes total. Reads via `peekfloat` at offsets 0 and 8.
-    // Mismatch with stbai's pokefloat writes silently corrupts
-    // the second axis (write_f32+peekfloat was the original bug).
-    _ai_vxy      = malloc(16);
-    _ai_xy       = malloc(16);
+    // Scratch Vec2s for ai_seek + ai_step_collide outputs. The
+    // initial (0, 0) values get overwritten on the first AI tick;
+    // we just need backing storage. `vec2_new` is the canonical
+    // float-typed allocator from `bpp_math.bsm`.
+    _ai_vel      = vec2_new(0.0, 0.0);
+    _ai_pos      = vec2_new(0.0, 0.0);
     _pf          = path_new(w, h);
     // path_find writes (gx, gy) word pairs — 2 words = 16 bytes per
     // waypoint slot. Buffer must be max_steps * 16 bytes per the
@@ -146,14 +147,14 @@ static void _step_toward(ep: WolfEntPayload, tx: float, ty: float,
                          speed: float, radius: float, dt: float,
                          tm) @io {
     auto vx: float, vy: float, nx: float, ny: float;
-    ai_seek(ep.x, ep.y, tx, ty, speed, _ai_vxy);
-    vx = peekfloat(_ai_vxy);
-    vy = peekfloat(_ai_vxy + 8);
+    ai_seek(ep.x, ep.y, tx, ty, speed, _ai_vel);
+    vx = _ai_vel.x;
+    vy = _ai_vel.y;
     ep.vx = vx;
     ep.vy = vy;
-    ai_step_collide(tm, ep.x, ep.y, vx, vy, radius, dt, _ai_xy);
-    nx = peekfloat(_ai_xy);
-    ny = peekfloat(_ai_xy + 8);
+    ai_step_collide(tm, ep.x, ep.y, vx, vy, radius, dt, _ai_pos);
+    nx = _ai_pos.x;
+    ny = _ai_pos.y;
     ep.x = nx;
     ep.y = ny;
 }

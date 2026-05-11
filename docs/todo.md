@@ -277,6 +277,46 @@ game needs it):
 3. Add a regression test that takes `&local_struct`, passes it
    to another function, and reads a field both directions.
 
+### `&struct.field` returns wrong address (compiler bug)
+
+Confirmed 2026-05-11 with this 5-LOC repro:
+
+```bpp
+struct V { a, b, c }
+main() {
+    auto p: V, pa, pc;
+    p = malloc(24);
+    pa = &p.a;
+    pc = &p.c;
+    putstr("&p.a="); putnum(pa);
+    putstr(" &p.c="); putnum(pc);
+    putstr(" diff="); putnum(pc - pa);
+    putline();
+}
+```
+
+Expected: `diff = 16` (a at offset 0, c at offset 16). Actual:
+both `&p.a` and `&p.c` return the struct base pointer
+(`diff = 0`). With float-typed fields the same operator returns
+a non-zero offset that ALSO doesn't match the field's actual
+position — both behaviours are wrong, just differently wrong.
+
+Fix: codegen for `&` on a struct field expression must add the
+field's byte offset (already known via `get_field_offset`) to
+the base pointer, NOT short-circuit to the base or to a
+constant.
+
+Same family as `feedback_sliced_struct_access.md` (raw offset
+arithmetic vs typed access). Caught during the Vec2 promotion
+audit when investigating whether `&_ai_scratch.vel_x` could
+substitute for offset arithmetic in stbai callers — it cannot
+today because of this bug.
+
+Defer until: a real consumer needs `&` on struct fields. Today
+the workaround is "compute the offset by hand" or "use typed
+access (`s.field = ...`) instead of `&s.field`". Both are
+ergonomic enough that the bug doesn't block any active arc.
+
 ### `bug` headless detection
 
 `bug file.bug` (no `--dump`) routes to the GUI viewer. In a
