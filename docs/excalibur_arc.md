@@ -527,7 +527,7 @@ commits: `714f20e` (1.A), `a2d5011` (1.B), `6a3072e` (1.C),
   itself stays in bpp_math.bsm for the rare case where the float
   result is wanted. Suite 152/0/12 + 125/0/39, bootstrap byte-stable.
 
-**Feature 3 — SHIPPED v1 (declarations + zero-cost layout)**:
+**Feature 3 — SHIPPED full spec**:
 - `struct WorldPos as Vec2;` syntax parses. Parser uses a new
   `as` keyword path inside `parse_struct`; the layout (fields,
   hints, byte/bit offsets, size, field count) is COPIED from the
@@ -535,26 +535,23 @@ commits: `714f20e` (1.A), `a2d5011` (1.B), `6a3072e` (1.C),
   layout-walker stays agnostic.
 - `sd_newtype_base[idx]` parallel array tracks the base struct
   index (-1 for normal structs). `is_newtype(idx)` and
-  `newtype_base(idx)` helpers are exposed for downstream
-  consumers.
+  `newtype_base(idx)` helpers exposed.
 - `sizeof(newtype) == sizeof(base)`, dot access through inherited
   offsets, FFI auto-unwrap is automatic since the byte layout is
   identical (no wrapper code needed).
+- **E262 cross-struct assignment rejection** — at validate's
+  T_ASSIGN handler, when both lhs and rhs are typed-struct locals
+  AND their struct identities differ, the diagnostic fires with
+  both struct names + suggestion to write a conversion helper +
+  pointer at Rule 29. Uses `get_var_type_in_fn` (parser-side
+  per-function struct-idx tracker) instead of the global
+  `vt_names` to avoid cross-function name bleed. Bypasses the
+  type-system limitation (TY_STRUCT is still flat) by reaching
+  into the parser's existing struct-aware var registry.
 - `tests/test_newtype.bpp` pins size parity, field-offset
-  matching, cross-type byte-aliasing.
+  matching, same-newtype assignment compiles clean.
 - `tonify_checklist.md` Rule 29 documents when to reach for the
-  pattern (domain typing without runtime cost) and when to keep
-  the bare base.
-
-**Feature 3 — DEFERRED to a follow-up sidequest**: cross-newtype
-assignment rejection at `val_check_assign_compat`. Threading
-struct identity through the type system (today TY_STRUCT is a
-flat code without struct-id preservation) is a substantial type-
-system surgery — the right time to do it is when the first real
-cross-newtype bug surfaces in active code. Until then, the
-declaration alone is high enough value to ship: programmers
-reading the source see the distinction (WorldPos vs GridPos)
-even if the compiler doesn't reject mixing.
+  pattern.
 
 **Feature 4**: deferred until triggers fire
 

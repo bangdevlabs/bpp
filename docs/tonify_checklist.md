@@ -1807,21 +1807,30 @@ byte offsets, and the codegen emits identical instructions to the
 plain-Vec2 version. The identity exists ONLY in the parser's
 struct registry — there is zero runtime cost.
 
-### Limitations (Excalibur Feature 3 v1)
+### Enforcement (E262)
 
-The 2026-05-12 ship covers declarations + zero-cost layout +
-helper APIs (`is_newtype`, `newtype_base`). It does NOT yet ship
-compiler enforcement of cross-newtype mixing — `auto wp:
-WorldPos; auto gp: GridPos; wp = gp;` compiles silently because
-the type-system stores `TY_STRUCT` as a flat code without
-preserving the specific struct id at the validate path.
+The 2026-05-12 ship covers full enforcement: `auto wp: WorldPos;
+auto gp: GridPos; wp = gp;` fires E262 at validate time with both
+struct names + a help line pointing at the conversion-helper
+pattern. Implementation uses the parser's existing
+`get_var_type_in_fn` (per-function struct-idx tracker) instead of
+threading struct identity through the type system — sidesteps the
+TY_STRUCT-is-flat limitation while delivering the rejection where
+it matters (typed-local assignment).
 
-That's the next sidequest: thread struct identity through the
-type system so `val_check_assign_compat` can reject cross-struct
-assignments. Until that lands, newtype is a NAMING convention
-backed by the schema (programmer reading the code sees the
-distinction). Discipline catches what the compiler doesn't yet.
+When the conversion is genuinely intentional (e.g. you have a
+function `world_to_grid(w: WorldPos): GridPos` that performs the
+actual coordinate math), the helper makes the boundary explicit
+and the assignment becomes `gp = world_to_grid(wp)` — no diagnostic
+fires because the LHS receives the function's return value, not
+another struct-typed local.
 
-The first programmer who hits a real cross-newtype bug in active
-code is the trigger for the enforcement sidequest. Until then the
-declaration alone is high enough value to ship.
+### Limitation: parameter passing across struct identities
+
+E262 is currently scoped to T_ASSIGN. Calling `take_world(gp)`
+where `take_world(w: WorldPos)` does NOT yet fire — function
+parameter hints store `TY_STRUCT` flat without struct id, so the
+validator cannot tell which struct the parameter expected. That
+gap closes when the type system grows full struct-identity
+threading. Until then, the assignment-site rejection covers the
+common case where domain-mixing bugs surface.
