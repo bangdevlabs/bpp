@@ -74,8 +74,16 @@ static auto fn_vt_starts;
 static auto var_stack_names;
 static auto var_stack_fns;
 
-// Enum constant registry: 2 parallel dynamic arrays (packed_name, int_value).
-extrn ev_names, ev_values;
+// Enum constant registry: 3 parallel dynamic arrays.
+//   ev_names[eid]    packed (offset, length) ref to the constant name
+//   ev_values[eid]   integer value (or 0 placeholder for float consts)
+//   ev_lit_src[eid]  packed source ref for float consts, or 0 if int
+//
+// `ev_lit_src` is the Excalibur Arc Feature 1 closure (gap B): when a
+// const RHS is a SHAPE_DECIMAL literal, the original source bytes
+// ("0.6", "1e-9", etc.) are captured here so the inline-at-use-site
+// path can rebuild a real float T_LIT instead of casting to int 0.
+extrn ev_names, ev_values, ev_lit_src;
 
 // Const function registry: name, params array, param count, body array, body count.
 static auto cf_names, cf_params, cf_pcnts, cf_bodies, cf_bcnts, cf_count;
@@ -177,6 +185,7 @@ void init_parser() {
     var_stack_fns = arr_new();
     ev_names = arr_new();
     ev_values = arr_new();
+    ev_lit_src = arr_new();
     cf_names = arr_new();
     cf_params = arr_new();
     cf_pcnts = arr_new();
@@ -441,6 +450,20 @@ is_var_stack(var_p, fn_idx) {
 void add_enum_val(name_p, val) {
     ev_names = arr_push(ev_names, name_p);
     ev_values = arr_push(ev_values, val);
+    ev_lit_src = arr_push(ev_lit_src, 0);
+    enum_mods = arr_push(enum_mods, tok_mod(tok_pos));
+}
+
+// Register a const that holds a float literal. The original source
+// bytes (e.g. "0.6", "1e-9") are captured by `lit_src` so a use-site
+// reference can rebuild a real SHAPE_DECIMAL T_LIT and let codegen
+// emit it as a float — preserving the IEEE 754 bits the int path
+// would otherwise truncate. The integer slot is set to 0 so legacy
+// callers that read `ev_values[eid]` directly see a benign sentinel.
+void add_enum_val_float(name_p, lit_src) {
+    ev_names = arr_push(ev_names, name_p);
+    ev_values = arr_push(ev_values, 0);
+    ev_lit_src = arr_push(ev_lit_src, lit_src);
     enum_mods = arr_push(enum_mods, tok_mod(tok_pos));
 }
 
@@ -1349,6 +1372,7 @@ static const_eval_call(node) {
     result = const_eval_body(cbody, cbcnt);
     arr_truncate(ev_names, save);
     arr_truncate(ev_values, save);
+    arr_truncate(ev_lit_src, save);
     arr_truncate(enum_mods, save);
     return result;
 }
@@ -1427,6 +1451,26 @@ static void parse_const() {
     // Const value: const NAME = expr;
     consume();
     expr_node = parse_expr();
+
+    // Float-const fast path (Excalibur Arc Feature 1 gap B). When the
+    // RHS is a single SHAPE_DECIMAL literal, capture the source bytes
+    // and register the const as float. The use-site emit path rebuilds
+    // a real T_LIT with SHAPE_DECIMAL so codegen treats the constant
+    // identically to a hand-written `0.6` at the call site. Without
+    // this, `const_eval_node` truncates "0.6" to integer 0 and every
+    // downstream comparison with the const sees the wrong value.
+    auto _const_lit_node: Node;
+    _const_lit_node = expr_node;
+    if (_const_lit_node != 0) {
+        if (_const_lit_node.ntype == T_LIT) {
+            if (lit_shape(_const_lit_node) == SHAPE_DECIMAL) {
+                add_enum_val_float(name_p, _const_lit_node.a);
+                if (val_is_ch(';')) { consume(); }
+                return;
+            }
+        }
+    }
+
     val = const_eval_node(expr_node);
     enum_register(name_p, val);
     if (val_is_ch(';')) { consume(); }
@@ -2810,9 +2854,23 @@ static parse_primary() {
             }
             return node;
         }
-        // Enum/const: inline as integer literal if found.
+        // Enum/const: inline as integer literal if found. Float-shaped
+        // consts (Excalibur Arc Feature 1 gap B) carry a non-zero
+        // `ev_lit_src` slot pointing at the original "0.6" / "1e-9"
+        // source bytes — rebuild a SHAPE_DECIMAL T_LIT so codegen
+        // emits the float through its existing literal path instead
+        // of calling `make_int_lit(0)` which silently dropped the
+        // fractional bits.
         ev_idx = find_enum_idx(name_p);
         if (ev_idx >= 0) {
+            auto _ev_float_src;
+            _ev_float_src = arr_get(ev_lit_src, ev_idx);
+            if (_ev_float_src != 0) {
+                node = make_node(T_LIT);
+                node.a = _ev_float_src;
+                node.b = SHAPE_DECIMAL;
+                return node;
+            }
             return make_int_lit(arr_get(ev_values, ev_idx));
         }
         node = make_node(T_VAR);
