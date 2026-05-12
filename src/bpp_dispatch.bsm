@@ -136,6 +136,19 @@ static auto glob_promote_reason;
 // Any extern not in this table is assumed to have side effects.
 static auto pure_ext;
 
+// `@safe`-suggestion sinks (Task 4 of phase annotation collapse arc).
+// Builtins whose fn_ptr argument MUST be annotated `@safe` for the
+// compiler to verify the safety contract. When `_cgb_walk` sees a
+// T_CALL to one of these names with a `fn_ptr(target)` literal in
+// the args, it looks up `fn_phase_hint[target]` and emits W031 if
+// the target is not `@safe`. Killer use cases (per Rule 28 audit):
+// `maestro_register_base` (worker thread entry — race latent if not
+// safe) and `job_submit` (worker task — same risk class). Other
+// register_* functions are bounded but main-thread, so they don't
+// carry the same race surface; expand this list when a real bug
+// surfaces.
+static auto _safe_sinks;
+
 // Extern effect table for Level 4 sub-step B. Parallel arrays mapping
 // each known builtin name to a finer-grained effect code (PHASE_BASE,
 // PHASE_IO, PHASE_GPU, PHASE_REALTIME, or PHASE_SOLO). The plain
@@ -209,8 +222,18 @@ void init_dispatch() {
     pure_ext = arr_new();
     ext_names = arr_new();
     ext_effects = arr_new();
+    _safe_sinks = arr_new();
     stride_vars = arr_new();
     dsp_local_vars = arr_new();
+
+    // Seed the `@safe`-suggestion sinks. Each name registered here
+    // turns into a W031 warning whenever the compiler sees a
+    // `fn_ptr(target)` argument and `target` is not annotated `@safe`.
+    // Initial set covers the worker-thread entry points where a
+    // missing `@safe` is a latent race or audible glitch waiting to
+    // happen. See Task 4 in `docs/todo.md` for the Rule 28 audit.
+    _safe_sinks = arr_push(_safe_sinks, _dsp_pack_cstr("maestro_register_base"));
+    _safe_sinks = arr_push(_safe_sinks, _dsp_pack_cstr("job_submit"));
 
     // Seed the pure-extern set with builtins the compiler emits inline
     // and that have no observable side effect. Without this seed the
@@ -299,6 +322,21 @@ dsp_find_global(name_p) {
 // library code that wraps FFI calls it has audited as side-effect-free.
 void add_pure_extern(name_p) {
     pure_ext = arr_push(pure_ext, name_p);
+}
+
+// Return 1 if `name_p` is registered as a `@safe`-suggestion sink
+// (e.g. `maestro_register_base`, `job_submit`). Used by `_cgb_walk`
+// to decide whether to scan the call's arguments for fn_ptr literals
+// whose target should be `@safe`. Content comparison (packed_eq)
+// handles the same-identifier-different-vbuf-offset case.
+_is_safe_sink(name_p) {
+    auto i, v;
+    for (i = 0; i < arr_len(_safe_sinks); i++) {
+        v = arr_get(_safe_sinks, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
+    }
+    return 0;
 }
 
 // Return 1 if a packed name matches any registered pure extern, 0
@@ -1211,6 +1249,55 @@ static _cgb_walk(nd) {
                     _resolved = _cgb_resolve_call_target(arr[0]);
                     if (_resolved >= 0) { n.e = _resolved + 1; }
                 }
+            }
+        }
+        // W031 — `@safe`-suggestion. When the call target is a
+        // registration sink (maestro_register_base, job_submit), scan
+        // the args for `fn_ptr(target)` literals and check that
+        // `target` is annotated `@safe`. The annotation is the only
+        // way the compiler can verify the bounded-time / no-malloc
+        // contract; without it, a worker thread or audio path that
+        // grows a malloc later goes undetected until it manifests as
+        // a race or audible glitch under load.
+        if (_is_safe_sink(name_p)) {
+            auto _ws_i, _ws_arg: Node, _ws_fp: Node, _ws_fp_name;
+            auto _ws_target: Node, _ws_target_idx;
+            for (_ws_i = 0; _ws_i < cnt; _ws_i++) {
+                _ws_arg = arr[_ws_i];
+                if (_ws_arg == 0) { continue; }
+                if (_ws_arg.ntype != T_CALL) { continue; }
+                _ws_fp_name = _ws_arg.a;
+                if (unpack_l(_ws_fp_name) != 6) { continue; }
+                if (buf_eq(vbuf + unpack_s(_ws_fp_name), "fn_ptr", 6) == 0) {
+                    continue;
+                }
+                if (_ws_arg.c != 1) { continue; }
+                _ws_fp = _ws_arg.b;
+                _ws_target = _ws_fp[0];
+                if (_ws_target == 0) { continue; }
+                if (_ws_target.ntype != T_VAR) { continue; }
+                _ws_target_idx = _dsp_find_func_idx(_ws_target.a);
+                if (_ws_target_idx < 0) { continue; }
+                if (arr_get(fn_phase_hint, _ws_target_idx) == PHASE_SAFE) {
+                    continue;
+                }
+                diag_warn(31);
+                diag_str("'");
+                diag_packed(_ws_target.a);
+                diag_str("' registered via '");
+                diag_packed(name_p);
+                diag_str("' without '@safe' annotation");
+                diag_newline();
+                diag_loc(*(funcs[_ws_target_idx] + FN_SRC_TOK));
+                diag_show_line(*(funcs[_ws_target_idx] + FN_SRC_TOK));
+                diag_str("  = note: worker callbacks must be bounded-time / no-malloc / no-IO");
+                diag_newline();
+                diag_str("          @safe is the contract the compiler verifies (W026)");
+                diag_newline();
+                diag_str("  = help: annotate the function `(...)@safe { ... }`");
+                diag_newline();
+                diag_str("  = see:  docs/tonify_checklist.md Rule 4");
+                diag_newline();
             }
         }
         // Direct call to a user function: record edge.
