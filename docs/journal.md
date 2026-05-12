@@ -8924,14 +8924,7 @@ without keeping legacy keywords alive.
 
 ### What remains open
 
-`docs/todo.md` "Positive @safe suggestion engine" — a Rule 28-
-audited followup that would emit a warning when `fn_ptr(name)`
-flows into a callback-registration builtin (maestro / audio /
-job_register) without `name` being `@safe`. Closes the
-discipline-as-tooling gap: today the annotation is "the
-discipline you have to remember"; the suggestion engine turns it
-into "the compiler nudges you when it makes sense". ~1-2h of
-work, deferred to a focused session.
+(Updated below — Task 4 shipped same-day.)
 
 ### Verification snapshot
 
@@ -8956,3 +8949,30 @@ have BECOME the next iteration of the over-engineering trap if
 the close-out paperwork had been skipped — half-shipped
 sidequests with stale docs ARE the same Multics drift, just at
 a different layer.
+
+## 2026-05-11 (later still) — Task 4 shipped: W031 positive @safe suggestion
+
+The Rule 28-audited followup landed same-day (commit `4f95703`).
+W031 fires when `fn_ptr(target)` flows into `maestro_register_base`
+or `job_submit` without `target@safe`. Diagnostic points at the
+target signature with 3 help lines + `see: Rule 4` anchor — same
+pattern as E260 from the earlier cleanup, so future agents grepping
+for either find spec + Why + how-to-fix in one chain.
+
+Pipeline validated by annotating `particle_base_job` in
+`games/snake/particles.bsm`: W031 silenced (suggestion respected),
+W026 stayed silent (contract genuinely satisfied), suite green
+(runtime path executes). The W031→annotate→W026-silent loop is the
+canonical "use the compiler to fix the code" cycle Rule 28 wants.
+
+Five other production sites surfaced by W031 kept un-annotated as
+nudges for the next-touch agent. Restraint-bias: the diagnostic
+suggests, the programmer decides, the compiler enforces once the
+decision lands.
+
+**Arc fully closed.** 8 commits total: `842212f`, `60b1d8b`,
+`66e6da1`, `a17eff9`, `7e528d4`, `e1b16a1`, `5a04906`, `4f95703`.
+Bootstrap byte-stable in every one. Final suite 149/0/12 native +
+122/0/39 C. Memory file
+`project_session_20260511_phase_collapse.md` captures the pattern
+as transferrable lesson.

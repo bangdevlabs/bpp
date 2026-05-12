@@ -268,7 +268,20 @@ faster (no codegen conflict with literal shape work).
 the Multics-vs-Unix framing. Honors `feedback_cartridge_minimalism.md`
 spirit ("ship floor only, complexity is opt-in").
 
-### Positive `@safe` suggestion engine — Rule 28-audited followup
+### Positive `@safe` suggestion engine — CLOSED 2026-05-11 (commit 4f95703)
+
+**SHIPPED** end-to-end same-day as the open. W031 fires when
+`fn_ptr(target)` flows into `maestro_register_base` or `job_submit`
+without `target@safe`. Diagnostic points at target signature with
+3 help lines + `see: docs/tonify_checklist.md Rule 4` anchor.
+Pipeline validated by annotating `particle_base_job` in
+`games/snake/particles.bsm` — W031 silenced, W026 stayed silent
+(contract genuinely satisfied). 5 other production sites surfaced
+by W031, kept un-annotated as nudges for the next-touch agent
+(restraint-bias per Rule 28). Suite 149/0/12 + 122/0/39, bootstrap
+byte-stable. Briefing kept below for historical reference.
+
+---
 
 **Opened 2026-05-11** as the Task 4 followup to the Phase annotation
 collapse arc.
