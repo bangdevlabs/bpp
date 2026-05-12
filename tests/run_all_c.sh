@@ -61,7 +61,10 @@ RUN_BUDGET=5
 #                                            _stb_platform_macos.bsm which
 #                                            references objc_msgSend
 CC_FLAGS="-w -Wno-error=implicit-function-declaration"
-LD_FLAGS="-lobjc"
+# -lm pulled in for the Excalibur Feature 2 cast builtins (floor /
+# nearbyint). macOS links libm automatically via libSystem; Linux
+# requires the explicit flag, so we always pass it for parity.
+LD_FLAGS="-lobjc -lm"
 
 if [ ! -x "$BPP" ]; then
     echo "FATAL: $BPP not found or not executable. Run install.sh first."

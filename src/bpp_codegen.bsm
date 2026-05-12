@@ -283,6 +283,8 @@ struct ChipPrimitives {
     emit_push_acc,      // () — push accumulator onto stack
     emit_pop_scratch,   // () — pop stack top into scratch reg (x1/rcx)
     emit_coerce_float_to_int, // () — truncate float accumulator to int
+    emit_floor_to_int,        // () — floor float (round to -inf), then cast to int
+    emit_round_to_int,        // () — round float to nearest even, then cast to int
     emit_mem_barrier,   // () — full memory barrier + zero acc
     emit_shift_right_logical, // () — acc >>= scratch (unsigned)
     emit_load_float_ret, // (slot) — load float return save slot (0 or 1)
@@ -1351,6 +1353,43 @@ cg_builtin_dispatch(n) {
         ety = call(p.emit_node, *(arr + 0));
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_mem_read, 1);
+        return 1;
+    }
+
+    // Excalibur Feature 2 — explicit float→int conversion builtins.
+    // Each evaluates its arg as float, then lowers to a chip-specific
+    // rounding+cast pair. Returning ety=0 (int) so the caller treats
+    // the result as a normal integer accumulator value. The dispatch
+    // returns ety+1 (so r=1 for ety=0) per cg_emit_call's contract.
+    //
+    // floor_int(x: float) — round toward minus infinity, then cast.
+    // ARM: FRINTM + FCVTZS. x86: ROUNDSD imm=01 + CVTTSD2SI.
+    if (cg_str_eq(n.a, "floor_int", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 0) { call(p.emit_coerce_int_to_float); }
+        call(p.emit_floor_to_int);
+        return 1;
+    }
+    // trunc_int(x: float) — truncate toward zero, then cast. Reuses
+    // the existing emit_coerce_float_to_int primitive (FCVTZS / CVTTSD2SI
+    // are already round-toward-zero), but the named builtin makes the
+    // intent explicit at the call site instead of leaking it through
+    // an implicit cast.
+    if (cg_str_eq(n.a, "trunc_int", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 0) { call(p.emit_coerce_int_to_float); }
+        call(p.emit_coerce_float_to_int);
+        return 1;
+    }
+    // round_int(x: float) — round to nearest, ties to even, then cast.
+    // ARM: FRINTN + FCVTZS. x86: CVTSD2SI (uses MXCSR, default = nearest).
+    if (cg_str_eq(n.a, "round_int", 9)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));
+        if (ety == 0) { call(p.emit_coerce_int_to_float); }
+        call(p.emit_round_to_int);
         return 1;
     }
 

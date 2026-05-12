@@ -464,16 +464,18 @@ Numbering will adjust based on what rules exist at the time
 
 **Arc opened**: 2026-05-11
 
-**Current state**: Feature 1 SHIPPED 2026-05-11 (Sessions 1.A
-+ 1.B + 1.C all closed same day). Eligible for the Wolf3D
-pause-point or for moving directly to Feature 2.
+**Current state**: Feature 1 + Feature 2 SHIPPED 2026-05-12.
+Feature 1 closed in two passes: Sessions 1.A/1.B/1.C on
+2026-05-11 covering literal shape + call-site widening, then
+gaps A (E261 typed-local lossy assign) + B (`const NAME = 0.6`
+preserves float bits via `ev_lit_src`) on 2026-05-12. Feature 2
+shipped same-day as gap closure: floor_int / trunc_int /
+round_int with chip lowering on ARM64 + x86_64 + C emitter, plus
+migration of 18 floor_f sites across stb/games/tools.
 
-**Next session**: pick from
-- `Feature 2.A — Cast builtins` (~50 LOC, single session,
-  immediate ROI: replaces typed-local thunks across stbai,
-  stbpath, stbdraw float→int casts), or
-- Wolf3D Phase 2 Session 3 (Combat) — language work paused
-  per the arc's pause/resume convention.
+**Next session**: Feature 3 (Struct newtype). Three sessions —
+3.A parser + AST, 3.B type identity + dispatch + FFI rule, 3.C
+zero-cost validation + docs.
 
 **Feature 1 — SHIPPED**:
 - Session 1.A — SHIPPED 2026-05-11. T_LIT nodes carry
@@ -496,10 +498,28 @@ pause-point or for moving directly to Feature 2.
   for the call-site widening 1.B closed.
 
 **Feature 1 final tally**: ~50 LOC parser annotations + ~70
-LOC validate promotion + tests + ~120 LOC docs across the
-three sessions. Suite 145/0/12 → 147/0/12 (+2 tests).
-Bootstrap byte-stable at every commit.
-**Feature 2**: not started
+LOC validate promotion + ~40 LOC const-float storage + E261
+detection + tests + ~120 LOC docs. Suite 145/0/12 → 151/0/12
+(+4 tests). Bootstrap byte-stable at every commit. Closing
+commits: `714f20e` (1.A), `a2d5011` (1.B), `6a3072e` (1.C),
+`4054a04` (gaps A + B).
+
+**Feature 2 — SHIPPED**:
+- ARM64: enc_frintm + enc_frintn encoders, _a64_emit_floor_to_int
+  + _a64_emit_round_to_int primitives.
+- x86_64: x64_enc_cvtsd2si + x64_enc_roundsd encoders (SSE4.1),
+  _x64_emit_floor_to_int + _x64_emit_round_to_int primitives.
+- ChipPrimitives gains emit_floor_to_int + emit_round_to_int slots.
+- cg_builtin_dispatch handles "floor_int" / "trunc_int" / "round_int".
+- bpp_validate.bsm `val_is_builtin` accepts the 3 names; bpp_dispatch
+  registers them as pure_extern (safe to call from `@safe` contexts).
+- C emitter lowers via <math.h>: floor() / cast / nearbyint(). LD_FLAGS
+  in run_all_c.sh gains -lm.
+- Migration: 18 floor_f sites across stbai/stbphys/stbraycast/stbdraw/
+  games_fps_ai/fxlab_lib swept to direct floor_int calls. floor_f
+  itself stays in bpp_math.bsm for the rare case where the float
+  result is wanted. Suite 152/0/12 + 125/0/39, bootstrap byte-stable.
+
 **Feature 3**: not started
 **Feature 4**: deferred until triggers fire
 
