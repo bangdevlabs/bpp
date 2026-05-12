@@ -44,6 +44,18 @@ global fn_void;     // parallel to funcs[]: 1 if void (no useful return)
 // sd_byte_offs[i][j] = byte offset of field j in struct i (precomputed by add_struct_field).
 // sd_bit_offs[i][j]  = bit offset within that byte for bit-packed fields; 0 for byte+ fields.
 extrn sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
+
+// Excalibur Feature 3 — struct newtype registry. `sd_newtype_base[i]`
+// stores the base struct index (>= 0) when struct i was declared as
+// `struct WorldPos as Vec2;`, or -1 when struct i is a normal struct
+// with its own field list. The byte layout (sd_fields, sd_fhints,
+// sd_byte_offs, sd_bit_offs, sd_sizes, sd_fcounts) is COPIED from the
+// base at declaration time so every existing layout-walker stays
+// agnostic — a newtype is byte-identical to its base, which is the
+// "zero cost" property the type checker leans on. Identity lives in
+// `sd_names[i]` (distinct packed name) plus this slot (non-negative
+// flags newtype-ness for the type-system's cross-newtype check).
+extrn sd_newtype_base;
 extrn sd_byte_offs, sd_bit_offs;
 
 // Struct lookup acceleration. _parser_struct_hash maps a struct
@@ -172,6 +184,7 @@ void init_parser() {
     enum_mods = arr_new();
     extern_mods = arr_new();
     sd_names = arr_new();
+    sd_newtype_base = arr_new();
     sd_fields = arr_new();
     sd_fcounts = arr_new();
     sd_sizes = arr_new();
@@ -221,6 +234,7 @@ void register_struct_hash(name_p, idx) {
 add_struct_def(name_p) {
     auto idx;
     sd_names = arr_push(sd_names, name_p);
+    sd_newtype_base = arr_push(sd_newtype_base, 0 - 1);
     sd_fields = arr_push(sd_fields, buf_word(64));
     sd_fcounts = arr_push(sd_fcounts, 0);
     sd_sizes = arr_push(sd_sizes, 0);
@@ -232,6 +246,38 @@ add_struct_def(name_p) {
     idx = arr_len(sd_names) - 1;
     register_struct_hash(name_p, idx);
     return idx;
+}
+
+// Excalibur Feature 3 — copy `base_idx`'s layout into struct `idx`
+// so a newtype shares byte-exact storage with its base. Called from
+// `parse_struct` after `struct WorldPos as Vec2;` syntax landed.
+// The layout-walking code never has to ask "is this a newtype?" —
+// every consumer that reads sd_fields / sd_fhints / sd_byte_offs /
+// sd_bit_offs / sd_sizes / sd_fcounts sees the base's actual values.
+// Type identity (the new-name + newtype_base flag) lives separately
+// for the type checker.
+void _copy_struct_layout(idx, base_idx) {
+    auto i, fc;
+    auto src_fields, src_fhints, src_bytes, src_bits;
+    auto dst_fields, dst_fhints, dst_bytes, dst_bits;
+    fc = arr_get(sd_fcounts, base_idx);
+    src_fields = arr_get(sd_fields, base_idx);
+    src_fhints = arr_get(sd_fhints, base_idx);
+    src_bytes  = arr_get(sd_byte_offs, base_idx);
+    src_bits   = arr_get(sd_bit_offs, base_idx);
+    dst_fields = arr_get(sd_fields, idx);
+    dst_fhints = arr_get(sd_fhints, idx);
+    dst_bytes  = arr_get(sd_byte_offs, idx);
+    dst_bits   = arr_get(sd_bit_offs, idx);
+    for (i = 0; i < fc; i++) {
+        dst_fields[i] = src_fields[i];
+        dst_fhints[i] = src_fhints[i];
+        dst_bytes[i]  = src_bytes[i];
+        dst_bits[i]   = src_bits[i];
+    }
+    arr_set(sd_fcounts, idx, fc);
+    arr_set(sd_sizes, idx, arr_get(sd_sizes, base_idx));
+    arr_set(sd_newtype_base, idx, base_idx);
 }
 
 // Return the byte cost of a field given its type hint.
@@ -384,6 +430,24 @@ get_struct_size(idx) {
 void set_var_type(var_p, idx) {
     vt_names = arr_push(vt_names, var_p);
     vt_sidx = arr_push(vt_sidx, idx);
+}
+
+// Excalibur Feature 3 — return 1 if struct `idx` was declared as
+// `struct X as Base;`, 0 if it is a normal struct. Out-of-range
+// indices return 0 so callers can ask without bounds-checking.
+is_newtype(idx) {
+    if (idx < 0) { return 0; }
+    if (idx >= arr_len(sd_newtype_base)) { return 0; }
+    if (arr_get(sd_newtype_base, idx) >= 0) { return 1; }
+    return 0;
+}
+
+// Excalibur Feature 3 — return the base struct index for newtype
+// `idx`, or -1 if `idx` is a normal struct (or out of range).
+newtype_base(idx) {
+    if (idx < 0) { return 0 - 1; }
+    if (idx >= arr_len(sd_newtype_base)) { return 0 - 1; }
+    return arr_get(sd_newtype_base, idx);
 }
 
 // Look up a variable's struct type. Returns struct index or -1.
@@ -1219,6 +1283,34 @@ static void parse_struct() {
     consume();
     name_p = cur_packed();
     consume();
+
+    // Excalibur Feature 3 — newtype declaration
+    // (`struct WorldPos as Vec2;`). Detect the `as` keyword instead
+    // of `{` and route to the layout-copy path. The new name lands as
+    // its own entry in the struct registry — distinct identity for
+    // the type checker — but borrows the base's byte layout so every
+    // existing field-access site keeps working without ceremony.
+    if (val_is("as", 2)) {
+        auto _nt_idx, _nt_base_p, _nt_base_idx;
+        consume();
+        _nt_base_p = cur_packed();
+        consume();
+        _nt_base_idx = find_struct(_nt_base_p);
+        if (_nt_base_idx < 0) {
+            diag_error(101);
+            diag_str("newtype base '");
+            diag_packed(_nt_base_p);
+            diag_str("' is not a defined struct");
+            diag_newline();
+            diag_loc(tok_pos);
+            return;
+        }
+        _nt_idx = struct_register(name_p);
+        _copy_struct_layout(_nt_idx, _nt_base_idx);
+        if (val_is_ch(';')) { consume(); }
+        return;
+    }
+
     consume();
     // Dogfood migration (A.1): use the named struct_* API from
     // bpp_internal.bsm instead of calling add_struct_def directly.

@@ -464,18 +464,25 @@ Numbering will adjust based on what rules exist at the time
 
 **Arc opened**: 2026-05-11
 
-**Current state**: Feature 1 + Feature 2 SHIPPED 2026-05-12.
+**Current state**: Features 1 + 2 + 3 SHIPPED 2026-05-12 (Feature
+3 v1 — declarations + zero-cost layout; cross-newtype enforcement
+deferred to a follow-up sidequest). Excalibur arc closed for now;
+RTS Stress Arc (`docs/rts_stress_arc.md`) is the next thread.
 Feature 1 closed in two passes: Sessions 1.A/1.B/1.C on
 2026-05-11 covering literal shape + call-site widening, then
 gaps A (E261 typed-local lossy assign) + B (`const NAME = 0.6`
 preserves float bits via `ev_lit_src`) on 2026-05-12. Feature 2
 shipped same-day as gap closure: floor_int / trunc_int /
 round_int with chip lowering on ARM64 + x86_64 + C emitter, plus
-migration of 18 floor_f sites across stb/games/tools.
+migration of 18 floor_f sites across stb/games/tools. Feature 3
+shipped v1 same-day: declarations parse, layout copies from base
+(zero-cost), helper API exposed; cross-newtype enforcement
+deferred to a follow-up sidequest.
 
-**Next session**: Feature 3 (Struct newtype). Three sessions —
-3.A parser + AST, 3.B type identity + dispatch + FFI rule, 3.C
-zero-cost validation + docs.
+**Next thread**: RTS Stress Arc (`docs/rts_stress_arc.md`).
+Per the user directive, Phase 4 (templates) stays deferred — the
+RTS arc moves engine-side first, templates re-evaluated when /if
+specific consumers raise the trigger.
 
 **Feature 1 — SHIPPED**:
 - Session 1.A — SHIPPED 2026-05-11. T_LIT nodes carry
@@ -520,7 +527,35 @@ commits: `714f20e` (1.A), `a2d5011` (1.B), `6a3072e` (1.C),
   itself stays in bpp_math.bsm for the rare case where the float
   result is wanted. Suite 152/0/12 + 125/0/39, bootstrap byte-stable.
 
-**Feature 3**: not started
+**Feature 3 — SHIPPED v1 (declarations + zero-cost layout)**:
+- `struct WorldPos as Vec2;` syntax parses. Parser uses a new
+  `as` keyword path inside `parse_struct`; the layout (fields,
+  hints, byte/bit offsets, size, field count) is COPIED from the
+  base into the newtype's struct registry entry so every existing
+  layout-walker stays agnostic.
+- `sd_newtype_base[idx]` parallel array tracks the base struct
+  index (-1 for normal structs). `is_newtype(idx)` and
+  `newtype_base(idx)` helpers are exposed for downstream
+  consumers.
+- `sizeof(newtype) == sizeof(base)`, dot access through inherited
+  offsets, FFI auto-unwrap is automatic since the byte layout is
+  identical (no wrapper code needed).
+- `tests/test_newtype.bpp` pins size parity, field-offset
+  matching, cross-type byte-aliasing.
+- `tonify_checklist.md` Rule 29 documents when to reach for the
+  pattern (domain typing without runtime cost) and when to keep
+  the bare base.
+
+**Feature 3 — DEFERRED to a follow-up sidequest**: cross-newtype
+assignment rejection at `val_check_assign_compat`. Threading
+struct identity through the type system (today TY_STRUCT is a
+flat code without struct-id preservation) is a substantial type-
+system surgery — the right time to do it is when the first real
+cross-newtype bug surfaces in active code. Until then, the
+declaration alone is high enough value to ship: programmers
+reading the source see the distinction (WorldPos vs GridPos)
+even if the compiler doesn't reject mixing.
+
 **Feature 4**: deferred until triggers fire
 
 **Pause history**: (will fill as Wolf3D sessions interleave)

@@ -1742,3 +1742,86 @@ adding more.
 The rule does not say "never add features." It says "demand
 specific bug-class evidence per addition, and prefer the smaller
 tool when the bug can be caught without expanding the system."
+
+## Rule 29: `struct X as Base` — domain typing without runtime cost
+
+Discovered 2026-05-12 alongside Excalibur Feature 3 shipping. The
+rule is when to reach for `struct WorldPos as Vec2;` and when to
+keep using the base struct directly.
+
+### When to declare a newtype
+
+Use `struct X as Base;` when two values share the same byte layout
+but represent DIFFERENT DOMAINS, and mixing them up has caused (or
+would cause) a real bug:
+
+| Domain pair                 | Newtype instead of bare base                    |
+|-----------------------------|-------------------------------------------------|
+| World coordinates / grid coords  | `struct WorldPos as Vec2; struct GridPos as Vec2;` |
+| Damage points / health points    | `struct Damage as float; struct Health as float;` |
+| Screen pixels / world pixels     | `struct ScreenPx as Vec2; struct WorldPx as Vec2;` |
+| Input event ID / output channel ID | `struct InputId as word; struct ChannelId as word;` |
+
+The rule is the same as Rule 28: name a specific bug class.
+"Programmer passed grid coords to a world-coords function" is a
+bug class with concrete examples (Wolf3D Phase 2 enemy AI sees
+fractional grid positions, draw code interprets world coords as
+grid). Newtype declares the distinction at the schema level so
+the future programmer cannot mix them by accident.
+
+### When NOT to declare a newtype
+
+- The base type is already domain-specific (e.g. there is only one
+  flavor of "score" — just use `: word`).
+- The conversion is dynamic and unpredictable (e.g. `: word`
+  parameters to syscalls — over-typing makes the FFI surface
+  noisier without catching anything real).
+- You are tempted to declare it "for documentation" rather than
+  for real disambiguation. Documentation lives in comments.
+
+### Mechanics
+
+```bpp
+struct Vec2 {
+    x: float,
+    y: float
+}
+
+// Newtype declaration. Layout is COPIED from Vec2, so a
+// WorldPos value is byte-identical to a Vec2 value.
+struct WorldPos as Vec2;
+struct GridPos  as Vec2;
+
+main() {
+    auto wp: WorldPos;
+    wp = malloc(sizeof(WorldPos));    // sizeof(WorldPos) == sizeof(Vec2)
+    wp.x = 1.5;                       // dot access works through inherited layout
+    wp.y = 2.5;
+    free(wp);
+    return 0;
+}
+```
+
+`sizeof(WorldPos) == sizeof(Vec2)`, dot access reaches the same
+byte offsets, and the codegen emits identical instructions to the
+plain-Vec2 version. The identity exists ONLY in the parser's
+struct registry — there is zero runtime cost.
+
+### Limitations (Excalibur Feature 3 v1)
+
+The 2026-05-12 ship covers declarations + zero-cost layout +
+helper APIs (`is_newtype`, `newtype_base`). It does NOT yet ship
+compiler enforcement of cross-newtype mixing — `auto wp:
+WorldPos; auto gp: GridPos; wp = gp;` compiles silently because
+the type-system stores `TY_STRUCT` as a flat code without
+preserving the specific struct id at the validate path.
+
+That's the next sidequest: thread struct identity through the
+type system so `val_check_assign_compat` can reject cross-struct
+assignments. Until that lands, newtype is a NAMING convention
+backed by the schema (programmer reading the code sees the
+distinction). Discipline catches what the compiler doesn't yet.
+
+The first programmer who hits a real cross-newtype bug in active
+code is the trigger for the enforcement sidequest. Until then the
+declaration alone is high enough value to ship.
