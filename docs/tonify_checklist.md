@@ -487,6 +487,17 @@ expectations to every caller.
 | `pos_set(x, y)` where both are word | Keep as-is — word is the default |
 | `set_color(r, g, b, a)` where all are float | Add: `set_color(r: float, g: float, b: float, a: float)` |
 | `set_pixel(x: byte, y: byte, c: byte)` already follows the rule | No change |
+| `sound_load_wav(path)` where `path` is a C-string pointer | Add: `sound_load_wav(path: ptr)` |
+| `image_load(path)` where `path` is a string pointer | Add: `image_load(path: ptr)` |
+
+**The `: ptr` annotation (shipped 2026-05-12).** Same shape as
+`: float` / `: word` / `: byte` — declares the parameter is a pointer.
+The motivating bug: `put_err(path)` inside an unannotated-param body
+silently dispatches to `putnum_err` (TY_WORD default) and prints the
+pointer as a decimal integer instead of dereferencing the string.
+Annotating the parameter `: ptr` routes the smart dispatch through
+`putstr_err` and the path prints correctly. See `docs/journal.md`
+2026-05-12 for the codebase-wide sweep that introduced this pattern.
 
 **Why.** API is contract. Without explicit hints on public parameters,
 two callers using the same function disagree about its type intent.
@@ -507,6 +518,16 @@ W025 itself; fixing page_count unblocked the nudge. The first
 violation it caught was `_stb_init_window(w, h, title)` using
 `w * 3.0` / `h * 3.0` inside a Cocoa CGRect setup — annotated to
 `w: word, h: word` since pixel counts are integers at the call site.
+
+**W032 (shipped 2026-05-12):** the compiler nudge for the
+ambiguous `put` / `put_err` call. Fires when smart dispatch picks
+`putnum` / `putnum_err` because the argument is a TY_WORD variable
+(parameter default OR untyped local) — but the call might have
+been intended as a string print whose pointer is being formatted as
+a decimal integer. The fix is either `param: ptr` on the declaration
+(smart dispatch then routes to `putstr` / `putstr_err`) or calling
+`putnum` / `putnum_err` directly to acknowledge the integer intent.
+Literals like `put(42)` never warn — they are obviously intentional.
 
 ## Rule 14: Increment and compound assignment operators
 

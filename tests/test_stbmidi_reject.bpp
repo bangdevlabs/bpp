@@ -1,0 +1,115 @@
+// skip-c: relies on stbmixer (audio pipeline) which the C transpile path does not implement.
+import "stbmidi.bsm";
+
+// test_stbmidi_reject.bpp — Pin the parser's malformed-header
+// rejection paths.
+//
+// Three rejection cases the plan committed to:
+//   1. Format 2 — multiple independent sequences. Returns 0 with a
+//      `stbmidi: ... Format 2 not supported` diagnostic.
+//   2. SMPTE division — header word with the high bit set encodes
+//      fps + ticks-per-frame. Music MIDIs never use this; we reject
+//      with a clear diagnostic.
+//   3. Missing MThd magic — anything that does not start with the
+//      4-byte SMF header magic is rejected.
+//
+// The diagnostic text itself is not asserted (test would brittle on
+// wording tweaks); we just confirm load returns 0 in each case.
+
+static void _put_byte(out_buf, ofs_buf, b) {
+    poke(out_buf + ofs_buf[0], b);
+    ofs_buf[0]++;
+}
+static void _put_be32(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 16777216) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 65536) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+static void _put_be16(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+
+// Build a header-only SMF with the given format / tracks / division.
+// Useful for exercising rejection paths — we never reach the track
+// parse, so an empty body is fine.
+static _build_header_only(out_buf, format, n_tracks, division) {
+    auto ofs_buf, total;
+    ofs_buf = buf_word(1);
+    ofs_buf[0] = 0;
+    _put_byte(out_buf, ofs_buf, 0x4D); // 'M'
+    _put_byte(out_buf, ofs_buf, 0x54); // 'T'
+    _put_byte(out_buf, ofs_buf, 0x68); // 'h'
+    _put_byte(out_buf, ofs_buf, 0x64); // 'd'
+    _put_be32(out_buf, ofs_buf, 6);
+    _put_be16(out_buf, ofs_buf, format);
+    _put_be16(out_buf, ofs_buf, n_tracks);
+    _put_be16(out_buf, ofs_buf, division);
+    total = ofs_buf[0];
+    free(ofs_buf);
+    return total;
+}
+
+main() {
+    auto buf, n, fails;
+    auto file_fmt2, file_smpte, file_bad_magic;
+
+    fails = 0;
+    buf = malloc(64);
+
+    // ── Case 1: Format 2 should be rejected.
+    n = _build_header_only(buf, 2, 1, 480);
+    if (file_write_all("/tmp/stbmidi_fmt2.mid", buf, n) != 0) {
+        put("FAIL: write fmt2 file\n"); free(buf); return 1;
+    }
+    file_fmt2 = midi_file_load("/tmp/stbmidi_fmt2.mid");
+    if (file_fmt2 != 0) {
+        put("FAIL: Format 2 should have been rejected (got non-NULL)\n");
+        midi_file_free(file_fmt2);
+        fails++;
+    }
+
+    // ── Case 2: SMPTE division (sign bit set) should be rejected.
+    // 0x8001 reads as a negative tick count under the SMF spec.
+    n = _build_header_only(buf, 0, 1, 0x8001);
+    if (file_write_all("/tmp/stbmidi_smpte.mid", buf, n) != 0) {
+        put("FAIL: write smpte file\n"); free(buf); return 1;
+    }
+    file_smpte = midi_file_load("/tmp/stbmidi_smpte.mid");
+    if (file_smpte != 0) {
+        put("FAIL: SMPTE division should have been rejected (got non-NULL)\n");
+        midi_file_free(file_smpte);
+        fails++;
+    }
+
+    // ── Case 3: missing MThd magic.
+    auto ofs_buf;
+    ofs_buf = buf_word(1);
+    ofs_buf[0] = 0;
+    _put_byte(buf, ofs_buf, 'X');
+    _put_byte(buf, ofs_buf, 'X');
+    _put_byte(buf, ofs_buf, 'X');
+    _put_byte(buf, ofs_buf, 'X');
+    _put_be32(buf, ofs_buf, 6);
+    _put_be16(buf, ofs_buf, 0);
+    _put_be16(buf, ofs_buf, 1);
+    _put_be16(buf, ofs_buf, 480);
+    n = ofs_buf[0];
+    free(ofs_buf);
+    if (file_write_all("/tmp/stbmidi_bad.mid", buf, n) != 0) {
+        put("FAIL: write bad file\n"); free(buf); return 1;
+    }
+    file_bad_magic = midi_file_load("/tmp/stbmidi_bad.mid");
+    if (file_bad_magic != 0) {
+        put("FAIL: missing MThd should have been rejected (got non-NULL)\n");
+        midi_file_free(file_bad_magic);
+        fails++;
+    }
+
+    free(buf);
+
+    if (fails == 0) { put("OK\n"); return 0; }
+    put("FAILED: "); putnum(fails); put(" assertion(s)\n");
+    return 1;
+}

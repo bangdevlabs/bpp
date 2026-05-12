@@ -1,0 +1,151 @@
+// skip-c: relies on stbmixer (audio pipeline) which the C transpile path does not implement.
+import "stbmidi.bsm";
+
+// test_stbmidi_format1.bpp — Pin Format 1 multi-track merge.
+//
+// Builds a Format 1 SMF with two MTrks:
+//   track 1: events at ticks 100, 300
+//   track 2: events at ticks 200, 400
+// After load + merge + sort, the parallel-array event stream must
+// be globally tick-ordered: 100, 200, 300, 400 (plus per-track EOT
+// metas at tick 300 / 400). This is the gate the parser's
+// _midi_sort_events_by_tick step has to pass for Format 1 to be
+// trusted as a market-standard format the cartridge claims to
+// support.
+
+static void _put_byte(out_buf, ofs_buf, b) {
+    poke(out_buf + ofs_buf[0], b);
+    ofs_buf[0]++;
+}
+static void _put_be32(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 16777216) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 65536) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+static void _put_be16(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+static void _put_vlq(out_buf, ofs_buf, v) {
+    if (v < 128) {
+        _put_byte(out_buf, ofs_buf, v);
+    } else {
+        _put_byte(out_buf, ofs_buf, ((v / 128) & 0x7F) | 0x80);
+        _put_byte(out_buf, ofs_buf, v & 0x7F);
+    }
+}
+
+// Append one MTrk chunk emitting note_on + note_off + EOT at the
+// given absolute ticks. Patches the chunk length after the body.
+static void _put_mtrk_two_notes(out_buf, ofs_buf, tick_a, tick_b, key) {
+    auto len_ofs, body_start, body_len, save;
+    _put_byte(out_buf, ofs_buf, 0x4D); // 'M'
+    _put_byte(out_buf, ofs_buf, 0x54); // 'T'
+    _put_byte(out_buf, ofs_buf, 0x72); // 'r'
+    _put_byte(out_buf, ofs_buf, 0x6B); // 'k'
+    len_ofs = ofs_buf[0];
+    _put_be32(out_buf, ofs_buf, 0);    // placeholder
+    body_start = ofs_buf[0];
+
+    _put_vlq(out_buf, ofs_buf, tick_a);          // delta from 0
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_ON | 0);
+    _put_byte(out_buf, ofs_buf, key);
+    _put_byte(out_buf, ofs_buf, 100);
+
+    _put_vlq(out_buf, ofs_buf, tick_b - tick_a); // delta to b
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_OFF | 0);
+    _put_byte(out_buf, ofs_buf, key);
+    _put_byte(out_buf, ofs_buf, 0);
+
+    _put_vlq(out_buf, ofs_buf, 0);               // EOT at same tick
+    _put_byte(out_buf, ofs_buf, MIDI_META);
+    _put_byte(out_buf, ofs_buf, MIDI_META_EOT);
+    _put_byte(out_buf, ofs_buf, 0);
+
+    body_len = ofs_buf[0] - body_start;
+    save = ofs_buf[0];
+    ofs_buf[0] = len_ofs;
+    _put_be32(out_buf, ofs_buf, body_len);
+    ofs_buf[0] = save;
+}
+
+static _build_format1_smf(out_buf) {
+    auto ofs_buf, total;
+    ofs_buf = buf_word(1);
+    ofs_buf[0] = 0;
+
+    // Header — Format 1, 2 tracks, division 480.
+    _put_byte(out_buf, ofs_buf, 0x4D); _put_byte(out_buf, ofs_buf, 0x54);
+    _put_byte(out_buf, ofs_buf, 0x68); _put_byte(out_buf, ofs_buf, 0x64);
+    _put_be32(out_buf, ofs_buf, 6);
+    _put_be16(out_buf, ofs_buf, 1);    // format 1
+    _put_be16(out_buf, ofs_buf, 2);    // 2 tracks
+    _put_be16(out_buf, ofs_buf, 480);
+
+    // Track 1: notes at tick 100 (on) + 300 (off).
+    _put_mtrk_two_notes(out_buf, ofs_buf, 100, 300, 60);
+    // Track 2: notes at tick 200 (on) + 400 (off).
+    _put_mtrk_two_notes(out_buf, ofs_buf, 200, 400, 64);
+
+    total = ofs_buf[0];
+    free(ofs_buf);
+    return total;
+}
+
+main() {
+    auto buf, n, file: MidiFile, fails;
+
+    fails = 0;
+    buf = malloc(512);
+    n = _build_format1_smf(buf);
+    if (file_write_all("/tmp/stbmidi_fmt1.mid", buf, n) != 0) {
+        put("FAIL: write\n"); free(buf); return 1;
+    }
+    free(buf);
+
+    file = midi_file_load("/tmp/stbmidi_fmt1.mid");
+    if (file == 0) { put("FAIL: load returned 0\n"); return 1; }
+
+    if (file.format != 1)   { put("FAIL: format expected 1 got "); put(file.format);   put("\n"); fails++; }
+    if (file.n_tracks != 2) { put("FAIL: n_tracks expected 2 got "); put(file.n_tracks); put("\n"); fails++; }
+
+    // Each track contributes 3 events (note_on, note_off, EOT) → 6 total.
+    if (file.n_events != 6) {
+        put("FAIL: n_events expected 6 got "); put(file.n_events); put("\n");
+        fails++;
+    }
+
+    // Critical invariant — the merge sort must produce a globally
+    // tick-ordered stream:
+    //   tick 100: track1 note_on  (key 60)
+    //   tick 200: track2 note_on  (key 64)
+    //   tick 300: track1 note_off (key 60) AND track1 EOT (same tick)
+    //   tick 400: track2 note_off (key 64) AND track2 EOT
+    auto i;
+    for (i = 1; i < file.n_events; i++) {
+        if (file.e_tick[i] < file.e_tick[i - 1]) {
+            put("FAIL: not tick-ordered at i="); putnum(i);
+            put(" tick[i-1]="); putnum(file.e_tick[i - 1]);
+            put(" tick[i]=");   putnum(file.e_tick[i]);
+            put("\n");
+            fails++;
+        }
+    }
+
+    // Spot-check the boundary events: first must be tick 100 / NOTE_ON / key 60.
+    if (file.e_tick[0] != 100)              { put("FAIL: first tick\n"); fails++; }
+    if (file.e_type[0] != MIDI_NOTE_ON)     { put("FAIL: first type\n"); fails++; }
+    if (file.e_data1[0] != 60)              { put("FAIL: first key\n"); fails++; }
+
+    // Second must be tick 200 / NOTE_ON / key 64.
+    if (file.e_tick[1] != 200)              { put("FAIL: second tick\n"); fails++; }
+    if (file.e_type[1] != MIDI_NOTE_ON)     { put("FAIL: second type\n"); fails++; }
+    if (file.e_data1[1] != 64)              { put("FAIL: second key\n"); fails++; }
+
+    midi_file_free(file);
+
+    if (fails == 0) { put("OK\n"); return 0; }
+    put("FAILED: "); putnum(fails); put(" assertion(s)\n");
+    return 1;
+}

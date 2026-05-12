@@ -1,0 +1,185 @@
+// skip-c: relies on stbmixer (audio pipeline) which the C transpile path does not implement.
+import "stbmidi.bsm";
+
+// test_stbmidi_tempo.bpp — Pin tempo-change re-anchor against a
+// closed-form prediction.
+//
+// Builds a Format 0 SMF with a mid-stream tempo change. The
+// sequencer's tick→sample math has to honour the new
+// samples_per_tick from the tempo event forward, while anchoring
+// on the EXACT sample position the tempo event itself fired at.
+// If the implementation accidentally precomputes sample positions
+// at parse time (or fails to re-anchor at the tempo event's own
+// sample), the captured tick_samples will diverge from prediction.
+//
+// Stream:
+//   tick 0   tempo = 500000 us/quarter (120 BPM, samples_per_tick = 45)
+//   tick 100 note_on  ch=0 key=60   → sample 100 * 45 = 4500
+//   tick 200 tempo = 250000 us/quarter (240 BPM, samples_per_tick = 22)
+//                                  → tempo anchor at sample 9000
+//   tick 300 note_on  ch=0 key=64   → 9000 + (300-200)*22 = 11200
+//   tick 300 EOT
+//
+// Numbers above use division = 480, sample_rate = 44100. With
+// integer math:
+//   500000 * 44100 / 480 / 1000000 = 45
+//   250000 * 44100 / 480 / 1000000 = 22
+
+global _t_idx;
+global _t_samples_0;
+global _t_samples_1;
+global _t_samples_2;
+global _t_samples_3;
+global _t_samples_4;
+
+static void _t_capture(event) @safe {
+    auto e: MidiEvent;
+    e = event;
+    if (_t_idx == 0) { _t_samples_0 = e.tick_samples; }
+    if (_t_idx == 1) { _t_samples_1 = e.tick_samples; }
+    if (_t_idx == 2) { _t_samples_2 = e.tick_samples; }
+    if (_t_idx == 3) { _t_samples_3 = e.tick_samples; }
+    if (_t_idx == 4) { _t_samples_4 = e.tick_samples; }
+    _t_idx++;
+}
+
+static void _put_byte(out_buf, ofs_buf, b) {
+    poke(out_buf + ofs_buf[0], b);
+    ofs_buf[0]++;
+}
+static void _put_be32(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 16777216) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 65536) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+static void _put_be16(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+static void _put_vlq(out_buf, ofs_buf, v) {
+    if (v < 128) { _put_byte(out_buf, ofs_buf, v); }
+    else {
+        _put_byte(out_buf, ofs_buf, ((v / 128) & 0x7F) | 0x80);
+        _put_byte(out_buf, ofs_buf, v & 0x7F);
+    }
+}
+
+// Emit a tempo meta event: FF 51 03 <us-per-quarter big-endian 24-bit>.
+static void _put_tempo(out_buf, ofs_buf, us_per_quarter) {
+    _put_byte(out_buf, ofs_buf, MIDI_META);
+    _put_byte(out_buf, ofs_buf, MIDI_META_TEMPO);
+    _put_byte(out_buf, ofs_buf, 3);                                  // VLQ length 3
+    _put_byte(out_buf, ofs_buf, (us_per_quarter / 65536) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (us_per_quarter / 256)   & 0xFF);
+    _put_byte(out_buf, ofs_buf, us_per_quarter & 0xFF);
+}
+
+static _build_tempo_change_smf(out_buf) {
+    auto ofs_buf, len_ofs, body_start, body_len, save, total;
+    ofs_buf = buf_word(1);
+    ofs_buf[0] = 0;
+
+    // Header — Format 0, 1 track, division 480.
+    _put_byte(out_buf, ofs_buf, 0x4D); _put_byte(out_buf, ofs_buf, 0x54);
+    _put_byte(out_buf, ofs_buf, 0x68); _put_byte(out_buf, ofs_buf, 0x64);
+    _put_be32(out_buf, ofs_buf, 6);
+    _put_be16(out_buf, ofs_buf, 0);
+    _put_be16(out_buf, ofs_buf, 1);
+    _put_be16(out_buf, ofs_buf, 480);
+
+    // Track header.
+    _put_byte(out_buf, ofs_buf, 0x4D); _put_byte(out_buf, ofs_buf, 0x54);
+    _put_byte(out_buf, ofs_buf, 0x72); _put_byte(out_buf, ofs_buf, 0x6B);
+    len_ofs = ofs_buf[0];
+    _put_be32(out_buf, ofs_buf, 0);
+    body_start = ofs_buf[0];
+
+    // tick 0: initial tempo 120 BPM.
+    _put_vlq(out_buf, ofs_buf, 0);
+    _put_tempo(out_buf, ofs_buf, 500000);
+
+    // delta 100 → tick 100: note_on key 60.
+    _put_vlq(out_buf, ofs_buf, 100);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_ON | 0);
+    _put_byte(out_buf, ofs_buf, 60);
+    _put_byte(out_buf, ofs_buf, 100);
+
+    // delta 100 → tick 200: tempo 240 BPM.
+    _put_vlq(out_buf, ofs_buf, 100);
+    _put_tempo(out_buf, ofs_buf, 250000);
+
+    // delta 100 → tick 300: note_on key 64.
+    _put_vlq(out_buf, ofs_buf, 100);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_ON | 0);
+    _put_byte(out_buf, ofs_buf, 64);
+    _put_byte(out_buf, ofs_buf, 80);
+
+    // delta 0: EOT.
+    _put_vlq(out_buf, ofs_buf, 0);
+    _put_byte(out_buf, ofs_buf, MIDI_META);
+    _put_byte(out_buf, ofs_buf, MIDI_META_EOT);
+    _put_byte(out_buf, ofs_buf, 0);
+
+    body_len = ofs_buf[0] - body_start;
+    save = ofs_buf[0];
+    ofs_buf[0] = len_ofs;
+    _put_be32(out_buf, ofs_buf, body_len);
+    ofs_buf[0] = save;
+
+    total = ofs_buf[0];
+    free(ofs_buf);
+    return total;
+}
+
+main() {
+    auto buf, n, file: MidiFile, seq: MidiSequencer, fails;
+
+    fails = 0;
+    _t_idx = 0;
+
+    buf = malloc(256);
+    n = _build_tempo_change_smf(buf);
+    if (file_write_all("/tmp/stbmidi_tempo.mid", buf, n) != 0) {
+        put("FAIL: write\n"); free(buf); return 1;
+    }
+    free(buf);
+
+    file = midi_file_load("/tmp/stbmidi_tempo.mid");
+    if (file == 0) { put("FAIL: load\n"); return 1; }
+
+    if (file.n_events != 5) {
+        put("FAIL: n_events expected 5 got "); put(file.n_events); put("\n");
+        fails++;
+    }
+
+    // Initial tempo from header should be 500000 (120 BPM) since
+    // the first tempo meta sits at tick 0.
+    if (file.initial_us_per_quarter != 500000) {
+        put("FAIL: initial_us_per_quarter expected 500000 got ");
+        put(file.initial_us_per_quarter); put("\n");
+        fails++;
+    }
+
+    seq = midi_seq_new(file, fn_ptr(_t_capture), 0, 44100);
+    midi_seq_advance_samples(seq, 100000);   // sweep all events
+
+    // Predicted sample positions per the closed-form math above:
+    //   event 0 (tempo @ tick 0)    → sample 0
+    //   event 1 (note_on @ tick 100) → 4500
+    //   event 2 (tempo @ tick 200)   → 9000
+    //   event 3 (note_on @ tick 300) → 9000 + 100*22 = 11200
+    //   event 4 (EOT @ tick 300)     → 11200 (same anchor, same offset)
+    if (_t_samples_0 != 0)     { put("FAIL: e0 expected 0 got ");     putnum(_t_samples_0); put("\n"); fails++; }
+    if (_t_samples_1 != 4500)  { put("FAIL: e1 expected 4500 got ");  putnum(_t_samples_1); put("\n"); fails++; }
+    if (_t_samples_2 != 9000)  { put("FAIL: e2 expected 9000 got ");  putnum(_t_samples_2); put("\n"); fails++; }
+    if (_t_samples_3 != 11200) { put("FAIL: e3 expected 11200 got "); putnum(_t_samples_3); put("\n"); fails++; }
+    if (_t_samples_4 != 11200) { put("FAIL: e4 expected 11200 got "); putnum(_t_samples_4); put("\n"); fails++; }
+
+    midi_seq_free(seq);
+    midi_file_free(file);
+
+    if (fails == 0) { put("OK\n"); return 0; }
+    put("FAILED: "); putnum(fails); put(" assertion(s)\n");
+    return 1;
+}

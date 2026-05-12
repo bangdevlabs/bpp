@@ -335,6 +335,13 @@ static _midi_parse_track(buf, track_ofs, file, out_idx_buf) {
 // (few thousand events). N^2 worst case is fine until the corpus
 // pushes into the tens of thousands; promote to merge sort when a
 // real consumer hits that scale.
+//
+// Loop discipline: the inner while exits via `break` when it lands
+// on a position with `e_tick[j] <= t`. Setting `j = -1` to exit
+// would change the insertion index — `f.e_tick[j+1] = t` would
+// write to slot 0, overwriting the sorted region. The previous
+// version of this function had that bug; the test_stbmidi_format1
+// pin catches the regression.
 static _midi_sort_events_by_tick(file) {
     auto f: MidiFile, n, i, j;
     auto t, ty, ch, d1, d2;
@@ -348,15 +355,13 @@ static _midi_sort_events_by_tick(file) {
         d2 = f.e_data2[i];
         j = i - 1;
         while (j >= 0) {
-            if (f.e_tick[j] <= t) { j = -1; }
-            else {
-                f.e_tick[j + 1]    = f.e_tick[j];
-                f.e_type[j + 1]    = f.e_type[j];
-                f.e_channel[j + 1] = f.e_channel[j];
-                f.e_data1[j + 1]   = f.e_data1[j];
-                f.e_data2[j + 1]   = f.e_data2[j];
-                j--;
-            }
+            if (f.e_tick[j] <= t) { break; }
+            f.e_tick[j + 1]    = f.e_tick[j];
+            f.e_type[j + 1]    = f.e_type[j];
+            f.e_channel[j + 1] = f.e_channel[j];
+            f.e_data1[j + 1]   = f.e_data1[j];
+            f.e_data2[j + 1]   = f.e_data2[j];
+            j--;
         }
         f.e_tick[j + 1]    = t;
         f.e_type[j + 1]    = ty;
@@ -369,7 +374,7 @@ static _midi_sort_events_by_tick(file) {
 // Load an SMF file from disk and return a MidiFile (0 on failure).
 // Format 0 and 1 are supported; Format 2 and SMPTE division are
 // rejected with a diagnostic on stderr.
-midi_file_load(path) {
+midi_file_load(path: ptr) {
     auto buf, size_out, size;
     auto magic, hdr_len, format, n_tracks, division;
     auto f: MidiFile, ofs, idx_buf, t;

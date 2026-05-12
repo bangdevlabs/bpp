@@ -807,6 +807,25 @@ becomes the seed for the dedicated session decomposition.
     consumes it; cartridge restored to C-emit-clean. See
     `tests/bench_ecs_physics_simd.bpp` for the canonical pattern
     consumers should follow until this sidequest opens.
+- **Return-type annotations propagating to assignment-site
+  inference** — local variables annotated `: ptr` that receive the
+  result of a TY_WORD-returning function (e.g. `malloc`, `str_dup`,
+  `json_string`) trigger E053 today because the compiler enforces
+  the annotation strictly. Two-part fix when a real consumer hits
+  this often enough: (a) annotate built-in / canonical helpers with
+  TY_PTR return type via `set_func_type` (similar to how `buf_word`
+  and `arr_new` are tagged today); (b) for user-defined helpers,
+  honour an optional `-> ptr` return-type clause in the function
+  declaration. Surfaced 2026-05-12 during the stb-wide `: ptr` /
+  W032 sweep. Workaround for now: keep the local untyped and call
+  `putstr_err` at the use site to make string-intent explicit.
+- **W032 cleanup sweep across remaining tests** — ~57 sites still
+  emit W032 because of intentional integer `put(x)` calls in test
+  diagnostics (e.g. `put("count="); put(n);`). Each site swaps to
+  `putnum(n)` per the explicit-intent rule. Mechanical edit; defer
+  until either someone adds a `--strict-warnings` CI gate or the
+  remaining tests get touched for unrelated reasons. The stb/ stb-
+  cartridge sites + stbmidi tests are already swept clean.
 - **`restrict` keyword** — useful only when the native codegen
   does aliasing-aware optimization. Not part of Mini Cooper.
   Revisit post-1.0.

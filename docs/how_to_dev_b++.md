@@ -421,6 +421,8 @@ Attach `:` + type name to any local, field, or parameter:
 auto hp: word;              // 64-bit int (same as un-annotated)
 auto tile: byte;            // 8-bit — compiler emits strb/ldrb
 auto health_ratio: float;   // 64-bit double — FP register
+auto path: ptr;             // opaque pointer slot — drives put / put_err
+                            //   smart dispatch through putstr / putstr_err
 auto c: Character;          // struct — sized to struct_size(Character)
 ```
 
