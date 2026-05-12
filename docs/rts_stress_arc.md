@@ -439,9 +439,77 @@ Wait for one of the soft prerequisites too.
 same-day; Session 1 shipped immediately after per the
 continuous-execute directive.
 
-**Current state**: Session 1 SHIPPED 2026-05-12.
+**Current state**: Sessions 1, 2, and 3 SHIPPED 2026-05-12.
 
-**Next session**: Session 3 — SIMD batching inside systems.
+**Next session**: Session 4 — Flow fields pathfinding (independent of 1/2/3).
+
+**Session 3 — SHIPPED 2026-05-12** (with a portability-tier course correction):
+
+- `ecs_chunk_each2(q, comp_a, comp_b, fn)` added to `stb/stbecs.bsm`
+  — generic two-component archetype walker. Yields per-chunk pointers
+  to two component arrays simultaneously so a callback can read one
+  and write the other (e.g. `pos += vel * dt`) without per-entity
+  dispatch. Pure walker, zero SIMD, C-emit-clean.
+- SIMD primitive `_vec_axpy_f32(out, in_buf, scalar: float, n_floats)`
+  shipped **inside the bench file**, not the cartridge. Four-wide
+  inner loop via `vec_load4 / vec_mul4 / vec_add4 / vec_store4` (NEON
+  on ARM64, SSE2 on x86_64), scalar tail for `n_floats % 4`. Lives
+  with its only current consumer per Rule 20 (two-consumer); promotes
+  to `stb/stbsimd.bsm` when a second consumer arrives.
+- `tests/bench_ecs_physics_simd.bpp` proves the gate empirically.
+  50K-entity Combatant archetype (Pos+Vel+Hp), 200 iterations of
+  `pos += vel * dt`. Two worlds with identical initial state; one
+  runs the scalar path, the other the SIMD path; both must converge
+  to identical floats (mul-then-add in the same order, no FMA
+  elision). Measured: **~3.85x scalar/SIMD ratio** (e.g. 29132us
+  scalar vs 7580us SIMD), well above the 2x gate calibrated from
+  the Step 0 raw-SIMD ceiling.
+
+### Step 0 — raw-SIMD ceiling probe (pre-Session 3)
+
+`tests/bench_simd_raw.bpp` (added 2026-05-12) measured B++'s codegen
+quality against the theoretical 4-wide ceiling: scalar `LDR S / FADD S
+/ STR S` vs `LDR Q / FADD .4S / STR Q` on three 4MB float buffers
+across 20 reps. Four runs averaged ~3.87x (range 3.51–4.30x). Hitting
+nearly the full theoretical ceiling meant no codegen investigation
+was needed and Session 3's gate (≥2x) sat comfortably below the raw
+ceiling, leaving ~50% headroom for the ECS chunk-walk overhead.
+ECS-level ratio (~3.85x) ended up essentially matching the raw
+ceiling — the chunk-walk overhead is absorbed.
+
+### Portability-tier course correction
+
+The first cut of Session 3 placed `vec_axpy_f32` inside
+`stb/stbecs.bsm` alongside `ecs_chunk_each2`. The C-emit suite then
+dropped from 128/0/39 to 124/4/39 — four pre-existing ECS tests
+(test_ecs, test_ecs_archetype, test_ecs_component, test_ecs_query)
+broke because they transitively import stbecs and the C emitter has
+no `_mm_*` mapping for `vec_*` (documented as intentional in
+`src/backend/c/bpp_emitter.bsm:1626-1631`, "any program using vec_*
+via --c today will fail the extern-lookup path, which is the correct
+feedback").
+
+Rule 28 audit:
+
+| Test | Result |
+|------|--------|
+| Killer use case | Zero — no game / lib today demands SIMD via the C-emit path. |
+| Smaller tool | Yes — keep `vec_axpy_f32` out of stbecs entirely. |
+| Restraint bias | Adding SIMD support to the C emitter biases B++ toward "C path symmetric with native" — exactly the Rust-vibe completeness pull Rule 28 rejects. |
+
+C is already a two-tier language itself (SSE/AVX intrinsics are
+non-standard `<immintrin.h>` extensions; portable C99/C11 has no
+SIMD), so B++ mirroring that split — `vec_*` native-only opt-in,
+stb cartridges stay C-emit-clean — is alignment with industry
+practice, not a portability hole. The C-emit SIMD mapping
+sidequest is logged in `docs/todo.md` with explicit Rule 20 triggers
+(two shipped real consumers + a target where only the C path is
+available).
+
+Refactor: `vec_axpy_f32` moved into the bench file as a static
+helper `_vec_axpy_f32`; stbecs header gained a portability-tier note
+documenting the convention. Suite restored to 128/0/39 + 155/0/12,
+bootstrap byte-stable.
 
 **Session 2 — SHIPPED 2026-05-12** (with empirical claim correction):
 
@@ -595,3 +663,127 @@ shipping an RTS demo at Red Alert scale becomes "write the game
 code," not "fight the engine."
 
 That's the cantar.
+
+---
+
+## Addendum — Anti-feature: vec_*8 / vec_*16 (AVX-256 / AVX-512)
+
+Recorded 2026-05-12 alongside the Session 3 pre-flight audit.
+Documented here so future readers do not re-open the question
+without new evidence.
+
+### The proposal that came up
+
+While auditing Session 3's SIMD readiness, a "deferred-but-on-the-
+horizon" line slipped into the design notes: "someday B++ may
+grow `vec_load8` / `vec_load16` for AVX-256 / AVX-512." That line
+was speculation drift — adjacent topic, no killer use case
+attached — and is being stripped here per Rule 28.
+
+### What AVX-256 / AVX-512 are
+
+Wider SIMD register banks on x86_64. Each generation doubles the
+lane count:
+
+| Tech | Width | Floats/op | Hardware | B++ surface |
+|------|-------|-----------|----------|-------------|
+| SSE2 | 128-bit | 4 | All x86_64 since 2003 | `vec_*4` (today) |
+| AVX-256 | 256-bit | 8 | Sandy Bridge 2011+ / Bulldozer 2011+ | hypothetical `vec_*8` |
+| AVX-512 | 512-bit | 16 | Skylake-X 2017+ / partial Zen4+ | hypothetical `vec_*16` |
+
+ARM64 has no direct 256/512-bit counterpart. NEON is fixed at
+128-bit; SVE exists but its register width varies per chip and
+needs runtime detection. There is no portable "wider than NEON"
+default on ARM.
+
+### Industry audit (2026-05-12)
+
+What real game engines actually ship:
+
+| Engine / game | AVX2 (256-bit) status |
+|---------------|-----------------------|
+| Unreal Engine 4/5 | Opt-in via `bUseAVX` flag. Not default. |
+| Unity (Burst) | Optional target. Default is conservative. |
+| PhysX | Migrated to AVX2 ~2022 after leaving GPU. |
+| Uncharted: Legacy of Thieves PC | Requires AVX2 (notable enough to be polemic). |
+| Most shipped games | SSE2 baseline, no AVX. |
+
+AVX-512 in games: essentially absent. Industry consensus —
+"AVX-512 has specific use cases mostly in HPC, but no game dev is
+going to compile for AVX-512 given that 99.9999% of retail SKUs
+don't support it."
+
+Why game adoption is slow:
+
+- **Lowest-common-denominator target.** Steam Hardware Survey
+  still includes pre-Haswell CPUs. Requiring AVX2 loses players.
+- **Realised speedup is below theoretical.** AVX2 promises 2× SSE2
+  but memory bandwidth, not lane width, is the bottleneck for
+  typical game workloads. Measured win is closer to 1.3–1.5×.
+- **CPU SIMD is rarely the gargalo.** Games are GPU-bound ~90% of
+  the time; squeezing 1–2 ms of CPU SIMD savings out of a 16 ms
+  budget is not where the wins live.
+- **Build complexity.** Fat binaries with SSE2 + AVX paths + CPU
+  detection raise dev cost above the realised speedup.
+- **Console penalties.** PS5 / Xbox Series X have AVX2 but with
+  downclocking and power penalties — not free even when present.
+
+13 years post-Haswell (AVX2, 2013) the dominant baseline is still
+SSE2 / NEON. B++'s `vec_*4` sits exactly on that baseline.
+
+### Applying Rule 28
+
+| Test | Result |
+|------|--------|
+| Killer use case test | Zero specific bugs in the B++ roadmap that `vec_*8` would catch and `vec_*4` cannot. |
+| Smaller-tool test | `vec_*4` already covers the SIMD use case the engine actually has (ECS update over chunks of 4 entities). Wider lanes add no semantic surface. |
+| Restraint-bias convention test | Adding `vec_*8` biases the language toward "matches AVX2" instead of "matches what shipped games do." |
+| Symmetry-driven addition? | Yes — "we have `vec_*4`, completeness wants `vec_*8` / `vec_*16`." Match for the post-mortem heuristic. |
+| Match-Rust-vibe / completeness pull? | Yes — "wider lanes exist in CPUs, so wider lanes should exist in B++." Tech-completist, not goal-driven. |
+
+All five flags fire. Strip the proposal, do not park it on a
+"someday" shelf.
+
+### Decision
+
+`vec_*8` and `vec_*16` are anti-features for B++. Not deferred,
+not tracked, not on the horizon. The language commits to
+`vec_*4` (SSE2 on x86_64, NEON on ARM64) as the SIMD ceiling
+because:
+
+1. It is the actual game-industry baseline.
+2. It is portable across both currently-targeted chip backends
+   without runtime dispatch.
+3. The codegen quality at 4-wide is already ~3.5–4× of scalar
+   (measured 2026-05-12 via `tests/bench_simd_raw.bpp`: scalar
+   `LDR S / FADD S / STR S` vs `LDR Q / FADD .4S / STR Q` on
+   1M-float buffers, four runs averaging ~3.87× — well above
+   the 3× threshold the Session 3 plan needs).
+
+The only condition under which this decision reopens is concrete:
+a real B++ game ships, the profiler shows the SIMD path saturating
+the 4-wide ceiling, and the workload is float-arithmetic-bound
+(not memory-bandwidth-bound) such that going to 8-wide would
+realistically deliver more than ~1.3×. That condition is extremely
+improbable pre-1.0 given the GPU-bound nature of the game
+workloads on the roadmap. When and if it materialises, the
+discussion reopens with a fresh killer-use-case write-up — not as
+continuation of this addendum.
+
+### Sources audited
+
+- Quora — "Why doesn't AVX code get more widely adopted in games"
+- Steam Community — "How many AAA games have AVX2 requirement"
+- Epic Developer Community — "Use AVX instruction" (Unreal)
+- Unity Discussions — "BURST and AVX512"
+- Wikipedia — "Advanced Vector Extensions"
+- guru3D — "PhysX deprecated in UE 5.0" (CPU AVX2 migration context)
+
+### Cross-references
+
+- `tonify_checklist.md` Rule 28 — the gate that rejected the
+  proposal.
+- `tests/bench_simd_raw.bpp` — empirical anchor for the 4-wide
+  ceiling claim. Re-runnable, re-auditable.
+- `docs/rts_stress_arc.md` Session 3 — consumer of the
+  `vec_*4` baseline this addendum locks in.

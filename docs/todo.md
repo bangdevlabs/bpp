@@ -158,6 +158,78 @@ between any two sessions without conflict.
 
 ---
 
+## Queued — RTS Stress Arc (runtime scaling)
+
+**Opened 2026-05-12 (planning).** Five-session arc that scales
+B++'s existing ECS / profile / multicore / SIMD infrastructure
+from demo scope (2 unit types per `games_roadtrip.md` Game 3) to
+**Red Alert scale stress test** (30+ unit types, 1000+ live
+units, 60fps target). User named the target "B++ cantando" —
+the proof that B++ carries a real RTS workload, not just a
+vertical-slice demo.
+
+**Canonical spec**: [`docs/rts_stress_arc.md`](rts_stress_arc.md)
+— read this first.
+
+Five sessions:
+
+1. **ECS query + iterator** (~120 LOC) — replace manual
+   `for i, if alive[i]` with `ecs_query_each(query, fn_ptr)`.
+   Foundation for sessions 2-5.
+
+2. **Archetype storage** (~400 LOC) — entities with same
+   component set live in 16KB contiguous chunks. Cache locality
+   3-5x speedup at 1000+ entities. Major refactor with backward-
+   compat shim for existing parallel-array consumers.
+
+3. **SIMD batching inside systems** (~120 LOC, up to ~250 if
+   `vec_*` builtins need extension) — `ecs_physics` and similar
+   use `vec_*` on 4-entity batches. Another 2-4x on top of
+   Session 2.
+
+4. **Flow fields pathfinding** (~250 LOC) — new
+   `stb/stbflow.bsm`. One compute per goal, all units sample.
+   Replaces per-unit A* for many-units-to-same-objective.
+
+5. **System scheduler** (~120 LOC) — register systems,
+   auto-parallelize independent ones via maestro pool. Ties
+   query + archetype + multicore together.
+
+**Optional Session 6**: stress demo (`games/rts_stress/`),
+~300 LOC game code proving 1000 units / 60fps. Ships separately
+after infra arc closes.
+
+**Total**: ~1010 LOC infra + ~300 LOC optional demo. Five-six
+sessions. Net deliverable: B++ at AAA RTS scale.
+
+**Anti-features**: templates (graduated out of Excalibur per
+Rule 28), GPU compute for unit simulation (industry uses
+CPU for game logic; GPU for rendering stays as-is), lockstep
+fixed-point determinism (post-1.0 with multiplayer arc).
+
+**Industry context audited 2026-05-12**: C&C Red Alert /
+Warcraft / StarCraft all scaled to AAA via OOP+vtables (no
+templates). Modern AAA (Unity DOTS, Bevy) use archetype ECS.
+GPU compute used in industry for particles/cloth/fluid, NOT
+for unit AI / strategy logic (branching + sync overhead beats
+parallelism win).
+
+**Triggers — when to open**:
+- Hard prerequisite: Excalibur Features 1+2+3 closed
+- Soft prerequisite (one of):
+  - Wolf3D Phase 2 demo level shipping or near-shipping
+  - User explicit "let's start stress test"
+
+**Pause discipline**: each session ends with bootstrap byte-stable
++ suite green + `docs/rts_stress_arc.md` Status section updated
+with `next: <session ID>` marker. Excalibur / Wolf3D / other
+work can resume between any two sessions.
+
+**Current state**: doc landed. No code yet. Blocked on
+Excalibur 1+2+3.
+
+---
+
 ## Engine-side sidequests (not blocking content arc)
 
 These tighten the engine but don't gate any content. Pick up
@@ -714,7 +786,27 @@ becomes the seed for the dedicated session decomposition.
   transpile path needs `: double` locals typed as `__m128` and
   the eleven builtins mapped to `_mm_*` intrinsics. Today the
   emitter uses `long long` for every local unconditionally —
-  invasive change. Zero demand from `bpp --c` today.
+  invasive change (~200-300 LOC). Zero demand from `bpp --c`
+  today.
+  - **Trigger to open the sidequest** (Rule 20 two-consumer):
+    two real consumers must demand SIMD via the C-emit path. A
+    bench file or single-purpose library does not count — needs
+    a shipped game / lib + a portability target where only the
+    C path is available. Until then, `vec_*` stays native-only
+    opt-in and the stb cartridges that import `vec_*` are
+    quarantined to native (the convention is documented in the
+    `stb/stbecs.bsm` header — portability-tier note). C is
+    already a two-tier language itself (SSE/AVX intrinsics are
+    non-standard `<immintrin.h>` extensions), so B++ mirroring
+    that split is alignment with industry practice, not a
+    portability hole.
+  - **Confirmed 2026-05-12 during RTS Stress Arc Session 3**:
+    initial attempt put `vec_axpy_f32` inside stbecs.bsm, broke
+    four pre-existing C-emit tests transitively. Refactor moved
+    the helper out of the cartridge into the bench file that
+    consumes it; cartridge restored to C-emit-clean. See
+    `tests/bench_ecs_physics_simd.bpp` for the canonical pattern
+    consumers should follow until this sidequest opens.
 - **`restrict` keyword** — useful only when the native codegen
   does aliasing-aware optimization. Not part of Mini Cooper.
   Revisit post-1.0.

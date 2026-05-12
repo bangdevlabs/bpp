@@ -1,0 +1,263 @@
+import "stbecs.bsm";
+
+// bench_ecs_physics_simd.bpp — RTS Stress Arc Session 3 gate.
+//
+// Native-only: this file exercises vec_* SIMD builtins, which the
+// C transpile path does not lower (see stbecs.bsm header). Run via
+// the native binary; the C-emit suite skips this file via skip-c.
+//
+// Compares two implementations of "pos += vel * dt" over an archetype
+// chunk stream of 50K combatant entities:
+//
+//   (a) Scalar callback — walks each chunk one entity at a time, doing
+//       a per-component float add and multiply. This is what a consumer
+//       gets today from Session 2's ecs_chunk_each2 without any SIMD
+//       primitive on top.
+//   (b) SIMD callback — same chunk walk, but the inner per-entity loop
+//       is replaced by a single call to `_vec_axpy_f32`, which processes
+//       four floats per iteration via vec_load4 / vec_mul4 / vec_add4 /
+//       vec_store4. Two floats per entity (interleaved x, y) means each
+//       SIMD iteration covers two entities.
+//
+// Both paths walk identical archetypes via the same ecs_chunk_each2
+// primitive — the storage layout is constant across the comparison.
+// Only the inner-loop math differs. That isolates the SIMD codegen
+// quality from the chunk-walk overhead.
+//
+// Correctness gate: after N physics iterations on identical initial
+// state, both worlds' final positions must agree to within a float32
+// epsilon (the operations are mul-then-add in the same order, so the
+// rounding profile is identical in principle).
+//
+// Performance gate: SIMD must be at least 2x faster than scalar over
+// the same workload. The raw-SIMD ceiling (tests/bench_simd_raw.bpp,
+// 2026-05-12) measured ~3.5-4x on 1M-float buffers; a 2x ECS gate
+// leaves headroom for the chunk-walk overhead (callback dispatch,
+// archetype scan) and stays comfortably above noise.
+
+const N_ENTITIES = 50000;
+const ITERATIONS = 200;
+const POS_BYTES  = 8;       // struct Pos { x: float, y: float }
+const VEL_BYTES  = 8;       // struct Vel { x: float, y: float }
+const HP_BYTES   = 8;       // word, registered so chunks are realistic
+
+global _bench_dt: float;    // shared dt for both callbacks; passing it
+                            // through the call() argument boundary
+                            // narrows the IEEE bits (V3 numeric conv),
+                            // so we keep it in a global per
+                            // feedback_float_arg_boundary.md.
+
+// SIMD axpy on contiguous float32 arrays: out[i] += in_buf[i] * scalar
+// for i in [0, n_floats). Lives in this bench (not in stbecs.bsm) so
+// the cartridge stays C-emit-clean — see the stbecs header note on the
+// portability tier. The first floor(n_floats / 4) * 4 lanes process
+// four floats per iteration via vec_load4 / vec_mul4 / vec_add4 /
+// vec_store4 (NEON on ARM64, SSE2 on x86_64); the tail < 4 falls
+// through to scalar peekfloat_h / pokefloat_h. `scalar` is annotated
+// `: float` so the V3 numeric-conversion path at the call boundary
+// does not truncate the IEEE bits to integer.
+//
+// When a second consumer arrives (real game, RTS demo), this primitive
+// graduates to a sibling cartridge `stb/stbsimd.bsm` per Rule 20.
+static void _vec_axpy_f32(out_buf, in_buf, scalar: float, n_floats) {
+    auto i, simd_end;
+    auto v_scalar: double;
+
+    simd_end = (n_floats / 4) * 4;
+    v_scalar = vec_splat4(scalar);
+    for (i = 0; i < simd_end; i += 4) {
+        vec_store4(out_buf + i * 4,
+                   vec_add4(vec_load4(out_buf + i * 4),
+                            vec_mul4(vec_load4(in_buf + i * 4), v_scalar)));
+    }
+
+    // Scalar tail. Same arithmetic shape so the two paths produce
+    // identical floats (mul-then-add, no FMA elision). pokefloat_h
+    // narrows via FCVT S + STR S at the store, so passing the
+    // double-precision expression directly skips the intermediate
+    // `: half float` local that would otherwise fire W010.
+    for (i = simd_end; i < n_floats; i++) {
+        pokefloat_h(out_buf + i * 4,
+                    peekfloat_h(out_buf + i * 4)
+                  + peekfloat_h(in_buf + i * 4) * scalar);
+    }
+}
+
+// Scalar archetype-chunk callback. Iterates entities one at a time,
+// reading and writing two floats per entity. This is the baseline the
+// SIMD path has to beat. pokefloat_h narrows double-precision math to
+// 4-byte storage in its own codegen (FCVT S + STR S), so the expression
+// can be passed directly and no `: half float` intermediate is needed.
+static void _bench_chunk_scalar(w, pos_ptr, vel_ptr, n, sz_pos, sz_vel) {
+    auto i, off;
+    for (i = 0; i < n; i++) {
+        off = i * 8;        // both components are 8 bytes per entity
+        pokefloat_h(pos_ptr + off,
+                    peekfloat_h(pos_ptr + off)
+                  + peekfloat_h(vel_ptr + off)     * _bench_dt);
+        pokefloat_h(pos_ptr + off + 4,
+                    peekfloat_h(pos_ptr + off + 4)
+                  + peekfloat_h(vel_ptr + off + 4) * _bench_dt);
+    }
+}
+
+// SIMD archetype-chunk callback. Defers the entire inner loop to
+// _vec_axpy_f32, which processes four floats per iteration. With
+// 8-byte Pos / Vel records (x, y interleaved) and n entities, the
+// total float count is n * 2.
+static void _bench_chunk_simd(w, pos_ptr, vel_ptr, n, sz_pos, sz_vel) {
+    _vec_axpy_f32(pos_ptr, vel_ptr, _bench_dt, n * 2);
+}
+
+// Seed a world with N entities in a single Combatant archetype.
+// Returns (world, pos_comp, vel_comp, query). Each entity gets a
+// non-trivial initial position and velocity so the physics loop has
+// real work to do.
+static _setup_world(seed_a: half float, seed_b: half float, pos_out, vel_out, q_out) {
+    auto w;
+    auto pos_comp, vel_comp, hp_comp;
+    auto comp_ids;
+    auto arch_id, id, i;
+    auto pos_ptr, vel_ptr;
+
+    w = ecs_new(4);          // legacy slots unused; pick small to avoid waste
+    pos_comp = ecs_component_register(w, "Pos", POS_BYTES);
+    vel_comp = ecs_component_register(w, "Vel", VEL_BYTES);
+    hp_comp  = ecs_component_register(w, "Hp",  HP_BYTES);
+
+    comp_ids = buf_word(3);
+    comp_ids[0] = pos_comp;
+    comp_ids[1] = vel_comp;
+    comp_ids[2] = hp_comp;
+    arch_id = ecs_archetype(w, comp_ids, 3);
+
+    // Seed expressions inlined into pokefloat_h so narrowing happens
+    // at the store (FCVT S + STR S inside the builtin) instead of via
+    // a `: half float` local that would fire W010.
+    for (i = 0; i < N_ENTITIES; i++) {
+        id = ecs_spawn_at(w, arch_id);
+        pos_ptr = ecs_get(w, pos_comp, id);
+        vel_ptr = ecs_get(w, vel_comp, id);
+        pokefloat_h(pos_ptr,     seed_a + (i % 100) * 0.125);
+        pokefloat_h(pos_ptr + 4, seed_a + (i % 50)  * 0.25);
+        pokefloat_h(vel_ptr,     seed_b + (i % 7)   * 0.5);
+        pokefloat_h(vel_ptr + 4, seed_b + (i % 11)  * 0.75);
+    }
+
+    pos_out[0] = pos_comp;
+    vel_out[0] = vel_comp;
+    q_out[0]   = ecs_query(w, 1);
+    return w;
+}
+
+main() {
+    auto w_scalar, w_simd;
+    auto pos_a, vel_a, q_a;
+    auto pos_b, vel_b, q_b;
+    auto pos_comp_a, vel_comp_a, q_scalar;
+    auto pos_comp_b, vel_comp_b, q_simd;
+    auto i;
+    auto t0, t1, dt_scalar, dt_simd;
+    auto check_id;
+    auto pa_x: half float;
+    auto pa_y: half float;
+    auto pb_x: half float;
+    auto pb_y: half float;
+    auto pos_a_ptr, pos_b_ptr;
+
+    // _bench_dt is small but non-zero — typical frame delta in seconds.
+    _bench_dt = 0.01666666;     // ~ 1/60 frame
+
+    pos_a = buf_word(1); vel_a = buf_word(1); q_a = buf_word(1);
+    pos_b = buf_word(1); vel_b = buf_word(1); q_b = buf_word(1);
+
+    // Both worlds share identical initial state (same seed args). The
+    // scalar and SIMD paths must therefore land on identical final
+    // positions after N iterations.
+    w_scalar = _setup_world(1.5, 0.25, pos_a, vel_a, q_a);
+    w_simd   = _setup_world(1.5, 0.25, pos_b, vel_b, q_b);
+    pos_comp_a = pos_a[0]; vel_comp_a = vel_a[0]; q_scalar = q_a[0];
+    pos_comp_b = pos_b[0]; vel_comp_b = vel_b[0]; q_simd   = q_b[0];
+
+    // Warm-up: one pass each so the loop bodies are I-cache resident
+    // and chunk pages are touched before timing.
+    ecs_chunk_each2(q_scalar, pos_comp_a, vel_comp_a, fn_ptr(_bench_chunk_scalar));
+    ecs_chunk_each2(q_simd,   pos_comp_b, vel_comp_b, fn_ptr(_bench_chunk_simd));
+
+    // ── Scalar bench ───────────────────────────────────────────────
+    t0 = _stb_get_time_us();
+    for (i = 0; i < ITERATIONS; i++) {
+        ecs_chunk_each2(q_scalar, pos_comp_a, vel_comp_a, fn_ptr(_bench_chunk_scalar));
+    }
+    t1 = _stb_get_time_us();
+    dt_scalar = t1 - t0;
+
+    // ── SIMD bench ─────────────────────────────────────────────────
+    t0 = _stb_get_time_us();
+    for (i = 0; i < ITERATIONS; i++) {
+        ecs_chunk_each2(q_simd, pos_comp_b, vel_comp_b, fn_ptr(_bench_chunk_simd));
+    }
+    t1 = _stb_get_time_us();
+    dt_simd = t1 - t0;
+
+    // ── Correctness ────────────────────────────────────────────────
+    // Spot-check a mid-range entity. Both worlds applied the same
+    // physics step the same number of times, so positions must agree.
+    check_id = 12345;
+    pos_a_ptr = ecs_get(w_scalar, pos_comp_a,
+                        (1 * 0x100000000) + check_id);
+    pos_b_ptr = ecs_get(w_simd,   pos_comp_b,
+                        (1 * 0x100000000) + check_id);
+    pa_x = peekfloat_h(pos_a_ptr);
+    pa_y = peekfloat_h(pos_a_ptr + 4);
+    pb_x = peekfloat_h(pos_b_ptr);
+    pb_y = peekfloat_h(pos_b_ptr + 4);
+
+    // ── Report ─────────────────────────────────────────────────────
+    put("--- ECS archetype physics: ");
+    put(N_ENTITIES);
+    put(" entities x ");
+    put(ITERATIONS);
+    put(" iters ---\n");
+    put("scalar (per-entity peek/poke): ");
+    put(dt_scalar);
+    put(" us\n");
+    put("simd   (_vec_axpy_f32 chunks):  ");
+    put(dt_simd);
+    put(" us\n");
+
+    if (dt_simd <= 0) {
+        put("FAIL: simd timing dropped to 0us (timer too coarse)\n");
+        return 1;
+    }
+
+    put("ratio (scalar / simd, int floor): ");
+    put(dt_scalar / dt_simd);
+    put("x\n");
+
+    put("scalar @ idx 12345 pos = (");
+    put(pa_x); put(", "); put(pa_y); put(")\n");
+    put("simd   @ idx 12345 pos = (");
+    put(pb_x); put(", "); put(pb_y); put(")\n");
+
+    // Gate the perf claim. Raw SIMD ceiling is ~3.5-4x; ECS gate at
+    // 2x leaves ~50-100% headroom for chunk-walk overhead.
+    if (dt_scalar / dt_simd < 2) {
+        put("FAIL: SIMD gate requires ratio >= 2x\n");
+        return 1;
+    }
+
+    // Correctness: agreed final position bit-for-bit (same math, same
+    // order). The two halves of each entity must match between worlds.
+    if (pa_x != pb_x) {
+        put("FAIL: scalar/SIMD x diverged at idx 12345\n");
+        return 1;
+    }
+    if (pa_y != pb_y) {
+        put("FAIL: scalar/SIMD y diverged at idx 12345\n");
+        return 1;
+    }
+
+    put("PASS\n");
+    return 0;
+}

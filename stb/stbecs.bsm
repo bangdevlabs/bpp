@@ -2,6 +2,17 @@
 // layouts: SoA flat (legacy, the default below) and AoSoA chunked
 // (archetype path, added 2026-05-12).
 //
+// Portability tier: this cartridge stays C-emit-clean. ECS storage,
+// queries, and chunk walkers compile through both the native backends
+// (ARM64 / x86_64) and the C transpile path. SIMD helpers (vec_*) are
+// native-only opt-in builtins — putting them inside this file would
+// regress C-emit coverage for every consumer that imports stbecs. Games
+// that want SIMD-batched physics call the vec_* builtins directly from
+// their own code (or, when a second consumer arrives, from a sibling
+// `stbsimd.bsm` cartridge that explicitly trades C-emit support for
+// SIMD). See `tests/bench_ecs_physics_simd.bpp` for the canonical
+// pattern.
+//
 // Pick the layout by workload (see `docs/tonify_checklist.md` Rule 30
 // for the decision matrix):
 //
@@ -536,6 +547,54 @@ void ecs_physics(w, dt) {
         if (peek(w.alive + i)) {
             w.pos_x[i] = w.pos_x[i] + w.vel_x[i] * dt / 1000;
             w.pos_y[i] = w.pos_y[i] + w.vel_y[i] * dt / 1000;
+        }
+    }
+}
+
+// Like `ecs_chunk_each` but yields TWO component pointers per chunk
+// callback. Iterates only archetypes that carry both comp_a and
+// comp_b; archetypes carrying neither or only one are skipped (the
+// two-component view cannot apply to them).
+//
+// Callback signature:
+//   (world, ptr_a, ptr_b, n_entities, stride_a, stride_b)
+//
+// ptr_a and ptr_b are the per-chunk SoA arrays for the two components;
+// stride_a / stride_b are bytes per entity. Both pointers refer into
+// the same chunk, so a SIMD pass that reads from one and writes to the
+// other (e.g. pos += vel * dt) stays cache-resident for the chunk's
+// lifetime.
+void ecs_chunk_each2(q, comp_a, comp_b, fn) {
+    auto eq: EcsQuery, w: World, ai, ar: ArchetypeRec;
+    auto k, ck, chunk_ptr, n_in_chunk, remaining;
+    auto found_a, found_b, off_a, off_b, sz_a, sz_b;
+    eq = q;
+    w = eq.world;
+    for (ai = 0; ai < w.archetype_count; ai++) {
+        ar = arr_get(w.archetypes, ai);
+        found_a = 0 - 1;
+        found_b = 0 - 1;
+        for (k = 0; k < ar.comp_count; k++) {
+            if (ar.comp_ids[k] == comp_a) { found_a = k; }
+            if (ar.comp_ids[k] == comp_b) { found_b = k; }
+        }
+        if (found_a < 0) { continue; }
+        if (found_b < 0) { continue; }
+        off_a = ar.comp_offsets[found_a];
+        off_b = ar.comp_offsets[found_b];
+        sz_a  = ar.comp_sizes[found_a];
+        sz_b  = ar.comp_sizes[found_b];
+        remaining = ar.total_entities;
+        for (ck = 0; ck < ar.chunk_count; ck++) {
+            chunk_ptr = arr_get(ar.chunks, ck);
+            if (remaining >= ar.entities_per_chunk) { n_in_chunk = ar.entities_per_chunk; }
+            else                                    { n_in_chunk = remaining; }
+            if (n_in_chunk > 0) {
+                call(fn, w,
+                     chunk_ptr + off_a, chunk_ptr + off_b,
+                     n_in_chunk, sz_a, sz_b);
+            }
+            remaining = remaining - n_in_chunk;
         }
     }
 }

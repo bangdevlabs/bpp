@@ -1,0 +1,143 @@
+import "bpp_io.bsm";
+
+// bench_simd_raw.bpp — RTS Stress Arc Session 3 Step 0: SIMD ceiling probe.
+//
+// Measures the raw codegen quality of B++'s vector intrinsics against a
+// hand-written scalar loop on a 1M-float buffer. This is the empirical
+// anchor that calibrates Session 3's gate: if the raw SIMD ceiling is
+// not >= 3x, then an ECS-level chunk-walking primitive cannot exceed
+// that ceiling either, and the Session 3 plan has to scale its claim
+// to what the codegen actually delivers.
+//
+// Why 1M floats: at 4 bytes each, three buffers (a, b, out) total 12MB —
+// past every L2 on commodity hardware. Memory bandwidth dominates, which
+// is the regime an RTS hot loop touching tens of thousands of units
+// actually runs in. A smaller buffer fits in L1 and rewards arithmetic
+// throughput unfairly; a much larger buffer adds page-fault noise.
+//
+// Why REPS=20: a single 1M-float pass takes a few milliseconds; one pass
+// alone is too short for _stb_get_time_us (microsecond granularity) to
+// distinguish scalar from SIMD reliably. Twenty passes amortise startup
+// jitter (page-touch, branch warmup) over a stable steady-state.
+//
+// The scalar loop uses peekfloat_h / pokefloat_h directly (not the
+// read_f32 / write_f32 wrappers in bpp_buf) so the comparison measures
+// codegen, not function-call cost. The SIMD path's vec_load4 / vec_add4
+// / vec_store4 are inline-emitted by the codegen and have no call
+// overhead, so the scalar baseline must be on the same footing.
+
+const N = 1000000;
+const REPS = 20;
+
+main() {
+    auto a, b, out;
+    auto i, r;
+    auto i_byte;
+    auto t0, t1, dt_scalar, dt_simd;
+    auto seed_a: half float;
+    auto seed_b: half float;
+    auto sum_val: half float;
+    auto va: double;
+    auto vb: double;
+    auto vsum: double;
+    auto checksum_scalar: half float;
+    auto checksum_simd: half float;
+
+    // Allocate three 4MB buffers — past L2 on common hardware. Plain
+    // malloc is fine: backend always emits unaligned-tolerant LDR Q /
+    // MOVUPS (per Phase B4 design), and malloc already returns
+    // 16-byte-aligned pointers since Phase A2.
+    a = malloc(N * 4);
+    b = malloc(N * 4);
+    out = malloc(N * 4);
+
+    // Seed both buffers with a non-trivial repeating pattern so the
+    // compiler cannot fold the sum to a constant. Two-loop seeding so
+    // each buffer's pages are pre-touched before the timed sections.
+    seed_a = 1.25;
+    seed_b = 2.5;
+    for (i = 0; i < N; i++) {
+        pokefloat_h(a + i * 4, seed_a);
+        pokefloat_h(b + i * 4, seed_b);
+    }
+
+    // Warm-up: touch out so its pages are present and TLB is warm
+    // before timing. Also serves as a correctness sanity rehearsal.
+    for (i = 0; i < N; i++) {
+        pokefloat_h(out + i * 4, 0.0);
+    }
+
+    // ── Scalar baseline ─────────────────────────────────────────────
+    // One add per lane via direct peekfloat_h / pokefloat_h. The
+    // backend emits LDR S + LDR S + FADD S + STR S per iteration on
+    // arm64, MOVSS-equivalents on x86_64. No function call overhead.
+    t0 = _stb_get_time_us();
+    for (r = 0; r < REPS; r++) {
+        for (i = 0; i < N; i++) {
+            sum_val = peekfloat_h(a + i * 4) + peekfloat_h(b + i * 4);
+            pokefloat_h(out + i * 4, sum_val);
+        }
+    }
+    t1 = _stb_get_time_us();
+    dt_scalar = t1 - t0;
+
+    // Capture a representative output value so the optimiser cannot
+    // dead-code the whole scalar loop. Print after both passes for
+    // a sanity-check side-by-side.
+    checksum_scalar = peekfloat_h(out + 12345 * 4);
+
+    // ── SIMD path ───────────────────────────────────────────────────
+    // Four lanes per iteration via vec_load4 / vec_add4 / vec_store4.
+    // Backend emits LDR Q + LDR Q + FADD .4S + STR Q on arm64,
+    // MOVUPS + ADDPS + MOVUPS on x86_64. The step is 16 bytes
+    // because N is a multiple of 4 by construction (1M / 4 = 250K).
+    t0 = _stb_get_time_us();
+    for (r = 0; r < REPS; r++) {
+        for (i_byte = 0; i_byte < N * 4; i_byte = i_byte + 16) {
+            va = vec_load4(a + i_byte);
+            vb = vec_load4(b + i_byte);
+            vsum = vec_add4(va, vb);
+            vec_store4(out + i_byte, vsum);
+        }
+    }
+    t1 = _stb_get_time_us();
+    dt_simd = t1 - t0;
+
+    checksum_simd = peekfloat_h(out + 12345 * 4);
+
+    // ── Report ──────────────────────────────────────────────────────
+    put("--- SIMD ceiling probe: 1M floats x ");
+    put(REPS);
+    put(" reps ---\n");
+    put("scalar  (LDR S / FADD S / STR S): ");
+    put(dt_scalar);
+    put(" us\n");
+    put("simd    (LDR Q / FADD 4S / STR Q): ");
+    put(dt_simd);
+    put(" us\n");
+
+    if (dt_simd <= 0) {
+        put("FAIL: simd timing dropped to 0us (timer too coarse)\n");
+        return 1;
+    }
+
+    // Integer ratio rounded down — informational only. The full ratio
+    // can be eyeballed from the two us totals.
+    put("ratio (scalar / simd, int floor): ");
+    put(dt_scalar / dt_simd);
+    put("x\n");
+
+    // Correctness — both paths must agree at the spot-check index.
+    // 1.25 + 2.5 = 3.75; pokefloat_h round-trip preserves the bits.
+    put("checksum scalar @ idx 12345 (expect 3.75): ");
+    put(checksum_scalar);
+    put("\n");
+    put("checksum simd   @ idx 12345 (expect 3.75): ");
+    put(checksum_simd);
+    put("\n");
+
+    free(a);
+    free(b);
+    free(out);
+    return 0;
+}

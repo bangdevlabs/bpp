@@ -1,5 +1,83 @@
 # B++ Bootstrap Journal
 
+## 2026-05-12 — RTS Stress Arc Session 3 SHIPPED + portability-tier convention captured
+
+Session 3 closed the SIMD-batching gap on the archetype path. The
+ECS chunk walker `ecs_chunk_each2` (two-component yield) lives in
+`stb/stbecs.bsm`; the SIMD math helper `_vec_axpy_f32` lives in
+the bench that consumes it. The split was forced by a Rule 28
+audit triggered mid-session, and the lesson is worth pinning here
+so future agents do not relearn it.
+
+**The empirical anchor (Step 0)** — `tests/bench_simd_raw.bpp`
+measured the raw codegen ceiling: scalar `LDR S / FADD S / STR S`
+vs `LDR Q / FADD .4S / STR Q` on 1M-float buffers across 20 reps.
+Four runs averaged ~3.87x. Theoretical ceiling for a 4-wide SIMD
+op is 4x; hitting nearly that meant the backend's vector codegen
+is healthy and the Session 3 gate (>=2x) could sit comfortably
+below the raw ceiling with room for chunk-walk overhead.
+
+**The ECS-level result** — `tests/bench_ecs_physics_simd.bpp` ran
+50K entities through `pos += vel * dt` 200 times. Scalar path
+(per-entity peek/poke through `ecs_chunk_each2`) vs SIMD path
+(same walker, callback delegates the whole chunk to `_vec_axpy_f32`).
+Measured ratio: ~3.85x. The chunk-walk overhead is essentially
+zero — the ECS layer is paying for almost none of the work.
+Bit-for-bit position equality between paths confirms correctness.
+
+**The course correction (Rule 28 in action)** — the first cut put
+`vec_axpy_f32` inside stbecs.bsm next to `ecs_chunk_each2`. C-emit
+suite immediately dropped from 128/0/39 to 124/4/39 because the
+four pre-existing ECS tests transitively import stbecs and the C
+emitter has no `_mm_*` intrinsic mapping (documented as intentional
+in `src/backend/c/bpp_emitter.bsm:1626`). The instinct was to open
+a sidequest and teach the C emitter about vec_* — ~200-300 LOC of
+emitter type-system refactor.
+
+User reframed via Rule 28 framework:
+
+1. **Killer use case test** — zero real consumers demand SIMD via
+   the C-emit path. The four broken tests do not test SIMD; they
+   test ECS data structures and got hit transitively.
+2. **Smaller tool test** — keep `vec_axpy_f32` out of stbecs.
+   The bench is the only consumer; let the bench own the helper.
+   Per Rule 20 (two-consumer), promote to `stb/stbsimd.bsm` only
+   when a second real consumer arrives.
+3. **Industry alignment** — C itself is a two-tier language. SSE
+   and AVX intrinsics live in `<immintrin.h>` extensions, not
+   ANSI C. Programs targeting portable C lose SIMD. B++ mirroring
+   that split (vec_* native-only, stb cartridges C-emit-clean)
+   is alignment with industry practice, not a portability hole.
+
+10 minutes of refactor restored 128/0/39 + 155/0/12. The deferred
+C-emit SIMD sidequest is logged in `docs/todo.md` with explicit
+Rule 20 triggers (two shipped real consumers + a target where
+only C-emit is available).
+
+**The lesson worth pinning** — stb cartridges stay C-emit-portable
+by default. SIMD primitives are native-only opt-in. When a module
+genuinely needs SIMD inside its surface, either (a) split into a
+sibling cartridge that opts out of C-emit explicitly, or (b) open
+the C-emit SIMD sidequest. Not a tonify rule yet — needs two or
+three real violations before the pattern earns one.
+
+The Session 3 close also locked in the **AVX-256 / AVX-512 anti-
+feature decision** as a permanent addendum on `docs/rts_stress_arc.md`.
+Industry audit (Quora, Steam Hardware Survey, Unreal docs, Unity
+Burst, PhysX, Wikipedia) confirmed games ship on SSE2/NEON baseline
+13 years after AVX2 released. B++ committed to `vec_*4` as the
+SIMD ceiling — same baseline real games hit, fully portable across
+both native backends, no runtime CPU dispatch complexity, no AVX
+downclocking penalty.
+
+Suite: 155/0/12 native + 128/0/39 C-emit. Bootstrap byte-stable.
+RTS Stress Arc Sessions 1+2+3 closed same-day per the
+continuous-execute directive. Next session is Session 4 (flow
+fields pathfinding), independent of the SIMD work, player's call
+on whether to open immediately or interleave Wolf3D Phase 2.
+
+---
+
 ## 2026-05-11 — Wolf3D Phase 2 Session 0 polish: level hot-reload end-to-end + UI overflow fix + const-string pitfall graduated
 
 The Session 0 ship landed with two paper cuts that surfaced on
