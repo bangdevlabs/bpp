@@ -141,12 +141,18 @@ static auto pure_ext;
 // compiler to verify the safety contract. When `_cgb_walk` sees a
 // T_CALL to one of these names with a `fn_ptr(target)` literal in
 // the args, it looks up `fn_phase_hint[target]` and emits W031 if
-// the target is not `@safe`. Killer use cases (per Rule 28 audit):
-// `maestro_register_base` (worker thread entry — race latent if not
-// safe) and `job_submit` (worker task — same risk class). Other
-// register_* functions are bounded but main-thread, so they don't
-// carry the same race surface; expand this list when a real bug
-// surfaces.
+// the target is not `@safe`. Killer use cases: worker-thread dispatch
+// (`job_submit`, `job_parallel_for`) where the fn argument runs in
+// a worker pool with bounded-time / no-malloc expectations.
+//
+// `maestro_register_*` are NOT on this list. They register main-thread
+// phase callbacks (base / solo / render) that maestro_run() calls
+// directly via `call(_ms_cb_*, ...)` inside the main loop, not from a
+// worker. Phase callbacks routinely orchestrate workers via job_submit
+// (which can block on sys_usleep when a queue is full); marking them
+// `@safe` would trigger W026 by construction. The bounded-worker
+// contract belongs on the fn passed to job_submit, not on the
+// dispatcher that issued the submit.
 static auto _safe_sinks;
 
 // Extern effect table for Level 4 sub-step B. Parallel arrays mapping
@@ -229,11 +235,14 @@ void init_dispatch() {
     // Seed the `@safe`-suggestion sinks. Each name registered here
     // turns into a W031 warning whenever the compiler sees a
     // `fn_ptr(target)` argument and `target` is not annotated `@safe`.
-    // Initial set covers the worker-thread entry points where a
-    // missing `@safe` is a latent race or audible glitch waiting to
-    // happen. See Task 4 in `docs/todo.md` for the Rule 28 audit.
-    _safe_sinks = arr_push(_safe_sinks, _dsp_pack_cstr("maestro_register_base"));
+    // The set covers worker-pool dispatch sinks where the fn argument
+    // runs on a worker thread under bounded-time / no-malloc
+    // expectations. Phase callbacks (maestro_register_*) are NOT
+    // here — they run on the main thread and may block on worker
+    // dispatch by design. See the `_safe_sinks` declaration block above
+    // for the full rationale.
     _safe_sinks = arr_push(_safe_sinks, _dsp_pack_cstr("job_submit"));
+    _safe_sinks = arr_push(_safe_sinks, _dsp_pack_cstr("job_parallel_for"));
 
     // Seed the pure-extern set with builtins the compiler emits inline
     // and that have no observable side effect. Without this seed the
@@ -332,8 +341,8 @@ void add_pure_extern(name_p) {
 }
 
 // Return 1 if `name_p` is registered as a `@safe`-suggestion sink
-// (e.g. `maestro_register_base`, `job_submit`). Used by `_cgb_walk`
-// to decide whether to scan the call's arguments for fn_ptr literals
+// (e.g. `job_submit`, `job_parallel_for`). Used by `_cgb_walk` to
+// decide whether to scan the call's arguments for fn_ptr literals
 // whose target should be `@safe`. Content comparison (packed_eq)
 // handles the same-identifier-different-vbuf-offset case.
 _is_safe_sink(name_p) {
@@ -1259,13 +1268,13 @@ static _cgb_walk(nd) {
             }
         }
         // W031 — `@safe`-suggestion. When the call target is a
-        // registration sink (maestro_register_base, job_submit), scan
+        // worker-dispatch sink (job_submit, job_parallel_for), scan
         // the args for `fn_ptr(target)` literals and check that
         // `target` is annotated `@safe`. The annotation is the only
         // way the compiler can verify the bounded-time / no-malloc
-        // contract; without it, a worker thread or audio path that
-        // grows a malloc later goes undetected until it manifests as
-        // a race or audible glitch under load.
+        // contract for the worker callback; without it, a worker
+        // thread that grows a malloc later goes undetected until it
+        // manifests as a race under load.
         if (_is_safe_sink(name_p)) {
             auto _ws_i, _ws_arg: Node, _ws_fp: Node, _ws_fp_name;
             auto _ws_target: Node, _ws_target_idx;
