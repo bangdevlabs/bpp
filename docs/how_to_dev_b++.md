@@ -1912,9 +1912,30 @@ hook used by ModuLab + games that animate sprite atlases.
 
 ## Game systems (Caps 41-43)
 
-**stbecs** — Entity-Component-System. `ecs_spawn` returns a handle;
-components added per-entity via `ecs_set_*`. Custom components via
-`ecs_component_new(world, sizeof(MyComponent))`.
+**stbecs** — Entity-Component-System. Two storage layouts coexist
+(see `tonify_checklist.md` Rule 30 for the decision rule):
+
+- **SoA flat** (default — `ecs_spawn` / `ecs_set_pos` / `ecs_alive`):
+  parallel `buf_word` arrays per component. One contiguous run per
+  field across all entities. Right for homogeneous worlds with a few
+  components touched in dense loops — pathfind, snake, fps_wolf3d.
+- **AoSoA chunked** (opt-in — `ecs_component_register` /
+  `ecs_archetype` / `ecs_spawn_at` / `ecs_chunk_each`): entities with
+  the same component set live in 16 KB chunks; each chunk is SoA
+  internally. Right for heterogeneous worlds with sparse queries
+  (e.g. RTS with 30 unit types where only 5K of 50K entities are
+  combatants).
+
+Both paths feed the same `ecs_query_each` iterator. Migration is
+per-game, optional, never forced. Custom word-sized components via
+`ecs_component_new(world, sizeof(MyComponent))` work alongside both.
+
+**Never roll AoS** (`struct Entity { x, y, vx, vy }; entities[N]`)
+for the per-frame hot loop. It strides past unused fields per entity
+and breaks SIMD-friendliness. SoA flat or AoSoA chunked are the
+right defaults — AoS belongs to the 1990s C++ era that modern AAA
+(Bevy, Unity DOTS, Flecs) all left behind. Rule 30 has the full
+rationale + decision matrix.
 
 **stbphys** — platformer physics. Collide-and-slide AABB against
 Tilemap, gravity, jump, state machine (idle/run/jump/fall).

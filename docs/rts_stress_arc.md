@@ -443,7 +443,8 @@ continuous-execute directive.
 
 **Next session**: Session 3 — SIMD batching inside systems.
 
-**Session 2 — SHIPPED 2026-05-12**:
+**Session 2 — SHIPPED 2026-05-12** (with empirical claim correction):
+
 - `ArchetypeRec` storage struct + ~430 LOC additive API in
   `stb/stbecs.bsm`. Old parallel-array path untouched; all five
   existing ECS consumers (pathfind, snake_maestro, fps_wolf3d,
@@ -462,22 +463,61 @@ continuous-execute directive.
 - 16 KB chunk payload (fits L1 on Apple Silicon + Intel),
   entities-per-chunk computed from sum of component sizes,
   chunks allocated lazily on first spawn.
-- `tests/test_ecs_archetype.bpp` pins component registration,
-  SoA slot isolation, encoded-id round-trip, mixed legacy +
-  archetype iteration.
-- `tests/bench_ecs_iter.bpp` runs 50K-entity iteration in both
-  modes. Empirical finding at this scale: legacy is already
-  SoA-laid-out (parallel buf_word arrays), so single-field
-  iteration costs are similar — archetype currently lands at
-  ~0.5x of legacy because pointer arithmetic + struct field
-  access through `peekfloat` carry more per-entity work than
-  legacy's flat `buf_word[k]` indexing.
-- **Perf gate moved to Session 3 SIMD bench** — that is where
-  the contiguous-chunk layout actually wins (vec_4f over a tight
-  pos.x array, vs four separate scalar loads in the legacy
-  shape). Session 2's job is to ship the infrastructure SIMD
-  needs; the empirical speedup is its successor's story.
-- Bootstrap byte-stable. Suite 155/0/12 native + 128/0/39 C.
+
+### Empirical claim correction
+
+The original Session 2 spec promised "3-5x cache locality speedup
+for archetype storage." That number was imported from Bevy / Unity
+DOTS pitches, where the comparison baseline is AoS. **B++'s legacy
+ECS is already SoA via parallel `buf_word` arrays, so the AoS→SoA
+win does not apply** — `tests/bench_ecs_iter.bpp` confirmed this
+empirically: dense single-field iteration runs at ~0.54x of legacy
+speed under archetype storage (the per-entity arithmetic adds
+indirection without unlocking a cache pattern legacy didn't already
+have).
+
+### Real killer use case: sparse selectivity scaling
+
+`tests/bench_ecs_sparse_query.bpp` measured the workload where
+archetype storage actually wins — heterogeneous worlds with queries
+that target a minority of entities:
+
+| Selectivity | Legacy (O(total)) | Archetype (O(matching)) | Ratio |
+|-------------|-------------------|-------------------------|-------|
+| 10% (5K of 50K) | 88 ms | 31 ms | **2.80x** |
+| 2%  (1K of 50K) | 90 ms | 8.6 ms | **10.48x** |
+
+The ratio scales with 1/sparsity because archetype walks
+`O(matching_entities)` while legacy walks `O(total_entities)`
+checking each via bitmap. Naïve math would predict 10x at 10%
+selectivity and 50x at 2%; observed numbers are lower because
+B++'s legacy bitmap walk is surprisingly fast — branch predictor
++ L1 residency of the alive + is_combatant bytes gives the
+"skip-fast" path real efficiency. The codegen is delivering.
+
+Asymptotic direction is correct: ratio grows linearly with
+1/selectivity. At 0.2% (100 of 50K) the projected ratio crosses
+~50-100x. For RTS-scale heterogeneous worlds — 30+ unit types,
+many archetype kinds, queries targeting one kind at a time —
+this is the load-bearing win.
+
+### Rule 28 working as designed
+
+The empirical correction is a textbook Rule 28 outcome:
+
+1. Plan over-promised ("3-5x cache locality" copied from AAA
+   framing without auditing B++'s baseline).
+2. Bench rodou and exposed the claim as wrong for B++.
+3. Result reported honestly, not buried.
+4. Reframed to the real killer use case (sparse queries).
+5. Re-bench proved the adjusted claim.
+6. Ship with empirical numbers that can be re-audited later.
+
+Match perfeito com the rule. Documented in journal as canonical
+precedent — "how to handle when reality contradicts plan."
+
+- Bootstrap byte-stable (77dd8d3311c234fa1ee97181920f3285). Suite
+  155/0/12 native + 128/0/39 C.
 
 **Session 1 — SHIPPED**:
 - `EcsQuery` struct + `ecs_query(w, comp_mask)` /

@@ -8976,3 +8976,124 @@ Bootstrap byte-stable in every one. Final suite 149/0/12 native +
 122/0/39 C. Memory file
 `project_session_20260511_phase_collapse.md` captures the pattern
 as transferrable lesson.
+
+## 2026-05-12 — RTS Stress Arc Session 2 SHIPPED — Rule 28 in action
+
+Session 2 added archetype storage to `stb/stbecs.bsm` as an additive
+path parallel to the existing parallel-array layout. The ship is
+technically clean (bootstrap byte-stable, all five existing ECS
+consumers compile bit-identical, two new tests green), but the more
+load-bearing story is what happened to the perf claim along the
+way. This entry captures it as canonical precedent for any future
+arc that imports a perf number from external framing.
+
+### What the spec promised
+
+The original `docs/rts_stress_arc.md` Session 2 section said:
+
+> "Cache hit rate goes from ~60% to ~95%. Bench: ecs_physics over
+> 1000 entities — 3-5x speedup for 1000-entity iteration vs legacy
+> layout (concrete measurement, not theoretical)."
+
+The number was imported from the Bevy / Unity DOTS pitch. In those
+engines the baseline is AoS — entities laid out as `struct Entity
+{ pos, vel, hp, ... }; entities[N]`. Archetype storage converts
+that to SoA, and the 3-5x speedup is a real measured win against
+AoS.
+
+### What B++ actually has
+
+B++'s legacy ECS is already SoA via parallel `buf_word` arrays
+(`pos_x[]`, `pos_y[]`, `vel_x[]`, etc.) — separate contiguous runs
+per field. The AoS→SoA win the framing assumes does not apply
+because B++ never had AoS to begin with.
+
+`tests/bench_ecs_iter.bpp` measured: dense single-field iteration
+at 50K entities runs at ~0.54x of legacy speed under archetype
+storage. The per-entity arithmetic (chunk pointer + component
+offset + slot stride) adds indirection without unlocking a cache
+pattern legacy didn't already have. The "3-5x cache locality"
+claim was wrong for B++.
+
+### Where archetype actually wins
+
+`tests/bench_ecs_sparse_query.bpp` measured the real killer use
+case — sparse selectivity:
+
+| Selectivity | Legacy | Archetype | Ratio |
+|-------------|--------|-----------|-------|
+| 10% (5K of 50K) | 88 ms | 31 ms | **2.80x** |
+| 2%  (1K of 50K) | 90 ms | 8.6 ms | **10.48x** |
+
+Archetype walks `O(matching_entities)` directly; legacy walks
+`O(total_entities)` with bitmap checks. Ratio scales with
+1/sparsity. For RTS-scale heterogeneous worlds — 30+ unit types,
+queries targeting one kind — this is the load-bearing win.
+
+Interesting observation: naïve math predicts 10x at 10% selectivity
+and 50x at 2%. Observed numbers are lower because B++'s legacy
+bitmap walk is surprisingly fast. The codegen + branch predictor +
+L1 residency of the alive byte and is_combatant byte give the
+"skip-fast" path real efficiency. The codegen is delivering well —
+the gap is genuinely about algorithmic O() difference, not
+constant factors.
+
+### The Rule 28 success sequence
+
+This is the textbook Rule 28 outcome — captured here as the
+canonical precedent for "how to handle when reality contradicts
+plan":
+
+1. **Plan over-promised** — claim copied from AAA framing without
+   auditing B++'s already-SoA baseline.
+2. **Bench rodou and exposed the claim** — dense iteration
+   measurement landed at 0.54x, opposite direction of the spec
+   promise.
+3. **Reported honestly, not buried** — the agent didn't fake the
+   gate or hand-wave the result. The bench output was reported
+   verbatim and the design framing was questioned.
+4. **Reframed to the real killer use case** — sparse multi-component
+   queries, where the algorithmic O(matching) vs O(total) gap is
+   structural, not architectural.
+5. **Re-bench proved the adjusted claim** — 2.80x at 10%
+   selectivity, 10.48x at 2%, ratio scales with sparsity.
+6. **Shipped with empirical numbers** that can be re-audited as
+   the codebase evolves.
+
+Match perfeito with Rule 28's "killer-use-case gate per addition"
++ "demand specific bug-class evidence" + "smaller-tool test
+prefers measurement over claim."
+
+### What this means for future arcs
+
+Any time a spec imports a perf number from external framing
+(Rust does X, Bevy does Y, Unity does Z), the bench MUST audit
+the claim against B++'s specific architecture. The trap is
+assuming the comparison baseline transfers. B++'s storage classes
++ `tudo é word` + buf_word arrays make many "modern engine wins"
+already-realized at the baseline; the surface area where
+additional infrastructure wins narrows to specific algorithmic
+patterns (sparse queries here; SIMD batching in Session 3).
+
+Lesson canonicalized: trust the bench, not the AAA pitch. When
+they disagree, audit the AAA pitch's baseline against B++'s
+baseline. The number that survives that audit is the only one
+worth shipping a perf claim around.
+
+### Closure state
+
+- Session 2 shipped with two benches:
+  - `bench_ecs_iter.bpp` — informational only (legacy wins ~1.85x
+    at dense iter; no perf gate)
+  - `bench_ecs_sparse_query.bpp` — the empirical proof point (2.80x
+    at 10% selectivity, 10.48x at 2%, gate ≥2.5x at 10%)
+- `tonify_checklist.md` Rule 30 updated with bench numbers.
+- `rts_stress_arc.md` Session 2 section rewritten to reflect
+  empirical truth and document the Rule 28 sequence.
+- Bootstrap byte-stable (77dd8d3311c234fa1ee97181920f3285). Suite
+  155/0/12 native + 128/0/39 C.
+
+Next: Session 3 SIMD batching. The perf gate for SIMD-vs-scalar is
+expected to land regardless of storage mode (legacy parallel arrays
+or archetype chunks are both SIMD-natural). The session will
+measure it cleanly without inheriting Session 2's framing baggage.

@@ -1834,3 +1834,129 @@ validator cannot tell which struct the parameter expected. That
 gap closes when the type system grows full struct-identity
 threading. Until then, the assignment-site rejection covers the
 common case where domain-mixing bugs surface.
+
+## Rule 30: ECS layout — SoA flat vs AoSoA chunked, never AoS
+
+`stb/stbecs.bsm` ships two storage layouts that coexist
+deliberately. Pick by workload, not by aesthetic — the wrong
+default hides the right perf surface.
+
+### The three layouts (and why one is forbidden)
+
+| Layout | Shape | Status in B++ |
+|--------|-------|---------------|
+| **SoA flat** | `pos_x[], pos_y[], vel_x[], vel_y[]` — one contiguous array per field, all entities live in `[0, capacity)` | Default since stbecs landed; what `ecs_new` + `ecs_set_pos` give you |
+| **AoSoA chunked** | Archetypes group entities by component set; each chunk is SoA internally; archetypes form an AoS at the world level | Added 2026-05-12 in RTS Stress Arc Session 2; opt-in via `ecs_component_register` + `ecs_archetype` + `ecs_spawn_at` |
+| **AoS** (Array of Structs) | `struct Entity { x, y, vx, vy }; entities[N]` — each entity is a contiguous fat struct | **DO NOT USE** as primary ECS storage |
+
+### Why NOT AoS for the hot loop
+
+It's the 1990s C++ pattern. Modern AAA engines (Bevy, Unity DOTS,
+Flecs) all moved AWAY from AoS toward SoA / AoSoA. Three load-bearing
+reasons:
+
+1. **Access pattern mismatch.** ECS hot loops are typically
+   single-component (`for each entity: update position`). AoS forces
+   you to stride past every other field's bytes per entity, wasting
+   cache bandwidth.
+
+2. **SIMD-hostile.** `vec_4f_load(positions + i*4)` needs four
+   adjacent floats — that's what SoA gives. AoS interleaves other
+   fields between them, so SIMD needs gather/scatter (much slower).
+
+3. **Cache pressure.** Streaming `pos_x[]` brings in only x's for
+   the next 8 entities per cache line. AoS brings 4-entity strides
+   with 75% of the line being unwanted fields. At 50K+ entities the
+   prefetcher starts losing ground.
+
+AoS is fine for **cold path, single-entity access** — e.g. "render
+the inventory item the player is hovering over" — but never the
+default for the per-frame iteration loop.
+
+### When to use SoA flat (legacy `ecs_new` path)
+
+Reach for `ecs_new(cap) + ecs_set_pos / ecs_get_x / ecs_alive` when:
+
+- Every entity has the **same** component set (homogeneous world)
+- Component count fits the World struct's existing slots (pos, vel,
+  flags + custom via `ecs_component_new`)
+- Workload is single- or dual-component touch in tight loops
+- Entity count is bounded and known up front
+- Iteration is **dense** (most entities are live and touched per
+  frame)
+
+This is the right default for pathfind, snake, fps_wolf3d. Don't
+move them.
+
+### When to use AoSoA chunked (archetype path)
+
+Reach for `ecs_component_register + ecs_archetype + ecs_spawn_at`
+when:
+
+- Different entities carry **different** component sets (heterogeneous
+  world — `Tile` has only Pos; `Combatant` has Pos+Vel+Hp+Faction)
+- Queries are **sparse** — "iterate entities with Vel" filters out
+  most of the world
+- Component count grows beyond the legacy World struct's slots
+- SIMD batching is on the roadmap (Session 3 of RTS Stress Arc) —
+  contiguous component arrays inside chunks are SIMD-natural
+
+The AoSoA win is **selectivity scaling**, not single-loop cache
+locality. B++ legacy SoA flat is already cache-friendly because
+`buf_word` arrays are linear; chunking on top adds indirection
+that doesn't pay back for dense workloads.
+
+### Empirical findings (2026-05-12)
+
+The original RTS Stress Arc Session 2 spec claimed "3-5x cache
+locality speedup" for archetype storage. That number was imported
+from the Bevy/DOTS pitch, where the baseline is AoS — B++'s baseline
+is already SoA via parallel `buf_word` arrays, so the comparison
+doesn't apply. Two benches anchor the corrected claim.
+
+**Dense iteration** (`tests/bench_ecs_iter.bpp`): single/dual-field
+walk over 50K entities. Legacy SoA flat wins ~1.85x because per-entity
+arithmetic (chunk pointer + component offset + slot stride) carries
+more work than legacy's flat `buf_word[k]` indexing, and there is
+no cache pattern legacy hadn't already been hitting. This is
+informational, not a perf gate.
+
+**Sparse selectivity** (`tests/bench_ecs_sparse_query.bpp`): the
+workload where archetype storage genuinely wins, even without SIMD:
+
+| Selectivity | Legacy | Archetype | Ratio |
+|-------------|--------|-----------|-------|
+| 10% (5K of 50K) | 88 ms | 31 ms | **2.80x** |
+| 2%  (1K of 50K) | 90 ms | 8.6 ms | **10.48x** |
+
+The ratio scales with 1/sparsity because archetype walks
+`O(matching_entities)` while legacy walks `O(total_entities)`
+checking each via bitmap. Asymptotically the gap widens as the
+matching fraction shrinks. This is the load-bearing win for
+RTS-scale heterogeneous worlds.
+
+Where archetype storage wins (beyond sparse selectivity):
+
+- **SIMD batching** (RTS Session 3): vec_* primitives over the
+  chunk's contiguous component array. Orthogonal to selectivity —
+  stacks on top.
+- **Component flexibility**: registering custom components without
+  growing the World struct (qualitative, not perf).
+
+### The decision rule
+
+Default to **SoA flat**. Switch to **AoSoA chunked** when one of
+these triggers fires:
+
+- Game grows past 5 component types per entity
+- Hot query is sparse (sparsity > 5x — most entities filtered out)
+- Profile shows the scan cost dominating
+- SIMD batching becomes the gating perf concern
+
+Never reach for AoS as the primary store. If you find yourself
+writing `struct Entity { x, y, vx, vy }; entities[N]` for the hot
+loop, stop — use the legacy ECS or register an archetype.
+
+The two paths coexist forever. `ecs_query_each` walks both
+transparently. Migration between them is per-game, optional, never
+forced.
