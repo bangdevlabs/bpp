@@ -79,7 +79,37 @@ Bare `return;` (no expression) is supported in B++ and produces an implicit
 `return 0`. Use it in `void` functions for early-exit guards instead of
 the misleading `return 0;`.
 
-## Rule 4: Phase annotations (`@base` / `@solo` / `@time` / `@io` / `@gpu`)
+## Rule 4: Phase annotations — collapse direction locked 2026-05-11
+
+> **DIRECTION (locked 2026-05-11)**: the 8-phase system below
+> (`@base / @solo / @time / @io / @gpu` + internal `@heap / @panic
+> / @realtime`) is being collapsed to a 2-state user-facing model
+> (`@safe` + `@profile` + default no-annotation). Compiler internal
+> also collapses (4 states: AUTO / BASE / SOLO / SAFE).
+>
+> Implementation tracked at `docs/todo.md` →
+> "Phase annotation collapse — Multics → Unix simplification".
+> Trigger: after Excalibur Feature 1 closes.
+>
+> Until the collapse ships, **the description below documents
+> CURRENT CODE STATE (8 phases). When writing new code, prefer
+> the proposed model: pin `@safe` only on audio callbacks and
+> worker thread entries, leave everything else unannotated.**
+>
+> **Post-collapse user-facing model**:
+>
+> | Annotation | Use case | Compiler enforces |
+> |-----------|----------|-------------------|
+> | `@safe` | Audio callbacks, worker entry points, bounded-time paths | YES — rejects malloc / IO / syscalls / blocking |
+> | `@profile("name")` | Scoped instrumentation (Phase 6.3) | NO (metadata) |
+> | (none) | Default — full power, programmer responsibility | NO |
+>
+> Lesson from the over-engineering audit (see Rule 28 below):
+> annotations earn their keep ONLY when they catch a specific bug
+> class via compiler verification. Documentation-via-annotation
+> belongs in comments.
+
+### Current state — pre-collapse 8-phase model
 
 For functions where the intent is clear:
 
@@ -1618,3 +1648,112 @@ Bootstrap after EACH BATCH:
 Note: `--clean-cache` is a no-op (cache was removed in 2026-04-13). B++
 compiles everything from source on every run. The bootstrap check is
 `gen1 == gen2` (idempotent self-compilation), not a shasum pair.
+
+---
+
+## Rule 28: Killer use case gate — restraint over completion
+
+Discovered 2026-05-11 during the phase annotation over-engineering
+audit. The lesson is meta — it applies to every system-design
+decision in the language, not just one feature.
+
+### The pattern that creates over-engineering
+
+Each addition to a system feels locally rational:
+
+- "We need `PHASE_HEAP` so `@realtime` can reject malloc but
+  `@io` audio setup can still allocate." → justified by ONE
+  immediate need.
+- "We need `PHASE_PANIC` so `sys_exit` doesn't contaminate
+  effect propagation." → justified by ONE specific bug.
+- "We need `@io` and `@gpu` distinct for symmetry." → "completes
+  the lattice."
+
+Cumulatively, B++'s phase system grew from 2 useful phases
+(BASE/SOLO + TIME for audio safety) to 8 phases over a single
+long session in 2026-04-16. Most of the resulting expansion was
+inert metadata — propagating through the lattice without driving
+enforcement that any consumer used. ~500 redundant annotations
+accumulated in the codebase. Five months later (2026-05-11) we
+audited and decided to collapse back.
+
+### The rule — three checks before adding a feature
+
+Before adding a new annotation, type slice, builtin, phase,
+diagnostic, or any other surface-area addition to the language:
+
+**1. Killer use case test.** "What specific bug class does this
+catch that CANNOT be caught inside existing features?" If the
+answer is "completes the model" or "Rust/Swift/Zig has it" — red
+flag. Add the bug class to the answer, then re-evaluate. If you
+cannot name 2 specific real bugs this catches, the feature is
+speculative.
+
+**2. Smaller-tool test.** "Could a special-case rule, sentinel
+handling, or attribute on a builtin solve this without adding a
+new dimension to the system?" PHASE_HEAP could have been a rule
+inside `@realtime` ("realtime rejects malloc"), not a new phase.
+PHASE_PANIC could have been special-case handling of `sys_exit`
+in effect propagation, not a lattice bottom element. Prefer the
+smaller tool.
+
+**3. Restraint-bias convention test.** "Does the rule we're
+about to write bias toward adoption or restraint?" The original
+Rule 4 said "annotate when intent is obvious" — encouraged
+adoption, led to ~500 annotation sites. The restraint phrasing
+would be: "annotate ONLY when compiler verification is needed;
+comments are for documentation."
+
+### The post-mortem heuristics
+
+Specific patterns to watch for in future feature proposals:
+
+- **"Completes the model" justification** → demand specific
+  bug class, otherwise reject.
+- **Symmetry-driven additions** (we have IO, so we need GPU)
+  → ask if the asymmetry was actually causing problems.
+- **Long-session feature stacking** → at the end of a
+  ~6+ hour session, attention is depleted; the "let's also add
+  X while we're here" move suppresses the step-back audit.
+  Defer system-design additions to a fresh session.
+- **Documentation-via-annotation** → if the value is
+  communication-to-humans, use a comment. If it's
+  communication-to-the-compiler-for-proof, then the annotation
+  earns its keep.
+- **Match-Rust-vibe** → B++'s stated philosophy is "back to the
+  future, programmer freedom, less Rust verbosity." Rust-style
+  effect tracking (`unsafe`, `async`, `const fn`) is dimensional
+  pinning; we already explicitly chose NOT to follow it.
+
+### Quarterly system audit checklist
+
+Every ~3 months, step back from active work and audit:
+
+- Storage classes — still 3 (auto/static/extrn)? Should it grow?
+- Phase annotations — how many phases? Each earning its keep?
+- Tonify rules — how many? Reading the latest 5 added, do they
+  bias toward restraint or accretion?
+- Builtins — how many? Each used in real consumer code?
+- Type slices — how many? Real bugs caught?
+- Diagnostics — how many warnings? Each fires in real code?
+
+If any number GREW since last audit without a corresponding
+"killer use case" doc entry per addition: audit deeper before
+adding more.
+
+### Examples of the rule applied (project history)
+
+- **fxlab plan 2026-05-09**: agent proposed 1100-LOC plan with
+  codegen + MSL parser + .fx.meta + import keyword surgery.
+  Killer-use-case test rejected it. Collapsed to ~400 LOC.
+- **Vec2 promotion 2026-05-10**: agent wanted to wait for
+  two-consumer rule. User correctly identified Vec2 as
+  primitive-tier (always justified). Pre-existing rule needed
+  refinement.
+- **Phase annotation collapse 2026-05-11**: this rule.
+  System being collapsed precisely because earlier additions
+  failed the killer-use-case test retrospectively.
+
+The rule does not say "never add features." It says "demand
+specific bug-class evidence per addition, and prefer the smaller
+tool when the bug can be caught without expanding the system."

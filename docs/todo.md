@@ -112,10 +112,130 @@ Reference: `docs/games_roadtrip.md` Game 3.
 
 ---
 
+## Active — Excalibur Arc (strategic language polish)
+
+**Opened 2026-05-11.** Multi-session arc that lifts B++ into the
+modern game-dev language tier (Jai / Zig / Odin convergence) while
+preserving B++'s identity: storage class system, Tonify discipline,
+retro feel. Runs in parallel with the content arc; can be paused
+at any session boundary for Wolf3D / RPG / etc. work.
+
+**Canonical spec**: [`docs/excalibur_arc.md`](excalibur_arc.md) —
+read this first before any session here.
+
+Four features in sequence:
+
+1. **Polymorphic numeric literals** — literals carry shape until
+   slot context fixes the type. Kills `feedback_const_float_demotes`
+   bug class. ~150 LOC compiler + 80 tests across 3 sessions.
+
+2. **Cast builtins** — `floor_int` / `trunc_int` / `round_int`
+   replace typed-local thunks and ad-hoc `(long long)` casts.
+   ~50 LOC + 30 tests + -100 cleanup across 1 session.
+
+3. **Struct newtype** — opt-in `struct WorldPos as Vec2` with
+   compiler-enforced identity. World vs Grid mixing becomes
+   compile error. ~250 LOC + 80 tests across 3 sessions.
+
+4. **Templates / metaprogramming** — generic procedures with
+   compile-time substitution. Absorbs the "Metaprogramming"
+   entry below into the Excalibur frame. ~1500-2500 LOC across
+   5-8 sessions. Triggers when Features 1-3 close + 2 real
+   consumers ask (RTS metaprog + Adventure DSL + Excalibur 3
+   newtype operations).
+
+**FFI compatibility**: verified — none of the 4 features break
+extern surface. The orthogonal "FFI auto-marshalling" sidequest
+remains independent.
+
+**Current state**: Session 1.A (literal shape in lexer/parser)
+is next. ~50 LOC, pause-safe, no runtime behavior change.
+
+**Pause discipline**: each session ends with bootstrap byte-stable
++ suite green + Status section in `docs/excalibur_arc.md` updated
+with `next: <session ID>` marker. Wolf3D / other work can resume
+between any two sessions without conflict.
+
+---
+
 ## Engine-side sidequests (not blocking content arc)
 
 These tighten the engine but don't gate any content. Pick up
 opportunistically.
+
+### Phase annotation collapse — Multics → Unix simplification
+
+**Opened 2026-05-11.** Strategic simplification of the 8-phase
+annotation system to a binary user-facing model. Honors B++'s
+"tudo é word" philosophy (Unix-style one abstraction does many
+uses, unlike Multics-style specialized abstractions).
+
+**The diagnosis.** The current system has 8 phase tags
+(`@base`, `@solo`, `@time`, `@io`, `@gpu`, `@heap`, `@panic`,
+`@realtime`) in a flat namespace, mixing 5 orthogonal dimensions
+(time, space/resource, purity, control flow, instrumentation).
+Compiler internal logic already only consults BASE/SOLO + TIME
+for actual decisions — the rest is decoration that propagates
+through the lattice without driving enforcement. Per the
+diagnostic comment at `src/bpp_dispatch.bsm:156`: phase hints
+beyond BASE/SOLO are "inert tags ignored by W013 and dispatch
+logic". Codebase has accumulated ~500 redundant phase
+annotations as cultural drift.
+
+**The proposed model.** Two user-facing annotations replace the
+8-phase lattice:
+
+- **`@safe`** — bounded time + no malloc + no IO/GPU/syscall +
+  worker-thread-safe. Covers the killer use cases (audio
+  callback verification, multi-core worker safety). Compiler
+  enforces. Replaces `@time` semantically and pins what `@base`
+  was used for in worker contexts.
+- **`@profile("name")`** — scoped instrumentation (Phase 6.3).
+  Different category from effects; kept intact.
+- **default** (no annotation) — full power, no compiler
+  verification. Programmer is on their own.
+
+Internal `fn_effect` array (already in `bpp_dispatch.bsm`) keeps
+fine-grained effect tracking for optimization decisions
+(inlining, parallelization candidates). The user-facing namespace
+shrinks; compiler internal capability unchanged.
+
+**Tradeoffs audited (2026-05-11)**:
+- ✅ Zero performance loss — effect inference stays internal
+- ✅ Zero safety capability loss — audio + worker safety preserved
+- ✅ Zero optimization opportunity loss — `fn_effect` keeps tracking
+- 🟡 Reporting granularity reduces (errors say "unsafe context"
+  instead of "expected @io got @gpu") — cosmetic
+- 🟡 Annotation-as-documentation lost — mitigate with code comments
+
+**Net ship**:
+- Compiler: add `@safe` annotation + back-compat aliases for old
+  phases that map to it (`@time` → `@safe`, `@base` →
+  inferred). ~30 LOC compiler.
+- Tonify Rule 4: rewrite to reflect 2-state model. ~50 LOC docs.
+- Migration: grep + replace across codebase, remove redundant
+  annotations. -500 chars verbosity. ~2-3 hours focused work.
+- Tests: confirm audio callback verification still fires on
+  malloc, worker-safety inference still rejects shared-mutation
+  paths. ~30 LOC tests.
+
+**Total: ~3-4 hours focused work + bootstrap byte-stable in each
+phase. Net codebase change: subtraction.**
+
+**Step 0 — audit before commit**: 30 min grep audit in
+`src/bpp_dispatch.bsm` and `src/bpp_codegen.bsm` to confirm
+codegen doesn't depend on @io/@gpu/@heap distinctions for
+decisions beyond error reporting. If audit reveals a real
+codegen consumer of those phases, revise scope. Otherwise
+proceed with full collapse.
+
+**Trigger**: after Excalibur Feature 1 closes. Can interleave
+between Excalibur sessions if user wants the simplification
+faster (no codegen conflict with literal shape work).
+
+**Reference**: conversation 2026-05-11 with user — established
+the Multics-vs-Unix framing. Honors `feedback_cartridge_minimalism.md`
+spirit ("ship floor only, complexity is opt-in").
 
 ### Multi-core completion — Sprints A-G
 
@@ -442,9 +562,15 @@ Could land as early as the Adventure Puzzle demo prep.
 
 ---
 
-## Metaprogramming (Dev Loop 4)
+## Metaprogramming (Dev Loop 4) — ABSORBED INTO EXCALIBUR ARC
 
-Lands during RTS, not before. Two features:
+**Status 2026-05-11**: this work is now Feature 4 of the
+Excalibur Arc — see [`docs/excalibur_arc.md`](excalibur_arc.md).
+Same scope, same triggers (lands during RTS), now anchored
+to the strategic language arc instead of standalone Dev Loop.
+
+Original notes retained here for reference until Feature 4
+opens dedicated planning:
 
 - **`$T` generic parameters**: `swap($T, a, b) { auto tmp: T;
   ... }`. Compiler instantiates one AST copy per concrete type
@@ -458,6 +584,9 @@ Lands during RTS, not before. Two features:
 
 Also the foundation for bangscript's `scene { }` block
 rewriting.
+
+When Feature 4 of the Excalibur Arc opens, this section
+becomes the seed for the dedicated session decomposition.
 
 ---
 

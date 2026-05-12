@@ -553,6 +553,37 @@ does not enforce this, but every stdlib module follows it.
 
 ### §5.4 — Effect annotations (the five phases)
 
+> **DIRECTION LOCKED 2026-05-11**: the 5-phase model below
+> (`@solo / @base / @io / @gpu / @time` + internal `@heap / @panic`)
+> is being collapsed to a 2-state user-facing model
+> (`@safe` + `@profile` + default no-annotation). The 5-phase
+> description below documents CURRENT CODE STATE; existing code
+> uses these annotations and they still compile / verify as
+> documented. New code should prefer the proposed model:
+> pin `@safe` on audio callbacks + worker entries, leave the
+> rest unannotated.
+>
+> Implementation tracked at `docs/todo.md` →
+> "Phase annotation collapse — Multics → Unix simplification".
+> Rationale + post-mortem in `docs/tonify_checklist.md` Rule 4
+> and Rule 28.
+>
+> **Post-collapse user-facing model**:
+>
+> | Annotation | Use case | Compiler enforces |
+> |-----------|----------|-------------------|
+> | `@safe` | Audio callbacks, worker entry points, bounded paths | YES — rejects malloc / IO / syscalls |
+> | `@profile("name")` | Scoped instrumentation (§ Profile annotations) | NO (metadata) |
+> | (none) | Default — full power, programmer responsibility | NO |
+>
+> Compiler internal also simplifies: 4 states (AUTO / BASE /
+> SOLO / SAFE) replace the 8 internal phase codes. `fn_effect`
+> inference array continues to exist; only the value range
+> shrinks. Optimization opportunities (inline, parallel candidates)
+> preserved via internal BASE inference.
+
+#### Current state — pre-collapse 5-phase model
+
 Functions carry one of five **phase annotations** that describe
 what kind of work they do. The annotation is an `@` sigil glued to
 the phase word with no space, placed between the parameter list

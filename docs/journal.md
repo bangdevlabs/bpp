@@ -8683,3 +8683,162 @@ slot-aware type resolution. Once that lands, the four
 typed-local thunks in `src/bpp_math.bsm` Vec2 helpers and the
 `feedback_const_float_demotes` workaround pattern across the
 codebase become removable in Session 1.C.
+
+## 2026-05-11 (later) — Phase annotation system: Multics-drift post-mortem
+
+Triggered by user question after a casual review of the
+annotation surface: *"isso tá over-engineered?"* Audit confirmed:
+8 user-facing phases shipped, but the compiler internal only
+consults BASE/SOLO + TIME for real decisions. The other 5
+(`@io`, `@gpu`, `@heap`, `@panic`, `@realtime`) accumulated
+without earning their keep.
+
+Captured permanently in
+`feedback_phase_overengineering_lesson.md` so the lesson is
+available in future conversations. Sidequest opened in
+`docs/todo.md` ("Phase annotation collapse — Multics → Unix
+simplification") to reduce the user-facing surface to `@safe` +
+`@profile`. This entry records the *why* — both how we got here
+and the systemic moves that prevent the next iteration of the
+same trap.
+
+### Timeline of the drift
+
+- **2026-04-09** — Tonify Rule 4 v1 ships with 2 phases
+  (`:base` / `:solo`). Justified: purity verification has a
+  killer use case (worker thread safety + inline opportunity).
+- **2026-04-11** — tonify sweep applies ~50 `:base` annotations
+  across the codebase. Cultural seed: "annotate when intent is
+  obvious."
+- **2026-04-16** (the long session — audio + Mach-O bug + Level
+  4 expansion in one day) — `PHASE_HEAP` and `PHASE_PANIC`
+  added. Each had a local justification:
+  - HEAP: needed because `:realtime` had to reject malloc but
+    `:io` had to accept it. Solution: new phase between them.
+  - PANIC: needed because `sys_exit` was contaminating effect
+    propagation. Solution: new phase as bottom element.
+  - Both could have been special-case rules within existing
+    phases instead of new phases.
+- **2026-04-17b** — lattice ratchets into the canonical doc
+  (The Book of B++). After this, removing phases became
+  politically expensive — the doc was a public commitment.
+- **2026-04-28** — cosmetic migration `:phase` colon syntax →
+  `@phase` sigil. Lattice unchanged. More visibility to the
+  sigil reinforced perceived importance, encouraging more
+  annotations.
+- **2026-05-11** — re-audit. ~500 annotations across the
+  codebase, 5 of the 8 phases not consulted by codegen for any
+  real decision. The diagnostic comment at
+  `src/bpp_dispatch.bsm:156` already calls out the dead phases
+  as "inert tags ignored by W013 and dispatch logic" — the
+  compiler had been honest about it for weeks; nobody had
+  asked.
+
+### What the pegadinha was
+
+Each new phase felt locally rational because it solved a real
+bug. But the SOLUTION space wasn't audited:
+
+- HEAP could have been "`:realtime` rejects malloc explicitly"
+  — a rule, not a phase.
+- PANIC could have been "`sys_exit` skipped in effect
+  propagation" — a special case in the propagator, not a phase.
+
+Adding a new phase was the maximal response. Smaller responses
+(special-case rules, sentinel handling, attribute on individual
+builtins) weren't considered because the immediate cognitive
+frame was *"phases are how we model effects"* not *"what's the
+smallest fix for this specific bug?"*
+
+The "long session" of 2026-04-16 made this worse — depleted
+attention biases toward "complete the model formally" instead
+of step-back audit. Audit-via-step-back is exactly the move
+that long sessions suppress.
+
+### Four root causes (in order of impact)
+
+1. **No "killer use case" gate per addition.** Each new phase
+   needed a paragraph: "this catches THESE bug classes that
+   existing phases CANNOT catch even with rule additions." HEAP
+   and PANIC didn't get that paragraph. Comparison with
+   Rust/Swift ("Rust has Never type") was the substitute, which
+   is wrong — Rust is not B++'s tier reference.
+
+2. **Convention rule biased toward adoption, not restraint.**
+   Tonify Rule 4 said "annotate when intent is obvious." Should
+   have said "annotate ONLY when compiler verification is
+   needed." Subtle wording difference, big consequence: humans
+   AND agents interpreted the loose framing as license to
+   annotate liberally. ~500 annotation sites accumulated.
+
+3. **No periodic step-back audit.** No structured moment of
+   "look at the system as a whole, count the constants, ask if
+   each earns its keep." Drift was visible in the source for
+   weeks but never tallied until 2026-05-11.
+
+4. **Local rationality ≠ global simplicity.** Each phase
+   addition was rational in isolation. Globally accumulated
+   complexity. The compiler-internal `fn_effect` array (which
+   actually does the work) was never audited against the
+   user-facing surface (which exposes 8 distinct concepts).
+   That mismatch is the over-engineering signature.
+
+### How we apply the lesson going forward
+
+**Killer-use-case gate for any new language feature.** Before
+adding a new phase, builtin, type slice, or annotation:
+
+> "Name 2-3 specific bugs this catches that CANNOT be caught
+> within existing features even with a rule addition."
+
+If the answer involves "completes the model" or "language X
+has this" — red flag, no killer use case. Demand specific bug
+class first. This is Tonify Rule 20 (two-consumer rule) applied
+to language features instead of cartridges.
+
+**Restraint-biased convention rules.** When writing or revising
+a Tonify rule that affects what programmers WRITE, default to
+the restrictive framing:
+
+| Bad (encourages adoption) | Good (demands evidence) |
+|---|---|
+| "Annotate when intent is obvious" | "Annotate only when compiler verification is needed" |
+| "Add a Tonify rule when a pattern appears 3+ times" | "Add a Tonify rule when a pattern's absence has caused a bug in active code" |
+
+**Quarterly system audit.** Add to `docs/how_to_dev_b++.md` a
+recurring "step back" prompt for each major system: storage
+classes, phase annotations, Tonify rules, builtins, type
+slices, diagnostics. If any number GREW since last audit
+without a corresponding "killer use case" doc entry, audit
+deeper.
+
+**Detect the pattern in agent proposals.** Recurring tell:
+agents (Claude included) tend to propose maximal solutions when
+seeing an opportunity to "complete the model formally."
+Examples observed in this repo:
+
+- fxlab original plan (~1100 LOC with codegen + MSL parser +
+  `.fx.meta` + import surgery) — cut to ~400 LOC after audit.
+- Excalibur Arc original framing — proposed Feature 5
+  "Annotation Inference" as compiler change before realizing
+  inference already existed.
+- Vec2 promotion — agent wanted to wait for two-consumer rule
+  before promoting; user corrected (Vec2 is foundational
+  primitive, two-consumer rule was wrong category for it).
+- Phase annotations themselves — this very lesson.
+
+When an agent proposes adding language surface, ask: "what's
+the smallest possible response to this specific bug?" If the
+answer is not "the proposed addition," the proposed addition is
+over-built.
+
+### What this entry is NOT
+
+It is NOT a critique of the contributors who added each phase
+— each addition was locally rational and shipped under genuine
+constraint pressure. The lesson is process-level: the *system*
+of how additions are gated is what failed, and the system can
+be fixed without anyone needing to feel they made the wrong
+call at the moment they made it. Phases that earned their keep
+(BASE/SOLO + TIME) survive the collapse to `@safe`; phases
+that didn't return to the pool. Subtraction without blame.
