@@ -8615,3 +8615,71 @@ first, then run inference) would close the forward-ref gap
 completely. ~150 LOC sidequest if mutual recursion or import
 cycles ever bite — not worth doing pre-emptively because today
 the leaves-first idiom handles every real case.
+
+## 2026-05-11 (later) — Excalibur Arc Session 1.A SHIPPED
+
+First code landing of the Excalibur Arc (multi-session strategic
+language polish, anchor doc `docs/excalibur_arc.md`). Session 1.A
+is the foundation pass for Feature 1 (polymorphic numeric literals).
+
+### Shipped (commit `714f20e`)
+
+- `src/bpp_defs.bsm` — `SHAPE_INT = 1`, `SHAPE_DECIMAL = 2`,
+  reserved `0` for "not set / non-numeric" (existing
+  string-literal T_LIT nodes).
+- `src/bpp_parser.bsm` — `parse_primary` and `make_int_lit`
+  set `n.b` to the right shape at every T_LIT construction site.
+  `lit_shape(n)@base` exposes the annotation.
+- `tests/test_literal_shape.bpp` — pins the additive-only
+  promise across decimal int / hex / float / negative / mixed
+  arithmetic.
+
+### Why "additive only" was the right scope
+
+The temptation was to ship 1.A + 1.B together (annotate AST and
+immediately use the annotation in `add_type`). Resisting that
+cleanly separates the risk surface:
+
+- 1.A touches only the parser. Codegen and type inference are
+  untouched. Worst-case regression is a parse-time crash that
+  would fail bootstrap immediately — easy bisect.
+- 1.B touches `add_type` and `cg_emit_lit`. Worst-case regression
+  is a literal that emits the wrong type at runtime — much
+  subtler, needs gating behind a feature flag during development.
+
+Splitting the sessions per the Excalibur arc's pause-safety
+discipline meant 1.A could ship the same day with full
+confidence; 1.B can fail and revert without disturbing the AST
+shape work.
+
+### Test design pitfall (caught + corrected mid-session)
+
+First draft of `test_literal_shape.bpp` tried to verify
+`SHAPE_INT != 0 && SHAPE_DECIMAL != 0` from a user program via
+`extrn SHAPE_INT, SHAPE_DECIMAL`. Failed at runtime because the
+SHAPE constants live in `src/bpp_defs.bsm` — compiler-internal,
+NOT exported into the runtime user programs link against. The
+extrn declared a fresh slot in the user binary that was never
+initialised.
+
+Corrected approach: test only the observable runtime invariance
+("decimal/hex/float/negative literals all evaluate correctly").
+SHAPE constants are tooling for the COMPILER's parser-to-types
+pipeline; they have no presence at user-program runtime.
+
+Lesson: when adding a constant to the compiler's internal
+namespace (`bpp_*` modules), don't reach for it from user-side
+test programs. Test the OBSERVABLE behavior the constant enables.
+
+### Verification
+
+Bootstrap byte-stable. Native suite 145/0/12 → 146/0/12. C
+suite 119/0/39. No regressions in any consumer of the parser.
+
+### What unblocks
+
+Session 1.B can read `lit_shape(n)` from `add_type` to drive
+slot-aware type resolution. Once that lands, the four
+typed-local thunks in `src/bpp_math.bsm` Vec2 helpers and the
+`feedback_const_float_demotes` workaround pattern across the
+codebase become removable in Session 1.C.
