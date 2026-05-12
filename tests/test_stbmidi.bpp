@@ -1,0 +1,242 @@
+// skip-c: relies on stbmixer (audio pipeline) which the C transpile path does not implement.
+import "stbmidi.bsm";
+
+// test_stbmidi.bpp — Correctness pins for the MIDI cartridge.
+//
+// The test synthesises a tiny SMF Format 0 file in memory, writes it
+// to a temp path, loads it back through midi_file_load, then walks
+// the sequencer in sample batches and confirms the callback receives
+// every event in tick order at the predicted sample offset.
+
+global _t_n_callbacks;
+global _t_last_type;
+global _t_last_channel;
+global _t_last_data1;
+global _t_last_data2;
+global _t_last_tick_samples;
+
+// Test callback: counts dispatches and stamps the most recent event.
+static void _t_capture(event) @safe {
+    auto e: MidiEvent;
+    e = event;
+    _t_n_callbacks++;
+    _t_last_type = e.type;
+    _t_last_channel = e.channel;
+    _t_last_data1 = e.data1;
+    _t_last_data2 = e.data2;
+    _t_last_tick_samples = e.tick_samples;
+}
+
+// Append a single byte to a strbuf-style buffer kept in scratch.
+// We hand-roll a tiny appender here so the test does not depend on
+// strbuf semantics.
+static void _put_byte(out_buf, ofs_buf, b) {
+    poke(out_buf + ofs_buf[0], b);
+    ofs_buf[0]++;
+}
+
+// Write a 32-bit BE word.
+static void _put_be32(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 16777216) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 65536) & 0xFF);
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+
+static void _put_be16(out_buf, ofs_buf, v) {
+    _put_byte(out_buf, ofs_buf, (v / 256) & 0xFF);
+    _put_byte(out_buf, ofs_buf, v & 0xFF);
+}
+
+// Write a VLQ. Tests assume values fit in 14 bits — sufficient for
+// the synthetic streams below.
+static void _put_vlq(out_buf, ofs_buf, v) {
+    if (v < 128) {
+        _put_byte(out_buf, ofs_buf, v);
+    } else {
+        _put_byte(out_buf, ofs_buf, ((v / 128) & 0x7F) | 0x80);
+        _put_byte(out_buf, ofs_buf, v & 0x7F);
+    }
+}
+
+// Build a Format 0 SMF in memory at `out_buf`. Division = 480 ticks/
+// quarter, default tempo (120 BPM = 500000 us/quarter). Returns the
+// total byte count written.
+//
+// Event stream:
+//   tick 0   note_on  ch=0 key=60 vel=100
+//   tick 240 note_off ch=0 key=60 vel=0
+//   tick 480 note_on  ch=1 key=64 vel=80
+//   tick 960 note_off ch=1 key=64 vel=0
+//   tick 960 end-of-track
+static _build_synthetic_smf(out_buf) {
+    auto ofs_buf, hdr_start, mtrk_start, mtrk_len_ofs, mtrk_body_start;
+    ofs_buf = buf_word(1);
+    ofs_buf[0] = 0;
+
+    // Header chunk.
+    _put_byte(out_buf, ofs_buf, 0x4D); // 'M'
+    _put_byte(out_buf, ofs_buf, 0x54); // 'T'
+    _put_byte(out_buf, ofs_buf, 0x68); // 'h'
+    _put_byte(out_buf, ofs_buf, 0x64); // 'd'
+    _put_be32(out_buf, ofs_buf, 6);    // length
+    _put_be16(out_buf, ofs_buf, 0);    // format 0
+    _put_be16(out_buf, ofs_buf, 1);    // n_tracks
+    _put_be16(out_buf, ofs_buf, 480);  // division
+
+    // Track chunk — length placeholder, fill after body.
+    _put_byte(out_buf, ofs_buf, 0x4D); // 'M'
+    _put_byte(out_buf, ofs_buf, 0x54); // 'T'
+    _put_byte(out_buf, ofs_buf, 0x72); // 'r'
+    _put_byte(out_buf, ofs_buf, 0x6B); // 'k'
+    mtrk_len_ofs = ofs_buf[0];
+    _put_be32(out_buf, ofs_buf, 0);    // placeholder
+    mtrk_body_start = ofs_buf[0];
+
+    // Event 1: delta 0, note_on ch 0, key 60, vel 100.
+    _put_vlq(out_buf, ofs_buf, 0);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_ON | 0);
+    _put_byte(out_buf, ofs_buf, 60);
+    _put_byte(out_buf, ofs_buf, 100);
+
+    // Event 2: delta 240, note_off ch 0, key 60, vel 0.
+    _put_vlq(out_buf, ofs_buf, 240);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_OFF | 0);
+    _put_byte(out_buf, ofs_buf, 60);
+    _put_byte(out_buf, ofs_buf, 0);
+
+    // Event 3: delta 240, note_on ch 1, key 64, vel 80.
+    _put_vlq(out_buf, ofs_buf, 240);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_ON | 1);
+    _put_byte(out_buf, ofs_buf, 64);
+    _put_byte(out_buf, ofs_buf, 80);
+
+    // Event 4: delta 480, note_off ch 1, key 64, vel 0.
+    _put_vlq(out_buf, ofs_buf, 480);
+    _put_byte(out_buf, ofs_buf, MIDI_NOTE_OFF | 1);
+    _put_byte(out_buf, ofs_buf, 64);
+    _put_byte(out_buf, ofs_buf, 0);
+
+    // Event 5: delta 0, meta EOT.
+    _put_vlq(out_buf, ofs_buf, 0);
+    _put_byte(out_buf, ofs_buf, MIDI_META);
+    _put_byte(out_buf, ofs_buf, MIDI_META_EOT);
+    _put_byte(out_buf, ofs_buf, 0);    // VLQ length 0
+
+    // Patch the track-length placeholder.
+    auto body_len, save_ofs;
+    body_len = ofs_buf[0] - mtrk_body_start;
+    save_ofs = ofs_buf[0];
+    ofs_buf[0] = mtrk_len_ofs;
+    _put_be32(out_buf, ofs_buf, body_len);
+    ofs_buf[0] = save_ofs;
+
+    auto total;
+    total = ofs_buf[0];
+    free(ofs_buf);
+    return total;
+}
+
+main() {
+    auto buf, n, fails;
+    auto path, file: MidiFile, seq: MidiSequencer;
+    auto expected_spt;
+
+    fails = 0;
+
+    // ── Build synthetic SMF in memory and write to a temp file.
+    buf = malloc(256);
+    n = _build_synthetic_smf(buf);
+    path = "/tmp/stbmidi_test.mid";
+    if (file_write_all(path, buf, n) != 0) {
+        put("FAIL: could not write temp SMF\n");
+        free(buf);
+        return 1;
+    }
+    free(buf);
+
+    // ── Load it.
+    file = midi_file_load(path);
+    if (file == 0) {
+        put("FAIL: midi_file_load returned 0\n");
+        return 1;
+    }
+
+    if (file.format != 0) {
+        put("FAIL: format expected 0 got "); put(file.format); put("\n");
+        fails++;
+    }
+    if (file.n_tracks != 1) {
+        put("FAIL: n_tracks expected 1 got "); put(file.n_tracks); put("\n");
+        fails++;
+    }
+    if (file.division != 480) {
+        put("FAIL: division expected 480 got "); put(file.division); put("\n");
+        fails++;
+    }
+    if (file.n_events != 5) {
+        put("FAIL: n_events expected 5 got "); put(file.n_events); put("\n");
+        fails++;
+    }
+
+    // Tick stream should be 0, 240, 480, 960, 960.
+    if (file.e_tick[0] != 0)   { put("FAIL: e_tick[0] expected 0 got ");   put(file.e_tick[0]);   put("\n"); fails++; }
+    if (file.e_tick[1] != 240) { put("FAIL: e_tick[1] expected 240 got "); put(file.e_tick[1]); put("\n"); fails++; }
+    if (file.e_tick[2] != 480) { put("FAIL: e_tick[2] expected 480 got "); put(file.e_tick[2]); put("\n"); fails++; }
+    if (file.e_tick[3] != 960) { put("FAIL: e_tick[3] expected 960 got "); put(file.e_tick[3]); put("\n"); fails++; }
+    if (file.e_tick[4] != 960) { put("FAIL: e_tick[4] expected 960 got "); put(file.e_tick[4]); put("\n"); fails++; }
+
+    // Type stream: NOTE_ON, NOTE_OFF, NOTE_ON, NOTE_OFF, META.
+    if (file.e_type[0] != MIDI_NOTE_ON)  { put("FAIL: e_type[0]\n"); fails++; }
+    if (file.e_type[1] != MIDI_NOTE_OFF) { put("FAIL: e_type[1]\n"); fails++; }
+    if (file.e_type[2] != MIDI_NOTE_ON)  { put("FAIL: e_type[2]\n"); fails++; }
+    if (file.e_type[3] != MIDI_NOTE_OFF) { put("FAIL: e_type[3]\n"); fails++; }
+    if (file.e_type[4] != MIDI_META)     { put("FAIL: e_type[4]\n"); fails++; }
+
+    // Channels match the source.
+    if (file.e_channel[0] != 0) { put("FAIL: ch[0]\n"); fails++; }
+    if (file.e_channel[2] != 1) { put("FAIL: ch[2]\n"); fails++; }
+
+    // ── Sequencer: advance a small batch, confirm dispatch count.
+    _t_n_callbacks = 0;
+    seq = midi_seq_new(file, fn_ptr(_t_capture), 0, 44100);
+
+    // samples_per_tick = 500000 * 44100 / 480 / 1000000 = 45.9 -> 45
+    // (integer math truncates). Verify the cached value.
+    expected_spt = MIDI_DEFAULT_US_PER_QUARTER * 44100 / 480 / 1000000;
+    if (seq.samples_per_tick != expected_spt) {
+        put("FAIL: samples_per_tick expected "); put(expected_spt);
+        put(" got "); put(seq.samples_per_tick); put("\n");
+        fails++;
+    }
+
+    // Advance 50 samples — only event at tick 0 should fire (sample 0).
+    midi_seq_advance_samples(seq, 50);
+    if (_t_n_callbacks != 1) {
+        put("FAIL: after 50 samples expected 1 callback got "); put(_t_n_callbacks); put("\n");
+        fails++;
+    }
+
+    // Advance the rest in one big batch — remaining 4 events fire.
+    midi_seq_advance_samples(seq, 100000);
+    if (_t_n_callbacks != 5) {
+        put("FAIL: after full advance expected 5 callbacks got "); put(_t_n_callbacks); put("\n");
+        fails++;
+    }
+
+    // Last event was the EOT meta.
+    if (_t_last_type != MIDI_META || _t_last_data1 != MIDI_META_EOT) {
+        put("FAIL: last event was not EOT meta\n");
+        fails++;
+    }
+
+    midi_seq_free(seq);
+    midi_file_free(file);
+
+    if (fails == 0) {
+        put("OK\n");
+        return 0;
+    }
+    put("FAILED: "); put(fails); put(" assertion(s)\n");
+    return 1;
+}

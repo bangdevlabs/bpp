@@ -1,0 +1,88 @@
+// skip-c: relies on stbmixer + reads a binary asset.
+import "stbmidi.bsm";
+
+// test_stbmidi_wc1.bpp — Smoke test that the parser handles real
+// Warcraft 1 MIDI corpus end-to-end. Loads track 00.mid (Format 0,
+// division 245, converted from XMI), confirms the file structure
+// looks reasonable, and walks the sequencer through ~10 seconds of
+// playback counting note_on events.
+
+global _t_n_note_on;
+global _t_n_total;
+global _t_n_tempo_changes;
+
+static void _t_count_callback(event) @safe {
+    auto e: MidiEvent;
+    e = event;
+    _t_n_total++;
+    if (e.type == MIDI_NOTE_ON) { _t_n_note_on++; }
+    if (e.type == MIDI_META) {
+        if (e.data1 == MIDI_META_TEMPO) { _t_n_tempo_changes++; }
+    }
+}
+
+main() {
+    auto file: MidiFile, seq: MidiSequencer, fails;
+    auto ten_seconds_samples;
+
+    fails = 0;
+    _t_n_note_on = 0;
+    _t_n_total = 0;
+    _t_n_tempo_changes = 0;
+
+    file = midi_file_load("games/rts_1.0/assets/converted/music/00.mid");
+    if (file == 0) {
+        put("FAIL: could not load 00.mid (run from repo root)\n");
+        return 1;
+    }
+
+    // From the wire-format peek done during research:
+    //   format=0, n_tracks=1, division=245 (XMI 120Hz time base)
+    if (file.format != 0) {
+        put("FAIL: WC1 format expected 0 got "); put(file.format); put("\n");
+        fails++;
+    }
+    if (file.n_tracks != 1) {
+        put("FAIL: WC1 n_tracks expected 1 got "); put(file.n_tracks); put("\n");
+        fails++;
+    }
+    if (file.division != 245) {
+        put("FAIL: WC1 division expected 245 got "); put(file.division); put("\n");
+        fails++;
+    }
+    if (file.n_events <= 100) {
+        put("FAIL: WC1 n_events suspiciously low: "); put(file.n_events); put("\n");
+        fails++;
+    }
+
+    // Walk the sequencer through ~10 seconds at 44.1kHz. The track
+    // is several minutes long, so we expect to land mid-stream with
+    // plenty of note events fired.
+    seq = midi_seq_new(file, fn_ptr(_t_count_callback), 0, 44100);
+    ten_seconds_samples = 44100 * 10;
+    midi_seq_advance_samples(seq, ten_seconds_samples);
+
+    if (_t_n_total < 50) {
+        put("FAIL: dispatched only "); put(_t_n_total);
+        put(" events in 10 seconds — parser may be stuck\n");
+        fails++;
+    }
+    if (_t_n_note_on < 20) {
+        put("FAIL: only "); put(_t_n_note_on);
+        put(" note_on events — track may not be playing\n");
+        fails++;
+    }
+
+    put("WC1 00.mid: total events parsed = "); put(file.n_events);
+    put(", events in first 10s = "); put(_t_n_total);
+    put(", note_on count = "); put(_t_n_note_on);
+    put(", tempo changes seen = "); put(_t_n_tempo_changes);
+    put("\n");
+
+    midi_seq_free(seq);
+    midi_file_free(file);
+
+    if (fails == 0) { put("OK\n"); return 0; }
+    put("FAILED: "); put(fails); put(" assertion(s)\n");
+    return 1;
+}

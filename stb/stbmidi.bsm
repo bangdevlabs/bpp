@@ -1,0 +1,676 @@
+// stbmidi.bsm — MIDI parser + sample-accurate sequencer + synth
+// dispatcher. See docs/stbmidi_plan.md for the full design anchor.
+//
+// Three-layer split mirroring JUCE / RtMidi / libsmf:
+//
+//   Parser:      reads SMF Format 0 / 1 into a tick-ordered event
+//                stream. Format 2 + SMPTE division rejected.
+//   Sequencer:   walks the stream in sample units. Tempo changes
+//                are re-anchored so the timebase stays drift-free.
+//   Synth:       default callback dispatches note_on / note_off to
+//                stbmixer. Other event types pass through the
+//                callback signature so future synths / live-input
+//                drivers can intercept them.
+//
+// Threading: B++ audio is main-thread only (stbmixer.mixer_stream
+// produces samples on main thread, platform-native realtime thread
+// drains the SPSC ring opaquely). stbmidi inherits that — no atomic
+// flags, no cross-thread state. Same `midi_seq_advance_samples`
+// works whether called per-frame or from a future audio callback.
+
+import "stbmixer.bsm";
+
+// ─── MIDI status bytes (high nibble of channel events) ────────────
+const MIDI_NOTE_OFF           = 0x80;
+const MIDI_NOTE_ON            = 0x90;
+const MIDI_POLY_AFTERTOUCH    = 0xA0;
+const MIDI_CONTROLLER         = 0xB0;
+const MIDI_PROGRAM            = 0xC0;
+const MIDI_CHANNEL_AFTERTOUCH = 0xD0;
+const MIDI_PITCH_BEND         = 0xE0;
+const MIDI_META               = 0xFF;
+
+// ─── Meta event sub-types (data1 holds the sub-type for MIDI_META) ─
+const MIDI_META_TEXT          = 0x01;
+const MIDI_META_TRACK_NAME    = 0x03;
+const MIDI_META_INST_NAME     = 0x04;
+const MIDI_META_EOT           = 0x2F;
+const MIDI_META_TEMPO         = 0x51;
+const MIDI_META_TIME_SIG      = 0x58;
+
+// Default tempo = 120 BPM = 500000 microseconds per quarter note.
+// SMF spec mandates this when the file omits a leading tempo meta.
+const MIDI_DEFAULT_US_PER_QUARTER = 500000;
+
+// Event view passed to the synth callback. Allocated once per
+// sequencer (reused across dispatches — no per-event malloc inside
+// the hot loop).
+struct MidiEvent {
+    tick_samples,   // absolute sample offset from file start
+    type,           // high nibble of status (NOTE_ON / NOTE_OFF / etc) or MIDI_META
+    channel,        // 0..15 (0 for meta events)
+    data1,          // note / program / controller / meta sub-type
+    data2           // velocity / value / tempo us-per-quarter / etc
+}
+
+// Parsed file. Events stored as parallel arrays (SoA per Tonify
+// Rule 30) so the sequencer walk hits one contiguous stream per
+// field.
+struct MidiFile {
+    format,                  // 0 or 1
+    n_tracks,
+    division,                // ticks per quarter note (positive only)
+    initial_us_per_quarter,  // tempo at tick 0 (500000 default)
+    n_events,
+    e_tick,                  // buf_word: absolute MIDI tick per event
+    e_type,                  // buf_word
+    e_channel,               // buf_word
+    e_data1,                 // buf_word
+    e_data2                  // buf_word
+}
+
+// Sequencer state. Carries the playback cursor plus the
+// anchor-tick / anchor-sample / samples-per-tick triplet that
+// makes mid-stream tempo changes drift-free.
+struct MidiSequencer {
+    file,             // MidiFile pointer
+    cursor,           // next event index in file.e_*
+    sample_pos,       // current sample cursor
+    anchor_tick,      // most-recent tempo-change anchor
+    anchor_sample,    // sample position at anchor_tick
+    samples_per_tick, // samples per MIDI tick from anchor forward
+    sample_rate,
+    callback,         // fn_ptr called once per dispatched event
+    scratch_evt,      // pre-allocated MidiEvent reused for callbacks
+    loop,
+    playing
+}
+
+// ─── Module init ───────────────────────────────────────────────────
+//
+// `_midi_semi_table` holds the 12 semitone frequencies in octave 5
+// (C5 = key 60 at 261 Hz through B5 at 493 Hz). Pre-allocated once
+// so `_midi_freq_for_key` can be `@safe` — looking up a frequency
+// must not touch malloc / free if the synth dispatcher is to run
+// inside a bounded context (audio callback, worker dispatch, etc).
+static extrn _midi_semi_table;
+static extrn _midi_inited;
+
+void init_midi() {
+    if (_midi_inited != 0) { return; }
+    _midi_semi_table = buf_word(12);
+    _midi_semi_table[0]  = 261;   // C
+    _midi_semi_table[1]  = 277;   // C#
+    _midi_semi_table[2]  = 293;   // D
+    _midi_semi_table[3]  = 311;   // D#
+    _midi_semi_table[4]  = 329;   // E
+    _midi_semi_table[5]  = 349;   // F
+    _midi_semi_table[6]  = 369;   // F#
+    _midi_semi_table[7]  = 391;   // G
+    _midi_semi_table[8]  = 415;   // G#
+    _midi_semi_table[9]  = 440;   // A — reference (key 69 is A5 in this layout)
+    _midi_semi_table[10] = 466;   // A#
+    _midi_semi_table[11] = 493;   // B
+    _midi_inited = 1;
+}
+
+// ─── VLQ helpers ───────────────────────────────────────────────────
+
+// Decode a variable-length quantity (1–4 bytes, big-endian-ish with
+// the high bit of each byte signalling continuation). Advances the
+// offset stored in ofs_buf[0] past the consumed bytes.
+//
+// The SMF spec caps VLQs at 4 bytes (max value 0x0FFFFFFF). Anything
+// longer is malformed; we still read up to 4 bytes defensively and
+// return whatever value the high bits accumulate, which keeps the
+// parser advancing past corrupt regions without crashing.
+static _midi_read_vlq(buf, ofs_buf) {
+    auto val, b, i, ofs;
+    val = 0;
+    ofs = ofs_buf[0];
+    for (i = 0; i < 4; i++) {
+        b = peek(buf + ofs);
+        ofs++;
+        val = (val * 128) + (b & 0x7F);
+        if ((b & 0x80) == 0) {
+            ofs_buf[0] = ofs;
+            return val;
+        }
+    }
+    ofs_buf[0] = ofs;
+    return val;
+}
+
+// Read big-endian 16-bit word at the given offset. SMF uses BE for
+// every multi-byte numeric header field.
+static _midi_read_be16(buf, ofs) {
+    auto hi, lo;
+    hi = peek(buf + ofs);
+    lo = peek(buf + ofs + 1);
+    return (hi * 256) + lo;
+}
+
+// Read big-endian 32-bit word at the given offset.
+static _midi_read_be32(buf, ofs) {
+    auto b0, b1, b2, b3;
+    b0 = peek(buf + ofs);
+    b1 = peek(buf + ofs + 1);
+    b2 = peek(buf + ofs + 2);
+    b3 = peek(buf + ofs + 3);
+    return (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3;
+}
+
+// ─── Parser ───────────────────────────────────────────────────────
+
+// Forward declarations for static helpers used below.
+// (B++ resolves leaves-first per Tonify Rule 27; these are written
+// after `midi_file_load` so the caller sees them via _ refs.)
+
+// Parse one MTrk chunk starting at `track_ofs` (offset of the
+// "MTrk" magic), writing events into the parallel arrays at the
+// given `out_idx` cursor. Returns the next free index in the arrays.
+// Each event is stored with `tick_abs` already computed from the
+// running delta-time. Running status is honoured.
+static _midi_parse_track(buf, track_ofs, file, out_idx_buf) {
+    auto chunk_len, ofs, end_ofs;
+    auto delta_buf, abs_tick;
+    auto status, prev_status, type_nibble, ch_nibble;
+    auto data1, data2, meta_type, meta_len, b;
+    auto idx, eof_seen;
+    auto f: MidiFile;
+
+    f = file;
+    // The track chunk: 4-byte magic + 4-byte BE length + payload.
+    // The caller verified the magic, so we read the length at +4.
+    chunk_len = _midi_read_be32(buf, track_ofs + 4);
+    ofs = track_ofs + 8;
+    end_ofs = ofs + chunk_len;
+
+    delta_buf = buf_word(1);
+    abs_tick = 0;
+    prev_status = 0;
+    idx = out_idx_buf[0];
+    eof_seen = 0;
+
+    while (ofs < end_ofs) {
+        if (eof_seen != 0) { ofs = end_ofs; }
+        // Each event begins with a VLQ delta from the previous event.
+        delta_buf[0] = ofs;
+        abs_tick = abs_tick + _midi_read_vlq(buf, delta_buf);
+        ofs = delta_buf[0];
+
+        if (ofs >= end_ofs) { ofs = end_ofs; }
+
+        // Status byte. If the high bit is set this is a fresh
+        // status; otherwise we're in running status — reuse the
+        // previous channel-event status byte and the byte we just
+        // peeked is actually data1.
+        b = peek(buf + ofs);
+        if ((b & 0x80) != 0) {
+            status = b;
+            ofs++;
+        } else {
+            status = prev_status;
+            // Running status only applies to channel events; if
+            // the previous status was a meta or sysex this is
+            // malformed. Best-effort: keep advancing.
+        }
+
+        if (status == MIDI_META) {
+            // FF <type> <vlq-len> <bytes...>
+            meta_type = peek(buf + ofs);
+            ofs++;
+            delta_buf[0] = ofs;
+            meta_len = _midi_read_vlq(buf, delta_buf);
+            ofs = delta_buf[0];
+
+            if (meta_type == MIDI_META_TEMPO) {
+                // Tempo meta: 3-byte big-endian us-per-quarter.
+                if (meta_len >= 3) {
+                    data1 = (peek(buf + ofs) * 65536)
+                          + (peek(buf + ofs + 1) * 256)
+                          + (peek(buf + ofs + 2));
+                } else {
+                    data1 = MIDI_DEFAULT_US_PER_QUARTER;
+                }
+                f.e_tick[idx]    = abs_tick;
+                f.e_type[idx]    = MIDI_META;
+                f.e_channel[idx] = 0;
+                f.e_data1[idx]   = MIDI_META_TEMPO;
+                f.e_data2[idx]   = data1;
+                idx++;
+                // If this is the file's very first tempo, store it
+                // as the initial too.
+                if (abs_tick == 0) {
+                    f.initial_us_per_quarter = data1;
+                }
+            } else if (meta_type == MIDI_META_EOT) {
+                f.e_tick[idx]    = abs_tick;
+                f.e_type[idx]    = MIDI_META;
+                f.e_channel[idx] = 0;
+                f.e_data1[idx]   = MIDI_META_EOT;
+                f.e_data2[idx]   = 0;
+                idx++;
+                eof_seen = 1;
+            } else {
+                // Other meta events (track name, instrument name,
+                // time signature, text) — store the sub-type but
+                // skip the payload. The synth callback ignores them.
+                f.e_tick[idx]    = abs_tick;
+                f.e_type[idx]    = MIDI_META;
+                f.e_channel[idx] = 0;
+                f.e_data1[idx]   = meta_type;
+                f.e_data2[idx]   = meta_len;
+                idx++;
+            }
+            ofs = ofs + meta_len;
+            // Meta events do NOT update running status.
+            continue;
+        }
+
+        // SysEx (F0 or F7): skip the VLQ-length payload entirely.
+        // We don't surface SysEx through the callback in v1.
+        if (status == 0xF0) { delta_buf[0] = ofs; meta_len = _midi_read_vlq(buf, delta_buf); ofs = delta_buf[0] + meta_len; continue; }
+        if (status == 0xF7) { delta_buf[0] = ofs; meta_len = _midi_read_vlq(buf, delta_buf); ofs = delta_buf[0] + meta_len; continue; }
+
+        // Channel voice event. type_nibble selects the family,
+        // ch_nibble selects the channel.
+        type_nibble = status & 0xF0;
+        ch_nibble   = status & 0x0F;
+
+        if (type_nibble == MIDI_PROGRAM) {
+            // 1 data byte.
+            data1 = peek(buf + ofs);
+            ofs++;
+            data2 = 0;
+        } else if (type_nibble == MIDI_CHANNEL_AFTERTOUCH) {
+            data1 = peek(buf + ofs);
+            ofs++;
+            data2 = 0;
+        } else {
+            // 2 data bytes (note on/off, poly aftertouch, controller,
+            // pitch bend).
+            data1 = peek(buf + ofs);
+            ofs++;
+            data2 = peek(buf + ofs);
+            ofs++;
+        }
+
+        // SMF convention: a NOTE_ON with velocity 0 is a NOTE_OFF.
+        // Normalise here so the callback sees the simpler shape.
+        if (type_nibble == MIDI_NOTE_ON) {
+            if (data2 == 0) { type_nibble = MIDI_NOTE_OFF; }
+        }
+
+        f.e_tick[idx]    = abs_tick;
+        f.e_type[idx]    = type_nibble;
+        f.e_channel[idx] = ch_nibble;
+        f.e_data1[idx]   = data1;
+        f.e_data2[idx]   = data2;
+        idx++;
+
+        prev_status = status;
+    }
+
+    free(delta_buf);
+    out_idx_buf[0] = idx;
+    return end_ofs;
+}
+
+// Sort the parallel event arrays by tick in-place. Stable insertion
+// sort — sufficient for the merged-track sizes typical of game MIDIs
+// (few thousand events). N^2 worst case is fine until the corpus
+// pushes into the tens of thousands; promote to merge sort when a
+// real consumer hits that scale.
+static _midi_sort_events_by_tick(file) {
+    auto f: MidiFile, n, i, j;
+    auto t, ty, ch, d1, d2;
+    f = file;
+    n = f.n_events;
+    for (i = 1; i < n; i++) {
+        t  = f.e_tick[i];
+        ty = f.e_type[i];
+        ch = f.e_channel[i];
+        d1 = f.e_data1[i];
+        d2 = f.e_data2[i];
+        j = i - 1;
+        while (j >= 0) {
+            if (f.e_tick[j] <= t) { j = -1; }
+            else {
+                f.e_tick[j + 1]    = f.e_tick[j];
+                f.e_type[j + 1]    = f.e_type[j];
+                f.e_channel[j + 1] = f.e_channel[j];
+                f.e_data1[j + 1]   = f.e_data1[j];
+                f.e_data2[j + 1]   = f.e_data2[j];
+                j--;
+            }
+        }
+        f.e_tick[j + 1]    = t;
+        f.e_type[j + 1]    = ty;
+        f.e_channel[j + 1] = ch;
+        f.e_data1[j + 1]   = d1;
+        f.e_data2[j + 1]   = d2;
+    }
+}
+
+// Load an SMF file from disk and return a MidiFile (0 on failure).
+// Format 0 and 1 are supported; Format 2 and SMPTE division are
+// rejected with a diagnostic on stderr.
+midi_file_load(path) {
+    auto buf, size_out, size;
+    auto magic, hdr_len, format, n_tracks, division;
+    auto f: MidiFile, ofs, idx_buf, t;
+    auto max_events;
+
+    size_out = malloc(8);
+    *size_out = 0;
+    buf = file_read_all(path, size_out);
+    size = *size_out;
+    free(size_out);
+    if (buf == 0) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': file not found or unreadable\n");
+        return 0;
+    }
+
+    if (size < 14) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': file too small to be an SMF\n");
+        free(buf);
+        return 0;
+    }
+
+    // Header chunk: "MThd" (4) + length (4 BE) + format (2 BE) +
+    // n_tracks (2 BE) + division (2 BE) = 14 bytes total when length
+    // is the canonical 6.
+    magic = _midi_read_be32(buf, 0);
+    if (magic != 0x4D546864) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': missing MThd header magic\n");
+        free(buf);
+        return 0;
+    }
+    hdr_len = _midi_read_be32(buf, 4);
+    format   = _midi_read_be16(buf, 8);
+    n_tracks = _midi_read_be16(buf, 10);
+    division = _midi_read_be16(buf, 12);
+
+    if (format == 2) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': Format 2 not supported (use Format 0 or 1)\n");
+        free(buf);
+        return 0;
+    }
+    if (format != 0) {
+        if (format != 1) {
+            put_err("stbmidi: '"); put_err(path);
+            put_err("': unknown SMF format\n");
+            free(buf);
+            return 0;
+        }
+    }
+    if ((division & 0x8000) != 0) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': SMPTE division not supported (ticks-per-quarter only)\n");
+        free(buf);
+        return 0;
+    }
+    if (division == 0) {
+        put_err("stbmidi: '"); put_err(path);
+        put_err("': division 0 is invalid\n");
+        free(buf);
+        return 0;
+    }
+
+    f = malloc(sizeof(MidiFile));
+    f.format = format;
+    f.n_tracks = n_tracks;
+    f.division = division;
+    f.initial_us_per_quarter = MIDI_DEFAULT_US_PER_QUARTER;
+
+    // Worst-case event budget: each event takes at least 2 bytes
+    // on the wire (delta-time VLQ + status). Allocating one slot
+    // per file byte over-provisions but guarantees no realloc
+    // inside the hot parse loop. We'll trim n_events at the end.
+    max_events = size;
+    f.e_tick    = buf_word(max_events);
+    f.e_type    = buf_word(max_events);
+    f.e_channel = buf_word(max_events);
+    f.e_data1   = buf_word(max_events);
+    f.e_data2   = buf_word(max_events);
+    f.n_events  = 0;
+
+    // Walk every track chunk in order. Chunks may be preceded by
+    // junk bytes — scan for the "MTrk" magic each time.
+    ofs = 8 + hdr_len;
+    idx_buf = buf_word(1);
+    idx_buf[0] = 0;
+    for (t = 0; t < n_tracks; t++) {
+        // Skip forward to the next "MTrk" magic. SMF files
+        // occasionally include alignment padding between tracks.
+        while (ofs + 4 <= size) {
+            if (_midi_read_be32(buf, ofs) == 0x4D54726B) { t = t; break; }
+            ofs++;
+        }
+        if (ofs + 4 > size) { t = n_tracks; break; }
+        ofs = _midi_parse_track(buf, ofs, f, idx_buf);
+    }
+    f.n_events = idx_buf[0];
+    free(idx_buf);
+    free(buf);
+
+    // Format 1 merges multiple tracks into one stream; the
+    // concatenation is not tick-ordered globally. Sort to restore
+    // the invariant the sequencer relies on. Format 0 already
+    // arrives sorted but the sort is idempotent on that case.
+    if (format == 1) {
+        _midi_sort_events_by_tick(f);
+    }
+
+    return f;
+}
+
+void midi_file_free(file) {
+    auto f: MidiFile;
+    f = file;
+    if (f == 0) { return; }
+    if (f.e_tick    != 0) { free(f.e_tick); }
+    if (f.e_type    != 0) { free(f.e_type); }
+    if (f.e_channel != 0) { free(f.e_channel); }
+    if (f.e_data1   != 0) { free(f.e_data1); }
+    if (f.e_data2   != 0) { free(f.e_data2); }
+    free(file);
+}
+
+// ─── Sequencer ────────────────────────────────────────────────────
+
+// Compute samples-per-tick from a tempo (us per quarter), the
+// file's tick division, and the playback sample rate. Integer math
+// throughout; precision is preserved by deferring the divide.
+static _midi_compute_spt(us_per_quarter, division, sample_rate) {
+    // samples_per_tick = us_per_quarter * sample_rate / (division * 1_000_000)
+    // Re-order to keep intermediate products inside 63 bits for
+    // every plausible (tempo, division, sample_rate) triple.
+    return us_per_quarter * sample_rate / division / 1000000;
+}
+
+midi_seq_new(file, callback, loop, sample_rate) {
+    auto s: MidiSequencer, f: MidiFile;
+    f = file;
+    s = malloc(sizeof(MidiSequencer));
+    s.file = file;
+    s.cursor = 0;
+    s.sample_pos = 0;
+    s.anchor_tick = 0;
+    s.anchor_sample = 0;
+    s.samples_per_tick = _midi_compute_spt(f.initial_us_per_quarter,
+                                            f.division, sample_rate);
+    s.sample_rate = sample_rate;
+    s.callback = callback;
+    s.scratch_evt = malloc(sizeof(MidiEvent));
+    s.loop = loop;
+    s.playing = 1;
+    return s;
+}
+
+void midi_seq_free(seq) {
+    auto s: MidiSequencer;
+    s = seq;
+    if (s == 0) { return; }
+    if (s.scratch_evt != 0) { free(s.scratch_evt); }
+    free(seq);
+}
+
+void midi_seq_pause(seq) {
+    auto s: MidiSequencer;
+    s = seq;
+    s.playing = 0;
+}
+
+void midi_seq_resume(seq) {
+    auto s: MidiSequencer;
+    s = seq;
+    s.playing = 1;
+}
+
+void midi_seq_stop(seq) {
+    auto s: MidiSequencer, f: MidiFile;
+    s = seq;
+    f = s.file;
+    s.playing = 0;
+    s.cursor = 0;
+    s.sample_pos = 0;
+    s.anchor_tick = 0;
+    s.anchor_sample = 0;
+    s.samples_per_tick = _midi_compute_spt(f.initial_us_per_quarter,
+                                            f.division, s.sample_rate);
+}
+
+// Compute the absolute sample position of an event at `event_tick`,
+// using the sequencer's current tempo anchor.
+static _midi_sample_of(seq, event_tick) {
+    auto s: MidiSequencer;
+    s = seq;
+    return s.anchor_sample + (event_tick - s.anchor_tick) * s.samples_per_tick;
+}
+
+// Advance the sequencer by `n_samples`. Every event whose computed
+// sample position falls in [sample_pos, sample_pos + n_samples) is
+// dispatched via the callback in tick order. Tempo meta events
+// re-anchor the timebase mid-loop so the conversion stays drift-
+// free across tempo changes.
+void midi_seq_advance_samples(seq, n_samples) {
+    auto s: MidiSequencer, f: MidiFile, evt: MidiEvent;
+    auto target_sample, event_sample, ev_tick;
+
+    s = seq;
+    if (s.playing == 0) { return; }
+    f = s.file;
+    evt = s.scratch_evt;
+    target_sample = s.sample_pos + n_samples;
+
+    while (s.cursor < f.n_events) {
+        ev_tick = f.e_tick[s.cursor];
+        event_sample = _midi_sample_of(s, ev_tick);
+        if (event_sample >= target_sample) { s.cursor = s.cursor; break; }
+
+        // Tempo meta: re-anchor before treating the event normally.
+        if (f.e_type[s.cursor] == MIDI_META) {
+            if (f.e_data1[s.cursor] == MIDI_META_TEMPO) {
+                s.anchor_sample   = event_sample;
+                s.anchor_tick     = ev_tick;
+                s.samples_per_tick = _midi_compute_spt(f.e_data2[s.cursor],
+                                                       f.division, s.sample_rate);
+            }
+        }
+
+        evt.tick_samples = event_sample;
+        evt.type    = f.e_type[s.cursor];
+        evt.channel = f.e_channel[s.cursor];
+        evt.data1   = f.e_data1[s.cursor];
+        evt.data2   = f.e_data2[s.cursor];
+        call(s.callback, evt);
+        s.cursor++;
+    }
+
+    s.sample_pos = target_sample;
+
+    // Loop: when the cursor walks past the last event, restart from
+    // the top while preserving the initial tempo. Caller-visible
+    // sample_pos resets to 0 too so external schedules stay aligned.
+    if (s.cursor >= f.n_events) {
+        if (s.loop != 0) {
+            s.cursor = 0;
+            s.sample_pos = 0;
+            s.anchor_tick = 0;
+            s.anchor_sample = 0;
+            s.samples_per_tick = _midi_compute_spt(f.initial_us_per_quarter,
+                                                    f.division, s.sample_rate);
+        } else {
+            s.playing = 0;
+        }
+    }
+}
+
+// Wall-clock convenience for non-audio-batched callers. Converts
+// `dt_us` to samples via the cached sample rate, then dispatches
+// identically to the primary advance path.
+void midi_seq_advance_us(seq, dt_us) {
+    auto s: MidiSequencer, n_samples;
+    s = seq;
+    n_samples = dt_us * s.sample_rate / 1000000;
+    midi_seq_advance_samples(seq, n_samples);
+}
+
+// ─── Default synth — routes events to stbmixer ────────────────────
+
+// MIDI key number (0..127) -> frequency in Hz. 12-TET, A4 = 69 = 440 Hz.
+// The semitone table is pre-allocated in `init_midi` so this lookup
+// is malloc-free and `@safe`-compatible.
+static _midi_freq_for_key(key) @safe {
+    auto octave, semi, base;
+    semi   = key % 12;
+    octave = key / 12;
+    base   = _midi_semi_table[semi];
+    // The semitone table is anchored at octave 5 (keys 60..71).
+    // Shift by powers of two for other octaves — this preserves the
+    // 12-TET ratios without recomputing them.
+    if (octave > 5) { base = base * (1 << (octave - 5)); }
+    if (octave < 5) { base = base / (1 << (5 - octave)); }
+    return base;
+}
+
+// Default synth callback. Routes note-on / note-off through the
+// existing stbmixer voice pool. Ignores program / controller /
+// pitch-bend / meta events — those reach the callback so future
+// synths (richer mixer, sample-based) can intercept them, but the
+// v1 dispatch is intentionally minimal.
+//
+// `@safe` because the body is bounded: integer math, table lookup,
+// mixer call (which is itself main-thread bounded).
+void midi_synth_default(event) @safe {
+    auto e: MidiEvent, key, freq;
+    e = event;
+    if (e.type == MIDI_NOTE_ON) {
+        key = e.data1;
+        freq = _midi_freq_for_key(key);
+        mixer_note_on(key, freq);
+    }
+    if (e.type == MIDI_NOTE_OFF) {
+        mixer_note_off(e.data1);
+    }
+}
+
+// ─── High-level helper for games ──────────────────────────────────
+//
+// Loads the file, builds a sequencer wired to `midi_synth_default`,
+// and auto-calls `init_midi` so the synth's frequency table is
+// available before the first dispatch. Games that use the default
+// synth callback do not need to touch `init_midi` themselves.
+midi_play_file(path, loop) {
+    auto file;
+    init_midi();
+    file = midi_file_load(path);
+    if (file == 0) { return 0; }
+    return midi_seq_new(file, fn_ptr(midi_synth_default), loop, 44100);
+}
