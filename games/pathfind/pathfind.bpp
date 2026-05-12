@@ -462,27 +462,43 @@ void update_mechanics(dt_ms) {
 
 // Step the ECS particle system and draw each live particle as a 2x2
 // red rect. Life is the low byte of flags; color is everything above.
-// Decrement uses `flags - 1` (safe because life > 0 in the branch),
+// Per-particle step. Receives `(world, id)` from the ecs_query_each
+// dispatch. Reads the entity's encoded life + color, decrements life,
+// kills the slot when expired, otherwise renders a 2x2 rect at the
+// particle's screen position.
+//
+// Migration target: this callback replaces the inline `for i,
+// ecs_alive(world, i)` loop the function used to carry. Decrement
+// uses `flags - 1` (safe because life > 0 in the live branch),
 // avoiding the 24-bit mask bug that bit us in snake.
-void update_particles(dt_ms) {
-    auto i, cap, flags, life, px, py, color;
-    cap = ecs_capacity(world);
-    ecs_physics(world, dt_ms);
-    for (i = 0; i < cap; i++) {
-        if (ecs_alive(world, i)) {
-            flags = ecs_get_flags(world, i);
-            life = flags & 0xFF;
-            if (life <= 0) {
-                ecs_kill(world, i);
-            } else {
-                ecs_set_flags(world, i, flags - 1);
-                px = ecs_get_x(world, i) / 1000;
-                py = ecs_get_y(world, i) / 1000;
-                color = flags >> 8;
-                render_rect(px, py, 2, 2, color);
-            }
-        }
+void _pf_step_particle(w, id) {
+    auto flags, life, px, py, color;
+    flags = ecs_get_flags(w, id);
+    life = flags & 0xFF;
+    if (life <= 0) {
+        ecs_kill(w, id);
+    } else {
+        ecs_set_flags(w, id, flags - 1);
+        px = ecs_get_x(w, id) / 1000;
+        py = ecs_get_y(w, id) / 1000;
+        color = flags >> 8;
+        render_rect(px, py, 2, 2, color);
     }
+}
+
+// First pathfind consumer of the RTS Stress Arc Session 1 query
+// API. Builds a one-shot query for live entities and dispatches the
+// per-particle step to each. The query is allocated and freed each
+// frame for now; a long-lived handle is safe (the borrow follows the
+// world's lifetime) and would be the natural shape once Session 2
+// lands archetype storage. Functionally identical to the inline loop
+// the previous version carried — same skip-dead pattern, same body.
+void update_particles(dt_ms) {
+    auto q;
+    ecs_physics(world, dt_ms);
+    q = ecs_query(world, 1);
+    ecs_query_each(q, fn_ptr(_pf_step_particle));
+    ecs_query_free(q);
 }
 
 // ── Reset ────────────────────────────────────────────────

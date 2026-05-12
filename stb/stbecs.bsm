@@ -161,6 +161,72 @@ ecs_component_at(comp_base, id, element_size) {
     return comp_base + id * element_size;
 }
 
+// --- Query iterator (RTS Stress Arc Session 1) ---
+
+// Selector handle that pairs a world with the component-mask the
+// caller wants to iterate over. `comp_mask = 1` means "any live
+// entity"; richer masks become meaningful once Session 2 introduces
+// archetype storage. Until then the mask is just future-proofing
+// the API shape so consumers do not have to be rewritten when
+// archetypes land.
+struct EcsQuery { world, comp_mask }
+
+// Build a query for the given world + component mask. Returns a
+// handle the caller passes to ecs_query_each / ecs_query_count.
+// The query holds a borrow of the world, not a copy — kill the
+// query (ecs_query_free) before freeing the world.
+ecs_query(w, comp_mask) {
+    auto q: EcsQuery;
+    q = malloc(sizeof(EcsQuery));
+    q.world = w;
+    q.comp_mask = comp_mask;
+    return q;
+}
+
+// Walk every entity that matches the query and call the callback
+// once per match. The callback receives `(world, id)` per the
+// canonical ECS-iterator signature; capture additional state via
+// globals or a pre-allocated context buffer the callback can
+// peek at. Returns nothing; the iteration is the side effect.
+//
+// Today the loop is the same skip-dead walk consumers used to
+// inline (`for i in 0..capacity, if alive[i]`); the value is the
+// API shape — Session 2 archetype storage will swap the inner
+// loop to a contiguous archetype-chunk stream without touching
+// any caller. That is the foundation Session 1 ships.
+void ecs_query_each(q, fn) {
+    auto eq: EcsQuery, w: World, i;
+    eq = q;
+    w = eq.world;
+    for (i = 0; i < w.capacity; i++) {
+        if (peek(w.alive + i)) {
+            call(fn, w, i);
+        }
+    }
+}
+
+// Count how many entities currently match the query. Same skip-
+// dead walk as ecs_query_each, but accumulates instead of dispatching
+// per match. Useful for sizing buffers, picking a uniform sample,
+// or asserting "at least N units alive" in tests.
+ecs_query_count(q) {
+    auto eq: EcsQuery, w: World, i, n;
+    eq = q;
+    w = eq.world;
+    n = 0;
+    for (i = 0; i < w.capacity; i++) {
+        if (peek(w.alive + i)) {
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+// Free a query handle. Does not touch the underlying world.
+void ecs_query_free(q) {
+    free(q);
+}
+
 // --- Systems ---
 
 // Apply velocity to position for all live entities.

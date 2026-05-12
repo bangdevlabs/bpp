@@ -1,0 +1,94 @@
+import "stbecs.bsm";
+
+// test_ecs_query.bpp — RTS Stress Arc Session 1.
+//
+// Pins the new ecs_query / ecs_query_each / ecs_query_count API.
+// What the test confirms:
+//   - ecs_query_count returns the number of currently-live entities
+//     (matches ecs_count for the trivial mask=1 case)
+//   - ecs_query_each visits every live entity exactly once and skips
+//     the dead ones — verified via a global counter the callback bumps
+//   - The callback receives (world, id) so it can read any component
+//     associated with the entity
+//   - Killing entities mid-arc updates both count and each visit set
+//   - The query handle survives kill/spawn churn (it borrows the world)
+//
+// The hot path is identical to the boilerplate `for i, if alive[i]`
+// pattern Session 1 replaces; the value is the API shape that Session 2
+// will swap to archetype-chunk iteration without rewriting any caller.
+
+global _q_visited;     // count of (w, id) callback invocations
+global _q_id_sum;      // sum of ids visited (sanity that the right ids land)
+
+void _q_count_live(w, id) {
+    _q_visited = _q_visited + 1;
+    _q_id_sum = _q_id_sum + id;
+}
+
+void check_int(label, got, want) {
+    if (got != want) {
+        putstr("FAIL "); putstr(label);
+        putstr(" got=");  putnum(got);
+        putstr(" want="); putnum(want);
+        putline();
+        sys_exit(1);
+    }
+}
+
+main() {
+    auto w, q, i;
+    auto id0, id1, id2, id3, id4;
+
+    w = ecs_new(8);
+
+    // Spawn five entities. IDs come from the free stack and form a
+    // descending sequence (capacity-1, capacity-2, ...) by construction.
+    id0 = ecs_spawn(w);
+    id1 = ecs_spawn(w);
+    id2 = ecs_spawn(w);
+    id3 = ecs_spawn(w);
+    id4 = ecs_spawn(w);
+
+    q = ecs_query(w, 1);
+
+    // Count matches ecs_count for the trivial alive-mask case.
+    check_int("count_5", ecs_query_count(q), 5);
+
+    // Walk every entity, accumulate count + id sum.
+    _q_visited = 0;
+    _q_id_sum = 0;
+    ecs_query_each(q, fn_ptr(_q_count_live));
+    check_int("each_visited_5", _q_visited, 5);
+    check_int("each_id_sum_5", _q_id_sum, id0 + id1 + id2 + id3 + id4);
+
+    // Kill one entity, query reflects the change immediately.
+    ecs_kill(w, id2);
+    check_int("count_after_kill", ecs_query_count(q), 4);
+
+    _q_visited = 0;
+    _q_id_sum = 0;
+    ecs_query_each(q, fn_ptr(_q_count_live));
+    check_int("each_visited_4", _q_visited, 4);
+    check_int("each_id_sum_4", _q_id_sum, id0 + id1 + id3 + id4);
+
+    // Kill all remaining, count should fall to 0.
+    ecs_kill(w, id0);
+    ecs_kill(w, id1);
+    ecs_kill(w, id3);
+    ecs_kill(w, id4);
+    check_int("count_after_full_kill", ecs_query_count(q), 0);
+
+    _q_visited = 0;
+    ecs_query_each(q, fn_ptr(_q_count_live));
+    check_int("each_visited_0", _q_visited, 0);
+
+    // Re-spawn, query handle survives the churn (borrow, not copy).
+    ecs_spawn(w);
+    ecs_spawn(w);
+    check_int("count_after_respawn", ecs_query_count(q), 2);
+
+    ecs_query_free(q);
+
+    putstr("OK\n");
+    return 0;
+}
