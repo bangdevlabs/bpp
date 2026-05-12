@@ -57,8 +57,14 @@ struct MidiEvent {
     data2           // velocity / value / tempo us-per-quarter / etc
 }
 
-// Parsed file. Events are stored as parallel arrays (SoA per
-// Tonify Rule 30 — keeps cache locality on the iteration loop).
+// Parsed file. Events are stored as parallel arrays (SoA),
+// mirroring the 11-voice parallel-array pattern in stbmixer
+// (`stb/stbmixer.bsm:141-151`). The sequencer's hot loop in
+// `midi_seq_advance_samples` reads e_tick on every iteration for
+// the dispatch-window comparison and only reaches into e_type /
+// e_data1 / e_data2 for events that actually fire — SoA keeps the
+// comparison column cache-hot. (Tonify Rule 30 is ECS-specific; the
+// precedent here is the stbmixer voice-state layout, not Rule 30.)
 struct MidiFile {
     format,                  // 0 or 1 (Format 2 rejected at load)
     n_tracks,
@@ -75,11 +81,24 @@ struct MidiFile {
 // Sequencer state. Carries the playback cursor plus the
 // anchor-tick / anchor-sample / samples-per-tick triplet that
 // makes mid-stream tempo changes drift-free.
+//
+// `owns_file` decides whether `midi_seq_free` also releases the
+// underlying MidiFile. `midi_play_file` sets it to 1 so callers can
+// free everything with a single call; direct `midi_seq_new` users
+// keep ownership of the file and `owns_file` stays 0.
+//
+// `scratch_evt` is a single pre-allocated MidiEvent reused across
+// every dispatch. The callback receives a pointer to this scratch
+// instance — its fields are valid ONLY for the duration of the
+// callback call. Callbacks that need to retain an event must copy
+// the fields out before returning. No per-event malloc in the hot
+// loop.
 struct MidiSequencer {
     file,             // MidiFile pointer
+    owns_file,        // 1 if midi_seq_free should also free `file`
     cursor,           // next event index in file.e_*
-    sample_pos,       // current sample cursor
-    anchor_tick,      // most-recent tempo-change anchor
+    sample_pos,       // current sample cursor (continuous, never reset)
+    anchor_tick,      // most-recent tempo-change anchor (resets on loop)
     anchor_sample,    // sample position at anchor_tick
     samples_per_tick, // samples per MIDI tick from anchor forward
     sample_rate,
@@ -110,10 +129,19 @@ void midi_seq_advance_samples(seq, n_samples)
 // dispatches identically.
 void midi_seq_advance_us(seq, dt_us)
 
+// pause / resume: the cursor stays where it is; resume continues
+// from the exact event the dispatcher last visited.
+// stop: also resets cursor to 0 AND restores the initial tempo
+// anchor (sample_pos goes back to 0). pause = "freeze in place,"
+// stop = "rewind and freeze." A subsequent resume after stop plays
+// the track from the beginning.
 void midi_seq_pause(seq)
 void midi_seq_resume(seq)
 void midi_seq_stop(seq)
 void midi_seq_free(seq)
+   // If `owns_file` was set (the midi_play_file path) the file
+   // is freed along with the sequencer. Otherwise the caller still
+   // owns `seq.file` and must call midi_file_free separately.
 
 // ─── Default synth — routes events to stbmixer ────────────────────
 // Event-only signature so live-input drivers can reuse it without
@@ -123,6 +151,11 @@ void midi_synth_default(event) @safe
 
 // ─── High-level helper for games ──────────────────────────────────
 midi_play_file(path, loop) -> MidiSequencer
+   // Returns 0 on load failure (the parser already printed a
+   // diagnostic via put_err). Callers MUST check before passing to
+   // any other API; passing 0 to midi_seq_advance_samples crashes.
+   // The returned sequencer owns the underlying MidiFile — a single
+   // midi_seq_free call releases everything.
 ```
 
 ## Timebase — sample-accurate from day 1
@@ -146,6 +179,36 @@ accumulated rounding.
 `midi_seq_advance_samples(n)` walks events whose computed sample
 position falls in `[sample_pos, sample_pos + n)` and fires the
 callback in tick order. After the loop, `sample_pos += n`.
+
+**Sample-pos authority.** The sequencer is the sole authority on
+its own `sample_pos`. The advance API increments it strictly by the
+`n_samples` the caller passes. The sequencer does NOT consult
+`beat_now_samples` (which is millisecond-resolution under the hood —
+see `src/bpp_beat.bsm`) during the per-event dispatch loop. This
+decouples MIDI clock from wall-clock drift and keeps tempo-change
+re-anchoring deterministic. `beat_now_samples` is still useful to
+seed an anchor at sequencer creation and to cross-check long-running
+drift in tests, but it never appears in the hot path.
+
+**Tempo re-anchor — implementation discipline.** When an
+`advance_samples` call spans a tempo change, events BEFORE the
+tempo event use the OLD `samples_per_tick`, the tempo event itself
+triggers the re-anchor, and events AFTER it use the NEW
+`samples_per_tick`. The dispatch loop MUST recompute each event's
+sample position using the CURRENT anchor at the moment of dispatch.
+Pre-computing all events' sample positions upfront breaks the
+invariant: any event after a tempo change would carry a stale
+offset baked at parse time. Always: read tick, read tempo state,
+multiply, dispatch — never cache the product.
+
+**Loop continuity.** When `loop != 0` and the cursor walks past the
+last event, the sequencer restarts the cursor at 0 BUT keeps
+`sample_pos` continuous (it is not reset to 0). The tick anchor
+resets — file ticks restart at 0 — but `anchor_sample` picks up the
+current `sample_pos` value so forward tick→sample math stays
+consistent. External callers tracking elapsed playback time
+("how long has the music been running?") observe a monotonic
+`sample_pos` across loop boundaries instead of an abrupt rewind.
 
 ## Threading — main thread only
 
@@ -257,7 +320,11 @@ Per Rule 28 — deferred until concrete consumer demand surfaces:
 
 - Full General MIDI instrument set (sample-based synthesis). Default
   synth uses the existing `mixer_note_on(key_id, freq)` + the fader-
-  driven waveform.
+  driven waveform. stbmixer's tone-voice pool is 8 slots (slots 0–7
+  in `_MX_MAX_VOICES = 10`; slot 8 is dedicated to streaming music
+  via `mixer_play_music`, slot 9 is reserved). A single MIDI track
+  fits comfortably in 8 simultaneous voices for early-90s GM music;
+  denser modern arrangements clip at the eighth concurrent note-on.
 - Per-channel program change → instrument selection. Default synth
   ignores program-change events; future synth-callback consumers can
   intercept them.
@@ -269,6 +336,16 @@ Per Rule 28 — deferred until concrete consumer demand surfaces:
   driver exists (CoreMIDI / ALSA / WinMM).
 - SMF file writing. mini_synth can save recordings once the read
   path is stable.
+- Multi-sequencer voice arbitration. v1 assumes at most one
+  MidiSequencer is dispatching note-on events to the mixer at a time.
+  Two sequencers running concurrently share the same 8-voice tone
+  pool; if both attempt note-on on the same MIDI key, the second
+  call returns the existing voice (stbmixer's "already playing this
+  key" short-circuit) instead of starting a new voice with a
+  different timbre. Cross-sequencer voice allocation is a separate
+  design when a real use case demands two MIDI streams audible at
+  once — game music + ambient sting, for instance — and depends on
+  the mixer growing per-voice timbre selection first.
 
 ## Cross-references
 

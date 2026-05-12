@@ -72,11 +72,24 @@ struct MidiFile {
 // Sequencer state. Carries the playback cursor plus the
 // anchor-tick / anchor-sample / samples-per-tick triplet that
 // makes mid-stream tempo changes drift-free.
+//
+// `owns_file` decides whether `midi_seq_free` also releases the
+// underlying MidiFile. The helper `midi_play_file` sets it to 1 so
+// callers can free everything with a single call; direct
+// `midi_seq_new` users keep ownership of the file and `owns_file`
+// stays 0.
+//
+// `scratch_evt` is a single pre-allocated MidiEvent reused across
+// every dispatch. The callback receives a pointer to this scratch
+// instance — its contents are valid only for the duration of the
+// callback call. Callbacks that need to retain an event must copy
+// the fields before returning.
 struct MidiSequencer {
     file,             // MidiFile pointer
+    owns_file,        // 1 if midi_seq_free should also free `file`
     cursor,           // next event index in file.e_*
-    sample_pos,       // current sample cursor
-    anchor_tick,      // most-recent tempo-change anchor
+    sample_pos,       // current sample cursor (continuous, never reset)
+    anchor_tick,      // most-recent tempo-change anchor (resets on loop)
     anchor_sample,    // sample position at anchor_tick
     samples_per_tick, // samples per MIDI tick from anchor forward
     sample_rate,
@@ -494,11 +507,15 @@ static _midi_compute_spt(us_per_quarter, division, sample_rate) {
     return us_per_quarter * sample_rate / division / 1000000;
 }
 
+// Wire a sequencer over a caller-owned MidiFile. The caller retains
+// responsibility for `midi_file_free` — see `midi_play_file` for the
+// owned-file variant.
 midi_seq_new(file, callback, loop, sample_rate) {
     auto s: MidiSequencer, f: MidiFile;
     f = file;
     s = malloc(sizeof(MidiSequencer));
     s.file = file;
+    s.owns_file = 0;
     s.cursor = 0;
     s.sample_pos = 0;
     s.anchor_tick = 0;
@@ -513,11 +530,18 @@ midi_seq_new(file, callback, loop, sample_rate) {
     return s;
 }
 
+// Release the sequencer. If `owns_file` is set (the helper
+// `midi_play_file` path) the underlying MidiFile is freed too. For
+// the `midi_seq_new` path the caller still owns the file and must
+// call `midi_file_free` separately.
 void midi_seq_free(seq) {
     auto s: MidiSequencer;
     s = seq;
     if (s == 0) { return; }
     if (s.scratch_evt != 0) { free(s.scratch_evt); }
+    if (s.owns_file != 0) {
+        if (s.file != 0) { midi_file_free(s.file); }
+    }
     free(seq);
 }
 
@@ -595,15 +619,18 @@ void midi_seq_advance_samples(seq, n_samples) {
 
     s.sample_pos = target_sample;
 
-    // Loop: when the cursor walks past the last event, restart from
-    // the top while preserving the initial tempo. Caller-visible
-    // sample_pos resets to 0 too so external schedules stay aligned.
+    // Loop: when the cursor walks past the last event, restart event
+    // playback from the top while keeping `sample_pos` continuous —
+    // external callers tracking elapsed playback time stay aligned
+    // across the loop boundary. The tick anchor resets so file ticks
+    // restart at 0 (otherwise we would have to rebase every event
+    // tick), but anchor_sample picks up the current sample_pos so
+    // the tick→sample math stays consistent forward from here.
     if (s.cursor >= f.n_events) {
         if (s.loop != 0) {
             s.cursor = 0;
-            s.sample_pos = 0;
             s.anchor_tick = 0;
-            s.anchor_sample = 0;
+            s.anchor_sample = s.sample_pos;
             s.samples_per_tick = _midi_compute_spt(f.initial_us_per_quarter,
                                                     f.division, s.sample_rate);
         } else {
@@ -665,12 +692,17 @@ void midi_synth_default(event) @safe {
 //
 // Loads the file, builds a sequencer wired to `midi_synth_default`,
 // and auto-calls `init_midi` so the synth's frequency table is
-// available before the first dispatch. Games that use the default
-// synth callback do not need to touch `init_midi` themselves.
+// available before the first dispatch. The returned sequencer
+// OWNS the underlying MidiFile — calling `midi_seq_free` releases
+// both. Returns 0 on load failure (parser already printed a
+// diagnostic via `put_err`); callers must check before passing to
+// the advance / free APIs.
 midi_play_file(path, loop) {
-    auto file;
+    auto file, seq: MidiSequencer;
     init_midi();
     file = midi_file_load(path);
     if (file == 0) { return 0; }
-    return midi_seq_new(file, fn_ptr(midi_synth_default), loop, 44100);
+    seq = midi_seq_new(file, fn_ptr(midi_synth_default), loop, 44100);
+    seq.owns_file = 1;
+    return seq;
 }
