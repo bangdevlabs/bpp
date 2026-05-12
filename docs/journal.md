@@ -1,5 +1,63 @@
 # B++ Bootstrap Journal
 
+## 2026-05-12 — Parser DRY violation fix: `++` / `--` on struct fields
+
+Late-day follow-up to the RTS Stress Arc closure. While shipping
+Session 5 the scheduler tripped over a silent codegen no-op:
+`wd.sys_count++` on a struct field did nothing, while `wd.sys_count
+= wd.sys_count + 1` worked. The Session 5 commit logged the gap as
+a deferred sidequest; the user audited the source on the spot and
+identified it as a classic DRY violation rather than a design gap,
+worth closing immediately while the context was fresh.
+
+**Root cause**: `bpp_parser.bsm` had two sibling desugar helpers,
+`_make_inc_assign` (for `++` / `--`) and `_make_compound_assign`
+(for `+=` / `-=` / `*=` / `/=`). They were 90% identical, but only
+the compound-assign side carried the T_MEMLD → T_MEMST branch that
+makes the assignment actually write back through a memory-load lhs.
+The inc-assign side always emitted a plain T_ASSIGN, which silently
+no-op'd on T_MEMLD lhs. The compound-assign comment even said
+"mirrors the T_MEMST path of plain '='" — the author who added that
+branch knew the discipline but did not propagate it to the sibling.
+
+The bug survived months because:
+
+- B++ convention already favoured the longhand `= field + 1` form;
+  Session 2's archetype storage code never wrote `++` on struct
+  fields, so the gap had no consumer.
+- Loop counters (`for (i = 0; i < n; i++)`) use `++` on plain
+  locals where the desugar is correct.
+- The compiler emitted T_ASSIGN cleanly and did not warn — so the
+  program compiled, ran, and silently degraded.
+
+**Fix**: replace `_make_inc_assign` with a one-line delegate to
+`_make_compound_assign(op_ch, lhs, make_int_lit(1))`. Eliminates
+the duplication entirely; the T_MEMLD branch and any future
+semantic refinements live in one place. Net change in
+`bpp_parser.bsm`: -7 LOC. Bootstrap byte-stable on first try (the
+compiler itself uses the longhand form throughout, so the codegen
+change exercises only user code).
+
+**Pin**: `tests/test_inc_struct_field.bpp` covers postfix / prefix
+`++` / `--` on both struct fields (`c.value++`) and `buf_word`
+indexed slots (`arr[2]++`). The test FAILS today against the old
+parser (3 of 6 assertions) and PASSES after the fix.
+
+Same-day cleanup: Session 5's `wd.sys_count = wd.sys_count + 1`
+workaround in stbecs.bsm reverted to `wd.sys_count++`. The deferred
+sidequest entry in `docs/todo.md` removed. Suite gains one (the
+pin): 158/0/12 native + 130/0/40 C-emit.
+
+**Lesson worth pinning**: sibling helpers with copy-pasted bodies
+will drift. Either (a) factor the shared logic into a delegate /
+dispatcher so it cannot drift, or (b) write exhaustive tests
+covering every cross-product of input shape × helper variant. Both
+are valid; this case picked (a) because the delegate was a one-line
+shrink. Not a tonify rule yet — needs more occurrences before it
+earns one — but a real lesson worth carrying.
+
+---
+
 ## 2026-05-12 — RTS Stress Arc infrastructure CLOSED (Sessions 4 + 5)
 
 Same day arc close. Session 4 (flow-field pathfinding) and Session 5

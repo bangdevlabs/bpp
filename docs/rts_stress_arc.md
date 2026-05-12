@@ -497,13 +497,21 @@ literal `fn_ptr(NAME)` arguments, so the dynamic path silences the
 warning without losing the verification at the genuine registration
 site.
 
-Also surfaced the **struct-field `++` codegen gap** in B++:
-`_make_inc_assign` in `bpp_parser.bsm` lacks the T_MEMLD branch that
-`_make_compound_assign` has. So `wd.sys_count++` silently no-ops on
-struct fields, while `wd.sys_count = wd.sys_count + 1` works.
-Tracked as a deferred compiler sidequest in `docs/todo.md`. Existing
-Session 2 archetype code already used the `= field + 1` form,
-suggesting the gap predates Session 5 and was simply unfound.
+Also surfaced (and same-day FIXED) the **struct-field `++` codegen
+gap** in B++. Root cause was a DRY violation in `bpp_parser.bsm`:
+`_make_inc_assign` reimplemented the desugar instead of delegating
+to `_make_compound_assign`, and the T_MEMLD → T_MEMST branch that
+landed on the latter (for `+=` / `-=` / `*=` / `/=`) never made it
+back to the former. So `wd.sys_count++` silently no-op'd on struct
+fields and array slots, while `wd.sys_count = wd.sys_count + 1`
+worked. Pre-existing Session 2 archetype code already used the
+longhand form by convention, which is why the gap survived months
+unfound. Fix replaced `_make_inc_assign` with a 1-line delegate to
+`_make_compound_assign(op_ch, lhs, make_int_lit(1))`; pinned by
+`tests/test_inc_struct_field.bpp` covering postfix / prefix `++` /
+`--` on both struct fields and buf_word slots. Bootstrap byte-stable
+on first try (the compiler itself uses the longhand form throughout,
+so the codegen change exercises only user code).
 
 **Session 4 — SHIPPED 2026-05-12** (perf gate cleared by ~30x):
 
