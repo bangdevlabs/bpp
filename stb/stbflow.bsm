@@ -1,0 +1,276 @@
+// stbflow.bsm — Flow-field pathfinding for one-to-many goal scenarios.
+//
+// Use case: RTS-scale movement where many units share a destination
+// (a rally point, an enemy base, a building objective). A* per unit
+// scales as O(units * cells); flow fields amortise the cost across
+// all units that share the goal: one BFS from the goal fills a
+// distance field in O(cells), and every unit sampling the field is
+// O(1).
+//
+// API at a glance:
+//
+//   flow_new(w, h)                         — allocate a FlowField
+//   flow_free(field)                       — release all buffers
+//   flow_set_blocked(field, gx, gy, b)     — paint a cell walkable/blocked
+//   flow_is_blocked(field, gx, gy)         — bounds-safe read
+//   flow_compute(field, goal_x, goal_y)    — BFS from goal; fills dist
+//   flow_dist(field, gx, gy)               — O(1) lookup; FLOW_INF if unreachable
+//   flow_step(field, gx, gy, out_step)     — out_step[0]=dx, out_step[1]=dy
+//                                            in {-1, 0, 1}^2 (4-connected)
+//
+// Storage layout is parallel arrays sized w*h: `blocked` (1 byte
+// per cell), `dist` (1 word per cell), `queue` (1 word per cell —
+// BFS each cell at most once, so capacity w*h is sufficient).
+//
+// 4-connected only by design. Diagonal motion plus √2 edge cost
+// would require a Dijkstra heap (see stbpath) and changes the BFS
+// invariant; promote to that only when a real consumer asks. Same
+// restraint applies to multi-goal fields and moving goals.
+//
+// Portability tier: pure B++ over `buf_word` / `buf_byte`. No SIMD,
+// no FFI; C-emit-clean.
+
+struct FlowField {
+    w, h,         // grid dimensions in cells
+    blocked,      // w*h byte array: 0 = walkable, 1 = blocked
+    dist,         // w*h word array: hops from goal; FLOW_INF if unreachable
+    queue         // w*h word array: BFS queue, used linearly each compute
+}
+
+// Sentinel value for "no path to goal." Any positive cell distance
+// is smaller; sampling at FLOW_INF cells returns the zero step.
+const FLOW_INF = 2000000000;
+
+// ── Module init ─────────────────────────────────────────────────
+
+// Initialize the module. Currently a no-op; present for symmetry
+// with `init_path` so games can call `init_flow()` uniformly.
+void init_flow() {
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────
+
+// Allocate a new FlowField for a (w x h) grid. All cells start
+// walkable. The distance field is not initialised here — the first
+// `flow_compute` call seeds it per-query.
+flow_new(w, h) {
+    auto f: FlowField, n;
+    f = malloc(sizeof(FlowField));
+    f.w = w;
+    f.h = h;
+    n = w * h;
+
+    f.blocked = buf_byte(n);
+    f.dist    = buf_word(n);
+    f.queue   = buf_word(n);
+
+    buf_fill(f.blocked, 0, n);
+    return f;
+}
+
+// Free a FlowField and all its scratch buffers.
+void flow_free(field) {
+    auto f: FlowField;
+    f = field;
+    if (f.blocked != 0) { free(f.blocked); }
+    if (f.dist    != 0) { free(f.dist); }
+    if (f.queue   != 0) { free(f.queue); }
+    free(field);
+}
+
+// ── Cell access ─────────────────────────────────────────────────
+
+// Mark a cell walkable (blocked = 0) or blocked (blocked = 1).
+// Out-of-bounds writes are silently ignored, matching stbpath's
+// convention.
+void flow_set_blocked(field, gx, gy, blocked) {
+    auto f: FlowField;
+    f = field;
+    if (gx < 0) { return; }
+    if (gy < 0) { return; }
+    if (gx >= f.w) { return; }
+    if (gy >= f.h) { return; }
+    poke(f.blocked + gy * f.w + gx, blocked);
+}
+
+// Returns 1 for blocked or out-of-bounds, 0 for walkable.
+flow_is_blocked(field, gx, gy) {
+    auto f: FlowField;
+    f = field;
+    if (gx < 0) { return 1; }
+    if (gy < 0) { return 1; }
+    if (gx >= f.w) { return 1; }
+    if (gy >= f.h) { return 1; }
+    return peek(f.blocked + gy * f.w + gx);
+}
+
+// ── Compute ─────────────────────────────────────────────────────
+
+// Fill the distance field via BFS from (goal_x, goal_y). After this
+// returns, `dist[cell] == hop count` from the goal for every
+// reachable cell, or FLOW_INF for cells the goal cannot reach.
+//
+// If the goal is out of bounds or sits on a blocked cell, the entire
+// field becomes FLOW_INF (no reachable cells) — callers that pass an
+// invalid goal get a consistent "all unreachable" result instead of
+// a silent half-filled field.
+void flow_compute(field, goal_x, goal_y) {
+    auto f: FlowField, n, i;
+    auto head, tail, cur, cx, cy, cur_dist;
+    auto nx, ny, nidx;
+
+    f = field;
+    n = f.w * f.h;
+
+    // Seed dist with the unreachable sentinel.
+    for (i = 0; i < n; i++) {
+        f.dist[i] = FLOW_INF;
+    }
+
+    // Reject invalid goals up front so the BFS invariant holds.
+    if (goal_x < 0) { return; }
+    if (goal_y < 0) { return; }
+    if (goal_x >= f.w) { return; }
+    if (goal_y >= f.h) { return; }
+    if (peek(f.blocked + goal_y * f.w + goal_x) != 0) { return; }
+
+    head = 0;
+    tail = 0;
+    f.dist[goal_y * f.w + goal_x] = 0;
+    f.queue[tail] = goal_y * f.w + goal_x;
+    tail += 1;
+
+    // BFS. Each cell is enqueued at most once because the dist
+    // check below is the visited guard. With 4-connected motion
+    // and unit edge cost, BFS produces the shortest-hop field.
+    while (head < tail) {
+        cur = f.queue[head];
+        head += 1;
+        cur_dist = f.dist[cur];
+        cx = cur % f.w;
+        cy = cur / f.w;
+
+        // North neighbour.
+        ny = cy - 1;
+        if (ny >= 0) {
+            nidx = ny * f.w + cx;
+            if (peek(f.blocked + nidx) == 0) {
+                if (f.dist[nidx] == FLOW_INF) {
+                    f.dist[nidx] = cur_dist + 1;
+                    f.queue[tail] = nidx;
+                    tail += 1;
+                }
+            }
+        }
+
+        // South neighbour.
+        ny = cy + 1;
+        if (ny < f.h) {
+            nidx = ny * f.w + cx;
+            if (peek(f.blocked + nidx) == 0) {
+                if (f.dist[nidx] == FLOW_INF) {
+                    f.dist[nidx] = cur_dist + 1;
+                    f.queue[tail] = nidx;
+                    tail += 1;
+                }
+            }
+        }
+
+        // West neighbour.
+        nx = cx - 1;
+        if (nx >= 0) {
+            nidx = cy * f.w + nx;
+            if (peek(f.blocked + nidx) == 0) {
+                if (f.dist[nidx] == FLOW_INF) {
+                    f.dist[nidx] = cur_dist + 1;
+                    f.queue[tail] = nidx;
+                    tail += 1;
+                }
+            }
+        }
+
+        // East neighbour.
+        nx = cx + 1;
+        if (nx < f.w) {
+            nidx = cy * f.w + nx;
+            if (peek(f.blocked + nidx) == 0) {
+                if (f.dist[nidx] == FLOW_INF) {
+                    f.dist[nidx] = cur_dist + 1;
+                    f.queue[tail] = nidx;
+                    tail += 1;
+                }
+            }
+        }
+    }
+}
+
+// ── Sampling ────────────────────────────────────────────────────
+
+// Distance from (gx, gy) to the goal. Returns FLOW_INF for blocked,
+// out-of-bounds, or unreachable cells.
+flow_dist(field, gx, gy) {
+    auto f: FlowField;
+    f = field;
+    if (gx < 0) { return FLOW_INF; }
+    if (gy < 0) { return FLOW_INF; }
+    if (gx >= f.w) { return FLOW_INF; }
+    if (gy >= f.h) { return FLOW_INF; }
+    return f.dist[gy * f.w + gx];
+}
+
+// Fill `out_step` with the unit step (dx, dy) a unit at (gx, gy)
+// should take toward the goal. `out_step` is a buf_word(2): out[0]
+// receives dx, out[1] receives dy. Both are in {-1, 0, 1}; the cell
+// pointing at the goal has the smallest distance among the four
+// neighbours.
+//
+// Returns (0, 0) for the goal cell itself, for unreachable cells,
+// and for blocked / out-of-bounds queries — the caller can treat
+// "no step" as a single condition.
+void flow_step(field, gx, gy, out_step) {
+    auto f: FlowField;
+    auto here, best, best_dx, best_dy, nd;
+
+    f = field;
+    out_step[0] = 0;
+    out_step[1] = 0;
+    if (gx < 0) { return; }
+    if (gy < 0) { return; }
+    if (gx >= f.w) { return; }
+    if (gy >= f.h) { return; }
+    if (peek(f.blocked + gy * f.w + gx) != 0) { return; }
+
+    here = f.dist[gy * f.w + gx];
+    if (here == FLOW_INF) { return; }
+    if (here == 0) { return; }      // already at the goal
+
+    best = here;
+    best_dx = 0;
+    best_dy = 0;
+
+    // North. Strict less-than: only pick a neighbour that actually
+    // descends, so the (0, 0) result is reserved for "already at the
+    // goal" or "unreachable."
+    if (gy - 1 >= 0) {
+        nd = f.dist[(gy - 1) * f.w + gx];
+        if (nd < best) { best = nd; best_dx = 0; best_dy = -1; }
+    }
+    // South.
+    if (gy + 1 < f.h) {
+        nd = f.dist[(gy + 1) * f.w + gx];
+        if (nd < best) { best = nd; best_dx = 0; best_dy = 1; }
+    }
+    // West.
+    if (gx - 1 >= 0) {
+        nd = f.dist[gy * f.w + (gx - 1)];
+        if (nd < best) { best = nd; best_dx = -1; best_dy = 0; }
+    }
+    // East.
+    if (gx + 1 < f.w) {
+        nd = f.dist[gy * f.w + (gx + 1)];
+        if (nd < best) { best = nd; best_dx = 1; best_dy = 0; }
+    }
+
+    out_step[0] = best_dx;
+    out_step[1] = best_dy;
+}

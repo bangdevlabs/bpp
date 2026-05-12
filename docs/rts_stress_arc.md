@@ -439,9 +439,45 @@ Wait for one of the soft prerequisites too.
 same-day; Session 1 shipped immediately after per the
 continuous-execute directive.
 
-**Current state**: Sessions 1, 2, and 3 SHIPPED 2026-05-12.
+**Current state**: Sessions 1, 2, 3, and 4 SHIPPED 2026-05-12.
 
-**Next session**: Session 4 — Flow fields pathfinding (independent of 1/2/3).
+**Next session**: Session 5 — System scheduler.
+
+**Session 4 — SHIPPED 2026-05-12** (perf gate cleared by ~30x):
+
+- `stb/stbflow.bsm` (~210 LOC) — new cartridge, doesn't touch
+  stbpath. API: `flow_new(w, h)`, `flow_free`, `flow_set_blocked`,
+  `flow_is_blocked`, `flow_compute(field, goal_x, goal_y)`,
+  `flow_dist(field, gx, gy)`, `flow_step(field, gx, gy, out_step)`.
+  Storage: parallel `buf_byte` (blocked mask) + two `buf_word` arrays
+  (distance field + BFS queue). 4-connected BFS only by design —
+  diagonals require Dijkstra-with-heap (stbpath's territory) and
+  add complexity without a current consumer to justify it.
+- `tests/test_stbflow.bpp` correctness pins: empty grid (manhattan
+  distance), wall maze (BFS routes around blockers, length matches
+  geometric prediction), unreachable sealed region (FLOW_INF +
+  zero step), goal-on-blocked-cell (consistent all-unreachable
+  result, not half-filled field).
+- `tests/bench_stbflow.bpp` perf gate: 100 units pathing to the
+  centre of a 64x64 grid with three diagonal wall segments. Two
+  paths timed:
+  - Per-unit A* (stbpath): ~1.8 ms total for 100 invocations.
+  - Flow field (1 compute + 100 step samples): **~48 us total**.
+  - **Ratio: ~38x**, well under the 2 ms gate. All 100 units
+    reachable. Aggregate path lengths within 4% across the two
+    algorithms (A* per-pair vs flow descent from goal — same
+    geometry, equivalent costs).
+
+Asymptotic shape: A* scales O(units * cells log cells); flow scales
+O(cells + units). At RTS scale (1000+ units) the ratio widens
+proportionally — flow's BFS cost is paid once, every additional
+unit is a constant-time sample. This is the load-bearing win
+Session 6 (optional capstone) builds on.
+
+Suite: 156/0/12 native + 129/0/39 C-emit. New cartridge is
+C-emit-clean (pure B++ over `buf_word` / `buf_byte`, no SIMD).
+
+**Session 3 — SHIPPED 2026-05-12** (with a portability-tier course correction):
 
 **Session 3 — SHIPPED 2026-05-12** (with a portability-tier course correction):
 

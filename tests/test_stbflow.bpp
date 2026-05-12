@@ -1,0 +1,127 @@
+import "stbflow.bsm";
+
+// test_stbflow.bpp — Correctness pins for the flow-field cartridge.
+//
+// Covers four scenarios:
+//   1. Empty grid    — distance equals manhattan, steps descend monotonically.
+//   2. Wall maze     — flow routes around a blocking wall (longer than manhattan).
+//   3. Unreachable   — cells separated from the goal report FLOW_INF + zero step.
+//   4. Edge cases    — at-goal, out-of-bounds, blocked queries return zero step.
+
+static _expect_int(label, got, want) {
+    if (got == want) {
+        return 0;
+    }
+    put("FAIL: ");
+    put(label);
+    put(" got=");
+    put(got);
+    put(" want=");
+    put(want);
+    put("\n");
+    return 1;
+}
+
+main() {
+    auto f;
+    auto step;
+    auto fails;
+
+    fails = 0;
+    step = buf_word(2);
+
+    // ── Scenario 1: empty 10x10 grid, goal at (5, 5).
+    f = flow_new(10, 10);
+    flow_compute(f, 5, 5);
+
+    fails = fails + _expect_int("empty goal dist",      flow_dist(f, 5, 5), 0);
+    fails = fails + _expect_int("empty manhattan 10",   flow_dist(f, 0, 0), 10);
+    fails = fails + _expect_int("empty manhattan 4",    flow_dist(f, 5, 1), 4);
+    fails = fails + _expect_int("empty corner",         flow_dist(f, 9, 9), 8);
+
+    // Step at (0, 0) should descend. Either east or south is valid since
+    // both reduce distance equally — accept either as long as the step
+    // is monotonic-descending.
+    flow_step(f, 0, 0, step);
+    if (flow_dist(f, 0 + step[0], 0 + step[1]) >= flow_dist(f, 0, 0)) {
+        put("FAIL: empty step at (0,0) not descending\n");
+        fails = fails + 1;
+    }
+
+    // At-goal: zero step expected (no descent possible).
+    flow_step(f, 5, 5, step);
+    fails = fails + _expect_int("at-goal dx", step[0], 0);
+    fails = fails + _expect_int("at-goal dy", step[1], 0);
+
+    // Out-of-bounds: zero step + FLOW_INF dist.
+    flow_step(f, -1, 5, step);
+    fails = fails + _expect_int("oob dx", step[0], 0);
+    fails = fails + _expect_int("oob dy", step[1], 0);
+    fails = fails + _expect_int("oob dist", flow_dist(f, -1, 5), FLOW_INF);
+
+    flow_free(f);
+
+    // ── Scenario 2: wall maze. 10x10 grid, vertical wall on column 5
+    // from row 0 to row 8 (leaves a single opening at row 9). Goal at
+    // (0, 0); a unit at (9, 0) must route down to row 9, across, and
+    // back up. Path length = 9 (down) + 9 (left) + 9 (up) = 27.
+    auto x, y;
+    f = flow_new(10, 10);
+    for (y = 0; y < 9; y++) {
+        flow_set_blocked(f, 5, y, 1);
+    }
+    flow_compute(f, 0, 0);
+
+    fails = fails + _expect_int("wall goal dist",  flow_dist(f, 0, 0), 0);
+    fails = fails + _expect_int("wall route len",  flow_dist(f, 9, 0), 27);
+    // The blocked cells themselves stay at FLOW_INF (they were never
+    // visited — `compute` skips blocked neighbours).
+    fails = fails + _expect_int("wall cell unreached", flow_dist(f, 5, 0), FLOW_INF);
+
+    // Step at (9, 0) should be south (toward the opening at row 9).
+    flow_step(f, 9, 0, step);
+    fails = fails + _expect_int("wall step dx", step[0], 0);
+    fails = fails + _expect_int("wall step dy", step[1], 1);
+
+    flow_free(f);
+
+    // ── Scenario 3: unreachable region. Seal the goal entirely with a
+    // 4-cell ring; anything outside the ring should be FLOW_INF.
+    f = flow_new(10, 10);
+    flow_set_blocked(f, 4, 5, 1);
+    flow_set_blocked(f, 6, 5, 1);
+    flow_set_blocked(f, 5, 4, 1);
+    flow_set_blocked(f, 5, 6, 1);
+    flow_compute(f, 5, 5);
+
+    fails = fails + _expect_int("sealed goal dist", flow_dist(f, 5, 5), 0);
+    fails = fails + _expect_int("outside dist",     flow_dist(f, 0, 0), FLOW_INF);
+
+    // Unreachable cell: zero step (no descent direction exists).
+    flow_step(f, 0, 0, step);
+    fails = fails + _expect_int("unreach dx", step[0], 0);
+    fails = fails + _expect_int("unreach dy", step[1], 0);
+
+    flow_free(f);
+
+    // ── Scenario 4: goal on a blocked cell. The whole field should be
+    // FLOW_INF — callers that pass an invalid goal get a consistent
+    // "all unreachable" result, not a half-filled field.
+    f = flow_new(5, 5);
+    flow_set_blocked(f, 2, 2, 1);
+    flow_compute(f, 2, 2);
+    fails = fails + _expect_int("blocked-goal dist", flow_dist(f, 0, 0), FLOW_INF);
+    fails = fails + _expect_int("blocked-goal at-goal", flow_dist(f, 2, 2), FLOW_INF);
+    flow_free(f);
+
+    free(step);
+
+    if (fails == 0) {
+        put("OK\n");
+        return 0;
+    }
+    put("FAILED: ");
+    put(fails);
+    put(" assertion(s)\n");
+    return 1;
+}

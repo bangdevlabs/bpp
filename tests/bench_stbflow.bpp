@@ -1,0 +1,171 @@
+import "stbflow.bsm";
+import "stbpath.bsm";
+
+// bench_stbflow.bpp — RTS Stress Arc Session 4 perf gate.
+//
+// Compares two ways to path 100 units to a shared goal:
+//
+//   (a) Per-unit A*: 100 invocations of stbpath's `path_find`, one
+//       per unit. Cost scales O(units * cells log cells) — the AAA
+//       RTS quadratic-explosion case.
+//   (b) Flow field: one `flow_compute` from the goal (O(cells)),
+//       then 100 `flow_step` lookups (each O(1)). Cost is the BFS
+//       fill plus a constant per unit.
+//
+// 64x64 grid with a few diagonal walls forces both paths to do real
+// work — an empty grid lets A*'s heuristic guide it almost
+// straight to the goal, which understates the win.
+//
+// Gate: flow-field total < 2 ms (compute + 100 samples). Per the
+// Session 4 spec.
+
+const N_UNITS  = 100;
+const GRID_W   = 64;
+const GRID_H   = 64;
+const GOAL_X   = 32;
+const GOAL_Y   = 32;
+
+// Build a fresh grid into both the FlowField and the PathFinder so
+// both algorithms see identical terrain. Walls are placed at three
+// diagonal segments that block direct lines from corner to centre.
+static void _seed_grid(field, pf) {
+    auto x, y;
+    // Wall 1: top-left diagonal blocker from (10, 10) to (22, 22).
+    for (x = 10; x <= 22; x++) {
+        flow_set_blocked(field, x, x, 1);
+        path_set_blocked(pf, x, x, 1);
+    }
+    // Wall 2: top-right diagonal blocker from (53, 10) to (41, 22).
+    for (x = 0; x <= 12; x++) {
+        flow_set_blocked(field, 53 - x, 10 + x, 1);
+        path_set_blocked(pf, 53 - x, 10 + x, 1);
+    }
+    // Wall 3: horizontal segment under the goal, rows 40 cols 20..44.
+    for (x = 20; x <= 44; x++) {
+        flow_set_blocked(field, x, 40, 1);
+        path_set_blocked(pf, x, 40, 1);
+    }
+    // Make sure the goal cell is walkable (no accidental overlap).
+    flow_set_blocked(field, GOAL_X, GOAL_Y, 0);
+    path_set_blocked(pf, GOAL_X, GOAL_Y, 0);
+}
+
+main() {
+    auto field, pf;
+    auto t0, t1, dt_astar, dt_flow;
+    auto units_x, units_y;
+    auto i;
+    auto out_buf;
+    auto step;
+    auto astar_total_steps;
+    auto flow_total_steps;
+    auto n_reachable;
+
+    field = flow_new(GRID_W, GRID_H);
+    pf    = path_new(GRID_W, GRID_H);
+    _seed_grid(field, pf);
+
+    // Seed 100 unit positions spread around the grid corners, all
+    // pathing to the centre goal. The fixed pattern keeps the bench
+    // deterministic across runs.
+    units_x = buf_word(N_UNITS);
+    units_y = buf_word(N_UNITS);
+    for (i = 0; i < N_UNITS; i++) {
+        // Walk a 10x10 grid of starting points in the top half so
+        // the route has to cross the walls.
+        units_x[i] = (i % 10) * 6 + 2;
+        units_y[i] = (i / 10) * 4 + 2;
+        // Skip any unit that fell on a blocked cell.
+        if (flow_is_blocked(field, units_x[i], units_y[i])) {
+            units_x[i] = 0;
+            units_y[i] = 0;
+        }
+    }
+
+    // ── (a) Per-unit A*: 100 invocations of path_find. ──────────
+    // Out buffer big enough for the longest realistic route on a
+    // 64x64 grid (worst case ~ 2 * (W + H) = 256 cells).
+    out_buf = buf_word(GRID_W + GRID_H + GRID_W + GRID_H);
+    astar_total_steps = 0;
+    t0 = _stb_get_time_us();
+    for (i = 0; i < N_UNITS; i++) {
+        astar_total_steps = astar_total_steps
+            + path_find(pf, units_x[i], units_y[i], GOAL_X, GOAL_Y,
+                        out_buf, GRID_W + GRID_H + GRID_W + GRID_H);
+    }
+    t1 = _stb_get_time_us();
+    dt_astar = t1 - t0;
+    free(out_buf);
+
+    // ── (b) Flow field: 1 compute + 100 step samples. ───────────
+    step = buf_word(2);
+    flow_total_steps = 0;
+    n_reachable = 0;
+    t0 = _stb_get_time_us();
+    flow_compute(field, GOAL_X, GOAL_Y);
+    for (i = 0; i < N_UNITS; i++) {
+        flow_step(field, units_x[i], units_y[i], step);
+        // Count units that successfully sampled a descent direction.
+        if (step[0] != 0 || step[1] != 0) {
+            n_reachable = n_reachable + 1;
+        }
+        // Accumulate the field's full hop count for each unit's
+        // starting cell — the "total path length" comparator that
+        // lines up with A*'s aggregate cost.
+        flow_total_steps = flow_total_steps + flow_dist(field, units_x[i], units_y[i]);
+    }
+    t1 = _stb_get_time_us();
+    dt_flow = t1 - t0;
+    free(step);
+
+    // ── Report ──────────────────────────────────────────────────
+    put("--- Flow field vs per-unit A*: ");
+    put(N_UNITS);
+    put(" units to goal (");
+    put(GOAL_X);
+    put(", ");
+    put(GOAL_Y);
+    put(") on ");
+    put(GRID_W);
+    put("x");
+    put(GRID_H);
+    put(" ---\n");
+
+    put("A* per-unit total: ");
+    put(dt_astar);
+    put(" us  (aggregate path cells: ");
+    put(astar_total_steps);
+    put(")\n");
+
+    put("Flow field total: ");
+    put(dt_flow);
+    put(" us  (aggregate hops: ");
+    put(flow_total_steps);
+    put(", reachable units: ");
+    put(n_reachable);
+    put(")\n");
+
+    if (dt_flow <= 0) {
+        put("FAIL: flow timing dropped to 0us (timer too coarse)\n");
+        return 1;
+    }
+
+    put("ratio (A* / flow, int floor): ");
+    put(dt_astar / dt_flow);
+    put("x\n");
+
+    // Gate: total flow time must stay under 2 ms (2000 us) per the
+    // Session 4 spec.
+    if (dt_flow >= 2000) {
+        put("FAIL: flow total >= 2 ms gate\n");
+        return 1;
+    }
+
+    flow_free(field);
+    path_free(pf);
+    free(units_x);
+    free(units_y);
+
+    put("PASS\n");
+    return 0;
+}
