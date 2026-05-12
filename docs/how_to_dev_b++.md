@@ -551,105 +551,84 @@ public_api(x) { return _private_helper(x); }
 Convention: prefix private helpers with an underscore. The compiler
 does not enforce this, but every stdlib module follows it.
 
-### §5.4 — Effect annotations (the five phases)
+### §5.4 — Effect annotations (`@safe` + `@profile` + default)
 
-> **DIRECTION LOCKED 2026-05-11**: the 5-phase model below
-> (`@solo / @base / @io / @gpu / @time` + internal `@heap / @panic`)
-> is being collapsed to a 2-state user-facing model
-> (`@safe` + `@profile` + default no-annotation). The 5-phase
-> description below documents CURRENT CODE STATE; existing code
-> uses these annotations and they still compile / verify as
-> documented. New code should prefer the proposed model:
-> pin `@safe` on audio callbacks + worker entries, leave the
-> rest unannotated.
->
-> Implementation tracked at `docs/todo.md` →
-> "Phase annotation collapse — Multics → Unix simplification".
-> Rationale + post-mortem in `docs/tonify_checklist.md` Rule 4
-> and Rule 28.
->
-> **Post-collapse user-facing model**:
->
-> | Annotation | Use case | Compiler enforces |
-> |-----------|----------|-------------------|
-> | `@safe` | Audio callbacks, worker entry points, bounded paths | YES — rejects malloc / IO / syscalls |
-> | `@profile("name")` | Scoped instrumentation (§ Profile annotations) | NO (metadata) |
-> | (none) | Default — full power, programmer responsibility | NO |
->
-> Compiler internal also simplifies: 4 states (AUTO / BASE /
-> SOLO / SAFE) replace the 8 internal phase codes. `fn_effect`
-> inference array continues to exist; only the value range
-> shrinks. Optimization opportunities (inline, parallel candidates)
-> preserved via internal BASE inference.
+Two user-facing annotations earn their keep on a function signature.
+Everything else is default (no annotation = full power).
 
-#### Current state — pre-collapse 5-phase model
+| Annotation | Use case | Compiler enforces |
+|-----------|----------|-------------------|
+| `@safe` | Audio callbacks, worker entry points, bounded paths | YES — W026 fires if call graph reaches malloc / IO / GPU / syscall |
+| `@profile("name")` | Scoped instrumentation (Phase 6.3) | NO — metadata only, drives `_prof_save_enter` / `_prof_save_drain` codegen |
+| (none) | Default — full power, programmer's responsibility | NO |
 
-Functions carry one of five **phase annotations** that describe
-what kind of work they do. The annotation is an `@` sigil glued to
-the phase word with no space, placed between the parameter list
-and the function body:
+The annotation is an `@` sigil glued to the keyword with no space,
+placed between the parameter list and the function body:
 
 ```c
-@solo    // runs on main thread, drives presentation side effects
-@base    // pure computation, parallelizable on worker threads
-@io      // blocking I/O — stdin/stdout, files, sockets, syscalls
-@gpu     // touches GPU resources (palette, texture, draw calls)
-@time    // time-bounded path — audio callbacks, no malloc, no IO
-```
+// Audio callback — bounded time, no malloc, no IO, no syscall.
+// W026 fires if any of those leak in via the call graph.
+static _aud_square_cb(user, queue, buffer)@safe {
+    // realtime audio path: emit samples, advance phase, return.
+}
 
-The effects form a lattice — a function inherits the WORST effect
-of any function it calls. A `@base` function that calls a `@io`
-function is itself `@io`. The compiler tracks this automatically
-and emits errors (W026) if annotations don't match the actual
-call graph.
+// Worker thread entry point — same enforcement, same use case.
+worker_step(state)@safe {
+    // ...
+}
 
-```
-@time            (most strict — no malloc, no IO, no GPU)
-   ↓
-@io / @gpu       (sibling categories — can call base or own kind)
-   ↓
-@base            (pure, callable by everyone)
-   ↓
-@solo            (catch-all — most permissive, can call anything)
-```
-
-**Phase `@base` = the parallelizable phase.** Anything marked
-`@base` can run on a worker thread during smart dispatch. The
-compiler rejects side-effect-causing operations inside a `@base`
-function (no writes to shared globals, no I/O, no allocation) —
-the annotation is a contract the compiler enforces (W013).
-
-**Phase `@time` = the realtime phase.** Audio callbacks, frame
-deadlines, anything where a heap allocation would be a glitch.
-The compiler forbids HEAP-tagged builtins (malloc, arr_push,
-buf_byte, buf_word) inside a `@time` function.
-
-```c
-// Pure function — parallelizable:
-static _dist(ax, ay, bx, by)@base {
+// Pure helper — no annotation needed, compiler infers purity for
+// optimization. Don't add `@safe` "for documentation" — comments
+// are for documentation, annotations are for compiler verification.
+static _dist(ax, ay, bx, by) {
     auto dx, dy;
     dx = bx - ax; dy = by - ay;
     return sqrt(dx * dx + dy * dy);
 }
 
-// Game loop — drives presentation, stays on main thread:
-void tick(w, dt)@solo {
-    update_positions(w, dt);    // inherits @solo through call
+// Game loop, orchestrator, IO path — no annotation needed.
+void tick(w, dt) {
+    update_positions(w, dt);
     render_sprites(w);
-}
-
-// Audio callback — no malloc, no IO:
-void mixer_callback(buf, n)@time {
-    auto i;
-    for (i = 0; i < n; i++) { poke(buf + i, _next_sample()); }
 }
 ```
 
-`heap` is an internal compiler effect (PHASE_HEAP) the lattice
-uses to track allocation; user code does not write `@heap`.
-Allocation-free is implied by `@base` and `@time`; `@io` and
-`@gpu` permit allocation because scaffolding (file readers,
-texture uploaders) is allocation-heavy by nature.
+**Compiler internal**: a 4-state classifier (AUTO / BASE / SOLO /
+SAFE) lives in `bpp_dispatch.bsm` and computes purity + safety
+properties for inline / parallel-candidate decisions. The classifier
+runs whether or not the function is annotated; the annotation is the
+mechanism that turns the classifier's result into a diagnostic.
+`@safe` claims a property; the compiler proves or refutes the claim.
+
+#### The killer use case
+
+An audio callback annotated `@safe` is proven by the compiler to
+never call `malloc`, `putchar`, or any other side-effecting builtin
+through its transitive call graph. This eliminates an entire class
+of audible glitches by proof rather than testing — the only kind of
+contract that catches latent bugs before the program runs.
+
+The two CoreAudio callbacks in
+`src/backend/os/macos/_stb_audio_macos.bsm` (`_aud_square_cb`,
+`_aud_stream_cb`) are the canonical `@safe` consumers in the stdlib.
+
+#### Migration history (2026-05-11)
+
+The current 2-state model replaces an 8-phase lattice that accumulated
+between 2026-04-09 and 2026-04-17. Audit on 2026-05-11 found that the
+compiler internal already only consulted BASE / SOLO + TIME for real
+decisions; the other 5 phases were inert documentation that propagated
+through the lattice without driving enforcement. ~700 redundant
+annotations were stripped across the codebase in a one-day migration
+sweep. The post-mortem lives in `journal.md` (2026-05-11) and the
+meta-lesson (killer-use-case gate, restraint-bias convention,
+quarterly audit) in `tonify_checklist.md` Rule 28.
+
+The compiler still accepts the old phase keywords (`@base`, `@time`,
+`@io`, `@gpu`, `@solo`) for back-compat. Drop tracked at
+`docs/todo.md` "Phase annotation collapse Step 4". The
+`examples/phase_lattice.bpp` and `phase_lattice_bad.bpp` programs are
+kept as reference material for the deprecated diagnostics.
 
 ### §5.5 — Function pointers
 

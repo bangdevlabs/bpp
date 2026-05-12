@@ -79,7 +79,7 @@ LOC realistic: ~140.
 - Reuse `_ai_buf`-style scratch pattern for the hit result.
 - `combat.bsm` should NOT touch the GPU sprite buffer directly —
   `_pack_sprite_buf` in fps_wolf3d.bpp keeps owning visual state.
-- Tonify checklist applies (storage class, `@solo`, slice types
+- Tonify checklist applies (storage class, slice types
   where the struct says, comments-as-user-manual).
 
 ### What NOT to do this session
@@ -165,7 +165,7 @@ struct Tilemap {
     state           // ← NEW in Session 5: word per cell
 }
 
-tile_state_get(tm, gx, gy)@base
+tile_state_get(tm, gx, gy)
 tile_state_set(tm, gx, gy, val)
 ```
 

@@ -256,8 +256,9 @@ modifying how B++ parses, type-checks, dispatches, or emits code.
 A contributor at this layer needs:
 - B++ fluency (obvious)
 - Compiler theory basics (lexer, parser, AST, codegen)
-- Understanding of the existing dispatch model (phases: base, io, gpu,
-  time, solo)
+- Understanding of the existing dispatch model (`@safe` user-facing
+  + internal AUTO/BASE/SOLO classification — see `tonify_checklist.md`
+  Rule 4)
 - Patience: every layer 3 change forces a bootstrap, gen1==gen2 is
   mandatory
 

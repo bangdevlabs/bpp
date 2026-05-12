@@ -79,95 +79,74 @@ Bare `return;` (no expression) is supported in B++ and produces an implicit
 `return 0`. Use it in `void` functions for early-exit guards instead of
 the misleading `return 0;`.
 
-## Rule 4: Phase annotations — collapse direction locked 2026-05-11
+## Rule 4: Phase annotations — `@safe` + `@profile` + default
 
-> **DIRECTION (locked 2026-05-11)**: the 8-phase system below
-> (`@base / @solo / @time / @io / @gpu` + internal `@heap / @panic
-> / @realtime`) is being collapsed to a 2-state user-facing model
-> (`@safe` + `@profile` + default no-annotation). Compiler internal
-> also collapses (4 states: AUTO / BASE / SOLO / SAFE).
->
-> Implementation tracked at `docs/todo.md` →
-> "Phase annotation collapse — Multics → Unix simplification".
-> Trigger: after Excalibur Feature 1 closes.
->
-> Until the collapse ships, **the description below documents
-> CURRENT CODE STATE (8 phases). When writing new code, prefer
-> the proposed model: pin `@safe` only on audio callbacks and
-> worker thread entries, leave everything else unannotated.**
->
-> **Post-collapse user-facing model**:
->
-> | Annotation | Use case | Compiler enforces |
-> |-----------|----------|-------------------|
-> | `@safe` | Audio callbacks, worker entry points, bounded-time paths | YES — rejects malloc / IO / syscalls / blocking |
-> | `@profile("name")` | Scoped instrumentation (Phase 6.3) | NO (metadata) |
-> | (none) | Default — full power, programmer responsibility | NO |
->
-> Lesson from the over-engineering audit (see Rule 28 below):
-> annotations earn their keep ONLY when they catch a specific bug
-> class via compiler verification. Documentation-via-annotation
-> belongs in comments.
+Two user-facing annotations earn their keep; everything else is
+default (no annotation = full power, programmer's responsibility).
 
-### Current state — pre-collapse 8-phase model
+| Annotation | Use case | Compiler enforces |
+|-----------|----------|-------------------|
+| `@safe` | Audio callbacks, worker entry points, any bounded path that MUST stay bounded | YES — W026 fires if call graph reaches malloc / IO / GPU / syscall / blocking |
+| `@profile("name")` | Scoped instrumentation (Phase 6.3) | NO — metadata only, drives `_prof_save_enter` / `_prof_save_drain` codegen |
+| (none) | Default — full power, programmer responsibility | NO |
 
-For functions where the intent is clear:
-
-| Pattern | Action |
-|---------|--------|
-| Pure function: reads args, computes, returns value. No global writes. | Add `@base` |
-| Side-effect function: writes globals, calls impure functions | Add `@solo` (optional — compiler infers) |
-| Audio callback / time-bounded path: no malloc, no IO, bounded time | Add `@time` |
-| Touches files / network / stdout / syscalls | Add `@io` |
-| Touches GPU resources (calls `_stb_gpu_*`) | Add `@gpu` |
-| Unclear / mixed | Leave unannotated (compiler auto-classifies) |
-
-The annotation is an `@` sigil glued to the phase word, with no space, placed
-between the parameter list and the function body:
+The annotation is an `@` sigil glued to the keyword with no space,
+placed between the parameter list and the function body:
 
 ```bpp
-static _dist(ax, ay, bx, by)@base {
-    return sqrt((bx-ax)*(bx-ax) + (by-ay)*(by-ay));
+// Audio callback: bounded time, no malloc, no IO, no syscall.
+// W026 fires if any of those leak in via the call graph.
+static _aud_square_cb(user, queue, buffer)@safe {
+    // ...
 }
 
-void mixer_callback(buf, n)@time {
-    // no malloc, no io, no gpu
+// Worker thread entry point: same enforcement, same use case.
+worker_step(state)@safe {
+    // ...
 }
 ```
 
-**Only annotate when the intent is OBVIOUS.** Don't guess. The compiler classifies automatically for unannotated functions.
+The killer use case: an audio callback annotated `@safe` is proven by
+the compiler to never call `malloc`, `putchar`, or any other side-
+effecting builtin through its transitive call graph. Eliminates an
+entire class of audible glitches by proof rather than testing.
 
-**WARNING: do NOT mark `@base` on functions that call builtins** (malloc, free, putchar, str_peek, envp_get, sys_*, etc.). The classifier treats ALL builtins as impure. Only pure pointer-arithmetic readers qualify (arr_get, arr_len, etc.). W013 will catch mistakes — trust it.
+### When to annotate
 
-**Effect annotations form a strict-to-loose ladder:**
+Annotate `@safe` ONLY when the function MUST satisfy the safety
+contract (audio callbacks, multi-core worker entries, hard real-time
+paths). Don't annotate "for documentation" — comments are for
+documentation. Per Rule 28: annotations earn their keep ONLY when
+they catch a specific bug class via compiler verification.
 
-```
-@time     (most strict — can only call base or other time)
-   ↓
-@io / @gpu  (sibling categories — can call base or own kind)
-   ↓
-@base     (pure, callable by everyone)
-   ↓
-@solo     (catch-all — most permissive, can call anything)
-```
+For everything else — pure helpers, syscall wrappers, GPU calls,
+game logic, orchestrators — leave unannotated. The compiler's
+internal `fn_effect` array still classifies each function for its
+own optimization decisions (inline candidates, parallel candidates);
+it just doesn't emit a warning if you accidentally do something
+side-effecting in a function you never claimed was pure.
 
-The killer use case: an audio callback annotated `@time` is verified
-by the compiler to never call `malloc`, `putchar`, or anything `@io` /
-`@gpu` — eliminating an entire class of audible glitches by proof
-rather than testing.
+### Migration history (2026-05-11)
 
-**Status (2026-04-28):** the `@phase` sigil syntax is the canonical
-form across all 55+ stb/games/tools/bang9 files. The old `: phase`
-colon form was retired in the 2026-04-28 migration. `realtime` was
-renamed to `time` in the same sweep.
+Pre-collapse, B++ shipped an 8-state phase lattice
+(`@base / @solo / @time / @io / @gpu` + internal `@heap / @panic /
+@realtime`). The audit on 2026-05-11 found that the compiler internal
+already only consulted BASE / SOLO + TIME for real decisions; the
+other 5 phases accumulated as inert documentation that propagated
+through the lattice without driving enforcement. ~500 redundant
+annotations were stripped across the codebase in the migration sweep.
+The post-mortem lives in `journal.md` (2026-05-11 "Multics-drift")
+and the meta-lesson lives in Rule 28.
 
-| Module category | Suggested effect annotation |
-|---|---|
-| `_stb_gpu_*` primitives, `render_*`, `sprite_*`, `tile_draw` | `@gpu` |
-| `*_load`, `audio_*`, `_stb_audio_tone_*`, `_stb_init_window` | `@io` |
-| Audio callbacks (e.g. `_aud_square_cb`) | `@time` |
-| Pure helpers (math, string, array, hash) | `@base` |
-| Game `init` / `update` / orchestrator `main` | leave unannotated (`@solo` inferred) |
+The compiler still accepts the old phase keywords (`@base`, `@time`,
+`@io`, `@gpu`, `@solo`) so any third-party code that hasn't migrated
+keeps building. The eventual drop of the deprecated keywords is
+tracked in `docs/todo.md` as "Phase annotation collapse Step 4".
+
+The `phase_lattice.bpp` and `phase_lattice_bad.bpp` examples in
+`examples/` are kept as reference material for the deprecated
+diagnostics — they showcase what W013 / W026 look like for the legacy
+annotations.
 
 ## Rule 5: Control flow (`continue` + `for` + `switch`)
 
