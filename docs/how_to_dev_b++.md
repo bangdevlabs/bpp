@@ -553,6 +553,11 @@ does not enforce this, but every stdlib module follows it.
 
 ### §5.4 — Effect annotations (`@safe` + `@profile` + default)
 
+> **SHIPPED 2026-05-11** — collapse from 8-phase lattice to 2-state
+> user-facing model. Spec + post-mortem in `tonify_checklist.md`
+> Rule 4 + Rule 28. Programs using deprecated keywords produce E260.
+
+
 Two user-facing annotations earn their keep on a function signature.
 Everything else is default (no annotation = full power).
 
@@ -614,21 +619,21 @@ The two CoreAudio callbacks in
 
 #### Migration history (2026-05-11)
 
-The current 2-state model replaces an 8-phase lattice that accumulated
-between 2026-04-09 and 2026-04-17. Audit on 2026-05-11 found that the
-compiler internal already only consulted BASE / SOLO + TIME for real
-decisions; the other 5 phases were inert documentation that propagated
-through the lattice without driving enforcement. ~700 redundant
-annotations were stripped across the codebase in a one-day migration
-sweep. The post-mortem lives in `journal.md` (2026-05-11) and the
-meta-lesson (killer-use-case gate, restraint-bias convention,
-quarterly audit) in `tonify_checklist.md` Rule 28.
+The current 2-state model replaces an 8-phase lattice that
+accumulated between 2026-04-09 and 2026-04-17. Audit on 2026-05-11
+found that the compiler internal already only consulted BASE / SOLO
++ TIME for real decisions; the other 5 phases were inert
+documentation that propagated through the lattice without driving
+enforcement. 700+ redundant annotations were stripped from 95 files
+in a one-day migration sweep. The post-mortem lives in `journal.md`
+(2026-05-11) and the meta-lesson (killer-use-case gate, restraint-
+bias convention, quarterly audit) in `tonify_checklist.md` Rule 28.
 
-The compiler still accepts the old phase keywords (`@base`, `@time`,
-`@io`, `@gpu`, `@solo`) for back-compat. Drop tracked at
-`docs/todo.md` "Phase annotation collapse Step 4". The
-`examples/phase_lattice.bpp` and `phase_lattice_bad.bpp` programs are
-kept as reference material for the deprecated diagnostics.
+The deprecated keywords are no longer accepted by the parser. A
+program using one of them produces E260 with a clear hint pointing
+at Rule 4 and the `@safe` replacement. The
+`examples/phase_lattice.bpp` and `phase_lattice_bad.bpp` programs
+were rewritten as `@safe` showcases.
 
 ### §5.5 — Function pointers
 

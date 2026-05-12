@@ -8842,3 +8842,117 @@ be fixed without anyone needing to feel they made the wrong
 call at the moment they made it. Phases that earned their keep
 (BASE/SOLO + TIME) survive the collapse to `@safe`; phases
 that didn't return to the pool. Subtraction without blame.
+
+## 2026-05-11 (closure) — Phase annotation collapse SHIPPED end-to-end
+
+The Multics-drift post-mortem above sketched the diagnosis. This
+entry records the closure: the same-day sidequest that turned the
+8-phase lattice into the 2-state (`@safe` + `@profile` + default)
+user-facing model, with bootstrap byte-stable in every commit.
+
+### What landed (six commits, one day)
+
+| Commit    | Step  | Scope                                                     |
+|-----------|-------|-----------------------------------------------------------|
+| `842212f` | 1     | `@safe` keyword + W026 enforcement clause + smoke test    |
+| `60b1d8b` | 2a    | stb cartridges — 242 sites stripped from 23 files         |
+| `66e6da1` | 2b    | compiler internals + backend — 302 sites from 33 files    |
+| `a17eff9` | 2c+2d | games / tools / examples / tests — 130 sites from 31 fs   |
+| `7e528d4` | 3+4   | parser strict-mode (drop back-compat) + docs rewrite      |
+| `e1b16a1` | post  | dead enforcement strip, E260 diagnostic, lattice rewrite  |
+
+**Net subtraction:** 700+ annotation sites removed across 95 files;
+~80 lines of dead enforcement code stripped from
+`bpp_dispatch.bsm`. The compiler internal `fn_effect` array still
+classifies every function for inline / parallel-candidate decisions
+— what disappeared is the user-facing namespace.
+
+### Architecture decisions made along the way
+
+**Strict mode over back-compat.** The original briefing proposed
+keeping the deprecated keywords accepted for a transition period.
+User overrode mid-arc ("isso é dead code"): drop back-compat now
+while the cleanup is fresh. Right call — back-compat is exactly
+the mechanism through which 700 redundant annotations
+re-accumulate. Refusing the deprecated keywords is the actual fix.
+
+**E260 as Rule 28 anchor pattern.** When the parser rejects a
+deprecated keyword, generic E104 ("unexpected token '{'") is
+useless for a programmer with muscle memory. E260 emits source
+location + three help lines:
+
+- "use @safe if this function needs compiler-verified safety"
+- "otherwise omit the annotation — purity is inferred internally"
+- "see: docs/tonify_checklist.md Rule 4 for the post-collapse
+  model"
+
+The `see:` line is the canonical Rule 28 pattern: every diagnostic
+about a removed feature points at the rule that explains the
+removal. Future agents grepping for "E260" find the spec, find the
+post-mortem, find the Why. The dead code becomes self-documenting
+through the diagnostic surface.
+
+**Incremental bootstrap discipline.** The `bpp_dispatch.bsm`
+cleanup (~80 LOC removed) was split into two batches: W013 first,
+W026 sub-clauses second. Bootstrap byte-stable + suite green
+between them. Per Rule 28: if any codegen path inexpectedly
+depended on the removed code, the bisect surface stays one batch
+wide. (Both batches were byte-stable — no surprises — but the
+discipline is the lesson, not the absence of surprise.)
+
+**Lattice demos rewritten, not deleted.** `phase_lattice.bpp` and
+`phase_lattice_bad.bpp` both got rewritten as `@safe` showcases
+(positive + W026-firing variants). The migration sweep had
+EXCLUDED them initially because they were the canonical
+demonstration material; after strict-mode landed they were broken
+(parse error). Rewriting them as `@safe` demos preserves the
+"compile this to see what the diagnostic looks like" use case
+without keeping legacy keywords alive.
+
+### What did NOT change (intentionally)
+
+- Internal `fn_effect` classifier: still runs, still classifies,
+  still drives inline / parallel decisions. The compiler doesn't
+  lose any optimization capability; only the user-facing
+  enforcement annotations changed.
+- Extern effect table (`add_extern_effect("malloc", PHASE_HEAP)`
+  etc): kept intact. Those constants classify what BUILTINS do,
+  not what user code claims. They feed the lattice that drives
+  W026 on `@safe`.
+- `@profile("name")` scoped instrumentation: untouched. Different
+  category (instrumentation, not effect classification).
+
+### What remains open
+
+`docs/todo.md` "Positive @safe suggestion engine" — a Rule 28-
+audited followup that would emit a warning when `fn_ptr(name)`
+flows into a callback-registration builtin (maestro / audio /
+job_register) without `name` being `@safe`. Closes the
+discipline-as-tooling gap: today the annotation is "the
+discipline you have to remember"; the suggestion engine turns it
+into "the compiler nudges you when it makes sense". ~1-2h of
+work, deferred to a focused session.
+
+### Verification snapshot
+
+- Bootstrap byte-stable across all six commits
+- Native suite: 148/0/12 throughout
+- C suite:     121/0/39 throughout
+- E260 confirmed firing for all 8 deprecated keywords with
+  location + source line + 3 help lines
+- Final bpp hash: `af2ec66af8d3896c98e0fad4e5a123fa`
+
+### The pattern this closure validates
+
+Sidequest opened, audited (Step 0 grep), planned (briefing
+written by previous agent), executed (six commits same day),
+documented (Rule 4 + §5.4 + warning_error_log + journal +
+todo updated to CLOSED + Task 4 sidequest queued). Paperwork
+close-out is non-negotiable: the next agent reads `todo.md`,
+sees CLOSED with commit list, sees Task 4 with Rule 28 audit
+already in place, sees journal with the why-and-how. Zero
+context cliff between sessions. Phase collapse ironically would
+have BECOME the next iteration of the over-engineering trap if
+the close-out paperwork had been skipped — half-shipped
+sidequests with stale docs ARE the same Multics drift, just at
+a different layer.

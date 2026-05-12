@@ -81,6 +81,16 @@ the misleading `return 0;`.
 
 ## Rule 4: Phase annotations — `@safe` + `@profile` + default
 
+> **SHIPPED 2026-05-11** — collapse from 8-phase lattice to 2-state
+> user-facing model. Commits: `842212f` (introduce `@safe`),
+> `60b1d8b` (stb sweep), `66e6da1` (compiler internals), `a17eff9`
+> (apps), `7e528d4` (parser strict-mode + docs rewrite), `e1b16a1`
+> (cleanup + E260 diagnostic). Net codebase change: 700+ annotation
+> sites removed across 95 files; ~80 lines of dead enforcement
+> stripped from `bpp_dispatch.bsm`; new E260 directs muscle-memory
+> users at the new model.
+
+
 Two user-facing annotations earn their keep; everything else is
 default (no annotation = full power, programmer's responsibility).
 
@@ -130,23 +140,19 @@ side-effecting in a function you never claimed was pure.
 
 Pre-collapse, B++ shipped an 8-state phase lattice
 (`@base / @solo / @time / @io / @gpu` + internal `@heap / @panic /
-@realtime`). The audit on 2026-05-11 found that the compiler internal
-already only consulted BASE / SOLO + TIME for real decisions; the
-other 5 phases accumulated as inert documentation that propagated
-through the lattice without driving enforcement. ~500 redundant
-annotations were stripped across the codebase in the migration sweep.
-The post-mortem lives in `journal.md` (2026-05-11 "Multics-drift")
-and the meta-lesson lives in Rule 28.
+@realtime`). The audit found that the compiler internal already only
+consulted BASE / SOLO + TIME for real decisions; the other 5 phases
+accumulated as inert documentation that propagated through the
+lattice without driving enforcement. 700+ redundant annotations were
+stripped in a one-day migration sweep. The post-mortem lives in
+`journal.md` (2026-05-11 "Multics-drift") and the meta-lesson lives
+in Rule 28.
 
-The compiler still accepts the old phase keywords (`@base`, `@time`,
-`@io`, `@gpu`, `@solo`) so any third-party code that hasn't migrated
-keeps building. The eventual drop of the deprecated keywords is
-tracked in `docs/todo.md` as "Phase annotation collapse Step 4".
-
-The `phase_lattice.bpp` and `phase_lattice_bad.bpp` examples in
-`examples/` are kept as reference material for the deprecated
-diagnostics — they showcase what W013 / W026 look like for the legacy
-annotations.
+The deprecated keywords are no longer accepted by the parser — a
+program using `@base`/`@time`/`@io`/`@gpu`/`@solo`/`@heap`/`@panic`/
+`@realtime` produces E260 with a clear migration hint pointing back
+at this rule. The `phase_lattice.bpp` and `phase_lattice_bad.bpp`
+examples were rewritten as `@safe` showcases.
 
 ## Rule 5: Control flow (`continue` + `for` + `switch`)
 

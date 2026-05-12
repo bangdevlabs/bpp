@@ -163,12 +163,43 @@ between any two sessions without conflict.
 These tighten the engine but don't gate any content. Pick up
 opportunistically.
 
-### Phase annotation collapse — Multics → Unix simplification
+### Phase annotation collapse — Multics → Unix simplification — CLOSED 2026-05-11
 
-**Opened 2026-05-11.** Strategic simplification of the 8-phase
-annotation system to a binary user-facing model. Honors B++'s
-"tudo é word" philosophy (Unix-style one abstraction does many
-uses, unlike Multics-style specialized abstractions).
+**SHIPPED 2026-05-11 — same day as the open.** Six commits across
+the arc:
+
+| Commit    | Scope                                                  |
+|-----------|--------------------------------------------------------|
+| `842212f` | Step 1: introduce `@safe` + W026 enforcement clause    |
+| `60b1d8b` | Step 2a: stb cartridges (242 sites stripped, 23 files) |
+| `66e6da1` | Step 2b: compiler internals + backend (302 sites, 33)  |
+| `a17eff9` | Step 2c+2d: games / tools / examples / tests (130, 31) |
+| `7e528d4` | Step 3+4: parser strict-mode + docs rewrite (27 sites) |
+| `e1b16a1` | Cleanup: dead enforcement strip, E260, lattice rewrite |
+
+**Net result:** 700+ redundant annotation sites removed across
+95 files. ~80 lines of dead enforcement stripped from
+`bpp_dispatch.bsm`. Single user-facing annotation `@safe` (plus
+`@profile` for scoped instrumentation, plus default no-annotation
+for everything else). E260 fires with a focused migration hint when
+any of the eight deprecated keywords appears in source. Bootstrap
+byte-stable in every commit. Native suite 148/0/12, C suite
+121/0/39 throughout.
+
+Spec + post-mortem now in `tonify_checklist.md` Rule 4 (current
+model) + Rule 28 (meta-lesson) + `journal.md` (2026-05-11
+"Multics-drift post-mortem" + arc closure summary).
+
+**Original briefing kept below for historical reference.**
+
+---
+
+### Original briefing (2026-05-11, pre-execution)
+
+Strategic simplification of the 8-phase annotation system to a
+binary user-facing model. Honors B++'s "tudo é word" philosophy
+(Unix-style one abstraction does many uses, unlike Multics-style
+specialized abstractions).
 
 **The diagnosis.** The current system has 8 phase tags
 (`@base`, `@solo`, `@time`, `@io`, `@gpu`, `@heap`, `@panic`,
@@ -236,6 +267,79 @@ faster (no codegen conflict with literal shape work).
 **Reference**: conversation 2026-05-11 with user — established
 the Multics-vs-Unix framing. Honors `feedback_cartridge_minimalism.md`
 spirit ("ship floor only, complexity is opt-in").
+
+### Positive `@safe` suggestion engine — Rule 28-audited followup
+
+**Opened 2026-05-11** as the Task 4 followup to the Phase annotation
+collapse arc.
+
+**The gap.** The collapse made `@safe` the only user-facing phase
+annotation, and E260 catches programmers who write a deprecated
+keyword. But there is no positive diagnostic: a programmer who
+SHOULD annotate `@safe` (because they're registering a worker
+thread or an audio callback) gets no compiler nudge if they forget.
+The annotation becomes "the discipline you have to remember" —
+exactly the failure mode Rule 28 warns about.
+
+**Killer use case (Rule 28 gate)** — two specific bug classes that
+nothing today catches:
+
+1. Worker thread registered via `maestro_register_base(fn_ptr(name))`
+   without `name` being annotated `@safe` → race condition latent
+   until the worker hits an unprotected global write under load.
+2. Audio callback registered via `AudioQueueNewOutput(..., fn_ptr(cb),
+   ...)` (or the Linux ALSA equivalent) without `cb` being annotated
+   `@safe` → audible glitch latent until the callback hits malloc /
+   syscall under buffer pressure.
+
+Both bugs are invisible at compile-time today and surface only at
+runtime under stress. The compiler already knows the context: it
+sees the `fn_ptr(name)` literal flow into the registration builtin.
+A diagnostic at the registration site closes the loop.
+
+**Smaller-tool test** — could docs alone solve this? No. Programmers
+forget. Compiler suggestion is the right tooling here.
+
+**Restraint-bias test** — emit as a WARNING (not error). Programmer
+can ignore for one-shot scripts or experiments. Match B++'s
+"programmer freedom" stance.
+
+Passes Rule 28 gates: specific bug classes, smallest tool that
+catches them, restraint-biased emit (warning not error).
+
+**Scope.** ~1-2 hours. Instrument `add_extern_effect` (or build a
+dedicated table) marking specific builtin names as
+"callback-registration sinks". When the call-graph walker sees
+`fn_ptr(name)` flowing into one of those sinks, look up
+`fn_phase_hint[name]` — if not `PHASE_SAFE`, emit W-new with text:
+
+```
+warning[Wxxx]: 'name' registered as <kind> callback without @safe
+   --> file.bpp:N
+   N | maestro_register_base(fn_ptr(name));
+     |                       ^^^^^^^^^^^^
+   = note: <kind> callbacks must satisfy bounded-time + no-malloc
+           contract; @safe gives the compiler a chance to verify
+   = help: annotate `name(...)@safe { ... }` to enable W026
+   = see:  docs/tonify_checklist.md Rule 4
+```
+
+Initial sink list: `maestro_register_base`, `maestro_register_solo`
+(the latter to suggest dropping the registration if the function
+is pure-enough), `job_register`, plus the audio FFI builtins via
+the existing `add_extern_effect` slot.
+
+**Trigger**: first time a real bug from this class hits us in
+production, OR opportunistically before that to close the
+discipline-as-tooling gap.
+
+**Verification**: bootstrap byte-stable; 2 new tests
+(`test_safe_suggestion_worker.bpp`, `test_safe_suggestion_audio.bpp`)
+pin the warning fires for each killer use case; existing suite
+green.
+
+**Closes**: the open question raised in `e1b16a1` commit message
+("falta diagnóstico positivo").
 
 ### Multi-core completion — Sprints A-G
 
