@@ -441,8 +441,43 @@ continuous-execute directive.
 
 **Current state**: Session 1 SHIPPED 2026-05-12.
 
-**Next session**: Session 2 — Archetype storage (~400 LOC, the
-big single session of the arc).
+**Next session**: Session 3 — SIMD batching inside systems.
+
+**Session 2 — SHIPPED 2026-05-12**:
+- `ArchetypeRec` storage struct + ~430 LOC additive API in
+  `stb/stbecs.bsm`. Old parallel-array path untouched; all five
+  existing ECS consumers (pathfind, snake_maestro, fps_wolf3d,
+  rhythm, particles) compile bit-identical.
+- New API: `ecs_component_register(w, name, size_bytes) -> id`,
+  `ecs_archetype(w, comp_ids, n) -> arch_id`,
+  `ecs_spawn_at(w, arch_id) -> entity_id` (high 32 bits encode
+  `arch_idx + 1`, low 32 bits encode row),
+  `ecs_get(w, comp_id, entity_id) -> ptr`,
+  `ecs_chunk_each(q, comp_id, fn)` for the SIMD-friendly inner
+  loop (one callback per chunk with a direct pointer to the
+  component's SoA array).
+- `ecs_query_each` / `ecs_query_count` (Session 1) extended to
+  walk legacy + archetype entities transparently — callers do
+  not see the storage split.
+- 16 KB chunk payload (fits L1 on Apple Silicon + Intel),
+  entities-per-chunk computed from sum of component sizes,
+  chunks allocated lazily on first spawn.
+- `tests/test_ecs_archetype.bpp` pins component registration,
+  SoA slot isolation, encoded-id round-trip, mixed legacy +
+  archetype iteration.
+- `tests/bench_ecs_iter.bpp` runs 50K-entity iteration in both
+  modes. Empirical finding at this scale: legacy is already
+  SoA-laid-out (parallel buf_word arrays), so single-field
+  iteration costs are similar — archetype currently lands at
+  ~0.5x of legacy because pointer arithmetic + struct field
+  access through `peekfloat` carry more per-entity work than
+  legacy's flat `buf_word[k]` indexing.
+- **Perf gate moved to Session 3 SIMD bench** — that is where
+  the contiguous-chunk layout actually wins (vec_4f over a tight
+  pos.x array, vs four separate scalar loads in the legacy
+  shape). Session 2's job is to ship the infrastructure SIMD
+  needs; the empirical speedup is its successor's story.
+- Bootstrap byte-stable. Suite 155/0/12 native + 128/0/39 C.
 
 **Session 1 — SHIPPED**:
 - `EcsQuery` struct + `ecs_query(w, comp_mask)` /

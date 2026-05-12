@@ -30,7 +30,59 @@
 //   n.beat_time = 1.0;
 
 struct World { capacity, count, alive, free_ids, free_count,
-               pos_x, pos_y, vel_x, vel_y, flags }
+               pos_x, pos_y, vel_x, vel_y, flags,
+               // RTS Stress Arc Session 2 — archetype storage.
+               // The fields above stay unchanged so every existing
+               // consumer (snake, pathfind, fps_wolf3d, rhythm, etc.)
+               // keeps working bit-for-bit. The fields below add a
+               // parallel archetype path for games that opt in.
+               comp_count,        // registered component types
+               comp_names,        // arr<packed>: component names
+               comp_sizes,        // arr<int>:    component byte sizes
+               archetype_count,   // archetype bundles registered
+               archetypes }       // arr<ArchetypeRec>: per-archetype storage
+
+// RTS Stress Arc Session 2 — per-archetype storage record. Each
+// archetype is an ordered bundle of component IDs; entities of the
+// same archetype share the same component set and live in the same
+// chunk stream. Storage is SoA within each chunk: every component's
+// data forms a contiguous run inside the chunk, so iteration over
+// "all entities of component K in this archetype" is a linear walk
+// (the cache-locality win Session 2 measures).
+//
+// Entity ID encoding for archetype entities: high 32 bits hold the
+// archetype index + 1 (so 0 means "default / legacy parallel-array
+// path"), low 32 bits hold the row within the archetype. This keeps
+// the entity-id space disjoint from the [0..capacity) legacy IDs;
+// ecs_get dispatches on whichever half is non-zero.
+struct ArchetypeRec {
+    arch_idx,            // own slot in world.archetypes
+    comp_count,          // components in this archetype
+    comp_ids,            // arr<comp_id>: which components live here
+    comp_sizes,          // arr<int>:    byte size per component (parallel)
+    comp_offsets,        // arr<int>:    offset within a chunk per component
+    entities_per_chunk,  // computed from chunk_payload / sum(comp_sizes)
+    chunks,              // arr<ptr>:    each entry is a raw byte buffer
+    chunk_count,         // chunks allocated
+    total_entities       // live entities across all chunks (monotonic)
+}
+
+// Encoded entity-id for archetype rows. archetype slot 0 is reserved
+// as a sentinel so legacy IDs (which live in [0, world.capacity))
+// never collide with archetype-encoded IDs.
+//
+//   legacy id:   raw integer in [0, world.capacity)
+//   archetype id: (arch_idx + 1) << 32 | row
+//
+// Callers should treat the returned `entity_id` as opaque and pass it
+// back to ecs_get / ecs_kill_at unchanged.
+const _ECS_ARCH_BIT      = 0x100000000;
+const _ECS_ROW_MASK      = 0xFFFFFFFF;
+// Chunk size budget. 16 KB lands in L1 on Apple Silicon (192 KB L1d)
+// and Intel (32-48 KB L1d) without crowding out instruction cache or
+// other hot data. With a typical 3-5 component archetype averaging
+// 8 bytes/component, this fits ~400-650 entities per chunk.
+const _ECS_CHUNK_PAYLOAD = 16384;
 
 // Create a new world with the given entity capacity.
 //
@@ -58,7 +110,162 @@ ecs_new(capacity) {
         w.free_ids[i] = capacity - 1 - i;
     }
     w.free_count = capacity;
+    // RTS Stress Arc Session 2 — empty archetype state. No
+    // components or archetypes are registered until the game asks
+    // for them via ecs_component_register / ecs_archetype; legacy
+    // games never touch these slots.
+    w.comp_count = 0;
+    w.comp_names = arr_new();
+    w.comp_sizes = arr_new();
+    w.archetype_count = 0;
+    w.archetypes = arr_new();
     return w;
+}
+
+// --- Archetype storage (RTS Stress Arc Session 2) ---
+
+// Register a component type the world will store inside archetypes.
+// The size in bytes is the per-entity slot occupied within each
+// archetype chunk. Returns a component id (>= 0) that callers pass
+// back to ecs_archetype and ecs_get.
+//
+// `name_str` is a cstring pointer captured verbatim for diagnostic
+// readers (it does NOT dedup by name — callers are expected to
+// stash the returned id in a global). Pass 0 if the call site has
+// no useful name to attach.
+ecs_component_register(w, name_str, size_bytes) {
+    auto wd: World;
+    wd = w;
+    wd.comp_names = arr_push(wd.comp_names, name_str);
+    wd.comp_sizes = arr_push(wd.comp_sizes, size_bytes);
+    wd.comp_count = wd.comp_count + 1;
+    return wd.comp_count - 1;
+}
+
+// Register an archetype: a bundle of component ids that entities of
+// this kind always carry. Returns an archetype id. The chunk layout
+// is computed once here from the component sizes; chunks are
+// allocated lazily on first spawn.
+//
+// `comp_ids` is a buf_word holding `n_comps` component ids in order.
+// The order defines the per-chunk SoA layout (component 0's array
+// comes first, then component 1's array, etc.), so iteration order
+// is predictable across architectures.
+ecs_archetype(w, comp_ids, n_comps) {
+    auto wd: World, ar: ArchetypeRec, i, sz, off, sum;
+    wd = w;
+    ar = malloc(sizeof(ArchetypeRec));
+    ar.arch_idx = wd.archetype_count;
+    ar.comp_count = n_comps;
+    ar.comp_ids = buf_word(n_comps);
+    ar.comp_sizes = buf_word(n_comps);
+    ar.comp_offsets = buf_word(n_comps);
+    sum = 0;
+    for (i = 0; i < n_comps; i++) {
+        ar.comp_ids[i] = comp_ids[i];
+        sz = arr_get(wd.comp_sizes, comp_ids[i]);
+        ar.comp_sizes[i] = sz;
+        sum = sum + sz;
+    }
+    // entities_per_chunk = floor(payload / sum_sizes). Guard against
+    // a zero-sum archetype (no components, or all zero-sized) by
+    // forcing at least 1 entity per chunk so spawn paths never divide
+    // by zero. The zero-component case is degenerate but valid for
+    // tag-only entities.
+    if (sum > 0) { ar.entities_per_chunk = _ECS_CHUNK_PAYLOAD / sum; }
+    else         { ar.entities_per_chunk = 1; }
+    if (ar.entities_per_chunk < 1) { ar.entities_per_chunk = 1; }
+    // Component offsets within a chunk: SoA layout = each component's
+    // array starts after the previous component's full run.
+    off = 0;
+    for (i = 0; i < n_comps; i++) {
+        ar.comp_offsets[i] = off;
+        off = off + ar.comp_sizes[i] * ar.entities_per_chunk;
+    }
+    ar.chunks = arr_new();
+    ar.chunk_count = 0;
+    ar.total_entities = 0;
+    wd.archetypes = arr_push(wd.archetypes, ar);
+    wd.archetype_count = wd.archetype_count + 1;
+    return ar.arch_idx;
+}
+
+// Allocate a fresh chunk worth of bytes for the archetype. Returns
+// the new chunk index. Caller is responsible for staying within the
+// chunk's per-entity slot count.
+static _ecs_archetype_grow(ar) {
+    auto a: ArchetypeRec, total_bytes, chunk_buf, sum, i;
+    a = ar;
+    sum = 0;
+    for (i = 0; i < a.comp_count; i++) {
+        sum = sum + a.comp_sizes[i];
+    }
+    total_bytes = a.entities_per_chunk * sum;
+    if (total_bytes < 1) { total_bytes = 1; }
+    chunk_buf = malloc(total_bytes);
+    a.chunks = arr_push(a.chunks, chunk_buf);
+    a.chunk_count = a.chunk_count + 1;
+    return a.chunk_count - 1;
+}
+
+// Encode an entity id for the given archetype slot + row. The high
+// 32 bits hold `arch_idx + 1` so id 0 stays reserved for the legacy
+// path; the low 32 bits hold the row index. Callers treat the result
+// as opaque and pass it back to ecs_get.
+static _ecs_encode_id(arch_idx, row) {
+    return ((arch_idx + 1) * _ECS_ARCH_BIT) + row;
+}
+
+// Spawn an entity into the given archetype. Returns the entity id
+// (encoded as above). Grows the chunk list lazily — the first spawn
+// allocates the first chunk, subsequent spawns reuse it until the
+// chunk fills, then a new chunk is appended.
+ecs_spawn_at(w, archetype_id) {
+    auto wd: World, ar: ArchetypeRec, row, chunk_idx;
+    wd = w;
+    ar = arr_get(wd.archetypes, archetype_id);
+    row = ar.total_entities;
+    chunk_idx = row / ar.entities_per_chunk;
+    while (chunk_idx >= ar.chunk_count) {
+        _ecs_archetype_grow(ar);
+    }
+    ar.total_entities = ar.total_entities + 1;
+    return _ecs_encode_id(archetype_id, row);
+}
+
+// Resolve the byte address of `comp_id`'s slot for `entity_id`.
+// Callers cast the result to a typed pointer for field access:
+//
+//   auto v: Vec2;
+//   v = ecs_get(world, pos_comp, entity);
+//   v.x = 1.5;
+//
+// Legacy entity ids (< _ECS_ARCH_BIT) currently fall through to a
+// null return — the legacy API exposes its components through the
+// flat `pos_x[id]` / `vel_x[id]` / `flags[id]` arrays that
+// ecs_set_pos / ecs_get_x / etc. wrap. The two paths coexist; games
+// pick one per world.
+ecs_get(w, comp_id, entity_id) {
+    auto wd: World, ar: ArchetypeRec, arch_idx, row, chunk_idx, slot;
+    auto chunk_ptr, k, found;
+    wd = w;
+    if (entity_id < _ECS_ARCH_BIT) { return 0; }
+    arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
+    row = entity_id & _ECS_ROW_MASK;
+    ar = arr_get(wd.archetypes, arch_idx);
+    chunk_idx = row / ar.entities_per_chunk;
+    slot = row % ar.entities_per_chunk;
+    // Linear scan over the archetype's component list. Archetypes
+    // rarely carry more than 5-8 components — a hash would be
+    // overkill at this scale and the branch-predictor handles the
+    // scan well.
+    found = 0 - 1;
+    for (k = 0; k < ar.comp_count; k++) {
+        if (ar.comp_ids[k] == comp_id) { found = k; k = ar.comp_count; }
+    }
+    if (found < 0) { return 0; }
+    chunk_ptr = arr_get(ar.chunks, chunk_idx);
+    return chunk_ptr + ar.comp_offsets[found] + slot * ar.comp_sizes[found];
 }
 
 // Spawn an entity. Returns its ID, or -1 if the world is full.
@@ -189,18 +396,33 @@ ecs_query(w, comp_mask) {
 // globals or a pre-allocated context buffer the callback can
 // peek at. Returns nothing; the iteration is the side effect.
 //
-// Today the loop is the same skip-dead walk consumers used to
-// inline (`for i in 0..capacity, if alive[i]`); the value is the
-// API shape — Session 2 archetype storage will swap the inner
-// loop to a contiguous archetype-chunk stream without touching
-// any caller. That is the foundation Session 1 ships.
+// Walks both the legacy parallel-array path and every registered
+// archetype's chunk stream. Legacy ids stay in [0, capacity);
+// archetype ids are encoded via _ecs_encode_id (high 32 bits =
+// arch_idx + 1, low 32 bits = row). Callbacks treat the id as
+// opaque and pass it back to ecs_get / ecs_kill_at unchanged.
 void ecs_query_each(q, fn) {
-    auto eq: EcsQuery, w: World, i;
+    auto eq: EcsQuery, w: World, i, ai, ar: ArchetypeRec, row;
     eq = q;
     w = eq.world;
+    // Legacy entities — skip-dead walk over the alive bitmap. Same
+    // hot path Session 1 shipped; archetype entities are tracked
+    // separately and don't appear in this bitmap.
     for (i = 0; i < w.capacity; i++) {
         if (peek(w.alive + i)) {
             call(fn, w, i);
+        }
+    }
+    // Archetype entities — each archetype is dense (entities 0
+    // through total_entities-1 are all live), so the inner loop is
+    // a tight `for row in 0..total`. The chunk-stride math lives
+    // inside ecs_get; this loop just enumerates ids in order so
+    // the callback's `ecs_get(w, c, id)` lookups stay sequential
+    // across the chunk's component arrays.
+    for (ai = 0; ai < w.archetype_count; ai++) {
+        ar = arr_get(w.archetypes, ai);
+        for (row = 0; row < ar.total_entities; row++) {
+            call(fn, w, _ecs_encode_id(ai, row));
         }
     }
 }
@@ -210,14 +432,22 @@ void ecs_query_each(q, fn) {
 // per match. Useful for sizing buffers, picking a uniform sample,
 // or asserting "at least N units alive" in tests.
 ecs_query_count(q) {
-    auto eq: EcsQuery, w: World, i, n;
+    auto eq: EcsQuery, w: World, i, n, ai, ar: ArchetypeRec;
     eq = q;
     w = eq.world;
     n = 0;
+    // Legacy live entities.
     for (i = 0; i < w.capacity; i++) {
         if (peek(w.alive + i)) {
             n = n + 1;
         }
+    }
+    // Archetype entities — total_entities tracks live count per
+    // archetype (kill compaction lands in a future session; today
+    // archetype entities are append-only and never reused).
+    for (ai = 0; ai < w.archetype_count; ai++) {
+        ar = arr_get(w.archetypes, ai);
+        n = n + ar.total_entities;
     }
     return n;
 }
@@ -225,6 +455,54 @@ ecs_query_count(q) {
 // Free a query handle. Does not touch the underlying world.
 void ecs_query_free(q) {
     free(q);
+}
+
+// RTS Stress Arc Session 2 — chunk-walking primitive. Yields one
+// callback per archetype chunk with a direct pointer to the
+// requested component's data array inside that chunk. The callback
+// walks the array linearly, which is where the SoA-layout cache
+// locality manifests — no per-entity function-call dispatch, no
+// per-entity component scan, just a tight `for i in 0..n` over
+// a contiguous run of bytes.
+//
+// Callback signature: `(world, comp_base, n_entities, comp_size)`
+// where comp_base is the start of the component's array within
+// the current chunk and comp_size is the per-entity byte stride.
+// Walk with `auto p; p = comp_base + i * comp_size;`.
+//
+// Skips archetypes that do not carry comp_id. Legacy parallel-array
+// entities are NOT visited (they live outside the archetype path);
+// callers that want both should walk the legacy alive bitmap
+// separately. This primitive is specifically for the SIMD-batching
+// inner loop Session 3 builds on top.
+void ecs_chunk_each(q, comp_id, fn) {
+    auto eq: EcsQuery, w: World, ai, ar: ArchetypeRec;
+    auto k, found, ck, chunk_ptr, comp_off, comp_sz, n_in_chunk, remaining;
+    eq = q;
+    w = eq.world;
+    for (ai = 0; ai < w.archetype_count; ai++) {
+        ar = arr_get(w.archetypes, ai);
+        // Locate comp_id in this archetype's bundle. Linear scan over
+        // comp_count entries — typically ≤ 8 components per archetype,
+        // so a hash would be overkill.
+        found = 0 - 1;
+        for (k = 0; k < ar.comp_count; k++) {
+            if (ar.comp_ids[k] == comp_id) { found = k; k = ar.comp_count; }
+        }
+        if (found < 0) { continue; }
+        comp_off = ar.comp_offsets[found];
+        comp_sz  = ar.comp_sizes[found];
+        remaining = ar.total_entities;
+        for (ck = 0; ck < ar.chunk_count; ck++) {
+            chunk_ptr = arr_get(ar.chunks, ck);
+            if (remaining >= ar.entities_per_chunk) { n_in_chunk = ar.entities_per_chunk; }
+            else                                    { n_in_chunk = remaining; }
+            if (n_in_chunk > 0) {
+                call(fn, w, chunk_ptr + comp_off, n_in_chunk, comp_sz);
+            }
+            remaining = remaining - n_in_chunk;
+        }
+    }
 }
 
 // --- Systems ---

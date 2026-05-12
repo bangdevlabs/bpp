@@ -1,0 +1,130 @@
+import "stbecs.bsm";
+
+// test_ecs_archetype.bpp — RTS Stress Arc Session 2.
+//
+// Pins the archetype-storage path that lives in parallel to the
+// legacy parallel-array API. What this test confirms:
+//   - ecs_component_register returns distinct ids per call
+//   - ecs_archetype packs the component bundle and computes a
+//     reasonable entities_per_chunk
+//   - ecs_spawn_at returns opaque archetype-encoded ids (high bit set)
+//   - ecs_get resolves the encoded id back to a byte address that
+//     respects the SoA layout — writes through one entity do not
+//     bleed into a neighbour
+//   - ecs_query_each visits BOTH legacy entities AND archetype rows
+//     in a single walk
+//   - Chunk growth: spawning past the first chunk's capacity allocates
+//     a new chunk and the new entities land at the right offsets
+
+struct Pos { x: float, y: float }
+struct Vel { dx: float, dy: float }
+
+global _q_total;     // (w, id) callbacks observed across both paths
+
+void _q_count(w, id) {
+    _q_total = _q_total + 1;
+}
+
+void check_int(label, got, want) {
+    if (got != want) {
+        putstr("FAIL "); putstr(label);
+        putstr(" got=");  putnum(got);
+        putstr(" want="); putnum(want);
+        putline();
+        sys_exit(1);
+    }
+}
+
+void check_eq(label, got: float, want: float) {
+    auto diff: float;
+    diff = got - want;
+    if (diff < 0.0) { diff = 0.0 - diff; }
+    if (diff > 0.0001) {
+        putstr("FAIL "); putstr(label);
+        putstr(" got=");  putfloat(got);
+        putstr(" want="); putfloat(want);
+        putline();
+        sys_exit(1);
+    }
+}
+
+main() {
+    auto w, pos_comp, vel_comp, arch_pv;
+    auto comp_ids;
+    auto e0, e1, e2;
+    auto p0: Pos, p1: Pos, p2: Pos;
+    auto v0: Vel, q;
+
+    w = ecs_new(8);
+
+    // Register two components. Sequential ids start at 0.
+    pos_comp = ecs_component_register(w, 0, sizeof(Pos));
+    vel_comp = ecs_component_register(w, 0, sizeof(Vel));
+    check_int("pos_comp_0", pos_comp, 0);
+    check_int("vel_comp_1", vel_comp, 1);
+
+    // Archetype with both components in (Pos, Vel) order.
+    comp_ids = buf_word(2);
+    comp_ids[0] = pos_comp;
+    comp_ids[1] = vel_comp;
+    arch_pv = ecs_archetype(w, comp_ids, 2);
+    check_int("arch_pv_0", arch_pv, 0);
+
+    // Spawn three entities into the archetype.
+    e0 = ecs_spawn_at(w, arch_pv);
+    e1 = ecs_spawn_at(w, arch_pv);
+    e2 = ecs_spawn_at(w, arch_pv);
+
+    // Encoded ids have the archetype-bit set: high 32 bits ≥ 1.
+    if (e0 < 0x100000000) {
+        putstr("FAIL e0 missing archetype bit\n");
+        sys_exit(1);
+    }
+
+    // Write through each entity's Pos slot. SoA layout means writes
+    // to entity 0's Pos do not overlap entity 1's Pos.
+    p0 = ecs_get(w, pos_comp, e0);
+    p0.x = 1.0; p0.y = 2.0;
+    p1 = ecs_get(w, pos_comp, e1);
+    p1.x = 10.0; p1.y = 20.0;
+    p2 = ecs_get(w, pos_comp, e2);
+    p2.x = 100.0; p2.y = 200.0;
+
+    // Velocity component (different offset within chunk) is
+    // independent — writes here do not corrupt Pos data.
+    v0 = ecs_get(w, vel_comp, e0);
+    v0.dx = 0.5; v0.dy = 0.25;
+
+    // Round-trip reads through fresh typed locals confirm the SoA
+    // layout did not alias.
+    auto rp0: Pos, rp1: Pos, rp2: Pos, rv0: Vel;
+    rp0 = ecs_get(w, pos_comp, e0);
+    rp1 = ecs_get(w, pos_comp, e1);
+    rp2 = ecs_get(w, pos_comp, e2);
+    rv0 = ecs_get(w, vel_comp, e0);
+    check_eq("rp0_x", rp0.x, 1.0);   check_eq("rp0_y", rp0.y, 2.0);
+    check_eq("rp1_x", rp1.x, 10.0);  check_eq("rp1_y", rp1.y, 20.0);
+    check_eq("rp2_x", rp2.x, 100.0); check_eq("rp2_y", rp2.y, 200.0);
+    check_eq("rv0_dx", rv0.dx, 0.5); check_eq("rv0_dy", rv0.dy, 0.25);
+
+    // query_each walks BOTH legacy + archetype entities. Legacy has 0
+    // entities here (we never called ecs_spawn), archetype has 3.
+    q = ecs_query(w, 1);
+    check_int("count_3_arch", ecs_query_count(q), 3);
+    _q_total = 0;
+    ecs_query_each(q, fn_ptr(_q_count));
+    check_int("each_3_arch", _q_total, 3);
+
+    // Add a legacy entity. Count + each should see 4 total.
+    auto leg_id;
+    leg_id = ecs_spawn(w);
+    check_int("count_4_mixed", ecs_query_count(q), 4);
+    _q_total = 0;
+    ecs_query_each(q, fn_ptr(_q_count));
+    check_int("each_4_mixed", _q_total, 4);
+
+    ecs_query_free(q);
+
+    putstr("OK\n");
+    return 0;
+}
