@@ -346,6 +346,16 @@ session to decompose Feature 4 into its sessions.
   concrete emissions), mutual recursion / forward refs, tests +
   macro pattern cleanup.
 
+**Cross-reference — `bpp_defs` exposure to user code**: Feature 4
+needs the compiler's vocabulary (AST node kinds T_*, type codes
+TY_*/BASE_*/SL_*, the Excalibur SHAPE_* literal annotations,
+struct layout queries) reachable from user programs at
+compile-evaluation time. Bundle this exposure into Feature 4's
+planning rather than fragmenting per-constant. Note discovered
+2026-05-11 during Session 1.A test design — a user-side test
+that tried `extrn SHAPE_INT` failed because bpp_defs is
+compiler-internal today.
+
 When Feature 4 opens, this section gets fully detailed.
 
 **Feature 4 close marker**: TBD.
@@ -454,21 +464,30 @@ Numbering will adjust based on what rules exist at the time
 
 **Arc opened**: 2026-05-11
 
-**Current state**: Feature 1 in flight. Session 1.A shipped
-2026-05-11 (commit `714f20e`).
+**Current state**: Feature 1 in flight. Sessions 1.A + 1.B
+shipped 2026-05-11.
 
-**Next session**: `1.B — Resolution via slot context`. Wires
-`add_type` in `src/bpp_types.bsm` to read the shape annotation
-that 1.A added and materialise the literal to its slot's type
-when the bind is lossless (int → float widening OK, decimal →
-int rejected as lossy). Behind a feature flag during dev.
+**Next session**: `1.C — Migration + cleanup`. Sweep the
+codebase for typed-local thunks that exist solely because of
+the pre-arc literal demotion (e.g. `auto local: float; local =
+0.6;`). After 1.B these can collapse to direct expressions in
+many places; verify each rewrite preserves the intent. Update
+`feedback_const_float_demotes` memory entry to "Resolved" once
+the workaround is gone from active code.
 
 **Feature 1**:
-- Session 1.A — SHIPPED 2026-05-11 (`714f20e`). T_LIT nodes
-  carry `SHAPE_INT` / `SHAPE_DECIMAL` in `n.b`. Purely additive;
+- Session 1.A — SHIPPED 2026-05-11. T_LIT nodes carry
+  `SHAPE_INT` / `SHAPE_DECIMAL` in `n.b`. Purely additive;
   no runtime behavior change. Bootstrap byte-stable, suite
   146/0/12 (+ test_literal_shape).
-- Session 1.B — pending.
+- Session 1.B — SHIPPED 2026-05-11. Decimal int literals
+  (`SHAPE_INT`, NOT hex) passed to `: float` parameters
+  silently widen at validate time via in-place source rewrite
+  (".0" appended to literal bytes in vbuf). Codegen sees a
+  normal float literal and uses the existing path. Hex
+  literals + typed int locals continue to error E240.
+  Bootstrap byte-stable, suite 147/0/12
+  (+ test_polymorphic_int_lit).
 - Session 1.C — pending.
 **Feature 2**: not started
 **Feature 3**: not started

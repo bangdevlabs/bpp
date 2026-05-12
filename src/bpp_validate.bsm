@@ -161,6 +161,60 @@ static void _val_check_call_args_against_fntype(fp_ty, args_arr, arg_cnt, src_to
     }
 }
 
+// Excalibur Arc Feature 1 (Session 1.B) — promote a SHAPE_INT
+// literal to a SHAPE_DECIMAL one in place, so codegen treats it
+// as float. Used at the call boundary when an integer literal is
+// passed to a `: float` parameter — int → float widening is
+// lossless and matches the universal numeric-literal idiom of
+// every modern language we draw from (Jai / Zig / Odin / C).
+//
+// Implementation: append ".0" to the literal's source bytes in
+// `vbuf` (the shared interned buffer; codegen's `cg_sbuf` is the
+// same pointer) and update the node's packed ref to span the new
+// length. `cg_is_float_lit` then recognises it on the codegen
+// side without any new code path.
+//
+// Hex literals are NOT promoted — `0xFF.0` would not parse as a
+// float. The detection in the E240 site filters them out.
+//
+// `@io` because it mutates the shared `vbuf` buffer.
+static void _val_promote_int_lit_to_float(node_p) @io {
+    auto n: Node, s, l, new_start, i, ch;
+    n = node_p;
+    s = unpack_s(n.a);
+    l = unpack_l(n.a);
+    new_start = vbuf_pos;
+    for (i = 0; i < l; i++) {
+        ch = peek(vbuf + s + i);
+        poke(vbuf + vbuf_pos, ch);
+        vbuf_pos++;
+    }
+    poke(vbuf + vbuf_pos, '.');
+    vbuf_pos++;
+    poke(vbuf + vbuf_pos, '0');
+    vbuf_pos++;
+    n.a     = pack(new_start, l + 2);
+    n.b     = SHAPE_DECIMAL;
+    n.itype = TY_FLOAT;
+}
+
+// Return 1 when a literal node's source bytes look like a
+// hexadecimal literal (`0x...`). Hex literals can't be promoted
+// to float by appending ".0" — `0xFF.0` is not a valid float
+// syntax — so the polymorphic-literal path skips them and lets
+// E240 fire as before.
+static _val_lit_is_hex(node_p)@base {
+    auto n: Node, s, l;
+    n = node_p;
+    s = unpack_s(n.a);
+    l = unpack_l(n.a);
+    if (l < 2) { return 0; }
+    if (peek(vbuf + s) != '0') { return 0; }
+    if (peek(vbuf + s + 1) == 'x') { return 1; }
+    if (peek(vbuf + s + 1) == 'X') { return 1; }
+    return 0;
+}
+
 // V3 Session 2 — for a resolved target function fidx, validate each
 // arg's compile-time type against the callee's declared param type.
 // Mismatch on float/int polarity emits W028. Skips slots where either
@@ -773,9 +827,24 @@ val_check_node(nd) {
                     // (via SCVTF) — both are bug-shaped. Force the user to
                     // either annotate the local `: float` or write the value
                     // as a float literal.
+                    //
+                    // Excalibur Arc Feature 1 (Session 1.B) — bare integer
+                    // literals (decimal `42`, NOT hex `0xFF`) get promoted
+                    // to float in place when bound to a `: float` parameter.
+                    // The widening is lossless and matches every modern
+                    // language's polymorphic-literal idiom. Typed int locals
+                    // and hex literals continue to error: the locals could
+                    // have been silently demoted upstream, and hex implies a
+                    // bit-pattern intent that float-cast would mangle.
                     if (is_float_type(par_ty)) {
                         if (is_float_type(arg_ty) == 0) {
                             if (arg_ty != TY_UNK) {
+                                if (an.ntype == T_LIT
+                                    && lit_shape(arg_nd) == SHAPE_INT
+                                    && _val_lit_is_hex(arg_nd) == 0) {
+                                    _val_promote_int_lit_to_float(arg_nd);
+                                    continue;
+                                }
                                 diag_error(240);
                                 diag_str("argument ");
                                 diag_int(ai + 1);
