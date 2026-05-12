@@ -367,6 +367,61 @@ The compiler emits the explicit conversion path (`FCVTZS` on ARM64,
 `: word`, `: byte`, `: half`, `: quarter`. The `: int` synonym was
 removed in 0.23.x — `: word` is the canonical name.
 
+### Polymorphic literals at call sites (Excalibur Arc 1.B)
+
+Excalibur Arc Feature 1 Session 1.B (shipped 2026-05-11) relaxed
+ONE specific case: a **decimal integer literal** passed directly to
+a `: float` parameter silently widens to float at the call boundary.
+
+```bpp
+void foo(speed: float) { ... }
+
+foo(42);        // OK — `42` widens to 42.0 (lossless)
+foo(0xFF);      // E240 — hex literals preserve bit-pattern intent
+foo(my_int);    // E240 — typed int local could have demoted upstream
+foo(0 - 7);     // E240 — `0 - 7` is T_BINOP, not a bare T_LIT
+foo(3.14);      // OK — float literal already matches
+```
+
+The widening is in-place: validate appends `.0` to the literal's
+source bytes so codegen sees a normal float literal. Bit-pattern
+intent (hex), demotion concerns (typed int local), and compound
+expressions remain explicit by design.
+
+### `const` demotes float literals just like bare `auto`
+
+`const NAME = 0.001;` stores a parsed-int 0, NOT the IEEE bits of
+0.001. The const declaration has no type annotation slot in v0.23.x,
+so a float literal at the right-hand side is silently demoted at
+parse time. Subsequent uses see zero, not the intended fraction.
+
+**Status post-Excalibur 1.B**: still broken. Session 1.B fixed only
+the call-site widening for decimal int literals. The const-storage
+demotion is a separate language gap that needs `const` to learn float
+typing at the slot level — tracked for a future Excalibur session
+or independent compiler sidequest. Until then, the `auto local: float`
+workaround below is the safe pattern.
+
+Discovered 2026-05-09 while writing `tests/test_json_float.bpp` —
+`const _JSON_FLOAT_TOL = 0.000000001;` was 0 at every comparison
+site, making `diff > tol` always true and the test always fail.
+Replacement: declare a local instead, with the annotation:
+
+```b++
+auto tol_floor: float;
+tol_floor = 0.000000001;
+```
+
+| Pattern | Action |
+|---------|--------|
+| `const TOL = 1e-9;` (float literal at RHS) | Use `auto tol: float;` local with the same value, OR move the literal to the only call site that needs it |
+| `const PI = 3.14159;` ditto | Same — local annotated `: float` |
+| `const N = 8;` (integer) | Fine, `const` works for ints |
+| `const NAME = "label";` (string) | Fine, `const` works for string-pool refs |
+
+W027 (the diagnostic that catches `auto` demotion) does NOT fire on
+`const`, so the pitfall is silent — easy to miss in code review.
+
 ### `const` demotes float literals just like bare `auto`
 
 `const NAME = 0.001;` stores a parsed-int 0, NOT the IEEE bits of

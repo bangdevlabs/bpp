@@ -464,31 +464,41 @@ Numbering will adjust based on what rules exist at the time
 
 **Arc opened**: 2026-05-11
 
-**Current state**: Feature 1 in flight. Sessions 1.A + 1.B
-shipped 2026-05-11.
+**Current state**: Feature 1 SHIPPED 2026-05-11 (Sessions 1.A
++ 1.B + 1.C all closed same day). Eligible for the Wolf3D
+pause-point or for moving directly to Feature 2.
 
-**Next session**: `1.C — Migration + cleanup`. Sweep the
-codebase for typed-local thunks that exist solely because of
-the pre-arc literal demotion (e.g. `auto local: float; local =
-0.6;`). After 1.B these can collapse to direct expressions in
-many places; verify each rewrite preserves the intent. Update
-`feedback_const_float_demotes` memory entry to "Resolved" once
-the workaround is gone from active code.
+**Next session**: pick from
+- `Feature 2.A — Cast builtins` (~50 LOC, single session,
+  immediate ROI: replaces typed-local thunks across stbai,
+  stbpath, stbdraw float→int casts), or
+- Wolf3D Phase 2 Session 3 (Combat) — language work paused
+  per the arc's pause/resume convention.
 
-**Feature 1**:
+**Feature 1 — SHIPPED**:
 - Session 1.A — SHIPPED 2026-05-11. T_LIT nodes carry
   `SHAPE_INT` / `SHAPE_DECIMAL` in `n.b`. Purely additive;
-  no runtime behavior change. Bootstrap byte-stable, suite
-  146/0/12 (+ test_literal_shape).
+  no runtime behavior change.
 - Session 1.B — SHIPPED 2026-05-11. Decimal int literals
   (`SHAPE_INT`, NOT hex) passed to `: float` parameters
   silently widen at validate time via in-place source rewrite
   (".0" appended to literal bytes in vbuf). Codegen sees a
   normal float literal and uses the existing path. Hex
   literals + typed int locals continue to error E240.
-  Bootstrap byte-stable, suite 147/0/12
-  (+ test_polymorphic_int_lit).
-- Session 1.C — pending.
+- Session 1.C — SHIPPED 2026-05-11 (docs-only). Tonify Rule 12
+  extended to document the new polymorphic-literal rule and
+  the residual gap (const-storage demote still needs a
+  separate fix). `feedback_const_float_demotes` memory updated
+  to note the partial fix. No code-side workarounds were
+  removable in active source: the typed-float locals that
+  exist (e.g. `_enemy_step` tunings in `games/fps/ai.bsm`)
+  are workarounds for the unfixed const-storage demote, NOT
+  for the call-site widening 1.B closed.
+
+**Feature 1 final tally**: ~50 LOC parser annotations + ~70
+LOC validate promotion + tests + ~120 LOC docs across the
+three sessions. Suite 145/0/12 → 147/0/12 (+2 tests).
+Bootstrap byte-stable at every commit.
 **Feature 2**: not started
 **Feature 3**: not started
 **Feature 4**: deferred until triggers fire
