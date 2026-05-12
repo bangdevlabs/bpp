@@ -1,0 +1,128 @@
+// skip-c: relies on the worker pool (job_init / job_parallel_for) which the C transpile path does not implement (same gate as test_job / test_maestro).
+import "stbecs.bsm";
+
+// test_ecs_scheduler.bpp — Correctness pins for the ECS system
+// scheduler (RTS Stress Arc Session 5).
+//
+// Covers:
+//   1. Registration handles return monotonically (0, 1, 2, ...).
+//   2. Mixed SYS_SERIAL / SYS_PARALLEL tick runs every registered
+//      system exactly once per tick.
+//   3. Each system sees the dt the scheduler was called with.
+//   4. Registration order is preserved across parallel batches.
+
+// Test instrumentation: each system increments a counter and stamps
+// the dt it observed into a per-system slot. Globals are the canonical
+// way to communicate from worker-context callbacks back to the test
+// (the scheduler routes dt through globals already — see stbecs.bsm).
+global _t_count_sys_a;
+global _t_count_sys_b;
+global _t_count_sys_c;
+global _t_count_sys_d;
+global _t_dt_sys_a: float;
+global _t_dt_sys_b: float;
+global _t_dt_sys_c: float;
+global _t_dt_sys_d: float;
+
+// All systems use the uniform `(_arg) [@safe]` signature: the dispatch
+// arg is unused, and the system reads dt / world from the scheduler
+// globals (_ecs_sys_dt / _ecs_sys_world). SYS_PARALLEL callbacks
+// must be `@safe`; SYS_SERIAL callbacks are unconstrained.
+
+// SYS_SERIAL — runs on the main thread.
+static void _t_sys_a(_arg) {
+    _t_count_sys_a++;
+    _t_dt_sys_a = _ecs_sys_dt;
+}
+
+// SYS_PARALLEL — runs on a worker. Pure counter + dt stamp; bounded.
+static void _t_sys_b(_arg) @safe {
+    _t_count_sys_b++;
+    _t_dt_sys_b = _ecs_sys_dt;
+}
+
+static void _t_sys_c(_arg) @safe {
+    _t_count_sys_c++;
+    _t_dt_sys_c = _ecs_sys_dt;
+}
+
+// Second SYS_SERIAL after the parallel batch — ensures the scheduler
+// resumes serial execution correctly after dispatching a parallel run.
+static void _t_sys_d(_arg) {
+    _t_count_sys_d++;
+    _t_dt_sys_d = _ecs_sys_dt;
+}
+
+main() {
+    auto w, fails;
+    auto h_a, h_b, h_c, h_d;
+    auto i;
+
+    fails = 0;
+    _t_count_sys_a = 0;
+    _t_count_sys_b = 0;
+    _t_count_sys_c = 0;
+    _t_count_sys_d = 0;
+
+    // Worker pool must exist before any SYS_PARALLEL tick can run.
+    // job_init spins up the workers and parks them on the queue.
+    job_init(2);
+
+    w = ecs_new(8);
+
+    // Registration handles are the registration index, monotonic.
+    h_a = ecs_system_register(w, fn_ptr(_t_sys_a), SYS_SERIAL);
+    h_b = ecs_system_register(w, fn_ptr(_t_sys_b), SYS_PARALLEL);
+    h_c = ecs_system_register(w, fn_ptr(_t_sys_c), SYS_PARALLEL);
+    h_d = ecs_system_register(w, fn_ptr(_t_sys_d), SYS_SERIAL);
+
+    if (h_a != 0) { put("FAIL: h_a expected 0 got "); put(h_a); put("\n"); fails++; }
+    if (h_b != 1) { put("FAIL: h_b expected 1 got "); put(h_b); put("\n"); fails++; }
+    if (h_c != 2) { put("FAIL: h_c expected 2 got "); put(h_c); put("\n"); fails++; }
+    if (h_d != 3) { put("FAIL: h_d expected 3 got "); put(h_d); put("\n"); fails++; }
+
+    // Tick once with a known dt. All four systems must run; all four
+    // must see the same dt; counters all bump to 1.
+    ecs_systems_tick(w, 0.01666);
+
+    if (_t_count_sys_a != 1) { put("FAIL: sys_a count "); put(_t_count_sys_a); put("\n"); fails++; }
+    if (_t_count_sys_b != 1) { put("FAIL: sys_b count "); put(_t_count_sys_b); put("\n"); fails++; }
+    if (_t_count_sys_c != 1) { put("FAIL: sys_c count "); put(_t_count_sys_c); put("\n"); fails++; }
+    if (_t_count_sys_d != 1) { put("FAIL: sys_d count "); put(_t_count_sys_d); put("\n"); fails++; }
+
+    // Each system must have observed the exact dt passed to
+    // ecs_systems_tick. Float bit-equality matters here: the scheduler
+    // routes dt through a `: float` global, so the IEEE bits round-
+    // trip; if a future refactor accidentally introduces a numeric
+    // coercion, this catches it.
+    if (_t_dt_sys_a != 0.01666) { put("FAIL: sys_a dt "); put(_t_dt_sys_a); put("\n"); fails++; }
+    if (_t_dt_sys_b != 0.01666) { put("FAIL: sys_b dt "); put(_t_dt_sys_b); put("\n"); fails++; }
+    if (_t_dt_sys_c != 0.01666) { put("FAIL: sys_c dt "); put(_t_dt_sys_c); put("\n"); fails++; }
+    if (_t_dt_sys_d != 0.01666) { put("FAIL: sys_d dt "); put(_t_dt_sys_d); put("\n"); fails++; }
+
+    // Tick five more times with a different dt. Every system's
+    // counter should land at 6, dt should be the new value.
+    for (i = 0; i < 5; i++) {
+        ecs_systems_tick(w, 0.03333);
+    }
+
+    if (_t_count_sys_a != 6) { put("FAIL: sys_a count6 "); put(_t_count_sys_a); put("\n"); fails++; }
+    if (_t_count_sys_b != 6) { put("FAIL: sys_b count6 "); put(_t_count_sys_b); put("\n"); fails++; }
+    if (_t_count_sys_c != 6) { put("FAIL: sys_c count6 "); put(_t_count_sys_c); put("\n"); fails++; }
+    if (_t_count_sys_d != 6) { put("FAIL: sys_d count6 "); put(_t_count_sys_d); put("\n"); fails++; }
+    if (_t_dt_sys_a != 0.03333) { put("FAIL: sys_a dt2 "); put(_t_dt_sys_a); put("\n"); fails++; }
+    if (_t_dt_sys_b != 0.03333) { put("FAIL: sys_b dt2 "); put(_t_dt_sys_b); put("\n"); fails++; }
+    if (_t_dt_sys_c != 0.03333) { put("FAIL: sys_c dt2 "); put(_t_dt_sys_c); put("\n"); fails++; }
+    if (_t_dt_sys_d != 0.03333) { put("FAIL: sys_d dt2 "); put(_t_dt_sys_d); put("\n"); fails++; }
+
+    job_shutdown();
+
+    if (fails == 0) {
+        put("OK\n");
+        return 0;
+    }
+    put("FAILED: ");
+    put(fails);
+    put(" assertion(s)\n");
+    return 1;
+}

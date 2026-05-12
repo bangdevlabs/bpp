@@ -1,0 +1,121 @@
+import "stbecs.bsm";
+
+// bench_ecs_scheduler.bpp — RTS Stress Arc Session 5 perf gate.
+//
+// Verifies that SYS_PARALLEL systems actually execute concurrently
+// on the worker pool, not sequentially on the main thread. Compares
+// two ticks over the same workload:
+//
+//   (a) Sequential: register two SYS_SERIAL systems. They run back-
+//       to-back on the main thread; total time approximates the sum
+//       of each system's solo work.
+//   (b) Parallel:   register two SYS_PARALLEL systems with the same
+//       body. The scheduler dispatches them via job_parallel_for; on
+//       a multi-core host they overlap, so total time approximates
+//       max(system_a, system_b) rather than the sum.
+//
+// Workload per system: 10 million arithmetic operations. Heavy enough
+// that worker dispatch overhead (typically ~10-50us) cannot account
+// for the speedup; if the gate flips, real parallelism is happening.
+//
+// Gate: parallel time < 0.7 * sequential time. A perfect 2-worker
+// scenario would land near 0.5x; the 0.7x ceiling leaves headroom
+// for dispatch overhead, OS scheduling jitter, and the cost of
+// reading dt from the shared global inside the worker.
+
+const N_OPS = 10000000;     // 10M busy-work iterations per system
+
+global _bench_sink_a;
+global _bench_sink_b;
+
+// Both systems do identical busy work — the timing comparison
+// isolates the scheduler's effect on wall time. Uniform `(_arg) @safe`
+// signature per the stbecs scheduler convention; dt would be read
+// from `_ecs_sys_dt` if the body needed it.
+static void _bench_sys_a(_arg) @safe {
+    auto i, acc;
+    acc = 0;
+    for (i = 0; i < N_OPS; i++) {
+        acc = acc + i * 3 + 7;
+    }
+    _bench_sink_a = acc;
+}
+
+static void _bench_sys_b(_arg) @safe {
+    auto i, acc;
+    acc = 0;
+    for (i = 0; i < N_OPS; i++) {
+        acc = acc + i * 5 + 11;
+    }
+    _bench_sink_b = acc;
+}
+
+main() {
+    auto w_seq, w_par;
+    auto t0, t1, dt_seq, dt_par;
+    auto dt_frame: float;
+
+    job_init(2);
+    dt_frame = 0.016;
+
+    // ── Sequential variant: two SYS_SERIAL systems.
+    w_seq = ecs_new(4);
+    ecs_system_register(w_seq, fn_ptr(_bench_sys_a), SYS_SERIAL);
+    ecs_system_register(w_seq, fn_ptr(_bench_sys_b), SYS_SERIAL);
+
+    // Warm-up tick so the worker pool is hot and the I-cache is
+    // primed for both bodies before the timed run.
+    ecs_systems_tick(w_seq, dt_frame);
+
+    t0 = _stb_get_time_us();
+    ecs_systems_tick(w_seq, dt_frame);
+    t1 = _stb_get_time_us();
+    dt_seq = t1 - t0;
+
+    // ── Parallel variant: two SYS_PARALLEL systems with identical
+    // bodies. The scheduler batches them into one job_parallel_for
+    // dispatch; on a multi-core host they overlap.
+    w_par = ecs_new(4);
+    ecs_system_register(w_par, fn_ptr(_bench_sys_a), SYS_PARALLEL);
+    ecs_system_register(w_par, fn_ptr(_bench_sys_b), SYS_PARALLEL);
+
+    // Warm-up tick.
+    ecs_systems_tick(w_par, dt_frame);
+
+    t0 = _stb_get_time_us();
+    ecs_systems_tick(w_par, dt_frame);
+    t1 = _stb_get_time_us();
+    dt_par = t1 - t0;
+
+    job_shutdown();
+
+    // ── Report ─────────────────────────────────────────────────
+    put("--- ECS scheduler: 2 systems x ");
+    put(N_OPS);
+    put(" ops each ---\n");
+    put("sequential (2 x SYS_SERIAL): ");
+    put(dt_seq);
+    put(" us\n");
+    put("parallel   (2 x SYS_PARALLEL): ");
+    put(dt_par);
+    put(" us\n");
+
+    if (dt_par <= 0) {
+        put("FAIL: parallel timing dropped to 0us (timer too coarse)\n");
+        return 1;
+    }
+
+    put("ratio (parallel / sequential, int floor x100): ");
+    put(dt_par * 100 / dt_seq);
+    put("% (lower = better parallelism)\n");
+
+    // Gate: parallel time must be < 70% of sequential. Anything
+    // higher means the systems serialized in practice.
+    if (dt_par * 10 >= dt_seq * 7) {
+        put("FAIL: parallel >= 0.7 * sequential — systems serialized\n");
+        return 1;
+    }
+
+    put("PASS\n");
+    return 0;
+}

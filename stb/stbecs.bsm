@@ -71,7 +71,16 @@ struct World { capacity, count, alive, free_ids, free_count,
                comp_names,        // arr<packed>: component names
                comp_sizes,        // arr<int>:    component byte sizes
                archetype_count,   // archetype bundles registered
-               archetypes }       // arr<ArchetypeRec>: per-archetype storage
+               archetypes,        // arr<ArchetypeRec>: per-archetype storage
+               // RTS Stress Arc Session 5 — system scheduler.
+               // Registered systems tick in registration order;
+               // adjacent SYS_PARALLEL groups dispatch via the job
+               // pool. Cap is fixed (_ECS_SYS_MAX) — games that
+               // genuinely need more re-register dynamically per
+               // scene or extend the cap.
+               sys_fns,           // buf_word(_ECS_SYS_MAX): fn_ptr handles
+               sys_flags,         // buf_word(_ECS_SYS_MAX): SYS_SERIAL or SYS_PARALLEL
+               sys_count }        // number of registered systems
 
 // RTS Stress Arc Session 2 — per-archetype storage record. Each
 // archetype is an ordered bundle of component IDs; entities of the
@@ -109,6 +118,14 @@ struct ArchetypeRec {
 // back to ecs_get / ecs_kill_at unchanged.
 const _ECS_ARCH_BIT      = 0x100000000;
 const _ECS_ROW_MASK      = 0xFFFFFFFF;
+// Scheduler cap (RTS Stress Arc Session 5). Games that register more
+// than this re-bucket per scene or extend the cap. 32 covers the
+// typical RTS workload (physics + AI + 3-5 production / economy
+// systems + render hooks) with headroom; AAA scale is closer to 8-12
+// systems per tick.
+const _ECS_SYS_MAX       = 32;
+const SYS_SERIAL         = 0;
+const SYS_PARALLEL       = 1;
 // Chunk size budget. 16 KB lands in L1 on Apple Silicon (192 KB L1d)
 // and Intel (32-48 KB L1d) without crowding out instruction cache or
 // other hot data. With a typical 3-5 component archetype averaging
@@ -150,6 +167,13 @@ ecs_new(capacity) {
     w.comp_sizes = arr_new();
     w.archetype_count = 0;
     w.archetypes = arr_new();
+    // RTS Stress Arc Session 5 — empty scheduler state. Games
+    // opt in by calling ecs_system_register; legacy callers
+    // never touch sys_count and pay only the fixed-size buffer
+    // allocation above.
+    w.sys_fns   = buf_word(_ECS_SYS_MAX);
+    w.sys_flags = buf_word(_ECS_SYS_MAX);
+    w.sys_count = 0;
     return w;
 }
 
@@ -595,6 +619,103 @@ void ecs_chunk_each2(q, comp_a, comp_b, fn) {
                      n_in_chunk, sz_a, sz_b);
             }
             remaining = remaining - n_in_chunk;
+        }
+    }
+}
+
+// --- System scheduler (RTS Stress Arc Session 5) ---
+//
+// Register multiple systems with the world; `ecs_systems_tick` walks
+// them in registration order. Adjacent SYS_PARALLEL systems dispatch
+// via `job_submit`; SYS_SERIAL systems run on the main thread. The
+// worker pool must be initialised (via `job_init` or `maestro_run`)
+// before any SYS_PARALLEL system ticks.
+//
+// Uniform system signature for both flags:
+//
+//     void my_sys(_arg)              // SYS_SERIAL — no contract
+//     void my_sys(_arg) @safe        // SYS_PARALLEL — @safe required
+//                                    // (the worker pool will not
+//                                    //  tolerate malloc / blocking
+//                                    //  inside the callback)
+//
+// The `_arg` parameter is the job_submit / call() payload slot; it is
+// unused. Systems read the current world and dt from two scheduler
+// globals set by `ecs_systems_tick` immediately before dispatch:
+//
+//     _ecs_sys_world   — World pointer for the current tick
+//     _ecs_sys_dt      — float dt in seconds for the current tick
+//
+// The global handoff exists because passing dt directly across the
+// `call()` / `job_submit()` boundary loses IEEE bits via the V3
+// numeric conversion path (see `feedback_float_arg_boundary.md`).
+// Reading from a `: float`-typed global preserves the bits.
+//
+// Dispatch indirection: the scheduler calls `job_submit(wd.sys_fns[i],
+// 0)` with a dynamic fn handle (loaded from the registry buffer),
+// not a `fn_ptr(LITERAL)` argument. That keeps the W031 suggestion
+// engine quiet on every consumer of stbecs — only the games that
+// actually pass `fn_ptr(my_sys)` to `ecs_system_register` need to
+// think about the @safe contract, and they do so at the registration
+// site (where the literal lives), not at compile time of stbecs
+// itself.
+
+global _ecs_sys_world;       // current world being ticked
+global _ecs_sys_dt: float;   // current frame dt in seconds
+
+// Register a system. `fn_sys` is the fn_ptr of the callback;
+// `flags` is one of SYS_SERIAL or SYS_PARALLEL. Returns the system
+// handle (registration index); useful for diagnostic prints, ignored
+// otherwise.
+ecs_system_register(w, fn_sys, flags) {
+    auto wd: World, idx;
+    wd = w;
+    if (wd.sys_count >= _ECS_SYS_MAX) {
+        put_err("stbecs: ecs_system_register overflow — _ECS_SYS_MAX=");
+        put_err(_ECS_SYS_MAX);
+        put_err(" reached\n");
+        return -1;
+    }
+    idx = wd.sys_count;
+    wd.sys_fns[idx]   = fn_sys;
+    wd.sys_flags[idx] = flags;
+    // Struct-field `++` is broken in B++ codegen today
+    // (`_make_inc_assign` lacks the T_MEMLD branch that
+    // `_make_compound_assign` has). Use `+= 1` until that ships.
+    wd.sys_count = wd.sys_count + 1;
+    return idx;
+}
+
+// Tick all registered systems once. Adjacent SYS_PARALLEL systems
+// are batched and dispatched via `job_submit`; the batch is drained
+// at the end of each parallel run via `job_wait_all` so SYS_SERIAL
+// systems that follow observe the parallel results.
+void ecs_systems_tick(w, dt: float) {
+    auto wd: World, i;
+    wd = w;
+    _ecs_sys_world = wd;
+    _ecs_sys_dt    = dt;
+
+    i = 0;
+    while (i < wd.sys_count) {
+        if (wd.sys_flags[i] == SYS_PARALLEL) {
+            // Greedy batch: walk forward submitting each
+            // SYS_PARALLEL system into the worker pool. The dispatch
+            // arg is unused — every system reads dt / world from the
+            // module globals set above. One `job_wait_all` at the
+            // end of the batch syncs before the next SYS_SERIAL or
+            // the tick exits.
+            while (i < wd.sys_count && wd.sys_flags[i] == SYS_PARALLEL) {
+                job_submit(wd.sys_fns[i], 0);
+                i++;
+            }
+            job_wait_all();
+        } else {
+            // Serial system: call inline on the main thread. The
+            // arg is unused; the system reads dt / world from the
+            // module globals.
+            call(wd.sys_fns[i], 0);
+            i++;
         }
     }
 }

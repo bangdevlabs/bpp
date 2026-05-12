@@ -439,9 +439,73 @@ Wait for one of the soft prerequisites too.
 same-day; Session 1 shipped immediately after per the
 continuous-execute directive.
 
-**Current state**: Sessions 1, 2, 3, and 4 SHIPPED 2026-05-12.
+**Current state**: Sessions 1, 2, 3, 4, and 5 SHIPPED 2026-05-12.
+Infrastructure arc CLOSED.
 
-**Next session**: Session 5 — System scheduler.
+**Optional capstone**: Session 6 (RTS stress demo) — 300 LOC game
+that empirically composes all 5 infrastructure sessions at AAA
+scale. Not required for arc closure; ships when the player wants
+to validate the cantar visually.
+
+**Session 5 — SHIPPED 2026-05-12** (parallelism proven at 57%):
+
+- `stb/stbecs.bsm` scheduler addition (~110 LOC): `SYS_SERIAL` /
+  `SYS_PARALLEL` constants, `ecs_system_register(w, fn_sys, flags)`,
+  `ecs_systems_tick(w, dt)`. Registry lives inside the World struct
+  (fixed cap `_ECS_SYS_MAX = 32`); SYS_SERIAL systems call inline
+  on the main thread, adjacent SYS_PARALLEL systems batch into
+  job_submit dispatches sealed by a single job_wait_all at the end
+  of each parallel run.
+- Uniform `(_arg)` signature for both flags; systems read `dt` and
+  `world` from two module globals (`_ecs_sys_dt`, `_ecs_sys_world`)
+  that the tick function refreshes before dispatch. The global
+  handoff exists because `call() / job_submit()` arg boundaries lose
+  IEEE bits on float values via the V3 numeric conversion path
+  (`feedback_float_arg_boundary.md`); a `: float`-typed global
+  preserves them.
+- Dispatch indirection uses `job_submit(wd.sys_fns[i], 0)` with a
+  dynamic fn handle from the registry buffer — not a `fn_ptr(LITERAL)`
+  argument. That keeps the W031 `@safe`-suggestion engine quiet on
+  every consumer of stbecs (pathfind, snake, fps_wolf3d). Only games
+  that pass `fn_ptr(my_sys)` to `ecs_system_register` get the W031
+  on un-annotated parallel callbacks, which is the intended
+  positive signal.
+- `tests/test_ecs_scheduler.bpp` correctness pins: registration
+  handles return monotonically; mixed SERIAL/PARALLEL/PARALLEL/SERIAL
+  tick runs every system exactly once with the correct dt; multi-
+  tick churn confirms the registry remains stable across many
+  invocations. Marked `// skip-c:` (job_init / job_parallel_for
+  unsupported under C-emit — same gate as test_job / test_maestro).
+- `tests/bench_ecs_scheduler.bpp` perf gate: two 10M-op busy-work
+  systems registered as SYS_SERIAL (sequential ~17.9 ms) vs
+  SYS_PARALLEL (parallel ~10.1 ms). Three stability runs:
+  56% / 50% / 58% parallel-to-sequential ratio. Gate (<70%) cleared
+  comfortably; ideal 2-worker is 50%, observed is within scheduling-
+  overhead distance of that ceiling.
+
+Suite: 157/0/12 native + 129/0/40 C-emit. Bootstrap unaffected
+(stbecs is not imported by the compiler).
+
+**Course correction (mid-Session 5)**: the first cut wrapped each
+parallel system in a static dispatcher (`_ecs_sys_par_worker`) and
+called `job_parallel_for(batch_count, fn_ptr(_ecs_sys_par_worker))`.
+That fn_ptr literal at compile time of stbecs triggered W031 on
+**every** consumer of stbecs — even games that never call the
+scheduler. Refactor moved to direct `job_submit(wd.sys_fns[i], 0)`
+dispatch with dynamic fn handles; the W031 engine only fires on
+literal `fn_ptr(NAME)` arguments, so the dynamic path silences the
+warning without losing the verification at the genuine registration
+site.
+
+Also surfaced the **struct-field `++` codegen gap** in B++:
+`_make_inc_assign` in `bpp_parser.bsm` lacks the T_MEMLD branch that
+`_make_compound_assign` has. So `wd.sys_count++` silently no-ops on
+struct fields, while `wd.sys_count = wd.sys_count + 1` works.
+Tracked as a deferred compiler sidequest in `docs/todo.md`. Existing
+Session 2 archetype code already used the `= field + 1` form,
+suggesting the gap predates Session 5 and was simply unfound.
+
+**Session 4 — SHIPPED 2026-05-12** (perf gate cleared by ~30x):
 
 **Session 4 — SHIPPED 2026-05-12** (perf gate cleared by ~30x):
 

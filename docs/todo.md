@@ -807,6 +807,17 @@ becomes the seed for the dedicated session decomposition.
     consumes it; cartridge restored to C-emit-clean. See
     `tests/bench_ecs_physics_simd.bpp` for the canonical pattern
     consumers should follow until this sidequest opens.
+- **`++` / `--` codegen on T_MEMLD (struct fields, array indices)**
+  — `_make_inc_assign` in `bpp_parser.bsm:733` desugars `x++` to
+  `T_ASSIGN(x, x + 1)` unconditionally; it lacks the T_MEMLD →
+  T_MEMST branch that `_make_compound_assign` carries for `+=`.
+  Today `wd.sys_count++` silently no-ops where `wd.sys_count =
+  wd.sys_count + 1` works. ~20 LOC fix mirroring the `+=` path.
+  Surfaced by RTS Stress Arc Session 5 (2026-05-12); pre-existing
+  Session 2 archetype code already worked around this with the
+  `= field + 1` form. Open when more than one consumer hits the
+  trap or before any new Tonify-driven sweep adds widespread `++`
+  on struct fields.
 - **`restrict` keyword** — useful only when the native codegen
   does aliasing-aware optimization. Not part of Mini Cooper.
   Revisit post-1.0.
