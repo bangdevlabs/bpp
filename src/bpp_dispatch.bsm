@@ -1708,24 +1708,12 @@ classify_all_functions() {
         }
     }
 
-    // W013: verify phase annotations match the analysis results.
-    // `@base` on a function that classify found to be SOLO = warning.
-    // `@solo` is always valid (programmer override, never warns).
-    for (i = 0; i < func_cnt; i++) {
-        if (arr_get(fn_phase_hint, i) == PHASE_BASE) {
-            if (arr_get(fn_phase, i) == PHASE_SOLO) {
-                diag_warn(13);
-                diag_str("'");
-                diag_packed(*(funcs[i] + FN_NAME));
-                diag_str("' annotated '@base' but has side effects");
-                diag_newline();
-                diag_loc(*(funcs[i] + FN_SRC_TOK));
-                diag_show_line(*(funcs[i] + FN_SRC_TOK));
-            }
-        }
-    }
-
-    // Level 4 sub-step C — deferred to the block after the fixpoint.
+    // W013 (`@base` mismatch) was retired in the 2026-05-11 phase
+    // collapse. The parser no longer accepts `@base`, so phase_hint
+    // can never equal PHASE_BASE — the diagnostic block that lived
+    // here was dead code. Internal BASE/SOLO classification still
+    // runs (the fixpoint above) for inline / parallel-candidate
+    // decisions; it just doesn't drive a user-facing warning.
 
     // Level 4 sub-step B — effect lattice fixpoint. fn_effect[i] was
     // seeded during call_graph_build with the joined effect of the
@@ -1763,89 +1751,44 @@ classify_all_functions() {
         }
     }
 
-    // Level 4 sub-step C — enforcement. Compare each function's phase
-    // hint against the effect the fixpoint computed for it. A `@time`
-    // function that can eventually hit IO or SOLO violates its contract;
-    // same story for `@io` and `@gpu`. `@base` is already covered by
-    // the W013 block above and is left untouched.
+    // W026 — `@safe` contract enforcement. The annotation claims the
+    // function is bounded-time and side-effect-free (no malloc, no IO,
+    // no GPU, no syscall). The fixpoint above computed `fn_effect[i]`
+    // — the worst effect reachable through the call graph. If the
+    // effect lands anywhere above BASE in the lattice, the contract
+    // is broken.
     //
-    // @time is the high-value check — it's the one that unlocks the
-    // stbaudio callback guarantee. IO and GPU are included for symmetry
-    // and will start firing when the Rule 4 sweep annotates those paths.
+    // Killer use case: audio callbacks (e.g. `_aud_square_cb` in
+    // `_stb_audio_macos.bsm`) and worker thread entry points — places
+    // where a latent malloc or syscall would manifest as an audible
+    // glitch or a race. The `@safe` annotation turns "I trust the
+    // programmer wrote this carefully" into "the compiler proved it."
+    //
+    // The legacy `@time` / `@io` / `@gpu` enforcement clauses that
+    // lived here were retired in the 2026-05-11 phase collapse. The
+    // parser no longer produces those phase_hint values.
     for (i = 0; i < func_cnt; i++) {
-        auto _h, _e, _name, _label;
+        auto _h, _e, _name;
         _h = arr_get(fn_phase_hint, i);
+        if (_h != PHASE_SAFE) { continue; }
         _e = arr_get(fn_effect, i);
-        _name = _e == PHASE_IO ? "IO"
-              : _e == PHASE_GPU ? "GPU"
+        if (_e == PHASE_BASE) { continue; }
+        if (_e == PHASE_REALTIME) { continue; }
+        if (_e == PHASE_AUTO) { continue; }
+        _name = _e == PHASE_IO   ? "IO"
+              : _e == PHASE_GPU  ? "GPU"
               : _e == PHASE_HEAP ? "HEAP"
               : _e == PHASE_SOLO ? "SOLO"
-              : _e == PHASE_REALTIME ? "TIME"
               : "BASE";
-        if (_h == PHASE_REALTIME) {
-            // @time = the strictest annotation. Callees must be
-            // @base or @time; HEAP, IO, GPU, SOLO all violate — an
-            // audio callback that touches malloc will glitch.
-            if (_e != PHASE_BASE && _e != PHASE_REALTIME && _e != PHASE_AUTO) {
-                diag_warn(26);
-                diag_str("'");
-                diag_packed(*(funcs[i] + FN_NAME));
-                diag_str("' annotated '@time' but reaches ");
-                diag_str(_name);
-                diag_str(" through its call graph");
-                diag_newline();
-                diag_loc(*(funcs[i] + FN_SRC_TOK));
-                diag_show_line(*(funcs[i] + FN_SRC_TOK));
-            }
-        }
-        if (_h == PHASE_SAFE) {
-            // @safe = the canonical post-collapse safety annotation.
-            // Identical enforcement to @time: callees must be @base
-            // (compiler-verified pure), @safe, or @time; anything
-            // touching HEAP / IO / GPU / SOLO violates the contract.
-            // The error label says "@safe" instead of "@time" so the
-            // diagnostic matches the spelling the programmer wrote.
-            if (_e != PHASE_BASE && _e != PHASE_REALTIME && _e != PHASE_AUTO) {
-                diag_warn(26);
-                diag_str("'");
-                diag_packed(*(funcs[i] + FN_NAME));
-                diag_str("' annotated '@safe' but reaches ");
-                diag_str(_name);
-                diag_str(" through its call graph");
-                diag_newline();
-                diag_loc(*(funcs[i] + FN_SRC_TOK));
-                diag_show_line(*(funcs[i] + FN_SRC_TOK));
-            }
-        }
-        if (_h == PHASE_IO) {
-            // @io permits HEAP (nearly every io function allocates
-            // scaffolding). GPU and SOLO are incompatible.
-            if (_e == PHASE_GPU || _e == PHASE_SOLO) {
-                diag_warn(26);
-                diag_str("'");
-                diag_packed(*(funcs[i] + FN_NAME));
-                diag_str("' annotated '@io' but reaches ");
-                diag_str(_name);
-                diag_str(" through its call graph");
-                diag_newline();
-                diag_loc(*(funcs[i] + FN_SRC_TOK));
-                diag_show_line(*(funcs[i] + FN_SRC_TOK));
-            }
-        }
-        if (_h == PHASE_GPU) {
-            // @gpu permits HEAP. IO and SOLO are incompatible.
-            if (_e == PHASE_IO || _e == PHASE_SOLO) {
-                diag_warn(26);
-                diag_str("'");
-                diag_packed(*(funcs[i] + FN_NAME));
-                diag_str("' annotated '@gpu' but reaches ");
-                diag_str(_name);
-                diag_str(" through its call graph");
-                diag_newline();
-                diag_loc(*(funcs[i] + FN_SRC_TOK));
-                diag_show_line(*(funcs[i] + FN_SRC_TOK));
-            }
-        }
+        diag_warn(26);
+        diag_str("'");
+        diag_packed(*(funcs[i] + FN_NAME));
+        diag_str("' annotated '@safe' but reaches ");
+        diag_str(_name);
+        diag_str(" through its call graph");
+        diag_newline();
+        diag_loc(*(funcs[i] + FN_SRC_TOK));
+        diag_show_line(*(funcs[i] + FN_SRC_TOK));
     }
 
     return 0;

@@ -1,69 +1,55 @@
-// phase_lattice.bpp — Canonical demonstration of the @phase lattice.
+// phase_lattice.bpp — Canonical demonstration of `@safe`.
 //
-// Every @phase annotation below matches its actual call graph, so the
-// compiler accepts this program without W013 or W026 diagnostics.
+// Every annotation below matches its actual call graph, so the
+// compiler accepts this program without W026 diagnostics.
 //
 //   ./bpp examples/phase_lattice.bpp -o /tmp/phase_lattice
 //   /tmp/phase_lattice
 //
-// To see what each violation looks like, compile examples/phase_lattice_bad.bpp
-// instead and observe the warnings.
+// To see what a violation looks like, compile
+// examples/phase_lattice_bad.bpp instead and observe the warnings.
 //
-// Lattice (top = most side effects):
+// Post-2026-05-11 collapse model:
 //
-//           @solo
-//           /    \
-//         @io    @gpu     siblings; cannot call each other
-//           \    /
-//           @safe          realtime: arg-writes only
-//             |
-//           @base          pure
+//   @safe    — bounded time, no malloc, no IO, no GPU, no syscall.
+//              Audio callbacks + worker entry points + any path
+//              that MUST stay bounded.
+//   (none)   — default: full power, no compiler verification.
+//   @profile("name") — scoped instrumentation, parsed elsewhere.
 //
-// A function can CALL anything at its level or below.
-// A function can BE CALLED from its level or above.
-// @base is callable by everyone; @solo can call anything.
+// See docs/tonify_checklist.md Rule 4 for the spec.
 
-// ── @base — pure compute. No globals, no malloc, no I/O. ──────
-static add(a, b)@base { return a + b; }
+// Pure compute. No annotation needed — the compiler infers purity
+// internally for inline / parallel candidate decisions.
+static add(a, b) { return a + b; }
 
-// ── @safe — realtime path. Reads / writes through pointer args.
-//    Forbidden: heap, I/O, GPU. Audio callbacks live here.
+// Bounded path. Reads / writes through pointer args, no malloc, no
+// IO, no GPU. The compiler proves the contract by walking the call
+// graph and checking that every reachable callee is BASE or AUTO.
 static dsp_zero(buf, n)@safe {
     auto i;
     for (i = 0; i < n; i++) { poke(buf + i, 0); }
 }
 
+// Composes with other @safe paths and pure helpers. Compiler walks
+// `dsp_zero` and `add` and verifies neither escapes the contract.
 static dsp_mix(buf, n)@safe {
     auto s;
-    dsp_zero(buf, n);              // OK: @safe may call @safe
-    s = add(1, 2);                 // OK: @safe may call @base
+    dsp_zero(buf, n);
+    s = add(1, 2);
     return s;
 }
 
-// ── @io — touches stdout. Permits HEAP. ───────────────────────
-static greet()@io {
-    auto p;
-    p = malloc(8);                 // HEAP allowed in @io
-    putchar('h'); putchar('i'); putchar(10);
-    free(p);
-}
-
-// ── @gpu — touches GPU resources. Permits HEAP, NOT I/O. ──────
-static fake_upload()@gpu {
-    auto buf;
-    buf = malloc(16);              // HEAP allowed in @gpu
-    free(buf);
-}
-
-// ── @solo — catch-all. Absorbs everything. ────────────────────
-static frame()@solo {
+// Driver — no annotation needed. malloc + audio mixing live here
+// because the driver lives outside the bounded path.
+static frame() {
     auto buf, sum;
     buf = malloc(64);
-    dsp_mix(buf, 64);              // OK: @solo absorbs @safe
-    greet();                       // OK: @solo absorbs @io
-    fake_upload();                 // OK: @solo absorbs @gpu
-    sum = add(2, 3);               // OK: @solo absorbs @base
+    dsp_mix(buf, 64);
+    sum = add(2, 3);
     free(buf);
+    putstr("hi\n");
+    return sum;
 }
 
 main() {

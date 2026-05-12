@@ -48,6 +48,7 @@ Reserved:              2  (W017, W014 — see Reserved section)
 | E247 | func-type cannot exceed 8 args | bpp_parser.bsm | parse_fn_type | ✅ | A `func(arg1, ..., arg9)` declaration exceeds the AAPCS64/SysV register-pass ceiling (V3 Session 1 — shipped 2026-05-04) |
 | E248 | func-type nesting exceeds maximum depth | bpp_parser.bsm | parse_fn_type | ✅ | Higher-order `func` types deeper than 16 levels — almost always a typo (V3 Session 1) |
 | E249 | malformed func-type | bpp_parser.bsm | parse_fn_type | ✅ | Missing `(` after `func` or missing `->` after argument list (V3 Session 1) |
+| E260 | deprecated phase keyword | bpp_parser.bsm | 1556 | ✅ | Programmer wrote one of the legacy phase keywords (`@base`, `@solo`, `@time`, `@io`, `@gpu`, `@heap`, `@panic`, `@realtime`) on a function signature. All eight were retired in the 2026-05-11 phase annotation collapse. The diagnostic emits source location plus three help lines pointing at `@safe` (the post-collapse replacement), the omit-it option, and `docs/tonify_checklist.md` Rule 4 for the spec. Replaces the generic E104 "unexpected token '{'" that fired before the dedicated diagnostic landed. |
 
 ## Runtime asset-load diagnostics (stderr, not compile-time)
 
@@ -93,11 +94,11 @@ re-log.
 | W010 | narrowing conversion | bpp_validate.bsm | 270 | ❌ | Float narrowed to half/quarter |
 | W011 | precision loss | bpp_validate.bsm | 254 | ❌ | Word to half float |
 | W012 | & in FFI argument | bpp_validate.bsm | 451 | ✅ | Address-of passed to extern/call |
-| W013 | @base mismatch | bpp_dispatch.bsm | 1156 | ✅ | Function annotated `@base` but the BASE/SOLO classifier marked it SOLO (impure). Seed: any direct write to a global, any call into a SOLO callee, or any builtin not in the pure-extern table. Verify with `examples/phase_lattice_bad.bpp` (`bad_base`) |
+| W013 | @base mismatch | bpp_dispatch.bsm | n/a | n/a | REMOVED 2026-05-11 (phase annotation collapse). The `@base` annotation was retired with the rest of the 8-phase lattice; `@safe` (W026) is now the only user-facing phase enforcement. The classifier code that drove this warning is dead. Historical: fired when a function annotated `@base` was found to be SOLO by the BASE/SOLO classifier. |
 | W020 | static cross-module | bpp_validate.bsm | 397 | ✅ | Calling static fn from other module |
 | W021 | switch not exhaustive | bpp_parser.bsm | TBD | ✅ | switch without else arm |
 | W025 | public param without hint used in float arithmetic | bpp_validate.bsm | 681 | ✅ | Non-static fn uses un-hinted param in a T_BINOP where the other side is float-typed — annotate `: float` to preserve IEEE bits or `: word` to document integer intent (Rule 13) |
-| W026 | phase annotation violated by effect lattice | bpp_dispatch.bsm | 1228 | ✅ | Function annotated `@time` / `@io` / `@gpu` transitively reaches an incompatible effect through its call graph — Level 4 sub-step C. Lattice: BASE < TIME < HEAP < {IO, GPU} < SOLO. `@time` forbids HEAP, IO, GPU, SOLO; `@io` permits BASE, TIME, HEAP, IO (forbids GPU, SOLO); `@gpu` permits BASE, TIME, HEAP, GPU (forbids IO, SOLO). `@gpu` enforcement is armed via annotation-driven seed (Option B in `call_graph_build`): the annotation IS the source of truth for GPU effect, propagated through the fixpoint. Verify with `examples/phase_lattice_bad.bpp` (5/5 violations fire) |
+| W026 | @safe contract violated | bpp_dispatch.bsm | 1796 | ✅ | Function annotated `@safe` reaches HEAP / IO / GPU / SOLO through its transitive call graph. The annotation is a contract: bounded time, no malloc, no IO, no GPU, no syscall. Killer use case: audio callbacks (e.g. `_aud_square_cb` in `_stb_audio_macos.bsm`) and worker thread entry points. Verify with `examples/phase_lattice_bad.bpp` (`bad_safe_heap`, `bad_safe_io`). The legacy `@time`/`@io`/`@gpu` enforcement was REMOVED 2026-05-11 in the phase annotation collapse — those annotations are no longer accepted by the parser. |
 | W028 | call() arg-type mismatch via flow analysis | bpp_validate.bsm | 165 | ✅ | `call(fp, args)` where fp's resolved target (intra-function origin tracking, Session 2; or cross-function via registration helper, Session 4) declares a parameter whose float/int polarity does not match the supplied arg. Estrita conflict resolution for multi-origin: any registered target with a mismatching signature fires. Diagnostic-shipped 2026-05-05 — closes Pitfall 6 from `tonify_checklist.md` |
 
 ## What "has location" means
@@ -163,7 +164,7 @@ Codes reserved for planned features. Do NOT reuse these numbers for other diagno
 |------|-------------|--------|
 | W017 | void used as value (`x = void_func()`) | Reserved — ships with void keyword validation |
 | W014 | extrn written after freeze point | Reserved — needs investigation (crashed self-host) |
-| W030 | scoped zone inside `@gpu` region | Reserved — GPU pipeline roadmap Phase 6.3 (scoped zones compiler feature) |
+| W030 | scoped zone inside `@safe` region | Reserved — GPU pipeline roadmap Phase 6.3 (scoped zones compiler feature). Originally reserved for `@gpu`; renamed during the 2026-05-11 phase annotation collapse. |
 | E250 | shader source compile failure | Reserved — GPU pipeline roadmap Phase 2.1 (`.metal` → `MTLLibrary` failure surfaced as compiler diagnostic when build-time validated; runtime path remains stderr + exit) |
 | E251 | pipeline state creation failure | Reserved — GPU pipeline roadmap Phase 2.1 (`MTLRenderPipelineState` construction failure with named vertex/fragment functions) |
 | E252 | atlas grid metadata mismatch | Reserved — GPU pipeline roadmap Phase 3.1 (atlas declared NxM but PNG dimensions disagree) |
@@ -396,3 +397,81 @@ Investigation needed.
 (sync on outstanding signals before returning), or filtering of
 samples whose PC falls within `_wolf3d_dump_profile` /
 `profile_dump` / `_runtime_resolve_pc` themselves.
+
+---
+
+## Apple-side noise (known, ignore)
+
+External warnings that look like our bugs but originate inside
+Apple frameworks. Listed here so future devs don't burn hours
+hunting causes in our backend.
+
+### `The class 'NSOpenPanel' overrides the method identifier`
+
+Full message shape:
+
+```
+<timestamp> <binary>[pid:tid] The class 'NSOpenPanel' overrides the method identifier.
+                              This method is implemented by class 'NSWindow'
+```
+
+**When it fires.** Once per process, the first time NSOpenPanel
+is touched — i.e. the first call to `window_open_dialog` /
+`window_save_dialog` / `window_open_folder_dialog`. ObjC runtime
+realizes classes lazily; the warning is emitted by `_objc_inform`
+when it notices that NSOpenPanel and NSWindow both declare
+`-identifier` (via the `NSUserInterfaceItemIdentification`
+protocol).
+
+Empirically: standalone `level_editor` does NOT warn until the
+user clicks Open. Bang 9 does NOT warn until Open is clicked
+in the Levels tab. modulab / fxlab / games never warn (no
+NSOpenPanel touch in any code path).
+
+**Why it is NOT ours.** Verified by triangulation:
+
+1. Zero dynamic class registration in our backend.
+   `grep -rn "objc_allocateClassPair\|class_addMethod\|class_replaceMethod"`
+   in `src/backend/os/macos/` returns only the source-side
+   diagnostic comment at `_stb_platform_macos.bsm:741-757`.
+2. Zero `identifier` selector usage anywhere in the tree.
+3. Our NSOpenPanel call is vanilla:
+   `objc_msgSend(objc_getClass("NSOpenPanel"), sel_registerName("openPanel"))`
+   — identical pattern to any Swift / ObjC app that opens a
+   file dialog.
+4. Empirically reproduced in `level_editor` standalone with no
+   Bang 9 involvement — same single warning line on first
+   Open click.
+5. **macOS 15 (Sequoia) regression**, not a long-standing
+   bug. Surfaced September 2024 across the third-party app
+   ecosystem that uses NSOpenPanel directly (instead of
+   SwiftUI's `fileImporter` modifier which abstracts over
+   it). Same warning reported in unrelated codebases —
+   Deep-Live-Cam (Python+PyObjC), NoMachine native client,
+   anylabeling (Python+Qt), Activity Browser, Docling,
+   Scilab. Pattern: any app touching raw NSOpenPanel on
+   macOS 15+ hits this regardless of language / framework.
+
+**Why no fix.** ObjC dispatch chooses the most-specific method
+via vtable normally — zero behavioural impact. Pre-warming
+NSOpenPanel during startup would only relocate the warning to
+a "less suspicious" moment; it adds boot cost for cosmetic gain
+and would mask the message if Apple ever changes the trigger.
+Suppressing via `objc_setLogFunction` is brittle and risks
+hiding real warnings.
+
+**Source-side comment.** `src/backend/os/macos/_stb_platform_macos.bsm:741-757`
+holds the on-site explanation for anyone reading the dialog
+wrappers and wondering.
+
+**Triage template** for future `overrides the method X` warnings
+on AppKit classes we touch: grep our backend for class
+registration calls (`objc_allocateClassPair`, `class_addMethod`,
+`class_replaceMethod`, `method_exchangeImplementations`). If
+clean, the warning is Apple's — log it here, do not pre-warm,
+do not suppress.
+
+**Revisit when**: macOS 16 lands, or when any of the third-party
+apps tracking this regression confirm Apple shipped a fix in a
+macOS 15.X.Y point release. If Apple corrects the regression,
+the warning vanishes on its own.
