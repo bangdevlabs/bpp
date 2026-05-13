@@ -596,6 +596,32 @@ production consumer (path_asset, added the same week), the
 unification cost was 1 line of source + 1 line of test +
 3 docs sites. Future programmers see one canonical form.
 
+### Builtin return-type registry — exception only for true builtins
+
+`src/bpp_types.bsm:_builtin_ret_type` is a hardcoded registry
+that tags a function's return type by string match. After the
+2026-05-13 cleanup it contains ONLY entries for **true builtins**
+— functions implemented directly in codegen with no B++ source
+file (`peekfloat` emits a single LDR D + FCVT instruction;
+`peekfloat_h` emits LDR S + FCVT). They cannot be source
+functions because the inline instruction is the point — wrapping
+them in a function call defeats the purpose.
+
+**Rule for new code:** any function that has (or could have) a
+`.bsm` source MUST declare its return type via `-> ret` on the
+signature directly. Adding entries to `_builtin_ret_type` for
+source-having functions is forbidden — it splits the canonical
+form across two locations and forces future readers to grep the
+compiler internals to learn an API's shape.
+
+**Migration history:** 2026-05-13 retired the registry tagging
+of `arr_new` / `buf_word` / `buf_byte` (moved to source `->
+array` / `-> ptr`) and demoted `argc_get` / `argv_get` /
+`envp_get` from codegen builtin to plain source functions in
+`src/bpp_args.bsm`. The registry now contains only `peekfloat`
+and `peekfloat_h`. See `docs/builtin_to_source_plan.md` for the
+full rationale + execution log.
+
 ## Rule 14: Increment and compound assignment operators
 
 `++`, `--`, `+=`, `-=`, `*=`, `/=`, `%=` are now first-class syntax.
