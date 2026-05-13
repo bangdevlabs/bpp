@@ -53,6 +53,48 @@ declaring the work done.
    runtime-dispatched. If unsure: ask "does the bpp BINARY need both
    variants linked?" If yes, spine. If no, per-target file.
 
+4. **New module → update `install.sh` in the same commit.** Every new
+   `src/bpp_*.bsm` (auto-injected compiler/runtime module) and every
+   new `stb/stb*.bsm` (opt-in game cartridge) MUST land in `install.sh`'s
+   copy list at the same time as the file itself. Forgetting this rule
+   produces a recurring class of bug: the project tree compiles fine
+   (find_file walks up to `src/` from any cwd inside the repo), but
+   once `install.sh` runs and the user compiles from any non-repo
+   cwd, the missing module trips `error[E201]: function 'X' called
+   but never defined` or `error[E002]: import 'Y' not found` — only
+   visible AFTER the install, by which point the connection to the
+   commit that introduced the module is easy to miss.
+
+   Concrete checklist for the commit that adds the new file:
+
+   - `src/bpp_<name>.bsm` (auto-injected) → add a `sudo cp src/bpp_<name>.bsm "$LIB_DIR/"`
+     line in install.sh, alongside its peer auto-inject entries
+     (bpp_array / bpp_str / bpp_io / bpp_runtime / etc., lines 131-147
+     of install.sh as of 2026-05-13).
+   - `stb/stb<name>.bsm` (opt-in cartridge) → add a `sudo cp stb/stb<name>.bsm "$STB_DIR/"`
+     line in the same script's stb section.
+   - `src/backend/<chip>/<file>.bsm` or `src/backend/os/<os>/<file>.bsm` →
+     match the corresponding `$CHIP_*_DIR` or `$OS_*_DIR` copy block.
+   - Shader assets in `stb/shaders/<name>.metal` → match the
+     `$SHADER_DIR` copy block.
+
+   Symptoms when this rule is violated (graduated to its own
+   sub-section to make the diagnosis fast):
+
+   > Most games compile and run. Audio-dependent games (or any
+   > consumer of the missing module) compile but hang or crash
+   > silently at runtime. New users coming from a `git clone +
+   > install.sh + cd elsewhere + bpp foo.bpp` flow trip the
+   > E201/E002 immediately.
+
+   Worked precedents this rule is named after: `bpp_args.bsm` ship
+   2026-05-13 (forgotten in initial commit, caught when audio
+   games hung after install — fixed within minutes once located,
+   but the trail of false leads cost ~30 minutes); `bpp_path.bsm`
+   ship 2026-04-19 (same shape); `bpp_arena.bsm` ship 0.75-era
+   (same). Three repeats of the same omission is the signal that
+   the rule needs to live in the manual, not in tribal memory.
+
 **When to run the bootstrap cycle (and when to skip it).** The cycle below
 exists to verify that a change to the compiler/runtime/backends still
 produces a byte-stable, suite-green binary. If your change touches none of

@@ -142,6 +142,14 @@ sudo cp src/bpp_job.bsm "$LIB_DIR/"
 sudo cp src/bpp_maestro.bsm "$LIB_DIR/"
 sudo cp src/bpp_arena.bsm "$LIB_DIR/"
 sudo cp src/bpp_path.bsm "$LIB_DIR/"
+# bpp_args.bsm holds argc_get / argv_get / envp_get as source
+# functions (migrated from codegen builtins on 2026-05-13 — see
+# docs/builtin_to_source_plan.md). Auto-injected by bpp_import.bsm
+# next to bpp_runtime; missing here breaks any compile from a
+# non-repo cwd with `error[E201]: function 'argv_get' called but
+# never defined`. Every B++ program reads argv at startup so
+# this is universal infrastructure, not opt-in.
+sudo cp src/bpp_args.bsm "$LIB_DIR/"
 sudo cp src/bpp_mem.bsm "$LIB_DIR/"
 sudo cp src/bpp_time.bsm "$LIB_DIR/"
 sudo cp src/bpp_thread.bsm "$LIB_DIR/"
