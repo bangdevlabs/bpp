@@ -41,16 +41,34 @@ Nothing on this list needs new infrastructure. The arc is
 
 ## Source material
 
-| Source | Where | Role |
-|---|---|---|
-| Original DOS executables | `/Users/Codes/Warcraft1/Warcraft_Orcs_and_Humans_DOS_Files_EN/Game Files/` | reference behaviour (run in DOSBox to verify a port-day question) |
-| `war1gus` engine + scripts | `/Users/Codes/Warcraft1/war1gus/` (cloned upstream) | reference implementation — Stratagus C++ engine plus ~9.5K LOC of Lua scripts encoding every game rule |
-| Converted assets | `games/rts_1.0/assets/converted/` (in this repo) | the actual PNG / WAV / MID / SMS / SMP / TXT files our port consumes |
+| Source | Where | Role | Caveat |
+|---|---|---|---|
+| Original DOS executables | `/Users/Codes/Warcraft1/Warcraft_Orcs_and_Humans_DOS_Files_EN/Game Files/` | behavioural ground truth (run in DOSBox for disputed mechanics) | the only reference for the unmodified Blizzard 1994 simulation |
+| `war1gus` repo | `/Users/Codes/Warcraft1/war1gus/` (Wargus's WC1 port to Stratagus engine) | readable reference for asset format + game data shape | **not the original Blizzard source** — Blizzard never released it; war1gus is a clean-room reimplementation |
+| `war1gus/scripts/*.lua` | inside the war1gus repo | Lua "specification" for every unit, building, missile, animation, spell, and AI subroutine | mostly faithful to WC1 1994 — see `units.lua` for base unit data |
+| `war1gus/scripts/balancing.lua` | inside the war1gus repo | tempting to read as canon — DO NOT | header literally says "*changes* on top of the normal unit definitions for better balancing in multiplayer and with War1gus features such as dynamic fog of war and autocasting." These are **war1gus-specific rebalances**, not original WC1 numbers. |
+| `war1gus/war1gus.cpp` + `war1tool.cpp` | inside the war1gus repo | engine glue (Stratagus C++) and asset converter | we already used `war1tool` to populate `assets/converted/`; engine glue is reference only |
+| Converted assets | `games/rts_1.0/assets/converted/` (in this repo) | the actual PNG / WAV / MID / SMS / SMP / TXT files our port consumes | runtime input, not reference |
 
-The Lua scripts in `war1gus/scripts/` are the "specification" — they
-read like data sheets for every unit, building, missile, animation,
-spell, and AI subroutine. We port the data into B++ structures and
-the behaviour into B++ functions; we do not embed Lua.
+**Where to look for what:**
+
+- "What does a peasant cost / how many HP / what's its sprite?"
+  → `war1gus/scripts/units.lua` first; verify against DOSBox if
+  the value smells war1gus-specific.
+- "How much damage does a footman do to a grunt?"
+  → DOSBox is canon. `balancing.lua` is contaminated.
+- "What animation frames per direction?"
+  → `war1gus/scripts/anim.lua` (visual data, faithful).
+- "AI behaviour grammar?"
+  → `war1gus/scripts/ai.lua` is a starting point; the original
+  DOS AI was simpler. Port the war1gus version, then trim if
+  we hit "this AI feels too smart for 1994."
+
+The Lua scripts read like data sheets. We port the data into B++
+structures and the behaviour into B++ functions; we do **not** embed
+Lua. License notice (war1gus is GPL-2): we treat it as readable
+reference / executable documentation, not as code we copy. Clean-
+room reimplementation in B++.
 
 ## Module layout (proposed)
 
@@ -248,6 +266,54 @@ condition triggers cleanly. The "B++ cantando" proof.
 
 **Files**: `wc1_mission.bsm` — mission orchestrator; load
 `assets/converted/campaigns/human/01.sms` + `01.smp`.
+
+## Engineering principles
+
+### Use what stb offers; evolve stb when it doesn't
+
+Every session starts by asking: "does an existing stb cartridge
+cover this?" — `stbecs`, `stbpath`, `stbflow`, `stbmixer`,
+`stbmidi`, `stbsound`, `stbsprite`, `stbtile`, `stbpal`,
+`stbrender`, `stbgame`, `stbwindow`. If yes, consume it as-is.
+
+If a session genuinely needs something the cartridge does not
+expose, the right move is **to evolve the cartridge**, not to
+build a one-off helper inside `wc1_*.bsm`. The cartridge already
+has the right surface; the new feature lives where the next
+consumer can re-use it. Two checks before adding the feature:
+
+- Killer-use-case test (Tonify Rule 28): does this catch a real
+  bug class for at least one consumer beyond WC1, or is it
+  WC1-specific?
+- Smaller-tool test: can the existing cartridge surface be
+  composed differently to avoid the addition?
+
+WC1-specific game logic stays in `games/rts_1.0/wc1_*.bsm`. Cross-
+project infrastructure that just happens to be discovered by WC1
+graduates to `stb/`. The line moves with consumer count, not with
+intuition.
+
+### Tonify checklist on every new function
+
+Mandatory pre-flight per Tonify Rule 14 / Rule 25 / Rule 30 /
+Rule 13 / Rule 27 (leaves-first ordering) / Rule 17 (`put`
+smart dispatch) / Rule 28 (killer-use-case gate). The checklist
+is the pocket manual. Open `docs/tonify_checklist.md` alongside
+the editor; do not write a function without referencing it.
+
+Specific rules that bite hardest in game code:
+
+- Rule 13 (`: ptr` / `: float` / `: word` annotations on public API
+  params) — every `wc1_*` function exposed to other modules.
+- Rule 27 (leaves-first definition ordering) — V3 inference
+  needs callees defined before callers in the same file.
+- Rule 28 (killer-use-case gate) — guards every "we should
+  probably also add X" temptation mid-session.
+- Rule 30 (ECS layout) — picks SoA flat vs AoSoA chunked per
+  workload; defaults to AoSoA for archetype-heavy game state.
+- Rule 17 (`put` / `put_err` smart dispatch) — never bypass to
+  raw `putnum_err` unless explicit integer intent; W032 catches
+  the lapse.
 
 ## Cross-cutting design decisions
 
