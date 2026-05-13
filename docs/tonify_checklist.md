@@ -529,6 +529,73 @@ a decimal integer. The fix is either `param: ptr` on the declaration
 `putnum` / `putnum_err` directly to acknowledge the integer intent.
 Literals like `put(42)` never warn — they are obviously intentional.
 
+**Return-type annotation (`->` form, canonical since 2026-05-13):**
+function return type uses `->` (NOT `:`), placed between the
+parameter list and the body opening brace. Different glyph from
+the variable / param / field annotations: `:` reads "X has type T"
+(it's a property of X), `->` reads "function returns T" (it's the
+output side of a function arrow). Same convention as Rust /
+Python / Swift / C++11+ trailing-return / TypeScript.
+
+```bpp
+// Public API: declares the function returns a pointer. Callers
+// can write `auto local: ptr = path_asset("foo");` without E053,
+// and `put(path_asset(...))` routes through putstr (no W032).
+path_asset(relpath: ptr) -> ptr {
+    ...
+    return out;             // out is a malloc'd byte buffer
+}
+
+// stub form: same annotation on the declaration.
+stub path_asset(relpath: ptr) -> ptr;
+
+// Higher-order: outer fn-def uses `->`, inner fn-type also uses `->`.
+make_handler() -> func(float) -> word {
+    auto inner: func(float) -> word;
+    return inner;
+}
+```
+
+The two glyphs at a glance:
+
+| Position | Glyph | Reads as |
+|----------|-------|----------|
+| `auto x: ptr` | `:` | "x has type ptr" |
+| `(p: ptr)` | `:` | "param p has type ptr" |
+| `field: byte` | `:` | "field has type byte" |
+| `f(args) -> ptr {` | `->` | "f returns ptr" |
+| `func(args) -> ptr` (type expr) | `->` | "type of fn returning ptr" |
+
+`:` is reserved for "X has type T" annotations on storage; `->`
+is reserved for "function returns T" — never the same glyph for
+both concepts. Mixing them is a parser error since the
+2026-05-13 cleanup (commit pending).
+
+**When to annotate the return type:**
+
+| Pattern | Action |
+|---------|--------|
+| Public function returning a malloc'd pointer (`str_dup`, `path_asset`, `image_load`, `strbuf_new`) | Annotate `-> ptr` so callers can chain without workarounds |
+| Public function returning a float (`game_dt`, `sin_f`, `cos_f`) | Annotate `-> float` (or `-> half float` for 32-bit precision) |
+| Public function returning a sub-word int by intent (rarely needed) | Annotate the matching slice type; usually unnecessary |
+| Static helpers used only in this file | Skip — flow analysis covers the call site |
+| Functions returning a plain word (counts, indices, IDs) | Skip — TY_WORD is the default, no annotation needed |
+
+Sweep is not bulk — only annotate when a consumer actually
+needs the return type for downstream smart dispatch. Same
+opt-in shape as `: ptr` on params. Two-consumer rule (Rule 20)
+applies before promoting "we should annotate ALL pointer
+returns."
+
+**Migration history (2026-05-13):** B++ briefly accepted both
+`fn(): ret {` and `fn() -> ret {` for function definitions
+between the V3 ship (2026-05-05) and the cleanup (2026-05-13).
+The `:` form was a wart — same glyph for "var has type" and
+"function returns" obscured the distinction. With only 1
+production consumer (path_asset, added the same week), the
+unification cost was 1 line of source + 1 line of test +
+3 docs sites. Future programmers see one canonical form.
+
 ## Rule 14: Increment and compound assignment operators
 
 `++`, `--`, `+=`, `-=`, `*=`, `/=`, `%=` are now first-class syntax.
@@ -1981,3 +2048,79 @@ loop, stop — use the legacy ECS or register an archetype.
 The two paths coexist forever. `ecs_query_each` walks both
 transparently. Migration between them is per-game, optional, never
 forced.
+
+## Rule 31: Asset infra — games consume Bang 9 / Modulab formats
+
+The B++ stack ships an **authoring surface** (Bang 9 IDE,
+Modulab sprite editor, level_editor) and a **runtime surface**
+(the game binary). A new game that authors its own asset
+editor splits the investment two ways: every WC1-only sprite
+editor is hours not spent making the existing tools better,
+AND it doubles the surface area of "tool that knows about
+this asset shape."
+
+**The rule: new games consume the formats Bang 9 / Modulab
+already author, unless they can name a specific bug class
+those formats cause.**
+
+### Canonical asset → tool → format → loader
+
+| Asset kind | Authoring tool | Format | Game loader |
+|---|---|---|---|
+| Levels (tile grids) | Bang 9 Levels tab + `level_editor` | JSON: `{width, height, tiles[][], spawns?, resources?}` | `bpp_json` (auto-injected) + `tile_set` per cell |
+| Sprites + animations | Modulab + Bang 9 Sprite tab | Atlas pack: `*.atlas.json` (single PNG + named-id index) | `image_load("...atlas.json")` + `image_named_id` + `image_draw_size` |
+| Audio (one-shots) | external editor / war1tool | `.wav` | `sound_load_wav` |
+| Music (BGM) | external sequencer / war1tool | `.mid` (Format 0/1, no SMPTE) | `midi_play_file` |
+| Hot-reload signal | filesystem mtime | n/a | `file_watch_register` (level edits + atlas re-saves both ride this) |
+
+### When new code touches assets
+
+| Pattern | Action |
+|---|---|
+| New game wants a level format | Use level_editor JSON. Need new fields (spawn points, resource deposits, victory triggers)? **Extend the schema, don't fork.** |
+| New game wants sprite tiles | Use Modulab atlas-pack. Author in Modulab; consume via `image_load`. Don't write a per-game PNG-slicing helper. |
+| Asset arrives in a foreign syntax (Lua-ish, INI, XML) | Write a one-shot offline converter under `tools/<game>_<asset>_convert/` that emits the canonical Bang 9 format. The **game NEVER reads the foreign format at runtime.** |
+| Hot-reload during dev | `file_watch_register` from day 1. Pathfind ↔ level_editor is the proven rail; the same code shape works for any new game. |
+
+### Why
+
+Tools investment compounds. Every game that opts into Bang 9
++ Modulab pays for the next game's bug fixes in those tools.
+Every game that forks pays maintenance on its own editor
+forever, AND the IDE tabs the team lives in (Bang 9) stays
+ignorant of that game's asset shape — no in-context preview,
+no round-trip edits, no shared hot-reload.
+
+The killer use case for the convention exists today: pathfind
+authors `level1.json` in Bang 9's Levels tab; the running game
+picks up edits in ~30ms via `file_watch_register`. The WC1 mod
+arc (Session 2 onwards) opens its `forest1.json` in the SAME
+tab with the SAME shape; the SAME hot-reload path works
+without one new line in level_editor. **Two consumers, one
+authoring surface — the asset toolchain pays for itself
+twice.**
+
+### When to fork (Rule 28 escape hatch)
+
+If a new game's asset shape is structurally different and
+Bang 9's UI cannot represent it cleanly (a 3D voxel game where
+the level_editor's 2D-tile abstraction doesn't apply, an
+audio-only game with no visual asset surface, etc.), the right
+answer is **a new tab in Bang 9** — not a parallel external
+editor. Discuss before forking; restraint-bias per Rule 28.
+
+### Cross-references
+
+- `how_to_dev_b++.md` Cap 16 — "Asset infra" sub-section,
+  one-paragraph version of this rule with the same tool/format
+  pointers.
+- Modulab atlas-pack reference: `tools/modulab/` (authoring),
+  `pathfind.atlas.json` (canonical consumer example),
+  `stb/stbimage.bsm` `image_load` / `image_hot_reload_enable`.
+- level_editor JSON reference: `bang9/` Levels tab (authoring),
+  `games/pathfind/assets/levels/level1.json` (canonical
+  consumer example), `bpp_json` (loader).
+- Per-project meta entries (asset choices specific to one
+  game): drop a memory entry like
+  `project_<game>_bang9_editable_meta.md` so future sessions
+  inherit the format choice without re-deciding.

@@ -507,13 +507,33 @@ void print_greeting() {
 // With typed parameters:
 physics_tick(world, dt: float) { ... }
 
+// With explicit return type — `->` glyph (NOT `:`):
+path_asset(relpath: ptr) -> ptr { ... }
+sin_f(x: float) -> float { ... }
+
 // With effect annotation (see §5.4):
-pure_hash(s)@base { ... }
+pure_hash(s)@safe { ... }
 ```
 
 Functions return a word by default. The `void` keyword makes the
 return type explicit as "no value" — typically used for
 side-effect functions.
+
+**Two glyphs, two concepts.** B++ keeps `:` and `->` cleanly
+separated:
+
+- `:` annotates "X has type T" — variables, parameters, struct
+  fields. Reads as a property of X.
+- `->` annotates "function returns T" — function definitions and
+  function-pointer types (`func(args) -> ret`). Reads as the
+  output side of a function arrow.
+
+Mixing them is a parser error. The convention matches Rust /
+Python / Swift / C++11+ trailing-return / TypeScript / Kotlin
+arrow-return — every modern systems language uses `->` for
+returns and `:` for storage annotations. Tonify Rule 13 covers
+when to reach for the explicit return type (smart-dispatch
+consumers; deferred-precision floats; pointer chains).
 
 **Implicit return:** a function body that falls through the end
 without `return` yields 0 for non-void functions. Cap 48 documents
@@ -536,7 +556,8 @@ A() {
 that has an annotation must repeat the annotation:
 
 ```c
-stub compute(x)@base;   // stub must carry the effect signature
+stub compute(x)@safe;            // stub carries the effect signature
+stub path_asset(relpath: ptr) -> ptr;   // stub carries the return type
 ```
 
 ### §5.3 — Visibility
@@ -1672,6 +1693,39 @@ Rule of thumb the project uses:
 When a `load`ed module defines a struct that the loading file
 needs, **the `load` statement must appear at the top of the
 file**, after `import`s but before any consumer site.
+
+### Asset infra — games consume Bang 9 / Modulab formats
+
+A game that ships its own asset editor splits the IDE
+investment two ways: every game-specific sprite editor is
+hours not spent improving the existing tools, AND it doubles
+the surface area of "tool that knows about this asset shape."
+The convention: **new games consume the formats Bang 9 /
+Modulab already author**.
+
+| Asset kind | Authoring tool | Format | Game loader |
+|---|---|---|---|
+| Levels | Bang 9 Levels tab | JSON via `bpp_json` (same shape pathfind's `level1.json` uses) | `bpp_json` + `tile_set` per cell |
+| Sprites | Modulab + Bang 9 Sprite tab | Atlas pack `*.atlas.json` (single PNG + named-id index) | `image_load` + `image_named_id` + `image_draw_size` |
+| Audio (one-shots) | external editor | `.wav` | `sound_load_wav` |
+| Music (BGM) | external sequencer | `.mid` (Format 0/1) | `midi_play_file` |
+
+Hot-reload is `file_watch_register` from day 1 — Bang 9
+saves, the running game's `image_hot_reload_tick_throttled` /
+`file_watch_tick` picks up the change in ~30ms. Pathfind ↔
+level_editor is the proven rail; new games ride the same
+rail.
+
+If an asset arrives in a foreign syntax (Lua-ish SMS, custom
+XML, INI) — common when a third-party tool emitted the
+converted assets — write a one-shot **offline converter**
+under `tools/<game>_<asset>_convert/` that emits the canonical
+Bang 9 format. The game NEVER reads the foreign format at
+runtime.
+
+Full rule (with tool/format/loader table, killer-use-case
+justification, and the "when to fork" escape hatch): see
+`docs/tonify_checklist.md` Rule 31.
 
 ---
 

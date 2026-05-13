@@ -807,18 +807,20 @@ becomes the seed for the dedicated session decomposition.
     consumes it; cartridge restored to C-emit-clean. See
     `tests/bench_ecs_physics_simd.bpp` for the canonical pattern
     consumers should follow until this sidequest opens.
-- **Return-type annotations propagating to assignment-site
-  inference** — local variables annotated `: ptr` that receive the
-  result of a TY_WORD-returning function (e.g. `malloc`, `str_dup`,
-  `json_string`) trigger E053 today because the compiler enforces
-  the annotation strictly. Two-part fix when a real consumer hits
-  this often enough: (a) annotate built-in / canonical helpers with
-  TY_PTR return type via `set_func_type` (similar to how `buf_word`
-  and `arr_new` are tagged today); (b) for user-defined helpers,
-  honour an optional `-> ptr` return-type clause in the function
-  declaration. Surfaced 2026-05-12 during the stb-wide `: ptr` /
-  W032 sweep. Workaround for now: keep the local untyped and call
-  `putstr_err` at the use site to make string-intent explicit.
+- **Return-type annotations** — RESOLVED 2026-05-13. End-to-end
+  flow (parser → V3 inference via `fn_ret_hint` → validate +
+  codegen) was always shipped, only the surface syntax had a
+  wart: the original `fn(args): ret {` form used `:` for both
+  "var has type" (storage) and "function returns" (output). The
+  2026-05-13 cleanup migrated to `fn(args) -> ret {` (single
+  parser change + 1 production consumer + 1 test). The two
+  glyphs are now cleanly split: `:` = "X has type T" (storage),
+  `->` = "function returns T" (output). Same convention as Rust
+  / Python / Swift / C++11+ / TypeScript. First consumer:
+  `path_asset(relpath: ptr) -> ptr`. Sweep is opt-in per call-
+  site (Rule 13 + Rule 20). See Tonify Rule 13's "Return-type
+  annotation" section for the canonical pattern + how_to_dev
+  Cap 5.1 for the two-glyph convention.
 - **W032 cleanup sweep across remaining tests** — ~57 sites still
   emit W032 because of intentional integer `put(x)` calls in test
   diagnostics (e.g. `put("count="); put(n);`). Each site swaps to
