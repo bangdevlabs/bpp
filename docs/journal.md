@@ -9316,3 +9316,117 @@ Next: Session 3 SIMD batching. The perf gate for SIMD-vs-scalar is
 expected to land regardless of storage mode (legacy parallel arrays
 or archetype chunks are both SIMD-natural). The session will
 measure it cleanly without inheriting Session 2's framing baggage.
+
+## 2026-05-13 — WC1 mod Session 2 CLOSED — hot-reload working end-to-end
+
+WC1 mod Session 2 shipped today. The end-to-end loop is alive:
+open Bang 9 → File → Open folder `games/rts1/` → Levels tab
+auto-discovers `assets/levels/forest1.json` → paint a stone tile
+on the canvas → Cmd+S → the running `rts.bpp` instance in another
+process reflects the new tile in ~30 ms via `file_watch_register`.
+
+Same project milestone shape as the fxlab arc (2026-05-10): first
+time the WC1 mod's content loop actually closes — author edits in
+Bang 9, game responds. Validates the entire meta-goal commit from
+2026-05-12 ("WC1 mod assets are authored in Bang 9's existing
+tabs, not in a parallel WC1-only editor").
+
+### What Session 2 actually delivered
+
+Originally scoped as "SMS → JSON converter + native map loader,"
+the arc grew mid-session to include Level Editor tileset mode +
+the bang9 auto-load + a canonical asset format spec, because the
+converter alone wasn't enough to satisfy the meta-goal. The
+meta-goal says Bang 9 must *open and edit* the converted file —
+which forced Level Editor to grow a tileset-mode renderer (the
+forest tileset has 320 tiles; MCU-8 was never going to express
+that vocabulary) and forced Bang 9's `_panel_levels` to discover
+the file automatically (you can't claim hot-reload "just works"
+if the user has to load the file manually every restart).
+
+Concretely shipped:
+- `tools/wc1_map_convert/wc1_map_convert.bpp` — offline SMS→JSON
+  converter. Trivial token scanner finds `SetTile(id, gx, gy, _)`
+  in the war1tool-emitted SMS file and emits a level_editor-format
+  JSON with `tileset` field pointing at the forest terrain PNG.
+- `tools/level_editor/level_editor_lib.bsm` — tileset mode as a
+  parallel rendering path to the existing MCU-8 palette mode. Same
+  editor, two flavours chosen at load time by which top-level
+  field the JSON carries (`"palette"` vs `"tileset"`).
+- `games/rts1/wc1_map.bsm` + `games/rts1/rts.bpp` — game-side loader
+  for the converted JSON, plus `file_watch_register` for the
+  ~30 ms hot-reload.
+- `docs/asset_formats.md` — canonical spec for level JSON (both
+  modes), atlas pack JSON, and audio formats. The "what shape does
+  a level have" reference. Cross-linked from Tonify Rule 31 (asset
+  infra) and how_to_dev Cap 16.
+- `games/rts1/assets/levels/forest1.json` — first converted map
+  (~512 lines, 64×64 cells).
+
+### The architectural pivot that mattered (and the trap that took two attempts)
+
+Initial implementation of tileset mode in Level Editor used
+`tile_load_set` (GPU textures) + `_stb_gpu_sprite` for the canvas
++ picker. Worked standalone. Hard-crashed bang9 the moment the
+Levels tab opened a tileset-mode file. The crash stack pointed at
+`_stb_present` → `CGBitmapContextCreate`, not the tile path.
+
+Root cause: `tile_load_set` triggers `render_init`, which removes
+the NSImageView from the window and replaces it with a CAMetalLayer.
+Every subsequent frame in bang9 calls `draw_end → _stb_present`,
+which writes to the NSImageView that no longer exists. Same trap
+the fxlab Sessão 2 closure (2026-05-09) caught: *tools that host
+CPU-side `_stb_present` cannot call `render_init`.* It was already
+in `feedback_cartridge_minimalism.md` (Rule 23) and in the fxlab
+arc memory. The first fix attempt swallowed the GPU/NSImageView
+mismatch by adding the `render_init` call — which silenced one
+crash (`tile_load_set` at PC=0) by introducing another.
+
+Right fix: remove the GPU path from Level Editor entirely. The
+editor reads the tileset PNG once via `pixels_load` (CPU RGBA
+buffer), and the new `_blit_tile_cpu` helper samples from that
+buffer and writes pixels via `put_px` directly into `_stb_fb`
+with nearest-neighbor scale. Both call sites (canvas grid + tile
+picker) switched in one pass. Zero GPU dependencies remain in
+the Level Editor — it now plays clean inside Bang 9, the
+standalone host, or any future CPU-only host.
+
+The "look at how pathfind does it" reflex the user invoked turned
+out to be the right move twice over: pathfind has always been
+palette mode (no GPU dep), which is why it never tripped this trap.
+The lesson generalises beyond the editor — every tool that lives
+as a Bang 9 panel must stay GPU-free until Bang 9 itself moves to
+a GPU renderer (and at that point all of them migrate together).
+
+### The auto-load convention sidequest
+
+Pathfind and fps work cleanly in Bang 9's Levels tab because their
+levels live at `<project>/assets/levels/level1.json` — the path
+`_panel_levels` searches. The original Session 2 layout put
+`forest1.json` at `assets/converted/maps/forest1.json` (mirroring
+the war1tool output directory). Bang 9 found nothing there,
+silently fell back to "blank canvas," and the user had to
+manually load the file every restart.
+
+Fix: moved `forest1.json` to the canonical `assets/levels/`
+location; the `assets/converted/maps/` directory keeps the source
+SMS / SMP files for re-conversion. `rts.bpp` updated to read the
+new path. One-liner convention enforcement — the kind of small
+infrastructure that pays off the moment a third game lands.
+
+### Pattern this closure validates
+
+"Editor inside Bang 9 + game in another process + JSON in
+`assets/levels/` + `file_watch_register` on both sides" is now
+the canonical content loop for every B++ game that ships levels.
+Pathfind proved the rail; fxlab proved the trap; WC1 is the third
+consumer (Rule 20 graduation territory). Any future game with
+tilemap-edit needs lands on the same wiring without rebuilding
+the substrate.
+
+Session 3 (units + ECS spawn) starts from a known-good content
+loop. The sprite tab + atlas-pack flow ports the same pattern
+to graphics; the difference will be that sprite atlas-pack
+authoring is Modulab's job (already shipping), not Level
+Editor's.
+

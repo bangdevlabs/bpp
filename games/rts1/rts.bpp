@@ -1,79 +1,84 @@
-// rts.bpp — Warcraft 1 in B++ (mod plan, Session 1).
+// rts.bpp — Warcraft 1 in B++ (mod plan, Session 2).
 //
-// Session 1 ship: open a window, load the converted forest tileset
-// PNG (assets/converted/graphics/tilesets/forest/terrain.png — 256×320,
-// sliced into 320 tiles of 16×16 pixels), bind it to a stbtile grid,
-// paint a hand-authored "Warcraft forest patch" pattern, render the
-// result. ESC quits. No units, no input beyond ESC.
-//
-// Verifies the tile + render pipeline end-to-end on the real WC1
-// asset bundle without depending on Session 2's map-format work.
-// When the screen comes up looking like a WC1 forest, Session 1 is
-// green; the rest of the arc is composition on top.
+// Session 2 ship: load the real forest1 map from the war1tool-
+// derived JSON (converted offline by tools/wc1_map_convert from
+// the original SMS file) and render it. ESC quits.
 //
 // Build the binary alongside the assets/ directory (the canonical
 // layout other B++ games use — pathfind ships `path`/`path2`,
 // rhythm ships `rtm`):
 //
-//   ./bpp games/rts_1.0/rts.bpp -o games/rts_1.0/rts
-//   cd games/rts_1.0 && ./rts        # or just `games/rts_1.0/rts`
+//   ./bpp games/rts1/rts.bpp -o games/rts1/rts
+//   cd games/rts1 && ./rts        # or just `games/rts1/rts`
 //
 // Asset paths are resolved through `path_asset()` (bpp_path.bsm),
 // which walks up to 4 parent levels from the binary's own location
 // to find the `assets/` directory — so the same binary works from
 // any CWD.
+//
+// Hot-reload: the forest1.json file is registered with
+// `file_watch_register`, so any save of that JSON from Bang 9's
+// Levels tab (or a manual edit + save) re-loads the tile grid
+// into the running game within ~30 ms. Meta goal anchor —
+// docs/tonify_checklist.md Rule 31.
 
 import "stbgame.bsm";
 import "stbrender.bsm";
 import "stbtile.bsm";
+import "stbimage.bsm";       // for file_watch_register / file_watch_tick
 load   "wc1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
 
 // ── Constants ────────────────────────────────────────────
 
 // Virtual screen: 20 × 15 tiles at 16 px each = 320 × 240. Same
 // chunky-pixel-art shape as the original WC1 viewport (320 × 200
-// + a bit of HUD allowance). The actual window is auto-scaled to
-// fit ~80% of the monitor by stbgame's Phase 4.1.3 logic.
+// + a bit of HUD allowance). forest1 is 64×64 tiles total; with
+// no camera yet (Session 4 work), only the top-left 20×15 region
+// is visible. The actual window is auto-scaled to fit ~80% of
+// the monitor by stbgame's Phase 4.1.3 logic.
 const SCREEN_W = 320;
 const SCREEN_H = 240;
-const GRID_W   = 20;          // SCREEN_W / WC1_TILE_PX
-const GRID_H   = 15;          // SCREEN_H / WC1_TILE_PX
-
-// Asset path is resolved through `path_asset()` (bpp_path.bsm) at
-// the call site, so the path here is RELATIVE to the game's own
-// `assets/` directory — exactly what every other game in
-// `games/*` does. No `games/rts_1.0/` prefix; the resolver walks
-// up to find the right ancestor.
 
 // ── Game state ───────────────────────────────────────────
 
 // Allocated once in main, never reassigned — Tonify Rule 1.
 extrn map;
 
+// Path used by both the initial load and the hot-reload callback.
+// Kept in a global so the callback (which receives no arguments,
+// per file_watch_register's contract) can find it.
+extrn _map_json_path;
+
+// Hot-reload callback. Fires from file_watch_tick when forest1.json
+// changes on disk. Re-loads the JSON into the existing map handle
+// (preserving the bound GPU tileset). On failure the existing
+// tiles stay untouched so the game keeps something walkable on
+// screen.
+void _reload_map() {
+    if (wc1_map_reload_from(map, _map_json_path) != 0) {
+        put_err("rts: forest1.json reload failed — keeping previous tiles\n");
+    }
+}
+
 // ── Entry point ──────────────────────────────────────────
 
 main() {
     auto tileset, tile_count, tm;
-    auto tileset_path: ptr;       // path_asset returns `: ptr` — see Rule 13 return-type form
+    auto tileset_path: ptr;
 
     // Open the window + initialise input/draw/font/etc. via the
     // standard stbgame floor (Rule 23 — stbgame ships the floor
-    // only; the wc1 arc opts in to stbrender + stbtile explicitly).
+    // only; the wc1 arc opts in to stbrender + stbtile + stbimage
+    // explicitly).
     game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
     render_init();
 
     // Resolve the forest tileset PNG against the binary's own
     // location — works from any CWD as long as the binary lives
-    // somewhere inside the games/rts_1.0/ tree (canonical layout
-    // for B++ games; same convention as pathfind/rhythm/snake).
+    // somewhere inside the games/rts1/ tree (canonical layout for
+    // B++ games; same convention as pathfind/rhythm/snake).
     tileset_path = path_asset("assets/converted/graphics/tilesets/forest/terrain.png");
 
-    // Slice the forest tileset PNG into 320 individual GPU
-    // textures, indexed 1..320 in row-major order. Tile IDs
-    // returned here line up with the war1tool-emitted SetTile()
-    // calls in the original .sms maps, so when Session 2 lands
-    // its SMS-derived map files the same IDs work without any
-    // remap table.
     tileset = 0;
     tile_count = tile_load_set(tileset_path, WC1_TILE_PX, WC1_TILE_PX, &tileset);
     if (tile_count == 0) {
@@ -85,13 +90,28 @@ main() {
     }
     free(tileset_path);
 
-    // Build a fresh map and paint the Session 1 smoke pattern —
-    // grass everywhere, a tree cluster upper-left, a dirt clearing
-    // centre, a dark band along the bottom. Lives in wc1_map.bsm.
-    map = wc1_map_new(GRID_W, GRID_H);
+    // Load the converted forest1 map (64×64). The JSON shape
+    // matches pathfind's level1.json — Bang 9's Levels tab can
+    // open and edit the same file.
+    // Canonical location: every B++ game ships level JSONs under
+    // `assets/levels/`. Bang 9's Levels tab auto-discovers that
+    // directory when the project folder is opened — moving the
+    // map here gives rts1 the same one-click load pathfind / fps
+    // already enjoy.
+    _map_json_path = path_asset("assets/levels/forest1.json");
+    map = wc1_map_load(_map_json_path);
+    if (map == 0) {
+        put_err("rts: forest1.json load failed — exiting\n");
+        free(_map_json_path);
+        return 1;
+    }
     tm = wc1_map_tm(map);
     tile_bind_set(tm, tileset, tile_count);
-    wc1_map_paint_smoke(map);
+
+    // Hot-reload: re-runs _reload_map whenever forest1.json
+    // changes on disk. Same rail pathfind uses for level1.json
+    // edits in Bang 9.
+    file_watch_register(_map_json_path, fn_ptr(_reload_map));
 
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
@@ -99,6 +119,7 @@ main() {
     // pass; tile_draw culls to the screen-visible region.
     while (game_should_quit() == 0) {
         game_frame_begin();
+        file_watch_tick();        // pick up forest1.json edits
         if (key_pressed(KEY_ESC)) { break; }
 
         game_render_begin();
@@ -108,5 +129,6 @@ main() {
     }
 
     wc1_map_free(map);
+    free(_map_json_path);
     return 0;
 }

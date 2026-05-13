@@ -29,6 +29,19 @@
 //
 // See docs/bang9_tool_embed.md for the embed contract.
 
+// stbimage is needed by tileset-mode levels (level files that
+// declare a "tileset" PNG instead of the MCU-8 palette). The
+// editor reads the PNG into a CPU RGBA buffer and blits tiles
+// directly to the software framebuffer — NEVER through the GPU
+// pipeline (render_init / _stb_gpu_create_texture). Reason:
+// hosts like Bang 9 use stbwindow's manual loop with CPU
+// _stb_present writing to an NSImageView; calling render_init
+// replaces the NSImageView with a CAMetalLayer, breaking every
+// subsequent draw_end. Keeping the editor 100% CPU-side means
+// the same lib renders cleanly standalone, embedded in Bang 9,
+// or inside any future CPU-only host.
+import "stbimage.bsm";
+
 // ── Globals ──────────────────────────────────────────────
 
 // Panel rect captured at the top of every level_editor_lib_frame
@@ -51,6 +64,36 @@ static extrn _le_ox, _le_oy, _le_pw, _le_ph;
 static extrn _lvl_w;               // level width in tiles
 static extrn _lvl_h;               // level height in tiles
 static extrn _lvl_cell;            // pixel size of a single tile
+
+// Level format flavours. The current file is in ONE of these modes
+// determined at load time by which top-level JSON field it carries:
+//
+//   "palette": "MCU-8"       → _LE_FMT_PALETTE, _lvl_tiles is the
+//                              authoritative grid (byte indices 0..7,
+//                              rendered as MCU-8 colour swatches)
+//   "tileset": "path.png"    → _LE_FMT_TILESET, _lvl_words is the
+//                              authoritative grid (1-based row-major
+//                              tile indices into the bound tileset
+//                              PNG, rendered with the actual tile
+//                              textures)
+//
+// Both modes share `width`, `height`, `entities`, `version`. New
+// games declare their mode explicitly via the JSON field they
+// emit; legacy files without either field default to palette
+// (zero-breaking-change for pathfind / fps). See
+// docs/asset_formats.md for the full spec.
+const _LE_FMT_PALETTE = 0;
+const _LE_FMT_TILESET = 1;
+
+static extrn _lvl_fmt;             // _LE_FMT_PALETTE or _LE_FMT_TILESET
+static extrn _lvl_tileset;         // RGBA pixel buffer from pixels_load (0 when no tileset)
+static extrn _lvl_tileset_cols;    // number of tile columns in the source PNG
+static extrn _lvl_tileset_count;   // total tiles available (cols * rows)
+static extrn _lvl_tileset_path;    // heap-owned C-string, saved back to JSON on _save
+static extrn _lvl_tileset_tw, _lvl_tileset_th;  // source tile dimensions in the PNG
+static extrn _lvl_tileset_img_w;   // full PNG width in pixels (for row stride)
+static extrn _lvl_words;           // buf_word(w*h) — tileset-mode grid (parallel to _lvl_tiles)
+static extrn _lvl_pick_scroll;     // tileset picker scroll offset in tiles
 
 static extrn _lvl_tiles;           // Layer* — palette-indexed byte grid
                                     // exposed by stbdraw. Level editor
@@ -271,6 +314,22 @@ static void _state_init(w, h, cell) {
     _lvl_entities      = malloc(_LE_MAX_ENTITIES * sizeof(LvlEntity));
     _lvl_entity_count  = 0;
     _init_kinds();
+
+    // Tileset-mode state. Starts empty — palette mode is the
+    // default until a tileset-bearing JSON gets loaded. Allocating
+    // the word grid here keeps _paint_cell / _flood_fill simple
+    // (always a valid destination buffer regardless of mode).
+    _lvl_fmt           = _LE_FMT_PALETTE;
+    _lvl_tileset       = 0;
+    _lvl_tileset_cols  = 0;
+    _lvl_tileset_count = 0;
+    _lvl_tileset_path  = 0;
+    _lvl_tileset_tw    = 16;
+    _lvl_tileset_th    = 16;
+    _lvl_tileset_img_w = 0;
+    _lvl_words         = buf_word(total);
+    buf_fill(_lvl_words, 0, total * 8);
+    _lvl_pick_scroll   = 0;
 }
 
 // Resize the editor's grid to new dimensions. Called from _load
@@ -302,6 +361,12 @@ static void _resize_grid(w, h, cell) {
     _lvl_undo_len    = 0;
     _lvl_undo_cursor = 0;
     _lvl_dirty       = 0;
+
+    // Resize the tileset-mode word grid alongside the byte grid so
+    // both stay valid regardless of which mode the next load picks.
+    if (_lvl_words != 0) { free(_lvl_words); }
+    _lvl_words = buf_word(total);
+    buf_fill(_lvl_words, 0, total * 8);
 }
 
 static void _state_free() {
@@ -317,6 +382,11 @@ static void _state_free() {
         _lvl_entities = 0;
     }
     if (_lvl_kinds != 0) { free(_lvl_kinds); _lvl_kinds = 0; }
+    if (_lvl_words != 0) { free(_lvl_words); _lvl_words = 0; }
+    if (_lvl_tileset_path != 0) { free(_lvl_tileset_path); _lvl_tileset_path = 0; }
+    // CPU pixel buffer — released cleanly because pixels_load
+    // returns a plain malloc'd RGBA buffer (no GPU resources).
+    if (_lvl_tileset != 0) { free(_lvl_tileset); _lvl_tileset = 0; }
 }
 
 // ── Undo ─────────────────────────────────────────────────
@@ -383,15 +453,58 @@ static void _paint_cell(cx, cy, idx) {
     // the dirty flag only when a real change happened, so we peek
     // first.
     if (cx < 0 || cy < 0 || cx >= _lvl_w || cy >= _lvl_h) { return; }
+    if (_lvl_fmt == _LE_FMT_TILESET) {
+        auto cur, off;
+        off = cy * _lvl_w + cx;
+        cur = _lvl_words[off];
+        if (cur == idx) { return; }
+        _lvl_words[off] = idx;
+        _lvl_dirty = 1;
+        return;
+    }
     if (layer_get(_lvl_tiles, cx, cy) == idx) { return; }
     layer_set(_lvl_tiles, cx, cy, idx);
     _lvl_dirty = 1;
 }
 
-// 4-connected flood fill — delegates to the shared layer_fill in
-// stbdraw, which uses the same BFS pattern level_editor carried
-// locally before the extraction.
+// 4-connected flood fill — palette mode delegates to the shared
+// layer_fill in stbdraw; tileset mode runs a small explicit BFS
+// over the word grid (layer_fill is byte-only).
 static void _flood_fill(cx, cy, idx) {
+    if (_lvl_fmt == _LE_FMT_TILESET) {
+        auto target, queue, qh, qt, cap, off, nx, ny;
+        if (cx < 0 || cy < 0 || cx >= _lvl_w || cy >= _lvl_h) { return; }
+        target = _lvl_words[cy * _lvl_w + cx];
+        if (target == idx) { return; }
+        cap   = _lvl_w * _lvl_h;
+        queue = buf_word(cap * 2);
+        qh = 0; qt = 0;
+        queue[qt * 2 + 0] = cx;
+        queue[qt * 2 + 1] = cy;
+        qt++;
+        _lvl_words[cy * _lvl_w + cx] = idx;
+        while (qh < qt) {
+            auto x, y;
+            x = queue[qh * 2 + 0];
+            y = queue[qh * 2 + 1];
+            qh++;
+            for (off = 0; off < 4; off++) {
+                if      (off == 0) { nx = x + 1; ny = y; }
+                else if (off == 1) { nx = x - 1; ny = y; }
+                else if (off == 2) { nx = x;     ny = y + 1; }
+                else               { nx = x;     ny = y - 1; }
+                if (nx < 0 || ny < 0 || nx >= _lvl_w || ny >= _lvl_h) { continue; }
+                if (_lvl_words[ny * _lvl_w + nx] != target) { continue; }
+                _lvl_words[ny * _lvl_w + nx] = idx;
+                queue[qt * 2 + 0] = nx;
+                queue[qt * 2 + 1] = ny;
+                qt++;
+            }
+        }
+        free(queue);
+        _lvl_dirty = 1;
+        return;
+    }
     layer_fill(_lvl_tiles, cx, cy, idx);
     _lvl_dirty = 1;
 }
@@ -413,12 +526,26 @@ static _save(path) {
     sb = json_write_int_field(sb, "version", 2);
     sb = json_write_int_field(sb, "width",  _lvl_w);
     sb = json_write_int_field(sb, "height", _lvl_h);
-    sb = json_write_string_field(sb, "palette", "MCU-8");
+    // Mode-aware envelope. Palette mode emits the legacy "palette"
+    // field; tileset mode emits "tileset" + dimensions. Per the
+    // spec at docs/asset_formats.md, never both.
+    if (_lvl_fmt == _LE_FMT_TILESET) {
+        sb = json_write_string_field(sb, "tileset",
+                                      _lvl_tileset_path != 0 ? _lvl_tileset_path : "");
+        sb = json_write_int_field(sb, "tileset_tw", _lvl_tileset_tw);
+        sb = json_write_int_field(sb, "tileset_th", _lvl_tileset_th);
+    } else {
+        sb = json_write_string_field(sb, "palette", "MCU-8");
+    }
     sb = json_write_array_field_begin(sb, "tiles");
     for (y = 0; y < _lvl_h; y++) {
         sb = json_write_array_begin(sb);
         for (x = 0; x < _lvl_w; x++) {
-            idx = layer_get(_lvl_tiles, x, y);
+            if (_lvl_fmt == _LE_FMT_TILESET) {
+                idx = _lvl_words[y * _lvl_w + x];
+            } else {
+                idx = layer_get(_lvl_tiles, x, y);
+            }
             sb = json_write_int(sb, idx);
         }
         sb = json_write_array_end(sb);
@@ -447,6 +574,60 @@ static _save(path) {
         return -1;
     }
     return 0;
+}
+
+// Resolve a project-asset-relative path (e.g.
+// "assets/converted/graphics/tilesets/forest/terrain.png") against
+// the directory the level JSON itself lives in. We split the JSON
+// path at "/assets/" to find the project root — every B++ game
+// keeps its assets under `<project>/assets/...`, so the prefix
+// before `/assets/` IS the project root by convention.
+//
+// Same shape pathfind / fps use implicitly: their game binary
+// runs from `<project>/` so relative `assets/...` paths resolve.
+// The editor doesn't have that cwd luxury (it runs from Bang 9 /
+// the tool's own dir), so we reconstruct project-root from the
+// loaded JSON's location instead.
+//
+// Returns a freshly-malloc'd absolute path; caller frees.
+// Returns 0 on failure (no "/assets/" in the JSON path).
+static _resolve_relative_to_project(json_path, rel_path) {
+    auto jlen, i, ai, found, prefix_len, total, out;
+    jlen = str_len(json_path);
+    // Walk for the FIRST occurrence of "/assets/" in the JSON
+    // path. Earlier matches in deeper layouts still hit the
+    // outermost project boundary, which is what we want.
+    found = 0 - 1;
+    for (i = 0; i + 8 <= jlen; i++) {
+        if (peek(json_path + i) == '/'
+            && peek(json_path + i + 1) == 'a'
+            && peek(json_path + i + 2) == 's'
+            && peek(json_path + i + 3) == 's'
+            && peek(json_path + i + 4) == 'e'
+            && peek(json_path + i + 5) == 't'
+            && peek(json_path + i + 6) == 's'
+            && peek(json_path + i + 7) == '/') {
+            found = i;
+            break;
+        }
+    }
+    if (found < 0) { return 0; }
+
+    // Project root = json_path[0..found+1] (keep the trailing '/'
+    // so concat with rel_path produces a valid path).
+    prefix_len = found + 1;
+    auto rel_len;
+    rel_len = str_len(rel_path);
+    total = prefix_len + rel_len;
+    out = malloc(total + 1);
+    for (i = 0; i < prefix_len; i++) {
+        poke(out + i, peek(json_path + i));
+    }
+    for (i = 0; i < rel_len; i++) {
+        poke(out + prefix_len + i, peek(rel_path + i));
+    }
+    poke(out + total, 0);
+    return out;
 }
 
 static _load(path) {
@@ -519,6 +700,88 @@ static _load(path) {
     if (w != _lvl_w || h != _lvl_h) {
         _resize_grid(w, h, _lvl_cell);
     }
+
+    // Mode detection: a "tileset" field switches the editor into
+    // tileset mode and triggers a CPU pixels_load on the referenced
+    // PNG. Missing "tileset" → palette mode (legacy behaviour,
+    // zero-breaking-change for pathfind / fps). See
+    // docs/asset_formats.md for the schema.
+    auto ts_idx, ts_path_raw, ts_path_local, ts_resolved;
+    auto tw_idx, th_idx, ts_tw, ts_th;
+    ts_idx = json_object_get(doc, root, "tileset");
+    if (ts_idx >= 0) {
+        ts_path_raw = json_string(doc, ts_idx);
+        if (ts_path_raw == 0) {
+            putstr_err("level: tileset field present but empty\n");
+            json_free(doc);
+            return -1;
+        }
+        // json_string returns a pointer into the parsed buffer that
+        // lives only as long as `doc`. Copy it to heap so the save
+        // path (and the post-json_free render path) keep working.
+        // Locals stay untyped (TY_WORD) because json_string /
+        // str_dup don't carry `-> ptr` annotations yet — the
+        // explicit putstr_err below acknowledges the pointer intent
+        // without needing the slot annotation.
+        ts_path_local = str_dup(ts_path_raw);
+        tw_idx = json_object_get(doc, root, "tileset_tw");
+        th_idx = json_object_get(doc, root, "tileset_th");
+        ts_tw = tw_idx >= 0 ? json_int(doc, tw_idx) : 16;
+        ts_th = th_idx >= 0 ? json_int(doc, th_idx) : 16;
+        // Resolve the tileset path RELATIVE TO THE JSON FILE'S
+        // PROJECT ROOT (the dir containing the `assets/` subtree
+        // the JSON itself lives in). path_asset (binary-relative)
+        // doesn't work for the editor because the editor's binary
+        // sits in `bang9/` or `tools/level_editor/`, far from the
+        // game's `assets/` directory. The JSON's own path is the
+        // anchor that knows where the project root lives — see
+        // _resolve_relative_to_project above.
+        ts_resolved = _resolve_relative_to_project(path, ts_path_local);
+        if (ts_resolved == 0) {
+            // No `/assets/` in the JSON path — fall back to
+            // path_asset (binary-relative) so weird layouts at
+            // least try something. Editors loading from a non-
+            // standard location are on their own past this point.
+            ts_resolved = path_asset(ts_path_local);
+        }
+        if (_lvl_tileset_path != 0) { free(_lvl_tileset_path); }
+        _lvl_tileset_path  = ts_path_local;
+        _lvl_tileset_tw    = ts_tw;
+        _lvl_tileset_th    = ts_th;
+        // Drop any previous tileset buffer before loading the new
+        // one — pixels_load returns a fresh malloc'd RGBA buffer
+        // that we own end-to-end.
+        if (_lvl_tileset != 0) { free(_lvl_tileset); _lvl_tileset = 0; }
+        _lvl_tileset_cols  = 0;
+        _lvl_tileset_count = 0;
+        _lvl_tileset_img_w = 0;
+        auto ts_pixels, ts_img_w, ts_img_h, ts_rows;
+        ts_pixels = pixels_load(ts_resolved);
+        if (ts_pixels == 0) {
+            putstr_err("level: tileset PNG load failed: ");
+            putstr_err(ts_resolved);
+            putstr_err("\n");
+            putstr_err("  (declared as: ");
+            putstr_err(ts_path_local);
+            putstr_err(")\n");
+            // Continue anyway — cells will render as the empty-
+            // cell checker pattern below so the user sees the
+            // grid rather than a blank canvas.
+        } else {
+            ts_img_w           = pixels_w();
+            ts_img_h           = pixels_h();
+            _lvl_tileset       = ts_pixels;
+            _lvl_tileset_img_w = ts_img_w;
+            _lvl_tileset_cols  = ts_img_w / ts_tw;
+            ts_rows            = ts_img_h / ts_th;
+            _lvl_tileset_count = _lvl_tileset_cols * ts_rows;
+        }
+        free(ts_resolved);
+        _lvl_fmt = _LE_FMT_TILESET;
+    } else {
+        _lvl_fmt = _LE_FMT_PALETTE;
+    }
+
     tiles_idx = json_object_get(doc, root, "tiles");
     if (tiles_idx < 0) { json_free(doc); return -1; }
     for (y = 0; y < _lvl_h; y++) {
@@ -526,8 +789,16 @@ static _load(path) {
         for (x = 0; x < _lvl_w; x++) {
             cell = json_int(doc, json_child(doc, row, x));
             if (cell < 0) { cell = 0; }
-            if (cell > 7) { cell = 7; }
-            layer_set(_lvl_tiles, x, y, cell);
+            if (_lvl_fmt == _LE_FMT_TILESET) {
+                // Tileset mode stores the raw tile id (1-based row-
+                // major into the bound PNG; up to ~65535). No clamp.
+                _lvl_words[y * _lvl_w + x] = cell;
+            } else {
+                // Palette mode clamps to the MCU-8 index range so
+                // a corrupt file never paints garbage swatches.
+                if (cell > 7) { cell = 7; }
+                layer_set(_lvl_tiles, x, y, cell);
+            }
         }
     }
 
@@ -567,6 +838,39 @@ static _load(path) {
 
 // ── Rendering ────────────────────────────────────────────
 
+// Blit a single tile from the loaded RGBA pixel buffer into the
+// shared software framebuffer (_stb_fb) at (dst_x, dst_y), scaled
+// nearest-neighbor into a (dst_w × dst_h) rectangle.
+//
+// tile_id follows the 1-based row-major convention from
+// docs/asset_formats.md — tile 1 is the top-left tile of the PNG,
+// tile N maps to PNG cell ((N-1) % cols, (N-1) / cols). tile_id 0
+// is the "empty" sentinel and produces no draw.
+//
+// Used by both the canvas grid renderer and the tileset picker.
+static void _blit_tile_cpu(tile_id, dst_x, dst_y, dst_w, dst_h,
+                            src_tw, src_th) {
+    auto src_col, src_row, src_x0, src_y0;
+    auto dy, dx, sx, sy, off, pixel;
+    if (tile_id <= 0)                  { return; }
+    if (_lvl_tileset == 0)             { return; }
+    if (_lvl_tileset_cols <= 0)        { return; }
+    if (tile_id > _lvl_tileset_count)  { return; }
+    src_col = (tile_id - 1) % _lvl_tileset_cols;
+    src_row = (tile_id - 1) / _lvl_tileset_cols;
+    src_x0  = src_col * src_tw;
+    src_y0  = src_row * src_th;
+    for (dy = 0; dy < dst_h; dy++) {
+        sy = src_y0 + dy * src_th / dst_h;
+        for (dx = 0; dx < dst_w; dx++) {
+            sx    = src_x0 + dx * src_tw / dst_w;
+            off   = (sy * _lvl_tileset_img_w + sx) * 4;
+            pixel = read_u32(_lvl_tileset, off);
+            put_px(dst_x + dx, dst_y + dy, pixel);
+        }
+    }
+}
+
 static void _render_grid() {
     auto y, x, idx, color, px, py, side_w, side_h;
     side_w = _lvl_w * _lvl_cell;
@@ -575,9 +879,27 @@ static void _render_grid() {
               rgba(14, 16, 22, 255));
     for (y = 0; y < _lvl_h; y++) {
         for (x = 0; x < _lvl_w; x++) {
-            idx = layer_get(_lvl_tiles, x, y);
             px = _lvl_cvs_x + x * _lvl_cell;
             py = _lvl_cvs_y + y * _lvl_cell;
+            if (_lvl_fmt == _LE_FMT_TILESET) {
+                idx = _lvl_words[y * _lvl_w + x];
+                if (idx > 0 && idx <= _lvl_tileset_count
+                    && _lvl_tileset != 0) {
+                    _blit_tile_cpu(idx, px, py,
+                                    _lvl_cell, _lvl_cell,
+                                    _lvl_tileset_tw, _lvl_tileset_th);
+                    continue;
+                }
+                // Empty cell OR no tileset loaded — checker fill
+                // so the empty-vs-painted distinction stays
+                // visible.
+                color = ((x + y) & 1) != 0
+                    ? rgba(40, 40, 50, 255)
+                    : rgba(60, 60, 75, 255);
+                draw_rect(px, py, _lvl_cell, _lvl_cell, color);
+                continue;
+            }
+            idx = layer_get(_lvl_tiles, x, y);
             if (idx == 0) {
                 // Transparent cell — 2x2 checker.
                 color = ((x + y) & 1) != 0
@@ -956,14 +1278,101 @@ level_editor_lib_frame(px, py, pw, ph) {
     auto picked_kind;
     picked_kind = -1;
     if (_le_mode == _LE_MODE_TILES) {
-        clicked = gui_palette(picker_x, _lvl_cvs_y,
-                              _lvl_palette, 8, 1, 24, _lvl_sel);
-        if (clicked >= 1) { _lvl_sel = clicked; }
-        auto tool_name;
-        if      (_lvl_tool == 0) { tool_name = "PAINT"; }
-        else if (_lvl_tool == 1) { tool_name = "ERASE"; }
-        else                     { tool_name = "FILL"; }
-        draw_text(tool_name, picker_x, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
+        if (_lvl_fmt == _LE_FMT_TILESET) {
+            // Tileset picker: grid of actual tile graphics drawn
+            // from the bound _lvl_tileset textures. 4 columns wide
+            // (28 px each); scrolls vertically via two click-arrow
+            // buttons above/below the grid because B++ doesn't
+            // expose a mouse-wheel API yet (a real `mouse_wheel()`
+            // builtin is its own future sidequest — see
+            // docs/todo.md).
+            auto pick_cols, pick_cell, pick_h, max_rows, total_rows;
+            auto tile_id, row, col, tx, ty, mx, my;
+            auto arrow_h, btn_w;
+            pick_cols = 4;
+            pick_cell = 28;
+            btn_w     = pick_cols * (pick_cell + 2);
+            arrow_h   = 20;
+            // Reserve top + bottom rows for the scroll buttons.
+            pick_h    = _lvl_h * _lvl_cell - 2 * arrow_h - 8;
+            max_rows  = pick_h / (pick_cell + 2);
+            if (max_rows < 1) { max_rows = 1; }
+            total_rows = (_lvl_tileset_count + pick_cols - 1) / pick_cols;
+            mx = mouse_x();
+            my = mouse_y();
+
+            // Scroll-up button at the top of the picker column.
+            if (gui_button(picker_x, _lvl_cvs_y, btn_w, arrow_h, "^")) {
+                _lvl_pick_scroll -= 4;
+                if (_lvl_pick_scroll < 0) { _lvl_pick_scroll = 0; }
+            }
+            // Tile grid lives below the up-arrow.
+            auto grid_y;
+            grid_y = _lvl_cvs_y + arrow_h + 4;
+            for (row = 0; row < max_rows; row++) {
+                for (col = 0; col < pick_cols; col++) {
+                    tile_id = (row + _lvl_pick_scroll) * pick_cols + col + 1;
+                    if (tile_id > _lvl_tileset_count) { continue; }
+                    tx = picker_x + col * (pick_cell + 2);
+                    ty = grid_y + row * (pick_cell + 2);
+                    draw_rect(tx, ty, pick_cell, pick_cell,
+                              rgba(20, 22, 28, 255));
+                    _blit_tile_cpu(tile_id, tx, ty,
+                                    pick_cell, pick_cell,
+                                    _lvl_tileset_tw, _lvl_tileset_th);
+                    if (tile_id == _lvl_sel) {
+                        draw_rect(tx - 1, ty - 1, pick_cell + 2, 1,
+                                  rgba(255, 200, 0, 255));
+                        draw_rect(tx - 1, ty + pick_cell, pick_cell + 2, 1,
+                                  rgba(255, 200, 0, 255));
+                        draw_rect(tx - 1, ty, 1, pick_cell,
+                                  rgba(255, 200, 0, 255));
+                        draw_rect(tx + pick_cell, ty, 1, pick_cell,
+                                  rgba(255, 200, 0, 255));
+                    }
+                    if (point_in_rect(mx, my, tx, ty, pick_cell, pick_cell)
+                        && mouse_pressed(MOUSE_LEFT) != 0) {
+                        _lvl_sel = tile_id;
+                    }
+                }
+            }
+            // Scroll-down button below the grid.
+            auto down_y;
+            down_y = grid_y + max_rows * (pick_cell + 2) + 2;
+            if (gui_button(picker_x, down_y, btn_w, arrow_h, "v")) {
+                _lvl_pick_scroll += 4;
+                if (_lvl_pick_scroll > total_rows - max_rows
+                    && total_rows > max_rows) {
+                    _lvl_pick_scroll = total_rows - max_rows;
+                }
+                if (total_rows <= max_rows) { _lvl_pick_scroll = 0; }
+            }
+
+            // Tool name + currently-selected tile id label below.
+            auto tool_name;
+            if      (_lvl_tool == 0) { tool_name = "PAINT"; }
+            else if (_lvl_tool == 1) { tool_name = "ERASE"; }
+            else                     { tool_name = "FILL"; }
+            draw_text(tool_name, picker_x, down_y + arrow_h + 4, 8, WHITE);
+            // Build the "tile N" label via strbuf so we don't need
+            // a fixed-buffer str_cat sequence (and it picks up the
+            // canonical builder API rather than rolling its own).
+            auto id_sb;
+            id_sb = strbuf_new();
+            id_sb = strbuf_cat(id_sb, "tile ");
+            id_sb = strbuf_num(id_sb, _lvl_sel);
+            draw_text(id_sb, picker_x, down_y + arrow_h + 16, 8, WHITE);
+            strbuf_free(id_sb);
+        } else {
+            clicked = gui_palette(picker_x, _lvl_cvs_y,
+                                  _lvl_palette, 8, 1, 24, _lvl_sel);
+            if (clicked >= 1) { _lvl_sel = clicked; }
+            auto tool_name;
+            if      (_lvl_tool == 0) { tool_name = "PAINT"; }
+            else if (_lvl_tool == 1) { tool_name = "ERASE"; }
+            else                     { tool_name = "FILL"; }
+            draw_text(tool_name, picker_x, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
+        }
     } else {
         // Objects mode — vertical kind picker. Each kind is a
         // labelled button; the selected one is accent-bordered.

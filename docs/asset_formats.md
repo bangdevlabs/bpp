@@ -1,0 +1,260 @@
+# B++ Asset Formats — Canonical Spec
+
+Authoritative reference for every JSON / atlas / palette / tileset
+format Bang 9 + Modulab author and the games consume. When a new
+game arc opens, this is the file that says "use THESE shapes."
+
+If you arrived here from **Tonify Rule 31** or **how_to_dev_b++.md
+Cap 16**, you're in the right place — those rules name the
+convention; this file defines the schemas. New asset categories
+land here at the same time as their first consumer.
+
+---
+
+## Level JSON
+
+Used by every game that ships a tile-grid level: pathfind, fps,
+rts1 (WC1 mod), future games. Authored by Bang 9's Level Editor
+tab. Loaded at runtime via `bpp_json` (auto-injected).
+
+The level format has **two modes** chosen via the schema:
+
+| Mode | Tile semantics | Picker UI | When to use |
+|------|----------------|-----------|-------------|
+| **`palette`** | Tile id is an index into an N-color palette (default MCU-8 = 8 colors) | 8 colored circles | Schematic / colour-blocked games — pathfind walls, fps wolfenstein-style tiles, anything where 8 colours is enough vocabulary |
+| **`tileset`** | Tile id is a 1-based row-major index into a PNG tileset image | Scrollable grid of actual tile graphics | Games with real tile art — rts1's WC1 forest (320 tiles), future rts2 Red Alert, any time the visual vocabulary exceeds a flat palette |
+
+A level file declares exactly ONE mode by which top-level field it
+carries: `"palette"` (palette mode) or `"tileset"` (tileset mode).
+Missing both → palette mode with default MCU-8 (backward compat).
+
+### Palette mode (pathfind / fps style)
+
+```json
+{
+  "type": "level",
+  "version": 2,
+  "width": 20,
+  "height": 11,
+  "palette": "MCU-8",
+  "tiles": [
+    [0, 0, 0, 0, 0, 6, 6, 6, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 6, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 1, 0, 0]
+  ],
+  "entities": [
+    { "kind": "player_spawn", "x": 2.5, "y": 8.5 },
+    { "kind": "enemy",         "x": 11.5, "y": 9.5 }
+  ]
+}
+```
+
+Field reference:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `type` | string | yes | Always `"level"` |
+| `version` | int | yes | Schema version. Current = `2`. Older versions get a clear migration error from the loader |
+| `width` | int | yes | Grid width in cells |
+| `height` | int | yes | Grid height in cells |
+| `palette` | string | optional | Palette name. Currently only `"MCU-8"` is implemented. Missing = `MCU-8` default |
+| `tiles` | array of arrays of int | yes | Row-major grid. `tiles[y][x]` is the cell at column `x`, row `y`. Values are palette indices `0..N-1` (clamped on load) |
+| `entities` | array of objects | yes (may be empty) | Spawn points + game-specific objects placed on the grid. See "Entity entries" below |
+
+**MCU-8 palette** (the only palette implemented today):
+
+| Index | ARGB | Name |
+|-------|------|------|
+| 0 | `0x00000000` | transparent (empty cell) |
+| 1 | `0xFF000000` | black |
+| 2 | `0xFF8C1A1A` | dark red |
+| 3 | `0xFF808080` | gray |
+| 4 | `0xFFFFA500` | orange |
+| 5 | `0xFF008000` | green |
+| 6 | `0xFF800080` | purple |
+| 7 | `0xFFFFFF00` | yellow |
+
+Game-side semantics are the game's call — pathfind treats every
+non-zero index as a wall; fps assigns specific colours to wall /
+floor / door tiles. The palette is just the visual.
+
+### Tileset mode (rts1 / WC1 style)
+
+```json
+{
+  "type": "level",
+  "version": 2,
+  "width": 64,
+  "height": 64,
+  "tileset": "assets/converted/graphics/tilesets/forest/terrain.png",
+  "tileset_tw": 16,
+  "tileset_th": 16,
+  "tiles": [
+    [94, 94, 80, 79, 109, 109, ...],
+    [80, 93, 79, 109, 109, 109, ...]
+  ],
+  "entities": [
+    { "kind": "start_view", "player": 0, "x": 16.0, "y": 16.0 }
+  ]
+}
+```
+
+Field reference (differences from palette mode):
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `tileset` | string | yes (tileset mode) | Path to the source PNG, **relative to the project's `assets/` directory** (same anchor convention `path_asset` uses) |
+| `tileset_tw` | int | optional | Tile width in pixels. Default `16` |
+| `tileset_th` | int | optional | Tile height in pixels. Default `16` |
+| `tiles` | array of arrays of int | yes | Same shape as palette mode, but values are 1-based row-major indices into the tileset PNG. `0` = empty cell (no draw) |
+
+**Tile-id convention:** the tileset PNG is read row-major top-to-
+bottom, left-to-right. Tile `1` is at PNG `(0, 0)`. Tile `N` lives
+at PNG `((N - 1) % cols * tw, (N - 1) / cols * th)`. ID `0` is
+reserved for "empty" and never references a PNG cell.
+
+This is the SAME convention `stbtile`'s `tile_load_set` produces.
+Tile IDs round-trip cleanly: war1tool → `wc1_map_convert` → JSON
+→ Level Editor → game.
+
+### Entity entries
+
+Every level (both modes) carries an `entities` array. Each entry
+is an object with at least `kind` + position. Position fields
+depend on the game's coordinate convention — pathfind / fps use
+cell-centered floats (`x = gx + 0.5`, `y = gy + 0.5`); rts1
+games typically use whole-cell integers.
+
+Common kinds the Level Editor recognises:
+
+| Kind | Used by | Meaning |
+|------|---------|---------|
+| `player_spawn` | pathfind, fps | Player start position |
+| `enemy` | fps | Enemy spawn |
+| `start_view` | rts1 | Camera initial centre per player. Extra field: `player` (int) |
+
+New games add new kinds by listing them in the editor's
+`_init_kinds()` (see `tools/level_editor/level_editor_lib.bsm`).
+
+---
+
+## Atlas Pack JSON (sprite atlases)
+
+Used by every game shipping sprites: pathfind cat/rat, fps player /
+enemy / weapon, rts1 unit portraits, future rts2 Red Alert units.
+Authored by Modulab's "Atlas" topbar button, loaded at runtime
+via `image_load`.
+
+### Schema
+
+```json
+{
+  "image": "pathfind.atlas.png",
+  "tw": 16,
+  "th": 16,
+  "frames": [
+    { "id": "rat",  "x": 0,  "y": 0, "w": 16, "h": 16 },
+    { "id": "cat",  "x": 16, "y": 0, "w": 16, "h": 16 }
+  ]
+}
+```
+
+Field reference:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `image` | string | yes | Path to the combined PNG, relative to the atlas JSON's directory |
+| `tw`, `th` | int | optional | Default tile/frame dimensions in the atlas — used when individual frames omit `w` / `h` |
+| `frames` | array | yes | Named regions in the PNG. Each has `id` (string), `x`, `y` and optionally `w`, `h` |
+
+Consumers do:
+
+```bpp
+auto atlas;
+atlas = image_load("assets/sprites/pathfind.atlas.json");
+auto rat_id; rat_id = image_named_id(atlas, "rat");
+image_draw_size(atlas, rat_id, sx, sy, 16, 16);
+```
+
+The atlas pack supports hot-reload via
+`image_hot_reload_enable(atlas)` — Modulab edits the PNG, the
+running game picks up the new pixels within ~30ms.
+
+---
+
+## Audio
+
+Two simple formats, no JSON envelope, no custom schema:
+
+| Asset | Format | Loader | Authoring |
+|-------|--------|--------|-----------|
+| One-shot sound effects | `.wav` (16-bit PCM) | `sound_load_wav` (stbsound) | External editor (Audacity / Reaper). war1tool emits these directly from WC1's binary asset bundle |
+| Background music | `.mid` (Format 0 or 1; SMPTE division rejected — stbmidi only supports musical-time division per the 2026-05-12 ship) | `midi_play_file` (stbmidi) | External sequencer / DAW |
+
+Audio assets are NOT edited inside Bang 9 today. If a game needs
+in-engine audio editing, that's a separate tool arc (none planned
+as of 2026-05-13).
+
+---
+
+## Compatibility rules
+
+**Version field is mandatory in every JSON envelope.** Current
+version everywhere is `2`. Bumping to `3` means a schema-breaking
+change — the loader produces a clear migration error rather than
+silently misinterpreting old fields.
+
+**Optional fields default sensibly.** A missing `palette` defaults
+to `MCU-8`, a missing `tileset_tw` defaults to `16`, a missing
+`entities` array defaults to empty. Older files keep working
+without rewriting them.
+
+**One mode per level.** A level declares `palette` OR `tileset`,
+never both. Mixed-mode levels are a future feature (per-cell
+"this cell uses tileset, that cell uses palette") with no current
+consumer — Rule 28 gates the addition until a game actually needs
+it.
+
+**Path fields are project-asset-relative.** Every path inside a
+JSON (atlas `image`, level `tileset`) resolves via `path_asset`
+(`bpp_path.bsm`) from the consuming game's `assets/` directory.
+Absolute paths are accepted but discouraged — they break when
+the project moves.
+
+---
+
+## How to extend this spec
+
+When a new asset shape lands:
+
+1. Add a section here describing the canonical schema + field
+   reference + a worked example.
+2. Update Tonify Rule 31's "canonical asset → tool → format →
+   loader" table to mention the new shape.
+3. Update `how_to_dev_b++.md` Cap 16 "Asset infra" if the
+   convention point changes.
+4. Ship the corresponding Level Editor / Modulab support and
+   the first consumer game in the same arc.
+
+Asset shapes only graduate into this spec when at least TWO
+consumers exist (Rule 20 two-consumer rule) — until then the
+shape can live game-local and migrate up later.
+
+---
+
+## Cross-references
+
+- `docs/tonify_checklist.md` Rule 31 — discipline rule that says
+  "games consume Bang 9 / Modulab formats."
+- `docs/how_to_dev_b++.md` Cap 16 "Asset infra" — short paragraph
+  pointing back at this file.
+- `tools/level_editor/level_editor_lib.bsm` — Level Editor source,
+  consumes both level modes.
+- `tools/modulab/modulab_lib.bsm` — Modulab source, authors atlas
+  packs.
+- `tools/wc1_map_convert/wc1_map_convert.bpp` — offline converter
+  that produces tileset-mode level JSON from war1tool SMS files.
+- `stb/stbtile.bsm` `tile_load_set` — runtime tileset loader,
+  same row-major id convention as the spec.
+- `stb/stbimage.bsm` `image_load` — runtime atlas pack loader.
+- `src/bpp_json.bsm` — auto-injected JSON reader / writer used by
+  every consumer above.

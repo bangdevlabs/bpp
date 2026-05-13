@@ -2137,15 +2137,23 @@ editor. Discuss before forking; restraint-bias per Rule 28.
 
 ### Cross-references
 
+- **`docs/asset_formats.md`** — **canonical spec** for every JSON /
+  atlas / palette / tileset shape the table above mentions. When a
+  new asset shape lands (e.g. animation graph, particle preset),
+  document the schema there + extend the table here. THIS is where
+  to look for "what fields does a level JSON carry" / "how do I
+  emit a tileset-mode map."
 - `how_to_dev_b++.md` Cap 16 — "Asset infra" sub-section,
-  one-paragraph version of this rule with the same tool/format
-  pointers.
+  one-paragraph version of this rule pointing back at this rule +
+  `asset_formats.md`.
 - Modulab atlas-pack reference: `tools/modulab/` (authoring),
   `pathfind.atlas.json` (canonical consumer example),
   `stb/stbimage.bsm` `image_load` / `image_hot_reload_enable`.
-- level_editor JSON reference: `bang9/` Levels tab (authoring),
-  `games/pathfind/assets/levels/level1.json` (canonical
-  consumer example), `bpp_json` (loader).
+- level_editor JSON reference: `tools/level_editor/level_editor_lib.bsm`
+  (consumer/authoring tool — palette + tileset modes), `bang9/panels.bsm`
+  (embedded host), `games/pathfind/assets/levels/level1.json`
+  (palette-mode example), `games/rts1/assets/converted/maps/forest1.json`
+  (tileset-mode example), `bpp_json` (loader).
 - Per-project meta entries (asset choices specific to one
   game): drop a memory entry like
   `project_<game>_bang9_editable_meta.md` so future sessions

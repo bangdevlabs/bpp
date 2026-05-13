@@ -1727,6 +1727,12 @@ Full rule (with tool/format/loader table, killer-use-case
 justification, and the "when to fork" escape hatch): see
 `docs/tonify_checklist.md` Rule 31.
 
+**Canonical schemas** for every asset shape Bang 9 / Modulab
+author — level JSON (palette + tileset modes), atlas pack JSON,
+audio format requirements: see **`docs/asset_formats.md`**. That
+file is the authoritative field-by-field reference; when you add
+a new asset shape, extend it there + update the table in Rule 31.
+
 ---
 
 ## Cap 17 — Anti-patterns

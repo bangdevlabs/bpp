@@ -275,7 +275,12 @@ speed, level layout) is where hot reload pays for itself.
 
 ---
 
-## Game 3 — RTS demo
+## Game 3 — RTS
+
+This game ships in **two tiers**: a 1.0-gate demo scope, and a
+post-1.0 stress-test scope. Same engine, very different scale.
+
+### Tier 1 — RTS demo (1.0 gate)
 
 **Goal**: ship a vertical slice that defines B++ 1.0. A playable
 real-time strategy scenario with tilemap, unit pathfinding, audio,
@@ -291,9 +296,41 @@ a commercial RTS.
 Everything the previous games exercised lands here at the same time:
 tilemap rendering, pathfinding, ECS with dozens of units, audio mixer
 with several concurrent sounds, fog of war, UI, and a simple AI
-opponent. Metaprogramming lands during this phase because the RTS is
-where boilerplate hurts the most (multiple unit types × save/load/
-update/render/debug).
+opponent.
+
+### Tier 2 — RTS stress test (post-1.0, "B++ cantando")
+
+**Goal**: prove B++ scales to **Red Alert / Warcraft tier** —
+30+ unit types, 1000+ live units, 60fps maintained on dev
+hardware. This is "B++ cantando," the empirical proof that the
+language carries a real RTS workload, not just a vertical slice.
+
+**Not part of the 1.0 gate.** Ships after the demo (Tier 1) lands
+and after the supporting runtime infrastructure (RTS Stress Arc)
+matures stbecs into archetype storage + SIMD batching + flow
+fields + system scheduler.
+
+**Canonical spec for the infra**:
+[`docs/rts_stress_arc.md`](rts_stress_arc.md). Five sessions
+(~1010 LOC infra + ~300 LOC optional stress demo). Triggered
+when Excalibur Features 1+2+3 close and Wolf3D Phase 2 is
+shipping.
+
+**Industry reference for this scale**: C&C Red Alert (1996,
+source open under GPL v3, ~30+ unit types) and Warcraft 2
+(same era, similar scale). Both shipped without templates or
+GPU compute for unit simulation — pure OOP + virtual methods.
+B++ equivalent: ECS components + function-pointer systems +
+multicore dispatch.
+
+**Anti-features in the stress scope** (carried over from the
+arc doc):
+- Templates / metaprogramming — graduated out 2026-05-12 after
+  audit confirmed AAA RTS classics scaled without them.
+- GPU compute for unit AI / strategy logic — industry standard
+  is CPU for game logic, GPU for rendering. Stress test follows.
+- Lockstep fixed-point determinism — multiplayer concern,
+  post-stress-test arc.
 
 ### Reference candidates (open assets)
 

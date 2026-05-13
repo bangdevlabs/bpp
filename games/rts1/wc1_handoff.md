@@ -144,6 +144,15 @@ Each session ships a self-contained slice of the game, leaves the
 suite green, and is verifiable on screen. Estimated effort listed
 per session; sessions can be re-scoped mid-flight per Rule 28.
 
+**Status (2026-05-13):**
+
+- ✅ Session 1 — Tile renderer + map walk (CLOSED, commit `15ee36f`)
+- ✅ Session 2 — Native map format + offline converter + tileset
+  Level Editor + bang9 auto-load (CLOSED 2026-05-13). Hot-reload
+  validated end-to-end: edit `forest1.json` in Bang 9's Levels
+  tab → running `rts.bpp` reflects the new tile in ~30 ms.
+- ⏭ Session 3 — Unit sprite rendering + ECS spawn (next).
+
 ### Session 0 — stbmidi audio fidelity smoke (~30 min, pre-flight)
 
 **Goal**: hook one of the 45 converted MIDIs (`assets/converted/music/00.mid`)

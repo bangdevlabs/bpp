@@ -1,0 +1,441 @@
+// wc1_map_convert.bpp — Offline converter: WC1 SMS map → level_editor JSON.
+//
+// The converted-asset pipeline (war1tool → assets/converted/) emits
+// the WC1 maps as Stratagus SMS files, which happen to use Lua-call
+// syntax (`SetTile(94, 0, 0, 0)`). The B++ runtime never reads SMS
+// at all — that would either drag in a Lua interpreter (anti-goal:
+// zero non-B++ runtime deps) or grow a foreign-syntax parser inside
+// the game binary. Instead this tool runs ONCE per SMS file at
+// asset-prep time and emits a JSON file in the same shape Bang 9's
+// level_editor reads/writes:
+//
+//   {"type":"level","version":2,"width":W,"height":H,"tiles":[[...]]}
+//
+// That shape lets the converted maps:
+//   1. Load into the WC1 game via wc1_map_load (bpp_json + tile_set).
+//   2. Open in Bang 9's Levels tab for hot-reload editing.
+//   3. Round-trip cleanly back through file_watch_register so the
+//      running game picks up Bang 9 edits in ~30 ms.
+//
+// Tonify Rule 31 anchor: "If an asset arrives in a foreign syntax
+// (Lua-ish SMS, custom XML, INI), write a one-shot offline converter
+// under tools/<game>_<asset>_convert/ that emits the canonical Bang
+// 9 format. The game NEVER reads the foreign format at runtime."
+//
+// Usage:
+//
+//   ./wc1_map_convert <input.sms> <output.json>
+//
+// What the scanner extracts (deliberately minimal for Session 2):
+//
+//   SetTile(tileId, gx, gy, _)   → tile grid + map dimensions
+//
+// What it ignores (intentional — Session 2 ships rendering only;
+// units / spawns / resources land in later sessions):
+//
+//   Player(...), LoadTileModels(...), SetStartView(...),
+//   SetPlayerData(...), SetAiType(...), SetResourcesHeld(...)
+//
+// The scanner is intentionally trivial: skip whitespace and
+// `-- comment`, find an identifier, check if it's "SetTile", parse
+// integer args until `)`. No Lua semantics, no expression parser,
+// no string handling. Just "find the right function-call shape and
+// extract its int args."
+
+// No imports needed — bpp_array, bpp_buf, bpp_io, bpp_str,
+// bpp_file are all auto-injected (Cap 2 prelude). This is a
+// pure offline tool: read a file, scan bytes, write a file.
+// No window, no GPU, no audio, no game loop.
+
+// ── Scanner state ───────────────────────────────────────────
+
+// Source byte buffer + length. Set once in main.
+extrn _src;
+extrn _src_len;
+
+// Cursor offset into _src. Walks forward only; the scanner never
+// rewinds because comment-skip and whitespace-skip are deterministic
+// from any starting byte.
+auto _off;
+
+// Accumulated tile placements. Three parallel arrays keep the data
+// SoA so the later "compute W/H, then fill tiles[][]" loop is a
+// straight walk per Tonify Rule 30 default. arr_push grows them.
+extrn _tile_ids;             // tile values (e.g. 94, 109, 251)
+extrn _tile_gxs;
+extrn _tile_gys;
+
+// Map dimensions, derived from max(gx, gy) + 1 across all SetTile
+// calls. SMS files don't carry an explicit grid size; the cells
+// SetTile touches define the bounding box. Cells not touched stay
+// at tile 0 (empty) in the emitted JSON.
+auto _max_gx;
+auto _max_gy;
+
+// ── Byte-level helpers (leaves first per Tonify Rule 27) ────
+
+// Return 1 when byte `c` is ASCII whitespace (space, tab, CR, LF)
+// otherwise 0. Pure scalar — never touches global state.
+static _is_ws(c) {
+    if (c == ' ')  { return 1; }
+    if (c == '\t') { return 1; }
+    if (c == '\n') { return 1; }
+    if (c == '\r') { return 1; }
+    return 0;
+}
+
+// Return 1 when byte `c` is an ASCII decimal digit.
+static _is_digit(c) {
+    if (c >= '0') {
+        if (c <= '9') { return 1; }
+    }
+    return 0;
+}
+
+// Return 1 when byte `c` can begin or continue an identifier
+// (letter or underscore; digits handled separately at non-start
+// positions but the SMS files have no digit-leading idents so we
+// don't bother distinguishing).
+static _is_ident(c) {
+    if (c >= 'A') {
+        if (c <= 'Z') { return 1; }
+    }
+    if (c >= 'a') {
+        if (c <= 'z') { return 1; }
+    }
+    if (c == '_') { return 1; }
+    return 0;
+}
+
+// Skip whitespace AND `-- to end of line` comments at the cursor.
+// Repeats until the next byte is neither whitespace nor the start
+// of a comment, so consecutive blank lines and comments collapse.
+static void _skip_ws_and_comments() {
+    auto c, c2;
+    while (_off < _src_len) {
+        c = peek(_src + _off);
+        if (_is_ws(c)) {
+            _off++;
+        } else if (c == '-') {
+            if (_off + 1 >= _src_len) { return; }
+            c2 = peek(_src + _off + 1);
+            if (c2 != '-') { return; }
+            // `-- comment` — skip to end of line.
+            _off += 2;
+            while (_off < _src_len) {
+                if (peek(_src + _off) == '\n') { break; }
+                _off++;
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+// Test whether the byte sequence starting at `_off` matches the
+// null-terminated literal `word` exactly, AND that the byte right
+// after the match is NOT an identifier byte (so "SetTile" matches
+// "SetTile(" but not "SetTilePlus("). Returns 1 on match without
+// advancing the cursor; 0 otherwise.
+static _at_word(word: ptr) {
+    auto wlen, i, c;
+    wlen = str_len(word);
+    if (_off + wlen > _src_len) { return 0; }
+    for (i = 0; i < wlen; i++) {
+        if (peek(_src + _off + i) != peek(word + i)) { return 0; }
+    }
+    // Boundary check: the byte after the candidate must not extend
+    // the identifier, so "Player" doesn't match a "PlayerData" stem.
+    if (_off + wlen < _src_len) {
+        c = peek(_src + _off + wlen);
+        if (_is_ident(c) || _is_digit(c)) { return 0; }
+    }
+    return 1;
+}
+
+// Parse a signed decimal integer at the cursor and advance past it.
+// Skips leading whitespace inside the call argument list. Stores
+// the parsed value into the slot pointed to by `out` and returns 1
+// on success; returns 0 when no digit was found (caller is the one
+// that decides whether that's an error).
+static _parse_int(out) {
+    auto c, val, sign, started;
+    _skip_ws_and_comments();
+    if (_off >= _src_len) { return 0; }
+
+    sign = 1;
+    if (peek(_src + _off) == '-') {
+        sign = -1;
+        _off++;
+    }
+
+    val = 0;
+    started = 0;
+    while (_off < _src_len) {
+        c = peek(_src + _off);
+        if (_is_digit(c) == 0) { break; }
+        val = val * 10 + (c - '0');
+        started = 1;
+        _off++;
+    }
+    if (started == 0) { return 0; }
+    *(out) = val * sign;
+    return 1;
+}
+
+// Skip an argument that is NOT an integer — for SMS calls that mix
+// quoted strings with ints. Walks until the next ',' at depth 0 or
+// the closing ')'. Quoted strings handled crudely: enter `"`, walk
+// until the closing `"`, ignoring escapes (the SMS files don't use
+// escape sequences inside quoted strings).
+static void _skip_arg() {
+    auto c, in_str;
+    in_str = 0;
+    while (_off < _src_len) {
+        c = peek(_src + _off);
+        if (in_str != 0) {
+            if (c == '"') { in_str = 0; }
+            _off++;
+        } else {
+            if (c == '"') { in_str = 1; _off++; }
+            else if (c == ',' || c == ')') { return; }
+            else { _off++; }
+        }
+    }
+}
+
+// Walk to the next `,` or `)` at depth 0, advancing past the
+// separator (or stopping AT `)`). Used between argument
+// extractions to keep the cursor positioned at the next arg's
+// first byte.
+static void _consume_separator() {
+    _skip_ws_and_comments();
+    if (_off >= _src_len) { return; }
+    if (peek(_src + _off) == ',') { _off++; }
+    _skip_ws_and_comments();
+}
+
+// ── Per-call extractors ─────────────────────────────────────
+
+// Handle `SetTile(tileId, gx, gy, fixedZero)`. Already-positioned
+// cursor: just past the `(`. Reads four ints, stores tile, updates
+// the running max-gx / max-gy. Cursor lands just past the `)`.
+static void _handle_set_tile() {
+    auto tile_id, gx, gy, ignored;
+
+    if (_parse_int(&tile_id) == 0) { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&gx) == 0)      { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&gy) == 0)      { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&ignored) == 0) { _skip_arg(); }
+
+    // Walk to the closing ')'.
+    while (_off < _src_len) {
+        if (peek(_src + _off) == ')') { _off++; break; }
+        _off++;
+    }
+
+    _tile_ids = arr_push(_tile_ids, tile_id);
+    _tile_gxs = arr_push(_tile_gxs, gx);
+    _tile_gys = arr_push(_tile_gys, gy);
+    if (gx > _max_gx) { _max_gx = gx; }
+    if (gy > _max_gy) { _max_gy = gy; }
+}
+
+// Skip past an entire function-call we don't care about. Cursor
+// starts on the function name; ends just past the matching `)`.
+// Handles nested parens defensively though SMS files don't seem
+// to use them in the call shapes we see.
+static void _skip_unrecognised_call() {
+    auto depth, c;
+
+    // Walk past the identifier.
+    while (_off < _src_len) {
+        c = peek(_src + _off);
+        if (_is_ident(c) == 0 && _is_digit(c) == 0) { break; }
+        _off++;
+    }
+    _skip_ws_and_comments();
+    if (_off >= _src_len) { return; }
+    if (peek(_src + _off) != '(') { return; }
+    _off++;
+
+    depth = 1;
+    while (_off < _src_len && depth > 0) {
+        c = peek(_src + _off);
+        if (c == '"') {
+            // Skip a quoted string verbatim.
+            _off++;
+            while (_off < _src_len) {
+                if (peek(_src + _off) == '"') { _off++; break; }
+                _off++;
+            }
+        } else if (c == '(') {
+            depth++; _off++;
+        } else if (c == ')') {
+            depth--; _off++;
+        } else {
+            _off++;
+        }
+    }
+}
+
+// ── Main scan loop ──────────────────────────────────────────
+
+// Walk the source from start to finish, dispatching to the
+// per-call handler when we recognise SetTile and skipping any
+// other top-level call cleanly. Comments and whitespace are
+// transparent.
+static void _scan() {
+    auto c;
+    _off = 0;
+    while (_off < _src_len) {
+        _skip_ws_and_comments();
+        if (_off >= _src_len) { break; }
+
+        c = peek(_src + _off);
+        if (_is_ident(c) == 0) {
+            // Stray byte (probably a comma between top-level calls
+            // — though SMS doesn't actually use those — or a stray
+            // newline survivor). Advance and keep scanning.
+            _off++;
+            continue;
+        }
+
+        if (_at_word("SetTile")) {
+            // Past the identifier and the `(`.
+            _off += 7;
+            _skip_ws_and_comments();
+            if (_off < _src_len && peek(_src + _off) == '(') {
+                _off++;
+                _handle_set_tile();
+            }
+        } else {
+            _skip_unrecognised_call();
+        }
+    }
+}
+
+// ── JSON emit ───────────────────────────────────────────────
+
+// Build the level_editor JSON shape into a strbuf and write it
+// out via file_write_all. Layout matches pathfind's level1.json
+// exactly (type / version / width / height / tiles) so Bang 9's
+// Levels tab can open the result without WC1-specific UI work.
+static void _emit_json(out_path: ptr) {
+    auto sb, w, h, gx, gy, i, n, grid, idx;
+
+    w = _max_gx + 1;
+    h = _max_gy + 1;
+
+    // Allocate a flat tile grid initialised to zero, then poke
+    // each recorded SetTile placement into its cell. Untouched
+    // cells stay at tile 0 (empty) — same convention pathfind
+    // uses for its grid.
+    grid = buf_word(w * h);
+    buf_fill(grid, 0, w * h * 8);
+
+    n = arr_len(_tile_ids);
+    for (i = 0; i < n; i++) {
+        gx = arr_get(_tile_gxs, i);
+        gy = arr_get(_tile_gys, i);
+        idx = gy * w + gx;
+        grid[idx] = arr_get(_tile_ids, i);
+    }
+
+    // strbuf_* calls all return a possibly-moved buffer pointer
+    // (the underlying buffer is reallocated when growth crosses
+    // the current capacity). Reassigning `sb` from every call is
+    // mandatory — without it the next call writes into freed
+    // memory and the process dies silently after enough growth.
+    // Tileset path is recorded relative to the project's assets/
+    // directory so Bang 9's Level Editor (and any other consumer)
+    // can resolve it via path_asset from any cwd. Hardcoded to the
+    // forest tileset for now — when wc1_map_convert handles other
+    // tilesets (swamp / dungeon) it'll grow a flag or auto-detect
+    // from the SMS filename pattern.
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "{\"type\":\"level\",\"version\":2,\"width\":");
+    sb = strbuf_num(sb, w);
+    sb = strbuf_cat(sb, ",\"height\":");
+    sb = strbuf_num(sb, h);
+    sb = strbuf_cat(sb, ",\"tileset\":\"assets/converted/graphics/tilesets/forest/terrain.png\"");
+    sb = strbuf_cat(sb, ",\"tileset_tw\":16,\"tileset_th\":16");
+    sb = strbuf_cat(sb, ",\"tiles\":[");
+    for (gy = 0; gy < h; gy++) {
+        if (gy > 0) { sb = strbuf_ch(sb, ','); }
+        sb = strbuf_ch(sb, '[');
+        for (gx = 0; gx < w; gx++) {
+            if (gx > 0) { sb = strbuf_ch(sb, ','); }
+            sb = strbuf_num(sb, grid[gy * w + gx]);
+        }
+        sb = strbuf_ch(sb, ']');
+    }
+    sb = strbuf_cat(sb, "]}\n");
+
+    file_write_all(out_path, sb, strbuf_len(sb));
+    strbuf_free(sb);
+    free(grid);
+}
+
+// ── Entry point ─────────────────────────────────────────────
+
+main() {
+    auto in_path: ptr;
+    auto out_path: ptr;
+    auto fsize, n;
+
+    if (argc_get() < 3) {
+        putstr_err("usage: wc1_map_convert <input.sms> <output.json>\n");
+        return 1;
+    }
+    in_path  = argv_get(1);
+    out_path = argv_get(2);
+
+    _src = file_read_all(in_path, &fsize);
+    if (_src == 0) {
+        put_err("wc1_map_convert: cannot read ");
+        put_err(in_path);
+        put_err("\n");
+        return 1;
+    }
+    _src_len = fsize;
+
+    _tile_ids = arr_new();
+    _tile_gxs = arr_new();
+    _tile_gys = arr_new();
+    _max_gx = 0;
+    _max_gy = 0;
+
+    _scan();
+
+    n = arr_len(_tile_ids);
+    if (n == 0) {
+        put_err("wc1_map_convert: no SetTile calls found in ");
+        put_err(in_path);
+        put_err("\n");
+        return 1;
+    }
+
+    _emit_json(out_path);
+
+    put("wc1_map_convert: ");
+    put(in_path);
+    put(" → ");
+    put(out_path);
+    put(" (");
+    putnum(n);
+    put(" tiles, ");
+    putnum(_max_gx + 1);
+    put("×");
+    putnum(_max_gy + 1);
+    put(")\n");
+
+    free(_src);
+    arr_free(_tile_ids);
+    arr_free(_tile_gxs);
+    arr_free(_tile_gys);
+    return 0;
+}

@@ -98,6 +98,115 @@ wc1_map_h(map) {
     return m.h;
 }
 
+// ── JSON loader (Session 2) ─────────────────────────────────
+
+// Load a WC1 map from the level_editor JSON format that the
+// `tools/wc1_map_convert` offline tool produces from a war1tool-
+// emitted SMS file. Returns a WC1Map handle on success, 0 on any
+// read/parse/shape error.
+//
+// JSON shape (matches games/pathfind/assets/levels/level1.json
+// so Bang 9's level_editor opens the same file for hot-reload
+// editing):
+//
+//   {"type":"level","version":2,"width":W,"height":H,
+//    "tiles":[[id, id, ...], [id, ...], ...]}
+//
+// `id` values are 1-based row-major indices into the bound
+// tileset, matching the original war1tool SetTile output.
+wc1_map_load(path: ptr) {
+    auto buf, fsize, doc, root;
+    auto w_idx, h_idx, tiles_idx, w, h;
+    auto x, y, row_idx, cell, map: WC1Map, m;
+
+    buf = file_read_all(path, &fsize);
+    if (buf == 0) {
+        put_err("wc1_map_load: cannot read ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    doc = json_parse(buf, fsize);
+    free(buf);
+    if (doc == 0) {
+        put_err("wc1_map_load: malformed JSON in ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    root      = json_root(doc);
+    w_idx     = json_object_get(doc, root, "width");
+    h_idx     = json_object_get(doc, root, "height");
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (w_idx < 0 || h_idx < 0 || tiles_idx < 0) {
+        json_free(doc);
+        put_err("wc1_map_load: missing width/height/tiles in ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    w = json_int(doc, w_idx);
+    h = json_int(doc, h_idx);
+
+    map = wc1_map_new(w, h);
+    m = map;
+    for (y = 0; y < h; y++) {
+        row_idx = json_child(doc, tiles_idx, y);
+        for (x = 0; x < w; x++) {
+            cell = json_int(doc, json_child(doc, row_idx, x));
+            if (cell != 0) { tile_set(m.tm, x, y, cell); }
+        }
+    }
+
+    json_free(doc);
+    return map;
+}
+
+// Clear every tile in the map back to empty (0). Used by the
+// hot-reload callback to wipe the grid before re-loading the
+// edited JSON — without this, deleted tiles linger.
+void wc1_map_clear(map) {
+    auto m: WC1Map;
+    auto gx, gy;
+    m = map;
+    for (gy = 0; gy < m.h; gy++) {
+        for (gx = 0; gx < m.w; gx++) {
+            tile_set(m.tm, gx, gy, 0);
+        }
+    }
+}
+
+// Re-load tile data from a JSON file into an EXISTING map handle
+// (preserving the underlying stbtile so the GPU tileset binding
+// stays valid through the swap). Returns 0 on success, -1 on
+// load failure (in which case the existing tiles stay untouched).
+wc1_map_reload_from(map, path: ptr) {
+    auto fresh: WC1Map, m: WC1Map;
+    auto gx, gy, w, h;
+
+    fresh = wc1_map_load(path);
+    if (fresh == 0) { return -1; }
+
+    m = map;
+    w = m.w;
+    h = m.h;
+    if (w != fresh.w || h != fresh.h) {
+        wc1_map_free(fresh);
+        return -1;
+    }
+
+    for (gy = 0; gy < h; gy++) {
+        for (gx = 0; gx < w; gx++) {
+            tile_set(m.tm, gx, gy, tile_get(fresh.tm, gx, gy));
+        }
+    }
+    wc1_map_free(fresh);
+    return 0;
+}
+
 // ── Hand-authored test layout (Session 1 only) ──────────────
 
 // Paint a uniform field of grass with a single 2×2 tree cluster
