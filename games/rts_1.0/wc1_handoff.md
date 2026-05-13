@@ -1,14 +1,44 @@
-# Warcraft 1 in B++ — port plan
+# Warcraft 1 in B++ — mod plan
 
-A clean-room port of *Warcraft: Orcs & Humans* (Blizzard, 1994) from
-the C/C++ Stratagus engine + Lua game scripts (war1gus) into pure
-B++. The deliverable is a playable WC1 with **zero non-B++ runtime
-dependencies** — no Lua interpreter, no SDL, no Stratagus, no FFI to
-C libraries. The b++ stb cartridge family is the entire stack.
+A B++ RTS that runs on the *Warcraft: Orcs & Humans* (Blizzard,
+1994) asset bundle. **Not a 1:1 port** — the constraint is the
+assets, the gameplay is ours. We use the converted PNG / WAV / MID
+/ map files in `games/rts_1.0/assets/converted/` as the "skin and
+soundtrack"; balance, AI, and feel are creative choices we make as
+the game comes together. Zero non-B++ runtime dependencies — no Lua
+interpreter, no SDL, no Stratagus, no FFI to C libraries. The b++
+stb cartridge family is the entire stack.
 
 This document is the canonical anchor for the multi-session arc.
 Each session below is sized to fit one focused work block; every
 session ships visible value and leaves the tree green.
+
+**Scope clarifier (2026-05-12):** the original WC1 numbers are a
+starting point, not a spec. Where war1gus / DOSBox mechanics make
+the game more fun, we copy them. Where they don't (or where we
+just have a better idea), we deviate. "Plays like a Warcraft 1
+mod" is the bar, not "passes a frame-by-frame DOSBox diff."
+
+**Meta goal — Bang 9 edits the mod assets (2026-05-12):** WC1
+sprites and levels are authored in Bang 9's existing tabs
+(sprite + level_editor), not in a parallel WC1-only editor.
+Concretely:
+
+- **Maps** ship in the same JSON shape `level_editor` reads/writes
+  (`{width, height, tiles[][]}`, identical to
+  `games/pathfind/assets/levels/level1.json`). Session 2's
+  converter outputs THAT format directly — no custom `.b1map`.
+- **Sprites** ship as Modulab atlas-pack files (`*.atlas.json`,
+  same shape pathfind uses). Session 3 loads via `image_load` +
+  `image_hot_reload_enable`; Bang 9's sprite tab authors them.
+- **Hot-reload via `file_watch_register` from day 1** —
+  pathfind ↔ level_editor proves the rail; WC1 rides the same
+  rail for both maps and sprites.
+
+This rules out: WC1-only level editor, custom binary map format,
+WC1-only sprite editor, direct-PNG sprite loading bypassing the
+atlas-pack convention. Tooling investment compounds across
+projects.
 
 ## Why this is the right shape now
 
@@ -41,34 +71,37 @@ Nothing on this list needs new infrastructure. The arc is
 
 ## Source material
 
-| Source | Where | Role | Caveat |
-|---|---|---|---|
-| Original DOS executables | `/Users/Codes/Warcraft1/Warcraft_Orcs_and_Humans_DOS_Files_EN/Game Files/` | behavioural ground truth (run in DOSBox for disputed mechanics) | the only reference for the unmodified Blizzard 1994 simulation |
-| `war1gus` repo | `/Users/Codes/Warcraft1/war1gus/` (Wargus's WC1 port to Stratagus engine) | readable reference for asset format + game data shape | **not the original Blizzard source** — Blizzard never released it; war1gus is a clean-room reimplementation |
-| `war1gus/scripts/*.lua` | inside the war1gus repo | Lua "specification" for every unit, building, missile, animation, spell, and AI subroutine | mostly faithful to WC1 1994 — see `units.lua` for base unit data |
-| `war1gus/scripts/balancing.lua` | inside the war1gus repo | tempting to read as canon — DO NOT | header literally says "*changes* on top of the normal unit definitions for better balancing in multiplayer and with War1gus features such as dynamic fog of war and autocasting." These are **war1gus-specific rebalances**, not original WC1 numbers. |
-| `war1gus/war1gus.cpp` + `war1tool.cpp` | inside the war1gus repo | engine glue (Stratagus C++) and asset converter | we already used `war1tool` to populate `assets/converted/`; engine glue is reference only |
-| Converted assets | `games/rts_1.0/assets/converted/` (in this repo) | the actual PNG / WAV / MID / SMS / SMP / TXT files our port consumes | runtime input, not reference |
+| Source | Where | Role |
+|---|---|---|
+| Converted assets | `games/rts_1.0/assets/converted/` (in this repo) | **the actual constraint** — PNG / WAV / MID / SMS / SMP / TXT files our game consumes at runtime |
+| Original DOS executables | `/Users/Codes/Warcraft1/Warcraft_Orcs_and_Humans_DOS_Files_EN/Game Files/` | run in DOSBox if we want to *feel* a specific mechanic before deciding what to do with it; not a binding spec |
+| `war1gus` repo | `/Users/Codes/Warcraft1/war1gus/` (Wargus's WC1 port to Stratagus engine) | readable reference for asset format + how the data was originally shaped; **not the original Blizzard source** (Blizzard never released it, war1gus is a clean-room reimplementation) |
+| `war1gus/scripts/*.lua` | inside the war1gus repo | starting numbers for units / buildings / missiles / animations / spells / AI — copy what's good, change what's not |
+| `war1gus/scripts/balancing.lua` | inside the war1gus repo | war1gus-specific multiplayer rebalances (header says so). Useful as one data point, not gospel. We pick our own numbers anyway. |
+| `war1gus/war1gus.cpp` + `war1tool.cpp` | inside the war1gus repo | engine glue (Stratagus C++) and asset converter. `war1tool` already populated `assets/converted/`; engine glue is reading material when we get curious. |
 
 **Where to look for what:**
 
 - "What does a peasant cost / how many HP / what's its sprite?"
-  → `war1gus/scripts/units.lua` first; verify against DOSBox if
-  the value smells war1gus-specific.
+  → `war1gus/scripts/units.lua` for a starting point; tweak as
+  the game shapes up.
 - "How much damage does a footman do to a grunt?"
-  → DOSBox is canon. `balancing.lua` is contaminated.
+  → pick numbers that feel right; `balancing.lua` is one suggestion.
+  DOSBox is a sanity check, not a specification.
 - "What animation frames per direction?"
-  → `war1gus/scripts/anim.lua` (visual data, faithful).
+  → `war1gus/scripts/anim.lua` — the visual data is faithful and
+  we'll generally just use it (the assets are sliced for it).
 - "AI behaviour grammar?"
-  → `war1gus/scripts/ai.lua` is a starting point; the original
-  DOS AI was simpler. Port the war1gus version, then trim if
-  we hit "this AI feels too smart for 1994."
+  → `war1gus/scripts/ai.lua` is a starting point. We're free to
+  write something simpler, smarter, weirder — whatever makes the
+  matches fun.
 
 The Lua scripts read like data sheets. We port the data into B++
 structures and the behaviour into B++ functions; we do **not** embed
 Lua. License notice (war1gus is GPL-2): we treat it as readable
-reference / executable documentation, not as code we copy. Clean-
-room reimplementation in B++.
+reference, not as code we copy. Clean-room reimplementation in B++.
+
+**The asset bundle is the contract; the rest is design space.**
 
 ## Module layout (proposed)
 
@@ -111,18 +144,39 @@ Each session ships a self-contained slice of the game, leaves the
 suite green, and is verifiable on screen. Estimated effort listed
 per session; sessions can be re-scoped mid-flight per Rule 28.
 
+### Session 0 — stbmidi audio fidelity smoke (~30 min, pre-flight)
+
+**Goal**: hook one of the 45 converted MIDIs (`assets/converted/music/00.mid`)
+into `midi_play_file` and confirm it actually sounds like Warcraft 1
+music — not just that the parser walks events without crashing
+(`tests/test_stbmidi_wc1.bpp` already proves the latter).
+
+**Why before Session 1**: discovering an XMI-quirk in stbmidi
+during Session 12 (audio integration) wastes a render-side context.
+30 minutes of "play one .mid through stbmixer → speakers" closes the
+audio risk now, leaving Sessions 1-11 free to focus on visuals +
+gameplay.
+
+**Files**: `examples/wc1_midi_smoke.bpp` (~30 LOC) — `init_audio` +
+`init_midi` + `midi_play_file("games/rts_1.0/assets/converted/music/00.mid", 0)` +
+sleep loop until ESC.
+
+**Verification**: it sounds musical (recognisable melody, no drift,
+no glitch, tempo changes land cleanly). Negative result → file
+stbmidi sidequest before Session 1.
+
 ### Session 1 — Tile renderer + map walk (~3-4h)
 
-**Goal**: open a window, load the forest tileset PNG, paint a hand-
-authored 32×32 tile grid on screen. No units, no input beyond
-window-close. Success = "the screen looks like a Warcraft 1 map."
+**Goal**: open a window, load the forest tileset PNG (256×320,
+16×16 tiles), paint a hand-authored 32×32 tile grid on screen
+using `stbtile`. No units, no input beyond window-close. Success
+= "the screen looks like a Warcraft 1 map."
 
 **Files**:
-- `wc1_render.bsm` — palette + atlas wiring around the forest
-  tileset PNG.
-- `wc1_map.bsm` — minimal grid struct + a hard-coded test map.
-- `rts.bpp` — game_init wires a render loop, game_render paints
-  the grid.
+- `wc1_map.bsm` — thin wrapper around `stbtile`: `wc1_map_new(w,h)`,
+  `wc1_map_set_tile`, hard-coded test map factory.
+- `rts.bpp` — `game_init` + `tile_load_set` + `tile_bind_set` +
+  `game_frame_begin` / `tile_draw` loop.
 
 **Verification**:
 - Bootstrap byte-stable, suite green.
@@ -130,21 +184,62 @@ window-close. Success = "the screen looks like a Warcraft 1 map."
   shows a Warcraft-style forest landscape on screen.
 - Smoke commit: tile pipeline proven independent of game logic.
 
-### Session 2 — SMS / SMP map loader (~3-4h)
+### Session 2 — Native map format + offline converter (~3-4h)
 
-**Goal**: parse one of the converted skirmish maps from
-`assets/converted/maps/forest1.{sms,smp}` and render IT instead of
-the hard-coded grid. Real Warcraft map terrain on screen.
+**Goal**: render real WC1 maps without the runtime ever touching
+the war1tool-emitted SMS / SMP files. Pipeline: SMS → offline
+B++ converter → native `.b1map` (or JSON via `bpp_json`) → game
+loads native format. Zero Lua at runtime, zero string-parsing
+of foreign syntax at runtime — the converter does all of that
+once, ahead of time.
+
+**Why offline conversion, not runtime parse**: the war1tool
+output happens to be written in Lua-call syntax (`SetTile(94, 0,
+0, 0)`), which is convenient for war1gus's Stratagus engine but
+irrelevant to us. Embedding ANY Lua-syntax recognition in the
+runtime drags the wrong shape of work into the hot path. The
+conversion is one-shot; the game ships with `.b1map` files, not
+`.sms` files. Same staging principle as war1tool itself
+(`DATA.WAR` → PNG/WAV is offline; the game never opens
+`DATA.WAR`).
 
 **Files**:
-- `wc1_map.bsm` — gain `wc1_map_load(path) -> WC1Map` + struct
-  with width, height, tile-id grid, spawn-point list.
-- SMS is text Lua-style (the war1tool output); we port the
-  small subset needed for terrain (the SetMapTile-like calls)
-  into a tiny B++ parser. SMP is the binary tile grid.
+- `tools/wc1_map_convert/wc1_map_convert.bpp` — offline tool.
+  Reads an SMS file, scans for `SetTile(id, x, y, _)` /
+  `SetStartView(_, x, y)` / `SetPlayerData(player, "Resources",
+  "gold|wood", n)` / `PresentMap(_, players, w, h, _)` via a
+  trivial token scanner (skip whitespace, match identifier,
+  skip `(`, read integer args until `)`), and writes a JSON
+  file in the **level_editor format** (`{"width": w, "height":
+  h, "tiles": [[...]], "spawns": [...], "resources": {...}}`).
+  Scanner is ~100 LOC of B++ — no parser generator, no Lua
+  semantics, just "find function name, grab the integer args."
+  Output JSON shape extends pathfind's level1.json with `spawns`
+  + `resources` arrays; level_editor and WC1 game both read it
+  cleanly.
+- `games/rts_1.0/wc1_map.bsm` — gain `wc1_map_load(path: ptr)
+  -> WC1Map` that reads the JSON via auto-injected `bpp_json`
+  (same path pathfind takes). Spawn-point list, player resource
+  defaults, and tile grid all populated from the JSON. Hot-
+  reload via `file_watch_register` from day 1.
 
-**Verification**: real WC1 forest1 / swamp1 / dungeon1 maps render
-faithfully against the original game (DOSBox side-by-side check).
+**Why level_editor format (not custom `.b1map`)**: the meta goal
+above commits the mod to Bang 9 as the authoring surface. A custom
+binary format would fork from level_editor and force a parallel
+editor. JSON via bpp_json keeps the round-trip
+`Bang 9 → file → game → file_watch → game` working from day 1.
+
+**Verification**: `forest1.json` loads + renders identical to the
+SMS-driven war1gus reference. Converter is idempotent (re-running
+on the same SMS produces byte-stable output). Bang 9's Levels
+tab opens the converted JSON, edits a cell, saves, the running
+game reflects the change in ~30ms (pathfind hot-reload pattern).
+`tools/wc1_map_convert/` lands as a sibling tool to `war1tool` —
+runs once per SMS file at asset-prep time.
+
+**Verification**: WC1 forest1 / swamp1 / dungeon1 maps render
+recognisably (the layouts are unmistakable). Pixel-perfect match
+against DOSBox is not required.
 
 ### Session 3 — Unit sprite rendering + ECS spawn (~3-4h)
 
@@ -156,12 +251,22 @@ No animation yet beyond the idle frame; no movement.
 - `wc1_units.bsm` — first 4-8 unit type entries from units.lua
   ported to a B++ struct table (HitPoints, Armor, Speed, Image,
   Size).
+- `assets/wc1_units.atlas.json` — Modulab-style atlas pack
+  authored from the converted PNG sprites (or generated via a
+  one-shot `tools/sprite16_to_atlas.sh`-style pre-process).
+  Loaded via `image_load("...atlas.json")` + hot-reloaded via
+  `image_hot_reload_enable` per the meta goal above. Bang 9
+  sprite tab can open and edit this file — same workflow as
+  `pathfind.atlas.json`.
 - Component registration in `wc1_render.bsm`: register Pos, Sprite,
   UnitType components; build the Combatant archetype.
-- Render path: archetype walk → sprite blit at world-to-screen
-  position.
+- Render path: archetype walk → `image_draw_size(atlas,
+  sprite_id, sx, sy, w, h)` (smart-bind batches into one
+  drawPrimitives via Phase 3.2).
 
 **Verification**: peasant visible on the map at the spawn point.
+Edit the peasant sprite in Bang 9's sprite tab → ~30ms later the
+running game shows the new pixels (atlas hot-reload).
 
 ### Session 4 — Camera + input + selection (~3-4h)
 
@@ -209,16 +314,18 @@ the per-frame budget spike that 50 × A* would cause.
 ### Session 7 — Combat basics (~3-4h)
 
 **Goal**: attack-move command. Units engage enemies in range, deal
-BasicDamage / PiercingDamage per balancing.lua, missile units fire
-arrows, dead units spawn corpses.
+damage, missile units fire arrows, dead units spawn corpses.
 
 **Files**:
-- `wc1_combat.bsm` — damage formula (port of balancing.lua section
-  5), missile entity lifecycle.
+- `wc1_combat.bsm` — damage formula (start from balancing.lua's
+  basic + piercing model, then tune for feel), missile entity
+  lifecycle.
 - `wc1_missiles.bsm` — missile type table.
 
-**Verification**: footman vs grunt deathmatch resolves correctly;
-archer vs grunt has missile flight on screen.
+**Verification**: footman vs grunt deathmatch resolves with the
+right "weight" (a few hits, not one-shots, not slogs); archer vs
+grunt has missile flight on screen. We iterate on numbers until
+the engagements feel good — not until they match DOSBox.
 
 ### Session 8 — Buildings + construction (~3-4h)
 
@@ -241,13 +348,17 @@ to town hall, deposit. Resource counter in HUD ticks up.
 
 ### Session 10 — Production (training + research) (~3-4h)
 
-**Goal**: barracks trains footmen with gold cost + training time
-from balancing.lua. Train queue UI in command card.
+**Goal**: barracks trains footmen with gold cost + training time.
+Initial values cribbed from balancing.lua; we adjust as the
+economy tells us what's fun. Train queue UI in command card.
 
 ### Session 11 — AI baseline (~4-5h)
 
-**Goal**: enemy player builds, gathers, attacks. Port of ai.lua's
-basic strategy script.
+**Goal**: enemy player builds, gathers, attacks. Pick a strategy
+that gives the player a fair fight on mission 1 — could be
+inspired by ai.lua, could be simpler (timed waves) or weirder
+(opportunistic harasser). Whatever lets us call this a finished
+game first; sophistication is iterable later.
 
 ### Session 12 — Audio integration (~2-3h)
 
@@ -260,12 +371,15 @@ voice-acknowledge bus per faction.
 
 ### Session 13 — Mission 1 playable (~4-5h capstone)
 
-**Goal**: human campaign mission 1 playable end-to-end. Briefing
-text shown, briefing voice plays, gameplay loads, victory or defeat
-condition triggers cleanly. The "B++ cantando" proof.
+**Goal**: a human-side scenario playable end-to-end on the
+mission-1 map (or our own remix of it). Briefing text shown,
+briefing voice plays, gameplay loads, victory or defeat condition
+triggers cleanly. The "B++ cantando" proof — and the first time
+a player can sit down and *play* this thing.
 
 **Files**: `wc1_mission.bsm` — mission orchestrator; load
-`assets/converted/campaigns/human/01.sms` + `01.smp`.
+`assets/converted/campaigns/human/01.sms` + `01.smp` (or a
+hand-authored alternative if our mechanics call for it).
 
 ## Engineering principles
 
@@ -293,6 +407,13 @@ project infrastructure that just happens to be discovered by WC1
 graduates to `stb/`. The line moves with consumer count, not with
 intuition.
 
+**Pre-existing W032 sweep is parallel work, not a blocker.** The
+~57 W032 hits in older stb cartridges (`stbimage`, `stbforge`,
+`stbasset`, `stbsound` path-receiving sites) are tracked in
+`docs/todo.md` and can be cleaned up in any spare half-hour
+between sessions — they don't gate the wc1 arc. New code in
+`wc1_*.bsm` written under Rule 13 emits zero W032 from day one.
+
 ### Tonify checklist on every new function
 
 Mandatory pre-flight per Tonify Rule 14 / Rule 25 / Rule 30 /
@@ -309,8 +430,12 @@ Specific rules that bite hardest in game code:
   needs callees defined before callers in the same file.
 - Rule 28 (killer-use-case gate) — guards every "we should
   probably also add X" temptation mid-session.
-- Rule 30 (ECS layout) — picks SoA flat vs AoSoA chunked per
-  workload; defaults to AoSoA for archetype-heavy game state.
+- Rule 30 (ECS layout) — defaults to SoA flat; this game's
+  heterogeneous entity classes (Tile / Combatant / Building /
+  Missile) fire the AoSoA trigger from Session 3 onwards (component
+  set differs per class + sparse "iterate all Combatants" queries
+  filter most of the world). Switch via `ecs_archetype` /
+  `ecs_spawn_at` from Session 3.
 - Rule 17 (`put` / `put_err` smart dispatch) — never bypass to
   raw `putnum_err` unless explicit integer intent; W032 catches
   the lapse.
@@ -319,10 +444,13 @@ Specific rules that bite hardest in game code:
 
 ### Coordinates
 
-WC1 grid is 32×32 pixels per tile. Standard convention:
+WC1 grid is 16×16 pixels per tile (verified via `file
+graphics/tilesets/forest/terrain.png` → 256×320, with 16 cols × 20
+rows of 16-pixel tiles = 320 tiles total). Standard convention:
 
-- `gx`, `gy` — tile coordinates (integer, range determined by map)
-- `px`, `py` — pixel coordinates in world space (gx * 32 + sub)
+- `gx`, `gy` — tile coordinates (integer, range determined by map;
+  forest1 is 64×64 per `forest1.smp`)
+- `px`, `py` — pixel coordinates in world space (gx * 16 + sub)
 - `sx`, `sy` — pixel coordinates in screen space (after camera)
 
 Camera transform lives in `wc1_camera.bsm`; render code calls
@@ -332,8 +460,9 @@ Camera transform lives in `wc1_camera.bsm`; render code calls
 
 Speed / position in milli-units (×1000) the same way `stbecs`
 already encodes pos_x / vel_x. Combat damage in plain integer (HP
-is 1..400 in the unit table). No floats in the simulation hot path
-— audio + render do their own float math internally.
+in roughly the 1..400 range like the original — convenient size
+for tuning, fits in a halfword). No floats in the simulation hot
+path — audio + render do their own float math internally.
 
 ### Save state
 
@@ -342,9 +471,10 @@ post-1.0 sidequest tracked in `docs/todo.md`.
 
 ### Unit caps
 
-Original WC1 capped at 75 units per side. We honour that initially
-but the engine has no hard limit — the `_ECS_SYS_MAX = 32` in the
-scheduler is system-count, not entity-count.
+Original WC1 capped at 75 units per side — fine starting point,
+not a constraint. The engine has no hard limit (the
+`_ECS_SYS_MAX = 32` in the scheduler is system-count, not
+entity-count); raise the cap if a scenario calls for it.
 
 ### Pathing strategy
 
@@ -386,7 +516,12 @@ Standing gates per Tonify discipline:
   130/0/45).
 - Manual visual smoke check on the new feature.
 - No new W032 / W026 / W031 hits introduced (sweep at session
-  close if any).
+  close if any). **Pre-existing W032 noise from older stb
+  cartridges (`stbimage`, `stbforge`, `stbasset`, `stbsound`
+  call sites that pre-date the `: ptr` annotation, ~57 sites)
+  is tracked separately in `docs/todo.md` and is OK to ignore
+  during the wc1 arc.** New `wc1_*.bsm` code must emit ZERO
+  W032 by annotating every path-receiving param `: ptr`.
 - Commit before the next session starts.
 
 ## Cross-references
@@ -400,11 +535,12 @@ Standing gates per Tonify discipline:
 - `/Users/Codes/Warcraft1/war1gus/scripts/` — Lua specification we
   port from (read; do not link).
 - `/Users/Codes/Warcraft1/Warcraft_Orcs_and_Humans_DOS_Files_EN/` —
-  original DOS executables; run in DOSBox for behavioural ground
-  truth on disputed mechanics.
+  original DOS executables; fire up in DOSBox when you want to
+  feel a specific mechanic before deciding what to do with it.
 
 ## Status
 
-**Plan saved 2026-05-12.** Implementation pending — Session 1
-slot in when ready to attack. Day was dense (12 commits) — fresh
-context recommended before opening the first session.
+**Plan saved 2026-05-12; mod-framing clarification added same
+day.** Implementation pending — Session 1 slot in when ready to
+attack. Day was dense (12 commits) — fresh context recommended
+before opening the first session.

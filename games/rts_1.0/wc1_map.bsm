@@ -1,0 +1,130 @@
+// wc1_map.bsm — Warcraft 1 map data + tile-grid wrapper.
+//
+// Session 1 ship: a thin shell over `stbtile` that fixes the WC1
+// conventions in one place — 16×16 pixel tiles, 1-based tile IDs
+// matching the converted forest tileset (`graphics/tilesets/forest/
+// terrain.png`, 256×320 = 16 cols × 20 rows = 320 tiles total). Real
+// SMS / SMP loading lands in Session 2; for now the map is painted
+// from a hand-authored pattern so the tile pipeline can be smoke-
+// tested independently of the file-format work.
+//
+// Convention reminder (per the wc1_handoff coordinate section):
+//   gx, gy — tile coordinates, integer
+//   px, py — world pixels (gx * 16 + sub)
+//   sx, sy — screen pixels (after camera; identity in Session 1)
+
+import "stbtile.bsm";
+
+// Pixel size of every tile in the WC1 forest tileset. The tileset
+// PNG is laid out as a 16-column grid; tile_load_set slices it on
+// these dimensions and assigns 1-based row-major IDs that match
+// the war1tool SetTile output.
+const WC1_TILE_PX = 16;
+
+// Forest-tileset IDs verified by frequency analysis of
+// `assets/converted/maps/forest1.sms`: tile 109 occurs 1659 times
+// (canonical grass). Tile 76 falls in the 71-87 cluster the SMS
+// uses for tree groves. Other variants (80, 79, 72, 251) are also
+// present in the corpus but their semantics depend on context
+// (cliff edges, water borders, etc.) and aren't safe to use as
+// hand-authored placeholders without a real map context.
+const WC1_T_GRASS = 109;
+const WC1_T_TREE  = 76;
+
+// ── Map struct ──────────────────────────────────────────────
+
+// A WC1 map is a `stbtile` tilemap plus the dimensions in the
+// units the game cares about. The `tm` field is the underlying
+// tilemap handle; everything else is derived bookkeeping. Future
+// sessions will hang spawn-point and player-data fields off the
+// same struct.
+struct WC1Map {
+    tm,             // stbtile handle (tile_new return)
+    w,              // grid width in tiles
+    h               // grid height in tiles
+}
+
+// ── Lifecycle ───────────────────────────────────────────────
+
+// Allocate a fresh map of the requested grid size. Tile cells
+// start at 0 (empty); the caller paints tiles with `wc1_map_set`
+// or one of the `wc1_map_paint_*` helpers below.
+wc1_map_new(w, h) {
+    auto m: WC1Map;
+    m = malloc(sizeof(WC1Map));
+    m.w = w;
+    m.h = h;
+    m.tm = tile_new(w, h, WC1_TILE_PX, WC1_TILE_PX);
+    return m;
+}
+
+// Free the map and its underlying tilemap. Caller passes the
+// handle returned by `wc1_map_new`.
+void wc1_map_free(map) {
+    auto m: WC1Map;
+    m = map;
+    if (m.tm != 0) { tile_free(m.tm); }
+    free(map);
+}
+
+// ── Tile access ─────────────────────────────────────────────
+
+// Write a tile ID at grid (gx, gy). Out-of-bounds writes are
+// silently dropped by the underlying `tile_set`.
+void wc1_map_set(map, gx, gy, tile_id) {
+    auto m: WC1Map;
+    m = map;
+    tile_set(m.tm, gx, gy, tile_id);
+}
+
+// Fetch the underlying stbtile handle so the renderer can call
+// `tile_draw` directly. Wrapped here so callers don't need to
+// know the struct layout.
+wc1_map_tm(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.tm;
+}
+
+wc1_map_w(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.w;
+}
+
+wc1_map_h(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.h;
+}
+
+// ── Hand-authored test layout (Session 1 only) ──────────────
+
+// Paint a uniform field of grass with a single 2×2 tree cluster
+// at (5, 5). Deliberately minimal — the smoke goal is "tileset
+// renders, positions land where the paint code says" not "looks
+// like a real WC1 map." Real maps come in Session 2 via the SMS
+// converter; until then any artificial pattern just adds visual
+// noise that competes with the actual debugging signal.
+void wc1_map_paint_smoke(map) {
+    auto m: WC1Map;
+    auto gx, gy;
+    m = map;
+
+    // Base layer: solid grass everywhere.
+    for (gy = 0; gy < m.h; gy++) {
+        for (gx = 0; gx < m.w; gx++) {
+            tile_set(m.tm, gx, gy, WC1_T_GRASS);
+        }
+    }
+
+    // Single 2×2 tree cluster at (5, 5) so the visual smoke can
+    // confirm "tile X gets painted at (gx, gy) → tile X appears
+    // at (gx * 16, gy * 16) on screen." Pick a position that's
+    // off-axis so a tile-coords-vs-pixel-coords swap would be
+    // visually obvious.
+    tile_set(m.tm, 5, 5, WC1_T_TREE);
+    tile_set(m.tm, 6, 5, WC1_T_TREE);
+    tile_set(m.tm, 5, 6, WC1_T_TREE);
+    tile_set(m.tm, 6, 6, WC1_T_TREE);
+}

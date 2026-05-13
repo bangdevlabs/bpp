@@ -1,0 +1,112 @@
+// rts.bpp — Warcraft 1 in B++ (mod plan, Session 1).
+//
+// Session 1 ship: open a window, load the converted forest tileset
+// PNG (assets/converted/graphics/tilesets/forest/terrain.png — 256×320,
+// sliced into 320 tiles of 16×16 pixels), bind it to a stbtile grid,
+// paint a hand-authored "Warcraft forest patch" pattern, render the
+// result. ESC quits. No units, no input beyond ESC.
+//
+// Verifies the tile + render pipeline end-to-end on the real WC1
+// asset bundle without depending on Session 2's map-format work.
+// When the screen comes up looking like a WC1 forest, Session 1 is
+// green; the rest of the arc is composition on top.
+//
+// Build the binary alongside the assets/ directory (the canonical
+// layout other B++ games use — pathfind ships `path`/`path2`,
+// rhythm ships `rtm`):
+//
+//   ./bpp games/rts_1.0/rts.bpp -o games/rts_1.0/rts
+//   cd games/rts_1.0 && ./rts        # or just `games/rts_1.0/rts`
+//
+// Asset paths are resolved through `path_asset()` (bpp_path.bsm),
+// which walks up to 4 parent levels from the binary's own location
+// to find the `assets/` directory — so the same binary works from
+// any CWD.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbtile.bsm";
+load   "wc1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
+
+// ── Constants ────────────────────────────────────────────
+
+// Virtual screen: 20 × 15 tiles at 16 px each = 320 × 240. Same
+// chunky-pixel-art shape as the original WC1 viewport (320 × 200
+// + a bit of HUD allowance). The actual window is auto-scaled to
+// fit ~80% of the monitor by stbgame's Phase 4.1.3 logic.
+const SCREEN_W = 320;
+const SCREEN_H = 240;
+const GRID_W   = 20;          // SCREEN_W / WC1_TILE_PX
+const GRID_H   = 15;          // SCREEN_H / WC1_TILE_PX
+
+// Asset path is resolved through `path_asset()` (bpp_path.bsm) at
+// the call site, so the path here is RELATIVE to the game's own
+// `assets/` directory — exactly what every other game in
+// `games/*` does. No `games/rts_1.0/` prefix; the resolver walks
+// up to find the right ancestor.
+
+// ── Game state ───────────────────────────────────────────
+
+// Allocated once in main, never reassigned — Tonify Rule 1.
+extrn map;
+
+// ── Entry point ──────────────────────────────────────────
+
+main() {
+    auto tileset, tile_count, tm;
+    auto tileset_path: ptr;       // path_asset returns `: ptr` — see Rule 13 return-type form
+
+    // Open the window + initialise input/draw/font/etc. via the
+    // standard stbgame floor (Rule 23 — stbgame ships the floor
+    // only; the wc1 arc opts in to stbrender + stbtile explicitly).
+    game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
+    render_init();
+
+    // Resolve the forest tileset PNG against the binary's own
+    // location — works from any CWD as long as the binary lives
+    // somewhere inside the games/rts_1.0/ tree (canonical layout
+    // for B++ games; same convention as pathfind/rhythm/snake).
+    tileset_path = path_asset("assets/converted/graphics/tilesets/forest/terrain.png");
+
+    // Slice the forest tileset PNG into 320 individual GPU
+    // textures, indexed 1..320 in row-major order. Tile IDs
+    // returned here line up with the war1tool-emitted SetTile()
+    // calls in the original .sms maps, so when Session 2 lands
+    // its SMS-derived map files the same IDs work without any
+    // remap table.
+    tileset = 0;
+    tile_count = tile_load_set(tileset_path, WC1_TILE_PX, WC1_TILE_PX, &tileset);
+    if (tile_count == 0) {
+        put_err("rts: failed to load tileset at ");
+        put_err(tileset_path);
+        put_err("\n");
+        free(tileset_path);
+        return 1;
+    }
+    free(tileset_path);
+
+    // Build a fresh map and paint the Session 1 smoke pattern —
+    // grass everywhere, a tree cluster upper-left, a dirt clearing
+    // centre, a dark band along the bottom. Lives in wc1_map.bsm.
+    map = wc1_map_new(GRID_W, GRID_H);
+    tm = wc1_map_tm(map);
+    tile_bind_set(tm, tileset, tile_count);
+    wc1_map_paint_smoke(map);
+
+    // Game loop. Identical shape to the existing pathfind /
+    // platformer / fps_3d_gpu loops — game_frame_begin handles
+    // dt + input polling; game_render_begin / end wrap the GPU
+    // pass; tile_draw culls to the screen-visible region.
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        game_render_begin();
+        render_clear(rgba(0, 0, 0, 255));
+        tile_draw(tm, 0, 0, SCREEN_W, SCREEN_H);
+        game_render_end();
+    }
+
+    wc1_map_free(map);
+    return 0;
+}
