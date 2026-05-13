@@ -807,14 +807,16 @@ becomes the seed for the dedicated session decomposition.
     consumes it; cartridge restored to C-emit-clean. See
     `tests/bench_ecs_physics_simd.bpp` for the canonical pattern
     consumers should follow until this sidequest opens.
-- **Retire `emit_load_runtime_global` chip primitive** — after the
-  2026-05-13 builtin → source migration (see
-  `docs/builtin_to_source_plan.md`), `_a64_emit_load_runtime_global`
-  and `_x64_emit_load_runtime_global` have zero call sites. The
-  dispatch-table entries (`p.emit_load_runtime_global = fn_ptr(...)`)
-  and the two primitive bodies (~10 LOC across both chip backends)
-  are dead code. Delete in a focused cleanup commit; needs
-  bootstrap + suite gate but no functional change. Trivial.
+- **Retire `emit_load_runtime_global` + `emit_index_word` chip
+  primitives** — RESOLVED 2026-05-13 (same day, in the follow-on
+  commit). Both primitives were exclusively consumed by the
+  argv_get / envp_get builtin dispatch which the migration
+  deleted. Cleanup removed: vtable slot declarations in
+  `src/bpp_codegen.bsm:298-299`, vtable wires in
+  `a64_codegen.bsm:191-192` + `x64_codegen.bsm:169-170`, and the
+  primitive bodies in `a64_primitives.bsm:1314-1333` +
+  `x64_primitives.bsm:782-797`. Bootstrap byte-stable cycle 1,
+  suite 163/0/12 + 130/0/45 maintained. Net -30 LOC.
 
 - **Return-type annotations** — RESOLVED 2026-05-13. End-to-end
   flow (parser → V3 inference via `fn_ret_hint` → validate +
