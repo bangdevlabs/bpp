@@ -8,6 +8,7 @@ import "stbrender.bsm";
 import "stbtile.bsm";
 import "stbimage.bsm";   // Phase 3.5.4 — atlases for char sheet + tileset
 import "stbphys.bsm";
+import "stbcamera.bsm";  // shared 2D camera state + clamp
 
 // ── Constants ────────────────────────────────────────────
 
@@ -80,7 +81,11 @@ auto player_anim_t;
 auto player_alive;
 
 auto score;
-auto CAM_X, CAM_Y;
+// Camera handle. Allocated once in main() before init_game so
+// KEY_R restart can call cam_set without leaking a fresh handle
+// each time. Read by sprite blit, parallax background, and
+// tile_draw via cam_x / cam_y accessors.
+auto cam;
 
 // ── Level design ─────────────────────────────────────────
 
@@ -150,14 +155,14 @@ void build_level() {
 
 // ── Camera ───────────────────────────────────────────────
 
+// Follow the player. The +8 offset compensates for the player's
+// 16-px sprite width (centers on the sprite middle, not its
+// top-left). cam_follow handles the screen-half subtraction +
+// the bounds clamp so this stays a one-liner.
 void update_camera() {
-    auto target_x, target_y, scr_w, scr_h;
-    scr_w = 320;
-    scr_h = 180;
-    target_x = phys_px_x(player) - scr_w / 2 + 8;
-    target_y = phys_px_y(player) - scr_h / 2 + 8;
-    CAM_X = clamp(target_x, 0, MAP_W * TILE_W - scr_w);
-    CAM_Y = clamp(target_y, 0, MAP_H * TILE_H - scr_h);
+    cam_follow(cam,
+               phys_px_x(player) + 8,
+               phys_px_y(player) + 8);
 }
 
 // ── Player update ────────────────────────────────────────
@@ -219,8 +224,8 @@ void update_player(dt) {
 // Draw the player using a Kenney character sprite.
 void draw_player() {
     auto sx, sy, tex;
-    sx = phys_px_x(player) - CAM_X;
-    sy = phys_px_y(player) - CAM_Y;
+    sx = phys_px_x(player) - cam_x(cam);
+    sy = phys_px_y(player) - cam_y(cam);
 
     // Offset sprite to center on hitbox (sprite is 24x24, hitbox is 14x18).
     sx -= 5;
@@ -251,7 +256,7 @@ void draw_background() {
     }
 
     auto mx, mh;
-    mx = 0 - CAM_X / 3;
+    mx = 0 - cam_x(cam) / 3;
     mh = 40;
     while (mx < 340) {
         render_rect(mx, 180 - mh - 30, 60, mh + 30, rgba(80, 100, 80, 255));
@@ -334,8 +339,10 @@ void init_game() {
     player_alive = 1;
 
     score = 0;
-    CAM_X = 0;
-    CAM_Y = 0;
+    // cam handle is allocated once in main(); init_game runs on
+    // KEY_R restart too, so just reset the position in place to
+    // avoid leaking a fresh handle each restart.
+    cam_set(cam, 0, 0);
 }
 
 // ── Main ─────────────────────────────────────────────────
@@ -347,6 +354,9 @@ main() {
     // Load character sprites once (survives game restarts).
     load_characters();
 
+    // Camera handle lives across restarts — init_game's cam_set
+    // resets the position only.
+    cam = cam_new(320, 180, MAP_W * TILE_W, MAP_H * TILE_H);
     init_game();
 
     while (game_should_quit() == 0) {
@@ -364,7 +374,7 @@ main() {
         render_clear(CLR_SKY);
 
         draw_background();
-        tile_draw(tilemap, CAM_X, CAM_Y, 320, 180);
+        tile_draw(tilemap, cam_x(cam), cam_y(cam), 320, 180);
         draw_player();
         draw_hud();
 

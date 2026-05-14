@@ -27,6 +27,7 @@ import "stbrender.bsm";
 import "stbtile.bsm";
 import "stbimage.bsm";       // for file_watch_register / file_watch_tick
 import "stbecs.bsm";         // ECS world for unit entities
+import "stbcamera.bsm";      // 2D camera state + clamp
 load   "wc1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
 load   "wc1_units.bsm";
 load   "wc1_render.bsm";
@@ -59,12 +60,11 @@ extrn world;
 // image_hot_reload_tick_throttled.
 extrn peasant_atlas;
 
-// Camera position in pixels (top-left of the visible viewport).
-// Read by tile_draw and ecs_render_units; written by the input
-// pan loop in main() and seeded by start_view player 0 if the
-// level has one. wc1_render.bsm reads these globals directly so
-// the per-entity render callback can subtract them.
-global cam_x, cam_y;
+// Camera handle — owned by main, read by tile_draw and the per-
+// entity render callback (which extrn's it). cam_pan / cam_set
+// keep the clamp uniform with every other 2D consumer of the
+// engine (platformer + future RTS games + zelda-style top-down).
+extrn cam;
 
 // Camera pan speed in pixels per second. RTS-typical pace: pans
 // the 1024 px (64 × 16) forest map edge-to-edge in ~5 seconds at
@@ -166,11 +166,11 @@ main() {
     ecs_wire(world);
 
     // Seed the camera before unit spawn so the start_view consumer
-    // can override it. Defaults to (0, 0); _seed_camera_from_level
+    // can override it. cam_new lands at (0, 0); the seeder
     // looks for a `start_view` entity belonging to player 0 (the
     // human in WC1 campaign maps) and centers the viewport on it.
-    cam_x = 0;
-    cam_y = 0;
+    cam = cam_new(SCREEN_W, SCREEN_H,
+                    wc1_map_w(map) * 16, wc1_map_h(map) * 16);
     _seed_camera_from_level(map);
     _spawn_units_from_level(world, peasant_atlas, map);
 
@@ -190,7 +190,7 @@ main() {
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
-        tile_draw(tm, cam_x, cam_y, SCREEN_W, SCREEN_H);
+        tile_draw(tm, cam_x(cam), cam_y(cam), SCREEN_W, SCREEN_H);
         ecs_render_units(world);
         game_render_end();
     }
@@ -198,6 +198,7 @@ main() {
     ecs_query_free(peasant_q);
     free(world);
     image_free(peasant_atlas);
+    cam_free(cam);
     wc1_map_free(map);
     free(_map_json_path);
     return 0;
@@ -223,7 +224,7 @@ static void _spawn_units_from_level(world, atlas, map) {
     }
 }
 
-// Seed cam_x / cam_y from the FIRST `start_view` entity the level
+// Seed the camera from the FIRST `start_view` entity the level
 // carries. WC1 SMS files declare one SetStartView per player; the
 // converter emits all of them but rts1 only honors the first one
 // for now (campaign maps put player 0 first, which matches the
@@ -231,45 +232,28 @@ static void _spawn_units_from_level(world, atlas, map) {
 // arrives.
 //
 // The view position is the grid cell the campaign wants the
-// camera to LOOK AT — center the viewport on it, then clamp so
-// we never scroll past the map edges. wc1_map_entity_gx already
-// reverses the cell-centered float to whole-cell integers.
+// camera to LOOK AT — center the viewport on it. cam_set folds
+// in the clamp so a near-edge anchor never exposes off-map area.
 static void _seed_camera_from_level(map) {
     auto i, n, k;
     n = wc1_map_entity_count(map);
     for (i = 0; i < n; i++) {
         k = wc1_map_entity_kind(map, i);
         if (str_eq(k, "start_view") != 0) {
-            cam_x = wc1_map_entity_gx(map, i) * 16 - SCREEN_W / 2;
-            cam_y = wc1_map_entity_gy(map, i) * 16 - SCREEN_H / 2;
-            _camera_clamp(map);
+            cam_set(cam,
+                      wc1_map_entity_gx(map, i) * 16 - SCREEN_W / 2,
+                      wc1_map_entity_gy(map, i) * 16 - SCREEN_H / 2);
             return;
         }
     }
 }
 
-// Clamp the camera so the viewport never exposes off-map area.
-// Map dimensions are in tiles; multiply by the 16-px tile to get
-// pixels, subtract the screen size, and floor at 0 so a map
-// smaller than the viewport pins the camera to the top-left.
-static void _camera_clamp(map) {
-    auto max_x, max_y;
-    max_x = wc1_map_w(map) * 16 - SCREEN_W;
-    max_y = wc1_map_h(map) * 16 - SCREEN_H;
-    if (max_x < 0) { max_x = 0; }
-    if (max_y < 0) { max_y = 0; }
-    if (cam_x < 0) { cam_x = 0; }
-    if (cam_y < 0) { cam_y = 0; }
-    if (cam_x > max_x) { cam_x = max_x; }
-    if (cam_y > max_y) { cam_y = max_y; }
-}
-
 // Per-frame camera pan. Arrow keys + WASD push the camera at the
 // constant CAM_SPEED_PX_S rate; opposing keys cancel out. ms-
-// based int math keeps cam_x / cam_y on the integer rail (tile_
-// draw expects int pixel coords) — at 60 FPS the per-frame step
-// is ~3 px which still reads as smooth on a 320 px viewport.
-// Clamps to the map after every move so a held key against a map
+// based int math keeps cam coords on the integer rail (tile_draw
+// expects int pixel coords) — at 60 FPS the per-frame step is
+// ~3 px which still reads as smooth on a 320 px viewport. The
+// cam_pan call folds in the clamp so a held key against a map
 // edge doesn't accumulate negative coords.
 static void _camera_pan_tick() {
     auto dx, dy, step;
@@ -284,7 +268,5 @@ static void _camera_pan_tick() {
     if (key_down(KEY_W)     != 0) { dy = dy - step; }
     if (key_down(KEY_DOWN)  != 0) { dy = dy + step; }
     if (key_down(KEY_S)     != 0) { dy = dy + step; }
-    cam_x = cam_x + dx;
-    cam_y = cam_y + dy;
-    _camera_clamp(map);
+    cam_pan(cam, dx, dy);
 }

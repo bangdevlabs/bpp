@@ -1,0 +1,129 @@
+// stbcamera.bsm — 2D camera state + clamp for top-down / side-scroll games.
+//
+// Captures the THREE things every 2D camera shares:
+//   1. State (cam.x, cam.y in integer pixels — sub-pixel smoothing
+//      lives in a future v2; today every consumer uses ints because
+//      tile_draw + image_draw expect int pixel coords).
+//   2. Bounds (world size + screen size) so the clamp is uniform.
+//   3. Two update primitives — pan (input-driven, RTS) and follow
+//      (target-driven, side-scroll / top-down zelda). Each consumer
+//      picks which to call.
+//
+// What this cartridge does NOT cover:
+//   - 3D camera (yaw/pitch/projection) — fps_3d / fps_wolf3d keep
+//     their FPSBody-driven setup; the math is different shape. If
+//     a 3D camera lib eventually earns its slot it'd live alongside
+//     here as cam3d_* primitives, sharing the stbcamera namespace.
+//   - Cinematic state machine (Cinemachine-style) — Rule 28 when a
+//     real consumer asks for it.
+//   - Shake / smoothing / zoom — same Rule 28 reason.
+//   - Edge-of-screen mouse pan — adds later as cam_pan_edge(...)
+//     when RTS selection lands (S5+).
+//   - Parallax bg camera (stbscene._bg_cam_x is float for sub-pixel
+//     factor math); stbscene keeps its own state for now. Future
+//     refactor: bg_set_camera reads from a Cam handle.
+
+struct Cam {
+    x, y,                  // top-left of viewport in pixels (int)
+    screen_w, screen_h,    // viewport size
+    world_w, world_h       // map size in pixels (already multiplied by tile size)
+}
+
+// Allocate a fresh camera anchored at (0, 0) sized for the given
+// viewport + world. Pass world_w/world_h as ZERO if the world size
+// isn't known yet at creation time (e.g. before map_load); call
+// cam_set_world later. With world == 0 the clamp is a no-op so
+// the camera floats freely until bounds arrive.
+cam_new(screen_w, screen_h, world_w, world_h) {
+    auto c: Cam;
+    c = malloc(sizeof(Cam));
+    c.x = 0; c.y = 0;
+    c.screen_w = screen_w; c.screen_h = screen_h;
+    c.world_w  = world_w;  c.world_h  = world_h;
+    return c;
+}
+
+// Free the camera handle. Pairs 1:1 with cam_new.
+void cam_free(cam) {
+    free(cam);
+}
+
+// Update world dimensions — used when a map loads after the camera
+// was created, or when the map gets resized via hot-reload. Re-clamps
+// the camera against the new bounds so the viewport never exposes
+// off-map area after a shrink.
+void cam_set_world(cam, world_w, world_h) {
+    auto c: Cam;
+    c = cam;
+    c.world_w = world_w;
+    c.world_h = world_h;
+    _cam_clamp(c);
+}
+
+// Move the camera by (dx, dy) pixels. RTS-style free pan: each consumer
+// computes dx/dy from input keys + dt and calls this. Clamping is
+// folded in so callers never see off-map coords.
+void cam_pan(cam, dx, dy) {
+    auto c: Cam;
+    c = cam;
+    c.x = c.x + dx;
+    c.y = c.y + dy;
+    _cam_clamp(c);
+}
+
+// Center the camera on a world-space target point. Side-scroll /
+// top-down follow: the consumer passes player position (or selection
+// centroid, etc) and the camera centers on it, then clamps.
+// For zero-deadzone snap-follow; deadzone variant lives in
+// cam_follow_deadzone (v2 if a game asks).
+void cam_follow(cam, target_x, target_y) {
+    auto c: Cam;
+    c = cam;
+    c.x = target_x - c.screen_w / 2;
+    c.y = target_y - c.screen_h / 2;
+    _cam_clamp(c);
+}
+
+// Direct set (used by start_view seeding etc — set a desired x/y,
+// then clamp). Skips the "compute via target" math of cam_follow
+// because the caller already has the final pixel coords.
+void cam_set(cam, x, y) {
+    auto c: Cam;
+    c = cam;
+    c.x = x;
+    c.y = y;
+    _cam_clamp(c);
+}
+
+// Read accessors. Callers DON'T unpack the struct — keeps the API
+// stable if Cam grows fields later (smoothing accumulators, etc).
+cam_x(cam) { auto c: Cam; c = cam; return c.x; }
+cam_y(cam) { auto c: Cam; c = cam; return c.y; }
+
+// World → screen and screen → world helpers. The world→screen form
+// is `world - cam`; the screen→world form is `screen + cam`. These
+// will earn their slot once mouse-click selection lands (Session 4
+// completion / S5) — the click handler needs screen→world to map
+// mouse coords to game tile coords.
+cam_world_to_screen_x(cam, wx) { auto c: Cam; c = cam; return wx - c.x; }
+cam_world_to_screen_y(cam, wy) { auto c: Cam; c = cam; return wy - c.y; }
+cam_screen_to_world_x(cam, sx) { auto c: Cam; c = cam; return sx + c.x; }
+cam_screen_to_world_y(cam, sy) { auto c: Cam; c = cam; return sy + c.y; }
+
+// Clamp the camera so the viewport never exposes off-map area.
+// world_size - screen_size is the max coord; floor at 0 so a map
+// smaller than the viewport pins to (0, 0). When world dimensions
+// are zero (map not loaded yet) clamping is a no-op so the camera
+// floats freely until cam_set_world arrives.
+static void _cam_clamp(c: Cam) {
+    auto max_x, max_y;
+    if (c.world_w == 0 && c.world_h == 0) { return; }
+    max_x = c.world_w - c.screen_w;
+    max_y = c.world_h - c.screen_h;
+    if (max_x < 0) { max_x = 0; }
+    if (max_y < 0) { max_y = 0; }
+    if (c.x < 0) { c.x = 0; }
+    if (c.y < 0) { c.y = 0; }
+    if (c.x > max_x) { c.x = max_x; }
+    if (c.y > max_y) { c.y = max_y; }
+}
