@@ -82,6 +82,21 @@ extrn _sv_player;
 extrn _sv_gxs;
 extrn _sv_gys;
 
+// Accumulated CreateUnit calls. SMS shape:
+//   `unit = CreateUnit("unit-NAME", player, {gx, gy})`
+// Stored kind strings have the `unit-` prefix stripped so the
+// JSON entity carries the consumer-friendly tag (`peasant`,
+// `gold-mine`, `peon`) — same shape rts1's spawn loop already
+// uses for hand-authored entities. Per-record fields:
+//   _u_kinds   — heap-owned C-string of the stripped name
+//   _u_player  — int player id (0..15; 15 = neutral in WC1)
+//   _u_gxs     — int grid x
+//   _u_gys     — int grid y
+extrn _u_kinds;
+extrn _u_player;
+extrn _u_gxs;
+extrn _u_gys;
+
 // ── Byte-level helpers (leaves first per Tonify Rule 27) ────
 
 // Return 1 when byte `c` is ASCII whitespace (space, tab, CR, LF)
@@ -278,6 +293,95 @@ static void _handle_set_start_view() {
     _sv_gys    = arr_push(_sv_gys,    gy);
 }
 
+// Parse a double-quoted string at the cursor (skipping leading
+// whitespace). On match, allocates a heap copy of the bytes
+// between the quotes, stores the pointer at *out, and returns 1.
+// Returns 0 if the cursor is not on a quote. SMS strings don't
+// use escape sequences so the loop is byte-for-byte until the
+// closing quote.
+static _parse_quoted_string(out) {
+    auto start, len;
+    auto buf;
+    _skip_ws_and_comments();
+    if (_off >= _src_len) { return 0; }
+    if (peek(_src + _off) != '"') { return 0; }
+    _off++;
+    start = _off;
+    while (_off < _src_len) {
+        if (peek(_src + _off) == '"') { break; }
+        _off++;
+    }
+    len = _off - start;
+    if (_off < _src_len) { _off++; }    // consume closing quote
+    buf = malloc(len + 1);
+    memcpy(buf, _src + start, len);
+    poke(buf + len, 0);
+    *(out) = buf;
+    return 1;
+}
+
+// Drop the leading `unit-` prefix from a war1tool unit name
+// ("unit-peasant" → "peasant") so the JSON entity tag matches
+// the convention rts1 already consumes for hand-authored
+// entities. Returns the input pointer unchanged when the prefix
+// is absent (defensive — every observed SMS unit name carries
+// the prefix). Frees the input buffer and returns a fresh heap
+// copy when the prefix matched.
+static _strip_unit_prefix(name: ptr) {
+    auto out, src_len, out_len;
+    if (peek(name) != 'u') { return name; }
+    if (peek(name + 1) != 'n') { return name; }
+    if (peek(name + 2) != 'i') { return name; }
+    if (peek(name + 3) != 't') { return name; }
+    if (peek(name + 4) != '-') { return name; }
+    src_len = str_len(name);
+    out_len = src_len - 5;
+    out = malloc(out_len + 1);
+    memcpy(out, name + 5, out_len);
+    poke(out + out_len, 0);
+    free(name);
+    return out;
+}
+
+// Handle `CreateUnit("unit-NAME", player, {gx, gy})`. Cursor
+// positioned just past the `(`. The Lua-style table literal
+// `{gx, gy}` is parsed inline: open brace, two ints, close
+// brace, then the closing `)`. Cursor lands just past the `)`.
+static void _handle_create_unit() {
+    auto name: ptr, player, gx, gy;
+
+    if (_parse_quoted_string(&name) == 0) { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&player) == 0)         { free(name); _skip_arg(); return; }
+    _consume_separator();
+
+    // Expect the `{gx, gy}` table literal.
+    _skip_ws_and_comments();
+    if (_off >= _src_len || peek(_src + _off) != '{') {
+        free(name);
+        _skip_arg();
+        return;
+    }
+    _off++;
+    if (_parse_int(&gx) == 0) { free(name); return; }
+    _consume_separator();
+    if (_parse_int(&gy) == 0) { free(name); return; }
+    _skip_ws_and_comments();
+    if (_off < _src_len && peek(_src + _off) == '}') { _off++; }
+
+    // Walk to the closing ')'.
+    while (_off < _src_len) {
+        if (peek(_src + _off) == ')') { _off++; break; }
+        _off++;
+    }
+
+    name = _strip_unit_prefix(name);
+    _u_kinds  = arr_push(_u_kinds,  name);
+    _u_player = arr_push(_u_player, player);
+    _u_gxs    = arr_push(_u_gxs,    gx);
+    _u_gys    = arr_push(_u_gys,    gy);
+}
+
 // Skip past an entire function-call we don't care about. Cursor
 // starts on the function name; ends just past the matching `)`.
 // Handles nested parens defensively though SMS files don't seem
@@ -357,6 +461,19 @@ static void _scan() {
                 _off++;
                 _handle_set_start_view();
             }
+        } else if (_at_word("CreateUnit")) {
+            // SMS lines look like `unit = CreateUnit(...)`. The
+            // assignment prefix is invisible to us: the scanner
+            // already swallowed `unit` via _skip_unrecognised_call
+            // (which returns when it finds `=` instead of `(`),
+            // then the stray-byte branch ate the `=`, and now the
+            // cursor is sitting on `CreateUnit`.
+            _off += 10;
+            _skip_ws_and_comments();
+            if (_off < _src_len && peek(_src + _off) == '(') {
+                _off++;
+                _handle_create_unit();
+            }
         } else {
             _skip_unrecognised_call();
         }
@@ -421,20 +538,39 @@ static void _emit_json(out_path: ptr) {
     sb = strbuf_cat(sb, "]");
 
     // Entities array. SetStartView calls become `start_view`
-    // entities, one per player slot. Coordinates land in the
-    // cell-centered float convention (gx + 0.5) the level editor
-    // uses for every entity — wc1_map_load reverses the half-cell
-    // back to whole-cell integers.
+    // entities (one per player slot); CreateUnit calls become
+    // entities tagged with the stripped unit name (`peasant`,
+    // `gold-mine`, `peon`, ...). Coordinates land in the cell-
+    // centered float convention (gx + 0.5) the level editor uses
+    // for every entity — wc1_map_load reverses the half-cell back
+    // to whole-cell integers.
+    auto first;
     sb = strbuf_cat(sb, ",\"entities\":[");
+    first = 1;
     n = arr_len(_sv_player);
     for (i = 0; i < n; i++) {
-        if (i > 0) { sb = strbuf_ch(sb, ','); }
+        if (first == 0) { sb = strbuf_ch(sb, ','); }
+        first = 0;
         sb = strbuf_cat(sb, "{\"kind\":\"start_view\",\"player\":");
         sb = strbuf_num(sb, arr_get(_sv_player, i));
         sb = strbuf_cat(sb, ",\"x\":");
         sb = strbuf_num(sb, arr_get(_sv_gxs, i));
         sb = strbuf_cat(sb, ".5,\"y\":");
         sb = strbuf_num(sb, arr_get(_sv_gys, i));
+        sb = strbuf_cat(sb, ".5}");
+    }
+    n = arr_len(_u_kinds);
+    for (i = 0; i < n; i++) {
+        if (first == 0) { sb = strbuf_ch(sb, ','); }
+        first = 0;
+        sb = strbuf_cat(sb, "{\"kind\":\"");
+        sb = strbuf_cat(sb, arr_get(_u_kinds, i));
+        sb = strbuf_cat(sb, "\",\"player\":");
+        sb = strbuf_num(sb, arr_get(_u_player, i));
+        sb = strbuf_cat(sb, ",\"x\":");
+        sb = strbuf_num(sb, arr_get(_u_gxs, i));
+        sb = strbuf_cat(sb, ".5,\"y\":");
+        sb = strbuf_num(sb, arr_get(_u_gys, i));
         sb = strbuf_cat(sb, ".5}");
     }
     sb = strbuf_cat(sb, "]}\n");
@@ -473,6 +609,10 @@ main() {
     _sv_player = arr_new();
     _sv_gxs    = arr_new();
     _sv_gys    = arr_new();
+    _u_kinds   = arr_new();
+    _u_player  = arr_new();
+    _u_gxs     = arr_new();
+    _u_gys     = arr_new();
     _max_gx = 0;
     _max_gy = 0;
 
@@ -500,7 +640,9 @@ main() {
     putnum(_max_gy + 1);
     put(", ");
     putnum(arr_len(_sv_player));
-    put(" start_views)\n");
+    put(" start_views, ");
+    putnum(arr_len(_u_kinds));
+    put(" units)\n");
 
     free(_src);
     arr_free(_tile_ids);
@@ -509,5 +651,15 @@ main() {
     arr_free(_sv_player);
     arr_free(_sv_gxs);
     arr_free(_sv_gys);
+    // Each kind string is heap-owned (str_dup'd in
+    // _handle_create_unit) so free per-entry first, then the
+    // array's slot storage.
+    auto j, kn;
+    kn = arr_len(_u_kinds);
+    for (j = 0; j < kn; j++) { free(arr_get(_u_kinds, j)); }
+    arr_free(_u_kinds);
+    arr_free(_u_player);
+    arr_free(_u_gxs);
+    arr_free(_u_gys);
     return 0;
 }
