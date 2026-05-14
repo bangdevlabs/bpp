@@ -40,9 +40,37 @@ For EVERY `auto x;` at file scope, decide:
 |---------|-----------|---------|
 | Set once in init, never written again | `extrn x;` | `extrn _ARR_HDR;` |
 | Read/written by worker functions | `global x;` | `global _last_dt;` |
-| Compile-time literal | `const X = value;` | `const CELL = 10;` |
+| Compile-time literal (inline, no slot) | `const X = value;` | `const CELL = 10;` |
+| Cross-module immutable, **needs a slot** | `global const X = value;` | `global const SCREEN_W = 320;` |
+| Module-private immutable, **needs a slot** | `static const X = value;` | `static const _MX_MAX_VOICES = 10;` |
 | Intentionally serial, don't promote | `auto x: serial;` | `auto _temp: serial;` |
 | Mutable per-frame state | `auto x;` (keep) | `auto head_x;` |
+
+**`const` vs `global const` vs `static const` — when does each apply.**
+
+`const X = value;` (no qualifier) is **compile-time literal substitution**.
+The parser inlines the value at every use site; no symbol is emitted into
+the data section, no `extrn X;` from another module can resolve to it.
+This is the cheapest form and the right choice for *most* constants.
+
+`global const X = value;` emits a real **read-only slot** into `.data`
+with a global symbol. Other modules can `extrn X;` it, and the compiler
+rejects writes (E263). Use when a constant has to be addressable from a
+different module — typically because the consumer is upstream of the
+declaration in the call graph and cannot inline.
+
+`static const X = value;` is the same shape as `global const` but the
+symbol stays module-private. Use when a constant needs an addressable
+slot but should not leak across modules.
+
+The trap that motivated the dedicated slot variants (sidequest 2026-05-14):
+`stb/stbrender.bsm` declares `extrn SCREEN_W;` and dereferences it inside
+`render_init()`. A consumer game writing `const SCREEN_W = 320;` does NOT
+satisfy that extrn — the const is parser-level only. The fix is `global
+const SCREEN_W = 320;` (or, more commonly, importing `stbgame` /
+`stbwindow` which already define the slot via their own write-once init).
+The compiler now points at this exact distinction via E264 when the
+extrn fails to resolve.
 
 ## Rule 2: Visibility (`static`)
 

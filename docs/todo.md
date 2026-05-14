@@ -781,6 +781,33 @@ becomes the seed for the dedicated session decomposition.
 
 ## Deferred — tracked, revisit when demand arises
 
+- **Tonify Rule 33: composition pattern heuristic (distinct enum vs
+  bit flag)** — back-to-back sidequests on 2026-05-14 (storage class
+  shipped, unsigned annotations queued) chose OPPOSITE structures for
+  what surface-looked similar problems:
+  - Storage class added 2 new **distinct enum** entries
+    (`GLOB_GLOBAL_CONST = 3`, `GLOB_STATIC_CONST = 4`). 5+ code paths
+    diverge (data layout, linker visibility, mutability check, codegen,
+    C-emit). Combinatorial space small. Enum gives clean equality
+    checks.
+  - Unsigned annotation (planned) uses a single **bit flag**
+    (`TY_UNSIGNED_BIT = 0x40` ORed into existing TY_WORD* variants).
+    4 widths × 2 signedness = 8 combinations with 1 const + 4 keywords.
+    Only 3 code paths diverge (DIV/MOD/SHR dispatch). "Unsigned" is a
+    qualifier on width, not a new kind.
+  - The heuristic sketch (3 checks): how many code paths diverge?
+    is the secondary dimension a true qualifier? does the combinatorial
+    space grow with N independent dimensions? Distinct enum for the
+    first; bit flag for the second.
+  - **Trigger to open the sidequest** (Rule 28 killer-use-case):
+    after the unsigned annotations sidequest ships AND the retroactive
+    audit sweep (grep `/ 0x100000000`-class patterns, classify each
+    hit as bit-shift vs `: u_word`) completes. That gives 4-5 concrete
+    examples — enough density to canonize the heuristic as Rule 33.
+    Adding the rule with only the 2 source examples is premature.
+  - Doc-only sidequest when it lands (~30 min): full text drafted
+    in conversation 2026-05-14, ready to paste once examples mature.
+
 - **C emitter SIMD mapping (`: double` + `vec_*`)** — native
   backends (NEON, SSE2) emit `vec_*` as instructions. The C
   transpile path needs `: double` locals typed as `__m128` and

@@ -25,9 +25,20 @@ extrn globals, glob_cnt;
 // a static intent flag that smart dispatch consults to decide whether
 // a loop touching the global is safe to fan out across workers.
 // Per-global storage class (parallel to globals[]). One of GLOB_AUTO,
-// GLOB_GLOBAL, or GLOB_EXTRN. Codegen and the smart-dispatch pass read
-// this to decide whether a loop touching the variable is safe to fan out.
+// GLOB_GLOBAL, GLOB_EXTRN, GLOB_GLOBAL_CONST, or GLOB_STATIC_CONST.
+// Codegen and the smart-dispatch pass read this to decide whether a
+// loop touching the variable is safe to fan out, and whether the slot
+// needs initialised data emitted.
 global glob_class;
+
+// Parallel arrays carrying the initial value for `global const` and
+// `static const` declarations. For all other storage classes the slot
+// at index i is left at 0 and ignored. `glob_init_is_float` tags
+// whether the value should be emitted as float bits (1) or integer
+// (0) — the parser detects this via SHAPE_DECIMAL on the literal,
+// matching the float-const fast path in `parse_const`.
+global glob_init_val;
+global glob_init_is_float;
 
 // Set to 1 by the orchestrator (bpp.bpp) when parsing the entry file's
 // content (module 0). Used by Fix 2 to enforce "main() only in entry file"
@@ -171,6 +182,8 @@ void init_parser() {
     globals = arr_new();
     glob_cnt = 0;
     glob_class = arr_new();
+    glob_init_val = arr_new();
+    glob_init_is_float = arr_new();
     _parser_is_entry = 0;
     externs = arr_new();
     ext_cnt = 0;
@@ -875,6 +888,21 @@ static val_at_ch(off, c) {
     return peek(vbuf + *(addr + 8)) == c;
 }
 
+// Check if the token at offset is a TK_KW with the given keyword
+// value. Lookahead-without-consume — used by composite-keyword
+// dispatch like `global const` where the parser needs to peek the
+// next token before deciding which sub-parser to call.
+static _kw_at_offset(off, s, slen) {
+    auto addr, vs, vl;
+    if (tok_pos + off >= tok_cnt) { return 0; }
+    if (peek_type_at(off) != TK_KW) { return 0; }
+    addr = toks + (tok_pos + off) * 24;
+    vl = *(addr + 16);
+    if (vl != slen) { return 0; }
+    vs = *(addr + 8);
+    return buf_eq(vbuf + vs, s, slen);
+}
+
 // ============================================================
 // ── Module tracking ───────────────────────────────────────────
 // Each function and global records which module it was defined in.
@@ -903,10 +931,57 @@ static void add_global(p, gclass) {
     glob_cnt = arr_len(globals);
     glob_mods = arr_push(glob_mods, tok_mod(tok_pos));
     glob_class = arr_push(glob_class, gclass);
+    // Reserve init-value slots so codegen can index in lockstep.
+    // For non-CONST classes these stay at 0 (ignored). For
+    // GLOB_*_CONST, parse_global_const overwrites the last entry
+    // with the actual compile-time value.
+    glob_init_val = arr_push(glob_init_val, 0);
+    glob_init_is_float = arr_push(glob_init_is_float, 0);
     // Grow glob_pinned alongside — parser may set it via `: serial` hint.
     while (arr_len(glob_pinned) < glob_cnt) {
         glob_pinned = arr_push(glob_pinned, 0);
     }
+}
+
+// Resolve a global symbol's data-section initial value by packed
+// name. Walks globals[] looking for a matching name (pointer-equal
+// or packed_eq); when found, returns the compile-time init value
+// IF the storage class is GLOB_GLOBAL_CONST or GLOB_STATIC_CONST.
+// Returns 0 for any other class (auto/global/extrn fall back to
+// zero-initialised slots, matching the legacy mo_pad / elf_pad
+// behaviour for those classes).
+//
+// Centralises the lookup so every backend's data-section writer
+// (a64 Mach-O, x64 ELF, C emitter) asks the same question and gets
+// the same answer. Writers stay format-only — they never touch
+// glob_class / glob_init_val / globals directly. Storage-class
+// sidequest 2026-05-14: feature placement check (`feedback_feature_
+// placement_canonical.md`) — same bytes flowing through 3 backends
+// means semantic decision belongs in the spine.
+glob_slot_init_value(name_p) {
+    auto j, gp, gclass;
+    j = 0;
+    while (j < glob_cnt) {
+        gp = arr_get(globals, j);
+        if (gp == name_p) {
+            gclass = arr_get(glob_class, j);
+            if (gclass == GLOB_GLOBAL_CONST
+                || gclass == GLOB_STATIC_CONST) {
+                return arr_get(glob_init_val, j);
+            }
+            return 0;
+        }
+        if (packed_eq(gp, name_p)) {
+            gclass = arr_get(glob_class, j);
+            if (gclass == GLOB_GLOBAL_CONST
+                || gclass == GLOB_STATIC_CONST) {
+                return arr_get(glob_init_val, j);
+            }
+            return 0;
+        }
+        j++;
+    }
+    return 0;
 }
 
 // Flag set by try_type_annotation when it encounters `: serial`.
@@ -1512,6 +1587,63 @@ static const_eval_body(body, bcnt) {
 // Parse a const declaration or const function definition.
 // const NAME = expr;           → compile-time constant value
 // const NAME(args) { body }    → compile-time evaluated function
+// Parse `global const NAME = expr;` or `static const NAME = expr;`.
+// Both create a real slot with a global symbol (GLOB_GLOBAL_CONST,
+// visible cross-module) or a local symbol (GLOB_STATIC_CONST,
+// module-private). The initial value is captured at parse time —
+// the RHS must be a compile-time-evaluable expression. Float
+// literals are detected via SHAPE_DECIMAL and stored as raw IEEE
+// bits, mirroring the parse_const float fast path so codegen
+// can emit `.double` directives without re-deriving the bits.
+static void parse_global_const(gclass) {
+    auto name_p, expr_node, val, _const_lit_node: Node, is_float;
+    name_p = cur_packed();
+    consume();   // consume name
+
+    // Optional type annotation (e.g. `: half`, `: float`). The hint
+    // is registered on the global itself via the same plumbing the
+    // mutable-slot path uses, so codegen + smart dispatch see the
+    // same declared type regardless of mutability.
+    try_type_annotation(name_p);
+
+    consume();   // consume '='
+    expr_node = parse_expr();
+
+    // Float-literal fast path. When the RHS is a single SHAPE_DECIMAL
+    // literal, capture the raw IEEE bits (already packed in the T_LIT
+    // node's `a` field) so the emit step can write `.double` for the
+    // exact bit pattern. Without this, const_eval_node truncates to
+    // integer 0 and the slot loses every fractional bit.
+    _const_lit_node = expr_node;
+    is_float = 0;
+    if (_const_lit_node != 0) {
+        if (_const_lit_node.ntype == T_LIT) {
+            if (lit_shape(_const_lit_node) == SHAPE_DECIMAL) {
+                val = _const_lit_node.a;
+                is_float = 1;
+            }
+        }
+    }
+    if (is_float == 0) {
+        // Integer or general-const path. const_eval_node walks
+        // T_BINOP/T_UNARY/T_LIT and returns the resolved word.
+        // Function calls and references to mutable globals will
+        // produce 0 here (silently — the wider diagnostic upgrade
+        // for "const RHS must be compile-time" is out of scope for
+        // this sidequest's first pass).
+        val = const_eval_node(expr_node);
+    }
+
+    add_global(name_p, gclass);
+    // glob_cnt is now 1 past the newly-pushed entry; index it back.
+    arr_set_at(glob_init_val, glob_cnt - 1, val);
+    if (is_float != 0) {
+        arr_set_at(glob_init_is_float, glob_cnt - 1, 1);
+    }
+
+    if (val_is_ch(';')) { consume(); }
+}
+
 static void parse_const() {
     auto name_p, expr_node, val;
     auto params, pcnt, body, bcnt;
@@ -1894,7 +2026,19 @@ void parse_program() {
             if (val_is("auto", 4)) {
                 parse_global(GLOB_AUTO);
             } else if (val_is("global", 6)) {
-                parse_global(GLOB_GLOBAL);
+                // `global const X = expr;` is the storage-class
+                // sidequest path (slot in .data with global symbol).
+                // Plain `global X;` is the legacy worker-shared
+                // mutable. Disambiguate via lookahead — parse_global
+                // assumes the leading keyword is still pending so we
+                // only consume both when const branch is taken.
+                if (_kw_at_offset(1, "const", 5)) {
+                    consume();   // global
+                    consume();   // const
+                    parse_global_const(GLOB_GLOBAL_CONST);
+                } else {
+                    parse_global(GLOB_GLOBAL);
+                }
             } else if (val_is("extrn", 5)) {
                 parse_global(GLOB_EXTRN);
             } else if (val_is("struct", 6)) {
@@ -1924,12 +2068,11 @@ void parse_program() {
                         }
                     }
                     else if (val_is("const", 5)) {
-                        diag_fatal(230);
-                        diag_str("'static const' is not supported — use 'const' or 'static auto' with assignment");
-                        diag_newline();
-                        diag_loc(tok_pos);
-                        diag_show_line(tok_pos);
-                        sys_exit(1);
+                        // `static const X = expr;` — module-private
+                        // .data slot. Replaces the prior E230 hard
+                        // reject. Storage-class sidequest 2026-05-14.
+                        consume();
+                        parse_global_const(GLOB_STATIC_CONST);
                     }
                     else { consume(); }
                 } else if (peek_type() == TK_ID) {
@@ -1961,7 +2104,13 @@ void parse_module(tok_end) {
             if (val_is("auto", 4)) {
                 parse_global(GLOB_AUTO);
             } else if (val_is("global", 6)) {
-                parse_global(GLOB_GLOBAL);
+                if (_kw_at_offset(1, "const", 5)) {
+                    consume();   // global
+                    consume();   // const
+                    parse_global_const(GLOB_GLOBAL_CONST);
+                } else {
+                    parse_global(GLOB_GLOBAL);
+                }
             } else if (val_is("extrn", 5)) {
                 parse_global(GLOB_EXTRN);
             } else if (val_is("struct", 6)) {
@@ -1991,12 +2140,8 @@ void parse_module(tok_end) {
                         }
                     }
                     else if (val_is("const", 5)) {
-                        diag_fatal(230);
-                        diag_str("'static const' is not supported — use 'const' or 'static auto' with assignment");
-                        diag_newline();
-                        diag_loc(tok_pos);
-                        diag_show_line(tok_pos);
-                        sys_exit(1);
+                        consume();
+                        parse_global_const(GLOB_STATIC_CONST);
                     }
                     else { consume(); }
                 } else if (peek_type() == TK_ID) {

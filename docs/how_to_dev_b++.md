@@ -471,7 +471,39 @@ x = pixel & 0xFF;   // compiler emits byte-sized arithmetic
 the critical rule that `*(ptr + 8)` does NOT work for sliced
 struct fields (must use `auto n: Node; n.a` pattern).
 
-### §4.5 — What this chapter does NOT cover
+### §4.5 — Constants and storage classes
+
+A constant in B++ takes one of three shapes, picked by whether the
+value needs a real data slot the linker can address:
+
+```c
+// Inline literal substitution. The parser splices the value at every
+// use site; no symbol enters the data section. Cheapest form, right
+// for almost every "named magic number" use case.
+const CELL = 16;
+const PI   = 3.14159;          // float bits preserved via SHAPE_DECIMAL
+
+// Cross-module immutable slot. Emits a real .data entry with a global
+// symbol so other modules can `extrn X;` it. The compiler rejects
+// writes (E263 — "cannot assign to const slot 'X'").
+global const SCREEN_W = 320;
+
+// Module-private immutable slot. Same shape as `global const` but the
+// symbol is local to the module — invisible to `extrn` from elsewhere.
+static const _MX_MAX_VOICES = 10;
+```
+
+The trap to avoid: `const X = N;` does **not** satisfy an `extrn X;`
+declared in another module. The const is parser-only; the extrn wants
+a slot. If a stb cartridge declares `extrn SCREEN_W;` and uses it in
+a function body, the consumer game must either `import` a module that
+defines the slot (`stbgame` / `stbwindow` both do) or declare its own
+`global const SCREEN_W = N;`. The compiler now flags the gap with
+E264, listing all three fix paths.
+
+See Tonify Rule 1 for the full storage-class decision table.
+
+### §4.6 — What this chapter does NOT cover
 
 - **Type inference engine internals** — `src/bpp_types.bsm`, covered
   in Cap 21 as part of parser/analysis pipeline.
@@ -676,23 +708,49 @@ or returned from builder functions.
 
 ### §5.6 — The Maestro pattern (introduction)
 
-For games that want structured concurrency (main thread does I/O
-+ render, worker threads do pure compute), `bpp_maestro.bsm`
-provides a callback registration API:
+For games that want structured concurrency (main thread orchestrates
+input + state + render, worker pool runs the parallel compute that
+the program dispatches), `bpp_maestro.bsm` provides a callback
+registration API:
 
 ```c
 main() {
     maestro_register_init(fn_ptr(my_init));
-    maestro_register_solo(fn_ptr(my_solo));      // every frame, main
-    maestro_register_base(fn_ptr(my_physics));   // every frame, worker
-    maestro_register_render(fn_ptr(my_render));
+    maestro_register_solo(fn_ptr(my_solo));      // every tick, main thread
+    maestro_register_base(fn_ptr(my_physics));   // every tick, main thread; dispatches parallel work
+    maestro_register_render(fn_ptr(my_render));  // every frame, main thread
     maestro_run();
     return 0;
 }
 ```
 
-Full details in Cap 24. Effect annotations are the mechanism that
-lets maestro dispatch to the right thread.
+**All four callbacks (init / solo / base / render) execute on the
+main thread** — maestro calls them in sequence each tick via a plain
+function call. What makes `base` the parallel-dispatch phase is the
+convention that programs use it to call `job_submit` or
+`job_parallel_for`, which fans work out to the worker pool. Maestro
+then calls `job_wait_all` automatically after `base` returns so the
+next phase sees the completed worker results.
+
+```c
+// Inside `my_physics`, dispatch parallel work to the worker pool:
+void my_physics(dt: float) {
+    job_parallel_for(n_units, fn_ptr(update_one_unit));   // workers run this
+    // After we return, maestro calls job_wait_all on our behalf.
+}
+
+// THIS is the worker entry — runs on a bpp_job worker thread.
+// `@safe` here is the contract the worker pool depends on.
+static void update_one_unit(idx) @safe { ... }
+```
+
+The `@safe` annotation lives on the worker entry (`update_one_unit`),
+**not on the maestro callback** (`my_physics`). The callback can
+allocate, do IO, or touch the GPU freely — it runs on main thread.
+The dispatched function runs on a worker thread and must satisfy the
+bounded contract; see §5.4 and Tonify Rule 4.
+
+Full details in Cap 24 (Maestro concurrency).
 
 ### §5.7 — What this chapter does NOT cover
 
@@ -1844,6 +1902,361 @@ shasum /tmp/bpp_verify /tmp/bpp_verify2   # must match
 cp /tmp/bpp_verify2 ./bpp
 ./tests/run_all.sh                         # must be green
 ```
+
+---
+
+## Cap 24 — Maestro concurrency
+
+`bpp_maestro.bsm` is the structured-concurrency runtime that every
+B++ game and tool uses for its main loop. It owns three things:
+
+- the **worker thread pool** (spun up via `bpp_job` at run start),
+- the **frame timing** (fixed-timestep accumulator, sleep budget),
+- the **callback registration** that turns a program's `solo` /
+  `base` / `render` functions into a coordinated tick.
+
+The §5.6 introduction showed the registration shape. This chapter
+goes deeper: thread topology, the parallel-dispatch pattern, how
+`@safe` participates, and the timing knobs.
+
+### §24.0 — Mental model: bandleader plus orchestra
+
+Maestro is a **bandleader on the main stage**. The main thread
+calls `maestro_run`, which drives the entire program from there.
+The worker pool is the **orchestra** — N OS threads parked in their
+spin loops waiting for jobs.
+
+```
+[main thread]
+  maestro_run()                                ← driver
+    job_init(N_WORKERS)                        ← spawns orchestra
+    loop forever:
+      solo_callback(dt)                        ← on main; reads input, mutates state
+      base_callback(dt)                        ← on main; dispatches parallel work
+         └─ inside: job_parallel_for(N, fn) ─→ [worker 1] runs fn(0)
+                                                [worker 2] runs fn(1)
+                                                [worker 3] runs fn(2)
+                                                [worker 4] runs fn(3)
+      job_wait_all()                           ← on main; barrier
+      render_callback(alpha)                   ← on main; draws to GPU
+    job_shutdown()                             ← joins orchestra
+```
+
+Every callback registered with maestro runs on the **main thread**.
+Maestro never schedules a callback onto a worker. What `base` does
+is *dispatch* worker work via `bpp_job` (`job_submit`,
+`job_parallel_for`); the dispatched function is the worker entry
+and runs on a worker thread.
+
+### §24.1 — Phase order on every tick
+
+```c
+//   1. Accumulate elapsed time into a bucket.
+//   2. While bucket >= fixed_dt:
+//        a. solo(fixed_dt)        — main thread
+//        b. base(fixed_dt)        — main thread; dispatches parallel work
+//        c. job_wait_all()        — barrier, drain workers
+//        d. bucket -= fixed_dt
+//   3. render(alpha)              — main thread; alpha = how far through the
+//                                   physics step the renderer is for interpolation
+//   4. Sleep to fit frame budget.
+```
+
+`solo` is the place for input + state mutation. `base` is the place
+for parallelizable per-frame compute (physics, AI step, ECS system
+walks). `render` is the place for GPU draw submission. The split is
+convention — maestro doesn't enforce it — but every game in the
+repo follows it.
+
+### §24.2 — Thread topology
+
+| Code | Thread |
+|------|--------|
+| `init_callback` | main thread |
+| `solo_callback` | main thread |
+| `base_callback` | main thread |
+| `render_callback` | main thread |
+| `quit_callback` | main thread |
+| `job_submit` argument fn | worker thread (round-robin assigned) |
+| `job_parallel_for` argument fn | worker threads (fan-out across pool) |
+| Audio callback (`stbaudio`-owned) | audio realtime thread (platform-opaque) |
+
+The audio realtime thread is **not** B++-managed — CoreAudio (macOS)
+or ALSA (Linux) calls into the platform layer and the layer pushes
+samples it picks up from `stbmixer`'s SPSC ring. No user code runs
+there directly.
+
+The single rule: **`@safe` is required for any function that the
+program hands to `job_submit` / `job_parallel_for` / `stbecs`'s
+`SYS_PARALLEL` registration / a stbaudio callback registration.**
+Maestro callbacks themselves don't need `@safe` — they're main-
+thread code and can allocate, do IO, touch the GPU freely.
+
+### §24.3 — Dispatching parallel work from `base`
+
+Inside the `base` callback, dispatch via one of three patterns:
+
+**Pattern 1 — Fan out N independent tasks (most common).**
+
+```c
+// Worker entry: bounded, @safe, called once per index.
+static void update_unit(idx) @safe {
+    auto u: Unit;
+    u = units + idx * sizeof(Unit);
+    u.x = u.x + u.vx;
+    u.y = u.y + u.vy;
+}
+
+// base callback — main thread.
+void game_base(dt: float) {
+    job_parallel_for(n_units, fn_ptr(update_unit));
+    // workers process indices 0..n_units-1 in parallel;
+    // maestro calls job_wait_all() after we return.
+}
+```
+
+`job_parallel_for(n, fn)` divides `n` indices across the workers
+round-robin. Each worker calls `fn(i)` for its slice. The function
+must be `@safe`.
+
+**Pattern 2 — Submit specific jobs.**
+
+```c
+job_submit(fn_ptr(task_a), 0);    // → worker 0
+job_submit(fn_ptr(task_b), 0);    // → worker 1
+job_submit(fn_ptr(task_c), 0);    // → worker 2
+```
+
+`job_submit(fn, arg)` queues a single call `fn(arg)` onto the next
+worker in round-robin order. Use when you have heterogeneous tasks
+rather than a uniform fan-out.
+
+**Pattern 3 — Parallel reduce.**
+
+```c
+auto total;
+total = job_parallel_reduce(n_units, fn_ptr(unit_damage_sum));
+```
+
+Like `parallel_for` but each worker returns a value; the runtime
+sums (or otherwise reduces) the results into a single return. The
+reducer function is `@safe` and pure.
+
+### §24.4 — `@safe` and worker entries
+
+The worker entry is the function passed to `job_submit`,
+`job_parallel_for`, or `job_parallel_reduce`. Two contracts pin
+its shape:
+
+- **`@safe`** — proves to the compiler that the call graph stays
+  bounded (no malloc, no IO, no GPU calls, no syscalls, no
+  blocking). The compiler verifies via W026; mis-annotation is a
+  hard error at compile time.
+- **Per-tick liveness** — the function holds nothing that outlives
+  the tick. The worker thread reuses its stack across jobs; the
+  function should not stash pointers expecting them to survive.
+
+Concretely:
+
+```c
+static void physics_step(idx) @safe {
+    // OK — arithmetic, struct field reads/writes, peek/poke.
+    auto u: Unit;
+    u = units + idx * sizeof(Unit);
+    u.x = u.x + u.vx;
+
+    // NOT OK — compiler rejects via W026.
+    // auto buf; buf = malloc(64);          // heap → reject
+    // put("update step\n");                // io → reject
+    // render_sprite(tex, x, y, 1);         // gpu → reject
+    // mutex_lock(some_lock);               // blocking → reject
+}
+```
+
+The `@safe` annotation is opt-in for general code — Tonify Rule 4
+says "annotate only when MUST satisfy the contract." For worker
+entries the answer is always yes; not annotating means "no
+compiler verification," which is the silent variant of "I'm
+going to crash audibly later."
+
+### §24.5 — The `job_wait_all` barrier
+
+Maestro calls `job_wait_all` automatically after `base` returns.
+This is the **physics-render synchronization barrier**: nothing
+after the barrier sees worker state mid-update. The renderer
+always reads a consistent post-physics snapshot.
+
+If a `base` callback dispatches no workers, `job_wait_all` is a
+near-zero-cost no-op (the worker queues are empty and the wait
+returns immediately).
+
+For programs that want explicit job control without maestro:
+
+```c
+// Without maestro — direct bpp_job usage.
+main() {
+    job_init(4);
+    job_parallel_for(1000, fn_ptr(work_fn));
+    job_wait_all();              // explicit barrier
+    job_shutdown();
+    return 0;
+}
+```
+
+This is the pattern that batch processors, headless tools, and
+test harnesses use.
+
+### §24.6 — Decoupling `physics_hz` from `fps`
+
+By default `physics_hz == fps` (one solo+base tick per render
+frame). For grid games (snake, turn-based, anything where physics
+is coarse) decouple:
+
+```c
+maestro_configure(60);                    // render at 60 fps
+maestro_set_physics_hz(10);               // but physics at 10 Hz
+maestro_register_render(fn_ptr(my_render));
+```
+
+The accumulator pattern (Glenn Fiedler's "Fix Your Timestep")
+guarantees solo and base run at the configured rate regardless of
+display refresh. When physics is slower than render, `render`
+receives a non-zero `alpha` parameter (range 0.0 to 1.0) telling it
+how far between the last and next physics tick — useful for
+interpolating sprite positions so they look smooth at 60 fps even
+though physics ticked at 10 Hz.
+
+```c
+void my_render(alpha: float) {
+    // alpha = 0.0 right after a physics tick;
+    // alpha → 1.0 just before the next one.
+    auto x: float;
+    x = prev_x + (cur_x - prev_x) * alpha;
+    render_sprite_at(x, y);
+}
+```
+
+### §24.7 — The dt convention
+
+Since 2026-05-04, every maestro callback that receives a delta
+receives **float seconds**:
+
+```c
+void my_physics(dt: float) {
+    // dt is fixed_dt converted to seconds (e.g. 1/60 = 0.01667).
+    // Direct multiplication reads as the physics formula:
+    pos = pos + vel * dt;
+}
+```
+
+This matches Unity's `Time.deltaTime`, Unreal's
+`FApp::GetDeltaTime`, Bevy's `Res<Time>.delta_seconds`. The earlier
+integer-millisecond convention forced every callsite to divide by
+1000 + dropped sub-millisecond precision.
+
+Annotate the parameter `: float` on public callbacks (Tonify
+Rule 13) so flow analysis can verify call-site shape; without the
+annotation the value still arrives correctly via the AAPCS64 /
+SysV float-register path, but the type checker can't catch arg
+shape mismatches.
+
+### §24.8 — Worker pool size
+
+Default = 4 workers. Override before `maestro_run`:
+
+```c
+maestro_configure(60);
+maestro_set_workers(8);           // 8 workers instead of 4
+maestro_register_*(...);
+maestro_run();
+```
+
+Recommended values: match the machine's physical core count for
+CPU-bound workloads (Apple Silicon M1: 8, M2 Pro: 10-12, Linux
+desktop: `nproc`). For audio-heavy programs that share cores with
+the audio realtime thread, leave one core unallocated (e.g. 7
+workers on an 8-core M1) so the audio thread always has a free
+core.
+
+### §24.9 — Clean shutdown
+
+```c
+maestro_quit();                   // signal the loop to exit
+```
+
+Callable from any callback (solo, base, render, signal handler).
+The loop finishes the current tick, calls the user's `quit_callback`
+on the main thread, drains the worker pool via `job_shutdown`, and
+returns from `maestro_run` to `main`.
+
+Maestro disarms the SIGPROF profiler timer before shutdown so the
+profiler signal can't fire mid-`pthread_join` (race fix landed
+2026-05-07).
+
+### §24.10 — Worked example: per-frame parallel physics
+
+```c
+import "stbgame.bsm";
+import "stbecs.bsm";
+
+extrn world;
+
+static void update_unit(idx) @safe {
+    auto u;
+    u = ecs_get(world, pos_comp, idx);
+    u.x = u.x + u.vx;
+    u.y = u.y + u.vy;
+}
+
+void game_solo(dt: float) {
+    // input — input_axis returns float; physics consumes via globals
+}
+
+void game_base(dt: float) {
+    auto n;
+    n = ecs_count(world);
+    job_parallel_for(n, fn_ptr(update_unit));
+    // maestro calls job_wait_all() after we return
+}
+
+void game_render(alpha: float) {
+    render_clear(BLACK);
+    // walk ECS, draw sprites; interpolate with alpha if physics_hz < fps
+}
+
+main() {
+    game_init(320, 240, "demo", 60);
+    world = ecs_new(1024);
+    // ... spawn units ...
+    maestro_register_solo(fn_ptr(game_solo));
+    maestro_register_base(fn_ptr(game_base));
+    maestro_register_render(fn_ptr(game_render));
+    maestro_run();
+    return 0;
+}
+```
+
+The annotation on `update_unit` is the contract that lets the
+worker pool run it safely; the lack of annotation on `game_base`
+is the convention that lets the callback dispatch + return without
+needing the bounded discipline (it's main-thread code).
+
+### §24.11 — What this chapter does NOT cover
+
+- **`bpp_job` internals** — SPSC ring layout, memory barriers,
+  round-robin counter — live in `src/bpp_job.bsm`'s source comments.
+  Read them when you need to understand why a job took longer than
+  expected or want to write a custom dispatcher.
+- **Audio thread integration** — the SPSC ring between `stbmixer`
+  and the platform audio thread is documented in `stb++_lib.md`
+  Cap 30 (stbmixer) and lives outside maestro's scope.
+- **The profiler hook timeline** — `_prof_capture(0)` fires at every
+  phase boundary; the captured samples feed `stbprofile`'s HUD.
+  Sampling cadence and SIGPROF mechanics are covered in
+  `stb++_lib.md` Cap 56 (stbprofile).
+- **Custom job dispatchers** — work-stealing, priority queues,
+  affinity pinning. None ship today; promote when a real consumer
+  proves the need.
 
 ---
 

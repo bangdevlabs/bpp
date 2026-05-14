@@ -1043,9 +1043,26 @@ void mo_resolve_relocations(gl_names, gl_count) {
                 // Target address (within __DATA): data_off + gl_idx * 8.
                 target_addr = mo_data_off + gl_idx * 8;
             } else {
-                diag_str("internal error: global '");
+                // E264 — extrn references a name with no backing
+                // definition in the link graph. Common cause: writing
+                // `const X = N;` (parser-level literal substitution,
+                // emits no symbol) when something declares `extrn X;`
+                // expecting a real slot. The fix is one of three
+                // shapes; the diagnostic spells them out so the
+                // programmer can pick without reading the spec.
+                diag_error(264);
+                diag_str("extrn '");
                 diag_packed(sym);
-                diag_str("' not found in data section\n");
+                diag_str("' has no backing definition in the link graph");
+                diag_newline();
+                diag_help("declare a slot with one of:");
+                diag_help_packed("  - 'global const ", sym,
+                                  " = N;' (cross-module immutable, .data slot)");
+                diag_help_packed("  - 'auto ", sym,
+                                  ";' + write-once init (Rule 1 discipline, mutable slot)");
+                diag_help("  - import a module that defines it (e.g. stbgame / stbwindow define SCREEN_W)");
+                diag_help_packed("note: 'const ", sym,
+                                  " = N;' is compile-time literal substitution and emits no symbol");
                 sys_exit(2);
             }
         }
@@ -1253,8 +1270,27 @@ void write_macho(filename, main_label, gl_names, gl_count) {
     // Layout: globals (zero-initialized) + float literals (raw IEEE 754 bytes).
     if (has_data) {
         mo_pad(mo_data_off - mo_pos);
-        // Write globals as zero-initialized 8-byte slots.
-        mo_pad(gl_count * 8);
+        // Write globals one slot at a time. Most slots resolve to 0
+        // (GLOB_AUTO / GLOB_GLOBAL / GLOB_EXTRN); GLOB_*_CONST slots
+        // carry a compile-time init value. The storage-class lookup
+        // lives in the spine (`glob_slot_init_value` in bpp_parser.bsm)
+        // because it's semantic, not target-format-specific — every
+        // backend writer asks the same question. Storage class
+        // sidequest 2026-05-14 + DRY pass same day.
+        auto _gd_i, _gd_val;
+        _gd_i = 0;
+        while (_gd_i < gl_count) {
+            _gd_val = glob_slot_init_value(arr_get(gl_names, _gd_i));
+            // Split the 64-bit value into two 32-bit halves. Use bit
+            // shift (matches the existing mo_flt_data emit pattern
+            // a few lines below) instead of `/ 0x100000000` — the
+            // division path rounds toward zero for negatives and
+            // silently truncates the upper word, breaking negative
+            // const slots like `global const NEG = -1947;`.
+            mo_w32(_gd_val & 0xFFFFFFFF);
+            mo_w32((_gd_val >> 32) & 0xFFFFFFFF);
+            _gd_i++;
+        }
         // Write float literals as 8-byte IEEE 754 doubles.
         // Each entry in mo_flt_data is a raw 64-bit IEEE 754 value.
         i = 0;
