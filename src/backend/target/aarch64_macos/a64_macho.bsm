@@ -549,10 +549,10 @@ void mo_write_lc_main() {
 void mo_write_lc_uuid() {
     mo_w32(0x1B);                   // cmd (LC_UUID)
     mo_w32(24);                     // cmdsize
-    mo_w64(_bug_build_id_lo & 0xFFFFFFFF,
-           (_bug_build_id_lo >> 32) & 0xFFFFFFFF);
-    mo_w64(_bug_build_id_hi & 0xFFFFFFFF,
-           (_bug_build_id_hi >> 32) & 0xFFFFFFFF);
+    // _bug_build_id_lo / _hi are : u_word so >> 32 emits LSR;
+    // the explicit mask is redundant.
+    mo_w64(_bug_build_id_lo, _bug_build_id_lo >> 32);
+    mo_w64(_bug_build_id_hi, _bug_build_id_hi >> 32);
 }
 
 // LC_LOAD_DYLIB (56 bytes): "/usr/lib/libSystem.B.dylib".
@@ -1129,7 +1129,8 @@ void mo_resolve_relocations(gl_names, gl_count) {
 //   gl_count   — number of global variables
 void write_macho(filename, main_label, gl_names, gl_count) {
     auto fd, written, code_size, main_code_off;
-    auto nseg, has_data, i, et_actual, flt_bits;
+    auto nseg, has_data, i, et_actual;
+    auto flt_bits: u_word;
 
     code_size = enc_pos;
 
@@ -1277,18 +1278,18 @@ void write_macho(filename, main_label, gl_names, gl_count) {
         // because it's semantic, not target-format-specific — every
         // backend writer asks the same question. Storage class
         // sidequest 2026-05-14 + DRY pass same day.
-        auto _gd_i, _gd_val;
+        auto _gd_i;
+        auto _gd_val: u_word;
         _gd_i = 0;
         while (_gd_i < gl_count) {
             _gd_val = glob_slot_init_value(arr_get(gl_names, _gd_i));
-            // Split the 64-bit value into two 32-bit halves. Use bit
-            // shift (matches the existing mo_flt_data emit pattern
-            // a few lines below) instead of `/ 0x100000000` — the
-            // division path rounds toward zero for negatives and
-            // silently truncates the upper word, breaking negative
-            // const slots like `global const NEG = -1947;`.
-            mo_w32(_gd_val & 0xFFFFFFFF);
-            mo_w32((_gd_val >> 32) & 0xFFFFFFFF);
+            // Split the 64-bit value into two 32-bit halves. The
+            // u_word annotation routes >> 32 to LSR (zero-fill)
+            // so negative const slots like `global const NEG =
+            // -1947;` keep their high bits intact instead of
+            // sign-extending into the upper word.
+            mo_w32(_gd_val);
+            mo_w32(_gd_val >> 32);
             _gd_i++;
         }
         // Write float literals as 8-byte IEEE 754 doubles.
@@ -1296,8 +1297,8 @@ void write_macho(filename, main_label, gl_names, gl_count) {
         i = 0;
         while (i < arr_len(mo_flt_data)) {
             flt_bits = arr_get(mo_flt_data, i);
-            mo_w32(flt_bits & 0xFFFFFFFF);
-            mo_w32((flt_bits >> 32) & 0xFFFFFFFF);
+            mo_w32(flt_bits);
+            mo_w32(flt_bits >> 32);
             i++;
         }
         // Write string literal data (raw bytes copied from mo_sdata).
