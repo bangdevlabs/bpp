@@ -503,7 +503,40 @@ E264, listing all three fix paths.
 
 See Tonify Rule 1 for the full storage-class decision table.
 
-### §4.6 — What this chapter does NOT cover
+### §4.6 — Unsigned annotations (`: u_word` family)
+
+Four annotations declare a variable as **unsigned**:
+
+```c
+auto h: u_word;        // 64-bit unsigned int
+auto pixel: u_byte;    // 8-bit unsigned int (lane in a packed RGBA)
+auto code: u_quarter;  // 16-bit unsigned int
+auto idx: u_half;      // 32-bit unsigned int
+```
+
+The bit pattern in memory is identical to the signed counterpart.
+The annotation only steers codegen for three operators where signed
+and unsigned diverge: `/` (UDIV vs SDIV), `%` (unsigned vs signed
+remainder), and `>>` (LSR/zero-fill vs ASR/sign-extend). Every
+other operator (`+`, `-`, `*`, `&`, `|`, `^`, `<<`, `==`, etc.) is
+bit-identical in two's-complement and stays on the signed path.
+
+The dispatch is **LHS-only**: `z = x / y` looks at `x`'s type, not
+`y`'s. This mirrors the float-promotion convention. Mixed-sign
+arithmetic picks the LHS interpretation and runs.
+
+When to reach for `: u_word`:
+
+- Hashing — `idx = hash % cap` where the hash's top bit may be set;
+  signed `%` returns negative remainders that blow array bounds.
+- Bitfields packed into the high bits of a word; unsigned `>>`
+  extracts the field cleanly without sign-extension corruption.
+- Reading byte streams as 64-bit words (file decoders, packed
+  formats).
+
+See Tonify Rule 32 for the full table + cross-references.
+
+### §4.7 — What this chapter does NOT cover
 
 - **Type inference engine internals** — `src/bpp_types.bsm`, covered
   in Cap 21 as part of parser/analysis pipeline.

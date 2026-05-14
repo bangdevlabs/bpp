@@ -2186,3 +2186,94 @@ editor. Discuss before forking; restraint-bias per Rule 28.
   game): drop a memory entry like
   `project_<game>_bang9_editable_meta.md` so future sessions
   inherit the format choice without re-deciding.
+
+## Rule 32: `: u_word` family — unsigned semantics for `/`, `%`, `>>`
+
+The `: u_word` / `: u_half` / `: u_quarter` / `: u_byte`
+storage-class annotations declare the variable as **unsigned**.
+The bit pattern stored in memory is unchanged — these annotations
+only affect the codegen for three operators where signed and
+unsigned semantics diverge:
+
+| Operator | Signed (default) | With `: u_*` LHS                |
+|----------|------------------|---------------------------------|
+| `/`      | SDIV / IDIV      | UDIV / DIV (zero-extend RDX)    |
+| `%`      | signed remainder | unsigned remainder              |
+| `>>`     | ASR / SAR (sign) | LSR / SHR (zero-fill)           |
+
+Every other operator (`+`, `-`, `*`, `&`, `|`, `^`, `<<`, `==`,
+`!=`, `<`, `>`, `<=`, `>=`) is **bit-identical** in two's-complement
+and stays on the existing signed path — no annotation needed.
+
+### Dispatch is LHS-only
+
+The smart dispatch reads `n.b.itype` (left-hand operand). The
+right-hand side's annotation is ignored. This mirrors the float
+dispatch convention: `auto x: u_word; auto y; z = x / y;` picks
+the unsigned path. `auto x; auto y: u_word; z = x / y;` does NOT.
+
+Rationale: the LHS carries the dividend / shifted-value semantics.
+A "mixed" expression has to pick one — picking LHS keeps the
+contract local to the variable the programmer annotated.
+
+### When to use
+
+Reach for `: u_word` when the high bit carries data, not sign:
+
+- **Bitfields packed into the top bits of a word** — e.g. tagged
+  pointers, packed array lengths, hash tables that use the high
+  byte for a generation counter. Without the annotation,
+  `>> N` sign-extends and corrupts the read.
+- **Hash buckets, modulo addressing into power-of-two tables** —
+  `idx % cap` where `idx` is a 64-bit hash. Signed `%` returns
+  negative remainders for hashes with the top bit set, which
+  blows the array bounds check.
+- **Reading byte streams as 64-bit words** — file decoders that
+  pack 8 bytes into a `word` and shift them out.
+
+Stay on the default signed path otherwise. Most B++ code treats
+`word` as a generic integer where the sign just works.
+
+### Example
+
+```bpp
+auto h: u_word, idx;
+h = hash64(key);
+idx = h % cap;        // unsigned mod — never negative
+```
+
+Versus the signed default:
+
+```bpp
+auto h, idx;
+h = hash64(key);
+idx = h % cap;        // signed mod — may be negative when h's top bit is set
+```
+
+### Don't write the workaround
+
+Pre-Rule-32 code worked around this with explicit masking:
+
+```bpp
+idx = (h >> 1) & 0x7FFFFFFFFFFFFFFF;   // strip sign bit, then divide
+idx = idx % cap;
+```
+
+That pattern compiles and ran for years. The annotation
+replaces it with one source-level character. After landing
+this rule, audit for `>> 1` followed by an `& 0x7FFF...`
+mask — those are candidates to migrate to `: u_word` and
+delete the mask.
+
+### Cross-references
+
+- `src/bpp_codegen.bsm` — type-helper definitions (`is_unsigned_type`,
+  `is_int_type`).
+- `src/backend/chip/aarch64/a64_codegen.bsm` T_BINOP — dispatch site
+  (a64 path).
+- `src/backend/chip/x86_64/x64_codegen.bsm` T_BINOP — dispatch site
+  (x64 path).
+- `src/backend/c/bpp_emitter.bsm` T_BINOP — `(uint64_t)` cast wrap
+  for the C transpiler.
+- Smoke tests: `tests/test_unsigned_div.bpp`, `_mod.bpp`, `_shr.bpp`,
+  `_arith_shared.bpp`.
