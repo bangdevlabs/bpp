@@ -72,6 +72,16 @@ extrn _tile_gys;
 auto _max_gx;
 auto _max_gy;
 
+// Accumulated SetStartView calls. WC1 SMS files declare one per
+// player slot — `SetStartView(player, gx, gy)` — typically three
+// for the campaign maps (player 0 is the human, 1-2 are AI). We
+// emit every recorded view as a `start_view` entity in the JSON
+// so the level editor can show them and the game can pick the
+// player it cares about (rts1 reads player 0 today).
+extrn _sv_player;
+extrn _sv_gxs;
+extrn _sv_gys;
+
 // ── Byte-level helpers (leaves first per Tonify Rule 27) ────
 
 // Return 1 when byte `c` is ASCII whitespace (space, tab, CR, LF)
@@ -244,6 +254,30 @@ static void _handle_set_tile() {
     if (gy > _max_gy) { _max_gy = gy; }
 }
 
+// Handle `SetStartView(player, gx, gy)`. Cursor positioned just
+// past the `(`. Records the player + grid coords into the parallel
+// arrays; the JSON emitter walks them later. Cursor lands just
+// past the `)`.
+static void _handle_set_start_view() {
+    auto player, gx, gy;
+
+    if (_parse_int(&player) == 0) { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&gx) == 0)     { _skip_arg(); return; }
+    _consume_separator();
+    if (_parse_int(&gy) == 0)     { _skip_arg(); return; }
+
+    // Walk to the closing ')'.
+    while (_off < _src_len) {
+        if (peek(_src + _off) == ')') { _off++; break; }
+        _off++;
+    }
+
+    _sv_player = arr_push(_sv_player, player);
+    _sv_gxs    = arr_push(_sv_gxs,    gx);
+    _sv_gys    = arr_push(_sv_gys,    gy);
+}
+
 // Skip past an entire function-call we don't care about. Cursor
 // starts on the function name; ends just past the matching `)`.
 // Handles nested parens defensively though SMS files don't seem
@@ -312,6 +346,17 @@ static void _scan() {
                 _off++;
                 _handle_set_tile();
             }
+        } else if (_at_word("SetStartView")) {
+            // Past the identifier and the `(`. Order matters: this
+            // branch must come before the SetTile branch is widened
+            // — both start with "Set" and `_at_word` only succeeds
+            // on a full match against a non-identifier byte after.
+            _off += 12;
+            _skip_ws_and_comments();
+            if (_off < _src_len && peek(_src + _off) == '(') {
+                _off++;
+                _handle_set_start_view();
+            }
         } else {
             _skip_unrecognised_call();
         }
@@ -373,6 +418,25 @@ static void _emit_json(out_path: ptr) {
         }
         sb = strbuf_ch(sb, ']');
     }
+    sb = strbuf_cat(sb, "]");
+
+    // Entities array. SetStartView calls become `start_view`
+    // entities, one per player slot. Coordinates land in the
+    // cell-centered float convention (gx + 0.5) the level editor
+    // uses for every entity — wc1_map_load reverses the half-cell
+    // back to whole-cell integers.
+    sb = strbuf_cat(sb, ",\"entities\":[");
+    n = arr_len(_sv_player);
+    for (i = 0; i < n; i++) {
+        if (i > 0) { sb = strbuf_ch(sb, ','); }
+        sb = strbuf_cat(sb, "{\"kind\":\"start_view\",\"player\":");
+        sb = strbuf_num(sb, arr_get(_sv_player, i));
+        sb = strbuf_cat(sb, ",\"x\":");
+        sb = strbuf_num(sb, arr_get(_sv_gxs, i));
+        sb = strbuf_cat(sb, ".5,\"y\":");
+        sb = strbuf_num(sb, arr_get(_sv_gys, i));
+        sb = strbuf_cat(sb, ".5}");
+    }
     sb = strbuf_cat(sb, "]}\n");
 
     file_write_all(out_path, sb, strbuf_len(sb));
@@ -403,9 +467,12 @@ main() {
     }
     _src_len = fsize;
 
-    _tile_ids = arr_new();
-    _tile_gxs = arr_new();
-    _tile_gys = arr_new();
+    _tile_ids  = arr_new();
+    _tile_gxs  = arr_new();
+    _tile_gys  = arr_new();
+    _sv_player = arr_new();
+    _sv_gxs    = arr_new();
+    _sv_gys    = arr_new();
     _max_gx = 0;
     _max_gy = 0;
 
@@ -431,11 +498,16 @@ main() {
     putnum(_max_gx + 1);
     put("×");
     putnum(_max_gy + 1);
-    put(")\n");
+    put(", ");
+    putnum(arr_len(_sv_player));
+    put(" start_views)\n");
 
     free(_src);
     arr_free(_tile_ids);
     arr_free(_tile_gxs);
     arr_free(_tile_gys);
+    arr_free(_sv_player);
+    arr_free(_sv_gxs);
+    arr_free(_sv_gys);
     return 0;
 }
