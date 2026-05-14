@@ -26,7 +26,10 @@ import "stbgame.bsm";
 import "stbrender.bsm";
 import "stbtile.bsm";
 import "stbimage.bsm";       // for file_watch_register / file_watch_tick
+import "stbecs.bsm";         // ECS world for unit entities
 load   "wc1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
+load   "wc1_units.bsm";
+load   "wc1_render.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
@@ -43,6 +46,18 @@ const SCREEN_H = 240;
 
 // Allocated once in main, never reassigned — Tonify Rule 1.
 extrn map;
+
+// ECS world holding every unit entity. Sized for 256 — covers
+// Session 3's "spawn one peasant from forest1.json" plus headroom
+// for the production economy + AI that arrives in Sessions 6-9.
+// When that lands, revisit the cap.
+extrn world;
+
+// Peasant atlas handle. Loaded from the atlas_grid sister JSON
+// (see assets/sprites/wc1/peasant.json). Hot-reload registered so
+// edits to the JSON or the underlying PNG re-propagate via
+// image_hot_reload_tick_throttled.
+extrn peasant_atlas;
 
 // Path used by both the initial load and the hot-reload callback.
 // Kept in a global so the callback (which receives no arguments,
@@ -113,22 +128,73 @@ main() {
     // edits in Bang 9.
     file_watch_register(_map_json_path, fn_ptr(_reload_map));
 
+    // Peasant atlas. Loaded from the atlas_grid sister JSON; the
+    // resolver concatenates JSON-dir + the `image` field and lets
+    // the OS open() collapse the `..` segments (see Tonify Rule 31
+    // + asset_formats.md "Atlas Grid JSON" entry). Hot-reload is
+    // opt-in; once enabled, edits to the JSON OR the underlying
+    // PNG re-propagate via image_hot_reload_tick_throttled().
+    auto atlas_path: ptr;
+    atlas_path = path_asset("assets/sprites/wc1/peasant.json");
+    peasant_atlas = image_load(atlas_path);
+    free(atlas_path);
+    if (peasant_atlas == 0) {
+        put_err("rts: peasant atlas load failed — exiting\n");
+        wc1_map_free(map);
+        free(_map_json_path);
+        return 1;
+    }
+    image_hot_reload_enable(peasant_atlas);
+
+    // ECS world + per-game wiring. unit_defs_init populates the
+    // unit kind table; ecs_wire registers components + the peasant
+    // archetype + the render query. Both run once at startup.
+    unit_defs_init();
+    world = ecs_new(256);
+    ecs_wire(world);
+    _spawn_units_from_level(world, peasant_atlas, map);
+
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
     // dt + input polling; game_render_begin / end wrap the GPU
-    // pass; tile_draw culls to the screen-visible region.
+    // pass; tile_draw culls to the screen-visible region;
+    // ecs_render_units walks every unit entity and emits its
+    // sprite on top of the tilemap.
     while (game_should_quit() == 0) {
         game_frame_begin();
-        file_watch_tick();        // pick up forest1.json edits
+        file_watch_tick();                       // pick up forest1.json edits
+        image_hot_reload_tick_throttled();       // pick up peasant.json / .png edits
         if (key_pressed(KEY_ESC)) { break; }
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
         tile_draw(tm, 0, 0, SCREEN_W, SCREEN_H);
+        ecs_render_units(world);
         game_render_end();
     }
 
+    ecs_query_free(peasant_q);
+    free(world);
+    image_free(peasant_atlas);
     wc1_map_free(map);
     free(_map_json_path);
     return 0;
+}
+
+// Walk the entity records the level loader parsed and route each
+// recognized kind to the right ECS spawn. Unknown kinds are
+// silently ignored — Session 4+ adds start_view (camera anchor)
+// and door / chest entities; until those handlers ship, the
+// level editor can still author them without crashing the game.
+static void _spawn_units_from_level(world, atlas, map) {
+    auto i, n, k;
+    n = wc1_map_entity_count(map);
+    for (i = 0; i < n; i++) {
+        k = wc1_map_entity_kind(map, i);
+        if (str_eq(k, "peasant") != 0) {
+            ecs_spawn_peasant(world, atlas,
+                              wc1_map_entity_gx(map, i),
+                              wc1_map_entity_gy(map, i));
+        }
+    }
 }

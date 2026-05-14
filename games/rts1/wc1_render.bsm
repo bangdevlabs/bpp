@@ -1,0 +1,97 @@
+// wc1_render.bsm — ECS wiring + spawn + per-frame render walk.
+//
+// Session 3 ships one archetype (peasant) with three components:
+// Pos (grid coords), Sprite (atlas + frame), UnitType (kind tag).
+// Render is a thin walk that reads Pos + Sprite per entity and
+// calls image_draw_size with the WC1 visual offset (sprites are
+// 32 px tall but tiles are 16 px, so each peasant overhangs one
+// tile row — center horizontally + bottom-align so the feet sit
+// on the tile, matching war1gus).
+//
+// Animation, movement, combat, hot-reload of entities all defer
+// to later sessions. The render callback isn't @safe annotated:
+// it eventually calls _stb_gpu_sprite_uv (GPU side effect) and
+// the call chain isn't @safe-tagged anywhere. Pathfind / fps
+// renderers follow the same convention.
+
+import "stbecs.bsm";
+import "stbimage.bsm";
+load   "wc1_units.bsm";
+
+// Component layouts. Pos uses whole-cell grid coords (not pixels)
+// so move logic can do path planning in tile units; render scales
+// to pixels via the *16 step below. Sprite carries the atlas
+// pointer per entity so future archetypes can reference their own
+// atlas without a global-table lookup. UnitType is the kind tag
+// (UNIT_PEASANT etc) — drives future combat / production picks.
+struct Pos      { x, y }
+struct Sprite   { atlas, frame }
+struct UnitType { kind }
+
+// Globals captured by the render callback. ecs_query_each's
+// callback signature is fn(world, entity_id) — extra state has
+// to flow through globals because B++ doesn't carry closures.
+// Same pattern every other stbecs consumer follows.
+global pos_comp, sprite_comp, unit_comp;
+global peasant_arch, peasant_q;
+
+// Register components + the peasant archetype + the render query.
+// Call once at game startup AFTER ecs_new but BEFORE any spawn.
+// The query gets built once and reused every frame — comp_mask is
+// 0 because stbecs.bsm:431 still treats the mask as future-proofing
+// (today it walks every archetype regardless). When a second
+// archetype lands (S7+ buildings), revisit to a real mask filter.
+ecs_wire(world) {
+    auto comps;
+    pos_comp    = ecs_component_register(world, "Pos",      sizeof(Pos));
+    sprite_comp = ecs_component_register(world, "Sprite",   sizeof(Sprite));
+    unit_comp   = ecs_component_register(world, "UnitType", sizeof(UnitType));
+    comps    = buf_word(3);
+    comps[0] = pos_comp;
+    comps[1] = sprite_comp;
+    comps[2] = unit_comp;
+    peasant_arch = ecs_archetype(world, comps, 3);
+    peasant_q    = ecs_query(world, 0);
+}
+
+// Spawn one peasant at grid (gx, gy). Returns the encoded entity
+// id so callers can hold onto it for later kills / queries; the
+// id is opaque (encoded with the archetype bit) and only useful
+// to ecs_get / ecs_kill_at.
+ecs_spawn_peasant(world, atlas, gx, gy) {
+    auto eid;
+    auto p: Pos, s: Sprite, u: UnitType;
+    eid = ecs_spawn_at(world, peasant_arch);
+    p = ecs_get(world, pos_comp, eid);
+    p.x = gx;
+    p.y = gy;
+    s = ecs_get(world, sprite_comp, eid);
+    s.atlas = atlas;
+    s.frame = PEASANT_IDLE_S;
+    u = ecs_get(world, unit_comp, eid);
+    u.kind = UNIT_PEASANT;
+    return eid;
+}
+
+// Per-entity render callback. Reads Pos + Sprite, maps the tile
+// grid coords to screen pixels (16 px per tile) and offsets the
+// 32 px sprite so its feet land on the tile (gx*16 - 8 horizontal
+// shift to center, gy*16 - 16 vertical shift to bottom-align).
+// Visually matches the war1gus reference for peasant placement.
+static void _render_unit(w, eid) {
+    auto p: Pos, s: Sprite;
+    p = ecs_get(w, pos_comp, eid);
+    s = ecs_get(w, sprite_comp, eid);
+    image_draw_size(s.atlas, s.frame,
+                    p.x * 16 - 8,
+                    p.y * 16 - 16,
+                    32, 32);
+}
+
+// Walk every unit and emit its sprite. Call once per frame between
+// the tile draw and game_render_end. Cheap — peasant_q caches the
+// query so the per-frame cost is just the alive-bitmap walk +
+// per-entity callback dispatch.
+ecs_render_units(world) {
+    ecs_query_each(peasant_q, fn_ptr(_render_unit));
+}

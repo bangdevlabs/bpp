@@ -33,15 +33,35 @@ const WC1_T_TREE  = 76;
 
 // ── Map struct ──────────────────────────────────────────────
 
+// Game-side mirror of one entity record carried inside the level
+// JSON (`{"kind":"peasant","x":10.5,"y":7.5}`). Session 3 reads
+// these and uses them to drive ECS spawn at startup. The level
+// editor stores positions as cell-centered floats; the loader
+// reverses the half-cell offset so consumers get whole-cell
+// integer grid coordinates.
+// Game-side mirror of one entity record carried inside the level
+// JSON. Fields stay untyped (TY_WORD) to mirror the level_editor
+// LvlEntity pattern — str_dup and json pointer-arithmetic flow
+// through here as words, and adding `: ptr` annotations cascades
+// into E053/E050 errors at the assign sites until the upstream
+// chain (str_dup, json_string) also gains annotations.
+struct WC1Entity {
+    kind,           // heap-owned C-string ("peasant", "start_view", ...)
+    gx,             // grid x (whole-cell)
+    gy              // grid y (whole-cell)
+}
+
 // A WC1 map is a `stbtile` tilemap plus the dimensions in the
-// units the game cares about. The `tm` field is the underlying
-// tilemap handle; everything else is derived bookkeeping. Future
-// sessions will hang spawn-point and player-data fields off the
-// same struct.
+// units the game cares about, plus the entity list parsed from
+// the level JSON. The `tm` field is the underlying tilemap
+// handle; `entities`/`entity_count` carry the spawn metadata
+// for Session 3+ consumers.
 struct WC1Map {
-    tm,             // stbtile handle (tile_new return)
-    w,              // grid width in tiles
-    h               // grid height in tiles
+    tm,                    // stbtile handle (tile_new return)
+    w,                     // grid width in tiles
+    h,                     // grid height in tiles
+    entities,              // contiguous WC1Entity records (0 when empty)
+    entity_count           // number of valid entries in `entities`
 }
 
 // ── Lifecycle ───────────────────────────────────────────────
@@ -55,15 +75,26 @@ wc1_map_new(w, h) {
     m.w = w;
     m.h = h;
     m.tm = tile_new(w, h, WC1_TILE_PX, WC1_TILE_PX);
+    m.entities = 0;
+    m.entity_count = 0;
     return m;
 }
 
-// Free the map and its underlying tilemap. Caller passes the
-// handle returned by `wc1_map_new`.
+// Free the map, its underlying tilemap, and every entity record
+// (each kind string is heap-owned via str_dup at load time, so
+// the array's bytes alone aren't enough — walk + free per-entry
+// first, then free the array, then the map struct itself).
 void wc1_map_free(map) {
-    auto m: WC1Map;
+    auto m: WC1Map, i, e: WC1Entity;
     m = map;
     if (m.tm != 0) { tile_free(m.tm); }
+    if (m.entities != 0) {
+        for (i = 0; i < m.entity_count; i++) {
+            e = m.entities + i * sizeof(WC1Entity);
+            if (e.kind != 0) { free(e.kind); }
+        }
+        free(m.entities);
+    }
     free(map);
 }
 
@@ -98,6 +129,48 @@ wc1_map_h(map) {
     return m.h;
 }
 
+// ── Entity access ───────────────────────────────────────────
+
+// Number of entity records loaded from the level JSON. Returns
+// 0 for maps authored before Session 3 (no `entities` field).
+wc1_map_entity_count(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.entity_count;
+}
+
+// Kind tag for entity `i` (e.g. "peasant", "start_view", "door").
+// Returns 0 on out-of-range index so callers can probe blindly.
+// Untyped return: the kind string flows through unannotated
+// (str_dup is untyped upstream), so adding `-> ptr` would force
+// callers to annotate their receivers as `: ptr` and that
+// cascades into the json layer that isn't annotated yet.
+wc1_map_entity_kind(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.kind;
+}
+
+// Grid x coordinate (whole-cell integer) for entity `i`.
+wc1_map_entity_gx(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.gx;
+}
+
+// Grid y coordinate (whole-cell integer) for entity `i`.
+wc1_map_entity_gy(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.gy;
+}
+
 // ── JSON loader (Session 2) ─────────────────────────────────
 
 // Load a WC1 map from the level_editor JSON format that the
@@ -118,6 +191,8 @@ wc1_map_load(path: ptr) {
     auto buf, fsize, doc, root;
     auto w_idx, h_idx, tiles_idx, w, h;
     auto x, y, row_idx, cell, map: WC1Map, m;
+    auto ents_idx, n_ents, i, ent_obj, kind_idx, x_idx, y_idx;
+    auto kind_s, ex: word, ey: word, e: WC1Entity;
 
     buf = file_read_all(path, &fsize);
     if (buf == 0) {
@@ -158,6 +233,44 @@ wc1_map_load(path: ptr) {
         for (x = 0; x < w; x++) {
             cell = json_int(doc, json_child(doc, row_idx, x));
             if (cell != 0) { tile_set(m.tm, x, y, cell); }
+        }
+    }
+
+    // Entities array — optional. Legacy maps shipped before
+    // Session 3 carry no `entities` field; treat as empty. Each
+    // entry must declare kind + x + y; malformed entries are
+    // skipped with a stderr note so a corrupt file never kills
+    // the load. The kind string is copied (str_dup) because
+    // json_string returns a pointer into the doc buffer that
+    // dies on json_free.
+    ents_idx = json_object_get(doc, root, "entities");
+    if (ents_idx >= 0) {
+        n_ents = json_length(doc, ents_idx);
+        if (n_ents > 0) {
+            m.entities = malloc(n_ents * sizeof(WC1Entity));
+            for (i = 0; i < n_ents; i++) {
+                ent_obj  = json_child(doc, ents_idx, i);
+                kind_idx = json_object_get(doc, ent_obj, "kind");
+                x_idx    = json_object_get(doc, ent_obj, "x");
+                y_idx    = json_object_get(doc, ent_obj, "y");
+                if (kind_idx < 0 || x_idx < 0 || y_idx < 0) {
+                    put_err("wc1_map_load: entity ");
+                    putnum_err(i);
+                    put_err(" malformed, skipped\n");
+                    continue;
+                }
+                kind_s = str_dup(json_string(doc, kind_idx));
+                // Level editor stores positions as cell-centered
+                // floats (gx + 0.5). Reverse the offset so game
+                // consumers see whole-cell indices.
+                ex = json_float(doc, x_idx) - 0.5;
+                ey = json_float(doc, y_idx) - 0.5;
+                e = m.entities + m.entity_count * sizeof(WC1Entity);
+                e.kind = kind_s;
+                e.gx   = ex;
+                e.gy   = ey;
+                m.entity_count++;
+            }
         }
     }
 

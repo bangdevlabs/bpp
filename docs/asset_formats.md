@@ -181,6 +181,75 @@ running game picks up the new pixels within ~30ms.
 
 ---
 
+## Atlas Grid JSON (sprite sheets)
+
+Used by games that ship sprite sheets where every tile is the
+same fixed size — rts1's WC1 unit strips (5 columns × 13 rows
+of 32×32 frames), future tilesheet-style sprites. Authored
+indirectly: the source PNG comes from an external tool (war1tool
+for rts1, future hand-painted sheets for other games) and a tiny
+sister JSON declares the slice geometry. The sister JSON IS
+editable in any text editor or Bang 9; in Modulab it lives
+read-only because Modulab's canvas authors per-pixel sprites,
+not pre-baked PNGs.
+
+### Schema
+
+```json
+{
+  "type": "atlas_grid",
+  "version": 2,
+  "tile_w": 32,
+  "tile_h": 32,
+  "image": "../../converted/graphics/human/units/peasant.png"
+}
+```
+
+Field reference:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `type` | string | yes | Always `"atlas_grid"` |
+| `version` | int | yes | Current = `2` |
+| `tile_w`, `tile_h` | int | yes | Tile dimensions in pixels (uniform across the whole sheet) |
+| `image` | string | yes | Path to source PNG, **resolved relative to the JSON file's directory** (see "Compatibility rules" below). `..` segments allowed and resolved by the OS at `open()` time |
+
+The runtime slices the source PNG row-major into uniform
+`tile_w × tile_h` tiles. Frame count = `(image_w / tile_w) *
+(image_h / tile_h)`. Frames are addressed by **integer index
+0..N-1**, no named accessor — human-readable names live as
+`const` declarations in the consuming game's `.bsm`:
+
+```bpp
+const PEASANT_IDLE_N  = 0;
+const PEASANT_IDLE_NE = 1;
+const PEASANT_IDLE_E  = 2;
+const PEASANT_IDLE_SE = 3;
+const PEASANT_IDLE_S  = 4;
+```
+
+Consumers do:
+
+```bpp
+auto atlas;
+atlas = image_load("assets/sprites/wc1/peasant.json");
+image_draw_size(atlas, PEASANT_IDLE_S, sx, sy, 32, 32);
+```
+
+**When to use vs. Atlas Pack JSON:** atlas_grid expects ONE source
+PNG with uniform tiles, indexed by position. Atlas Pack JSON
+composes MULTIPLE per-sprite Modulab files into a named manifest.
+Pick atlas_grid when the source is a pre-baked sheet (war1tool
+output, Aseprite spritesheet export, etc.); pick Atlas Pack when
+each frame is authored as its own Modulab sprite.
+
+Hot-reload: atlas_grid honours `image_hot_reload_enable(atlas)`
+on the sister JSON itself; editing the PNG independently does
+NOT trigger reload today (only the JSON's bytes are watched —
+see todo for the PNG-watch extension).
+
+---
+
 ## Audio
 
 Two simple formats, no JSON envelope, no custom schema:
@@ -214,11 +283,19 @@ never both. Mixed-mode levels are a future feature (per-cell
 consumer — Rule 28 gates the addition until a game actually needs
 it.
 
-**Path fields are project-asset-relative.** Every path inside a
-JSON (atlas `image`, level `tileset`) resolves via `path_asset`
-(`bpp_path.bsm`) from the consuming game's `assets/` directory.
-Absolute paths are accepted but discouraged — they break when
-the project moves.
+**Path fields are JSON-relative.** Every path inside a JSON
+(atlas `image`, level `tileset`) resolves against the directory
+containing the JSON file itself — NOT via `path_asset`. The
+runtime concatenates the JSON's directory with the path string
+verbatim; relative segments (`..`) are allowed and resolved by
+the OS at `open()` time. Absolute paths (starting with `/`)
+bypass the JSON-dir prefix entirely.
+
+This convention means siblings ship side-by-side cleanly
+(`peasant.json` + `peasant.png` in the same dir, `image:
+"peasant.png"`), and authored JSONs in `assets/sprites/` can
+point back into `../../converted/...` without the runtime
+needing a project-root concept.
 
 ---
 
