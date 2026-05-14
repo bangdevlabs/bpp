@@ -1,0 +1,132 @@
+// wc1_input.bsm — selection bookkeeping + click-to-target.
+//
+// Session 4 ships single-select: left-click on a peasant selects
+// it (highlighted by wc1_hud.bsm); left-click on empty ground
+// clears the selection; right-click on ground writes a Target
+// component on the selected unit and prints a debug line. ESC
+// stays bound to quit (no deselect-on-ESC — would conflict).
+//
+// Multi-select via drag-rectangle marquee + selection groups
+// (Ctrl+1/2/3) earn their slot when a real consumer asks for
+// them (Rule 28). v1 single-select covers the S4 verification
+// from wc1_handoff.md word for word: "click peasant → ring
+// appears; right-click ground → debug 'target = (gx, gy)' prints."
+
+import "stbecs.bsm";
+import "stbinput.bsm";
+import "stbcamera.bsm";
+import "bpp_io.bsm";
+
+// Selected entity id, or -1 when nothing is selected. Read by
+// wc1_hud.bsm to draw the ring overlay and by the right-click
+// branch below to know which unit gets the Target write.
+global selected_eid;
+
+// Globals captured by the hit-test callback. ecs_query_each's
+// signature is fn(world, eid) — extra inputs flow through
+// globals because B++ doesn't carry closures (same pattern
+// wc1_render._render_unit follows for cam).
+extrn pos_comp, target_comp, peasant_q;
+extrn cam;
+
+// Hit-test scratch — set by _hit_test_cb when it finds a unit
+// whose bounding box contains (_hit_wx, _hit_wy). _hit_eid stays
+// -1 if no unit was hit. Reset before every walk.
+static auto _hit_wx, _hit_wy;
+static auto _hit_eid;
+
+// Initialize selection state. Call once at startup before the
+// game loop runs. `selected_eid = -1` is the "nothing selected"
+// sentinel honored by wc1_hud_render and the right-click branch.
+wc1_input_init() {
+    selected_eid = -1;
+}
+
+// Per-entity callback for the hit-test walk. Reads the unit's
+// Pos, computes its 32×32 bounding box in world-space pixels
+// (peasant feet sit on the tile, sprite extends 16 px above and
+// 8 px to either side — matches the offset wc1_render uses), and
+// records the eid if the click point landed inside.
+//
+// First-hit-wins because ecs_query_each walks in spawn order;
+// if two peasants ever overlap, the earlier-spawned one captures
+// the click. Z-ordered hit-test is polish for a future session.
+static void _hit_test_cb(w, eid) {
+    auto p: Pos, x0, y0;
+    if (_hit_eid >= 0) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    x0 = p.x * 16 - 8;     // left edge in world pixels
+    y0 = p.y * 16 - 16;    // top edge (sprite extends UP from the tile)
+    if (_hit_wx < x0)      { return; }
+    if (_hit_wy < y0)      { return; }
+    if (_hit_wx >= x0 + 32) { return; }
+    if (_hit_wy >= y0 + 32) { return; }
+    _hit_eid = eid;
+}
+
+// Look up the first unit whose bounding box contains the world
+// point (wx, wy). Returns -1 when no unit is hit. Walks via the
+// canonical ecs_query_each — reusing peasant_q from wc1_render
+// keeps the iteration shape consistent across input + render.
+static _unit_at_world(world, wx, wy) {
+    _hit_wx  = wx;
+    _hit_wy  = wy;
+    _hit_eid = -1;
+    ecs_query_each(peasant_q, fn_ptr(_hit_test_cb));
+    return _hit_eid;
+}
+
+// Per-frame input dispatch. Reads mouse state via stbinput's
+// edge-triggered helpers (mouse_pressed fires once per click,
+// not every frame the button is held), translates screen coords
+// to world coords through the camera, and routes to selection
+// or target-write depending on which button.
+//
+// Call AFTER the camera pan tick — the click resolves against
+// where the camera ended up THIS frame, not last.
+void wc1_input_tick(world) {
+    auto mx, my, wx, wy;
+    auto hit, t: Target;
+
+    if (mouse_pressed(MOUSE_LEFT) != 0) {
+        mx = mouse_x();
+        my = mouse_y();
+        wx = cam_screen_to_world_x(cam, mx);
+        wy = cam_screen_to_world_y(cam, my);
+        hit = _unit_at_world(world, wx, wy);
+        // Click on a unit selects it; click on empty ground
+        // deselects (matches WC1 / Warcraft 2 / SC1 UX — no
+        // mode toggle, just direct manipulation).
+        selected_eid = hit;
+    }
+
+    if (mouse_pressed(MOUSE_RIGHT) != 0) {
+        if (selected_eid >= 0) {
+            mx = mouse_x();
+            my = mouse_y();
+            wx = cam_screen_to_world_x(cam, mx);
+            wy = cam_screen_to_world_y(cam, my);
+            // World → grid: integer divide by tile size (16 px).
+            // Negative world coords (camera at edge) shouldn't
+            // happen because cam clamps to [0, world-screen],
+            // but the floor is defensive against any future
+            // unclamped camera mode.
+            auto gx, gy;
+            gx = wx / 16;
+            gy = wy / 16;
+            if (gx < 0) { gx = 0; }
+            if (gy < 0) { gy = 0; }
+            t = ecs_get(world, target_comp, selected_eid);
+            t.gx = gx;
+            t.gy = gy;
+            // Debug print matching the wc1_handoff S4
+            // verification line word for word: "right-click
+            // ground → debug 'target = (gx, gy)' prints".
+            putstr("target = (");
+            putnum(gx);
+            putstr(", ");
+            putnum(gy);
+            putstr(")\n");
+        }
+    }
+}

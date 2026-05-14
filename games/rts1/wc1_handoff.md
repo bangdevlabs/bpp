@@ -277,19 +277,31 @@ No animation yet beyond the idle frame; no movement.
 Edit the peasant sprite in Bang 9's sprite tab → ~30ms later the
 running game shows the new pixels (atlas hot-reload).
 
-### Session 4 — Camera + input + selection (~3-4h)
+### Session 4 — Camera + input + selection (~3-4h) — CLOSED
 
 **Goal**: arrow keys (or edge-pan) scroll the viewport. Left-click
 selects a unit (highlight ring); right-click is the move-command.
 Selected unit stores a target tile, no movement yet.
 
-**Files**:
-- `wc1_camera.bsm` — viewport offset; tile↔screen transform.
+**Files** (as shipped):
+- Camera lives in `stb/stbcamera.bsm` instead of a per-game
+  `wc1_camera.bsm` — factored after platformer was found to
+  copy-paste the same clamp logic. Same functional goal met.
 - `wc1_input.bsm` — selection bookkeeping; click-to-target.
-- HUD foundations in `wc1_hud.bsm` (selection ring overlay).
+- `wc1_hud.bsm` — selection ring overlay (HUD foundations
+  for the minimap / info panel that S6+ extend).
 
-**Verification**: click peasant → ring appears; right-click ground
-→ debug "target = (gx, gy)" prints.
+**Verification PASSED**: click peasant → bright-yellow ring
+appears around the 32×32 sprite; right-click ground → debug
+`target = (gx, gy)` prints to stdout; click empty ground →
+deselect; ESC stays bound to quit.
+
+**Shipped in two passes**:
+1. `c736261` — camera + start_view consumer (this commit got
+   the macro framing wrong: I scoped to ~60% of the roadmap
+   without flagging the deviation. The other half landed in
+   the second pass after the gap was caught).
+2. (this commit) — wc1_input + wc1_hud + Target component.
 
 ### Session 5 — Movement (per-unit pathing) (~3-4h)
 
