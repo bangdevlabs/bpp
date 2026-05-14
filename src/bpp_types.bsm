@@ -111,16 +111,41 @@ ty_var_type(name_p) {
 // the explicit annotation is the user's contract with the codegen, and the
 // E232 / E233 diagnostics rely on it being authoritative.
 void ty_set_var_type(name_p, ty) {
-    auto i, old;
+    auto i, old, j;
     for (i = 0; i < arr_len(ty_vt_names); i++) {
         if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
             if (arr_get(ty_vt_locked, i)) { return; }
             old = arr_get(ty_vt_types, i);
-            arr_set(ty_vt_types, i, promote(old, ty));
+            // TY_UNK in the slot means the local was pre-declared
+            // by T_DECL without a hint — the first real assignment
+            // wins outright (promote(TY_UNK, x) returns TY_UNK so
+            // the special case is required to seed the slot
+            // correctly).
+            if (old == TY_UNK) { arr_set(ty_vt_types, i, ty); }
+            else { arr_set(ty_vt_types, i, promote(old, ty)); }
             return;
         }
     }
-    // New variable: append to table, unlocked, word element by default.
+    // Annotated globals are authoritative: their declared type
+    // (set in parse_global via ty_set_global_type) wins over any
+    // assignment-inferred type. Skip the local-table registration
+    // so the T_VAR fallback in add_type T_VAR reads the global
+    // type intact. Without this, `global x: u_word; main() { x =
+    // -1 }` would shadow x's u_word type with TY_WORD from the
+    // literal, and the unsigned smart-dispatch never fires.
+    //
+    // Locals that shadow an annotated global are pre-registered
+    // by T_DECL with TY_UNK (see T_DECL handler), so the loop
+    // above catches them before this gate ever runs. Unannotated
+    // globals (NOT in ty_gl_names) keep the legacy behavior —
+    // the assignment falls through to the local-table append
+    // below.
+    for (j = 0; j < arr_len(ty_gl_names); j++) {
+        if (packed_eq(arr_get(ty_gl_names, j), name_p)) {
+            return;
+        }
+    }
+    // New local variable: append to table, unlocked, word element by default.
     ty_vt_names  = arr_push(ty_vt_names,  name_p);
     ty_vt_types  = arr_push(ty_vt_types,  ty);
     ty_vt_locked = arr_push(ty_vt_locked, 0);
@@ -403,9 +428,13 @@ add_type(nd) {
         return ty;
     }
 
-    // Variable: look up from symbol table.
+    // Variable: look up from symbol table. Local types win when
+    // present; otherwise fall back to the global type table so
+    // annotations like `global x: u_word;` flow to T_BINOP smart-
+    // dispatch the same way local annotations do.
     if (t == T_VAR) {
         ty = ty_var_type(n.a);
+        if (ty == TY_UNK) { ty = ty_get_global_type(n.a); }
         n.itype = ty;
         return ty;
     }
@@ -543,10 +572,34 @@ add_type(nd) {
 
     // Declaration with optional type hints (per-variable or single).
     if (t == T_DECL) {
-        auto hints_arr;
+        auto hints_arr, j;
         hints_arr = n.e;
         arr = n.a;
         cnt = n.b;
+        // Pre-register every declared local in the type table —
+        // even without a hint — so subsequent T_ASSIGN routes
+        // through the local row (and shadows any same-named
+        // annotated global). TY_UNK seeds the slot; the first
+        // real assignment overwrites it via the TY_UNK
+        // special-case in ty_set_var_type.
+        // Bypass ty_set_var_type's annotated-global gate (which
+        // would skip the registration entirely for shadowed
+        // names) by appending directly. Re-declaration of the
+        // same local in nested blocks is harmless — duplicate
+        // entries are tolerated, the first match wins.
+        for (i = 0; i < cnt; i++) {
+            j = 0;
+            while (j < arr_len(ty_vt_names)) {
+                if (packed_eq(arr_get(ty_vt_names, j), arr[i])) { break; }
+                j++;
+            }
+            if (j == arr_len(ty_vt_names)) {
+                ty_vt_names  = arr_push(ty_vt_names,  arr[i]);
+                ty_vt_types  = arr_push(ty_vt_types,  TY_UNK);
+                ty_vt_locked = arr_push(ty_vt_locked, 0);
+                ty_vt_elem   = arr_push(ty_vt_elem,   TY_WORD);
+            }
+        }
         if (hints_arr != 0) {
             // Per-variable hints array: each variable has its own hint.
             for (i = 0; i < cnt; i++) {
