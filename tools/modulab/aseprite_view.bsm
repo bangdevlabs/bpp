@@ -87,6 +87,31 @@ static extrn _sheet_origin_x;
 static extrn _sheet_origin_y;
 static extrn _sheet_scale;
 
+// ── Frame-edit state (Commit 6 — slice edit) ───────────────────
+// View mode: 0 = sheet viewer, 1 = single-frame editor. The flag
+// is module-private; the lib renders whichever the viewer reports.
+static extrn _aseprite_edit_mode;
+// True for any frame that has unsaved pixel edits in memory. Reset
+// by a successful save or by `mlab_close_aseprite_sheet`. The
+// sheet view tints dirty frames so the user can see which frames
+// have pending changes when scrolling the grid.
+static extrn _aseprite_dirty;
+// Currently-picked paint color (ARGB) and a flag that distinguishes
+// "paint with color" from "erase to transparent". Eyedrop fills
+// `_paint_color` from a sampled pixel.
+static extrn _paint_color;
+static extrn _paint_erase;
+// Last mouse-button states for the editor so paint fires on the
+// rising edge and drag-paint smooths over rapid mouse motion.
+static extrn _edit_mb_left_prev;
+static extrn _edit_mb_right_prev;
+// Cached editor canvas placement so the paint handler can map
+// screen coords to per-pixel (x, y) cells without recomputing the
+// scale every frame.
+static extrn _edit_origin_x;
+static extrn _edit_origin_y;
+static extrn _edit_scale;
+
 // ── Accessors ───────────────────────────────────────────────────
 
 // True when a sheet is currently loaded. modulab_lib_frame calls
@@ -156,6 +181,8 @@ mlab_close_aseprite_sheet() {
     _aseprite_active_tag          = -1;
     _aseprite_preview_playing     = 0;
     _aseprite_preview_elapsed_ms  = 0;
+    _aseprite_edit_mode           = 0;
+    _aseprite_dirty               = 0;
     _aseprite_active              = 0;
 }
 
@@ -318,6 +345,10 @@ mlab_load_aseprite_sheet(path) {
     _aseprite_active_tag          = -1;
     _aseprite_preview_playing     = 1;     // auto-play; user can pause
     _aseprite_preview_elapsed_ms  = 0;
+    _aseprite_edit_mode           = 0;
+    _aseprite_dirty               = 0;
+    _paint_color                  = rgba(255, 255, 255, 255);
+    _paint_erase                  = 0;
     _aseprite_active              = 1;
 
     // Register a hot-reload callback so external Aseprite saves
@@ -614,7 +645,10 @@ static _tag_containing(frame) {
 // loaded. Owns the entire panel: top topbar with the file path,
 // left sheet display, right tag list, bottom preview, footer
 // hints. Returns 1 when the topbar's "Close" was clicked (the
-// caller drops back into editor mode).
+// caller drops back into editor mode). Routes to the frame
+// editor when `_aseprite_edit_mode` is on — the editor and the
+// sheet viewer share state but render with totally different
+// layouts.
 aseprite_view_render(px, py, pw, ph) {
     auto sheet_w, sheet_h, list_w, preview_h, content_y;
     auto close_hit, play_hit, footer_y, clicked_frame;
@@ -623,11 +657,22 @@ aseprite_view_render(px, py, pw, ph) {
 
     if (_aseprite_active == 0) { return 0; }
 
+    if (_aseprite_edit_mode != 0) {
+        _render_edit_mode(px, py, pw, ph);
+        return 0;
+    }
+
     // Topbar: file path + Close + Play/Pause. Same look as the
-    // editor topbar so the user feels at home.
+    // editor topbar so the user feels at home. Dirty sheets get
+    // an asterisk before the path so the user notices unsaved
+    // edits before clicking Close.
     draw_text("Aseprite viewer", px + 12, py + 8, 8,
               rgba(97, 218, 251, 255));
     if (_aseprite_json_path != 0) {
+        if (_aseprite_dirty != 0) {
+            draw_text("*", px + 150, py + 8, 8,
+                      rgba(255, 180, 80, 255));
+        }
         draw_text(_aseprite_json_path, px + 160, py + 8, 8,
                   rgba(200, 210, 230, 255));
     }
@@ -683,6 +728,10 @@ aseprite_view_render(px, py, pw, ph) {
                 _aseprite_active_tag         = tag_for_click;
                 _aseprite_preview_elapsed_ms = 0;
             }
+            // Double-click on the same frame opens the editor on
+            // that frame — `_aseprite_handle_double_click` owns
+            // the threshold + reset rules.
+            _aseprite_handle_double_click(clicked_frame);
         }
     }
 
@@ -696,11 +745,13 @@ aseprite_view_render(px, py, pw, ph) {
     return 0;
 }
 
-// Tick the preview clock. Called once per frame from
-// modulab_lib_frame BEFORE aseprite_view_render so the displayed
-// frame matches the freshly-advanced clock.
+// Tick the preview clock + double-click clock. Called once per
+// frame from modulab_lib_frame BEFORE aseprite_view_render so the
+// displayed frame matches the freshly-advanced clock and the
+// double-click window stays accurate.
 aseprite_view_tick(dt_ms) {
     if (_aseprite_active == 0) { return; }
+    _aseprite_last_click_ms = _aseprite_last_click_ms + dt_ms;
     if (_aseprite_preview_playing == 0) { return; }
     _aseprite_preview_elapsed_ms = _aseprite_preview_elapsed_ms + dt_ms;
 }
@@ -709,3 +760,346 @@ aseprite_view_tick(dt_ms) {
 // the sheet picker fires once per press, not every frame the
 // button is held.
 static extrn _aseprite_mb_prev;
+
+// Double-click bookkeeping. We treat any two left-clicks landing
+// on the same frame within 400 ms as a double-click and use that
+// to enter edit mode. The threshold matches the macOS default for
+// double-clicks (and works fine on Linux where the OS doesn't
+// expose a configurable interval).
+static extrn _aseprite_last_click_frame;
+static extrn _aseprite_last_click_ms;
+
+// ── Frame editor ────────────────────────────────────────────────
+
+// Write the ARGB color `c` into the sheet's RGBA buffer at the
+// given pixel coordinate. Honours the editor's eraser mode by
+// writing fully-transparent pixels (alpha 0) so the PNG round-trip
+// preserves transparency the way Aseprite does. Bounds checked —
+// out-of-range writes are silently ignored so a sloppy bbox math
+// can never corrupt memory.
+static void _sheet_pixel_write(x, y, c) {
+    auto off;
+    if (x < 0 || y < 0
+     || x >= _aseprite_png_w
+     || y >= _aseprite_png_h) { return; }
+    off = (y * _aseprite_png_w + x) * 4;
+    poke(_aseprite_png_rgba + off,     (c >> 16) & 0xFF);  // R
+    poke(_aseprite_png_rgba + off + 1, (c >> 8)  & 0xFF);  // G
+    poke(_aseprite_png_rgba + off + 2,  c        & 0xFF);  // B
+    poke(_aseprite_png_rgba + off + 3, (c >> 24) & 0xFF);  // A
+}
+
+// Translate a mouse coord (mx, my) into a pixel cell within the
+// active frame using the cached editor layout. Returns -1 in
+// either axis when the cursor is outside the editor canvas.
+static _edit_pixel_at(mx, my, out_xy: ptr) {
+    auto fx, fy, fw, fh, cell_x, cell_y;
+    fx = arr_get(_aseprite_frame_x, _aseprite_active_frame);
+    fy = arr_get(_aseprite_frame_y, _aseprite_active_frame);
+    fw = arr_get(_aseprite_frame_w, _aseprite_active_frame);
+    fh = arr_get(_aseprite_frame_h, _aseprite_active_frame);
+    if (_edit_scale <= 0) { return -1; }
+    if (mx < _edit_origin_x || my < _edit_origin_y) { return -1; }
+    cell_x = (mx - _edit_origin_x) / _edit_scale;
+    cell_y = (my - _edit_origin_y) / _edit_scale;
+    if (cell_x < 0 || cell_y < 0 || cell_x >= fw || cell_y >= fh) {
+        return -1;
+    }
+    // Return absolute sheet coords (frame origin + cell offset) so
+    // the caller can write straight into the RGBA buffer.
+    *(out_xy)     = fx + cell_x;
+    *(out_xy + 8) = fy + cell_y;
+    return 0;
+}
+
+// Persist the current sheet RGBA buffer to the PNG file referenced
+// by the loaded JSON. Drops the dirty flag on success and prints a
+// diagnostic on failure so the user can tell the save did NOT
+// happen (file-system permissions, missing parent dir, etc.).
+static _aseprite_save_png() {
+    auto json_path, image_s, buf, fsize, doc, root, meta_idx, png_path, rc;
+
+    if (_aseprite_png_rgba == 0 || _aseprite_json_path == 0) { return -1; }
+
+    // Re-resolve the PNG path on every save (instead of caching at
+    // load time) so external moves of the sheet are tolerated —
+    // the JSON's `meta.image` field is the single source of truth.
+    fsize = 0;
+    buf = file_read_all(_aseprite_json_path, &fsize);
+    if (buf == 0) { return -1; }
+    doc = json_parse(buf, fsize);
+    free(buf);
+    if (doc == 0) { return -1; }
+    root     = json_root(doc);
+    meta_idx = json_object_get(doc, root, "meta");
+    if (meta_idx < 0) { json_free(doc); return -1; }
+    image_s = json_object_get_string(doc, meta_idx, "image");
+    if (image_s == 0) { json_free(doc); return -1; }
+    png_path = image_path_sibling(_aseprite_json_path, image_s);
+    json_free(doc);
+
+    rc = pixels_save_png(png_path, _aseprite_png_rgba,
+                         _aseprite_png_w, _aseprite_png_h);
+    if (rc == 0) {
+        _aseprite_dirty = 0;
+        put_err("modulab: '");
+        putstr_err(png_path);
+        put_err("' saved\n");
+    } else {
+        put_err("modulab: '");
+        putstr_err(png_path);
+        put_err("' save failed\n");
+    }
+    free(png_path);
+    return rc;
+}
+
+// Draw the active frame at the largest integer scale that fits in
+// the given rect. The cached editor placement (origin + scale) is
+// what the paint handler uses to map clicks back into pixels.
+static void _draw_edit_canvas(px, py, pw, ph) {
+    auto fx, fy, fw, fh, scale_x, scale_y, scale, draw_w, draw_h;
+    auto i, j;
+
+    if (_aseprite_active_frame < 0
+     || _aseprite_active_frame >= _aseprite_frame_count) { return; }
+
+    fx = arr_get(_aseprite_frame_x, _aseprite_active_frame);
+    fy = arr_get(_aseprite_frame_y, _aseprite_active_frame);
+    fw = arr_get(_aseprite_frame_w, _aseprite_active_frame);
+    fh = arr_get(_aseprite_frame_h, _aseprite_active_frame);
+    if (fw <= 0 || fh <= 0) { return; }
+
+    scale_x = pw / fw;
+    scale_y = ph / fh;
+    scale   = scale_x < scale_y ? scale_x : scale_y;
+    if (scale < 1) { scale = 1; }
+
+    draw_w = fw * scale;
+    draw_h = fh * scale;
+    _edit_origin_x = px + (pw - draw_w) / 2;
+    _edit_origin_y = py + (ph - draw_h) / 2;
+    _edit_scale    = scale;
+
+    // Checkerboard backdrop so transparent pixels are visually
+    // distinct from any opaque color the user paints. A coarse
+    // 8-cell pitch keeps the pattern readable at every zoom.
+    auto cb_dark, cb_light;
+    cb_dark  = rgba(40, 42, 50, 255);
+    cb_light = rgba(56, 58, 68, 255);
+    for (j = 0; j < fh; j++) {
+        for (i = 0; i < fw; i++) {
+            auto cx, cy, cell;
+            cx = _edit_origin_x + i * scale;
+            cy = _edit_origin_y + j * scale;
+            cell = ((i / 4) + (j / 4)) & 1;
+            draw_rect(cx, cy, scale, scale,
+                      cell != 0 ? cb_light : cb_dark);
+        }
+    }
+
+    // Foreground pixels.
+    _draw_sheet_region(fx, fy, fw, fh, _edit_origin_x, _edit_origin_y, scale);
+
+    // Outer border so the canvas region is unmistakable.
+    draw_border(_edit_origin_x - 1, _edit_origin_y - 1,
+                draw_w + 2, draw_h + 2, rgba(120, 130, 150, 255), 1);
+}
+
+// Picks the pixel under (mx, my) and stores its color as the
+// active paint color. Wraps the bounds check + ARGB read so the
+// click handler stays terse.
+static void _edit_eyedropper(mx, my) {
+    auto coords, sx, sy;
+    coords = malloc(16);
+    if (_edit_pixel_at(mx, my, coords) != 0) {
+        free(coords);
+        return;
+    }
+    sx = *(coords);
+    sy = *(coords + 8);
+    free(coords);
+    _paint_color = _sheet_pixel_argb(sx, sy);
+    _paint_erase = 0;
+}
+
+// Apply the current paint color (or eraser) to the pixel under
+// (mx, my). Used by both the click rising-edge and drag-to-paint
+// passes — the function is idempotent on the same pixel.
+static void _edit_paint_pixel(mx, my) {
+    auto coords, sx, sy, c;
+    coords = malloc(16);
+    if (_edit_pixel_at(mx, my, coords) != 0) {
+        free(coords);
+        return;
+    }
+    sx = *(coords);
+    sy = *(coords + 8);
+    free(coords);
+    if (_paint_erase != 0) { c = 0; }
+    else                    { c = _paint_color; }
+    _sheet_pixel_write(sx, sy, c);
+    _aseprite_dirty = 1;
+}
+
+// Draw the color preview swatch + tool buttons that sit next to
+// the editor canvas. Returns 1 when a button consumed the click
+// (so the paint handler skips the same edge).
+static _draw_edit_sidebar(px, py, pw, ph) {
+    auto consumed, y, btn_h;
+    consumed = 0;
+    btn_h    = 26;
+
+    draw_rect(px, py, pw, ph, rgba(20, 22, 28, 255));
+    draw_text("Color", px + 8, py + 6, 8, rgba(140, 160, 200, 255));
+
+    // Color swatch — bigger than the toolbar buttons so it doubles
+    // as the visual "current color" indicator. Eraser mode dims
+    // the swatch so the user can see they are about to wipe pixels.
+    auto sw_x, sw_y, sw_w, sw_h, label;
+    sw_x = px + 8;
+    sw_y = py + 28;
+    sw_w = pw - 16;
+    sw_h = 40;
+    draw_rect(sw_x - 2, sw_y - 2, sw_w + 4, sw_h + 4,
+              rgba(70, 76, 96, 255));
+    if (_paint_erase != 0) {
+        draw_rect(sw_x, sw_y, sw_w, sw_h, rgba(40, 42, 50, 255));
+        label = "ERASE";
+    } else {
+        draw_rect(sw_x, sw_y, sw_w, sw_h, _paint_color);
+        label = "PAINT";
+    }
+    draw_text(label, sw_x + 6, sw_y + sw_h + 6, 8,
+              rgba(140, 160, 200, 255));
+
+    // Tool buttons.
+    y = sw_y + sw_h + 26;
+    if (gui_button(px + 8, y, pw - 16, btn_h,
+                   _paint_erase != 0 ? "Paint" : "Erase")) {
+        _paint_erase = _paint_erase != 0 ? 0 : 1;
+        consumed = 1;
+    }
+    y += btn_h + 6;
+    if (gui_button(px + 8, y, pw - 16, btn_h, "Save (Cmd+S)")) {
+        _aseprite_save_png();
+        consumed = 1;
+    }
+    y += btn_h + 6;
+    if (gui_button(px + 8, y, pw - 16, btn_h, "Prev frame")) {
+        if (_aseprite_active_frame > 0) { _aseprite_active_frame--; }
+        consumed = 1;
+    }
+    y += btn_h + 6;
+    if (gui_button(px + 8, y, pw - 16, btn_h, "Next frame")) {
+        if (_aseprite_active_frame < _aseprite_frame_count - 1) {
+            _aseprite_active_frame++;
+        }
+        consumed = 1;
+    }
+    y += btn_h + 6;
+    if (gui_button(px + 8, y, pw - 16, btn_h, "Back to sheet")) {
+        _aseprite_edit_mode = 0;
+        consumed = 1;
+    }
+
+    // Frame name + dirty marker so the user sees which Aseprite
+    // frame they are editing.
+    y += btn_h + 14;
+    auto name;
+    name = arr_get(_aseprite_frame_name, _aseprite_active_frame);
+    if (name != 0) {
+        draw_text(name, px + 8, y, 8, WHITE);
+    }
+    if (_aseprite_dirty != 0) {
+        draw_text("[unsaved]", px + 8, y + 16, 8,
+                  rgba(255, 180, 80, 255));
+    }
+
+    // Hint footer.
+    draw_text("LMB paint  RMB sample",
+              px + 8, py + ph - 30, 8, rgba(120, 130, 150, 255));
+    draw_text("E toggle erase",
+              px + 8, py + ph - 16, 8, rgba(120, 130, 150, 255));
+    return consumed;
+}
+
+// Render the frame-edit view and dispatch mouse + keyboard. Owns
+// the entire panel exactly the way the sheet viewer does.
+static void _render_edit_mode(px, py, pw, ph) {
+    auto sidebar_w, canvas_w, mx, my, lmb_press, rmb_press, lmb_held;
+    auto consumed, edit_held;
+
+    // Topbar — keep the same close hook so the user always has an
+    // exit. Cmd+S also lives here as a button (the editor sidebar
+    // duplicates it for muscle memory).
+    draw_text("Aseprite frame editor",
+              px + 12, py + 8, 8, rgba(97, 218, 251, 255));
+    if (_aseprite_json_path != 0) {
+        draw_text(_aseprite_json_path, px + 200, py + 8, 8,
+                  rgba(200, 210, 230, 255));
+    }
+    if (gui_button(px + pw - 120, py + 4, 110, 22, "Close")) {
+        mlab_close_aseprite_sheet();
+        return;
+    }
+
+    // Layout — sidebar on the right, canvas takes the rest.
+    sidebar_w = 200;
+    canvas_w  = pw - sidebar_w - 4;
+
+    _draw_edit_canvas(px, py + 32, canvas_w, ph - 32);
+    consumed = _draw_edit_sidebar(px + canvas_w + 4, py + 32,
+                                   sidebar_w, ph - 32);
+
+    // Keyboard shortcuts. E toggles erase. Cmd+S (or Ctrl+S on
+    // Linux) saves. ESC drops back into sheet mode without exiting
+    // Modulab itself (the lib's outer loop handles ESC = quit only
+    // in viewer mode, the editor short-circuits here).
+    if (key_pressed(KEY_E) != 0) {
+        _paint_erase = _paint_erase != 0 ? 0 : 1;
+    }
+    edit_held = key_down(KEY_META) != 0 || key_down(KEY_CTRL) != 0;
+    if (edit_held != 0 && key_pressed(KEY_S) != 0) {
+        _aseprite_save_png();
+    }
+
+    mx        = mouse_x();
+    my        = mouse_y();
+    lmb_held  = mouse_down(MOUSE_LEFT);
+    lmb_press = lmb_held != 0 && _edit_mb_left_prev == 0;
+    rmb_press = mouse_down(MOUSE_RIGHT) != 0 && _edit_mb_right_prev == 0;
+    _edit_mb_left_prev  = lmb_held;
+    _edit_mb_right_prev = mouse_down(MOUSE_RIGHT);
+
+    // Sidebar consumed the click — skip paint so the user doesn't
+    // accidentally drop a pixel through a button.
+    if (consumed != 0) { return; }
+
+    // Right-click samples a color. Left-click paints, and held LMB
+    // continues painting for drag-to-fill behaviour every painter
+    // expects.
+    if (rmb_press != 0) { _edit_eyedropper(mx, my); return; }
+    if (lmb_press != 0) { _edit_paint_pixel(mx, my); return; }
+    if (lmb_held  != 0) { _edit_paint_pixel(mx, my); }
+}
+
+// Hook called from the viewer's click handler: when a left-click
+// lands on the same frame within the double-click window, enter
+// the editor on that frame. The wall-clock counter
+// `_aseprite_last_click_ms` is bumped every frame by
+// `aseprite_view_tick`; the threshold below matches the macOS
+// default of 400 ms and is the same elapsed math both platforms
+// expect from a double-click.
+static void _aseprite_handle_double_click(frame_id) {
+    if (frame_id == _aseprite_last_click_frame
+     && _aseprite_last_click_ms <= 400) {
+        _aseprite_edit_mode    = 1;
+        _aseprite_active_frame = frame_id;
+        _aseprite_last_click_frame = -1;
+        _aseprite_last_click_ms    = 0;
+        return;
+    }
+    _aseprite_last_click_frame = frame_id;
+    _aseprite_last_click_ms    = 0;
+}
