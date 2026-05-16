@@ -1,0 +1,418 @@
+// wc1_sprite_convert.bpp — Offline converter: war1tool PNG strip →
+// Aseprite-compatible sprite sheet sidecar JSON.
+//
+// The converted-asset pipeline (war1tool → assets/converted/)
+// emits each WC1 unit as a single PNG file laid out as a uniform
+// row-major grid of frames (peasant.png = 5 cols × 13 rows of
+// 32×32 cells, packing idle + walk + chop + die + carry into one
+// strip). The B++ game side already had peasant.json in atlas_grid
+// shape addressing frames by integer index — that worked for
+// static rendering but ruled out named animations.
+//
+// This tool runs ONCE per unit PNG at asset-prep time and emits a
+// sidecar JSON in the literal Aseprite-export schema. Frames live
+// inside one PNG (preserved bit-for-bit) and the sidecar carries
+// per-frame bounding boxes plus named frameTags for each
+// animation (5 idle + 5 walk for v1; chop / die / carry tags land
+// in S7+ when the consumer is wired).
+//
+// Tonify Rule 31 anchor: "If an asset arrives in a foreign syntax,
+// write a one-shot offline converter under tools/<game>_<asset>_
+// convert/ that emits the canonical Bang 9 format. The game NEVER
+// reads the foreign format at runtime." The Aseprite-compatible
+// sheet IS the canonical format for sprites with animation; this
+// tool fits the pattern.
+//
+// Tonify Rule 7 anchor (Aseprite-compatibility, adopted 2026-05-
+// 16): match the literal Aseprite "Export Sprite Sheet > JSON
+// Hash" output so the same loader serves both war1tool imports
+// and Aseprite-authored sprites.
+//
+// Usage:
+//
+//   ./wc1_sprite_convert <input.png> <output_dir>
+//
+// Example:
+//
+//   ./wc1_sprite_convert \
+//     games/rts1/assets/converted/graphics/human/units/peasant.png \
+//     games/rts1/assets/sprites/wc1
+//
+// Output:
+//
+//   <output_dir>/peasant.png   (copy of input, byte-identical)
+//   <output_dir>/peasant.json  (Aseprite-schema sidecar)
+//
+// The output PNG carries the original pixels; the sidecar declares
+// frame slicing (uniform 32×32 grid) + frameTags for the known
+// peasant animations.
+
+// No imports needed — bpp_array, bpp_buf, bpp_io, bpp_str,
+// bpp_file are all auto-injected. Pure offline tool.
+
+// ── Layout knowledge embedded ───────────────────────────────
+
+// Peasant grid: 5 cols × 13 rows of 32×32 frames. Confirmed by
+// reading the war1tool output. If other units ship with different
+// grids, extend this with a per-unit lookup or pass via argv.
+const TILE_W = 32;
+const TILE_H = 32;
+
+// Default frame duration (ms). 100 ms = 10 fps cycle, which feels
+// right for WC1's 5-frame walk anims (~500 ms per cycle, the
+// canonical Warcraft-era pacing).
+const DEFAULT_FRAME_MS = 100;
+
+// ── Path helpers ────────────────────────────────────────────
+
+// Find the last `/` in a path string. Returns the index of the
+// character AFTER the slash (start of basename), or 0 if no slash
+// is present.
+static _basename_start(path: ptr) {
+    auto i, last, c;
+    last = 0;
+    i = 0;
+    while (1) {
+        c = peek(path + i);
+        if (c == 0) { return last; }
+        if (c == '/') { last = i + 1; }
+        i++;
+    }
+}
+
+// Find the last `.` in a path string AFTER the basename start.
+// Returns the index, or -1 if no extension is present. Used to
+// strip the `.png` from the input filename so we can emit the
+// sidecar with the matching prefix.
+static _ext_start(path: ptr, basename_off) {
+    auto i, last, c;
+    last = 0 - 1;
+    i = basename_off;
+    while (1) {
+        c = peek(path + i);
+        if (c == 0) { return last; }
+        if (c == '.') { last = i; }
+        i++;
+    }
+}
+
+// Copy `len` bytes from src to dst. Trivial inline loop — avoids
+// pulling memcpy when the only consumer is here.
+static void _bytecopy(dst, src, len) {
+    auto i;
+    for (i = 0; i < len; i++) {
+        poke(dst + i, peek(src + i));
+    }
+}
+
+// Copy a file byte-for-byte. Used to mirror the source PNG into
+// the sidecar's directory so `meta.image` can reference it by
+// basename. Returns 0 on success, -1 on failure (matches
+// file_write_all's convention).
+static _file_copy(src_path: ptr, dst_path: ptr) {
+    auto buf, size, rc;
+    size = 0;
+    buf = file_read_all(src_path, &size);
+    if (buf == 0) { return 0 - 1; }
+    rc = file_write_all(dst_path, buf, size);
+    free(buf);
+    return rc;
+}
+
+// Read width + height from a PNG file's IHDR chunk. PNG layout:
+//   bytes  0..7   — PNG signature
+//   bytes  8..11  — IHDR chunk length (always 13 for IHDR)
+//   bytes 12..15  — chunk type "IHDR"
+//   bytes 16..19  — width  (big-endian uint32)
+//   bytes 20..23  — height (big-endian uint32)
+//
+// Avoids pulling stbimage (which drags in GPU + window deps the
+// offline tool has no use for). Returns 0 on success with the
+// dimensions written through the pointers, -1 on read failure.
+static _png_read_dims(path: ptr, out_w, out_h) {
+    auto buf, size;
+    auto w, h;
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) { return 0 - 1; }
+    if (size < 24) { free(buf); return 0 - 1; }
+    w = (peek(buf + 16) << 24) | (peek(buf + 17) << 16)
+      | (peek(buf + 18) << 8)  |  peek(buf + 19);
+    h = (peek(buf + 20) << 24) | (peek(buf + 21) << 16)
+      | (peek(buf + 22) << 8)  |  peek(buf + 23);
+    free(buf);
+    *(out_w) = w;
+    *(out_h) = h;
+    return 0;
+}
+
+// ── JSON emission helpers ───────────────────────────────────
+
+// Write a single frame entry into the strbuf. Aseprite Array
+// format:
+//   {
+//     "filename": "<name> <i>",
+//     "frame": {"x":X, "y":Y, "w":W, "h":H},
+//     "rotated": false,
+//     "trimmed": false,
+//     "spriteSourceSize": {"x":0, "y":0, "w":W, "h":H},
+//     "sourceSize": {"w":W, "h":H},
+//     "duration": MS
+//   }
+//
+// Aseprite's "Array" output (vs "Hash" which keys frames by name)
+// — the engine's packed-format loader walks an array indexed by
+// integer, reading `filename` per entry. The defaults match an
+// untrimmed, unrotated Aseprite export so a loader written
+// against the full schema reads our output without special cases.
+static _emit_frame(sb, name: ptr, frame_idx, x, y, w, h, duration_ms) {
+    sb = strbuf_cat(sb, "{\"filename\":\"");
+    sb = strbuf_cat(sb, name);
+    sb = strbuf_ch(sb, ' ');
+    sb = strbuf_num(sb, frame_idx);
+    sb = strbuf_cat(sb, "\",");
+    sb = strbuf_cat(sb, "\"frame\":{\"x\":");
+    sb = strbuf_num(sb, x);
+    sb = strbuf_cat(sb, ",\"y\":");
+    sb = strbuf_num(sb, y);
+    sb = strbuf_cat(sb, ",\"w\":");
+    sb = strbuf_num(sb, w);
+    sb = strbuf_cat(sb, ",\"h\":");
+    sb = strbuf_num(sb, h);
+    sb = strbuf_cat(sb, "},");
+    sb = strbuf_cat(sb, "\"rotated\":false,\"trimmed\":false,");
+    sb = strbuf_cat(sb, "\"spriteSourceSize\":{\"x\":0,\"y\":0,\"w\":");
+    sb = strbuf_num(sb, w);
+    sb = strbuf_cat(sb, ",\"h\":");
+    sb = strbuf_num(sb, h);
+    sb = strbuf_cat(sb, "},");
+    sb = strbuf_cat(sb, "\"sourceSize\":{\"w\":");
+    sb = strbuf_num(sb, w);
+    sb = strbuf_cat(sb, ",\"h\":");
+    sb = strbuf_num(sb, h);
+    sb = strbuf_cat(sb, "},\"duration\":");
+    sb = strbuf_num(sb, duration_ms);
+    sb = strbuf_ch(sb, '}');
+    return sb;
+}
+
+// Emit one frameTag entry. Aseprite shape:
+//   {"name":"<name>", "from":N, "to":M, "direction":"forward"}
+//
+// Direction is always "forward" in v1 — reverse and pingpong land
+// when a real consumer asks (Rule 28).
+static _emit_frame_tag(sb, name: ptr, from, to) {
+    sb = strbuf_cat(sb, "{\"name\":\"");
+    sb = strbuf_cat(sb, name);
+    sb = strbuf_cat(sb, "\",\"from\":");
+    sb = strbuf_num(sb, from);
+    sb = strbuf_cat(sb, ",\"to\":");
+    sb = strbuf_num(sb, to);
+    sb = strbuf_cat(sb, ",\"direction\":\"forward\"}");
+    return sb;
+}
+
+// ── Sidecar JSON emit ───────────────────────────────────────
+
+// Build the Aseprite-schema sidecar for a uniform-grid PNG. Names
+// the sheet via `sheet_name` (typically "peasant") — used as the
+// frames-object key prefix. PNG geometry comes from cols / rows /
+// tile_w / tile_h. Outputs to `sidecar_path` via file_write_all.
+//
+// Returns 0 on success, -1 on write failure.
+static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
+                     sheet_name: ptr, image_w, image_h,
+                     cols, rows, tile_w, tile_h) {
+    auto sb, total_frames, i, col, row;
+    auto rc;
+
+    total_frames = cols * rows;
+    sb = strbuf_new();
+
+    // Top-level open + frames array (Aseprite "Array" output).
+    sb = strbuf_cat(sb, "{\"frames\":[");
+    for (i = 0; i < total_frames; i++) {
+        if (i > 0) { sb = strbuf_ch(sb, ','); }
+        col = i % cols;
+        row = i / cols;
+        sb = _emit_frame(sb, sheet_name, i,
+                         col * tile_w, row * tile_h,
+                         tile_w, tile_h,
+                         DEFAULT_FRAME_MS);
+    }
+    sb = strbuf_cat(sb, "],");
+
+    // Meta block with image ref, dimensions, and frameTags.
+    sb = strbuf_cat(sb, "\"meta\":{\"image\":\"");
+    sb = strbuf_cat(sb, image_basename);
+    sb = strbuf_cat(sb, "\",\"size\":{\"w\":");
+    sb = strbuf_num(sb, image_w);
+    sb = strbuf_cat(sb, ",\"h\":");
+    sb = strbuf_num(sb, image_h);
+    sb = strbuf_cat(sb, "},\"scale\":\"1\",\"format\":\"RGBA8888\",");
+
+    // frameTags — known peasant anims. If we add more units, extend
+    // with a per-sheet tag table (or read from a sidecar config).
+    // Today: hardcoded for peasant since it's the only consumer.
+    sb = strbuf_cat(sb, "\"frameTags\":[");
+    sb = _emit_frame_tag(sb, "idle_N",  0, 0);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_NE", 1, 1);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_E",  2, 2);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_SE", 3, 3);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_S",  4, 4);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_N",  5, 9);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_NE", 10, 14); sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_E",  15, 19); sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_SE", 20, 24); sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_S",  25, 29);
+    sb = strbuf_cat(sb, "]}}\n");
+
+    rc = file_write_all(sidecar_path, sb, strbuf_len(sb));
+    strbuf_free(sb);
+    return rc;
+}
+
+// ── Entry point ─────────────────────────────────────────────
+
+main() {
+    auto in_path: ptr;
+    auto out_dir: ptr;
+    auto basename_off, ext_off;
+    auto name_buf, name_len;
+    auto dst_png, dst_json;
+    auto w, h, cols, rows;
+    auto rc;
+
+    if (argc_get() < 3) {
+        putstr_err("usage: wc1_sprite_convert <input.png> <output_dir>\n");
+        return 1;
+    }
+    in_path = argv_get(1);
+    out_dir = argv_get(2);
+
+    // Derive the sheet name from the input filename: drop the
+    // directory prefix + `.png` extension. "peasant.png" → "peasant",
+    // ".../peasant.png" → "peasant".
+    basename_off = _basename_start(in_path);
+    ext_off = _ext_start(in_path, basename_off);
+    if (ext_off < 0) {
+        // No extension on input — fall back to the full basename.
+        ext_off = str_len(in_path);
+    }
+    name_len = ext_off - basename_off;
+    name_buf = malloc(name_len + 1);
+    _bytecopy(name_buf, in_path + basename_off, name_len);
+    poke(name_buf + name_len, 0);
+
+    // Read PNG dimensions from the IHDR chunk — we then COPY the
+    // source bytes verbatim, so we never need to decode the
+    // actual pixels (avoids pulling stbimage into this tool).
+    w = 0; h = 0;
+    if (_png_read_dims(in_path, &w, &h) != 0) {
+        put_err("wc1_sprite_convert: cannot read ");
+        put_err(in_path);
+        put_err("\n");
+        free(name_buf);
+        return 1;
+    }
+
+    // Validate uniform grid.
+    if (w % TILE_W != 0 || h % TILE_H != 0) {
+        put_err("wc1_sprite_convert: image dimensions ");
+        putnum_err(w);
+        put_err("x");
+        putnum_err(h);
+        put_err(" are not a multiple of ");
+        putnum_err(TILE_W);
+        put_err("x");
+        putnum_err(TILE_H);
+        put_err("\n");
+        free(name_buf);
+        return 1;
+    }
+    cols = w / TILE_W;
+    rows = h / TILE_H;
+
+    // Build destination paths: <out_dir>/<name>.png + <name>.json
+    auto out_len, png_len, json_len;
+    out_len = str_len(out_dir);
+    png_len = out_len + 1 + name_len + 4 + 1;   // "/", ".png", "\0"
+    json_len = out_len + 1 + name_len + 5 + 1;  // "/", ".json", "\0"
+    dst_png  = malloc(png_len);
+    dst_json = malloc(json_len);
+    _bytecopy(dst_png, out_dir, out_len);
+    poke(dst_png + out_len, '/');
+    _bytecopy(dst_png + out_len + 1, name_buf, name_len);
+    poke(dst_png + out_len + 1 + name_len + 0, '.');
+    poke(dst_png + out_len + 1 + name_len + 1, 'p');
+    poke(dst_png + out_len + 1 + name_len + 2, 'n');
+    poke(dst_png + out_len + 1 + name_len + 3, 'g');
+    poke(dst_png + out_len + 1 + name_len + 4, 0);
+    _bytecopy(dst_json, out_dir, out_len);
+    poke(dst_json + out_len, '/');
+    _bytecopy(dst_json + out_len + 1, name_buf, name_len);
+    poke(dst_json + out_len + 1 + name_len + 0, '.');
+    poke(dst_json + out_len + 1 + name_len + 1, 'j');
+    poke(dst_json + out_len + 1 + name_len + 2, 's');
+    poke(dst_json + out_len + 1 + name_len + 3, 'o');
+    poke(dst_json + out_len + 1 + name_len + 4, 'n');
+    poke(dst_json + out_len + 1 + name_len + 5, 0);
+
+    // Copy PNG (preserves source bytes — meta.image references this
+    // copy by basename, NOT the original converted path, so the
+    // sidecar + PNG sit next to each other inside assets/sprites/).
+    rc = _file_copy(in_path, dst_png);
+    if (rc != 0) {
+        put_err("wc1_sprite_convert: failed to copy PNG to ");
+        putstr_err(dst_png);
+        put_err("\n");
+        free(name_buf); free(dst_png); free(dst_json);
+        return 1;
+    }
+
+    // Emit sidecar. The basename inside meta.image is just the
+    // PNG's filename (no directory) — the loader resolves it
+    // relative to the sidecar's own directory at load time.
+    auto image_basename;
+    image_basename = malloc(name_len + 5);
+    _bytecopy(image_basename, name_buf, name_len);
+    poke(image_basename + name_len + 0, '.');
+    poke(image_basename + name_len + 1, 'p');
+    poke(image_basename + name_len + 2, 'n');
+    poke(image_basename + name_len + 3, 'g');
+    poke(image_basename + name_len + 4, 0);
+
+    rc = _emit_sidecar(dst_json, image_basename, name_buf,
+                       w, h, cols, rows, TILE_W, TILE_H);
+    if (rc != 0) {
+        put_err("wc1_sprite_convert: failed to write sidecar ");
+        putstr_err(dst_json);
+        put_err("\n");
+        free(name_buf); free(dst_png); free(dst_json); free(image_basename);
+        return 1;
+    }
+
+    // Stats line. Use putstr explicitly for the ptr-typed dst
+    // paths so the smart-dispatch doesn't fall back to the
+    // integer formatter (W032 — declared untyped to land malloc
+    // returns cleanly).
+    putstr("wc1_sprite_convert: ");
+    putstr(in_path);
+    putstr(" -> ");
+    putstr(dst_png);
+    putstr(" + ");
+    putstr(dst_json);
+    putstr(" (");
+    putnum(cols * rows);
+    putstr(" frames, ");
+    putnum(cols);
+    putstr("x");
+    putnum(rows);
+    putstr(" grid, 10 frameTags)\n");
+
+    free(name_buf);
+    free(dst_png);
+    free(dst_json);
+    free(image_basename);
+    return 0;
+}
