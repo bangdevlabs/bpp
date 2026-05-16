@@ -303,22 +303,33 @@ deselect; ESC stays bound to quit.
    the second pass after the gap was caught).
 2. (this commit) — wc1_input + wc1_hud + Target component.
 
-### Session 5 — Movement (per-unit pathing) (~3-4h)
+### Session 5 — Movement (per-unit pathing) (~3-4h) — PARTIAL
+
+**Status**: Movement core SHIPPED (this commit). Animation deferred
+to the WC1 modulab pipeline sidequest (see
+`docs/sidequest_wc1_modulab_pipeline.md`) — walk frame cycling
+requires the sprite pipeline first migrating to Aseprite-compatible
+sheet format so frames are addressable by name.
 
 **Goal**: selected unit walks from its current tile to the right-
 clicked target along an A* path. Animation cycles through walk
 frames. Multiple units can be commanded independently.
 
-**Files**:
-- `wc1_movement.bsm` — A* via stbpath; per-unit cursor along the
-  returned waypoint list; smooth pixel interpolation between
-  tiles for the 60fps render.
-- Animation hookup in `wc1_anims.bsm` — pull walk frames from
-  the sprite atlas based on facing direction (8 directions, per
-  the Lua animation table).
+**Files** (as shipped):
+- `wc1_movement.bsm` (NEW) — A* via stbpath; per-unit Path
+  component (waypoint buffer + cursor); pixel interpolation
+  toward next waypoint at UnitDef.speed_pxs.
+- Animation hookup deferred — `wc1_anims.bsm` will land after
+  the Aseprite pipeline migration commits.
 
-**Verification**: 3 peasants on the map, click each, send them to
-different corners — all walk along their A* paths simultaneously.
+**Movement verification**: PASSED — user reported ~28 right-clicks
+resolved correctly, peasant walks to each target, redirect mid-
+path works, arrival snaps to tile center.
+
+**Animation verification (DEFERRED)**: "3 peasants on the map,
+click each, send them to different corners — all walk along their
+A* paths simultaneously." Code supports it; visual confirmation
+pending until animation cycle lands in the pipeline sidequest.
 
 ### Session 6 — Flow-field crowd movement (~2-3h)
 

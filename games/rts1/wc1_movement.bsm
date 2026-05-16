@@ -1,0 +1,157 @@
+// wc1_movement.bsm — A* pathing + per-unit waypoint follower.
+//
+// Session 5 ships single-unit, multi-target movement: a peasant
+// with a Target component computes an A* path from its current
+// tile to the target tile (once, at right-click time), and the
+// per-frame tick advances Pos in pixel coords toward the next
+// waypoint at UnitDef.speed_pxs. Hitting a waypoint advances the
+// cursor; running off the end clears Target sentinel and the unit
+// idles in place.
+//
+// What this file does NOT do (Rule 28 — earn the slot):
+//   - Walk frame animation (sprite stays on PEASANT_IDLE_S during
+//     motion). The handoff's wc1_anims.bsm with 8-direction walk
+//     cycles needs the war1tool Lua anim table for the canonical
+//     row mapping; lands as a separate sidequest.
+//   - Tile blocking (trees impassable). Today A* runs on an open
+//     grid — peasants walk through trees visually. Tile-properties
+//     table from war1tool is a separate sidequest.
+//   - Path re-planning when the target changes mid-walk. The
+//     wc1_input right-click writes a fresh Target + calls
+//     _request_path, which OVERWRITES the path buffer. So
+//     re-targeting just works; the issue is if the world changes
+//     under a unit (S7+ when units block).
+//   - Multi-unit group commands. Wait for marquee multi-select.
+
+import "stbecs.bsm";
+import "stbpath.bsm";
+import "stbgame.bsm";
+load   "wc1_units.bsm";
+
+// Module-private pathfinder shared by every unit. One A* per
+// right-click pays the planning cost once; the per-frame tick
+// only advances cursors. wc1_movement_init allocates this from
+// the map dimensions; the world-grid size never changes mid-game
+// so we don't need to grow it.
+extrn _pf;
+
+// Globals captured by the per-frame tick callback (ecs_query_each
+// signature is fn(world, eid)). Same closure-via-globals pattern
+// wc1_render / wc1_input use.
+extrn pos_comp, target_comp, path_comp;
+extrn peasant_q;
+
+// Per-frame movement step in pixels — set by wc1_movement_tick
+// once at the top of the tick from speed_pxs * dt, then read by
+// the per-entity callback. UnitDef speed is per-kind in v1 we
+// only have peasants so a single global step is fine; when more
+// unit types arrive the callback will read speed via unit_def_for.
+static auto _frame_step;
+
+// Allocate the shared A* pathfinder. Call once at startup AFTER
+// the map is loaded so the grid dimensions are known. Today A*
+// treats every cell as walkable (no path_set_blocked calls);
+// tile-properties + obstacle blocking is a separate sidequest.
+wc1_movement_init(map) {
+    _pf = path_new(wc1_map_w(map), wc1_map_h(map));
+}
+
+// Compute a fresh A* path from the unit's current pixel position
+// to the destination grid cell, and stash it in the unit's Path
+// component. Called by wc1_input on right-click. Overwrites any
+// in-flight path so re-targeting just works.
+//
+// The current position is the floor-of-pixel-pos / 16 so the
+// peasant pathfinds from the tile it's CURRENTLY standing on,
+// not the tile it was originally spawned at. A mid-walk redirect
+// drops whatever sub-pixel offset it had — visually a tiny snap
+// to tile center, acceptable for v1.
+void wc1_movement_request(world, eid, dst_gx, dst_gy) {
+    auto p: Pos, pa: Path;
+    auto src_gx, src_gy, n;
+    p  = ecs_get(world, pos_comp,  eid);
+    pa = ecs_get(world, path_comp, eid);
+    src_gx = p.x / 16;
+    src_gy = p.y / 16;
+    n = path_find(_pf, src_gx, src_gy, dst_gx, dst_gy,
+                  pa.buf, MAX_WAYPOINTS);
+    pa.count  = n;
+    // Skip waypoint 0 (it's the start cell the unit is already on);
+    // start walking toward waypoint 1. If the path collapsed to
+    // a single point (start == goal) the cursor immediately equals
+    // count and the tick treats it as "arrived".
+    pa.cursor = 1;
+}
+
+// Per-entity tick: advance the unit one frame-step toward
+// waypoints[cursor]. When the unit is within step distance of
+// the waypoint, snap to it and advance the cursor. When the
+// cursor passes the last waypoint, clear the Target sentinel
+// and idle.
+static void _step_unit(w, eid) {
+    auto p: Pos, pa: Path, t: Target;
+    auto wp_gx, wp_gy, wp_px, wp_py;
+    auto dx, dy, dist_sq, step_sq;
+    pa = ecs_get(w, path_comp, eid);
+    if (pa.cursor >= pa.count) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    // Waypoint pixel position. The A* output is grid coords; tile
+    // centers in pixels are `gx * 16` since Pos stores the tile's
+    // top-left as the unit anchor (peasant feet sit on the tile).
+    wp_gx = pa.buf[pa.cursor * 2];
+    wp_gy = pa.buf[pa.cursor * 2 + 1];
+    wp_px = wp_gx * 16;
+    wp_py = wp_gy * 16;
+    dx = wp_px - p.x;
+    dy = wp_py - p.y;
+    dist_sq = dx * dx + dy * dy;
+    step_sq = _frame_step * _frame_step;
+    if (dist_sq <= step_sq) {
+        // Snap to the waypoint and advance the cursor. Once the
+        // cursor exceeds count, the next tick early-returns above.
+        p.x = wp_px;
+        p.y = wp_py;
+        pa.cursor++;
+        if (pa.cursor >= pa.count) {
+            // Path finished — clear Target so wc1_input's UI layer
+            // (and S7+ combat) can tell the unit is idle now.
+            t = ecs_get(w, target_comp, eid);
+            t.gx = -1;
+            t.gy = -1;
+        }
+        return;
+    }
+    // Move toward the waypoint by _frame_step pixels along the
+    // (dx, dy) vector. Sub-pixel precision lives in the integer
+    // pixel itself — at 60 FPS the per-frame step is 2 px which
+    // is fine-grained enough that the staircase artifact stays
+    // invisible. True sub-pixel float coords are a v2 polish.
+    //
+    // dist_sq > step_sq guarantees we don't divide by zero; we
+    // approximate dist via the manhattan-ish max(|dx|, |dy|) so
+    // we avoid a sqrt — RTS movement doesn't need physically
+    // accurate diagonal speed.
+    auto dist;
+    dist = dx;
+    if (dist < 0) { dist = 0 - dist; }
+    auto adx;
+    adx = dy;
+    if (adx < 0) { adx = 0 - adx; }
+    if (adx > dist) { dist = adx; }
+    if (dist == 0) { return; }
+    p.x = p.x + dx * _frame_step / dist;
+    p.y = p.y + dy * _frame_step / dist;
+}
+
+// Walk every peasant and step its movement one frame. Compute
+// _frame_step from speed + dt at the top so each callback can
+// just read the global instead of re-multiplying. At 60 FPS with
+// peasant speed_pxs = 128, _frame_step is ~2 px/frame.
+void wc1_movement_tick(world) {
+    auto def: UnitDef, dt_ms;
+    def = unit_def_for(UNIT_PEASANT);
+    dt_ms = game_dt_ms();
+    _frame_step = def.speed_pxs * dt_ms / 1000;
+    if (_frame_step < 1) { _frame_step = 1; }
+    ecs_query_each(peasant_q, fn_ptr(_step_unit));
+}
