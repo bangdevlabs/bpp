@@ -27,6 +27,7 @@ import "stbecs.bsm";
 import "stbpath.bsm";
 import "stbgame.bsm";
 load   "wc1_units.bsm";
+load   "wc1_anims.bsm";
 
 // Module-private pathfinder shared by every unit. One A* per
 // right-click pays the planning cost once; the per-frame tick
@@ -38,8 +39,13 @@ extrn _pf;
 // Globals captured by the per-frame tick callback (ecs_query_each
 // signature is fn(world, eid)). Same closure-via-globals pattern
 // wc1_render / wc1_input use.
-extrn pos_comp, target_comp, path_comp;
+extrn pos_comp, target_comp, path_comp, anim_comp;
 extrn peasant_q;
+
+// Per-tick dt in ms. Set once at the top of wc1_movement_tick so
+// the per-entity callback can accumulate Anim.elapsed_ms without
+// re-querying game_dt_ms per unit.
+static auto _dt_ms;
 
 // Per-frame movement step in pixels — set by wc1_movement_tick
 // once at the top of the tick from speed_pxs * dt, then read by
@@ -83,17 +89,36 @@ void wc1_movement_request(world, eid, dst_gx, dst_gy) {
     pa.cursor = 1;
 }
 
-// Per-entity tick: advance the unit one frame-step toward
-// waypoints[cursor]. When the unit is within step distance of
-// the waypoint, snap to it and advance the cursor. When the
-// cursor passes the last waypoint, clear the Target sentinel
-// and idle.
+// Per-entity tick: advance Pos toward the next waypoint and keep
+// Anim in sync (state, facing, elapsed_ms). Idle units only see
+// their elapsed_ms advance; walking units also update facing on
+// every direction change and reset elapsed_ms so the new walk
+// cycle starts at frame 0.
 static void _step_unit(w, eid) {
-    auto p: Pos, pa: Path, t: Target;
+    auto p: Pos, pa: Path, t: Target, an: Anim;
     auto wp_gx, wp_gy, wp_px, wp_py;
     auto dx, dy, dist_sq, step_sq;
+    auto new_facing;
     pa = ecs_get(w, path_comp, eid);
-    if (pa.cursor >= pa.count) { return; }
+    an = ecs_get(w, anim_comp, eid);
+    // Idle path — keep accumulating elapsed_ms for consistency with
+    // walking units. Also ensures Anim.state is correct in case a
+    // path just finished on a previous tick.
+    if (pa.cursor >= pa.count) {
+        if (an.state != UNIT_STATE_IDLE) {
+            an.state      = UNIT_STATE_IDLE;
+            an.elapsed_ms = 0;
+        } else {
+            an.elapsed_ms = an.elapsed_ms + _dt_ms;
+        }
+        return;
+    }
+    // Walking path — first time we hit this in a cycle, flip state
+    // and reset the timer so the walk anim starts at frame 0.
+    if (an.state != UNIT_STATE_WALK) {
+        an.state      = UNIT_STATE_WALK;
+        an.elapsed_ms = 0;
+    }
     p = ecs_get(w, pos_comp, eid);
     // Waypoint pixel position. The A* output is grid coords; tile
     // centers in pixels are `gx * 16` since Pos stores the tile's
@@ -104,21 +129,36 @@ static void _step_unit(w, eid) {
     wp_py = wp_gy * 16;
     dx = wp_px - p.x;
     dy = wp_py - p.y;
+    // Resolve facing from the heading vector. Only update when the
+    // vector is non-zero; reset elapsed_ms when facing actually
+    // changes so each new walk direction starts at frame 0 of its
+    // cycle (prevents the half-cycle jump that happens when a
+    // peasant turns mid-walk).
+    if (dx != 0 || dy != 0) {
+        new_facing = wc1_facing_for_delta(dx, dy);
+        if (new_facing != an.facing) {
+            an.facing     = new_facing;
+            an.elapsed_ms = 0;
+        }
+    }
     dist_sq = dx * dx + dy * dy;
     step_sq = _frame_step * _frame_step;
     if (dist_sq <= step_sq) {
         // Snap to the waypoint and advance the cursor. Once the
-        // cursor exceeds count, the next tick early-returns above.
+        // cursor exceeds count, the next tick takes the idle branch.
         p.x = wp_px;
         p.y = wp_py;
         pa.cursor++;
         if (pa.cursor >= pa.count) {
             // Path finished — clear Target so wc1_input's UI layer
-            // (and S7+ combat) can tell the unit is idle now.
+            // (and S7+ combat) can tell the unit is idle now. Anim
+            // flip to IDLE waits for the next tick to keep the
+            // walk cycle's last frame visible this frame.
             t = ecs_get(w, target_comp, eid);
             t.gx = -1;
             t.gy = -1;
         }
+        an.elapsed_ms = an.elapsed_ms + _dt_ms;
         return;
     }
     // Move toward the waypoint by _frame_step pixels along the
@@ -141,6 +181,7 @@ static void _step_unit(w, eid) {
     if (dist == 0) { return; }
     p.x = p.x + dx * _frame_step / dist;
     p.y = p.y + dy * _frame_step / dist;
+    an.elapsed_ms = an.elapsed_ms + _dt_ms;
 }
 
 // Walk every peasant and step its movement one frame. Compute
@@ -148,10 +189,10 @@ static void _step_unit(w, eid) {
 // just read the global instead of re-multiplying. At 60 FPS with
 // peasant speed_pxs = 128, _frame_step is ~2 px/frame.
 void wc1_movement_tick(world) {
-    auto def: UnitDef, dt_ms;
+    auto def: UnitDef;
     def = unit_def_for(UNIT_PEASANT);
-    dt_ms = game_dt_ms();
-    _frame_step = def.speed_pxs * dt_ms / 1000;
+    _dt_ms = game_dt_ms();
+    _frame_step = def.speed_pxs * _dt_ms / 1000;
     if (_frame_step < 1) { _frame_step = 1; }
     ecs_query_each(peasant_q, fn_ptr(_step_unit));
 }

@@ -18,6 +18,7 @@ import "stbecs.bsm";
 import "stbimage.bsm";
 import "stbcamera.bsm";
 load   "wc1_units.bsm";
+load   "wc1_anims.bsm";
 
 // Component layouts. Pos uses PIXEL coords (not tile coords) so
 // movement can interpolate sub-tile for smooth 60 FPS render.
@@ -35,6 +36,15 @@ struct Sprite   { atlas, frame }
 struct UnitType { kind }
 struct Target   { gx, gy }
 struct Path     { buf, count, cursor }
+// Anim drives the per-unit animation state. `state` is one of
+// UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
+// — used to dispatch between idle anim and walk anim families.
+// `facing` is one of FACE_N..FACE_NW (clockwise from north,
+// 0..7); picks which atlas tag to play and whether to mirror
+// horizontally. `elapsed_ms` accumulates since the last state OR
+// facing change so wc1_movement can reset the cycle to frame 0
+// when the unit turns or starts/stops.
+struct Anim     { state, facing, elapsed_ms }
 
 // Maximum waypoints in a single peasant's path. Forest1 is 64×64;
 // a worst-case Manhattan path crosses ~128 tiles. 256 covers that
@@ -47,7 +57,7 @@ const MAX_WAYPOINTS = 256;
 // callback signature is fn(world, entity_id) — extra state has
 // to flow through globals because B++ doesn't carry closures.
 // Same pattern every other stbecs consumer follows.
-global pos_comp, sprite_comp, unit_comp, target_comp, path_comp;
+global pos_comp, sprite_comp, unit_comp, target_comp, path_comp, anim_comp;
 global peasant_arch, peasant_q;
 
 // Camera handle owned by rts.bpp. Read by _render_unit via
@@ -70,13 +80,15 @@ ecs_wire(world) {
     unit_comp   = ecs_component_register(world, "UnitType", sizeof(UnitType));
     target_comp = ecs_component_register(world, "Target",   sizeof(Target));
     path_comp   = ecs_component_register(world, "Path",     sizeof(Path));
-    comps    = buf_word(5);
+    anim_comp   = ecs_component_register(world, "Anim",     sizeof(Anim));
+    comps    = buf_word(6);
     comps[0] = pos_comp;
     comps[1] = sprite_comp;
     comps[2] = unit_comp;
     comps[3] = target_comp;
     comps[4] = path_comp;
-    peasant_arch = ecs_archetype(world, comps, 5);
+    comps[5] = anim_comp;
+    peasant_arch = ecs_archetype(world, comps, 6);
     peasant_q    = ecs_query(world, 0);
 }
 
@@ -86,7 +98,7 @@ ecs_wire(world) {
 // to ecs_get / ecs_kill_at.
 ecs_spawn_peasant(world, atlas, gx, gy) {
     auto eid;
-    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path;
+    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim;
     eid = ecs_spawn_at(world, peasant_arch);
     p = ecs_get(world, pos_comp, eid);
     // Pos lives in PIXEL coords so the movement system can walk
@@ -112,23 +124,47 @@ ecs_spawn_peasant(world, atlas, gx, gy) {
     pa.buf    = buf_word(MAX_WAYPOINTS * 2);
     pa.count  = 0;
     pa.cursor = 0;
+    // Initial anim state: idle facing south (the convention every
+    // WC1 unit sprite renders by default). wc1_movement updates
+    // facing per step + flips to UNIT_STATE_WALK when a path is
+    // active.
+    an = ecs_get(world, anim_comp, eid);
+    an.state      = UNIT_STATE_IDLE;
+    an.facing     = FACE_S;
+    an.elapsed_ms = 0;
     return eid;
 }
 
-// Per-entity render callback. Reads Pos + Sprite, applies the
-// camera to land in screen coords. Pos lives in pixels so no
-// tile→pixel multiply is needed here. Sprite offset (-8 horizontal,
-// -16 vertical) centers the 32 px sprite on the unit's anchor
-// position + bottom-aligns the feet, matching the war1gus
-// reference for peasant placement.
+// Per-entity render callback. Reads Pos + Sprite + Anim, resolves
+// the current animation frame via wc1_anim_id_for + image_anim_frame,
+// then dispatches to image_draw_size or image_draw_size_flipped
+// depending on whether the facing requires horizontal mirror (WC1
+// only stores 5 facings; W/NW/SW reuse E/NE/SE flipped).
+//
+// Sprite offset (-8 horizontal, -16 vertical) centers the 32 px
+// sprite on the unit's anchor position + bottom-aligns the feet,
+// matching the war1gus reference for peasant placement.
 static void _render_unit(w, eid) {
-    auto p: Pos, s: Sprite;
-    p = ecs_get(w, pos_comp, eid);
-    s = ecs_get(w, sprite_comp, eid);
-    image_draw_size(s.atlas, s.frame,
-                    p.x - 8  - cam_x(cam),
-                    p.y - 16 - cam_y(cam),
-                    32, 32);
+    auto p: Pos, s: Sprite, an: Anim;
+    auto anim_id, flip, sprite_id, sx, sy;
+    p  = ecs_get(w, pos_comp, eid);
+    s  = ecs_get(w, sprite_comp, eid);
+    an = ecs_get(w, anim_comp, eid);
+    anim_id = 0;
+    flip    = 0;
+    wc1_anim_id_for(an.state, an.facing, &anim_id, &flip);
+    sprite_id = image_anim_frame(s.atlas, anim_id, an.elapsed_ms);
+    // Defensive: if the atlas didn't carry the requested anim,
+    // sprite_id falls back to -1 — keep rendering the spawn-time
+    // default frame instead of crashing.
+    if (sprite_id < 0) { sprite_id = s.frame; }
+    sx = p.x - 8  - cam_x(cam);
+    sy = p.y - 16 - cam_y(cam);
+    if (flip != 0) {
+        image_draw_size_flipped(s.atlas, sprite_id, sx, sy, 32, 32);
+    } else {
+        image_draw_size(s.atlas, sprite_id, sx, sy, 32, 32);
+    }
 }
 
 // Walk every unit and emit its sprite. Call once per frame between

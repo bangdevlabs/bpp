@@ -181,6 +181,107 @@ running game picks up the new pixels within ~30ms.
 
 ---
 
+## Sprite Sheet JSON (Aseprite-compatible)
+
+Canonical format for sprites that carry **animation metadata** —
+WC1 units (peasant + future footman / archer / ...), and any
+sprite imported from a tool that exports the Aseprite shape
+(Aseprite itself, TexturePacker, war1tool via
+`tools/wc1_sprite_convert`). The runtime consumes the LITERAL
+Aseprite "Export Sprite Sheet > JSON Array > Frame Tags" output
+— no bespoke field names, no extra envelope.
+
+Adopted as canonical 2026-05-16 (sidequest
+`docs/sidequest_wc1_modulab_pipeline.md`) — Modulab repositions
+as IDE-companion to Aseprite, not Aseprite-replacement.
+
+### Schema
+
+```json
+{
+  "frames": [
+    {
+      "filename": "peasant 0",
+      "frame": {"x": 0, "y": 0, "w": 32, "h": 32},
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {"x": 0, "y": 0, "w": 32, "h": 32},
+      "sourceSize": {"w": 32, "h": 32},
+      "duration": 100
+    },
+    {"filename": "peasant 1", "frame": {"x": 32, "y": 0, ...}, ...}
+  ],
+  "meta": {
+    "image": "peasant.png",
+    "size": {"w": 160, "h": 416},
+    "scale": "1",
+    "format": "RGBA8888",
+    "frameTags": [
+      {"name": "idle_S",  "from": 4, "to": 4,  "direction": "forward"},
+      {"name": "walk_N",  "from": 5, "to": 9,  "direction": "forward"},
+      {"name": "walk_NE", "from": 10, "to": 14, "direction": "forward"}
+    ]
+  }
+}
+```
+
+Field reference:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `frames` | array | yes | Per-frame bounding boxes inside the source PNG. Each carries `filename` (string id, accessed via `image_named_id`), `frame` (rect inside the PNG), `duration` (ms). `rotated` / `trimmed` / `spriteSourceSize` / `sourceSize` are honoured if present, defaulted to the un-rotated/un-trimmed shape otherwise |
+| `meta.image` | string | yes | Path to the source PNG, **resolved relative to the JSON file's directory** (same convention as atlas_grid) |
+| `meta.size` | `{w,h}` | optional | Source PNG dimensions; informational |
+| `meta.frameTags` | array | optional | Named animation ranges. Each: `name` (string, looked up via `image_anim_id`), `from` / `to` (inclusive frame index range), `direction` (one of `forward` / `reverse` / `pingpong` — only `forward` honoured in v1; non-forward is parsed but plays as forward) |
+
+### Consumers
+
+```bpp
+auto atlas;
+atlas = image_load("assets/sprites/wc1/peasant.json");
+
+// Cache anim ids once at startup
+auto walk_n_id;
+walk_n_id = image_anim_id(atlas, "walk_N");
+
+// Per-frame: resolve current sprite from the cycle
+auto sprite_id;
+sprite_id = image_anim_frame(atlas, walk_n_id, elapsed_ms);
+image_draw_size(atlas, sprite_id, sx, sy, 32, 32);
+
+// Or mirror for the western half (WC1 5-facing convention)
+image_draw_size_flipped(atlas, sprite_id, sx, sy, 32, 32);
+```
+
+### Detection
+
+`image_load` dispatches by content shape, not extension. The
+sniffer routes the JSON to `_image_load_packed_format` when it
+finds a top-level `frames` array AND no `type` field — exactly
+Aseprite's output. Hand-authored Modulab packs (`type:
+"atlas_pack"`) and uniform grids (`type: "atlas_grid"`) keep
+their existing paths.
+
+### Variable per-frame duration
+
+The schema supports it (`duration` is per-frame, not per-tag),
+but v1 of the engine reads ONE duration per tag (the first frame's)
+and applies it uniformly across the cycle. War1tool imports and
+typical Aseprite exports use uniform-rate per tag anyway. Variable-
+rate cycles inside a tag would require walking the durations array
+on every `image_anim_frame` call — schema bump when a real consumer
+needs it.
+
+### Aseprite Hash format (NOT supported)
+
+Aseprite's "JSON Hash" export keys `frames` by filename string
+instead of by integer position. The runtime loader does NOT
+parse that shape — use "JSON Array" instead. The error message
+on Hash is clear: "missing `frames` array (Hash format not
+supported)".
+
+---
+
 ## Atlas Grid JSON (sprite sheets)
 
 Used by games that ship sprite sheets where every tile is the

@@ -1,0 +1,129 @@
+// wc1_anims.bsm — animation state + facing math for WC1 units.
+//
+// Session 5 close: walk frame cycling + 8-directional facing
+// resolved through the Aseprite-compatible sidecar's frameTags.
+// The sidecar carries 10 named animations (5 idle + 5 walk, one
+// per facing N / NE / E / SE / S); facings W / NW / SW reuse the
+// corresponding eastern variants drawn flipped horizontally via
+// `image_draw_size_flipped` — same atlas, half the disk space.
+//
+// Cached anim ids: looked up at startup via wc1_anims_init and
+// stored in globals so the per-frame render path doesn't pay the
+// string compare cost. With 10 tags the linear scan is cheap, but
+// caching matches the convention every other stbimage consumer
+// follows.
+
+import "stbimage.bsm";
+load   "wc1_units.bsm";
+
+// Unit motion state — drives which animation family plays
+// (idle vs walk). const enums avoid the cost of packed-string
+// dispatch on the per-frame render path. New states earn their
+// slot when a game system needs them (S7+ chop / attack / die).
+const UNIT_STATE_IDLE = 0;
+const UNIT_STATE_WALK = 1;
+
+// 8-directional facing enum — index into the per-unit Anim.facing
+// field. WC1 sprites only cover the eastern half; W/NW/SW are
+// rendered with image_draw_size_flipped using the E/NE/SE atlas
+// tags. Numbered clockwise starting from N so the dir-from-vector
+// math is a straightforward atan2-style 8-way bucket.
+const FACE_N  = 0;
+const FACE_NE = 1;
+const FACE_E  = 2;
+const FACE_SE = 3;
+const FACE_S  = 4;
+const FACE_SW = 5;
+const FACE_W  = 6;
+const FACE_NW = 7;
+
+// Anim id cache. Populated once at startup by wc1_anims_init. -1
+// when the tag isn't present in the loaded atlas (shouldn't happen
+// for the canonical peasant.json but the lookup guards anyway).
+global _anim_idle_N, _anim_idle_NE, _anim_idle_E, _anim_idle_SE, _anim_idle_S;
+global _anim_walk_N, _anim_walk_NE, _anim_walk_E, _anim_walk_SE, _anim_walk_S;
+
+// Resolve every named animation we care about in one shot at
+// startup. Cheap (10 string compares total) and means the per-
+// frame render doesn't touch image_anim_id at all. Call AFTER
+// the atlas is loaded.
+wc1_anims_init(atlas) {
+    _anim_idle_N  = image_anim_id(atlas, "idle_N");
+    _anim_idle_NE = image_anim_id(atlas, "idle_NE");
+    _anim_idle_E  = image_anim_id(atlas, "idle_E");
+    _anim_idle_SE = image_anim_id(atlas, "idle_SE");
+    _anim_idle_S  = image_anim_id(atlas, "idle_S");
+    _anim_walk_N  = image_anim_id(atlas, "walk_N");
+    _anim_walk_NE = image_anim_id(atlas, "walk_NE");
+    _anim_walk_E  = image_anim_id(atlas, "walk_E");
+    _anim_walk_SE = image_anim_id(atlas, "walk_SE");
+    _anim_walk_S  = image_anim_id(atlas, "walk_S");
+}
+
+// Pick a facing enum from a movement vector. 8-way bucketing
+// using the |dx| > |dy| * 2 test for cardinal directions and the
+// quadrant signs for the diagonals. No trig — pure integer
+// comparisons, deterministic, branch-friendly.
+//
+// Zero vector returns the previous facing's responsibility — we
+// don't change facing when standing still, so callers gate on
+// "moved this tick" before consulting this function.
+wc1_facing_for_delta(dx, dy) {
+    auto adx, ady;
+    adx = dx; if (adx < 0) { adx = 0 - adx; }
+    ady = dy; if (ady < 0) { ady = 0 - ady; }
+    // Strongly horizontal: |dx| > 2*|dy| → cardinal E or W
+    if (adx > ady * 2) {
+        if (dx > 0) { return FACE_E; }
+        return FACE_W;
+    }
+    // Strongly vertical: |dy| > 2*|dx| → cardinal N or S
+    if (ady > adx * 2) {
+        if (dy > 0) { return FACE_S; }
+        return FACE_N;
+    }
+    // Diagonals — sign of (dx, dy) picks one of NE / SE / SW / NW
+    if (dx > 0) {
+        if (dy > 0) { return FACE_SE; }
+        return FACE_NE;
+    }
+    if (dy > 0) { return FACE_SW; }
+    return FACE_NW;
+}
+
+// Resolve (state, facing) → (anim_id, flip_flag). Facings 0..4
+// (N..S) map directly to the cached anim ids and emit unflipped.
+// Facings 5..7 (SW / W / NW) reuse the E-side anims (SE / E / NE
+// respectively) drawn flipped horizontally — the WC1 sprite-half
+// convention.
+//
+// Writes both outputs through pointer args so the call site stays
+// allocation-free. anim_id is -1 if the tag is missing from the
+// atlas (defensive — shouldn't happen for the canonical peasant
+// asset).
+wc1_anim_id_for(state, facing, out_anim, out_flip) {
+    auto a, flip;
+    a = 0 - 1;
+    flip = 0;
+    if (state == UNIT_STATE_IDLE) {
+        if (facing == FACE_N)  { a = _anim_idle_N; }
+        if (facing == FACE_NE) { a = _anim_idle_NE; }
+        if (facing == FACE_E)  { a = _anim_idle_E; }
+        if (facing == FACE_SE) { a = _anim_idle_SE; }
+        if (facing == FACE_S)  { a = _anim_idle_S; }
+        if (facing == FACE_SW) { a = _anim_idle_SE; flip = 1; }
+        if (facing == FACE_W)  { a = _anim_idle_E;  flip = 1; }
+        if (facing == FACE_NW) { a = _anim_idle_NE; flip = 1; }
+    } else {
+        if (facing == FACE_N)  { a = _anim_walk_N; }
+        if (facing == FACE_NE) { a = _anim_walk_NE; }
+        if (facing == FACE_E)  { a = _anim_walk_E; }
+        if (facing == FACE_SE) { a = _anim_walk_SE; }
+        if (facing == FACE_S)  { a = _anim_walk_S; }
+        if (facing == FACE_SW) { a = _anim_walk_SE; flip = 1; }
+        if (facing == FACE_W)  { a = _anim_walk_E;  flip = 1; }
+        if (facing == FACE_NW) { a = _anim_walk_NE; flip = 1; }
+    }
+    *(out_anim) = a;
+    *(out_flip) = flip;
+}

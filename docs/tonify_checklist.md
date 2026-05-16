@@ -2122,7 +2122,8 @@ those formats cause.**
 | Asset kind | Authoring tool | Format | Game loader |
 |---|---|---|---|
 | Levels (tile grids) | Bang 9 Levels tab + `level_editor` | JSON: `{width, height, tiles[][], spawns?, resources?}` | `bpp_json` (auto-injected) + `tile_set` per cell |
-| Sprites + animations | Modulab + Bang 9 Sprite tab | Atlas pack: `*.json` (single PNG + named-id index) | `image_load("....json")` + `image_named_id` + `image_draw_size` |
+| Sprites (no animation) | Modulab + Bang 9 Sprite tab | Atlas pack: `*.json` (manifest + per-sprite Modulab files) | `image_load` + `image_named_id` + `image_draw_size` |
+| Sprites (with animation) | Aseprite (heavy work) + Modulab (in-context tweaks) | Aseprite-compatible sprite sheet: PNG + `*.json` sidecar (Array shape + frameTags) | `image_load` + `image_anim_id` + `image_anim_frame` + `image_draw_size_flipped` |
 | Audio (one-shots) | external editor / war1tool | `.wav` | `sound_load_wav` |
 | Music (BGM) | external sequencer / war1tool | `.mid` (Format 0/1, no SMPTE) | `midi_play_file` |
 | Hot-reload signal | filesystem mtime | n/a | `file_watch_register` (level edits + atlas re-saves both ride this) |

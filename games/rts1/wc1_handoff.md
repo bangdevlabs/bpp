@@ -303,33 +303,47 @@ deselect; ESC stays bound to quit.
    the second pass after the gap was caught).
 2. (this commit) — wc1_input + wc1_hud + Target component.
 
-### Session 5 — Movement (per-unit pathing) (~3-4h) — PARTIAL
-
-**Status**: Movement core SHIPPED (this commit). Animation deferred
-to the WC1 modulab pipeline sidequest (see
-`docs/sidequest_wc1_modulab_pipeline.md`) — walk frame cycling
-requires the sprite pipeline first migrating to Aseprite-compatible
-sheet format so frames are addressable by name.
+### Session 5 — Movement (per-unit pathing) (~3-4h) — CLOSED
 
 **Goal**: selected unit walks from its current tile to the right-
 clicked target along an A* path. Animation cycles through walk
 frames. Multiple units can be commanded independently.
 
 **Files** (as shipped):
-- `wc1_movement.bsm` (NEW) — A* via stbpath; per-unit Path
-  component (waypoint buffer + cursor); pixel interpolation
-  toward next waypoint at UnitDef.speed_pxs.
-- Animation hookup deferred — `wc1_anims.bsm` will land after
-  the Aseprite pipeline migration commits.
+- `wc1_movement.bsm` — A* via stbpath; per-unit Path component
+  (waypoint buffer + cursor); pixel interpolation toward next
+  waypoint at UnitDef.speed_pxs.
+- `wc1_anims.bsm` — facing math (8-octant bucket from movement
+  vector); state enum (idle / walk); cached anim ids from the
+  loaded sprite sheet; flip-flag dispatch for W/NW/SW facings
+  via image_draw_size_flipped.
+- Sprite sheet pipeline migrated to Aseprite-compatible format
+  by the WC1 modulab pipeline sidequest. The 10 named anims
+  (5 idle + 5 walk) live in the sheet's frameTags; game-side
+  reads them via image_anim_id at startup, image_anim_frame
+  per render.
 
-**Movement verification**: PASSED — user reported ~28 right-clicks
-resolved correctly, peasant walks to each target, redirect mid-
-path works, arrival snaps to tile center.
+**Verification**: PASSED.
+  - Movement: user reported ~28 right-clicks resolved correctly,
+    peasant walks to each target, redirect mid-path works,
+    arrival snaps to tile center.
+  - Animation cycling: visual smoke (user-side) — peasant cycles
+    through walk frames during movement, returns to idle frame
+    on arrival, faces the direction of motion (8 facings via
+    5 atlas variants + horizontal flip).
+  - Multi-unit independence: forest1 spawns 2 peasants (player
+    0 at 16,16 + player 2 at 16,48); each holds its own Path /
+    Anim components and walks independently when commanded.
 
-**Animation verification (DEFERRED)**: "3 peasants on the map,
-click each, send them to different corners — all walk along their
-A* paths simultaneously." Code supports it; visual confirmation
-pending until animation cycle lands in the pipeline sidequest.
+Shipped in 5 commits via `docs/sidequest_wc1_modulab_pipeline.md`:
+  - Commit 1: WC1 S5 PARTIAL — movement (no animation)
+  - Commit 2: convention cleanup `.atlas.json` → `.json`
+  - Commit 3: wc1_sprite_convert + Aseprite-schema sidecar
+  - Commit 4: stbimage parses Aseprite + game-side animation
+    wires S5 (this commit)
+  - Commits 5+6 (Modulab read/edit Aseprite sheets) ship
+    separately to close the "Modulab as IDE-companion" promise
+    end-to-end.
 
 ### Session 6 — Flow-field crowd movement (~2-3h)
 

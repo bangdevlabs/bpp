@@ -1169,13 +1169,32 @@ struct Image {
     frame_y,    // per-sprite y in atlas pixels (variable atlases)
     frame_w,    // per-sprite width in pixels (variable atlases)
     frame_h,    // per-sprite height (variable atlases)
-    src_path,   // strdup'd path used at load time. 0 for procedural
-                // images (image_create_rgba). Hot-reload uses this
-                // to re-execute image_load when the source changes.
-    last_hash   // FNV-1a content hash captured at load (Phase 3.5.6)
-                // — covers the manifest plus every sibling sprite
-                // file. Hot-reload tick rehashes and reloads when
-                // the value differs.
+    src_path,       // strdup'd path used at load time. 0 for procedural
+                    // images (image_create_rgba). Hot-reload uses this
+                    // to re-execute image_load when the source changes.
+    last_hash,      // FNV-1a content hash captured at load (Phase 3.5.6)
+                    // — covers the manifest plus every sibling sprite
+                    // file. Hot-reload tick rehashes and reloads when
+                    // the value differs.
+    anim_names,     // optional dynamic array of strdup'd anim names —
+                    // populated by the packed loader when the sidecar
+                    // carries `meta.frameTags` (Aseprite convention).
+                    // 0 when no animations were declared. Looked up by
+                    // `image_anim_id`.
+    anim_from,      // parallel arr<int>: first sprite_id of each anim
+                    // cycle (inclusive). Same index space as the frame
+                    // arrays above.
+    anim_to,        // parallel arr<int>: last sprite_id of each anim
+                    // cycle (inclusive). Together with anim_from this
+                    // defines the cycle range.
+    anim_frame_ms,  // parallel arr<int>: duration in ms of EACH frame
+                    // in the cycle. v1 assumes uniform — read once
+                    // from frames[from].duration at parse time. When
+                    // a consumer needs variable rate, bump the schema
+                    // and store the per-frame durations directly.
+    anims_count     // total animations registered (0 when no
+                    // frameTags were present). Indexed by anim_id
+                    // returned from image_anim_id.
 }
 
 // ── Lifecycle ───────────────────────────────────────────────
@@ -1208,9 +1227,14 @@ image_create_rgba(rgba_buf, tex_w, tex_h, tile_w, tile_h) {
     a.frame_y   = 0;   // from sprite_id + tile_w/tile_h instead.
     a.frame_w   = 0;
     a.frame_h   = 0;
-    a.src_path  = 0;   // procedural images have no on-disk source
-    a.last_hash = 0;
-    a.tex       = _stb_gpu_create_texture(rgba_buf, tex_w, tex_h);
+    a.src_path     = 0;   // procedural images have no on-disk source
+    a.last_hash    = 0;
+    a.anim_names   = 0;   // procedural images carry no animations
+    a.anim_from    = 0;
+    a.anim_to      = 0;
+    a.anim_frame_ms = 0;
+    a.anims_count  = 0;
+    a.tex          = _stb_gpu_create_texture(rgba_buf, tex_w, tex_h);
     return a;
 }
 
@@ -1578,6 +1602,11 @@ static _image_reload(img) {
     im.frame_h  = fr.frame_h;
     im.src_path = fr.src_path;
     im.last_hash = fr.last_hash;
+    im.anim_names    = fr.anim_names;
+    im.anim_from     = fr.anim_from;
+    im.anim_to       = fr.anim_to;
+    im.anim_frame_ms = fr.anim_frame_ms;
+    im.anims_count   = fr.anims_count;
 
     // The fresh struct's heap slot is no longer referenced — its
     // contents were moved over. Releasing it reclaims the
@@ -2476,6 +2505,51 @@ static _image_load_packed_format(json_path: ptr) {
         fh_arr = arr_push(fh_arr, fh);
     }
 
+    // Optional `meta.frameTags` (Aseprite convention) — declares
+    // named animation ranges over the frames just parsed. Each tag
+    // becomes a row in four parallel arrays the runtime walks via
+    // `image_anim_id` / `image_anim_frame`. Absence of the field
+    // is normal — atlases without anims (pathfind cat/rat) load
+    // exactly as before, with anims_count == 0.
+    auto anim_names_arr, anim_from_arr, anim_to_arr, anim_frame_ms_arr;
+    auto anims_n, tags_idx, tag_i;
+    anim_names_arr     = 0;
+    anim_from_arr      = 0;
+    anim_to_arr        = 0;
+    anim_frame_ms_arr  = 0;
+    anims_n            = 0;
+    tags_idx = json_object_get(doc, meta_idx, "frameTags");
+    if (tags_idx >= 0) {
+        anim_names_arr    = arr_new();
+        anim_from_arr     = arr_new();
+        anim_to_arr       = arr_new();
+        anim_frame_ms_arr = arr_new();
+        anims_n = json_length(doc, tags_idx);
+        for (tag_i = 0; tag_i < anims_n; tag_i++) {
+            auto tag_node, tag_name_s, tag_from, tag_to, tag_name_dup;
+            auto frame_for_rate, rate_obj, rate_ms;
+            tag_node    = json_child(doc, tags_idx, tag_i);
+            tag_name_s  = json_object_get_string(doc, tag_node, "name");
+            tag_from    = json_object_get_int(doc, tag_node, "from", 0);
+            tag_to      = json_object_get_int(doc, tag_node, "to",   tag_from);
+            tag_name_dup = 0;
+            if (tag_name_s != 0) { tag_name_dup = str_dup(tag_name_s); }
+            // Tag's frame_ms is the duration of its first frame
+            // (uniform-rate assumption — variable rate lands when a
+            // game asks). Default 100 if the source omits duration.
+            rate_ms = 100;
+            if (tag_from >= 0 && tag_from < n) {
+                frame_for_rate = json_child(doc, frames_idx, tag_from);
+                rate_obj = frame_for_rate;
+                rate_ms = json_object_get_int(doc, rate_obj, "duration", 100);
+            }
+            anim_names_arr    = arr_push(anim_names_arr,    tag_name_dup);
+            anim_from_arr     = arr_push(anim_from_arr,     tag_from);
+            anim_to_arr       = arr_push(anim_to_arr,       tag_to);
+            anim_frame_ms_arr = arr_push(anim_frame_ms_arr, rate_ms);
+        }
+    }
+
     json_free(doc);
     free(buf);
     free(image_path);
@@ -2483,19 +2557,24 @@ static _image_load_packed_format(json_path: ptr) {
     // Build Image struct directly — variable-frame mode means
     // tile_w/tile_h stay 0 and the per-frame arrays carry the truth.
     a = malloc(sizeof(Image));
-    a.tex_w   = w;
-    a.tex_h   = h;
-    a.tile_w  = 0;
-    a.tile_h  = 0;
-    a.cols    = 0;
-    a.rows    = 0;
-    a.count   = n;
-    a.names   = names;
-    a.frame_x = fx_arr;
-    a.frame_y = fy_arr;
-    a.frame_w = fw_arr;
-    a.frame_h = fh_arr;
-    a.tex     = _stb_gpu_create_texture(pixels, w, h);
+    a.tex_w           = w;
+    a.tex_h           = h;
+    a.tile_w          = 0;
+    a.tile_h          = 0;
+    a.cols            = 0;
+    a.rows            = 0;
+    a.count           = n;
+    a.names           = names;
+    a.frame_x         = fx_arr;
+    a.frame_y         = fy_arr;
+    a.frame_w         = fw_arr;
+    a.frame_h         = fh_arr;
+    a.anim_names      = anim_names_arr;
+    a.anim_from       = anim_from_arr;
+    a.anim_to         = anim_to_arr;
+    a.anim_frame_ms   = anim_frame_ms_arr;
+    a.anims_count     = anims_n;
+    a.tex             = _stb_gpu_create_texture(pixels, w, h);
     return a;
 }
 
@@ -2543,6 +2622,59 @@ image_named_id(a, name) {
         if (str_eq(stored, name)) { return i; }
     }
     return -1;
+}
+
+// Look up an animation id by name. Returns the 0-based index into
+// the atlas's frameTags table, or -1 when no animation matches OR
+// the atlas has no animation metadata (procedural atlases, or
+// sidecars without `meta.frameTags`). Linear scan over the
+// typically-small tag table (dozens at most).
+//
+// The returned id is opaque — pass it back to image_anim_frame to
+// resolve the current sprite. Callers usually cache the result at
+// startup so the per-frame path is two array lookups + modulo
+// math, no string compare.
+image_anim_id(a, name) {
+    auto t: Image, names, n, i, stored;
+    t = a;
+    names = t.anim_names;
+    if (names == 0) { return -1; }
+    n = arr_len(names);
+    for (i = 0; i < n; i++) {
+        stored = arr_get(names, i);
+        if (stored == 0) { continue; }
+        if (str_eq(stored, name)) { return i; }
+    }
+    return -1;
+}
+
+// Resolve the sprite_id of the current frame in an animation cycle
+// at the given elapsed_ms. The cycle wraps forever via modulo, so
+// callers don't need to clamp — just keep accumulating elapsed_ms
+// and image_anim_frame returns the right frame for that moment.
+//
+// v1 assumes uniform frame rate within a tag (read from the first
+// frame's duration at parse time). Variable-rate frames inside a
+// tag would need walking the durations array on every call;
+// schema bump when a real consumer asks.
+//
+// Returns -1 if anim_id is out of range so a bad cache lookup
+// surfaces immediately instead of indexing the wrong sprite.
+image_anim_frame(a, anim_id, elapsed_ms) {
+    auto t: Image, from_v, to_v, rate_ms, frame_count, cycle_ms, phase, offset;
+    t = a;
+    if (anim_id < 0) { return -1; }
+    if (anim_id >= t.anims_count) { return -1; }
+    from_v      = arr_get(t.anim_from, anim_id);
+    to_v        = arr_get(t.anim_to, anim_id);
+    rate_ms     = arr_get(t.anim_frame_ms, anim_id);
+    frame_count = to_v - from_v + 1;
+    if (frame_count <= 0) { return from_v; }
+    if (rate_ms <= 0) { return from_v; }
+    cycle_ms = rate_ms * frame_count;
+    phase    = elapsed_ms % cycle_ms;
+    offset   = phase / rate_ms;
+    return from_v + offset;
 }
 
 // Free an atlas's CPU-side bookkeeping struct + its name and frame
@@ -2675,6 +2807,20 @@ void image_draw_size(a, sprite_id, x, y, w, h) {
     t = a;
     _image_uvs_for(a, sprite_id, &u0, &v0, &u1, &v1);
     _stb_gpu_sprite_uv(t.tex, x, y, w, h, u0, v0, u1, v1);
+}
+
+// Same as image_draw_size but mirrored along the horizontal axis.
+// Swaps u0 / u1 so the GPU samples right-to-left from the source
+// texture, flipping the sprite without needing a second atlas.
+// Standard trick for 2D games where characters face left vs right
+// — WC1 packs only 5 facings (N..S) and mirrors them for W/NW/SW;
+// platformers mirror the player sprite when changing direction;
+// tile sets re-use one variant for both orientations.
+void image_draw_size_flipped(a, sprite_id, x, y, w, h) {
+    auto t: Image, u0, v0, u1, v1;
+    t = a;
+    _image_uvs_for(a, sprite_id, &u0, &v0, &u1, &v1);
+    _stb_gpu_sprite_uv(t.tex, x, y, w, h, u1, v0, u0, v1);
 }
 
 // Sized + tinted variant — multiplies a per-vertex `tint` (packed
