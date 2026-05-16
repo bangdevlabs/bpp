@@ -170,7 +170,7 @@ Consumers do:
 
 ```bpp
 auto atlas;
-atlas = image_load("assets/sprites/pathfind.atlas.json");
+atlas = image_load("assets/sprites/pathfind.json");
 auto rat_id; rat_id = image_named_id(atlas, "rat");
 image_draw_size(atlas, rat_id, sx, sy, 16, 16);
 ```

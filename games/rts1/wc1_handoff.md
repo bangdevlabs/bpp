@@ -28,7 +28,7 @@ Concretely:
   (`{width, height, tiles[][]}`, identical to
   `games/pathfind/assets/levels/level1.json`). Session 2's
   converter outputs THAT format directly — no custom `.b1map`.
-- **Sprites** ship as Modulab atlas-pack files (`*.atlas.json`,
+- **Sprites** ship as Modulab atlas-pack files (`*.json`,
   same shape pathfind uses). Session 3 loads via `image_load` +
   `image_hot_reload_enable`; Bang 9's sprite tab authors them.
 - **Hot-reload via `file_watch_register` from day 1** —
@@ -260,13 +260,13 @@ No animation yet beyond the idle frame; no movement.
 - `wc1_units.bsm` — first 4-8 unit type entries from units.lua
   ported to a B++ struct table (HitPoints, Armor, Speed, Image,
   Size).
-- `assets/wc1_units.atlas.json` — Modulab-style atlas pack
+- `assets/wc1_units.json` — Modulab-style atlas pack
   authored from the converted PNG sprites (or generated via a
   one-shot `tools/sprite16_to_atlas.sh`-style pre-process).
-  Loaded via `image_load("...atlas.json")` + hot-reloaded via
+  Loaded via `image_load("....json")` + hot-reloaded via
   `image_hot_reload_enable` per the meta goal above. Bang 9
   sprite tab can open and edit this file — same workflow as
-  `pathfind.atlas.json`.
+  `pathfind.json`.
 - Component registration in `wc1_render.bsm`: register Pos, Sprite,
   UnitType components; build the Combatant archetype.
 - Render path: archetype walk → `image_draw_size(atlas,

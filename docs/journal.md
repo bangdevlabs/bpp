@@ -1,5 +1,46 @@
 # B++ Bootstrap Journal
 
+## 2026-05-16 — `.atlas.json` double-suffix retired
+
+Last holdout of double-suffix asset extensions retired. Convention
+now fully uniform: every BangDev asset JSON is a single `.json`,
+with folder context (`assets/levels/`, `assets/sprites/`) plus
+content sniffing via the `type` field handling dispatch at load.
+
+The three retirements in order:
+
+- `.modulab.json` collapsed into `.json` (2026-04-23) — Modulab's
+  two-file authoring became one-file.
+- `.level.json` retired in favor of `.json` (2026-05-13) — folder
+  context (`assets/levels/`) disambiguates type.
+- `.atlas.json` retired in favor of `.json` (today) — same
+  reasoning: folder context (`assets/sprites/`) + content sniffing
+  via `type:"atlas_pack"` field handle dispatch in `image_load`.
+
+Touched: `games/pathfind/assets/sprites/pathfind.atlas.json` →
+`pathfind.json` (single rename via `git mv` preserves history);
+`tools/modulab/modulab_lib.bsm` writes `.json` instead of
+`.atlas.json`; comment + doc refs synced across `tools/modulab/`,
+`stb/stbimage.bsm`, `tools/sprite16_to_atlas.sh`, and 6 docs
+(`gpu_pipeline_roadmap.md`, `bang9_space_manual.md`,
+`stb++_lib.md`, `asset_formats.md`, `tonify_checklist.md`,
+`how_to_dev_b++.md`).
+
+Smart-dispatch in `image_load` unchanged — content sniff by JSON
+shape always trumped extension anyway. Pure cosmetic + convention
+change. Bootstrap byte-stable. Pathfind continues to load cat / rat
+sprites, Modulab continues to save atlas packs (now with the
+single-suffix output), suite green.
+
+Historical journal entries that mention `pathfind.atlas.json`
+accurately describe past state — left untouched per the "preserve
+history" convention.
+
+This unblocks the WC1 modulab pipeline arc — new WC1 sprite assets
+will land directly as single-suffix `.json` sidecars in the
+Aseprite-compatible format, without inheriting the legacy
+double-suffix naming.
+
 ## 2026-05-12 — Parser DRY violation fix: `++` / `--` on struct fields
 
 Late-day follow-up to the RTS Stress Arc closure. While shipping

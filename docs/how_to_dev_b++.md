@@ -1797,7 +1797,7 @@ Modulab already author**.
 | Asset kind | Authoring tool | Format | Game loader |
 |---|---|---|---|
 | Levels | Bang 9 Levels tab | JSON via `bpp_json` (same shape pathfind's `level1.json` uses) | `bpp_json` + `tile_set` per cell |
-| Sprites | Modulab + Bang 9 Sprite tab | Atlas pack `*.atlas.json` (single PNG + named-id index) | `image_load` + `image_named_id` + `image_draw_size` |
+| Sprites | Modulab + Bang 9 Sprite tab | Atlas pack `*.json` (single PNG + named-id index) | `image_load` + `image_named_id` + `image_draw_size` |
 | Audio (one-shots) | external editor | `.wav` | `sound_load_wav` |
 | Music (BGM) | external sequencer | `.mid` (Format 0/1) | `midi_play_file` |
 

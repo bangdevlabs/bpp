@@ -109,7 +109,7 @@ Bang 9 expects a project to look like this:
 │   ├── sprites/              ← edited by modulab
 │   │   ├── hero.json
 │   │   ├── hero.modulab.json (full editor state, optional)
-│   │   └── tileset.atlas.json
+│   │   └── tileset.json
 │   ├── levels/               ← edited by level_editor
 │   │   └── level1.level.json
 │   ├── fonts/                ← TTF or bitmap fonts

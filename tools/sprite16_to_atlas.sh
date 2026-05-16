@@ -13,11 +13,11 @@
 # `cat_sprite.json` → name "cat", `apple.json` → name "apple".
 #
 # Usage:
-#   sprite16_to_atlas.sh OUT.atlas.json IN1.json [IN2.json ...]
+#   sprite16_to_atlas.sh OUT.json IN1.json [IN2.json ...]
 #
 # Example:
 #   tools/sprite16_to_atlas.sh \
-#     games/pathfind/assets/sprites/pathfind.atlas.json \
+#     games/pathfind/assets/sprites/pathfind.json \
 #     games/pathfind/assets/sprites/cat_sprite.json \
 #     games/pathfind/assets/sprites/rat_sprite.json
 #
@@ -28,7 +28,7 @@
 set -e
 
 if [ $# -lt 2 ]; then
-    echo "usage: $0 OUT.atlas.json IN1.json [IN2.json ...]" >&2
+    echo "usage: $0 OUT.json IN1.json [IN2.json ...]" >&2
     exit 1
 fi
 

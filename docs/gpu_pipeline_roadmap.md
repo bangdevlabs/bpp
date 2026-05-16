@@ -1424,7 +1424,7 @@ entire frame timeline as a single JSON pack file. Schema v1:
 "tile_w":N, "tile_h":N, "sprites":[{"name","data"},...] }`.
 Layer 0 of each frame is the sprite — multi-layer compositing
 deferred to v2 when a real consumer needs it. Topbar gains an
-"Atlas" button (`UI_ACT_ATLAS`); writes `<prefix>.atlas.json`.
+"Atlas" button (`UI_ACT_ATLAS`); writes `<prefix>.json`.
 
 #### Session 3.5.2 — `atlas_load_modulab` + `atlas_load_aseprite` — **SHIPPED**
 
@@ -1435,7 +1435,7 @@ fields: `names` (sprite labels), `frame_x` / `frame_y` /
 `frame_w` / `frame_h` (per-sprite pixel rects for variable-sized
 atlases — Aseprite's "trim" produces non-uniform frames).
 
-- **`atlas_load_modulab(path)`** — reads `.atlas.json` pack files
+- **`atlas_load_modulab(path)`** — reads `.json` pack files
   ModuLab writes, decodes palette indices through MCU-8 to RGBA,
   composites all sprites into a single horizontal strip MTLTexture.
   Names from the pack file go into `Atlas.names`.
@@ -1472,12 +1472,12 @@ without waiting for ModuLab parity. The "tunnel" is open.
 #### Session 3.5.3 — Pathfind atlas migration — **SHIPPED**
 
 `tools/sprite16_to_atlas.sh` (bash + jq) — one-shot converter that
-combines N sprite16 JSON files into a single `.atlas.json` pack.
+combines N sprite16 JSON files into a single `.json` pack.
 Validates tile dimensions match across inputs (fails loudly on
 mismatch). Future B++ port: `tools/sprite16_to_atlas.bpp` when the
 script accumulates real complexity.
 
-`games/pathfind/assets/sprites/pathfind.atlas.json` generated from
+`games/pathfind/assets/sprites/pathfind.json` generated from
 the existing `cat_sprite.json` + `rat_sprite.json` via the
 converter. `games/pathfind/pathfind.bpp` migrated:
 
@@ -1567,7 +1567,7 @@ walks `frames[0].data` → `frames[0].layers[0].data` →
 top-level `data`. The legacy `type:"modulab"` and
 `type:"sprite16"` files keep loading via the same reader.
 
-**Manifest atlas pack.** `pathfind.atlas.json` was a bundle —
+**Manifest atlas pack.** `pathfind.json` was a bundle —
 every sprite's pixel data inlined, regenerated only by an
 explicit Modulab "Atlas" export. Cycle break: edits to
 `cat_sprite.json` never reached the bundle, so build/run kept
@@ -1612,7 +1612,7 @@ Games can opt into live edit-while-running for any loaded
 Image:
 
 ```bpp
-pf_image = image_load("pathfind.atlas.json");
+pf_image = image_load("pathfind.json");
 image_hot_reload_enable(pf_image);
 ```
 

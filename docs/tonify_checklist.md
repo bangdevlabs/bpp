@@ -1351,7 +1351,7 @@ import "stbimage.bsm";
 
 main() {
     game_init(W, H, "Game", 60);
-    auto atlas = image_load("assets/sprites.atlas.json");
+    auto atlas = image_load("assets/sprites.json");
     image_hot_reload_enable(atlas);
 
     while (game_should_quit() == 0) {
@@ -2122,7 +2122,7 @@ those formats cause.**
 | Asset kind | Authoring tool | Format | Game loader |
 |---|---|---|---|
 | Levels (tile grids) | Bang 9 Levels tab + `level_editor` | JSON: `{width, height, tiles[][], spawns?, resources?}` | `bpp_json` (auto-injected) + `tile_set` per cell |
-| Sprites + animations | Modulab + Bang 9 Sprite tab | Atlas pack: `*.atlas.json` (single PNG + named-id index) | `image_load("...atlas.json")` + `image_named_id` + `image_draw_size` |
+| Sprites + animations | Modulab + Bang 9 Sprite tab | Atlas pack: `*.json` (single PNG + named-id index) | `image_load("....json")` + `image_named_id` + `image_draw_size` |
 | Audio (one-shots) | external editor / war1tool | `.wav` | `sound_load_wav` |
 | Music (BGM) | external sequencer / war1tool | `.mid` (Format 0/1, no SMPTE) | `midi_play_file` |
 | Hot-reload signal | filesystem mtime | n/a | `file_watch_register` (level edits + atlas re-saves both ride this) |
@@ -2175,7 +2175,7 @@ editor. Discuss before forking; restraint-bias per Rule 28.
   one-paragraph version of this rule pointing back at this rule +
   `asset_formats.md`.
 - Modulab atlas-pack reference: `tools/modulab/` (authoring),
-  `pathfind.atlas.json` (canonical consumer example),
+  `pathfind.json` (canonical consumer example),
   `stb/stbimage.bsm` `image_load` / `image_hot_reload_enable`.
 - level_editor JSON reference: `tools/level_editor/level_editor_lib.bsm`
   (consumer/authoring tool — palette + tileset modes), `bang9/panels.bsm`
