@@ -1,0 +1,143 @@
+// test_gpu_atlas_aseprite.bpp — Aseprite sheet loader smoke test.
+//
+// Generates a self-contained fixture in /tmp (a 16x8 PNG with two
+// 8x8 frames + a JSON sidecar in Aseprite "Array" export shape
+// with one animation tag) and exercises the loader end-to-end:
+//
+//   * image_load picks up the sheet via meta.frameTags detection.
+//   * image_anim_id resolves the tag name to a row in the anim
+//     table; nonexistent names return -1.
+//   * image_anim_frame advances through the cycle and wraps
+//     after the tag's total duration.
+//
+// Classified as a `test_gpu_*` smoke because image_load uploads
+// the parsed PNG to a GPU texture; the harness skips this test
+// when no display is available. Opens a tiny window for the GPU
+// context, runs the parser checks, then sys_exit(0) so the
+// runner doesn't hang on the platform's auto-quit detection.
+
+import "stbgame.bsm";
+import "stbimage.bsm";
+import "stbrender.bsm";
+
+main() {
+    auto png_path: ptr, json_path: ptr;
+    auto rgba, w, h, x, y, off, atlas, anim_id, sprite_id;
+    auto sb;
+
+    // Bring up a real window + GPU context so image_load's
+    // _stb_gpu_create_texture call has something to bind against.
+    // The window is tiny because we never render anything into it —
+    // the test work is all parser and accessor calls.
+    game_init(32, 32, "atlas aseprite smoke", 60);
+    render_init();
+    game_frame_begin();
+
+    png_path  = "/tmp/test_gpu_atlas_aseprite.png";
+    json_path = "/tmp/test_gpu_atlas_aseprite.json";
+
+    // 1. Fixture PNG: 16x8 RGBA, two 8x8 frames laid out
+    //    side-by-side. Frame 0 is solid red; frame 1 is solid
+    //    green. Distinct colors make a manual eyeball check
+    //    trivial if the smoke ever fails.
+    w = 16; h = 8;
+    rgba = malloc(w * h * 4);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            off = (y * w + x) * 4;
+            if (x < 8) {
+                poke(rgba + off,     255);
+                poke(rgba + off + 1,   0);
+                poke(rgba + off + 2,   0);
+                poke(rgba + off + 3, 255);
+            } else {
+                poke(rgba + off,       0);
+                poke(rgba + off + 1, 255);
+                poke(rgba + off + 2,   0);
+                poke(rgba + off + 3, 255);
+            }
+        }
+    }
+    if (pixels_save_png(png_path, rgba, w, h) != 0) {
+        putmsg("FAIL: pixels_save_png returned non-zero");
+        free(rgba);
+        sys_exit(1);
+    }
+    free(rgba);
+
+    // 2. Fixture JSON in literal Aseprite "Array" export shape —
+    //    same format the war1tool converter emits and the in-tree
+    //    `_image_load_packed_format` parses. Two frames, one
+    //    animation tag "blink" covering both.
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "{\"frames\":[");
+    sb = strbuf_cat(sb, "{\"filename\":\"test 0\",");
+    sb = strbuf_cat(sb, "\"frame\":{\"x\":0,\"y\":0,\"w\":8,\"h\":8},");
+    sb = strbuf_cat(sb, "\"duration\":100},");
+    sb = strbuf_cat(sb, "{\"filename\":\"test 1\",");
+    sb = strbuf_cat(sb, "\"frame\":{\"x\":8,\"y\":0,\"w\":8,\"h\":8},");
+    sb = strbuf_cat(sb, "\"duration\":100}");
+    sb = strbuf_cat(sb, "],\"meta\":{");
+    sb = strbuf_cat(sb, "\"image\":\"test_gpu_atlas_aseprite.png\",");
+    sb = strbuf_cat(sb, "\"size\":{\"w\":16,\"h\":8},");
+    sb = strbuf_cat(sb, "\"format\":\"RGBA8888\",");
+    sb = strbuf_cat(sb, "\"frameTags\":[");
+    sb = strbuf_cat(sb, "{\"name\":\"blink\",\"from\":0,\"to\":1,");
+    sb = strbuf_cat(sb, "\"direction\":\"forward\"}");
+    sb = strbuf_cat(sb, "]}}\n");
+    if (file_write_all(json_path, sb, strbuf_len(sb)) != 0) {
+        putmsg("FAIL: file_write_all returned non-zero");
+        sb = strbuf_free(sb);
+        sys_exit(1);
+    }
+    sb = strbuf_free(sb);
+
+    // 3. Load via image_load — content sniff routes the sidecar
+    //    to the packed-format reader because of `meta.frameTags`.
+    atlas = image_load(json_path);
+    if (atlas == 0) {
+        putmsg("FAIL: image_load returned 0");
+        sys_exit(1);
+    }
+
+    // 4. Resolve the tag by name. Anything other than 0 here
+    //    means the tag table parsed but the entry is missing.
+    anim_id = image_anim_id(atlas, "blink");
+    if (anim_id < 0) {
+        putmsg("FAIL: image_anim_id('blink') < 0");
+        sys_exit(1);
+    }
+
+    // 5. Unknown names must return -1 — guards against silent
+    //    fallback to anim 0 (the most common false-positive).
+    if (image_anim_id(atlas, "nonexistent") != -1) {
+        putmsg("FAIL: image_anim_id('nonexistent') did not return -1");
+        sys_exit(1);
+    }
+
+    // 6. Cycle math: frame 0 at elapsed=0; frame 1 after one
+    //    frame's duration; wraps to frame 0 after two.
+    sprite_id = image_anim_frame(atlas, anim_id, 0);
+    if (sprite_id != 0) {
+        putmsg("FAIL: anim_frame(0) != 0");
+        sys_exit(1);
+    }
+    sprite_id = image_anim_frame(atlas, anim_id, 100);
+    if (sprite_id != 1) {
+        putmsg("FAIL: anim_frame(100) != 1");
+        sys_exit(1);
+    }
+    sprite_id = image_anim_frame(atlas, anim_id, 200);
+    if (sprite_id != 0) {
+        putmsg("FAIL: anim_frame(200) cycle wrap broke (expected 0)");
+        sys_exit(1);
+    }
+
+    image_free(atlas);
+    sys_unlink(png_path);
+    sys_unlink(json_path);
+
+    putmsg("OK");
+    sys_exit(0);
+    return 0;
+}

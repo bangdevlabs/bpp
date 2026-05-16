@@ -91,11 +91,14 @@ static extrn _sheet_scale;
 // View mode: 0 = sheet viewer, 1 = single-frame editor. The flag
 // is module-private; the lib renders whichever the viewer reports.
 static extrn _aseprite_edit_mode;
-// True for any frame that has unsaved pixel edits in memory. Reset
-// by a successful save or by `mlab_close_aseprite_sheet`. The
-// sheet view tints dirty frames so the user can see which frames
-// have pending changes when scrolling the grid.
-static extrn _aseprite_dirty;
+// Heap-owned arr_* of frame indices whose pixels were edited in
+// memory but not yet written back to disk. Cleared by a successful
+// save and by `mlab_close_aseprite_sheet`. The sheet view tints
+// every entry's frame with a yellow border so the user can see
+// pending work at a glance; the editor sidebar's `[unsaved]`
+// indicator reads the per-frame entry of the currently-active
+// frame.
+static extrn _aseprite_dirty_frames;
 // Currently-picked paint color (ARGB) and a flag that distinguishes
 // "paint with color" from "erase to transparent". Eyedrop fills
 // `_paint_color` from a sampled pixel.
@@ -125,6 +128,66 @@ mlab_aseprite_active() {
 // not free.
 mlab_aseprite_json_path() {
     return _aseprite_json_path;
+}
+
+// ── Dirty tracking (per-frame) ─────────────────────────────────
+
+// True if `frame_id` carries unsaved pixel edits. Linear scan
+// across the dirty-list — fine for the typical handful of frames
+// a user touches in one session; revisit if a real workflow ever
+// edits dozens of frames between saves.
+static _aseprite_frame_is_dirty(frame_id) {
+    auto i, n;
+    if (_aseprite_dirty_frames == 0) { return 0; }
+    n = arr_len(_aseprite_dirty_frames);
+    for (i = 0; i < n; i++) {
+        if (arr_get(_aseprite_dirty_frames, i) == frame_id) { return 1; }
+    }
+    return 0;
+}
+
+// Record `frame_id` as carrying unsaved edits. Idempotent —
+// adding the same frame twice keeps the list a set. Called from
+// the paint hook every time a pixel is written or erased.
+static void _aseprite_mark_frame_dirty(frame_id) {
+    if (_aseprite_dirty_frames == 0) {
+        _aseprite_dirty_frames = arr_new();
+    }
+    if (_aseprite_frame_is_dirty(frame_id) != 0) { return; }
+    _aseprite_dirty_frames = arr_push(_aseprite_dirty_frames, frame_id);
+}
+
+// Drop every dirty entry. Called by the save hook once the PNG
+// hit disk — after this returns no frame should report as dirty.
+static void _aseprite_clear_dirty() {
+    if (_aseprite_dirty_frames != 0) { arr_free(_aseprite_dirty_frames); }
+    _aseprite_dirty_frames = arr_new();
+}
+
+// Public: true if ANY frame has unsaved edits. Used by the
+// topbar marker, the confirm-discard helper, and io.bsm before
+// it opens a different file.
+mlab_aseprite_dirty() {
+    if (_aseprite_dirty_frames == 0) { return 0; }
+    return arr_len(_aseprite_dirty_frames) > 0 ? 1 : 0;
+}
+
+// Prompt the user before throwing away unsaved edits. Returns 1
+// when it is safe to proceed with the destructive action (either
+// nothing was dirty, or the user explicitly chose to discard);
+// returns 0 when the caller should abort. `action_label` is the
+// verb that fills in the message — e.g. "Close sheet" yields
+// "...edits. Close sheet anyway?".
+static _aseprite_confirm_discard(action_label) {
+    auto msg_sb, ok;
+    if (mlab_aseprite_dirty() == 0) { return 1; }
+    msg_sb = strbuf_new();
+    msg_sb = strbuf_cat(msg_sb, "Sheet has unsaved pixel edits. ");
+    msg_sb = strbuf_cat(msg_sb, action_label);
+    msg_sb = strbuf_cat(msg_sb, " anyway?");
+    ok = window_confirm("Discard unsaved edits?", msg_sb);
+    msg_sb = strbuf_free(msg_sb);
+    return ok;
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────
@@ -173,6 +236,11 @@ mlab_close_aseprite_sheet() {
     if (_aseprite_tag_to   != 0) { arr_free(_aseprite_tag_to);   _aseprite_tag_to   = 0; }
     if (_aseprite_tag_ms   != 0) { arr_free(_aseprite_tag_ms);   _aseprite_tag_ms   = 0; }
 
+    if (_aseprite_dirty_frames != 0) {
+        arr_free(_aseprite_dirty_frames);
+        _aseprite_dirty_frames = 0;
+    }
+
     _aseprite_png_w               = 0;
     _aseprite_png_h               = 0;
     _aseprite_frame_count         = 0;
@@ -182,7 +250,17 @@ mlab_close_aseprite_sheet() {
     _aseprite_preview_playing     = 0;
     _aseprite_preview_elapsed_ms  = 0;
     _aseprite_edit_mode           = 0;
-    _aseprite_dirty               = 0;
+    // Reset the double-click + mouse-edge stashes so a fresh
+    // session starts clean. `-1` is the sentinel that "no frame
+    // was previously clicked"; the zeroed mouse-prev flags say
+    // "no button currently held". Without these resets the global
+    // defaults (all zero) made a single click on frame 0 trip the
+    // double-click detector immediately after load.
+    _aseprite_last_click_frame    = -1;
+    _aseprite_last_click_ms       = 0;
+    _aseprite_mb_prev             = 0;
+    _edit_mb_left_prev            = 0;
+    _edit_mb_right_prev           = 0;
     _aseprite_active              = 0;
 }
 
@@ -346,9 +424,18 @@ mlab_load_aseprite_sheet(path) {
     _aseprite_preview_playing     = 1;     // auto-play; user can pause
     _aseprite_preview_elapsed_ms  = 0;
     _aseprite_edit_mode           = 0;
-    _aseprite_dirty               = 0;
+    _aseprite_dirty_frames        = arr_new();
     _paint_color                  = rgba(255, 255, 255, 255);
     _paint_erase                  = 0;
+    // Same rationale as the close-time reset: zero the click /
+    // mouse-edge stashes so the first user click on the freshly-
+    // loaded sheet behaves like a true first click, not the tail
+    // of an imaginary previous press.
+    _aseprite_last_click_frame    = -1;
+    _aseprite_last_click_ms       = 0;
+    _aseprite_mb_prev             = 0;
+    _edit_mb_left_prev            = 0;
+    _edit_mb_right_prev           = 0;
     _aseprite_active              = 1;
 
     // Register a hot-reload callback so external Aseprite saves
@@ -466,7 +553,10 @@ static void _draw_sheet_panel(px, py, pw, ph) {
     // Per-frame overlays. A box per frame so the user sees the
     // grid even when the source PNG packs frames edge-to-edge;
     // active frame gets a brighter colour, and any frame inside
-    // the playing tag gets a dimmer cyan tint.
+    // the playing tag gets a dimmer cyan tint. Dirty frames get a
+    // 2-pixel amber border drawn LAST so it overrides any of the
+    // earlier per-frame tints — pending edits should be the
+    // loudest visual signal in the sheet view.
     for (i = 0; i < _aseprite_frame_count; i++) {
         fx = arr_get(_aseprite_frame_x, i);
         fy = arr_get(_aseprite_frame_y, i);
@@ -486,6 +576,17 @@ static void _draw_sheet_panel(px, py, pw, ph) {
         draw_border(_sheet_origin_x + fx * scale,
                     _sheet_origin_y + fy * scale,
                     fw * scale, fh * scale, color, 1);
+    }
+    for (i = 0; i < _aseprite_frame_count; i++) {
+        if (_aseprite_frame_is_dirty(i) == 0) { continue; }
+        fx = arr_get(_aseprite_frame_x, i);
+        fy = arr_get(_aseprite_frame_y, i);
+        fw = arr_get(_aseprite_frame_w, i);
+        fh = arr_get(_aseprite_frame_h, i);
+        draw_border(_sheet_origin_x + fx * scale,
+                    _sheet_origin_y + fy * scale,
+                    fw * scale, fh * scale,
+                    rgba(255, 200, 80, 255), 2);
     }
 }
 
@@ -669,7 +770,7 @@ aseprite_view_render(px, py, pw, ph) {
     draw_text("Aseprite viewer", px + 12, py + 8, 8,
               rgba(97, 218, 251, 255));
     if (_aseprite_json_path != 0) {
-        if (_aseprite_dirty != 0) {
+        if (mlab_aseprite_dirty() != 0) {
             draw_text("*", px + 150, py + 8, 8,
                       rgba(255, 180, 80, 255));
         }
@@ -684,8 +785,10 @@ aseprite_view_render(px, py, pw, ph) {
     }
     close_hit = gui_button(px + pw - 120, py + 4, 110, 22, "Close");
     if (close_hit != 0) {
-        mlab_close_aseprite_sheet();
-        return 1;
+        if (_aseprite_confirm_discard("Close sheet") != 0) {
+            mlab_close_aseprite_sheet();
+            return 1;
+        }
     }
 
     // Layout — left 65% for the sheet display, right 35% for the
@@ -841,7 +944,7 @@ static _aseprite_save_png() {
     rc = pixels_save_png(png_path, _aseprite_png_rgba,
                          _aseprite_png_w, _aseprite_png_h);
     if (rc == 0) {
-        _aseprite_dirty = 0;
+        _aseprite_clear_dirty();
         put_err("modulab: '");
         putstr_err(png_path);
         put_err("' saved\n");
@@ -939,7 +1042,7 @@ static void _edit_paint_pixel(mx, my) {
     if (_paint_erase != 0) { c = 0; }
     else                    { c = _paint_color; }
     _sheet_pixel_write(sx, sy, c);
-    _aseprite_dirty = 1;
+    _aseprite_mark_frame_dirty(_aseprite_active_frame);
 }
 
 // Draw the color preview swatch + tool buttons that sit next to
@@ -998,20 +1101,25 @@ static _draw_edit_sidebar(px, py, pw, ph) {
         consumed = 1;
     }
     y += btn_h + 6;
-    if (gui_button(px + 8, y, pw - 16, btn_h, "Back to sheet")) {
+    // "Done editing" rather than "Back to sheet" because the
+    // in-memory edits survive the mode switch (only Cmd+S
+    // persists). A "discard" verb here would mislead the user.
+    if (gui_button(px + 8, y, pw - 16, btn_h, "Done editing")) {
         _aseprite_edit_mode = 0;
         consumed = 1;
     }
 
-    // Frame name + dirty marker so the user sees which Aseprite
-    // frame they are editing.
+    // Frame name + per-frame dirty marker so the user sees which
+    // Aseprite frame they are editing and whether IT specifically
+    // has pending edits. The sheet view tints every dirty frame
+    // with a yellow border for the bird's-eye picture.
     y += btn_h + 14;
     auto name;
     name = arr_get(_aseprite_frame_name, _aseprite_active_frame);
     if (name != 0) {
         draw_text(name, px + 8, y, 8, WHITE);
     }
-    if (_aseprite_dirty != 0) {
+    if (_aseprite_frame_is_dirty(_aseprite_active_frame) != 0) {
         draw_text("[unsaved]", px + 8, y + 16, 8,
                   rgba(255, 180, 80, 255));
     }
@@ -1040,8 +1148,10 @@ static void _render_edit_mode(px, py, pw, ph) {
                   rgba(200, 210, 230, 255));
     }
     if (gui_button(px + pw - 120, py + 4, 110, 22, "Close")) {
-        mlab_close_aseprite_sheet();
-        return;
+        if (_aseprite_confirm_discard("Close sheet") != 0) {
+            mlab_close_aseprite_sheet();
+            return;
+        }
     }
 
     // Layout — sidebar on the right, canvas takes the rest.
