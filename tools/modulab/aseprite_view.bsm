@@ -1,0 +1,711 @@
+// aseprite_view.bsm — ModuLab Aseprite sheet viewer (read + display).
+//
+// Phase 3.6 — Modulab's "companion in-context" pivot. Modulab no
+// longer tries to replicate Aseprite; instead it OPENS the JSON +
+// PNG pair Aseprite produces and lets the user inspect frames,
+// step through animation tags, and preview playback. Pixel editing
+// of a single frame lands in the next commit (slice-edit).
+//
+// What this module owns:
+//
+//   * Module-level state for the currently-loaded Aseprite sheet
+//     (PNG RGBA buffer, per-frame bounding boxes, animation tags).
+//   * The loader `mlab_load_aseprite_sheet(path)` invoked by io.bsm
+//     when an opened JSON carries `meta.frameTags`.
+//   * The frame renderer `aseprite_view_render(px, py, pw, ph)`
+//     that modulab_lib swaps in for the canvas when a sheet is
+//     active.
+//   * Mouse + keyboard helpers that pick a frame and play /
+//     pause the active animation.
+//   * Hot-reload tick that re-parses the JSON + PNG when the file
+//     hash changes (same rail games use for asset hot-reload).
+//
+// Out of scope for this commit (next commit ships them):
+//
+//   * Editing pixels of a frame and writing the PNG back. The
+//     viewer is read-only.
+//   * Editing animation tags (renaming, adjusting from/to).
+//   * Multi-sheet sprites (Aseprite supports one JSON to point at
+//     multiple PNGs — we assume a single sheet).
+
+import "stbwindow.bsm";
+import "stbdraw.bsm";
+import "stbui.bsm";
+import "stbimage.bsm";
+import "stbinput.bsm";
+
+// ── Cap definitions ─────────────────────────────────────────────
+// Hard caps keep the parallel-array model dead simple. WC1's
+// peasant has 65 frames + 10 tags so 256 / 64 give comfortable
+// headroom; bump if a project ever ships a wider sheet.
+const MLAB_ASEPRITE_MAX_FRAMES = 256;
+const MLAB_ASEPRITE_MAX_TAGS   = 64;
+
+// ── Module-private state ────────────────────────────────────────
+// Marks whether a sheet is loaded. modulab_lib_frame consults this
+// to decide between the editor view and the Aseprite viewer.
+static extrn _aseprite_active;
+
+// Source JSON path (heap-owned). Kept so the hot-reload tick can
+// re-parse when the file or its sibling PNG changes.
+static extrn _aseprite_json_path;
+
+// RGBA pixel buffer of the source PNG (heap-owned, w*h*4 bytes).
+// Held verbatim because the viewer paints scanlines directly via
+// draw_sprite — no GPU upload, no palette quantization.
+static extrn _aseprite_png_rgba;
+static extrn _aseprite_png_w;
+static extrn _aseprite_png_h;
+
+// Per-frame parallel arrays. arr_get returns the int stored.
+static extrn _aseprite_frame_x;
+static extrn _aseprite_frame_y;
+static extrn _aseprite_frame_w;
+static extrn _aseprite_frame_h;
+static extrn _aseprite_frame_ms;
+static extrn _aseprite_frame_name;
+static extrn _aseprite_frame_count;
+
+// Per-tag parallel arrays. Same layout convention.
+static extrn _aseprite_tag_name;
+static extrn _aseprite_tag_from;
+static extrn _aseprite_tag_to;
+static extrn _aseprite_tag_ms;
+static extrn _aseprite_tag_count;
+
+// UI selection + preview state.
+static extrn _aseprite_active_frame;
+static extrn _aseprite_active_tag;
+static extrn _aseprite_preview_playing;
+static extrn _aseprite_preview_elapsed_ms;
+
+// Cached layout — recomputed inside render so the sheet display
+// always fits the panel exactly. Stored as module-private state so
+// the click-picker can map mouse coords back to a frame index
+// without recomputing.
+static extrn _sheet_origin_x;
+static extrn _sheet_origin_y;
+static extrn _sheet_scale;
+
+// ── Accessors ───────────────────────────────────────────────────
+
+// True when a sheet is currently loaded. modulab_lib_frame calls
+// this once per frame to choose between the editor and the viewer.
+mlab_aseprite_active() {
+    return _aseprite_active;
+}
+
+// Path of the JSON currently displayed (or 0 when no sheet is
+// loaded). Returned pointer is owned by this module — caller must
+// not free.
+mlab_aseprite_json_path() {
+    return _aseprite_json_path;
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────
+
+// Free every heap allocation tied to the active sheet and reset
+// the module to its empty state. Safe to call when no sheet is
+// loaded — it just resets the active flag.
+mlab_close_aseprite_sheet() {
+    auto i, name_ptr;
+
+    if (_aseprite_json_path != 0) {
+        free(_aseprite_json_path);
+        _aseprite_json_path = 0;
+    }
+    if (_aseprite_png_rgba != 0) {
+        pixels_free(_aseprite_png_rgba);
+        _aseprite_png_rgba = 0;
+    }
+
+    // Each frame name was str_dup'd at load — free per-entry then
+    // release the parent array.
+    if (_aseprite_frame_name != 0) {
+        for (i = 0; i < _aseprite_frame_count; i++) {
+            name_ptr = arr_get(_aseprite_frame_name, i);
+            if (name_ptr != 0) { free(name_ptr); }
+        }
+        arr_free(_aseprite_frame_name);
+        _aseprite_frame_name = 0;
+    }
+
+    if (_aseprite_frame_x  != 0) { arr_free(_aseprite_frame_x);  _aseprite_frame_x  = 0; }
+    if (_aseprite_frame_y  != 0) { arr_free(_aseprite_frame_y);  _aseprite_frame_y  = 0; }
+    if (_aseprite_frame_w  != 0) { arr_free(_aseprite_frame_w);  _aseprite_frame_w  = 0; }
+    if (_aseprite_frame_h  != 0) { arr_free(_aseprite_frame_h);  _aseprite_frame_h  = 0; }
+    if (_aseprite_frame_ms != 0) { arr_free(_aseprite_frame_ms); _aseprite_frame_ms = 0; }
+
+    if (_aseprite_tag_name != 0) {
+        for (i = 0; i < _aseprite_tag_count; i++) {
+            name_ptr = arr_get(_aseprite_tag_name, i);
+            if (name_ptr != 0) { free(name_ptr); }
+        }
+        arr_free(_aseprite_tag_name);
+        _aseprite_tag_name = 0;
+    }
+    if (_aseprite_tag_from != 0) { arr_free(_aseprite_tag_from); _aseprite_tag_from = 0; }
+    if (_aseprite_tag_to   != 0) { arr_free(_aseprite_tag_to);   _aseprite_tag_to   = 0; }
+    if (_aseprite_tag_ms   != 0) { arr_free(_aseprite_tag_ms);   _aseprite_tag_ms   = 0; }
+
+    _aseprite_png_w               = 0;
+    _aseprite_png_h               = 0;
+    _aseprite_frame_count         = 0;
+    _aseprite_tag_count           = 0;
+    _aseprite_active_frame        = 0;
+    _aseprite_active_tag          = -1;
+    _aseprite_preview_playing     = 0;
+    _aseprite_preview_elapsed_ms  = 0;
+    _aseprite_active              = 0;
+}
+
+// Parse the Aseprite sheet at `path` and bring up the viewer. The
+// PNG referenced by `meta.image` is loaded relative to the JSON
+// file's directory (matching every other atlas loader in stbimage).
+//
+// Returns 0 on success, -1 on any failure. Prints a one-line
+// stderr diagnostic per failure path. Any previously-loaded sheet
+// is freed first, so the call is always safe to make.
+mlab_load_aseprite_sheet(path) {
+    auto buf, fsize, doc, root;
+    auto meta_idx, frames_idx, tags_idx;
+    auto image_s, png_path, pixels, w, h;
+    auto n, i, tag_i;
+
+    mlab_close_aseprite_sheet();
+
+    fsize = 0;
+    buf = file_read_all(path, &fsize);
+    if (buf == 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': read failed\n");
+        return -1;
+    }
+    doc = json_parse(buf, fsize);
+    free(buf);
+    if (doc == 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': JSON parse failed\n");
+        return -1;
+    }
+
+    root       = json_root(doc);
+    frames_idx = json_object_get(doc, root, "frames");
+    meta_idx   = json_object_get(doc, root, "meta");
+    if (frames_idx < 0 || meta_idx < 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': not an Aseprite sheet (missing frames or meta)\n");
+        json_free(doc);
+        return -1;
+    }
+    tags_idx = json_object_get(doc, meta_idx, "frameTags");
+    if (tags_idx < 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': not an Aseprite sheet (missing meta.frameTags)\n");
+        json_free(doc);
+        return -1;
+    }
+
+    image_s = json_object_get_string(doc, meta_idx, "image");
+    if (image_s == 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': missing meta.image\n");
+        json_free(doc);
+        return -1;
+    }
+    png_path = image_path_sibling(path, image_s);
+    pixels   = pixels_load(png_path);
+    if (pixels == 0) {
+        put_err("modulab: '");
+        putstr_err(path);
+        put_err("': sister PNG ");
+        putstr_err(png_path);
+        put_err(" failed to decode\n");
+        free(png_path);
+        json_free(doc);
+        return -1;
+    }
+    w = pixels_w();
+    h = pixels_h();
+    free(png_path);
+
+    _aseprite_png_rgba = pixels;
+    _aseprite_png_w    = w;
+    _aseprite_png_h    = h;
+
+    // Frames array — Aseprite "Array" export shape: each entry is
+    // an object with `filename`, `frame:{x,y,w,h}`, `duration`.
+    n = json_length(doc, frames_idx);
+    if (n > MLAB_ASEPRITE_MAX_FRAMES) { n = MLAB_ASEPRITE_MAX_FRAMES; }
+
+    _aseprite_frame_x    = arr_new();
+    _aseprite_frame_y    = arr_new();
+    _aseprite_frame_w    = arr_new();
+    _aseprite_frame_h    = arr_new();
+    _aseprite_frame_ms   = arr_new();
+    _aseprite_frame_name = arr_new();
+    for (i = 0; i < n; i++) {
+        auto fr_node, frame_obj, name_s, name_dup;
+        auto fx, fy, fw, fh, fms;
+        fr_node   = json_child(doc, frames_idx, i);
+        frame_obj = json_object_get(doc, fr_node, "frame");
+        fx  = json_object_get_int(doc, frame_obj, "x", 0);
+        fy  = json_object_get_int(doc, frame_obj, "y", 0);
+        fw  = json_object_get_int(doc, frame_obj, "w", 0);
+        fh  = json_object_get_int(doc, frame_obj, "h", 0);
+        fms = json_object_get_int(doc, fr_node,  "duration", 100);
+        name_s = json_object_get_string(doc, fr_node, "filename");
+        if (name_s == 0) {
+            auto fb;
+            fb = strbuf_new();
+            fb = strbuf_cat(fb, "frame_");
+            fb = strbuf_num(fb, i);
+            name_dup = str_dup(fb);
+            fb = strbuf_free(fb);
+        } else {
+            name_dup = str_dup(name_s);
+        }
+        _aseprite_frame_x    = arr_push(_aseprite_frame_x,    fx);
+        _aseprite_frame_y    = arr_push(_aseprite_frame_y,    fy);
+        _aseprite_frame_w    = arr_push(_aseprite_frame_w,    fw);
+        _aseprite_frame_h    = arr_push(_aseprite_frame_h,    fh);
+        _aseprite_frame_ms   = arr_push(_aseprite_frame_ms,   fms);
+        _aseprite_frame_name = arr_push(_aseprite_frame_name, name_dup);
+    }
+    _aseprite_frame_count = n;
+
+    // Tags — each describes a named animation range. Aseprite
+    // supports `direction` (forward/reverse/pingpong) but the
+    // preview only plays forward; the field is ignored for now.
+    auto nt;
+    nt = json_length(doc, tags_idx);
+    if (nt > MLAB_ASEPRITE_MAX_TAGS) { nt = MLAB_ASEPRITE_MAX_TAGS; }
+
+    _aseprite_tag_name = arr_new();
+    _aseprite_tag_from = arr_new();
+    _aseprite_tag_to   = arr_new();
+    _aseprite_tag_ms   = arr_new();
+    for (tag_i = 0; tag_i < nt; tag_i++) {
+        auto tag_node, tag_name_s, tag_name_dup, tag_from, tag_to, tag_rate;
+        tag_node  = json_child(doc, tags_idx, tag_i);
+        tag_name_s = json_object_get_string(doc, tag_node, "name");
+        tag_from   = json_object_get_int(doc, tag_node, "from", 0);
+        tag_to     = json_object_get_int(doc, tag_node, "to",   tag_from);
+        // Take the rate from the first frame of the tag — uniform
+        // playback for v1.
+        tag_rate = 100;
+        if (tag_from >= 0 && tag_from < _aseprite_frame_count) {
+            tag_rate = arr_get(_aseprite_frame_ms, tag_from);
+        }
+        if (tag_name_s != 0) { tag_name_dup = str_dup(tag_name_s); }
+        else                  { tag_name_dup = 0; }
+        _aseprite_tag_name = arr_push(_aseprite_tag_name, tag_name_dup);
+        _aseprite_tag_from = arr_push(_aseprite_tag_from, tag_from);
+        _aseprite_tag_to   = arr_push(_aseprite_tag_to,   tag_to);
+        _aseprite_tag_ms   = arr_push(_aseprite_tag_ms,   tag_rate);
+    }
+    _aseprite_tag_count = nt;
+
+    json_free(doc);
+
+    _aseprite_json_path           = str_dup(path);
+    _aseprite_active_frame        = 0;
+    _aseprite_active_tag          = -1;
+    _aseprite_preview_playing     = 1;     // auto-play; user can pause
+    _aseprite_preview_elapsed_ms  = 0;
+    _aseprite_active              = 1;
+
+    // Register a hot-reload callback so external Aseprite saves
+    // re-poke the viewer. Only the JSON is watched — the PNG
+    // typically rewrites alongside it and the cache invalidates on
+    // either path's hash change once the JSON callback fires.
+    file_watch_register(_aseprite_json_path, fn_ptr(_aseprite_hot_reload));
+
+    put_err("modulab: '");
+    putstr_err(path);
+    put_err("': Aseprite sheet loaded (");
+    putnum_err(_aseprite_frame_count);
+    put_err(" frames, ");
+    putnum_err(_aseprite_tag_count);
+    put_err(" tags)\n");
+    return 0;
+}
+
+// Hot-reload callback fired from file_watch_tick when the JSON
+// file's hash changes. Re-parses the sheet in place; on failure
+// the existing display stays loaded so the user keeps something
+// visible.
+static void _aseprite_hot_reload() {
+    auto path_copy;
+    if (_aseprite_json_path == 0) { return; }
+    path_copy = str_dup(_aseprite_json_path);
+    if (mlab_load_aseprite_sheet(path_copy) != 0) {
+        put_err("modulab: Aseprite hot-reload failed, keeping previous sheet\n");
+    }
+    free(path_copy);
+}
+
+// ── Rendering ───────────────────────────────────────────────────
+
+// Helper: read a 32-bit RGBA pixel from the sheet buffer. The
+// stored layout is byte-major R, G, B, A so we reassemble into
+// the 0xAARRGGBB packing draw_rect / put_px expect.
+static _sheet_pixel_argb(x, y) {
+    auto off, r, g, b, a;
+    off = (y * _aseprite_png_w + x) * 4;
+    r = peek(_aseprite_png_rgba + off);
+    g = peek(_aseprite_png_rgba + off + 1);
+    b = peek(_aseprite_png_rgba + off + 2);
+    a = peek(_aseprite_png_rgba + off + 3);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+// Draw a slice of the PNG (in source pixel coordinates) into the
+// destination rectangle at an integer scale factor. Nearest-
+// neighbour so pixel art stays crisp. A scale of 0 is silently
+// treated as 1 so callers don't have to clamp.
+static void _draw_sheet_region(src_x, src_y, src_w, src_h, dst_x, dst_y, scale) {
+    auto sx, sy, color, dx, dy, i, j;
+    if (scale < 1) { scale = 1; }
+    for (sy = 0; sy < src_h; sy++) {
+        for (sx = 0; sx < src_w; sx++) {
+            color = _sheet_pixel_argb(src_x + sx, src_y + sy);
+            if (((color >> 24) & 0xFF) == 0) { continue; }
+            dx = dst_x + sx * scale;
+            dy = dst_y + sy * scale;
+            for (j = 0; j < scale; j++) {
+                for (i = 0; i < scale; i++) {
+                    put_px(dx + i, dy + j, color);
+                }
+            }
+        }
+    }
+}
+
+// Draw the full sheet inside (px, py, pw, ph), maintaining aspect
+// ratio. The active frame gets a yellow border; every frame
+// belonging to the active tag gets a thin cyan tint border so the
+// user sees the animation range at a glance.
+static void _draw_sheet_panel(px, py, pw, ph) {
+    auto scale_x, scale_y, scale, draw_w, draw_h;
+    auto fx, fy, fw, fh, i, color, in_tag, active_tag_from, active_tag_to;
+
+    if (_aseprite_png_w <= 0 || _aseprite_png_h <= 0) { return; }
+
+    // Pick the largest integer scale that fits both dimensions —
+    // pixel art tools always prefer integer scaling to avoid
+    // blurry sampling. 1× is the floor (sheets bigger than the
+    // panel will simply overflow; that's fine for v1 since the
+    // user can resize the window).
+    scale_x = pw / _aseprite_png_w;
+    scale_y = ph / _aseprite_png_h;
+    scale   = scale_x < scale_y ? scale_x : scale_y;
+    if (scale < 1) { scale = 1; }
+
+    draw_w = _aseprite_png_w * scale;
+    draw_h = _aseprite_png_h * scale;
+
+    // Centre the sheet in the panel for a cleaner look.
+    _sheet_origin_x = px + (pw - draw_w) / 2;
+    _sheet_origin_y = py + (ph - draw_h) / 2;
+    _sheet_scale    = scale;
+
+    // Background plate so transparent PNG pixels read as dark
+    // rather than blending into whatever lives behind.
+    draw_rect(_sheet_origin_x - 2, _sheet_origin_y - 2,
+              draw_w + 4, draw_h + 4, rgba(20, 22, 28, 255));
+
+    _draw_sheet_region(0, 0, _aseprite_png_w, _aseprite_png_h,
+                       _sheet_origin_x, _sheet_origin_y, scale);
+
+    // Resolve the active tag range once so the per-frame border
+    // loop doesn't repeat the same arr_get pair on every frame.
+    active_tag_from = -1;
+    active_tag_to   = -1;
+    if (_aseprite_active_tag >= 0 && _aseprite_active_tag < _aseprite_tag_count) {
+        active_tag_from = arr_get(_aseprite_tag_from, _aseprite_active_tag);
+        active_tag_to   = arr_get(_aseprite_tag_to,   _aseprite_active_tag);
+    }
+
+    // Per-frame overlays. A box per frame so the user sees the
+    // grid even when the source PNG packs frames edge-to-edge;
+    // active frame gets a brighter colour, and any frame inside
+    // the playing tag gets a dimmer cyan tint.
+    for (i = 0; i < _aseprite_frame_count; i++) {
+        fx = arr_get(_aseprite_frame_x, i);
+        fy = arr_get(_aseprite_frame_y, i);
+        fw = arr_get(_aseprite_frame_w, i);
+        fh = arr_get(_aseprite_frame_h, i);
+
+        in_tag = (active_tag_from >= 0
+               && i >= active_tag_from
+               && i <= active_tag_to);
+        if (i == _aseprite_active_frame) {
+            color = rgba(255, 220, 80, 255);   // active frame — yellow
+        } else if (in_tag != 0) {
+            color = rgba( 90, 200, 220, 180);  // tag member — cyan
+        } else {
+            color = rgba( 70,  76,  96, 120);  // base grid — dim
+        }
+        draw_border(_sheet_origin_x + fx * scale,
+                    _sheet_origin_y + fy * scale,
+                    fw * scale, fh * scale, color, 1);
+    }
+}
+
+// Animation list panel — one row per tag. Click selects a tag,
+// resets the preview clock, and starts playback. Returns 1 when a
+// click was consumed.
+static _draw_tag_list(px, py, pw, ph) {
+    auto i, name, from, to, row_y, row_h, hit, label, consumed;
+    auto count_sb, label_sb, label_str;
+
+    consumed = 0;
+    row_h    = 26;
+
+    draw_rect(px, py, pw, ph, rgba(20, 22, 28, 255));
+    draw_text("Animations", px + 8, py + 6, 8, rgba(140, 160, 200, 255));
+
+    for (i = 0; i < _aseprite_tag_count; i++) {
+        row_y = py + 28 + i * (row_h + 2);
+        if (row_y + row_h > py + ph) { break; }
+
+        name = arr_get(_aseprite_tag_name, i);
+        from = arr_get(_aseprite_tag_from, i);
+        to   = arr_get(_aseprite_tag_to,   i);
+
+        // Build "<name>  <from>..<to>" once per row. Strbuf in,
+        // local C-string out so the click feedback ui sees stable
+        // text for the frame.
+        label_sb = strbuf_new();
+        if (name != 0) { label_sb = strbuf_cat(label_sb, name); }
+        else            { label_sb = strbuf_cat(label_sb, "(unnamed)"); }
+        label_sb = strbuf_cat(label_sb, "  ");
+        label_sb = strbuf_num(label_sb, from);
+        label_sb = strbuf_cat(label_sb, "..");
+        label_sb = strbuf_num(label_sb, to);
+        label_str = str_dup(label_sb);
+        label_sb  = strbuf_free(label_sb);
+
+        if (i == _aseprite_active_tag) {
+            draw_rect(px + 4, row_y, pw - 8, row_h, rgba(60, 90, 130, 255));
+        }
+        hit = gui_button(px + 4, row_y, pw - 8, row_h, label_str);
+        free(label_str);
+        if (hit != 0) {
+            _aseprite_active_tag         = i;
+            _aseprite_preview_elapsed_ms = 0;
+            _aseprite_preview_playing    = 1;
+            _aseprite_active_frame       = from;
+            consumed = 1;
+        }
+    }
+
+    return consumed;
+}
+
+// Compute which frame inside the active tag should show right now,
+// given the accumulated preview clock. Uniform-rate cycle: total
+// cycle ms = frame_ms * count, current = (elapsed % cycle) /
+// frame_ms. Returns -1 when no tag is active.
+static _preview_current_frame() {
+    auto from, to, ms, count, cycle, current;
+    if (_aseprite_active_tag < 0 || _aseprite_active_tag >= _aseprite_tag_count) {
+        return -1;
+    }
+    from  = arr_get(_aseprite_tag_from, _aseprite_active_tag);
+    to    = arr_get(_aseprite_tag_to,   _aseprite_active_tag);
+    ms    = arr_get(_aseprite_tag_ms,   _aseprite_active_tag);
+    count = to - from + 1;
+    if (count <= 0) { return from; }
+    if (ms <= 0)    { ms = 100; }
+    cycle   = ms * count;
+    current = (_aseprite_preview_elapsed_ms % cycle) / ms;
+    return from + current;
+}
+
+// Animation preview panel — renders the current cycle frame at a
+// fixed scale, big enough to read clearly. The frame number /
+// elapsed clock prints below so the user can see playback speed.
+static void _draw_preview_panel(px, py, pw, ph) {
+    auto frame_idx, fx, fy, fw, fh, draw_x, draw_y, scale, max_s;
+
+    draw_rect(px, py, pw, ph, rgba(20, 22, 28, 255));
+    draw_text("Preview", px + 8, py + 6, 8, rgba(140, 160, 200, 255));
+
+    if (_aseprite_active_tag < 0) {
+        draw_text("Click an animation to preview",
+                  px + 8, py + 32, 8, rgba(120, 130, 150, 255));
+        return;
+    }
+
+    frame_idx = _preview_current_frame();
+    if (frame_idx < 0 || frame_idx >= _aseprite_frame_count) { return; }
+
+    fx = arr_get(_aseprite_frame_x, frame_idx);
+    fy = arr_get(_aseprite_frame_y, frame_idx);
+    fw = arr_get(_aseprite_frame_w, frame_idx);
+    fh = arr_get(_aseprite_frame_h, frame_idx);
+    if (fw <= 0 || fh <= 0) { return; }
+
+    // Largest integer scale that fits a margin around the frame.
+    max_s = (pw - 32) / fw;
+    if ((ph - 56) / fh < max_s) { max_s = (ph - 56) / fh; }
+    if (max_s < 1) { max_s = 1; }
+    scale = max_s;
+    draw_x = px + (pw - fw * scale) / 2;
+    draw_y = py + 28 + (ph - 28 - fh * scale - 18) / 2;
+
+    _draw_sheet_region(fx, fy, fw, fh, draw_x, draw_y, scale);
+
+    // Status footer — frame number + (play / pause) hint.
+    draw_text("frame", px + 8, py + ph - 18, 8, rgba(140, 160, 200, 255));
+    draw_number(px + 50, py + ph - 18, 8, WHITE, frame_idx);
+    draw_text(_aseprite_preview_playing != 0 ? "[playing]" : "[paused]",
+              px + 100, py + ph - 18, 8,
+              _aseprite_preview_playing != 0
+                  ? rgba(120, 220, 140, 255)
+                  : rgba(220, 200, 120, 255));
+    draw_text("space=play/pause  click sheet=pick frame  esc=quit",
+              px + 220, py + ph - 18, 8, rgba(120, 130, 150, 255));
+}
+
+// Map a window-absolute (mx, my) onto a frame index by walking
+// every bounding box. Returns -1 when the click misses. Uses the
+// cached sheet origin / scale captured during the last render —
+// guaranteed up to date because render runs every frame before the
+// mouse handler does.
+static _frame_at_pixel(mx, my) {
+    auto i, fx, fy, fw, fh, x0, y0, x1, y1;
+    if (_sheet_scale <= 0) { return -1; }
+    for (i = 0; i < _aseprite_frame_count; i++) {
+        fx = arr_get(_aseprite_frame_x, i);
+        fy = arr_get(_aseprite_frame_y, i);
+        fw = arr_get(_aseprite_frame_w, i);
+        fh = arr_get(_aseprite_frame_h, i);
+        x0 = _sheet_origin_x + fx * _sheet_scale;
+        y0 = _sheet_origin_y + fy * _sheet_scale;
+        x1 = x0 + fw * _sheet_scale;
+        y1 = y0 + fh * _sheet_scale;
+        if (mx >= x0 && mx < x1 && my >= y0 && my < y1) { return i; }
+    }
+    return -1;
+}
+
+// Find the first tag containing `frame` (or -1 if none). When the
+// user clicks a frame inside a tag we automatically highlight that
+// tag in the animation list — handy when scrubbing through walks.
+static _tag_containing(frame) {
+    auto i, from, to;
+    for (i = 0; i < _aseprite_tag_count; i++) {
+        from = arr_get(_aseprite_tag_from, i);
+        to   = arr_get(_aseprite_tag_to,   i);
+        if (frame >= from && frame <= to) { return i; }
+    }
+    return -1;
+}
+
+// Public entry called from modulab_lib_frame when a sheet is
+// loaded. Owns the entire panel: top topbar with the file path,
+// left sheet display, right tag list, bottom preview, footer
+// hints. Returns 1 when the topbar's "Close" was clicked (the
+// caller drops back into editor mode).
+aseprite_view_render(px, py, pw, ph) {
+    auto sheet_w, sheet_h, list_w, preview_h, content_y;
+    auto close_hit, play_hit, footer_y, clicked_frame;
+    auto mx, my, mb_pressed;
+    auto sheet_panel_x, sheet_panel_y, list_x, list_y, preview_y;
+
+    if (_aseprite_active == 0) { return 0; }
+
+    // Topbar: file path + Close + Play/Pause. Same look as the
+    // editor topbar so the user feels at home.
+    draw_text("Aseprite viewer", px + 12, py + 8, 8,
+              rgba(97, 218, 251, 255));
+    if (_aseprite_json_path != 0) {
+        draw_text(_aseprite_json_path, px + 160, py + 8, 8,
+                  rgba(200, 210, 230, 255));
+    }
+
+    play_hit  = gui_button(px + pw - 240, py + 4, 110, 22,
+                           _aseprite_preview_playing != 0 ? "Pause" : "Play");
+    if (play_hit != 0) {
+        _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
+    }
+    close_hit = gui_button(px + pw - 120, py + 4, 110, 22, "Close");
+    if (close_hit != 0) {
+        mlab_close_aseprite_sheet();
+        return 1;
+    }
+
+    // Layout — left 65% for the sheet display, right 35% for the
+    // tag list, bottom 35% of the panel for the preview.
+    content_y     = py + 32;
+    list_w        = 260;
+    preview_h     = (ph - 32) * 35 / 100;
+    if (preview_h < 160) { preview_h = 160; }
+
+    sheet_panel_x = px;
+    sheet_panel_y = content_y;
+    sheet_w       = pw - list_w - 4;
+    sheet_h       = ph - 32 - preview_h - 4;
+
+    list_x        = px + sheet_w + 4;
+    list_y        = content_y;
+
+    preview_y     = content_y + sheet_h + 4;
+
+    _draw_sheet_panel(sheet_panel_x, sheet_panel_y, sheet_w, sheet_h);
+    _draw_tag_list(list_x, list_y, list_w, sheet_h);
+    _draw_preview_panel(px, preview_y, pw, preview_h);
+
+    // Mouse pick on the sheet — left-click selects a frame and
+    // auto-locks the matching tag. We poll mouse_down's rising
+    // edge against the previous-frame flag stored in module scope.
+    mx = mouse_x();
+    my = mouse_y();
+    mb_pressed = mouse_down(MOUSE_LEFT) != 0 && _aseprite_mb_prev == 0;
+    _aseprite_mb_prev = mouse_down(MOUSE_LEFT);
+    if (mb_pressed != 0
+     && mx >= sheet_panel_x && mx < sheet_panel_x + sheet_w
+     && my >= sheet_panel_y && my < sheet_panel_y + sheet_h) {
+        clicked_frame = _frame_at_pixel(mx, my);
+        if (clicked_frame >= 0) {
+            auto tag_for_click;
+            _aseprite_active_frame = clicked_frame;
+            tag_for_click = _tag_containing(clicked_frame);
+            if (tag_for_click >= 0) {
+                _aseprite_active_tag         = tag_for_click;
+                _aseprite_preview_elapsed_ms = 0;
+            }
+        }
+    }
+
+    // Spacebar toggles preview playback — matches the universal
+    // media-player convention. We share the modulab keypress
+    // semantics (rising-edge) so a held space doesn't flicker.
+    if (key_pressed(KEY_SPACE) != 0) {
+        _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
+    }
+
+    return 0;
+}
+
+// Tick the preview clock. Called once per frame from
+// modulab_lib_frame BEFORE aseprite_view_render so the displayed
+// frame matches the freshly-advanced clock.
+aseprite_view_tick(dt_ms) {
+    if (_aseprite_active == 0) { return; }
+    if (_aseprite_preview_playing == 0) { return; }
+    _aseprite_preview_elapsed_ms = _aseprite_preview_elapsed_ms + dt_ms;
+}
+
+// Module-private — tracks the mouse-button state across frames so
+// the sheet picker fires once per press, not every frame the
+// button is held.
+static extrn _aseprite_mb_prev;
