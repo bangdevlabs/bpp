@@ -8,8 +8,16 @@ import "bpp_internal.bsm";
 
 // ── State ────────────────────────────────────────────────────
 
-static auto fbuf;          // File read buffer (256KB), used as a stack.
-static auto fbuf_top;      // Stack pointer within fbuf for nested imports.
+// `fbuf` is a small scratch stack used only for short-lived PATH
+// strings (resolved import targets, auto-inject pathname slots).
+// File CONTENTS no longer live here — each process_file invocation
+// mallocs a fresh `content_buf` sized to the actual file, and
+// frees it on return. That kills the silent-overflow class of bug
+// (sum-along-import-chain exceeding fbuf size, then writing into
+// neighbouring heap and SIGSEGV'ing in arr_push downstream).
+// Heap-per-file mirrors what gcc/clang do per translation unit.
+static auto fbuf;          // Scratch stack for path strings (~32KB plenty).
+static auto fbuf_top;      // Stack pointer within fbuf for nested paths.
 static auto imp_hashes;    // Dynamic array: hash values of imported file paths.
 extrn pathbuf;       // Scratch buffer for path resolution.
 static auto linebuf;       // Current line being processed.
@@ -573,7 +581,7 @@ void process_file(path_off, path_len) { return; }
 void process_file(path_off, path_len) {
     auto fd, nread, fsize, pos, line_start, ch;
     auto fname_len, plen, i;
-    auto saved_top, my_path, my_file, my_mod_idx;
+    auto saved_top, my_path, content_buf, my_mod_idx;
 
     if (was_imported(path_off, path_len)) { return; }
     mark_imported(path_off, path_len);
@@ -582,13 +590,11 @@ void process_file(path_off, path_len) {
     saved_top = fbuf_top;
 
     // Copy our path into the fbuf stack so it survives child recursion
-    // (pathbuf gets overwritten by find_file in nested imports).
+    // (pathbuf gets overwritten by find_file in nested imports). Paths
+    // are ~50 bytes — keeping them on fbuf is fine.
     my_path = fbuf_top;
     buf_copy(fbuf + my_path, path_off, path_len);
     fbuf_top += path_len;
-
-    // File content will be read starting here.
-    my_file = fbuf_top;
 
     // Copy path to pathbuf for sys_open (null-terminated).
     buf_copy(pathbuf, fbuf + my_path, path_len);
@@ -607,17 +613,30 @@ void process_file(path_off, path_len) {
         sys_exit(1);
     }
 
-    // Read file contents into fbuf at our stack frame.
-    fsize = 0;
-    nread = sys_read(fd, fbuf + my_file + fsize, 65536);
-    while (nread > 0) {
-        fsize += nread;
-        nread = sys_read(fd, fbuf + my_file + fsize, 65536);
+    // Discover exact file size via lseek-to-end, rewind, malloc once.
+    // Avoids the realloc-grow dance that read-chunks would force, and
+    // keeps the read loop a single syscall on the common case. Files
+    // that change size mid-read (rare for source code) get the prefix
+    // we got the size for — sys_read will short-read if EOF arrives
+    // early.
+    fsize = sys_lseek(fd, 0, 2);
+    sys_lseek(fd, 0, 0);
+
+    // Allocate exact-size heap buffer for this file's contents. Freed
+    // before return so each process_file invocation owns its own
+    // O(file_size) allocation — recursion depth × file_size lives in
+    // the heap, not in a shared fixed stack that overflows silently
+    // when an import chain grows.
+    content_buf = malloc(fsize + 1);
+
+    nread = 0;
+    pos   = 0;
+    while (pos < fsize) {
+        nread = sys_read(fd, content_buf + pos, fsize - pos);
+        if (nread <= 0) { fsize = pos; }
+        if (nread > 0)  { pos = pos + nread; }
     }
     sys_close(fd);
-
-    // Advance fbuf_top past our data so child imports get their own space.
-    fbuf_top = my_file + fsize;
 
     // Record file boundary for diagnostic location info.
     // Copy filename to permanent buffer (fbuf is a stack and gets overwritten).
@@ -629,7 +648,7 @@ void process_file(path_off, path_len) {
     diag_file_names = arr_push(diag_file_names, pack(fn_start, path_len));
     diag_file_line_starts = arr_push(diag_file_line_starts, outbuf_lines);
     // Hash the file content for cache invalidation.
-    mod_hashes = arr_push(mod_hashes, fnv1a(fbuf + my_file, fsize));
+    mod_hashes = arr_push(mod_hashes, fnv1a(content_buf, fsize));
     my_mod_idx = arr_len(diag_file_starts) - 1;
     // Tracks how many SOURCE-FILE lines of THIS file have been
     // processed so far. Increments once per iteration of the line
@@ -1107,7 +1126,7 @@ void process_file(path_off, path_len) {
         // Find end of current line.
         line_start = pos;
         while (pos < fsize) {
-            if (peek(fbuf + my_file + pos) == 10) {
+            if (peek(content_buf + pos) == 10) {
                 pos++;
                 pos = fsize + pos;
             }
@@ -1116,7 +1135,7 @@ void process_file(path_off, path_len) {
         if (pos > fsize) { pos -= fsize; }
 
         // Check if this line is a file import or load.
-        fname_len = check_file_import(fbuf + my_file + line_start, pos - line_start);
+        fname_len = check_file_import(content_buf + line_start, pos - line_start);
         if (fname_len > 0) {
             if (_import_is_load) {
                 // `load` keyword: resolve ONLY relative to the entry file's
@@ -1174,12 +1193,15 @@ void process_file(path_off, path_len) {
         } else {
             // Output the line as-is.
             for (i = line_start; i < pos; i++) {
-                emit_ch(peek(fbuf + my_file + i));
+                emit_ch(peek(content_buf + i));
             }
         }
     }
 
-    // Restore fbuf stack position.
+    // Release this file's content buffer + restore fbuf stack
+    // position (which still holds my_path + any auto-inject scratch
+    // pushed during this invocation).
+    free(content_buf);
     fbuf_top = saved_top;
 }
 
@@ -1188,7 +1210,12 @@ void process_file(path_off, path_len) {
 // Allocate all buffers used by the import resolver.
 // Must be called before process_file().
 void init_import() {
-    fbuf = malloc(262144);
+    // 64 KB scratch for nested path strings + auto-inject pathname
+    // slots. File CONTENTS are no longer pushed here — each
+    // process_file invocation mallocs its own content_buf sized to
+    // the file. fbuf now holds only short strings (~50 bytes each)
+    // so even pathological import chains use a few KB at most.
+    fbuf = malloc(65536);
     fbuf_top = 0;
     imp_hashes = arr_new();
     pathbuf = malloc(4096);
