@@ -214,31 +214,87 @@ static _emit_frame_tag(sb, name: ptr, from, to) {
 
 // ── Sidecar JSON emit ───────────────────────────────────────
 
-// Build the Aseprite-schema sidecar for a uniform-grid PNG. Names
-// the sheet via `sheet_name` (typically "peasant") — used as the
-// frames-object key prefix. PNG geometry comes from cols / rows /
-// tile_w / tile_h. Outputs to `sidecar_path` via file_write_all.
+// Emit one frame entry pointing at PNG cell (col, row). Wrapper
+// over `_emit_frame` that hides the pixel-coord math so the
+// anim-layout loop below reads as "frames at these grid cells in
+// this order".
+static _emit_cell(sb, sheet_name: ptr, frame_idx, col, row, tile_w, tile_h) {
+    return _emit_frame(sb, sheet_name, frame_idx,
+                       col * tile_w, row * tile_h,
+                       tile_w, tile_h,
+                       DEFAULT_FRAME_MS);
+}
+
+// Build the Aseprite-schema sidecar for the peasant PNG layout.
+// The war1tool output is COLUMN-MAJOR within each animation —
+// each column maps to a direction (N/NE/E/SE/S), each row to a
+// frame inside that direction's cycle. The previous version of
+// this converter assumed row-major emission, which made
+// `walk_S` (intended frames 25-29) actually point at PNG row 5
+// (the WALK_N cycle), so the running game played the north
+// frames for any unit walking south.
+//
+// Fix: reorder the frame emission so the on-disk frame index is
+// CONTIGUOUS per tag. Each frame still references its true PNG
+// bbox; only the iteration order changes.
+//
+// Resulting layout (peasant — 5 cols x 13 rows):
+//
+//   frame_idx 0..4   = idle facings N..S          (PNG row 0, cols 0..4)
+//   frame_idx 5..9   = walk_N cycle               (PNG col 0, rows 1..5)
+//   frame_idx 10..14 = walk_NE cycle              (PNG col 1, rows 1..5)
+//   frame_idx 15..19 = walk_E  cycle              (PNG col 2, rows 1..5)
+//   frame_idx 20..24 = walk_SE cycle              (PNG col 3, rows 1..5)
+//   frame_idx 25..29 = walk_S  cycle              (PNG col 4, rows 1..5)
+//   frame_idx 30..64 = remaining (rows 6..12)     (UNTAGGED — chop /
+//                                                  die / carry need a
+//                                                  war1tool cross-ref
+//                                                  to tag, separate
+//                                                  sidequest)
 //
 // Returns 0 on success, -1 on write failure.
 static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
                      sheet_name: ptr, image_w, image_h,
                      cols, rows, tile_w, tile_h) {
-    auto sb, total_frames, i, col, row;
-    auto rc;
+    auto sb, idx, dir, frame_in_cycle, row, col, rc;
 
-    total_frames = cols * rows;
     sb = strbuf_new();
 
     // Top-level open + frames array (Aseprite "Array" output).
     sb = strbuf_cat(sb, "{\"frames\":[");
-    for (i = 0; i < total_frames; i++) {
-        if (i > 0) { sb = strbuf_ch(sb, ','); }
-        col = i % cols;
-        row = i / cols;
-        sb = _emit_frame(sb, sheet_name, i,
-                         col * tile_w, row * tile_h,
-                         tile_w, tile_h,
-                         DEFAULT_FRAME_MS);
+    idx = 0;
+
+    // Idle: row 0, one frame per direction.
+    for (col = 0; col < cols; col++) {
+        if (idx > 0) { sb = strbuf_ch(sb, ','); }
+        sb = _emit_cell(sb, sheet_name, idx, col, 0, tile_w, tile_h);
+        idx++;
+    }
+
+    // Walk: one column per direction, 5 frames each (PNG rows 1..5).
+    // Loop direction-first so frames for the same direction land at
+    // contiguous indices the tag can address with a from..to range.
+    for (dir = 0; dir < cols; dir++) {
+        for (frame_in_cycle = 0; frame_in_cycle < 5; frame_in_cycle++) {
+            sb = strbuf_ch(sb, ',');
+            sb = _emit_cell(sb, sheet_name, idx,
+                            dir, 1 + frame_in_cycle,
+                            tile_w, tile_h);
+            idx++;
+        }
+    }
+
+    // Remaining rows (6..rows-1) — chop / die / carry. Emitted in
+    // row-major order so a future tagging pass (when war1tool
+    // documentation is cross-referenced) can address them, but
+    // untagged for now to avoid mislabeling.
+    for (row = 6; row < rows; row++) {
+        for (col = 0; col < cols; col++) {
+            sb = strbuf_ch(sb, ',');
+            sb = _emit_cell(sb, sheet_name, idx, col, row,
+                            tile_w, tile_h);
+            idx++;
+        }
     }
     sb = strbuf_cat(sb, "],");
 
@@ -251,19 +307,18 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
     sb = strbuf_num(sb, image_h);
     sb = strbuf_cat(sb, "},\"scale\":\"1\",\"format\":\"RGBA8888\",");
 
-    // frameTags — known peasant anims. If we add more units, extend
-    // with a per-sheet tag table (or read from a sidecar config).
-    // Today: hardcoded for peasant since it's the only consumer.
+    // frameTags — index ranges match the reordered emission above.
+    // walk_X cycles are 5 frames apiece, idle is 1 frame apiece.
     sb = strbuf_cat(sb, "\"frameTags\":[");
-    sb = _emit_frame_tag(sb, "idle_N",  0, 0);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_NE", 1, 1);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_E",  2, 2);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_SE", 3, 3);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_S",  4, 4);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_N",  5, 9);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_NE", 10, 14); sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_E",  15, 19); sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_SE", 20, 24); sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_N",   0,  0);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_NE",  1,  1);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_E",   2,  2);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_SE",  3,  3);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "idle_S",   4,  4);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_N",   5,  9);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_NE", 10, 14);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_E",  15, 19);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_SE", 20, 24);  sb = strbuf_ch(sb, ',');
     sb = _emit_frame_tag(sb, "walk_S",  25, 29);
     sb = strbuf_cat(sb, "]}}\n");
 
