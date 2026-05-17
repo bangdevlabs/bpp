@@ -4,6 +4,7 @@
 
 import "stbdraw.bsm";
 import "stbinput.bsm";
+import "stbimage.bsm";  // image_draw_size for the IMAGE widget in the declarative layout API below
 
 // --- Style System ---
 // Separates appearance from geometry — the B++ equivalent of CSS.
@@ -1629,4 +1630,653 @@ void gui_status_bar(y, w, text, color) {
     draw_rect(0, y, w, 1, _theme.border);
     draw_text(text, 8, y + height / 2 - UI_FONT_SZ / 2,
               UI_FONT_SZ, _theme.text_muted);
+}
+
+// ─── Declarative layout (Clay-inspired) ─────────────────────
+//
+// Why this lives in stbui (not a separate cartridge) — see
+// docs/sidequest_stbui_v2_clay.md. Short version: the original
+// `lay_push / lay_pop` helpers above shipped April 2026 with
+// zero adoption because they still demanded explicit (x, y, w, h)
+// at every call site. The primitives below add FIT / GROW /
+// FIXED / PERCENT sizing so the consumer declares STRUCTURE and
+// the engine resolves positions — the abstraction that v1's
+// `lay_*` never reached.
+//
+// Old gui_* / lay_* widgets above keep working unchanged.
+// New consumers (and migrations from old ones) reach for the
+// `ui_*` family below.
+//
+// Model (adapted from Nic Barker's Clay, MIT-licensed C library):
+//   * Stack-based `ui_box / ui_end` pairs (no macros — B++
+//     doesn't have them, but begin/end reads naturally).
+//   * Sizing modes per axis: FIT (size to children), GROW (fill
+//     parent), FIXED (pixels), PERCENT (parent fraction).
+//   * Layout direction: ROW (left-to-right) or COL (top-to-bottom).
+//   * Padding (single value all sides for MVP) + child gap +
+//     alignment per axis.
+//   * Four layout passes in `ui_layout_end`: resolve FIXED +
+//     PERCENT top-down, FIT bottom-up, GROW top-down,
+//     position assignment. Render commands dispatched directly
+//     to stbdraw in `ui_render`.
+//   * Arena memory: 256 nodes (~45 KB), reset every frame at
+//     `ui_layout_begin`. Zero per-frame allocation.
+//
+// Typical use (Modulab-shaped three-panel):
+//
+//   ui_layout_begin(window_w, window_h);
+//   ui_col(0);
+//       ui_row(6);
+//           ui_text("Title");
+//           ui_spacer_grow();
+//           if (ui_button("Play"))  { _toggle_play(); }
+//           if (ui_button("Close")) { _close(); }
+//       ui_end();
+//       ui_row_grow(4);
+//           ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), 0, 0);
+//               draw_centre_panel();
+//           ui_end();
+//           ui_box(UI_LAYOUT_COL, ui_sz_fixed(260), ui_sz_grow(), 4, 0);
+//               draw_side_panel();
+//           ui_end();
+//       ui_end();
+//   ui_end();
+//   ui_layout_end();
+//   ui_render();
+
+// Sizing modes — encoded in high 8 bits of a word, value in low.
+// Decoded via `_ui2_sz_mode(w)` / `_ui2_sz_value(w)`.
+const UI_SZ_FIT     = 1;
+const UI_SZ_GROW    = 2;
+const UI_SZ_FIXED   = 3;
+const UI_SZ_PERCENT = 4;
+
+// Layout direction for a container.
+const UI_LAYOUT_ROW = 0;
+const UI_LAYOUT_COL = 1;
+
+// Cross-axis alignment of children within a container.
+const UI_ALIGN_START  = 0;
+const UI_ALIGN_CENTER = 1;
+const UI_ALIGN_END    = 2;
+
+// Node kinds — drives render dispatch.
+const UI_KIND_BOX    = 0;
+const UI_KIND_TEXT   = 1;
+const UI_KIND_BUTTON = 2;
+const UI_KIND_IMAGE  = 3;
+const UI_KIND_SPACER = 4;
+
+// Arena + node cap. 256 nodes covers every current B++ tool with
+// 3x headroom (Modulab uses ~50, Bang 9 ~100). Bump if a future
+// tool ever hits the cap — diagnostic fires in `_ui2_new_node`.
+const UI2_MAX_NODES    = 256;
+const UI2_STACK_DEPTH  = 16;
+
+// One node = container OR leaf widget. Tree links by index into
+// `_ui2_nodes` (-1 = none). All fields default to 0 / -1 in
+// `_ui2_new_node` so config helpers only write what they set.
+struct UiNode {
+    // Tree links — indices into _ui2_nodes. -1 = none.
+    parent,
+    first_child,
+    last_child,
+    next_sibling,
+
+    // Layout config (set during declaration).
+    direction,
+    sz_w_mode, sz_w_val,
+    sz_h_mode, sz_h_val,
+    pad,             // single value, all 4 sides (v1 simplification)
+    gap,
+    align_x, align_y,
+
+    // Computed by layout passes.
+    x, y, w, h,
+
+    // Visual config — meaning depends on `kind`.
+    kind,
+    text: ptr,        // TEXT / BUTTON label
+    color,            // ARGB foreground / fill
+    bg_color,         // ARGB background plate
+    image,            // IMAGE atlas handle
+    frame,            // IMAGE sprite index
+
+    // Hit-test cache — written by ui_render.
+    hovered,
+    clicked
+}
+
+// Pre-allocated node pool — sized at init_ui_layout(), reused
+// across frames. `_ui2_node_count` resets to 0 at ui_layout_begin.
+static extrn _ui2_nodes;
+static extrn _ui2_node_count;
+
+// Layout stack — current ancestry chain so widgets append to the
+// right parent. Stores node indices. Depth 16 is generous (Clay
+// suggests 32; B++ consumers nest 4-5 deep typically).
+static extrn _ui2_stack;
+static extrn _ui2_stack_top;
+
+// Viewport (set by ui_layout_begin, used as root size).
+static extrn _ui2_viewport_w;
+static extrn _ui2_viewport_h;
+
+// Click latching — Dear-ImGui trick to avoid the chicken-and-egg
+// between "declare widget" and "know if it was clicked". The
+// button returns the PREVIOUS frame's click state matched by
+// sequence index. Latency is invisible at 60 fps and keeps the
+// API single-call (no register-then-query dance). Hit results
+// from THIS frame are written to `_ui2_curr_clicks` for next-
+// frame lookup.
+static extrn _ui2_prev_clicks;
+static extrn _ui2_curr_clicks;
+static extrn _ui2_seq_idx;
+static extrn _ui2_mouse_prev_down;
+
+// Allocate the node pool + stack + click buffers. Idempotent —
+// host calls once, no-op on re-entry. Pairs with the existing
+// `init_ui` (legacy widgets); both can co-exist within the same
+// process for as long as consumers haven't fully migrated.
+void init_ui_layout() {
+    auto i;
+    if (_ui2_nodes != 0) { return; }
+    _ui2_nodes       = malloc(UI2_MAX_NODES * sizeof(UiNode));
+    _ui2_stack       = malloc(UI2_STACK_DEPTH * 8);
+    _ui2_prev_clicks = malloc(UI2_MAX_NODES * 8);
+    _ui2_curr_clicks = malloc(UI2_MAX_NODES * 8);
+    _ui2_node_count  = 0;
+    _ui2_stack_top   = 0 - 1;
+    _ui2_seq_idx     = 0;
+    _ui2_viewport_w  = 0;
+    _ui2_viewport_h  = 0;
+    _ui2_mouse_prev_down = 0;
+    for (i = 0; i < UI2_MAX_NODES; i++) {
+        *(_ui2_prev_clicks + i * 8) = 0;
+        *(_ui2_curr_clicks + i * 8) = 0;
+    }
+}
+
+// Begin a layout frame. Resets the node pool + stack + click
+// sequencer, captures viewport dimensions for root sizing, and
+// promotes last frame's hit results into `_ui2_prev_clicks` so
+// widgets see their previous-frame click state.
+void ui_layout_begin(viewport_w, viewport_h) {
+    auto i, tmp;
+    if (_ui2_nodes == 0) { init_ui_layout(); }
+    _ui2_node_count = 0;
+    _ui2_stack_top  = 0 - 1;
+    _ui2_seq_idx    = 0;
+    _ui2_viewport_w = viewport_w;
+    _ui2_viewport_h = viewport_h;
+    // Swap buffers: this frame's curr becomes next frame's prev.
+    // Zero the new curr buffer for fresh hit accumulation.
+    tmp              = _ui2_prev_clicks;
+    _ui2_prev_clicks = _ui2_curr_clicks;
+    _ui2_curr_clicks = tmp;
+    for (i = 0; i < UI2_MAX_NODES; i++) {
+        *(_ui2_curr_clicks + i * 8) = 0;
+    }
+}
+
+// Sizing helpers — encoded as words (pass-by-value), mode in
+// high 8 bits + value in low 56. Decoded by the internal
+// `_ui2_sz_mode` / `_ui2_sz_value` helpers below.
+ui_sz_fit() {
+    return UI_SZ_FIT << 56;
+}
+ui_sz_grow() {
+    return UI_SZ_GROW << 56;
+}
+ui_sz_fixed(n) {
+    return (UI_SZ_FIXED << 56) | (n & 0xFFFFFFFFFFFFFF);
+}
+ui_sz_pct(p) {
+    if (p < 0)   { p = 0; }
+    if (p > 100) { p = 100; }
+    return (UI_SZ_PERCENT << 56) | p;
+}
+
+static _ui2_sz_mode(encoded) {
+    return (encoded >> 56) & 0xFF;
+}
+static _ui2_sz_value(encoded) {
+    return encoded & 0xFFFFFFFFFFFFFF;
+}
+
+// Acquire a fresh node from the pool. Returns index, or -1 when
+// the cap is hit. Stamps defaults so config helpers only need to
+// write fields they change.
+static _ui2_new_node() {
+    auto idx, n: UiNode;
+    if (_ui2_node_count >= UI2_MAX_NODES) {
+        put_err("stbui: node cap (");
+        putnum_err(UI2_MAX_NODES);
+        put_err(") exceeded — bump UI2_MAX_NODES or audit consumer\n");
+        return 0 - 1;
+    }
+    idx = _ui2_node_count;
+    _ui2_node_count = _ui2_node_count + 1;
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.parent       = 0 - 1;
+    n.first_child  = 0 - 1;
+    n.last_child   = 0 - 1;
+    n.next_sibling = 0 - 1;
+    n.direction    = UI_LAYOUT_ROW;
+    n.sz_w_mode    = UI_SZ_FIT;
+    n.sz_w_val     = 0;
+    n.sz_h_mode    = UI_SZ_FIT;
+    n.sz_h_val     = 0;
+    n.pad          = 0;
+    n.gap          = 0;
+    n.align_x      = UI_ALIGN_START;
+    n.align_y      = UI_ALIGN_START;
+    n.x = 0; n.y = 0; n.w = 0; n.h = 0;
+    n.kind         = UI_KIND_BOX;
+    n.text         = 0;
+    n.color        = 0;
+    n.bg_color     = 0;
+    n.image        = 0;
+    n.frame        = 0;
+    n.hovered      = 0;
+    n.clicked      = 0;
+    return idx;
+}
+
+// Append `child_idx` as the last child of the current top-of-stack
+// node. When the stack is empty the node becomes the root with no
+// parent — its sizing modes are respected verbatim (FIT computes
+// from children, GROW fills the viewport, FIXED + PERCENT resolve
+// in the first pass against the viewport as implicit parent).
+static void _ui2_attach(child_idx) {
+    auto parent_idx, p: UiNode, c: UiNode, last: UiNode;
+    c = _ui2_nodes + child_idx * sizeof(UiNode);
+    if (_ui2_stack_top < 0) { return; }
+    parent_idx = *(_ui2_stack + _ui2_stack_top * 8);
+    p = _ui2_nodes + parent_idx * sizeof(UiNode);
+    c.parent = parent_idx;
+    if (p.first_child < 0) {
+        p.first_child = child_idx;
+        p.last_child  = child_idx;
+    } else {
+        last = _ui2_nodes + p.last_child * sizeof(UiNode);
+        last.next_sibling = child_idx;
+        p.last_child = child_idx;
+    }
+}
+
+// Push a new container onto the stack. Future child declarations
+// attach to it until `ui_end()` pops.
+static void _ui2_push(idx) {
+    if (_ui2_stack_top + 1 >= UI2_STACK_DEPTH) {
+        put_err("stbui: layout stack depth exceeded — nest less or bump UI2_STACK_DEPTH\n");
+        return;
+    }
+    _ui2_stack_top = _ui2_stack_top + 1;
+    *(_ui2_stack + _ui2_stack_top * 8) = idx;
+}
+
+// Pop the current container. Mismatched begin/end is a programmer
+// error — surface it loudly so the consumer notices immediately.
+void ui_end() {
+    if (_ui2_stack_top < 0) {
+        put_err("stbui: ui_end called with empty layout stack\n");
+        return;
+    }
+    _ui2_stack_top = _ui2_stack_top - 1;
+}
+
+// Full-control container — caller specifies every layout knob.
+// The shorter helpers below cover ~90% of cases; this is the
+// escape hatch when a layout needs something exotic (mixed
+// sizing per axis, alignment per axis, etc.).
+void ui_box(direction, size_w, size_h, gap, pad) {
+    auto idx, n: UiNode;
+    idx = _ui2_new_node();
+    if (idx < 0) { return; }
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.direction = direction;
+    n.sz_w_mode = _ui2_sz_mode(size_w);
+    n.sz_w_val  = _ui2_sz_value(size_w);
+    n.sz_h_mode = _ui2_sz_mode(size_h);
+    n.sz_h_val  = _ui2_sz_value(size_h);
+    n.gap = gap;
+    n.pad = pad;
+    _ui2_attach(idx);
+    _ui2_push(idx);
+}
+
+// Common-case variants — short names for the layouts that recur.
+void ui_row(gap) {
+    ui_box(UI_LAYOUT_ROW, ui_sz_fit(), ui_sz_fit(), gap, 0);
+}
+void ui_col(gap) {
+    ui_box(UI_LAYOUT_COL, ui_sz_fit(), ui_sz_fit(), gap, 0);
+}
+void ui_row_grow(gap) {
+    ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_grow(), gap, 0);
+}
+void ui_col_grow(gap) {
+    ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), gap, 0);
+}
+void ui_row_pad(pad, gap) {
+    ui_box(UI_LAYOUT_ROW, ui_sz_fit(), ui_sz_fit(), gap, pad);
+}
+void ui_col_pad(pad, gap) {
+    ui_box(UI_LAYOUT_COL, ui_sz_fit(), ui_sz_fit(), gap, pad);
+}
+
+// Text label. Sizes to the rendered glyph extent so a row of
+// labels FITs naturally. font_sz hardcoded to 8 px (stbdraw's
+// bitmap font default); future polish surface a `ui_text_sized`
+// variant when a consumer needs other sizes.
+void ui_text(s: ptr) {
+    auto idx, n: UiNode, len;
+    idx = _ui2_new_node();
+    if (idx < 0) { return; }
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.kind  = UI_KIND_TEXT;
+    n.text  = s;
+    n.color = rgba(220, 230, 250, 255);
+    len = str_len(s);
+    n.sz_w_mode = UI_SZ_FIXED;
+    n.sz_w_val  = len * 8;
+    n.sz_h_mode = UI_SZ_FIXED;
+    n.sz_h_val  = 16;
+    _ui2_attach(idx);
+}
+
+// Button. Returns 1 if the PREVIOUS frame's click landed on the
+// button with the same sequence index. The one-frame lag is
+// invisible at 60 fps + keeps the API single-call (no
+// register-then-query dance). Hit result is written to
+// `_ui2_curr_clicks` during `ui_render`.
+ui_button(label: ptr) {
+    auto idx, n: UiNode, len, my_seq, prev_clicked;
+    idx = _ui2_new_node();
+    if (idx < 0) { return 0; }
+    my_seq = _ui2_seq_idx;
+    _ui2_seq_idx = _ui2_seq_idx + 1;
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.kind     = UI_KIND_BUTTON;
+    n.text     = label;
+    n.color    = rgba(240, 240, 245, 255);
+    n.bg_color = rgba( 60,  76, 110, 255);
+    n.pad      = 8;
+    len = str_len(label);
+    n.sz_w_mode = UI_SZ_FIXED;
+    n.sz_w_val  = len * 8 + n.pad * 2;
+    n.sz_h_mode = UI_SZ_FIXED;
+    n.sz_h_val  = 16 + n.pad * 2;
+    _ui2_attach(idx);
+    prev_clicked = *(_ui2_prev_clicks + my_seq * 8);
+    return prev_clicked;
+}
+
+// Image cell — paints a single atlas frame into the box's
+// computed bounds. The image is FIXED 32x32 by default; consumer
+// wraps in a sized container to grow / fix to other sizes.
+void ui_image(img, frame_idx) {
+    auto idx, n: UiNode;
+    idx = _ui2_new_node();
+    if (idx < 0) { return; }
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.kind  = UI_KIND_IMAGE;
+    n.image = img;
+    n.frame = frame_idx;
+    n.sz_w_mode = UI_SZ_FIXED;
+    n.sz_w_val  = 32;
+    n.sz_h_mode = UI_SZ_FIXED;
+    n.sz_h_val  = 32;
+    _ui2_attach(idx);
+}
+
+// Spacer — invisible node that takes the caller-specified size.
+// Pass `ui_sz_grow()` to push siblings apart, `ui_sz_fixed(N)`
+// for an exact gap, etc.
+void ui_spacer(size) {
+    auto idx, n: UiNode;
+    idx = _ui2_new_node();
+    if (idx < 0) { return; }
+    n = _ui2_nodes + idx * sizeof(UiNode);
+    n.kind = UI_KIND_SPACER;
+    n.sz_w_mode = _ui2_sz_mode(size);
+    n.sz_w_val  = _ui2_sz_value(size);
+    n.sz_h_mode = _ui2_sz_mode(size);
+    n.sz_h_val  = _ui2_sz_value(size);
+    _ui2_attach(idx);
+}
+
+// Convenience: spacer that grows to fill remaining space. Most
+// common spacer use case (push right-side widgets to the edge).
+void ui_spacer_grow() {
+    ui_spacer(ui_sz_grow());
+}
+
+// Pass 1: resolve FIXED + PERCENT sizes top-down. Walks each
+// node; FIXED uses the stored value, PERCENT multiplies parent's
+// already-resolved size. FIT and GROW are deferred.
+static void _ui2_pass_fixed_percent() {
+    auto i, n: UiNode, p: UiNode, parent_w, parent_h;
+    for (i = 0; i < _ui2_node_count; i++) {
+        n = _ui2_nodes + i * sizeof(UiNode);
+        parent_w = _ui2_viewport_w;
+        parent_h = _ui2_viewport_h;
+        if (n.parent >= 0) {
+            p = _ui2_nodes + n.parent * sizeof(UiNode);
+            parent_w = p.w;
+            parent_h = p.h;
+        }
+        if (n.sz_w_mode == UI_SZ_FIXED)   { n.w = n.sz_w_val; }
+        if (n.sz_h_mode == UI_SZ_FIXED)   { n.h = n.sz_h_val; }
+        if (n.sz_w_mode == UI_SZ_PERCENT) { n.w = parent_w * n.sz_w_val / 100; }
+        if (n.sz_h_mode == UI_SZ_PERCENT) { n.h = parent_h * n.sz_h_val / 100; }
+        // Root GROW: viewport is the implicit parent. Without this
+        // root.w/h would stay 0 because pass 3 only distributes
+        // INTO a parent, never sizes the root itself.
+        if (n.parent < 0) {
+            if (n.sz_w_mode == UI_SZ_GROW) { n.w = _ui2_viewport_w; }
+            if (n.sz_h_mode == UI_SZ_GROW) { n.h = _ui2_viewport_h; }
+        }
+    }
+}
+
+// Pass 2: resolve FIT sizes bottom-up. For each FIT axis, sum
+// children along that axis (or take max across-axis), add padding
+// and gap. Reverse declaration order is post-order on the tree
+// because declaration is pre-order — children always have higher
+// indices than their parent.
+static void _ui2_pass_fit() {
+    auto i, n: UiNode, c: UiNode, ci, gap_count;
+    auto accum_w, accum_h;
+    for (i = _ui2_node_count - 1; i >= 0; i--) {
+        n = _ui2_nodes + i * sizeof(UiNode);
+        if (n.sz_w_mode != UI_SZ_FIT && n.sz_h_mode != UI_SZ_FIT) { continue; }
+        accum_w = 0;
+        accum_h = 0;
+        gap_count = 0;
+        ci = n.first_child;
+        while (ci >= 0) {
+            c = _ui2_nodes + ci * sizeof(UiNode);
+            if (n.direction == UI_LAYOUT_ROW) {
+                accum_w = accum_w + c.w;
+                if (c.h > accum_h) { accum_h = c.h; }
+            } else {
+                accum_h = accum_h + c.h;
+                if (c.w > accum_w) { accum_w = c.w; }
+            }
+            gap_count = gap_count + 1;
+            ci = c.next_sibling;
+        }
+        if (gap_count > 1) {
+            if (n.direction == UI_LAYOUT_ROW) { accum_w = accum_w + n.gap * (gap_count - 1); }
+            else                              { accum_h = accum_h + n.gap * (gap_count - 1); }
+        }
+        if (n.sz_w_mode == UI_SZ_FIT) { n.w = accum_w + n.pad * 2; }
+        if (n.sz_h_mode == UI_SZ_FIT) { n.h = accum_h + n.pad * 2; }
+    }
+}
+
+// Pass 3: distribute parent's remaining space to GROW children
+// along the layout direction. Cross-axis GROW children fill
+// parent's inner cross size. Walks top-down so parent dimensions
+// are stable before children touch them.
+static void _ui2_pass_grow() {
+    auto i, n: UiNode, c: UiNode, ci, grow_count, fixed_sum, gap_count;
+    auto remaining, per_grow;
+    for (i = 0; i < _ui2_node_count; i++) {
+        n = _ui2_nodes + i * sizeof(UiNode);
+        ci = n.first_child;
+        if (ci < 0) { continue; }
+        grow_count = 0;
+        fixed_sum  = 0;
+        gap_count  = 0;
+        while (ci >= 0) {
+            c = _ui2_nodes + ci * sizeof(UiNode);
+            if (n.direction == UI_LAYOUT_ROW) {
+                if (c.sz_w_mode == UI_SZ_GROW) { grow_count = grow_count + 1; }
+                else                            { fixed_sum  = fixed_sum + c.w; }
+            } else {
+                if (c.sz_h_mode == UI_SZ_GROW) { grow_count = grow_count + 1; }
+                else                            { fixed_sum  = fixed_sum + c.h; }
+            }
+            gap_count = gap_count + 1;
+            ci = c.next_sibling;
+        }
+        if (grow_count > 0) {
+            if (n.direction == UI_LAYOUT_ROW) {
+                remaining = n.w - n.pad * 2 - fixed_sum
+                          - n.gap * (gap_count - 1);
+            } else {
+                remaining = n.h - n.pad * 2 - fixed_sum
+                          - n.gap * (gap_count - 1);
+            }
+            if (remaining < 0) { remaining = 0; }
+            per_grow = remaining / grow_count;
+            ci = n.first_child;
+            while (ci >= 0) {
+                c = _ui2_nodes + ci * sizeof(UiNode);
+                if (n.direction == UI_LAYOUT_ROW) {
+                    if (c.sz_w_mode == UI_SZ_GROW) { c.w = per_grow; }
+                } else {
+                    if (c.sz_h_mode == UI_SZ_GROW) { c.h = per_grow; }
+                }
+                ci = c.next_sibling;
+            }
+        }
+        // Cross-axis GROW: each child whose cross axis is GROW
+        // fills the parent's inner cross size.
+        ci = n.first_child;
+        while (ci >= 0) {
+            c = _ui2_nodes + ci * sizeof(UiNode);
+            if (n.direction == UI_LAYOUT_ROW) {
+                if (c.sz_h_mode == UI_SZ_GROW) { c.h = n.h - n.pad * 2; }
+            } else {
+                if (c.sz_w_mode == UI_SZ_GROW) { c.w = n.w - n.pad * 2; }
+            }
+            ci = c.next_sibling;
+        }
+    }
+}
+
+// Pass 4: compute child positions from parent origin + direction.
+// Alignment within the parent's cross axis applied per child.
+// Walks top-down so each parent's (x, y) is final before children
+// reference it.
+static void _ui2_pass_position() {
+    auto i, n: UiNode, c: UiNode, ci, cursor, inner_cross, child_cross_off;
+    for (i = 0; i < _ui2_node_count; i++) {
+        n = _ui2_nodes + i * sizeof(UiNode);
+        ci = n.first_child;
+        if (n.direction == UI_LAYOUT_ROW) { cursor = n.x + n.pad; }
+        else                               { cursor = n.y + n.pad; }
+        while (ci >= 0) {
+            c = _ui2_nodes + ci * sizeof(UiNode);
+            if (n.direction == UI_LAYOUT_ROW) {
+                c.x = cursor;
+                inner_cross = n.h - n.pad * 2;
+                if      (n.align_y == UI_ALIGN_CENTER) {
+                    child_cross_off = (inner_cross - c.h) / 2;
+                } else if (n.align_y == UI_ALIGN_END) {
+                    child_cross_off = inner_cross - c.h;
+                } else {
+                    child_cross_off = 0;
+                }
+                c.y = n.y + n.pad + child_cross_off;
+                cursor = cursor + c.w + n.gap;
+            } else {
+                c.y = cursor;
+                inner_cross = n.w - n.pad * 2;
+                if      (n.align_x == UI_ALIGN_CENTER) {
+                    child_cross_off = (inner_cross - c.w) / 2;
+                } else if (n.align_x == UI_ALIGN_END) {
+                    child_cross_off = inner_cross - c.w;
+                } else {
+                    child_cross_off = 0;
+                }
+                c.x = n.x + n.pad + child_cross_off;
+                cursor = cursor + c.h + n.gap;
+            }
+            ci = c.next_sibling;
+        }
+    }
+}
+
+// Run all layout passes. Call AFTER all begin/end pairs for the
+// frame, BEFORE ui_render.
+void ui_layout_end() {
+    if (_ui2_stack_top != 0 - 1) {
+        put_err("stbui: ui_layout_end called with non-empty layout stack — missing ui_end?\n");
+        _ui2_stack_top = 0 - 1;
+    }
+    if (_ui2_node_count == 0) { return; }
+    _ui2_pass_fixed_percent();
+    _ui2_pass_fit();
+    _ui2_pass_grow();
+    _ui2_pass_position();
+}
+
+// Walk the tree, dispatch each node's render commands via stbdraw.
+// Also runs hit-testing for BUTTON nodes — the click result is
+// stashed in `_ui2_curr_clicks` keyed by the button's sequence
+// index so next frame's `ui_button` call sees it.
+void ui_render() {
+    auto i, n: UiNode, mx, my, mb, mb_press, seq;
+    mx = mouse_x();
+    my = mouse_y();
+    mb = mouse_down(MOUSE_LEFT);
+    mb_press = mb != 0 && _ui2_mouse_prev_down == 0;
+    _ui2_mouse_prev_down = mb;
+    seq = 0;
+
+    for (i = 0; i < _ui2_node_count; i++) {
+        n = _ui2_nodes + i * sizeof(UiNode);
+        auto hovered;
+        hovered = (mx >= n.x && mx < n.x + n.w
+                && my >= n.y && my < n.y + n.h) ? 1 : 0;
+        n.hovered = hovered;
+
+        if (n.kind == UI_KIND_BOX) {
+            if (n.bg_color != 0) {
+                draw_rect(n.x, n.y, n.w, n.h, n.bg_color);
+            }
+        } else if (n.kind == UI_KIND_TEXT) {
+            draw_text(n.text, n.x, n.y + 4, 8, n.color);
+        } else if (n.kind == UI_KIND_BUTTON) {
+            auto bg;
+            bg = n.bg_color;
+            if (hovered != 0) { bg = rgba(85, 110, 150, 255); }
+            draw_rect(n.x, n.y, n.w, n.h, bg);
+            draw_text(n.text, n.x + n.pad, n.y + n.pad + 4, 8, n.color);
+            if (hovered != 0 && mb_press != 0) {
+                *(_ui2_curr_clicks + seq * 8) = 1;
+            }
+            seq = seq + 1;
+        } else if (n.kind == UI_KIND_IMAGE) {
+            if (n.image != 0) {
+                image_draw_size(n.image, n.frame, n.x, n.y, n.w, n.h);
+            }
+        }
+        // UI_KIND_SPACER renders nothing.
+    }
 }

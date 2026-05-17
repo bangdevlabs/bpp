@@ -1,0 +1,246 @@
+// test_stbui_layout.bpp — Regression net for stbui's declarative
+// layout passes (FIT / GROW / FIXED / PERCENT, row + column,
+// padding + gap + alignment).
+//
+// Headless — no window, no GPU. Builds a node tree per test,
+// runs ui_layout_end (which is the four-pass solver), then peeks
+// the computed (x, y, w, h) off `_ui2_nodes` via the internal
+// node sizeof + offset math. Each test prints PASS or FAIL with
+// the expected vs actual numbers; main returns 1 on any FAIL so
+// the suite runner picks it up.
+//
+// Why this lives in tests/ (not examples/): pure regression net.
+// First-line defence for anyone refactoring `_ui2_pass_fit` or
+// `_ui2_pass_grow` — sizing math is the kind of code where an
+// off-by-one slips through visual tests because the eye reads
+// "close enough" but the math is wrong by a pixel that compounds
+// across nested rows.
+
+import "stbgame.bsm";
+import "stbui.bsm";
+
+// Read a computed dimension off the node at `idx`. The struct
+// layout is locked by stbui's `struct UiNode { ... x, y, w, h ... }`
+// — field order matters here because we reach in via offsets.
+// Match against `sizeof(UiNode)` so tests do not bake the byte
+// count into themselves.
+extrn _ui2_nodes;
+
+// Local mirror of UiNode just so we can name fields when reading
+// back. Stays in lockstep with stbui's declaration; if a future
+// refactor adds fields ABOVE x/y/w/h the test will need its
+// fields reordered too.
+struct UiNodeRead {
+    parent, first_child, last_child, next_sibling,
+    direction,
+    sz_w_mode, sz_w_val,
+    sz_h_mode, sz_h_val,
+    pad, gap,
+    align_x, align_y,
+    x, y, w, h,
+    kind,
+    text: ptr,
+    color, bg_color,
+    image, frame,
+    hovered, clicked
+}
+
+static node_at(idx) {
+    return _ui2_nodes + idx * sizeof(UiNodeRead);
+}
+
+static auto _fail_count;
+
+static void assert_eq(label: ptr, got, want) {
+    if (got == want) {
+        putstr("  PASS ");
+        putstr(label);
+        putline();
+        return;
+    }
+    putstr("  FAIL ");
+    putstr(label);
+    putstr(" expected=");
+    putnum(want);
+    putstr(" got=");
+    putnum(got);
+    putline();
+    _fail_count = _fail_count + 1;
+}
+
+// ── Test 1: single FIXED root ──────────────────────────────────
+static void test_fixed_root() {
+    putmsg("test: fixed root");
+    auto root: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(400), ui_sz_fixed(300), 0, 0);
+    ui_end();
+    ui_layout_end();
+    root = node_at(0);
+    assert_eq("root.w = 400", root.w, 400);
+    assert_eq("root.h = 300", root.h, 300);
+    assert_eq("root.x = 0",   root.x, 0);
+    assert_eq("root.y = 0",   root.y, 0);
+}
+
+// ── Test 2: FIT row of two FIXED children + gap ────────────────
+static void test_fit_row_with_gap() {
+    putmsg("test: fit row + gap");
+    auto root: UiNodeRead, c0: UiNodeRead, c1: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fit(), ui_sz_fit(), 10, 0);
+        ui_box(UI_LAYOUT_ROW, ui_sz_fixed(100), ui_sz_fixed(50), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_ROW, ui_sz_fixed(150), ui_sz_fixed(30), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    root = node_at(0);
+    c0   = node_at(1);
+    c1   = node_at(2);
+    assert_eq("root.w = 260 (100 + 10 + 150)", root.w, 260);
+    assert_eq("root.h = 50 (max child h)",     root.h, 50);
+    assert_eq("c0.x = 0",                       c0.x, 0);
+    assert_eq("c1.x = 110 (100 + gap 10)",      c1.x, 110);
+}
+
+// ── Test 3: GROW split — two grow siblings share remainder ─────
+static void test_grow_split() {
+    putmsg("test: grow split");
+    auto root: UiNodeRead, c0: UiNodeRead, c1: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(600), ui_sz_fixed(100), 0, 0);
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(100), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(100), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    root = node_at(0);
+    c0   = node_at(1);
+    c1   = node_at(2);
+    assert_eq("c0.w = 300 (600/2)",      c0.w, 300);
+    assert_eq("c1.w = 300 (600/2)",      c1.w, 300);
+    assert_eq("c1.x = 300 (after c0)",   c1.x, 300);
+}
+
+// ── Test 4: FIXED + GROW siblings ──────────────────────────────
+static void test_fixed_plus_grow() {
+    putmsg("test: fixed + grow row");
+    auto c0: UiNodeRead, c1: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(500), ui_sz_fixed(50), 0, 0);
+        ui_box(UI_LAYOUT_ROW, ui_sz_fixed(120), ui_sz_fixed(50), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(50), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    c0 = node_at(1);
+    c1 = node_at(2);
+    assert_eq("c0.w = 120 (fixed)",        c0.w, 120);
+    assert_eq("c1.w = 380 (500 - 120)",    c1.w, 380);
+}
+
+// ── Test 5: padding eats into inner space ──────────────────────
+static void test_padding_inner() {
+    putmsg("test: padding shrinks inner");
+    auto root: UiNodeRead, c0: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(200), ui_sz_fixed(100), 0, 20);
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_grow(), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    root = node_at(0);
+    c0   = node_at(1);
+    assert_eq("c0.x = 20 (pad)",       c0.x, 20);
+    assert_eq("c0.y = 20 (pad)",       c0.y, 20);
+    assert_eq("c0.w = 160 (200 - 40)", c0.w, 160);
+    assert_eq("c0.h = 60  (100 - 40)", c0.h, 60);
+}
+
+// ── Test 6: COL direction stacks children vertically ───────────
+static void test_col_direction() {
+    putmsg("test: col stacks vertically");
+    auto c0: UiNodeRead, c1: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_COL, ui_sz_fixed(100), ui_sz_fixed(300), 5, 0);
+        ui_box(UI_LAYOUT_ROW, ui_sz_fixed(100), ui_sz_fixed(40), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_ROW, ui_sz_fixed(100), ui_sz_fixed(60), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    c0 = node_at(1);
+    c1 = node_at(2);
+    assert_eq("c0.y = 0",                c0.y, 0);
+    assert_eq("c1.y = 45 (40 + gap 5)",  c1.y, 45);
+    assert_eq("c0.x = c1.x = 0",         c0.x, c1.x);
+}
+
+// ── Test 7: PERCENT resolves against parent ────────────────────
+static void test_percent_of_parent() {
+    putmsg("test: percent of parent");
+    auto c0: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(400), ui_sz_fixed(200), 0, 0);
+        ui_box(UI_LAYOUT_ROW, ui_sz_pct(25), ui_sz_pct(50), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    c0 = node_at(1);
+    assert_eq("c0.w = 100 (25% of 400)", c0.w, 100);
+    assert_eq("c0.h = 100 (50% of 200)", c0.h, 100);
+}
+
+// ── Test 8: nested rows — center column grows ──────────────────
+static void test_nested_three_columns() {
+    putmsg("test: three-column grow centre");
+    auto left: UiNodeRead, mid: UiNodeRead, right: UiNodeRead;
+    ui_layout_begin(800, 600);
+    ui_box(UI_LAYOUT_ROW, ui_sz_fixed(800), ui_sz_fixed(480), 0, 0);
+        ui_box(UI_LAYOUT_COL, ui_sz_fixed(140), ui_sz_grow(), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), 0, 0);
+        ui_end();
+        ui_box(UI_LAYOUT_COL, ui_sz_fixed(200), ui_sz_grow(), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    left  = node_at(1);
+    mid   = node_at(2);
+    right = node_at(3);
+    assert_eq("left.w = 140",            left.w, 140);
+    assert_eq("mid.w = 460 (800-140-200)", mid.w, 460);
+    assert_eq("right.w = 200",           right.w, 200);
+    assert_eq("left.x = 0",              left.x, 0);
+    assert_eq("mid.x = 140",             mid.x, 140);
+    assert_eq("right.x = 600",           right.x, 600);
+    assert_eq("all .h = 480",            left.h, 480);
+}
+
+main() {
+    init_str();
+    init_ui_layout();
+    _fail_count = 0;
+
+    test_fixed_root();
+    test_fit_row_with_gap();
+    test_grow_split();
+    test_fixed_plus_grow();
+    test_padding_inner();
+    test_col_direction();
+    test_percent_of_parent();
+    test_nested_three_columns();
+
+    if (_fail_count > 0) {
+        putstr("FAIL: ");
+        putnum(_fail_count);
+        putstr(" assertion(s) failed");
+        putline();
+        return 1;
+    }
+    putmsg("OK");
+    return 0;
+}

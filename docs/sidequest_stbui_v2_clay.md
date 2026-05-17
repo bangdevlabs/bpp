@@ -246,10 +246,9 @@ green throughout.
 
 | File | Action | Size |
 |---|---|---|
-| `stb/stbui_v2.bsm` | NEW — engine + widgets | ~600 LOC |
-| `stb/stbui_v2_types.bsm` | NEW — `UiBox`, `UiSize`, `UiRenderCmd` structs | ~60 LOC |
-| `examples/stbui_v2_smoke.bpp` | NEW — 3-panel demo, asserts layout math | ~80 LOC |
-| `tests/test_stbui_v2_layout.bpp` | NEW — unit tests for sizing passes (FIT/GROW/PERCENT combos) | ~150 LOC |
+| `stb/stbui.bsm` | EXTEND — declarative layout section appended to existing widgets | ~530 LOC added |
+| `examples/stbui_layout_smoke.bpp` | NEW — 3-panel visible demo | ~90 LOC |
+| `tests/test_stbui_layout.bpp` | NEW — unit tests for FIT/GROW/FIXED/PERCENT combos | ~210 LOC |
 | `tools/modulab/aseprite_view.bsm` | MODIFY (S2) — declare layout via v2 instead of computing rects | -50 LOC net |
 | `tools/modulab/modulab_lib.bsm` | MODIFY (S3) — same, replaces `_draw_status` + panel anchoring | -150 LOC net |
 | `docs/asset_formats.md` | minor: note v2 widgets in cross-references |
@@ -352,9 +351,16 @@ bash tests/run_all_c.sh
 
 ## Decisões fechadas
 
-1. **Naming.** `stbui_v2.bsm` parallel to `stbui.bsm`. Consumers
-   reference either explicitly; v1 stays until natural attrition
-   migrates last consumer.
+1. **Naming + file layout.** "v2" is INTERNAL CLASSIFICATION only —
+   used in this sidequest doc to talk about the work. The actual
+   code lives in `stb/stbui.bsm` next to the legacy `gui_*` /
+   `lay_*` helpers. New declarative primitives are namespaced
+   `ui_*` so there's no symbol collision; consumers `import
+   "stbui.bsm"` and reach for whichever family fits. Original
+   draft proposed a parallel `stbui_v2.bsm`; user rejected
+   (2026-05-17) — extra file confuses consumers + suggests a
+   fork that doesn't exist. Done correctly: ONE cartridge that
+   gradually picks up new API as old helpers are deprecated.
 
 2. **Migration order.** Aseprite viewer first (~3 panels, 2h).
    Modulab second (biggest payoff). Bang 9 / level_editor /
