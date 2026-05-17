@@ -981,66 +981,124 @@ modulab_lib_frame(px, py, pw, ph) {
         return quit;
     }
 
-    // Topbar first — buttons fire here, filename captures focus.
-    // Pass the panel origin so the bar lands inside our rect
-    // instead of over the host's own chrome (Bang 9 menubar, etc).
-    act = ui_topbar(px, py);
+    // ── Declarative layout shell ────────────────────────────
+    //
+    // The editor's panel scaffold is now declared via stbui's
+    // layout primitives instead of anchored to the canvas's
+    // zoom-dependent right / bottom edges. Side panels stay put
+    // when the user zooms the canvas in or out — the canvas
+    // viewport is the only thing whose inner pixel scale
+    // changes; the box that holds it owns a stable GROW slot.
+    //
+    // v1 widgets (ui_topbar, ui_tool_sidebar, palette / frame /
+    // phase4 / layer) still draw themselves the legacy way; we
+    // just declare WHERE each one lives and call it with the
+    // computed (x, y).
+    auto topbar_idx, tool_idx, canvas_idx, pal_idx, fs_idx;
+    auto phase4_idx, layer_idx;
+    auto canvas_bx, canvas_by;
+
+    ui_layout_begin(pw, ph);
+    ui_box(UI_LAYOUT_COL, ui_sz_fixed(pw), ui_sz_fixed(ph), 0, 0);
+        // Topbar — fixed 32 px row, spans width.
+        topbar_idx = ui_row_fixed_h(32, 0); ui_end();
+        // Status strip — leaves 20 px above the body for the
+        // grid / zoom / tool readout `_draw_status` emits.
+        ui_row_fixed_h(20, 0); ui_end();
+        // Body — row: tool sidebar | centre column | right column.
+        ui_row_grow(0);
+            tool_idx = ui_col_fixed_w(132, 0); ui_end();
+            ui_col_grow(0);
+                canvas_idx = ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), 0, 0);
+                ui_end();
+                pal_idx = ui_row_fixed_h(48, 0); ui_end();
+                fs_idx  = ui_row_fixed_h(70, 0); ui_end();
+            ui_end();
+            ui_col_fixed_w(240, 0);
+                phase4_idx = ui_row_fixed_h(220, 0); ui_end();
+                layer_idx  = ui_row_fixed_h(200, 0); ui_end();
+            ui_end();
+        ui_end();
+        // Footer help — 18 px tall, full width.
+        ui_row_fixed_h(18, 0); ui_end();
+    ui_end();
+    ui_layout_end();
+
+    // Topbar — buttons fire on click. Call into the declared
+    // box's origin so the topbar lands inside our rect (Bang 9
+    // embeds Modulab inside its own chrome, hence the offset).
+    act = ui_topbar(ui_node_x(topbar_idx), ui_node_y(topbar_idx));
     _handle_topbar(act);
 
+    // Status line — uses _ml_oy + 42 internally (sits in the
+    // status row we just declared). Existing _draw_status reads
+    // _ml_ox/_ml_oy/_ml_pw so it already lands correctly.
     _draw_status();
 
-    // Left sidebar of tools.
-    ui_tool_sidebar(px + 12, py + 64);
+    // Tool sidebar.
+    ui_tool_sidebar(ui_node_x(tool_idx) + 12, ui_node_y(tool_idx) + 4);
 
-    // Canvas in the middle.
+    // Canvas viewport — clamp zoom to the bbox's largest integer
+    // fit, then centre the canvas inside the bbox so a smaller
+    // canvas reads as "the work area" instead of being shoved to
+    // the top-left corner. Without the zoom cap a high zoom
+    // overflows the bbox and paints over the right sidebar
+    // (user-reported 2026-05-17 with zoom 41 on a 16-cell canvas).
+    auto cvs_bbox_x, cvs_bbox_y, cvs_bbox_w, cvs_bbox_h;
+    auto max_zoom_w, max_zoom_h, max_zoom, cpx, cpy;
+    cvs_bbox_x = ui_node_x(canvas_idx);
+    cvs_bbox_y = ui_node_y(canvas_idx);
+    cvs_bbox_w = ui_node_w(canvas_idx);
+    cvs_bbox_h = ui_node_h(canvas_idx);
+    if (g_canvas_n > 0 && cvs_bbox_w > 0 && cvs_bbox_h > 0) {
+        max_zoom_w = cvs_bbox_w / g_canvas_n;
+        max_zoom_h = cvs_bbox_h / g_canvas_n;
+        max_zoom   = max_zoom_w < max_zoom_h ? max_zoom_w : max_zoom_h;
+        if (max_zoom < 1) { max_zoom = 1; }
+        if (_cvs_zoom > max_zoom) { _cvs_zoom = max_zoom; }
+        if (_cvs_zoom < 1)        { _cvs_zoom = 1; }
+    }
+    // Centre the canvas inside the bbox. Pixel size of the canvas
+    // is g_canvas_n × zoom on each axis; leftover space splits
+    // evenly so the canvas reads as the focal point of the panel
+    // at any zoom level.
+    cpx = g_canvas_n * _cvs_zoom;
+    cpy = g_canvas_n * _cvs_zoom;
+    _cvs_x = cvs_bbox_x + (cvs_bbox_w - cpx) / 2;
+    _cvs_y = cvs_bbox_y + (cvs_bbox_h - cpy) / 2;
     canvas_draw(_cvs_x, _cvs_y, _cvs_zoom);
-
-    // Selection marching-ants overlay on top of the composite.
     if (select_active() != 0) {
         select_draw_overlay(_cvs_x, _cvs_y, _cvs_zoom);
     }
 
-    // Compute canvas-relative anchors. Everything below positions
-    // itself OFF the canvas's actual right and bottom edges instead
-    // of fixed (px,py) offsets, so the layout stays correct whether
-    // modulab is hosted standalone (small panel) or embedded in
-    // Bang 9 (larger panel). Earlier code hardcoded `px + 620`
-    // for the right sidebar X and `py + 500` for the frame-strip Y,
-    // which worked at the original ~20-cell canvas but invades the
-    // canvas area whenever cells * zoom grows past those constants.
-    auto _canvas_right, _canvas_bottom;
-    _canvas_right  = _cvs_x + g_canvas_n * _cvs_zoom;
-    _canvas_bottom = _cvs_y + g_canvas_n * _cvs_zoom;
-
-    // Palette row directly under the canvas (already canvas-relative).
-    palette_consumed = ui_palette_row(_cvs_x, _canvas_bottom + 12);
-
-    // Frame strip below the palette row.
-    frame_ret = ui_frame_strip(px + 12, _canvas_bottom + 60);
+    // Palette + frame strip — live in the same column as the
+    // canvas, just below it. No longer chase _canvas_bottom.
+    palette_consumed = ui_palette_row(ui_node_x(pal_idx) + 12,
+                                       ui_node_y(pal_idx));
+    frame_ret = ui_frame_strip(ui_node_x(fs_idx) + 12,
+                                ui_node_y(fs_idx));
     _handle_frame_strip(frame_ret);
 
-    // Right sidebar upper half: universe / dither / stencil.
-    // Anchored 20 px to the right of the canvas edge, aligned with
-    // canvas top.
-    uni_req = ui_phase4_sidebar(_canvas_right + 20, _cvs_y);
+    // Right column — phase4 sidebar on top, layer panel below.
+    uni_req = ui_phase4_sidebar(ui_node_x(phase4_idx),
+                                 ui_node_y(phase4_idx));
     _handle_universe_request(uni_req);
-
-    // Right sidebar lower half: layer panel. Same column as the
-    // phase4 sidebar, ~230 px below it (leaves room for universe /
-    // dither / alt / stencil / color rows above).
-    layer_ret = ui_layer_panel(_canvas_right + 20, _cvs_y + 230);
+    layer_ret = ui_layer_panel(ui_node_x(layer_idx),
+                                ui_node_y(layer_idx));
     _handle_layer_action(layer_ret);
 
-    // Any topbar / sidebar / palette / frame-strip / phase4-sidebar
-    // / layer-panel click this frame counts as "UI consumed the
-    // click" so the canvas handler doesn't also paint on the same
-    // edge. Tool sidebar is to the left of the canvas (x < _cvs_x);
-    // right-hand sidebar spans x >= _canvas_right + 10.
+    // Click-suppress for the canvas handler. Recompute the
+    // visible canvas bbox (zoom + size) every frame so a
+    // resized canvas doesn't accidentally let stray clicks
+    // through. Anything outside the canvas's viewport box is a
+    // UI click; anything inside, the canvas owns.
     mx = mouse_x();
+    auto cvs_right;
+    cvs_right = _cvs_x + g_canvas_n * _cvs_zoom;
     suppress = act != 0 || palette_consumed != 0
             || frame_ret != 0 || uni_req != 0
             || layer_ret != 0
-            || mx < _cvs_x || mx > _canvas_right + 10;
+            || mx < _cvs_x || mx > cvs_right;
 
     _handle_mouse(suppress);
 
