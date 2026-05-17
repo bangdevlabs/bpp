@@ -1129,39 +1129,79 @@ level_editor_lib_frame(px, py, pw, ph) {
         level_editor_lib_init("level1", 40, 22, 16);
     }
 
-    // Canvas origin recalculated every frame so the editor tracks
-    // the host's panel rect even if the host reflows on resize.
-    _lvl_cvs_x = px + 40;
-    _lvl_cvs_y = py + 48;
+    // Declarative shell layout (stbui v2). The editor used to
+    // hardcode `_lvl_cvs_x = px + 40`, `picker_x = px + 700`, and
+    // a help-bar y of `py + ph - 20`. That left the picker column
+    // at a fixed offset no matter the panel width, broke whenever
+    // a host carved out a non-default rectangle, and forced every
+    // future tweak to re-derive the chrome math. The new shell
+    // declares the same structure as a tree:
+    //
+    //   COL panel
+    //     ├─ ROW topbar  — fixed 28 px tall, spans width
+    //     ├─ ROW body    — grow vertically; row split:
+    //     │     ├─ COL canvas — grow horizontally
+    //     │     └─ COL picker — fixed 140 px wide
+    //     └─ ROW helpbar — fixed 24 px tall, spans width
+    //
+    // Bboxes for each named region are read back via ui_node_*.
+    // ui_layout_begin runs at panel origin (0, 0), so we add the
+    // (px, py) panel offset to every bbox read — the editor is
+    // embedded under Bang 9's Levels tab (bang9/panels.bsm:509)
+    // with non-zero (x, y), and the standalone launcher passes
+    // (0, 0) so the offset is a no-op there.
+    auto topbar_idx, body_idx, canvas_idx, picker_idx, helpbar_idx;
+    auto tb_x, tb_y, tb_w;
+    auto cvs_bbox_x, cvs_bbox_y, cvs_bbox_w, cvs_bbox_h;
+    auto pkr_x, pkr_y, pkr_h;
+    auto hb_x, hb_y;
+    ui_layout_begin(pw, ph);
+    ui_box(UI_LAYOUT_COL, ui_sz_fixed(pw), ui_sz_fixed(ph), 0, 0);
+        topbar_idx = ui_row_fixed_h(28, 0); ui_end();
+        body_idx = ui_row_grow(0);
+            canvas_idx = ui_col_grow(0); ui_end();
+            picker_idx = ui_col_fixed_w(140, 0); ui_end();
+        ui_end();
+        helpbar_idx = ui_row_fixed_h(24, 0); ui_end();
+    ui_end();
+    ui_layout_end();
 
-    // Auto-scale the cell size to fill the panel. Without this, a
-    // 20×11 level (pathfind) inside Bang 9's full-width Levels
-    // panel would render as a tiny 320×176 area with 700 px of
-    // wasted space on the right. We derive a cell size that
-    // maximizes the canvas within the available space while
-    // keeping cells square and on integer pixel boundaries.
-    //
-    // Reserved chrome:
-    //   left edge  — canvas origin is px + 40
-    //   right edge — palette column eats ~80 px
-    //   top        — topbar + padding ≈ 48 px (canvas origin)
-    //   bottom     — help bar ≈ 40 px + some breathing room
-    //
-    // We never shrink below 8 px (readable floor) and never grow
-    // past 48 px (past that, zoom becomes comical). Clamping at
-    // both ends also prevents divide-by-zero weirdness if the
-    // panel is freakishly small.
-    auto avail_w, avail_h, cell_w_fit, cell_h_fit, new_cell;
-    avail_w = pw - 40 - 80;   // left margin + palette column
-    avail_h = ph - 48 - 48;   // topbar + help bar
-    if (avail_w < 64) { avail_w = 64; }
-    if (avail_h < 64) { avail_h = 64; }
-    cell_w_fit = avail_w / _lvl_w;
-    cell_h_fit = avail_h / _lvl_h;
+    tb_x       = px + ui_node_x(topbar_idx);
+    tb_y       = py + ui_node_y(topbar_idx);
+    tb_w       = ui_node_w(topbar_idx);
+    cvs_bbox_x = px + ui_node_x(canvas_idx);
+    cvs_bbox_y = py + ui_node_y(canvas_idx);
+    cvs_bbox_w = ui_node_w(canvas_idx);
+    cvs_bbox_h = ui_node_h(canvas_idx);
+    pkr_x      = px + ui_node_x(picker_idx) + 4;   // 4 px left pad
+    pkr_y      = py + ui_node_y(picker_idx) + 16;  // 16 px top pad (room for "Kinds" label)
+    pkr_h      = ui_node_h(picker_idx) - 16;
+    hb_x       = px + ui_node_x(helpbar_idx);
+    hb_y       = py + ui_node_y(helpbar_idx);
+
+    // Auto-fit cell size from the canvas bbox. The bbox already
+    // accounts for topbar / picker / helpbar reservations because
+    // the layout engine subtracts them — no more "ph - 48 - 48"
+    // magic numbers chasing chrome heights. We still clamp to
+    // [8, 48] so cells stay readable and never go comically large
+    // on huge panels.
+    auto cell_w_fit, cell_h_fit, new_cell;
+    cell_w_fit = cvs_bbox_w / _lvl_w;
+    cell_h_fit = cvs_bbox_h / _lvl_h;
     new_cell   = cell_w_fit < cell_h_fit ? cell_w_fit : cell_h_fit;
     if (new_cell < 8)  { new_cell = 8;  }
     if (new_cell > 48) { new_cell = 48; }
     _lvl_cell = new_cell;
+
+    // Centre the grid inside the canvas bbox. Without this a small
+    // level (20×11 pathfind) in a wide panel slides to the top-left
+    // corner instead of reading as the focal point — same fix
+    // Modulab's canvas got during S3 of the stbui v2 arc.
+    auto grid_pw, grid_ph;
+    grid_pw    = _lvl_w * _lvl_cell;
+    grid_ph    = _lvl_h * _lvl_cell;
+    _lvl_cvs_x = cvs_bbox_x + (cvs_bbox_w - grid_pw) / 2;
+    _lvl_cvs_y = cvs_bbox_y + (cvs_bbox_h - grid_ph) / 2;
 
     quit = 0;
     if (key_pressed(KEY_ESC)) { quit = 1; }
@@ -1209,30 +1249,31 @@ level_editor_lib_frame(px, py, pw, ph) {
     // is ~112 px — hardcoded widths around 56-64 silently clipped
     // the labels to "Obje"/"Tile"/"Sav"/"Ope" in earlier sessions.
     auto title_x, mode_x, save_x, open_x, name_x, dirty_x;
-    auto btn_h, name_w, pad;
+    auto btn_h, btn_y, name_w, pad;
     auto tiles_w, obj_w, save_w, open_w;
     pad     = 16;
     btn_h   = 22;
-    title_x = px + 12;
+    btn_y   = tb_y + 3;                            // 22 in a 28-tall row → 3 px top margin
+    title_x = tb_x + 12;
     tiles_w = measure_text("Tiles",   UI_FONT_SZ) + pad;
     obj_w   = measure_text("Objects", UI_FONT_SZ) + pad;
     save_w  = measure_text("Save",    UI_FONT_SZ) + pad;
     open_w  = measure_text("Open",    UI_FONT_SZ) + pad;
-    mode_x  = px + 140;                            // after the title text
+    mode_x  = tb_x + 140;                          // after the title text
     save_x  = mode_x + tiles_w + 2 + obj_w + 12;   // gap after mode toggle
     open_x  = save_x + save_w + 4;
     name_x  = open_x + open_w + 8;
-    name_w  = pw - (name_x - px) - 80;             // flex; reserve dirty mark
+    name_w  = tb_w - (name_x - tb_x) - 80;         // flex; reserve dirty mark
     if (name_w < 80) { name_w = 80; }
     dirty_x = name_x + name_w + 6;
 
-    draw_text("Level Editor 0.2", title_x, py + 8, 8,
+    draw_text("Level Editor 0.2", title_x, btn_y + 5, 8,
               rgba(97, 218, 251, 255));
 
-    if (gui_button(mode_x, py + 6, tiles_w, btn_h, "Tiles")) {
+    if (gui_button(mode_x, btn_y, tiles_w, btn_h, "Tiles")) {
         _le_mode = _LE_MODE_TILES;
     }
-    if (gui_button(mode_x + tiles_w + 2, py + 6, obj_w, btn_h, "Objects")) {
+    if (gui_button(mode_x + tiles_w + 2, btn_y, obj_w, btn_h, "Objects")) {
         _le_mode = _LE_MODE_OBJECTS;
     }
     // Active-mode accent — 2-px bar under whichever button is on,
@@ -1245,10 +1286,10 @@ level_editor_lib_frame(px, py, pw, ph) {
         acc_x = mode_x + tiles_w + 2;
         acc_w = obj_w;
     }
-    draw_rect(acc_x, py + 6 + btn_h, acc_w, 2,
+    draw_rect(acc_x, btn_y + btn_h, acc_w, 2,
               rgba(97, 218, 251, 255));
 
-    if (gui_button(save_x, py + 6, save_w, btn_h, "Save")) {
+    if (gui_button(save_x, btn_y, save_w, btn_h, "Save")) {
         path_sb = strbuf_new();
         path_sb = strbuf_cat(path_sb, _lvl_dir_buf);
         path_sb = strbuf_cat(path_sb, _lvl_name_buf);
@@ -1257,7 +1298,7 @@ level_editor_lib_frame(px, py, pw, ph) {
         path_sb = strbuf_free(path_sb);
         _lvl_dirty = 0;
     }
-    if (gui_button(open_x, py + 6, open_w, btn_h, "Open")) {
+    if (gui_button(open_x, btn_y, open_w, btn_h, "Open")) {
         auto picked;
         picked = window_open_dialog("Open level");
         if (picked != 0) {
@@ -1268,9 +1309,9 @@ level_editor_lib_frame(px, py, pw, ph) {
             free(picked);
         }
     }
-    gui_text_input(_lvl_name_ti, name_x, py + 6, name_w, btn_h);
+    gui_text_input(_lvl_name_ti, name_x, btn_y, name_w, btn_h);
     if (_lvl_dirty != 0) {
-        draw_text("*unsaved", dirty_x, py + 12, 8,
+        draw_text("*unsaved", dirty_x, btn_y + 6, 8,
                   rgba(255, 180, 80, 255));
     }
 
@@ -1281,10 +1322,12 @@ level_editor_lib_frame(px, py, pw, ph) {
     _render_entities();
 
     // Right side panel — palette picker in Tiles mode, kind picker
-    // in Objects mode. Same x position so the layout doesn't jump.
-    auto picker_x;
-    picker_x = px + 700;
-    clicked  = -1;
+    // in Objects mode. Position + height come from the declared
+    // picker column (pkr_x / pkr_y / pkr_h); the column is fixed
+    // at 140 px wide and grows vertically inside the body row, so
+    // resizing the host panel keeps the picker aligned without
+    // needing a hardcoded x-offset.
+    clicked = -1;
     auto picked_kind;
     picked_kind = -1;
     if (_le_mode == _LE_MODE_TILES) {
@@ -1303,8 +1346,10 @@ level_editor_lib_frame(px, py, pw, ph) {
             pick_cell = 28;
             btn_w     = pick_cols * (pick_cell + 2);
             arrow_h   = 20;
-            // Reserve top + bottom rows for the scroll buttons.
-            pick_h    = _lvl_h * _lvl_cell - 2 * arrow_h - 8;
+            // Reserve top + bottom rows for the scroll buttons +
+            // a small bottom margin for the tool / tile-id labels.
+            pick_h    = pkr_h - 2 * arrow_h - 32;
+            if (pick_h < pick_cell + 2) { pick_h = pick_cell + 2; }
             max_rows  = pick_h / (pick_cell + 2);
             if (max_rows < 1) { max_rows = 1; }
             total_rows = (_lvl_tileset_count + pick_cols - 1) / pick_cols;
@@ -1312,18 +1357,18 @@ level_editor_lib_frame(px, py, pw, ph) {
             my = mouse_y();
 
             // Scroll-up button at the top of the picker column.
-            if (gui_button(picker_x, _lvl_cvs_y, btn_w, arrow_h, "^")) {
+            if (gui_button(pkr_x, pkr_y, btn_w, arrow_h, "^")) {
                 _lvl_pick_scroll -= 4;
                 if (_lvl_pick_scroll < 0) { _lvl_pick_scroll = 0; }
             }
             // Tile grid lives below the up-arrow.
             auto grid_y;
-            grid_y = _lvl_cvs_y + arrow_h + 4;
+            grid_y = pkr_y + arrow_h + 4;
             for (row = 0; row < max_rows; row++) {
                 for (col = 0; col < pick_cols; col++) {
                     tile_id = (row + _lvl_pick_scroll) * pick_cols + col + 1;
                     if (tile_id > _lvl_tileset_count) { continue; }
-                    tx = picker_x + col * (pick_cell + 2);
+                    tx = pkr_x + col * (pick_cell + 2);
                     ty = grid_y + row * (pick_cell + 2);
                     draw_rect(tx, ty, pick_cell, pick_cell,
                               rgba(20, 22, 28, 255));
@@ -1349,7 +1394,7 @@ level_editor_lib_frame(px, py, pw, ph) {
             // Scroll-down button below the grid.
             auto down_y;
             down_y = grid_y + max_rows * (pick_cell + 2) + 2;
-            if (gui_button(picker_x, down_y, btn_w, arrow_h, "v")) {
+            if (gui_button(pkr_x, down_y, btn_w, arrow_h, "v")) {
                 _lvl_pick_scroll += 4;
                 if (_lvl_pick_scroll > total_rows - max_rows
                     && total_rows > max_rows) {
@@ -1363,7 +1408,7 @@ level_editor_lib_frame(px, py, pw, ph) {
             if      (_lvl_tool == 0) { tool_name = "PAINT"; }
             else if (_lvl_tool == 1) { tool_name = "ERASE"; }
             else                     { tool_name = "FILL"; }
-            draw_text(tool_name, picker_x, down_y + arrow_h + 4, 8, WHITE);
+            draw_text(tool_name, pkr_x, down_y + arrow_h + 4, 8, WHITE);
             // Build the "tile N" label via strbuf so we don't need
             // a fixed-buffer str_cat sequence (and it picks up the
             // canonical builder API rather than rolling its own).
@@ -1371,17 +1416,17 @@ level_editor_lib_frame(px, py, pw, ph) {
             id_sb = strbuf_new();
             id_sb = strbuf_cat(id_sb, "tile ");
             id_sb = strbuf_num(id_sb, _lvl_sel);
-            draw_text(id_sb, picker_x, down_y + arrow_h + 16, 8, WHITE);
+            draw_text(id_sb, pkr_x, down_y + arrow_h + 16, 8, WHITE);
             strbuf_free(id_sb);
         } else {
-            clicked = gui_palette(picker_x, _lvl_cvs_y,
+            clicked = gui_palette(pkr_x, pkr_y,
                                   _lvl_palette, 8, 1, 24, _lvl_sel);
             if (clicked >= 1) { _lvl_sel = clicked; }
             auto tool_name;
             if      (_lvl_tool == 0) { tool_name = "PAINT"; }
             else if (_lvl_tool == 1) { tool_name = "ERASE"; }
             else                     { tool_name = "FILL"; }
-            draw_text(tool_name, picker_x, _lvl_cvs_y + 8 * 24 + 8, 8, WHITE);
+            draw_text(tool_name, pkr_x, pkr_y + 8 * 24 + 8, 8, WHITE);
         }
     } else {
         // Objects mode — vertical kind picker. Each kind is a
@@ -1389,22 +1434,22 @@ level_editor_lib_frame(px, py, pw, ph) {
         auto ki, by, label, btn_h, btn_w, sel_color;
         btn_h = 24;
         btn_w = 80;
-        draw_text("Kinds", picker_x, _lvl_cvs_y - 14, 8, WHITE);
+        draw_text("Kinds", pkr_x, pkr_y - 14, 8, WHITE);
         for (ki = 0; ki < _lvl_kind_count; ki++) {
             label = *(_lvl_kinds + ki * 8);
-            by    = _lvl_cvs_y + ki * (btn_h + 4);
+            by    = pkr_y + ki * (btn_h + 4);
             // Color swatch left of the label so the user knows
             // which kind a marker on the canvas corresponds to.
             sel_color = _entity_color_for(label);
-            draw_rect(picker_x, by, 12, btn_h, sel_color);
-            if (gui_button(picker_x + 16, by, btn_w - 16, btn_h, label)) {
+            draw_rect(pkr_x, by, 12, btn_h, sel_color);
+            if (gui_button(pkr_x + 16, by, btn_w - 16, btn_h, label)) {
                 _lvl_kind_sel = ki;
                 picked_kind   = ki;
             }
             if (ki == _lvl_kind_sel) {
                 // Accent border around selected (top + bottom strips).
-                draw_rect(picker_x, by - 1,            btn_w, 1, rgba(97, 218, 251, 255));
-                draw_rect(picker_x, by + btn_h,        btn_w, 1, rgba(97, 218, 251, 255));
+                draw_rect(pkr_x, by - 1,            btn_w, 1, rgba(97, 218, 251, 255));
+                draw_rect(pkr_x, by + btn_h,        btn_w, 1, rgba(97, 218, 251, 255));
             }
         }
     }
@@ -1417,7 +1462,7 @@ level_editor_lib_frame(px, py, pw, ph) {
 
     // Only act when the cursor is inside the canvas band (left of
     // the picker column) and the picker didn't consume the click.
-    if (mx < picker_x && clicked < 0 && picked_kind < 0) {
+    if (mx < pkr_x && clicked < 0 && picked_kind < 0) {
         cell = _le_cursor_cell();
         if (cell >= 0) {
             auto cx, cy, press;
@@ -1464,7 +1509,7 @@ level_editor_lib_frame(px, py, pw, ph) {
     } else {
         help = "LMB:place RMB:remove  click a kind on the right to select  TAB:Tiles mode  S:save";
     }
-    draw_text(help, px + 12, py + ph - 20, 8, rgba(120, 130, 150, 255));
+    draw_text(help, hb_x + 12, hb_y + 8, 8, rgba(120, 130, 150, 255));
 
     return quit;
 }
