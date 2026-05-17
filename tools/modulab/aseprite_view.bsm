@@ -42,9 +42,19 @@ const MLAB_ASEPRITE_MAX_FRAMES = 256;
 const MLAB_ASEPRITE_MAX_TAGS   = 64;
 
 // ── Module-private state ────────────────────────────────────────
-// Marks whether a sheet is loaded. modulab_lib_frame consults this
-// to decide between the editor view and the Aseprite viewer.
+// Marks whether a sheet is loaded in memory. Separate from the
+// `_aseprite_view_visible` flag below so the user can swap to the
+// Modulab editor briefly (via Tab) without losing the parsed
+// state. The viewer's "Close" button only flips the visibility
+// flag; the in-memory state survives until a new file is loaded
+// or the app exits.
 static extrn _aseprite_active;
+// Whether the viewer panel renders this frame. Toggled by Tab in
+// the editor and the viewer's Close button. When `_aseprite_active`
+// is on but `_aseprite_view_visible` is off, the Modulab editor
+// takes over the panel and a footer hint reminds the user that
+// Tab brings the sheet back.
+static extrn _aseprite_view_visible;
 
 // Source JSON path (heap-owned). Kept so the hot-reload tick can
 // re-parse when the file or its sibling PNG changes.
@@ -117,10 +127,31 @@ static extrn _edit_scale;
 
 // ── Accessors ───────────────────────────────────────────────────
 
-// True when a sheet is currently loaded. modulab_lib_frame calls
-// this once per frame to choose between the editor and the viewer.
+// True when a sheet is currently loaded. modulab_lib_frame uses
+// this for the dirty-discard guards on File→Open + for keying off
+// Tab cycle behaviour, but it does NOT directly decide whether
+// the viewer renders this frame — see `mlab_aseprite_view_visible`
+// for the render gate.
 mlab_aseprite_active() {
     return _aseprite_active;
+}
+
+// True when the viewer should render this frame (sheet loaded
+// AND user has not toggled visibility off). The lib uses this to
+// pick viewer vs editor each frame.
+mlab_aseprite_view_visible() {
+    if (_aseprite_active == 0) { return 0; }
+    return _aseprite_view_visible;
+}
+
+// Show / hide the viewer panel without touching the loaded sheet
+// state. Idempotent. Tab in the editor calls this to bring the
+// viewer back after the user toggled it off.
+void mlab_aseprite_view_show() {
+    _aseprite_view_visible = 1;
+}
+void mlab_aseprite_view_hide() {
+    _aseprite_view_visible = 0;
 }
 
 // Path of the JSON currently displayed (or 0 when no sheet is
@@ -261,6 +292,7 @@ mlab_close_aseprite_sheet() {
     _aseprite_mb_prev             = 0;
     _edit_mb_left_prev            = 0;
     _edit_mb_right_prev           = 0;
+    _aseprite_view_visible        = 0;
     _aseprite_active              = 0;
 }
 
@@ -436,6 +468,7 @@ mlab_load_aseprite_sheet(path) {
     _aseprite_mb_prev             = 0;
     _edit_mb_left_prev            = 0;
     _edit_mb_right_prev           = 0;
+    _aseprite_view_visible        = 1;
     _aseprite_active              = 1;
 
     // Register a hot-reload callback so external Aseprite saves
@@ -783,12 +816,15 @@ aseprite_view_render(px, py, pw, ph) {
     if (play_hit != 0) {
         _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
     }
-    close_hit = gui_button(px + pw - 120, py + 4, 110, 22, "Close");
+    // "Hide (Tab)" instead of "Close" — the button only flips the
+    // visibility flag, the in-memory sheet state survives. Tab in
+    // the editor toggles it back on. The actual discard happens
+    // automatically when the user opens a different file (with the
+    // dirty-discard prompt) or on app exit.
+    close_hit = gui_button(px + pw - 120, py + 4, 110, 22, "Hide (Tab)");
     if (close_hit != 0) {
-        if (_aseprite_confirm_discard("Close sheet") != 0) {
-            mlab_close_aseprite_sheet();
-            return 1;
-        }
+        mlab_aseprite_view_hide();
+        return 0;
     }
 
     // Layout — left 65% for the sheet display, right 35% for the
@@ -1147,11 +1183,13 @@ static void _render_edit_mode(px, py, pw, ph) {
         draw_text(_aseprite_json_path, px + 200, py + 8, 8,
                   rgba(200, 210, 230, 255));
     }
-    if (gui_button(px + pw - 120, py + 4, 110, 22, "Close")) {
-        if (_aseprite_confirm_discard("Close sheet") != 0) {
-            mlab_close_aseprite_sheet();
-            return;
-        }
+    // Editor topbar "Hide" follows the same semantics as the
+    // viewer's: the sheet state survives a hide. Tab in the editor
+    // brings the viewer back. Any in-flight pixel edits stay in
+    // the RGBA buffer until the user saves or opens a new file.
+    if (gui_button(px + pw - 120, py + 4, 110, 22, "Hide (Tab)")) {
+        mlab_aseprite_view_hide();
+        return;
     }
 
     // Layout — sidebar on the right, canvas takes the rest.
