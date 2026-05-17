@@ -856,64 +856,75 @@ static _tag_containing(frame) {
 // Modulab's MAIN canvas now (binding-based hand-off) rather than
 // a duplicate mini-editor inside the viewer.
 aseprite_view_render(px, py, pw, ph) {
-    auto sheet_w, sheet_h, list_w, preview_h, content_y;
-    auto close_hit, play_hit, footer_y, clicked_frame;
+    auto preview_h, clicked_frame;
     auto mx, my, mb_pressed;
-    auto sheet_panel_x, sheet_panel_y, list_x, list_y, preview_y;
+    auto sheet_idx, list_idx, preview_idx;
+    auto sheet_panel_x, sheet_panel_y, sheet_w, sheet_h;
 
     if (_aseprite_active == 0) { return 0; }
 
-    // Topbar: file path + Close + Play/Pause. Same look as the
-    // editor topbar so the user feels at home. Dirty sheets get
-    // an asterisk before the path so the user notices unsaved
-    // edits before clicking Close.
-    draw_text("Aseprite viewer", px + 12, py + 8, 8,
-              rgba(97, 218, 251, 255));
-    if (_aseprite_json_path != 0) {
-        if (mlab_aseprite_dirty() != 0) {
-            draw_text("*", px + 150, py + 8, 8,
-                      rgba(255, 180, 80, 255));
-        }
-        draw_text(_aseprite_json_path, px + 160, py + 8, 8,
-                  rgba(200, 210, 230, 255));
-    }
-
-    play_hit  = gui_button(px + pw - 240, py + 4, 110, 22,
-                           _aseprite_preview_playing != 0 ? "Pause" : "Play");
-    if (play_hit != 0) {
-        _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
-    }
-    // "Hide (Tab)" instead of "Close" — the button only flips the
-    // visibility flag, the in-memory sheet state survives. Tab in
-    // the editor toggles it back on. The actual discard happens
-    // automatically when the user opens a different file (with the
-    // dirty-discard prompt) or on app exit.
-    close_hit = gui_button(px + pw - 120, py + 4, 110, 22, "Hide (Tab)");
-    if (close_hit != 0) {
-        mlab_aseprite_view_hide();
-        return 0;
-    }
-
-    // Layout — left 65% for the sheet display, right 35% for the
-    // tag list, bottom 35% of the panel for the preview.
-    content_y     = py + 32;
-    list_w        = 260;
-    preview_h     = (ph - 32) * 35 / 100;
+    // Declare the panel structure using stbui's declarative layout.
+    // The whole shell is six begin/end pairs reading top-to-bottom
+    // as the visual hierarchy. Custom panel rendering (sheet PNG +
+    // tag list rows + preview frame) happens AFTER ui_render against
+    // the computed bboxes recovered via `ui_node_x/y/w/h`.
+    //
+    // Preview gets ~35% of remaining height (160 px floor); sheet
+    // takes the rest minus a 260 px tag-list column.
+    preview_h = (ph - 32) * 35 / 100;
     if (preview_h < 160) { preview_h = 160; }
 
-    sheet_panel_x = px;
-    sheet_panel_y = content_y;
-    sheet_w       = pw - list_w - 4;
-    sheet_h       = ph - 32 - preview_h - 4;
+    ui_layout_begin(pw, ph);
+    ui_box(UI_LAYOUT_COL, ui_sz_fixed(pw), ui_sz_fixed(ph), 0, 0);
+        // Topbar — fixed-height row, padded inset, title at the
+        // left + spacer pushes Play / Hide to the right edge.
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(28), 6, 6);
+            ui_text("Aseprite viewer");
+            if (mlab_aseprite_dirty() != 0) { ui_text("*"); }
+            if (_aseprite_json_path != 0) {
+                ui_text(_aseprite_json_path);
+            }
+            ui_spacer_grow();
+            if (ui_button(_aseprite_preview_playing != 0 ? "Pause" : "Play")) {
+                _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
+            }
+            // "Hide (Tab)" — only flips visibility, sheet state
+            // survives. Tab in the editor brings the viewer back.
+            if (ui_button("Hide (Tab)")) {
+                mlab_aseprite_view_hide();
+                ui_end(); ui_end(); ui_end();
+                ui_layout_end();
+                return 0;
+            }
+        ui_end();
 
-    list_x        = px + sheet_w + 4;
-    list_y        = content_y;
+        // Body — sheet panel grows, tag list column is fixed 260.
+        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_grow(), 4, 0);
+            sheet_idx = ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), 0, 0);
+            ui_end();
+            list_idx = ui_box(UI_LAYOUT_COL, ui_sz_fixed(260), ui_sz_grow(), 0, 0);
+            ui_end();
+        ui_end();
 
-    preview_y     = content_y + sheet_h + 4;
+        // Preview — fixed-height bottom strip, full width.
+        preview_idx = ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(preview_h), 0, 0);
+        ui_end();
+    ui_end();
+    ui_layout_end();
+    ui_render();
 
+    // Render custom panel content into the computed bboxes. The
+    // helpers below still do their own drawing into (x, y, w, h)
+    // — only the bbox math moved into the layout engine.
+    sheet_panel_x = ui_node_x(sheet_idx);
+    sheet_panel_y = ui_node_y(sheet_idx);
+    sheet_w       = ui_node_w(sheet_idx);
+    sheet_h       = ui_node_h(sheet_idx);
     _draw_sheet_panel(sheet_panel_x, sheet_panel_y, sheet_w, sheet_h);
-    _draw_tag_list(list_x, list_y, list_w, sheet_h);
-    _draw_preview_panel(px, preview_y, pw, preview_h);
+    _draw_tag_list(ui_node_x(list_idx),    ui_node_y(list_idx),
+                   ui_node_w(list_idx),    ui_node_h(list_idx));
+    _draw_preview_panel(ui_node_x(preview_idx), ui_node_y(preview_idx),
+                        ui_node_w(preview_idx), ui_node_h(preview_idx));
 
     // Mouse pick on the sheet — left-click selects a frame and
     // auto-locks the matching tag. We poll mouse_down's rising
