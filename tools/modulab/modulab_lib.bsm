@@ -248,9 +248,18 @@ static void _draw_help() {
     draw_text("tools 1-7  [ ]=color  -+=size  ZY=undo/redo  NM=new/dup frame  ,.=nav  X=fill outline  ESC=quit",
               _ml_ox + 12, y, 8, c);
     // When an Aseprite sheet is loaded but its panel is hidden,
-    // remind the user that Tab toggles the viewer back. Saves
-    // them from thinking the sheet was discarded after a Hide.
-    if (mlab_aseprite_active() != 0 && mlab_aseprite_view_visible() == 0) {
+    // remind the user that Tab toggles the viewer back. Editing
+    // a frame surfaces a stronger banner so the user understands
+    // Save (Cmd+S) writes back to the sheet, not the filename
+    // field — and which frame index they're working on.
+    if (mlab_aseprite_editing() != 0) {
+        draw_text("Editing Aseprite frame",
+                  _ml_ox + 12, y - 16, 8, rgba(255, 220, 80, 255));
+        draw_number(_ml_ox + 184, y - 16, 8, WHITE,
+                    mlab_aseprite_editing_frame_id());
+        draw_text("— Cmd+S saves back to sheet  |  Tab toggles viewer",
+                  _ml_ox + 220, y - 16, 8, rgba(120, 130, 150, 255));
+    } else if (mlab_aseprite_active() != 0 && mlab_aseprite_view_visible() == 0) {
         draw_text("Aseprite sheet loaded — Tab to show viewer",
                   _ml_ox + 12, y - 16, 8,
                   rgba(97, 218, 251, 255));
@@ -297,8 +306,20 @@ static _prefix_from_filename() {
 // Commit the current canvas to disk using the filename field as a
 // base path. Strips any .json / .modulab.json extension the user
 // might have typed so both sidecars land at a clean prefix.
+//
+// When an Aseprite frame is bound for edit, the save routes
+// through `mlab_aseprite_save_canvas_to_sheet` instead — Cmd+S
+// then writes the canvas pixels back to the sheet PNG at the
+// frame's bbox, not to the editor's filename field. This is the
+// key intercept that lets the Aseprite-frame-edit-on-main-canvas
+// hand-off feel natural: the user just edits and presses Save.
 static void _do_save() {
     auto prefix;
+    if (mlab_aseprite_editing() != 0) {
+        mlab_aseprite_save_canvas_to_sheet();
+        g_dirty = 0;
+        return;
+    }
     prefix = _prefix_from_filename();
     mlab_save_both(prefix);
     g_dirty = 0;
@@ -584,6 +605,19 @@ static void _handle_mouse(suppress) {
 // Dispatch the topbar's action code to the right IO handler.
 static void _handle_topbar(act) {
     auto sheet_path, prefix;
+
+    // When a frame is bound for Aseprite edit, the Modulab editor
+    // is borrowing the canvas — only the in-place Save makes sense.
+    // Save As / Sheet / Atlas would all write to the filename
+    // field's prefix and produce garbage (a partial atlas_pack JSON
+    // built from a single Aseprite frame). Refuse politely and
+    // point the user at Cmd+S, which routes correctly.
+    if (mlab_aseprite_editing() != 0
+     && (act == UI_ACT_SAVE_AS || act == UI_ACT_SHEET || act == UI_ACT_ATLAS)) {
+        put_err("modulab: this action is disabled while editing an Aseprite frame. ");
+        put_err("Use Save (Cmd+S) — it writes the frame back to the sheet PNG.\n");
+        return;
+    }
 
     if (act == UI_ACT_SAVE) {
         _do_save();
