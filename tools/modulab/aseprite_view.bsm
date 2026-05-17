@@ -96,6 +96,10 @@ static extrn _aseprite_preview_elapsed_ms;
 static extrn _sheet_origin_x;
 static extrn _sheet_origin_y;
 static extrn _sheet_scale;
+// Vertical pan offset (in screen pixels) for sheets taller than
+// the panel area. Up / Down arrows step it. The render clamps so
+// the user can never scroll past the sheet edges.
+static extrn _sheet_pan_y;
 
 // ── Frame-edit state (Commit 6 — slice edit) ───────────────────
 // View mode: 0 = sheet viewer, 1 = single-frame editor. The flag
@@ -293,6 +297,7 @@ mlab_close_aseprite_sheet() {
     _edit_mb_left_prev            = 0;
     _edit_mb_right_prev           = 0;
     _aseprite_view_visible        = 0;
+    _sheet_pan_y                  = 0;
     _aseprite_active              = 0;
 }
 
@@ -469,6 +474,7 @@ mlab_load_aseprite_sheet(path) {
     _edit_mb_left_prev            = 0;
     _edit_mb_right_prev           = 0;
     _aseprite_view_visible        = 1;
+    _sheet_pan_y                  = 0;
     _aseprite_active              = 1;
 
     // Register a hot-reload callback so external Aseprite saves
@@ -538,21 +544,24 @@ static void _draw_sheet_region(src_x, src_y, src_w, src_h, dst_x, dst_y, scale) 
     }
 }
 
-// Draw the full sheet inside (px, py, pw, ph), maintaining aspect
-// ratio. The active frame gets a yellow border; every frame
-// belonging to the active tag gets a thin cyan tint border so the
-// user sees the animation range at a glance.
+// Draw the full sheet inside (px, py, pw, ph). When the sheet at
+// 1× already overflows the panel vertically (peasant.png is 416
+// tall vs typical ~340 panel area), the active frame gets a
+// yellow border; every frame belonging to the active tag gets a
+// thin cyan tint. A vertical pan offset (`_sheet_pan_y`, driven
+// by Up / Down arrows) lets the user scroll to bottom rows that
+// otherwise clip off the panel.
 static void _draw_sheet_panel(px, py, pw, ph) {
     auto scale_x, scale_y, scale, draw_w, draw_h;
     auto fx, fy, fw, fh, i, color, in_tag, active_tag_from, active_tag_to;
+    auto pan_max;
 
     if (_aseprite_png_w <= 0 || _aseprite_png_h <= 0) { return; }
 
     // Pick the largest integer scale that fits both dimensions —
     // pixel art tools always prefer integer scaling to avoid
-    // blurry sampling. 1× is the floor (sheets bigger than the
-    // panel will simply overflow; that's fine for v1 since the
-    // user can resize the window).
+    // blurry sampling. 1× is the floor; if the sheet still does
+    // not fit, the pan offset below scrolls the overflow.
     scale_x = pw / _aseprite_png_w;
     scale_y = ph / _aseprite_png_h;
     scale   = scale_x < scale_y ? scale_x : scale_y;
@@ -561,18 +570,48 @@ static void _draw_sheet_panel(px, py, pw, ph) {
     draw_w = _aseprite_png_w * scale;
     draw_h = _aseprite_png_h * scale;
 
-    // Centre the sheet in the panel for a cleaner look.
+    // Clamp the pan offset so the user can never scroll past the
+    // sheet edges. When the sheet fits entirely, pan_max collapses
+    // to 0 and the offset is forced back to 0.
+    pan_max = draw_h - ph;
+    if (pan_max < 0)              { pan_max = 0; }
+    if (_sheet_pan_y < 0)         { _sheet_pan_y = 0; }
+    if (_sheet_pan_y > pan_max)   { _sheet_pan_y = pan_max; }
+
+    // Horizontal centring stays; vertical anchors at the top of
+    // the panel (minus the pan offset) so the user can scroll
+    // downward into the overflow.
     _sheet_origin_x = px + (pw - draw_w) / 2;
-    _sheet_origin_y = py + (ph - draw_h) / 2;
-    _sheet_scale    = scale;
+    if (pan_max == 0) {
+        // Fits — centre vertically too, looks calmer.
+        _sheet_origin_y = py + (ph - draw_h) / 2;
+    } else {
+        _sheet_origin_y = py - _sheet_pan_y;
+    }
+    _sheet_scale = scale;
 
     // Background plate so transparent PNG pixels read as dark
     // rather than blending into whatever lives behind.
-    draw_rect(_sheet_origin_x - 2, _sheet_origin_y - 2,
-              draw_w + 4, draw_h + 4, rgba(20, 22, 28, 255));
+    draw_rect(px, py, pw, ph, rgba(20, 22, 28, 255));
 
     _draw_sheet_region(0, 0, _aseprite_png_w, _aseprite_png_h,
                        _sheet_origin_x, _sheet_origin_y, scale);
+
+    // Scroll cue — small triangular markers at the top / bottom
+    // edge when more sheet exists in that direction. Cheap to
+    // draw with three draw_rect bands.
+    if (pan_max > 0) {
+        if (_sheet_pan_y > 0) {
+            draw_rect(px + pw - 14, py + 4, 10, 2, rgba(180, 200, 230, 200));
+            draw_rect(px + pw - 12, py + 6, 6,  2, rgba(180, 200, 230, 200));
+            draw_rect(px + pw - 10, py + 8, 2,  2, rgba(180, 200, 230, 200));
+        }
+        if (_sheet_pan_y < pan_max) {
+            draw_rect(px + pw - 14, py + ph - 6, 10, 2, rgba(180, 200, 230, 200));
+            draw_rect(px + pw - 12, py + ph - 8, 6,  2, rgba(180, 200, 230, 200));
+            draw_rect(px + pw - 10, py + ph - 10, 2, 2, rgba(180, 200, 230, 200));
+        }
+    }
 
     // Resolve the active tag range once so the per-frame border
     // loop doesn't repeat the same arr_get pair on every frame.
@@ -697,19 +736,33 @@ static _preview_current_frame() {
 // Animation preview panel — renders the current cycle frame at a
 // fixed scale, big enough to read clearly. The frame number /
 // elapsed clock prints below so the user can see playback speed.
+//
+// When the active frame belongs to a tag, the preview plays the
+// whole tag in cycle. When the active frame is untagged (e.g.
+// peasant.png's chop / die / carry frames that the converter
+// didn't tag), the preview falls back to a STATIC render of just
+// that frame so the user can still see what they clicked.
 static void _draw_preview_panel(px, py, pw, ph) {
     auto frame_idx, fx, fy, fw, fh, draw_x, draw_y, scale, max_s;
+    auto playing_tag;
 
     draw_rect(px, py, pw, ph, rgba(20, 22, 28, 255));
     draw_text("Preview", px + 8, py + 6, 8, rgba(140, 160, 200, 255));
 
-    if (_aseprite_active_tag < 0) {
-        draw_text("Click an animation to preview",
+    playing_tag = 0;
+    if (_aseprite_active_tag >= 0) {
+        frame_idx   = _preview_current_frame();
+        playing_tag = 1;
+    } else if (_aseprite_active_frame >= 0
+            && _aseprite_active_frame < _aseprite_frame_count) {
+        // Untagged frame — display it on its own. No cycle math.
+        frame_idx = _aseprite_active_frame;
+    } else {
+        draw_text("Click a frame or animation to preview",
                   px + 8, py + 32, 8, rgba(120, 130, 150, 255));
         return;
     }
 
-    frame_idx = _preview_current_frame();
     if (frame_idx < 0 || frame_idx >= _aseprite_frame_count) { return; }
 
     fx = arr_get(_aseprite_frame_x, frame_idx);
@@ -728,14 +781,21 @@ static void _draw_preview_panel(px, py, pw, ph) {
 
     _draw_sheet_region(fx, fy, fw, fh, draw_x, draw_y, scale);
 
-    // Status footer — frame number + (play / pause) hint.
+    // Status footer — frame number + (playing tag / static / paused) hint.
     draw_text("frame", px + 8, py + ph - 18, 8, rgba(140, 160, 200, 255));
     draw_number(px + 50, py + ph - 18, 8, WHITE, frame_idx);
-    draw_text(_aseprite_preview_playing != 0 ? "[playing]" : "[paused]",
-              px + 100, py + ph - 18, 8,
-              _aseprite_preview_playing != 0
-                  ? rgba(120, 220, 140, 255)
-                  : rgba(220, 200, 120, 255));
+    auto status, status_c;
+    if (playing_tag == 0) {
+        status   = "[static]";        // untagged frame on display
+        status_c = rgba(150, 160, 200, 255);
+    } else if (_aseprite_preview_playing != 0) {
+        status   = "[playing]";
+        status_c = rgba(120, 220, 140, 255);
+    } else {
+        status   = "[paused]";
+        status_c = rgba(220, 200, 120, 255);
+    }
+    draw_text(status, px + 100, py + ph - 18, 8, status_c);
     draw_text("space=play/pause  click sheet=pick frame  esc=quit",
               px + 220, py + ph - 18, 8, rgba(120, 130, 150, 255));
 }
@@ -863,8 +923,18 @@ aseprite_view_render(px, py, pw, ph) {
             auto tag_for_click;
             _aseprite_active_frame = clicked_frame;
             tag_for_click = _tag_containing(clicked_frame);
+            // Clicking a tagged frame switches the preview to that
+            // tag (and resets the cycle); clicking an UNTAGGED
+            // frame drops `active_tag` to -1 so the preview panel
+            // shows the single frame statically. Previously the
+            // preview kept playing whatever tag was last selected,
+            // making untagged frames appear to "not animate" —
+            // user-reported on the WC1 peasant chop/die frames.
             if (tag_for_click >= 0) {
                 _aseprite_active_tag         = tag_for_click;
+                _aseprite_preview_elapsed_ms = 0;
+            } else {
+                _aseprite_active_tag         = -1;
                 _aseprite_preview_elapsed_ms = 0;
             }
             // Double-click on the same frame opens the editor on
@@ -880,6 +950,15 @@ aseprite_view_render(px, py, pw, ph) {
     if (key_pressed(KEY_SPACE) != 0) {
         _aseprite_preview_playing = _aseprite_preview_playing != 0 ? 0 : 1;
     }
+
+    // Vertical scroll for sheets taller than the panel area. Up /
+    // Down arrows step the pan offset; Page Up / Down jump by a
+    // larger amount. The render-time clamp keeps the offset honest
+    // even if the user mashes the key past the end of the sheet.
+    if (key_pressed(KEY_DOWN) != 0)   { _sheet_pan_y = _sheet_pan_y + 32; }
+    if (key_pressed(KEY_UP)   != 0)   { _sheet_pan_y = _sheet_pan_y - 32; }
+    if (key_pressed(KEY_PGDOWN) != 0) { _sheet_pan_y = _sheet_pan_y + 200; }
+    if (key_pressed(KEY_PGUP)   != 0) { _sheet_pan_y = _sheet_pan_y - 200; }
 
     return 0;
 }
