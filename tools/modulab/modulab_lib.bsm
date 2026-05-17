@@ -62,6 +62,15 @@ extrn UI_LAYER_ADD, UI_LAYER_DEL;
 // Canvas screen placement.
 static extrn _cvs_x, _cvs_y, _cvs_zoom;
 
+// Last canvas side length we re-fitted for. When state_resize is
+// called (e.g. by the Aseprite frame-edit hand-off pulling a
+// 32x32 frame into the editor) g_canvas_n changes but `_cvs_zoom`
+// keeps the previous value — at the 24× default a 32-cell canvas
+// is 768 px wide and overflows the 800 px panel. Detecting the
+// change at the top of each frame lets us auto-refit before the
+// editor paints.
+static extrn _last_canvas_n;
+
 // Accessors exposed to prefs.bsm so the prefs module can persist
 // window zoom without reaching into modulab.bpp's private state
 // via extrn directly. prefs.bsm declares these as extrn and calls
@@ -71,6 +80,36 @@ void modulab_prefs_zoom_set(v) {
     if (v < 1)  { v = 1; }
     if (v > 64) { v = 64; }
     _cvs_zoom = v;
+}
+
+// Re-anchor the canvas inside the panel rect and pick the largest
+// integer zoom that fits both the canvas width and height into
+// the area between the left tool sidebar and the right phase-4
+// sidebar (column estimates match the layout pinned in
+// modulab_lib_frame). Called whenever g_canvas_n changes — keeps
+// the editor visible after state_resize swaps the canvas to a
+// new size (e.g. the 16→32 hand-off when the user double-clicks
+// a peasant frame in the Aseprite viewer).
+static void _refit_canvas_to_panel(px, py, pw, ph) {
+    auto avail_w, avail_h, zoom_w, zoom_h, zoom;
+    // Subtract the chrome that frames the canvas: tool sidebar on
+    // the left, palette + layer panel on the right, topbar +
+    // status above, palette row + frame strip + help footer below.
+    // Numbers are conservative — overshooting leaves a margin
+    // rather than clipping the canvas.
+    avail_w = pw - 144 - 240 - 20;
+    avail_h = ph - 60 - 180;
+    if (avail_w < 32) { avail_w = 32; }
+    if (avail_h < 32) { avail_h = 32; }
+    if (g_canvas_n <= 0) { return; }
+    zoom_w = avail_w / g_canvas_n;
+    zoom_h = avail_h / g_canvas_n;
+    zoom   = zoom_w < zoom_h ? zoom_w : zoom_h;
+    if (zoom < 1)  { zoom = 1; }
+    if (zoom > 64) { zoom = 64; }
+    _cvs_zoom = zoom;
+    _cvs_x    = px + 144;
+    _cvs_y    = py + 60;
 }
 
 // Zoom around the cursor: keep the cell under the mouse locked in
@@ -754,6 +793,7 @@ void modulab_lib_init(initial_name, canvas_n) {
     _cvs_x    = 144;   // re-anchored in modulab_lib_frame's first call
     _cvs_y    = 60;
     _cvs_zoom_default = 24;
+    _last_canvas_n    = canvas_n;  // seed so the first frame doesn't refit
     _mmb_down_prev = 0;
     _mmb_last_mx   = 0;
     _mmb_last_my   = 0;
@@ -818,6 +858,15 @@ modulab_lib_frame(px, py, pw, ph) {
     if (_cvs_x < px || _cvs_x > px + pw) { _cvs_x = px + 144; }
     // Keep canvas below the topbar (buttons at py+6..py+28, status at py+42).
     if (_cvs_y < py + 50 || _cvs_y > py + ph) { _cvs_y = py + 60; }
+
+    // Auto-refit when the canvas side length has changed since the
+    // last frame — typically because state_resize was called by
+    // the Aseprite-frame-edit hand-off pulling a frame of a
+    // different size into the editor.
+    if (_last_canvas_n != g_canvas_n) {
+        _refit_canvas_to_panel(px, py, pw, ph);
+        _last_canvas_n = g_canvas_n;
+    }
 
     // File-watch tick — fires the Aseprite hot-reload callback
     // (and any future Modulab watches) when a source file's hash
