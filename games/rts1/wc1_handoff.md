@@ -345,6 +345,55 @@ Shipped in 5 commits via `docs/sidequest_wc1_modulab_pipeline.md`:
     separately to close the "Modulab as IDE-companion" promise
     end-to-end.
 
+### Post-S5 tooling sidequests (2026-05-16 to 2026-05-17)
+
+Game-side WC1 work paused after S5 to harden the Aseprite +
+Modulab editing pipeline. Shipped before opening S6:
+
+- `docs/sidequest_wc1_modulab_pipeline.md` Commits 5-6 —
+  Modulab opens Aseprite sheets (`e5ece55` viewer +
+  `9742457` slice editor).
+- `docs/sidequest_aseprite_viewer_fixup.md` (`2afb7fa`) —
+  double-click init bug + dirty discard prompt + per-frame
+  dirty tracking + `tests/test_gpu_atlas_aseprite.bpp` smoke.
+- Modulab UX polish — `cf68316` (Tab toggle + filename guard),
+  `9005e7c` (untagged-frame static preview + sheet vertical
+  pan + Cmd+Z/Cmd+Shift+Z), `69bdcaa` (Tonify polish).
+- `docs/sidequest_aseprite_edit_main_canvas.md` (`834402d`) —
+  killed the in-viewer mini-editor; double-click hands the
+  frame off to Modulab's main canvas with full tool surface
+  (brush/fill/line/rect/oval/palette/layers/undo). Cmd+S
+  writes back to the sheet PNG.
+- `9f59ca2` — wc1_sprite_convert column-major fix. War1tool
+  emits walk cycles column-major (col=direction, row=frame);
+  the original converter assumed row-major so `walk_S`
+  played `walk_N` frames ("peasant looked like dying"). Fix
+  reorders frame emission so tags stay contiguous; game-side
+  required no change (only tag names referenced).
+- `1f749c8` — auto-refit Modulab canvas zoom + origin when
+  `g_canvas_n` changes (the 32×32 hand-off was overflowing
+  the 800px panel at the default 24× zoom).
+- (uncommitted at handoff time) — grid + zoom +/- controls
+  in the Modulab status line.
+
+**Open at handoff:**
+- WC1 chop/die/carry frames (rows 6-12 of peasant.png) are
+  emitted by the converter as UNTAGGED frames. Mapping to
+  tag names needs a war1tool Lua-table cross-reference.
+  Filed for whenever a consumer (S7 combat / S9 resources)
+  asks. Modulab's untagged-frame click already shows static
+  preview so users can inspect them visually today.
+- **stbui v2 — Clay-inspired layout** (decision pending):
+  Modulab zoom buttons trigger full UI reflow because side
+  panels are anchored canvas-relative. Symptom of a deeper
+  issue — stbui's "explicit pixel positioning" model doesn't
+  scale to the ~500+ widget call sites across Bang 9 /
+  Modulab / level_editor / fxlab / Aseprite viewer. User
+  flagged Clay (Nic Barker, C) as inspiration for next stbui
+  iteration. Sidequest doc + plan being written separately;
+  do NOT open S6 before the stbui direction is decided —
+  S6+ work will benefit from the new layout primitives.
+
 ### Session 6 — Flow-field crowd movement (~2-3h)
 
 **Goal**: when N > 5 units are selected and given the same target,
@@ -586,7 +635,26 @@ Standing gates per Tonify discipline:
 
 ## Status
 
-**Plan saved 2026-05-12; mod-framing clarification added same
-day.** Implementation pending — Session 1 slot in when ready to
-attack. Day was dense (12 commits) — fresh context recommended
-before opening the first session.
+**Sessions 1-5 CLOSED.** S6 (flow-field crowd movement) is next
+on the game arc, BUT blocked on the stbui v2 direction decision
+(see "Post-S5 tooling sidequests" above — Modulab's UI-reflow
+symptom surfaced a deeper layout-architecture question worth
+addressing before adding more consumers).
+
+**Next action when resuming:**
+1. Read `docs/sidequest_stbui_v2_clay.md` (being written
+   2026-05-17) and decide go/no-go on the layout migration.
+2. If go: execute the stbui v2 arc first (~3-4 sessions). S6
+   benefits because flow-field debug overlay + selection UI
+   land on the new layout primitives.
+3. If no-go (defer): patch the Modulab side-panel anchoring
+   to pin to panel rect (not canvas-relative), then open S6.
+
+**Recent activity (2026-05-16 / 2026-05-17):** Aseprite +
+Modulab pipeline hardened end-to-end. Peasant sheet ships
+with correct frameTags, edits round-trip through Modulab's
+main canvas, file destruction bugs closed (filename field
+no longer points at Aseprite sources). See "Post-S5 tooling
+sidequests" subsection for the full shipping trail. Memory
+`project_session_20260516_modulab_aseprite_pivot.md` is the
+short-form summary.
