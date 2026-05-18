@@ -1,0 +1,158 @@
+// stbgrid.bsm — Generic 2D grid storage primitive.
+//
+// Pure data structure, zero dependencies. Same leaf-module status as
+// stbcol — kept primitive so any consumer (RTS unit occupancy,
+// roguelike entity tracking, Sokoban puzzle state, Snake tail buffer,
+// Tetris board, tower-defense placement, etc.) can pull it without
+// dragging unrelated semantics.
+//
+// This cartridge stores BYTES OR WORDS PER CELL. Nothing more.
+// Consumers give those bytes/words their own meaning — eid+1 for
+// occupancy, tile IDs for terrain, timer ticks for bomb fuses, layer
+// indices for fog of war. The grid does not know what is in its cells.
+//
+// DO NOT add semantic concerns here. If you need "is this cell
+// occupied by an enemy faction", "is this cell visible to player N",
+// "what tile texture lives here" — those are CONSUMER concerns, not
+// grid concerns. Build them on top of stbgrid in the consumer.
+//
+// This restraint is the lesson from the stbui v2 `ui_image` drift
+// (commit `dedfb04`, reverted): speculative widgets on primitive
+// cartridges create real architectural pain. stbgrid stays storage-
+// only until two real consumers ask for the same higher-level shape
+// (Tonify Rule 20 — two-consumer rule).
+//
+// API at a glance:
+//
+//   grid_new_word(w, h)        — allocate w*h word cells, zero-initialized
+//   grid_new_byte(w, h)        — allocate w*h byte cells, zero-initialized
+//   grid_free(g)               — release the cells + the wrapper struct
+//   grid_set(g, x, y, val)     — write one cell (dispatches on cell size)
+//   grid_get(g, x, y)          — read one cell  (dispatches on cell size)
+//   grid_clear(g)              — zero every cell
+//   grid_in_bounds(g, x, y)    — 1 if (0 ≤ x < w) AND (0 ≤ y < h)
+//   grid_w(g) / grid_h(g)      — dimensions accessors
+//
+// Bounds-safety: out-of-bounds writes are no-ops; out-of-bounds reads
+// return 0. The intent is that consumers can pass world coords through
+// the grid without per-call clamping logic.
+
+// cell_size is the byte width of one cell, used by grid_set / grid_get
+// to dispatch between byte-grid (poke / peek) and word-grid (indexed
+// array) access. 1 = byte grid, 8 = word grid. The two are not
+// interchangeable mid-life — once allocated, the variant is fixed.
+struct Grid { w, h, cell_size, cells }
+
+const _GRID_BYTE = 1;
+const _GRID_WORD = 8;
+
+// ── Lifecycle ───────────────────────────────────────────────────
+
+// Allocate a w × h word-grid. All cells start at 0. Use this variant
+// whenever the per-cell value needs more than a byte — entity ids,
+// distance fields, layer masks, etc.
+grid_new_word(w, h) {
+    auto g: Grid, i, n;
+    g = malloc(sizeof(Grid));
+    g.w = w;
+    g.h = h;
+    g.cell_size = _GRID_WORD;
+    n = w * h;
+    g.cells = buf_word(n);
+    // buf_word does not zero-init the backing memory; do it explicitly
+    // so consumers can trust the "all-free" / "all-zero" start state.
+    for (i = 0; i < n; i++) {
+        g.cells[i] = 0;
+    }
+    return g;
+}
+
+// Allocate a w × h byte-grid. All cells start at 0. Use this variant
+// when 0..255 covers the value range — boolean blocked flags, tile-
+// class indices, small enums.
+grid_new_byte(w, h) {
+    auto g: Grid;
+    g = malloc(sizeof(Grid));
+    g.w = w;
+    g.h = h;
+    g.cell_size = _GRID_BYTE;
+    g.cells = buf_byte(w * h);
+    buf_fill(g.cells, 0, w * h);
+    return g;
+}
+
+// Release the cell buffer + the wrapper struct. After this returns the
+// handle is invalid; the caller should drop the reference.
+void grid_free(g) {
+    auto gr: Grid;
+    gr = g;
+    if (gr.cells != 0) { free(gr.cells); }
+    free(g);
+}
+
+// ── Accessors ───────────────────────────────────────────────────
+
+// 1 if (x, y) is inside the grid, 0 otherwise. Bounds are half-open:
+// valid x ∈ [0, w), valid y ∈ [0, h).
+grid_in_bounds(g, x, y) {
+    auto gr: Grid;
+    gr = g;
+    if (x < 0) { return 0; }
+    if (y < 0) { return 0; }
+    if (x >= gr.w) { return 0; }
+    if (y >= gr.h) { return 0; }
+    return 1;
+}
+
+grid_w(g) {
+    auto gr: Grid;
+    gr = g;
+    return gr.w;
+}
+
+grid_h(g) {
+    auto gr: Grid;
+    gr = g;
+    return gr.h;
+}
+
+// Write one cell. Out-of-bounds writes are silently ignored — the
+// caller does not need to clamp world coords before calling.
+void grid_set(g, x, y, val) {
+    auto gr: Grid;
+    gr = g;
+    if (grid_in_bounds(g, x, y) == 0) { return; }
+    if (gr.cell_size == _GRID_BYTE) {
+        poke(gr.cells + y * gr.w + x, val);
+        return;
+    }
+    gr.cells[y * gr.w + x] = val;
+}
+
+// Read one cell. Out-of-bounds reads return 0 — same intent as
+// grid_set's silent OOB-ignore; consumers can sample world coords
+// freely.
+grid_get(g, x, y) {
+    auto gr: Grid;
+    gr = g;
+    if (grid_in_bounds(g, x, y) == 0) { return 0; }
+    if (gr.cell_size == _GRID_BYTE) {
+        return peek(gr.cells + y * gr.w + x);
+    }
+    return gr.cells[y * gr.w + x];
+}
+
+// Zero every cell. Use to reset a grid between rounds / levels
+// without reallocating.
+void grid_clear(g) {
+    auto gr: Grid, i, n;
+    gr = g;
+    n = gr.w * gr.h;
+    if (gr.cell_size == _GRID_BYTE) {
+        buf_fill(gr.cells, 0, n);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        gr.cells[i] = 0;
+    }
+}
