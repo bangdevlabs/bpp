@@ -36,16 +36,22 @@ import "stbecs.bsm";
 import "stbcharsheet.bsm";
 import "stbgame.bsm";
 load   "wc1_units.bsm";
+load   "wc1_anims.bsm";
 
 // ECS component handles + query. ecs_query_each's callback shape
 // (`fn(world, eid)`) means combat state flows through globals.
-extrn pos_comp, sheet_comp, attack_target_comp, path_comp;
+extrn pos_comp, sheet_comp, attack_target_comp, path_comp, anim_comp;
 extrn peasant_q;
 
 // Per-tick dt in ms — set once at the top of wc1_combat_tick so
 // the per-entity callback reads a global instead of re-querying
 // game_dt_ms per unit.
 static auto _combat_dt_ms;
+
+// Time a dying unit lingers on the map playing its 3-frame death
+// animation before ecs_kill_at finalizes it. ~600 ms = three 200 ms
+// frames, the rhythm WC1's classic chunky death felt right at.
+const _DIE_DURATION_MS = 600;
 
 // Walk every unit, advance its combat state by one frame. Call
 // AFTER wc1_input_tick (which writes AttackTargets) and BEFORE
@@ -69,13 +75,27 @@ static _tile_chebyshev(ax_px, ay_px, bx_px, by_px) {
     return dx;
 }
 
-// Per-entity combat tick. Pre-conditions: nothing — every code
-// path early-returns when the unit has no engagement.
+// Per-entity combat tick. Three branches: dying (timer expiration
+// → finalize), engaged (out of range → path, in range → swing),
+// idle (nothing to do — early return).
 static void _combat_step(w, eid) {
-    auto at: AttackTarget, sh: Sheet, target_sh: Sheet;
-    auto my_p: Pos, target_p: Pos, my_pa: Path, target_pa: Path;
+    auto at: AttackTarget, sh: Sheet, target_sh: Sheet, target_an: Anim;
+    auto an: Anim, my_p: Pos, target_p: Pos, my_pa: Path;
     auto target_eid, dist_tiles, my_range;
     auto cooldown_ms, damage, target_armor, target_hp;
+
+    an = ecs_get(w, anim_comp, eid);
+
+    // Dying — advance the death-anim timer; finalize when expired.
+    // Other branches must be skipped: a dying unit has no business
+    // pathing, swinging, or being commanded.
+    if (an.state == UNIT_STATE_DYING) {
+        an.elapsed_ms = an.elapsed_ms + _combat_dt_ms;
+        if (an.elapsed_ms >= _DIE_DURATION_MS) {
+            _finalize_death(w, eid);
+        }
+        return;
+    }
 
     at = ecs_get(w, attack_target_comp, eid);
     if (at.eid < 0) { return; }
@@ -91,6 +111,13 @@ static void _combat_step(w, eid) {
     }
     target_sh = ecs_get(w, sheet_comp, target_eid);
     if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
+        at.eid = -1;
+        at.last_attack_ms = 0;
+        return;
+    }
+    // Also skip if target is mid-death-animation — let it finish.
+    target_an = ecs_get(w, anim_comp, target_eid);
+    if (target_an.state == UNIT_STATE_DYING) {
         at.eid = -1;
         at.last_attack_ms = 0;
         return;
@@ -111,15 +138,28 @@ static void _combat_step(w, eid) {
         // collision keeps us from stepping ONTO the target tile.
         // Cooldown clears while moving — closing the gap costs
         // a swing's worth of recovery, same as SC1 melee feel.
+        // Movement tick will set state to WALK on its own.
         wc1_movement_request(w, eid, target_p.x / 16, target_p.y / 16);
         at.last_attack_ms = 0;
         return;
     }
 
     // In range — halt any in-flight move path (cursor = count
-    // forces _step_unit into the idle branch next movement tick).
+    // forces _step_unit into the idle branch next movement tick)
+    // and face the target so the chop animation aims correctly.
     my_pa = ecs_get(w, path_comp, eid);
     my_pa.cursor = my_pa.count;
+    an.facing = wc1_facing_for_delta(target_p.x - my_p.x,
+                                     target_p.y - my_p.y);
+    // State flip to ATTACK on entry (resets the anim cycle so the
+    // chop starts at frame 0); subsequent frames in the same state
+    // let the anim cycle naturally via elapsed_ms accumulation.
+    if (an.state != UNIT_STATE_ATTACK) {
+        an.state      = UNIT_STATE_ATTACK;
+        an.elapsed_ms = 0;
+    } else {
+        an.elapsed_ms = an.elapsed_ms + _combat_dt_ms;
+    }
 
     // Cooldown gate. Accumulate elapsed time toward the unit's
     // STAT_COOLDOWN_MS; only fire when it overflows.
@@ -147,20 +187,33 @@ static void _combat_step(w, eid) {
     putstr("\n");
 
     if (target_hp <= 0) {
-        // S7.5 death — free the per-unit heap first (CharSheet
-        // handle + path waypoint buffer) THEN mark the row dead
-        // in the ECS. Release the tile claim so other units can
-        // walk through the corpse-tile; ecs_kill_at by itself
-        // doesn't touch the occupancy grid.
-        target_pa = ecs_get(w, path_comp, target_eid);
-        wc1_collision_release(target_pa.tile_gx, target_pa.tile_gy);
-        cs_free(target_sh.handle);
-        free(target_pa.buf);
-        ecs_kill_at(w, target_eid);
+        // Death — flip the target into DYING so its death anim
+        // plays; the dying tick (this same function on the
+        // target's row next frame) finalizes ecs_kill_at +
+        // tile-release + heap-free after _DIE_DURATION_MS.
+        target_an.state      = UNIT_STATE_DYING;
+        target_an.elapsed_ms = 0;
         at.eid = -1;
         at.last_attack_ms = 0;
-        putstr("kill eid=");
-        putnum(target_eid);
+        putstr("dying eid=");
+        putstr(" "); putnum(target_eid);
         putstr("\n");
     }
+}
+
+// Final stage of the death pipeline: release the tile claim,
+// free per-unit heap (CharSheet + Path waypoint buffer), then
+// mark the ECS row dead. Other attackers see ecs_alive_at == 0
+// next frame and clear their stale AttackTarget references.
+static void _finalize_death(w, eid) {
+    auto sh: Sheet, pa: Path;
+    sh = ecs_get(w, sheet_comp, eid);
+    pa = ecs_get(w, path_comp, eid);
+    wc1_collision_release(pa.tile_gx, pa.tile_gy);
+    cs_free(sh.handle);
+    free(pa.buf);
+    ecs_kill_at(w, eid);
+    putstr("kill eid=");
+    putnum(eid);
+    putstr("\n");
 }
