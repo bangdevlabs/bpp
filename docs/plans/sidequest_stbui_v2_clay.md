@@ -1,10 +1,16 @@
 # Sidequest — stbui v2: Clay-inspired layout for B++
 
-**Status:** ARC LARGELY CLOSED 2026-05-18 — **S1 → S6 + S8 + S9
+**Status:** ARC LARGELY CLOSED 2026-05-18 — **S1 → S6 + S9
 SHIPPED**, **S7 DEFERRED** (mini_synth + sprite_viewer — no
 killer-use-case under Rule 28; reopens when either tool gains a
-Bang 9 panel embed). **S9.1 follow-up open** (mechanical
-stbui.bsm dead-code excision — see Session 9 entry below).
+Bang 9 panel embed). **S8 REVERTED** in the same session — Bang 9
+shell migration attempted, surfaced an `ui_layout_begin` re-entrancy
+gap that breaks embedded tool layouts + v2 button clicks. Reverted
+to manual chrome math; reopens as S8.1 once stbui grows a
+nested-call mode (or moves the click-swap into a separate
+`ui_frame_begin`). **S8.1 + S9.1 follow-ups open** — both touch
+`stb/stbui.bsm`, so pair them in a single bootstrap-gated cleanup
+session.
 
 **Shipping trail (2026-05-17):**
 - S1 — `c6d8ee8` (plan + grid/zoom UI) + `dedfb04` (engine integrated)
@@ -16,7 +22,9 @@ stbui.bsm dead-code excision — see Session 9 entry below).
 - S5 — fxlab declarative shell migration
 - S6 — the_bug debug-map viewer declarative shell
 - S7 — DEFERRED (mini_synth + sprite_viewer, Rule 28 no consumer)
-- S8 — Bang 9 main shell declarative chrome
+- S8 — ATTEMPTED + REVERTED same session: ui_layout_begin not
+  re-entrant; embedded tools' layouts and v2 button clicks broke
+  visibly. Re-opens as S8.1 once stbui grows a nested-call mode.
 - S9 — PARTIAL: ui_demo.bpp deleted (lone v1-layout consumer);
   stbui.bsm dead-code excision deferred to S9.1
 - Bonus closure: parser fbuf overflow that S1's `import stbimage`
@@ -322,22 +330,67 @@ Concrete order:
    the Music tab in `stb++_lib.md` Cap 26's roadmap table —
    embed-contract refactor + v2 declarative migration land
    together when that arc opens).
-8. **Session 8 — CLOSED 2026-05-18**: Bang 9 shell migration.
-   `bang9.bpp` main() chrome reframed as `COL win { ROW menu
-   fixed(28) + ROW tabs fixed(32) + ROW panel grow + ROW status
-   fixed(24) }`. Killed two chrome-math lines:
-   `panel_y = MENUBAR_H + TABSTRIP_H` and
-   `panel_h = win_h - panel_y - STATUSBAR_H`. The internal panels
-   (`_panel_project`, `_panel_code`, `_panel_run`, etc.) keep
-   their existing pixel arithmetic inside the panel rect they
-   receive — those internal layouts didn't have resize-pain
-   evidence to justify per-panel migration (Rule 28). The
-   payoff is at the shell level: future chrome additions (search
-   bar, notification strip) drop in as one `ui_row_fixed_h` call
-   without rewiring `panel_y` / `panel_h` arithmetic. Bang 9
-   continues to embed all four migrated tools (S3 Modulab, S4
-   level_editor, S5 fxlab, S6 the_bug) cleanly via the same
-   `<tool>_lib_frame(x, y, w, h)` contract.
+8. **Session 8 — REVERTED 2026-05-18**: Bang 9 shell migration
+   attempted, shipped, then reverted in the SAME session after
+   user smoke caught the regression. The original migration
+   declared the Bang 9 chrome as `COL win { ROW menu fixed(28)
+   + ROW tabs fixed(32) + ROW panel grow + ROW status fixed(24) }`
+   and replaced the two chrome-math lines (`panel_y =
+   MENUBAR_H + TABSTRIP_H`, `panel_h = win_h - panel_y -
+   STATUSBAR_H`) with bbox queries. Builds clean, but every
+   embedded tool that itself calls `ui_layout_begin` (Modulab
+   S3, level_editor S4, fxlab S5, the_bug S6) hit two
+   regressions:
+
+   1. **Node pool clobber.** `ui_layout_begin` resets
+      `_ui2_node_count = 0`. The Bang 9 shell's
+      `shell_draw_statusbar` reads `ui_node_y(status_idx)` AFTER
+      `panels_draw` ran — by which time the embedded tool's own
+      `ui_layout_begin` had wiped the pool and reused slot 0..N
+      for its own tree. Statusbar rendered at random `(y, h)` —
+      the visible "UI distorce" symptom.
+   2. **Click buffer double-swap.** `ui_layout_begin` swaps
+      `_ui2_curr_clicks` ↔ `_ui2_prev_clicks` and zeros the new
+      curr. Calling it twice per frame (shell + embedded tool)
+      double-swaps, so `prev_clicks` for the second call is the
+      buffer that was just zeroed by the first. Modulab's
+      aseprite viewer (uses `ui_button`) got dead buttons —
+      `ui_button` reads `prev_clicks[seq]` which was zeroed by
+      the shell's swap.
+
+   Root cause: `ui_layout_begin` was designed under the
+   "one-per-frame" invariant. Shell + embedded tool both calling
+   it violates that invariant.
+
+   Revert restores the manual chrome math
+   (`MENUBAR_H + TABSTRIP_H` etc.) — same code that shipped pre-
+   S8. Comment in `bang9.bpp` records the design intent and the
+   bug class so the next visitor knows why the chrome arithmetic
+   wasn't migrated.
+
+9. **Session 8.1 — OPEN (replaces shipped S8)**: re-attempt the
+   Bang 9 shell migration after `ui_layout_begin` learns a
+   nested-call discipline. Two candidate shapes:
+
+   - **`ui_frame_begin()` + `ui_layout_begin()` split.** Move
+     the click-buffer swap into a new `ui_frame_begin` that the
+     host calls ONCE per frame, before any layout. Layout-begin
+     just resets node pool + seq + viewport. Every consumer
+     migrates to call `ui_frame_begin` at frame top. ~10 LOC
+     in stbui.bsm + one call site per consumer (5 today).
+   - **Save/restore around panels_draw.** Bang 9 captures the
+     node pool state + click buffers before `panels_draw`,
+     restores after. Self-contained in the host, no stbui
+     change. ~30 LOC of state-marshalling per call.
+
+   The split (option 1) matches how ImGui / Clay / Dear ImGui
+   draw the frame/layout boundary; option 2 is a hack to
+   preserve a leaky abstraction. Prefer option 1 once a
+   stb-touching cleanup session opens.
+
+   Touches `stb/stbui.bsm` so it gates on bootstrap byte-stable
+   + suite green. Pair with S9.1's dead-code excision in the
+   same session — both are stb-only edits.
 9. **Session 9 — PARTIAL CLOSED 2026-05-18**: deletion of
    `examples/ui_demo.bpp` (the lone holdout consumer of the v1
    `lay_*` layout helpers + the styled widget family

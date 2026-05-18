@@ -9862,3 +9862,90 @@ chrome arithmetic).
 closed: S1 → S6 + S8 + S9 SHIPPED, S7 DEFERRED with Rule 28
 reasoning, S9.1 follow-up open with concrete scope. Next reader
 landing on the doc gets the full state without re-deriving it.
+
+### Addendum — S8 REVERTED same session (visual regression caught
+### by user smoke after install.sh)
+
+User ran `install.sh`, rebuilt Bang 9, opened Modulab and
+level_editor panels — UI distorted on tab clicks. Modulab's
+aseprite viewer in particular had dead buttons. Diagnosis traced
+through `stb/stbui.bsm`:
+
+```bpp
+void ui_layout_begin(viewport_w, viewport_h) {
+    ...
+    _ui2_node_count = 0;            // ← clobbers earlier-frame
+                                    //   node pool entries
+    ...
+    tmp              = _ui2_prev_clicks;
+    _ui2_prev_clicks = _ui2_curr_clicks;
+    _ui2_curr_clicks = tmp;          // ← click swap assumes one
+                                    //   begin-per-frame
+    for (...) { *(_ui2_curr_clicks + i * 8) = 0; }
+}
+```
+
+S8 had Bang 9's main loop call `ui_layout_begin` for the chrome
+shell. The embedded tools (Modulab S3, level_editor S4, fxlab S5,
+the_bug S6) ALSO call `ui_layout_begin` from inside their own
+`*_lib_frame(x, y, w, h)`. Two calls per frame = two bugs:
+
+1. **Node pool clobber.** Shell read `ui_node_y(status_idx)` etc.
+   before `panels_draw`, but `shell_draw_statusbar` runs AFTER
+   `panels_draw`. By then the embedded tool's `ui_layout_begin`
+   had reset `_ui2_node_count` to 0 and reused slots that the
+   shell still needed. Statusbar drew at garbage `(y, h)` —
+   visible as "UI distorce" on every tab.
+2. **Click buffer double-swap.** Two swaps per frame means the
+   v2 `ui_button` reads `prev_clicks` which was zeroed by the
+   FIRST swap. Aseprite viewer's Play / Pause / Hide buttons
+   (only ui_button consumers in the embedded toolchain) went
+   dead.
+
+Fastest fix: revert S8's body in `bang9.bpp`. Restore the manual
+chrome math (`panel_y = MENUBAR_H + TABSTRIP_H` etc.) — same code
+the file shipped with before today. Comment in the file records
+the design intent + the bug class for the next visitor.
+
+Re-attempt as S8.1, gated on a `stb/stbui.bsm` refactor that
+makes `ui_layout_begin` safely nestable. Two candidate shapes
+documented in the sidequest doc:
+
+- **`ui_frame_begin()` + `ui_layout_begin()` split.** Move the
+  click-buffer swap into a new `ui_frame_begin` that the host
+  calls ONCE per frame. Layout-begin keeps node-pool reset +
+  seq + viewport. Every consumer migrates to call
+  `ui_frame_begin` at frame top. ~10 LOC stbui + one call site
+  per consumer (5 today). Matches the ImGui / Clay frame/layout
+  separation.
+- **Save/restore around `panels_draw`.** Bang 9 captures node
+  pool + click buffers before `panels_draw`, restores after.
+  Self-contained, no stbui touch, ~30 LOC of state-marshalling.
+  A hack that preserves a leaky abstraction.
+
+Prefer the split. Pair with S9.1's dead-code excision in a
+single bootstrap-gated stb cleanup session.
+
+### Lesson — re-entrancy invariants aren't free
+
+S8 looked clean: same `ui_layout_begin → ui_box → ui_layout_end`
+pattern as S3-S6, applied at a higher level. Builds passed. The
+embedded tools STILL build clean today even with S8 active,
+because the bug surfaces at runtime via state-machine
+interleaving, not at compile time. The visual smoke (the user
+running Bang 9 and clicking tabs) caught what the build pipeline
+couldn't.
+
+The class of bug — "this primitive is single-call-per-frame and I
+didn't say so anywhere" — argues for naming invariants explicitly.
+A `// invariant: call exactly once per frame` comment on
+`ui_layout_begin` would have surfaced the conflict at design time
+rather than runtime. Adding that comment is part of the S8.1
+cleanup.
+
+The right verification gate for S8 wasn't "does it build" — it
+was "does Bang 9 still render correctly when I click through
+every tab that has an embedded tool with v2 layout calls." That
+gate only exists in the user's hands today (no headless visual
+smoke for Bang 9 panels). Until that gate exists, shell-level
+v2 changes need a manual cycle through every tab.
