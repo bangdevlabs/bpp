@@ -104,7 +104,10 @@ struct ArchetypeRec {
     entities_per_chunk,  // computed from chunk_payload / sum(comp_sizes)
     chunks,              // arr<ptr>:    each entry is a raw byte buffer
     chunk_count,         // chunks allocated
-    total_entities       // live entities across all chunks (monotonic)
+    total_entities,      // high-water row count; not all of these are alive
+    alive,               // buf_byte sized to alive_cap; 1 = live, 0 = dead/free
+    alive_cap,           // capacity of `alive` (grows by doubling)
+    live_count           // count of currently-live rows (alive[row] == 1)
 }
 
 // Encoded entity-id for archetype rows. archetype slot 0 is reserved
@@ -240,6 +243,11 @@ ecs_archetype(w, comp_ids, n_comps) {
     ar.chunks = arr_new();
     ar.chunk_count = 0;
     ar.total_entities = 0;
+    // Alive bitmap starts empty; lazy-allocated on first spawn so a
+    // never-spawned archetype carries zero overhead.
+    ar.alive = 0;
+    ar.alive_cap = 0;
+    ar.live_count = 0;
     wd.archetypes = arr_push(wd.archetypes, ar);
     wd.archetype_count++;
     return ar.arch_idx;
@@ -271,21 +279,104 @@ static _ecs_encode_id(arch_idx, row) {
     return ((arch_idx + 1) * _ECS_ARCH_BIT) + row;
 }
 
+// Grow the alive bitmap to at least `needed` bytes, copying the
+// previous live/dead bits and zero-initializing the new tail.
+// Doubling growth keeps amortized cost O(1) per spawn.
+static _ecs_archetype_grow_alive(ar, needed) {
+    auto a: ArchetypeRec, new_cap, new_buf, i;
+    a = ar;
+    if (needed <= a.alive_cap) { return; }
+    new_cap = a.alive_cap;
+    if (new_cap == 0) { new_cap = 16; }
+    while (new_cap < needed) { new_cap = new_cap * 2; }
+    new_buf = buf_byte(new_cap);
+    buf_fill(new_buf, 0, new_cap);
+    if (a.alive != 0) {
+        for (i = 0; i < a.alive_cap; i++) {
+            poke(new_buf + i, peek(a.alive + i));
+        }
+        free(a.alive);
+    }
+    a.alive = new_buf;
+    a.alive_cap = new_cap;
+}
+
 // Spawn an entity into the given archetype. Returns the entity id
-// (encoded as above). Grows the chunk list lazily — the first spawn
-// allocates the first chunk, subsequent spawns reuse it until the
-// chunk fills, then a new chunk is appended.
+// (encoded as above). Reuses the first dead slot when available so
+// long-running worlds don't grow indefinitely; falls back to
+// extending the high-water row count + growing chunks lazily when
+// the alive bitmap is fully live.
+//
+// The previous occupant's component bytes are NOT cleared — callers
+// are expected to overwrite every component they care about. The
+// per-archetype init sites (e.g. ecs_spawn_peasant) already do this
+// because they always set Pos / Sprite / etc. at spawn time.
 ecs_spawn_at(w, archetype_id) {
-    auto wd: World, ar: ArchetypeRec, row, chunk_idx;
+    auto wd: World, ar: ArchetypeRec, row, chunk_idx, i;
     wd = w;
     ar = arr_get(wd.archetypes, archetype_id);
-    row = ar.total_entities;
-    chunk_idx = row / ar.entities_per_chunk;
-    while (chunk_idx >= ar.chunk_count) {
-        _ecs_archetype_grow(ar);
+    // Try to recycle a dead slot in [0, total_entities).
+    row = 0 - 1;
+    for (i = 0; i < ar.total_entities; i++) {
+        if (peek(ar.alive + i) == 0) { row = i; i = ar.total_entities; }
     }
-    ar.total_entities++;
+    if (row < 0) {
+        // No dead slot — extend the high-water row count.
+        row = ar.total_entities;
+        chunk_idx = row / ar.entities_per_chunk;
+        while (chunk_idx >= ar.chunk_count) {
+            _ecs_archetype_grow(ar);
+        }
+        _ecs_archetype_grow_alive(ar, row + 1);
+        ar.total_entities++;
+    }
+    poke(ar.alive + row, 1);
+    ar.live_count++;
     return _ecs_encode_id(archetype_id, row);
+}
+
+// Mark an archetype-encoded entity as dead. Legacy ids fall through
+// to the flat ecs_kill path so callers can use one entry point. The
+// slot's row index is recycled by the next ecs_spawn_at; until then,
+// ecs_get / ecs_query_each report it as absent.
+//
+// Component data on the dead slot is NOT scrubbed — relying on the
+// next spawn to overwrite. Callers that hold game-owned heap on a
+// component (e.g. CharSheet handles, per-unit Path buffers) MUST
+// free those before calling ecs_kill_at; the cartridge does not
+// know what your components own.
+void ecs_kill_at(w, entity_id) {
+    auto wd: World, ar: ArchetypeRec, arch_idx, row;
+    wd = w;
+    if (entity_id < _ECS_ARCH_BIT) {
+        ecs_kill(wd, entity_id);
+        return;
+    }
+    arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
+    row = entity_id & _ECS_ROW_MASK;
+    if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return; }
+    ar = arr_get(wd.archetypes, arch_idx);
+    if (row < 0 || row >= ar.total_entities) { return; }
+    if (peek(ar.alive + row) == 0) { return; }
+    poke(ar.alive + row, 0);
+    ar.live_count--;
+}
+
+// Return 1 if `entity_id` is alive, 0 if dead or never spawned.
+// Used by game code holding a stale eid (e.g. wc1_combat's
+// AttackTarget) to decide whether the reference is still valid.
+ecs_alive_at(w, entity_id) {
+    auto wd: World, ar: ArchetypeRec, arch_idx, row;
+    wd = w;
+    if (entity_id < _ECS_ARCH_BIT) {
+        return ecs_alive(wd, entity_id);
+    }
+    arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
+    row = entity_id & _ECS_ROW_MASK;
+    if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return 0; }
+    ar = arr_get(wd.archetypes, arch_idx);
+    if (row < 0 || row >= ar.total_entities) { return 0; }
+    return peek(ar.alive + row);
 }
 
 // Resolve the byte address of `comp_id`'s slot for `entity_id`.
@@ -307,7 +398,14 @@ ecs_get(w, comp_id, entity_id) {
     if (entity_id < _ECS_ARCH_BIT) { return 0; }
     arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
     row = entity_id & _ECS_ROW_MASK;
+    if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return 0; }
     ar = arr_get(wd.archetypes, arch_idx);
+    if (row < 0 || row >= ar.total_entities) { return 0; }
+    // Dead slot — return 0 so stale eids fail safely. Callers that
+    // hold an eid across frames should ecs_alive_at-check before
+    // any deref to avoid an awkward 0-dereference; this guard
+    // exists as a safety net for ecs_get sites the caller forgot.
+    if (peek(ar.alive + row) == 0) { return 0; }
     chunk_idx = row / ar.entities_per_chunk;
     slot = row % ar.entities_per_chunk;
     // Linear scan over the archetype's component list. Archetypes
@@ -468,15 +566,17 @@ void ecs_query_each(q, fn) {
             call(fn, w, i);
         }
     }
-    // Archetype entities — each archetype is dense (entities 0
-    // through total_entities-1 are all live), so the inner loop is
-    // a tight `for row in 0..total`. The chunk-stride math lives
-    // inside ecs_get; this loop just enumerates ids in order so
-    // the callback's `ecs_get(w, c, id)` lookups stay sequential
-    // across the chunk's component arrays.
+    // Archetype entities — rows 0..total_entities-1 cover every
+    // slot that has ever been spawned. The alive bitmap tells
+    // which of those slots are currently live (slots vacated by
+    // ecs_kill_at have alive[row] == 0 and stay until recycled).
+    // Iterate in row order so callbacks see ids in sequence;
+    // skip-dead via a single peek so the dead-row cost is one
+    // byte read per slot.
     for (ai = 0; ai < w.archetype_count; ai++) {
         ar = arr_get(w.archetypes, ai);
         for (row = 0; row < ar.total_entities; row++) {
+            if (peek(ar.alive + row) == 0) { continue; }
             call(fn, w, _ecs_encode_id(ai, row));
         }
     }
@@ -497,12 +597,12 @@ ecs_query_count(q) {
             n = n + 1;
         }
     }
-    // Archetype entities — total_entities tracks live count per
-    // archetype (kill compaction lands in a future session; today
-    // archetype entities are append-only and never reused).
+    // Archetype entities — live_count tracks the actively-alive
+    // rows; dead slots vacated by ecs_kill_at don't count even
+    // though they still occupy a row index in [0, total_entities).
     for (ai = 0; ai < w.archetype_count; ai++) {
         ar = arr_get(w.archetypes, ai);
-        n = n + ar.total_entities;
+        n = n + ar.live_count;
     }
     return n;
 }
