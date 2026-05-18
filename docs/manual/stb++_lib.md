@@ -2768,62 +2768,89 @@ slot — no separate index table, no header per slot.
 
 ---
 
-## Cap 44 — Color math (stbcol)
+## Cap 44 — Collision geometry (stbcol)
 
 *Depends on: Cap 2 (auto-injected prelude)*
 *Source: new*
-*Status: COMPLETE — 2026-04-22*
+*Status: REWRITTEN — 2026-05-18 (color-math content moved to
+stbdraw; this cap now documents the actual `stbcol.bsm`)*
 
-`stbcol.bsm` is pure color math — no allocations, no state, just
-functions. RGBA packing / unpacking, blending, HSV conversion.
+`stbcol.bsm` is the **fully-generic** geometry leaf module
+(Tonify Rule 33). Pure math, no allocations, no state — just
+axis-aligned-rect and circle primitives that any 2D game can
+pull. Same leaf-module status as `stbgrid`: anything that needs
+geometry tests imports `stbcol`; cartridges built on top
+(`stbphys`, `stbai`, `stbflow` indirectly) consume it.
 
-### §44.1 — Packing
+The historical "stbcol = color math" content has moved into
+`stbdraw.bsm` (`rgba()` packing + palette constants live with the
+draw primitives that consume them).
 
-```c
-rgba_of(r, g, b, a);       // pack 4 bytes into a single ARGB word
-rgba_r(color);             // extract channel
-rgba_g(color);
-rgba_b(color);
-rgba_a(color);
-```
-
-### §44.2 — Blending
-
-```c
-rgba_blend(dst, src);                 // standard over-compositing
-rgba_lerp(a, b, t);                   // 0..255 interpolation
-rgba_multiply(a, b);                  // modulation
-rgba_mix(a, b, ratio_of_256);
-```
-
-`rgba_blend` implements the Porter-Duff `over` operator using the
-src's alpha: `out = src.rgb + dst.rgb * (1 - src.a)`. Integer
-arithmetic throughout.
-
-### §44.3 — HSV
+### §44.1 — Overlap tests
 
 ```c
-hsv_to_rgba(h, s, v, a);        // hue 0..360, sat/val 0..255
-rgba_to_hsv(color, out_h, out_s, out_v);
+rect_overlap(x1, y1, w1, h1, x2, y2, w2, h2);   // AABB ↔ AABB
+circle_overlap(x1, y1, r1, x2, y2, r2);          // disc ↔ disc (squared dist, no sqrt)
 ```
 
-Useful for color pickers, hue shifting, rainbow effects.
+Both return 1 on overlap, 0 otherwise. Inputs are integer pixel
+coords; the circle test compares squared distance against squared
+radius sum, so it avoids the sqrt and stays integer-clean.
 
-### §44.4 — Predefined constants
+### §44.2 — Containment tests
 
 ```c
-BLACK, WHITE, RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, GRAY
-PURPLE, ORANGE, PINK, LIME, NAVY, TEAL, MAROON
-TRANSPARENT            // = 0
+rect_contains(rx, ry, rw, rh, px, py);   // 1 if point in rect
+circle_contains(cx, cy, r, px, py);       // 1 if point in disc
 ```
 
-Declared in `init_color()` (called by `game_init`).
+Half-open intervals on the rect side (`px ∈ [rx, rx+rw)`), so
+adjacent rects partition the plane cleanly. Used by every
+mouse-pick / unit-pick site in the game tree.
 
-### §44.5 — What this chapter does NOT cover
+### §44.3 — Center coords (sprite + indicator anchoring)
 
-- **sRGB gamma correction** — all math is linear in integer space.
-- **Color space conversions** (LAB, XYZ, OKLCH). Out of scope.
-- **HDR / wide-gamut** colors. 32-bit integer ARGB only.
+```c
+rect_center_x(x, w);      // = x + w / 2
+rect_center_y(y, h);      // = y + h / 2
+```
+
+Two scalar helpers that answer "where is the visual center of
+this rect?". Used by every HUD overlay that lands on top of a
+unit — selection rings, HP bars, damage numbers, target arrows,
+build-progress meters. The caller passes the **sprite slot rect**
+(the rectangle its render code draws into) and gets back the
+center coords; the indicator's top-left is then
+`center - indicator_size / 2`.
+
+Example (WC1 peasant; sprite drawn at `(p.x-8, p.y-16)` size
+`32 × 32`):
+
+```c
+cx = rect_center_x(p.x - 8, 32);    // = p.x + 8
+cy = rect_center_y(p.y - 16, 32);   // = p.y
+render_rect_outline(cx - 8, cy - 8, 16, 16, ring_color);   // 16×16 ring centered
+```
+
+Scalar form (one per axis) instead of a packed `(cx, cy)` return
+because callers feed the two coords into independent draw
+arguments — the scalar form avoids the `buf_word(2)` tuple a
+packed return would force.
+
+### §44.4 — What this chapter does NOT cover
+
+- **Color math** — moved to `stbdraw` (`rgba()` packer + palette
+  constants are co-located with the draw primitives that consume
+  them).
+- **OBB / rotated rects** — every consumer today works in
+  axis-aligned space; rotated bodies would need a new primitive
+  (defer until two consumers ask).
+- **Continuous swept overlap** (moving rects / circles). The
+  primitives here are instantaneous; sweeping is `stbphys`
+  territory.
+- **Stateful occupancy / spatial index** — that lives in
+  `stbgrid` (cell storage) and consumer wrappers like
+  `wc1_collision_*` (occupancy semantics) on top.
 
 ---
 
@@ -4158,6 +4185,97 @@ tonify_checklist.md.
 
 ---
 
+## Cap 57 — 2D cell-storage grid (stbgrid)
+
+*Depends on: bpp_buf (auto-injected `buf_byte` / `buf_word` / `buf_fill`)*
+*Source: new — 2026-05-18*
+*Status: COMPLETE — 2026-05-18*
+
+`stbgrid.bsm` is the **fully-generic** 2D cell-storage primitive
+(Tonify Rule 33). Same leaf-module status as `stbcol`: every
+consumer that needs "w × h cells, byte or word per cell, bounds-
+safe set/get" pulls it without dragging genre semantics.
+
+The cartridge knows nothing about what its cells mean. Consumers
+give them their own meaning — occupancy markers (`eid + 1`),
+tile-class IDs, fog-of-war layer bits, distance fields, BFS
+queues. Anti-speculation guard in the header keeps it that way:
+DO NOT add semantic APIs (`grid_is_blocked`, `grid_visibility`)
+or speculative helpers (`grid_iter`, `grid_walk`) here — those
+are consumer concerns, built on top.
+
+### §57.1 — Lifecycle
+
+```c
+grid_new_byte(w, h);     // allocate w*h * 1 byte cells, zero-init
+grid_new_word(w, h);     // allocate w*h * 8 byte (word) cells, zero-init
+grid_free(g);            // release cells + wrapper struct
+```
+
+Variant is fixed at allocation. The struct stores `cell_size`
+(1 or 8) so `grid_set` / `grid_get` dispatch internally; consumers
+never see the variant flag.
+
+### §57.2 — Access
+
+```c
+grid_set(g, x, y, val);   // OOB writes are no-ops
+grid_get(g, x, y);        // OOB reads return 0
+grid_clear(g);            // zero every cell
+grid_in_bounds(g, x, y);  // 1 if (0 ≤ x < w) AND (0 ≤ y < h)
+grid_w(g);                // dimensions accessors
+grid_h(g);
+```
+
+Bounds-safety is explicit: consumers can pass world coords
+without per-call clamping, and OOB queries return safe sentinels
+(0 for `get`, no-op for `set`). When OOB needs to mean
+"blocked" (or any non-zero sentinel), the caller wraps with an
+explicit `grid_in_bounds` check first — `stbflow.flow_is_blocked`
+is the worked example.
+
+### §57.3 — Consumer pattern (occupancy)
+
+A unit-occupancy grid for a tile-based game:
+
+```c
+auto _occupied;
+_occupied = grid_new_word(map_w, map_h);
+
+// Register a unit at (gx, gy). eid + 1 because 0 is "empty".
+grid_set(_occupied, gx, gy, eid + 1);
+
+// Free the tile.
+grid_set(_occupied, gx, gy, 0);
+
+// Blocked-by-other check (the unit must ignore its own claim).
+claim = grid_get(_occupied, gx, gy);
+if (claim != 0 && claim != self_eid + 1) {
+    // tile is held by another unit
+}
+```
+
+WC1's `wc1_collision_*` helpers in `games/rts1/wc1_movement.bsm`
+are exactly this. `stbflow`'s internal `blocked` (byte grid) and
+`dist` (word grid) are the second consumer, validated end-to-end
+in the same arc that graduated this cartridge.
+
+### §57.4 — What this chapter does NOT cover
+
+- **Semantics layer** — what cells mean. Build that in the
+  consumer (`wc1_collision_*`, `flow_is_blocked`, etc.).
+- **Iteration helpers** (`grid_iter`, `grid_walk`). Defer until
+  two consumers ask (Tonify Rule 20).
+- **Mass-fill** (`grid_fill(val)`). Same defer; stbflow loops
+  with `grid_set` to seed `FLOW_INF` and the cost is negligible
+  for path-planning cadence.
+- **Multi-cell-size variants** (4-byte halfword, 2-byte
+  quarterword). Two variants cover every consumer so far.
+- **Spatial-index queries** (rect-overlap, k-NN). Out of scope;
+  consumer cartridges built on top do their own indexing.
+
+---
+
 # Appendices
 
 ## Appendix A — Compiler Flags Reference
@@ -4210,6 +4328,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-05-12 | stbmidi added; W031 / W032 / E246 / E260 / E262 diagnostic rows added; Cap 28 lattice text replaced with `@safe` model per Rule 4 collapse | Cap 28 + Cap 48 |
 | 2026-05-12 | Eight cartridges promoted from "undocumented" to dedicated chapters: stbflow, stbraycast, stbtexture, stbai, stbscene, stbshader, stbfx, stbprofile. Reading source files + journal entries for grounding. | Caps 49-56 |
 | 2026-05-18 | stbui v2 arc closed (S1-S6 + S8.1 + S9 + S9.1 shipped; S7 deferred Rule 28). §36.4 retired-stack notice + §36.7 `ui_frame_begin` invariant + panel-origin offset gotcha. Sidequest moved to `legacy_docs/sidequest_stbui_v2_clay.md`. | Cap 36 |
+| 2026-05-18 | stbgrid arc closed (`2b7c8d4` → `cfa1e77`). Cap 57 new (stbgrid). Cap 44 rewritten (was stale "color math" boilerplate; now documents the actual `stbcol.bsm` collision-geometry API + adds `rect_center_x/y`). Layout table grew an "Engine plumbing" row entry for stbgrid + corrected stbcol's description. Tier-intro paragraph added in Layout section pointing at Tonify Rule 33. | Cap 44 + Cap 57 + Layout |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its

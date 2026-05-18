@@ -144,14 +144,13 @@ Each session ships a self-contained slice of the game, leaves the
 suite green, and is verifiable on screen. Estimated effort listed
 per session; sessions can be re-scoped mid-flight per Rule 28.
 
-**Status (2026-05-13):**
+**Status (2026-05-18):**
 
-- ✅ Session 1 — Tile renderer + map walk (CLOSED, commit `15ee36f`)
-- ✅ Session 2 — Native map format + offline converter + tileset
-  Level Editor + bang9 auto-load (CLOSED 2026-05-13). Hot-reload
-  validated end-to-end: edit `forest1.json` in Bang 9's Levels
-  tab → running `rts.bpp` reflects the new tile in ~30 ms.
-- ⏭ Session 3 — Unit sprite rendering + ECS spawn (next).
+- ✅ Sessions 1-6 CLOSED. See per-session blocks below for
+  per-commit detail. Latest: S6 shipped `5bba3de` (marquee + flow
+  + tile-claim collision) + `cfa1e77` (ring centered on sprite
+  slot via `stbcol.rect_center_x/y`).
+- ⏭ Session 7 — Combat basics (next).
 
 ### Session 0 — stbmidi audio fidelity smoke (~30 min, pre-flight)
 
@@ -394,17 +393,73 @@ Modulab editing pipeline. Shipped before opening S6:
   do NOT open S6 before the stbui direction is decided —
   S6+ work will benefit from the new layout primitives.
 
-### Session 6 — Flow-field crowd movement (~2-3h)
+### Session 6 — Flow-field crowd movement (~2-3h) — CLOSED
 
-**Goal**: when N > 5 units are selected and given the same target,
-switch from N × A* to one `stbflow` field. Validates the Stress
-Arc S4 work in a real game context.
+**Goal as planned**: when N > 5 units are selected and given the
+same target, switch from N × A* to one `stbflow` field. Validates
+the Stress Arc S4 work in a real game context.
 
-**Files**: extend `wc1_movement.bsm` with the per-tick flow-vs-A*
-decision (matches the Stress Arc S4 bench's threshold).
+**Goal as shipped (scope grew during execution):** marquee
+multi-select + flow-vs-A* dispatch + **tile-claim collision** +
+HUD ring centered on sprite slot. Collision was added mid-session
+when the smoke test surfaced peasants stacking at convergent goals
+(visually one sprite, terminal showed N=2). Ring centering was the
+follow-on polish — peasants drifting "off-center" relative to the
+ring once stacking was fixed.
 
-**Verification**: 50-unit rush to a rally point completes without
-the per-frame budget spike that 50 × A* would cause.
+**Files** (as shipped):
+- `games/rts1/wc1_input.bsm` — marquee multi-select (drag rect
+  AABB-tests every peasant; `selected_eids[]` + `selected_count`
+  replace single `selected_eid`).
+- `games/rts1/wc1_movement.bsm` — `wc1_movement_request_group`
+  dispatches per group size: ≥ FLOW_THRESHOLD (6) → one shared
+  `flow_compute` + per-unit `flow_step`; below threshold → N × A*.
+  Adds `wc1_collision_init/_register/_release/_is_blocked_for`
+  helpers backed by a shared `stbgrid` word-grid; `_step_unit`
+  transfers the tile claim atomically when the micro-target
+  changes; blocked = idle 1 frame.
+- `games/rts1/wc1_render.bsm` — `Path` gains `mode` (A* vs
+  FLOW) + `tile_gx/tile_gy` (current claim). `ecs_spawn_peasant`
+  registers the spawn tile up front.
+- `games/rts1/wc1_hud.bsm` — N rings centered on sprite slot
+  via `stbcol.rect_center_x/y`; live marquee overlay while
+  dragging.
+- `games/rts1/rts.bpp` — `wc1_movement_init` reordered to run
+  before unit spawn (so `_occupied` is allocated when spawn calls
+  `wc1_collision_register`); `P`-key debug spawn drops a 5 × 2
+  peasant cluster at the cursor so one tap crosses
+  FLOW_THRESHOLD (debug affordance; comes out when a real
+  production trigger lands).
+
+**Cartridges graduated this session:**
+- `stb/stbgrid.bsm` — generic 2D cell-storage primitive (byte +
+  word variants). Was the right home for the occupancy grid —
+  `stbcol` is leaf-math, `stbflow` is RTS-only. New fully-generic
+  cartridge per Tonify Rule 33.
+- `stbflow` refactored to consume `stbgrid` (validates the API
+  as the second consumer beyond WC1).
+- `stbcol.rect_center_x/y` — sprite-slot centering helper. Every
+  future indicator that lands on top of a unit (HP bar, damage
+  number, target arrow, build-progress overlay) reuses it.
+- Tonify Rule 33 codified — fully-generic vs genre-generic
+  cartridge tiers + the graduation pattern that produced this
+  arc's work.
+
+**Verification** (PASSED, manual smoke per user):
+- One `P`-tap → 10 peasants → marquee → right-click distant
+  goal → terminal prints `target = (gx, gy)  N=10`, peasants
+  swarm via flow field, blob forms at goal WITHOUT stacking.
+- Adjacent rings touch edge-to-edge without overlapping; each
+  ring centered on its peasant body across walk frames + facing
+  flips.
+- Single-unit click + right-click still works (S5 behavior
+  preserved).
+
+**Commits**: `2b7c8d4` (stbgrid) → `94f6257` (stbflow refactor) →
+`5bba3de` (WC1 S6 marquee + flow + collision) → `cfa1e77` (ring
+centering). Plus `64e3aea` (stbui ui_image orphan const cleanup)
++ `0a6209d` (Tonify Rule 33 doc) + `ec2f4cd` (sidequest closeout)
+shipped in the same arc.
 
 ### Session 7 — Combat basics (~3-4h)
 
@@ -635,26 +690,40 @@ Standing gates per Tonify discipline:
 
 ## Status
 
-**Sessions 1-5 CLOSED.** S6 (flow-field crowd movement) is next
-on the game arc, BUT blocked on the stbui v2 direction decision
-(see "Post-S5 tooling sidequests" above — Modulab's UI-reflow
-symptom surfaced a deeper layout-architecture question worth
-addressing before adding more consumers).
+**Sessions 1-6 CLOSED.** S6 shipped with scope growth — marquee
+multi-select + flow-field + tile-claim collision + ring centering
+all landed together (see the Session 6 block above for the full
+list of files + commits). The stbgrid graduation arc that backed
+S6's collision storage produced Tonify Rule 33 + a refactored
+stbflow as side benefits.
 
-**Next action when resuming:**
-1. Read `docs/plans/sidequest_stbui_v2_clay.md` (being written
-   2026-05-17) and decide go/no-go on the layout migration.
-2. If go: execute the stbui v2 arc first (~3-4 sessions). S6
-   benefits because flow-field debug overlay + selection UI
-   land on the new layout primitives.
-3. If no-go (defer): patch the Modulab side-panel anchoring
-   to pin to panel rect (not canvas-relative), then open S6.
+**S7 (Combat basics) is next** on the game arc. Nothing blocks it:
+flow-field + collision give attack-move the navigation it needs;
+target component already exists in Path; HP/Armor live in UnitDef;
+missiles get their own cartridge (`wc1_missiles.bsm`) per the
+module layout above.
 
-**Recent activity (2026-05-16 / 2026-05-17):** Aseprite +
-Modulab pipeline hardened end-to-end. Peasant sheet ships
-with correct frameTags, edits round-trip through Modulab's
-main canvas, file destruction bugs closed (filename field
-no longer points at Aseprite sources). See "Post-S5 tooling
-sidequests" subsection for the full shipping trail. Memory
-`project_session_20260516_modulab_aseprite_pivot.md` is the
-short-form summary.
+**S7 sketch (subject to scope refinement during execution):**
+- Damage formula (port `balancing.lua`'s basic + piercing model
+  as starting numbers; tune for feel, not DOSBox parity).
+- Attack-move command — extend right-click semantics: right-click
+  on an enemy unit = melee/range engage; right-click on ground
+  = move-and-defend.
+- Missile entity lifecycle (`wc1_missiles.bsm`): spawn at
+  attacker, travel toward target at missile-type speed, deal
+  damage on contact, despawn.
+- Death state — corpse component or simple sprite swap, no
+  resurrection in v1.
+
+**Recent activity (2026-05-18):** stbgrid arc + WC1 S6 shipped
+in 8 commits (`2b7c8d4` → `cfa1e77`). Tonify Rule 33 codifies
+fully-generic vs genre-generic cartridge taxonomy that surfaced
+during the stbgrid graduation. Suite 175/0/12 + bootstrap byte-
+stable throughout. Memory
+`project_session_20260518_stbgrid_arc.md` has the worked-example
+short form for cold-open.
+
+**Earlier activity (2026-05-16 / 2026-05-17):** Aseprite + Modulab
+pipeline hardened end-to-end; stbui v2 declarative layout shipped
+(closed `aed57c0`); WC1 S6 unblocked end-to-end by stbui v2
+closure.
