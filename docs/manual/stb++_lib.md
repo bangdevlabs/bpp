@@ -32,13 +32,42 @@ buzzword-heavy abstractions — the same flavour as the rest of B++.
 | V — Drawing | stbdraw (CPU framebuffer), stbui (widgets), stbimage (PNG decode) |
 | VI — Sprite + Tile | stbpal (palettes), stbtile (tilemaps), stbforge (animations) |
 | VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide) |
-| VIII — Engine plumbing | stbpool (pool allocator), stbcol (color math), stbasset (handle-based assets), stbprofile (sampling profiler + HUD) |
+| VIII — Engine plumbing | stbpool (pool allocator), stbcol (collision geometry), stbgrid (2D cell storage), stbasset (handle-based assets), stbprofile (sampling profiler + HUD) |
 | IX — GPU | stbrender (textures + sprites + palette LUT), stbtexture (procedural materials), stbraycast (2.5D walls), stbscene (parallax layers), stbshader (custom pipelines), stbfx (post-process chain) |
 
 The chapters keep their original numbering from `how_to_dev_b++.md`'s
 Part VI so cross-references in the rest of the codebase remain valid.
 The original `how_to_dev_b++.md` keeps a one-paragraph appendix per
 module pointing back here.
+
+### Two tiers of cartridge
+
+Every cartridge in the table above falls into one of two tiers,
+which determines who is allowed to import it and what kind of
+features may live in it:
+
+- **Fully-generic** — leaf primitives. They store data or compute
+  pure functions on it; they do not name a genre. Any cartridge
+  or game may consume them. Examples: `stbcol` (geometry tests),
+  `stbgrid` (cell storage), `bpp_buf` (raw buffers), `stbstr`.
+- **Genre-generic** — complete subsystems for one domain. They
+  may import fully-generic primitives freely and may carry
+  genre-shaped APIs, but they must not embed game-specific
+  semantics. Examples: `stbflow` (RTS / TD crowd pathing),
+  `stbphys` (platformer physics), `stbtile` (tilemaps),
+  `stbecs` (entity simulation), `stbraycast` (2.5D walls).
+
+Game-specific modules (`wc1_*.bsm`, `fps_*.bsm`, `snake_*.bsm`)
+are neither — they live inside the game's source folder, not
+under `stb/`, and may consume both tiers freely.
+
+The rule "genre-generic cartridges may consume fully-generic
+primitives" is the graduation path that lifts ad-hoc storage out
+of genre cartridges into new fully-generic ones — `stbflow` →
+`stbgrid` is the worked example, with `wc1_movement.bsm`
+validating the design as a second consumer. See **Tonify Rule 33**
+for the full decision procedure, anti-patterns, and the import-
+graph DAG rules.
 
 ---
 

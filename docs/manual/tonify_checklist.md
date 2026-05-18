@@ -2305,3 +2305,115 @@ delete the mask.
   for the C transpiler.
 - Smoke tests: `tests/test_unsigned_div.bpp`, `_mod.bpp`, `_shr.bpp`,
   `_arith_shared.bpp`.
+
+## Rule 33: Cartridge generality tiers — fully-generic vs genre-generic
+
+Every `stb*` cartridge in the library sits at one of two tiers:
+
+| Tier | Audience | Examples |
+|------|----------|----------|
+| **Fully-generic** | Any game or tool, regardless of genre | `stbcol` (geometry), `stbgrid` (cell storage), `bpp_buf` (raw buffers), `stbstr` (strings) |
+| **Genre-generic** | Programs in a specific genre lane | `stbflow` (RTS / TD crowd pathing), `stbphys` (platformer physics), `stbtile` (tilemap renderer), `stbecs` (entity simulation) |
+
+A program-specific module (`wc1_*.bsm`, `fps_*.bsm`, `snake_*.bsm`) is
+neither — it lives **inside** the game's source folder, not `stb/`.
+
+### Why the distinction matters
+
+It changes who is allowed to import the cartridge and what kind of
+features may live in it.
+
+- **Fully-generic cartridges** are leaf primitives. They store data
+  or compute pure functions on it. They must not embed genre
+  semantics. Any tier above can import them.
+- **Genre-generic cartridges** ship complete subsystems for one
+  domain. They may import fully-generic primitives freely and may
+  carry genre-shaped APIs (`flow_compute(goal_x, goal_y)`,
+  `phys_apply_gravity(body)`). They must not embed *game-specific*
+  semantics (player factions, unit names, level layouts).
+
+The rule "genre-generic cartridges may consume fully-generic
+primitives" is what made `stbgrid` happen — `stbflow` was carrying
+three ad-hoc grids that were really storage, not crowd pathing.
+Lifting them into `stbgrid` made `stbflow` smaller, gave non-RTS
+games (roguelikes, Sokoban puzzles, tower defense placement
+preview) a real handle to use.
+
+### Decision: which tier does a new cartridge belong in?
+
+Ask the two questions in order.
+
+1. **Could a non-`<genre>` game pull this cartridge and get value?**
+   Roguelike, snake, sokoban, tetris, top-down adventure, side-
+   scroller, puzzle, anything outside the genre that surfaced the
+   need. If yes → fully-generic. If no → genre-generic.
+2. **Does the cartridge store data without naming what the data
+   means?** A grid of words, a buffer of bytes, a geometry test,
+   a string. If yes → almost always fully-generic. Anything that
+   names the semantics ("occupancy", "tile class", "unit class",
+   "physics body") is genre-generic at minimum.
+
+WC1's tile-occupancy work surfaced this distinction the hard way.
+The first instinct was "put it in `stbcol`" — but `stbcol` is
+fully-generic geometry primitives, not stateful storage. The
+second instinct was "put it in `stbflow`" — but `stbflow` is RTS
+crowd pathing, and occupancy is useful to puzzle games + roguelikes
+that never touch crowd movement. The answer was a new fully-
+generic cartridge (`stbgrid`) plus a `wc1_collision_*` wrapper
+that gave the cells occupancy semantics in-game.
+
+### Cross-cartridge import rules
+
+```
+games/<g>/<g>_*.bsm       → may import fully-generic + genre-generic
+stb/<genre>*.bsm          → may import fully-generic; not other genre cartridges
+stb/<fully-generic>.bsm   → must not import any other cartridge
+```
+
+The fully-generic floor is a leaf set with zero outgoing
+dependencies into the rest of `stb/`. This is what keeps the
+import graph DAG-shaped (no cycles, no surprise transitive pulls
+— see Rule 23's `dedfb04` lesson where `stbui` reached down into
+`stbimage` and broke the rule).
+
+### When a genre-generic cartridge wants a fully-generic primitive
+
+That is the healthy graduation pattern (`stbflow` → `stbgrid`). The
+sequence is:
+
+1. The genre cartridge already carries an ad-hoc version of the
+   primitive (or a game is about to ask for the same shape).
+2. A second consumer exists or is concrete enough that Rule 20
+   (two-consumer rule) fires.
+3. Lift the primitive into a new fully-generic cartridge, with
+   the anti-speculation guard in the header (Rule 28).
+4. Refactor the genre cartridge to consume the new primitive.
+   This becomes the second-consumer test that validates the API.
+
+The graduation is single-commit, mechanical, and bisect-friendly.
+If it turns into a sprawling redesign, the primitive was not
+fully-generic enough — back out and rethink.
+
+### When NOT to graduate
+
+- One consumer, no second on the horizon. Stay in the consumer's
+  source folder (e.g. `wc1_collision.bsm` keeping the helpers
+  there) — Rule 20 + Rule 28.
+- The "primitive" naturally embeds genre vocabulary. If you
+  can't write the header docstring without saying "unit",
+  "player", "level", or "enemy", it is not fully-generic.
+- The graduation would force a cycle in the import DAG (e.g. a
+  fully-generic cartridge wanting to import a genre cartridge to
+  work). The shape is wrong — keep it in the game module.
+
+### Cross-references
+
+- Rule 20 — two-consumer promotion timing.
+- Rule 23 — cartridge minimalism (the floor-only rule for entry-
+  point cartridges).
+- Rule 26 — audit before creating; covers the "is there already a
+  cartridge that does this?" step.
+- Rule 28 — killer use case gate.
+- `docs/plans/sidequest_stbgrid.md` — worked example of a fully-
+  generic graduation that lifted stbflow's ad-hoc grids out into
+  `stbgrid`, with `wc1_movement.bsm` consuming both.
