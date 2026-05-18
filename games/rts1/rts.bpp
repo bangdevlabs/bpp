@@ -61,8 +61,9 @@ extrn world;
 // Peasant atlas handle. Loaded from the atlas_grid sister JSON
 // (see assets/sprites/wc1/peasant.json). Hot-reload registered so
 // edits to the JSON or the underlying PNG re-propagate via
-// image_hot_reload_tick_throttled.
-extrn peasant_atlas;
+// image_hot_reload_tick_throttled. peon_atlas is the orc-side
+// equivalent (same 5×13 grid, same frameTags, distinct pixels).
+extrn peasant_atlas, peon_atlas;
 
 // Camera handle — owned by main, read by tile_draw and the per-
 // entity render callback (which extrn's it). cam_pan / cam_set
@@ -161,6 +162,24 @@ main() {
         return 1;
     }
     image_hot_reload_enable(peasant_atlas);
+    // Orc peon atlas — same Aseprite shape (5 × 13 grid + 10
+    // frameTags), distinct pixels. Loaded next to the peasant
+    // atlas so the spawner can route by kind. Cache anim ids
+    // only from the peasant atlas — both sheets share the same
+    // tag names so the cached ids are valid for either, and
+    // caching twice would waste cycles.
+    auto peon_path: ptr;
+    peon_path = path_asset("assets/sprites/wc1/peon.json");
+    peon_atlas = image_load(peon_path);
+    free(peon_path);
+    if (peon_atlas == 0) {
+        put_err("rts: peon atlas load failed — exiting\n");
+        image_free(peasant_atlas);
+        wc1_map_free(map);
+        free(_map_json_path);
+        return 1;
+    }
+    image_hot_reload_enable(peon_atlas);
     // Cache anim ids from the loaded sidecar's frameTags so the
     // per-frame render lookup is two array reads + modulo math
     // (no string compare). Must run AFTER image_load but BEFORE
@@ -186,7 +205,7 @@ main() {
     // and the shared occupancy grid is allocated inside movement_init.
     wc1_input_init();
     wc1_movement_init(map);
-    _spawn_units_from_level(world, peasant_atlas, map);
+    _spawn_units_from_level(world, peasant_atlas, peon_atlas, map);
 
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
@@ -216,6 +235,7 @@ main() {
     ecs_query_free(peasant_q);
     free(world);
     image_free(peasant_atlas);
+    image_free(peon_atlas);
     cam_free(cam);
     wc1_map_free(map);
     free(_map_json_path);
@@ -232,17 +252,22 @@ main() {
 //
 // Session 7 routes both "peasant" (human side) and "peon" (orc
 // side) through ecs_spawn_peasant — they are functionally the
-// same worker unit in war1gus and share gameplay stats. Distinct
-// sprite sheets land when the orc peon atlas ships; for now both
-// render with the peasant atlas, differentiated by Faction.player.
-static void _spawn_units_from_level(world, atlas, map) {
-    auto i, n, k, p;
+// same worker unit in war1gus and share gameplay stats. The
+// atlas is chosen per-kind so peasants render with the human
+// peasant sheet and peons with the orc peon sheet; the spawn
+// archetype is identical (same component set), only the Sprite
+// component's atlas pointer differs.
+static void _spawn_units_from_level(world, peasant_a, peon_a, map) {
+    auto i, n, k, p, sprite_a;
     n = wc1_map_entity_count(map);
     for (i = 0; i < n; i++) {
         k = wc1_map_entity_kind(map, i);
         p = wc1_map_entity_player(map, i);
-        if (str_eq(k, "peasant") != 0 || str_eq(k, "peon") != 0) {
-            ecs_spawn_peasant(world, atlas,
+        sprite_a = 0;
+        if (str_eq(k, "peasant") != 0) { sprite_a = peasant_a; }
+        if (str_eq(k, "peon") != 0)    { sprite_a = peon_a; }
+        if (sprite_a != 0) {
+            ecs_spawn_peasant(world, sprite_a,
                               wc1_map_entity_gx(map, i),
                               wc1_map_entity_gy(map, i),
                               p);
