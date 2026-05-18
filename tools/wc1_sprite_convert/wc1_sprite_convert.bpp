@@ -238,39 +238,56 @@ static _emit_cell(sb, sheet_name: ptr, frame_idx, col, row, tile_w, tile_h) {
 // CONTIGUOUS per tag. Each frame still references its true PNG
 // bbox; only the iteration order changes.
 //
-// Resulting layout (peasant — 5 cols x 13 rows):
+// PNG-row → animation-type map comes from war1gus's
+// `GetFrameNumbers(5, {5, 4, 3})` round-robin schedule (peasant +
+// peon). The function emits ONE PNG row per iteration in a
+// rotating (move, attack, death) sequence, with the move counter
+// decremented by one up front. Tracing manually for peasant:
 //
-//   frame_idx 0..4   = idle facings N..S          (PNG row 0, cols 0..4)
-//   frame_idx 5..9   = walk_N cycle               (PNG col 0, rows 1..5)
-//   frame_idx 10..14 = walk_NE cycle              (PNG col 1, rows 1..5)
-//   frame_idx 15..19 = walk_E  cycle              (PNG col 2, rows 1..5)
-//   frame_idx 20..24 = walk_SE cycle              (PNG col 3, rows 1..5)
-//   frame_idx 25..29 = walk_S  cycle              (PNG col 4, rows 1..5)
-//   frame_idx 30..33 = chop_N  cycle              (PNG col 0, rows 6..9)
-//   frame_idx 34..37 = chop_NE cycle              (PNG col 1, rows 6..9)
-//   frame_idx 38..41 = chop_E  cycle              (PNG col 2, rows 6..9)
-//   frame_idx 42..45 = chop_SE cycle              (PNG col 3, rows 6..9)
-//   frame_idx 46..49 = chop_S  cycle              (PNG col 4, rows 6..9)
-//   frame_idx 50..52 = die_N   cycle              (PNG col 0, rows 10..12)
-//   frame_idx 53..55 = die_NE  cycle              (PNG col 1, rows 10..12)
-//   frame_idx 56..58 = die_E   cycle              (PNG col 2, rows 10..12)
-//   frame_idx 59..61 = die_SE  cycle              (PNG col 3, rows 10..12)
-//   frame_idx 62..64 = die_S   cycle              (PNG col 4, rows 10..12)
+//   row 0:  idle (one frame per direction)
+//   row 1:  chop[0]  per direction        row 7:  chop[2]
+//   row 2:  die[0]   per direction        row 8:  die[2]
+//   row 3:  walk[0]  per direction        row 9:  walk[2]
+//   row 4:  chop[1]                       row 10: chop[3]
+//   row 5:  die[1]                        row 11: walk[3]
+//   row 6:  walk[1]                       row 12: unused
 //
-// Chop and die frame counts come from war1gus's frameNumbers_5_5_4_3
-// schema (5 directions; 5 move / 4 attack / 3 death frames per
-// direction). war1tool emits the PNG row-major with IPR=5, so each
-// PNG column corresponds to one facing — same convention walk
-// already uses. The chop/die emission below mirrors that
-// direction-major layout so tag ranges stay contiguous.
+// Per-direction frame counts: 1 idle + 4 walk + 4 chop + 3 die +
+// 1 unused-pad = 13 rows × 5 cols = 65 cells.  Each PNG column
+// IS one facing (N / NE / E / SE / S).
+//
+// Aseprite emission order is direction-major per anim type so the
+// tag ranges stay contiguous:
+//
+//   frame_idx 0..4    idle N..S            (row 0)
+//   frame_idx 5..24   walk N..S × 4 frames (rows 3, 6, 9, 11)
+//   frame_idx 25..44  chop N..S × 4 frames (rows 1, 4, 7, 10)
+//   frame_idx 45..59  die  N..S × 3 frames (rows 2, 5, 8)
+//   frame_idx 60..64  row 12 (unused-pad — no tag refers to these
+//                     but the JSON's `frames` array must cover
+//                     every PNG cell to stay schema-valid).
+//
+// (For non-peasant unit kinds with different frameNumbers, this
+// emission needs a per-kind variant — defer until a real
+// consumer adds footman / archer / cleric / catapult sheets.)
 //
 // Returns 0 on success, -1 on write failure.
 static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
                      sheet_name: ptr, image_w, image_h,
                      cols, rows, tile_w, tile_h) {
-    auto sb, idx, dir, frame_in_cycle, row, col, rc;
+    auto sb, idx, dir, frame_in_cycle, col, rc;
+    auto walk_rows, chop_rows, die_rows;
 
     sb = strbuf_new();
+
+    // PNG-row maps per anim type, derived from war1gus's
+    // frameNumbers_5_5_4_3 round-robin (see header comment).
+    walk_rows = buf_word(4);
+    walk_rows[0] = 3; walk_rows[1] = 6; walk_rows[2] = 9; walk_rows[3] = 11;
+    chop_rows = buf_word(4);
+    chop_rows[0] = 1; chop_rows[1] = 4; chop_rows[2] = 7; chop_rows[3] = 10;
+    die_rows = buf_word(3);
+    die_rows[0] = 2; die_rows[1] = 5; die_rows[2] = 8;
 
     // Top-level open + frames array (Aseprite "Array" output).
     sb = strbuf_cat(sb, "{\"frames\":[");
@@ -283,42 +300,51 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
         idx++;
     }
 
-    // Walk: one column per direction, 5 frames each (PNG rows 1..5).
-    // Loop direction-first so frames for the same direction land at
-    // contiguous indices the tag can address with a from..to range.
-    for (dir = 0; dir < cols; dir++) {
-        for (frame_in_cycle = 0; frame_in_cycle < 5; frame_in_cycle++) {
-            sb = strbuf_ch(sb, ',');
-            sb = _emit_cell(sb, sheet_name, idx,
-                            dir, 1 + frame_in_cycle,
-                            tile_w, tile_h);
-            idx++;
-        }
-    }
-
-    // Chop: one column per direction, 4 frames each (PNG rows 6..9).
-    // Direction-major like walk so each tag covers a contiguous
-    // frame_idx range.
+    // Walk: 4 frames per direction at rows {3, 6, 9, 11}.
+    // Direction-major so each tag's from..to range is contiguous.
     for (dir = 0; dir < cols; dir++) {
         for (frame_in_cycle = 0; frame_in_cycle < 4; frame_in_cycle++) {
             sb = strbuf_ch(sb, ',');
             sb = _emit_cell(sb, sheet_name, idx,
-                            dir, 6 + frame_in_cycle,
+                            dir, walk_rows[frame_in_cycle],
                             tile_w, tile_h);
             idx++;
         }
     }
 
-    // Die: one column per direction, 3 frames each (PNG rows 10..12).
+    // Chop: 4 frames per direction at rows {1, 4, 7, 10}.
     for (dir = 0; dir < cols; dir++) {
-        for (frame_in_cycle = 0; frame_in_cycle < 3; frame_in_cycle++) {
+        for (frame_in_cycle = 0; frame_in_cycle < 4; frame_in_cycle++) {
             sb = strbuf_ch(sb, ',');
             sb = _emit_cell(sb, sheet_name, idx,
-                            dir, 10 + frame_in_cycle,
+                            dir, chop_rows[frame_in_cycle],
                             tile_w, tile_h);
             idx++;
         }
     }
+
+    // Die: 3 frames per direction at rows {2, 5, 8}.
+    for (dir = 0; dir < cols; dir++) {
+        for (frame_in_cycle = 0; frame_in_cycle < 3; frame_in_cycle++) {
+            sb = strbuf_ch(sb, ',');
+            sb = _emit_cell(sb, sheet_name, idx,
+                            dir, die_rows[frame_in_cycle],
+                            tile_w, tile_h);
+            idx++;
+        }
+    }
+
+    // Unused row 12 — emit as padding so the JSON `frames` array
+    // covers every PNG cell. No tag references these.
+    for (col = 0; col < cols; col++) {
+        sb = strbuf_ch(sb, ',');
+        sb = _emit_cell(sb, sheet_name, idx, col, 12, tile_w, tile_h);
+        idx++;
+    }
+
+    free(walk_rows);
+    free(chop_rows);
+    free(die_rows);
     sb = strbuf_cat(sb, "],");
 
     // Meta block with image ref, dimensions, and frameTags.
@@ -331,28 +357,28 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
     sb = strbuf_cat(sb, "},\"scale\":\"1\",\"format\":\"RGBA8888\",");
 
     // frameTags — index ranges match the reordered emission above.
-    // walk_X cycles are 5 frames apiece, idle is 1 frame apiece.
+    // Walk/chop are 4 frames per direction, die is 3 frames.
     sb = strbuf_cat(sb, "\"frameTags\":[");
     sb = _emit_frame_tag(sb, "idle_N",   0,  0);  sb = strbuf_ch(sb, ',');
     sb = _emit_frame_tag(sb, "idle_NE",  1,  1);  sb = strbuf_ch(sb, ',');
     sb = _emit_frame_tag(sb, "idle_E",   2,  2);  sb = strbuf_ch(sb, ',');
     sb = _emit_frame_tag(sb, "idle_SE",  3,  3);  sb = strbuf_ch(sb, ',');
     sb = _emit_frame_tag(sb, "idle_S",   4,  4);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_N",   5,  9);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_NE", 10, 14);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_E",  15, 19);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_SE", 20, 24);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_S",  25, 29);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_N",  30, 33);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_NE", 34, 37);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_E",  38, 41);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_SE", 42, 45);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_S",  46, 49);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_N",   50, 52);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_NE",  53, 55);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_E",   56, 58);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_SE",  59, 61);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_S",   62, 64);
+    sb = _emit_frame_tag(sb, "walk_N",   5,  8);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_NE",  9, 12);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_E",  13, 16);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_SE", 17, 20);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "walk_S",  21, 24);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "chop_N",  25, 28);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "chop_NE", 29, 32);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "chop_E",  33, 36);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "chop_SE", 37, 40);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "chop_S",  41, 44);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "die_N",   45, 47);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "die_NE",  48, 50);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "die_E",   51, 53);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "die_SE",  54, 56);  sb = strbuf_ch(sb, ',');
+    sb = _emit_frame_tag(sb, "die_S",   57, 59);
     sb = strbuf_cat(sb, "]}}\n");
 
     rc = file_write_all(sidecar_path, sb, strbuf_len(sb));
