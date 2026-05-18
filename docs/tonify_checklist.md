@@ -1372,6 +1372,20 @@ main() {
   it." Then every game that doesn't use atlases polls a watch list
   every frame. The poll cost is small but the principle is what
   matters: cartridges should not act on behalf of callers.
+- **2026-05-17 caught in real life:** stbui v2 engine commit
+  `dedfb04` added `import "stbimage.bsm"` so a new `ui_image`
+  widget could call `image_draw_size`. Same anti-pattern one
+  layer deeper — stbui is a Layer 2 cartridge that now forced
+  every consumer of stbui to transitively load stbimage. Cost
+  surfaced days later: stbgame → stbui → stbimage chain summed
+  past the parser's `fbuf` cap (286 KB > 256 KB) and silently
+  corrupted the heap, SIGSEGV'ing every game compile. Even after
+  the parser bug was fixed at the root (`cd6d00e`), the
+  speculative import was reverted (`dba3e2a`) because the
+  widget had zero consumers across games / tools / examples /
+  tests. The rule applies whether the cartridge being inflated
+  is `stbgame` or `stbui` itself: no convenience import without
+  a verified consumer.
 
 **The discipline that follows the rule:** the cartridge ships the
 floor. The caller imports what it needs. The dependency graph
@@ -1880,6 +1894,19 @@ adding more.
 - **Phase annotation collapse 2026-05-11**: this rule.
   System being collapsed precisely because earlier additions
   failed the killer-use-case test retrospectively.
+- **`ui_image` widget revert 2026-05-17 (commit `dba3e2a`)**: the
+  stbui v2 engine commit `dedfb04` had added a `ui_image(img,
+  frame_idx)` widget speculatively, on the assumption that
+  declarative layouts would want to compose atlas frames inline.
+  Killer-use-case test would have rejected at write time — there
+  was no consumer asking for it. The cost surfaced two ways: (a)
+  the supporting `import "stbimage.bsm"` pushed the
+  stbgame → stbui → stbimage import chain past the parser's fbuf
+  cap, SIGSEGV'ing every game compile (root-fixed by `cd6d00e`);
+  (b) the widget itself had zero call sites across all games /
+  tools / examples / tests at revert time. Both Rules 23 and 28
+  pointed the same direction: revert until a real consumer needs
+  the API + can shape it for what they actually want.
 
 The rule does not say "never add features." It says "demand
 specific bug-class evidence per addition, and prefer the smaller

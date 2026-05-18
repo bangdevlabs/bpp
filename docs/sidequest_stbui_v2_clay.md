@@ -1,6 +1,20 @@
 # Sidequest — stbui v2: Clay-inspired layout for B++
 
-**Status:** GO — design locked 2026-05-17, ready to execute S1.
+**Status:** PARTIAL CLOSED 2026-05-17 — **S1 → S4 SHIPPED** (engine
++ aseprite viewer + Modulab editor + level_editor migrations).
+**S5 → S9 remain open** (fxlab, the_bug, mini_synth + sprite_viewer,
+Bang 9 chrome, v1 deprecation).
+
+**Shipping trail (2026-05-17):**
+- S1 — `c6d8ee8` (plan + grid/zoom UI) + `dedfb04` (engine integrated)
+- S2 — `324c419` (aseprite viewer)
+- S3 — `54ba80d` (Modulab editor + mixed-sizing helpers)
+- S4 — `b484a17` (level_editor)
+- Bonus closure: parser fbuf overflow that S1's `import stbimage`
+  surfaced was killed by `cd6d00e` (heap-per-file refactor); the
+  speculative `ui_image` widget itself reverted by `dba3e2a`
+  (Rule 23 + Rule 28 — zero consumers, paying full import-budget
+  tax). See journal entry 2026-05-17 for the full narrative.
 **Trigger:** Modulab zoom +/- buttons reflow the entire panel
 because side widgets are anchored canvas-relative. Symptom of a
 deeper issue — stbui's "explicit pixel positioning" model
@@ -221,23 +235,49 @@ each consumer migrate when convenient. v1 stays until the last
 consumer moves.
 
 Concrete order:
-1. **Session 1**: ship stbui v2 engine (containers + sizing +
-   layout passes + render-command output) + first widgets
-   (`ui_text`, `ui_button`, `ui_spacer`, `ui_image`). One test
-   consumer: `examples/stbui_v2_smoke.bpp` that lays out a
-   3-panel demo + dumps the render commands.
-2. **Session 2**: migrate Aseprite viewer (smallest active
-   consumer, 4 panels). Validates the model on a real UI with
-   nested boxes + grow + fixed sizing.
-3. **Session 3**: migrate Modulab editor — biggest payoff.
-   Status line / palette / phase4 / layer / frame strip /
-   canvas viewport all flow naturally. Zoom changes only the
-   canvas's inner pixel scale, never the surrounding layout.
-4. **Session 4**: migrate Bang 9 tabs OR level_editor OR fxlab.
-   Whichever the user wants exercised next.
-5. **Session 5 (cleanup)**: with three migrations live, deprecate
-   v1 widgets that have no consumers left. Document the
-   `gui_button(x, y, w, h, label)` rosetta for any holdouts.
+1. **Session 1 — CLOSED 2026-05-17 (`c6d8ee8` + `dedfb04`)**: stbui
+   v2 engine integrated INTO `stb/stbui.bsm` (NOT a parallel cartridge —
+   user corrected the first draft). ~530 LOC: containers + sizing +
+   four-pass layout + render-command output + widgets (`ui_text`,
+   `ui_button`, `ui_image`, `ui_spacer`). Regression net at
+   `tests/test_stbui_layout.bpp` covers FIT/GROW/FIXED/PERCENT
+   combos (8 scenarios, 28 assertions). NOTE: `ui_image` later
+   reverted by `dba3e2a` — zero consumers, paid the import-budget
+   tax that broke pathfind via fbuf overflow. Re-add when a real
+   consumer surfaces.
+2. **Session 2 — CLOSED 2026-05-17 (`324c419`)**: Aseprite viewer
+   migration. Smallest active consumer used as the ergonomics
+   gate. Net LOC + clarity delta passed the gate criteria; cleared
+   S3.
+3. **Session 3 — CLOSED 2026-05-17 (`54ba80d`)**: Modulab editor
+   migration. Canvas viewport became the only GROW slot; side
+   panels (palette / frame strip / phase4 sidebar / layer panel)
+   stay fixed-width and don't budge on zoom. Two visual fixes
+   surfaced from user smoke: canvas centered inside its declared
+   bbox (was shoved to top-left at low zoom), zoom clamped to the
+   largest integer that fits (zoom 41 was overflowing into phase4).
+   Mixed-sizing helpers added to stbui after S2 showed them as the
+   most common asymmetric cases: `ui_col_fixed_w`, `ui_row_fixed_h`,
+   `ui_col_fixed`.
+4. **Session 4 — CLOSED 2026-05-17 (`b484a17`)**: level_editor
+   migration. User's call: "migra tools standalone antes do bang9
+   que engloba elas" — inner tools first, host last. Killed
+   `picker_x = px + 700` hardcode + `avail_w = pw - 40 - 80`
+   chrome-math; grid centered in canvas bbox; picker Y separated
+   from canvas Y so the centered grid doesn't drag the right
+   column vertically.
+5. **Session 5 — OPEN**: fxlab migration. Slider arrangement
+   currently explicit y-offsets, one per slider.
+6. **Session 6 — OPEN**: the_bug migration. Debug panels +
+   inspector layout.
+7. **Session 7 — OPEN**: mini_synth + sprite_viewer migrations
+   batched (small consumers).
+8. **Session 8 — OPEN**: Bang 9 chrome migration. The biggest
+   single consumer; ~7 tabs each computing panel rects manually
+   today.
+9. **Session 9 (cleanup) — OPEN**: with all consumers migrated,
+   deprecate v1 widgets that have no consumers left. Document
+   the `gui_button(x, y, w, h, label)` rosetta for any holdouts.
 
 Each session ~3-4h, bisect-friendly per migration. v1 stays
 green throughout.
