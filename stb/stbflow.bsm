@@ -23,23 +23,28 @@
 //   flow_step(field, gx, gy, out_step)     — out_step[0]=dx, out_step[1]=dy
 //                                            in {-1, 0, 1}^2 (4-connected)
 //
-// Storage layout is parallel arrays sized w*h: `blocked` (1 byte
-// per cell), `dist` (1 word per cell), `queue` (1 word per cell —
-// BFS each cell at most once, so capacity w*h is sufficient).
+// Storage: `blocked` and `dist` are stbgrid handles (byte + word
+// variants). `queue` stays a `buf_word` because it is a linear
+// FIFO with head/tail cursors — not a spatial grid. Tile coords
+// and bounds-safety go through the grid wrappers; the queue
+// stores pre-computed linear indices `gy * w + gx` that are
+// decomposed on dequeue.
 //
 // 4-connected only by design. Diagonal motion plus √2 edge cost
 // would require a Dijkstra heap (see stbpath) and changes the BFS
 // invariant; promote to that only when a real consumer asks. Same
 // restraint applies to multi-goal fields and moving goals.
 //
-// Portability tier: pure B++ over `buf_word` / `buf_byte`. No SIMD,
+// Portability tier: pure B++ over stbgrid + `buf_word`. No SIMD,
 // no FFI; C-emit-clean.
+
+import "stbgrid.bsm";
 
 struct FlowField {
     w, h,         // grid dimensions in cells
-    blocked,      // w*h byte array: 0 = walkable, 1 = blocked
-    dist,         // w*h word array: hops from goal; FLOW_INF if unreachable
-    queue         // w*h word array: BFS queue, used linearly each compute
+    blocked,      // Grid (byte variant): 0 = walkable, 1 = blocked
+    dist,         // Grid (word variant): hops from goal; FLOW_INF if unreachable
+    queue         // buf_word(w * h): linear BFS queue, head/tail cursors
 }
 
 // Sentinel value for "no path to goal." Any positive cell distance
@@ -56,20 +61,16 @@ void init_flow() {
 // ── Lifecycle ───────────────────────────────────────────────────
 
 // Allocate a new FlowField for a (w x h) grid. All cells start
-// walkable. The distance field is not initialised here — the first
-// `flow_compute` call seeds it per-query.
+// walkable. The distance field is seeded per-query inside
+// `flow_compute` — its initial contents are unspecified.
 flow_new(w, h) {
-    auto f: FlowField, n;
+    auto f: FlowField;
     f = malloc(sizeof(FlowField));
     f.w = w;
     f.h = h;
-    n = w * h;
-
-    f.blocked = buf_byte(n);
-    f.dist    = buf_word(n);
-    f.queue   = buf_word(n);
-
-    buf_fill(f.blocked, 0, n);
+    f.blocked = grid_new_byte(w, h);
+    f.dist    = grid_new_word(w, h);
+    f.queue   = buf_word(w * h);
     return f;
 }
 
@@ -77,8 +78,8 @@ flow_new(w, h) {
 void flow_free(field) {
     auto f: FlowField;
     f = field;
-    if (f.blocked != 0) { free(f.blocked); }
-    if (f.dist    != 0) { free(f.dist); }
+    if (f.blocked != 0) { grid_free(f.blocked); }
+    if (f.dist    != 0) { grid_free(f.dist); }
     if (f.queue   != 0) { free(f.queue); }
     free(field);
 }
@@ -86,27 +87,23 @@ void flow_free(field) {
 // ── Cell access ─────────────────────────────────────────────────
 
 // Mark a cell walkable (blocked = 0) or blocked (blocked = 1).
-// Out-of-bounds writes are silently ignored, matching stbpath's
-// convention.
+// Out-of-bounds writes are silently ignored — grid_set takes
+// care of the bounds check.
 void flow_set_blocked(field, gx, gy, blocked) {
     auto f: FlowField;
     f = field;
-    if (gx < 0) { return; }
-    if (gy < 0) { return; }
-    if (gx >= f.w) { return; }
-    if (gy >= f.h) { return; }
-    poke(f.blocked + gy * f.w + gx, blocked);
+    grid_set(f.blocked, gx, gy, blocked);
 }
 
-// Returns 1 for blocked or out-of-bounds, 0 for walkable.
+// Returns 1 for blocked or out-of-bounds, 0 for walkable. The
+// explicit bounds branch is needed because grid_get returns 0
+// for OOB (which would mean "walkable") — flow's contract is
+// the opposite: OOB cells are treated as blocked.
 flow_is_blocked(field, gx, gy) {
     auto f: FlowField;
     f = field;
-    if (gx < 0) { return 1; }
-    if (gy < 0) { return 1; }
-    if (gx >= f.w) { return 1; }
-    if (gy >= f.h) { return 1; }
-    return peek(f.blocked + gy * f.w + gx);
+    if (grid_in_bounds(f.blocked, gx, gy) == 0) { return 1; }
+    return grid_get(f.blocked, gx, gy);
 }
 
 // ── Compute ─────────────────────────────────────────────────────
@@ -120,16 +117,21 @@ flow_is_blocked(field, gx, gy) {
 // invalid goal get a consistent "all unreachable" result instead of
 // a silent half-filled field.
 void flow_compute(field, goal_x, goal_y) {
-    auto f: FlowField, n, i;
+    auto f: FlowField, x, y;
     auto head, tail, cur, cx, cy, cur_dist;
-    auto nx, ny, nidx;
+    auto nx, ny;
 
     f = field;
-    n = f.w * f.h;
 
-    // Seed dist with the unreachable sentinel.
-    for (i = 0; i < n; i++) {
-        f.dist[i] = FLOW_INF;
+    // Seed dist with the unreachable sentinel. grid_set's bounds
+    // check is redundant here (we iterate the in-bounds rectangle)
+    // but the cost is a handful of µs per call on a 64×64 grid —
+    // acceptable for a path-planning op that runs once per group
+    // command, not per frame.
+    for (y = 0; y < f.h; y++) {
+        for (x = 0; x < f.w; x++) {
+            grid_set(f.dist, x, y, FLOW_INF);
+        }
     }
 
     // Reject invalid goals up front so the BFS invariant holds.
@@ -137,11 +139,11 @@ void flow_compute(field, goal_x, goal_y) {
     if (goal_y < 0) { return; }
     if (goal_x >= f.w) { return; }
     if (goal_y >= f.h) { return; }
-    if (peek(f.blocked + goal_y * f.w + goal_x) != 0) { return; }
+    if (grid_get(f.blocked, goal_x, goal_y) != 0) { return; }
 
     head = 0;
     tail = 0;
-    f.dist[goal_y * f.w + goal_x] = 0;
+    grid_set(f.dist, goal_x, goal_y, 0);
     f.queue[tail] = goal_y * f.w + goal_x;
     tail += 1;
 
@@ -151,18 +153,17 @@ void flow_compute(field, goal_x, goal_y) {
     while (head < tail) {
         cur = f.queue[head];
         head += 1;
-        cur_dist = f.dist[cur];
         cx = cur % f.w;
         cy = cur / f.w;
+        cur_dist = grid_get(f.dist, cx, cy);
 
         // North neighbour.
         ny = cy - 1;
         if (ny >= 0) {
-            nidx = ny * f.w + cx;
-            if (peek(f.blocked + nidx) == 0) {
-                if (f.dist[nidx] == FLOW_INF) {
-                    f.dist[nidx] = cur_dist + 1;
-                    f.queue[tail] = nidx;
+            if (grid_get(f.blocked, cx, ny) == 0) {
+                if (grid_get(f.dist, cx, ny) == FLOW_INF) {
+                    grid_set(f.dist, cx, ny, cur_dist + 1);
+                    f.queue[tail] = ny * f.w + cx;
                     tail += 1;
                 }
             }
@@ -171,11 +172,10 @@ void flow_compute(field, goal_x, goal_y) {
         // South neighbour.
         ny = cy + 1;
         if (ny < f.h) {
-            nidx = ny * f.w + cx;
-            if (peek(f.blocked + nidx) == 0) {
-                if (f.dist[nidx] == FLOW_INF) {
-                    f.dist[nidx] = cur_dist + 1;
-                    f.queue[tail] = nidx;
+            if (grid_get(f.blocked, cx, ny) == 0) {
+                if (grid_get(f.dist, cx, ny) == FLOW_INF) {
+                    grid_set(f.dist, cx, ny, cur_dist + 1);
+                    f.queue[tail] = ny * f.w + cx;
                     tail += 1;
                 }
             }
@@ -184,11 +184,10 @@ void flow_compute(field, goal_x, goal_y) {
         // West neighbour.
         nx = cx - 1;
         if (nx >= 0) {
-            nidx = cy * f.w + nx;
-            if (peek(f.blocked + nidx) == 0) {
-                if (f.dist[nidx] == FLOW_INF) {
-                    f.dist[nidx] = cur_dist + 1;
-                    f.queue[tail] = nidx;
+            if (grid_get(f.blocked, nx, cy) == 0) {
+                if (grid_get(f.dist, nx, cy) == FLOW_INF) {
+                    grid_set(f.dist, nx, cy, cur_dist + 1);
+                    f.queue[tail] = cy * f.w + nx;
                     tail += 1;
                 }
             }
@@ -197,11 +196,10 @@ void flow_compute(field, goal_x, goal_y) {
         // East neighbour.
         nx = cx + 1;
         if (nx < f.w) {
-            nidx = cy * f.w + nx;
-            if (peek(f.blocked + nidx) == 0) {
-                if (f.dist[nidx] == FLOW_INF) {
-                    f.dist[nidx] = cur_dist + 1;
-                    f.queue[tail] = nidx;
+            if (grid_get(f.blocked, nx, cy) == 0) {
+                if (grid_get(f.dist, nx, cy) == FLOW_INF) {
+                    grid_set(f.dist, nx, cy, cur_dist + 1);
+                    f.queue[tail] = cy * f.w + nx;
                     tail += 1;
                 }
             }
@@ -212,15 +210,14 @@ void flow_compute(field, goal_x, goal_y) {
 // ── Sampling ────────────────────────────────────────────────────
 
 // Distance from (gx, gy) to the goal. Returns FLOW_INF for blocked,
-// out-of-bounds, or unreachable cells.
+// out-of-bounds, or unreachable cells. The explicit bounds branch
+// preserves the OOB → FLOW_INF contract — grid_get itself would
+// return 0 for OOB, which would mean "at the goal".
 flow_dist(field, gx, gy) {
     auto f: FlowField;
     f = field;
-    if (gx < 0) { return FLOW_INF; }
-    if (gy < 0) { return FLOW_INF; }
-    if (gx >= f.w) { return FLOW_INF; }
-    if (gy >= f.h) { return FLOW_INF; }
-    return f.dist[gy * f.w + gx];
+    if (grid_in_bounds(f.dist, gx, gy) == 0) { return FLOW_INF; }
+    return grid_get(f.dist, gx, gy);
 }
 
 // Fill `out_step` with the unit step (dx, dy) a unit at (gx, gy)
@@ -239,13 +236,10 @@ void flow_step(field, gx, gy, out_step) {
     f = field;
     out_step[0] = 0;
     out_step[1] = 0;
-    if (gx < 0) { return; }
-    if (gy < 0) { return; }
-    if (gx >= f.w) { return; }
-    if (gy >= f.h) { return; }
-    if (peek(f.blocked + gy * f.w + gx) != 0) { return; }
+    if (grid_in_bounds(f.dist, gx, gy) == 0) { return; }
+    if (grid_get(f.blocked, gx, gy) != 0) { return; }
 
-    here = f.dist[gy * f.w + gx];
+    here = grid_get(f.dist, gx, gy);
     if (here == FLOW_INF) { return; }
     if (here == 0) { return; }      // already at the goal
 
@@ -255,24 +249,26 @@ void flow_step(field, gx, gy, out_step) {
 
     // North. Strict less-than: only pick a neighbour that actually
     // descends, so the (0, 0) result is reserved for "already at the
-    // goal" or "unreachable."
+    // goal" or "unreachable." grid_get returns 0 for OOB, but here
+    // we still need the bounds branch because a 0 OOB read would
+    // wrongly look like "best descent" (0 < anything positive).
     if (gy - 1 >= 0) {
-        nd = f.dist[(gy - 1) * f.w + gx];
+        nd = grid_get(f.dist, gx, gy - 1);
         if (nd < best) { best = nd; best_dx = 0; best_dy = -1; }
     }
     // South.
     if (gy + 1 < f.h) {
-        nd = f.dist[(gy + 1) * f.w + gx];
+        nd = grid_get(f.dist, gx, gy + 1);
         if (nd < best) { best = nd; best_dx = 0; best_dy = 1; }
     }
     // West.
     if (gx - 1 >= 0) {
-        nd = f.dist[gy * f.w + (gx - 1)];
+        nd = grid_get(f.dist, gx - 1, gy);
         if (nd < best) { best = nd; best_dx = -1; best_dy = 0; }
     }
     // East.
     if (gx + 1 < f.w) {
-        nd = f.dist[gy * f.w + (gx + 1)];
+        nd = grid_get(f.dist, gx + 1, gy);
         if (nd < best) { best = nd; best_dx = 1; best_dy = 0; }
     }
 
