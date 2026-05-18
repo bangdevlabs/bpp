@@ -114,6 +114,11 @@ main(argc, argv) {
         // Recycle per-frame UI scratch (widget state, layout
         // bookkeeping). stbwindow no longer ticks this for us.
         ui_arena_reset();
+        // v2 layout per-frame reset (S8.1, 2026-05-18). Must
+        // fire here ONCE before the shell's ui_layout_begin AND
+        // each embedded tool's own ui_layout_begin. This is the
+        // primitive that unblocks the S8 re-application below.
+        ui_frame_begin();
 
         // React to user-driven window resize. The platform polled
         // the new size during _stb_poll_events; here we pick it up,
@@ -184,32 +189,52 @@ main(argc, argv) {
             }
         }
 
-        // Top-to-bottom layout: menubar, tab strip, panel body,
-        // status bar. Each section knows its own height; the width
-        // and the panel body height flex with the live window.
+        // Declarative shell layout (S8 / S8.1 of the stbui v2 arc).
         //
-        // Reverted from the v2 declarative tree that S8 of the
-        // stbui v2 arc attempted: `ui_layout_begin / ui_box /
-        // ui_layout_end` is not safely re-entrant within a single
-        // frame today. Calling it at the shell level wiped the
-        // node pool the embedded tools (Modulab S3, level_editor
-        // S4, fxlab S5, the_bug S6) depend on for their own
-        // declared layouts, AND double-swapped the v2 click
-        // buffer the Aseprite viewer's ui_button needs to detect
-        // clicks. The chrome math here is the canonical S8
-        // intent — promote to the v2 tree once `ui_layout_begin`
-        // grows a "nested" mode (or move the click-swap into a
-        // separate `ui_frame_begin` that fires once per frame).
-        // Tracked as S8.1 in `docs/plans/sidequest_stbui_v2_clay.md`.
-        shell_draw_menubar(0, 0, win_w, MENUBAR_H);
-        shell_draw_tabs(0, MENUBAR_H, win_w, TABSTRIP_H);
+        //   COL win
+        //     ├─ ROW menu    — fixed MENUBAR_H tall
+        //     ├─ ROW tabs    — fixed TABSTRIP_H tall
+        //     ├─ ROW panel   — grow vertically
+        //     └─ ROW status  — fixed STATUSBAR_H tall
+        //
+        // S8 first attempted this 2026-05-18 morning and shipped it
+        // — but `ui_layout_begin` was destructive (reset node pool
+        // + swap click buffers), and the embedded tools' own
+        // `ui_layout_begin` calls clobbered the shell's state.
+        // Statusbar rendered at garbage Y, aseprite viewer's
+        // `ui_button` calls saw zeroed prev_clicks. S8.1 split
+        // `ui_frame_begin` (per-frame click swap, fires once at the
+        // top of this loop) from `ui_layout_begin` (per-tree
+        // pool reset, safe to call multiple times per frame). With
+        // the split, both shell and embedded tools coexist.
+        //
+        // Critical: read ALL shell bboxes into locals BEFORE
+        // `panels_draw` runs. The embedded tool's `ui_layout_begin`
+        // resets the node pool — `ui_node_y(status_idx)` after
+        // panels_draw would read a tool node's bbox, not the
+        // shell's. Caching locally before delegation keeps the
+        // shell layout stable across the embedded call.
+        auto menu_idx, tabs_idx, panel_idx, status_idx;
+        auto menu_y, menu_h, tabs_y, tabs_h;
+        auto panel_y, panel_h, status_y, status_h;
+        ui_layout_begin(win_w, win_h);
+        ui_box(UI_LAYOUT_COL, ui_sz_fixed(win_w), ui_sz_fixed(win_h), 0, 0);
+            menu_idx   = ui_row_fixed_h(MENUBAR_H,  0); ui_end();
+            tabs_idx   = ui_row_fixed_h(TABSTRIP_H, 0); ui_end();
+            panel_idx  = ui_row_grow(0);                ui_end();
+            status_idx = ui_row_fixed_h(STATUSBAR_H,0); ui_end();
+        ui_end();
+        ui_layout_end();
 
-        auto panel_y, panel_h;
-        panel_y = MENUBAR_H + TABSTRIP_H;
-        panel_h = win_h - panel_y - STATUSBAR_H;
+        menu_y   = ui_node_y(menu_idx);   menu_h   = ui_node_h(menu_idx);
+        tabs_y   = ui_node_y(tabs_idx);   tabs_h   = ui_node_h(tabs_idx);
+        panel_y  = ui_node_y(panel_idx);  panel_h  = ui_node_h(panel_idx);
+        status_y = ui_node_y(status_idx); status_h = ui_node_h(status_idx);
+
+        shell_draw_menubar(0, menu_y, win_w, menu_h);
+        shell_draw_tabs(0, tabs_y, win_w, tabs_h);
         panels_draw(0, panel_y, win_w, panel_h);
-
-        shell_draw_statusbar(0, win_h - STATUSBAR_H, win_w, STATUSBAR_H);
+        shell_draw_statusbar(0, status_y, win_w, status_h);
 
         // Help overlay — drawn last so it sits above every other
         // chrome element. No-op when the overlay isn't toggled on,

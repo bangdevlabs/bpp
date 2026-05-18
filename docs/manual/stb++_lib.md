@@ -1823,26 +1823,23 @@ All widgets are stateless from the UI's perspective — you pass in
 the current state and get the new state back. The widget internals
 handle hover animations, click detection, and drawing.
 
-### §36.4 — Layout helpers (v1 cursor stack — superseded by §36.7)
+### §36.4 — Layout helpers (retired 2026-05-18)
 
-Absolute positioning gets tedious for multi-row forms. The original
-v1 layout stack provides a minimal cursor system:
-
-```c
-layout_begin(x, y, w, h, direction);   // LAYOUT_ROW or LAYOUT_COL
-  layout_push(width);                   // allocate space for next widget
-  gui_button(0, 0, 0, 0, "A");         // uses current layout slot
-  layout_push(width);
-  gui_button(0, 0, 0, 0, "B");
-layout_end();
-```
-
-Stack depth is 8 (fixed). The cursor advances by the `width`
-you pushed; nesting handles simple HUDs. Adoption stayed near
-zero because the helper still requires the consumer to pre-compute
-widths — it removed the per-widget `+24` arithmetic but not the
-"how big should this row be?" decision. The v2 declarative API
-(§36.7) addresses that gap; new code should prefer it.
+An earlier v1 cursor stack (`lay_push` / `lay_pop` / `lay_x` /
+`lay_y` / `lay_w`) shipped April 2026 and accumulated zero
+adoption because the helper still required the consumer to
+pre-compute widths — it removed the per-widget `+24` arithmetic
+but not the "how big should this row be?" decision. The v2
+declarative API (§36.7) addresses that gap. The cursor stack +
+its surrounding `Style`-struct widget family (`gui_panel_s`,
+`gui_label_s`, `gui_number_c`, `gui_button_s`, `gui_bar`) was
+excised from `stb/stbui.bsm` on 2026-05-18 (S9.1 of the v2 arc)
+once the last consumer (`examples/ui_demo.bpp`) was deleted.
+Surviving widgets (`gui_button`, `gui_label`, `gui_label_c`,
+`gui_number`, `gui_slider`, `gui_text_input`, etc.) take explicit
+`(x, y, w, h)` and compose inside bboxes recovered from v2
+`ui_node_*` accessors — the canonical pattern shipped consumers
+use today.
 
 ### §36.5 — Hover and press state
 
@@ -1865,29 +1862,47 @@ instead of snapping.
 - **Retained-mode UI** — this is strictly immediate. If you want a
   retained tree, build your own on top.
 
-### §36.7 — v2 declarative layout (Clay-inspired, shipped 2026-05-17)
+### §36.7 — v2 declarative layout (Clay-inspired, shipped 2026-05-17, refined 2026-05-18)
 
 The v2 API lets you DECLARE a tree of containers with sizing
-rules; the engine resolves positions for you. v1's `lay_push` got
-0 adoption because it still required pre-computed widths; v2
-removes that gap entirely.
+rules; the engine resolves positions for you. The retired
+`lay_*` cursor stack got 0 adoption because it still required
+pre-computed widths; v2 removes that gap entirely (and the
+retired stack itself was excised from the cartridge on
+2026-05-18 — see Appendix C arc trace).
 
 #### Mental model
 
 Every frame:
 
-1. `ui_layout_begin(panel_w, panel_h)` — open a new layout
-   tree, reset the per-frame arena.
-2. Declare nodes via `ui_box / ui_end` (begin/end pairs) or
+1. **`ui_frame_begin()` — call ONCE per frame, before any
+   `ui_layout_begin`.** Promotes this frame's recorded clicks
+   into `prev_clicks` so `ui_button` reads stable state.
+   **Invariant: exactly one call per frame.** Hosts that
+   declare multiple layout trees per frame (Bang 9 shell +
+   embedded tools) all share this single swap; each tool's
+   `ui_layout_begin` no longer touches the click buffer.
+   Shipped 2026-05-18 (S8.1 of the v2 arc) after Bang 9's
+   shell migration shipped a second `ui_layout_begin` per
+   frame and the embedded tools' v2 button clicks died from
+   the double-swap.
+2. `ui_layout_begin(panel_w, panel_h)` — open a new layout
+   tree, reset the node pool + sequencer + viewport. Safe to
+   call multiple times per frame (once per declared tree).
+3. Declare nodes via `ui_box / ui_end` (begin/end pairs) or
    shorter `ui_row / ui_col / ...` variants. Each call returns
    the node's index.
-3. `ui_layout_end()` — run the four-pass solver (FIXED + PERCENT
+4. `ui_layout_end()` — run the four-pass solver (FIXED + PERCENT
    top-down, FIT bottom-up, GROW top-down, position pass) and
    emit any built-in widget render commands.
-4. For v1 widgets you place INSIDE a declared bbox, read the
+5. For v1 widgets you place INSIDE a declared bbox, read the
    solved position via `ui_node_x/y/w/h(idx) + panel_origin`
    and call `gui_button(...)` / `gui_text_input(...)` etc. with
-   those coords.
+   those coords. **The panel_origin offset is load-bearing**:
+   bbox queries are LAYOUT-LOCAL (root at 0, 0). Embed-contract
+   libs that omit the `(px, py)` offset work standalone but
+   render at the window origin under Bang 9 — the bug class
+   the 2026-05-18 Modulab follow-up cycle caught.
 
 #### Sizing helpers
 
@@ -4165,6 +4180,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-04-22 | Initial Part VI extraction from `how_to_dev_b++.md` | Caps 26-47 |
 | 2026-05-12 | stbmidi added; W031 / W032 / E246 / E260 / E262 diagnostic rows added; Cap 28 lattice text replaced with `@safe` model per Rule 4 collapse | Cap 28 + Cap 48 |
 | 2026-05-12 | Eight cartridges promoted from "undocumented" to dedicated chapters: stbflow, stbraycast, stbtexture, stbai, stbscene, stbshader, stbfx, stbprofile. Reading source files + journal entries for grounding. | Caps 49-56 |
+| 2026-05-18 | stbui v2 arc closed (S1-S6 + S8.1 + S9 + S9.1 shipped; S7 deferred Rule 28). §36.4 retired-stack notice + §36.7 `ui_frame_begin` invariant + panel-origin offset gotcha. Sidequest moved to `legacy_docs/sidequest_stbui_v2_clay.md`. | Cap 36 |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its

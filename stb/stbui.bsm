@@ -5,11 +5,6 @@
 import "stbdraw.bsm";
 import "stbinput.bsm";
 
-// --- Style System ---
-// Separates appearance from geometry — the B++ equivalent of CSS.
-
-struct Style { bg, fg, font_sz, padding, radius }
-
 // Default UI font PIXEL HEIGHT. Passed directly as the `sz`
 // argument to draw_text / measure_text / draw_number, which the
 // rewritten stbdraw interprets as the target height in pixels
@@ -28,13 +23,6 @@ struct Style { bg, fg, font_sz, padding, radius }
 // their draw_text arguments.
 const UI_FONT_SZ = 16;
 
-// Built-in styles. Allocated once in init_ui and never reassigned,
-// matching the GLOB_EXTRN contract (pointer frozen, struct fields can
-// still be read from any thread).
-extrn _stl_default: Style;
-extrn _stl_button: Style;
-extrn _stl_panel: Style;
-
 // --- Theme ---
 // One Theme struct holds every design token the widgets consult.
 // `_theme` is a pointer to the currently-active Theme, set once by
@@ -42,7 +30,6 @@ extrn _stl_panel: Style;
 // theme_set / theme_dark / theme_light / theme_retro.
 //
 // Convention: widgets read only from _theme for default styling.
-// A caller-passed Style struct overrides the theme for one call.
 // Never hard-code an rgba inside a widget body — it defeats the
 // whole point of this struct.
 //
@@ -89,8 +76,7 @@ struct Theme {
 
 // Active theme. Pointer is frozen post-init but the struct it
 // points at can be mutated by a theme_* call at any time to
-// re-skin everything. Widgets read via _theme.<field> — mirrors
-// the _stl_* pattern above.
+// re-skin everything. Widgets read via _theme.<field>.
 extrn _theme: Theme;
 
 // Allocate + populate the theme to the canonical dark look the
@@ -204,21 +190,6 @@ void theme_set(t) {
     _theme = t;
 }
 
-// --- Layout Engine ---
-// Flex-like automatic positioning. Instead of manual x,y the programmer
-// pushes a layout context and widgets stack automatically.
-
-struct Layout { x, y, w, h, cx, cy, pad, dir }
-
-// Layout directions. Compile-time enum-style constants.
-const LAY_DOWN = 0;
-const LAY_RIGHT = 1;
-
-// Layout stack (up to 8 nested layouts). The stack buffer is allocated
-// once in init_ui (extrn); the top index mutates on every push/pop.
-extrn _lay_stack;
-static auto _lay_top;
-
 // --- Reactive Binding ---
 // Widgets can watch a pointer. The old value is stored alongside so the
 // widget only redraws when data changes. For immediate-mode this is an
@@ -243,45 +214,11 @@ extrn _ui_arena;   // bpp_arena Arena struct, created via arena_new
 // Initialize UI defaults, styles, layout stack, and arena.
 // Called automatically by game_init().
 void init_ui() {
-    // Install the default theme BEFORE any style allocations —
-    // the styles derive their colors and radii from the theme, so
-    // the theme has to exist first. Callers can swap themes any
-    // time via theme_set / theme_light / theme_retro; this just
-    // guarantees a sane starting point.
+    // Install the default theme. Widgets read their styling
+    // (background colours, radii, padding) directly from `_theme`
+    // — no separate Style struct layer. Callers can swap themes
+    // any time via theme_set / theme_light / theme_retro.
     theme_dark();
-
-    // Default style: primary text on transparent background.
-    _stl_default = malloc(sizeof(Style));
-    _stl_default.bg      = 0;
-    _stl_default.fg      = _theme.text;
-    _stl_default.font_sz = UI_FONT_SZ;
-    _stl_default.padding = 4;
-    _stl_default.radius  = 0;
-
-    // Button style: theme-button base + medium radius. The hover
-    // path is computed from this base via _ui_hover_fade so every
-    // button gets a consistent animated highlight without the
-    // style struct having to encode an "accent" field.
-    _stl_button = malloc(sizeof(Style));
-    _stl_button.bg      = _theme.button_bg;
-    _stl_button.fg      = _theme.text;
-    _stl_button.font_sz = UI_FONT_SZ;
-    _stl_button.padding = 10;
-    _stl_button.radius  = _theme.radius_md;
-
-    // Panel style: surface color + larger radius. Panels are
-    // backdrops, not buttons, so the radius is larger to match
-    // card-style layouts.
-    _stl_panel = malloc(sizeof(Style));
-    _stl_panel.bg      = _theme.surface;
-    _stl_panel.fg      = _theme.text;
-    _stl_panel.font_sz = UI_FONT_SZ;
-    _stl_panel.padding = 12;
-    _stl_panel.radius  = _theme.radius_lg;
-
-    // Layout stack: 8 entries of sizeof(Layout) each.
-    _lay_stack = malloc(8 * sizeof(Layout));
-    _lay_top = -1;
 
     // UI arena: fixed 32 KiB scratch space, reset each frame.
     // Wraps the bpp_arena bump allocator.
@@ -422,82 +359,6 @@ void ui_arena_reset() {
     arena_reset(_ui_arena);
 }
 
-// --- Style Constructors ---
-
-// Create a new style with the given colors, font size, and padding.
-style_new(bg, fg, font_sz, padding) {
-    auto s: Style;
-    s = ui_alloc(sizeof(Style));
-    s.bg = bg;
-    s.fg = fg;
-    s.font_sz = font_sz;
-    s.padding = padding;
-    s.radius = 0;
-    return s;
-}
-
-// --- Layout Functions ---
-
-// Push a new layout context. Widgets inside this context stack automatically.
-// dir: LAY_DOWN (vertical) or LAY_RIGHT (horizontal).
-void lay_push(x, y, w, h, pad, dir) {
-    auto l: Layout;
-    if (_lay_top >= 7) { return; }
-    _lay_top++;
-    l = _lay_stack + (_lay_top * sizeof(Layout));
-    l.x = x;
-    l.y = y;
-    l.w = w;
-    l.h = h;
-    l.cx = x + pad;
-    l.cy = y + pad;
-    l.pad = pad;
-    l.dir = dir;
-}
-
-// Pop the current layout context.
-void lay_pop() {
-    if (_lay_top >= 0) {
-        _lay_top--;
-    }
-}
-
-// Advance the layout cursor after placing a widget of the given size.
-static void _lay_advance(w, h) {
-    auto l: Layout;
-    if (_lay_top < 0) return;
-    l = _lay_stack + (_lay_top * sizeof(Layout));
-    if (l.dir == LAY_DOWN) {
-        l.cy = l.cy + h + l.pad;
-    } else {
-        l.cx = l.cx + w + l.pad;
-    }
-}
-
-// Return the current layout cursor X position, or the given fallback.
-lay_x(fallback) {
-    auto l: Layout;
-    if (_lay_top < 0) return fallback;
-    l = _lay_stack + (_lay_top * sizeof(Layout));
-    return l.cx;
-}
-
-// Return the current layout cursor Y position, or the given fallback.
-lay_y(fallback) {
-    auto l: Layout;
-    if (_lay_top < 0) return fallback;
-    l = _lay_stack + (_lay_top * sizeof(Layout));
-    return l.cy;
-}
-
-// Return the available width inside the current layout, or the fallback.
-lay_w(fallback) {
-    auto l: Layout;
-    if (_lay_top < 0) return fallback;
-    l = _lay_stack + (_lay_top * sizeof(Layout));
-    return l.w - (l.pad * 2);
-}
-
 // --- Reactive Watch ---
 
 // Create a watch on a memory address. Returns a Watch pointer.
@@ -524,59 +385,24 @@ watch_changed(w) {
 
 // --- Styled Widgets ---
 
-// Draw a text label at (x, y) in white. Uses layout cursor if active.
+// Draw a text label at (x, y) in white.
 void gui_label(x, y, text) {
-    auto rx, ry;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    draw_text(text, rx, ry, UI_FONT_SZ, WHITE);
-    _lay_advance(measure_text(text, UI_FONT_SZ), UI_FONT_SZ);
+    draw_text(text, x, y, UI_FONT_SZ, WHITE);
 }
 
 // Draw a text label with a custom color.
 void gui_label_c(x, y, text, color) {
-    auto rx, ry;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    draw_text(text, rx, ry, UI_FONT_SZ, color);
-    _lay_advance(measure_text(text, UI_FONT_SZ), UI_FONT_SZ);
-}
-
-// Draw a styled text label. Uses the style's font size and foreground color.
-void gui_label_s(x, y, text, style) {
-    auto s: Style;
-    auto rx, ry;
-    s = style;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    if (s.bg != 0) {
-        draw_rect(rx, ry, measure_text(text, s.font_sz) + s.padding * 2, s.font_sz + s.padding * 2, s.bg);
-    }
-    draw_text(text, rx + s.padding, ry + s.padding, s.font_sz, s.fg);
-    _lay_advance(measure_text(text, s.font_sz) + s.padding * 2, s.font_sz + s.padding * 2);
+    draw_text(text, x, y, UI_FONT_SZ, color);
 }
 
 // Draw a number at (x, y) in white.
 void gui_number(x, y, val) {
-    auto rx, ry;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    draw_number(rx, ry, UI_FONT_SZ, WHITE, val);
-    _lay_advance(60, UI_FONT_SZ);
-}
-
-// Draw a number with a custom color.
-void gui_number_c(x, y, val, color) {
-    auto rx, ry;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    draw_number(rx, ry, UI_FONT_SZ, color, val);
-    _lay_advance(60, UI_FONT_SZ);
+    draw_number(x, y, UI_FONT_SZ, WHITE, val);
 }
 
 // Draw a filled panel (background rectangle) with the given color.
 // Square corners for maximum back-compat; callers wanting rounded
-// edges use gui_panel_r or gui_panel_s with a Style.
+// edges use gui_panel_r.
 void gui_panel(x, y, w, h, color) {
     draw_rect(x, y, w, h, color);
 }
@@ -584,27 +410,6 @@ void gui_panel(x, y, w, h, color) {
 // Rounded-corner panel. Convenience wrapper over draw_rounded_rect.
 void gui_panel_r(x, y, w, h, color, radius) {
     draw_rounded_rect(x, y, w, h, radius, color);
-}
-
-// Draw a styled panel with a soft drop shadow and push a layout
-// context inside it. Widgets drawn after this call stack
-// automatically within the panel's padded interior.
-void gui_panel_s(x, y, w, h, style) {
-    auto s: Style;
-    s = style;
-
-    // Soft shadow behind the card — three alpha-blended layers
-    // via draw_shadow_rounded so the shadow corners match the
-    // panel's corners. Skipped on radius=0 panels where square
-    // chrome looks fine without falloff. Panel shadows are a
-    // notch stronger than button shadows (they're bigger
-    // elements that sit on top of backgrounds, not next to peers).
-    if (s.radius > 0) {
-        draw_shadow_rounded(x, y, w, h, s.radius,
-                            _theme.shadow_intensity + 10);
-    }
-    draw_rounded_rect(x, y, w, h, s.radius, s.bg);
-    lay_push(x, y, w, h, s.padding, LAY_DOWN);
 }
 
 // Draw a clickable button with hover fade, pressed state, and a
@@ -616,42 +421,41 @@ void gui_panel_s(x, y, w, h, style) {
 // Rendering stack — bottom to top:
 //   1. draw_shadow (dropped when pressed so the button
 //      "sinks" into the surface).
-//   2. Rounded-rect body filled with a hover-lerped color. The
-//      idle and hover colors come from _stl_button so styling
-//      stays consistent across every unstyled button.
+//   2. Rounded-rect body filled with a hover-lerped color. Idle
+//      background is `_theme.button_bg`, hover target is
+//      `_theme.button_hover_bg`, pressed swaps to
+//      `_theme.surface_pressed`. Swapping the theme re-skins
+//      every button automatically.
 //   3. Top-edge highlight (1px lighter band) for a soft bevel.
 //   4. Label text, nudged 1px down while pressed to sell the
 //      physical depression.
 gui_button(x, y, w, h, label) {
-    auto s: Style;
-    auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
-    auto y_off, tw, tx;
+    auto mx, my, hover, press, release, held, fade, bg, hl;
+    auto y_off, tw, tx, radius;
 
-    s = _stl_button;
-    rx = lay_x(x);
-    ry = lay_y(y);
+    radius = _theme.radius_md;
     mx = mouse_x();
     my = mouse_y();
-    hover = point_in_rect(mx, my, rx, ry, w, h);
+    hover = point_in_rect(mx, my, x, y, w, h);
     press   = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
     release = mouse_released(MOUSE_LEFT) != 0;
-    _ui_press_track(rx, ry, press, release);
-    held = hover != 0 && _ui_is_pressed(rx, ry);
+    _ui_press_track(x, y, press, release);
+    held = hover != 0 && _ui_is_pressed(x, y);
 
-    fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(s.bg, _theme.button_hover_bg, fade);
+    fade = _ui_hover_fade(x, y, hover != 0);
+    bg = lerp_color(_theme.button_bg, _theme.button_hover_bg, fade);
     if (held != 0) { bg = _theme.surface_pressed; }
 
     y_off = held != 0 ? 1 : 0;
 
-    if (held == 0) { draw_shadow(rx, ry, w, h, _theme.shadow_intensity); }
-    draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
+    if (held == 0) { draw_shadow(x, y, w, h, _theme.shadow_intensity); }
+    draw_rounded_rect(x, y + y_off, w, h, radius, bg);
 
     // Top-edge highlight — skipped when pressed (the button is
     // no longer catching light from above).
-    if (held == 0 && s.radius > 0) {
+    if (held == 0 && radius > 0) {
         hl = lerp_color(bg, WHITE, 40);
-        draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
+        draw_rect(x + radius, y + y_off, w - 2 * radius, 1, hl);
     }
 
     // Center the label horizontally. Falls back to a 4-px left
@@ -659,79 +463,14 @@ gui_button(x, y, w, h, label) {
     // leading characters stay readable instead of disappearing
     // off the left edge.
     tw = measure_text(label, UI_FONT_SZ);
-    tx = rx + (w - tw) / 2;
-    if (tx < rx + 4) { tx = rx + 4; }
+    tx = x + (w - tw) / 2;
+    if (tx < x + 4) { tx = x + 4; }
     draw_text(label, tx,
-              ry + y_off + (h / 2) - (UI_FONT_SZ / 2),
-              UI_FONT_SZ, s.fg);
-    _lay_advance(w, h);
+              y + y_off + (h / 2) - (UI_FONT_SZ / 2),
+              UI_FONT_SZ, _theme.text);
 
     if (press != 0) { return 1; }
     return 0;
-}
-
-// Styled button. Same render stack as gui_button but pulls bg /
-// fg / padding / radius / font_sz from the caller's Style. The
-// hover target is always the current theme's button_hover_bg —
-// keeping that as a fixed target means every button in the
-// program glows the same color on hover, regardless of whether
-// it's using the default style or a custom one, and swapping
-// themes re-skins the hover across the entire app.
-gui_button_s(x, y, w, h, label, style) {
-    auto s: Style;
-    auto mx, my, hover, rx, ry, press, release, held, fade, bg, hl;
-    auto y_off;
-
-    s = style;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    mx = mouse_x();
-    my = mouse_y();
-    hover = point_in_rect(mx, my, rx, ry, w, h);
-    press   = hover != 0 && mouse_pressed(MOUSE_LEFT) != 0;
-    release = mouse_released(MOUSE_LEFT) != 0;
-    _ui_press_track(rx, ry, press, release);
-    held = hover != 0 && _ui_is_pressed(rx, ry);
-
-    fade = _ui_hover_fade(rx, ry, hover != 0);
-    bg = lerp_color(s.bg, _theme.button_hover_bg, fade);
-    if (held != 0) { bg = lerp_color(s.bg, BLACK, 80); }
-
-    y_off = held != 0 ? 1 : 0;
-
-    if (held == 0) { draw_shadow(rx, ry, w, h, _theme.shadow_intensity); }
-    draw_rounded_rect(rx, ry + y_off, w, h, s.radius, bg);
-
-    if (held == 0 && s.radius > 0) {
-        hl = lerp_color(bg, WHITE, 40);
-        draw_rect(rx + s.radius, ry + y_off, w - 2 * s.radius, 1, hl);
-    }
-
-    draw_text(label, rx + s.padding,
-              ry + y_off + (h / 2) - (s.font_sz / 2),
-              s.font_sz, s.fg);
-    _lay_advance(w, h);
-
-    if (press != 0) { return 1; }
-    return 0;
-}
-
-// Draw a horizontal progress bar. val/max_val determines the fill percentage.
-void gui_bar(x, y, w, h, val, max_val, color) {
-    auto fill_w, rx, ry;
-    rx = lay_x(x);
-    ry = lay_y(y);
-    draw_rect(rx, ry, w, h, DARKGRAY);
-    fill_w = 0;
-    if (max_val > 0) {
-        fill_w = (val * w) / max_val;
-    }
-    if (fill_w > w) fill_w = w;
-    if (fill_w < 0) fill_w = 0;
-    if (fill_w > 0) {
-        draw_rect(rx, ry, fill_w, h, color);
-    }
-    _lay_advance(w, h);
 }
 
 // ─── Editable text field ────────────────────────────────────
@@ -808,8 +547,8 @@ gui_text_input(ti, x, y, w, h) {
     auto border, bg, text_color, caret_x, caret_on, fade, radius;
 
     t = ti;
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     hover = point_in_rect(mx, my, rx, ry, w, h);
@@ -865,7 +604,6 @@ gui_text_input(ti, x, y, w, h) {
         }
     }
 
-    _lay_advance(w, h);
 
     // Consume keyboard while focused. Backspace first (it fires on
     // press edge regardless of the char stream), then queued chars.
@@ -905,8 +643,8 @@ gui_grid(x, y, cols, rows, cell_size, border_color) {
     auto rx, ry, mx, my, total_w, total_h;
     auto col, row, cell_x, cell_y, hovered_idx, clicked_idx;
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     total_w = cols * cell_size;
@@ -938,7 +676,6 @@ gui_grid(x, y, cols, rows, cell_size, border_color) {
                   rgba(255, 255, 255, 40));
     }
 
-    _lay_advance(total_w, total_h);
 
     clicked_idx = -1;
     if (hovered_idx >= 0) {
@@ -961,8 +698,8 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) {
     auto rx, ry, mx, my, i, col, row;
     auto cx, cy, color, hover, clicked, rows, radius, pad;
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
 
@@ -1014,7 +751,6 @@ gui_palette(x, y, colors, n, per_row, cell_size, selected) {
         }
     }
 
-    _lay_advance(per_row * cell_size, rows * cell_size);
     return clicked;
 }
 
@@ -1035,8 +771,8 @@ gui_checkbox(x, y, val_ptr, label) {
     auto bg, border, label_w;
     box_sz = 14;
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
 
@@ -1076,7 +812,6 @@ gui_checkbox(x, y, val_ptr, label) {
               ry + (box_sz / 2) - (UI_FONT_SZ / 2),
               UI_FONT_SZ, _theme.text);
 
-    _lay_advance(box_sz + 6 + label_w, box_sz + 4);
     return val;
 }
 
@@ -1104,8 +839,8 @@ gui_radio(x, y, selected, options, n) {
     circle_r = 7;
     row_h = 20;
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     new_sel = selected;
@@ -1143,7 +878,6 @@ gui_radio(x, y, selected, options, n) {
                   UI_FONT_SZ, _theme.text);
     }
 
-    _lay_advance(120, n * row_h);
     return new_sel;
 }
 
@@ -1182,8 +916,8 @@ gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) {
 
     btn_h = 22;
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
 
@@ -1280,9 +1014,7 @@ gui_dropdown(x, y, w, labels, n, selected_ptr, open_ptr) {
             poke(open_ptr, 0);
         }
 
-        _lay_advance(w, btn_h + 2 + list_h);
     } else {
-        _lay_advance(w, btn_h);
     }
 
     return selected;
@@ -1306,8 +1038,8 @@ gui_slider(x, y, w, val, min, max) {
     range = max - min;
     if (range <= 0) { return val; }
 
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     id = (rx << 16) | ry;
@@ -1357,7 +1089,6 @@ gui_slider(x, y, w, val, min, max) {
     draw_rounded_rect(rx + knob_x - k_sz / 2, ry + (knob_w - k_sz) / 2,
                       k_sz, k_sz, k_sz / 2, knob_color);
 
-    _lay_advance(w, knob_w);
     return val;
 }
 
@@ -1379,8 +1110,8 @@ gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) {
     auto y_off, dx, dy, r;
 
     r = _theme.radius_md;
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     hover = point_in_rect(mx, my, rx, ry, w, h);
@@ -1412,7 +1143,6 @@ gui_icon_button(x, y, w, h, tex, tex_w, tex_h, selected) {
     dy = ry + y_off + (h - tex_h) / 2;
     _stb_gpu_sprite(tex, dx, dy, tex_w, tex_h, tex_w, tex_h);
 
-    _lay_advance(w, h);
 
     if (press != 0) { return 1; }
     return 0;
@@ -1446,15 +1176,14 @@ gui_scroll_view(x, y, w, h, content_h, scroll_y) {
     auto down, id, drag_y, bg;
 
     bar_w = 6;
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
 
     // Short-circuit: content fits, no bar needed. Reset scroll
     // so the caller's offset clamps to zero.
     if (content_h <= h) {
-        _lay_advance(w, h);
         return 0;
     }
 
@@ -1509,7 +1238,6 @@ gui_scroll_view(x, y, w, h, content_h, scroll_y) {
     }
     draw_rounded_rect(track_x, thumb_y, bar_w, thumb_h, bar_w / 2, bg);
 
-    _lay_advance(w, h);
     return scroll_y;
 }
 
@@ -1528,8 +1256,8 @@ gui_tabs(x, y, tab_w, labels, n, selected) {
 
     tab_h = 26;
     r = _theme.radius_sm + 2;
-    rx = lay_x(x);
-    ry = lay_y(y);
+    rx = x;
+    ry = y;
     mx = mouse_x();
     my = mouse_y();
     new_sel = selected;
@@ -1570,7 +1298,6 @@ gui_tabs(x, y, tab_w, labels, n, selected) {
     baseline = (_theme.accent & 0x00FFFFFF) | (100 << 24);
     draw_rect(rx, ry + tab_h, n * tab_w, 1, baseline);
 
-    _lay_advance(n * tab_w, tab_h + 4);
     return new_sel;
 }
 
@@ -1634,17 +1361,18 @@ void gui_status_bar(y, w, text, color) {
 // ─── Declarative layout (Clay-inspired) ─────────────────────
 //
 // Why this lives in stbui (not a separate cartridge) — see
-// docs/plans/sidequest_stbui_v2_clay.md. Short version: the original
-// `lay_push / lay_pop` helpers above shipped April 2026 with
-// zero adoption because they still demanded explicit (x, y, w, h)
-// at every call site. The primitives below add FIT / GROW /
-// FIXED / PERCENT sizing so the consumer declares STRUCTURE and
-// the engine resolves positions — the abstraction that v1's
-// `lay_*` never reached.
+// docs/plans/sidequest_stbui_v2_clay.md. Short version: an earlier
+// `lay_push / lay_pop` cursor stack shipped April 2026 with zero
+// adoption because it still demanded explicit (x, y, w, h) at
+// every call site. Retired 2026-05-18 (S9.1 of the v2 arc). The
+// primitives below add FIT / GROW / FIXED / PERCENT sizing so
+// the consumer declares STRUCTURE and the engine resolves
+// positions — the abstraction the retired `lay_*` never reached.
 //
-// Old gui_* / lay_* widgets above keep working unchanged.
-// New consumers (and migrations from old ones) reach for the
-// `ui_*` family below.
+// Surviving gui_* widgets (gui_button, gui_label, gui_slider,
+// etc.) take explicit (x, y, w, h) and draw at those coords.
+// They compose naturally INSIDE bboxes recovered from `ui_node_*`
+// after `ui_layout_end` resolves the declared tree.
 //
 // Model (adapted from Nic Barker's Clay, MIT-licensed C library):
 //   * Stack-based `ui_box / ui_end` pairs (no macros — B++
@@ -1796,18 +1524,22 @@ void init_ui_layout() {
     }
 }
 
-// Begin a layout frame. Resets the node pool + stack + click
-// sequencer, captures viewport dimensions for root sizing, and
-// promotes last frame's hit results into `_ui2_prev_clicks` so
-// widgets see their previous-frame click state.
-void ui_layout_begin(viewport_w, viewport_h) {
+// Begin a new frame for the v2 layout state. Promotes this
+// frame's recorded clicks into `_ui2_prev_clicks` so widgets see
+// their previous-frame click state, and zeroes the new curr
+// buffer for fresh hit accumulation.
+//
+// **Invariant: call exactly once per frame.** Hosts that declare
+// multiple layout trees per frame (Bang 9 shell + embedded tools)
+// call `ui_frame_begin` ONCE at the top of the frame, then
+// `ui_layout_begin` once per layout tree. Splitting these into
+// two calls (S8.1, 2026-05-18) was forced when Bang 9's S8 shell
+// migration shipped a second `ui_layout_begin` per frame and the
+// embedded tools' v2 button clicks died — see journal entry for
+// the full diagnosis.
+void ui_frame_begin() {
     auto i, tmp;
     if (_ui2_nodes == 0) { init_ui_layout(); }
-    _ui2_node_count = 0;
-    _ui2_stack_top  = 0 - 1;
-    _ui2_seq_idx    = 0;
-    _ui2_viewport_w = viewport_w;
-    _ui2_viewport_h = viewport_h;
     // Swap buffers: this frame's curr becomes next frame's prev.
     // Zero the new curr buffer for fresh hit accumulation.
     tmp              = _ui2_prev_clicks;
@@ -1816,6 +1548,20 @@ void ui_layout_begin(viewport_w, viewport_h) {
     for (i = 0; i < UI2_MAX_NODES; i++) {
         *(_ui2_curr_clicks + i * 8) = 0;
     }
+}
+
+// Begin one layout tree. Resets the node pool + stack + sequencer
+// + viewport. Safe to call multiple times per frame as long as
+// `ui_frame_begin` was called once before the first call (the
+// click-buffer swap that used to live here now lives in
+// `ui_frame_begin`).
+void ui_layout_begin(viewport_w, viewport_h) {
+    if (_ui2_nodes == 0) { init_ui_layout(); }
+    _ui2_node_count = 0;
+    _ui2_stack_top  = 0 - 1;
+    _ui2_seq_idx    = 0;
+    _ui2_viewport_w = viewport_w;
+    _ui2_viewport_h = viewport_h;
 }
 
 // Sizing helpers — encoded as words (pass-by-value), mode in

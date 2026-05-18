@@ -9949,3 +9949,101 @@ every tab that has an embedded tool with v2 layout calls." That
 gate only exists in the user's hands today (no headless visual
 smoke for Bang 9 panels). Until that gate exists, shell-level
 v2 changes need a manual cycle through every tab.
+
+### Addendum 2 — S8.1 + S9.1 SHIPPED + Modulab embed offset fix
+
+Same session, the proper cleanup landed end-to-end. Three pieces:
+
+**S8.1 — `ui_frame_begin` / `ui_layout_begin` split.** Moved the
+click-buffer swap out of `ui_layout_begin` into a new
+`ui_frame_begin()` that hosts call ONCE at the top of the frame.
+`ui_layout_begin` now only resets node pool + sequencer +
+viewport — safe to call multiple times per frame, once per
+declared layout tree. Same shape as the ImGui / Clay
+frame-vs-layout boundary. Documented as an **invariant** in the
+function's doc comment so the next reader doesn't have to learn
+it from a runtime regression: "call exactly once per frame."
+
+Every consumer updated to call `ui_frame_begin` after
+`ui_arena_reset()`:
+`bang9/bang9.bpp`, `tools/modulab/modulab.bpp`,
+`tools/level_editor/level_editor.bpp`,
+`tools/fxlab/fxlab.bpp`, `tools/the_bug/the_bug.bpp`,
+`examples/stbui_layout_smoke.bpp`.
+
+With the split landed, Bang 9 chrome went back to the declared
+`COL win { menu fixed(28) + tabs fixed(32) + panel grow +
+status fixed(24) }` tree (S8 re-applied). Shell bboxes cached
+locally BEFORE `panels_draw` runs, because the embedded tool's
+own `ui_layout_begin` still resets the node pool — only the
+click buffer survives via `ui_frame_begin`'s one-per-frame
+contract.
+
+**S9.1 — v1 dead-code excision.** ~280 LOC of dead code removed
+from `stb/stbui.bsm`:
+- `struct Style`, `_stl_default` / `_stl_button` / `_stl_panel`
+  extrns + their `init_ui` malloc blocks
+- `struct Layout`, `LAY_DOWN` / `LAY_RIGHT`, `_lay_stack`,
+  `_lay_top`
+- `lay_push` / `lay_pop` / `_lay_advance` / `lay_x` / `lay_y` /
+  `lay_w` functions
+- `gui_panel_s` / `gui_label_s` / `gui_number_c` /
+  `gui_button_s` / `gui_bar` / `style_new` (the styled-widget
+  family ui_demo.bpp depended on)
+- Every `_lay_advance(...)` call + `lay_x(x)` / `lay_y(y)`
+  indirection in surviving widget bodies — collapsed to
+  `rx = x; ry = y;` via content-pattern sed
+- `gui_button` refactored to read `_theme.button_bg` /
+  `_theme.button_hover_bg` / `_theme.text` /
+  `_theme.radius_md` directly, no longer goes through the
+  retired `_stl_button` cache
+
+`grep -nE "lay_x|lay_y|lay_w|_lay_advance|_stl_|struct Style|struct Layout|LAY_DOWN|LAY_RIGHT|gui_panel_s|gui_label_s|gui_number_c|gui_button_s|gui_bar|style_new" stb/stbui.bsm`
+returns 0 hits in code (comment references in the Theme +
+declarative-layout sections only). Project-wide grep confirms
+zero source consumers — those symbols stopped existing for any
+caller too.
+
+**Modulab embed-offset latent bug** (caught by user smoke after
+S8.1 + S9.1 builds installed). User ran `install.sh`, rebuilt
+Bang 9, opened the Sprites tab — Modulab's UI rendered at the
+WINDOW origin instead of inside the panel rect. Bug: S3's
+Modulab v2 migration (`tools/modulab/modulab_lib.bsm`) read
+bboxes via `ui_node_x/y(idx)` without adding the panel offset
+`(_ml_ox, _ml_oy)` — fine standalone (where both are 0), broken
+when Bang 9 embeds the lib with non-zero `(px, py)`. Same gap
+on `tools/modulab/aseprite_view.bsm` (S2 migration). Fix: add
+`_ml_ox +` / `_ml_oy +` to every bbox read in modulab_lib,
+`px +` / `py +` in aseprite_view. The level_editor S4 migration
+got this right originally; S2 + S3 inherited a pre-existing
+implicit-standalone assumption that nobody surfaced until the
+user clicked the Sprites tab in Bang 9 today.
+
+**Lesson appended:** v2 migrations of embed-contract libs MUST
+verify both standalone AND inside-Bang-9 from day 1. Standalone
+hides the offset bug (px=py=0 makes the addition a no-op);
+embed surfaces it instantly. Adding "verify in Bang 9 panel"
+to the S3/S2/S5/S6 verification gates would have caught this in
+the same arc rather than as a follow-up cycle after install.
+
+### Arc state
+
+Verification gates green:
+- Native suite 174/0/12 (zero regressions vs the 2026-05-17
+  milestone baseline)
+- C-emit suite 138/0/48 (same baseline)
+- Bootstrap byte-stable (gen1 == gen2 with
+  `BPP_BUILD_ID=00000000…`)
+- User smoke: Bang 9 + Modulab Sprites tab + level_editor
+  Levels tab + fxlab Effects tab + the_bug Debug tab all
+  render correctly post-install.sh
+
+Sidequest doc moves to `legacy_docs/sidequest_stbui_v2_clay.md`
+this commit (arc closed). `docs/todo.md` drops the stbui v2
+migration entry from its active-arcs list. `stb++_lib.md`
+Cap 36 §36.7 picks up the `ui_frame_begin` invariant +
+one-per-frame contract so the API reference matches what
+shipped.
+
+Next arc per the user's call: back to WC1 mod
+(`games/rts1/wc1_handoff.md`) — content side, not infrastructure.

@@ -12,9 +12,6 @@ Last refresh: 2026-05-17.
 - **Content arc — decision point.** Engine no longer gates any of
   the four candidates: Wolf3D Phase 2 cont., Adventure Puzzle,
   RPG Dungeon, RTS demo. See `docs/plans/games_roadtrip.md`.
-- **stbui v2 migration S5-S9.** fxlab → the_bug → mini_synth +
-  sprite_viewer (batched) → Bang 9 chrome → v1 deprecation.
-  See `docs/plans/sidequest_stbui_v2_clay.md`.
 - **Multi-core Sprints A-G.** ~1010 LOC across 5-6 sessions,
   scattered between game features. Sprint E (Linux pthreads)
   blocked on ELF dynlink. See `docs/plans/multicore_state_report.md` §5.
