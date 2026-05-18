@@ -850,13 +850,11 @@ static _tb_status_strbuf() {
 // Render one frame of the debug map viewer. Returns 1 if ESC pressed.
 the_bug_lib_frame(px, py, pw, ph) {
     auto quit, margin, hy, content_y, content_h;
-
-    // Reserve 24 px at the bottom for the status bar (drawn at
-    // py + ph - 20 in UI_FONT_SZ=16). Without this, the function /
-    // struct / global lists scroll past the status row and the two
-    // overlap visibly. The clip region in _tb_draw_line / _tb_draw_section
-    // honours _tb_ph, so shrinking it here is the single chokepoint.
-    _tb_ox = px; _tb_oy = py; _tb_pw = pw; _tb_ph = ph - 24;
+    auto topbar_idx, content_idx, statusbar_idx;
+    auto top_x, top_y, top_w, top_h;
+    auto cnt_x, cnt_y, cnt_w, cnt_h;
+    auto stat_x, stat_y, stat_w;
+    auto topbar_h;
 
     if (_tb_initialized == 0) {
         the_bug_lib_init();
@@ -867,15 +865,65 @@ the_bug_lib_frame(px, py, pw, ph) {
 
     margin = 16;
 
+    // Declarative shell layout (stbui v2 — S6 of the stbui v2 arc).
+    // The old shell hardcoded `bar_y = py + 8` for the topbar
+    // origin, `content_y = bar_y + chrome_math` for the scrollable
+    // map, and `py + ph - 20` for the status footer. Now the three
+    // regions are declared as rows in a column and bboxes come back
+    // via `ui_node_x/y/w/h`:
+    //
+    //   COL panel
+    //     ├─ ROW topbar    — title + buttons + optional status line
+    //     ├─ ROW content   — grow vertically; live panels + map
+    //     └─ ROW statusbar — fixed 24 px, counts + scroll hints
+    //
+    // Topbar height varies by run state: with no tracee launched yet
+    // the title row alone needs ~36 px; once `_tb_run_started` flips
+    // we add the status row + ~24 px more. The conditional is
+    // resolved BEFORE layout begins so the tree's row dimensions are
+    // static for the rest of the frame.
+    if (_tb_run_started != 0) { topbar_h = 60; }
+    else                      { topbar_h = 36; }
+
+    ui_layout_begin(pw, ph);
+    ui_box(UI_LAYOUT_COL, ui_sz_fixed(pw), ui_sz_fixed(ph), 0, 0);
+        topbar_idx    = ui_row_fixed_h(topbar_h, 0); ui_end();
+        content_idx   = ui_row_grow(0);              ui_end();
+        statusbar_idx = ui_row_fixed_h(24, 0);       ui_end();
+    ui_end();
+    ui_layout_end();
+
+    top_x  = px + ui_node_x(topbar_idx);
+    top_y  = py + ui_node_y(topbar_idx);
+    top_w  = ui_node_w(topbar_idx);
+    top_h  = ui_node_h(topbar_idx);
+    cnt_x  = px + ui_node_x(content_idx);
+    cnt_y  = py + ui_node_y(content_idx);
+    cnt_w  = ui_node_w(content_idx);
+    cnt_h  = ui_node_h(content_idx);
+    stat_x = px + ui_node_x(statusbar_idx);
+    stat_y = py + ui_node_y(statusbar_idx);
+    stat_w = ui_node_w(statusbar_idx);
+
+    // Clip-region globals consumed by `_tb_draw_line` /
+    // `_tb_draw_section` so the scrolling map never bleeds into
+    // the statusbar row. _tb_ph is the bottom edge of the
+    // content row (relative to py), matching what `ph - 24`
+    // computed before but now derived from the declared layout.
+    _tb_ox = px;
+    _tb_oy = py;
+    _tb_pw = pw;
+    _tb_ph = (cnt_y + cnt_h) - py;
+
     // ── Top bar ──
     auto bar_y;
-    bar_y = py + 8;
-    draw_text("The Bug — Debug Map Viewer", px + margin, bar_y,
+    bar_y = top_y + 8;
+    draw_text("The Bug — Debug Map Viewer", top_x + margin, bar_y,
               UI_FONT_SZ, _theme.accent);
 
     // Buttons on the right side of the top bar.
     auto btn_x;
-    btn_x = px + pw - margin;
+    btn_x = top_x + top_w - margin;
 
     // Button widths sized for UI_FONT_SZ=16 bitmap (16 px per char):
     //   "Load .bug"  =  9 chars * 16 = 144 + 16 padding = 160
@@ -937,7 +985,7 @@ the_bug_lib_frame(px, py, pw, ph) {
     // running = accent, stopped = text, exited / crashed = muted.
     if (_tb_run_started != 0) {
         auto sx, sy, sb_status, status_color;
-        sx = px + margin;
+        sx = top_x + margin;
         sy = bar_y + UI_FONT_SZ + 4;
         sb_status = _tb_status_strbuf();
         if (bug_shared_status == BUG_SHARED_RUNNING) {
@@ -951,13 +999,23 @@ the_bug_lib_frame(px, py, pw, ph) {
         strbuf_free(sb_status);
     }
 
-    bar_y += UI_FONT_SZ + 8;
-    draw_rect(px + margin, bar_y, pw - margin * 2, 1, _theme.border);
-    bar_y += 6;
+    // Separator line at the bottom edge of the declared topbar
+    // row. Old code maintained `bar_y` as a running cursor and
+    // placed the line at `bar_y += UI_FONT_SZ + 8`; now the
+    // topbar row already reserved its height (36 or 60), so the
+    // line sits at one pixel above the row's bottom.
+    draw_rect(top_x + margin, top_y + top_h - 1,
+              top_w - margin * 2, 1, _theme.border);
 
     // ── Content area ──
-    content_y = bar_y;
-    content_h = ph - (content_y - py) - 24;
+    // Origin + size now come from the declared content row bbox.
+    // Old code derived `content_y = bar_y` after manually shifting
+    // the cursor through the topbar; here cnt_y IS the top of
+    // content. The same goes for content_h — no more
+    // `ph - (content_y - py) - 24` magic chasing the bottom
+    // statusbar reservation.
+    content_y = cnt_y;
+    content_h = cnt_h;
 
     // When the tracee is paused at a breakpoint, take the top
     // portion of the content area for the live watch + viz panels
@@ -972,10 +1030,10 @@ the_bug_lib_frame(px, py, pw, ph) {
         live_h = 240;
         if (live_h > content_h / 2) { live_h = content_h / 2; }
         if (live_h < 120)            { live_h = 120; }
-        _tb_render_live_panels(px + margin, content_y,
-                               pw - margin * 2, live_h);
+        _tb_render_live_panels(cnt_x + margin, content_y,
+                               cnt_w - margin * 2, live_h);
         content_y += live_h + 12;
-        content_h  = ph - (content_y - py) - 24;
+        content_h  = (cnt_y + cnt_h) - content_y;
     }
 
     if (_tb_loaded == 0) {
@@ -983,30 +1041,32 @@ the_bug_lib_frame(px, py, pw, ph) {
         //   1. headline ("No debug map loaded")
         //   2. instruction ("Click 'Load .bug' to open ...")
         //   3. error from the last try_load attempt, if any
+        // Centered inside the content bbox so the message tracks
+        // the actual drawable area, not the panel rect.
         auto msg, msg_w, line_y;
-        line_y = py + ph / 2 - UI_FONT_SZ * 2;
+        line_y = cnt_y + cnt_h / 2 - UI_FONT_SZ * 2;
 
         msg = "No debug map loaded";
         msg_w = measure_text(msg, UI_FONT_SZ);
-        draw_text(msg, px + (pw - msg_w) / 2, line_y,
+        draw_text(msg, cnt_x + (cnt_w - msg_w) / 2, line_y,
                   UI_FONT_SZ, _theme.text);
         line_y += UI_FONT_SZ + 6;
 
         msg = "Click 'Load .bug' to open a debug map file";
         msg_w = measure_text(msg, UI_FONT_SZ);
-        draw_text(msg, px + (pw - msg_w) / 2, line_y,
+        draw_text(msg, cnt_x + (cnt_w - msg_w) / 2, line_y,
                   UI_FONT_SZ, _theme.text_muted);
         line_y += UI_FONT_SZ + 6;
 
         msg = "compile with bpp --bug to emit one";
         msg_w = measure_text(msg, UI_FONT_SZ);
-        draw_text(msg, px + (pw - msg_w) / 2, line_y,
+        draw_text(msg, cnt_x + (cnt_w - msg_w) / 2, line_y,
                   UI_FONT_SZ, _theme.text_muted);
 
         if (_tb_load_err != 0) {
             line_y += UI_FONT_SZ * 2;
             msg_w = measure_text(_tb_load_err, UI_FONT_SZ);
-            draw_text(_tb_load_err, px + (pw - msg_w) / 2, line_y,
+            draw_text(_tb_load_err, cnt_x + (cnt_w - msg_w) / 2, line_y,
                       UI_FONT_SZ, _theme.accent);
         }
         return quit;
@@ -1025,7 +1085,7 @@ the_bug_lib_frame(px, py, pw, ph) {
 
     // Clip the content area.
     auto lx, ly;
-    lx = px + margin;
+    lx = cnt_x + margin;
     ly = content_y - _tb_scroll;
 
     // Render all sections sequentially.
@@ -1051,8 +1111,11 @@ the_bug_lib_frame(px, py, pw, ph) {
     }
 
     // ── Bottom status ──
+    // Anchored to the declared statusbar row instead of
+    // `py + ph - 20` magic. 4 px down from the row top centres
+    // the 16 px font inside the 24 px row.
     auto status_y, status_sb, status_len;
-    status_y = py + ph - 20;
+    status_y = stat_y + 4;
     status_sb = strbuf_new();
     status_sb = strbuf_num(status_sb, bug_fn_count);
     status_sb = strbuf_cat(status_sb, " functions  ");
@@ -1067,7 +1130,7 @@ the_bug_lib_frame(px, py, pw, ph) {
     buf_copy(_tb_line_buf, status_sb, status_len);
     poke(_tb_line_buf + status_len, 0);
     strbuf_free(status_sb);
-    draw_text(_tb_line_buf, px + margin, status_y,
+    draw_text(_tb_line_buf, stat_x + margin, status_y,
               UI_FONT_SZ, _theme.text_muted);
 
     return quit;

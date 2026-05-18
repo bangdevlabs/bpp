@@ -9685,3 +9685,180 @@ authoritative arc trace for stbui v2. S5+ (fxlab → the_bug →
 mini_synth + sprite_viewer → Bang 9 chrome → v1 deprecation)
 remain queued; level_editor S4 was the smallest of the
 migrations and validated the API survives a real consumer.
+
+## 2026-05-18 — stbui v2 arc closed (S5 → S9)
+
+Continuation of the 2026-05-17 stbui v2 work. The previous session
+shipped S1 → S4 (engine + aseprite viewer + Modulab + level_editor).
+Today closed the remaining migrations end-to-end: S5 → S9 in one
+sitting, with S7 deferred under Rule 28. Same mechanical shape
+each session: declare a `ui_box` tree, recover bboxes via
+`ui_node_x/y/w/h`, anchor existing v1 widget calls to those
+bboxes plus the panel `(px, py)` offset.
+
+### S5 — fxlab (`tools/fxlab/fxlab_lib.bsm`)
+
+Shell reframed as `COL panel → ROW body { COL sidebar fixed_w(180)
+| COL main grow } + ROW helpbar fixed_h(24)`. Killed three magic
+offsets: `sx = px + _FXLAB_SIDEBAR_W + 16`,
+`sw = pw - _FXLAB_SIDEBAR_W - 32`, footer `py + ph - 18`. All
+derive from declared bboxes now. The slider stack itself keeps
+the manual `slider_y += 36` accumulator inside the main column —
+each slider row is `gui_label_c` + `gui_slider` + value readout,
+three v1 widgets that don't pay enough for a per-row
+`ui_row_fixed_h` wrapper. Promote when a slider variant needs
+alignment v1 can't express (Rule 20 deferred).
+
+### S6 — the_bug (`tools/the_bug/the_bug_lib.bsm`)
+
+Shell reframed as `COL panel → ROW topbar (fixed 36 or 60,
+depending on `_tb_run_started`) + ROW content (grow) + ROW
+statusbar (fixed 24)`. Topbar height is computed BEFORE
+`ui_layout_begin` so the row dimensions stay static for the
+frame. Killed four magic offsets: `_tb_ph = ph - 24`, `bar_y =
+py + 8`, `content_h = ph - (content_y - py) - 24`, and
+`status_y = py + ph - 20`. The dynamic per-state logic (live
+panels only in STOPPED, conditional Run/Stop/Continue buttons,
+scroll math) stays inside the content bbox. The clip-region
+globals `_tb_ph` that feed `_tb_draw_line` / `_tb_draw_section`
+now derive from `(cnt_y + cnt_h) - py` instead of a hardcoded
+`ph - 24` — numerically the same with the new layout but tied
+to the declared row rather than a magic constant.
+
+### S7 — DEFERRED (mini_synth + sprite_viewer)
+
+Audit returned no killer-use-case. Both are standalone-only
+with fixed windows (320×180 and 640×480) and bespoke graphical
+layouts — a piano keyboard at `6 + col*24` positions in
+mini_synth, a centered sprite + corner HUD in sprite_viewer.
+Neither has an `_lib.bsm` embed split today, neither receives a
+panel rect, neither has documented layout misalignment bugs.
+The v2 declarative API earns its keep when chrome-math survives
+resize/embed transitions; here it would just shuffle hardcoded
+offsets without bug-class evidence. Per Rule 28's killer-use-
+case gate, deferred until either tool gains a Bang 9 panel
+embed (`stb++_lib.md` Cap 26 already names mini_synth as the
+future Music tab — embed-contract refactor + v2 declarative
+migration land together when that arc opens).
+
+### S8 — Bang 9 main shell (`bang9/bang9.bpp`)
+
+The biggest single consumer per the original sidequest scoping.
+Killed the textbook chrome math:
+
+```bpp
+panel_y = MENUBAR_H + TABSTRIP_H;
+panel_h = win_h - panel_y - STATUSBAR_H;
+```
+
+Reframed as `COL win → ROW menu fixed(28) + ROW tabs fixed(32)
++ ROW panel grow + ROW status fixed(24)`. The four shell-draw
+calls (`shell_draw_menubar`, `shell_draw_tabs`, `panels_draw`,
+`shell_draw_statusbar`) now read their `(y, h)` from
+`ui_node_y(idx) / ui_node_h(idx)` directly. Future chrome
+additions (search bar between tabs and panel, notification
+strip above the statusbar) drop in as one `ui_row_fixed_h`
+without rewiring `panel_y` / `panel_h` arithmetic.
+
+The internal panels (`_panel_project`, `_panel_code`,
+`_panel_run`, etc.) kept their existing pixel positioning
+inside the panel rect they receive. None had documented
+resize-pain evidence to justify per-panel migration — they
+render lists/headers at top-left of the rect they get and the
+output positioning is correct. The S8 win is at the shell
+level; internal panels can migrate later when they grow real
+layout pain.
+
+### S9 — PARTIAL (`examples/ui_demo.bpp` deleted)
+
+Per-symbol grep audit of every v1-only helper revealed exactly
+one consumer across the whole project: `examples/ui_demo.bpp`.
+That file's line 2 carried a stale `NOTE: Does not work with
+current stb` comment, but it actually compiled — the NOTE was
+dead documentation from a pre-stbui refactor era. It used
+`lay_push` / `lay_pop` / `gui_panel_s` / `gui_label_s` /
+`gui_number_c` / `gui_bar` and the `Style` struct as its
+demonstration surface. After the v2 `examples/stbui_layout_smoke.bpp`
+shipped during S1, ui_demo had no remaining role — same content
+showcased better by the v2 demo + the four real migrated
+consumers (S3 / S4 / S5 / S6).
+
+Deleted ui_demo. The v1 layout API + styled widget family are
+now provably zero-consumer (per-symbol grep across
+`tools/ bang9/ games/ examples/ tests/` returns nothing).
+
+### S9.1 — DEFERRED (`stb/stbui.bsm` dead-code excision)
+
+The mechanical removal of `lay_*` + `_lay_advance` +
+`struct Layout` + `Style` + `gui_*_s` + `gui_bar` from
+`stb/stbui.bsm` is scoped but deferred. The change spans ~30
+`_lay_advance(...)` call lines scattered through surviving
+widget bodies (gui_label / gui_button / gui_slider / etc.) plus
+`lay_x(x)` / `lay_y(y)` indirection collapses to `rx = x; ry =
+y;`. Touches `stb/` so it gates on bootstrap byte-stable +
+suite green. Per the user's batching directive ("não precisa
+fazer tanto commit assim"), pairing this stb-only cleanup with
+at least one other stb/ touch in a future cleanup session
+amortises the bootstrap cost. Sidequest doc tracks as S9.1
+follow-up; documentation entry is the canonical
+"this is finished but for one mechanical follow-up" close-out.
+
+### Lessons (the meta-shape that came out of S5-S9)
+
+1. **Rule 28's killer-use-case gate fired honestly on S7.** The
+   sidequest doc listed mini_synth + sprite_viewer as S7, but
+   the actual code didn't earn the migration: fixed windows,
+   no embed, no panel rect, no resize pain. The discipline
+   said defer + document the trigger condition for re-opening
+   (Bang 9 panel embed). Same shape the phase-collapse arc
+   (2026-05-11) trained: prefer restraint, demand specific
+   bug-class evidence per addition.
+
+2. **S9 scope discipline.** "Deprecate v1 widgets that have no
+   consumers" is ambiguous. The honest split is "delete the
+   single dead consumer (ui_demo.bpp)" (low risk, immediate
+   win) vs "excise the now-zero-consumer helpers from
+   stbui.bsm" (mechanical, ~30 surgical line edits, gates on
+   bootstrap). Doing both in one session conflates two risk
+   profiles; splitting them respects the bootstrap cost
+   amortisation rule the user named today.
+
+3. **The S4 pattern generalised cleanly across S5 / S6 / S8.**
+   `ui_layout_begin → ui_box tree → ui_layout_end → bbox
+   queries + (px, py) offset → v1 widgets unchanged inside`
+   was the canonical shape. Four migrations, identical
+   mechanical structure, no API surface changed between them.
+   The v2 engine itself didn't grow a feature during S5-S8 —
+   it was already shaped right after S1's design choices.
+
+4. **Bbox queries are cheap; declared trees per frame are
+   cheap.** No per-frame allocation (arena reset is O(1)), all
+   bboxes computed in `ui_layout_end`'s four-pass solver. No
+   migration paid a measurable perf cost relative to the
+   manual chrome math it replaced.
+
+### Verification
+
+Tool-only commit (touches `bang9/bang9.bpp`,
+`tools/fxlab/fxlab_lib.bsm`, `tools/the_bug/the_bug_lib.bsm`,
+deletes `examples/ui_demo.bpp`). No `src/` or `stb/` touched,
+so per `feedback_verification_scope.md` no bootstrap. All
+three migrated binaries build clean:
+
+- Standalone fxlab: 314322-byte arm64 Mach-O.
+- Standalone the_bug: 435874-byte arm64 Mach-O.
+- Bang 9 (embeds fxlab Effects tab + the_bug Debug tab +
+  Modulab Sprites tab + level_editor Levels tab): 816210-byte
+  arm64 Mach-O.
+
+Visual smoke owned by the user (the actual chrome-survives-
+resize behaviour is the canonical smoke surface — resize Bang 9
+or any standalone tool, panels stay aligned without manual
+chrome arithmetic).
+
+### Sidequest doc state
+
+`docs/plans/sidequest_stbui_v2_clay.md` marks the arc largely
+closed: S1 → S6 + S8 + S9 SHIPPED, S7 DEFERRED with Rule 28
+reasoning, S9.1 follow-up open with concrete scope. Next reader
+landing on the doc gets the full state without re-deriving it.

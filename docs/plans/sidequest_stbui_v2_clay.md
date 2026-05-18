@@ -1,15 +1,24 @@
 # Sidequest — stbui v2: Clay-inspired layout for B++
 
-**Status:** PARTIAL CLOSED 2026-05-17 — **S1 → S4 SHIPPED** (engine
-+ aseprite viewer + Modulab editor + level_editor migrations).
-**S5 → S9 remain open** (fxlab, the_bug, mini_synth + sprite_viewer,
-Bang 9 chrome, v1 deprecation).
+**Status:** ARC LARGELY CLOSED 2026-05-18 — **S1 → S6 + S8 + S9
+SHIPPED**, **S7 DEFERRED** (mini_synth + sprite_viewer — no
+killer-use-case under Rule 28; reopens when either tool gains a
+Bang 9 panel embed). **S9.1 follow-up open** (mechanical
+stbui.bsm dead-code excision — see Session 9 entry below).
 
 **Shipping trail (2026-05-17):**
 - S1 — `c6d8ee8` (plan + grid/zoom UI) + `dedfb04` (engine integrated)
 - S2 — `324c419` (aseprite viewer)
 - S3 — `54ba80d` (Modulab editor + mixed-sizing helpers)
 - S4 — `b484a17` (level_editor)
+
+**Shipping trail (2026-05-18):**
+- S5 — fxlab declarative shell migration
+- S6 — the_bug debug-map viewer declarative shell
+- S7 — DEFERRED (mini_synth + sprite_viewer, Rule 28 no consumer)
+- S8 — Bang 9 main shell declarative chrome
+- S9 — PARTIAL: ui_demo.bpp deleted (lone v1-layout consumer);
+  stbui.bsm dead-code excision deferred to S9.1
 - Bonus closure: parser fbuf overflow that S1's `import stbimage`
   surfaced was killed by `cd6d00e` (heap-per-file refactor); the
   speculative `ui_image` widget itself reverted by `dba3e2a`
@@ -266,18 +275,91 @@ Concrete order:
    chrome-math; grid centered in canvas bbox; picker Y separated
    from canvas Y so the centered grid doesn't drag the right
    column vertically.
-5. **Session 5 — OPEN**: fxlab migration. Slider arrangement
-   currently explicit y-offsets, one per slider.
-6. **Session 6 — OPEN**: the_bug migration. Debug panels +
-   inspector layout.
-7. **Session 7 — OPEN**: mini_synth + sprite_viewer migrations
-   batched (small consumers).
-8. **Session 8 — OPEN**: Bang 9 chrome migration. The biggest
-   single consumer; ~7 tabs each computing panel rects manually
-   today.
-9. **Session 9 (cleanup) — OPEN**: with all consumers migrated,
-   deprecate v1 widgets that have no consumers left. Document
-   the `gui_button(x, y, w, h, label)` rosetta for any holdouts.
+5. **Session 5 — CLOSED 2026-05-18**: fxlab migration. Shell
+   reframed as `COL panel → ROW body { COL sidebar fixed_w(180)
+   | COL main grow } + ROW helpbar fixed_h(24)`. Killed three
+   magic-number offsets: `sx = px + _FXLAB_SIDEBAR_W + 16`,
+   `sw = pw - _FXLAB_SIDEBAR_W - 32`, footer `py + ph - 18`.
+   All now derive from declared bboxes. Preset list anchored
+   to sidebar bbox; slider stack anchored to main bbox; footer
+   anchored to helpbar bbox. The slider stack itself keeps the
+   manual `slider_y += 36` accumulator — each slider row is two
+   v1 widgets (`gui_label_c` + `gui_slider`) plus a value
+   readout, doesn't pay enough to justify a `ui_row_fixed_h` per
+   slider. Promote to per-row declared layout when a slider
+   variant needs alignment v1 can't express. Bang 9 Effects tab
+   continues to embed cleanly (same `fxlab_lib_frame(x, y, w, h)`
+   signature — only positioning math changed).
+6. **Session 6 — CLOSED 2026-05-18**: the_bug migration. Shell
+   reframed as `COL panel → ROW topbar (fixed 36 or 60, depending
+   on `_tb_run_started`) + ROW content (grow) + ROW statusbar
+   (fixed 24)`. Killed four magic offsets: `_tb_ph = ph - 24`,
+   `bar_y = py + 8`, `content_h = ph - (content_y - py) - 24`,
+   `status_y = py + ph - 20`. Topbar height is computed before
+   layout begins so the row dimensions stay static for the
+   frame. Live panel split (only in STOPPED state) + scroll
+   handling + placeholder centering all anchor to the content
+   bbox instead of `(px, pw)` math. `_tb_ph` clip globals
+   continue to feed `_tb_draw_line` / `_tb_draw_section` —
+   computed from the content row's bottom edge now rather than
+   a hardcoded `ph - 24`. Bang 9 Debug tab embed survives
+   unchanged (same `the_bug_lib_frame(x, y, w, h)` signature).
+7. **Session 7 — DEFERRED 2026-05-18 (Rule 28)**: mini_synth and
+   sprite_viewer audit returned no killer-use-case. Both ship as
+   standalone-only with fixed windows (320×180 and 640×480) and
+   bespoke graphical layouts — a piano keyboard at `6 + col*24`
+   key positions in mini_synth, a centered sprite + corner HUD in
+   sprite_viewer. Neither has an `_lib.bsm` embed split today,
+   neither has a panel-rect input, neither has a documented
+   layout-misalignment bug. The v2 declarative API was designed
+   for "tool that ships as Bang 9 panel + standalone with the
+   same body" and pays for itself when chrome-math survives
+   resize / embed transitions. Migrating these tools today would
+   shuffle hardcoded offsets without delivering bug-class
+   evidence — the exact restraint Rule 28's killer-use-case gate
+   is designed to enforce. **Re-open the moment either tool
+   gains a Bang 9 panel embed** (mini_synth already named as
+   the Music tab in `stb++_lib.md` Cap 26's roadmap table —
+   embed-contract refactor + v2 declarative migration land
+   together when that arc opens).
+8. **Session 8 — CLOSED 2026-05-18**: Bang 9 shell migration.
+   `bang9.bpp` main() chrome reframed as `COL win { ROW menu
+   fixed(28) + ROW tabs fixed(32) + ROW panel grow + ROW status
+   fixed(24) }`. Killed two chrome-math lines:
+   `panel_y = MENUBAR_H + TABSTRIP_H` and
+   `panel_h = win_h - panel_y - STATUSBAR_H`. The internal panels
+   (`_panel_project`, `_panel_code`, `_panel_run`, etc.) keep
+   their existing pixel arithmetic inside the panel rect they
+   receive — those internal layouts didn't have resize-pain
+   evidence to justify per-panel migration (Rule 28). The
+   payoff is at the shell level: future chrome additions (search
+   bar, notification strip) drop in as one `ui_row_fixed_h` call
+   without rewiring `panel_y` / `panel_h` arithmetic. Bang 9
+   continues to embed all four migrated tools (S3 Modulab, S4
+   level_editor, S5 fxlab, S6 the_bug) cleanly via the same
+   `<tool>_lib_frame(x, y, w, h)` contract.
+9. **Session 9 — PARTIAL CLOSED 2026-05-18**: deletion of
+   `examples/ui_demo.bpp` (the lone holdout consumer of the v1
+   `lay_*` layout helpers + the styled widget family
+   `gui_panel_s` / `gui_label_s` / `gui_number_c` / `gui_bar`
+   + the `Style` struct). After this removal, the entire v1
+   layout API (`lay_push` / `lay_pop` / `lay_x` / `lay_y` /
+   `lay_w` / `LAY_DOWN` / `LAY_RIGHT` / `struct Layout` /
+   `_lay_advance` / `_lay_stack` / `_lay_top`) and the styled
+   widget set have zero source consumers across the whole
+   project (verified via per-symbol grep of `tools/ bang9/
+   games/ examples/ tests/`).
+
+   **Followup S9.1 (deferred — own session):** mechanical
+   deletion of the dead symbols from `stb/stbui.bsm`. Scope is
+   ~30 `_lay_advance(...)` call lines scattered across surviving
+   widget bodies (gui_label / gui_button / gui_slider /
+   gui_text_input / etc.) plus the `lay_x(x)` / `lay_y(y)`
+   fallback-resolver indirections that can collapse to bare
+   `rx = x; ry = y;`. Touches `stb/` so it gates on bootstrap
+   byte-stable + suite green. The work is mechanical but
+   high-volume; pairing it with at least one other stb/ touch
+   in a future cleanup session amortises the bootstrap cost.
 
 Each session ~3-4h, bisect-friendly per migration. v1 stays
 green throughout.
