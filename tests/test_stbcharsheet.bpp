@@ -1,0 +1,153 @@
+import "stbcharsheet.bsm";
+
+// test_stbcharsheet.bpp — Correctness pins for the stbcharsheet
+// storage primitive. Covers four scenarios using SC1-flavored stat
+// keys (illustrative; the cartridge itself is genre-agnostic):
+//   1. Empty sheet — both sections zero-init.
+//   2. Stats — set / get / OOB / count.
+//   3. Resources — init, current/max, set with clamp, adjust with
+//      clamp, full / empty queries.
+//   4. Reset — zeros every slot but keeps allocation alive.
+
+const STAT_ARMOR    = 0;
+const STAT_DAMAGE   = 1;
+const STAT_RANGE    = 2;
+const STAT_COOLDOWN = 3;
+const STAT_SIGHT    = 4;
+const RES_HP        = 0;
+const RES_SHIELDS   = 1;
+const RES_ENERGY    = 2;
+
+static _expect_int(label: ptr, got, want) {
+    if (got == want) {
+        return 0;
+    }
+    putstr("FAIL: ");
+    putstr(label);
+    putstr(" got=");
+    putnum(got);
+    putstr(" want=");
+    putnum(want);
+    putstr("\n");
+    return 1;
+}
+
+main() {
+    auto cs, fails;
+    fails = 0;
+
+    // ── Scenario 1: empty sheet zero-init.
+    cs = cs_new(5, 3);
+    fails += _expect_int("stat count",     cs_stat_count(cs), 5);
+    fails += _expect_int("resource count", cs_res_count(cs),  3);
+    fails += _expect_int("stat zero",      cs_stat_get(cs, STAT_DAMAGE), 0);
+    fails += _expect_int("res cur zero",   cs_res_current(cs, RES_HP),   0);
+    fails += _expect_int("res max zero",   cs_res_max(cs, RES_HP),       0);
+    // Fresh resource at 0/0 reads as "empty" by definition.
+    fails += _expect_int("res empty when zero", cs_res_empty(cs, RES_HP), 1);
+    fails += _expect_int("res full when zero",  cs_res_full(cs, RES_HP),  1);
+
+    // ── Scenario 2: stats.
+    cs_stat_set(cs, STAT_ARMOR,    0);
+    cs_stat_set(cs, STAT_DAMAGE,   6);
+    cs_stat_set(cs, STAT_RANGE,    4);
+    cs_stat_set(cs, STAT_COOLDOWN, 15);
+    cs_stat_set(cs, STAT_SIGHT,    7);
+    fails += _expect_int("stat damage", cs_stat_get(cs, STAT_DAMAGE),   6);
+    fails += _expect_int("stat range",  cs_stat_get(cs, STAT_RANGE),    4);
+    fails += _expect_int("stat sight",  cs_stat_get(cs, STAT_SIGHT),    7);
+
+    // OOB stat ops are silent (write) / 0 (read).
+    cs_stat_set(cs, 99, 999);
+    cs_stat_set(cs, -1, 999);
+    fails += _expect_int("stat OOB read +",  cs_stat_get(cs, 99), 0);
+    fails += _expect_int("stat OOB read -",  cs_stat_get(cs, -1), 0);
+    fails += _expect_int("stat untouched",   cs_stat_get(cs, STAT_DAMAGE), 6);
+
+    // ── Scenario 3: resources.
+    cs_res_init(cs, RES_HP, 40);              // Marine HP
+    cs_res_init(cs, RES_SHIELDS, 0);          // Marines have no shields
+    cs_res_init(cs, RES_ENERGY, 0);           // ... or energy
+
+    fails += _expect_int("hp current after init", cs_res_current(cs, RES_HP), 40);
+    fails += _expect_int("hp max after init",     cs_res_max(cs, RES_HP),     40);
+    fails += _expect_int("hp full after init",    cs_res_full(cs, RES_HP),     1);
+    fails += _expect_int("hp empty after init",   cs_res_empty(cs, RES_HP),    0);
+
+    // Take damage — clamp-on-floor.
+    auto v;
+    v = cs_res_adjust(cs, RES_HP, -10);
+    fails += _expect_int("hp after -10 dmg", v, 30);
+    fails += _expect_int("hp current matches", cs_res_current(cs, RES_HP), 30);
+    fails += _expect_int("hp not full", cs_res_full(cs, RES_HP), 0);
+    fails += _expect_int("hp not empty", cs_res_empty(cs, RES_HP), 0);
+
+    // Over-damage — clamps at 0, not negative.
+    v = cs_res_adjust(cs, RES_HP, -100);
+    fails += _expect_int("hp clamp floor", v, 0);
+    fails += _expect_int("hp empty after KO", cs_res_empty(cs, RES_HP), 1);
+
+    // Heal — clamps at max, not over.
+    cs_res_init(cs, RES_HP, 40);              // reset
+    v = cs_res_adjust(cs, RES_HP, -20);       // 40 - 20 = 20
+    fails += _expect_int("hp after damage",  v, 20);
+    v = cs_res_adjust(cs, RES_HP, 9999);      // big heal
+    fails += _expect_int("hp clamp ceiling", v, 40);
+    fails += _expect_int("hp full after heal", cs_res_full(cs, RES_HP), 1);
+
+    // cs_res_set clamps too.
+    cs_res_set(cs, RES_HP, 25);
+    fails += _expect_int("hp set 25", cs_res_current(cs, RES_HP), 25);
+    cs_res_set(cs, RES_HP, 9999);
+    fails += _expect_int("hp set above max", cs_res_current(cs, RES_HP), 40);
+    cs_res_set(cs, RES_HP, -50);
+    fails += _expect_int("hp set below zero", cs_res_current(cs, RES_HP), 0);
+
+    // cs_res_set_max preserves overflow-clamped current.
+    cs_res_init(cs, RES_HP, 40);
+    cs_res_set_max(cs, RES_HP, 25);           // shrink ceiling — current was 40
+    fails += _expect_int("hp clamped on max shrink", cs_res_current(cs, RES_HP), 25);
+    fails += _expect_int("hp new max",               cs_res_max(cs, RES_HP),     25);
+
+    // OOB resource ops are silent (write) / 0 (read).
+    cs_res_init(cs, 99, 100);
+    cs_res_adjust(cs, -1, 50);
+    fails += _expect_int("res OOB read +", cs_res_current(cs, 99), 0);
+    fails += _expect_int("res OOB max +",  cs_res_max(cs, 99),     0);
+
+    // ── Scenario 4: reset zeros everything but keeps the sheet alive.
+    cs_res_init(cs, RES_HP, 40);
+    cs_stat_set(cs, STAT_DAMAGE, 9);
+    cs_reset(cs);
+    fails += _expect_int("stat zero after reset", cs_stat_get(cs, STAT_DAMAGE), 0);
+    fails += _expect_int("hp cur zero after reset", cs_res_current(cs, RES_HP), 0);
+    fails += _expect_int("hp max zero after reset", cs_res_max(cs, RES_HP),     0);
+    // Sheet still usable after reset.
+    cs_stat_set(cs, STAT_DAMAGE, 5);
+    fails += _expect_int("stat usable after reset", cs_stat_get(cs, STAT_DAMAGE), 5);
+
+    cs_free(cs);
+
+    // ── Edge: 0-stat or 0-resource sections.
+    auto only_stats, only_res;
+    only_stats = cs_new(2, 0);
+    cs_stat_set(only_stats, 0, 42);
+    fails += _expect_int("0-res sheet stat",  cs_stat_get(only_stats, 0), 42);
+    fails += _expect_int("0-res sheet rcount", cs_res_count(only_stats),   0);
+    cs_free(only_stats);
+
+    only_res = cs_new(0, 1);
+    cs_res_init(only_res, 0, 100);
+    fails += _expect_int("0-stat sheet res",   cs_res_current(only_res, 0), 100);
+    fails += _expect_int("0-stat sheet scount", cs_stat_count(only_res),     0);
+    cs_free(only_res);
+
+    if (fails == 0) {
+        putstr("OK\n");
+        return 0;
+    }
+    putstr("FAILED: ");
+    putnum(fails);
+    putstr(" assertion(s)\n");
+    return 1;
+}

@@ -1,0 +1,252 @@
+// stbcharsheet.bsm — Programmable character sheet primitive.
+//
+// Fully-generic (Tonify Rule 33). Stores N stats and M resources
+// per character; each game registers what the keys mean.
+//
+//   STATS     — scalar base values that change rarely or never:
+//               armor, sight range, base damage, build cost,
+//               STR/DEX/CON, weapon range, supply cost. Read often,
+//               written at spawn time or on level-up.
+//   RESOURCES — current/max pairs that change every frame in
+//               combat: HP, shields, energy, mana, stamina,
+//               ammo, hunger. Damage / heal / regen run through
+//               cs_res_adjust which clamps to [0, max].
+//
+// The cartridge knows NOTHING about combat formulas, regen curves,
+// status effects, equipment modifiers, level-up scaling, or
+// derived-stat calculations. Those are consumer concerns built on
+// top — wc1_combat applies armor before calling cs_res_adjust on
+// HP; an RPG ability system wraps cs_stat_set for temporary
+// buff/debuff bookkeeping; a Pokemon engine wraps cs_res_init for
+// per-level HP curves.
+//
+// Anti-speculation guard: DO NOT add modifiers, buff stacks,
+// derived-stat formulas, regen curves, status effects, equipment
+// slots, or skill trees here. Those vary so wildly across genres
+// (D&D vs SC vs Pokemon vs Soulslike) that the lowest common
+// denominator is "named int slots with clamped resource pairs."
+// Anything richer earns its slot only when two consumer genres
+// converge on the same shape (Tonify Rule 20).
+//
+// Designed to feed an ECS component (one CharSheet handle per
+// entity) but works standalone — a turn-based engine could store
+// sheets in a battle struct directly without an ECS.
+//
+// ── Usage (WC1 worker unit) ─────────────────────────────────
+//
+//   const WC1_STAT_ARMOR    = 0;
+//   const WC1_STAT_DAMAGE   = 1;
+//   const WC1_STAT_SPEED    = 2;
+//   const WC1_RES_HP        = 0;
+//
+//   peasant = cs_new(3, 1);                       // 3 stats, 1 resource
+//   cs_stat_set(peasant, WC1_STAT_ARMOR,  0);
+//   cs_stat_set(peasant, WC1_STAT_DAMAGE, 4);
+//   cs_stat_set(peasant, WC1_STAT_SPEED,  128);
+//   cs_res_init(peasant, WC1_RES_HP, 30);
+//
+//   cs_res_adjust(peasant, WC1_RES_HP, -10);      // damage
+//   if (cs_res_empty(peasant, WC1_RES_HP)) { ... }
+//
+// ── Usage (SC1 Marine reference, canonical Liquipedia/BWAPI) ─
+//
+//   const SC1_STAT_ARMOR    = 0;
+//   const SC1_STAT_DAMAGE   = 1;
+//   const SC1_STAT_RANGE    = 2;
+//   const SC1_STAT_COOLDOWN = 3;
+//   const SC1_STAT_SIGHT    = 4;
+//   const SC1_RES_HP        = 0;
+//   // (Marines have no shields/energy — just one resource slot.)
+//
+//   marine = cs_new(5, 1);
+//   cs_stat_set(marine, SC1_STAT_ARMOR,    0);
+//   cs_stat_set(marine, SC1_STAT_DAMAGE,   6);
+//   cs_stat_set(marine, SC1_STAT_RANGE,    4);
+//   cs_stat_set(marine, SC1_STAT_COOLDOWN, 15);     // 15 frames @ 24fps
+//   cs_stat_set(marine, SC1_STAT_SIGHT,    7);
+//   cs_res_init(marine, SC1_RES_HP,       40);
+//
+// A Protoss Zealot needs the same sheet shape plus a shields
+// resource (4-slot sheet); a Zerg Zergling drops the shields slot
+// but adds an attack-cooldown bonus stat — the consumer game
+// decides the slot count + key meaning. The cartridge stays
+// agnostic.
+//
+// Portability tier: pure B++ over buf_word. No FFI, no SIMD;
+// C-emit-clean.
+
+struct CharSheet {
+    n_stats,           // number of stat slots
+    n_resources,       // number of resource slots
+    stats,             // buf_word[n_stats] — base scalar values
+    res_cur,           // buf_word[n_resources] — current values
+    res_max            // buf_word[n_resources] — max values
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────
+
+// Allocate a fresh sheet with `n_stats` scalar stat slots and
+// `n_resources` current/max resource pairs. All slots start at 0
+// (stats), 0/0 (resources). The caller populates them with
+// cs_stat_set / cs_res_init.
+//
+// Pass 0 for either dimension to skip that section — a Pokemon
+// move template might want 4 stats (power, accuracy, pp_max, type)
+// and 0 resources; a healing potion might be 0 stats + 1 resource
+// (charges_current / charges_max).
+cs_new(n_stats, n_resources) {
+    auto cs: CharSheet, i;
+    cs = malloc(sizeof(CharSheet));
+    cs.n_stats     = n_stats;
+    cs.n_resources = n_resources;
+    cs.stats   = buf_word(n_stats);
+    cs.res_cur = buf_word(n_resources);
+    cs.res_max = buf_word(n_resources);
+    for (i = 0; i < n_stats; i++)     { cs.stats[i]   = 0; }
+    for (i = 0; i < n_resources; i++) { cs.res_cur[i] = 0; cs.res_max[i] = 0; }
+    return cs;
+}
+
+// Release a sheet + all backing buffers. After this the handle is
+// invalid; the caller should drop the reference.
+void cs_free(cs) {
+    auto c: CharSheet;
+    c = cs;
+    if (c.stats   != 0) { free(c.stats); }
+    if (c.res_cur != 0) { free(c.res_cur); }
+    if (c.res_max != 0) { free(c.res_max); }
+    free(cs);
+}
+
+// Zero every slot without reallocating. Use to reset a sheet
+// between encounters, rounds, or scene transitions without
+// reallocating — same buffer lifetimes survive the wipe.
+void cs_reset(cs) {
+    auto c: CharSheet, i;
+    c = cs;
+    for (i = 0; i < c.n_stats; i++)     { c.stats[i]   = 0; }
+    for (i = 0; i < c.n_resources; i++) { c.res_cur[i] = 0; c.res_max[i] = 0; }
+}
+
+// ── Stats (scalar base values) ──────────────────────────────────
+
+// Write a stat slot. Out-of-range keys are silently ignored so
+// consumers can probe optional slots without per-call bounds.
+void cs_stat_set(cs, key, val) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_stats) { return; }
+    c.stats[key] = val;
+}
+
+// Read a stat slot. Out-of-range keys return 0 — same intent as
+// the OOB write being a no-op: consumers can sample optional
+// slots and treat 0 as "not set / default".
+cs_stat_get(cs, key) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_stats) { return 0; }
+    return c.stats[key];
+}
+
+cs_stat_count(cs) {
+    auto c: CharSheet;
+    c = cs;
+    return c.n_stats;
+}
+
+// ── Resources (current/max pairs) ───────────────────────────────
+
+// Initialize a resource at full — current = max = `max`. The
+// canonical way to set up HP / shields / mana / stamina at spawn
+// time. Out-of-range keys are silently ignored.
+void cs_res_init(cs, key, max) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return; }
+    c.res_cur[key] = max;
+    c.res_max[key] = max;
+}
+
+// Change a resource's max value; if the current value exceeds the
+// new max, it clamps down. Use to model level-up / debuff effects
+// that change the HP ceiling — the current value never silently
+// exceeds max.
+void cs_res_set_max(cs, key, max) {
+    auto c: CharSheet, cur;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return; }
+    c.res_max[key] = max;
+    cur = c.res_cur[key];
+    if (cur > max) { c.res_cur[key] = max; }
+}
+
+// Set the current value, clamped to [0, max]. Use when a save-game
+// loader or a script wants to write a precise value (e.g. "load
+// this RPG with 23/40 HP"). Damage / heal go through cs_res_adjust
+// which is the more common path.
+void cs_res_set(cs, key, current) {
+    auto c: CharSheet, m;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return; }
+    m = c.res_max[key];
+    if (current < 0) { current = 0; }
+    if (current > m) { current = m; }
+    c.res_cur[key] = current;
+}
+
+// Add `delta` to current (delta may be negative for damage),
+// clamp the result to [0, max], and return the new current value.
+// The clamping behaviour is the whole point: callers don't have
+// to remember the bounds, and an over-damaged unit reads as 0
+// (cs_res_empty fires), not as a negative HP.
+cs_res_adjust(cs, key, delta) {
+    auto c: CharSheet, m, v;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return 0; }
+    m = c.res_max[key];
+    v = c.res_cur[key] + delta;
+    if (v < 0) { v = 0; }
+    if (v > m) { v = m; }
+    c.res_cur[key] = v;
+    return v;
+}
+
+cs_res_current(cs, key) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return 0; }
+    return c.res_cur[key];
+}
+
+cs_res_max(cs, key) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return 0; }
+    return c.res_max[key];
+}
+
+// 1 if the resource is at its ceiling (full). Useful for "do not
+// heal further" gates, animation triggers, regen rate caps.
+cs_res_full(cs, key) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return 0; }
+    return c.res_cur[key] >= c.res_max[key];
+}
+
+// 1 if the resource is at floor (depleted). The canonical "dead"
+// check for HP — `cs_res_empty(sheet, HP_KEY)` is true exactly
+// when the unit has been damaged to 0.
+cs_res_empty(cs, key) {
+    auto c: CharSheet;
+    c = cs;
+    if (key < 0 || key >= c.n_resources) { return 1; }
+    return c.res_cur[key] <= 0;
+}
+
+cs_res_count(cs) {
+    auto c: CharSheet;
+    c = cs;
+    return c.n_resources;
+}
