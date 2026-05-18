@@ -43,6 +43,13 @@ global drag_x0, drag_y0, drag_x1, drag_y1;
 // shaky mouse without swallowing real micro-marquees.
 const _DRAG_PX_THRESHOLD = 3;
 
+// The player id the local user commands. Single-player today =
+// always 0 (the WC1 campaign's human side). When a real
+// pre-game setup ships (multi-player lobby, AI player picker)
+// this becomes a runtime value piped in from rts.bpp; for now
+// a const keeps the selection filters tight.
+const _HUMAN_PLAYER = 0;
+
 extrn pos_comp, target_comp, peasant_q;
 extrn faction_comp, attack_target_comp;
 extrn cam;
@@ -70,7 +77,36 @@ wc1_input_init() {
 // first unit whose 32 × 32 bbox contains (_hit_wx, _hit_wy);
 // first-hit-wins by spawn order. Z-ordered hit-test is polish
 // for a future session.
+//
+// SELECTION VARIANT — invoked by _unit_at_world_owned. Skips
+// units that don't belong to the human side (player 0). The
+// attack-target hit-test (S7.2 right-click) uses a different
+// callback that scans EVERY unit so the player can click on
+// enemies.
 static void _hit_test_cb(w, eid) {
+    auto p: Pos, x0, y0, fa: Faction;
+    if (_hit_eid >= 0) { return; }
+    // Selection is human-only — a player commanding orcs is a
+    // future multiplayer / spectator feature (Rule 28). The
+    // attack-target hit-test below uses _hit_test_any_cb which
+    // skips this filter.
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _HUMAN_PLAYER) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    x0 = p.x - 8;
+    y0 = p.y - 16;
+    if (_hit_wx <  x0)      { return; }
+    if (_hit_wy <  y0)      { return; }
+    if (_hit_wx >= x0 + 32) { return; }
+    if (_hit_wy >= y0 + 32) { return; }
+    _hit_eid = eid;
+}
+
+// Hit-test variant that ignores Faction — used by the right-click
+// attack-target lookup so the player can click an enemy unit. The
+// _is_enemy guard upstream filters out friendly hits before
+// treating it as an attack.
+static void _hit_test_any_cb(w, eid) {
     auto p: Pos, x0, y0;
     if (_hit_eid >= 0) { return; }
     p = ecs_get(w, pos_comp, eid);
@@ -83,13 +119,16 @@ static void _hit_test_cb(w, eid) {
     _hit_eid = eid;
 }
 
-// Per-entity callback for the marquee walk. Appends every unit
-// whose bbox overlaps the world-space rect (_mq_x0,_mq_y0)-
-// (_mq_x1,_mq_y1). AABB-overlap: rectangles overlap when neither
-// is strictly to the side / above the other.
+// Per-entity callback for the marquee walk. Appends every PLAYER-
+// OWNED unit whose bbox overlaps the world-space rect. Filters out
+// enemy factions for the same reason _hit_test_cb does — the human
+// player only commands their own side. AABB-overlap: rectangles
+// overlap when neither is strictly to the side / above the other.
 static void _marquee_test_cb(w, eid) {
-    auto p: Pos, ux0, uy0, ux1, uy1;
+    auto p: Pos, ux0, uy0, ux1, uy1, fa: Faction;
     if (selected_count >= _MAX_SELECTION) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _HUMAN_PLAYER) { return; }
     p = ecs_get(w, pos_comp, eid);
     ux0 = p.x - 8;
     uy0 = p.y - 16;
@@ -103,13 +142,28 @@ static void _marquee_test_cb(w, eid) {
     selected_count = selected_count + 1;
 }
 
-// Single-hit lookup at world point (wx, wy). Returns -1 when
-// nothing was hit. Wrapper over the shared peasant_q walk.
-static _unit_at_world(world, wx, wy) {
+// Single-hit lookup at world point (wx, wy), HUMAN-OWNED units
+// only. Returns -1 when nothing was hit (or only enemies are
+// under the cursor). Use this for the "selection" click — a
+// player can't select enemies.
+static _unit_at_world_owned(world, wx, wy) {
     _hit_wx  = wx;
     _hit_wy  = wy;
     _hit_eid = -1;
     ecs_query_each(peasant_q, fn_ptr(_hit_test_cb));
+    return _hit_eid;
+}
+
+// Single-hit lookup at world point (wx, wy), ANY faction. Returns
+// -1 when nothing was hit. Use this for the "attack-target" right-
+// click — the player needs to be able to click on enemies. The
+// upstream _is_enemy guard rejects friendly hits before turning
+// them into attack commands.
+static _unit_at_world_any(world, wx, wy) {
+    _hit_wx  = wx;
+    _hit_wy  = wy;
+    _hit_eid = -1;
+    ecs_query_each(peasant_q, fn_ptr(_hit_test_any_cb));
     return _hit_eid;
 }
 
@@ -131,12 +185,13 @@ static void _resolve_release(world) {
     if (dx <= _DRAG_PX_THRESHOLD && dy <= _DRAG_PX_THRESHOLD) {
         // Click — single hit-test at the release point. The down
         // and up points are within _DRAG_PX_THRESHOLD of each
-        // other, so picking either is fine.
+        // other, so picking either is fine. _owned variant skips
+        // enemy factions (selection is player-only in v1).
         mx = mouse_x();
         my = mouse_y();
         wx = cam_screen_to_world_x(cam, mx);
         wy = cam_screen_to_world_y(cam, my);
-        hit = _unit_at_world(world, wx, wy);
+        hit = _unit_at_world_owned(world, wx, wy);
         if (hit >= 0) {
             selected_eids[0] = hit;
             selected_count   = 1;
@@ -200,7 +255,7 @@ void wc1_input_tick(world) {
             wx = cam_screen_to_world_x(cam, mx);
             wy = cam_screen_to_world_y(cam, my);
             auto target_eid;
-            target_eid = _unit_at_world(world, wx, wy);
+            target_eid = _unit_at_world_any(world, wx, wy);
             if (target_eid >= 0 && _is_enemy(world, target_eid) != 0) {
                 _issue_attack(world, target_eid);
             } else {
