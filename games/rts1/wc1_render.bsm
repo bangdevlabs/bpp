@@ -43,6 +43,13 @@ struct Sprite   { atlas, frame }
 struct UnitType { kind }
 struct Target   { gx, gy }
 struct Path     { mode, buf, count, cursor, tile_gx, tile_gy }
+// Faction tags every unit with its owning player id (0 = human side
+// 1, 1 = orc side 1, ...) so S7 combat can decide "friend vs foe"
+// in one read instead of consulting an external table. Stored as a
+// component because every unit is faction-typed from spawn time —
+// archetype-fan-out isn't needed unless future buildings or
+// neutral entities show a different layout (Rule 30 trigger).
+struct Faction  { player }
 // Anim drives the per-unit animation state. `state` is one of
 // UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
 // — used to dispatch between idle anim and walk anim families.
@@ -65,6 +72,7 @@ const MAX_WAYPOINTS = 256;
 // to flow through globals because B++ doesn't carry closures.
 // Same pattern every other stbecs consumer follows.
 global pos_comp, sprite_comp, unit_comp, target_comp, path_comp, anim_comp;
+global faction_comp;
 global peasant_arch, peasant_q;
 
 // Camera handle owned by rts.bpp. Read by _render_unit via
@@ -82,30 +90,34 @@ extrn cam;
 // archetype lands (S7+ buildings), revisit to a real mask filter.
 ecs_wire(world) {
     auto comps;
-    pos_comp    = ecs_component_register(world, "Pos",      sizeof(Pos));
-    sprite_comp = ecs_component_register(world, "Sprite",   sizeof(Sprite));
-    unit_comp   = ecs_component_register(world, "UnitType", sizeof(UnitType));
-    target_comp = ecs_component_register(world, "Target",   sizeof(Target));
-    path_comp   = ecs_component_register(world, "Path",     sizeof(Path));
-    anim_comp   = ecs_component_register(world, "Anim",     sizeof(Anim));
-    comps    = buf_word(6);
+    pos_comp     = ecs_component_register(world, "Pos",      sizeof(Pos));
+    sprite_comp  = ecs_component_register(world, "Sprite",   sizeof(Sprite));
+    unit_comp    = ecs_component_register(world, "UnitType", sizeof(UnitType));
+    target_comp  = ecs_component_register(world, "Target",   sizeof(Target));
+    path_comp    = ecs_component_register(world, "Path",     sizeof(Path));
+    anim_comp    = ecs_component_register(world, "Anim",     sizeof(Anim));
+    faction_comp = ecs_component_register(world, "Faction",  sizeof(Faction));
+    comps    = buf_word(7);
     comps[0] = pos_comp;
     comps[1] = sprite_comp;
     comps[2] = unit_comp;
     comps[3] = target_comp;
     comps[4] = path_comp;
     comps[5] = anim_comp;
-    peasant_arch = ecs_archetype(world, comps, 6);
+    comps[6] = faction_comp;
+    peasant_arch = ecs_archetype(world, comps, 7);
     peasant_q    = ecs_query(world, 0);
 }
 
-// Spawn one peasant at grid (gx, gy). Returns the encoded entity
-// id so callers can hold onto it for later kills / queries; the
-// id is opaque (encoded with the archetype bit) and only useful
-// to ecs_get / ecs_kill_at.
-ecs_spawn_peasant(world, atlas, gx, gy) {
+// Spawn one peasant at grid (gx, gy) owned by `player`. Returns the
+// encoded entity id so callers can hold onto it for later kills /
+// queries; the id is opaque (encoded with the archetype bit) and
+// only useful to ecs_get / ecs_kill_at. The `player` argument tags
+// the unit's Faction so S7+ combat can decide friend vs foe at
+// hit-test and tick time.
+ecs_spawn_peasant(world, atlas, gx, gy, player) {
     auto eid;
-    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim;
+    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim, fa: Faction;
     eid = ecs_spawn_at(world, peasant_arch);
     p = ecs_get(world, pos_comp, eid);
     // Pos lives in PIXEL coords so the movement system can walk
@@ -149,6 +161,12 @@ ecs_spawn_peasant(world, atlas, gx, gy) {
     an.state      = UNIT_STATE_IDLE;
     an.facing     = FACE_S;
     an.elapsed_ms = 0;
+    // Faction tag — used by S7+ combat to decide friend vs foe.
+    // Single-player today runs the human as player 0 against orc
+    // factions at 1..N; the spawner sources this from the level
+    // JSON's `player` field.
+    fa = ecs_get(world, faction_comp, eid);
+    fa.player = player;
     return eid;
 }
 
