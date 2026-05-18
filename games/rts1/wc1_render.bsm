@@ -27,15 +27,22 @@ load   "wc1_anims.bsm";
 // can reference their own atlas without a global-table lookup.
 // UnitType is the kind tag (UNIT_PEASANT etc). Target carries the
 // right-clicked DESTINATION GRID CELL set by wc1_input; gx == -1
-// sentinel means "no target". Path is the A* result the movement
-// system follows: buf is a per-unit buf_word(MAX_WP * 2) allocated
-// at spawn, count is the live waypoint count (0 = no path),
-// cursor is the index of the next waypoint to walk toward.
+// sentinel means "no target". Path tracks the active movement
+// intent: `mode` switches between A* waypoints (0) and flow-field
+// sampling (1) — see wc1_movement.bsm PATH_MODE_*; `buf` is a per-
+// unit buf_word(MAX_WP * 2) used by mode 0; `count` is the live
+// waypoint count (0 = no path); `cursor` is the next waypoint
+// index. In flow mode `count` / `cursor` are unused — the field
+// itself drives the next-tile sample each frame. `tile_gx` /
+// `tile_gy` is the unit's CURRENT TILE CLAIM in the occupancy
+// grid (see wc1_movement.bsm `_occupied`); transferred atomically
+// whenever the micro-target tile changes so two units can never
+// stack on the same tile.
 struct Pos      { x, y }
 struct Sprite   { atlas, frame }
 struct UnitType { kind }
 struct Target   { gx, gy }
-struct Path     { buf, count, cursor }
+struct Path     { mode, buf, count, cursor, tile_gx, tile_gy }
 // Anim drives the per-unit animation state. `state` is one of
 // UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
 // — used to dispatch between idle anim and walk anim families.
@@ -119,11 +126,21 @@ ecs_spawn_peasant(world, atlas, gx, gy) {
     t.gy = -1;
     // Per-unit path buffer. count = 0 means "no path", so the
     // movement tick is a no-op until wc1_input writes a target
-    // and the path planner populates count + cursor.
+    // and the path planner populates count + cursor. mode = 0
+    // is PATH_MODE_ASTAR (defined in wc1_movement.bsm); a fresh
+    // peasant always starts on the A* code path. tile_gx /
+    // tile_gy mirror the spawn tile so the unit's occupancy
+    // claim aligns with its initial Pos.
     pa = ecs_get(world, path_comp, eid);
     pa.buf    = buf_word(MAX_WAYPOINTS * 2);
     pa.count  = 0;
     pa.cursor = 0;
+    pa.mode   = 0;
+    pa.tile_gx = gx;
+    pa.tile_gy = gy;
+    // Reserve the spawn tile in the shared occupancy grid so
+    // pathing for OTHER units treats this peasant as a blocker.
+    wc1_collision_register(eid, gx, gy);
     // Initial anim state: idle facing south (the convention every
     // WC1 unit sprite renders by default). wc1_movement updates
     // facing per step + flips to UNIT_STATE_WALK when a path is

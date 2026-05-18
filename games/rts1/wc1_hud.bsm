@@ -1,18 +1,15 @@
 // wc1_hud.bsm — HUD foundations.
 //
-// Session 4 ships one piece: the selection ring overlay drawn
-// around `selected_eid` (managed by wc1_input.bsm). Future
-// sessions extend this file with the minimap (S6+), unit info
-// panel (S7+), build menu (S8+), and resource counters
-// (S9+) — all of those share the "draw on top of the world,
+// Session 4 shipped one piece (the single selection ring); Session 6
+// extends it to N rings (every entry in selected_eids) plus the live
+// marquee rectangle while the user is mid-drag. Future sessions
+// extend this file with the minimap, unit info panel, build menu,
+// and resource counters — all share the "draw on top of the world,
 // after the unit pass" lifecycle.
 //
-// The ring is rendered in WORLD space (not screen space) so it
-// follows the unit through camera pans naturally — the camera
-// offset is applied at draw time the same way wc1_render does
-// for the unit sprite. Drawn as a `render_rect_outline` (four
-// edge lines) for v1; a real ring sprite asset can replace this
-// later without changing the call site.
+// Rings are rendered in WORLD space so they follow units through
+// camera pans; the marquee is rendered in SCREEN space because it
+// lives in the input layer, not the simulation.
 
 import "stbecs.bsm";
 import "stbrender.bsm";
@@ -20,30 +17,46 @@ import "stbcamera.bsm";
 
 extrn pos_comp;
 extrn cam;
-extrn selected_eid;
+extrn selected_eids, selected_count;
+extrn drag_active, drag_x0, drag_y0, drag_x1, drag_y1;
 
-// Color of the selection ring. Bright yellow matches the WC1 /
-// Warcraft 2 visual convention for "this is the unit you're
-// commanding right now"; the alpha is full so the ring stays
-// readable over both grass and tree tiles.
+// Bright yellow ring matches the WC1 / Warcraft 2 convention for
+// "this is a unit you are commanding right now."
 const _RING_COLOR = 0xFFFF00FF;
 
-// Render every HUD layer that lives on top of the world. Today
-// that's just the selection ring; future sessions add minimap +
-// info panel here. Call once per frame AFTER ecs_render_units
-// so the ring lands on top of the sprite and BEFORE
-// game_render_end so the GPU pass commits the draw.
+// Bright white marquee outline reads cleanly over grass + trees +
+// shadow tiles. Outline-only (no fill) keeps the world visible
+// underneath the rect.
+const _MARQUEE_COLOR = 0xFFFFFFFF;
+
+// Render every HUD layer that lives on top of the world. Call once
+// per frame AFTER ecs_render_units so the rings land on top of the
+// sprites, BEFORE game_render_end so the GPU pass commits the draw.
 wc1_hud_render(world) {
-    auto p: Pos, sx, sy;
-    if (selected_eid < 0) { return; }
-    // Same per-entity transform wc1_render._render_unit uses:
-    // tile (gx, gy) → world pixels (gx*16 - 8, gy*16 - 16) for
-    // the 32×32 sprite; subtract the camera to land in screen
-    // pixels. Keeping the math identical guarantees the ring
-    // sits exactly on the sprite's bounding box at every camera
-    // position.
-    p = ecs_get(world, pos_comp, selected_eid);
-    sx = p.x - 8  - cam_x(cam);
-    sy = p.y - 16 - cam_y(cam);
-    render_rect_outline(sx, sy, 32, 32, _RING_COLOR);
+    auto p: Pos, sx, sy, i, eid;
+    auto rx, ry, rw, rh;
+    // One ring per selected unit. Same per-entity transform
+    // wc1_render._render_unit uses: (gx*16 - 8, gy*16 - 16),
+    // minus the camera offset.
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        p = ecs_get(world, pos_comp, eid);
+        sx = p.x - 8  - cam_x(cam);
+        sy = p.y - 16 - cam_y(cam);
+        render_rect_outline(sx, sy, 32, 32, _RING_COLOR);
+    }
+    // Marquee overlay — only while the left button is held. The
+    // drag coords are screen pixels already (the input tick stored
+    // them via mouse_x / mouse_y), so we just normalize and draw.
+    if (drag_active != 0) {
+        rx = drag_x0;
+        ry = drag_y0;
+        rw = drag_x1 - drag_x0;
+        rh = drag_y1 - drag_y0;
+        if (rw < 0) { rx = drag_x1; rw = 0 - rw; }
+        if (rh < 0) { ry = drag_y1; rh = 0 - rh; }
+        if (rw > 0 || rh > 0) {
+            render_rect_outline(rx, ry, rw, rh, _MARQUEE_COLOR);
+        }
+    }
 }

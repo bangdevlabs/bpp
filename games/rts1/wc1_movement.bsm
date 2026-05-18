@@ -1,40 +1,74 @@
-// wc1_movement.bsm — A* pathing + per-unit waypoint follower.
+// wc1_movement.bsm — A* + flow-field movement with tile-claim
+// collision.
 //
-// Session 5 ships single-unit, multi-target movement: a peasant
-// with a Target component computes an A* path from its current
-// tile to the target tile (once, at right-click time), and the
-// per-frame tick advances Pos in pixel coords toward the next
-// waypoint at UnitDef.speed_pxs. Hitting a waypoint advances the
-// cursor; running off the end clears Target sentinel and the unit
-// idles in place.
+// Session 5 shipped single-unit A* via stbpath; Session 6 adds three
+// pieces in one arc:
+//   1. Flow-field crowd movement (≥ FLOW_THRESHOLD units share one
+//      BFS field) — matches the Stress Arc S4 bench's ~38× win.
+//   2. Marquee multi-select + per-unit group dispatch (the
+//      `wc1_movement_request_group` entry point below).
+//   3. Tile-claim collision (Stratagus / OpenRA pattern). Each
+//      peasant reserves the tile under its feet in a shared stbgrid
+//      occupancy field; the next-tile is claimed atomically before
+//      sub-pixel walk, so two units can never converge on the same
+//      cell. Convergent goals form a queue around the goal tile
+//      instead of stacking on it.
 //
-// What this file does NOT do (Rule 28 — earn the slot):
-//   - Walk frame animation (sprite stays on PEASANT_IDLE_S during
-//     motion). The handoff's wc1_anims.bsm with 8-direction walk
-//     cycles needs the war1tool Lua anim table for the canonical
-//     row mapping; lands as a separate sidequest.
-//   - Tile blocking (trees impassable). Today A* runs on an open
-//     grid — peasants walk through trees visually. Tile-properties
-//     table from war1tool is a separate sidequest.
-//   - Path re-planning when the target changes mid-walk. The
-//     wc1_input right-click writes a fresh Target + calls
-//     _request_path, which OVERWRITES the path buffer. So
-//     re-targeting just works; the issue is if the world changes
-//     under a unit (S7+ when units block).
-//   - Multi-unit group commands. Wait for marquee multi-select.
+// Per-unit Path state carries a `mode` flag and `tile_gx, tile_gy`:
+//   PATH_MODE_ASTAR (0) — pa.buf holds A* waypoints; cursor walks them.
+//   PATH_MODE_FLOW  (1) — pa.buf is unused; flow_step is sampled
+//                         from the unit's current tile each frame.
+//   tile_gx, tile_gy    — the unit's CURRENT TILE CLAIM in _occupied.
+//
+// What this file STILL does not do (Rule 28 — earn the slot):
+//   - Walk frame animation polish (stays on the S5 facing math).
+//   - Static tile blocking (trees impassable). Both A* and flow run
+//     on an open grid today. Tile-properties + flow_set_blocked land
+//     when the war1tool tile-class table is mined.
+//   - Path re-planning when blocked by another unit. A blocked
+//     next-tile causes the unit to idle one frame and retry — fine
+//     for momentary contention, but a unit blocked by a stationary
+//     idle unit will sit forever. Cooperative pathfinding waits
+//     for S7+ combat.
+//   - Tile reservation across the full waypoint chain. The claim is
+//     "next tile only" — the rest of the path is not pre-reserved.
+//     Two convergent units may A*-plan through the same intermediate
+//     tile and waste cycles taking turns. Acceptable for v1.
+//   - Multi-flow (different goals concurrent). _flow holds a single
+//     active field — a new group command overwrites it.
 
 import "stbecs.bsm";
 import "stbpath.bsm";
+import "stbflow.bsm";
+import "stbgrid.bsm";
 import "stbgame.bsm";
 load   "wc1_units.bsm";
 load   "wc1_anims.bsm";
 
 // Module-private pathfinder shared by every unit. One A* per
-// right-click pays the planning cost once; the per-frame tick
-// only advances cursors. wc1_movement_init allocates this from
-// the map dimensions; the world-grid size never changes mid-game
-// so we don't need to grow it.
+// request pays the planning cost once; the per-frame tick only
+// advances cursors.
 extrn _pf;
+
+// Module-private flow field. Allocated alongside _pf; reused
+// across crowd commands by overwriting the dist field on each
+// flow_compute. Single field at a time keeps memory bounded and
+// matches the single-rally-point shape of WC1 group commands.
+extrn _flow;
+
+// Module-private occupancy grid (stbgrid word-grid). Cells store
+// `eid + 1` so 0 stays the "empty" sentinel. Allocated by
+// wc1_movement_init and consulted by every claim-transfer in
+// _step_unit. The wc1_collision_* helpers below give it occupancy
+// semantics; stbgrid itself stays storage-only.
+extrn _occupied;
+
+// Threshold for switching from per-unit A* to one shared flow
+// field. Six is the Stress Arc S4 break-even point: below it,
+// path_find amortises well; above it, the BFS field wins.
+const FLOW_THRESHOLD  = 6;
+const PATH_MODE_ASTAR = 0;
+const PATH_MODE_FLOW  = 1;
 
 // Globals captured by the per-frame tick callback (ecs_query_each
 // signature is fn(world, eid)). Same closure-via-globals pattern
@@ -42,36 +76,74 @@ extrn _pf;
 extrn pos_comp, target_comp, path_comp, anim_comp;
 extrn peasant_q;
 
-// Per-tick dt in ms. Set once at the top of wc1_movement_tick so
-// the per-entity callback can accumulate Anim.elapsed_ms without
-// re-querying game_dt_ms per unit.
+// Per-tick dt + frame step in pixels. Set once at the top of
+// wc1_movement_tick so the per-entity callback reads a global
+// instead of re-multiplying speed * dt per unit.
 static auto _dt_ms;
-
-// Per-frame movement step in pixels — set by wc1_movement_tick
-// once at the top of the tick from speed_pxs * dt, then read by
-// the per-entity callback. UnitDef speed is per-kind in v1 we
-// only have peasants so a single global step is fine; when more
-// unit types arrive the callback will read speed via unit_def_for.
 static auto _frame_step;
 
-// Allocate the shared A* pathfinder. Call once at startup AFTER
-// the map is loaded so the grid dimensions are known. Today A*
-// treats every cell as walkable (no path_set_blocked calls);
-// tile-properties + obstacle blocking is a separate sidequest.
+// 2-word scratch buffer reused by every flow_step call inside the
+// frame. Allocated once at init; the field receives (dx, dy) in
+// {-1, 0, 1}^2.
+static auto _flow_step_buf;
+
+// Allocate every shared scratch resource the movement system
+// needs: A* pathfinder, flow field, flow scratch buffer, and the
+// tile-occupancy grid. Call once at startup AFTER the map is
+// loaded so the grid dimensions are known, and BEFORE any peasant
+// is spawned so spawn-time wc1_collision_register has a live grid.
 wc1_movement_init(map) {
-    _pf = path_new(wc1_map_w(map), wc1_map_h(map));
+    _pf  = path_new(wc1_map_w(map), wc1_map_h(map));
+    _flow = flow_new(wc1_map_w(map), wc1_map_h(map));
+    _flow_step_buf = buf_word(2);
+    _occupied = grid_new_word(wc1_map_w(map), wc1_map_h(map));
 }
 
+// ── Tile-claim collision ────────────────────────────────────────
+
+// Reserve (gx, gy) for `eid`. Stores `eid + 1` so 0 stays the
+// "empty" sentinel. Out-of-bounds writes are silently absorbed by
+// stbgrid — lets the spawn pipeline pass world coords without
+// pre-clamping.
+void wc1_collision_register(eid, gx, gy) {
+    grid_set(_occupied, gx, gy, eid + 1);
+}
+
+// Free a tile previously held by some unit. Idempotent and bounds-
+// safe via stbgrid. Does NOT check ownership — the caller (always
+// the unit whose claim it is) is trusted.
+void wc1_collision_release(gx, gy) {
+    grid_set(_occupied, gx, gy, 0);
+}
+
+// Return 1 if (gx, gy) is held by a unit OTHER than `self_eid`.
+// Empty cells and self-held cells return 0. Used by _step_unit to
+// decide whether the next micro-target is enterable; "self-held"
+// matters because a unit re-claiming the same tile (no movement
+// this frame) must not see its own marker as a blocker.
+//
+// Out-of-bounds queries return 0, NOT 1 — the simulation never
+// asks about OOB tiles (waypoints come from path_find, which only
+// emits in-bounds cells, and flow_step never picks OOB neighbours).
+// Treating OOB as blocked would be defensive noise.
+wc1_collision_is_blocked_for(eid, gx, gy) {
+    auto claim;
+    claim = grid_get(_occupied, gx, gy);
+    if (claim == 0)       { return 0; }
+    if (claim == eid + 1) { return 0; }
+    return 1;
+}
+
+// ── Path requests ───────────────────────────────────────────────
+
 // Compute a fresh A* path from the unit's current pixel position
-// to the destination grid cell, and stash it in the unit's Path
-// component. Called by wc1_input on right-click. Overwrites any
-// in-flight path so re-targeting just works.
+// to the destination grid cell and stash it in the unit's Path
+// component. Called by the click branch of wc1_input on right-
+// click when only one unit is selected, and also by the group
+// fallback below when count < FLOW_THRESHOLD.
 //
 // The current position is the floor-of-pixel-pos / 16 so the
-// peasant pathfinds from the tile it's CURRENTLY standing on,
-// not the tile it was originally spawned at. A mid-walk redirect
-// drops whatever sub-pixel offset it had — visually a tiny snap
-// to tile center, acceptable for v1.
+// peasant pathfinds from the tile it is CURRENTLY standing on.
 void wc1_movement_request(world, eid, dst_gx, dst_gy) {
     auto p: Pos, pa: Path;
     auto src_gx, src_gy, n;
@@ -81,59 +153,130 @@ void wc1_movement_request(world, eid, dst_gx, dst_gy) {
     src_gy = p.y / 16;
     n = path_find(_pf, src_gx, src_gy, dst_gx, dst_gy,
                   pa.buf, MAX_WAYPOINTS);
+    pa.mode   = PATH_MODE_ASTAR;
     pa.count  = n;
-    // Skip waypoint 0 (it's the start cell the unit is already on);
-    // start walking toward waypoint 1. If the path collapsed to
-    // a single point (start == goal) the cursor immediately equals
-    // count and the tick treats it as "arrived".
     pa.cursor = 1;
 }
 
-// Per-entity tick: advance Pos toward the next waypoint and keep
-// Anim in sync (state, facing, elapsed_ms). Idle units only see
-// their elapsed_ms advance; walking units also update facing on
-// every direction change and reset elapsed_ms so the new walk
-// cycle starts at frame 0.
-static void _step_unit(w, eid) {
-    auto p: Pos, pa: Path, t: Target, an: Anim;
-    auto wp_gx, wp_gy, wp_px, wp_py;
-    auto dx, dy, dist_sq, step_sq;
-    auto new_facing;
-    pa = ecs_get(w, path_comp, eid);
-    an = ecs_get(w, anim_comp, eid);
-    // Idle path — keep accumulating elapsed_ms for consistency with
-    // walking units. Also ensures Anim.state is correct in case a
-    // path just finished on a previous tick.
-    if (pa.cursor >= pa.count) {
-        if (an.state != UNIT_STATE_IDLE) {
-            an.state      = UNIT_STATE_IDLE;
-            an.elapsed_ms = 0;
-        } else {
-            an.elapsed_ms = an.elapsed_ms + _dt_ms;
+// Issue a move-command to a group of units. Chooses the cheaper
+// of two strategies based on group size:
+//   - count >= FLOW_THRESHOLD: one BFS from (dst_gx, dst_gy) fills
+//     _flow.dist; every unit gets PATH_MODE_FLOW and samples per
+//     frame. O(cells) once + O(1) per unit per frame.
+//   - count <  FLOW_THRESHOLD: per-unit A* through path_find,
+//     keeping the precise waypoint trail. O(units * cells).
+//
+// `eids` is a buf_word holding the entity ids; `count` is the live
+// length. The buffer is read-only here — the input layer owns it.
+void wc1_movement_request_group(world, eids: ptr, count, dst_gx, dst_gy) {
+    auto i, eid, pa: Path;
+    if (count <= 0) { return; }
+    if (count >= FLOW_THRESHOLD) {
+        flow_compute(_flow, dst_gx, dst_gy);
+        for (i = 0; i < count; i++) {
+            eid = eids[i];
+            pa = ecs_get(world, path_comp, eid);
+            pa.mode   = PATH_MODE_FLOW;
+            pa.count  = 0;
+            pa.cursor = 0;
         }
         return;
     }
-    // Walking path — first time we hit this in a cycle, flip state
-    // and reset the timer so the walk anim starts at frame 0.
+    for (i = 0; i < count; i++) {
+        wc1_movement_request(world, eids[i], dst_gx, dst_gy);
+    }
+}
+
+// ── Per-entity tick ─────────────────────────────────────────────
+
+// Helper used by both branches when a unit has no movement work
+// this frame OR is blocked from entering its next tile. Keeps Anim
+// state coherent without duplicating the if/else at every idle
+// site.
+static void _idle_anim(an: Anim) {
+    if (an.state != UNIT_STATE_IDLE) {
+        an.state      = UNIT_STATE_IDLE;
+        an.elapsed_ms = 0;
+    } else {
+        an.elapsed_ms = an.elapsed_ms + _dt_ms;
+    }
+}
+
+// Per-entity tick. Resolves the micro-target (A* waypoint or
+// flow-sampled neighbor), tries to claim it through the shared
+// occupancy grid, and either walks toward it or idles.
+//
+// Claim transfer is atomic: release the old tile + register the new
+// one happen in the same step, with the blocked-check in between.
+// During sub-pixel transit the unit's claim is on the DESTINATION
+// tile, which prevents others from heading there.
+static void _step_unit(w, eid) {
+    auto p: Pos, pa: Path, t: Target, an: Anim;
+    auto wp_gx, wp_gy, wp_px, wp_py;
+    auto dx, dy, dist_sq, step_sq, new_facing;
+    auto p_gx, p_gy, flow_dx, flow_dy, has_target;
+    pa = ecs_get(w, path_comp, eid);
+    an = ecs_get(w, anim_comp, eid);
+
+    // Resolve the micro-target candidate.
+    has_target = 0;
+    if (pa.mode == PATH_MODE_FLOW) {
+        p = ecs_get(w, pos_comp, eid);
+        p_gx = p.x / 16;
+        p_gy = p.y / 16;
+        flow_step(_flow, p_gx, p_gy, _flow_step_buf);
+        flow_dx = _flow_step_buf[0];
+        flow_dy = _flow_step_buf[1];
+        if (flow_dx == 0 && flow_dy == 0) {
+            // Arrived at goal (or unreachable cell). Drop back to
+            // A* mode and clear Target. The tile claim stays where
+            // it is so other units treat the goal as occupied.
+            pa.mode = PATH_MODE_ASTAR;
+            t = ecs_get(w, target_comp, eid);
+            t.gx = -1;
+            t.gy = -1;
+        } else {
+            wp_gx = p_gx + flow_dx;
+            wp_gy = p_gy + flow_dy;
+            has_target = 1;
+        }
+    } else {
+        if (pa.cursor < pa.count) {
+            wp_gx = pa.buf[pa.cursor * 2];
+            wp_gy = pa.buf[pa.cursor * 2 + 1];
+            p = ecs_get(w, pos_comp, eid);
+            has_target = 1;
+        }
+    }
+
+    if (has_target == 0) {
+        _idle_anim(an);
+        return;
+    }
+
+    // Atomic claim transfer when the micro-target tile changes.
+    // If the next tile is held by another unit, idle this frame —
+    // the other unit may have cleared by the next tick.
+    if (wp_gx != pa.tile_gx || wp_gy != pa.tile_gy) {
+        if (wc1_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
+            _idle_anim(an);
+            return;
+        }
+        wc1_collision_release(pa.tile_gx, pa.tile_gy);
+        wc1_collision_register(eid, wp_gx, wp_gy);
+        pa.tile_gx = wp_gx;
+        pa.tile_gy = wp_gy;
+    }
+
+    // Walking — flip state + reset elapsed_ms when entering.
     if (an.state != UNIT_STATE_WALK) {
         an.state      = UNIT_STATE_WALK;
         an.elapsed_ms = 0;
     }
-    p = ecs_get(w, pos_comp, eid);
-    // Waypoint pixel position. The A* output is grid coords; tile
-    // centers in pixels are `gx * 16` since Pos stores the tile's
-    // top-left as the unit anchor (peasant feet sit on the tile).
-    wp_gx = pa.buf[pa.cursor * 2];
-    wp_gy = pa.buf[pa.cursor * 2 + 1];
     wp_px = wp_gx * 16;
     wp_py = wp_gy * 16;
     dx = wp_px - p.x;
     dy = wp_py - p.y;
-    // Resolve facing from the heading vector. Only update when the
-    // vector is non-zero; reset elapsed_ms when facing actually
-    // changes so each new walk direction starts at frame 0 of its
-    // cycle (prevents the half-cycle jump that happens when a
-    // peasant turns mid-walk).
     if (dx != 0 || dy != 0) {
         new_facing = wc1_facing_for_delta(dx, dy);
         if (new_facing != an.facing) {
@@ -144,16 +287,18 @@ static void _step_unit(w, eid) {
     dist_sq = dx * dx + dy * dy;
     step_sq = _frame_step * _frame_step;
     if (dist_sq <= step_sq) {
-        // Snap to the waypoint and advance the cursor. Once the
-        // cursor exceeds count, the next tick takes the idle branch.
+        // Snap to the micro-target. No occupancy change here — the
+        // claim was already transferred above when the target tile
+        // first changed. In A* mode advance the cursor; in flow
+        // mode the next frame's flow_step re-samples.
         p.x = wp_px;
         p.y = wp_py;
+        if (pa.mode == PATH_MODE_FLOW) {
+            an.elapsed_ms = an.elapsed_ms + _dt_ms;
+            return;
+        }
         pa.cursor++;
         if (pa.cursor >= pa.count) {
-            // Path finished — clear Target so wc1_input's UI layer
-            // (and S7+ combat) can tell the unit is idle now. Anim
-            // flip to IDLE waits for the next tick to keep the
-            // walk cycle's last frame visible this frame.
             t = ecs_get(w, target_comp, eid);
             t.gx = -1;
             t.gy = -1;
@@ -161,20 +306,13 @@ static void _step_unit(w, eid) {
         an.elapsed_ms = an.elapsed_ms + _dt_ms;
         return;
     }
-    // Move toward the waypoint by _frame_step pixels along the
-    // (dx, dy) vector. Sub-pixel precision lives in the integer
-    // pixel itself — at 60 FPS the per-frame step is 2 px which
-    // is fine-grained enough that the staircase artifact stays
-    // invisible. True sub-pixel float coords are a v2 polish.
-    //
-    // dist_sq > step_sq guarantees we don't divide by zero; we
-    // approximate dist via the manhattan-ish max(|dx|, |dy|) so
-    // we avoid a sqrt — RTS movement doesn't need physically
-    // accurate diagonal speed.
-    auto dist;
+    // Interpolate toward the micro-target by _frame_step pixels.
+    // Avoid a sqrt by approximating the distance with the larger
+    // of |dx|, |dy| — RTS movement doesn't need physically accurate
+    // diagonal speed.
+    auto dist, adx;
     dist = dx;
     if (dist < 0) { dist = 0 - dist; }
-    auto adx;
     adx = dy;
     if (adx < 0) { adx = 0 - adx; }
     if (adx > dist) { dist = adx; }
@@ -185,9 +323,8 @@ static void _step_unit(w, eid) {
 }
 
 // Walk every peasant and step its movement one frame. Compute
-// _frame_step from speed + dt at the top so each callback can
-// just read the global instead of re-multiplying. At 60 FPS with
-// peasant speed_pxs = 128, _frame_step is ~2 px/frame.
+// _frame_step from speed + dt once so each callback just reads
+// the global.
 void wc1_movement_tick(world) {
     auto def: UnitDef;
     def = unit_def_for(UNIT_PEASANT);

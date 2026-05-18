@@ -181,9 +181,12 @@ main() {
     cam = cam_new(SCREEN_W, SCREEN_H,
                     wc1_map_w(map) * 16, wc1_map_h(map) * 16);
     _seed_camera_from_level(map);
-    _spawn_units_from_level(world, peasant_atlas, map);
+    // wc1_movement_init MUST precede _spawn_units_from_level: spawn
+    // calls wc1_collision_register on the peasant's starting tile,
+    // and the shared occupancy grid is allocated inside movement_init.
     wc1_input_init();
     wc1_movement_init(map);
+    _spawn_units_from_level(world, peasant_atlas, map);
 
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
@@ -199,6 +202,7 @@ main() {
 
         _camera_pan_tick();
         wc1_input_tick(world);
+        _debug_spawn_tick();
         wc1_movement_tick(world);
 
         game_render_begin();
@@ -258,6 +262,43 @@ static void _seed_camera_from_level(map) {
                       wc1_map_entity_gx(map, i) * 16 - SCREEN_W / 2,
                       wc1_map_entity_gy(map, i) * 16 - SCREEN_H / 2);
             return;
+        }
+    }
+}
+
+// Debug helper for S6 smoke. Each press of P spawns a 5 × 2 cluster
+// of peasants centered on the tile under the cursor — one tap is
+// enough to cross FLOW_THRESHOLD so the flow-field branch of
+// wc1_movement_request_group fires immediately. Spawning a cluster
+// (rather than a single peasant per tap) avoids the common pitfall
+// where multiple presses at a static mouse position stack at the
+// same pixel and read as a single sprite. key_pressed is edge-
+// triggered so each tap = exactly one cluster; the cap on accidental
+// over-spawn is the ECS world size (256 in rts.bpp). Kept here
+// rather than in wc1_input.bsm because it is strictly a verifier
+// affordance — once a real production trigger (training UI / AI
+// spawn) lands, this can come out.
+static void _debug_spawn_tick() {
+    auto mx, my, wx, wy, gx, gy, dx, dy, sx, sy;
+    if (key_pressed(KEY_P) == 0) { return; }
+    mx = mouse_x();
+    my = mouse_y();
+    wx = cam_screen_to_world_x(cam, mx);
+    wy = cam_screen_to_world_y(cam, my);
+    gx = wx / 16;
+    gy = wy / 16;
+    // 5 × 2 cluster centered on (gx, gy). Cells outside the grid
+    // are tolerated by ecs_spawn_peasant + path_find (out-of-bounds
+    // targets simply find no path); clamping the origin keeps the
+    // bulk of the cluster on-map even when the cursor sits near an
+    // edge.
+    for (dy = 0; dy < 2; dy++) {
+        for (dx = 0; dx < 5; dx++) {
+            sx = gx + dx - 2;
+            sy = gy + dy;
+            if (sx < 0) { sx = 0; }
+            if (sy < 0) { sy = 0; }
+            ecs_spawn_peasant(world, peasant_atlas, sx, sy);
         }
     }
 }
