@@ -31,7 +31,7 @@ buzzword-heavy abstractions — the same flavour as the rest of B++.
 | IV — Input + Window | stbinput (keyboard/mouse), stbwindow (native dialogs), stbgame (loop) |
 | V — Drawing | stbdraw (CPU framebuffer), stbui (widgets), stbimage (PNG decode) |
 | VI — Sprite + Tile | stbpal (palettes), stbtile (tilemaps), stbforge (animations) |
-| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide) |
+| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide), stbcharsheet (stat + resource bookkeeping) |
 | VIII — Engine plumbing | stbpool (pool allocator), stbcol (collision geometry), stbgrid (2D cell storage), stbasset (handle-based assets), stbprofile (sampling profiler + HUD) |
 | IX — GPU | stbrender (textures + sprites + palette LUT), stbtexture (procedural materials), stbraycast (2.5D walls), stbscene (parallax layers), stbshader (custom pipelines), stbfx (post-process chain) |
 
@@ -4185,6 +4185,117 @@ tonify_checklist.md.
 
 ---
 
+## Cap 58 — Character sheet (stbcharsheet)
+
+*Depends on: bpp_buf (auto-injected `buf_word`)*
+*Source: new — 2026-05-18*
+*Status: COMPLETE — 2026-05-18*
+
+`stbcharsheet.bsm` is the fully-generic primitive for the **data
+side** of unit / character bookkeeping. Each sheet carries
+`N` scalar stats (armor, sight, damage, weapon range, supply
+cost, STR/DEX/CON, ...) and `M` resource pairs (HP, shields,
+energy, mana, stamina, ammo, hunger — anything with a current +
+max + clamp). Game registers what the keys mean; the cartridge
+stays agnostic.
+
+The boundary is the same one stbgrid honors: this is STORAGE.
+Combat formulas, regen curves, status effects, equipment slots,
+modifier stacks, level-up scaling, skill trees — those vary
+wildly across genres (D&D vs SC vs Pokemon vs Soulslike) and
+live in consumer cartridges / game modules. Anti-speculation
+guard in the header says so explicitly.
+
+### §58.1 — Lifecycle
+
+```c
+cs_new(n_stats, n_resources);     // both can be 0 if a section is unused
+cs_free(cs);
+cs_reset(cs);                     // zero all slots, keep allocation
+```
+
+### §58.2 — Stats (scalar base values)
+
+```c
+cs_stat_set(cs, key, val);        // OOB writes no-op
+cs_stat_get(cs, key);             // OOB reads return 0
+cs_stat_count(cs);
+```
+
+### §58.3 — Resources (current/max pairs)
+
+```c
+cs_res_init(cs, key, max);        // current = max = max (spawn-time init)
+cs_res_set_max(cs, key, max);     // change ceiling, clamp current
+cs_res_set(cs, key, current);     // clamp to [0, max]
+cs_res_adjust(cs, key, delta);    // clamp + return new current
+cs_res_current(cs, key);
+cs_res_max(cs, key);
+cs_res_full(cs, key);             // 1 if current >= max
+cs_res_empty(cs, key);            // 1 if current <= 0 (the canonical "is dead?")
+cs_res_count(cs);
+```
+
+The clamping behaviour of `cs_res_adjust` is the load-bearing
+part: damage / heal / regen all flow through it, so callers never
+have to remember the bounds and an over-damaged unit reads as
+`0` (`cs_res_empty` fires), not as negative HP.
+
+### §58.4 — Consumer pattern (WC1)
+
+```c
+const WC1_STAT_ARMOR  = 0;
+const WC1_STAT_DAMAGE = 1;
+const WC1_STAT_SPEED  = 2;
+const WC1_RES_HP      = 0;
+
+peasant = cs_new(3, 1);
+cs_stat_set(peasant, WC1_STAT_DAMAGE, 4);
+cs_res_init(peasant, WC1_RES_HP, 30);
+
+cs_res_adjust(peasant, WC1_RES_HP, -10);          // take damage
+if (cs_res_empty(peasant, WC1_RES_HP)) { kill(); }
+```
+
+### §58.5 — SC1-style reference (canonical Liquipedia / BWAPI)
+
+The shape scales straightforwardly to SC1's richer model — a
+Terran Marine needs 5 stats (armor, damage, range, cooldown,
+sight) and 1 resource (HP). A Protoss Zealot adds a shields
+resource. A Zerg caster (Defiler) drops shields but adds energy.
+The sheet count + key meaning is the consumer's call:
+
+```c
+marine = cs_new(5, 1);
+cs_stat_set(marine, SC1_STAT_ARMOR,    0);
+cs_stat_set(marine, SC1_STAT_DAMAGE,   6);
+cs_stat_set(marine, SC1_STAT_RANGE,    4);
+cs_stat_set(marine, SC1_STAT_COOLDOWN, 15);
+cs_stat_set(marine, SC1_STAT_SIGHT,    7);
+cs_res_init(marine, SC1_RES_HP,       40);
+```
+
+The cartridge ships no SC1 data — those numbers are illustrative,
+not canonical. Every game registers its own stat keys + values.
+
+### §58.6 — What this chapter does NOT cover
+
+- **Modifiers / buff stacks** — temporary bonuses with stacking
+  rules, durations, sources. Wait for two consumers (RPG and a
+  buff-driven action game) to converge.
+- **Derived-stat formulas** — "effective damage = base + weapon
+  mod + level scaling". Compose in the consumer.
+- **Regen curves** — "shields regen 7/sec after 10s out of
+  combat". Per-game tick loop calls `cs_res_adjust` itself.
+- **Status effects** — paralysis, poison, burn ticks. Compose
+  with a separate component or sheet section in the consumer.
+- **Equipment slots** — weapon / armor / accessory inventories.
+  Different shape per genre; consumer-owned.
+- **Save/load** — JSON serialization can iterate via
+  `cs_stat_count` / `cs_res_count`; format is consumer's choice.
+
+---
+
 ## Cap 57 — 2D cell-storage grid (stbgrid)
 
 *Depends on: bpp_buf (auto-injected `buf_byte` / `buf_word` / `buf_fill`)*
@@ -4329,6 +4440,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-05-12 | Eight cartridges promoted from "undocumented" to dedicated chapters: stbflow, stbraycast, stbtexture, stbai, stbscene, stbshader, stbfx, stbprofile. Reading source files + journal entries for grounding. | Caps 49-56 |
 | 2026-05-18 | stbui v2 arc closed (S1-S6 + S8.1 + S9 + S9.1 shipped; S7 deferred Rule 28). §36.4 retired-stack notice + §36.7 `ui_frame_begin` invariant + panel-origin offset gotcha. Sidequest moved to `legacy_docs/sidequest_stbui_v2_clay.md`. | Cap 36 |
 | 2026-05-18 | stbgrid arc closed (`2b7c8d4` → `cfa1e77`). Cap 57 new (stbgrid). Cap 44 rewritten (was stale "color math" boilerplate; now documents the actual `stbcol.bsm` collision-geometry API + adds `rect_center_x/y`). Layout table grew an "Engine plumbing" row entry for stbgrid + corrected stbcol's description. Tier-intro paragraph added in Layout section pointing at Tonify Rule 33. | Cap 44 + Cap 57 + Layout |
+| 2026-05-18 | stbcharsheet shipped (`43a7641`). Cap 58 new. Layout row VII (Game systems) grew an stbcharsheet entry. SC1-style reference example included in the chapter, grounding the upcoming WC1 + SC1 mechanical crossover. | Cap 58 + Layout |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its

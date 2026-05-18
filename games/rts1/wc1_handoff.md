@@ -19,6 +19,37 @@ the game more fun, we copy them. Where they don't (or where we
 just have a better idea), we deviate. "Plays like a Warcraft 1
 mod" is the bar, not "passes a frame-by-frame DOSBox diff."
 
+**Design vision — WC1 assets + SC1 mechanics crossover
+(2026-05-18):** the game ships unique by leaning on **WC1's
+visual identity** (peasant/peon sheets, forest tilesets, midi
+soundtrack — see `assets/converted/`) while adopting **the
+mechanical depth of Starcraft 1**:
+
+- **Cooldown-based attacks** (frames between shots per unit
+  kind), not WC1's tick-fixed melee.
+- **Damage type × size class matrix** (Normal / Concussive /
+  Explosive vs Small / Medium / Large) — gives unit
+  composition meaning. Numbers cribbed from SC1's canon
+  (Liquipedia / BWAPI) as a starting point; tuned for feel.
+- **Layered resources** via `stbcharsheet` — HP for everyone,
+  Shields for "tech-blessed" units (Knight upgrade?), Energy
+  for casters (Conjurer / Warlock). Shields regen out of
+  combat in SC1 — we follow that.
+- **Supply cap** via farms (Human) and pig farms (Orc) — same
+  mental model as SC1's depot / pylon / overlord.
+- **Asymmetric factions** — the two sides don't share a unit
+  template. Each gets its own quirks, mirroring SC1's three-
+  race asymmetry.
+
+The point is not "SC1 in a WC1 skin" — it is "what would
+Warcraft have looked like if Blizzard had skipped the WC2-era
+incremental polish and gone straight to SC1's mechanical
+richness". WC1 + SC1 mechanics is our combinatorial novelty:
+neither game shipped like that, the assets are already in the
+tree, and the engine (`stbflow` crowd movement, `stbgrid`
+occupancy, `stbcharsheet` resource bookkeeping) already
+carries every primitive that mechanical jump needs.
+
 **Meta goal — Bang 9 edits the mod assets (2026-05-12):** WC1
 sprites and levels are authored in Bang 9's existing tabs
 (sprite + level_editor), not in a parallel WC1-only editor.
@@ -704,16 +735,36 @@ missiles get their own cartridge (`wc1_missiles.bsm`) per the
 module layout above.
 
 **S7 sketch (subject to scope refinement during execution):**
-- Damage formula (port `balancing.lua`'s basic + piercing model
-  as starting numbers; tune for feel, not DOSBox parity).
-- Attack-move command — extend right-click semantics: right-click
-  on an enemy unit = melee/range engage; right-click on ground
-  = move-and-defend.
-- Missile entity lifecycle (`wc1_missiles.bsm`): spawn at
-  attacker, travel toward target at missile-type speed, deal
-  damage on contact, despawn.
-- Death state — corpse component or simple sprite swap, no
-  resurrection in v1.
+
+The S7 arc adopts the SC1-style mechanical model laid out in the
+design-vision section above. Per-unit data lives in a
+`stbcharsheet` handle stored in a new `Sheet` ECS component.
+Combat reads cooldown + damage type from the sheet; damage
+resolution applies the type × size-class matrix; HP / Shields /
+Energy are resources in the sheet, so the bounded-adjust API
+makes "did this unit die" a single `cs_res_empty` call.
+
+- **S7.2** Sheet wiring — `Sheet` ECS component (CharSheet
+  handle) + per-unit-kind initializer that populates HP / armor /
+  damage / cooldown / range / sight from `UnitDef` extended with
+  SC1-flavored fields. Right-click hit-test distinguishes enemy
+  unit vs ground via Faction lookup.
+- **S7.3** Combat tick — attacker-target pair runs through a
+  per-frame "in range? cooldown ready? deal damage" loop. Damage
+  formula starts as `max(1, raw - armor)` for v1; the
+  type × size matrix lands in S7.4.
+- **S7.4** Damage type matrix — Normal / Concussive / Explosive
+  vs Small / Medium / Large. Starting numbers cribbed from SC1
+  canon (Liquipedia / BWAPI), tuned for feel.
+- **S7.5** Death — `cs_res_empty(sheet, RES_HP)` triggers
+  `ecs_kill_at` + `wc1_collision_release` (the tile claim must
+  free up so other units can walk over the corpse-tile).
+- **S7.6** Missile entities — `wc1_missiles.bsm` for ranged
+  attacks (archer, grunt-thrower). Missile entity spawns at
+  attacker, travels at missile-speed, applies damage on impact.
+- **S7.7** Energy + first caster — when the Conjurer/Warlock
+  sprite ships, energy as a resource + cast-cost bookkeeping.
+  Shields regen for tech-upgraded units lands here too.
 
 **Recent activity (2026-05-18):** stbgrid arc + WC1 S6 shipped
 in 8 commits (`2b7c8d4` → `cfa1e77`). Tonify Rule 33 codifies
