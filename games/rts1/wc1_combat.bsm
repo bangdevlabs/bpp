@@ -1,0 +1,166 @@
+// wc1_combat.bsm — Session 7 combat tick.
+//
+// Per-frame engagement resolution: every unit with a live
+// AttackTarget gets one step closer to combat resolution. Three
+// outcomes per attacker per frame:
+//
+//   1. Target invalid (killed or sentinel -1) → clear our claim,
+//      idle.
+//   2. Target alive but out of weapon range → request a fresh
+//      path to the target's tile. wc1_movement walks the path
+//      on the next movement tick; collision keeps us from
+//      stepping ONTO the target tile so we stall adjacent.
+//   3. Target alive and in range → halt movement, run the
+//      cooldown timer, fire damage on overflow. If damage drops
+//      the target's HP to zero, kill the entity, free its
+//      CharSheet handle, and release its tile claim so other
+//      units can walk through the corpse-tile.
+//
+// Damage formula (S7.3 v1): max(1, raw_damage - target.armor).
+// The damage-type × size-class matrix (Normal / Concussive /
+// Explosive vs Small / Medium / Large) lands in S7.4 — until
+// then every hit is a "Normal vs anything" multiplier of 1.0.
+//
+// Pathing strategy: re-request the path every frame the target
+// is out of range so the attacker tracks a moving target. A* on
+// a 64×64 grid is microseconds per call — cheap enough at
+// crowd-pathing scale validated by the Stress Arc S4 bench;
+// optimize when a profile says so.
+//
+// Death: ecs_kill_at marks the row dead in the world's archetype
+// alive bitmap. ecs_get on the freed eid returns 0 after this,
+// so other attackers' next combat tick sees the target gone and
+// clears their AttackTarget reference automatically.
+
+import "stbecs.bsm";
+import "stbcharsheet.bsm";
+import "stbgame.bsm";
+load   "wc1_units.bsm";
+
+// ECS component handles + query. ecs_query_each's callback shape
+// (`fn(world, eid)`) means combat state flows through globals.
+extrn pos_comp, sheet_comp, attack_target_comp, path_comp;
+extrn peasant_q;
+
+// Per-tick dt in ms — set once at the top of wc1_combat_tick so
+// the per-entity callback reads a global instead of re-querying
+// game_dt_ms per unit.
+static auto _combat_dt_ms;
+
+// Walk every unit, advance its combat state by one frame. Call
+// AFTER wc1_input_tick (which writes AttackTargets) and BEFORE
+// wc1_movement_tick (which walks any path that combat may have
+// requested this frame).
+void wc1_combat_tick(world) {
+    _combat_dt_ms = game_dt_ms();
+    ecs_query_each(peasant_q, fn_ptr(_combat_step));
+}
+
+// Tile-space Chebyshev distance between two pixel positions.
+// Used by the in-range check — diagonal neighbours count as
+// "1 tile away" so 8-connected adjacency means melee range = 1.
+static _tile_chebyshev(ax_px, ay_px, bx_px, by_px) {
+    auto dx, dy;
+    dx = (bx_px / 16) - (ax_px / 16);
+    dy = (by_px / 16) - (ay_px / 16);
+    if (dx < 0) { dx = 0 - dx; }
+    if (dy < 0) { dy = 0 - dy; }
+    if (dy > dx) { return dy; }
+    return dx;
+}
+
+// Per-entity combat tick. Pre-conditions: nothing — every code
+// path early-returns when the unit has no engagement.
+static void _combat_step(w, eid) {
+    auto at: AttackTarget, sh: Sheet, target_sh: Sheet;
+    auto my_p: Pos, target_p: Pos, my_pa: Path, target_pa: Path;
+    auto target_eid, dist_tiles, my_range;
+    auto cooldown_ms, damage, target_armor, target_hp;
+
+    at = ecs_get(w, attack_target_comp, eid);
+    if (at.eid < 0) { return; }
+    target_eid = at.eid;
+
+    // Validate target is still alive (it may have been killed last
+    // frame by another attacker). ecs_alive_at is the canonical
+    // check for stale eids.
+    if (ecs_alive_at(w, target_eid) == 0) {
+        at.eid = -1;
+        at.last_attack_ms = 0;
+        return;
+    }
+    target_sh = ecs_get(w, sheet_comp, target_eid);
+    if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
+        at.eid = -1;
+        at.last_attack_ms = 0;
+        return;
+    }
+
+    // Tile-space distance — close enough to engage?
+    my_p     = ecs_get(w, pos_comp, eid);
+    target_p = ecs_get(w, pos_comp, target_eid);
+    dist_tiles = _tile_chebyshev(my_p.x, my_p.y, target_p.x, target_p.y);
+
+    sh = ecs_get(w, sheet_comp, eid);
+    my_range = cs_stat_get(sh.handle, STAT_WEAPON_RANGE);
+
+    if (dist_tiles > my_range) {
+        // Out of range — re-request a path each frame so we
+        // adapt if the target moves. wc1_movement_request runs
+        // A* and writes Path.buf / count / cursor; the tile-claim
+        // collision keeps us from stepping ONTO the target tile.
+        // Cooldown clears while moving — closing the gap costs
+        // a swing's worth of recovery, same as SC1 melee feel.
+        wc1_movement_request(w, eid, target_p.x / 16, target_p.y / 16);
+        at.last_attack_ms = 0;
+        return;
+    }
+
+    // In range — halt any in-flight move path (cursor = count
+    // forces _step_unit into the idle branch next movement tick).
+    my_pa = ecs_get(w, path_comp, eid);
+    my_pa.cursor = my_pa.count;
+
+    // Cooldown gate. Accumulate elapsed time toward the unit's
+    // STAT_COOLDOWN_MS; only fire when it overflows.
+    cooldown_ms = cs_stat_get(sh.handle, STAT_COOLDOWN_MS);
+    at.last_attack_ms = at.last_attack_ms + _combat_dt_ms;
+    if (at.last_attack_ms < cooldown_ms) { return; }
+    at.last_attack_ms = 0;
+
+    // Damage roll — v1 formula: max(1, raw - armor). The
+    // type × size matrix lands in S7.4 (Normal / Concussive /
+    // Explosive vs Small / Medium / Large); until then every
+    // attack reads as Normal-vs-anything with a 1.0 multiplier.
+    damage = cs_stat_get(sh.handle, STAT_DAMAGE);
+    target_armor = cs_stat_get(target_sh.handle, STAT_ARMOR);
+    damage = damage - target_armor;
+    if (damage < 1) { damage = 1; }
+    target_hp = cs_res_adjust(target_sh.handle, RES_HP, 0 - damage);
+
+    putstr("hit eid=");
+    putnum(target_eid);
+    putstr(" dmg=");
+    putnum(damage);
+    putstr(" hp=");
+    putnum(target_hp);
+    putstr("\n");
+
+    if (target_hp <= 0) {
+        // S7.5 death — free the per-unit heap first (CharSheet
+        // handle + path waypoint buffer) THEN mark the row dead
+        // in the ECS. Release the tile claim so other units can
+        // walk through the corpse-tile; ecs_kill_at by itself
+        // doesn't touch the occupancy grid.
+        target_pa = ecs_get(w, path_comp, target_eid);
+        wc1_collision_release(target_pa.tile_gx, target_pa.tile_gy);
+        cs_free(target_sh.handle);
+        free(target_pa.buf);
+        ecs_kill_at(w, target_eid);
+        at.eid = -1;
+        at.last_attack_ms = 0;
+        putstr("kill eid=");
+        putnum(target_eid);
+        putstr("\n");
+    }
+}
