@@ -82,7 +82,7 @@ constraint (J) caught during the user's final pass:
   manual at the `register_*` API level and the compiler only validates that
   annotations agree with analysis (W013)
 - **J** — Phase 1 ships macOS-only. Linux pthread requires ELF dynamic linking
-  (P0 in `docs/todo.md`, multi-day milestone) which is intentionally NOT
+  (P0 in `docs/plans/todo.md`, multi-day milestone) which is intentionally NOT
   bundled into this plan. `snake_maestro` inherits Linux support automatically
   when ELF dynlink ships independently. See Constraint 6 for the full story.
 
@@ -135,7 +135,7 @@ modern glibc, just `libc.so.6`), which is a shared object. B++'s
 `src/x86_64/x64_elf.bsm` writes static ELF — no PLT, no GOT, no `DT_NEEDED`,
 no `PT_INTERP` for the dynamic linker. A statically-linked ELF cannot call
 into a `.so`. Until ELF dynamic linking ships (it's the P0 item from
-`docs/todo.md` post-0.21, an independent multi-day project), Linux cannot do
+`docs/plans/todo.md` post-0.21, an independent multi-day project), Linux cannot do
 FFI to anything that isn't a raw syscall, and therefore cannot do pthread.
 
 Resolution for Phase 1:
@@ -207,7 +207,7 @@ sounds. Side-by-side with original.
 | `src/bpp_validate.bsm` | 4 | Add `mem_barrier` to `val_is_builtin()`. |
 | `src/bpp_emitter.bsm` | 8 | C emitter equivalent: `mem_barrier` → `__sync_synchronize`. |
 | `src/aarch64/_stb_platform_macos.bsm` | 12 | FFI declarations for `pthread_create`, `pthread_join`, `pthread_self`. macOS already links `libSystem.B.dylib` which provides pthread; no new link flag needed. **This is the only platform that actually ships in Phase 1.** |
-| `src/x86_64/_stb_platform_linux.bsm` | 0 in Phase 1 | Deferred until ELF dynamic linking lands (P0 item from `docs/todo.md`, independent multi-day project). The same ~12 lines of pthread FFI declarations will be added at that time, plus the dynlink machinery itself (PLT/GOT, `DT_NEEDED`, `PT_INTERP`, relocations). Until then, Linux cannot FFI to `libpthread` because the ELF writer produces static binaries. See "Phase 1 platform caveat" above. |
+| `src/x86_64/_stb_platform_linux.bsm` | 0 in Phase 1 | Deferred until ELF dynamic linking lands (P0 item from `docs/plans/todo.md`, independent multi-day project). The same ~12 lines of pthread FFI declarations will be added at that time, plus the dynlink machinery itself (PLT/GOT, `DT_NEEDED`, `PT_INTERP`, relocations). Until then, Linux cannot FFI to `libpthread` because the ELF writer produces static binaries. See "Phase 1 platform caveat" above. |
 
 **Total Phase 1**: ~770 lines (compiler ~42, library ~440, game ~250,
 tests/script ~38). Significantly lighter than the original draft because
@@ -782,7 +782,7 @@ cp /tmp/bpp_gen1 ./bpp
   layout.
 - Refactoring user game structs to use slices — programmer's choice. The
   Phase 1.5 stb examples become the reference.
-- ELF dynamic linking on Linux — this is a P0 item in `docs/todo.md` but it
+- ELF dynamic linking on Linux — this is a P0 item in `docs/plans/todo.md` but it
   is its own multi-day milestone, not part of this plan. Constraint 6
   explains the consequence: `snake_maestro` is macOS-only in Phase 1, and
   Linux inherits maestro support automatically when ELF dynlink ships
@@ -899,7 +899,7 @@ at commit 3 if you're not paying attention. `pthread_create` lives in
 linker to resolve it.
 
 Resolution: Phase 1 ships macOS-only. Linux maestro is deferred until ELF
-dynamic linking lands as its own milestone (P0 in `docs/todo.md`, independent
+dynamic linking lands as its own milestone (P0 in `docs/plans/todo.md`, independent
 of this plan, multi-day project that touches PLT/GOT generation, dynamic
 relocations, program header layout, and the `PT_INTERP` interpreter path).
 Once dynlink ships, Linux maestro inherits automatically because
@@ -909,7 +909,7 @@ layer's pthread FFI declarations need to land.
 **Why this is not Option 2** (block Phase 1 on dynlink): bundling ELF
 dynlink into Phase 1 would inflate the plan from ~770 lines to ~1500+ lines,
 double the timeline, and delay Rhythm Teacher (Game 1 in
-`docs/games_roadtrip.md`, which itself needs threads for audio). It would
+`docs/plans/games_roadtrip.md`, which itself needs threads for audio). It would
 also force a major piece of compiler work into a plan that's supposed to be
 about the maestro pattern. The honest decoupling is: maestro pattern ships
 now on macOS, dynlink ships independently, Linux gets both when both exist.
@@ -1032,5 +1032,5 @@ GC.
 Snake has been the canary for every major B++ feature: first program
 self-compiled, first GPU game, first Linux X11 game, first Docker game.
 Continuing the tradition: snake is the first game on `stbmaestro`. This is
-recorded narratively in `docs/snake_report.md` and reinforced by keeping
+recorded narratively in `docs/manual/snake_report.md` and reinforced by keeping
 `snakefull_gpu.bpp` untouched alongside the new `snake_maestro.bpp`.

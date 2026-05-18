@@ -24,8 +24,8 @@ Three commits since `0.68` (`26254e6`):
 - `docs/bpp_manual.md` + `bpp_language_reference.md` merged into a
   single K&R-style book: `docs/the_b++_programming_language.md`
   (16 chapters, 1318 lines).
-- `docs/bootprod_manual.md` + `docs/tonify_checklist.md` merged
-  into `docs/how_to_dev_b++.md` (9 parts, 830 lines). This is now
+- `docs/bootprod_manual.md` + `docs/manual/tonify_checklist.md` merged
+  into `docs/manual/how_to_dev_b++.md` (9 parts, 830 lines). This is now
   the canonical "how to dev" guide.
 - Stale plan docs (`dev_loop_2_plan.md`, `libb_design.md`,
   `maestro_plan.md`, `module_discipline_report.md`,
@@ -216,7 +216,7 @@ Five new or extended stb modules + one new stb module + one new
   - NSEvKeyDown now also reads `-[NSEvent characters]` and feeds
     printable ASCII into stbinput's ring via `_input_push_char`.
 
-- **`docs/how_to_dev_b++.md`** — new rebuild-scope rule table. Only
+- **`docs/manual/how_to_dev_b++.md`** — new rebuild-scope rule table. Only
   bootstrap when compiler changes; only full suite when stb/ or
   runtime changes. Game/tool-only changes compile just that
   artifact.

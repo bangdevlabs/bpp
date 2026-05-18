@@ -644,7 +644,7 @@ in the profile output.
 ## Appendix — what `bug` cannot do yet
 
 - **No `name:line` breakpoints.** Function-entry only. Tracked
-  as `docs/todo.md` bug #3b.
+  as `docs/plans/todo.md` bug #3b.
 - **No watchpoints.** Memory writes are not observed.
 - **No attach-to-pid.** `bug` always fork-execs its target.
 - **Linux GUI not wired.** `bug_observe_linux.bsm` speaks the
@@ -659,4 +659,7 @@ in the profile output.
   consumer asks (YAGNI).
 
 For the broader roadmap (Wolf3D, multicore Sprints, etc.), see
-`docs/bug_viz_plan.md` and `docs/multicore_state_report.md`.
+`docs/plans/multicore_state_report.md`. The original bug visualization
+plan that this manual implements is archived at
+`legacy_docs/bug_viz_plan.md` (Phases 1–5 all shipped — see the
+status table above).

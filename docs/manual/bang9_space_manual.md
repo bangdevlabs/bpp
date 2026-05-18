@@ -53,7 +53,7 @@ in `tools/` and as a panel inside Bang 9.
 |---|---|---|---|---|
 | Project | (built-in) | Project tree, file open | n/a | Always-on |
 | Sprites | modulab | Pixel sprites + atlases | `tools/modulab/` | Shipped |
-| Levels | level_editor | Tilemap layers + (planned) entity layers | `tools/level_editor/` | Shipped (single-layer); multi-layer in flight |
+| Levels | level_editor | Tilemap + entity layer (place markers per kind) | `tools/level_editor/` | Shipped (tiles + entities); declarative layout S4 2026-05-17 |
 | Effects | fxlab | Post-process shader uniforms via JSON manifests | `tools/fxlab/` | Shipped 2026-05-10 |
 | Code | (built-in) | Source files (`.bpp` / `.bsm`) | n/a | Acme-style editor |
 | Run | (built-in) | Build + run + log | n/a | F7 build / F8 run |
@@ -350,9 +350,9 @@ examples that exist today:
   (Pathfind + modulab loop.)
 
 - **Edit level → see in game**: F8 a game that loads
-  `assets/levels/level1.level.json`. Switch to Levels tab. Paint
+  `assets/levels/level1.json`. Switch to Levels tab. Paint
   walls. Save. Game reloads tilemap. (Pathfind + level_editor;
-  Wolf3D Phase 2 will inherit this.)
+  inherited by Wolf3D Phase 2 + WC1 mod end-to-end.)
 
 The cross-process file_watch is what makes these feel like one
 program even though Bang 9 + the game are separate OS processes.
@@ -367,7 +367,7 @@ friction:
 
 | Signal | Triggered tool |
 |---|---|
-| "I want enemies and items in my Wolf3D level, not just walls" | Levels gets entity/object layer (in flight, Caminho A — see Wolf3D Phase 2 notes) |
+| "I want richer entity data — properties per entity, links between entities" | Levels gets entity inspector (currently kind + cell position only; properties / links / scripts deferred until first game asks) |
 | "I'm tuning sound effects by hand-editing JSON" | Sound tab (sample browser + envelope editor) |
 | "I'm hand-coding sprite animation timing in the game source" | Animation tab (timeline + FSM editor) |
 | "My game's MSL shader needs constant recompile" | Shaders tab (Modelo 4 from fxlab arc) |
@@ -431,5 +431,5 @@ The fxlab arc + this manual together establish the canonical shapes.
   contract, not the depth.
 
 For the engine vision in the broader B++ context, see
-`docs/games_roadtrip.md` (the 1.0 path) and
-`docs/how_to_dev_b++.md` (the developer journey).
+`docs/plans/games_roadtrip.md` (the 1.0 path) and
+`docs/manual/how_to_dev_b++.md` (the developer journey).

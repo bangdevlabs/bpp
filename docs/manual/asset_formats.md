@@ -421,9 +421,9 @@ shape can live game-local and migrate up later.
 
 ## Cross-references
 
-- `docs/tonify_checklist.md` Rule 31 — discipline rule that says
+- `docs/manual/tonify_checklist.md` Rule 31 — discipline rule that says
   "games consume Bang 9 / Modulab formats."
-- `docs/how_to_dev_b++.md` Cap 16 "Asset infra" — short paragraph
+- `docs/manual/how_to_dev_b++.md` Cap 16 "Asset infra" — short paragraph
   pointing back at this file.
 - `tools/level_editor/level_editor_lib.bsm` — Level Editor source,
   consumes both level modes.

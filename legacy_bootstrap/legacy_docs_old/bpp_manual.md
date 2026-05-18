@@ -77,7 +77,7 @@ showing on a macOS host:
       /tmp/snake_linux
 
 Currently only `draw_*` (CPU framebuffer) games work via X11. GPU games
-(`render_*`) need Vulkan, which is deferred (see `docs/todo.md`).
+(`render_*`) need Vulkan, which is deferred (see `docs/plans/todo.md`).
 
 ### Portable C Output (raylib / SDL drivers)
 

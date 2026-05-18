@@ -188,7 +188,7 @@ breakpoint fires or all of them, the handler is the same.
 | `src/bug.bpp` | argv parse for `--break` | ~45 |
 | `src/backend/os/macos/bug_observe_macos.bsm` | resolver + selective BP | ~80 |
 | `tests/test_bug_break.bpp` (NEW) | sample target for manual tests | ~30 |
-| `docs/warning_error_log.md` | note on `--break` error codes | ~5 |
+| `docs/manual/warning_error_log.md` | note on `--break` error codes | ~5 |
 | **Total** | | **~175** |
 
 Slightly over the agent's 160 LOC estimate because the resolver

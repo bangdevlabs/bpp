@@ -27,13 +27,13 @@ buzzword-heavy abstractions — the same flavour as the rest of B++.
 |------|----------|
 | I — Tools | Bang 9 IDE, embedded tools (ModuLab, level_editor, mini_synth) |
 | II — Diagnostics | Compiler warnings + errors catalogue |
-| III — Audio | stbaudio (device), stbmixer (8-voice polyphonic), stbsound (file formats) |
+| III — Audio | stbaudio (device), stbmixer (8-voice polyphonic), stbsound (file formats), stbmidi (parser + sequencer + synth) |
 | IV — Input + Window | stbinput (keyboard/mouse), stbwindow (native dialogs), stbgame (loop) |
 | V — Drawing | stbdraw (CPU framebuffer), stbui (widgets), stbimage (PNG decode) |
 | VI — Sprite + Tile | stbpal (palettes), stbtile (tilemaps), stbforge (animations) |
-| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*) |
-| VIII — Engine plumbing | stbpool (pool allocator), stbcol (color math), stbasset (handle-based assets) |
-| IX — GPU | stbrender (textures + sprites + palette LUT) |
+| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide) |
+| VIII — Engine plumbing | stbpool (pool allocator), stbcol (color math), stbasset (handle-based assets), stbprofile (sampling profiler + HUD) |
+| IX — GPU | stbrender (textures + sprites + palette LUT), stbtexture (procedural materials), stbraycast (2.5D walls), stbscene (parallax layers), stbshader (custom pipelines), stbfx (post-process chain) |
 
 The chapters keep their original numbering from `how_to_dev_b++.md`'s
 Part VI so cross-references in the rest of the codebase remain valid.
@@ -250,10 +250,10 @@ The `bug` debugger's embed in a future Debug tab is a separate design. This chap
 ## Cap 28 — Diagnostics (warnings + errors)
 
 *Depends on: —*
-*Source: docs/warning_error_log.md*
+*Source: docs/manual/warning_error_log.md*
 *Status: COMPLETE — 2026-04-27*
 
-The compiler emits two kinds of diagnostics: **errors** (fatal — compilation stops) and **warnings** (non-fatal — compilation continues with a caution). All codes are numeric: `EXXX` for errors, `WXXX` for warnings. The canonical reference lives at `docs/warning_error_log.md`; this chapter explains the system design and the most important codes.
+The compiler emits two kinds of diagnostics: **errors** (fatal — compilation stops) and **warnings** (non-fatal — compilation continues with a caution). All codes are numeric: `EXXX` for errors, `WXXX` for warnings. The canonical reference lives at `docs/manual/warning_error_log.md`; this chapter explains the system design and the most important codes.
 
 ### How diagnostics are emitted
 
@@ -303,6 +303,9 @@ Reserved:              2  (W017, W014)
 | E243 | Pointer compared to non-zero literal | `if (ptr == 42)` is almost always a bug |
 | E244 | Float literal in int context | Array index or shift count cannot be a float |
 | E245 | Array element type conflict | Two different inferred elem types for same `TY_ARR` |
+| E246 | `func(args) -> ret` annotation contract violated | Both sides of an assignment carry explicit fn-pointer annotations with mismatched shapes (V3 Session 3) |
+| E260 | Deprecated phase keyword | Parser rejects `@base / @time / @io / @gpu / @solo / @heap / @panic / @realtime` — migrate to `@safe` or remove. Shipped 2026-05-11 with the phase collapse. |
+| E262 | Newtype assignment conflict | `auto a: WorldPos; auto b: GridPos; a = b;` — Rule 29 `struct X as Base` newtypes refuse cross-domain assignment even though they share byte layout |
 
 ### Warnings (non-fatal)
 
@@ -318,19 +321,20 @@ Reserved:              2  (W017, W014)
 | W020 | Static cross-module call | Calling `: static` function from another module |
 | W021 | Switch not exhaustive | Value switch without `else` arm |
 | W025 | Public param without hint in float arithmetic | Annotate `: float` or `: word` — see Rule 13 |
-| W026 | Phase annotation violated | Function annotated `@time` reaches a HEAP call, etc. |
+| W026 | `@safe` contract violated | Function annotated `@safe` reaches malloc / IO / GPU / blocking via call graph — see below |
+| W028 | Func-pointer shape mismatch | V3 flow analysis catches `call(fp, args)` where `fp`'s registered targets disagree with the call shape |
+| W031 | `@safe`-suggestion | Function's effective call graph is bounded; compiler nudges to add `@safe` annotation |
+| W032 | `put` / `put_err` smart-dispatch ambiguity | `put_err(x)` where `x` has type TY_WORD (unannotated param) silently dispatches to `putnum_err`. Annotate the param `: ptr` for strings, `: float` for floats, or call `putstr_err` / `putfloat_err` directly. Shipped 2026-05-12. |
 
-### W026 — the effect lattice guard
+### W026 — the `@safe` guard
 
-W026 fires when a function's explicit phase annotation is violated by its transitive call graph. The lattice is:
+W026 fires when a function annotated `@safe` violates the safety contract by reaching, through its transitive call graph, any of: `malloc`, IO (file / stdout / syscall), GPU calls, or blocking primitives. This is the bounded-callback contract the audio callback and worker entries depend on.
 
-```
-BASE < REALTIME < HEAP < {IO, GPU} < SOLO
-```
+Phase annotations were collapsed in 2026-05-11 from an 8-state lattice (`@base / @solo / @time / @io / @gpu / @heap / @panic / @realtime`) to two user-facing keywords: `@safe` (compiler-enforced bounded-path contract) and `@profile("name")` (codegen-driving scope marker). The deprecated keywords are rejected by the parser with **E260**, which points the migrator at Tonify Rule 4. See `journal.md` (2026-05-11) and Rule 4 in `tonify_checklist.md` for the full migration history.
 
-A function annotated `@time` must not call anything that reaches HEAP (i.e., no malloc). A function annotated `@io` permits HEAP (allocation is ubiquitous in I/O scaffolding) but must not be called from a `@time` context.
+Unknown externs default to a permissive classification; only **known-to-be-incompatible** paths fire W026. The check is gradual: new extern calls are safe by default and earn their classification when used in a `@safe`-annotated graph.
 
-Unknown externs default to `PHASE_AUTO`, so only **known-to-be-incompatible** paths fire W026. This makes the check gradual: new extern calls are safe by default and opt into classification over time.
+A sibling diagnostic — **W031** — runs in the opposite direction: when a function's effective call graph would have passed `@safe` enforcement, the compiler suggests adding the annotation. The two together (W026 + W031) push every callback-shaped function into the compiler-verified path.
 
 ### Runtime asset-load diagnostics
 
@@ -346,11 +350,11 @@ The loader prints to stderr and returns 0 (null handle). Callers in `stbasset.bs
 
 ### Adding a new diagnostic
 
-1. Pick the next available code in `docs/warning_error_log.md`.
+1. Pick the next available code in `docs/manual/warning_error_log.md`.
 2. Add the emission call in the appropriate pass file (`bpp_parser.bsm`, `bpp_validate.bsm`, or `bpp_dispatch.bsm`).
 3. Use `diag_error(tok_pos, EXXX, message)` or `diag_warn(tok_pos, WXXX, message)` — never bare `print_msg`.
 4. Add an xfail test: `// xfail: EXXX` on line 1 of a new `tests/test_EXXX.bpp`.
-5. Update `docs/warning_error_log.md` with the new row.
+5. Update `docs/manual/warning_error_log.md` with the new row.
 
 The rule is firm: **no new diagnostic ships without a source location and an xfail test**.
 
@@ -1744,12 +1748,27 @@ time. Game loop reads the atlas, not the rasterizer.
 
 *Depends on: Cap 35 (stbdraw)*
 *Source: new*
-*Status: COMPLETE — 2026-04-22*
+*Status: COMPLETE — 2026-04-22 (v1 widgets), extended 2026-05-17 (v2 declarative layout)*
 
-`stbui.bsm` is an immediate-mode UI toolkit — widgets compute
-geometry, dispatch input, and draw themselves in a single function
-call. No retained tree, no register/deregister, no IDs beyond what
-your layout provides.
+`stbui.bsm` ships TWO families of API in the same cartridge:
+
+- **v1 widgets** (`gui_button`, `gui_label`, `gui_slider`, ...) —
+  the original immediate-mode toolkit. Each widget takes explicit
+  `(x, y, w, h)` and draws itself. Use when you already know the
+  pixel rectangle you want, or when porting code that already
+  computes positions.
+- **v2 declarative layout** (`ui_layout_begin`, `ui_box`,
+  `ui_row`, `ui_col`, `ui_text`, `ui_button`, ...) — Clay-inspired
+  flex-style system. Declare a tree of containers with sizing
+  rules; the engine resolves positions for you. Use for any
+  layout that needs to survive panel resize, zoom, or
+  embed-into-host transitions.
+
+Both families are immediate-mode (no retained tree across frames,
+no register/deregister). They coexist freely — a consumer can use
+v2 for the shell and v1 widgets for individual buttons placed
+inside computed bboxes (the level_editor S4 migration is the
+canonical example of this pattern).
 
 ### §36.1 — Immediate-mode philosophy
 
@@ -1804,10 +1823,10 @@ All widgets are stateless from the UI's perspective — you pass in
 the current state and get the new state back. The widget internals
 handle hover animations, click detection, and drawing.
 
-### §36.4 — Layout helpers
+### §36.4 — Layout helpers (v1 cursor stack — superseded by §36.7)
 
-Absolute positioning gets tedious for multi-row forms. The layout
-stack provides a minimal flex-style system:
+Absolute positioning gets tedious for multi-row forms. The original
+v1 layout stack provides a minimal cursor system:
 
 ```c
 layout_begin(x, y, w, h, direction);   // LAYOUT_ROW or LAYOUT_COL
@@ -1818,9 +1837,12 @@ layout_begin(x, y, w, h, direction);   // LAYOUT_ROW or LAYOUT_COL
 layout_end();
 ```
 
-Stack depth is 8 (fixed). Nested row-inside-column compositions
-handle most game HUDs. For complex layouts (popups with arbitrary
-positioning), fall back to absolute coordinates.
+Stack depth is 8 (fixed). The cursor advances by the `width`
+you pushed; nesting handles simple HUDs. Adoption stayed near
+zero because the helper still requires the consumer to pre-compute
+widths — it removed the per-widget `+24` arithmetic but not the
+"how big should this row be?" decision. The v2 declarative API
+(§36.7) addresses that gap; new code should prefer it.
 
 ### §36.5 — Hover and press state
 
@@ -1842,6 +1864,144 @@ instead of snapping.
   keyboard support via `gui_text_input`; no broader a11y framework.
 - **Retained-mode UI** — this is strictly immediate. If you want a
   retained tree, build your own on top.
+
+### §36.7 — v2 declarative layout (Clay-inspired, shipped 2026-05-17)
+
+The v2 API lets you DECLARE a tree of containers with sizing
+rules; the engine resolves positions for you. v1's `lay_push` got
+0 adoption because it still required pre-computed widths; v2
+removes that gap entirely.
+
+#### Mental model
+
+Every frame:
+
+1. `ui_layout_begin(panel_w, panel_h)` — open a new layout
+   tree, reset the per-frame arena.
+2. Declare nodes via `ui_box / ui_end` (begin/end pairs) or
+   shorter `ui_row / ui_col / ...` variants. Each call returns
+   the node's index.
+3. `ui_layout_end()` — run the four-pass solver (FIXED + PERCENT
+   top-down, FIT bottom-up, GROW top-down, position pass) and
+   emit any built-in widget render commands.
+4. For v1 widgets you place INSIDE a declared bbox, read the
+   solved position via `ui_node_x/y/w/h(idx) + panel_origin`
+   and call `gui_button(...)` / `gui_text_input(...)` etc. with
+   those coords.
+
+#### Sizing helpers
+
+Sizing modes are passed by value as 64-bit words (high 8 bits =
+mode, low 56 bits = value):
+
+```c
+ui_sz_fit();         // size to children (default for ui_box)
+ui_sz_grow();        // share remaining space with grow siblings
+ui_sz_fixed(N);      // exact pixels
+ui_sz_pct(P);        // P% of parent (0..100, clamped)
+```
+
+#### Container declaration
+
+The general form:
+
+```c
+ui_box(direction, size_w, size_h, gap, pad);   // direction = UI_LAYOUT_ROW | UI_LAYOUT_COL
+  ...child boxes / widgets...
+ui_end();
+```
+
+Shorter variants for the common cases (all return the node index):
+
+```c
+ui_row(gap);              // ROW, fit×fit, gap, no pad
+ui_col(gap);              // COL, fit×fit
+ui_row_grow(gap);         // ROW, grow×grow
+ui_col_grow(gap);         // COL, grow×grow
+ui_row_pad(pad, gap);     // ROW, fit×fit, gap, pad
+ui_col_pad(pad, gap);     // COL, fit×fit, gap, pad
+ui_col_fixed_w(w, gap);   // COL, fixed(w)×grow — sidebar shape
+ui_row_fixed_h(h, gap);   // ROW, grow×fixed(h) — topbar / footer shape
+ui_col_fixed(w, h, gap);  // COL, fixed×fixed — toolbar of exact size
+```
+
+#### Bbox accessors
+
+After `ui_layout_end()` has run, read computed (x, y, w, h) of
+any declared node by its index:
+
+```c
+ui_node_x(idx);     // 0 if idx is out of range
+ui_node_y(idx);
+ui_node_w(idx);
+ui_node_h(idx);
+```
+
+Coordinates are LAYOUT-LOCAL (root at 0,0). When the layout
+is being painted inside a host panel rect `(px, py, pw, ph)`
+(e.g. embedded under Bang 9), add the panel origin manually:
+`bbox_x = px + ui_node_x(idx)`.
+
+#### Built-in widgets
+
+```c
+ui_text(label);          // bitmap text in the next slot
+ui_button(label);        // → 1 the frame it's clicked, 0 otherwise
+ui_spacer(size);         // invisible node taking the given size
+ui_spacer_grow();        // shorthand for ui_spacer(ui_sz_grow())
+```
+
+#### Real-world example: tool shell layout
+
+The level_editor panel uses this layout (S4 migration,
+`tools/level_editor/level_editor_lib.bsm`):
+
+```c
+ui_layout_begin(pw, ph);
+ui_box(UI_LAYOUT_COL, ui_sz_fixed(pw), ui_sz_fixed(ph), 0, 0);
+    topbar_idx  = ui_row_fixed_h(28, 0); ui_end();
+    body_idx    = ui_row_grow(0);
+        canvas_idx = ui_col_grow(0);       ui_end();
+        picker_idx = ui_col_fixed_w(140, 0); ui_end();
+    ui_end();
+    helpbar_idx = ui_row_fixed_h(24, 0); ui_end();
+ui_end();
+ui_layout_end();
+
+// Recover bboxes (add panel origin for the embed case)
+auto cvs_x = px + ui_node_x(canvas_idx);
+auto cvs_y = py + ui_node_y(canvas_idx);
+// ... use cvs_x, cvs_y to paint via v1 widgets, draw_rect, etc.
+```
+
+Side panels stay fixed-width regardless of host panel size. The
+canvas is the only GROW slot, so zoom / content changes inside
+it don't reflow neighbours — the bug that motivated v2 in the
+first place.
+
+#### Choosing v1 vs v2
+
+| Situation | Use |
+|---|---|
+| Single widget at a known position (HUD score, debug overlay) | v1 `gui_*` directly |
+| Multi-panel tool shell that must survive host resize | v2 declarative outer; v1 widgets placed inside bbox |
+| Form rows that just need to flow left-to-right | v2 `ui_row` with `ui_button` / `ui_text` children |
+| Nested grow / fixed mixes (sidebar + main + sidebar) | v2 — this is what it was built for |
+
+#### What v2 does NOT cover (yet)
+
+- **Scroll containers** — defer until a real consumer needs panning
+  on small windows. Today's consumers (Modulab, level_editor)
+  manage scroll manually inside their canvas bbox.
+- **Z-index / modal overlays** — single layer only.
+- **Theme system** — v1 themes (`theme_dark`, `theme_light`) apply
+  to `ui_button` text rendering, but colour customisation per
+  declared node is a future addition.
+- **Animation** between frames — no built-in tweening.
+
+See `docs/plans/sidequest_stbui_v2_clay.md` for the live arc
+status (S5+ migrations remain open) and `docs/journal.md`
+2026-05-17 for the full design narrative.
 
 ---
 
@@ -1898,7 +2058,7 @@ top-level shape to dispatch:
 Caller usage stays trivially simple:
 
 ```bpp
-var hero = image_load("hero.atlas.json");
+var hero = image_load("hero.json");
 image_draw_size(hero, frame_id, x, y, w, h);
 ```
 
@@ -1968,7 +2128,7 @@ one GPU call.
 Game opts into edit-while-running for any loaded Image:
 
 ```bpp
-var pf_image = image_load("pathfind.atlas.json");
+var pf_image = image_load("pathfind.json");
 image_hot_reload_enable(pf_image);
 ```
 
@@ -2850,11 +3010,1115 @@ lookup per pixel, zero CPU cost.
 
 ---
 
+## Cap 48 — MIDI parser + sequencer + synth (stbmidi)
+
+*Depends on: Cap 30 (stbmixer)*
+*Source: new — 2026-05-12*
+*Status: SHIPPED — 2026-05-12*
+
+`stbmidi.bsm` is the canonical MIDI playback stack: a Standard MIDI
+File (SMF) parser, a sample-accurate sequencer, and a default synth
+dispatcher that routes events to stbmixer. The cartridge mirrors how
+JUCE / RtMidi / libsmf carve the problem — three layers behind a
+unified event representation — so each layer can evolve without
+forcing a client refactor.
+
+Three concrete consumer classes anchor the design (Rule 20 satisfied
+on day one):
+
+1. **Game music playback** — `games/rts_1.0/assets/converted/music/`
+   ships 45 MIDI tracks (converted from XMI by war1tool). Future
+   retro games using SMF music re-use the same path.
+2. **`mini_synth` recording playback** — the embedded synth tool
+   already synthesises live; recording-to-MIDI plus loading-back
+   leans on the same event representation.
+3. **Live MIDI hardware input** (future) — a CoreMIDI / ALSA driver
+   pushes events into the same synth dispatcher. No special-cased
+   "live mode."
+
+### §48.0 — Three layers behind one event type
+
+```
+                ┌─────────────────────┐
+   .mid bytes → │  midi_file_load     │ → MidiFile (SoA event arrays)
+                └─────────────────────┘
+                          ↓
+                ┌─────────────────────┐
+   sample tick→ │  midi_seq_advance_  │ → MidiEvent (scratch reused)
+                │   samples           │
+                └─────────────────────┘
+                          ↓                        ┌───────────────┐
+                ┌─────────────────────┐            │ user override │
+                │  midi_synth_default │ ←┐         │  callback     │
+                │   (callback fn_ptr) │  └─────────│   (recording, │
+                └─────────────────────┘            │   plugin, …)  │
+                          ↓                        └───────────────┘
+                ┌─────────────────────┐
+                │  mixer_note_on /    │
+                │  mixer_note_off     │
+                └─────────────────────┘
+```
+
+The synth signature is **event-only** (`midi_synth_default(event)`),
+not `(sequencer, event)`. That symmetry is intentional: a live MIDI
+hardware driver pushes `MidiEvent` values into the synth without
+inventing a fake sequencer handle. Same function, three call paths.
+
+### §48.1 — Load an SMF file
+
+```c
+midi_file_load(path: ptr) -> ptr        // MidiFile*; 0 on parse error
+void midi_file_free(file)                // releases the event arrays
+```
+
+The parser accepts **SMF Format 0** (single MTrk merged across
+channels — what war1tool produces from XMI) and **SMF Format 1**
+(N MTrks, each independent, merged into one tick-sorted stream at
+load time). Format 2 is rejected with `stbmidi: '<path>': Format 2
+not supported (use Format 0 or 1)`. SMPTE division (header word
+high bit set) is rejected with `stbmidi: '<path>': SMPTE division
+not supported (ticks-per-quarter only)` — music MIDI uses ticks-
+per-quarter; SMPTE is a film/video sync convention. The `: ptr`
+annotation on `path` is what makes `put_err(path)` in the error
+diagnostics dispatch correctly (Rule 13).
+
+### §48.2 — Drive the sequencer
+
+```c
+midi_seq_new(file, callback, loop, sample_rate) -> ptr   // MidiSequencer*
+void midi_seq_advance_samples(seq, n_samples)
+void midi_seq_advance_us(seq, dt_us)     // wall-clock convenience
+void midi_seq_pause(seq)
+void midi_seq_resume(seq)
+void midi_seq_stop(seq)
+void midi_seq_free(seq)
+```
+
+The sequencer's cursor is a **sample position**, not a wall-clock
+timestamp. `midi_seq_advance_samples(seq, n)` walks every event whose
+computed sample offset falls in `[sample_pos, sample_pos + n)`, fires
+the callback once per event in tick order, then advances `sample_pos
++= n`. The sequencer is the single authority on its own sample_pos —
+it never consults `beat_now_samples` during advance, so the MIDI
+timeline never drifts against the audio clock.
+
+The wall-clock wrapper `midi_seq_advance_us(seq, dt_us)` converts the
+delta to samples using the cached `sample_rate` and dispatches
+identically. Use it when the caller is a game loop and 16 ms event
+resolution is enough; switch to the `_samples` form when you're
+calling from `mixer_stream`'s site and want sample-accurate dispatch.
+
+### §48.3 — Tempo re-anchor model
+
+Events carry the absolute MIDI tick from the file. The sequencer
+converts ticks to samples on the fly using:
+
+```
+sample_of(event) = anchor_sample + (event.tick - anchor_tick) * samples_per_tick
+```
+
+When a tempo meta event (`FF 51 03 <us-per-quarter>`) crosses the
+dispatch boundary, the sequencer re-anchors:
+
+```
+anchor_sample    = sample_of(tempo_event)
+anchor_tick      = tempo_event.tick
+samples_per_tick = new_us_per_quarter / division * sample_rate / 1_000_000
+```
+
+This avoids drift across tempo changes — every tempo segment is
+anchored at the exact sample its boundary tick maps to. There is
+no accumulated rounding because each segment's math starts fresh
+from an exact anchor pair.
+
+When the sequencer's `loop` flag is set and the dispatcher hits
+`MIDI_META_EOT`, the cursor wraps to 0 and the tempo anchor resets
+to the file's `initial_us_per_quarter` at the current sample_pos.
+`sample_pos` itself does not rewind — the timeline is monotonic
+from sequencer creation.
+
+### §48.4 — Default synth dispatch
+
+```c
+void midi_synth_default(event) @safe
+```
+
+Routes `NOTE_ON` to `mixer_note_on(key_id, freq)` using a 128-entry
+MIDI-key → frequency table (12-TET equal temperament, A4 = 440 Hz).
+Routes `NOTE_OFF` to `mixer_note_off`. Other event types
+(program change, controller, pitch bend, aftertouch) pass through the
+parser cleanly and reach the callback, but the default synth ignores
+them. Future synth-callback consumers — `mini_synth` recording, a
+sample-based MIDI renderer, a plugin host — can intercept the full
+event vocabulary without parser changes.
+
+The `@safe` annotation is the load-bearing piece: an audio-context
+synth callback **must** be malloc-free and IO-free. The compiler
+proves it via W026.
+
+### §48.5 — High-level helper
+
+```c
+midi_play_file(path, loop) -> ptr        // MidiSequencer*
+```
+
+`midi_file_load` + `midi_seq_new` + sets `midi_synth_default` as
+the callback. The 90% case for a game scene that wants background
+music with a single call.
+
+### §48.6 — Callback contract
+
+The `MidiEvent` view passed to the callback is the sequencer's
+**scratch event** — one struct allocated per sequencer at
+`midi_seq_new`, reused across every dispatch. Callbacks that need to
+retain event data (e.g. a recording bus that copies into a ring
+buffer) must copy `tick_samples / type / channel / data1 / data2`
+**before returning**. Holding the pointer past return is undefined —
+the next event will overwrite it.
+
+### §48.7 — Threading
+
+B++ audio is main-thread only. `stbmixer.mixer_stream(n)` generates
+samples on the main thread and pushes them into the SPSC ring;
+the platform-native realtime thread drains the ring opaquely. No
+b++ code runs on the realtime thread.
+
+`stbmidi` inherits the discipline trivially:
+
+- Parser load runs on the main thread.
+- Sequencer advance runs on the main thread (alongside or just
+  before `mixer_stream`).
+- Synth callback runs on the main thread (called by the sequencer).
+- Pause / play / stop are plain function calls.
+
+No atomic flags, no lock-free queues, no cross-thread state.
+
+The future upgrade path — sample-driven advance from a real audio
+callback — stays compatible: the same `midi_seq_advance_samples`
+becomes the audio-callback entry, with the sample-accurate timebase
+already in place.
+
+### §48.8 — Format limits (intentionally NOT in v1)
+
+Per Rule 28 — deferred until a concrete consumer demand surfaces:
+
+- Full General MIDI instrument set (sample-based synthesis). The
+  default synth uses the existing `mixer_note_on(key_id, freq)`
+  with stbmixer's waveform fader for crude timbre.
+- Per-channel program change → instrument selection. Default
+  synth ignores program-change events; future synth-callback
+  consumers can intercept them.
+- ADSR envelopes. Needs a richer voice in stbmixer first.
+- Velocity → loudness mapping. Same dependency.
+- Pitch bend, modulation wheel, sustain pedal. Events parse
+  cleanly and reach the callback; the default synth ignores them.
+- Live MIDI hardware I/O. Will be a sibling cartridge when the
+  platform driver lands (CoreMIDI / ALSA / WinMM).
+- SMF file writing. Once `mini_synth` recording stabilises against
+  the read path, the writer joins.
+
+### §48.9 — Verification
+
+- `tests/test_stbmidi_*.bpp` — Format 0 round-trip, Format 1
+  multi-track merge, tempo-change closed-form drift check,
+  Format 2 / SMPTE / malformed-header rejection.
+- Smoke against a real WC1 .mid: load
+  `games/rts_1.0/assets/converted/music/00.mid`, advance for ten
+  seconds of samples, assert > 100 events dispatched without
+  crash.
+
+### §48.10 — What this chapter does NOT cover
+
+The XMI → MIDI conversion that produced the WC1 corpus is handled
+externally by war1tool (Wargus's clean-room WC1 extractor). The
+B++ side consumes only the resulting `.mid` files.
+
+The `mini_synth` recording protocol — keyboard events → in-memory
+event list → SMF writer — lives in `tools/mini_synth/` and is a
+separate piece that consumes the stbmidi event representation.
+
+---
+
+## Cap 49 — Flow-field pathfinding (stbflow)
+
+*Depends on: nothing (pure leaf, uses bpp_buf primitives)*
+*Source: new — 2026-05-12 (RTS Stress Arc Session 4)*
+*Status: SHIPPED — 2026-05-12*
+
+`stbflow.bsm` is the **crowd pathfinding** cartridge. Its sibling
+`stbpath` (Cap 42) solves single-agent A→B navigation; stbflow solves
+the orthogonal "many agents, shared destination" problem that RTS,
+tower-defense, and swarm games hit. The two cartridges are deliberately
+split — importing one signals the genre, the mental models do not mix.
+
+### §49.0 — Why a separate cartridge
+
+A* per unit scales as `O(units × cells)`. With 100 units on a 64×64
+grid the cost is real (`~1.8 ms` per frame in the Session 4 bench).
+Flow fields amortise the cost: **one BFS from the goal fills a
+distance field in `O(cells)`**, and every unit sampling the field is
+`O(1)`. The same bench measures `~48 µs` total for 100 units —
+**38× speedup**, asymptotically widening as the unit count grows.
+
+Trade-offs against A*:
+
+- 4-connected only (no diagonal motion). Diagonal motion plus
+  √2 edge cost needs a Dijkstra-with-heap which is what
+  stbpath already is.
+- Single goal per field (one BFS per goal). For multi-goal
+  scenarios (multiple rally points), allocate multiple
+  `FlowField` structs.
+- Field is invalidated whenever the obstacle map changes.
+  Recompute via `flow_compute` when terrain or building layout
+  shifts.
+
+### §49.1 — Lifecycle
+
+```c
+flow_new(w, h) -> ptr;                   // FlowField*
+void  flow_free(field);
+```
+
+Allocates parallel buffers sized `w*h`: `blocked` (1 byte/cell),
+`dist` (1 word/cell), `queue` (1 word/cell, BFS scratch reused
+each compute). All cells start walkable. The `dist` field is not
+initialised until the first `flow_compute`.
+
+### §49.2 — Obstacle map
+
+```c
+void flow_set_blocked(field, gx, gy, blocked);    // 1 = wall, 0 = walkable
+flow_is_blocked(field, gx, gy) -> word;           // bounds-safe; OOB → 1
+```
+
+Out-of-bounds writes are silently ignored, matching stbpath's
+convention. The read variant returns 1 for blocked, OOB, or
+invalid queries — the caller can treat "can't go there" as a
+single condition.
+
+### §49.3 — Compute + sample
+
+```c
+void flow_compute(field, goal_x, goal_y);          // BFS fills `dist`
+flow_dist(field, gx, gy) -> word;                  // hop count; FLOW_INF if unreachable
+void flow_step(field, gx, gy, out_step);           // out_step[0..1] = (dx, dy)
+```
+
+`flow_compute` runs 4-connected BFS from the goal. After return
+each reachable cell carries its hop count; unreachable cells stay
+at `FLOW_INF` (`2_000_000_000` sentinel). An invalid goal (OOB or
+on a blocked cell) leaves the entire field at FLOW_INF —
+consistent "all unreachable" instead of a half-filled field.
+
+`flow_step` writes the unit step `(dx, dy)` a unit at `(gx, gy)`
+should take toward the goal into `out_step` (a `buf_word(2)`).
+Returns `(0, 0)` for the goal cell, unreachable cells, blocked
+queries, or OOB — "no step needed" is a single condition.
+
+### §49.4 — Hybrid with A*
+
+The RTS playbook is "A* for one unit, flow for a crowd". The Stress
+Arc Session 4 bench validates the crossover at ~6 units sharing a
+goal. The recommended decision rule lives in the RTS handoff
+(`games/rts_1.0/wc1_handoff.md` §"Pathing strategy"):
+
+```c
+if (n_selected == 1) {
+    path_find(pf, sx, sy, gx, gy);    // stbpath A*
+} else if (n_selected >= 6) {
+    flow_compute(ff, gx, gy);         // one BFS
+    // then per-unit: flow_step(ff, ux, uy, step)
+}
+```
+
+The 2-5 unit range can go either way; pick whichever path looks
+better on the bench for your map shape.
+
+### §49.5 — What this chapter does NOT cover
+
+The Stress Arc S4 bench (`tests/bench_stbflow.bpp`) drives the
+38× speedup measurement; read the bench for the exact harness
+setup. Future work — diagonal motion with Dijkstra-heap variant,
+multi-goal fields, moving-goal incremental update — is deferred
+until a real consumer surfaces (Rule 28). Stbflow is intentionally
+the simplest possible BFS field today.
+
+---
+
+## Cap 50 — 2.5D raycaster (stbraycast)
+
+*Depends on: stbtile (Cap 39), stbrender (Cap 47)*
+*Source: new — 2026-05-04 (Wolf3D Phase 1)*
+*Status: SHIPPED — 2026-05-04*
+
+`stbraycast.bsm` is the rendering pillar of B++'s FPS / dungeon-
+crawler stack. Generic DDA (Digital Differential Analyzer) ray
+casting — the algorithm Wolfenstein 3D, ROTT, Catacomb 3-D, and
+every Wolf3D-style indie revival share. Each screen column becomes
+one ray; the ray walks the integer grid until it hits a solid
+tile; the perpendicular wall distance projects to a vertical strip
+whose height is inverse-proportional to that distance.
+
+Algorithm reference: `lodev.org/cgtutor/raycasting`.
+
+### §50.0 — What stbraycast owns vs what the game owns
+
+The cartridge is intentionally minimal — it composes with existing
+stb cartridges rather than reinventing them.
+
+**stbraycast owns**:
+- the DDA + projection math
+- the `RayHit` struct (compact, sub-word slices)
+- the per-column draw helper that ties cast_ray output to
+  stbrender + caller-supplied textures
+
+**The calling game owns**:
+- level layout (`tile_set` calls in init)
+- texture choice (which generator, which dimensions)
+- the `wall_type → texture handle` dispatch table
+- player state (position, angle, FOV — too FPS-specific for stb)
+- input mapping (WASD vs arrow keys vs gamepad)
+- assets (texture file paths)
+
+There is intentionally NO `stbfps.bsm` for player state. FPS
+movement (no gravity, no jump, rotation as primary input axis)
+is structurally different from `stbphys.Body` (platformer-oriented).
+Promoting would either overspecialise stbphys or create a
+near-empty stbfps. YAGNI until two games share the same FPS player
+shape.
+
+### §50.1 — The RayHit struct
+
+```c
+struct RayHit {
+    distance: half float,      // perpendicular distance to wall
+    tex_x:    half,            // 0..63 column in texture (Wolf3D-tier 64-wide)
+    wall_type: byte,           // 0 = miss, 1+ = Tilemap cell value
+    side:     bit              // 0 = NS-facing, 1 = EW-facing
+}
+```
+
+Sub-word slices keep the struct in ~10 payload bytes, padded to 16.
+The bug debugger (`bug --watch hit`) auto-expands struct fields —
+debugging the hot loop shows `.distance = 4.7, .tex_x = 47,
+.wall_type = 2, .side = 1` directly rather than as opaque hex.
+
+### §50.2 — `cast_ray` — one column, one ray
+
+```c
+void cast_ray(hit: RayHit, col: half, screen_w: half,
+              px: float, py: float, pang: float, fov: float,
+              tm);
+```
+
+Algorithm:
+
+1. **Direction + camera-plane vectors** — `dir = (cos(pang), sin(pang))`;
+   `plane` is perpendicular to dir, scaled by `tan(fov/2)`. Camera-space
+   `x` maps screen column to [-1, +1].
+2. **DDA loop** — start at the player cell, walk integer grid steps
+   along whichever axis has the closer next-side distance, stop when
+   the cell is solid (per `tile_is_solid`).
+3. **Project** — perpendicular distance (not raw ray length)
+   eliminates fish-eye. Texture column = fractional position along
+   the wall the ray hit.
+
+Why caller-allocated buffer (not return-by-value): B++ doesn't
+return structs by value cleanly. A single 16-byte buffer reused
+across `640 cols × 60 fps = 38400` casts per second keeps allocator
+pressure at zero. Same model as `make_node` in the parser.
+
+### §50.3 — `raycast_draw_column` — strip rendering
+
+```c
+void raycast_draw_column(hit: RayHit, col: half,
+                         screen_w: half, screen_h: half,
+                         tex, tex_w: half);
+```
+
+Projection math:
+
+```
+line_height = screen_h / hit.distance        (clamped to screen_h)
+draw_start  = (screen_h - line_height) / 2
+draw_end    = draw_start + line_height
+```
+
+The wall-type-to-texture dispatch lives in the caller:
+
+```c
+switch (hit.wall_type) {
+    1 { tex = TEX_BRICK; }
+    2 { tex = TEX_STONE; }
+    3 { tex = TEX_WOOD;  }
+    else { return; }
+}
+raycast_draw_column(hit, col, screen_w, screen_h, tex, 64);
+```
+
+EW walls render with a 70% grey tint so adjacent same-type cells
+read as distinct surfaces under perspective — the classic
+Wolfenstein 3D look.
+
+### §50.4 — Performance
+
+At 640 columns × 60 fps × ~30 float ops/cast = ~1.2M float ops/sec
+in the hot loop, comfortably within budget on any modern CPU. The
+critical `cos_f` / `sin_f` / `abs_f` / `floor_f` helpers live in
+`bpp_math.bsm` (auto-injected) after stbphys's FPSBody walker
+became a second consumer — Rule 20 promotion in action.
+
+### §50.5 — What this chapter does NOT cover
+
+Sprite billboards (enemies, items facing the camera), floor and
+ceiling rendering, doors / pushwalls, weapon overlays — all live
+in the game module, not stbraycast. The cartridge is single-purpose:
+**walls only**. Wolf3D Phase 2 adds enemy sprites in `games/fps/`
+without touching stbraycast.
+
+---
+
+## Cap 51 — Procedural textures (stbtexture)
+
+*Depends on: bpp_buf, platform `_stb_gpu_create_texture`*
+*Source: new — 2026-05-04 (Wolf3D Phase 1)*
+*Status: SHIPPED — 2026-05-04*
+
+`stbtexture.bsm` is the middle layer of the texture pipeline:
+
+```
+filesystem  → texture  (PNG decode, asset slots)   — stbasset
+programmatic → texture (procedural materials)      — stbtexture  ← this
+texture     → screen   (sampling, drawing)         — stbrender
+```
+
+It ships parameterised builders for common materials — brick,
+stone, wood, solid colour — that fill an RGBA byte buffer in pure
+B++. No FFI, no asset files, no GPU library. The pixel algorithm
+is the deliverable; a 2.5D raycaster, a dungeon crawler, a
+top-down RPG, a tile editor preview all want the same shapes.
+Each game picks its own palette and dimensions; the cartridge
+owns the geometry.
+
+### §51.0 — Two entry points per material
+
+Every material exposes a `_to_buf` writer and a GPU factory:
+
+```c
+void  texture_<name>_to_buf(buf, w, h, ...);   // fills caller's RGBA buffer
+       texture_<name>(w, h, ...);              // allocates + uploads, returns handle
+```
+
+The `_to_buf` form does **no allocation, no GPU side effect** —
+ideal for tests, CPU-only renderers (TUI fallback, ANSI mode), or
+any caller that wants just the bytes. The GPU factory allocates a
+buffer, calls `_to_buf`, and uploads via
+`_stb_gpu_create_texture`. Use from game init / load steps.
+
+### §51.1 — Catalog
+
+```c
+// Solid colour fill
+void texture_solid_to_buf(buf, w, h, color);
+     texture_solid(w, h, color);
+
+// Running-bond brick (mortar at row tops + brick-column edges,
+// alternating row shift = brick_w/2)
+void texture_brick_to_buf(buf, w, h, brick_color, mortar_color,
+                          brick_w, brick_h);
+     texture_brick(w, h, brick_color, mortar_color, brick_w, brick_h);
+
+// Noisy stone (two-tone deterministic hash, base + accent speckles)
+void texture_stone_to_buf(buf, w, h, base_color, accent_color);
+     texture_stone(w, h, base_color, accent_color);
+
+// Vertical wood planks with seams + horizontal grain modulation
+void texture_wood_to_buf(buf, w, h, base_color, dark_color, plank_w);
+     texture_wood(w, h, base_color, dark_color, plank_w);
+```
+
+Pixel layout in memory is `R, G, B, A` — matches
+`_stb_gpu_create_texture` and the precedent set by
+`render_create_sprite16`.
+
+### §51.2 — Determinism
+
+Every generator uses a deterministic per-pixel hash (no RNG state,
+no time-dependent input). The same parameters produce
+byte-identical output across builds — useful for golden-image
+tests and for the bootstrap byte-stability check.
+
+### §51.3 — Memory contract
+
+Each GPU factory returns a handle the caller treats as opaque. The
+intermediate pixel buffer is intentionally **not freed** — Apple
+Silicon's unified memory may not have finished the upload at the
+moment of return; the per-texture cost (16 KB for a 64×64 RGBA) is
+negligible against the lifetime of a wall set. The `_to_buf`
+variants don't allocate at all; caller owns buffer lifetime.
+
+### §51.4 — What this chapter does NOT cover
+
+Atlas builders, format conversions (palette → RGBA), blit /
+copy / sub-region operations — all reserved future work under the
+`texture_*` prefix but unshipped. PNG decoding lives in stbimage;
+GPU texture sampling and binding lives in stbrender and stbshader.
+
+---
+
+## Cap 52 — AI primitives (stbai)
+
+*Depends on: stbtile (Cap 39), bpp_math (`Vec2`, `sqrt`, `floor_int`)*
+*Source: new — 2026-05-04 (Wolf3D Phase 2 Session 2)*
+*Status: SHIPPED — 2026-05-04*
+
+`stbai.bsm` is the genre-agnostic AI primitive toolkit for grid-world
+games: line-of-sight, distance, seek-vector, move-with-collision.
+The complement of stbpath (discrete A*) — stbpath returns a list of
+waypoints once per second, stbai operates continuously every frame.
+
+### §52.0 — Territory split (stbai vs stbpath)
+
+| Cartridge | Operates on | Allocates | Frequency |
+|-----------|-------------|-----------|-----------|
+| `stbpath` | Discrete grid (integer cells) | Once per goal | Few times / sec |
+| `stbai` | Continuous space (float cells) | Never | Every frame |
+
+Games that need both (e.g. enemy uses LoS when player visible,
+falls back to A* when player ducks around a corner) compose them
+in their own `ai.bsm` module. The cartridges share no internals —
+no name collisions (`ai_*` vs `path_*`), no duplicated algorithms.
+
+### §52.1 — Coordinate convention
+
+`x`, `y` in **cell floats** (one world unit per tile, fractional
+within-cell offsets). Matches `stbphys.FPSBody` and
+`stbraycast.cast_ray` so the three cartridges compose without
+scale shifts.
+
+### §52.2 — Line of sight
+
+```c
+ai_los_clear(tm, x0: float, y0: float, x1: float, y1: float) -> word;
+```
+
+Walks a straight line from `(x0, y0)` to `(x1, y1)` via DDA at
+`_AI_LOS_STEP = 0.1` cells. Returns 1 if every interior cell is
+non-solid, 0 if any solid cell blocks. The endpoints themselves
+are NOT tested — callers know both ends are walkable and only
+care about the gap.
+
+Step length 0.1 is plenty for Wolf3D-tier maps (worst-case 16
+cells diagonal = 160 steps). Halve the constant if a larger map
+shows perforation artifacts.
+
+### §52.3 — Steering
+
+```c
+ai_dist(x0: float, y0: float, x1: float, y1: float) -> float;
+void  ai_seek(ex: float, ey: float, tx: float, ty: float,
+              speed: float, out);                  // out is Vec2*
+```
+
+`ai_dist` is the obvious Euclidean distance for range checks
+(`if (ai_dist(ex, ey, px, py) < ATTACK_RANGE)`). `ai_seek` writes
+a unit-vector × speed into the caller-owned `Vec2` — zero-distance
+input produces zero output so the caller can detect "already
+arrived" without sentinels.
+
+Why a Vec2 out-pointer instead of returning the velocity: B++ doesn't
+return struct-by-value cleanly. The caller pre-allocates one Vec2
+via `vec2_new` and reuses it across every AI step — zero allocator
+pressure per frame.
+
+The angle-to-target helper (`ai_angle_to` using `atan2`) is
+deliberately deferred. `atan2_f` doesn't exist in `bpp_math.bsm`
+yet, and Session 2 AI only needs the seek-vector direction.
+Promote both together when a consumer needs the explicit angle.
+
+### §52.4 — Move with tilemap collision
+
+```c
+void ai_step_collide(tm, x: float, y: float,
+                     vx: float, vy: float, radius: float,
+                     dt: float, out);            // out is Vec2*
+```
+
+Per-axis collision (X first, then Y using the possibly-updated X).
+Diagonal moves into outside corners slide along the unblocked
+axis — same scheme as `stbphys.fps_walk` uses for the player.
+
+`radius` is the body's half-extent in cells. Typical AI body
+size: 0.25-0.35 (smaller than half a cell so the body slips past
+narrow doorways).
+
+### §52.5 — What stays in the calling game
+
+- State machines (per-kind FSM lives in the game's module —
+  enemy variants have wildly different state vocabularies)
+- Per-frame dispatch over an entity pool (the game owns the
+  iteration shape — flat array, stbecs, custom)
+- Combat / target acquisition logic (Wolf3D shoots, Adventure
+  dispenses dialog, RTS routes orders — too different)
+
+The two-consumer rule was satisfied by Wolf3D Phase 2 Session 2 +
+the expected Adventure / Doom-clone follow-on. Each successive
+game adds its FSM dialect on top of these primitives without
+extending the cartridge itself.
+
+### §52.6 — What this chapter does NOT cover
+
+Behaviour trees, GOAP, utility AI, flocking — none of those exist
+in stbai today. They are all candidates for separate cartridges
+when concrete consumers surface. Pathfinding (long-range route
+discovery) lives in stbpath; crowd pathing in stbflow.
+
+---
+
+## Cap 53 — Scene backgrounds + parallax (stbscene)
+
+*Depends on: stbimage, stbshader, stbgame*
+*Source: new — 2026-05-07 (GPU pipeline Phase 5)*
+*Status: SHIPPED — 2026-05-07*
+
+`stbscene.bsm` ships layered background rendering with parallax.
+A "scene" is a back-to-front stack of textured fullscreen quads;
+each layer carries its own image plus a pair of parallax factors
+that scale how much the global camera moves it.
+
+The cartridge is **opt-in**. Games that never call `init_scene_bg`
+pay nothing — no shader load, no frame-time cost, no allocations.
+The bg_layer pipeline loads lazily on the first `bg_draw_all` call.
+
+### §53.0 — The parallax illusion
+
+The classic side-scroller depth effect (sky drifts, hills move
+slower, foreground keeps pace with the player) falls out of three
+layers with factors roughly `0.1 / 0.4 / 1.0`:
+
+```c
+init_scene_bg();
+auto sky_img = image_load("sky.png");
+auto mid_img = image_load("hills.png");
+auto fg_img  = image_load("trees.png");
+
+auto sky = bg_layer_new(sky_img, 0.1, 0.0);   // barely moves
+auto mid = bg_layer_new(mid_img, 0.4, 0.0);   // slow drift
+auto fg  = bg_layer_new(fg_img,  1.0, 0.0);   // matches camera
+
+// each frame:
+bg_set_camera(player_x, 0.0);
+game_render_begin();
+bg_draw_all();
+render_text("hud", ...);
+game_render_end();
+```
+
+Layers draw in **registration order** — the first registered
+goes furthest back. Re-order via `bg_layer_set_z` if you need
+dynamic restacking; the first cut trusts insertion order to keep
+the API surface tiny.
+
+### §53.1 — Layer struct
+
+```c
+struct BgLayer {
+    image,
+    factor_x: float, factor_y: float,
+    visible,
+    alpha: float
+}
+```
+
+The image pointer is **borrowed** — stbscene does not take
+ownership. The caller is responsible for freeing the underlying
+Image at shutdown.
+
+### §53.2 — API
+
+```c
+void init_scene_bg();                            // idempotent
+     bg_layer_new(image, factor_x, factor_y);    // returns handle
+void bg_layer_set_visible(handle, v);
+void bg_layer_set_alpha(handle, alpha);
+void bg_set_camera(cx: float, cy: float);
+void bg_draw_all();                              // call after game_render_begin
+     bg_layer_count();
+```
+
+`bg_layer_set_visible` toggles draw-skip per layer (hidden layers
+stay in the list). Flipping a sky between day/night variants is
+two layers and a pair of `set_visible` calls.
+
+`bg_layer_set_alpha` adjusts per-layer opacity for cross-fades
+during scene transitions. The fragment shader multiplies texel
+alpha by this value — partially-transparent textures stay so at
+alpha = 1.0.
+
+### §53.3 — Naming co-existence
+
+stbscene's `bg_*` prefix is intentional. The game-state machine in
+stbgame uses `scene_register / scene_switch / scene_*` for the
+orthogonal "switch between menu / play / results" concern; the two
+namespaces coexist without collision.
+
+### §53.4 — What this chapter does NOT cover
+
+Dynamic scrolling tilemaps live in stbtile (Cap 39). Sprite
+billboards, particle systems, fog-of-war overlays are game-side
+work, not stbscene. Camera shake / cinematic transitions are also
+caller-owned — `bg_set_camera` is a single source-of-truth knob
+the caller drives.
+
+---
+
+## Cap 54 — Custom GPU pipelines (stbshader)
+
+*Depends on: bpp_file, platform `_stb_gpu_pipeline_*` primitives*
+*Source: new — 2026-05-07 (GPU pipeline Phase 4-7)*
+*Status: SHIPPED — 2026-05-07*
+
+`stbshader.bsm` is the **bring-your-own-shader** cartridge. While
+stbrender (Cap 47) owns the high-level "draw a thing" API (rect,
+line, sprite, text) backed by the engine's default Metal pipeline,
+stbshader owns the "build and run my own pipeline" API: load a
+`.metal` file, compile it through MTLLibrary + MTLRenderPipelineState,
+swap it in for a stretch of draws, then restore the default.
+
+Games that only paint with the built-ins (snake, rhythm) never
+import this. Games that need custom shaders (CRT effects, ray-cast
+fragment, palette quantise, scanlines) import it on top of
+stbrender.
+
+### §54.0 — Built-in sampler defaults
+
+The default Metal pipeline samples textures with these conventions:
+
+| Texture kind | Filter | Reason |
+|--------------|--------|--------|
+| RGBA atlas sprites | NEAREST | Pixel art; bilinear blurs neighbouring tiles into adjacent fragments — 1-pixel dark line around every uniform-grid tile (the Kenney case) |
+| Font-glyph alpha masks | LINEAR | Rare sub-pixel glyph kerning at non-1.0 scales |
+| Palette-indexed sprites + palette LUT | NEAREST | Filtering an integer index corrupts colour lookup |
+
+When the Linux/Vulkan or Windows/D3D backend grows a real sprite
+shader, it MUST honour the same defaults for parity.
+
+### §54.1 — Load a pipeline
+
+```c
+gpu_pipeline_load(metal_path: ptr, vert_name: ptr, frag_name: ptr) -> ptr;   // 0 on failure
+```
+
+Returns a pipeline handle or 0 on failure. The platform layer
+prints the Metal compiler error to stderr; unreadable files and
+compile failures share the 0 sentinel.
+
+Install resolution: callers pass a bare basename
+(`gpu_pipeline_load("crt.metal", "crt_vert", "crt_frag")`); the
+loader resolves against `/usr/local/lib/bpp/stb/shaders/` post-
+install, falls back to the repo path during development. Same
+pattern as stbasset's image resolver.
+
+### §54.2 — Use a pipeline
+
+```c
+void gpu_pipeline_use(handle);
+void gpu_pipeline_use_default();    // restore engine pipeline
+void gpu_uniform_set_frag(slot, buf, size);
+void gpu_uniform_set_vert(slot, buf, size);
+void gpu_texture_bind(handle, slot);
+void gpu_draw_full();               // fullscreen-triangle pass
+```
+
+The default pipeline stays available across pipeline swaps — call
+`gpu_pipeline_use_default()` to restore it after a stretch of
+custom draws so subsequent `render_*` calls keep working without
+manual encoder reset.
+
+### §54.3 — Samplers
+
+```c
+gpu_sampler_nearest() -> ptr;
+gpu_sampler_linear()  -> ptr;
+```
+
+Return handles to the two built-in sampler states. The default
+pipeline already routes the right one per draw kind; custom
+pipelines bind whichever fits the source texture.
+
+### §54.4 — Offscreen render targets
+
+```c
+gpu_target_create(w: word, h: word) -> ptr;
+void gpu_target_use(handle);
+void gpu_target_use_default();
+void gpu_present_target(handle);
+```
+
+Render-to-texture for post-process effects, mini-maps, mirror
+surfaces. Switch targets via `gpu_target_use`; restore the screen
+target via `gpu_target_use_default`. `gpu_present_target` blits
+the captured target back to the window with letterbox respect.
+
+### §54.5 — Backend portability
+
+The functions in this file dispatch into the platform layer's
+`_stb_gpu_pipeline_*` primitives. Full Metal implementations live
+under `src/backend/os/macos/`. The Linux ports today are
+**no-op stubs** with cross-OS contract comments (real Vulkan / DX12
+/ WebGPU backends are deferred per `gpu_pipeline_roadmap.md`'s
+cross-platform decision). Game code linked against this cartridge
+compiles on every supported OS — only execution differs until the
+parity sidequests land.
+
+### §54.6 — What this chapter does NOT cover
+
+Writing actual MSL shaders, the post-process effect chain (that
+is stbfx, Cap 55), compute shaders, MTLBuffer management, async
+texture upload — all out of scope. See
+`docs/gpu_pipeline_roadmap.md` for the full roadmap.
+
+---
+
+## Cap 55 — Post-process effect chain (stbfx)
+
+*Depends on: stbshader, stbrender, stbgame, bpp_json (for effect manifests)*
+*Source: new — 2026-05-09 / 2026-05-10 (fxlab arc)*
+*Status: SHIPPED — 2026-05-10*
+
+`stbfx.bsm` stacks one or more fragment-shader passes between the
+game's offscreen render and the final window blit. Each effect is a
+pipeline + an optional uniform buffer; the chain ping-pongs through
+two scratch targets so **any number of effects can be applied in
+sequence without per-frame allocation**.
+
+### §55.0 — Render flow
+
+```c
+game_render_begin();
+// ... user draws into the virtual canvas ...
+
+fx_chain_begin();           // commit offscreen pass; src = game target
+fx_apply(crt);              // game target -> scratch_a
+fx_apply(scanlines);        // scratch_a -> scratch_b
+fx_apply(chromatic);        // scratch_b -> scratch_a
+fx_present();               // blit result to window with letterbox;
+                            // closes window pass (replaces game_render_end)
+```
+
+Without effects, the existing `game_render_end` path is the
+simpler choice — `fx_chain_begin` / `fx_present` is **mutually
+exclusive** with it. Do not call both for the same frame.
+
+### §55.1 — Register an effect
+
+```c
+fx_register(metal_path: ptr, vert_name: ptr, frag_name: ptr, uniform_size) -> ptr;
+fx_uniform(handle) -> ptr;     // pointer to the effect's uniform buffer
+```
+
+Loads the pipeline, allocates an `uniform_size`-byte uniform
+buffer owned by the effect. `fx_uniform(handle)` returns the
+pointer so the caller can poke values each frame before
+`fx_apply`. The same as stbshader's `gpu_uniform_set_frag` but
+self-owned per effect.
+
+### §55.2 — JSON manifest loading (live tuning)
+
+```c
+effect_from_json(path: ptr) -> ptr;                // returns handle
+void effect_set(handle, name: ptr, val: float);
+```
+
+The fxlab editor (`tools/fxlab/`) ships a GUI that drags sliders
+over named parameters and writes back to a `.json` manifest. The
+game side calls `effect_from_json` once; the manifest declares
+named params with their byte offsets into the uniform buffer.
+`effect_set` mutates a single named param without rebuilding the
+pipeline.
+
+`file_watch_register` hot-reloads the manifest each tick — drag a
+slider in fxlab, the running game's effect updates in ~30 ms. See
+the 2026-05-10 fxlab journal entry for the full feedback-loop
+architecture.
+
+```c
+struct FxParam {
+    name,       // null-terminated, str_dup'd
+    offset      // byte offset in uniform buffer (typically i*4 for one f32 per slot)
+}
+```
+
+Convention: `params[i]` in the manifest maps to byte offset `i*4`
+in the uniform buffer (one 32-bit float per slot), matching the
+`.metal` struct field order.
+
+### §55.3 — Chain dispatch
+
+```c
+void fx_chain_begin();
+void fx_apply(handle);
+void fx_present();
+```
+
+`fx_chain_begin` is the "commit" point — it ends the game's
+offscreen render pass and sets up scratch_a / scratch_b targets.
+Each `fx_apply` ping-pongs the source/destination; the chain
+preserves the last-written scratch as the visible result.
+`fx_present` does the final letterboxed blit to the window and
+closes the present pass.
+
+### §55.4 — Built-in effects
+
+The repo ships four reference effects in
+`stb/effects/`:
+
+| Effect | Effect type | Parameters |
+|--------|-------------|------------|
+| `crt.json` / `crt.metal` | CRT phosphor + curvature | `curvature`, `vignette`, `scanline` |
+| `scanlines.json` / `.metal` | Plain scanlines | `intensity`, `frequency` |
+| `chromatic.json` / `.metal` | RGB channel split | `offset`, `falloff` |
+| `pixelate.json` / `.metal` | Block pixelation | `block_size` |
+
+Games that want their own effects ship a `.metal` + `.json` pair
+under `stb/effects/` (install) or `assets/effects/` (per-game).
+The lazy resolver checks both.
+
+### §55.5 — What this chapter does NOT cover
+
+The fxlab GUI editor (`tools/fxlab/`) is documented separately —
+its design notes live in the 2026-05-09 / 2026-05-10 / 2026-05-11
+journal entries. Compute shaders, multi-pass effects with
+intermediate framebuffers, particle systems — all out of scope
+for stbfx today.
+
+---
+
+## Cap 56 — Sampling profiler + HUD (stbprofile)
+
+*Depends on: stbrender (HUD draw), bpp_runtime (auto-injected `profile_*` primitives)*
+*Source: new — 2026-05-07 / 2026-05-08 (Phase 6.3 + v2)*
+*Status: SHIPPED — 2026-05-08 (v2 scoped-cleanup epilogues)*
+
+`stbprofile.bsm` wraps the auto-injected `bpp_runtime` profiler
+primitives (`profile_start` / `profile_stop` / `profile_dump`)
+with the UX every modern game profiler ships:
+
+- Hotkey toggle starts / stops sampling.
+- While sampling, a `REC •` badge with elapsed seconds renders on
+  the HUD.
+- On stop, top-N hottest functions dump to stderr.
+
+Comparable to Tracy, Optick, Unreal `stat`, Unity profiler — but
+single-state, single-session, oriented at the local dev loop.
+
+### §56.0 — What stbprofile owns vs game-side
+
+**stbprofile owns**:
+- The active flag + elapsed-time tracking
+- The HUD geometry (`REC •` text, blinking dot, mm:ss timer)
+- The dump format
+
+**The calling game owns**:
+- The hotkey binding (call `action_define` with whatever key)
+- The HUD position (x, y, size, colour passed to draw)
+- WHEN to call draw (typically once per render phase)
+
+Single-state — meant for the local dev profiling loop, not
+concurrent profile sessions.
+
+### §56.1 — Sampling profiler (SIGPROF-based)
+
+```c
+void profile_hud_toggle();              // start/stop hotkey hook
+void profile_hud_set_rate(rate_hz, depth);
+void profile_hud_cycle_thread();        // cycle visible thread on multi-core
+void profile_hud_draw(x, y, sz, color);
+void profile_hud_draw_fps_only(x, y, sz, color);
+```
+
+The sampling profiler uses SIGPROF at `_PROFILE_DEFAULT_RATE = 1000`
+Hz with `_PROFILE_DEFAULT_DEPTH = 8` captured stack frames per
+sample. On stop, the top `_PROFILE_TOP_N = 20` functions print to
+stderr with relative %.
+
+Multi-thread aware (job workers + audio callbacks). The HUD shows
+one thread at a time; `profile_hud_cycle_thread` cycles through
+worker indices.
+
+### §56.2 — Scoped zones (`@profile` zones)
+
+The `@profile("name")` annotation in user code (Cap 25 of tonify)
+lowers to prologue + epilogue calls into `_prof_save_enter` /
+`_prof_save_drain` synthesised by the compiler. The runtime store
+lives here:
+
+```c
+void profile_zones_reset();
+void profile_zones_hud_draw(x, y, sz, color);
+```
+
+`profile_zones_hud_draw` renders the FLAT aggregate (each zone's
+total time + sample count) overlaid on the HUD. Nested zones in
+v1 aggregate flat (one zone's time bubbles up to its enclosing
+zone); v2 (2026-05-08) ships scoped-cleanup epilogues so
+early-return + panic paths still drain the save-stack.
+
+### §56.3 — GPU timing (Tier 3)
+
+```c
+void  profile_gpu_enable();
+void  profile_gpu_disable();
+      profile_gpu_us();           // microseconds, last frame
+      profile_gpu_ms();           // milliseconds, last frame
+```
+
+Captures GPU encoder duration via the platform layer's
+`_stb_gpu_timing_*` primitives. Disabled by default; enable only
+when chasing GPU bottlenecks (the timer queries add a small
+fixed cost to every frame).
+
+### §56.4 — Usage pattern
+
+```c
+load "stbprofile.bsm";
+
+// init:
+init_profile();
+action_define("profile_toggle", KEY_P, 0);
+
+// solo:
+if (action_pressed("profile_toggle")) { profile_hud_toggle(); }
+
+// render:
+profile_hud_draw(SCREEN_W - 80, 8, 1, 0xFFFF3333);
+```
+
+### §56.5 — Shutdown discipline
+
+`maestro_run` calls `profile_stop` before `job_shutdown` so the
+SIGPROF timer is disarmed before worker teardown. Without this,
+the profiler signal can fire mid-`pthread_join` and walk worker
+state being deallocated. The race was caught + fixed during the
+GPU-arc closeout (journal 2026-05-07 "SIGPROF race").
+
+### §56.6 — What this chapter does NOT cover
+
+The auto-injected `bpp_runtime` primitives (`profile_start` /
+`_stop` / `_dump` / `_capture`) are the foundation; stbprofile is
+the UX shell. Flamegraph generation, Tracy-format export, remote
+profile session — all candidates for future work but unshipped.
+For the meta-design lesson behind keeping v1 simple (no flame-
+graph, no symbol-export, no parallel sessions) see Rule 28 in
+tonify_checklist.md.
+
+---
+
 # Appendices
 
 ## Appendix A — Compiler Flags Reference
 
-*Source: legacy_docs/how_to_dev_b++.md Part 8*
+*Source: legacy_docs/manual/how_to_dev_b++.md Part 8*
 *Status: COMPLETE — 2026-04-27*
 
 | Flag | Effect |
@@ -2889,6 +4153,23 @@ main() {
 ```
 
 Use xfail tests to lock in rejection behavior: they catch regressions where a previously-invalid program starts compiling silently.
+
+---
+
+## Appendix C — Sweep history
+
+*Status: rolling log*
+
+| Date | Action | Chapters affected |
+|------|--------|-------------------|
+| 2026-04-22 | Initial Part VI extraction from `how_to_dev_b++.md` | Caps 26-47 |
+| 2026-05-12 | stbmidi added; W031 / W032 / E246 / E260 / E262 diagnostic rows added; Cap 28 lattice text replaced with `@safe` model per Rule 4 collapse | Cap 28 + Cap 48 |
+| 2026-05-12 | Eight cartridges promoted from "undocumented" to dedicated chapters: stbflow, stbraycast, stbtexture, stbai, stbscene, stbshader, stbfx, stbprofile. Reading source files + journal entries for grounding. | Caps 49-56 |
+
+When a new stb cartridge ships, add a row here describing the
+sweep that wrote its chapter — same pattern Tonify uses for its
+own rule additions. Skipping the row is the bug class Rule 28's
+quarterly audit is designed to catch.
 
 ---
 

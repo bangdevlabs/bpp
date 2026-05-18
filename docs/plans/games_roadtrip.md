@@ -432,7 +432,7 @@ modules that every subsequent game inherits.
 gameplay through **bangscript**, B++'s embedded adventure game DSL.
 This is the game the project was born to make.
 
-See `docs/bangscript_plan.md` for the full bangscript specification.
+See `docs/plans/bangscript_plan.md` for the full bangscript specification.
 
 An adventure scene in the style of Indiana Jones: Fate of Atlantis,
 Monkey Island 2, and Gabriel Knight. Point-and-click verb system,

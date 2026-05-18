@@ -47,7 +47,7 @@ straight to PR.
 4. **Run the full test suite** (`sh tests/run_all.sh`). All
    tests must pass before the PR is reviewed.
 5. **Bootstrap the compiler** if you touched `src/` — see the
-   workflow in `docs/how_to_dev_b++.md`. The two rebuild
+   workflow in `docs/manual/how_to_dev_b++.md`. The two rebuild
    shasums must match.
 6. Commit with a clear message. First line describes the
    change; body explains why if non-obvious.
@@ -56,7 +56,7 @@ straight to PR.
 ## Coding conventions
 
 All new code follows the tonification rules in
-`docs/how_to_dev_b++.md`. Briefly:
+`docs/manual/how_to_dev_b++.md`. Briefly:
 
 - **Comments in English**, complete sentences, user-manual
   style. Explain **why**, not just **what**.
@@ -69,7 +69,7 @@ All new code follows the tonification rules in
   full list in the language reference.
 - **Type hints are opt-in performance tuning**, not default.
   Use `: base` for pure functions, `: gpu` for GPU-only
-  paths, etc. See `docs/how_to_dev_b++.md` Part 2, Rule 4.
+  paths, etc. See `docs/manual/how_to_dev_b++.md` Part 2, Rule 4.
 
 ## Tests
 
@@ -83,7 +83,7 @@ All new code follows the tonification rules in
 
 B++ targets macOS (native) and Linux (X11 or terminal
 fallback). Both must compile clean. Linux testing runs
-through a Docker flow — see `docs/how_to_dev_b++.md` Part 7.
+through a Docker flow — see `docs/manual/how_to_dev_b++.md` Part 7.
 If you only have one platform available, open the PR with a
 note; we'll test the other before merge.
 

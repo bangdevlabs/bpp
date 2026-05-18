@@ -191,7 +191,7 @@ AAPCS64 calling convention) constrain everything above.
 bootstrap.c            — the only C file in the system
 install.sh             — install + smoke test
 tests/run_all.sh       — suite verification
-docs/bootstrap_manual.md — this file
+docs/manual/bootstrap_manual.md — this file
 ```
 
 `bootstrap.c` is the seed: a C compiler that compiles `bpp.bpp` once
@@ -445,7 +445,7 @@ n = node_ptr;
 n.a           // correct: compiler emits the real packed offset
 ```
 
-See `docs/tonify_checklist.md` Rule 8 for the full rule. Manual
+See `docs/manual/tonify_checklist.md` Rule 8 for the full rule. Manual
 records (RECORD_SZ, tokens) are unsliced by design and may still use
 named offset constants — only sliced structs need typed access.
 
@@ -634,7 +634,7 @@ docker run --rm \
   /tmp/snake_linux
 ```
 
-The window appears in XQuartz on the macOS host. This works for any game using `draw_*` (CPU framebuffer). GPU games (`render_*`) require Vulkan, which is not yet implemented (see `docs/todo.md` P0 / P4).
+The window appears in XQuartz on the macOS host. This works for any game using `draw_*` (CPU framebuffer). GPU games (`render_*`) require Vulkan, which is not yet implemented (see `docs/plans/todo.md` P0 / P4).
 
 **How to tell if X11 actually connected.** The platform layer falls back to ANSI rendering whenever the X server is unreachable, and the fallback also exits cleanly with `rc=0` — a successful run on its own does not prove X11 is active. The signal is the binary's stdout: if it floods the terminal with ANSI escape codes (`[?25l[2J[H[38;5;...m▀▀▀...`), the X11 path failed and the renderer is drawing block characters into the terminal. If stdout is empty and a window appears in XQuartz, X11 is wired correctly.
 
@@ -646,7 +646,7 @@ The C emitter (`--c`) translates B++ to C99 source code on stdout. It is the uni
 
 - **`extrn` declarations colliding with function definitions.** B++'s native backend resolves cross-module function calls through the function table, so a leftover `extrn fn_name;` is harmless on the native path. The C emitter, however, emits the extrn as a C `extern long long fn_name;` — and C has a single namespace where a symbol cannot be both a variable and a function. The first sweep through `tests/run_all_c.sh` produced cascades of `error: redefinition of 'fn_name' as different kind of symbol` for primitives like `a64_emit_mov`, `x64_emit_load_var`, `layer_count`, and `modulab_prefs_zoom_get`. The fix is in `bpp_validate.bsm` (E223) plus the source-side cleanup of stale extrn lines.
 
-- **`var T` storage location is implicit in the native path, explicit in C.** A local declared as `var s: Pt` allocates space for the struct on the stack in the native backend, so `&s` becomes a single `add x0, fp, #-offset` and `s.field` reads/writes via the same FP-relative pointer. The C emitter has no such "address of a value-typed local" — it lowers `var s: Pt` to `long long s[N]` (an array large enough to cover `sizeof(Pt)`), so writing `s` already produces the array's address as it decays, and `&s` would have to special-case the cast. Both paths read the field at the right place because the `T_MEMLD` field-hint covers the load width; the divergence shows up only when source code takes the address of the local and passes it around. **For now, the rule of thumb when writing code that must compile through `--c`: prefer heap allocation (`auto p: Pt; p = malloc(sizeof_struct);`) over `var p: Pt` when you intend to pass `p` (or `&p`) to another function.** The two backends agree on the heap pattern. The Wolf3D player FPSBody uses `fps_body()`, the audio plugin state pattern should follow suit. If a future workload needs `var T` semantics in the C path, the path forward is documenting `var T` as a single uniform allocation strategy in both backends — likely "always heap-backed" — rather than papering over the C side with more special-cases. Tracked in `docs/todo.md` under "C-emitter `var T` parity".
+- **`var T` storage location is implicit in the native path, explicit in C.** A local declared as `var s: Pt` allocates space for the struct on the stack in the native backend, so `&s` becomes a single `add x0, fp, #-offset` and `s.field` reads/writes via the same FP-relative pointer. The C emitter has no such "address of a value-typed local" — it lowers `var s: Pt` to `long long s[N]` (an array large enough to cover `sizeof(Pt)`), so writing `s` already produces the array's address as it decays, and `&s` would have to special-case the cast. Both paths read the field at the right place because the `T_MEMLD` field-hint covers the load width; the divergence shows up only when source code takes the address of the local and passes it around. **For now, the rule of thumb when writing code that must compile through `--c`: prefer heap allocation (`auto p: Pt; p = malloc(sizeof_struct);`) over `var p: Pt` when you intend to pass `p` (or `&p`) to another function.** The two backends agree on the heap pattern. The Wolf3D player FPSBody uses `fps_body()`, the audio plugin state pattern should follow suit. If a future workload needs `var T` semantics in the C path, the path forward is documenting `var T` as a single uniform allocation strategy in both backends — likely "always heap-backed" — rather than papering over the C side with more special-cases. Tracked in `docs/plans/todo.md` under "C-emitter `var T` parity".
 
 The recommended pattern for portable applications is to write the game using `drv_raylib.bsm` (or `drv_sdl.bsm`) instead of `stbgame.bsm`, so the generated C calls regular C functions and avoids the Objective-C calling-convention pitfalls of dlopen + objc_msgSend.
 
@@ -1031,7 +1031,7 @@ Each layer has a clear responsibility:
 
 When Linux-ARM64 or Intel-macOS arrives, a new `os/<os>/` or
 `target/<chip>_<os>/` folder drops in without disturbing existing
-backends. See `docs/todo.md` for the timeline.
+backends. See `docs/plans/todo.md` for the timeline.
 
 ## Portability Tiers — Where Stdlib Features Live
 

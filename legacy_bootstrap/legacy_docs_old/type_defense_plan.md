@@ -136,7 +136,7 @@ sites.
 |---|---|---|
 | `src/bpp_validate.bsm` | E240, E241, E243, E244 logic | ~60 |
 | `src/bpp_parser.bsm` | E242 shift range | ~10 |
-| `docs/warning_error_log.md` | Document E240-E244 | ~30 |
+| `docs/manual/warning_error_log.md` | Document E240-E244 | ~30 |
 | `tests/test_diag_types.bpp` | Coverage for all 5 | ~80 |
 
 ### Bootstrap gate (Level 1)
@@ -151,7 +151,7 @@ in stb/ or src/, investigate before shipping.
 
 ### Rule 13 — Public API parameters use explicit hints when non-word
 
-Add to `docs/tonify_checklist.md`:
+Add to `docs/manual/tonify_checklist.md`:
 
 > Functions declared without `static` form the module's public API.
 > Parameters that expect non-word types (float, byte, struct pointer,
@@ -220,8 +220,8 @@ until debugger lands.
 | File | Change | Lines |
 |---|---|---|
 | `src/bpp_validate.bsm` | W025 logic | ~30 |
-| `docs/tonify_checklist.md` | Rule 13 section | ~30 |
-| `docs/warning_error_log.md` | Document W025 | ~10 |
+| `docs/manual/tonify_checklist.md` | Rule 13 section | ~30 |
+| `docs/manual/warning_error_log.md` | Document W025 | ~10 |
 | `tests/test_rule13.bpp` | Test coverage | ~40 |
 
 ### Bootstrap gate (Level 2)
@@ -308,7 +308,7 @@ Effect is unknown at compile time. Two options:
 | `stb/stbaudio.bsm` | Annotate audio callback `: realtime` | ~5 |
 | `stb/stbgame.bsm` | Annotate GPU funcs `: gpu` | ~10 |
 | `docs/bpp_language_reference.md` | New "Effect annotations" section | ~80 |
-| `docs/tonify_checklist.md` | Extend Rule 4 | ~20 |
+| `docs/manual/tonify_checklist.md` | Extend Rule 4 | ~20 |
 | `tests/test_effects.bpp` | Comprehensive effect test | ~100 |
 
 ### Bootstrap gate (Level 4) — three sub-steps

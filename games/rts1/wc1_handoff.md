@@ -505,7 +505,7 @@ intuition.
 **Pre-existing W032 sweep is parallel work, not a blocker.** The
 ~57 W032 hits in older stb cartridges (`stbimage`, `stbforge`,
 `stbasset`, `stbsound` path-receiving sites) are tracked in
-`docs/todo.md` and can be cleaned up in any spare half-hour
+`docs/plans/todo.md` and can be cleaned up in any spare half-hour
 between sessions — they don't gate the wc1 arc. New code in
 `wc1_*.bsm` written under Rule 13 emits zero W032 from day one.
 
@@ -514,7 +514,7 @@ between sessions — they don't gate the wc1 arc. New code in
 Mandatory pre-flight per Tonify Rule 14 / Rule 25 / Rule 30 /
 Rule 13 / Rule 27 (leaves-first ordering) / Rule 17 (`put`
 smart dispatch) / Rule 28 (killer-use-case gate). The checklist
-is the pocket manual. Open `docs/tonify_checklist.md` alongside
+is the pocket manual. Open `docs/manual/tonify_checklist.md` alongside
 the editor; do not write a function without referencing it.
 
 Specific rules that bite hardest in game code:
@@ -562,7 +562,7 @@ path — audio + render do their own float math internally.
 ### Save state
 
 Out of scope for v1. Each session ships gameplay; save/load is a
-post-1.0 sidequest tracked in `docs/todo.md`.
+post-1.0 sidequest tracked in `docs/plans/todo.md`.
 
 ### Unit caps
 
@@ -614,7 +614,7 @@ Standing gates per Tonify discipline:
   close if any). **Pre-existing W032 noise from older stb
   cartridges (`stbimage`, `stbforge`, `stbasset`, `stbsound`
   call sites that pre-date the `: ptr` annotation, ~57 sites)
-  is tracked separately in `docs/todo.md` and is OK to ignore
+  is tracked separately in `docs/plans/todo.md` and is OK to ignore
   during the wc1 arc.** New `wc1_*.bsm` code must emit ZERO
   W032 by annotating every path-receiving param `: ptr`.
 - Commit before the next session starts.
@@ -642,7 +642,7 @@ symptom surfaced a deeper layout-architecture question worth
 addressing before adding more consumers).
 
 **Next action when resuming:**
-1. Read `docs/sidequest_stbui_v2_clay.md` (being written
+1. Read `docs/plans/sidequest_stbui_v2_clay.md` (being written
    2026-05-17) and decide go/no-go on the layout migration.
 2. If go: execute the stbui v2 arc first (~3-4 sessions). S6
    benefits because flow-field debug overlay + selection UI

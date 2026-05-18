@@ -192,7 +192,7 @@ auto lanes: double;         // 128-bit SIMD vector (Phase B4)
 **Important — Rule 8:** When a pointer targets a sliced struct, always
 use typed access (`auto p: Struct; p.field`). Raw offset `*(ptr + N)`
 does NOT respect the packed layout and will read wrong memory. See
-`docs/tonify_checklist.md` Rule 8.
+`docs/manual/tonify_checklist.md` Rule 8.
 
 ### Storage annotation (after top-level variable name)
 
@@ -354,7 +354,7 @@ as `__m128`, which is an invasive change to the emitter. Programs
 that use SIMD and go through the C backend will fail at the
 extern-lookup stage, which is the correct signal. Native `bpp`
 (ARM64 / x86_64) is the supported SIMD target; C-backend support
-is tracked in `docs/todo.md`.
+is tracked in `docs/plans/todo.md`.
 
 ---
 

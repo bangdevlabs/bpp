@@ -6,7 +6,7 @@ type, 1 level, edited visually inside Bang 9. Authentic features
 walls, voice acting) move to Phase 3+.
 
 Entry file: `games/fps/fps_wolf3d.bpp`. Map: `games/fps/assets/levels/level1.json`.
-Tooling: Bang 9 (Levels tab + Effects tab) — see `docs/bang9_space_manual.md`.
+Tooling: Bang 9 (Levels tab + Effects tab) — see `docs/manual/bang9_space_manual.md`.
 
 ---
 
@@ -319,14 +319,14 @@ tools/
 
 ## Reference materials
 
-- `docs/bang9_space_manual.md` — engine/IDE premise + embed
+- `docs/manual/bang9_space_manual.md` — engine/IDE premise + embed
   contract + project layout. Read first when joining the project.
 - `docs/journal.md` — chronological context. Most relevant entries:
   `2026-05-04` (Phase 1 close), `2026-05-10` (fxlab arc),
   `2026-05-11` (Wolf3D Phase 2 Session 0).
-- `docs/how_to_dev_b++.md` "2.5D engine + textures + profiler" —
+- `docs/manual/how_to_dev_b++.md` "2.5D engine + textures + profiler" —
   cartridge tour for the engine subsystems Wolf3D leans on.
-- `docs/tonify_checklist.md` — apply on every change (storage
+- `docs/manual/tonify_checklist.md` — apply on every change (storage
   class, visibility, return type, phase annotation, slice types,
   comments-as-user-manual).
 - Lode Vandevenne raycasting tutorial: lodev.org/cgtutor/raycasting

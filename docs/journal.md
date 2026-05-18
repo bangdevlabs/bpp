@@ -1292,7 +1292,7 @@ Established the three-pillar vision for B++:
 2. **SOUND** — `stbdsp.bsm` (DSP primitives) + `stbplugin.bsm` (CLAP audio plugins, native + FFI driver like SDL)
 3. **GAMES** — stbgame + stbtile + stbphys + stbpath
 
-Asset pipeline: `.bspr` → `.btm` → `.blvl` → game binary. Full plan in `docs/todo.md`.
+Asset pipeline: `.bspr` → `.btm` → `.blvl` → game binary. Full plan in `docs/plans/todo.md`.
 
 Key blockers identified: mouse events not polled (B0), `mouse_pressed()` undefined (B1), `file_write_all()` missing (B2), SDL key gaps (B3).
 
@@ -2179,7 +2179,7 @@ Triple bootstrap verified stable after each codegen change. Two rounds: ARM64 sy
 - `src/bug_observe_macos.bsm` — entitlements, mach_vm_protect writes, lookup_pc fix, disk patching (WIP)
 - `bug.entitlements` — new: debug entitlements for task_for_pid
 - `README.md` — updated features, stb table, compiler flags
-- `docs/todo.md` — updated status and done list
+- `docs/plans/todo.md` — updated status and done list
 
 ## 2026-04-02b — Bug Debugger v2: debugserver Backend + Full Debug Features
 
@@ -2304,7 +2304,7 @@ gen2==gen3 verified after: sys_socket/sys_connect/sys_usleep builtins, BRK remov
 - `src/bpp_diag.bsm` — negative line number guard (show ? instead)
 - `src/bpp_import.bsm` — moved auto nbuf to function top
 - `stb/stbarray.bsm` — arr_truncate
-- `docs/bootstrap_manual.md` — corrected: auto inside blocks is supported
+- `docs/manual/bootstrap_manual.md` — corrected: auto inside blocks is supported
 - `examples/snake_full.bpp` — new: snake with all game infrastructure
 
 ## 2026-04-03 — GPU Text + TrueType + realloc + Module Reorganization
@@ -2474,7 +2474,7 @@ Key lesson: "it worked before" is a lie when changing backends. Implicit assumpt
 - `src/bug_observe_linux.bsm` — `&` cleanup
 - `games/platformer/platform_noasset.bpp` — NEW: platformer with stbtile+stbphys
 - `games/platformer/platform_assets.bpp` — NEW: platformer with Kenney assets
-- `docs/todo.md` — updated roadmap, X11 as priority
+- `docs/plans/todo.md` — updated roadmap, X11 as priority
 - `docs/x11_plan_review.md` — NEW: review notes for X11 agent
 
 ---
@@ -2617,7 +2617,7 @@ Mixing them (`stbgame.bsm` through `--c`) is the path that hits the objc_msgSend
 - `src/bpp_validate.bsm` — `validate_module(mi)` added, E052 removed, builtin recognition extended
 - `src/bpp.bpp` — `run_validate()` now runs after module 0 in incremental mode
 - `src/bpp_typeck.bsm` — DELETED (507-line orphan)
-- `docs/todo.md` — version 0.21, ELF dynamic linking promoted to P0, P4 Vulkan revised
+- `docs/plans/todo.md` — version 0.21, ELF dynamic linking promoted to P0, P4 Vulkan revised
 
 ---
 
@@ -2696,7 +2696,7 @@ Four files moved out of confusing locations:
 
 `find_file()` in `bpp_import.bsm` extended with four new search paths: `src/aarch64/`, `src/x86_64/`, `/usr/local/lib/bpp/aarch64/`, `/usr/local/lib/bpp/x86_64/`. `install.sh` updated to copy from `src/aarch64/*.bsm` and `src/x86_64/*.bsm` into the new install directories.
 
-**Architectural caveat**: chip and OS aren't the same thing. macOS is OS, aarch64 is chip. They happen to be 1:1 paired in B++ today (Apple Silicon = aarch64+macOS, B++ has no Linux ARM yet) but will diverge when a new combination lands. Each chip folder now has a `README.md` explaining the current chip+OS coupling and documenting the future `arch/` + `os/` + `targets/` split (P3 in `docs/todo.md`).
+**Architectural caveat**: chip and OS aren't the same thing. macOS is OS, aarch64 is chip. They happen to be 1:1 paired in B++ today (Apple Silicon = aarch64+macOS, B++ has no Linux ARM yet) but will diverge when a new combination lands. Each chip folder now has a `README.md` explaining the current chip+OS coupling and documenting the future `arch/` + `os/` + `targets/` split (P3 in `docs/plans/todo.md`).
 
 The codegen files (`a64_codegen.bsm`, `x64_codegen.bsm`) were ALREADY chip+OS bundles — the encoder logic is chip-pure but the binary writer (Mach-O for macOS, ELF for Linux) and syscall numbers are OS-specific. So the platform layer joining the codegen in the chip folder reflects reality: each chip folder is a complete target backend.
 
@@ -2763,7 +2763,7 @@ All 19 deleted (one file kept and rewritten: `tests/test_io.bpp` is now a clean 
 - `tests/test_path.bpp` — NEW: 7 A* scenarios
 - `tests/test_io.bpp` — rewritten for current stbio API
 - `tests/test_io2.bpp`, `test_io4.bpp`, `test_io6.bpp`, `test_io7.bpp`, `test_io8.bpp`, `test_io_simple.bpp`, `test_q.bpp`, `test_stbio_q.bpp`, `test_types.bpp`, `test_init2.bpp`, `test_import.bpp`, `test_enc_arm64.bpp`, `test_getdents.bpp`, `test_debug_bin.bpp`, `test_native_debug2.bpp`, `test_native_debug3.bpp`, `test_native_debug4.bpp`, `test_stbdraw.bpp`, `test_linux_exit.bpp` — DELETED (legacy drift)
-- `docs/todo.md` — Done section reorganized by category, P0 stbaudio + host-aware compiler, P2 stbpath/stbhash done, P3 target architecture refactor
+- `docs/plans/todo.md` — Done section reorganized by category, P0 stbaudio + host-aware compiler, P2 stbpath/stbhash done, P3 target architecture refactor
 
 ---
 
@@ -3087,8 +3087,8 @@ A few things came up in design discussion but were explicitly deferred:
 
 **Documentation**:
 - `docs/maestro_plan.md` — NEW, ~1000 lines
-- `docs/games_roadtrip.md` — maestro phase notes
-- `docs/todo.md` — 0.22 cycle done section, P0 reordered
+- `docs/plans/games_roadtrip.md` — maestro phase notes
+- `docs/plans/todo.md` — 0.22 cycle done section, P0 reordered
 - `README.md` — typo fixes
 
 **Build infrastructure**:
@@ -3137,7 +3137,7 @@ First bug: auto-injected modules weren't recording their `dep_from` / `dep_to` e
 
 Second bug: `bo_read_export` wasn't populating `fn_static[]`, `fn_void[]`, `fn_phase_hint[]` for cached functions. The arrays ran shorter than `funcs[]`, so `arr_get(fn_static, i)` for a cached function read garbage. "Is static" flags were false-positive on cached functions across module boundaries. Fix: default to 0 when reading cached exports and populate all three arrays to match `funcs[]` length.
 
-Tonify infrastructure: `docs/tonify_checklist.md` added as the 7-rule (at the time) expert checklist for sweeping `.bsm` and `.bpp` files. Rules cover storage classes, visibility, return types, phase annotations, control flow, slice types, and comment style. The key learned rule: never mark `: base` on a function that calls a builtin (`malloc`, `putchar`, `peek`, `sys_*`, etc.) — the classifier treats all builtins as impure, and W013 will catch the mistake. Pure pointer-arithmetic readers (`arr_get`, `arr_len`, `unpack_s`) are the only safe candidates.
+Tonify infrastructure: `docs/manual/tonify_checklist.md` added as the 7-rule (at the time) expert checklist for sweeping `.bsm` and `.bpp` files. Rules cover storage classes, visibility, return types, phase annotations, control flow, slice types, and comment style. The key learned rule: never mark `: base` on a function that calls a builtin (`malloc`, `putchar`, `peek`, `sys_*`, etc.) — the classifier treats all builtins as impure, and W013 will catch the mistake. Pure pointer-arithmetic readers (`arr_get`, `arr_len`, `unpack_s`) are the only safe candidates.
 
 Batch 1 tonified: `bpp_io`, `bpp_array`, `bpp_buf`, `bpp_str`. Bootstrap: `6b532917...`. Suite: 50 / 0 / 11.
 
@@ -3192,7 +3192,7 @@ Added a `_try_dir()` helper in `find_file()` that replaced ~90 lines of per-path
 
 **6. Jump tables + eval-once switch (commit `7b2b578`).** Form-1 value-dispatch switches with dense integer arms now emit a branch table on both backends: ARM64 uses `adr + add + br` into a `b arm_lbl` table; x86_64 uses `shl rax, 3 + lea + add + jmp rcx` into 8-byte slots (`jmp rel32` + 3 nops). Fallback (non-dense switches) now evaluates the switch condition ONCE and peeks it from `[sp]` per comparison — the old pattern re-emitted the condition per arm-value, turning switch-on-function-call into N function calls. C emitter upgraded to emit real C `switch` statements (previously if/else-if chain) so gcc can apply its own jump-table optimization.
 
-**7. Sliced struct access bug discovered and documented.** The root cause of a jump-table bug was a B++-ism: `*(node + 8)` did NOT read `.a` because Node's sliced layout packs fields without alignment padding. `.a` actually lives at byte offset 1 (not 8) because `ntype: byte` consumes 1 byte with no padding after it. Same bug was latent in the T_IF dead-code-elimination path since slicing landed — `*(cond_node + 0) == T_LIT` never matched because junk bytes from `.a` bled into the 8-byte read. Both call sites fixed to use typed access (`auto n: Node; n.a`). `docs/tonify_checklist.md` Rule 8 added. `feedback_sliced_struct_access.md` saved to agent memory.
+**7. Sliced struct access bug discovered and documented.** The root cause of a jump-table bug was a B++-ism: `*(node + 8)` did NOT read `.a` because Node's sliced layout packs fields without alignment padding. `.a` actually lives at byte offset 1 (not 8) because `ntype: byte` consumes 1 byte with no padding after it. Same bug was latent in the T_IF dead-code-elimination path since slicing landed — `*(cond_node + 0) == T_LIT` never matched because junk bytes from `.a` bled into the 8-byte read. Both call sites fixed to use typed access (`auto n: Node; n.a`). `docs/manual/tonify_checklist.md` Rule 8 added. `feedback_sliced_struct_access.md` saved to agent memory.
 
 **8. Mini Cooper plan approved.** End of session produced a fresh multi-session plan at `~/.claude/plans/compressed-soaring-turing.md`: native performance ladder (B0 const folding, B1 expression register allocation, B2 inline `: base` functions, B3 local RA, B4 `: double` slice + SIMD builtins) plus language gaps (A1 bitfields, A2 aligned malloc). Target: Wolfenstein 3D at 60 fps and RTS with 1000+ units on native B++ without `bpp --c | gcc -O2`. Honest speedup expectation: 30-40% of gcc -O2 in general code, 60-80% on hot paths with manual SIMD. Enough on modern hardware (Apple M4 has ~100× the compute of the 386 that shipped Wolf3D in 1992).
 
@@ -3229,7 +3229,7 @@ The decision to put this in the frontend rather than in each chip codegen — tw
 
 **Canonical tests added**: `test_bitfield`, `test_aligned_alloc`, `test_const_fold`, `test_realloc`, `test_signed_half`, `test_switch`, `test_ternary`, `test_short_circuit`. Each guards one feature, each runs on both macOS ARM64 and Linux Docker x86. The suite moved from 51 → 59 passing.
 
-**Memory and rules codified**: four new agent-memory files (`feedback_tonify_first`, `feedback_backend_layers`, `feedback_canonical_tests_and_docker`, `feedback_feature_placement_canonical`) plus three new rules in `docs/tonify_checklist.md` (Rule 9 on `var` vs `auto` struct declaration, Rule 10 on portable built-ins, Rule 11 on ternary and short-circuit idioms).
+**Memory and rules codified**: four new agent-memory files (`feedback_tonify_first`, `feedback_backend_layers`, `feedback_canonical_tests_and_docker`, `feedback_feature_placement_canonical`) plus three new rules in `docs/manual/tonify_checklist.md` (Rule 9 on `var` vs `auto` struct declaration, Rule 10 on portable built-ins, Rule 11 on ternary and short-circuit idioms).
 
 **What's next.** Phase B1 is the big one — expression register allocation, four sub-steps, 400 lines, two-pool freelist (GP + SIMD), 74+ push/pop sites to rewrite. The parser improvements from this session make B1's code analysis cleaner (short-circuit means `&&` is no longer a binop the RA has to handle; const fold means literal sub-trees are already collapsed). Smart dispatch (originally blocked on cache format extension) also cleared: the cache doesn't exist anymore, so that dependency evaporated.
 
@@ -3257,7 +3257,7 @@ The last Mini Cooper performance phase landed: 128-bit SIMD is now a first-class
 
 Suite 61 → 65 passing, 0 failed, 11 skipped.
 
-**C emitter — deferred.** The native backends emit vec_* as instructions; the C transpile path needs `: double` locals typed as `__m128` and the eleven builtins mapped to `_mm_*` intrinsics. The current C emitter uses `long long` for every local unconditionally — changing that is invasive work with zero demand from B++ programs that target the C backend today. Punted with a TODO comment in `bpp_emitter.bsm` and an entry in `docs/todo.md`. `bpp --c` on a program that uses `vec_*` builtins will fail cleanly at the extern-lookup stage, which is the correct behaviour — wrong-output would be worse than no-output.
+**C emitter — deferred.** The native backends emit vec_* as instructions; the C transpile path needs `: double` locals typed as `__m128` and the eleven builtins mapped to `_mm_*` intrinsics. The current C emitter uses `long long` for every local unconditionally — changing that is invasive work with zero demand from B++ programs that target the C backend today. Punted with a TODO comment in `bpp_emitter.bsm` and an entry in `docs/plans/todo.md`. `bpp --c` on a program that uses `vec_*` builtins will fail cleanly at the extern-lookup stage, which is the correct behaviour — wrong-output would be worse than no-output.
 
 **Cross-compile verified.** All four vec tests pass on macOS ARM64 natively and on x86_64 under docker/alpine (`bpp --linux64` → static ELF → `alpine` container run). Bootstrap converges at gen2 (`shasum` matches gen1). The Linux self-host workaround for B1/B2 (documented in a prior journal entry) was untouched and remains in force; SIMD bypasses the freelist entirely because `vec_*` results always land in v0 / xmm0 directly.
 
@@ -3323,8 +3323,8 @@ address-of as a first-class section, E232 note on the
 are gone from `docs/`; `.md~` backups remain.
 
 **The production guide.** Earlier the same day,
-`docs/bootprod_manual.md` (760 lines) and `docs/tonify_checklist.md`
-(538 lines) were consolidated into `docs/how_to_dev_b++.md`
+`docs/bootprod_manual.md` (760 lines) and `docs/manual/tonify_checklist.md`
+(538 lines) were consolidated into `docs/manual/how_to_dev_b++.md`
 (830 lines, 9 parts): Daily Loop, Tonify Expert Mode, Architectural
 Discipline, Writing Modules, File Order / Sweep Discipline, Testing,
 Cross-Compile and Deploy, Compiler Flags Reference, Recovery. The
@@ -3743,7 +3743,7 @@ with defaults) work. 77th passing test.
 
 **Rebuild-scope rule documented.** User flagged the waste of
 running full bootstrap + suite after every touch. Added a table
-to `docs/how_to_dev_b++.md` mapping what-you-changed →
+to `docs/manual/how_to_dev_b++.md` mapping what-you-changed →
 minimum verification. Game/tool edits compile that one artifact;
 stb/ needs the full suite; src/ compiler needs bootstrap + suite;
 docs need nothing. Kills a big source of unnecessary rebuild
@@ -4415,7 +4415,7 @@ stbforge line 1189 (sprite argb clear), stbinput line 87
 (keys_prev snapshot copy).
 
 **Caps 35-47 shipped** — thirteen book chapters, one per stb
-module in `docs/how_to_dev_b++.md`. Pattern matches the earlier
+module in `docs/manual/how_to_dev_b++.md`. Pattern matches the earlier
 Caps 29-34: intent / scope / API / decision points / caveats /
 verification / "what this chapter does NOT cover". Book grew
 from ~2800 lines to 3276 lines.
@@ -4576,7 +4576,7 @@ commit messages matter more than volume of commits.
 
 Short doc-maintenance session. Three files updated:
 
-**`docs/todo.md`** — status date updated to 2026-04-23, version to
+**`docs/plans/todo.md`** — status date updated to 2026-04-23, version to
 0.111, suite to 111/0 (non-GPU). The 1.0 path gained four new ✅
 milestones (GPU palette + ModuLab 1.0, Waves 18-21 portable backend,
 Phase D). The stale wave-by-wave Active section replaced with a
@@ -4790,7 +4790,7 @@ interactive GPU tests require user input to quit. Bootstrap gen1 == gen2.
 ## 2026-04-28 — 🧹 TONIFY V1+V2: FULL REPO FAXINA + OPERATORS + POINTER PRIMITIVES
 
 Two-session sweep that brought the entire B++ codebase — compiler, stdlib, games,
-tools, IDE — to expert-state quality per the `docs/tonify_checklist.md` playbook,
+tools, IDE — to expert-state quality per the `docs/manual/tonify_checklist.md` playbook,
 and shipped two language features that had been in the backlog.
 
 **New language features**
@@ -5270,7 +5270,7 @@ Two doc-only artifacts shipped this evening, both born from the
 "if C/C++ knew about multi-core in 1972, what would they have done
 differently" design discussion.
 
-- `docs/multicore_state_report.md` (new, 670 lines) — empirical
+- `docs/plans/multicore_state_report.md` (new, 670 lines) — empirical
   audit of B++'s existing parallelism. Confirmed the auto-dispatch
   pipeline (`find_dispatch_candidates` → `synthesize_loop_fn` →
   `rewrite_dispatch_loops`) actually rewrites for-loops into
@@ -5282,7 +5282,7 @@ differently" design discussion.
   parity, reduction support, stride != 1, channels, atomics, CPU
   detection) with LOC estimates and Sprint plan.
 
-- `docs/bootstrap_manual.md` — gained two new conceptual sections
+- `docs/manual/bootstrap_manual.md` — gained two new conceptual sections
   (placed between existing structural sections to teach
   fundamentals before specifics):
   - **Architecture — The Six-Layer Cake** (line 72) — diagram of
@@ -5952,7 +5952,7 @@ Items 3 and 4 stay deferred per `feedback_no_fallback.md`'s
 YAGNI rule — no consumer in user code asks for them yet. Item
 5 is its own multi-session project that depends on Linux
 thread parity, which itself depends on ELF dynlink. Tracked
-in `docs/multicore_state_report.md`.
+in `docs/plans/multicore_state_report.md`.
 
 ### Lesson
 
@@ -6061,7 +6061,7 @@ The regression test wraps each `bpp` invocation in an 8-retry
 loop so the byte-stability invariant it enforces stays
 checkable around the orthogonal flake. The fix is its own
 session — likely 1 day of `arr_push` retained-pointer
-instrumentation. Logged in `docs/todo.md` under "Open:
+instrumentation. Logged in `docs/plans/todo.md` under "Open:
 compiler self-compile transient failure" with the symptoms,
 the workaround, and the most likely investigation surface so
 the next session does not re-derive the diagnosis.
@@ -6233,7 +6233,7 @@ landed across one big session, each its own commit:
    text dump now see the fix immediately instead of watching
    the process silently spin in the event loop. Full
    `isatty(0)` auto-fallback would be nicer but needs new
-   syscall plumbing — tracked in `docs/todo.md` under "`bug`
+   syscall plumbing — tracked in `docs/plans/todo.md` under "`bug`
    headless detection".
 
 7. **C-emitter `var T` parity doc** (follow-up to #4) — fixing
@@ -6244,7 +6244,7 @@ landed across one big session, each its own commit:
    thumb in `bootstrap_manual.md` ("when source must compile
    through `--c` and the address is taken, prefer heap
    allocation") and tracked the unification path in
-   `docs/todo.md` under "C-emitter `var T` parity". Reactive
+   `docs/plans/todo.md` under "C-emitter `var T` parity". Reactive
    protection against the next agent re-discovering the same
    gap in 6 months.
 
@@ -6511,9 +6511,9 @@ there.
   stub for parity),
   `src/backend/target/aarch64_macos/a64_macho.bsm` (mo_atof →
   cg_parse_float_bits delegation)
-- Docs: `docs/journal.md` (this entry), `docs/how_to_dev_b++.md`
-  (Cap 3 §3.3 scientific notation table), `docs/tonify_checklist.md`
-  (Rule 20 + Pitfall 5), `docs/warning_error_log.md` (W027 +
+- Docs: `docs/journal.md` (this entry), `docs/manual/how_to_dev_b++.md`
+  (Cap 3 §3.3 scientific notation table), `docs/manual/tonify_checklist.md`
+  (Rule 20 + Pitfall 5), `docs/manual/warning_error_log.md` (W027 +
   T_BLOCK fix entry + diagnostic gaps section), `README.md`
   (Phase 1 closure header), `games/fps/HANDOFF.md` (Phase 2 prep)
 
@@ -6976,7 +6976,7 @@ jitter at 60 FPS, frame-time spikes clip at the top in the
 - `docs/gpu_pipeline_roadmap.md`: Phase 6.3 marker flipped
   from DEFERRED → CLOSED. All seven phases of the roadmap
   carry CLOSED markers now.
-- `docs/tonify_checklist.md`: Rule 25 covers the new
+- `docs/manual/tonify_checklist.md`: Rule 25 covers the new
   annotation + v1 caveats.
 - The Decision Point at the end of Phase 7 stays
   intentionally open — content arc next is a player-side
@@ -7621,7 +7621,7 @@ combo that confirmed the race hypothesis.
   blit vertex + fragment shader with NEAREST sampler.
 - `examples/render_target_smoke.bpp` (new, ~95 LOC): visual
   validator for the entire Phase 4.1.1 + 4.1.2 contract.
-- `docs/tonify_checklist.md`: Rule 24 (smart-dispatch
+- `docs/manual/tonify_checklist.md`: Rule 24 (smart-dispatch
   `render_clear`) + Pitfall 7 (multi-pass shared-buffer race).
 - `docs/gpu_pipeline_roadmap.md`: Phase 4.1.1 + 4.1.2 marked
   CLOSED.
@@ -7680,7 +7680,7 @@ src/backend/chip/x86_64/x64_primitives.bsm   +37  _x64_emit_drain_call_preserve_
 tests/test_profile_zones_v2.bpp              +118 smoke: depth == 0 after fall-through,
                                                    early-return, nested early-return; counts
                                                    credited to all four zones
-docs/tonify_checklist.md                     ±33  Rule 25 v2 closed-leak section + caveats
+docs/manual/tonify_checklist.md                     ±33  Rule 25 v2 closed-leak section + caveats
                                                    that survive (FLAT aggregation, C path,
                                                    recursion overflow)
 ```
@@ -7870,7 +7870,7 @@ of a working substrate.
 ### What this unblocks
 
 - **Wolf3D Phase 2 tuning workflow** (canonical use case per
-  `docs/games_roadtrip.md:274`). Stack of 5+ effects, edit JSON
+  `docs/plans/games_roadtrip.md:274`). Stack of 5+ effects, edit JSON
   per effect, see live changes. No fxlab GUI needed for the work
   to begin.
 - **Sessão 2 (fxlab GUI standalone)**: now a thin layer — list
@@ -7986,7 +7986,7 @@ src/bpp_json.bsm                  +60   _json_parse_number computes float;
                                         json_float reader added
 tests/test_json_float.bpp        +118   smoke covering 8 float shapes
                                         + 3 int regression cases
-docs/tonify_checklist.md          +33   Rule 12 extended with `const`
+docs/manual/tonify_checklist.md          +33   Rule 12 extended with `const`
                                         float-demotion pitfall + workaround
 docs/journal.md                   +85   this entry
 ```
@@ -8337,7 +8337,7 @@ shipped — level_editor now paints both tiles and objects, JSON
 schema v2 stores both, fps_wolf3d loads from disk instead of
 shipping a hardcoded ASCII maze.
 
-The session also produced `docs/bang9_space_manual.md` — the
+The session also produced `docs/manual/bang9_space_manual.md` — the
 canonical articulation of Bang 9 as the engine/IDE of the B++
 ecosystem. Not just an IDE on top of bpp, but the place where
 every game tool lands once it earns its tab. Pathfind sprites went
@@ -8347,7 +8347,7 @@ product.
 
 ### What landed in this batch
 
-- **`docs/bang9_space_manual.md`** (~280 LOC) — premise, what ships
+- **`docs/manual/bang9_space_manual.md`** (~280 LOC) — premise, what ships
   today, hot-reload backbone, project layout convention, embed
   contract, recipe to add a new tab, "tools as their own consumers"
   forcing function. Anchors every future tool integration.
@@ -8401,7 +8401,7 @@ asset type Bang 9 supports.
 - `bang9/modulab_prefs.json` removed from git, added to
   `.gitignore`. modulab writes per-user prefs there every
   open/close — pure user state that should never have been
-  tracked. Sidequest in `docs/todo.md`: migrate the write target
+  tracked. Sidequest in `docs/plans/todo.md`: migrate the write target
   to `~/.config/bpp/modulab_prefs.json` (XDG) — same
   CWD/install path bug class fxlab arc fixed.
 
@@ -8444,7 +8444,7 @@ asset type Bang 9 supports.
 
 | File | Change |
 |---|---|
-| `docs/bang9_space_manual.md` | NEW (~280 LOC) — engine/IDE manual |
+| `docs/manual/bang9_space_manual.md` | NEW (~280 LOC) — engine/IDE manual |
 | `src/bpp_json.bsm` | + `json_write_float_field` public writer |
 | `tools/level_editor/level_editor_lib.bsm` | + entity layer + kinds + UI toggle + JSON v2 r/w |
 | `games/fps/fps_wolf3d.bpp` | + `_load_level` replaces `_init_map`; entity buffer; quit cleanup |
@@ -8460,7 +8460,7 @@ asset type Bang 9 supports.
 | `tests/test_modulab_testbed_level.bpp` | filename .json suffix |
 | `bang9/level1.level.json` | DELETED (dead artifact) |
 | `bang9/modulab_prefs.json` | git rm --cached + .gitignore |
-| `docs/todo.md` | Session 0 closure + modulab prefs sidequest |
+| `docs/plans/todo.md` | Session 0 closure + modulab prefs sidequest |
 
 ---
 
@@ -8538,7 +8538,7 @@ AI was being dispatched per-frame, narrowing the bug to the
 render side without further guessing.
 
 What `bug` is missing for game-debug at 60Hz emerged from this
-session and is now tracked in `docs/todo.md` "bug Phase 7" — trace
+session and is now tracked in `docs/plans/todo.md` "bug Phase 7" — trace
 mode (no-pause logging), `name:line` breakpoints (locals at
 function entry are uninitialised), conditional breakpoints, REPL
 hexdump, snapshot/replay. Open as a dedicated arc after the next
@@ -8604,7 +8604,7 @@ Suite still 145/0/12, bootstrap byte-stable.
 ### Lesson for B++ contributors
 
 Within a single file, define functions in dependency order:
-leaves first, callers last. Same convention `docs/tonify_checklist.md`
+leaves first, callers last. Same convention `docs/manual/tonify_checklist.md`
 already canonises for cross-file batch ordering during a tonify
 sweep, just applied at the function level.
 
@@ -8707,7 +8707,7 @@ without earning their keep.
 Captured permanently in
 `feedback_phase_overengineering_lesson.md` so the lesson is
 available in future conversations. Sidequest opened in
-`docs/todo.md` ("Phase annotation collapse — Multics → Unix
+`docs/plans/todo.md` ("Phase annotation collapse — Multics → Unix
 simplification") to reduce the user-facing surface to `@safe` +
 `@profile`. This entry records the *why* — both how we got here
 and the systemic moves that prevent the next iteration of the
@@ -8816,7 +8816,7 @@ the restrictive framing:
 | "Annotate when intent is obvious" | "Annotate only when compiler verification is needed" |
 | "Add a Tonify rule when a pattern appears 3+ times" | "Add a Tonify rule when a pattern's absence has caused a bug in active code" |
 
-**Quarterly system audit.** Add to `docs/how_to_dev_b++.md` a
+**Quarterly system audit.** Add to `docs/manual/how_to_dev_b++.md` a
 recurring "step back" prompt for each major system: storage
 classes, phase annotations, Tonify rules, builtins, type
 slices, diagnostics. If any number GREW since last audit
@@ -8894,7 +8894,7 @@ location + three help lines:
 
 - "use @safe if this function needs compiler-verified safety"
 - "otherwise omit the annotation — purity is inferred internally"
-- "see: docs/tonify_checklist.md Rule 4 for the post-collapse
+- "see: docs/manual/tonify_checklist.md Rule 4 for the post-collapse
   model"
 
 The `see:` line is the canonical Rule 28 pattern: every diagnostic
@@ -9033,7 +9033,7 @@ parser (3 of 6 assertions) and PASSES after the fix.
 
 Same-day cleanup: Session 5's `wd.sys_count = wd.sys_count + 1`
 workaround in stbecs.bsm reverted to `wd.sys_count++`. The deferred
-sidequest entry in `docs/todo.md` removed. Suite gains one (the
+sidequest entry in `docs/plans/todo.md` removed. Suite gains one (the
 pin): 158/0/12 native + 130/0/40 C-emit.
 
 **Lesson worth pinning**: sibling helpers with copy-pasted bodies
@@ -9100,7 +9100,7 @@ Stability: 56% / 50% / 58% across three runs.
    unconditionally; it lacks the T_MEMLD → T_MEMST branch that
    `_make_compound_assign` carries for `+=`. Workaround:
    `wd.sys_count = wd.sys_count + 1`. Tracked as a deferred
-   compiler sidequest in docs/todo.md. Existing Session 2 archetype
+   compiler sidequest in docs/plans/todo.md. Existing Session 2 archetype
    code already used the longhand form — the gap predates Session 5
    and was simply unfound until I hit it.
 
@@ -9179,7 +9179,7 @@ User reframed via Rule 28 framework:
    is alignment with industry practice, not a portability hole.
 
 10 minutes of refactor restored 128/0/39 + 155/0/12. The deferred
-C-emit SIMD sidequest is logged in `docs/todo.md` with explicit
+C-emit SIMD sidequest is logged in `docs/plans/todo.md` with explicit
 Rule 20 triggers (two shipped real consumers + a target where
 only C-emit is available).
 
@@ -9365,7 +9365,7 @@ Concretely shipped:
 - `games/rts1/wc1_map.bsm` + `games/rts1/rts.bpp` — game-side loader
   for the converted JSON, plus `file_watch_register` for the
   ~30 ms hot-reload.
-- `docs/asset_formats.md` — canonical spec for level JSON (both
+- `docs/manual/asset_formats.md` — canonical spec for level JSON (both
   modes), atlas pack JSON, and audio formats. The "what shape does
   a level have" reference. Cross-linked from Tonify Rule 31 (asset
   infra) and how_to_dev Cap 16.
@@ -9680,7 +9680,7 @@ positive on visual smoke before commit.
    migration) are the right granularity — one commit per
    coherent unit of work, not per file touched.
 
-Sidequest doc `docs/sidequest_stbui_v2_clay.md` stays as the
+Sidequest doc `docs/plans/sidequest_stbui_v2_clay.md` stays as the
 authoritative arc trace for stbui v2. S5+ (fxlab → the_bug →
 mini_synth + sprite_viewer → Bang 9 chrome → v1 deprecation)
 remain queued; level_editor S4 was the smallest of the

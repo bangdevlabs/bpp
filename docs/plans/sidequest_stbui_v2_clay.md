@@ -291,8 +291,8 @@ green throughout.
 | `tests/test_stbui_layout.bpp` | NEW — unit tests for FIT/GROW/FIXED/PERCENT combos | ~210 LOC |
 | `tools/modulab/aseprite_view.bsm` | MODIFY (S2) — declare layout via v2 instead of computing rects | -50 LOC net |
 | `tools/modulab/modulab_lib.bsm` | MODIFY (S3) — same, replaces `_draw_status` + panel anchoring | -150 LOC net |
-| `docs/asset_formats.md` | minor: note v2 widgets in cross-references |
-| `docs/tonify_checklist.md` | Rule 23 anchor — stbui_v2 ships floor only; consumers opt-in to v1 OR v2 |
+| `docs/manual/asset_formats.md` | minor: note v2 widgets in cross-references |
+| `docs/manual/tonify_checklist.md` | Rule 23 anchor — stbui_v2 ships floor only; consumers opt-in to v1 OR v2 |
 
 ## API design decisions (closed before execute)
 

@@ -2193,7 +2193,7 @@ editor. Discuss before forking; restraint-bias per Rule 28.
 
 ### Cross-references
 
-- **`docs/asset_formats.md`** — **canonical spec** for every JSON /
+- **`docs/manual/asset_formats.md`** — **canonical spec** for every JSON /
   atlas / palette / tileset shape the table above mentions. When a
   new asset shape lands (e.g. animation graph, particle preset),
   document the schema there + extend the table here. THIS is where

@@ -153,7 +153,7 @@ The compiler (`src/bpp_import.bsm`) auto-injects these nine modules at the top o
 
 Two groups of functions are NOT in this prelude and need `import`:
 
-1. **`stb/*.bsm`** — game / tool libraries (`stbgame`, `stbdraw`, `stbui`, `stbaudio`, `stbtile`, ...). These are the game engine; import as needed.
+1. **`stb/*.bsm`** — game / tool libraries (`stbgame`, `stbdraw`, `stbui`, `stbaudio`, `stbtile`, ...). These are the game engine; import as needed. `stbui` exposes both the legacy `gui_button(x, y, w, h, label)` widget family and the v2 declarative `ui_box / ui_row / ui_col / ui_layout_end` layout API (shipped 2026-05-17); see `docs/manual/stb++_lib.md` Cap 36 for which to use when.
 2. **Compiler-internal** modules (`bpp_codegen`, `bpp_parser`, `bpp_lexer`, `bpp_internal`, `bpp_types`, ...). These are for people writing the compiler itself. User programs should not import them.
 
 ### Consequence for Hello World
@@ -1530,12 +1530,12 @@ The rules, patterns, and anti-patterns that separate a first program from a ship
 ## Cap 14 — Tonify (the style rules)
 
 *Depends on: —*
-*Source: see `docs/tonify_checklist.md`*
+*Source: see `docs/manual/tonify_checklist.md`*
 *Status: REFERENCE — content lives in tonify_checklist.md*
 
 The tonification rules — storage classes, visibility, return types,
 phase annotations, control flow, slice types, comments, struct
-access, operator preferences — live in **`docs/tonify_checklist.md`**.
+access, operator preferences — live in **`docs/manual/tonify_checklist.md`**.
 
 That file is canonical: every new function in the codebase is
 written against its 20 rules from the first keystroke, not
@@ -1651,7 +1651,7 @@ When in doubt:
 ## Cap 16 — Idioms
 
 *Depends on: Cap 14, Cap 15*
-*Source: legacy_docs/how_to_dev_b++.md Part 4*
+*Source: legacy_docs/manual/how_to_dev_b++.md Part 4*
 *Status: COMPLETE — 2026-04-27*
 
 ### stb module conventions
@@ -1816,11 +1816,11 @@ runtime.
 
 Full rule (with tool/format/loader table, killer-use-case
 justification, and the "when to fork" escape hatch): see
-`docs/tonify_checklist.md` Rule 31.
+`docs/manual/tonify_checklist.md` Rule 31.
 
 **Canonical schemas** for every asset shape Bang 9 / Modulab
 author — level JSON (palette + tileset modes), atlas pack JSON,
-audio format requirements: see **`docs/asset_formats.md`**. That
+audio format requirements: see **`docs/manual/asset_formats.md`**. That
 file is the authoritative field-by-field reference; when you add
 a new asset shape, extend it there + update the table in Rule 31.
 
@@ -1829,7 +1829,7 @@ a new asset shape, extend it there + update the table in Rule 31.
 ## Cap 17 — Anti-patterns
 
 *Depends on: Cap 14, Cap 15*
-*Source: legacy_docs/how_to_dev_b++.md Part 5*
+*Source: legacy_docs/manual/how_to_dev_b++.md Part 5*
 *Status: COMPLETE — 2026-04-27*
 
 When tonifying existing code (or adding a rule that affects the whole codebase), process files in dependency order — leaves first, complex last. A broken leaf cascades; a broken root breaks in isolation and is easier to revert.
@@ -2298,7 +2298,7 @@ needing the bounded discipline (it's main-thread code).
 The chapters that used to live here (bootstrap procedure, canary
 discipline, testing strategy, frontend + spine + battalions
 architecture, runtime primitives, adding a new backend) now live in
-**`docs/bootstrap_manual.md`** — the dedicated reference for
+**`docs/manual/bootstrap_manual.md`** — the dedicated reference for
 evolving the B++ compiler itself.
 
 That manual covers:
@@ -2357,7 +2357,7 @@ font), `tools/the_bug/` (bug debugger panel).
 ## Diagnostics (Cap 28)
 
 Compiler warnings and errors catalogue. Detail in
-`standard_b++_lib.md` Cap 28 + `docs/warning_error_log.md`. The latter
+`standard_b++_lib.md` Cap 28 + `docs/manual/warning_error_log.md`. The latter
 is the canonical registry — every diagnostic the compiler emits, where
 it's defined, what triggers it, whether it shows source location.
 
@@ -2583,7 +2583,7 @@ panel sorts them by total_us within ~1 second.
 ## Cap 48 — Compiler Flags Reference
 
 *Depends on: Cap 18*
-*Source: legacy_docs/how_to_dev_b++.md Part 8*
+*Source: legacy_docs/manual/how_to_dev_b++.md Part 8*
 *Status: COMPLETE — 2026-04-27*
 
 All flags are passed to `bpp` on the command line before the source file.
@@ -2657,7 +2657,7 @@ This book is living. Every change to the compiler, stdlib, or tooling updates it
 1. **A PR that ships new stdlib or backend logic MUST update its chapter.** Missing doc = CI should fail (today manual; eventually a gate).
 2. **Depends on:** links are authoritative. If Cap 10 says "Depends on: Cap 4", and you change Cap 4 semantics, Cap 10 needs revisit. Grep `Depends on: Cap 4` to find them.
 3. **Source: legacy_docs/X.md §Y** stays until the legacy section is marked ABSORBED in `legacy_docs/README.md`. Do not delete `legacy_docs/` until `grep -c PENDING\|DRAFT legacy_docs/README.md` returns 0.
-4. **TOC at top of this file is the live index.** Status column drives the faxina progress. Run `grep -c PENDING docs/how_to_dev_b++.md` to see how many chapters remain.
+4. **TOC at top of this file is the live index.** Status column drives the faxina progress. Run `grep -c PENDING docs/manual/how_to_dev_b++.md` to see how many chapters remain.
 5. **Code examples in every chapter should compile.** If they do not, fix the code OR the doc — never leave false examples.
 
 When the book is complete: `legacy_docs/` is deletable, this file is the canonical reference, and any new chapter follows the same template.
