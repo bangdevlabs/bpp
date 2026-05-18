@@ -17,6 +17,7 @@
 import "stbecs.bsm";
 import "stbimage.bsm";
 import "stbcamera.bsm";
+import "stbcharsheet.bsm";
 load   "wc1_units.bsm";
 load   "wc1_anims.bsm";
 
@@ -50,6 +51,18 @@ struct Path     { mode, buf, count, cursor, tile_gx, tile_gy }
 // archetype-fan-out isn't needed unless future buildings or
 // neutral entities show a different layout (Rule 30 trigger).
 struct Faction  { player }
+// Sheet stores the per-unit CharSheet handle allocated at spawn
+// time. Stats (armor, damage, weapon range, cooldown, sight,
+// size class, damage type) + resources (HP today; shields,
+// energy when those tech upgrades land) all live behind one
+// handle. Consumers read via cs_stat_get / cs_res_current.
+struct Sheet    { handle }
+// AttackTarget records the entity the unit is currently engaging.
+// eid == -1 is the "no target" sentinel (matches Target.gx/gy's
+// convention). Right-click on an enemy unit writes it; right-
+// click on ground clears it. S7.3's combat tick reads it to
+// decide who to swing at.
+struct AttackTarget { eid }
 // Anim drives the per-unit animation state. `state` is one of
 // UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
 // — used to dispatch between idle anim and walk anim families.
@@ -72,7 +85,7 @@ const MAX_WAYPOINTS = 256;
 // to flow through globals because B++ doesn't carry closures.
 // Same pattern every other stbecs consumer follows.
 global pos_comp, sprite_comp, unit_comp, target_comp, path_comp, anim_comp;
-global faction_comp;
+global faction_comp, sheet_comp, attack_target_comp;
 global peasant_arch, peasant_q;
 
 // Camera handle owned by rts.bpp. Read by _render_unit via
@@ -90,14 +103,16 @@ extrn cam;
 // archetype lands (S7+ buildings), revisit to a real mask filter.
 ecs_wire(world) {
     auto comps;
-    pos_comp     = ecs_component_register(world, "Pos",      sizeof(Pos));
-    sprite_comp  = ecs_component_register(world, "Sprite",   sizeof(Sprite));
-    unit_comp    = ecs_component_register(world, "UnitType", sizeof(UnitType));
-    target_comp  = ecs_component_register(world, "Target",   sizeof(Target));
-    path_comp    = ecs_component_register(world, "Path",     sizeof(Path));
-    anim_comp    = ecs_component_register(world, "Anim",     sizeof(Anim));
-    faction_comp = ecs_component_register(world, "Faction",  sizeof(Faction));
-    comps    = buf_word(7);
+    pos_comp           = ecs_component_register(world, "Pos",          sizeof(Pos));
+    sprite_comp        = ecs_component_register(world, "Sprite",       sizeof(Sprite));
+    unit_comp          = ecs_component_register(world, "UnitType",     sizeof(UnitType));
+    target_comp        = ecs_component_register(world, "Target",       sizeof(Target));
+    path_comp          = ecs_component_register(world, "Path",         sizeof(Path));
+    anim_comp          = ecs_component_register(world, "Anim",         sizeof(Anim));
+    faction_comp       = ecs_component_register(world, "Faction",      sizeof(Faction));
+    sheet_comp         = ecs_component_register(world, "Sheet",        sizeof(Sheet));
+    attack_target_comp = ecs_component_register(world, "AttackTarget", sizeof(AttackTarget));
+    comps    = buf_word(9);
     comps[0] = pos_comp;
     comps[1] = sprite_comp;
     comps[2] = unit_comp;
@@ -105,7 +120,9 @@ ecs_wire(world) {
     comps[4] = path_comp;
     comps[5] = anim_comp;
     comps[6] = faction_comp;
-    peasant_arch = ecs_archetype(world, comps, 7);
+    comps[7] = sheet_comp;
+    comps[8] = attack_target_comp;
+    peasant_arch = ecs_archetype(world, comps, 9);
     peasant_q    = ecs_query(world, 0);
 }
 
@@ -117,7 +134,9 @@ ecs_wire(world) {
 // hit-test and tick time.
 ecs_spawn_peasant(world, atlas, gx, gy, player) {
     auto eid;
-    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim, fa: Faction;
+    auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim;
+    auto fa: Faction, sh: Sheet, at: AttackTarget;
+    auto def: UnitDef;
     eid = ecs_spawn_at(world, peasant_arch);
     p = ecs_get(world, pos_comp, eid);
     // Pos lives in PIXEL coords so the movement system can walk
@@ -167,6 +186,29 @@ ecs_spawn_peasant(world, atlas, gx, gy, player) {
     // JSON's `player` field.
     fa = ecs_get(world, faction_comp, eid);
     fa.player = player;
+    // Per-unit Sheet — allocate the CharSheet handle and populate
+    // from UnitDef. Stats (armor, damage, weapon range, cooldown,
+    // sight, size, type) live in the stat section; HP lives in
+    // the resource section so cs_res_adjust can clamp damage /
+    // heal automatically. The handle is freed in S7.5's death
+    // hook when the entity dies (today: leaks on quit, bounded
+    // by the 256-unit cap).
+    def = unit_def_for(UNIT_PEASANT);
+    sh = ecs_get(world, sheet_comp, eid);
+    sh.handle = cs_new(WC1_STAT_COUNT, WC1_RES_COUNT);
+    cs_stat_set(sh.handle, STAT_ARMOR,        def.armor);
+    cs_stat_set(sh.handle, STAT_DAMAGE,       def.damage);
+    cs_stat_set(sh.handle, STAT_WEAPON_RANGE, def.weapon_range);
+    cs_stat_set(sh.handle, STAT_COOLDOWN_MS,  def.cooldown_ms);
+    cs_stat_set(sh.handle, STAT_SIGHT_TILES,  def.sight_tiles);
+    cs_stat_set(sh.handle, STAT_SIZE_CLASS,   def.size_class);
+    cs_stat_set(sh.handle, STAT_DAMAGE_TYPE,  def.damage_type);
+    cs_res_init(sh.handle, RES_HP, def.hp);
+    // AttackTarget — sentinel -1 means "no target." Right-click
+    // on an enemy unit (wc1_input.bsm) writes the target eid; S7.3
+    // combat reads + engages.
+    at = ecs_get(world, attack_target_comp, eid);
+    at.eid = -1;
     return eid;
 }
 

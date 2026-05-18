@@ -1,9 +1,16 @@
-// wc1_units.bsm — Unit type registry + named frame indices.
+// wc1_units.bsm — Unit type registry + named frame indices + SC1-
+// style combat stat keys for stbcharsheet wiring.
 //
-// Session 3 ships one unit (peasant). Future sessions extend the
-// table — UNIT_FOOTMAN / UNIT_ARCHER lands when those sprites ship,
-// PEASANT_WALK_* lands with animation (S5+), PEASANT_CHOP_* with
-// combat (S7+).
+// Session 3 shipped one unit (peasant). Session 7 extends the
+// UnitDef record with combat fields (damage, weapon_range,
+// cooldown_ms, sight_tiles, size_class, damage_type) so the
+// per-unit sheet allocated at spawn time picks up SC1-shaped
+// combat data — see the design vision in `wc1_handoff.md` for
+// why combat reads from SC1 conventions, not WC1.
+//
+// Future sessions extend the table — UNIT_FOOTMAN / UNIT_ARCHER
+// lands when those sprites ship, PEASANT_CHOP_* with the combat
+// animation wiring.
 //
 // Frame indices match the row-major grid in the converted PNG
 // strips that war1tool emits for each unit. peasant.png is laid
@@ -23,18 +30,67 @@ const PEASANT_IDLE_E  = 2;
 const PEASANT_IDLE_SE = 3;
 const PEASANT_IDLE_S  = 4;
 
+// ── SC1-style combat enums ──────────────────────────────────────
+//
+// Size classes feed the damage-type × size matrix that S7.4 will
+// resolve to a multiplier. SC1's three-tier model is the proven
+// shape (small/medium/large); B++ adopts it as-is. Peasants are
+// SMALL (the canonical infantry size).
+const SIZE_SMALL  = 0;
+const SIZE_MEDIUM = 1;
+const SIZE_LARGE  = 2;
+
+// Damage types — the other axis of S7.4's matrix. SC1's Normal/
+// Concussive/Explosive maps to "attacks small effectively /
+// attacks medium effectively / attacks large effectively" once
+// the matrix lands. Peasant chop is NORMAL (no special bonus).
+const DAMAGE_NORMAL     = 0;
+const DAMAGE_CONCUSSIVE = 1;
+const DAMAGE_EXPLOSIVE  = 2;
+
+// ── Sheet key registry (stbcharsheet slots) ─────────────────────
+//
+// stbcharsheet stores stats + resources by integer key. The game
+// registers what each slot means; below is rts1's mapping. STAT
+// slots are scalar per-unit constants (read often, written at
+// spawn or upgrade); RES slots are current/max pairs (HP today,
+// shields + energy when those tech upgrades land).
+//
+// Adding a new STAT? Bump WC1_STAT_COUNT so cs_new gives the
+// right slot count. Same for RES.
+const STAT_ARMOR        = 0;
+const STAT_DAMAGE       = 1;
+const STAT_WEAPON_RANGE = 2;     // tiles (1 = melee, 4+ = ranged)
+const STAT_COOLDOWN_MS  = 3;     // ms between consecutive attacks
+const STAT_SIGHT_TILES  = 4;     // vision range, distinct from weapon
+const STAT_SIZE_CLASS   = 5;     // SIZE_SMALL / MEDIUM / LARGE
+const STAT_DAMAGE_TYPE  = 6;     // DAMAGE_NORMAL / CONCUSSIVE / EXPLOSIVE
+const WC1_STAT_COUNT    = 7;
+
+const RES_HP            = 0;
+const WC1_RES_COUNT     = 1;
+// Shields + energy land when their respective tech unlocks ship
+// (Rule 28 — earn the slot). Bumping WC1_RES_COUNT and the
+// cs_new call in spawn is the only churn needed when that day
+// comes.
+
 // Per-unit static data the game reads at spawn time. Flat record
-// indexed by UNIT_* constant. Stays small — fields earn their slot
-// when a system needs them. armor / speed_pxs anchor the future
-// combat + movement systems; px_size lets render scale per unit
-// kind without hardcoding 32 everywhere.
+// indexed by UNIT_* constant. Spawn copies these into the Sheet
+// component for live consumers (combat, HP UI, AI); UnitDef stays
+// the immutable template per kind.
 struct UnitDef {
-    kind,            // UNIT_PEASANT, UNIT_FOOTMAN, ...
-    hp,              // starting hit points
-    armor,           // damage reduction (S7 combat)
-    speed_pxs,       // movement speed in pixels/sec — 128 = 8 tiles/sec
-    atlas_frame,     // default render frame (idle facing south)
-    px_size          // sprite dimension on screen, usually 32
+    kind,             // UNIT_PEASANT, UNIT_FOOTMAN, ...
+    hp,               // starting hit points (spawn-time max)
+    armor,            // damage reduction
+    speed_pxs,        // movement speed in pixels/sec — 128 = 8 tiles/sec
+    atlas_frame,      // default render frame (idle facing south)
+    px_size,          // sprite dimension on screen, usually 32
+    damage,           // base damage per attack
+    weapon_range,     // tiles (1 melee, 4+ ranged)
+    cooldown_ms,      // attack period
+    sight_tiles,      // vision range
+    size_class,       // SIZE_* enum
+    damage_type       // DAMAGE_* enum
 }
 
 // Module-private table allocated by unit_defs_init. Indexed by
@@ -51,12 +107,21 @@ unit_defs_init() {
     auto pe: UnitDef;
     _unit_defs = malloc(8 * sizeof(UnitDef));
     pe = _unit_defs + UNIT_PEASANT * sizeof(UnitDef);
-    pe.kind        = UNIT_PEASANT;
-    pe.hp          = 30;
-    pe.armor       = 0;
-    pe.speed_pxs   = 128;
-    pe.atlas_frame = PEASANT_IDLE_S;
-    pe.px_size     = 32;
+    pe.kind         = UNIT_PEASANT;
+    pe.hp           = 30;
+    pe.armor        = 0;
+    pe.speed_pxs    = 128;
+    pe.atlas_frame  = PEASANT_IDLE_S;
+    pe.px_size      = 32;
+    // Combat profile: WC1 peasants chop with axe — short range,
+    // moderate damage, slow cooldown. SC1-flavored starting
+    // numbers; tune for feel in S7.3+.
+    pe.damage       = 4;
+    pe.weapon_range = 1;             // melee
+    pe.cooldown_ms  = 480;
+    pe.sight_tiles  = 4;
+    pe.size_class   = SIZE_SMALL;
+    pe.damage_type  = DAMAGE_NORMAL;
     _unit_def_count = 1;
 }
 

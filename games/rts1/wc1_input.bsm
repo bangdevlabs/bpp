@@ -44,6 +44,7 @@ global drag_x0, drag_y0, drag_x1, drag_y1;
 const _DRAG_PX_THRESHOLD = 3;
 
 extrn pos_comp, target_comp, peasant_q;
+extrn faction_comp, attack_target_comp;
 extrn cam;
 
 // Single-hit scratch for the click branch (unchanged from S4).
@@ -186,38 +187,88 @@ void wc1_input_tick(world) {
         drag_active = 0;
     }
 
-    // Right mouse: send every selected unit to the clicked tile.
-    // wc1_movement_request_group picks flow-field vs A* based on
-    // selected_count (>= FLOW_THRESHOLD → shared flow_compute).
+    // Right mouse: faction-aware dispatch. Hit-test the click
+    // against units first — if it lands on a unit whose Faction
+    // differs from the FIRST selected unit's Faction, treat it as
+    // an attack-target (S7.3 combat will resolve the engagement);
+    // otherwise fall through to a move command on the clicked
+    // tile (existing S6 behavior).
     if (mouse_pressed(MOUSE_RIGHT) != 0) {
         if (selected_count > 0) {
             mx = mouse_x();
             my = mouse_y();
             wx = cam_screen_to_world_x(cam, mx);
             wy = cam_screen_to_world_y(cam, my);
-            gx = wx / 16;
-            gy = wy / 16;
-            if (gx < 0) { gx = 0; }
-            if (gy < 0) { gy = 0; }
-            // Write each unit's Target so any future combat /
-            // UI consumer sees the live intent. Path planning
-            // happens inside wc1_movement_request_group.
-            for (i = 0; i < selected_count; i++) {
-                eid = selected_eids[i];
-                t = ecs_get(world, target_comp, eid);
-                t.gx = gx;
-                t.gy = gy;
+            auto target_eid;
+            target_eid = _unit_at_world(world, wx, wy);
+            if (target_eid >= 0 && _is_enemy(world, target_eid) != 0) {
+                _issue_attack(world, target_eid);
+            } else {
+                gx = wx / 16;
+                gy = wy / 16;
+                if (gx < 0) { gx = 0; }
+                if (gy < 0) { gy = 0; }
+                _issue_move(world, gx, gy);
             }
-            wc1_movement_request_group(world, selected_eids,
-                                       selected_count, gx, gy);
-            // Debug print extends the S4 line with the group size.
-            putstr("target = (");
-            putnum(gx);
-            putstr(", ");
-            putnum(gy);
-            putstr(")  N=");
-            putnum(selected_count);
-            putstr("\n");
         }
     }
+}
+
+// True if `target_eid` is held by a faction other than the FIRST
+// selected unit's. Mixed-faction selection (only possible via
+// marquee in v1) resolves against the first entry; future
+// selection-filter polish would prevent that case at marquee
+// time.
+static _is_enemy(world, target_eid) {
+    auto fs: Faction, ft: Faction;
+    fs = ecs_get(world, faction_comp, selected_eids[0]);
+    ft = ecs_get(world, faction_comp, target_eid);
+    return fs.player != ft.player;
+}
+
+// Write the attack-target on every selected unit so S7.3's combat
+// tick can engage in lockstep. Clears any in-flight move target so
+// the units don't keep walking past the enemy. Movement toward the
+// target is wired in S7.3 (the combat tick will path each unit to
+// weapon range using the existing flow / A* dispatch).
+static void _issue_attack(world, target_eid) {
+    auto i, eid, at: AttackTarget, t: Target;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = target_eid;
+        t = ecs_get(world, target_comp, eid);
+        t.gx = -1;
+        t.gy = -1;
+    }
+    // Debug — confirms the hit-test fired. Replaced by combat
+    // resolution in S7.3.
+    putstr("attack target = ");
+    putnum(target_eid);
+    putstr("  N=");
+    putnum(selected_count);
+    putstr("\n");
+}
+
+// Move command — clears any in-flight attack-target on every
+// selected unit and dispatches the group movement (S6 behavior).
+static void _issue_move(world, gx, gy) {
+    auto i, eid, t: Target, at: AttackTarget;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        t = ecs_get(world, target_comp, eid);
+        t.gx = gx;
+        t.gy = gy;
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = -1;
+    }
+    wc1_movement_request_group(world, selected_eids,
+                               selected_count, gx, gy);
+    putstr("target = (");
+    putnum(gx);
+    putstr(", ");
+    putnum(gy);
+    putstr(")  N=");
+    putnum(selected_count);
+    putstr("\n");
 }
