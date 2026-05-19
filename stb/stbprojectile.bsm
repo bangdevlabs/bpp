@@ -1,0 +1,221 @@
+// stbprojectile.bsm — 2D / 3D projectile motion + lifecycle pool.
+//
+// Tier-2 cartridge built on top of `stbpool` (Tier 1). Owns the
+// physics-and-bookkeeping side of fire-and-forget projectiles:
+//   - Per-slot position (x, y, z) + velocity (vx, vy, vz)
+//   - Optional z-gravity for ballistic arcs
+//   - Lifetime budget with auto-expire
+//   - Game-side opaque payload word (eid / struct ptr / damage word)
+//
+// What this cartridge does NOT own (intentionally — different per
+// genre, so it stays in the consuming game cartridge):
+//   - Targeting math (RTS homing vs FPS angle-shoot vs lobbed arc)
+//   - Collision detection (entity overlap vs tile raycast vs none)
+//   - Rendering (top-down sprite vs billboard vs particle)
+//   - Damage application policy (CharSheet read, armor matrix, etc.)
+//
+// Designed with three prospective consumers in view:
+//   - rts1 WC1: arrow + spear + fireball + catapult stone
+//   - fps Doom-mode (future Phase 4+): rocket + plasma + grenade
+//   - rpg Game 4 (Zelda-style top-down): arrow + magic
+//
+// Industry precedent: same shape as Doom `mobj_t` (1993), SC1
+// Bullet pool (1998), Stratagus Missile pool (2002). Pool-based
+// because projectile lifetimes are short and counts are bounded
+// per-genre (RTS ~64, FPS ~32, RPG ~16, bullet-hell upward).
+//
+// Usage:
+//
+//   import "stbprojectile.bsm";
+//
+//   auto pp;
+//   pp = projectile_pool_new(64);
+//
+//   // Spawn an arrow flying from (sx, sy) toward (dx, dy) in
+//   // ~600 ms, carrying target eid 42 as the payload word.
+//   auto dx_step, dy_step;
+//   dx_step = (dx - sx) * 1000 / 600;   // px/sec
+//   dy_step = (dy - sy) * 1000 / 600;
+//   projectile_spawn(pp, sx, sy, 0,
+//                    dx_step, dy_step, 0,
+//                    0,                    // no gravity (flat 2D)
+//                    600,                  // lifetime_ms
+//                    42);                  // payload — target eid
+//
+//   // Per frame:
+//   projectile_tick(pp, game_dt_ms(), fn_ptr(my_on_impact));
+//   projectile_each(pp, fn_ptr(my_collision_check));
+//
+//   // my_on_impact(slot) reads slot->payload_w, applies damage.
+//   // my_collision_check(slot) reads slot->x/y, tests overlap,
+//   // calls projectile_kill(pp, slot) on early hit.
+//
+// Coordinate units: the cartridge is unit-agnostic. Caller picks
+// pixels-per-second or tiles-per-second or whatever — the math is
+// `pos += vel * dt_ms / 1000`. Stay consistent across spawn /
+// tick / consumer-side rendering.
+
+import "stbpool.bsm";
+
+// ── Slot layout ──────────────────────────────────────────────
+//
+// One Projectile per live missile. The pool's free-list reuses the
+// first 8 bytes of each FREE slot to thread the next-pointer —
+// nothing in this cartridge depends on field bytes surviving across
+// a put → get cycle. Fresh spawn re-initialises every field.
+//
+// `payload_w` is one word (eid, struct ptr, damage word, anything).
+// Game-side casts it to whatever shape the consumer cares about.
+struct Projectile {
+    x, y, z,                   // position
+    vx, vy, vz,                // velocity (units per second)
+    gravity_z,                 // 0 = straight-line; positive = arc
+    elapsed_ms,
+    lifetime_ms,
+    payload_w
+}
+
+// ── Pool wrapper ─────────────────────────────────────────────
+//
+// `alive` is a parallel byte array — slot i is in flight iff
+// alive[i] == 1. We can't rely on a "live" bit inside Projectile
+// because stbpool overwrites the first 8 bytes of freed slots
+// with the freelist next-pointer; the canonical "is this slot
+// in use" signal lives outside the pool buffer.
+struct ProjectilePool {
+    pool,             // stbpool handle (obj_size = sizeof(Projectile))
+    alive,            // buf_byte(capacity) — 1 if slot live, 0 if free
+    capacity,
+    obj_size          // cached so the hot loop avoids one struct deref
+}
+
+// ── Lifecycle ────────────────────────────────────────────────
+
+// Allocate a pool sized for `capacity` simultaneous projectiles.
+// Pick the cap to the peak concurrency the game expects — RTS WC1
+// targets ~64, FPS Doom-mode ~32, top-down RPG ~16. Going higher
+// is cheap (sizeof(Projectile) ~= 80 bytes/slot + 1 alive byte).
+projectile_pool_new(capacity) {
+    auto pp: ProjectilePool, i;
+    pp = malloc(sizeof(ProjectilePool));
+    pp.obj_size = sizeof(Projectile);
+    pp.pool     = pool_new(pp.obj_size, capacity);
+    pp.alive    = buf_byte(capacity);
+    pp.capacity = capacity;
+    for (i = 0; i < capacity; i++) { poke(pp.alive + i, 0); }
+    return pp;
+}
+
+// Tear down the pool. Caller is responsible for any payload-side
+// resources tracked through `payload_w` (eids, struct ptrs) —
+// stbprojectile only owns the projectile slots themselves.
+void projectile_pool_free(pp: ProjectilePool) {
+    pool_free(pp.pool);
+    free(pp.alive);
+    free(pp);
+}
+
+// ── Spawn / kill ─────────────────────────────────────────────
+
+// Spawn one projectile into the pool. Returns the slot pointer
+// (game-side can re-read it later, e.g. for early-kill on hit), or
+// 0 if the pool is full. The slot stays live until either the
+// lifetime budget expires (projectile_tick auto-dispatches) or the
+// caller explicitly invokes projectile_kill.
+//
+// Velocity units = pixels-per-second (or whatever consistent unit
+// the consuming game uses). Lifetime is in milliseconds.
+projectile_spawn(pp: ProjectilePool, x, y, z, vx, vy, vz,
+                 gravity_z, lifetime_ms, payload_w) {
+    auto p: Projectile, slot, idx, p_pool: Pool;
+    slot = pool_get(pp.pool);
+    if (slot == 0) { return 0; }
+    p_pool = pp.pool;
+    idx = (slot - p_pool.buf) / pp.obj_size;
+    poke(pp.alive + idx, 1);
+    p = slot;
+    p.x  = x;  p.y  = y;  p.z  = z;
+    p.vx = vx; p.vy = vy; p.vz = vz;
+    p.gravity_z   = gravity_z;
+    p.elapsed_ms  = 0;
+    p.lifetime_ms = lifetime_ms;
+    p.payload_w   = payload_w;
+    return slot;
+}
+
+// Explicit despawn — used by the consuming game when a collision
+// check decides the projectile has hit something and shouldn't
+// continue flying (e.g. RTS arrow tagged target). Lifetime-expired
+// despawn is handled internally by projectile_tick; callers don't
+// need to invoke projectile_kill in that case.
+void projectile_kill(pp: ProjectilePool, slot) {
+    auto idx, p_pool: Pool;
+    p_pool = pp.pool;
+    idx = (slot - p_pool.buf) / pp.obj_size;
+    poke(pp.alive + idx, 0);
+    pool_put(pp.pool, slot);
+}
+
+// ── Per-frame tick ───────────────────────────────────────────
+
+// Advance every live projectile by `dt_ms` and dispatch
+// `on_expire_fn(slot)` for each slot whose lifetime budget runs
+// out this frame. The expire callback is called BEFORE the slot
+// is recycled, so it can read the payload + apply impact damage.
+// Pass 0 for `on_expire_fn` to silently discard expired slots.
+//
+// Motion math: pos += vel * dt_ms / 1000 (integer divide — the
+// engine intentionally avoids floats in the simulation hot path,
+// the same numeric convention rts1/stbphys/stbecs already share).
+// Gravity adds to vz only — pure 2D consumers leave gravity_z=0
+// and never see it touch their state.
+void projectile_tick(pp: ProjectilePool, dt_ms, on_expire_fn) {
+    auto i, slot, p: Projectile, p_pool: Pool;
+    p_pool = pp.pool;
+    for (i = 0; i < pp.capacity; i++) {
+        if (peek(pp.alive + i) == 0) { continue; }
+        slot = p_pool.buf + i * pp.obj_size;
+        p    = slot;
+        p.x = p.x + p.vx * dt_ms / 1000;
+        p.y = p.y + p.vy * dt_ms / 1000;
+        p.z = p.z + p.vz * dt_ms / 1000;
+        if (p.gravity_z != 0) {
+            p.vz = p.vz + p.gravity_z * dt_ms / 1000;
+        }
+        p.elapsed_ms = p.elapsed_ms + dt_ms;
+        if (p.elapsed_ms >= p.lifetime_ms) {
+            if (on_expire_fn != 0) { call(on_expire_fn, slot); }
+            poke(pp.alive + i, 0);
+            pool_put(pp.pool, slot);
+        }
+    }
+}
+
+// Walk every live projectile and dispatch `fn(slot)` once per. The
+// game-side uses this for mid-flight collision checks: read pos
+// from the slot, test against entities/tiles, call projectile_kill
+// if an early hit is detected. Safe to kill the slot from inside
+// the callback — the loop reads the alive bitmap before each
+// dispatch so a freed slot is skipped on subsequent iterations.
+void projectile_each(pp: ProjectilePool, fn) {
+    auto i, slot, p_pool: Pool;
+    p_pool = pp.pool;
+    for (i = 0; i < pp.capacity; i++) {
+        if (peek(pp.alive + i) == 0) { continue; }
+        slot = p_pool.buf + i * pp.obj_size;
+        call(fn, slot);
+    }
+}
+
+// Live projectile count. O(capacity); fine for HUDs / debug, not
+// for hot-loop budgeting. The underlying stbpool tracks its own
+// allocation count but we use the alive bitmap as the source of
+// truth so kills issued during projectile_tick stay consistent.
+projectile_count(pp: ProjectilePool) {
+    auto i, n;
+    n = 0;
+    for (i = 0; i < pp.capacity; i++) {
+        if (peek(pp.alive + i) != 0) { n++; }
+    }
+    return n;
+}

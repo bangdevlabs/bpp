@@ -36,6 +36,8 @@ load   "wc1_input.bsm";
 load   "wc1_hud.bsm";
 load   "wc1_movement.bsm";
 load   "wc1_combat.bsm";
+load   "wc1_missiles.bsm";
+load   "wc1_regen.bsm";
 
 // ── Constants ────────────────────────────────────────────
 
@@ -64,7 +66,19 @@ extrn world;
 // edits to the JSON or the underlying PNG re-propagate via
 // image_hot_reload_tick_throttled. peon_atlas is the orc-side
 // equivalent (same 5×13 grid, same frameTags, distinct pixels).
+// All 16 unit atlases loaded at startup. Global so wc1_render +
+// the debug spawn tick can pick the right sheet by kind. Atlases
+// are paired with UnitDef stats via the `kind` argument flowing
+// through ecs_spawn_unit; the atlas just provides pixels.
 extrn peasant_atlas, peon_atlas;
+extrn footman_atlas, grunt_atlas;
+extrn knight_atlas, raider_atlas;
+extrn archer_atlas, spearman_atlas;
+extrn cleric_atlas, conjurer_atlas;
+extrn necrolyte_atlas, warlock_atlas;
+extrn human_catapult_atlas, orc_catapult_atlas;
+extrn lothar_atlas, medivh_atlas;
+extrn arrow_atlas;
 
 // Camera handle — owned by main, read by tile_draw and the per-
 // entity render callback (which extrn's it). cam_pan / cam_set
@@ -93,11 +107,57 @@ void _reload_map() {
     }
 }
 
+// Load one atlas JSON from `assets/sprites/wc1/<name>`. Wraps the
+// path_asset + image_load + image_hot_reload_enable triple so the
+// per-unit load reads as a single line at the call site. Returns
+// the atlas handle on success or 0 on failure; the caller batches
+// the null check across the whole roster (image_free(0) is a no-op
+// so partial loads still clean up correctly via _free_all_atlases).
+static _load_wc1_atlas(name: ptr) {
+    auto path, full, atlas, prefix_len, name_len;
+    auto prefix: ptr;
+    prefix = "assets/sprites/wc1/";
+    prefix_len = str_len(prefix);
+    name_len   = str_len(name);
+    full = malloc(prefix_len + name_len + 1);
+    str_cpy(full, prefix);
+    str_cpy(full + prefix_len, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+// Release every unit atlas + the missile atlas. Safe to call with
+// partially-loaded state (image_free is null-tolerant). Called by
+// the failure path during init AND by the normal shutdown.
+static void _free_all_atlases() {
+    image_free(peasant_atlas);
+    image_free(peon_atlas);
+    image_free(footman_atlas);
+    image_free(grunt_atlas);
+    image_free(knight_atlas);
+    image_free(raider_atlas);
+    image_free(archer_atlas);
+    image_free(spearman_atlas);
+    image_free(cleric_atlas);
+    image_free(conjurer_atlas);
+    image_free(necrolyte_atlas);
+    image_free(warlock_atlas);
+    image_free(human_catapult_atlas);
+    image_free(orc_catapult_atlas);
+    image_free(lothar_atlas);
+    image_free(medivh_atlas);
+    image_free(arrow_atlas);
+}
+
 // ── Entry point ──────────────────────────────────────────
 
 main() {
-    auto tileset, tile_count, tm;
-    auto tileset_path: ptr;
+    auto tile_atlas, tm;
+    auto tileset_json_path: ptr;
 
     // Open the window + initialise input/draw/font/etc. via the
     // standard stbgame floor (Rule 23 — stbgame ships the floor
@@ -106,22 +166,28 @@ main() {
     game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
     render_init();
 
-    // Resolve the forest tileset PNG against the binary's own
-    // location — works from any CWD as long as the binary lives
-    // somewhere inside the games/rts1/ tree (canonical layout for
-    // B++ games; same convention as pathfind/rhythm/snake).
-    tileset_path = path_asset("assets/converted/graphics/tilesets/forest/terrain.png");
-
-    tileset = 0;
-    tile_count = tile_load_set(tileset_path, WC1_TILE_PX, WC1_TILE_PX, &tileset);
-    if (tile_count == 0) {
-        put_err("rts: failed to load tileset at ");
-        put_err(tileset_path);
+    // Resolve the forest tileset against the binary's own location
+    // — works from any CWD as long as the binary lives somewhere
+    // inside the games/rts1/ tree (canonical layout for B++ games;
+    // same convention as pathfind/rhythm/snake).
+    //
+    // The tileset loads through the modern atlas_grid path (single
+    // MTLTexture, sprite_id-indexed sub-rects) instead of the legacy
+    // tile_load_set / tile_bind_set pair (one MTLTexture per tile —
+    // 320 separate textures for the WC1 forest tileset, which both
+    // wastes bind cycles and surfaces visual artifacts under Phase
+    // 3.2 smart-bind batching). Pathfind has run this path since
+    // its inception; rts1 graduates to it as part of S7 closeout.
+    tileset_json_path = path_asset("assets/converted/graphics/tilesets/forest/terrain.json");
+    tile_atlas = image_load(tileset_json_path);
+    if (tile_atlas == 0) {
+        put_err("rts: failed to load tileset atlas at ");
+        put_err(tileset_json_path);
         put_err("\n");
-        free(tileset_path);
+        free(tileset_json_path);
         return 1;
     }
-    free(tileset_path);
+    free(tileset_json_path);
 
     // Load the converted forest1 map (64×64). The JSON shape
     // matches pathfind's level1.json — Bang 9's Levels tab can
@@ -139,48 +205,55 @@ main() {
         return 1;
     }
     tm = wc1_map_tm(map);
-    tile_bind_set(tm, tileset, tile_count);
+    tile_bind_image(tm, tile_atlas);
 
     // Hot-reload: re-runs _reload_map whenever forest1.json
     // changes on disk. Same rail pathfind uses for level1.json
     // edits in Bang 9.
     file_watch_register(_map_json_path, fn_ptr(_reload_map));
 
-    // Peasant atlas. Loaded from the atlas_grid sister JSON; the
-    // resolver concatenates JSON-dir + the `image` field and lets
-    // the OS open() collapse the `..` segments (see Tonify Rule 31
-    // + asset_formats.md "Atlas Grid JSON" entry). Hot-reload is
-    // opt-in; once enabled, edits to the JSON OR the underlying
-    // PNG re-propagate via image_hot_reload_tick_throttled().
-    auto atlas_path: ptr;
-    atlas_path = path_asset("assets/sprites/wc1/peasant.json");
-    peasant_atlas = image_load(atlas_path);
-    free(atlas_path);
-    if (peasant_atlas == 0) {
-        put_err("rts: peasant atlas load failed — exiting\n");
+    // Full WC1 sprite roster — atlases load through the atlas_grid
+    // sister JSON (`assets/sprites/wc1/<unit>.json`). `_load_wc1_atlas`
+    // wraps path_asset + image_load + image_hot_reload_enable; returns
+    // 0 on failure (caller checks). Hot-reload runs through
+    // image_hot_reload_tick_throttled below — edit the JSON or the
+    // sister PNG and the running game picks it up in ~30ms.
+    peasant_atlas        = _load_wc1_atlas("peasant.json");
+    peon_atlas           = _load_wc1_atlas("peon.json");
+    footman_atlas        = _load_wc1_atlas("footman.json");
+    grunt_atlas          = _load_wc1_atlas("grunt.json");
+    knight_atlas         = _load_wc1_atlas("knight.json");
+    raider_atlas         = _load_wc1_atlas("raider.json");
+    archer_atlas         = _load_wc1_atlas("archer.json");
+    spearman_atlas       = _load_wc1_atlas("spearman.json");
+    cleric_atlas         = _load_wc1_atlas("cleric.json");
+    conjurer_atlas       = _load_wc1_atlas("conjurer.json");
+    necrolyte_atlas      = _load_wc1_atlas("necrolyte.json");
+    warlock_atlas        = _load_wc1_atlas("warlock.json");
+    human_catapult_atlas = _load_wc1_atlas("human_catapult.json");
+    orc_catapult_atlas   = _load_wc1_atlas("orc_catapult.json");
+    lothar_atlas         = _load_wc1_atlas("lothar.json");
+    medivh_atlas         = _load_wc1_atlas("medivh.json");
+    arrow_atlas          = _load_wc1_atlas("arrow.json");
+
+    // Single failure check covers the whole batch — image_free(0)
+    // is a no-op so _free_all_atlases handles partial loads
+    // cleanly without per-atlas cascading.
+    if (peasant_atlas == 0 || peon_atlas == 0 ||
+        footman_atlas == 0 || grunt_atlas == 0 ||
+        knight_atlas  == 0 || raider_atlas == 0 ||
+        archer_atlas  == 0 || spearman_atlas == 0 ||
+        cleric_atlas  == 0 || conjurer_atlas == 0 ||
+        necrolyte_atlas == 0 || warlock_atlas == 0 ||
+        human_catapult_atlas == 0 || orc_catapult_atlas == 0 ||
+        lothar_atlas == 0 || medivh_atlas == 0 ||
+        arrow_atlas  == 0) {
+        put_err("rts: one or more unit atlases failed to load — exiting\n");
+        _free_all_atlases();
         wc1_map_free(map);
         free(_map_json_path);
         return 1;
     }
-    image_hot_reload_enable(peasant_atlas);
-    // Orc peon atlas — same Aseprite shape (5 × 13 grid + 10
-    // frameTags), distinct pixels. Loaded next to the peasant
-    // atlas so the spawner can route by kind. Cache anim ids
-    // only from the peasant atlas — both sheets share the same
-    // tag names so the cached ids are valid for either, and
-    // caching twice would waste cycles.
-    auto peon_path: ptr;
-    peon_path = path_asset("assets/sprites/wc1/peon.json");
-    peon_atlas = image_load(peon_path);
-    free(peon_path);
-    if (peon_atlas == 0) {
-        put_err("rts: peon atlas load failed — exiting\n");
-        image_free(peasant_atlas);
-        wc1_map_free(map);
-        free(_map_json_path);
-        return 1;
-    }
-    image_hot_reload_enable(peon_atlas);
     // Cache anim ids from the loaded sidecar's frameTags so the
     // per-frame render lookup is two array reads + modulo math
     // (no string compare). Must run AFTER image_load but BEFORE
@@ -206,7 +279,8 @@ main() {
     // and the shared occupancy grid is allocated inside movement_init.
     wc1_input_init();
     wc1_movement_init(map);
-    _spawn_units_from_level(world, peasant_atlas, peon_atlas, map);
+    wc1_missiles_init(arrow_atlas);
+    _spawn_units_from_level(world, map);
 
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
@@ -225,22 +299,28 @@ main() {
         _debug_spawn_tick();
         // Combat runs BEFORE movement so attackers can request a
         // fresh path-to-target this frame and the movement tick
-        // walks them toward weapon range immediately.
+        // walks them toward weapon range immediately. Missiles
+        // tick AFTER both so any arrows spawned by this frame's
+        // combat get one frame of motion before the next.
         wc1_combat_tick(world);
         wc1_movement_tick(world);
+        wc1_missiles_tick(world);
+        wc1_regen_tick(world);
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
         tile_draw(tm, cam_x(cam), cam_y(cam), SCREEN_W, SCREEN_H);
         ecs_render_units(world);
+        wc1_missiles_render();
         wc1_hud_render(world);
         game_render_end();
     }
 
     ecs_query_free(peasant_q);
     free(world);
-    image_free(peasant_atlas);
-    image_free(peon_atlas);
+    wc1_missiles_free();
+    _free_all_atlases();
+    image_free(tile_atlas);
     cam_free(cam);
     wc1_map_free(map);
     free(_map_json_path);
@@ -255,27 +335,54 @@ main() {
 // those handlers ship, the level editor can still author them
 // without crashing the game.
 //
-// Session 7 routes both "peasant" (human side) and "peon" (orc
-// side) through ecs_spawn_peasant — they are functionally the
-// same worker unit in war1gus and share gameplay stats. The
-// atlas is chosen per-kind so peasants render with the human
-// peasant sheet and peons with the orc peon sheet; the spawn
-// archetype is identical (same component set), only the Sprite
-// component's atlas pointer differs.
-static void _spawn_units_from_level(world, peasant_a, peon_a, map) {
-    auto i, n, k, p, sprite_a;
+// Session 7 routes every supported unit kind through ecs_spawn_unit,
+// picking the atlas + UnitDef by the entity's `kind` string in the
+// level JSON. Atlases are read from the module-global pointers (all
+// extrn'd at the top of the file) so the signature stays clean as
+// the roster grows. Unknown kinds are silently ignored — the level
+// editor can author placeholders before the spawn route lands.
+//
+// Workers (peasant/peon) share UNIT_PEASANT stats — only the
+// rendered atlas differs by faction. Same for casters / heroes
+// that aren't faction-mirrored: each kind keeps its own UnitDef
+// slot.
+static void _spawn_units_from_level(world, map) {
+    auto i, n, k, p, sprite_a, kind;
     n = wc1_map_entity_count(map);
     for (i = 0; i < n; i++) {
         k = wc1_map_entity_kind(map, i);
         p = wc1_map_entity_player(map, i);
         sprite_a = 0;
-        if (str_eq(k, "peasant") != 0) { sprite_a = peasant_a; }
-        if (str_eq(k, "peon") != 0)    { sprite_a = peon_a; }
+        kind     = 0 - 1;
+        // Workers — same stats, different atlas per faction.
+        if (str_eq(k, "peasant")        != 0) { sprite_a = peasant_atlas;        kind = UNIT_PEASANT;   }
+        if (str_eq(k, "peon")           != 0) { sprite_a = peon_atlas;           kind = UNIT_PEASANT;   }
+        // Light infantry.
+        if (str_eq(k, "footman")        != 0) { sprite_a = footman_atlas;        kind = UNIT_FOOTMAN;   }
+        if (str_eq(k, "grunt")          != 0) { sprite_a = grunt_atlas;          kind = UNIT_GRUNT;     }
+        // Cavalry.
+        if (str_eq(k, "knight")         != 0) { sprite_a = knight_atlas;         kind = UNIT_KNIGHT;    }
+        if (str_eq(k, "raider")         != 0) { sprite_a = raider_atlas;         kind = UNIT_RAIDER;    }
+        // Ranged infantry.
+        if (str_eq(k, "archer")         != 0) { sprite_a = archer_atlas;         kind = UNIT_ARCHER;    }
+        if (str_eq(k, "spearman")       != 0) { sprite_a = spearman_atlas;       kind = UNIT_SPEARMAN;  }
+        // Casters.
+        if (str_eq(k, "cleric")         != 0) { sprite_a = cleric_atlas;         kind = UNIT_CLERIC;    }
+        if (str_eq(k, "conjurer")       != 0) { sprite_a = conjurer_atlas;       kind = UNIT_CONJURER;  }
+        if (str_eq(k, "necrolyte")      != 0) { sprite_a = necrolyte_atlas;      kind = UNIT_NECROLYTE; }
+        if (str_eq(k, "warlock")        != 0) { sprite_a = warlock_atlas;        kind = UNIT_WARLOCK;   }
+        // Siege.
+        if (str_eq(k, "human_catapult") != 0) { sprite_a = human_catapult_atlas; kind = UNIT_CATAPULT;  }
+        if (str_eq(k, "orc_catapult")   != 0) { sprite_a = orc_catapult_atlas;   kind = UNIT_CATAPULT;  }
+        // Heroes (campaign).
+        if (str_eq(k, "lothar")         != 0) { sprite_a = lothar_atlas;         kind = UNIT_LOTHAR;    }
+        if (str_eq(k, "medivh")         != 0) { sprite_a = medivh_atlas;         kind = UNIT_MEDIVH;    }
+
         if (sprite_a != 0) {
-            ecs_spawn_peasant(world, sprite_a,
-                              wc1_map_entity_gx(map, i),
-                              wc1_map_entity_gy(map, i),
-                              p);
+            ecs_spawn_unit(world, sprite_a,
+                           wc1_map_entity_gx(map, i),
+                           wc1_map_entity_gy(map, i),
+                           p, kind);
         }
     }
 }
@@ -318,28 +425,92 @@ static void _seed_camera_from_level(map) {
 // spawn) lands, this can come out.
 static void _debug_spawn_tick() {
     auto mx, my, wx, wy, gx, gy, dx, dy, sx, sy;
-    if (key_pressed(KEY_P) == 0) { return; }
+    auto atlas, kind, player, cluster_w, cluster_h;
+    // Number keys 1..9 + 0 pick the unit kind to spawn at the
+    // mouse cursor. Keys deliberately don't overlap WASD (camera
+    // pan) or P (kept as a peasant alias from the S6 debug
+    // spawner). Each press = one cluster spawn (key_pressed is
+    // edge-triggered).
+    //
+    //   1 / Q → peasant  (human worker)        player 0
+    //   2     → footman  (human melee)         player 0
+    //   3     → knight   (human cavalry)       player 0
+    //   4     → archer   (human ranged)        player 0
+    //   5     → cleric   (human caster)        player 0
+    //   6     → conjurer (human caster)        player 0
+    //   7     → peon     (orc worker)          player 1
+    //   8     → grunt    (orc melee)           player 1
+    //   9     → raider   (orc cavalry)         player 1
+    //   0     → spearman (orc ranged)          player 1
+    //   -     → necrolyte (orc caster)         player 1
+    //   =     → warlock  (orc caster)          player 1
+    //   [     → catapult (human siege)         player 0
+    //   ]     → catapult (orc siege)           player 1
+    //   ;     → lothar   (human hero)          player 0
+    //   '     → medivh   (orc hero / mage)     player 1
+    atlas  = 0;
+    kind   = 0 - 1;
+    player = 0;
+    cluster_w = 1;
+    cluster_h = 1;
+    if (key_pressed(KEY_1) != 0) {
+        atlas = peasant_atlas;  kind = UNIT_PEASANT;  player = 0;
+        cluster_w = 5; cluster_h = 2;
+    } else if (key_pressed(KEY_2) != 0) {
+        atlas = footman_atlas;  kind = UNIT_FOOTMAN;  player = 0;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_3) != 0) {
+        atlas = knight_atlas;   kind = UNIT_KNIGHT;   player = 0;
+        cluster_w = 2; cluster_h = 1;
+    } else if (key_pressed(KEY_4) != 0) {
+        atlas = archer_atlas;   kind = UNIT_ARCHER;   player = 0;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_5) != 0) {
+        atlas = cleric_atlas;   kind = UNIT_CLERIC;   player = 0;
+    } else if (key_pressed(KEY_6) != 0) {
+        atlas = conjurer_atlas; kind = UNIT_CONJURER; player = 0;
+    } else if (key_pressed(KEY_7) != 0) {
+        atlas = peon_atlas;     kind = UNIT_PEASANT;  player = 1;
+        cluster_w = 5; cluster_h = 2;
+    } else if (key_pressed(KEY_8) != 0) {
+        atlas = grunt_atlas;    kind = UNIT_GRUNT;    player = 1;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_9) != 0) {
+        atlas = raider_atlas;   kind = UNIT_RAIDER;   player = 1;
+        cluster_w = 2; cluster_h = 1;
+    } else if (key_pressed(KEY_0) != 0) {
+        atlas = spearman_atlas; kind = UNIT_SPEARMAN; player = 1;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_MINUS) != 0) {
+        atlas = necrolyte_atlas; kind = UNIT_NECROLYTE; player = 1;
+    } else if (key_pressed(KEY_EQUAL) != 0) {
+        atlas = warlock_atlas;  kind = UNIT_WARLOCK;  player = 1;
+    } else if (key_pressed(KEY_LBRACKET) != 0) {
+        atlas = human_catapult_atlas; kind = UNIT_CATAPULT; player = 0;
+    } else if (key_pressed(KEY_RBRACKET) != 0) {
+        atlas = orc_catapult_atlas;   kind = UNIT_CATAPULT; player = 1;
+    } else if (key_pressed(KEY_SEMICOLON) != 0) {
+        atlas = lothar_atlas;   kind = UNIT_LOTHAR;   player = 0;
+    } else if (key_pressed(KEY_QUOTE) != 0) {
+        atlas = medivh_atlas;   kind = UNIT_MEDIVH;   player = 1;
+    } else {
+        return;
+    }
+    if (atlas == 0) { return; }   // unit class not yet wired
+
     mx = mouse_x();
     my = mouse_y();
     wx = cam_screen_to_world_x(cam, mx);
     wy = cam_screen_to_world_y(cam, my);
     gx = wx / 16;
     gy = wy / 16;
-    // 5 × 2 cluster centered on (gx, gy). Cells outside the grid
-    // are tolerated by ecs_spawn_peasant + path_find (out-of-bounds
-    // targets simply find no path); clamping the origin keeps the
-    // bulk of the cluster on-map even when the cursor sits near an
-    // edge.
-    for (dy = 0; dy < 2; dy++) {
-        for (dx = 0; dx < 5; dx++) {
-            sx = gx + dx - 2;
+    for (dy = 0; dy < cluster_h; dy++) {
+        for (dx = 0; dx < cluster_w; dx++) {
+            sx = gx + dx - cluster_w / 2;
             sy = gy + dy;
             if (sx < 0) { sx = 0; }
             if (sy < 0) { sy = 0; }
-            // Debug spawns belong to player 0 (human side) so the
-            // tester can marquee + command them with the existing
-            // single-player UX.
-            ecs_spawn_peasant(world, peasant_atlas, sx, sy, 0);
+            ecs_spawn_unit(world, atlas, sx, sy, player, kind);
         }
     }
 }

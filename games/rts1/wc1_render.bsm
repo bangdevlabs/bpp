@@ -57,12 +57,13 @@ struct Faction  { player }
 // energy when those tech upgrades land) all live behind one
 // handle. Consumers read via cs_stat_get / cs_res_current.
 struct Sheet    { handle }
-// AttackTarget records the entity the unit is currently engaging.
-// eid == -1 is the "no target" sentinel (matches Target.gx/gy's
-// convention). Right-click on an enemy unit writes it; right-
-// click on ground clears it. S7.3's combat tick reads it to
-// decide who to swing at.
-struct AttackTarget { eid }
+// AttackTarget records the entity the unit is currently engaging
+// plus the cooldown timer between swings. eid == -1 is the "no
+// target" sentinel (matches Target.gx/gy's convention). Right-
+// click on an enemy unit writes it; right-click on ground clears
+// it. last_attack_ms accumulates dt while in range; combat fires
+// when it crosses STAT_COOLDOWN_MS, then resets to 0.
+struct AttackTarget { eid, last_attack_ms }
 // Anim drives the per-unit animation state. `state` is one of
 // UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
 // — used to dispatch between idle anim and walk anim families.
@@ -126,29 +127,39 @@ ecs_wire(world) {
     peasant_q    = ecs_query(world, 0);
 }
 
-// Spawn one peasant at grid (gx, gy) owned by `player`. Returns the
-// encoded entity id so callers can hold onto it for later kills /
-// queries; the id is opaque (encoded with the archetype bit) and
-// only useful to ecs_get / ecs_kill_at. The `player` argument tags
-// the unit's Faction so S7+ combat can decide friend vs foe at
-// hit-test and tick time.
-ecs_spawn_peasant(world, atlas, gx, gy, player) {
+// Spawn one unit of `kind` (UNIT_PEASANT, UNIT_ARCHER, etc.) at
+// grid (gx, gy) owned by `player`. Returns the encoded entity id so
+// callers can hold onto it for later kills / queries; the id is
+// opaque (encoded with the archetype bit) and only useful to
+// ecs_get / ecs_kill_at. The `player` argument tags the unit's
+// Faction so combat can decide friend vs foe at hit-test and tick
+// time; the `kind` argument selects which UnitDef (HP / damage /
+// weapon range / etc.) seeds the per-unit CharSheet.
+//
+// All unit kinds share the same archetype today — same component
+// set, only the UnitType.kind tag and the Sheet stats differ.
+// Per-archetype fan-out (Rule 30 trigger) kicks in when a unit
+// class needs a STRUCTURALLY different component set (e.g.
+// buildings without Path, or stationary turrets without Sheet);
+// the workers / ranged / melee infantry / casters share this one.
+ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     auto eid;
     auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim;
     auto fa: Faction, sh: Sheet, at: AttackTarget;
     auto def: UnitDef;
+    def = unit_def_for(kind);
     eid = ecs_spawn_at(world, peasant_arch);
     p = ecs_get(world, pos_comp, eid);
     // Pos lives in PIXEL coords so the movement system can walk
-    // sub-tile each frame. Spawn places the peasant centered on
-    // the requested grid cell.
+    // sub-tile each frame. Spawn places the unit centered on the
+    // requested grid cell.
     p.x = gx * 16;
     p.y = gy * 16;
     s = ecs_get(world, sprite_comp, eid);
     s.atlas = atlas;
-    s.frame = PEASANT_IDLE_S;
+    s.frame = def.atlas_frame;
     u = ecs_get(world, unit_comp, eid);
-    u.kind = UNIT_PEASANT;
+    u.kind = kind;
     // Sentinel "no target" — movement consumer treats gx == -1
     // as "stay put" so a freshly spawned peasant doesn't try to
     // walk to (0, 0).
@@ -193,7 +204,6 @@ ecs_spawn_peasant(world, atlas, gx, gy, player) {
     // heal automatically. The handle is freed in S7.5's death
     // hook when the entity dies (today: leaks on quit, bounded
     // by the 256-unit cap).
-    def = unit_def_for(UNIT_PEASANT);
     sh = ecs_get(world, sheet_comp, eid);
     sh.handle = cs_new(WC1_STAT_COUNT, WC1_RES_COUNT);
     cs_stat_set(sh.handle, STAT_ARMOR,        def.armor);
@@ -203,12 +213,17 @@ ecs_spawn_peasant(world, atlas, gx, gy, player) {
     cs_stat_set(sh.handle, STAT_SIGHT_TILES,  def.sight_tiles);
     cs_stat_set(sh.handle, STAT_SIZE_CLASS,   def.size_class);
     cs_stat_set(sh.handle, STAT_DAMAGE_TYPE,  def.damage_type);
-    cs_res_init(sh.handle, RES_HP, def.hp);
+    cs_stat_set(sh.handle, STAT_ENERGY_COST,  def.energy_cost);
+    cs_res_init(sh.handle, RES_HP,      def.hp);
+    cs_res_init(sh.handle, RES_SHIELDS, def.start_shields);
+    cs_res_init(sh.handle, RES_ENERGY,  def.start_energy);
     // AttackTarget — sentinel -1 means "no target." Right-click
-    // on an enemy unit (wc1_input.bsm) writes the target eid; S7.3
-    // combat reads + engages.
+    // on an enemy unit (wc1_input.bsm) writes the target eid; the
+    // combat tick reads + engages. last_attack_ms accumulates
+    // toward STAT_COOLDOWN_MS while in range.
     at = ecs_get(world, attack_target_comp, eid);
     at.eid = -1;
+    at.last_attack_ms = 0;
     return eid;
 }
 
@@ -218,15 +233,25 @@ ecs_spawn_peasant(world, atlas, gx, gy, player) {
 // depending on whether the facing requires horizontal mirror (WC1
 // only stores 5 facings; W/NW/SW reuse E/NE/SE flipped).
 //
-// Sprite offset (-8 horizontal, -16 vertical) centers the 32 px
-// sprite on the unit's anchor position + bottom-aligns the feet,
-// matching the war1gus reference for peasant placement.
+// Per-entity render callback. Sprite size comes from the unit's
+// UnitDef (32 px for infantry / workers, 48 px for cavalry +
+// heroes — knight, raider, lothar, etc. — to fit the horse + rider
+// pixels). Offset math centers horizontally + bottom-aligns the
+// feet on the 16 px tile anchor: dx = -(px - 16) / 2, dy = -(px - 16).
+// For a 32 px sprite that yields (-8, -16); for a 48 px sprite,
+// (-16, -32). Matches the war1gus reference placement.
 static void _render_unit(w, eid) {
-    auto p: Pos, s: Sprite, an: Anim;
-    auto anim_id, flip, sprite_id, sx, sy;
-    p  = ecs_get(w, pos_comp, eid);
+    auto p: Pos, s: Sprite, an: Anim, u: UnitType;
+    auto def: UnitDef;
+    auto anim_id, flip, sprite_id, sx, sy, px, off_x, off_y;
+    p  = ecs_get(w, pos_comp,    eid);
     s  = ecs_get(w, sprite_comp, eid);
-    an = ecs_get(w, anim_comp, eid);
+    an = ecs_get(w, anim_comp,   eid);
+    u  = ecs_get(w, unit_comp,   eid);
+    def = unit_def_for(u.kind);
+    px = def.px_size;
+    off_x = 0 - (px - 16) / 2;
+    off_y = 0 - (px - 16);
     anim_id = 0;
     flip    = 0;
     wc1_anim_id_for(an.state, an.facing, &anim_id, &flip);
@@ -235,12 +260,12 @@ static void _render_unit(w, eid) {
     // sprite_id falls back to -1 — keep rendering the spawn-time
     // default frame instead of crashing.
     if (sprite_id < 0) { sprite_id = s.frame; }
-    sx = p.x - 8  - cam_x(cam);
-    sy = p.y - 16 - cam_y(cam);
+    sx = p.x + off_x - cam_x(cam);
+    sy = p.y + off_y - cam_y(cam);
     if (flip != 0) {
-        image_draw_size_flipped(s.atlas, sprite_id, sx, sy, 32, 32);
+        image_draw_size_flipped(s.atlas, sprite_id, sx, sy, px, px);
     } else {
-        image_draw_size(s.atlas, sprite_id, sx, sy, 32, 32);
+        image_draw_size(s.atlas, sprite_id, sx, sy, px, px);
     }
 }
 

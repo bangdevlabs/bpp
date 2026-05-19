@@ -3,18 +3,17 @@
 //
 // The converted-asset pipeline (war1tool → assets/converted/)
 // emits each WC1 unit as a single PNG file laid out as a uniform
-// row-major grid of frames (peasant.png = 5 cols × 13 rows of
-// 32×32 cells, packing idle + walk + chop + die + carry into one
-// strip). The B++ game side already had peasant.json in atlas_grid
-// shape addressing frames by integer index — that worked for
-// static rendering but ruled out named animations.
+// row-major grid of frames (e.g. peasant.png = 5 cols × 13 rows of
+// 32×32 cells, packing idle + walk + attack + die into one strip).
+// The B++ game side already had peasant.json in atlas_grid shape
+// addressing frames by integer index — that worked for static
+// rendering but ruled out named animations.
 //
 // This tool runs ONCE per unit PNG at asset-prep time and emits a
 // sidecar JSON in the literal Aseprite-export schema. Frames live
 // inside one PNG (preserved bit-for-bit) and the sidecar carries
 // per-frame bounding boxes plus named frameTags for each
-// animation (5 idle + 5 walk for v1; chop / die / carry tags land
-// in S7+ when the consumer is wired).
+// animation (5 idle + 5×(W-1) walk + 5×A attack + 5×D die).
 //
 // Tonify Rule 31 anchor: "If an asset arrives in a foreign syntax,
 // write a one-shot offline converter under tools/<game>_<asset>_
@@ -30,33 +29,55 @@
 //
 // Usage:
 //
-//   ./wc1_sprite_convert <input.png> <output_dir>
+//   ./wc1_sprite_convert <input.png> <output_dir> [walk_n] [atk_n] [die_n]
+//
+// The three integer args carry the war1gus animation schema —
+// the {walk, attack, death} counts passed to `GetFrameNumbers(5, ...)`
+// in `war1gus/scripts/anim.lua`. Defaults are the peasant/peon
+// schema (5, 4, 3) so the original use case still works arg-free.
+//
+// Common schemas (see anim.lua for the full table):
+//
+//   peasant / peon / cleric / sorceress    →  5 4 3
+//   footman / grunt / warlock / lothar     →  5 5 3
+//   archer / spearman                      →  5 2 3
+//   conjurer                               →  5 4 4
+//   necrolyte                              →  5 5 4
+//   knight / raider / ogre                 →  5 5 5
+//   brigand                                →  5 3 2
+//
+// Buildings ship under a different schema (single still frame +
+// collapse cycle, no per-direction layout) and land in a separate
+// codepath when S8 brings construction.
 //
 // Example:
 //
 //   ./wc1_sprite_convert \
-//     games/rts1/assets/converted/graphics/human/units/peasant.png \
-//     games/rts1/assets/sprites/wc1
+//     games/rts1/assets/converted/graphics/human/units/archer.png \
+//     games/rts1/assets/sprites/wc1  5 2 3
 //
 // Output:
 //
-//   <output_dir>/peasant.png   (copy of input, byte-identical)
-//   <output_dir>/peasant.json  (Aseprite-schema sidecar)
+//   <output_dir>/archer.png   (copy of input, byte-identical)
+//   <output_dir>/archer.json  (Aseprite-schema sidecar with
+//                              5 + 5*(W-1) + 5*A + 5*D tags)
 //
 // The output PNG carries the original pixels; the sidecar declares
-// frame slicing (uniform 32×32 grid) + frameTags for the known
-// peasant animations.
+// frame slicing (uniform 32×32 grid) + frameTags for every named
+// animation.
 
 // No imports needed — bpp_array, bpp_buf, bpp_io, bpp_str,
 // bpp_file are all auto-injected. Pure offline tool.
 
 // ── Layout knowledge embedded ───────────────────────────────
 
-// Peasant grid: 5 cols × 13 rows of 32×32 frames. Confirmed by
-// reading the war1tool output. If other units ship with different
-// grids, extend this with a per-unit lookup or pass via argv.
-const TILE_W = 32;
-const TILE_H = 32;
+// Default tile dimensions. WC1 sprites are mostly 32×32 (peasant,
+// peon, archer, spearman, caster, cleric, footman-on-foot...) but
+// the larger units (knight, raider, lothar, medivh) ship as 48×48
+// to fit horse + rider. The converter accepts overrides as the
+// trailing CLI args; default keeps the most common case arg-free.
+const DEFAULT_TILE_W = 32;
+const DEFAULT_TILE_H = 32;
 
 // Default frame duration (ms). 100 ms = 10 fps cycle, which feels
 // right for WC1's 5-frame walk anims (~500 ms per cycle, the
@@ -103,6 +124,23 @@ static void _bytecopy(dst, src, len) {
     for (i = 0; i < len; i++) {
         poke(dst + i, peek(src + i));
     }
+}
+
+// Parse a small positive integer from a null-terminated C string.
+// Returns the parsed value, or 0 if the string has no leading
+// digits. Matches the convention every B++ CLI tool uses for
+// integer argv parsing (see sprite_viewer / wc1_map_convert).
+static _parse_uint(s: ptr) {
+    auto v, i, ch;
+    v = 0;
+    i = 0;
+    while (1) {
+        ch = peek(s + i);
+        if (ch < '0' || ch > '9') { break; }
+        v = v * 10 + (ch - '0');
+        i++;
+    }
+    return v;
 }
 
 // Copy a file byte-for-byte. Used to mirror the source PNG into
@@ -225,69 +263,170 @@ static _emit_cell(sb, sheet_name: ptr, frame_idx, col, row, tile_w, tile_h) {
                        DEFAULT_FRAME_MS);
 }
 
-// Build the Aseprite-schema sidecar for the peasant PNG layout.
-// The war1tool output is COLUMN-MAJOR within each animation —
-// each column maps to a direction (N/NE/E/SE/S), each row to a
-// frame inside that direction's cycle. The previous version of
-// this converter assumed row-major emission, which made
-// `walk_S` (intended frames 25-29) actually point at PNG row 5
-// (the WALK_N cycle), so the running game played the north
-// frames for any unit walking south.
+// Port of war1gus `GetFrameNumbers(5, {W, A, D})` from
+// `scripts/anim.lua`. Computes the PNG-row index where each
+// animation frame lives, given the war1gus schema (walk_n, atk_n,
+// die_n) — counts of frames per direction.
 //
-// Fix: reorder the frame emission so the on-disk frame index is
-// CONTIGUOUS per tag. Each frame still references its true PNG
-// bbox; only the iteration order changes.
+// The algorithm walks a round-robin (walk → attack → death → walk
+// → ...) cursor, decrementing the current type's counter and
+// advancing past any whose counter has hit zero. Row 0 is reserved
+// for idle (the implicit first move frame); the cursor starts at
+// PNG row 1.
 //
-// PNG-row → animation-type map comes from war1gus's
-// `GetFrameNumbers(5, {5, 4, 3})` round-robin schedule (peasant +
-// peon). The function emits ONE PNG row per iteration in a
-// rotating (move, attack, death) sequence, with the move counter
-// decremented by one up front. Tracing manually for peasant:
+// Output buffers receive 1-based PNG row indices:
+//   - out_walk_rows[0 .. walk_n - 2]   (walk_n - 1 entries, idle
+//                                       takes the first walk slot)
+//   - out_atk_rows[0 .. atk_n - 1]
+//   - out_die_rows[0 .. die_n - 1]
 //
-//   row 0:  idle (one frame per direction)
-//   row 1:  chop[0]  per direction        row 7:  chop[2]
-//   row 2:  die[0]   per direction        row 8:  die[2]
-//   row 3:  walk[0]  per direction        row 9:  walk[2]
-//   row 4:  chop[1]                       row 10: chop[3]
-//   row 5:  die[1]                        row 11: walk[3]
-//   row 6:  walk[1]                       row 12: unused
+// Caller is responsible for allocating buffers of the right size.
+// Sanity-checked against the hardcoded peasant table (5,4,3) before
+// generalizing — see commit history.
+static _compute_schema(walk_n, atk_n, die_n,
+                       out_walk_rows: ptr, out_atk_rows: ptr, out_die_rows: ptr) {
+    auto counter, total, itype;
+    auto walk_pos, atk_pos, die_pos;
+    auto i;
+    counter = buf_word(3);
+    // counter[0]/[1]/[2] = walk / attack / death frames remaining.
+    // walk_n is the war1gus "move" count which INCLUDES idle; the
+    // round-robin emits walk_n - 1 walk frames because row 0 is
+    // idle. The counter init mirrors war1gus's pre-loop decrement.
+    counter[0] = walk_n;
+    counter[1] = atk_n;
+    counter[2] = die_n;
+    total = (walk_n - 1) + atk_n + die_n;
+    itype = 0;
+    walk_pos = 0; atk_pos = 0; die_pos = 0;
+    for (i = 1; i <= total; i++) {
+        // Decrement current type, then hop forward to the next
+        // type with frames still owed. The mod-3 + while loop is
+        // the literal translation of war1gus's recursive nextType.
+        counter[itype] = counter[itype] - 1;
+        itype = (itype + 1) % 3;
+        while (counter[itype] == 0) {
+            itype = (itype + 1) % 3;
+        }
+        if (itype == 0) {
+            out_walk_rows[walk_pos] = i;
+            walk_pos++;
+        }
+        if (itype == 1) {
+            out_atk_rows[atk_pos] = i;
+            atk_pos++;
+        }
+        if (itype == 2) {
+            out_die_rows[die_pos] = i;
+            die_pos++;
+        }
+    }
+    free(counter);
+}
+
+// Emit one family of direction-suffixed frameTags into the strbuf.
+// e.g. with prefix "walk" + 5 directions + 4 frames-per-dir starting
+// at frame index 5, writes 5 tags:
+//   walk_N  (5..8)
+//   walk_NE (9..12)
+//   walk_E  (13..16)
+//   walk_SE (17..20)
+//   walk_S  (21..24)
 //
-// Per-direction frame counts: 1 idle + 4 walk + 4 chop + 3 die +
-// 1 unused-pad = 13 rows × 5 cols = 65 cells.  Each PNG column
-// IS one facing (N / NE / E / SE / S).
+// Returns the new strbuf head + writes the next-free frame index
+// through `out_next` so chained calls don't need to recompute the
+// running offset. `leading_comma` (1 = prepend comma before first
+// tag, 0 = suppress) lets the caller chain families inside an
+// existing JSON array without producing `[,...]` or `[...,]`.
+static _emit_dir_tags(sb, prefix: ptr, start_idx, frames_per_dir,
+                      leading_comma, out_next: ptr) {
+    auto d, from, to, name_buf, prefix_len;
+    // Direction suffixes hardcoded to the WC1 5-facing convention
+    // (N → S clockwise; W/NW/SW use horizontal flip at render time
+    // and don't appear in the atlas). num_dirs = 5 always.
+    auto dir_suffixes;
+    dir_suffixes = buf_word(5);
+    dir_suffixes[0] = "N";
+    dir_suffixes[1] = "NE";
+    dir_suffixes[2] = "E";
+    dir_suffixes[3] = "SE";
+    dir_suffixes[4] = "S";
+
+    prefix_len = str_len(prefix);
+    name_buf = malloc(prefix_len + 4 + 1);  // prefix + "_NE" + nul
+
+    for (d = 0; d < 5; d++) {
+        auto suffix, suffix_len;
+        if (d > 0 || leading_comma != 0) { sb = strbuf_ch(sb, ','); }
+        _bytecopy(name_buf, prefix, prefix_len);
+        poke(name_buf + prefix_len, '_');
+        suffix = dir_suffixes[d];
+        suffix_len = str_len(suffix);
+        _bytecopy(name_buf + prefix_len + 1, suffix, suffix_len);
+        poke(name_buf + prefix_len + 1 + suffix_len, 0);
+        from = start_idx + d * frames_per_dir;
+        to   = from + frames_per_dir - 1;
+        sb = _emit_frame_tag(sb, name_buf, from, to);
+    }
+    *(out_next) = start_idx + 5 * frames_per_dir;
+    free(name_buf);
+    free(dir_suffixes);
+    return sb;
+}
+
+// Build the Aseprite-schema sidecar for one war1tool PNG strip
+// using the (walk_n, atk_n, die_n) schema. The war1tool output is
+// COLUMN-MAJOR within each animation — each PNG column maps to a
+// direction (N/NE/E/SE/S), each row to a frame inside that
+// direction's cycle.
 //
-// Aseprite emission order is direction-major per anim type so the
-// tag ranges stay contiguous:
+// The PNG-row → anim-type map is computed by `_compute_schema`,
+// the verbatim port of war1gus's `GetFrameNumbers`. Row 0 is
+// always idle (the implicit first move frame); the round-robin
+// fills rows 1..(walk_n-1 + atk_n + die_n) with attack/death/walk
+// rotating one row at a time. Extra PNG rows past the schema (e.g.
+// peasant.png has 13 rows but its 5,4,3 schema only fills 12) are
+// emitted as untagged padding so the JSON's `frames` array still
+// covers every PNG cell.
 //
-//   frame_idx 0..4    idle N..S            (row 0)
-//   frame_idx 5..24   walk N..S × 4 frames (rows 3, 6, 9, 11)
-//   frame_idx 25..44  chop N..S × 4 frames (rows 1, 4, 7, 10)
-//   frame_idx 45..59  die  N..S × 3 frames (rows 2, 5, 8)
-//   frame_idx 60..64  row 12 (unused-pad — no tag refers to these
-//                     but the JSON's `frames` array must cover
-//                     every PNG cell to stay schema-valid).
+// Frame layout in the sidecar (direction-major per anim family so
+// each tag's from..to range stays contiguous):
 //
-// (For non-peasant unit kinds with different frameNumbers, this
-// emission needs a per-kind variant — defer until a real
-// consumer adds footman / archer / cleric / catapult sheets.)
+//   idle    : 5 frames                — frames 0..4
+//   walk    : 5 * (walk_n - 1) frames — starts at 5
+//   attack  : 5 * atk_n frames        — starts at 5 + 5*(walk_n-1)
+//   die     : 5 * die_n frames        — starts after attack
+//   padding : 5 * extra_rows frames   — untagged tail
 //
 // Returns 0 on success, -1 on write failure.
 static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
                      sheet_name: ptr, image_w, image_h,
-                     cols, rows, tile_w, tile_h) {
+                     cols, rows, tile_w, tile_h,
+                     walk_n, atk_n, die_n) {
     auto sb, idx, dir, frame_in_cycle, col, rc;
-    auto walk_rows, chop_rows, die_rows;
+    auto walk_rows, atk_rows, die_rows;
+    auto walks_per_dir, total_used_rows, extra_rows, pad_row;
+    auto idle_start, walk_start, atk_start, die_start, next_idx;
 
     sb = strbuf_new();
 
-    // PNG-row maps per anim type, derived from war1gus's
-    // frameNumbers_5_5_4_3 round-robin (see header comment).
-    walk_rows = buf_word(4);
-    walk_rows[0] = 3; walk_rows[1] = 6; walk_rows[2] = 9; walk_rows[3] = 11;
-    chop_rows = buf_word(4);
-    chop_rows[0] = 1; chop_rows[1] = 4; chop_rows[2] = 7; chop_rows[3] = 10;
-    die_rows = buf_word(3);
-    die_rows[0] = 2; die_rows[1] = 5; die_rows[2] = 8;
+    // Round-robin row schedule per war1gus GetFrameNumbers.
+    // walks_per_dir = walk_n - 1 because row 0 (idle) consumes the
+    // first move slot. Buffers are sized to the schema; oversized
+    // allocations would be harmless but waste a couple of words.
+    walks_per_dir = walk_n - 1;
+    walk_rows = buf_word(walks_per_dir);
+    atk_rows  = buf_word(atk_n);
+    die_rows  = buf_word(die_n);
+    _compute_schema(walk_n, atk_n, die_n, walk_rows, atk_rows, die_rows);
+
+    // How many PNG rows the schema actually fills: 1 idle + the
+    // round-robin total. Anything past that is emitted as untagged
+    // padding (peasant.png has 1 extra; archer / spearman /
+    // conjurer / warlock have 0).
+    total_used_rows = 1 + walks_per_dir + atk_n + die_n;
+    extra_rows = rows - total_used_rows;
+    if (extra_rows < 0) { extra_rows = 0; }
 
     // Top-level open + frames array (Aseprite "Array" output).
     sb = strbuf_cat(sb, "{\"frames\":[");
@@ -300,10 +439,9 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
         idx++;
     }
 
-    // Walk: 4 frames per direction at rows {3, 6, 9, 11}.
-    // Direction-major so each tag's from..to range is contiguous.
+    // Walk: walks_per_dir frames per direction.
     for (dir = 0; dir < cols; dir++) {
-        for (frame_in_cycle = 0; frame_in_cycle < 4; frame_in_cycle++) {
+        for (frame_in_cycle = 0; frame_in_cycle < walks_per_dir; frame_in_cycle++) {
             sb = strbuf_ch(sb, ',');
             sb = _emit_cell(sb, sheet_name, idx,
                             dir, walk_rows[frame_in_cycle],
@@ -312,20 +450,20 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
         }
     }
 
-    // Chop: 4 frames per direction at rows {1, 4, 7, 10}.
+    // Attack: atk_n frames per direction.
     for (dir = 0; dir < cols; dir++) {
-        for (frame_in_cycle = 0; frame_in_cycle < 4; frame_in_cycle++) {
+        for (frame_in_cycle = 0; frame_in_cycle < atk_n; frame_in_cycle++) {
             sb = strbuf_ch(sb, ',');
             sb = _emit_cell(sb, sheet_name, idx,
-                            dir, chop_rows[frame_in_cycle],
+                            dir, atk_rows[frame_in_cycle],
                             tile_w, tile_h);
             idx++;
         }
     }
 
-    // Die: 3 frames per direction at rows {2, 5, 8}.
+    // Die: die_n frames per direction.
     for (dir = 0; dir < cols; dir++) {
-        for (frame_in_cycle = 0; frame_in_cycle < 3; frame_in_cycle++) {
+        for (frame_in_cycle = 0; frame_in_cycle < die_n; frame_in_cycle++) {
             sb = strbuf_ch(sb, ',');
             sb = _emit_cell(sb, sheet_name, idx,
                             dir, die_rows[frame_in_cycle],
@@ -334,16 +472,20 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
         }
     }
 
-    // Unused row 12 — emit as padding so the JSON `frames` array
-    // covers every PNG cell. No tag references these.
-    for (col = 0; col < cols; col++) {
-        sb = strbuf_ch(sb, ',');
-        sb = _emit_cell(sb, sheet_name, idx, col, 12, tile_w, tile_h);
-        idx++;
+    // Extra PNG rows past the schema — emit as padding so the JSON
+    // `frames` array covers every PNG cell. No tag references these.
+    for (pad_row = 0; pad_row < extra_rows; pad_row++) {
+        for (col = 0; col < cols; col++) {
+            sb = strbuf_ch(sb, ',');
+            sb = _emit_cell(sb, sheet_name, idx, col,
+                            total_used_rows + pad_row,
+                            tile_w, tile_h);
+            idx++;
+        }
     }
 
     free(walk_rows);
-    free(chop_rows);
+    free(atk_rows);
     free(die_rows);
     sb = strbuf_cat(sb, "],");
 
@@ -356,29 +498,14 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
     sb = strbuf_num(sb, image_h);
     sb = strbuf_cat(sb, "},\"scale\":\"1\",\"format\":\"RGBA8888\",");
 
-    // frameTags — index ranges match the reordered emission above.
-    // Walk/chop are 4 frames per direction, die is 3 frames.
+    // frameTags — four direction-suffixed families, chained via
+    // `next_idx` so each picks up where the previous one ended.
     sb = strbuf_cat(sb, "\"frameTags\":[");
-    sb = _emit_frame_tag(sb, "idle_N",   0,  0);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_NE",  1,  1);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_E",   2,  2);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_SE",  3,  3);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "idle_S",   4,  4);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_N",   5,  8);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_NE",  9, 12);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_E",  13, 16);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_SE", 17, 20);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "walk_S",  21, 24);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_N",  25, 28);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_NE", 29, 32);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_E",  33, 36);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_SE", 37, 40);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "chop_S",  41, 44);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_N",   45, 47);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_NE",  48, 50);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_E",   51, 53);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_SE",  54, 56);  sb = strbuf_ch(sb, ',');
-    sb = _emit_frame_tag(sb, "die_S",   57, 59);
+    idle_start = 0;
+    sb = _emit_dir_tags(sb, "idle",   idle_start, 1,             0, &walk_start);
+    sb = _emit_dir_tags(sb, "walk",   walk_start, walks_per_dir, 1, &atk_start);
+    sb = _emit_dir_tags(sb, "attack", atk_start,  atk_n,         1, &die_start);
+    sb = _emit_dir_tags(sb, "die",    die_start,  die_n,         1, &next_idx);
     sb = strbuf_cat(sb, "]}}\n");
 
     rc = file_write_all(sidecar_path, sb, strbuf_len(sb));
@@ -395,14 +522,41 @@ main() {
     auto name_buf, name_len;
     auto dst_png, dst_json;
     auto w, h, cols, rows;
-    auto rc;
+    auto rc, walk_n, atk_n, die_n, tile_w, tile_h;
 
     if (argc_get() < 3) {
-        putstr_err("usage: wc1_sprite_convert <input.png> <output_dir>\n");
+        putstr_err("usage: wc1_sprite_convert <input.png> <output_dir> [walk_n] [atk_n] [die_n] [tile_w] [tile_h]\n");
+        putstr_err("  walk_n / atk_n / die_n — war1gus schema, defaults 5 4 3 (peasant)\n");
+        putstr_err("  tile_w / tile_h        — frame dims in px, defaults 32 32\n");
+        putstr_err("                            (48 48 for knight / raider / lothar)\n");
         return 1;
     }
     in_path = argv_get(1);
     out_dir = argv_get(2);
+
+    // Optional schema args — peasant/peon (5,4,3) by default. Each
+    // arg is a positional integer in war1gus's `GetFrameNumbers`
+    // shape. See the file header for the common-unit table.
+    walk_n = 5;
+    atk_n  = 4;
+    die_n  = 3;
+    tile_w = DEFAULT_TILE_W;
+    tile_h = DEFAULT_TILE_H;
+    if (argc_get() >= 4) { walk_n = _parse_uint(argv_get(3)); }
+    if (argc_get() >= 5) { atk_n  = _parse_uint(argv_get(4)); }
+    if (argc_get() >= 6) { die_n  = _parse_uint(argv_get(5)); }
+    if (argc_get() >= 7) { tile_w = _parse_uint(argv_get(6)); }
+    if (argc_get() >= 8) { tile_h = _parse_uint(argv_get(7)); }
+
+    // Sanity: walk_n must be at least 1 (reserves the idle frame).
+    // atk_n / die_n may be 0 for units with no attack or no death
+    // animation (none currently, but the math handles it).
+    if (walk_n < 1) {
+        put_err("wc1_sprite_convert: walk_n must be >= 1 (got ");
+        putnum_err(walk_n);
+        put_err(")\n");
+        return 1;
+    }
 
     // Derive the sheet name from the input filename: drop the
     // directory prefix + `.png` extension. "peasant.png" → "peasant",
@@ -430,22 +584,24 @@ main() {
         return 1;
     }
 
-    // Validate uniform grid.
-    if (w % TILE_W != 0 || h % TILE_H != 0) {
+    // Validate uniform grid against the (caller-provided or default)
+    // tile dimensions. Mismatch is fatal — the converter does not
+    // guess geometry; pass the right tile_w/tile_h for the unit.
+    if (w % tile_w != 0 || h % tile_h != 0) {
         put_err("wc1_sprite_convert: image dimensions ");
         putnum_err(w);
         put_err("x");
         putnum_err(h);
         put_err(" are not a multiple of ");
-        putnum_err(TILE_W);
+        putnum_err(tile_w);
         put_err("x");
-        putnum_err(TILE_H);
+        putnum_err(tile_h);
         put_err("\n");
         free(name_buf);
         return 1;
     }
-    cols = w / TILE_W;
-    rows = h / TILE_H;
+    cols = w / tile_w;
+    rows = h / tile_h;
 
     // Build destination paths: <out_dir>/<name>.png + <name>.json
     auto out_len, png_len, json_len;
@@ -497,7 +653,8 @@ main() {
     poke(image_basename + name_len + 4, 0);
 
     rc = _emit_sidecar(dst_json, image_basename, name_buf,
-                       w, h, cols, rows, TILE_W, TILE_H);
+                       w, h, cols, rows, tile_w, tile_h,
+                       walk_n, atk_n, die_n);
     if (rc != 0) {
         put_err("wc1_sprite_convert: failed to write sidecar ");
         putstr_err(dst_json);
@@ -509,14 +666,18 @@ main() {
     // Stats line. Use putstr explicitly for the ptr-typed dst
     // paths so the smart-dispatch doesn't fall back to the
     // integer formatter (W032 — declared untyped to land malloc
-    // returns cleanly).
+    // returns cleanly). Tag count is 5*(idle + walk + attack + die)
+    // families = 5*4 = 20 named tags (idle always present even when
+    // walk_n == 1, since the idle row is unconditional).
     putstr("wc1_sprite_convert: ");
     putstr(in_path);
     putstr(" -> ");
     putstr(dst_png);
     putstr(" + ");
     putstr(dst_json);
-    putstr(" (");
+    putstr(" (schema ");
+    putnum(walk_n); putstr(","); putnum(atk_n); putstr(","); putnum(die_n);
+    putstr(", ");
     putnum(cols * rows);
     putstr(" frames, ");
     putnum(cols);

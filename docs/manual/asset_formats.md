@@ -112,9 +112,43 @@ bottom, left-to-right. Tile `1` is at PNG `(0, 0)`. Tile `N` lives
 at PNG `((N - 1) % cols * tw, (N - 1) / cols * th)`. ID `0` is
 reserved for "empty" and never references a PNG cell.
 
-This is the SAME convention `stbtile`'s `tile_load_set` produces.
 Tile IDs round-trip cleanly: war1tool → `wc1_map_convert` → JSON
 → Level Editor → game.
+
+### Loader pipeline (canonical)
+
+The tileset PNG ships with a sister JSON sidecar in the
+**atlas_grid** shape (documented later in this file). The game
+loads the sidecar via `image_load(...)` and binds the result to
+its tilemap via `stbtile.tile_bind_image`:
+
+```bpp
+auto tile_atlas, tm;
+tile_atlas = image_load(path_asset("assets/converted/graphics/tilesets/forest/terrain.json"));
+tm = wc1_map_tm(map);
+tile_bind_image(tm, tile_atlas);          // single shared MTLTexture
+```
+
+The sister sidecar lives next to the PNG:
+
+```json
+{ "type": "atlas_grid", "tile_w": 16, "tile_h": 16, "image": "terrain.png" }
+```
+
+This routes every visible cell through `image_draw_size` on a
+shared MTLTexture — Phase 3.2 smart-bind coalesces them into a
+single `drawPrimitives` call per frame, regardless of how many
+distinct tile types are on screen.
+
+**Avoid `tile_load_set` + `tile_bind_set`.** The legacy pair
+slices the PNG into ONE MTLTexture PER TILE (320 separate
+textures for the WC1 forest tileset). Beyond the bind-overhead
+penalty, the legacy path surfaces visual artifacts under smart-
+bind batching — `rts1` ran on it through S7.3 and the map
+rendered as a checkerboard of mis-sampled neighbour cells until
+S7.4 closeout migrated to `tile_bind_image`. The legacy path
+stays in `stbtile.bsm` for back-compat with games that have not
+been migrated yet; do not use it for new code.
 
 ### Entity entries
 

@@ -1,0 +1,280 @@
+// wc1_missiles.bsm — RTS-side glue around stbprojectile.
+//
+// Tier-3 game cartridge that wraps the generic Tier-2 projectile
+// pool (`stb/stbprojectile`) with the WC1-specific bits:
+//
+//   - Target-locked spawn: arrow flies toward the target's launch-
+//     time position (predictive, not homing — matches WC1's
+//     tile-paced combat where targets rarely dodge in flight).
+//   - Damage matrix application on impact: re-uses the same
+//     `mult% × raw - armor` formula combat melee applies, but
+//     reads target stats at IMPACT time (so an upgrade or shield
+//     change between launch and arrival lands correctly).
+//   - Stale-target tolerance: target may have died (or its row
+//     recycled) before impact — payload check skips applying
+//     damage to a dead/stale eid.
+//   - Direction-aware sprite render: 5 of the WC1 arrow.png
+//     frames map to N/NE/E/SE/S; W/NW/SW flip the E-side frames
+//     horizontally, same convention as unit sprites.
+//
+// What this file does NOT own (lives in stbprojectile):
+//   - Motion math (pos += vel * dt / 1000)
+//   - Pool allocation / freelist
+//   - Lifetime expire dispatch
+//
+// What this file does NOT own (lives in wc1_combat):
+//   - When to spawn a missile (combat_step decides "in range +
+//     ranged weapon")
+//   - Cooldown gating between successive shots
+//
+// One pool for the whole game — RTS-scale concurrent missile
+// count (~64) fits comfortably in the bounded allocation.
+
+import "stbprojectile.bsm";
+import "stbecs.bsm";
+import "stbcharsheet.bsm";
+import "stbimage.bsm";
+import "stbcamera.bsm";
+load   "wc1_units.bsm";
+load   "wc1_anims.bsm";
+
+// ── Module state ─────────────────────────────────────────────
+
+// Single pool of arrow / spear / fireball slots. Sized for RTS
+// peak concurrency: 64 missiles in flight ≈ 32 attacking units
+// each with one arrow in the air. Bump if a future scenario
+// (siege, mass ranged) needs more.
+const _MISSILE_POOL_SIZE = 64;
+
+// Default missile flight speed in pixels per second. WC1 arrows
+// look snappy — ~240 px/s = 15 tiles/s = 4 tiles in ~267 ms. Tune
+// per missile-type later (catapult stones lob slower, fireballs
+// in between). The flight TIME in stbprojectile is computed per
+// spawn from `distance / speed`.
+const _MISSILE_SPEED_PXS = 240;
+
+// Module-private pool handle + arrow atlas pointer. Set once at
+// init (wc1_missiles_init) and read by spawn / render. Atlas is
+// caller-owned; we just keep the pointer for image_draw_size.
+extrn _missile_pool;
+extrn _missile_atlas;
+
+// Per-tick world handle for the impact callback — stbprojectile's
+// on_expire dispatch only passes the slot pointer; the world we
+// need to look up ECS state has to flow through a module global.
+// Set at the top of wc1_missiles_tick before any expire fires.
+static auto _impact_world;
+
+// ── Payload encoding ─────────────────────────────────────────
+//
+// The projectile carries a single payload word. We pack the
+// target eid + damage roll into a heap struct so impact has the
+// raw damage roll (computed at LAUNCH) AND the damage-type +
+// attacker info for the matrix lookup at IMPACT. The struct is
+// freed by the impact handler (whether it lands or whiffs).
+//
+// Why a struct (not bit-packing into the word): eids in B++ are
+// 64-bit (archetype<<32 | row), and we want damage + dtype +
+// dsize next to them. Cleaner to allocate ~32 bytes per missile.
+struct Payload {
+    target_eid,
+    damage_raw,           // STAT_DAMAGE of attacker (pre-matrix)
+    damage_type           // DAMAGE_NORMAL / CONCUSSIVE / EXPLOSIVE
+}
+
+// ── Lifecycle ────────────────────────────────────────────────
+
+// Allocate the pool + cache the arrow atlas. Call once at game
+// startup AFTER image_load("arrow.json") has succeeded.
+void wc1_missiles_init(arrow_atlas) {
+    _missile_pool  = projectile_pool_new(_MISSILE_POOL_SIZE);
+    _missile_atlas = arrow_atlas;
+}
+
+void wc1_missiles_free() {
+    projectile_pool_free(_missile_pool);
+}
+
+// ── Spawn ────────────────────────────────────────────────────
+
+// Spawn one missile from (src_x, src_y) toward (dst_x, dst_y) with
+// damage payload bound to `target_eid`. Returns the projectile
+// slot ptr (game-side can hold it for early-kill on intercept), 0
+// if the pool is full.
+//
+// Flight time is distance / speed so visual pace is consistent
+// regardless of weapon range. Lifetime acts as the impact trigger:
+// when elapsed_ms reaches lifetime_ms, the projectile is at (or
+// past) the dst position and stbprojectile calls back into our
+// _on_impact handler.
+wc1_missile_spawn(src_x, src_y, dst_x, dst_y,
+                  target_eid, damage_raw, damage_type) {
+    auto pay: Payload, dx, dy, dist, flight_ms, vx, vy;
+    dx = dst_x - src_x;
+    dy = dst_y - src_y;
+    // Approximate distance with the larger of |dx|, |dy| — same
+    // cheap diagonal approximation wc1_movement uses for sub-pixel
+    // steps; one cycle of micro-physics is good enough for the
+    // visual feel of a 4-tile-range arrow.
+    auto adx, ady;
+    adx = dx; if (adx < 0) { adx = 0 - adx; }
+    ady = dy; if (ady < 0) { ady = 0 - ady; }
+    dist = adx;
+    if (ady > dist) { dist = ady; }
+    if (dist < 1) { dist = 1; }   // avoid div-by-zero on stationary spawn
+    flight_ms = dist * 1000 / _MISSILE_SPEED_PXS;
+    if (flight_ms < 50) { flight_ms = 50; }   // minimum visible frame
+    vx = dx * 1000 / flight_ms;
+    vy = dy * 1000 / flight_ms;
+
+    pay = malloc(sizeof(Payload));
+    pay.target_eid  = target_eid;
+    pay.damage_raw  = damage_raw;
+    pay.damage_type = damage_type;
+
+    return projectile_spawn(_missile_pool,
+                            src_x, src_y, 0,        // z = 0 (flat 2D)
+                            vx, vy, 0,              // no vz
+                            0,                      // no gravity
+                            flight_ms,
+                            pay);                   // payload word = ptr
+}
+
+// ── Impact handler ───────────────────────────────────────────
+//
+// Called by stbprojectile when a slot's lifetime expires (i.e.,
+// the missile has reached its destination). Reads the payload,
+// checks the target is still alive, applies damage through the
+// same SC1-style matrix combat melee uses (mult% * raw - armor,
+// floored at 1).
+
+static void _on_impact(slot) {
+    auto p: Projectile, pay: Payload;
+    auto target_sh: Sheet, target_an: Anim;
+    auto damage, mult_pct, target_armor, target_size, target_hp;
+    p   = slot;
+    pay = p.payload_w;
+
+    // Target validation — eid may be dead by the time the arrow
+    // lands (another attacker finished them, friendly fire killed
+    // them, etc). Skip the damage application; the projectile just
+    // visually arrives and disappears.
+    if (ecs_alive_at(_impact_world, pay.target_eid) == 0) {
+        free(pay);
+        return;
+    }
+    target_an = ecs_get(_impact_world, anim_comp, pay.target_eid);
+    if (target_an.state == UNIT_STATE_DYING) {
+        // Target already mid-death-anim — let the existing death
+        // play out; don't double-damage.
+        free(pay);
+        return;
+    }
+    target_sh = ecs_get(_impact_world, sheet_comp, pay.target_eid);
+    if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
+        free(pay);
+        return;
+    }
+
+    // Same matrix + armor formula combat melee uses. Re-reading
+    // target stats AT IMPACT (not at launch) means a shield buff
+    // / armor upgrade during flight time lands correctly.
+    target_size  = cs_stat_get(target_sh.handle, STAT_SIZE_CLASS);
+    target_armor = cs_stat_get(target_sh.handle, STAT_ARMOR);
+    mult_pct     = _wc1_missile_mult_pct(pay.damage_type, target_size);
+    damage = (pay.damage_raw * mult_pct) / 100;
+    damage = damage - target_armor;
+    if (damage < 1) { damage = 1; }
+    target_hp = cs_res_adjust(target_sh.handle, RES_HP, 0 - damage);
+
+    putstr("arrow hit eid=");
+    putnum(pay.target_eid);
+    putstr(" dmg=");
+    putnum(damage);
+    putstr(" mult=");
+    putnum(mult_pct);
+    putstr("% hp=");
+    putnum(target_hp);
+    putstr("\n");
+
+    if (target_hp <= 0) {
+        target_an.state      = UNIT_STATE_DYING;
+        target_an.elapsed_ms = 0;
+        putstr("dying eid= ");
+        putnum(pay.target_eid);
+        putstr("\n");
+    }
+    free(pay);
+}
+
+// Damage-type × size-class multiplier — duplicates wc1_combat's
+// table verbatim. Cleaner than a cross-module call (wc1_combat's
+// version is static + lives in the melee hot path); when S7.4's
+// matrix grows enough fields to warrant its own module, this
+// duplication graduates to a shared `wc1_balance.bsm`.
+static _wc1_missile_mult_pct(dtype, size) {
+    if (dtype == DAMAGE_NORMAL) { return 100; }
+    if (dtype == DAMAGE_CONCUSSIVE) {
+        if (size == SIZE_SMALL)  { return 100; }
+        if (size == SIZE_MEDIUM) { return 50; }
+        if (size == SIZE_LARGE)  { return 25; }
+    }
+    if (dtype == DAMAGE_EXPLOSIVE) {
+        if (size == SIZE_SMALL)  { return 50; }
+        if (size == SIZE_MEDIUM) { return 75; }
+        if (size == SIZE_LARGE)  { return 100; }
+    }
+    return 100;
+}
+
+// ── Per-frame tick ───────────────────────────────────────────
+
+// Advance every live missile + dispatch impact callbacks. Pass
+// the ECS world so _on_impact can look up the target. Call once
+// per frame, AFTER wc1_combat_tick (which spawns new missiles)
+// and BEFORE the render pass (which draws their lerped position).
+void wc1_missiles_tick(world) {
+    _impact_world = world;
+    projectile_tick(_missile_pool, game_dt_ms(), fn_ptr(_on_impact));
+}
+
+// ── Render ───────────────────────────────────────────────────
+
+// Capture the camera so the per-projectile render callback can
+// subtract the viewport offset without re-resolving it per slot.
+// Same shape as the unit render pass in wc1_render.
+extrn cam;
+
+// Draw one missile sprite at its current lerped position. Facing
+// derives from the velocity vector — straight east arrows pick
+// frame index 2 (E), north arrows pick 0 (N), etc. W/NW/SW reuse
+// the east-side frames flipped horizontally (5 atlas frames total
+// in arrow.png).
+static void _render_missile(slot) {
+    auto p: Projectile, facing, frame, sx, sy, flip;
+    p = slot;
+    facing = wc1_facing_for_delta(p.vx, p.vy);
+    flip   = 0;
+    // The 5 atlas frames are laid out N=0, NE=1, E=2, SE=3, S=4
+    // in arrow.png (5 cols × 1 row × 32 px). W/NW/SW reuse the
+    // east-side frames mirrored.
+    if (facing == FACE_N)        { frame = 0; }
+    else if (facing == FACE_NE)  { frame = 1; }
+    else if (facing == FACE_E)   { frame = 2; }
+    else if (facing == FACE_SE)  { frame = 3; }
+    else if (facing == FACE_S)   { frame = 4; }
+    else if (facing == FACE_SW)  { frame = 3; flip = 1; }
+    else if (facing == FACE_W)   { frame = 2; flip = 1; }
+    else                          { frame = 1; flip = 1; }
+    sx = p.x - 16 - cam_x(cam);   // arrow sprite is 32 px; center it
+    sy = p.y - 16 - cam_y(cam);
+    if (flip != 0) {
+        image_draw_size_flipped(_missile_atlas, frame, sx, sy, 32, 32);
+    } else {
+        image_draw_size(_missile_atlas, frame, sx, sy, 32, 32);
+    }
+}
+
+void wc1_missiles_render() {
+    projectile_each(_missile_pool, fn_ptr(_render_missile));
+}

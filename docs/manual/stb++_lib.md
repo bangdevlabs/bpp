@@ -31,7 +31,7 @@ buzzword-heavy abstractions — the same flavour as the rest of B++.
 | IV — Input + Window | stbinput (keyboard/mouse), stbwindow (native dialogs), stbgame (loop) |
 | V — Drawing | stbdraw (CPU framebuffer), stbui (widgets), stbimage (PNG decode) |
 | VI — Sprite + Tile | stbpal (palettes), stbtile (tilemaps), stbforge (animations) |
-| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide), stbcharsheet (stat + resource bookkeeping) |
+| VII — Game systems | stbecs (entities), stbphys (physics), stbpath (A*), stbflow (BFS flow-field), stbai (line-of-sight + steering + collide), stbcharsheet (stat + resource bookkeeping), stbprojectile (pool of in-flight projectiles) |
 | VIII — Engine plumbing | stbpool (pool allocator), stbcol (collision geometry), stbgrid (2D cell storage), stbasset (handle-based assets), stbprofile (sampling profiler + HUD) |
 | IX — GPU | stbrender (textures + sprites + palette LUT), stbtexture (procedural materials), stbraycast (2.5D walls), stbscene (parallax layers), stbshader (custom pipelines), stbfx (post-process chain) |
 
@@ -4387,6 +4387,120 @@ in the same arc that graduated this cartridge.
 
 ---
 
+## Cap 59 — Projectile pool (stbprojectile)
+
+*Depends on: stbpool (Cap 43) — pool slot allocation + freelist*
+*Source: new — 2026-05-18*
+*Status: COMPLETE — 2026-05-18*
+
+`stbprojectile.bsm` is the **genre-generic** (Tier-2) pool of
+in-flight projectiles. Owns 2D/3D position + velocity + lifetime
++ payload bookkeeping; the consuming game wraps it with targeting,
+collision detection, render, and damage application policy.
+
+Designed with three prospective consumers in view: RTS arrows /
+spears / fireballs (`games/rts1/wc1_missiles.bsm`, current first
+consumer), FPS Doom-mode rockets / plasma / grenades (Phase 4+),
+top-down RPG arrows / magic (Game 4 in `docs/plans/games_roadtrip
+.md`). Industry pattern: Doom `mobj_t` (1993), StarCraft 1 Bullet
+pool (1998), Stratagus Missile pool (2002).
+
+### §59.1 — What the cartridge owns
+
+- **Motion**: `pos += vel * dt_ms / 1000` (integer math, no float
+  in the hot path)
+- **Gravity**: optional z-axis acceleration for ballistic arcs
+  (`gravity_z != 0` → `vz += gravity_z * dt_ms / 1000`)
+- **Lifetime**: per-slot budget in milliseconds; auto-expire when
+  elapsed_ms ≥ lifetime_ms
+- **Payload**: one word per slot, opaque to the cartridge —
+  consumer stuffs an eid, struct ptr, or packed damage word
+- **Storage**: parallel alive bitmap on top of stbpool (cannot
+  put a "live" bit inside the slot because stbpool overwrites
+  the first 8 bytes of free slots with the freelist next-ptr)
+
+### §59.2 — What the cartridge does NOT own
+
+These are policy bits that differ per genre, so they stay in the
+consuming game cartridge:
+
+- **Targeting** (RTS homing / FPS angle-shoot / lobbed arc)
+- **Collision detection** (entity overlap vs tile raycast vs
+  none)
+- **Rendering** (top-down sprite vs billboard scaled-by-depth)
+- **Damage application** (CharSheet read, armor matrix, faction
+  rules)
+
+The cartridge exposes a callback API for impact (`projectile_
+tick` dispatches `on_expire_fn(slot)`) and a walk API for mid-
+flight collision check (`projectile_each(pool, fn)` so the
+consumer iterates live slots and may `projectile_kill` on hit).
+
+### §59.3 — Lifecycle
+
+```c
+projectile_pool_new(capacity);   // size for peak concurrency
+projectile_pool_free(pp);
+
+projectile_spawn(pp, x, y, z, vx, vy, vz,
+                 gravity_z, lifetime_ms, payload_w);
+projectile_kill(pp, slot);       // explicit early despawn
+
+projectile_tick(pp, dt_ms, on_expire_fn);   // advance + auto-expire
+projectile_each(pp, fn);                    // walk alive slots
+projectile_count(pp);                       // live count
+```
+
+`projectile_spawn` returns the slot pointer (or 0 if pool full).
+The slot stays valid until either lifetime expires (tick auto-
+fires `on_expire_fn` then recycles) or the consumer calls
+`projectile_kill` directly. Both kill paths are safe to invoke
+from inside `each` / `on_expire` callbacks.
+
+### §59.4 — Consumer pattern (RTS arrow, target-locked)
+
+```bpp
+// Spawn from attacker pos toward target pos, with damage payload.
+auto dx, dy, dist, flight_ms, vx, vy;
+dx = dst_x - src_x;
+dy = dst_y - src_y;
+dist = (dx*dx + dy*dy could underflow; use chebyshev approx)
+flight_ms = dist * 1000 / ARROW_SPEED_PXS;
+vx = dx * 1000 / flight_ms;
+vy = dy * 1000 / flight_ms;
+projectile_spawn(pool, src_x, src_y, 0, vx, vy, 0,
+                 0, flight_ms, target_eid_or_struct_ptr);
+
+// Per frame:
+projectile_tick(pool, game_dt_ms(), fn_ptr(on_arrow_impact));
+
+// On impact: read payload + apply damage matrix at IMPACT time
+// (so target's current stats / armor / shields land correctly).
+static on_arrow_impact(slot) {
+    auto p: Projectile;
+    p = slot;
+    apply_damage_to_eid(p.payload_w, ...);
+}
+```
+
+`games/rts1/wc1_missiles.bsm` is the worked example end-to-end.
+
+### §59.5 — What this chapter does NOT cover
+
+- **Rendering helpers** — render in the consumer (RTS uses
+  `image_draw_size`, FPS will use billboard pack, RPG uses
+  top-down sprite). Cartridge doesn't ship a default.
+- **Splash damage** (rocket explosion at impact). Consumer's
+  `on_expire_fn` reads the slot's last position + walks nearby
+  entities; cartridge doesn't know what "nearby" means.
+- **Homing** (mid-flight retargeting). Consumer's `each` callback
+  can mutate `p.vx / p.vy` in place; no cartridge support
+  needed.
+- **Multi-pool tracking** (one pool per missile type vs shared
+  pool with type discriminator in payload). Consumer's call.
+
+---
+
 # Appendices
 
 ## Appendix A — Compiler Flags Reference
@@ -4441,6 +4555,7 @@ Use xfail tests to lock in rejection behavior: they catch regressions where a pr
 | 2026-05-18 | stbui v2 arc closed (S1-S6 + S8.1 + S9 + S9.1 shipped; S7 deferred Rule 28). §36.4 retired-stack notice + §36.7 `ui_frame_begin` invariant + panel-origin offset gotcha. Sidequest moved to `legacy_docs/sidequest_stbui_v2_clay.md`. | Cap 36 |
 | 2026-05-18 | stbgrid arc closed (`2b7c8d4` → `cfa1e77`). Cap 57 new (stbgrid). Cap 44 rewritten (was stale "color math" boilerplate; now documents the actual `stbcol.bsm` collision-geometry API + adds `rect_center_x/y`). Layout table grew an "Engine plumbing" row entry for stbgrid + corrected stbcol's description. Tier-intro paragraph added in Layout section pointing at Tonify Rule 33. | Cap 44 + Cap 57 + Layout |
 | 2026-05-18 | stbcharsheet shipped (`43a7641`). Cap 58 new. Layout row VII (Game systems) grew an stbcharsheet entry. SC1-style reference example included in the chapter, grounding the upcoming WC1 + SC1 mechanical crossover. | Cap 58 + Layout |
+| 2026-05-18 | stbprojectile shipped end of S7. Cap 59 new — pool-based projectile motion + lifecycle (genre-generic Tier-2 built on stbpool). Designed with three consumers in view: rts1 wc1_missiles (first), fps Doom-mode (Phase 4+), rpg Game 4. Industry precedent: Doom mobj_t / SC1 Bullet / Stratagus Missile. Layout row VII grew an stbprojectile entry. | Cap 59 + Layout |
 
 When a new stb cartridge ships, add a row here describing the
 sweep that wrote its chapter — same pattern Tonify uses for its

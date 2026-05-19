@@ -37,6 +37,7 @@ import "stbcharsheet.bsm";
 import "stbgame.bsm";
 load   "wc1_units.bsm";
 load   "wc1_anims.bsm";
+load   "wc1_missiles.bsm";
 
 // ECS component handles + query. ecs_query_each's callback shape
 // (`fn(world, eid)`) means combat state flows through globals.
@@ -75,6 +76,57 @@ static _tile_chebyshev(ax_px, ay_px, bx_px, by_px) {
     return dx;
 }
 
+// Damage-type × size-class multiplier in percent. SC1 Brood War
+// canon (Liquipedia / BWAPI), kept in integer percent form because
+// the simulation hot path is float-free per handoff numeric model.
+//
+//   Type / Size      | SMALL | MEDIUM | LARGE
+//   ─────────────────┼───────┼────────┼──────
+//   NORMAL           |  100  |  100   |  100
+//   CONCUSSIVE       |  100  |   50   |   25
+//   EXPLOSIVE        |   50  |   75   |  100
+//
+// Concussive shines vs small (peon / peasant / footman swarms);
+// Explosive shines vs large (catapult / dragon / future siege);
+// Normal is the well-rounded middle. The two extreme rows give
+// unit composition meaning — pick the right attacker for the
+// target class, not just the highest raw damage.
+//
+// Out-of-range inputs return 100 so a unit shipped before its
+// damage_type slot is filled in defaults to the no-op multiplier
+// rather than crashing. New rows / columns are appended by adding
+// const enums in wc1_units.bsm and a matching branch here.
+static _damage_mult_pct(dtype, size) {
+    if (dtype == DAMAGE_NORMAL) { return 100; }
+    if (dtype == DAMAGE_CONCUSSIVE) {
+        if (size == SIZE_SMALL)  { return 100; }
+        if (size == SIZE_MEDIUM) { return 50; }
+        if (size == SIZE_LARGE)  { return 25; }
+    }
+    if (dtype == DAMAGE_EXPLOSIVE) {
+        if (size == SIZE_SMALL)  { return 50; }
+        if (size == SIZE_MEDIUM) { return 75; }
+        if (size == SIZE_LARGE)  { return 100; }
+    }
+    return 100;
+}
+
+// Drop combat engagement: clear the AttackTarget sentinel + reset
+// the cooldown, and if we were mid-attack, flip the anim state back
+// to IDLE so the movement tick can resume control. Called from
+// every "target gone" branch in _combat_step (target dead, target
+// HP empty, target dying). The state reset is critical — without
+// it the ATTACK guard in wc1_movement._step_unit would refuse to
+// step the unit forever, even after a new right-click target.
+static void _disengage(an: Anim, at: AttackTarget) {
+    at.eid = -1;
+    at.last_attack_ms = 0;
+    if (an.state == UNIT_STATE_ATTACK) {
+        an.state      = UNIT_STATE_IDLE;
+        an.elapsed_ms = 0;
+    }
+}
+
 // Per-entity combat tick. Three branches: dying (timer expiration
 // → finalize), engaged (out of range → path, in range → swing),
 // idle (nothing to do — early return).
@@ -83,6 +135,7 @@ static void _combat_step(w, eid) {
     auto an: Anim, my_p: Pos, target_p: Pos, my_pa: Path;
     auto target_eid, dist_tiles, my_range;
     auto cooldown_ms, damage, target_armor, target_hp;
+    auto my_dtype, target_size, mult_pct;
 
     an = ecs_get(w, anim_comp, eid);
 
@@ -98,28 +151,36 @@ static void _combat_step(w, eid) {
     }
 
     at = ecs_get(w, attack_target_comp, eid);
-    if (at.eid < 0) { return; }
+    if (at.eid < 0) {
+        // No target. If we were attacking last frame (e.g. just
+        // killed the target, or the user right-clicked elsewhere
+        // and wc1_input cleared at.eid), flip state back so the
+        // movement tick can take over. Without this, the ATTACK
+        // guard in _step_unit would keep the unit frozen forever.
+        if (an.state == UNIT_STATE_ATTACK) {
+            an.state      = UNIT_STATE_IDLE;
+            an.elapsed_ms = 0;
+        }
+        return;
+    }
     target_eid = at.eid;
 
     // Validate target is still alive (it may have been killed last
     // frame by another attacker). ecs_alive_at is the canonical
     // check for stale eids.
     if (ecs_alive_at(w, target_eid) == 0) {
-        at.eid = -1;
-        at.last_attack_ms = 0;
+        _disengage(an, at);
         return;
     }
     target_sh = ecs_get(w, sheet_comp, target_eid);
     if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
-        at.eid = -1;
-        at.last_attack_ms = 0;
+        _disengage(an, at);
         return;
     }
     // Also skip if target is mid-death-animation — let it finish.
     target_an = ecs_get(w, anim_comp, target_eid);
     if (target_an.state == UNIT_STATE_DYING) {
-        at.eid = -1;
-        at.last_attack_ms = 0;
+        _disengage(an, at);
         return;
     }
 
@@ -168,12 +229,56 @@ static void _combat_step(w, eid) {
     if (at.last_attack_ms < cooldown_ms) { return; }
     at.last_attack_ms = 0;
 
-    // Damage roll — v1 formula: max(1, raw - armor). The
-    // type × size matrix lands in S7.4 (Normal / Concussive /
-    // Explosive vs Small / Medium / Large); until then every
-    // attack reads as Normal-vs-anything with a 1.0 multiplier.
-    damage = cs_stat_get(sh.handle, STAT_DAMAGE);
+    // Energy gate (S7.7) — casters can't fire when their RES_ENERGY
+    // pool dips below STAT_ENERGY_COST. Non-casters have
+    // energy_cost == 0 and short-circuit through this check. Drains
+    // happen AFTER the gate passes so the message log only shows
+    // the energy line on the actual cast frame.
+    auto energy_cost, current_energy;
+    energy_cost = cs_stat_get(sh.handle, STAT_ENERGY_COST);
+    if (energy_cost > 0) {
+        current_energy = cs_res_current(sh.handle, RES_ENERGY);
+        if (current_energy < energy_cost) {
+            // Not enough energy — wait one full cooldown cycle for
+            // the regen tick to refill. Roll the cooldown back so
+            // the next frame's check still gates against the same
+            // window (otherwise we'd just keep cycling cooldowns
+            // without firing).
+            at.last_attack_ms = cooldown_ms;
+            return;
+        }
+        cs_res_adjust(sh.handle, RES_ENERGY, 0 - energy_cost);
+    }
+
+    // Ranged branch — weapon_range > 1 means we don't slam HP
+    // directly. We spawn a missile through wc1_missiles_spawn; it
+    // flies for `distance / missile_speed` ms; when it arrives the
+    // stbprojectile expire callback runs the damage matrix + armor
+    // formula against the target's CURRENT stats (which may have
+    // changed during flight). Melee (weapon_range == 1) still
+    // applies damage instantly below.
+    damage   = cs_stat_get(sh.handle, STAT_DAMAGE);
+    my_dtype = cs_stat_get(sh.handle, STAT_DAMAGE_TYPE);
+    if (my_range > 1) {
+        wc1_missile_spawn(my_p.x, my_p.y, target_p.x, target_p.y,
+                          target_eid, damage, my_dtype);
+        return;
+    }
+
+    // Melee — SC1-style two-stage formula resolves immediately:
+    //   step 1: scale raw by the type × size matrix (in percent)
+    //   step 2: subtract armor
+    //   step 3: floor at 1 so an attacker always chips at least
+    //           one HP, preventing "tank with 99 armor vs peasant"
+    //           stalemates that drag forever.
+    // Order matters: SC1 / BWAPI applies the multiplier BEFORE the
+    // armor subtraction. Difference vs the reversed order is small
+    // at low numbers but it's the canonical convention; matters
+    // more once damage upgrades + heavy armor stack later.
+    target_size  = cs_stat_get(target_sh.handle, STAT_SIZE_CLASS);
     target_armor = cs_stat_get(target_sh.handle, STAT_ARMOR);
+    mult_pct     = _damage_mult_pct(my_dtype, target_size);
+    damage = (damage * mult_pct) / 100;
     damage = damage - target_armor;
     if (damage < 1) { damage = 1; }
     target_hp = cs_res_adjust(target_sh.handle, RES_HP, 0 - damage);
@@ -182,7 +287,9 @@ static void _combat_step(w, eid) {
     putnum(target_eid);
     putstr(" dmg=");
     putnum(damage);
-    putstr(" hp=");
+    putstr(" mult=");
+    putnum(mult_pct);
+    putstr("% hp=");
     putnum(target_hp);
     putstr("\n");
 

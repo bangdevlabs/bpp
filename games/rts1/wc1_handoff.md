@@ -177,11 +177,30 @@ per session; sessions can be re-scoped mid-flight per Rule 28.
 
 **Status (2026-05-18):**
 
-- ✅ Sessions 1-6 CLOSED. See per-session blocks below for
-  per-commit detail. Latest: S6 shipped `5bba3de` (marquee + flow
-  + tile-claim collision) + `cfa1e77` (ring centered on sprite
-  slot via `stbcol.rect_center_x/y`).
-- ⏭ Session 7 — Combat basics (next).
+- ✅ Sessions 1-7 CLOSED. See per-session blocks below for
+  per-commit detail. S7 sub-arc 7.1 → 7.7 closed end-to-end:
+  - 7.1 Faction + spawning + orc peon atlas
+  - 7.2 Sheet ECS component + faction-aware right-click
+  - 7.3 Combat tick + damage + chop/die animations + death
+    (absorbed 7.5 — heap-free + tile-release + ecs_kill_at)
+  - 7.4 Damage type × size matrix (SC1 canon — Normal /
+    Concussive / Explosive vs Small / Medium / Large)
+  - 7.5 Death (shipped inside 7.3, see commit message)
+  - 7.6 Missile entities — new Tier-2 `stb/stbprojectile.bsm`
+    (pool-based, built on `stbpool`) + RTS-side
+    `wc1_missiles.bsm` (target-locked spawn, arrow atlas,
+    damage matrix at impact). Archer + spearman wired.
+  - 7.7 Energy + caster + shields regen — `RES_SHIELDS` +
+    `RES_ENERGY` + `STAT_ENERGY_COST` slots, casters gated by
+    energy pool, regen at SC1 cadence (7 HP/s shields,
+    1 energy/s).
+  - Bonus: full 14-unit roster wired (peasant/footman/knight/
+    archer/cleric/conjurer/catapult/lothar/medivh on human side;
+    peon/grunt/raider/spearman/necrolyte/warlock/catapult on
+    orc side). Debug spawn keys 1-9 + 0/-/=/[/]/;/'. `wc1_
+    sprite_convert` generalized to per-unit schema +
+    configurable tile size (32 / 48 px).
+- ⏭ Session 8 — Buildings + construction (next).
 
 ### Session 0 — stbmidi audio fidelity smoke (~30 min, pre-flight)
 
@@ -492,21 +511,83 @@ centering). Plus `64e3aea` (stbui ui_image orphan const cleanup)
 + `0a6209d` (Tonify Rule 33 doc) + `ec2f4cd` (sidequest closeout)
 shipped in the same arc.
 
-### Session 7 — Combat basics (~3-4h)
+### Session 7 — Combat basics (~3-4h) — CLOSED 2026-05-18
 
-**Goal**: attack-move command. Units engage enemies in range, deal
-damage, missile units fire arrows, dead units spawn corpses.
+**Goal as planned**: attack-move command. Units engage enemies in
+range, deal damage, missile units fire arrows, dead units spawn
+corpses.
 
-**Files**:
-- `wc1_combat.bsm` — damage formula (start from balancing.lua's
-  basic + piercing model, then tune for feel), missile entity
-  lifecycle.
-- `wc1_missiles.bsm` — missile type table.
+**Goal as shipped (scope grew during execution)**: full 7.1 → 7.7
+sub-arc CLOSED in a single session — combat tick + damage matrix
++ death pipeline + missile entities + energy/shields + entire WC1
+roster (14 unit kinds) wired and spawnable. Plus three new stb
+graduations during the arc:
 
-**Verification**: footman vs grunt deathmatch resolves with the
-right "weight" (a few hits, not one-shots, not slogs); archer vs
-grunt has missile flight on screen. We iterate on numbers until
-the engagements feel good — not until they match DOSBox.
+- **Tier-2 `stb/stbprojectile.bsm`** (NEW, ~215 LOC) — generic
+  2D/3D pool of projectiles built on `stbpool`. Owns pos/vel/
+  gravity_z/lifetime/payload_w bookkeeping; consumer-agnostic.
+  Designed with three prospective consumers in view (rts1 now,
+  fps Doom-mode phase 4+, rpg Game 4). Industry pattern: Doom
+  `mobj_t` (1993), SC1 bullets, Stratagus missiles.
+- **`wc1_sprite_convert` generalized** (Tier-3 tool) — was
+  hardcoded peasant schema; now takes `[walk_n] [atk_n] [die_n]
+  [tile_w] [tile_h]` positional args + ports
+  `GetFrameNumbers(...)` verbatim from war1gus `anim.lua`.
+  Handles every WC1 unit schema (5,4,3 / 5,5,3 / 5,5,5 / 5,2,3
+  / 5,4,4 / 5,5,4 / 2,5,3) at 32 or 48 px tiles. Tag rename
+  `chop_*` → `attack_*` (SC1 universal vocabulary).
+- **`tile_bind_image` migration** — rts1 graduated from the
+  legacy `tile_load_set` + `tile_bind_set` pair (one MTLTexture
+  per tile, surfaced visual checkerboard artifacts under Phase
+  3.2 smart-bind) to the modern atlas_grid path (single
+  MTLTexture, batched draws). Added a `Loader pipeline`
+  paragraph to `docs/manual/asset_formats.md` documenting the
+  canonical loader for WC1-style tilesets.
+
+**Files** (as shipped):
+- `games/rts1/wc1_combat.bsm` — `_combat_step` with 4-branch
+  state machine (dying / no-target / out-of-range / engaged) +
+  matrix-aware melee + ranged dispatch + energy gate.
+  `_disengage` helper resets state on target loss so units don't
+  freeze in ATTACK after kill.
+- `games/rts1/wc1_missiles.bsm` (NEW) — RTS-side glue around
+  stbprojectile: target-locked launch, distance-based flight
+  time, matrix damage at impact, arrow atlas + facing-based
+  frame selection.
+- `games/rts1/wc1_regen.bsm` (NEW) — per-frame shields + energy
+  regen. SC1 cadence (7 HP/s shields, 1 energy/s).
+- `games/rts1/wc1_units.bsm` — UnitDef populator compacted into
+  `_def(...)` helper; 14 kinds populated with SC1-flavored
+  stats. Added `STAT_ENERGY_COST`, `RES_SHIELDS`, `RES_ENERGY`
+  slots + `start_energy / start_shields / energy_cost` UnitDef
+  fields.
+- `games/rts1/wc1_render.bsm` — `ecs_spawn_peasant` renamed
+  `ecs_spawn_unit(kind)` to support multiple kinds. `_render_
+  unit` reads `def.px_size` so 48 px sprites (knight, raider,
+  lothar) render with their correct dims + offset math.
+- `games/rts1/wc1_movement.bsm` — `_step_unit` early-returns
+  for `UNIT_STATE_ATTACK` (parallel to existing DYING guard) so
+  the combat tick's state assignment isn't clobbered.
+- `games/rts1/rts.bpp` — 16 atlas loads compacted into
+  `_load_wc1_atlas` helper; `_free_all_atlases` shutdown
+  helper; debug spawn covers all 16 kinds via number keys +
+  punctuation; full tile pipeline migration.
+- `games/rts1/assets/sprites/wc1/*.{png,json}` — all 16 unit
+  atlases + arrow missile atlas + atlas_grid sidecars.
+- `games/rts1/assets/converted/graphics/tilesets/forest/
+  terrain.json` (NEW) — atlas_grid sidecar so `image_load` can
+  consume the tileset PNG.
+
+**Verification**: full WC1 roster spawns + animates + attacks +
+dies. Peasants chop, archers shoot arrows, conjurers gate on
+energy + drain on cast + regen back. Catapults visible on screen
+(human + orc share the same war1tool-extracted PNG, faithful to
+WC1 original). Map renders as proper forest tilemap (no more
+checkerboard artifacts). User-reported visual smoke PASSED at
+end of session.
+
+**Commits**: bundled at S7 closeout — `WC1 S7 CLOSED: full combat
+arc + 14-unit roster + Tier-2 stbprojectile`.
 
 ### Session 8 — Buildings + construction (~3-4h)
 
@@ -721,56 +802,34 @@ Standing gates per Tonify discipline:
 
 ## Status
 
-**Sessions 1-6 CLOSED.** S6 shipped with scope growth — marquee
-multi-select + flow-field + tile-claim collision + ring centering
-all landed together (see the Session 6 block above for the full
-list of files + commits). The stbgrid graduation arc that backed
-S6's collision storage produced Tonify Rule 33 + a refactored
-stbflow as side benefits.
+**Sessions 1-7 CLOSED.** S7 shipped the full combat arc in a
+single late-2026-05-18 session: damage matrix + missile entity
+pipeline (with `stb/stbprojectile` graduation) + energy & shields
+slots + the entire 14-unit WC1 roster wired and spawnable. See
+the Session 7 block above for the per-file breakdown.
 
-**S7 (Combat basics) is next** on the game arc. Nothing blocks it:
-flow-field + collision give attack-move the navigation it needs;
-target component already exists in Path; HP/Armor live in UnitDef;
-missiles get their own cartridge (`wc1_missiles.bsm`) per the
-module layout above.
+**S8 (Buildings + construction) is next** on the game arc.
+Foundations: town hall, farm, barracks. A peasant walks to the
+foundation, plays the construction animation, building completes
+and unlocks training. Building schema differs structurally from
+unit schema (single still frame + collapse cycle, no per-
+direction layout) so `wc1_sprite_convert` gains a separate
+`--mode building` code path.
 
-**S7 sketch (subject to scope refinement during execution):**
+**Recent activity (2026-05-18, evening):** WC1 S7 shipped end-to-
+end. Tier-2 `stb/stbprojectile.bsm` graduated with three
+prospective consumers in view (rts1, fps Doom-mode, rpg Game 4).
+`wc1_sprite_convert` generalized to per-unit schema + configurable
+tile size. Map render migrated from legacy `tile_load_set` to
+modern `tile_bind_image` (single MTLTexture, smart-bind batched).
+Doc `docs/manual/asset_formats.md` gained a "Loader pipeline"
+section codifying the canonical WC1-style tileset path.
 
-The S7 arc adopts the SC1-style mechanical model laid out in the
-design-vision section above. Per-unit data lives in a
-`stbcharsheet` handle stored in a new `Sheet` ECS component.
-Combat reads cooldown + damage type from the sheet; damage
-resolution applies the type × size-class matrix; HP / Shields /
-Energy are resources in the sheet, so the bounded-adjust API
-makes "did this unit die" a single `cs_res_empty` call.
-
-- **S7.2** Sheet wiring — `Sheet` ECS component (CharSheet
-  handle) + per-unit-kind initializer that populates HP / armor /
-  damage / cooldown / range / sight from `UnitDef` extended with
-  SC1-flavored fields. Right-click hit-test distinguishes enemy
-  unit vs ground via Faction lookup.
-- **S7.3** Combat tick — attacker-target pair runs through a
-  per-frame "in range? cooldown ready? deal damage" loop. Damage
-  formula starts as `max(1, raw - armor)` for v1; the
-  type × size matrix lands in S7.4.
-- **S7.4** Damage type matrix — Normal / Concussive / Explosive
-  vs Small / Medium / Large. Starting numbers cribbed from SC1
-  canon (Liquipedia / BWAPI), tuned for feel.
-- **S7.5** Death — `cs_res_empty(sheet, RES_HP)` triggers
-  `ecs_kill_at` + `wc1_collision_release` (the tile claim must
-  free up so other units can walk over the corpse-tile).
-- **S7.6** Missile entities — `wc1_missiles.bsm` for ranged
-  attacks (archer, grunt-thrower). Missile entity spawns at
-  attacker, travels at missile-speed, applies damage on impact.
-- **S7.7** Energy + first caster — when the Conjurer/Warlock
-  sprite ships, energy as a resource + cast-cost bookkeeping.
-  Shields regen for tech-upgraded units lands here too.
-
-**Recent activity (2026-05-18):** stbgrid arc + WC1 S6 shipped
-in 8 commits (`2b7c8d4` → `cfa1e77`). Tonify Rule 33 codifies
-fully-generic vs genre-generic cartridge taxonomy that surfaced
-during the stbgrid graduation. Suite 175/0/12 + bootstrap byte-
-stable throughout. Memory
+**Recent activity (2026-05-18, morning):** stbgrid arc + WC1 S6
+shipped in 8 commits (`2b7c8d4` → `cfa1e77`). Tonify Rule 33
+codifies fully-generic vs genre-generic cartridge taxonomy that
+surfaced during the stbgrid graduation. Suite 175/0/12 + bootstrap
+byte-stable throughout. Memory
 `project_session_20260518_stbgrid_arc.md` has the worked-example
 short form for cold-open.
 
