@@ -1,49 +1,10 @@
-# * B++ 2 MONTHS * 
+# B++ 2 MONTHS 
 
-> **Read the book**: [`docs/manual/how_to_dev_b++.md`](docs/manual/how_to_dev_b++.md) — single unified manual, 28 chapters, 6 parts.
-> Language basics → stdlib reference → writing pro B++ → building the compiler → architecture → ecosystem.
-> Everything you need in one file. No other canonical doc.
-
-### B++ 0.99
+## B++ 0.99
 
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
-> **Version 0.99x**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)** (the acme-inspired IDE that hosts the open tools as panels, itself open-source under Apache 2.0 + trademark).
-
----
-
-## The Synthesizer
-
-`tools/mini_synth/mini_synth.bpp` — 300 lines, polyphonic, 4 octaves (C3–B6), WAV recording:
-
-```
-bpp synthkey.bpp -o synth && ./synth
-```
-
-| Control | What it does |
-|---------|-------------|
-| **Keyboard rows** (ZXCV / ASDF / QWERTY / 1234) | 46 chromatic keys across 4 octaves. Press to sustain, release to stop. 8 simultaneous voices. |
-| **LEFT / RIGHT** | Waveform morph: sine (clean) → triangle → sawtooth → square (harsh) |
-| **UP / DOWN** | Dirt: clean signal → bitcrush + sample-and-hold decimation |
-| **SPACE** | Toggle WAV recording (saves to disk on stop) |
-| **ESC** | Quit |
-
-The same audio stack powers the game engine. Snake can play a WAV sample recorded in synthkey. Rhythm Teacher (next) will use the mixer for sample-accurate note timing.
-
----
-
-## Six Games Protoypes, One Engine
-
-B++ ships with six games in `games/`, all GPU-accelerated on Metal:
-
-| Game | Folder | What it is |
-|------|--------|-----------|
-| **Snake** | `games/snake/` | Classic snake with ECS particle effects, high-score ranking, arena + pool allocators, **background music + in-code eat SFX**. Eat the apple, grow the tail, don't bite yourself. |
-| **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. Canonical hot-reload smoke (edit level in Bang 9 → game reflects in ~30 ms). |
-| **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
-| **Rhythm** | `games/rhythm/` | Rhythm-genre prototype. Menu → demo (auto-play) → transition countdown → play (snare on F or SPACE). Hit-windows: ±20 ms perfect, ±60 ms ok. Uses stbscene / stbasset / stbmixer music+SFX buses / beat_map text parser. |
-| **FPS — Wolf3D** | `games/fps/` | Three builds in the same folder: `fps_3d.bpp` is the CPU raycaster baseline (Phase 1), `fps_3d_gpu.bpp` is the GPU port through CRT post-process + procedural wall textures (Phase 4-6 reference), `fps_wolf3d.bpp` is the Phase 2 build with enemies + billboard sprites with per-fragment depth + AI (`stbai` cartridge). WASD + ←/→ to move, P toggles the runtime profiler HUD, ESC quits. |
-| **WC1 (RTS, mod)** | `games/rts1/` | Warcraft 1 mod on the original Blizzard asset bundle. Full 14-unit roster, melee + ranged combat, SC1-style damage matrix + caster energy. Hot-reload through Bang 9's Levels + Sprites tabs. Sessions 1-7 CLOSED; S8 (buildings) next. See `games/rts1/wc1_handoff.md`. |
+> **Version 0.99x**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)**
 
 ---
 
@@ -61,33 +22,91 @@ But what if Sean Barrett later joined that group with his STB — all written in
 
 And now we have a standard library that is, itself, a game engine. With audio. And it just played its first chord.
 
-## From Silence to Music
-
-Two weeks ago B++ could draw pixels but couldn't make a sound. The compiler worked, the games ran, but the speakers were silent.
-
-Then we cleaned the house. Eight modules moved from `stb/` into `src/` — array, hash, buf, str, io, math, file, arena — because they weren't game library code, they were foundation. Things every program needs. They became auto-injected: no import line required, just call the function and it's there. On top of them we built `bpp_beat` (a monotonic clock that thinks in milliseconds, microseconds, samples, BPM, and frames), `bpp_job` (a worker pool with lock-free SPSC queues and `mem_barrier` fences), and `bpp_maestro` (a game loop that splits work into solo, base, and render phases — jazz band, not orchestra).
-
-The repo got reorganized. `src/backend/chip/` for instruction encoding, `os/` for syscalls and platform code, `target/` for binary formats, `c/` for the transpiler. The `.bo` module cache — the #1 historical source of bugs — got deleted entirely. Every compile runs from source now. Takes 0.27 seconds. Nobody misses the cache.
-
-The language syntax locked in. `switch` with jump tables. `?:` ternary. `&&`/`||` short-circuit. `static` for module privacy. `void` for functions that return nothing. `extrn` for write-once state. `global` for shared mutable state. Bitfields (`: bit` through `: bit7`). 128-bit SIMD (`: double`, eleven `vec_*` builtins on NEON and SSE2). Every keyword earned its place because a game or tool needed it.
-
-Then came the tonify sweep — a week of reading every line of B++ code written so far and asking "does this say what it means?" 350 functions got `void`. 200 got `static`. 50 got `: base` (verified pure by the compiler). The Node struct that holds the AST shrank 29% by slicing fields to byte-width. The smart dispatch engine — call-graph analysis + fixpoint purity classifier — shrank Snake from 69 KB to 33 KB just by not emitting dead code.
-
-And then we turned the sound on.
-
-`stbaudio` opens the audio device via CoreAudio FFI. A lock-free ring buffer sits between the main thread (producer) and CoreAudio's realtime callback (consumer). `stbmixer` runs eight voices simultaneously — sine, triangle, sawtooth, square — blended by a continuous fader with bitcrush and decimation for that digital dirt. `stbsound` reads and writes WAV files.
-
-We didn't plan to build a synthesizer. The plan said "audio stack, then Rhythm Teacher game." But the infrastructure was strong enough that a 300-line polyphonic synth fell out naturally. 46 chromatic keys across 4 octaves, 8 simultaneous voices, waveform morphing, dirt control, WAV recording. Someone sat down and played chords.
-
-The compiler now understands effects. Every function carries a classification — pure, heap, I/O, GPU, realtime, or solo — propagated through the call graph by a fixpoint lattice. The audio callback is annotated `: realtime`. If someone accidentally adds a `malloc` or a `putchar` inside the callback path, W026 fires at compile time. The click never reaches the speakers.
-
-The debugger found the hardest bug of the sprint. A Mach-O header had `page_count = 1` hardcoded — when the data section grew past 16 KB, string literals silently corrupted. `bug --dump-str` showed the wrong bytes at the call site in one run. Three days of blind archaeology replaced by one command.
-
-41 compiler modules in `src/`. 29 library cartridges in `stb/`. 3 platform layers. 52 diagnostics. 77 keyboard inputs. 174 native + 138 C-emitter tests, zero failures.
-
-The version number is the test count.
-
 ## The Language
+
+The minimum B++ program is three lines. No headers, no imports, no return statement:
+
+## How to Dev B++ — The Programmer's Book
+
+**The K&R-style entry point for writing programs in B++.** The
+language. The arsenal. The discipline. Everything you need from "I
+have never seen B++" to "I am writing a non-trivial program in it."
+
+This is one of four canonical books that ship with B++:
+
+| Book | Audience | What's inside |
+|---|---|---|
+| **how_to_dev_b++.md** (this one) | someone writing a B++ program | language tour, stdlib essentials, idioms, compiler flags |
+| `tonify_checklist.md` | anyone contributing code | the 20 style rules, applied from the first keystroke |
+| `bootstrap_manual.md` | anyone hacking the compiler itself | bootstrap cycle, backend layout, portability tiers, adding builtins |
+| `standard_b++_lib.md` | anyone using the game engine library | every `stb*.bsm` module in depth + Bang 9 + bundled tools |
+
+## The Auto-Injected Prelude
+
+Every B++ program starts with modules already in scope. You do not need to `import` them. Their functions are globals. This is the "prelude" — the libraries the compiler auto-injects into every compilation unit.
+
+## Hello World
+
+```c
+main() {
+    put("Hello, World\n");
+}
+```
+
+Compile and run:
+
+```bash
+bpp hello.bpp -o hello
+./hello
+# Hello, World
+```
+
+That is everything. `put(x)` dispatches at compile time by the type of `x` — string, integer, or float. `main` returns 0 implicitly when no explicit return. No `#include`, no `import`. How that works is Cap 2.
+
+## Variations
+
+Print an integer:
+
+```c
+main() {
+    put(42);
+    putchar('\n');
+}
+```
+
+Interpolate:
+
+```c
+main() {
+    auto score;
+    score = 150;
+    put("score: ");
+    put(score);
+    putchar('\n');
+}
+```
+
+B++ has no `printf` format strings. You compose output with `put` calls — the compiler routes each call to `putstr`, `putnum`, or `putfloat` based on the argument type. For newlines, use `putchar('\n')` or `putmsg(s)` (which appends `\n` automatically). Build multi-part strings with `strbuf_*` (Cap 6).
+
+Byte-level output when you need it:
+
+```c
+main() {
+    putchar('H');
+    putchar('i');
+    putchar('\n');
+}
+```
+
+`putchar(c)` writes one byte to stdout. It is the lowest-level output in the language — every other print helper builds on it.
+
+## the three-line program lives in the repo
+
+`examples/hello_world.bpp`. Open Bang 9 (or your editor), point at `examples/`, and this file plus a dozen siblings (`hello_window.bpp`, `snake_cpu.bpp`, `ui_demo.bpp`) are the learning on-ramp. Read the source, run the binary, modify, rebuild.
+
+---
+
+## The stbgame for game devs
 
 ```bpp
 import "stbgame.bsm";
@@ -119,7 +138,6 @@ main() {
         draw_text("arrows to move", 90, 4, 1, GRAY);
         draw_end();
     }
-    return 0;
 }
 ```
 
@@ -130,6 +148,53 @@ bpp game.bpp -o game && ./game
 ```
 
 No SDL. No raylib. No dependencies. One file in, one native binary out.
+
+## Six Games Protoypes, One Engine
+
+B++ ships with six games in `games/`, all GPU-accelerated on Metal:
+
+| Game | Folder | What it is |
+|------|--------|-----------|
+| **Snake** | `games/snake/` | Classic snake with ECS particle effects, high-score ranking, arena + pool allocators, **background music + in-code eat SFX**. Eat the apple, grow the tail, don't bite yourself. |
+| **Pathfinder** | `games/pathfind/` | Rat vs cat chase. WASD movement, AI pursuit, collision, ECS particles on impact. Loads palette-indexed JSON sprites. Canonical hot-reload smoke (edit level in Bang 9 → game reflects in ~30 ms). |
+| **Platformer** | `games/platformer/` | Side-scrolling platformer with Kenney Pixel Platformer assets (CC0). Real tilemap (stbtile), milli-pixel physics (stbphys), gravity, jumping, parallax, scrolling camera, coin collection, spikes, goal flag. Also ships a `platform_noasset.bpp` version with debug rectangles. |
+| **Rhythm** | `games/rhythm/` | Rhythm-genre prototype. Menu → demo (auto-play) → transition countdown → play (snare on F or SPACE). Hit-windows: ±20 ms perfect, ±60 ms ok. Uses stbscene / stbasset / stbmixer music+SFX buses / beat_map text parser. |
+| **FPS — Wolf3D** | `games/fps/` | Three builds in the same folder: `fps_3d.bpp` is the CPU raycaster baseline (Phase 1), `fps_3d_gpu.bpp` is the GPU port through CRT post-process + procedural wall textures (Phase 4-6 reference), `fps_wolf3d.bpp` is the Phase 2 build with enemies + billboard sprites with per-fragment depth + AI (`stbai` cartridge). WASD + ←/→ to move, P toggles the runtime profiler HUD, ESC quits. |
+| **WC1 (RTS, mod)** | `games/rts1/` | Warcraft 1 mod on the original Blizzard asset bundle. Full 14-unit roster, melee + ranged combat, SC1-style damage matrix + caster energy. Hot-reload through Bang 9's Levels + Sprites tabs. Sessions 1-7 CLOSED; S8 (buildings) next. See `games/rts1/wc1_handoff.md`. |
+
+---
+
+## Bang 9 IDE/Engine
+
+**Bang 9 is the integrated game-dev space of the B++ ecosystem.**
+Not just an IDE. Not just an engine. One process where source
+editing, asset authoring, runtime preview, and live tuning share a
+window — because they share the same compiler, the same standard
+library, and the same hot-reload backbone.
+
+If you are building a new B++ game and you wonder "where do I edit
+this?", the answer is always Bang 9. If the panel doesn't exist
+yet, the path to building it is in this document.
+
+## The Synthesizer
+
+`tools/mini_synth/mini_synth.bpp` — 300 lines, polyphonic, 4 octaves (C3–B6), WAV recording:
+
+```
+bpp synthkey.bpp -o synth && ./synth
+```
+
+| Control | What it does |
+|---------|-------------|
+| **Keyboard rows** (ZXCV / ASDF / QWERTY / 1234) | 46 chromatic keys across 4 octaves. Press to sustain, release to stop. 8 simultaneous voices. |
+| **LEFT / RIGHT** | Waveform morph: sine (clean) → triangle → sawtooth → square (harsh) |
+| **UP / DOWN** | Dirt: clean signal → bitcrush + sample-and-hold decimation |
+| **SPACE** | Toggle WAV recording (saves to disk on stop) |
+| **ESC** | Quit |
+
+The same audio stack powers the game engine. Snake can play a WAV sample recorded in synthkey. Rhythm Teacher (next) will use the mixer for sample-accurate note timing.
+
+---
 
 ## What B++ Has
 
@@ -189,7 +254,7 @@ You write code. You compile it. You run it.
 
 The name **stb** is a tribute to [Sean Barrett's stb libraries](https://github.com/nothings/stb) — the single-header C libraries that defined a generation of small, focused, dependency-free building blocks for graphics, audio, fonts, and data. `stb_image.h`, `stb_truetype.h`, `stb_vorbis.c`, `stb_ds.h` and the rest are how a lot of indie game developers learned that "the right amount of library" is one file you can read in an afternoon. B++'s standard library is the same idea reframed as a pure-B++ collection: small modules, no headers (B++ has no headers anyway), no third-party dependencies, the minimum API surface for the maximum game.
 
-stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 29 cartridges, pulled in opt-in per program — `import "stbgame.bsm"` brings only the floor (window + input + draw + font + color + strbuf); each cartridge above that is an explicit `import` line (Tonify Rule 23 — convenience couplings hide the dependency graph).
+stb is the game engine. It's not a wrapper around SDL or raylib — it **is** the engine, written entirely in B++. 32 cartridges, pulled in opt-in per program — `import "stbgame.bsm"` brings only the floor (window + input + draw + font + color + strbuf); each cartridge above that is an explicit `import` line (Tonify Rule 23 — convenience couplings hide the dependency graph).
 
 **Rendering:**
 
@@ -236,6 +301,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
 | `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics, custom components via `ecs_component_new` |
 | `stbscene` | Scene manager — register/switch/load/update/draw/unload with deferred switches |
+| `stbchasheet`| Universal Charcter Sheet |
+| `stbprojectile` | Universal math and logic for 2d tiled projectiles |
 
 **Audio:**
 
@@ -252,7 +319,7 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 |--------|-------------|
 | `stbasset` | Handle-based asset manager — `uint32` handles with 16-bit generation, dedup by path, ABA-safe stale detection, one table for sprites/sounds/music/fonts |
 | `stbimage` | Pure B++ PNG loader — DEFLATE, Huffman, all filter types, zero FFI |
-
+ 
 ### AND MANY MORE TO COME!!!!!
 
 ### Universal runtime (promoted from stb to src)
