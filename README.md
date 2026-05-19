@@ -149,7 +149,7 @@ bpp game.bpp -o game && ./game
 
 No SDL. No raylib. No dependencies. One file in, one native binary out.
 
-## Six Games Protoypes, One Engine
+## Six Game Prototypes, One Engine
 
 B++ ships with six games in `games/`, all GPU-accelerated on Metal:
 
@@ -260,17 +260,15 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 
 | Module | What it does |
 |--------|-------------|
-| `stbdraw` | Software framebuffer rendering — rects, circles, lines, sprites, text |
+| `stbdraw` | Software framebuffer rendering — rects, circles, lines, sprites, text, named colors (`rgba()`, BLACK, WHITE, …), 8×8 bitmap font + pure-B++ TrueType reader (cmap, glyf, Bezier, scanline AA) |
 | `stbrender` | GPU-accelerated 2D rendering — rects, circles, lines, outlines, text, sprites (Metal) |
-| `stbsprite` | GPU sprite loading and rendering — any w×h, palette-indexed, JSON loader |
 | `stbshader` | Custom vertex+fragment pipelines — `gpu_pipeline_load(metal_path, vert, frag)` with cwd → install dir → walk-up resolve, `gpu_target_create / present_target` for off-screen rendering |
 | `stbfx` | Post-process effect chain — `fx_register / fx_chain_begin / fx_apply / fx_present` ping-pong infrastructure + 4 typed factories (`effect_crt`, `effect_scanlines`, `effect_chromatic`, `effect_dither`) |
 | `stbpal` | GPU palette pipeline — 7 built-in catalogs, phase-correct cycling, LUT remap, lerp |
 | `stbtexture` | Procedural textures — `texture_brick / stone / wood / solid` + `_to_buf` headless variants |
 | `stbraycast` | DDA + RayHit + per-column projection — content-blind cartridge for any 2.5D raycaster |
 | `stbprofile` | Runtime profiler HUD — REC indicator, FPS smoothed, sparkline (fixed budget reference), live top-N tally, GPU timing readout, `@profile` zone aggregates |
-| `stbfont` | 8×8 bitmap font fallback + pure B++ TrueType reader (cmap, glyf, Bezier, scanline AA) |
-| `stbcolor` | Color palette — `rgba()`, named constants (BLACK, WHITE, RED, BLUE, ...) |
+| `stbforge` | Editor + playtest infrastructure — `.character.json` schema, mini platformer testbed runtime, debug overlay, deterministic input recorder. Used by ModuLab + level_editor |
 
 **Game loop & input:**
 
@@ -299,10 +297,10 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `stbpool` | Fixed-size object pool — O(1) get/put via embedded freelist |
+| `stbgrid` | Generic 2D cell storage — bytes or words per cell, leaf primitive consumed by occupancy / fog-of-war / tile-class / BFS scratch (Tonify Rule 33 Tier 1) |
 | `stbecs` | Entity-component system — spawn/kill/recycle, parallel arrays, milli-unit physics, custom components via `ecs_component_new` |
-| `stbscene` | Scene manager — register/switch/load/update/draw/unload with deferred switches |
-| `stbchasheet`| Universal Charcter Sheet |
-| `stbprojectile` | Universal math and logic for 2d tiled projectiles |
+| `stbcharsheet` | Universal character sheet — stat + resource slots (HP / shields / energy / armor / damage / cooldown / etc.) consumed by RTS unit sheets, RPG party members, FPS enemies |
+| `stbprojectile` | 2D / 3D projectile motion + lifecycle pool — pos + vel + gravity_z + lifetime + opaque payload. Built on `stbpool`; consumers wrap with targeting + collision + render policy |
 
 **Audio:**
 
@@ -780,7 +778,7 @@ B++ is ~50 days old. The following are the milestones, in order:
 | **Apr 16** | **First sound** — `stbaudio` opens CoreAudio device. 440 Hz sine tone plays through the speakers from B++ code. |
 | **Apr 17** | **Polyphonic synthesizer** — 300-line `synthkey.bpp`, 4 octaves, 8 voices, waveform morph (sine → square), bitcrush + decimation dirt, WAV recording. |
 | **Apr 17** | **The book + zero-warning clean compile** — language reference + dev guide merged into `docs/the_b++_programming_language.md`. Last two W026 false positives resolved. Every game compiles warning-free. |
-| **Apr 18** | **Rhythm Teacher foundations — five-module ship**. `stbasset` (new, handle-based assets). `stbscene` (new, deferred scene switch). `stbmixer` extended (sample voices + 3 buses MASTER/MUSIC/SFX). `stbecs` + `stbsprite` extended. Suite 68 → 74. |
+| **Apr 18** | **Rhythm Teacher foundations — five-module ship**. `stbasset` (new, handle-based assets). `stbscene` (new, layered backgrounds + parallax). `stbmixer` extended (sample voices + 3 buses MASTER/MUSIC/SFX). `stbecs` + `stbimage` extended (component helpers + spritesheet frame sampling). Suite 68 → 74. |
 | **Apr 18** | **`bpp_path` + auto-inject + the dog-food loop closed**. Assets resolve relative to `argv[0]`. `sound_load_wav` becomes a proper chunk scanner (PCM 8/16/24/32, IEEE f32, mono→stereo). Snake plays a WAV recorded in mini_synth + in-code SFX on apple-eat — **a cobra comeu o próprio rabo**. |
 | **Apr 19** | **Tool infrastructure — ModuLab-ready bundle**. `stbwindow` (new, native dialogs). `stbinput` extended (printable-character ring). `src/bpp_json.bsm` (new, ~800 LOC reader + writer). `stbui` extensions (`gui_text_input`, `gui_grid`, `gui_palette`). Suite 75 → 78. |
 | **Apr 20** | **GPU palette + animation** — `stbpal` (7 catalogs: MCU-8, PICO-8, GB-4, NES-54…), indexed R8 sprite shader + 1×256 palette texture (O(1) palette swap). `stbforge` animation runtime. ModuLab 1.0 shipped. Suite 108. |
