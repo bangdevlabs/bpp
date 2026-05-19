@@ -1,16 +1,14 @@
 # Sidequest — stbui v2: Clay-inspired layout for B++
 
-**Status:** ARC LARGELY CLOSED 2026-05-18 — **S1 → S6 + S9
-SHIPPED**, **S7 DEFERRED** (mini_synth + sprite_viewer — no
-killer-use-case under Rule 28; reopens when either tool gains a
-Bang 9 panel embed). **S8 REVERTED** in the same session — Bang 9
-shell migration attempted, surfaced an `ui_layout_begin` re-entrancy
-gap that breaks embedded tool layouts + v2 button clicks. Reverted
-to manual chrome math; reopens as S8.1 once stbui grows a
-nested-call mode (or moves the click-swap into a separate
-`ui_frame_begin`). **S8.1 + S9.1 follow-ups open** — both touch
-`stb/stbui.bsm`, so pair them in a single bootstrap-gated cleanup
-session.
+**Status:** ARC CLOSED 2026-05-18 — **S1 → S6 + S8 (via S8.1) +
+S9 + S9.1 SHIPPED**, **S7 DEFERRED** (mini_synth + sprite_viewer
+— no killer-use-case under Rule 28; reopens when either tool
+gains a Bang 9 panel embed). The Bang 9 shell now uses the v2
+declarative tree alongside every embedded tool, because
+`ui_frame_begin` decouples the per-frame click-swap from the
+per-tree layout reset. v1 layout + Style helpers are gone from
+`stb/stbui.bsm` (verified zero source consumers across
+`tools/ bang9/ games/ examples/ tests/`).
 
 **Shipping trail (2026-05-17):**
 - S1 — `c6d8ee8` (plan + grid/zoom UI) + `dedfb04` (engine integrated)
@@ -24,9 +22,20 @@ session.
 - S7 — DEFERRED (mini_synth + sprite_viewer, Rule 28 no consumer)
 - S8 — ATTEMPTED + REVERTED same session: ui_layout_begin not
   re-entrant; embedded tools' layouts and v2 button clicks broke
-  visibly. Re-opens as S8.1 once stbui grows a nested-call mode.
-- S9 — PARTIAL: ui_demo.bpp deleted (lone v1-layout consumer);
-  stbui.bsm dead-code excision deferred to S9.1
+  visibly.
+- S9 — PARTIAL: ui_demo.bpp deleted (lone v1-layout consumer)
+- S8.1 — ui_frame_begin/ui_layout_begin split SHIPPED; Bang 9
+  shell re-migrated to v2 chrome tree (S8 re-applied, now safe)
+- S9.1 — v1 dead-code excised from stbui.bsm: struct Style + v1
+  layout (`lay_*`, `_lay_advance`, `struct Layout`, `LAY_*`,
+  `_lay_stack/top`) + dead widgets (`gui_panel_s`, `gui_label_s`,
+  `gui_number_c`, `gui_button_s`, `gui_bar`, `style_new`) + the
+  three `_stl_*` extrn caches in `init_ui`. ~280 LOC out of
+  stbui.bsm. Mechanical sweep collapsed `rx = lay_x(x); ry =
+  lay_y(y);` to `rx = x; ry = y;` and dropped every
+  `_lay_advance(...)` call from surviving widgets via
+  content-pattern sed. Suite 174/0/12 + 138/0/48 green,
+  bootstrap byte-stable.
 - Bonus closure: parser fbuf overflow that S1's `import stbimage`
   surfaced was killed by `cd6d00e` (heap-per-file refactor); the
   speculative `ui_image` widget itself reverted by `dba3e2a`
@@ -368,29 +377,23 @@ Concrete order:
    bug class so the next visitor knows why the chrome arithmetic
    wasn't migrated.
 
-9. **Session 8.1 — OPEN (replaces shipped S8)**: re-attempt the
-   Bang 9 shell migration after `ui_layout_begin` learns a
-   nested-call discipline. Two candidate shapes:
-
-   - **`ui_frame_begin()` + `ui_layout_begin()` split.** Move
-     the click-buffer swap into a new `ui_frame_begin` that the
-     host calls ONCE per frame, before any layout. Layout-begin
-     just resets node pool + seq + viewport. Every consumer
-     migrates to call `ui_frame_begin` at frame top. ~10 LOC
-     in stbui.bsm + one call site per consumer (5 today).
-   - **Save/restore around panels_draw.** Bang 9 captures the
-     node pool state + click buffers before `panels_draw`,
-     restores after. Self-contained in the host, no stbui
-     change. ~30 LOC of state-marshalling per call.
-
-   The split (option 1) matches how ImGui / Clay / Dear ImGui
-   draw the frame/layout boundary; option 2 is a hack to
-   preserve a leaky abstraction. Prefer option 1 once a
-   stb-touching cleanup session opens.
-
-   Touches `stb/stbui.bsm` so it gates on bootstrap byte-stable
-   + suite green. Pair with S9.1's dead-code excision in the
-   same session — both are stb-only edits.
+9. **Session 8.1 — CLOSED 2026-05-18**: re-attempt of S8 after
+   `ui_layout_begin` learned a nested-call discipline. The
+   `ui_frame_begin()` + `ui_layout_begin()` split shipped: the
+   click-buffer swap moved into a new `ui_frame_begin` that the
+   host calls ONCE per frame, before any layout; the layout-begin
+   now only resets node pool + sequencer + viewport (safe to
+   call multiple times per frame). Same shape as the ImGui /
+   Clay frame/layout boundary. Every consumer was updated to
+   call `ui_frame_begin` at frame top:
+   `bang9/bang9.bpp` + `tools/{modulab,level_editor,fxlab,
+   the_bug}/{}.bpp` + `examples/stbui_layout_smoke.bpp`. Bang 9
+   chrome migration re-applied: `COL win { menu fixed(28) + tabs
+   fixed(32) + panel grow + status fixed(24) }` with shell
+   bboxes cached locally BEFORE `panels_draw` runs (because the
+   embedded tool's `ui_layout_begin` resets the node pool — same
+   reasoning as before, just now the click buffer survives via
+   `ui_frame_begin`'s one-per-frame contract).
 9. **Session 9 — PARTIAL CLOSED 2026-05-18**: deletion of
    `examples/ui_demo.bpp` (the lone holdout consumer of the v1
    `lay_*` layout helpers + the styled widget family
@@ -403,16 +406,23 @@ Concrete order:
    project (verified via per-symbol grep of `tools/ bang9/
    games/ examples/ tests/`).
 
-   **Followup S9.1 (deferred — own session):** mechanical
-   deletion of the dead symbols from `stb/stbui.bsm`. Scope is
-   ~30 `_lay_advance(...)` call lines scattered across surviving
-   widget bodies (gui_label / gui_button / gui_slider /
-   gui_text_input / etc.) plus the `lay_x(x)` / `lay_y(y)`
-   fallback-resolver indirections that can collapse to bare
-   `rx = x; ry = y;`. Touches `stb/` so it gates on bootstrap
-   byte-stable + suite green. The work is mechanical but
-   high-volume; pairing it with at least one other stb/ touch
-   in a future cleanup session amortises the bootstrap cost.
+   **Followup S9.1 — CLOSED 2026-05-18 (same session as S8.1):**
+   mechanical deletion of dead symbols from `stb/stbui.bsm`
+   completed. ~280 LOC removed: the v1 layout API (`lay_push` /
+   `lay_pop` / `_lay_advance` / `lay_x` / `lay_y` / `lay_w` /
+   `struct Layout` / `LAY_DOWN` / `LAY_RIGHT` / `_lay_stack` /
+   `_lay_top`), the styled-widget family (`gui_panel_s` /
+   `gui_label_s` / `gui_number_c` / `gui_button_s` / `gui_bar` /
+   `style_new` / `struct Style`), the three theme-shadow caches
+   (`_stl_default` / `_stl_button` / `_stl_panel` + their
+   `init_ui` malloc blocks), plus every `_lay_advance(...)` call
+   and `lay_x(x)` / `lay_y(y)` indirection in surviving widget
+   bodies (collapsed to `rx = x; ry = y;` via
+   content-pattern sed). `gui_button` was refactored to read
+   `_theme.button_bg` / `_theme.button_hover_bg` / `_theme.text`
+   directly instead of going through `_stl_button` (since the
+   Style cache no longer exists). Suite stayed 174/0/12 native
+   + 138/0/48 C-emit; bootstrap byte-stable.
 
 Each session ~3-4h, bisect-friendly per migration. v1 stays
 green throughout.

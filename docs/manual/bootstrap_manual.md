@@ -271,6 +271,27 @@ pattern but live in their own repo: import them by relative path,
 share idioms with the canonical stb. The "tight-bound stdlib"
 philosophy scales to user code naturally.
 
+#### Layer 2 internals — three tiers within stb
+
+Layer 1 (programs) and Layer 2 (stb) is the user-visible
+layering, but inside Layer 2 itself there is a finer 3-tier
+distinction codified by **Tonify Rule 33**:
+
+| Tier | Name | Audience | Examples |
+|------|------|----------|----------|
+| **1** | Root primitives | Any consumer, any genre | `stbpool`, `stbgrid`, `stbcol`, `stbstr`, `bpp_buf` |
+| **2** | Genre cartridges | One genre lane | `stbflow`, `stbphys`, `stbecs`, `stbprojectile`, `stbcharsheet` |
+| **3** | Game modules | One specific game (lives in `games/<g>/`) | `wc1_combat`, `wc1_missiles`, `fps_walk`, `snake_*` |
+
+Tier 1 modules cannot import any other stb cartridge — they are
+the leaves of the import DAG. Tier 2 modules may import Tier 1
+freely but not other Tier 2 modules. Tier 3 game modules may
+import both freely. This is what keeps the import graph cycle-
+free and makes promotions between tiers single-commit and
+bisect-friendly. See `tonify_checklist.md` Rule 33 for the full
+decision procedure + graduation pattern (Tier 3 → Tier 2 →
+Tier 1) + import-graph DAG rules.
+
 ### Layer 3 — Compiler frontend + runtime
 
 ```

@@ -589,6 +589,55 @@ end of session.
 **Commits**: bundled at S7 closeout — `WC1 S7 CLOSED: full combat
 arc + 14-unit roster + Tier-2 stbprojectile`.
 
+### Session 8.0 — Pre-flight sidequests (open at S7 closeout)
+
+Caught during the manual smoke of the full S7 roster; landed in
+the S7 closeout commit as pending issues to address before the
+S8 building work begins.
+
+**8.0a — Catapult animation polish.** The human catapult and orc
+catapult atlases ship from war1tool byte-identical (faithful to
+WC1 1994 — faction-distinction only landed in WC2). Visually
+correct per source bundle, but the in-game catapult animation
+under combat looks stiff vs the SC1-paced melee animations
+around it. Two angles to investigate:
+
+- Per-frame timing — the 2,5,3 schema's 5 attack frames may be
+  cycling too fast (default 100 ms per frame ≈ 500 ms full attack
+  cycle, but a catapult fires every 2000 ms per its cooldown,
+  so the rest of the cycle is idle-static — looks like the
+  catapult "twitches" once per cooldown).
+- Faction tint — even if the original assets are byte-identical,
+  a runtime palette swap on the orc catapult (red flags / orange
+  tint) would help players read the unit at a glance without
+  needing a sprite redraw.
+
+Defer the palette swap until `stbpal` + atlas-runtime-recolor is
+exercised in another consumer (Rule 28). Frame-timing fix is
+local to `wc1_anims` + a per-state duration override.
+
+**8.0b — Window resize breaks mouse centering.** Resizing the
+running game's window mid-session (drag the window edge) breaks
+the cursor → world-coord transform. The `cam_screen_to_world_x/y`
+math reads from a SCREEN_W / SCREEN_H constant baked at game_init
+time; the underlying NSView grows but the camera viewport stays
+nailed to 320×240, so the cursor sample maps to the wrong tile
+once the window doesn't match.
+
+Two paths:
+- Lock window size at game_init (cheapest — disables the user's
+  drag-resize, but matches WC1 1994 fixed-resolution behaviour).
+- Plumb a `game_window_size(&w, &h)` accessor through stbgame +
+  recompute SCREEN_W / SCREEN_H + cam viewport on every frame
+  (proper fix, but touches stbcamera + stbinput coordinate
+  conversion). Worth doing right when a future game (rpg
+  Dungeon, top-down adventure) wants resize support genuinely.
+
+Likely the first path for v1; the second graduates into stb when
+a real consumer needs runtime resize. See `feedback_phase_
+overengineering_lesson` — don't build the generic fix without a
+second consumer.
+
 ### Session 8 — Buildings + construction (~3-4h)
 
 **Goal**: place foundation, peasant walks to it, construction
@@ -598,6 +647,13 @@ playable.
 **Files**:
 - `wc1_buildings.bsm` — building type table (port of buildings.lua).
 - `wc1_production.bsm` — construction state machine.
+
+**Tool prep**: `wc1_sprite_convert` gains a `--mode building`
+code path. Buildings differ structurally from units — single
+still frame + collapse cycle, no per-direction layout, no
+attack/walk/die round-robin. The construction animation (the
+peasant scaffolding overlay) is a separate animation that lives
+on top of the building sprite, not inside it.
 
 ### Session 9 — Resources (~3-4h)
 

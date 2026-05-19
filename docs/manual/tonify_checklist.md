@@ -2306,105 +2306,138 @@ delete the mask.
 - Smoke tests: `tests/test_unsigned_div.bpp`, `_mod.bpp`, `_shr.bpp`,
   `_arith_shared.bpp`.
 
-## Rule 33: Cartridge generality tiers — fully-generic vs genre-generic
+## Rule 33: Cartridge generality tiers — three layers, named explicitly
 
-Every `stb*` cartridge in the library sits at one of two tiers:
+Every B++ module sits at one of three tiers. The tier picks who
+is allowed to import the module, what kind of features may live
+in it, and where the file physically lives on disk.
 
-| Tier | Audience | Examples |
-|------|----------|----------|
-| **Fully-generic** | Any game or tool, regardless of genre | `stbcol` (geometry), `stbgrid` (cell storage), `bpp_buf` (raw buffers), `stbstr` (strings) |
-| **Genre-generic** | Programs in a specific genre lane | `stbflow` (RTS / TD crowd pathing), `stbphys` (platformer physics), `stbtile` (tilemap renderer), `stbecs` (entity simulation) |
+| Tier | Name | Audience | Location | Examples |
+|------|------|----------|----------|----------|
+| **1** | **Fully-generic** (stb root) | Any game or tool, regardless of genre | `stb/<name>.bsm` (leaf, zero outgoing stb deps) | `stbcol` (geometry), `stbgrid` (cell storage), `stbpool` (object pool), `bpp_buf` (raw buffers), `stbstr` (strings) |
+| **2** | **Genre-generic** (stb specialised) | Programs in a specific genre lane | `stb/<name>.bsm` (may import Tier 1 freely) | `stbflow` (RTS / TD crowd pathing), `stbphys` (platformer physics), `stbtile` (tilemap renderer), `stbecs` (entity simulation), `stbprojectile` (pooled flight + lifecycle), `stbcharsheet` (stat + resource bookkeeping) |
+| **3** | **Game-specific** | One named game | `games/<game>/<game>_*.bsm` (may import Tiers 1 + 2 freely) | `wc1_combat.bsm`, `wc1_missiles.bsm`, `wc1_units.bsm`, `fps_walk.bsm`, `snake_*.bsm`, `pathfind_*.bpp` |
 
-A program-specific module (`wc1_*.bsm`, `fps_*.bsm`, `snake_*.bsm`) is
-neither — it lives **inside** the game's source folder, not `stb/`.
+The 3-tier shape matches how the layers actually grow: Tier 1
+primitives appear once a fully-generic shape gets pulled out of
+multiple Tier 2 cartridges (the `stbgrid` graduation from `stbflow`
++ `wc1_collision`); Tier 2 cartridges appear once a genre-shape
+gets pulled out of multiple Tier 3 game cartridges (or, in the
+restricted "consumer-in-view" case, when two Tier-3 consumers are
+concretely planned — the `stbprojectile` graduation from
+`wc1_missiles` with rts1 + fps Doom-mode + rpg Game 4 in view).
 
 ### Why the distinction matters
 
 It changes who is allowed to import the cartridge and what kind of
 features may live in it.
 
-- **Fully-generic cartridges** are leaf primitives. They store data
-  or compute pure functions on it. They must not embed genre
+- **Tier 1 — root primitives.** Leaves of the import graph. Store
+  data or compute pure functions on it. They must not embed genre
   semantics. Any tier above can import them.
-- **Genre-generic cartridges** ship complete subsystems for one
-  domain. They may import fully-generic primitives freely and may
-  carry genre-shaped APIs (`flow_compute(goal_x, goal_y)`,
-  `phys_apply_gravity(body)`). They must not embed *game-specific*
-  semantics (player factions, unit names, level layouts).
+- **Tier 2 — genre cartridges.** Ship complete subsystems for one
+  domain. They may import Tier 1 primitives freely and may carry
+  genre-shaped APIs (`flow_compute(goal_x, goal_y)`,
+  `phys_apply_gravity(body)`, `projectile_spawn(...)`). They must
+  not embed *game-specific* semantics (player factions, unit
+  names, level layouts).
+- **Tier 3 — game modules.** Live inside the game's folder, not
+  `stb/`. May import Tier 1 + Tier 2 freely. Embed all the
+  game-specific semantics — unit kinds, faction names, level
+  routing, etc. The vocabulary of the game lives here.
 
-The rule "genre-generic cartridges may consume fully-generic
-primitives" is what made `stbgrid` happen — `stbflow` was carrying
-three ad-hoc grids that were really storage, not crowd pathing.
-Lifting them into `stbgrid` made `stbflow` smaller, gave non-RTS
-games (roguelikes, Sokoban puzzles, tower defense placement
-preview) a real handle to use.
+The rule "Tier 2 cartridges may consume Tier 1 primitives" is what
+made `stbgrid` happen — `stbflow` (Tier 2) was carrying three
+ad-hoc grids that were really storage, not crowd pathing. Lifting
+them into `stbgrid` (Tier 1) made `stbflow` smaller and gave
+non-RTS games (roguelikes, Sokoban puzzles, tower defense
+placement preview) a real handle to use.
 
-### Decision: which tier does a new cartridge belong in?
+The rule "Tier 3 modules may consume Tier 1 + Tier 2 freely" is
+what makes game code clean — `wc1_missiles` (Tier 3) consumes
+`stbprojectile` (Tier 2, which itself consumes `stbpool` Tier 1)
+and adds the RTS-specific targeting + damage matrix + arrow atlas
+glue, without re-implementing the motion bookkeeping.
 
-Ask the two questions in order.
+### Decision: which tier does a new module belong in?
 
-1. **Could a non-`<genre>` game pull this cartridge and get value?**
-   Roguelike, snake, sokoban, tetris, top-down adventure, side-
-   scroller, puzzle, anything outside the genre that surfaced the
-   need. If yes → fully-generic. If no → genre-generic.
-2. **Does the cartridge store data without naming what the data
+Ask the questions in order.
+
+1. **Does it live inside a single game's folder?** If yes →
+   Tier 3 (game module). Stop here.
+2. **Could a non-`<genre>` game pull this cartridge and get
+   value?** Roguelike, snake, sokoban, tetris, top-down
+   adventure, side-scroller, puzzle, anything outside the
+   genre that surfaced the need. If yes → Tier 1. If no →
+   Tier 2.
+3. **Does the cartridge store data without naming what the data
    means?** A grid of words, a buffer of bytes, a geometry test,
-   a string. If yes → almost always fully-generic. Anything that
+   a string. If yes → Tier 1 almost certainly. Anything that
    names the semantics ("occupancy", "tile class", "unit class",
-   "physics body") is genre-generic at minimum.
+   "physics body", "projectile") is Tier 2 at minimum.
 
 WC1's tile-occupancy work surfaced this distinction the hard way.
 The first instinct was "put it in `stbcol`" — but `stbcol` is
-fully-generic geometry primitives, not stateful storage. The
-second instinct was "put it in `stbflow`" — but `stbflow` is RTS
-crowd pathing, and occupancy is useful to puzzle games + roguelikes
-that never touch crowd movement. The answer was a new fully-
-generic cartridge (`stbgrid`) plus a `wc1_collision_*` wrapper
-that gave the cells occupancy semantics in-game.
+Tier 1 geometry primitives, not stateful storage. The second
+instinct was "put it in `stbflow`" — but `stbflow` is Tier 2 RTS
+crowd pathing, and occupancy is useful to puzzle games +
+roguelikes that never touch crowd movement. The answer was a new
+Tier 1 cartridge (`stbgrid`) plus a `wc1_collision_*` Tier-3
+wrapper that gave the cells occupancy semantics in-game.
 
 ### Cross-cartridge import rules
 
 ```
-games/<g>/<g>_*.bsm       → may import fully-generic + genre-generic
-stb/<genre>*.bsm          → may import fully-generic; not other genre cartridges
-stb/<fully-generic>.bsm   → must not import any other cartridge
+Tier 3 (game module)     → may import Tier 1 + Tier 2 freely
+Tier 2 (genre cartridge) → may import Tier 1 only; not other Tier 2
+Tier 1 (root primitive)  → must not import any other cartridge
 ```
 
-The fully-generic floor is a leaf set with zero outgoing
-dependencies into the rest of `stb/`. This is what keeps the
-import graph DAG-shaped (no cycles, no surprise transitive pulls
-— see Rule 23's `dedfb04` lesson where `stbui` reached down into
-`stbimage` and broke the rule).
+The Tier-1 floor is a leaf set with zero outgoing dependencies
+into the rest of `stb/`. This is what keeps the import graph
+DAG-shaped (no cycles, no surprise transitive pulls — see Rule
+23's `dedfb04` lesson where `stbui` reached down into `stbimage`
+and broke the rule).
 
-### When a genre-generic cartridge wants a fully-generic primitive
+### Graduation between tiers (the healthy growth path)
 
-That is the healthy graduation pattern (`stbflow` → `stbgrid`). The
-sequence is:
+**Tier 3 → Tier 2.** A second game-cartridge consumer wants the
+same shape. Examples:
 
-1. The genre cartridge already carries an ad-hoc version of the
-   primitive (or a game is about to ask for the same shape).
-2. A second consumer exists or is concrete enough that Rule 20
-   (two-consumer rule) fires.
-3. Lift the primitive into a new fully-generic cartridge, with
-   the anti-speculation guard in the header (Rule 28).
-4. Refactor the genre cartridge to consume the new primitive.
-   This becomes the second-consumer test that validates the API.
+- `wc1_missiles` → `stbprojectile`: rts1 first, fps Doom-mode +
+  rpg Game 4 in view. The Tier-2 cartridge owns motion + lifecycle
+  (genre-agnostic); each Tier-3 consumer owns targeting + render +
+  collision policy (genre-specific).
+- A hypothetical second platformer would lift `platformer_jump`
+  helpers into `stbjump` (Tier 2 — genre-shaped, but reusable
+  across action-platformer + adventure-platformer + metroidvania).
+
+**Tier 2 → Tier 1.** A Tier-2 cartridge already carries an
+ad-hoc primitive AND a non-genre consumer (puzzle, roguelike,
+test harness) wants the same primitive. Examples:
+
+- `stbflow` carrying three ad-hoc grids → `stbgrid` (Tier 1) +
+  `wc1_collision` second consumer. Roguelikes / Sokoban /
+  TD-placement-preview all benefit, none touch crowd movement.
 
 The graduation is single-commit, mechanical, and bisect-friendly.
 If it turns into a sprawling redesign, the primitive was not
-fully-generic enough — back out and rethink.
+generic enough for the new tier — back out and rethink.
 
 ### When NOT to graduate
 
-- One consumer, no second on the horizon. Stay in the consumer's
-  source folder (e.g. `wc1_collision.bsm` keeping the helpers
-  there) — Rule 20 + Rule 28.
-- The "primitive" naturally embeds genre vocabulary. If you
+- **One consumer, no second on the horizon.** Stay in the
+  consumer's source folder (Rule 20 + Rule 28). The exception:
+  Tier 2 graduation may proceed with one current consumer
+  + multiple concretely-planned consumers (the rts1 + fps Doom
+  + rpg "consumer-in-view" pattern that surfaced
+  `stbprojectile`).
+- **The "primitive" naturally embeds genre vocabulary.** If you
   can't write the header docstring without saying "unit",
-  "player", "level", or "enemy", it is not fully-generic.
-- The graduation would force a cycle in the import DAG (e.g. a
-  fully-generic cartridge wanting to import a genre cartridge to
-  work). The shape is wrong — keep it in the game module.
+  "player", "level", or "enemy", it doesn't belong at Tier 1.
+- **The graduation would force a cycle in the import DAG** (e.g. a
+  Tier 1 cartridge wanting to import a Tier 2 to work). The shape
+  is wrong — keep it in the higher tier.
 
 ### Cross-references
 

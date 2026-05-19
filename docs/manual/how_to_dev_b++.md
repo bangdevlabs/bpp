@@ -167,11 +167,12 @@ That is the entire reason the minimum program is three lines instead of the seve
 
 ### Consequence for the tick loop
 
-A windowed program also needs no `import`:
+A windowed program also needs no `import` — the platform layer is
+auto-injected, so the raw primitives are reachable directly:
 
 ```c
 main() {
-    _stb_init_window(320, 180, "Tool", 60);
+    _stb_init_window(320, 180, "Tool");
     while (_stb_should_close() == 0) {
         _stb_poll_events();
         _stb_frame_wait();
@@ -179,7 +180,22 @@ main() {
 }
 ```
 
-`_stb_init_window`, `_stb_should_close`, `_stb_poll_events`, `_stb_frame_wait` all come from `_stb_platform.bsm`, auto-injected. The tick loop is written by YOUR `main()` — neither `stbgame` nor the platform layer runs a tick on your behalf. See Cap 26 for when to use `stbgame`'s 60-FPS wrappers instead of raw platform primitives.
+`_stb_init_window` (3 args: width, height, title — frame timing
+lives inside `_stb_frame_wait`, no FPS argument), `_stb_should_close`,
+`_stb_poll_events`, `_stb_frame_wait` all come from `_stb_platform.bsm`,
+auto-injected. The tick loop is written by YOUR `main()` — neither
+`stbgame` nor the platform layer runs a tick on your behalf.
+
+**You almost never write this in practice.** Tools opt in to
+`stbwindow.bsm` (`window_init_full(w, h, title)` + `window_should_close()`
++ `window_frame_step()` + native file dialogs) and games opt in to
+`stbgame.bsm` (`game_init(w, h, title, fps)` + `game_should_quit()`
++ `game_frame_begin()` + maestro + pixel-perfect canvas). The raw
+`_stb_*` primitives shown above are the layer those cartridges wrap;
+calling them directly is reserved for new platform-layer bring-up
+or one-off probes. See Cap 26 for when to use `stbgame`'s 60-FPS
+wrappers; tools use `stbwindow` (per Tonify Rule 23 — cartridge
+minimalism, tools split from games at the window layer).
 
 ---
 
