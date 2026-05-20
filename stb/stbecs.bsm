@@ -172,7 +172,14 @@ ecs_new(capacity) {
     w.comp_names = arr_new();
     w.comp_sizes = arr_new();
     w.archetype_count = 0;
-    w.archetypes = arr_new();
+    // ArchetypeRec storage. Inline-AoS via `bpp_arr` so each archetype
+    // lives in the contiguous backing buffer (no per-archetype malloc;
+    // every field reachable via the typed pointer `arr_struct_at`
+    // returns). Initial capacity 4 covers the ~2-5 archetypes a
+    // typical world holds; growth is doubling. ArchetypeRec pointers
+    // are CALL-SITE-LOCAL — never cache across an `ecs_archetype`
+    // registration, since the alloc may realloc.
+    w.archetypes = arr_struct_new(sizeof(ArchetypeRec), 4);
     // RTS Stress Arc Session 5 — empty scheduler state. Games
     // opt in by calling ecs_system_register; legacy callers
     // never touch sys_count and pay only the fixed-size buffer
@@ -213,9 +220,14 @@ ecs_component_register(w, name_str, size_bytes) {
 // comes first, then component 1's array, etc.), so iteration order
 // is predictable across architectures.
 ecs_archetype(w, comp_ids, n_comps) {
-    auto wd: World, ar: ArchetypeRec, i, sz, off, sum, mask;
+    auto wd: World, ar: ArchetypeRec, i, sz, off, sum, mask, idx;
     wd = w;
-    ar = malloc(sizeof(ArchetypeRec));
+    // Inline the record in `wd.archetypes`'s backing buffer. The
+    // alloc may grow + realloc; we hold `ar` only within this call,
+    // never hand it out. Callers receive `arch_idx` and re-resolve
+    // via `arr_struct_at(wd.archetypes, arch_idx)`.
+    idx = arr_struct_alloc(wd.archetypes);
+    ar  = arr_struct_at(wd.archetypes, idx);
     ar.arch_idx = wd.archetype_count;
     ar.comp_count = n_comps;
     ar.comp_ids = buf_word(n_comps);
@@ -261,7 +273,6 @@ ecs_archetype(w, comp_ids, n_comps) {
     ar.alive = 0;
     ar.alive_cap = 0;
     ar.live_count = 0;
-    wd.archetypes = arr_push(wd.archetypes, ar);
     wd.archetype_count++;
     return ar.arch_idx;
 }
@@ -327,7 +338,7 @@ static _ecs_archetype_grow_alive(ar, needed) {
 ecs_spawn_at(w, archetype_id) {
     auto wd: World, ar: ArchetypeRec, row, chunk_idx, i;
     wd = w;
-    ar = arr_get(wd.archetypes, archetype_id);
+    ar = arr_struct_at(wd.archetypes,archetype_id);
     // Try to recycle a dead slot in [0, total_entities).
     row = 0 - 1;
     for (i = 0; i < ar.total_entities; i++) {
@@ -368,7 +379,7 @@ void ecs_kill_at(w, entity_id) {
     arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
     row = entity_id & _ECS_ROW_MASK;
     if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return; }
-    ar = arr_get(wd.archetypes, arch_idx);
+    ar = arr_struct_at(wd.archetypes,arch_idx);
     if (row < 0 || row >= ar.total_entities) { return; }
     if (peek(ar.alive + row) == 0) { return; }
     poke(ar.alive + row, 0);
@@ -387,7 +398,7 @@ ecs_alive_at(w, entity_id) {
     arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
     row = entity_id & _ECS_ROW_MASK;
     if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return 0; }
-    ar = arr_get(wd.archetypes, arch_idx);
+    ar = arr_struct_at(wd.archetypes,arch_idx);
     if (row < 0 || row >= ar.total_entities) { return 0; }
     return peek(ar.alive + row);
 }
@@ -412,7 +423,7 @@ ecs_get(w, comp_id, entity_id) {
     arch_idx = (entity_id / _ECS_ARCH_BIT) - 1;
     row = entity_id & _ECS_ROW_MASK;
     if (arch_idx < 0 || arch_idx >= wd.archetype_count) { return 0; }
-    ar = arr_get(wd.archetypes, arch_idx);
+    ar = arr_struct_at(wd.archetypes,arch_idx);
     if (row < 0 || row >= ar.total_entities) { return 0; }
     // Dead slot — return 0 so stale eids fail safely. Callers that
     // hold an eid across frames should ecs_alive_at-check before
@@ -601,7 +612,7 @@ void ecs_query_each(q, fn) {
     // dead via a single peek so the dead-row cost is one byte read
     // per slot.
     for (ai = 0; ai < w.archetype_count; ai++) {
-        ar = arr_get(w.archetypes, ai);
+        ar = arr_struct_at(w.archetypes,ai);
         if (mask != 0 && (ar.comp_bitmask & mask) != mask) { continue; }
         for (row = 0; row < ar.total_entities; row++) {
             if (peek(ar.alive + row) == 0) { continue; }
@@ -629,7 +640,7 @@ ecs_query_count(q) {
     // rows; dead slots vacated by ecs_kill_at don't count even
     // though they still occupy a row index in [0, total_entities).
     for (ai = 0; ai < w.archetype_count; ai++) {
-        ar = arr_get(w.archetypes, ai);
+        ar = arr_struct_at(w.archetypes,ai);
         n = n + ar.live_count;
     }
     return n;
@@ -664,7 +675,7 @@ void ecs_chunk_each(q, comp_id, fn) {
     eq = q;
     w = eq.world;
     for (ai = 0; ai < w.archetype_count; ai++) {
-        ar = arr_get(w.archetypes, ai);
+        ar = arr_struct_at(w.archetypes,ai);
         // Locate comp_id in this archetype's bundle. Linear scan over
         // comp_count entries — typically ≤ 8 components per archetype,
         // so a hash would be overkill.
@@ -723,7 +734,7 @@ void ecs_chunk_each2(q, comp_a, comp_b, fn) {
     eq = q;
     w = eq.world;
     for (ai = 0; ai < w.archetype_count; ai++) {
-        ar = arr_get(w.archetypes, ai);
+        ar = arr_struct_at(w.archetypes,ai);
         found_a = 0 - 1;
         found_b = 0 - 1;
         for (k = 0; k < ar.comp_count; k++) {
