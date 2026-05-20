@@ -1463,6 +1463,36 @@ handler) that the native pipeline merely happened to tolerate. Fix
 the source, not the C emitter, unless the bug truly belongs to the
 emitter (a missing inline handler for a B++ builtin, for example).
 
+### The fourth canonical harness — `tests/bench_compile.sh`
+
+The three runners above guard correctness. The fourth canonical
+harness, `tests/bench_compile.sh`, guards compile-time
+performance. It runs three reference compiles (bootstrap +
+small + medium) for N iterations and prints min/median/max
+wall-clock per case, with an optional `--sample` flag for the
+macOS hot-list:
+
+```bash
+sh tests/bench_compile.sh                  # default 5 runs
+sh tests/bench_compile.sh --runs 10        # tighter median
+sh tests/bench_compile.sh --bpp /tmp/cand  # benchmark a candidate
+sh tests/bench_compile.sh --sample         # add sample(1) hot-list
+```
+
+Cite the output in commits, journal entries, and PRs whenever
+a change is perf-relevant (accessor shape, hot lookup, data
+layout, codegen path). The harness pins `BPP_BUILD_ID` and
+`cd`s to `REPO_ROOT` so numbers reproduce across machines and
+shells. **Tonify Rule 37** documents the citation contract;
+the harness itself is the artifact every claim points back at.
+
+The 2026-05-20 compiler array migration arc was the first to
+cite this harness — it caught a measurement bug ("16%
+regression") that turned out to be an apples-vs-oranges
+comparison (old compiler errored fast on new source). Without
+the harness, the wrong number would have shipped in the
+journal entry.
+
 ## Recovering from a Broken bpp
 
 If `./bpp` is corrupted or produces broken binaries:

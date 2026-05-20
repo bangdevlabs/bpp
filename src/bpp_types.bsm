@@ -22,64 +22,98 @@ import "bpp_internal.bsm";
 import "bpp_parser.bsm";
 
 // ── Symbol table ───────────────────────────────────────────
-// Dynamic parallel arrays of packed name and type code.
-// ty_vt_elem tracks the inferred element type of TY_ARR variables.
-// Default is TY_WORD (word array). Set by writes and str_* call inference.
-static auto ty_vt_names, ty_vt_types, ty_vt_locked, ty_vt_elem;
+// Per-function local variable type table. One VtEntry per
+// inferred local: packed name + inferred type code + locked
+// flag (set by `: <type>` annotations to pin the inference) +
+// element type (for TY_ARR locals — defaults to TY_WORD, set
+// by writes and str_* call inference).
+//
+// Backed by `arr_struct` (auto-injected from bpp_arr): single
+// growable struct array replaces what was four parallel
+// arrays (ty_vt_names + ty_vt_types + ty_vt_locked +
+// ty_vt_elem). Tonify Rule 35 + 36 graduation — the compiler
+// was the canonical workload exposing the gap.
+struct VtEntry {
+    name,    // packed name of the local
+    type,    // TY_* code (TY_WORD, TY_FLOAT, etc.)
+    locked,  // 1 = explicit annotation pinned the type (no widening)
+    elem     // for TY_ARR locals: element type (TY_WORD default)
+}
+static auto ty_vt;
 
-// Known function return types: dynamic parallel arrays.
-static auto ft_names, ft_types;
+// Known function return types — one FtEntry per recorded
+// function name. Same shape as GlEntry above (name + type).
+// Backed by arr_struct.
+struct FtEntry {
+    name,    // packed function name
+    type     // TY_* return type code
+}
+static auto fn_ret_table;
 
-// Per-function persistent type data (survives scope resets, used by emitter).
-// fn_vt_data[i]  → pointer to interleaved (name, type) pairs for function i.
-// fn_vt_cnts[i]  → number of variables stored for function i.
-// fn_ret_types[i] → inferred return type for function i.
-// fn_par_types[i] → pointer to array of param type codes for function i.
-extrn fn_vt_data, fn_vt_cnts; static auto fn_ret_types, fn_par_types;
+// Per-function persistent type data (survives scope resets, used by
+// emitter). One FnMeta per function, indexed by func_idx. Combines
+// the four legacy parallel arrays (fn_vt_data / fn_vt_cnts /
+// fn_ret_types / fn_par_types) into a single arr_struct — access
+// pattern is random index by func_idx, which AoS handles equally
+// well as SoA. Cross-file readers (bpp_codegen, bpp_bug,
+// bpp_dispatch, bug_eval) reach the fields through the
+// `fn_meta_*` accessors below.
+struct FnMeta {
+    vt_block,    // ptr to 24-byte VtEntry-shaped blob (name,type,elem per local)
+    vt_count,    // number of locals in vt_block
+    ret_type,    // inferred return type (TY_*)
+    par_block    // ptr to buf_word holding param type codes
+}
+extrn fn_metas;
 
 // Current function's inferred return type (accumulated across return statements).
 static auto ty_cur_ret;
 
 // Global variable type tracking (persists across functions).
-static auto ty_gl_names, ty_gl_types;
+// One GlEntry per declared global; promote-on-overwrite +
+// linear-scan lookup. Backed by `arr_struct` (same migration
+// pattern as ty_vt above).
+struct GlEntry {
+    name,    // packed name of the global
+    type     // TY_* code (TY_WORD, TY_FLOAT, etc.)
+}
+static auto ty_gl;
 
 // Initialize the type inference engine. Call once at startup.
 void init_types() {
-    ty_vt_names  = arr_new();
-    ty_vt_types  = arr_new();
-    ty_vt_locked = arr_new();
-    ty_vt_elem   = arr_new();
-    ft_names = arr_new();
-    ft_types = arr_new();
-    fn_vt_data = arr_new();
-    fn_vt_cnts = arr_new();
-    fn_ret_types = arr_new();
-    fn_par_types = arr_new();
+    ty_vt = arr_struct_new(sizeof(VtEntry), 64);
+    fn_ret_table = arr_struct_new(sizeof(FtEntry), 64);
+    fn_metas = arr_struct_new(sizeof(FnMeta), 64);
     ty_cur_ret = TY_UNK;
-    ty_gl_names = arr_new();
-    ty_gl_types = arr_new();
+    ty_gl = arr_struct_new(sizeof(GlEntry), 32);
     init_fn_types();
 }
 
 // Record or update a global variable's type.
 void ty_set_global_type(name_p, ty) {
-    auto i;
-    for (i = 0; i < arr_len(ty_gl_names); i++) {
-        if (packed_eq(arr_get(ty_gl_names, i), name_p)) {
-            arr_set(ty_gl_types, i, promote(arr_get(ty_gl_types, i), ty));
+    auto i, n, g: GlEntry, idx;
+    n = arr_struct_count(ty_gl);
+    for (i = 0; i < n; i++) {
+        g = arr_struct_at(ty_gl, i);
+        if (packed_eq(g.name, name_p)) {
+            g.type = promote(g.type, ty);
             return;
         }
     }
-    ty_gl_names = arr_push(ty_gl_names, name_p);
-    ty_gl_types = arr_push(ty_gl_types, ty);
+    idx = arr_struct_alloc(ty_gl);
+    g = arr_struct_at(ty_gl, idx);
+    g.name = name_p;
+    g.type = ty;
 }
 
 // Look up a global variable's inferred type.
 ty_get_global_type(name_p) {
-    auto i;
-    for (i = 0; i < arr_len(ty_gl_names); i++) {
-        if (packed_eq(arr_get(ty_gl_names, i), name_p)) {
-            return arr_get(ty_gl_types, i);
+    auto i, n, g: GlEntry;
+    n = arr_struct_count(ty_gl);
+    for (i = 0; i < n; i++) {
+        g = arr_struct_at(ty_gl, i);
+        if (packed_eq(g.name, name_p)) {
+            return g.type;
         }
     }
     return TY_WORD;
@@ -87,18 +121,17 @@ ty_get_global_type(name_p) {
 
 // Reset the variable table for a new function scope.
 void ty_reset_scope() {
-    arr_clear(ty_vt_names);
-    arr_clear(ty_vt_types);
-    arr_clear(ty_vt_locked);
-    arr_clear(ty_vt_elem);
+    arr_struct_reset(ty_vt);
 }
 
 // Look up a variable's inferred type by packed name. Returns TY_UNK if not found.
 ty_var_type(name_p) {
-    auto i;
-    for (i = 0; i < arr_len(ty_vt_names); i++) {
-        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
-            return arr_get(ty_vt_types, i);
+    auto i, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            return e.type;
         }
     }
     return TY_UNK;
@@ -111,18 +144,19 @@ ty_var_type(name_p) {
 // the explicit annotation is the user's contract with the codegen, and the
 // E232 / E233 diagnostics rely on it being authoritative.
 void ty_set_var_type(name_p, ty) {
-    auto i, old, j;
-    for (i = 0; i < arr_len(ty_vt_names); i++) {
-        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
-            if (arr_get(ty_vt_locked, i)) { return; }
-            old = arr_get(ty_vt_types, i);
+    auto i, j, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            if (e.locked) { return; }
             // TY_UNK in the slot means the local was pre-declared
             // by T_DECL without a hint — the first real assignment
             // wins outright (promote(TY_UNK, x) returns TY_UNK so
             // the special case is required to seed the slot
             // correctly).
-            if (old == TY_UNK) { arr_set(ty_vt_types, i, ty); }
-            else { arr_set(ty_vt_types, i, promote(old, ty)); }
+            if (e.type == TY_UNK) { e.type = ty; }
+            else                  { e.type = promote(e.type, ty); }
             return;
         }
     }
@@ -140,26 +174,34 @@ void ty_set_var_type(name_p, ty) {
     // globals (NOT in ty_gl_names) keep the legacy behavior —
     // the assignment falls through to the local-table append
     // below.
-    for (j = 0; j < arr_len(ty_gl_names); j++) {
-        if (packed_eq(arr_get(ty_gl_names, j), name_p)) {
+    auto gl_n, g: GlEntry;
+    gl_n = arr_struct_count(ty_gl);
+    for (j = 0; j < gl_n; j++) {
+        g = arr_struct_at(ty_gl, j);
+        if (packed_eq(g.name, name_p)) {
             return;
         }
     }
     // New local variable: append to table, unlocked, word element by default.
-    ty_vt_names  = arr_push(ty_vt_names,  name_p);
-    ty_vt_types  = arr_push(ty_vt_types,  ty);
-    ty_vt_locked = arr_push(ty_vt_locked, 0);
-    ty_vt_elem   = arr_push(ty_vt_elem,   TY_WORD);
+    auto idx;
+    idx = arr_struct_alloc(ty_vt);
+    e = arr_struct_at(ty_vt, idx);
+    e.name   = name_p;
+    e.type   = ty;
+    e.locked = 0;
+    e.elem   = TY_WORD;
 }
 
 // Lock a variable's type. Subsequent ty_set_var_type calls become no-ops, so
 // inference cannot widen `: word` into float. Called by the typer during
 // T_AUTO whenever the parser attached an explicit type hint.
 void ty_lock_var(name_p) {
-    auto i;
-    for (i = 0; i < arr_len(ty_vt_names); i++) {
-        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
-            arr_set(ty_vt_locked, i, 1);
+    auto i, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            e.locked = 1;
             return;
         }
     }
@@ -170,11 +212,12 @@ void ty_lock_var(name_p) {
 // always homogeneous, so two different element types in the same array is a
 // programmer bug, not an inference ambiguity.
 void ty_set_elem(name_p, elem_ty, src_tok) {
-    auto i, cur;
-    for (i = 0; i < arr_len(ty_vt_names); i++) {
-        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
-            cur = arr_get(ty_vt_elem, i);
-            if (cur != TY_WORD && cur != elem_ty) {
+    auto i, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            if (e.elem != TY_WORD && e.elem != elem_ty) {
                 diag_error(245);
                 diag_str("array element type conflict: array '");
                 diag_packed(name_p);
@@ -184,7 +227,7 @@ void ty_set_elem(name_p, elem_ty, src_tok) {
                 diag_show_line(src_tok);
                 return;
             }
-            arr_set(ty_vt_elem, i, elem_ty);
+            e.elem = elem_ty;
             return;
         }
     }
@@ -192,10 +235,12 @@ void ty_set_elem(name_p, elem_ty, src_tok) {
 
 // Return the inferred element type of a TY_ARR variable.
 ty_get_elem(name_p) {
-    auto i;
-    for (i = 0; i < arr_len(ty_vt_names); i++) {
-        if (packed_eq(arr_get(ty_vt_names, i), name_p)) {
-            return arr_get(ty_vt_elem, i);
+    auto i, n, e: VtEntry;
+    n = arr_struct_count(ty_vt);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(ty_vt, i);
+        if (packed_eq(e.name, name_p)) {
+            return e.elem;
         }
     }
     return TY_WORD;
@@ -238,15 +283,19 @@ static _arr_base_var(nd) {
 // Register or update a known function return type.
 // If the function already exists in the table, updates its type.
 void set_func_type(name_p, ty) {
-    auto i;
-    for (i = 0; i < arr_len(ft_names); i++) {
-        if (packed_eq(arr_get(ft_names, i), name_p)) {
-            arr_set(ft_types, i, ty);
+    auto i, n, e: FtEntry, idx;
+    n = arr_struct_count(fn_ret_table);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(fn_ret_table, i);
+        if (packed_eq(e.name, name_p)) {
+            e.type = ty;
             return;
         }
     }
-    ft_names = arr_push(ft_names, name_p);
-    ft_types = arr_push(ft_types, ty);
+    idx = arr_struct_alloc(fn_ret_table);
+    e = arr_struct_at(fn_ret_table, idx);
+    e.name = name_p;
+    e.type = ty;
 }
 
 // Return the inferred type for a known builtin call, or 0 when the name
@@ -277,12 +326,14 @@ static _builtin_ret_type(name_p) {
 // Builtins are checked first so a missing or stale entry in `ft_names`
 // cannot mask a known float-returning builtin as an integer.
 func_type(name_p) {
-    auto i, bt;
+    auto i, bt, n, e: FtEntry;
     bt = _builtin_ret_type(name_p);
     if (bt != 0) { return bt; }
-    for (i = 0; i < arr_len(ft_names); i++) {
-        if (packed_eq(arr_get(ft_names, i), name_p)) {
-            return arr_get(ft_types, i);
+    n = arr_struct_count(fn_ret_table);
+    for (i = 0; i < n; i++) {
+        e = arr_struct_at(fn_ret_table, i);
+        if (packed_eq(e.name, name_p)) {
+            return e.type;
         }
     }
     return TY_WORD;
@@ -588,16 +639,21 @@ add_type(nd) {
         // same local in nested blocks is harmless — duplicate
         // entries are tolerated, the first match wins.
         for (i = 0; i < cnt; i++) {
+            auto vt_n, e: VtEntry, new_idx;
+            vt_n = arr_struct_count(ty_vt);
             j = 0;
-            while (j < arr_len(ty_vt_names)) {
-                if (packed_eq(arr_get(ty_vt_names, j), arr[i])) { break; }
+            while (j < vt_n) {
+                e = arr_struct_at(ty_vt, j);
+                if (packed_eq(e.name, arr[i])) { break; }
                 j++;
             }
-            if (j == arr_len(ty_vt_names)) {
-                ty_vt_names  = arr_push(ty_vt_names,  arr[i]);
-                ty_vt_types  = arr_push(ty_vt_types,  TY_UNK);
-                ty_vt_locked = arr_push(ty_vt_locked, 0);
-                ty_vt_elem   = arr_push(ty_vt_elem,   TY_WORD);
+            if (j == vt_n) {
+                new_idx = arr_struct_alloc(ty_vt);
+                e = arr_struct_at(ty_vt, new_idx);
+                e.name   = arr[i];
+                e.type   = TY_UNK;
+                e.locked = 0;
+                e.elem   = TY_WORD;
             }
         }
         if (hints_arr != 0) {
@@ -666,36 +722,41 @@ add_type(nd) {
 // Layout per entry: [name:8][type:8][elem:8] = 24 bytes.
 // Called after inference completes for each function.
 void save_fn_types(func_idx) {
-    auto block, i, cnt;
-    cnt = arr_len(ty_vt_names);
+    auto block, i, cnt, e: VtEntry, m: FnMeta;
+    cnt = arr_struct_count(ty_vt);
     block = buf_byte(cnt * 24);
     for (i = 0; i < cnt; i++) {
-        *(block + i * 24)      = arr_get(ty_vt_names, i);
-        *(block + i * 24 + 8)  = arr_get(ty_vt_types, i);
-        *(block + i * 24 + 16) = arr_get(ty_vt_elem,  i);
+        e = arr_struct_at(ty_vt, i);
+        *(block + i * 24)      = e.name;
+        *(block + i * 24 + 8)  = e.type;
+        *(block + i * 24 + 16) = e.elem;
     }
-    arr_set(fn_vt_data, func_idx, block);
-    arr_set(fn_vt_cnts, func_idx, cnt);
-    arr_set(fn_ret_types, func_idx, ty_cur_ret);
+    m = arr_struct_at(fn_metas, func_idx);
+    m.vt_block = block;
+    m.vt_count = cnt;
+    m.ret_type = ty_cur_ret;
 }
 
 // Save parameter types for a function. Called after inference when
 // param types may have been updated by call-site propagation.
 void save_fn_par_types(func_idx, params_arr, param_cnt) {
-    auto block, i;
+    auto block, i, m: FnMeta;
     block = buf_word(param_cnt);
     for (i = 0; i < param_cnt; i++) {
         block[i] = ty_var_type(params_arr[i]);
     }
-    arr_set(fn_par_types, func_idx, block);
+    m = arr_struct_at(fn_metas, func_idx);
+    m.par_block = block;
 }
 
 // Query a variable's inferred type for a given function index.
 // Used by the emitter to decide double vs long long.
 get_fn_var_type(func_idx, name_p) {
-    auto block, cnt, i;
-    block = arr_get(fn_vt_data, func_idx);
-    cnt = arr_get(fn_vt_cnts, func_idx);
+    auto block, cnt, i, m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return TY_WORD; }
+    block = m.vt_block;
+    cnt   = m.vt_count;
     for (i = 0; i < cnt; i++) {
         if (packed_eq(*(block + i * 24), name_p)) {
             return *(block + i * 24 + 8);
@@ -707,9 +768,11 @@ get_fn_var_type(func_idx, name_p) {
 // Query the element type of a TY_ARR variable for a given function index.
 // Returns TY_WORD if not found or not an array.
 get_fn_elem_type(func_idx, name_p) {
-    auto block, cnt, i;
-    block = arr_get(fn_vt_data, func_idx);
-    cnt = arr_get(fn_vt_cnts, func_idx);
+    auto block, cnt, i, m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return TY_WORD; }
+    block = m.vt_block;
+    cnt   = m.vt_count;
     for (i = 0; i < cnt; i++) {
         if (packed_eq(*(block + i * 24), name_p)) {
             return *(block + i * 24 + 16);
@@ -720,15 +783,66 @@ get_fn_elem_type(func_idx, name_p) {
 
 // Query a function's inferred return type.
 get_fn_ret_type(func_idx) {
-    return arr_get(fn_ret_types, func_idx);
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return TY_WORD; }
+    return m.ret_type;
 }
 
 // Query a parameter's inferred type for a given function index.
 get_fn_par_type(func_idx, par_idx) {
-    auto block;
-    block = arr_get(fn_par_types, func_idx);
+    auto block, m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return TY_WORD; }
+    block = m.par_block;
     if (block == 0) { return TY_WORD; }
     return block[par_idx];
+}
+
+// ── Cross-file accessors for FnMeta ───────────────────────
+//
+// Readers in bpp_codegen / bpp_bug / bpp_dispatch / bug_eval
+// reach the per-function metadata through these accessors
+// instead of directly indexing parallel arrays. Keeps the
+// FnMeta struct encapsulated and lets the layout evolve
+// (e.g., adding a fifth field) without rippling into every
+// call site.
+//
+// Out-of-range indices return zero (matching the original
+// parallel-array semantics: arr_get past the live count
+// quietly returned the zero-filled slack). Smart-dispatch
+// synthesizes worker functions AFTER run_types pre-fills
+// fn_metas, so codegen later asks about func_idx values
+// that have no FnMeta slot — for those, "no recorded
+// metadata" is the correct answer and zero is fine: synth
+// workers carry their own typing through other channels.
+
+fn_meta_vt_block(func_idx) {
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 0; }
+    return m.vt_block;
+}
+
+fn_meta_vt_count(func_idx) {
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 0; }
+    return m.vt_count;
+}
+
+fn_meta_ret_type(func_idx) {
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 0; }
+    return m.ret_type;
+}
+
+fn_meta_par_block(func_idx) {
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 0; }
+    return m.par_block;
 }
 
 // ── Orchestrator ───────────────────────────────────────────
@@ -1060,13 +1174,14 @@ find_func_idx(name_p) {
 
 // Set a parameter type in the persistent par_types array.
 void propagate_set_par_type(func_idx, par_idx, ty) {
-    auto block, pcnt, fn_rec, k;
-    block = arr_get(fn_par_types, func_idx);
+    auto block, pcnt, fn_rec, k, m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    block = m.par_block;
     if (block == 0) {
         fn_rec = arr_get(funcs, func_idx);
         pcnt = *(fn_rec + FN_PCNT);
         block = buf_word(pcnt);
-        arr_set(fn_par_types, func_idx, block);
+        m.par_block = block;
         // Initialize all params to TY_WORD.
         for (k = 0; k < pcnt; k++) { block[k] = TY_WORD; }
     }
@@ -1113,12 +1228,17 @@ infer_module(mi) {
         // in bpp_array.bsm / bpp_buf.bsm. See docs/builtin_to_source_plan.md.)
     }
 
-    // Ensure per-function arrays are large enough for new functions.
-    while (arr_len(fn_vt_data) < func_cnt) {
-        fn_vt_data = arr_push(fn_vt_data, 0);
-        fn_vt_cnts = arr_push(fn_vt_cnts, 0);
-        fn_ret_types = arr_push(fn_ret_types, 0);
-        fn_par_types = arr_push(fn_par_types, 0);
+    // Ensure per-function FnMeta slots are large enough for new
+    // functions. arr_struct_alloc returns sequential indices, so
+    // the loop guarantees fn_metas[i] exists for all i < func_cnt.
+    while (arr_struct_count(fn_metas) < func_cnt) {
+        auto _new_idx, _new_m: FnMeta;
+        _new_idx = arr_struct_alloc(fn_metas);
+        _new_m   = arr_struct_at(fn_metas, _new_idx);
+        _new_m.vt_block  = 0;
+        _new_m.vt_count  = 0;
+        _new_m.ret_type  = 0;
+        _new_m.par_block = 0;
     }
 
     // Infer types for this module's functions only.
@@ -1175,16 +1295,19 @@ run_types() {
         // and `-> ptr` annotations on the source signatures.)
     }
 
-    // Pre-fill per-function arrays so arr_set can index by func_idx.
-    arr_clear(fn_vt_data);
-    arr_clear(fn_vt_cnts);
-    arr_clear(fn_ret_types);
-    arr_clear(fn_par_types);
+    // Pre-fill per-function FnMeta slots so arr_struct_at can
+    // index by func_idx without bounds-erroring. Reset count
+    // first (replaces arr_clear pattern), then alloc one slot
+    // per function with zero-initialized fields.
+    arr_struct_reset(fn_metas);
     for (i = 0; i < func_cnt; i++) {
-        fn_vt_data = arr_push(fn_vt_data, 0);
-        fn_vt_cnts = arr_push(fn_vt_cnts, 0);
-        fn_ret_types = arr_push(fn_ret_types, 0);
-        fn_par_types = arr_push(fn_par_types, 0);
+        auto _pre_idx, _pre_m: FnMeta;
+        _pre_idx = arr_struct_alloc(fn_metas);
+        _pre_m   = arr_struct_at(fn_metas, _pre_idx);
+        _pre_m.vt_block  = 0;
+        _pre_m.vt_count  = 0;
+        _pre_m.ret_type  = 0;
+        _pre_m.par_block = 0;
     }
 
     // Fixed-point loop: infer → propagate → re-infer until stable.

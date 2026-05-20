@@ -1,0 +1,542 @@
+// wc1_buildings.bsm — building type table + ECS archetype + render.
+//
+// Session 8 introduces buildings as a second ECS archetype, distinct
+// from the unit archetype peasant_arch defined in wc1_render.bsm.
+// Buildings differ from units in component set (no Path, Target,
+// AttackTarget, Anim, UnitType, Sprite — buildings own their two
+// atlases directly in the Building component) so they live in a
+// separate chunk stream per Rule 30's archetype-fanout trigger.
+//
+// The cross-archetype filter is the comp_bitmask field on
+// ArchetypeRec (shipped this session in stbecs.bsm): every
+// ecs_query_each pass filters by the caller's required-component
+// mask, so peasant_q (`1 << unit_comp`) sees only units and
+// building_q (`1 << building_comp`) sees only buildings.
+//
+// Per buildings.lua: 9 building kinds across both factions. Cost +
+// HP + footprint numbers are SC1-flavored adaptations of the WC1
+// original values (the same "WC1 visual identity + SC1 mechanical
+// depth" lens the unit roster uses). Construction times shipped
+// here are placeholders tuned for fast iteration — final pacing
+// lands when the resource economy arrives in S9.
+
+import "stbimage.bsm";       // image_anim_id / image_anim_frame / image_draw_size
+import "stbecs.bsm";          // ecs_component_register / ecs_archetype / ecs_query
+import "stbcharsheet.bsm";    // cs_new / cs_res_init for HP
+import "stbrender.bsm";       // render_rect_outline (selection feedback hook)
+import "stbcamera.bsm";       // cam_x / cam_y
+load   "wc1_render.bsm";      // Pos / Faction / Sheet structs + their comp ids
+
+// ── Building kinds ─────────────────────────────────────────────
+
+// Building kind enum. The faction-asymmetric pairs (church/temple,
+// stable/kennel, keep/spire) share a single kind constant — the
+// gameplay role is the same; only the rendered atlas differs by
+// faction. wc1_buildings_load_atlas picks the right atlas from the
+// caller-provided per-faction pair at spawn time.
+const BLDG_TOWN_HALL   = 0;
+const BLDG_FARM        = 1;
+const BLDG_BARRACKS    = 2;
+const BLDG_LUMBER_MILL = 3;
+const BLDG_BLACKSMITH  = 4;
+const BLDG_STABLE      = 5;   // orc kennel = same kind, different atlas
+const BLDG_CHURCH      = 6;   // orc temple = same kind, different atlas
+const BLDG_TOWER       = 7;
+const BLDG_KEEP        = 8;   // orc blackrock spire = same kind
+
+// Total kinds — sized for the v1 roster. Bump alongside the
+// `_bdef` block below if S10+ adds expansion-era buildings.
+const _WC1_BLDG_COUNT  = 9;
+
+// ── Construction state ─────────────────────────────────────────
+
+// Two-state machine. CONSTRUCTING runs the 3-frame scaffolding
+// loop on `atlas_construct`; DONE swaps to the 1-frame completed
+// `atlas_idle`. State transitions are owned by wc1_production —
+// this module just exposes the constants.
+const BLDG_STATE_CONSTRUCTING = 0;
+const BLDG_STATE_DONE         = 1;
+
+// ── Static type table (BuildingDef) ────────────────────────────
+
+// Per-kind template. Same shape as UnitDef but for buildings:
+// HP, footprint in pixels, construction duration, resource cost,
+// and the supply contribution (farms + town halls add 5 each in
+// the WC1 baseline; combat buildings add 0). The build cost
+// columns hook into S9's resource economy; today they're stored
+// but not consumed.
+//
+// Numbers cribbed from `war1gus/scripts/buildings.lua` with WC1
+// "ticks" (30 ticks/sec) converted to milliseconds and trimmed to
+// keep playtesting tight. The original Town Hall is 100 ticks ≈
+// 3.3 s; we ship 12 s so the player sees the scaffolding cycle
+// multiple times before completion. Tune in S10's balancing pass.
+struct BuildingDef {
+    kind,                  // BLDG_* constant
+    hp_max,                // starting HP — also feeds combat damage receipts
+    px_w,                  // footprint width in pixels (48 / 64 / 80)
+    px_h,                  // footprint height (square for most; orc kennel = 48)
+    construction_time_ms,  // CONSTRUCTING duration before flipping to DONE
+    cost_gold,             // S9 — consumed at foundation placement
+    cost_wood,             // S9 — consumed at foundation placement
+    supply                 // food supply granted when DONE (5 for farm/townhall)
+}
+
+// Module-private table allocated by building_defs_init. Indexed by
+// BLDG_* constant; entries populated in init order. Accessor
+// `building_def_for` does the bounds check.
+extrn _building_defs;
+
+// Compact populator — keeps the BLDG_DEFS block scannable as a
+// numeric table rather than 9 verbose struct-field assignments.
+// Private to this module; new kinds add another `_bdef` line.
+static void _bdef(idx, hp, px_w, px_h, time_ms, gold, wood, supply) {
+    auto d: BuildingDef;
+    d = _building_defs + idx * sizeof(BuildingDef);
+    d.kind                 = idx;
+    d.hp_max               = hp;
+    d.px_w                 = px_w;
+    d.px_h                 = px_h;
+    d.construction_time_ms = time_ms;
+    d.cost_gold            = gold;
+    d.cost_wood            = wood;
+    d.supply               = supply;
+}
+
+// Allocate + populate the BuildingDef table. Call once at game
+// startup BEFORE buildings_wire / ecs_spawn_building. Sized for the
+// full 9-kind roster.
+//
+//                                hp   pw  ph   build  gold wood  supply
+void building_defs_init() {
+    _building_defs = malloc(_WC1_BLDG_COUNT * sizeof(BuildingDef));
+    _bdef(BLDG_TOWN_HALL,        1200, 64, 64, 12000,  400,  400,  5);
+    _bdef(BLDG_FARM,              400, 48, 48,  8000,  500,  250,  5);
+    _bdef(BLDG_BARRACKS,          800, 64, 64, 11000,  600,  500,  0);
+    _bdef(BLDG_LUMBER_MILL,       600, 64, 64, 11000,  600,  450,  0);
+    _bdef(BLDG_BLACKSMITH,        800, 48, 48, 11000,  700,  400,  0);
+    _bdef(BLDG_STABLE,            500, 64, 64, 12000,  800,  400,  0);
+    _bdef(BLDG_CHURCH,            700, 64, 64, 14000,  700,  500,  0);
+    _bdef(BLDG_TOWER,             900, 48, 48, 14000,  600,  300,  0);
+    _bdef(BLDG_KEEP,             2500, 80, 80, 25000, 1000,  800, 10);
+}
+
+// Look up a building's template by kind. Returns 0 on out-of-range
+// so callers can probe blindly; defensive callers should check.
+building_def_for(kind) {
+    if (kind < 0 || kind >= _WC1_BLDG_COUNT) { return 0; }
+    return _building_defs + kind * sizeof(BuildingDef);
+}
+
+// ── Building ECS component ─────────────────────────────────────
+
+// Building component — per-entity state distinct from the static
+// BuildingDef template. Carries the construction progress + the
+// two atlas handles (idle = completed sprite, construct = 3-frame
+// scaffolding strip; the latter is 0 for NotConstructable
+// buildings like keep / spire which spawn DONE). The render path
+// picks the scaffolding frame directly from `progress_ms` (a
+// progress-bar mapping, not a wall-clock cycle), so there's no
+// separate animation-clock field — the bookkeeping reduces to
+// "how far through construction are we?"
+struct Building {
+    kind,                  // BLDG_* constant
+    state,                 // BLDG_STATE_*
+    progress_ms,           // 0 → BuildingDef.construction_time_ms; production tick advances
+    atlas_idle,            // image handle — completed sprite (always set)
+    atlas_construct,       // image handle — 3-frame scaffolding strip (0 if absent)
+    assigned_peasant_eid   // -1 = unassigned (construction paused);
+                           //   otherwise = the peasant entity walking
+                           //   toward (or parked at) the foundation
+}
+
+// Component id + archetype + query — populated by buildings_wire.
+// Same shape as the unit globals defined in wc1_render.bsm.
+global building_comp;
+global building_arch;
+global building_q;
+
+// Pos / Faction / Sheet component ids are owned by wc1_render.bsm's
+// ecs_wire. We extrn them here so the Building archetype reuses
+// the same registered slots — buildings have a position and a
+// faction tag, and their HP lives in the same CharSheet rail
+// units use.
+extrn pos_comp, faction_comp, sheet_comp;
+
+// Camera handle owned by rts.bpp — read by _render_building's
+// world-to-screen conversion.
+extrn cam;
+
+// Register the Building component + Building archetype + the
+// render query. Call once at game startup AFTER `ecs_wire` (so
+// pos_comp / faction_comp / sheet_comp are registered) but
+// BEFORE the first ecs_spawn_building call.
+//
+// Query mask: `1 << building_comp` — selects ONLY the building
+// archetype. The mask filter shipped in stbecs.bsm's
+// ecs_query_each this session lets buildings and units share
+// the same world without leaking iteration across archetypes.
+buildings_wire(world) {
+    auto comps;
+    building_comp = ecs_component_register(world, "Building", sizeof(Building));
+    comps    = buf_word(4);
+    comps[0] = pos_comp;
+    comps[1] = faction_comp;
+    comps[2] = sheet_comp;
+    comps[3] = building_comp;
+    building_arch = ecs_archetype(world, comps, 4);
+    building_q    = ecs_query(world, 1 << building_comp);
+}
+
+// ── Spawn ──────────────────────────────────────────────────────
+
+// Spawn a building of `kind` at grid (gx, gy) owned by `player`.
+// `atlas_idle` is the completed-sprite atlas (must be non-zero);
+// `atlas_construct` is the 3-frame scaffolding strip (pass 0 for
+// NotConstructable buildings — keep / spire — to spawn DONE
+// instantly). Returns the encoded entity id.
+//
+// Pos is set to the top-left CORNER of the footprint in pixels —
+// the render path uses px_w / px_h from BuildingDef to fill the
+// rect. This contrasts with units whose Pos centers the sprite;
+// buildings being multi-tile fit better as corner-anchored. The
+// foundation tile claim against stbgrid is the caller's job (the
+// production tick reserves a 2×2 / 3×3 / 4×4 footprint depending
+// on px_w / px_h before letting the construction state machine
+// start).
+ecs_spawn_building(world, atlas_idle, atlas_construct, gx, gy, player, kind) {
+    auto eid;
+    auto p: Pos, fa: Faction, sh: Sheet, b: Building;
+    auto def: BuildingDef;
+    def = building_def_for(kind);
+    eid = ecs_spawn_at(world, building_arch);
+    // Pos = top-left corner of footprint. Buildings cover gx..gx+ntiles
+    // horizontally and gy..gy+ntiles vertically (ntiles = px_w/16).
+    p = ecs_get(world, pos_comp, eid);
+    p.x = gx * 16;
+    p.y = gy * 16;
+    // Faction tag — same shape as the unit spawner. Drives the
+    // friend / foe split that S9+ targeting will care about.
+    fa = ecs_get(world, faction_comp, eid);
+    fa.player = player;
+    // CharSheet handle — same rail units use. Buildings only spend
+    // RES_HP in v1 (no shields / energy), but allocating the full
+    // sheet keeps the spawn shape uniform with units so the combat
+    // tick can damage buildings without a per-archetype branch.
+    sh = ecs_get(world, sheet_comp, eid);
+    sh.handle = cs_new(WC1_STAT_COUNT, WC1_RES_COUNT);
+    cs_res_init(sh.handle, RES_HP, def.hp_max);
+    // Building component — runtime state.
+    b = ecs_get(world, building_comp, eid);
+    b.kind            = kind;
+    b.atlas_idle      = atlas_idle;
+    b.atlas_construct = atlas_construct;
+    // No construction atlas (NotConstructable: keep / spire) or
+    // zero-duration template → spawn DONE immediately. Else start
+    // CONSTRUCTING; production tick will flip the state when
+    // progress_ms reaches construction_time_ms.
+    if (atlas_construct == 0 || def.construction_time_ms <= 0) {
+        b.state       = BLDG_STATE_DONE;
+        b.progress_ms = def.construction_time_ms;
+    } else {
+        b.state       = BLDG_STATE_CONSTRUCTING;
+        b.progress_ms = 0;
+    }
+    // S8 assignment slot — -1 means "no peasant assigned yet, do
+    // not progress". Construction is gated on a worker reaching
+    // the foundation tile (see wc1_production._tick_building).
+    // The right-click handler in wc1_input flips this to a real
+    // entity id when the player commands a selected peasant.
+    b.assigned_peasant_eid = 0 - 1;
+    // Tile-occupancy claim — reserve every tile inside the
+    // building's pixel-footprint so other units can't path
+    // through and other buildings can't be placed on overlap.
+    // Footprint = (px_w / 16) × (px_h / 16) tiles. Same
+    // wc1_collision_register API units use, with the building's
+    // encoded eid as the holder so wc1_movement's blocker-check
+    // distinguishes it from peasant-claimed cells.
+    _claim_building_footprint(eid, gx, gy, def);
+    return eid;
+}
+
+// Reserve every tile inside the building's pixel footprint via
+// the shared stbgrid occupancy. Out-of-bounds writes are absorbed
+// by stbgrid so a foundation placed at the map edge silently
+// clamps its claim. Idempotent: calling twice with the same
+// (eid, gx, gy) just rewrites the same cells.
+static void _claim_building_footprint(eid, gx, gy, def: BuildingDef) {
+    auto ntx, nty, dx, dy;
+    ntx = def.px_w / 16;
+    nty = def.px_h / 16;
+    for (dy = 0; dy < nty; dy++) {
+        for (dx = 0; dx < ntx; dx++) {
+            wc1_collision_register(eid, gx + dx, gy + dy);
+        }
+    }
+}
+
+// ── Render ─────────────────────────────────────────────────────
+
+// Total construction-stage frames in the atlas the converter
+// emits — 3 by design (early scaffolding / mid / late). Used by
+// the progress → frame mapping below.
+const _BUILDING_CONSTRUCT_FRAMES = 3;
+
+// Per-entity render callback. Reads Pos + Building to decide
+// which atlas drives the current frame.
+//
+// **DONE entities** draw the completed sprite (atlas_idle has a
+// single frame tagged "idle"; frame index 0 is the only valid pick).
+//
+// **CONSTRUCTING entities** pick the scaffolding frame from
+// `progress_ms / construction_time_ms` — the construction atlas
+// is a 3-frame strip representing PROGRESS STAGES, not a looping
+// animation, so the frame must advance monotonically toward
+// completion rather than cycling on a wall-clock timer:
+//
+//   0%   – 33% progress → frame 0 (early scaffolding)
+//   33%  – 66% progress → frame 1 (mid build)
+//   66%  – 100% progress → frame 2 (almost done)
+//
+// Caught during S8 smoke (2026-05-20): an earlier implementation
+// fed `b.elapsed_ms` through `image_anim_frame`, which cycles by
+// per-tag duration — the building visually rebuilt itself in a
+// tight loop until completion instead of progressing forward
+// once. image_anim_frame is correct for true animation loops
+// (catapult attack, peasant walk); building construction is a
+// progress visualization that wants direct frame indexing.
+//
+// The footprint dims come from BuildingDef so image_draw_size
+// fills the right pixel rect — town hall fills 64×64, farm 48×48,
+// keep 80×80, orc kennel 64×48 (rectangular). No camera-relative
+// flip math: buildings have a single facing.
+static void _render_building(w, eid) {
+    auto p: Pos, b: Building;
+    auto def: BuildingDef;
+    auto atlas, sprite_id, sx, sy;
+    p = ecs_get(w, pos_comp, eid);
+    b = ecs_get(w, building_comp, eid);
+    def = building_def_for(b.kind);
+    if (b.state == BLDG_STATE_DONE) {
+        atlas     = b.atlas_idle;
+        sprite_id = 0;
+    } else {
+        atlas = b.atlas_construct;
+        // Progress-driven frame pick. Guard against zero-duration
+        // templates (defensive — should never spawn CONSTRUCTING
+        // with construction_time_ms <= 0 per ecs_spawn_building,
+        // but the floor at 1 keeps the integer divide safe).
+        auto denom;
+        denom = def.construction_time_ms;
+        if (denom < 1) { denom = 1; }
+        sprite_id = (b.progress_ms * _BUILDING_CONSTRUCT_FRAMES) / denom;
+        // Clamp into [0, frame_count - 1] — the production tick
+        // pins progress_ms = construction_time_ms on completion,
+        // which would otherwise round to frame 3 (out of bounds
+        // for the 3-frame strip) for one render before the state
+        // flip propagates.
+        if (sprite_id < 0)                              { sprite_id = 0; }
+        if (sprite_id >= _BUILDING_CONSTRUCT_FRAMES)    { sprite_id = _BUILDING_CONSTRUCT_FRAMES - 1; }
+    }
+    sx = p.x - cam_x(cam);
+    sy = p.y - cam_y(cam);
+    image_draw_size(atlas, sprite_id, sx, sy, def.px_w, def.px_h);
+}
+
+// Walk every Building entity and emit its sprite. Call once per
+// frame between the tile draw and the unit render so buildings
+// sit on top of the terrain but BELOW units (units overlap
+// building footprints when they walk past — classic RTS draw
+// order). The mask filter on building_q ensures only buildings
+// fire, not units, so the per-frame cost scales with the build
+// count, not the world entity total.
+ecs_render_buildings(world) {
+    ecs_query_each(building_q, fn_ptr(_render_building));
+}
+
+// ── Hit-test + assignment (S8 peasant-walks-to-foundation) ─────
+
+// Scratch for the building hit-test walk. ecs_query_each callbacks
+// can't pass extra state directly so the click coords + result
+// flow through globals — same shape wc1_input's unit hit-test
+// uses.
+static auto _bldg_hit_wx, _bldg_hit_wy;
+static auto _bldg_hit_eid;
+
+// Per-entity hit-test callback. First building whose pixel
+// footprint contains (_bldg_hit_wx, _bldg_hit_wy) wins. Z-order:
+// later-spawned buildings hit-test first via the alive iteration
+// order, matching the "place last → click last" expectation.
+static void _bldg_hit_test_cb(w, eid) {
+    auto p: Pos, b: Building, def: BuildingDef;
+    auto x0, y0;
+    if (_bldg_hit_eid >= 0) { return; }
+    b = ecs_get(w, building_comp, eid);
+    def = building_def_for(b.kind);
+    p = ecs_get(w, pos_comp, eid);
+    x0 = p.x;
+    y0 = p.y;
+    if (_bldg_hit_wx <  x0)             { return; }
+    if (_bldg_hit_wy <  y0)             { return; }
+    if (_bldg_hit_wx >= x0 + def.px_w)  { return; }
+    if (_bldg_hit_wy >= y0 + def.px_h)  { return; }
+    _bldg_hit_eid = eid;
+}
+
+// Find the building (if any) at world point (wx, wy). Returns
+// the entity id, or -1 when no building's footprint covers that
+// pixel. Used by wc1_input's right-click branch to decide
+// peasant-assignment vs the existing attack / move dispatch.
+wc1_building_at_world(world, wx, wy) {
+    _bldg_hit_wx  = wx;
+    _bldg_hit_wy  = wy;
+    _bldg_hit_eid = 0 - 1;
+    ecs_query_each(building_q, fn_ptr(_bldg_hit_test_cb));
+    return _bldg_hit_eid;
+}
+
+// Pick a free tile adjacent to the building's footprint that the
+// worker can stand on while constructing. Walks the perimeter
+// ring (one tile outside the footprint) clockwise from the
+// south-center — peasants approach from the south in the WC1
+// convention — and returns the first cell that's not currently
+// occupied by another entity (the worker itself, the foundation,
+// or any other unit) according to `wc1_collision_is_blocked_for`.
+//
+// Returns the (gx, gy) of the free tile through the out-pointers
+// and 1 on success, 0 if the entire ring is blocked. Caller
+// (wc1_building_assign_peasant) falls back to the foundation's
+// top-left when the ring is fully blocked — A* will halt at
+// whatever's reachable.
+static _find_free_perimeter_tile(self_eid, fgx, fgy, ntx, nty,
+                                 out_gx, out_gy) {
+    auto i, candidates, n, cx, cy;
+    // 4 perimeter edges × max footprint side ≈ 16-20 tiles. Sized
+    // generously for 4×4 + corners; the loop bounds dictate the
+    // real walk count.
+    candidates = buf_word(32);
+    n = 0;
+    // South edge (gy + nty, varying x), center-out so the first
+    // hit is straight below the building's centroid.
+    for (i = 0; i < ntx; i++) {
+        candidates[n * 2 + 0] = fgx + i;
+        candidates[n * 2 + 1] = fgy + nty;
+        n = n + 1;
+    }
+    // North edge.
+    for (i = 0; i < ntx; i++) {
+        candidates[n * 2 + 0] = fgx + i;
+        candidates[n * 2 + 1] = fgy - 1;
+        n = n + 1;
+    }
+    // East edge.
+    for (i = 0; i < nty; i++) {
+        candidates[n * 2 + 0] = fgx + ntx;
+        candidates[n * 2 + 1] = fgy + i;
+        n = n + 1;
+    }
+    // West edge.
+    for (i = 0; i < nty; i++) {
+        candidates[n * 2 + 0] = fgx - 1;
+        candidates[n * 2 + 1] = fgy + i;
+        n = n + 1;
+    }
+    for (i = 0; i < n; i++) {
+        cx = candidates[i * 2 + 0];
+        cy = candidates[i * 2 + 1];
+        if (wc1_collision_is_blocked_for(self_eid, cx, cy) == 0) {
+            *(out_gx) = cx;
+            *(out_gy) = cy;
+            free(candidates);
+            return 1;
+        }
+    }
+    free(candidates);
+    return 0;
+}
+
+// Assign a peasant to construct a CONSTRUCTING building. Sets the
+// Building's assignment slot so the production tick knows which
+// worker to wait for, then commands the peasant to walk toward
+// a free tile on the foundation's perimeter via the existing
+// movement request rail. Targeting the foundation's top-left
+// tile directly would fail — that cell is claimed by the
+// building's own footprint, so A* returns no path. The free-
+// perimeter helper picks the first unblocked tile on the ring
+// around the footprint instead.
+//
+// No-op if the building is already DONE or is owned by a
+// different faction; callers (wc1_input) gate these but the
+// defensive check keeps the API misuse-safe.
+extrn faction_comp, target_comp, attack_target_comp, anim_comp, path_comp;
+wc1_building_assign_peasant(world, building_eid, peasant_eid) {
+    auto b: Building, fa_b: Faction, fa_p: Faction;
+    auto p: Pos, p_w: Pos;
+    auto def: BuildingDef;
+    auto bgx, bgy, ntx, nty, target_gx, target_gy, ok;
+    auto t: Target, at: AttackTarget, an: Anim, pa: Path;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.state == BLDG_STATE_DONE) { return; }
+    fa_b = ecs_get(world, faction_comp, building_eid);
+    fa_p = ecs_get(world, faction_comp, peasant_eid);
+    if (fa_b.player != fa_p.player) { return; }
+    b.assigned_peasant_eid = peasant_eid;
+    // Walk-target = first free tile on the footprint's perimeter
+    // ring. Falls back to the building's top-left if the entire
+    // ring is blocked (rare — would need a peasant pressed up
+    // against every adjacent cell); A* in that case halts at
+    // whatever's reachable, which still parks the worker near
+    // the foundation.
+    p   = ecs_get(world, pos_comp, building_eid);
+    def = building_def_for(b.kind);
+    bgx = p.x / 16;
+    bgy = p.y / 16;
+    ntx = def.px_w / 16;
+    nty = def.px_h / 16;
+    ok = _find_free_perimeter_tile(peasant_eid, bgx, bgy, ntx, nty,
+                                   &target_gx, &target_gy);
+    if (ok == 0) {
+        target_gx = bgx;
+        target_gy = bgy;
+    }
+    // Mirror _issue_move's full setup so the assignment behaves
+    // identically to a regular right-click move from the worker's
+    // perspective: set Target component, clear any stale
+    // AttackTarget that would otherwise keep the worker in
+    // UNIT_STATE_ATTACK + halt the path, and force the anim back
+    // to IDLE so _step_unit picks up the new path immediately
+    // (it early-returns for ATTACK / DYING states).
+    t = ecs_get(world, target_comp, peasant_eid);
+    t.gx = target_gx;
+    t.gy = target_gy;
+    at = ecs_get(world, attack_target_comp, peasant_eid);
+    at.eid = 0 - 1;
+    an = ecs_get(world, anim_comp, peasant_eid);
+    if (an.state == UNIT_STATE_ATTACK || an.state == UNIT_STATE_DYING) {
+        an.state      = UNIT_STATE_IDLE;
+        an.elapsed_ms = 0;
+    }
+    wc1_movement_request(world, peasant_eid, target_gx, target_gy);
+    // Debug — confirms the assignment AND surfaces whether
+    // path_find actually built a route. pa.count > 0 means the
+    // worker has a real path; pa.count == 0 means the destination
+    // is unreachable (rare — adjacent tile blocked by another
+    // unit + tight terrain) and the worker will idle in place.
+    pa = ecs_get(world, path_comp, peasant_eid);
+    p_w = ecs_get(world, pos_comp, peasant_eid);
+    putstr("peasant assigned to construction: eid=");
+    putnum(peasant_eid);
+    putstr(" -> building eid=");
+    putnum(building_eid);
+    putstr(" walking (");
+    putnum(p_w.x / 16);
+    putstr(",");
+    putnum(p_w.y / 16);
+    putstr(") -> (");
+    putnum(target_gx);
+    putstr(",");
+    putnum(target_gy);
+    putstr(") path.count=");
+    putnum(pa.count);
+    putstr("\n");
+}

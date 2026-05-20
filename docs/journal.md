@@ -10047,3 +10047,779 @@ shipped.
 
 Next arc per the user's call: back to WC1 mod
 (`games/rts1/wc1_handoff.md`) — content side, not infrastructure.
+
+## 2026-05-19 → 20 — WC1 S8.0 pre-flight sidequests CLOSED (3-iteration arc on the resize bug)
+
+Closeout pass on the two open items from S7's 2026-05-18 closeout
+(`games/rts1/wc1_handoff.md` Sessão 8.0). Both shipped within a
+single morning, both byte-stable bootstrap, both validated against
+the WC1 mod smoke. The 8.0 list now reads CLOSED end-to-end and
+S8 (buildings + construction) is clear to open.
+
+### 8.0b — Window resize, the 3-iteration debugging arc
+
+**The original symptom (per S7 closeout handoff):** dragging the
+rts1 window's bottom-right corner to enlarge the OS-level NSView
+made `cam_screen_to_world_x/y` produce wrong tile coordinates.
+The platform mouse handler in `_stb_platform_macos.bsm` divides
+`locationInWindow` by `_plt_scale` (the integer scale frozen at
+`_stb_init_window` time, line 296). When the user resized, the
+framebuffer stretched via the imgview's `setAutoresizingMask:18`
+but `_plt_scale` stayed at the init value, so window pixels
+mapped to the wrong virtual-canvas pixels.
+
+#### Iteration 1 — lock the window (shipped, reverted same day)
+
+The handoff listed two paths. Path 1 (lock the window via a new
+`game_set_window_nonresizable()` opt-in + NSResizable bit clear
+in styleMask) shipped first as "cheapest, matches WC1 1994 fixed-
+resolution feel". Four-file change: new opt-in API in stbgame,
+`_stb_set_window_resizable(flag)` in macOS platform, Linux stub,
+rts1 calling the setter before `game_init`.
+
+User reviewed and pushed back — "agora perdeu o resize de vez,
+pelo que me lembro tinha coisa fazendo resize certo antes". The
+trade-off framing in the original handoff ("disables drag-resize,
+matches WC1 1994") was a rationalisation for a capability
+regression, not a feature. Reverted all four files clean.
+
+#### Iteration 2 — letterbox-aware mouse math (shipped, reverted)
+
+Path 2 as originally framed in the handoff: rewrite the macOS
+mouse handler to compute live integer scale + letterbox offsets
+every event, mirroring `game_compute_present_rect`. Single-file
+change (~30 LOC in `_stb_poll_events`); math projects window
+pixels back into virtual-canvas coords correctly under any
+resize.
+
+```bpp
+eff_scale = min(_stb_win_w / _stb_w, _stb_win_h / _stb_h);  // floor 1
+dst_w     = _stb_w * eff_scale;
+off_x     = (_stb_win_w - dst_w) / 2;
+ix        = (lx - off_x) / eff_scale;
+iy        = _stb_h - (ly - off_y) / eff_scale;
+```
+
+User tested: "rodou, fez resize mas todas vez que eu mexia o
+mouse selecionava uma área involuntariamente". A phantom marquee
+appeared after every resize gesture and persisted until the user
+clicked the map.
+
+#### Iteration 3 — the real bug (event loss during system gestures)
+
+Diagnosis took two more user-feedback rounds. The math fix was
+correct; the marquee bug was a separate latent issue that had
+always been there but only got exposed once mouse coords actually
+worked.
+
+Root cause: when the user grabs a window's resize handle and
+drags, macOS sends the initial `NSEventTypeLeftMouseDown` through
+the normal `nextEventMatchingMask` queue (so `_stb_mouse_btn` gets
+bit 0 set), processes the resize through its own non-client-area
+machinery, then silently consumes the matching
+`NSEventTypeLeftMouseUp` when the user releases — that up-event
+never reaches our queue. `_stb_mouse_btn` stays at 1 indefinitely.
+WC1's `wc1_input_tick` reads `mouse_pressed(LEFT)` (edge), starts
+drag_active = 1 on the swallowed-down's transition, then every
+subsequent frame reads `mouse_down(LEFT) == 1` (still latched)
+and grows the marquee.
+
+Iteration 2's math rewrite EXPOSED this — at the original frozen-
+scale math, mouse coords drifted enough after resize that the
+phantom marquee tracked positions far from where the cursor
+actually was, so the visual impact was less obvious. With correct
+coords, the phantom marquee tracked exactly with the cursor and
+became user-visible.
+
+**The final fix (shipped):** two surgical additions to
+`_stb_platform_macos.bsm`, each in a separate spot, both in
+`_stb_poll_events`:
+
+1. **Mouse handler reverted to the original `_plt_scale`-based
+   math** (no letterbox accounting — small visual offset on non-
+   integer-scale resizes). The resize poll now recomputes
+   `_plt_scale` live whenever the contentView size changes:
+
+   ```bpp
+   if (_stb_w > 0 && _stb_h > 0) {
+       sx = cur_w / _stb_w;
+       sy = cur_h / _stb_h;
+       _plt_scale = sx < sy ? sx : sy;
+       if (_plt_scale < 1) { _plt_scale = 1; }
+   }
+   ```
+
+2. **End of `_stb_poll_events` syncs `_stb_mouse_btn` to OS truth:**
+
+   ```bpp
+   _stb_mouse_btn = objc_msgSend(objc_getClass("NSEvent"),
+                                 sel_registerName("pressedMouseButtons")) & 7;
+   ```
+
+   `[NSEvent pressedMouseButtons]` returns the hardware-level
+   bitmask of currently-pressed mouse buttons (bit 0 = left, bit 1
+   = right, bit 2 = "other"). Same layout our globals use. Calling
+   it once per poll cycle self-heals any LeftMouseUp events Cocoa
+   silently consumed during system gestures (window resize, title-
+   bar drag, dock interactions, force-touch gestures). The button
+   state can never get stuck at 1 once the user physically lets
+   go of the button.
+
+Mouse handler itself: zero changes vs the S7 closeout. The mouse-
+coord math is the same line-for-line as before.
+
+#### Bonus — canvas aspect-ratio bump (rts1 only)
+
+Once the resize bug closed, the user noticed letterbox bars even
+at full screen. Diagnosis: rts1's virtual canvas was 320×240 (4:3
+aspect ratio); modern monitors are 16:9. Pixel-perfect integer-
+scale presentation by `game_compute_present_rect` always
+letterboxes on a mismatched aspect.
+
+Fix: bumped `SCREEN_W=480, SCREEN_H=270` in `rts.bpp:50-51`.
+16:9 canvas, integer-scale-perfect on 1080p (4×) and 4K (8×),
+small letterbox on 1440p (480 isn't a factor of 2560). Strategic
+view jumped from 20×15 tiles visible to 30×17 — more battlefield,
+better-suited to the SC1-paced mechanics rts1 is targeting.
+
+HUD scaled automatically (selection rings + marquee work in
+world/screen coords with no hardcoded dims).
+
+#### Lessons graduated this session
+
+- [[feedback-prefer-proper-when-it-is-cheap]] — when the
+  "cheapest" fix is a capability removal, retrace the proper
+  fix's cost from scratch.
+- [[feedback-system-gesture-event-loss]] — macOS Cocoa silently
+  consumes `NSEventTypeLeftMouseUp` during window-resize / title-
+  bar drag / dock-grab gestures. Sync app-side button state to
+  `[NSEvent pressedMouseButtons]` once per poll cycle to self-
+  heal.
+- The "math fix exposed a separate latent bug" pattern: when a
+  correctness improvement makes a previously-masked bug user-
+  visible, treat the new bug as a separate diagnosis, not a
+  regression of the math change. Both iteration 2's math AND the
+  pressedMouseButtons sync were needed; reverting iteration 2 by
+  itself would have left rts1 broken under resize.
+
+### 8.0a — Catapult animation polish (asset-side, smaller-tool win)
+
+The bug: WC1's catapult cooldown is 2000 ms (`wc1_units.bsm:192`,
+the slowest in the roster). Its attack atlas has 5 frames per
+direction at the converter's default 100 ms each, so the attack
+animation plays in 500 ms and the unit sits idle-static for the
+remaining 1500 ms — reads as a "twitch" once per cooldown rather
+than a continuous swing.
+
+Two angles surfaced in the handoff: per-frame timing override and
+faction tint (orc palette swap). Tint stays deferred per Rule 28
+until `stbpal` + atlas-runtime-recolor earn a second consumer.
+Timing got the smallest-tool fix: edit the JSON sidecar.
+
+`stbimage.bsm:2537` reads each tag's per-frame rate from the
+**first** frame's `duration` field (`rate_ms = json_object_
+get_int(doc, rate_obj, "duration", 100)`). So bumping just frames
+10 / 15 / 20 / 25 / 30 (the tag-starts of attack_N / NE / E / SE /
+S) from 100 to 400 produces a 5×400 = 2000 ms cycle that exactly
+fills the cooldown. Done in both
+`assets/sprites/wc1/human_catapult.json` and `orc_catapult.json`.
+
+Maintenance gotcha logged at the top of the handoff's 8.0a
+closeout: `wc1_sprite_convert` emits a global 100 ms for every
+frame. A future re-run of the converter against the catapult
+atlases would silently regress this tuning. The fix is local
+asset config until the next siege unit lands and earns a real
+per-unit converter override.
+
+### Why no per-state runtime override
+
+The handoff originally suggested wiring a `wc1_anims` per-state
+duration override or a new `image_anim_frame_rate(..., override)`
+in stbimage. Both clear Rule 28's killer-use-case gate poorly —
+zero consumers beyond the catapult, the bug class is "one unit
+has cooldown > anim length", and the smaller tool (config the
+asset, full stop) already solves it. The runtime-override design
+stays available for the moment a second consumer actually needs
+it.
+
+### Verification
+
+- Bootstrap byte-stable across all three iterations (gen1 == gen2
+  after each platform change).
+- Native suite 176/0/12 (matches the 2026-05-18 S7 closeout
+  baseline — zero regressions).
+- C-emit suite 140/0/48 (same baseline).
+- User-reported smoke: resize works freely, no phantom marquee
+  after the resize gesture ends, mouse-to-tile mapping correct
+  at any scale, catapult anim cycles smoothly through the
+  cooldown, full-screen at 1080p covers without letterbox.
+
+Next: S8 (Buildings + construction) per
+`games/rts1/wc1_handoff.md`. `wc1_sprite_convert` grows a
+`--mode building` codepath; `wc1_buildings.bsm` +
+`wc1_production.bsm` ship the foundation → walk-to → animate →
+complete loop. ~3-4 h target.
+
+## 2026-05-20 — WC1 S8 CLOSED — Buildings + construction end-to-end
+
+The full S8 arc shipped in one focused block: all 9 WC1 building
+kinds (town hall, farm, barracks, lumber mill, blacksmith, stable
+/ kennel, church / temple, tower, keep / spire) wired for both
+factions, peasants walk to a foundation and physically chop while
+the construction progress accumulates, buildings complete on
+time, the bottom command card shows authentic WC1 portraits from
+the war1tool icon strip. Suite 176/0/12 + 140/0/48 throughout,
+bootstrap byte-stable.
+
+### Asset pipeline — converter --mode building
+
+`tools/wc1_sprite_convert/wc1_sprite_convert.bpp` grew a building
+codepath (~200 LOC) so the same `wc1_sprite_convert` tool that
+emits unit atlases now also emits building atlases. The unit
+schema (5 × N round-robin per direction across walk / attack /
+die) doesn't fit buildings — a foundation is one column of
+square frames stacked vertically (1 frame for the completed
+sprite, 3 for the construction strip), no per-direction layout
+required. The building branch auto-detects frame size from PNG
+width (with an optional `frame_h` override for the rectangular
+orc kennel at 64×48) and emits a 1-tag sidecar named `idle` or
+`construct` per filename convention.
+
+Batch run produced 34 building atlases (17 per faction; the
+keep / spire ship completed-only since they're NotConstructable
+per the buildings.lua spec). Plus 7 HUD atlases (portrait_icons,
+bottom_panel, left_panel, right_panel, top_resource_bar,
+icon_border, minimap) using the same `--mode building` codepath
+— it's the natural tool for "vertical column of frames" shape
+which covers buildings AND the WC1 icon strips equally.
+
+### Tier-2 engine win — ArchetypeRec.comp_bitmask in stbecs
+
+The unit / building split needed a real archetype filter on
+`ecs_query_each`. Pre-S8 the comment in `wc1_render.bsm` already
+foreshadowed this: *"comp_mask is 0 because stbecs.bsm:431 still
+treats the mask as future-proofing (today it walks every
+archetype regardless). When a second archetype lands (S7+
+buildings), revisit to a real mask filter."* The mask landed as
+a `comp_bitmask` field on `ArchetypeRec`, computed once at
+`ecs_archetype` registration time as `OR(1 << comp_id)`, and
+consulted in `ecs_query_each`: archetypes whose bitmask doesn't
+satisfy the caller's required-mask are skipped entirely. ~10 LOC
+change in stbecs.
+
+`peasant_q = ecs_query(world, 1 << unit_comp)` now visits only
+units; `building_q = ecs_query(world, 1 << building_comp)` only
+buildings. The performance win is the obvious one (no wasted
+iteration), but the correctness win is bigger — without the
+filter, `_render_unit` would attempt to ecs_get(sprite_comp)
+on building entities and read garbage out of the wrong chunk
+layout. The filter makes multi-archetype games safe.
+
+### Tier-3 game wins
+
+**wc1_buildings.bsm.** 9 BuildingDef entries sourced from
+`war1gus/scripts/buildings.lua` (HP, footprint pixel dims, build
+time, gold / wood cost, supply contribution); a Building ECS
+component (kind + state + progress_ms + atlas_idle +
+atlas_construct + assigned_peasant_eid); the building archetype
++ mask-filtered query; spawn / render functions. The
+foundation's footprint tiles are claimed in stbgrid at spawn
+time (`wc1_collision_register` per tile of the
+`px_w/16 × px_h/16` rect), and a perimeter-search helper picks
+a free tile around the footprint as the worker's walk target
+so the pathfinder doesn't fail trying to enter the blocked
+foundation cells.
+
+**wc1_production.bsm.** Construction state machine. Per-frame
+tick walks `building_q`, gates progress on a peasant being
+within 48 px of the building centroid, parks the worker in
+`UNIT_STATE_BUILD` on arrival, advances progress + anim clock,
+flips to `BLDG_STATE_DONE` when `progress_ms >=
+construction_time_ms`. The worker pops back to IDLE on
+completion + the on-finish print is the debug breadcrumb until
+S10 wires production hooks (unlock training UI, fire SFX, etc.).
+
+**wc1_input.bsm.** Left-click first hit-tests buildings, then
+units — clicking on a building footprint always picks the
+building. New `selected_kind` global routes right-click handling:
+SEL_KIND_UNITS dispatches the existing move / attack / build-
+assign branches; SEL_KIND_BUILDING is a no-op for now (the
+production UI in S10 will hook in). Right-click on a friendly
+CONSTRUCTING foundation with a peasant selected calls
+`wc1_building_assign_peasant`, which sets the assignment slot +
+issues a movement request via the existing rail.
+
+**wc1_hud.bsm.** HP bar (3-bracket green / yellow / red at WC1's
+66 % / 33 % splits) drawn over damaged or selected units;
+amber construction progress bar over CONSTRUCTING buildings;
+selection ring sized to the building's pixel footprint when a
+building is selected. New bottom command card (60 px strip)
+with the WC1-authentic chrome: `bottom_panel.png` tiled
+horizontally as the top divider, `portrait_icons.png` frame-
+indexed by unit / building kind (the indices crib from
+`war1gus icons.lua` so the portraits land on the canonical
+WC1 unit faces), `icon_border.png` as the frame around the
+portrait, name + HP / progress text on the right.
+
+**wc1_anims.bsm + wc1_render.bsm + wc1_combat.bsm +
+wc1_movement.bsm.** `UNIT_STATE_BUILD` enum entry; the build
+state reuses the attack-direction frames so the worker visibly
+chops while the foundation progresses. Combat + movement ticks
+both early-return on BUILD state (the worker doesn't engage,
+doesn't dodge, doesn't path).
+
+### Tree collision (terrain blockers)
+
+`wc1_movement_init` now walks the loaded tilemap and marks tile
+76 (the canonical WC1 forest tree per the verified frequency
+analysis in wc1_map.bsm's header) as a permanent blocker in
+both stbpath's internal `_pf` array (so A* / flow routes around
+it) and the occupancy grid (so per-step movement also rejects
+it). A reserved `_TERRAIN_BLOCKER = 0x7FFFFFFF` sentinel
+distinguishes terrain from entity-claimed cells.
+
+Wider tile ranges (71-87 cluster, 80 / 79 / 72 cliffs, 251
+water) stay walkable in v1 — marking the whole range turned
+pathfind into a no-op for peasants crossing partially-forested
+areas during smoke testing. The narrow tile-76 block solves
+the gameplay-critical "peasant walks through trees" bug while
+keeping foundation construction reachable on the forest1 map.
+A proper per-tile walkability table graduates when S9 brings
+gold mines + forest patches that need to be reachable from
+the town hall.
+
+### Platform layer wins (macOS)
+
+Three event-loss / coord bugs surfaced and fixed in the same
+arc as `_stb_platform_macos.bsm`:
+
+1. **Mouse coords drift under window resize.** The mouse
+   handler used `_plt_scale` frozen at init; user-driven window
+   resize broke the click-to-tile mapping. Final fix: the
+   handler computes the live integer scale + letterbox offsets
+   per event from `_stb_win_w / _stb_win_h` against `_stb_w /
+   _stb_h`, mirroring `game_compute_present_rect`. Click coords
+   stay correct at any window size.
+
+2. **Phantom marquee after window resize.** Cocoa silently
+   consumes the `NSEventTypeLeftMouseUp` event that ends a
+   window-resize drag — our queue never sees it, so
+   `_stb_mouse_btn` stays at 1 even though the button is
+   physically released. Fix: `[NSEvent pressedMouseButtons]`
+   sync at the end of `_stb_poll_events` heals the missed
+   up-events without us having to track every system gesture
+   Cocoa intercepts. Pattern logged at
+   [[feedback-system-gesture-event-loss]].
+
+3. **Modifier keys never fired.** Cocoa delivers Shift / Ctrl
+   / Alt / Cmd via `NSEventTypeFlagsChanged` (event type 12),
+   a separate lane from the KeyDown / KeyUp our handler
+   processes — so `_stb_keys[KEY_SHIFT]` etc. never flipped.
+   Caught when rts1's Shift+N building-spawn dispatch did
+   nothing. Same shape of fix as the mouse-button sync above:
+   `[NSEvent modifierFlags]` query at end of poll, bits 17-20
+   poked into the slots for KEY_SHIFT (13), KEY_CTRL (70),
+   KEY_ALT (71), KEY_META (72).
+
+### Verification
+
+- Bootstrap byte-stable (gen1 == gen2 after each engine touch).
+- Native suite 176/0/12 (zero regressions vs the 2026-05-18 S7
+  closeout baseline).
+- C-emit suite 140/0/48 (same baseline).
+- Manual smoke validated end-to-end: spawn peasant + foundation
+  via Shift+N → click peasant → right-click foundation →
+  peasant walks around trees to the foundation perimeter → chop
+  animation cycles → progress bar rises → "building complete:
+  kind=0" prints → completed sprite replaces the scaffolding.
+- Building selection draws a footprint-sized ring; HUD shows
+  the authentic 27×19 portrait scaled 2× inside the
+  `icon_border` frame, name + HP / progress text alongside.
+
+### Lessons that graduated this arc
+
+- **Mask filter shipped on the second-archetype trigger**, not
+  speculatively earlier. The Rule 30 pre-condition (Building
+  has a structurally different component set than the unit
+  archetype) gated the work, and the work was small (~10 LOC).
+- **Tree collision narrowed to the verified canonical tile**
+  rather than the wider cluster. Smaller tool wins on first
+  encounter; expand only when consumer demand surfaces (gold
+  mines in S9 will give us a real terrain-classifier consumer).
+- **Authentic asset wiring shipped on demand**, not
+  preemptively. The placeholder portrait box read OK during
+  the construction-loop smoke; once the player saw real WC1
+  unit faces in the command card, the polish gain was obvious.
+
+### Open — S8.5 polish, queued for S9
+
+- Wider bottom HUD layout (left_panel / right_panel /
+  top_resource_bar composition).
+- Per-tile walkability classifier (water / cliffs / wider tree
+  variants).
+- Peasant-absorb during construction (hide worker inside
+  building instead of parking visible).
+
+S9 (Resources — gold mines + forest harvesting + resource
+counter HUD) opens next per `games/rts1/wc1_handoff.md`.
+
+## 2026-05-20 (later) — S8.5 HUD infra arc — stbhud cartridge + bpp_arr prelude primitive
+
+User pushed for a stbui-derived HUD infra story after S8 shipped
+visually but with raw / inline command-card composition. The
+real architectural question was the right home for HUD-flavored
+widgets (image, bar, panel-tile-strip): inside stbui itself
+(violates Rule 23 floor + Bang 9 GPU-free invariant), in a
+separate cartridge (Rule 33 Tier-2 layered extension), or
+inside a brand-new `stbhud` namespace. Multiple iterations of
+that pivot here surface a couple of pattern lessons (graduated
+as Tonify Rules 35 and 36 below).
+
+### What shipped
+
+**stb/stbhud.bsm (~170 LOC, new Tier-2 cartridge).**
+
+Imports stbui for the layout engine (`ui_box` / `ui_row` /
+`ui_col` / `ui_text` / `ui_button` / `ui_spacer` + the
+FIT/GROW/FIXED/PERCENT solver + `UiNode` struct + node pool
+accessors) and stbrender + stbimage for GPU primitives.
+Defines two new node kinds:
+
+- `HUD_KIND_IMAGE = 5` — atlas frame draw at the layout-resolved
+  rect (consumed by WC1 portraits + panel-tile strips +
+  eventual minimap).
+- `HUD_KIND_BAR = 6` — solid-color progress / status bar with
+  pre-computed colors (caller brackets HP into green / yellow
+  / red OR picks amber for construction).
+
+`hud_render()` is a full GPU walker — handles every node kind
+(stbui's `UI_KIND_*` + stbhud's `HUD_KIND_*`) via
+`render_rect` + `render_text` + `image_draw_size`. Drop-in for
+games composing HUD inside `game_render_begin/end`.
+
+The layered split (stbhud imports stbui for layout, contributes
+GPU widgets + renderer; stbui stays CPU-only with its own
+`ui_render`) means tools (Bang 9, Modulab, level_editor,
+the_bug, fxlab — all CPU framebuffer hosts) never transitively
+pull `stbimage` / `stbrender`. Rule 23 floor preserved
+end-to-end.
+
+**src/bpp_arr.bsm (~80 LOC, new auto-injected prelude primitive).**
+
+Growable struct-sized array. Sibling to `bpp_array` which
+stores word elements; `bpp_arr` stores fixed-size structs the
+caller picks at creation time. API:
+
+| Function | Purpose |
+|---|---|
+| `arr_struct_new(elem_size, initial_cap)` | Allocate handle + backing buffer. |
+| `arr_struct_alloc(a)` | Append a slot, return its index. May realloc. |
+| `arr_struct_at(a, idx)` | Pointer to element. Invalidated by next alloc that grows. |
+| `arr_struct_count(a)` | Live count. |
+| `arr_struct_cap(a)` | Current capacity. |
+| `arr_struct_buf(a)` | Base pointer for custom iteration. |
+| `arr_struct_elem_size(a)` | Element size in bytes. |
+| `arr_struct_reset(a)` | Count to zero, keep buffer. |
+| `arr_struct_free(a)` | Release everything. |
+
+Doubling growth strategy on `alloc` overflow keeps amortized
+cost O(1) per element. The doctrine matches the per-file `fbuf`
+refactor at `cd6d00e` (heap-per-file in the parser): growable
+backing storage + predictable failure mode (malloc OOM is the
+platform's job, not silent drop / loud abort at a fixed cap).
+
+Lives in the auto-inject prelude (not `stb/`) because the shape
+is universal — not domain-specific. Real consumers in view:
+
+- stbui's `UiNode` pool (shipped this arc — fixed 256 → growable).
+- stbecs's archetype chunks + alive bitmap (planned migration
+  when the consistency refactor earns its slot).
+- The compiler's ~12 hand-rolled parallel-array patterns
+  (`fn_names + fn_types + fn_calls + ...`, `ty_vt_names +
+  ty_vt_types + ...`, `mod_hashes + mod_paths`,
+  `diag_file_starts + diag_file_names + diag_file_line_starts`)
+  — natural future refactor when the compiler internals work
+  next surfaces the maintenance burden.
+
+The argument for prelude (vs `stb/stbarr.bsm`): word arrays
+and struct arrays are equally fundamental data shapes that any
+B++ program might want. Gating one behind `import` and not the
+other is arbitrary. Auto-inject parse cost is ~80 LOC per
+compilation unit — marginal. API is stable (vector-shape has
+30+ years of literature in C++ / Rust / Go).
+
+**stb/stbui.bsm — accessors added, pool migrated.**
+
+New public surface for cartridges that want to drive a custom
+render walker over the same node tree stbui's own `ui_render`
+walks:
+
+| Accessor | Returns |
+|---|---|
+| `ui_node_pool()` | Base pointer of the node array. |
+| `ui_node_count()` | Live node count this frame. |
+| `ui_node_alloc()` | Allocate one node, return index. |
+| `ui_node_attach(idx)` | Wire newly-allocated node into the current parent. |
+| `ui_curr_clicks_set(seq, value)` | Write button-click latch. |
+
+`_ui2_new_node` no longer hard-caps at 256 + drops on overflow.
+The pool is now an `Arr` handle (from `bpp_arr`); each
+allocation that crosses `cap` triggers `_arr_struct_grow`
+internally. The legacy `_ui2_nodes` raw buffer pointer +
+`_ui2_node_count` shadow counter survive as derived state
+refreshed inside `_ui2_new_node` (the dozens of inline
+arithmetic sites elsewhere in stbui keep working unchanged —
+each read of `_ui2_nodes` picks up the post-realloc pointer).
+Click buffers grow in lockstep so every node retains its latch
+slot.
+
+**Bootstrap behavior.** Adding `bpp_arr` to the auto-inject
+list is a sensitive change — every B++ program's compilation
+output now embeds the prelude module. Gen1 (compiled by the
+pre-bpp_arr binary) and Gen2 (compiled by gen1, which now
+auto-injects bpp_arr) MUSt diverge — that's expected the same
+shape every prior auto-inject addition shipped. The
+fixed-point check is Gen2 == Gen3 (Gen3 compiled by Gen2; both
+emit the same code now that the new prelude is baked in).
+Achieved on first try this arc — no compiler-internal symbol
+collision with `arr_struct_*`.
+
+### How the arc actually unfolded (the messy version)
+
+User pushback drove three architectural reversals in this same
+day:
+
+1. **Dual-mode `ui_render` dispatch attempt.** Initial proposal:
+   add `ui_image` + `ui_bar` back to stbui with a runtime
+   `_gpu_in_pass` check that picks `render_*` (GPU) or
+   `draw_*` (CPU). Reverted same day — silent no-op trap in
+   CPU mode (image_draw_size has no CPU framebuffer
+   equivalent, so tool dev calling `ui_image` would get zero
+   pixels with no diagnostic) + Bang 9 GPU-free invariant
+   from S2 closure violated by forcing `stbimage` into the
+   stbui import chain.
+
+2. **stbarr as Tier-2 cartridge.** Second proposal: build
+   `stb/stbarr.bsm` next to `stbgrid` + `stbphys`. Pivoted to
+   prelude after the user's framing audit (mirrored by the
+   advice agent): the shape is universal, not domain-specific.
+   The compiler's own parallel-array patterns are a real
+   future refactor target. Promoting later via `bpp_arr`
+   rename would be a breaking change for every game / tool
+   that imported `stbarr` in the interim — easier to start in
+   the prelude. Moved file location stb → src, renamed
+   functions stbarr_* → arr_struct_*, dropped the explicit
+   import in stbui, added to auto-inject list. Migration cost:
+   ~30 minutes.
+
+3. **Hand-rolled realloc inside stbui (rejected before
+   shipping).** Brief detour where the user asked "are we
+   using existing infra?" — audit revealed bpp_array (words,
+   wrong shape), bpp_arena (fixed cap, wrong shape), stbpool
+   (freelist, wrong shape) — none fit. The realloc loop I had
+   started inside stbui's `_ui2_new_node` IS the right
+   algorithm, but the location was wrong: a growable struct-
+   array primitive belongs in a primitive module, not inline
+   inside every consumer. ~20 LOC moved into `bpp_arr`'s
+   `_arr_struct_grow` + `arr_struct_alloc`.
+
+### Tonify rules 35 + 36 — what the pattern looks like generalized
+
+The whole arc surfaces a stable pattern that's worth codifying:
+games are the canonical workloads that expose engine gaps.
+B++'s game tree (rts1, fps_3d, fps_wolf3d, pathfind, snake,
+rhythm, platformer, future rpg Game 4) isn't a passive
+playground — each game's implementation hitting an infra limit
+IS the forcing function for the fix. Worked examples:
+
+- WC1 multi-archetype iteration needed → `ecs_query_each`
+  comp_bitmask filter.
+- WC1 Shift+N dispatch needed → macOS `[NSEvent
+  modifierFlags]` sync.
+- WC1 HUD command card needed declarative layout → `stbhud`
+  cartridge.
+- WC1 HUD needed growable widget pool → `bpp_arr` prelude
+  primitive.
+- Parser stbgame → stbui → stbimage chain overflowed fbuf →
+  per-file malloc refactor.
+
+These aren't speculation (no Rule 28 violation). The game IS
+the consumer; the primitive is built because the game arc
+needs it. Rule 35 codifies that pattern. Rule 36 refines Rule
+20's two-consumer trigger — "two consumers planned" (concrete
+arcs, named refactor targets) is sufficient, not strictly "two
+consumers in production today."
+
+### Verification
+
+- Bootstrap fixed-point (gen2 == gen3 after the auto-inject
+  change; gen1 != gen2 is the expected one-step transition).
+- Native suite 177/0/12 (one new test: `test_bpp_arr.bpp`
+  exercising the lifecycle + grow path).
+- C-emit suite 140/0/48 (unchanged baseline).
+- rts1 builds clean, runs end-to-end. Manual smoke validates
+  bottom_panel divider strip now drawn via stbui+stbhud
+  declarative layout (was inline `image_draw_size` loop).
+
+### What's still open (queued sidequests)
+
+- **stbecs archetype refactor to bpp_arr** — pure consistency
+  rewrite of `_ecs_archetype_grow` + `_ecs_archetype_grow_alive`
+  to use the shared primitive. No capability gap right now (the
+  archetype path already grows via doubling realloc); defer
+  until either (a) a game hits a stbecs cap, or (b) a dedicated
+  "consolidate growable storage" arc earns the time.
+- **Compiler internals refactor to bpp_arr** — the ~12
+  parallel-array patterns in `src/bpp_dispatch.bsm` /
+  `src/bpp_types.bsm` / `src/bpp_codegen.bsm` /
+  `src/bpp_diag.bsm`. Major win for code clarity. Defer until
+  next compiler-internals arc surfaces the maintenance pain.
+- **Wider HUD layout** — top_resource_bar + left_panel +
+  right_panel + minimap composition. Lands alongside S9
+  (resource counter HUD).
+- **Per-tile walkability classifier** (water, cliffs, more
+  tree variants beyond tile 76). Lands alongside S9 (gold
+  mines + harvestable forest patches need to be reachable).
+
+S9 (Resources — gold mines + forest harvesting + resource
+counter HUD) opens next per `games/rts1/wc1_handoff.md`.
+
+## 2026-05-20 (later) — Compiler array migration arc CLOSED
+
+### What landed
+
+Same-day continuation of the S8.5 arc. The user pushed
+"FECHA SIDEQUEST ARRAYS — plano completo" with explicit
+ETAPAS 1-5: profile sanity, deep `fn_*` audit, per-cluster
+shape decision, validation, doc.
+
+Migrated five parallel-array clusters in the compiler core:
+
+| Cluster | New shape | File |
+|---|---|---|
+| `ty_vt_names/_types/_locked/_elems` | `arr_struct<VtEntry>` | `bpp_types.bsm` |
+| `ty_gl_names/_types` | `arr_struct<GlEntry>` | `bpp_types.bsm` |
+| `ft_names/_types` | `arr_struct<FtEntry>` | `bpp_types.bsm` |
+| `fn_vt_data/_cnts + fn_ret_types + fn_par_types` | `arr_struct<FnMeta>` + 4 cross-file accessors | `bpp_types.bsm`, readers in `bpp_codegen.bsm` + `bpp_bug.bsm` |
+| `diag_file_starts/_names/_line_starts` | `arr_struct<DiagFile>` + 4 accessors | `bpp_import.bsm`, readers in `bpp_lexer.bsm` + `bpp_parser.bsm` + `bpp_diag.bsm` + `bpp.bpp` |
+| `mod_bnd_off/_mi/_line_off` | `arr_struct<ModBnd>` | `bpp_import.bsm` |
+
+Five clusters audited and **left as SoA** with bench evidence
+(Rule 36b in `tonify_checklist.md`): the hot fixpoint cluster
+(`fn_phase`, `fn_effect`, `fn_reachable`, `fn_calls`,
+`fn_address_taken`, `fn_locally_impure`, `fn_phase_hint`) and
+the lexer `toks` buf. The dense-iter regression bench
+(`tests/bench_ecs_iter.bpp`, 50K entities at 0.54×) is the
+empirical anchor; the cluster table is the permanent record
+so the next agent does not re-audit from scratch.
+
+### The synth-fn safety bug
+
+First bootstrap of the FnMeta migration shipped byte-stable
+gen2==gen3 but the test suite dropped from 177/0/12 to
+168/9/12. Nine failed tests clustered on
+dispatch/maestro/profile/reduction (`test_smart_dispatch`,
+`test_dispatch_maestro`, `test_beat`, `test_bpp_bench`,
+`test_job`, `test_profile_cooperative`, `test_reduce_runtime`,
+`test_reduction_sum`, `test_auto_promote`).
+
+The thread: smart-dispatch's worker synthesis
+(`bpp_dispatch.bsm:3252`) grows `funcs[]` AFTER `run_types`
+pre-fills `fn_metas`. The legacy parallel arrays returned
+zero on a read past the live count (slack capacity stayed
+zero-initialised after `arr_push`). The AoS migration's
+`arr_struct_at` returns 0 (a null pointer) for the same
+out-of-range read, and the FnMeta accessors loaded
+`m.vt_count` through that null — SIGSEGV at `+0x8`.
+
+Fix: every `fn_meta_*` and `get_fn_*` accessor now checks
+`m == 0` and returns the zero default. Preserves the legacy
+semantics without forcing the synthesizer to extend
+`fn_metas` (which would require exposing the array handle
+across the bpp_types ↔ bpp_dispatch boundary).
+
+### Validation
+
+- Bootstrap fixed-point: gen2 == gen3 byte-stable.
+- Native suite: 177/0/12 (back to baseline).
+- C-emit suite: 141/0/48 (was 138/0/48; +3 is `test_bpp_arr`
+  plus two unrelated new tests landed since the last baseline).
+- Compile-time bench (`tests/bench_compile.sh`, harness
+  shipped same arc — Tonify Rule 37). First citation of the
+  harness in the journal:
+
+  ```
+  bench_compile.sh
+    bpp:  /Users/Codes/b++/bpp  (924434 bytes, mtime 2026-05-20 17:35)
+    runs: 5
+
+    case                    min     median  max
+    ──────────────────────  ──────  ──────  ──────
+    bootstrap               0.47    0.47    0.48
+    small (test_array)      0.06    0.06    0.06
+    medium (test_stbmidi)   0.08    0.08    0.08
+  ```
+
+  Bootstrap target is 0.5s (per `bootstrap_manual.md`); we
+  are 4-6% under. The `--sample` hot-list shows `arr_struct_at`
+  at 11/348 = ~3% of bootstrap CPU — comfortably below the
+  Rule 36b 5% re-open gate. No measurable perf regression
+  from the migration.
+
+### The "16% regression" that wasn't (measurement bug, recorded)
+
+Initial perf check during this arc reported a 16% bootstrap
+regression: `/tmp/bpp_baseline src/bpp.bpp` took 0.40-0.41s,
+`./bpp src/bpp.bpp` took 0.47-0.48s. That delta turned out to
+be entirely a measurement bug.
+
+The baseline binary was `git show HEAD:bpp` (pre-arc bpp).
+Its auto-inject list does not know about `bpp_arr.bsm`, the
+new prelude module added in this same arc. When `bpp_baseline`
+runs against the CURRENT `src/bpp.bpp`, every `arr_struct_*`
+call resolves to E201 and the compiler ERRORS OUT at the
+import phase. The 0.40s was the wall time of the old compiler
+emitting 20+ error lines and exiting — not a successful
+compile.
+
+The honest comparison runs both compilers against a source
+tree both of them can compile (`tests/test_array.bpp`,
+`tests/test_stbmidi.bpp`). Done that way, the two compilers
+match within measurement noise (0.06s vs 0.06s; 0.08s vs
+0.07-0.09s).
+
+This near-miss is exactly the failure mode Tonify Rule 37
+(bench citation) exists to prevent. The harness header
+prints binary identity — path, size, mtime — so a future
+re-citation cannot silently substitute "the binary that
+errors fast" for "the binary that compiles fast." Every
+perf claim from this point on cites `tests/bench_compile.sh`.
+
+### The C-emit runner's missing cwd pin (sidequest, fixed in same arc)
+
+Initial C-emit sweep during this arc reported 137/4/48 — three
+runtime fails (`test_asset_wav`, `test_beat_map`,
+`test_modulab_handdiff`) plus one emit fail (`test_bpp_arr`).
+Misleading: there was no C-emitter bug.
+
+`tests/run_all.sh` (native) pins `cd "$REPO_ROOT"` near the top
+so every binary the suite spawns inherits the repo root as cwd.
+`tests/run_all_c.sh` did not. Running the C runner from inside
+`tests/` left the worker binaries with `tests/` as cwd, so:
+
+- Tests that load fixtures via relative paths (rhythm map,
+  WAV samples, modulab JSON) opened the wrong files at run time.
+- `test_bpp_arr` failed at the EMIT stage because `bpp_arr.bsm`
+  is not yet copied to `/usr/local/lib/bpp/` (install step
+  pending) and `find_file()`'s local-search arm tries `src/`
+  relative to cwd — `tests/src/bpp_arr.bsm` does not exist.
+
+Fix: a single `cd "$REPO_ROOT"` line in `tests/run_all_c.sh`,
+mirroring the existing one in `tests/run_all.sh`. Both suites
+now run green from any cwd. Documented inline so a future agent
+that finds the line knows what it prevents.
+
+### Followups deferred
+
+- `stbecs` archetype migration to `bpp_arr` (Rule 28: no
+  current consumer pressing, defer).

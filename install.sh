@@ -130,6 +130,7 @@ sudo rm -f "$BACKEND_C_DIR"/*.bsm
 # same time.
 sudo cp src/bpp_defs.bsm "$LIB_DIR/"
 sudo cp src/bpp_array.bsm "$LIB_DIR/"
+sudo cp src/bpp_arr.bsm "$LIB_DIR/"
 sudo cp src/bpp_buf.bsm "$LIB_DIR/"
 sudo cp src/bpp_str.bsm "$LIB_DIR/"
 sudo cp src/bpp_hash.bsm "$LIB_DIR/"

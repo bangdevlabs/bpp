@@ -4,6 +4,11 @@
 
 import "stbdraw.bsm";
 import "stbinput.bsm";
+// `bpp_arr` (growable struct-array primitive) is auto-injected;
+// the UiNode pool below uses `arr_struct_*` for grow-on-demand
+// backing storage. Click buffers grow in lockstep inside
+// `_ui2_new_node`. Same doctrine the per-file `fbuf` refactor
+// (cd6d00e) established for parser buffers.
 
 // Default UI font PIXEL HEIGHT. Passed directly as the `sz`
 // argument to draw_text / measure_text / draw_number, which the
@@ -1436,7 +1441,11 @@ const UI_KIND_SPACER = 4;
 // Arena + node cap. 256 nodes covers every current B++ tool with
 // 3x headroom (Modulab uses ~50, Bang 9 ~100). Bump if a future
 // tool ever hits the cap — diagnostic fires in `_ui2_new_node`.
-const UI2_MAX_NODES    = 256;
+// Initial UiNode pool capacity. The pool grows on demand via
+// stbarr (doubling on overflow) so this is the SEED size, not
+// a hard cap. Click latch buffers (`_ui2_prev_clicks` /
+// `_ui2_curr_clicks`) grow in lockstep inside `_ui2_new_node`.
+const UI2_INIT_NODES   = 256;
 const UI2_STACK_DEPTH  = 16;
 
 // One node = container OR leaf widget. Tree links by index into
@@ -1473,10 +1482,25 @@ struct UiNode {
     clicked
 }
 
-// Pre-allocated node pool — sized at init_ui_layout(), reused
-// across frames. `_ui2_node_count` resets to 0 at ui_layout_begin.
+// UiNode pool backed by `stbarr` (Tier-1 growable struct array).
+// `_ui2_node_arr` is the handle; `_ui2_nodes` is the raw buffer
+// pointer the legacy arithmetic sites in this module rely on
+// (`_ui2_nodes + i * sizeof(UiNode)`) — refreshed from
+// `arr_struct_buf` after every `_ui2_new_node` so a grow-induced
+// realloc never leaves stale arithmetic. `_ui2_node_count` is
+// manually mirrored from `arr_struct_count` for the same reason
+// (the legacy `for i in 0.._ui2_node_count` loop pattern stays
+// untouched).
+//
+// `_ui2_clicks_cap` tracks the current click-buffer capacity in
+// lockstep with the pool — when the pool grows, the click
+// buffers realloc to match so every node retains its latch
+// slot. Same predictable-failure-mode doctrine the per-file
+// `fbuf` refactor (cd6d00e) established.
+static extrn _ui2_node_arr;
 static extrn _ui2_nodes;
 static extrn _ui2_node_count;
+static extrn _ui2_clicks_cap;
 
 // Layout stack — current ancestry chain so widgets append to the
 // right parent. Stores node indices. Depth 16 is generous (Clay
@@ -1506,18 +1530,20 @@ static extrn _ui2_mouse_prev_down;
 // process for as long as consumers haven't fully migrated.
 void init_ui_layout() {
     auto i;
-    if (_ui2_nodes != 0) { return; }
-    _ui2_nodes       = malloc(UI2_MAX_NODES * sizeof(UiNode));
+    if (_ui2_node_arr != 0) { return; }
+    _ui2_node_arr    = arr_struct_new(sizeof(UiNode), UI2_INIT_NODES);
+    _ui2_nodes       = arr_struct_buf(_ui2_node_arr);
+    _ui2_clicks_cap  = UI2_INIT_NODES;
     _ui2_stack       = malloc(UI2_STACK_DEPTH * 8);
-    _ui2_prev_clicks = malloc(UI2_MAX_NODES * 8);
-    _ui2_curr_clicks = malloc(UI2_MAX_NODES * 8);
+    _ui2_prev_clicks = malloc(_ui2_clicks_cap * 8);
+    _ui2_curr_clicks = malloc(_ui2_clicks_cap * 8);
     _ui2_node_count  = 0;
     _ui2_stack_top   = 0 - 1;
     _ui2_seq_idx     = 0;
     _ui2_viewport_w  = 0;
     _ui2_viewport_h  = 0;
     _ui2_mouse_prev_down = 0;
-    for (i = 0; i < UI2_MAX_NODES; i++) {
+    for (i = 0; i < _ui2_clicks_cap; i++) {
         *(_ui2_prev_clicks + i * 8) = 0;
         *(_ui2_curr_clicks + i * 8) = 0;
     }
@@ -1538,13 +1564,13 @@ void init_ui_layout() {
 // the full diagnosis.
 void ui_frame_begin() {
     auto i, tmp;
-    if (_ui2_nodes == 0) { init_ui_layout(); }
+    if (_ui2_node_arr == 0) { init_ui_layout(); }
     // Swap buffers: this frame's curr becomes next frame's prev.
     // Zero the new curr buffer for fresh hit accumulation.
     tmp              = _ui2_prev_clicks;
     _ui2_prev_clicks = _ui2_curr_clicks;
     _ui2_curr_clicks = tmp;
-    for (i = 0; i < UI2_MAX_NODES; i++) {
+    for (i = 0; i < _ui2_clicks_cap; i++) {
         *(_ui2_curr_clicks + i * 8) = 0;
     }
 }
@@ -1555,7 +1581,8 @@ void ui_frame_begin() {
 // click-buffer swap that used to live here now lives in
 // `ui_frame_begin`).
 void ui_layout_begin(viewport_w, viewport_h) {
-    if (_ui2_nodes == 0) { init_ui_layout(); }
+    if (_ui2_node_arr == 0) { init_ui_layout(); }
+    arr_struct_reset(_ui2_node_arr);
     _ui2_node_count = 0;
     _ui2_stack_top  = 0 - 1;
     _ui2_seq_idx    = 0;
@@ -1592,14 +1619,28 @@ static _ui2_sz_value(encoded) {
 // the cap is hit. Stamps defaults so config helpers only need to
 // write fields they change.
 static _ui2_new_node() {
-    auto idx, n: UiNode;
-    if (_ui2_node_count >= UI2_MAX_NODES) {
-        put_err("stbui: node cap (");
-        putnum_err(UI2_MAX_NODES);
-        put_err(") exceeded — bump UI2_MAX_NODES or audit consumer\n");
-        return 0 - 1;
+    auto idx, n: UiNode, i, node_cap;
+    // stbarr handles the growable pool — alloc may realloc the
+    // backing buffer when count == cap. Refresh `_ui2_nodes`
+    // from the post-alloc buf pointer so the per-frame
+    // arithmetic in callers (`_ui2_nodes + idx*sizeof(UiNode)`)
+    // stays valid across grows.
+    idx = arr_struct_alloc(_ui2_node_arr);
+    _ui2_nodes = arr_struct_buf(_ui2_node_arr);
+    node_cap   = arr_struct_cap(_ui2_node_arr);
+    // Click buffers grow in lockstep with the pool. Every node
+    // needs a latch slot; if the pool just doubled, the click
+    // buffers double too. Newly-allocated tail is zeroed so
+    // out-of-range reads never return garbage.
+    if (node_cap > _ui2_clicks_cap) {
+        _ui2_prev_clicks = realloc(_ui2_prev_clicks, node_cap * 8);
+        _ui2_curr_clicks = realloc(_ui2_curr_clicks, node_cap * 8);
+        for (i = _ui2_clicks_cap; i < node_cap; i++) {
+            *(_ui2_prev_clicks + i * 8) = 0;
+            *(_ui2_curr_clicks + i * 8) = 0;
+        }
+        _ui2_clicks_cap = node_cap;
     }
-    idx = _ui2_node_count;
     _ui2_node_count = _ui2_node_count + 1;
     n = _ui2_nodes + idx * sizeof(UiNode);
     n.parent       = 0 - 1;
@@ -1831,6 +1872,71 @@ void ui_spacer(size) {
 // common spacer use case (push right-side widgets to the edge).
 void ui_spacer_grow() {
     ui_spacer(ui_sz_grow());
+}
+
+// ── Node-pool accessors (for custom render walkers) ─────────────
+//
+// stbui ships one render walker — `ui_render` — that draws every
+// node via the CPU `draw_*` primitives. Cartridges that want to
+// drive a DIFFERENT walker over the same node tree (notably
+// `stbhud`, which dispatches the same widgets to the GPU
+// `render_*` + `image_draw_size` primitives so games inside
+// `game_render_begin/end` can use the layout engine) read the
+// pool via these accessors instead of re-extrn'ing the static
+// globals. Encapsulation stays — the pool memory is read-only
+// by convention, the globals remain `static` so nothing else
+// can write through them.
+//
+// Performance: 2 accessor calls per render frame is noise even
+// at 60 Hz (~120 calls/sec). The inner per-node loop walks the
+// returned pointer with plain pointer arithmetic + zero
+// overhead. The pattern matches the rest of B++ (`grid_w`,
+// `wc1_map_w`, `image_load`, `game_render_target` etc — accessor
+// is the canonical shape).
+
+// Base pointer of the UiNode array. Walk via
+// `pool + i * sizeof(UiNode)` for i in `[0, ui_node_count())`.
+ui_node_pool() {
+    return _ui2_nodes;
+}
+
+// Live count of declared nodes in the current frame's tree.
+// Resets to 0 at every `ui_layout_begin`.
+ui_node_count() {
+    return _ui2_node_count;
+}
+
+// Record a button click in the per-frame click buffer. The next
+// frame's `ui_button` / equivalent looks up `seq` to return the
+// "was I clicked" boolean. Used by custom render walkers
+// (stbhud's `hud_render`) that need to write the same latch
+// stbui's own `ui_render` writes — keeps the one-frame-delayed
+// click semantics consistent regardless of which renderer drew
+// the previous frame.
+void ui_curr_clicks_set(seq, value) {
+    *(_ui2_curr_clicks + seq * 8) = value;
+}
+
+// Allocate a fresh UiNode + return its index. Public wrapper
+// around the private `_ui2_new_node` so cartridges that define
+// their own widgets (stbhud's `hud_image` / `hud_bar`) don't
+// trip W020 by reaching into stbui's static internals. Returns
+// -1 if the pool is exhausted (UI2_MAX_NODES); caller must
+// guard.
+//
+// Standard widget shape after the call: write `kind`, fill in
+// sizing + payload fields on the returned node, then call
+// `ui_node_attach(idx)` to wire it into the current parent.
+ui_node_alloc() {
+    return _ui2_new_node();
+}
+
+// Attach a freshly-allocated node to the current parent in the
+// layout stack. Pairs 1:1 with `ui_node_alloc` — widgets that
+// allocate but don't attach create orphans the layout passes
+// then skip.
+void ui_node_attach(idx) {
+    _ui2_attach(idx);
 }
 
 // Pass 1: resolve FIXED + PERCENT sizes top-down. Walks each

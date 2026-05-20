@@ -1,0 +1,150 @@
+// wc1_production.bsm — building construction state machine.
+//
+// Session 8 ships the foundation-to-completed transition: a
+// building spawned in BLDG_STATE_CONSTRUCTING accumulates progress
+// every frame until BuildingDef.construction_time_ms elapses, at
+// which point the state flips to BLDG_STATE_DONE and the renderer
+// swaps from the 3-frame scaffolding strip to the 1-frame
+// completed sprite.
+//
+// The tick is intentionally narrow for v1 — no peasant assignment,
+// no resource consumption, no production queue. Future sessions
+// layer those on top:
+//
+//   S8.1  Peasant-assignment loop: a peasant walks to the
+//         foundation and the construction tick only advances
+//         while at least one peasant is parked on the tile.
+//   S9    Resource economy: gold + wood + food are debited at
+//         foundation placement (per BuildingDef.cost_*) and the
+//         supply field grants food cap on completion.
+//   S10   Training queues + research: barracks / stable / church
+//         schedule unit production; lumber mill + blacksmith
+//         schedule upgrades.
+//
+// For now the foundation spawns and ticks down to completion on
+// its own — enough to verify the rendering pipeline + state-machine
+// shape end-to-end, and unblock the manual smoke that S8.0
+// instructs.
+
+import "stbecs.bsm";          // ecs_query_each
+import "stbgame.bsm";          // game_dt_ms
+load   "wc1_buildings.bsm";    // Building struct + building_comp + building_q
+load   "wc1_render.bsm";       // Pos / Anim structs + pos_comp / anim_comp
+load   "wc1_anims.bsm";        // UNIT_STATE_BUILD + facing helpers
+
+// Pixel radius around the building's center within which an
+// assigned peasant counts as "at the foundation" — i.e., close
+// enough to advance construction. 48 px ≈ 3 tiles, covering the
+// adjacent ring around even the smallest 48×48 footprint and
+// matching the natural stopping distance of A* against a
+// blocked target tile (the pathfinder halts at the closest
+// unblocked cell, which lands the worker 1-2 tiles outside the
+// foundation).
+const _BLDG_ASSIGN_RADIUS_PX = 48;
+
+// Per-entity tick. Three behaviours, gated by Building state:
+//
+//   DONE          — no-op. The early-return keeps the per-frame
+//                   cost free for the steady-state late-game
+//                   scenario where most buildings finished.
+//
+//   CONSTRUCTING  — gated on a peasant assignment. With no
+//                   peasant assigned (assigned_peasant_eid ==
+//                   -1) the foundation sits at progress 0,
+//                   showing the early-scaffolding frame
+//                   indefinitely; the player must right-click
+//                   the foundation with a peasant selected to
+//                   assign one. Once assigned, the tick checks
+//                   the worker's pixel distance to the
+//                   building's center — only when that worker
+//                   is within `_BLDG_ASSIGN_RADIUS_PX` does
+//                   `progress_ms` advance. This implements the
+//                   classic RTS "peasant has to physically walk
+//                   to the construction site before it starts"
+//                   loop.
+//
+// On completion the state flips to DONE and progress is clamped
+// to construction_time_ms so the render path picks the final
+// scaffolding frame for the same frame as the flip (no visual
+// glitch).
+static void _tick_building(w, eid) {
+    auto b: Building;
+    auto def: BuildingDef;
+    auto p_b: Pos, p_w: Pos, an_w: Anim;
+    auto bcx, bcy, dx, dy, sq, dt;
+    b = ecs_get(w, building_comp, eid);
+    if (b.state == BLDG_STATE_DONE) { return; }
+    if (b.assigned_peasant_eid < 0) { return; }   // no worker → no progress
+    def = building_def_for(b.kind);
+    // Building center in pixels. Pos is top-left; add half the
+    // footprint to land on the centroid.
+    p_b = ecs_get(w, pos_comp, eid);
+    bcx = p_b.x + def.px_w / 2;
+    bcy = p_b.y + def.px_h / 2;
+    // Worker position. Squared-distance test avoids a sqrt on
+    // the hot path — same shape every other proximity check in
+    // wc1_combat / wc1_input uses.
+    p_w  = ecs_get(w, pos_comp,  b.assigned_peasant_eid);
+    an_w = ecs_get(w, anim_comp, b.assigned_peasant_eid);
+    dx = p_w.x - bcx;
+    dy = p_w.y - bcy;
+    sq = dx * dx + dy * dy;
+    if (sq > _BLDG_ASSIGN_RADIUS_PX * _BLDG_ASSIGN_RADIUS_PX) {
+        // Worker still walking toward the foundation — drop them
+        // out of BUILD if they had been parked here previously
+        // (e.g. interrupted by another command); the movement /
+        // combat ticks will pick up control again.
+        if (an_w.state == UNIT_STATE_BUILD) {
+            an_w.state      = UNIT_STATE_IDLE;
+            an_w.elapsed_ms = 0;
+        }
+        return;
+    }
+    // Worker is at the foundation — park them in BUILD state so
+    // the render path picks the chop-attack frames + freeze them
+    // facing the foundation. The state flip happens once; the
+    // elapsed_ms bump every frame drives the looping anim.
+    if (an_w.state != UNIT_STATE_BUILD) {
+        an_w.state      = UNIT_STATE_BUILD;
+        an_w.elapsed_ms = 0;
+        an_w.facing     = wc1_facing_for_delta(bcx - p_w.x, bcy - p_w.y);
+        // One-shot debug — confirms the worker reached the
+        // foundation. If this never prints, the worker is
+        // walking but not arriving (tree collision / blocked
+        // path / wrong target tile).
+        putstr("peasant arrived at foundation: building eid=");
+        putnum(eid);
+        putstr("\n");
+    }
+    dt = game_dt_ms();
+    an_w.elapsed_ms = an_w.elapsed_ms + dt;
+    // Worker present → advance construction.
+    b.progress_ms = b.progress_ms + dt;
+    if (b.progress_ms >= def.construction_time_ms) {
+        b.state       = BLDG_STATE_DONE;
+        b.progress_ms = def.construction_time_ms;
+        // Worker pops back to IDLE so the next command (move,
+        // attack, another build) lands on a fresh state. The
+        // peasant stays at the foundation tile until the player
+        // gives them new orders.
+        an_w.state      = UNIT_STATE_IDLE;
+        an_w.elapsed_ms = 0;
+        // Debug — confirms the state flip lands on the right
+        // frame. S10 will replace this with a production-system
+        // hook (unlock training UI, grant supply, fire SFX) but
+        // the print is a useful manual-smoke breadcrumb for v1.
+        putstr("building complete: kind=");
+        putnum(b.kind);
+        putstr("\n");
+    }
+}
+
+// Per-frame production tick. Walks every Building entity via
+// building_q (mask-filtered to ONLY building_arch) and advances
+// each one's CONSTRUCTING state by dt. Call AFTER the unit
+// movement tick and BEFORE the missile tick so a freshly-built
+// building's completed sprite renders the same frame it flips
+// state.
+void wc1_production_tick(world) {
+    ecs_query_each(building_q, fn_ptr(_tick_building));
+}

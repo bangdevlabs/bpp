@@ -27,12 +27,36 @@ extrn fname_buf;     // Permanent buffer for module filenames (survives fbuf sta
 static auto fname_pos;     // Write position in fname_buf.
 
 // File boundary tracking for diagnostic location info.
-extrn diag_file_starts;  // Dynamic array: outbuf offset where each file's content begins.
-extrn diag_file_names;   // Dynamic array: packed filename for each file.
-extrn diag_file_line_starts; // Dynamic array: cumulative line count at each file boundary.
-extrn mod_bnd_off;        // Boundary list (ofs) — see _record_bnd / mod_idx.
-extrn mod_bnd_mi;         // Boundary list (mi).
-extrn mod_bnd_line_off;   // Boundary list (subtract this from tok_lines for file-relative line).
+//
+// `diag_files` (an `arr_struct` of `DiagFile`) replaces what
+// was three parallel arrays (diag_file_starts / diag_file_names
+// / diag_file_line_starts) — the compiler's canonical struct-
+// of-arrays-in-disguise pattern. Same Tonify Rule 35 + 36
+// graduation as the stbui pool: real consumer pressure (this
+// table accessed from bpp_lexer / bpp_bug / bpp_parser / bpp_
+// diag / bpp.bpp) + the new `bpp_arr` primitive makes the
+// rewrite mechanical. Accessors below funnel reads + the one
+// targeted write (line-start adjust for the leading dot file)
+// so call sites stay close to their pre-migration shape.
+struct DiagFile {
+    start,       // outbuf offset where this file's content begins
+    name,        // packed filename (start in fname_buf << 32) | length
+    line_start   // cumulative line count BEFORE this file's content
+}
+extrn diag_files;
+// Boundary list — records where each (sub)module's content
+// begins in outbuf + its module index + the cumulative line
+// count before it. Migrated from 3 parallel arrays (mod_bnd_
+// off / mod_bnd_mi / mod_bnd_line_off) to a single arr_struct
+// of ModBnd. Single-file scope (all access in bpp_import.bsm),
+// same shape the diag_files migration above already
+// established.
+struct ModBnd {
+    off,         // outbuf offset where this boundary starts
+    mi,          // module index of the file that owns this boundary
+    line_off     // cumulative line count BEFORE this boundary
+}
+extrn mod_bnds;
 static auto outbuf_lines;      // Running count of newline characters written to outbuf.
 
 // Module dependency graph and hashing.
@@ -136,18 +160,21 @@ static void mark_imported(path_off, path_len) {
 // attribution is what lets us fix the warning-points-to-wrong
 // -file/line bug without breaking the per-module emit loop.
 static _record_bnd(mi, line_off) {
-    auto n;
-    n = arr_len(mod_bnd_off);
+    auto n, b: ModBnd, idx;
+    n = arr_struct_count(mod_bnds);
     if (n > 0) {
-        if (arr_get(mod_bnd_off, n - 1) == outbuf_len) {
-            arr_set(mod_bnd_mi, n - 1, mi);
-            arr_set(mod_bnd_line_off, n - 1, line_off);
+        b = arr_struct_at(mod_bnds, n - 1);
+        if (b.off == outbuf_len) {
+            b.mi       = mi;
+            b.line_off = line_off;
             return;
         }
     }
-    mod_bnd_off = arr_push(mod_bnd_off, outbuf_len);
-    mod_bnd_mi = arr_push(mod_bnd_mi, mi);
-    mod_bnd_line_off = arr_push(mod_bnd_line_off, line_off);
+    idx = arr_struct_alloc(mod_bnds);
+    b   = arr_struct_at(mod_bnds, idx);
+    b.off      = outbuf_len;
+    b.mi       = mi;
+    b.line_off = line_off;
 }
 
 // Find the module index for a given source buffer offset.
@@ -157,14 +184,15 @@ static _record_bnd(mi, line_off) {
 // follows the boundary list and tracks the interleaved-import
 // model correctly.
 mod_idx(src_off) {
-    auto lo, hi, mid, ms;
+    auto lo, hi, mid, ms, df: DiagFile;
     if (mod0_real_start >= 0) {
         if (src_off >= mod0_real_start) { return 0; }
     }
-    lo = 0; hi = arr_len(diag_file_starts) - 1;
+    lo = 0; hi = arr_struct_count(diag_files) - 1;
     while (lo < hi) {
         mid = (lo + hi + 1) / 2;
-        ms = arr_get(diag_file_starts, mid);
+        df = arr_struct_at(diag_files, mid);
+        ms = df.start;
         if (ms <= src_off) { lo = mid; } else { hi = mid - 1; }
     }
     return lo;
@@ -173,12 +201,14 @@ mod_idx(src_off) {
 // Find the boundary index that owns a given source offset.
 // Helper for `diag_mod_idx` and `diag_mod_line_off`.
 static _diag_bnd_idx(src_off) {
-    auto lo, hi, mid, ms;
-    if (arr_len(mod_bnd_off) == 0) { return -1; }
-    lo = 0; hi = arr_len(mod_bnd_off) - 1;
+    auto lo, hi, mid, ms, b: ModBnd, n;
+    n = arr_struct_count(mod_bnds);
+    if (n == 0) { return -1; }
+    lo = 0; hi = n - 1;
     while (lo < hi) {
         mid = (lo + hi + 1) / 2;
-        ms = arr_get(mod_bnd_off, mid);
+        b = arr_struct_at(mod_bnds, mid);
+        ms = b.off;
         if (ms <= src_off) { lo = mid; } else { hi = mid - 1; }
     }
     return lo;
@@ -195,10 +225,11 @@ static _diag_bnd_idx(src_off) {
 // file to print in `file:line`" — not necessarily the same as
 // `mod_idx` returns for the same offset.
 diag_mod_idx(src_off) {
-    auto bi;
+    auto bi, b: ModBnd;
     bi = _diag_bnd_idx(src_off);
     if (bi < 0) { return mod_idx(src_off); }
-    return arr_get(mod_bnd_mi, bi);
+    b = arr_struct_at(mod_bnds, bi);
+    return b.mi;
 }
 
 // Find the per-boundary line offset for a given source offset —
@@ -207,10 +238,55 @@ diag_mod_idx(src_off) {
 // `diag_file_line_starts[mod_idx(off)]` when the boundary list is
 // empty (very early diagnostics, before any process_file ran).
 diag_mod_line_off(src_off) {
-    auto bi;
+    auto bi, df: DiagFile, b: ModBnd;
     bi = _diag_bnd_idx(src_off);
-    if (bi < 0) { return arr_get(diag_file_line_starts, mod_idx(src_off)); }
-    return arr_get(mod_bnd_line_off, bi);
+    if (bi < 0) {
+        df = arr_struct_at(diag_files, mod_idx(src_off));
+        return df.line_start;
+    }
+    b = arr_struct_at(mod_bnds, bi);
+    return b.line_off;
+}
+
+// ── Public accessors for the diag_files table ──────────────
+//
+// External readers (bpp_lexer, bpp_bug, bpp_parser, bpp_diag,
+// bpp.bpp) reach the per-file diagnostic data through these
+// thin accessors instead of importing the DiagFile struct or
+// fishing for fields directly. Keeps the layout encapsulated:
+// the day a 4th column joins (e.g. per-file CRC), the accessor
+// surface absorbs the change without rippling into every caller.
+
+diag_file_count() {
+    return arr_struct_count(diag_files);
+}
+
+diag_file_start(i) {
+    auto df: DiagFile;
+    df = arr_struct_at(diag_files, i);
+    return df.start;
+}
+
+diag_file_name(i) {
+    auto df: DiagFile;
+    df = arr_struct_at(diag_files, i);
+    return df.name;
+}
+
+diag_file_line_start(i) {
+    auto df: DiagFile;
+    df = arr_struct_at(diag_files, i);
+    return df.line_start;
+}
+
+// One targeted write — the leading dot-file's line_start needs
+// to be reset to the post-dot-file line count so subsequent
+// modules' tok_lines compute correctly. Called once from
+// bpp.bpp after the dot file is consumed.
+void diag_file_set_line_start(i, value) {
+    auto df: DiagFile;
+    df = arr_struct_at(diag_files, i);
+    df.line_start = value;
 }
 
 // Find the module index for a file path by searching imp_hashes (path hashes).
@@ -243,7 +319,7 @@ static fnv1a(off, len) {
 // the top-level driver comes last. This is the correct compilation order.
 void topo_sort() {
     auto n, i, j, in_deg, queue, head, tail, u;
-    n = arr_len(diag_file_starts);
+    n = arr_struct_count(diag_files);
     in_deg = buf_word(n);
     // Initialize in-degrees to zero.
     for (i = 0; i < n; i++) { in_deg[i] = 0; }
@@ -278,7 +354,7 @@ void topo_sort() {
     // by the topological sort, there is a cycle in the import graph.
     auto _topo_cnt, _total, _ci, _cj, _cfound;
     _topo_cnt = arr_len(mod_topo);
-    _total = arr_len(diag_file_starts);
+    _total = arr_struct_count(diag_files);
     if (_topo_cnt < _total) {
         diag_fatal(222);
         diag_str("circular dependency between modules");
@@ -291,7 +367,9 @@ void topo_sort() {
             if (_cfound == 0) {
                 auto _fp, _fs, _fl;
                 diag_str("  unresolved: ");
-                _fp = arr_get(diag_file_names, _ci);
+                auto _df: DiagFile;
+                _df = arr_struct_at(diag_files, _ci);
+                _fp = _df.name;
                 _fs = unpack_s(_fp); _fl = unpack_l(_fp);
                 diag_buf(fname_buf + _fs, _fl);
                 diag_newline();
@@ -644,12 +722,15 @@ void process_file(path_off, path_len) {
     fn_start = fname_pos;
     buf_copy(fname_buf + fname_pos, fbuf + my_path, path_len);
     fname_pos += path_len;
-    diag_file_starts = arr_push(diag_file_starts, outbuf_len);
-    diag_file_names = arr_push(diag_file_names, pack(fn_start, path_len));
-    diag_file_line_starts = arr_push(diag_file_line_starts, outbuf_lines);
+    auto _df_idx, _df: DiagFile;
+    _df_idx = arr_struct_alloc(diag_files);
+    _df = arr_struct_at(diag_files, _df_idx);
+    _df.start      = outbuf_len;
+    _df.name       = pack(fn_start, path_len);
+    _df.line_start = outbuf_lines;
     // Hash the file content for cache invalidation.
     mod_hashes = arr_push(mod_hashes, fnv1a(content_buf, fsize));
-    my_mod_idx = arr_len(diag_file_starts) - 1;
+    my_mod_idx = arr_struct_count(diag_files) - 1;
     // Tracks how many SOURCE-FILE lines of THIS file have been
     // processed so far. Increments once per iteration of the line
     // loop below (whether the line is an import or a non-import
@@ -815,6 +896,26 @@ void process_file(path_off, path_len) {
         _ai_pname = "bpp_array.bsm";
         buf_copy(linebuf, _ai_pname, 13);
         _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 13);
+        if (_ai_plen > 0) {
+            auto _ai_sp, _ai_si;
+            _ai_sp = fbuf_top;
+            buf_copy(fbuf + _ai_sp, pathbuf, _ai_plen);
+            fbuf_top += _ai_plen;
+            process_file(pathbuf, _ai_plen);
+            _record_bnd(my_mod_idx, outbuf_lines - _source_line);
+            dep_from = arr_push(dep_from, my_mod_idx);
+            dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + _ai_sp, _ai_plen));
+            fbuf_top = _ai_sp;
+        }
+
+        // bpp_arr.bsm  (11 bytes) — growable struct-sized array
+        // primitive. Sibling of bpp_array (word sequences) for
+        // struct-sized sequences. Consumed by stbui (UiNode pool),
+        // stbecs (entity tables, planned), and the compiler's own
+        // internal tables (planned refactor).
+        _ai_pname = "bpp_arr.bsm";
+        buf_copy(linebuf, _ai_pname, 11);
+        _ai_plen = find_file(fbuf + my_path, path_len, linebuf, 11);
         if (_ai_plen > 0) {
             auto _ai_sp, _ai_si;
             _ai_sp = fbuf_top;
@@ -1231,12 +1332,8 @@ void init_import() {
     outbuf_len = 0;
     fname_buf = malloc(65536);
     fname_pos = 0;
-    diag_file_starts = arr_new();
-    diag_file_names = arr_new();
-    diag_file_line_starts = arr_new();
-    mod_bnd_off = arr_new();
-    mod_bnd_mi = arr_new();
-    mod_bnd_line_off = arr_new();
+    diag_files = arr_struct_new(sizeof(DiagFile), 32);
+    mod_bnds = arr_struct_new(sizeof(ModBnd), 32);
     outbuf_lines = 0;
     mod0_real_start = -1;
     mod_hashes = arr_new();

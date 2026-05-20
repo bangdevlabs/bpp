@@ -513,6 +513,251 @@ static _emit_sidecar(sidecar_path: ptr, image_basename: ptr,
     return rc;
 }
 
+// ── Building mode ───────────────────────────────────────────
+//
+// Buildings differ structurally from units: a single still frame
+// for the completed sprite (`town_hall.png`, etc.) plus a
+// vertically-stacked construction strip (`town_hall_construction
+// .png` = 3 frames showing the scaffolding stages early → mid →
+// late). No per-direction layout, no walk/attack/die round-robin
+// — far simpler than the unit schema, so the codepath stays
+// separate from `_emit_sidecar`.
+//
+// Layout convention: every building PNG is one column of N
+// square frames stacked vertically. Width determines the frame
+// size; height / width determines the frame count. The 1-frame
+// completed sprite trivially matches.
+
+// Default per-frame durations (ms). The 3-frame construction
+// strip cycles in 750 ms (slow enough to read as "active
+// scaffolding", fast enough that the player sees motion). The
+// completed sprite is 1 frame so its duration is moot, but
+// still emitted so the sidecar shape matches Aseprite output
+// byte-for-byte.
+const _BUILDING_CONSTRUCT_FRAME_MS = 250;
+const _BUILDING_IDLE_FRAME_MS      = 100;
+
+// Return 1 if the trailing bytes of `s` (length `s_len`) match
+// the null-terminated string `suffix`. Used to detect the
+// `_construction` filename convention so the codepath picks the
+// right frameTag name (`construct` vs `idle`) without an
+// explicit caller-passed tag.
+static _ends_with(s: ptr, s_len, suffix: ptr) {
+    auto suf_len, i;
+    suf_len = str_len(suffix);
+    if (suf_len > s_len) { return 0; }
+    for (i = 0; i < suf_len; i++) {
+        if (peek(s + s_len - suf_len + i) != peek(suffix + i)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Emit an Aseprite-schema sidecar for a building atlas. The
+// frame array is the simple `[{x:0,y:i*fs,w:fs,h:fs}, ...]`
+// vertical column; the meta block carries a single frameTag
+// (named by the caller) covering every frame. Same byte-for-
+// byte shape the loader already understands from the unit
+// converter.
+static _emit_building_sidecar(sidecar_path: ptr, image_basename: ptr,
+                              name: ptr, image_w, image_h,
+                              frame_w, frame_h, n_frames,
+                              tag: ptr, duration_ms) {
+    auto sb, i, rc;
+    sb = strbuf_new();
+    sb = strbuf_cat(sb, "{\"frames\":[");
+    for (i = 0; i < n_frames; i++) {
+        if (i > 0) { sb = strbuf_ch(sb, ','); }
+        sb = strbuf_cat(sb, "{\"filename\":\"");
+        sb = strbuf_cat(sb, name);
+        sb = strbuf_ch(sb, ' ');
+        sb = strbuf_num(sb, i);
+        sb = strbuf_cat(sb, "\",\"frame\":{\"x\":0,\"y\":");
+        sb = strbuf_num(sb, i * frame_h);
+        sb = strbuf_cat(sb, ",\"w\":");
+        sb = strbuf_num(sb, frame_w);
+        sb = strbuf_cat(sb, ",\"h\":");
+        sb = strbuf_num(sb, frame_h);
+        sb = strbuf_cat(sb, "},\"rotated\":false,\"trimmed\":false,\"spriteSourceSize\":{\"x\":0,\"y\":0,\"w\":");
+        sb = strbuf_num(sb, frame_w);
+        sb = strbuf_cat(sb, ",\"h\":");
+        sb = strbuf_num(sb, frame_h);
+        sb = strbuf_cat(sb, "},\"sourceSize\":{\"w\":");
+        sb = strbuf_num(sb, frame_w);
+        sb = strbuf_cat(sb, ",\"h\":");
+        sb = strbuf_num(sb, frame_h);
+        sb = strbuf_cat(sb, "},\"duration\":");
+        sb = strbuf_num(sb, duration_ms);
+        sb = strbuf_ch(sb, '}');
+    }
+    sb = strbuf_cat(sb, "],\"meta\":{\"image\":\"");
+    sb = strbuf_cat(sb, image_basename);
+    sb = strbuf_cat(sb, "\",\"size\":{\"w\":");
+    sb = strbuf_num(sb, image_w);
+    sb = strbuf_cat(sb, ",\"h\":");
+    sb = strbuf_num(sb, image_h);
+    sb = strbuf_cat(sb, "},\"scale\":\"1\",\"format\":\"RGBA8888\",\"frameTags\":[{\"name\":\"");
+    sb = strbuf_cat(sb, tag);
+    sb = strbuf_cat(sb, "\",\"from\":0,\"to\":");
+    sb = strbuf_num(sb, n_frames - 1);
+    sb = strbuf_cat(sb, ",\"direction\":\"forward\"}]}}\n");
+    rc = file_write_all(sidecar_path, sb, strbuf_len(sb));
+    strbuf_free(sb);
+    return rc;
+}
+
+// Convert one building PNG → sidecar + PNG copy. Returns 0 on
+// success, 1 on any failure (with an error already logged to
+// stderr). Same shape as the unit codepath inside `main()`,
+// just calling `_emit_building_sidecar` instead of
+// `_emit_sidecar` and skipping the schema args.
+//
+// Frame width is always the PNG width. Frame height defaults to
+// the width (square frames — the common case for town hall, farm,
+// barracks, etc.) but the caller may pass an explicit override
+// via the 3rd positional arg for rectangular buildings like the
+// orc kennel (64×48 per `buildings.lua`).
+static _convert_building(in_path: ptr, out_dir: ptr, frame_h_override) {
+    auto basename_off, ext_off, name_buf, name_len;
+    auto w, h, frame_w, frame_h, n_frames;
+    auto tag: ptr, duration_ms;
+    auto out_len, png_len, json_len;
+    auto dst_png, dst_json, image_basename, rc;
+
+    // Derive sheet name from the input filename.
+    basename_off = _basename_start(in_path);
+    ext_off = _ext_start(in_path, basename_off);
+    if (ext_off < 0) { ext_off = str_len(in_path); }
+    name_len = ext_off - basename_off;
+    name_buf = malloc(name_len + 1);
+    _bytecopy(name_buf, in_path + basename_off, name_len);
+    poke(name_buf + name_len, 0);
+
+    // Read PNG dimensions from the IHDR chunk.
+    w = 0; h = 0;
+    if (_png_read_dims(in_path, &w, &h) != 0) {
+        put_err("wc1_sprite_convert: cannot read ");
+        putstr_err(in_path);
+        put_err("\n");
+        free(name_buf);
+        return 1;
+    }
+
+    // Frame width = PNG width. Frame height = override if passed
+    // (non-zero), else the PNG width (square frames — the common
+    // case). The rectangular branch covers the orc kennel
+    // (64×48 per `buildings.lua`).
+    frame_w = w;
+    frame_h = frame_h_override > 0 ? frame_h_override : w;
+    if (frame_w <= 0 || frame_h <= 0 || h % frame_h != 0) {
+        put_err("wc1_sprite_convert: image dims ");
+        putnum_err(w);
+        put_err("x");
+        putnum_err(h);
+        put_err(" — expected frames stacked vertically (h % frame_h == 0; frame_h=");
+        putnum_err(frame_h);
+        put_err(")\n");
+        free(name_buf);
+        return 1;
+    }
+    n_frames = h / frame_h;
+
+    // Tag from filename convention: `<name>_construction.png` is
+    // the 3-frame scaffolding strip; everything else is a 1-frame
+    // completed sprite. Per-frame duration matches the role:
+    // 250 ms for construction (3 × 250 = 750 ms cycle reads as
+    // active building work), 100 ms for the static completed
+    // frame (duration is moot at N == 1 but kept for schema
+    // shape symmetry with the unit converter's output).
+    if (_ends_with(name_buf, name_len, "_construction") != 0) {
+        tag         = "construct";
+        duration_ms = _BUILDING_CONSTRUCT_FRAME_MS;
+    } else {
+        tag         = "idle";
+        duration_ms = _BUILDING_IDLE_FRAME_MS;
+    }
+
+    // Build destination paths: <out_dir>/<name>.png + <name>.json
+    out_len  = str_len(out_dir);
+    png_len  = out_len + 1 + name_len + 4 + 1;   // "/", ".png", "\0"
+    json_len = out_len + 1 + name_len + 5 + 1;   // "/", ".json", "\0"
+    dst_png  = malloc(png_len);
+    dst_json = malloc(json_len);
+    _bytecopy(dst_png, out_dir, out_len);
+    poke(dst_png + out_len, '/');
+    _bytecopy(dst_png + out_len + 1, name_buf, name_len);
+    poke(dst_png + out_len + 1 + name_len + 0, '.');
+    poke(dst_png + out_len + 1 + name_len + 1, 'p');
+    poke(dst_png + out_len + 1 + name_len + 2, 'n');
+    poke(dst_png + out_len + 1 + name_len + 3, 'g');
+    poke(dst_png + out_len + 1 + name_len + 4, 0);
+    _bytecopy(dst_json, out_dir, out_len);
+    poke(dst_json + out_len, '/');
+    _bytecopy(dst_json + out_len + 1, name_buf, name_len);
+    poke(dst_json + out_len + 1 + name_len + 0, '.');
+    poke(dst_json + out_len + 1 + name_len + 1, 'j');
+    poke(dst_json + out_len + 1 + name_len + 2, 's');
+    poke(dst_json + out_len + 1 + name_len + 3, 'o');
+    poke(dst_json + out_len + 1 + name_len + 4, 'n');
+    poke(dst_json + out_len + 1 + name_len + 5, 0);
+
+    // Copy PNG.
+    rc = _file_copy(in_path, dst_png);
+    if (rc != 0) {
+        put_err("wc1_sprite_convert: failed to copy PNG to ");
+        putstr_err(dst_png);
+        put_err("\n");
+        free(name_buf); free(dst_png); free(dst_json);
+        return 1;
+    }
+
+    // Image-basename inside meta.image (no directory prefix).
+    image_basename = malloc(name_len + 5);
+    _bytecopy(image_basename, name_buf, name_len);
+    poke(image_basename + name_len + 0, '.');
+    poke(image_basename + name_len + 1, 'p');
+    poke(image_basename + name_len + 2, 'n');
+    poke(image_basename + name_len + 3, 'g');
+    poke(image_basename + name_len + 4, 0);
+
+    rc = _emit_building_sidecar(dst_json, image_basename, name_buf,
+                                w, h, frame_w, frame_h, n_frames,
+                                tag, duration_ms);
+    if (rc != 0) {
+        put_err("wc1_sprite_convert: failed to write sidecar ");
+        putstr_err(dst_json);
+        put_err("\n");
+        free(name_buf); free(dst_png); free(dst_json); free(image_basename);
+        return 1;
+    }
+
+    // Stats line.
+    putstr("wc1_sprite_convert: ");
+    putstr(in_path);
+    putstr(" -> ");
+    putstr(dst_png);
+    putstr(" + ");
+    putstr(dst_json);
+    putstr(" (building, ");
+    putnum(n_frames);
+    putstr(" frame");
+    if (n_frames != 1) { putchar('s'); }
+    putstr(" at ");
+    putnum(frame_w);
+    putstr("x");
+    putnum(frame_h);
+    putstr("px, tag=");
+    putstr(tag);
+    putstr(")\n");
+
+    free(name_buf);
+    free(dst_png);
+    free(dst_json);
+    free(image_basename);
+    return 0;
+}
+
 // ── Entry point ─────────────────────────────────────────────
 
 main() {
@@ -524,11 +769,35 @@ main() {
     auto w, h, cols, rows;
     auto rc, walk_n, atk_n, die_n, tile_w, tile_h;
 
+    // Building mode dispatch — `--mode building <input.png>
+    // <output_dir> [frame_h]`. Buildings have a simpler schema
+    // than units (no walk / attack / die round-robin), so the
+    // codepath is factored into `_convert_building`. `frame_h` is
+    // optional — defaults to the PNG width for the common square-
+    // frame case (town hall, farm, etc.); pass `48` for the
+    // 64×48 orc kennel and any future rectangular building. The
+    // legacy positional form (no `--mode` prefix) stays the
+    // default for unit PNGs.
+    if (argc_get() >= 5
+        && str_eq(argv_get(1), "--mode") != 0
+        && str_eq(argv_get(2), "building") != 0) {
+        auto frame_h_override;
+        frame_h_override = 0;
+        if (argc_get() >= 6) { frame_h_override = _parse_uint(argv_get(5)); }
+        return _convert_building(argv_get(3), argv_get(4), frame_h_override);
+    }
+    if (argc_get() >= 2 && str_eq(argv_get(1), "--mode") != 0) {
+        putstr_err("usage: wc1_sprite_convert --mode building <input.png> <output_dir> [frame_h]\n");
+        putstr_err("       wc1_sprite_convert <input.png> <output_dir> [walk_n] [atk_n] [die_n] [tile_w] [tile_h]\n");
+        return 1;
+    }
+
     if (argc_get() < 3) {
         putstr_err("usage: wc1_sprite_convert <input.png> <output_dir> [walk_n] [atk_n] [die_n] [tile_w] [tile_h]\n");
         putstr_err("  walk_n / atk_n / die_n — war1gus schema, defaults 5 4 3 (peasant)\n");
         putstr_err("  tile_w / tile_h        — frame dims in px, defaults 32 32\n");
         putstr_err("                            (48 48 for knight / raider / lothar)\n");
+        putstr_err("  --mode building <input.png> <output_dir> — single-column building PNG\n");
         return 1;
     }
     in_path = argv_get(1);

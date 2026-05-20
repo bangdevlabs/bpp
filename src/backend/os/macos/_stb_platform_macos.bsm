@@ -458,21 +458,62 @@ void _stb_poll_events() {
         if (etype == NSEvRightUp) { _stb_mouse_btn = _stb_mouse_btn & (0 - 3); }
 
         // Mouse position: [ev locationInWindow] returns NSPoint (d0=x, d1=y).
-        // float_ret() / float_ret2() read the saved d0/d1 from the last extern call.
-        // Window is scaled by _plt_scale (chosen at init to fit the screen):
-        // divide locationInWindow by that factor. Cocoa Y is flipped:
-        // subtract from framebuffer height.
+        // float_ret() / float_ret2() read the saved d0/d1 from the last
+        // extern call.
+        //
+        // Map window-pixel coords back into the game's virtual canvas using
+        // the SAME integer-scale-and-center math `game_compute_present_rect`
+        // applies when the GPU presenter blits the offscreen target into
+        // the window. Two pieces have to match the presenter exactly so a
+        // click lands on the pixel under the cursor regardless of the live
+        // window size:
+        //
+        //   1. INTEGER SCALE. `min(win_w/_stb_w, win_h/_stb_h)` floor at 1
+        //      — the same value `game_compute_present_rect` picks. Reading
+        //      `_plt_scale` (frozen at init by `_stb_init_window`) would
+        //      drift the moment the user resizes the window; the resize
+        //      poll lower in this function keeps `_plt_scale` live as a
+        //      convenience, but the mouse handler computes the scale
+        //      itself so a click in the same poll cycle as the resize
+        //      detection still maps correctly.
+        //
+        //   2. LETTERBOX OFFSET. When the resized window's aspect ratio
+        //      doesn't match the virtual canvas, the centered blit
+        //      letterboxes — and the mouse coord has to subtract that
+        //      offset before dividing by scale, or every click drifts by
+        //      half the letterbox width. (Without this step, a 2000×900
+        //      window resize against a 480×270 canvas at scale 3 leaves
+        //      280 px of letterbox per side, and clicks land that far off
+        //      target.)
+        //
+        // Cocoa Y is bottom-up — subtract from `_stb_h` AFTER projecting
+        // back into canvas space so the flip lands on top-down virtual-
+        // canvas coords. `_stb_win_w / _stb_win_h` are kept in sync by
+        // the resize poll later in this function and by the seed at
+        // `_stb_init_window` time, so they're always non-zero when a
+        // mouse event fires.
         if (etype == NSEvMouseMoved || etype == NSEvLeftDrag || etype == NSEvRightDrag) {
             auto lx: float, ly: float, ix: word, iy: word, inv: float;
+            auto eff_scale, eff_scale_x, eff_scale_y, dst_w, dst_h, off_x, off_y;
             objc_msgSend(ev, sel_registerName("locationInWindow"));
             lx = float_ret();
             ly = float_ret2();
-            // Convert to integer via : word locals. The forced type hint makes
-            // the codegen emit fcvtzs (float→int) and prevents the float type
-            // from poisoning the integer globals _stb_mouse_x / _stb_mouse_y.
-            inv = 1.0 / (_plt_scale * 1.0);
-            ix = lx * inv;
-            iy = _stb_h - ly * inv;
+            eff_scale_x = _stb_win_w / _stb_w;
+            eff_scale_y = _stb_win_h / _stb_h;
+            if (eff_scale_x < eff_scale_y) { eff_scale = eff_scale_x; }
+            else                           { eff_scale = eff_scale_y; }
+            if (eff_scale < 1) { eff_scale = 1; }
+            dst_w = _stb_w * eff_scale;
+            dst_h = _stb_h * eff_scale;
+            off_x = (_stb_win_w - dst_w) / 2;
+            off_y = (_stb_win_h - dst_h) / 2;
+            // Convert to integer via : word locals. The forced type hint
+            // makes the codegen emit fcvtzs (float→int) and prevents the
+            // float type from poisoning the integer globals
+            // _stb_mouse_x / _stb_mouse_y.
+            inv = 1.0 / (eff_scale * 1.0);
+            ix = (lx - off_x * 1.0) * inv;
+            iy = _stb_h - (ly - off_y * 1.0) * inv;
             _stb_mouse_x = ix;
             _stb_mouse_y = iy;
             if (_stb_mouse_x < 0) { _stb_mouse_x = 0; }
@@ -529,9 +570,77 @@ void _stb_poll_events() {
                 _stb_win_w = cur_w;
                 _stb_win_h = cur_h;
                 _stb_win_resize_flag = 1;
+                // Recompute the live integer scale used by the mouse
+                // handler above. min(scale_x, scale_y) keeps the canvas
+                // aspect-correct; the floor at 1 matches the pixel-
+                // perfect "never bilinear-shrink" guarantee. Without
+                // this update, mouse coords stay aligned with the old
+                // window scale even though the framebuffer stretched
+                // to fill the new size.
+                auto sx, sy;
+                if (_stb_w > 0 && _stb_h > 0) {
+                    sx = cur_w / _stb_w;
+                    sy = cur_h / _stb_h;
+                    if (sx < sy) {
+                        _plt_scale = sx;
+                    } else {
+                        _plt_scale = sy;
+                    }
+                    if (_plt_scale < 1) { _plt_scale = 1; }
+                }
             }
         }
     }
+
+    // Sync mouse-button state to actual hardware state.
+    //
+    // Cocoa silently swallows the NSEventTypeLeftMouseUp event when
+    // the user releases the mouse button at the end of a window
+    // resize gesture (and a few other system-handled drags). The
+    // system event loop consumes the up-event for its own non-client-
+    // area handling, so it never reaches our `nextEventMatchingMask`
+    // dequeue above — `_stb_mouse_btn` keeps bit 0 set even though
+    // the button is physically released. Symptom in rts1's
+    // wc1_input drag-select: the user resizes the window, releases
+    // the corner, then sees a marquee appear because `drag_active`
+    // latched on the swallowed down + the level-triggered
+    // `mouse_down(LEFT)` keeps reading 1.
+    //
+    // `[NSEvent pressedMouseButtons]` is the OS-truth bitmask
+    // (bit 0 = left, bit 1 = right, bit 2 = "other") — same
+    // layout our globals use. Re-reading it after each poll loop
+    // self-heals the missed up-events without us having to track
+    // every special drag mode Cocoa intercepts.
+    _stb_mouse_btn = objc_msgSend(objc_getClass("NSEvent"),
+                                  sel_registerName("pressedMouseButtons")) & 7;
+
+    // Sync modifier-key state to actual hardware state.
+    //
+    // Cocoa delivers modifier-key (Shift / Ctrl / Option / Cmd)
+    // transitions via `NSEventTypeFlagsChanged` (event type 12),
+    // a separate event lane from the standard KeyDown / KeyUp
+    // pair this module processes. Without a per-event handler
+    // for FlagsChanged, `_stb_keys[KEY_SHIFT]` etc never flip
+    // and game-side checks like `key_down(KEY_SHIFT)` always
+    // read 0 — caught when rts1's Shift+N building-spawn dispatch
+    // never triggered. Same kind of event-loss the mouse-button
+    // sync above heals; same shape of fix.
+    //
+    // `[NSEvent modifierFlags]` is the OS-truth bitmask for the
+    // current modifier-key state. Layout from `NSEvent.h`:
+    //   bit 17 (1 << 17) = NSEventModifierFlagShift
+    //   bit 18 (1 << 18) = NSEventModifierFlagControl
+    //   bit 19 (1 << 19) = NSEventModifierFlagOption (Alt)
+    //   bit 20 (1 << 20) = NSEventModifierFlagCommand (Meta)
+    // Slots come from `_plt_map_vkey` above: KEY_SHIFT=13,
+    // KEY_CTRL=70, KEY_ALT=71, KEY_META=72.
+    auto mod_flags;
+    mod_flags = objc_msgSend(objc_getClass("NSEvent"),
+                             sel_registerName("modifierFlags"));
+    poke(_stb_keys + 13, (mod_flags >> 17) & 1);   // KEY_SHIFT
+    poke(_stb_keys + 70, (mod_flags >> 18) & 1);   // KEY_CTRL
+    poke(_stb_keys + 71, (mod_flags >> 19) & 1);   // KEY_ALT
+    poke(_stb_keys + 72, (mod_flags >> 20) & 1);   // KEY_META
 
     // Detect window closed via red X button. One check per frame after all events.
     if (objc_msgSend(_plt_win, sel_registerName("isVisible")) == 0) {

@@ -87,16 +87,63 @@ static auto _frame_step;
 // {-1, 0, 1}^2.
 static auto _flow_step_buf;
 
+// Sentinel value stored in `_occupied` for tiles that hold a
+// PERMANENT terrain blocker (tree, water, cliff). Picked so it
+// can never collide with a real `eid + 1` payload — entity ids
+// are array-row indices well under 31 bits, so 0x7FFFFFFF is
+// safely out of reach for the v1 entity cap. Treated as
+// "permanently held" by `wc1_collision_is_blocked_for` (the
+// claim != self_eid + 1 branch fires).
+const _TERRAIN_BLOCKER = 0x7FFFFFFF;
+
+// Forest-tileset canonical tree ID. The wc1_map.bsm header
+// verified tile 76 as the canonical tree-grove tile through
+// frequency analysis of forest1.sms. The wider 71-87 cluster
+// also contains grass-floor + transition tiles that LOOK like
+// forest understory but are actually walkable in the original
+// — blocking the whole range turned pathfind into a no-op for
+// peasants trying to cross any partially-forested area (caught
+// during S8 construction-assignment smoke when the worker
+// couldn't reach foundations placed near tree clusters).
+//
+// Narrow to just 76 for v1. A proper terrain classifier (per-
+// tile-id walkability table sourced from the war1gus reference)
+// graduates in S8.5 sidequest when the second class of blocked
+// terrain (water / cliffs) earns its slot.
+const _WC1_TREE_TILE = 76;
+
 // Allocate every shared scratch resource the movement system
 // needs: A* pathfinder, flow field, flow scratch buffer, and the
 // tile-occupancy grid. Call once at startup AFTER the map is
 // loaded so the grid dimensions are known, and BEFORE any peasant
 // is spawned so spawn-time wc1_collision_register has a live grid.
+//
+// S8.5 — also seeds permanent terrain blockers (trees) into BOTH
+// the pathfinder's blocked array (path_set_blocked) AND the
+// occupancy grid (_TERRAIN_BLOCKER). The pathfinder uses its
+// own internal `cells` array for A* / flow routing; the
+// occupancy grid backs the per-step `_step_unit` walker. Both
+// have to know the tree is impassable or units fall through the
+// crack between the two systems.
 wc1_movement_init(map) {
-    _pf  = path_new(wc1_map_w(map), wc1_map_h(map));
-    _flow = flow_new(wc1_map_w(map), wc1_map_h(map));
+    auto w, h, gx, gy, tile_id;
+    auto tm;
+    w = wc1_map_w(map);
+    h = wc1_map_h(map);
+    _pf  = path_new(w, h);
+    _flow = flow_new(w, h);
     _flow_step_buf = buf_word(2);
-    _occupied = grid_new_word(wc1_map_w(map), wc1_map_h(map));
+    _occupied = grid_new_word(w, h);
+    tm = wc1_map_tm(map);
+    for (gy = 0; gy < h; gy++) {
+        for (gx = 0; gx < w; gx++) {
+            tile_id = tile_get(tm, gx, gy);
+            if (tile_id == _WC1_TREE_TILE) {
+                path_set_blocked(_pf, gx, gy, 1);
+                grid_set(_occupied, gx, gy, _TERRAIN_BLOCKER);
+            }
+        }
+    }
 }
 
 // ── Tile-claim collision ────────────────────────────────────────
@@ -228,8 +275,12 @@ static void _step_unit(w, eid) {
     // and advances elapsed_ms so the chop anim cycles). Without this
     // guard, _step_unit would fall through to has_target==0 and
     // _idle_anim would clobber state back to IDLE every tick,
-    // making the chop animation invisible.
+    // making the chop animation invisible. UNIT_STATE_BUILD shares
+    // the same "don't move" guarantee — `wc1_production_tick` parks
+    // the assigned worker at the foundation and advances the build
+    // anim.
     if (an.state == UNIT_STATE_ATTACK) { return; }
+    if (an.state == UNIT_STATE_BUILD)  { return; }
 
     // Resolve the micro-target candidate.
     has_target = 0;

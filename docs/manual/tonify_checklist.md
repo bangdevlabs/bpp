@@ -2450,3 +2450,443 @@ generic enough for the new tier — back out and rethink.
 - `docs/plans/sidequest_stbgrid.md` — worked example of a fully-
   generic graduation that lifted stbflow's ad-hoc grids out into
   `stbgrid`, with `wc1_movement.bsm` consuming both.
+
+## Rule 34: No silent narrowing — annotate or refuse
+
+B++ rejects silent narrowing between numeric types. This is a
+**design premise**, not a stylistic preference — narrowing
+conversions that pass without programmer acknowledgement are the
+canonical source of bugs Bjarne Stroustrup spent his late career
+trying to eliminate from C++ (see his Nov 2025 paper
+"Concept-Based Generic Programming in C++" which proposes a type
+system for "absence of narrowing conversions" as part of complete
+type safety; the Peterman Pod 2026 interview includes his closing
+admission that the problem is "obvious" in hindsight). C++ inherits
+the implicit conversion rules from C and cannot remove them
+without breaking 50 years of code. B++ never inherited them —
+its lineage is B (1969), and the orthogonal-type-system decision
+encoded that escape.
+
+The doctrine is enforced by three diagnostics that already ship:
+
+| Diagnostic | What it catches | Severity |
+|---|---|---|
+| **E232** | Storing a float value into a destination with no type annotation — the IEEE 754 bits would be silently truncated to integer | Fatal |
+| **W010** | Narrowing within the same base (e.g. `auto x: byte; x = some_word_value`) | Warning |
+| **W011** | Storing an int into a narrower float (precision loss); signedness-agnostic — both `BASE_WORD` and `BASE_UWORD` sources warn | Warning |
+
+Plus the `: u_word` family (Rule 32) which separates signed vs.
+unsigned arithmetic dispatch so the signed/unsigned mixing trap from
+C cannot fire silently.
+
+### What this means at every site
+
+- **Assignments**: annotate the destination when the value's natural
+  type differs. `auto x: float = 3.14;` preserves IEEE bits;
+  `auto x = 3.14;` triggers E232.
+- **Function parameters**: if you pass a float through a parameter
+  declared as a word, the conversion fires the same diagnostic
+  family at the call site. Annotate the parameter or convert the
+  caller's expression.
+- **Struct fields**: a field declared `hp: half` receiving a
+  full-word value triggers W010. Pre-convert with the explicit cast
+  builtin or widen the field.
+- **Return values**: returning a float from a function whose
+  inferred return is word triggers E232 at the return site.
+
+### When narrowing is legitimate
+
+There are cases — rounding screen coordinates from float math,
+packing bits into byte fields, decoding a word as a slice of bytes
+— where the narrowing IS the operation, not an accident. The
+pattern is **annotate the destination explicitly**:
+
+```bpp
+// Float → int rounding (intentional truncation):
+auto sx: word;
+sx = pos_x * scale;        // word destination, float source.
+                            // Backends emit fcvtzs implicitly; no diagnostic.
+                            // The annotation IS the consent.
+
+// Packing bits into a byte field:
+struct Pixel { r: byte, g: byte, b: byte, a: byte }
+auto p: Pixel;
+p.r = compute_red();       // W010 fires if compute_red returns word.
+                            // To silence: annotate compute_red as returning
+                            // byte (-> byte) and propagate the type.
+```
+
+The diagnostic is the **acknowledgement gate**. Pre-annotating the
+destination says "I know this narrows; this is my intent." Removing
+the diagnostic by relaxing the compiler defeats the design — do
+not patch the validator to suppress W010/W011 except for a
+documented language-level evolution.
+
+### Why this premise matters
+
+A narrowing-permissive type system creates two failure modes that
+no test suite reliably catches:
+
+1. **Refactor drift** — a function returns `float` after a
+   change; old callers still treat the result as int. The codebase
+   silently rounds at every call site. Production sees rounding
+   bugs only when input magnitudes hit the edge.
+2. **Genre drift** — adding 64-bit positions to a game that
+   started with 32-bit ints. Every assignment between the new
+   wide type and old narrow consumers silently loses bits. Bugs
+   surface as "physics jitters past coordinate 16384."
+
+B++'s diagnostics catch both at compile time, before the bug
+ships. The cost is annotation friction: programmer must write
+`: float` / `: u_word` / etc. when the type differs from word.
+That friction is the entire point.
+
+### Cross-references
+
+- Rule 13 — annotation philosophy (when to add `: type`).
+- Rule 32 — `: u_word` family for signed/unsigned dispatch.
+- `docs/manual/how_to_dev_b++.md` §4.5 — storage class + const
+  variants.
+- `docs/manual/how_to_dev_b++.md` §4.7 — narrative version of this
+  rule with code examples.
+- `docs/manual/warning_error_log.md` E232 / W010 / W011 entries.
+- External: Stroustrup, "Concept-Based Generic Programming in
+  C++", Nov 2025, available at
+  `https://www.stroustrup.com/Concept-based-GP.pdf`. The Peterman
+  Pod 2026 interview frames the historical context.
+
+### Don't relax this
+
+When a contributor proposes "remove W010, it's noisy" or "let
+E232 be a warning, not fatal": the answer is no without an
+explicit RFC explaining what changed about the design premise.
+The diagnostics are the implementation of Rule 34; relaxing them
+relaxes the rule. If a specific call site is producing false
+positives, fix the call site (annotate, widen, or pre-cast) — do
+not weaken the compiler.
+
+## Rule 35: Games as infra stress test
+
+B++ games (rts1, fps_3d, fps_wolf3d, pathfind, snake, rhythm,
+platformer, the future rpg Game 4) are not passive playgrounds.
+They are the canonical workloads that surface engine gaps in
+production-shape conditions — fixed pool caps, silent buffer
+overflows, missing diagnostics, cartridge layering issues,
+performance cliffs, missing primitives.
+
+When a game implementation hits an infra limit, that is the
+**forcing function** to fix the infra. The fix ships in the
+same arc as the game work — same commit batch when small, a
+dedicated sidequest when larger.
+
+### How this differs from Rule 28 (anti-speculation)
+
+Rule 28 rejects features without consumers — "this might be
+useful someday" is not enough. Rule 35 does not contradict
+that: the consumer is the game whose implementation hit the
+gap. The infra fix has a concrete, named, in-tree caller as its
+justification — exactly the bar Rule 28 demands.
+
+The distinguishing test: would the second consumer ship anyway
+if the primitive / fix did not exist? If yes (a real game arc
+needs it, the use case is real regardless of primitive
+availability) — build the infra. If no (the second consumer is
+speculative; "maybe someone will want this someday") — defer.
+
+### Worked examples
+
+| Game pressure | Infra fix | Date |
+|---|---|---|
+| Parser `fbuf` overflow on stbgame → stbui → stbimage chain (S8.5 era stbui drift) | Per-file `malloc` (heap-per-file, mirrors gcc/clang) | 2026-05-17 (cd6d00e) |
+| WC1 S8.5 stbui pool hardcoded at 256 nodes — multi-select HUD or dense panel would silently drop widgets | `bpp_arr` Tier-1 primitive (growable struct-array) added to prelude; stbui pool backed by it | 2026-05-20 |
+| WC1 S6 unit occupancy + stbflow ad-hoc grids both needing 2D cell storage | `stbgrid` Tier-1 primitive (`grid_new_word`, `grid_set`, `grid_get`) | 2026-05-18 |
+| rts1 + fps Doom-mode + rpg Game 4 all projecting need for in-flight projectile pools | `stbprojectile` Tier-2 cartridge with `pool` integration | 2026-05-18 |
+| WC1 unit + building need separate archetype iteration but `ecs_query_each` walks every archetype | `comp_bitmask` on ArchetypeRec + filter pass | 2026-05-20 |
+| WC1 modifier-key dispatch (Shift+N building spawn) never fired because Cocoa delivers modifier transitions on `NSEventTypeFlagsChanged`, not `NSEventTypeKeyDown` | `[NSEvent modifierFlags]` sync at end of `_stb_poll_events` | 2026-05-20 |
+
+### What this rule does NOT mean
+
+It does NOT mean "any game friction becomes engine work." Game-
+specific quirks stay in the game (Tier 3). The infra-promotion
+gate is the same Rule 33 + Rule 20 tier check:
+
+- If the gap is game-specific (one game's wiring, one map's
+  shape) → fix in the game.
+- If the gap is genre-specific (RTS pathfinding, FPS raycasting,
+  RPG inventory) → fix in a Tier-2 cartridge.
+- If the gap is universal (data structure, runtime ABI, parser
+  internals) → fix in `bpp_*` (prelude) or fundamental engine.
+
+### Pattern: "audit before reinvent"
+
+When a game hits a gap, the FIRST step is to grep / audit
+existing infra. Rule 26 already says this for cartridges; Rule
+35 extends it to primitive-shape work. The bpp_arr addition
+followed exactly this — audit stbpool (fixed freelist, wrong
+shape), bpp_arena (fixed cap, wrong shape), bpp_array (word
+elements, wrong shape) → real gap → new primitive. Without the
+audit, the temptation is to reinvent inside the game (the same
+hand-rolled doubling realloc loop everyone writes).
+
+### Cross-references
+
+- Rule 20 — two-consumer rule (the trigger condition for
+  cartridge graduation).
+- Rule 23 — cartridge minimalism (the floor that prevents
+  speculative bloat).
+- Rule 26 — audit existing cartridges before creating a new
+  one (the search pass).
+- Rule 28 — killer-use-case gate (the anti-speculation rule
+  Rule 35 explicitly complements rather than contradicts).
+- Rule 33 — cartridge tier triage (which tier the fix lands
+  in).
+
+## Rule 36: Primitive promotion — two consumers planned, not just shipped
+
+Rule 20 says graduate to a primitive when two consumers exist.
+The strict reading is "two consumers already in production"; the
+intent is anti-speculation. When two consumers are CONCRETELY
+PLANNED in the same arc — both named, both with real use cases,
+both ready to migrate — the gate is met BEFORE either ships,
+and building the primitive first is the correct order.
+
+The test: would the second consumer ship anyway if the primitive
+did not exist? If yes (the use case is real, the consumer is
+committed) — build the primitive first. The consumer will use
+it. If no (the second consumer is hypothetical, "maybe someone
+will want this someday") — defer. Build the primitive after the
+second consumer surfaces concretely.
+
+### Worked examples
+
+**Passed:**
+
+- `stbgrid` (2026-05-18) — WC1 unit occupancy was the current
+  consumer, stbflow's three ad-hoc grids were the named
+  refactor target. Built primitive first; both migrated in the
+  same arc.
+- `bpp_arr` (2026-05-20) — stbui pool growable was the current
+  consumer, stbecs entity table growable was the named refactor
+  target, the compiler's ~12 internal parallel-array patterns
+  were the future refactor surface. Built primitive first;
+  stbui migrated in the same arc.
+
+**Failed:**
+
+- `ui_image` widget in stbui (dba3e2a revert, 2026-05-17) —
+  added speculatively with zero consumers; the supporting
+  `import "stbimage.bsm"` inflated the import chain for every
+  stbui consumer (Bang 9, Modulab, level_editor, the_bug,
+  fxlab) whether they needed atlas drawing or not. No named
+  refactor target.
+- `stbhud` initial dual-mode dispatch attempt (S8.5 draft,
+  reverted same day) — proposed re-adding `ui_image` /
+  `ui_bar` to stbui itself with `_gpu_in_pass` runtime
+  dispatch, on the assumption that the import chain was the
+  only objection. The actual objection (Rule 23 floor +
+  Bang 9 GPU-free invariant + silent no-op trap in CPU mode)
+  was structural, not import-budget. The fix was a separate
+  `stbhud` cartridge that imports stbui for layout — same
+  pattern this rule advocates.
+
+### Cross-references
+
+- Rule 20 — the strict two-consumer trigger this rule refines.
+- Rule 28 — killer-use-case gate (the speculation rejector
+  this rule explicitly does NOT relax — both planned consumers
+  must be REAL, with concrete arcs).
+- Rule 33 — cartridge tier triage (primitive promotion lands
+  in Tier 1 or `bpp_*` prelude per the universality test).
+- Rule 35 — games as infra stress test (the typical trigger
+  pattern: game arc surfaces the gap, primitive promotion is
+  the structural response).
+
+## Rule 36b: AoS vs SoA — empirical doctrine, not fresh audit
+
+**Search the journal first.** Before opining on parallel-array
+storage shape, grep for the prior decision. B++'s baseline IS
+SoA via parallel `buf_word` arrays, and the dense-vs-sparse
+trade-off was empirically benched in the RTS Stress Arc Session 2
+closure (journal 2026-05-12). The doctrine is:
+
+- **Dense single-field iteration loses under AoS-chunked.** The
+  empirical bench (`tests/bench_ecs_iter.bpp`, 50K entities):
+  archetype storage runs at **0.54×** of legacy SoA speed.
+  Indirection through `chunk_ptr + comp_offset + slot_stride`
+  costs more than the cache-locality story claims to save when
+  the baseline is already SoA (which B++'s is).
+
+- **Sparse multi-component queries win under AoS-chunked.** The
+  empirical bench (`tests/bench_ecs_sparse_query.bpp`):
+  | Selectivity | Legacy | Archetype | Ratio |
+  |---|---|---|---|
+  | 10% (5K of 50K) | 88 ms | 31 ms | **2.80×** |
+  | 2%  (1K of 50K) | 90 ms | 8.6 ms | **10.48×** |
+  Ratio scales with 1/sparsity (`O(matching)` vs `O(total)`).
+
+- **Small tables don't trip either bench.** The 0.54× regression
+  is at 50K entities. At 30-100 entries (the compiler's local-
+  var-type table per function, global-type table, module table,
+  module boundary list), constant overhead dominates and the
+  shape choice is dominated by maintainability + readability.
+
+### Applying the doctrine
+
+Three shapes; pick from the FIRST matching rule:
+
+1. **Small table + multi-field access** → **AoS** via
+   `arr_struct`. Reason: shape choice is maintainability-
+   dominated at < ~1000 entries. Tag the table with size +
+   access pattern in the cluster table below.
+
+2. **Large table + dense single-field iteration in hot path**
+   → **SoA preserved**. The bench is empirical: AoS-chunked
+   regresses 0.54× here. Even at 0.5 s bootstrap where bootstrap
+   time is not pressing, choosing the architecturally worse
+   shape with empirical evidence available is anti-doctrine.
+
+3. **Large table + sparse multi-component queries dominate** →
+   **AoSoA chunked** (i.e. `stbecs` archetype). Only justified
+   when the per-pass query selects a strict subset of all
+   entities. This is the path Rule 30 already documents.
+
+### Worked examples — verified against bench precedent
+
+### Worked examples (compiler arc 2026-05-20)
+
+| Cluster | Sites | Shape chosen | Reason |
+|---|---|---|---|
+| `ty_vt_*` (4 arrays) | ~30 in `bpp_types.bsm` | **AoS** (`VtEntry`) | Small struct (32 B), every lookup touches name + at least 1 other field. AoS wins cache. |
+| `ty_gl_*` (2 arrays) | ~10 in `bpp_types.bsm` | **AoS** (`GlEntry`) | Tiny struct (16 B), name + type always co-accessed. AoS wins. |
+| `diag_file_*` (3 arrays) | ~15 across 5 files | **AoS** (`DiagFile`) | Most accesses single-field (mod_idx scan), but the table is tiny (~50 modules max); migration cost dominated by maintainability gain, not cache. AoS via accessors keeps call sites close to pre-migration shape. |
+| `mod_bnd_*` (3 arrays) | ~18 in `bpp_import.bsm` | **AoS** (`ModBnd`) | Same shape as `diag_file_*` but single-file. Each lookup uses 2+ fields. AoS clear win. |
+| `fn_*` codegen cluster (`vt_data`, `vt_cnts`, `ret_types`, `par_types`) | ~57 across 5 files | **AoS** (`FnMeta`) — landed 2026-05-20 | Codegen reads all 4 fields per function per emit. Multi-field co-access is the dominant pattern, table is small (~200 funcs typical). AoS via `arr_struct<FnMeta>` + 4 cross-file accessors (`fn_meta_vt_block` / `_vt_count` / `_ret_type` / `_par_block`). **Synth-fn safety:** smart-dispatch's worker synthesis (`bpp_dispatch.bsm:3252`) grows `funcs[]` AFTER `run_types` pre-fills `fn_metas`; accessors return zero on out-of-range index — preserves the legacy parallel-array "read past live count returns zero from slack" semantics. |
+| `fn_*` hot fixpoint cluster (`ret_hint`, `vt_locs`, etc.) | ~15 across 2 files | **SoA preserved** | Hot fixpoint passes touch `fn_calls + small_subset` with zero co-access into the codegen cluster. Migration would force every cache line to load fields the pass doesn't use. **Permanent shape.** |
+| `fn_*` hot cluster (`fn_calls`, `fn_reachable`, `fn_phase`, `fn_effect`, `fn_locally_impure`, `fn_address_taken`, `fn_phase_hint`) | many in `bpp_dispatch.bsm` | **SoA preserved** | Audit shows each hot pass (mark_reachable, classify, phase fixpoint, effect fixpoint) touches a DISTINCT subset of 2-3 fields with NO co-access into the others. AoS would force every cache line to load 7 fields when the pass uses 2. Strict SoA is cache-optimal. **Permanent shape.** |
+| `fn_static`, `fn_void`, `fn_inlineable` | ~15 across 3 files | **SoA preserved** | Mixed hot/cold access (call-site decisions in parser hot path, codegen reads per function). Defer. |
+| `mod_hashes`, `mod_topo`, `fn_vt_starts` | Single arrays each | **No migration** | Not parallel-array clusters; single growable arrays. Stay as `bpp_array`. |
+| `toks` (lexer token records) | hand-rolled AoS, 24-byte stride in fixed buf | **No migration** | Already AoS via hand-rolled buf-base + offset arithmetic. Hot path (every token read). Promoting to `arr_struct` adds one extra load per read for no shape change. Stay as-is. |
+
+### Method-of-skipping
+
+When a cluster's audit says SoA preserved, document the decision
+HERE so the next agent doesn't re-audit from scratch and
+mistakenly migrate to AoS. The cluster table above is the
+permanent record — extended as new clusters are audited, not
+rewritten.
+
+The bar for re-opening: a future arc actually touches the
+growth points (e.g., compiler internals refactor adding 4+ new
+fields) OR a profile run shows the cold codegen path
+contributing > 5% of bootstrap time. Until either, stay SoA.
+
+### Cross-references
+
+- Rule 33 — cartridge tier triage (`bpp_arr` is the prelude
+  primitive Rule 36b consumers reach for).
+- Rule 35 — games as infra stress test (consumer pressure
+  decides which clusters earn migration vs stay SoA).
+- Rule 37 — bench citation rule (every perf claim about a
+  cluster migration cites `tests/bench_compile.sh`).
+- `src/bpp_arr.bsm` — the primitive itself.
+- `tests/test_bpp_arr.bpp` — smoke test covering grow / reset
+  / out-of-range.
+
+## Rule 37: Bench citation — every compile-perf claim quotes `bench_compile.sh`
+
+Any commit message, journal entry, PR description, or memory
+file that asserts a compile-time win, regression, or "no
+measurable change" MUST cite a fresh run of
+`tests/bench_compile.sh`. The harness lives at
+`tests/bench_compile.sh` and exists to make every perf claim
+reproducible — quote the harness output verbatim or summarize
+its three rows (bootstrap / small / medium) with min/median
+per case.
+
+### Why this rule exists
+
+The 2026-05-20 compiler array migration arc almost shipped
+with a "16% bootstrap regression" finding that was a
+measurement bug: the baseline binary (`HEAD:bpp`, pre-arc)
+could not compile the post-arc source tree because the new
+source uses `arr_struct_*` which the old auto-inject list
+did not know about. The OLD compiler ran for 0.40s, errored
+out with E201, and exited — looking like a fast "successful"
+baseline against the NEW compiler's 0.48s real compile. The
+gap was 100% measurement bias, not real cost.
+
+Same arc, after a valid bench (both compilers running on
+sources they each could compile + sample(1) hot-list to
+double-check): no measurable regression, `arr_struct_at` at
+3% of self-host CPU time, comfortably under the 5% Rule 36b
+re-open gate.
+
+### What the rule requires
+
+When a change is perf-relevant (touches accessor shape, data
+layout, hot lookup, codegen path, runtime primitive,
+type-inference inner loop), the citing artifact must show:
+
+1. **The exact bench output**, fenced as a code block. Quote
+   verbatim. Trimming a row is OK; re-typing numbers is not
+   (typos > truth).
+2. **The binary identity** for both sides if a comparison is
+   made: `bpp` path, byte size, mtime — the harness header
+   prints all three. Without that header an entry can be
+   confidently re-cited later when the numbers drift.
+3. **The case that matters.** Bootstrap moves on
+   compiler-internal regressions; small/medium move on
+   prelude-internal regressions. Cite the row that confirms
+   the claim, not just the row that looks best.
+
+### What the rule does NOT require
+
+- A bench citation on changes that are not perf-relevant
+  (refactor inside one cartridge that doesn't touch a hot
+  path; UI / asset / doc work). Use judgement — when
+  uncertain, run the bench; it's three commands.
+- A bench citation on `--c` (C-emit) perf claims —
+  `bench_compile.sh` measures the native pipeline only. The
+  C-emit pipeline runs through gcc / clang which dominates
+  the wall time; a separate harness would be wanted before
+  citing C-emit perf claims.
+- Inline numbers in throwaway comments (e.g. a one-line
+  Bash debug session). The rule fires when the claim is
+  durable — commit, journal, PR, memory — and someone three
+  months from now might re-cite it.
+
+### How to apply
+
+```sh
+# At commit / journal time, run from repo root:
+sh tests/bench_compile.sh
+
+# More runs for tighter min/median (the harness sorts numerically):
+sh tests/bench_compile.sh --runs 10
+
+# Benchmark a specific binary (e.g. a generation candidate before install):
+sh tests/bench_compile.sh --bpp /tmp/bpp_gen2
+
+# Add the macOS `sample(1)` hot-list — useful when the wall numbers
+# don't move much and the suspicion is "which function got 3% slower":
+sh tests/bench_compile.sh --sample
+```
+
+Then paste the output (header + table, optionally the hot
+list) into the artifact that's making the claim. Memory
+entries get the table-only summary to keep the index tight;
+journal + PR get the full block.
+
+### Cross-references
+
+- `tests/bench_compile.sh` — the harness this rule cites.
+- `docs/manual/bootstrap_manual.md` "Testing Changes" — the
+  three canonical test runners (`run_all.sh`, `run_all_c.sh`,
+  Docker / X11). `bench_compile.sh` joins this list as the
+  fourth canonical harness for perf-relevant work.
+- Rule 36b — the empirical AoS-vs-SoA doctrine that the
+  bench feeds into. The 5% Rule 36b re-open gate is measured
+  against a valid bench run; no bench output → no claim.
+- `docs/journal.md` 2026-05-20 (compiler array migration arc
+  closeout) — the first arc that cites `bench_compile.sh` in
+  its validation section.

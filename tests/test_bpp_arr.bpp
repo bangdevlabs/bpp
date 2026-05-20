@@ -1,0 +1,138 @@
+// test_bpp_arr.bpp — smoke test for src/bpp_arr.bsm (auto-injected
+// prelude primitive — no import statement needed).
+//
+// Verifies the growable struct-array primitive across the
+// canonical lifecycle: new → alloc many → at → reset → alloc
+// again → free. Exercises the grow-on-overflow path explicitly
+// by pushing past the initial cap.
+
+// Sample struct for the test — 24 bytes (3 word fields). Larger
+// than the word slot bpp_array uses, smaller than stbui's UiNode
+// so the smoke runs fast.
+struct Cell { x, y, tag }
+
+main() {
+    auto a, idx, i, c: Cell;
+    auto initial_cap;
+
+    initial_cap = 4;
+
+    // ── Phase 1 — basic alloc + at ─────────────────────────────
+    a = arr_struct_new(sizeof(Cell), initial_cap);
+    if (arr_struct_count(a) != 0) {
+        putstr("FAIL: fresh arr_struct_count != 0\n");
+        return 1;
+    }
+    if (arr_struct_cap(a) != initial_cap) {
+        putstr("FAIL: fresh arr_struct_cap != initial_cap\n");
+        return 1;
+    }
+
+    // Push 4 elements (exactly fills initial cap, no grow yet).
+    for (i = 0; i < initial_cap; i++) {
+        idx = arr_struct_alloc(a);
+        if (idx != i) {
+            putstr("FAIL: idx mismatch under cap; got ");
+            putnum(idx); putstr(" expected ");
+            putnum(i); putstr("\n");
+            return 1;
+        }
+        c = arr_struct_at(a, idx);
+        c.x = i * 10;
+        c.y = i * 20;
+        c.tag = i + 100;
+    }
+    if (arr_struct_count(a) != initial_cap) {
+        putstr("FAIL: count after fill != initial_cap\n");
+        return 1;
+    }
+    if (arr_struct_cap(a) != initial_cap) {
+        putstr("FAIL: cap unexpectedly grew at exactly initial_cap\n");
+        return 1;
+    }
+
+    // ── Phase 2 — overflow triggers grow ───────────────────────
+    idx = arr_struct_alloc(a);
+    if (idx != initial_cap) {
+        putstr("FAIL: overflow idx wrong; got ");
+        putnum(idx); putstr(" expected ");
+        putnum(initial_cap); putstr("\n");
+        return 1;
+    }
+    if (arr_struct_cap(a) != initial_cap * 2) {
+        putstr("FAIL: cap did not double on overflow; got ");
+        putnum(arr_struct_cap(a)); putstr("\n");
+        return 1;
+    }
+    c = arr_struct_at(a, idx);
+    c.x = 999;
+    c.y = 888;
+    c.tag = 777;
+
+    // ── Phase 3 — original data survived the realloc ───────────
+    for (i = 0; i < initial_cap; i++) {
+        c = arr_struct_at(a, i);
+        if (c.x != i * 10 || c.y != i * 20 || c.tag != i + 100) {
+            putstr("FAIL: pre-grow data corrupted at idx ");
+            putnum(i); putstr("\n");
+            return 1;
+        }
+    }
+    // And the newly-pushed slot.
+    c = arr_struct_at(a, initial_cap);
+    if (c.x != 999 || c.y != 888 || c.tag != 777) {
+        putstr("FAIL: overflow slot data wrong\n");
+        return 1;
+    }
+
+    // ── Phase 4 — push enough to trigger multiple grows ────────
+    for (i = initial_cap + 1; i < 100; i++) {
+        idx = arr_struct_alloc(a);
+        c = arr_struct_at(a, idx);
+        c.x = i;
+        c.y = i * 2;
+        c.tag = i * 3;
+    }
+    if (arr_struct_count(a) != 100) {
+        putstr("FAIL: count after 100 pushes != 100\n");
+        return 1;
+    }
+    if (arr_struct_cap(a) < 100) {
+        putstr("FAIL: cap < count after pushing\n");
+        return 1;
+    }
+
+    // ── Phase 5 — reset zeroes count, keeps buffer ─────────────
+    auto cap_before;
+    cap_before = arr_struct_cap(a);
+    arr_struct_reset(a);
+    if (arr_struct_count(a) != 0) {
+        putstr("FAIL: count after reset != 0\n");
+        return 1;
+    }
+    if (arr_struct_cap(a) != cap_before) {
+        putstr("FAIL: cap changed across reset\n");
+        return 1;
+    }
+
+    // After reset, alloc restarts at idx 0.
+    idx = arr_struct_alloc(a);
+    if (idx != 0) {
+        putstr("FAIL: alloc after reset didn't return 0\n");
+        return 1;
+    }
+
+    // ── Phase 6 — out-of-range at returns 0 ───────────────────
+    if (arr_struct_at(a, 0 - 1) != 0) {
+        putstr("FAIL: at(-1) didn't return 0\n");
+        return 1;
+    }
+    if (arr_struct_at(a, 1000) != 0) {
+        putstr("FAIL: at(1000) didn't return 0\n");
+        return 1;
+    }
+
+    arr_struct_free(a);
+    putstr("OK\n");
+    return 0;
+}

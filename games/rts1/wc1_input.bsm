@@ -22,6 +22,7 @@ import "stbinput.bsm";
 import "stbcamera.bsm";
 import "bpp_io.bsm";
 load   "wc1_anims.bsm";
+load   "wc1_buildings.bsm";    // Building struct + BLDG_STATE_* + wc1_building_at_world
 
 // Selection buffer + live count. selected_count == 0 is the
 // "nothing selected" state honored by wc1_hud_render and the
@@ -29,8 +30,20 @@ load   "wc1_anims.bsm";
 // rts.bpp (256) so a marquee covering every unit cannot overflow.
 const _MAX_SELECTION = 256;
 
+// Selection kind enum. Tracks whether `selected_eids` holds
+// units or a single building, so the right-click handler can
+// skip unit-only paths (move, attack, peasant-assignment) when
+// the player has a building selected, and wc1_hud_render can
+// pick the right selection-ring geometry. v1 disallows mixed
+// selection — clicking a building replaces any unit selection
+// and vice versa.
+const SEL_KIND_NONE     = 0;
+const SEL_KIND_UNITS    = 1;
+const SEL_KIND_BUILDING = 2;
+
 global selected_eids: ptr;
 global selected_count;
+global selected_kind;
 
 // Drag-rectangle state. drag_active flips on press, off on
 // release; while active, drag_x1/drag_y1 track the live mouse so
@@ -70,6 +83,7 @@ static auto _mq_x0, _mq_y0, _mq_x1, _mq_y1;
 wc1_input_init() {
     selected_eids  = buf_word(_MAX_SELECTION);
     selected_count = 0;
+    selected_kind  = SEL_KIND_NONE;
     drag_active    = 0;
     drag_x0 = 0; drag_y0 = 0; drag_x1 = 0; drag_y1 = 0;
 }
@@ -183,7 +197,7 @@ static _unit_at_world_any(world, wx, wy) {
 // the single hit-test (click) or walk peasant_q with the marquee
 // callback (drag). Either way the previous selection is replaced.
 static void _resolve_release(world) {
-    auto sx0, sy0, sx1, sy1, swap, dx, dy, hit;
+    auto sx0, sy0, sx1, sy1, swap, dx, dy, hit, building_eid;
     auto wx, wy, mx, my;
     sx0 = drag_x0;
     sy0 = drag_y0;
@@ -196,23 +210,39 @@ static void _resolve_release(world) {
     if (dx <= _DRAG_PX_THRESHOLD && dy <= _DRAG_PX_THRESHOLD) {
         // Click — single hit-test at the release point. The down
         // and up points are within _DRAG_PX_THRESHOLD of each
-        // other, so picking either is fine. _owned variant skips
-        // enemy factions (selection is player-only in v1).
+        // other, so picking either is fine.
         mx = mouse_x();
         my = mouse_y();
         wx = cam_screen_to_world_x(cam, mx);
         wy = cam_screen_to_world_y(cam, my);
+        // 1. Building hit-test first. Buildings are larger than
+        //    units; clicking on a footprint that overlaps a unit
+        //    sprite should still prefer the building (matches WC1
+        //    behaviour). Single-building selection replaces any
+        //    prior unit selection.
+        building_eid = wc1_building_at_world(world, wx, wy);
+        if (building_eid >= 0) {
+            selected_eids[0] = building_eid;
+            selected_count   = 1;
+            selected_kind    = SEL_KIND_BUILDING;
+            return;
+        }
+        // 2. Unit hit-test. _owned variant skips enemy factions
+        //    (selection is player-only in v1).
         hit = _unit_at_world_owned(world, wx, wy);
         if (hit >= 0) {
             selected_eids[0] = hit;
             selected_count   = 1;
+            selected_kind    = SEL_KIND_UNITS;
         } else {
             selected_count = 0;
+            selected_kind  = SEL_KIND_NONE;
         }
         return;
     }
     // Drag — normalize the screen rect, project corners to world
-    // pixels via the camera, then walk peasant_q.
+    // pixels via the camera, then walk peasant_q. Marquee selects
+    // units only; buildings are excluded (matches WC1).
     if (sx0 > sx1) { swap = sx0; sx0 = sx1; sx1 = swap; }
     if (sy0 > sy1) { swap = sy0; sy0 = sy1; sy1 = swap; }
     _mq_x0 = cam_screen_to_world_x(cam, sx0);
@@ -221,6 +251,8 @@ static void _resolve_release(world) {
     _mq_y1 = cam_screen_to_world_y(cam, sy1);
     selected_count = 0;
     ecs_query_each(peasant_q, fn_ptr(_marquee_test_cb));
+    if (selected_count > 0) { selected_kind = SEL_KIND_UNITS; }
+    else                    { selected_kind = SEL_KIND_NONE; }
 }
 
 // Per-frame input dispatch. Reads mouse state via stbinput's
@@ -254,18 +286,36 @@ void wc1_input_tick(world) {
     }
 
     // Right mouse: faction-aware dispatch. Hit-test the click
-    // against units first — if it lands on a unit whose Faction
-    // differs from the FIRST selected unit's Faction, treat it as
-    // an attack-target (S7.3 combat will resolve the engagement);
-    // otherwise fall through to a move command on the clicked
-    // tile (existing S6 behavior).
+    // against buildings first (S8 — assign the first selected
+    // peasant to a CONSTRUCTING foundation), then against units
+    // (attack-target if enemy), then fall through to a move
+    // command on the clicked tile.
+    //
+    // Only fires when the current selection is units — clicking
+    // right while a building is selected is a no-op for v1 (S10
+    // will hook this into the training-queue dispatch when the
+    // command card UI lands).
     if (mouse_pressed(MOUSE_RIGHT) != 0) {
-        if (selected_count > 0) {
+        if (selected_count > 0 && selected_kind == SEL_KIND_UNITS) {
             mx = mouse_x();
             my = mouse_y();
             wx = cam_screen_to_world_x(cam, mx);
             wy = cam_screen_to_world_y(cam, my);
-            auto target_eid;
+            auto target_eid, building_eid;
+            // 1. Construction-assignment hit-test. Click on a
+            //    friendly CONSTRUCTING building → assign the
+            //    first selected peasant to it. Production tick
+            //    advances progress while peasant is in range.
+            building_eid = wc1_building_at_world(world, wx, wy);
+            if (building_eid >= 0
+                && _building_is_friendly_constructing(world, building_eid) != 0) {
+                wc1_building_assign_peasant(world, building_eid,
+                                            selected_eids[0]);
+                return;
+            }
+            // 2. Attack-target hit-test against units of any
+            //    faction; _is_enemy filters friendly hits before
+            //    issuing the attack.
             target_eid = _unit_at_world_any(world, wx, wy);
             if (target_eid >= 0 && _is_enemy(world, target_eid) != 0) {
                 _issue_attack(world, target_eid);
@@ -278,6 +328,22 @@ void wc1_input_tick(world) {
             }
         }
     }
+}
+
+// Return 1 if `building_eid` is a CONSTRUCTING building owned by
+// the human player — the gate the right-click construction
+// assignment uses before flipping the building's assignment slot.
+// DONE buildings + enemy foundations both skip the assignment
+// branch (clicking an enemy building should still fall through
+// to move-or-attack; clicking a completed one is a no-op for v1
+// until production UI lands in S10).
+static _building_is_friendly_constructing(world, building_eid) {
+    auto b: Building, fa: Faction;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.state == BLDG_STATE_DONE) { return 0; }
+    fa = ecs_get(world, faction_comp, building_eid);
+    if (fa.player != _HUMAN_PLAYER) { return 0; }
+    return 1;
 }
 
 // True if `target_eid` is held by a faction other than the FIRST

@@ -1,0 +1,180 @@
+// bpp_arr.bsm — Growable struct-sized array (auto-injected prelude
+// primitive).
+//
+// Fills the gap between bpp_array (growable WORD array) and
+// bpp_arena (fixed-cap bump allocator). Consumers that need a
+// linear-append container of fixed-size structs (UiNode pool in
+// stbui v2, entity tables in stbecs, the compiler's own internal
+// function / type / module tables that currently roll their own
+// parallel-array patterns) reach here instead of hand-rolling
+// realloc loops.
+//
+// Lives in the auto-inject prelude alongside `bpp_array` so the
+// "do I need an import?" axis is consistent: word sequences and
+// struct sequences are both fundamental data shapes any B++
+// program might want, and gating one behind an import while the
+// other is free is arbitrary. Parse cost is ~80 LOC per
+// compilation unit — marginal.
+//
+// Shape:
+//
+//   auto a;
+//   a = arr_struct_new(sizeof(MyStruct), 256);  // initial cap = 256
+//   auto idx, p: MyStruct;
+//   idx = arr_struct_alloc(a);                   // returns index; may realloc
+//   p   = arr_struct_at(a, idx);                 // ptr to the struct
+//   p.field = 42;
+//   ...
+//   arr_struct_reset(a);                         // count = 0, keep backing buffer
+//   ...
+//   arr_struct_free(a);
+//
+// **Invalidation contract.** `arr_struct_alloc` may grow the
+// backing buffer (doubling on overflow). Any pointer the consumer
+// cached from a previous `arr_struct_at` call is dangling after
+// the grow. The canonical pattern allocates THEN fetches the
+// pointer:
+//
+//   idx = arr_struct_alloc(a);     // may grow
+//   p   = arr_struct_at(a, idx);   // fresh pointer
+//
+// Iteration (`for i in 0..arr_struct_count(a)`) caches the pool
+// pointer ONCE before the loop and never allocates inside the
+// loop — same hot path the WC1 unit-render walker uses.
+//
+// **Reset vs Free.** `arr_struct_reset` zeros the count but KEEPS
+// the backing allocation; the next round of `arr_struct_alloc`
+// calls reuses the same buffer at zero-malloc cost. `arr_struct_
+// free` returns the backing memory to the OS. Per-frame consumers
+// (UI / HUD trees) reset; per-process consumers (entity tables
+// surviving across scenes) hold the handle until shutdown.
+//
+// **Why a separate primitive instead of extending bpp_array.**
+// `bpp_array`'s `arr_*` family stores 8-byte words (single
+// integer / pointer per slot). `arr_struct_*` stores fixed-size
+// structs (the consumer picks elem_size at creation). The shape
+// difference is real — packing 22-field UiNode records as 22
+// separate word slots would split each "logical row" across non-
+// contiguous memory, breaking cache locality on hot iteration
+// loops. `bpp_arr` keeps each struct contiguous so `for i in
+// 0..n: visit(pool + i * elem_size)` is the cache-friendly walk
+// every consumer wants.
+
+// No imports — bpp_io / bpp_buf are auto-injected for malloc /
+// realloc / putstr_err. Pure leaf prelude module.
+
+// Handle layout. The growable array tracks its current count
+// (live elements), capacity (backing slots), per-element size
+// (set at new), and the data buffer. Reset zeros count; alloc
+// grows cap when count == cap.
+struct Arr {
+    buf,         // raw byte buffer holding count × elem_size struct slots
+    elem_size,   // bytes per element (set once at new; immutable)
+    count,       // live element count (0 ≤ count ≤ cap)
+    cap          // current capacity in elements (grows by doubling)
+}
+
+// Allocate a fresh growable struct-array. `elem_size` is bytes
+// per element (8-byte align it on the caller side if needed —
+// `bpp_arr` does not pad). `initial_cap` is the seed slot count;
+// passing 0 defaults to 16 to avoid a useless 0-cap then
+// immediate-grow on the first alloc.
+arr_struct_new(elem_size, initial_cap) {
+    auto a: Arr;
+    if (initial_cap <= 0) { initial_cap = 16; }
+    if (elem_size <= 0)   { elem_size   = 8; }
+    a = malloc(sizeof(Arr));
+    a.buf       = malloc(initial_cap * elem_size);
+    a.elem_size = elem_size;
+    a.count     = 0;
+    a.cap       = initial_cap;
+    return a;
+}
+
+// Grow the backing buffer to a new capacity. Internal helper —
+// callers reach for `arr_struct_alloc` which calls this on
+// overflow. Doubling keeps the amortized cost of `count`
+// allocations at O(count) total (each element copied at most
+// twice over the life of the array).
+static void _arr_struct_grow(a: Arr, new_cap) {
+    a.buf = realloc(a.buf, new_cap * a.elem_size);
+    a.cap = new_cap;
+}
+
+// Reserve one more element slot and return its index. The slot
+// memory is NOT zeroed — caller writes the fields explicitly via
+// the pointer from `arr_struct_at`. Grows the backing buffer (by
+// doubling) when count == cap.
+arr_struct_alloc(a: Arr) {
+    auto idx;
+    if (a.count >= a.cap) {
+        _arr_struct_grow(a, a.cap * 2);
+    }
+    idx = a.count;
+    a.count = a.count + 1;
+    return idx;
+}
+
+// Pointer to the element at `idx`. Valid until the NEXT
+// `arr_struct_alloc` call that triggers a grow — the canonical
+// pattern is alloc-then-at, never cache the pointer across
+// allocs.
+//
+// Out-of-range queries return 0 (the entity-id encoding in
+// stbecs makes 0 an invalid pointer anyway, so callers can
+// probe blindly). Defensive callers check `idx < arr_struct_
+// count` first.
+arr_struct_at(a: Arr, idx) {
+    if (idx < 0 || idx >= a.count) { return 0; }
+    return a.buf + idx * a.elem_size;
+}
+
+// Live element count. Cache once before iteration loops so the
+// hot path is `for i in 0..count: at(arr, i)` without re-reading
+// count every iteration (alloc inside a loop is the caller's
+// responsibility to avoid; the layout passes in stbui run
+// AFTER all widgets attach, so there's no in-loop growth there).
+arr_struct_count(a: Arr) {
+    return a.count;
+}
+
+// Current capacity (allocated slots, of which `count` are
+// live). Exposed mainly for diagnostics — most consumers care
+// about count + alloc, not the underlying buffer size.
+arr_struct_cap(a: Arr) {
+    return a.cap;
+}
+
+// Pointer to the base of the backing buffer. Same pointer
+// `at(arr, 0)` would return when count > 0. Custom iterators
+// (`for i in 0..count: buf + i*elem_size`) cache this once
+// before the hot loop to avoid per-iter accessor overhead.
+// Invalidated by the next `arr_struct_alloc` that triggers a
+// grow.
+arr_struct_buf(a: Arr) {
+    return a.buf;
+}
+
+// Element size in bytes — useful for the custom-iterator
+// pattern above (`for i: buf + i * stride`). Set once at new
+// and immutable thereafter.
+arr_struct_elem_size(a: Arr) {
+    return a.elem_size;
+}
+
+// Reset the array to empty WITHOUT freeing the backing buffer.
+// The next round of allocs reuses the same memory; the
+// per-frame UI / HUD tree consumers call reset at the top of
+// each frame so the high-water mark across the run keeps the
+// allocator cost amortized.
+void arr_struct_reset(a: Arr) {
+    a.count = 0;
+}
+
+// Release the backing buffer + the handle itself. Pairs 1:1
+// with `arr_struct_new`. After this call the handle pointer is
+// dangling and must not be reused.
+void arr_struct_free(a: Arr) {
+    free(a.buf);
+    free(a);
+}

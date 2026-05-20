@@ -41,6 +41,18 @@ BUILD_DIR="/tmp/bpp_run_all_c"
 RESULTS="$BUILD_DIR/.results"
 SELF="$REPO_ROOT/tests/run_all_c.sh"
 
+# Pin cwd to the repo root so:
+#   1. find_file() picks up `src/`, `stb/`, and `ffi/` relative to the
+#      project (matters before `install.sh` has placed prelude modules
+#      under `/usr/local/lib/bpp/`).
+#   2. tests that load fixtures via relative paths
+#      (e.g. `games/rhythm/assets/beat_map.txt`) resolve the same way as
+#      under run_all.sh, which already pins cwd.
+# Without this, running `tests/run_all_c.sh` from inside `tests/`
+# silently failed asset_wav / beat_map / modulab_handdiff at the run
+# stage and test_bpp_arr at the emit stage.
+cd "$REPO_ROOT"
+
 # Per-step time budgets in seconds. The cap exists to protect the host
 # CPU when the C emitter or clang or the resulting binary hangs — without
 # this, a single bad test pins a core for the whole run.

@@ -38,17 +38,23 @@ load   "wc1_movement.bsm";
 load   "wc1_combat.bsm";
 load   "wc1_missiles.bsm";
 load   "wc1_regen.bsm";
+load   "wc1_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
+load   "wc1_production.bsm";  // S8 — construction state-machine tick
 
 // ── Constants ────────────────────────────────────────────
 
-// Virtual screen: 20 × 15 tiles at 16 px each = 320 × 240. Same
-// chunky-pixel-art shape as the original WC1 viewport (320 × 200
-// + a bit of HUD allowance). forest1 is 64×64 tiles total; with
-// no camera yet (Session 4 work), only the top-left 20×15 region
-// is visible. The actual window is auto-scaled to fit ~80% of
-// the monitor by stbgame's Phase 4.1.3 logic.
-const SCREEN_W = 320;
-const SCREEN_H = 240;
+// Virtual screen: 30 × ~17 tiles at 16 px each = 480 × 270. 16:9
+// aspect ratio so a modern monitor (1920×1080, 2560×1440, 3840×2160)
+// hits an exact integer scale and presents WITHOUT letterbox —
+// 4× at 1080p, 5⅓ clamped to 5 at 1440p (still tight), 8× at 4K.
+// Wider strategic view than the WC1 original's 320×200 viewport
+// (the original's narrow viewport made sense when monitors were
+// 4:3 and the HUD ate the right quarter of the screen; we keep
+// the HUD scenic and let the player see more battlefield).
+// forest1 is 64×64 tiles = 1024×1024 world pixels, so the camera
+// can pan freely in both axes.
+const SCREEN_W = 480;
+const SCREEN_H = 270;
 
 // ── Game state ───────────────────────────────────────────
 
@@ -79,6 +85,47 @@ extrn necrolyte_atlas, warlock_atlas;
 extrn human_catapult_atlas, orc_catapult_atlas;
 extrn lothar_atlas, medivh_atlas;
 extrn arrow_atlas;
+
+// S8 — building atlases. Two PNGs per building (completed +
+// 3-frame construction strip) per faction, except keep / spire
+// which ship completed-only (NotConstructable per buildings.lua —
+// they're campaign-given, not player-built). Pre-loaded at boot
+// so the production tick can flip a foundation into a finished
+// building with a zero-allocation atlas swap.
+//
+// Naming: `<faction>_<role>[_construction]_atlas`. The _atlas
+// suffix matches the unit-atlas convention (peasant_atlas, etc.);
+// the leading faction prefix keeps human + orc atlas slots
+// distinct since the on-disk basename collides ("barracks.png"
+// in both folders).
+extrn human_town_hall_atlas, human_town_hall_construct_atlas;
+extrn human_farm_atlas, human_farm_construct_atlas;
+extrn human_barracks_atlas, human_barracks_construct_atlas;
+extrn human_lumber_mill_atlas, human_lumber_mill_construct_atlas;
+extrn human_blacksmith_atlas, human_blacksmith_construct_atlas;
+extrn human_stable_atlas, human_stable_construct_atlas;
+extrn human_church_atlas, human_church_construct_atlas;
+extrn human_tower_atlas, human_tower_construct_atlas;
+extrn stormwind_keep_atlas;            // NotConstructable: completed only
+extrn orc_town_hall_atlas, orc_town_hall_construct_atlas;
+extrn orc_farm_atlas, orc_farm_construct_atlas;
+extrn orc_barracks_atlas, orc_barracks_construct_atlas;
+extrn orc_lumber_mill_atlas, orc_lumber_mill_construct_atlas;
+extrn orc_blacksmith_atlas, orc_blacksmith_construct_atlas;
+extrn orc_kennel_atlas, orc_kennel_construct_atlas;
+extrn orc_temple_atlas, orc_temple_construct_atlas;
+extrn orc_tower_atlas, orc_tower_construct_atlas;
+extrn blackrock_spire_atlas;           // NotConstructable: completed only
+
+// S8.5 — authentic WC1 HUD atlases. portrait_icons holds the 93-
+// frame strip of mini-unit-portraits (27×19 each) the command
+// card uses to show a per-selection picture; icon_border wraps
+// any portrait in the WC1-faithful frame; bottom_panel is the
+// 240×12 strip we tile across the bottom of the canvas as the
+// divider between the game viewport and the HUD area.
+extrn portrait_icons_atlas;
+extrn icon_border_atlas;
+extrn bottom_panel_atlas;
 
 // Camera handle — owned by main, read by tile_draw and the per-
 // entity render callback (which extrn's it). cam_pan / cam_set
@@ -130,7 +177,67 @@ static _load_wc1_atlas(name: ptr) {
     return atlas;
 }
 
-// Release every unit atlas + the missile atlas. Safe to call with
+// Building-atlas loader. Same wrap as _load_wc1_atlas but rooted
+// at `assets/sprites/wc1/buildings/<faction>/<name>` so the
+// per-faction nesting the converter writes is honored. Hot-reload
+// enabled so a Bang 9 edit on the JSON or PNG re-propagates into
+// the running game in ~30 ms — same rail every unit atlas uses.
+// HUD-atlas loader. Same shape as `_load_wc1_building_atlas` but
+// rooted at `assets/sprites/wc1/hud/<faction>/<name>` — the
+// hand-converted WC1 panels + portrait strip live there per
+// the asset-conversion pass in S8.5. The faction segment is
+// `forest` for the portrait icons (tileset-shared sprite, the
+// same strip works for both player colors after palette swap),
+// `human` for the human player chrome, `orc` for the orc set.
+static _load_wc1_hud_atlas(faction: ptr, name: ptr) {
+    auto path, full, atlas;
+    auto prefix: ptr, sep: ptr;
+    auto prefix_len, faction_len, sep_len, name_len, off;
+    prefix      = "assets/sprites/wc1/hud/";
+    sep         = "/";
+    prefix_len  = str_len(prefix);
+    faction_len = str_len(faction);
+    sep_len     = str_len(sep);
+    name_len    = str_len(name);
+    full = malloc(prefix_len + faction_len + sep_len + name_len + 1);
+    off = 0;
+    str_cpy(full + off, prefix);  off = off + prefix_len;
+    str_cpy(full + off, faction); off = off + faction_len;
+    str_cpy(full + off, sep);     off = off + sep_len;
+    str_cpy(full + off, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+static _load_wc1_building_atlas(faction: ptr, name: ptr) {
+    auto path, full, atlas;
+    auto prefix: ptr, sep: ptr;
+    auto prefix_len, faction_len, sep_len, name_len, off;
+    prefix      = "assets/sprites/wc1/buildings/";
+    sep         = "/";
+    prefix_len  = str_len(prefix);
+    faction_len = str_len(faction);
+    sep_len     = str_len(sep);
+    name_len    = str_len(name);
+    full = malloc(prefix_len + faction_len + sep_len + name_len + 1);
+    off = 0;
+    str_cpy(full + off, prefix);  off = off + prefix_len;
+    str_cpy(full + off, faction); off = off + faction_len;
+    str_cpy(full + off, sep);     off = off + sep_len;
+    str_cpy(full + off, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+// Release every unit + building + missile atlas. Safe to call with
 // partially-loaded state (image_free is null-tolerant). Called by
 // the failure path during init AND by the normal shutdown.
 static void _free_all_atlases() {
@@ -151,6 +258,43 @@ static void _free_all_atlases() {
     image_free(lothar_atlas);
     image_free(medivh_atlas);
     image_free(arrow_atlas);
+    image_free(human_town_hall_atlas);
+    image_free(human_town_hall_construct_atlas);
+    image_free(human_farm_atlas);
+    image_free(human_farm_construct_atlas);
+    image_free(human_barracks_atlas);
+    image_free(human_barracks_construct_atlas);
+    image_free(human_lumber_mill_atlas);
+    image_free(human_lumber_mill_construct_atlas);
+    image_free(human_blacksmith_atlas);
+    image_free(human_blacksmith_construct_atlas);
+    image_free(human_stable_atlas);
+    image_free(human_stable_construct_atlas);
+    image_free(human_church_atlas);
+    image_free(human_church_construct_atlas);
+    image_free(human_tower_atlas);
+    image_free(human_tower_construct_atlas);
+    image_free(stormwind_keep_atlas);
+    image_free(orc_town_hall_atlas);
+    image_free(orc_town_hall_construct_atlas);
+    image_free(orc_farm_atlas);
+    image_free(orc_farm_construct_atlas);
+    image_free(orc_barracks_atlas);
+    image_free(orc_barracks_construct_atlas);
+    image_free(orc_lumber_mill_atlas);
+    image_free(orc_lumber_mill_construct_atlas);
+    image_free(orc_blacksmith_atlas);
+    image_free(orc_blacksmith_construct_atlas);
+    image_free(orc_kennel_atlas);
+    image_free(orc_kennel_construct_atlas);
+    image_free(orc_temple_atlas);
+    image_free(orc_temple_construct_atlas);
+    image_free(orc_tower_atlas);
+    image_free(orc_tower_construct_atlas);
+    image_free(blackrock_spire_atlas);
+    image_free(portrait_icons_atlas);
+    image_free(icon_border_atlas);
+    image_free(bottom_panel_atlas);
 }
 
 // ── Entry point ──────────────────────────────────────────
@@ -165,6 +309,15 @@ main() {
     // explicitly).
     game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
     render_init();
+    // S8.5 — initialize the stbui layout-engine node pool + stbhud
+    // GPU walker. Both are idempotent so the order with respect to
+    // other inits doesn't matter; calling them once at boot before
+    // the game loop is what counts. wc1_hud's command-card strip
+    // declaration flows through ui_layout_begin / ui_box / hud_image
+    // and `hud_render` walks the resulting node tree via the GPU
+    // primitives inside `game_render_begin / end`.
+    init_ui_layout();
+    init_hud();
 
     // Resolve the forest tileset against the binary's own location
     // — works from any CWD as long as the binary lives somewhere
@@ -236,6 +389,54 @@ main() {
     medivh_atlas         = _load_wc1_atlas("medivh.json");
     arrow_atlas          = _load_wc1_atlas("arrow.json");
 
+    // S8 — building atlases. Two per constructable building
+    // (completed + 3-frame construction strip), one for keep /
+    // spire (NotConstructable per buildings.lua). 34 atlases
+    // total across both factions. Same hot-reload rail as units.
+    human_town_hall_atlas             = _load_wc1_building_atlas("human", "town_hall.json");
+    human_town_hall_construct_atlas   = _load_wc1_building_atlas("human", "town_hall_construction.json");
+    human_farm_atlas                  = _load_wc1_building_atlas("human", "farm.json");
+    human_farm_construct_atlas        = _load_wc1_building_atlas("human", "farm_construction.json");
+    human_barracks_atlas              = _load_wc1_building_atlas("human", "barracks.json");
+    human_barracks_construct_atlas    = _load_wc1_building_atlas("human", "barracks_construction.json");
+    human_lumber_mill_atlas           = _load_wc1_building_atlas("human", "lumber_mill.json");
+    human_lumber_mill_construct_atlas = _load_wc1_building_atlas("human", "lumber_mill_construction.json");
+    human_blacksmith_atlas            = _load_wc1_building_atlas("human", "blacksmith.json");
+    human_blacksmith_construct_atlas  = _load_wc1_building_atlas("human", "blacksmith_construction.json");
+    human_stable_atlas                = _load_wc1_building_atlas("human", "stable.json");
+    human_stable_construct_atlas      = _load_wc1_building_atlas("human", "stable_construction.json");
+    human_church_atlas                = _load_wc1_building_atlas("human", "church.json");
+    human_church_construct_atlas      = _load_wc1_building_atlas("human", "church_construction.json");
+    human_tower_atlas                 = _load_wc1_building_atlas("human", "tower.json");
+    human_tower_construct_atlas       = _load_wc1_building_atlas("human", "tower_construction.json");
+    stormwind_keep_atlas              = _load_wc1_building_atlas("human", "stormwind_keep.json");
+    orc_town_hall_atlas               = _load_wc1_building_atlas("orc",   "town_hall.json");
+    orc_town_hall_construct_atlas     = _load_wc1_building_atlas("orc",   "town_hall_construction.json");
+    orc_farm_atlas                    = _load_wc1_building_atlas("orc",   "farm.json");
+    orc_farm_construct_atlas          = _load_wc1_building_atlas("orc",   "farm_construction.json");
+    orc_barracks_atlas                = _load_wc1_building_atlas("orc",   "barracks.json");
+    orc_barracks_construct_atlas      = _load_wc1_building_atlas("orc",   "barracks_construction.json");
+    orc_lumber_mill_atlas             = _load_wc1_building_atlas("orc",   "lumber_mill.json");
+    orc_lumber_mill_construct_atlas   = _load_wc1_building_atlas("orc",   "lumber_mill_construction.json");
+    orc_blacksmith_atlas              = _load_wc1_building_atlas("orc",   "blacksmith.json");
+    orc_blacksmith_construct_atlas    = _load_wc1_building_atlas("orc",   "blacksmith_construction.json");
+    orc_kennel_atlas                  = _load_wc1_building_atlas("orc",   "kennel.json");
+    orc_kennel_construct_atlas        = _load_wc1_building_atlas("orc",   "kennel_construction.json");
+    orc_temple_atlas                  = _load_wc1_building_atlas("orc",   "temple.json");
+    orc_temple_construct_atlas        = _load_wc1_building_atlas("orc",   "temple_construction.json");
+    orc_tower_atlas                   = _load_wc1_building_atlas("orc",   "tower.json");
+    orc_tower_construct_atlas         = _load_wc1_building_atlas("orc",   "tower_construction.json");
+    blackrock_spire_atlas             = _load_wc1_building_atlas("orc",   "blackrock_spire.json");
+
+    // S8.5 — authentic WC1 HUD atlases. Loaded once at boot from
+    // `assets/sprites/wc1/hud/{forest,human}/<name>.json` so the
+    // command card can swap in real portraits + frame chrome
+    // without per-frame allocation. Hot-reload enabled so tweaks
+    // to the source PNG propagate live.
+    portrait_icons_atlas = _load_wc1_hud_atlas("forest", "portrait_icons.json");
+    icon_border_atlas    = _load_wc1_hud_atlas("human",  "icon_border.json");
+    bottom_panel_atlas   = _load_wc1_hud_atlas("human",  "bottom_panel.json");
+
     // Single failure check covers the whole batch — image_free(0)
     // is a no-op so _free_all_atlases handles partial loads
     // cleanly without per-atlas cascading.
@@ -247,8 +448,20 @@ main() {
         necrolyte_atlas == 0 || warlock_atlas == 0 ||
         human_catapult_atlas == 0 || orc_catapult_atlas == 0 ||
         lothar_atlas == 0 || medivh_atlas == 0 ||
-        arrow_atlas  == 0) {
-        put_err("rts: one or more unit atlases failed to load — exiting\n");
+        arrow_atlas  == 0 ||
+        human_town_hall_atlas == 0 || human_farm_atlas == 0 ||
+        human_barracks_atlas == 0 || human_lumber_mill_atlas == 0 ||
+        human_blacksmith_atlas == 0 || human_stable_atlas == 0 ||
+        human_church_atlas == 0 || human_tower_atlas == 0 ||
+        stormwind_keep_atlas == 0 ||
+        orc_town_hall_atlas == 0 || orc_farm_atlas == 0 ||
+        orc_barracks_atlas == 0 || orc_lumber_mill_atlas == 0 ||
+        orc_blacksmith_atlas == 0 || orc_kennel_atlas == 0 ||
+        orc_temple_atlas == 0 || orc_tower_atlas == 0 ||
+        blackrock_spire_atlas == 0 ||
+        portrait_icons_atlas == 0 || icon_border_atlas == 0 ||
+        bottom_panel_atlas == 0) {
+        put_err("rts: one or more atlases failed to load — exiting\n");
         _free_all_atlases();
         wc1_map_free(map);
         free(_map_json_path);
@@ -263,9 +476,18 @@ main() {
     // ECS world + per-game wiring. unit_defs_init populates the
     // unit kind table; ecs_wire registers components + the peasant
     // archetype + the render query. Both run once at startup.
+    // S8 — building_defs_init populates the 9-kind BuildingDef
+    // table; buildings_wire registers the Building component + a
+    // SECOND archetype + a mask-filtered query that walks only
+    // building entities (Rule 30 — distinct component set warrants
+    // archetype fan-out). Order matters: buildings_wire references
+    // pos_comp / faction_comp / sheet_comp which ecs_wire registers,
+    // so it MUST come after.
     unit_defs_init();
+    building_defs_init();
     world = ecs_new(256);
     ecs_wire(world);
+    buildings_wire(world);
 
     // Seed the camera before unit spawn so the start_view consumer
     // can override it. cam_new lands at (0, 0); the seeder
@@ -297,6 +519,7 @@ main() {
         _camera_pan_tick();
         wc1_input_tick(world);
         _debug_spawn_tick();
+        _debug_spawn_building_tick();
         // Combat runs BEFORE movement so attackers can request a
         // fresh path-to-target this frame and the movement tick
         // walks them toward weapon range immediately. Missiles
@@ -306,10 +529,19 @@ main() {
         wc1_movement_tick(world);
         wc1_missiles_tick(world);
         wc1_regen_tick(world);
+        // Production tick — advances every CONSTRUCTING building's
+        // progress + scaffolding-animation clock. Flips state to
+        // DONE the first frame progress_ms crosses
+        // BuildingDef.construction_time_ms.
+        wc1_production_tick(world);
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
         tile_draw(tm, cam_x(cam), cam_y(cam), SCREEN_W, SCREEN_H);
+        // Buildings render AFTER the tilemap but BEFORE units so
+        // units overlap building footprints when they walk past
+        // (classic RTS draw order — units in front of structures).
+        ecs_render_buildings(world);
         ecs_render_units(world);
         wc1_missiles_render();
         wc1_hud_render(world);
@@ -448,6 +680,13 @@ static void _debug_spawn_tick() {
     //   ]     → catapult (orc siege)           player 1
     //   ;     → lothar   (human hero)          player 0
     //   '     → medivh   (orc hero / mage)     player 1
+    //
+    // Modifier keys route the number keys to building spawn
+    // instead — Shift = human, Ctrl = orc; see
+    // _debug_spawn_building_tick. Early-return here so the same
+    // key doesn't fire both spawns in one frame.
+    if (key_down(KEY_SHIFT) != 0) { return; }
+    if (key_down(KEY_CTRL)  != 0) { return; }
     atlas  = 0;
     kind   = 0 - 1;
     player = 0;
@@ -513,6 +752,136 @@ static void _debug_spawn_tick() {
             ecs_spawn_unit(world, atlas, sx, sy, player, kind);
         }
     }
+}
+
+// S8 debug-spawn for buildings. The modifier-key route picks the
+// faction; the number key picks the building kind. Cursor decides
+// the foundation tile.
+//
+//   Shift+1 → Town Hall (human)      Shift+6 → Stable
+//   Shift+2 → Farm                   Shift+7 → Church
+//   Shift+3 → Barracks               Shift+8 → Tower
+//   Shift+4 → Lumber Mill            Shift+9 → Stormwind Keep
+//   Shift+5 → Blacksmith                       (spawns DONE —
+//                                              NotConstructable)
+//
+//   Ctrl+1 → Town Hall (orc)         Ctrl+6 → Kennel
+//   Ctrl+2 → Farm                    Ctrl+7 → Temple
+//   Ctrl+3 → Barracks                Ctrl+8 → Tower
+//   Ctrl+4 → Lumber Mill             Ctrl+9 → Blackrock Spire
+//   Ctrl+5 → Blacksmith                       (spawns DONE)
+//
+// Both routes go through `ecs_spawn_building` so faction tagging
+// is just the `player` argument (0 = human, 1 = orc). Tile
+// occupancy + assignment slot wire identically.
+static void _debug_spawn_building_tick() {
+    auto mx, my, wx, wy, gx, gy;
+    auto atlas_idle, atlas_construct, kind, player;
+    auto shift_held, ctrl_held;
+    shift_held = key_down(KEY_SHIFT);
+    ctrl_held  = key_down(KEY_CTRL);
+    if (shift_held == 0 && ctrl_held == 0) { return; }
+    atlas_idle      = 0;
+    atlas_construct = 0;
+    kind            = 0 - 1;
+    player          = ctrl_held != 0 ? 1 : 0;
+    if (shift_held != 0) {
+        if (key_pressed(KEY_1) != 0) {
+            atlas_idle = human_town_hall_atlas;
+            atlas_construct = human_town_hall_construct_atlas;
+            kind = BLDG_TOWN_HALL;
+        } else if (key_pressed(KEY_2) != 0) {
+            atlas_idle = human_farm_atlas;
+            atlas_construct = human_farm_construct_atlas;
+            kind = BLDG_FARM;
+        } else if (key_pressed(KEY_3) != 0) {
+            atlas_idle = human_barracks_atlas;
+            atlas_construct = human_barracks_construct_atlas;
+            kind = BLDG_BARRACKS;
+        } else if (key_pressed(KEY_4) != 0) {
+            atlas_idle = human_lumber_mill_atlas;
+            atlas_construct = human_lumber_mill_construct_atlas;
+            kind = BLDG_LUMBER_MILL;
+        } else if (key_pressed(KEY_5) != 0) {
+            atlas_idle = human_blacksmith_atlas;
+            atlas_construct = human_blacksmith_construct_atlas;
+            kind = BLDG_BLACKSMITH;
+        } else if (key_pressed(KEY_6) != 0) {
+            atlas_idle = human_stable_atlas;
+            atlas_construct = human_stable_construct_atlas;
+            kind = BLDG_STABLE;
+        } else if (key_pressed(KEY_7) != 0) {
+            atlas_idle = human_church_atlas;
+            atlas_construct = human_church_construct_atlas;
+            kind = BLDG_CHURCH;
+        } else if (key_pressed(KEY_8) != 0) {
+            atlas_idle = human_tower_atlas;
+            atlas_construct = human_tower_construct_atlas;
+            kind = BLDG_TOWER;
+        } else if (key_pressed(KEY_9) != 0) {
+            // Keep ships completed-only — passing 0 for construct
+            // tells ecs_spawn_building to skip the CONSTRUCTING
+            // state and spawn DONE on frame 0.
+            atlas_idle = stormwind_keep_atlas;
+            atlas_construct = 0;
+            kind = BLDG_KEEP;
+        } else {
+            return;
+        }
+    } else {
+        // ctrl_held — orc faction. Same kinds map; different atlases.
+        if (key_pressed(KEY_1) != 0) {
+            atlas_idle = orc_town_hall_atlas;
+            atlas_construct = orc_town_hall_construct_atlas;
+            kind = BLDG_TOWN_HALL;
+        } else if (key_pressed(KEY_2) != 0) {
+            atlas_idle = orc_farm_atlas;
+            atlas_construct = orc_farm_construct_atlas;
+            kind = BLDG_FARM;
+        } else if (key_pressed(KEY_3) != 0) {
+            atlas_idle = orc_barracks_atlas;
+            atlas_construct = orc_barracks_construct_atlas;
+            kind = BLDG_BARRACKS;
+        } else if (key_pressed(KEY_4) != 0) {
+            atlas_idle = orc_lumber_mill_atlas;
+            atlas_construct = orc_lumber_mill_construct_atlas;
+            kind = BLDG_LUMBER_MILL;
+        } else if (key_pressed(KEY_5) != 0) {
+            atlas_idle = orc_blacksmith_atlas;
+            atlas_construct = orc_blacksmith_construct_atlas;
+            kind = BLDG_BLACKSMITH;
+        } else if (key_pressed(KEY_6) != 0) {
+            atlas_idle = orc_kennel_atlas;
+            atlas_construct = orc_kennel_construct_atlas;
+            kind = BLDG_STABLE;        // kennel is the orc variant of stable
+        } else if (key_pressed(KEY_7) != 0) {
+            atlas_idle = orc_temple_atlas;
+            atlas_construct = orc_temple_construct_atlas;
+            kind = BLDG_CHURCH;        // temple is the orc variant of church
+        } else if (key_pressed(KEY_8) != 0) {
+            atlas_idle = orc_tower_atlas;
+            atlas_construct = orc_tower_construct_atlas;
+            kind = BLDG_TOWER;
+        } else if (key_pressed(KEY_9) != 0) {
+            atlas_idle = blackrock_spire_atlas;
+            atlas_construct = 0;
+            kind = BLDG_KEEP;
+        } else {
+            return;
+        }
+    }
+    if (atlas_idle == 0) { return; }
+
+    mx = mouse_x();
+    my = mouse_y();
+    wx = cam_screen_to_world_x(cam, mx);
+    wy = cam_screen_to_world_y(cam, my);
+    gx = wx / 16;
+    gy = wy / 16;
+    if (gx < 0) { gx = 0; }
+    if (gy < 0) { gy = 0; }
+    ecs_spawn_building(world, atlas_idle, atlas_construct, gx, gy,
+                       player, kind);
 }
 
 // Per-frame camera pan. Arrow keys + WASD push the camera at the

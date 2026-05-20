@@ -101,6 +101,9 @@ struct ArchetypeRec {
     comp_ids,            // arr<comp_id>: which components live here
     comp_sizes,          // arr<int>:    byte size per component (parallel)
     comp_offsets,        // arr<int>:    offset within a chunk per component
+    comp_bitmask,        // 1 << comp_id for each id — used by ecs_query_each
+                         //                            to filter archetypes
+                         //                            via the caller's mask
     entities_per_chunk,  // computed from chunk_payload / sum(comp_sizes)
     chunks,              // arr<ptr>:    each entry is a raw byte buffer
     chunk_count,         // chunks allocated
@@ -210,7 +213,7 @@ ecs_component_register(w, name_str, size_bytes) {
 // comes first, then component 1's array, etc.), so iteration order
 // is predictable across architectures.
 ecs_archetype(w, comp_ids, n_comps) {
-    auto wd: World, ar: ArchetypeRec, i, sz, off, sum;
+    auto wd: World, ar: ArchetypeRec, i, sz, off, sum, mask;
     wd = w;
     ar = malloc(sizeof(ArchetypeRec));
     ar.arch_idx = wd.archetype_count;
@@ -219,12 +222,22 @@ ecs_archetype(w, comp_ids, n_comps) {
     ar.comp_sizes = buf_word(n_comps);
     ar.comp_offsets = buf_word(n_comps);
     sum = 0;
+    mask = 0;
     for (i = 0; i < n_comps; i++) {
         ar.comp_ids[i] = comp_ids[i];
         sz = arr_get(wd.comp_sizes, comp_ids[i]);
         ar.comp_sizes[i] = sz;
         sum = sum + sz;
+        // Build the archetype's component bitmask. ecs_query_each
+        // uses this to filter archetypes whose component bundle
+        // satisfies the caller's required-component mask — the
+        // shipped path for multi-archetype games (e.g. wc1 units
+        // + buildings). Component ids must stay < 64 for the
+        // bitmask to fit a word; that's well within the typical
+        // game's component count (~10).
+        mask = mask | (1 << comp_ids[i]);
     }
+    ar.comp_bitmask = mask;
     // entities_per_chunk = floor(payload / sum_sizes). Guard against
     // a zero-sum archetype (no components, or all zero-sized) by
     // forcing at least 1 entity per chunk so spawn paths never divide
@@ -555,12 +568,17 @@ ecs_query(w, comp_mask) {
 // arch_idx + 1, low 32 bits = row). Callbacks treat the id as
 // opaque and pass it back to ecs_get / ecs_kill_at unchanged.
 void ecs_query_each(q, fn) {
-    auto eq: EcsQuery, w: World, i, ai, ar: ArchetypeRec, row;
+    auto eq: EcsQuery, w: World, i, ai, ar: ArchetypeRec, row, mask;
     eq = q;
     w = eq.world;
+    mask = eq.comp_mask;
     // Legacy entities — skip-dead walk over the alive bitmap. Same
     // hot path Session 1 shipped; archetype entities are tracked
-    // separately and don't appear in this bitmap.
+    // separately and don't appear in this bitmap. Legacy entities
+    // carry no archetype tag, so any caller-supplied `mask` cannot
+    // discriminate them — they always match. Legacy use is now rare
+    // (every shipped game uses archetypes); when the path retires
+    // entirely this branch comes out.
     for (i = 0; i < w.capacity; i++) {
         if (peek(w.alive + i)) {
             call(fn, w, i);
@@ -570,11 +588,21 @@ void ecs_query_each(q, fn) {
     // slot that has ever been spawned. The alive bitmap tells
     // which of those slots are currently live (slots vacated by
     // ecs_kill_at have alive[row] == 0 and stay until recycled).
-    // Iterate in row order so callbacks see ids in sequence;
-    // skip-dead via a single peek so the dead-row cost is one
-    // byte read per slot.
+    //
+    // Mask filter: skip archetypes whose component bundle does not
+    // contain every bit the caller required. `mask == 0` means
+    // "no requirement" and matches every archetype (the legacy
+    // shape every pre-multi-archetype game uses). When `mask` is
+    // a single component bit (e.g. `1 << unit_comp`), only the
+    // archetype that owns that component fires its callbacks —
+    // the shipped path for wc1's unit / building split.
+    //
+    // Iterate in row order so callbacks see ids in sequence; skip-
+    // dead via a single peek so the dead-row cost is one byte read
+    // per slot.
     for (ai = 0; ai < w.archetype_count; ai++) {
         ar = arr_get(w.archetypes, ai);
+        if (mask != 0 && (ar.comp_bitmask & mask) != mask) { continue; }
         for (row = 0; row < ar.total_entities; row++) {
             if (peek(ar.alive + row) == 0) { continue; }
             call(fn, w, _ecs_encode_id(ai, row));

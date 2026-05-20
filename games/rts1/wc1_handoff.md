@@ -589,71 +589,363 @@ end of session.
 **Commits**: bundled at S7 closeout — `WC1 S7 CLOSED: full combat
 arc + 14-unit roster + Tier-2 stbprojectile`.
 
-### Session 8.0 — Pre-flight sidequests (open at S7 closeout)
+### Session 8.0 — Pre-flight sidequests (CLOSED 2026-05-19)
 
 Caught during the manual smoke of the full S7 roster; landed in
-the S7 closeout commit as pending issues to address before the
-S8 building work begins.
+the S7 closeout commit as pending issues. Both shipped 2026-05-19
+in the run-up to S8.
 
-**8.0a — Catapult animation polish.** The human catapult and orc
-catapult atlases ship from war1tool byte-identical (faithful to
-WC1 1994 — faction-distinction only landed in WC2). Visually
-correct per source bundle, but the in-game catapult animation
-under combat looks stiff vs the SC1-paced melee animations
-around it. Two angles to investigate:
+**8.0a — Catapult animation polish (CLOSED).** Smallest-tool fix
+per Rule 28: bumped the attack-tag frame duration on
+`assets/sprites/wc1/human_catapult.json` and `orc_catapult.json`
+from 100 ms to 400 ms (only the tag-start frames — 10 / 15 / 20 /
+25 / 30 — since `stbimage`'s loader reads the per-tag rate from
+the first frame). Five frames × 400 ms = 2000 ms, which exactly
+fills the catapult's 2000 ms cooldown, so the unit reads as
+continuously swinging instead of twitching once per cooldown. No
+code change; preserves byte-stable bootstrap. **Maintenance
+note**: `wc1_sprite_convert` emits a global 100 ms duration for
+every frame. Re-running the converter against the catapult atlases
+would silently regress the tuning — re-apply the 400 ms bump after
+any conversion pass or teach the converter a per-unit override
+when the next siege unit lands.
 
-- Per-frame timing — the 2,5,3 schema's 5 attack frames may be
-  cycling too fast (default 100 ms per frame ≈ 500 ms full attack
-  cycle, but a catapult fires every 2000 ms per its cooldown,
-  so the rest of the cycle is idle-static — looks like the
-  catapult "twitches" once per cooldown).
-- Faction tint — even if the original assets are byte-identical,
-  a runtime palette swap on the orc catapult (red flags / orange
-  tint) would help players read the unit at a glance without
-  needing a sprite redraw.
+Faction-tint variant (orc catapult palette swap) intentionally
+deferred per Rule 28 — wait for `stbpal` + atlas-runtime-recolor
+to earn its second consumer.
 
-Defer the palette swap until `stbpal` + atlas-runtime-recolor is
-exercised in another consumer (Rule 28). Frame-timing fix is
-local to `wc1_anims` + a per-state duration override.
+**8.0b — Window resize breaks mouse centering (CLOSED, 2026-05-19
+→ 20).** Three iterations before the right fix landed; the final
+shape is two surgical additions to the macOS platform layer +
+a canvas-aspect bump in rts1.
 
-**8.0b — Window resize breaks mouse centering.** Resizing the
-running game's window mid-session (drag the window edge) breaks
-the cursor → world-coord transform. The `cam_screen_to_world_x/y`
-math reads from a SCREEN_W / SCREEN_H constant baked at game_init
-time; the underlying NSView grows but the camera viewport stays
-nailed to 320×240, so the cursor sample maps to the wrong tile
-once the window doesn't match.
+**Iteration 1 (reverted):** added `game_set_window_nonresizable()`
+opt-in in stbgame + macOS `_stb_set_window_resizable` clearing
+the NSResizable bit. Rts1 locked its window. User pushed back —
+losing drag-resize was a capability regression, not a feature.
 
-Two paths:
-- Lock window size at game_init (cheapest — disables the user's
-  drag-resize, but matches WC1 1994 fixed-resolution behaviour).
-- Plumb a `game_window_size(&w, &h)` accessor through stbgame +
-  recompute SCREEN_W / SCREEN_H + cam viewport on every frame
-  (proper fix, but touches stbcamera + stbinput coordinate
-  conversion). Worth doing right when a future game (rpg
-  Dungeon, top-down adventure) wants resize support genuinely.
+**Iteration 2 (reverted):** rewrote the macOS mouse handler to
+compute live integer scale + letterbox offsets every event,
+mirroring `game_compute_present_rect`. Math was technically
+correct, but a new bug surfaced: every time the user finished
+a window drag-resize, a phantom marquee appeared and persisted
+until the user clicked the map. Root cause was event-loss during
+system gestures, not the math — Cocoa silently consumes the
+`NSEventTypeLeftMouseUp` event that ends a window-resize drag,
+so `_stb_mouse_btn` stayed at 1 even though the button was
+physically released. The math rewrite exposed this more readily
+because clicks worked correctly, so the latched button state
+triggered drag-select on every subsequent mouse move.
 
-Likely the first path for v1; the second graduates into stb when
-a real consumer needs runtime resize. See `feedback_phase_
-overengineering_lesson` — don't build the generic fix without a
-second consumer.
+**Iteration 3 (shipped, two-spot diff in `_stb_platform_macos.bsm`):**
 
-### Session 8 — Buildings + construction (~3-4h)
+1. Mouse handler reverted to the original `_plt_scale`-based math
+   (no letterbox accounting — small visual offset on non-integer-
+   scale resizes, but no math regression). The resize poll inside
+   `_stb_poll_events` now recomputes `_plt_scale` live:
+   `_plt_scale = max(1, min(cur_w / _stb_w, cur_h / _stb_h))`.
+   Mouse coords stay aligned with the visible framebuffer under
+   any user drag-resize.
+2. End of `_stb_poll_events` syncs `_stb_mouse_btn` to
+   `[NSEvent pressedMouseButtons]` — the OS-truth bitmask, masked
+   to bits 0-2 (left / right / middle). Self-heals the
+   LeftMouseUp events Cocoa swallows during system gestures
+   (window resize, title-bar drag, dock interactions). No more
+   phantom marquee after the user finishes a resize gesture.
 
-**Goal**: place foundation, peasant walks to it, construction
-animation runs, building completes. Town hall, farm, barracks
-playable.
+Linux `_stb_platform_linux.bsm` mouse handler is unchanged this
+pass — the X11 path has its own coordinate decode that already
+reads from live state. When parity work lands it will mirror
+the same `_plt_scale`-update + button-state-sync pattern.
 
-**Files**:
-- `wc1_buildings.bsm` — building type table (port of buildings.lua).
-- `wc1_production.bsm` — construction state machine.
+**Bonus — canvas aspect change.** Bumped rts1's virtual canvas
+from 320×240 (4:3) to **480×270** (16:9) in `rts.bpp:50-51`.
+Modern monitors are 16:9; the old 4:3 canvas always letterboxed
+on widescreen. New behaviour:
 
-**Tool prep**: `wc1_sprite_convert` gains a `--mode building`
-code path. Buildings differ structurally from units — single
-still frame + collapse cycle, no per-direction layout, no
-attack/walk/die round-robin. The construction animation (the
-peasant scaffolding overlay) is a separate animation that lives
-on top of the building sprite, not inside it.
+| Monitor | Scale | Letterbox |
+|---|---|---|
+| 1080p (1920×1080) | 4× | **none** |
+| 4K (3840×2160) | 8× | **none** |
+| 1440p (2560×1440) | 5× | thin (480 isn't a factor of 2560) |
+| MacBook retina interior | 3× | thin |
+
+Strategic-view side win: 30×17 tiles visible instead of 20×15 —
+more battlefield, closer to a modern RTS feel. WC1 1994's
+original 14×11-ish viewport stays a stylistic reference, not a
+constraint.
+
+The fully-letterbox-clean alternative would have been 320×180
+(pathfind's canvas, fits every 16:9 monitor at exact integer
+scale). Traded that for the strategic-view gain. Easy to flip
+later if a 1440p user wants zero letterbox at the cost of fewer
+visible tiles.
+
+### Session 8 — Buildings + construction (CLOSED 2026-05-20)
+
+**Goal hit**: place foundation, peasant walks to it (right-click
+on the foundation while a peasant is selected), construction
+animation plays while the peasant chops, building completes.
+All 9 WC1 building kinds (town hall, farm, barracks, lumber
+mill, blacksmith, stable / kennel, church / temple, tower,
+keep / spire) wired for both factions; Shift+1..9 spawns human,
+Ctrl+1..9 spawns orc.
+
+**Shipped this session** (`games/rts1/`):
+- `wc1_buildings.bsm` (new) — 9-kind BuildingDef table sourced
+  from `war1gus/scripts/buildings.lua` numbers, Building ECS
+  component, second archetype + mask-filtered query, hit-test
+  helper, assignment helper that picks a free perimeter tile
+  + commands the peasant via the existing movement rail.
+- `wc1_production.bsm` (new) — construction state machine. The
+  tick gates progress on a peasant being within 48 px of the
+  building centroid; the worker enters `UNIT_STATE_BUILD` (a
+  new state that reuses the chop-attack frames) on arrival and
+  pops back to IDLE on completion.
+- `wc1_render.bsm` — peasant_q query now filters by
+  `1 << unit_comp`, isolating the unit pass from the building
+  archetype.
+- `wc1_input.bsm` — right-click on a friendly foundation
+  assigns the first selected peasant via
+  `wc1_building_assign_peasant`; left-click hit-tests buildings
+  before units so a click on a building footprint always picks
+  the building. New `selected_kind` global (UNITS / BUILDING /
+  NONE) routes right-click handling per selection class.
+- `wc1_hud.bsm` — HP bars (3-bracket green / yellow / red) over
+  every damaged or selected unit + building; construction
+  progress bars (amber) over CONSTRUCTING buildings; selection
+  ring matches building footprint exactly; new bottom command
+  card strip (60 px) with authentic WC1 portrait + icon_border
+  + bottom_panel divider on top.
+- `wc1_movement.bsm` — terrain-blocker seed at init walks the
+  tilemap and marks tile 76 (canonical WC1 forest tree) as
+  blocked in both path_find's `_pf` and the occupancy grid so
+  peasants route around trees instead of through them.
+- `wc1_anims.bsm` — `UNIT_STATE_BUILD` enum entry; the
+  `wc1_anim_id_for` route reuses the attack-direction frames
+  for build state.
+- `wc1_combat.bsm` — combat tick skips `UNIT_STATE_BUILD` units
+  so a peasant doesn't engage / dodge while parked at a
+  foundation.
+- `rts.bpp` — load wc1_buildings + wc1_production, 34 building
+  atlas extrns + loads + frees (full forest set per faction),
+  3 HUD atlas extrns (portrait_icons + icon_border +
+  bottom_panel) + their loader, `_debug_spawn_building_tick`
+  (Shift+1..9 human, Ctrl+1..9 orc).
+
+**Engine wins (Tier 2):**
+- `stb/stbecs.bsm` — `comp_bitmask` on ArchetypeRec computed at
+  registration; `ecs_query_each` filters by archetype mask so
+  multi-archetype games (units + buildings + future projectiles)
+  don't leak iteration across types.
+- `src/backend/os/macos/_stb_platform_macos.bsm` —
+  - mouse handler now subtracts letterbox offset before
+    dividing by integer scale so click coords stay correct
+    under any window resize / aspect ratio,
+  - `[NSEvent pressedMouseButtons]` syncs `_stb_mouse_btn` at
+    end of poll (heals the LeftMouseUp events Cocoa swallows
+    during window-resize gestures),
+  - `[NSEvent modifierFlags]` syncs `_stb_keys[KEY_SHIFT/CTRL/
+    ALT/META]` so modifier-key actions (Shift+N, Ctrl+N)
+    actually fire.
+
+**Tool wins:**
+- `tools/wc1_sprite_convert/wc1_sprite_convert.bpp` — new
+  `--mode building` codepath (input PNG of column-stacked
+  square or rectangular frames, optional `frame_h` override).
+  Used to produce 34 building sidecars + 7 HUD sidecars
+  (portrait_icons, icon_border, bottom_panel, top_resource_bar,
+  left_panel, right_panel, minimap) in one batch.
+
+**Deferred to S8.5** (not blockers for S9):
+- Bottom HUD polish — panels show but layout is rough; the
+  WC1-authentic `left_panel` / `right_panel` / `top_resource_bar`
+  / `minimap` PNGs are loaded but not yet composed into the
+  bar. Pick this up alongside the resource counter in S9 (HUD
+  work compounds).
+- Wider terrain classifier — only tile 76 currently treated as
+  a blocker; tiles 77 / 78 / 80-87 (other tree variants, cliff
+  edges, water borders) stay walkable. Graduate a proper
+  per-tile walkability table when S9 surfaces gold mines / forest
+  patches the player needs to harvest (gather destinations have
+  to be reachable, and gold mines + forests are the natural
+  terrain-classifier consumers).
+- Peasant-absorb on construction — the worker currently parks
+  visible next to the foundation chopping; WC1 hid the peasant
+  inside the building. Easier to add once portraits / selection
+  feedback proves the worker is "occupied" by the construction
+  job.
+
+### HUD evolution — multi-session roadmap
+
+**Where we are (post-S8.5):** the bottom command card draws a
+single 60 px strip with the selected unit / building portrait
+in a 56 × 56 box, framed by `icon_border`, on top of a
+horizontally-tiled `bottom_panel` divider. HP bars (3-bracket
+colour) float over damaged or selected entities; construction
+progress bars (amber) sit above building footprints. That is
+the entire visible HUD.
+
+**What original WC1 actually shipped** (reference: any WC1
+screenshot or `war1gus` UI overlay):
+- Top **resource bar** spanning the full width — gold count,
+  wood count, food count (used / cap), each with its own icon.
+- Left **portrait + name pane** for the selected unit /
+  building (large square, ~96 × 96) with the unit's bespoke
+  portrait art (peasant, footman, knight, archer, conjurer,
+  cleric, ogre, grunt, raider, axe-thrower, warlock, necrolyte,
+  catapult, water elemental, daemon, scorpion, etc — every
+  unit has its own face).
+- Below the portrait: **stat strip** — name, current/max HP,
+  attack / armour / range numbers, kills counter for combat
+  units, "Building: <name>" + cost stack for foundations.
+- **Command card** — 9-slot grid (3 × 3) of action buttons
+  with WC1-style icons + hotkey letters underlined: move,
+  stop, attack, patrol, return-cargo for units; train-
+  peasant / train-footman / repair / cancel for buildings;
+  build-menu sub-pages for peasants (farm, barracks, lumber
+  mill, ...). Each button shows a tooltip on hover, gold-out
+  greys itself when unaffordable.
+- **Minimap** bottom-right — scaled-down render of the full
+  map with team-coloured dots for units + buildings, viewport
+  rectangle showing the camera frame, click-to-scroll.
+- **Alert system** — flashing minimap dots + voice clip when
+  a unit takes damage off-screen ("We're under attack!"); same
+  channel for "Job's done", "Cannot build there", "Insufficient
+  gold".
+
+**Assets already converted** (S8 tool pass produced these,
+loaded in rts.bpp, NOT yet composed):
+- `assets/sprites/wc1/hud/top_resource_bar.{json,png}` — the
+  full-width strip behind gold / wood / food counters.
+- `assets/sprites/wc1/hud/left_panel.{json,png}` — backdrop
+  for the portrait + stat column.
+- `assets/sprites/wc1/hud/right_panel.{json,png}` — backdrop
+  for the command card + minimap column.
+- `assets/sprites/wc1/hud/minimap.{json,png}` — minimap frame
+  (the dot rendering itself is procedural, not an atlas).
+- `assets/sprites/wc1/hud/portrait_icons.png` — 27 × 19 unit
+  portrait strip (already used for command-card thumbnails;
+  needs a separate large-portrait variant for the left pane).
+- `assets/sprites/wc1/hud/icon_border.{json,png}` — already
+  used as command-card thumbnail frame; reuse for the large
+  portrait + every command-card button.
+- `assets/sprites/wc1/hud/bottom_panel.{json,png}` — already
+  used as the divider strip; will retire once left/right
+  panels take over the bottom-row real estate.
+
+**Evolution sessions** (each ~2-4 h, slot into the natural
+gameplay arc — Rule 35 says HUD work earns its hour when the
+game's pressure surfaces a real gap, not on a calendar):
+
+#### S8.6 — Resource bar (spawns naturally in S9)
+- Top strip via `hud_image(top_resource_bar)` + 3 ×
+  `hud_text` widgets (gold / wood / food). Numbers live as
+  globals in `wc1_resources.bsm` (S9 owns them). Layout via
+  `ui_row` (`hud_image` left-anchored, counters distributed).
+- Acceptance: gold/wood/food ticks up when peasants deposit;
+  values readable without overlapping sprites.
+- **Lands inside S9.**
+
+#### S8.7 — Left pane: large portrait + stat strip
+- Convert a HIGH-RES portrait atlas from `war1gus`'s
+  per-unit `.png` portraits (the small 27 × 19 strip we have
+  is the command-card variant). Author `assets/sprites/wc1/
+  hud/portrait_large.{json,png}`. One row per unit, 14 cells.
+- Compose left pane: `hud_image(left_panel)` →
+  `hud_image(portrait_large, sel.kind)` →
+  `hud_text(sel.name)` → `hud_bar(hp_pct, w, h, green, dark)`
+  → `hud_text("Atk N  Def N  Rng N")`. Switch to building
+  card on building selection (no HP bar — show "Building"
+  status + cost stack).
+- Acceptance: selecting any unit OR building shows the right
+  portrait + stats; faction-colour border on the portrait.
+- **Lands as a focused S8.7 or as the visual half of S10
+  (production), depending on which arc surfaces it first.**
+
+#### S8.8 — Command card (action buttons)
+- 9-slot grid via `ui_row` × 3 of `gui_button` (or a hud-
+  flavoured equivalent that reuses `icon_border`). Each
+  button binds to an action + a hotkey letter; tooltip on
+  hover.
+- Per-selection action set: peasants get move / stop / attack
+  / build-menu / harvest; combat units get move / stop /
+  attack / patrol / hold; buildings get train-{kind} /
+  upgrade / cancel.
+- Build-menu sub-page for peasants: 9 slots × 2 factions
+  worth of building kinds (the same 9 we already wire under
+  Shift / Ctrl debug spawns become real buttons here).
+- Acceptance: clicking a button issues the same command the
+  hotkey would; greyed-out state when unaffordable.
+- **Lands in S10 (production) — train + research buttons
+  are the killer use case.**
+
+#### S8.9 — Minimap
+- `hud_image(minimap)` frame at bottom-right of right pane.
+  Inside the frame: a downscaled tile render via
+  `tile_render_minimap(tm, mm_w, mm_h)` (new helper in
+  `stbtile`?), team-coloured dots via `ecs_query_each`,
+  viewport rect from camera state, click-to-scroll mapping
+  pixels → world coords.
+- Acceptance: unit movements visible on the minimap;
+  clicking the minimap snaps the camera there; off-screen
+  combat alerts (next session) light up dots.
+- **Lands in S11 (AI baseline) or earlier if the player
+  starts losing track of off-screen action.**
+
+#### S8.10 — Alert system + voice
+- Off-screen damage → flashing dot on minimap + voice clip
+  ("We're under attack!"). Failed-command voice ("Cannot
+  build there"). Acknowledgement clips ("Yes, my lord",
+  "At your command") on selection / move-issue.
+- Channel via `stbsound` voices on a dedicated `VOICE` bus
+  in stbmixer. Sample bank under `assets/sounds/wc1/voice/`
+  (extracted by an existing or new `war1tool` codepath).
+- Acceptance: identifiable feedback on every primary command
+  + every danger event without the player needing the screen.
+- **Lands in S12 (audio integration).**
+
+#### S8.11 — Polish pass (lands with mission 1)
+- Faction-tinted portrait borders (gold for human, red for
+  orc); pulsing low-HP indicators; resource counters flash
+  red on insufficient-funds; mouse-over tooltips for ALL
+  buttons + portraits; pause / objectives screen overlay.
+- **Lands with S13 (mission 1 playable) — the polish is
+  what makes the demo feel shippable, not a separate arc.**
+
+**Why the splay across sessions, not one monolithic "HUD"
+session:** the WC1 HUD is integrated with the game state at
+every level — resource counters depend on S9, action buttons
+depend on S10's production, minimap dots depend on S11's AI,
+voice clips depend on S12's audio bus. Bundling them produces
+~12 hours of UI work disconnected from the gameplay arc that
+makes each piece visible. Spreading them keeps every HUD
+deliverable paired with the game-side feature it surfaces —
+that's how the bottom command card landed in S8 (you can only
+SEE the portrait + icon border because S4 selection +
+S8 building exist).
+
+**Engine evolution path (stbhud Tier-2 + Tier-3
+specializations):** every HUD addition above is composable
+from `stbhud` primitives the S8.5 arc set up (`hud_image`,
+`hud_bar`, `hud_render`) plus stbui layout primitives
+(`ui_row`, `ui_col`, `ui_box`). The Tier-3 game module is
+`wc1_hud.bsm` — it owns the WC1-specific composition (which
+portrait, which colour, which layout per selection class),
+while the Tier-2 primitive stays game-agnostic. A future RTS
+or top-down adventure can compose its own HUD from the same
+Tier-2 building blocks without forking `wc1_hud.bsm`.
+
+**Cross-references:**
+- `docs/manual/stb++_lib.md` — when stbhud's API grows past
+  ~5 widget kinds it earns its own chapter there.
+- Rule 33 (cartridge tier triage) — `wc1_hud` is Tier 3 and
+  stays in `games/rts1/`; `stbhud` is Tier 2 and stays in
+  `stb/`.
+- Rule 35 (games as infra stress test) — every gap above
+  surfaces a `stbhud` widget or layout primitive; promotion
+  to Tier 2 only when the second consumer (fps Doom-mode,
+  rpg Game 4) demonstrably needs the same shape.
 
 ### Session 9 — Resources (~3-4h)
 
@@ -662,7 +954,8 @@ to town hall, deposit. Resource counter in HUD ticks up.
 
 **Files**:
 - `wc1_resources.bsm` — gather state machine; deposit logic.
-- HUD updates in `wc1_hud.bsm`.
+- HUD updates in `wc1_hud.bsm` — first piece of the HUD
+  evolution roadmap above (S8.6 resource bar).
 
 ### Session 10 — Production (training + research) (~3-4h)
 
@@ -864,13 +1157,71 @@ pipeline (with `stb/stbprojectile` graduation) + energy & shields
 slots + the entire 14-unit WC1 roster wired and spawnable. See
 the Session 7 block above for the per-file breakdown.
 
-**S8 (Buildings + construction) is next** on the game arc.
-Foundations: town hall, farm, barracks. A peasant walks to the
-foundation, plays the construction animation, building completes
-and unlocks training. Building schema differs structurally from
-unit schema (single still frame + collapse cycle, no per-
-direction layout) so `wc1_sprite_convert` gains a separate
-`--mode building` code path.
+**S9 (Resources) is next** on the game arc. Gold mines + forests
+become harvestable; peasants gather, return to a town hall,
+deposit. Resource counter ticks up in the HUD. The HUD work in
+S9 dovetails with the S8.5 infra below — gold/wood/food counters
+compose through `ui_text` widgets in a declarative layout
+alongside `top_resource_bar` panel images.
+
+**Recent activity (2026-05-20, afternoon):** S8.5 — HUD infra
+arc CLOSED. **stbhud** Tier-2 cartridge created (`stb/stbhud.
+bsm`, ~170 LOC) — layered extension of stbui: imports stbui for
+the layout engine + stbrender + stbimage for GPU primitives,
+adds `hud_image` / `hud_bar` widgets + `hud_render` GPU walker.
+stbui core stays slim (Rule 23 preserved — Bang 9 / Modulab /
+level_editor / the_bug / fxlab do NOT transitively pull
+stbimage). **bpp_arr** Tier-1 prelude primitive added
+(`src/bpp_arr.bsm`, ~80 LOC) — growable struct-sized array
+sibling to bpp_array (which is word-only); stbui's UiNode pool
+now grows on demand via `arr_struct_*` instead of hard-capping
+at 256 with a silent drop. Fixed-point bootstrap achieved
+(gen2 == gen3 after the auto-inject change; gen1 != gen2 is
+transient). wc1_hud's bottom-panel divider strip refactored to
+declarative layout (`ui_box` + `ui_row` + `hud_image`) as
+proof-of-life. New rules: **Tonify Rule 35** (games as infra
+stress test — games are canonical workloads exposing engine
+gaps; the game's pressure is the forcing function) +
+**Rule 36** (primitive promotion when two consumers are
+PLANNED, not just shipped — refinement of Rule 20 that
+prevents migration friction). Suite 177/0/12 + 140/0/48.
+
+**Recent activity (2026-05-20, late morning):** S8 CLOSED. All 9
+WC1 building kinds wired (BuildingDef + ECS archetype +
+production tick + atlas pipeline), peasants walk to assigned
+foundations + chop while progress accumulates, buildings complete
+on time. HP bars + construction progress bars over every entity;
+left-click selects buildings, command card shows authentic WC1
+portraits (27×19 strip from `tilesets/forest/portrait_icons.png`,
+scaled 2× into the 56×56 portrait box, framed by `icon_border`).
+Tree-tile 76 marked as a permanent blocker so peasants route
+around forest patches. Engine-side wins logged in the closeout
+block: `stbecs` archetype mask filtering + platform-layer
+modifier-key sync + letterbox-aware mouse coords. Suite 176/0/12
++ 140/0/48, bootstrap byte-stable.
+
+**Recent activity (2026-05-19 → 20, earlier):** S8.0 pre-flight
+sidequests
+CLOSED after three iterations on 8.0b. Final shape: macOS
+`_stb_platform_macos.bsm` got two surgical additions — live-
+update of `_plt_scale` whenever the contentView resize poll
+fires, and a `[NSEvent pressedMouseButtons]` sync at the end of
+`_stb_poll_events` that self-heals the LeftMouseUp events Cocoa
+silently consumes during window-resize gestures. The button-
+state sync was the actual fix for the "phantom marquee after
+resize" bug that iterations 1 (window lock, reverted) and 2
+(letterbox-aware math rewrite, also reverted) missed. Iteration
+2 was a near-miss — the math was correct but exposed the latent
+event-loss bug. Rts1's virtual canvas bumped from 320×240 (4:3)
+to 480×270 (16:9) so modern monitors get integer-scale
+coverage; 1080p / 4K hit zero letterbox, 1440p has a small
+margin (480 isn't a factor of 2560). 8.0a — catapult attack
+JSON sidecars hand-tuned to 400 ms per attack-tag-start frame
+so the 5-frame anim cycles the 2000 ms cooldown smoothly.
+Suite 176/0/12 + 140/0/48, bootstrap byte-stable. Maintenance
+note in S8.0a: `wc1_sprite_convert` re-runs against the catapult
+atlases would regress the tuning until a per-unit override lands
+in the tool.
 
 **Recent activity (2026-05-18, evening):** WC1 S7 shipped end-to-
 end. Tier-2 `stb/stbprojectile.bsm` graduated with three

@@ -19,6 +19,35 @@ With filename only:    3  ⚠️  (import resolver — runs before lexer, no tok
 Reserved:              2  (W017, W014 — see Reserved section)
 ```
 
+## Design premise — no silent narrowing
+
+A subset of diagnostics in this log exist to implement a single
+language premise: B++ does not allow silent narrowing between
+numeric types. Annotate the destination or refuse the conversion.
+This is **Tonify Rule 34** (`tonify_checklist.md`) and is one of
+the defining decisions of the language — not a stylistic preference
+that can be relaxed without an explicit design RFC.
+
+The diagnostics that implement Rule 34:
+
+| Code | What it catches |
+|---|---|
+| **E232** | float value stored into untyped destination — IEEE 754 bits would be lost |
+| **E233** | float arg passed to int parameter at call site (promoted from W002) |
+| **E240** | int arg passed to float parameter — caller needs to annotate `: float` or use a float literal |
+| **W010** | same-base narrowing (word → byte, half → quarter, etc.) |
+| **W011** | int → narrow float; signedness-agnostic precision loss |
+
+When narrowing is the operation — rounding screen coords, packing
+bits, decoding word-slices — annotate the destination explicitly.
+The annotation IS the programmer's consent. Do not patch the
+validator to suppress these diagnostics; fix the call site instead.
+
+Rationale + worked examples in `how_to_dev_b++.md` §4.7. Tonify
+Rule 34 documents the doctrine, when it does NOT apply, and the
+"don't relax this" guidance for contributors who hit false-positive
+noise.
+
 ## Errors (fatal — compilation stops)
 
 | Code | Message | File | Line | Has loc? | Trigger |

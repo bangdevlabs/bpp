@@ -552,7 +552,78 @@ When to reach for `: u_word`:
 
 See Tonify Rule 32 for the full table + cross-references.
 
-### §4.7 — What this chapter does NOT cover
+### §4.7 — No silent narrowing (design premise)
+
+B++ rejects silent narrowing between numeric types. This is one
+of the defining decisions of the language — not a style preference
+that can be relaxed. The rationale is short and is exactly the
+problem Bjarne Stroustrup writes about in his Nov 2025 paper
+"Concept-Based Generic Programming in C++": implicit numeric
+conversions inherited from C are "tricky and often only partially
+understood by developers," and they fire at points the programmer
+cannot easily spot. Stroustrup states his ultimate aim for C++ was
+complete type safety, including absence of narrowing conversions;
+C++ cannot deliver that without breaking 50 years of code. B++
+never inherited the conversion rules — its lineage is B (1969),
+which predated C's numeric-promotion machinery, and the
+orthogonal-type-system decision in B++ encoded the escape.
+
+Three diagnostics implement the doctrine:
+
+```bpp
+// E232 — fatal. The destination is untyped (defaults to word) but
+// the value is float; the IEEE 754 bits would be silently dropped.
+auto x = 44100.0;
+//   ^ error[E232]: 'x' has no type annotation but the value being
+//                  stored is a float — the IEEE 754 bits will be
+//                  silently truncated to an integer.
+// Fix: write `auto x: float = 44100.0;` to preserve, or
+//      `auto x = 44100;` to use an integer literal directly.
+
+// W010 — warning. Narrowing within the same base (word → byte).
+auto x: byte;
+x = some_word_value;
+//   ^ warning[W010]: narrowing word to 'x' (byte)
+// Fix: widen 'x' to word, OR pre-mask the source to byte range,
+//      OR accept and document the warning as intentional.
+
+// W011 — warning. Int (signed or unsigned) into narrow float.
+// Precision loss; both BASE_WORD and BASE_UWORD source families
+// trigger because precision-loss is signedness-agnostic.
+auto y: half float;
+y = some_word_value;
+//   ^ warning[W011]: possible precision loss: word to 'y' (half float)
+```
+
+When narrowing IS the operation — rounding screen coordinates,
+packing pixel bytes, decoding word-slice fields — the pattern is to
+**annotate the destination explicitly so the annotation IS the
+consent**. The backends emit `fcvtzs` (aarch64) or rely on C's
+implicit `double → long long` (C emitter) for float-to-int when the
+destination is explicitly typed word; no diagnostic fires because
+the annotation is the programmer's signal "I know this narrows."
+
+```bpp
+// Float-to-int rounding (intentional):
+auto sx: word;
+sx = pos_x * scale;        // pos_x: float; sx is explicitly word.
+                            // No diagnostic — annotation = consent.
+```
+
+Do not work around the diagnostics by removing annotations. The
+friction of writing `: float`, `: u_word`, `: byte` at every
+destination that differs from word IS the type system doing its
+job. Tonify Rule 34 documents the rule formally; the warning_error
+log lists every diagnostic the rule emits.
+
+Cross-references:
+- `tonify_checklist.md` Rule 34 — the full doctrine + when to
+  not relax it.
+- `warning_error_log.md` — E232 / W010 / W011 line items.
+- §4.6 — the `: u_word` family that separates signed/unsigned
+  arithmetic dispatch (the same family of concerns).
+
+### §4.8 — What this chapter does NOT cover
 
 - **Type inference engine internals** — `src/bpp_types.bsm`, covered
   in Cap 21 as part of parser/analysis pipeline.
