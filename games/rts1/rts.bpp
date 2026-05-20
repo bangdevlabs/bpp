@@ -40,6 +40,8 @@ load   "wc1_missiles.bsm";
 load   "wc1_regen.bsm";
 load   "wc1_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
 load   "wc1_production.bsm";  // S8 — construction state-machine tick
+load   "wc1_resources.bsm";   // S9 — gold/wood/food + food-cap recompute
+load   "wc1_gather.bsm";      // S9 — peasant gather/return state machine
 
 // ── Constants ────────────────────────────────────────────
 
@@ -116,6 +118,9 @@ extrn orc_kennel_atlas, orc_kennel_construct_atlas;
 extrn orc_temple_atlas, orc_temple_construct_atlas;
 extrn orc_tower_atlas, orc_tower_construct_atlas;
 extrn blackrock_spire_atlas;           // NotConstructable: completed only
+// S9 — neutral gold mine. Pre-placed on the map at level load;
+// not constructable, no construction atlas.
+extrn gold_mine_atlas;
 
 // S8.5 — authentic WC1 HUD atlases. portrait_icons holds the 93-
 // frame strip of mini-unit-portraits (27×19 each) the command
@@ -126,6 +131,15 @@ extrn blackrock_spire_atlas;           // NotConstructable: completed only
 extrn portrait_icons_atlas;
 extrn icon_border_atlas;
 extrn bottom_panel_atlas;
+// S9 — top resource bar (gold + lumber icons + strip chrome).
+// Loaded once at startup; read every frame by _draw_top_resource_bar.
+extrn top_resource_bar_atlas;
+extrn gold_icon_atlas, lumber_icon_atlas;
+// S9 — carry-sprite atlases for peasant + peon, gold + wood.
+// Same 160×416 layout as the base atlases; wc1_gather swaps to
+// these for RETURNING_GOLD / RETURNING_WOOD states.
+extrn peasant_with_gold_atlas, peasant_with_wood_atlas;
+extrn peon_with_gold_atlas,    peon_with_wood_atlas;
 
 // Camera handle — owned by main, read by tile_draw and the per-
 // entity render callback (which extrn's it). cam_pan / cam_set
@@ -292,9 +306,17 @@ static void _free_all_atlases() {
     image_free(orc_tower_atlas);
     image_free(orc_tower_construct_atlas);
     image_free(blackrock_spire_atlas);
+    image_free(gold_mine_atlas);
     image_free(portrait_icons_atlas);
     image_free(icon_border_atlas);
     image_free(bottom_panel_atlas);
+    image_free(top_resource_bar_atlas);
+    image_free(gold_icon_atlas);
+    image_free(lumber_icon_atlas);
+    image_free(peasant_with_gold_atlas);
+    image_free(peasant_with_wood_atlas);
+    image_free(peon_with_gold_atlas);
+    image_free(peon_with_wood_atlas);
 }
 
 // ── Entry point ──────────────────────────────────────────
@@ -427,6 +449,10 @@ main() {
     orc_tower_atlas                   = _load_wc1_building_atlas("orc",   "tower.json");
     orc_tower_construct_atlas         = _load_wc1_building_atlas("orc",   "tower_construction.json");
     blackrock_spire_atlas             = _load_wc1_building_atlas("orc",   "blackrock_spire.json");
+    // S9 — neutral gold mine sprite (single-frame, 64×64). One
+    // copy shared between forest + swamp tilesets; the canonical
+    // forest variant is what level1 spawns from.
+    gold_mine_atlas                   = _load_wc1_building_atlas("neutral", "gold_mine.json");
 
     // S8.5 — authentic WC1 HUD atlases. Loaded once at boot from
     // `assets/sprites/wc1/hud/{forest,human}/<name>.json` so the
@@ -436,6 +462,20 @@ main() {
     portrait_icons_atlas = _load_wc1_hud_atlas("forest", "portrait_icons.json");
     icon_border_atlas    = _load_wc1_hud_atlas("human",  "icon_border.json");
     bottom_panel_atlas   = _load_wc1_hud_atlas("human",  "bottom_panel.json");
+    // S9 / HUD evolution S8.6 — top resource bar + the two
+    // resource-counter icons (gold pile, lumber log). Loaded
+    // alongside the bottom_panel divider so the chrome is
+    // uniform across both panels.
+    top_resource_bar_atlas = _load_wc1_hud_atlas("human", "top_resource_bar.json");
+    gold_icon_atlas        = _load_wc1_hud_atlas("human", "gold_icon.json");
+    lumber_icon_atlas      = _load_wc1_hud_atlas("human", "lumber_icon.json");
+    // S9 — peasant + peon carry-sprite atlases. Same shape as the
+    // base atlases so wc1_gather's atlas swap reuses the animation
+    // ids cached from the base peasant atlas via wc1_anims_init.
+    peasant_with_gold_atlas = _load_wc1_atlas("peasant_with_gold.json");
+    peasant_with_wood_atlas = _load_wc1_atlas("peasant_with_wood.json");
+    peon_with_gold_atlas    = _load_wc1_atlas("peon_with_gold.json");
+    peon_with_wood_atlas    = _load_wc1_atlas("peon_with_wood.json");
 
     // Single failure check covers the whole batch — image_free(0)
     // is a no-op so _free_all_atlases handles partial loads
@@ -459,8 +499,13 @@ main() {
         orc_blacksmith_atlas == 0 || orc_kennel_atlas == 0 ||
         orc_temple_atlas == 0 || orc_tower_atlas == 0 ||
         blackrock_spire_atlas == 0 ||
+        gold_mine_atlas == 0 ||
         portrait_icons_atlas == 0 || icon_border_atlas == 0 ||
-        bottom_panel_atlas == 0) {
+        bottom_panel_atlas == 0 ||
+        top_resource_bar_atlas == 0 ||
+        gold_icon_atlas == 0 || lumber_icon_atlas == 0 ||
+        peasant_with_gold_atlas == 0 || peasant_with_wood_atlas == 0 ||
+        peon_with_gold_atlas == 0    || peon_with_wood_atlas == 0) {
         put_err("rts: one or more atlases failed to load — exiting\n");
         _free_all_atlases();
         wc1_map_free(map);
@@ -502,6 +547,16 @@ main() {
     wc1_input_init();
     wc1_movement_init(map);
     wc1_missiles_init(arrow_atlas);
+    // S9 — resource state + gather wiring. init_wc1_resources
+    // seeds the gold / wood / food / food_cap globals; the carry-
+    // atlas registration tells wc1_gather which sprite to swap to
+    // per faction + carry kind during RETURNING_* states.
+    init_wc1_resources();
+    wc1_render_set_carry_atlases(peasant_with_gold_atlas,
+                                 peasant_with_wood_atlas,
+                                 peon_with_gold_atlas,
+                                 peon_with_wood_atlas);
+    _spawn_buildings_from_level(world, map);
     _spawn_units_from_level(world, map);
 
     // Game loop. Identical shape to the existing pathfind /
@@ -534,6 +589,14 @@ main() {
         // DONE the first frame progress_ms crosses
         // BuildingDef.construction_time_ms.
         wc1_production_tick(world);
+        // S9 — gather tick. Advances every peasant in
+        // GATHER_GOLD / GATHER_WOOD state + every peasant on a
+        // RETURNING_* run. Resource counters update on deposit.
+        wc1_gather_tick(world, game_dt_ms());
+        // S9 / Phase D — food cap + used recompute. Walks the
+        // building + unit archetypes once; cheap. Drives the
+        // HUD's "n/cap" counter.
+        wc1_resources_recompute_cap();
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
@@ -574,6 +637,34 @@ main() {
 // the roster grows. Unknown kinds are silently ignored — the level
 // editor can author placeholders before the spawn route lands.
 //
+// S9 — spawn pre-placed buildings (gold mines, future neutral
+// fountains / dropships in scenario maps). Runs BEFORE
+// `_spawn_units_from_level` so the gold mines exist as ECS
+// entities before any peasant tries to right-click them.
+//
+// Only handles entities `wc1_map_entity_kind` reports as
+// "gold-mine" today; other kinds (start_view, peasant, peon,
+// ...) fall through to their respective spawn pipelines.
+static void _spawn_buildings_from_level(world, map) {
+    auto i, n, k, gx, gy, player;
+    n = wc1_map_entity_count(map);
+    for (i = 0; i < n; i++) {
+        k      = wc1_map_entity_kind(map, i);
+        gx     = wc1_map_entity_gx(map, i);
+        gy     = wc1_map_entity_gy(map, i);
+        player = wc1_map_entity_player(map, i);
+        if (str_eq(k, "gold-mine") != 0) {
+            // Gold mines spawn DONE (no construction state) with
+            // their atlas_idle pinned to gold_mine_atlas and no
+            // construct atlas. ecs_spawn_building handles the
+            // DONE branch when construction_time_ms == 0 +
+            // atlas_construct == 0 (both true for the mine def).
+            ecs_spawn_building(world, BLDG_GOLD_MINE, gx, gy, player,
+                               gold_mine_atlas, 0);
+        }
+    }
+}
+
 // Workers (peasant/peon) share UNIT_PEASANT stats — only the
 // rendered atlas differs by faction. Same for casters / heroes
 // that aren't faction-mirrored: each kind keeps its own UnitDef

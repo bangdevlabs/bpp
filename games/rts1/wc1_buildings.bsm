@@ -43,10 +43,16 @@ const BLDG_STABLE      = 5;   // orc kennel = same kind, different atlas
 const BLDG_CHURCH      = 6;   // orc temple = same kind, different atlas
 const BLDG_TOWER       = 7;
 const BLDG_KEEP        = 8;   // orc blackrock spire = same kind
+// S9 — neutral gold mine. Player 15 in WC1 / war1gus convention
+// (the "Neutral" faction). Spawned pre-DONE from the level
+// loader, gold reserve tracked per-instance via Building.payload
+// (the same word slot Building.assigned_peasant_eid uses for
+// non-mine kinds — see the struct comment).
+const BLDG_GOLD_MINE   = 9;
 
 // Total kinds — sized for the v1 roster. Bump alongside the
 // `_bdef` block below if S10+ adds expansion-era buildings.
-const _WC1_BLDG_COUNT  = 9;
+const _WC1_BLDG_COUNT  = 10;
 
 // ── Construction state ─────────────────────────────────────────
 
@@ -56,6 +62,11 @@ const _WC1_BLDG_COUNT  = 9;
 // this module just exposes the constants.
 const BLDG_STATE_CONSTRUCTING = 0;
 const BLDG_STATE_DONE         = 1;
+// S9 — gold mine state. Set when `gold_remaining` reaches 0;
+// peasants can no longer assign to the mine and the render
+// path can swap the sprite to a depleted variant later (v1
+// leaves the same sprite + grays the icon overlay).
+const BLDG_STATE_DEPLETED     = 2;
 
 // ── Static type table (BuildingDef) ────────────────────────────
 
@@ -119,6 +130,12 @@ void building_defs_init() {
     _bdef(BLDG_CHURCH,            700, 64, 64, 14000,  700,  500,  0);
     _bdef(BLDG_TOWER,             900, 48, 48, 14000,  600,  300,  0);
     _bdef(BLDG_KEEP,             2500, 80, 80, 25000, 1000,  800, 10);
+    // Gold mine: neutral, pre-built, untrainable. HP nominally
+    // huge so combat ticks treat it as a fixture; construction
+    // time 0 because it ships DONE on the level. Cost columns
+    // unused (players can't build mines); supply 0 (it's not a
+    // food source).
+    _bdef(BLDG_GOLD_MINE,       25500, 64, 64,     0,    0,    0,  0);
 }
 
 // Look up a building's template by kind. Returns 0 on out-of-range
@@ -145,9 +162,16 @@ struct Building {
     progress_ms,           // 0 → BuildingDef.construction_time_ms; production tick advances
     atlas_idle,            // image handle — completed sprite (always set)
     atlas_construct,       // image handle — 3-frame scaffolding strip (0 if absent)
-    assigned_peasant_eid   // -1 = unassigned (construction paused);
+    assigned_peasant_eid,  // -1 = unassigned (construction paused);
                            //   otherwise = the peasant entity walking
-                           //   toward (or parked at) the foundation
+                           //   toward (or parked at) the foundation.
+                           //   S9: also the peasant currently INSIDE
+                           //   a gold mine (mine hides them while
+                           //   gathering — render check uses this).
+    gold_remaining         // S9 — only meaningful for BLDG_GOLD_MINE.
+                           // Decremented per deposit cycle; the mine
+                           // collapses (BLDG_STATE_DEPLETED) when it
+                           // hits 0. Other kinds leave this at 0.
 }
 
 // Component id + archetype + query — populated by buildings_wire.
@@ -248,6 +272,15 @@ ecs_spawn_building(world, atlas_idle, atlas_construct, gx, gy, player, kind) {
     // The right-click handler in wc1_input flips this to a real
     // entity id when the player commands a selected peasant.
     b.assigned_peasant_eid = 0 - 1;
+    // S9 — gold mine reserve. Canonical WC1 default is 25,500
+    // gold per mine; spent in _WC1_GOLD_YIELD increments per
+    // deposit cycle. Non-mine kinds leave this at 0 — only the
+    // gather state machine reads the field.
+    if (kind == BLDG_GOLD_MINE) {
+        b.gold_remaining = 25500;
+    } else {
+        b.gold_remaining = 0;
+    }
     // Tile-occupancy claim — reserve every tile inside the
     // building's pixel-footprint so other units can't path
     // through and other buildings can't be placed on overlap.

@@ -20,9 +20,11 @@
 import "stbecs.bsm";
 import "stbinput.bsm";
 import "stbcamera.bsm";
+import "stbtile.bsm";
 import "bpp_io.bsm";
 load   "wc1_anims.bsm";
 load   "wc1_buildings.bsm";    // Building struct + BLDG_STATE_* + wc1_building_at_world
+load   "wc1_gather.bsm";       // S9 — wc1_gather_assign_mine / _tree
 
 // Selection buffer + live count. selected_count == 0 is the
 // "nothing selected" state honored by wc1_hud_render and the
@@ -313,6 +315,20 @@ void wc1_input_tick(world) {
                                             selected_eids[0]);
                 return;
             }
+            // 1b. S9 — gold mine hit-test. Click on a (neutral)
+            //     gold mine → start the gather cycle for every
+            //     selected peasant. Mines accept multiple workers
+            //     in WC1 canon; we route each peasant
+            //     independently and they share the mine reserve.
+            if (building_eid >= 0
+                && _building_is_gold_mine(world, building_eid) != 0) {
+                auto i;
+                for (i = 0; i < selected_count; i++) {
+                    wc1_gather_assign_mine(world, selected_eids[i],
+                                            building_eid);
+                }
+                return;
+            }
             // 2. Attack-target hit-test against units of any
             //    faction; _is_enemy filters friendly hits before
             //    issuing the attack.
@@ -324,10 +340,46 @@ void wc1_input_tick(world) {
                 gy = wy / 16;
                 if (gx < 0) { gx = 0; }
                 if (gy < 0) { gy = 0; }
+                // 2b. S9 — tree-tile hit-test BEFORE the generic
+                //     move. The pathfinder treats trees as blocked
+                //     so a plain move-to-tree command would fail
+                //     silently; the gather assignment routes to
+                //     an adjacent cell instead.
+                if (_tile_is_tree(gx, gy) != 0) {
+                    auto j;
+                    for (j = 0; j < selected_count; j++) {
+                        wc1_gather_assign_tree(world, selected_eids[j],
+                                                gx, gy);
+                    }
+                    return;
+                }
                 _issue_move(world, gx, gy);
             }
         }
     }
+}
+
+// S9 — true if the right-clicked tile holds a tree. The pathfinder
+// treats tile 76 as blocked; the gather assignment translates the
+// click into a chop command instead of a doomed move-to-blocked-tile.
+// world_map is the Tilemap handle owned by rts.bpp.
+extrn world_map;
+const _WC1_TREE_TILE_INPUT = 76;
+static _tile_is_tree(gx, gy) {
+    return tile_get(world_map, gx, gy) == _WC1_TREE_TILE_INPUT;
+}
+
+// S9 — true if `building_eid` is a (neutral) gold mine. Gold mines
+// always carry the BLDG_GOLD_MINE kind regardless of faction —
+// peasants from any side can mine the same node. Depleted mines
+// (state == BLDG_STATE_DEPLETED) reject the gather assignment so
+// the right-click falls through to a regular move.
+static _building_is_gold_mine(world, building_eid) {
+    auto b: Building;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.kind != BLDG_GOLD_MINE)       { return 0; }
+    if (b.state == BLDG_STATE_DEPLETED) { return 0; }
+    return 1;
 }
 
 // Return 1 if `building_eid` is a CONSTRUCTING building owned by
@@ -393,6 +445,10 @@ static void _issue_move(world, gx, gy) {
         t.gy = gy;
         at = ecs_get(world, attack_target_comp, eid);
         at.eid = -1;
+        // S9 — clear any pending gather. A bare move command
+        // cancels the gold / wood loop so the peasant goes where
+        // the player pointed instead of resuming the cycle.
+        wc1_gather_clear(world, eid);
     }
     wc1_movement_request_group(world, selected_eids,
                                selected_count, gx, gy);

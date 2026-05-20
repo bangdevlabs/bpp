@@ -26,6 +26,17 @@ load   "wc1_input.bsm";        // selected_kind + SEL_KIND_*
 // to swap the placeholder with real WC1 portraits + frame chrome.
 extrn portrait_icons_atlas, icon_border_atlas, bottom_panel_atlas;
 
+// S9 (Session 8.6 in the HUD roadmap) — top resource bar atlas +
+// gold / lumber icon atlases. Loaded once at startup by rts.bpp.
+// The strip is 240 × 12 (same dims as bottom_panel — WC1 reuses
+// the same chrome top + bottom); the gold + lumber icons are tiny
+// (13×6 + 9×9) single-frame atlases drawn 1×.
+extrn top_resource_bar_atlas, gold_icon_atlas, lumber_icon_atlas;
+
+// S9 resource state — read for the HUD; values come from
+// wc1_resources.bsm (gold + wood + food + food_cap).
+extrn wc1_gold, wc1_wood, wc1_food, wc1_food_cap;
+
 extrn pos_comp, sheet_comp, anim_comp, faction_comp;
 extrn unit_comp;
 extrn building_arch;
@@ -97,6 +108,40 @@ const _ICON_BORDER_SRC_H = 24;
 // border of the HUD bar.
 const _BOTTOM_PANEL_SRC_W = 240;
 const _BOTTOM_PANEL_SRC_H = 12;
+
+// S9 / HUD evolution S8.6 — top resource bar dims. Same 240×12
+// strip as bottom_panel; tiled twice across the 480 px canvas.
+// Anchored at y=0 (top of screen). Holds three counters across
+// its width: gold (left third), wood (middle third), food / cap
+// (right third).
+const _TOP_BAR_SRC_W = 240;
+const _TOP_BAR_SRC_H = 12;
+
+// Native WC1 icon source dims. The gold pile is a 13×6 rectangle
+// (with the metallic gradient baked in); lumber is a 9×9 log
+// cross-section. Both stay at native scale — the strip is 12 px
+// tall so 1× is the right fit.
+const _GOLD_ICON_W   = 13;
+const _GOLD_ICON_H   = 6;
+const _LUMBER_ICON_W = 9;
+const _LUMBER_ICON_H = 9;
+
+// Resource counter palette + slot geometry. Counters sit inside
+// the top bar at fixed pixel anchors (icon left-anchored, number
+// 2 px to the right of the icon). Yellow / brown counter color
+// matches the WC1 art palette; food counter has its own slot so
+// "1/4" reads as one chunk.
+const _TOP_BAR_TEXT_COLOR  = 0xFFE6C200;   // WC1 yellow-gold
+const _TOP_BAR_FOOD_COLOR  = 0xFFFFFFFF;   // white for the n/cap
+                                            // ratio (food has no icon
+                                            // in canonical WC1)
+const _TOP_BAR_TEXT_Y_OFF  = 2;              // px below bar-top to
+                                              // align text vertically
+                                              // inside the strip
+const _TOP_BAR_GOLD_X      = 24;
+const _TOP_BAR_WOOD_X      = 168;
+const _TOP_BAR_FOOD_X      = 312;
+const _TOP_BAR_ICON_TEXT_GAP = 16;
 
 // Sprite render geometry (mirrors wc1_render._render_unit's slot —
 // see that file for the war1gus-faithful anchor convention). Kept
@@ -175,6 +220,11 @@ wc1_hud_render(world) {
     // Command card — bottom bar with portrait / stats. Rendered
     // last so it sits on top of the world + every overlay.
     _command_card_render(world);
+    // S9 — top resource bar (gold / wood / food). Drawn AFTER the
+    // command card so the strip sits above any HP / progress
+    // overlay that overlapped the top of the canvas (none today,
+    // but the ordering is the safe one).
+    _draw_top_resource_bar();
 }
 
 // ── HP bar + construction progress bar overlays ─────────────────
@@ -391,6 +441,64 @@ static void _draw_bottom_panel_border(bar_y) {
     ui_end();
     ui_layout_end();
     hud_render();
+}
+
+// S9 / HUD evolution S8.6 — top resource bar (gold + wood + food).
+// Layered draw: the 240×12 strip tiles twice across the full canvas
+// at y=0, then the three counters (icon + number) overlay at fixed
+// x anchors. Numbers come straight from the wc1_resources globals
+// — no caching, no formatting helper, just a strbuf per slot.
+//
+// Why the icons are drawn through `image_draw_size` instead of
+// `hud_image` inside the stbui pass: the resource numbers need to
+// land at exact pixel positions, and the strip-then-overlay
+// composition reads cleanly as imperative draw calls. The stbhud
+// declarative path handles the chrome (the strip); the counters
+// composite on top. Both paths end inside the same
+// `game_render_begin / end` GPU pass.
+static void _draw_top_resource_bar() {
+    auto strip_y, text_y, sb, x;
+    strip_y = 0;
+    text_y  = strip_y + _TOP_BAR_TEXT_Y_OFF;
+    // Strip chrome — two tiles of the 240-wide source to cover
+    // the 480-wide canvas. Drawn via the declarative HUD layout
+    // for symmetry with `_draw_bottom_panel_border`.
+    ui_layout_begin(SCREEN_W, SCREEN_H);
+    ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(_TOP_BAR_SRC_H), 0, 0);
+        hud_image(top_resource_bar_atlas, 0,
+                  _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
+        hud_image(top_resource_bar_atlas, 0,
+                  _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
+    ui_end();
+    ui_layout_end();
+    hud_render();
+    // Gold icon + counter.
+    x = _TOP_BAR_GOLD_X;
+    image_draw_size(gold_icon_atlas, 0, x, strip_y + (_TOP_BAR_SRC_H - _GOLD_ICON_H) / 2,
+                    _GOLD_ICON_W, _GOLD_ICON_H);
+    sb = strbuf_new();
+    sb = strbuf_num(sb, wc1_gold);
+    render_text(sb, x + _TOP_BAR_ICON_TEXT_GAP, text_y, 1, _TOP_BAR_TEXT_COLOR);
+    strbuf_free(sb);
+    // Lumber icon + counter.
+    x = _TOP_BAR_WOOD_X;
+    image_draw_size(lumber_icon_atlas, 0, x, strip_y + (_TOP_BAR_SRC_H - _LUMBER_ICON_H) / 2,
+                    _LUMBER_ICON_W, _LUMBER_ICON_H);
+    sb = strbuf_new();
+    sb = strbuf_num(sb, wc1_wood);
+    render_text(sb, x + _TOP_BAR_ICON_TEXT_GAP, text_y, 1, _TOP_BAR_TEXT_COLOR);
+    strbuf_free(sb);
+    // Food slot — no icon in canonical WC1, just the "used/cap"
+    // ratio. Renders white so the slash reads clearly against
+    // the brown strip.
+    x = _TOP_BAR_FOOD_X;
+    sb = strbuf_new();
+    sb = strbuf_num(sb, wc1_food);
+    sb = strbuf_ch(sb, '/');
+    sb = strbuf_num(sb, wc1_food_cap);
+    render_text(sb, x, text_y, 1, _TOP_BAR_FOOD_COLOR);
+    strbuf_free(sb);
+    return;
 }
 
 // Draw the WC1 portrait + icon_border for the selected entity.

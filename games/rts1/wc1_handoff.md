@@ -947,15 +947,136 @@ Tier-2 building blocks without forking `wc1_hud.bsm`.
   to Tier 2 only when the second consumer (fps Doom-mode,
   rpg Game 4) demonstrably needs the same shape.
 
-### Session 9 — Resources (~3-4h)
+### Session 9 — Resources (CLOSED 2026-05-20)
 
-**Goal**: gold mines + forests harvestable. Peasants gather, return
-to town hall, deposit. Resource counter in HUD ticks up.
+**Goal hit**: gold mines + forests harvestable end-to-end.
+Peasants gather, walk back to the nearest town hall, deposit;
+gold + wood counters tick up in the HUD. Mine reserves +
+tree wood deplete on each cycle (felled trees flip to a
+walkable stump tile). Food cap recomputes per tick from town
+halls + farms.
 
-**Files**:
-- `wc1_resources.bsm` — gather state machine; deposit logic.
-- HUD updates in `wc1_hud.bsm` — first piece of the HUD
-  evolution roadmap above (S8.6 resource bar).
+**Polish landed inside the arc** (originally deferred to a
+later session but the user folded it into S9): peasants
+disappear into the mine while gathering (canonical WC1
+"into-the-mine" feedback), peasants render with sacks of
+gold / logs during the RETURNING_* walk back (atlas swap to
+peasant_with_gold / peasant_with_wood per faction), trees
+flip to stump after one chop cycle and unblock the
+pathfinder.
+
+**Shipped this session** (`games/rts1/`):
+- `wc1_resources.bsm` (new) — gold / wood / food / food_cap
+  globals + accessors + WC1-canonical starting values
+  (400 / 400 / 0 / 4). `wc1_resources_deposit(yield_kind)`
+  is the credit point the gather state machine calls;
+  `wc1_resources_recompute_cap(world)` walks the building
+  archetype every tick and rebuilds the food cap from
+  BuildingDef.supply (so farms / town halls contribute
+  dynamically). `wc1_resources_can_afford` / `_spend`
+  are the production gate the S10 training UI will use.
+- `wc1_gather.bsm` (new) — the per-peasant state machine.
+  GATHER_TARGET_NONE / MINE / TREE + CARRY_NONE / GOLD /
+  WOOD enums. `wc1_gather_assign_mine` / `_tree` are
+  called by wc1_input.bsm's right-click handler;
+  `wc1_gather_tick(world, dt)` advances every active gather
+  in one walker (`peasant_q` with `target_kind != 0` early-
+  return for non-gatherers). Includes the per-tile wood
+  counter (`stbgrid<word>` keyed by tile linear idx) +
+  `_find_nearest_town_hall` deposit-router + the tree-to-
+  stump tile flip + the `wc1_movement_unblock_tile` call
+  to free the pathfinder.
+- `wc1_hud.bsm` — `_draw_top_resource_bar()` composes
+  the 240×12 strip (tiled 2× across the canvas) + gold
+  icon + lumber icon + 3 counters (gold, wood, food/cap).
+  Called from `wc1_hud_render` every frame; renders AFTER
+  the bottom command card so the strip sits cleanly above
+  any HUD overlay.
+- `wc1_buildings.bsm` — new `BLDG_GOLD_MINE` kind +
+  `_WC1_BLDG_COUNT` bumped to 10. Building struct gains
+  `gold_remaining` (only meaningful for mines; other kinds
+  leave it at 0). `BLDG_STATE_DEPLETED` enum value for
+  mines that hit 0 reserve.
+- `wc1_movement.bsm` — `wc1_movement_unblock_tile(gx, gy)`
+  drops a permanent terrain blocker from both the
+  pathfinder AND the occupancy grid. Called by
+  `wc1_gather` when a tree falls.
+- `wc1_anims.bsm` — `UNIT_STATE_GATHER_GOLD/WOOD` +
+  `UNIT_STATE_RETURNING_GOLD/WOOD` enum entries. The
+  resolver dispatches GATHER_* to attack frames (same swing
+  motion); RETURNING_* to walk frames (the carry happens at
+  the atlas-handle level in wc1_render).
+- `wc1_render.bsm` — Gather component added to the peasant
+  archetype (10 components total now). `_render_unit`
+  inlines the mine-hide skip + the carry-atlas swap (per
+  faction). `wc1_render_set_carry_atlases` is the
+  single-point setter rts.bpp calls at startup.
+- `wc1_input.bsm` — right-click handler grew two new
+  branches: gold-mine hit-test (every selected peasant
+  enters the gather cycle) + tree-tile hit-test (every
+  selected peasant enters the chop cycle). `_issue_move`
+  now clears any in-flight gather assignment so a bare
+  move command cancels the loop.
+- `wc1_combat.bsm` — combat tick skips GATHER_* +
+  RETURNING_* states (workers don't auto-engage while
+  hauling resources, canonical WC1).
+- `rts.bpp` — loads the new resource module + 7 new
+  atlases (gold_mine + top_resource_bar + gold_icon +
+  lumber_icon + 4 carry atlases). New
+  `_spawn_buildings_from_level` runs BEFORE units, picks
+  up `kind:"gold-mine"` entries (4 in forest1.json). New
+  ticks: `wc1_gather_tick` + `wc1_resources_recompute_cap`.
+
+**Asset additions** (`games/rts1/assets/sprites/wc1/`):
+- `buildings/neutral/gold_mine.{json,png}` — 64×64 single
+  frame.
+- `hud/human/gold_icon.{json,png}` (13×6),
+  `hud/human/lumber_icon.{json,png}` (9×9).
+- `peasant_with_gold.{json,png}`, `peasant_with_wood.{json,png}`,
+  `peon_with_gold.{json,png}`, `peon_with_wood.{json,png}` —
+  same 160×416 Aseprite-shaped layout as the base atlases.
+
+**Engine touch** (`stb/`):
+- `stbecs.bsm` — `world.archetypes` migrated from
+  `arr<ArchetypeRec*>` (per-archetype malloc) to
+  `arr_struct<ArchetypeRec>` (inline AoS). User audit after
+  the array-migration arc pushed the deferred-then-deleted
+  task back open — rts1 is now at 2 archetypes (units +
+  buildings) and S11 (AI + projectiles + resources +
+  decorations) is the named consumer that justified the
+  migration under Rule 36. Compiler binary byte-identical
+  to the prior commit (stbecs is a stb cartridge, not
+  imported by bpp.bpp).
+
+**Validation**: bootstrap byte-stable. Native suite
+177/0/12, C-emit 141/0/48 (last validated on the prior arc
+commit; this arc didn't touch the compiler). ECS-specific
+smoke tests (`test_ecs_archetype` / `_component` / `_query`
+/ `_scheduler`) all pass against the new archetype storage.
+
+**HUD evolution roadmap** — S8.6 (top resource bar) lands
+with this session. S8.7 (left pane: large portrait + stat
+strip) + S8.8 (command card action buttons) + S8.9
+(minimap) + S8.10 (alert system + voice) + S8.11 (polish
+pass) remain queued per the roadmap above; each gates on
+the corresponding gameplay-arc trigger (S10 production for
+the command card, S11 AI for the minimap, S12 audio for
+alerts).
+
+**Deferred to S10 / future polish**:
+- Production gate not wired yet — `wc1_resources_can_afford`
+  + `_spend` shipped as the API, but no UI today calls them.
+  Lands with S10's training-button arc.
+- Lumber mill drop-point — canonical WC1 routes wood to the
+  lumber mill (if built) instead of the town hall. v1 sends
+  every deposit to the nearest town hall; the lumber-mill
+  variant is a one-line swap in `_find_nearest_town_hall`
+  once the player has reason to build one.
+- Gold mine "collapse" visuals — mines flip to
+  `BLDG_STATE_DEPLETED` when the reserve hits 0 but the
+  sprite stays the same. A depleted variant (or simply
+  greying the atlas) lands with the eventual mine-sprite
+  polish.
 
 ### Session 10 — Production (training + research) (~3-4h)
 

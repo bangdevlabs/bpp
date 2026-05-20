@@ -21,6 +21,38 @@ import "stbcharsheet.bsm";
 load   "wc1_units.bsm";
 load   "wc1_anims.bsm";
 
+// S9 — Gather component constants (mirrored from wc1_gather.bsm
+// to avoid a wc1_render ↔ wc1_gather load cycle). The render
+// path inlines the carry-atlas dispatch + mine-hide check
+// because both are one-struct-load decisions that don't earn
+// a cross-module function call. wc1_gather owns the writes;
+// wc1_render only reads.
+const _GATHER_TARGET_NONE_RD = 0;
+const _GATHER_TARGET_MINE_RD = 1;
+const _CARRY_NONE_RD         = 0;
+const _CARRY_GOLD_RD         = 1;
+const _CARRY_WOOD_RD         = 2;
+
+// Per-faction carry atlases — populated by rts.bpp at startup via
+// `wc1_render_set_carry_atlases`. Mirrors the symmetric setup in
+// wc1_gather (both modules read these for their own dispatch); we
+// keep TWO copies instead of one shared global because the cycle
+// would require `import` instead of `load`, and the four extrn
+// slots live on the bare-minimum heap (32 bytes).
+static auto _render_carry_atlas_human_gold;
+static auto _render_carry_atlas_human_wood;
+static auto _render_carry_atlas_orc_gold;
+static auto _render_carry_atlas_orc_wood;
+
+void wc1_render_set_carry_atlases(human_gold, human_wood,
+                                  orc_gold,   orc_wood) {
+    _render_carry_atlas_human_gold = human_gold;
+    _render_carry_atlas_human_wood = human_wood;
+    _render_carry_atlas_orc_gold   = orc_gold;
+    _render_carry_atlas_orc_wood   = orc_wood;
+    return;
+}
+
 // Component layouts. Pos uses PIXEL coords (not tile coords) so
 // movement can interpolate sub-tile for smooth 60 FPS render.
 // Convert to grid via `/16` when path planning needs cell coords.
@@ -73,6 +105,18 @@ struct AttackTarget { eid, last_attack_ms }
 // facing change so wc1_movement can reset the cycle to frame 0
 // when the unit turns or starts/stops.
 struct Anim     { state, facing, elapsed_ms }
+// S9 — gather state. Carried by every peasant in the unit
+// archetype (it's small + always present even when the unit isn't
+// gathering). `target_kind` is GATHER_TARGET_* (NONE / MINE /
+// TREE); `target` is the mine eid (MINE) or the tree tile linear
+// index gy*map_w+gx (TREE). `deposit_eid` is latched to the
+// nearest town hall on the first cycle so subsequent runs route
+// through the same building. `progress_ms` accumulates dt while
+// peasant is at the target; reaches _WC1_GATHER_TICK_MS and the
+// peasant flips to RETURNING_*. `carry` is CARRY_NONE / GOLD /
+// WOOD — drives the atlas swap to peasant_with_gold /
+// peasant_with_wood while the peasant walks back.
+struct Gather   { target_kind, target, deposit_eid, progress_ms, carry }
 
 // Maximum waypoints in a single peasant's path. Forest1 is 64×64;
 // a worst-case Manhattan path crosses ~128 tiles. 256 covers that
@@ -86,7 +130,7 @@ const MAX_WAYPOINTS = 256;
 // to flow through globals because B++ doesn't carry closures.
 // Same pattern every other stbecs consumer follows.
 global pos_comp, sprite_comp, unit_comp, target_comp, path_comp, anim_comp;
-global faction_comp, sheet_comp, attack_target_comp;
+global faction_comp, sheet_comp, attack_target_comp, gather_comp;
 global peasant_arch, peasant_q;
 
 // Camera handle owned by rts.bpp. Read by _render_unit via
@@ -115,7 +159,8 @@ ecs_wire(world) {
     faction_comp       = ecs_component_register(world, "Faction",      sizeof(Faction));
     sheet_comp         = ecs_component_register(world, "Sheet",        sizeof(Sheet));
     attack_target_comp = ecs_component_register(world, "AttackTarget", sizeof(AttackTarget));
-    comps    = buf_word(9);
+    gather_comp        = ecs_component_register(world, "Gather",       sizeof(Gather));
+    comps    = buf_word(10);
     comps[0] = pos_comp;
     comps[1] = sprite_comp;
     comps[2] = unit_comp;
@@ -125,7 +170,8 @@ ecs_wire(world) {
     comps[6] = faction_comp;
     comps[7] = sheet_comp;
     comps[8] = attack_target_comp;
-    peasant_arch = ecs_archetype(world, comps, 9);
+    comps[9] = gather_comp;
+    peasant_arch = ecs_archetype(world, comps, 10);
     peasant_q    = ecs_query(world, 1 << unit_comp);
 }
 
@@ -147,7 +193,7 @@ ecs_wire(world) {
 ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     auto eid;
     auto p: Pos, s: Sprite, u: UnitType, t: Target, pa: Path, an: Anim;
-    auto fa: Faction, sh: Sheet, at: AttackTarget;
+    auto fa: Faction, sh: Sheet, at: AttackTarget, gt: Gather;
     auto def: UnitDef;
     def = unit_def_for(kind);
     eid = ecs_spawn_at(world, peasant_arch);
@@ -226,6 +272,15 @@ ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     at = ecs_get(world, attack_target_comp, eid);
     at.eid = -1;
     at.last_attack_ms = 0;
+    // S9 Gather — every unit carries the slot; the gather tick
+    // skips entries with target_kind == GATHER_TARGET_NONE so
+    // non-peasant units (footmen etc.) pay zero cycle cost.
+    gt = ecs_get(world, gather_comp, eid);
+    gt.target_kind  = 0;          // GATHER_TARGET_NONE
+    gt.target       = 0;
+    gt.deposit_eid  = -1;
+    gt.progress_ms  = 0;
+    gt.carry        = 0;          // CARRY_NONE
     return eid;
 }
 
@@ -246,18 +301,46 @@ static void _render_unit(w, eid) {
     auto p: Pos, s: Sprite, an: Anim, u: UnitType;
     auto def: UnitDef;
     auto anim_id, flip, sprite_id, sx, sy, px, off_x, off_y;
+    auto draw_atlas, gt: Gather, fa: Faction;
     p  = ecs_get(w, pos_comp,    eid);
     s  = ecs_get(w, sprite_comp, eid);
     an = ecs_get(w, anim_comp,   eid);
     u  = ecs_get(w, unit_comp,   eid);
+    gt = ecs_get(w, gather_comp, eid);
     def = unit_def_for(u.kind);
     px = def.px_size;
     off_x = 0 - (px - 16) / 2;
     off_y = 0 - (px - 16);
+    // S9 — peasants inside a gold mine vanish (canonical WC1
+    // feedback). The gather state machine sets the Anim.state to
+    // GATHER_GOLD only after the peasant arrives at the mine,
+    // so this check skips the actual draw without removing the
+    // unit from the simulation.
+    if (gt.target_kind == _GATHER_TARGET_MINE_RD
+        && gt.carry == _CARRY_NONE_RD
+        && an.state == UNIT_STATE_GATHER_GOLD) {
+        return;
+    }
     anim_id = 0;
     flip    = 0;
     wc1_anim_id_for(an.state, an.facing, &anim_id, &flip);
-    sprite_id = image_anim_frame(s.atlas, anim_id, an.elapsed_ms);
+    // S9 — atlas swap. Peasants carrying gold / wood render
+    // through the peasant_with_* / peon_with_* atlases so the
+    // WC1 carry visual shows up. Faction read tells us which
+    // sprite set to use (human vs orc).
+    draw_atlas = s.atlas;
+    if (gt.carry != _CARRY_NONE_RD) {
+        fa = ecs_get(w, faction_comp, eid);
+        if (gt.carry == _CARRY_GOLD_RD) {
+            if (fa.player == 0) { draw_atlas = _render_carry_atlas_human_gold; }
+            else                { draw_atlas = _render_carry_atlas_orc_gold;   }
+        } else {
+            if (fa.player == 0) { draw_atlas = _render_carry_atlas_human_wood; }
+            else                { draw_atlas = _render_carry_atlas_orc_wood;   }
+        }
+        if (draw_atlas == 0) { draw_atlas = s.atlas; }
+    }
+    sprite_id = image_anim_frame(draw_atlas, anim_id, an.elapsed_ms);
     // Defensive: if the atlas didn't carry the requested anim,
     // sprite_id falls back to -1 — keep rendering the spawn-time
     // default frame instead of crashing.
@@ -265,9 +348,9 @@ static void _render_unit(w, eid) {
     sx = p.x + off_x - cam_x(cam);
     sy = p.y + off_y - cam_y(cam);
     if (flip != 0) {
-        image_draw_size_flipped(s.atlas, sprite_id, sx, sy, px, px);
+        image_draw_size_flipped(draw_atlas, sprite_id, sx, sy, px, px);
     } else {
-        image_draw_size(s.atlas, sprite_id, sx, sy, px, px);
+        image_draw_size(draw_atlas, sprite_id, sx, sy, px, px);
     }
 }
 
