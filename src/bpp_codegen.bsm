@@ -1587,6 +1587,31 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: unpack_l(p) — extract the upper 32 bits of a packed
+    // string ref. Equivalent to `shr(p, 32)` but with the shift
+    // count hardcoded so the spine can skip the second emit_node
+    // pass. Hot-path opt sidequest (S3b): unpack_l shows ~20% of
+    // bootstrap CPU in `bench_compile.sh --sample`; lifting it into
+    // the builtin lane swaps a ~14-instruction function-call frame
+    // for the 5 inline ops below.
+    //
+    // Sequence (same shape as `shr` but with the constant baked in):
+    //   1. mov_imm(32) → acc = 32
+    //   2. push_acc    → stack = [32]
+    //   3. emit_node(p) → acc = p
+    //   4. pop_scratch → scratch = 32
+    //   5. shift_right_logical → acc = p >>u 32  (LSR on ARM64,
+    //                                              SHR on x86_64)
+    if (cg_str_eq(n.a, "unpack_l", 8)) {
+        arr = n.b;
+        call(p.emit_mov_imm, 32);
+        call(p.emit_push_acc);
+        call(p.emit_node, *(arr + 0));   // p (the packed ref)
+        call(p.emit_pop_scratch);
+        call(p.emit_shift_right_logical);
+        return 1;
+    }
+
     // Built-in: float_ret() / float_ret2() — read the saved float
     // return value from the frame slot set after an extern call.
     // Return 2 means "handled and result is float (ety=1)" — chip

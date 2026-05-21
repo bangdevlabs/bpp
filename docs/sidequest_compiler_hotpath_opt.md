@@ -1,6 +1,43 @@
 # Sidequest — Compiler hot path optimization (3 layered stages)
 
-**Status:** PROPOSED 2026-05-20, ready-to-execute.
+**Status:** SHIPPED 2026-05-20 (commit pending). All four stages
+landed (S1 + S2 + S3a + S3b) with profile sanity gate between
+each. Bootstrap 0.51s → 0.37s = **~27% improvement** (well past
+the doc's original 20-25% estimate). Suite 177/0/12 native +
+141/0/48 C-emit, both byte-stable.
+
+Final hot-list state vs baseline:
+
+| Function | Baseline samples | After S3b | Change |
+|---|---|---|---|
+| `unpack_l` | 69 (20%) | <5 (out of top) | inlined as builtin |
+| `_dsp_find_func_idx` | 27 (8%) | <5 (out of top) | replaced by hash lookup |
+| `packed_eq` | 55 (16%) | 54 (15%) | CSE saved ~20% of body cost but the function itself stayed in the top |
+| `unpack_s` | (not in top) | (not in top) | unchanged — call-frame overhead remains; queued for future polish |
+
+Per stage:
+
+- **S1** (unpack_l SDIV→LSR): bootstrap 0.51→0.50, ~2%
+- **S2** (hash for _dsp_find_func_idx): bootstrap 0.50→0.42, ~17%
+- **S3a** (CSE in packed_eq): 0.42→0.41, ~2%
+- **S3b** (unpack_l as builtin): 0.41→0.37, ~10%
+
+S3b was originally deferred as "ROI marginal" — that turned out
+to be wrong. The function-call frame around `unpack_l` was where
+most of its 20% lived; the LSR-vs-SDIV improvement in S1 only
+shaved the body, not the prologue/epilogue. Lifting it into the
+builtin lane (5-op inline sequence, mirror of the existing `shr`
+builtin) eliminated the frame entirely. Lesson: when a hot
+function's body is already trivial, the call frame is the
+remaining cost — inlining via `cg_builtin_dispatch` is the right
+next step, not parser-level rewrite.
+
+**Original proposal text below, preserved as-is for the
+historical record of how the audit landed.**
+
+---
+
+**Status (original):** PROPOSED 2026-05-20, ready-to-execute.
 **Trigger:** Profile audit do bootstrap (`time ./bpp src/bpp.bpp -o /tmp/bpp_g1`) mostra que 3 funções
 triviais consomem ~44% das amostras de CPU. Cada uma tem fix profile-justified com Rule 28 gate batido.
 

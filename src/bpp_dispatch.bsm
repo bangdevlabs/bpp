@@ -213,6 +213,12 @@ void init_dispatch() {
     fn_effect = arr_new();
     fn_effect_next = arr_new();
     fn_inlineable = arr_new();
+    // S9 — sentinel for the lazy func-name hash. -1 forces a build
+    // on the first `_dsp_find_func_idx` call (after parser finishes
+    // populating funcs[]); subsequent stale-count rebuilds handle
+    // smart-dispatch's worker-synth growth.
+    _dsp_func_hash = 0;
+    _dsp_func_hash_count = 0 - 1;
     init_fn_origins();
     init_fn_reg();
     init_glob_origins();
@@ -757,21 +763,44 @@ void analyze_body(body_arr, body_cnt) {
 
 // ── Function lookup helper ─────────────────────────────────
 
-// Find a function index by its packed name. Returns -1 if not found.
-// Linear scan for now — only called by call_graph_build during AST walk.
-// Future optimization: build a name→idx hash up front, like val_find_func.
-// Find a function index by packed name. Uses content comparison
-// (packed_eq) because the call site and the definition site often
-// have different packed values — they were scanned in different modules.
-static _dsp_find_func_idx(name_p) {
-    auto i, rec, fname;
+// Find a function index by packed name. O(1) via hash with rebuild-
+// on-stale-count semantics so smart-dispatch's late synth-fn
+// additions (bpp_dispatch.bsm:3252 grows funcs[] after
+// call_graph_build) stay visible — see `_dsp_build_func_hash`.
+//
+// Mirrors the val_find_func pattern from bpp_validate.bsm:421 +
+// shares the same `+1/-1` dance to distinguish "absent" (hash_get
+// returns 0) from "idx 0". Hot path: this function shows ~8% in
+// `bench_compile.sh --sample`, dominated by the linear scan +
+// packed_eq calls — see docs/sidequest_compiler_hotpath_opt.md.
+static auto _dsp_func_hash;            // hash_str: name → (idx + 1)
+static auto _dsp_func_hash_count;      // func_cnt at last build; -1 = unbuilt
+
+static void _dsp_build_func_hash() {
+    auto i, rec, name_p;
+    if (_dsp_func_hash == 0) { _dsp_func_hash = hash_str_new(256); }
+    hash_str_clear(_dsp_func_hash);
     for (i = 0; i < func_cnt; i++) {
         rec = funcs[i];
-        fname = *(rec + FN_NAME);
-        if (fname == name_p) { return i; }
-        if (packed_eq(fname, name_p)) { return i; }
+        name_p = *(rec + FN_NAME);
+        hash_str_set(_dsp_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
     }
-    return -1;
+    _dsp_func_hash_count = func_cnt;
+}
+
+static _dsp_find_func_idx(name_p) {
+    auto v;
+    // Lazy build + stale-count rebuild. Smart-dispatch's worker
+    // synthesizer grows funcs[] after the initial call_graph_build
+    // pass; comparing against `_dsp_func_hash_count` catches that
+    // without exposing the table boundary to callers.
+    if (_dsp_func_hash_count != func_cnt) { _dsp_build_func_hash(); }
+    v = hash_str_get(_dsp_func_hash,
+                     vbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return -1; }
+    return v - 1;
 }
 
 // ── Call graph build ────────────────────────────────────────

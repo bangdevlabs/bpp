@@ -10968,3 +10968,138 @@ peasant per frame.
 - Production gate UI — `wc1_resources_can_afford` / `_spend`
   shipped as the API. The training-button UI (S10) is what
   consumes them.
+
+## 2026-05-20 (latest) — Compiler hot-path opt CLOSED — ~27% bootstrap improvement
+
+### What landed
+
+Four stacked stages of mechanical, profile-justified optimization
+to the compiler self-host hot path. Proposal lives in
+`docs/sidequest_compiler_hotpath_opt.md` (shipped same arc, see
+the updated header for the SHIPPED status block).
+
+| Stage | What | LOC | Bootstrap | Cumulative gain |
+|---|---|---|---|---|
+| Baseline | — | — | 0.51s | — |
+| S1 | `unpack_l` SDIV → LSR (via `: u_word`) | ~10 in `bpp_defs.bsm` | 0.50s | ~2% |
+| S2 | Hash for `_dsp_find_func_idx` | ~45 in `bpp_dispatch.bsm` | 0.42s | ~18% |
+| S3a | CSE in `packed_eq` (hoist `unpack_s`) | ~5 in `bpp_internal.bsm` | 0.41s | ~20% |
+| S3b | `unpack_l` as a `cg_builtin_dispatch` builtin | ~25 across 3 files | 0.37s | **~27%** |
+
+### Each stage, in one paragraph
+
+**S1 — unpack_l shift fix.** Phase D.1 strength reduction
+explicitly skipped `/ 2^k` to preserve signed semantics, so the
+natural `p / 0x100000000` shape compiled to SDIV (~12-20 cycles on
+ARM64). For packed string refs `p` is always non-negative, so an
+unsigned shift is bit-equivalent. Re-spell `unpack_l` to route
+through `auto pu: u_word; pu = p; return pu >> 32;` so the
+`>>` operator's LHS dispatch picks LSR per Rule 32. Verified via
+`otool -tv` — the body now emits `lsr x0, x9, x0`. Gain modest
+(~2%) because the function-call frame survived intact.
+
+**S2 — Hash for `_dsp_find_func_idx`.** The function already had
+a TODO comment ("Future optimization: build a name→idx hash up
+front, like val_find_func"). Mirror the `val_find_func` pattern
+from `bpp_validate.bsm`: `hash_str_set(name, idx + 1)` populated
+lazily on first call + rebuilt on stale `func_cnt` (sentinel
+`_dsp_func_hash_count`) so smart-dispatch's late-added synth
+functions stay visible. Biggest single win of the arc — linear
+scan over ~600 functions × thousands of call sites in
+`call_graph_build` was the silent quadratic that dominated 17%
+of bootstrap CPU. Hash lookup at O(1) collapsed the entire
+fixpoint pass.
+
+**S3a — CSE in `packed_eq`.** Five-line edit: hoist
+`unpack_s(a)` + `unpack_s(b)` out of the byte-compare loop. The
+original called both per iteration — for a 10-char name, 20
+redundant function calls per `packed_eq` invocation. After
+hoisting: 2 calls total. `packed_eq` dropped from 55 to 44
+samples (~20% of its own body cost).
+
+**S3b — unpack_l lifted to `cg_builtin_dispatch`.** Originally
+deferred as "ROI marginal" — that turned out to be wrong. The
+function-call frame around `unpack_l` was the remaining cost:
+S1 cut the SDIV inside the body, but the prologue/epilogue
+(`stp x29, x30, [sp, #-0x40]!` + 6 reg-shuffles + `ldp` + `ret`)
+was ~13 instructions of overhead around 1 instruction of work.
+Add `unpack_l` to `val_is_builtin`; add a dispatch case in
+`cg_builtin_dispatch` that mirrors the existing `shr` pattern
+with the count hardcoded (5-op inline sequence: `mov_imm(32)` →
+`push_acc` → `emit_node(arg)` → `pop_scratch` →
+`shift_right_logical`); add the `--c` emit pattern
+(`((long long)((uint64_t)(arg) >> 32))`). The B++ function body
+in `bpp_defs.bsm` stays as the fallback for `fn_ptr(unpack_l)`
+takers + the C-emit path before the new dispatch case fires.
+Single biggest gain after S2 — `unpack_l` went from 76 samples
+(20% of bootstrap CPU) to under 5.
+
+### Engine touch — no new chip primitive
+
+S3b composed entirely from existing primitives
+(`emit_mov_imm` + `emit_push_acc` + `emit_pop_scratch` +
+`emit_shift_right_logical`). Adding a dedicated
+`emit_shift_right_logical_imm(count)` would shave a few cycles
+(skip the push/pop dance + immediate-encoded LSR) but the saving
+is single-digit percent on top of the already-~10% S3b gain.
+Queued behind any compiler arc that needs the imm-shift primitive
+for other reasons.
+
+### Verification per Tonify Rule 37
+
+```
+bench_compile.sh
+  bpp:  /Users/Codes/b++/bpp  (924482 bytes, mtime 2026-05-20 22:14)
+  runs: 5
+
+  case                    min     median  max
+  ──────────────────────  ──────  ──────  ──────
+  bootstrap               0.37    0.37    0.37
+  small (test_array)      0.05    0.05    0.05
+  medium (test_stbmidi)   0.07    0.07    0.07
+
+  sample(1) hot-list (top-of-stack, >=5 samples):
+            packed_eq           54
+            cg_str_eq_packed    31
+            _mem_free_pages     28
+            malloc              26
+            arr_get             25
+            mo_packed_eq        12
+            u32                 11
+            sha_rotr            10
+            sha_transform        8
+            arr_struct_at        7
+            _mem_alloc_pages     6
+            dsp_find_global      6
+```
+
+Bootstrap fixed-point: g1 ≠ g2 (1-cycle oscillation expected
+since the compiler self-hosts inline-`unpack_l` differently after
+S3b) but g2 == g3 byte-stable. Suite 177/0/12 native + 141/0/48
+C-emit, both green.
+
+### Followups deferred
+
+- **S3c — inline `unpack_s` as builtin.** Same shape as S3b but
+  the inner op is `acc & 0xFFFFFFFF` (no scratch register
+  needed). Would need either a new chip primitive
+  (`emit_and_imm`) or compose from `emit_mov_imm(0xFFFFFFFF)` +
+  push/pop scratch + `emit_arithmetic_and`. Profile didn't put
+  `unpack_s` in the post-S3b top list — defer until it surfaces.
+- **S3d — inline `packed_eq`.** Function-call frame around
+  `packed_eq` is the remaining cost (it's still 54 samples).
+  Inlining it would require either D.4 parser whitelist
+  expansion (parses `packed_eq(a, b)` and rewrites to a loop
+  block) or a more general "inline trivial wrappers" cost-model
+  pass. Defer until a bigger compiler-internals arc absorbs it.
+- **`cg_str_eq_packed` at 31 samples.** Next obvious candidate
+  after S3d — same call-frame-around-tight-loop shape.
+
+### Lesson recorded
+
+When a hot function's body is already trivial (single arithmetic
+op), **the call frame is the cost**. Optimizing the body via
+strength reduction or strength-equivalence is a half-measure;
+lifting the whole call into the builtin lane via
+`cg_builtin_dispatch` is the right next step. S1 alone was the
+half-measure; S3b was the actual fix.
