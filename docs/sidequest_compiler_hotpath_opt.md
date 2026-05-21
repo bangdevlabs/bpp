@@ -1,10 +1,13 @@
 # Sidequest — Compiler hot path optimization (3 layered stages)
 
-**Status:** SHIPPED 2026-05-20 (commit pending). All four stages
-landed (S1 + S2 + S3a + S3b) with profile sanity gate between
-each. Bootstrap 0.51s → 0.37s = **~27% improvement** (well past
-the doc's original 20-25% estimate). Suite 177/0/12 native +
-141/0/48 C-emit, both byte-stable.
+**Status:** SHIPPED 2026-05-20 (committed 71b64a2 + S3c
+follow-up). Five stages landed (S1 + S2 + S3a + S3b + S3c) with
+profile sanity gate between each. Bootstrap 0.51s → 0.37s =
+**~27% improvement** (well past the doc's original 20-25%
+estimate). S3c didn't move the wall-time bench but the
+sample(1) hot list confirmed it eliminated `unpack_s` call
+frames inside `cg_str_eq_packed` (31 → 22 samples). Suite
+177/0/12 native + 141/0/48 C-emit, both byte-stable.
 
 Final hot-list state vs baseline:
 

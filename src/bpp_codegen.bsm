@@ -1612,6 +1612,31 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: unpack_s(p) — extract the lower 32 bits of a packed
+    // string ref. Equivalent to `p & 0xFFFFFFFF`. Hot-path opt
+    // sidequest (S3c) — unpack_s is called inside packed_eq +
+    // cg_str_eq_packed (each twice per invocation post-S3a CSE)
+    // + many other lookup sites; the call frame around the trivial
+    // AND was the cost.
+    //
+    // BINOP convention (chip primitive `emit_and(left_reg)`
+    // expects right operand in acc / x0, left operand in
+    // `left_reg`, emits `acc = left_reg & acc`):
+    //   1. emit_node(p)    → acc = p (LHS)
+    //   2. push_acc        → stack = [p]
+    //   3. mov_imm(0xFFFFFFFF) → acc = mask (RHS)
+    //   4. pop_scratch     → scratch (x1 / rcx) = p
+    //   5. emit_and(1)     → acc = scratch & acc = p & mask
+    if (cg_str_eq(n.a, "unpack_s", 8)) {
+        arr = n.b;
+        call(p.emit_node, *(arr + 0));   // p (the packed ref, LHS)
+        call(p.emit_push_acc);
+        call(p.emit_mov_imm, 0xFFFFFFFF); // mask (RHS) in acc
+        call(p.emit_pop_scratch);        // p restored into scratch
+        call(p.emit_and, 1);             // acc = (scratch) & acc
+        return 1;
+    }
+
     // Built-in: float_ret() / float_ret2() — read the saved float
     // return value from the frame slot set after an extern call.
     // Return 2 means "handled and result is float (ety=1)" — chip

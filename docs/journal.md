@@ -11078,22 +11078,68 @@ since the compiler self-hosts inline-`unpack_l` differently after
 S3b) but g2 == g3 byte-stable. Suite 177/0/12 native + 141/0/48
 C-emit, both green.
 
-### Followups deferred
+### S3c — `unpack_s` as builtin (shipped continuação)
 
-- **S3c — inline `unpack_s` as builtin.** Same shape as S3b but
-  the inner op is `acc & 0xFFFFFFFF` (no scratch register
-  needed). Would need either a new chip primitive
-  (`emit_and_imm`) or compose from `emit_mov_imm(0xFFFFFFFF)` +
-  push/pop scratch + `emit_arithmetic_and`. Profile didn't put
-  `unpack_s` in the post-S3b top list — defer until it surfaces.
+User pushed past the original S3b stopping point ("vambora");
+next candidate was `unpack_s`. Same lift pattern as S3b but the
+inner op is AND instead of LSR. Body: `p & 0xFFFFFFFF`.
+
+Composed via the BINOP convention (`emit_and(left_reg)` reads
+right operand from acc, left from `left_reg`, emits `acc =
+left_reg & acc`):
+
+```
+emit_node(p)                  # acc = p (LHS)
+push_acc                       # stack = [p]
+mov_imm(0xFFFFFFFF)            # acc = mask (RHS)
+pop_scratch                    # scratch (x1 / rcx) = p
+emit_and(1)                    # acc = scratch & acc = p & mask
+```
+
+C-emit: `((long long)((uint64_t)(p) & 0xFFFFFFFFULL))`.
+
+No new chip primitive. Same 1-cycle bootstrap oscillation as
+S3b (g1 ≠ g2 because the OLD compiler emits the call form into
+gen1; gen1, the new compiler, inlines its own source into
+gen2; g2 == g3 byte-stable).
+
+**Bench result**: bootstrap wall time **stayed at 0.37s** — the
+~27% from S3b was already at the measurement noise floor for
+`bench_compile.sh` (~10ms resolution at 5 runs). The
+`sample(1)` hot list confirmed the win is real: `cg_str_eq_packed`
+dropped 31 → 22 samples (it calls `unpack_s` twice per
+invocation, both got inlined after S3c). The total CPU win is
+~5-10ms spread across the bootstrap, masked by the bench's
+per-run variance.
+
+Verdict: real micro-win, shipped. Documents the principle that
+"hot-list rank shifted, wall-time stable" is a valid stopping
+signal — the optimization paid for itself in distribution even
+if not at the wall-time scale.
+
+### Followups deferred (after S3c)
+
+- **`arr_get` inline as builtin (~21 samples).** Body is
+  `*(arr + i * _ARR_ELEM)` (single load with shift-index).
+  Would need to extend `emit_mem_read_indexed` to width=8
+  (currently width=1 only — the TODO comment in
+  `a64_primitives.bsm:1516` literally says "widths 2/4/8 — no
+  callers today. Add when needed."). Touches both chips. Defer
+  until a bigger compiler-internals arc earns the primitive.
+- **`arr_len` inline as builtin (~16 samples).** Body has a
+  null guard (`if (arr == 0) return 0`) before the load.
+  Inlining a branch via `cg_builtin_dispatch` requires emit_label
+  + emit_branch_if_zero — adds new control-flow shape to the
+  dispatch path. Defer until the pattern is needed for two
+  consumers (Rule 36).
 - **S3d — inline `packed_eq`.** Function-call frame around
-  `packed_eq` is the remaining cost (it's still 54 samples).
-  Inlining it would require either D.4 parser whitelist
-  expansion (parses `packed_eq(a, b)` and rewrites to a loop
-  block) or a more general "inline trivial wrappers" cost-model
-  pass. Defer until a bigger compiler-internals arc absorbs it.
-- **`cg_str_eq_packed` at 31 samples.** Next obvious candidate
-  after S3d — same call-frame-around-tight-loop shape.
+  `packed_eq` is the remaining cost (it's still 59 samples post-
+  S3c, picking up some of the cg_str_eq_packed redistribution).
+  Inlining a function with a loop body via `cg_builtin_dispatch`
+  is doable (emit_label + emit_branch_if + the byte-compare
+  body) but creates substantial code bloat at every call site.
+  Defer until a profile run shows packed_eq dominating enough
+  to justify the bloat trade.
 
 ### Lesson recorded
 
