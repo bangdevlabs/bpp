@@ -28,20 +28,20 @@ import "stbtile.bsm";
 import "stbimage.bsm";       // for file_watch_register / file_watch_tick
 import "stbecs.bsm";         // ECS world for unit entities
 import "stbcamera.bsm";      // 2D camera state + clamp
-load   "wc1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
-load   "wc1_units.bsm";
-load   "wc1_anims.bsm";
-load   "wc1_render.bsm";
-load   "wc1_input.bsm";
-load   "wc1_hud.bsm";
-load   "wc1_movement.bsm";
-load   "wc1_combat.bsm";
-load   "wc1_missiles.bsm";
-load   "wc1_regen.bsm";
-load   "wc1_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
-load   "wc1_production.bsm";  // S8 — construction state-machine tick
-load   "wc1_resources.bsm";   // S9 — gold/wood/food + food-cap recompute
-load   "wc1_gather.bsm";      // S9 — peasant gather/return state machine
+load   "rts1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
+load   "rts1_units.bsm";
+load   "rts1_anims.bsm";
+load   "rts1_render.bsm";
+load   "rts1_input.bsm";
+load   "rts1_hud.bsm";
+load   "rts1_movement.bsm";
+load   "rts1_combat.bsm";
+load   "rts1_missiles.bsm";
+load   "rts1_regen.bsm";
+load   "rts1_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
+load   "rts1_production.bsm";  // S8 — construction state-machine tick
+load   "rts1_resources.bsm";   // S9 — gold/wood/food + food-cap recompute
+load   "rts1_gather.bsm";      // S9 — peasant gather/return state machine
 
 // ── Constants ────────────────────────────────────────────
 
@@ -557,6 +557,16 @@ main() {
                                  peon_with_gold_atlas,
                                  peon_with_wood_atlas);
     _spawn_buildings_from_level(world, map);
+    // S9 closure — seed every player a pre-DONE town hall as a
+    // deposit point; without it the gather cycle stalls after the
+    // first chop / mine tick (peasant carries the resource
+    // forever with nowhere to drop it). forest1.json clusters
+    // every player's entities on a single tile (campaign-style
+    // "drop pod"); the seeder spreads a faction-appropriate town
+    // hall a few tiles inward from each `start_view`. Runs
+    // BEFORE unit spawn so the unit spawner can route peasants
+    // around the claimed building footprints.
+    _seed_town_halls_for_players(world, map);
     _spawn_units_from_level(world, map);
 
     // Game loop. Identical shape to the existing pathfind /
@@ -665,13 +675,191 @@ static void _spawn_buildings_from_level(world, map) {
     }
 }
 
+// Tilemap handle exported by wc1_movement once `wc1_movement_init`
+// has run. Imported here for the town-hall seeder's clear-tile
+// scan; declared inline so it lives next to its only user. The
+// predicate functions (`wc1_is_forest_tile`,
+// `wc1_collision_is_blocked_for`) resolve through the cross-module
+// function table directly — `extrn` is for globals only.
+extrn world_map;
+
+// Faction lookup for town-hall atlases — players 0/2 are human,
+// players 1/3 are orc per forest1.json convention. Multi-faction
+// lobbies graduate later; the v1 table is hard-coded against the
+// current 4-corner level.
+static _player_is_human(player) {
+    if (player == 0) { return 1; }
+    if (player == 2) { return 1; }
+    return 0;
+}
+
+// Probe a 4×4 region rooted at (rx, ry). Returns 1 if every tile
+// is in-bounds, walkable (not a forest cluster cell), and free of
+// any prior collision claim. -2 is the sentinel "not me" entity id
+// — `wc1_collision_is_blocked_for` returns 1 for any non-zero
+// claim because no entity id matches -1 in storage.
+static _region_4x4_is_clear(rx, ry, w, h) {
+    auto dx, dy, tx, ty, tid;
+    for (dy = 0; dy < 4; dy++) {
+        for (dx = 0; dx < 4; dx++) {
+            tx = rx + dx;
+            ty = ry + dy;
+            if (tx < 0 || ty < 0)        { return 0; }
+            if (tx >= w || ty >= h)      { return 0; }
+            tid = tile_get(world_map, tx, ty);
+            if (wc1_is_forest_tile(tid) != 0)                 { return 0; }
+            if (wc1_collision_is_blocked_for(0 - 2, tx, ty)
+                                                       != 0)  { return 0; }
+        }
+    }
+    return 1;
+}
+
+// Single-tile variant of `_region_4x4_is_clear` — checks one cell
+// for the unit spawner. Workers occupy a single tile, so the 4×4
+// scan is overkill; this faster probe gets called once per unit
+// spawn.
+static _cell_is_clear(rx, ry, w, h) {
+    auto tid;
+    if (rx < 0 || ry < 0)             { return 0; }
+    if (rx >= w || ry >= h)           { return 0; }
+    tid = tile_get(world_map, rx, ry);
+    if (wc1_is_forest_tile(tid) != 0)              { return 0; }
+    if (wc1_collision_is_blocked_for(0 - 2, rx, ry) != 0) { return 0; }
+    return 1;
+}
+
+// Spiral-search a clear 1×1 cell near (origin_gx, origin_gy).
+// Returns the cell via out_gxy[0..1] and 1 on success; 0 when no
+// open tile is found within `radius`. Mirrors `_find_clear_4x4`'s
+// expansion pattern but probes single cells — used by the unit
+// spawner to walk a worker off a building-claimed tile.
+static _find_clear_cell(origin_gx, origin_gy, radius, w, h, out_gxy) {
+    auto r, dx, dy;
+    if (_cell_is_clear(origin_gx, origin_gy, w, h) != 0) {
+        out_gxy[0] = origin_gx;
+        out_gxy[1] = origin_gy;
+        return 1;
+    }
+    for (r = 1; r <= radius; r++) {
+        for (dy = 0 - r; dy <= r; dy++) {
+            for (dx = 0 - r; dx <= r; dx++) {
+                if (dx > 0 - r && dx < r && dy > 0 - r && dy < r) { continue; }
+                if (_cell_is_clear(origin_gx + dx,
+                                   origin_gy + dy, w, h) != 0) {
+                    out_gxy[0] = origin_gx + dx;
+                    out_gxy[1] = origin_gy + dy;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Spiral-search a clear 4×4 region near (origin_gx, origin_gy),
+// starting at radius `min_r` (so the placement is guaranteed to
+// be at least that many tiles from the origin tile). Returns the
+// top-left tile of the placement via out_gxy[0..1] and 1 on
+// success; 0 when no free spot is found within `radius`. The
+// `min_r` knob lets the town-hall seeder push the hall a few
+// tiles off the gold mine (both share the start_view position in
+// forest1.json) so the two buildings don't sit corner-to-corner
+// — their sprites otherwise overlap visually and the path
+// between them becomes a single-tile gap.
+static _find_clear_4x4(origin_gx, origin_gy, min_r, radius, w, h, out_gxy) {
+    auto r, dx, dy;
+    if (min_r <= 0 && _region_4x4_is_clear(origin_gx, origin_gy, w, h) != 0) {
+        out_gxy[0] = origin_gx;
+        out_gxy[1] = origin_gy;
+        return 1;
+    }
+    auto r_start;
+    r_start = min_r;
+    if (r_start < 1) { r_start = 1; }
+    for (r = r_start; r <= radius; r++) {
+        // Walk the perimeter of an (origin ± r) square; pick the
+        // first clear region. Order (E / W / S / N then corners)
+        // is arbitrary — the first match wins.
+        for (dy = 0 - r; dy <= r; dy++) {
+            for (dx = 0 - r; dx <= r; dx++) {
+                // Skip the interior already probed at smaller r.
+                if (dx > 0 - r && dx < r && dy > 0 - r && dy < r) { continue; }
+                if (_region_4x4_is_clear(origin_gx + dx,
+                                         origin_gy + dy, w, h) != 0) {
+                    out_gxy[0] = origin_gx + dx;
+                    out_gxy[1] = origin_gy + dy;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Seed a town hall per player. Iterates `start_view` entities,
+// picks faction by `_player_is_human`, and drops a pre-DONE town
+// hall at the first clear 4×4 region inside a 12-tile radius of
+// the start. Skipped silently if no clear region exists in range
+// — the player can still build one manually; we don't crash the
+// map load over a tight forest pocket.
+static void _seed_town_halls_for_players(world, map) {
+    auto i, n, k, sgx, sgy, sp, mw, mh;
+    auto atlas_idle, out_gxy;
+    n  = wc1_map_entity_count(map);
+    mw = wc1_map_w(map);
+    mh = wc1_map_h(map);
+    out_gxy = buf_word(2);
+    for (i = 0; i < n; i++) {
+        k = wc1_map_entity_kind(map, i);
+        if (str_eq(k, "start_view") == 0) { continue; }
+        sgx = wc1_map_entity_gx(map, i);
+        sgy = wc1_map_entity_gy(map, i);
+        sp  = wc1_map_entity_player(map, i);
+        if (_player_is_human(sp) != 0) {
+            atlas_idle = human_town_hall_atlas;
+        } else {
+            atlas_idle = orc_town_hall_atlas;
+        }
+        // min_r=6: keeps the seeded town hall at least 6 tiles
+        // off the start_view + gold mine so the two 4×4 footprints
+        // don't end up corner-to-corner (the visual collision the
+        // S9 close-out smoke flagged).
+        if (_find_clear_4x4(sgx, sgy, 6, 14, mw, mh, out_gxy) == 0) {
+            putstr_err("[seed-th] player="); putnum_err(sp);
+            putstr_err(" NO CLEAR REGION near (");
+            putnum_err(sgx); putstr_err(",");
+            putnum_err(sgy); putstr_err(")\n");
+            continue;
+        }
+        putstr_err("[seed-th] player="); putnum_err(sp);
+        putstr_err(" hall at ("); putnum_err(out_gxy[0]);
+        putstr_err(","); putnum_err(out_gxy[1]); putstr_err(")\n");
+        // atlas_construct = 0 → ecs_spawn_building flips to DONE
+        // immediately (no scaffolding phase for the seeded hall).
+        ecs_spawn_building(world, atlas_idle, 0,
+                           out_gxy[0], out_gxy[1], sp, BLDG_TOWN_HALL);
+    }
+    free(out_gxy);
+}
+
 // Workers (peasant/peon) share UNIT_PEASANT stats — only the
 // rendered atlas differs by faction. Same for casters / heroes
 // that aren't faction-mirrored: each kind keeps its own UnitDef
 // slot.
+//
+// Spawn-tile resolution: the level may place a worker on the
+// same tile as a gold mine or town hall ("drop pod" campaign
+// convention). Stepping onto a building-claimed tile traps the
+// worker because the collision check sees a foreign claim on
+// every neighbour. `_resolve_unit_spawn_tile` walks the same
+// spiral the town-hall seeder uses to find the first 1×1 cell
+// the worker can stand on without colliding with another entity.
 static void _spawn_units_from_level(world, map) {
     auto i, n, k, p, sprite_a, kind;
+    auto sgx, sgy, out_gxy;
     n = wc1_map_entity_count(map);
+    out_gxy = buf_word(2);
     for (i = 0; i < n; i++) {
         k = wc1_map_entity_kind(map, i);
         p = wc1_map_entity_player(map, i);
@@ -702,12 +890,24 @@ static void _spawn_units_from_level(world, map) {
         if (str_eq(k, "medivh")         != 0) { sprite_a = medivh_atlas;         kind = UNIT_MEDIVH;    }
 
         if (sprite_a != 0) {
-            ecs_spawn_unit(world, sprite_a,
-                           wc1_map_entity_gx(map, i),
-                           wc1_map_entity_gy(map, i),
-                           p, kind);
+            // Resolve a clear cell near the entity's level tile so
+            // workers don't spawn inside a gold-mine / town-hall
+            // footprint. The spiral falls back silently to the
+            // original tile if nothing within 8 tiles is open —
+            // worker stays stuck, but at least the spawn doesn't
+            // crash and the level still loads.
+            sgx = wc1_map_entity_gx(map, i);
+            sgy = wc1_map_entity_gy(map, i);
+            if (_find_clear_cell(sgx, sgy, 8,
+                                 wc1_map_w(map), wc1_map_h(map),
+                                 out_gxy) != 0) {
+                sgx = out_gxy[0];
+                sgy = out_gxy[1];
+            }
+            ecs_spawn_unit(world, sprite_a, sgx, sgy, p, kind);
         }
     }
+    free(out_gxy);
 }
 
 // Seed the camera from the FIRST `start_view` entity the level

@@ -22,9 +22,9 @@ import "stbinput.bsm";
 import "stbcamera.bsm";
 import "stbtile.bsm";
 import "bpp_io.bsm";
-load   "wc1_anims.bsm";
-load   "wc1_buildings.bsm";    // Building struct + BLDG_STATE_* + wc1_building_at_world
-load   "wc1_gather.bsm";       // S9 — wc1_gather_assign_mine / _tree
+load   "rts1_anims.bsm";
+load   "rts1_buildings.bsm";    // Building struct + BLDG_STATE_* + wc1_building_at_world
+load   "rts1_gather.bsm";       // S9 — wc1_gather_assign_mine / _tree
 
 // Selection buffer + live count. selected_count == 0 is the
 // "nothing selected" state honored by wc1_hud_render and the
@@ -315,7 +315,35 @@ void wc1_input_tick(world) {
                                             selected_eids[0]);
                 return;
             }
-            // 1b. S9 — gold mine hit-test. Click on a (neutral)
+            // 1b. S9 — manual delivery. Click on a friendly DONE
+            //     town hall while any selected peasant is carrying
+            //     gold or wood → route every carrying peasant to
+            //     deposit at this hall. Canonical WC1 fallback
+            //     after the player cancelled the auto-deliver mid
+            //     trip and now wants the resource dropped off
+            //     somewhere specific. Non-carrying peasants in the
+            //     selection fall through to the normal move below.
+            if (building_eid >= 0
+                && _building_is_friendly_townhall(world, building_eid) != 0) {
+                auto k, any_carry;
+                any_carry = 0;
+                for (k = 0; k < selected_count; k++) {
+                    if (wc1_gather_carry(world, selected_eids[k]) != CARRY_NONE) {
+                        any_carry = 1;
+                    }
+                }
+                if (any_carry != 0) {
+                    for (k = 0; k < selected_count; k++) {
+                        if (wc1_gather_carry(world, selected_eids[k]) != CARRY_NONE) {
+                            wc1_gather_route_to_deposit(world,
+                                                        selected_eids[k],
+                                                        building_eid);
+                        }
+                    }
+                    return;
+                }
+            }
+            // 1c. S9 — gold mine hit-test. Click on a (neutral)
             //     gold mine → start the gather cycle for every
             //     selected peasant. Mines accept multiple workers
             //     in WC1 canon; we route each peasant
@@ -360,13 +388,13 @@ void wc1_input_tick(world) {
 }
 
 // S9 — true if the right-clicked tile holds a tree. The pathfinder
-// treats tile 76 as blocked; the gather assignment translates the
-// click into a chop command instead of a doomed move-to-blocked-tile.
-// world_map is the Tilemap handle owned by rts.bpp.
+// treats every cell in the forest cluster as blocked; the gather
+// assignment translates the click into a chop command instead of a
+// doomed move-to-blocked-tile. `wc1_is_forest_tile` is the shared
+// 71..87 cluster predicate exported by wc1_movement.bsm.
 extrn world_map;
-const _WC1_TREE_TILE_INPUT = 76;
 static _tile_is_tree(gx, gy) {
-    return tile_get(world_map, gx, gy) == _WC1_TREE_TILE_INPUT;
+    return wc1_is_forest_tile(tile_get(world_map, gx, gy));
 }
 
 // S9 — true if `building_eid` is a (neutral) gold mine. Gold mines
@@ -379,6 +407,22 @@ static _building_is_gold_mine(world, building_eid) {
     b = ecs_get(world, building_comp, building_eid);
     if (b.kind != BLDG_GOLD_MINE)       { return 0; }
     if (b.state == BLDG_STATE_DEPLETED) { return 0; }
+    return 1;
+}
+
+// S9 — true if `building_eid` is a finished town hall owned by the
+// human player. Drop-off point for the manual delivery branch:
+// right-clicking such a hall while the selected peasants carry
+// gold/wood routes them through `wc1_gather_route_to_deposit`.
+// CONSTRUCTING town halls go to the construction-assign path
+// instead (the worker chops at the foundation, not delivers to it).
+static _building_is_friendly_townhall(world, building_eid) {
+    auto b: Building, fa: Faction;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.kind != BLDG_TOWN_HALL)   { return 0; }
+    if (b.state != BLDG_STATE_DONE) { return 0; }
+    fa = ecs_get(world, faction_comp, building_eid);
+    if (fa.player != _HUMAN_PLAYER) { return 0; }
     return 1;
 }
 

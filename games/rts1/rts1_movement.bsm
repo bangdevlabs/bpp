@@ -42,8 +42,8 @@ import "stbpath.bsm";
 import "stbflow.bsm";
 import "stbgrid.bsm";
 import "stbgame.bsm";
-load   "wc1_units.bsm";
-load   "wc1_anims.bsm";
+load   "rts1_units.bsm";
+load   "rts1_anims.bsm";
 
 // Module-private pathfinder shared by every unit. One A* per
 // request pays the planning cost once; the per-frame tick only
@@ -96,21 +96,47 @@ static auto _flow_step_buf;
 // claim != self_eid + 1 branch fires).
 const _TERRAIN_BLOCKER = 0x7FFFFFFF;
 
-// Forest-tileset canonical tree ID. The wc1_map.bsm header
-// verified tile 76 as the canonical tree-grove tile through
-// frequency analysis of forest1.sms. The wider 71-87 cluster
-// also contains grass-floor + transition tiles that LOOK like
-// forest understory but are actually walkable in the original
-// — blocking the whole range turned pathfind into a no-op for
-// peasants trying to cross any partially-forested area (caught
-// during S8 construction-assignment smoke when the worker
-// couldn't reach foundations placed near tree clusters).
+// Forest-tileset tree-cluster IDs. The war1gus spec puts the
+// "forest" slot at 0x47..0x5f (71..95) per
+// `scripts/tilesets/forest.lua`, with 95 being the canonical
+// "removed-tree" stump. In practice forest1.sms uses tile 94 as
+// the dense "background canopy" tile saturating every wooded
+// area — marking it as a blocker turns the map into a maze and
+// breaks pathfinding from the inner forest back to the town
+// hall / gold mine after a chop. The cluster therefore stays
+// narrow at 71..87 (trunk variants the original engine drew as
+// individual tree silhouettes — the visually-tree tiles), with
+// 88..94 left walkable even though they look like leaves; the
+// "background canopy" tiles read as scenery rather than
+// obstacles. Felled trees flip to 95 (stump, walkable).
 //
-// Narrow to just 76 for v1. A proper terrain classifier (per-
-// tile-id walkability table sourced from the war1gus reference)
-// graduates in S8.5 sidequest when the second class of blocked
-// terrain (water / cliffs) earns its slot.
-const _WC1_TREE_TILE = 76;
+// `wc1_is_forest_tile` is the single truth used by the
+// movement init seeder, `_tile_is_tree` in wc1_input (right-
+// click → chop), and the tree-grid bootstrap in wc1_gather. A
+// wider terrain classifier (water / cliffs / transitions)
+// graduates when the second blocked-terrain class earns its
+// slot.
+const _WC1_TREE_CLUSTER_LO = 71;
+const _WC1_TREE_CLUSTER_HI = 87;
+
+// Returns 1 if `tid` lies inside the forest tree cluster, else 0.
+// Exported (not `static`) so the input + gather modules consume
+// it directly without re-declaring the bounds.
+wc1_is_forest_tile(tid) {
+    if (tid >= _WC1_TREE_CLUSTER_LO && tid <= _WC1_TREE_CLUSTER_HI) {
+        return 1;
+    }
+    return 0;
+}
+
+// Tile ID written into the map when a tree is felled. War1gus
+// forest tileset reserves tile 95 (0x5f) under the "special"
+// slot as `"removed-tree"` — the canonical chopped-tree stump
+// (see scripts/tilesets/forest.lua line 44). It's walkable and
+// visually distinct from both live trees and plain grass, so
+// the felled cell reads as "this tree was chopped" without a
+// custom sprite.
+const _WC1_FELLED_TILE = 95;
 
 // Allocate every shared scratch resource the movement system
 // needs: A* pathfinder, flow field, flow scratch buffer, and the
@@ -147,7 +173,7 @@ wc1_movement_init(map) {
     for (gy = 0; gy < h; gy++) {
         for (gx = 0; gx < w; gx++) {
             tile_id = tile_get(tm, gx, gy);
-            if (tile_id == _WC1_TREE_TILE) {
+            if (wc1_is_forest_tile(tile_id) != 0) {
                 path_set_blocked(_pf, gx, gy, 1);
                 grid_set(_occupied, gx, gy, _TERRAIN_BLOCKER);
             }
@@ -165,6 +191,16 @@ void wc1_collision_register(eid, gx, gy) {
     grid_set(_occupied, gx, gy, eid + 1);
 }
 
+// S9 — also mark a tile as path-blocked. Used by the building
+// claim helper so path_find routes AROUND building footprints
+// instead of emitting paths that go through them (which then
+// stall at the collision check inside `_step_unit`, producing
+// the classic "auto-deliver parou no meio do caminho" bug).
+// Idempotent + bounds-safe via stbpath.
+void wc1_movement_block_path_tile(gx, gy) {
+    path_set_blocked(_pf, gx, gy, 1);
+}
+
 // S9 — drop a permanent terrain blocker from BOTH the pathfinder
 // + occupancy grid. Called by wc1_gather when a tree is felled
 // so peasants can stand on the stump tile + path through the
@@ -173,6 +209,77 @@ void wc1_movement_unblock_tile(gx, gy) {
     path_set_blocked(_pf, gx, gy, 0);
     grid_set(_occupied, gx, gy, 0);
     return;
+}
+
+// S9 — pick the perimeter tile around a building's footprint
+// that is BOTH walkable AND closest to the building's pixel
+// centre. "Walkable" = not blocked in the pathfinder (no tree
+// underneath) AND not occupied by another entity in the
+// collision grid. forest1.json puts trees right next to some
+// mines so the canonical "south of footprint" cells are
+// path-blocked; scanning every edge and picking the closest
+// walkable cell to the centre gives the peasant a natural
+// "enter at the middle of an edge" approach instead of landing
+// at a corner just because that corner happened to be the first
+// open cell scanned.
+//
+// Returns 1 with (*out_gx, *out_gy) populated on success, 0 if
+// the entire perimeter ring is blocked. Callers fall back to the
+// classic +64/16 south point on a 0 return — that's the rare
+// "totally walled-in" case and path_find will still gracefully
+// fail to that fallback rather than crash.
+static auto _perimeter_best_x;
+static auto _perimeter_best_y;
+static auto _perimeter_best_d;
+static auto _perimeter_found;
+static auto _perimeter_self_eid;
+static auto _perimeter_cx_px;
+static auto _perimeter_cy_px;
+static void _perimeter_probe(cx, cy) {
+    auto dx_p, dy_p, d_sq;
+    if (path_is_blocked(_pf, cx, cy) != 0)                          { return; }
+    if (wc1_collision_is_blocked_for(_perimeter_self_eid, cx, cy) != 0) { return; }
+    dx_p = cx * 16 + 8 - _perimeter_cx_px;
+    dy_p = cy * 16 + 8 - _perimeter_cy_px;
+    d_sq = dx_p * dx_p + dy_p * dy_p;
+    if (_perimeter_found == 0 || d_sq < _perimeter_best_d) {
+        _perimeter_best_d = d_sq;
+        _perimeter_best_x = cx;
+        _perimeter_best_y = cy;
+        _perimeter_found  = 1;
+    }
+    return;
+}
+wc1_movement_find_walkable_perimeter(self_eid, fgx, fgy, ntx, nty,
+                                     out_gx: ptr, out_gy: ptr) {
+    auto i;
+    _perimeter_self_eid = self_eid;
+    // Reference point is the SOUTH-MID-PERIMETER (one tile south
+    // of the building's south face, horizontally centered). WC1
+    // mines + town halls show their doorway on the south side, so
+    // measuring distance from that point biases the pick toward
+    // the south edge and falls back to other edges only when the
+    // south is fully tree-walled (forest1's mine at (16,16) only
+    // has (16,20) walkable on the south, but biasing south still
+    // beats the prior north-edge pick).
+    _perimeter_cx_px    = fgx * 16 + (ntx * 16) / 2;
+    _perimeter_cy_px    = (fgy + nty) * 16 + 8;
+    _perimeter_found    = 0;
+    _perimeter_best_d   = 0x7FFFFFFF;
+    // South + north edges.
+    for (i = 0; i < ntx; i++) {
+        _perimeter_probe(fgx + i, fgy + nty);
+        _perimeter_probe(fgx + i, fgy - 1);
+    }
+    // East + west edges.
+    for (i = 0; i < nty; i++) {
+        _perimeter_probe(fgx + ntx, fgy + i);
+        _perimeter_probe(fgx - 1,   fgy + i);
+    }
+    if (_perimeter_found == 0) { return 0; }
+    *out_gx = _perimeter_best_x;
+    *out_gy = _perimeter_best_y;
+    return 1;
 }
 
 // Free a tile previously held by some unit. Idempotent and bounds-
@@ -300,6 +407,14 @@ static void _step_unit(w, eid) {
     // anim.
     if (an.state == UNIT_STATE_ATTACK) { return; }
     if (an.state == UNIT_STATE_BUILD)  { return; }
+    // S9 — gather states behave like ATTACK/BUILD: the peasant is
+    // parked at the resource cell while wc1_gather_tick advances
+    // progress + cycles the chop anim. Without this guard,
+    // _step_unit falls through to _idle_anim and clobbers the
+    // gather state back to IDLE every frame, freezing the chop
+    // sprite on frame 0.
+    if (an.state == UNIT_STATE_GATHER_GOLD) { return; }
+    if (an.state == UNIT_STATE_GATHER_WOOD) { return; }
 
     // Resolve the micro-target candidate.
     has_target = 0;

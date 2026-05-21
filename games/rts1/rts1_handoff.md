@@ -1078,6 +1078,129 @@ alerts).
   greying the atlas) lands with the eventual mine-sprite
   polish.
 
+### Session 9.x — Gather polish arc (CLOSED 2026-05-21)
+
+S9 shipped end-to-end gather/return/deposit (commit
+`d91a110`) and the engine-side follow-ups (`a8e3b07` —
+`world_map` NULL fix + `image_draw_*` defensive guards;
+`c5e9890` — `ecs_spawn_building` param order). User
+playtest on 2026-05-21 surfaced six follow-on issues that
+landed today as the S9 polish arc:
+
+**Bugs fixed:**
+
+1. **Tree stump tile** — felled cell now flips to tile 95
+   (`removed-tree` per `war1gus/scripts/tilesets/forest.lua`
+   line 44) instead of plain grass (tile 109). Visually
+   reads as a chopped stump; pathfinder + occupancy still
+   unblocked so peasants can walk on it.
+
+2. **Peasant stuck after gather cancel** — `_step_unit`
+   early-returns for `UNIT_STATE_GATHER_GOLD/WOOD` so the
+   chop animation cycles without the movement tick
+   clobbering state. When the player issued a new command
+   mid-gather, `wc1_gather_clear` cleared `target_kind`
+   but left `an.state` at `GATHER_*` and the worker froze
+   forever. New helper `_reset_anim_if_gathering` wired
+   into `wc1_gather_clear` / `wc1_gather_assign_mine` /
+   `wc1_gather_assign_tree` resets to `IDLE` on every
+   re-assignment.
+
+3. **Tree chop fired from 1–2 tiles away** — the 48 px
+   reach radius was correct for the 4×4 mine but too
+   generous for a single-tile tree. Replaced with
+   tile-adjacency: peasant must be on a 4-neighbour of
+   the tree (Manhattan distance == 1) before the axe
+   swings. Mine still uses dist² against the 4×4
+   footprint.
+
+4. **Manual delivery via right-click on TH** — canonical
+   WC1 fallback after the player cancels auto-deliver
+   mid-trip. New API `wc1_gather_route_to_deposit(world,
+   peasant_eid, th_eid)` + input handler branch detects
+   "friendly DONE town hall + selected peasants
+   carrying gold/wood" → routes each carrying worker to
+   deposit at the clicked hall. `wc1_gather_clear` now
+   preserves `carry` so the resource isn't dropped when
+   the gather loop is interrupted; `_gather_visit`'s
+   early-return relaxed from
+   `target_kind == NONE` to
+   `target_kind == NONE && carry == NONE` so the
+   INBOUND branch keeps deposit logic alive when the
+   gather assignment is gone but the carry isn't.
+
+5. **Auto-deliver / mine-after-tree stuck mid-path** —
+   path_find was emitting waypoint paths *through*
+   building footprints because only forest tiles were
+   path-blocked at init; `_step_unit` then stalled at
+   each footprint boundary. New helper
+   `wc1_movement_block_path_tile(gx, gy)` called from
+   `_claim_building_footprint` marks every building
+   tile path-blocked at spawn, forcing the A* to route
+   around. Drop tile picking moved off the hard-coded
+   `+48/16` (which sometimes landed inside a tree south
+   of the mine footprint) onto the new
+   `wc1_movement_find_walkable_perimeter` helper —
+   scans every perimeter cell, returns the walkable one
+   closest to the building's south-mid-perimeter
+   reference. Town-hall seeder
+   (`_seed_town_halls_for_players`) gained a `min_r=6`
+   gate so the hall lands at least 6 tiles off the
+   start-view / gold-mine (no more 4×4 footprints
+   corner-touching).
+
+6. **Mine entry "too far / wrong side"** — even with the
+   south-biased perimeter pick, the dist² check inside
+   `_gather_visit`'s outbound branch was firing the
+   moment the peasant grazed the 48 px radius mid-walk,
+   landing the chop animation at whichever radius edge
+   the approach happened to cross first (usually the
+   NW corner when approaching from the human TH). The
+   gate now requires `pa.cursor >= pa.count` AS WELL
+   AS the dist² check, so the gather only triggers once
+   the peasant fully arrives at the perimeter pick.
+
+**Engine wins (Tier 2):**
+- `stb/stbpath.bsm` consumer pattern — buildings now
+  publish their footprint to BOTH the collision grid
+  (`stbgrid` via `wc1_collision_register`) AND the
+  A* grid (`stbpath` via the new
+  `wc1_movement_block_path_tile`). The two grids stay
+  separate (Rule 33 — generic vs game-generic) but the
+  game-side helper keeps them in sync at spawn time so
+  the path planner respects what the simulator
+  enforces.
+- `wc1_movement_find_walkable_perimeter` — bias the
+  pick by a configurable reference pixel (currently
+  south-mid-perimeter for WC1's mine-doorway
+  convention). The same helper transparently handles
+  partial-tree-bound layouts (e.g. forest1's mine at
+  (16,16) where the south face is mostly tree-walled —
+  only the SW perimeter cell is walkable; the helper
+  still returns it instead of failing).
+
+**Validation:**
+- Bootstrap byte-stable (game-side only — compiler not
+  touched).
+- Native suite + C-emit suite untouched; gather work
+  lives entirely in `games/rts1/*.bsm`.
+- Manual playtest: peasant mine → return → deposit →
+  return → mine loops indefinitely; tree chop, auto-
+  deliver, manual interrupt + right-click TH delivery,
+  and switching between mine ↔ tree all work without
+  stalling. Mine entry sprite now hides at the south
+  perimeter pick (visually "under the mine rocks").
+
+**Bonus — wc1_ → rts1_ rename:** User renamed every
+`games/rts1/wc1_*.bsm` to `games/rts1/rts1_*.bsm` in
+this same session ahead of the polish work. The
+namespace prefix now matches the game directory; the
+`wc1_*` function names inside the modules stay (they
+identify the WC1 mod's domain language) but file
+discovery aligns with the `rts1/` folder. Same
+treatment for `wc1_handoff.md` → `rts1_handoff.md`
+(this doc).
+
 ### Session 10 — Production (training + research) (~3-4h)
 
 **Goal**: barracks trains footmen with gold cost + training time.
