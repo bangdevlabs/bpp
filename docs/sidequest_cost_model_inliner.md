@@ -133,16 +133,32 @@ Every mature compiler ships:
 | Per-callsite threshold adjustment | ✓ | – | ✓ | – | – |
 | Per-function cap | ✓ | ✓ | ✓ | – | – |
 | Per-binary growth cap | – | ✓ | – | – | – |
-| `@inline` (force) annotation | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `@no_inline` (block) annotation | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `@inline` (force) annotation | ✓ | ✓ | ✓ | ✓ | ✓ | (B++ skips — Rule 4) |
+| `@no_inline` (block) annotation | ✓ | ✓ | ✓ | ✓ | ✓ | (B++ skips — default) |
 | PGO integration | ✓ | ✓ | ✓ | – | – |
 
 **B++ S4 adopts:** cost model w/ bonuses + penalties, per-
 callsite threshold adjustment, both caps (per-function +
-per-binary), `@inline` / `@no_inline` annotations.
+per-binary).
+
+**B++ S4 deliberately deviates on the universal `@inline` /
+`@no_inline` pattern.** Tonify Rule 4 (the 2026-05-11
+Multics-drift collapse) reduced B++'s function-level
+annotations to exactly `@safe` (compiler-verified safety
+contract) + statement-level `@profile` (instrumentation
+metadata). Rule 4 + Rule 28 require annotations to "earn
+their keep" by catching a specific bug class via compiler
+verification — `@inline` is a perf hint, not a contract,
+and `@no_inline` is the default (anything the cost model
+rejects stays a normal call). Adding both as user-facing
+keywords would be exactly the kind of inert-tag growth the
+collapse killed. **The cost model is the sole arbiter.**
+Bisect/debug needs are served by the `--no-inline` flag
+(Q10), not by per-function annotations.
 
 **B++ S4 skips:** PGO (no profile infra), comptime-driven
-inlining (no comptime semantics in B++ today).
+inlining (no comptime semantics in B++ today), per-function
+annotations (Rule 4 — see above).
 
 ---
 
@@ -184,9 +200,12 @@ Threshold (per call site):
 threshold = base_threshold              # default 30 (see "Sanity-check on xorshift64")
 if caller in hot path:    threshold *= 2
 if callsite in loop:      threshold *= 1.5
-if callee is @inline:     return ALWAYS  # override
-if callee is @no_inline:  return NEVER   # override
 ```
+
+No `@inline` / `@no_inline` overrides — see "Industry research"
+above for why B++ deviates from the universal pattern. The cost
+model is the sole arbiter. Programs needing to disable inlining
+globally for bisect/debug use the `--no-inline` flag (Q10).
 
 Decision: inline if `cost ≤ threshold` AND `node_count(body)
 ≤ body_node_cap` (see Q4), subject to per-binary growth cap.
@@ -498,26 +517,23 @@ S4 does not change that — it only adds more flat sites.
 
 ### Q10 — Flags (cost model tunability)
 
-**Decision: three flags, mirror of Cap 48 patterns.**
+**Decision: four flags, mirror of Cap 48 patterns. No
+function-level annotations** — see Industry-research section
+for why B++ deviates from the universal `@inline` /
+`@no_inline` pattern (Tonify Rule 4).
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--inline-threshold=N` | 5 | `base_threshold` constant in Q2 formula |
+| `--inline-threshold=N` | 30 | `base_threshold` constant in Q2 formula |
 | `--inline-budget=pct` | 20 | per-binary growth cap in Q4 (GCC style) |
 | `--no-inline` | off | kill switch: disable Phase B2 + S4 entirely |
 | `--show-inlines` | off | print decisions and exit (Q7) |
 
-Plus two annotations at the function definition site (mirror of
-`@safe` / `@profile`):
-
-| Annotation | Effect |
-|---|---|
-| `@inline` | Force inline at every call site (override cost model upward) |
-| `@no_inline` | Block inline at every call site (override cost model downward) |
-
 `--no-inline` is essential for debugging and bisect: when a
 bug surfaces after an S4 commit, first test is recompile with
-`--no-inline` to isolate. Mirror of `gcc -fno-inline`.
+`--no-inline` to isolate. Mirror of `gcc -fno-inline`. Since
+B++ ships no per-function inline annotation, the flag is the
+sole inliner control surface.
 
 NO profile-guided inlining (no infra in B++ today). NO
 learning model. Static cost + bench-gated thresholds are
@@ -532,14 +548,14 @@ Phase B2 already supplies the classify/clone/splice scaffolding.
 
 | Phase | What | LOC est. | Risk |
 |---|---|---|---|
-| P0 | Parser: annotate T_CALL nodes with `loop_depth` (field `.d` already reserved); add `@inline` / `@no_inline` to phase_hint parsing | ~50 | low |
+| P0 | Parser: annotate T_CALL nodes with `loop_depth` via the `.d` field. SHIPPED as commit `5ca27fa`. Originally scoped to also parse `@inline` / `@no_inline` annotations, but Tonify Rule 4 (the 2026-05-11 Multics-drift collapse — "annotations earn their keep ONLY when they catch a specific bug class") rules them out: `@inline` is a perf hint, not a contract; `@no_inline` is the default. Cost model is the sole arbiter; `--no-inline` flag covers the bisect/debug need. P0 ships with loop_depth only (~17 LOC actual). | ~17 (shipped) | low |
 | P1 | Cost function: extend `_inline_count_nodes`, `_inline_has_tcall`, `_inline_param_refs` to walk statement nodes (T_ASSIGN, T_MEMST, T_DECL, T_RET) — currently all four return 99 for non-expression types (Phase B2 assumed `body_cnt == 1` with single T_RET). Then layer penalty+bonus sum on top; add `_inline_const_arg_count`, `_inline_dead_branch_count` helpers. Keep `else → return 99` as the safety net for control-flow types not handled yet. | ~80 | low |
 | P2 | Threshold function: lookup `_fn_callers` for fanout, `fn_phase` for hot/cold, T_CALL.d for loop depth, multipliers per Q2 | ~50 | low |
 | P3a | Multi-statement body support: extend `classify_inlineable` to accept body_cnt > 1 AND `fn_phase in {BASE, AUTO}`. Extend `ast_clone_subst` symmetrically to clone T_ASSIGN, T_MEMST, T_DECL, T_RET (and the T_BLOCK statement sequence wrapping them). Reject during classify any body containing T_IF/T_WHILE/T_SWITCH/nested T_BLOCK — control-flow inlining is out of scope (Q1 caveat). | ~80 | medium |
 | P3b | Local-variable alpha-rename: extend `fn_pre_reg_vars` to walk inlineable T_CALL sites; for each, assign monotonic ID and `cg_var_add("_inl<N>_<orig>")` for each callee local BEFORE `fn_compute_offsets` runs. Splice procedure in both codegens: emit prelude statements via `emit_node`, then final expression value lands in acc | ~100 | medium |
 | P3c | Enclosing-expression rule: at splice time, walk caller's expression ancestor chain (captured via codegen recursion stack) bounded by statement/sequence-point; check no T_VAR/T_MEMLD on globals written by callee | ~60 | medium |
 | P4 | Caps: per-function (50) hard ceiling check; per-binary growth counter in `run_dispatch`; rollback if cap exceeded mid-pass | ~40 | low |
-| P5 | Flags: `--inline-threshold`, `--inline-budget`, `--no-inline`, `--show-inlines` in `bpp_args.bsm`; tests | ~50 | low |
+| P5 | Flags: `--inline-threshold`, `--inline-budget`, `--no-inline`, `--show-inlines` in `bpp_args.bsm`; tests. No annotation parsing — see P0 note + Industry-research section for why B++ skips `@inline` / `@no_inline`. | ~50 | low |
 | P6 | Bench iteration: tablah → 5% gate, regression sweep | ~20 | depends |
 
 **Total: ~530 LOC** (down from original ~700 estimate, because
@@ -624,7 +640,8 @@ B++ anchor files (foundation that S4 extends):
 - `src/bpp_dispatch.bsm:3720-3905` — Phase B2 inliner
 - `src/bpp_codegen.bsm:1408-…` — `cg_builtin_dispatch` lane
 - `src/backend/chip/aarch64/a64_codegen.bsm:1200-1212` — splice site (a64)
-- `src/bpp_parser.bsm:2437-2510` — `@profile` zone lowering (model for `@inline` parsing)
+- `src/bpp_parser.bsm:1840-1908` — `@safe` annotation parsing (canonical pattern; S4 deliberately does NOT add a sibling per Rule 4)
+- `docs/manual/tonify_checklist.md` Rule 4 — annotation-collapse rationale (the 2026-05-11 "Multics-drift" lesson)
 - `docs/manual/how_to_dev_b++.md` Cap 48 — flag conventions
 - `docs/manual/tonify_checklist.md` Rule 37 — bench protocol
 - `docs/sidequest_compiler_hotpath_opt.md` — preceding arc, including S3g revert lesson
