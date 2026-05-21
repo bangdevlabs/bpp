@@ -1592,6 +1592,50 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: arr_len(arr) — length field of an arr_new array
+    // (or 0 for a null pointer). Body is the null-guarded
+    // `*(arr - 16)` — see `arr_len` in `bpp_array.bsm`. Hot-path
+    // opt S3f: builds on S3e by reusing the just-completed
+    // emit_mem_read_indexed primitive matrix plus the existing
+    // emit_branch_if_zero control-flow primitive. No new chip
+    // ABI member — the dispatch shape "early-return guard inside
+    // a builtin" generalises for any future accessor that wraps a
+    // single load behind a null check (arr_cap, arr_last, etc).
+    //
+    // Sequence — produces `acc = arr-len-or-zero` via a single
+    // conditional branch:
+    //   1. emit_node(arr)         → acc = arr
+    //   2. lbl = emit_new_label
+    //   3. emit_branch_if_zero(lbl) → if acc == 0 jump (acc stays 0)
+    //   4. push_acc               → stack = [arr]
+    //   5. mov_imm(16)            → acc = 16
+    //   6. pop_scratch            → scratch = arr
+    //   7. emit_sub(1)            → acc = scratch - acc = arr - 16
+    //   8. emit_mem_read(8)       → acc = *(arr - 16)
+    //   9. emit_label(lbl)
+    //
+    // Inline cost ≈ 6 instructions on a64 (cbz/str/movz/ldr/sub/
+    // ldr) + 2 stack ops, vs the prior ~14-instr call frame around
+    // a 4-instr body. ~50 % shrink at every call site. The C
+    // emitter does not need a symmetric case — the original
+    // `arr_len` B++ function still compiles to C and the C
+    // compiler inlines the trivial body verbatim.
+    if (cg_str_eq(n.a, "arr_len", 7)) {
+        auto lbl_end;
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 0));   // arr
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        lbl_end = call(p.emit_new_label);
+        call(p.emit_branch_if_zero, lbl_end);  // if arr == 0 → acc=0, jump
+        call(p.emit_push_acc);                 // stack = [arr]
+        call(p.emit_mov_imm, 16);              // acc = 16
+        call(p.emit_pop_scratch);              // scratch = arr
+        call(p.emit_sub, 1);                   // acc = arr - 16
+        call(p.emit_mem_read, 8);              // acc = *(arr - 16)
+        call(p.emit_label, lbl_end);
+        return 1;
+    }
+
     // Built-in: mem_barrier() — full memory barrier + zero acc.
     // Used by stbjob to order producer/consumer writes on SPSC
     // queues. 0 args.
