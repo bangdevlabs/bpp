@@ -567,8 +567,29 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
     vs = ty_slice(val_ty);
 
     // E050: ptr to non-ptr.
+    //
+    // Special-case: `: ptr` → `: <Struct>` is ALLOWED silently.
+    // Typed-struct locals are pointer-addressed under the hood
+    // (`auto t: Image` materialises as a struct-pointer slot, and
+    // `t.field` lowers to an offsetted load through that pointer).
+    // The bit pattern of a `: ptr` source and a `: <Struct>` destination
+    // is identical — only the type-information lattice differs, and
+    // the destination annotation IS the user's responsibility-claim
+    // ("I know what's at this address"). The source-strict version
+    // of E050 used to block this case and produced an asymmetric
+    // type system: `: ptr` could be assigned to `: word` silently
+    // (both word-sized, no info lost), but going to a *typed*
+    // pointer required a separate dance. The 2026-05-20 W038 arc
+    // surfaced the asymmetry — annotating `image_draw_size(a: ptr,
+    // ...)` broke 47 tests because the body's `t: Image; t = a;`
+    // hit E050 even though the runtime semantics were unchanged.
+    //
+    // The remaining E050 catches still fire (ptr→word with a
+    // narrowing slice, ptr→float, etc.) — only the ptr→struct
+    // case is allowed through. See `docs/journal.md` 2026-05-20
+    // for the asymmetry write-up.
     if (vb == BASE_PTR) {
-        if (hb != BASE_PTR) {
+        if (hb != BASE_PTR && hb != BASE_STRUCT) {
             diag_error(50);
             diag_str("cannot assign ptr to '");
             diag_packed(var_name_p);
@@ -577,25 +598,6 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str(")");
             diag_newline();
             _val_show_context_at(_val_src_tok);
-            // W038-companion help: the canonical way this fires
-            // is when someone annotates a function parameter `: ptr`
-            // but the body re-binds the param into a typed-struct
-            // local (`auto t: Image; t = a;`). The function shape
-            // works the same with or without the `: ptr` annotation
-            // (structs are pointer-addressed in B++ under the
-            // hood); the annotation just turns the silent flow
-            // into this hard error. Telling the contributor that
-            // is more useful than the bare "cannot assign" line.
-            // (See docs/sidequest_compiler_hotpath_opt.md's W038
-            // arc for the originating session.)
-            if (ty_base(hint_ty) == BASE_STRUCT) {
-                diag_help("the source value is a pointer (`: ptr`) but the destination is a typed-struct local (`: <Struct>`)");
-                diag_newline();
-                diag_help("a typed-struct local IS pointer-addressed under the hood — usually the fix is to drop the `: ptr` annotation on the source (often a function parameter), not add a cast");
-                diag_newline();
-                diag_help("if the source must stay `: ptr`, declare the destination `: ptr` too and address fields through a separate explicit `: <Struct>` local that aliases it");
-                diag_newline();
-            }
         }
     }
 
