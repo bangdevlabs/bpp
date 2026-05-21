@@ -72,23 +72,39 @@ void print_buf(start, len) {
 
 // Compare two packed string references by content (not offset).
 // Returns 1 if they represent the same text, 0 otherwise.
+//
+// Body shape (post-S3i hot-path opt): equal-length strings are
+// compared in 8-byte chunks via `peek_w` before falling back to
+// byte-by-byte for the tail. peek_w lowers to a single LDR
+// instruction on every supported chip; comparing two LDR results
+// is independent of endianness because byte sequences that match
+// pairwise produce identical 64-bit loads regardless of how the
+// chip interprets the bytes. Unaligned loads are native on a64
+// + x64 so no alignment dance is needed. For a 10-char identifier
+// (typical compiler name), the loop now runs 1 chunk + 2 byte
+// iterations = 3 cmp ops vs the original 10 — ~3× tighter inner
+// loop, on top of the S3a CSE that hoisted `unpack_s` out of the
+// loop.
 packed_eq(a, b) {
-    auto al, bl, i, sa, sb;
+    auto al, bl, i, sa, sb, pa, pb;
     al = unpack_l(a);
     bl = unpack_l(b);
     if (al != bl) { return 0; }
-    // CSE — hoist the start offsets out of the loop. The original
-    // shape called `unpack_s(a)` + `unpack_s(b)` on every byte
-    // compare; for a 10-char name that's 20 redundant function
-    // calls per `packed_eq` invocation. The profile (see
-    // `bench_compile.sh --sample`) showed packed_eq at 16% of
-    // bootstrap CPU dominated by inner-loop calls. See
-    // docs/sidequest_compiler_hotpath_opt.md Stage 3a.
     sa = unpack_s(a);
     sb = unpack_s(b);
+    pa = vbuf + sa;
+    pb = vbuf + sb;
     i = 0;
+    // 8-byte chunk compare. Loops while at least 8 bytes remain
+    // so the LDR never crosses the string's tail into unrelated
+    // bytes that could falsely mismatch.
+    while (i + 8 <= al) {
+        if (peek_w(pa + i) != peek_w(pb + i)) { return 0; }
+        i += 8;
+    }
+    // Byte tail (0..7 trailing bytes).
     while (i < al) {
-        if (peek(vbuf + sa + i) != peek(vbuf + sb + i)) { return 0; }
+        if (peek(pa + i) != peek(pb + i)) { return 0; }
         i++;
     }
     return 1;
