@@ -577,6 +577,25 @@ val_check_assign_compat(hint_ty, val_ty, var_name_p) {
             diag_str(")");
             diag_newline();
             _val_show_context_at(_val_src_tok);
+            // W038-companion help: the canonical way this fires
+            // is when someone annotates a function parameter `: ptr`
+            // but the body re-binds the param into a typed-struct
+            // local (`auto t: Image; t = a;`). The function shape
+            // works the same with or without the `: ptr` annotation
+            // (structs are pointer-addressed in B++ under the
+            // hood); the annotation just turns the silent flow
+            // into this hard error. Telling the contributor that
+            // is more useful than the bare "cannot assign" line.
+            // (See docs/sidequest_compiler_hotpath_opt.md's W038
+            // arc for the originating session.)
+            if (ty_base(hint_ty) == BASE_STRUCT) {
+                diag_help("the source value is a pointer (`: ptr`) but the destination is a typed-struct local (`: <Struct>`)");
+                diag_newline();
+                diag_help("a typed-struct local IS pointer-addressed under the hood — usually the fix is to drop the `: ptr` annotation on the source (often a function parameter), not add a cast");
+                diag_newline();
+                diag_help("if the source must stay `: ptr`, declare the destination `: ptr` too and address fields through a separate explicit `: <Struct>` local that aliases it");
+                diag_newline();
+            }
         }
     }
 
@@ -993,6 +1012,74 @@ val_check_node(nd) {
                                 diag_help("if you meant to pass a literal, write it with a decimal point (e.g. 44100.0)");
                                 diag_newline();
                             }
+                        }
+                    }
+                    // W038 — pointer parameter receives integer / word arg.
+                    //
+                    // When a callee declares a parameter `: ptr` (atlas
+                    // handle, string pointer, opaque heap block), the
+                    // bit pattern lands in a register that the callee
+                    // dereferences. A non-zero integer literal in that
+                    // position is the canonical param-order-swap bug:
+                    // rts1 S9's `ecs_spawn_building` call passed
+                    // `BLDG_GOLD_MINE` (literal 9) into the `atlas_idle: ptr`
+                    // slot, and `_image_uvs_for` then derefed at NULL+0x28.
+                    //
+                    // Three cases the warning fires on:
+                    //   1. Non-zero integer literal (`takes_ptr(42)` or
+                    //      `takes_ptr(BLDG_GOLD_MINE)` — the parser
+                    //      inlines `const` enums as int literals).
+                    //   2. TY_WORD-typed variable (`auto x; x = 42;
+                    //      takes_ptr(x);`) — Rule 13 says annotate the
+                    //      var `: ptr` if it holds a pointer.
+                    //   3. TY_FLOAT-typed value — IEEE bits in a ptr
+                    //      slot is always wrong.
+                    //
+                    // Skipped cases (intentional, no warning):
+                    //   - Literal `0` (canonical NULL / sentinel).
+                    //   - TY_PTR-typed arg (correctly annotated).
+                    //   - TY_UNK arg (no information; type inference
+                    //     didn't reach this site yet).
+                    //   - TY_ARR arg (arrays decay to pointers via
+                    //     existing rules).
+                    //
+                    // Mirrors the E232 / W032 shape (silent type-
+                    // confusion at call boundaries); see
+                    // `docs/manual/warning_error_log.md` W038 entry.
+                    if (is_ptr_type(par_ty)) {
+                        // Narrow gate: only fire when the arg is a
+                        // non-zero INTEGER LITERAL. That's the actual
+                        // bug class W038 targets — param-order swaps
+                        // where the caller passes `BLDG_GOLD_MINE`
+                        // (parser-inlined `const` = literal 9) into
+                        // a `: ptr` slot. Catching TY_WORD-typed
+                        // vars too would dump warnings on every call
+                        // site where a handle moves through an
+                        // unannotated local (B++ type inference does
+                        // not yet propagate `-> ptr` returns
+                        // reliably). The TY_WORD-var case is a Rule
+                        // 13 nudge for a future, more thorough
+                        // audit; W038 today catches the specific
+                        // compile-time-loud shape the user hit on
+                        // 2026-05-20.
+                        if (an.ntype == T_LIT
+                            && lit_shape(arg_nd) == SHAPE_INT
+                            && parse_int_lit_value(an.a) != 0) {
+                            diag_warn(38);
+                            diag_str("argument ");
+                            diag_int(ai + 1);
+                            diag_str(" of '");
+                            diag_packed(name_p);
+                            diag_str("' expects a pointer (declared ': ptr'), got integer literal ");
+                            diag_int(parse_int_lit_value(an.a));
+                            diag_newline();
+                            _val_show_context_at(n.src_tok);
+                            diag_help("if the wrong argument is in this slot, double-check the call-site parameter order");
+                            diag_newline();
+                            diag_help("the literal `0` is the canonical NULL sentinel and is permitted; any other integer is almost always a bug");
+                            diag_newline();
+                            diag_help("if you really need a literal address (rare), cast through a ': ptr' typed local");
+                            diag_newline();
                         }
                     }
                 }
