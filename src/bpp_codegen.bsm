@@ -290,6 +290,19 @@ struct ChipPrimitives {
     emit_round_to_int,        // () — round float to nearest even, then cast to int
     emit_mem_barrier,   // () — full memory barrier + zero acc
     emit_shift_right_logical, // () — acc >>= scratch (unsigned)
+    emit_ror32,         // () — 32-bit rotate right.
+                        //   acc = (acc & 0xFFFFFFFF) ROR (scratch & 31)
+                        //   Result zero-extended into the full 64-bit
+                        //   destination. Uses the same `acc = value,
+                        //   scratch = count` convention as
+                        //   `emit_shift_right_logical` so the primitive
+                        //   reads identically across chips (the BINOP
+                        //   convention is asymmetric — a64 places LHS
+                        //   in left_reg, x64 places LHS in acc — and
+                        //   rotation needs a consistent operand order).
+                        //   Sole consumer today is the `sha_rotr`
+                        //   SHA-256 helper; future hash / crypto code
+                        //   reuses without extending the chip ABI.
     emit_load_float_ret, // (slot) — load float return save slot (0 or 1)
     emit_trap_if_zero,  // () — if acc == 0, trap (brk/INT3)
 
@@ -1598,6 +1611,38 @@ cg_builtin_dispatch(n) {
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_pop_scratch);             // scratch = byte_offset
         call(p.emit_mem_read_indexed, 8);     // acc = *(acc + scratch)
+        return 1;
+    }
+
+    // Built-in: sha_rotr(x, n) — 32-bit rotate right of the low
+    // 32 bits of `x` by `n` bits, zero-extended. Body in
+    // `src/backend/target/aarch64_macos/a64_macho.bsm:115` is
+    // `return u32((x >> n) | ((x & 0xFFFFFFFF) << (32 - n)));` —
+    // the canonical SHA-256 rotate idiom assembled out of two
+    // shifts + an or + a mask. ARM64 + x86_64 both ship a single
+    // instruction for this exact operation (RORV W on a64,
+    // ROR r32 cl on x64); the new `emit_ror32` chip primitive
+    // exposes it portably. S3j hot-path opt (~16 samples per
+    // bootstrap run dominated by SHA-256 code signing — the
+    // function runs a few thousand iterations per binary signed,
+    // and each call paid a ~14-instruction frame around what is
+    // now a 1-instruction body).
+    //
+    // Sequence — mirrors the `unpack_l` shape (value-in-acc,
+    // count-in-scratch) so the chip primitive reads the same on
+    // both backends:
+    //   1. emit_node(n)       → acc = n        (count, RHS)
+    //   2. push_acc           → stack = [n]
+    //   3. emit_node(x)       → acc = x        (value, LHS)
+    //   4. pop_scratch        → scratch = n
+    //   5. emit_ror32         → acc = (x & 0xFFFFFFFF) ROR (n & 31)
+    if (cg_str_eq(n.a, "sha_rotr", 8)) {
+        arr = n.b;
+        call(p.emit_node, *(arr + 8));   // n (count)
+        call(p.emit_push_acc);
+        call(p.emit_node, *(arr + 0));   // x (value)
+        call(p.emit_pop_scratch);
+        call(p.emit_ror32);
         return 1;
     }
 
