@@ -974,15 +974,54 @@ global cg_fn_name, cg_fn_par, cg_fn_pcnt, cg_fn_body, cg_fn_bcnt, cg_fn_fidx;
 global cg_gl_name;
 global cg_ex_name, cg_ex_ret, cg_ex_args, cg_ex_acnt;
 
+// Function-name → emitter-index hash, lazy-built on first
+// `cg_find_fn` query and rebuilt when `cg_fn_name` grows past
+// the last-seen length. Slot value is `idx + 1` so 0 doubles
+// as the hash's "absent" sentinel. Mirrors the S2 dispatch
+// hash (`_dsp_func_hash` in `src/bpp_dispatch.bsm`) — same
+// lazy-build + stale-count rebuild pattern, scoped to cg's
+// own function table.
+//
+// Why hash: pre-S3k, `cg_find_fn` linear-scanned every
+// `cg_fn_name` entry per call, costing ~O(N·M) where N is the
+// number of function names and M is the average packed-string
+// compare. Bootstrap profile (`bench_compile.sh --sample`)
+// pinned cg_find_fn at 7-11 samples + `cg_str_eq_packed` at
+// 17-20 from the same call chain. Hashing reduces both —
+// every fn lookup becomes O(1) average.
+static auto _cg_fn_hash;          // hash_str: name → (idx + 1)
+static auto _cg_fn_hash_count;    // arr_len(cg_fn_name) at last build; -1 = unbuilt
+
+static void _cg_build_fn_hash() {
+    auto i, name_p, n;
+    if (_cg_fn_hash == 0) { _cg_fn_hash = hash_str_new(256); }
+    hash_str_clear(_cg_fn_hash);
+    n = arr_len(cg_fn_name);
+    for (i = 0; i < n; i++) {
+        name_p = arr_get(cg_fn_name, i);
+        hash_str_set(_cg_fn_hash,
+                     cg_sbuf + unpack_s(name_p), unpack_l(name_p),
+                     i + 1);
+    }
+    _cg_fn_hash_count = n;
+}
+
 // Find a B++ function's emitter index by packed name.
 // Returns -1 if not declared.
 cg_find_fn(name_p) {
-    auto i; i = 0;
-    while (i < arr_len(cg_fn_name)) {
-        if (cg_str_eq_packed(name_p, arr_get(cg_fn_name, i))) { return i; }
-        i++;
-    }
-    return -1;
+    auto v, n;
+    n = arr_len(cg_fn_name);
+    // Lazy build + stale-count rebuild. `bridge_data` populates
+    // cg_fn_name in stages and later passes may push synth
+    // entries onto the array (smart-dispatch's worker
+    // synthesizer is the canonical case); comparing the cached
+    // length against the live array length catches every growth
+    // without exposing the hash boundary to callers.
+    if (_cg_fn_hash_count != n) { _cg_build_fn_hash(); }
+    v = hash_str_get(_cg_fn_hash,
+                     cg_sbuf + unpack_s(name_p), unpack_l(name_p));
+    if (v == 0) { return -1; }
+    return v - 1;
 }
 
 // Find an extern declaration by packed name alone. Returns the
