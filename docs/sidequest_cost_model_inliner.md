@@ -181,15 +181,15 @@ cost(callee) = node_count(callee.body)
 Threshold (per call site):
 
 ```
-threshold = base_threshold              # default 5 (Phase B2 today)
+threshold = base_threshold              # default 30 (see "Sanity-check on xorshift64")
 if caller in hot path:    threshold *= 2
 if callsite in loop:      threshold *= 1.5
 if callee is @inline:     return ALWAYS  # override
 if callee is @no_inline:  return NEVER   # override
 ```
 
-Decision: inline if `cost ≤ threshold`, subject to the caps in
-Q4.
+Decision: inline if `cost ≤ threshold` AND `node_count(body)
+≤ body_node_cap` (see Q4), subject to per-binary growth cap.
 
 **No ladder of hardcoded constants.** Each call site computes
 its own threshold from static signals already in B++:
@@ -197,53 +197,212 @@ its own threshold from static signals already in B++:
 graph), `fn_phase[fi]`, loop depth (needs ~20 LOC parser
 annotation on T_CALL nodes via `.d` field already reserved).
 
-### Q3 — Alpha-rename
+### Sanity-check on xorshift64 (the anchor)
+
+The whole point of S4 is to inline xorshift64 from
+`examples/tablah.bpp`. Calibrate `base_threshold` against the
+actual measured shape:
+
+```
+xorshift64 body: 6 statements + 1 T_RET, 1 global write
+  s = rng_states[worker_id];      // T_ASSIGN + T_MEMLD
+  s = s ^ (s << 13);
+  s = s ^ (s >> 7);
+  s = s ^ (s << 17);
+  rng_states[worker_id] = s;      // T_MEMST (global write)
+  return s;
+
+Estimated node_count: ~31
+cost = 31 + 10 (1 global write) + 0 - 0 - 0 - 0 = 41
+```
+
+Call site at `tablah.bpp:70` is inside a `for` loop, so
+`threshold = base × 1.5`.
+
+To inline: need `threshold ≥ 41` → `base_threshold ≥ 28`.
+
+**Default lands at `base_threshold = 30`** (rounds up the
+xorshift64 anchor with a small margin). Industry parallels:
+
+- LLVM `OptSizeThreshold = 50`
+- GCC `max-inline-insns-auto` historically ~30-80
+- Phase B2 today: 5 (single-expression bodies only — different cost model)
+
+If xorshift64's body grows past ~37 nodes, the margin
+collapses; that's a known boundary and an acceptable design
+constraint — going beyond means re-tuning `base_threshold`
+upward (single constant, one commit), not a global refactor.
+
+### Q3 — Alpha-rename + multi-statement splice mechanics
 
 **Decision: add slots to `cg_vars` with mangled names
-`_inl<N>_<orig>`, monotonic counter per call site. NOT a new
-scoped symbol table.**
+`_inl<N>_<orig>`, monotonic counter per call site. Frame
+slots pre-registered via `fn_pre_reg_vars` extension, BEFORE
+`fn_compute_offsets` runs.**
 
 Rationale: `cg_vars` is flat per-function (line 914-918 of
 bpp_codegen.bsm). Scoped sub-tables would require refactoring
 `cg_var_idx` which scans linearly. Mangling with a monotonic
-counter guarantees uniqueness without scope tracking —
-`_inl42_y` never collides with `_inl43_y` or with caller's
-own `y`. `fn_compute_offsets` (line 385) handles frame growth
-naturally; existing `auto x; auto y;` codegen already grows
-frames the same way.
+counter guarantees uniqueness — `_inl42_y` never collides with
+`_inl43_y` or with caller's own `y`.
 
-Implementation: extend `ast_clone_subst` to also substitute
-T_VAR references to callee locals with mangled-name T_VAR
-nodes. Each callee local triggers a fresh `cg_var_add` in the
-caller before splice.
+**Splice mechanics for multi-statement bodies** (the part Phase
+B2 doesn't have to handle):
+
+Phase B2's splice is trivial because the body is a single
+expression — clone, substitute, emit. Multi-statement bodies
+need to execute prelude statements (assignments, etc.) BEFORE
+producing the call's return value.
+
+Current emit pipeline (step-by-step from `cg_emit_func`, line
+2225-2269 of bpp_codegen.bsm):
+
+```
+2. arr_clear(cg_vars)
+5. cg_var_add for each param
+6. fn_pre_reg_vars(body)    ← walks body, adds T_DECL'd locals
+   fn_compute_offsets()      ← lays out frame offsets
+7..14. emit prologue + body  ← per-node dispatch
+```
+
+The two-pass structure (pre-register then emit) is the key.
+For S4, extend step 6:
+
+```
+6'. fn_pre_reg_vars walks body INCLUDING inlineable T_CALL sites.
+    For each inlineable callsite C:
+      - assign next monotonic ID N
+      - for each T_DECL in callee body, cg_var_add("_inl<N>_<orig>")
+      - record N on the T_CALL node (new field, or T_CALL.d
+        if not used for loop_depth)
+```
+
+Then at emit time, when the codegen hits an inlineable T_CALL:
+
+```
+Splice procedure (extension of Phase B2 splice):
+  for stmt in body[0 .. n-2]:          // all prelude statements
+    cloned = ast_clone_subst(stmt, params, args, locals_map<N>)
+    emit_node(cloned)                  // executes for side effects
+  final_ret = body[n-1]                // the T_RET
+  cloned_expr = ast_clone_subst(final_ret.a, ...)
+  return emit_node(cloned_expr)        // value lands in acc
+```
+
+Why this works in B++ specifically: emit_node landing the
+final value in `acc` is EXACTLY what regular T_CALL emission
+does. Caller's enclosing expression doesn't care whether `acc`
+came from a `bl callee` instruction or from inline splice —
+the contract is the same.
+
+`ast_clone_subst` is extended to take `locals_map<N>` — a
+parallel array of (original-name, mangled-name) pairs. When it
+sees a T_VAR matching a callee local, it rewrites to the
+mangled name. The existing param-substitution logic stays
+intact.
+
+**No statement-lifting pass needed.** The splice happens
+during expression emission with the codegen's normal flow.
+Stack/register state across the inlined statements is
+preserved because each statement emit ends with values
+written to frame slots (the mangled locals) or to memory —
+no live values across statement boundaries except via slots,
+which is identical to non-inlined emission.
 
 ### Q4 — Side-effect rule + caps
 
-**Decision: use `fn_locally_impure[]` + `glob_writers[]` +
-`glob_readers[]` already populated, plus two industry-standard
-caps.**
+**Decision: phase whitelist (BASE + AUTO), expression-level
+"enclosing" check, plus two industry-standard caps.**
 
-Allow rule:
-1. `fn_phase[i] != PHASE_IO` and `!= PHASE_GPU` (Phase B2
-   already enforces; keep)
-2. For each global G written by callee: caller's enclosing
-   expression of the call site must not also reference G
+#### Phase eligibility (relaxation of Phase B2)
 
-Caps:
-- **Per-function absolute ceiling: 50 nodes** (LLVM
-  `OptSizeThreshold` style). No call site, no matter how hot,
-  inlines a body larger than 50 nodes.
+Phase B2 today requires `fn_phase[i] == PHASE_BASE` (pure).
+That excludes xorshift64, which writes `rng_states` and
+therefore is not PHASE_BASE.
+
+S4 widens to **PHASE_BASE OR PHASE_AUTO**:
+
+```
+allowed_phase(fi):
+  return fn_phase[fi] in { PHASE_BASE, PHASE_AUTO }
+
+rejected_phase(fi):
+  return fn_phase[fi] in { PHASE_IO, PHASE_GPU, PHASE_HEAP,
+                           PHASE_SOLO, PHASE_REALTIME,
+                           PHASE_SAFE, PHASE_PANIC }
+```
+
+Rationale: `PHASE_AUTO` is the lattice no-op (line 322 +
+413-414 of `bpp_dispatch.bsm`) — functions that have side
+effects but don't transitively reach malloc/IO/GPU stay
+PHASE_AUTO. xorshift64 is precisely PHASE_AUTO: writes a
+global, but the global isn't malloc'd by this function and no
+realtime constraint is on it. Allowing PHASE_AUTO catches the
+"tame impurity" case (global reads + global writes) without
+opening the door to malloc/IO/GPU.
+
+#### Enclosing-expression rule (precision)
+
+For each global G that callee writes (lookup via `glob_writers`
+reverse map), the call site is **rejected for inlining** if
+any T_VAR / T_MEMLD referencing G appears anywhere in the
+**enclosing expression** of the T_CALL.
+
+**Enclosing expression** is defined as: the entire AST subtree
+from the T_CALL upward, bounded by the nearest of:
+
+- A statement boundary (T_ASSIGN's RHS root, T_MEMST's source,
+  T_RET's value, T_IF condition, T_WHILE condition,
+  statement-separator `;`)
+- A sequence-point operator (`&&`, `||`, ternary `?:`) — the
+  short-circuit boundary
+
+Worked example for `char_idx = (xorshift64(worker_id) &
+0x7FFFFFFFFFFFFFFF) % 62;` (tablah.bpp:70):
+
+- T_CALL's parent: T_BINOP(&)
+- Up: T_BINOP(%)
+- Up: T_ASSIGN's RHS — statement boundary
+- Enclosing = the entire RHS subtree
+- Walk: no T_VAR(rng_states), no T_MEMLD on rng_states → **pass**
+
+Adversarial example `x = rng_states[i] + xorshift64(j);`:
+
+- Enclosing = RHS subtree
+- Walk: finds T_MEMLD(rng_states[i]) → **reject**, fall back
+  to regular call (caller's read-before-write semantics
+  preserved)
+
+Implementation: the check runs at **splice time** (per call
+site), not at classify time (per function).
+`classify_inlineable_v2` decides eligibility-in-principle; the
+enclosing-expression check decides per-callsite. Implementation
+captures the expression-root context during codegen tree walk
+(no AST parent pointers needed — the recursion stack already
+provides ancestor context). ~30 LOC in P3c.
+
+#### Caps (two independent gates)
+
+- **Per-function absolute ceiling: `body_node_cap = 50`**
+  (LLVM `OptSizeThreshold` style). Hard gate on raw
+  `node_count(body)`, regardless of bonuses or caller hotness.
+  Independent from `threshold` (which is cost-with-bonuses).
 - **Per-binary growth cap: +20%** (GCC `inline-unit-growth`
   style). Inliner maintains a "bytes injected so far" counter
   in `run_dispatch()`. Once binary growth would exceed 20%,
   inliner stops accepting candidates regardless of individual
   cost.
 
-xorshift64 (the anchor): writes `rng_state`, reads
-`rng_state`. Typical call site is `x = xorshift64();` (pure
-assignment, no concurrent read of the same global) — passes.
-Pathological case `x = rng_state + xorshift64();` is statically
-detected, rejected.
+The two caps serve different protections:
+- `body_node_cap` blocks individual blow-up (one huge function
+  being inlined N times).
+- `binary_growth` blocks aggregate blow-up (many small
+  functions each individually fine, but together too much).
+
+xorshift64 sits at ~31 nodes, well under the 50 cap. Margin of
+~19 nodes — comfortable but not lavish. If a future workload's
+hot function exceeds 50, the constant is bumped (one-line
+tunable); this is a known design boundary.
 
 ### Q5 — `fn_ptr` parity
 
@@ -374,11 +533,11 @@ Phase B2 already supplies the classify/clone/splice scaffolding.
 | Phase | What | LOC est. | Risk |
 |---|---|---|---|
 | P0 | Parser: annotate T_CALL nodes with `loop_depth` (field `.d` already reserved); add `@inline` / `@no_inline` to phase_hint parsing | ~50 | low |
-| P1 | Cost function: extend `_inline_count_nodes` to compute penalty+bonus sum; add `_inline_const_arg_count`, `_inline_dead_branch_count` helpers | ~80 | low |
+| P1 | Cost function: extend `_inline_count_nodes`, `_inline_has_tcall`, `_inline_param_refs` to walk statement nodes (T_ASSIGN, T_MEMST, T_DECL, T_RET) — currently all four return 99 for non-expression types (Phase B2 assumed `body_cnt == 1` with single T_RET). Then layer penalty+bonus sum on top; add `_inline_const_arg_count`, `_inline_dead_branch_count` helpers. Keep `else → return 99` as the safety net for control-flow types not handled yet. | ~80 | low |
 | P2 | Threshold function: lookup `_fn_callers` for fanout, `fn_phase` for hot/cold, T_CALL.d for loop depth, multipliers per Q2 | ~50 | low |
-| P3a | Multi-statement body support: extend `classify_inlineable` to accept body_cnt > 1 (no globals yet); extend `ast_clone_subst` to clone T_BLOCK | ~80 | medium |
-| P3b | Local-variable alpha-rename: detect T_DECL in body, mangle to `_inl<N>_<orig>`, cg_var_add at splice point in both codegens | ~100 | medium |
-| P3c | Global write rule: check enclosing-expression rule from Q4 against `glob_readers[g]` for each `g` in callee's write set | ~60 | medium |
+| P3a | Multi-statement body support: extend `classify_inlineable` to accept body_cnt > 1 AND `fn_phase in {BASE, AUTO}`. Extend `ast_clone_subst` symmetrically to clone T_ASSIGN, T_MEMST, T_DECL, T_RET (and the T_BLOCK statement sequence wrapping them). Reject during classify any body containing T_IF/T_WHILE/T_SWITCH/nested T_BLOCK — control-flow inlining is out of scope (Q1 caveat). | ~80 | medium |
+| P3b | Local-variable alpha-rename: extend `fn_pre_reg_vars` to walk inlineable T_CALL sites; for each, assign monotonic ID and `cg_var_add("_inl<N>_<orig>")` for each callee local BEFORE `fn_compute_offsets` runs. Splice procedure in both codegens: emit prelude statements via `emit_node`, then final expression value lands in acc | ~100 | medium |
+| P3c | Enclosing-expression rule: at splice time, walk caller's expression ancestor chain (captured via codegen recursion stack) bounded by statement/sequence-point; check no T_VAR/T_MEMLD on globals written by callee | ~60 | medium |
 | P4 | Caps: per-function (50) hard ceiling check; per-binary growth counter in `run_dispatch`; rollback if cap exceeded mid-pass | ~40 | low |
 | P5 | Flags: `--inline-threshold`, `--inline-budget`, `--no-inline`, `--show-inlines` in `bpp_args.bsm`; tests | ~50 | low |
 | P6 | Bench iteration: tablah → 5% gate, regression sweep | ~20 | depends |
@@ -395,6 +554,12 @@ part. The Phase B2 design avoided it entirely (param-refs ≤ 1
 guarantees no duplication). S4 has to do it for real because
 multi-statement bodies have locals that survive across
 statements.
+
+The two-pass codegen structure (pre-register then emit, steps
+6 and 7 of `cg_emit_func`) is what makes this tractable:
+P3b's `cg_var_add` calls land in step 6 before
+`fn_compute_offsets`, so the frame is sized correctly when
+step 7 starts emitting. No mid-emit frame resizing.
 
 ---
 
