@@ -122,6 +122,17 @@ static auto _prim_hint;
 // when called from if/while/for. Used to warn about auto inside blocks.
 static auto _block_depth;
 
+// Loop nesting depth. 0 = outside any loop. Incremented by parse_while
+// and parse_for around their `parse_body()` call; decremented on exit.
+// Stamped onto every T_CALL node's `.d` field at creation so the S4
+// cost-model inliner can multiply the per-callsite threshold for hot
+// loop bodies. `.d` is otherwise unused on T_CALL nodes (verified by
+// grep across src/), and `ast_clone_subst` (bpp_dispatch.bsm:3878)
+// already preserves `cl.d = orig.d` so inlined calls keep their loop
+// stamp. Switch arms are NOT loops (one-shot dispatch, not repetition)
+// — they intentionally do not bump the depth.
+static auto _cur_loop_depth;
+
 // Recognise FFI driver modules by filename prefix. Drivers are
 // allowed to silently override the auto-injected `_stb_platform_<os>`
 // platform layer — the convention is the `drv_` prefix on the
@@ -178,6 +189,7 @@ void init_parser() {
     vbuf_pos = 0;
     tok_cnt = 0;
     tok_pos = 0;
+    _cur_loop_depth = 0;
     globals = arr_new();
     glob_cnt = 0;
     glob_class = arr_new();
@@ -2277,8 +2289,10 @@ static parse_while(hint_p) {
     consume();
     cond = parse_expr();
     consume();
+    _cur_loop_depth++;
     body_arr = parse_body();
     body_cnt = last_list_cnt;
+    _cur_loop_depth--;
     // Dead code elimination: `while (0) { body }` never runs — drop it.
     // `while (1)` is a legitimate infinite loop (game loops, REPLs) so
     // that case stays as-is and the body emits normally.
@@ -2317,8 +2331,10 @@ static parse_for() {
     step = parse_expr();
     consume();
     // Parse body — leave it untouched. The step lives in node.e.
+    _cur_loop_depth++;
     body_arr = parse_body();
     body_cnt = last_list_cnt;
+    _cur_loop_depth--;
     // Stash init for parse_body to insert before the while.
     _for_init = init_node;
     // Build while node. node.e (offset 40) carries the step expression
@@ -3090,6 +3106,7 @@ static parse_primary() {
             node.a = name_p;
             node.b = args_arr;
             node.c = last_list_cnt;
+            node.d = _cur_loop_depth;   // S4 P0a — loop-depth stamp
 
             // Phase D.4 inline trivials (2026-04-22): rewrite known
             // zero-overhead wrappers at parse time so hot paths stop
