@@ -11149,3 +11149,93 @@ strength reduction or strength-equivalence is a half-measure;
 lifting the whole call into the builtin lane via
 `cg_builtin_dispatch` is the right next step. S1 alone was the
 half-measure; S3b was the actual fix.
+
+## 2026-05-21 — Compiler hot-path opt arc FULLY CLOSED — ~41% cumulative bootstrap
+
+### Arc closure
+
+Continued the hot-path opt sidequest from 2026-05-20 (S1→S3c
+shipped, ~27%) for one more day of profile-driven stages. Six
+more candidates evaluated, five shipped, one reverted. Final
+bootstrap **0.51s → 0.30s = ~41%** cumulative. Suite 177/0/12
++ 141/0/48 byte-stable throughout. Doc updated to `FULLY
+CLOSED` in `docs/sidequest_compiler_hotpath_opt.md`.
+
+| Stage | What | Bootstrap | Commit |
+|---|---|---|---|
+| S3e | `arr_get` as builtin | 0.37 → 0.36 | `7101382` |
+| S3f | `arr_len` as builtin | 0.36 → 0.35 | `b5172bb` |
+| S3g | `arr_struct_at` as builtin | — REVERTED | — |
+| S3h | `u32` as builtin | 0.34 → 0.33 | `e7a10c7` |
+| S3i | `packed_eq` 8-byte chunk compare | 0.33 → 0.31 | `95012e8` |
+| S3j | `emit_ror32` chip primitive + `sha_rotr` builtin | 0.31 → 0.30 | `5cbac08` |
+| S3k | Hash for `cg_find_fn` | 0.30 (asymptotic) | `32dd8e3` |
+
+### S3g revert — the boundary of mechanical inlining
+
+`arr_struct_at(a, idx)` looked like a natural next builtin (~7
+samples post-S3h, struct accessor on the WC1 RTS hot path). The
+inline body would have been a 30-primitive sequence: 2 branches
++ 3 struct loads + mul + add, with `a` and `idx` re-pushed and
+re-popped between every step because the dispatch lane has no
+register-state continuity across primitive calls. Bench showed
+a 3-7% bootstrap regression — stack-juggling overhead exceeded
+the call-frame savings. Reverted.
+
+The rule of thumb now in the sidequest doc: **trivial body
+(1-op single statement) wins, composite body loses**. This is
+the upper bound of the `cg_builtin_dispatch` lane without
+register-state continuity. Anything past S3g needs a real
+inliner with shared register state — i.e. S4 cost-model
+inliner.
+
+### S3j was the first chip-level lift
+
+Every prior S3-series stage composed from existing primitives.
+S3j introduced a new primitive: `emit_ror32` (a64 RORV.W +
+x64 ROR_CL). Built because `sha_rotr` is on the hot path of any
+crypto-using workload (and was at 10 samples top-of-stack at the
+time). Pattern: lift the chip primitive to ABI, then lift the
+B++ function to `cg_builtin_dispatch`. Confirms the chip
+primitive ABI is the right shape for chip-level inlining; future
+hot ops on either chip can follow the same recipe.
+
+Implementation note: BINOP convention is asymmetric — a64 places
+LHS in `left_reg` while x64 places LHS in `acc`. New primitives
+should pick the non-BINOP `acc=value, scratch=count` convention
+for cross-chip consistency (mirrors `emit_shift_right_logical`).
+First version attempted BINOP and was caught in review.
+
+### S3k — asymptotic, not wall-time
+
+`cg_find_fn` was linear scan over ~600 functions × thousands of
+call sites = silent quadratic. Hash table with sentinel-rebuild
+cuts to O(1). Bench wall-time barely moved (it was only ~3% of
+samples at this point — the prior stages had already eaten the
+big-ticket items) but it's the right shape and it's bisect-
+friendly. Mirrors S2 (`_dsp_find_func_idx`) in spirit.
+
+### S4 cost-model inliner — opened as its own sidequest
+
+Decision point at end of arc: ship and close, or roll into S4.
+Picked: ship the arc, open `docs/sidequest_cost_model_inliner.md`
+with proper design phase. The remaining ~18% gap (tablah 49ms
+vs tablah_opt 40ms hand-unrolled xorshift64) needs multi-stmt +
+alpha-rename + side-effect tracking — a 1-2 dedicated session
+project that deserves its own scope, not a tack-on at the end
+of a long arc.
+
+Minimum-viable S4 (single-return-no-calls) was explicitly
+rejected — its scope is defined by what's easy, not by what's
+profile-justified. xorshift64 is the canonical workload and it
+has 7 statements + two local mutations + one global mutation,
+so any inliner short of the serious version would not catch it.
+
+### Lesson recorded (sidequest doc captures it)
+
+Mechanical inlining via `cg_builtin_dispatch` has an upper
+bound: bodies that fit in 1 primitive sequence with no
+re-evaluation of args. Past that, the cost is the dispatch
+lane's lack of register-state continuity — the next step is a
+proper inliner that emits into the regular codegen path with
+shared state, not into the dispatch lane.

@@ -1,13 +1,68 @@
 # Sidequest — Compiler hot path optimization (3 layered stages)
 
-**Status:** SHIPPED 2026-05-20 (committed 71b64a2 + S3c
-follow-up). Five stages landed (S1 + S2 + S3a + S3b + S3c) with
-profile sanity gate between each. Bootstrap 0.51s → 0.37s =
-**~27% improvement** (well past the doc's original 20-25%
-estimate). S3c didn't move the wall-time bench but the
-sample(1) hot list confirmed it eliminated `unpack_s` call
-frames inside `cg_str_eq_packed` (31 → 22 samples). Suite
-177/0/12 native + 141/0/48 C-emit, both byte-stable.
+**Status:** FULLY CLOSED 2026-05-21. Arc ran S1 → S3k across
+two days. Original three-stage scope expanded organically as
+each profile-sanity gate uncovered the next dominant cost.
+Final bootstrap **0.51s → 0.30s = ~41% cumulative improvement**
+(original target was 20-25%). Suite 177/0/12 native + 141/0/48
+C-emit byte-stable throughout.
+
+Stage-by-stage cumulative:
+
+| Stage | What | Bootstrap | Cumulative gain | Commit |
+|---|---|---|---|---|
+| Baseline | — | 0.51s | — | — |
+| S1 | `unpack_l` SDIV → LSR (via `: u_word`) | 0.50s | ~2% | 71b64a2 |
+| S2 | Hash for `_dsp_find_func_idx` | 0.42s | ~18% | 71b64a2 |
+| S3a | CSE in `packed_eq` | 0.41s | ~20% | 71b64a2 |
+| S3b | `unpack_l` as `cg_builtin_dispatch` builtin | 0.37s | ~27% | 71b64a2 |
+| S3c | `unpack_s` as builtin | 0.37s | ~27% | 592ba0f |
+| S3e | `arr_get` as builtin | 0.36s | ~29% | 7101382 |
+| S3f | `arr_len` as builtin | 0.35s | ~31% | b5172bb |
+| S3g | `arr_struct_at` as builtin | — | **REVERTED** | (no commit) |
+| S3h | `u32` as builtin | 0.33s | ~35% | e7a10c7 |
+| S3i | `packed_eq` 8-byte chunk compare | 0.31s | ~39% | 95012e8 |
+| S3j | `emit_ror32` chip primitive + `sha_rotr` builtin | 0.31s | ~39% | 5cbac08 |
+| S3k | Hash for `cg_find_fn` | 0.30s | ~41% | 32dd8e3 |
+
+### S3g revert — boundary of inline-via-builtin pattern
+
+`arr_struct_at(a, idx)` was attempted as a builtin but reverted
+when it caused a ~3-7% regression on the bench. Root cause:
+the body has 2 branches + 3 struct loads + mul + add = ~30
+primitive calls that re-evaluate `a` and `idx` via stack ops.
+Stack-juggling overhead exceeded call-frame savings.
+
+**Rule of thumb captured:** trivial body (1-op single statement)
+inlines via `cg_builtin_dispatch` cleanly. Composite body
+(branches + multi-load + arithmetic on re-pushed args) loses to
+the call frame because the dispatch lane has no shared register
+state across primitive calls — every value round-trips through
+the stack. This is the upper bound of what mechanical inlining
+in the current emit lane can do without a real cost model.
+
+### S4 cost-model inliner — punted to its own sidequest
+
+The remaining ~18% gap (tablah baseline 49ms vs tablah_opt
+40ms with hand-unrolled xorshift64) needs a real cost-model
+inliner: multi-statement bodies + local renaming + side-effect
+tracking. Minimum-viable single-return-no-calls inliner would
+NOT catch xorshift64 (7 stmts + mutations + global rng_state)
+so it's not worth doing as a tack-on. Opened as separate
+sidequest: `docs/sidequest_cost_model_inliner.md` (~700 LOC,
+1-2 dedicated sessions, design phase first).
+
+### Engine touches in this arc
+
+- New chip primitive `emit_ror32` (a64 RORV.W + x64 ROR_CL).
+  Mirrors S3b-h "lift hot trivial via cg_builtin_dispatch" but
+  for an op that needed ABI extension. First proof that the
+  primitive ABI was the right shape for chip-level inlining.
+- `packed_eq` 8-byte fast loop in three places (B++ source +
+  Mach-O linker + ELF linker). Documented BINOP convention
+  asymmetry (a64 LHS in left_reg, x64 LHS in acc) — kept the
+  new primitive on the non-BINOP `acc=value, scratch=count`
+  convention for cross-chip consistency.
 
 Final hot-list state vs baseline:
 
