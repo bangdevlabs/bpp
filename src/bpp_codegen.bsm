@@ -1549,6 +1549,49 @@ cg_builtin_dispatch(n) {
         return 1;
     }
 
+    // Built-in: arr_get(arr, i) — element i of an arr_new array
+    // (or any 8-byte-element word buffer). Body is the trivial
+    // `*(arr + i * 8)` — see `arr_get` in `bpp_array.bsm`. Hot-path
+    // opt S3e (sidequest: arc 1): promotes the most-called wrapper
+    // in the language to a Tier 1 builtin so the call frame
+    // disappears and the load goes through the chip's indexed-
+    // addressing primitive.
+    //
+    // Eval order — produces `acc = arr`, `scratch = i * 8`, then
+    // `emit_mem_read_indexed(8)` does `acc = peek_w(acc + scratch)`:
+    //   1. emit_node(i)       → acc = i                (LHS for shl)
+    //   2. push_acc           → stack = [i]
+    //   3. mov_imm(3)         → acc = 3                (RHS — shift count)
+    //   4. pop_scratch        → scratch = i            (LHS in left reg)
+    //   5. emit_shl(1)        → acc = scratch << acc = i << 3 = byte_offset
+    //   6. push_acc           → stack = [byte_offset]
+    //   7. emit_node(arr)     → acc = arr              (base, re-eval AST)
+    //   8. pop_scratch        → scratch = byte_offset
+    //   9. mem_read_indexed(8)→ acc = *(acc + scratch) = arr[i]
+    //
+    // Total: 9 spine calls vs the prior ~14-instr function-call
+    // frame. The chip primitive uses ARM64's native register-offset
+    // LDR (`LDR x0, [x0, x1]`) so the indexed load is a single
+    // instruction on a64; x64 keeps its `add+load` shape since SIB
+    // scaling here would require a new encoder. Future ports
+    // implement `_emit_mem_read_indexed(8)` once and inherit fast
+    // `arr_get`.
+    if (cg_str_eq(n.a, "arr_get", 7)) {
+        arr = n.b;
+        ety = call(p.emit_node, *(arr + 8));  // i (second arg)
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_push_acc);                // stack = [i]
+        call(p.emit_mov_imm, 3);              // acc = 3 (shift count)
+        call(p.emit_pop_scratch);             // scratch = i
+        call(p.emit_shl, 1);                  // acc = i << 3 = byte offset
+        call(p.emit_push_acc);                // stack = [byte_offset]
+        ety = call(p.emit_node, *(arr + 0));  // arr (base, re-eval AST)
+        if (ety == 1) { call(p.emit_coerce_float_to_int); }
+        call(p.emit_pop_scratch);             // scratch = byte_offset
+        call(p.emit_mem_read_indexed, 8);     // acc = *(acc + scratch)
+        return 1;
+    }
+
     // Built-in: mem_barrier() — full memory barrier + zero acc.
     // Used by stbjob to order producer/consumer writes on SPSC
     // queues. 0 args.
