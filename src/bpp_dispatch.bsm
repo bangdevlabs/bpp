@@ -4002,6 +4002,69 @@ static _inline_cost(fn_idx, args_arr, arg_cnt) {
     return nodes + 5 * indirect + 10 * globals - 10 * consts - 5 * dead;
 }
 
+// ── S4 P2: per-callsite threshold function ──────────────────
+//
+// Companion to `_inline_cost` above. The threshold is computed
+// PER-CALLSITE (not per-callee) because the same callee can be
+// worth inlining at one site and not worth it at another:
+// inside a tight loop the inliner trades a bigger body for the
+// saved call-frame on every iteration, while at a one-shot
+// startup site the same body is just bloat.
+//
+// Per Q2 of the S4 design doc:
+//
+//   threshold = INLINE_BASE_THRESHOLD              # default 30
+//   if caller in hot path:    threshold *= 2
+//   if callsite in loop:      threshold *= 1.5
+//
+// Caller hotness = caller has many call sites itself, signalled
+// by `arr_len(_fn_callers[caller_idx])`. A heavily-called caller
+// is hot transitively, so its own call sites are hot. Threshold
+// `INLINE_HOT_FANOUT = 10` is a conservative starting point —
+// any caller invoked from 10+ places passes the gate. Adjustable
+// post-bench (P6) via the `--inline-threshold` flag landing in
+// P5; for now the constant is in source.
+//
+// Loop-depth signal lives on the T_CALL node's `.d` field
+// (S4 P0a), stamped at parse time by parse_while / parse_for.
+// Switch arms intentionally do NOT bump the counter — one-shot
+// dispatch, not repetition (see commit 5ca27fa rationale).
+//
+// Not called by any consumer yet. P3a's `classify_inlineable_v2`
+// will be the first; cg_emit_call's splice point in each chip
+// (a64_codegen:1200, x64_codegen:953) will be the second.
+const INLINE_BASE_THRESHOLD = 30;
+const INLINE_HOT_FANOUT     = 10;
+
+static _inline_caller_fanout(caller_idx) {
+    auto callers;
+    if (caller_idx < 0) { return 0; }
+    if (caller_idx >= arr_len(_fn_callers)) { return 0; }
+    callers = arr_get(_fn_callers, caller_idx);
+    if (callers == 0) { return 0; }
+    return arr_len(callers);
+}
+
+static _inline_threshold(callee_idx, caller_idx, call_node) {
+    auto n: Node, threshold;
+    threshold = INLINE_BASE_THRESHOLD;
+    if (_inline_caller_fanout(caller_idx) >= INLINE_HOT_FANOUT) {
+        threshold = threshold * 2;
+    }
+    if (call_node != 0) {
+        n = call_node;
+        // n.d = loop_depth stamped by parser (S4 P0a). Defaults to
+        // 0 for the rare case of a synth-constructed T_CALL that
+        // never went through parse_call_expression (no current
+        // such site exists; the guard is defensive).
+        if (n.d > 0) {
+            // Q2 specifies × 1.5; integer-safe as × 3 / 2.
+            threshold = threshold * 3 / 2;
+        }
+    }
+    return threshold;
+}
+
 // Walk the function table and tag every entry that meets the inline
 // criteria above. Must run after classify_all_functions so fn_phase
 // is final. Codegens read fn_inlineable when emitting T_CALL.
