@@ -4138,18 +4138,19 @@ _inline_pack_mangled_name(id, orig_p) {
 
 // Scan top-level statements of a callee body for T_DECL nodes
 // and register a mangled `_inl<id>_<orig>` slot for each local.
-// The classifier rejects bodies with T_IF/T_WHILE/T_BLOCK/
-// T_SWITCH so this only needs to look at flat top-level T_DECLs
-// — no nested-scope traversal.
+// Mirrors the type-metadata copy that `a64_pre_reg_vars` does
+// for regular T_DECL nodes (n.c → cg_var_forced_ty, n.d →
+// cg_var_stack + cg_var_struct_idx). Without this propagation
+// typed locals like `auto m: Hash` lose their forced_ty when
+// inlined and the codegen's typed store/load path takes the
+// wrong branch for struct-typed slots.
 //
 // T_DECL.a is either a single packed name (when .b == 1) or a
 // word-array of packed names (when .b > 1, for `auto x, y, z;`).
-// `cg_var_add` (in bpp_codegen.bsm) appends to the caller's
-// `cg_vars` table and returns the assigned slot index.
 _inline_register_callee_locals(body_arr, body_cnt, id) {
-    auto i, j;
+    auto i, j, vi;
     auto n: Node;
-    auto mangled;
+    auto mangled, orig_name;
     i = 0;
     while (i < body_cnt) {
         n = body_arr[i];
@@ -4157,8 +4158,16 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
             if (n.ntype == T_DECL) {
                 j = 0;
                 while (j < n.b) {
-                    mangled = _inline_pack_mangled_name(id, *(n.a + j * 8));
-                    cg_var_add(mangled);
+                    orig_name = *(n.a + j * 8);
+                    mangled = _inline_pack_mangled_name(id, orig_name);
+                    vi = cg_var_add(mangled);
+                    if (n.d == 1) {
+                        arr_set(cg_var_stack, vi, 1);
+                        arr_set(cg_var_struct_idx, vi, get_var_type(orig_name));
+                    }
+                    if (n.c > 0) {
+                        arr_set(cg_var_forced_ty, vi, n.c);
+                    }
                     j++;
                 }
             }
@@ -4268,7 +4277,7 @@ void _inline_pre_reg_walk(nd) {
 }
 
 // Driver — walks a body array (= function body or block body) of
-// statement nodes. Called from each chip's `pre_reg_vars` (P3b-2).
+// statement nodes. Called from each chip's `pre_reg_vars`.
 void _inline_pre_reg_walk_body(arr, cnt) {
     auto i;
     i = 0;
@@ -4276,6 +4285,32 @@ void _inline_pre_reg_walk_body(arr, cnt) {
         _inline_pre_reg_walk(arr[i]);
         i++;
     }
+}
+
+// Collect packed names of every top-level T_DECL local in a
+// callee body into `out_buf`. Writes one packed-name pointer
+// per word slot. Returns the count of names written. Used at
+// splice time to assemble the rename map.
+_inline_collect_locals(body_arr, body_cnt, out_buf) {
+    auto i, j, count;
+    auto n: Node;
+    i = 0;
+    count = 0;
+    while (i < body_cnt) {
+        n = body_arr[i];
+        if (n != 0) {
+            if (n.ntype == T_DECL) {
+                j = 0;
+                while (j < n.b) {
+                    *(out_buf + count * 8) = *(n.a + j * 8);
+                    count++;
+                    j++;
+                }
+            }
+        }
+        i++;
+    }
+    return count;
 }
 
 // Body-node hard cap (Q4 of S4 sidequest doc). Independent from
@@ -4364,23 +4399,27 @@ void classify_inlineable() {
             if (_inline_has_tcall(body_arr[j])) { ok = 0; break; }
         }
         if (ok == 0) { continue; }
-        // Param-ref ≤ 1 invariant — only enforced for the
-        // single-statement case. The codegen splice for
-        // single-T_RET bodies substitutes args directly with
-        // no temp binding, so duplicating a side-effecting arg
-        // would double-evaluate. P3b's multi-stmt splice
-        // alpha-renames into temps and relaxes this constraint.
-        if (body_cnt == 1) {
-            ret_stmt = body_arr[0];
-            ret_expr = ret_stmt.a;
-            if (ret_expr == 0) { continue; }
-            params = *(fn_rec + FN_PARS);
-            for (j = 0; j < pcnt; j++) {
-                refs = _inline_param_refs(ret_expr, *(params + j * 8));
-                if (refs > 1) { ok = 0; }
+        // Param-ref ≤ 1 invariant — enforced for both single-
+        // and multi-statement bodies. The codegen splice in
+        // both paths substitutes args directly into the cloned
+        // body with no temp binding, so a side-effecting arg
+        // referenced more than once would double-evaluate.
+        // For multi-stmt, the body is scanned across all
+        // statements (params can be touched in any of them).
+        // A future P3b refinement (alpha-rename + arg-binding
+        // prologue) could relax this; until then, single-ref
+        // is the contract.
+        params = *(fn_rec + FN_PARS);
+        ok = 1;
+        for (j = 0; j < pcnt; j++) {
+            auto k, refs_total;
+            refs_total = 0;
+            for (k = 0; k < body_cnt; k++) {
+                refs_total += _inline_param_refs(body_arr[k], *(params + j * 8));
             }
-            if (ok == 0) { continue; }
+            if (refs_total > 1) { ok = 0; }
         }
+        if (ok == 0) { continue; }
         arr_set(fn_inlineable, i, 1);
     }
 }

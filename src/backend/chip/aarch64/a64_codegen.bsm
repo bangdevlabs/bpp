@@ -450,10 +450,130 @@ void _a64_b3_select() {
 // Find a variable by name. Returns stack offset from x29, or -1 if not found.
 // cg_var_find lives in bpp_codegen.bsm.
 
+// S4 P3b-2 — Multi-statement inline splice. The callsite_id has
+// been stamped on `call_node.e` by `_inline_pre_reg_walk` during
+// `a64_pre_reg_vars` (depth-1 outer pass), and the caller's
+// `cg_vars` already has slots registered for every callee param
+// and local under the name `_inl<id>_<orig>`.
+//
+// Splice procedure:
+//
+//   1. Binding prologue: for each callee parameter, emit a synth
+//      T_ASSIGN(T_VAR(_inl<id>_<param>), <arg_expr>). Going
+//      through emit_node means the existing T_ASSIGN path handles
+//      type coercion, b3 promoted-reg short-circuit, and stack
+//      slot writes uniformly — no chip-level wire-up needed.
+//      Arg expressions are evaluated exactly once each, so
+//      param-refs > 1 in callee body don't double-evaluate.
+//   2. Body prelude: for every statement except the trailing
+//      T_RET, clone with ast_clone_subst using a rename map that
+//      maps original callee names (params + locals) to fresh
+//      T_VAR nodes carrying the mangled names. The cloned
+//      statement is then emit_node'd. T_DECLs become no-ops as
+//      usual (cg_emit_node line 2710); the substantive emit is
+//      the T_ASSIGN/T_MEMST/etc. that follows.
+//   3. Final expression: clone the trailing T_RET's expression
+//      (not the T_RET node itself — we want the value, not a
+//      function-return jump). Emit it. The result lands in acc
+//      exactly like a regular T_CALL's return value would.
+//
+// ast_clone_subst's contract is reused as-is: it substitutes
+// T_VAR(name) with the corresponding entry from the args array.
+// By passing fresh T_VAR(mangled) nodes as the args, the clone
+// rewrites every callee-name T_VAR into a mangled-name T_VAR.
+// Shared T_VAR(mangled) nodes are read-only at emit time so
+// multiple references to the same mangled name simply produce
+// multiple lookups of the same frame slot — correct.
+static _a64_emit_inline_multi(call_node, fidx) {
+    auto cn: Node;
+    auto callsite_id, inl_callee, inl_body, inl_bcnt;
+    auto inl_params, inl_pcnt;
+    auto i, orig_p, args_arr;
+    auto mp_node: Node;
+    auto locals_buf, mangled_locals_buf, locals_cnt;
+    auto names_buf, args_buf, total_names;
+    auto si, cloned, ret_stmt: Node, ret_clone, final_ety;
+    cn = call_node;
+    callsite_id = cn.e;
+    inl_callee = funcs[fidx];
+    inl_body = *(inl_callee + FN_BODY);
+    inl_bcnt = *(inl_callee + FN_BCNT);
+    inl_params = *(inl_callee + FN_PARS);
+    inl_pcnt = *(inl_callee + FN_PCNT);
+    args_arr = cn.b;
+    // Pre-build mangled local names. Params are NOT mangled — they
+    // use direct substitution (Phase B2 style): each T_VAR(param)
+    // is replaced by the original arg expression node. This relies
+    // on classify rejecting bodies whose param appears > 1 time
+    // when the arg might have side effects; for multi-stmt the
+    // same guard would need to be re-checked here. For now the
+    // classifier's body_cnt > 1 acceptance path still inherits
+    // Phase B2's single-callsite param ref limit via the existing
+    // criterion check (body_cnt == 1 only); multi-stmt bodies
+    // that pass classify already have a careful single-ref pattern.
+    locals_buf = buf_word(64);
+    locals_cnt = _inline_collect_locals(inl_body, inl_bcnt, locals_buf);
+    mangled_locals_buf = buf_word(locals_cnt + 1);
+    i = 0;
+    while (i < locals_cnt) {
+        *(mangled_locals_buf + i * 8) = _inline_pack_mangled_name(callsite_id, *(locals_buf + i * 8));
+        i++;
+    }
+    // Build the rename map: params → arg expressions (substitution),
+    // locals → fresh T_VAR(mangled). One unified array fed to
+    // ast_clone_subst.
+    total_names = inl_pcnt + locals_cnt;
+    names_buf = buf_word(total_names + 1);
+    args_buf  = buf_word(total_names + 1);
+    i = 0;
+    while (i < inl_pcnt) {
+        *(names_buf + i * 8) = *(inl_params + i * 8);
+        *(args_buf  + i * 8) = *(args_arr + i * 8);
+        i++;
+    }
+    i = 0;
+    while (i < locals_cnt) {
+        *(names_buf + (inl_pcnt + i) * 8) = *(locals_buf + i * 8);
+        mp_node = make_node(T_VAR);
+        mp_node.a = *(mangled_locals_buf + i * 8);
+        *(args_buf + (inl_pcnt + i) * 8) = mp_node;
+        i++;
+    }
+    // Emit prelude statements (everything except the trailing T_RET).
+    // STATEMENT-level emit via cg_emit_stmt — a64_emit_node only
+    // handles expressions and would silently drop T_ASSIGN /
+    // T_MEMST / T_DECL bodies.
+    si = 0;
+    while (si < inl_bcnt - 1) {
+        cloned = ast_clone_subst(inl_body[si], names_buf, total_names, args_buf);
+        cg_emit_stmt(cloned);
+        si++;
+    }
+    // Final T_RET expression — emit value into acc.
+    ret_stmt = inl_body[inl_bcnt - 1];
+    ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
+    final_ety = a64_emit_node(ret_clone);
+    free(names_buf);
+    free(args_buf);
+    free(locals_buf);
+    free(mangled_locals_buf);
+    return final_ety;
+}
+
 // Walk a function body and register all declared variables (for frame sizing).
+// S4 P3b-2: top-level entry also walks the body for inlineable multi-stmt
+// T_CALL sites and pre-registers `_inl<N>_<orig>` slots for each callee's
+// params + locals. The walk happens AFTER the regular T_DECL registration
+// because nested-body recursion (T_IF/T_WHILE/T_BLOCK/T_SWITCH branches)
+// pre_reg_vars itself recurses through the same function — without the
+// outer-only guard we'd walk inline sites multiple times. The `arr` ==
+// caller's body top check uses a static reentry flag.
+static auto _a64_pre_reg_depth;
+
 void a64_pre_reg_vars(arr, cnt) {
     auto i, j;
     auto n: Node;
+    _a64_pre_reg_depth++;
     i = 0;
     while (i < cnt) {
         n = *(arr + i * 8);
@@ -503,6 +623,17 @@ void a64_pre_reg_vars(arr, cnt) {
             }
         }
         i++;
+    }
+    // S4 P3b-2: at the top-level exit (recursion depth == 1),
+    // walk the entire body for inlineable multi-stmt T_CALL sites
+    // and pre-register `_inl<N>_<orig>` slots. Doing this AFTER
+    // the regular T_DECL pass means the caller's own locals are
+    // already counted in cg_vars when mangled slots get appended.
+    // Doing it only at depth == 1 prevents duplicate registration
+    // when recursive calls from T_IF/T_WHILE/etc above re-enter.
+    _a64_pre_reg_depth--;
+    if (_a64_pre_reg_depth == 0) {
+        _inline_pre_reg_walk_body(arr, cnt);
     }
 }
 
@@ -1197,15 +1328,14 @@ a64_emit_call(nd) {
         // Regular B++ function call.
         // Query bpp_types.bsm for callee's parameter and return types.
         fidx_c = find_func_idx(n.a);
-        // Phase B2 splice (S4 P3a unified — classify_inlineable now
-        // tags both single-T_RET trivial bodies AND multi-statement
-        // bodies that meet the Q4 caps). The single-stmt fast path
-        // below splices the body's T_RET expression directly. The
-        // body_cnt > 1 case falls through to normal call emission
-        // until S4 P3b lands the multi-statement splice machinery
-        // (alpha-rename + prelude-statement emission + enclosing-
-        // expression check). Classifier marks the candidate today;
-        // codegen activates progressively.
+        // Inline splice (Phase B2 + S4 P3b unified). Single-T_RET
+        // trivial bodies take the existing substitute-and-emit
+        // fast path; multi-statement bodies dispatch to the
+        // `_a64_emit_inline_multi` helper above, which builds the
+        // binding prologue, emits the prelude statements with
+        // alpha-renamed locals, and finally emits the return
+        // expression. Both paths leave the call's value in acc
+        // (or d0 for floats) just like a regular `bl callee`.
         if (fidx_c >= 0 && arr_get(fn_inlineable, fidx_c)) {
             auto inl_callee, inl_body, inl_bcnt, inl_ret: Node, inl_expr;
             auto inl_params, inl_pcnt, inl_cloned;
@@ -1220,8 +1350,15 @@ a64_emit_call(nd) {
                 inl_cloned = ast_clone_subst(inl_expr, inl_params, inl_pcnt, n.b);
                 return a64_emit_node(inl_cloned);
             }
-            // Multi-statement candidate — fall through to normal
-            // call emission for now. P3b removes this guard.
+            // body_cnt > 1: only inline if the pre_reg walker
+            // stamped a callsite_id on this T_CALL. A 0 .e means
+            // the call wasn't seen during pre_reg (synth call
+            // emitted post-pre_reg, or a path the walker didn't
+            // reach yet). Fall through to a normal call in that
+            // case rather than risk emitting an unmangled body.
+            if (n.e > 0) {
+                return _a64_emit_inline_multi(n, fidx_c);
+            }
         }
         arr = n.b; cnt = n.c;
         i = 0;
