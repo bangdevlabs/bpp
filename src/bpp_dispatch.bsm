@@ -4065,6 +4065,219 @@ static _inline_threshold(callee_idx, caller_idx, call_node) {
     return threshold;
 }
 
+// ── S4 P3b-1: multi-statement splice infrastructure (dead code) ──
+//
+// All of the helpers below are part of the multi-statement
+// inline machinery. P3b-1 (this commit) only DEFINES them;
+// nothing calls them yet. P3b-2 wires them in:
+//   * `_inline_pre_reg_walk_body` invoked from each chip's
+//     `pre_reg_vars` so the caller's frame gets `_inl<N>_<orig>`
+//     slots for every inlineable multi-stmt callsite.
+//   * The splice point in `a64_codegen.bsm:1200+` extended to
+//     emit the binding prologue + prelude statements + final
+//     T_RET expression for body_cnt > 1 callees.
+//
+// Bootstrap stays byte-stable for P3b-1 because none of these
+// functions are reached from emit code paths.
+
+// Per-function monotonic counter for unique inline call site
+// IDs. The first callsite in a function gets ID 1; ID 0 is the
+// "not an inline site" sentinel for the T_CALL.e field.
+// `cg_emit_func` resets this before each function via
+// `_inline_reset_callsite_id()`.
+global _inline_callsite_id;
+
+void _inline_reset_callsite_id() {
+    _inline_callsite_id = 0;
+}
+
+// Construct a mangled packed name `_inl<id>_<orig>` by appending
+// bytes to vbuf. Returns a packed reference to the new name.
+// `id` must be > 0 (the sentinel 0 is "no inline").
+//
+// Layout of the mangled bytes:
+//   "_inl" (4) + decimal digits of id (variable) + "_" (1) + orig
+//
+// The original name is read from `vbuf + unpack_s(orig_p)` so
+// the function is independent of how `orig_p` was constructed.
+_inline_pack_mangled_name(id, orig_p) {
+    auto start, i, n, digits, orig_len, orig_off, ch, div, d;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'i'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'n'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'l'); vbuf_pos++;
+    n = id; digits = 0;
+    while (n > 0) { digits++; n = n / 10; }
+    if (digits == 0) { digits = 1; }
+    div = 1;
+    i = 1;
+    while (i < digits) { div = div * 10; i++; }
+    n = id;
+    i = 0;
+    while (i < digits) {
+        d = n / div;
+        poke(vbuf + vbuf_pos, d + '0');
+        vbuf_pos++;
+        n = n - d * div;
+        div = div / 10;
+        i++;
+    }
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    orig_len = unpack_l(orig_p);
+    orig_off = unpack_s(orig_p);
+    i = 0;
+    while (i < orig_len) {
+        ch = peek(vbuf + orig_off + i);
+        poke(vbuf + vbuf_pos, ch);
+        vbuf_pos++;
+        i++;
+    }
+    return pack(start, 4 + digits + 1 + orig_len);
+}
+
+// Scan top-level statements of a callee body for T_DECL nodes
+// and register a mangled `_inl<id>_<orig>` slot for each local.
+// The classifier rejects bodies with T_IF/T_WHILE/T_BLOCK/
+// T_SWITCH so this only needs to look at flat top-level T_DECLs
+// — no nested-scope traversal.
+//
+// T_DECL.a is either a single packed name (when .b == 1) or a
+// word-array of packed names (when .b > 1, for `auto x, y, z;`).
+// `cg_var_add` (in bpp_codegen.bsm) appends to the caller's
+// `cg_vars` table and returns the assigned slot index.
+_inline_register_callee_locals(body_arr, body_cnt, id) {
+    auto i, j;
+    auto n: Node;
+    auto mangled;
+    i = 0;
+    while (i < body_cnt) {
+        n = body_arr[i];
+        if (n != 0) {
+            if (n.ntype == T_DECL) {
+                j = 0;
+                while (j < n.b) {
+                    mangled = _inline_pack_mangled_name(id, *(n.a + j * 8));
+                    cg_var_add(mangled);
+                    j++;
+                }
+            }
+        }
+        i++;
+    }
+}
+
+// Register a single inline call site. Assigns the next monotonic
+// id, stamps it on `call_node.e`, then registers `_inl<id>_<orig>`
+// slots for every callee parameter and every callee local in the
+// caller's frame. After this returns, `cg_var_idx(mangled_name)`
+// resolves to a valid slot index for use by the splice procedure.
+void _inline_register_callsite(call_node, fidx) {
+    auto cn: Node;
+    auto fn_rec, body_arr, body_cnt, params, pcnt, i;
+    auto orig_p, mangled;
+    _inline_callsite_id++;
+    cn = call_node;
+    cn.e = _inline_callsite_id;
+    fn_rec = funcs[fidx];
+    params = *(fn_rec + FN_PARS);
+    pcnt = *(fn_rec + FN_PCNT);
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    i = 0;
+    while (i < pcnt) {
+        orig_p = *(params + i * 8);
+        mangled = _inline_pack_mangled_name(_inline_callsite_id, orig_p);
+        cg_var_add(mangled);
+        i++;
+    }
+    _inline_register_callee_locals(body_arr, body_cnt, _inline_callsite_id);
+}
+
+// AST walker — for every T_CALL anywhere in the caller's AST,
+// check whether the target is an inlineable multi-stmt callee.
+// If yes, register a callsite slot block via the helpers above.
+// Single-statement inlineable callees are left alone — the
+// existing Phase B2 trivial splice handles them without any
+// per-callsite slot registration.
+//
+// Recurses through all expression-bearing node types. Switch arms
+// not yet covered (callee body would have to contain T_CALL +
+// T_SWITCH in a non-rejected combination; the classifier already
+// excludes T_CALL anywhere in body so this is moot for now,
+// but keeping the function statement-shape complete makes future
+// callers reusable).
+void _inline_pre_reg_walk(nd) {
+    auto n: Node, t, arr, cnt, i, fidx, fn_rec, callee_bcnt;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) {
+            _inline_pre_reg_walk(arr[i]);
+            i++;
+        }
+        fidx = find_func_idx(n.a);
+        if (fidx >= 0) {
+            if (arr_get(fn_inlineable, fidx)) {
+                fn_rec = funcs[fidx];
+                callee_bcnt = *(fn_rec + FN_BCNT);
+                if (callee_bcnt > 1) {
+                    _inline_register_callsite(n, fidx);
+                }
+            }
+        }
+        return 0;
+    }
+    switch (t) {
+    T_BINOP   { _inline_pre_reg_walk(n.b); _inline_pre_reg_walk(n.c); }
+    T_UNARY   { _inline_pre_reg_walk(n.b); }
+    T_MEMLD   { _inline_pre_reg_walk(n.a); }
+    T_ADDR    { _inline_pre_reg_walk(n.a); }
+    T_TERNARY { _inline_pre_reg_walk(n.a); _inline_pre_reg_walk(n.b); _inline_pre_reg_walk(n.c); }
+    T_ASSIGN  { _inline_pre_reg_walk(n.a); _inline_pre_reg_walk(n.b); }
+    T_MEMST   { _inline_pre_reg_walk(n.a); _inline_pre_reg_walk(n.b); }
+    T_RET     { _inline_pre_reg_walk(n.a); }
+    T_IF      {
+        _inline_pre_reg_walk(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _inline_pre_reg_walk(arr[i]); i++; }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            i = 0;
+            while (i < cnt) { _inline_pre_reg_walk(arr[i]); i++; }
+        }
+    }
+    T_WHILE   {
+        _inline_pre_reg_walk(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _inline_pre_reg_walk(arr[i]); i++; }
+    }
+    T_BLOCK   {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _inline_pre_reg_walk(arr[i]); i++; }
+    }
+    else { }
+    }
+    return 0;
+}
+
+// Driver — walks a body array (= function body or block body) of
+// statement nodes. Called from each chip's `pre_reg_vars` (P3b-2).
+void _inline_pre_reg_walk_body(arr, cnt) {
+    auto i;
+    i = 0;
+    while (i < cnt) {
+        _inline_pre_reg_walk(arr[i]);
+        i++;
+    }
+}
+
 // Body-node hard cap (Q4 of S4 sidequest doc). Independent from
 // the cost threshold (which is cost-with-bonuses, computed
 // per-callsite in `_inline_threshold`). This is the absolute
