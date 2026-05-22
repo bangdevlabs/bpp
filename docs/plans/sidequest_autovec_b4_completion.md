@@ -379,9 +379,11 @@ Mirror outlining's gates (Rule 37):
 | P1 | C emitter SIMD path — `__m128` for `: double`, `_mm_*` for vec_* | ~150 | low |
 | P2 | Pattern matcher P1 — `arr[i] = arr[i] OP literal` recognition | ~150 | medium |
 | P3 | Pattern matcher P2 — `arr[i] = lhs[i] OP rhs[i]` | ~150 | medium |
-| P4 | Aligned-memory hint — `auto buf: aligned;` + MOVAPS path | ~50 | low |
+| P4 | ⏭️ **SKIPPED** — aligned-memory hint. Annotation form violates Rule 4 (no new annotations); doctrine-OK tracking form is ~200 LOC for near-zero perf gain (MOVAPS / MOVUPS indistinguishable on modern chips). Decision recorded in commit `4bc79dd`. | — | — |
 | P5 | Code emission — vector loop + scalar tail generator | ~200 | medium |
-| P6 | Outlining composition — autovec inside synth worker bodies | ~80 | medium |
+| P6.1 | Range-synth migration — synth signature changes to `(loop_var, _end, cap_ptr)`; chunk_worker calls synth ONCE per worker with `(start, end)` instead of N per-iter calls. Commit `a2d5fdf`. | ~120 | medium |
+| P6.2 | Compose outlining + autovec inside synth body — when both gates accept, synth body wraps SIMD vec-loop + scalar tail. Commit `2384b46`. Measured 6x compose vs serial on `bench_compose.bpp` (memory-bandwidth-bound; compute-bound would scale closer to 32x ceiling). | ~150 | medium |
+| ⚠️ Known | **Incremental-emit-mode bug**: in incremental compile (`flag_incr = 1` default), modules 1..N emit IMMEDIATELY at parse time, before the dispatch pipeline runs for module 0. Synths created by dispatch belong to modules N (via `import`/`load`), so they get orphaned — never emitted. Diagnosed via `bug --dump`: 12 synths in `.bug` map, 0 in binary for FPS. FIX: re-emit affected modules after dispatch (or move dispatch before per-module emit). Affects games that put hot loops in non-entry modules (FPS, RTS). Single-module test programs (bench_compose, test_outline_smoke) work fine. | — | — |
 | Pn | Bench + iterate — measure on representative loops | ~80 | depends |
 
 **Total: ~890 LOC, 4-5 sessions estimate.**
