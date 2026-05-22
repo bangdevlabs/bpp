@@ -47,14 +47,18 @@ import "stbtile.bsm";      // tile_get / tile_is_solid (for the sync)
 //   x, y     — world position in cell units (FPSBody convention)
 //   vx, vy   — velocity in cells/sec (zero for idle entities)
 //   hp       — remaining health (Session 3 fills this in)
-//   cooldown — generic countdown (kind-specific meaning)
+//   cooldown — generic countdown in seconds (kind-specific meaning).
+//              `half float` (BASE_FLOAT + SL_HALF) so the per-frame
+//              decrement loop in `wolf_ai_tick_cooldowns` matches
+//              the autovec P1 pattern (`arr[i].cooldown =
+//              arr[i].cooldown - dt`) and gets 4-wide SIMD emission.
 struct WolfEntPayload {
     kind:     byte,
     state:    byte,
     x: float, y: float,
     vx: float, vy: float,
     hp:       half,
-    cooldown: half
+    cooldown: half float
 }
 
 // ── FSM states for the Wolf3D enemy ────────────────────────
@@ -88,6 +92,14 @@ static extrn _ai_pos: Vec2;       // ai_step_collide output (new pos)
 static extrn _pf;
 static extrn _pf_path_buf;
 
+// Module-scope cap mirror — wolf_ai_init records the ECS
+// capacity here so per-frame hot loops (notably
+// `wolf_ai_tick_cooldowns`) can use a global bound instead of a
+// function parameter. Smart-dispatch gate 5 rejects loops whose
+// bound is a function parameter; the global bound makes the loop
+// outlining-eligible AND autovec-eligible at the same time.
+global _wolf_ent_cap;
+
 // Module init — call once from the game's init_phase before
 // wolf_ai_step_all runs. Allocates the scratch buffers + the
 // PathFinder, then mirrors the Tilemap's solid cells into the
@@ -115,6 +127,13 @@ void wolf_ai_init(tm, w, h) {
     // stbpath contract.
     _pf_path_buf = malloc(_PF_PATH_MAX * 16);
     wolf_ai_resync_walls(tm, w, h);
+}
+
+// Late init: game passes the ECS world capacity so per-frame hot
+// loops in this module can use a module-global bound (gate-5
+// requirement for smart-dispatch / autovec eligibility).
+void wolf_ai_set_capacity(cap) {
+    _wolf_ent_cap = cap;
 }
 
 // Re-mirror the Tilemap's solid bits into the PathFinder's
@@ -236,6 +255,40 @@ static void _enemy_step(ep: WolfEntPayload, p: FPSBody,
 // `WolfEntPayload.kind` (1 = enemy, 2 = door, …). Per Tonify
 // Rule 4 the wrapper inherits `@solo` because it both reads and
 // writes per-entity heap state.
+// Cooldown tick — separate hot loop that decrements every entity's
+// `cooldown` field by `dt`. Designed to match autovec pattern P1
+// exactly: single-statement T_MEMST body with BASE_FLOAT + SL_HALF
+// hint and same-shape load/store on `e.cooldown`. The compiler's
+// matcher (commits 376ff2f → c9f1d7a → 4bc79dd) flags the loop and
+// P5 lowers it to a 4-wide SIMD vector loop + scalar tail.
+//
+// Caller (game tick) calls this BEFORE wolf_ai_step_all so AI logic
+// sees the freshly-decremented cooldown. Cooldown semantics:
+//   < 0  → ready to fire (combat module checks)
+//   > 0  → counting down
+//
+// Walks the full payload buffer including non-alive slots. The
+// non-alive slots' cooldown is dontcare (kind == 0 means the slot
+// is empty), so harmlessly decrementing them avoids the
+// `if (alive) continue;` shape that would reject at gate 8.
+//
+// Bound MUST be a global / const literal for outlining to also
+// catch the loop (gate 5). `cap` here is a function parameter; if
+// outlining is desired later, hoist `cap` to a module-scope global
+// or pass via a captured struct.
+// `dt` accepted as full-precision `: float` — the matcher only
+// requires the STORE hint to be half-float; the RHS arithmetic
+// promotes naturally. Passing full-precision avoids a narrowing
+// W010 at the call site.
+void wolf_ai_tick_cooldowns(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _wolf_ent_cap; i++) {
+        auto e: WolfEntPayload;
+        e = payload + i * sizeof(WolfEntPayload);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+
 void wolf_ai_step_all(dt: float, world, payload, tm, p)  {
     auto cap, i, ep: WolfEntPayload, pb: FPSBody;
     pb  = p;
