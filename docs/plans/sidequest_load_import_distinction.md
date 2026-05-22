@@ -461,6 +461,101 @@ deliverable shipped here covers ONLY the infrastructure
 lex+orchestrator change moves to a follow-up commit ("P3
 combined") with both pieces landing atomically.
 
+### Session 2026-05-22 (later) — combined-attempt findings
+
+Attempted P3+P4+orchestrator-topo+emit_all as ONE atomic commit
+this session. Bootstrap DID NOT converge. Investigation uncovered
+TWO latent bugs that have been hiding behind OLD code's
+over-lex behaviour:
+
+**Latent bug 1: mark_reachable misses ~471 functions in BOTH
+OLD and NEW code.** Empirical: `./bpp --stats src/bpp.bpp -o
+/tmp/dummy` on the OLD repo bpp reports `functions: 1551 (1080
+reachable, 471 pruned)`. Same numbers in NEW code. So the
+reachability analysis has been miscomputing for the same set
+of functions all along.
+
+Why OLD code worked anyway: the OLD orchestrator's per-module
+emit loop (line 272-285) runs BEFORE `mark_reachable()`. At
+that point `_lazy_emit_ready = 0`, so emit_module_arm64
+emits ALL functions of each module regardless of reach
+status. Only the FINAL `emit_module_arm64(0)` (after
+mark_reachable runs) applies the lazy filter — and that only
+touches module 0's functions.
+
+Net effect in OLD: ALL functions from modules 1..N emit
+unconditionally, plus reachable ones from module 0. Total
+~1548. Mark_reachable's bug is masked.
+
+NEW code's `emit_all_arm64()` runs AFTER mark_reachable, with
+`_lazy_emit_ready = 1`. The filter prunes the 471 functions —
+which turn out to include `_time_now_ns`, `panic`,
+`profile_start`, `malloc_aligned`, `_hash_insert_raw`, etc.
+These are ACTUALLY USED at runtime (via fn_ptr signal
+handlers, dynamic dispatch, etc.) but mark_reachable's
+call-graph BFS doesn't see them. Excluding them produces
+broken binaries.
+
+Bypassing the filter (`_lazy_emit_ready = 0` before
+`emit_all`) restores all 1552 functions to the binary — but
+the bootstrap STILL doesn't converge (next finding).
+
+**Latent bug 2: Codegen non-determinism.** Even with all
+functions emitted, gen1 → gen2 → gen3 produces DIFFERENT
+bytes each iteration:
+
+```
+gen1 (b9d1e89d...) — compiled by OLD bpp from NEW source
+gen2 (a4aa9740...) — compiled by gen1 (NEW code)
+gen3 (3bed6373...) — compiled by gen2 (NEW code)
+gen4 — SIGSEGV (gen3 broken)
+```
+
+Same compiler twice on same source IS deterministic — gen2
+compiled bpp.bpp twice both produced `3bed6373`. So the
+non-determinism is across binary VERSIONS, not within a
+single compile.
+
+The expected behaviour per the bootstrap manual: 1-cycle
+oscillation is normal when codegen changes (gen1 ≠ gen2,
+gen2 == gen3). What we see is MULTI-cycle drift — each
+generation produces different bytes.
+
+Hypothesis: some compile-time state depends on a value that
+shifts each generation. Possibly:
+  - `cg_fn_name` order via `cg_bridge_data` differs from
+    OLD's per-module-append order, and the difference
+    cascades through label IDs / relocations.
+  - Synthesized dispatch functions get attached at different
+    `func_cnt` positions across generations, so their
+    references shift.
+  - Some randomness or read-from-uninitialized memory.
+
+Root cause not yet identified.
+
+### Conclusion + next-session scope
+
+The load/import distinction sidequest's correct ATTRIBUTION
+phase (P3+P4) is shippable — `func_mods[]` becomes correct for
+nested-import content, the W020-static warnings now fire for
+real cross-module-static-call patterns that OLD code's
+over-lex was hiding. But the EMIT/codegen side needs more
+work than the design lock anticipated:
+
+  * **Mark_reachable needs a fix** to correctly seed signal
+    handlers, fn_ptr targets passed through external APIs,
+    and other indirect-call paths. Likely needs to extend the
+    address-taken seed set, or accept that some functions
+    must be conservatively kept (no pruning).
+  * **Codegen determinism** needs root-cause investigation.
+    Maybe a label-ID allocation issue, maybe a state-reset
+    issue between per-module-emit and the final emit pass.
+
+This is multi-session work with focused design. The current
+state (P1 infra `0f68dfa` + P2 inline-mode flag `562c0b5` +
+P3 ModBnd.abs_line + accessors `1bd87b6` + this finding doc)
+is the right stopping point.
+
 ### Why P3+P4+P5 must land BEFORE P6
 
 `emit_module_arm64(mi)` filters by `func_mods[i] == mi`. If
