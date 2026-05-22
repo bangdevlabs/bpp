@@ -2278,6 +2278,25 @@ static auto _fdc_write_set;
 // declared type readily available via the parser's vt_block.
 static auto _fdc_captures;
 
+// ── Autovec P2 (2026-05-22) ──────────────────────────────────
+// Per-candidate scoreboard for the autovectorization
+// transformation. Mirrors the smart-dispatch outlining shape:
+// pre-walk classifies each candidate as autovec-eligible, P5
+// (code emission) will consume the classification.
+//
+// `_av_pattern[i]` — pattern ordinal for `dispatch_candidates[i]`:
+//   0 = not autovec-eligible
+//   1 = P1: arr[i] = arr[i] OP literal_or_loop_invariant
+//       (single-pointer, single body statement, op is one of
+//        +/-/*/min/max, RHS is a constant or a name proven
+//        read-only by the existing write-set pre-walk)
+// Higher pattern ordinals reserved for P3 (multi-pointer)
+// and later phases.
+//
+// The matcher today scans only the simplest single-statement
+// shape. Anything else stays at pattern 0 (no autovec).
+static auto _av_pattern;
+
 // Monotonic counter for capture struct types. Each outlining call
 // site gets its own `_capture_K` struct. Reset would happen between
 // program-level compile units, but since smart-dispatch runs once
@@ -2550,6 +2569,158 @@ static _outline_synth_capture_struct() {
         i++;
     }
     return sidx;
+}
+
+// ── Autovec P2 helpers — pattern P1 matcher ──────────────────
+//
+// Pattern P1 (the simplest autovec-able shape):
+//
+//     arr[i] = arr[i] OP literal_or_loop_invariant
+//
+// In B++ AST that's:
+//
+//     T_MEMST(
+//         .a = T_BINOP(+, T_VAR(arr), <loop-var-index-expression>),
+//         .b = T_BINOP(OP,
+//             T_MEMLD(SAME-shape-as-.a, hint),
+//             T_LIT | T_VAR(loop-invariant)),
+//         .c = hint
+//     )
+//
+// Where `OP` is one of +, -, *, /, & (bitwise), | (bitwise),
+// ^ (bitwise). min/max not supported via T_BINOP; will be
+// recognised separately when needed.
+
+// Return 1 if `a` and `b` are structurally identical T_VAR
+// nodes (same packed name), 0 otherwise. Used to verify the
+// load address and store address reference the same array.
+static _av_node_same_var(a, b) {
+    auto na: Node, nb: Node;
+    if (a == 0 || b == 0) { return 0; }
+    na = a;
+    nb = b;
+    if (na.ntype != T_VAR) { return 0; }
+    if (nb.ntype != T_VAR) { return 0; }
+    if (na.a == nb.a) { return 1; }
+    if (packed_eq(na.a, nb.a)) { return 1; }
+    return 0;
+}
+
+// Walk two address expressions and return 1 if they have the
+// same structural shape (same operator chain, same operand
+// identity). Recursion mirrors the parser's address-expression
+// builder; only T_BINOP / T_VAR / T_LIT nodes appear in
+// addr-of-array-slot trees.
+static _av_addr_same(a, b) {
+    auto na: Node, nb: Node;
+    if (a == 0 || b == 0) { return a == b; }
+    na = a;
+    nb = b;
+    if (na.ntype != nb.ntype) { return 0; }
+    if (na.ntype == T_VAR) {
+        return _av_node_same_var(a, b);
+    }
+    if (na.ntype == T_LIT) {
+        // Numeric literals — compare the packed text.
+        if (na.a == nb.a) { return 1; }
+        if (packed_eq(na.a, nb.a)) { return 1; }
+        return 0;
+    }
+    if (na.ntype == T_BINOP) {
+        // Operator + both sides must match. Address arithmetic
+        // is built left-leaning so we don't try commuting.
+        if (packed_eq(na.a, nb.a) == 0) { return 0; }
+        if (_av_addr_same(na.b, nb.b) == 0) { return 0; }
+        return _av_addr_same(na.c, nb.c);
+    }
+    return 0;
+}
+
+// Return 1 if `op_p` is a packed one-character operator that
+// pattern P1 considers SIMD-friendly. Mirrors the eight ops
+// the existing `vec_*` family supports: +/-/*//. Bitwise &|^
+// are also acceptable on integer arrays (SSE2 PAND/POR/PXOR,
+// NEON VAND/VORR/VEOR) but the current `vec_*` builtin set
+// targets floats only; integer-array autovec is deferred.
+static _av_op_is_simd_friendly(op_p) {
+    auto op_l, op_ch;
+    op_l = unpack_l(op_p);
+    if (op_l != 1) { return 0; }
+    op_ch = peek(vbuf + unpack_s(op_p));
+    if (op_ch == '+') { return 1; }
+    if (op_ch == '-') { return 1; }
+    if (op_ch == '*') { return 1; }
+    if (op_ch == '/') { return 1; }
+    return 0;
+}
+
+// Return 1 if `nd` is a loop-invariant operand for pattern P1:
+// a literal, OR a name not in the write-set, not equal to the
+// loop variable, and not a body-local. Captures (caller-frame
+// reads via outlining) also count as invariant — they don't
+// change during the loop.
+static _av_is_loop_invariant(nd, loop_var_p) {
+    auto n: Node, name_p, i, v;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype == T_LIT) { return 1; }
+    if (n.ntype != T_VAR) { return 0; }
+    name_p = n.a;
+    if (name_p == loop_var_p) { return 0; }
+    if (packed_eq(name_p, loop_var_p)) { return 0; }
+    if (_fdc_in_write_set(name_p)) { return 0; }
+    // Body locals are scratch — values may change between iters.
+    i = 0;
+    while (i < arr_len(_fdc_loop_locals)) {
+        v = arr_get(_fdc_loop_locals, i);
+        if (v == name_p) { return 0; }
+        if (packed_eq(v, name_p)) { return 0; }
+        i++;
+    }
+    return 1;
+}
+
+// Recognise pattern P1 on a single statement. Returns the
+// pattern ordinal (1) on match, 0 on miss. Caller invokes once
+// per body statement; the loop is P1-eligible only when EVERY
+// statement matches (and body_cnt > 0).
+static _av_match_p1_stmt(stmt, loop_var_p) {
+    auto st: Node, rhs: Node, ld: Node;
+    if (stmt == 0) { return 0; }
+    st = stmt;
+    if (st.ntype != T_MEMST) { return 0; }
+    rhs = st.b;
+    if (rhs == 0) { return 0; }
+    if (rhs.ntype != T_BINOP) { return 0; }
+    if (_av_op_is_simd_friendly(rhs.a) == 0) { return 0; }
+    ld = rhs.b;
+    if (ld == 0) { return 0; }
+    if (ld.ntype != T_MEMLD) { return 0; }
+    // Store address must structurally equal load address.
+    if (_av_addr_same(st.a, ld.a) == 0) { return 0; }
+    // Other operand must be loop-invariant.
+    if (_av_is_loop_invariant(rhs.c, loop_var_p) == 0) { return 0; }
+    return 1;
+}
+
+// Run the autovec matcher on a candidate body. Returns the
+// pattern ordinal (0 if not eligible) and is meant to be
+// stored into `_av_pattern[cand_idx]` by the caller.
+//
+// Today only the P1 single-statement shape qualifies. Multi-
+// statement bodies, reductions, and bodies with calls all
+// stay at pattern 0.
+static _av_classify_body(body_arr, body_cnt, loop_var_p) {
+    auto i, p;
+    if (body_cnt <= 0) { return 0; }
+    // Every statement must match P1.
+    i = 0;
+    while (i < body_cnt) {
+        p = _av_match_p1_stmt(body_arr[i], loop_var_p);
+        if (p == 0) { return 0; }
+        i++;
+    }
+    return 1;
 }
 
 // Reserved name for the capture-struct pointer parameter in
@@ -3156,6 +3327,14 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
         _cap_sidx = _outline_synth_capture_struct();
     }
     dispatch_cand_capture_idx = arr_push(dispatch_cand_capture_idx, _cap_sidx);
+    // Autovec P2 (2026-05-22) — classify the candidate's body
+    // against the pattern matcher and store the pattern ordinal
+    // in the parallel array. P5 (code emission) reads this
+    // ordinal to decide whether to emit a SIMD vector loop +
+    // scalar tail in place of the original body.
+    auto _av_p;
+    _av_p = _av_classify_body(body_arr, body_cnt, loop_var_p);
+    _av_pattern = arr_push(_av_pattern, _av_p);
 }
 
 // Scan every parsed function body and record every top-level for-loop
@@ -3190,6 +3369,8 @@ void find_dispatch_candidates() {
     if (_fdc_write_set == 0) { _fdc_write_set = arr_new(); }
     if (dispatch_cand_capture_idx == 0) { dispatch_cand_capture_idx = arr_new(); }
     else { arr_clear(dispatch_cand_capture_idx); }
+    if (_av_pattern == 0) { _av_pattern = arr_new(); }
+    else { arr_clear(_av_pattern); }
 
     for (i = 0; i < func_cnt; i++) {
         fn_rec = funcs[i];
