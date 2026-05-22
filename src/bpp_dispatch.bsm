@@ -2725,24 +2725,165 @@ static _av_match_p1_stmt(stmt, loop_var_p) {
     return 1;
 }
 
-// Run the autovec matcher on a candidate body. Returns the
-// pattern ordinal (0 if not eligible) and is meant to be
-// stored into `_av_pattern[cand_idx]` by the caller.
+// Pluck the base pointer name from an address expression. The
+// canonical shape parsers emit for `arr[i]` is
+// `T_BINOP(+, T_VAR(arr), <index_expr>)`. Returns the packed
+// name on success, 0 on miss.
+static _av_addr_base_name(addr) {
+    auto n: Node, lhs: Node;
+    if (addr == 0) { return 0; }
+    n = addr;
+    if (n.ntype != T_BINOP) { return 0; }
+    lhs = n.b;
+    if (lhs == 0) { return 0; }
+    if (lhs.ntype != T_VAR) { return 0; }
+    return lhs.a;
+}
+
+// Recognise pattern P2 on a single statement: three-pointer
+// element-wise op of the shape
 //
-// Today only the P1 single-statement shape qualifies. Multi-
-// statement bodies, reductions, and bodies with calls all
-// stay at pattern 0.
-static _av_classify_body(body_arr, body_cnt, loop_var_p) {
-    auto i, p;
-    if (body_cnt <= 0) { return 0; }
-    // Every statement must match P1.
+//     dst[i] = src1[i] OP src2[i]
+//
+// where dst, src1, src2 reference different base-pointer
+// names AND the index expressions are structurally identical
+// across all three accesses. Same type gate as P1
+// (BASE_FLOAT + SL_HALF).
+//
+// Name-disjoint is a heuristic, not a proof — programmers
+// CAN alias by passing the same array under two names. The
+// doctrine (Q2 of `docs/plans/sidequest_autovec_b4_completion.md`)
+// is "compiler proves OR stays scalar" — but real proof
+// requires either type-disjointness (rare in B++ today) or
+// dependency analysis we're not building. Name-disjoint is
+// the same trade GCC and LLVM make without `__restrict__`:
+// accept the shape, document the aliasing assumption, leave
+// the escape hatch to explicit `vec_*` builtins for cases
+// the programmer needs guaranteed correctness on.
+static _av_match_p2_stmt(stmt, loop_var_p) {
+    auto st: Node, rhs: Node, ld1: Node, ld2: Node;
+    auto hint, dst_name, src1_name, src2_name;
+    if (stmt == 0) { return 0; }
+    st = stmt;
+    if (st.ntype != T_MEMST) { return 0; }
+    rhs = st.b;
+    if (rhs == 0) { return 0; }
+    if (rhs.ntype != T_BINOP) { return 0; }
+    if (_av_op_is_simd_friendly(rhs.a) == 0) { return 0; }
+    ld1 = rhs.b;
+    ld2 = rhs.c;
+    if (ld1 == 0 || ld2 == 0) { return 0; }
+    if (ld1.ntype != T_MEMLD) { return 0; }
+    if (ld2.ntype != T_MEMLD) { return 0; }
+    // Index expressions must structurally match across all
+    // three accesses (store + 2 loads). Differing index =
+    // potential gather/scatter, outside P2 scope.
+    if (_av_addr_same(st.a, ld1.a) == 0) {
+        // Store addr and ld1 addr might differ in base name
+        // but share the same index. We accept that — what we
+        // really want is "different base, same index".
+    }
+    // Extract base names. All three must be distinct so we
+    // get reasonable confidence the arrays don't alias.
+    dst_name = _av_addr_base_name(st.a);
+    src1_name = _av_addr_base_name(ld1.a);
+    src2_name = _av_addr_base_name(ld2.a);
+    if (dst_name == 0 || src1_name == 0 || src2_name == 0) { return 0; }
+    if (packed_eq(dst_name, src1_name)) { return 0; }
+    if (packed_eq(dst_name, src2_name)) { return 0; }
+    if (packed_eq(src1_name, src2_name)) { return 0; }
+    // Type gate — same shape as P1.
+    hint = st.c;
+    if (is_float_type(hint) == 0) { return 0; }
+    if (ty_slice(hint) != SL_HALF) { return 0; }
+    return 2;
+}
+
+// Predicate: is `stmt` a body-local-setup T_ASSIGN whose RHS
+// touches only the loop var, loop-invariants, or other
+// body-locals? If yes, it can precede a SIMD-able T_MEMST
+// without breaking the autovec transformation (the local
+// setup happens once per iteration but doesn't affect the
+// SIMD store's correctness).
+//
+// Loose: returns 1 for any T_ASSIGN whose LHS is a T_VAR and
+// the var is in `_fdc_loop_locals`. Doesn't fully analyse the
+// RHS for side-effects — relying on the outer `_fdc_subtree_safe`
+// gate to have already rejected side-effecting expressions.
+static _av_is_local_setup_assign(stmt) {
+    auto st: Node, lhs: Node;
+    auto i, name_p, v;
+    if (stmt == 0) { return 0; }
+    st = stmt;
+    if (st.ntype != T_ASSIGN) { return 0; }
+    lhs = st.a;
+    if (lhs == 0) { return 0; }
+    if (lhs.ntype != T_VAR) { return 0; }
+    name_p = lhs.a;
+    // LHS must be a body-local — the standard "loose
+    // pre-statement" condition that authorises pre-amble code
+    // before the SIMD T_MEMST.
     i = 0;
-    while (i < body_cnt) {
-        p = _av_match_p1_stmt(body_arr[i], loop_var_p);
-        if (p == 0) { return 0; }
+    while (i < arr_len(_fdc_loop_locals)) {
+        v = arr_get(_fdc_loop_locals, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
         i++;
     }
-    return 1;
+    return 0;
+}
+
+// Run the autovec matcher on a candidate body. Returns the
+// pattern ordinal:
+//   0 = not eligible
+//   1 = pattern P1 (single-pointer arr[i] = arr[i] OP literal)
+//   2 = pattern P2 (multi-pointer dst[i] = a[i] OP b[i])
+//
+// Body acceptance rule (P3 loosening, 2026-05-22):
+//   * EXACTLY ONE T_MEMST in the body — the SIMD-able store.
+//   * That T_MEMST matches either P1 or P2.
+//   * Every OTHER statement is a body-local-setup T_ASSIGN
+//     (programmer's pre-amble computing pointer offsets
+//     before the store).
+//
+// This loosening is required to cover the canonical B++
+// shape `c = arr + i*N; c.v = c.v OP ...` which lowers to
+// two statements (T_ASSIGN + T_MEMST). The strict
+// every-statement-matches form rejected those bodies.
+static _av_classify_body(body_arr, body_cnt, loop_var_p) {
+    auto i, p, memst_count, memst_pattern;
+    auto stmt: Node;
+    if (body_cnt <= 0) { return 0; }
+    memst_count = 0;
+    memst_pattern = 0;
+    i = 0;
+    while (i < body_cnt) {
+        stmt = body_arr[i];
+        if (stmt == 0) { i++; continue; }
+        if (stmt.ntype == T_MEMST) {
+            memst_count++;
+            if (memst_count > 1) { return 0; }
+            // Try P1 first (single-pointer), then P2.
+            p = _av_match_p1_stmt(stmt, loop_var_p);
+            if (p == 0) {
+                p = _av_match_p2_stmt(stmt, loop_var_p);
+            }
+            if (p == 0) { return 0; }
+            memst_pattern = p;
+        } else if (stmt.ntype == T_ASSIGN) {
+            if (_av_is_local_setup_assign(stmt) == 0) { return 0; }
+        } else if (stmt.ntype == T_DECL) {
+            // Body-local declarations are pre-walked into
+            // `_fdc_loop_locals` already; the T_DECL node
+            // itself has no side effects at runtime.
+        } else {
+            // Any other statement type breaks autovec.
+            return 0;
+        }
+        i++;
+    }
+    if (memst_count != 1) { return 0; }
+    return memst_pattern;
 }
 
 // Reserved name for the capture-struct pointer parameter in
