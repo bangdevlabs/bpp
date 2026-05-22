@@ -2725,6 +2725,45 @@ static _av_match_p1_stmt(stmt, loop_var_p) {
     return 1;
 }
 
+// ── Autovec P6 Phase 1 — range-synth body builder ───────────
+//
+// Lazy-init packed name for the synth function's `_end` parameter.
+// Each outlined synth function takes `(loop_var, _end)` where
+// `loop_var` is the iteration index (initialised to `start`) and
+// `_end` is the upper bound. The chunk_worker calls
+// `call(fn, start, end)` and AAPCS64 places those in x0 / x1
+// matching the param order.
+static auto _av_end_param_name;
+static _av_get_end_param_name() {
+    if (_av_end_param_name == 0) {
+        _av_end_param_name = _dsp_pack_cstr("_end");
+    }
+    return _av_end_param_name;
+}
+
+// Wrap the original loop body in `while (loop_var < _end) {
+// body; loop_var = loop_var + 1; }`. Returns a single-statement
+// body_ptr (one T_WHILE) that the synth function can use.
+static _av_make_range_synth_body(loop_var_p, body_arr, body_cnt) {
+    auto wh: Node, cond: Node, step: Node;
+    auto stmts;
+    cond = _dsp_make_binop('<',
+        _dsp_make_var(loop_var_p),
+        _dsp_make_var(_av_get_end_param_name()));
+    step = _dsp_make_assign(_dsp_make_var(loop_var_p),
+        _dsp_make_binop('+', _dsp_make_var(loop_var_p),
+                        _outline_make_int_lit(1)));
+    wh = make_node(T_WHILE);
+    wh.a = cond;
+    wh.b = body_arr;
+    wh.c = body_cnt;
+    wh.d = 0;
+    wh.e = step;
+    stmts = malloc(8);
+    *stmts = wh;
+    return stmts;
+}
+
 // ── Autovec P5 — code emission helpers ──────────────────────
 //
 // Map a single-char arithmetic op to the corresponding `vec_*`
@@ -4499,35 +4538,68 @@ void synthesize_loop_fn() {
             body_ptr = _dsp_build_red_body(wh, loop_var_p, rv, op_ch, cid_p);
             body_cnt = _dsp_red_body_cnt;
         } else {
-            // MAP path — original behaviour. Reuse the loop body
-            // verbatim and bind the induction variable as the
-            // worker's single parameter.
+            // MAP path — two shapes:
+            //
+            //   (a) Outlining (capture_idx >= 0): range-synth shape.
+            //       Synth takes (loop_var, _end), wraps body in
+            //       `while (loop_var < _end) { body; loop_var++; }`.
+            //       Runtime `job_parallel_for_data` uses chunked
+            //       dispatch — one call per worker, not per iter.
+            //
+            //   (b) Standard MAP (capture_idx < 0): per-iter shape.
+            //       Synth takes (idx), body is the original. Runtime
+            //       `job_parallel_for` submits per-iter. UNCHANGED
+            //       from the pre-P6-Phase-1 behaviour to keep tests
+            //       (test_smart_dispatch, test_job, test_reduce*) green.
+            //
+            // P6 Phase 2 will fold standard MAP into chunked
+            // dispatch once we add a chunked variant of
+            // `job_parallel_for` (today it submits per-iter).
             param_p  = loop_var_p;
-            body_ptr = wh.b;
-            body_cnt = wh.c;
-            // Outlining: if the candidate captured caller-frame
-            // names, the synth body's references to those names
-            // must be rewritten to read from the global capture
-            // pointer `_outline_cap_ptr + field_offset`.
-            auto _cap_idx;
+            auto _cap_idx, _orig_body, _orig_cnt;
+            _orig_body = wh.b;
+            _orig_cnt  = wh.c;
             _cap_idx = arr_get(dispatch_cand_capture_idx, i);
             if (_cap_idx >= 0) {
                 _outline_restore_captures_from_struct(_cap_idx);
-                body_ptr = _outline_clone_body_with_captures(
+                _orig_body = _outline_clone_body_with_captures(
                     wh.b, wh.c, _cap_idx);
+                // Wrap in range-loop only for outlining case.
+                body_ptr = _av_make_range_synth_body(loop_var_p, _orig_body, _orig_cnt);
+                body_cnt = 1;
+            } else {
+                // Standard MAP — original body verbatim, per-iter.
+                body_ptr = _orig_body;
+                body_cnt = _orig_cnt;
             }
         }
 
         // Build the function record. Fields match parse_function's
         // registration path so downstream passes see a regular entry.
+        //
+        // Param count by path:
+        //   * Reduction: 1 param (cid_p).
+        //   * Outlining MAP: 2 params (loop_var, _end) — range-synth.
+        //   * Standard MAP: 1 param (loop_var) — per-iter synth.
         fname = _synth_make_name();
-        params_arr = malloc(8);
-        *(params_arr) = param_p;
+        auto _pcnt, _is_outline_map;
+        _is_outline_map = (rv == 0)
+            && (arr_get(dispatch_cand_capture_idx, i) >= 0);
+        if (_is_outline_map) {
+            params_arr = malloc(16);
+            *(params_arr) = param_p;
+            *(params_arr + 8) = _av_get_end_param_name();
+            _pcnt = 2;
+        } else {
+            params_arr = malloc(8);
+            *(params_arr) = param_p;
+            _pcnt = 1;
+        }
         record = malloc(RECORD_SZ);
         *(record + FN_TYPE) = 22;
         *(record + FN_NAME) = fname;
         *(record + FN_PARS) = params_arr;
-        *(record + FN_PCNT) = 1;
+        *(record + FN_PCNT) = _pcnt;
         *(record + FN_BODY) = body_ptr;
         *(record + FN_BCNT) = body_cnt;
         *(record + FN_HINTS) = 0;
