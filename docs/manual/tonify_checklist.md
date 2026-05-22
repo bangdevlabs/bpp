@@ -2978,3 +2978,119 @@ claim.
 - `src/bpp_dispatch.bsm` `_fdc_subtree_safe` line 2334 — the
   scanner gate that accepts both PHASE_BASE and PHASE_SAFE.
 - Commit `4a9d3e7` — the relax that landed the implicit form.
+
+## Rule 39: Explicit vs implicit SIMD (`vec_*` vs autovec)
+
+Same shape as Rule 38, applied to per-iteration SIMD instead
+of per-iteration parallelism. Two valid forms; the implicit
+form is the convenience when compiler can prove safety, the
+explicit form is the guarantee when programmer cares.
+
+```c
+// EXPLICIT — programmer writes vec_* builtins directly:
+auto i, dt_v;
+dt_v = vec_splat4(dt);
+for (i = 0; i + 4 <= n; i += 4) {
+    vec_store4(positions + i,
+        vec_add4(vec_load4(positions + i),
+                 vec_mul4(vec_load4(velocities + i), dt_v)));
+}
+for (; i < n; i++) {   // scalar tail
+    positions[i] = positions[i] + velocities[i] * dt;
+}
+
+// IMPLICIT — natural scalar loop, autovec recognises it:
+for (i = 0; i < n; i++) {
+    positions[i] = positions[i] + velocities[i] * dt;
+}
+```
+
+Both forms produce equivalent SIMD code on chips where the
+implicit form's pattern matcher accepts. Implicit fails over
+to scalar silently when the matcher rejects.
+
+### Decision table
+
+| Pattern | Use form |
+|---------|----------|
+| Performance-critical loop where SIMD is the WHOLE point | **Explicit** — `vec_*` guarantees emission |
+| Compiler cannot prove non-aliasing between pointers | **Explicit** — autovec stays scalar conservatively |
+| Loop body has SIMD-unfriendly ops (calls, branches per-iter) | **Explicit** — autovec rejects, scalar silently |
+| Single-pointer body (`arr[i] = arr[i] OP literal`) | **Implicit** OK — compiler proves trivially |
+| Multi-pointer body with type-disjoint declarations | **Implicit** OK — type discipline gives proof |
+| Game-update over a single struct-array (`world.units[i].field`) | **Implicit** OK — field-offset disjointness |
+
+### When implicit silently falls back to scalar
+
+Autovec rejects when any of the following hold:
+
+1. Two or more untyped pointers in the body and the compiler
+   cannot prove disjointness structurally.
+2. Body has function calls (no autovec into call boundaries).
+3. Cross-iteration dependence (`arr[i] = arr[i-1] + 1`).
+4. Address-taken (`&local`) escapes pointer.
+5. Loop bound is not statically large enough to amortise the
+   scalar-tail dispatch cost.
+
+When the matcher fails, the programmer's recourse is to:
+
+  - **Refactor** to single-pointer form if possible (often
+    natural with SoA / ECS layout).
+  - **Add type discipline** — declare arrays with distinct
+    type-hint annotations so compiler proves disjointness.
+  - **Write `vec_*` explicit** — same code, just verbose.
+
+### NO annotation override (Rule 4 reinforced)
+
+There is NO per-loop `@simd`, `@no_alias`, or `@vectorize`
+annotation. The 2026-05-11 phase-annotation collapse and
+Rule 4 together lock the doctrine: `@safe` + `@profile` +
+default, no per-loop hints. `@safe` does NOT extend to
+autovec because purity and non-aliasing are **orthogonal
+claims** — a pure function can have aliased pointer args:
+
+```c
+void copy_loop(@safe dst, src, n) {
+    for (i = 0; i < n; i++) dst[i] = src[i];  // dst+1 aliasing OK
+                                              // for purity, fatal for SIMD
+}
+```
+
+Overloading `@safe` with "and also non-aliasing" would
+silently miscompile honestly-pure functions called with
+overlapping pointers. Two distinct semantic claims need
+either two annotations (drift) or zero (this doctrine).
+The zero-annotation answer wins because the explicit
+`vec_*` escape hatch already exists.
+
+### Evidence gate for adding an annotation later
+
+If empirical measurement (after a real game ships a real
+SIMD-friendly hot loop) shows the compiler's structural
+proof misses > 30% of intended-vectorizable sites AND those
+sites can't be refactored to single-pointer or
+type-disjoint shapes, the discussion reopens. The annotation
+that would land then would be a **type qualifier** (mirror
+of C's `__restrict__`), NOT a per-loop hint — qualifier on
+the pointer's declared type, verified structurally:
+
+```c
+// HYPOTHETICAL — not implemented, not approved:
+void apply(restrict positions, restrict velocities, dt, n) { ... }
+```
+
+Until that evidence lands, the doctrine is: compiler proves
+or programmer writes explicit. Same shape as Rule 38; same
+shape as Rule 4.
+
+### Cross-references
+
+- Rule 4 — `@safe` + `@profile` + default doctrine.
+- Rule 28 — killer use case gate; annotations earn keep via
+  bug-class evidence.
+- Rule 38 — explicit vs implicit parallel dispatch (the
+  template this rule mirrors).
+- `docs/plans/sidequest_autovec_b4_completion.md` Q2 — the
+  full reasoning for why `@safe` doesn't extend to autovec.
+- Phase B4 initial ship — 2026-04-15 journal entry; the 11
+  `vec_*` builtins are the explicit-form vocabulary.
