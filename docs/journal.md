@@ -11239,3 +11239,147 @@ re-evaluation of args. Past that, the cost is the dispatch
 lane's lack of register-state continuity — the next step is a
 proper inliner that emits into the regular codegen path with
 shared state, not into the dispatch lane.
+
+## 2026-05-22 — Smart-dispatch outlining sidequest CLOSED
+
+Closed the smart-dispatch outlining sidequest end-to-end. The
+transformation that GCC OpenMP / LLVM / Cilk / Intel TBB / Unity
+Burst / Apple GCD all ship — *procedure outlining for parallel-
+for*, dating back to Allen + Cocke (1972) — now lives in
+`bpp_dispatch.bsm`. The smart-dispatch scanner accepts loops
+whose body references caller-frame names (function parameters,
+outer locals); the compiler synthesises a capture struct, emits
+publishing code on the caller side, rewrites the loop into a
+call to a new runtime variant `job_parallel_for_data`, and
+inserts the worker function with its body rewritten to read
+captures from a global sidechannel.
+
+The visible game-dev result: this loop now auto-parallelises
+without the programmer extracting an explicit worker function:
+
+```bpp
+void update_all(world, dt) {
+    auto i;
+    for (i = 0; i < world.count; i++) {
+        update_unit(i, world, dt);   // world, dt = caller-frame
+    }
+}
+```
+
+Pre-outlining the scanner rejected this at gate 6 (caller-frame
+refs unsafe in workers). Post-outlining the scanner ACCEPTS,
+captures `world` + `dt` into a `_capture_K` struct, dispatches
+through `job_parallel_for_data`, workers read the struct via the
+`_outline_cap_ptr` global. Same semantic as hand-written
+`job_parallel_for(N, fn_ptr(worker))` — programmer writes
+natural code, gets the same parallel dispatch.
+
+### Six-phase arc (~700 LOC, 3-4 sessions)
+
+| Phase | Commit | What landed |
+|---|---|---|
+| P0 | `7da49fc` | Design doc — `docs/plans/sidequest_smart_dispatch_outlining.md`. Industry research surveyed GCC OpenMP, LLVM, Cilk, TBB, Burst, GCD. Eight design questions resolved (Q1-Q8). |
+| P1 | `30ea81b` | Free-variable analysis — `_fdc_collect_captures` walks loop body, identifies T_VAR refs not in (loop_var, body_local, global). Pure data collection, no consumer yet. |
+| P2 | `f5071e7` | Capture struct synthesis — `_outline_synth_capture_struct` calls `add_struct_def` + `add_struct_field` from dispatch time. Confirmed the parser's struct API works post-parse (the `sd_*` arrays are plain B++ data structures). |
+| P3 | `f606e52` | AST rewriter — `_outline_clone_body_with_captures` reuses S4 P3a's `ast_clone_subst` with a different substitution map (`captured_name → T_MEMLD(_outline_cap_ptr + offset)`). `get_field_offset` declassified from `static` to public. |
+| P4 | `a63275f` | Stage 3 rewriter — `_outline_rewrite_with_captures` mutates the T_WHILE into a T_BLOCK that declares `var _cap_local_K`, publishes each field via T_MEMST, then calls `job_parallel_for_data`. |
+| P5 | `282e316` + `3ff7642` | Runtime variant — `job_parallel_for_data(N, fn, data)` in `bpp_job.bsm`, plus the `_outline_cap_ptr` global that workers read. Sidechannel design chosen over extending `job_submit` to take two payload args. Polish commit fixed Rule 3 (void + bare `return;`). |
+| P6 | `ab8e0aa` | Gate-6 relax + wire-up — write-set pre-walk, captures filter against write-set, `_fdc_name_is_safe` accepts capture-list members, reduction-with-captures rejected (out-of-scope), runtime-availability check defends against missing `bpp_job.bsm`. ALSO: `ast_clone_subst` extended to recurse into T_IF/T_WHILE/T_BLOCK bodies — a bug caught mid-P6 by `test_mixer_sample` C-emit failing on nested-if capture refs. |
+
+### Industry-precedent grounding
+
+The transformation has a name and a literature. Five reference
+implementations surveyed in the design doc:
+
+  * GCC OpenMP (`gcc/omp-low.c`, ~6k LOC) — `.omp_data_t` struct
+    + outlined `.omp_fn` + `GOMP_parallel(.omp_fn, &data, ...)`.
+  * LLVM OpenMP — `OpenMPOpt.cpp` outliner pass.
+  * Cilk Plus — spawn frames as captured-data structs
+    (Frigo et al, PLDI 1995 + SPAA 2009).
+  * Apple GCD blocks — clang `CGBlocks.cpp` generates block
+    descriptors.
+  * Intel TBB — C++ lambda capture is the closure object the
+    compiler synthesises automatically; `parallel_for` consumes
+    the functor.
+
+B++ adapts the same pattern to its single-pass AST architecture:
+struct synthesis happens during dispatch analysis (post-parse,
+pre-codegen), not at a mid-IR stage. The mechanism is identical;
+the timing is different. Allen + Cocke (1972) and the Dragon
+Book chapter 11 provide the foundational vocabulary
+("procedure extraction", "free variable identification").
+
+### The two bugs found and fixed mid-arc
+
+Two failure modes surfaced before P6 closed clean, each worth
+recording because they're traps any future outlining work might
+hit:
+
+**1. Reduction path bypasses captures.** A loop with `head++`
+inside the body looks like `head = head + 1`, which the
+reduction scanner (`_fdc_find_reduction`) recognises as
+`acc = acc OP val` with `acc = head` and `OP = +`. The
+reduction trial then re-admits `head` to the loop-locals set
+and re-runs the safety walk — at which point `head` is no
+longer unsafe. Captures were still populated from the pre-walk
+(buf, etc.), and the candidate got accepted with both a
+reduce_var and a captures list. The reduction synthesiser
+(`_dsp_build_red_body`) doesn't know about captures, so it
+emitted a synth body referencing caller-frame names with no
+backing. Fix: reject candidates that combine reduction with
+captures (commit `ab8e0aa`). Reduction-with-captures is a real
+future-work item but out of scope for this sidequest.
+
+**2. `ast_clone_subst` missed T_IF / T_WHILE / T_BLOCK.** The
+function was originally written for S4 P3a where the inliner's
+classify gate rejects bodies with control-flow nodes. Outlining
+loops can have top-level `if` and nested control flow, and the
+cloner SILENTLY shared the body arrays of T_IF/T_WHILE/T_BLOCK
+nodes with the original — leaving captured T_VAR refs
+un-substituted in those nested bodies. Symptom: C-emit
+`test_mixer_sample` failed with `key_id` undeclared in
+`__synth_4`, because the synth body had an `if
+(_mx_voice_key[i] == key_id)` from a nested T_IF whose body
+hadn't been cloned. Fix: extend `ast_clone_subst` to allocate
+fresh body arrays for T_IF/T_WHILE/T_BLOCK and clone each
+statement (`ab8e0aa`). S4 inliner benefits transitively if any
+future S4 work relaxes its no-control-flow gate.
+
+### Validation
+
+  * Bootstrap byte-stable across every phase commit. Each
+    commit's gen1 == gen2 == gen3.
+  * Native suite 178/0/12 + C-emit suite 141/0/49 — both clean
+    throughout. P6's intermediate state failed two C-emit
+    tests; the `ast_clone_subst` extension fixed both.
+  * Capability is dormant infrastructure for current programs:
+    no game in `games/` or example in `examples/` currently
+    writes a parent-frame-reference loop in the shape the
+    scanner accepts. The outlining transformation produces
+    output that emit byte-stably reproduces (bootstrap proof),
+    so when game code DOES start adopting natural-for-loop
+    patterns over `@safe` workers, the pipeline activates
+    automatically.
+
+### Sequencing the next arc
+
+The compose-multiplicatively roadmap recorded in `e60851c`:
+outlining ships (this arc), autovec / Phase B4 completion is
+next. Outlining gives N-cores parallelism; autovec gives
+M-lanes SIMD per iteration. Together they approach the perf
+ceiling Burst / Unity DOTS deliver in production game engines.
+
+Theoretical composition target for hot loops:
+
+```
+Baseline scalar single-thread       1x
++ S4 inline (shipped 2026-05-21)   ~1.1x
++ Outlining (shipped 2026-05-22)   ~8x (cores)
++ Autovec / Phase B4 (next arc)    ~4x (SIMD lanes)
+                                  ─────────
+Total combined                     ~35x potential
+```
+
+Autovec is a chip-level arc (a64 NEON works, x64 SSE/AVX
+incomplete). Likely 2-3x outlining's LOC, multi-session. Opens
+as a new sidequest doc when it starts.
