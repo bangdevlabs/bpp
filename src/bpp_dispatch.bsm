@@ -3507,6 +3507,158 @@ static _dsp_build_red_body(wh_p, loop_var_p, acc_p, op_ch, cid_p) {
     return stmts;
 }
 
+// ── Capture-local name minting ────────────────────────────
+// Each Stage 3 rewrite that needs captures introduces a fresh
+// stack-allocated variable `_cap_local_K` typed as the matching
+// `_capture_K` struct. Counter mirrors `_synth_counter` shape.
+
+static auto _outline_cap_local_counter;
+
+static _outline_make_cap_local_name() {
+    auto start, n, tmp, digits, i;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'c'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'a'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'p'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'l'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'o'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'c'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'a'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'l'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    n = _outline_cap_local_counter;
+    if (n == 0) {
+        poke(vbuf + vbuf_pos, '0'); vbuf_pos++;
+    } else {
+        tmp = n;
+        digits = 0;
+        while (tmp > 0) { digits++; tmp /= 10; }
+        vbuf_pos += digits;
+        tmp = n;
+        for (i = 0; i < digits; i++) {
+            poke(vbuf + vbuf_pos - 1 - i, '0' + tmp % 10);
+            tmp /= 10;
+        }
+    }
+    _outline_cap_local_counter++;
+    return pack(start, vbuf_pos - start);
+}
+
+// Mutate a T_WHILE node into a T_BLOCK that publishes the captures
+// and then calls the outlined worker via `job_parallel_for_data`.
+//
+// The generated block has the shape:
+//
+//   {
+//       var _cap_local_K: _capture_K;
+//       *(_cap_local_K + off_0) = captured_value_0;
+//       *(_cap_local_K + off_1) = captured_value_1;
+//       ...
+//       job_parallel_for_data(N, fn_ptr(synth), &_cap_local_K);
+//   }
+//
+// The struct is stack-allocated (var keyword) so it lives until the
+// enclosing block returns — and `job_parallel_for_data` blocks until
+// `job_wait_all` returns, so workers always see a live struct.
+//
+// Each field assignment uses T_MEMST through `_cap_local_K + offset`
+// (raw pointer + integer offset) — mirrors the parser's
+// dot-assignment lowering and avoids any per-field hint translation.
+//
+// Returns 1 on success (wh mutated into T_BLOCK), 0 if the runtime
+// helper `job_parallel_for_data` is not available (caller falls back
+// to the original `job_parallel_for` rewrite without captures).
+static _outline_rewrite_with_captures(wh, sidx, synth_name, bound_n, src_fi, jpf_data_idx, jpf_data_name, fnptr_name) {
+    auto wh_node: Node;
+    auto cap_local_name, captures_cnt, i, off;
+    auto cap_name, val_var: Node, cap_var: Node;
+    auto plus_op, addr_expr: Node, memst_node: Node;
+    auto decl: Node, name_arr;
+    auto stmts, stmt_count;
+    auto synth_var: Node, inner_args, addr_of_cap: Node;
+    auto fnptr_call: Node, outer_args, call_node: Node;
+    auto callees;
+    wh_node = wh;
+    if (jpf_data_idx < 0) { return 0; }
+    captures_cnt = arr_len(_fdc_captures);
+    if (captures_cnt == 0) { return 0; }
+    cap_local_name = _outline_make_cap_local_name();
+    set_var_type(cap_local_name, sidx);
+    // Build T_DECL for the stack struct.
+    name_arr = malloc(8);
+    *name_arr = cap_local_name;
+    decl = make_node(T_DECL);
+    decl.a = name_arr;
+    decl.b = 1;
+    decl.c = 0x08;       // TY_STRUCT
+    decl.d = 1;          // var = stack-allocated
+    // Allocate statement array: 1 decl + N field-publishes + 1 call.
+    stmts = malloc((captures_cnt + 2) * 8);
+    *stmts = decl;
+    stmt_count = 1;
+    // Emit `*(_cap_local + off) = value` per captured name.
+    i = 0;
+    while (i < captures_cnt) {
+        cap_name = arr_get(_fdc_captures, i);
+        off = get_field_offset(sidx, cap_name);
+        if (off >= 0) {
+            val_var = make_node(T_VAR);
+            val_var.a = cap_name;
+            cap_var = make_node(T_VAR);
+            cap_var.a = cap_local_name;
+            plus_op = _outline_make_op_char('+');
+            addr_expr = make_node(T_BINOP);
+            addr_expr.a = plus_op;
+            addr_expr.b = cap_var;
+            addr_expr.c = _outline_make_int_lit(off);
+            memst_node = _dsp_make_memst(addr_expr, val_var);
+            *(stmts + stmt_count * 8) = memst_node;
+            stmt_count++;
+        }
+        i++;
+    }
+    // Build `job_parallel_for_data(N, fn_ptr(synth), &_cap_local)`.
+    synth_var = make_node(T_VAR);
+    synth_var.a = synth_name;
+    inner_args = malloc(8);
+    *inner_args = synth_var;
+    fnptr_call = make_node(T_CALL);
+    fnptr_call.a = fnptr_name;
+    fnptr_call.b = inner_args;
+    fnptr_call.c = 1;
+    cap_var = make_node(T_VAR);
+    cap_var.a = cap_local_name;
+    addr_of_cap = make_node(T_ADDR);
+    addr_of_cap.a = cap_var;
+    outer_args = malloc(24);
+    *outer_args = bound_n;
+    *(outer_args + 8) = fnptr_call;
+    *(outer_args + 16) = addr_of_cap;
+    call_node = make_node(T_CALL);
+    call_node.a = jpf_data_name;
+    call_node.b = outer_args;
+    call_node.c = 3;
+    *(stmts + stmt_count * 8) = call_node;
+    stmt_count++;
+    // Mutate wh into T_BLOCK that wraps the publish + dispatch.
+    wh_node.ntype = T_BLOCK;
+    wh_node.a = 0;
+    wh_node.b = stmts;
+    wh_node.c = stmt_count;
+    wh_node.d = 0;
+    wh_node.e = 0;
+    wh_node.dispatch = 0;
+    // Record the new call-graph edge so mark_reachable picks the
+    // runtime helper up.
+    callees = arr_get(fn_calls, src_fi);
+    if (callees == 0) { callees = arr_new(); arr_set(fn_calls, src_fi, callees); }
+    callees = arr_push(callees, jpf_data_idx);
+    arr_set(fn_calls, src_fi, callees);
+    return 1;
+}
+
 // Build a packed synthetic function name of the form `__synth_N`,
 // with N being a monotonic counter. The double-underscore prefix
 // keeps the name out of any user program's namespace, so an
@@ -3893,32 +4045,47 @@ void rewrite_dispatch_loops() {
             runtime_idx = jpr_idx;
         } else {
             // ── MAP rewrite ──────────────────────────────────────
-            // Build fn_ptr(synth_name). Inner T_CALL with one T_VAR arg.
-            synth_var = make_node(T_VAR);
-            synth_var.a = synth_name;
-            inner_args_arr = malloc(8);
-            *(inner_args_arr) = synth_var;
-            fnptr_call = make_node(T_CALL);
-            fnptr_call.a = fnptr_name;
-            fnptr_call.b = inner_args_arr;
-            fnptr_call.c = 1;
-
-            // Build the outer args array: [bound, fn_ptr_call].
-            args_arr = malloc(16);
-            *(args_arr) = bound_n;
-            *(args_arr + 8) = fnptr_call;
-
-            // Mutate the T_WHILE node in place into a T_CALL to
-            // job_parallel_for.
-            wh.ntype = T_CALL;
-            wh.a = jpf_name;
-            wh.b = args_arr;
-            wh.c = 2;
-            wh.d = 0;
-            wh.e = 0;
-            wh.dispatch = 0;
-
-            runtime_idx = jpf_idx;
+            // When the candidate has captures (P6 wires this; today
+            // capture_idx is always -1 for accepted candidates),
+            // route through the outlining variant that publishes the
+            // captures before dispatching. Falls back to the plain
+            // `job_parallel_for` rewrite if outlining isn't possible
+            // (runtime helper absent, no captures, etc.).
+            auto _cap_idx, _did_outline, _jpf_data_idx, _jpf_data_name;
+            _cap_idx = arr_get(dispatch_cand_capture_idx, i);
+            _did_outline = 0;
+            if (_cap_idx >= 0) {
+                _jpf_data_name = _dsp_pack_name("job_parallel_for_data", 21);
+                _jpf_data_idx = _dsp_find_func_idx(_jpf_data_name);
+                _did_outline = _outline_rewrite_with_captures(
+                    wh, _cap_idx, synth_name, bound_n, src_fi,
+                    _jpf_data_idx, _jpf_data_name, fnptr_name);
+                if (_did_outline) {
+                    runtime_idx = _jpf_data_idx;
+                }
+            }
+            if (_did_outline == 0) {
+                // Standard MAP rewrite — no captures.
+                synth_var = make_node(T_VAR);
+                synth_var.a = synth_name;
+                inner_args_arr = malloc(8);
+                *(inner_args_arr) = synth_var;
+                fnptr_call = make_node(T_CALL);
+                fnptr_call.a = fnptr_name;
+                fnptr_call.b = inner_args_arr;
+                fnptr_call.c = 1;
+                args_arr = malloc(16);
+                *(args_arr) = bound_n;
+                *(args_arr + 8) = fnptr_call;
+                wh.ntype = T_CALL;
+                wh.a = jpf_name;
+                wh.b = args_arr;
+                wh.c = 2;
+                wh.d = 0;
+                wh.e = 0;
+                wh.dispatch = 0;
+                runtime_idx = jpf_idx;
+            }
         }
 
         // Record the new edge from the enclosing function to the
