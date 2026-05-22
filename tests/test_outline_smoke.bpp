@@ -1,0 +1,101 @@
+// skip-c: smart-dispatch outlining is a native-codegen transformation —
+//         the C emitter path emits scalar fallback and links against
+//         platform Cocoa/Metal symbols the C harness doesn't resolve.
+//         Native suite covers correctness end-to-end (synth body
+//         loads _outline_cap_ptr at runtime; commit ab8e0aa).
+// test_outline_smoke.bpp — Canonical smoke test for the smart-dispatch
+// outlining transformation (closed 2026-05-22, commits 7da49fc-ab8e0aa).
+//
+// Exercises the end-to-end pipeline: free-variable analysis → capture
+// struct synthesis → AST rewriter → Stage 3 publishing → runtime
+// dispatch via job_parallel_for_data. Without outlining, the loop
+// below would be rejected by gate 6 of _fdc_subtree_safe and stay
+// serial. With outlining, the compiler captures `factor` + `dst` from
+// the caller's frame into a struct, dispatches workers that read the
+// values back through `_outline_cap_ptr`.
+//
+// Validates BOTH directions: (1) outlining produces correct results
+// (output matches scalar reference), (2) it doesn't crash or skip
+// iterations.
+//
+// Returns 0 on success, nonzero error code on mismatch.
+
+// Loop bound MUST be a global / const literal — gate 5 of the
+// smart-dispatch scanner rejects loops whose bound is a function
+// parameter (outlining solves the body-reference problem at gate 6,
+// not the bound problem at gate 5). For tests, a global is the
+// simplest knob.
+global N_ELEMS;
+global _scratch;
+
+// Helper called per index. Reads from `dst` (a caller-frame
+// pointer) and writes through it. `factor` is a caller-frame
+// scalar. Both are captures the outlining transformation must
+// publish through the capture struct.
+//
+// @safe annotation eligible because:
+//   - No malloc / free / IO / GPU
+//   - Pure computation + indirect array write
+void _scale_one(i, dst, factor) @safe {
+    *(dst + i * 8) = *(dst + i * 8) * factor;
+}
+
+// Caller-frame loop — the one outlining is supposed to catch.
+// Body references `dst` and `factor`, both parameters of this
+// function (caller-frame names). Pre-outlining: gate 6 rejected,
+// runs serial. Post-outlining: gate 6 accepts via captures path.
+void scale_array(dst, factor) @safe {
+    auto i;
+    for (i = 0; i < N_ELEMS; i++) {     // bound = global, gate 5 OK
+        _scale_one(i, dst, factor);     // body refs dst, factor — captures!
+    }
+}
+
+main() {
+    auto buf, n, i, expected, got, factor;
+
+    N_ELEMS = 32;
+    n = N_ELEMS;
+    factor = 7;
+    buf = malloc(n * 8);
+
+    // Seed: buf[i] = i + 1.
+    for (i = 0; i < n; i++) {
+        *(buf + i * 8) = i + 1;
+    }
+
+    // Exercise the outlining path. If the transformation is
+    // broken, this either segfaults (capture pointer wrong) or
+    // produces zeros / garbage (captures not published).
+    scale_array(buf, factor);
+
+    // Verify: every slot should be (i + 1) * factor.
+    for (i = 0; i < n; i++) {
+        expected = (i + 1) * factor;
+        got = *(buf + i * 8);
+        if (got != expected) {
+            putstr_err("MISMATCH at i=");
+            // simple decimal print
+            if (i < 10) {
+                putchar_err('0' + i);
+            } else {
+                putchar_err('0' + i / 10);
+                putchar_err('0' + i % 10);
+            }
+            putstr_err(" expected=");
+            if (expected < 10) {
+                putchar_err('0' + expected);
+            } else {
+                putchar_err('0' + expected / 100);
+                putchar_err('0' + (expected / 10) % 10);
+                putchar_err('0' + expected % 10);
+            }
+            putchar_err(10);
+            free(buf);
+            return 1;
+        }
+    }
+
+    free(buf);
+    return 0;
+}

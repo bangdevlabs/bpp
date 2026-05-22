@@ -1,0 +1,144 @@
+// bench_outline.bpp — Runtime benchmark for smart-dispatch outlining.
+//
+// Compares THREE forms of the same workload to measure the runtime
+// side of the outlining tradeoff:
+//
+//   1. Serial scalar  — control. Just runs the loop on the main thread.
+//   2. Outlined       — natural for-loop with caller-frame refs.
+//                       Smart-dispatch should auto-dispatch to workers
+//                       via job_parallel_for_data + capture struct.
+//   3. Explicit       — same workload rewritten as job_parallel_for
+//                       + named worker function. Baseline for what
+//                       outlining SHOULD match (same runtime path).
+//
+// Workload: per-iteration xorshift64 chain (substantial enough that
+// 8-core dispatch overcomes overhead). N = 1M items.
+//
+// Compile and run:
+//   bpp examples/bench_outline.bpp -o bench_outline && ./bench_outline
+
+import "bpp_job.bsm";
+import "bpp_beat.bsm";
+import "bpp_io.bsm";
+
+const N = 1000000;
+const NUM_WORKERS = 8;
+const ITERS = 100;          // xorshift rounds per element — work per iter
+
+auto buf;                   // shared output array
+
+// Per-iteration work — substantial enough that dispatch overhead
+// is amortised. xorshift64 chain ITERS deep + write back to buf[i].
+static do_work(i, arr, seed) @safe {
+    auto s, k;
+    s = seed + i;                       // seed varies with index
+    if (s == 0) { s = 1; }              // xorshift avoids 0
+    for (k = 0; k < ITERS; k++) {
+        s = s ^ (s << 13);
+        s = s ^ (s >> 7);
+        s = s ^ (s << 17);
+    }
+    arr[i] = s;
+}
+
+// FORM 1 — serial. Plain loop on main thread. Control measurement.
+// We deliberately defeat outlining by using a descending loop
+// (stride != +1) which the scanner rejects at gate 1. Body
+// identical to run_outlined.
+static void run_serial(arr, seed) {
+    auto i;
+    for (i = N - 1; i >= 0; i--) {
+        do_work(i, arr, seed);
+    }
+}
+
+// FORM 2 — outlined. Natural for-loop with caller-frame refs
+// (`arr` and `seed` are parameters). Outlining MUST catch this
+// at gate 6 and dispatch via job_parallel_for_data.
+static void run_outlined(arr, seed) @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        do_work(i, arr, seed);
+    }
+}
+
+// FORM 3 — explicit. Same workload as a named worker chunked by
+// worker_id. Baseline for what outlining SHOULD match.
+auto _glob_arr;
+auto _glob_seed;
+static void worker_explicit(worker_id) @safe {
+    auto chunk, start, end, i;
+    chunk = N / NUM_WORKERS;
+    start = worker_id * chunk;
+    if (worker_id == NUM_WORKERS - 1) { end = N; }
+    else { end = start + chunk; }
+    for (i = start; i < end; i++) {
+        do_work(i, _glob_arr, _glob_seed);
+    }
+}
+
+static void print_timing(label, us) {
+    auto ms, frac;
+    ms = us / 1000;
+    frac = us % 1000;
+    put(label);
+    putchar(' ');
+    put(ms);
+    putchar('.');
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    put(frac);
+    putmsg(" ms");
+}
+
+main() {
+    auto t0, elapsed_serial, elapsed_outlined, elapsed_explicit;
+    auto seed;
+
+    putmsg("--- BENCH OUTLINING ---");
+    putmsg("Workload: N=1M elements x ITERS=100 xorshift rounds each.");
+    putmsg("");
+
+    seed = 42;
+    buf = buf_word(N);
+    job_init(NUM_WORKERS);
+
+    // FORM 1: serial baseline
+    t0 = beat_now_us();
+    run_serial(buf, seed);
+    elapsed_serial = beat_now_us() - t0;
+    print_timing("SERIAL:  ", elapsed_serial);
+
+    // FORM 2: implicit (should be outlined)
+    t0 = beat_now_us();
+    run_outlined(buf, seed);
+    elapsed_outlined = beat_now_us() - t0;
+    print_timing("OUTLINED:", elapsed_outlined);
+
+    // FORM 3: explicit
+    _glob_arr = buf;
+    _glob_seed = seed;
+    t0 = beat_now_us();
+    job_parallel_for(NUM_WORKERS, fn_ptr(worker_explicit));
+    elapsed_explicit = beat_now_us() - t0;
+    print_timing("EXPLICIT:", elapsed_explicit);
+
+    putmsg("");
+    putmsg("--- RATIOS ---");
+    // Outlined speedup over serial
+    if (elapsed_outlined > 0) {
+        put("OUTLINED speedup vs SERIAL: ");
+        put(elapsed_serial / elapsed_outlined);
+        putmsg("x");
+    }
+    // Outlined parity with explicit
+    if (elapsed_outlined > 0) {
+        put("OUTLINED / EXPLICIT ratio:  ");
+        put((elapsed_outlined * 100) / elapsed_explicit);
+        putmsg("% (100% = parity)");
+    }
+
+    free(buf);
+    job_shutdown();
+    return 0;
+}
