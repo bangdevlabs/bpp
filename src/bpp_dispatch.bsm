@@ -2268,6 +2268,19 @@ static auto _fdc_loop_locals;
 // declared type readily available via the parser's vt_block.
 static auto _fdc_captures;
 
+// Monotonic counter for capture struct types. Each outlining call
+// site gets its own `_capture_K` struct. Reset would happen between
+// program-level compile units, but since smart-dispatch runs once
+// per `bpp` invocation the counter just grows monotonically.
+static auto _outline_capture_counter;
+
+// Parallel array slot per dispatch candidate: the synthesised capture
+// struct's index in `sd_*`, or -1 when no captures are needed (current
+// state: always -1 because the scanner rejects loops with free vars
+// at gate 6; P6 flips that). Indexed in lockstep with the other
+// `dispatch_cand_*` arrays. Initialised in `find_dispatch_candidates`.
+static auto dispatch_cand_capture_idx;
+
 // Return the one-character operator stored inside a packed identifier,
 // or 0 if the packed value is not exactly a one-character name. Used
 // to recognize `+` and `<` without relying on pointer-identity compare,
@@ -2365,6 +2378,73 @@ static _fdc_collect_captures(nd, loop_var_p) {
     else { }
     }
     return 0;
+}
+
+// Build a packed name of the form `_capture_K` (mirror of the synth
+// function's `_synth_make_name`) by writing to vbuf and packing.
+// Used by `_outline_synth_capture_struct` to give each outlining call
+// site a unique struct type.
+static _outline_make_capture_name() {
+    auto start, n, tmp, digits, i;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'c'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'a'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'p'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 't'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'u'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'r'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, 'e'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '_'); vbuf_pos++;
+    n = _outline_capture_counter;
+    if (n == 0) {
+        poke(vbuf + vbuf_pos, '0'); vbuf_pos++;
+    } else {
+        tmp = n;
+        digits = 0;
+        while (tmp > 0) { digits++; tmp /= 10; }
+        vbuf_pos += digits;
+        tmp = n;
+        for (i = 0; i < digits; i++) {
+            poke(vbuf + vbuf_pos - 1 - i, '0' + tmp % 10);
+            tmp /= 10;
+        }
+    }
+    _outline_capture_counter++;
+    return pack(start, vbuf_pos - start);
+}
+
+// Synthesise a `_capture_K` struct type from the current
+// `_fdc_captures` list, one field per captured name. Returns the
+// struct index in `sd_*` for the caller to record in
+// `dispatch_cand_capture_idx`. Field hints default to TY_WORD —
+// proper mode inference (by-value scalar vs by-reference pointer)
+// is deferred to P3 when we have the variable's vt_block type
+// readily available via `get_var_type`. TY_WORD covers the common
+// case (pointers and ints are both word-sized).
+//
+// MUST be called only when `_fdc_captures` is non-empty AND the
+// candidate has otherwise passed the safety gates. Returns -1 when
+// the list is empty (no struct needed).
+//
+// Called by `_fdc_try_candidate` in P6 when the gate-6 relax accepts
+// caller-frame refs. Today (P2): defined but uncalled — pure
+// infrastructure waiting for P6 wire-up.
+static _outline_synth_capture_struct() {
+    auto cap_name, sidx, i, fname;
+    if (arr_len(_fdc_captures) == 0) { return 0 - 1; }
+    cap_name = _outline_make_capture_name();
+    sidx = add_struct_def(cap_name);
+    i = 0;
+    while (i < arr_len(_fdc_captures)) {
+        fname = arr_get(_fdc_captures, i);
+        // TY_WORD = 0x02 (see bpp_defs.bsm). Pointer / scalar both
+        // fit in a single 8-byte slot, so this is the safe default
+        // until P3's mode inference distinguishes them.
+        add_struct_field(sidx, fname, 0x02);
+        i++;
+    }
+    return sidx;
 }
 
 // Return 1 if the packed name refers to a safe target inside a
@@ -2738,6 +2818,9 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     dispatch_cand_stride = arr_push(dispatch_cand_stride, stride_val);
     dispatch_cand_reduce_var = arr_push(dispatch_cand_reduce_var, reduce_var);
     dispatch_cand_reduce_op  = arr_push(dispatch_cand_reduce_op,  reduce_op_ch);
+    // Outlining capture struct index — always -1 until P6 wires the
+    // gate-6 relax. Parallel array kept in lockstep with the others.
+    dispatch_cand_capture_idx = arr_push(dispatch_cand_capture_idx, 0 - 1);
 }
 
 // Scan every parsed function body and record every top-level for-loop
@@ -2769,6 +2852,8 @@ void find_dispatch_candidates() {
     else { arr_clear(dispatch_cand_reduce_op); }
     if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
     if (_fdc_captures == 0) { _fdc_captures = arr_new(); }
+    if (dispatch_cand_capture_idx == 0) { dispatch_cand_capture_idx = arr_new(); }
+    else { arr_clear(dispatch_cand_capture_idx); }
 
     for (i = 0; i < func_cnt; i++) {
         fn_rec = funcs[i];
