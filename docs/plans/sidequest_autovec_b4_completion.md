@@ -225,27 +225,58 @@ subtract / multiply. P3 handles "FMA-like" patterns.
 
 Recommend: P1 + P2 for v1; P3 if v1 lands cleanly.
 
-### Q2 — Aliasing assumption
+### Q2 — Aliasing assumption (the critical doctrine question)
 
 Two arrays `arr[i]` and `lhs[i]` might be aliased pointers
 to the same memory. Aggressive vectorizers prove they aren't
-(via dep analysis). B++ doctrine — per Tonify Rule 4
-(`@safe` + `@profile` + default only) and the 2026-05-11
-phase-annotation collapse — explicitly forbids reintroducing
-per-loop annotations like `@seq` or `@simd`. The doctrine is:
+(via dep analysis). For B++, the question is: what's the
+override mechanism when the proof fails?
 
-  * **Compiler proves safety, or doesn't vectorize.** Default
-    behaviour is conservative; autovec runs only when the
-    transformation is provably correct.
-  * **`@safe` is the programmer's "I promise" override** when
-    the compiler's proof is too conservative. Already exists,
-    already documented (Rule 4 + Rule 38 + W026 verification).
-    The same annotation that drives smart-dispatch outlining
-    eligibility (Rule 38) drives autovec eligibility — one
-    annotation, multiple consumers, no doctrine drift.
-  * **No new keyword surface.** If the compiler can't prove
-    a loop safe AND the programmer hasn't asserted `@safe`,
-    the loop stays scalar.
+**Initial proposal (rejected after review):** use `@safe` as
+the autovec override, mirroring the outlining sidequest's
+reuse pattern. REJECTED because `@safe` and "safe-to-
+vectorize" are ORTHOGONAL properties:
+
+  * `@safe` semantically claims **purity** — no malloc, no
+    I/O, no GPU, no global mutation. W026 verifies the
+    claim against the call graph.
+  * Vectorization safety requires **non-aliasing between
+    pointer arguments + no cross-iteration dependence**.
+
+These are independent. A function can be perfectly `@safe`
+(zero side effects) yet still be UNSAFE to vectorize:
+
+```bpp
+void copy_loop(@safe dst, src, n) {
+    auto i;
+    for (i = 0; i < n; i++) {
+        dst[i] = src[i];   // if dst = src + 1, vectorizing
+                           //   miscompiles silently
+    }
+}
+```
+
+The function is pure. W026 passes. Smart-dispatch outlining
+would correctly accept it as a worker. But autovec assuming
+non-aliasing from `@safe` would emit wrong code when the
+caller passes overlapping pointers. Treating `@safe` as a
+"trust the programmer about aliasing too" override
+**conflates two distinct claims** and is exactly the
+doctrine-drift the 2026-05-11 phase-annotation collapse was
+meant to prevent.
+
+**Resolved doctrine — no programmer override for autovec:**
+
+  * **Compiler proves non-aliasing, or stays scalar.** Default
+    is conservative. The proof is structural — type-based,
+    no flow analysis.
+  * **Escape hatch already exists: explicit `vec_*` builtins.**
+    Phase B4 shipped these on 2026-04-15. A programmer who
+    wants vectorization despite aliasing risk writes `vec_*`
+    calls directly. The "explicit form" already documented
+    in Rule 38 generalises here.
+  * **No new annotation.** Rule 4 remains intact — `@safe`
+    keeps its single meaning (purity), no overload, no drift.
 
 What the proof looks like in practice (Tier B v1):
 
@@ -253,13 +284,16 @@ What the proof looks like in practice (Tier B v1):
     var, `arr` is a stable pointer in the body (in write-set
     only as `*(arr + ...) = ...` indirect writes — never as
     direct LHS T_VAR(arr)).
-  * Disjoint destinations: when writing through `arr`, no
-    other pointer in the body reads from `arr[i + k]` for
-    any k > 0 (RAW dep that would break vectorization).
+  * Single destination per loop: at most one pointer is
+    written through, AND its base type is distinct from any
+    other pointer read in the same body (declared-type
+    disjointness). If two `: float*`-shaped pointers appear,
+    we can't prove disjointness and stay scalar.
   * No address-taken (`&local`): excludes pointer escape.
 
-If proof fails AND no `@safe`: stay scalar.
-If proof succeeds OR `@safe` present: vectorize.
+If proof fails: stay scalar. Programmer's option is to write
+explicit `vec_*` calls in the loop body — same machinery,
+no transformation needed at the call site.
 
 Same machinery shape as outlining's gate-6 relax. Reuses
 `_fdc_collect_writes` from the outlining sidequest.
@@ -402,13 +436,18 @@ implementation-heavy).
 
 ## Open questions to resolve at design phase kickoff
 
-- **No new annotations is LOCKED in this sidequest.** The
-  2026-05-11 phase-annotation collapse + Tonify Rule 4 +
-  the outlining sidequest closure all reinforce the same
-  doctrine: `@safe` + `@profile` + default, full stop.
-  Q2 above resolves aliasing risk via compiler proof +
-  existing `@safe` programmer-override path; no `@seq`,
-  no `@simd`, no per-loop hints.
+- **No new annotations + no `@safe` override for autovec is
+  LOCKED in this sidequest.** Q2 above documents the
+  reasoning: `@safe` semantically claims purity, NOT
+  non-aliasing — those are orthogonal properties.
+  Conflating them would silently miscompile pure functions
+  with aliased pointer args (e.g.
+  `copy_loop(@safe dst, src, n)` called with `src = dst+1`).
+  Doctrine: compiler proves non-aliasing structurally or
+  loop stays scalar; programmer's escape hatch is explicit
+  `vec_*` builtins (already exists from Phase B4 initial
+  ship). Same shape as outlining's "no annotation needed,
+  compiler proves write-set" decision.
 - Cost model: simple heuristic or full analysis? Recommend
   simple heuristic for v1; revisit after first bench
   iteration shows where it misses.
