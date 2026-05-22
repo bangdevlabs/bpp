@@ -2914,35 +2914,130 @@ is what smart-dispatch produces when its scanner accepts the
 loop; if the scanner rejects (shape mismatch, body too complex),
 the loop runs SERIAL silently — no diagnostic.
 
-### Decision table
+### Both forms run the SAME runtime (parity validated)
 
-| Pattern | Use form |
-|---------|----------|
-| Performance-critical loop where parallelism is the WHOLE point | **Explicit** — `job_parallel_for` guarantees dispatch |
-| Worker function used at multiple call sites | **Explicit** — one named worker, many calls |
-| Worker takes more than 1 parameter | **Explicit** — implicit synth generates single-param workers |
-| Loop shape unusual (descending, non-unit stride, while-true with break) | **Explicit** — scanner rejects, serial silently |
-| Body references function parameters or parent-frame locals | **Explicit** — scanner gate 6 rejects |
-| Simple `for (i = 0; i < N; i++)` with `N` literal/global | **Implicit** OK |
-| Body has just one or two helper calls + global writes by index | **Implicit** OK |
-| Helper is small, single-use, only meaningful at this site | **Implicit** OK |
+Critical point that resolves the "which is faster?" question
+before it's asked: explicit and implicit produce structurally
+equivalent code. Both submit jobs to the same worker pool,
+both wait via `job_wait_all`, both honour the worker-recursion
+guards. The implicit form is NOT a special optimisation — it's
+syntactic sugar over the explicit pattern.
+
+Empirical proof: `examples/bench_outline.bpp` measures
+SERIAL / OUTLINED / EXPLICIT on identical work (N=1M elements
+× ITERS=100 xorshift rounds each, 8 workers). The outlined
+form lands within 2% of the hand-chunked explicit form
+(50ms vs 49ms, both ~6x speedup vs serial). The 102% parity
+ratio means choosing between forms is an ergonomics decision,
+NOT a performance decision.
+
+Caveat: this requires the outlining runtime to chunk work
+across workers. Pre-2026-05-22 the implicit form submitted
+one job per iteration (N submits for N items) and the
+implicit form ran ~6x SLOWER than explicit despite using
+the same pool. The chunking fix in `bpp_job.bsm`
+(`_outline_chunk_worker`) closes that gap; this rule
+assumes the chunking is in place.
+
+### Practical decision table
+
+| Case | Form | Why |
+|------|------|-----|
+| Game ECS update — homogeneous work over a struct array | **Implicit** | natural loop reads like serial, parallel under the hood |
+| Pixel pipeline per-row / per-tile | **Implicit** | helper is small, single-use, no per-worker state |
+| Audio mixer / DSP per-sample | **Implicit** | same shape, captures publish through cap struct |
+| RNG benchmark (per-worker state: `rng_states[worker_id]`) | **Explicit** | implicit synth only sees iter index, not worker_id |
+| Multi-phase pipeline (phase1 → postprocess → phase2) | **Explicit** | each dispatch is its own named call site |
+| Loop body has `break` / `continue` / `return` | **Explicit** | gate 8 rejects, implicit falls back to serial |
+| Body has nested `for` / `while` | **Explicit** | gate 9 rejects |
+| Trip count is a function parameter | **Explicit** | gate 5 rejects |
+| Programmer wants the worker function visible for `bug` debugging / profiling | **Explicit** | synth name `__synth_K` is generated, harder to grep |
+| Uneven work distribution (some chunks heavier than others) | **Explicit** | implicit splits evenly via `_outline_chunk_worker` |
+
+### Explicit is OBLIGATORY when
+
+Five concrete scanner gates reject implicit dispatch — when
+any fires, the loop runs serial silently with no diagnostic:
+
+1. **Trip count is a function parameter or local** (gate 5).
+   ```c
+   void process(items, n) {            // n is parameter
+       for (i = 0; i < n; i++) { ... } // → rejected, serial
+   }
+   ```
+   Workaround: hoist `n` to a global, or use explicit.
+
+2. **Body needs per-worker state via `worker_id`**.
+   Implicit synth signature only takes the iteration index.
+   The classic case is `rng_states[worker_id]` from
+   `tablah.bpp` — each worker has its own RNG slot. Implicit
+   can't express this; explicit is required.
+
+3. **Body has nested `for` / `while` / `switch`** (gate 9).
+   ```c
+   for (i = 0; i < N; i++) {
+       for (j = 0; j < M; j++) { ... } // → rejected
+   }
+   ```
+
+4. **Body has `break` / `continue` / `return`** (gate 8).
+   ```c
+   for (i = 0; i < N; i++) {
+       if (skip(i)) { continue; }      // → rejected
+       work(i);
+   }
+   ```
+
+5. **Body's `T_CALL` targets a non-`@safe`, non-`PHASE_BASE`
+   callee** (gate 7). The implicit form's worker may run on
+   any thread; calling something IO/GPU/HEAP-tainted from a
+   worker is the bug class `@safe` was built to catch.
+
+### Implicit ergonomics — what you save in the natural case
+
+For the cases the scanner accepts, implicit is significantly
+shorter. Same workload, both forms:
+
+```c
+// IMPLICIT — 5 lines:
+void simulate(world, dt) @safe {
+    for (i = 0; i < N_UNITS; i++) {
+        update_unit(i, world, dt);
+    }
+}
+
+// EXPLICIT — 15+ lines:
+auto _g_world;
+auto _g_dt;
+static void _update_worker(worker_id) {
+    auto chunk, start, end, i;
+    chunk = N_UNITS / NUM_WORKERS;
+    start = worker_id * chunk;
+    end = (worker_id == NUM_WORKERS - 1) ? N_UNITS : start + chunk;
+    for (i = start; i < end; i++) {
+        update_unit(i, _g_world, _g_dt);
+    }
+}
+void simulate(world, dt) {
+    _g_world = world;
+    _g_dt = dt;
+    job_parallel_for(NUM_WORKERS, fn_ptr(_update_worker));
+}
+```
+
+Both produce identical machine code modulo synth naming.
+Pick implicit when the natural form reads cleanly; pick
+explicit when one of the gate-rejection cases above fires
+OR when the named worker helps code review / debugging.
 
 ### When implicit silently falls back to serial
 
-The scanner rejects when any of the following hold:
-
-1. Loop bound is a function parameter or local variable (gate 5).
-   `for (i = 0; i < n; i++)` where `n` is a parameter → REJECTED.
-   Workaround: hoist `n` to a global, or use the explicit form.
-2. Body references a parent-frame local or parameter (gate 6).
-   Worker context cannot reach the caller's stack frame safely.
-3. Body has nested `while` / `for` / `switch` (gate 9).
-4. Body has `break`, `continue`, or `return` (gate 8).
-5. Body's T_CALL targets a non-`@safe`, non-PHASE_BASE callee
-   (gate 7).
-
-When in doubt, write explicit. The explicit form is the
-guarantee; the implicit form is the convenience.
+Same as the "obligatory when" list above. The scanner does
+not emit a diagnostic when it rejects — the loop just runs
+serially. Programmer who EXPECTED parallelism only finds out
+via bench. This is why the decision table is structured
+around predicting the scanner's behaviour from the loop's
+shape; if you want a guarantee, write explicit.
 
 ### When to migrate explicit → implicit
 
@@ -2977,7 +3072,16 @@ claim.
 - Rule 4 — `@safe` annotation discipline.
 - `src/bpp_dispatch.bsm` `_fdc_subtree_safe` line 2334 — the
   scanner gate that accepts both PHASE_BASE and PHASE_SAFE.
+- `src/bpp_job.bsm` `_outline_chunk_worker` — the runtime
+  chunking that makes the implicit form match explicit
+  performance (commit `fd87f65`).
+- `examples/bench_outline.bpp` — empirical parity validator;
+  re-run anytime the dispatch path changes.
+- `tests/test_outline_smoke.bpp` — canonical end-to-end test.
 - Commit `4a9d3e7` — the relax that landed the implicit form.
+- Commit `ab8e0aa` — outlining sidequest P6 closure (captures
+  pipeline).
+- Commit `fd87f65` — chunking fix that achieved 102% parity.
 
 ## Rule 39: Explicit vs implicit SIMD (`vec_*` vs autovec)
 
