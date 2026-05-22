@@ -44,6 +44,24 @@ struct DiagFile {
     line_start   // cumulative line count BEFORE this file's content
 }
 extrn diag_files;
+
+// ── Load vs import — compile module mapping ──────────────────
+//
+// Each diag_files[i] entry is a SOURCE FILE (preserved for the
+// bug debugger's line-attribution). The COMPILE MODULE that a
+// source file belongs to may differ when `load` inlines content
+// into the parent's compile module instead of creating its own.
+//
+// Initial (default) state: each diag_files[i] maps 1:1 to
+// compile module i. Inline loads override an entry to point at
+// the parent's compile module — typically module 0 for game
+// internal helpers.
+//
+// Consumers that need COMPILE module (codegen, dispatch, emit
+// pipeline) use `compile_mod_of(diag_file_idx)`. Consumers that
+// need the source file (bug debugger, error diagnostics) read
+// diag_files[i] directly.
+extrn diag_file_compile_module;
 // Boundary list — records where each (sub)module's content
 // begins in outbuf + its module index + the cumulative line
 // count before it. Migrated from 3 parallel arrays (mod_bnd_
@@ -259,6 +277,16 @@ diag_mod_line_off(src_off) {
 
 diag_file_count() {
     return arr_struct_count(diag_files);
+}
+
+// Look up the COMPILE MODULE index for a given source-file
+// index. Initial state: identity (each source file is its own
+// compile module). After `load` inline (P2), source files that
+// were loaded share their parent's compile module index.
+compile_mod_of(diag_file_idx) {
+    if (diag_file_idx < 0) { return 0; }
+    if (diag_file_idx >= arr_len(diag_file_compile_module)) { return diag_file_idx; }
+    return arr_get(diag_file_compile_module, diag_file_idx);
 }
 
 diag_file_start(i) {
@@ -731,6 +759,10 @@ void process_file(path_off, path_len) {
     // Hash the file content for cache invalidation.
     mod_hashes = arr_push(mod_hashes, fnv1a(content_buf, fsize));
     my_mod_idx = arr_struct_count(diag_files) - 1;
+    // Initial mapping: each source file IS its own compile module.
+    // P2 of this sidequest will override this entry for inline-mode
+    // `load` to point at the parent's compile module.
+    diag_file_compile_module = arr_push(diag_file_compile_module, my_mod_idx);
     // Tracks how many SOURCE-FILE lines of THIS file have been
     // processed so far. Increments once per iteration of the line
     // loop below (whether the line is an import or a non-import
@@ -1333,6 +1365,7 @@ void init_import() {
     fname_buf = malloc(65536);
     fname_pos = 0;
     diag_files = arr_struct_new(sizeof(DiagFile), 32);
+    diag_file_compile_module = arr_new();
     mod_bnds = arr_struct_new(sizeof(ModBnd), 32);
     outbuf_lines = 0;
     mod0_real_start = -1;
