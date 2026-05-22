@@ -2725,6 +2725,24 @@ static _av_match_p1_stmt(stmt, loop_var_p) {
     return 1;
 }
 
+// ── Autovec P5 — code emission helpers ──────────────────────
+//
+// Map a single-char arithmetic op to the corresponding `vec_*`
+// builtin name. Used by the lowering rule that turns a scalar
+// `arr[i] OP arr[i]` into `vec_OP4(vec_load4(arr+i*4), ...)`.
+// Returns packed name or 0 if the op isn't SIMD-friendly.
+static _av_op_to_vec_name(op_p) {
+    auto op_l, op_ch;
+    op_l = unpack_l(op_p);
+    if (op_l != 1) { return 0; }
+    op_ch = peek(vbuf + unpack_s(op_p));
+    if (op_ch == '+') { return _dsp_pack_name("vec_add4", 8); }
+    if (op_ch == '-') { return _dsp_pack_name("vec_sub4", 8); }
+    if (op_ch == '*') { return _dsp_pack_name("vec_mul4", 8); }
+    if (op_ch == '/') { return _dsp_pack_name("vec_div4", 8); }
+    return 0;
+}
+
 // Pluck the base pointer name from an address expression. The
 // canonical shape parsers emit for `arr[i]` is
 // `T_BINOP(+, T_VAR(arr), <index_expr>)`. Returns the packed
@@ -2884,6 +2902,187 @@ static _av_classify_body(body_arr, body_cnt, loop_var_p) {
     }
     if (memst_count != 1) { return 0; }
     return memst_pattern;
+}
+
+// Build a generic T_CALL node for builtins.
+static _av_make_call(name_p, args_arr, argc) {
+    auto node: Node;
+    node = make_node(T_CALL);
+    node.a = name_p;
+    node.b = args_arr;
+    node.c = argc;
+    return node;
+}
+
+// Lower the matched T_MEMST into the SIMD-equivalent T_CALL
+// expression. Returns the new T_MEMST node whose RHS is the
+// vec_*4 chain. The store address is kept verbatim — what
+// the original wrote, the SIMD version writes too — but the
+// RHS now does vec_load4(ld_addr1) [vec_OP4 vec_load4(ld_addr2)
+// | vec_splat4(literal)] depending on pattern.
+//
+// Single-arg variant (vec_store4 inside another expression) is
+// also emitted at the parser-recognised builtin so codegen
+// already handles it.
+static _av_lower_stmt(orig_memst, pattern) {
+    auto orig: Node, rhs: Node, ld1: Node, ld2_or_rhs: Node;
+    auto vec_op_name, ld_args1, ld_args2, splat_args;
+    auto vec_load_name, vec_splat_name, vec_store_name;
+    auto load1: Node, load2_or_splat: Node, vec_op: Node;
+    auto vec_op_args;
+    auto store_call: Node, store_args;
+    orig = orig_memst;
+    rhs = orig.b;
+    ld1 = rhs.b;
+    ld2_or_rhs = rhs.c;
+    vec_op_name = _av_op_to_vec_name(rhs.a);
+    vec_load_name = _dsp_pack_name("vec_load4", 9);
+    vec_splat_name = _dsp_pack_name("vec_splat4", 10);
+    vec_store_name = _dsp_pack_name("vec_store4", 10);
+    // First operand of OP is always a load.
+    ld_args1 = malloc(8);
+    *ld_args1 = ld1.a;
+    load1 = _av_make_call(vec_load_name, ld_args1, 1);
+    // Second operand: load (P2) or splat (P1).
+    if (pattern == 2) {
+        ld_args2 = malloc(8);
+        *ld_args2 = ld2_or_rhs.a;
+        load2_or_splat = _av_make_call(vec_load_name, ld_args2, 1);
+    } else {
+        splat_args = malloc(8);
+        *splat_args = ld2_or_rhs;
+        load2_or_splat = _av_make_call(vec_splat_name, splat_args, 1);
+    }
+    // Combine via vec_OP4.
+    vec_op_args = malloc(16);
+    *vec_op_args = load1;
+    *(vec_op_args + 8) = load2_or_splat;
+    vec_op = _av_make_call(vec_op_name, vec_op_args, 2);
+    // Store result.
+    store_args = malloc(16);
+    *store_args = orig.a;
+    *(store_args + 8) = vec_op;
+    store_call = _av_make_call(vec_store_name, store_args, 2);
+    return store_call;
+}
+
+// Build the SIMD version of the loop body. Walks the original
+// body, copies pre-amble T_DECL / T_ASSIGN statements, and
+// replaces the single T_MEMST with the lowered vec_store4 call.
+static _av_build_simd_body(body_arr, body_cnt, pattern, simd_body_out, simd_cnt_out) {
+    auto i, out_i;
+    auto stmt: Node;
+    out_i = 0;
+    i = 0;
+    while (i < body_cnt) {
+        stmt = body_arr[i];
+        if (stmt != 0) {
+            if (stmt.ntype == T_MEMST) {
+                *(simd_body_out + out_i * 8) = _av_lower_stmt(stmt, pattern);
+            } else {
+                // T_DECL / T_ASSIGN pre-amble — keep verbatim.
+                // Cloning avoids sharing nodes between vector
+                // and scalar tail.
+                *(simd_body_out + out_i * 8) = ast_clone_subst(stmt, 0, 0, 0);
+            }
+            out_i++;
+        }
+        i++;
+    }
+    *simd_cnt_out = out_i;
+}
+
+// Build a fresh T_WHILE node that wraps `body_arr` as the
+// vector loop. cond is `i + 4 <= bound_n`, step is `i += 4`.
+static _av_build_vector_loop(loop_var_p, bound_n, body_arr, body_cnt) {
+    auto wh: Node, cond: Node, step: Node;
+    auto iv1: Node, iv2: Node, iv3: Node;
+    auto lit4: Node, plus_op, le_op;
+    iv1 = _dsp_make_var(loop_var_p);
+    lit4 = _dsp_make_int_lit(4);
+    plus_op = _outline_make_op_char('+');
+    iv2 = make_node(T_BINOP);
+    iv2.a = plus_op;
+    iv2.b = iv1;
+    iv2.c = lit4;
+    // cond: (i + 4) <= bound_n  — packed two-char "<=".
+    le_op = pack(vbuf_pos, 2);
+    poke(vbuf + vbuf_pos, '<'); vbuf_pos++;
+    poke(vbuf + vbuf_pos, '='); vbuf_pos++;
+    cond = make_node(T_BINOP);
+    cond.a = le_op;
+    cond.b = iv2;
+    cond.c = bound_n;
+    // step: i = i + 4
+    iv3 = _dsp_make_var(loop_var_p);
+    step = _dsp_make_assign(_dsp_make_var(loop_var_p),
+        _dsp_make_binop('+', iv3, _outline_make_int_lit(4)));
+    wh = make_node(T_WHILE);
+    wh.a = cond;
+    wh.b = body_arr;
+    wh.c = body_cnt;
+    wh.d = 0;
+    wh.e = step;
+    return wh;
+}
+
+// Build a fresh T_WHILE that re-runs the original body from
+// the index where the vector loop left off through `bound_n`.
+// Body is a clone of the original so the vector + tail don't
+// share AST nodes. cond is `i < bound_n`, step is `i += 1`
+// (matches original scalar shape exactly).
+static _av_build_scalar_tail(loop_var_p, bound_n, orig_body_arr, orig_body_cnt) {
+    auto wh: Node, cond: Node, step: Node;
+    auto iv1: Node, iv2: Node;
+    auto cloned, i;
+    // Clone body so the tail has its own nodes.
+    cloned = malloc(orig_body_cnt * 8);
+    i = 0;
+    while (i < orig_body_cnt) {
+        *(cloned + i * 8) = ast_clone_subst(orig_body_arr[i], 0, 0, 0);
+        i++;
+    }
+    iv1 = _dsp_make_var(loop_var_p);
+    cond = _dsp_make_binop('<', iv1, bound_n);
+    iv2 = _dsp_make_var(loop_var_p);
+    step = _dsp_make_assign(_dsp_make_var(loop_var_p),
+        _dsp_make_binop('+', iv2, _outline_make_int_lit(1)));
+    wh = make_node(T_WHILE);
+    wh.a = cond;
+    wh.b = cloned;
+    wh.c = orig_body_cnt;
+    wh.d = 0;
+    wh.e = step;
+    return wh;
+}
+
+// Mutate a T_WHILE into a T_BLOCK containing the vector loop
+// followed by a scalar tail. Same in-place pattern outlining
+// uses — the enclosing function's body still sees the same
+// node at the same position.
+static _av_rewrite_loop(wh, loop_var_p, bound_n, body_arr, body_cnt, pattern) {
+    auto wh_node: Node, vec_loop: Node, tail_loop: Node;
+    auto simd_body, simd_cnt_p, simd_cnt;
+    auto stmts;
+    wh_node = wh;
+    simd_body = malloc(body_cnt * 8);
+    simd_cnt_p = malloc(8);
+    *simd_cnt_p = 0;
+    _av_build_simd_body(body_arr, body_cnt, pattern, simd_body, simd_cnt_p);
+    simd_cnt = *simd_cnt_p;
+    vec_loop = _av_build_vector_loop(loop_var_p, bound_n, simd_body, simd_cnt);
+    tail_loop = _av_build_scalar_tail(loop_var_p, bound_n, body_arr, body_cnt);
+    stmts = malloc(16);
+    *stmts = vec_loop;
+    *(stmts + 8) = tail_loop;
+    wh_node.ntype = T_BLOCK;
+    wh_node.a = 0;
+    wh_node.b = stmts;
+    wh_node.c = 2;
+    wh_node.d = 0;
+    wh_node.e = 0;
+    wh_node.dispatch = 0;
+    return 1;
 }
 
 // Reserved name for the capture-struct pointer parameter in
@@ -4486,6 +4685,22 @@ void rewrite_dispatch_loops() {
         wh = arr_get(dispatch_candidates, i);
         src_fi = arr_get(dispatch_cand_fn_idx, i);
         bound_n = arr_get(dispatch_cand_bound, i);
+
+        // Autovec P5 (2026-05-22) — if the body matches an
+        // autovec pattern AND there's no caller-frame capture
+        // demanding outlining, lower the loop into a vector +
+        // scalar-tail pair. Reductions still go through the
+        // reduction path. Composition with outlining (P6) is
+        // deferred.
+        auto _av_p, _av_cap;
+        _av_p = arr_get(_av_pattern, i);
+        _av_cap = arr_get(dispatch_cand_capture_idx, i);
+        if (rv == 0 && _av_p > 0 && _av_cap < 0) {
+            auto _loop_var_av;
+            _loop_var_av = arr_get(dispatch_cand_loop_var, i);
+            _av_rewrite_loop(wh, _loop_var_av, bound_n, wh.b, wh.c, _av_p);
+            continue;
+        }
 
         if (rv != 0) {
             // ── REDUCTION rewrite ────────────────────────────────
