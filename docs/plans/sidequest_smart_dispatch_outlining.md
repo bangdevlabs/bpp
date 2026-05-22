@@ -330,6 +330,40 @@ playbook is established).
 
 ---
 
+## Next arc after this one — autovec / Phase B4 completion
+
+Sequence locked 2026-05-22: outlining ships first, then
+autovec is the next big-perf arc. The two compose
+multiplicatively — outlining gives N-cores parallelism,
+autovec gives M-lanes SIMD-per-iteration. Together they
+approach the perf ceiling that Burst / Unity DOTS deliver
+in C# (and that hand-tuned C++ with SSE/AVX intrinsics
+delivers in production engines).
+
+Rough estimate of the second arc:
+
+| Feature gap | Status today | Impact pos-arc 2 |
+|---|---|---|
+| `: double` slice → NEON | a64 working, x64 incomplete | both chips full SIMD |
+| Autovec pass (loop → SIMD inference) | None | implicit SIMD for safe loops |
+| Aligned memory hints | Partial via `malloc_aligned` | first-class type slice |
+| SoA-friendly iteration | Manual via `: u_word` array shapes | compiler-assisted |
+
+Likely 2-3x the outlining sidequest in LOC. Multi-session.
+Touches chip primitives, type system, codegen splice point.
+Separate sidequest doc when this arc closes.
+
+Composition target (theoretical hot-loop ceiling):
+
+```
+Baseline scalar single-thread       1x
++ S4 inline (shipped 2026-05-21)   ~1.1x
++ Outlining (THIS sidequest)        ~8x (cores)
++ Autovec / Phase B4 (next arc)     ~4x (SIMD lanes)
+                                  ─────────
+Total combined                     ~35x potential
+```
+
 ## Out of scope explicitly
 
 - **Write-through-capture** (Burst's `[WriteOnly]` /
