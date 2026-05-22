@@ -98,7 +98,7 @@ static auto _fn_callers;         // arr<arr<int>>: callers per callee
 // is the parallel list of target_fidx arrays.
 static auto _glob_origin_names;   // arr<packed>:    globals with recorded origins
 static auto _glob_origin_targets; // arr<arr<int>>:  parallel, target_fidx lists
-extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place (Phase B2)
+extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place
 extrn _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
 
@@ -4065,53 +4065,109 @@ static _inline_threshold(callee_idx, caller_idx, call_node) {
     return threshold;
 }
 
-// Walk the function table and tag every entry that meets the inline
-// criteria above. Must run after classify_all_functions so fn_phase
-// is final. Codegens read fn_inlineable when emitting T_CALL.
+// Body-node hard cap (Q4 of S4 sidequest doc). Independent from
+// the cost threshold (which is cost-with-bonuses, computed
+// per-callsite in `_inline_threshold`). This is the absolute
+// ceiling on raw `node_count(body)` — no call site, no caller
+// hotness, no const-arg bonus can push a body past it. LLVM
+// uses 50 for `OptSizeThreshold`; xorshift64 (the S4 anchor)
+// is ~31 nodes, leaving ~19 nodes of headroom.
+const INLINE_BODY_NODE_CAP = 50;
+
+// Walk the function table and tag every entry that meets the
+// inline criteria. Must run after classify_all_functions so
+// fn_phase is final. Codegens read fn_inlineable when emitting
+// T_CALL.
+//
+// S4 P3a unification — single classifier covers both the
+// Phase B2 single-T_RET trivial case AND the multi-statement
+// case targeted by S4. The two used to be conceptually
+// separate (v1 = expression body, v2 = multi-stmt) but
+// keeping parallel flags violates Tonify Rule 4 — one
+// concept, one flag. The codegen splice point carries a
+// `body_cnt == 1` guard until P3b lands the multi-stmt
+// emitter; the classifier marks multi-stmt candidates today
+// and the guard makes them transparently fall through to a
+// normal call. P3b removes the guard.
+//
+// Eligibility (all must hold):
+//   1. fn_phase in {PHASE_BASE, PHASE_AUTO}
+//        - BASE = pure. AUTO = lattice no-op (writes globals
+//          but doesn't transitively reach malloc/IO/GPU). Per
+//          Q4, opens "tame impurity" candidates like xorshift64.
+//   2. body_arr != 0, body_cnt >= 1
+//   3. Last statement is a T_RET (we need a value to use as
+//      the call's expression value at the splice point).
+//   4. param_cnt ≤ 3
+//   5. No floats (return or any param)
+//   6. node_count_body(body) ≤ INLINE_BODY_NODE_CAP (Q4 hard cap)
+//   7. No T_CALL anywhere in body (avoids transitive blow-up;
+//      Phase B2's existing restriction kept verbatim)
+//   8. For body_cnt == 1 only: each param referenced at most
+//      once (Phase B2's substitute-without-bind invariant; the
+//      multi-statement splice in P3b will alpha-rename args
+//      into temps and relax this).
 void classify_inlineable() {
-    auto i, fn_rec, body_arr, body_cnt, params, pcnt, ret_stmt: Node;
-    auto ret_expr, j, ok, refs;
-    // Grow the array to exactly func_cnt slots so arr_set below is safe.
-    // arr_set does not bounds-check or resize; the naked indexed writes
-    // below would smash adjacent heap allocations once i passes the
-    // initial capacity of 8. Pre-seeding with arr_push keeps length and
-    // capacity in sync.
+    auto i, fn_rec, body_arr, body_cnt, params, pcnt;
+    auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
+    auto phase, body_cost;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
     for (i = 0; i < func_cnt; i++) {
         arr_set(fn_inlineable, i, 0);
-        if (arr_get(fn_phase, i) != PHASE_BASE) { continue; }
+        phase = arr_get(fn_phase, i);
+        if (phase != PHASE_BASE && phase != PHASE_AUTO) { continue; }
         fn_rec = funcs[i];
         body_arr = *(fn_rec + FN_BODY);
         body_cnt = *(fn_rec + FN_BCNT);
         if (body_arr == 0) { continue; }
-        if (body_cnt != 1) { continue; }
-        ret_stmt = body_arr[0];
-        if (ret_stmt == 0) { continue; }
-        if (ret_stmt.ntype != T_RET) { continue; }
-        ret_expr = ret_stmt.a;
-        if (ret_expr == 0) { continue; }
+        if (body_cnt < 1) { continue; }
+        // Last statement must be T_RET so the splice has an
+        // expression value to use.
+        last_stmt = body_arr[body_cnt - 1];
+        if (last_stmt == 0) { continue; }
+        if (last_stmt.ntype != T_RET) { continue; }
         pcnt = *(fn_rec + FN_PCNT);
         if (pcnt > 3) { continue; }
-        if (_inline_count_nodes(ret_expr) > 5) { continue; }
-        if (_inline_has_tcall(ret_expr)) { continue; }
-        // Reject any function that reads or returns a float — inlining
-        // bypasses the regular call path's int/float coercion logic, so
-        // restrict Phase B2 to the pure-integer `: base` helpers that
-        // benefit the most (peek, arr_get, unpack_s, is_float_type, …).
+        // Float coercion bypass — inlining skips the call path's
+        // int/float convert logic, so restrict to pure-integer
+        // candidates (mirror Phase B2).
         if (is_float_type(get_fn_ret_type(i))) { continue; }
         ok = 1;
         for (j = 0; j < pcnt; j++) {
             if (is_float_type(get_fn_par_type(i, j))) { ok = 0; }
         }
         if (ok == 0) { continue; }
-        params = *(fn_rec + FN_PARS);
-        for (j = 0; j < pcnt; j++) {
-            refs = _inline_param_refs(ret_expr, *(params + j * 8));
-            if (refs > 1) { ok = 0; }
+        // Body node count (Q4 hard cap) — also rejects bodies
+        // containing T_IF/T_WHILE/T_SWITCH/nested T_BLOCK
+        // because `_inline_count_nodes` returns 99 for them
+        // (control-flow inlining is out of scope per Q1).
+        body_cost = _inline_count_nodes_body(body_arr, body_cnt);
+        if (body_cost > INLINE_BODY_NODE_CAP) { continue; }
+        // No T_CALL anywhere in body — walk every statement.
+        ok = 1;
+        for (j = 0; j < body_cnt; j++) {
+            if (_inline_has_tcall(body_arr[j])) { ok = 0; break; }
         }
         if (ok == 0) { continue; }
+        // Param-ref ≤ 1 invariant — only enforced for the
+        // single-statement case. The codegen splice for
+        // single-T_RET bodies substitutes args directly with
+        // no temp binding, so duplicating a side-effecting arg
+        // would double-evaluate. P3b's multi-stmt splice
+        // alpha-renames into temps and relaxes this constraint.
+        if (body_cnt == 1) {
+            ret_stmt = body_arr[0];
+            ret_expr = ret_stmt.a;
+            if (ret_expr == 0) { continue; }
+            params = *(fn_rec + FN_PARS);
+            for (j = 0; j < pcnt; j++) {
+                refs = _inline_param_refs(ret_expr, *(params + j * 8));
+                if (refs > 1) { ok = 0; }
+            }
+            if (ok == 0) { continue; }
+        }
         arr_set(fn_inlineable, i, 1);
     }
 }
@@ -4163,6 +4219,21 @@ ast_clone_subst(nd, params, pcnt, args) {
         }
         cl.b = new_arr;
     }
+    // S4 P3a — statement-typed nodes. Walked symmetrically to the
+    // expression cases so a multi-statement body clones with full
+    // param substitution. T_DECL stands alone (just the declared
+    // name in .a) — no recursion needed. Field layouts mirror
+    // cg_b3_walk (bpp_codegen.bsm:1113-1117).
+    T_ASSIGN {
+        cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        cl.b = ast_clone_subst(orig.b, params, pcnt, args);
+    }
+    T_MEMST {
+        cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        cl.b = ast_clone_subst(orig.b, params, pcnt, args);
+    }
+    T_RET   { cl.a = ast_clone_subst(orig.a, params, pcnt, args); }
+    T_DECL  { }   // standalone, .a already copied above
     else { }
     }
     return cl;
