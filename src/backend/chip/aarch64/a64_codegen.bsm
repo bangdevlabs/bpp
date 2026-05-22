@@ -489,7 +489,8 @@ static _a64_emit_inline_multi(call_node, fidx) {
     auto callsite_id, inl_callee, inl_body, inl_bcnt;
     auto inl_params, inl_pcnt;
     auto i, orig_p, args_arr;
-    auto mp_node: Node;
+    auto mp_node: Node, bind_lhs: Node, bind_assign: Node;
+    auto mangled_params_buf;
     auto locals_buf, mangled_locals_buf, locals_cnt;
     auto names_buf, args_buf, total_names;
     auto si, cloned, ret_stmt: Node, ret_clone, final_ety;
@@ -501,16 +502,15 @@ static _a64_emit_inline_multi(call_node, fidx) {
     inl_params = *(inl_callee + FN_PARS);
     inl_pcnt = *(inl_callee + FN_PCNT);
     args_arr = cn.b;
-    // Pre-build mangled local names. Params are NOT mangled — they
-    // use direct substitution (Phase B2 style): each T_VAR(param)
-    // is replaced by the original arg expression node. This relies
-    // on classify rejecting bodies whose param appears > 1 time
-    // when the arg might have side effects; for multi-stmt the
-    // same guard would need to be re-checked here. For now the
-    // classifier's body_cnt > 1 acceptance path still inherits
-    // Phase B2's single-callsite param ref limit via the existing
-    // criterion check (body_cnt == 1 only); multi-stmt bodies
-    // that pass classify already have a careful single-ref pattern.
+    // Pre-build mangled names for every callee identifier so the
+    // binding prologue and the rename map share the same packed
+    // references (cheaper packed_eq downstream).
+    mangled_params_buf = buf_word(inl_pcnt + 1);
+    i = 0;
+    while (i < inl_pcnt) {
+        *(mangled_params_buf + i * 8) = _inline_pack_mangled_name(callsite_id, *(inl_params + i * 8));
+        i++;
+    }
     locals_buf = buf_word(64);
     locals_cnt = _inline_collect_locals(inl_body, inl_bcnt, locals_buf);
     mangled_locals_buf = buf_word(locals_cnt + 1);
@@ -519,16 +519,66 @@ static _a64_emit_inline_multi(call_node, fidx) {
         *(mangled_locals_buf + i * 8) = _inline_pack_mangled_name(callsite_id, *(locals_buf + i * 8));
         i++;
     }
-    // Build the rename map: params → arg expressions (substitution),
-    // locals → fresh T_VAR(mangled). One unified array fed to
-    // ast_clone_subst.
+    // 1. Per-param strategy:
+    //    - Arg is T_VAR or T_LIT (cheap, idempotent): SUBSTITUTE.
+    //      Multiple refs to the param re-emit the load/lit each
+    //      time — same cost as a single ref with no binding
+    //      overhead.
+    //    - Arg is anything else (T_CALL, T_BINOP, etc.): BIND.
+    //      Emit `_inl<N>_<param> = <arg_expr>` once via
+    //      `cg_emit_stmt`, then the rename map uses the mangled
+    //      slot. Arg evaluates exactly once, regardless of how
+    //      many times the body touches the param.
+    //
+    //    The mixed strategy preserves correctness (no side-effect
+    //    duplication) while avoiding the per-iteration store/load
+    //    overhead that pure binding adds for simple-variable args
+    //    — measured on `examples/tablah.bpp:gen_u64_worker` where
+    //    `xorshift64(worker_id)` is the hot inner call: pure binding
+    //    regressed phase 1 from ~10 ms to ~16 ms; substitute-when-
+    //    simple closes the gap.
+    //
+    //    `cg_emit_stmt` (not `a64_emit_node`) is mandatory for the
+    //    synth T_ASSIGN — the node dispatcher is expression-only
+    //    and silently drops statement-typed nodes. Same pitfall as
+    //    the body-prelude loop further down; see commit `6a7dcd5`.
+    auto arg_node: Node, arg_t;
+    auto bind_needed;
+    bind_needed = buf_word(inl_pcnt + 1);
+    i = 0;
+    while (i < inl_pcnt) {
+        arg_node = *(args_arr + i * 8);
+        arg_t = arg_node.ntype;
+        if (arg_t == T_VAR || arg_t == T_LIT) {
+            *(bind_needed + i * 8) = 0;
+        } else {
+            *(bind_needed + i * 8) = 1;
+            bind_lhs = make_node(T_VAR);
+            bind_lhs.a = *(mangled_params_buf + i * 8);
+            bind_assign = make_node(T_ASSIGN);
+            bind_assign.a = bind_lhs;
+            bind_assign.b = arg_node;
+            cg_emit_stmt(bind_assign);
+        }
+        i++;
+    }
+    // 2. Build the rename map. For BIND-needed params, substitute
+    //    to T_VAR(mangled). For SIMPLE params, substitute to the
+    //    arg node directly (Phase B2 shape — read/load each ref).
+    //    Locals always substitute to fresh T_VAR(mangled).
     total_names = inl_pcnt + locals_cnt;
     names_buf = buf_word(total_names + 1);
     args_buf  = buf_word(total_names + 1);
     i = 0;
     while (i < inl_pcnt) {
         *(names_buf + i * 8) = *(inl_params + i * 8);
-        *(args_buf  + i * 8) = *(args_arr + i * 8);
+        if (*(bind_needed + i * 8)) {
+            mp_node = make_node(T_VAR);
+            mp_node.a = *(mangled_params_buf + i * 8);
+            *(args_buf + i * 8) = mp_node;
+        } else {
+            *(args_buf + i * 8) = *(args_arr + i * 8);
+        }
         i++;
     }
     i = 0;
@@ -557,6 +607,8 @@ static _a64_emit_inline_multi(call_node, fidx) {
     free(args_buf);
     free(locals_buf);
     free(mangled_locals_buf);
+    free(mangled_params_buf);
+    free(bind_needed);
     return final_ety;
 }
 

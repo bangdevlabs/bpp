@@ -4148,7 +4148,7 @@ _inline_pack_mangled_name(id, orig_p) {
 // T_DECL.a is either a single packed name (when .b == 1) or a
 // word-array of packed names (when .b > 1, for `auto x, y, z;`).
 _inline_register_callee_locals(body_arr, body_cnt, id) {
-    auto i, j, vi;
+    auto i, j, vi, k, ref_count;
     auto n: Node;
     auto mangled, orig_name;
     i = 0;
@@ -4168,6 +4168,23 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
                     if (n.c > 0) {
                         arr_set(cg_var_forced_ty, vi, n.c);
                     }
+                    // Mirror the callee body's reference count onto
+                    // the mangled slot so the b3 selector (which
+                    // runs BEFORE the inline expansion at emit time)
+                    // can decide whether this slot deserves register
+                    // promotion. Without this, every inlined local
+                    // would default to frame storage and hot inner-
+                    // loop work (xorshift64's `s` is the canonical
+                    // case) would lose the B3 promotion the original
+                    // function got. _inline_param_refs already walks
+                    // the statement-typed body shape post-P1.
+                    ref_count = 0;
+                    k = 0;
+                    while (k < body_cnt) {
+                        ref_count += _inline_param_refs(body_arr[k], orig_name);
+                        k++;
+                    }
+                    arr_set(cg_var_refs, vi, ref_count);
                     j++;
                 }
             }
@@ -4183,7 +4200,7 @@ _inline_register_callee_locals(body_arr, body_cnt, id) {
 // resolves to a valid slot index for use by the splice procedure.
 void _inline_register_callsite(call_node, fidx) {
     auto cn: Node;
-    auto fn_rec, body_arr, body_cnt, params, pcnt, i;
+    auto fn_rec, body_arr, body_cnt, params, pcnt, i, vi, k, ref_count;
     auto orig_p, mangled;
     _inline_callsite_id++;
     cn = call_node;
@@ -4197,7 +4214,19 @@ void _inline_register_callsite(call_node, fidx) {
     while (i < pcnt) {
         orig_p = *(params + i * 8);
         mangled = _inline_pack_mangled_name(_inline_callsite_id, orig_p);
-        cg_var_add(mangled);
+        vi = cg_var_add(mangled);
+        // Mirror callee body's reference count to the mangled
+        // param slot. The b3 selector consults this to decide
+        // promotion, and the splice helper may bind args into
+        // this slot (complex args path); promoting hot mangled
+        // params keeps the inlined code in registers.
+        ref_count = 0;
+        k = 0;
+        while (k < body_cnt) {
+            ref_count += _inline_param_refs(body_arr[k], orig_p);
+            k++;
+        }
+        arr_set(cg_var_refs, vi, ref_count);
         i++;
     }
     _inline_register_callee_locals(body_arr, body_cnt, _inline_callsite_id);
@@ -4365,7 +4394,20 @@ void classify_inlineable() {
     for (i = 0; i < func_cnt; i++) {
         arr_set(fn_inlineable, i, 0);
         phase = arr_get(fn_phase, i);
-        if (phase != PHASE_BASE && phase != PHASE_AUTO) { continue; }
+        // Phase whitelist: BASE / AUTO / SOLO. SOLO is "has direct
+        // or transitive side effects, must run on main thread".
+        // xorshift64 in `examples/tablah.bpp` is classified SOLO
+        // because it writes the `rng_states` global; allowing SOLO
+        // here means S4 can inline that style of "tame impurity"
+        // worker helper. If a SOLO function is genuinely main-
+        // thread-only (Cocoa, GL context, etc.), it would not be
+        // called from a worker context to begin with — inlining
+        // it into a context that already calls it is semantically
+        // identical to the un-inlined call. Reject IO / GPU /
+        // HEAP / REALTIME / PANIC / SAFE — those carry stronger
+        // contracts (allocator, syscall, real-time deadline,
+        // safety verification) that inlining could weaken.
+        if (phase != PHASE_BASE && phase != PHASE_AUTO && phase != PHASE_SOLO) { continue; }
         fn_rec = funcs[i];
         body_arr = *(fn_rec + FN_BODY);
         body_cnt = *(fn_rec + FN_BCNT);
@@ -4399,27 +4441,28 @@ void classify_inlineable() {
             if (_inline_has_tcall(body_arr[j])) { ok = 0; break; }
         }
         if (ok == 0) { continue; }
-        // Param-ref ≤ 1 invariant — enforced for both single-
-        // and multi-statement bodies. The codegen splice in
-        // both paths substitutes args directly into the cloned
-        // body with no temp binding, so a side-effecting arg
-        // referenced more than once would double-evaluate.
-        // For multi-stmt, the body is scanned across all
-        // statements (params can be touched in any of them).
-        // A future P3b refinement (alpha-rename + arg-binding
-        // prologue) could relax this; until then, single-ref
-        // is the contract.
-        params = *(fn_rec + FN_PARS);
-        ok = 1;
-        for (j = 0; j < pcnt; j++) {
-            auto k, refs_total;
-            refs_total = 0;
-            for (k = 0; k < body_cnt; k++) {
-                refs_total += _inline_param_refs(body_arr[k], *(params + j * 8));
+        // Param-ref ≤ 1 invariant — only enforced for the
+        // single-statement case. Phase B2's substitute-and-emit
+        // path drops the arg expression into the body wherever
+        // the param appears, so a side-effecting arg used twice
+        // would double-evaluate. The S4 P3b-3 multi-statement
+        // splice instead binds each arg to a mangled
+        // `_inl<N>_<param>` slot once at the splice prologue,
+        // then the cloned body references that slot — every
+        // subsequent param touch is a pure local load with
+        // no re-evaluation, regardless of count.
+        if (body_cnt == 1) {
+            params = *(fn_rec + FN_PARS);
+            ok = 1;
+            ret_stmt = body_arr[0];
+            ret_expr = ret_stmt.a;
+            if (ret_expr == 0) { continue; }
+            for (j = 0; j < pcnt; j++) {
+                refs = _inline_param_refs(ret_expr, *(params + j * 8));
+                if (refs > 1) { ok = 0; }
             }
-            if (refs_total > 1) { ok = 0; }
+            if (ok == 0) { continue; }
         }
-        if (ok == 0) { continue; }
         arr_set(fn_inlineable, i, 1);
     }
 }
