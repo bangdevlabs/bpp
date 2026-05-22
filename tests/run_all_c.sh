@@ -157,8 +157,8 @@ should_skip() {
             # tests/test_panic.sh covers it; skip from the rc=0 loop.
             echo "skip:shell-wrapped" && return
             ;;
-        test_vec_*)
-            echo "skip:simd-deferred" && return
+        test_vec_align_stack)
+            echo "skip:stack-alignment-checks-native-frame-layout" && return
             ;;
         test_thread|test_job|test_maestro)
             echo "skip:phase1-macos-only" && return

@@ -370,7 +370,23 @@ void emit_body(arr, cnt) {
                 // Sub-word hints in n.c select a narrower C type for truncation semantics.
                 auto dh;
                 dh = n.c;
-                if (ty_slice(dh) == SL_BYTE) {
+                if (ty_slice(dh) == SL_DOUBLE) {
+                    // 128-bit SIMD slot — Autovec P1 (2026-05-22).
+                    // `: double` locals lower to `_bpp_vec4f` defined
+                    // in the SIMD preamble. The `is_float_type` filter
+                    // does NOT match SL_DOUBLE (it's a vector slot,
+                    // not a scalar float) so we emit the variable
+                    // group unconditionally for every name in the
+                    // declaration.
+                    di = 0; has_int = 0;
+                    while (di < dcnt) {
+                        if (has_int == 0) { emit_pad(); out("_bpp_vec4f "); has_int = 1; }
+                        else { out(", "); }
+                        print_p(darr[di]);
+                        di++;
+                    }
+                    if (has_int) { out(";"); putchar('\n'); }
+                } else if (ty_slice(dh) == SL_BYTE) {
                     // uint8_t variables.
                     di = 0; has_int = 0;
                     while (di < dcnt) {
@@ -422,17 +438,22 @@ void emit_body(arr, cnt) {
                     }
                     if (has_int) { out(";"); putchar('\n'); }
                 }
-                // Emit float variables.
+                // Emit float variables — skip SL_DOUBLE (handled
+                // above as `_bpp_vec4f`). `is_float_type` matches
+                // both scalar floats and SL_DOUBLE, so the slice
+                // check excludes the vector slot from this group.
                 has_flt = 0;
-                for (di = 0; di < dcnt; di++) {
-                    vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                    if (is_float_type(vty)) {
-                        if (has_flt == 0) { emit_pad(); out("double "); has_flt = 1; }
-                        else { out(", "); }
-                        print_p(darr[di]);
+                if (ty_slice(dh) != SL_DOUBLE) {
+                    for (di = 0; di < dcnt; di++) {
+                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
+                        if (is_float_type(vty)) {
+                            if (has_flt == 0) { emit_pad(); out("double "); has_flt = 1; }
+                            else { out(", "); }
+                            print_p(darr[di]);
+                        }
                     }
+                    if (has_flt) { out(";"); putchar('\n'); }
                 }
-                if (has_flt) { out(";"); putchar('\n'); }
                 }
             } else if (n.ntype == T_IF | n.ntype == T_WHILE) {
                 emit_pad();
@@ -600,6 +621,15 @@ void emit_node(nd) {
                 out("))))");
                 return;
             }
+            if (ld_sl == SL_DOUBLE) {
+                // Autovec P1 (2026-05-22) — 128-bit SIMD load from
+                // a struct field or array slot. The portable wrapper
+                // resolves to LDR-Q on NEON / MOVUPS on SSE2.
+                out("_bpp_vec_load4(");
+                emit_node(n.a);
+                out(")");
+                return;
+            }
             // SL_FULL float = double.
             out("(*(double*)((uintptr_t)(");
             emit_node(n.a);
@@ -691,7 +721,8 @@ void emit_node(nd) {
             return;
         }
         // Float writes at the matching width. SL_HALF stores as 32-bit
-        // float (narrowing); SL_FULL stores as double.
+        // float (narrowing); SL_DOUBLE stores 16-byte SIMD vector;
+        // SL_FULL stores as double.
         if (is_float_type(n.c)) {
             if (st_sl == SL_HALF) {
                 out("(*(float*)((uintptr_t)(");
@@ -699,6 +730,18 @@ void emit_node(nd) {
                 out(")) = (float)(");
                 emit_node(n.b);
                 out("))");
+                return;
+            }
+            if (st_sl == SL_DOUBLE) {
+                // Autovec P1 (2026-05-22) — 128-bit SIMD store
+                // through a struct field or array slot. Emits the
+                // portable vec_store wrapper so the same code
+                // compiles on SSE2 and NEON.
+                out("(_bpp_vec_store4(");
+                emit_node(n.a);
+                out(",");
+                emit_node(n.b);
+                out("),0)");
                 return;
             }
             out("(*(double*)((uintptr_t)(");
@@ -753,6 +796,73 @@ void emit_node(nd) {
         name_p = n.a;
         arr = n.b;
         cnt = n.c;
+
+        // Built-ins: SIMD vec_* — Autovec P1 (2026-05-22). Each
+        // lowers to the portable wrapper macros / inline fns in
+        // the SIMD preamble. Unary, binary, and the two specials
+        // (get4, dot4) all collapse to one-line expansions.
+        if (emit_name_eq(name_p, "vec_splat4", 10)) {
+            out("_bpp_vec_splat4("); if (cnt > 0) { emit_node(arr[0]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_load4", 9)) {
+            out("_bpp_vec_load4("); if (cnt > 0) { emit_node(arr[0]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_store4", 10)) {
+            out("(_bpp_vec_store4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out("),0)");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_add4", 8)) {
+            out("_bpp_vec_add4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_sub4", 8)) {
+            out("_bpp_vec_sub4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_mul4", 8)) {
+            out("_bpp_vec_mul4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_div4", 8)) {
+            out("_bpp_vec_div4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_min4", 8)) {
+            out("_bpp_vec_min4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_max4", 8)) {
+            out("_bpp_vec_max4(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_get4", 8)) {
+            out("_bpp_vec_get4_fn(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
+        if (emit_name_eq(name_p, "vec_dot4", 8)) {
+            out("_bpp_vec_dot4_fn(");
+            if (cnt > 0) { emit_node(arr[0]); } out(",");
+            if (cnt > 1) { emit_node(arr[1]); } out(")");
+            return;
+        }
 
         // Built-in: malloc -> real malloc.
         if (emit_name_eq(name_p, "malloc", 6)) {
@@ -1699,12 +1809,58 @@ void emit_includes() {
     out("#include <sys/mman.h>"); putchar('\n');
     out("#include <sys/time.h>"); putchar('\n');
     out("#include <time.h>"); putchar('\n');
-    // Phase B4: SIMD builtins (vec_*) lower to SSE2 intrinsics in the
-    // native backends. The C transpile path needs `: double` locals
-    // mapped to `__m128` (the current emitter uses `long long` for
-    // every local); that is tracked in docs/plans/todo.md and not emitted
-    // here. Any program using vec_* via --c today will fail the
-    // extern-lookup path, which is the correct feedback.
+    // Phase B4 C-emit SIMD preamble — Autovec sidequest P1
+    // (2026-05-22). `: double` locals lower to `_bpp_vec4f`; the 11
+    // `vec_*` builtins lower to portable inline wrappers that
+    // dispatch to SSE2 on x86_64 and NEON on aarch64 / arm. The
+    // wrappers stay in this preamble so the emitted C is a single
+    // freestanding file that compiles on either chip without
+    // external shim libraries.
+    out("#if defined(__SSE2__) || defined(__x86_64__) || defined(__i386__)");
+    putchar('\n');
+    out("#include <emmintrin.h>"); putchar('\n');
+    out("typedef __m128 _bpp_vec4f;"); putchar('\n');
+    out("#define _bpp_vec_splat4(s) _mm_set1_ps((float)(s))"); putchar('\n');
+    out("#define _bpp_vec_load4(p)  _mm_loadu_ps((float*)(uintptr_t)(p))"); putchar('\n');
+    out("#define _bpp_vec_store4(p,v) _mm_storeu_ps((float*)(uintptr_t)(p),(v))"); putchar('\n');
+    out("#define _bpp_vec_add4(a,b) _mm_add_ps((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_sub4(a,b) _mm_sub_ps((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_mul4(a,b) _mm_mul_ps((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_div4(a,b) _mm_div_ps((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_min4(a,b) _mm_min_ps((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_max4(a,b) _mm_max_ps((a),(b))"); putchar('\n');
+    out("static inline long long _bpp_vec_get4_fn(_bpp_vec4f v,long long lane){");
+    putchar('\n');
+    out("  float buf[4]; _mm_storeu_ps(buf,v); return (long long)(int)buf[lane&3]; }");
+    putchar('\n');
+    out("static inline long long _bpp_vec_dot4_fn(_bpp_vec4f a,_bpp_vec4f b){");
+    putchar('\n');
+    out("  float buf[4]; _mm_storeu_ps(buf,_mm_mul_ps(a,b));"); putchar('\n');
+    out("  return (long long)(int)(buf[0]+buf[1]+buf[2]+buf[3]); }"); putchar('\n');
+    out("#elif defined(__aarch64__) || defined(__ARM_NEON)"); putchar('\n');
+    out("#include <arm_neon.h>"); putchar('\n');
+    out("typedef float32x4_t _bpp_vec4f;"); putchar('\n');
+    out("#define _bpp_vec_splat4(s) vdupq_n_f32((float)(s))"); putchar('\n');
+    out("#define _bpp_vec_load4(p)  vld1q_f32((float*)(uintptr_t)(p))"); putchar('\n');
+    out("#define _bpp_vec_store4(p,v) vst1q_f32((float*)(uintptr_t)(p),(v))"); putchar('\n');
+    out("#define _bpp_vec_add4(a,b) vaddq_f32((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_sub4(a,b) vsubq_f32((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_mul4(a,b) vmulq_f32((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_div4(a,b) vdivq_f32((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_min4(a,b) vminq_f32((a),(b))"); putchar('\n');
+    out("#define _bpp_vec_max4(a,b) vmaxq_f32((a),(b))"); putchar('\n');
+    out("static inline long long _bpp_vec_get4_fn(_bpp_vec4f v,long long lane){");
+    putchar('\n');
+    out("  float buf[4]; vst1q_f32(buf,v); return (long long)(int)buf[lane&3]; }");
+    putchar('\n');
+    out("static inline long long _bpp_vec_dot4_fn(_bpp_vec4f a,_bpp_vec4f b){");
+    putchar('\n');
+    out("  return (long long)(int)vaddvq_f32(vmulq_f32(a,b)); }"); putchar('\n');
+    out("#else"); putchar('\n');
+    out("typedef struct { float v[4]; } _bpp_vec4f;"); putchar('\n');
+    out("#error \"B++ SIMD requires SSE2 or NEON; this target has neither.\"");
+    putchar('\n');
+    out("#endif"); putchar('\n');
     putchar('\n');
     for (i = 0; i < ex_cnt; i++) {
         if (is_used(ex_name[i])) {
