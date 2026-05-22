@@ -229,25 +229,40 @@ Recommend: P1 + P2 for v1; P3 if v1 lands cleanly.
 
 Two arrays `arr[i]` and `lhs[i]` might be aliased pointers
 to the same memory. Aggressive vectorizers prove they aren't
-(via dep analysis); B++ Tier B will assume non-aliasing
-unless the parser can prove otherwise from declared types.
+(via dep analysis). B++ doctrine — per Tonify Rule 4
+(`@safe` + `@profile` + default only) and the 2026-05-11
+phase-annotation collapse — explicitly forbids reintroducing
+per-loop annotations like `@seq` or `@simd`. The doctrine is:
 
-Risk: if a programmer aliases two `arr`-typed pointers, the
-vectorized code computes wrong results. Game devs rarely do
-this on purpose, but the failure mode is silent miscompile.
+  * **Compiler proves safety, or doesn't vectorize.** Default
+    behaviour is conservative; autovec runs only when the
+    transformation is provably correct.
+  * **`@safe` is the programmer's "I promise" override** when
+    the compiler's proof is too conservative. Already exists,
+    already documented (Rule 4 + Rule 38 + W026 verification).
+    The same annotation that drives smart-dispatch outlining
+    eligibility (Rule 38) drives autovec eligibility — one
+    annotation, multiple consumers, no doctrine drift.
+  * **No new keyword surface.** If the compiler can't prove
+    a loop safe AND the programmer hasn't asserted `@safe`,
+    the loop stays scalar.
 
-Mitigation: add a "no autovec" annotation on loops where
-the programmer wants conservative behaviour (probably
-`@seq` revived — Rule 38 already documents the explicit-vs-
-implicit decision; adding `@seq` for "don't autovec this"
-is the same shape).
+What the proof looks like in practice (Tier B v1):
 
-Alternative mitigation: only autovec on declared types we
-can statically prove disjoint (`auto a, b: ptr_to_4xfloat`
-where the types disagree). Stricter, less coverage.
+  * Stride-1 array access: `arr[i]` where `i` is the loop
+    var, `arr` is a stable pointer in the body (in write-set
+    only as `*(arr + ...) = ...` indirect writes — never as
+    direct LHS T_VAR(arr)).
+  * Disjoint destinations: when writing through `arr`, no
+    other pointer in the body reads from `arr[i + k]` for
+    any k > 0 (RAW dep that would break vectorization).
+  * No address-taken (`&local`): excludes pointer escape.
 
-Recommend: assume non-aliasing + `@seq` opt-out. Same
-discipline as the outlining sidequest.
+If proof fails AND no `@safe`: stay scalar.
+If proof succeeds OR `@safe` present: vectorize.
+
+Same machinery shape as outlining's gate-6 relax. Reuses
+`_fdc_collect_writes` from the outlining sidequest.
 
 ### Q3 — Vector lane width
 
@@ -387,12 +402,13 @@ implementation-heavy).
 
 ## Open questions to resolve at design phase kickoff
 
-- Does autovec need a per-loop `@simd` opt-in annotation, or
-  is implicit-when-safe enough? Rule 4 says no new
-  annotations without bug class evidence; the "silent
-  miscompile on aliased pointers" risk is the evidence
-  if we want one. Probably defer — Tier B + `@seq` opt-out
-  handles 99 % of cases.
+- **No new annotations is LOCKED in this sidequest.** The
+  2026-05-11 phase-annotation collapse + Tonify Rule 4 +
+  the outlining sidequest closure all reinforce the same
+  doctrine: `@safe` + `@profile` + default, full stop.
+  Q2 above resolves aliasing risk via compiler proof +
+  existing `@safe` programmer-override path; no `@seq`,
+  no `@simd`, no per-loop hints.
 - Cost model: simple heuristic or full analysis? Recommend
   simple heuristic for v1; revisit after first bench
   iteration shows where it misses.
