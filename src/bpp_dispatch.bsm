@@ -2250,6 +2250,16 @@ static auto _fdc_red_op;
 // the candidate body. Rebuilt per candidate by _fdc_try_candidate.
 static auto _fdc_loop_locals;
 
+// Names that the candidate body WRITES — directly via T_ASSIGN
+// LHS or indirectly by exposing their address via T_ADDR. Free
+// variables in this set CANNOT be captured for outlining (the
+// worker's copy would diverge from the caller's, or the
+// pointer-exposed slot could be mutated through an alias). The
+// write-set is rebuilt per candidate and consulted by
+// `_fdc_collect_captures` to filter the candidate captures
+// against the read-only invariant.
+static auto _fdc_write_set;
+
 // Free-variable capture list — names referenced inside the loop body
 // that are NOT the loop variable, NOT body-local declarations, and
 // NOT known globals. These are the names whose values live in the
@@ -2290,6 +2300,95 @@ static _fdc_op_char(packed) {
     return peek(vbuf + unpack_s(packed));
 }
 
+// Walk a loop body subtree and add every directly-mutated name to
+// `_fdc_write_set`. A name is "directly mutated" when it appears
+// as the LHS of `T_ASSIGN` with `lhs.ntype == T_VAR`, OR when its
+// address is taken via `T_ADDR(T_VAR(name))` (the address could
+// be followed by writes through a pointer the scanner cannot
+// trace). Writes through indirect addresses (`T_MEMST` whose
+// address subexpression mentions the name) do NOT count — those
+// modify the memory the name points at, not the name itself, and
+// the disjoint-index argument keeps such writes safe for
+// outlining.
+static _fdc_collect_writes(nd) {
+    auto n: Node, t, arr, cnt, i;
+    auto lhs: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_ASSIGN) {
+        lhs = n.a;
+        if (lhs != 0) {
+            if (lhs.ntype == T_VAR) {
+                _fdc_write_set = arr_push(_fdc_write_set, lhs.a);
+            } else {
+                _fdc_collect_writes(n.a);
+            }
+        }
+        _fdc_collect_writes(n.b);
+        return 0;
+    }
+    if (t == T_ADDR) {
+        lhs = n.a;
+        if (lhs != 0 && lhs.ntype == T_VAR) {
+            _fdc_write_set = arr_push(_fdc_write_set, lhs.a);
+        } else {
+            _fdc_collect_writes(n.a);
+        }
+        return 0;
+    }
+    switch (t) {
+    T_BINOP   { _fdc_collect_writes(n.b); _fdc_collect_writes(n.c); }
+    T_UNARY   { _fdc_collect_writes(n.b); }
+    T_MEMLD   { _fdc_collect_writes(n.a); }
+    T_MEMST   { _fdc_collect_writes(n.a); _fdc_collect_writes(n.b); }
+    T_TERNARY { _fdc_collect_writes(n.a); _fdc_collect_writes(n.b); _fdc_collect_writes(n.c); }
+    T_RET     { _fdc_collect_writes(n.a); }
+    T_CALL    {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_writes(arr[i]); i++; }
+    }
+    T_IF      {
+        _fdc_collect_writes(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_writes(arr[i]); i++; }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            i = 0;
+            while (i < cnt) { _fdc_collect_writes(arr[i]); i++; }
+        }
+    }
+    T_WHILE   {
+        _fdc_collect_writes(n.a);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_writes(arr[i]); i++; }
+    }
+    T_BLOCK   {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_writes(arr[i]); i++; }
+    }
+    else { }
+    }
+    return 0;
+}
+
+// Return 1 if `name_p` is present in the write-set.
+static _fdc_in_write_set(name_p) {
+    auto i, v;
+    i = 0;
+    while (i < arr_len(_fdc_write_set)) {
+        v = arr_get(_fdc_write_set, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
+        i++;
+    }
+    return 0;
+}
+
 // Walk a loop body subtree and add every free-variable name to
 // `_fdc_captures`. A free variable is a `T_VAR` reference where the
 // name is NOT the loop variable, NOT a body-local declaration, and
@@ -2325,7 +2424,13 @@ static _fdc_collect_captures(nd, loop_var_p) {
         }
         gi = dsp_find_global(name_p);
         if (gi >= 0) { return 0; }
-        // Free variable — deduplicate against existing capture list.
+        // Free variable. Skip if the body mutates it directly —
+        // capture-by-value would diverge from caller's slot, and
+        // address-taken aliases could be modified through pointer.
+        // Only read-only free vars are safe to capture into the
+        // outlining struct.
+        if (_fdc_in_write_set(name_p)) { return 0; }
+        // Deduplicate against existing capture list.
         already = 0;
         i = 0;
         while (i < arr_len(_fdc_captures)) {
@@ -2570,6 +2675,25 @@ static _outline_build_subst_map(sidx, params_out, args_out) {
     return arr_len(_fdc_captures);
 }
 
+// Repopulate `_fdc_captures` from the capture struct's fields. Called
+// from Stage 2 (`synthesize_loop_fn`) and Stage 3
+// (`_outline_rewrite_with_captures`) — both run AFTER
+// `_fdc_try_candidate` cleared the captures scratch for the next
+// candidate. The struct fields are the canonical record of which
+// names this candidate captured, in the order they were added.
+static _outline_restore_captures_from_struct(sidx) {
+    auto fields, fc, i;
+    arr_clear(_fdc_captures);
+    if (sidx < 0) { return; }
+    fields = arr_get(sd_fields, sidx);
+    fc = arr_get(sd_fcounts, sidx);
+    i = 0;
+    while (i < fc) {
+        _fdc_captures = arr_push(_fdc_captures, *(fields + i * 8));
+        i++;
+    }
+}
+
 // Clone every statement in a body array, substituting captured names
 // with the corresponding capture-struct field access. Returns a new
 // body_arr that the synth function can use as its `FN_BODY`. Allocates
@@ -2625,6 +2749,17 @@ static _fdc_name_is_safe(name_p, loop_var_p) {
         cls = arr_get(glob_class, gi);
         if (cls == GLOB_EXTRN) { return 1; }
         if (cls == GLOB_GLOBAL) { return 1; }
+    }
+    // Outlining (P6 wire-up): accept caller-frame names that the
+    // pre-walk added to `_fdc_captures`. The capture-collection
+    // pass already filtered against the write-set, so anything in
+    // this list is provably read-only during the loop. Stage 2 +
+    // Stage 3 take care of publishing the value through the
+    // capture struct so the worker can access it.
+    for (i = 0; i < arr_len(_fdc_captures); i++) {
+        v = arr_get(_fdc_captures, i);
+        if (v == name_p) { return 1; }
+        if (packed_eq(v, name_p)) { return 1; }
     }
     return 0;
 }
@@ -2889,6 +3024,8 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     // Loop-locals declared in nested blocks are not collected, which
     // keeps the MVP conservative — such loops will simply be rejected.
     arr_clear(_fdc_loop_locals);
+    arr_clear(_fdc_write_set);
+    arr_clear(_fdc_captures);
     body_arr = wh.b;
     body_cnt = wh.c;
     for (i = 0; i < body_cnt; i++) {
@@ -2900,6 +3037,32 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
                     _fdc_loop_locals = arr_push(_fdc_loop_locals, darr[k]);
                 }
             }
+        }
+    }
+    // Outlining pre-walk: compute the write-set (names mutated
+    // directly in the body) and the captures list (free vars not
+    // mutated, that the outlining transformation will carry across
+    // worker frames via a capture struct). Both must be computed
+    // BEFORE the safety walk, because `_fdc_name_is_safe` consults
+    // the captures list as a positive acceptance signal.
+    for (i = 0; i < body_cnt; i++) {
+        _fdc_collect_writes(body_arr[i]);
+    }
+    for (i = 0; i < body_cnt; i++) {
+        _fdc_collect_captures(body_arr[i], loop_var_p);
+    }
+    // Outlining is only feasible when the runtime helper
+    // `job_parallel_for_data` is available — that requires the
+    // program to import `bpp_job.bsm` (which also defines the
+    // `_outline_cap_ptr` global the synth body references). If the
+    // helper isn't available, clear the captures list so the
+    // safety walk reverts to the original parent-frame-strict
+    // behaviour (rejects loops that need outlining). The candidate
+    // simply stays serial without producing an unresolvable
+    // synth function.
+    if (arr_len(_fdc_captures) > 0) {
+        if (_dsp_find_func_idx(_dsp_pack_name("job_parallel_for_data", 21)) < 0) {
+            arr_clear(_fdc_captures);
         }
     }
     // First trial: MAP candidate — every statement must be
@@ -2937,6 +3100,14 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
         // not inherit it as a "safe" name.
         arr_pop(_fdc_loop_locals);
         if (red_safe == 0) { return; }
+        // Outlining is only supported on the MAP path. The reduction
+        // synthesiser generates a custom body (`_dsp_build_red_body`)
+        // that doesn't go through the capture-rewrite plumbing, so
+        // reduction candidates that ALSO need captures would emit
+        // synth bodies referencing caller-frame names with no
+        // backing slot. Reject the candidate entirely until reduction
+        // outlining is a separate sidequest.
+        if (arr_len(_fdc_captures) > 0) { return; }
         reduce_var   = _fdc_red_acc;
         reduce_op_ch = _fdc_red_op;
     }
@@ -2976,9 +3147,15 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     dispatch_cand_stride = arr_push(dispatch_cand_stride, stride_val);
     dispatch_cand_reduce_var = arr_push(dispatch_cand_reduce_var, reduce_var);
     dispatch_cand_reduce_op  = arr_push(dispatch_cand_reduce_op,  reduce_op_ch);
-    // Outlining capture struct index — always -1 until P6 wires the
-    // gate-6 relax. Parallel array kept in lockstep with the others.
-    dispatch_cand_capture_idx = arr_push(dispatch_cand_capture_idx, 0 - 1);
+    // Outlining capture struct index — synth the struct from
+    // `_fdc_captures` if any free vars survived the write-set
+    // filter, otherwise -1 (no outlining for this candidate).
+    auto _cap_sidx;
+    _cap_sidx = 0 - 1;
+    if (arr_len(_fdc_captures) > 0) {
+        _cap_sidx = _outline_synth_capture_struct();
+    }
+    dispatch_cand_capture_idx = arr_push(dispatch_cand_capture_idx, _cap_sidx);
 }
 
 // Scan every parsed function body and record every top-level for-loop
@@ -3010,6 +3187,7 @@ void find_dispatch_candidates() {
     else { arr_clear(dispatch_cand_reduce_op); }
     if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
     if (_fdc_captures == 0) { _fdc_captures = arr_new(); }
+    if (_fdc_write_set == 0) { _fdc_write_set = arr_new(); }
     if (dispatch_cand_capture_idx == 0) { dispatch_cand_capture_idx = arr_new(); }
     else { arr_clear(dispatch_cand_capture_idx); }
 
@@ -3588,6 +3766,10 @@ static _outline_rewrite_with_captures(wh, sidx, synth_name, bound_n, src_fi, jpf
     auto callees;
     wh_node = wh;
     if (jpf_data_idx < 0) { return 0; }
+    // `_fdc_captures` was cleared by the next `_fdc_try_candidate`
+    // call; recover the captures list from the struct that
+    // `_outline_synth_capture_struct` left behind.
+    _outline_restore_captures_from_struct(sidx);
     captures_cnt = arr_len(_fdc_captures);
     if (captures_cnt == 0) { return 0; }
     cap_local_name = _outline_make_cap_local_name();
@@ -3780,6 +3962,17 @@ void synthesize_loop_fn() {
             param_p  = loop_var_p;
             body_ptr = wh.b;
             body_cnt = wh.c;
+            // Outlining: if the candidate captured caller-frame
+            // names, the synth body's references to those names
+            // must be rewritten to read from the global capture
+            // pointer `_outline_cap_ptr + field_offset`.
+            auto _cap_idx;
+            _cap_idx = arr_get(dispatch_cand_capture_idx, i);
+            if (_cap_idx >= 0) {
+                _outline_restore_captures_from_struct(_cap_idx);
+                body_ptr = _outline_clone_body_with_captures(
+                    wh.b, wh.c, _cap_idx);
+            }
         }
 
         // Build the function record. Fields match parse_function's
@@ -5066,6 +5259,51 @@ ast_clone_subst(nd, params, pcnt, args) {
     }
     T_RET   { cl.a = ast_clone_subst(orig.a, params, pcnt, args); }
     T_DECL  { }   // standalone, .a already copied above
+    // Outlining P6 — control-flow types whose bodies are arrays of
+    // statement nodes. Without these branches, the cloned T_IF /
+    // T_WHILE / T_BLOCK would SHARE the body array with the
+    // original, leaving any T_VAR(captured_name) inside the body
+    // un-substituted. The smart-dispatch scanner accepts loops with
+    // top-level T_IF (e.g. `for (i = 0; i < n; i++) { if (cond) {
+    // touch(i); } }`), and the outlining rewrite must follow the
+    // free-var substitution all the way into nested control flow.
+    T_IF {
+        cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        arr = orig.b; cnt = orig.c;
+        new_arr = buf_word(cnt);
+        for (i = 0; i < cnt; i++) {
+            new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+        }
+        cl.b = new_arr;
+        if (orig.e > 0) {
+            arr = orig.d; cnt = orig.e;
+            new_arr = buf_word(cnt);
+            for (i = 0; i < cnt; i++) {
+                new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+            }
+            cl.d = new_arr;
+        }
+    }
+    T_WHILE {
+        cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        arr = orig.b; cnt = orig.c;
+        new_arr = buf_word(cnt);
+        for (i = 0; i < cnt; i++) {
+            new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+        }
+        cl.b = new_arr;
+        if (orig.e != 0) {
+            cl.e = ast_clone_subst(orig.e, params, pcnt, args);
+        }
+    }
+    T_BLOCK {
+        arr = orig.b; cnt = orig.c;
+        new_arr = buf_word(cnt);
+        for (i = 0; i < cnt; i++) {
+            new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+        }
+        cl.b = new_arr;
+    }
     else { }
     }
     return cl;
