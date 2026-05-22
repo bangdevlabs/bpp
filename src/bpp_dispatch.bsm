@@ -2250,6 +2250,24 @@ static auto _fdc_red_op;
 // the candidate body. Rebuilt per candidate by _fdc_try_candidate.
 static auto _fdc_loop_locals;
 
+// Free-variable capture list — names referenced inside the loop body
+// that are NOT the loop variable, NOT body-local declarations, and
+// NOT known globals. These are the names whose values live in the
+// caller's frame and must be captured into an outlining struct so the
+// synth worker function can access them. Rebuilt per candidate.
+//
+// P1 of the smart-dispatch outlining sidequest — pure data
+// collection. The capture struct synthesis, AST rewriting, and
+// runtime publish happen in later phases (P2-P5). Until then, this
+// list is computed but not consumed; the existing scanner gates 5
+// and 6 still reject loops whose body uses these names.
+//
+// Mode inference (by-value vs by-reference, mirror of OpenMP
+// `firstprivate` vs `shared`) is deferred to P2 when the capture
+// struct type is synthesised — that's when we have the variable's
+// declared type readily available via the parser's vt_block.
+static auto _fdc_captures;
+
 // Return the one-character operator stored inside a packed identifier,
 // or 0 if the packed value is not exactly a one-character name. Used
 // to recognize `+` and `<` without relying on pointer-identity compare,
@@ -2257,6 +2275,96 @@ static auto _fdc_loop_locals;
 static _fdc_op_char(packed) {
     if (unpack_l(packed) != 1) { return 0; }
     return peek(vbuf + unpack_s(packed));
+}
+
+// Walk a loop body subtree and add every free-variable name to
+// `_fdc_captures`. A free variable is a `T_VAR` reference where the
+// name is NOT the loop variable, NOT a body-local declaration, and
+// NOT a known global. Those are the names that, with outlining,
+// must be carried from the caller's frame into a capture struct so
+// the worker can access them.
+//
+// Deduplicates — the same name referenced N times in the body
+// produces one capture entry. Linear scan of the existing list per
+// match (capture lists are small, < 10 entries typically).
+//
+// P1 of the outlining sidequest. The list is collected per
+// candidate but not yet consumed; P2 synthesises the capture struct
+// type from it, P3 rewrites the synth body to reference struct
+// fields, P4 emits the publish code on the caller side, P5 extends
+// the runtime to pass the capture pointer.
+static _fdc_collect_captures(nd, loop_var_p) {
+    auto n: Node, t, arr, cnt, i;
+    auto name_p, gi, v, already;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+    if (t == T_VAR) {
+        name_p = n.a;
+        if (name_p == loop_var_p) { return 0; }
+        if (packed_eq(name_p, loop_var_p)) { return 0; }
+        i = 0;
+        while (i < arr_len(_fdc_loop_locals)) {
+            v = arr_get(_fdc_loop_locals, i);
+            if (v == name_p) { return 0; }
+            if (packed_eq(v, name_p)) { return 0; }
+            i++;
+        }
+        gi = dsp_find_global(name_p);
+        if (gi >= 0) { return 0; }
+        // Free variable — deduplicate against existing capture list.
+        already = 0;
+        i = 0;
+        while (i < arr_len(_fdc_captures)) {
+            v = arr_get(_fdc_captures, i);
+            if (v == name_p) { already = 1; i = arr_len(_fdc_captures); }
+            else if (packed_eq(v, name_p)) { already = 1; i = arr_len(_fdc_captures); }
+            else { i++; }
+        }
+        if (already == 0) {
+            _fdc_captures = arr_push(_fdc_captures, name_p);
+        }
+        return 0;
+    }
+    switch (t) {
+    T_BINOP   { _fdc_collect_captures(n.b, loop_var_p); _fdc_collect_captures(n.c, loop_var_p); }
+    T_UNARY   { _fdc_collect_captures(n.b, loop_var_p); }
+    T_MEMLD   { _fdc_collect_captures(n.a, loop_var_p); }
+    T_MEMST   { _fdc_collect_captures(n.a, loop_var_p); _fdc_collect_captures(n.b, loop_var_p); }
+    T_ADDR    { _fdc_collect_captures(n.a, loop_var_p); }
+    T_TERNARY { _fdc_collect_captures(n.a, loop_var_p); _fdc_collect_captures(n.b, loop_var_p); _fdc_collect_captures(n.c, loop_var_p); }
+    T_ASSIGN  { _fdc_collect_captures(n.a, loop_var_p); _fdc_collect_captures(n.b, loop_var_p); }
+    T_RET     { _fdc_collect_captures(n.a, loop_var_p); }
+    T_CALL    {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_captures(arr[i], loop_var_p); i++; }
+    }
+    T_IF      {
+        _fdc_collect_captures(n.a, loop_var_p);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_captures(arr[i], loop_var_p); i++; }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            i = 0;
+            while (i < cnt) { _fdc_collect_captures(arr[i], loop_var_p); i++; }
+        }
+    }
+    T_WHILE   {
+        _fdc_collect_captures(n.a, loop_var_p);
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_captures(arr[i], loop_var_p); i++; }
+    }
+    T_BLOCK   {
+        arr = n.b; cnt = n.c;
+        i = 0;
+        while (i < cnt) { _fdc_collect_captures(arr[i], loop_var_p); i++; }
+    }
+    else { }
+    }
+    return 0;
 }
 
 // Return 1 if the packed name refers to a safe target inside a
@@ -2660,6 +2768,7 @@ void find_dispatch_candidates() {
     if (dispatch_cand_reduce_op == 0) { dispatch_cand_reduce_op = arr_new(); }
     else { arr_clear(dispatch_cand_reduce_op); }
     if (_fdc_loop_locals == 0) { _fdc_loop_locals = arr_new(); }
+    if (_fdc_captures == 0) { _fdc_captures = arr_new(); }
 
     for (i = 0; i < func_cnt; i++) {
         fn_rec = funcs[i];
