@@ -1,6 +1,8 @@
 # Sidequest — `load` vs `import` proper distinction
 
-**Status:** PROPOSED 2026-05-22, design-phase open.
+**Status:** DESIGN-LOCKED 2026-05-22 (followup section at the end
+of this doc supersedes the original "Tier A vs Tier B" framing
+and the "Next-session scope (revised)" section).
 
 **Trigger:** Autovec P6 Phase 2 (compose outlining + autovec) shipped
 2026-05-22 (commit `2384b46`). Single-module test programs measure
@@ -329,3 +331,193 @@ than a quick fix.
   * `src/bpp_import.bsm` — primary file modified
   * `src/bpp.bpp` — orchestrator; verify both incremental and
     monolithic paths still work
+
+---
+
+## Design lock (2026-05-22 followup — supersedes Tier A vs Tier B)
+
+After a second deep-read of the source (sessions late 2026-05-22),
+the original "two-tier" framing turned out to be a remediation,
+not a root-cause solution. The new design is grounded in the
+actual call chain that produces the bug.
+
+### The bug as a cascade, not a point
+
+```
+process_file recurses on nested imports
+  ↓ outbuf becomes interleaved (parent | child | parent | grandchild | parent ...)
+lex_module(mi) partitions by the range [diag_file_start(mi), diag_file_start(mi+1))
+  ↓ parent's resumed content (after child) lands in the next module's range
+parse_function reads my_mod = tok_mod(tok_pos) → mod_idx(tok_pos)
+  ↓ wrong module attribution
+func_mods[i] = wrong module
+emit_module_arm64(mi) filters by func_mods[i] == mi
+  ↓ function emits in wrong module, OR never emits, OR emits in a module that ran before dispatch
+run_dispatch rewrites the AST of an already-emitted function
+  ↓ rewrite silently lost — synth functions in .bug map, zero in binary
+```
+
+The root is **step 2 (lex_module's contiguous-range assumption)**.
+All downstream consequences chain from there.
+
+### The two emit APIs and why the agent's deferred-emit attempt failed
+
+The ARM64 backend has two emit paths today:
+
+| API | Population strategy | Today's use |
+|---|---|---|
+| `emit_all_arm64()` in `a64_codegen.bsm:2357` | `cg_bridge_data()` clears + rebuilds `cg_fn_name` from `func_cnt`; allocates labels for all functions; emits each via `cg_emit_func(i)` | `--monolithic`, `--c`, `--asm` (proven byte-stable) |
+| `emit_module_arm64(mi)` in `a64_codegen.bsm:2269` | Appends to existing `cg_fn_name` filtering by `func_mods[i] == mi`; allocates labels only for new functions; emits this module's subset | Default native binary (incremental path) |
+
+The agent's earlier "defer modules 1..N emit" attempt kept the
+**append** strategy but reordered:
+
+```
+parse 1..N → parse 0 → dispatch → emit_module(0) → emit_module(1) → ... → emit_module(N)
+```
+
+This broke because `cg_fn_name` got synth functions (emitted via
+module 0 first) prepended before the original modules' functions
+got appended. Label IDs shifted vs the previous order, so
+`bo_resolve_calls_arm64()` bound calls to the wrong targets —
+gen1 produced a binary missing `_main`.
+
+The fix is to switch the per-module path from **append** to
+**rebuild-and-slice**: call `cg_bridge_data()` once after
+dispatch to populate `cg_fn_name` with all functions (synths
+included, in `func_cnt` order — the same order monolithic mode
+already uses byte-stably), then have each `emit_module_arm64(i)`
+WALK the existing table and emit the subset where
+`func_mods[i] == i`.
+
+### What this preserves vs what changes
+
+| Aspect | Preserved | Changed |
+|---|---|---|
+| Per-module emit organization (`emit_module_arm64(i)` per `i`) | ✓ | — |
+| `.bug` map per-module function attribution | ✓ | — |
+| `func_mods[]` as the filter primitive | ✓ | — |
+| Source-file granularity in error reporting | ✓ | — |
+| `cg_fn_name` population strategy | — | **append → rebuild-once** |
+| Phase ordering of emit vs dispatch | — | **emit-before-dispatch → emit-after-dispatch** |
+| `lex_module` range source | — | **`diag_file_start` → `mod_bnds`** (interleaved-import aware) |
+| `tok_mod` / `mod_idx` semantics | — | **converges with `diag_mod_idx`** |
+| `flag_incr` / `flag_mono` dual paths in `bpp.bpp:265-414` | — | **removed** (single linear pipeline) |
+| `--monolithic`, `--clean-cache` flags | — | **removed** (no longer meaningful) |
+
+**We are NOT regressing to monolithic mode.** The per-module
+emit structure stays. Only the *function-table population
+strategy* changes (rebuild vs append), and the *phase ordering*
+of emit vs dispatch becomes consistent (always emit-after).
+
+### Phase plan (8 phases, ~320 LOC total, 2-3 sessions)
+
+Each phase is one commit, bootstrap byte-stable, suite green
+(Tonify Rule 37). Risk peaks at P6 — but the upstream phases
+P3+P4+P5 make P6 tractable because `func_mods[]` accuracy is
+fixed first.
+
+| Phase | What | Anchor in source | LOC | Risk |
+|---|---|---|---|---|
+| P1 ✓ | `diag_file_compile_module[]` array + `compile_mod_of()` helper. Initial identity mapping. | shipped `0f68dfa` | done | — |
+| P2 | `_process_file_inline_into` flag in `bpp_import.bsm`. Load call site sets it before recursing. `process_file` reads + consumes it + decides whether to set `diag_file_compile_module[my_mod_idx] = parent_compile_mod` or `= my_mod_idx`. | `bpp_import.bsm:594, 687, 1273-1300` | ~50 | medium |
+| P3 | Switch `lex_module(mi)` from `diag_file_start` range to `mod_bnds`-based partitioning. New shape: walk `mod_bnds` entries, lex tokens where `b.mi == mi` for each boundary range. Resolves the cascade root. | `bpp_lexer.bsm:679-703` | ~40 | medium |
+| P4 | Switch `tok_mod` / `mod_idx` to use `diag_mod_idx` (or alias them). The two converge once `lex_module` is mod_bnds-aware. | `bpp_import.bsm:204-217` (`mod_idx`) + callers | ~20 | low |
+| P5 | Audit consumers of `tok_mod(tok_pos)` and `func_mods[i]`. Verify nested-import functions now get correct `func_mods` value. Key site: `parse_function:1789`. Other sites via grep. | `bpp_parser.bsm:1789` + `grep -rn "tok_mod\|func_mods" src/` | ~30 | medium |
+| P6 | **Tier B core, the risky one.** Reorder `bpp.bpp:265-414` so `emit_module_arm64(i)` for `i in 0..N` runs AFTER `run_dispatch()`. Refactor `emit_module_arm64`: instead of appending to `cg_fn_name`, READ from it (populated once by a single `cg_bridge_data()` call after dispatch). Per-module emit becomes "walk cg_fn_name, emit where func_mods matches". Same change in `x64_codegen.bsm`. | `bpp.bpp:265-414`, `a64_codegen.bsm:2269`, `x64_codegen.bsm` equivalent | ~80 | **high** |
+| P7 | Cleanup: remove `flag_incr` / `flag_mono` dual paths from `bpp.bpp`. Drop `--monolithic` and `--clean-cache` flags. Update `docs/manual/bootstrap_manual.md` "Compiler Flags Reference" + `docs/manual/how_to_dev_b++.md` Cap 48. | `bpp.bpp`, `bpp_args.bsm`, manual chapters | ~50 | low |
+| P8 | Tests + game adoption + bench. `tests/test_load_inline.bpp` + `tests/test_load_vs_import.bpp`. FPS rebuild verifies `__synth_K` in `nm` + `bl job_parallel_for_data` in `objdump`. RTS rebuild smoke. `bench_compile.sh` 5-run delta. | `tests/`, FPS+RTS rebuild | ~50 | low |
+
+### Session 2026-05-22 (later) — P3 scope revision
+
+Empirical finding while attempting P3: **the mod_bnds-aware
+lex_module change cannot ship without simultaneously switching
+the orchestrator parse loop from mi-ascending to topological
+order.**
+
+Why: the orchestrator's `for i in 1..mk-1` (`bpp.bpp:272`)
+iterates modules in diag_files CREATION order (depth-first by
+process_file). Parents get LOWER mi than their imports (mi is
+assigned at process_file entry). With OLD lex_module's
+single-range partitioning (`[diag_file_start(mi), diag_file_start(mi+1))`),
+each module's lex range silently includes content of its
+adjacent sibling/child files in outbuf — an OVER-LEX side
+effect that covered the parser's "parent references child's
+types before child is parsed" gap.
+
+Switch to mod_bnds-aware lex (correct per-mi partitioning) +
+keep mi-asc parse order → bootstrap fails with `unknown type
+'ChipPrimitives'`-shape errors at the FIRST module that
+references a struct from its own import.
+
+Switch to topological order alone (with OLD lex) → also
+breaks because OLD lex over-includes sibling content; iterating
+in topo order makes those over-lexed tokens land in the wrong
+parse_module pass.
+
+The two changes must land together. Single-commit P3
+deliverable shipped here covers ONLY the infrastructure
+(abs_line in ModBnd + public accessors). The combined
+lex+orchestrator change moves to a follow-up commit ("P3
+combined") with both pieces landing atomically.
+
+### Why P3+P4+P5 must land BEFORE P6
+
+`emit_module_arm64(mi)` filters by `func_mods[i] == mi`. If
+`func_mods[]` is still wrong (the bug today), the filter picks
+the wrong functions even after rebuild-via-cg_bridge_data.
+P3+P4+P5 fix `func_mods[]` accuracy. After that, P6's "rebuild
+once + per-module emit reads the table" works as intended.
+
+Reverse order would be: rebuild-once works correctly but
+filtered-emit still misses functions because their `func_mods`
+is wrong. The bug would reproduce at a later stage.
+
+### Acceptance gates (per Tonify Rule 37, per phase)
+
+```
+1. Bootstrap byte-stable: g1 → g2 → g3, cmp g2 g3 (g1 may differ
+   in P3/P4/P5/P6 due to mod attribution changes — 1-cycle
+   oscillation acceptable; g2 == g3 mandatory).
+2. Native suite: 179/0/12 (no regression in pass/fail count).
+3. C-emit suite: 144/0/47 (no regression).
+4. bench_compile.sh: bootstrap delta within ±5%. Larger budget
+   than usual because P6 reorders the entire emit phase.
+5. (P8 only) FPS empirical: `nm /tmp/fps_w | grep __synth` shows
+   the synth functions, `objdump -d /tmp/fps_w | grep "bl.*job_parallel_for_data"`
+   shows the host body calling the worker dispatcher.
+```
+
+### What this sidequest is NOT
+
+- **Not threading the compiler.** Single-thread stays. Multi-thread
+  is its own arc, behind significant bench-justified pressure.
+- **Not adding generics / monomorphization.** Future arc.
+- **Not bringing back the `.bo` cache.** Future arc; this design
+  prepares for it cleanly (per-module emit + post-dispatch
+  invariant = right shape for cache key by `(content_hash, dispatch_input_hash)`).
+- **Not changing namespace semantics.** Globally-visible
+  functions stay globally visible.
+
+### Commit message style (for the implementing agent)
+
+Mirror the S4 / outlining / autovec arcs:
+
+```
+load/import P2: process_file inline-mode flag
+
+P2 of the load/import distinction sidequest (see
+docs/plans/sidequest_load_import_distinction.md "Design lock"
+section). Adds _process_file_inline_into static flag to
+bpp_import.bsm. When `load` keyword is detected at the
+check_file_import site, the flag is set before process_file
+recurses. process_file reads + consumes the flag; if set, the
+new diag_files entry's compile_module index points to parent's
+compile_module (= reuses parent), instead of pointing at itself
+(= new module).
+
+Bootstrap byte-stable: gen1 == gen2 == gen3.
+Suite: 179/0/12 native + 144/0/47 C-emit, no regression.
+No game behavior change yet (P3+ unlock it).
+```
+
