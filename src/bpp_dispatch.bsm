@@ -2684,8 +2684,24 @@ static _av_is_loop_invariant(nd, loop_var_p) {
 // pattern ordinal (1) on match, 0 on miss. Caller invokes once
 // per body statement; the loop is P1-eligible only when EVERY
 // statement matches (and body_cnt > 0).
+//
+// Type gate: the SIMD lowering target uses `vec_*_ps` packed
+// floats (4 × 32-bit float per register on SSE2 / NEON). To
+// qualify, the store hint must encode BASE_FLOAT and the slice
+// must be SL_HALF (32-bit element width). 64-bit word slots
+// (default `: word` / no annotation) would need separate
+// integer-SIMD builtins (PADDQ family on SSE2, VADDQ on NEON)
+// which the current `vec_*` family doesn't cover. Bytes /
+// quarters / sub-word floats are also outside the current
+// vector width.
+//
+// The type info comes from B++'s existing slice + base
+// inference — programmer doesn't add new annotations; declaring
+// `: half` on the pointer or field flows the hint into the
+// T_MEMST.c slot the parser fills.
 static _av_match_p1_stmt(stmt, loop_var_p) {
     auto st: Node, rhs: Node, ld: Node;
+    auto hint;
     if (stmt == 0) { return 0; }
     st = stmt;
     if (st.ntype != T_MEMST) { return 0; }
@@ -2700,6 +2716,12 @@ static _av_match_p1_stmt(stmt, loop_var_p) {
     if (_av_addr_same(st.a, ld.a) == 0) { return 0; }
     // Other operand must be loop-invariant.
     if (_av_is_loop_invariant(rhs.c, loop_var_p) == 0) { return 0; }
+    // Type gate: store hint must be 32-bit float (BASE_FLOAT +
+    // SL_HALF) — the element type that the existing `vec_*_ps`
+    // family targets.
+    hint = st.c;
+    if (is_float_type(hint) == 0) { return 0; }
+    if (ty_slice(hint) != SL_HALF) { return 0; }
     return 1;
 }
 
