@@ -1,0 +1,122 @@
+// bench_compose.bpp — Measure outlining × autovec composition.
+//
+// Three forms of the same workload:
+//   1. SERIAL    — descending, single-thread scalar (baseline).
+//   2. PARALLEL  — outlining catches via @safe + global bound +
+//                  per-iter helper. No SIMD inside (helper call
+//                  defeats autovec).
+//   3. COMPOSE   — both fire. Simple inline body that the
+//                  matcher catches. dt is caller-frame =
+//                  outlining captures. half-float field +
+//                  single T_MEMST = autovec match.
+//
+// Workload: N=1M Cell structs (half-float field), K=100 rounds
+// of `arr[i].v = arr[i].v * dt` where dt is a caller-frame
+// constant. Compose: 8 cores × 4 SIMD lanes target = up to 32x.
+
+import "bpp_beat.bsm";
+import "bpp_io.bsm";
+import "bpp_job.bsm";
+
+const N = 1000000;
+const K = 100;
+const NUM_WORKERS = 8;
+
+struct Cell {
+    v: half float,
+}
+
+global cells;
+
+// FORM 1 — SERIAL (descending defeats both gates).
+static void serial_once(dt: half float) {
+    auto i;
+    for (i = N - 1; i >= 0; i--) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * dt;
+    }
+}
+
+static void run_serial(rounds, dt: half float) {
+    auto k;
+    for (k = 0; k < rounds; k++) { serial_once(dt); }
+}
+
+// FORM 2 — COMPOSE: simple inline body that matches both
+// outlining (dt is caller-frame capture) and autovec (single
+// T_MEMST half-float).
+static void compose_once(dt: half float) @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * dt;
+    }
+}
+
+static void run_compose(rounds, dt: half float) {
+    auto k;
+    for (k = 0; k < rounds; k++) { compose_once(dt); }
+}
+
+static void print_timing(label, us) {
+    auto ms, frac;
+    ms = us / 1000;
+    frac = us % 1000;
+    put(label);
+    putchar(' ');
+    put(ms);
+    putchar('.');
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    put(frac);
+    putmsg(" ms");
+}
+
+static void reseed() {
+    auto i;
+    auto one: half float;
+    one = 1.0;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = one;
+    }
+}
+
+main() {
+    auto t0, t_serial, t_compose;
+    auto dt: half float;
+
+    putmsg("--- BENCH COMPOSE (outlining x autovec) ---");
+    putmsg("Workload: N=1M cells x K=100 mul-by-dt rounds, 8 workers.");
+    putmsg("");
+
+    cells = malloc(N * 4);
+    job_init(NUM_WORKERS);
+    dt = 1.0;
+
+    reseed();
+    t0 = beat_now_us();
+    run_serial(K, dt);
+    t_serial = beat_now_us() - t0;
+    print_timing("SERIAL:    ", t_serial);
+
+    reseed();
+    t0 = beat_now_us();
+    run_compose(K, dt);
+    t_compose = beat_now_us() - t0;
+    print_timing("COMPOSE:   ", t_compose);
+
+    putmsg("");
+    if (t_compose > 0) {
+        put("COMPOSE speedup vs SERIAL: ");
+        put(t_serial / t_compose);
+        putmsg("x");
+    }
+
+    free(cells);
+    job_shutdown();
+    return 0;
+}

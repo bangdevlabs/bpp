@@ -4556,17 +4556,68 @@ void synthesize_loop_fn() {
             // dispatch once we add a chunked variant of
             // `job_parallel_for` (today it submits per-iter).
             param_p  = loop_var_p;
-            auto _cap_idx, _orig_body, _orig_cnt;
+            auto _cap_idx, _orig_body, _orig_cnt, _av_p;
             _orig_body = wh.b;
             _orig_cnt  = wh.c;
             _cap_idx = arr_get(dispatch_cand_capture_idx, i);
+            _av_p = arr_get(_av_pattern, i);
             if (_cap_idx >= 0) {
                 _outline_restore_captures_from_struct(_cap_idx);
-                _orig_body = _outline_clone_body_with_captures(
-                    wh.b, wh.c, _cap_idx);
-                // Wrap in range-loop only for outlining case.
-                body_ptr = _av_make_range_synth_body(loop_var_p, _orig_body, _orig_cnt);
-                body_cnt = 1;
+                if (_av_p > 0) {
+                    // P6 Phase 2 (2026-05-22) — COMPOSE outlining +
+                    // autovec. Range-synth body becomes a T_BLOCK
+                    // with [vector_while, scalar_tail_while]:
+                    //
+                    //   while (i + 4 <= _end) { vec_body; i += 4; }
+                    //   while (i < _end)      { scalar_body; i++; }
+                    //
+                    // SIMD lowering runs FIRST (on the original
+                    // body's T_VAR(arr) refs), then capture
+                    // substitution rewrites those refs to
+                    // T_MEMLD(_outline_cap_ptr + offset). The
+                    // recursion into T_CALL / T_BLOCK in
+                    // ast_clone_subst (added 2026-05-22 outlining
+                    // P6) handles the vec_* T_CALL nodes that
+                    // P5's `_av_lower_stmt` produces.
+                    auto _simd_body, _simd_cnt_p, _simd_cnt;
+                    auto _vec_while, _tail_while, _block_stmts;
+                    auto _block_node: Node, _block_arr;
+                    auto _end_var: Node;
+                    _simd_body = malloc(wh.c * 8);
+                    _simd_cnt_p = malloc(8);
+                    *_simd_cnt_p = 0;
+                    _av_build_simd_body(wh.b, wh.c, _av_p,
+                        _simd_body, _simd_cnt_p);
+                    _simd_cnt = *_simd_cnt_p;
+                    _end_var = _dsp_make_var(_av_get_end_param_name());
+                    _vec_while = _av_build_vector_loop(loop_var_p,
+                        _end_var, _simd_body, _simd_cnt);
+                    _end_var = _dsp_make_var(_av_get_end_param_name());
+                    _tail_while = _av_build_scalar_tail(loop_var_p,
+                        _end_var, wh.b, wh.c);
+                    _block_arr = malloc(16);
+                    *_block_arr = _vec_while;
+                    *(_block_arr + 8) = _tail_while;
+                    _block_node = make_node(T_BLOCK);
+                    _block_node.b = _block_arr;
+                    _block_node.c = 2;
+                    // Now apply capture substitution to the whole
+                    // block. The cloner recurses into T_BLOCK +
+                    // T_WHILE bodies (added P6 outlining fix) and
+                    // into T_CALL args (vec_load4 / vec_splat4 /
+                    // vec_store4 args contain T_VAR(captures)).
+                    _block_stmts = malloc(8);
+                    *_block_stmts = _block_node;
+                    body_ptr = _outline_clone_body_with_captures(
+                        _block_stmts, 1, _cap_idx);
+                    body_cnt = 1;
+                } else {
+                    _orig_body = _outline_clone_body_with_captures(
+                        wh.b, wh.c, _cap_idx);
+                    body_ptr = _av_make_range_synth_body(
+                        loop_var_p, _orig_body, _orig_cnt);
+                    body_cnt = 1;
+                }
             } else {
                 // Standard MAP — original body verbatim, per-iter.
                 body_ptr = _orig_body;
