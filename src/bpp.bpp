@@ -268,14 +268,14 @@ main() {
         if (mode == 2) { a64_bin_mode = 1; a64_mod_init(); }
         if (mode == 3) { x64_mod_init(); }
 
-        // P3+P4+P6 combined: iterate modules in TOPOLOGICAL order
-        // (mod_topo) instead of diag_files creation order. Topo
-        // order guarantees deps parse before their importers. With
-        // mod_bnds-aware lex_module (P3) and diag_mod_idx-based
-        // tok_mod (P4), func_mods is correctly attributed. The
-        // BSYS_* rename (commit `dca7ead`) eliminated the
-        // cross-target const collision that this attribution change
-        // would otherwise have exposed.
+        // P3+P4 + P6: iterate modules in TOPOLOGICAL order
+        // (mod_topo). PARSE only here — defer all per-module emit
+        // until AFTER the dispatch pipeline runs (further down).
+        // Without this deferral, host functions get emitted with
+        // their pre-rewrite scalar bodies — dispatch's rewrites
+        // (outlining T_BLOCK with publish + job_parallel_for_data,
+        // autovec SIMD lowering) never reach the binary, synth
+        // functions created post-emit get orphaned.
         auto _topo_n, _mi;
         _topo_n = arr_len(mod_topo);
         i = 0;
@@ -287,8 +287,6 @@ main() {
                 infer_module(_mi);
                 if (mode == 2) { cg_bind_startup_syms(); }
                 if (mode == 3) { cg_bind_startup_syms(); }
-                if (mode == 2) { emit_module_arm64(_mi); }
-                if (mode == 3) { emit_module_x86_64(_mi); }
             }
             i = i + 1;
         }
@@ -333,6 +331,32 @@ main() {
             run_dispatch();
             run_validate();
             diag_check_errors();
+
+            // P6: emit ALL modules now, in topo order, AFTER the
+            // dispatch pipeline. cg_fn_name accumulates across the
+            // emit_module calls just like the legacy mi-asc loop
+            // did, except every host function body has its
+            // dispatch-time rewrites applied and every synth
+            // function is present in funcs[]. mark_reachable still
+            // has the latent miss-of-471-functions bug — temporarily
+            // suppress the lazy filter so per-module emit doesn't
+            // prune them (matches OLD per-module-emit-before-
+            // mark_reachable behaviour, which already worked).
+            auto _saved_lazy;
+            _saved_lazy = _lazy_emit_ready;
+            _lazy_emit_ready = 0;
+            i = 0;
+            while (i < _topo_n) {
+                _mi = arr_get(mod_topo, i);
+                if (_mi != 0) {
+                    if (mode == 2) { emit_module_arm64(_mi); }
+                    if (mode == 3) { emit_module_x86_64(_mi); }
+                }
+                i = i + 1;
+            }
+            // Restore lazy filter for module 0's emit, matching
+            // OLD `emit_module_arm64(0)` semantics.
+            _lazy_emit_ready = _saved_lazy;
 
             if (mode == 2) {
                 fn_s = arr_len(cg_fn_name);
