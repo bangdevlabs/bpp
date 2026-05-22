@@ -248,6 +248,75 @@ all consumers — easy to miss one).
     inline-mode's parent compile module. For game code this
     is module 0 (entry .bpp).
 
+## Session 2026-05-22 — investigation findings
+
+Attempted P2 (load inline flag) + P3 (parser uses
+`compile_mod_of`) implementation discovered two architectural
+issues deeper than the original scope assumed:
+
+**1. `tok_mod` / `mod_idx` known-broken for nested imports.**
+Existing comment in `bpp_parser.bsm:45`: *"without relying on
+tok_mod() which returns incorrect module attribution for
+module 0 (its content sits at mod0_real_start, past all
+auto-injected modules)"*. The same issue applies to any
+module with nested imports — `mod_idx` returns the diag_files
+idx whose `.start <= src_off`, but when a module imports
+others recursively, its content gets split into chunks. The
+later chunks have `.start` ≥ next file's start, so binary
+search returns the wrong (nested) module.
+
+Empirical confirmation: compiling FPS, `tok_mod` for
+`wolf_ai_tick_cooldowns` returns 39 (some nested import's
+idx), not 37 (ai.bsm's actual idx). `compile_mod_of(39)`
+returns 39 (identity, since P2 only set the entry for ai.bsm
+at idx 37).
+
+**2. `lex_module(i)` partitions by a single contiguous range
+`[diag_files[i].start, diag_files[i+1].start)`** — doesn't
+account for the file's content RESUMING after nested imports
+return. The later content gets lexed under whichever module
+happens to own that outbuf range, not the original file's
+module.
+
+The CORRECT semantic primitive is `diag_mod_idx` (uses
+`mod_bnds` boundary records which DO track interleaved-import
+correctly). But switching parsers + per-module emit
+attribution to use `mod_bnds`-based lookup is substantially
+more work than the original scope.
+
+**Deferred-emit approach attempted and reverted:** changed
+the orchestrator to defer modules 1..N emit until after
+dispatch. Bootstrap broke (gen1 produced an incomplete binary
+missing `_main`). The reason: `emit_module_arm64` has
+ordering-sensitive interactions with `cg_bridge_data` +
+`cg_fn_name` accumulation + label allocation that need
+detailed sequencing. Not safe to defer without redesigning
+those interactions.
+
+## Next-session scope (revised)
+
+The architectural fix is bigger than this sidequest's
+original ~180 LOC estimate. Real scope:
+
+  * Either: switch parser + emit-attribution to use
+    `diag_mod_idx` (mod_bnds-based) instead of `tok_mod` /
+    `mod_idx`. Then the inline-load mapping can apply
+    cleanly. ~150-200 LOC, touches parser + several callers.
+  * OR: redesign incremental-emit ordering. Decouple parse
+    from emit. Track which modules need re-emit after
+    dispatch. ~200-300 LOC, touches orchestrator + module
+    metadata.
+
+Both require careful bootstrap-verify per phase. Better to
+treat as a 2-3 session arc with proper design checkpoints
+than a quick fix.
+
+**Current state preserved:**
+  * `0f68dfa` — P1 array infrastructure (committed, harmless
+    identity mapping until consumers wired up).
+  * `38fd075` — Original design doc.
+  * This update — findings honest record.
+
 ## Cross-references
 
   * `docs/plans/sidequest_autovec_b4_completion.md` — sidequest
