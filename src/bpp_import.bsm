@@ -593,6 +593,19 @@ static find_file(base_off, base_len, name_off, name_len) {
 // entry file's directory only (project-local, no engine fallback).
 static auto _import_is_load;
 
+// P2 of load/import distinction (2026-05-22). Set by the load
+// call site BEFORE recursing into process_file. Read + consumed
+// at the top of process_file to flip the new diag_files entry's
+// `diag_file_compile_module[]` value from "self" (default for
+// `import`) to "parent's compile module" (for `load`-inline).
+//
+// One flag is sufficient: process_file consumes it on entry, and
+// the loaded file's own children (its `load` / `import` lines)
+// either set the flag again before THEIR recursion (load nested
+// inside load = still inlined to outermost parent) or leave it 0
+// (import inside load = creates new module like any import).
+static auto _process_file_inline_into;
+
 static check_file_import(loff, llen) {
     auto p, q, ch, name_start, name_len;
     p = 0;
@@ -751,6 +764,24 @@ void process_file(path_off, path_len) {
     buf_copy(fname_buf + fname_pos, fbuf + my_path, path_len);
     fname_pos += path_len;
     auto _df_idx, _df: DiagFile;
+    // P2: capture inline-mode flag BEFORE any recursion below
+    // resets it. Per-call: each process_file invocation reads its
+    // own flag value; the recursion's own children get their normal
+    // module-creation behaviour unless they're loads too.
+    auto _inline_mode, _parent_cm;
+    _inline_mode = _process_file_inline_into;
+    _process_file_inline_into = 0;
+    _parent_cm = 0;
+    if (_inline_mode != 0) {
+        // Parent's compile module = the latest entry in
+        // diag_file_compile_module BEFORE we add our own. For
+        // a top-level entry .bpp this is 0; for nested loads
+        // this propagates the outermost parent's compile module.
+        if (arr_len(diag_file_compile_module) > 0) {
+            _parent_cm = arr_get(diag_file_compile_module,
+                arr_len(diag_file_compile_module) - 1);
+        }
+    }
     _df_idx = arr_struct_alloc(diag_files);
     _df = arr_struct_at(diag_files, _df_idx);
     _df.start      = outbuf_len;
@@ -759,10 +790,19 @@ void process_file(path_off, path_len) {
     // Hash the file content for cache invalidation.
     mod_hashes = arr_push(mod_hashes, fnv1a(content_buf, fsize));
     my_mod_idx = arr_struct_count(diag_files) - 1;
-    // Initial mapping: each source file IS its own compile module.
-    // P2 of this sidequest will override this entry for inline-mode
-    // `load` to point at the parent's compile module.
-    diag_file_compile_module = arr_push(diag_file_compile_module, my_mod_idx);
+    // P2: compile module attribution.
+    //   * Default (entry / import): self — each diag_files entry
+    //     is its own compile module (identity mapping).
+    //   * Inline load: parent's compile module, captured above.
+    //     The loaded file's source-file entry stays (preserves
+    //     bug-debugger line attribution at `ai.bsm:42`-style),
+    //     but its functions get attributed to parent for the
+    //     dispatch / emit pipeline.
+    if (_inline_mode != 0) {
+        diag_file_compile_module = arr_push(diag_file_compile_module, _parent_cm);
+    } else {
+        diag_file_compile_module = arr_push(diag_file_compile_module, my_mod_idx);
+    }
     // Tracks how many SOURCE-FILE lines of THIS file have been
     // processed so far. Increments once per iteration of the line
     // loop below (whether the line is an import or a non-import
@@ -1292,17 +1332,30 @@ void process_file(path_off, path_len) {
                 // every affected dep edge to module 0 (the entry file). This bug
                 // was latent until import trees got deep enough (e.g. stbmaestro
                 // → stbgame) to reliably clobber pathbuf during recursion.
-                auto saved_path;
+                auto saved_path, _was_load;
                 saved_path = fbuf_top;
                 buf_copy(fbuf + saved_path, pathbuf, plen);
                 fbuf_top += plen;
 
+                // P2: snapshot _import_is_load BEFORE the recurse —
+                // the recursed process_file's own check_file_import
+                // calls will clobber the static. Used to decide
+                // whether to skip the dep edge for inline loads.
+                _was_load = _import_is_load;
+                if (_was_load != 0) {
+                    _process_file_inline_into = 1;
+                }
                 process_file(pathbuf, plen);
                 _record_bnd(my_mod_idx, outbuf_lines - _source_line);
 
-                // Record dependency edge: this module imports the resolved module.
-                dep_from = arr_push(dep_from, my_mod_idx);
-                dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + saved_path, plen));
+                // P2: skip the dep edge for inline loads — the loaded
+                // file's content is part of THIS file's compile module,
+                // not a separate dep target. (`import` still records
+                // edges normally.)
+                if (_was_load == 0) {
+                    dep_from = arr_push(dep_from, my_mod_idx);
+                    dep_to = arr_push(dep_to, mod_idx_by_hash(fbuf + saved_path, plen));
+                }
 
                 // Restore fbuf stack so the next iteration's saved_path reuses
                 // the same slot instead of growing the stack on every import.
