@@ -38,8 +38,30 @@ Last refresh: 2026-05-17.
   palette post-process.
 - **`fxlab` v2+** — auto-discover presets, live `.metal` editor,
   effect-chain reorder UI. Ships when v1 reveals real signal.
-- **x86_64 perf parity on Linux** — restore B1+B2 after `bug`
-  ships Linux/x86_64 (gdbserver backend needed first).
+- **Linux x86_64 health restoration sidequest** — multi-item
+  arc, widened 2026-05-21 after a cheap-discovery pass for S4
+  cost-model inliner. ARM64 stays the reference target for
+  every active perf sidequest until this closes.
+    1. ✅ `pthread_kill` cross-compile fail — FIXED 2026-05-21
+       (`d1f5457`), 14-LOC stub in `_core_linux.bsm`.
+    2. ⚠️ `bpp_lin` runtime SIGSEGV on Linux x86_64 — newly
+       discovered. Cross-compiled `bpp_lin` ELF runs cleanly
+       for hello-world programs but segfaults at startup
+       when self-hosting. strace shows the binary oscillating
+       between "x32 mode" and "64 bit mode" before the
+       fault — likely entry-point or runtime-init regression
+       accumulated between 2026-05-02 and 2026-05-21. Bisect
+       on commits in that window is the next step.
+    3. ⏸️ Phase B1 (freelist register alloc) x86_64 emission
+       bug — disabled since 2026-04-15 (`19da538`). Manifests
+       under self-host on a fresh `_x64_has_call` recursion
+       path. Untested since (items 1 + 2 block re-evaluation).
+    4. ⏸️ Phase B2 (inline `: base` helpers) x86_64 path —
+       disabled same commit, paired with B1.
+  Items 3 + 4 cannot be re-evaluated until 1 + 2 are clean.
+  S4 (cost-model inliner) inherits the ARM64-only posture for
+  the same reason; see `docs/plans/sidequest_cost_model_inliner.md`
+  for the explicit deferral note.
 - **Host-aware compiler + install** — `bpp` auto-detects host
   OS+chip; defaults match host instead of always macOS arm64.
 - **C-emitter `var T` parity** — pick uniform storage strategy

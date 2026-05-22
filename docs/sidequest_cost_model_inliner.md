@@ -1,14 +1,28 @@
 # Sidequest — Cost-model inliner (S4)
 
-**Status:** DESIGN-LOCKED 2026-05-21, ready-to-execute.
+**Status:** IN PROGRESS 2026-05-21. P0a + P1 + P2 + P3a
+shipped (loop_depth + cost function + threshold function +
+unified classifier). P3b next.
+
+**Target backend:** **ARM64 only.** The x86_64 backend has had
+Phase B2 disabled since 2026-04-15 (`19da538`) pending
+diagnosis of an emission bug under self-host; a separate
+Linux x86_64 runtime regression surfaced 2026-05-21 during S4
+discovery (`bpp_lin` segfaults at startup). Both feed into the
+"Linux x86_64 health restoration" sidequest in `docs/todo.md`.
+S4 ships ARM64-only until that arc closes — at which point
+both Phase B2 and S4's multi-statement splice activate on
+x86_64 in one go. The classifier (P3a) is chip-neutral; only
+the per-chip splice point in `*/codegen.bsm` files diverges.
+
 **Trigger:** Hot-path opt arc S1→S3k (closed 2026-05-21) shipped
 ~41% bootstrap improvement via mechanical `cg_builtin_dispatch`
 inlining of trivial-body functions. The remaining wins on
 real-game workloads need a generalised inliner with a cost
 model — the dispatch lane has no shared register state across
 primitive calls, so anything beyond a single arithmetic op
-loses to stack-juggling overhead (see S3g revert in
-`docs/sidequest_compiler_hotpath_opt.md`).
+loses to stack-juggling overhead (see S3g revert in the
+hot-path arc closure doc, now archived under `legacy_docs/`).
 
 **Benchmark anchor:** `examples/tablah.bpp` (clean API) ~49ms
 vs `examples/tablah_opt.bpp` (hand-unrolled xorshift64) ~40ms
