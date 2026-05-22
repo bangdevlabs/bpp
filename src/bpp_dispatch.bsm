@@ -2447,6 +2447,158 @@ static _outline_synth_capture_struct() {
     return sidx;
 }
 
+// Reserved name for the capture-struct pointer parameter in
+// synthesised worker functions. All outlining sites share the same
+// parameter name (each synth function has its own slot, just one
+// name in source). Lazy-initialised at first use to avoid touching
+// vbuf at startup before the parser has run.
+static auto _outline_cap_ptr_name;
+
+static _outline_get_cap_ptr_name() {
+    if (_outline_cap_ptr_name == 0) {
+        _outline_cap_ptr_name = _dsp_pack_cstr("_cap_ptr");
+    }
+    return _outline_cap_ptr_name;
+}
+
+// Build a T_LIT node for an integer value by writing the decimal
+// digits to vbuf and packing. Mirror of parser's static
+// `make_int_lit` — replicated here because the parser keeps it
+// private. Returns a fresh node.
+static _outline_make_int_lit(val) {
+    auto start, tmp, digit, i, j, t;
+    auto node: Node;
+    start = vbuf_pos;
+    if (val == 0) {
+        poke(vbuf + vbuf_pos, '0');
+        vbuf_pos++;
+    } else {
+        tmp = val;
+        while (tmp > 0) {
+            digit = tmp % 10;
+            poke(vbuf + vbuf_pos, '0' + digit);
+            vbuf_pos++;
+            tmp /= 10;
+        }
+        // Reverse the digits in place.
+        i = start;
+        j = vbuf_pos - 1;
+        while (i < j) {
+            t = peek(vbuf + i);
+            poke(vbuf + i, peek(vbuf + j));
+            poke(vbuf + j, t);
+            i++;
+            j--;
+        }
+    }
+    node = make_node(T_LIT);
+    node.a = pack(start, vbuf_pos - start);
+    node.b = SHAPE_INT;
+    return node;
+}
+
+// Build a one-character packed operator. Mirror of parser's
+// `make_plus_op` (also static there). Lazy-cached single-char
+// operators land in vbuf at the first call and the same packed
+// reference is reused — but the parser allocates a new entry each
+// time it builds an op, so duplicating the bytes here is consistent
+// with the existing convention (the codegen compares operators
+// byte-wise via `_fdc_op_char`, not pointer-wise).
+static _outline_make_op_char(ch) {
+    auto start;
+    start = vbuf_pos;
+    poke(vbuf + vbuf_pos, ch);
+    vbuf_pos++;
+    return pack(start, 1);
+}
+
+// Build a synthetic `T_MEMLD(*(_cap_ptr + offset_of(field)))` node
+// that — when emit_node sees it — produces a load from the
+// capture-struct field. Used as the substitution target when
+// `ast_clone_subst` rewrites the synth body.
+//
+// Shape mirrors the parser's `resolve_dot` (bpp_parser.bsm:2928)
+// output exactly so codegen treats this no differently from a
+// hand-written `cap.field` source-level access.
+static _outline_make_field_access(sidx, field_p) {
+    auto offset, op_plus, off_node, ptr_node: Node, mem_node: Node;
+    auto var_node: Node;
+    offset = get_field_offset(sidx, field_p);
+    if (offset < 0) { return 0; }
+
+    var_node = make_node(T_VAR);
+    var_node.a = _outline_get_cap_ptr_name();
+
+    off_node = _outline_make_int_lit(offset);
+
+    op_plus = _outline_make_op_char('+');
+    ptr_node = make_node(T_BINOP);
+    ptr_node.a = op_plus;
+    ptr_node.b = var_node;
+    ptr_node.c = off_node;
+
+    mem_node = make_node(T_MEMLD);
+    mem_node.a = ptr_node;
+    mem_node.b = 0;     // default field hint (full word)
+    return mem_node;
+}
+
+// Build the (names, replacements) arrays that `ast_clone_subst`
+// consumes. For each captured name, the replacement is a freshly-
+// minted `T_MEMLD(_cap_ptr + offset)` node. Caller pre-allocates
+// the two output buffers (sized to `arr_len(_fdc_captures)`).
+//
+// Each (name, mem_node) pair is independent — the cloner shares the
+// mem_node across every reference to the captured name in the body,
+// but emit_node only reads node fields so multi-reference is safe.
+static _outline_build_subst_map(sidx, params_out, args_out) {
+    auto i, name, mem_node;
+    i = 0;
+    while (i < arr_len(_fdc_captures)) {
+        name = arr_get(_fdc_captures, i);
+        mem_node = _outline_make_field_access(sidx, name);
+        *(params_out + i * 8) = name;
+        *(args_out + i * 8) = mem_node;
+        i++;
+    }
+    return arr_len(_fdc_captures);
+}
+
+// Clone every statement in a body array, substituting captured names
+// with the corresponding capture-struct field access. Returns a new
+// body_arr that the synth function can use as its `FN_BODY`. Allocates
+// a fresh body_arr buffer; the caller owns it.
+//
+// When `sidx < 0` (no captures), returns the original `body_arr`
+// untouched — saves the clone work for the common path.
+//
+// P3 of the outlining sidequest. Synth-time use; not invoked until
+// P6 wires the gate-6 relax that produces non-empty `_fdc_captures`
+// for accepted candidates.
+static _outline_clone_body_with_captures(body_arr, body_cnt, sidx) {
+    auto params_buf, args_buf, pcnt, i;
+    auto cloned_body, stmt;
+    if (sidx < 0) { return body_arr; }
+    if (arr_len(_fdc_captures) == 0) { return body_arr; }
+
+    params_buf = buf_word(arr_len(_fdc_captures) + 1);
+    args_buf = buf_word(arr_len(_fdc_captures) + 1);
+    pcnt = _outline_build_subst_map(sidx, params_buf, args_buf);
+
+    cloned_body = buf_word(body_cnt + 1);
+    i = 0;
+    while (i < body_cnt) {
+        stmt = body_arr[i];
+        if (stmt == 0) {
+            cloned_body[i] = 0;
+        } else {
+            cloned_body[i] = ast_clone_subst(stmt, params_buf, pcnt, args_buf);
+        }
+        i++;
+    }
+    return cloned_body;
+}
+
 // Return 1 if the packed name refers to a safe target inside a
 // candidate loop body: the induction variable, a loop-local auto, or
 // a global whose storage class is GLOB_EXTRN / GLOB_GLOBAL. Function
