@@ -11383,3 +11383,206 @@ Total combined                     ~35x potential
 Autovec is a chip-level arc (a64 NEON works, x64 SSE/AVX
 incomplete). Likely 2-3x outlining's LOC, multi-session. Opens
 as a new sidequest doc when it starts.
+
+## 2026-05-22 (later) — Autovec arc CLOSED + multi-module bug surfaced
+
+The autovec sidequest landed end-to-end same day the design
+doc opened. Single-module compose-multiplicatively measures
+6x speedup on `bench_compose.bpp` (cores × lanes, memory-
+bandwidth-bound for that workload — compute-bound workloads
+approach the ~32x theoretical ceiling). But the first attempt
+at REAL GAME ADOPTION (FPS `wolf_ai_tick_cooldowns`) exposed
+a latent multi-module compile bug that's been there since
+outlining shipped. Opened the architectural follow-up
+sidequest.
+
+### Autovec phase plan as shipped
+
+  * P1 (`812057f`) — C emitter SIMD path. `__m128` typedef +
+    11 `vec_*_ps` wrapper macros (SSE2 + NEON branches). Three
+    `: double`-using tests promoted from SKIP to PASS in
+    C-emit suite.
+  * P2 (`376ff2f` + `05f393b`) — Pattern matcher P1
+    (`arr[i] = arr[i] OP literal_or_invariant`). Type gate
+    via BASE_FLOAT + SL_HALF on store hint (uses B++'s
+    existing slice + base inference; no new annotation per
+    Rule 4).
+  * P3 (`c9f1d7a`) — Pattern matcher P2 (multi-pointer
+    `dst[i] = lhs[i] OP rhs[i]`) + loosened classifier
+    (multi-statement bodies with pointer-setup T_DECL /
+    T_ASSIGN pre-amble + one T_MEMST as the SIMD-able store).
+  * P4 SKIPPED — aligned-memory hint. Annotation form
+    violates Rule 4; tracking form is 4x the LOC for ~0%
+    measurable gain on modern chips (MOVAPS / MOVUPS
+    indistinguishable when data IS aligned).
+  * P5 (`4bc79dd`) — Code emission. Vector loop
+    (`i + 4 <= N`) + scalar tail (`i < N`). Measured 3.94x
+    speedup on `bench_autovec.bpp` (close to the 4-lane
+    ceiling).
+  * P6 Phase 1 (`a2d5fdf`) — Range-synth migration. Synth
+    signature changes from `(idx)` to `(loop_var, _end)`;
+    `_outline_chunk_worker` calls synth ONCE per worker with
+    `(start, end)` instead of N per-iter calls. Sets up
+    Phase 2's compose.
+  * P6 Phase 2 (`2384b46`) — Compose outlining + autovec
+    inside synth body. When both gates accept, synth body
+    becomes T_BLOCK with vector while + scalar tail loops,
+    both with capture substitution applied through
+    `ast_clone_subst`'s T_CALL recursion. Measured 6x on
+    `bench_compose.bpp` (workload memory-bandwidth-bound;
+    compute-bound workloads scale higher).
+
+### The internal API contract — explicit at top of bpp_job.bsm
+
+Three SHAPES of synth function coexist after P6 Phase 1.
+Mixing them silently miscompiles because `call(fn, args...)`
+is variadic. Documented prominently at the top of bpp_job.bsm:
+
+  * SHAPE A — Reduction synth: 1 param (cid). Runtime
+    `job_parallel_reduce`.
+  * SHAPE B — Standard MAP synth (no captures): 1 param
+    (idx). Runtime `job_parallel_for`, per-iter dispatch.
+  * SHAPE C — Outlining range synth (with captures): 2 params
+    `(loop_var, _end)`. Runtime `job_parallel_for_data` calls
+    chunk_worker, which calls synth ONCE per worker. Body
+    wraps original in `while (loop_var < _end) { ...;
+    loop_var++; }`. With P6 Phase 2, the wrap becomes T_BLOCK
+    of vector + scalar tail when autovec also matches.
+
+This contract was DOCUMENTED only after a real bug hit it
+mid-development: the serial-fallback paths of
+`job_parallel_for_data` still passed `(idx)` after the synth
+migrated to `(start, end)`, causing infinite loops with
+garbage `end` values. Bug debugger pinpointed it inside
+`_scale_one` with `i = 2046` (where i should max at 31).
+Fix: serial fallbacks now pass `(0, n)` matching SHAPE C.
+
+### FPS adoption attempted (and the deep bug)
+
+`games/fps/ai.bsm` `wolf_ai_tick_cooldowns` (commit `f09e5ad`)
+was structurally a perfect compose candidate:
+
+  * `cooldown: half float` field (BASE_FLOAT + SL_HALF) —
+    autovec matcher's type gate.
+  * `dt` parameter — outlining's caller-frame capture.
+  * Single-statement T_MEMST body `e.cooldown = e.cooldown - dt`.
+
+The classifier ACCEPTED it (`av_p=1`, `cap_idx=7`).
+`synthesize_loop_fn` generated the compose synth.
+`_outline_rewrite_with_captures` mutated the host's T_WHILE
+into the publish + dispatch T_BLOCK.
+
+But the FPS binary doesn't reflect any of this. Diagnosed via
+`bug --dump /tmp/fps_w.bug`:
+
+  * 12 `__synth_K` functions in the debug map
+  * ZERO `__synth_*` in `nm` output
+  * Host body still scalar in `objdump`
+
+Root cause: **incremental-emit mode**. `bpp.bpp` defaults
+`flag_incr = 1`. Per-module loop at lines 272-285 lexes +
+parses + EMITS modules 1..N immediately. THEN module 0
+processes (parse + dispatch + emit). Dispatch creates synths
+that belong to modules N (their host functions live in
+imported / loaded files), but those modules already finished
+emitting. Synths orphaned. Host body's rewrite at
+dispatch-time happens AFTER its module's emit pass → not in
+binary.
+
+The bug is "always was". Outlining shipped 2026-05-22 morning
+(`7da49fc` → `ab8e0aa`). Before `f09e5ad`, NO game code
+triggered outlining: games use `ecs_query_each(fn_ptr(...))`
+which gate-7-rejects the matcher (`call` to runtime fn ptr).
+The first natural-for-loop adopter exposed the latent issue.
+
+### Two deeper architectural findings (from attempted fix)
+
+Tried to fix via two approaches in the session; both surfaced
+deeper issues than scoped:
+
+**1. `tok_mod` / `mod_idx` known-broken for nested imports.**
+Existing comment at `bpp_parser.bsm:45` already documents this
+("tok_mod() returns incorrect module attribution"). The
+`mod_idx` binary search uses `diag_files[i].start` ascending
+sort, but module content gets SPLIT into chunks when the
+module has nested imports. Post-import content's src_off ≥
+next file's start, so binary search returns the wrong
+(nested) module.
+
+Empirical: compiling FPS, `tok_mod` returns 39 for
+`wolf_ai_tick_cooldowns` (a nested import's idx, not
+`ai.bsm`'s actual idx 37). So a fix attempt that wraps
+`compile_mod_of(tok_mod(...))` operates on the wrong input.
+
+The correct primitive is `diag_mod_idx` (uses `mod_bnds`
+boundary records — tracks interleaved-import correctly per
+the existing docstring at `bpp_import.bsm:198`). Switching
+parser + emit-attribution to use it is ~150-200 LOC of
+careful work.
+
+**2. Deferred-emit approach broke bootstrap.** Attempted to
+restructure the orchestrator: defer modules 1..N emit until
+after dispatch. gen1 produced a binary missing `_main`
+entirely. `emit_module_arm64` + `cg_bridge_data` + label
+allocation have ordering-sensitive interactions that need
+redesign, not simple reordering. (Bootstrap manual note:
+1-cycle oscillation IS expected for codegen changes — test
+gen2 == gen3. Almost reverted prematurely on a codegen
+change — user reminded me to read the manual.)
+
+### Load vs import distinction sidequest opened
+
+Per user direction: "all games use `load` for project-internal
+modules, `import` for stb cartridges. They don't touch src/
+by principle."
+
+Conceptual fix: separate SOURCE FILE from COMPILE MODULE.
+
+  * SOURCE FILE — per-file diag entry, preserves bug
+    debugger line attribution (`ai.bsm:42` remains
+    identifiable).
+  * COMPILE MODULE — parse/emit pipeline boundary. `load`-ed
+    files SHARE the parent's compile module (effectively
+    inlined for dispatch); `import`-ed files keep their own.
+
+Design doc `38fd075` + P1 array infrastructure `0f68dfa` +
+findings revision `c89e4dc`. Honest scope: 2-3 session arc
+with proper design checkpoints — the `tok_mod` brokenness
+means the consumer side of the fix is substantial.
+
+### Empirical bench panorama at session close
+
+```
+Bench               Value   Notes
+─────────────────────────────────────────────────────
+Compile bootstrap   0.34s   (was 0.30s pre-outlining, +13%)
+bench_outline       6x      Parallel (chunked dispatch)
+bench_autovec       4x      SIMD lanes
+bench_compose       6x      Bandwidth-bound on N=1M
+                            (compute-bound workloads → 32x)
+Native suite        179/0/12
+C-emit suite        144/0/47
+Bootstrap MD5       aaa4cc9f36... byte-stable
+```
+
+### Lessons codified
+
+  * **Bug debugger essential for emit-time disconnects.**
+    `bug --dump file.bug` vs `nm file` shows the
+    registered-vs-emitted delta. Critical tool when synth
+    functions registered correctly but never reach the
+    binary.
+  * **Bootstrap manual rules:** 2-gen byte-identity (gen1 ==
+    gen2) for non-codegen changes; 1-cycle oscillation
+    allowed for codegen changes (test gen2 == gen3). Don't
+    revert prematurely — read the manual.
+  * **Rule 4 still locked.** `@safe` claims purity ONLY —
+    does NOT extend to autovec aliasing (orthogonal claims).
+    No new per-loop annotations. Explicit `vec_*` builtins
+    remain the escape hatch for cases the compiler-proof
+    misses.
+  * **Honest scope revision late in session is fine** when
+    the deeper issue is real. Better to ship the
+    infrastructure (`0f68dfa` P1 array) + document findings
+    than push broken P2+P3 through. Architecture decisions
+    deserve their own design phase.

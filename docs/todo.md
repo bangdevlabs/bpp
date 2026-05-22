@@ -3,11 +3,19 @@
 Pending-only. Detail lives in `docs/plans/*.md`. Shipped work lives
 in `docs/journal.md` + commit history.
 
-Last refresh: 2026-05-17.
+Last refresh: 2026-05-22.
 
 ---
 
 ## Active arcs (pick a thread to drive next session)
+
+- **🔥 Load vs import architectural fix.** Multi-module game
+  adoption of compose-multiplicatively (FPS / RTS) blocked by
+  latent incremental-emit bug + `tok_mod` known-broken for
+  nested imports. P1 infra shipped (`0f68dfa`). Two approaches
+  documented; pick at design phase next session. See
+  `docs/plans/sidequest_load_import_distinction.md`. **Blocks
+  FPS adoption demo.**
 
 - **Content arc — decision point.** Engine no longer gates any of
   the four candidates: Wolf3D Phase 2 cont., Adventure Puzzle,
@@ -27,8 +35,13 @@ Last refresh: 2026-05-17.
   FFI module unblock. ~2-3 days focused. See `docs/plans/elf_dynlink_plan.md`.
 - **Linux Vulkan parity** — `stb/_stb_gpu_linux_vulkan.bsm`,
   ~1500 LOC. Depends on ELF dynlink.
-- **Tier F compiler opts** — CSE / RegAlloc v2 / Auto-vectorization.
-  Profile-gated, no real consumer yet. See `docs/plans/compiler_boost_roadmap.md`.
+- **Tier F compiler opts** — CSE / RegAlloc v2 / ~~Auto-vectorization~~.
+  Autovec **SHIPPED 2026-05-22** (`812057f` → `2384b46`, P1-P6).
+  Compose with outlining measured 6x on bench_compose
+  (bandwidth-bound; ~32x compute-bound ceiling). CSE +
+  RegAlloc v2 remain profile-gated. See
+  `docs/plans/compiler_boost_roadmap.md` +
+  `docs/plans/sidequest_autovec_b4_completion.md`.
 - **`bug` Phase 7 (game-debugger evolutions)** — trace mode +
   `name:line` breakpoints + conditional break + memory hexdump +
   snapshot/replay. ~280 LOC for items 1-4. Open when next
@@ -76,6 +89,19 @@ Last refresh: 2026-05-17.
 
 ## Known open bugs
 
+- **🔥 Multi-module smart-dispatch orphan synths.** Incremental-emit
+  mode (default) emits modules 1..N immediately at parse time,
+  before dispatch pipeline runs. Synth functions created during
+  dispatch belong to those already-emitted modules → never reach
+  binary. Affects any game with hot loops in `import`/`load`-ed
+  modules (FPS / RTS / future games). Single-module test
+  programs work. Diagnosed 2026-05-22 via `bug --dump`. Open
+  arc: `docs/plans/sidequest_load_import_distinction.md`.
+- **`tok_mod` / `mod_idx` wrong for nested imports.** Documented
+  at `bpp_parser.bsm:45`. Binary search on `diag_files[i].start`
+  ascending returns the wrong (nested) module when content
+  resumes after nested imports. The fix is to use `diag_mod_idx`
+  (mod_bnds-based) instead. Part of the load/import arc.
 - **`&struct.field` returns wrong address.** Codegen short-circuits
   to base instead of adding field offset. Workaround: hand-compute
   offset or use typed `s.field = ...` access. Defer until a real
