@@ -870,7 +870,41 @@ allocate, do IO, or touch the GPU freely — it runs on main thread.
 The dispatched function runs on a worker thread and must satisfy the
 bounded contract; see §5.4 and Tonify Rule 4.
 
-Full details in Cap 24 (Maestro concurrency).
+#### Explicit vs implicit parallel dispatch
+
+The `job_parallel_for(N, fn_ptr(worker))` form is the EXPLICIT
+syntax — programmer chooses the worker and the call site. The
+compiler also accepts an IMPLICIT form: a natural `for` loop
+whose body calls an `@safe` callee. Smart-dispatch synthesises
+the worker and rewrites the loop to the same `job_parallel_for`
+call under the hood.
+
+```c
+// Explicit — guaranteed parallel dispatch:
+job_parallel_for(n_units, fn_ptr(update_one_unit));
+
+// Implicit — same runtime if the loop shape passes the scanner:
+for (i = 0; i < n_units; i++) {
+    update_one_unit(i);
+}
+```
+
+Both compile to identical worker dispatch. The implicit form
+requires:
+1. The loop body's only T_CALL targets a callee that is either
+   `@safe`-annotated OR compiler-inferred PHASE_BASE (pure).
+2. The loop shape matches the scanner's accepted form
+   (`i = 0; i < N; i++` with `N` a literal or stable global —
+   see Tonify Rule 38).
+3. The body has no nested loops, no `break`/`continue`/`return`,
+   and references only globals or body-local declarations.
+
+When the loop shape does NOT pass, the scanner silently leaves
+the loop serial. Use the explicit `job_parallel_for` form when
+parallelism is performance-critical and the natural-loop shape
+might not be detected — the explicit form is the guarantee.
+
+Full details in Cap 24 (Maestro concurrency) and Tonify Rule 38.
 
 ### §5.7 — What this chapter does NOT cover
 

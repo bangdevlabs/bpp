@@ -2890,3 +2890,91 @@ journal + PR get the full block.
 - `docs/journal.md` 2026-05-20 (compiler array migration arc
   closeout) — the first arc that cites `bench_compile.sh` in
   its validation section.
+
+## Rule 38: Explicit vs implicit parallel dispatch (`@safe`-driven)
+
+Two valid syntaxes for parallel work over a range; both compile
+to the same runtime path (`job_parallel_for` + worker pool).
+Picking the right one is a clarity / guarantee choice, not a
+correctness one.
+
+```c
+// EXPLICIT — programmer names the worker and the call:
+job_parallel_for(n_units, fn_ptr(update_one_unit));
+
+// IMPLICIT — natural for-loop over `@safe` callee:
+for (i = 0; i < n_units; i++) {
+    update_one_unit(i);    // smart-dispatch synthesises the worker
+}
+```
+
+Both require the callee to be `@safe` (or compiler-classified
+PHASE_BASE). Both run iterations in parallel. The implicit form
+is what smart-dispatch produces when its scanner accepts the
+loop; if the scanner rejects (shape mismatch, body too complex),
+the loop runs SERIAL silently — no diagnostic.
+
+### Decision table
+
+| Pattern | Use form |
+|---------|----------|
+| Performance-critical loop where parallelism is the WHOLE point | **Explicit** — `job_parallel_for` guarantees dispatch |
+| Worker function used at multiple call sites | **Explicit** — one named worker, many calls |
+| Worker takes more than 1 parameter | **Explicit** — implicit synth generates single-param workers |
+| Loop shape unusual (descending, non-unit stride, while-true with break) | **Explicit** — scanner rejects, serial silently |
+| Body references function parameters or parent-frame locals | **Explicit** — scanner gate 6 rejects |
+| Simple `for (i = 0; i < N; i++)` with `N` literal/global | **Implicit** OK |
+| Body has just one or two helper calls + global writes by index | **Implicit** OK |
+| Helper is small, single-use, only meaningful at this site | **Implicit** OK |
+
+### When implicit silently falls back to serial
+
+The scanner rejects when any of the following hold:
+
+1. Loop bound is a function parameter or local variable (gate 5).
+   `for (i = 0; i < n; i++)` where `n` is a parameter → REJECTED.
+   Workaround: hoist `n` to a global, or use the explicit form.
+2. Body references a parent-frame local or parameter (gate 6).
+   Worker context cannot reach the caller's stack frame safely.
+3. Body has nested `while` / `for` / `switch` (gate 9).
+4. Body has `break`, `continue`, or `return` (gate 8).
+5. Body's T_CALL targets a non-`@safe`, non-PHASE_BASE callee
+   (gate 7).
+
+When in doubt, write explicit. The explicit form is the
+guarantee; the implicit form is the convenience.
+
+### When to migrate explicit → implicit
+
+Most existing programs use the explicit form because it predates
+the `@safe`-scanner relaxation. Migrating to implicit is a
+SYNTACTIC refactor only when:
+
+- The worker is `@safe`-annotated already (no W026 surprise).
+- The loop shape matches scanner gates 1-5 / 8-9.
+- The loop body has just the worker call (no other top-level
+  statements that would violate gate-D safety rules).
+
+When in doubt, keep the explicit form — same runtime, more
+visible.
+
+### When NOT to migrate
+
+Do NOT add `@safe` to a function just to enable implicit
+parallel-loop syntax. The `@safe` annotation is a SAFETY
+contract first (catches the W026 bug class — worker reaches
+malloc/IO/GPU). Adding it for syntactic convenience without
+the worker context to motivate it dilutes the meaning. Per
+Rule 4: annotations earn their keep by catching a bug class
+the compiler can verify. Smart-dispatch eligibility is a
+SIDE EFFECT of the safety claim, not a reason to make the
+claim.
+
+### Cross-references
+
+- `docs/manual/how_to_dev_b++.md` §5.6 — Maestro pattern,
+  explicit vs implicit parallel.
+- Rule 4 — `@safe` annotation discipline.
+- `src/bpp_dispatch.bsm` `_fdc_subtree_safe` line 2334 — the
+  scanner gate that accepts both PHASE_BASE and PHASE_SAFE.
+- Commit `4a9d3e7` — the relax that landed the implicit form.
