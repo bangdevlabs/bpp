@@ -17,9 +17,27 @@ Last refresh: 2026-05-22 (load/import arc close).
   mod_bnds + topo coupling, outlining @safe gate). Suite
   179/0/12 + 144/0/47. See `docs/plans/sidequest_load_import_distinction.md`.
 
-- **RTS adoption** — add `@safe` to game-side loops in `rts1`
-  that match outlining + autovec. Game-side refactor only, no
-  compiler work. Estimated ~30-100 LOC across `rts1_*.bsm`.
+- **RTS adoption** — substantially larger than FPS adoption was.
+  rts1's hot loops live inside `ecs_query_each(q, fn_ptr(callback))`
+  — the indirect-call pattern is gate-7-rejected by the outlining
+  matcher (callee unknown at compile time). The FPS pattern that
+  worked (`wolf_ai_tick_cooldowns @safe` with flat
+  `payload + i * sizeof(Entity)` walk + single-T_MEMST body) does
+  not apply directly.
+  Two paths:
+  (a) Game-side refactor: add a parallel flat payload array
+      alongside the ECS component table, walk it in a natural
+      for-loop. ~200-400 LOC per system migrated. Game design
+      decision.
+  (b) Compiler enhancement: make outlining matcher recognise
+      `ecs_query_each(q, fn_ptr(X))` and substitute X's body
+      inline. Substantial dispatch-pipeline work, ~200-300 LOC.
+  Verified bench numbers (2026-05-22) on the closed engine:
+    * `bench_compose.bpp`: 114 ms serial → 19 ms compose (6x).
+    * `bench_outline.bpp`: 290 ms serial → 49 ms outlined (5x),
+      within 8% of explicit `job_parallel_for` chunked form.
+    * `bench_autovec.bpp`: 108 ms scalar → 30 ms autovec (3x).
+    * `bench_compile.sh`: bootstrap 0.34 s (no regression).
 
 - **FPS runtime bench** — measure actual frame-time delta from
   outlining + autovec adoption. Closes the empirical loop on
