@@ -3,19 +3,39 @@
 Pending-only. Detail lives in `docs/plans/*.md`. Shipped work lives
 in `docs/journal.md` + commit history.
 
-Last refresh: 2026-05-22.
+Last refresh: 2026-05-22 (load/import arc close).
 
 ---
 
 ## Active arcs (pick a thread to drive next session)
 
-- **🔥 Load vs import architectural fix.** Multi-module game
-  adoption of compose-multiplicatively (FPS / RTS) blocked by
-  latent incremental-emit bug + `tok_mod` known-broken for
-  nested imports. P1 infra shipped (`0f68dfa`). Two approaches
-  documented; pick at design phase next session. See
-  `docs/plans/sidequest_load_import_distinction.md`. **Blocks
-  FPS adoption demo.**
+- ~~**Load vs import architectural fix.**~~ **CLOSED 2026-05-22**
+  (`0f68dfa` → `a6fa70a`, 7 commits). Multi-module game
+  adoption unblocked. FPS `wolf_ai_tick_cooldowns @safe`
+  outlines to `__synth_4` + `bl _job_parallel_for_data`.
+  Three latent bugs uncovered + fixed (BSYS_* collision,
+  mod_bnds + topo coupling, outlining @safe gate). Suite
+  179/0/12 + 144/0/47. See `docs/plans/sidequest_load_import_distinction.md`.
+
+- **RTS adoption** — add `@safe` to game-side loops in `rts1`
+  that match outlining + autovec. Game-side refactor only, no
+  compiler work. Estimated ~30-100 LOC across `rts1_*.bsm`.
+
+- **FPS runtime bench** — measure actual frame-time delta from
+  outlining + autovec adoption. Closes the empirical loop on
+  multi-module compose-multiplicatively. `bench_compose.bpp`
+  already shows 6x at single-module scale.
+
+- **mark_reachable proper fix** — extend call-graph seeds to
+  cover signal handlers, fn_ptr passed via externs. Currently
+  ~471 reachable functions are pruned but needed at runtime;
+  P6 of the load/import arc works around by suppressing the
+  lazy filter for non-entry modules. ~50-100 LOC.
+
+- **W031 audit** — load/import P3+P4's correct attribution
+  exposed 27 cross-module-static-call warnings. Each is a real
+  architectural smell. Audit + fix per warning. Mostly in chip
+  backends (a64/x64 cross-calls to encoder primitives).
 
 - **Content arc — decision point.** Engine no longer gates any of
   the four candidates: Wolf3D Phase 2 cont., Adventure Puzzle,
@@ -89,19 +109,19 @@ Last refresh: 2026-05-22.
 
 ## Known open bugs
 
-- **🔥 Multi-module smart-dispatch orphan synths.** Incremental-emit
-  mode (default) emits modules 1..N immediately at parse time,
-  before dispatch pipeline runs. Synth functions created during
-  dispatch belong to those already-emitted modules → never reach
-  binary. Affects any game with hot loops in `import`/`load`-ed
-  modules (FPS / RTS / future games). Single-module test
-  programs work. Diagnosed 2026-05-22 via `bug --dump`. Open
-  arc: `docs/plans/sidequest_load_import_distinction.md`.
-- **`tok_mod` / `mod_idx` wrong for nested imports.** Documented
-  at `bpp_parser.bsm:45`. Binary search on `diag_files[i].start`
-  ascending returns the wrong (nested) module when content
-  resumes after nested imports. The fix is to use `diag_mod_idx`
-  (mod_bnds-based) instead. Part of the load/import arc.
+- ~~**Multi-module smart-dispatch orphan synths.**~~ **FIXED
+  2026-05-22** by load/import arc (`a6fa70a`). Emit deferred
+  to after dispatch; synths now reach the binary.
+- ~~**`tok_mod` / `mod_idx` wrong for nested imports.**~~
+  **FIXED 2026-05-22** (`fbaf98e`). `tok_mod` switched to
+  `diag_mod_idx` (mod_bnds-based, interleaved-import-aware).
+- **mark_reachable misses ~471 functions** across both OLD and
+  NEW bpp. Includes `panic`, `profile_start`, `malloc_aligned`,
+  `_hash_insert_raw`, etc. — needed at runtime via fn_ptr
+  through externs / signal handlers, but call-graph BFS doesn't
+  see those edges. Load/import P6 (`7dd3ff6`) works around by
+  suppressing the lazy filter for non-entry modules. Proper fix:
+  extend mark_reachable seeds. Separate ~50-100 LOC arc.
 - **`&struct.field` returns wrong address.** Codegen short-circuits
   to base instead of adding field offset. Workaround: hand-compute
   offset or use typed `s.field = ...` access. Defer until a real

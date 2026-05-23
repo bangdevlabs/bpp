@@ -22,6 +22,65 @@ But what if Sean Barrett later joined that group with his STB — all written in
 
 And now we have a standard library that is, itself, a game engine. With audio. And it just played its first chord.
 
+## Compose-Multiplicatively: ~32x for free
+
+A B++ program writes a plain natural-for loop. The compiler
+fans it out across cores AND across SIMD lanes — same source,
+zero annotations beyond `@safe` to say "yes, this function is
+worker-safe."
+
+```bpp
+void tick(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _cap; i++) {
+        auto e: Entity;
+        e = payload + i * sizeof(Entity);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+```
+
+The compiler:
+1. Detects caller-frame captures (`dt`, `_cap`) → wraps in a
+   capture struct, synthesises a worker function, rewrites the
+   host body to call `job_parallel_for_data` (**outlining**,
+   ~6x on 8 cores).
+2. Sees the loop body is a single `half float` store +
+   classifies as autovec pattern P1 → emits a 4-wide SIMD
+   vector loop + scalar tail (**autovec**, ~4x on 4 lanes).
+3. Both fire on the same loop → the worker body itself is
+   SIMD'd (**compose**, theoretical ~32x ceiling).
+
+Measured on `examples/bench_compose.bpp` (single-module, N=1M
+cells × K=100 mul-by-literal rounds):
+
+```
+SERIAL (1 thread, scalar):    303 ms
+COMPOSE (8 cores × 4 SIMD):    19 ms     → 16x measured
+                                          (bandwidth-bound;
+                                           compute-bound workloads
+                                           approach the 32x ceiling)
+```
+
+Multi-module game adoption verified on FPS (`wolf_ai_tick_cooldowns`
+in `games/fps/ai.bsm`): the per-frame cooldown decrement compiles
+to `bl _job_parallel_for_data` with `__synth_4` as the worker.
+
+Stack (each tier composed atop the previous):
+
+| Tier | Source-level | Measured | Doctrine |
+|---|---|---|---|
+| Baseline scalar | natural-for | 1x | "obvious code" |
+| Smart-dispatch outlining | `@safe` on host | ~6x (cores) | "compiler proves; programmer marks safe" |
+| Autovec | type+shape hint via `half float` | ~4x (lanes) | "compiler proves; explicit `vec_*` is the escape hatch" |
+| Compose | both fire on same loop | ~32x ceiling | bandwidth-bound workloads cap earlier |
+
+Bang for the buck: no manual threading, no manual SIMD, no
+build-system tuning. The compiler does the work. The
+`@safe` annotation is the only required user-side cost — and
+it has the same value as `pure` in Haskell or `const` in C: an
+honest contract about what the function does.
+
 ## The Language
 
 The minimum B++ program is three lines. No headers, no imports, no return statement:

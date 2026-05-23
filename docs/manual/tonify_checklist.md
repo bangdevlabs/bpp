@@ -2914,6 +2914,42 @@ is what smart-dispatch produces when its scanner accepts the
 loop; if the scanner rejects (shape mismatch, body too complex),
 the loop runs SERIAL silently — no diagnostic.
 
+**Capture-driven outlining (loops with caller-frame refs)
+requires `@safe` on the HOST function, not just the callee.**
+As of 2026-05-22 (`a6fa70a`, load/import arc close), the
+dispatch pipeline rejects capture-driven outlining when the
+enclosing function is not `@safe`-annotated. Reason: an
+outlined loop calls `job_parallel_for_data` to spawn workers;
+if the host can be reached from a signal-handler / interrupt
+context (SIGPROF, etc.), the dispatch is illegal. The `@safe`
+annotation is the explicit programmer contract for "this
+function is OK in worker / dispatch context."
+
+```c
+// REJECTED — host not @safe, loop has caller-frame `dt` capture:
+void update(dt: float, payload) {
+    auto i;
+    for (i = 0; i < _cap; i++) {
+        auto e: Entity;
+        e = payload + i * sizeof(Entity);
+        e.cooldown = e.cooldown - dt;  // dt is captured
+    }
+}
+
+// ACCEPTED — same loop, host marked @safe:
+void update(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _cap; i++) {
+        auto e: Entity;
+        e = payload + i * sizeof(Entity);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+```
+
+Pure MAP (no captures, just index iteration) does not require
+the host to be `@safe` — the callee's own annotation suffices.
+
 ### Both forms run the SAME runtime (parity validated)
 
 Critical point that resolves the "which is faster?" question

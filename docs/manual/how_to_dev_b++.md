@@ -904,6 +904,51 @@ the loop serial. Use the explicit `job_parallel_for` form when
 parallelism is performance-critical and the natural-loop shape
 might not be detected — the explicit form is the guarantee.
 
+#### Outlining: implicit dispatch with caller-frame captures
+
+When the loop body references caller-frame variables (parameters,
+auto declarations in the host) — not just globals — the compiler
+performs **outlining**: it synthesises a capture struct, allocates
+it on the host's stack frame, writes the captured values, and
+dispatches a worker function that reads them from the struct.
+
+```c
+// HOST function — note `@safe` is required for capture-driven outlining.
+void update(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _cap; i++) {       // <- _cap is global, OK
+        auto e: Entity;
+        e = payload + i * sizeof(Entity);   // <- payload is caller-frame
+        e.cooldown = e.cooldown - dt;       // <- dt is caller-frame
+    }
+}
+```
+
+The compiler:
+1. Builds a capture struct from `{ payload, dt }` (the caller-frame
+   refs in the loop body).
+2. Synthesises a worker function `__synth_N(i, &captures)` that
+   reads `payload` / `dt` through the captured pointer.
+3. Rewrites the host body to:
+   - publish: push captures onto host's stack frame
+   - dispatch: call `job_parallel_for_data(_cap, fn_ptr(__synth_N), &captures)`
+
+The `@safe` annotation on the host is **required** for capture-
+driven outlining. Reason: the synth dispatches workers, which is
+illegal in signal-handler / interrupt context. The annotation is
+the explicit programmer contract for "this function is OK in
+worker / dispatch context."
+
+Pure MAP (no captures, just index iteration like
+`update_one_unit(i)`) does NOT require host `@safe` — the
+callee's own annotation suffices.
+
+Compose: when outlining + autovec both fire on the same loop,
+the synth body itself becomes a 4-wide SIMD vector loop + scalar
+tail. Cores × lanes = up to 32x on compute-bound workloads.
+Measured 6x on `examples/bench_compose.bpp` (bandwidth-bound at
+that workload size).
+
 Full details in Cap 24 (Maestro concurrency) and Tonify Rule 38.
 
 ### §5.7 — What this chapter does NOT cover

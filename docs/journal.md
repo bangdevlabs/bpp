@@ -11586,3 +11586,152 @@ Bootstrap MD5       aaa4cc9f36... byte-stable
     infrastructure (`0f68dfa` P1 array) + document findings
     than push broken P2+P3 through. Architecture decisions
     deserve their own design phase.
+
+## 2026-05-22 (closeout) — Load/import distinction arc CLOSED
+
+Seven-commit arc landing same-day (`0f68dfa` → `a6fa70a`)
+finishing what the autovec session opened. Multi-module game
+adoption of compose-multiplicatively (outlining × autovec) is
+now functional end-to-end. `wolf_ai_tick_cooldowns` in
+`games/fps/ai.bsm` becomes the first canonical demonstration —
+its `for (i = 0; i < cap; i++) { e.cooldown -= dt; }` loop
+gets outlined into `__synth_4` and dispatched via
+`job_parallel_for_data` at runtime. The dispatch / autovec /
+compose work shipped during the autovec arc finally reaches
+real game code.
+
+### The seven commits
+
+  * `0f68dfa` — P1: `diag_file_compile_module[]` array +
+    `compile_mod_of()` accessor. Identity mapping, no
+    behaviour change. Pure infrastructure.
+  * `562c0b5` — P2: `_process_file_inline_into` flag in
+    `process_file`. When `load` recurses, the loaded file's
+    `diag_file_compile_module` slot points at parent's compile
+    module instead of itself. Dep edge skipped for inline
+    loads. Source-file diag entry preserved for bug-debugger
+    line attribution.
+  * `1bd87b6` — P3 infra: `ModBnd.abs_line` field +
+    `mod_bnd_count` / `mod_bnd_off` / `mod_bnd_mi` /
+    `mod_bnd_abs_line` public accessors. Stores outbuf-
+    absolute line at boundary creation so `lex_module` can
+    set `cur_line` correctly when resuming non-contiguous
+    ranges.
+  * `dca7ead` — **BSYS_* rename**: latent cross-target const
+    collision fix. Constants in `_bsys_macos.bsm` and
+    `_bsys_linux.bsm` (both pulled into cross-compile builds)
+    renamed from unqualified `BSYS_*` to target-prefixed
+    `BSYS_MACOS_*` / `BSYS_LINUX_*`. a64_primitives +
+    x64_primitives + chip-specific codegen call sites
+    updated accordingly. OLD code happened to register MACOS
+    last in mi-asc parse order so the right value won; without
+    the over-lex bug, LINUX would have won → macOS binary
+    syscalling Linux's mmap=9 → SIGSEGV.
+  * `fbaf98e` — P3+P4 combined: `lex_module` walks `mod_bnds`
+    instead of single-range partition; `tok_mod` uses
+    `diag_mod_idx` (mod_bnds-aware) instead of `mod_idx`
+    (single binary search); orchestrator loop iterates
+    `mod_topo` instead of `1..mk-1`. The three changes are
+    tightly coupled — each one alone breaks bootstrap (any
+    single fix exposes the bugs the other two had masked).
+  * `7dd3ff6` — P6: defer all `emit_module_arm64` /
+    `emit_module_x86_64` calls until AFTER the dispatch
+    pipeline runs. Without this, host functions emit with
+    their pre-rewrite scalar bodies and dispatch's synth
+    functions get orphaned. Lazy-emit filter explicitly
+    suppressed for non-entry modules to match OLD effective
+    behaviour (mark_reachable has a latent miss-by-471-
+    functions bug; OLD code's per-module-before-mark_reachable
+    timing accidentally avoided it).
+  * `a6fa70a` — Outlining gate: capture-driven outlining now
+    requires `fn_phase_hint == PHASE_SAFE` on the host. P6's
+    correct attribution started matching loops in
+    `_prof_capture_n` (a SIGPROF handler routine) — synth
+    would have dispatched workers from signal context. The
+    `@safe` annotation becomes the explicit programmer
+    contract for "OK to outline this function's loops".
+
+### Three latent bugs uncovered + fixed
+
+**1. BSYS_* cross-target const collision.** Diagnosed by byte-
+comparing gen2 vs gen3 binaries (`cmp -l /tmp/g2 /tmp/g3`
+showed divergence at file offset 0x459 inside
+`__mem_alloc_pages`'s `mov x16, #imm` syscall-number load —
+0xc5 (macOS mmap=197) in one gen, 0x09 (Linux mmap=9) in the
+other). The rename eliminated the cross-target collision
+without changing emit semantics for either target.
+
+**2. mark_reachable miss-by-471 functions.** Empirical: in
+both OLD and NEW bpp, `--stats` reports `1551 functions (1080
+reachable, 471 pruned)`. OLD code only applied the lazy filter
+to module 0's emit (other modules emit before `mark_reachable`
+runs, with filter inactive). P6 preserves this effective
+behaviour explicitly. Proper fix (extending the call-graph
+seeds) deferred to a separate arc.
+
+**3. Outlining vs signal-handler safety.** P3+P4's correct
+attribution lets dispatch see loops in `_prof_capture_n`
+clearly, and the gate-7 fan-out check wasn't catching them
+(no other gate matched). Tying outlining eligibility to the
+host's `@safe` annotation matches Tonify Rule 4 doctrine
+("`@safe` is the explicit safe-callback contract") and gives
+the user a one-line opt-in for parallelizing their hot loops.
+
+### Final bench panorama at close
+
+```
+Bootstrap MD5:        6d2cf7f6a0ff6ee7... (gen2 == gen3)
+Native test suite:    179 passed, 0 failed, 12 skipped
+C-emit test suite:    144 passed, 0 failed, 47 skipped
+FPS empirical (multi-module adoption):
+  ./bpp games/fps/fps_wolf3d.bpp -o /tmp/fps
+  nm /tmp/fps | grep synth
+    ___synth_0..___synth_4
+  objdump -d /tmp/fps  (wolf_ai_tick_cooldowns)
+    adr x0, <___synth_4>
+    bl  <_job_parallel_for_data>
+```
+
+### Pull together: the multiplicatively-compose story
+
+With this arc, the full ~32x compose story has a complete
+demonstration path for real games:
+
+```
+Path             Speedup    Status
+─────────────────────────────────────────────────────────
+Serial baseline   1x        always
+S4 inline        ~1.1x      shipped 2026-05-21
+Outlining        ~6x        shipped 2026-05-22 morning
+Autovec          ~4x        shipped 2026-05-22 mid-day
+Compose          ~6x→32x    shipped 2026-05-22 mid-day
+Multi-module     ✓          shipped 2026-05-22 close
+                            (this arc)
+```
+
+The 6x compose on `bench_compose.bpp` is bandwidth-bound
+(memory-throughput limited at 19ms vs 800MB÷50GB/s ≈ 16ms
+floor); compute-bound workloads should approach the 32x
+theoretical ceiling. FPS runtime bench is the empirical next
+step — verifying the projection on real game frame-time.
+
+### Lessons codified
+
+  * **Latent bugs hide behind compensating bugs.** The OLD
+    bpp worked because over-lex masked the BSYS collision +
+    the mark_reachable miss + the wrong-mi-attribution. Fix
+    any one and the others surface. Atomic ship is mandatory
+    for tightly-coupled fixes.
+  * **`bug --dump` + `nm` diff** is the diagnostic combo for
+    emit-time disconnects. `.bug` shows REGISTERED;
+    `nm` shows EMITTED. Difference = filtering bug.
+  * **Byte-level diff during bootstrap chase** finds
+    cross-source divergence fast. `cmp -l` + `xxd -s` +
+    `otool -tV` triangulate.
+  * **Bootstrap 1-cycle oscillation is the norm for codegen-
+    changing commits.** Test gen2 == gen3, not gen1 == gen2.
+    The bootstrap manual is the authority — almost reverted
+    valid codegen changes mid-arc until reminded to read it.
+  * **`@safe` annotation is the dispatch-safety contract.**
+    Outlining capture-driven path now requires it. This is
+    Tonify Rule 4 doctrine made executable.
