@@ -621,6 +621,97 @@ void ecs_query_each(q, fn) {
     }
 }
 
+// Worker entry for ecs_query_each_parallel — invoked once per worker
+// thread with a [start, end) row range. Recovers the capture struct
+// the parent published through `_outline_cap_ptr` (the same
+// sidechannel global outlining uses), walks the slice, skips dead
+// rows, and dispatches the user callback on each live entity.
+//
+// Marked `@safe` so the smart-dispatch pipeline transitively forbids
+// the user callback (passed in `fn`) from doing malloc / IO / GPU /
+// blocking syscalls. The compiler enforces this via W026 when the
+// callback is registered through the W031 safe-sink list (see
+// `_safe_sinks` in `bpp_dispatch.bsm`).
+static void _ecs_parallel_worker(start, end) @safe {
+    auto cap, w, base_id, alive, fn, row;
+    cap     = _outline_cap_ptr;
+    w       = *(cap +  0);
+    base_id = *(cap +  8);
+    alive   = *(cap + 16);
+    fn      = *(cap + 24);
+    row = start;
+    while (row < end) {
+        if (peek(alive + row) != 0) {
+            call(fn, w, base_id + row);
+        }
+        row = row + 1;
+    }
+}
+
+// Parallel sibling of `ecs_query_each` — same semantics, but the
+// per-archetype row walk dispatches across `_job_n_workers` worker
+// threads via `job_parallel_for_data` (the same runtime
+// outlining uses). The legacy bitmap path stays serial because
+// the alive-walk is already a tight per-byte loop.
+//
+// REQUIRES the callback `fn` to be `@safe` — the compiler emits
+// W031 at the call site if a non-`@safe` fn_ptr is passed (the
+// safe-sink list in `bpp_dispatch.bsm` includes this function).
+// The `@safe` contract guarantees the callback is bounded /
+// no-malloc / no-IO / no-GPU, which is what the worker pool
+// needs to safely fan out.
+//
+// Use when:
+//   - hot loop (per-frame, per-tick), AND
+//   - N entities ≥ ~16 (below this the ~50µs dispatch overhead
+//     dominates the per-entity work), AND
+//   - per-entity work ≥ ~100 cycles (otherwise the worker-pool
+//     overhead dwarfs the saving).
+//
+// Do NOT use when:
+//   - callback writes a shared accumulator without locks
+//     (e.g. nearest-target tracking, marquee-select gathering),
+//   - callback's first-hit early-exit is the perf strategy,
+//   - render order matters (z-layer / framebuffer dependencies),
+//   - N is tiny (~1-15).
+// For all of these, the serial `ecs_query_each` stays the
+// correct choice and remains unchanged.
+void ecs_query_each_parallel(q, fn) {
+    auto eq: EcsQuery, w: World, ai, ar: ArchetypeRec, mask, i;
+    eq = q;
+    w = eq.world;
+    mask = eq.comp_mask;
+    // Legacy entities — stays serial. The bitmap walk is already
+    // tight, and the rare legacy path doesn't benefit from
+    // chunked dispatch (alive entities are typically sparse here).
+    for (i = 0; i < w.capacity; i++) {
+        if (peek(w.alive + i)) {
+            call(fn, w, i);
+        }
+    }
+    // Archetype entities — dispatch each archetype's row range to
+    // the worker pool. Captures (world / base_id / alive bitmap /
+    // user fn_ptr) flow through a heap-alloc'd struct published
+    // via `_outline_cap_ptr`, matching the outlining convention.
+    for (ai = 0; ai < w.archetype_count; ai++) {
+        ar = arr_struct_at(w.archetypes, ai);
+        if (mask != 0) {
+            if ((ar.comp_bitmask & mask) != mask) { continue; }
+        }
+        if (ar.total_entities <= 0) { continue; }
+        auto cap;
+        cap = malloc(32);
+        *(cap +  0) = w;
+        *(cap +  8) = _ecs_encode_id(ai, 0);
+        *(cap + 16) = ar.alive;
+        *(cap + 24) = fn;
+        job_parallel_for_data(ar.total_entities,
+                              fn_ptr(_ecs_parallel_worker),
+                              cap);
+        free(cap);
+    }
+}
+
 // Count how many entities currently match the query. Same skip-
 // dead walk as ecs_query_each, but accumulates instead of dispatching
 // per match. Useful for sizing buffers, picking a uniform sample,
