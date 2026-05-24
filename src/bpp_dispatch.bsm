@@ -3722,12 +3722,63 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     // otherwise the host might be reached from a signal-handler /
     // interrupt context where job_parallel_for_data cannot legally
     // spawn workers (e.g. SIGPROF handlers in bpp_runtime).
-    if (arr_len(_fdc_captures) > 0) {
-        if (arr_get(fn_phase_hint, fn_idx) != PHASE_SAFE) {
-            arr_clear(_fdc_captures);
-            return;
-        }
+    // Capture-driven outlining gate (a6fa70a) + MAP gate extension
+    // (this commit): both flavors of dispatch now require the host
+    // function to be `@safe`-annotated. Without that, the matcher's
+    // existing body-call check (PHASE_BASE / PHASE_SAFE on callees)
+    // is insufficient — it accepts T_MEMST stores to globals that
+    // produce indexed writes (safe per-iter) but the SURROUNDING
+    // module state (allocator, GPU pipeline, audio ring, font
+    // glyph atlas, etc.) gets touched indirectly through the same
+    // host fn's other call sites. Game adoption observed regressions
+    // (snake yellow dot, fps magenta overlay) when stb hot loops
+    // started running parallel without their hosts being @safe-
+    // audited. Tightening this to `host must be @safe` makes the
+    // doctrine consistent — the annotation is the explicit
+    // programmer contract for "worker-pool-safe at the function
+    // level", not just the loop level.
+    if (arr_get(fn_phase_hint, fn_idx) != PHASE_SAFE) {
+        arr_clear(_fdc_captures);
+        return;
     }
+
+    // W032 — surface every loop that's about to be parallelized
+    // so the user can audit. Emits a diagnostic naming the host
+    // function and its source line. The candidate is still
+    // accepted; the warning is informational. Use `--dispatch` to
+    // see the full list at compile time.
+    auto _host_name;
+    _host_name = *(funcs[fn_idx] + FN_NAME);
+    diag_warn(32);
+    diag_str("loop in '");
+    diag_packed(_host_name);
+    diag_str("' will run in worker pool");
+    // Distinguish the two shapes the matcher accepted. The strict
+    // @safe gate above already returned when !PHASE_SAFE, so the
+    // host is known to be @safe here; the kind of dispatch is
+    // determined by whether the body closes over caller locals
+    // (outlining = captures > 0) or runs purely on the loop index
+    // and indexed globals (MAP).
+    if (arr_len(_fdc_captures) > 0) {
+        diag_str(" (outlining — closes over caller frame)");
+    } else {
+        diag_str(" (MAP — per-iteration body dispatch)");
+    }
+    diag_newline();
+    diag_loc(*(funcs[fn_idx] + FN_SRC_TOK));
+    diag_show_line(*(funcs[fn_idx] + FN_SRC_TOK));
+    diag_str("  = note: each iteration runs on a worker thread;");
+    diag_newline();
+    diag_str("          shared mutable state (globals, scratch");
+    diag_newline();
+    diag_str("          buffers, accumulators) creates races.");
+    diag_newline();
+    diag_str("  = help: if the loop is order-dependent or accumulates");
+    diag_newline();
+    diag_str("          state across iterations, refactor or use");
+    diag_newline();
+    diag_str("          explicit `job_parallel_for` / serial form.");
+    diag_newline();
 
     // All criteria met — record the candidate.
     dispatch_candidates = arr_push(dispatch_candidates, wh_p);
