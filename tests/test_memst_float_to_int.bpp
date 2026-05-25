@@ -1,0 +1,47 @@
+// Regression test for T_MEMST float→int conversion bug.
+//
+// The pattern `*(int_slot) = float_expr` used to silently
+// reinterpret IEEE 754 bits as an integer instead of converting
+// the float to an integer. Symptom in the wild (2026-05-23):
+// snake_maestro particle positions teleporting to address space
+// far outside the framebuffer because `pos_x[i] = pos_x[i] +
+// vel_x[i] * dt` (with `dt: float`) stored the IEEE bits of the
+// float result into an integer position slot.
+//
+// Fix at `_a64_emit_memst_int` in `a64_codegen.bsm`: when the
+// RHS returns ety == 1 (float in d0) into an integer destination,
+// emit `fcvtzs x0, d0` (truncate-toward-zero conversion) instead
+// of `fmov x0, d0` (bit reinterpret).
+//
+// The C emitter was already correct (uses native cast). Test
+// passes through both backends.
+
+main() {
+    auto buf;
+    auto val: float;
+
+    buf = malloc(8);
+
+    // Case 1: pure float literal stored into untyped slot.
+    val = 0.5;
+    *(buf) = val * 1000;      // expect 500 (0.5 * 1000 trunc = 500)
+    if (*(buf) != 500) { return 1; }
+
+    // Case 2: float expr with int+float mix, stored.
+    val = 2.5;
+    *(buf) = val + 10;        // expect 12 (2.5 + 10 = 12.5, trunc toward 0 = 12)
+    if (*(buf) != 12) { return 2; }
+
+    // Case 3: negative float, trunc-toward-zero semantics.
+    val = -1.5;
+    *(buf) = val;             // expect -1 (trunc toward zero, not -2 toward minus-inf)
+    if (*(buf) != -1) { return 3; }
+
+    // Case 4: small float that truncates to zero.
+    val = 0.016;
+    *(buf) = val;             // expect 0 (sub-1 float trunc = 0)
+    if (*(buf) != 0) { return 4; }
+
+    free(buf);
+    return 0;
+}

@@ -1891,12 +1891,24 @@ void a64_emit_stmt(nd) {
         // Phase B1c: freelist the value save when safe. The pointer
         // expression in n.a might trigger a BL (caller-saved clobber),
         // in which case we keep the push/pop fallback.
+        //
+        // When the RHS is a float (ety == 1) but the destination is an
+        // integer slot, convert the float value to a signed integer
+        // (truncate toward zero) instead of reinterpreting the IEEE
+        // bits as an integer. The historical use of `fmov x0, d0`
+        // (bitcast) silently corrupted every `int_slot = float_expr`
+        // store — `*(buf) = 0.5 * 1000` written the IEEE bits of 500.0
+        // (0x407F400000000000 ≈ 4.6e18) instead of the integer 500.
+        // Surfaced as snake particles teleporting to addresses outside
+        // the framebuffer (load/import P6 made ecs_physics inline
+        // through the broken path; pre-P6 the call frame masked it).
+        // See tests/test_memst_float_to_int.bpp for the minimal repro.
         auto alloc_reg_st, val_reg;
         alloc_reg_st = -1;
         val_reg = 1;
         ety = a64_emit_node(n.b);
         if (ety == 1) {
-            if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
+            if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
         }
         if (_a64_has_call(n.a)) {
             a64_emit_push();
@@ -2192,8 +2204,18 @@ void _a64_emit_memst_int(nd, fh) {
     val_reg = 1;
     ety = a64_emit_node(n.b);
     if (ety == 1) {
-        if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); }
-        else { out("  fmov x0, d0"); putchar('\n'); }
+        // Float RHS going into integer destination: convert with
+        // fcvtzs (truncate toward zero), do NOT bitcast with fmov.
+        // The bitcast path silently corrupted every
+        // `int_slot = float_expr` store — `*(buf) = 0.5 * 1000` would
+        // write the IEEE bits of 500.0 (0x407F400000000000) instead
+        // of the integer 500. Surfaced 2026-05-23 as snake particles
+        // teleporting outside the framebuffer (load/import P6 made
+        // ecs_physics inline through this primitive; pre-P6 the call
+        // frame around ecs_physics masked it).
+        // Test: tests/test_memst_float_to_int.bpp
+        if (a64_bin_mode) { enc_fcvtzs(0, 0); }
+        else { out("  fcvtzs x0, d0"); putchar('\n'); }
     }
     if (cg_has_call(n.a)) {
         a64_emit_push();
