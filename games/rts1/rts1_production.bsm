@@ -146,9 +146,50 @@ wc1_production_try_click(world, eid, mx, my) {
         }
         i = i + 1;
     }
+    // No train button hit — a click on the progress strip cancels the
+    // most-recently-queued unit (and refunds its cost).
+    wc1_cmd_progress_rect(rect);
+    bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+    if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+        wc1_production_cancel_last(world, eid);
+        free(menu);
+        free(rect);
+        return 1;
+    }
     free(menu);
     free(rect);
     return 0;
+}
+
+// S10 — set a producer's rally point (the tile trained units walk to
+// after they finish). Any building accepts a rally; non-producers
+// just never read it. The spawn default -1/-1 means "no rally → the
+// unit appears adjacent to the footprint and stays".
+void wc1_production_set_rally(world, eid, gx, gy) {
+    auto b: Building;
+    b = ecs_get(world, building_comp, eid);
+    b.rally_gx = gx;
+    b.rally_gy = gy;
+    return;
+}
+
+// S10 — cancel the most-recently-queued unit and refund its gold/wood
+// (LIFO — the player's last misclick is the first undone). Resets the
+// training timer when the queue empties so a re-queue starts fresh.
+// Returns 1 if something was cancelled.
+wc1_production_cancel_last(world, eid) {
+    auto b: Building, q, last_kind, def: UnitDef;
+    b = ecs_get(world, building_comp, eid);
+    if (b.train_count <= 0) { return 0; }
+    q = b.train_queue;
+    last_kind = q[b.train_count - 1];
+    b.train_count = b.train_count - 1;
+    if (b.train_count == 0) { b.train_progress_ms = 0; }
+    def = unit_def_for(last_kind);
+    if (def != 0) {
+        wc1_resources_refund(def.cost_gold, def.cost_wood);
+    }
+    return 1;
 }
 
 // Advance a completed building's training queue by one frame. When
@@ -158,7 +199,7 @@ wc1_production_try_click(world, eid, mx, my) {
 // it returns immediately for non-producers (train_count == 0).
 static void _tick_training(w, eid) {
     auto b: Building, def: UnitDef, fa: Faction, bdef: BuildingDef;
-    auto p_b: Pos, dt, front, q, sgx, sgy, atlas, player, i;
+    auto p_b: Pos, dt, front, q, sgx, sgy, atlas, player, i, new_eid;
     b = ecs_get(w, building_comp, eid);
     if (b.train_count <= 0) { return; }
     q     = b.train_queue;
@@ -173,18 +214,17 @@ static void _tick_training(w, eid) {
     player = fa.player;
     bdef   = building_def_for(b.kind);
     p_b    = ecs_get(w, pos_comp, eid);
-    if (b.rally_gx >= 0) {
-        sgx = b.rally_gx;
-        sgy = b.rally_gy;
-    } else {
-        // One tile below the footprint center. S10.3 replaces this
-        // with proper free-tile resolution + a walk-to-rally order.
-        sgx = (p_b.x + bdef.px_w / 2) / 16;
-        sgy = (p_b.y + bdef.px_h) / 16 + 1;
-    }
+    // Spawn just below the footprint center; if a rally point is set,
+    // issue a move order so the unit walks there (WC1 behaviour)
+    // instead of teleporting onto the rally tile.
+    sgx = (p_b.x + bdef.px_w / 2) / 16;
+    sgy = (p_b.y + bdef.px_h) / 16 + 1;
     atlas = wc1_atlas_for_unit(front, player);
     if (atlas != 0) {
-        ecs_spawn_unit(w, atlas, sgx, sgy, player, front);
+        new_eid = ecs_spawn_unit(w, atlas, sgx, sgy, player, front);
+        if (b.rally_gx >= 0 && new_eid >= 0) {
+            wc1_movement_request(w, new_eid, b.rally_gx, b.rally_gy);
+        }
     }
     // Pop the front of the queue (shift the rest left).
     i = 0;
