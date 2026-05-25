@@ -46,12 +46,16 @@ SCUMM defined LucasArts. SCI defined Sierra. bangscript defines B++.
 | **Ren'Py** | Tom Rothamel | 2004-present | `.rpy` files | Line-oriented, indent-based. Millions of games made. Most successful modern adventure DSL. |
 | **Ink** | Inkle Studios | 2016-present | `.ink` files | Pure narrative format. Branching, conditions, diversions. 80 Days, Heaven's Vault. |
 | **Yarn Spinner** | Secret Lab | 2015-present | `.yarn` files | Unity integration. Line-oriented, node-based dialogue. |
+| **AyumuScript** | pac-ac (OsakaOS) | 2024-present | embedded OS shell | Line-based parser inside a hobby OS. **Special variables (`$KEY_CHAR`, `$MOUSE_X`)** expose runtime state as the engine-script boundary. `ex` (sync) vs `ext` (async-task) execution modes. ~150 LOC interpreter handles loops, conditions, functions, lists. See [pac-ac/osakaOS](https://github.com/pac-ac/osakaOS). |
 
 bangscript takes from each: AGI/SCI's resource separation, SCUMM's
-parallel actor model, Ren'Py's line-oriented readability, and Ink's
-narrative purity. The `.bang` format is closest to Ren'Py in syntax
-but closer to SCUMM in execution model (coroutine scheduler, not
-linear script).
+parallel actor model, Ren'Py's line-oriented readability, Ink's
+narrative purity, and **AyumuScript's special-variable boundary
+between engine state and script logic** (added 2026-05-25 after the
+OsakaOS deep-dive — see "Script Expressivity" section below). The
+`.bang` format is closest to Ren'Py in syntax but closer to SCUMM in
+execution model (coroutine scheduler, not linear script), with
+AyumuScript's `$var` convention adopted for runtime-state reads.
 
 ---
 
@@ -82,9 +86,20 @@ The artist is confirmed — original assets, no copyright issues.
 - Numbers are integer literals.
 - Suffix `s` = seconds, `ms` = milliseconds, `f` = frames.
 - `#` starts a comment.
-- `set` / `check` for boolean flags.
+- `set` / `check` for boolean flags (binary persistent state).
+- `var` for script-local variables (scene-scoped numeric/string state).
+- `$name` reads a value — either a script-defined `var` or a
+  special variable published by the engine (`$mouse_x`, `$time_sec`,
+  etc. — see "Special Variables" below).
+- Expressions in conditions: `check $score >= 100`, `check $hp > 0`.
 - `call` invokes a B++ function (the bridge to custom logic).
 - `par` executes children in parallel (waits for all to finish).
+- `spawn` starts a child block in the background and continues
+  immediately — fire-and-forget, used for NPC behaviors that
+  outlive the parent block.
+- `loop` / `pool` repeats a block while a condition holds (or a
+  fixed count). Different from `par` — `loop` is sequential
+  iteration.
 - `choice` / `label` / `goto` for branching.
 
 ### Scene definition
@@ -154,6 +169,144 @@ dialogue guard_encounter
     say guard "I'm calling security."
     goto game_over
 ```
+
+### Special variables (engine → script boundary)
+
+Inspired by **AyumuScript** in OsakaOS, the engine publishes runtime
+state as **read-only special variables** that scripts read with the
+`$` prefix. This replaces dozens of small B++ callbacks with direct
+script reads.
+
+Engine-published variables (read-only from script):
+
+| Variable | Type | Source |
+|---|---|---|
+| `$mouse_x`, `$mouse_y` | int | cursor position in screen coords |
+| `$mouse_click` | int (0/1) | 1 if mouse pressed this frame |
+| `$key_last` | int | last raw key code received |
+| `$key_pressed` | int (0/1) | 1 if any key down this frame |
+| `$time_sec`, `$time_ms` | int | elapsed time since `bangs_init` |
+| `$frame_count` | int | total frames rendered |
+| `$player_x`, `$player_y` | int | player actor position |
+| `$current_scene` | string | id of the active scene |
+| `$active_actor` | string | actor currently in focus (last spoke) |
+| `$random_0_100` | int | new random integer 0-99 per read |
+| `$dt_ms` | int | frame delta in milliseconds (read by AI behaviors) |
+
+Mutations always flow one way: **script reads via `$`, writes via
+`call` to a B++ function**. The engine never lets script write
+runtime state directly — that boundary stays clean.
+
+Example — branching on live state:
+
+```bang
+hotspot ambient_check at 0 0 800 600
+  on enter
+    if $time_sec > 60
+      say indy "I've been here too long."
+    fi
+    if $mouse_x > 400
+      face indy right
+    fi
+```
+
+This eliminates the "create a flag for every comparison" antipattern.
+
+### Script-local variables (`var`)
+
+Scenes can declare local variables that exist only for the scene's
+lifetime — they reset on `bangs_enter`. Useful for counters, temps,
+and accumulators that don't need to persist as flags.
+
+```bang
+scene office
+  var visit_count 0
+  var last_item_picked "none"
+
+  on enter
+    var visit_count $visit_count + 1
+    if $visit_count > 3
+      say indy "I keep coming back here."
+    fi
+
+  hotspot desk at 100 200 50 50
+    on pick
+      var last_item_picked "key"
+      say indy "I picked up the key."
+```
+
+`var` accepts expressions on the RHS (numeric: `+ - * / %`,
+comparisons: `< <= > >= == !=`, strings: literal only). The
+expression evaluator is shared with `check`.
+
+### General loops (`loop` / `pool`)
+
+`par` runs children concurrently and waits for all. `loop` repeats
+sequentially while a condition holds (or for a fixed count).
+
+```bang
+# Loop while condition is true:
+behavior guard_patrol
+  loop $guard_alert == 0
+    walk guard waypoint_a 3s
+    wait 1s
+    walk guard waypoint_b 3s
+    wait 1s
+  pool
+  say guard "I see you!"
+
+# Loop a fixed number of times:
+cutscene knock_at_door
+  loop 3
+    sound "knock.wav"
+    wait 500ms
+  pool
+  say indy "Someone's here."
+```
+
+### Async background tasks (`spawn`)
+
+`par` blocks the parent until all children complete. `spawn` starts
+a child block in the background and the parent continues
+immediately. The spawned task runs as a separate coroutine — useful
+for NPC behaviors that should outlive the cutscene that started
+them.
+
+```bang
+cutscene intro
+  fade_in 2s
+  spawn guard_patrol      # guard starts walking, doesn't block
+  say indy "Time to leave."
+  walk indy door 3s
+  # guard_patrol is still running here, will continue after cutscene
+```
+
+Maps to AyumuScript's `ex` (sync, like `par`) vs `ext` (async, like
+`spawn`) distinction.
+
+### Function definitions (post-MVP Phase 1)
+
+Reusable named blocks for DRY patterns. Stored alongside scenes in
+the scene graph; invoked by name with positional args.
+
+```bang
+function greet(actor_id, greeting)
+  walk $actor_id indy 2s
+  face $actor_id indy
+  say $actor_id $greeting
+end
+
+scene tavern
+  on enter
+    greet bartender "Welcome traveler!"
+    greet patron_1 "What's the news?"
+    greet patron_2 "Have a drink with me."
+```
+
+Function args use `$arg_name` to read inside the body. Return values
+via `$R` (mirrors AyumuScript). **Out of MVP scope** — adds ~100 LOC
+for call stack + arg binding. Tracked for Phase 1 after the MVP
+ships.
 
 ### Callbacks to B++ for complex logic
 
@@ -282,30 +435,36 @@ right after the RPG Dungeon demo, before metaprog and the RTS.
 
 ---
 
-## Runtime Modules (NEW — ~1430 Lines Total)
+## Runtime Modules (NEW — ~1680 Lines Total)
 
-### `stbbangs.bsm` (~700 lines) — The Complete bangscript Engine
+### `stbbangs.bsm` (~950 lines) — The Complete bangscript Engine
 
 Combines the `.bang` parser, coroutine scheduler, command dispatcher,
-and flag machine in a single module. This is the heart of bangscript.
+flag machine, special-variable publisher, and expression evaluator in
+a single module. This is the heart of bangscript.
 
 ```
 // Initialization and loading.
-bangs_init()                     — Allocate scheduler arena, command arrays.
+bangs_init()                     — Allocate scheduler arena, command arrays, var table.
 bangs_load(dir_path)             — Parse all .bang files in a directory.
-bangs_enter(scene_id)            — Activate a scene, load bg, register hotspots.
+bangs_enter(scene_id)            — Activate a scene, load bg, register hotspots, reset scene-local vars.
 
 // Game loop integration.
-bangs_tick(dt, mx, my, click)    — Advance coroutines, check hotspots, dispatch verbs.
+bangs_tick(dt, mx, my, click)    — Publish special vars, advance coroutines, check hotspots, dispatch verbs.
 bangs_draw()                     — Render active scene (bg, actors, speech bubbles, verb bar).
 
 // Callback registry (bridge to B++ game logic).
 bangs_register(name, fn_ptr)     — Register a B++ function as a .bang callback.
 
-// State flags (persistent puzzle state).
+// Special variable publishing (engine → script boundary).
+bangs_publish(name, val)         — Publish a special variable for scripts to read via $name.
+                                   Called every tick for $mouse_x/$mouse_y/$time_sec/etc.,
+                                   and on demand for $player_x/$active_actor.
+
+// State flags (persistent binary puzzle state).
 bangs_flag_set(id, val)          — Set a flag.
 bangs_flag_get(id)               — Read a flag.
-bangs_save(path)                 — Serialize all flags + current scene to file.
+bangs_save(path)                 — Serialize all flags + vars + current scene to file.
 bangs_load_save(path)            — Restore saved state.
 
 // Cutscene primitives (called from B++ callbacks).
@@ -313,13 +472,23 @@ bangs_say(actor, text)           — Show speech bubble.
 bangs_walk(actor, x, y, speed)   — Move actor.
 bangs_sound(path)                — Play sound effect.
 bangs_music(path)                — Start music loop.
+
+// Live REPL (dev-time iteration, AyumuScript-inspired).
+bangs_repl_eval(line)            — Parse + execute one .bang line against the current scene.
+                                   Used by Bang 9 / level_editor for interactive scene authoring.
 ```
 
 Internally:
-- `.bang` parser: ~300 lines (line-oriented, indent-based)
-- Coroutine scheduler: ~150 lines (fixed 64 slots, arena-allocated)
-- Command dispatcher: ~200 lines (switch over ~20 command types)
+- `.bang` parser: ~400 lines (line-oriented, indent-based, expression
+  evaluator for `var` RHS and `check` conditions)
+- Coroutine scheduler: ~150 lines (fixed 64 slots, arena-allocated,
+  supports `par` / `spawn` / `loop`)
+- Command dispatcher: ~280 lines (switch over ~25 command types
+  including `var` / `loop` / `pool` / `spawn`)
 - Flag machine: ~50 lines (array of id→value pairs)
+- Special-variable table: ~50 lines (name→value hash, published per
+  tick, read on demand)
+- REPL eval helper: ~20 lines (parse one line, dispatch to handler)
 
 ### `stbverb.bsm` (~200 lines) — Verb / Interaction System
 
@@ -363,15 +532,21 @@ cursor_over_hotspot()            — Returns hotspot_id or -1.
 
 | Category | Lines | When |
 |----------|-------|------|
-| `stbbangs.bsm` (parser + scheduler + dispatcher + flags) | ~700 | After RPG ships |
+| `stbbangs.bsm` (parser + scheduler + dispatcher + flags + special vars + REPL) | ~950 | After RPG ships |
 | `stbverb.bsm` | ~200 | Together with stbbangs |
 | `stbcursor.bsm` | ~80 | Together |
 | Adventure demo game code (`.bpp` + `.bang` files) | ~500-800 | After all modules ship |
-| **Total bangscript-specific** | **~1500-1800** | **~3-5 weeks** |
+| **Total bangscript-specific** | **~1730-2030** | **~4-6 weeks** |
 
 Compare to the embedded approach: **~2300-2600 lines, ~4-6 weeks**.
-The `.bang` format saves ~800 lines and 1-2 weeks, AND removes the
-metaprog dependency.
+The `.bang` format saves ~600 lines and 0-2 weeks even with the
+AyumuScript-inspired additions, AND removes the metaprog dependency.
+
+The ~250 LOC over the original ~1500-1800 estimate comes from the
+AyumuScript-derived additions (special variables, expression
+evaluator, `var` / `loop` / `spawn` commands, REPL eval). The
+expressivity gain is large — many puzzle/scene patterns that would
+have needed B++ callbacks become readable `.bang` directly.
 
 ---
 
@@ -501,6 +676,34 @@ hotspot clicked → `say` command executed → speech bubble rendered.
 7. **`.bang` file discovery.** Load all `.bang` files in a directory
    (`bangs_load("scenes/")`) or explicit manifest? Directory scan is
    simpler and matches the "drop a file, it works" workflow.
+
+8. **`var` scoping rules** (AyumuScript addition). Three options:
+   - **Scene-local** (default): vars reset on `bangs_enter`. Simple,
+     prevents leaks across scenes. Limits cross-scene state to flags.
+   - **Function-local** (when functions ship in Phase 1): vars
+     declared inside `function ... end` are scope-bound, separate
+     from scene vars. Mirrors AyumuScript's call stack.
+   - **Global** (opt-in via `global $name` syntax): a small set of
+     truly persistent vars (`$money`, `$party_size`). Persists with
+     flags in saves.
+
+   Recommend: scene-local default, function-local for Phase 1,
+   `global` opt-in via `set` extension (`set $money 100` to declare
+   a persistent numeric — flags can already do this if we generalise
+   them to int values).
+
+9. **Special variable refresh cadence**. Every-tick vars (`$mouse_x`,
+   `$time_sec`) cost ~30 ns/tick of write traffic per var (~10 vars
+   = ~300 ns/tick total — negligible). On-demand vars
+   (`$current_scene`, `$active_actor`) only re-publish on change.
+   Recommend: publish-every-tick for input + time, publish-on-change
+   for scene state, both via the same `bangs_publish(name, val)` API.
+
+10. **REPL eval scope**. The Bang 9 / level_editor REPL evaluates one
+    `.bang` line at a time against the current scene. Open: does the
+    REPL share `var` state with the running scene, or have its own
+    isolated scratch scope? Recommend shared — feels like a debugger
+    where you can poke at scene state, not a sandbox.
 
 ---
 

@@ -2914,16 +2914,20 @@ is what smart-dispatch produces when its scanner accepts the
 loop; if the scanner rejects (shape mismatch, body too complex),
 the loop runs SERIAL silently — no diagnostic.
 
-**Capture-driven outlining (loops with caller-frame refs)
-requires `@safe` on the HOST function, not just the callee.**
-As of 2026-05-22 (`a6fa70a`, load/import arc close), the
-dispatch pipeline rejects capture-driven outlining when the
-enclosing function is not `@safe`-annotated. Reason: an
-outlined loop calls `job_parallel_for_data` to spawn workers;
-if the host can be reached from a signal-handler / interrupt
-context (SIGPROF, etc.), the dispatch is illegal. The `@safe`
-annotation is the explicit programmer contract for "this
-function is OK in worker / dispatch context."
+**Both outlining AND MAP require `@safe` on the HOST function,
+not just the callee.** As of 2026-05-23 (`48d16e1`, strict gate
+doctrine), the dispatch pipeline rejects ANY parallel-loop
+candidate when the enclosing function is not `@safe`-annotated
+— both capture-driven outlining (loops with caller-frame refs)
+and pure MAP (index iteration only) flow through the same gate.
+The earlier gate (2026-05-22 `a6fa70a`) only covered outlining;
+the strict version covers MAP too. Reason: even pure indexed
+writes are safe *in isolation*, but the host function's OTHER
+state (allocator, GPU pipeline, audio ring, font glyph atlas)
+gets touched indirectly through call sites near the loop. The
+gate's level is the FUNCTION contract, not the loop body. The
+`@safe` annotation is the explicit programmer contract for
+"this function is OK in worker / dispatch context."
 
 ```c
 // REJECTED — host not @safe, loop has caller-frame `dt` capture:
@@ -2945,10 +2949,63 @@ void update(dt: float, payload) @safe {
         e.cooldown = e.cooldown - dt;
     }
 }
+
+// ALSO REJECTED — pure MAP shape but host not @safe:
+void init_game() {
+    auto i;
+    for (i = 0; i < MAX_BODY * 2; i++) {
+        body[i] = 0;        // no captures, just indexed write
+    }
+}
 ```
 
-Pure MAP (no captures, just index iteration) does not require
-the host to be `@safe` — the callee's own annotation suffices.
+### What hosts should NOT be `@safe` (audit closeout)
+
+The strict gate emerged from a real regression: load/import P6
+(`7dd3ff6`) made stb-module synth functions reach the binary
+for the first time, exposing months of accepted-but-orphan MAP
+matches in stb hot loops. snake_maestro lost its particle
+explosion (yellow dot regression), FPS got a magenta overlay.
+The fix: tighten the gate so the matcher rejects every host
+that isn't `@safe`-annotated.
+
+An audit of the 5 stb hosts that the old matcher accepted but
+the strict gate now rejects confirmed **none should be `@safe`:**
+
+| Host | Loop shape | Why not `@safe` |
+|------|-----------|-----------------|
+| `profile_start` (bpp_runtime) | 32-iter zero `_prof_*` rings | host calls allocator + SIGPROF syscall; init-once, never reached from worker |
+| `mixer_init` (stbmixer) | 3-iter bus-volume copy | host malloc-heavy; init-once |
+| `init_ui_layout` (stbui) | ~64-iter zero `_ui2_clicks_*` | host mallocs UI pool; startup-only |
+| `ui_frame_begin` (stbui) | ~64-iter zero | per-frame main-thread; no worker contract |
+| `init_game` (snake_maestro) | ~200-iter zero `body[]` | game-start main-thread; no worker contract |
+
+The matcher detected loop SHAPE (pure indexed zero/copy =
+textbook parallelize), but the contract on the HOST function
+isn't "worker-safe" — these are all init or per-frame paths
+that never run inside `job_parallel_for_data`. The strict gate
+filters at exactly the right level: `@safe` claims "OK in
+worker context", not "this loop is shape-eligible."
+
+Real `@safe` candidates look different:
+  - hot per-frame inner loops with N >> 16 (worth dispatch cost)
+  - worker entry points called by `job_parallel_for(N, fn_ptr(W))`
+  - compute-bound helpers workers transitively reach
+
+`wolf_ai_tick_cooldowns @safe` in `games/fps/ai.bsm` is the
+canonical positive case: per-frame, N=~30, body has cooldown
+arithmetic + indexed writes only, no allocator path.
+
+### W032 retired — the gate is the audit
+
+A `W032` diagnostic briefly existed (`48d16e1` → `e4bdf9a`) to
+surface every accepted parallel-dispatch candidate "for
+programmer audit." Once the strict gate filtered non-`@safe`
+hosts BEFORE the warning emit, the diagnostic became redundant
+noise — it fired only on hosts the programmer had already
+opted in via `@safe`. The `@safe` annotation IS the audit; the
+gate is the door. Use `--dispatch` for an explicit candidate
+dump when investigating.
 
 ### Both forms run the SAME runtime (parity validated)
 
@@ -3234,3 +3291,143 @@ shape as Rule 4.
   full reasoning for why `@safe` doesn't extend to autovec.
 - Phase B4 initial ship — 2026-04-15 journal entry; the 11
   `vec_*` builtins are the explicit-form vocabulary.
+
+## Rule 40: Hot-path malloc/free is a frame-jitter trap
+
+Any function called per-frame, per-tick, or per-input event
+that does `buf = malloc(N); ... free(buf);` around a scratch
+buffer is a steady-state perf bug. The malloc itself is
+usually cheap (free-list hit, ~20 cycles), but allocating
+and freeing in tight cadence keeps the free-list churning,
+and any allocation that overlaps with another subsystem's
+allocator activity can spill into a fresh kernel page
+(`_mem_alloc_pages` syscall, ~50-200µs). One spilled page
+in the wrong frame = missed frame budget = visible jitter.
+
+The fix is the same every time: **pre-allocate the scratch
+buffer at module init, store as file-scope `static`, reuse.**
+
+```c
+// File scope:
+static auto _render_num_scratch;
+
+// In module's init function (render_init / init_profile / etc.):
+_render_num_scratch = malloc(24);   // size for the worst case
+
+// Hot function — was:
+void render_number(...) {
+    auto buf;
+    buf = malloc(24);     // ← per-call malloc
+    ... format int into buf ...
+    render_text(buf, ...);
+    free(buf);            // ← per-call free
+}
+
+// Hot function — now:
+void render_number(...) {
+    auto buf;
+    buf = _render_num_scratch;   // ← pre-allocated, no malloc
+    ... format int into buf ...
+    render_text(buf, ...);
+    // no free — buffer is module-owned
+}
+```
+
+### When the rule applies
+
+Apply to any function whose call-rate × allocation-size
+makes the free-list spillover plausible:
+
+- **HUD overlays** — FPS counter, profile zone table, debug
+  text overlay. Called every render frame.
+- **Per-tick scratch** — particle update, AI cooldown decay,
+  any maestro `base` callback that needs a temporary buffer.
+- **Per-input handlers** — text input echo, key event log.
+- **Hot-reload watchers** — file mtime check loops (the
+  watcher is per-frame even if the actual reload is rare).
+
+### When the rule does NOT apply
+
+- **One-shot init** — game_init, level_load, asset_load.
+  These run once. Per-call malloc/free is correct.
+- **User input dialogs** — file_open dialog, alert box.
+  Rare events, small allocations, no jitter concern.
+- **Truly variable-size hot paths** — if the buffer size
+  depends on per-call input that can grow unboundedly,
+  pre-allocation needs a "grow as needed" wrapper. The
+  scratch-buffer pattern works when the worst case is
+  bounded and small (typical HUD case).
+
+### Worked example — fps_wolf3d 60→59 fps flicker (2026-05-25)
+
+Steady-state profiler runs surfaced a 1-2 frame/sec drop in
+the FPS readout (60→59→60→59 flicker). Live HUD showed
+`ms:17 max:18` — average frame time 17ms, max 18ms, a ~50µs
+spike pattern. Top-N profile (`profile_dump`) showed
+`_mem_alloc_pages` with 22 samples out of ~4000 — only
+0.5% of total time, but concentrated on bad frames.
+
+Tracing the call chains with `profile_print_chains`
+(`src/bpp_runtime.bsm`) revealed three offending sites:
+
+| Site | Calls per frame | Cause |
+|------|----------------|-------|
+| `render_number` (stbrender) | 10-20 (FPS HUD, top-N list, zone numbers) | `malloc(24)` for itoa scratch every call |
+| `profile_zones_hud_draw` (stbprofile) | 1 (drew the zone panel) | `buf_word(n_top) + buf_byte(n)` for sort scratch |
+| `_profile_dump_inner` (bpp_runtime) | 1 (HUD aggregates samples) | `buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS)` x2 |
+
+All three were the same pattern: malloc / free around a
+fixed-size or bounded scratch buffer. All three fixed by
+pre-allocating in the relevant init (`render_init` /
+`init_profile` / lazy on first `_profile_dump_inner` call).
+
+Result: `_mem_alloc_pages` samples dropped 22 → 4 (95%
+reduction, residual is legitimate file_watch + GPU flush
+allocations). Live HUD steady at `ms:17 max:17` — variance
+collapsed to zero, no visible flicker.
+
+### Diagnostic — `profile_print_chains(name)`
+
+Added to `src/bpp_runtime.bsm` during the 2026-05-25
+investigation. Walks every captured SIGPROF sample and
+prints the stack chain when the innermost frame's resolved
+name matches `name`. Reverse of `profile_dump`'s
+aggregated top-N view: answers "who called X?" instead
+of "what runs hot?".
+
+Usage:
+```c
+void quit_phase() {
+    put_err("--- malloc chains ---\n");
+    profile_print_chains("_mem_alloc_pages");
+    put_err("--- end ---\n");
+}
+```
+
+Each chain prints one line, innermost frame leftmost:
+```
+[t0] _mem_alloc_pages <- malloc <- render_number <- profile_hud_draw <- ...
+```
+
+Filter by any function name to see its callers across all
+threads' rings. Standard tool for any future spike
+investigation.
+
+### The general lesson
+
+`profile_dump` (top-N aggregated by innermost) understates
+spike-bound problems because spike causes are RARE samples
+concentrated in specific frames. The 0.5% sample rate of
+`_mem_alloc_pages` was real and important. **For spike-
+bound diagnosis, always look at the tail.** Call chains
++ frame-time histograms expose what averages hide.
+
+### Cross-references
+
+- `src/bpp_runtime.bsm` — `profile_print_chains` definition.
+- Phase 6.3 — `@profile("name")` scoped zones; the
+  complementary tool to track per-zone time consumption.
+- Rule 23 — cartridge minimalism; init scratch buffers stay
+  in the cartridge that owns the hot path.
+- Commit `d03127b` — the 2026-05-25 investigation
+  (render_number / profile_zones_hud_draw / _profile_dump_inner).

@@ -933,15 +933,19 @@ The compiler:
    - publish: push captures onto host's stack frame
    - dispatch: call `job_parallel_for_data(_cap, fn_ptr(__synth_N), &captures)`
 
-The `@safe` annotation on the host is **required** for capture-
-driven outlining. Reason: the synth dispatches workers, which is
-illegal in signal-handler / interrupt context. The annotation is
-the explicit programmer contract for "this function is OK in
-worker / dispatch context."
-
-Pure MAP (no captures, just index iteration like
-`update_one_unit(i)`) does NOT require host `@safe` — the
-callee's own annotation suffices.
+The `@safe` annotation on the host is **required** for both
+capture-driven outlining AND pure MAP dispatch. The strict gate
+(2026-05-23, `48d16e1`) rejects every parallel-loop candidate
+whose host is not `@safe`-annotated — even when the loop body
+has no captures and looks like a textbook indexed-write MAP.
+Reason: an outlined or MAP-rewritten loop dispatches workers
+via `job_parallel_for_data`, which is illegal in signal-handler
+/ interrupt context. The annotation is the explicit programmer
+contract for "this function is OK in worker / dispatch
+context." See Tonify Rule 38 for the audit closeout — 5 stb
+init hosts had loop shapes the matcher accepted but the host
+contract said "main-thread only", so the gate's rejection was
+correct.
 
 Compose: when outlining + autovec both fire on the same loop,
 the synth body itself becomes a 4-wide SIMD vector loop + scalar
