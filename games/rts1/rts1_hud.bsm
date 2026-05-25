@@ -88,6 +88,13 @@ const _CMD_PORTRAIT_BG    = 0xFF3A3A3A;     // dark gray
 const _CMD_FRAME_COLOR    = 0xFF6A6A6A;     // medium gray
 const _CMD_TEXT_COLOR     = 0xFFFFFFFF;     // white
 const _CMD_TEXT_DIM       = 0xFFB0B0B0;     // dimmed gray
+// S10 — command-card train button grid (right portion of the card).
+// Geometry is exposed via wc1_cmd_button_rect so the input tick
+// hit-tests the same rects the render draws (single source of truth).
+const _CMD_BTN_PX   = 36;    // square train button
+const _CMD_BTN_GAP  = 6;
+const _CMD_BTN_X0   = 296;   // left edge of the button row (480-wide card)
+const _CMD_BTN_UNAFFORD = 0xFF402020;   // dim red border when too poor
 
 // Source dims of the WC1 portrait icon strip (27×19 per frame, 93
 // frames stacked vertically — see war1gus icons.lua Size = {27,
@@ -524,6 +531,67 @@ static void _draw_portrait(box_x, box_y, frame_idx) {
                     _PORTRAIT_DRAW_W, _PORTRAIT_DRAW_H);
 }
 
+// Top Y of the command-card strip (world above, HUD below). Exposed
+// as a function so the input tick can ask "did this click land on the
+// HUD?" without depending on _CMD_BAR_HEIGHT_PX being in scope (the
+// input module loads before this one, so the const isn't visible
+// there — a function resolves at link time regardless of order).
+wc1_cmd_bar_y() { return SCREEN_H - _CMD_BAR_HEIGHT_PX; }
+
+// Fill `out` (a buf_word with >= 4 slots) with the [x, y, w, h] pixel
+// rect of train-button slot `slot`. Single source of truth shared by
+// the render (draws the button) and the input tick (hit-tests the
+// click), so the two never drift. Buttons lay out left-to-right in a
+// row anchored to the right portion of the card.
+wc1_cmd_button_rect(slot, out) {
+    out[0] = _CMD_BTN_X0 + slot * (_CMD_BTN_PX + _CMD_BTN_GAP);
+    out[1] = wc1_cmd_bar_y() + 14;
+    out[2] = _CMD_BTN_PX;
+    out[3] = _CMD_BTN_PX;
+    return 0;
+}
+
+// Draw the train buttons for a completed producer building: one
+// button per kind in the building's train menu, each showing the
+// unit portrait icon + its gold cost. Unaffordable buttons render
+// with a dim red border + dimmed cost so the player reads the gate
+// at a glance. The actual click → enqueue happens in wc1_input's
+// _cmd_card_click, which hit-tests the same wc1_cmd_button_rect.
+static void _draw_train_buttons(world, kind, player) {
+    auto menu, n, i, rect, bx, by, bw, bh, ukind, def: UnitDef;
+    auto frame, afford, border, sb;
+    menu = buf_word(8);
+    n = wc1_train_menu(kind, player, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        ukind = menu[i];
+        def = unit_def_for(ukind);
+        afford = def != 0 && wc1_resources_can_afford(def.cost_gold, def.cost_wood);
+        // Button backdrop + border (dim red when unaffordable).
+        render_rect(bx, by, bw, bh, _CMD_PORTRAIT_BG);
+        border = afford != 0 ? _CMD_FRAME_COLOR : _CMD_BTN_UNAFFORD;
+        render_rect_outline(bx, by, bw, bh, border);
+        // Unit portrait icon scaled into the button interior.
+        frame = _unit_portrait_frame(ukind, player);
+        image_draw_size(portrait_icons_atlas, frame,
+                        bx + 2, by + 2, bw - 4, bh - 4);
+        // Gold cost just below the button.
+        if (def != 0) {
+            sb = strbuf_new();
+            sb = strbuf_num(sb, def.cost_gold);
+            render_text(sb, bx, by + bh + 1, 1,
+                        afford != 0 ? _TOP_BAR_TEXT_COLOR : _CMD_TEXT_DIM);
+            strbuf_free(sb);
+        }
+        i = i + 1;
+    }
+    free(menu);
+    free(rect);
+}
+
 extrn unit_comp;
 static void _command_card_render(world) {
     auto bar_y, eid, sx, sy;
@@ -604,6 +672,13 @@ static void _command_card_render(world) {
     }
     render_text(hp_sb, sx, sy + 12, 1, _CMD_TEXT_DIM);
     strbuf_free(hp_sb);
+    // S10 — train buttons for the player's own completed producers.
+    // Non-producers (farm / tower / mine) get an empty menu and draw
+    // nothing; enemy buildings show no buttons (you command your side
+    // only). fa.player == 0 is the human convention used everywhere.
+    if (b.state == BLDG_STATE_DONE && fa.player == 0) {
+        _draw_train_buttons(world, b.kind, fa.player);
+    }
 }
 
 // Per-building bar callback. CONSTRUCTING buildings show a
