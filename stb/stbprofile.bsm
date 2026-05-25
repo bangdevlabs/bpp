@@ -172,6 +172,11 @@ global _profile_zone_stack_depth;
 extrn _profile_save_stack;
 global _profile_save_depth;
 
+// Reusable scratch buffers for profile_zones_hud_draw — see
+// init_profile and the function body for the per-frame motivation.
+extrn _profile_zones_sorted_idx;
+extrn _profile_zones_used_mask;
+
 // Cross-module hook: `bpp_runtime`'s `panic` reads this fp and,
 // if non-null, calls it before printing the trace. `init_profile`
 // installs `_prof_drain_all` here so panic-time profile dumps see
@@ -209,6 +214,16 @@ void init_profile() {
     // Phase 6.3 v2 — per-function depth-snapshot stack.
     _profile_save_stack       = buf_byte(_PROF_SAVE_MAX * 8);
     _profile_save_depth       = 0;
+
+    // Scratch buffers for profile_zones_hud_draw's selection-sort
+    // pass. Sized for the worst case (_PROFILE_ZONE_HUD_TOP for the
+    // sorted index, _PROFILE_ZONE_MAX for the per-iteration "used"
+    // mask). Pre-allocating means the HUD's per-frame draw doesn't
+    // malloc/free a fresh pair each frame — surfaced as the top
+    // _mem_alloc_pages contributor after render_number was fixed
+    // (60→59 fps flick investigation, 2026-05-25).
+    _profile_zones_sorted_idx = buf_word(_PROFILE_ZONE_HUD_TOP);
+    _profile_zones_used_mask  = buf_byte(_PROFILE_ZONE_MAX);
 
     // Phase 6.3 v2 — register the drain hook so `panic()` can
     // close open zones at abort time. Idempotent across repeated
@@ -681,13 +696,14 @@ void profile_zones_hud_draw(x, y, sz, color)  {
 
     // Selection-sort top _PROFILE_ZONE_HUD_TOP entries by total_us.
     // Tiny N (cap 16, top 4) so an O(N²) pass costs nothing.
-    auto sorted_idx, n_top, i, j, best, best_total, cand_total;
+    // Uses pre-allocated _profile_zones_sorted_idx / _used_mask
+    // (init_profile) so the per-frame draw doesn't malloc/free.
+    auto sorted_idx, used, n_top, i, j, best, best_total, cand_total;
+    sorted_idx = _profile_zones_sorted_idx;
+    used = _profile_zones_used_mask;
     n_top = _profile_zone_count;
     if (n_top > _PROFILE_ZONE_HUD_TOP) { n_top = _PROFILE_ZONE_HUD_TOP; }
-    sorted_idx = buf_word(n_top);
-    auto used;
-    used = buf_byte(_profile_zone_count);
-    buf_fill(used, 0, _profile_zone_count);
+    buf_fill(used, 0, _PROFILE_ZONE_MAX);
     for (i = 0; i < n_top; i++) {
         best = -1;
         best_total = 0;
@@ -703,7 +719,6 @@ void profile_zones_hud_draw(x, y, sz, color)  {
         sorted_idx[i] = best;
         poke(used + best, 1);
     }
-    free(used);
 
     render_text("ZONES (avg us | count)", x, y, sz, color);
     auto row_y, idx, off, name_p, total_us, cnt, avg_us;
@@ -721,7 +736,8 @@ void profile_zones_hud_draw(x, y, sz, color)  {
         render_number(x + 24 * 8 * sz, row_y, sz, color, cnt);
         row_y = row_y + 10 * sz;
     }
-    free(sorted_idx);
+    // sorted_idx + used point at the pre-allocated module-scope
+    // scratch buffers; no free here.
 }
 
 // Standalone FPS counter — renders just the "FPS: <n>" line at the

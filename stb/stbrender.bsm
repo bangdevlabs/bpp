@@ -42,10 +42,20 @@ import "stbpal.bsm";
 // games that already invoke `render_init` explicitly are
 // unaffected — the second call returns immediately.
 static auto _stbrender_inited;
+// Pre-allocated 24-byte scratch buffer used by `render_number` to
+// itoa-format the integer to a null-terminated string before handing
+// it off to render_text. Allocated once at init so the HUD's
+// per-frame `render_number` calls (FPS counter, top-N profile
+// table, etc.) don't malloc/free a fresh 24-byte buffer each time.
+// 24 bytes is the canonical itoa scratch (matches str_from_int's
+// header guidance) — enough for any signed 64-bit integer plus a
+// minus sign and null terminator.
+static auto _render_num_scratch;
 void render_init() {
     if (_stbrender_inited != 0) { return; }
     _stbrender_inited = 1;
     _stb_gpu_init(SCREEN_W, SCREEN_H);
+    _render_num_scratch = malloc(24);
 }
 
 // Start a GPU render frame. Call at the top of the draw section.
@@ -329,10 +339,20 @@ void render_text(text, x, y, sz, color) {
     }
 }
 
-// Draw an integer number on GPU. Converts to string then calls render_text.
+// Draw an integer number on GPU. Converts to string then calls
+// render_text. Uses the pre-allocated `_render_num_scratch` buffer
+// instead of malloc/free per call — at HUD rates (10-20 calls per
+// frame for the profile overlay) the per-call malloc+free pair
+// accumulates into page-allocator pressure (each 24-byte malloc
+// occupies a free-list slot until the next free, and when render_text
+// allocates internally between malloc and free here the free list
+// can spill into a fresh page-allocation syscall). Identified as the
+// top contributor to a 60→59 fps flick on fps_wolf3d 2026-05-25:
+// _mem_alloc_pages call-chain traces showed render_number → malloc
+// 14 out of 17 sampled page allocations.
 void render_number(x, y, sz, color, val) {
     auto buf, len, tmp, digit, i, j, t, start;
-    buf = malloc(24);
+    buf = _render_num_scratch;
     len = 0; start = 0;
     if (val < 0) { poke(buf, 45); len = 1; start = 1; val = 0 - val; }
     if (val == 0) { poke(buf + len, 48); len++; }
@@ -347,7 +367,6 @@ void render_number(x, y, sz, color, val) {
     }
     poke(buf + len, 0);
     render_text(buf, x, y, sz, color);
-    free(buf);
 }
 
 // Create a GPU texture from a 16x16 palette-indexed sprite.

@@ -784,6 +784,16 @@ static _prof_is_dump_internal(name_addr, name_len) {
 // walk every thread or 0..N-1 to pick one. Tier 3a per-thread
 // breakdown rides on top: callers can iterate thread indices and
 // render each ring's top-N independently — main vs each worker.
+// Scratch buffers for the unique-sample tally. Allocated lazily on
+// the first dump call and reused across every subsequent invocation
+// — the HUD calls profile_dump every frame, so a per-call
+// buf_word allocation cycle was contributing to the 60→59 fps
+// flick (_mem_alloc_pages call-chain trace, 2026-05-25). Sized for
+// the worst case (every ring slot is a unique innermost function);
+// real workloads land far below.
+static auto _prof_dump_name_buf;
+static auto _prof_dump_count_buf;
+
 static _profile_dump_inner(out_buf, cap, target_thread) {
     auto t, t_start, t_end, samples, i, j, k, slot, base, found;
     auto pc, packed, name_addr, name_len, pc_up, packed_up;
@@ -792,9 +802,19 @@ static _profile_dump_inner(out_buf, cap, target_thread) {
 
     if (_prof_inited == 0) { return 0; }
 
-    name_buf  = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
-    count_buf = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
+    if (_prof_dump_name_buf == 0) {
+        _prof_dump_name_buf  = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
+        _prof_dump_count_buf = buf_word(_PROF_MAX_THREADS * _PROF_RING_SLOTS);
+    }
+    name_buf  = _prof_dump_name_buf;
+    count_buf = _prof_dump_count_buf;
     unique_count = 0;
+    // Zero the count buffer so stale counts from the previous dump
+    // call don't bleed into this one. The name slots overwrite
+    // naturally on first hit but counts are accumulated.
+    for (i = 0; i < _PROF_MAX_THREADS * _PROF_RING_SLOTS; i++) {
+        *(count_buf + i * 8) = 0;
+    }
 
     if (target_thread < 0) {
         t_start = 0;
@@ -893,4 +913,76 @@ profile_dump_thread(out_buf, cap, thread_idx) {
     if (thread_idx < 0)                  { return 0; }
     if (thread_idx >= _PROF_MAX_THREADS) { return 0; }
     return _profile_dump_inner(out_buf, cap, thread_idx);
+}
+
+// Spike investigation — walk every captured sample and print the
+// stack chain when the innermost frame's resolved name matches
+// `filter_name` (a null-terminated C-string). The aggregated
+// `profile_dump` view counts unique innermost frames; this helper
+// answers "who called X?" by emitting each chain frame-by-frame
+// to stderr. Useful for one-off perf detective work — e.g. tracing
+// `_mem_alloc_pages` callers to identify which subsystems trigger
+// page-allocation spikes during a hot loop. Returns the number of
+// matching samples printed.
+profile_print_chains(filter_name) {
+    auto t, samples, i, j, slot, base, pc, packed;
+    auto name_addr, name_len, filter_len, hits;
+    if (_prof_inited == 0) { return 0; }
+    // Compute filter string length once (caller-owned C-string).
+    filter_len = 0;
+    while (peek(filter_name + filter_len) != 0) { filter_len++; }
+    hits = 0;
+    for (t = 0; t < _PROF_MAX_THREADS; t++) {
+        samples = *(_prof_count + t * 8);
+        if (samples > _PROF_RING_SLOTS) { samples = _PROF_RING_SLOTS; }
+        for (i = 0; i < samples; i++) {
+            slot = i % _PROF_RING_SLOTS;
+            base = *(_prof_rings + t * 8) + slot * _PROF_MAX_DEPTH * 8;
+            pc = *(base);
+            if (pc == 0) { continue; }
+            packed = _runtime_resolve_pc(pc);
+            if (packed == 0) { continue; }
+            name_addr = _runtime_name_addr(packed);
+            name_len  = _runtime_name_len(packed);
+            // Match length first, then bytes. bpp_runtime intentionally
+            // has no imports (file header) — inline the comparison to
+            // avoid pulling buf_eq into every user program.
+            if (name_len != filter_len) { continue; }
+            auto _bm_ok, _bm_k;
+            _bm_ok = 1;
+            for (_bm_k = 0; _bm_k < filter_len; _bm_k++) {
+                if (peek(name_addr + _bm_k) != peek(filter_name + _bm_k)) {
+                    _bm_ok = 0;
+                    _bm_k = filter_len;
+                }
+            }
+            if (_bm_ok == 0) { continue; }
+            // Emit the chain: thread index, then innermost outward
+            // until depth exhausted or a null PC sentinels the end.
+            hits = hits + 1;
+            put_err("[t");
+            putnum_err(t);
+            put_err("] ");
+            for (j = 0; j < _PROF_MAX_DEPTH; j++) {
+                pc = *(base + j * 8);
+                if (pc == 0) { j = _PROF_MAX_DEPTH; }
+                else {
+                    packed = _runtime_resolve_pc(pc);
+                    if (packed == 0) {
+                        put_err("?");
+                    } else {
+                        auto pn_addr, pn_len, k;
+                        pn_addr = _runtime_name_addr(packed);
+                        pn_len  = _runtime_name_len(packed);
+                        for (k = 0; k < pn_len; k++) {
+                            putchar_err(peek(pn_addr + k));
+                        }
+                    }
+                    put_err(" <- ");
+                }
+            }
+            put_err("\n");
+        }
+    }
+    return hits;
 }
