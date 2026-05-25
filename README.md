@@ -39,136 +39,6 @@ But what if Sean Barrett later joined that group with his STB — all written in
 
 And now we have a standard library that is, itself, a game engine. With audio. And it just played its first chord.
 
-## Compose-Multiplicatively: ~32x for free
-
-A B++ program writes a plain natural-for loop. The compiler
-fans it out across cores AND across SIMD lanes — same source,
-zero annotations beyond `@safe` to say "yes, this function is
-worker-safe."
-
-```bpp
-void tick(dt: float, payload) @safe {
-    auto i;
-    for (i = 0; i < _cap; i++) {
-        auto e: Entity;
-        e = payload + i * sizeof(Entity);
-        e.cooldown = e.cooldown - dt;
-    }
-}
-```
-
-The compiler:
-1. Detects caller-frame captures (`dt`, `_cap`) → wraps in a
-   capture struct, synthesises a worker function, rewrites the
-   host body to call `job_parallel_for_data` (**outlining**,
-   ~6x on 8 cores).
-2. Sees the loop body is a single `half float` store +
-   classifies as autovec pattern P1 → emits a 4-wide SIMD
-   vector loop + scalar tail (**autovec**, ~4x on 4 lanes).
-3. Both fire on the same loop → the worker body itself is
-   SIMD'd (**compose**, theoretical ~32x ceiling).
-
-Measured on `examples/bench_compose.bpp` (single-module, N=1M
-cells × K=100 mul-by-literal rounds):
-
-```
-SERIAL (1 thread, scalar):    303 ms
-COMPOSE (8 cores × 4 SIMD):    19 ms     → 16x measured
-                                          (bandwidth-bound;
-                                           compute-bound workloads
-                                           approach the 32x ceiling)
-```
-
-Multi-module game adoption verified on FPS (`wolf_ai_tick_cooldowns`
-in `games/fps/ai.bsm`): the per-frame cooldown decrement compiles
-to `bl _job_parallel_for_data` with `__synth_4` as the worker.
-
-Stack (each tier composed atop the previous):
-
-| Tier | Source-level | Measured | Doctrine |
-|---|---|---|---|
-| Baseline scalar | natural-for | 1x | "obvious code" |
-| Smart-dispatch outlining | `@safe` on host | ~6x (cores) | "compiler proves; programmer marks safe" |
-| Autovec | type+shape hint via `half float` | ~4x (lanes) | "compiler proves; explicit `vec_*` is the escape hatch" |
-| Compose | both fire on same loop | ~32x ceiling | bandwidth-bound workloads cap earlier |
-
-Bang for the buck: no manual threading, no manual SIMD, no
-build-system tuning. The compiler does the work. The
-`@safe` annotation is the only required user-side cost — and
-it has the same value as `pure` in Haskell or `const` in C: an
-honest contract about what the function does.
-
-## Inline + Outline: the structural-work compiler
-
-The Compose section above shows the headline transformation
-(outlining × autovec). Two adjacent arcs landed in the same
-push window and round out the picture:
-
-**S4 cost-model inliner** (May 21). Trivial helpers — single-
-return accessors, integer arithmetic, struct field reads —
-splice their body at every call site. The classic motivating
-case is `xorshift64(state) → state ^ ...`: a 7-statement RNG
-helper that used to cost a call frame per use and now compiles
-to a 30-instruction inline sequence. Both single-statement
-(Phase B2) and multi-statement bodies are eligible; the
-classifier uses a cost function (caller fan-out, callsite
-hotness, const-arg savings) instead of a hardcoded heuristic,
-so the right thing happens for both 1-line trig wrappers and
-13-line ECS accessors. ~700 LOC across 5 sessions; bootstrap
-held byte-stable through every commit.
-
-**Smart-dispatch outlining** (May 22). The transformation
-GCC OpenMP, LLVM, Cilk, Intel TBB, Unity Burst, and Apple GCD
-all ship — procedure outlining for parallel-for, named in
-Allen + Cocke 1972. A natural `for (i = 0; i < n; i++) {
-work(i, captured_arg) }` whose host is `@safe`-annotated gets
-its captures wrapped in a synthesised struct, the body
-rewritten into a worker function, and the loop replaced with
-a `job_parallel_for_data` dispatch. The programmer writes
-serial-looking code; the compiler emits N-core parallelism.
-6x measured on `bench_compose.bpp` (bandwidth-bound at that
-N); the FPS demo's `wolf_ai_tick_cooldowns` is the first
-canonical game adopter.
-
-The May 23 strict-`@safe` gate is the safety scaffolding
-underneath both arcs: a loop only parallelizes if its host
-function carries the `@safe` annotation (programmer's
-explicit "OK in worker context" contract). The annotation
-catches dispatch from a signal-handler / interrupt frame
-before the regression hits runtime.
-
-## Spine Closeout: One Codegen, Two Chip Backends
-
-The compiler's two native backends (ARM64 + x86_64) used to
-carry parallel AST-level walkers: each handled `T_BINOP`,
-`T_CALL`, `T_IF`, `T_MEMST`, every statement and expression
-case, with chip-specific register allocation woven through
-the tree. Adding a new chip meant porting ~3000 lines of
-walker logic. Adding a new feature meant fixing the same bug
-in two places (the May 23 silent float→int store —
-`fmov` vs `fcvtzs` — was discovered in `a64`, fixed there,
-then independently in `x64`).
-
-Wave 20 (May 24) and Wave 21 (May 25) collapsed both walkers
-into the spine. `cg_emit_stmt` and `cg_emit_node` in
-`src/bpp_codegen.bsm` now own every AST case directly,
-dispatching atomic ISA operations through the per-chip
-`ChipPrimitives` table. The chip files (`a64_codegen.bsm` /
-`x64_codegen.bsm`) lost ~1300 LOC of dead walker code and
-became pure primitive providers: emit one ARM64 instruction,
-emit one x86_64 instruction, expose the function pointer in
-the table. Adding a third backend (RISC-V, WASM) is now a
-single file of primitive bodies — no tree walker, no AST
-dispatch, no per-case duplication.
-
-Side wins from the same window: cross-module global float
-types flow through validate via a single re-resolution call
-(no more `extrn X: float;` workaround in every consumer);
-the HUD's per-frame malloc churn was killed (60 fps held
-flat instead of flicking 60→59→60); and a regression-test
-fixture (`tests/test_memst_float_to_int.bpp`) guards both
-backends against the float→int store bug class going forward.
-
 ## The Language
 
 The minimum B++ program is three lines. No headers, no imports, no return statement:
@@ -341,6 +211,80 @@ bpp synthkey.bpp -o synth && ./synth
 
 The same audio stack powers the game engine. Snake can play a WAV sample recorded in synthkey. Rhythm Teacher (next) will use the mixer for sample-accurate note timing.
 
+## Compose-Multiplicatively: ~32× ceiling, 16× measured
+
+A B++ program writes a plain natural-for loop. The compiler fans it
+out across cores AND across SIMD lanes — same source, only `@safe`
+on the host:
+
+```bpp
+void tick(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _cap; i++) {
+        auto e: Entity;
+        e = payload + i * sizeof(Entity);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+```
+
+**Outlining** wraps the caller-frame captures (`dt`, `_cap`) in a
+synthesised struct and dispatches the body through
+`job_parallel_for_data` (~6× on 8 cores). **Autovec** sees the
+inner store as pattern P1 and emits 4-wide SIMD + scalar tail
+(~4× on 4 lanes). Both fire on the same loop — the worker body
+itself is SIMD'd:
+
+```
+bench_compose.bpp (1M cells × 100 rounds):
+  SERIAL  303 ms
+  COMPOSE  19 ms     → 16× measured  (bandwidth-bound; compute-
+                                       bound workloads reach ~32×)
+```
+
+Multi-module game adoption: `wolf_ai_tick_cooldowns` in
+`games/fps/ai.bsm` compiles to `bl _job_parallel_for_data` with
+`__synth_4` as the worker. The `@safe` annotation is the only
+user-side cost — same shape as `pure` in Haskell.
+
+## Inline + Outline: the structural-work compiler
+
+**S4 cost-model inliner** (May 21). Small helpers — single-return
+accessors, integer arithmetic, struct field reads, multi-statement
+bodies meeting the cost function (caller fan-out × callsite
+hotness × const-arg savings) — splice their body at every call
+site. Programmers write idiomatic `get_x(p)` accessors and a
+7-statement xorshift64 RNG; the compiler emits the same code a
+manual inline would. Per Tonify Rule 4, no `@no_inline` exists.
+
+**Smart-dispatch outlining** (May 22). The transformation GCC
+OpenMP / LLVM / Cilk / TBB / Burst / Apple GCD all ship (Allen +
+Cocke 1972). Natural for-loops over `@safe` hosts get captures
+synthesised into a struct, body rewritten as a worker, loop
+replaced with `job_parallel_for_data`. The strict-`@safe` gate
+(May 23) is the safety scaffolding — a loop only parallelises
+when its host carries the annotation, catching dispatch from
+signal-handler / interrupt frames before runtime.
+
+## Spine Closeout: One Codegen, Two Chip Backends
+
+The two native backends used to carry parallel AST walkers — every
+statement and expression case implemented twice, register
+allocation woven through the tree. The May 23 silent float→int
+store bug (`fmov` vs `fcvtzs`) was discovered, fixed in `a64`,
+then re-fixed in `x64` independently. Wave 20 (May 24) and Wave 21
+(May 25) collapsed both walkers into the spine: `cg_emit_stmt` and
+`cg_emit_node` in `src/bpp_codegen.bsm` own every AST case,
+dispatching atomic ISA ops through a per-chip `ChipPrimitives`
+table. ~1300 LOC of dead walker code deleted; adding a third
+backend (RISC-V, WASM) is now one file of primitive bodies.
+
+Side wins from the same window: cross-module global float types
+recovered at validate time (no more `extrn X: float;` per
+consumer); HUD per-frame malloc churn killed (60 fps held flat);
+regression test `tests/test_memst_float_to_int.bpp` guards both
+backends against the bug class.
+
 ---
 
 ## What B++ Has
@@ -358,8 +302,9 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 - **Polymorphic numeric literals** — literals carry SHAPE until slot context fixes the type. `const TOL = 0.0001` now preserves float bits cleanly. Kills the `feedback_const_float_demotes` bug class
 - **Newtype structs** — `struct WorldPos as Vec2` produces a distinct type with compiler-enforced identity. World vs Grid mixing becomes a compile error, with zero runtime cost
 - **Ternary and short-circuit** — `x = a ? b : c;`, `if (p != 0 && p.field > 0)` both lowered in the parser (one implementation, every backend inherits)
-- **SIMD** — 11 `vec_*` builtins lowering to NEON (ARM64) or SSE2 (x86_64). `auto v: double` allocates from the SIMD register pool
-- **Smart dispatch** — compiler analyzes purity across the call graph and auto-parallelizes worker-safe loops into `job_parallel_for`
+- **SIMD — explicit + autovec** — 11 `vec_*` builtins lower to NEON (ARM64) or SSE2 (x86_64) for the explicit path; the autovec pattern matcher recognises `arr[i] = arr[i] OP literal` shapes and emits a 4-wide SIMD loop + scalar tail automatically. `auto v: double` allocates from the SIMD register pool
+- **Outline + compose (~32× ceiling, 6× measured)** — natural `for` loops over `@safe`-annotated hosts get their caller-frame captures wrapped in a synthesised struct, the body rewritten into a worker function, and the loop replaced with a `job_parallel_for_data` dispatch (smart-dispatch outlining, May 22). Autovec composes inside the synth body — cores × lanes both fire on the same source loop. The `@safe` annotation is the only user-facing cost (see Compose-Multiplicatively section above)
+- **Cost-model inliner** — small `: base` helpers (single-statement trivial up to multi-statement bodies meeting the S4 cost model — caller fan-out × callsite hotness × const-arg savings) splice their body at every call site. Programmers write idiomatic `get_x(p)` accessors and the compiler emits the same code as a manual inline. Per Tonify Rule 4, no `@no_inline` annotation exists — inlining heuristics belong in the compiler
 - **FFI** — `import "SDL2" { void InitWindow(...); }` calls any C library
 
 **Compiler:**
@@ -368,11 +313,12 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 - **Cross-compilation** — `bpp --linux64 game.bpp -o game` from macOS
 - **Own runtime (libb)** — `bmem` allocator via `sys_mmap`, `brt0` startup code, `bsys` syscall tables. Native binaries have zero libc dependency
 - **Module discipline** — `static` private to module, `load` vs `import` separates project from library, circular imports are errors (E222), cross-module duplicates are errors (E221)
-- **Effect inference** — internal fixpoint classifier tracks purity / IO / GPU / heap / syscall / panic across the call graph. The user-facing surface is binary (`@safe` annotation either holds or fails W026); internal granularity drives optimization decisions (inlining, parallelization candidates)
+- **Effect inference** — internal 4-state classifier (AUTO / BASE / SOLO / SAFE) tracks purity + side-effect surface across the call graph. The user-facing surface is binary (`@safe` annotation either holds or fails W026); internal granularity drives inlining + outlining + autovec eligibility decisions
 - **V3 function-pointer type checking** — flow analysis + opt-in `func(...)` annotations + Estrita mode. Compiler proves `fn_ptr(target)` matches the resolved callee's shape; mismatches surface as W028 / E246 at the call site instead of register-bank corruption at runtime
-- **Three-backend split** — `chip/`, `os/`, `target/`. Adding Linux ARM64 or Windows is a folder, not a rewrite
-- **Diagnostics** — 25 error/warning codes with `file:line:caret` locations, multi-error recovery, 20-error cap
-- **Self-compile speed** — ~0.1 seconds from scratch, no cache
+- **Spine + primitive providers** — `cg_emit_module / func / stmt / node` all live in `src/bpp_codegen.bsm`. Each chip backend (`backend/chip/aarch64/`, `backend/chip/x86_64/`) exposes ~80 atomic ISA primitives via a function-pointer table. Adding a new chip (RISC-V, WASM) is one file of primitive bodies, no tree walker (Wave 20+21 closeout, May 24–25). Tonify Rule 41 (Additive Portability) codifies the doctrine: new targets ADD layers, never modify the shared spine
+- **Four-backend split** — `chip/` (a64, x64), `os/` (macos, linux), `target/` (aarch64_macos, x86_64_linux), `c/` (universal C transpile escape hatch). Each axis composes independently
+- **Diagnostics** — 39 codes registered (24 errors + 15 warnings) with `file:line:caret` locations, multi-error recovery, 20-error cap. Highest IDs: E264 (extrn no-def upgrade), W038 (int literal in `: ptr` parameter)
+- **Self-compile speed** — bootstrap ~0.34s, small program ~0.05s, medium ~0.06s (Apple Silicon M-series, no cache)
 
 **Debugger (`bug`):**
 - **Three modes** — `bug --dump file.bug` (text dump), `bug --tui ./prog` (live REPL + watch), plain `bug` (GUI inspector with map browser + watch + viz panels)
@@ -382,7 +328,7 @@ The same audio stack powers the game engine. Snake can play a WAV sample recorde
 - **Watch list + expression evaluator** — `--watch "player.vx,score,*head"` evaluates B++ expressions at every stop (struct fields, array indexing, dereference)
 - **Type-aware display** — structs render as field trees, arrays as lists, pointers as addresses + target, floats with full precision
 - **Runtime visualizers** — `viz_render_graph` / `viz_render_rgba` etc. for in-target panel rendering, GUI mirrors the same panels live
-- **Phase 6 runtime symbolication** — `panic("msg")` writes a stack trace to stderr and exits 134; `profile_start(rate_hz, depth)` samples FP chains via SIGPROF + cooperative hooks across worker threads, `profile_dump` returns the top-N hot frames. No external `.bug` required at runtime — the binary embeds a minisym table
+- **Phase 6 runtime symbolication** — `panic("msg")` writes a stack trace to stderr and exits 134; `profile_start(rate_hz, depth)` samples FP chains via SIGPROF + cooperative hooks across worker threads. Three aggregators: `profile_dump` (top-N by innermost frame), `profile_dump_thread` (per-worker breakdown), `profile_print_chains(name)` (full stack chains filtered by innermost — spike-bound diagnosis, May 25). No external `.bug` required at runtime — the binary embeds a minisym table
 
 **Audio stack:**
 - **stbaudio** — CoreAudio AudioQueue FFI, SPSC ring buffer, realtime callback annotated `: realtime`

@@ -3431,3 +3431,158 @@ bound diagnosis, always look at the tail.** Call chains
   in the cartridge that owns the hot path.
 - Commit `d03127b` — the 2026-05-25 investigation
   (render_number / profile_zones_hud_draw / _profile_dump_inner).
+
+---
+
+## Rule 41: Additive Portability — new targets ADD layers, never modify them
+
+Every new target combination (chip + OS + GPU + binary format)
+is added by writing **only the missing layers**. The existing
+layers — compiler frontend, stb modules, programs, other targets'
+backends — stay completely untouched.
+
+This is not aspirational. It is the architectural reason B++ can
+scale to N target combinations without the cost curve exploding.
+Adding the 5th target is as cheap as adding the 2nd, because the
+shared layers carry zero modification cost across all of them.
+
+### The four addable layer types
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ stb/ + programs (target-agnostic — NEVER modified)        │
+└────────────────────────────────────────────────────────────┘
+            │
+            ├── New CHIP: src/backend/chip/<isa>/
+            │     <isa>_codegen.bsm    (~2000 LOC)
+            │     <isa>_primitives.bsm (~700 LOC)
+            │     <isa>_enc.bsm        (~500 LOC)
+            │
+            ├── New OS: src/backend/os/<os>/
+            │     _stb_platform_<os>.bsm  (~1500-2000 LOC)
+            │     _core_<os>.bsm          (~400 LOC)
+            │     _bsys_<os>.bsm          (~100 LOC)
+            │     bug_observe_<os>.bsm    (~500 LOC)
+            │
+            ├── New TARGET BINARY FORMAT: src/backend/target/<fmt>/
+            │     <fmt>_writer.bsm    (~500-1000 LOC, Mach-O / ELF / PE / WASM)
+            │
+            └── New GPU BACKEND: stb/<gpu>_render_backend.bsm
+                  + (loader+surface per OS, ~500 LOC each pair)
+```
+
+A new target combination is the **sum** of layers it requires.
+Examples:
+
+| Adding | Combination | Cost |
+|---|---|---|
+| RISC-V Linux + Vulkan | new chip + reuse Linux + reuse Vulkan | ~3000 LOC |
+| Windows x86_64 + DX12 | reuse chip + new OS + new GPU | ~6000 LOC |
+| Bare-metal ARM64 CPU-only | reuse chip + new OS + no GPU | ~2500 LOC |
+| Bare-metal ARM64 + Vulkan | reuse chip + new OS + reuse Vulkan + new (Vulkan-baremetal) connector | ~5000 LOC |
+| Apple visionOS + RealityKit | reuse chip + new OS + new GPU | ~5000 LOC |
+
+The cost stays bounded because the SHARED layers — stb, compiler
+frontend, dispatch, codegen orchestration — never accumulate
+target-specific bloat.
+
+### The three audit tests for any portability-claiming PR
+
+1. **Did you modify any `stb/` file?**
+
+   If yes, justify why the existing abstraction was insufficient.
+   The fix is usually to widen the abstraction in stb (one place)
+   rather than special-case per target (N places). If you must
+   modify stb to land the target, the abstraction has leaked —
+   document why and update the relevant `stb<name>.bsm` header
+   so the contract is honest.
+
+2. **Did you touch another target's backend directory?**
+
+   Targets are siblings, not parents. A change to
+   `src/backend/os/macos/` for a Linux feature is a violation —
+   it couples two targets you're claiming are independent. If
+   the change is truly shared infra, lift it to a target-agnostic
+   location (`src/backend/common/` or a new abstract spine).
+
+3. **Can a hello-world program built for the new target be
+   byte-identical at the source level to the same program for
+   an existing target?**
+
+   The contract is: programs say `import "stbwindow.bsm"; main()
+   { ... }` and that source compiles unchanged for every target.
+   No `#if TARGET_X` conditionals, no per-target `if (platform ==
+   "linux")` runtime branches, no source forks. If your target
+   needs program-level escape hatches, that's the leakage — push
+   it back into the platform layer where it belongs.
+
+### When the rule applies
+
+This rule binds every PR that:
+
+- Adds a new backend directory under `src/backend/chip/` or
+  `src/backend/os/` or `src/backend/target/`.
+- Claims a new GPU backend or extends `stb/stbrender.bsm`'s
+  dispatch.
+- Touches the compile pipeline orchestrator (`src/bpp.bpp`) to
+  add target-specific branches — review carefully whether the
+  branch is necessary or whether the platform layer should
+  absorb it.
+
+### When the rule does NOT apply
+
+- Bug fixes in existing target backends (e.g., fixing a Mach-O
+  relocation bug) — that's targeted maintenance, not portability.
+- Compiler frontend changes (parser, types, dispatch) — those
+  improve every target equally; no portability concern.
+- stb evolution that adds new APIs visible to ALL targets — fine
+  as long as every existing platform layer can implement them
+  (or fall back cleanly).
+
+### The wider lesson — separation pays the bill
+
+Compare with the C/C++ ecosystem on the same problem:
+
+| Operation | C/C++ workflow | B++ workflow (Rule 41) |
+|---|---|---|
+| Add new chip | LLVM backend + libc port + ABI doc + months of team time | ~3200 LOC self-host, weeks solo |
+| Add new OS | libc port (~50K LOC) + threading + signals + months | ~2500-3000 LOC platform layer |
+| Add new GPU API | Per-engine bespoke integration | ~3000 LOC render backend |
+| User code changes for new target | Frequently (`#ifdef _WIN32`, ...) | **Zero** — stb is the contract |
+
+The "zero change in user code" is the feature, not a side effect.
+A game written for macOS runs on Linux without patch (assuming
+the relevant GPU backend ships). A tool written for Linux runs on
+bare-metal without patch (assuming the relevant OS layer ships).
+**Source compatibility is total.**
+
+This is why this rule exists, and why it is worth defending hard.
+
+### Precedents
+
+- **macOS → Linux x86_64 port** (early 2026): added only
+  `src/backend/os/linux/` (~1700 LOC) +
+  `src/backend/target/x86_64_linux/` (~600 LOC). Zero changes
+  to stb/, zero changes to chip backends, zero changes to any
+  program. ~2300 LOC total, ~3 weeks.
+
+- **a64 → x64 chip backend addition**: added only
+  `src/backend/chip/x86_64/` (~3200 LOC). Zero changes to stb/,
+  no chip-conditional code in any program. The same `import
+  "stbgame.bsm"` source compiles cleanly for either chip.
+
+- **Future ports follow the same pattern**: Vulkan port, Windows
+  port, bare-metal target, RISC-V, WebAssembly. Each is bounded
+  by the matrix above. None requires touching stb or programs.
+
+### Cross-references
+
+- `docs/manual/bootstrap_manual.md` "Architecture — The Six-Layer
+  Cake" — the broader layering context (HOST / META / PROGRAMS /
+  STB / COMPILER / BACKEND).
+- `docs/plans/sidequest_bangbox.md` — bare-metal ARM64 sidequest
+  applying this rule (BangBox MVP adds an OS layer only).
+- Rule 23 — cartridge minimalism keeps stb clean enough that
+  this rule is sustainable.
+- Rule 33 — cartridge generality tiers; complement to Rule 41 at
+  the cartridge level.
