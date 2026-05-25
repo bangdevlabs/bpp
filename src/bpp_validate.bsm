@@ -81,6 +81,27 @@ static _val_get_hint(name_p) {
     return 0;
 }
 
+// Returns 1 if name_p is a local or parameter of the function
+// currently under validation. Used at T_CALL-arg validation to
+// distinguish locals from globals before consulting ty_gl[] (the
+// global type table) — locals shadow globals, so a cross-module
+// global type lookup must NOT override the inferred type when the
+// name actually refers to a function-scope variable. fn_metas
+// vt_block holds both params and auto declarations after infer
+// completes for each function.
+static _val_is_function_local(func_idx, name_p) {
+    auto m: FnMeta, block, cnt, i;
+    if (func_idx < 0) { return 0; }
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 0; }
+    block = m.vt_block;
+    cnt = m.vt_count;
+    for (i = 0; i < cnt; i++) {
+        if (packed_eq(*(block + i * 24), name_p)) { return 1; }
+    }
+    return 0;
+}
+
 // Returns 1 if name_p is the name of an un-hinted parameter of the
 // function currently under validation. Used by W025 to detect the
 // shape "public function, param used in float arithmetic, caller
@@ -948,6 +969,29 @@ val_check_node(nd) {
                     an = arg_nd;
                     arg_ty = an.itype;
                     par_ty = get_fn_par_type(fi, ai);
+                    // Cross-module global type recovery: parser
+                    // processes non-entry modules BEFORE the entry
+                    // module declares its `global X: T;`, so
+                    // T_VAR.itype on a reference to an entry-module
+                    // global falls back to ty_get_global_type's
+                    // TY_WORD default. By the time validate runs,
+                    // ty_gl[] is fully populated — re-resolve the
+                    // type so E233/E240 see the correct float vs
+                    // int. Guard: only override when the name isn't
+                    // a local/param of the current function (locals
+                    // shadow globals — test_global_kw case).
+                    if (an.ntype == T_VAR) {
+                        if (is_float_type(arg_ty) == 0) {
+                            if (_val_is_function_local(_val_current_fi, an.a) == 0) {
+                                auto _gty;
+                                _gty = ty_get_global_type(an.a);
+                                if (is_float_type(_gty)) {
+                                    arg_ty = _gty;
+                                    an.itype = _gty;
+                                }
+                            }
+                        }
+                    }
                     // V3 Session 1: skip int/float diagnostics when either
                     // side is a fn-type — Session 2 will check Fn-vs-Fn
                     // signature compatibility once flow analysis lands.
