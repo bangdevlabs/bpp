@@ -1,0 +1,94 @@
+// codegen_parity_probe.bpp — exercise every expression path in
+// cg_emit_node / a64_emit_node / x64_emit_node to detect codegen
+// divergence between the chip walker and the spine takeover.
+//
+// Wave 21 gate: differential disasm test. Build this with the
+// CURRENT bpp (chip walker active) and with a LOCALLY-FLIPPED bpp
+// (p.emit_node = fn_ptr(cg_emit_node)). objdump -d both binaries
+// and `diff` the output. Empty diff → bootstrap will converge.
+//
+// Cases covered (one section per case):
+//   T_LIT      — positive int, negative int (unary), float
+//   T_VAR      — local, global, stack-struct
+//   T_BINOP    — int simple, int nested, with right-side call
+//   T_TERNARY  — int and float arms
+//   T_UNARY    — negate, bitwise not
+//   T_CALL     — bare void, with int return, with float return
+//   T_MEMLD    — *(ptr), with field hint via typed local
+//   T_ADDR     — &local, &global, &stack_struct
+
+struct Point { x, y }
+
+global g_word;
+global g_float: float;
+
+word_id(x) { return x; }
+float_id(x: float) -> float { return x; }
+
+main() {
+    // ── T_LIT ─────────────────────────────────────────────
+    auto i_pos, i_neg;
+    auto f_lit: float;
+    i_pos = 42;
+    i_neg = -7;
+    f_lit = 3.14;
+
+    // ── T_VAR ─────────────────────────────────────────────
+    auto v_loc;
+    auto p_struct: Point;
+    v_loc = 100;
+    g_word = 200;
+    g_float = 2.5;
+    p_struct.x = 10;
+    p_struct.y = 20;
+
+    // ── T_BINOP simple int ────────────────────────────────
+    auto bin_a, bin_b;
+    bin_a = i_pos + i_neg;          // add
+    bin_b = i_pos * 2 - v_loc / 4;  // mul, sub, div nested
+    auto bin_c;
+    bin_c = (i_pos < v_loc) * 7;    // comparison + mul
+
+    // ── T_BINOP with right-side call (push/pop dance) ─────
+    auto bin_call;
+    bin_call = i_pos + word_id(v_loc);
+
+    // ── T_BINOP nested deeper ─────────────────────────────
+    auto deep;
+    deep = ((i_pos + 1) * (i_neg - 2)) + (v_loc / 5);
+
+    // ── T_TERNARY ─────────────────────────────────────────
+    auto tern_i;
+    tern_i = (i_pos > 0) ? i_pos : i_neg;
+    auto tern_f: float;
+    tern_f = (f_lit > 1.0) ? f_lit : g_float;
+
+    // ── T_UNARY ───────────────────────────────────────────
+    auto un_neg, un_not;
+    un_neg = -i_pos;
+    un_not = ~i_pos;
+
+    // ── T_CALL ────────────────────────────────────────────
+    auto ret_i;
+    ret_i = word_id(42);
+    auto ret_f: float;
+    ret_f = float_id(1.5);
+
+    // ── T_MEMLD ───────────────────────────────────────────
+    auto buf;
+    buf = malloc(32);
+    *(buf) = 1234;
+    *(buf + 8) = 5678;
+    auto mem_a, mem_b;
+    mem_a = *(buf);
+    mem_b = *(buf + 8);
+
+    // ── T_ADDR ────────────────────────────────────────────
+    auto addr_l, addr_g, addr_s;
+    addr_l = &v_loc;
+    addr_g = &g_word;
+    addr_s = &p_struct;
+
+    free(buf);
+    return 0;
+}
