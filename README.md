@@ -6,6 +6,23 @@ B++ tools producing content for B++ games, on a stack where every byte — from 
 
 > **Version 0.99x**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)**
 
+**What's new in the compiler (May 21–25):**
+The compiler now does the structural work natural-for loops imply.
+**Inline** (S4 cost-model inliner) splices small `: base` helpers
+at every call site; **outline** (smart-dispatch capture rewriter)
+turns natural `for` loops over `@safe` hosts into
+`job_parallel_for_data` dispatches; **compose** (outline × autovec)
+runs SIMD inside the synthesised worker — 6× measured on
+`bench_compose.bpp`, ~32× theoretical ceiling. The two native
+backends collapsed their AST walkers into one shared spine
+(Wave 20 + 21, –1300 LOC of duplicated codegen) — the chip files
+are now pure primitive providers, so adding a third backend is a
+single file. A latent silent float→int store bug
+(`fmov`/`movq` reinterpret instead of `fcvtzs`/`cvttsd2si` truncate)
+fixed on both backends; cross-module global float types flow
+through the validator without per-consumer annotations; HUD
+overhead killed (60 fps held flat, no more 60→59→60 flicker).
+
 ---
 
 ## Back to the Future
@@ -80,6 +97,77 @@ build-system tuning. The compiler does the work. The
 `@safe` annotation is the only required user-side cost — and
 it has the same value as `pure` in Haskell or `const` in C: an
 honest contract about what the function does.
+
+## Inline + Outline: the structural-work compiler
+
+The Compose section above shows the headline transformation
+(outlining × autovec). Two adjacent arcs landed in the same
+push window and round out the picture:
+
+**S4 cost-model inliner** (May 21). Trivial helpers — single-
+return accessors, integer arithmetic, struct field reads —
+splice their body at every call site. The classic motivating
+case is `xorshift64(state) → state ^ ...`: a 7-statement RNG
+helper that used to cost a call frame per use and now compiles
+to a 30-instruction inline sequence. Both single-statement
+(Phase B2) and multi-statement bodies are eligible; the
+classifier uses a cost function (caller fan-out, callsite
+hotness, const-arg savings) instead of a hardcoded heuristic,
+so the right thing happens for both 1-line trig wrappers and
+13-line ECS accessors. ~700 LOC across 5 sessions; bootstrap
+held byte-stable through every commit.
+
+**Smart-dispatch outlining** (May 22). The transformation
+GCC OpenMP, LLVM, Cilk, Intel TBB, Unity Burst, and Apple GCD
+all ship — procedure outlining for parallel-for, named in
+Allen + Cocke 1972. A natural `for (i = 0; i < n; i++) {
+work(i, captured_arg) }` whose host is `@safe`-annotated gets
+its captures wrapped in a synthesised struct, the body
+rewritten into a worker function, and the loop replaced with
+a `job_parallel_for_data` dispatch. The programmer writes
+serial-looking code; the compiler emits N-core parallelism.
+6x measured on `bench_compose.bpp` (bandwidth-bound at that
+N); the FPS demo's `wolf_ai_tick_cooldowns` is the first
+canonical game adopter.
+
+The May 23 strict-`@safe` gate is the safety scaffolding
+underneath both arcs: a loop only parallelizes if its host
+function carries the `@safe` annotation (programmer's
+explicit "OK in worker context" contract). The annotation
+catches dispatch from a signal-handler / interrupt frame
+before the regression hits runtime.
+
+## Spine Closeout: One Codegen, Two Chip Backends
+
+The compiler's two native backends (ARM64 + x86_64) used to
+carry parallel AST-level walkers: each handled `T_BINOP`,
+`T_CALL`, `T_IF`, `T_MEMST`, every statement and expression
+case, with chip-specific register allocation woven through
+the tree. Adding a new chip meant porting ~3000 lines of
+walker logic. Adding a new feature meant fixing the same bug
+in two places (the May 23 silent float→int store —
+`fmov` vs `fcvtzs` — was discovered in `a64`, fixed there,
+then independently in `x64`).
+
+Wave 20 (May 24) and Wave 21 (May 25) collapsed both walkers
+into the spine. `cg_emit_stmt` and `cg_emit_node` in
+`src/bpp_codegen.bsm` now own every AST case directly,
+dispatching atomic ISA operations through the per-chip
+`ChipPrimitives` table. The chip files (`a64_codegen.bsm` /
+`x64_codegen.bsm`) lost ~1300 LOC of dead walker code and
+became pure primitive providers: emit one ARM64 instruction,
+emit one x86_64 instruction, expose the function pointer in
+the table. Adding a third backend (RISC-V, WASM) is now a
+single file of primitive bodies — no tree walker, no AST
+dispatch, no per-case duplication.
+
+Side wins from the same window: cross-module global float
+types flow through validate via a single re-resolution call
+(no more `extrn X: float;` workaround in every consumer);
+the HUD's per-frame malloc churn was killed (60 fps held
+flat instead of flicking 60→59→60); and a regression-test
+fixture (`tests/test_memst_float_to_int.bpp`) guards both
+backends against the float→int store bug class going forward.
 
 ## The Language
 
@@ -808,7 +896,7 @@ canonical distribution** — forks welcome, just rename your fork.
 
 ## Timeline
 
-B++ is ~50 days old. The following are the milestones, in order:
+B++ is ~70 days old. The following are the milestones, in order:
 
 | Date | Milestone |
 |------|-----------|
@@ -867,6 +955,18 @@ B++ is ~50 days old. The following are the milestones, in order:
 | **May 20** | **Compiler array migration arc CLOSED — 6 clusters to `arr_struct`**. `ty_vt` / `ty_gl` / `ft` / `diag_file` / `mod_bnd` / `fn_meta` (the codegen vt/cnts/ret/par cluster) migrated to AoS via `arr_struct<T>` + cross-file accessors; 3 hot clusters (`fn_phase` / `fn_effect` / lexer `toks`) audited and **preserved as SoA** with bench evidence (Rule 36b). Synth-fn safety bug caught + fixed by null-guarding `fn_meta_*` accessors — smart-dispatch's worker synthesizer grows `funcs[]` after `run_types` pre-fills `fn_metas`. New harness `tests/bench_compile.sh` (Rule 37 — bench citation) catches a fake "16% bootstrap regression" that turned out to be an old-bpp-erroring-fast-on-new-source measurement bug. Bootstrap 0.47s vs 0.5s target; suite 177/0/12 + 141/0/48 byte-stable. |
 | **May 20** | **WC1 S9 CLOSED — Resources end-to-end + polish**. Gold mines pre-placed from the level (4 in forest1.json), right-click → peasant walks in, vanishes into the mine (canonical WC1 "into-the-mine" feedback), gather tick → comes out with the `peasant_with_gold` atlas swap, walks to nearest town hall, deposits → gold counter ticks up. Same loop for forests: right-click a tree (tile 76), peasant chops, tile flips to stump (tile 71) + pathfinder unblocks, peasant walks back with the `peasant_with_wood` carry sprite. Top resource bar HUD (gold + lumber icons + 3 counters) lands as the first piece of the HUD evolution roadmap (S8.6). Food cap recomputes per tick from town halls + farms; `wc1_resources_can_afford` / `_spend` shipped as the S10 production gate. Engine: `stbecs` `world.archetypes` migrated to `arr_struct<ArchetypeRec>` (per-archetype malloc → inline AoS) — rts1 now at 2 archetypes (units + buildings) is the consumer trigger Rule 36b queued for. Bootstrap byte-stable. |
 | **May 20** | **Compiler hot-path opt CLOSED — bootstrap 0.51s → 0.37s (~27% faster)**. Four-stage stack of mechanical optimization, each profile-justified via `bench_compile.sh --sample` and shipped behind a sanity gate. S1: `unpack_l` SDIV → LSR (via `: u_word`, was bit-equivalent for packed refs but Phase D.1 skipped `/ 2^k` for signed semantics). S2: hash for `_dsp_find_func_idx` (the linear-scan-over-funcs-per-call-site was the silent quadratic that ate 17% of bootstrap CPU). S3a: CSE in `packed_eq` (hoist `unpack_s` out of byte-compare loop). S3b: lift `unpack_l` to `cg_builtin_dispatch` so call sites get 5-op inline (mirror of `shr` builtin with count hardcoded) — eliminated the function-call frame around the trivial body. Total ~85 LOC across 5 files; both suites unchanged at 177/0/12 + 141/0/48; bootstrap byte-stable (1-cycle oscillation expected after S3b changes self-host inlining). |
+| **May 21** | **Compiler hot-path arc FULLY CLOSED — bootstrap 0.51s → 0.30s (~41% cumulative)**. Six more profile-driven stages on top of May 20's S1-S3b. S3e/S3f/S3h lift `arr_get` / `arr_len` / `u32` to `cg_builtin_dispatch` (trivial-body builtins eliminate call frames). S3i: `packed_eq` family compares 8 bytes/iter via `peek_w` chunking. S3j: first chip-level lift — `emit_ror32` chip primitive + `sha_rotr` builtin (cross-chip BINOP asymmetry caught in review, settled on `acc=value, scratch=count` convention). S3k: hash table for `cg_find_fn` (silent quadratic eliminated; asymptotic, not wall-time at this point). S3g reverted (composite `arr_struct_at` body lost 3-7% to dispatch-lane stack juggling) — established the rule of thumb that mechanical inlining via `cg_builtin_dispatch` wins for 1-op trivial bodies and loses for composites. Cost-model inliner S4 opened as the next sidequest. |
+| **May 21** | **S4 cost-model inliner SHIPPED end-to-end (Phase B2 + multi-statement)**. ~700 LOC across 5 sessions. Cost function (P1) + per-callsite threshold (P2) + unified classifier (P3a) + multi-statement splice infrastructure (P3b-1) + activation guards (P3b-2) + smart-bind param strategy + B3 ref-count propagation (P3b-3). The classic xorshift64 RNG helper used to cost a call frame per use; post-S4 it splices into a 30-instruction inline sequence. Both single-statement (Phase B2) and multi-statement bodies are eligible; cost function uses caller fan-out + callsite hotness + const-arg savings instead of a hardcoded heuristic. Bootstrap byte-stable through every commit. |
+| **May 22** | **Smart-dispatch outlining sidequest CLOSED — 6 phases**. The transformation GCC OpenMP / LLVM / Cilk / Intel TBB / Unity Burst / Apple GCD all ship (Allen + Cocke 1972, "procedure extraction for parallel-for") now lives in `bpp_dispatch.bsm`. P1 free-variable analysis → P2 capture struct synthesis → P3 AST rewriter → P4 Stage 3 publish → P5 `job_parallel_for_data` runtime variant + `_outline_cap_ptr` sidechannel → P6 gate-6 relax + wire-up. Two latent bugs caught mid-arc: reduction-with-captures rejected as out-of-scope; `ast_clone_subst` extended to recurse into T_IF / T_WHILE / T_BLOCK bodies (C-emit `test_mixer_sample` failure surfaced it). Programmer writes natural `for (i = 0; i < n; i++) { work(i, captured) }`; compiler dispatches N-core parallel via the same pattern as hand-written `job_parallel_for`. |
+| **May 22** | **Autovec arc CLOSED + compose-multiplicatively measured**. Single-module `bench_compose.bpp` (1M cells × 100 mul-by-literal rounds): SERIAL 303ms → COMPOSE 19ms = **6x measured** (bandwidth-bound at this N; compute-bound workloads approach the ~32x theoretical ceiling). Autovec phases: P1 C-emitter SIMD path + 11 `vec_*_ps` wrapper macros → P2 pattern matcher (`arr[i] = arr[i] OP literal`) → P3 multi-pointer + multi-statement body classifier → P5 4-wide SIMD loop + scalar tail emission → P6 Phase 1 range-synth migration → P6 Phase 2 compose outlining + autovec inside synth body. FPS adoption attempted same day (`wolf_ai_tick_cooldowns`), blocked by a latent multi-module incremental-emit bug. |
+| **May 22** | **Load/import distinction arc CLOSED — multi-module game adoption UNBLOCKED**. Seven-commit same-day arc (`0f68dfa`→`a6fa70a`). P1 `diag_file_compile_module[]` mapping → P2 `_process_file_inline_into` flag (load's contents attribute to parent's compile module, not own file) → P3+P4 combined: `lex_module` walks `mod_bnds` + `tok_mod` uses `diag_mod_idx` + orchestrator iterates topo order → P6 defer all per-module emit until AFTER the dispatch pipeline (so synth functions reach the binary instead of orphaning). Three latent bugs uncovered + fixed: BSYS_* cross-target const collision (renamed to `BSYS_MACOS_*` / `BSYS_LINUX_*`); mark_reachable miss-by-471-functions (worked around via lazy-filter suppression); outlining vs signal-handler safety (introduced `@safe` host gate). FPS `wolf_ai_tick_cooldowns` now compiles to `__synth_4` + `bl _job_parallel_for_data`. Bootstrap byte-stable + suite 179/0/12 + 144/0/47. |
+| **May 23** | **stbecs gains `ecs_query_each_parallel`** — opt-in worker-pool variant of the query iterator, dispatches the per-archetype row walk across `_job_n_workers` worker threads. RTS adoption: 3 of 14 call sites (per-entity-independent workloads — movement / combat / regen) migrated in follow-up commits with `@safe` annotation on the callbacks. |
+| **May 23** | **Strict `@safe` gate doctrine** — both capture-driven outlining AND pure MAP dispatch now require host `@safe`. The pre-strict gate (May 22 `a6fa70a`) only covered capture-driven outlining; the May 23 audit (`48d16e1`) extended to MAP after game adoption observed regressions in stb host functions whose loop shape the matcher accepted but whose function contract said "main-thread only". Five-host audit confirmed none of `profile_start` / `mixer_init` / `init_ui_layout` / `ui_frame_begin` / `init_game` deserves `@safe` — they're all init/per-frame main-thread paths. Tonify Rule 38 updated to capture the doctrine + the cautionary tale. |
+| **May 23-24** | **T_MEMST float→int codegen bug FIXED on both backends**. `*(int_slot) = float_expr` silently reinterpreted IEEE 754 bits as integer (`fmov x0, d0` on a64; `movq rax, xmm0` on x64) instead of converting (`fcvtzs` / `cvttsd2si`). Surfaced when snake_maestro particles teleported to addresses outside the framebuffer after the load/import P6 commit made `ecs_physics` inline through this primitive (pre-P6 the call frame masked it). Fixed in `a64_codegen.bsm` (`2b0bbef`) and mirrored in `x64_codegen.bsm` (`e4bdf9a`) with regression test `tests/test_memst_float_to_int.bpp` guarding both backends. `ecs_physics` migrated to `dt: float` seconds API in the same window (no more milliseconds-int / seconds-float impedance mismatch). |
+| **May 24** | **Wave 20 closeout — chip statement walkers retired**. The spine's `cg_emit_stmt` now owns the full 11-AST-case statement dispatcher (T_DECL / T_NOP / T_BLOCK / T_BREAK / T_CONTINUE / T_IF / T_WHILE / T_RET / T_ASSIGN / T_MEMST / T_SWITCH / expression-stmt). Chip-side `a64_emit_stmt` + `x64_emit_stmt` walkers + their fat `_full` wrappers + the `emit_stmt_full` primitive slot all deleted as dead code (-639 LOC across a64 + x64). The chip backends now contribute only ISA-atomic primitives to T_ASSIGN / T_MEMST / T_SWITCH; AST-level dispatch lives in one place. |
+| **May 25** | **Wave 21 closeout — chip expression walkers retired**. `cg_emit_node` in `src/bpp_codegen.bsm` takes the eight expression cases (T_LIT / T_VAR / T_TERNARY / T_UNARY / T_CALL / T_MEMLD / T_ADDR / T_BINOP) including the T_BINOP left-save dance via `emit_binop_save_left` + `emit_binop_resolve` primitives, the T_VAR stack-struct address-of via `emit_addr_stack_struct`, and the `: u_word` unsigned-dispatch port (UDIV/UMOD/LSR). Three-commit ship per the bisect-friendly plan: pre-migration of chip-internal call sites (37 a64 + 46 x64 sites converted to indirect primitive calls) → wire flip (`p.emit_node = fn_ptr(cg_emit_node)`, validated via differential disasm probe `tests/codegen_parity_probe.bpp` — 0 bytes of divergence) → delete chip walker bodies (~700 LOC). Bootstrap convergent; native 180/0/12 + C-emit 145/0/47 + Linux/Docker headless 5/5. The chip backends are now pure primitive providers — adding a third backend is a single file of primitive bodies. |
+| **May 25** | **Cross-module global float type recovery (E233/E240 gap fix)**. When a non-entry module references an entry-module `global X: float;` declaration, the type wasn't visible at infer time (parser processes non-entry modules in topological order BEFORE the entry module declares its globals). Result: the validator either missed E233 silently OR fired E240 ("int passed to float param") when the value WAS actually float. Workaround required `extrn X: float;` per consumer. Fix re-resolves T_VAR arg types at validator time (when `ty_gl[]` is fully populated) with a local-shadow guard via `fn_metas` vt_block to prevent the test_global_kw false positive. Surgical (+9% bootstrap) vs the rejected split-parse-infer alternative (+17%). |
+| **May 25** | **HUD performance fix — 60→59 fps flicker eliminated**. Stack-chain profiling on `_mem_alloc_pages` (new diagnostic `profile_print_chains` in `bpp_runtime`) identified three HUD overlay sites mallocing scratch buffers per frame: `render_number` (10-20 calls/frame for the FPS counter + top-N list + zone numbers), `profile_zones_hud_draw` (selection-sort + used-mask scratch), `_profile_dump_inner` (sample aggregation scratch x2). Pre-allocating all three at init dropped `_mem_alloc_pages` samples 22 → 4 (95% reduction); live HUD steady at `ms:17 max:17` with variance zero. Tonify gains **Rule 40** (hot-path malloc is a frame-jitter trap) — pre-allocate scratch buffers at module init, file-scope static, reuse forever. |
 
 B++ went from "parser that parses itself" to "an IDE that authors content for the games it compiles" in two months. The philosophy that emerged along the way — **semantics in the frontend, emission in the backend; progressive disclosure everywhere; every dependency earned its place** — is written into [`docs/manual/how_to_dev_b++.md`](docs/manual/how_to_dev_b++.md), the unified manual that absorbs the previously fragmented programming-language reference, dev guide, and Bang 9 design docs. Adding a new chip, OS, or feature follows the same pattern the existing code does.
 

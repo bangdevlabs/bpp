@@ -780,6 +780,18 @@ runs whether or not the function is annotated; the annotation is the
 mechanism that turns the classifier's result into a diagnostic.
 `@safe` claims a property; the compiler proves or refutes the claim.
 
+**Inlining is automatic.** Small pure helpers (single-statement
+trivial returns up to multi-statement bodies meeting the S4 cost
+model — caller fan-out × callsite hotness × const-arg savings) get
+spliced at every call site without any annotation. Programmers should
+write the idiomatic accessor (`get_x(p)` returning `p.x`) instead of
+manually inlining for performance — the compiler eliminates the call
+frame and emits the same code as the manual inline would. The
+opposite annotation (`@no_inline`) does NOT exist: per Tonify Rule 4,
+user-facing annotations earn their keep by catching a bug class
+(`@safe`) or driving instrumentation codegen (`@profile`); inlining
+heuristics belong inside the compiler, not at the source level.
+
 #### The killer use case
 
 An audio callback annotated `@safe` is proven by the compiler to
