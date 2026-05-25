@@ -333,12 +333,13 @@ struct ChipPrimitives {
     fn_label_for,             // (fi) → chip-local label id for function fi
     emit_prologue_full,       // (name_p, fn_lbl_id, frame_size) — fat prologue
 
-    // Wave 20: emit_stmt orchestration. Fat delegator to the chip's
-    // statement walker — the spine's cg_emit_stmt bounces straight
-    // through this slot until the 11 AST cases inside split into
-    // individual primitives. Four supporting slots cover the pieces
-    // of T_ASSIGN and T_SWITCH that are cleanly chip-uniform today.
-    emit_stmt_full,           // (nd) — fat walker, full statement recipe
+    // Wave 20: emit_stmt orchestration. Spine cg_emit_stmt owns the
+    // 11 statement cases directly; the four supporting slots below
+    // cover the chip-uniform pieces of T_ASSIGN and T_SWITCH that
+    // resolve cleanly per backend. The previous fat `emit_stmt_full`
+    // delegator slot was retired once the spine took T_ASSIGN /
+    // T_MEMST / T_SWITCH inline (the chip walkers + wrappers became
+    // dead code; cleanup commit follows the cg_emit_stmt rewrite).
     emit_struct_copy_word,    // (src_word_off, dst_frame_off_bytes) — 8B load+store
     emit_peek_cond,           // () — load saved cond from [sp] into scratch
     emit_cmp_scratch_acc,     // () — flags ← compare(scratch, acc)
@@ -2698,13 +2699,16 @@ cg_emit_node(nd) {
     return call(p.emit_node, nd);
 }
 
-// Wave 20 takeover: spine now owns the statement dispatcher for
-// every AST case that uses only portable state + ChipPrimitives
-// slots. The three tangled cases (T_ASSIGN, T_MEMST, T_SWITCH)
-// still fall back to the chip walker through emit_stmt_full until
-// their final primitives (store_var_typed, memst_float_narrow,
-// memst_simd, switch_jtbl, pop_discard) land. Once those ship, the
-// fall-back disappears and the chip's emit_stmt becomes dead code.
+// Wave 20 complete: spine owns the statement dispatcher for every
+// AST case (T_DECL, T_NOP, T_BLOCK, T_BREAK, T_CONTINUE, T_IF,
+// T_WHILE, T_RET, T_ASSIGN, T_MEMST, T_SWITCH, expression-stmt).
+// T_ASSIGN, T_MEMST, and T_SWITCH — the previously tangled cases —
+// resolved through dedicated primitives (emit_store_var_typed,
+// emit_memst_float_simd/scalar/int, emit_switch_jtbl, emit_pop_discard,
+// emit_peek_cond, emit_cmp_scratch_acc, emit_struct_copy_word). The
+// chip-side a64_emit_stmt / x64_emit_stmt walkers + their full-fat
+// wrappers were retired as dead code (commit follows this comment).
+// Wave 21 picks up emit_node next.
 void cg_emit_stmt(nd) {
     auto p: ChipPrimitives;
     auto n: Node;
