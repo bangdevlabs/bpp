@@ -31,6 +31,7 @@ import "stbgame.bsm";          // game_dt_ms
 load   "rts1_buildings.bsm";    // Building struct + building_comp + building_q
 load   "rts1_render.bsm";       // Pos / Anim structs + pos_comp / anim_comp
 load   "rts1_anims.bsm";        // UNIT_STATE_BUILD + facing helpers
+load   "rts1_units.bsm";        // UnitDef + UNIT_* + unit_def_for (S10 training)
 
 // Pixel radius around the building's center within which an
 // assigned peasant counts as "at the foundation" — i.e., close
@@ -41,6 +42,119 @@ load   "rts1_anims.bsm";        // UNIT_STATE_BUILD + facing helpers
 // unblocked cell, which lands the worker 1-2 tiles outside the
 // foundation).
 const _BLDG_ASSIGN_RADIUS_PX = 48;
+
+// ── S10 production: training queue ────────────────────────────
+//
+// Max units a single building may queue at once. 7 is a comfortable
+// depth that fits the command-card pip row without scrolling.
+const _WC1_QUEUE_MAX = 7;
+
+// Fill `out` (a buf_word with at least _WC1_QUEUE_MAX slots) with
+// the UNIT_* kinds a building of `bldg_kind` can train for `player`
+// (0 = human, 1 = orc) and return the count. The same building role
+// trains a faction-distinct roster (human footman vs orc grunt), so
+// the menu branches on player. Non-producer kinds return 0. This is
+// the data the command card lays buttons out from + the enqueue path
+// validates against. Catapults + heroes are intentionally absent —
+// siege production wires onto the blacksmith in a later pass, heroes
+// are mission-placed.
+wc1_train_menu(bldg_kind, player, out) {
+    auto n, human;
+    n = 0;
+    human = player == 0;
+    switch (bldg_kind) {
+        BLDG_TOWN_HALL {
+            out[0] = UNIT_PEASANT;          // peon shares the slot
+            n = 1;
+        }
+        BLDG_BARRACKS {
+            if (human != 0) {
+                out[0] = UNIT_FOOTMAN; out[1] = UNIT_ARCHER;
+            } else {
+                out[0] = UNIT_GRUNT;   out[1] = UNIT_SPEARMAN;
+            }
+            n = 2;
+        }
+        BLDG_STABLE {
+            out[0] = human != 0 ? UNIT_KNIGHT : UNIT_RAIDER;
+            n = 1;
+        }
+        BLDG_CHURCH {
+            if (human != 0) {
+                out[0] = UNIT_CLERIC;    out[1] = UNIT_CONJURER;
+            } else {
+                out[0] = UNIT_NECROLYTE; out[1] = UNIT_WARLOCK;
+            }
+            n = 2;
+        }
+        else { n = 0; }
+    }
+    return n;
+}
+
+// Append a unit to a building's training queue. Lazy-allocates the
+// queue buffer on first use (non-producers never pay). The CALLER
+// gates affordability (gold / wood / food) — this only records the
+// order. Returns 1 on success, 0 if the queue is already full.
+wc1_production_enqueue(w, eid, unit_kind) {
+    auto b: Building, q;
+    b = ecs_get(w, building_comp, eid);
+    if (b.train_count >= _WC1_QUEUE_MAX) { return 0; }
+    if (b.train_queue == 0) {
+        b.train_queue = buf_word(_WC1_QUEUE_MAX);
+    }
+    q = b.train_queue;
+    q[b.train_count] = unit_kind;
+    b.train_count = b.train_count + 1;
+    return 1;
+}
+
+// Advance a completed building's training queue by one frame. When
+// the front unit's build_time_ms elapses, spawn it (at the rally
+// tile if set, else one tile below the footprint) and pop the queue.
+// Called from _tick_building for every BLDG_STATE_DONE building, so
+// it returns immediately for non-producers (train_count == 0).
+static void _tick_training(w, eid) {
+    auto b: Building, def: UnitDef, fa: Faction, bdef: BuildingDef;
+    auto p_b: Pos, dt, front, q, sgx, sgy, atlas, player, i;
+    b = ecs_get(w, building_comp, eid);
+    if (b.train_count <= 0) { return; }
+    q     = b.train_queue;
+    front = q[0];
+    def   = unit_def_for(front);
+    if (def == 0) { return; }                  // unknown kind — drop safely
+    dt = game_dt_ms();
+    b.train_progress_ms = b.train_progress_ms + dt;
+    if (b.train_progress_ms < def.build_time_ms) { return; }
+    // Front unit finished — resolve where it appears.
+    fa     = ecs_get(w, faction_comp, eid);
+    player = fa.player;
+    bdef   = building_def_for(b.kind);
+    p_b    = ecs_get(w, pos_comp, eid);
+    if (b.rally_gx >= 0) {
+        sgx = b.rally_gx;
+        sgy = b.rally_gy;
+    } else {
+        // One tile below the footprint center. S10.3 replaces this
+        // with proper free-tile resolution + a walk-to-rally order.
+        sgx = (p_b.x + bdef.px_w / 2) / 16;
+        sgy = (p_b.y + bdef.px_h) / 16 + 1;
+    }
+    atlas = wc1_atlas_for_unit(front, player);
+    if (atlas != 0) {
+        ecs_spawn_unit(w, atlas, sgx, sgy, player, front);
+    }
+    // Pop the front of the queue (shift the rest left).
+    i = 0;
+    while (i < b.train_count - 1) {
+        q[i] = q[i + 1];
+        i = i + 1;
+    }
+    b.train_count       = b.train_count - 1;
+    b.train_progress_ms = 0;
+    putstr("trained unit kind="); putnum(front);
+    putstr(" at building eid="); putnum(eid); putstr("\n");
+}
 
 // Per-entity tick. Three behaviours, gated by Building state:
 //
@@ -73,7 +187,14 @@ static void _tick_building(w, eid) {
     auto p_b: Pos, p_w: Pos, an_w: Anim;
     auto bcx, bcy, dx, dy, sq, dt;
     b = ecs_get(w, building_comp, eid);
-    if (b.state == BLDG_STATE_DONE) { return; }
+    if (b.state == BLDG_STATE_DONE) {
+        // Completed building → advance its training queue (S10). The
+        // queue is empty for non-producers, so this is a cheap
+        // early-return for them.
+        _tick_training(w, eid);
+        return;
+    }
+    if (b.state != BLDG_STATE_CONSTRUCTING) { return; }   // DEPLETED mine → no-op
     if (b.assigned_peasant_eid < 0) { return; }   // no worker → no progress
     def = building_def_for(b.kind);
     // Building center in pixels. Pos is top-left; add half the
