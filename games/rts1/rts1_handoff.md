@@ -1395,18 +1395,84 @@ Standing gates per Tonify discipline:
 
 ## Status
 
-**Sessions 1-7 CLOSED.** S7 shipped the full combat arc in a
-single late-2026-05-18 session: damage matrix + missile entity
-pipeline (with `stb/stbprojectile` graduation) + energy & shields
-slots + the entire 14-unit WC1 roster wired and spawnable. See
-the Session 7 block above for the per-file breakdown.
+**Sessions 1-10 CLOSED.** S7 (combat), S8 (buildings), S8.5 (HUD
+infra), S9 (resources end-to-end), S10 (production — training +
+research) all shipped. See per-session blocks above + the S10
+sub-session commits for the per-file breakdowns.
 
-**S9 (Resources) is next** on the game arc. Gold mines + forests
-become harvestable; peasants gather, return to a town hall,
-deposit. Resource counter ticks up in the HUD. The HUD work in
-S9 dovetails with the S8.5 infra below — gold/wood/food counters
-compose through `ui_text` widgets in a declarative layout
-alongside `top_resource_bar` panel images.
+**S10 closed in five sub-sessions (2026-05-25, `2668ad2` →
+`0cbc46f`):**
+
+  - **S10.0** (`2668ad2`) — UnitDef production economics
+    (`cost_gold` / `cost_wood` / `food_cost` / `build_time_ms`) for
+    all 14 unit kinds.
+  - **S10.1** (`3624f4c`) — lazy training queue on `Building` +
+    `_tick_training` + `wc1_atlas_for_unit` + `wc1_train_menu` +
+    `wc1_production_enqueue`. Debug key **T** queues into the
+    selected building.
+  - **S10.2** (`12b5fbb`) — command-card train buttons (icon +
+    cost, dim when unaffordable) + click-to-enqueue gated on
+    `wc1_resources_can_afford` + spend. HUD strip is now an opaque
+    overlay (eats clicks).
+  - **S10.3** (`e1a1cab`) — right-click rally point + walk-to-rally
+    on spawn + queue progress bar + click-to-cancel with gold/wood
+    refund (`wc1_resources_refund`).
+  - **S10.4** (`0cbc46f`) — blacksmith research (weapon / armor
+    upgrades): per-player tech-flag table + `_tick_research` +
+    research buttons, with a **real combat effect** (+2 damage / +2
+    armor read at strike time via `wc1_tech_weapon_bonus` /
+    `wc1_tech_armor_bonus`).
+
+**S11 (AI baseline) is next** — the genuinely MAX-worthy seam S10
+unblocks. The enemy player builds, gathers, **trains** (now
+possible — the training loop the AI drives exists), and attacks at
+5 Hz. First design call: graduate a `stbai` cartridge vs keep an
+`rts1_ai.bsm` game module (Rule 28 gate — name a second consumer:
+RPG AI? FPS enemy AI?). See the Session 11 block above.
+
+**S10 follow-ons (not blockers — fold into a later polish pass):**
+
+  - Per-kind `food_cost` (knight = 2) is data-only; the recompute
+    counts 1 per unit, so the food gate is effectively "1 free
+    slot". Sum `food_cost` in `_food_used_visit` (rts1_resources)
+    to enforce it.
+  - Over-queueing past the food cap is possible (the gold spend is
+    the real limiter); count queued + live against the cap to
+    tighten.
+  - Trained units spawn one tile below the footprint with no free-
+    tile resolution — they can stack if no rally is set.
+  - Ranged (missile-impact) damage ignores the defender's armor
+    upgrade; only the melee path reads `wc1_tech_armor_bonus` today.
+
+**⚠️ Resume point for the next agent.** The rts1 working tree is
+clean — S10 is fully committed to `main` (HEAD `0cbc46f`). The only
+uncommitted items are doc edits the user is batching:
+`docs/journal.md` (2026-05-23..25 entries) + `docs/todo.md`
+(refresh). The earlier README / Rule 41 / BangBox tray is already
+committed.
+
+The **bpp binary is unchanged since `90f83f6`** (S10 is pure rts1
+game code — zero compiler/runtime edits). All suites green
+(180/0/12 + 145/0/47 + Linux/Docker headless 5/5). Bootstrap 0.34s
+nominal. Use `bpp` from repo as-is.
+
+**Compiler context the next session inherits:** Wave 21 closeout
+shipped today (chip emit_node walkers retired, spine cg_emit_node
+owns every expression case). The strict-`@safe` gate is the
+parallel-loop doctrine (host MUST be `@safe` for both outlining
+AND MAP). The T_MEMST float→int store bug fixed on both backends
+with regression test `tests/test_memst_float_to_int.bpp`. HUD
+60→59 fps flicker eliminated by killing per-frame malloc in
+`render_number` / `profile_zones_hud_draw` / `_profile_dump_inner`.
+The S10 work itself doesn't touch any of this — it's all rts1
+gameplay on top.
+
+**Diagnostic helper added today:** `profile_print_chains(name)` in
+`src/bpp_runtime.bsm`. Walks every captured SIGPROF sample and
+prints stack chains where the innermost frame's resolved name
+matches the filter. Useful for spike-bound investigation
+(when `profile_dump` aggregate top-N doesn't expose the cause
+because the spike sample count is too rare to rank).
 
 **Recent activity (2026-05-20, afternoon):** S8.5 — HUD infra
 arc CLOSED. **stbhud** Tier-2 cartridge created (`stb/stbhud.
