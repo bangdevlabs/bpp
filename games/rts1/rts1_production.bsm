@@ -49,6 +49,100 @@ const _BLDG_ASSIGN_RADIUS_PX = 48;
 // depth that fits the command-card pip row without scrolling.
 const _WC1_QUEUE_MAX = 7;
 
+// ── S10.4 research: blacksmith upgrades ───────────────────────
+//
+// Two techs in v1, both researched at the blacksmith, both global
+// per player. A flat weapon / armor bonus the combat tick reads at
+// strike time — enough to prove the research loop (button → cost →
+// tick → flag → effect) without a full upgrade tree.
+const TECH_WEAPON      = 0;
+const TECH_ARMOR       = 1;
+const _WC1_TECH_COUNT  = 2;
+const _WC1_TECH_BONUS  = 2;        // +2 damage / +2 armor per tech
+const _WC1_RESEARCH_MS = 15000;    // 15 s per upgrade
+
+// Per-player tech-done flags, lazy-allocated (2 players × 2 techs).
+// 0 = not researched, 1 = done. Lazy so a game that never opens a
+// blacksmith never allocates the table.
+global _wc1_tech_done;
+
+static _tech_slot(player, tech) { return player * _WC1_TECH_COUNT + tech; }
+
+static void _tech_ensure() {
+    if (_wc1_tech_done == 0) {
+        _wc1_tech_done = buf_byte(2 * _WC1_TECH_COUNT);
+        buf_fill(_wc1_tech_done, 0, 2 * _WC1_TECH_COUNT);
+    }
+}
+
+// 1 if `player` has finished researching `tech`, else 0.
+wc1_tech_has(player, tech) {
+    if (_wc1_tech_done == 0) { return 0; }
+    return peek(_wc1_tech_done + _tech_slot(player, tech));
+}
+
+static void _tech_set_done(player, tech) {
+    _tech_ensure();
+    poke(_wc1_tech_done + _tech_slot(player, tech), 1);
+}
+
+// Combat reads these at strike time — flat bonus once the tech lands.
+wc1_tech_weapon_bonus(player) {
+    return wc1_tech_has(player, TECH_WEAPON) != 0 ? _WC1_TECH_BONUS : 0;
+}
+wc1_tech_armor_bonus(player) {
+    return wc1_tech_has(player, TECH_ARMOR) != 0 ? _WC1_TECH_BONUS : 0;
+}
+
+// Fill `out` with the TECH_* a building offers `player`. Blacksmith
+// only in v1; returns 0 for everything else. Researched techs stay
+// in the menu (the button renders "done") so the player still sees
+// what is already unlocked.
+wc1_research_menu(bldg_kind, player, out) {
+    if (bldg_kind == BLDG_BLACKSMITH) {
+        out[0] = TECH_WEAPON;
+        out[1] = TECH_ARMOR;
+        return 2;
+    }
+    return 0;
+}
+
+wc1_research_cost_gold(tech) { return 500; }
+wc1_research_cost_wood(tech) { return 100; }
+wc1_research_time_ms(tech)   { return _WC1_RESEARCH_MS; }
+
+// Short label for a research button (techs have no unit portrait).
+// Kept to 3 chars so it fits the 36 px button. Lives here, not in the
+// HUD, because the TECH_* constants are defined in this module.
+wc1_tech_label(tech) {
+    switch (tech) {
+    TECH_WEAPON { return "Wpn"; }
+    TECH_ARMOR  { return "Arm"; }
+    else        { return "?"; }
+    }
+    return "?";
+}
+
+// Start researching `tech` at building `eid`. Rejects if the player
+// already has it, the building is already researching, or the player
+// can't afford gold + wood (no food gate — research consumes no
+// supply). Spends on success. Returns 1 if research started.
+wc1_research_start(world, eid, tech) {
+    auto b: Building, fa: Faction, g, wd;
+    b = ecs_get(world, building_comp, eid);
+    if (b.research_tech >= 0) { return 0; }          // one at a time
+    fa = ecs_get(world, faction_comp, eid);
+    if (wc1_tech_has(fa.player, tech) != 0) { return 0; }   // already done
+    g  = wc1_research_cost_gold(tech);
+    wd = wc1_research_cost_wood(tech);
+    if (wc1_resources_gold() < g)  { return 0; }
+    if (wc1_resources_wood() < wd) { return 0; }
+    wc1_resources_spend(g, wd);
+    b.research_tech        = tech;
+    b.research_progress_ms = 0;
+    return 1;
+}
+
 // Fill `out` (a buf_word with at least _WC1_QUEUE_MAX slots) with
 // the UNIT_* kinds a building of `bldg_kind` can train for `player`
 // (0 = human, 1 = orc) and return the count. The same building role
@@ -140,6 +234,21 @@ wc1_production_try_click(world, eid, mx, my) {
                 wc1_resources_spend(def.cost_gold, def.cost_wood);
                 wc1_production_enqueue(world, eid, kind);
             }
+            free(menu);
+            free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    // Research buttons reuse the same slot rects (a building either
+    // trains or researches, never both, so the slots don't collide).
+    n = wc1_research_menu(b.kind, fa.player, menu);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            wc1_research_start(world, eid, menu[i]);
             free(menu);
             free(rect);
             return 1;
@@ -238,6 +347,25 @@ static void _tick_training(w, eid) {
     putstr(" at building eid="); putnum(eid); putstr("\n");
 }
 
+// Advance a building's in-progress research by one frame. On
+// completion sets the player's tech flag (read by the combat tick
+// for the weapon / armor bonus) and clears the slot. Independent of
+// the training queue — a blacksmith researches without training.
+static void _tick_research(w, eid) {
+    auto b: Building, fa: Faction, dt;
+    b = ecs_get(w, building_comp, eid);
+    if (b.research_tech < 0) { return; }
+    dt = game_dt_ms();
+    b.research_progress_ms = b.research_progress_ms + dt;
+    if (b.research_progress_ms < _WC1_RESEARCH_MS) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    _tech_set_done(fa.player, b.research_tech);
+    putstr("research complete: tech="); putnum(b.research_tech);
+    putstr(" player="); putnum(fa.player); putstr("\n");
+    b.research_tech        = 0 - 1;
+    b.research_progress_ms = 0;
+}
+
 // Per-entity tick. Three behaviours, gated by Building state:
 //
 //   DONE          — no-op. The early-return keeps the per-frame
@@ -270,10 +398,10 @@ static void _tick_building(w, eid) {
     auto bcx, bcy, dx, dy, sq, dt;
     b = ecs_get(w, building_comp, eid);
     if (b.state == BLDG_STATE_DONE) {
-        // Completed building → advance its training queue (S10). The
-        // queue is empty for non-producers, so this is a cheap
-        // early-return for them.
+        // Completed building → advance its training queue + research
+        // (S10). Both are cheap early-returns for non-producers.
         _tick_training(w, eid);
+        _tick_research(w, eid);
         return;
     }
     if (b.state != BLDG_STATE_CONSTRUCTING) { return; }   // DEPLETED mine → no-op
