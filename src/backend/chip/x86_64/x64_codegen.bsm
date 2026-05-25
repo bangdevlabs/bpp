@@ -1297,7 +1297,13 @@ void x64_emit_stmt(nd) {
             return 0;
         }
         ety = x64_emit_node(n.b);
-        if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
+        // Float RHS → integer destination: cvttsd2si (truncate)
+        // not movq (bitcast). Mirror of the a64 fix at a64_emit_stmt's
+        // T_MEMST branch (commit 2b0bbef). This branch is dead path
+        // post-Wave 20 spine takeover (cg_emit_stmt dispatches direct
+        // via p.emit_memst_int), kept aligned for when the spine
+        // sweep finalizes and removes all chip emit_stmt branches.
+        if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
         x64_emit_push();
         x64_emit_node(n.a);
         x64_emit_pop(1);
@@ -1501,7 +1507,15 @@ void _x64_emit_memst_int(nd, fh) {
     auto pp: ChipPrimitives;
     n = nd;
     ety = x64_emit_node(n.b);
-    if (ety == 1) { x64_enc_movq_from_xmm(0, 0); }
+    // Float RHS going into integer destination: convert with
+    // cvttsd2si (truncate toward zero), do NOT bitcast with
+    // movq. The bitcast path silently corrupted every
+    // `int_slot = float_expr` store — `*(buf) = 0.5 * 1000`
+    // would write the IEEE bits of 500.0 (0x407F400000000000)
+    // instead of the integer 500. Mirror of the a64 fix at
+    // `_a64_emit_memst_int` (commit 2b0bbef).
+    // Test: tests/test_memst_float_to_int.bpp
+    if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
     x64_emit_push();
     x64_emit_node(n.a);
     x64_emit_pop(1);
