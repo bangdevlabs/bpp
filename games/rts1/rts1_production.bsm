@@ -135,9 +135,9 @@ wc1_research_start(world, eid, tech) {
     if (wc1_tech_has(fa.player, tech) != 0) { return 0; }   // already done
     g  = wc1_research_cost_gold(tech);
     wd = wc1_research_cost_wood(tech);
-    if (wc1_resources_gold() < g)  { return 0; }
-    if (wc1_resources_wood() < wd) { return 0; }
-    wc1_resources_spend(g, wd);
+    if (wc1_resources_gold(fa.player) < g)  { return 0; }
+    if (wc1_resources_wood(fa.player) < wd) { return 0; }
+    wc1_resources_spend(fa.player, g, wd);
     b.research_tech        = tech;
     b.research_progress_ms = 0;
     return 1;
@@ -284,12 +284,14 @@ wc1_cmd_entry_frame(e, player) {
 // enabled; a build entry is gated on the player affording its gold +
 // wood (the HUD dims the icon, the click is rejected upstream).
 wc1_cmd_entry_affordable(e) {
-    auto def: BuildingDef;
+    auto def: BuildingDef, lp;
     if (_cmd_action(e) != CMD_BUILD) { return 1; }
     def = building_def_for(e % 1000);
     if (def == 0) { return 0; }
-    return wc1_resources_gold() >= def.cost_gold
-        && wc1_resources_wood() >= def.cost_wood;
+    // The command card always shows the LOCAL player's economy.
+    lp = wc1_local_player();
+    return wc1_resources_gold(lp) >= def.cost_gold
+        && wc1_resources_wood(lp) >= def.cost_wood;
 }
 
 // Fill `out` (>= 9 slots) with the command entries for `unit_kind` at
@@ -417,8 +419,8 @@ wc1_unit_cmd_click(world, eid, mx, my) {
                 // dimmed otherwise); the click is consumed either way.
                 bdef = building_def_for(value);
                 if (bdef != 0
-                    && wc1_resources_gold() >= bdef.cost_gold
-                    && wc1_resources_wood() >= bdef.cost_wood) {
+                    && wc1_resources_gold(fa.player) >= bdef.cost_gold
+                    && wc1_resources_wood(fa.player) >= bdef.cost_wood) {
                     wc1_placement_begin(value, eid);
                     _cmd_menu_level = CMD_LEVEL_ROOT;
                 }
@@ -481,39 +483,10 @@ wc1_placement_valid(kind, gx, gy) {
     return 1;
 }
 
-// Peasant build-icon click. If `eid` is a worker and the click hit a
-// build icon, enter placement mode for that building. Returns 1 if a
-// build icon was hit. Lives here (UnitType / UNIT_* / BLDG_* in scope).
-wc1_build_try_click(world, eid, mx, my) {
-    auto u: UnitType, fa: Faction, menu, n, i, rect, bx, by, bw, bh, bdef: BuildingDef;
-    u = ecs_get(world, unit_comp, eid);
-    if (u.kind != UNIT_PEASANT) { return 0; }      // only workers build
-    fa = ecs_get(world, faction_comp, eid);
-    menu = buf_word(16);
-    n = wc1_build_menu(fa.player, menu);
-    rect = buf_word(4);
-    i = 0;
-    while (i < n) {
-        wc1_cmd_build_button_rect(i, rect);
-        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
-        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
-            // Only enter placement when the player can pay (the icon is
-            // already dimmed when unaffordable) — avoids dropping into a
-            // ghost that can never commit. Click is consumed either way.
-            bdef = building_def_for(menu[i]);
-            if (bdef != 0
-                && wc1_resources_gold() >= bdef.cost_gold
-                && wc1_resources_wood() >= bdef.cost_wood) {
-                wc1_placement_begin(menu[i], eid);
-            }
-            free(menu); free(rect);
-            return 1;
-        }
-        i = i + 1;
-    }
-    free(menu); free(rect);
-    return 0;
-}
+// (S10.5's flat build-icon click handler `wc1_build_try_click` +
+// `wc1_cmd_build_button_rect` were superseded by the S10.6 two-level
+// command card — `wc1_unit_cmd_click` / `wc1_unit_cmd_menu` above —
+// and removed.)
 
 // Try to drop the active placement at tile (gx, gy). On a valid spot
 // with enough gold/wood: spend, spawn the foundation (CONSTRUCTING)
@@ -527,14 +500,15 @@ wc1_placement_try_at(world, gx, gy) {
     if (wc1_placement_valid(kind, gx, gy) == 0) { return 0; }
     def = building_def_for(kind);
     if (def == 0) { return 0; }
-    // Buildings cost gold + wood only (no food — they GRANT it).
-    if (wc1_resources_gold() < def.cost_gold) { return 0; }
-    if (wc1_resources_wood() < def.cost_wood) { return 0; }
+    // The placing peasant's player owns + pays for the building.
     fa = ecs_get(world, faction_comp, _placement_peasant);
-    player    = fa.player;
+    player = fa.player;
+    // Buildings cost gold + wood only (no food — they GRANT it).
+    if (wc1_resources_gold(player) < def.cost_gold) { return 0; }
+    if (wc1_resources_wood(player) < def.cost_wood) { return 0; }
     idle      = wc1_building_atlas_idle(kind, player);
     construct = wc1_building_atlas_construct(kind, player);
-    wc1_resources_spend(def.cost_gold, def.cost_wood);
+    wc1_resources_spend(player, def.cost_gold, def.cost_wood);
     eid = ecs_spawn_building(world, idle, construct, gx, gy, player, kind);
     // Auto-assign the worker that initiated the build so it walks
     // over and starts construction (same path the right-click assign
@@ -588,8 +562,8 @@ wc1_production_try_click(world, eid, mx, my) {
             kind = menu[i];
             def = unit_def_for(kind);
             if (def != 0
-                && wc1_resources_can_afford(def.cost_gold, def.cost_wood) != 0) {
-                wc1_resources_spend(def.cost_gold, def.cost_wood);
+                && wc1_resources_can_afford(fa.player, def.cost_gold, def.cost_wood) != 0) {
+                wc1_resources_spend(fa.player, def.cost_gold, def.cost_wood);
                 wc1_production_enqueue(world, eid, kind);
             }
             free(menu);
@@ -645,7 +619,7 @@ void wc1_production_set_rally(world, eid, gx, gy) {
 // training timer when the queue empties so a re-queue starts fresh.
 // Returns 1 if something was cancelled.
 wc1_production_cancel_last(world, eid) {
-    auto b: Building, q, last_kind, def: UnitDef;
+    auto b: Building, q, last_kind, def: UnitDef, fa: Faction;
     b = ecs_get(world, building_comp, eid);
     if (b.train_count <= 0) { return 0; }
     q = b.train_queue;
@@ -654,7 +628,9 @@ wc1_production_cancel_last(world, eid) {
     if (b.train_count == 0) { b.train_progress_ms = 0; }
     def = unit_def_for(last_kind);
     if (def != 0) {
-        wc1_resources_refund(def.cost_gold, def.cost_wood);
+        // Refund to the building's owner.
+        fa = ecs_get(world, faction_comp, eid);
+        wc1_resources_refund(fa.player, def.cost_gold, def.cost_wood);
     }
     return 1;
 }
