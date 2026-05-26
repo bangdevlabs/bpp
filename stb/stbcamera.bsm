@@ -25,8 +25,18 @@
 
 struct Cam {
     x, y,                  // top-left of viewport in pixels (int)
-    screen_w, screen_h,    // viewport size
-    world_w, world_h       // map size in pixels (already multiplied by tile size)
+    screen_w, screen_h,    // viewport size: the visible world area, NOT
+                           // necessarily the whole canvas (see view_ox/oy)
+    world_w, world_h,      // map size in pixels (already multiplied by tile size)
+    view_ox, view_oy       // viewport origin: the screen-space pixel where
+                           // this camera's world view starts. Defaults to
+                           // (0, 0) — the world fills the whole canvas. A
+                           // game that reserves screen space for a HUD (an
+                           // RTS left command panel, a top status bar) sets
+                           // this so world<->screen transforms land inside
+                           // the play area while the HUD keeps its own
+                           // absolute-coordinate space. Same role as
+                           // raylib's Camera2D.offset.
 }
 
 // Allocate a fresh camera anchored at (0, 0) sized for the given
@@ -40,6 +50,9 @@ cam_new(screen_w, screen_h, world_w, world_h) {
     c.x = 0; c.y = 0;
     c.screen_w = screen_w; c.screen_h = screen_h;
     c.world_w  = world_w;  c.world_h  = world_h;
+    // Default viewport origin (0, 0): the world view fills the whole
+    // canvas. Games reserving HUD space call cam_set_viewport later.
+    c.view_ox  = 0;        c.view_oy  = 0;
     return c;
 }
 
@@ -95,20 +108,46 @@ void cam_set(cam, x, y) {
     _cam_clamp(c);
 }
 
+// Set the viewport origin — the screen-space pixel where this
+// camera's world view begins. Pass the size of the HUD region the
+// game reserves on the left / top. The world view then spans
+// (ox, oy) .. (ox + screen_w, oy + screen_h) on screen; HUD chrome
+// owns the rest. Re-clamps in case screen_w/h were also adjusted.
+// Pair this with a cam_new whose screen_w/h is the VISIBLE world
+// size (canvas minus the reserved HUD), so the clamp lets the
+// camera reach the true map edge instead of stopping a panel-width
+// short.
+void cam_set_viewport(cam, ox, oy) {
+    auto c: Cam;
+    c = cam;
+    c.view_ox = ox;
+    c.view_oy = oy;
+    _cam_clamp(c);
+}
+
 // Read accessors. Callers DON'T unpack the struct — keeps the API
 // stable if Cam grows fields later (smoothing accumulators, etc).
 cam_x(cam) { auto c: Cam; c = cam; return c.x; }
 cam_y(cam) { auto c: Cam; c = cam; return c.y; }
 
+// Viewport-size + origin accessors. screen_w/h is the visible world
+// area; view_ox/oy is where it sits on screen. HUD code reads these
+// to size a minimap viewport rect or to test "did this click land in
+// the world view or on the panel?".
+cam_screen_w(cam) { auto c: Cam; c = cam; return c.screen_w; }
+cam_screen_h(cam) { auto c: Cam; c = cam; return c.screen_h; }
+cam_view_ox(cam)  { auto c: Cam; c = cam; return c.view_ox; }
+cam_view_oy(cam)  { auto c: Cam; c = cam; return c.view_oy; }
+
 // World → screen and screen → world helpers. The world→screen form
-// is `world - cam`; the screen→world form is `screen + cam`. These
-// will earn their slot once mouse-click selection lands (Session 4
-// completion / S5) — the click handler needs screen→world to map
-// mouse coords to game tile coords.
-cam_world_to_screen_x(cam, wx) { auto c: Cam; c = cam; return wx - c.x; }
-cam_world_to_screen_y(cam, wy) { auto c: Cam; c = cam; return wy - c.y; }
-cam_screen_to_world_x(cam, sx) { auto c: Cam; c = cam; return sx + c.x; }
-cam_screen_to_world_y(cam, sy) { auto c: Cam; c = cam; return sy + c.y; }
+// is `world - cam + view_origin`; the screen→world form inverts it
+// (`screen - view_origin + cam`). The view-origin terms are 0 for a
+// full-canvas camera, so games that never call cam_set_viewport see
+// the original `world - cam` / `screen + cam` behaviour unchanged.
+cam_world_to_screen_x(cam, wx) { auto c: Cam; c = cam; return wx - c.x + c.view_ox; }
+cam_world_to_screen_y(cam, wy) { auto c: Cam; c = cam; return wy - c.y + c.view_oy; }
+cam_screen_to_world_x(cam, sx) { auto c: Cam; c = cam; return sx - c.view_ox + c.x; }
+cam_screen_to_world_y(cam, sy) { auto c: Cam; c = cam; return sy - c.view_oy + c.y; }
 
 // Clamp the camera so the viewport never exposes off-map area.
 // world_size - screen_size is the max coord; floor at 0 so a map
