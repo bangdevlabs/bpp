@@ -203,6 +203,108 @@ wc1_build_menu(player, out) {
     return 8;
 }
 
+// ── S10.5 building placement (peasant build flow) ─────────────
+//
+// Select a peasant → click a build icon → a ghost of the building
+// follows the cursor (green where every footprint tile is free, red
+// otherwise) → click a valid spot to drop the foundation + auto-
+// assign the peasant to build it. State is a small global triple;
+// the HUD renders the ghost, the input tick drives begin / place /
+// cancel through here.
+global _placement_active;     // 0 = not placing, 1 = placing
+global _placement_kind;       // BLDG_* being placed
+global _placement_peasant;    // eid of the worker that will build it
+
+void wc1_placement_begin(kind, peasant_eid) {
+    _placement_active  = 1;
+    _placement_kind    = kind;
+    _placement_peasant = peasant_eid;
+}
+void wc1_placement_cancel() { _placement_active = 0; }
+wc1_placement_active()  { return _placement_active; }
+wc1_placement_kind()    { return _placement_kind; }
+wc1_placement_peasant() { return _placement_peasant; }
+
+// True if a building of `kind` fits with its top-left at tile
+// (gx, gy): every footprint tile must be free (no terrain block, no
+// unit/building claim). self_eid = -1 → a fresh building must land
+// on entirely clear ground. Shared by the ghost render + the place
+// gate so the green/red tint matches what actually drops.
+wc1_placement_valid(kind, gx, gy) {
+    auto def: BuildingDef, ntx, nty, ix, iy;
+    def = building_def_for(kind);
+    if (def == 0) { return 0; }
+    ntx = def.px_w / 16;
+    nty = def.px_h / 16;
+    iy = 0;
+    while (iy < nty) {
+        ix = 0;
+        while (ix < ntx) {
+            if (wc1_collision_is_blocked_for(0 - 1, gx + ix, gy + iy) != 0) {
+                return 0;
+            }
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+    return 1;
+}
+
+// Peasant build-icon click. If `eid` is a worker and the click hit a
+// build icon, enter placement mode for that building. Returns 1 if a
+// build icon was hit. Lives here (UnitType / UNIT_* / BLDG_* in scope).
+wc1_build_try_click(world, eid, mx, my) {
+    auto u: UnitType, fa: Faction, menu, n, i, rect, bx, by, bw, bh;
+    u = ecs_get(world, unit_comp, eid);
+    if (u.kind != UNIT_PEASANT) { return 0; }      // only workers build
+    fa = ecs_get(world, faction_comp, eid);
+    menu = buf_word(16);
+    n = wc1_build_menu(fa.player, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_build_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            wc1_placement_begin(menu[i], eid);
+            free(menu); free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    free(menu); free(rect);
+    return 0;
+}
+
+// Try to drop the active placement at tile (gx, gy). On a valid spot
+// with enough gold/wood: spend, spawn the foundation (CONSTRUCTING)
+// with the resolved atlases, auto-assign the placement peasant, and
+// exit placement. Returns 1 if placed. Invalid spot / too poor: stays
+// in placement so the player can reposition.
+wc1_placement_try_at(world, gx, gy) {
+    auto kind, player, def: BuildingDef, fa: Faction, idle, construct, eid;
+    if (_placement_active == 0) { return 0; }
+    kind = _placement_kind;
+    if (wc1_placement_valid(kind, gx, gy) == 0) { return 0; }
+    def = building_def_for(kind);
+    if (def == 0) { return 0; }
+    // Buildings cost gold + wood only (no food — they GRANT it).
+    if (wc1_resources_gold() < def.cost_gold) { return 0; }
+    if (wc1_resources_wood() < def.cost_wood) { return 0; }
+    fa = ecs_get(world, faction_comp, _placement_peasant);
+    player    = fa.player;
+    idle      = wc1_building_atlas_idle(kind, player);
+    construct = wc1_building_atlas_construct(kind, player);
+    wc1_resources_spend(def.cost_gold, def.cost_wood);
+    eid = ecs_spawn_building(world, idle, construct, gx, gy, player, kind);
+    // Auto-assign the worker that initiated the build so it walks
+    // over and starts construction (same path the right-click assign
+    // uses).
+    wc1_building_assign_peasant(world, eid, _placement_peasant);
+    _placement_active = 0;
+    return 1;
+}
+
 // Append a unit to a building's training queue. Lazy-allocates the
 // queue buffer on first use (non-producers never pay). The CALLER
 // gates affordability (gold / wood / food) — this only records the

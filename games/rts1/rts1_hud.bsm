@@ -229,6 +229,9 @@ wc1_hud_render(world) {
             render_rect_outline(rx, ry, rw, rh, _MARQUEE_COLOR);
         }
     }
+    // S10.5 — building-placement ghost (world-space, drawn under the
+    // command card so the bar stays on top).
+    wc1_placement_render(world);
     // Command card — bottom bar with portrait / stats. Rendered
     // last so it sits on top of the world + every overlay.
     _command_card_render(world);
@@ -567,6 +570,76 @@ wc1_cmd_build_button_rect(slot, out) {
     return 0;
 }
 
+// S10.5 — draw the peasant build-icon row: one small button per
+// constructable building (portrait icon + border, dim border when the
+// player can't afford the gold/wood). No food gate here — buildings
+// GRANT food. Click → wc1_build_try_click enters placement.
+static void _draw_build_icons(world, player) {
+    auto menu, n, i, rect, bx, by, bw, bh, bkind, def: BuildingDef, frame, afford, border;
+    menu = buf_word(16);
+    n = wc1_build_menu(player, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_build_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        bkind = menu[i];
+        def = building_def_for(bkind);
+        afford = def != 0 && wc1_resources_gold() >= def.cost_gold
+              && wc1_resources_wood() >= def.cost_wood;
+        render_rect(bx, by, bw, bh, _CMD_PORTRAIT_BG);
+        border = afford != 0 ? _CMD_FRAME_COLOR : _CMD_BTN_UNAFFORD;
+        render_rect_outline(bx, by, bw, bh, border);
+        frame = _building_portrait_frame(bkind, player);
+        image_draw_size(portrait_icons_atlas, frame, bx + 2, by + 2, bw - 4, bh - 4);
+        i = i + 1;
+    }
+    free(menu);
+    free(rect);
+}
+
+// S10.5 — render the placement ghost while a peasant is dropping a
+// building. The building's idle sprite previews at the cursor tile,
+// and each footprint tile gets a green (free) / red (blocked) outline
+// so the player reads validity at a glance. Drawn in WORLD space
+// (under the command card). No-op when not placing.
+void wc1_placement_render(world) {
+    auto kind, def: BuildingDef, ntx, nty, wx, wy, gx, gy, ix, iy, sx, sy, idle, col;
+    if (wc1_placement_active() == 0) { return; }
+    kind = wc1_placement_kind();
+    def = building_def_for(kind);
+    if (def == 0) { return; }
+    ntx = def.px_w / 16;
+    nty = def.px_h / 16;
+    wx = cam_screen_to_world_x(cam, mouse_x());
+    wy = cam_screen_to_world_y(cam, mouse_y());
+    gx = wx / 16;
+    gy = wy / 16;
+    if (gx < 0) { gx = 0; }
+    if (gy < 0) { gy = 0; }
+    // Ghost sprite of the building at the footprint top-left.
+    idle = wc1_building_atlas_idle(kind, 0);
+    sx = gx * 16 - cam_x(cam);
+    sy = gy * 16 - cam_y(cam);
+    if (idle != 0) { image_draw_size(idle, 0, sx, sy, def.px_w, def.px_h); }
+    // Per-tile validity outline.
+    iy = 0;
+    while (iy < nty) {
+        ix = 0;
+        while (ix < ntx) {
+            if (wc1_collision_is_blocked_for(0 - 1, gx + ix, gy + iy) != 0) {
+                col = 0xFFFF3030;       // red — tile blocked
+            } else {
+                col = 0xFF30FF30;       // green — tile free
+            }
+            render_rect_outline((gx + ix) * 16 - cam_x(cam),
+                                (gy + iy) * 16 - cam_y(cam), 16, 16, col);
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+}
+
 // Draw the train buttons for a completed producer building: one
 // button per kind in the building's train menu, each showing the
 // unit portrait icon + its gold cost. Unaffordable buttons render
@@ -650,7 +723,10 @@ static void _draw_research_buttons(world, kind, player) {
 // the two never drift.
 wc1_cmd_progress_rect(out) {
     out[0] = _CMD_PORTRAIT_INSET + _CMD_PORTRAIT_PX + 8;   // = 66, under the text
-    out[1] = wc1_cmd_bar_y() + 30;
+    // Sits BELOW the name (bar_y+10) + HP (bar_y+22) lines so the
+    // "Footman" caption (drawn at y-10) and the bar don't collide
+    // with the HP text. Caption lands at bar_y+34, bar at bar_y+44.
+    out[1] = wc1_cmd_bar_y() + 44;
     out[2] = 120;
     out[3] = 10;
     return 0;
@@ -754,6 +830,10 @@ static void _command_card_render(world) {
         }
         render_text(hp_sb, sx, sy + 12, 1, _CMD_TEXT_DIM);
         strbuf_free(hp_sb);
+        // S10.5 — a selected human worker shows the build-icon row.
+        if (u.kind == UNIT_PEASANT && fa.player == 0) {
+            _draw_build_icons(world, fa.player);
+        }
         return;
     }
     // selected_kind == SEL_KIND_BUILDING.
