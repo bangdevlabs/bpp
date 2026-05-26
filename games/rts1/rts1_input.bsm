@@ -201,6 +201,10 @@ static _unit_at_world_any(world, wx, wy) {
 static void _resolve_release(world) {
     auto sx0, sy0, sx1, sy1, swap, dx, dy, hit, building_eid;
     auto wx, wy, mx, my;
+    // A new selection always resets the command card back to its root
+    // level and disarms any pending Move / Harvest cursor (WC1: picking
+    // a different unit starts on its top-level command card).
+    wc1_cmd_menu_reset();
     sx0 = drag_x0;
     sy0 = drag_y0;
     sx1 = drag_x1;
@@ -270,21 +274,39 @@ void wc1_input_tick(world) {
     // mouse_down tracks the moving end; release resolves into
     // click-or-marquee and clears drag_active.
     if (mouse_pressed(MOUSE_LEFT) != 0) {
+        // S10.6 — armed cursor: after the player clicked Move or Harvest
+        // on the peasant command card, the next WORLD click is the
+        // command's target (WC1 click-button-then-click-target flow).
+        // A click on the panel falls through so the player can re-pick.
+        if (wc1_cmd_pending() != 0 && mouse_x() >= wc1_panel_w()) {
+            wx = cam_screen_to_world_x(cam, mouse_x());
+            wy = cam_screen_to_world_y(cam, mouse_y());
+            gx = wx / 16;
+            gy = wy / 16;
+            if (gx < 0) { gx = 0; }
+            if (gy < 0) { gy = 0; }
+            if (wc1_cmd_pending() == 1)      { _issue_move(world, gx, gy); }
+            else if (wc1_cmd_pending() == 2) { _cmd_exec_harvest(world, gx, gy); }
+            else                             { _cmd_exec_attack(world, wx, wy, gx, gy); }
+            wc1_cmd_pending_clear();
+            return;
+        }
         // S10.5 — in placement mode, a world click drops the
-        // foundation (HUD clicks still fall through to the build icons
-        // below). Stays in placement on an invalid spot so the player
-        // can reposition.
-        if (wc1_placement_active() != 0 && mouse_y() < wc1_cmd_bar_y()) {
+        // foundation (clicks on the command panel still fall through to
+        // the build icons below). Stays in placement on an invalid spot
+        // so the player can reposition.
+        if (wc1_placement_active() != 0 && mouse_x() >= wc1_panel_w()) {
             wx = cam_screen_to_world_x(cam, mouse_x());
             wy = cam_screen_to_world_y(cam, mouse_y());
             wc1_placement_try_at(world, wx / 16, wy / 16);
             return;
         }
-        // S10 — the command card is an opaque overlay. A press on its
-        // strip is consumed here so it never starts a marquee or
-        // deselects whatever is behind it. Route to the train buttons
-        // (building selected) or the build icons (worker selected).
-        if (mouse_y() >= wc1_cmd_bar_y()) {
+        // S10.6 — the left command panel is an opaque overlay. A press
+        // on it (mouse_x < panel width) is consumed here so it never
+        // starts a marquee or deselects whatever is behind it. Route to
+        // the train buttons (building selected) or the build icons
+        // (worker selected).
+        if (mouse_x() < wc1_panel_w()) {
             // S10.6 — a click on the minimap pans the camera; otherwise
             // route to the command buttons.
             if (wc1_minimap_click(mouse_x(), mouse_y()) != 0) {
@@ -295,8 +317,10 @@ void wc1_input_tick(world) {
                     wc1_production_try_click(world, selected_eids[0],
                                              mouse_x(), mouse_y());
                 } else if (selected_kind == SEL_KIND_UNITS) {
-                    wc1_build_try_click(world, selected_eids[0],
-                                        mouse_x(), mouse_y());
+                    // S10.6 — per-unit command card: peasant build/
+                    // harvest, combat units Move / Stop / Attack.
+                    wc1_unit_cmd_click(world, selected_eids[0],
+                                       mouse_x(), mouse_y());
                 }
             }
             return;
@@ -329,6 +353,9 @@ void wc1_input_tick(world) {
     // will hook this into the training-queue dispatch when the
     // command card UI lands).
     if (mouse_pressed(MOUSE_RIGHT) != 0) {
+        // S10.6 — right-click also cancels an armed Move/Harvest cursor
+        // and closes the build submenu (back to the root command card).
+        wc1_cmd_menu_reset();
         // S10.5 — right-click cancels an in-progress building placement.
         if (wc1_placement_active() != 0) {
             wc1_placement_cancel();
@@ -424,7 +451,7 @@ void wc1_input_tick(world) {
             // producer building; trained units walk here on completion.
             mx = mouse_x();
             my = mouse_y();
-            if (my < wc1_cmd_bar_y()) {       // ignore clicks on the HUD strip
+            if (mx >= wc1_panel_w()) {        // ignore clicks on the command panel
                 wx = cam_screen_to_world_x(cam, mx);
                 wy = cam_screen_to_world_y(cam, my);
                 gx = wx / 16;
@@ -553,4 +580,39 @@ static void _issue_move(world, gx, gy) {
     putstr(")  N=");
     putnum(selected_count);
     putstr("\n");
+}
+
+// S10.6 — execute a Harvest command (armed via the peasant command
+// card) at world tile (gx, gy): a tree tile → chop; a gold mine under
+// the tile → mine. Routes every selected unit, matching the right-click
+// gather behaviour. No tree / mine at the tile → nothing happens (the
+// click already consumed the armed cursor).
+static void _cmd_exec_harvest(world, gx, gy) {
+    auto i, beid;
+    if (_tile_is_tree(gx, gy) != 0) {
+        for (i = 0; i < selected_count; i++) {
+            wc1_gather_assign_tree(world, selected_eids[i], gx, gy);
+        }
+        return;
+    }
+    beid = wc1_building_at_world(world, gx * 16 + 8, gy * 16 + 8);
+    if (beid >= 0 && _building_is_gold_mine(world, beid) != 0) {
+        for (i = 0; i < selected_count; i++) {
+            wc1_gather_assign_mine(world, selected_eids[i], beid);
+        }
+    }
+}
+
+// S10.6 — execute an Attack command (armed via a combat unit's command
+// card) at world point (wx, wy) / tile (gx, gy): an enemy unit under the
+// cursor → attack it; empty ground → move there (attack-move degrades to
+// a plain move in v1). Mirrors the right-click combat dispatch.
+static void _cmd_exec_attack(world, wx, wy, gx, gy) {
+    auto teid;
+    teid = _unit_at_world_any(world, wx, wy);
+    if (teid >= 0 && _is_enemy(world, teid) != 0) {
+        _issue_attack(world, teid);
+    } else {
+        _issue_move(world, gx, gy);
+    }
 }

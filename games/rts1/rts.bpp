@@ -339,15 +339,9 @@ main() {
     // explicitly).
     game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
     render_init();
-    // S8.5 — initialize the stbui layout-engine node pool + stbhud
-    // GPU walker. Both are idempotent so the order with respect to
-    // other inits doesn't matter; calling them once at boot before
-    // the game loop is what counts. wc1_hud's command-card strip
-    // declaration flows through ui_layout_begin / ui_box / hud_image
-    // and `hud_render` walks the resulting node tree via the GPU
-    // primitives inside `game_render_begin / end`.
-    init_ui_layout();
-    init_hud();
+    // S10.6 — the HUD draws through stbrender + stbimage directly
+    // (the left command panel is imperative draw calls), so the
+    // stbui/stbhud layout engine is no longer wired in.
 
     // Resolve the forest tileset against the binary's own location
     // — works from any CWD as long as the binary lives somewhere
@@ -552,8 +546,16 @@ main() {
     // can override it. cam_new lands at (0, 0); the seeder
     // looks for a `start_view` entity belonging to player 0 (the
     // human in WC1 campaign maps) and centers the viewport on it.
-    cam = cam_new(SCREEN_W, SCREEN_H,
+    //
+    // S10.6 — the world view is inset to the RIGHT of the WC1 left
+    // command panel. The camera's screen_w is the VISIBLE world width
+    // (canvas minus the panel) so the clamp reaches the true map edge;
+    // cam_set_viewport plants the world origin at (panel_w, 0) so every
+    // world<->screen transform lands inside the play area while the HUD
+    // panel owns x < panel_w in absolute screen space.
+    cam = cam_new(SCREEN_W - wc1_panel_w(), SCREEN_H,
                     wc1_map_w(map) * 16, wc1_map_h(map) * 16);
+    cam_set_viewport(cam, wc1_panel_w(), 0);
     _seed_camera_from_level(map);
     // wc1_movement_init MUST precede _spawn_units_from_level: spawn
     // calls wc1_collision_register on the peasant's starting tile,
@@ -635,7 +637,13 @@ main() {
 
         game_render_begin();
         render_clear(rgba(0, 0, 0, 255));
-        tile_draw(tm, cam_x(cam), cam_y(cam), SCREEN_W, SCREEN_H);
+        // World tiles drawn shifted right by the viewport origin so they
+        // land in the play area. tile_draw computes screen x as
+        // `gx*tw - cam_arg`, so passing `cam_x - view_ox` adds the +view_ox
+        // shift to every cell. The leftmost view_ox px of tiles draw under
+        // where the command panel will paint over them (it renders last).
+        tile_draw(tm, cam_x(cam) - cam_view_ox(cam),
+                      cam_y(cam) - cam_view_oy(cam), SCREEN_W, SCREEN_H);
         // Buildings render AFTER the tilemap but BEFORE units so
         // units overlap building footprints when they walk past
         // (classic RTS draw order — units in front of structures).

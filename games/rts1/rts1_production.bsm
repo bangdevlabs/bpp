@@ -203,6 +203,237 @@ wc1_build_menu(player, out) {
     return 8;
 }
 
+// ── S10.6 per-unit command menu (WC1 two-level command card) ──────
+//
+// WC1 defines command buttons PER UNIT TYPE: war1gus scripts/buttons.lua
+// gives each DefineButton a ForUnit list, a Pos (1-9 slot in the 3x3
+// command grid) and a Level (0 = root card, 1+ = submenu). A peasant's
+// root card is Move / Stop / Harvest + Build Basic + Build Advanced; the
+// two build buttons switch the card to a submenu of the basic / advanced
+// structures, each with a Cancel back to root. Combat units share
+// Move / Stop / Attack; casters add spell slots. Only the peasant card
+// ships here in v1 — every other kind returns an empty menu (name + HP
+// only, as before).
+//
+// Each entry packs (pos, action, value) into one word so the HUD (draw)
+// and the input tick (hit-test) read the same list without sharing the
+// CMD_* constants. pos is 1-9; action is a CMD_*; value carries the
+// BLDG_* for a build button (0 otherwise). The HUD reads entries through
+// the wc1_cmd_entry_* accessors below, so the CMD_* enum stays private.
+const CMD_MOVE        = 1;
+const CMD_STOP        = 2;
+const CMD_HARVEST     = 3;
+const CMD_BUILD_BASIC = 4;   // switch the card to the basic-build submenu
+const CMD_BUILD_ADV   = 5;   // switch the card to the advanced-build submenu
+const CMD_CANCEL      = 6;   // submenu → back to the root card
+const CMD_BUILD       = 7;   // place a specific building (value = BLDG_*)
+const CMD_ATTACK      = 8;   // arm the cursor to attack a target / ground
+
+const CMD_LEVEL_ROOT  = 0;
+const CMD_LEVEL_BASIC = 1;
+const CMD_LEVEL_ADV   = 2;
+
+static _cmd_pack(pos, action, value) { return pos * 100000 + action * 1000 + value; }
+wc1_cmd_entry_pos(e)    { return e / 100000; }
+static _cmd_action(e)   { return (e / 1000) % 100; }
+wc1_cmd_entry_value(e)  { return e % 1000; }
+wc1_cmd_entry_is_build(e) { return _cmd_action(e) == CMD_BUILD; }
+
+// Map a building kind to its frame in the portrait_icons strip (human
+// 14-32 / orc faction-distinct per war1gus icons.lua). Public so both
+// the command-grid icons (here) and the HUD portrait box read the same
+// mapping. player == 1 selects the orc variant where the pair differs.
+wc1_building_icon_frame(kind, player) {
+    switch (kind) {
+    BLDG_TOWN_HALL   { return player == 1 ? 21 : 20; }
+    BLDG_FARM        { return player == 1 ? 15 : 14; }
+    BLDG_BARRACKS    { return player == 1 ? 17 : 16; }
+    BLDG_LUMBER_MILL { return player == 1 ? 23 : 22; }
+    BLDG_BLACKSMITH  { return player == 1 ? 27 : 26; }
+    BLDG_STABLE      { return player == 1 ? 25 : 24; }    // kennel (orc)
+    BLDG_CHURCH      { return player == 1 ? 29 : 28; }    // temple (orc)
+    BLDG_TOWER       { return player == 1 ? 19 : 18; }
+    BLDG_KEEP        { return player == 1 ? 32 : 31; }    // spire (orc)
+    else             { return 20; }
+    }
+    return 20;
+}
+
+// Portrait-icon frame for a command entry. Actions use the war1gus
+// action-icon frames (move-peasant 33 / move-peon 34, stop = shield
+// 79/82, harvest 36, build-basic 37, build-advanced 38, cancel 40);
+// build entries use the building icon frame.
+wc1_cmd_entry_frame(e, player) {
+    auto value;
+    value = e % 1000;
+    switch (_cmd_action(e)) {
+    CMD_MOVE        { return player == 1 ? 34 : 33; }
+    CMD_STOP        { return player == 1 ? 82 : 79; }
+    CMD_ATTACK      { return value; }   // weapon icon packed in the entry
+    CMD_HARVEST     { return 36; }
+    CMD_BUILD_BASIC { return 37; }
+    CMD_BUILD_ADV   { return 38; }
+    CMD_CANCEL      { return 40; }
+    CMD_BUILD       { return wc1_building_icon_frame(value, player); }
+    else            { return 40; }
+    }
+    return 40;
+}
+
+// 1 if the entry's command is currently enabled. Actions are always
+// enabled; a build entry is gated on the player affording its gold +
+// wood (the HUD dims the icon, the click is rejected upstream).
+wc1_cmd_entry_affordable(e) {
+    auto def: BuildingDef;
+    if (_cmd_action(e) != CMD_BUILD) { return 1; }
+    def = building_def_for(e % 1000);
+    if (def == 0) { return 0; }
+    return wc1_resources_gold() >= def.cost_gold
+        && wc1_resources_wood() >= def.cost_wood;
+}
+
+// Fill `out` (>= 9 slots) with the command entries for `unit_kind` at
+// menu `level` and return the count. Only the peasant has a card in v1.
+wc1_unit_cmd_menu(unit_kind, player, level, out) {
+    if (unit_kind != UNIT_PEASANT) {
+        // Combat units share one root card: Move / Stop / Attack (no
+        // submenus). The attack icon is the unit's weapon — arrow for
+        // ranged (archer / spearman / catapult), sword for human melee,
+        // axe for orc melee — carried in the entry's value so the HUD
+        // draws the right one. Casters use the melee icon in v1 (spell
+        // buttons land when spell mechanics ship).
+        auto ranged, atk_icon;
+        ranged = unit_kind == UNIT_ARCHER || unit_kind == UNIT_SPEARMAN
+              || unit_kind == UNIT_CATAPULT;
+        atk_icon = ranged != 0 ? 71 : (player == 1 ? 66 : 63);
+        out[0] = _cmd_pack(1, CMD_MOVE,   0);
+        out[1] = _cmd_pack(2, CMD_STOP,   0);
+        out[2] = _cmd_pack(3, CMD_ATTACK, atk_icon);
+        return 3;
+    }
+    if (level == CMD_LEVEL_BASIC) {
+        // Build Basic Structure — WC1 grouping (Farm, Lumber Mill,
+        // Barracks, Town Hall) + Cancel back to the root card.
+        out[0] = _cmd_pack(1, CMD_BUILD, BLDG_FARM);
+        out[1] = _cmd_pack(2, CMD_BUILD, BLDG_LUMBER_MILL);
+        out[2] = _cmd_pack(3, CMD_BUILD, BLDG_BARRACKS);
+        out[3] = _cmd_pack(4, CMD_BUILD, BLDG_TOWN_HALL);
+        out[4] = _cmd_pack(6, CMD_CANCEL, 0);
+        return 5;
+    }
+    if (level == CMD_LEVEL_ADV) {
+        // Build Advanced Structure — Blacksmith, Church, Tower, Stable.
+        out[0] = _cmd_pack(1, CMD_BUILD, BLDG_BLACKSMITH);
+        out[1] = _cmd_pack(2, CMD_BUILD, BLDG_CHURCH);
+        out[2] = _cmd_pack(3, CMD_BUILD, BLDG_TOWER);
+        out[3] = _cmd_pack(4, CMD_BUILD, BLDG_STABLE);
+        out[4] = _cmd_pack(6, CMD_CANCEL, 0);
+        return 5;
+    }
+    // Root card.
+    out[0] = _cmd_pack(1, CMD_MOVE, 0);
+    out[1] = _cmd_pack(2, CMD_STOP, 0);
+    out[2] = _cmd_pack(4, CMD_HARVEST, 0);
+    out[3] = _cmd_pack(5, CMD_BUILD_BASIC, 0);
+    out[4] = _cmd_pack(6, CMD_BUILD_ADV, 0);
+    return 5;
+}
+
+// ── command-card state + armed cursor ─────────────────────────────
+//
+// _cmd_menu_level tracks which card the selected peasant is showing
+// (root / basic / advanced). _cmd_pending is the armed-cursor state:
+// after the player clicks Move or Harvest, the next world click is
+// consumed by the input tick as the command's target. 0 = none,
+// 1 = move-armed, 2 = harvest-armed (the input tick reads these via
+// wc1_cmd_pending and executes against the live selection).
+global _cmd_menu_level;
+global _cmd_pending;
+
+wc1_cmd_menu_level()        { return _cmd_menu_level; }
+void wc1_cmd_menu_reset()   { _cmd_menu_level = 0; _cmd_pending = 0; }
+wc1_cmd_pending()           { return _cmd_pending; }
+void wc1_cmd_pending_clear() { _cmd_pending = 0; }
+
+// Selection state owned by the input module — STOP clears every
+// selected unit's orders. extrn (not load) keeps the dependency one-
+// way: production reads the selection, input drives production.
+extrn selected_eids, selected_count;
+extrn target_comp, attack_target_comp;
+
+// STOP — clear move / attack / gather orders on the whole selection so
+// the units halt where they stand.
+static void _cmd_stop_selection(world) {
+    auto i, eid, t: Target, at: AttackTarget;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        t = ecs_get(world, target_comp, eid);
+        t.gx = 0 - 1; t.gy = 0 - 1;
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = 0 - 1;
+        wc1_gather_clear(world, eid);
+    }
+}
+
+// Resolve a left-click on the command card while unit `eid` is
+// selected. Hit-tests the active card's entries (same wc1_cmd_button_rect
+// the HUD draws) for the unit's kind + menu level. Build Basic /
+// Advanced / Cancel switch the peasant card; a build entry (if
+// affordable) enters placement; Stop halts the selection; Move /
+// Harvest / Attack arm the cursor for the next world click. Returns 1
+// if any button was hit (so the click is consumed). Units with no card
+// (the menu returns 0 entries) just fall through returning 0.
+wc1_unit_cmd_click(world, eid, mx, my) {
+    auto u: UnitType, fa: Faction, level, menu, n, i, e, pos, action, value;
+    auto rect, bx, by, bw, bh, bdef: BuildingDef;
+    u = ecs_get(world, unit_comp, eid);
+    fa = ecs_get(world, faction_comp, eid);
+    level = _cmd_menu_level;
+    menu = buf_word(9);
+    n = wc1_unit_cmd_menu(u.kind, fa.player, level, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        e   = menu[i];
+        pos = e / 100000;
+        wc1_cmd_button_rect(pos - 1, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            action = _cmd_action(e);
+            value  = e % 1000;
+            // Picking any button cancels a stale armed cursor; the
+            // Move / Harvest cases below re-arm it.
+            _cmd_pending = 0;
+            switch (action) {
+            CMD_BUILD_BASIC { _cmd_menu_level = CMD_LEVEL_BASIC; }
+            CMD_BUILD_ADV   { _cmd_menu_level = CMD_LEVEL_ADV; }
+            CMD_CANCEL      { _cmd_menu_level = CMD_LEVEL_ROOT; }
+            CMD_STOP        { _cmd_stop_selection(world); }
+            CMD_MOVE        { _cmd_pending = 1; }
+            CMD_HARVEST     { _cmd_pending = 2; }
+            CMD_ATTACK      { _cmd_pending = 3; }
+            CMD_BUILD {
+                // Only enter placement when affordable (icon is already
+                // dimmed otherwise); the click is consumed either way.
+                bdef = building_def_for(value);
+                if (bdef != 0
+                    && wc1_resources_gold() >= bdef.cost_gold
+                    && wc1_resources_wood() >= bdef.cost_wood) {
+                    wc1_placement_begin(value, eid);
+                    _cmd_menu_level = CMD_LEVEL_ROOT;
+                }
+            }
+            else { }
+            }
+            free(menu); free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    free(menu); free(rect);
+    return 0;
+}
+
 // ── S10.5 building placement (peasant build flow) ─────────────
 //
 // Select a peasant → click a build icon → a ghost of the building

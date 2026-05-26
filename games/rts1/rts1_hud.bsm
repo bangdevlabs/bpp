@@ -17,8 +17,6 @@ import "stbcamera.bsm";
 import "stbcol.bsm";
 import "stbcharsheet.bsm";     // cs_res_current / cs_res_max for HP bars
 import "stbimage.bsm";          // image_draw_size for HUD portraits + chrome
-import "stbui.bsm";             // ui_layout_begin / ui_box / ui_spacer (layout engine)
-import "stbhud.bsm";            // hud_image / hud_render (GPU widgets)
 load   "rts1_buildings.bsm";    // building_comp + BuildingDef + building_def_for
 load   "rts1_input.bsm";        // selected_kind + SEL_KIND_*
 
@@ -69,41 +67,66 @@ const _HP_BAR_OFFSET_PX      = 4;            // px above sprite top
 // built". Orange-yellow fill on dark background.
 const _CONSTRUCT_BAR_COLOR   = 0xFFFFA500;   // amber
 
-// ── Command card (bottom HUD strip) ─────────────────────────────
-
-// Reserve the bottom strip of the canvas for the command card.
-// SCREEN_W is canvas-wide (480 in rts.bpp); _CMD_BAR_HEIGHT_PX
-// claims the bottom 60 px (≈ 22 % of the 270-tall canvas), close
-// to the SC1 / WC2 convention. The bar is drawn LAST so it sits
-// on top of the world view — players give up the bottom strip
-// of the world in exchange for portrait / stats / (S10) command
-// buttons. The camera still pans the full world; the card is a
-// pure overlay.
+// ── WC1 left command panel ──────────────────────────────────────
+//
+// Authentic WC1 layout: a full-height vertical panel down the LEFT
+// of the canvas. Top-to-bottom it stacks the minimap, the selected
+// entity's portrait + name + HP, an in-progress production bar, the
+// command icon grid (train / build / research), and a MENU button
+// pinned to the bottom. The world view is inset to the RIGHT of this
+// panel via the camera viewport origin (rts.bpp cam_set_viewport).
+// The panel is drawn LAST so it paints over any world overlay that
+// bled into x < WC1_PANEL_W.
 extrn SCREEN_W, SCREEN_H;
-const _CMD_BAR_HEIGHT_PX  = 60;
-const _CMD_PORTRAIT_PX    = 56;   // square portrait box
-// S10.6 — the minimap occupies the far-left of the bar; the portrait
-// + text + progress sit to its right (they all derive from this inset).
-const _CMD_MINIMAP_X      = 2;
-const _CMD_MINIMAP_PX     = 56;
-const _CMD_PORTRAIT_INSET = 60;   // portrait x — right of the minimap
-const _CMD_BAR_COLOR      = 0xFF1A1A1A;     // near-black
-const _CMD_PORTRAIT_BG    = 0xFF3A3A3A;     // dark gray
-const _CMD_FRAME_COLOR    = 0xFF6A6A6A;     // medium gray
-const _CMD_TEXT_COLOR     = 0xFFFFFFFF;     // white
-const _CMD_TEXT_DIM       = 0xFFB0B0B0;     // dimmed gray
-// S10 — command-card train button grid (right portion of the card).
-// Geometry is exposed via wc1_cmd_button_rect so the input tick
-// hit-tests the same rects the render draws (single source of truth).
-const _CMD_BTN_PX   = 36;    // square train button
-const _CMD_BTN_GAP  = 6;
-const _CMD_BTN_X0   = 296;   // left edge of the button row (480-wide card)
-const _CMD_BTN_UNAFFORD = 0xFF402020;   // dim red border when too poor
-// S10.5 — peasant build-icon row. Smaller than train buttons so all
-// eight constructable buildings fit in one row right of the text.
-const _CMD_BUILD_BTN_PX  = 28;
-const _CMD_BUILD_BTN_GAP = 4;
-const _CMD_BUILD_BTN_X0  = 220;   // right of minimap+portrait+text (S10.6)
+
+// Panel width — also the world viewport origin x. Read via the
+// wc1_panel_w() function (defined below) from the input tick + the
+// rts.bpp camera setup so they never depend on const load order.
+// WC1's native panel was 72/320 = 22.5% of the canvas; 96/480 = 20%
+// keeps that proportion on the 16:9 canvas with a round number.
+const WC1_PANEL_W = 96;
+
+// Minimap — top of the panel. Live-rendered at native 72×72 centred
+// in the 96-wide column (12 px stone margin each side).
+const _CMD_MINIMAP_X  = 12;
+const _CMD_MINIMAP_Y  = 6;
+const _CMD_MINIMAP_PX  = 72;
+
+// Portrait block — below the minimap. 48×48 box centred in the panel,
+// then three stacked text lines: name, HP/status, and (for producers)
+// the training/research label above its progress bar.
+const _CMD_PORTRAIT_PX     = 48;
+const _CMD_PORTRAIT_INSET  = 24;   // (96 - 48) / 2 — portrait box x
+const _CMD_PORTRAIT_Y      = 84;
+const _CMD_NAME_Y          = 134;
+const _CMD_HP_Y            = 143;
+const _CMD_PROG_LABEL_Y    = 152;  // training/research caption (also the
+                                   //   build-icon hover cost line)
+const _CMD_PROG_Y          = 160;  // progress bar
+const _CMD_PROG_H          = 5;
+
+// Command icon grid — 3 columns of icon_border-framed buttons. Train
+// / research buttons print their gold cost just below the icon (one
+// row, room to spare); the peasant build menu (three rows) shows cost
+// on hover only so it never collides with the MENU button.
+const _CMD_GRID_X    = 6;
+const _CMD_GRID_Y    = 168;
+const _CMD_GRID_COLS = 3;
+const _CMD_BTN_PX    = 26;
+const _CMD_COL_PITCH = 30;
+const _CMD_ROW_PITCH = 30;
+
+// MENU button — pinned to the bottom of the panel.
+const _CMD_MENU_Y = 258;
+const _CMD_MENU_H = 9;
+
+// Palette (shared by the panel chrome + every button).
+const _CMD_BAR_COLOR    = 0xFF1A1A1A;     // near-black fallback fill
+const _CMD_PORTRAIT_BG  = 0xFF3A3A3A;     // dark gray
+const _CMD_FRAME_COLOR  = 0xFF6A6A6A;     // medium gray
+const _CMD_TEXT_COLOR   = 0xFFFFFFFF;     // white
+const _CMD_TEXT_DIM     = 0xFFB0B0B0;     // dimmed gray
+const _CMD_BTN_UNAFFORD = 0xFF402020;     // dim red border when too poor
 
 // Source dims of the WC1 portrait icon strip (27×19 per frame, 93
 // frames stacked vertically — see war1gus icons.lua Size = {27,
@@ -192,8 +215,8 @@ wc1_hud_render(world) {
         b   = ecs_get(world, building_comp, eid);
         def = building_def_for(b.kind);
         p   = ecs_get(world, pos_comp, eid);
-        sx = p.x - cam_x(cam);
-        sy = p.y - cam_y(cam);
+        sx = cam_world_to_screen_x(cam, p.x);
+        sy = cam_world_to_screen_y(cam, p.y);
         render_rect_outline(sx, sy, def.px_w, def.px_h, _RING_COLOR);
     } else {
         // Unit selection (possibly N units after a marquee). One
@@ -208,8 +231,8 @@ wc1_hud_render(world) {
             p = ecs_get(world, pos_comp, eid);
             cx = rect_center_x(p.x + _SPRITE_OFF_X, _SPRITE_W);
             cy = rect_center_y(p.y + _SPRITE_OFF_Y, _SPRITE_H);
-            sx = cx - _RING_W / 2 - cam_x(cam);
-            sy = cy - _RING_H / 2 - cam_y(cam);
+            sx = cam_world_to_screen_x(cam, cx - _RING_W / 2);
+            sy = cam_world_to_screen_y(cam, cy - _RING_H / 2);
             render_rect_outline(sx, sy, _RING_W, _RING_H, _RING_COLOR);
         }
     }
@@ -234,15 +257,15 @@ wc1_hud_render(world) {
         }
     }
     // S10.5 — building-placement ghost (world-space, drawn under the
-    // command card so the bar stays on top).
+    // panel so the chrome stays on top).
     wc1_placement_render(world);
-    // Command card — bottom bar with portrait / stats. Rendered
-    // last so it sits on top of the world + every overlay.
-    _command_card_render(world);
-    // S9 — top resource bar (gold / wood / food). Drawn AFTER the
-    // command card so the strip sits above any HP / progress
-    // overlay that overlapped the top of the canvas (none today,
-    // but the ordering is the safe one).
+    // S10.6 — WC1 left command panel (minimap / portrait / command
+    // grid / MENU). Rendered last so it sits on top of the world view
+    // + every world-space overlay.
+    _panel_render(world);
+    // S9 — top resource bar (gold / wood / food) across the world
+    // area, to the right of the panel. Drawn AFTER the panel so the
+    // strip's left edge butts cleanly against the panel's right edge.
     _draw_top_resource_bar();
 }
 
@@ -312,8 +335,8 @@ static void _render_unit_hpbar(w, eid) {
     // sprite-top edge as defined by the render anchor in
     // wc1_render._render_unit (_SPRITE_OFF_Y above the Pos).
     bar_w = _SPRITE_W;
-    sx = p.x + _SPRITE_OFF_X - cam_x(cam);
-    sy = p.y + _SPRITE_OFF_Y - cam_y(cam) - _HP_BAR_OFFSET_PX;
+    sx = cam_world_to_screen_x(cam, p.x + _SPRITE_OFF_X);
+    sy = cam_world_to_screen_y(cam, p.y + _SPRITE_OFF_Y) - _HP_BAR_OFFSET_PX;
     _draw_hp_bar(sx, sy, bar_w, current, max);
 }
 
@@ -346,25 +369,8 @@ static _unit_portrait_frame(kind, player) {
     return 4;
 }
 
-// Same mapping for buildings — frame indices 14-32 per icons.lua.
-// Faction asymmetry encoded as player==1 → orc side; v1 uses the
-// faction-distinct icon for human/orc pairs (church 28 vs temple
-// 29, etc.).
-static _building_portrait_frame(kind, player) {
-    switch (kind) {
-    BLDG_TOWN_HALL   { return player == 1 ? 21 : 20; }
-    BLDG_FARM        { return player == 1 ? 15 : 14; }
-    BLDG_BARRACKS    { return player == 1 ? 17 : 16; }
-    BLDG_LUMBER_MILL { return player == 1 ? 23 : 22; }
-    BLDG_BLACKSMITH  { return player == 1 ? 27 : 26; }
-    BLDG_STABLE      { return player == 1 ? 25 : 24; }    // kennel orc
-    BLDG_CHURCH      { return player == 1 ? 29 : 28; }    // temple orc
-    BLDG_TOWER       { return player == 1 ? 19 : 18; }
-    BLDG_KEEP        { return player == 1 ? 32 : 31; }    // spire orc
-    else             { return 20; }
-    }
-    return 20;
-}
+// (Building portrait frames now live in wc1_building_icon_frame, in
+// rts1_production.bsm, shared by the portrait box + the command grid.)
 
 // Map a unit kind to a short display name. Mirrors the WC1 /
 // SC1 unit-info convention — the name shows in the command
@@ -444,24 +450,6 @@ static _building_name_for(kind) {
 // this same tree instead of writing one-off image_draw_size
 // loops.
 //
-// Layout: root col fills SCREEN_W × SCREEN_H; a fixed-height
-// spacer pushes the strip row to y = bar_y; the row holds two
-// hud_image children covering the 240+240 = 480 width.
-static void _draw_bottom_panel_border(bar_y) {
-    ui_layout_begin(SCREEN_W, SCREEN_H);
-    ui_box(UI_LAYOUT_COL, ui_sz_grow(), ui_sz_grow(), 0, 0);
-        ui_spacer(ui_sz_fixed(bar_y));
-        ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(_BOTTOM_PANEL_SRC_H), 0, 0);
-            hud_image(bottom_panel_atlas, 0,
-                      _BOTTOM_PANEL_SRC_W, _BOTTOM_PANEL_SRC_H);
-            hud_image(bottom_panel_atlas, 0,
-                      _BOTTOM_PANEL_SRC_W, _BOTTOM_PANEL_SRC_H);
-        ui_end();
-    ui_end();
-    ui_layout_end();
-    hud_render();
-}
-
 // S9 / HUD evolution S8.6 — top resource bar (gold + wood + food).
 // Layered draw: the 240×12 strip tiles twice across the full canvas
 // at y=0, then the three counters (icon + number) overlay at fixed
@@ -476,23 +464,22 @@ static void _draw_bottom_panel_border(bar_y) {
 // composite on top. Both paths end inside the same
 // `game_render_begin / end` GPU pass.
 static void _draw_top_resource_bar() {
-    auto strip_y, text_y, sb, x;
-    strip_y = 0;
-    text_y  = strip_y + _TOP_BAR_TEXT_Y_OFF;
-    // Strip chrome — two tiles of the 240-wide source to cover
-    // the 480-wide canvas. Drawn via the declarative HUD layout
-    // for symmetry with `_draw_bottom_panel_border`.
-    ui_layout_begin(SCREEN_W, SCREEN_H);
-    ui_box(UI_LAYOUT_ROW, ui_sz_grow(), ui_sz_fixed(_TOP_BAR_SRC_H), 0, 0);
-        hud_image(top_resource_bar_atlas, 0,
-                  _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
-        hud_image(top_resource_bar_atlas, 0,
-                  _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
-    ui_end();
-    ui_layout_end();
-    hud_render();
+    auto strip_y, text_y, sb, x, world_x0;
+    strip_y  = 0;
+    text_y   = strip_y + _TOP_BAR_TEXT_Y_OFF;
+    // The bar lives over the WORLD area only — its left edge butts
+    // against the command panel's right edge (authentic WC1: the
+    // 240-wide top strip spans canvas-minus-panel). All counter
+    // anchors are relative to this origin.
+    world_x0 = wc1_panel_w();
+    // Strip chrome — two tiles of the 240-wide source from the panel
+    // edge rightward; the GPU clips the overhang past the canvas edge.
+    image_draw_size(top_resource_bar_atlas, 0, world_x0, strip_y,
+                    _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
+    image_draw_size(top_resource_bar_atlas, 0, world_x0 + _TOP_BAR_SRC_W, strip_y,
+                    _TOP_BAR_SRC_W, _TOP_BAR_SRC_H);
     // Gold icon + counter.
-    x = _TOP_BAR_GOLD_X;
+    x = world_x0 + _TOP_BAR_GOLD_X;
     image_draw_size(gold_icon_atlas, 0, x, strip_y + (_TOP_BAR_SRC_H - _GOLD_ICON_H) / 2,
                     _GOLD_ICON_W, _GOLD_ICON_H);
     sb = strbuf_new();
@@ -500,7 +487,7 @@ static void _draw_top_resource_bar() {
     render_text(sb, x + _TOP_BAR_ICON_TEXT_GAP, text_y, 1, _TOP_BAR_TEXT_COLOR);
     strbuf_free(sb);
     // Lumber icon + counter.
-    x = _TOP_BAR_WOOD_X;
+    x = world_x0 + _TOP_BAR_WOOD_X;
     image_draw_size(lumber_icon_atlas, 0, x, strip_y + (_TOP_BAR_SRC_H - _LUMBER_ICON_H) / 2,
                     _LUMBER_ICON_W, _LUMBER_ICON_H);
     sb = strbuf_new();
@@ -510,7 +497,7 @@ static void _draw_top_resource_bar() {
     // Food slot — no icon in canonical WC1, just the "used/cap"
     // ratio. Renders white so the slash reads clearly against
     // the brown strip.
-    x = _TOP_BAR_FOOD_X;
+    x = world_x0 + _TOP_BAR_FOOD_X;
     sb = strbuf_new();
     sb = strbuf_num(sb, wc1_food);
     sb = strbuf_ch(sb, '/');
@@ -520,35 +507,33 @@ static void _draw_top_resource_bar() {
     return;
 }
 
-// Draw the WC1 portrait + icon_border for the selected entity.
-// Portrait is scaled 2× (27×19 → 54×38) to fill the 56×56
-// box readably; the icon_border (31×24) sits at 1× behind/
-// around it for the WC1 chrome frame.
+// Draw the selected entity's portrait inside the command-card box.
+// The portrait frame is 27×19 (3:2-ish); it's scaled to FIT entirely
+// within the box, keeping that aspect, so the figure never spills past
+// the frame (the old version drew it 2× and overflowed the box). A
+// dark backing fills any transparent pixels and a thin frame outline
+// rims the box for the WC1 chrome look.
 static void _draw_portrait(box_x, box_y, frame_idx) {
-    auto portrait_x, portrait_y, border_x, border_y;
-    // Backdrop in case the portrait has alpha.
+    auto pw, ph, px, py;
     render_rect(box_x, box_y, _CMD_PORTRAIT_PX, _CMD_PORTRAIT_PX, _CMD_PORTRAIT_BG);
-    // icon_border at the WC1 native 31×24 size, centered in the
-    // 56×56 box.
-    border_x = box_x + (_CMD_PORTRAIT_PX - _ICON_BORDER_SRC_W) / 2;
-    border_y = box_y + (_CMD_PORTRAIT_PX - _ICON_BORDER_SRC_H) / 2;
-    image_draw_size(icon_border_atlas, 0,
-                    border_x, border_y,
-                    _ICON_BORDER_SRC_W, _ICON_BORDER_SRC_H);
-    // Portrait scaled 2× and centered atop the border.
-    portrait_x = box_x + (_CMD_PORTRAIT_PX - _PORTRAIT_DRAW_W) / 2;
-    portrait_y = box_y + (_CMD_PORTRAIT_PX - _PORTRAIT_DRAW_H) / 2;
-    image_draw_size(portrait_icons_atlas, frame_idx,
-                    portrait_x, portrait_y,
-                    _PORTRAIT_DRAW_W, _PORTRAIT_DRAW_H);
+    // Scale to the box width minus a 2 px inset, keeping the source
+    // 27:19 aspect (so 44 wide → 31 tall inside the 48 box), centred.
+    pw = _CMD_PORTRAIT_PX - 4;
+    ph = pw * _PORTRAIT_SRC_H / _PORTRAIT_SRC_W;
+    px = box_x + (_CMD_PORTRAIT_PX - pw) / 2;
+    py = box_y + (_CMD_PORTRAIT_PX - ph) / 2;
+    image_draw_size(portrait_icons_atlas, frame_idx, px, py, pw, ph);
+    render_rect_outline(box_x, box_y, _CMD_PORTRAIT_PX, _CMD_PORTRAIT_PX, _CMD_FRAME_COLOR);
 }
 
-// Top Y of the command-card strip (world above, HUD below). Exposed
-// as a function so the input tick can ask "did this click land on the
-// HUD?" without depending on _CMD_BAR_HEIGHT_PX being in scope (the
-// input module loads before this one, so the const isn't visible
-// there — a function resolves at link time regardless of order).
-wc1_cmd_bar_y() { return SCREEN_H - _CMD_BAR_HEIGHT_PX; }
+// Panel width — the world view starts at this screen x. Exposed as a
+// function so the input tick + rts.bpp camera setup can ask "where
+// does the command panel end?" without depending on WC1_PANEL_W being
+// in scope (those modules load before this one, so the const isn't
+// visible there — a function resolves at link time regardless of
+// order). A left-click with mouse_x() < wc1_panel_w() landed on the
+// HUD panel; anything to the right landed in the world view.
+wc1_panel_w() { return WC1_PANEL_W; }
 
 // Fill `out` (a buf_word with >= 4 slots) with the [x, y, w, h] pixel
 // rect of train-button slot `slot`. Single source of truth shared by
@@ -556,70 +541,76 @@ wc1_cmd_bar_y() { return SCREEN_H - _CMD_BAR_HEIGHT_PX; }
 // click), so the two never drift. Buttons lay out left-to-right in a
 // row anchored to the right portion of the card.
 wc1_cmd_button_rect(slot, out) {
-    out[0] = _CMD_BTN_X0 + slot * (_CMD_BTN_PX + _CMD_BTN_GAP);
-    out[1] = wc1_cmd_bar_y() + 14;
+    auto col, row;
+    col = slot % _CMD_GRID_COLS;
+    row = slot / _CMD_GRID_COLS;
+    out[0] = _CMD_GRID_X + col * _CMD_COL_PITCH;
+    out[1] = _CMD_GRID_Y + row * _CMD_ROW_PITCH;
     out[2] = _CMD_BTN_PX;
     out[3] = _CMD_BTN_PX;
     return 0;
 }
 
-// Build-icon button rect for `slot` (S10.5 peasant build menu).
-// Smaller than the train buttons so all eight building icons fit in
-// one row. Shared by render + the input hit-test.
-wc1_cmd_build_button_rect(slot, out) {
-    out[0] = _CMD_BUILD_BTN_X0 + slot * (_CMD_BUILD_BTN_PX + _CMD_BUILD_BTN_GAP);
-    out[1] = wc1_cmd_bar_y() + 14;
-    out[2] = _CMD_BUILD_BTN_PX;
-    out[3] = _CMD_BUILD_BTN_PX;
-    return 0;
+// Build-icon slots share the command grid with the train buttons — a
+// worker shows the build menu, a producer shows the train menu, never
+// both at once, so one grid geometry serves both hit-tests.
+wc1_cmd_build_button_rect(slot, out) { return wc1_cmd_button_rect(slot, out); }
+
+// Draw one command-grid icon: a dark backing, the WC1 icon_border
+// frame at the button rect, the portrait icon inset inside the frame,
+// and — when the action is unaffordable — a dim-red outline over the
+// frame so the player reads the gate at a glance.
+static void _draw_icon_button(bx, by, bw, bh, frame, afford) {
+    render_rect(bx, by, bw, bh, _CMD_PORTRAIT_BG);
+    image_draw_size(icon_border_atlas, 0, bx, by, bw, bh);
+    image_draw_size(portrait_icons_atlas, frame, bx + 3, by + 3, bw - 6, bh - 6);
+    if (afford == 0) {
+        render_rect_outline(bx, by, bw, bh, _CMD_BTN_UNAFFORD);
+    }
 }
 
-// S10.5 — draw the peasant build-icon row: one small button per
-// constructable building (portrait icon + border, dim border when the
-// player can't afford the gold/wood). No food gate here — buildings
-// GRANT food. Click → wc1_build_try_click enters placement.
-static void _draw_build_icons(world, player) {
-    auto menu, n, i, rect, bx, by, bw, bh, bkind, def: BuildingDef, frame, afford, border;
-    auto mx, my, hov, hdef: BuildingDef, sb, tx, ty;
+// S10.6 — draw the command card for the selected unit (WC1 per-type
+// layout). The peasant gets a two-level card (Move / Stop / Harvest +
+// Build Basic / Advanced, the build buttons opening a submenu of framed
+// building icons + Cancel); combat units get Move / Stop / Attack. The
+// active level comes from wc1_cmd_menu_level. Entries carry their WC1
+// grid position (pos 1-9) so the icons land in the authentic slots. A
+// hovered build icon shows its gold/wood cost on the status line above
+// the grid (WC1 showed cost on hover).
+static void _draw_unit_commands(world, unit_kind, player) {
+    auto menu, n, i, e, pos, rect, bx, by, bw, bh, frame, afford;
+    auto mx, my, hov_build, hdef: BuildingDef, sb;
     mx = mouse_x();
     my = mouse_y();
-    hov = 0 - 1;
-    menu = buf_word(16);
-    n = wc1_build_menu(player, menu);
+    hov_build = 0 - 1;
+    menu = buf_word(9);
+    n = wc1_unit_cmd_menu(unit_kind, player, wc1_cmd_menu_level(), menu);
     rect = buf_word(4);
     i = 0;
     while (i < n) {
-        wc1_cmd_build_button_rect(i, rect);
+        e   = menu[i];
+        pos = wc1_cmd_entry_pos(e);
+        wc1_cmd_button_rect(pos - 1, rect);
         bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
-        bkind = menu[i];
-        def = building_def_for(bkind);
-        afford = def != 0 && wc1_resources_gold() >= def.cost_gold
-              && wc1_resources_wood() >= def.cost_wood;
-        render_rect(bx, by, bw, bh, _CMD_PORTRAIT_BG);
-        border = afford != 0 ? _CMD_FRAME_COLOR : _CMD_BTN_UNAFFORD;
-        render_rect_outline(bx, by, bw, bh, border);
-        frame = _building_portrait_frame(bkind, player);
-        image_draw_size(portrait_icons_atlas, frame, bx + 2, by + 2, bw - 4, bh - 4);
-        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) { hov = bkind; }
+        frame  = wc1_cmd_entry_frame(e, player);
+        afford = wc1_cmd_entry_affordable(e);
+        _draw_icon_button(bx, by, bw, bh, frame, afford);
+        if (wc1_cmd_entry_is_build(e) != 0
+            && mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            hov_build = wc1_cmd_entry_value(e);
+        }
         i = i + 1;
     }
     free(menu);
     free(rect);
-    // Hovered building: name + gold/wood cost on the line below the
-    // worker's HP — WC1 showed the build cost in the status line on
-    // hover. Lets the player read the price before committing.
-    if (hov >= 0) {
-        hdef = building_def_for(hov);
-        tx = _CMD_PORTRAIT_INSET + _CMD_PORTRAIT_PX + 8;
-        ty = wc1_cmd_bar_y() + 34;
+    if (hov_build >= 0) {
+        hdef = building_def_for(hov_build);
         sb = strbuf_new();
-        sb = strbuf_cat(sb, _building_name_for(hov));
-        sb = strbuf_cat(sb, "  ");
         sb = strbuf_num(sb, hdef.cost_gold);
         sb = strbuf_cat(sb, "g ");
         sb = strbuf_num(sb, hdef.cost_wood);
         sb = strbuf_cat(sb, "w");
-        render_text(sb, tx, ty, 1, _TOP_BAR_TEXT_COLOR);
+        _panel_text_centered(sb, _CMD_PROG_LABEL_Y, _TOP_BAR_TEXT_COLOR);
         strbuf_free(sb);
     }
 }
@@ -632,6 +623,9 @@ static void _draw_build_icons(world, player) {
 void wc1_placement_render(world) {
     auto kind, def: BuildingDef, ntx, nty, wx, wy, gx, gy, ix, iy, sx, sy, idle, col;
     if (wc1_placement_active() == 0) { return; }
+    // Don't preview the ghost while the cursor is over the command
+    // panel — there's no world tile under it to place on.
+    if (mouse_x() < wc1_panel_w()) { return; }
     kind = wc1_placement_kind();
     def = building_def_for(kind);
     if (def == 0) { return; }
@@ -645,8 +639,8 @@ void wc1_placement_render(world) {
     if (gy < 0) { gy = 0; }
     // Ghost sprite of the building at the footprint top-left.
     idle = wc1_building_atlas_idle(kind, 0);
-    sx = gx * 16 - cam_x(cam);
-    sy = gy * 16 - cam_y(cam);
+    sx = cam_world_to_screen_x(cam, gx * 16);
+    sy = cam_world_to_screen_y(cam, gy * 16);
     if (idle != 0) { image_draw_size(idle, 0, sx, sy, def.px_w, def.px_h); }
     // Per-tile validity outline.
     iy = 0;
@@ -658,8 +652,8 @@ void wc1_placement_render(world) {
             } else {
                 col = 0xFF30FF30;       // green — tile free
             }
-            render_rect_outline((gx + ix) * 16 - cam_x(cam),
-                                (gy + iy) * 16 - cam_y(cam), 16, 16, col);
+            render_rect_outline(cam_world_to_screen_x(cam, (gx + ix) * 16),
+                                cam_world_to_screen_y(cam, (gy + iy) * 16), 16, 16, col);
             ix = ix + 1;
         }
         iy = iy + 1;
@@ -667,14 +661,18 @@ void wc1_placement_render(world) {
 }
 
 // Draw the train buttons for a completed producer building: one
-// button per kind in the building's train menu, each showing the
-// unit portrait icon + its gold cost. Unaffordable buttons render
-// with a dim red border + dimmed cost so the player reads the gate
-// at a glance. The actual click → enqueue happens in wc1_input's
-// _cmd_card_click, which hit-tests the same wc1_cmd_button_rect.
+// framed icon per kind in the building's train menu. Unaffordable
+// buttons get the dim-red frame. The hovered unit's gold/wood cost
+// shows on the status line above the grid (uniform with the build
+// menu, and it keeps cost text out of the icon grid where it would
+// collide across rows). Click → enqueue happens in wc1_input, which
+// hit-tests the same wc1_cmd_button_rect.
 static void _draw_train_buttons(world, kind, player) {
     auto menu, n, i, rect, bx, by, bw, bh, ukind, def: UnitDef;
-    auto frame, afford, border, sb;
+    auto frame, afford, mx, my, hov, hdef: UnitDef, sb;
+    mx = mouse_x();
+    my = mouse_y();
+    hov = 0 - 1;
     menu = buf_word(8);
     n = wc1_train_menu(kind, player, menu);
     rect = buf_word(4);
@@ -685,26 +683,25 @@ static void _draw_train_buttons(world, kind, player) {
         ukind = menu[i];
         def = unit_def_for(ukind);
         afford = def != 0 && wc1_resources_can_afford(def.cost_gold, def.cost_wood);
-        // Button backdrop + border (dim red when unaffordable).
-        render_rect(bx, by, bw, bh, _CMD_PORTRAIT_BG);
-        border = afford != 0 ? _CMD_FRAME_COLOR : _CMD_BTN_UNAFFORD;
-        render_rect_outline(bx, by, bw, bh, border);
-        // Unit portrait icon scaled into the button interior.
         frame = _unit_portrait_frame(ukind, player);
-        image_draw_size(portrait_icons_atlas, frame,
-                        bx + 2, by + 2, bw - 4, bh - 4);
-        // Gold cost just below the button.
-        if (def != 0) {
-            sb = strbuf_new();
-            sb = strbuf_num(sb, def.cost_gold);
-            render_text(sb, bx, by + bh + 1, 1,
-                        afford != 0 ? _TOP_BAR_TEXT_COLOR : _CMD_TEXT_DIM);
-            strbuf_free(sb);
-        }
+        _draw_icon_button(bx, by, bw, bh, frame, afford);
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) { hov = ukind; }
         i = i + 1;
     }
     free(menu);
     free(rect);
+    if (hov >= 0) {
+        hdef = unit_def_for(hov);
+        if (hdef != 0) {
+            sb = strbuf_new();
+            sb = strbuf_num(sb, hdef.cost_gold);
+            sb = strbuf_cat(sb, "g ");
+            sb = strbuf_num(sb, hdef.cost_wood);
+            sb = strbuf_cat(sb, "w");
+            _panel_text_centered(sb, _CMD_PROG_LABEL_Y, _TOP_BAR_TEXT_COLOR);
+            strbuf_free(sb);
+        }
+    }
 }
 
 // Draw the research buttons for a completed researcher (blacksmith):
@@ -748,13 +745,10 @@ static void _draw_research_buttons(world, kind, player) {
 // queued unit. Shared by the render + the input cancel hit-test so
 // the two never drift.
 wc1_cmd_progress_rect(out) {
-    out[0] = _CMD_PORTRAIT_INSET + _CMD_PORTRAIT_PX + 8;   // = 66, under the text
-    // Sits BELOW the name (bar_y+10) + HP (bar_y+22) lines so the
-    // "Footman" caption (drawn at y-10) and the bar don't collide
-    // with the HP text. Caption lands at bar_y+34, bar at bar_y+44.
-    out[1] = wc1_cmd_bar_y() + 44;
-    out[2] = 120;
-    out[3] = 10;
+    out[0] = _CMD_GRID_X;
+    out[1] = _CMD_PROG_Y;
+    out[2] = WC1_PANEL_W - 2 * _CMD_GRID_X;
+    out[3] = _CMD_PROG_H;
     return 0;
 }
 
@@ -829,13 +823,12 @@ static void _minimap_blip(w, eid) {
 }
 
 static void _draw_minimap(world) {
-    auto bar_y, mw, mh, vx, vy, vw, vh;
+    auto mw, mh, vx, vy, vw, vh;
     mw = wc1_map_tiles_w();
     mh = wc1_map_tiles_h();
     if (mw <= 0 || mh <= 0) { return; }
-    bar_y = wc1_cmd_bar_y();
     _mm_x  = _CMD_MINIMAP_X;
-    _mm_y  = bar_y + 2;
+    _mm_y  = _CMD_MINIMAP_Y;
     _mm_px = _CMD_MINIMAP_PX;
     _mm_mw = mw;
     _mm_mh = mh;
@@ -843,12 +836,13 @@ static void _draw_minimap(world) {
     // Buildings first so unit dots land on top of them.
     ecs_query_each(building_q, fn_ptr(_minimap_blip));
     ecs_query_each(peasant_q,  fn_ptr(_minimap_blip));
-    // Camera viewport rect: shows SCREEN_W/16 x SCREEN_H/16 tiles from
-    // (cam_x, cam_y).
+    // Camera viewport rect: the VISIBLE world area is cam_screen_w ×
+    // cam_screen_h pixels (the canvas minus this panel), so the rect
+    // matches what the player actually sees, not the full canvas.
     vx = _mm_x + (cam_x(cam) / 16) * _mm_px / mw;
     vy = _mm_y + (cam_y(cam) / 16) * _mm_px / mh;
-    vw = (SCREEN_W / 16) * _mm_px / mw;
-    vh = (SCREEN_H / 16) * _mm_px / mh;
+    vw = (cam_screen_w(cam) / 16) * _mm_px / mw;
+    vh = (cam_screen_h(cam) / 16) * _mm_px / mh;
     render_rect_outline(vx, vy, vw, vh, 0xFFFFFFFF);
 }
 
@@ -857,119 +851,131 @@ static void _draw_minimap(world) {
 // input tick's HUD-strip click handler so minimap clicks pan instead
 // of routing to the command buttons.
 wc1_minimap_click(mx, my) {
-    auto bar_y, mw, mh, lx, ly, wtx, wty;
-    bar_y = wc1_cmd_bar_y();
+    auto mw, mh, lx, ly, wtx, wty;
     if (mx < _CMD_MINIMAP_X || mx >= _CMD_MINIMAP_X + _CMD_MINIMAP_PX) { return 0; }
-    if (my < bar_y + 2 || my >= bar_y + 2 + _CMD_MINIMAP_PX) { return 0; }
+    if (my < _CMD_MINIMAP_Y || my >= _CMD_MINIMAP_Y + _CMD_MINIMAP_PX) { return 0; }
     mw = wc1_map_tiles_w();
     mh = wc1_map_tiles_h();
     if (mw <= 0 || mh <= 0) { return 0; }
     lx = mx - _CMD_MINIMAP_X;
-    ly = my - (bar_y + 2);
+    ly = my - _CMD_MINIMAP_Y;
     wtx = lx * mw / _CMD_MINIMAP_PX;
     wty = ly * mh / _CMD_MINIMAP_PX;
-    cam_set(cam, wtx * 16 - SCREEN_W / 2, wty * 16 - SCREEN_H / 2);
+    // Centre the visible viewport (cam_screen_w/h) on the clicked point.
+    cam_set(cam, wtx * 16 - cam_screen_w(cam) / 2,
+                 wty * 16 - cam_screen_h(cam) / 2);
     return 1;
 }
 
+// Draw `s` centred horizontally inside the panel at screen y. Used
+// for the name / HP / status lines so they read balanced in the
+// narrow column regardless of text length.
+static void _panel_text_centered(s: ptr, y, color) {
+    auto w, x;
+    w = render_measure(s, 1);
+    x = (WC1_PANEL_W - w) / 2;
+    if (x < 1) { x = 1; }
+    render_text(s, x, y, 1, color);
+}
+
+// MENU button pinned to the bottom of the panel. Visual only for v1
+// (no main-menu screen yet); the input tick consumes clicks on the
+// panel so the button never falls through to the world.
+static void _draw_menu_button() {
+    auto x, w;
+    x = _CMD_GRID_X;
+    w = WC1_PANEL_W - 2 * _CMD_GRID_X;
+    render_rect(x, _CMD_MENU_Y, w, _CMD_MENU_H, _CMD_PORTRAIT_BG);
+    render_rect_outline(x, _CMD_MENU_Y, w, _CMD_MENU_H, _CMD_FRAME_COLOR);
+    _panel_text_centered("MENU", _CMD_MENU_Y + 1, _CMD_TEXT_COLOR);
+}
+
 extrn unit_comp;
-static void _command_card_render(world) {
-    auto bar_y, eid, sx, sy;
+
+// Render the WC1 left command panel. Top-to-bottom: faction stone
+// background down the full-height left column, the minimap, the MENU
+// button, then (when something is selected) the portrait + name + HP
+// and — for the player's own producers / workers — the command icon
+// grid. Drawn LAST in wc1_hud_render so it paints over any world
+// overlay that bled into x < WC1_PANEL_W.
+static void _panel_render(world) {
+    auto eid, px, py;
     auto sh: Sheet, current, max, b: Building, u: UnitType, def: BuildingDef;
-    auto fa: Faction;
-    auto name: ptr, hp_buf, hp_sb;
-    auto pct, frame_idx;
-    bar_y = SCREEN_H - _CMD_BAR_HEIGHT_PX;
-    // S10.6 — WC1 stone panel background (per local-player faction)
-    // stretched across the bar, replacing the flat near-black fill.
-    // Falls back to the flat fill if the texture didn't load.
-    auto _pbg;
+    auto fa: Faction, name: ptr, hp_sb, pct, frame_idx, _pbg;
+    // Panel background — WC1 stone (per local-player faction) stretched
+    // down the full-height left column. Falls back to a flat fill.
     _pbg = wc1_hud_panel_bg();
     if (_pbg != 0) {
-        image_draw_size(_pbg, 0, 0, bar_y, SCREEN_W, _CMD_BAR_HEIGHT_PX);
+        image_draw_size(_pbg, 0, 0, 0, WC1_PANEL_W, SCREEN_H);
     } else {
-        render_rect(0, bar_y, SCREEN_W, _CMD_BAR_HEIGHT_PX, _CMD_BAR_COLOR);
+        render_rect(0, 0, WC1_PANEL_W, SCREEN_H, _CMD_BAR_COLOR);
     }
-    // Authentic WC1 divider strip on top of the panel.
-    _draw_bottom_panel_border(bar_y);
-    // S10.6 — minimap always shows on the far-left, even with nothing
-    // selected.
+    // Minimap + MENU always show, even with nothing selected.
     _draw_minimap(world);
+    _draw_menu_button();
     if (selected_count <= 0 || selected_kind == SEL_KIND_NONE) {
         return;
     }
-    // Portrait box — anchored a few pixels below the divider so
-    // the portrait sits inside the dark fill area, not on top
-    // of the panel border.
-    sx = _CMD_PORTRAIT_INSET;
-    sy = bar_y + _BOTTOM_PANEL_SRC_H - 4;
     eid = selected_eids[0];
-    name = "?";
-    fa = ecs_get(world, faction_comp, eid);
+    fa  = ecs_get(world, faction_comp, eid);
+    px  = _CMD_PORTRAIT_INSET;
+    py  = _CMD_PORTRAIT_Y;
     if (selected_kind == SEL_KIND_UNITS) {
         u = ecs_get(world, unit_comp, eid);
         frame_idx = _unit_portrait_frame(u.kind, fa.player);
-        _draw_portrait(sx, sy, frame_idx);
-        // Text panel — anchor to the right of the portrait box.
-        sx = _CMD_PORTRAIT_INSET + _CMD_PORTRAIT_PX + 8;
-        sy = bar_y + _BOTTOM_PANEL_SRC_H - 2;
+        _draw_portrait(px, py, frame_idx);
         name = _unit_name_for(u.kind);
         sh = ecs_get(world, sheet_comp, eid);
         current = cs_res_current(sh.handle, RES_HP);
         max     = cs_res_max(sh.handle, RES_HP);
-        render_text(name, sx, sy, 1, _CMD_TEXT_COLOR);
-        // HP line — "HP: 30 / 30" rendered as concatenated
-        // strbuf, freed after the draw.
+        _panel_text_centered(name, _CMD_NAME_Y, _CMD_TEXT_COLOR);
+        // HP line — "30/30", with an "xN" multi-select count appended.
         hp_sb = strbuf_new();
-        hp_sb = strbuf_cat(hp_sb, "HP: ");
         hp_sb = strbuf_num(hp_sb, current);
-        hp_sb = strbuf_cat(hp_sb, " / ");
+        hp_sb = strbuf_ch(hp_sb, '/');
         hp_sb = strbuf_num(hp_sb, max);
         if (selected_count > 1) {
-            hp_sb = strbuf_cat(hp_sb, "   x");
+            hp_sb = strbuf_cat(hp_sb, " x");
             hp_sb = strbuf_num(hp_sb, selected_count);
         }
-        render_text(hp_sb, sx, sy + 12, 1, _CMD_TEXT_DIM);
+        _panel_text_centered(hp_sb, _CMD_HP_Y, _CMD_TEXT_DIM);
         strbuf_free(hp_sb);
-        // S10.5 — a selected human worker shows the build-icon row.
-        if (u.kind == UNIT_PEASANT && fa.player == 0) {
-            _draw_build_icons(world, fa.player);
+        // S10.6 — the player's own units show their WC1 command card:
+        // the peasant gets build/harvest, combat units get Move/Stop/
+        // Attack. Enemy units (player != 0) show portrait + HP only.
+        if (fa.player == 0) {
+            _draw_unit_commands(world, u.kind, fa.player);
         }
         return;
     }
     // selected_kind == SEL_KIND_BUILDING.
     b   = ecs_get(world, building_comp, eid);
     def = building_def_for(b.kind);
-    frame_idx = _building_portrait_frame(b.kind, fa.player);
-    _draw_portrait(sx, sy, frame_idx);
-    sx = _CMD_PORTRAIT_INSET + _CMD_PORTRAIT_PX + 8;
-    sy = bar_y + _BOTTOM_PANEL_SRC_H - 2;
+    frame_idx = wc1_building_icon_frame(b.kind, fa.player);
+    _draw_portrait(px, py, frame_idx);
     name = _building_name_for(b.kind);
-    render_text(name, sx, sy, 1, _CMD_TEXT_COLOR);
+    _panel_text_centered(name, _CMD_NAME_Y, _CMD_TEXT_COLOR);
     sh = ecs_get(world, sheet_comp, eid);
     current = cs_res_current(sh.handle, RES_HP);
     max     = cs_res_max(sh.handle, RES_HP);
     hp_sb = strbuf_new();
     if (b.state == BLDG_STATE_CONSTRUCTING) {
-        // Progress line — "Building: 42%". Integer percentage
-        // computed from progress / construction_time.
+        // Construction percentage — "42%".
         pct = b.progress_ms * 100;
         if (def.construction_time_ms > 0) { pct = pct / def.construction_time_ms; }
         else                              { pct = 100; }
         if (pct > 100) { pct = 100; }
-        hp_sb = strbuf_cat(hp_sb, "Building: ");
         hp_sb = strbuf_num(hp_sb, pct);
         hp_sb = strbuf_ch(hp_sb, '%');
     } else {
-        hp_sb = strbuf_cat(hp_sb, "HP: ");
         hp_sb = strbuf_num(hp_sb, current);
-        hp_sb = strbuf_cat(hp_sb, " / ");
+        hp_sb = strbuf_ch(hp_sb, '/');
         hp_sb = strbuf_num(hp_sb, max);
     }
-    render_text(hp_sb, sx, sy + 12, 1, _CMD_TEXT_DIM);
+    _panel_text_centered(hp_sb, _CMD_HP_Y, _CMD_TEXT_DIM);
     strbuf_free(hp_sb);
-    // S10 — train buttons for the player's own completed producers.
-    // Non-producers (farm / tower / mine) get an empty menu and draw
+    // S10 — train + research command grid for the player's own
+    // completed producers. Non-producers get empty menus and draw
     // nothing; enemy buildings show no buttons (you command your side
     // only). fa.player == 0 is the human convention used everywhere.
     if (b.state == BLDG_STATE_DONE && fa.player == 0) {
@@ -991,8 +997,8 @@ static void _render_building_bars(w, eid) {
     def = building_def_for(b.kind);
     p = ecs_get(w, pos_comp, eid);
     bar_w = def.px_w;
-    sx = p.x - cam_x(cam);
-    sy = p.y - cam_y(cam) - _HP_BAR_OFFSET_PX;
+    sx = cam_world_to_screen_x(cam, p.x);
+    sy = cam_world_to_screen_y(cam, p.y) - _HP_BAR_OFFSET_PX;
     if (b.state == BLDG_STATE_CONSTRUCTING) {
         // Progress bar — orange fill on the dark background.
         filled = b.progress_ms * bar_w / def.construction_time_ms;
