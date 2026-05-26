@@ -137,6 +137,15 @@ extrn bottom_panel_atlas;
 // selection (future) flips _hud_player_faction; defaults to human (0).
 extrn panel_bg_human_atlas, panel_bg_orc_atlas;
 global _hud_player_faction;
+
+// S11 — the player id the local user commands, chosen on the race
+// screen (0 = human, 1 = orc per the forest1.json 4-corner layout).
+// Read via wc1_local_player() from the input / HUD / production
+// faction gates so "my units" follows the chosen race. Functions
+// resolve at link time, so the loaded game modules call the accessor
+// without depending on this global being in their scope.
+global _local_player;
+wc1_local_player() { return _local_player; }
 // S9 — top resource bar (gold + lumber icons + strip chrome).
 // Loaded once at startup; read every frame by _draw_top_resource_bar.
 extrn top_resource_bar_atlas;
@@ -542,6 +551,12 @@ main() {
     ecs_wire(world);
     buildings_wire(world);
 
+    // S11 — race select. The player picks Humans (player 0) or Orcs
+    // (player 1); the choice drives every "my faction" gate (selection,
+    // command card, production, minimap colors) and the HUD panel skin.
+    _local_player = _race_select_screen();
+    _hud_player_faction = _player_is_human(_local_player) != 0 ? 0 : 1;
+
     // Seed the camera before unit spawn so the start_view consumer
     // can override it. cam_new lands at (0, 0); the seeder
     // looks for a `start_view` entity belonging to player 0 (the
@@ -607,11 +622,6 @@ main() {
         _debug_spawn_tick();
         _debug_spawn_building_tick();
         _debug_train_tick();
-        // S10.6 debug — H toggles the HUD chrome faction (human/orc)
-        // so both command-card skins are visible without race select.
-        if (key_pressed(KEY_H) != 0) {
-            wc1_hud_set_faction(wc1_hud_faction() != 0 ? 0 : 1);
-        }
         // Combat runs BEFORE movement so attackers can request a
         // fresh path-to-target this frame and the movement tick
         // walks them toward weapon range immediately. Missiles
@@ -943,27 +953,89 @@ static void _spawn_units_from_level(world, map) {
     free(out_gxy);
 }
 
-// Seed the camera from the FIRST `start_view` entity the level
-// carries. WC1 SMS files declare one SetStartView per player; the
-// converter emits all of them but rts1 only honors the first one
-// for now (campaign maps put player 0 first, which matches the
-// human-controlled side). Multi-player picks land when the lobby
-// arrives.
+// S11 — one faction banner on the race-select screen: a stone box with
+// the faction's portrait face (footman 0 / grunt 1) and a label, gold-
+// rimmed + lit when the cursor is over it.
+static void _race_box(bx, by, bw, bh, frame, label: ptr, hovered) {
+    auto pw, ph, px, py, lw;
+    render_rect(bx, by, bw, bh,
+                hovered != 0 ? rgba(64, 52, 38, 255) : rgba(40, 34, 26, 255));
+    render_rect_outline(bx, by, bw, bh, hovered != 0 ? 0xE6C200FF : 0x6A6A6AFF);
+    // Faction face, scaled to the box keeping the 27:19 portrait aspect.
+    pw = bw - 24;
+    ph = pw * 19 / 27;
+    px = bx + (bw - pw) / 2;
+    py = by + 16;
+    image_draw_size(portrait_icons_atlas, frame, px, py, pw, ph);
+    lw = render_measure(label, 1);
+    render_text(label, bx + (bw - lw) / 2, by + bh - 22, 1, 0xFFFFFFFF);
+}
+
+// S11 — race-select start screen. Runs its own frame loop before the
+// match: the player clicks Humans (→ player 0) or Orcs (→ player 1),
+// or presses 1 / 2. Returns the chosen player id. Closing the window
+// returns 0 (Humans) and the caller exits cleanly on game_should_quit.
+// Uses the already-loaded portrait atlas for the two faction faces.
+static _race_select_screen() {
+    auto choice, mx, my, hx, ox, by, bw, bh, hh, ho, title: ptr, hint: ptr, tw;
+    bw = 130; bh = 140; by = 64;
+    hx = 64;                       // human banner x
+    ox = SCREEN_W - 64 - bw;       // orc banner x (mirrored)
+    choice = 0 - 1;
+    while (game_should_quit() == 0 && choice < 0) {
+        game_frame_begin();
+        mx = mouse_x();
+        my = mouse_y();
+        hh = mx >= hx && mx < hx + bw && my >= by && my < by + bh;
+        ho = mx >= ox && mx < ox + bw && my >= by && my < by + bh;
+        if (mouse_pressed(MOUSE_LEFT) != 0) {
+            if (hh != 0) { choice = 0; }
+            if (ho != 0) { choice = 1; }
+        }
+        if (key_pressed(KEY_1) != 0) { choice = 0; }
+        if (key_pressed(KEY_2) != 0) { choice = 1; }
+        game_render_begin();
+        render_clear(rgba(24, 18, 12, 255));
+        title = "CHOOSE YOUR RACE";
+        tw = render_measure(title, 2);
+        render_text(title, (SCREEN_W - tw) / 2, 26, 2, 0xE6C200FF);
+        _race_box(hx, by, bw, bh, 0, "HUMANS", hh);
+        _race_box(ox, by, bw, bh, 1, "ORCS",   ho);
+        hint = "click a banner   ( 1 humans  /  2 orcs )";
+        tw = render_measure(hint, 1);
+        render_text(hint, (SCREEN_W - tw) / 2, by + bh + 18, 1, 0xB0B0B0FF);
+        game_render_end();
+    }
+    return choice < 0 ? 0 : choice;
+}
+
+// Seed the camera on the LOCAL player's `start_view` entity (the race
+// the user picked), falling back to the first start_view if the level
+// has none for that player. WC1 SMS files declare one SetStartView per
+// player; the converter emits all of them.
 //
-// The view position is the grid cell the campaign wants the
-// camera to LOOK AT — center the viewport on it. cam_set folds
-// in the clamp so a near-edge anchor never exposes off-map area.
+// The view position is the grid cell the campaign wants the camera to
+// LOOK AT — center the viewport on it. cam_set folds in the clamp so a
+// near-edge anchor never exposes off-map area.
 static void _seed_camera_from_level(map) {
-    auto i, n, k;
+    auto i, n, k, fallback_i;
     n = wc1_map_entity_count(map);
+    fallback_i = 0 - 1;
     for (i = 0; i < n; i++) {
         k = wc1_map_entity_kind(map, i);
-        if (str_eq(k, "start_view") != 0) {
+        if (str_eq(k, "start_view") == 0) { continue; }
+        if (fallback_i < 0) { fallback_i = i; }
+        if (wc1_map_entity_player(map, i) == _local_player) {
             cam_set(cam,
                       wc1_map_entity_gx(map, i) * 16 - SCREEN_W / 2,
                       wc1_map_entity_gy(map, i) * 16 - SCREEN_H / 2);
             return;
         }
+    }
+    if (fallback_i >= 0) {
+        cam_set(cam,
+                  wc1_map_entity_gx(map, fallback_i) * 16 - SCREEN_W / 2,
+                  wc1_map_entity_gy(map, fallback_i) * 16 - SCREEN_H / 2);
     }
 }
 
