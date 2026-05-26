@@ -82,7 +82,11 @@ const _CONSTRUCT_BAR_COLOR   = 0xFFFFA500;   // amber
 extrn SCREEN_W, SCREEN_H;
 const _CMD_BAR_HEIGHT_PX  = 60;
 const _CMD_PORTRAIT_PX    = 56;   // square portrait box
-const _CMD_PORTRAIT_INSET = 2;    // gap between bar edge + portrait
+// S10.6 — the minimap occupies the far-left of the bar; the portrait
+// + text + progress sit to its right (they all derive from this inset).
+const _CMD_MINIMAP_X      = 2;
+const _CMD_MINIMAP_PX     = 56;
+const _CMD_PORTRAIT_INSET = 60;   // portrait x — right of the minimap
 const _CMD_BAR_COLOR      = 0xFF1A1A1A;     // near-black
 const _CMD_PORTRAIT_BG    = 0xFF3A3A3A;     // dark gray
 const _CMD_FRAME_COLOR    = 0xFF6A6A6A;     // medium gray
@@ -99,7 +103,7 @@ const _CMD_BTN_UNAFFORD = 0xFF402020;   // dim red border when too poor
 // eight constructable buildings fit in one row right of the text.
 const _CMD_BUILD_BTN_PX  = 28;
 const _CMD_BUILD_BTN_GAP = 4;
-const _CMD_BUILD_BTN_X0  = 206;
+const _CMD_BUILD_BTN_X0  = 220;   // right of minimap+portrait+text (S10.6)
 
 // Source dims of the WC1 portrait icon strip (27×19 per frame, 93
 // frames stacked vertically — see war1gus icons.lua Size = {27,
@@ -805,6 +809,69 @@ static void _draw_train_progress(b: Building) {
     strbuf_free(sb);
 }
 
+// S10.6 — minimap. Drawn on the far-left of the command card: a solid
+// terrain backdrop, a faction-colored blip per unit/building, and the
+// camera viewport rectangle. Click-to-pan is wc1_minimap_click below.
+// Per-tile terrain sampling is a later refinement — the blips + the
+// viewport rect are the load-bearing read. The blip callback gets only
+// (w, eid) from ecs_query_each, so the minimap geometry is staged in
+// file-scope statics for it to read.
+static auto _mm_x, _mm_y, _mm_px, _mm_mw, _mm_mh;
+
+static void _minimap_blip(w, eid) {
+    auto p: Pos, fa: Faction, bx, by, col;
+    p  = ecs_get(w, pos_comp, eid);
+    fa = ecs_get(w, faction_comp, eid);
+    bx = _mm_x + (p.x / 16) * _mm_px / _mm_mw;
+    by = _mm_y + (p.y / 16) * _mm_px / _mm_mh;
+    col = fa.player == 0 ? 0xFF40C0FF : 0xFFE03030;   // cyan own / red other
+    render_rect(bx, by, 2, 2, col);
+}
+
+static void _draw_minimap(world) {
+    auto bar_y, mw, mh, vx, vy, vw, vh;
+    mw = wc1_map_tiles_w();
+    mh = wc1_map_tiles_h();
+    if (mw <= 0 || mh <= 0) { return; }
+    bar_y = wc1_cmd_bar_y();
+    _mm_x  = _CMD_MINIMAP_X;
+    _mm_y  = bar_y + 2;
+    _mm_px = _CMD_MINIMAP_PX;
+    _mm_mw = mw;
+    _mm_mh = mh;
+    render_rect(_mm_x, _mm_y, _mm_px, _mm_px, 0xFF1E3A1E);   // forest backdrop
+    // Buildings first so unit dots land on top of them.
+    ecs_query_each(building_q, fn_ptr(_minimap_blip));
+    ecs_query_each(peasant_q,  fn_ptr(_minimap_blip));
+    // Camera viewport rect: shows SCREEN_W/16 x SCREEN_H/16 tiles from
+    // (cam_x, cam_y).
+    vx = _mm_x + (cam_x(cam) / 16) * _mm_px / mw;
+    vy = _mm_y + (cam_y(cam) / 16) * _mm_px / mh;
+    vw = (SCREEN_W / 16) * _mm_px / mw;
+    vh = (SCREEN_H / 16) * _mm_px / mh;
+    render_rect_outline(vx, vy, vw, vh, 0xFFFFFFFF);
+}
+
+// S10.6 — if (mx, my) is inside the minimap, pan the camera to centre
+// on the matching world point and return 1; else 0. Called from the
+// input tick's HUD-strip click handler so minimap clicks pan instead
+// of routing to the command buttons.
+wc1_minimap_click(mx, my) {
+    auto bar_y, mw, mh, lx, ly, wtx, wty;
+    bar_y = wc1_cmd_bar_y();
+    if (mx < _CMD_MINIMAP_X || mx >= _CMD_MINIMAP_X + _CMD_MINIMAP_PX) { return 0; }
+    if (my < bar_y + 2 || my >= bar_y + 2 + _CMD_MINIMAP_PX) { return 0; }
+    mw = wc1_map_tiles_w();
+    mh = wc1_map_tiles_h();
+    if (mw <= 0 || mh <= 0) { return 0; }
+    lx = mx - _CMD_MINIMAP_X;
+    ly = my - (bar_y + 2);
+    wtx = lx * mw / _CMD_MINIMAP_PX;
+    wty = ly * mh / _CMD_MINIMAP_PX;
+    cam_set(cam, wtx * 16 - SCREEN_W / 2, wty * 16 - SCREEN_H / 2);
+    return 1;
+}
+
 extrn unit_comp;
 static void _command_card_render(world) {
     auto bar_y, eid, sx, sy;
@@ -825,6 +892,9 @@ static void _command_card_render(world) {
     }
     // Authentic WC1 divider strip on top of the panel.
     _draw_bottom_panel_border(bar_y);
+    // S10.6 — minimap always shows on the far-left, even with nothing
+    // selected.
+    _draw_minimap(world);
     if (selected_count <= 0 || selected_kind == SEL_KIND_NONE) {
         return;
     }
