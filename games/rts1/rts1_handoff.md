@@ -1423,6 +1423,49 @@ sub-session commits for the per-file breakdowns.
     armor read at strike time via `wc1_tech_weapon_bonus` /
     `wc1_tech_armor_bonus`).
 
+**S10.5 — peasant build flow (2026-05-25, `12e5cc5` → `dba0bf5`):**
+the player path that replaces the Shift+N debug spawn. Select a
+worker → command card shows the buildable-building icons → click one →
+ghost follows the cursor with a per-tile green/red validity outline →
+left-click a valid + affordable spot drops the foundation + auto-
+assigns the worker → right-click/ESC cancels. Building cost shows on
+hover; placement only starts when affordable. Key fns:
+`wc1_build_menu`, `wc1_placement_*` (begin/valid/try_at/cancel),
+`wc1_building_atlas_idle/_construct`. **Important workflow note for
+testing:** compile + run the SAME path — `bpp rts.bpp -o rts && ./rts`
+from `games/rts1/`. `-o /rts` (root) silently fails to write on macOS,
+so `./rts` would run a stale binary (this cost a long debug detour).
+
+**S10.6 — WC1-style command card (IN PROGRESS, 2026-05-25/26):**
+bottom-bar layout kept (no camera/viewport refactor); WC1 assets used
+for the chrome.
+  - **S10.6.0** (`d1d9ca9`) — stone panel background (`panel_1`,
+    loaded raw per faction via `_load_raw_png`) replaces the flat bar.
+    Faction-aware via `_hud_player_faction` (default 0 = human);
+    `wc1_hud_panel_bg()` picks human/orc. **Debug key H** toggles the
+    HUD faction so both skins are visible without race selection
+    (which is the future hook that sets `_hud_player_faction`).
+  - **S10.6.1** (`cc72520`) — minimap on the far-left of the bar
+    (56×56): solid forest backdrop + faction-colored unit/building
+    blips + camera viewport rect + click-to-pan (`wc1_minimap_click`).
+    Map dims via `wc1_map_tiles_w/h` (world_map is the stbtile
+    Tilemap). Layout shifted to fit: minimap x=2..58, portrait inset
+    2→60, build-icon row 206→220.
+  - ⚠️ **Built without a display — needs visual tuning.** The bottom
+    bar is genuinely cramped (minimap + portrait + text + build/train
+    fill it); the stone stretch + minimap scale + blip/rect positions
+    are best-effort and likely need eyeball adjustment. Per-tile
+    minimap terrain is a flat backdrop for now (sampling = refinement).
+  - **S10.6.2 — unit action buttons (NEXT, not started).** Combat
+    units (footman/knight/archer/…) have the button area free (no
+    build/train) — put Move/Stop/Attack/Hold/Patrol there using the
+    `icons.lua` frames (move 33/34, repair 35, harvest 36, attack ~40).
+    Stop (clear Target + AttackTarget + Path → IDLE) is the simple win;
+    Move/Attack overlap right-click; Hold/Patrol need a small state
+    machine. Better done with the user (testable + the cramped layout
+    needs eyes). Peasants are build-icon-focused; their Move/Stop is a
+    follow-on.
+
 **S11 (AI baseline) is next** — the genuinely MAX-worthy seam S10
 unblocks. The enemy player builds, gathers, **trains** (now
 possible — the training loop the AI drives exists), and attacks at
