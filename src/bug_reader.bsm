@@ -143,6 +143,13 @@ extrn bug_sk_vcnt;    // Variable count.
 extrn bug_sk_voffs;   // Pointer to array of variable stack offsets.
 extrn bug_sk_count;   // Total stack map entries.
 
+// Inline-splice ranges (v5). Reader-owned (not part of the GUI cross-thread
+// snapshot set, so defined here rather than extrn'd from bug_shared).
+global bug_il_start;   // arr<int>: text offset where each inlined body begins
+global bug_il_end;     // arr<int>: end offset (exclusive)
+global bug_il_name;    // arr<packed>: packed name of the inlined callee
+global bug_il_count;   // entry count
+
 // -- Initialization -------------------------------------------
 
 // Reset all parsed state. Safe to call multiple times: frees the
@@ -248,6 +255,16 @@ void init_reader() {
     bug_sk_vcnt  = arr_new();
     bug_sk_voffs = arr_new();
     bug_sk_count = 0;
+
+    // v5 INLINE section: parallel arrays of [start, end) text offsets + the
+    // inlined callee's packed name.
+    if (bug_il_start != 0) { arr_free(bug_il_start); }
+    if (bug_il_end != 0)   { arr_free(bug_il_end); }
+    if (bug_il_name != 0)  { arr_free(bug_il_name); }
+    bug_il_start = arr_new();
+    bug_il_end   = arr_new();
+    bug_il_name  = arr_new();
+    bug_il_count = 0;
 }
 
 // -- File loading ---------------------------------------------
@@ -278,7 +295,9 @@ static bug_parse_header() {
     if (m1 != 71) { return -1; }
     bug_version = br_read_u8();
     bug_target  = br_read_u8();
-    if (bug_version != 4) { return -2; }
+    // v5 (2026-05-27) appends the INLINE section after the backend sections;
+    // v4 maps still parse (bug_parse skips the INLINE read for v4).
+    if (bug_version != 4 && bug_version != 5) { return -2; }
     // 16-byte build_id, low half then high half, little-endian.
     lo_a = br_read_u32();
     lo_b = br_read_u32();
@@ -586,6 +605,19 @@ static void bug_parse_stackmap() {
     }
 }
 
+// Parse the INLINE section (v5). Mirrors bpp_bug's bug_write_inline: count,
+// then per entry [start u32, end u32, callee_name str].
+static void bug_parse_inline() {
+    auto n, i;
+    n = br_read_u16();
+    bug_il_count = n;
+    for (i = 0; i < n; i++) {
+        bug_il_start = arr_push(bug_il_start, br_read_u32());
+        bug_il_end   = arr_push(bug_il_end,   br_read_u32());
+        bug_il_name  = arr_push(bug_il_name,  br_read_str());
+    }
+}
+
 // Parse the VIZ HINTS section. Each entry is u16 length + raw
 // bytes; we malloc a NUL-terminated C-string per entry so the
 // debugger can hand the pointer straight to the runtime `v`
@@ -621,6 +653,7 @@ bug_parse() {
     bug_parse_viz_hints();
     bug_parse_addrmap();
     bug_parse_stackmap();
+    if (bug_version >= 5) { bug_parse_inline(); }
     return 0;
 }
 

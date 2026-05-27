@@ -59,6 +59,29 @@ global a64_b3_spill_base; // Assigned by a64_primitives (a64_emit_func_prologue)
 // via bpp_enc_arm64.bsm. a64-only because x64 is always binary.
 global a64_bin_mode; // Set from bpp.bpp (command-line mode selection).
 
+// Inline-splice ranges for the .bug debug map. When a function body is spliced
+// into a caller (S4 value-inline or VI void-inline), the inlined instructions
+// live in the caller's text range, so a PC there would be mis-attributed to the
+// caller. These parallel arrays record [start, end) text offsets + the callee
+// fidx of every splice so bpp_bug can emit an INLINE section and the debugger
+// can resolve a PC back to the inlined function. enc_pos is the absolute text
+// offset (same coordinate as the address map), so the ranges are directly
+// comparable to function offsets. Populated only in binary mode.
+global bug_inl_start;   // arr<int>: text offset where each inlined body begins
+global bug_inl_end;     // arr<int>: text offset where it ends (exclusive)
+global bug_inl_callee;  // arr<packed>: packed name of the inlined callee
+
+// Record one inline-splice range. No-op outside binary mode (enc_pos is only a
+// real text offset there) and for empty ranges.
+_bug_inl_record(s, e, fidx) {
+    if (a64_bin_mode == 0) { return 0; }
+    if (e <= s) { return 0; }
+    bug_inl_start  = arr_push(bug_inl_start, s);
+    bug_inl_end    = arr_push(bug_inl_end, e);
+    bug_inl_callee = arr_push(bug_inl_callee, *(funcs[fidx] + FN_NAME));
+    return 0;
+}
+
 // Binary mode: function entry labels (dynamic array mapping fn index → label ID).
 extrn a64_fn_lbl; // Array pointer stable; read from bpp.bpp, bpp_bo.bsm, bpp_bug.bsm.
 
@@ -237,6 +260,7 @@ void cg_install_arm64_primitives() {
 void init_codegen_arm64() {
     cg_install_arm64_primitives();
 
+    bug_inl_start = arr_new(); bug_inl_end = arr_new(); bug_inl_callee = arr_new();
     cg_fn_name = arr_new(); cg_fn_par = arr_new();
     cg_fn_pcnt = arr_new(); cg_fn_body = arr_new();
     cg_fn_bcnt = arr_new(); cg_fn_fidx = arr_new();
@@ -497,6 +521,8 @@ static _a64_emit_inline_multi(call_node, fidx) {
     pp = cg_prim;
     cn = call_node;
     callsite_id = cn.e;
+    auto _inl_s;
+    _inl_s = enc_pos;   // .bug: text offset where this inlined body begins
     inl_callee = funcs[fidx];
     inl_body = *(inl_callee + FN_BODY);
     inl_bcnt = *(inl_callee + FN_BCNT);
@@ -626,6 +652,7 @@ static _a64_emit_inline_multi(call_node, fidx) {
         ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
         final_ety = call(pp.emit_node, ret_clone);
     }
+    _bug_inl_record(_inl_s, enc_pos, fidx);   // .bug: record this inlined range
     free(names_buf);
     free(args_buf);
     free(locals_buf);
@@ -1428,7 +1455,12 @@ a64_emit_call(nd) {
                 inl_params = *(inl_callee + FN_PARS);
                 inl_pcnt = *(inl_callee + FN_PCNT);
                 inl_cloned = ast_clone_subst(inl_expr, inl_params, inl_pcnt, n.b);
-                return call(pp.emit_node, inl_cloned);
+                // Record the inlined range for the .bug map (debugger PC attribution).
+                auto _inl_s, _inl_ety;
+                _inl_s = enc_pos;
+                _inl_ety = call(pp.emit_node, inl_cloned);
+                _bug_inl_record(_inl_s, enc_pos, fidx_c);
+                return _inl_ety;
             }
             // body_cnt > 1: only inline if the pre_reg walker
             // stamped a callsite_id on this T_CALL. A 0 .e means
