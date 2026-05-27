@@ -109,14 +109,33 @@ va
   every active perf sidequest until this closes.
     1. ✅ `pthread_kill` cross-compile fail — FIXED 2026-05-21
        (`d1f5457`), 14-LOC stub in `_core_linux.bsm`.
-    2. ⚠️ `bpp_lin` runtime SIGSEGV on Linux x86_64 — newly
-       discovered. Cross-compiled `bpp_lin` ELF runs cleanly
-       for hello-world programs but segfaults at startup
-       when self-hosting. strace shows the binary oscillating
-       between "x32 mode" and "64 bit mode" before the
-       fault — likely entry-point or runtime-init regression
-       accumulated between 2026-05-02 and 2026-05-21. Bisect
-       on commits in that window is the next step.
+    2. ⚠️ `bpp_lin` runtime SIGSEGV on Linux x86_64 — NARROWED
+       2026-05-27 (printf-bisection; gdb is unusable here —
+       Rosetta blocks ptrace of the translated x64 process,
+       "Couldn't get registers: I/O error").
+         - "segfaults at startup" was WRONG: startup + every
+           `init_*` complete (probes print). The fault is during
+           COMPILATION: `main` → `copy_cstr` → `process_file` →
+           `was_imported` → **`hash_mem`** (the first import-dedup,
+           a djb2 over the path string).
+         - It is NOT a bad-pointer logic error: at the fault site
+           `off`/`len` are valid (`peek(off)`=47 `'/'`, `len`=11).
+         - It is a **HEISENBUG**: adding a `peek(off)` probe right
+           before the djb2 loop makes the crash VANISH (rc=0). So
+           it is layout-sensitive — register allocation / stack
+           frame / uninitialized value in the x64 codegen, not a
+           deterministic entry-point fault. The instrumentation
+           itself perturbs it.
+         - Small x64 programs cross-compiled by the a64 bpp run
+           fine (Docker/Rosetta tripod 11/11); only the large bpp
+           binary triggers it → scale/complexity-dependent.
+         - The earlier strace "x32 / 64-bit mode" oscillation may
+           be a Rosetta translation artifact, not the fault.
+         - NEXT: needs REAL x64 hardware + a working debugger, or a
+           layout-stable bisect that does not move the bug. A
+           printf-bisect alone hits the heisenbug wall.
+       (This SIGSEGV also blocks a Linux-native bootstrap — bpp
+       cannot run on Linux to self-host until it is fixed.)
     3. ⏸️ Phase B1 (freelist register alloc) x86_64 emission
        bug — disabled since 2026-04-15 (`19da538`). Manifests
        under self-host on a fresh `_x64_has_call` recursion
@@ -127,6 +146,13 @@ va
   S4 (cost-model inliner) inherits the ARM64-only posture for
   the same reason; see `docs/plans/sidequest_cost_model_inliner.md`
   for the explicit deferral note.
+- **`bpp` no-args SIGSEGV (BOTH platforms, robustness)** — with no
+  input file `arg_ptr` stays 0 and `copy_cstr(pathbuf, 0)` reads NULL
+  → SIGSEGV (rc=139) instead of printing usage. Present on a64 AND
+  x64 (NOT a Linux-only issue — surfaced 2026-05-27 while bisecting
+  the `bpp_lin` crash; it was a red herring there). Trivial fix:
+  guard `if (arg_ptr == 0) { <print usage>; return 1; }` after the
+  arg-parse loop in `bpp.bpp` main.
 - **Host-aware compiler + install** — `bpp` auto-detects host
   OS+chip; defaults match host instead of always macOS arm64.
 - **C-emitter `var T` parity** — pick uniform storage strategy
