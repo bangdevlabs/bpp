@@ -316,3 +316,55 @@ as a parallel hedge.
 The next session can pick up VI-2 with the verification gate explicit. If gen3 !=
 gen2 OR C suite regresses, the lazy-slot refactor is the fallback path before
 proceeding.
+
+---
+
+# Progress + portability contract (2026-05-27, session 3)
+
+## Shipped this session
+- Source-side: `_path_heap_swap` hand-inlined into both sift functions +
+  stbpath lazy-clear — `06ae76e` (locks the 15 samples independent of VI).
+- **VI-1** (inert classifier flag `fn_void_inlineable`) — `4beaec3`. gen1==gen2
+  exact (`2f951f0d`); tripod identical (native 180/0/12, C 145/0/47, Linux 11/11).
+- **VI-2** (walker stamps void callsites + a64 splice void mode + defensive
+  assert) — this commit. Bootstrap converged as predicted: gen1 `522422a2` !=
+  gen2 `e6d6148a` == gen3 (the 1-cycle is the compiler now inlining its own void
+  helpers). Tripod: native 180/0/12, **C 145/0/47 (the mandatory Q4 check)**,
+  Linux Docker 11/11.
+
+## Q4 risk RESOLVED (not just mitigated)
+The slot-leakage worry: the walker stamps `_inl<N>_<param>` into the var table;
+x64/C read it → dead-code/regression. Investigation found the walker
+(`_inline_pre_reg_walk_body`) is invoked from **a64 only** (`a64_codegen.bsm:689`
+is the sole call site — not x64, and the C emitter never runs pre_reg nor reads
+`cg_vars`). So void slots are registered only on the a64 path, where the splice
+consumes them; x64/C never see them. `run_all_c` stayed 145/0/47, confirming it
+empirically. The lazy-slot fallback was not needed.
+
+## Portability contract (Disciplina #2 — behavioral parity, not optimization parity)
+Inline (S4/B2 value + VI void) is an **a64-only optimization**:
+- **a64** inlines → correct + optimized.
+- **x64** emits a plain call (B2 disabled) → correct, not optimized.
+- **C emitter** emits a plain C call and delegates inlining to the C compiler
+  (`-O2`) → correct, optimized at the C level. Intentional + permanent.
+
+All three produce behaviorally-equivalent programs, so portability parity holds.
+Documented at the `x64_codegen.bsm` call-emit site and here.
+
+## The x64 self-host bug (fuxicada finding) + Linux bootstrap status
+Confirmed empirically this session: the x64-cross-compiled bpp (`bpp_lin`)
+**SIGSEGVs at startup, deterministically** (6/6 rc=139, even no-args). Small x64
+programs cross-compile + run fine (tripod 11/11), so it is a **scale-dependent**
+codegen/ELF bug that only hits the large bpp binary (consistent with the old
+"many call sites" note). Narrowing showed it crashes before any real work (even
+`--show-deps`), i.e. at startup/load of the large binary.
+
+**Answer to "can we bootstrap on Linux via Docker?":** in principle yes (Docker
+is a real Linux x64 environment); in practice **no, not yet** — a Linux-native
+bootstrap (run bpp on Linux to compile src/bpp.bpp → gen2_lin, check byte-identity)
+is blocked by this exact crash, because bpp can't run on Linux to self-host. The
+macOS-ARM64 self-host bootstrap works; the Linux-x64 self-host is the open
+frontier. Fixing the startup SIGSEGV (the "Linux x86_64 health restoration" arc —
+approach: build `bpp_lin` with `--bug`, core dump + gdb in the container, or real
+x64 hardware) would unblock BOTH x64 inline AND a Linux Docker bootstrap. Good
+candidate for a "last exercise".

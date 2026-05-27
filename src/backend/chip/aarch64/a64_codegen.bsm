@@ -590,20 +590,42 @@ static _a64_emit_inline_multi(call_node, fidx) {
         *(args_buf + (inl_pcnt + i) * 8) = mp_node;
         i++;
     }
-    // Emit prelude statements (everything except the trailing T_RET).
-    // STATEMENT-level emit via cg_emit_stmt — a64_emit_node only
-    // handles expressions and would silently drop T_ASSIGN /
-    // T_MEMST / T_DECL bodies.
+    // Emit the body statements. STATEMENT-level emit via cg_emit_stmt —
+    // a64_emit_node only handles expressions and would silently drop
+    // T_ASSIGN / T_MEMST / T_DECL bodies.
+    //
+    // VI-2 — two splice shapes share this loop, told apart by the last
+    // statement:
+    //   * value body (ends in T_RET): emit statements 0..bcnt-2, then emit
+    //     the trailing T_RET's EXPRESSION as the call's value (into acc).
+    //   * void body (falls off the end, no trailing T_RET): emit ALL bcnt
+    //     statements; the call is in statement position so there is no value.
+    auto is_void_splice, last_emit;
+    ret_stmt = inl_body[inl_bcnt - 1];
+    is_void_splice = (ret_stmt.ntype != T_RET);
+    if (is_void_splice != 0) {
+        // Defensive: the void emit shape must agree with the classifier —
+        // only an fn_void_inlineable callee should ever reach this branch,
+        // and only in statement context (a void call has no usable value).
+        assert(arr_get(fn_void_inlineable, fidx));
+        last_emit = inl_bcnt;
+    } else {
+        last_emit = inl_bcnt - 1;
+    }
     si = 0;
-    while (si < inl_bcnt - 1) {
+    while (si < last_emit) {
         cloned = ast_clone_subst(inl_body[si], names_buf, total_names, args_buf);
         cg_emit_stmt(cloned);
         si++;
     }
-    // Final T_RET expression — emit value into acc.
-    ret_stmt = inl_body[inl_bcnt - 1];
-    ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
-    final_ety = call(pp.emit_node, ret_clone);
+    if (is_void_splice != 0) {
+        // No value to leave in acc — the statement-context caller discards it.
+        final_ety = 0;
+    } else {
+        // Final T_RET expression — emit value into acc.
+        ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
+        final_ety = call(pp.emit_node, ret_clone);
+    }
     free(names_buf);
     free(args_buf);
     free(locals_buf);
@@ -1414,6 +1436,17 @@ a64_emit_call(nd) {
             // emitted post-pre_reg, or a path the walker didn't
             // reach yet). Fall through to a normal call in that
             // case rather than risk emitting an unmangled body.
+            if (n.e > 0) {
+                return _a64_emit_inline_multi(n, fidx_c);
+            }
+        } else if (fidx_c >= 0 && arr_get(fn_void_inlineable, fidx_c)) {
+            // VI-2: void / statement-context callee — splice its statements in
+            // place of the call with NO value (the call sits in statement
+            // position). Reuses the multi-statement splicer, which detects the
+            // void shape (last statement is not a T_RET) and emits every
+            // statement. Requires the pre_reg walker's callsite_id; n.e == 0
+            // means the call was not seen during pre_reg, so fall through to a
+            // normal call rather than risk an unmangled body.
             if (n.e > 0) {
                 return _a64_emit_inline_multi(n, fidx_c);
             }
