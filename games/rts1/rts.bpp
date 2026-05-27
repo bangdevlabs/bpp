@@ -65,6 +65,10 @@ const SCREEN_H = 270;
 // Allocated once in main, never reassigned — Tonify Rule 1.
 extrn map;
 
+// Verbose combat / AI / command logging gate (defined in rts1_render).
+// main sets it from the RTS_DEBUG environment variable below.
+extrn wc1_debug;
+
 // ECS world holding every unit entity. Sized for 256 — covers
 // Session 3's "spawn one peasant from forest1.json" plus headroom
 // for the production economy + AI that arrives in Sessions 6-9.
@@ -549,7 +553,9 @@ main() {
     // so it MUST come after.
     unit_defs_init();
     building_defs_init();
-    world = ecs_new(256);
+    world = ecs_new(512);   // 512 so the RTS_STRESS arena (up to 230v230 +
+                            // the match's own units) fits; normal play uses
+                            // far fewer. Kept in step with _MAX_SELECTION.
     ecs_wire(world);
     buildings_wire(world);
 
@@ -612,6 +618,94 @@ main() {
     // a top-N hot-function sampler. Pure overlay; nothing draws until the
     // toggle is on.
     init_profile();
+
+    // Verbose per-event logging (hit / kill / target / AI state) prints
+    // only when `RTS_DEBUG` is set. Read once here so the hot combat /
+    // command paths just test a global instead of re-querying the env.
+    wc1_debug = (getenv("RTS_DEBUG") != 0);
+
+    // ── Skirmish / stress arena — `RTS_STRESS=N ./rts` turns this match into
+    // an N-vs-N field battle for profiling the engine with units actually IN
+    // ACTION (the "profile under load" loop). It (1) grasses over every tile
+    // so there is a clear field — forest1's centre is dense forest and packed
+    // units got stuck in the trees — (2) spawns N of YOUR footmen and N of the
+    // enemy's grunts in 10-wide blocks facing each other across a narrow
+    // no-man's-land at the centre of the map, and (3) plants the camera on the
+    // seam so the clash is on-screen at once. The blocks start ~7 tiles apart
+    // — just OUTSIDE the auto-acquire range — so YOU command the engagement:
+    // select your footmen and attack-move forward a couple of tiles, and the
+    // enemy AI's grunts auto-defend on contact (the new auto-target scan). The
+    // armies start in contact range ON PURPOSE: marching a dense block across
+    // the WHOLE map still gridlocks (the open movement arc — see
+    // docs/plans/sidequest_horde_movement.md), so starting them adjacent gives
+    // a real battle to profile today instead of two armies that never meet.
+    // Off unless the env var is set — a dev/profiling lever, never shipped
+    // behaviour. (Atlas is just pixels; the kind drives stats. The map keeps
+    // forest1's town halls / gold mine, so the AI brain still has its seeds.)
+    auto _stress_s;
+    _stress_s = getenv("RTS_STRESS");
+    if (_stress_s != 0) {
+        auto _sn, _si, _d, _i, _mw, _mh, _gx, _gy, _y0, _lp, _en;
+        auto _cx, _gap, _pl_x0, _en_x0;
+        _sn = 0; _si = 0;
+        while (str_peek(_stress_s, _si) != 0) {
+            _d = str_peek(_stress_s, _si) - '0';
+            if (_d < 0 || _d > 9) { break; }
+            _sn = _sn * 10 + _d;
+            _si = _si + 1;
+        }
+        if (_sn <= 0) { _sn = 200; }
+        // 2*N units must fit ecs_new(512) with headroom for the existing
+        // units + the marquee selection buffer (_MAX_SELECTION, bumped to
+        // match). Both bumped together this arc.
+        if (_sn > 230) { _sn = 230; }
+        _mw = wc1_map_w(map);
+        _mh = wc1_map_h(map);
+        // (1) Open the battlefield — solid grass everywhere.
+        _gy = 0;
+        while (_gy < _mh) {
+            _gx = 0;
+            while (_gx < _mw) {
+                wc1_map_set(map, _gx, _gy, WC1_T_GRASS);
+                _gx = _gx + 1;
+            }
+            _gy = _gy + 1;
+        }
+        // (2) Two 10-wide blocks centred on the map, facing across a 6-tile
+        // gap. Player block sits left of centre, enemy block right of it; the
+        // facing columns end up ~7 tiles apart — one short advance from the
+        // auto-acquire range, so the player drives the charge.
+        _lp = wc1_local_player();
+        _en = _lp ^ 1;
+        _cx = _mw / 2;
+        _gap = 6;
+        _pl_x0 = _cx - _gap / 2 - 10;
+        if (_pl_x0 < 1) { _pl_x0 = 1; }
+        _en_x0 = _cx + _gap / 2;
+        _y0 = _mh / 2 - (_sn / 10) / 2;
+        if (_y0 < 1) { _y0 = 1; }
+        _i = 0;
+        while (_i < _sn) {
+            _gx = _pl_x0 + (_i % 10);
+            _gy = _y0 + (_i / 10);
+            ecs_spawn_unit(world, footman_atlas, _gx, _gy, _lp, UNIT_FOOTMAN);
+            _i = _i + 1;
+        }
+        _i = 0;
+        while (_i < _sn) {
+            _gx = _en_x0 + (_i % 10);
+            _gy = _y0 + (_i / 10);
+            ecs_spawn_unit(world, grunt_atlas, _gx, _gy, _en, UNIT_GRUNT);
+            _i = _i + 1;
+        }
+        // (3) Look at the seam so the battle is centred on screen.
+        cam_set(cam, _cx * 16 - SCREEN_W / 2, (_mh / 2) * 16 - SCREEN_H / 2);
+        put("[skirmish] centred arena: ");
+        putnum(_sn);
+        put(" footmen vs ");
+        putnum(_sn);
+        put(" grunts, 6-tile gap — attack-move to charge, profile the clash\n");
+    }
 
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles

@@ -44,6 +44,7 @@ load   "rts1_missiles.bsm";
 extrn pos_comp, sheet_comp, attack_target_comp, path_comp, anim_comp, faction_comp;
 extrn peasant_q;
 extrn building_comp;    // S11 — tells a building target from a unit (ecs_has)
+extrn wc1_debug;        // verbose hit / kill logging gate (set by rts.bpp)
 
 // Per-tick dt in ms — set once at the top of wc1_combat_tick so
 // the per-entity callback reads a global instead of re-querying
@@ -136,6 +137,22 @@ static _player_of(w, eid) {
     return fa.player;
 }
 
+// ── Auto-target acquisition (Stratagus UnitActionStill → AutoAttack) ──
+// An idle unit with no orders defends itself: it engages the nearest enemy
+// unit within reaction range, the way WC1/SC1 units do (a footman doesn't
+// stand and watch a grunt walk up and hit it). This lives in the engine,
+// not the AI brain, so it applies to BOTH the player's idle units and the
+// enemy AI's — the "units are dumb at attacking" fix.
+//
+// The scan walks the (2R+1)² tile WINDOW of the movement occupancy grid
+// around the unit (via wc1_collision_unit_at) — O(window), constant in the
+// army size — and keeps the nearest enemy in it. The first cut walked every
+// unit per idle unit (O(N²)); at 400-unit scale that dominated the frame
+// profile, so it was rewritten to this spatial window. Reaction range is in
+// TILES; the window bounds the range, so the nearest is picked by raw
+// tile-distance with no separate range check.
+const _ACQ_RANGE_TILES = 6;
+
 // Per-entity combat tick. Three branches: dying (timer expiration
 // → finalize), engaged (out of range → path, in range → swing),
 // idle (nothing to do — early return).
@@ -182,6 +199,51 @@ static void _combat_step(w, eid) {
         if (an.state == UNIT_STATE_ATTACK) {
             an.state      = UNIT_STATE_IDLE;
             an.elapsed_ms = 0;
+        }
+        // Auto-acquire: a truly idle unit (no orders, not walking to a
+        // commanded destination) engages the nearest enemy in reaction
+        // range, so it defends itself instead of standing there. Skipped
+        // for WALK / other states so we never override a move or
+        // attack-move the player or AI just issued. The engage logic
+        // below picks it up on the next tick (≤0.2s at the 5 Hz combat
+        // tick — imperceptible).
+        if (an.state == UNIT_STATE_IDLE) {
+            auto mgx, mgy, ox, oy, other, ofa: Faction, ddx, ddy, d2;
+            auto best_eid, best_d2, my_player;
+            my_p      = ecs_get(w, pos_comp, eid);
+            mgx       = my_p.x / 16;
+            mgy       = my_p.y / 16;
+            my_player = _player_of(w, eid);
+            best_eid  = 0 - 1;
+            best_d2   = 0;
+            // Walk the tile window of the occupancy grid; keep the nearest
+            // live enemy. wc1_collision_unit_at is O(1) per cell and
+            // bounds-safe, so this is O((2R+1)^2) regardless of army size.
+            oy = mgy - _ACQ_RANGE_TILES;
+            while (oy <= mgy + _ACQ_RANGE_TILES) {
+                ox = mgx - _ACQ_RANGE_TILES;
+                while (ox <= mgx + _ACQ_RANGE_TILES) {
+                    other = wc1_collision_unit_at(ox, oy);
+                    if (other >= 0 && other != eid) {
+                        ofa = ecs_get(w, faction_comp, other);
+                        if (ofa.player != my_player && ecs_alive_at(w, other) != 0) {
+                            ddx = ox - mgx;
+                            ddy = oy - mgy;
+                            d2  = ddx * ddx + ddy * ddy;
+                            if (best_eid < 0 || d2 < best_d2) {
+                                best_eid = other;
+                                best_d2  = d2;
+                            }
+                        }
+                    }
+                    ox = ox + 1;
+                }
+                oy = oy + 1;
+            }
+            if (best_eid >= 0) {
+                at.eid            = best_eid;
+                at.last_attack_ms = 0;
+            }
         }
         return;
     }
@@ -319,15 +381,17 @@ static void _combat_step(w, eid) {
     if (damage < 1) { damage = 1; }
     target_hp = cs_res_adjust(target_sh.handle, RES_HP, 0 - damage);
 
-    putstr("hit eid=");
-    putnum(target_eid);
-    putstr(" dmg=");
-    putnum(damage);
-    putstr(" mult=");
-    putnum(mult_pct);
-    putstr("% hp=");
-    putnum(target_hp);
-    putstr("\n");
+    if (wc1_debug != 0) {
+        putstr("hit eid=");
+        putnum(target_eid);
+        putstr(" dmg=");
+        putnum(damage);
+        putstr(" mult=");
+        putnum(mult_pct);
+        putstr("% hp=");
+        putnum(target_hp);
+        putstr("\n");
+    }
 
     if (target_hp <= 0) {
         if (target_is_building != 0) {
@@ -344,9 +408,11 @@ static void _combat_step(w, eid) {
         }
         at.eid = -1;
         at.last_attack_ms = 0;
-        putstr("dying eid=");
-        putstr(" "); putnum(target_eid);
-        putstr("\n");
+        if (wc1_debug != 0) {
+            putstr("dying eid=");
+            putstr(" "); putnum(target_eid);
+            putstr("\n");
+        }
     }
 }
 
@@ -362,7 +428,9 @@ static void _finalize_death(w, eid) {
     cs_free(sh.handle);
     free(pa.buf);
     ecs_kill_at(w, eid);
-    putstr("kill eid=");
-    putnum(eid);
-    putstr("\n");
+    if (wc1_debug != 0) {
+        putstr("kill eid=");
+        putnum(eid);
+        putstr("\n");
+    }
 }
