@@ -5,37 +5,145 @@
 // and `_mem_free_pages`) ship in the matching `_core_<os>.bsm`
 // Section 2 and become visible through the auto-inject system.
 //
-// Layout: each allocation comes from a private region via the
-// platform's `_mem_alloc_pages(size)`. A 16-byte header sits
-// immediately before the user pointer:
-//
-//   user_ptr - 16: original raw allocation base (so free can release)
-//   user_ptr -  8: total allocation size in bytes
+// Layout: a 16-byte header sits immediately before the user pointer:
+//   user_ptr - 16: raw allocation base (large) or block base (small)
+//   user_ptr -  8: marker — class index (small) or total bytes (large)
 //
 // Auto-injected by the compiler. Programs do not need to import.
 //
 // Adding a new OS = adding the two primitive functions to its
 // `_core_<newos>.bsm` Section 2. This file is not touched.
 
-// Header size — 8 bytes for the raw allocation base plus 8 bytes
-// for the total allocation size.
 const _MEM_HEADER = 16;
+
+// ── Small-block size-class free-list (2026-05-26, WIP) ─────────
+//
+// Motivation: B++'s original allocator made every malloc a
+// `_mem_alloc_pages` (mmap) syscall and every free a `_mem_free_pages`
+// (munmap) — fine for the compiler (alloc-and-grow, then exit), but the
+// rts1 profiler showed a long-running per-frame consumer spends ~98% of
+// its time in _mem_*_pages (on Apple Silicon a 64-byte malloc burns a
+// 16 KB page via syscall). Fix: serve requests <= _MEM_LARGE_THRESHOLD
+// from per-class free-lists carved out of 64 KB chunks (pop/push instead
+// of a syscall); larger requests keep the direct page path. Per Rule 41
+// the policy is fully portable — the per-OS page primitives are
+// untouched, so every target inherits the win with no backend work.
+//
+// Header marker: SMALL blocks store the class index (0..8); LARGE blocks
+// store the total byte count (always >= 4112, since size > 4096). The
+// ranges are disjoint, so free / realloc tell them apart with a plain
+// `marker < _MEM_NUM_CLASSES` test (no sign-bit games).
+//
+// DIAGNOSTIC TOGGLE — `_MEM_REUSE`:
+//   0 → carve-only: every small alloc is a fresh unique block, free is a
+//       no-op for small blocks, so NO block is ever handed out twice.
+//   1 → recycle: full free-list pop/push.
+// If a self-compile that fails under reuse SUCCEEDS under carve-only, the
+// bug is a latent double-free / use-after-free in the consumer (which the
+// old mmap-per-alloc masked), not the free-list policy. Bisection tool.
+const _MEM_NUM_CLASSES     = 9;        // 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
+const _MEM_LARGE_THRESHOLD = 4096;     // > this → large (direct page); <= → free-list
+const _MEM_CHUNK_SIZE      = 65536;    // 64 KB carve chunk — fits any 4K..64K page size
+const _MEM_REUSE           = 0;        // 0 = carve-only (diagnostic); 1 = recycle freed blocks
+// DEBUG-ALLOCATOR mode (Zig-GPA-inspired) — see docs/plans/sidequest_debug_allocator.md.
+// When on (implies reuse), every freed small block is stamped with a distinctive
+// poison byte and pop does NOT re-zero. A use-after-free then reads the poison
+// signature instead of zero, so a corrupted field can be traced to recycled memory.
+const _MEM_DEBUG           = 0;        // 1 = poison-on-free + skip zero-on-pop
+const _MEM_POISON          = 0xBE;     // byte stamped into freed blocks under _MEM_DEBUG
+
+// Free-list bookkeeping, allocated once via a direct page request
+// (malloc cannot allocate its own state). Three contiguous
+// _MEM_NUM_CLASSES-word arrays live in the page:
+//   offset   0  fl_head[c]   — head of class c's free-list (0 = empty)
+//   offset  72  chunk_pos[c] — bump pointer in class c's chunk (0 = none yet)
+//   offset 144  chunk_end[c] — end address of class c's current chunk
+static auto _mem_inited;
+static auto _mem_bk;
+
+// Size class (0..8) for a free-list-eligible request. Class c holds
+// blocks of (16 << c) bytes: 16, 32, ..., 4096.
+static _mem_class_for(size) {
+    auto c, csz;
+    c = 0;
+    csz = 16;
+    while (csz < size) { csz = csz * 2; c = c + 1; }
+    return c;
+}
+
+// One-time bookkeeping init. Calls _mem_alloc_pages directly (never
+// malloc — that would recurse). mmap already zero-fills, but we zero
+// explicitly so a future non-zeroing page source stays correct.
+static void _mem_init() {
+    auto i;
+    _mem_bk = _mem_alloc_pages(_MEM_CHUNK_SIZE);
+    for (i = 0; i < _MEM_NUM_CLASSES * 3; i++) { *(_mem_bk + i * 8) = 0; }
+    _mem_inited = 1;
+}
 
 // Allocate `size` bytes. Returns a pointer the caller can write
 // through, or 0 if the platform refused the allocation.
 malloc(size) {
-    auto raw, total;
-    total = size + _MEM_HEADER;
-    raw = _mem_alloc_pages(total);
-    if (raw == 0) { return 0; }
-    *raw = raw;
-    *(raw + 8) = total;
-    return raw + _MEM_HEADER;
+    auto raw, total, c, csz, blk, user, head, pos, end, z;
+    // Large request → direct page allocation (unchanged path). Marker is
+    // the total size, so free / realloc route it back here.
+    if (size > _MEM_LARGE_THRESHOLD) {
+        total = size + _MEM_HEADER;
+        raw = _mem_alloc_pages(total);
+        if (raw == 0) { return 0; }
+        *raw = raw;
+        *(raw + 8) = total;
+        return raw + _MEM_HEADER;
+    }
+    // Small request → per-class free-list.
+    if (_mem_inited == 0) { _mem_init(); }
+    c   = _mem_class_for(size);
+    csz = 16 << c;
+    // Reuse a parked block if recycling is on and the class has one. Its
+    // 16-byte header is intact from carve time; the free-list link lived
+    // in the user word, so zero the user region (mmap-per-malloc always
+    // handed back zeroed memory and the codebase relies on it) and return.
+    if (_MEM_REUSE != 0) {
+        head = *(_mem_bk + c * 8);
+        if (head != 0) {
+            *(_mem_bk + c * 8) = *head;
+            // Release mode re-zeros the recycled block, because callers rely
+            // on malloc handing back zeroed memory. Debug mode deliberately
+            // skips the zero so any field the new owner leaves unwritten
+            // keeps its poison byte — turning a use-after-free into a
+            // visible signature instead of silent zero.
+            if (_MEM_DEBUG == 0) {
+                z = 0;
+                while (z < csz) { *(head + z) = 0; z = z + 8; }
+            }
+            return head;
+        }
+    }
+    // Carve the next block off this class's chunk, grabbing a fresh 64 KB
+    // chunk first if the current one can't fit header + csz. Carved blocks
+    // come from freshly mmap'd (zeroed) chunk memory, so no zeroing here.
+    pos = *(_mem_bk + 72 + c * 8);
+    end = *(_mem_bk + 144 + c * 8);
+    if (pos == 0 || pos + _MEM_HEADER + csz > end) {
+        raw = _mem_alloc_pages(_MEM_CHUNK_SIZE);
+        if (raw == 0) { return 0; }
+        pos = raw;
+        end = raw + _MEM_CHUNK_SIZE;
+        *(_mem_bk + 144 + c * 8) = end;
+    }
+    blk  = pos;
+    user = blk + _MEM_HEADER;
+    *blk       = blk;                        // raw base (header uniformity)
+    *(blk + 8) = c;                           // marker: class index (< _MEM_NUM_CLASSES)
+    *(_mem_bk + 72 + c * 8) = pos + _MEM_HEADER + csz;
+    return user;
 }
 
 // Allocate `size` bytes whose user pointer is a multiple of
 // `alignment`. `alignment` must be a power of two. Callers wanting
 // SIMD-friendly buffers typically pass 16 (NEON / SSE) or 32 (AVX).
+// Always uses the large (direct page) path; its marker is the total
+// size, so free / realloc treat it as large regardless of `size`.
 malloc_aligned(size, alignment) {
     auto raw, total, user;
     total = size + alignment + _MEM_HEADER;
@@ -51,26 +159,59 @@ malloc_aligned(size, alignment) {
 }
 
 // Release memory previously returned by malloc or malloc_aligned.
-// Safe to call with 0. Reads the back-pointer and total size from
-// the header.
+// Safe to call with 0.
 void free(p) {
-    auto raw, total;
+    auto raw, total, marker, c, z, csz;
     if (p == 0) { return; }
+    marker = *(p - 8);
+    // Small block. Under recycling, push onto its class free-list (the
+    // intrusive link lives in the user word; the header is preserved for
+    // re-pop). Under carve-only, freeing a small block is a no-op.
+    if (marker < _MEM_NUM_CLASSES) {
+        if (_MEM_REUSE != 0) {
+            c = marker;
+            // Debug mode stamps the whole freed block with a distinctive
+            // poison byte before parking it on the free-list, so a later
+            // read through a dangling pointer surfaces the poison rather
+            // than valid-looking leftover data. The intrusive free-list
+            // link is written last (on top of the first word), so the
+            // list itself stays intact under the poison.
+            if (_MEM_DEBUG != 0) {
+                csz = 16 << c;
+                z = 0;
+                while (z < csz) { poke(p + z, _MEM_POISON); z = z + 1; }
+            }
+            *p = *(_mem_bk + c * 8);
+            *(_mem_bk + c * 8) = p;
+        }
+        return;
+    }
+    // Large block → release the page region. marker is the total bytes.
     raw = *(p - _MEM_HEADER);
-    total = *(p - 8);
+    total = marker;
     _mem_free_pages(raw, total);
 }
 
-// Resize an existing allocation. On success returns the new
-// pointer (may differ from the old one). On failure returns 0 and
-// leaves the old block alive so the caller can recover.
+// Resize an existing allocation. On success returns the new pointer
+// (may differ from the old one). On failure returns 0 and leaves the
+// old block alive so the caller can recover.
 realloc(p, new_size) {
-    auto new_p, old_size, raw, total, limit;
+    auto new_p, old_size, raw, total, marker, limit, c;
     if (p == 0) { return malloc(new_size); }
-    raw = *(p - _MEM_HEADER);
-    total = *(p - 8);
-    // The user region runs from p up to the end of the allocation.
-    old_size = total - (p - raw);
+    marker = *(p - 8);
+    if (marker < _MEM_NUM_CLASSES) {
+        // Small block — usable size is its class size. If the new request
+        // still fits the same class, keep the block in place.
+        c = marker;
+        old_size = 16 << c;
+        if (new_size <= old_size) { return p; }
+    } else {
+        // Large block — usable size = total minus the header offset (which
+        // also accounts for malloc_aligned's slid user pointer).
+        raw = *(p - _MEM_HEADER);
+        total = marker;
+        old_size = total - (p - raw);
+    }
     new_p = malloc(new_size);
     if (new_p == 0) { return 0; }
     limit = old_size;
