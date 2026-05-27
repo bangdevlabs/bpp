@@ -196,6 +196,10 @@ sudo cp src/bug_brk.bsm "$LIB_DIR/"
 sudo cp src/bug_runviz.bsm "$LIB_DIR/"
 sudo cp src/bug_shared.bsm "$LIB_DIR/"
 sudo cp src/bug_tui.bsm "$LIB_DIR/"
+# bug_dump.bsm holds the .bug text-dump engine (dump_all + dump_*), extracted
+# from the_bug.bpp so both the GUI entry and the CLI entry (src/bug.bpp) share
+# it. Imported explicitly by both, so it must live next to the other bug_*.bsm.
+sudo cp src/bug_dump.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"

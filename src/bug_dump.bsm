@@ -1,0 +1,260 @@
+// bug_dump.bsm -- text dump of a parsed .bug debug map.
+//
+// Shared by both debugger entries: the CLI (src/bug.bpp, --dump mode) and the
+// GUI (tools/the_bug/the_bug.bpp). Extracted from the_bug.bpp so the dump
+// engine is reachable from a GUI-free entry that cross-compiles to Linux.
+// Pure read-side formatting: reads the parsed reader state (bug_* globals from
+// bug_reader) and writes via out_* (bug_shared). No GUI dependency.
+
+import "bpp_array.bsm";
+import "bug_reader.bsm";
+import "bug_shared.bsm";
+
+// -- Type name formatting -------------------------------------
+
+void out_type(ty) {
+    if (ty == 0x02) { out_str("word"); return; }
+    if (ty == 0x12) { out_str("half"); return; }
+    if (ty == 0x22) { out_str("quarter"); return; }
+    if (ty == 0x32) { out_str("byte"); return; }
+    if (ty == 0x03) { out_str("float"); return; }
+    if (ty == 0x13) { out_str("float_h"); return; }
+    if (ty == 0x23) { out_str("float_q"); return; }
+    if (ty == 0x33) { out_str("float_b"); return; }
+    if (ty == 0x04) { out_str("ptr"); return; }
+    if (ty == 0x08) { out_str("struct"); return; }
+    if (ty == 0x0C) { out_str("unknown"); return; }
+    if (ty == 0) { out_str("void"); return; }
+    out_str("ty:");
+    out_int(ty);
+}
+
+// -- Dump mode ------------------------------------------------
+// Print all debug info from a parsed .bug file.
+
+void dump_header() {
+    out_str("=== .bug Debug Map ===");
+    out_nl();
+    out_str("version: ");
+    out_int(bug_version);
+    out_str("  target: ");
+    if (bug_target == 0) { out_str("ARM64"); }
+    else { out_str("x86_64"); }
+    out_nl();
+    out_nl();
+}
+
+void dump_functions() {
+    auto i, j, pcnt, lcnt, pnames, ptypes, lnames, ltypes;
+    out_str("--- Functions (");
+    out_int(bug_fn_count);
+    out_str(") ---");
+    out_nl();
+
+    for (i = 0; i < bug_fn_count; i++) {
+        out_str("  ");
+        out_packed(arr_get(bug_fn_name, i));
+        out_str("(");
+
+        // Parameters.
+        pcnt = arr_get(bug_fn_pcnt, i);
+        pnames = arr_get(bug_fn_pnames, i);
+        ptypes = arr_get(bug_fn_ptypes, i);
+        for (j = 0; j < pcnt; j++) {
+            if (j > 0) { out_str(", "); }
+            out_packed(pnames[j]);
+            out_str(": ");
+            out_type(ptypes[j]);
+        }
+        out_str(") -> ");
+        out_type(arr_get(bug_fn_rtype, i));
+        out_nl();
+
+        // Locals.
+        lcnt = arr_get(bug_fn_lcnt, i);
+        lnames = arr_get(bug_fn_lnames, i);
+        ltypes = arr_get(bug_fn_ltypes, i);
+        if (lcnt > 0) {
+            out_str("    locals: ");
+            for (j = 0; j < lcnt; j++) {
+                if (j > 0) { out_str(", "); }
+                out_packed(lnames[j]);
+                out_str(": ");
+                out_type(ltypes[j]);
+            }
+            out_nl();
+        }
+    }
+    out_nl();
+}
+
+void dump_structs() {
+    auto i, j, fc, fnames, foffs, fsizes, ftypes;
+    if (bug_st_count == 0) { return; }
+    out_str("--- Structs (");
+    out_int(bug_st_count);
+    out_str(") ---");
+    out_nl();
+
+    for (i = 0; i < bug_st_count; i++) {
+        out_str("  struct ");
+        out_packed(arr_get(bug_st_name, i));
+        out_str(" (");
+        out_int(arr_get(bug_st_size, i));
+        out_str(" bytes)");
+        out_nl();
+
+        fc = arr_get(bug_st_fcnt, i);
+        fnames = arr_get(bug_st_fnames, i);
+        foffs = arr_get(bug_st_foffs, i);
+        fsizes = arr_get(bug_st_fsizes, i);
+        ftypes = arr_get(bug_st_ftypes, i);
+        for (j = 0; j < fc; j++) {
+            out_str("    +");
+            out_int(foffs[j]);
+            out_str("  ");
+            out_packed(fnames[j]);
+            out_str(" (");
+            out_int(fsizes[j]);
+            out_str("b ");
+            out_type(ftypes[j]);
+            out_str(")");
+            out_nl();
+        }
+    }
+    out_nl();
+}
+
+void dump_globals() {
+    auto i;
+    if (bug_gl_count == 0) { return; }
+    out_str("--- Globals (");
+    out_int(bug_gl_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_gl_count; i++) {
+        out_str("  ");
+        out_packed(arr_get(bug_gl_name, i));
+        out_str(": ");
+        out_type(arr_get(bug_gl_type, i));
+        // Storage class tag: [auto], [global], or [extrn].
+        auto _gc;
+        _gc = arr_get(bug_gl_class, i);
+        if (_gc == 0) { out_str(" [auto]"); }
+        if (_gc == 1) { out_str(" [global]"); }
+        if (_gc == 2) { out_str(" [extrn]"); }
+        out_nl();
+    }
+    out_nl();
+}
+
+void dump_externs() {
+    auto i, j, acnt, args;
+    if (bug_ex_count == 0) { return; }
+    out_str("--- Externs (");
+    out_int(bug_ex_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_ex_count; i++) {
+        out_str("  ");
+        out_packed(arr_get(bug_ex_name, i));
+        out_str(" [");
+        out_packed(arr_get(bug_ex_lib, i));
+        out_str("] -> ");
+        out_packed(arr_get(bug_ex_ret, i));
+        out_str("(");
+        acnt = arr_get(bug_ex_acnt, i);
+        args = arr_get(bug_ex_args, i);
+        for (j = 0; j < acnt; j++) {
+            if (j > 0) { out_str(", "); }
+            out_packed(args[j]);
+        }
+        out_str(")");
+        out_nl();
+    }
+    out_nl();
+}
+
+void dump_addrmap() {
+    auto i;
+    if (bug_am_count == 0) { return; }
+    out_str("--- Address Map (");
+    out_int(bug_am_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_am_count; i++) {
+        out_str("  ");
+        out_hex(arr_get(bug_am_off, i));
+        out_str("  ");
+        out_packed(arr_get(bug_am_name, i));
+        out_nl();
+    }
+    out_nl();
+}
+
+// Dump the source map — per-function line numbers relative to the
+// declaring module. Written to the .bug file by bpp_bug.bsm. A zero
+// value means the function came from a cached module with no live
+// token state; a non-zero value is the line where the function's
+// name appears in its source file.
+void dump_srcmap() {
+    auto i, fi, mi, pos;
+    if (bug_sm_count == 0) { return; }
+    out_str("--- Source Map (");
+    out_int(bug_sm_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_sm_count; i++) {
+        fi  = arr_get(bug_sm_fidx, i);
+        mi  = arr_get(bug_sm_midx, i);
+        pos = arr_get(bug_sm_pos, i);
+        out_str("  fn=");
+        out_int(fi);
+        out_str("  mod=");
+        out_int(mi);
+        out_str("  line=");
+        out_int(pos);
+        out_str("  ");
+        if (fi < bug_fn_count) { out_packed(arr_get(bug_fn_name, fi)); }
+        out_nl();
+    }
+    out_nl();
+}
+
+void dump_stackmap() {
+    auto i, j, fi, vcnt, voffs;
+    if (bug_sk_count == 0) { return; }
+    out_str("--- Stack Map (");
+    out_int(bug_sk_count);
+    out_str(") ---");
+    out_nl();
+    for (i = 0; i < bug_sk_count; i++) {
+        out_str("  ");
+        out_packed(arr_get(bug_sk_name, i));
+        out_str("  frame=");
+        out_int(arr_get(bug_sk_frame, i));
+        vcnt = arr_get(bug_sk_vcnt, i);
+        if (vcnt > 0) {
+            out_str("  vars=[");
+            voffs = arr_get(bug_sk_voffs, i);
+            for (j = 0; j < vcnt; j++) {
+                if (j > 0) { out_str(","); }
+                out_int(voffs[j]);
+            }
+            out_str("]");
+        }
+        out_nl();
+    }
+    out_nl();
+}
+
+void dump_all() {
+    dump_header();
+    dump_functions();
+    dump_structs();
+    dump_globals();
+    dump_externs();
+    dump_srcmap();
+    dump_addrmap();
+    dump_stackmap();
+}

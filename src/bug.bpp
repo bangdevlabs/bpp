@@ -1,0 +1,329 @@
+// bug.bpp -- CLI entry for the `bug` debugger (headless sibling of the GUI).
+//
+// `tools/the_bug/the_bug.bpp` is the GUI wrapper; this is the command-line
+// entry that drives the SAME engine (bug_reader / bug_observe_<os> / bug_tui /
+// bug_gdb). It imports ONLY the CLI modules — no stbwindow / stbdraw / stbui —
+// so it cross-compiles to Linux x86_64, where the Cocoa GUI cannot build. That
+// makes `bug` usable on Linux (and in Docker) for the first time: inspect a
+// .bug map (--dump, no ptrace needed) or observe a program under gdbserver
+// (--tui).
+//
+// Usage:
+//   bug --dump file.bug          dump the debug map to stdout (text)
+//   bug --tui ./program [args]   run + observe under debugserver/gdbserver
+//   bug --tui --break fn ./prog  break only on `fn`
+//   bug --tui --watch a,b ./prog watch names/expressions at every stop
+//
+// The dispatch + flag parsing below mirrors the CLI half of the_bug.bpp's
+// main(); the only thing dropped is the GUI path (_run_gui). When a follow-up
+// de-dups, both entries can share a `bug_cli_main()` — for now this is a
+// faithful, low-risk extraction so the GUI build stays untouched.
+
+import "bpp_array.bsm";
+import "bug_reader.bsm";
+import "bug_shared.bsm";
+import "bug_observe.bsm";     // resolves to bug_observe_<os>.bsm by target
+import "bug_viz.bsm";
+import "bug_eval.bsm";
+import "bug_brk.bsm";
+import "bug_runviz.bsm";
+import "bug_tui.bsm";
+import "bug_dump.bsm";     // .bug text-dump engine (shared with the_bug.bpp GUI)
+
+// Scratch path buffer this entry owns (same role as the_bug's static pathbuf).
+static auto pathbuf;
+
+// --break state, defined in bug_brk.bsm; bug_run reads it to decide selective
+// vs full tracing. flag_dump_str lives in bug_observe_<os>.bsm. flag_tui and
+// the watch_* globals come into scope via the bug_tui import.
+static extrn bp_names;
+static extrn bp_count;
+static extrn flag_break_all;
+extrn flag_dump_str;
+
+// Copy a NUL-terminated C string to dst. Returns length.
+copy_cstr(dst, src) {
+    auto i, ch;
+    i = 0;
+    ch = str_peek(src, i);
+    while (ch != 0) {
+        poke(dst + i, ch);
+        i++;
+        ch = str_peek(src, i);
+    }
+    poke(dst + i, 0);
+    return i;
+}
+
+// Returns 1 if `path` ends with ".bug".
+ends_with_bug(path) {
+    auto i, len;
+    len = 0;
+    i = str_peek(path, 0);
+    while (i != 0) { len++; i = str_peek(path, len); }
+    if (len < 4) { return 0; }
+    if (str_peek(path, len - 4) != '.') { return 0; }
+    if (str_peek(path, len - 3) != 'b') { return 0; }
+    if (str_peek(path, len - 2) != 'u') { return 0; }
+    if (str_peek(path, len - 1) != 'g') { return 0; }
+    return 1;
+}
+
+// Compare two NUL-terminated C strings. 1 if identical.
+static _cstr_eq(a, b) {
+    auto i, ca, cb;
+    i = 0;
+    ca = str_peek(a, 0);
+    cb = str_peek(b, 0);
+    while (ca == cb) {
+        if (ca == 0) { return 1; }
+        i++;
+        ca = str_peek(a, i);
+        cb = str_peek(b, i);
+    }
+    return 0;
+}
+
+// Returns 1 if C-string `s` contains byte `ch` before its NUL.
+static _cstr_has(s, ch) {
+    auto i, c;
+    i = 0;
+    c = str_peek(s, 0);
+    while (c != 0) {
+        if (c == ch) { return 1; }
+        i++;
+        c = str_peek(s, i);
+    }
+    return 0;
+}
+
+// -- Dump mode -- parse a .bug file and print every section to stdout.
+static _run_dump(bug_path) {
+    auto loaded, parsed;
+    copy_cstr(pathbuf, bug_path);
+    loaded = bug_load(pathbuf);
+    if (loaded < 0) {
+        out_str("error: cannot open "); out_str(bug_path); out_nl();
+        return 1;
+    }
+    parsed = bug_parse();
+    if (parsed == -1) {
+        out_str("error: invalid .bug file (bad magic)"); out_nl();
+        return 1;
+    }
+    if (parsed == -2) {
+        out_str("error: "); out_str(bug_path);
+        out_str(" is an older .bug format; recompile with current bpp"); out_nl();
+        return 1;
+    }
+    if (parsed < 0) {
+        out_str("error: failed to parse "); out_str(bug_path); out_nl();
+        return 1;
+    }
+    out_str("loaded "); out_int(loaded); out_str(" bytes from ");
+    out_str(bug_path); out_nl(); out_nl();
+    dump_all();
+    return 0;
+}
+
+// -- TUI / observe mode -- launch the target under debugserver/gdbserver and
+// observe. Loads <target>.bug for enhanced info when present + build-id-matched.
+static _run_tui(target_path_arg, target_idx, nargs) {
+    auto len, loaded, target_path;
+    len = copy_cstr(pathbuf, target_path_arg);
+    poke(pathbuf + len,     '.');
+    poke(pathbuf + len + 1, 'b');
+    poke(pathbuf + len + 2, 'u');
+    poke(pathbuf + len + 3, 'g');
+    poke(pathbuf + len + 4, 0);
+
+    loaded = bug_load(pathbuf);
+    if (loaded >= 0) {
+        if (bug_parse() >= 0) {
+            auto _match;
+            _match = bug_reader_match_binary(target_path_arg);
+            if (_match == 0) {
+                out_str("bug: stale .bug for "); out_str(target_path_arg); out_nl();
+                out_str("     expected build_id ");
+                out_hex(bug_build_id_lo); out_ch(' ');
+                out_hex(bug_build_id_hi); out_nl();
+                out_str("     binary has    ");
+                out_hex(bug_bin_build_id_lo); out_ch(' ');
+                out_hex(bug_bin_build_id_hi); out_nl();
+                out_str("     recompile to regenerate."); out_nl();
+                return 1;
+            }
+            if (_match == -2) {
+                out_str("bug: binary lacks build_id metadata; recompile with current bpp.");
+                out_nl();
+                return 1;
+            }
+            out_str("bug: loaded .bug debug map (");
+            out_int(bug_fn_count);
+            out_str(" functions)"); out_nl();
+            viz_replay_hints();
+            if (bug_vh_count > 0) {
+                out_str("bug: loaded "); out_int(bug_vh_count);
+                out_str(" @viz hint(s)"); out_nl();
+            }
+        }
+    }
+
+    target_path = malloc(4096);
+    copy_cstr(target_path, target_path_arg);
+    bug_run(target_path, target_idx, nargs, bp_names, bp_count, flag_break_all);
+    return 0;
+}
+
+// Print CLI usage to stderr (replaces the GUI's file dialog in this entry).
+static _usage() {
+    putstr_err("bug -- CLI debugger (headless). No GUI in this build.\n");
+    putstr_err("usage:\n");
+    putstr_err("  bug --dump file.bug          dump the debug map (text)\n");
+    putstr_err("  bug --tui ./program [args]   run + observe under gdbserver\n");
+    putstr_err("  bug --tui --break fn ./prog  break only on function fn\n");
+    putstr_err("  bug --tui --watch a,b ./prog watch names/expressions\n");
+    putstr_err("(for the windowed inspector use the GUI build, macOS only)\n");
+}
+
+main() {
+    auto nargs, arg, target_idx;
+    auto flag_dump;
+
+    pathbuf = malloc(4096);
+    bp_names = buf_word(32);
+    bp_count = 0;
+    flag_break_all = 0;
+    flag_dump_str  = 0;
+    watch_names    = buf_word(32);
+    watch_asts     = buf_word(32);
+    watch_count    = 0;
+    flag_tui       = 0;
+    flag_dump      = 0;
+
+    init_array();
+    init_reader();
+    init_bug_shared();
+    init_observe();
+    init_bug_brk();
+    init_bug_runviz();
+
+    nargs = argc_get();
+    if (nargs < 2) { _usage(); return 1; }
+
+    // Parse flags. The first non-flag argument is the target; everything
+    // after it is forwarded to the target.
+    target_idx = 1;
+    auto _done;
+    _done = 0;
+    while (_done == 0) {
+        if (target_idx >= nargs) { _done = 1; }
+        else {
+            arg = argv_get(target_idx);
+            if (_cstr_eq(arg, "--break")) {
+                if (target_idx + 1 >= nargs) {
+                    out_str("bug: --break requires a function name"); out_nl();
+                    return 1;
+                }
+                if (bp_count >= 32) {
+                    out_str("bug: too many --break flags (max 32)"); out_nl();
+                    return 1;
+                }
+                auto spec;
+                spec = argv_get(target_idx + 1);
+                if (_cstr_has(spec, ':')) {
+                    out_str("bug: `name:line` breakpoints are not yet implemented"); out_nl();
+                    return 1;
+                }
+                *(bp_names + bp_count * 8) = spec;
+                bp_count++;
+                target_idx += 2;
+            } else if (_cstr_eq(arg, "--break-all")) {
+                flag_break_all = 1;
+                target_idx++;
+            } else if (_cstr_eq(arg, "--tui")) {
+                flag_tui = 1;
+                target_idx++;
+            } else if (_cstr_eq(arg, "--dump")) {
+                flag_dump = 1;
+                target_idx++;
+            } else if (_cstr_eq(arg, "--dump-str")) {
+                flag_dump_str = 1;
+                target_idx++;
+            } else if (_cstr_eq(arg, "--watch")) {
+                if (target_idx + 1 >= nargs) {
+                    out_str("bug: --watch requires a comma-separated name list"); out_nl();
+                    return 1;
+                }
+                auto wspec, wdup, wlen, wp, wstart;
+                wspec  = argv_get(target_idx + 1);
+                wdup   = str_dup(wspec);
+                wlen   = str_len(wdup);
+                wstart = wdup;
+                for (wp = 0; wp <= wlen; wp++) {
+                    auto wc;
+                    wc = peek(wdup + wp);
+                    if (wc == 44 || wc == 0) {
+                        poke(wdup + wp, 0);
+                        if (wdup + wp > wstart) {
+                            *(watch_names + watch_count * 8) = wstart;
+                            auto _seg_len, _ci, _is_expr, _ch;
+                            _seg_len = wdup + wp - wstart;
+                            _is_expr = 0;
+                            for (_ci = 0; _ci < _seg_len; _ci++) {
+                                _ch = peek(wstart + _ci);
+                                if (_ch == '.') { _is_expr = 1; }
+                                if (_ch == '[') { _is_expr = 1; }
+                                if (_ch == '*') { _is_expr = 1; }
+                                if (_ch == '+') { _is_expr = 1; }
+                                if (_ch == '-') { _is_expr = 1; }
+                                if (_ch == ' ') { _is_expr = 1; }
+                            }
+                            if (_is_expr) {
+                                auto _ast;
+                                _ast = bug_eval_parse(wstart, _seg_len);
+                                if (_ast == 0) {
+                                    out_str("bug: failed to parse --watch expression"); out_nl();
+                                    return 1;
+                                }
+                                *(watch_asts + watch_count * 8) = _ast;
+                            }
+                            watch_count++;
+                        }
+                        wstart = wdup + wp + 1;
+                    }
+                }
+                target_idx += 2;
+            } else {
+                _done = 1;
+            }
+        }
+    }
+
+    // Dispatch on the positional argument + flags.
+    //   (no positional)        -> usage error (GUI file dialog is GUI-only)
+    //   foo.bug                -> _run_dump (text; CLI has no window)
+    //   ./binary  --tui        -> _run_tui  (observe)
+    //   ./binary  (no --tui)   -> error
+    if (target_idx >= nargs) { _usage(); return 1; }
+
+    arg = argv_get(target_idx);
+
+    if (ends_with_bug(arg)) {
+        // A .bug file always dumps in the CLI (no GUI to open).
+        return _run_dump(arg);
+    }
+
+    if (flag_dump) {
+        out_str("bug: --dump expects a .bug file, got '");
+        out_str(arg); out_str("'"); out_nl();
+        return 1;
+    }
+    if (flag_tui == 0) {
+        out_str("bug: '"); out_str(arg);
+        out_str("' is not a .bug file. Use --tui to debug a program."); out_nl();
+        return 1;
+    }
+
+    return _run_tui(arg, target_idx, nargs);
+}

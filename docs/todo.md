@@ -136,6 +136,16 @@ va
            printf-bisect alone hits the heisenbug wall.
        (This SIGSEGV also blocks a Linux-native bootstrap — bpp
        cannot run on Linux to self-host until it is fixed.)
+         - CORROBORATION 2026-05-27: it is NOT bpp-specific. The
+           CLI debugger `bug` cross-compiled to Linux (bug_lin)
+           does NOT crash but reads `argc_get() == 0` (sees zero
+           args), while the small test_linux_argv reads argc
+           correctly. So TWO large x64 binaries now show startup
+           corruption (bpp_lin → SIGSEGV, bug_lin → argc=0), small
+           ones are fine → a scale-dependent x64 STARTUP / global-
+           access codegen bug (brt0 / _core_linux argc store, or
+           large-binary global addressing). Best lead yet: diff the
+           startup codegen of a small vs a large x64 binary.
     3. ⏸️ Phase B1 (freelist register alloc) x86_64 emission
        bug — disabled since 2026-04-15 (`19da538`). Manifests
        under self-host on a fresh `_x64_has_call` recursion

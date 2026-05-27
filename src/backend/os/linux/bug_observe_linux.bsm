@@ -428,7 +428,39 @@ _print_crash_locals(fi, text_base) {
 
 // -- Main runner -------------------------------------------------
 
-bug_run(target_path, start_idx, argc) {
+// Compare a NUL-terminated C string against a packed name in the bug_reader
+// string buffer (_br_strbuf). Returns 1 if equal. Ported from the macOS
+// observer so the Linux --break resolver matches macOS byte-for-byte.
+_cstr_eq_packed(cstr, packed) {
+    auto s, l, i, pch, cch;
+    l = packed / 0x100000000;
+    s = packed % 0x100000000;
+    for (i = 0; i < l; i++) {
+        cch = str_peek(cstr, i);
+        if (cch == 0) { return 0; }
+        pch = peek(_br_strbuf + s + i);
+        if (pch != cch) { return 0; }
+    }
+    if (str_peek(cstr, l) != 0) { return 0; }
+    return 1;
+}
+
+// Resolve a --break function name (argv C-string) to an absolute text-section
+// address, or 0 when the name is not in the address map. Ported from macOS.
+_resolve_break_cstr(cstr, text_base) {
+    auto i;
+    for (i = 0; i < bug_am_count; i++) {
+        if (_cstr_eq_packed(cstr, arr_get(bug_am_name, i))) {
+            return text_base + arr_get(bug_am_off, i);
+        }
+    }
+    return 0;
+}
+
+// Run the target under gdbserver and observe. Signature matches the macOS
+// observer (selective --break support): bp_names / bp_count / flag_break_all
+// decide whether to break only on named functions or trace every entry.
+bug_run(target_path, start_idx, argc, bp_names, bp_count, flag_break_all) {
     auto ret, sig, pc, fi, i;
     auto text_base, retries;
     auto call_depth, has_bug;
@@ -472,22 +504,50 @@ bug_run(target_path, start_idx, argc) {
     gdb_handshake();
     gdb_query_stop();
 
-    // Set breakpoints at all function entry points.
-    auto bp_count;
-    bp_count = 0;
-    for (i = 0; i < bug_am_count; i++) {
-        auto addr;
-        addr = text_base + arr_get(bug_am_off, i);
-        ret = gdb_set_bp(addr);
-        if (ret == 0) { bp_count++; }
+    // Set breakpoints. Three modes (matches the macOS observer):
+    //   1. --break <fn> (bp_count > 0, !flag_break_all): only the named fns.
+    //   2. --break + --break-all: selective highlights inside the full trace.
+    //   3. no --break: trace every function entry (legacy default).
+    auto bp_set, _mode;
+    bp_set = 0;
+    _mode = 0;
+    if (bp_count > 0) {
+        if (flag_break_all) { _mode = 2; } else { _mode = 1; }
+    }
+    if (_mode == 1 || _mode == 2) {
+        auto _bi, _spec, _addr;
+        for (_bi = 0; _bi < bp_count; _bi++) {
+            _spec = *(bp_names + _bi * 8);
+            _addr = _resolve_break_cstr(_spec, text_base);
+            if (_addr == 0) {
+                out_str("bug: --break `");
+                auto _ci, _cch;
+                _ci = 0; _cch = str_peek(_spec, 0);
+                while (_cch != 0) { out_ch(_cch); _ci++; _cch = str_peek(_spec, _ci); }
+                out_str("` -- no function by that name in the binary"); out_nl();
+            } else {
+                ret = gdb_set_bp(_addr);
+                if (ret == 0) { bp_set++; }
+            }
+        }
+    }
+    if (_mode == 0 || _mode == 2) {
+        for (i = 0; i < bug_am_count; i++) {
+            auto addr;
+            addr = text_base + arr_get(bug_am_off, i);
+            ret = gdb_set_bp(addr);
+            if (ret == 0) { bp_set++; }
+        }
     }
 
     out_str("bug: ");
-    out_int(bp_count);
+    out_int(bp_set);
     out_str("/");
     out_int(bug_am_count);
     out_str(" breakpoints");
-    if (has_bug) { out_str(" (filtered)"); }
+    if (_mode == 1)      { out_str(" (selective)"); }
+    else if (_mode == 2) { out_str(" (selective + all)"); }
+    else if (has_bug)    { out_str(" (filtered)"); }
     out_nl();
 
     // Main debug loop with call depth tracking.
