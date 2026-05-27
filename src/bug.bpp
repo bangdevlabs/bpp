@@ -29,6 +29,7 @@ import "bug_brk.bsm";
 import "bug_runviz.bsm";
 import "bug_tui.bsm";
 import "bug_dump.bsm";     // .bug text-dump engine (shared with the_bug.bpp GUI)
+import "bug_disasm.bsm";   // x86-64 disassembler for --disasm (objdump-in-bug)
 
 // Scratch path buffer this entry owns (same role as the_bug's static pathbuf).
 static auto pathbuf;
@@ -184,53 +185,52 @@ static _hex2(b) {
     out_ch(lo < 10 ? lo + '0' : lo - 10 + 'a');
 }
 
-// -- `bug --bytes <binary> <fn>`: hexdump a function's machine code ----------
-// The foundation of an in-bug objdump. Reads the binary file, finds <fn> via
-// the .bug address map, maps the text-relative offset to a file position with
-// a minimal ELF64 parse, then hexdumps the code. This is the headless,
-// no-ptrace way to inspect what the compiler actually emitted -- exactly what
-// the Linux x64 startup hunt needs (compare a small vs a large binary's
-// `main` prologue). ELF only for now (the Linux target); Mach-O + a real
-// `--disasm` decoder are the next steps on this same module.
-static _run_bytes(bin_path, fn_name) {
-    auto fd, blen, bbuf, i;
-    auto phoff, phentsize, phnum, ph, ptype, note_off, note_fsz, code_base;
-    auto fn_off, file_pos, j, b, plen;
+// Shared results of _bx_locate: the loaded binary buffer, the target
+// function's code-relative offset, and its byte offset in the file.
+static auto _bx_buf;
+static auto _bx_fnoff;
+static auto _bx_filepos;
+
+// Open `bin_path`, read it, parse its ELF program headers to find the code
+// section's file offset, load `<bin_path>.bug`, and locate `fn_name` in the
+// address map. On success returns 0 and sets _bx_buf / _bx_fnoff / _bx_filepos.
+// On any failure prints a message and returns 1. Shared by --bytes + --disasm.
+//
+// Code-base derivation: B++ lays the exec segment out as [ELF header][program
+// headers][PT_NOTE (build_id + minisym)][code], and the exec PT_LOAD has
+// p_offset 0 -- so the code section starts where PT_NOTE ends, and a function
+// at address-map offset N sits at file offset code_base + N. This is exact
+// (verified against every function in small and large binaries). NB: do NOT
+// anchor on e_entry; it points at the entry trampoline appended after main,
+// not at the address-map `main` entry.
+static _bx_locate(bin_path, fn_name) {
+    auto fd, blen, i, phoff, phentsize, phnum, ph, ptype, note_off, note_fsz, code_base, plen;
 
     fd = sys_open(bin_path, 0);
     if (fd < 0) { out_str("bug: cannot open "); out_str(bin_path); out_nl(); return 1; }
-    bbuf = malloc(16777216);
-    blen = sys_read(fd, bbuf, 16777216);
+    _bx_buf = malloc(16777216);
+    blen = sys_read(fd, _bx_buf, 16777216);
     sys_close(fd);
     if (blen <= 0) { out_str("bug: empty / short read"); out_nl(); return 1; }
 
-    // Minimal ELF64 parse to find where the code section begins in the file.
-    // B++ lays the exec segment out as [ELF header][program headers][PT_NOTE
-    // (build_id + minisym)][code], and the exec PT_LOAD has p_offset 0 -- so the
-    // code section starts at the file offset where the PT_NOTE segment ends, and
-    // a function at address-map offset N sits at file offset code_base + N. This
-    // is exact (verified against every function in small and large binaries);
-    // anchoring on e_entry is WRONG because e_entry points at the entry
-    // trampoline appended after main, not at the address-map `main` entry.
-    if (peek(bbuf) != 0x7F) {
-        out_str("bug --bytes: ELF only for now (Mach-O is a follow-on)"); out_nl();
+    if (peek(_bx_buf) != 0x7F) {
+        out_str("bug: ELF only for now (Mach-O is a follow-on)"); out_nl();
         return 1;
     }
-    phoff     = read_u32(bbuf, 0x20);    // e_phoff
-    phentsize = read_u16(bbuf, 0x36);
-    phnum     = read_u16(bbuf, 0x38);
+    phoff     = read_u32(_bx_buf, 0x20);    // e_phoff
+    phentsize = read_u16(_bx_buf, 0x36);
+    phnum     = read_u16(_bx_buf, 0x38);
     note_off = 0; note_fsz = 0;
     for (i = 0; i < phnum; i++) {
         ph = phoff + i * phentsize;
-        ptype = read_u32(bbuf, ph);
+        ptype = read_u32(_bx_buf, ph);
         if (ptype == 4) {                          // PT_NOTE
-            note_off = read_u32(bbuf, ph + 8);     // p_offset
-            note_fsz = read_u32(bbuf, ph + 32);    // p_filesz
+            note_off = read_u32(_bx_buf, ph + 8);     // p_offset
+            note_fsz = read_u32(_bx_buf, ph + 32);    // p_filesz
         }
     }
     code_base = note_off + note_fsz;
 
-    // Load <binary>.bug and find the function in the address map.
     plen = copy_cstr(pathbuf, bin_path);
     poke(pathbuf + plen, '.'); poke(pathbuf + plen + 1, 'b');
     poke(pathbuf + plen + 2, 'u'); poke(pathbuf + plen + 3, 'g');
@@ -238,26 +238,42 @@ static _run_bytes(bin_path, fn_name) {
     if (bug_load(pathbuf) < 0) { out_str("bug: cannot load "); out_str(pathbuf); out_nl(); return 1; }
     if (bug_parse() < 0)       { out_str("bug: bad .bug map"); out_nl(); return 1; }
 
-    // Locate the target function in the address map; its offset is code-relative.
-    fn_off = 0 - 1;
+    _bx_fnoff = 0 - 1;
     for (i = 0; i < bug_am_count; i++) {
-        if (_cstr_eq_packed(fn_name, arr_get(bug_am_name, i))) { fn_off = arr_get(bug_am_off, i); }
+        if (_cstr_eq_packed(fn_name, arr_get(bug_am_name, i))) { _bx_fnoff = arr_get(bug_am_off, i); }
     }
-    if (fn_off < 0) { out_str("bug: no function '"); out_str(fn_name); out_str("' in the map"); out_nl(); return 1; }
+    if (_bx_fnoff < 0) { out_str("bug: no function '"); out_str(fn_name); out_str("' in the map"); out_nl(); return 1; }
+    _bx_filepos = code_base + _bx_fnoff;
+    return 0;
+}
 
-    file_pos = code_base + fn_off;
-
+// -- `bug --bytes <binary> <fn>`: hexdump a function's machine code ----------
+static _run_bytes(bin_path, fn_name) {
+    auto i, j, b;
+    if (_bx_locate(bin_path, fn_name)) { return 1; }
     out_str("--- bytes: "); out_str(fn_name);
-    out_str("  (text+"); out_hex(fn_off);
-    out_str(", file "); out_hex(file_pos); out_str(") ---"); out_nl();
+    out_str("  (text+"); out_hex(_bx_fnoff);
+    out_str(", file "); out_hex(_bx_filepos); out_str(") ---"); out_nl();
     for (i = 0; i < 128; i += 16) {
-        out_str("  +"); out_hex(fn_off + i); out_str(":  ");
+        out_str("  +"); out_hex(_bx_fnoff + i); out_str(":  ");
         for (j = 0; j < 16; j++) {
-            b = peek(bbuf + file_pos + i + j) & 0xFF;
+            b = peek(_bx_buf + _bx_filepos + i + j) & 0xFF;
             _hex2(b); out_ch(' ');
         }
         out_nl();
     }
+    return 0;
+}
+
+// -- `bug --disasm <binary> <fn>`: disassemble a function (objdump-in-bug) ----
+// Decodes the x86-64 subset the B++ backend emits (see bug_disasm.bsm), so a
+// codegen bug -- a reversed operand, a wild displacement -- reads off the
+// screen instead of being hand-decoded from a hexdump.
+static _run_disasm(bin_path, fn_name) {
+    if (_bx_locate(bin_path, fn_name)) { return 1; }
+    out_str("--- disasm: "); out_str(fn_name);
+    out_str("  (text+"); out_hex(_bx_fnoff); out_str(") ---"); out_nl();
+    disasm_range(_bx_buf, _bx_filepos, _bx_fnoff, 192);
     return 0;
 }
 
@@ -270,6 +286,7 @@ static _usage() {
     putstr_err("  bug --tui --break fn ./prog  break only on function fn\n");
     putstr_err("  bug --tui --watch a,b ./prog watch names/expressions\n");
     putstr_err("  bug --bytes ./prog fn        hexdump fn's machine code (ELF)\n");
+    putstr_err("  bug --disasm ./prog fn       disassemble fn (x86-64, ELF)\n");
     putstr_err("(for the windowed inspector use the GUI build, macOS only)\n");
 }
 
@@ -307,6 +324,13 @@ main() {
             return 1;
         }
         return _run_bytes(argv_get(2), argv_get(3));
+    }
+    if (_cstr_eq(argv_get(1), "--disasm")) {
+        if (nargs < 4) {
+            out_str("bug: --disasm requires <binary> <function>"); out_nl();
+            return 1;
+        }
+        return _run_disasm(argv_get(2), argv_get(3));
     }
 
     // Parse flags. The first non-flag argument is the target; everything

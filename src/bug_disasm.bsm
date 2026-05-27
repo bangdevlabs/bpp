@@ -1,0 +1,355 @@
+// bug_disasm.bsm -- a minimal x86-64 disassembler for the `bug` debugger.
+//
+// This is "objdump inside bug": it decodes the SUBSET of x86-64 that the B++
+// backend emits -- enough to read a function's codegen and spot operand-order
+// bugs (e.g. `sub rax, rcx` computing `16 - arr` instead of `arr - 16`) and
+// wild addresses without leaving the toolchain. It is NOT a complete x86
+// decoder; anything outside the backend's instruction vocabulary prints as
+// `.byte 0xNN` so the stream stays aligned-ish and the reader sees the gap.
+//
+// Entry point: disasm_range(buf, start_fp, disp_off, nbytes) decodes
+// instructions starting at file offset start_fp in `buf`, displaying each
+// instruction's offset as disp_off + (fp - start_fp) -- so the labels match
+// the .bug address map's code-relative coordinate. Used by `bug --disasm`.
+//
+// Register naming is always 64-bit (rax..r15); operand WIDTH is not rendered
+// because for codegen debugging the register identity and the operand
+// DIRECTION are what matter, not whether a move was 32 or 64 bits wide.
+
+import "bug_shared.bsm";
+
+// ── small print helpers ──────────────────────────────────────
+
+// Print n as minimal-width lowercase hex digits (no 0x prefix).
+static _dhx(n) {
+    auto d;
+    if (n >= 16) { _dhx(n / 16); }
+    d = n - (n / 16) * 16;
+    if (d < 10) { out_ch(d + '0'); }
+    else { out_ch(d - 10 + 'a'); }
+}
+
+// Print "0x<hex>".
+static _dh(n) {
+    out_str("0x");
+    _dhx(n);
+}
+
+// Print a signed displacement as "+0x.." or "-0x..".
+static _sdisp(d) {
+    if (d < 0) { out_str("-0x"); _dhx(0 - d); }
+    else        { out_str("+0x"); _dhx(d); }
+}
+
+// Read a signed little-endian 32-bit value at buf+off.
+static _rd32s(buf, off) {
+    auto v;
+    v = (peek(buf + off) & 0xFF)
+      | ((peek(buf + off + 1) & 0xFF) << 8)
+      | ((peek(buf + off + 2) & 0xFF) << 16)
+      | ((peek(buf + off + 3) & 0xFF) << 24);
+    if (v >= 0x80000000) { v = v - 4294967296; }   // sign-extend to 64-bit
+    return v;
+}
+
+// Print a 64-bit register name for index r (0..15).
+static _drn(r) {
+    if (r == 0)  { out_str("rax"); return 0; }
+    if (r == 1)  { out_str("rcx"); return 0; }
+    if (r == 2)  { out_str("rdx"); return 0; }
+    if (r == 3)  { out_str("rbx"); return 0; }
+    if (r == 4)  { out_str("rsp"); return 0; }
+    if (r == 5)  { out_str("rbp"); return 0; }
+    if (r == 6)  { out_str("rsi"); return 0; }
+    if (r == 7)  { out_str("rdi"); return 0; }
+    if (r == 8)  { out_str("r8");  return 0; }
+    if (r == 9)  { out_str("r9");  return 0; }
+    if (r == 10) { out_str("r10"); return 0; }
+    if (r == 11) { out_str("r11"); return 0; }
+    if (r == 12) { out_str("r12"); return 0; }
+    if (r == 13) { out_str("r13"); return 0; }
+    if (r == 14) { out_str("r14"); return 0; }
+    out_str("r15");
+    return 0;
+}
+
+// Print a condition-code suffix for a setcc/jcc tttn nibble.
+static _dcc(cc) {
+    if (cc == 0x2) { out_str("b");  return 0; }
+    if (cc == 0x3) { out_str("ae"); return 0; }
+    if (cc == 0x4) { out_str("e");  return 0; }
+    if (cc == 0x5) { out_str("ne"); return 0; }
+    if (cc == 0x6) { out_str("be"); return 0; }
+    if (cc == 0x7) { out_str("a");  return 0; }
+    if (cc == 0x8) { out_str("s");  return 0; }
+    if (cc == 0x9) { out_str("ns"); return 0; }
+    if (cc == 0xC) { out_str("l");  return 0; }
+    if (cc == 0xD) { out_str("ge"); return 0; }
+    if (cc == 0xE) { out_str("le"); return 0; }
+    if (cc == 0xF) { out_str("g");  return 0; }
+    out_str("?");
+    return 0;
+}
+
+// Print the r/m operand of a ModRM byte at file offset mp, and return the
+// number of bytes the ModRM (+SIB +displacement) occupies. rexB extends the
+// rm register field. Covers the addressing modes the B++ backend emits:
+// direct register, [reg], [reg+disp8], [reg+disp32], and [rip+disp32]; a SIB
+// byte is rendered as "[sib...]" since the backend rarely emits one.
+static _dis_rm(buf, mp, rexB) {
+    auto modrm, mod, rm3, rm, disp;
+    modrm = peek(buf + mp) & 0xFF;
+    mod = (modrm >> 6) & 3;
+    rm3 = modrm & 7;
+    rm  = rm3 | (rexB << 3);
+
+    if (mod == 3) { _drn(rm); return 1; }
+
+    if (mod == 0) {
+        if (rm3 == 5) {                       // RIP + disp32
+            disp = _rd32s(buf, mp + 1);
+            out_str("[rip"); _sdisp(disp); out_str("]");
+            return 5;
+        }
+        if (rm3 == 4) { out_str("[sib]"); return 2; }
+        out_str("["); _drn(rm); out_str("]");
+        return 1;
+    }
+    if (mod == 1) {                           // [reg + disp8]
+        disp = peek(buf + mp + 1) & 0xFF;
+        if (disp >= 128) { disp = disp - 256; }
+        out_str("["); _drn(rm); _sdisp(disp); out_str("]");
+        return 2;
+    }
+    // mod == 2 : [reg + disp32]
+    disp = _rd32s(buf, mp + 1);
+    out_str("["); _drn(rm); _sdisp(disp); out_str("]");
+    return 5;
+}
+
+// Decode ONE instruction at file offset fp, displaying it at code-relative
+// offset show_off. Prints the line and returns the instruction's byte length.
+// Unknown opcodes print ".byte 0xNN" and return 1 so the caller can resync.
+static _dis1(buf, fp, show_off) {
+    auto p, rexR, rexB, b, op, m, dir, mp, modrm, reg, rmlen, imm, rr, op2, rel, l;
+    p = fp;
+    rexR = 0; rexB = 0;
+
+    out_str("  +"); _dhx(show_off); out_str(":  ");
+
+    b = peek(buf + p) & 0xFF;
+    if (b >= 0x40 && b <= 0x4F) {             // REX prefix
+        rexR = (b >> 2) & 1;
+        rexB = b & 1;
+        p = p + 1;
+        b = peek(buf + p) & 0xFF;
+    }
+    op = b;
+
+    // push / pop r64
+    if (op >= 0x50 && op <= 0x57) { out_str("push "); _drn((op - 0x50) | (rexB << 3)); out_nl(); return (p - fp) + 1; }
+    if (op >= 0x58 && op <= 0x5F) { out_str("pop  "); _drn((op - 0x58) | (rexB << 3)); out_nl(); return (p - fp) + 1; }
+
+    // ALU / mov / lea : OP r/m, reg  (or reg, r/m when dir == 1)
+    m = 0; dir = 0;
+    if (op == 0x01) { m = "add"; }
+    if (op == 0x29) { m = "sub"; }
+    if (op == 0x21) { m = "and"; }
+    if (op == 0x09) { m = "or";  }
+    if (op == 0x31) { m = "xor"; }
+    if (op == 0x39) { m = "cmp"; }
+    if (op == 0x85) { m = "test"; }
+    if (op == 0x89) { m = "mov"; }
+    if (op == 0x8B) { m = "mov"; dir = 1; }
+    if (op == 0x8D) { m = "lea"; dir = 1; }
+    if (op == 0x3B) { m = "cmp"; dir = 1; }
+    if (m != 0) {
+        mp = p + 1;
+        modrm = peek(buf + mp) & 0xFF;
+        reg = ((modrm >> 3) & 7) | (rexR << 3);
+        out_str(m); out_str(" ");
+        if (dir == 1) {
+            _drn(reg); out_str(", ");
+            rmlen = _dis_rm(buf, mp, rexB);
+        } else {
+            rmlen = _dis_rm(buf, mp, rexB);
+            out_str(", "); _drn(reg);
+        }
+        out_nl();
+        return (p - fp) + 1 + rmlen;
+    }
+
+    // F7 group : /2 not  /3 neg  /4 mul  /5 imul  /6 div  /7 idiv
+    if (op == 0xF7) {
+        mp = p + 1;
+        modrm = peek(buf + mp) & 0xFF;
+        reg = (modrm >> 3) & 7;
+        m = "?";
+        if (reg == 2) { m = "not";  }
+        if (reg == 3) { m = "neg";  }
+        if (reg == 4) { m = "mul";  }
+        if (reg == 5) { m = "imul"; }
+        if (reg == 6) { m = "div";  }
+        if (reg == 7) { m = "idiv"; }
+        out_str(m); out_str(" ");
+        rmlen = _dis_rm(buf, mp, rexB);
+        out_nl();
+        return (p - fp) + 1 + rmlen;
+    }
+
+    // D3 group : shift by CL  ( /4 shl  /5 shr  /7 sar )
+    if (op == 0xD3) {
+        mp = p + 1;
+        modrm = peek(buf + mp) & 0xFF;
+        reg = (modrm >> 3) & 7;
+        m = "shl";
+        if (reg == 5) { m = "shr"; }
+        if (reg == 7) { m = "sar"; }
+        out_str(m); out_str(" ");
+        rmlen = _dis_rm(buf, mp, rexB);
+        out_str(", cl");
+        out_nl();
+        return (p - fp) + 1 + rmlen;
+    }
+
+    // C1 group : shift by imm8
+    if (op == 0xC1) {
+        mp = p + 1;
+        modrm = peek(buf + mp) & 0xFF;
+        reg = (modrm >> 3) & 7;
+        m = "shl";
+        if (reg == 5) { m = "shr"; }
+        if (reg == 7) { m = "sar"; }
+        out_str(m); out_str(" ");
+        rmlen = _dis_rm(buf, mp, rexB);
+        imm = peek(buf + mp + rmlen) & 0xFF;
+        out_str(", "); _dh(imm);
+        out_nl();
+        return (p - fp) + 1 + rmlen + 1;
+    }
+
+    // 81 / 83 group : OP r/m, imm32 / imm8  ( /0 add /1 or /4 and /5 sub /6 xor /7 cmp )
+    if (op == 0x81 || op == 0x83) {
+        mp = p + 1;
+        modrm = peek(buf + mp) & 0xFF;
+        reg = (modrm >> 3) & 7;
+        m = "?";
+        if (reg == 0) { m = "add"; }
+        if (reg == 1) { m = "or";  }
+        if (reg == 4) { m = "and"; }
+        if (reg == 5) { m = "sub"; }
+        if (reg == 6) { m = "xor"; }
+        if (reg == 7) { m = "cmp"; }
+        out_str(m); out_str(" ");
+        rmlen = _dis_rm(buf, mp, rexB);
+        if (op == 0x83) {
+            imm = peek(buf + mp + rmlen) & 0xFF;
+            if (imm >= 128) { imm = imm - 256; }
+            out_str(", "); _sdisp(imm);
+            out_nl();
+            return (p - fp) + 1 + rmlen + 1;
+        }
+        imm = _rd32s(buf, mp + rmlen);
+        out_str(", "); _sdisp(imm);
+        out_nl();
+        return (p - fp) + 1 + rmlen + 4;
+    }
+
+    // C7 /0 : mov r/m, imm32
+    if (op == 0xC7) {
+        mp = p + 1;
+        out_str("mov ");
+        rmlen = _dis_rm(buf, mp, rexB);
+        imm = _rd32s(buf, mp + rmlen);
+        out_str(", "); _sdisp(imm);
+        out_nl();
+        return (p - fp) + 1 + rmlen + 4;
+    }
+
+    // B8+r : mov r, imm  (imm32 zero-extended; the backend does not emit
+    // the 8-byte REX.W imm64 form, so only the 4-byte case is handled).
+    if (op >= 0xB8 && op <= 0xBF) {
+        rr = (op - 0xB8) | (rexB << 3);
+        imm = (peek(buf + p + 1) & 0xFF)
+            | ((peek(buf + p + 2) & 0xFF) << 8)
+            | ((peek(buf + p + 3) & 0xFF) << 16)
+            | ((peek(buf + p + 4) & 0xFF) << 24);
+        out_str("mov "); _drn(rr); out_str(", "); _dh(imm);
+        out_nl();
+        return (p - fp) + 1 + 4;
+    }
+
+    // call / jmp rel32 -- resolve the target to a code-relative offset.
+    if (op == 0xE8 || op == 0xE9) {
+        rel = _rd32s(buf, p + 1);
+        l = (p - fp) + 5;
+        if (op == 0xE8) { out_str("call "); } else { out_str("jmp  "); }
+        _dh(show_off + l + rel);
+        out_nl();
+        return l;
+    }
+
+    if (op == 0x99) { out_str("cqo"); out_nl(); return (p - fp) + 1; }
+    if (op == 0xC3) { out_str("ret"); out_nl(); return (p - fp) + 1; }
+
+    // Two-byte (0F) opcodes the backend uses.
+    if (op == 0x0F) {
+        op2 = peek(buf + p + 1) & 0xFF;
+        if (op2 == 0x05) { out_str("syscall"); out_nl(); return (p - fp) + 2; }
+        if (op2 == 0xB6 || op2 == 0xB7) {
+            mp = p + 2;
+            modrm = peek(buf + mp) & 0xFF;
+            reg = ((modrm >> 3) & 7) | (rexR << 3);
+            out_str("movzx "); _drn(reg); out_str(", ");
+            rmlen = _dis_rm(buf, mp, rexB);
+            out_nl();
+            return (p - fp) + 2 + rmlen;
+        }
+        if (op2 >= 0x80 && op2 <= 0x8F) {       // jcc rel32
+            rel = _rd32s(buf, p + 2);
+            l = (p - fp) + 6;
+            out_str("j"); _dcc(op2 - 0x80); out_str(" ");
+            _dh(show_off + l + rel);
+            out_nl();
+            return l;
+        }
+        if (op2 >= 0x90 && op2 <= 0x9F) {       // setcc r/m8
+            mp = p + 2;
+            out_str("set"); _dcc(op2 - 0x90); out_str(" ");
+            rmlen = _dis_rm(buf, mp, rexB);
+            out_nl();
+            return (p - fp) + 2 + rmlen;
+        }
+        if (op2 == 0xAF) {                      // imul r, r/m
+            mp = p + 2;
+            modrm = peek(buf + mp) & 0xFF;
+            reg = ((modrm >> 3) & 7) | (rexR << 3);
+            out_str("imul "); _drn(reg); out_str(", ");
+            rmlen = _dis_rm(buf, mp, rexB);
+            out_nl();
+            return (p - fp) + 2 + rmlen;
+        }
+        out_str(".byte 0x0f"); out_nl();
+        return (p - fp) + 1;
+    }
+
+    // Unknown -- emit one raw byte so the caller can resync on the next.
+    out_str(".byte "); _dh(op); out_nl();
+    return (p - fp) + 1;
+}
+
+// Decode and print instructions from file offset start_fp for nbytes bytes,
+// labelling each with code-relative offset disp_off + (fp - start_fp).
+void disasm_range(buf, start_fp, disp_off, nbytes) {
+    auto fp, end, ilen;
+    fp = start_fp;
+    end = start_fp + nbytes;
+    while (fp < end) {
+        ilen = _dis1(buf, fp, disp_off + (fp - start_fp));
+        if (ilen <= 0) { ilen = 1; }
+        fp = fp + ilen;
+    }
+}
+
+// Symmetry with the other bug_* modules; no state to initialise.
+void init_bug_disasm() { return 0; }

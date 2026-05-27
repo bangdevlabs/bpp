@@ -200,6 +200,9 @@ sudo cp src/bug_tui.bsm "$LIB_DIR/"
 # from the_bug.bpp so both the GUI entry and the CLI entry (src/bug.bpp) share
 # it. Imported explicitly by both, so it must live next to the other bug_*.bsm.
 sudo cp src/bug_dump.bsm "$LIB_DIR/"
+# bug_disasm.bsm is the x86-64 disassembler behind `bug --disasm` (objdump in
+# bug). Imported by src/bug.bpp; must sit next to the other bug_*.bsm modules.
+sudo cp src/bug_disasm.bsm "$LIB_DIR/"
 
 # Install standard library.
 sudo cp stb/*.bsm "$STB_DIR/"
@@ -285,7 +288,8 @@ rm -f "$SMOKE_SRC" "$SMOKE_BIN"
 # globs that could quietly match nothing).
 echo "==> Verifying debugger module install set..."
 BUG_REQUIRED="bug_reader.bsm bug_shared.bsm bug_viz.bsm bug_eval.bsm \
-              bug_brk.bsm bug_runviz.bsm bug_tui.bsm bug_gdb.bsm"
+              bug_brk.bsm bug_runviz.bsm bug_tui.bsm bug_gdb.bsm \
+              bug_dump.bsm bug_disasm.bsm"
 BUG_MISSING=""
 for m in $BUG_REQUIRED; do
     if [ ! -f "$LIB_DIR/$m" ]; then
