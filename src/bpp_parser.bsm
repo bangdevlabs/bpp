@@ -69,6 +69,15 @@ extrn sd_names, sd_fields, sd_fcounts, sd_sizes, sd_fhints;
 extrn sd_newtype_base;
 extrn sd_byte_offs, sd_bit_offs;
 
+// Capacity of each per-struct field table (sd_fields / sd_fhints /
+// sd_byte_offs / sd_bit_offs). Comfortably above the largest struct in
+// the tree (ChipPrimitives, 136 fields). add_struct_field bounds-checks
+// against this and emits E266 instead of overflowing the buffer — the
+// silent 64-slot overflow that the free-list allocator exposed (writing
+// 72 words past a buf_word(64) only corrupted neighbours once allocations
+// were packed tightly; the old mmap-per-alloc page slack absorbed it).
+const _SD_MAX_FIELDS = 256;
+
 // Struct lookup acceleration. _parser_struct_hash maps a struct
 // name's byte sequence to (struct_idx + 1). Updated incrementally by
 // add_struct_def — find_struct then runs in O(1) without ever needing
@@ -259,13 +268,13 @@ add_struct_def(name_p) {
     auto idx;
     sd_names = arr_push(sd_names, name_p);
     sd_newtype_base = arr_push(sd_newtype_base, 0 - 1);
-    sd_fields = arr_push(sd_fields, buf_word(64));
+    sd_fields = arr_push(sd_fields, buf_word(_SD_MAX_FIELDS));
     sd_fcounts = arr_push(sd_fcounts, 0);
     sd_sizes = arr_push(sd_sizes, 0);
-    sd_fhints = arr_push(sd_fhints, buf_word(64));
+    sd_fhints = arr_push(sd_fhints, buf_word(_SD_MAX_FIELDS));
     // Per-field precomputed layout: byte and bit offsets, populated by add_struct_field.
-    sd_byte_offs = arr_push(sd_byte_offs, buf_word(64));
-    sd_bit_offs = arr_push(sd_bit_offs, buf_word(64));
+    sd_byte_offs = arr_push(sd_byte_offs, buf_word(_SD_MAX_FIELDS));
+    sd_bit_offs = arr_push(sd_bit_offs, buf_word(_SD_MAX_FIELDS));
     struct_mods = arr_push(struct_mods, tok_mod(tok_pos));
     idx = arr_len(sd_names) - 1;
     register_struct_hash(name_p, idx);
@@ -326,6 +335,18 @@ void add_struct_field(idx, field_p, hint) {
     byte_offs = arr_get(sd_byte_offs, idx);
     bit_offs = arr_get(sd_bit_offs, idx);
     fc = arr_get(sd_fcounts, idx);
+    // Bounds gate — the per-struct tables hold _SD_MAX_FIELDS slots. A
+    // struct with more fields used to write past the buffer silently
+    // (only visible once a tightly-packed allocator clobbered the next
+    // allocation); now it is a clean compile error instead of corruption.
+    if (fc >= _SD_MAX_FIELDS) {
+        diag_error(265);
+        diag_str("struct '");
+        diag_packed(arr_get(sd_names, idx));
+        diag_str("' exceeds the per-struct field limit (256)");
+        diag_newline();
+        return;
+    }
     fields[fc] = field_p;
     hints[fc] = hint;
     fc++;
