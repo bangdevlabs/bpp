@@ -1808,7 +1808,7 @@ static parse_unary() { return 0; }
 // Collects primitive type hints for parameters and stores them in offset 48.
 static void parse_function(is_stub, is_static, is_void) {
     auto name_p, params_arr, param_cnt, body_arr, body_cnt, fn_rec, var_p, _fs;
-    auto ph_arr, ph_cnt, has_hints, my_mod, name_tok;
+    auto ph_arr, has_hints, my_mod, name_tok;
     my_mod = tok_mod(tok_pos);
     // Snapshot the global vt_names cursor BEFORE this function's
     // body adds anything. The bug debugger uses this to scope its
@@ -1825,9 +1825,15 @@ static void parse_function(is_stub, is_static, is_void) {
     name_p = cur_packed();
     consume();
     consume();
-    // Collect parameter hints while parsing the parameter list.
-    ph_arr = malloc(64);
-    ph_cnt = 0;
+    // Collect parameter hints while parsing the parameter list. A function can
+    // declare more than 8 parameters (e.g. _stb_gpu_sprite_uv_tint has 13), so
+    // the hints live in a growable `arr` — there is no fixed cap to overflow.
+    // (A previous fixed malloc(64) silently overran the neighbouring
+    // allocation on any function with more than 8 parameters; harmless under
+    // the old page-slack allocator, heap corruption under the tightly-packed
+    // free-list.) Stored raw in FN_HINTS; consumers index it directly, so an
+    // arr handle works unchanged. Freed with arr_free below when no hint.
+    ph_arr = arr_new();
     has_hints = 0;
     list_begin();
     while (val_is_ch(')') == 0) {
@@ -1835,9 +1841,8 @@ static void parse_function(is_stub, is_static, is_void) {
         list_push(var_p);
         consume();
         try_type_annotation(var_p);
-        ph_arr[ph_cnt] = _prim_hint;
+        ph_arr = arr_push(ph_arr, _prim_hint);
         if (_prim_hint > 0) { has_hints = 1; }
-        ph_cnt++;
         if (val_is_ch(',')) { consume(); }
     }
     consume();
@@ -1955,7 +1960,7 @@ static void parse_function(is_stub, is_static, is_void) {
     *(fn_rec + FN_BCNT) = body_cnt;
     // Store parameter hint array in the hints field.
     if (has_hints) { *(fn_rec + FN_HINTS) = ph_arr; }
-    else { *(fn_rec + FN_HINTS) = 0; free(ph_arr); }
+    else { *(fn_rec + FN_HINTS) = 0; arr_free(ph_arr); }
     // Mark as stub if declared with the `stub` keyword. Stubs are
     // intentional placeholders that can be silently overridden by a
     // real definition in any module without triggering W015.
@@ -2553,7 +2558,7 @@ static _build_profile_zone(zone_name_p) {
 
 // Parse a single statement: declaration, if, while, return, or expression.
 static parse_statement() {
-    auto node: Node, var_p, hint_p, decl_hint, dh_arr, dh_cnt, dh_has, kw_hint;
+    auto node: Node, var_p, hint_p, decl_hint, dh_arr, dh_has, kw_hint;
     // `@`-prefixed annotations come in two flavours at statement level:
     //   1. Phase 6.3 scoped zones — `@profile("name") { ... }`. Captured
     //      and lowered to a synthesized T_BLOCK with prologue / epilogue
@@ -2584,26 +2589,32 @@ static parse_statement() {
         if (val_is("auto", 4)) {
             consume();
             decl_hint = 0;
-            dh_arr = malloc(64);
-            dh_cnt = 0;
+            // Per-variable type hints for this declaration. A single `auto`
+            // can list arbitrarily many variables (e.g. `auto a, b, c, ... z;`),
+            // so the hints live in a growable `arr` — there is no fixed cap to
+            // overflow. (A previous fixed malloc(64) silently overran the
+            // neighbouring allocation once a declaration had more than 8
+            // variables; harmless under the old page-slack allocator, heap
+            // corruption under the tightly-packed free-list.) Stored raw in
+            // node.e; consumers index it directly, so an arr handle works
+            // unchanged. Freed with arr_free below when no hint is present.
+            dh_arr = arr_new();
             dh_has = 0;
             list_begin();
             var_p = cur_packed();
             list_push(var_p);
             consume();
             try_type_annotation(var_p);
-            dh_arr[dh_cnt] = _prim_hint;
+            dh_arr = arr_push(dh_arr, _prim_hint);
             if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
-            dh_cnt++;
             while (val_is_ch(';') == 0) {
                 if (val_is_ch(',')) { consume(); }
                 var_p = cur_packed();
                 list_push(var_p);
                 consume();
                 try_type_annotation(var_p);
-                dh_arr[dh_cnt] = _prim_hint;
+                dh_arr = arr_push(dh_arr, _prim_hint);
                 if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
-                dh_cnt++;
             }
             consume();
             node = make_node(T_DECL);
@@ -2611,7 +2622,7 @@ static parse_statement() {
             node.b = last_list_cnt;
             node.c = decl_hint;
             if (dh_has) { node.e = dh_arr; }
-            else { node.e = 0; free(dh_arr); }
+            else { node.e = 0; arr_free(dh_arr); }
             return node;
         }
         // Type-keyword declarations: byte hp; half w; quarter c;
