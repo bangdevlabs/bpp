@@ -196,6 +196,21 @@ void wc1_collision_register(eid, gx, gy) {
     grid_set(_occupied, gx, gy, eid + 1);
 }
 
+// Release the tile a unit currently claims and mark it "off the grid"
+// (tile = -1, -1). Used when a worker ENTERS a resource (gold mine):
+// while harvesting it holds no tile, so other workers cycle through the
+// perimeter freely (Stratagus capacity model — no perimeter pile-up).
+// The unit re-acquires tiles via the normal _step_unit claim-transfer
+// when it next walks (out to the depot). Safe to call repeatedly.
+void wc1_movement_release_unit_tile(world, eid) {
+    auto pa: Path;
+    pa = ecs_get(world, path_comp, eid);
+    wc1_collision_release(pa.tile_gx, pa.tile_gy);
+    pa.tile_gx = 0 - 1;
+    pa.tile_gy = 0 - 1;
+    return;
+}
+
 // S9 — also mark a tile as path-blocked. Used by the building
 // claim helper so path_find routes AROUND building footprints
 // instead of emitting paths that go through them (which then
@@ -309,6 +324,42 @@ wc1_collision_is_blocked_for(eid, gx, gy) {
     claim = grid_get(_occupied, gx, gy);
     if (claim == 0)       { return 0; }
     if (claim == eid + 1) { return 0; }
+    return 1;
+}
+
+// Head-on deadlock breaker. `eid` (at tile pa.tile) wants to step onto
+// (wp_gx, wp_gy), which is held by another unit. If that blocker's NEXT
+// path step is onto eid's CURRENT tile, the two are crossing head-on and
+// would each wait forever — so exchange their tile claims: eid takes the
+// blocker's tile, the blocker takes eid's. Each then interpolates to its
+// new tile and passes the other. Returns 1 if the swap fired (caller
+// proceeds), 0 if it's a genuine block (caller waits a frame). Only
+// resolves the head-on case (the dominant gather-route deadlock); a unit
+// parked on the target tile is left for the caller to wait out.
+static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
+    auto claim, blk, bp: Path, bwx, bwy, old_x, old_y;
+    // Only a moving UNIT can head-on swap. The blocker on this tile may
+    // instead be terrain (_TERRAIN_BLOCKER) or a BUILDING footprint
+    // (registered with the building's eid but no Path component) — both
+    // must bail. ecs_get returns 0 for a building (component absent) or
+    // an out-of-range "eid", so the `bp == 0` guard is the real safety
+    // net: a building eid here SIGSEGV'd before this check existed.
+    claim = grid_get(_occupied, wp_gx, wp_gy);
+    if (claim == 0 || claim == _TERRAIN_BLOCKER) { return 0; }
+    blk = claim - 1;
+    bp = ecs_get(w, path_comp, blk);
+    if (bp == 0)                   { return 0; }   // building / dead — not a unit
+    if (bp.mode == PATH_MODE_FLOW) { return 0; }   // flow units have no waypoints
+    if (bp.cursor >= bp.count)     { return 0; }   // blocker isn't moving
+    if (bp.buf == 0)               { return 0; }   // defensive: no path buffer
+    bwx = bp.buf[bp.cursor * 2];
+    bwy = bp.buf[bp.cursor * 2 + 1];
+    if (bwx != pa.tile_gx || bwy != pa.tile_gy) { return 0; }   // not head-on
+    old_x = pa.tile_gx; old_y = pa.tile_gy;
+    wc1_collision_register(eid, wp_gx, wp_gy);    // I take the blocker's tile
+    wc1_collision_register(blk, old_x, old_y);    // blocker takes mine
+    bp.tile_gx = old_x;  bp.tile_gy = old_y;
+    pa.tile_gx = wp_gx;  pa.tile_gy = wp_gy;
     return 1;
 }
 
@@ -462,13 +513,20 @@ static void _step_unit(w, eid) {
     // the other unit may have cleared by the next tick.
     if (wp_gx != pa.tile_gx || wp_gy != pa.tile_gy) {
         if (wc1_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
-            _idle_anim(an);
-            return;
+            // Blocked by another unit. If it's a head-on crossing, swap
+            // tiles so neither freezes (the common gather-route
+            // deadlock); otherwise wait a frame for it to clear.
+            if (_try_headon_swap(w, eid, wp_gx, wp_gy, pa) == 0) {
+                _idle_anim(an);
+                return;
+            }
+            // Swap fired: pa.tile is already updated to the new tile.
+        } else {
+            wc1_collision_release(pa.tile_gx, pa.tile_gy);
+            wc1_collision_register(eid, wp_gx, wp_gy);
+            pa.tile_gx = wp_gx;
+            pa.tile_gy = wp_gy;
         }
-        wc1_collision_release(pa.tile_gx, pa.tile_gy);
-        wc1_collision_register(eid, wp_gx, wp_gy);
-        pa.tile_gx = wp_gx;
-        pa.tile_gy = wp_gy;
     }
 
     // Walking — flip state + reset elapsed_ms when entering.

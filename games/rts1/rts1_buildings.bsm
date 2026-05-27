@@ -68,6 +68,13 @@ const BLDG_STATE_DONE         = 1;
 // leaves the same sprite + grays the icon overlay).
 const BLDG_STATE_DEPLETED     = 2;
 
+// S11 — concurrent-gatherer cap per gold mine (Stratagus
+// `MaxOnBoard`). war1gus `buildings.lua:286` ships 5 for the
+// campaign; `balancing.lua:85` rebalances it to 3 for multiplayer.
+// We take the campaign value. A worker arriving when the mine is
+// full waits at its perimeter tile (see _gather_visit's enter gate).
+const _WC1_MINE_MAX_ON_BOARD  = 5;
+
 // ── Static type table (BuildingDef) ────────────────────────────
 
 // Per-kind template. Same shape as UnitDef but for buildings:
@@ -172,6 +179,12 @@ struct Building {
                            // Decremented per deposit cycle; the mine
                            // collapses (BLDG_STATE_DEPLETED) when it
                            // hits 0. Other kinds leave this at 0.
+    active,                // S11 — gatherers currently INSIDE this mine
+                           // (Stratagus Resource.Active model). Gated by
+                           // _WC1_MINE_MAX_ON_BOARD: a worker arriving
+                           // when active >= cap waits at the perimeter
+                           // instead of entering. ++ on enter, -- on
+                           // leave / cancel. Mine-only; 0 for other kinds.
     // ── S10 production state (training queue + rally point) ───
     train_queue,           // ptr to buf_word(_WC1_QUEUE_MAX) of UNIT_*
                            // kinds; 0 until the first enqueue (lazy —
@@ -299,6 +312,8 @@ ecs_spawn_building(world, atlas_idle: ptr, atlas_construct: ptr,
     } else {
         b.gold_remaining = 0;
     }
+    // S11 — no gatherers inside yet (Stratagus Resource.Active starts 0).
+    b.active = 0;
     // S10 — production queue starts empty. train_queue is lazy-
     // allocated on the first enqueue (wc1_production_enqueue) so
     // non-producer buildings (farms, towers, mines) never pay for
@@ -344,6 +359,35 @@ static void _claim_building_footprint(eid, gx, gy, def: BuildingDef) {
             wc1_movement_block_path_tile(gx + dx, gy + dy);
         }
     }
+}
+
+// Raze a building: the inverse of _claim_building_footprint. Frees every
+// footprint tile (occupancy + path block) so units can walk the rubble,
+// frees the CharSheet, and kills the ECS row. Called by combat
+// (wc1_combat._combat_step) when a building's HP reaches 0 — buildings
+// have no death animation and aren't ticked by the combat walk, so the
+// teardown happens here in one shot.
+void wc1_building_destroy(w, eid) {
+    auto b: Building, def: BuildingDef, p: Pos, sh: Sheet;
+    auto gx, gy, ntx, nty, dx, dy;
+    b   = ecs_get(w, building_comp, eid);
+    p   = ecs_get(w, pos_comp, eid);
+    gx  = p.x / 16; gy = p.y / 16;
+    def = building_def_for(b.kind);
+    if (def != 0) {
+        ntx = def.px_w / 16; nty = def.px_h / 16;
+        for (dy = 0; dy < nty; dy++) {
+            for (dx = 0; dx < ntx; dx++) {
+                wc1_collision_release(gx + dx, gy + dy);
+                wc1_movement_unblock_tile(gx + dx, gy + dy);
+            }
+        }
+    }
+    sh = ecs_get(w, sheet_comp, eid);
+    cs_free(sh.handle);
+    ecs_kill_at(w, eid);
+    putstr("building razed eid="); putnum(eid); putstr("\n");
+    return;
 }
 
 // ── Render ─────────────────────────────────────────────────────

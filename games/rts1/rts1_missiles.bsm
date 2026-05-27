@@ -58,6 +58,7 @@ const _MISSILE_SPEED_PXS = 240;
 // caller-owned; we just keep the pointer for image_draw_size.
 extrn _missile_pool;
 extrn _missile_atlas;
+extrn building_comp;   // S11 — ecs_has discriminates a building target (no Anim)
 
 // Per-tick world handle for the impact callback — stbprojectile's
 // on_expire dispatch only passes the slot pointer; the world we
@@ -151,7 +152,7 @@ wc1_missile_spawn(src_x, src_y, dst_x, dst_y,
 static void _on_impact(slot) {
     auto p: Projectile, pay: Payload;
     auto target_sh: Sheet, target_an: Anim;
-    auto damage, mult_pct, target_armor, target_size, target_hp;
+    auto damage, mult_pct, target_armor, target_size, target_hp, tgt_is_building;
     p   = slot;
     pay = p.payload_w;
 
@@ -163,12 +164,19 @@ static void _on_impact(slot) {
         free(pay);
         return;
     }
-    target_an = ecs_get(_impact_world, anim_comp, pay.target_eid);
-    if (target_an.state == UNIT_STATE_DYING) {
-        // Target already mid-death-anim — let the existing death
-        // play out; don't double-damage.
-        free(pay);
-        return;
+    // Buildings carry no Anim (their archetype omits it), so the DYING
+    // check + death path below branch on target kind. ecs_has(building_comp)
+    // is the discriminator, same as the melee tick. Dereferencing the 0 that
+    // ecs_get returns for a building's absent anim_comp is the _on_impact
+    // SIGSEGV from the 2026-05-26 crash report (arrow fired into a building).
+    tgt_is_building = ecs_has(_impact_world, building_comp, pay.target_eid);
+    if (tgt_is_building == 0) {
+        target_an = ecs_get(_impact_world, anim_comp, pay.target_eid);
+        if (target_an.state == UNIT_STATE_DYING) {
+            // Mid-death-anim — let it play out; don't double-damage.
+            free(pay);
+            return;
+        }
     }
     target_sh = ecs_get(_impact_world, sheet_comp, pay.target_eid);
     if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
@@ -198,11 +206,17 @@ static void _on_impact(slot) {
     putstr("\n");
 
     if (target_hp <= 0) {
-        target_an.state      = UNIT_STATE_DYING;
-        target_an.elapsed_ms = 0;
-        putstr("dying eid= ");
-        putnum(pay.target_eid);
-        putstr("\n");
+        if (tgt_is_building != 0) {
+            // Buildings have no death anim + aren't ticked by the combat
+            // walk — raze immediately (free footprint + sheet + ECS row).
+            wc1_building_destroy(_impact_world, pay.target_eid);
+        } else {
+            target_an.state      = UNIT_STATE_DYING;
+            target_an.elapsed_ms = 0;
+            putstr("dying eid= ");
+            putnum(pay.target_eid);
+            putstr("\n");
+        }
     }
     free(pay);
 }

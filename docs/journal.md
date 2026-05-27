@@ -11735,3 +11735,324 @@ step — verifying the projection on real game frame-time.
   * **`@safe` annotation is the dispatch-safety contract.**
     Outlining capture-driven path now requires it. This is
     Tonify Rule 4 doctrine made executable.
+
+## 2026-05-23 — Load/import post-close + dispatch regression surfaces
+
+Four follow-on commits after the load/import arc, plus the first
+sighting of a visual regression the arc's P6 (`7dd3ff6`) had armed.
+
+### The commits
+
+  * `99a0d58` — fix(W020): drop `static` from chip-backend helpers
+    called cross-file. P3+P4's corrected module attribution started
+    flagging the a64/x64 cross-calls to encoder primitives (`enc_*`)
+    as cross-module-static violations. They were always cross-module;
+    the old wrong attribution hid it. Dropping `static` makes the
+    contract honest.
+  * `6a20414` — stbecs `ecs_query_each_parallel`: opt-in worker-pool
+    variant of the query iterator. Serial `ecs_query_each` stays the
+    default; games opt into the parallel walk explicitly.
+  * `1a0527b` — load/import P2 followup: keep dep edges for inline
+    `load`s (the P2 skip was too aggressive) + a `bug --tui` fix.
+  * `6b6caee` — docs: RTS adoption analysis + post-close bench results.
+
+### The regression (diagnosed, not yet fixed)
+
+snake_maestro shows a yellow dot instead of the particle explosion on
+apple-eat; fps_wolf3d shows a magenta overlay covering the scene after
+load. User-driven bisect pinned the trigger:
+
+```
+da2b8cc   pre-arc baseline          ✓ clean
+fbaf98e   + P3/P4 (mod_bnds+topo)    ✓ clean
+7dd3ff6   + P6 defer-emit            ✗ regression appears
+```
+
+P6 made dispatch's synth functions actually reach the binary instead
+of being orphaned by the incremental-emit ordering. That ACTIVATED
+months of aggressive MAP matches the matcher had been making in stb
+hot loops — `init_game`, `init_ui_layout`, `ui_frame_begin`,
+`mixer_init`, `profile_start` — none of them `@safe`, all touching
+allocator / GPU / audio-ring state. The loops were parallelizing and
+racing on shared module state. Fix designed (strict `@safe` gate);
+lands tomorrow.
+
+## 2026-05-24 — Strict @safe gate + T_MEMST float→int (a64)
+
+### The commits
+
+  * `48d16e1` — fix(dispatch): strict `@safe` gate covers BOTH
+    outlining and MAP. The capture-driven gate (`a6fa70a`) only
+    rejected loops WITH captures from non-`@safe` hosts. MAP synths
+    (pure indexed writes, no captures) slipped through — exactly the
+    snake/FPS regression. The fix tightens the gate to "host must be
+    `@safe`, period": every parallel-loop candidate, capture or MAP,
+    requires the host annotation. A `W032` diagnostic was added
+    alongside to surface every parallelized loop for audit. snake now
+    builds with 0 synths (correct — none of its hosts are `@safe`);
+    FPS keeps its 1 intentional synth (`wolf_ai_tick_cooldowns`).
+  * `2b0bbef` — fix(a64): T_MEMST integer destination uses `fcvtzs`,
+    not `fmov`, for a float RHS. See root cause below.
+  * `81357b3` — stbecs `ecs_physics(w, dt: float)`: seconds API. The
+    old int-millisecond signature forced callers to pre-divide; the
+    float-seconds form reads as the physics formula directly.
+
+### Root cause: a silent float→int store, latent for months
+
+The snake/FPS regression had a SECOND cause underneath the dispatch
+one. Disassembling `ecs_physics`:
+
+```
+fadd  d0, d1, d0     ← pos + vel*dt  (float result in d0)
+fmov  x0, d0         ← BUG: bit-reinterpret, not truncate
+str   x9, [x0]       ← store float BITS as an int → astronomical pos
+```
+
+`*(int_slot) = float_expr` was emitting `fmov` (copy the IEEE bit
+pattern verbatim) where it needed `fcvtzs` (Convert-to-Signed,
+truncate toward zero). Particles teleported; the GPU pipeline saw
+garbage coordinates. The bug had been latent for months — pre-P6 the
+call frame around `ecs_physics` provided a typed coercion boundary
+that masked it. P6's defer-emit let `ecs_physics` inline through the
+bare T_MEMST primitive for the first time, exposing it. Fixed in both
+the live and dead-Wave-20 T_MEMST branches on a64; x64 sibling lands
+tomorrow. New fixture `tests/test_memst_float_to_int.bpp` covers
+positive / negative / sub-1 cases.
+
+## 2026-05-25 — Wave 20+21 spine takeover + T_MEMST (x64) + HUD perf — most-productive day
+
+Eleven commits. The chip→spine codegen arc closed (both AST walkers
+deleted), the T_MEMST fix completed on x64, a cross-module float-type
+gap fixed at the validator, the 60→59 fps HUD flicker eliminated, a
+c-emit-suite regression caught and fixed, and three Tonify doctrine
+entries crystallized.
+
+### The commits
+
+```
+3dc0a66  inline + outlining fix
+e4bdf9a  fix(x64): T_MEMST float→int uses cvttsd2si + retire W032
+0e898ad  cleanup(codegen): retire dead chip stmt walkers (Wave 20 closeout)
+61a64e2  wave21 commit 1: pre-migrate chip-internal emit_node callers
+c4ca406  wave21 commit 2: spine cg_emit_node owns expression emission
+91c37ff  wave21 commit 3: delete chip emit_node walkers + port unsigned dispatch
+b571eea  fix(validate): cross-module global float type recovery (E233/E240)
+d03127b  perf(hud): kill per-frame malloc in profile/render HUD path
+1f321dc  docs: doctrine closeout — Rule 38 sync, Rule 40, bangscript
+572d146  docs: README + how_to_dev catch-up
+90f83f6  fix(runtime): hoist profile_print_chains autos to function top
+```
+
+### Wave 20 + 21 — one codegen, two chip backends
+
+The two native backends each carried a full AST walker — every
+statement and expression case implemented twice. Wave 20 (`0e898ad`)
+retired the dead chip statement walkers after the spine's
+`cg_emit_stmt` took over. Wave 21 finished the expression side in
+three bisect-friendly commits:
+
+  * `61a64e2` — pre-migrate 37 a64 + 46 x64 chip-internal direct
+    `*_emit_node(...)` calls to `call(pp.emit_node, ...)`. Byte-stable
+    (the slot still points at the chip walker, just adds the fn_ptr
+    indirection).
+  * `c4ca406` — flip `p.emit_node = fn_ptr(cg_emit_node)`. The
+    differential disasm probe (`tests/codegen_parity_probe.bpp`,
+    8 case categories) showed a 4-line diff — header only, machine
+    code byte-identical. Bootstrap 0.34→0.37s (+9%, within the 10%
+    gate).
+  * `91c37ff` — delete `a64_emit_node` (260 LOC) + `x64_emit_node`
+    (226 LOC). Caught one regression in the same commit: the spine was
+    missing the `: u_word` unsigned-dispatch branch (UDIV / UMOD / LSR)
+    the chip walker had. `test_unsigned_*` surfaced it; the branch was
+    ported into the spine. Suite 176/4/12 → 180/0/12.
+
+~1300 LOC of duplicated walker code gone across Wave 20+21. The chip
+files are now pure primitive providers — adding a third backend
+(RISC-V, WASM) is a single file of primitive bodies, no tree walker.
+This is the practice Tonify Rule 41 (Additive Portability) codifies.
+
+### T_MEMST x64 + W032 retirement (`e4bdf9a`)
+
+The x64 sibling of yesterday's a64 fix: float→int store now emits
+`cvttsd2si` (convert-with-truncation, scalar double to signed int)
+instead of a `movq` bit-reinterpret. `tests/test_memst_float_to_int.bpp`
+now passes through both native backends + Linux Docker cross-compile.
+
+The same commit RETIRED `W032`. Once the strict `@safe` gate
+(`48d16e1`) filtered non-`@safe` hosts BEFORE the warning emit, W032
+only ever fired on hosts the programmer had already opted in via
+`@safe` — redundant noise. The `@safe` annotation IS the audit; the
+gate is the door.
+
+### Cross-module global float recovery (`b571eea`, E233/E240)
+
+When a non-entry module references an entry-module `global X: float;`,
+the type wasn't visible at infer time — non-entry modules parse in
+topo order BEFORE the entry declares its globals, so `T_VAR.itype`
+fell back to TY_WORD. The validator then either silently missed E233
+(and codegen emitted the `fmov` reinterpret = the bug above) or fired
+E240 ("int into float param") incorrectly. Split-parse-infer (Pass 1
+parse all, Pass 2 infer all) was tried and rejected — +17% bootstrap.
+The shipped fix is surgical: re-resolve the type at validator
+T_CALL-arg time, when `ty_gl[]` is fully populated, guarded against
+local-shadow false-positives via a `fn_metas` vt_block check. +9%
+bootstrap, within gate. `games/snake/particles.bsm` reverted its
+manual `extrn _last_dt: float;` workaround.
+
+### HUD perf → Rule 40 (`d03127b`)
+
+The profiler showed a steady 60→59→60 fps flicker (`ms:17 max:18`, a
+~50µs spike pattern). `_mem_alloc_pages` was only 0.5% of samples but
+concentrated on the bad frames — the kind of spike-bound problem
+`profile_dump`'s aggregate top-N hides. A new diagnostic helper,
+`profile_print_chains(name)`, walks every SIGPROF sample and prints
+the stack chain when the innermost frame matches the filter — the
+reverse of the top-N view. It fingered three HUD overlay sites
+mallocing per call: `render_number`, `profile_zones_hud_draw`,
+`_profile_dump_inner`. Pre-allocating their scratch buffers at module
+init dropped `_mem_alloc_pages` samples 22 → 4 (95%); live HUD steady
+at `ms:17 max:17`, variance collapsed to zero. Crystallized as
+**Tonify Rule 40** — hot-path malloc/free is a frame-jitter trap;
+pre-allocate scratch at module init, reuse forever. Companion lesson:
+for spike-bound diagnosis, look at the tail (chains), not the average
+(top-N).
+
+### C-emit regression caught during the README audit (`90f83f6`)
+
+While auditing the README's "What B++ Has" numbers, a run of the
+c-emit suite came back **0 passed / 145 failed** — every test failing
+with `error: use of undeclared identifier 'k'`. The new
+`profile_print_chains` helper declared `auto pn_addr, pn_len, k;`
+inside a nested else branch. The native backend pre-registers all
+autos at function top (so the for-init `k = 0` works), but the C
+emitter respects block scope — and since `bpp_runtime` is
+auto-injected into every program, every B++ program was emitting
+broken C. Hoisting the six autos to the function prologue restored the
+suite to 145/0/47, bit-equivalent on native.
+
+### Bench panorama at close
+
+```
+Bootstrap            0.34s    no regression vs pre-Wave-21
+Native suite         180/0/12
+C-emit suite         145/0/47
+Linux Docker         5/5 headless
+bench_compose        16x      (bandwidth-bound; ~32x compute ceiling)
+Compiler HEAD        90f83f6  (3076e60 = README headline on top)
+HUD                  ms:17 max:17, 60 fps flat
+```
+
+### Lessons codified
+
+  * **A regression can have two causes stacked.** The snake/FPS visual
+    bug was BOTH the dispatch-activation (strict gate) AND the T_MEMST
+    miscompile underneath. Fixing one left the symptom; the
+    disassembly of `ecs_physics` found the second.
+  * **Latent codegen bugs surface when inlining boundaries move.**
+    `fmov`-vs-`fcvtzs` survived months because a call frame coerced the
+    type; P6's defer-emit removed the frame and exposed it.
+  * **The c-emit suite is the block-scope canary.** Native
+    pre-registers autos; C respects scope. Only the c-emit run catches
+    a misplaced declaration in an auto-injected module.
+  * **Spine unification makes the third backend a single file.** The
+    1300-LOC walker deletion is the payoff; Tonify Rule 41 is the rule
+    that keeps it that way.
+  * **Doc commit batching.** User pushed back on dedicated doc-only
+    commits — doc edits batch by session, `git status -s` before
+    staging; compiler/backend arcs still earn dedicated commits.
+    Recorded in `feedback_doc_commit_batching`.
+
+## 2026-05-26 — rts1 HUD takeover: WC1 left panel + playable orc faction
+
+The day started as "the bottom command bar is too poor next to the
+original" and ended with the authentic WC1 left-side command panel, a
+race-select start screen, a playable orc faction, and a forest-collision
+fix. Five commits, all rts1 game-layer + one Tier-2 cartridge edit; the
+bpp binary is untouched (zero compiler work).
+
+### The commits
+
+  * `4618c27` — **stbcamera viewport origin.** `Cam` gains
+    `view_ox/view_oy` (the screen-space pixel where the world view
+    begins) + `cam_set_viewport` + `cam_view_ox/oy` / `cam_screen_w/h`
+    accessors; the world↔screen helpers fold the origin in. Default
+    `(0,0)` keeps full-canvas cameras byte-identical (platformer
+    unaffected).
+  * `aaabf81` — **WC1 left command panel + world inset + per-type
+    command cards.** The HUD is rebuilt as the full-height left panel
+    (minimap → portrait/name/HP → command grid → MENU) with the world
+    inset to its right via the camera viewport origin.
+  * `9aac5cf` — **playable orc faction + race-select start screen.**
+  * `bcd6e01` — **felled tree → grass (109), not a tree-looking stump.**
+  * `ad9a53c` — **block forest canopy (71-94) so units can't walk in.**
+
+### Where the viewport origin belongs (the design question)
+
+User asked whether the inset-world feature should live in `stbwindow` /
+`stbgame` (the modules that open windows). It should NOT — it belongs on
+the **camera**, and the reasoning is a clean layering lesson: the offset
+must apply ONLY to world-space draws (tiles, units), never to HUD draws
+(absolute screen space). A translate in the window/present path would
+shift the HUD too. `stbwindow` / `stbgame` own the whole canvas; the
+decision to reserve a slice for HUD chrome is per-camera. Precedent:
+raylib's `Camera2D.offset`, Unity `Camera.rect`. So it went into
+`stbcamera` as a reusable cartridge feature — every world-space draw in
+rts1 now routes through `cam_world_to_screen_*`, and the ~16 click sites
+inherit the inverse offset through `cam_screen_to_world_*` for free.
+
+### Command cards are per unit type (war1gus `buttons.lua`)
+
+The peasant first got a flat grid of all 8 buildings — the user caught
+it: "we were going to follow the original design." Reading war1gus
+`scripts/buttons.lua` settled the model: command buttons are defined
+PER UNIT TYPE, each with a `Pos` (1-9 grid slot) and `Level` (0 = root,
+1+ = submenu). The peasant root is Move / Stop / Harvest + Build Basic /
+Build Advanced; the build buttons open a submenu (basic: Farm, Lumber
+Mill, Barracks, Town Hall; advanced: Blacksmith, Church, Tower, Stable)
++ Cancel. Combat units share Move / Stop / Attack. Built as
+`wc1_unit_cmd_menu(kind, player, level, out)` packing `(pos, action,
+value)` per entry; the HUD reads it through `wc1_cmd_entry_*` accessors
+so the `CMD_*` enum stays private to `rts1_production.bsm` (no
+cross-module const-scope coupling). Move / Harvest / Attack arm the
+cursor (next world click is the target); icon frames are the authentic
+war1gus indices (move-peasant 33 / peon 34, harvest 36, build-basic 37,
+build-advanced 38, sword 63 / axe 66 / arrow 71).
+
+### Playable orc — the gate flip, not new assets
+
+forest1 is a 4-corner map (player 0/2 human, 1/3 orc), each with a
+start_view + worker + seeded town hall — so the orc side was already
+fully spawned; it just wasn't *commandable*. `_local_player` (chosen on
+the race screen, read via `wc1_local_player()`) replaced every
+hard-coded "human == player 0" gate (selection, command card,
+production, minimap own/other colour); the entity-faction roster/atlas
+selections stayed. Orc assets were already at parity (units flat in
+`sprites/wc1/`, 17 building sprites, faction-aware `panel_1` skin, orc
+icon frames in the shared atlas).
+
+### The "orc walks through trees" two-fix saga
+
+A genuine debugging lesson. Symptom: orc peon walks through forest, human
+doesn't — looked faction-specific. But peasant/peon are the same
+`UNIT_PEASANT` kind running identical movement code, so faction couldn't
+be the cause. First fix mis-aimed: felled trees wrote tile 95
+("removed-tree stump"), which renders as canopy in the *converted*
+tileset, so chopped cells still looked like forest — flipped to 109
+(grass) to match the code's own documented intent. But units kept
+entering: the move log (`target = ...`) showed them reaching forest
+tiles. A tile histogram of forest1 found it: tile **94** (the
+"background canopy", 447 cells — 2nd most common) was **walkable** —
+only trunks (71-87) blocked. A flood-fill proved blocking 71-94 keeps
+all start views + gold mines reachable (2637 cells), refuting the
+original author's "it'll maze the map" rationale. Extending the cluster
+to 71-94 fixed it. **Lesson: a "faction bug" with faction-independent
+code is a render/data bug in disguise; verify a collision change with a
+connectivity flood-fill before trusting a comment that says "don't."**
+
+### Status
+
+S10 (production) closed; S10.6 (command card) done as the left panel —
+well past the planned bottom-bar, and it subsumes the S10.6.2 combat
+action buttons. Race select + playable orc + forest fix were extras. The
+genuine next arc is **S11 — enemy AI baseline** (build / gather / train /
+attack at 5 Hz); first call is `stbai` cartridge vs `rts1_ai.bsm`.

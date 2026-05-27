@@ -435,13 +435,20 @@ right after the RPG Dungeon demo, before metaprog and the RTS.
 
 ---
 
-## Runtime Modules (NEW — ~1680 Lines Total)
+## Runtime Modules (NEW — ~2230 Lines Total)
 
-### `stbbangs.bsm` (~950 lines) — The Complete bangscript Engine
+### `stbbangs.bsm` (~1500 lines) — The Complete bangscript Engine
 
 Combines the `.bang` parser, coroutine scheduler, command dispatcher,
 flag machine, special-variable publisher, and expression evaluator in
 a single module. This is the heart of bangscript.
+
+**LOC estimate revised 2026-05-26** based on AyumuScript study (~1200
+LOC C++ machine code in `pac-ac/osakaOS/src/script.cc`). The original
+~950 LOC estimate underestimated the expression evaluator + call
+stack + special-variable resolver. Honest estimate after studying a
+working reference implementation lands at ~1500 LOC. See "AyumuScript
+as design reference" section below.
 
 ```
 // Initialization and loading.
@@ -478,17 +485,41 @@ bangs_repl_eval(line)            — Parse + execute one .bang line against the 
                                    Used by Bang 9 / level_editor for interactive scene authoring.
 ```
 
-Internally:
-- `.bang` parser: ~400 lines (line-oriented, indent-based, expression
-  evaluator for `var` RHS and `check` conditions)
-- Coroutine scheduler: ~150 lines (fixed 64 slots, arena-allocated,
-  supports `par` / `spawn` / `loop`)
-- Command dispatcher: ~280 lines (switch over ~25 command types
-  including `var` / `loop` / `pool` / `spawn`)
-- Flag machine: ~50 lines (array of id→value pairs)
-- Special-variable table: ~50 lines (name→value hash, published per
-  tick, read on demand)
-- REPL eval helper: ~20 lines (parse one line, dispatch to handler)
+Internally, the ~1500 LOC split across three architectural layers:
+
+**Layer 2 — Interpreter machine (~680 LOC; directly portable from
+AyumuScript reference):**
+- Line parser state machine: ~80 LOC (char-by-char accumulation,
+  newline trigger)
+- Keyword detection + dispatch: ~100 LOC
+- Argument tokenizer (`argparse` / `argcount` / `argshift`): ~60 LOC
+- Var table lookup (uses `bpp_hash`): ~40 LOC
+- Loop stack (fixed 16-level bounded): ~30 LOC
+- Call stack (uses `arr_struct<CallStackUnit>`): ~80 LOC
+- Expression evaluator (operator precedence, `+ - * / % == < > etc.`): ~150 LOC
+- `numOrVar` / `strOrVar` type resolver: ~80 LOC
+- Special vars dispatch (`$key_last`, `$mouse_x`, etc.): ~60 LOC
+
+**Layer 3 — Bangscript domain commands (~320 LOC; designed fresh):**
+- Scene commands (`scene`, `bg`, `actor`, `hotspot`, `exit`): ~70 LOC
+- Cutscene commands (`cutscene`, `fade_in/out`, `cam_pan`, `wait`): ~60 LOC
+- Actor commands (`say`, `walk`, `face`, `animate`): ~50 LOC
+- Audio commands (`sound`, `music`): ~30 LOC
+- State commands (`set`, `check`, `var`, `goto`, `label`): ~50 LOC
+- Dialogue commands (`dialogue`, `choice`): ~30 LOC
+- Behavior commands (`behavior`, `state`, `random` — Phase 1 vision): ~30 LOC
+
+**New layers (~470 LOC; fresh design specific to bangscript):**
+- Coroutine scheduler (fixed 64 slots, supports `par` / `spawn` /
+  `loop`, frame-aware): ~150 LOC
+- Scene graph + hotspot dispatch (mouse click → verb match → handler): ~240 LOC
+- Special-variable publish API (engine → script boundary): ~50 LOC
+- REPL eval helper (parse one line, dispatch): ~20 LOC
+- Flag machine (binary persistent state): ~50 LOC
+
+Total breakdown: 680 (Layer 2 machine) + 320 (Layer 3 commands) +
+470 (coroutine + scene + special vars + REPL + flags) = **~1470 LOC
+core**, rounded up to ~1500 with edge cases.
 
 ### `stbverb.bsm` (~200 lines) — Verb / Interaction System
 
@@ -516,6 +547,169 @@ cursor_draw()                    — Render at mouse position.
 cursor_over_hotspot()            — Returns hotspot_id or -1.
 ```
 
+### AyumuScript as design reference — Hybrid implementation strategy
+
+bangscript's interpreter machine (Layer 2 above) is implemented via
+**Hybrid Strategy** — locked 2026-05-26 after studying AyumuScript
+(`pac-ac/osakaOS/src/script.cc`, ~1200 LOC C++):
+
+- **Lift mechanical patterns from AyumuScript** where the implementation
+  is universal (parser state machine, expression evaluator with operator
+  precedence, special-variable resolver convention, loop stack
+  management, call stack with arg passing).
+- **Redesign substrate via B++ primitives** where AyumuScript's C++
+  approach is unidiomatic. B++ has `bpp_hash` (replaces AyumuScript's
+  hand-rolled hash table), `arr_struct<T>` (replaces linked-list `Node`
+  containers), `bpp_str` packed refs (replaces `char*` + `mm->malloc`
+  per string), `bpp_arena` for scope-bound allocation.
+
+The resulting B++ code is shorter than literal C++ translation because
+the prelude does the heavy lifting that AyumuScript reinvented inline.
+
+**Specific patterns lifted from AyumuScript:**
+
+| AyumuScript C++ | bangscript B++ port |
+|---|---|
+| `while (indexF < size) switch (file[indexF])` line accumulator | Direct port (~80 LOC) |
+| `argparse` / `argcount` / `argshift` token helpers | Direct port (~60 LOC) |
+| Loop stack `nestedLoop[16]` + `nestedLoopCondition[16]` | Direct port (~30 LOC) |
+| `evalExpr()` operator-precedence walker | Direct port (~150 LOC) |
+| `numOrVar()` / `strOrVar()` type resolver with `$` prefix | Direct port (~80 LOC) |
+| `$0`–`$9`, `$F0`–`$F9`, `$R`, `$input` convention | Adopted (bangscript uses same `$` prefix with own var names) |
+
+**Specific patterns redesigned for B++ idiom:**
+
+| AyumuScript C++ | bangscript B++ rewrite |
+|---|---|
+| `Type*` union with manual tag (`type` field) + four-way switch | B++ tagged struct (Node-like AST node) |
+| Custom hash table `varTable[VAR_TABLE_SIZE]` | `bpp_hash` (already proven, packed-name keys) |
+| `List* lists` linked list of `Node*` | `arr_struct<T>` (cache-friendly, growable) |
+| `cli->mm->malloc / free` per object | `bpp_arena` scope-bound (zero-cost reset on scene exit) |
+| `char*` string buffers + manual length tracking | `bpp_str` packed refs (offset + length in one word) |
+| Singleton `CommandLine* cli` global state | Per-scene state struct (cleaner ownership) |
+
+**Patterns from AyumuScript NOT adopted in bangscript:**
+
+- **`varList` family** (`insertList`, `removeList`, `readList`, `writeList`,
+  `printList`, `destroyList`): list operations don't fit adventure-game
+  use case. Defer to Phase 2+ if a future consumer surfaces real need.
+- **`dvar` (delete variable)**: bangscript uses scene-local var lifetime
+  (auto-zero on `bangs_enter`); explicit delete is unnecessary.
+- **`@X` ASCII shortcut** (`@A` → 65): bangscript uses character literals
+  in strings; ASCII access via `$key_last` integer is sufficient.
+- **`inputStr` keyboard buffer**: bangscript handles input via special vars
+  (`$key_last`, `$key_pressed`) updated per-tick by engine.
+
+This Hybrid Strategy gives bangscript a **proven design oracle** for the
+hardest parts (expression evaluator, parser state machine, variable
+resolution) while using B++ primitives where they outperform C++'s
+hand-rolled substrate. Net effect: ~30% smaller code than literal
+translation, with same semantics.
+
+### Historical validation — bangscript is the third generation
+
+The strategic/tactical split that bangscript embodies (declarative data
+for high-level behavior + engine code for low-level mechanics) is the
+third iteration of a pattern Blizzard established in 1998 and BWAPI
+researchers consolidated in the 2010s:
+
+| Generation | Strategic layer | Tactical layer | Designer ergonomics |
+|---|---|---|---|
+| **Blizzard SC1 (1998)** | `aiscript.bin` (compiled bytecode), proprietary internal tooling | Hardcoded in game engine | Required Blizzard build environment, slow iteration |
+| **BWAPI bots (2010+)** | Text config files (build orders, strategy selection) | Algorithm-based managers (UAlbertaBot, CommandCenter) | Edit config + recompile bot |
+| **bangscript (2026)** | `.bang` text files with full expression evaluator + state machines | stbai managers + B++ game engine | Edit `.bang` + hot reload at runtime |
+
+The historical validation matters because it confirms two architectural
+decisions:
+
+1. **The split is correct.** Strategic = data, tactical = engine has been
+   validated for 28 years across at least two industry generations.
+2. **Modern toolchain pays off.** Text format + hot reload + expression
+   evaluator + multi-consumer runtime is what each generation gained
+   over the previous one. bangscript is on the right side of that
+   trajectory.
+
+See `docs/plans/sidequest_bangbox.md` for the analogous architectural
+pattern at the OS layer (Rule 41 additive portability).
+
+### Multi-consumer validation — three distinct use cases
+
+The bangscript runtime is **single design, multiple consumers**. The
+parser + dispatcher + coroutine scheduler doesn't know which use case
+it's running:
+
+| Consumer | Granularity | Tick rate | Lifetime | Vocabulary |
+|---|---|---|---|---|
+| **Cutscenes** | Sequence of events (linear narrative) | Per-frame (60Hz) | Scene lifetime | `say`, `walk`, `fade_in`, `cam_pan`, `par` |
+| **NPC behaviors** (Phase 1 vision) | FSM per-entity (micro-comportamento) | Per-frame (60Hz) | Entity lifetime | `state`, `walk`, `check`, `random`, `goto` |
+| **RTS strategies** (Phase 1.5 — game-local AI brain consumer) | FSM per-player (macro-comportamento) | Strategic tick (5Hz) | Game lifetime | `state`, `train`, `construct`, `attack`, `scout`, `check` |
+
+Three distinct consumers, one runtime. This is **Rule 36 (primitive
+promotion when two consumers planned)** passing emphatically — not 2
+hypothetical consumers, but 3 concrete consumers with overlapping
+requirements that share machinery.
+
+### Phase 1.5 — Strategic AI via `.bang` (~50-100 LOC game-local migration)
+
+**Layer boundary clarification** (important; documented in the existing
+`stb/stbai.bsm` header as of commit `52e2dab`):
+
+- `stbai` cartridge = **genre-agnostic primitives only** (line-of-sight
+  raycast, steering helpers, move-with-collision). The cartridge
+  header explicitly excludes "state machines, per-frame dispatch,
+  combat/target acquisition logic" — those stay in calling games.
+- `rts1_ai.bsm` (game-local module) = **the RTS strategic brain**
+  (build orders, economy FSM, attack waves, scouting state).
+  Consumes `stbai` primitives where useful (LoS for scout vision,
+  steering for unit movement) but owns all game-genre logic.
+
+So the migration path is for the **game-local AI brain module**, not
+for the stbai cartridge:
+
+Discovered via rts1 S11 AI design (2026-05-26): build orders are
+state-machine sequences naturally expressed in `.bang` syntax. **rts1_ai
+V1** ships with hardcoded struct-array build orders (because bangscript
+runtime is post-RPG); **rts1_ai V2** migrates to `.bang` files when
+bangscript runtime is available. The same migration pattern would apply
+to any future game-local AI brain module (rpg2_ai.bsm, tactics_ai.bsm,
+etc.) that consumes the bangscript runtime.
+
+Example `.bang` strategic AI (consumed by rts1_ai.bsm, not by stbai):
+
+```bang
+# games/rts1/ai/peon_rush_orc.bang
+ai_strategy peon_rush_orc
+  state opener
+    on supply 4: train peon
+    on supply 5: train peon
+    on supply 6: construct barracks
+    on supply 8: train peon
+    on supply 9: train grunt
+    check enemy_scouted -> response
+    check barracks_done -> midgame
+
+  state midgame
+    train grunt
+    train grunt
+    check army_count >= 5 -> attack
+    check enemy_attacking -> defend
+
+  state attack
+    rally_at enemy_hq
+    attack
+    check army_count < 3 -> defend
+```
+
+The strategic command set (`train`, `construct`, `attack`, `scout`,
+`rally_at`, `defend`) is registered by `rts1_ai.bsm` as bangscript
+callbacks via `bangs_register("train", fn_ptr(_rts1_ai_cmd_train))`.
+Each handler lives in `rts1_ai.bsm` because the semantics are RTS-
+genre-specific (a `train` command means something only inside an RTS).
+`stbai` primitives (LoS, steering) are reused as helpers from within
+those handlers.
+
+See `games/rts1/rts1_handoff.md` Session 11 for the rts1_ai design.
+
 ### Shared Modules (Land Earlier with RPG / RTS)
 
 | Module | Built during | Purpose for bangscript |
@@ -532,21 +726,32 @@ cursor_over_hotspot()            — Returns hotspot_id or -1.
 
 | Category | Lines | When |
 |----------|-------|------|
-| `stbbangs.bsm` (parser + scheduler + dispatcher + flags + special vars + REPL) | ~950 | After RPG ships |
+| `stbbangs.bsm` (Layer 2 machine + Layer 3 commands + coroutine + scene + special vars + REPL) | ~1500 | After RPG ships |
 | `stbverb.bsm` | ~200 | Together with stbbangs |
 | `stbcursor.bsm` | ~80 | Together |
 | Adventure demo game code (`.bpp` + `.bang` files) | ~500-800 | After all modules ship |
-| **Total bangscript-specific** | **~1730-2030** | **~4-6 weeks** |
+| **Total bangscript-specific** | **~2280-2580** | **~5-7 weeks** |
+
+LOC trajectory across estimates:
+
+| Date | Estimate | Source |
+|---|---|---|
+| Initial plan | ~700 stbbangs (~1500-1800 total) | Intuition |
+| Post-AyumuScript additions (special vars, expressions, var/loop/spawn, REPL) | ~950 stbbangs (~1730-2030 total) | Plan revision 2026-05-25 |
+| Post-AyumuScript study (Hybrid Strategy lock) | **~1500 stbbangs (~2280-2580 total)** | Reference impl validation 2026-05-26 |
+
+The growth is not feature creep — it is **estimate honesty**. The first
+two numbers underestimated the interpreter machine (expression evaluator,
+call stack, special-variable resolver). Studying AyumuScript's ~1200 LOC
+C++ implementation grounds the bangscript estimate against a working
+reference. ~1500 LOC for the same machine + bangscript-specific layers
+(coroutine, scene graph, hotspot dispatch) is honest.
 
 Compare to the embedded approach: **~2300-2600 lines, ~4-6 weeks**.
-The `.bang` format saves ~600 lines and 0-2 weeks even with the
-AyumuScript-inspired additions, AND removes the metaprog dependency.
-
-The ~250 LOC over the original ~1500-1800 estimate comes from the
-AyumuScript-derived additions (special variables, expression
-evaluator, `var` / `loop` / `spawn` commands, REPL eval). The
-expressivity gain is large — many puzzle/scene patterns that would
-have needed B++ callbacks become readable `.bang` directly.
+The `.bang` format still saves the metaprog dependency entirely and
+arrives at similar LOC with **dramatically better designer ergonomics**
+(text format, hot reload, three-consumer runtime). The win is qualitative,
+not quantitative.
 
 ---
 

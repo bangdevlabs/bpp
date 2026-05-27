@@ -3,7 +3,7 @@
 Pending-only. Detail lives in `docs/plans/*.md`. Shipped work lives
 in `docs/journal.md` + commit history.
 
-Last refresh: 2026-05-22 (load/import arc close).
+Last refresh: 2026-05-25 (Wave 21 spine + dispatch regression + T_MEMST + HUD perf — see journal).
 
 ---
 
@@ -16,6 +16,19 @@ Last refresh: 2026-05-22 (load/import arc close).
   Three latent bugs uncovered + fixed (BSYS_* collision,
   mod_bnds + topo coupling, outlining @safe gate). Suite
   179/0/12 + 144/0/47. See `docs/plans/sidequest_load_import_distinction.md`.
+
+- ~~**Dispatch regression + spine closeout.**~~ **CLOSED 2026-05-25**
+  (`48d16e1` → `3076e60`). P6's defer-emit activated latent MAP synths
+  in non-`@safe` stb hosts (snake yellow-dot, FPS magenta); strict
+  `@safe` gate (`48d16e1`) now requires host `@safe` for BOTH outlining
+  and MAP, W032 retired. A silent T_MEMST float→int store bug
+  (`fmov`/`movq` reinterpret vs `fcvtzs`/`cvttsd2si` truncate), latent
+  for months, surfaced + fixed both backends (`2b0bbef`/`e4bdf9a`,
+  test `test_memst_float_to_int.bpp`). Wave 20+21 collapsed both chip
+  AST walkers into the spine (~1300 LOC deleted); E233 cross-module
+  global float recovery; HUD per-frame malloc killed (Rule 40 + new
+  `profile_print_chains` helper). Suite 180/0/12 + 145/0/47, bootstrap
+  0.34s. See journal 2026-05-23..25.
 
 - **RTS adoption** — substantially larger than FPS adoption was.
   rts1's hot loops live inside `ecs_query_each(q, fn_ptr(callback))`
@@ -43,17 +56,18 @@ Last refresh: 2026-05-22 (load/import arc close).
   outlining + autovec adoption. Closes the empirical loop on
   multi-module compose-multiplicatively. `bench_compose.bpp`
   already shows 6x at single-module scale.
-
+va
 - **mark_reachable proper fix** — extend call-graph seeds to
   cover signal handlers, fn_ptr passed via externs. Currently
   ~471 reachable functions are pruned but needed at runtime;
   P6 of the load/import arc works around by suppressing the
   lazy filter for non-entry modules. ~50-100 LOC.
 
-- **W031 audit** — load/import P3+P4's correct attribution
-  exposed 27 cross-module-static-call warnings. Each is a real
-  architectural smell. Audit + fix per warning. Mostly in chip
-  backends (a64/x64 cross-calls to encoder primitives).
+- **W020 cross-module-static audit** — load/import P3+P4's correct
+  attribution exposed 27 cross-module-static-call warnings. The
+  chip-backend bulk (a64/x64 cross-calls to encoder primitives) was
+  cleared 2026-05-23 (`99a0d58` — dropped `static` from those
+  helpers). Re-run the suite and audit any remaining sites.
 
 - **Content arc — decision point.** Engine no longer gates any of
   the four candidates: Wolf3D Phase 2 cont., Adventure Puzzle,

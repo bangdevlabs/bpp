@@ -202,10 +202,46 @@ const _RING_H = 16;
 // Render every HUD layer that lives on top of the world. Call once
 // per frame AFTER ecs_render_units so the rings land on top of the
 // sprites, BEFORE game_render_end so the GPU pass commits the draw.
+// Drop dead entities from the current selection. A selected unit can die
+// in combat and a selected building can now be razed (S11 combat-target
+// pass), either of which leaves selected_eids[] pointing at a dead ECS row.
+// ecs_get returns 0 for a dead slot, so rendering that selection's ring /
+// portrait / stats dereferences 0 -> SIGSEGV (the wc1_hud_render crash in
+// the 2026-05-26 skirmish report). Compacting here, first thing each frame
+// (after the combat tick that may have killed the entity, before any
+// deref), keeps the whole HUD safe AND hands the input layer a clean
+// selection for free (the selected_* globals are shared).
+static void _prune_dead_selection(world) {
+    auto i, wr;
+    if (selected_count <= 0) { return; }
+    if (selected_kind == SEL_KIND_BUILDING) {
+        if (ecs_alive_at(world, selected_eids[0]) == 0) {
+            selected_count = 0;
+            selected_kind  = SEL_KIND_NONE;
+        }
+        return;
+    }
+    // Unit selection — compact the live eids to the front of the buffer.
+    wr = 0;
+    for (i = 0; i < selected_count; i++) {
+        if (ecs_alive_at(world, selected_eids[i]) != 0) {
+            selected_eids[wr] = selected_eids[i];
+            wr = wr + 1;
+        }
+    }
+    selected_count = wr;
+    if (selected_count <= 0) { selected_kind = SEL_KIND_NONE; }
+    return;
+}
+
 wc1_hud_render(world) {
     auto p: Pos, sx, sy, i, eid;
     auto cx, cy, rx, ry, rw, rh;
     auto b: Building, def: BuildingDef;
+    // Prune any dead selection BEFORE the rings / portrait / stats read it,
+    // so a unit that just died or a building that was just razed can't
+    // crash the HUD (2026-05-26 skirmish SIGSEGV).
+    _prune_dead_selection(world);
     // Selection rings — geometry per selection kind.
     if (selected_kind == SEL_KIND_BUILDING && selected_count > 0) {
         // Single-building selection: ring matches the building's

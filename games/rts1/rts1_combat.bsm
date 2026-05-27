@@ -43,6 +43,7 @@ load   "rts1_missiles.bsm";
 // (`fn(world, eid)`) means combat state flows through globals.
 extrn pos_comp, sheet_comp, attack_target_comp, path_comp, anim_comp, faction_comp;
 extrn peasant_q;
+extrn building_comp;    // S11 — tells a building target from a unit (ecs_has)
 
 // Per-tick dt in ms — set once at the top of wc1_combat_tick so
 // the per-entity callback reads a global instead of re-querying
@@ -143,7 +144,7 @@ static void _combat_step(w, eid) {
     auto an: Anim, my_p: Pos, target_p: Pos, my_pa: Path;
     auto target_eid, dist_tiles, my_range;
     auto cooldown_ms, damage, target_armor, target_hp;
-    auto my_dtype, target_size, mult_pct;
+    auto my_dtype, target_size, mult_pct, target_is_building;
 
     an = ecs_get(w, anim_comp, eid);
 
@@ -199,10 +200,17 @@ static void _combat_step(w, eid) {
         return;
     }
     // Also skip if target is mid-death-animation — let it finish.
-    target_an = ecs_get(w, anim_comp, target_eid);
-    if (target_an.state == UNIT_STATE_DYING) {
-        _disengage(an, at);
-        return;
+    // Buildings share Pos / Faction / Sheet with units but carry NO Anim
+    // (their archetype omits it), so the DYING check applies to units only.
+    // ecs_has(building_comp) is the discriminator — the engine primitive
+    // graduated this session.
+    target_is_building = ecs_has(w, building_comp, target_eid);
+    if (target_is_building == 0) {
+        target_an = ecs_get(w, anim_comp, target_eid);
+        if (target_an.state == UNIT_STATE_DYING) {
+            _disengage(an, at);
+            return;
+        }
     }
 
     // Tile-space distance — close enough to engage?
@@ -322,12 +330,18 @@ static void _combat_step(w, eid) {
     putstr("\n");
 
     if (target_hp <= 0) {
-        // Death — flip the target into DYING so its death anim
-        // plays; the dying tick (this same function on the
-        // target's row next frame) finalizes ecs_kill_at +
-        // tile-release + heap-free after _DIE_DURATION_MS.
-        target_an.state      = UNIT_STATE_DYING;
-        target_an.elapsed_ms = 0;
+        if (target_is_building != 0) {
+            // Buildings have no death anim and aren't ticked by
+            // _combat_step (it walks peasant_q only), so raze immediately:
+            // free footprint + CharSheet + kill the row.
+            wc1_building_destroy(w, target_eid);
+        } else {
+            // Flip the unit into DYING so its death anim plays; the dying
+            // tick (this function on the target's row next frame) finalizes
+            // ecs_kill_at + tile-release + heap-free after _DIE_DURATION_MS.
+            target_an.state      = UNIT_STATE_DYING;
+            target_an.elapsed_ms = 0;
+        }
         at.eid = -1;
         at.last_attack_ms = 0;
         putstr("dying eid=");

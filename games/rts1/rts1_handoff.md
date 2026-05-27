@@ -1436,9 +1436,10 @@ testing:** compile + run the SAME path — `bpp rts.bpp -o rts && ./rts`
 from `games/rts1/`. `-o /rts` (root) silently fails to write on macOS,
 so `./rts` would run a stale binary (this cost a long debug detour).
 
-**S10.6 — WC1-style command card (IN PROGRESS, 2026-05-25/26):**
-bottom-bar layout kept (no camera/viewport refactor); WC1 assets used
-for the chrome.
+**S10.6 — WC1 command card (CLOSED 2026-05-26).** Started as a
+bottom-bar (S10.6.0/.1 below) but the user rejected it as too poor vs
+the original; rebuilt as the authentic WC1 **left-side vertical panel**
+with the world inset to its right (S10.6.3). WC1 assets used throughout.
   - **S10.6.0** (`d1d9ca9`) — stone panel background (`panel_1`,
     loaded raw per faction via `_load_raw_png`) replaces the flat bar.
     Faction-aware via `_hud_player_faction` (default 0 = human);
@@ -1456,22 +1457,54 @@ for the chrome.
     fill it); the stone stretch + minimap scale + blip/rect positions
     are best-effort and likely need eyeball adjustment. Per-tile
     minimap terrain is a flat backdrop for now (sampling = refinement).
-  - **S10.6.2 — unit action buttons (NEXT, not started).** Combat
-    units (footman/knight/archer/…) have the button area free (no
-    build/train) — put Move/Stop/Attack/Hold/Patrol there using the
-    `icons.lua` frames (move 33/34, repair 35, harvest 36, attack ~40).
-    Stop (clear Target + AttackTarget + Path → IDLE) is the simple win;
-    Move/Attack overlap right-click; Hold/Patrol need a small state
-    machine. Better done with the user (testable + the cramped layout
-    needs eyes). Peasants are build-icon-focused; their Move/Stop is a
-    follow-on.
+  - **S10.6.2 — unit action buttons (DONE, folded into S10.6.3).**
+    Combat units get Move/Stop/Attack; the peasant got the full
+    two-level build card. See below.
 
-**S11 (AI baseline) is next** — the genuinely MAX-worthy seam S10
-unblocks. The enemy player builds, gathers, **trains** (now
-possible — the training loop the AI drives exists), and attacks at
-5 Hz. First design call: graduate a `stbai` cartridge vs keep an
-`rts1_ai.bsm` game module (Rule 28 gate — name a second consumer:
-RPG AI? FPS enemy AI?). See the Session 11 block above.
+  - **S10.6.3 — left-panel rebuild + viewport inset (`aaabf81`,
+    `4618c27`).** The bottom bar is gone; the HUD is the full-height
+    WC1 left panel (`WC1_PANEL_W = 96`): minimap → portrait+name+HP →
+    command grid → MENU. The world view is inset to its right via a new
+    **`stbcamera` viewport origin** (`view_ox/oy`, `cam_set_viewport`,
+    raylib `Camera2D.offset` model — default `(0,0)` so the platformer
+    consumer is unaffected). Every world-space draw routes through
+    `cam_world_to_screen_*`; the ~16 click sites inherit the inverse via
+    `cam_screen_to_world_*`. Input HUD boundary flipped bottom→left
+    (`mouse_x() < wc1_panel_w()`). **Command cards are per unit type**
+    (`wc1_unit_cmd_menu`, war1gus `buttons.lua` model — entries pack
+    `(pos, action, value)`; HUD reads via `wc1_cmd_entry_*` so `CMD_*`
+    stays private): peasant root = Move/Stop/Harvest + Build Basic /
+    Build Advanced → submenu (basic: Farm/Lumber Mill/Barracks/Town
+    Hall; advanced: Blacksmith/Church/Tower/Stable) + Cancel; combat =
+    Move/Stop/Attack (sword 63 / axe 66 / arrow 71). Move/Harvest/Attack
+    arm the cursor (next world click = target); Stop halts the
+    selection. Portrait scales to FIT the box (was overflowing).
+
+  - **S10.8 — playable orc faction + race select (`9aac5cf`).**
+    `_local_player` (chosen on a race-select start screen — Humans=0 /
+    Orcs=1, click a banner or 1/2) read via `wc1_local_player()`
+    replaces every hard-coded "human == player 0" gate (selection,
+    command card, production, minimap own/other colour); entity-faction
+    roster/atlas selections stay. Camera seeds on the chosen faction's
+    start_view; panel skin follows the pick. forest1 is a 4-corner map
+    (P0/2 human, P1/3 orc), each pre-seeded → both sides playable. KEY_H
+    debug skin toggle retired.
+
+  - **Forest collision fix (`bcd6e01`, `ad9a53c`).** Units walked into
+    the forest. Two stacked causes: (1) felled trees wrote tile 95
+    ("stump") which renders as canopy in the converted tileset → flipped
+    to 109 (grass); (2) the blocking cluster stopped at 87, leaving the
+    447× canopy tile 94 walkable → extended to **71-94**. A flood-fill
+    proved all start views + gold mines stay reachable (refuting the old
+    "don't block canopy or it mazes the map" comment).
+
+**S11 (AI baseline) is THE next arc** — the genuinely MAX-worthy seam.
+The enemy player builds, gathers, **trains** (the training loop exists),
+and attacks at ~5 Hz. NOT started — pending a design alignment with the
+user. First design call: graduate a `stbai` cartridge vs keep an
+`rts1_ai.bsm` game module (Rule 28 gate — name a second consumer: RPG
+AI? FPS enemy AI?). (Note: commit `9aac5cf` is *labelled* "S11" but is
+the playable-orc extra — the real S11 = AI is still ahead.)
 
 **S10 follow-ons (not blockers — fold into a later polish pass):**
 
@@ -1487,17 +1520,29 @@ RPG AI? FPS enemy AI?). See the Session 11 block above.
   - Ranged (missile-impact) damage ignores the defender's armor
     upgrade; only the melee path reads `wc1_tech_armor_bonus` today.
 
-**⚠️ Resume point for the next agent.** The rts1 working tree is
-clean — S10 is fully committed to `main` (HEAD `0cbc46f`). The only
-uncommitted items are doc edits the user is batching:
-`docs/journal.md` (2026-05-23..25 entries) + `docs/todo.md`
-(refresh). The earlier README / Rule 41 / BangBox tray is already
-committed.
+**⚠️ Resume point for the next agent.** rts1 HEAD is `ad9a53c`. S10
+(production) + S10.6 (WC1 left command panel) + playable orc + race
+select + forest fix are all committed to `main` (`4618c27` stbcamera,
+`aaabf81` panel, `9aac5cf` orc, `bcd6e01` + `ad9a53c` forest). The only
+uncommitted items are doc edits the user batches (`docs/journal.md`,
+`docs/todo.md`, this handoff). **Next arc = S11 enemy AI — DESIGN FIRST,
+not yet aligned with the user** (stbai cartridge vs rts1_ai.bsm; see the
+S11 paragraph below).
 
-The **bpp binary is unchanged since `90f83f6`** (S10 is pure rts1
-game code — zero compiler/runtime edits). All suites green
-(180/0/12 + 145/0/47 + Linux/Docker headless 5/5). Bootstrap 0.34s
-nominal. Use `bpp` from repo as-is.
+**Build note:** `stbcamera` was edited (a cartridge), so compiling rts1
+from inside `games/rts1/` needs the installed copy refreshed once
+(`sudo cp stb/stbcamera.bsm /usr/local/lib/bpp/stb/`) OR build from the
+repo root (`./bpp games/rts1/rts.bpp -o games/rts1/rts`, where the repo
+`stb/` wins). The committed `games/rts1/rts` binary is current.
+
+The **bpp binary is unchanged since `90f83f6`** (all rts1 work is pure
+game code — zero compiler/runtime edits). Use `bpp` from repo as-is.
+
+**S10 follow-ons still open (polish, non-blocking):** per-kind
+`food_cost` (knight=2 counts as 1), over-queue past food cap, trained
+units stack with no rally free-tile resolution, ranged damage ignores
+armor upgrade. Forest now depletes one-chop-per-tile (WC1 takes several)
+— a tuning follow-on if gradual depletion is wanted.
 
 **Compiler context the next session inherits:** Wave 21 closeout
 shipped today (chip emit_node walkers retired, spine cg_emit_node

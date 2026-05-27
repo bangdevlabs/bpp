@@ -28,6 +28,7 @@ import "stbtile.bsm";
 import "stbimage.bsm";       // for file_watch_register / file_watch_tick
 import "stbecs.bsm";         // ECS world for unit entities
 import "stbcamera.bsm";      // 2D camera state + clamp
+import "stbprofile.bsm";     // P toggles FPS / frame-time / top-N HUD (flick triage)
 load   "rts1_map.bsm";        // sibling .bsm — load, not import (Rule 0)
 load   "rts1_units.bsm";
 load   "rts1_anims.bsm";
@@ -42,6 +43,7 @@ load   "rts1_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
 load   "rts1_production.bsm";  // S8 — construction state-machine tick
 load   "rts1_resources.bsm";   // S9 — gold/wood/food + food-cap recompute
 load   "rts1_gather.bsm";      // S9 — peasant gather/return state machine
+load   "rts1_ai.bsm";          // S11 — enemy AI brain (econ/buildup/attack)
 
 // ── Constants ────────────────────────────────────────────
 
@@ -600,6 +602,17 @@ main() {
     _seed_town_halls_for_players(world, map);
     _spawn_units_from_level(world, map);
 
+    // S11 — wake the enemy AI. It commands the faction diagonally
+    // opposite the local player (local ^ 1) and hunts the local user.
+    // Runs after spawns so its town hall + starting worker exist.
+    wc1_ai_init(world, wc1_local_player() ^ 1, wc1_local_player());
+
+    // Profiler HUD (stbprofile) — off until P is pressed. Wired to triage
+    // the render flicks seen in skirmish play: FPS + frame-time avg/max +
+    // a top-N hot-function sampler. Pure overlay; nothing draws until the
+    // toggle is on.
+    init_profile();
+
     // Game loop. Identical shape to the existing pathfind /
     // platformer / fps_3d_gpu loops — game_frame_begin handles
     // dt + input polling; game_render_begin / end wrap the GPU
@@ -616,12 +629,19 @@ main() {
             if (wc1_placement_active() != 0) { wc1_placement_cancel(); }
             else { break; }
         }
+        // P toggles the profiler HUD (FPS / frame-time / hot functions).
+        if (key_pressed(KEY_P) != 0) { profile_hud_toggle(); }
 
         _camera_pan_tick();
         wc1_input_tick(world);
         _debug_spawn_tick();
         _debug_spawn_building_tick();
         _debug_train_tick();
+        // S11 — enemy AI strategic step (5 Hz internally). Runs BEFORE
+        // combat + movement so the orders it issues this frame (gather
+        // assignments, attack targets, group moves) are picked up by
+        // those ticks immediately.
+        wc1_ai_tick(world, game_dt_ms());
         // Combat runs BEFORE movement so attackers can request a
         // fresh path-to-target this frame and the movement tick
         // walks them toward weapon range immediately. Missiles
@@ -661,6 +681,9 @@ main() {
         ecs_render_units(world);
         wc1_missiles_render();
         wc1_hud_render(world);
+        // Profiler overlay — self-gates on the P toggle, drawn last so it
+        // sits on top of the HUD. x=104 clears the 96px command panel.
+        profile_hud_draw(104, 8, 1, 0xFFFF3333);
         game_render_end();
     }
 
