@@ -175,6 +175,92 @@ static _run_tui(target_path_arg, target_idx, nargs) {
     return 0;
 }
 
+// Print a byte as two lowercase hex digits.
+static _hex2(b) {
+    auto hi, lo;
+    hi = (b >> 4) & 0xF;
+    lo = b & 0xF;
+    out_ch(hi < 10 ? hi + '0' : hi - 10 + 'a');
+    out_ch(lo < 10 ? lo + '0' : lo - 10 + 'a');
+}
+
+// -- `bug --bytes <binary> <fn>`: hexdump a function's machine code ----------
+// The foundation of an in-bug objdump. Reads the binary file, finds <fn> via
+// the .bug address map, maps the text-relative offset to a file position with
+// a minimal ELF64 parse, then hexdumps the code. This is the headless,
+// no-ptrace way to inspect what the compiler actually emitted -- exactly what
+// the Linux x64 startup hunt needs (compare a small vs a large binary's
+// `main` prologue). ELF only for now (the Linux target); Mach-O + a real
+// `--disasm` decoder are the next steps on this same module.
+static _run_bytes(bin_path, fn_name) {
+    auto fd, blen, bbuf, i;
+    auto phoff, phentsize, phnum, ph, ptype, note_off, note_fsz, code_base;
+    auto fn_off, file_pos, j, b, plen;
+
+    fd = sys_open(bin_path, 0);
+    if (fd < 0) { out_str("bug: cannot open "); out_str(bin_path); out_nl(); return 1; }
+    bbuf = malloc(16777216);
+    blen = sys_read(fd, bbuf, 16777216);
+    sys_close(fd);
+    if (blen <= 0) { out_str("bug: empty / short read"); out_nl(); return 1; }
+
+    // Minimal ELF64 parse to find where the code section begins in the file.
+    // B++ lays the exec segment out as [ELF header][program headers][PT_NOTE
+    // (build_id + minisym)][code], and the exec PT_LOAD has p_offset 0 -- so the
+    // code section starts at the file offset where the PT_NOTE segment ends, and
+    // a function at address-map offset N sits at file offset code_base + N. This
+    // is exact (verified against every function in small and large binaries);
+    // anchoring on e_entry is WRONG because e_entry points at the entry
+    // trampoline appended after main, not at the address-map `main` entry.
+    if (peek(bbuf) != 0x7F) {
+        out_str("bug --bytes: ELF only for now (Mach-O is a follow-on)"); out_nl();
+        return 1;
+    }
+    phoff     = read_u32(bbuf, 0x20);    // e_phoff
+    phentsize = read_u16(bbuf, 0x36);
+    phnum     = read_u16(bbuf, 0x38);
+    note_off = 0; note_fsz = 0;
+    for (i = 0; i < phnum; i++) {
+        ph = phoff + i * phentsize;
+        ptype = read_u32(bbuf, ph);
+        if (ptype == 4) {                          // PT_NOTE
+            note_off = read_u32(bbuf, ph + 8);     // p_offset
+            note_fsz = read_u32(bbuf, ph + 32);    // p_filesz
+        }
+    }
+    code_base = note_off + note_fsz;
+
+    // Load <binary>.bug and find the function in the address map.
+    plen = copy_cstr(pathbuf, bin_path);
+    poke(pathbuf + plen, '.'); poke(pathbuf + plen + 1, 'b');
+    poke(pathbuf + plen + 2, 'u'); poke(pathbuf + plen + 3, 'g');
+    poke(pathbuf + plen + 4, 0);
+    if (bug_load(pathbuf) < 0) { out_str("bug: cannot load "); out_str(pathbuf); out_nl(); return 1; }
+    if (bug_parse() < 0)       { out_str("bug: bad .bug map"); out_nl(); return 1; }
+
+    // Locate the target function in the address map; its offset is code-relative.
+    fn_off = 0 - 1;
+    for (i = 0; i < bug_am_count; i++) {
+        if (_cstr_eq_packed(fn_name, arr_get(bug_am_name, i))) { fn_off = arr_get(bug_am_off, i); }
+    }
+    if (fn_off < 0) { out_str("bug: no function '"); out_str(fn_name); out_str("' in the map"); out_nl(); return 1; }
+
+    file_pos = code_base + fn_off;
+
+    out_str("--- bytes: "); out_str(fn_name);
+    out_str("  (text+"); out_hex(fn_off);
+    out_str(", file "); out_hex(file_pos); out_str(") ---"); out_nl();
+    for (i = 0; i < 128; i += 16) {
+        out_str("  +"); out_hex(fn_off + i); out_str(":  ");
+        for (j = 0; j < 16; j++) {
+            b = peek(bbuf + file_pos + i + j) & 0xFF;
+            _hex2(b); out_ch(' ');
+        }
+        out_nl();
+    }
+    return 0;
+}
+
 // Print CLI usage to stderr (replaces the GUI's file dialog in this entry).
 static _usage() {
     putstr_err("bug -- CLI debugger (headless). No GUI in this build.\n");
@@ -183,6 +269,7 @@ static _usage() {
     putstr_err("  bug --tui ./program [args]   run + observe under gdbserver\n");
     putstr_err("  bug --tui --break fn ./prog  break only on function fn\n");
     putstr_err("  bug --tui --watch a,b ./prog watch names/expressions\n");
+    putstr_err("  bug --bytes ./prog fn        hexdump fn's machine code (ELF)\n");
     putstr_err("(for the windowed inspector use the GUI build, macOS only)\n");
 }
 
@@ -210,6 +297,17 @@ main() {
 
     nargs = argc_get();
     if (nargs < 2) { _usage(); return 1; }
+
+    // `--bytes <binary> <fn>` is a sub-command: it takes two positional args
+    // (a binary and a function name) and never observes, so it bypasses the
+    // flag/observe machinery below. Dispatch it before anything else.
+    if (_cstr_eq(argv_get(1), "--bytes")) {
+        if (nargs < 4) {
+            out_str("bug: --bytes requires <binary> <function>"); out_nl();
+            return 1;
+        }
+        return _run_bytes(argv_get(2), argv_get(3));
+    }
 
     // Parse flags. The first non-flag argument is the target; everything
     // after it is forwarded to the target.
