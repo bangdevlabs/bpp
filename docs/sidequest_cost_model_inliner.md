@@ -1,8 +1,18 @@
 # Sidequest — Cost-model inliner (S4)
 
-**Status:** IN PROGRESS 2026-05-21. P0a + P1 + P2 + P3a
-shipped (loop_depth + cost function + threshold function +
-unified classifier). P3b next.
+**Status:** SHIPPED / CLOSED 2026-05-21. The full arc landed —
+P0a (loop_depth) + P1 (cost function) + P2 (per-callsite threshold)
++ P3a (unified classifier + a64 splice guard) + P3b-1/2/3 (multi-statement
+splice: infrastructure → activation for `param_refs ≤ 1` → smart-bind param
+strategy + B3 ref-count propagation), closed out by `3076e60` ("Inline +
+Outline: the structural-work compiler"). Journal records ~1.1x on the bench
+anchor. **The inliner is DONE — do not re-open it.** Everything below was the
+in-progress plan; it is kept for the design rationale only. ARM64-only still
+holds (x86_64 gated on the Linux x86_64 health sidequest; see below).
+
+> Doc-rot note (2026-05-27): this header read "IN PROGRESS / P3b next" for
+> six days after P3b-1/2/3 actually shipped, which nearly led to re-opening
+> closed work. Status corrected to match the commit log + journal.
 
 **Target backend:** **ARM64 only.** The x86_64 backend has had
 Phase B2 disabled since 2026-04-15 (`19da538`) pending
