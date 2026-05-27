@@ -61,6 +61,25 @@ void _mem_free_pages(raw, total) {
     sys_munmap(raw, total);
 }
 
+// Fill a FileInfo (by raw offset — is_dir at 0, size at 8, mtime at 16;
+// see the struct in bpp_file.bsm) by stat-ing `path`. Linux x86_64
+// `struct stat`: st_mode is a 32-bit field at byte 24, so the directory
+// format bit (0x4000) lands in byte 25; st_size is at byte 48; st_mtim is
+// at byte 88 (tv_sec) + 96 (tv_nsec). Returns 1 on success, 0 otherwise.
+// One syscall, never reads bytes. (Offsets per the x86_64 ABI; the macOS
+// host can't exercise this path — verify when a Linux build is run.)
+_file_stat(path, info_out) {
+    auto st, rc;
+    st = malloc(160);                  // struct stat is 144 bytes; round up
+    rc = sys_stat(path, st);
+    if (rc < 0) { free(st); return 0; }
+    *(info_out + 0)  = ((peek(st + 25) & 0xF0) == 0x40);         // is_dir
+    *(info_out + 8)  = *(st + 48);                               // size
+    *(info_out + 16) = *(st + 88) * 1000000000 + *(st + 96);     // mtime token
+    free(st);
+    return 1;
+}
+
 // ── Section 3: Time + threads ─────────────────────────────────
 //
 // Time uses the clock_gettime syscall directly (no shared lib).
