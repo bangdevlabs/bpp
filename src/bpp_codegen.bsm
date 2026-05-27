@@ -1622,15 +1622,22 @@ cg_builtin_dispatch(n) {
     //
     // Eval order — produces `acc = arr`, `scratch = i * 8`, then
     // `emit_mem_read_indexed(8)` does `acc = peek_w(acc + scratch)`:
-    //   1. emit_node(i)       → acc = i                (LHS for shl)
+    //   1. emit_node(i)       → acc = i
     //   2. push_acc           → stack = [i]
-    //   3. mov_imm(3)         → acc = 3                (RHS — shift count)
-    //   4. pop_scratch        → scratch = i            (LHS in left reg)
-    //   5. emit_shl(1)        → acc = scratch << acc = i << 3 = byte_offset
+    //   3. mov_imm(8)         → acc = 8                (element size)
+    //   4. pop_scratch        → scratch = i
+    //   5. emit_mul(1)        → acc = i * 8 = byte_offset  (== i << 3)
     //   6. push_acc           → stack = [byte_offset]
     //   7. emit_node(arr)     → acc = arr              (base, re-eval AST)
     //   8. pop_scratch        → scratch = byte_offset
     //   9. mem_read_indexed(8)→ acc = *(acc + scratch) = arr[i]
+    //
+    // Byte offset via `i * 8`, not `i << 3`: emit_shl's operand order is
+    // chip-specific (a64 does scratch<<acc via left_reg; x64 pins the value
+    // to rax and shifts by cl, so the same manual arrangement yields `3 << i`
+    // on x64 -- the exact crash arr_len hit). Multiplication commutes, so
+    // `i * 8` lands correctly on both chips regardless of which operand each
+    // parks in acc vs scratch, and equals i << 3 for any array index.
     //
     // Total: 9 spine calls vs the prior ~14-instr function-call
     // frame. The chip primitive uses ARM64's native register-offset
@@ -1644,9 +1651,9 @@ cg_builtin_dispatch(n) {
         ety = call(p.emit_node, *(arr + 8));  // i (second arg)
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
         call(p.emit_push_acc);                // stack = [i]
-        call(p.emit_mov_imm, 3);              // acc = 3 (shift count)
+        call(p.emit_mov_imm, 8);              // acc = 8 (element size)
         call(p.emit_pop_scratch);             // scratch = i
-        call(p.emit_shl, 1);                  // acc = i << 3 = byte offset
+        call(p.emit_mul, 1);                  // acc = i * 8 = byte offset (== i << 3)
         call(p.emit_push_acc);                // stack = [byte_offset]
         ety = call(p.emit_node, *(arr + 0));  // arr (base, re-eval AST)
         if (ety == 1) { call(p.emit_coerce_float_to_int); }
