@@ -12233,3 +12233,86 @@ next memory bug. Caveat for tomorrow: the games are **not** in the test
 suite, so a latent use-after-free in rts1 could surface under recycle
 that the suite never sees — `_MEM_DEBUG` is the tool to point at it if a
 playtest goes wrong.
+
+## 2026-05-27 (later) — `file_stat` builtin + Aseprite-aware hot-reload (the profile's second target)
+
+With the recycling allocator shipped, the rts1 profile's top three were
+`_mem_*_pages` + `file_read_all` — and they turned out to be the **same**
+cause: the game loop re-read whole asset files every frame to detect
+changes. Killing that drove a new filesystem-metadata capability and,
+along the way, fixed a hot-reload gap the Aseprite asset format had been
+hiding.
+
+### The hunt: not a leak, a per-frame re-read
+
+`_mem_alloc_pages == _mem_free_pages` in the sample (perfect symmetry =
+churn, not a leak). The driver was `rts.bpp` calling `file_watch_tick()`
+**every frame** on the 16 KB `forest1.json` — a >4 KB allocation through
+the page path (the free-list only serves ≤4 KB), read + hashed in full
+each tick. `game_frame_begin` already auto-ticks the *throttled*
+hot-reload, so the explicit per-frame call was pure redundant waste;
+deleting it (`f0846f9`) cut the dominant cost. But the deeper problem was
+that *change detection itself read the whole file* — even throttled, every
+poll re-read + FNV-hashed the manifest and the sprite sheets.
+
+### `file_stat` — filling a real stdlib gap (`f856588`)
+
+The project had **no** filesystem-metadata capability: existence was a
+`sys_open`+`sys_close` hack, size meant reading the whole file, "mtime" was
+a content hash, `is_dir` was impossible. The cousins (Go `FileInfo`, Rust
+`Metadata`, Zig, WASI) all converge on a `stat`-returning struct with the
+portable `size + mtime + is_dir` subset, so that is what B++ got:
+
+- a new **`sys_stat` builtin** through the four canonical sites (the spine's
+  `cg_builtin_dispatch` with a `CG_SYS_STAT` portable id, the per-chip
+  `_a64_sys_num`/`_x64_sys_num` mappers → `BSYS_MACOS_STAT64` (338) /
+  `BSYS_LINUX_STAT` (4), the validator, the C emitter → `stat()`), and
+- `struct FileInfo { is_dir, size, mtime }` + `file_stat(path, info_out)` in
+  `bpp_file.bsm`, with per-OS `_file_stat` in `_core_<os>.bsm` pulling the
+  fields from each platform's `struct stat` offsets (macOS stat64/INODE64
+  verified against `ls -l`; Linux x86_64 offsets per the ABI). `mtime` is an
+  opaque change token (compare with `!=` only).
+
+Bootstrap byte-stable; native 180/0/12 + C 145/0/47. `_image_file_hash` then
+switched to return the file's mtime (one stat, no read) with the content
+hash as a fallback (`076ddd8`).
+
+### The Aseprite catch — the question that saved the arc
+
+A first optimization skipped `_image_combined_hash`'s read+parse whenever the
+combined token equalled the bare manifest token (i.e. "no siblings"). It
+shipped green and the profile showed `file_read_all` gone. Then the right
+question: **"but these are Aseprite assets — isn't that the pattern we built
+for?"** Checking the data: every rts1 atlas is the literal Aseprite export
+(`"frames":[…]`, `"meta":{"image":"peasant.png"}`) — the pixels live in the
+**sibling PNG**, and `_image_combined_hash` had only ever chased `atlas_pack`
+`sprites[].path` siblings, never the Aseprite `meta.image`. So editing a
+sprite PNG in Modulab (which writes the PNG, not the JSON) would *never*
+hot-reload — a pre-existing gap the "no siblings" optimization would have
+cemented. The checkpoint commits made the revert painless.
+
+The proper version watches the `meta.image` sibling (and any `atlas_pack`
+paths) AND caches the resolved sibling list on the `Image`, re-reading +
+re-parsing the manifest **only when its own mtime changes** — every other
+poll just stats the cached siblings (`004c61c`). New `Image` fields come
+zero-initialised for free (the free-list zeroes on carve and on reuse-pop,
+a guarantee worth remembering). Result: `file_read_all` is gone from the
+frame profile (steady-state cost is cheap `_file_stat` polling), and editing
+the level or a sprite in Bang 9 updates the running rts1 **live** — verified
+on screen, edit-in-IDE → see-in-game with no restart.
+
+### Doctrine this arc forged
+
+- **Verify the premise of a bisect/optimization before acting on it.** The
+  "no siblings" conclusion came from grepping only for `atlas_pack`; the
+  Aseprite `meta.image` was the variant that mattered. When an optimization
+  rests on "this case never happens", grep twice — the known case, then its
+  variants.
+- **Checkpoints protect experimentation.** Shipping each verified step
+  (free-list → A0 → parser fixes → file_stat → mtime) as its own commit is
+  what made trying — and reverting — the wrong `_image_combined_hash`
+  shortcut a one-command operation instead of a salvage job.
+- **mtime polling is enough for good hot-reload UX.** Zero reads in steady
+  state, still catches sibling-PNG edits — no FSEvents/inotify needed at this
+  scale, matching the market study (polling is every serious watcher's
+  universal fallback anyway).
