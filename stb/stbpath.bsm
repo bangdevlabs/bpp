@@ -91,7 +91,9 @@ struct PathFinder {
     heap,               // w*h word array: min-heap of cell indices by f_score
     heap_pos,           // w*h word array: heap_pos[cell] = pos in heap, -1 if absent
     heap_cnt,           // current heap size in entries
-    closed              // w*h byte array: 1 if cell has been finalized
+    closed,             // w*h byte array: 1 if cell has been finalized
+    touched,            // w*h word array: indices of cells written this query
+    touched_cnt         // count of live entries in `touched`
 }
 
 // Sentinel value used in the g_score / f_score arrays to mean "infinity".
@@ -119,8 +121,7 @@ path_new(w, h) {
 
     // Phase D dogfood (2026-04-22): arr_byte / arr_word replace the
     // raw mallocs, and buf_fill zeros the cell mask in a single call
-    // instead of the per-byte loop. Other buffers stay uninitialized
-    // here on purpose — path_clear() seeds them per-query.
+    // instead of the per-byte loop.
     pf.cells     = buf_byte(n);         // 1 byte per cell
     pf.g_score   = buf_word(n);
     pf.f_score   = buf_word(n);
@@ -128,9 +129,27 @@ path_new(w, h) {
     pf.heap      = buf_word(n);
     pf.heap_pos  = buf_word(n);
     pf.closed    = buf_byte(n);
+    pf.touched   = buf_word(n);         // dirty list: cells written per query
     pf.heap_cnt  = 0;
+    pf.touched_cnt = 0;
 
     buf_fill(pf.cells, 0, n);
+
+    // Seed the per-cell scratch to its "untouched" defaults ONCE here.
+    // path_clear() used to do this full sweep every query; now it only
+    // rewinds the cells a search actually touched (the dirty list), so
+    // every untouched cell must already hold these defaults — otherwise
+    // the first query would read garbage from a never-cleared cell.
+    auto i;
+    i = 0;
+    while (i < n) {
+        pf.g_score[i]   = PATH_INF;
+        pf.f_score[i]   = PATH_INF;
+        pf.came_from[i] = -1;
+        pf.heap_pos[i]  = -1;
+        poke(pf.closed + i, 0);
+        i++;
+    }
     return pf;
 }
 
@@ -145,6 +164,7 @@ void path_free(pf) {
     if (p.heap != 0)      { free(p.heap); }
     if (p.heap_pos != 0)  { free(p.heap_pos); }
     if (p.closed != 0)    { free(p.closed); }
+    if (p.touched != 0)   { free(p.touched); }
     free(pf);
 }
 
@@ -172,23 +192,30 @@ path_is_blocked(pf, gx, gy) {
 
 // ── Search internals ────────────────────────────────────────
 
-// Reset all per-query state: scores to infinity, came_from to -1,
-// heap and heap_pos cleared, closed set empty.
+// Rewind the per-query state for the NEXT search. Lazy clear: instead
+// of sweeping all w*h cells, walk the dirty list — the cells the last
+// search actually wrote — and reset only those to their "untouched"
+// defaults. A short search (a unit chasing an adjacent target, the
+// common case in a melee) touches a handful of cells, so this is O(path
+// frontier) rather than O(grid). path_new() seeds every cell to these
+// defaults once, and _path_relax / path_find append each cell to the
+// dirty list the first time they write it, which keeps this in sync.
 static void path_clear(pf) {
-    auto p: PathFinder, n, i;
+    auto p: PathFinder, i, idx;
     p = pf;
-    n = p.w * p.h;
 
     i = 0;
-    while (i < n) {
-        p.g_score[i]   = PATH_INF;
-        p.f_score[i]   = PATH_INF;
-        p.came_from[i] = -1;
-        p.heap_pos[i]  = -1;
-        poke(p.closed + i, 0);
+    while (i < p.touched_cnt) {
+        idx = p.touched[i];
+        p.g_score[idx]   = PATH_INF;
+        p.f_score[idx]   = PATH_INF;
+        p.came_from[idx] = -1;
+        p.heap_pos[idx]  = -1;
+        poke(p.closed + idx, 0);
         i++;
     }
-    p.heap_cnt = 0;
+    p.touched_cnt = 0;
+    p.heap_cnt    = 0;
 }
 
 // Manhattan distance between two grid cells. Used as the A* heuristic
@@ -202,30 +229,29 @@ static _path_manhattan(ax, ay, bx, by) {
 
 // ── Binary heap with indexed positions ──────────────────────
 
-// Swap two heap entries by position and update heap_pos for both cells.
-// Keeping heap_pos in sync after every swap is what makes decrease-key
-// possible without searching the heap linearly.
-static void _path_heap_swap(pf, i, j) {
-    auto p: PathFinder, ci, cj;
-    p = pf;
-    ci = p.heap[i];
-    cj = p.heap[j];
-    p.heap[i] = cj;
-    p.heap[j] = ci;
-    p.heap_pos[ci] = j;
-    p.heap_pos[cj] = i;
-}
+// The heap-entry swap (swap heap[i]/heap[j] + fix heap_pos for both cells)
+// used to be a _path_heap_swap helper here; it is now inlined by hand into
+// _path_heap_sift_up and _path_heap_sift_down, the only two callers, because
+// the call frame around its 6-write body showed up in the A* heap hot loop.
 
 // Move the entry at position i upward toward the root while its
 // f_score is less than its parent's. Stops when the heap property
 // is satisfied or the entry reaches the root.
 static void _path_heap_sift_up(pf, i) {
-    auto p: PathFinder, parent;
+    auto p: PathFinder, parent, ci, cj;
     p = pf;
     while (i > 0) {
         parent = (i - 1) / 2;
         if (p.f_score[p.heap[parent]] <= p.f_score[p.heap[i]]) { return; }
-        _path_heap_swap(pf, i, parent);
+        // Swap heap[i] with heap[parent], keeping heap_pos in sync. Inlined
+        // by hand from the former _path_heap_swap helper — the call frame
+        // around a 6-write body was a measurable cost in the A* heap hot loop.
+        ci = p.heap[i];
+        cj = p.heap[parent];
+        p.heap[i]      = cj;
+        p.heap[parent] = ci;
+        p.heap_pos[ci] = parent;
+        p.heap_pos[cj] = i;
         i = parent;
     }
 }
@@ -234,7 +260,7 @@ static void _path_heap_sift_up(pf, i) {
 // child while the heap property is violated. Stops when both children
 // have larger f_score or the entry has no children.
 static void _path_heap_sift_down(pf, i) {
-    auto p: PathFinder, n, left, right, smallest;
+    auto p: PathFinder, n, left, right, smallest, ci, cj;
     p = pf;
     n = p.heap_cnt;
     while (1) {
@@ -248,7 +274,14 @@ static void _path_heap_sift_down(pf, i) {
             smallest = right;
         }
         if (smallest == i) { return; }
-        _path_heap_swap(pf, i, smallest);
+        // Swap heap[i] with heap[smallest], keeping heap_pos in sync. Inlined
+        // by hand from the former _path_heap_swap helper (call-frame cost).
+        ci = p.heap[i];
+        cj = p.heap[smallest];
+        p.heap[i]        = cj;
+        p.heap[smallest] = ci;
+        p.heap_pos[ci]   = smallest;
+        p.heap_pos[cj]   = i;
         i = smallest;
     }
 }
@@ -351,6 +384,15 @@ static void _path_relax(pf, cur_idx, nx, ny, gx, gy) {
     tentative = p.g_score[cur_idx] + 1;
     if (tentative >= p.g_score[n_idx]) { return; }
 
+    // First write to this cell (its score was still infinity)? Append it
+    // to the dirty list so the next path_clear knows to rewind it. Later
+    // decrease-key updates of the same cell already have a finite score,
+    // so they don't re-record — each cell appears at most once.
+    if (p.g_score[n_idx] == PATH_INF) {
+        p.touched[p.touched_cnt] = n_idx;
+        p.touched_cnt = p.touched_cnt + 1;
+    }
+
     p.came_from[n_idx] = cur_idx;
     p.g_score[n_idx]   = tentative;
     p.f_score[n_idx]   = tentative + _path_manhattan(nx, ny, gx, gy);
@@ -397,9 +439,13 @@ path_find(pf, sx, sy, gx, gy, out_buf, max_steps) {
 
     path_clear(pf);
 
-    // Seed the open heap with the start cell.
+    // Seed the open heap with the start cell. Record it in the dirty list
+    // too — it's the one cell whose score is set here rather than via
+    // _path_relax, so path_clear would otherwise never rewind it.
     p.g_score[start_idx] = 0;
     p.f_score[start_idx] = _path_manhattan(sx, sy, gx, gy);
+    p.touched[p.touched_cnt] = start_idx;
+    p.touched_cnt = p.touched_cnt + 1;
     _path_heap_push(pf, start_idx);
 
     while (p.heap_cnt > 0) {
