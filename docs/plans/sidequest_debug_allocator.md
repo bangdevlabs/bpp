@@ -1,9 +1,14 @@
 # Sidequest: Debug allocator (`_MEM_DEBUG`) + `bug` watchpoints
 
-**Status:** opened 2026-05-27. **Phase A0 SHIPPED** — `_MEM_DEBUG` toggle +
-poison-on-free + skip-zero-on-pop live in `bpp_mem.bsm`, default off,
-bootstrap byte-stable, suite 180/0/12. Phases A1 (double-free), A2
-(alloc/free-PC history + leak report), B0 (`bug` watchpoints) remain open.
+**Status:** opened 2026-05-27. **Phase A0 SHIPPED + already paid off** —
+`_MEM_DEBUG` (poison-on-free + skip-zero-on-pop) was used the same day to
+crack the `_MEM_REUSE=1` corruption (`sidequest_freelist_reuse_corruption.md`):
+poison proving the corrupt byte was a *written value*, not unwritten recycled
+memory, redirected the hunt from use-after-free to a fixed-buffer overflow,
+which a source audit then located. Full recycle is now the default (`f13cc5b`).
+`_MEM_DEBUG` lives on, default off, bootstrap byte-stable, suite 180/0/12.
+Phases A1 (double-free), A2 (alloc/free-PC history + leak report), B0 (`bug`
+watchpoints) remain open as standing infra for the next memory bug.
 Opened because the free-list reuse arc
 (`sidequest_freelist_reuse_corruption.md`) is "shooting in the dark" — we
 keep bisecting by hand because we have **no memory-safety tooling**. Every

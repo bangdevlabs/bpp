@@ -1,8 +1,54 @@
 # Free-list `_MEM_REUSE=1` — Node.itype Byte Corruption Sidequest
 
-**Status**: Open. Diagnosed but not fixed. Carve-only (`_MEM_REUSE=0`) ships clean with
-+37% bootstrap speedup; this sidequest is the followup to enable full recycling for
-the per-frame allocator win on rts1.
+**Status**: ✅ RESOLVED 2026-05-27. Full recycle (`_MEM_REUSE=1`) is now the default
+(`f13cc5b`); bootstrap byte-stable + suite 180/0/12 under reuse.
+
+## Root cause (the diagnosis below pointed the wrong way — read this first)
+
+It was **not** a use-after-free and **not** in the dispatch pipeline. It was a
+**fixed-buffer heap overflow** of the same class as the `sd_*` struct-field tables:
+
+- `ph_arr` (per-function parameter type hints) and `dh_arr` (per-declaration
+  variable type hints) were each a fixed `malloc(64)` = 8 slots, written
+  one-per-parameter / one-per-variable in `bpp_parser.bsm` **with no bounds
+  check**. Any function with >8 parameters (`_stb_gpu_sprite_uv_tint` has 13) or
+  declaration with >8 variables overran the buffer into the neighbouring
+  allocation.
+- The overrun wrote **type-hint codes** (a `: float` parameter writes a float
+  hint). The old mmap-per-alloc allocator left page slack after each small
+  buffer, so the stray writes landed on unused memory. The size-class free-list
+  packs allocations tightly, so under recycle the overrun landed on a live
+  `Node` and clobbered its `itype` byte with a float hint → the E233 cascade.
+
+The "corrupted value is positional, non-zero, poison-invariant" evidence was
+correct and consistent with an overflow writing real hint values — what threw
+the earlier diagnosis off was (a) assuming the node was the *victim of reuse*
+rather than *the victim of a neighbour's overflow*, and (b) the layout-dependence
+making code-disabling bisects unreliable (disabling code shifts which allocation
+is adjacent, so the symptom moves — see the 146/34 → 166/14 shift when the
+validate probe was added).
+
+## How it was found
+
+`_MEM_DEBUG` (poison + no-zero, `docs/plans/sidequest_debug_allocator.md` phase A0)
+established it was **a written value, not unwritten recycled memory** (poison 0xBE
+never appeared; the symptom was identical under zero-fill and poison-fill). That
+ruled out the use-after-free hypothesis and pointed at a deterministic overflow
+write, which a source audit of the parser's fixed `malloc(64)` hint buffers then
+located.
+
+## Fix
+
+All three fixed-buffer hint tables migrated to growable primitives, eliminating
+the "fixed buffer + cap + E-net" anti-pattern entirely:
+- `dh_arr`, `ph_arr` → growable `arr` (`a82d5eb`).
+- `sd_*` four parallel `buf_word(256)` tables → one `arr_struct<FieldRec>` per
+  struct; `_SD_MAX_FIELDS` + E265 retired (`48c5e68`).
+- `_MEM_REUSE=1` enabled by default (`f13cc5b`).
+
+---
+
+_Original (mis-pointed) diagnosis preserved below for the record._
 
 ## Symptom
 
