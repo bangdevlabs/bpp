@@ -368,3 +368,29 @@ frontier. Fixing the startup SIGSEGV (the "Linux x86_64 health restoration" arc 
 approach: build `bpp_lin` with `--bug`, core dump + gdb in the container, or real
 x64 hardware) would unblock BOTH x64 inline AND a Linux Docker bootstrap. Good
 candidate for a "last exercise".
+
+## VI-3 measurement (honest negative result)
+
+`tests/bench_compile.sh` baseline (pre-VI `e5a96d06`) vs VI-2 (`ae2c23bd`):
+
+| case | baseline | VI-2 |
+|---|---|---|
+| bootstrap | 0.22 / 0.22 / 0.23 | 0.22 / 0.22 / 0.22 |
+| small (test_array) | 0.03 | 0.03 |
+| medium (test_stbmidi) | 0.04 | 0.04 |
+
+**Compile time is identical within noise.** The compiler inlining its own void
+helpers did NOT shave bootstrap time (contrast S1–S3k's ~41%). Reason: bpp's hot
+path is the lexer/parser/codegen inner loops (value-returning, already optimized);
+the void helpers VI inlines are colder setup/emit-orchestration functions, not in
+tight loops. The bootstrap `gen1 != gen2` 1-cycle proves some void helpers DID
+inline (self-codegen changed), but they are not hot enough to register on the bench.
+
+**Bottom line for the arc:** VI-1 + VI-2 shipped a *correct, general, bootstrap-
+stable* capability (void / statement-context inlining on a64). The immediate
+15-sample game win was already captured by the source-side `_path_heap_swap`
+manual inline (`06ae76e`); the compiler self-compile is neutral. So VI is infra
+ready for FUTURE hot void helpers, not a perf headline today — which validates the
+external agent's Q5 (source-side inline = the pragmatic win; VI = the general
+capability). x64 remains call-emitting (the Linux x86_64 health arc owns its
+self-host SIGSEGV, which also blocks a Linux-native bootstrap).
