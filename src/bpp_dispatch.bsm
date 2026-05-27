@@ -100,6 +100,13 @@ static auto _fn_callers;         // arr<arr<int>>: callers per callee
 static auto _glob_origin_names;   // arr<packed>:    globals with recorded origins
 static auto _glob_origin_targets; // arr<arr<int>>:  parallel, target_fidx lists
 extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place
+extrn fn_void_inlineable;  // arr<int>: 1 if a void / statement-context callee is
+                          // splice-eligible. VI-1 populates this; NOTHING reads it
+                          // yet (the walker + a64 splice start consuming it in VI-2).
+                          // Kept separate from fn_inlineable so the pre-reg walker
+                          // (which stamps every fn_inlineable callsite into the var
+                          // table) does not pollute frames before the void splice
+                          // exists. See docs/plans/sidequest_void_inline.md.
 extrn _lazy_emit_ready;    // 1 after mark_reachable has populated fn_reachable.
                           // Codegen checks this before filtering — if 0, emit everything.
 
@@ -214,6 +221,7 @@ void init_dispatch() {
     fn_effect = arr_new();
     fn_effect_next = arr_new();
     fn_inlineable = arr_new();
+    fn_void_inlineable = arr_new();
     // S9 — sentinel for the lazy func-name hash. -1 forces a build
     // on the first `_dsp_find_func_idx` call (after parser finishes
     // populating funcs[]); subsequent stale-count rebuilds handle
@@ -5844,12 +5852,19 @@ const INLINE_BODY_NODE_CAP = 50;
 void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
-    auto phase, body_cost;
+    auto phase, body_cost, want_void;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
+    // VI-1 (inert): grow the parallel void-candidate flag alongside
+    // fn_inlineable. Populated below, read by nothing yet — VI-2 wires the
+    // walker + a64 splice to it. See docs/plans/sidequest_void_inline.md.
+    while (arr_len(fn_void_inlineable) < func_cnt) {
+        fn_void_inlineable = arr_push(fn_void_inlineable, 0);
+    }
     for (i = 0; i < func_cnt; i++) {
         arr_set(fn_inlineable, i, 0);
+        arr_set(fn_void_inlineable, i, 0);
         phase = arr_get(fn_phase, i);
         // Phase whitelist: BASE / AUTO / SOLO. SOLO is "has direct
         // or transitive side effects, must run on main thread".
@@ -5874,7 +5889,16 @@ void classify_inlineable() {
         // expression value to use.
         last_stmt = body_arr[body_cnt - 1];
         if (last_stmt == 0) { continue; }
-        if (last_stmt.ntype != T_RET) { continue; }
+        // Criterion 3. The value path needs a trailing T_RET to use as the
+        // call's expression value. A void function that falls off the end
+        // (no return at all) is the VI void-inline candidate instead — its
+        // body splices as plain statements with no value. Any other function
+        // that does not end in T_RET is rejected exactly as before.
+        want_void = 0;
+        if (last_stmt.ntype != T_RET) {
+            if (arr_get(fn_void, i) == 0) { continue; }
+            want_void = 1;
+        }
         pcnt = *(fn_rec + FN_PCNT);
         if (pcnt > 3) { continue; }
         // Float coercion bypass — inlining skips the call path's
@@ -5898,6 +5922,23 @@ void classify_inlineable() {
             if (_inline_has_tcall(body_arr[j])) { ok = 0; break; }
         }
         if (ok == 0) { continue; }
+        if (want_void) {
+            // Void candidate: reject if ANY statement is a T_RET. A mid- or
+            // early-return would splice into a jump to the CALLER's epilogue.
+            // The body is already straight-line (criterion 6 rejects control
+            // flow), so this top-level scan catches a trailing / dead return.
+            ok = 1;
+            for (j = 0; j < body_cnt; j++) {
+                ret_stmt = body_arr[j];
+                if (ret_stmt.ntype == T_RET) { ok = 0; break; }
+            }
+            if (ok == 0) { continue; }
+            // VI-1: mark the inert flag and skip the value-path tail. Nothing
+            // reads fn_void_inlineable yet, so this changes no emitted code —
+            // the a64 splice + pre-reg walker get wired to it in VI-2.
+            arr_set(fn_void_inlineable, i, 1);
+            continue;
+        }
         // Param-ref ≤ 1 invariant — only enforced for the
         // single-statement case. Phase B2's substitute-and-emit
         // path drops the arg expression into the body wherever
