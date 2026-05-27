@@ -109,60 +109,47 @@ va
   every active perf sidequest until this closes.
     1. ✅ `pthread_kill` cross-compile fail — FIXED 2026-05-21
        (`d1f5457`), 14-LOC stub in `_core_linux.bsm`.
-    2. ⚠️ `bpp_lin` runtime SIGSEGV on Linux x86_64 — NARROWED
-       2026-05-27 (printf-bisection; gdb is unusable here —
-       Rosetta blocks ptrace of the translated x64 process,
-       "Couldn't get registers: I/O error").
-         - "segfaults at startup" was WRONG: startup + every
-           `init_*` complete (probes print). The fault is during
-           COMPILATION: `main` → `copy_cstr` → `process_file` →
-           `was_imported` → **`hash_mem`** (the first import-dedup,
-           a djb2 over the path string).
-         - It is NOT a bad-pointer logic error: at the fault site
-           `off`/`len` are valid (`peek(off)`=47 `'/'`, `len`=11).
-         - It is a **HEISENBUG**: adding a `peek(off)` probe right
-           before the djb2 loop makes the crash VANISH (rc=0). So
-           it is layout-sensitive — register allocation / stack
-           frame / uninitialized value in the x64 codegen, not a
-           deterministic entry-point fault. The instrumentation
-           itself perturbs it.
-         - Small x64 programs cross-compiled by the a64 bpp run
-           fine (Docker/Rosetta tripod 11/11); only the large bpp
-           binary triggers it → scale/complexity-dependent.
-         - The earlier strace "x32 / 64-bit mode" oscillation may
-           be a Rosetta translation artifact, not the fault.
-         - NEXT: needs REAL x64 hardware + a working debugger, or a
-           layout-stable bisect that does not move the bug. A
-           printf-bisect alone hits the heisenbug wall.
-       (This SIGSEGV also blocks a Linux-native bootstrap — bpp
-       cannot run on Linux to self-host until it is fixed.)
-         - CORROBORATION 2026-05-27: it is NOT bpp-specific. The
-           CLI debugger `bug` cross-compiled to Linux (bug_lin)
-           does NOT crash but reads `argc_get() == 0` (sees zero
-           args), while the small test_linux_argv reads argc
-           correctly. So TWO large x64 binaries now show startup
-           corruption (bpp_lin → SIGSEGV, bug_lin → argc=0), small
-           ones are fine → a scale-dependent x64 STARTUP / global-
-           access codegen bug (brt0 / _core_linux argc store, or
-           large-binary global addressing). Best lead yet: diff the
-           startup codegen of a small vs a large x64 binary.
-    3. ⏸️ Phase B1 (freelist register alloc) x86_64 emission
-       bug — disabled since 2026-04-15 (`19da538`). Manifests
-       under self-host on a fresh `_x64_has_call` recursion
-       path. Untested since (items 1 + 2 block re-evaluation).
-    4. ⏸️ Phase B2 (inline `: base` helpers) x86_64 path —
-       disabled same commit, paired with B1.
-  Items 3 + 4 cannot be re-evaluated until 1 + 2 are clean.
+    2. ✅ `bpp_lin` runtime SIGSEGV on Linux x86_64 — FIXED
+       2026-05-27. Root cause: TWO x64 spine-builtin operand-order
+       bugs, NOT the startup/argc theory recorded earlier (that was
+       a red herring — the entry trampoline + argc→_bpp_argc store
+       are correctly encoded even in large binaries; verified).
+         - `arr_len`: spine builtin computed `*(16 - arr)` instead
+           of `*(arr - 16)`. The manual subtract dance arranged
+           operands in the a64 convention (LHS in scratch via pop);
+           x64 pins LHS to rax and `emit_sub` ignores left_reg, so
+           it emitted `16 - arr` → wild deref. Crashed at the first
+           `was_imported → arr_len(imp_hashes)` (hence the bogus
+           "hash_mem" localization — the fault was the call right
+           after). Fixed via `arr + (-16)` (neg+add; add commutes).
+         - `arr_get`: same class — `i << 3` byte-offset emitted as
+           `3 << i` on x64 (`mov rax,0x3; shl rax,cl`). Fixed via
+           `i * 8` (mul commutes). Surfaced by the NEW `bug --disasm`.
+         - Why it only hit the compiler: only bpp runs these builtins
+           on a live array early enough; small programs don't.
+         - Tooling built to crack it (Rosetta blocks gdb/strace/core
+           guest-state): `bug --bytes` + `bug --disasm` (x86-64
+           disassembler, objdump-in-bug) + the x64 `.bug` map fix
+           (writer wrote fn index where reader expected a name str).
+         - RESULT: full Linux self-host. bpp_lin compiles + bootstraps
+           itself byte-stable in Docker (7a634fe), and a Linux bpp now
+           defaults to ELF (item below).
+    3. ⏳ Phase B1 (freelist register alloc) x86_64 emission
+       bug — disabled since 2026-04-15 (`19da538`). Items 1 + 2 are
+       now clean, so B1 can finally be re-evaluated under a working
+       Linux self-host.
+    4. ⏳ Phase B2 (inline `: base` helpers) x86_64 path —
+       disabled same commit, paired with B1; same re-eval unblock.
+  Items 3 + 4 are now UNBLOCKED (1 + 2 clean as of 2026-05-27).
   S4 (cost-model inliner) inherits the ARM64-only posture for
   the same reason; see `docs/plans/sidequest_cost_model_inliner.md`
   for the explicit deferral note.
-- **`bpp` no-args SIGSEGV (BOTH platforms, robustness)** — with no
-  input file `arg_ptr` stays 0 and `copy_cstr(pathbuf, 0)` reads NULL
-  → SIGSEGV (rc=139) instead of printing usage. Present on a64 AND
-  x64 (NOT a Linux-only issue — surfaced 2026-05-27 while bisecting
-  the `bpp_lin` crash; it was a red herring there). Trivial fix:
-  guard `if (arg_ptr == 0) { <print usage>; return 1; }` after the
-  arg-parse loop in `bpp.bpp` main.
+- ✅ **`bpp` no-args SIGSEGV (BOTH platforms, robustness)** — FIXED
+  2026-05-27 (`8228f92`). With no input file `arg_ptr` stayed 0 and
+  `copy_cstr(pathbuf, 0)` read NULL → SIGSEGV; now guards
+  `if (arg_ptr == 0) { <print usage>; return 1; }` after the
+  arg-parse loop in `bpp.bpp` main. (Surfaced as a red herring while
+  bisecting the `bpp_lin` crash.)
 - **Host-aware compiler + install** — `bpp` auto-detects host
   OS+chip; defaults match host instead of always macOS arm64.
 - **C-emitter `var T` parity** — pick uniform storage strategy

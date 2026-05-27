@@ -12316,3 +12316,101 @@ on screen, edit-in-IDE → see-in-game with no restart.
   state, still catches sibling-PNG edits — no FSEvents/inotify needed at this
   scale, matching the market study (polling is every serious watcher's
   universal fallback anyway).
+
+## 2026-05-27 (later still) — Linux self-host: dog-fooding `bug` into an objdump to crack two x64 codegen bugs
+
+### Milestone
+
+`bpp` now compiles itself on Linux, byte-stable. A Linux-cross-compiled `bpp`
+runs under Docker (linux/amd64), compiles `bpp.bpp` to a Linux ELF, and that
+ELF compiles `bpp.bpp` again to a byte-identical binary (`7a634fe`,
+gen2==gen3==gen4). The cross-build from macOS (`--linux64`) and the
+self-hosted Linux build are the same bytes. This closes the long-standing
+"x86_64 Linux health" frontier (`docs/todo.md` item 2).
+
+### What the bug actually was
+
+Not a startup bug. The frontier had been recorded as a "heisenbug at
+`hash_mem` / `argc=0` / large-binary startup corruption." All red herrings.
+Static analysis (via the new tooling below) confirmed the entry trampoline and
+the `argc → _bpp_argc` store are correctly encoded even in the large binary —
+the RIP-relative store lands exactly on the data segment base.
+
+The real cause was **two x86_64 operand-order bugs in the hot-path array
+builtins**, both in the shared spine (`bpp_codegen.bsm`):
+
+- `arr_len(a)` returns `*(a - 16)`. The spine emits a manual subtract by
+  pushing the array, loading 16 into the accumulator, popping the array into
+  the scratch register, and calling `emit_sub`. That arranges operands in the
+  **ARM64** convention (LHS in the scratch/`left_reg`, RHS in acc), where
+  `emit_sub` computes `scratch - acc = a - 16`. But x86_64 pins the LHS to
+  `rax` and its `emit_sub` ignores `left_reg`, emitting `acc - scratch` =
+  `16 - a`. Subtraction does not commute, so the result was a wild pointer
+  (`16 - a`), dereferenced → SIGSEGV.
+- `arr_get(a, i)` computes the byte offset `i << 3` the same way and hit the
+  same wall: x86_64 emitted `3 << i`.
+
+Why only the compiler crashed: only `bpp` itself runs `arr_len`/`arr_get` on a
+live array early enough (the first `was_imported(path) → arr_len(imp_hashes)`).
+Every small cross-compiled *program* ran fine because its compiled code never
+exercised these compiler-internal builtins. "Small works, large crashes" was
+about *which binary contains the builtin*, not binary size.
+
+### The cycle — evolving `bug` to see the codegen
+
+Rosetta on Docker/Apple-Silicon blocks ptrace of a translated x86_64 process,
+so gdb and strace are dead ends ("Couldn't get registers: I/O error"), and a
+core dump exposes only Rosetta's host registers — the guest RIP is hidden in
+undocumented Apple notes. The way through was to make the debugger read the
+binary statically:
+
+1. **Fixed the x64 `.bug` map** (`3edd19d`). The x86_64 address-map + stack-map
+   writer emitted the function *index* as a `u16` where the reader expected a
+   length-prefixed *name* string — desyncing every field, so x64 `.bug` maps
+   were unreadable garbage. (ARM64 was correct; the reader is single-format.)
+   This unblocked function-name lookup on x64.
+2. **`bug --bytes <bin> <fn>`** (`c6cbd24`) — hexdump a function's machine code
+   located via the now-readable address map. Code base derived as
+   `PT_NOTE_end` (B++ lays code right after the notes; anchoring on `e_entry`
+   is wrong because it points at the entry trampoline appended after `main`).
+3. **`bug --disasm <bin> <fn>`** (`5da2e2b`) — a from-scratch x86-64
+   disassembler for the subset the backend emits, calibrated byte-for-byte
+   against `objdump`. It rendered the `arr_len` site as `mov rax,0x10;
+   pop rcx; sub rax,rcx` — `16 - arr` straight off the screen — and, once
+   `arr_len` was fixed, immediately surfaced the *second* bug (`arr_get`'s
+   `mov rax,0x3; shl rax,cl` = `3 << i`) in the same function.
+
+Localization used Docker-runnable phase markers (`putstr_err` probes) — the
+only ptrace-free signal under Rosetta — to walk the crash from `process_file`
+down to the exact `arr_len` call.
+
+### The fixes
+
+Both rewrite the non-commutative op into a commutative one, which lands
+correctly regardless of which register each chip parks an operand in:
+
+- `arr_len`: `a - 16` → `a + (-16)` via `emit_neg` + `emit_add` (`ef1f777`).
+- `arr_get`: `i << 3` → `i * 8` via `emit_mul` (`f671949`). `i*8 == i<<3` for
+  any array index.
+
+Then a UX fix (`9f181e6`): the default output mode now follows the host the
+`bpp` binary was *built* for, via `_bpp_host_default_mode()` in the
+auto-injected `_core_<os>.bsm` (macOS → Mach-O, Linux → ELF). A Linux `bpp`
+emits Linux binaries with the natural `bpp src.bpp -o out` — no `--linux64`.
+
+### Lessons
+
+- **Verify the premise against the bytes, not the bug report.** "Startup
+  crash", "hash_mem", "argc=0" were all plausible and all wrong. Disassembling
+  the suspect functions killed three hypotheses in minutes.
+- **When the platform blocks your debugger, build one into the program's own
+  toolchain.** A static disassembler reading the binary + `.bug` map needs no
+  ptrace, so Rosetta's restrictions stopped mattering. This is the same way
+  `bug` grew on ARM64 — incrementally, against a real bug.
+- **Cross-chip spine builtins must use commutative ops or chip-honest
+  primitives.** The manual push/mov/pop/`emit_sub` dance silently encoded the
+  ARM64 operand convention. `add`/`mul` commute and dodge the asymmetry;
+  anything non-commutative (`sub`/`shl`/`div`/`mod`) needs the chip's native
+  arrangement (the normal `emit_binop_resolve` path) or an `*_imm` primitive.
+- **Tripod stays green throughout:** native ARM64 180/0/12, C-emit 145/0/47,
+  Linux/Docker self-host byte-stable.
