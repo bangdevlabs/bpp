@@ -12056,3 +12056,180 @@ well past the planned bottom-bar, and it subsumes the S10.6.2 combat
 action buttons. Race select + playable orc + forest fix were extras. The
 genuine next arc is **S11 — enemy AI baseline** (build / gather / train /
 attack at 5 Hz); first call is `stbai` cartridge vs `rts1_ai.bsm`.
+
+## 2026-05-26 (later) — rts1 S11 enemy-AI baseline + per-player economy
+
+S11 landed as a whole-subsystem pass, not micro-patches — the same
+"study war1gus / Stratagus, adapt, don't port" discipline as the earlier
+WC1 arcs.
+
+### Per-player economy (`567adb6`) — the prerequisite
+
+Resources moved from a single global pool to a per-player economy so the
+AI and the human bank gold independently. This is the floor S11 needs:
+an AI that gathers and spends has to debit its own account, not the
+player's.
+
+### The AI brain (`967d612`) — `rts1_ai.bsm`
+
+A new `rts1_ai.bsm` runs at 5 Hz via `_ai_heartbeat`: `_ai_manage_workers`
+keeps peons on gold/forest, `_ai_think` drives build/train decisions, and
+`_ai_defend` (returns 1 when engaged) **preempts** `_ai_launch_attack`
+(which targets the enemy Town Hall) so a base under attack stops
+marshalling an offensive and turns to face the threat. The structure
+mirrors Stratagus' force/think split without copying its code.
+
+### Combat target-selection — buildings are valid targets now
+
+The "AI builds a warrior but it won't fight" bug was a target-selection
+gap: combat only acquired *unit* targets. The pass made combat
+building-aware throughout — `ecs_has` guards everywhere a target might be
+a building (no `pos`/`anim` components), `rts1_input` falls back to a
+building target when a right-click misses a unit, and `_on_impact`
+handles a projectile landing on a building. That last one exposed a
+crash: an arrow into a building dereferenced a null `anim_comp`
+(`ecs_get` returns 0 for a component the entity lacks). Fixed with an
+`ecs_has` guard plus `wc1_building_destroy(w, eid)` (frees footprint +
+CharSheet + ECS row). Also: `Building.active` flag,
+`_WC1_MINE_MAX_ON_BOARD = 5`, HUD `_prune_dead_selection` (drop dead
+entities from the selection so the command card doesn't read a freed
+row), and a gather guard against delivering to a razed deposit.
+
+### Engine pull-ups (Rule 35) + profiling
+
+Two consumer-driven graduations: `ecs_has(w, comp_id, eid)` graduated to
+**stbecs** (O(1) via `ar.comp_bitmask & (1 << comp_id)`) — the game kept
+hand-rolling component-presence checks, so the check belongs in the ECS.
+And **stbprofile** was wired into `rts.bpp` (import + `init_profile` +
+KEY_P toggle + `profile_hud_draw`) to chase the render flicks. That
+profiler is what set up the next day's arc: it showed a long-running
+rts1 frame spends **~98 % of its time in `_mem_*_pages`** — every small
+`malloc` was an `mmap` syscall.
+
+## 2026-05-27 — Free-list reuse: the allocator arc that cracked its own latent overflow
+
+The headline: B++'s allocator went from mmap-per-malloc to a recycling
+size-class free-list (**−37 % bootstrap, 0.35s → 0.22s**), and getting
+full recycle to ship surfaced — and fixed — a heap-overflow bug class
+that had been latent in the compiler for the life of the project. Six
+commits (`47c261b` → `3abe4c1`).
+
+### Why an allocator at all
+
+The S11 profiler (above) found rts1 burning ~98 % of a frame in
+`_mem_*_pages`: on Apple Silicon a 64-byte `malloc` costs a 16 KB page
+via syscall, and a game loop allocates small blocks every tick. The fix
+is the textbook one — serve small requests (≤ 4 KB) from per-class
+free-lists carved out of 64 KB chunks, keep the direct page path for big
+requests. Per Rule 41 the policy is fully portable: it lives in
+`bpp_mem.bsm`, the per-OS page primitives are untouched, so every target
+inherits the win.
+
+### Two ways to run it — and the bug that hid between them
+
+`_MEM_REUSE` is a toggle. **Carve-only** (0): every small alloc is a
+fresh unique block, `free` is a no-op — kills the syscall storm but
+leaks within a run (fine for a short-lived compiler, fatal for a game
+loop / Bang 9). **Recycle** (1): freed blocks return to their class
+free-list (bounded memory, what rts1 needs). Carve-only shipped green
+immediately (`28e012e`). Recycle broke the test suite 180 → 146/34 with
+an E233 cascade ("argument is a float, parameter is int"). Carve-only
+was committed as the safe default while recycle became a sidequest.
+
+Why does *recycling addresses* break a compiler? Because reuse hands the
+same address out twice, so a latent memory bug that the old
+mmap-per-alloc allocator masked (every address unique forever) becomes
+observable. The free-list is a bug-detector as much as a perf win.
+
+### Building the detector — `_MEM_DEBUG` A0 (the cousins' lesson)
+
+Before hunting blind, we built tooling. The free-list research into the
+cousins — C/C++ (ASan/Valgrind), Zig (the `GeneralPurposeAllocator`),
+Go (`allocfreetrace`), Jai/Odin — all teach the same thing: **a
+recycling allocator and its debug tooling co-evolve.** So `_MEM_DEBUG`
+(phase A0 of a new debug-allocator sidequest) shipped alongside: poison
+freed blocks with `0xBE` and skip the zero-on-pop, so a use-after-free
+reads the poison signature instead of silent zero. Default off, dead-code
+eliminated, bootstrap byte-stable.
+
+### The hunt — and how the obvious diagnosis was wrong twice
+
+The corruption was a `Node.itype` byte coming back as a float type for
+argument 13 of `_stb_gpu_sprite_uv_tint`. Two natural hypotheses both
+turned out **wrong**:
+
+1. *"It's in the smart-dispatch pipeline."* A bisect disabling
+   `run_dispatch` + `synthesize_loop_fn` + `rewrite_dispatch_loops` +
+   `annotate_temps` + `find_dispatch_candidates` still reproduced 146/34
+   — so "ruled out" the pipeline and pointed at inference/parse. **This
+   conclusion was an artifact.** The bug is *layout-dependent*: disabling
+   any code shifts which allocation sits next to which, so the symptom
+   moves. (Proof: adding a one-line probe to the validator shifted the
+   failures from `test_thread` to a different cluster — the probe, not
+   the code it probed, moved the bug.) **Lesson logged: a
+   layout-dependent heap bug makes code-disabling bisects unreliable.**
+
+2. *"It's a use-after-free."* This is where A0 paid for itself. Under
+   poison, the corrupt `itype` was **identical** to the zero-fill case
+   and never read `0xBE`. That proved the byte was a *written value*, not
+   unwritten recycled memory — which rules out a UAF and points at a
+   deterministic overflow write. A source audit of the parser's
+   fixed-size hint buffers then found it in minutes.
+
+### The actual bug — a fixed-buffer overflow, three times over
+
+`ph_arr` (per-function parameter type hints) and `dh_arr` (per-declaration
+variable type hints) were each `malloc(64)` — 8 word slots — written
+one-per-parameter / one-per-variable in `bpp_parser.bsm` **with no bounds
+check**. A function with more than 8 parameters (`_stb_gpu_sprite_uv_tint`
+has 13) or a declaration with more than 8 variables (the compiler is full
+of `auto a, b, c, …` lists with ten-plus locals) overran the buffer into
+the neighbouring allocation — writing **type-hint codes**, so a `: float`
+parameter wrote a *float* hint onto whatever sat next door. Under the old
+allocator the page slack after each small buffer absorbed the stray
+writes; the tightly-packed free-list put a live `Node` there, and the
+overrun clobbered its `itype` with a float hint → E233.
+
+This is the exact same class as the `sd_*` struct-field-table overflow
+caught earlier the same day (`ChipPrimitives`, 136 fields, overran a
+`buf_word(64)`), which had been band-aided with a `buf_word(256)` cap and
+the new **E265** diagnostic (`47c261b`).
+
+### The proper fix — kill the "fixed buffer + cap + E-net" anti-pattern
+
+Rather than bump another cap, we eliminated the pattern in all three
+sites (the user's call: "tudo proper agora"):
+
+- **`dh_arr` + `ph_arr` → growable `arr`** (`a82d5eb`). The hint buffers
+  become `arr_new` / `arr_push` — no cap to overflow. Consumers index
+  them raw, which still works on an `arr` handle; only the frees became
+  `arr_free`. This commit is what actually fixed the reuse bug: suite
+  back to 180/0/12 + byte-stable under `_MEM_REUSE=1`.
+- **`sd_*` four parallel `buf_word(256)` tables → one
+  `arr_struct<FieldRec>` per struct** (`48c5e68`), where
+  `FieldRec = { field_p, hint, byte_off, bit_off }` (new struct in
+  `bpp_defs.bsm`). This is the AoS migration the project has been making
+  everywhere (VtEntry/GlEntry/FnMeta); `_SD_MAX_FIELDS` and the E265
+  diagnostic are retired (E265 lived exactly one day). Six files touched
+  — the parser accessors (via a shared `_sd_field_by_name` helper), the
+  `bpp_internal` reflection API, the `.bug` map writer, the meta sidecar,
+  and outline capture-restore.
+- **`_MEM_REUSE = 1` is now the default** (`f13cc5b`). Freed small blocks
+  recycle instead of leaking, so a game loop holds bounded memory.
+  Bootstrap stays 0.22s (the recycle path's zero-on-pop is negligible
+  next to the syscall it replaced); rts1 compiles clean.
+- Arc docs closed (`3abe4c1`): the reuse-corruption sidequest is marked
+  resolved with the real root cause, and the debug-allocator sidequest
+  notes A0's first win.
+
+### Where it stands
+
+The "fixed buffer + cap + E-net" anti-pattern is gone from all three
+sites; the recycling allocator is the default; bootstrap is byte-stable
+and the suite is 180/0/12 under both `_MEM_REUSE` modes. The
+debug-allocator sidequest has standing follow-ons (A1 double-free, A2
+alloc/free-PC history + leak report, B0 watchpoints in `bug`) for the
+next memory bug. Caveat for tomorrow: the games are **not** in the test
+suite, so a latent use-after-free in rts1 could surface under recycle
+that the suite never sees — `_MEM_DEBUG` is the tool to point at it if a
+playtest goes wrong.
