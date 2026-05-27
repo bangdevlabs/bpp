@@ -1482,8 +1482,27 @@ static void _image_hr_init() {
 // "no change" rather than triggering a reload of a partial pack.
 // Same shape as `_file_hash` in stbasset, kept private to
 // stbimage so the two cartridges can evolve independently.
+// Returns a change token for `path` — a value that differs whenever the
+// file changes on disk, used only for `!=` comparison by the hot-reload
+// pollers. Fast path: a single `file_stat` yields the file's mtime, which
+// is exactly as good as a content hash for change detection at a fraction
+// of the cost (one stat syscall, no read). Fallback: FNV-1a over the whole
+// file, for any platform whose file_stat is unavailable. 0 means the file
+// is unreadable. (Before this, every poll re-read and re-hashed the entire
+// file — on rts1 that meant re-reading a 16 KB level JSON + the sprite
+// atlases every throttle tick, which dominated the frame profile as
+// _mem_*_pages + file_read_all.)
 static _image_file_hash(path: ptr) {
     auto size_out, buf, size, hash, i, ch;
+    auto fi: FileInfo;
+    fi = malloc(sizeof(FileInfo));
+    if (file_stat(path, fi) != 0) {
+        hash = fi.mtime;
+        free(fi);
+        if (hash == 0) { hash = 1; }   // 0 is the unreadable sentinel
+        return hash;
+    }
+    free(fi);
     size_out = malloc(8);
     *(size_out) = 0;
     buf = file_read_all(path, size_out);
