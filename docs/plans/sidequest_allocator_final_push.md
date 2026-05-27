@@ -145,3 +145,164 @@ our scale, show the evidence.
 - `src/bpp_mem.bsm`, `src/bpp_arena.bsm`, `stb/stbpool.bsm` — current state.
 - `docs/manual/tonify_checklist.md` Rule 41 (portability), Rule 40 (hot-path
   malloc jitter — the per-frame-churn pressure that motivates arenas).
+
+---
+
+# Market study + design lock (2026-05-27, session 2)
+
+## Hypothesis validated
+
+The original hypothesis ("object-level coalescing is NOT modern game-dev practice") is
+**confirmed by the cousins**. The 4 modern general-purpose allocators all converged on
+the same design: **size-class segregation for objects (no object coalescing) +
+page/span-level coalescing + decay-based return-to-OS**. Game engines use arenas.
+Audio realtime forbids allocation in callbacks. The only domains where object
+coalescing is still the answer are (a) legacy general malloc (glibc/dlmalloc) and
+(b) bare-metal embedded (FreeRTOS heap_4), and for very different reasons.
+
+### Comparative table — modern general allocators
+
+| Allocator | Object coalesce? | Page coalesce? | Return-to-OS | Trigger |
+|---|---|---|---|---|
+| jemalloc | ✗ | ✓ (extents) | `madvise MADV_FREE` (muzzy) / `MADV_DONTNEED` | `dirty_decay_ms=10s` default, decays over 200 steps |
+| tcmalloc | ✗ | ✓ (spans) | `madvise MADV_FREE` | `scavenge_counter_` paced |
+| mimalloc | ✗ | ✓ (segments + arenas) | reclaim whole segments | abandoned-segment bitmap |
+| Go runtime | ✗ | ✓ (mheap span coalesce) | `MADV_DONTNEED` / `MADV_FREE` / `VirtualFree` | background scavenger |
+| dlmalloc/glibc (legacy) | ✓ (boundary tags) | ✓ | sbrk shrink / madvise (limited) | malloc_consolidate periodic |
+| Emscripten dlmalloc (WASM) | ✓ | ✓ | **N/A** (no munmap) | — |
+| FreeRTOS heap_4 (bare-metal) | ✓ (adjacent merge) | N/A | **N/A** (no OS) | on every `free()` |
+| B++ today | ✗ | ✗ | ✗ | — |
+
+### Comparative table — game / audio / GPU consensus
+
+| System | Pattern | Notes |
+|---|---|---|
+| Jai `temp_allocator` | Linear bump + reset, context-scoped | Built-in language primitive |
+| Odin `context.temp_allocator` | Same shape | Built-in |
+| Unreal `FMemStack` | Greedy stack frame allocator (segments + free-list) | Push/Pop via `FMemMark`; segments never returned to OS while alive |
+| Unreal `FMallocArena` | Arena wrapper | Per-subsystem |
+| idTech 4 Hunk Allocator | 2 stack arenas (permanent + temp) sharing a region | Highwater marks; Quake/Doom design |
+| idTech 4 Zone Allocator | Smaller volatile allocations | Distinct from Hunk |
+| JUCE / CLAP / pluginval | **Zero alloc in audio callback** | Doctrine codified; pluginval validates; community asks for assert-on-malloc on audio thread |
+| Vulkan VMA | Buddy + suballocation with coalesce **inside** 256 MB blocks | Different problem: GPU memory sub-allocation, not CPU small-object |
+| Bevy / Rust gamedev | Per-frame arenas + ECS DOD storage | Pattern identical to Jai/Odin |
+
+**Zero production game engines centre their allocator on object-level coalescing.**
+The pattern is universal: arena + pool + (sometimes) general malloc as escape hatch.
+
+### The two nuances WASM + bare-metal reveal
+
+- **WASM linear memory**: `memory.grow` is monotonic. **No `munmap`, no `madvise`.** Decay-based
+  return-to-OS (the jem/tc/mi/Go strategy) simply does not exist. The only fragmentation
+  defenses available are (a) coalescing or (b) arena discipline (peak working-set bound).
+  Emscripten ships dlmalloc by default precisely because it coalesces — without that,
+  fragmentation grows unbounded.
+- **Bare-metal (FreeRTOS heap_4, BangOS-class targets)**: no OS to return to either, but
+  working sets are KB not MB, so coalescing makes sense at that scale.
+
+The arenas-first answer is the only pattern that scales across all four target categories
+(macOS, Linux, WASM, bare-metal) **without** needing target-specific allocator logic. That
+makes α the most portable answer per Rule 41.
+
+## Decision (locked)
+
+**Do α + β. Skip γ.**
+
+### α — Frame-arena pattern for rts1 (and every future game) — **DO NOW**
+
+Adopt `bpp_arena` (already exists) for per-frame allocation churn in rts1's `game_tick`.
+
+**Mechanism**: one `_frame_arena` initialized in `main`, `arena_reset(_frame_arena)` at the
+end of each tick. Per-frame transients (pathfinding scratch, ECS query intermediates, anything
+that lives a single tick) call `arena_alloc(_frame_arena, n)` instead of `malloc(n)`.
+
+**Why first**:
+- Industry-validated pattern (Jai/Odin/Unreal/idTech all converge).
+- `bpp_arena` exists; only adoption is needed. No risk in `bpp_mem`.
+- Scales to 100% of target categories (hosted OS + WASM + bare-metal). Arenas work
+  anywhere with contiguous memory.
+- Covers ~90% of the rts1 profile's residual `_mem_alloc_pages` without touching the
+  small-block allocator.
+
+**Consumer** (Rule 36b): rts1's `game_tick` (profile already named the per-frame
+allocators — `_path_*`, `ecs_query_each`, etc.). fps_wolf3d and snake-wasm follow when
+they adopt the pattern.
+
+**Validation gates**:
+- rts1 profile after adoption: `_mem_alloc_pages` should drop further; new top will be
+  game work (vertex emit, ECS, pathfinding).
+- Bootstrap byte-stable (changes are in `games/rts1/` only).
+- Suite 180/0/12.
+
+### β — Chunk-scavenging in `bpp_mem` — **DO AFTER α validates**
+
+Empty 64 KB small-class chunks return to the OS (or stay parked in a global free-chunk
+list on no-OS targets).
+
+**Mechanism**:
+1. Reserve first 16 bytes of each carved 64 KB chunk for inline metadata:
+   `[live_count: u64 | reserved: u64]`. The carved-block region starts at chunk_base + 16
+   (already aligned by `_MEM_HEADER`).
+2. `malloc` increments the chunk's `live_count` whenever it hands out a block from that
+   chunk (both carve path and free-list pop). Chunk_base is recovered from any block
+   pointer via `block_addr & ~(_MEM_CHUNK_SIZE - 1)` (chunks come page-aligned from
+   `_mem_alloc_pages`).
+3. `free` decrements the chunk's `live_count`.
+4. When `live_count == 0`: the chunk is fully unused, but its blocks may still be on the
+   class free-list. Walk the class's free-list, unlink any block whose chunk-base matches,
+   then call `_mem_free_pages(chunk_base, _MEM_CHUNK_SIZE)`.
+5. Per-OS behaviour:
+   - macOS/Linux: `_mem_free_pages` is `munmap` — memory returned to the kernel.
+   - WASM (future): `_mem_free_pages` is a no-op (linear memory can't shrink). The chunk
+     is unlinked from the class but stays in linear memory — the next chunk request can
+     re-carve it via a small "abandoned chunks" pool. Coherent with how Emscripten
+     dlmalloc handles the constraint.
+   - Bare-metal (future): `_mem_free_pages` is whatever the target defines (e.g. push to
+     a kernel-level chunk pool). Layer-6 decides.
+
+**Cost**: ~50 LOC in `bpp_mem.bsm`. One u64 counter per chunk (8 bytes of overhead per 64
+KB = 0.012%). Free-list walk on chunk-empty event is O(blocks-in-class), but rare —
+amortizes to O(1) per free.
+
+**Invariants** (the bug-surface budget — keep small):
+- Chunk metadata is at known offset; never moves; never invalidated until chunk is munmap'd.
+- `live_count` must be incremented before user gets the pointer, decremented before
+  free-list push (or after; pick one and assert).
+- Free-list walk on empty-chunk event must run BEFORE the munmap, or the next malloc
+  will pop a freed pointer.
+- `_MEM_DEBUG` poison still composes — chunk's blocks were poisoned at free time, and
+  walk-and-unlink just unlinks them without touching content.
+
+**Consumer**: Bang 9 long-edit sessions + modulab loading/freeing large PNG buffers. Two
+named consumers per Rule 36b.
+
+**Validation gates**:
+- Suite 180/0/12 with `_MEM_REUSE=1`.
+- `_MEM_DEBUG=1` + `_MEM_REUSE=1` smoke pass (no false UAF detection from the walk).
+- Bench `bench_compile.sh` — bootstrap stays ≤ 0.22s (target: no regression; chunk
+  metadata is per-chunk, not per-allocation).
+- Bootstrap byte-stable (gen1 == gen2).
+- A repro test that allocates 200×16 B, frees all, checks that the chunk's pages
+  reported by Mach `vm_region`/Linux `/proc/self/maps` actually shrink.
+
+### γ — Object-level coalescing — **NOT DOING**
+
+Industry abandoned it (jem/tc/mi/Go all skipped). Bug surface mirrors exactly what bit us
+on the reuse hunt (boundary tags + split/merge invariants). At B++'s scale (1–100 MB
+working sets), segregated classes plus β cover all observed fragmentation. The case for
+γ would require workloads B++ is not planned to take on (long-running server-like, with
+phase-varying allocations across many classes).
+
+## Sources
+
+- jemalloc decay/madvise: [GitHub issue #956](https://github.com/jemalloc/jemalloc/issues/956), [docs issue #2751](https://github.com/jemalloc/jemalloc/issues/2751), [How JeMalloc Works](https://yfractal.github.io/systems/memory-management/2022/10/04/jemalloc.html)
+- TCMalloc: [Google design doc](https://google.github.io/tcmalloc/design.html), [DeepWiki overview](https://deepwiki.com/gperftools/gperftools/2-tcmalloc)
+- mimalloc: [GitHub readme](https://github.com/microsoft/mimalloc), [src/segment.c](https://github.com/microsoft/mimalloc/blob/main/src/segment.c)
+- Go runtime: [internals-for-interns](https://internals-for-interns.com/posts/go-memory-allocator/), [Memory Scavenger](https://medium.com/@AlexanderObregon/memory-scavenger-in-go-runtime-b517147c0928)
+- Unreal `FMemStack`: [Greedy Stack Frame Allocator](https://nfrechette.github.io/2016/05/09/greedy_stack_frame_allocator/), [Epic docs](https://docs.unrealengine.com/4.26/en-US/API/Runtime/Core/Misc/FMemStackBase/)
+- idTech: [Quake III memory](https://realityforge.org/Quake-III-Arena/idTech/memory.html), [Doom allocator overview](https://bookdown.org/robertness/doom_tour/3_1_memory_allocator.html)
+- Audio realtime: [JUCE pluginval](https://forum.juce.com/t/pluginval-real-time-safety-checking/67439/1), [assert-on-malloc FR](https://forum.juce.com/t/fr-option-for-assert-on-audio-thread-allocation-or-syscall/58151)
+- Vulkan VMA: [custom pools](https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/custom_memory_pools.html), [Lumina's overview](https://www.dr-elliot.com/lumina/vulkanmemoryallocations/)
+- WASM allocators: [Emscripten settings](https://emscripten.org/docs/tools_reference/settings_reference.html), [scaling multithreaded Wasm with mimalloc](https://web.dev/articles/scaling-multithreaded-webassembly-applications)
+- Bare-metal: [FreeRTOS heap_1..5](https://medium.com/@akashkadamwork2026/memory-management-in-freertos-heap-1-to-heap-5-17ee7630788c), [Mastering FreeRTOS](https://freertos.gitbook.io/mastering-the-freertos-tm-real-time-kernel/mastering.ch03)
+- Jai: [Way to Jai book — allocators](https://github.com/Ivo-Balbaert/The_Way_to_Jai/blob/main/book/21A_Memory_Allocators_and_Temporary_Storage.md), [Jai context (Lernö)](https://medium.com/@christoffer_99666/a-little-context-d06dfdec79a3)
