@@ -1192,9 +1192,18 @@ struct Image {
                     // from frames[from].duration at parse time. When
                     // a consumer needs variable rate, bump the schema
                     // and store the per-frame durations directly.
-    anims_count     // total animations registered (0 when no
+    anims_count,    // total animations registered (0 when no
                     // frameTags were present). Indexed by anim_id
                     // returned from image_anim_id.
+    sib_mtime,      // hot-reload cache: the manifest's mtime when sib_paths
+                    // was last built (0 = not parsed yet). The combined-hash
+                    // poller re-reads + re-parses the manifest only when this
+                    // differs from the current mtime; otherwise it just stats
+                    // the cached siblings. malloc-zeroed, so 0 by default.
+    sib_paths       // hot-reload cache: arr of resolved sibling-file paths
+                    // watched alongside the manifest — the Aseprite sheet PNG
+                    // (meta.image) plus any atlas_pack sprites[].path. 0 until
+                    // the first parse.
 }
 
 // ── Lifecycle ───────────────────────────────────────────────
@@ -1529,22 +1538,39 @@ static _image_file_hash(path: ptr) {
 // Returns 0 if the entry-point file is unreadable. Sibling read
 // failures are silently treated as 0 so a half-deleted manifest
 // can still detect changes when the missing file reappears.
-static _image_combined_hash(path: ptr) {
-    auto h, doc, root, type_s, sprites_idx, n, i;
-    auto sprite_node, sib_path_s, resolved, sib_hash;
-    auto buf, fsize;
-
-    h = _image_file_hash(path);
-    if (h == 0) { return 0; }
-
+// Read + parse the manifest ONCE and return an arr of resolved sibling-file
+// paths to watch alongside it: the Aseprite sheet PNG (meta.image, or a
+// top-level "image" as a fallback) plus, for atlas_pack manifests, every
+// sprites[].path. Each entry is a freshly malloc'd path the caller owns
+// (release via _image_free_siblings). Returns 0 when the manifest cannot be
+// read or parsed (treated as "no siblings").
+static _image_collect_siblings(path: ptr) {
+    auto out, buf, fsize, doc, root, type_s, sprites_idx, n, i;
+    auto sprite_node, sib_path_s, resolved, meta_idx, image_s;
+    out = 0;
     fsize = 0;
     buf = file_read_all(path, &fsize);
-    if (buf == 0) { return h; }
+    if (buf == 0) { return 0; }
     doc = json_parse(buf, fsize);
     free(buf);
-    if (doc == 0) { return h; }
+    if (doc == 0) { return 0; }
     root = json_root(doc);
 
+    // Aseprite sheet PNG: meta.image (the loader's canonical field), or a
+    // top-level "image" as a fallback. The pixels live in this PNG, so a
+    // Modulab "save PNG" must trigger a reload even when the JSON is
+    // byte-for-byte unchanged.
+    image_s = 0;
+    meta_idx = json_object_get(doc, root, "meta");
+    if (meta_idx >= 0) { image_s = json_object_get_string(doc, meta_idx, "image"); }
+    if (image_s == 0)  { image_s = json_object_get_string(doc, root, "image"); }
+    if (image_s != 0) {
+        resolved = _image_resolve_sibling(path, image_s);
+        if (out == 0) { out = arr_new(); }
+        out = arr_push(out, resolved);
+    }
+
+    // atlas_pack: every sprites[].path is its own sibling PNG.
     type_s = json_object_get_string(doc, root, "type");
     if (type_s != 0 && str_eq(type_s, "atlas_pack")) {
         sprites_idx = json_object_get(doc, root, "sprites");
@@ -1556,14 +1582,57 @@ static _image_combined_hash(path: ptr) {
                 sib_path_s = json_object_get_string(doc, sprite_node, "path");
                 if (sib_path_s == 0) { continue; }
                 resolved = _image_resolve_sibling(path, sib_path_s);
-                sib_hash = _image_file_hash(resolved);
-                free(resolved);
-                if (sib_hash != 0) { h = h ^ sib_hash; }
+                if (out == 0) { out = arr_new(); }
+                out = arr_push(out, resolved);
             }
         }
     }
 
     json_free(doc);
+    return out;
+}
+
+// Free a cached sibling-path list (the strings + the arr) and clear the
+// slot. Safe on a 0 list.
+static _image_free_siblings(im: Image) {
+    auto sibs, i, n;
+    sibs = im.sib_paths;
+    if (sibs == 0) { return; }
+    n = arr_len(sibs);
+    i = 0;
+    while (i < n) { free(arr_get(sibs, i)); i = i + 1; }
+    arr_free(sibs);
+    im.sib_paths = 0;
+}
+
+// Combined change token for a hot-reloaded image: the manifest's mtime XOR
+// every sibling file's mtime, so editing the manifest OR any sheet / sprite
+// PNG advances the token and triggers a reload. The expensive part — the
+// manifest read + JSON parse that enumerates the siblings — runs only when
+// the manifest's own mtime changes; every other poll reuses the cached
+// sibling list and just stats it (one cheap syscall per file, no reads).
+static _image_combined_hash(im: Image) {
+    auto mt, sibs, h, i, n, sib, sh;
+    mt = _image_file_hash(im.src_path);     // manifest mtime — one stat
+    if (mt == 0) { return 0; }
+    if (mt != im.sib_mtime) {
+        // Manifest changed (or first call) — re-enumerate siblings once.
+        _image_free_siblings(im);
+        im.sib_paths = _image_collect_siblings(im.src_path);
+        im.sib_mtime = mt;
+    }
+    h = mt;
+    sibs = im.sib_paths;
+    if (sibs != 0) {
+        n = arr_len(sibs);
+        i = 0;
+        while (i < n) {
+            sib = arr_get(sibs, i);
+            sh = _image_file_hash(sib);     // sibling mtime — cheap
+            if (sh != 0) { h = h ^ sh; }
+            i = i + 1;
+        }
+    }
     return h;
 }
 
@@ -1651,7 +1720,7 @@ void image_hot_reload_enable(img: ptr) {
     im = img;
     if (im.src_path == 0) { return; }
     _image_hr_init();
-    im.last_hash = _image_combined_hash(im.src_path);
+    im.last_hash = _image_combined_hash(im);
     _image_hr_list = arr_push(_image_hr_list, img);
 }
 
@@ -1674,7 +1743,7 @@ image_hot_reload_tick() {
         if (img == 0) { continue; }
         im = img;
         if (im.src_path == 0) { continue; }
-        current_hash = _image_combined_hash(im.src_path);
+        current_hash = _image_combined_hash(im);
         if (current_hash == 0) { continue; }
         if (current_hash == im.last_hash) { continue; }
         if (_image_reload(img) != 0) {
