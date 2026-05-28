@@ -1,305 +1,307 @@
-# ELF Dynamic Linking — Implementation Plan
+# ELF Dynamic Linking — the Linux x86_64 portability engine
 
-The Linux backend (`src/backend/target/x86_64_linux/x64_elf.bsm`) currently
-emits **static ELF only**: 388 lines, no dynamic section, no PLT, no GOT, no
-DT_NEEDED. Programs running on Linux interact with the kernel exclusively
-through `sys_*` syscalls. This works for headless tests, file I/O, X11 over
-the wire protocol, and the CPU framebuffer path. It does NOT work for
-anything that lives in a shared library — pthread, OpenAL/PulseAudio,
-Vulkan, DBus.
+**Status:** reshaped 2026-05-28 to the *engine / door* form. Not started. This
+plans the dynamic-linking **engine** (build + Docker-verify now, no special
+hardware) plus the GPU/audio **door** (stub now, couple when an x86_64 box with
+a real driver arrives). Threads are **not** part of this plan — see the sibling
+note below. General portability technique lives in `docs/manual/nomad_manual.md`;
+this file is the Linux-x86_64-specific application of it.
 
-The macOS backend (`a64_macho.bsm`, 1462 lines) handles the equivalent via
-Mach-O chained fixups + LC_LOAD_DYLIB. The split is from a 4× LOC gap that
-this document closes.
+## What this is, and what it is not
 
-This file is the **single canonical reference** for closing that gap. Read
-it, follow the steps, ship.
+B++'s Linux backend emits **static ELF only** — programs reach the kernel through
+`sys_*` syscalls, with no `ld.so` and no `DT_NEEDED`. That is the right default
+and it stays the default: everything syscall-reachable (compute, files, time, the
+CPU framebuffer over the X11 wire protocol, **and threads via `clone(2)`**)
+remains a zero-dependency static binary.
 
-## Goal of the first cut
+Dynamic linking exists for exactly one reason: **capabilities the OS exposes
+*only* as a shared library** — the GPU (`libvulkan.so.1`) and audio
+(`libasound.so.2`). There is no syscall for Vulkan; the only door to the GPU is
+its driver's `.so`. So dynamic linking is **opt-in**, auto-triggered only when a
+program reaches such a library — and it does not compromise the zero-dependency
+identity, because a CPU/headless program never links anything. `ld.so` itself is
+platform ABI, the same category as the syscall interface we already rely on.
 
-One end-to-end test passing on Linux through Docker:
+**Threads are a sibling arc, not this one.** Threads are syscall-reachable via
+raw `clone(2)` + `futex(2)` — no `ld.so`, no libc, no TLS — so they stay in the
+static lane. B++'s job runtime fits cleanly: `@safe` workers (no malloc), the
+parallel-for model is "main allocates → workers compute on disjoint slices →
+main collects", and B++ uses its own `bpp_mem` (mmap), not glibc malloc, so there
+is no concurrent glibc state and no errno/TLS in worker bodies. Building threads
+belongs in its own `clone()`-based plan; do **not** route them through this
+dynlink engine. (This corrects the 2026-04-29 draft, which made pthread the first
+target — pthread drags in the entire C runtime; see "the libc-init reality".)
 
-```bash
-./bpp --linux64 tests/test_thread.bpp -o /tmp/t
-docker run --rm -v /tmp:/tmp ubuntu:22.04 /tmp/t   # exit 0, "thread: OK"
-```
+## The shape: engine now, door later
 
-That is the win condition. `test_thread` calls `_stb_thread_create` which
-on macOS routes to `pthread_create`. On Linux today it is stubbed to
-return 0 (failure). The test is currently `SKIP:phase1-macos-only` in
-`tests/run_all.sh:54`. After dynlink ships, it runs.
+This is **Discipline #2** (stub the parity floor) applied to a binary-format
+capability — "build the engine, test what hardware allows, stub the rest behind a
+wired door, couple on arrival." Two phases:
 
-## Reference shape — what gcc emits
+- **Phase 1 — the engine (build + verify NOW, no hardware needed).** The ELF
+  dynamic-emission machinery in `x64_elf.bsm` plus the reloc-driven
+  static-vs-dynamic detection. **The engine is payload-agnostic**: the PLT/GOT
+  machinery is byte-identical whether the `DT_NEEDED` is `libc`, `libvulkan`, or
+  `libasound`. So we build it and verify it in Docker against a library that
+  *exists* in the container (`libc.so.6`): link it, call a symbol, confirm the
+  binary loads and binds under a real `ld.so`. That proves the engine for *every*
+  future payload, and it answers the one real unknown (libc-init) cheaply.
 
-A minimal `int main() { puts("hi"); return 0; }` cross-compiled to Linux
-x86_64 produces 25 dynamic-section entries and 9 program headers. The
-**B++ first cut** does not have to match this — many of those entries are
-optional. Required for a working dynamic ELF:
+- **Phase 2 — the door (stub NOW, couple when x86 hardware arrives).** The
+  GPU/audio API surface + Linux platform hooks (`_gpu_linux.bsm` /
+  `_audio_linux.bsm`, Tier-3 per the manual's Portability Tiers), wired to the
+  engine, with the real driver `DT_NEEDED` + calls **stubbed** and marked
+  `// ships when x86 hardware + driver present`. When the hardware lands,
+  coupling is the small, known step in the Activation checklist — the engine
+  underneath is already proven.
 
-```
-Program headers
-├── PT_PHDR     (loader walks this to find everything else)
-├── PT_INTERP   (path to /lib64/ld-linux-x86-64.so.2 — 29 bytes)
-├── PT_LOAD     (text + read-only — code, .interp, .dynsym, .dynstr, .hash, .rela.plt, .plt)
-├── PT_LOAD     (writable — .got.plt, .data, .dynamic)
-└── PT_DYNAMIC  (points at .dynamic table)
+**End state of this arc:** engine done + Docker-verified, door wired + stubbed,
+payload pending hardware. The motor is mounted and the entry door is linked; you
+bolt on the driver when the hardware shows up.
 
-Dynamic section (DT_*)
-├── DT_NEEDED   "libc.so.6"          — pthread_create lives here on glibc 2.34+
-├── DT_STRTAB   (.dynstr address)
-├── DT_SYMTAB   (.dynsym address)
-├── DT_STRSZ    (.dynstr size in bytes)
-├── DT_SYMENT   24                   — sizeof(Elf64_Sym)
-├── DT_HASH     (.hash address)      — minimal 1-bucket hash works
-├── DT_PLTGOT   (.got.plt address)
-├── DT_PLTRELSZ (size of .rela.plt)
-├── DT_PLTREL   DT_RELA (7)
-├── DT_JMPREL   (.rela.plt address)
-├── DT_FLAGS_1  DF_1_NOW (0x1)       — eager binding, skip lazy stubs
-└── DT_NULL     0
-```
+## What's already done (the chip + spine side)
 
-**Symbol entries** (24 bytes each, struct Elf64_Sym):
+Most of the *call* side already exists — this arc is almost entirely the ELF
+*writer*:
 
-```
-struct {
-    uint32_t st_name;    // offset into .dynstr
-    uint8_t  st_info;    // (binding << 4) | type — STB_GLOBAL=1 << 4 | STT_FUNC=2
-    uint8_t  st_other;   // 0
-    uint16_t st_shndx;   // SHN_UNDEF=0 for imports
-    uint64_t st_value;   // 0 for imports
-    uint64_t st_size;    // 0 for imports
-}
-```
+- **The extern model is shared spine.** `cg_ex_name`/`cg_ex_ret`/`cg_ex_args`/
+  `cg_ex_acnt` live in `bpp_codegen.bsm`, populated from the parser's import
+  records. **Reloc type 4 = "call this extern, patch me"** is emitted by *both*
+  backends (a64 `a64_codegen.bsm:1353`; x64 `_x64_emit_call_extern` → `0xE8 call
+  rel32` + a type-4 reloc carrying the symbol name). The Mach-O writer already
+  consumes type-4 via `mo_add_got` to build its GOT + chained fixups; the ELF
+  writer needs to consume the *same* relocs. No new shared abstraction is needed.
+- **`_start` is already emitted** on both backends.
 
-The first entry (index 0) is always all-zero by ELF convention. Imported
-symbols start at index 1.
+So Phase 1 is concentrated in one file: the ELF writer (`write_elf_dyn`) + the
+detection predicate. The chip is ready.
 
-**Hash table** — minimal 1-bucket layout:
+## The libc-init reality (the one real unknown)
 
-```
-nbucket = 1, nchain = N+1                  // 8 bytes
-bucket[0] = 1                              // 4 bytes — first symbol index
-chain[0..N] = [0, 2, 3, ..., 0]            // 4 bytes per entry — chain[k]=k+1, last=0
-```
+Dog-fooding the cousins (gcc 13 / glibc 2.36 in Docker, three modes) showed:
+every gcc binary — even `-no-pie` — routes `_start → __libc_start_main → main`,
+carries `INIT_ARRAY`, and references **versioned** symbols
+(`pthread_create@GLIBC_2.34`). The reason is load-bearing: **glibc's runtime
+(TCB, the `%fs` TLS base, the stack canary) must be initialized** before most
+libc functions — including pthread — work. A hand-rolled `_start → main` that
+calls such a function crashes.
 
-ELF hash function (0 for all = all collide → all in 1 bucket → linear scan,
-fine for 5 symbols).
+This is why pthread is the *wrong* first payload (it forces "become a C-runtime
+program") and why threads go to `clone()` instead. For the GPU/audio cut:
+`libvulkan`/`libasound` are C libraries that transitively pull `libc.so.6`;
+`ld.so` loads and *initializes* those libraries (runs their `INIT_ARRAY`, sets up
+the static TLS block) before our `_start`. The open question is whether that is
+enough for their entry points, or whether the *main thread* still needs
+`__libc_start_main`-style setup. **Phase 1c settles this empirically in Docker**
+(pure symbol vs stdio symbol) so Phase 2 has the answer in hand.
 
-**Relocations** (24 bytes each, struct Elf64_Rela):
+## Phase 1 — the engine
 
-```
-struct {
-    uint64_t r_offset;   // address of GOT entry to patch
-    uint64_t r_info;     // (sym_index << 32) | R_X86_64_JUMP_SLOT (7)
-    int64_t  r_addend;   // 0
-}
-```
+### 1a. `write_elf_dyn` in `x64_elf.bsm` (the bulk)
 
-**.plt entries** (16 bytes per imported symbol, eager binding):
+Replace the `write_elf_dyn` stub (`error: dynamic ELF emission not yet
+implemented`) with real emission.
 
-```
-ff 25 xx xx xx xx    jmp QWORD PTR [rip+disp32]     ; jump to GOT[i]
-0f 1f 40 00          nop dword ptr [rax+0x0]         ; pad to 16
-... 4 bytes pad ...
-```
+`write_elf_dyn(filename, main_label, gl_names, gl_count, imports)` — `imports` is
+the list of *referenced* externs (those with a type-4 reloc), `imports ⊆
+cg_ex_name`, built by scanning the reloc list for type-4 and collecting distinct
+symbol names (also the detection signal — 1b).
 
-**.got.plt** (8 bytes per entry, plus 3 reserved):
-
-```
-got.plt[0] = 0   // address of .dynamic — kernel fills
-got.plt[1] = 0   // link_map  — dynamic linker fills
-got.plt[2] = 0   // _dl_runtime_resolve — dynamic linker fills (unused with eager binding)
-got.plt[3..] = address of corresponding PLT[N+1]
-                 // initially = "first PLT instruction after the jmp",
-                 // dynamic linker overwrites with resolved address
-```
-
-With **eager binding** (DT_FLAGS_1 = DF_1_NOW), `got.plt[3..]` is filled
-with the **resolved symbol address** before `main()` runs. The PLT stubs
-just `jmp [got.plt[3+i]]` and that lands in the real function.
-
-## Step-by-step implementation
-
-### Step 1 — Track imported symbols at codegen time
-
-`x64_codegen.bsm` currently emits direct `call rel32` for every function
-call. For dynlinked symbols we need to call the PLT instead, with a
-relocation that the ELF writer patches.
-
-Add to `x64_enc.bsm`:
-
-- A new relocation type, **type 4 = PLT call**.
-- `x64_enc_pltcall(name_p)` — emits `call rel32` with reloc type 4 and
-  the imported symbol name as the symbol.
-
-Add to `x64_codegen.bsm`:
-
-- A list `cg_imports` populated when emitting a call to a known FFI
-  symbol (initially: pthread_create, pthread_join). Detection: the
-  symbol is in a known `import "libc.B" { ... }` block.
-
-The B++ source side: ensure `_core_linux.bsm` declares the imports.
-
-### Step 2 — Add dynamic ELF emission to `x64_elf.bsm`
-
-New section: **`write_elf_dyn(filename, main_label, gl_names, gl_count, imports)`**.
-
-Layout pass:
+Layout pass (file offsets; virtual addresses follow file layout 1:1, `ELF_BASE =
+0x400000` for text, next page for data):
 
 ```
 hdr_off       = 0
 phdr_off      = 64
 interp_off    = 64 + nphdr * 56
-dynsym_off    = align(interp_off + 29, 8)
+dynsym_off    = align(interp_off + 28, 8)     // "/lib64/ld-linux-x86-64.so.2\0" = 28 bytes
 dynstr_off    = dynsym_off + (nimport + 1) * 24
 hash_off      = align(dynstr_off + dynstr_size, 8)
 relaplt_off   = align(hash_off + (8 + nimport * 8), 8)
 plt_off       = align(relaplt_off + nimport * 24, 16)
-text_off      = align(plt_off + (nimport + 1) * 16, 16)
-                                  // PLT[0] is reserved for lazy stub (16 bytes), unused with eager binding
+text_off      = align(plt_off + (nimport + 1) * 16, 16)   // PLT[0] reserved, unused w/ eager
 text_end      = text_off + code_size
-data_off      = align_page(text_end)
-gotplt_off    = data_off
-data_after_got = gotplt_off + (3 + nimport) * 8
+data_off      = align_page(text_end)                       // page-aligned writable segment
+gotplt_off    = data_off                                   // GOT contiguous at segment start
+data_after_got= gotplt_off + (3 + nimport) * 8
 flt_off       = data_after_got
 str_off       = flt_off + nflt * 8
 gl_off        = str_off + str_size
 dyn_off       = gl_off + gl_count * 8
-file_end      = dyn_off + (12 dyn entries) * 16
+file_end      = dyn_off + (dyn_entry_count) * 16
 ```
 
-Virtual addresses follow file layout 1:1 with `ELF_BASE = 0x400000` for
-text, `ELF_BASE + first_page_after_text` for data.
+Emit each section in order (see the ELF reference shape appendix for exact byte
+layouts of `Elf64_Sym`, the hash table, `Elf64_Rela`, the PLT stub, and the
+`DT_*` set):
+- `.dynstr` — position 0 empty, then `"<lib>\0<sym0>\0<sym1>\0…"`.
+- `.dynsym` — index 0 zero; one `Elf64_Sym` per import (STB_GLOBAL|STT_FUNC, SHN_UNDEF).
+- `.hash` — 1-bucket (nbucket=1, nchain=N+1, bucket[0]=1, chain[k]=k+1, last 0).
+- `.rela.plt` — one per import: `r_offset = gotplt_off + (3+i)*8`, `r_info = ((i+1)<<32)|7`, `r_addend = 0`.
+- `.plt` — one 16-byte stub per import: `ff 25` + disp32 → `got.plt[3+i]`, then `0f 1f 40 00` NOP pad.
+- `.got.plt` — 3 reserved zeros + per-import initial value `plt_off + 16 + i*16`.
+- `.dynamic` — the `DT_*` entries (NEEDED, STRTAB/SYMTAB/STRSZ/SYMENT, HASH, PLTGOT, PLTRELSZ, PLTREL=DT_RELA, JMPREL, FLAGS_1=DF_1_NOW), terminated by DT_NULL.
 
-Emit each section in order. For `.dynstr`, intern names: position 0 is
-empty string, then "libc.so.6\0pthread_create\0pthread_join\0...".
+Then patch the text relocations: types 0/1/2 (global/string/float) unchanged;
+**type 4 (extern call)** → `target = plt_off + 16 + (sym_index * 16)`, `disp32 =
+target - (reloc_site + 4)`, where `sym_index` is the import's PLT slot.
 
-For `.hash`, generate the 1-bucket layout (nbucket=1, nchain=N+1).
+### 1b. Reloc-driven detection (inside the writer)
 
-For `.rela.plt`, emit one entry per import:
-- `r_offset` = `gotplt_off + (3 + i) * 8`
-- `r_info` = `((i + 1) << 32) | 7`
-- `r_addend` = 0
+After `mark_reachable()` + codegen, the deciding signal is **any type-4 reloc**:
+≥ 1 → dynamic ELF (`imports` = distinct type-4 names); 0 → static, exactly as
+today. `bpp.bpp` has a single ELF call site (`write_elf(...)` at `bpp.bpp:539`);
+do **not** add an `if dynamic` branch in the orchestrator — `write_elf` itself
+scans for type-4 and dispatches internally to the static path or `write_elf_dyn`
+(Rule 41 audit test 3: push the decision into the target layer). `write_elf`'s
+signature stays backward compatible.
 
-For `.plt`, emit one stub per import (16 bytes):
-- bytes `ff 25` then 4-byte disp32 to `got.plt[3+i]`
-- bytes `0f 1f 40 00` (NOP padding) and 6 bytes more to total 16
+Reachability keeps this honest: a program that reaches no extern call (every
+plain test, and `bpp` itself) emits zero type-4 relocs and stays **static**.
 
-For `.got.plt`, write 3 reserved zeros + initial values pointing at `plt_off + 16 + i*16` for each import (the dynamic linker will overwrite these).
+### 1c. Verify in Docker against libc (mechanism smoke + libc-init answer)
 
-For `.dynamic`, emit the 12 entries above, terminated by DT_NULL.
+The engine's acceptance test needs **no GPU/audio**. Link `libc.so.6`, call a
+symbol, confirm load + bind under a real `ld.so`:
 
-### Step 3 — Patch text relocations
-
-After layout, walk the relocation list and patch:
-
-- Type 0/1/2 (existing — global/string/float): unchanged behaviour.
-- **Type 4 (new — PLT call)**: target = `plt_off + 16 + (sym_index * 16)`.
-  Disp32 = `target - (rip + 4)`.
-
-### Step 4 — Switch the entry point
-
-The entry point goes to `_start` which sets up argc/argv/envp before
-calling `main`. The current Linux backend ALREADY emits `_start` (see
-`a64_macho.bsm` and `x64_elf.bsm` — `start_lbl`). With dynamic linking,
-the dynamic linker resolves all PLT entries before jumping to entry, so
-`_start` doesn't need to do anything new.
-
-### Step 5 — Wire `_thread_spawn` on Linux
-
-In `_core_linux.bsm`:
-
-```bpp
-import "libc.B" {
-    int pthread_create(ptr, ptr, ptr, ptr);
-    int pthread_join(long, ptr);
-}
-
-_thread_spawn(tid_buf, start_fn, arg) {
-    return pthread_create(tid_buf, 0, start_fn, arg);
-}
-
-_thread_wait(tid) {
-    return pthread_join(tid, 0);
-}
-```
-
-The `import "libc.B"` block tells the codegen these are FFI imports.
-On macOS, `libc.B` resolves to `libSystem.B.dylib`. On Linux, to `libc.so.6`.
-Both are equivalent in the import-block convention.
-
-### Step 6 — Detection: when to emit dynamic vs static
-
-The cheapest detection: count `cg_imports` after codegen. If > 0, emit
-dynamic. Else emit static.
-
-`bpp.bpp` calls either `write_elf` (static) or `write_elf_dyn` (dynamic)
-based on this. Both signatures stay backward compatible.
-
-### Step 7 — Validation
+- **Pure symbol first** (e.g. `strlen`, `abs`) — exercises the *whole* dynlink
+  path (PT_INTERP → ld.so, `.dynsym` lookup, `.rela.plt` JUMP_SLOT, PLT/GOT bind)
+  with **no** libc-runtime dependency. `exit=0` in Docker proves the engine.
+- **Then a runtime-dependent symbol** (e.g. `puts`) — forces the **libc-init
+  answer** (does our `_start` suffice, or must we route through
+  `__libc_start_main` / set up `%fs`/TCB?). Record the verdict in this plan.
 
 ```bash
-# 1. Compile a thread test
-./bpp --linux64 tests/test_thread.bpp -o /tmp/test_thread
-
-# 2. Inspect the binary
-readelf -d /tmp/test_thread       # should show NEEDED libc.so.6, all dynamic entries
-readelf -l /tmp/test_thread       # should show PT_INTERP + PT_DYNAMIC
-readelf -r /tmp/test_thread       # should show JUMP_SLOT relocations for pthread_*
-ldd /tmp/test_thread              # should show "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6"
-
-# 3. Run in Docker
-docker run --rm -v /tmp:/tmp ubuntu:22.04 /tmp/test_thread
-# expected: "thread: OK", exit 0
-
-# 4. Update tests/run_all.sh:54 to drop "phase1-macos-only" skip for thread/job/maestro
+./bpp --linux64 tests/test_dynlink_smoke.bpp -o /tmp/t
+readelf -dlr /tmp/t        # NEEDED libc.so.6, PT_INTERP + PT_DYNAMIC, JUMP_SLOT relocs
+docker run --rm --platform linux/amd64 -v /tmp:/tmp ubuntu:22.04 /tmp/t   # exit 0
 ```
 
-## What this does NOT cover (yet)
+Add `tests/test_dynlink_smoke.bpp` (a tiny program that calls one libc symbol) as
+the permanent regression for the engine. This is the full Phase-1 win condition.
 
-- **Lazy binding** (PLT[0] + _dl_runtime_resolve trampolines). Eager
-  binding via DF_1_NOW is simpler, slightly slower at startup, fine
-  for our purposes. Switch to lazy when startup cost of resolving 100+
-  symbols becomes measurable.
-- **GNU_HASH** instead of legacy ELF DT_HASH. GNU_HASH is faster but
-  more complex (Bloom filter + hash). Stick with DT_HASH for the first
-  cut; libc resolves either.
-- **Vulkan / OpenAL / DBus / X11-via-libX11**. Same machinery applies
-  — just register more imports. The first cut hardcodes `libc.so.6`
-  with pthread_*. Adding `libvulkan.so.1` is a one-line `dyn_libs`
-  addition + symbol declarations.
-- **Pre-existing macOS pattern reuse**. Mach-O chained fixups don't
-  port directly — different format. But the `mo_got_syms` /
-  `mo_ext_libs` bookkeeping in `a64_macho.bsm:88-90` is the model for
-  the Linux side's `cg_imports` / `cg_dyn_libs`.
-- **Section headers**. Modern Linux loaders don't need `.shstrtab` /
-  section header table for execution — only program headers matter.
-  The reference gcc binary has them for `objdump -d`/`gdb` symbol
-  display; skipping them is a minor disassembler ergonomics loss.
-  Add them if needed for production debugging.
+## Phase 2 — the GPU/audio door (stub + hardware-gated)
+
+The mechanism is proven; Phase 2 wires the *consumers* and leaves the
+hardware-specific parts stubbed.
+
+- **Lift the single-`DT_NEEDED` assumption.** Phase 1 hardcodes one library
+  (`libc.so.6`). Add a per-extern library association so `libvulkan.so.1` and
+  `libasound.so.2` are named distinctly: either an `EX_LIB` field on the extern
+  record, or a parse-side lib→symbol map. `write_elf_dyn` then emits one
+  `DT_NEEDED` per referenced library.
+- **Create the Tier-3 platform files** `_gpu_linux.bsm` / `_audio_linux.bsm`
+  (separate files per the manual — GPU/Window/Audio are always per-OS files).
+  Wire the abstract API (`bpp_gpu` / `bpp_audio`) to the engine, with each driver
+  call **stubbed** and marked `// ships when x86 hardware + driver present`.
+- The stubs return sane "unavailable" defaults so a program *compiles and runs*
+  on a box without the driver (falling back to CPU render / silent audio), and
+  *links + uses* the driver on a box that has it.
+
+Phase 2 lands the door; it is not "done" until Activation runs on real hardware.
+Per the plan-lifecycle rule, this plan stays **active** with Phase 2 as the
+explicit "what's left" until that happens.
+
+## Activation on x86 hardware (the treasure map)
+
+When a real x86_64 Linux box with a GPU/audio driver arrives, coupling a stubbed
+payload is this checklist — the engine is already proven, so this is small:
+
+1. **Confirm the driver is present:** `ldconfig -p | grep -E 'libvulkan|libasound'`.
+2. **Flip the stub to real** in `_gpu_linux.bsm` / `_audio_linux.bsm`: replace
+   the stub body with the real `import "libvulkan.B" { … }` declaration + call.
+3. **Name the library** via the Phase-2 `EX_LIB` association so its `DT_NEEDED`
+   is emitted.
+4. **Build:** `./bpp --linux64 <gpu_demo>.bpp -o demo`.
+5. **Verify on hardware:** `readelf -d demo` shows the driver `.so`; `ldd demo`
+   resolves it; run it — the window renders / sound plays.
+6. **If a linked C library misbehaves at its entry**, apply the **libc-init
+   verdict from Phase 1c** (route `_start` through `__libc_start_main`, or set up
+   the main-thread `%fs`/TCB). This is the single pre-identified risk; everything
+   else is mechanical.
+7. **Drop the `// ships when hardware lands` markers** — the door is live. Update
+   this plan's status (close it → move to `docs/plans/legacy/` per the lifecycle
+   rule).
+
+The *general* version of this technique — build the engine, stub the
+hardware-gated payload, couple on arrival — is doctrine in
+`docs/manual/nomad_manual.md`.
+
+## Reference shape — what gcc emits (the ELF spec; does not drift)
+
+`Elf64_Sym` (24 B): `st_name`(u32 dynstr off) · `st_info`(u8, STB_GLOBAL<<4 |
+STT_FUNC) · `st_other`(u8 0) · `st_shndx`(u16 SHN_UNDEF=0) · `st_value`(u64 0) ·
+`st_size`(u64 0). Index 0 all-zero; imports start at 1.
+
+`Elf64_Rela` (24 B): `r_offset`(u64 GOT slot addr) · `r_info`(u64
+(sym_index<<32)|R_X86_64_JUMP_SLOT(7)) · `r_addend`(i64 0).
+
+`.plt` stub (16 B, eager): `ff 25 <disp32>` jmp `[rip+GOT[i]]`, then `0f 1f 40
+00` NOP pad. With `BIND_NOW`, GOT[i] is pre-resolved so the stub is a single jmp;
+the lazy `push $idx; jmp PLT0` tail is dead code we don't emit.
+
+`.got.plt` (8 B each, 3 reserved): `[0]`=&_DYNAMIC, `[1]`=link_map (ld.so),
+`[2]`=_dl_runtime_resolve (unused w/ eager), `[3..]`=resolved addresses.
+
+Confirmed in Docker (gcc 13 / glibc 2.36): a **non-PIE `ET_EXEC`** dynamic binary
+at `0x400000` loads + runs (`exit=0`); legacy **`DT_HASH`** is accepted (gcc emits
+both `.hash` and `.gnu.hash`, glibc uses either); interpreter is
+`/lib64/ld-linux-x86-64.so.2` (28 bytes incl. NUL).
+
+## GOT-layout policy (realized 2026-05-28)
+
+A GOT must be laid out so the loader's fixup mechanism resolves every entry.
+ELF makes this trivial — relocations are **per-entry** (`R_X86_64_JUMP_SLOT`, one
+`Elf64_Rela` per slot), so a `.got.plt` of any size resolves regardless of page
+boundaries. We still keep the writable `PT_LOAD` page-aligned and the `.got.plt`
+contiguous (free, and the shared discipline).
+
+The sibling lesson came from Mach-O, whose chained fixups are **per-page**: a GOT
+straddling a 16 KB page boundary left the spilled slots un-rebased. That bug was
+**fixed 2026-05-28** (`4d0b9ea`, `a64_macho.bsm` — pad the GOT off a straddle +
+make the byte-writer honor the same offset). ELF is immune by construction; a
+future per-page format (Windows PE `.reloc`) would inherit the Mach-O-style care.
+The shared, format-agnostic part (which externs, GOT slot assignment) lives in the
+spine (`cg_ex_*`); the per-format emission lives in each target writer. See
+`docs/manual/nomad_manual.md` ("format-agnostic model, format-specific emission").
+
+## Verification gates (every step)
+
+- Native a64 suite stays green + bootstrap **gen1 == gen2** byte-stable (this is
+  an x64/ELF-writer change; it must not perturb a64 output).
+- C-emit suite unaffected.
+- The **static ELF path is byte-identical** for non-linking programs — detection
+  only *adds* a dynamic route; it must not change the static one.
+- `bpp` itself stays a **static** ELF on Linux (it reaches no extern call) — the
+  self-host bootstrap must never silently acquire a `libc.so.6` dependency.
+- Phase 1c: `test_dynlink_smoke` loads + binds in Docker (`exit=0`).
+
+## Doctrine compliance (Rule 41 + Layer 4)
+
+Additive portability (Rule 41): brings the Linux target up in capability,
+touching **only** the Linux layers.
+1. **No `stb/` file modified** — the abstract `bpp_gpu`/`bpp_audio` API is the
+   contract; only the Linux backing changes.
+2. **No other target's backend touched** — changes confined to
+   `src/backend/target/x86_64_linux/x64_elf.bsm` + the new `_gpu_linux.bsm` /
+   `_audio_linux.bsm`. macOS untouched.
+3. **Source byte-identical across targets** — a `import "stbgpu.bsm"; main(){…}`
+   program compiles unchanged for every target; no `#if TARGET`.
+
+Decision-tree placement: the ELF-writer expansion is point 4 (chip+OS binary
+format) → `target/` layer, not the spine. The GPU/audio platform hooks are
+Tier-3 → separate per-OS files. New files → update `install.sh` in the same
+commit (Discipline #4).
 
 ## Estimated effort
 
-- Section emission: ~200 lines in `x64_elf.bsm`
-- Codegen reloc type 4 + import tracking: ~100 lines across
-  `x64_enc.bsm` + `x64_codegen.bsm`
-- `_core_linux.bsm` import block: ~10 lines
-- `tests/run_all.sh` skip removal: 1 line
-- Docker test loop: existing
-- Debug + trace through `readelf` / `ldd` until the binary loads
-  cleanly: 2-4 hours
+- `write_elf_dyn` section emission: ~200 lines in `x64_elf.bsm` (the bulk).
+- Detection (reloc scan) + type-4 patch in the dyn path: ~40 lines.
+- `test_dynlink_smoke.bpp` + Docker verification + libc-init settle: 2–4 hours.
+- Phase 2 door (EX_LIB + stubbed `_gpu_linux`/`_audio_linux`): a separate sitting.
 
-Total: a focused half-day session, including the inevitable byte-level
-debugging that ELF demands.
-
-## Why not now (this session)
-
-This document was written at the end of an overnight refactor
-(`bpp_mem.bsm` + `bpp_time.bsm` + `bpp_thread.bsm` + docs split + Option B
-+ Linux cross-compile unblocked + C emitter restored). Plate is full;
-ELF dynlink with cold tools at 7 a.m. is risk for risk's sake. Better in a
-fresh session with `readelf` muscle memory primed.
-
-The skeleton in `x64_elf.bsm` (just below this comment when it lands) is
-the entry point — empty function with TODOs. Wire it up next time.
+Phase 1 (engine + Docker-verify) is a focused half-day, front-loaded on the ELF
+writer and the byte-level `readelf`/`ldd` debugging ELF always demands — now with
+warm tools and a self-hosted Linux box to debug on. Phase 2 is bounded but waits
+on hardware to *finish*.

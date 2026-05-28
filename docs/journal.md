@@ -10975,7 +10975,7 @@ peasant per frame.
 
 Four stacked stages of mechanical, profile-justified optimization
 to the compiler self-host hot path. Proposal lives in
-`docs/sidequest_compiler_hotpath_opt.md` (shipped same arc, see
+`docs/plans/legacy/sidequest_compiler_hotpath_opt.md` (shipped same arc, see
 the updated header for the SHIPPED status block).
 
 | Stage | What | LOC | Bootstrap | Cumulative gain |
@@ -11159,7 +11159,7 @@ shipped, ~27%) for one more day of profile-driven stages. Six
 more candidates evaluated, five shipped, one reverted. Final
 bootstrap **0.51s → 0.30s = ~41%** cumulative. Suite 177/0/12
 + 141/0/48 byte-stable throughout. Doc updated to `FULLY
-CLOSED` in `docs/sidequest_compiler_hotpath_opt.md`.
+CLOSED` in `docs/plans/legacy/sidequest_compiler_hotpath_opt.md`.
 
 | Stage | What | Bootstrap | Commit |
 |---|---|---|---|
@@ -11218,7 +11218,7 @@ friendly. Mirrors S2 (`_dsp_find_func_idx`) in spirit.
 ### S4 cost-model inliner — opened as its own sidequest
 
 Decision point at end of arc: ship and close, or roll into S4.
-Picked: ship the arc, open `docs/sidequest_cost_model_inliner.md`
+Picked: ship the arc, open `docs/plans/legacy/sidequest_cost_model_inliner.md`
 with proper design phase. The remaining ~18% gap (tablah 49ms
 vs tablah_opt 40ms hand-unrolled xorshift64) needs multi-stmt +
 alpha-rename + side-effect tracking — a 1-2 dedicated session
@@ -11278,7 +11278,7 @@ natural code, gets the same parallel dispatch.
 
 | Phase | Commit | What landed |
 |---|---|---|
-| P0 | `7da49fc` | Design doc — `docs/plans/sidequest_smart_dispatch_outlining.md`. Industry research surveyed GCC OpenMP, LLVM, Cilk, TBB, Burst, GCD. Eight design questions resolved (Q1-Q8). |
+| P0 | `7da49fc` | Design doc — `docs/plans/legacy/sidequest_smart_dispatch_outlining.md`. Industry research surveyed GCC OpenMP, LLVM, Cilk, TBB, Burst, GCD. Eight design questions resolved (Q1-Q8). |
 | P1 | `30ea81b` | Free-variable analysis — `_fdc_collect_captures` walks loop body, identifies T_VAR refs not in (loop_var, body_local, global). Pure data collection, no consumer yet. |
 | P2 | `f5071e7` | Capture struct synthesis — `_outline_synth_capture_struct` calls `add_struct_def` + `add_struct_field` from dispatch time. Confirmed the parser's struct API works post-parse (the `sd_*` arrays are plain B++ data structures). |
 | P3 | `f606e52` | AST rewriter — `_outline_clone_body_with_captures` reuses S4 P3a's `ast_clone_subst` with a different substitution map (`captured_name → T_MEMLD(_outline_cap_ptr + offset)`). `get_field_offset` declassified from `static` to public. |
@@ -12487,3 +12487,73 @@ common non-nested cases get the register; deeper nesting falls back to the
   busy-check + stack fallback captures the bulk of the win at near-zero risk.
 - **Tripod green throughout:** native ARM64 180/0/12, C-emit 145/0/47, x64
   self-hosts byte-stable in Docker at every step.
+
+## 2026-05-28 — Bang 9 runs on Linux: a GOT-straddle fix, the stbui clamp, and a window-dim gap
+
+### The arc
+
+Started as an stbui "graceful clamp" sidequest; ended with Bang 9 fully
+interactive on Linux/X11 (ModuLab drawing and all) and two latent bugs cracked
+underneath. The clamp was correct the whole time — it kept *exposing* deeper
+problems, which is exactly what a good clamp should do.
+
+### What shipped
+
+- **Mach-O GOT page-straddle fix** (`4d0b9ea`). Implementing the clamp grew
+  `__DATA` enough to push the GOT across a 16 KB boundary; dyld's chained fixups
+  are per-page, so the spilled GOT slots never rebased and a call through one
+  landed on `pc=0x1` (SIGBUS in `test_modulab_select`). Dog-fooded `bug` to the
+  crash, then found *two* halves: `mo_compute_layout` now bumps the GOT off a
+  straddle, and the `__DATA` byte-writer now honours that exact offset instead
+  of re-deriving its own 8-byte alignment — there were two sources of truth for
+  the GOT offset and they diverged the moment the bump engaged (the 138→139
+  intermediate). Plus a hard guard if a GOT ever exceeds one page.
+
+- **stbui graceful clamp** (`2bc194c`). Three layers: L1 stbdraw clip-rect stack
+  (`draw_clip_push/pop`, ImGui intersect; `put_px`/`blend_px`/`draw_rect` honour
+  it, default unbounded so existing consumers stay byte-identical); L2 stbui
+  `ui_clip_push/pop` + non-negative `ui_node_w/h`; L3 Bang 9 `panels_draw` wraps
+  its dispatch. Headless `tests/test_clip.bpp` locks the semantics.
+
+- **Bang 9 on Linux** (`5ddfaca` + `fa390cb`). The clamp "broke" tab content in
+  Docker — but bisecting (disable L3) showed it was *masking* the real bug: the
+  X11 platform never set `_stb_win_w/_stb_win_h`, so `window_width/height()`
+  returned 0 and every `ui_layout` GROW row collapsed to height 0 (content
+  crammed/overlapped, then got clamped away). Fixed by publishing the dims in
+  `_stb_init_window` (mirroring macOS); then `ConfigureNotify` (type 22) makes
+  resize reflow + clamp, with an `_x11_pixbuf` capacity guard for grow. Bang 9
+  now switches tabs, renders without overlap, resizes, and takes ModuLab drawing
+  over XQuartz.
+
+- **Docs faxina + portability doctrine** (`fa1bb5d` + this entry). Archived 7
+  shipped plans to `docs/plans/legacy/` (verified against git — two were still
+  headed "PROPOSED"/"DESIGN-LOCKED" months after shipping) and fixed every path
+  reference. Added a **Plan Lifecycle** section to `bootstrap_manual.md` (on
+  ship: review vs git → close + `git mv` to legacy, or leave active with an
+  explicit "what's left"; don't cite active plans from manuals). Reshaped the ELF
+  dynlink plan to the **engine/door** form (build + Docker-verify the
+  payload-agnostic engine against libc now; stub the GPU/audio payload behind a
+  wired door + an activation checklist for when x86 hardware arrives). Wrote a
+  new **`nomad_manual.md`** distilling the portability techniques.
+
+### Lessons
+
+- **A fix that hides a symptom may be masking, not curing.** The clip made panel
+  content vanish on Linux; the real bug was upstream (window dims = 0). Bisect
+  the suspect layer to see what the symptom *really* is.
+- **Cross-compiling clean ≠ running clean.** Bang 9 built for Linux for weeks
+  before it *ran*; running it in Docker/XQuartz surfaced the window-dim + resize
+  gaps the build never could. Run in the real target.
+- **Two sources of truth for one value will diverge.** The GOT offset, computed
+  in the layout pass and re-derived in the writer, was fine until the straddle
+  bump made them disagree. One value, one owner.
+- **The engine is payload-agnostic.** ELF dynlink's PLT/GOT machinery is
+  identical for libc / vulkan / alsa — so it can be built + verified against libc
+  in Docker now and coupled to a real driver when hardware arrives (the
+  engine/door pattern, now doctrine in `nomad_manual.md`).
+
+### Tripod
+
+Native ARM64 181/0/12 (added `test_clip`), C-emit 145/0/47, gen1==gen2
+byte-stable throughout. Mach-O + Linux-platform changes only; compiler codegen
+untouched.

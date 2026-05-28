@@ -285,6 +285,18 @@ consumer); HUD per-frame malloc churn killed (60 fps held flat);
 regression test `tests/test_memst_float_to_int.bpp` guards both
 backends against the bug class.
 
+**Full optimization parity (May 27).** Collapsing the walkers was
+half the story; the parity push then brought every *optimization*
+level to x86_64 too — B1 expression-register freelist, B2 / S4 / VI
+inline (single-return, multi-statement, and void), B3 local
+promotion, B4 `: double` SIMD, and smart-dispatch outlining — and
+unified the inline-multi splicer into a single shared spine helper
+(`290d77d`). Both backends now run the *identical* optimization set;
+the only differences are ISA/ABI register-budget arithmetic (x64's
+expression freelist is 1 register vs a64's 7, B3 is 5 vs 6 — System V
+leaves x86_64 fewer free registers than AAPCS64). A third backend
+inherits the whole optimization pipeline for free.
+
 ---
 
 ## What B++ Has

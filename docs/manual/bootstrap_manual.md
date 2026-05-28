@@ -103,6 +103,43 @@ README updates, journal entries — you do **not** need to bootstrap or run
 the suite. Doc edits cannot affect codegen. Save the ~2 minutes for the
 next real change.
 
+## Plan Lifecycle and Hygiene
+
+Design plans live in `docs/plans/`. They are working documents, not
+permanent records — keep that directory showing only *live* work.
+
+**When a plan's work ships, close it in the same session.** Whoever
+finishes the implementation owns the plan's bookkeeping:
+
+1. **Review** the plan against what actually shipped — verify against
+   git, not the header (headers go stale).
+2. **Resolve** it one of two ways:
+   - **Fully done** → set the status to `CLOSED` / `SHIPPED` with the
+     date + key commits, then **move the file to `docs/plans/legacy/`**
+     (`git mv`, so history follows).
+   - **Partially done** → leave it in `docs/plans/`, but make the
+     remaining scope **explicit**: a "What's left / not yet shipped"
+     note listing exactly what is unfinished and why. An active plan
+     must say what it is still waiting on.
+
+Never leave a shipped plan in the active set under a stale
+`PROPOSED` / `scoped` header — that is how the directory rots and how a
+later reader trusts a header git contradicts. (The 2026-05-28 cleanup
+found `smart_dispatch_outlining` and `load_import_distinction` both
+shipped months earlier but still headed "PROPOSED" / "DESIGN-LOCKED".)
+
+**Living docs are exempt.** Roadmaps and state-reports
+(`compiler_boost_roadmap`, `games_roadtrip`, `multicore_state_report`,
+`bangscript_plan`) are never "closed" — they track an ongoing surface
+and stay in `docs/plans/`.
+
+**Do not cite an active plan from a manual.** The manuals
+(`bootstrap_manual`, `how_to_dev_b++`, `tonify_checklist`, …) are the
+stable reference; active plans churn and move, so a link to one rots.
+Cite a plan from a manual **only** once it is closed and living in
+`docs/plans/legacy/` — a legacy path is stable. For historical context
+prefer pointing at the journal entry or the commit instead.
+
 ## Quick Reference
 
 ```bash
