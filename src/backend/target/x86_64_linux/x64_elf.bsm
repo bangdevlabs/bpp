@@ -376,8 +376,35 @@ void write_elf(filename, main_label, gl_names, gl_count) {
     auto fd, written, code_size, main_code_off;
     auto i;
     auto flt_bits: u_word;
+    auto imports, _ri, _rsym, _dup, _k;
 
     code_size = x64_enc_pos;
+
+    // Static-vs-dynamic detection (reloc-driven). A type-4 relocation exists
+    // only where a reachable function actually calls an extern (mark_reachable
+    // prunes uncalled ones), so it is the call-driven signal that this program
+    // needs dynamic linking. Collect the distinct imported symbol names and
+    // route to write_elf_dyn; with zero type-4 relocs we fall through to the
+    // static path below, byte-identical to before. (Rule 41 audit test 3: the
+    // decision lives in the target writer, not in bpp.bpp's dispatch.)
+    imports = arr_new();
+    _ri = 0;
+    while (_ri < arr_len(x64_enc_rel_ty)) {
+        if (arr_get(x64_enc_rel_ty, _ri) == 4) {
+            _rsym = arr_get(x64_enc_rel_sym, _ri);
+            _dup = 0; _k = 0;
+            while (_k < arr_len(imports)) {
+                if (elf_packed_eq(arr_get(imports, _k), _rsym)) { _dup = 1; }
+                _k++;
+            }
+            if (_dup == 0) { imports = arr_push(imports, _rsym); }
+        }
+        _ri++;
+    }
+    if (arr_len(imports) > 0) {
+        write_elf_dyn(filename, main_label, gl_names, gl_count, imports);
+        return 0;
+    }
 
     // Find the byte offset of the entry point within the code buffer.
     main_code_off = arr_get(x64_enc_lbl_off, main_label);
