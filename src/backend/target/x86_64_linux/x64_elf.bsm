@@ -562,10 +562,246 @@ void write_elf(filename, main_label, gl_names, gl_count) {
 // Until then, programs that need libc symbols (pthread_*, audio,
 // X11 toolkits) are SKIP'd in `tests/run_all.sh`. See
 // `docs/plans/elf_dynlink_plan.md` Step-by-Step section.
+// Emit a dynamically-linked ELF: the program calls externs (imports) that the
+// dynamic linker resolves from a shared library at load time. `imports` is the
+// list of distinct packed extern names collected by write_elf's detection.
+//
+// First cut — the mechanism (PT_INTERP + PLT/GOT + eager binding against
+// libc.so.6), verified in Docker by linking a pure libc symbol (strlen). The
+// GPU/audio payload (libvulkan/libasound, per-lib DT_NEEDED) and the note/
+// minisym carry-over are follow-ups. Reference shape validated against gcc.
+//
+// Layout (non-PIE ET_EXEC at ELF_BASE; vaddr == ELF_BASE + file offset):
+//   TEXT segment (R+X): ELF hdr, phdrs, .interp, .dynsym, .dynstr, .hash,
+//                       .rela.plt, .plt, code
+//   DATA segment (R+W): globals, floats, strings, .got.plt, .dynamic
+// Globals/floats/strings stay first in DATA so elf_resolve_relocations handles
+// relocation types 0/1/2 exactly as in the static path; type 4 patches to PLT.
 void write_elf_dyn(filename, main_label, gl_names, gl_count, imports) {
-    diag_str("error: dynamic ELF emission not yet implemented");
-    diag_newline();
-    diag_str("see docs/plans/elf_dynlink_plan.md for the implementation plan");
-    diag_newline();
-    sys_exit(1);
+    auto fd, written, code_size, start_off, i, j, N, flt_cnt;
+    auto nphdr, interp_off, interp_len;
+    auto dynsym_off, dynsym_size, dynstr_off, dynstr_size;
+    auto hash_off, hash_size, relaplt_off, relaplt_size;
+    auto plt_off, plt_size, code_off, text_filesz;
+    auto data_off, globals_size, floats_size, strings_size;
+    auto gotplt_off, gotplt_size, dynamic_off, dynamic_size, data_filesz;
+    auto libc_off, name_offs, s, l, sym;
+    auto pos, ty, rsym, idx, rip_addr, plt_vaddr, disp, pv, gv, d;
+    auto gotplt_vaddr, dynamic_vaddr;
+    auto flt_bits: u_word;
+    auto gd_val: u_word;
+
+    code_size = x64_enc_pos;
+    start_off = arr_get(x64_enc_lbl_off, main_label);
+    N         = arr_len(imports);
+    flt_cnt   = arr_len(elf_flt_data);
+
+    // .dynstr offsets: byte 0 NUL, then "libc.so.6\0" at 1, then each import.
+    libc_off    = 1;
+    dynstr_size = 1 + 10;                  // NUL + "libc.so.6\0"
+    name_offs   = buf_word(N + 1);
+    i = 0;
+    while (i < N) {
+        *(name_offs + i * 8) = dynstr_size;
+        dynstr_size = dynstr_size + unpack_l(arr_get(imports, i)) + 1;
+        i++;
+    }
+
+    // ── Layout (file offsets) ──
+    nphdr       = 5;                        // PHDR, INTERP, LOAD(text), LOAD(data), DYNAMIC
+    interp_off  = ELF_HDRSZ + nphdr * ELF_PHSZ;
+    interp_len  = 28;                       // "/lib64/ld-linux-x86-64.so.2\0"
+    dynsym_off  = (interp_off + interp_len + 7) / 8 * 8;
+    dynsym_size = (N + 1) * 24;
+    dynstr_off  = dynsym_off + dynsym_size;
+    hash_off    = (dynstr_off + dynstr_size + 7) / 8 * 8;
+    hash_size   = (2 + 1 + (N + 1)) * 4;    // nbucket+nchain + bucket[1] + chain[N+1]
+    relaplt_off = (hash_off + hash_size + 7) / 8 * 8;
+    relaplt_size = N * 24;
+    plt_off     = (relaplt_off + relaplt_size + 15) / 16 * 16;
+    plt_size    = N * 16;
+    code_off    = (plt_off + plt_size + 15) / 16 * 16;
+    text_filesz = code_off + code_size;
+
+    data_off     = elf_page_align(text_filesz);
+    globals_size = gl_count * 8;
+    floats_size  = flt_cnt * 8;
+    strings_size = elf_sdata_size;
+    gotplt_off   = (data_off + globals_size + floats_size + strings_size + 7) / 8 * 8;
+    gotplt_size  = (3 + N) * 8;
+    dynamic_off  = (gotplt_off + gotplt_size + 7) / 8 * 8;
+    dynamic_size = 13 * 16;                 // 12 DT_* entries + DT_NULL
+    data_filesz  = (dynamic_off + dynamic_size) - data_off;
+
+    gotplt_vaddr  = ELF_BASE + gotplt_off;
+    dynamic_vaddr = ELF_BASE + dynamic_off;
+
+    // Header globals + the data base the reloc resolver reads.
+    elf_phnum      = nphdr;
+    elf_entry      = ELF_BASE + code_off + start_off;
+    elf_data_vaddr = ELF_BASE + data_off;   // globals start here
+
+    // ── Resolve relocations ──
+    // Types 0/1/2 (globals/strings/floats) via the shared resolver. Type 4
+    // (extern call) it leaves alone; patch those to their PLT stub here.
+    elf_resolve_relocations(gl_names, gl_count);
+    i = 0;
+    while (i < arr_len(x64_enc_rel_pos)) {
+        ty = arr_get(x64_enc_rel_ty, i);
+        if (ty == 4) {
+            pos  = arr_get(x64_enc_rel_pos, i);
+            rsym = arr_get(x64_enc_rel_sym, i);
+            idx = 0 - 1; j = 0;
+            while (j < N) {
+                if (elf_packed_eq(arr_get(imports, j), rsym)) { idx = j; }
+                j++;
+            }
+            if (idx >= 0) {
+                plt_vaddr = ELF_BASE + plt_off + idx * 16;
+                rip_addr  = ELF_BASE + code_off + pos + 4;
+                disp      = plt_vaddr - rip_addr;
+                x64_enc_patch32(pos, disp);
+            }
+        }
+        i++;
+    }
+
+    // ── Emit ──
+    elf_pos = 0;
+    elf_write_header();
+
+    // Program headers.
+    elf_write_phdr(6, 4, ELF_HDRSZ, ELF_BASE + ELF_HDRSZ, nphdr * ELF_PHSZ, nphdr * ELF_PHSZ, 8);
+    elf_write_phdr(3, 4, interp_off, ELF_BASE + interp_off, interp_len, interp_len, 1);
+    elf_write_phdr(1, 5, 0, ELF_BASE, text_filesz, text_filesz, ELF_PAGE);
+    elf_write_phdr(1, 6, data_off, ELF_BASE + data_off, data_filesz, data_filesz, ELF_PAGE);
+    elf_write_phdr(2, 6, dynamic_off, dynamic_vaddr, dynamic_size, dynamic_size, 8);
+
+    // .interp
+    elf_pad(interp_off - elf_pos);
+    elf_wcstr("/lib64/ld-linux-x86-64.so.2", 27); elf_w8(0);
+
+    // .dynsym (index 0 is the null symbol).
+    elf_pad(dynsym_off - elf_pos);
+    elf_pad(24);
+    i = 0;
+    while (i < N) {
+        elf_w32(*(name_offs + i * 8));      // st_name
+        elf_w8(0x12);                       // st_info = STB_GLOBAL<<4 | STT_FUNC
+        elf_w8(0);                          // st_other
+        elf_w16(0);                         // st_shndx = SHN_UNDEF
+        elf_w64(0);                         // st_value
+        elf_w64(0);                         // st_size
+        i++;
+    }
+
+    // .dynstr
+    elf_pad(dynstr_off - elf_pos);
+    elf_w8(0);
+    elf_wcstr("libc.so.6", 9); elf_w8(0);
+    i = 0;
+    while (i < N) {
+        sym = arr_get(imports, i);
+        s = unpack_s(sym); l = unpack_l(sym);
+        j = 0; while (j < l) { elf_w8(peek(vbuf + s + j)); j++; }
+        elf_w8(0);
+        i++;
+    }
+
+    // .hash (1 bucket, all symbols collide → linear chain).
+    elf_pad(hash_off - elf_pos);
+    elf_w32(1);                             // nbucket
+    elf_w32(N + 1);                         // nchain
+    elf_w32(N >= 1 ? 1 : 0);                // bucket[0] = first symbol index
+    elf_w32(0);                             // chain[0] (null symbol)
+    i = 1;
+    while (i < N + 1) {
+        if (i < N) { elf_w32(i + 1); } else { elf_w32(0); }
+        i++;
+    }
+
+    // .rela.plt (one JUMP_SLOT per import).
+    elf_pad(relaplt_off - elf_pos);
+    i = 0;
+    while (i < N) {
+        elf_w64(gotplt_vaddr + (3 + i) * 8);        // r_offset → got.plt[3+i]
+        elf_w64(((i + 1) * 0x100000000) | 7);       // r_info = (sym<<32) | R_X86_64_JUMP_SLOT
+        elf_w64(0);                                 // r_addend
+        i++;
+    }
+
+    // .plt (eager: each stub is jmp *[got.plt[3+i]], padded to 16 with NOPs).
+    elf_pad(plt_off - elf_pos);
+    i = 0;
+    while (i < N) {
+        pv = ELF_BASE + plt_off + i * 16;
+        gv = gotplt_vaddr + (3 + i) * 8;
+        d  = gv - (pv + 6);
+        elf_w8(0xFF); elf_w8(0x25); elf_w32(d);
+        j = 6; while (j < 16) { elf_w8(0x90); j++; }
+        i++;
+    }
+
+    // code
+    elf_pad(code_off - elf_pos);
+    i = 0;
+    while (i < code_size) {
+        poke(elf_buf + elf_pos, peek(x64_enc_buf + i));
+        elf_pos++; i++;
+    }
+
+    // ── DATA segment ──
+    elf_pad(data_off - elf_pos);
+    i = 0;
+    while (i < gl_count) {
+        gd_val = glob_slot_init_value(*(gl_names + i * 8));
+        elf_w32(gd_val);
+        elf_w32(gd_val >> 32);
+        i++;
+    }
+    i = 0;
+    while (i < flt_cnt) {
+        flt_bits = arr_get(elf_flt_data, i);
+        elf_w32(flt_bits);
+        elf_w32(flt_bits >> 32);
+        i++;
+    }
+    i = 0;
+    while (i < elf_sdata_size) {
+        poke(elf_buf + elf_pos, peek(elf_sdata + i));
+        elf_pos++; i++;
+    }
+
+    // .got.plt
+    elf_pad(gotplt_off - elf_pos);
+    elf_w64(dynamic_vaddr);                 // [0] = &_DYNAMIC
+    elf_w64(0);                             // [1] = link_map  (ld.so fills)
+    elf_w64(0);                             // [2] = resolver  (ld.so fills)
+    i = 0;
+    while (i < N) {
+        elf_w64(ELF_BASE + plt_off + i * 16);   // [3+i] init (ld.so overwrites, eager)
+        i++;
+    }
+
+    // .dynamic
+    elf_pad(dynamic_off - elf_pos);
+    elf_w64(1);  elf_w64(libc_off);                 // DT_NEEDED  "libc.so.6"
+    elf_w64(4);  elf_w64(ELF_BASE + hash_off);      // DT_HASH
+    elf_w64(5);  elf_w64(ELF_BASE + dynstr_off);    // DT_STRTAB
+    elf_w64(6);  elf_w64(ELF_BASE + dynsym_off);    // DT_SYMTAB
+    elf_w64(10); elf_w64(dynstr_size);              // DT_STRSZ
+    elf_w64(11); elf_w64(24);                       // DT_SYMENT
+    elf_w64(3);  elf_w64(gotplt_vaddr);             // DT_PLTGOT
+    elf_w64(2);  elf_w64(relaplt_size);             // DT_PLTRELSZ
+    elf_w64(20); elf_w64(7);                        // DT_PLTREL = DT_RELA
+    elf_w64(23); elf_w64(ELF_BASE + relaplt_off);   // DT_JMPREL
+    elf_w64(30); elf_w64(8);                        // DT_FLAGS   = DF_BIND_NOW
+    elf_w64(0x6ffffffb); elf_w64(1);                // DT_FLAGS_1 = DF_1_NOW
+    elf_w64(0);  elf_w64(0);                         // DT_NULL
+
+    // ── Write file ──
+    sys_unlink(filename);
+    fd = sys_open(filename, 0x241);          // O_WRONLY|O_CREAT|O_TRUNC
+    written = sys_write(fd, elf_buf, elf_pos);
+    sys_close(fd);
 }
