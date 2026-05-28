@@ -1,47 +1,69 @@
 # ELF Dynamic Linking — the Linux x86_64 portability engine
 
-**Status:** engine **BUILT + Docker-verified 2026-05-28** (commits `af1e449`
-write_elf_dyn + `7f62b0b` detection + the `elf_code_off` fix). One x64 codegen
-parity gap remains for the **default** path — see "Engine status" below. The
-GPU/audio **door** (stub now, couple on x86_64 hardware) is unstarted. Threads
-are **not** part of this plan. General technique: `docs/manual/nomad_manual.md`.
+**Status:** engine **BUILT + Docker-verified + DOOR OPEN 2026-05-28.** Both
+parity gaps closed; the default `--linux64` path routes FFI externs and the
+`DT_NEEDED` soname is resolved from the FFI library tag, so the engine links
+libc today and `libvulkan`/`libasound`/`libGL` the moment a program imports
+them. The GPU/audio calls themselves stay **stubbed** until the binary runs on
+real x86 hardware. Threads are **not** part of this plan (they use `clone(2)`,
+not dynlink). General technique: `docs/manual/nomad_manual.md`.
 
-## Engine status — 2026-05-28
+Commits: `af1e449` write_elf_dyn + `7f62b0b` detection + `340b5da` elf_code_off
+fix + `c59a585` extern parity (gap #1) + `c391738` portable extern smoke +
+`21d278e` soname-from-tag door (gap #2).
 
-**Done + verified (the mechanism is cemented).** `write_elf_dyn` emits a full
-dynamic ELF (PT_PHDR/PT_INTERP/PT_LOAD×2/PT_DYNAMIC, .interp/.dynsym/.dynstr/
-.hash/.rela.plt/.plt/.got.plt/.dynamic, eager `BIND_NOW`+`FLAGS_1=NOW`,
-`DT_NEEDED libc.so.6`), and `write_elf` routes type-4-reloc programs to it. In
-Docker (gcc:13/glibc 2.36): `readelf` shows the complete dynamic section, `ldd`
-resolves `libc.so.6`+`ld-linux`, and **`--monolithic --linux64` smokes run
-correctly — `strlen("hi")`→exit 2, `abs(-5)`→exit 5** (the full chain: ld.so
-binds libc, SysV arg marshaling, RIP-relative string reloc, real libc call).
-Two bugs found + fixed en route: the engine forgot to set the global
+## Engine status — 2026-05-28 (COMPLETE)
+
+**The mechanism is cemented.** `write_elf_dyn` emits a full dynamic ELF
+(PT_PHDR/PT_INTERP/PT_LOAD×2/PT_DYNAMIC, .interp/.dynsym/.dynstr/.hash/
+.rela.plt/.plt/.got.plt/.dynamic, eager `BIND_NOW`+`FLAGS_1=NOW`), and
+`write_elf` routes programs with FFI-extern relocs to it. In Docker
+(gcc:13/glibc 2.36): `readelf` shows the complete dynamic section, `ldd`
+resolves the soname + `ld-linux`, and the **default `--linux64`** smokes run
+correctly — `strlen("hi")`→exit 2, `abs(-5)`→exit 5 (the full chain: ld.so
+binds the lib, SysV arg marshaling, RIP-relative string reloc, real call).
+Two engine bugs found + fixed en route: the engine forgot to set the global
 `elf_code_off` (rip-relative relocs mis-resolved — `strlen` first returned 0),
 and the layout keeps globals/floats/strings first so `elf_resolve_relocations`
 handles reloc types 0/1/2 unchanged.
 
-**Remaining — GAP #1: default (incremental per-module) path doesn't route a
-user-module FFI extern (x64 only).** A user `import "System.B" { … }` extern
-called from the default `--linux64` build is emitted as a regular/cross-module
-*function* call (resolved via bo, fails) instead of `emit_call_extern` (type-4),
-so no dynamic ELF is produced — only `--monolithic` works. **a64 native routes
-it correctly (`strlen`→exit 2), so this is an x64-specific codegen-pipeline
-parity gap, not the engine.** Diagnosis for the next session: the default mode-3
-path emits incrementally via `emit_module_x86_64`, which (unlike the monolithic
-`cg_bridge_data` and unlike a64's per-module emit, `a64_codegen.bsm:1612`
-"Refresh externs from parser state") never refreshes `cg_ex_name` from the
-parser's `externs`; trace `find_func_idx`/`cg_find_fn` for the FFI name in
-`x64_codegen.bsm` T_CALL (~923/1010) to see why it resolves as a function.
-**Caution:** the fix touches the shared per-module emit — a regression there
-hits every `--linux64` build, so verify the full tripod + a static-program
-byte-diff. Once fixed, add `tests/test_dynlink_smoke.bpp` (strlen→2) to the
-Docker suite (it currently can't be a default-suite test because of this gap).
+**GAP #1 — FIXED (`c59a585`): default path routes FFI externs (x64).** x64's
+T_CALL conflated externs and cross-module B++ functions under reloc type 4, and
+`bo_resolve_calls_x64` resolves-and-removes type-4 relocs as function calls — so
+an extern's reloc was deleted before the ELF writer saw it (only `--monolithic`
+worked). Fix mirrors a64: T_CALL is 3-way (local fn → call label; FFI extern via
+`cg_find_ext` → reloc **type 3**; cross-module fn → type 4), and
+`emit_module_x86_64` refreshes `cg_ex_name` from the parser `externs` per module
+(parity with `cg_bridge_data` + a64). `bo` only touches type 4, so type-3
+externs survive to the writer. `write_elf` detection + the PLT patch key on
+type 3. Verified: default `--linux64` `strlen`→2 / `abs`→5, static cross-module
+`helper(4)`→5 still intact, gen1==gen2. Now covered by
+`tests/test_extern_strlen.bpp` (runs on every host: libSystem on macOS, libc on
+Linux).
 
-**Also deferred:** the dynamic ELF skips the PT_NOTE (build-id + minisym), so
-`bug` can't symbolicate dynamic binaries yet (the static path has it) and
-`bug --bytes/--disasm` (which read PT_NOTE for code_base) don't work on them —
-add the note region to `write_elf_dyn` as a follow-up.
+**GAP #2 — FIXED (`21d278e`): the hardware door (per-library soname).** The
+engine hardcoded `DT_NEEDED libc.so.6`. Now `elf_lib_soname` resolves the
+soname from the program's FFI library tag (the import-block name carried as
+`EX_LIB`): `System.B`→`libc.so.6`, `Vulkan.B`→`libvulkan.so.1`,
+`ALSA.B`→`libasound.so.2`, `GL.B`→`libGL.so.1`, `X11.B`→`libX11.so.6`,
+`Math.B`→`libm.so.6` (unknown → libc). The B++ runtime on Linux is
+syscall-based, so a program imports exactly one FFI library and a single
+`DT_NEEDED` suffices. **Verified in Docker:** `import "Vulkan.B" { … }` →
+`readelf -d` shows `NEEDED libvulkan.so.1` + INTERP present; `import "System.B"`
+still links + runs against libc. *This is the door:* no engine change is needed
+to link a GPU/audio library — only the stubbed extern body that ships with the
+hardware (see "Activation on x86 hardware").
+
+**Remaining follow-ups (documented, not blocking):**
+- **Two FFI libraries in one program.** The single-`DT_NEEDED` path assumes one
+  FFI library per program (true for GPU-only/audio-only/libc-only). A program
+  that mixes (e.g. Vulkan + a direct libc call) needs one `DT_NEEDED` per
+  distinct soname — collect distinct sonames in `write_elf_dyn`, widen `.dynstr`
+  + the DT entry count. Avoidable today (use syscalls instead of a 2nd FFI lib).
+- **PT_NOTE on dynamic binaries.** The dynamic ELF skips the PT_NOTE (build-id +
+  minisym), so `bug` can't symbolicate dynamic binaries yet (the static path
+  has it) and `bug --bytes/--disasm` (which read PT_NOTE for code_base) don't
+  work on them — add the note region to `write_elf_dyn`.
 
 ## What this is, and what it is not
 
@@ -219,14 +241,15 @@ the permanent regression for the engine. This is the full Phase-1 win condition.
 
 ## Phase 2 — the GPU/audio door (stub + hardware-gated)
 
-The mechanism is proven; Phase 2 wires the *consumers* and leaves the
-hardware-specific parts stubbed.
+The mechanism is proven and the **soname door is open** (`21d278e`); Phase 2
+wires the *consumers* and leaves the hardware-specific parts stubbed.
 
-- **Lift the single-`DT_NEEDED` assumption.** Phase 1 hardcodes one library
-  (`libc.so.6`). Add a per-extern library association so `libvulkan.so.1` and
-  `libasound.so.2` are named distinctly: either an `EX_LIB` field on the extern
-  record, or a parse-side lib→symbol map. `write_elf_dyn` then emits one
-  `DT_NEEDED` per referenced library.
+- **Soname from the FFI library tag — DONE (`21d278e`).** The single-`DT_NEEDED`
+  is no longer hardcoded `libc.so.6`: `elf_lib_soname` resolves it from the
+  import-block tag via the existing `EX_LIB` field — `Vulkan.B`→`libvulkan.so.1`,
+  `ALSA.B`→`libasound.so.2`, etc. Docker-verified: `import "Vulkan.B"` emits
+  `NEEDED libvulkan.so.1`. (One `DT_NEEDED` per *distinct* soname — for a program
+  that mixes two FFI libraries — remains a follow-up; see Engine status.)
 - **Create the Tier-3 platform files** `_gpu_linux.bsm` / `_audio_linux.bsm`
   (separate files per the manual — GPU/Window/Audio are always per-OS files).
   Wire the abstract API (`bpp_gpu` / `bpp_audio`) to the engine, with each driver
@@ -246,9 +269,10 @@ payload is this checklist — the engine is already proven, so this is small:
 
 1. **Confirm the driver is present:** `ldconfig -p | grep -E 'libvulkan|libasound'`.
 2. **Flip the stub to real** in `_gpu_linux.bsm` / `_audio_linux.bsm`: replace
-   the stub body with the real `import "libvulkan.B" { … }` declaration + call.
-3. **Name the library** via the Phase-2 `EX_LIB` association so its `DT_NEEDED`
-   is emitted.
+   the stub body with the real `import "Vulkan.B" { … }` declaration + call.
+3. **Name the library** — the tag→soname map already exists (`elf_lib_soname`),
+   so `import "Vulkan.B"` emits `DT_NEEDED libvulkan.so.1` with no engine change.
+   For a brand-new library, add one `elf_pk_eq_cstr` line to that map.
 4. **Build:** `./bpp --linux64 <gpu_demo>.bpp -o demo`.
 5. **Verify on hardware:** `readelf -d demo` shows the driver `.so`; `ldd demo`
    resolves it; run it — the window renders / sound plays.

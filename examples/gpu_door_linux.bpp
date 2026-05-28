@@ -1,0 +1,65 @@
+// gpu_door_linux.bpp — the Linux GPU/audio "hardware door" demonstrator.
+//
+// WHAT THIS IS
+//   A template, not a runnable demo. It proves that the B++ ELF dynamic linker
+//   will link a real GPU library on Linux x86_64: compiling this with
+//   `--linux64` produces a dynamic ELF whose DT_NEEDED is `libvulkan.so.1`. The
+//   engine that does this is done and Docker-verified — see
+//   `docs/plans/elf_dynlink_plan.md`. The Vulkan call bodies are STUBBED here;
+//   they "ship when x86 hardware + driver present".
+//
+//   The mapping from the FFI library tag to the soname lives in the engine
+//   (`elf_lib_soname` in src/backend/target/x86_64_linux/x64_elf.bsm):
+//     import "Vulkan.B"  ->  libvulkan.so.1
+//     import "ALSA.B"    ->  libasound.so.2
+//     import "GL.B"      ->  libGL.so.1
+//   To wire a brand-new library, add one line to that map.
+//
+// HOW TO VERIFY THE DOOR (no GPU needed — this is static linkage, not running)
+//   ./bpp --linux64 examples/gpu_door_linux.bpp -o /tmp/gpu_door
+//   docker run --rm --platform linux/amd64 -v /tmp:/tmp gcc:13 \
+//       readelf -d /tmp/gpu_door | grep -i needed
+//   # -> 0x...1 (NEEDED) Shared library: [libvulkan.so.1]
+//
+// HOW TO ACTIVATE ON REAL HARDWARE
+//   On an x86_64 Linux box with the Vulkan loader installed
+//   (`ldconfig -p | grep libvulkan`), this binary loads and the calls below
+//   reach the real driver. Replace the stub guard with a real instance setup,
+//   then build + run on that box. The activation checklist is in
+//   `docs/plans/elf_dynlink_plan.md` ("Activation on x86 hardware").
+//
+// WHY IT WON'T RUN ON A BOX WITHOUT THE DRIVER
+//   The binary is linked with eager binding (BIND_NOW), so the dynamic linker
+//   resolves every imported symbol at load time. On a box without
+//   libvulkan.so.1, ld.so refuses to start the program at all — which is the
+//   correct, honest behavior: a GPU program needs a GPU stack. That is exactly
+//   why the door is "stub now, couple on hardware".
+
+// The FFI declaration. The tag "Vulkan.B" is what the engine maps to
+// libvulkan.so.1 in DT_NEEDED. Only the symbols actually called are linked.
+import "Vulkan.B" {
+    long vkGetInstanceProcAddr(ptr, ptr);
+}
+
+// Returns 1 when a usable Vulkan instance is available, 0 otherwise. STUB: on a
+// box without a driver this stays 0, so nothing below executes. On real
+// hardware, replace the body with vkCreateInstance(...) and return its success.
+gpu_available() {
+    return 0;
+}
+
+main() {
+    auto instance, proc;
+
+    // Guarded so the binary is safe to compile and reason about everywhere,
+    // while the call site below still emits the extern reloc that drives the
+    // dynamic-link path (this is what makes DT_NEEDED libvulkan.so.1 appear).
+    if (gpu_available() != 0) {
+        instance = 0;
+        proc = vkGetInstanceProcAddr(instance, 0);
+        return proc != 0;
+    }
+
+    // No GPU here: fall back cleanly. A real consumer would render on the CPU.
+    return 0;
+}
