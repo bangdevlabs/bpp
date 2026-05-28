@@ -134,16 +134,28 @@ va
          - RESULT: full Linux self-host. bpp_lin compiles + bootstraps
            itself byte-stable in Docker (7a634fe), and a Linux bpp now
            defaults to ELF (item below).
-    3. ⏳ Phase B1 (freelist register alloc) x86_64 emission
-       bug — disabled since 2026-04-15 (`19da538`). Items 1 + 2 are
-       now clean, so B1 can finally be re-evaluated under a working
-       Linux self-host.
-    4. ⏳ Phase B2 (inline `: base` helpers) x86_64 path —
-       disabled same commit, paired with B1; same re-eval unblock.
-  Items 3 + 4 are now UNBLOCKED (1 + 2 clean as of 2026-05-27).
-  S4 (cost-model inliner) inherits the ARM64-only posture for
-  the same reason; see `docs/plans/sidequest_cost_model_inliner.md`
-  for the explicit deferral note.
+    3. ✅ Phase B1 (freelist register alloc) x86_64 — FIXED 2026-05-27
+       (`4050080`). The "regression" was a symptom of the arr_len/arr_get
+       crash (item 2), not B1. Added a 1-register caller-saved freelist
+       (r11) for the T_BINOP left operand; self-hosts byte-stable in Docker
+       (eb52660). a64 uses x9..x15 (7 regs, deeper nesting); x64's ABI leaves
+       only r11 caller-saved here → depth-1 in-register + stack fallback
+       (capability parity, ISA-constrained depth).
+    4. ✅ Phase B2 + S4 + VI inline x86_64 — FIXED 2026-05-27 (`5289e53`,
+       `d1ffddf`). Single-return + multi-statement + void splice all ported;
+       self-hosts byte-stable (d5ee4a2); verified firing (scale2 inlined,
+       prints 14). Same unblock story as B1.
+  Items 3 + 4 CLOSED. x86_64 now has capability parity with ARM64 on every
+  optimization arc: B1 (freelist), B2/S4/VI (inline), B3 (local promotion),
+  B4 (`: double` SIMD — already had SSE codegen), and smart-dispatch
+  outlining (shared transform in dispatch — was never chip-specific).
+  Residuals are ISA/ABI-constrained DEPTH, not capability: x64 B1 freelist
+  is 1 reg vs a64's 7; x64 B3 budget is 3 regs (rbx/r14/r15) vs a64's 6
+  (r12/r13 are callee-saved + ModR/M-fiddly). Possible minor follow-up: the
+  T_MEMST store-value freelist (a64 has it chip-side; on x64 the save is
+  spine-driven, so it'd be a spine change touching both chips). S4 no longer
+  ARM64-only; `docs/plans/sidequest_cost_model_inliner.md` deferral note is
+  now historical.
 - ✅ **`bpp` no-args SIGSEGV (BOTH platforms, robustness)** — FIXED
   2026-05-27 (`8228f92`). With no input file `arg_ptr` stayed 0 and
   `copy_cstr(pathbuf, 0)` read NULL → SIGSEGV; now guards
