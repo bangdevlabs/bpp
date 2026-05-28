@@ -1006,13 +1006,26 @@ x64_emit_call(nd) {
             cg_emit_call_arg_rearrange(cnt, exi, fidx_c);
         }
 
-        // Call the function.
+        // Call the function. Three cases, mirroring a64's split (a64_codegen.bsm
+        // cg_find_fn -> bl, cg_find_ext -> GOT, else -> type-4 BL):
+        //   local fn         -> call its label
+        //   FFI extern       -> CALL rel32, reloc type 3 (extern) — distinct
+        //                       from type 4 so bo_resolve_calls_x64 leaves it
+        //                       for the ELF writer to route through the PLT.
+        //   cross-module fn  -> CALL rel32, reloc type 4 (bo resolves it).
+        // Conflating the last two under type 4 (the old behaviour) made bo
+        // mis-handle externs in the default per-module path — only --monolithic
+        // worked. Requires cg_ex_name populated (cg_bridge_data + the
+        // per-module refresh in emit_module_x86_64).
         fi = cg_find_fn(n.a);
         padded = x64_align_call();
         if (fi >= 0) {
             x64_enc_call_label(arr_get(x64_fn_lbl, fi));
+        } else if (cg_find_ext(n.a) >= 0) {
+            x64_enc_add_reloc(x64_enc_pos + 1, n.a, 3);
+            x64_enc_emit8(0xE8);
+            x64_enc_emit32(0);
         } else {
-            // Cross-module or extern function: CALL rel32 placeholder with type 4 relocation.
             x64_enc_add_reloc(x64_enc_pos + 1, n.a, 4);
             x64_enc_emit8(0xE8);
             x64_enc_emit32(0);
@@ -1220,6 +1233,23 @@ void emit_module_x86_64(mi) {
                 arr_set(cg_fn_fidx, idx, i);
             }
         }
+        i++;
+    }
+
+    // Refresh externs from parser state (may have grown across modules), so
+    // cg_find_ext recognises FFI externs during per-module emit — parity with
+    // a64's per-module emit and with cg_bridge_data's monolithic copy. Without
+    // it, an extern call falls through to the type-4 (cross-module function)
+    // path and bo_resolve_calls_x64 mis-handles it.
+    arr_clear(cg_ex_name); arr_clear(cg_ex_ret);
+    arr_clear(cg_ex_args); arr_clear(cg_ex_acnt);
+    i = 0;
+    while (i < ext_cnt) {
+        rec = *(externs + i * 8);
+        cg_ex_name = arr_push(cg_ex_name, *(rec + EX_NAME));
+        cg_ex_ret  = arr_push(cg_ex_ret,  *(rec + EX_RET));
+        cg_ex_args = arr_push(cg_ex_args, *(rec + EX_ARGS));
+        cg_ex_acnt = arr_push(cg_ex_acnt, *(rec + EX_ACNT));
         i++;
     }
 
