@@ -1,0 +1,71 @@
+// test_clip.bpp — the draw-clip stack confines pixel writes to the
+// active clip rectangle. These stbdraw primitives back stbui's
+// ui_clip and the Bang 9 panel graceful-clamp; this test locks their
+// semantics headlessly (no window) against a small manual framebuffer.
+
+import "stbgame.bsm";
+import "stbdraw.bsm";
+
+// Read one framebuffer pixel as a packed ARGB word.
+static _px(x, y) { return read_u32(_stb_fb, (y * _stb_w + x) * 4); }
+
+main() {
+    auto i;
+
+    init_str();
+    init_draw();
+    // Override whatever init_draw set up with a deterministic 16x16
+    // framebuffer we fully control, then zero it.
+    _stb_w = 16; _stb_h = 16;
+    _stb_fb = malloc(_stb_w * _stb_h * 4);
+    i = 0;
+    while (i < _stb_w * _stb_h) { write_u32(_stb_fb, i * 4, 0); i = i + 1; }
+
+    // ── Default: nothing pushed → unbounded (old behavior preserved). ──
+    put_px(5, 5, 0xFF111111);
+    if (_px(5, 5) != 0xFF111111) { putmsg("FAIL: unclipped write\n"); return 1; }
+
+    // ── Push clip rect [8,12) x [8,12) (half-open). ──
+    draw_clip_push(8, 8, 4, 4);
+    put_px(5, 5, 0xFF222222);              // outside → suppressed
+    if (_px(5, 5) != 0xFF111111) { putmsg("FAIL: write leaked outside clip\n"); return 2; }
+    put_px(9, 9, 0xFF333333);              // inside → written
+    if (_px(9, 9) != 0xFF333333) { putmsg("FAIL: write blocked inside clip\n"); return 3; }
+    put_px(12, 12, 0xFF444444);            // upper bound exclusive → suppressed
+    if (_px(12, 12) != 0) { putmsg("FAIL: half-open upper bound\n"); return 4; }
+
+    // ── Nested push intersects to [10,11) x [10,11). ──
+    draw_clip_push(10, 10, 1, 1);
+    put_px(9, 9, 0xFF555555);              // outside nested → suppressed
+    if (_px(9, 9) != 0xFF333333) { putmsg("FAIL: nested clip leaked\n"); return 5; }
+    put_px(10, 10, 0xFF666666);            // inside nested → written
+    if (_px(10, 10) != 0xFF666666) { putmsg("FAIL: nested inside blocked\n"); return 6; }
+    draw_clip_pop();
+
+    // ── Back to [8,12) x [8,12): (9,9) writable again. ──
+    put_px(9, 9, 0xFF777777);
+    if (_px(9, 9) != 0xFF777777) { putmsg("FAIL: pop did not restore clip\n"); return 7; }
+    draw_clip_pop();
+
+    // ── Unbounded again after the final pop. ──
+    put_px(2, 2, 0xFF888888);
+    if (_px(2, 2) != 0xFF888888) { putmsg("FAIL: clip not fully released\n"); return 8; }
+
+    // ── draw_rect spans honor the clip (clamped, not per-pixel only). ──
+    draw_clip_push(8, 8, 2, 2);            // [8,10) x [8,10)
+    draw_rect(0, 0, 16, 16, 0xFFAAAAAA);
+    if (_px(8, 8) != 0xFFAAAAAA)   { putmsg("FAIL: draw_rect inside clip\n"); return 9; }
+    if (_px(0, 0) != 0)            { putmsg("FAIL: draw_rect leaked outside clip\n"); return 10; }
+    if (_px(10, 10) != 0xFF666666) { putmsg("FAIL: draw_rect crossed clip edge\n"); return 11; }
+    draw_clip_pop();
+
+    // ── Graceful clamp: a collapsed (negative-size) clip draws nothing
+    //    instead of inverting — the Bang 9 too-short-window behavior. ──
+    draw_clip_push(4, 4, 0 - 5, 0 - 5);
+    put_px(4, 4, 0xFFBBBBBB);
+    if (_px(4, 4) != 0) { putmsg("FAIL: collapsed clip still drew\n"); return 12; }
+    draw_clip_pop();
+
+    putmsg("test_clip: all PASS\n");
+    return 0;
+}

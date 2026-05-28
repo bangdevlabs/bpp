@@ -41,12 +41,66 @@ void init_color() {
 void init_draw() {
     init_color();
     init_layer_blends();
+    draw_clip_reset();
+}
+
+// ── Clip rectangle (ImGui-style stack) ───────────────────
+// Current clip in half-open framebuffer coords [_clip_x0,_clip_x1) ×
+// [_clip_y0,_clip_y1). Default is unbounded — the framebuffer bounds in the
+// pixel writers still apply. draw_clip_push intersects the requested rect with
+// the current clip (ImGui semantics) and saves the old one; draw_clip_pop
+// restores it. The three direct framebuffer writers (put_px, blend_px,
+// draw_rect) honour the clip, so every higher primitive — draw_text, draw_line,
+// rounded rects, blits — inherits clipping for free. `clear` stays unclipped:
+// it is the whole-frame reset. See docs/plans/sidequest_stbui_clip.md.
+static auto _clip_x0; static auto _clip_y0; static auto _clip_x1; static auto _clip_y1;
+static auto _clip_stack;   // 16 levels x 4 ints (x0,y0,x1,y1) = 32 bytes/level
+static auto _clip_sp;
+
+// Reset the clip to unbounded and empty the stack. Called from init_draw.
+void draw_clip_reset() {
+    _clip_x0 = 0 - 1000000000; _clip_y0 = 0 - 1000000000;
+    _clip_x1 = 1000000000;     _clip_y1 = 1000000000;
+    _clip_sp = 0;
+    if (_clip_stack == 0) { _clip_stack = malloc(16 * 32); }
+}
+
+// Intersect [x, x+w) x [y, y+h) with the current clip and push the old clip so
+// a matching draw_clip_pop can restore it. An empty/inverted intersection
+// collapses to a zero-area rect, which suppresses all drawing inside it.
+void draw_clip_push(x, y, w, h) {
+    auto nx0, ny0, nx1, ny1, b;
+    if (_clip_stack == 0) { draw_clip_reset(); }
+    if (_clip_sp < 16) {
+        b = _clip_stack + _clip_sp * 32;
+        *(b + 0) = _clip_x0; *(b + 8) = _clip_y0;
+        *(b + 16) = _clip_x1; *(b + 24) = _clip_y1;
+        _clip_sp = _clip_sp + 1;
+    }
+    nx0 = x;     if (nx0 < _clip_x0) { nx0 = _clip_x0; }
+    ny0 = y;     if (ny0 < _clip_y0) { ny0 = _clip_y0; }
+    nx1 = x + w; if (nx1 > _clip_x1) { nx1 = _clip_x1; }
+    ny1 = y + h; if (ny1 > _clip_y1) { ny1 = _clip_y1; }
+    if (nx1 < nx0) { nx1 = nx0; }
+    if (ny1 < ny0) { ny1 = ny0; }
+    _clip_x0 = nx0; _clip_y0 = ny0; _clip_x1 = nx1; _clip_y1 = ny1;
+}
+
+// Restore the clip saved by the matching draw_clip_push.
+void draw_clip_pop() {
+    auto b;
+    if (_clip_sp <= 0) { return; }
+    _clip_sp = _clip_sp - 1;
+    b = _clip_stack + _clip_sp * 32;
+    _clip_x0 = *(b + 0);  _clip_y0 = *(b + 8);
+    _clip_x1 = *(b + 16); _clip_y1 = *(b + 24);
 }
 
 // ── Pixel operations ─────────────────────────────────────
 
 // Write a single pixel to the framebuffer (bounds-checked).
 void put_px(x, y, color) {
+    if (_clip_sp > 0 && (x < _clip_x0 || x >= _clip_x1 || y < _clip_y0 || y >= _clip_y1)) { return; }
     if (x >= 0 && x < _stb_w && y >= 0 && y < _stb_h) {
         write_u32(_stb_fb, (y * _stb_w + x) * 4, color);
     }
@@ -56,6 +110,7 @@ void put_px(x, y, color) {
 // Both colors are packed ARGB (same as rgba()). Alpha 255 = fully opaque.
 void blend_px(x, y, src_color) {
     auto off, dst, sa, da, sr, sg, sb, dr, dg, db, or, og, ob;
+    if (_clip_sp > 0 && (x < _clip_x0 || x >= _clip_x1 || y < _clip_y0 || y >= _clip_y1)) { return; }
     if (x < 0 || x >= _stb_w || y < 0 || y >= _stb_h) { return; }
     sa = (src_color >> 24) & 0xFF;
     if (sa == 255) { put_px(x, y, src_color); return; }
@@ -94,6 +149,13 @@ void draw_rect(x, y, w, h, color) {
     y0 = y < 0 ? 0 : y;
     x1 = x + w > _stb_w ? _stb_w : x + w;
     y1 = y + h > _stb_h ? _stb_h : y + h;
+    // Clamp the span to the current clip rectangle (only when one is active).
+    if (_clip_sp > 0) {
+        if (x0 < _clip_x0) { x0 = _clip_x0; }
+        if (y0 < _clip_y0) { y0 = _clip_y0; }
+        if (x1 > _clip_x1) { x1 = _clip_x1; }
+        if (y1 > _clip_y1) { y1 = _clip_y1; }
+    }
     for (yy = y0; yy < y1; yy++) {
         for (xx = x0; xx < x1; xx++) {
             write_u32(_stb_fb, (yy * _stb_w + xx) * 4, color);
