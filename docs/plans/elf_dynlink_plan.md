@@ -1,11 +1,47 @@
 # ELF Dynamic Linking — the Linux x86_64 portability engine
 
-**Status:** reshaped 2026-05-28 to the *engine / door* form. Not started. This
-plans the dynamic-linking **engine** (build + Docker-verify now, no special
-hardware) plus the GPU/audio **door** (stub now, couple when an x86_64 box with
-a real driver arrives). Threads are **not** part of this plan — see the sibling
-note below. General portability technique lives in `docs/manual/nomad_manual.md`;
-this file is the Linux-x86_64-specific application of it.
+**Status:** engine **BUILT + Docker-verified 2026-05-28** (commits `af1e449`
+write_elf_dyn + `7f62b0b` detection + the `elf_code_off` fix). One x64 codegen
+parity gap remains for the **default** path — see "Engine status" below. The
+GPU/audio **door** (stub now, couple on x86_64 hardware) is unstarted. Threads
+are **not** part of this plan. General technique: `docs/manual/nomad_manual.md`.
+
+## Engine status — 2026-05-28
+
+**Done + verified (the mechanism is cemented).** `write_elf_dyn` emits a full
+dynamic ELF (PT_PHDR/PT_INTERP/PT_LOAD×2/PT_DYNAMIC, .interp/.dynsym/.dynstr/
+.hash/.rela.plt/.plt/.got.plt/.dynamic, eager `BIND_NOW`+`FLAGS_1=NOW`,
+`DT_NEEDED libc.so.6`), and `write_elf` routes type-4-reloc programs to it. In
+Docker (gcc:13/glibc 2.36): `readelf` shows the complete dynamic section, `ldd`
+resolves `libc.so.6`+`ld-linux`, and **`--monolithic --linux64` smokes run
+correctly — `strlen("hi")`→exit 2, `abs(-5)`→exit 5** (the full chain: ld.so
+binds libc, SysV arg marshaling, RIP-relative string reloc, real libc call).
+Two bugs found + fixed en route: the engine forgot to set the global
+`elf_code_off` (rip-relative relocs mis-resolved — `strlen` first returned 0),
+and the layout keeps globals/floats/strings first so `elf_resolve_relocations`
+handles reloc types 0/1/2 unchanged.
+
+**Remaining — GAP #1: default (incremental per-module) path doesn't route a
+user-module FFI extern (x64 only).** A user `import "System.B" { … }` extern
+called from the default `--linux64` build is emitted as a regular/cross-module
+*function* call (resolved via bo, fails) instead of `emit_call_extern` (type-4),
+so no dynamic ELF is produced — only `--monolithic` works. **a64 native routes
+it correctly (`strlen`→exit 2), so this is an x64-specific codegen-pipeline
+parity gap, not the engine.** Diagnosis for the next session: the default mode-3
+path emits incrementally via `emit_module_x86_64`, which (unlike the monolithic
+`cg_bridge_data` and unlike a64's per-module emit, `a64_codegen.bsm:1612`
+"Refresh externs from parser state") never refreshes `cg_ex_name` from the
+parser's `externs`; trace `find_func_idx`/`cg_find_fn` for the FFI name in
+`x64_codegen.bsm` T_CALL (~923/1010) to see why it resolves as a function.
+**Caution:** the fix touches the shared per-module emit — a regression there
+hits every `--linux64` build, so verify the full tripod + a static-program
+byte-diff. Once fixed, add `tests/test_dynlink_smoke.bpp` (strlen→2) to the
+Docker suite (it currently can't be a default-suite test because of this gap).
+
+**Also deferred:** the dynamic ELF skips the PT_NOTE (build-id + minisym), so
+`bug` can't symbolicate dynamic binaries yet (the static path has it) and
+`bug --bytes/--disasm` (which read PT_NOTE for code_base) don't work on them —
+add the note region to `write_elf_dyn` as a follow-up.
 
 ## What this is, and what it is not
 

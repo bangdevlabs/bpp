@@ -12557,3 +12557,45 @@ problems, which is exactly what a good clamp should do.
 Native ARM64 181/0/12 (added `test_clip`), C-emit 145/0/47, gen1==gen2
 byte-stable throughout. Mach-O + Linux-platform changes only; compiler codegen
 untouched.
+
+## 2026-05-28 (later) — bug line-map (v6) + ELF dynlink engine
+
+### bug line-map (Phase 1, `4b7bfa4` + `81837e1`)
+
+`.bug` v6 adds a per-statement LINE TABLE (`cg_emit_stmt` records
+`(cur_text_pos, src_tok)`, gated on `--bug`, mirroring `_bug_inl_record`) +
+MODULE NAMES, so a runtime PC maps to `file:line`. The crash report + backtrace
+now print `in: main() at cr2.bpp:4`, and `--disasm` interleaves `; file:line`
+(static, Docker-usable). `bug_line_for_pc` binary-searches. gen1==gen2 byte-
+stable (recording is dormant without `--bug`). Phase 2 (interactive stepping)
+deferred — the observe loop is breakpoint-continue only (`TUI_STEP` unwired) and
+stepping needs ptrace, which Rosetta blocks in Docker.
+
+### ELF dynlink engine (`af1e449` + `7f62b0b` + the elf_code_off fix)
+
+`write_elf_dyn` emits a real dynamic ELF — PT_INTERP/PT_DYNAMIC,
+.dynsym/.dynstr/.hash/.rela.plt/.plt/.got.plt/.dynamic, eager BIND_NOW,
+`DT_NEEDED libc.so.6`; `write_elf` routes type-4-reloc programs to it.
+**Verified in Docker (gcc:13/glibc 2.36): `--monolithic --linux64` smokes run —
+`strlen("hi")`→2, `abs(-5)`→5** (ld.so binds libc + SysV args + rip-relative
+string reloc). The mechanism is cemented; the reference shape was validated
+against gcc (dog-fooding the cousins). Two bugs en route: a stale global
+`elf_code_off` (rip-relative relocs mis-resolved → `strlen`→0 until set) and the
+data layout kept globals/floats/strings first so `elf_resolve_relocations`
+handles reloc types 0/1/2 unchanged.
+
+**Remaining (documented in the plan): the default incremental path doesn't route
+a user-module FFI extern on x64** — only `--monolithic` does; a64 native routes
+it (`strlen`→2). An x64 codegen-pipeline parity gap (`emit_module_x86_64` never
+refreshes `cg_ex_name`, unlike a64:1612), not the engine. The fix touches the
+shared per-module emit, so it's left for a focused session over a clean context
+rather than rushed at the tail of this one.
+
+### Lessons
+
+- **The engine was correct; the gaps were codegen-side.** `abs`→5 but `strlen`→0
+  isolated the bug to a reloc (the global `elf_code_off`), not the ELF layout —
+  and the "backends are paired" instinct surfaced the modular-extern asymmetry.
+- **Verify the mechanism where you can, stub the rest.** No hardware needed to
+  prove dynlink loads + binds — `libc`/`strlen` in Docker is the testable path;
+  GPU/audio is the stub-for-hardware door.
