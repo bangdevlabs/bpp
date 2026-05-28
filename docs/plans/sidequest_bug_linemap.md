@@ -1,9 +1,25 @@
 # Sidequest — bug: fine-grained source-line map + source-line stepping
 
-**Status:** scoped 2026-05-28. Not started. **Prioritized BEFORE
-`elf_dynlink_plan.md`** — the dynlink engine (and especially its eventual
-debugging on real x86 hardware) should ride on a `bug` that shows source lines
-and steps by line, not just functions and instructions.
+**Status:** Phase 1 **SHIPPED** 2026-05-28 (commit `4b7bfa4`) — the line map
+works end-to-end (`.bug` v6 LINE TABLE + MODULE NAMES; crash report + backtrace
+show `file:line`; byte-stable; suite 181/0/12). **Phase 2 (source-line
+stepping) RESCOPED + not started** — see the note in its section. Still
+prioritized BEFORE `elf_dynlink_plan.md`.
+
+> **Phase-2 reality check (2026-05-28, verify-not-the-header):** the original
+> Phase 2 assumed `bug` already single-steps instructions and we'd compose on
+> top. It does **not** — `bug_run`'s observe loop (`bug_observe_macos.bsm`) is
+> *breakpoint-continue only*: it always `gdb_continue`s, and `_tui_action` is
+> consumed solely for `TUI_QUIT`; `TUI_STEP` is returned by the prompt but never
+> acted on (the `gdb_step` after a stop just clears the breakpoint). So Phase 2
+> is bigger than "compose": **first wire interactive single-step** (restructure
+> the loop's resume to honor the action — step-and-reprompt vs continue), **then**
+> build `n` (step to next line) / step-over / `finish` on it. This touches the
+> **shared** observe engine — the CLI and the Bang 9 Debug panel's async poll
+> path both use `bug_run`/`bug_tui_repl` — so it needs care + interactive
+> testing (line-change detection, callee descent, no infinite step loops, EOF,
+> the non-TUI path). Best done as a focused push, not bolted on at the tail of
+> another arc.
 
 **Goal:** bring `bug` to DWARF-line-table + lldb-stepping *fidelity*, keeping the
 bespoke `.bug` format. Two phases, #2 builds on #1:
