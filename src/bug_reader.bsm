@@ -150,6 +150,16 @@ global bug_il_end;     // arr<int>: end offset (exclusive)
 global bug_il_name;    // arr<packed>: packed name of the inlined callee
 global bug_il_count;   // entry count
 
+// Per-statement line table (v6). Parallel arrays, in increasing-pc order.
+global bug_ln_pc;      // arr<int>: text offset at each statement's start
+global bug_ln_mod;     // arr<int>: source module index
+global bug_ln_line;    // arr<int>: source line within that module
+global bug_ln_count;   // entry count
+
+// Module index -> source filename (v6). Indexed by the mod field above.
+global bug_mod_names;  // arr<packed>: filename per module index
+global bug_mod_count;  // module count
+
 // -- Initialization -------------------------------------------
 
 // Reset all parsed state. Safe to call multiple times: frees the
@@ -265,6 +275,18 @@ void init_reader() {
     bug_il_end   = arr_new();
     bug_il_name  = arr_new();
     bug_il_count = 0;
+
+    // v6 LINE TABLE: parallel (pc, module, line) arrays.
+    if (bug_ln_pc != 0)   { arr_free(bug_ln_pc); }
+    if (bug_ln_mod != 0)  { arr_free(bug_ln_mod); }
+    if (bug_ln_line != 0) { arr_free(bug_ln_line); }
+    bug_ln_pc    = arr_new();
+    bug_ln_mod   = arr_new();
+    bug_ln_line  = arr_new();
+    bug_ln_count = 0;
+    if (bug_mod_names != 0) { arr_free(bug_mod_names); }
+    bug_mod_names = arr_new();
+    bug_mod_count = 0;
 }
 
 // -- File loading ---------------------------------------------
@@ -296,8 +318,9 @@ static bug_parse_header() {
     bug_version = br_read_u8();
     bug_target  = br_read_u8();
     // v5 (2026-05-27) appends the INLINE section after the backend sections;
-    // v4 maps still parse (bug_parse skips the INLINE read for v4).
-    if (bug_version != 4 && bug_version != 5) { return -2; }
+    // v6 (2026-05-28) appends the LINE TABLE after that. Older maps still parse
+    // (bug_parse skips the sections their version predates).
+    if (bug_version != 4 && bug_version != 5 && bug_version != 6) { return -2; }
     // 16-byte build_id, low half then high half, little-endian.
     lo_a = br_read_u32();
     lo_b = br_read_u32();
@@ -618,6 +641,47 @@ static void bug_parse_inline() {
     }
 }
 
+// Parse the LINE TABLE section (v6). Mirrors bpp_bug's bug_write_lines:
+// count(u32), then per row [pc u32, module u16, line u32] in increasing-pc
+// order.
+static void bug_parse_lines() {
+    auto n, i;
+    n = br_read_u32();
+    bug_ln_count = n;
+    for (i = 0; i < n; i++) {
+        bug_ln_pc   = arr_push(bug_ln_pc,   br_read_u32());
+        bug_ln_mod  = arr_push(bug_ln_mod,  br_read_u16());
+        bug_ln_line = arr_push(bug_ln_line, br_read_u32());
+    }
+}
+
+// Parse the MODULE NAMES section (v6): count(u16) then a filename per module.
+static void bug_parse_modnames() {
+    auto n, i;
+    n = br_read_u16();
+    bug_mod_count = n;
+    for (i = 0; i < n; i++) {
+        bug_mod_names = arr_push(bug_mod_names, br_read_str());
+    }
+}
+
+// Map a text PC to its line-table row: the row with the greatest pc <= the
+// query (rows are sorted ascending by construction — recorded in append-only
+// emission order). Returns the row index, or -1 if the table is empty or the
+// PC precedes the first row. Callers read bug_ln_line / bug_ln_mod at the idx.
+bug_line_for_pc(pc) {
+    auto lo, hi, mid, best, mp;
+    if (bug_ln_count == 0) { return 0 - 1; }
+    lo = 0; hi = bug_ln_count - 1; best = 0 - 1;
+    while (lo <= hi) {
+        mid = (lo + hi) / 2;
+        mp = arr_get(bug_ln_pc, mid);
+        if (mp <= pc) { best = mid; lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return best;
+}
+
 // Parse the VIZ HINTS section. Each entry is u16 length + raw
 // bytes; we malloc a NUL-terminated C-string per entry so the
 // debugger can hand the pointer straight to the runtime `v`
@@ -654,6 +718,7 @@ bug_parse() {
     bug_parse_addrmap();
     bug_parse_stackmap();
     if (bug_version >= 5) { bug_parse_inline(); }
+    if (bug_version >= 6) { bug_parse_lines(); bug_parse_modnames(); }
     return 0;
 }
 

@@ -476,6 +476,57 @@ void bug_write_inline() {
     }
 }
 
+// The per-statement line records (text PC + source token) captured by
+// cg_emit_stmt, defined in bpp_codegen.bsm. Empty unless --bug was set.
+extrn bug_line_pc, bug_line_tok;
+
+// -- Part 4 (v6): LINE TABLE ----------------------------------------------
+// count(u32), then per row: pc(u32) + module(u16) + line(u32). Rows are in
+// increasing-pc order (recorded in emission order, which is append-only into
+// the code buffer, hence monotonic), so the debugger binary-searches a runtime
+// PC to the row with the greatest pc <= it and reads the source file:line at
+// that address. The token -> (module, relative line) conversion is the same
+// path the SOURCE MAP uses (tok_lines / tok_mod / diag_file_line_start). Rows
+// whose token carries no source position (synthesized nodes, src_tok 0) are
+// dropped so the table holds only real source lines.
+void bug_write_lines() {
+    auto n, i, tok, cnt, line, modu;
+    n = arr_len(bug_line_pc);
+    cnt = 0;
+    for (i = 0; i < n; i++) {
+        if (arr_get(bug_line_tok, i) > 0) { cnt++; }
+    }
+    bo_write_u32(cnt);
+    for (i = 0; i < n; i++) {
+        tok = arr_get(bug_line_tok, i);
+        if (tok <= 0) { continue; }
+        modu = tok_mod(tok);
+        line = *(tok_lines + tok * 8) - diag_file_line_start(modu);
+        bo_write_u32(arr_get(bug_line_pc, i));
+        bo_write_u16(modu);
+        bo_write_u32(line);
+    }
+}
+
+// Module filenames live in the import layer's fname_buf.
+extrn fname_buf;
+
+// -- Part 5 (v6): MODULE NAMES --------------------------------------------
+// count(u16), then per module index its source filename (u16 len + bytes).
+// The LINE TABLE and SOURCE MAP store module *indices*; this resolves an
+// index to a filename so the debugger prints `foo.bpp:line`, not `mod 0`.
+void bug_write_modnames() {
+    auto nm, mi, fp, fs, fl;
+    nm = diag_file_count();
+    bo_write_u16(nm);
+    for (mi = 0; mi < nm; mi++) {
+        fp = diag_file_name(mi);
+        fs = unpack_s(fp);
+        fl = unpack_l(fp);
+        bo_write_strbuf(fname_buf, fs, fl);
+    }
+}
+
 void bug_save(out_path, target, override_path) {
     auto i, ch, p, src;
 
@@ -513,7 +564,12 @@ void bug_save(out_path, target, override_path) {
     // Reset the serialization buffer and write the file header.
     bo_reset();
 
-    // Header: magic "BG" + version 5 + target architecture + 16-byte build_id.
+    // Header: magic "BG" + version 6 + target architecture + 16-byte build_id.
+    //
+    // Version 6 (2026-05-28) appends a LINE TABLE after the INLINE section:
+    // per-statement (pc, module, line) rows in increasing-pc order, so the
+    // debugger maps a runtime address to its source file:line (not just the
+    // enclosing function). Target-agnostic; populated only when --bug is set.
     //
     // Version 5 (2026-05-27) appends an INLINE section after the backend
     // sections: the [start, end) text ranges (u32 each) + packed callee name of
@@ -545,7 +601,7 @@ void bug_save(out_path, target, override_path) {
     // expanded locals layout.
     bo_write_u8(66);
     bo_write_u8(71);
-    bo_write_u8(5);
+    bo_write_u8(6);
     bo_write_u8(target);
 
     // Build_id: 16 bytes, low half then high half, little-endian.
@@ -568,6 +624,12 @@ void bug_save(out_path, target, override_path) {
 
     // Part 3 (v5): inline-splice ranges. Target-agnostic — empty for x64.
     bug_write_inline();
+
+    // Part 4 (v6): per-statement line table (PC -> source file:line).
+    bug_write_lines();
+
+    // Part 5 (v6): module index -> filename, resolving the line table.
+    bug_write_modnames();
 
     // Write the buffer to disk.
     bo_save_file(_bug_pathbuf);

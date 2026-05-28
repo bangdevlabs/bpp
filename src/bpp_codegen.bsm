@@ -2595,12 +2595,17 @@ cg_body_has_profile_zones(body_arr, body_cnt) {
 global bug_inl_start;   // arr<int>: text offset where each inlined body begins
 global bug_inl_end;     // arr<int>: text offset where it ends (exclusive)
 global bug_inl_callee;  // arr<packed>: packed name of the inlined callee
+global bug_line_pc;     // arr<int>: text offset at the start of each statement
+global bug_line_tok;    // arr<int>: that statement's source token (Node.src_tok)
+extrn flag_bug;         // bpp_bug.bsm: set by --bug; gates line recording (matches .bug emission)
 
 // Reset the range arrays at codegen init. Called from BOTH chip inits.
 void init_bug_inl() {
     bug_inl_start  = arr_new();
     bug_inl_end    = arr_new();
     bug_inl_callee = arr_new();
+    bug_line_pc    = arr_new();
+    bug_line_tok   = arr_new();
 }
 
 // Record one inline-splice range. s/e come from the chip's cur_text_pos: -1 in
@@ -2612,6 +2617,18 @@ _bug_inl_record(s, e, fidx) {
     bug_inl_start  = arr_push(bug_inl_start, s);
     bug_inl_end    = arr_push(bug_inl_end, e);
     bug_inl_callee = arr_push(bug_inl_callee, *(funcs[fidx] + FN_NAME));
+    return 0;
+}
+
+// .bug line table: record (text PC, source token) for one statement. The
+// token -> (module, relative line) conversion is deferred to bug_write_lines
+// in bpp_bug.bsm, where tok_lines / diag_file_line_start already live. Only
+// called when flag_bug is set (see cg_emit_stmt), so a normal compile records
+// nothing and stays byte-stable; pc < 0 is asm-text mode (no real offset).
+_bug_line_record(pc, tok) {
+    if (pc < 0) { return 0; }
+    bug_line_pc  = arr_push(bug_line_pc, pc);
+    bug_line_tok = arr_push(bug_line_tok, tok);
     return 0;
 }
 
@@ -2987,6 +3004,15 @@ void cg_emit_stmt(nd) {
     // Parser-level DCE can collapse a constant-true if-branch into a
     // T_BLOCK wrapping the surviving statements; just walk them.
     if (t == T_BLOCK) { call(p.emit_body, n.b, n.c); return 0; }
+
+    // .bug line table: record this statement's start PC + source token so the
+    // debugger can map a runtime address back to its `.bpp` line. Gated on
+    // flag_bug (matches .bug emission), so a normal compile pays nothing and
+    // stays byte-stable. T_SWITCH is skipped — it reuses src_tok to hold its
+    // arm bodies; the arm statements record their own lines via cg_emit_stmt.
+    if (flag_bug != 0 && t != T_SWITCH) {
+        _bug_line_record(call(p.cur_text_pos), n.src_tok);
+    }
 
     // Control-flow break / continue patch through the current label
     // stacks. Empty stacks just drop the statement (the parser would
