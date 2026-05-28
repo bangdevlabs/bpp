@@ -547,29 +547,73 @@ void write_elf(filename, main_label, gl_names, gl_count) {
     sys_close(fd);
 }
 
-// ── Phase 2 scaffolding: dynamic linking ─────────────────────
+// ── Dynamic linking (ELF) ────────────────────────────────────
 //
-// `write_elf_dyn` is the entry point for the Phase 2 dynlink path. It
-// is currently a placeholder; calling it raises a fatal error. The
-// step-by-step build plan lives in `docs/plans/elf_dynlink_plan.md`.
+// Compare a packed vbuf string against a NUL-terminated C string literal.
+// Used to recognize a program's FFI library tag (the import-block name).
+static elf_pk_eq_cstr(pk, cs) {
+    auto s, l, n, j;
+    if (pk < 0) { return 0; }
+    s = unpack_s(pk); l = unpack_l(pk);
+    n = str_len(cs);
+    if (l != n) { return 0; }
+    j = 0;
+    while (j < l) {
+        if (peek(vbuf + s + j) != str_peek(cs, j)) { return 0; }
+        j++;
+    }
+    return 1;
+}
+
+// Resolve a program's FFI library to the Linux shared-object name (the soname
+// recorded in DT_NEEDED). This is the hardware door: the B++ runtime on Linux
+// is syscall-based, so a program imports exactly one FFI library — the
+// import-block tag carried as EX_LIB — and we map that tag to the matching .so.
 //
-// The signature accepts the same args as `write_elf` plus an `imports`
-// list (packed name + library tag pairs). When implemented, the layout
-// will add: PT_INTERP, PT_DYNAMIC program headers; .interp, .dynsym,
-// .dynstr, .hash, .rela.plt, .plt, .got.plt, .dynamic sections;
-// relocation type 4 (PLT call) handling in `elf_resolve_relocations`.
+//   import "System.B" { ... }   ->  libc.so.6        (proven in Docker today)
+//   import "Vulkan.B" { ... }   ->  libvulkan.so.1   ┐ wire on real x86
+//   import "ALSA.B"   { ... }   ->  libasound.so.2   │ hardware: the engine
+//   import "GL.B"     { ... }   ->  libGL.so.1       │ links these sonames;
+//   import "X11.B"    { ... }   ->  libX11.so.6      │ the extern bodies stay
+//   import "Math.B"   { ... }   ->  libm.so.6        ┘ stubbed until then.
 //
-// Until then, programs that need libc symbols (pthread_*, audio,
-// X11 toolkits) are SKIP'd in `tests/run_all.sh`. See
-// `docs/plans/elf_dynlink_plan.md` Step-by-Step section.
+// The library tag is found by matching the first import's name against the
+// extern records (EX_NAME -> EX_LIB). Unknown tags fall back to libc.so.6.
+// A program that mixes two FFI libraries (e.g. Vulkan + libc) is a documented
+// follow-up: it needs one DT_NEEDED per distinct soname, which this single-
+// soname path does not yet emit.
+static elf_lib_soname(imports) {
+    auto i, lib, rec;
+    lib = 0;
+    if (arr_len(imports) > 0) {
+        i = 0;
+        while (i < arr_len(externs)) {
+            rec = arr_get(externs, i);
+            if (elf_packed_eq(*(rec + EX_NAME), arr_get(imports, 0))) {
+                lib = *(rec + EX_LIB);
+            }
+            i++;
+        }
+    }
+    if (lib == 0)                        { return "libc.so.6"; }
+    if (elf_pk_eq_cstr(lib, "Vulkan.B")) { return "libvulkan.so.1"; }
+    if (elf_pk_eq_cstr(lib, "ALSA.B"))   { return "libasound.so.2"; }
+    if (elf_pk_eq_cstr(lib, "GL.B"))     { return "libGL.so.1"; }
+    if (elf_pk_eq_cstr(lib, "X11.B"))    { return "libX11.so.6"; }
+    if (elf_pk_eq_cstr(lib, "Math.B"))   { return "libm.so.6"; }
+    return "libc.so.6";
+}
+
 // Emit a dynamically-linked ELF: the program calls externs (imports) that the
 // dynamic linker resolves from a shared library at load time. `imports` is the
 // list of distinct packed extern names collected by write_elf's detection.
 //
-// First cut — the mechanism (PT_INTERP + PLT/GOT + eager binding against
-// libc.so.6), verified in Docker by linking a pure libc symbol (strlen). The
-// GPU/audio payload (libvulkan/libasound, per-lib DT_NEEDED) and the note/
-// minisym carry-over are follow-ups. Reference shape validated against gcc.
+// The mechanism (PT_INTERP + PLT/GOT + eager BIND_NOW) is proven in Docker by
+// linking a pure libc symbol (strlen). The DT_NEEDED soname is resolved from
+// the program's FFI library tag via elf_lib_soname, so the same engine links
+// libvulkan/libasound/libGL on real hardware. The note/minisym carry-over (so
+// `bug` can symbolicate dynamic binaries) is a follow-up. Shape validated
+// against gcc.
 //
 // Layout (non-PIE ET_EXEC at ELF_BASE; vaddr == ELF_BASE + file offset):
 //   TEXT segment (R+X): ELF hdr, phdrs, .interp, .dynsym, .dynstr, .hash,
@@ -585,7 +629,7 @@ void write_elf_dyn(filename, main_label, gl_names, gl_count, imports) {
     auto plt_off, plt_size, code_off, text_filesz;
     auto data_off, globals_size, floats_size, strings_size;
     auto gotplt_off, gotplt_size, dynamic_off, dynamic_size, data_filesz;
-    auto libc_off, name_offs, s, l, sym;
+    auto libc_off, name_offs, s, l, sym, soname, soname_len;
     auto pos, ty, rsym, idx, rip_addr, plt_vaddr, disp, pv, gv, d;
     auto gotplt_vaddr, dynamic_vaddr;
     auto flt_bits: u_word;
@@ -596,9 +640,11 @@ void write_elf_dyn(filename, main_label, gl_names, gl_count, imports) {
     N         = arr_len(imports);
     flt_cnt   = arr_len(elf_flt_data);
 
-    // .dynstr offsets: byte 0 NUL, then "libc.so.6\0" at 1, then each import.
+    // .dynstr offsets: byte 0 NUL, then the soname at 1, then each import.
+    soname      = elf_lib_soname(imports);
+    soname_len  = str_len(soname);
     libc_off    = 1;
-    dynstr_size = 1 + 10;                  // NUL + "libc.so.6\0"
+    dynstr_size = 1 + soname_len + 1;      // NUL + soname + NUL
     name_offs   = buf_word(N + 1);
     i = 0;
     while (i < N) {
@@ -703,7 +749,7 @@ void write_elf_dyn(filename, main_label, gl_names, gl_count, imports) {
     // .dynstr
     elf_pad(dynstr_off - elf_pos);
     elf_w8(0);
-    elf_wcstr("libc.so.6", 9); elf_w8(0);
+    elf_wcstr(soname, soname_len); elf_w8(0);
     i = 0;
     while (i < N) {
         sym = arr_get(imports, i);
@@ -790,7 +836,7 @@ void write_elf_dyn(filename, main_label, gl_names, gl_count, imports) {
 
     // .dynamic
     elf_pad(dynamic_off - elf_pos);
-    elf_w64(1);  elf_w64(libc_off);                 // DT_NEEDED  "libc.so.6"
+    elf_w64(1);  elf_w64(libc_off);                 // DT_NEEDED  soname (libc/vulkan/...)
     elf_w64(4);  elf_w64(ELF_BASE + hash_off);      // DT_HASH
     elf_w64(5);  elf_w64(ELF_BASE + dynstr_off);    // DT_STRTAB
     elf_w64(6);  elf_w64(ELF_BASE + dynsym_off);    // DT_SYMTAB
