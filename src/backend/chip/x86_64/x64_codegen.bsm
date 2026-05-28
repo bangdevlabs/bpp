@@ -899,22 +899,30 @@ x64_emit_call(nd) {
         // Regular B++ function call.
         // Query bpp_types for callee's parameter types (mirrors ARM64 logic).
         fidx_c = find_func_idx(n.a);
-        // B2 inline is deliberately skipped on x86_64 — and so is the VI
-        // void / statement-context inline (S4 follow-on). Both are a64-only
-        // optimizations; x64 emits the regular call path. This is not a
-        // half-change: the call path is behaviorally identical to the
-        // inlined path, so portability parity holds (Disciplina #2).
-        //
-        // The deferral is justified by a confirmed bug, not laziness: the
-        // x64-cross-compiled bpp (bpp_lin) SIGSEGVs at startup, deterministic
-        // (6/6 rc=139), even with no args — a scale-dependent codegen/ELF bug
-        // that hits the large bpp binary while small x64 programs cross-compile
-        // and run fine (the Docker/Rosetta tripod leg is 11/11). So B++ cannot
-        // self-host on Linux yet; inline would only pile onto a backend that
-        // can't run itself. ARM64 applies inline fully. Fixing the SIGSEGV is
-        // the "Linux x86_64 health restoration" arc and would also unblock a
-        // Linux-native bootstrap. See docs/plans/sidequest_void_inline.md
-        // (Portability contract) + docs/plans/todo.md for the bisect trail.
+        // Inline splice (x64 parity, Step 0 — single-return B2 fast path).
+        // The self-host blocker that justified skipping inline on x64
+        // (bpp_lin SIGSEGV) was the arr_len / arr_get operand-order bugs,
+        // fixed 2026-05-27; Linux now self-hosts byte-stable. This mirrors
+        // the a64 single-T_RET fast path (a64_codegen.bsm:1452): clone the
+        // return expression with parameter substitution and emit it in place
+        // of the call, leaving the value in acc exactly like a regular call.
+        // Multi-statement (S4) + void (VI) splice come next, via an x64
+        // analogue of _a64_emit_inline_multi.
+        if (fidx_c >= 0 && arr_get(fn_inlineable, fidx_c)) {
+            auto inl_callee, inl_body, inl_bcnt, inl_ret: Node, inl_expr;
+            auto inl_params, inl_pcnt, inl_cloned;
+            inl_callee = funcs[fidx_c];
+            inl_body = *(inl_callee + FN_BODY);
+            inl_bcnt = *(inl_callee + FN_BCNT);
+            if (inl_bcnt == 1) {
+                inl_ret = inl_body[0];
+                inl_expr = inl_ret.a;
+                inl_params = *(inl_callee + FN_PARS);
+                inl_pcnt = *(inl_callee + FN_PCNT);
+                inl_cloned = ast_clone_subst(inl_expr, inl_params, inl_pcnt, n.b);
+                return call(pp.emit_node, inl_cloned);
+            }
+        }
         arr = n.b; cnt = n.c;
         // Evaluate all arguments and push as GPR values (uniform convention).
         i = 0;
