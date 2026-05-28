@@ -159,7 +159,7 @@ this tooling permanently for exactly this reason).
 
 ## Cross-references
 
-- `docs/plans/sidequest_freelist_reuse_corruption.md` — the immediate
+- `docs/plans/legacy/sidequest_freelist_reuse_corruption.md` — the immediate
   consumer; A0 discriminates its two open hypotheses.
 - `docs/manual/debug_with_bug.md` — "No watchpoints" is the gap Piece B fills.
 - `src/bpp_mem.bsm` — `_MEM_REUSE` toggle is the pattern `_MEM_DEBUG` mirrors.

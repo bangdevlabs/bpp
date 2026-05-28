@@ -9,7 +9,7 @@ allocator / file_stat / horde-movement studies.
 
 > **Status of S4 itself:** SHIPPED / CLOSED 2026-05-21 (commits `6b9f719`
 > `6a7dcd5` `2f9a36a` P3b-1/2/3, closeout `3076e60`; journal "S4 inline
-> (shipped 2026-05-21) ~1.1x"). The `docs/plans/sidequest_cost_model_inliner.md`
+> (shipped 2026-05-21) ~1.1x"). The `docs/plans/legacy/sidequest_cost_model_inliner.md`
 > header was stale ("IN PROGRESS / P3b next") and has been corrected. **This
 > brief is a NEW increment, not a re-opening of S4.** Do not touch shipped S4
 > code paths except to extend them as described.
@@ -162,7 +162,7 @@ the 15 samples, but buys nothing general.
 - `src/backend/chip/aarch64/a64_codegen.bsm` — `_a64_emit_inline_multi` (486),
   T_CALL splice site (1397).
 - `src/bpp_parser.bsm` — `fn_void` (53), body build with no synthetic T_RET (1928).
-- `docs/plans/sidequest_cost_model_inliner.md` — the shipped S4 design (header now
+- `docs/plans/legacy/sidequest_cost_model_inliner.md` — the shipped S4 design (header now
   corrected to SHIPPED).
 - `docs/manual/bootstrap_manual.md` — Disciplines, the three-runner tripod
   (§"Running the suite"), the Docker/XQuartz Linux leg.

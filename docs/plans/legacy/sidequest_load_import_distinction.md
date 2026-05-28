@@ -602,7 +602,7 @@ Mirror the S4 / outlining / autovec arcs:
 load/import P2: process_file inline-mode flag
 
 P2 of the load/import distinction sidequest (see
-docs/plans/sidequest_load_import_distinction.md "Design lock"
+docs/plans/legacy/sidequest_load_import_distinction.md "Design lock"
 section). Adds _process_file_inline_into static flag to
 bpp_import.bsm. When `load` keyword is detected at the
 check_file_import site, the flag is set before process_file

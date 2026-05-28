@@ -668,4 +668,4 @@ B++ anchor files (foundation that S4 extends):
 - `docs/manual/tonify_checklist.md` Rule 4 — annotation-collapse rationale (the 2026-05-11 "Multics-drift" lesson)
 - `docs/manual/how_to_dev_b++.md` Cap 48 — flag conventions
 - `docs/manual/tonify_checklist.md` Rule 37 — bench protocol
-- `docs/sidequest_compiler_hotpath_opt.md` — preceding arc, including S3g revert lesson
+- `docs/plans/legacy/sidequest_compiler_hotpath_opt.md` — preceding arc, including S3g revert lesson

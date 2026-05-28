@@ -139,7 +139,7 @@ coalescing," say so plainly; if the market actually argues for coalescing at
 our scale, show the evidence.
 
 ## Cross-references
-- `docs/plans/sidequest_freelist_reuse_corruption.md` — the free-list arc +
+- `docs/plans/legacy/sidequest_freelist_reuse_corruption.md` — the free-list arc +
   the reuse-bug post-mortem (why invariant-heavy designs scare us).
 - `docs/plans/sidequest_debug_allocator.md` — `_MEM_DEBUG` (A0) + open A1/A2/B0.
 - `src/bpp_mem.bsm`, `src/bpp_arena.bsm`, `stb/stbpool.bsm` — current state.

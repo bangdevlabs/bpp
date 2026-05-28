@@ -1215,8 +1215,8 @@ phase end-to-end:
 
 | Phase | Key commits |
 |---|---|
-| Hot-path S1–S3k | `~2026-05-20` to `~2026-05-21` — see `docs/sidequest_compiler_hotpath_opt.md` and the journal entry of that day. |
-| S4 cost-model inliner | See `docs/sidequest_cost_model_inliner.md`. |
+| Hot-path S1–S3k | `~2026-05-20` to `~2026-05-21` — see `docs/plans/legacy/sidequest_compiler_hotpath_opt.md` and the journal entry of that day. |
+| S4 cost-model inliner | See `docs/plans/legacy/sidequest_cost_model_inliner.md`. |
 | Wave 20/21 spine takeover | `0e898ad` (Wave 20 closeout), `c4ca406` (Wave 21 commit 2: spine cg_emit_node owns expression emission). |
 | Outlining | `7da49fc` → `ab8e0aa` (closed 2026-05-22). |
 | VI void inline | `4beaec3` (VI-1 inert), `d6547fe` (VI-2 activation, a64). |
