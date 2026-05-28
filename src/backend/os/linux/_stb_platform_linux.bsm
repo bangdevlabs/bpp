@@ -827,30 +827,47 @@ _x11_convert_fb(w, h) {
     return 0;
 }
 
-// Send a PutImage (opcode 72) request with the BGRX pixel data. Single
-// request per frame — at 320x180 the body is 230400 bytes, well under
-// the 262140 byte max_request_length used by most X servers. Larger
-// windows will need strip splitting (TODO, deferred to Phase 4).
+// Send the framebuffer as one or more PutImage (opcode 72) requests, split
+// into horizontal strips so each request stays under the X server's
+// max_request_length. A single 320x180 frame (230400 bytes) fit in one
+// request, but a 1024x768 IDE window is ~3 MB — far over the ~262140-byte
+// limit AND over the u16 length field, which the X server rejects with
+// BadLength and then mis-parses the trailing bytes as bogus requests
+// (cascading BadRequest). Strip-splitting keeps every request well-formed.
+// (Completes the "strip splitting" TODO once deferred to Phase 4 — Bang 9's
+// 1024x768 window forced it.)
+//
+// _X11_MAX_REQ is the conservative default max_request_length (in bytes) that
+// every X server supports at least; XQuartz and Xorg both use 262140. Each
+// strip body (w * rows * 4) plus the 24-byte header must fit under it.
 _x11_put_image(w, h) {
-    auto pixel_bytes, req_words, n;
-    pixel_bytes = w * h * 4;
-    req_words = (24 + pixel_bytes) / 4;
-    // Build header in _x11_reqbuf.
-    auto i; buf_fill(_x11_reqbuf, 0, 24);
-    poke(_x11_reqbuf + 0, 72);           // opcode: PutImage
-    poke(_x11_reqbuf + 1, 2);            // format: ZPixmap
-    write_u16(_x11_reqbuf, 2, req_words);
-    write_u32(_x11_reqbuf, 4, _x11_wid);
-    write_u32(_x11_reqbuf, 8, _x11_gc);
-    write_u16(_x11_reqbuf, 12, w);       // width
-    write_u16(_x11_reqbuf, 14, h);       // height
-    write_u16(_x11_reqbuf, 16, 0);       // dst-x
-    write_u16(_x11_reqbuf, 18, 0);       // dst-y
-    poke(_x11_reqbuf + 20, 0);           // left-pad (must be 0)
-    poke(_x11_reqbuf + 21, 24);          // depth
-    write_u16(_x11_reqbuf, 22, 0);       // pad
-    n = sys_write(_x11_fd, _x11_reqbuf, 24);
-    n = sys_write(_x11_fd, _x11_pixbuf, pixel_bytes);
+    auto pixel_bytes, req_words, n, max_rows, y, strip_h, strip_bytes, src_off;
+    max_rows = (262140 - 24) / (w * 4);    // rows that fit in one request
+    if (max_rows < 1) { max_rows = 1; }
+    y = 0;
+    while (y < h) {
+        strip_h = h - y;
+        if (strip_h > max_rows) { strip_h = max_rows; }
+        strip_bytes = w * strip_h * 4;
+        req_words = (24 + strip_bytes) / 4;   // header is 24 bytes; body is 4-aligned
+        buf_fill(_x11_reqbuf, 0, 24);
+        poke(_x11_reqbuf + 0, 72);           // opcode: PutImage
+        poke(_x11_reqbuf + 1, 2);            // format: ZPixmap
+        write_u16(_x11_reqbuf, 2, req_words);
+        write_u32(_x11_reqbuf, 4, _x11_wid);
+        write_u32(_x11_reqbuf, 8, _x11_gc);
+        write_u16(_x11_reqbuf, 12, w);       // width
+        write_u16(_x11_reqbuf, 14, strip_h); // height of this strip
+        write_u16(_x11_reqbuf, 16, 0);       // dst-x
+        write_u16(_x11_reqbuf, 18, y);       // dst-y = strip top
+        poke(_x11_reqbuf + 20, 0);           // left-pad (must be 0)
+        poke(_x11_reqbuf + 21, 24);          // depth
+        write_u16(_x11_reqbuf, 22, 0);       // pad
+        src_off = y * w * 4;
+        n = sys_write(_x11_fd, _x11_reqbuf, 24);
+        n = sys_write(_x11_fd, _x11_pixbuf + src_off, strip_bytes);
+        y = y + strip_h;
+    }
     return 0;
 }
 
@@ -1694,3 +1711,16 @@ void _stb_gpu_timing_disable() {
 _stb_gpu_last_us() {
     return 0;
 }
+
+// -- Native dialogs / alerts stubs (Phase 0 — Linux GUI parity floor) ---------
+// macOS uses Cocoa NSOpenPanel / NSSavePanel / NSAlert (_stb_platform_macos).
+// X11 has no native equivalent; Phase 2 adds in-window modal alerts and Phase 3
+// an in-window file browser. Until then: dialogs report cancellation (0, no
+// path) and alerts print to stderr, so Bang 9 cross-compiles and runs without
+// a native picker.
+_stb_dialog_open(title)               { return 0; }   // 0 = cancelled / no path
+_stb_dialog_save(title, default_name) { return 0; }
+_stb_dialog_open_folder(title)        { return 0; }
+void _stb_alert_info(title, message)  { putstr_err(message); putstr_err("\n"); }
+void _stb_alert_error(title, message) { putstr_err(message); putstr_err("\n"); }
+_stb_alert_confirm(title, message)    { return 0; }   // 0 = No / cancel
