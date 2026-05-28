@@ -12599,3 +12599,56 @@ rather than rushed at the tail of this one.
 - **Verify the mechanism where you can, stub the rest.** No hardware needed to
   prove dynlink loads + binds — `libc`/`strlen` in Docker is the testable path;
   GPU/audio is the stub-for-hardware door.
+
+## 2026-05-28 (engine session) — both dynlink gaps closed, the hardware door opened
+
+The same-day continuation that finished the arc: the two parity gaps from the
+engine session above are now fixed, the default `--linux64` path links FFI
+externs, and the engine links a GPU/audio soname the moment a program imports
+one. The mechanism is no longer "proven only under `--monolithic`" — it is the
+default.
+
+### GAP #1 — default path routes FFI externs (`c59a585`)
+
+x64's `T_CALL` conflated externs and cross-module B++ functions under reloc
+**type 4**, and `bo_resolve_calls_x64` resolves-and-removes type-4 relocs as
+function calls — so an extern's reloc was deleted before the ELF writer saw it.
+Only `--monolithic` worked; a64 already kept them distinct. The fix mirrors a64:
+`T_CALL` is now 3-way (local fn → call label; FFI extern via `cg_find_ext` →
+reloc **type 3**; cross-module fn → type 4), and `emit_module_x86_64` refreshes
+`cg_ex_name` from the parser `externs` per module (the asymmetry vs `cg_bridge_data`
++ a64:1612 that the "backends are paired" instinct predicted). `bo` only touches
+type 4, so type-3 externs survive. **Default `--linux64`: `strlen("hi")`→2,
+`abs(-5)`→5, `ldd` resolves libc; static cross-module `helper(4)`→5 intact.**
+Now covered permanently by `tests/test_extern_strlen.bpp` — it runs on *every*
+host (libSystem on macOS, libc on Linux), so the extern chain has suite coverage
+on both backends (182/0/12).
+
+### GAP #2 — the hardware door (`21d278e`)
+
+The engine hardcoded `DT_NEEDED libc.so.6`. Now `elf_lib_soname` resolves the
+soname from the program's FFI library tag (the import-block name carried as
+`EX_LIB`): `System.B`→libc, `Vulkan.B`→libvulkan.so.1, `ALSA.B`→libasound.so.2,
+`GL.B`→libGL.so.1, `X11.B`→libX11.so.6, `Math.B`→libm.so.6. The B++ Linux
+runtime is syscall-based, so a program imports exactly one FFI library and a
+single `DT_NEEDED` carries it. **Docker-verified: `import "Vulkan.B"` →
+`readelf -d` shows `NEEDED libvulkan.so.1` + INTERP present.** That is the door:
+no engine change is needed to link a GPU/audio library — only the stubbed extern
+body that ships with the hardware. `examples/gpu_door_linux.bpp` is the permanent
+template the activation step flips. (Mixing two FFI libraries in one program —
+one `DT_NEEDED` per distinct soname — is the one documented follow-up.)
+
+### Lessons
+
+- **The "paired backends" instinct paid twice.** The same a64↔x64 asymmetry
+  (per-module `cg_ex_name` refresh) explained gap #1; once seen, the fix was a
+  mechanical mirror of a64. When one backend works and the other doesn't, diff
+  the pair before theorizing.
+- **A door is a mapping, not a feature.** Opening GPU/audio didn't need driver
+  code — it needed the soname to stop being a constant. The whole "door" is one
+  helper (`elf_lib_soname`) over a field (`EX_LIB`) that already existed. Build
+  the engine so the hardware-gated part is a table entry, not a rewrite.
+- **Don't fabricate the abstraction ahead of its consumer.** The plan lists
+  `_gpu_linux.bsm`/`bpp_gpu` for Phase 2, but with no consumer game they'd be
+  dead code (the phase-collapse lesson). The honest artifact today is the engine
+  door + a runnable demonstrator example, not an unused platform layer.
