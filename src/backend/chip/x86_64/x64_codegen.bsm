@@ -262,13 +262,18 @@ void init_codegen_x86_64() {
 
 // cg_b3_eligible, cg_b3_walk live in bpp_codegen.bsm.
 
-// SysV callee-saved pool: rbx (3), r14 (14), r15 (15).
+// SysV callee-saved pool: rbx (3), r12 (12), r13 (13), r14 (14), r15 (15).
 void _x64_b3_select() {
     auto budget, used, vi, n, best_vi, best_refs, reg;
     auto pool;
-    pool = buf_word(3);
-    pool[0] = 3; pool[1] = 14; pool[2] = 15;
-    budget = 3;
+    // SysV callee-saved pool: rbx(3), r12(12), r13(13), r14(14), r15(15).
+    // r12/r13 were originally excluded over ModR/M / SIB concerns, but those
+    // only apply when a register is used as a memory BASE; a B3-promoted local
+    // is only ever a value (reg-reg moves + rbp-based prologue spill), never a
+    // base — so they are safe here. 5 regs vs a64's 6 (x19..x24).
+    pool = buf_word(5);
+    pool[0] = 3; pool[1] = 12; pool[2] = 13; pool[3] = 14; pool[4] = 15;
+    budget = 5;
     n = arr_len(cg_vars);
     arr_clear(x64_promoted_regs);
     used = 0;
@@ -1253,10 +1258,29 @@ void _x64_emit_memst_int(nd, fh) {
     // `_a64_emit_memst_int` (commit 2b0bbef).
     // Test: tests/test_memst_float_to_int.bpp
     if (ety == 1) { x64_enc_cvttsd2si(0, 0); }
-    x64_emit_push();
-    call(pp.emit_node, n.a);
-    x64_emit_pop(1);
-    call(pp.emit_memst_store, fh, 1);
+    // B1 freelist parity (mirrors _a64_emit_memst_int): save the store value
+    // in r11 instead of the stack when the address expression has no call, so
+    // it survives address evaluation in a register. A binop inside the address
+    // sees r11 already busy (alloc == -1) and falls back to the stack — the
+    // single shared freelist reg keeps the nesting correct.
+    auto alloc_reg_st, val_reg;
+    alloc_reg_st = 0 - 1;
+    if (cg_has_call(n.a)) {
+        x64_emit_push();
+    } else {
+        alloc_reg_st = x64_gp_alloc();
+        if (alloc_reg_st >= 0) { x64_enc_mov_reg(alloc_reg_st, 0); }   // r11 = value
+        else                   { x64_emit_push(); }
+    }
+    call(pp.emit_node, n.a);            // address -> rax
+    if (alloc_reg_st >= 0) {
+        val_reg = alloc_reg_st;          // value in r11
+        x64_gp_free(alloc_reg_st);
+    } else {
+        x64_emit_pop(1);                 // value -> rcx
+        val_reg = 1;
+    }
+    call(pp.emit_memst_store, fh, val_reg);
 }
 
 // x86_64 does not split scalar float stores by sub-word width today;
