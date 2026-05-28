@@ -54,8 +54,13 @@ else
     ./bpp src/bpp.bpp -o /tmp/bpp_install
 fi
 
-echo "==> Compiling debugger..."
-./bpp tools/the_bug/the_bug.bpp -o /tmp/bug_install
+echo "==> Compiling debuggers (bug = CLI, the_bug = visual)..."
+# `bug` is the headless CLI (lldb/objdump-shaped command line);
+# `the_bug` is the standalone visual debugger. Both are thin frontends
+# over the same shared bug_* engine; the_bug also embeds as the Bang 9
+# Debug panel via the_bug_lib.bsm.
+./bpp src/bug.bpp -o /tmp/bug_install
+./bpp tools/the_bug/the_bug.bpp -o /tmp/the_bug_install
 
 echo "==> Installing to $PREFIX (requires sudo)..."
 
@@ -78,11 +83,17 @@ sudo cp /tmp/bpp_install "$BIN_DIR/bpp"
 sudo chmod 755 "$BIN_DIR/bpp"
 rm -f /tmp/bpp_install
 
-# Install debugger binary.
+# Install debugger binaries. `bug` = the headless CLI (src/bug.bpp);
+# `the_bug` = the standalone visual debugger. Fresh inode each so the
+# macOS code-signature cache validates from scratch.
 sudo rm -f "$BIN_DIR/bug"
 sudo cp /tmp/bug_install "$BIN_DIR/bug"
 sudo chmod 755 "$BIN_DIR/bug"
 rm -f /tmp/bug_install
+sudo rm -f "$BIN_DIR/the_bug"
+sudo cp /tmp/the_bug_install "$BIN_DIR/the_bug"
+sudo chmod 755 "$BIN_DIR/the_bug"
+rm -f /tmp/the_bug_install
 
 # Clear stale .bsm files from every install dir before copying. Without
 # this, files that move between directories across releases (e.g. the
