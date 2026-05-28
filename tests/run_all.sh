@@ -71,8 +71,28 @@ should_skip() {
             ;;
         test_thread|test_job|test_maestro)
             # pthread FFI is macOS-only in Phase 1 of the maestro plan.
-            # Linux inherits these tests when ELF dynamic linking lands.
+            # NOTE: ELF dynamic linking has landed (the dynlink arc), but
+            # threads still wait — they need clone(2) + TLS/%fs, not dynlink
+            # (libvulkan/libasound are the dynlink consumers; threads are not).
             [ "$OS" != "Darwin" ] && echo "skip:phase1-macos-only" && return
+            ;;
+        test_audio_*|test_mixer_*|test_stbmidi*)
+            # Audio + MIDI run through the CoreAudio backend (_stb_audio.bsm),
+            # which is macOS-only; stbmidi is coupled to that playback stack.
+            # Linux audio is the ALSA door — the ELF dynlink engine can link
+            # libasound.so.2 (see elf_dynlink_plan.md), but the backend module
+            # is not wired yet, so these cannot link on Linux. Tracked in
+            # docs/plans/linux_suite_gaps.md.
+            [ "$OS" != "Darwin" ] && echo "skip:audio-macos-only" && return
+            ;;
+        test_ecs_scheduler|test_reduce_runtime|test_profile_cooperative|test_profile_signal|test_outline_smoke)
+            # Parallel dispatch (the worker pool) and signal profiling
+            # (SIGPROF). Both need the thread/signal infra that is macOS-only
+            # in Phase 1 — Linux threads use clone(2), not yet wired. Same
+            # class as test_thread/job/maestro. On Linux the worker-pool tests
+            # hang (no workers) and outline_smoke crashes rather than degrading
+            # to serial — both detailed in docs/plans/linux_suite_gaps.md.
+            [ "$OS" != "Darwin" ] && echo "skip:concurrency-infra-macos-only" && return
             ;;
         test_gpu_*|test_stbgame_native|test_gameinfra)
             # GPU + window smoke tests. They open a real window, run a
