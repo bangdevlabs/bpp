@@ -40,7 +40,7 @@ global _stb_last_time; // Written by stbgame.bsm each frame tick.
 // GROW row (e.g. Bang 9's panel area) collapsed to height 0 — the
 // "panel content overlaps the tab strip" bug. The slot is the shared
 // extrn that stbwindow / stbgame also reference.
-extrn _stb_win_w, _stb_win_h;
+extrn _stb_win_w, _stb_win_h, _stb_win_resize_flag;
 
 // Original terminal settings (saved for restore on exit).
 static auto _plt_orig_termios;
@@ -84,6 +84,7 @@ static auto _x11_wm_protocols;
 static auto _x11_wm_delete;
 // Reusable buffers for rendering and input.
 static auto _x11_pixbuf;       // RGBA→BGRX conversion buffer for XPutImage
+static auto _x11_pixbuf_cap;   // allocated capacity of _x11_pixbuf in bytes; grown on window resize
 static auto _x11_reqbuf;       // Reusable 24-byte PutImage header
 static auto _x11_evbuf;        // Reusable 32-byte X11 event buffer
 static auto _x11_needs_redraw; // Set by Expose events
@@ -1165,6 +1166,24 @@ _x11_handle_event(buf) {
         _x11_needs_redraw = 1;
         return 0;
     }
+    if (type == 22) {                 // ConfigureNotify — window moved/resized.
+        // Width/height are CARD16 at offsets 20/22. Fire the resize flag
+        // only on an actual size change, so a bare window move doesn't
+        // reflow the layout. The app loop reads window_resized() and
+        // calls window_fb_resize(); the next ui_layout_begin then uses
+        // the new dims, so the graceful clamp applies to the resized
+        // panel (this is what makes the clamp exercisable on Linux).
+        auto new_w, new_h;
+        new_w = read_u16(buf, 20);
+        new_h = read_u16(buf, 22);
+        if (new_w > 0 && new_h > 0
+            && (new_w != _stb_win_w || new_h != _stb_win_h)) {
+            _stb_win_w = new_w;
+            _stb_win_h = new_h;
+            _stb_win_resize_flag = 1;
+        }
+        return 0;
+    }
     if (type == 33) {                 // ClientMessage
         // Bytes 12-15 = data.l[0] = WM_DELETE_WINDOW atom id
         auto atom;
@@ -1224,6 +1243,7 @@ _stb_init_window(w: word, h: word, title) {
                 _x11_setup_wm_delete();
                 // Allocate per-frame buffers.
                 _x11_pixbuf = malloc(w * h * 4);
+                _x11_pixbuf_cap = w * h * 4;
                 _x11_reqbuf = malloc(24);
                 _x11_evbuf  = malloc(32);
                 _x11_mode = 1;
@@ -1339,6 +1359,17 @@ _stb_present() {
     auto prev_top, prev_bot;
 
     if (_x11_mode == 1) {
+        // Grow the conversion buffer if the window was resized larger.
+        // window_fb_resize() (called by the app loop on window_resized)
+        // reallocs _stb_fb but not this platform-private pixbuf; without
+        // this guard a grown window overflows it in _x11_convert_fb.
+        auto need;
+        need = _stb_w * _stb_h * 4;
+        if (need > _x11_pixbuf_cap) {
+            if (_x11_pixbuf != 0) { free(_x11_pixbuf); }
+            _x11_pixbuf = malloc(need);
+            _x11_pixbuf_cap = need;
+        }
         _x11_convert_fb(_stb_w, _stb_h);
         _x11_put_image(_stb_w, _stb_h);
         return 0;
