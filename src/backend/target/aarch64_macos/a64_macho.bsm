@@ -822,7 +822,7 @@ void mo_write_nlist(n_strx, n_type, n_sect, n_desc, n_value_lo, n_value_hi) {
 //   data_count: number of 8-byte global slots
 //   has_data:   1 if __DATA segment is needed, 0 otherwise
 void mo_compute_layout(code_size, data_count) {
-    auto has_data, nseg, cf_data_size, pre_minisym_end;
+    auto has_data, nseg, cf_data_size, pre_minisym_end, got_bytes;
 
     // Compute the runtime minisym blob size up front. The blob
     // carries the (function address → name) table that
@@ -902,6 +902,31 @@ void mo_compute_layout(code_size, data_count) {
         // GOT entries must be 8-byte aligned (LDR requires it).
         mo_got_data_off = data_count * 8 + arr_len(mo_flt_data) * 8 + mo_sdata_size;
         mo_got_data_off = (mo_got_data_off + 7) / 8 * 8;
+        // Keep the whole GOT inside a single chained-fixup page.
+        // dyld's chained fixups are per-page: the metadata below wires
+        // up one page_start, for the page where the GOT begins, and a
+        // fixup chain cannot cross a 16 KB page boundary. If the GOT
+        // spilled onto the next page, those slots would never be
+        // rebased — the failure that surfaced as a call landing on
+        // pc=0x1 (e.g. `_time_now_ns`) once __DATA grew enough to push
+        // the GOT across a boundary. When the 8-byte-aligned GOT would
+        // straddle, start it on the next page so it sits whole within
+        // one page. Costs at most one page of zero padding, and only
+        // for the binaries that would otherwise straddle.
+        got_bytes = arr_len(mo_got_syms) * 8;
+        if (got_bytes > MO_PAGE_SIZE) {
+            // A GOT larger than one 16 KB page would need per-page
+            // chains, which the single-page metadata does not emit.
+            // B++ programs never approach 2048 externs; fail loud here
+            // rather than miscompile silently if that ever changes.
+            diag_str("error: GOT exceeds one 16 KB chained-fixup page (per-page chains not implemented)\n");
+            sys_exit(2);
+        }
+        if (got_bytes > 0) {
+            if (mo_got_data_off / MO_PAGE_SIZE != (mo_got_data_off + got_bytes - 1) / MO_PAGE_SIZE) {
+                mo_got_data_off = (mo_got_data_off / MO_PAGE_SIZE + 1) * MO_PAGE_SIZE;
+            }
+        }
         // __data section ends after the last GOT entry. mo_minisym_off
         // is 8-byte aligned to keep the minisym header aligned even
         // when no GOT bytes exist.
@@ -1320,8 +1345,15 @@ void write_macho(filename, main_label, gl_names, gl_count) {
             mo_pos++;
             i++;
         }
-        // Align to 8 bytes before GOT entries.
-        while ((mo_pos - mo_data_off) % 8 != 0) { poke(mo_buf + mo_pos, 0); mo_pos++; }
+        // Pad to the exact GOT offset computed in mo_compute_layout.
+        // That value is 8-byte aligned and may additionally have been
+        // pushed forward to a 16 KB page boundary so the GOT never
+        // straddles a chained-fixup page. The writer must honor that
+        // single source of truth — not re-derive its own 8-byte
+        // alignment here — otherwise the GOT bytes land at one offset
+        // while the page_start metadata points at another, and dyld
+        // rebases the wrong slot (the rebased-but-wrong-address crash).
+        mo_pad((mo_data_off + mo_got_data_off) - mo_pos);
         // Write GOT entries as dyld_chained_ptr_64_bind values.
         // Each 8-byte slot: ordinal(24)|addend(8)|reserved(19)|next(12)|bind(1).
         // Low 32 bits = ordinal (= import index).
