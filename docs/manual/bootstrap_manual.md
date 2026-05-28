@@ -1054,6 +1054,174 @@ When Linux-ARM64 or Intel-macOS arrives, a new `os/<os>/` or
 `target/<chip>_<os>/` folder drops in without disturbing existing
 backends. See `docs/plans/todo.md` for the timeline.
 
+## The Compiler — Optimization Phases and the Spine
+
+The B++ compiler does real optimization work. This section is a single
+reference for **what each phase is, where it lives, which backends it
+applies to, and how to add another**. It is the map for anyone reading
+the codegen for the first time, and the checklist for keeping both
+backends paired.
+
+### The spine — how shape-shared codegen lives in one place
+
+After the Wave 20/21 refactor (May 24–25, 2026), AST-shape decisions
+live in one file. The chips contribute only ISA-atomic primitives.
+
+- **Spine** — `src/bpp_codegen.bsm`. Owns `cg_emit_stmt` (the 11-case
+  statement dispatcher: T_DECL / T_NOP / T_BLOCK / T_BREAK / T_CONTINUE
+  / T_IF / T_WHILE / T_RET / T_ASSIGN / T_MEMST / T_SWITCH +
+  expression-statement) and `cg_emit_node` (the 8-case expression
+  dispatcher: T_LIT / T_VAR / T_TERNARY / T_UNARY / T_CALL / T_MEMLD /
+  T_ADDR / T_BINOP). Also owns the builtin dispatch
+  (`cg_builtin_dispatch`) and the inline splicer (`cg_emit_inline_multi`).
+- **Chip codegen** — `src/backend/chip/<arch>/<arch>_codegen.bsm`.
+  Registers chip primitives at init (`init_codegen_arm64` /
+  `init_codegen_x86_64`), provides the T_CALL handler (because the
+  call ABI + inline gating are chip-aware), the function prologue /
+  epilogue, and a few other ISA-specific paths.
+- **Chip primitives** — `src/backend/chip/<arch>/<arch>_primitives.bsm`.
+  ISA-atomic ops: `emit_add` / `emit_sub` / `emit_push_acc` /
+  `emit_pop_scratch` / `emit_mem_read` / `cur_text_pos` / ...
+  Registered into a function-pointer table (`cg_prim`,
+  `ChipPrimitives` struct in `bpp_codegen.bsm`) so spine code calls
+  them via `call(pp.emit_sub, ...)`.
+
+**Adding code follows three patterns:**
+
+| Shape-shared across chips? | Where it goes |
+|---|---|
+| Yes — pure AST/AST-rewrite logic | `bpp_codegen.bsm` (spine), call chip primitives for ISA ops |
+| One ISA op both chips need | New `ChipPrimitives` field, register from both chip inits, implement per chip |
+| Truly chip-only (e.g. ABI-fragile, asm-text rendering) | Chip file with a comment explaining why it can't be spine-shared |
+
+Bootstrap byte-stability is the verification floor. A truly
+shape-shared change produces gen1==gen2==gen3 with **no 1-cycle
+oscillation** — the worked example is the inline-multi splicer
+unification (`290d77d`, May 27, 2026), which moved 150 lines from each
+chip into one spine helper and produced a byte-identical compiler.
+
+### Phases at a glance
+
+| Phase | What | Where | Backends |
+|---|---|---|---|
+| **A1** | Bitfields (`: bit`–`: bit7` slice annotations) | parser layout pass + chip emit | a64 (UBFX/BFI), x64 (SHR+AND+OR+store), C (bitwise) |
+| **B0** | Const-fold + strength reduction (`* 2^k` → `<< k`, etc.) | spine (`bpp_codegen.bsm` const path) | both + C inherits via gcc -O2 |
+| **B1** | Register freelist for T_BINOP left + T_MEMST value | chip primitives | a64: 7 regs (x9..x15) / x64: 1 reg (r11) |
+| **B2** | Trivial inline (single T_RET, ≤5 nodes, ≤3 params) | chip T_CALL fast path | both |
+| **B3** | Local register promotion (Sethi-Ullman walker + chip pool) | spine selector + chip pool | a64: 6 regs (x19..x24) / x64: 5 regs (rbx, r12, r13, r14, r15) |
+| **B4** | `: double` 128-bit SIMD + 11 vec_* builtins | spine builtin dispatch + chip emit | a64 (NEON 4×f32), x64 (SSE2 packed f32), C (intrinsics) |
+| **Hot-path S1–S3k** | unpack_l strength-reduce, hash-table lookups, CSE, builtin lifts, 8-byte packed_eq, `emit_ror32` | spine builtin dispatch + chip primitives | both (one new chip primitive: `emit_ror32`) |
+| **S4** | Cost-model multi-statement inliner | spine `cg_emit_inline_multi` + dispatch's `_inline_pre_reg_walk` | both |
+| **VI** | Void / statement-context inline | same splicer, void shape detected at last-statement check | both (rarely fires — value-returning helpers dominate) |
+| **Smart-dispatch outlining** | Auto-parallelize `@safe` loops referencing caller frame | shared transform in `bpp_dispatch.bsm` (`synthesize_loop_fn` + `rewrite_dispatch_loops`), runs before per-chip emit | both (parallel on macOS, serial-correct on Linux until ELF threads ship) |
+| **Autovec** (proposed) | Loop pattern recognizer → vec_* | spine | not yet shipped on either backend |
+
+### The arcs in detail
+
+#### Hot-path S1 → S3k
+
+Shipped 2026-05-21; **~41% cumulative bootstrap improvement** (0.51s →
+0.30s). The dominant pattern was *finding hot wrappers around trivial
+bodies* and lifting them into `cg_builtin_dispatch`: `arr_get` (S3e),
+`arr_len` (S3f), `unpack_l` (S3b), `unpack_s` (S3c), `u32` (S3h). Plus
+hash-based symbol lookups replacing linear scans (`_dsp_find_func_idx`
+S2, `cg_find_fn` S3k), unpack_l SDIV → LSR strength reduction (S1),
+`packed_eq` CSE + 8-byte chunked compare (S3a + S3i), and the first
+cross-chip primitive `emit_ror32` (S3j).
+
+**Lesson**: a hot small function usually wants to become a spine
+builtin emitted as a few primitive calls — not stay as a call frame.
+The lift removes the prologue + arg setup + call + return + epilogue
+overhead from every site, and the primitive table makes adding a new
+ISA op cheap.
+
+#### B1 — Register freelist
+
+T_BINOP-left save and T_MEMST store-value-save would normally go
+through a stack push/pop. When the sibling sub-expression has **no
+call** (which would clobber caller-saved registers), the freelist
+parks the value in a register instead — a real cycle saving on every
+binop and store.
+
+- a64 (`_a64_emit_binop_save_left`, `_a64_emit_memst_int`,
+  `a64_gp_alloc` over x9..x15): 7 caller-saved registers, handles deep
+  binop nesting in-register.
+- x64 (`_x64_emit_binop_save_left`, `_x64_emit_memst_int`,
+  `x64_gp_alloc` over r11 only): System V leaves x86_64 fewer
+  caller-saved registers that aren't either accumulator/scratch
+  (rax/rcx), arg regs (rdi/rsi/rdx/r8/r9), B3-promoted (rbx/r14/r15),
+  or used as a global-`lea` base (r10). The single shared r11 freelist
+  with a busy-check gives a clean stack fallback for nested binops.
+
+#### Inline (B2 + S4 + VI) — spine-unified
+
+Three flavours route through one infrastructure (unified in `290d77d`):
+
+1. **B2 trivial** — chip T_CALL fast path when `fn_inlineable[fidx]`
+   AND `body_cnt == 1`. Substitutes parameters via `ast_clone_subst`
+   and emits the return expression in place.
+2. **S4 multi-statement** — `bpp_dispatch.bsm`'s
+   `_inline_pre_reg_walk_body` runs from each chip's `pre_reg_vars`,
+   stamps a callsite_id on inlineable T_CALL nodes, and pre-registers
+   `_inl<N>_<param>` mangled slots into the caller's frame via
+   `cg_var_add`. The chip T_CALL routes to spine `cg_emit_inline_multi`
+   (in `bpp_codegen.bsm`), which binds non-trivial args, alpha-renames
+   params + locals, and emits the body via `cg_emit_stmt`.
+3. **VI void** — same splicer detects the void shape (last statement
+   not a T_RET) and emits all statements with no value.
+
+The `cur_text_pos` chip primitive lets the spine helper record `.bug`
+inline ranges chip-agnostically (a64: `enc_pos` or `-1` in asm mode;
+x64: `x64_enc_pos`).
+
+#### Smart-dispatch outlining
+
+A loop body annotated with `@safe` (or eligible by analysis) that
+references caller-frame variables gets transformed in
+`bpp_dispatch.bsm` (`synthesize_loop_fn` + `rewrite_dispatch_loops`)
+into a synth worker function (`__synth_N`) plus a runtime dispatch via
+`_job_parallel_for_data` (`src/bpp_job.bsm`). The free variables are
+captured into a struct read back through `_outline_cap_ptr` inside
+the worker.
+
+The transform runs unconditionally before per-chip emit and emits via
+normal codegen, so both chips inherit it for free. On macOS the
+workers run in parallel; on Linux the runtime falls back to
+serial-correct execution until ELF threads land.
+
+### Cross-chip parity — what's shared vs ABI-bound depth
+
+After May 27, 2026, **every optimization listed above runs on both
+backends**. The differences between a64 and x64 are pure ISA/ABI
+arithmetic, not missing capabilities:
+
+| Item | a64 | x64 | Why |
+|---|---|---|---|
+| B1 freelist depth | 7 regs | 1 reg | System V leaves x86_64 fewer free caller-saved regs (see B1 above) |
+| B3 budget | 6 regs (x19..x24) | 5 regs (rbx, r12, r13, r14, r15) | System V has 3 fewer callee-saved GP regs than AAPCS64 |
+| `mem_read_indexed(8)` (`*(arr + i*8)`) | 1 instr `ldr x0, [x0, x1]` | 2 instr (add + load) | x86_64 has no two-register indexed load matching the spine's primitive shape |
+| Bitfield insert | 1 instr `BFI` | 4 instr (load + mask + or + store) | scalar x86_64 has no BFI (AVX has one for SIMD) |
+
+When something feels "missing on x64", the test is: **is it a
+capability the optimization needs that x86_64 can't express, or is it
+register-budget arithmetic?** Capability gaps go in the parity
+checklist; depth differences stay documented and live with it.
+
+### Recovering the history
+
+The bootstrap byte-stability discipline is what made this safe to
+build. Every phase shipped in small, verified commits. To trace any
+phase end-to-end:
+
+| Phase | Key commits |
+|---|---|
+| Hot-path S1–S3k | `~2026-05-20` to `~2026-05-21` — see `docs/sidequest_compiler_hotpath_opt.md` and the journal entry of that day. |
+| S4 cost-model inliner | See `docs/sidequest_cost_model_inliner.md`. |
+| Wave 20/21 spine takeover | `0e898ad` (Wave 20 closeout), `c4ca406` (Wave 21 commit 2: spine cg_emit_node owns expression emission). |
+| Outlining | `7da49fc` → `ab8e0aa` (closed 2026-05-22). |
+| VI void inline | `4beaec3` (VI-1 inert), `d6547fe` (VI-2 activation, a64). |
+| x86_64 parity push | `5289e53` (B2 single-return), `d1ffddf` (S4 + VI multi), `4050080` (B1 T_BINOP), `ee2e054` (T_MEMST + B3), `290d77d` (spine-unification). See journal `2026-05-27 (parity push)`. |
+
 ## Portability Tiers — Where Stdlib Features Live
 
 Above the chip / os / target backend layers, the stdlib has its own
