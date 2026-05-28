@@ -67,19 +67,16 @@ global a64_bin_mode; // Set from bpp.bpp (command-line mode selection).
 // can resolve a PC back to the inlined function. enc_pos is the absolute text
 // offset (same coordinate as the address map), so the ranges are directly
 // comparable to function offsets. Populated only in binary mode.
-global bug_inl_start;   // arr<int>: text offset where each inlined body begins
-global bug_inl_end;     // arr<int>: text offset where it ends (exclusive)
-global bug_inl_callee;  // arr<packed>: packed name of the inlined callee
+// The bug_inl_* range arrays + _bug_inl_record + the inline-multi splicer now
+// live in the spine (bpp_codegen.bsm) so both chips share one implementation;
+// this chip only provides cur_text_pos below.
 
-// Record one inline-splice range. No-op outside binary mode (enc_pos is only a
-// real text offset there) and for empty ranges.
-_bug_inl_record(s, e, fidx) {
-    if (a64_bin_mode == 0) { return 0; }
-    if (e <= s) { return 0; }
-    bug_inl_start  = arr_push(bug_inl_start, s);
-    bug_inl_end    = arr_push(bug_inl_end, e);
-    bug_inl_callee = arr_push(bug_inl_callee, *(funcs[fidx] + FN_NAME));
-    return 0;
+// Current byte offset in the code buffer, or -1 in asm-text mode where enc_pos
+// is not a real text offset. The spine inline splicer uses this to record .bug
+// inline ranges chip-agnostically, replacing the old a64_bin_mode dependency.
+_a64_cur_text_pos() {
+    if (a64_bin_mode == 0) { return 0 - 1; }
+    return enc_pos;
 }
 
 // Binary mode: function entry labels (dynamic array mapping fn index → label ID).
@@ -150,6 +147,7 @@ void cg_install_arm64_primitives() {
     p.emit_cmp_flt          = fn_ptr(_a64_emit_cmp_flt);
     p.emit_new_label        = fn_ptr(_a64_emit_new_label);
     p.emit_label            = fn_ptr(_a64_emit_label);
+    p.cur_text_pos          = fn_ptr(_a64_cur_text_pos);
     p.emit_jump             = fn_ptr(_a64_emit_jump);
     p.emit_branch_if_zero   = fn_ptr(_a64_emit_branch_if_zero);
     p.emit_fcond_to_int_truth = fn_ptr(_a64_emit_fcond_to_int_truth);
@@ -260,7 +258,7 @@ void cg_install_arm64_primitives() {
 void init_codegen_arm64() {
     cg_install_arm64_primitives();
 
-    bug_inl_start = arr_new(); bug_inl_end = arr_new(); bug_inl_callee = arr_new();
+    init_bug_inl();   // reset shared .bug inline-range arrays (spine)
     cg_fn_name = arr_new(); cg_fn_par = arr_new();
     cg_fn_pcnt = arr_new(); cg_fn_body = arr_new();
     cg_fn_bcnt = arr_new(); cg_fn_fidx = arr_new();
@@ -470,197 +468,6 @@ void _a64_b3_select() {
     }
 }
 
-// Find a variable by name. Returns stack offset from x29, or -1 if not found.
-// cg_var_find lives in bpp_codegen.bsm.
-
-// S4 P3b-2 — Multi-statement inline splice. The callsite_id has
-// been stamped on `call_node.e` by `_inline_pre_reg_walk` during
-// `a64_pre_reg_vars` (depth-1 outer pass), and the caller's
-// `cg_vars` already has slots registered for every callee param
-// and local under the name `_inl<id>_<orig>`.
-//
-// Splice procedure:
-//
-//   1. Binding prologue: for each callee parameter, emit a synth
-//      T_ASSIGN(T_VAR(_inl<id>_<param>), <arg_expr>). Going
-//      through emit_node means the existing T_ASSIGN path handles
-//      type coercion, b3 promoted-reg short-circuit, and stack
-//      slot writes uniformly — no chip-level wire-up needed.
-//      Arg expressions are evaluated exactly once each, so
-//      param-refs > 1 in callee body don't double-evaluate.
-//   2. Body prelude: for every statement except the trailing
-//      T_RET, clone with ast_clone_subst using a rename map that
-//      maps original callee names (params + locals) to fresh
-//      T_VAR nodes carrying the mangled names. The cloned
-//      statement is then emit_node'd. T_DECLs become no-ops as
-//      usual (cg_emit_node line 2710); the substantive emit is
-//      the T_ASSIGN/T_MEMST/etc. that follows.
-//   3. Final expression: clone the trailing T_RET's expression
-//      (not the T_RET node itself — we want the value, not a
-//      function-return jump). Emit it. The result lands in acc
-//      exactly like a regular T_CALL's return value would.
-//
-// ast_clone_subst's contract is reused as-is: it substitutes
-// T_VAR(name) with the corresponding entry from the args array.
-// By passing fresh T_VAR(mangled) nodes as the args, the clone
-// rewrites every callee-name T_VAR into a mangled-name T_VAR.
-// Shared T_VAR(mangled) nodes are read-only at emit time so
-// multiple references to the same mangled name simply produce
-// multiple lookups of the same frame slot — correct.
-static _a64_emit_inline_multi(call_node, fidx) {
-    auto cn: Node;
-    auto callsite_id, inl_callee, inl_body, inl_bcnt;
-    auto inl_params, inl_pcnt;
-    auto i, orig_p, args_arr;
-    auto mp_node: Node, bind_lhs: Node, bind_assign: Node;
-    auto mangled_params_buf;
-    auto locals_buf, mangled_locals_buf, locals_cnt;
-    auto names_buf, args_buf, total_names;
-    auto si, cloned, ret_stmt: Node, ret_clone, final_ety;
-    auto pp: ChipPrimitives;
-    pp = cg_prim;
-    cn = call_node;
-    callsite_id = cn.e;
-    auto _inl_s;
-    _inl_s = enc_pos;   // .bug: text offset where this inlined body begins
-    inl_callee = funcs[fidx];
-    inl_body = *(inl_callee + FN_BODY);
-    inl_bcnt = *(inl_callee + FN_BCNT);
-    inl_params = *(inl_callee + FN_PARS);
-    inl_pcnt = *(inl_callee + FN_PCNT);
-    args_arr = cn.b;
-    // Pre-build mangled names for every callee identifier so the
-    // binding prologue and the rename map share the same packed
-    // references (cheaper packed_eq downstream).
-    mangled_params_buf = buf_word(inl_pcnt + 1);
-    i = 0;
-    while (i < inl_pcnt) {
-        *(mangled_params_buf + i * 8) = _inline_pack_mangled_name(callsite_id, *(inl_params + i * 8));
-        i++;
-    }
-    locals_buf = buf_word(64);
-    locals_cnt = _inline_collect_locals(inl_body, inl_bcnt, locals_buf);
-    mangled_locals_buf = buf_word(locals_cnt + 1);
-    i = 0;
-    while (i < locals_cnt) {
-        *(mangled_locals_buf + i * 8) = _inline_pack_mangled_name(callsite_id, *(locals_buf + i * 8));
-        i++;
-    }
-    // 1. Per-param strategy:
-    //    - Arg is T_VAR or T_LIT (cheap, idempotent): SUBSTITUTE.
-    //      Multiple refs to the param re-emit the load/lit each
-    //      time — same cost as a single ref with no binding
-    //      overhead.
-    //    - Arg is anything else (T_CALL, T_BINOP, etc.): BIND.
-    //      Emit `_inl<N>_<param> = <arg_expr>` once via
-    //      `cg_emit_stmt`, then the rename map uses the mangled
-    //      slot. Arg evaluates exactly once, regardless of how
-    //      many times the body touches the param.
-    //
-    //    The mixed strategy preserves correctness (no side-effect
-    //    duplication) while avoiding the per-iteration store/load
-    //    overhead that pure binding adds for simple-variable args
-    //    — measured on `examples/tablah.bpp:gen_u64_worker` where
-    //    `xorshift64(worker_id)` is the hot inner call: pure binding
-    //    regressed phase 1 from ~10 ms to ~16 ms; substitute-when-
-    //    simple closes the gap.
-    //
-    //    `cg_emit_stmt` (not `a64_emit_node`) is mandatory for the
-    //    synth T_ASSIGN — the node dispatcher is expression-only
-    //    and silently drops statement-typed nodes. Same pitfall as
-    //    the body-prelude loop further down; see commit `6a7dcd5`.
-    auto arg_node: Node, arg_t;
-    auto bind_needed;
-    bind_needed = buf_word(inl_pcnt + 1);
-    i = 0;
-    while (i < inl_pcnt) {
-        arg_node = *(args_arr + i * 8);
-        arg_t = arg_node.ntype;
-        if (arg_t == T_VAR || arg_t == T_LIT) {
-            *(bind_needed + i * 8) = 0;
-        } else {
-            *(bind_needed + i * 8) = 1;
-            bind_lhs = make_node(T_VAR);
-            bind_lhs.a = *(mangled_params_buf + i * 8);
-            bind_assign = make_node(T_ASSIGN);
-            bind_assign.a = bind_lhs;
-            bind_assign.b = arg_node;
-            cg_emit_stmt(bind_assign);
-        }
-        i++;
-    }
-    // 2. Build the rename map. For BIND-needed params, substitute
-    //    to T_VAR(mangled). For SIMPLE params, substitute to the
-    //    arg node directly (Phase B2 shape — read/load each ref).
-    //    Locals always substitute to fresh T_VAR(mangled).
-    total_names = inl_pcnt + locals_cnt;
-    names_buf = buf_word(total_names + 1);
-    args_buf  = buf_word(total_names + 1);
-    i = 0;
-    while (i < inl_pcnt) {
-        *(names_buf + i * 8) = *(inl_params + i * 8);
-        if (*(bind_needed + i * 8)) {
-            mp_node = make_node(T_VAR);
-            mp_node.a = *(mangled_params_buf + i * 8);
-            *(args_buf + i * 8) = mp_node;
-        } else {
-            *(args_buf + i * 8) = *(args_arr + i * 8);
-        }
-        i++;
-    }
-    i = 0;
-    while (i < locals_cnt) {
-        *(names_buf + (inl_pcnt + i) * 8) = *(locals_buf + i * 8);
-        mp_node = make_node(T_VAR);
-        mp_node.a = *(mangled_locals_buf + i * 8);
-        *(args_buf + (inl_pcnt + i) * 8) = mp_node;
-        i++;
-    }
-    // Emit the body statements. STATEMENT-level emit via cg_emit_stmt —
-    // a64_emit_node only handles expressions and would silently drop
-    // T_ASSIGN / T_MEMST / T_DECL bodies.
-    //
-    // VI-2 — two splice shapes share this loop, told apart by the last
-    // statement:
-    //   * value body (ends in T_RET): emit statements 0..bcnt-2, then emit
-    //     the trailing T_RET's EXPRESSION as the call's value (into acc).
-    //   * void body (falls off the end, no trailing T_RET): emit ALL bcnt
-    //     statements; the call is in statement position so there is no value.
-    auto is_void_splice, last_emit;
-    ret_stmt = inl_body[inl_bcnt - 1];
-    is_void_splice = (ret_stmt.ntype != T_RET);
-    if (is_void_splice != 0) {
-        // Defensive: the void emit shape must agree with the classifier —
-        // only an fn_void_inlineable callee should ever reach this branch,
-        // and only in statement context (a void call has no usable value).
-        assert(arr_get(fn_void_inlineable, fidx));
-        last_emit = inl_bcnt;
-    } else {
-        last_emit = inl_bcnt - 1;
-    }
-    si = 0;
-    while (si < last_emit) {
-        cloned = ast_clone_subst(inl_body[si], names_buf, total_names, args_buf);
-        cg_emit_stmt(cloned);
-        si++;
-    }
-    if (is_void_splice != 0) {
-        // No value to leave in acc — the statement-context caller discards it.
-        final_ety = 0;
-    } else {
-        // Final T_RET expression — emit value into acc.
-        ret_clone = ast_clone_subst(ret_stmt.a, names_buf, total_names, args_buf);
-        final_ety = call(pp.emit_node, ret_clone);
-    }
-    _bug_inl_record(_inl_s, enc_pos, fidx);   // .bug: record this inlined range
-    free(names_buf);
-    free(args_buf);
-    free(locals_buf);
-    free(mangled_locals_buf);
-    free(mangled_params_buf);
-    free(bind_needed);
-    return final_ety;
-}
 
 // Walk a function body and register all declared variables (for frame sizing).
 // S4 P3b-2: top-level entry also walks the body for inlineable multi-stmt
@@ -1437,9 +1244,9 @@ a64_emit_call(nd) {
         fidx_c = find_func_idx(n.a);
         // Inline splice (Phase B2 + S4 P3b unified). Single-T_RET
         // trivial bodies take the existing substitute-and-emit
-        // fast path; multi-statement bodies dispatch to the
-        // `_a64_emit_inline_multi` helper above, which builds the
-        // binding prologue, emits the prelude statements with
+        // fast path; multi-statement bodies dispatch to the shared
+        // spine helper `cg_emit_inline_multi` (bpp_codegen.bsm), which
+        // builds the binding prologue, emits the prelude statements with
         // alpha-renamed locals, and finally emits the return
         // expression. Both paths leave the call's value in acc
         // (or d0 for floats) just like a regular `bl callee`.
@@ -1457,9 +1264,9 @@ a64_emit_call(nd) {
                 inl_cloned = ast_clone_subst(inl_expr, inl_params, inl_pcnt, n.b);
                 // Record the inlined range for the .bug map (debugger PC attribution).
                 auto _inl_s, _inl_ety;
-                _inl_s = enc_pos;
+                _inl_s = call(pp.cur_text_pos);
                 _inl_ety = call(pp.emit_node, inl_cloned);
-                _bug_inl_record(_inl_s, enc_pos, fidx_c);
+                _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx_c);
                 return _inl_ety;
             }
             // body_cnt > 1: only inline if the pre_reg walker
@@ -1469,7 +1276,7 @@ a64_emit_call(nd) {
             // reach yet). Fall through to a normal call in that
             // case rather than risk emitting an unmangled body.
             if (n.e > 0) {
-                return _a64_emit_inline_multi(n, fidx_c);
+                return cg_emit_inline_multi(n, fidx_c);
             }
         } else if (fidx_c >= 0 && arr_get(fn_void_inlineable, fidx_c)) {
             // VI-2: void / statement-context callee — splice its statements in
@@ -1480,7 +1287,7 @@ a64_emit_call(nd) {
             // means the call was not seen during pre_reg, so fall through to a
             // normal call rather than risk an unmangled body.
             if (n.e > 0) {
-                return _a64_emit_inline_multi(n, fidx_c);
+                return cg_emit_inline_multi(n, fidx_c);
             }
         }
         arr = n.b; cnt = n.c;
