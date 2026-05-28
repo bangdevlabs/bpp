@@ -12414,3 +12414,76 @@ emits Linux binaries with the natural `bpp src.bpp -o out` — no `--linux64`.
   arrangement (the normal `emit_binop_resolve` path) or an `*_imm` primitive.
 - **Tripod stays green throughout:** native ARM64 180/0/12, C-emit 145/0/47,
   Linux/Docker self-host byte-stable.
+
+## 2026-05-27 (parity push) — x86_64 brought level with ARM64 across every optimization
+
+### Milestone
+
+With Linux unblocked, the x86_64 backend is now at full optimization parity with
+ARM64. The "x64 is the perpetually-behind backend" era ends: every optimization
+arc that shipped on a64 either now runs on x64, was already shared, or differs
+only in ABI-constrained register *depth*.
+
+### What was actually behind (and the surprise)
+
+The standing assumption (and the April-era docs) was that x64 lagged on a long
+list. Investigation with the new `bug --disasm` + Docker self-host loop showed
+most of it was already paired or near-paired:
+
+- **Inline (B2 + S4 + VI)** — was genuinely a64-only, gated off on x64 since
+  2026-04-15. Ported in three steps: single-return fast path (`5289e53`),
+  multi-statement + void splice via `_x64_emit_inline_multi` mirroring the a64
+  helper + wiring the shared pre-reg walker into `x64_pre_reg_vars` (`d1ffddf`).
+  Verified firing: `scale2(a,b){auto t;t=a+b;return t*2}` inlines into the caller
+  with no call, prints 14; inlines on a64 too (parity confirmed via the .bug
+  inline ranges).
+- **B1 expression freelist** — was real: x64 push/popped every T_BINOP left
+  operand and T_MEMST store value; a64 parked them in a caller-saved register.
+  Added a single-register (r11) freelist (`4050080` for T_BINOP, `ee2e054` for
+  T_MEMST). r11 is safe because its only other use is the indirect-call path and
+  the freelist engages only when there is no call on the sibling subexpression —
+  the same caller-saved discipline a64's x9..x15 pool relies on. One shared reg
+  keeps nesting correct (a busy r11 → alloc returns -1 → stack fallback).
+- **B3 local-promotion budget** — grew from 3 regs {rbx,r14,r15} to 5
+  {rbx,r12,r13,r14,r15} (`ee2e054`). r12/r13 had been excluded over ModR/M / SIB
+  worries, but those only bite when a register is a memory *base*; a promoted
+  local is only ever a value (reg-reg + rbp-based spill), so they are safe.
+- **Outlining** — turned out to be *already* paired: `synthesize_loop_fn` +
+  `rewrite_dispatch_loops` run unconditionally in `main` before per-chip emit
+  (shared transform in dispatch), and the synth worker + `_job_parallel_for_data`
+  call go through normal codegen on both chips. Never was chip-specific.
+- **B4 `: double` SIMD** — already had full SSE codegen on x64 (MOVUPS,
+  vec_add4/mul4…), not just the encoders. No work needed.
+
+### The thread that runs through all of it
+
+Both the inline gate AND the B1 freelist were disabled in the same April commit
+"paired with the B1 x86_64 regression". That regression was never B1 or inline —
+it was the `arr_len`/`arr_get` operand-order bugs (fixed earlier today) crashing
+the cross-compiled compiler. With the real cause gone, every disabled feature
+re-enabled cleanly and self-hosts byte-stable. A misdiagnosis disabled two good
+optimizations for six weeks; the fix for the actual bug unblocked them in an
+afternoon.
+
+### Residuals (ISA, not capability)
+
+What remains is pure ABI arithmetic, not a missing capability: x64's B1 freelist
+is 1 register (r11) vs a64's 7 (x9..x15), and B3 is 5 vs 6 — System V simply
+leaves x86_64 fewer free callee/caller-saved registers than AAPCS64 does. The
+common non-nested cases get the register; deeper nesting falls back to the
+(always-correct) stack.
+
+### Lessons
+
+- **Verify "X is behind" against the code, not the doc.** Half the "gaps" were
+  already closed (outlining, B4) or near-closed; the docs were stale because the
+  Wave 20/21 spine refactor had quietly shared a lot of what used to be
+  chip-specific. The reframe saved more work than it cost.
+- **A disabled feature outlives its cause.** When two features are disabled
+  "paired with regression X", re-test them the moment X's real root cause is
+  fixed — the pairing may have been a misdiagnosis. Here it was.
+- **One shared freelist register is enough for the common case.** Full a64-style
+  depth needs many registers x86_64 doesn't have, but a single r11 with a clean
+  busy-check + stack fallback captures the bulk of the win at near-zero risk.
+- **Tripod green throughout:** native ARM64 180/0/12, C-emit 145/0/47, x64
+  self-hosts byte-stable in Docker at every step.
