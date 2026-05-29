@@ -205,12 +205,28 @@ void _x64_emit_jump_to_epilogue() { x64_enc_jmp_label(x64_ret_lbl); }
 
 _x64_emit_memld_load(fh) {
     auto sl, bo, bw, mask;
-    sl = ty_slice(fh);
-    if (sl == SL_DOUBLE) {
-        // 128-bit SIMD field — movups load. Returns SIMD type 2.
-        x64_enc_movups_load(0, 0, 0);
-        return 2;
+    // Float field: load into the XMM file and return the float ety so the
+    // caller treats the value as a float, not raw bits. Without this branch
+    // a `: float` field (SL_FULL) fell through to x64_enc_load — an 8-byte
+    // INTEGER load — so `p.x` came back as the IEEE bits reinterpreted as an
+    // int. Mirror of the a64 `_a64_emit_memld_load` float path.
+    if (is_float_type(fh)) {
+        sl = ty_slice(fh);
+        if (sl == SL_DOUBLE) {           // 128-bit SIMD field — movups
+            x64_enc_movups_load(0, 0, 0);
+            return 2;
+        }
+        if (sl == SL_HALF) {             // 32-bit f32 — load single, widen to f64
+            x64_enc_load_ss(0, 0, 0);
+            x64_enc_cvtss2sd(0, 0);
+            return 1;
+        }
+        // 64-bit f64 (SL_FULL). SL_QUARTER/f16 has no native x86_64 load
+        // (sub-word float is aarch64-only surface today) and lands here.
+        x64_enc_load_sd(0, 0, 0);        // movsd xmm0, [rax]
+        return 1;
     }
+    sl = ty_slice(fh);
     if (sl >= SL_BIT && sl <= SL_BIT7) {
         bo = (fh / 256) & 7;
         bw = sl - 3;
@@ -767,15 +783,18 @@ void _x64_emit_coerce_int_to_float() {
 }
 
 // Store float register val_reg at [rax].
-// x86_64 limitation: sub-word float (SL_HALF) bitcasts 64-bit double bits through
-// movq, then stores the low 32 bits. This is correct for SL_FULL (64-bit double).
-// For SL_HALF (32-bit single), a proper fix needs cvtsd2ss + movss.
+// SL_FULL (64-bit double): bitcast the xmm bits through movq and store 8 bytes.
+// SL_HALF (32-bit single): convert double → single with cvtsd2ss first, so the
+// low 32 bits hold the real f32 (not the low half of the double's bit pattern),
+// then store those 4 bytes. Mirrors the a64 `fcvt s, d; str s` path.
 void _x64_emit_float_store_scalar(fh_sl, val_reg) {
-    x64_enc_movq_from_xmm(val_reg, val_reg);   // bitcast xmm{val_reg} → r{val_reg}
     if (fh_sl == SL_HALF) {
+        x64_enc_cvtsd2ss(val_reg, val_reg);     // double → single (f32 in low 32 bits)
+        x64_enc_movq_from_xmm(val_reg, val_reg);
         x64_enc_store_w(val_reg, 0, 0);         // mov dword [rax], r{val_reg}d
         return;
     }
+    x64_enc_movq_from_xmm(val_reg, val_reg);   // bitcast xmm{val_reg} → r{val_reg}
     x64_enc_store(val_reg, 0, 0);               // mov qword [rax], r{val_reg}
 }
 

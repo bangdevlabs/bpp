@@ -1075,11 +1075,10 @@ void x64_emit_body(arr, cnt) {
 
 // ── Wave 20 stage 3: T_MEMST per-path primitives ──
 //
-// Mirror of the aarch64 siblings. x86_64 does not encode sub-word
-// scalar float stores today, so `emit_memst_float_scalar` simply
-// delegates to the generic int path (the scalar value gets bitcast
-// through movq_from_xmm during emit_node and follows the same push
-// / pop / memst_store recipe as an integer store).
+// Mirror of the aarch64 siblings. The SIMD path stores a 128-bit
+// vector, the scalar-float path stores a float's bits (movsd-class),
+// and the int path stores an integer (truncating a float RHS with
+// cvttsd2si — correct only for an int destination).
 
 void _x64_emit_memst_float_simd(nd) {
     auto n: Node, ety;
@@ -1138,12 +1137,25 @@ void _x64_emit_memst_int(nd, fh) {
     call(pp.emit_memst_store, fh, val_reg);
 }
 
-// x86_64 does not split scalar float stores by sub-word width today;
-// the int path already handles the value correctly after movq_from_xmm.
+// Store a float VALUE into a float field, preserving the bits. The old
+// version delegated to _x64_emit_memst_int, whose cvttsd2si — correct
+// for an INT destination (the May `fmov→fcvtzs` fix) — truncated
+// `field = 1.5` into a stored integer 1 because the field is float, not
+// int. Mirror the a64 sibling and the working `pokefloat` recipe:
+// value → xmm0 (int RHS promoted), fpush, address → rax, fpop → xmm1,
+// then store xmm1's bits at [rax] via emit_float_store_scalar (which
+// bitcasts xmm→gp and stores the right width for SL_FULL / SL_HALF).
 void _x64_emit_memst_float_scalar(nd, fh_sl) {
-    auto n: Node;
+    auto n: Node, ety;
+    auto pp: ChipPrimitives;
+    pp = cg_prim;
     n = nd;
-    _x64_emit_memst_int(nd, n.c);
+    ety = call(pp.emit_node, n.b);          // value → xmm0
+    if (ety == 0) { call(pp.emit_coerce_int_to_float); }
+    call(pp.emit_fpush, 0);                 // save the float value
+    call(pp.emit_node, n.a);                // address → rax
+    call(pp.emit_fpop, 1);                  // value → xmm1
+    call(pp.emit_float_store_scalar, fh_sl, 1);
 }
 
 // ── Per-module emission (for incremental compilation) ──────
