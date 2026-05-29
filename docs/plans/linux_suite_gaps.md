@@ -1,10 +1,16 @@
 # Linux full-suite gaps (x86_64 ELF)
 
-**Status:** open — surfaced 2026-05-28 by the **first-ever full `run_all.sh` on
-Linux**. The documented Linux verification (`bootstrap_manual.md` leg 3) only
-ran `test_linux_*`/`test_x11_*` (10 tests). Running the whole suite (~194) under
-the cross-compiled Linux `bpp` in Docker (`ubuntu:22.04`, glibc 2.35, x86_64
-under Rosetta) gave **142 passed / 26 failed / 26 skipped**.
+**Status:** RESOLVED — the full Linux suite is **green (153 passed / 0 failed /
+41 skipped)** as of 2026-05-28. This doc stays as the record of the first-ever
+full `run_all.sh` on Linux and the bugs it caught; the only living content is the
+skip-list rationale (those tests un-skip when audio/threads are wired) and the
+`outline_smoke` crash note (deferred to the thread/`clone(2)` work).
+
+Surfaced 2026-05-28 by the first whole-suite run (the documented verification,
+`bootstrap_manual.md` leg 3, only ran `test_linux_*`/`test_x11_*` — 10 tests).
+Running the whole suite (~194) under the cross-compiled Linux `bpp` in Docker
+(`ubuntu:22.04`, glibc 2.35, x86_64 under Rosetta) gave **142 / 26 / 26**;
+triage + four fixes took it to **153 / 0 / 41**.
 
 Context that frames every gap below:
 - **Self-host is solid.** The Linux `bpp` bootstraps byte-stable inside the
@@ -19,21 +25,12 @@ Context that frames every gap below:
   ALSA door, 10; worker-pool/SIGPROF = threads via `clone(2)`, 5), mirroring the
   existing `test_thread/job/maestro` skips. `outline_smoke` is among the 15
   skipped but its crash is noted below.
-- **10 of the 26 were root-caused and FIXED this session** — `test_modulab_prefs`
-  (open-flags portability) + the 9-test x64 float-through-memory codegen bug
-  (see "Resolved" below).
-- **1 remains open**: `test_extrn_no_def_diag` — a missing diagnostic, below.
+- **All 11 real bugs were root-caused and FIXED this session** —
+  `test_modulab_prefs` (open-flags portability), the 9-test x64
+  float-through-memory codegen bug, and `test_extrn_no_def_diag`
+  (E264-not-on-ELF). See "Resolved" below.
 
-Post-fix the Linux suite is **152 passed / 1 failed / 41 skipped**.
-
-## Open — E264 is not emitted on the ELF backend (1 test)
-
-`test_extrn_no_def_diag`. **Not a miscompile — a missing diagnostic.** The "extrn
-has no backing definition in the link graph" check (E264) is emitted only in
-`a64_macho.bsm:1083`; the ELF target (`x64_elf.bsm`) never grew it, so an
-undefined `extrn` global compiles cleanly on Linux instead of being refused.
-Port the link-graph check + E264 emission into the ELF reloc-resolution path
-(`elf_resolve_relocations`).
+Final Linux suite: **153 passed / 0 failed / 41 skipped** — green.
 
 ## Resolved this session
 
@@ -69,6 +66,15 @@ Port the link-graph check + E264 emission into the ELF reloc-resolution path
   (3) `_x64_emit_float_store_scalar` stored the low 32 bits of the double for
   `SL_HALF` without `cvtsd2ss`. All three now mirror the a64 paths. Verified in
   Docker; Linux suite 143/10/41 → **152/1/41**. Commit `4193fb1`.
+
+- **E264 on the ELF backend — FIXED.** `test_extrn_no_def_diag` is an xfail that
+  expects the compiler to refuse an `extrn` with no backing slot. Not a
+  miscompile — a *missing diagnostic*: the "extrn has no backing definition"
+  check (E264) lived only in `a64_macho.bsm:1083`, and `elf_resolve_relocations`
+  silently fell back to `elf_data_vaddr` for an unresolved global, so the bad
+  `extrn` compiled cleanly on Linux. Ported the same check + help text into the
+  ELF resolver (`diag_*` resolve cross-module like the parser globals x64_elf
+  already uses). Linux suite **152/1/41 → 153/0/41 (green)**. Commit `d3eb5f8`.
 
 ## Skipped-but-noted: outline_smoke crashes instead of degrading
 

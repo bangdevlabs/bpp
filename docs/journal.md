@@ -12711,13 +12711,22 @@ spots all "treat the float slot as int":
 3. **f32 store** — `_x64_emit_float_store_scalar` stored the low 32 bits of the
    double for `SL_HALF` without `cvtsd2ss`; fixed, so `half float` fields work.
 
-All three were straight mirrors of the working a64 code. Linux suite
-**142/26/26 → 143/10/41 (skip-list + Bug A) → 152/1/41 (Bug B)**. The lone
-remainder, `test_extrn_no_def_diag`, is not a miscompile: the E264
-"undefined extrn" diagnostic lives only in `a64_macho.bsm`; the ELF backend
-never grew it (filed in `docs/plans/linux_suite_gaps.md`). Native 182/0/12 and
-C-emit 147/0/47 untouched throughout (the fixes are x64-only); gen1==gen2
-byte-stable every step.
+All three were straight mirrors of the working a64 code.
+
+### Bug C — E264 was never ported to the ELF backend (`d3eb5f8`)
+
+The last failure, `test_extrn_no_def_diag`, was not a miscompile but a *missing
+diagnostic*. The "extrn has no backing definition in the link graph" check
+(E264) lived only in `a64_macho.bsm`; `elf_resolve_relocations` silently fell
+back to `elf_data_vaddr` when a global reloc's symbol wasn't found, so an
+undefined `extrn` compiled cleanly on Linux and only showed up as garbage at
+runtime. Ported the same check + three-shape help text into the ELF resolver
+(`diag_*` resolve cross-module like the parser globals x64_elf already calls).
+
+Linux suite **142/26/26 → 143/10/41 (skip-list + Bug A) → 152/1/41 (Bug B) →
+153/0/41 (Bug C) — green**. The full test suite passes on Linux for the first
+time. Native 182/0/12 and C-emit 147/0/47 untouched throughout (the fixes are
+x64-only / ELF-only); gen1==gen2 byte-stable every step.
 
 ### Lessons
 
