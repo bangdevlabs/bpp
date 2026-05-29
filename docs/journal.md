@@ -12652,3 +12652,84 @@ one `DT_NEEDED` per distinct soname — is the one documented follow-up.)
   `_gpu_linux.bsm`/`bpp_gpu` for Phase 2, but with no consumer game they'd be
   dead code (the phase-collapse lesson). The honest artifact today is the engine
   door + a runnable demonstrator example, not an unused platform layer.
+
+## 2026-05-28 (full Linux suite) — the first whole-suite run on Linux finds two real x64 bugs
+
+Closing the day by actually running the *entire* test suite on Linux for the
+first time — the documented verification (`bootstrap_manual.md` leg 3) only ever
+ran the 10 `test_linux_*`/`test_x11_*`. Cross-compiled a seed Linux `bpp`,
+bootstrapped it **inside** the container (gen2 == gen3, and gen1-cross ==
+gen2-self — same sha256, deterministic host-independent codegen), then ran
+`run_all.sh` against it with the repo mounted read-only and `./bpp` overlaid by
+the Linux binary. First result: **142 / 26 / 26**. Triage collapsed the 26 into
+clean buckets and turned up two genuine bugs neither of which the dynlink arc
+caused (the dynlink test passes; the failures take the static `write_elf` path).
+
+### Skip-list: 15 unwired-platform tests
+
+Audio/MIDI/mixer (CoreAudio FFI, the ALSA door not wired) and worker-pool /
+SIGPROF tests (threads via `clone(2)`, not wired) are macOS-only today — same
+class as the already-skipped `test_thread/job/maestro`. Added two Linux-only
+skip cases to `run_all.sh` (`audio-macos-only`, `concurrency-infra-macos-only`)
+so the Linux suite reflects what is actually portable. Corrected the stale
+`test_thread` comment too: ELF dynlink *landed*, but threads still wait on
+`clone(2)`+TLS — they were never a dynlink consumer.
+
+### Bug A — `file_write_all` could not create files on Linux (`a6d57b7`)
+
+`test_modulab_prefs` failed to write `~/.config/bpp/modulab_prefs.json` even
+though the dir was created and writable. The shared writers `file_write_all`
+(`bpp_file.bsm`) and `bo_save_file` (`bpp_bo.bsm`) hardcoded
+`sys_open(path, 0x601)` — the **macOS** `O_WRONLY|O_CREAT|O_TRUNC`. On Linux
+`0x601` decodes to `O_WRONLY|O_TRUNC|O_APPEND`: **no `O_CREAT`**, so creating any
+new file failed (only pre-existing files truncated). The ELF *output* writer had
+been fixed long ago (`x64_elf.bsm` → `0x241`); the shared file I/O never got the
+mirror — "fixed for the macOS target, Linux deferred while the backend was
+blocked." (The user remembered exactly this.) Fix: a per-OS
+`_sys_open_create_flags()` in `_core_<os>.bsm`, resolved by the same
+auto-injection that already gives every program `_stb_user_config_dir`. Not a
+test quirk — *no* B++ program could create a file via `file_write_all` on Linux.
+
+### Bug B — x64 dropped the fraction of every float through memory (`4193fb1`)
+
+Nine tests failed identically: a float that round-trips through memory lost its
+fraction. `newtype` → `1.0` for a `1.5` field; `peekfloat` → the IEEE bits
+reinterpreted as an int. The boundary was sharp — **scalar/in-register floats
+worked** (`test_float`, `test_const_float` pass); only struct-field /
+`pokefloat`/`peekfloat` memory broke. So this was **not** a Rosetta artifact
+(emulation gives tiny drift, never a systematic `1.5 → 1.0`, and the integer
+memory ops round-tripped intact) — a real x64 codegen type/width bug, in three
+spots all "treat the float slot as int":
+
+1. **Store** — `_x64_emit_memst_float_scalar` delegated to the int path, whose
+   `cvttsd2si` (correct for an int destination — the May `fmov→fcvtzs` fix)
+   truncated `1.5 → 1`. Now stores the bits via the `pokefloat` recipe.
+2. **Load** — `_x64_emit_memld_load` had **no `is_float_type` branch**, so a
+   `: float` field fell through to an 8-byte integer load. Added the float branch
+   (`movsd` / `load_ss`+`cvtss2sd`), mirroring a64; this fixed `peekfloat` too
+   (same primitive).
+3. **f32 store** — `_x64_emit_float_store_scalar` stored the low 32 bits of the
+   double for `SL_HALF` without `cvtsd2ss`; fixed, so `half float` fields work.
+
+All three were straight mirrors of the working a64 code. Linux suite
+**142/26/26 → 143/10/41 (skip-list + Bug A) → 152/1/41 (Bug B)**. The lone
+remainder, `test_extrn_no_def_diag`, is not a miscompile: the E264
+"undefined extrn" diagnostic lives only in `a64_macho.bsm`; the ELF backend
+never grew it (filed in `docs/plans/linux_suite_gaps.md`). Native 182/0/12 and
+C-emit 147/0/47 untouched throughout (the fixes are x64-only); gen1==gen2
+byte-stable every step.
+
+### Lessons
+
+- **Run the whole suite on the new platform, not a curated subset.** The 10-test
+  Linux gate was green for weeks while `file_write_all` couldn't create a file
+  and every float-in-a-struct silently truncated. The first full run paid for
+  itself twice over.
+- **A symptom can rule out emulation.** "Is it a real bug or a Rosetta artifact?"
+  felt unanswerable without x86 hardware — until the symptom (`1.5 → 1.0`
+  systematically, integers intact) made it obvious it was codegen. Read the
+  failure shape before reaching for the hardware gate.
+- **Paired backends, paired bugs (again).** Both fixes were "a64 had the right
+  path, x64 took the int path." Diffing the sibling primitive found each fix
+  faster than reasoning from scratch — the same lesson the dynlink extern-routing
+  fix taught this morning.

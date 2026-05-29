@@ -19,45 +19,21 @@ Context that frames every gap below:
   ALSA door, 10; worker-pool/SIGPROF = threads via `clone(2)`, 5), mirroring the
   existing `test_thread/job/maestro` skips. `outline_smoke` is among the 15
   skipped but its crash is noted below.
-- **1 of the 26 was root-caused and FIXED this session** — `test_modulab_prefs`
-  (see "Resolved" below). That leaves **10 open real bugs** (cluster C = 5,
-  cluster D = 5). Post-fix the Linux suite is **143 passed / 10 failed / 41
-  skipped**.
+- **10 of the 26 were root-caused and FIXED this session** — `test_modulab_prefs`
+  (open-flags portability) + the 9-test x64 float-through-memory codegen bug
+  (see "Resolved" below).
+- **1 remains open**: `test_extrn_no_def_diag` — a missing diagnostic, below.
 
-## Cluster C — x64 float drift (5 tests)
+Post-fix the Linux suite is **152 passed / 1 failed / 41 skipped**.
 
-`test_json_float`, `test_level_v2`, `test_struct_field_float_propagation`,
-`test_vec2_arithmetic`, `test_vec2_float_roundtrip`.
+## Open — E264 is not emitted on the ELF backend (1 test)
 
-All pass on native a64 (the algorithms are correct) but fail on x86_64 ELF with
-value drift — `test_level_v2` reports `ent0.x/y` and `ent1.x/y` "float drift".
-The common thread is float values surviving a store/load or a struct-field
-round-trip on the x64 backend.
-
-**Unknown to resolve first:** is this an x64 **codegen** bug (e.g. an SSE
-load/store width or a movq-vs-cvt issue, the same family as the May-2026
-`T_MEMST fmov→fcvtzs` fix) or a **Rosetta emulation** precision artifact? They
-cannot be told apart in Docker-on-Apple-Silicon — this needs a **real x86_64
-Linux box** (which is the same hardware gate as the GPU/audio door). First step
-on such a box: run these five natively (no Rosetta); if they pass, it was
-emulation; if they drift, disassemble the float store/load with `bug --disasm`
-and compare against the a64 emission.
-
-## Cluster D — codegen / diagnostic gaps (5 tests)
-
-- **`test_extrn_no_def_diag` (E264 only on Mach-O).** The "extrn has no backing
-  definition" diagnostic is emitted in `a64_macho.bsm:1083` only; the ELF target
-  (`x64_elf.bsm`) never grew it, so an undefined `extrn` global compiles cleanly
-  on Linux instead of being refused. Port the link-graph check + E264 emission
-  into the ELF reloc-resolution path (`elf_resolve_relocations`).
-- **`test_peek_widths` (exit 133).** Crashes (SIGILL/SIGTRAP class) on x64 ELF —
-  likely a sub-word `peek`/`peek_w` width-handling codegen gap. Disassemble the
-  failing peek site and compare to a64.
-- **`test_ecs_archetype` / `test_ecs_component` (exit 1).** ECS core (archetype
-  storage / component access), not the scheduler, fails an assertion on x64 ELF
-  while passing native. Isolate which assertion; suspect an `arr_struct`
-  offset/width difference on x64.
-- **`test_newtype` (exit 1).** Newtype feature assertion fails on x64 ELF.
+`test_extrn_no_def_diag`. **Not a miscompile — a missing diagnostic.** The "extrn
+has no backing definition in the link graph" check (E264) is emitted only in
+`a64_macho.bsm:1083`; the ELF target (`x64_elf.bsm`) never grew it, so an
+undefined `extrn` global compiles cleanly on Linux instead of being refused.
+Port the link-graph check + E264 emission into the ELF reloc-resolution path
+(`elf_resolve_relocations`).
 
 ## Resolved this session
 
@@ -76,7 +52,23 @@ and compare against the a64 emission.
   `_stb_user_config_dir`), used by both shared writers. This was a real
   portability hole — *no* B++ program could create a new file via `file_write_all`
   on Linux. Verified in Docker (`modulab_prefs` → OK, file written); Linux suite
-  143/10/41.
+  143/10/41. Commit `a6d57b7`.
+
+- **x64 float-through-memory — FIXED (9 tests).** `test_json_float`,
+  `test_level_v2`, `test_struct_field_float_propagation`, `test_vec2_arithmetic`,
+  `test_vec2_float_roundtrip`, `test_newtype`, `test_ecs_archetype`,
+  `test_ecs_component`, `test_peek_widths` all failed identically on x64-ELF: a
+  float that round-trips through memory **lost its fraction** (`1.5` read back as
+  `1.0`, `peekfloat` returned the bits as an int). Scalar/in-register floats were
+  fine; only struct-field / `pokefloat`-`peekfloat` memory broke. Three x64-only
+  spots treated the float slot as int — **not a Rosetta artifact**, a real
+  codegen type/width bug (the systematic `1.5 → 1.0`, with integer memory ops
+  intact, proved it): (1) `_x64_emit_memst_float_scalar` delegated to the
+  truncating int path (`cvttsd2si`); (2) `_x64_emit_memld_load` had no
+  `is_float_type` branch so a `: float` field loaded via an 8-byte integer load;
+  (3) `_x64_emit_float_store_scalar` stored the low 32 bits of the double for
+  `SL_HALF` without `cvtsd2ss`. All three now mirror the a64 paths. Verified in
+  Docker; Linux suite 143/10/41 → **152/1/41**. Commit `4193fb1`.
 
 ## Skipped-but-noted: outline_smoke crashes instead of degrading
 
