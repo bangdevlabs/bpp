@@ -91,10 +91,11 @@ abstraction is grounded in two concrete frontends.
   shareware data (`.WL1`) is freely distributable (Apogee/id shareware licence);
   the registered `.WL6` requires owning the game. (The engine is GPL; the
   registered *data* is not — same provenance care as the WC1 CD rip.)
-  **DONE 2026-05-28** (`tools/funnel/vswap_dump.bpp`): header parse verified
-  against a synthetic 56-byte fixture (5 chunks → 2 walls / 2 sprites / 1
-  sound, offsets + lengths exact). Awaiting a real `.WL1` to confirm on game
-  data.
+  **DONE + CONFIRMED ON REAL DATA 2026-05-28** (`tools/funnel/vswap_dump.bpp`).
+  Episode 1 shareware `VSWAP.WL1` (742 912 bytes): **663 chunks = 106 walls /
+  436 sprites / 121 sounds**, offsets page-aligned at 4096. Smoking gun: every
+  wall chunk is exactly **4096 bytes = 64×64×1** — the unmistakable VSWAP
+  signature, so the container parse is correct.
 - **S1 — walls → RGBA.** Decode 64×64 raw walls + apply the VGA palette → PNG.
   Validates palette + `pixels_save_png`. Emit an atlas_grid tileset.
 - **S2 — sprites → RGBA.** Decode the compiled-sprite post format + transparency.
