@@ -319,7 +319,32 @@ static void elf_resolve_relocations(gl_names, gl_count) {
             for (j = 0; j < gl_count; j++) {
                 if (elf_packed_eq(*(gl_names + j * 8), sym)) { gl_idx = j; }
             }
-            target_addr = gl_idx >= 0 ? elf_data_vaddr + gl_idx * 8 : elf_data_vaddr;
+            if (gl_idx >= 0) {
+                // Target address (within DATA): data_vaddr + gl_idx * 8.
+                target_addr = elf_data_vaddr + gl_idx * 8;
+            } else {
+                // E264 — extrn references a name with no backing definition
+                // in the link graph. Same check as the Mach-O resolver
+                // (a64_macho.bsm); the ELF path previously fell back to
+                // elf_data_vaddr (a wrong-but-valid address), so the error
+                // only surfaced as garbage at runtime. Common cause: a
+                // `const X = N;` (compile-time literal, emits no slot) where
+                // something declares `extrn X;` expecting a real slot.
+                diag_error(264);
+                diag_str("extrn '");
+                diag_packed(sym);
+                diag_str("' has no backing definition in the link graph");
+                diag_newline();
+                diag_help("declare a slot with one of:");
+                diag_help_packed("  - 'global const ", sym,
+                                  " = N;' (cross-module immutable, .data slot)");
+                diag_help_packed("  - 'auto ", sym,
+                                  ";' + write-once init (Rule 1 discipline, mutable slot)");
+                diag_help("  - import a module that defines it (e.g. stbgame / stbwindow define SCREEN_W)");
+                diag_help_packed("note: 'const ", sym,
+                                  " = N;' is compile-time literal substitution and emits no symbol");
+                sys_exit(2);
+            }
         }
         1 {
             // String literal: sym is the string index in elf_sdata_off.
