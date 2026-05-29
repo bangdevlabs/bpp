@@ -1,0 +1,88 @@
+// vswap_dump — funnel S0: report the chunk layout of a Wolf3D VSWAP page file.
+//
+// This proves we own the VSWAP CONTAINER format before writing the pixel
+// decoders (S1 walls / S2 sprites). It decodes NO pixels — it only reads the
+// header + the offset/length tables and reports how many wall, sprite, and
+// sound chunks the file holds, with a spot-check of the first few offsets.
+//
+// VSWAP header (little-endian, DOS/x86 — peek_q/peek_h read LE directly):
+//   u16 chunk_count                 total pages in the file
+//   u16 sprite_start                index of the first sprite page
+//   u16 sound_start                 index of the first sound page
+//   u32 page_offset[chunk_count]    absolute file offset of each page
+//   u16 page_length[chunk_count]    byte length of each page
+//
+// Page classes:
+//   walls   = pages [0, sprite_start)        64x64 raw, column-major
+//   sprites = pages [sprite_start, sound_start)   compiled-sprite posts
+//   sounds  = pages [sound_start, chunk_count)    digitized PCM
+//
+// Usage:  vswap_dump <VSWAP.WL1|VSWAP.WL6>
+// The header parse was verified against a synthetic 56-byte fixture (5 chunks:
+// 2 walls / 2 sprites / 1 sound). Point it at a shareware VSWAP.WL1 (freely
+// distributable) to confirm on real game data.
+
+main() {
+    auto path: ptr;
+    auto buf, size, hdr_min;
+    auto chunk_count, sprite_start, sound_start;
+    auto off_base, len_base, i, ofs, len, shown;
+
+    if (argc_get() < 2) {
+        putstr_err("usage: vswap_dump <VSWAP.WL1|VSWAP.WL6>\n");
+        return 1;
+    }
+    path = argv_get(1);
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) {
+        putstr_err("vswap_dump: cannot read ");
+        putstr_err(path);
+        putstr_err("\n");
+        return 1;
+    }
+    if (size < 6) {
+        putstr_err("vswap_dump: file too small to hold a VSWAP header\n");
+        return 1;
+    }
+
+    chunk_count  = peek_q(buf + 0);
+    sprite_start = peek_q(buf + 2);
+    sound_start  = peek_q(buf + 4);
+
+    // Sanity: the header tables must fit, and the class boundaries must be
+    // monotonic (walls <= sprites <= sounds <= total).
+    hdr_min = 6 + chunk_count * 4 + chunk_count * 2;
+    if (size < hdr_min) {
+        putstr_err("vswap_dump: truncated header (offset/length tables don't fit)\n");
+        return 1;
+    }
+    if (sprite_start > sound_start || sound_start > chunk_count) {
+        putstr_err("vswap_dump: class boundaries not monotonic — not a VSWAP?\n");
+        return 1;
+    }
+
+    off_base = buf + 6;
+    len_base = buf + 6 + chunk_count * 4;
+
+    putstr("VSWAP: "); putstr(path); putline();
+    putstr("  file size    : "); putnum(size); putline();
+    putstr("  chunks total : "); putnum(chunk_count); putline();
+    putstr("  walls   [0.."); putnum(sprite_start);
+    putstr(")    = "); putnum(sprite_start); putline();
+    putstr("  sprites ["); putnum(sprite_start); putstr(".."); putnum(sound_start);
+    putstr(")  = "); putnum(sound_start - sprite_start); putline();
+    putstr("  sounds  ["); putnum(sound_start); putstr(".."); putnum(chunk_count);
+    putstr(")  = "); putnum(chunk_count - sound_start); putline();
+
+    putstr("  first chunks (idx: offset, length):"); putline();
+    shown = chunk_count < 6 ? chunk_count : 6;
+    for (i = 0; i < shown; i++) {
+        ofs = peek_h(off_base + i * 4);
+        len = peek_q(len_base + i * 2);
+        putstr("    "); putnum(i); putstr(": "); putnum(ofs);
+        putstr(", "); putnum(len); putline();
+    }
+    return 0;
+}
