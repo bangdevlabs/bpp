@@ -49,7 +49,7 @@ inliner: multi-statement bodies + local renaming + side-effect
 tracking. Minimum-viable single-return-no-calls inliner would
 NOT catch xorshift64 (7 stmts + mutations + global rng_state)
 so it's not worth doing as a tack-on. Opened as separate
-sidequest: `docs/sidequest_cost_model_inliner.md` (~700 LOC,
+sidequest: `docs/plans/legacy/sidequest_cost_model_inliner.md` (~700 LOC,
 1-2 dedicated sessions, design phase first).
 
 ### Engine touches in this arc

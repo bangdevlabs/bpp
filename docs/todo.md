@@ -15,7 +15,7 @@ Last refresh: 2026-05-25 (Wave 21 spine + dispatch regression + T_MEMST + HUD pe
   outlines to `__synth_4` + `bl _job_parallel_for_data`.
   Three latent bugs uncovered + fixed (BSYS_* collision,
   mod_bnds + topo coupling, outlining @safe gate). Suite
-  179/0/12 + 144/0/47. See `docs/plans/sidequest_load_import_distinction.md`.
+  179/0/12 + 144/0/47. See `docs/plans/legacy/sidequest_load_import_distinction.md`.
 
 - ~~**Dispatch regression + spine closeout.**~~ **CLOSED 2026-05-25**
   (`48d16e1` → `3076e60`). P6's defer-emit activated latent MAP synths
@@ -154,7 +154,7 @@ va
   (r12/r13 are callee-saved + ModR/M-fiddly). Possible minor follow-up: the
   T_MEMST store-value freelist (a64 has it chip-side; on x64 the save is
   spine-driven, so it'd be a spine change touching both chips). S4 no longer
-  ARM64-only; `docs/plans/sidequest_cost_model_inliner.md` deferral note is
+  ARM64-only; `docs/plans/legacy/sidequest_cost_model_inliner.md` deferral note is
   now historical.
 - ✅ **`bpp` no-args SIGSEGV (BOTH platforms, robustness)** — FIXED
   2026-05-27 (`8228f92`). With no input file `arg_ptr` stayed 0 and
