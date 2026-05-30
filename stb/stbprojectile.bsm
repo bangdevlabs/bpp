@@ -67,12 +67,12 @@ import "stbpool.bsm";
 // `payload_w` is one word (eid, struct ptr, damage word, anything).
 // Game-side casts it to whatever shape the consumer cares about.
 struct Projectile {
-    x, y, z,                   // position
-    vx, vy, vz,                // velocity (units per second)
-    gravity_z,                 // 0 = straight-line; positive = arc
-    elapsed_ms,
+    x: float, y: float, z: float,        // position (world units — cells or px)
+    vx: float, vy: float, vz: float,     // velocity (units per second)
+    gravity_z: float,                    // 0 = straight-line; positive = arc
+    elapsed_ms,                          // integer ms counters
     lifetime_ms,
-    payload_w
+    payload_w                            // caller's opaque word (int / ptr)
 }
 
 // ── Pool wrapper ─────────────────────────────────────────────
@@ -125,8 +125,9 @@ void projectile_pool_free(pp: ProjectilePool) {
 //
 // Velocity units = pixels-per-second (or whatever consistent unit
 // the consuming game uses). Lifetime is in milliseconds.
-projectile_spawn(pp: ProjectilePool, x, y, z, vx, vy, vz,
-                 gravity_z, lifetime_ms, payload_w) {
+projectile_spawn(pp: ProjectilePool, x: float, y: float, z: float,
+                 vx: float, vy: float, vz: float,
+                 gravity_z: float, lifetime_ms, payload_w) {
     auto p: Projectile, slot, idx, p_pool: Pool;
     slot = pool_get(pp.pool);
     if (slot == 0) { return 0; }
@@ -164,23 +165,32 @@ void projectile_kill(pp: ProjectilePool, slot) {
 // is recycled, so it can read the payload + apply impact damage.
 // Pass 0 for `on_expire_fn` to silently discard expired slots.
 //
-// Motion math: pos += vel * dt_ms / 1000 (integer divide — the
-// engine intentionally avoids floats in the simulation hot path,
-// the same numeric convention rts1/stbphys/stbecs already share).
+// Motion math: pos += vel * (dt_ms / 1000) in float — positions and
+// velocities are float-native so sub-pixel / sub-cell trajectories stay
+// smooth (rts1 passes pixel units, the FPS passes world cells). `dt_ms`
+// stays an integer millisecond budget on the way in.
 // Gravity adds to vz only — pure 2D consumers leave gravity_z=0
 // and never see it touch their state.
 void projectile_tick(pp: ProjectilePool, dt_ms, on_expire_fn) {
     auto i, slot, p: Projectile, p_pool: Pool;
+    auto (dt_f, dt_s): float;
+    // Convert the integer millisecond budget to a float "seconds" scale
+    // ONCE up front. The motion math is `pos += vel * seconds`, so the
+    // frame delta must be a float. Assigning the int parameter to a float
+    // local is the clean, IEEE-preserving conversion; multiplying the raw
+    // int straight into the float velocity would drop bits (warning W025).
+    dt_f = dt_ms;
+    dt_s = dt_f / 1000.0;
     p_pool = pp.pool;
     for (i = 0; i < pp.capacity; i++) {
         if (peek(pp.alive + i) == 0) { continue; }
         slot = p_pool.buf + i * pp.obj_size;
         p    = slot;
-        p.x = p.x + p.vx * dt_ms / 1000;
-        p.y = p.y + p.vy * dt_ms / 1000;
-        p.z = p.z + p.vz * dt_ms / 1000;
-        if (p.gravity_z != 0) {
-            p.vz = p.vz + p.gravity_z * dt_ms / 1000;
+        p.x = p.x + p.vx * dt_s;
+        p.y = p.y + p.vy * dt_s;
+        p.z = p.z + p.vz * dt_s;
+        if (p.gravity_z != 0.0) {
+            p.vz = p.vz + p.gravity_z * dt_s;
         }
         p.elapsed_ms = p.elapsed_ms + dt_ms;
         if (p.elapsed_ms >= p.lifetime_ms) {

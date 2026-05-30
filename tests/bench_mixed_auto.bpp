@@ -1,0 +1,52 @@
+// tests/bench_mixed_auto.bpp — benchmark + cross-backend correctness for
+// MIXED-TYPE `auto` declarations (a float, integers, and a sub-word slice all
+// on ONE line). This is the exact shape the per-declarator type-hint fix
+// (2026-05-29) made correct: before it, a trailing `: float` / `: byte`
+// flooded the whole line, so `i` below would have been narrowed to a byte
+// loop counter (wrapping at 256 → the loop never reaches 2_000_000) on the
+// `--c` backend, and float pointer-math crashed on the native one.
+//
+// Every accumulated value is kept an exact integer (sums of small ints), so
+// the checksum is bit-identical on the native and `--c` backends — any
+// divergence means a backend mis-typed one of the mixed locals. Driven by
+// tests/bench_mixed_auto.sh (builds + times both backends, asserts a match).
+
+// Hot kernel. The first declaration mixes float + int + byte on one line; the
+// second adds a half. Per-declarator typing must give: sum=float, i=int,
+// mask=byte, acc=half — NOT all-float and NOT all-byte.
+//
+// The two `W010 narrowing` warnings (word -> half / byte) are EXPECTED: the
+// slice assignments deliberately store a wider value into a sub-word local.
+// They are the proof that `mask`/`acc` really are slice-typed, not flooded.
+kernel(n) {
+    auto sum: float, i, mask: byte;
+    auto acc: half;
+    sum = 0.0;
+    acc = 0;
+    i = 0;
+    while (i < n) {
+        mask = i & 0x3F;        // 0..63 — a byte-sliced value
+        acc  = acc + mask;      // 32-bit slice accumulate (exact for this n)
+        sum  = sum + mask;      // float accumulate of integers (exact in f64)
+        i = i + 1;
+    }
+    // Both halves are exact integers, so the result is deterministic and
+    // identical across the native and --c backends.
+    return trunc_int(sum) + acc;
+}
+
+main() {
+    auto n, reps, r, total;
+    n     = 2000000;
+    reps  = 16;
+    total = 0;
+    r = 0;
+    while (r < reps) {
+        total = total + kernel(n);
+        r = r + 1;
+    }
+    put("mixed_auto checksum=");
+    putnum(total);
+    put("\n");
+    return 0;
+}

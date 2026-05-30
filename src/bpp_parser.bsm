@@ -122,6 +122,14 @@ extrn TK_FLOAT;
 // TY_FLOAT or TY_WORD when the annotation is a primitive name.
 static auto _prim_hint;
 
+// Resolved struct index from the most recent annotation parse, or -1 when the
+// annotation was not a struct type. Lets the grouped-annotation path
+// (`auto (a, b): MyStruct`) re-apply one parsed struct type to every name in
+// the group via set_var_type — try_type_annotation(0) skips the per-var
+// attachment, so the group does it itself. Reset at the top of every
+// try_type_annotation; set in parse_type_expr's struct branch.
+static auto _struct_hint;
+
 // Block nesting depth. 0 = function top level. Incremented by parse_body
 // when called from if/while/for. Used to warn about auto inside blocks.
 static auto _block_depth;
@@ -771,7 +779,7 @@ static _make_inc_assign(lhs, op_ch) {
 // Desugar x += rhs → T_ASSIGN(lhs, T_BINOP(op_ch, lhs, rhs)).
 // Also handles T_MEMLD on lhs: mirrors the T_MEMST path of plain '='.
 static _make_compound_assign(op_ch, lhs, rhs) {
-    auto binop: Node, node: Node, ln: Node;
+    auto (binop, node, ln): Node;
     binop = make_node(T_BINOP);
     binop.a = _make_op_char(op_ch);
     binop.b = lhs;
@@ -1161,6 +1169,7 @@ static void parse_type_expr(var_p) {
     idx = struct_find(type_p);
     if (idx >= 0) {
         if (var_p != 0) { set_var_type(var_p, idx); }
+        _struct_hint = idx;   // captured for grouped `auto (a, b): Struct`
         // Lossy encoding for struct types inside func-type recursion:
         // Session 1 has no checking, so collapsing to TY_STRUCT loses no
         // safety. Session 2 will extend the fn-type record to preserve
@@ -1259,6 +1268,7 @@ static parse_fn_type() {
 static void try_type_annotation(var_p) {
     auto tl, ts, type_p;
     _prim_hint = 0;
+    _struct_hint = 0 - 1;
     _serial_hint = 0;
     if (val_is_ch(':') == 0) { return; }
     consume();
@@ -2502,7 +2512,7 @@ static _build_profile_zone(zone_name_p) {
     body_arr = parse_body();
     body_cnt = last_list_cnt;
 
-    auto name_lit1: Node, name_lit2: Node;
+    auto (name_lit1, name_lit2): Node;
     name_lit1 = make_node(T_LIT);
     name_lit1.a = zone_name_p;
     name_lit2 = make_node(T_LIT);
@@ -2584,20 +2594,48 @@ static parse_statement() {
             dh_arr = arr_new();
             dh_has = 0;
             list_begin();
-            var_p = cur_packed();
-            list_push(var_p);
-            consume();
-            try_type_annotation(var_p);
-            dh_arr = arr_push(dh_arr, _prim_hint);
-            if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+            // Each declarator is either a single `name [: T]` or a
+            // parenthesized group `(a, b, c): T` whose shared type applies to
+            // EVERY name in it (the grouped-annotation sugar — Rule 43). The
+            // group's type is parsed ONCE and pushed per-member, so the
+            // per-declarator hint array (node.e) stays parallel to the name
+            // list (node.a). A `(` can only begin a group here: this is the
+            // declarator position, not an expression, so there is nothing (no
+            // call, no parenthesised expr) to confuse it with.
+            auto _first, _grp, _gi, _gn, _gv;
+            _first = 1;
             while (val_is_ch(';') == 0) {
-                if (val_is_ch(',')) { consume(); }
-                var_p = cur_packed();
-                list_push(var_p);
-                consume();
-                try_type_annotation(var_p);
-                dh_arr = arr_push(dh_arr, _prim_hint);
-                if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+                if (_first == 0 && val_is_ch(',')) { consume(); }
+                _first = 0;
+                if (val_is_ch('(')) {
+                    consume();                       // '('
+                    _grp = arr_new();
+                    while (val_is_ch(')') == 0) {
+                        _gv = cur_packed();
+                        list_push(_gv);
+                        _grp = arr_push(_grp, _gv);
+                        consume();
+                        if (val_is_ch(',')) { consume(); }
+                    }
+                    consume();                       // ')'
+                    try_type_annotation(0);          // parse the shared `: T` once
+                    _gn = arr_len(_grp);
+                    for (_gi = 0; _gi < _gn; _gi++) {
+                        dh_arr = arr_push(dh_arr, _prim_hint);
+                        if (_struct_hint >= 0) {
+                            set_var_type(arr_get(_grp, _gi), _struct_hint);
+                        }
+                    }
+                    if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+                    arr_free(_grp);
+                } else {
+                    var_p = cur_packed();
+                    list_push(var_p);
+                    consume();
+                    try_type_annotation(var_p);
+                    dh_arr = arr_push(dh_arr, _prim_hint);
+                    if (_prim_hint > 0) { decl_hint = _prim_hint; dh_has = 1; }
+                }
             }
             consume();
             node = make_node(T_DECL);
@@ -2764,7 +2802,7 @@ static parse_binops(left, min_prec) {
         fold_ok = 0;
         folded = 0;
         if (is_int_lit_node(left) && is_int_lit_node(right)) {
-            auto left_n: Node, right_n: Node;
+            auto (left_n, right_n): Node;
             left_n = left;
             right_n = right;
             lv = parse_int_lit_value(left_n.a);

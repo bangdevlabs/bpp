@@ -3586,3 +3586,154 @@ This is why this rule exists, and why it is worth defending hard.
   this rule is sustainable.
 - Rule 33 — cartridge generality tiers; complement to Rule 41 at
   the cartridge level.
+
+## Rule 42: A `: float` declarator floats EVERY local in the same `auto`
+
+> **RESOLVED 2026-05-29 — the compiler now applies type hints per-declarator.**
+> `pre_reg_vars` (a64 + x64) and the inline-register path read the parser's
+> per-name hint array `n.e[j]` via `cg_decl_var_hint` instead of the
+> statement-wide `n.c`, so a `: float` (or `: byte`) annotation stays on its
+> own variable. `auto pr: Projectile, i, cap, p: WolfEntPayload, d: float;`
+> now types each correctly (verified by `bug --disasm`: zero `scvtf` on the
+> int/pointer ops). **You no longer need to isolate floats on their own
+> `auto` line** — the prescription below is kept only as historical context
+> for the bug and the diagnosis technique. (Residual: the `--c` emitter still
+> floods the *slice* width — `: byte`/`: half` — onto neighbouring non-float
+> names; its float handling is already per-variable and correct.)
+
+A single `: float`-typed local in an `auto` statement makes the
+compiler treat **all** of that statement's declarators as float —
+the explicit `: StructType` annotations and the untyped ints
+included. Struct-type annotations stay per-declarator, but float
+infects the whole comma list. Floating a local that holds a pointer
+is catastrophic: address arithmetic then runs through doubles, the
+resulting "address" is wrong (or rounds to zero), and the first
+store through it segfaults.
+
+The fix is mechanical: **put float locals on their own `auto` line;
+never mix them with struct- or int-typed locals.**
+
+```c
+// WRONG — the trailing `: float` floats pr, i, cap AND p too.
+// `p = ecs_component_at(...)` becomes (double)base + i*size, so p
+// lands near null and `p.hp = ...` faults.
+auto pr: Projectile, i, cap, p: WolfEntPayload, d: float;
+
+// RIGHT — structs + ints on one line, floats isolated on another.
+auto pr: Projectile, p: WolfEntPayload, i, cap;
+auto d: float;
+```
+
+### Why float and not struct types
+
+A struct annotation is a per-declarator "shape"; `: float` flips a
+numeric base flag the codegen tracks for the whole `auto` statement.
+So `auto a: S, b, c: T;` types a, b, c independently, but
+`auto a: S, b, c: float;` floats all three. The asymmetry is a
+compiler wart, not a feature — until it is fixed, this convention is
+the guardrail.
+
+### When the rule applies
+
+- ANY `auto` that declares a float local alongside a pointer, a
+  struct-typed local, an index, a count, or untyped scratch.
+- Especially callback bodies and tick/step loops that mix an entity
+  or `Projectile` pointer with a `: float` distance or `dt`.
+
+### When it does NOT apply
+
+- An `auto` whose declarators are ALL float
+  (`auto x: float, y: float;`) — everything is float anyway, so
+  there is nothing to corrupt.
+- An `auto` with NO float (`auto p: S, i, cap;`) — struct/int
+  annotations are correctly per-declarator.
+
+### Worked example — fps_wolf3d bullet crash (2026-05-29)
+
+`_proj_hit_check`, the per-bullet collision callback, declared
+`auto pr: Projectile, i, cap, p: WolfEntPayload, d: float;`. Firing
+a bullet SIGSEGV'd with a byte-write fault at `0x22` (a null
+`WolfEntPayload*` plus the `hp` field offset 34). The melee loop a
+few lines down never crashed because it isolates its floats:
+`auto pb: FPSBody, i, cap, p: WolfEntPayload, alive;` then a separate
+`auto fdx: float, fdy: float, d: float;`.
+
+Diagnosed with `bug --disasm` (the arm64/Mach-O objdump-in-bug): the
+function emitted `scvtf d0, x0` on `pr = slot` and computed
+`(double)wolf_payload + i*42` in floating point — a pointer built
+through doubles. The tell for this bug class is **`scvtf` on a
+pointer/struct assignment**. A minimal probe
+(`auto p: S, i, x: float;`) reproduced it; splitting `x` onto its
+own line made `p` and `i` integer again.
+
+### Cross-references
+
+- Memory `feedback_float_infects_mixed_auto` — the same finding.
+- The float family of pitfalls (const-float-demote, float-arg
+  boundary, write_f32/peekfloat width mismatch) — all "float is
+  handled specially, mind the seams."
+- Rule 4 — when the compiler grows per-declarator float typing (or a
+  `W0xx` warning for the mixed case), enforcement of this rule moves
+  from convention to diagnostic.
+- `bug --disasm <bin> <fn>` (`docs/manual/debug_with_bug.md`) — the
+  tool that pinned it; `scvtf` on a pointer op is the signature.
+
+## Rule 43: Group a run of same-typed locals with `auto (a, b, c): T`
+
+When two or more locals in one `auto` share a type, declare them as a
+**parenthesized group** — `auto (a, b, c): T;` types every name in the
+group as `T` — instead of repeating the annotation on each name.
+
+```c
+// Verbose — the annotation repeats on every name.
+auto dx: float, dy: float, dist: float;
+
+// Grouped — one type for the cluster. Same AST, same codegen, less noise.
+auto (dx, dy, dist): float;
+```
+
+It works for ANY annotation, not just float: `auto (a, b): MyStruct;`,
+`auto (lo, hi): half;`. The group's type is parsed once and applied to
+each member, so it composes exactly with Rule 42's per-declarator
+typing — a `(group): T` is N independent `name: T` declarators written
+short, nothing more.
+
+### Mixing groups with single declarators
+
+A group is just one declarator form; mix it freely with ungrouped names
+on the same line:
+
+```c
+auto (x, y): float, n, scratch;   // x,y float; n,scratch int
+auto p: Pos, (a, b): Sheet;       // p one struct; a,b another
+```
+
+### Why parens, and why only in the declarator position
+
+B++ uses `:` for "has type T" and `->` for "returns T", so a group's
+type can never collide with a return type. The group lives in the
+**declarator position** (`auto (...)`) — NOT after a closing `)` on a
+function signature, where `name(...) : T` is not even valid (returns
+use `->`). A `(` right after `auto` or a comma is unambiguous: that is
+not expression context, so there is no call or parenthesised expression
+to confuse it with.
+
+### When NOT to group
+
+- A single typed local — `auto x: float;` is already minimal.
+- Genuinely heterogeneous locals — don't force a group; use separate
+  groups or per-name annotations (`auto (x, y): float, n: byte;`).
+- Don't group just to shave a line at the cost of clarity. Group when
+  the names are a **cohesive cluster of the same type** — vector
+  components, paired bounds, a batch of float accumulators, a row of
+  ECS component pointers of one type.
+
+### Cross-references
+
+- Rule 42 (RESOLVED) — per-declarator typing is the foundation this
+  sugar sits on; grouping is N per-declarator hints written once. The
+  grouped form is the ergonomic answer to the verbosity
+  (`auto x: float, y: float, z: float`) that motivated the whole arc.
+- Parser: `bpp_parser.bsm` — the grouped declarator is parsed in the
+  `auto` branch of `parse_statement`; `_struct_hint` carries the
+  resolved struct id so a struct group re-applies one type to N names.
