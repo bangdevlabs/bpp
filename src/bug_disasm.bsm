@@ -1,20 +1,26 @@
-// bug_disasm.bsm -- a minimal x86-64 disassembler for the `bug` debugger.
+// bug_disasm.bsm -- a minimal disassembler for the `bug` debugger, covering
+// BOTH backends: x86-64 (Linux ELF) and AArch64 (macOS Mach-O).
 //
-// This is "objdump inside bug": it decodes the SUBSET of x86-64 that the B++
-// backend emits -- enough to read a function's codegen and spot operand-order
-// bugs (e.g. `sub rax, rcx` computing `16 - arr` instead of `arr - 16`) and
-// wild addresses without leaving the toolchain. It is NOT a complete x86
-// decoder; anything outside the backend's instruction vocabulary prints as
-// `.byte 0xNN` so the stream stays aligned-ish and the reader sees the gap.
+// This is "objdump inside bug": it decodes the SUBSET each backend emits --
+// enough to read a function's codegen and spot operand-order bugs (e.g.
+// `sub rax, rcx` computing `16 - arr` instead of `arr - 16`) and wild
+// addresses without leaving the toolchain. It is NOT a complete decoder for
+// either ISA; anything outside the backend's vocabulary prints as `.byte 0xNN`
+// (x86) / `.word 0x........` (A64) so the stream stays aligned and the reader
+// sees the gap. (A64 is fixed-width 4-byte, so resync there is automatic.)
 //
 // Entry point: disasm_range(buf, start_fp, disp_off, nbytes) decodes
 // instructions starting at file offset start_fp in `buf`, displaying each
 // instruction's offset as disp_off + (fp - start_fp) -- so the labels match
-// the .bug address map's code-relative coordinate. Used by `bug --disasm`.
+// the .bug address map's code-relative coordinate. It picks the decoder from
+// `bug_target` (0 = ARM64, 1 = x86_64), which bug_parse() read from the .bug
+// map header -- so a macOS `bug` reading a Linux ELF disassembles x86-64, and
+// vice-versa. Used by `bug --disasm`.
 //
-// Register naming is always 64-bit (rax..r15); operand WIDTH is not rendered
-// because for codegen debugging the register identity and the operand
-// DIRECTION are what matter, not whether a move was 32 or 64 bits wide.
+// x86 register naming is always 64-bit (rax..r15) because for codegen
+// debugging the register identity and operand DIRECTION matter more than
+// whether a move was 32 or 64 bits wide. A64 honors the sf bit (x vs w) since
+// the backend's width choices there are load-bearing (e.g. ldrb w0 / ldrsw x0).
 
 import "bug_shared.bsm";
 
@@ -338,12 +344,556 @@ static _dis1(buf, fp, show_off) {
     return (p - fp) + 1;
 }
 
+// ── AArch64 decoder ───────────────────────────────────────────
+//
+// The native (macOS) target is arm64 Mach-O, so the same "objdump inside bug"
+// has to read A64 as well as x86-64. A64 is fixed-width (every instruction is
+// 4 bytes), which makes both decoding AND resync trivial: an unrecognized word
+// prints as `.word 0x........` and the stream stays aligned automatically.
+// This covers the SUBSET the B++ backend emits, calibrated against `otool -tV`.
+
+// Read an unsigned little-endian 32-bit word at buf+off.
+static _rd32u(buf, off) {
+    return (peek(buf + off) & 0xFF)
+         | ((peek(buf + off + 1) & 0xFF) << 8)
+         | ((peek(buf + off + 2) & 0xFF) << 16)
+         | ((peek(buf + off + 3) & 0xFF) << 24);
+}
+
+// GPR name. Registers 0..30 print as x0..x30 (sf!=0) or w0..w30 (sf==0);
+// register 31 is the zero register (xzr / wzr) in this context.
+static _arn(r, sf) {
+    if (r == 31) { if (sf != 0) { out_str("xzr"); } else { out_str("wzr"); } return 0; }
+    if (sf != 0) { out_ch('x'); } else { out_ch('w'); }
+    out_int(r);
+    return 0;
+}
+
+// GPR name where register 31 denotes the stack pointer (the base of a memory
+// operand, or an add/sub-immediate operand) rather than the zero register.
+static _arnsp(r, sf) {
+    if (r == 31) { out_str("sp"); return 0; }
+    if (sf != 0) { out_ch('x'); } else { out_ch('w'); }
+    out_int(r);
+    return 0;
+}
+
+// Scalar FP register name: ty 1 -> dN (double), 3 -> hN (half), else sN.
+static _frn(r, ty) {
+    if (ty == 1)      { out_ch('d'); }
+    else if (ty == 3) { out_ch('h'); }
+    else              { out_ch('s'); }
+    out_int(r);
+    return 0;
+}
+
+// Print a signed immediate as a bare "0x.." (positive) or "-0x.." (negative) —
+// used inside a `#..` memory displacement, where objdump omits the leading +.
+static _simm(d) {
+    if (d < 0) { out_str("-0x"); _dhx(0 - d); }
+    else        { out_str("0x"); _dhx(d); }
+}
+
+// Barrier operand (CRm) for dmb / dsb.
+static _barrier(crm) {
+    if (crm == 0xf) { out_str("sy");    return 0; }
+    if (crm == 0xb) { out_str("ish");   return 0; }
+    if (crm == 0xa) { out_str("ishst"); return 0; }
+    if (crm == 0x9) { out_str("ishld"); return 0; }
+    if (crm == 0xe) { out_str("st");    return 0; }
+    if (crm == 0xd) { out_str("ld");    return 0; }
+    if (crm == 0x7) { out_str("nsh");   return 0; }
+    if (crm == 0x3) { out_str("osh");   return 0; }
+    out_str("#"); out_int(crm);
+    return 0;
+}
+
+// Condition-code suffix for b.cc / cset.
+static _acc(c) {
+    if (c == 0)  { out_str("eq"); return 0; }
+    if (c == 1)  { out_str("ne"); return 0; }
+    if (c == 2)  { out_str("hs"); return 0; }
+    if (c == 3)  { out_str("lo"); return 0; }
+    if (c == 4)  { out_str("mi"); return 0; }
+    if (c == 5)  { out_str("pl"); return 0; }
+    if (c == 6)  { out_str("vs"); return 0; }
+    if (c == 7)  { out_str("vc"); return 0; }
+    if (c == 8)  { out_str("hi"); return 0; }
+    if (c == 9)  { out_str("ls"); return 0; }
+    if (c == 10) { out_str("ge"); return 0; }
+    if (c == 11) { out_str("lt"); return 0; }
+    if (c == 12) { out_str("gt"); return 0; }
+    if (c == 13) { out_str("le"); return 0; }
+    if (c == 14) { out_str("al"); return 0; }
+    out_str("nv");
+    return 0;
+}
+
+// Print a load/store memory operand. mode: 0 = offset ([Rn] when imm==0, else
+// [Rn, #imm]); 1 = post-index ([Rn], #imm); 3 = pre-index ([Rn, #imm]!).
+static _amem(Rn, imm, mode) {
+    out_str("["); _arnsp(Rn, 1);
+    if (mode == 1) { out_str("], #"); _simm(imm); return 0; }
+    if (imm != 0 || mode == 3) { out_str(", #"); _simm(imm); }
+    out_str("]");
+    if (mode == 3) { out_str("!"); }
+    return 0;
+}
+
+// Print a load/store mnemonic + the transfer register Rt, choosing both from
+// size/V/opc. Shared by the immediate-offset and register-offset forms.
+static _ld_head(sz, V, opc, Rt) {
+    auto rw;
+    if (V != 0) {                                  // FP/SIMD: sz 3 -> d, 2 -> s
+        if ((opc & 1) != 0) { out_str("ldr  "); } else { out_str("str  "); }
+        if (sz == 3) { _frn(Rt, 1); } else { _frn(Rt, 0); }
+        return 0;
+    }
+    rw = 0;
+    if (sz == 3) {
+        if (opc == 0) { out_str("str  "); } else { out_str("ldr  "); }
+        rw = 1;
+    } else if (sz == 2) {
+        if (opc == 0) { out_str("str  "); } else if (opc == 1) { out_str("ldr  "); }
+        else { out_str("ldrsw "); rw = 1; }
+    } else if (sz == 1) {
+        if (opc == 0) { out_str("strh "); } else if (opc == 1) { out_str("ldrh "); }
+        else { out_str("ldrsh "); if (opc == 2) { rw = 1; } }
+    } else {
+        if (opc == 0) { out_str("strb "); } else if (opc == 1) { out_str("ldrb "); }
+        else { out_str("ldrsb "); if (opc == 2) { rw = 1; } }
+    }
+    _arn(Rt, rw);
+    return 0;
+}
+
+// Emit a load/store with an immediate memory operand. `mode` -> _amem.
+static _ld_emit(sz, V, opc, Rt, Rn, imm, mode) {
+    _ld_head(sz, V, opc, Rt);
+    out_str(", "); _amem(Rn, imm, mode); out_nl();
+    return 0;
+}
+
+// Decode ONE A64 instruction at file offset fp, displaying it at code-relative
+// offset show_off. Always advances 4 bytes (fixed width). Branch / load-pc
+// targets resolve to code-relative offsets matching the .bug address map.
+static _dis1_arm64(buf, fp, show_off) {
+    auto insn, sf, op, S, opc, Rd, Rn, Rm, Ra, imm, sh, cond, sz, V, mode;
+    auto hw, immr, imms, opc2, ty, rmode, fopc;
+
+    out_str("  +"); _dhx(show_off); out_str(":  ");
+    insn = _rd32u(buf, fp);
+
+    if (insn == 0xd503201f) { out_str("nop"); out_nl(); return 4; }
+    if (insn == 0xd503203f) { out_str("yield"); out_nl(); return 4; }
+
+    // ret / br / blr
+    if ((insn & 0xfffffc1f) == 0xd65f0000) { out_str("ret"); out_nl(); return 4; }
+    if ((insn & 0xfffffc1f) == 0xd61f0000) { out_str("br   "); _arn((insn >> 5) & 0x1f, 1); out_nl(); return 4; }
+    if ((insn & 0xfffffc1f) == 0xd63f0000) { out_str("blr  "); _arn((insn >> 5) & 0x1f, 1); out_nl(); return 4; }
+
+    // svc #imm16  (Darwin syscalls are svc #0x80)
+    if ((insn & 0xffe0001f) == 0xd4000001) { out_str("svc  #"); _dh((insn >> 5) & 0xffff); out_nl(); return 4; }
+
+    // memory barriers: dmb / dsb / isb (emitted around atomics + thread sync)
+    if ((insn & 0xfffff0ff) == 0xd50330bf) { out_str("dmb  "); _barrier((insn >> 8) & 0xf); out_nl(); return 4; }
+    if ((insn & 0xfffff0ff) == 0xd503309f) { out_str("dsb  "); _barrier((insn >> 8) & 0xf); out_nl(); return 4; }
+    if ((insn & 0xfffff0ff) == 0xd50330df) { out_str("isb"); out_nl(); return 4; }
+
+    // b / bl  (op 00101 imm26) — target is code-relative.
+    if (((insn >> 26) & 0x1f) == 0x05) {
+        imm = insn & 0x3ffffff;
+        if ((imm & 0x2000000) != 0) { imm = imm - 0x4000000; }
+        if ((insn >> 31) != 0) { out_str("bl   "); } else { out_str("b    "); }
+        _dh(show_off + imm * 4); out_nl();
+        return 4;
+    }
+
+    // b.cond  (0101 0100 imm19 0 cond)
+    if (((insn >> 24) & 0xff) == 0x54) {
+        imm = (insn >> 5) & 0x7ffff;
+        if ((imm & 0x40000) != 0) { imm = imm - 0x80000; }
+        out_str("b."); _acc(insn & 0xf); out_str(" "); _dh(show_off + imm * 4); out_nl();
+        return 4;
+    }
+
+    // cbz / cbnz  (sf 011010 op imm19 Rt)
+    if (((insn >> 25) & 0x3f) == 0x1a) {
+        sf  = (insn >> 31) & 1;
+        imm = (insn >> 5) & 0x7ffff;
+        if ((imm & 0x40000) != 0) { imm = imm - 0x80000; }
+        if (((insn >> 24) & 1) != 0) { out_str("cbnz "); } else { out_str("cbz  "); }
+        _arn(insn & 0x1f, sf); out_str(", "); _dh(show_off + imm * 4); out_nl();
+        return 4;
+    }
+
+    // adrp / adr  (op immlo 10000 immhi Rd)
+    if (((insn >> 24) & 0x1f) == 0x10) {
+        Rd  = insn & 0x1f;
+        imm = (((insn >> 5) & 0x7ffff) << 2) | ((insn >> 29) & 3);
+        if ((imm & 0x100000) != 0) { imm = imm - 0x200000; }
+        if ((insn >> 31) != 0) { out_str("adrp "); _arn(Rd, 1); out_str(", "); _sdisp(imm * 4096); }
+        else                   { out_str("adr  "); _arn(Rd, 1); out_str(", "); _sdisp(imm); }
+        out_nl();
+        return 4;
+    }
+
+    // movz / movn / movk  (sf opc 100101 hw imm16 Rd)
+    if (((insn >> 23) & 0x3f) == 0x25) {
+        sf  = (insn >> 31) & 1;
+        opc = (insn >> 29) & 3;
+        hw  = (insn >> 21) & 3;
+        imm = (insn >> 5) & 0xffff;
+        Rd  = insn & 0x1f;
+        if (opc == 2 && hw == 0)      { out_str("mov  "); _arn(Rd, sf); out_str(", #"); _dh(imm); }
+        else if (opc == 2)            { out_str("movz "); _arn(Rd, sf); out_str(", #"); _dh(imm); out_str(", lsl #"); out_int(hw * 16); }
+        else if (opc == 3)            { out_str("movk "); _arn(Rd, sf); out_str(", #"); _dh(imm); if (hw != 0) { out_str(", lsl #"); out_int(hw * 16); } }
+        else                          { out_str("movn "); _arn(Rd, sf); out_str(", #"); _dh(imm); if (hw != 0) { out_str(", lsl #"); out_int(hw * 16); } }
+        out_nl();
+        return 4;
+    }
+
+    // add / sub immediate  (sf op S 100010 sh imm12 Rn Rd)
+    if (((insn >> 23) & 0x3f) == 0x22) {
+        sf  = (insn >> 31) & 1;
+        op  = (insn >> 30) & 1;
+        S   = (insn >> 29) & 1;
+        imm = (insn >> 10) & 0xfff;
+        Rn  = (insn >> 5) & 0x1f;
+        Rd  = insn & 0x1f;
+        if (((insn >> 22) & 1) != 0) { imm = imm << 12; }
+        if (op == 0 && S == 0 && imm == 0 && (Rd == 31 || Rn == 31)) {
+            out_str("mov  "); _arnsp(Rd, sf); out_str(", "); _arnsp(Rn, sf); out_nl(); return 4;
+        }
+        if (S != 0 && Rd == 31) {
+            if (op != 0) { out_str("cmp  "); } else { out_str("cmn  "); }
+            _arnsp(Rn, sf); out_str(", #"); _dh(imm); out_nl(); return 4;
+        }
+        if (op != 0) { out_str("sub  "); } else { out_str("add  "); }
+        _arnsp(Rd, sf); out_str(", "); _arnsp(Rn, sf); out_str(", #"); _dh(imm); out_nl();
+        return 4;
+    }
+
+    // logical shifted register  (sf opc 01010 shift N Rm imm6 Rn Rd)
+    if (((insn >> 24) & 0x1f) == 0x0a) {
+        sf   = (insn >> 31) & 1;
+        opc  = (insn >> 29) & 3;
+        sh   = (insn >> 22) & 3;
+        Rm   = (insn >> 16) & 0x1f;
+        imms = (insn >> 10) & 0x3f;
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        if (opc == 1 && Rn == 31 && imms == 0 && sh == 0) {
+            out_str("mov  "); _arn(Rd, sf); out_str(", "); _arn(Rm, sf); out_nl(); return 4;
+        }
+        if (opc == 3 && Rd == 31) { out_str("tst  "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf); }
+        else {
+            if (opc == 0)      { out_str("and  "); }
+            else if (opc == 1) { out_str("orr  "); }
+            else if (opc == 2) { out_str("eor  "); }
+            else               { out_str("ands "); }
+            _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf);
+        }
+        if (imms != 0) {
+            if (sh == 0)      { out_str(", lsl #"); }
+            else if (sh == 1) { out_str(", lsr #"); }
+            else if (sh == 2) { out_str(", asr #"); }
+            else              { out_str(", ror #"); }
+            out_int(imms);
+        }
+        out_nl();
+        return 4;
+    }
+
+    // add / sub shifted register  (sf op S 01011 shift 0 Rm imm6 Rn Rd)
+    if (((insn >> 24) & 0x1f) == 0x0b && ((insn >> 21) & 1) == 0) {
+        sf   = (insn >> 31) & 1;
+        op   = (insn >> 30) & 1;
+        S    = (insn >> 29) & 1;
+        sh   = (insn >> 22) & 3;
+        Rm   = (insn >> 16) & 0x1f;
+        imms = (insn >> 10) & 0x3f;
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        if (S != 0 && Rd == 31) {
+            if (op != 0) { out_str("cmp  "); } else { out_str("cmn  "); }
+            _arn(Rn, sf); out_str(", "); _arn(Rm, sf);
+        } else {
+            if (op != 0) { out_str("sub  "); } else { out_str("add  "); }
+            _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf);
+        }
+        if (imms != 0) {
+            if (sh == 0)      { out_str(", lsl #"); }
+            else if (sh == 1) { out_str(", lsr #"); }
+            else              { out_str(", asr #"); }
+            out_int(imms);
+        }
+        out_nl();
+        return 4;
+    }
+
+    // madd / msub / mul / mneg  (sf 00 11011 000 Rm o0 Ra Rn Rd)
+    if (((insn >> 24) & 0x1f) == 0x1b) {
+        sf  = (insn >> 31) & 1;
+        Rm  = (insn >> 16) & 0x1f;
+        op  = (insn >> 15) & 1;
+        Ra  = (insn >> 10) & 0x1f;
+        Rn  = (insn >> 5) & 0x1f;
+        Rd  = insn & 0x1f;
+        if (Ra == 31) {
+            if (op != 0) { out_str("mneg "); } else { out_str("mul  "); }
+            _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf);
+        } else {
+            if (op != 0) { out_str("msub "); } else { out_str("madd "); }
+            _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf); out_str(", "); _arn(Ra, sf);
+        }
+        out_nl();
+        return 4;
+    }
+
+    // data-processing (2 source): udiv / sdiv / lslv / lsrv / asrv / rorv
+    //   (sf 0 0 11010110 Rm opcode Rn Rd) — distinguished by bits[28:21]=0xd6
+    if (((insn >> 21) & 0xff) == 0xd6) {
+        sf   = (insn >> 31) & 1;
+        Rm   = (insn >> 16) & 0x1f;
+        opc2 = (insn >> 10) & 0x3f;
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        op   = 1;
+        if (opc2 == 0x02)      { out_str("udiv "); }
+        else if (opc2 == 0x03) { out_str("sdiv "); }
+        else if (opc2 == 0x08) { out_str("lslv "); }
+        else if (opc2 == 0x09) { out_str("lsrv "); }
+        else if (opc2 == 0x0a) { out_str("asrv "); }
+        else if (opc2 == 0x0b) { out_str("rorv "); }
+        else { op = 0; }
+        if (op != 0) {
+            _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf); out_nl();
+            return 4;
+        }
+    }
+
+    // conditional select: csel / csinc (cset) / csinv (csetm) / csneg
+    //   (sf op S 11010100 Rm cond op2 Rn Rd) — bits[28:21]=0xd4
+    if (((insn >> 21) & 0xff) == 0xd4) {
+        sf   = (insn >> 31) & 1;
+        op   = (insn >> 30) & 1;
+        Rm   = (insn >> 16) & 0x1f;
+        cond = (insn >> 12) & 0xf;
+        opc2 = (insn >> 10) & 3;
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        // cset / csetm are csinc / csinv with both sources xzr and inverted cc.
+        if (op == 0 && opc2 == 1 && Rm == 31 && Rn == 31) { out_str("cset "); _arn(Rd, sf); out_str(", "); _acc(cond ^ 1); out_nl(); return 4; }
+        if (op == 1 && opc2 == 0 && Rm == 31 && Rn == 31) { out_str("csetm "); _arn(Rd, sf); out_str(", "); _acc(cond ^ 1); out_nl(); return 4; }
+        if (op == 0 && opc2 == 0)      { out_str("csel  "); }
+        else if (op == 0 && opc2 == 1) { out_str("csinc "); }
+        else if (op == 1 && opc2 == 0) { out_str("csinv "); }
+        else                           { out_str("csneg "); }
+        _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", "); _arn(Rm, sf); out_str(", "); _acc(cond);
+        out_nl();
+        return 4;
+    }
+
+    // bitfield ubfm / sbfm / bfm  (sf opc 100110 N immr imms Rn Rd) — with the
+    // lsl / lsr / asr aliases the backend actually emits for shift-by-constant.
+    if (((insn >> 23) & 0x3f) == 0x26) {
+        sf   = (insn >> 31) & 1;
+        opc  = (insn >> 29) & 3;
+        immr = (insn >> 16) & 0x3f;
+        imms = (insn >> 10) & 0x3f;
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        sz = 31; if (sf != 0) { sz = 63; }
+        if (opc == 2 && imms == sz)                        { out_str("lsr  "); _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", #"); out_int(immr); out_nl(); return 4; }
+        if (opc == 0 && imms == sz)                        { out_str("asr  "); _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", #"); out_int(immr); out_nl(); return 4; }
+        if (opc == 2 && imms != sz && imms + 1 == immr)    { out_str("lsl  "); _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", #"); out_int(sz - imms); out_nl(); return 4; }
+        if (opc == 0)      { out_str("sbfm "); }
+        else if (opc == 1) { out_str("bfm  "); }
+        else               { out_str("ubfm "); }
+        _arn(Rd, sf); out_str(", "); _arn(Rn, sf); out_str(", #"); out_int(immr); out_str(", #"); out_int(imms); out_nl();
+        return 4;
+    }
+
+    // load / store pair  (opc 101 V mode L imm7 Rt2 Rn Rt) — bits[29:27]=101
+    if (((insn >> 27) & 7) == 5 && ((insn >> 25) & 1) == 0) {
+        opc  = (insn >> 30) & 3;
+        V    = (insn >> 26) & 1;
+        mode = (insn >> 23) & 3;        // 01 post, 10 offset, 11 pre
+        op   = (insn >> 22) & 1;        // L
+        imm  = (insn >> 15) & 0x7f;
+        if ((imm & 0x40) != 0) { imm = imm - 0x80; }
+        Ra   = (insn >> 10) & 0x1f;     // Rt2
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;             // Rt
+        if (V != 0) {
+            if (opc == 0) { imm = imm * 4; } else { imm = imm * 8; }   // s=4, d=8
+            if (op != 0) { out_str("ldp  "); } else { out_str("stp  "); }
+            ty = 0; if (opc != 0) { ty = 1; }
+            _frn(Rd, ty); out_str(", "); _frn(Ra, ty);
+        } else {
+            sf = 1; if (opc == 0) { sf = 0; imm = imm * 4; } else { imm = imm * 8; }
+            if (op != 0) { out_str("ldp  "); } else { out_str("stp  "); }
+            _arn(Rd, sf); out_str(", "); _arn(Ra, sf);
+        }
+        out_str(", ");
+        // Pair addressing: post-index uses [Rn], #imm; pre uses [Rn, #imm]!;
+        // offset uses [Rn, #imm] (or [Rn] for 0). Reuse _amem's modes.
+        if (mode == 1)      { _amem(Rn, imm, 1); }
+        else if (mode == 3) { _amem(Rn, imm, 3); }
+        else                { _amem(Rn, imm, 0); }
+        out_nl();
+        return 4;
+    }
+
+    // load / store register, unsigned immediate offset
+    //   (size 111 V 01 opc imm12 Rn Rt)
+    if (((insn >> 27) & 7) == 7 && ((insn >> 24) & 3) == 1) {
+        sz  = (insn >> 30) & 3;
+        V   = (insn >> 26) & 1;
+        opc = (insn >> 22) & 3;
+        imm = ((insn >> 10) & 0xfff) << sz;     // scaled by access size
+        Rn  = (insn >> 5) & 0x1f;
+        Rd  = insn & 0x1f;
+        _ld_emit(sz, V, opc, Rd, Rn, imm, 0);
+        return 4;
+    }
+
+    // load / store register, register offset
+    //   (size 111 V 00 1 opc 1 Rm option S 10 Rn Rt) — e.g. ldrb w0, [x0, x1]
+    if (((insn >> 27) & 7) == 7 && ((insn >> 24) & 3) == 0 && ((insn >> 21) & 1) == 1 && ((insn >> 10) & 3) == 2) {
+        sz   = (insn >> 30) & 3;
+        V    = (insn >> 26) & 1;
+        opc  = (insn >> 22) & 3;
+        Rm   = (insn >> 16) & 0x1f;
+        op   = (insn >> 13) & 7;        // option (extend kind)
+        S    = (insn >> 12) & 1;        // scale flag (shift by access size)
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        _ld_head(sz, V, opc, Rd);
+        out_str(", ["); _arnsp(Rn, 1); out_str(", ");
+        if (op == 2 || op == 6) { _arn(Rm, 0); } else { _arn(Rm, 1); }   // uxtw/sxtw use Wm
+        if (op == 3) {                                                   // uxtx == lsl
+            if (S != 0) { out_str(", lsl #"); out_int(sz); }
+        } else {
+            out_str(", ");
+            if (op == 2)      { out_str("uxtw"); }
+            else if (op == 6) { out_str("sxtw"); }
+            else if (op == 7) { out_str("sxtx"); }
+            else              { out_str("uxtx"); }
+            if (S != 0) { out_str(" #"); out_int(sz); }
+        }
+        out_str("]"); out_nl();
+        return 4;
+    }
+
+    // load / store register, immediate pre/post/unscaled
+    //   (size 111 V 00 opc 0 imm9 mode Rn Rt)
+    if (((insn >> 27) & 7) == 7 && ((insn >> 24) & 3) == 0 && ((insn >> 21) & 1) == 0) {
+        sz   = (insn >> 30) & 3;
+        V    = (insn >> 26) & 1;
+        opc  = (insn >> 22) & 3;
+        imm  = (insn >> 12) & 0x1ff;
+        if ((imm & 0x100) != 0) { imm = imm - 0x200; }
+        mode = (insn >> 10) & 3;        // 00 unscaled (ldur), 01 post, 11 pre
+        Rn   = (insn >> 5) & 0x1f;
+        Rd   = insn & 0x1f;
+        _ld_emit(sz, V, opc, Rd, Rn, imm, mode);
+        return 4;
+    }
+
+    // scalar floating-point  (bits[28:24]=11110, bit21=1)
+    if (((insn >> 24) & 0x1f) == 0x1e && ((insn >> 21) & 1) == 1) {
+        ty = (insn >> 22) & 3;          // 00 single, 01 double
+        // fp <-> int conversions: bits[15:10]==000000
+        if (((insn >> 10) & 0x3f) == 0) {
+            sf    = (insn >> 31) & 1;
+            rmode = (insn >> 19) & 3;
+            fopc  = (insn >> 16) & 7;
+            Rn    = (insn >> 5) & 0x1f;
+            Rd    = insn & 0x1f;
+            if (rmode == 0 && fopc == 2)      { out_str("scvtf "); _frn(Rd, ty); out_str(", "); _arn(Rn, sf); }
+            else if (rmode == 0 && fopc == 3) { out_str("ucvtf "); _frn(Rd, ty); out_str(", "); _arn(Rn, sf); }
+            else if (rmode == 3 && fopc == 0) { out_str("fcvtzs "); _arn(Rd, sf); out_str(", "); _frn(Rn, ty); }
+            else if (rmode == 3 && fopc == 1) { out_str("fcvtzu "); _arn(Rd, sf); out_str(", "); _frn(Rn, ty); }
+            else if (rmode == 0 && fopc == 6) { out_str("fmov "); _arn(Rd, sf); out_str(", "); _frn(Rn, ty); }
+            else if (rmode == 0 && fopc == 7) { out_str("fmov "); _frn(Rd, ty); out_str(", "); _arn(Rn, sf); }
+            else                              { out_str(".word "); _dh(insn); }
+            out_nl();
+            return 4;
+        }
+        // fcmp: bits[15:14]=00, bits[13:10]=1000
+        if (((insn >> 14) & 3) == 0 && ((insn >> 10) & 0xf) == 8) {
+            Rm = (insn >> 16) & 0x1f;
+            Rn = (insn >> 5) & 0x1f;
+            out_str("fcmp "); _frn(Rn, ty);
+            if ((insn & 8) != 0) { out_str(", #0.0"); } else { out_str(", "); _frn(Rm, ty); }
+            out_nl();
+            return 4;
+        }
+        // fp data-processing, 2 source: bits[11:10]=10
+        if (((insn >> 10) & 3) == 2) {
+            Rm   = (insn >> 16) & 0x1f;
+            fopc = (insn >> 12) & 0xf;
+            Rn   = (insn >> 5) & 0x1f;
+            Rd   = insn & 0x1f;
+            if (fopc == 0)      { out_str("fmul "); }
+            else if (fopc == 1) { out_str("fdiv "); }
+            else if (fopc == 2) { out_str("fadd "); }
+            else if (fopc == 3) { out_str("fsub "); }
+            else if (fopc == 4) { out_str("fmax "); }
+            else if (fopc == 5) { out_str("fmin "); }
+            else                { out_str(".word "); _dh(insn); out_nl(); return 4; }
+            _frn(Rd, ty); out_str(", "); _frn(Rn, ty); out_str(", "); _frn(Rm, ty); out_nl();
+            return 4;
+        }
+        // fp data-processing, 1 source: bits[14:10]=10000
+        if (((insn >> 10) & 0x1f) == 0x10) {
+            fopc = (insn >> 15) & 0x3f;
+            Rn   = (insn >> 5) & 0x1f;
+            Rd   = insn & 0x1f;
+            // fcvt changes precision: opcode 0001xx, with the low 2 bits the
+            // destination type (0=s, 1=d, 3=h) and `ty` the source type.
+            if (fopc == 4 || fopc == 5 || fopc == 7) {
+                out_str("fcvt "); _frn(Rd, fopc & 3); out_str(", "); _frn(Rn, ty); out_nl();
+                return 4;
+            }
+            if (fopc == 0)      { out_str("fmov "); }
+            else if (fopc == 1) { out_str("fabs "); }
+            else if (fopc == 2) { out_str("fneg "); }
+            else if (fopc == 3) { out_str("fsqrt "); }
+            // frintN/P/M/Z/A/X/I — the rounding family the backend emits for
+            // floor_int / round_int / trunc_int (frintm = floor toward -inf).
+            else if (fopc == 8)  { out_str("frintn "); }
+            else if (fopc == 9)  { out_str("frintp "); }
+            else if (fopc == 10) { out_str("frintm "); }
+            else if (fopc == 11) { out_str("frintz "); }
+            else if (fopc == 12) { out_str("frinta "); }
+            else if (fopc == 14) { out_str("frintx "); }
+            else if (fopc == 15) { out_str("frinti "); }
+            else                 { out_str(".word "); _dh(insn); out_nl(); return 4; }
+            _frn(Rd, ty); out_str(", "); _frn(Rn, ty); out_nl();
+            return 4;
+        }
+        out_str(".word "); _dh(insn); out_nl();
+        return 4;
+    }
+
+    // Unknown — print the raw word; the 4-byte stride keeps the stream aligned.
+    out_str(".word "); _dh(insn); out_nl();
+    return 4;
+}
+
 // Decode and print instructions from file offset start_fp for nbytes bytes,
 // labelling each with code-relative offset disp_off + (fp - start_fp).
 // .bug v6 line table (from bug_reader). Lets --disasm interleave the source
 // line above the instructions it covers — objdump -l style, works statically
 // (no ptrace, so it's usable in Docker on cross-compiled binaries).
-extrn bug_ln_mod, bug_ln_line, bug_mod_names, bug_mod_count;
+//
+// `bug_target` (0 = ARM64, 1 = x86_64) comes from the .bug map header that
+// bug_parse() read, so the right decoder is selected from the file itself —
+// a macOS bug reading a Linux ELF picks x86-64, and vice-versa.
+extrn bug_ln_mod, bug_ln_line, bug_mod_names, bug_mod_count, bug_target;
 
 void disasm_range(buf, start_fp, disp_off, nbytes) {
     auto fp, end, ilen, off, lrow, last_line, last_mod, lmod, lline;
@@ -368,7 +918,8 @@ void disasm_range(buf, start_fp, disp_off, nbytes) {
                 last_mod  = lmod;
             }
         }
-        ilen = _dis1(buf, fp, off);
+        if (bug_target == 0) { ilen = _dis1_arm64(buf, fp, off); }
+        else                 { ilen = _dis1(buf, fp, off); }
         if (ilen <= 0) { ilen = 1; }
         fp = fp + ilen;
     }

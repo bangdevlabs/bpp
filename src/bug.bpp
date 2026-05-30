@@ -29,7 +29,7 @@ import "bug_brk.bsm";
 import "bug_runviz.bsm";
 import "bug_tui.bsm";
 import "bug_dump.bsm";     // .bug text-dump engine (shared with the_bug.bpp GUI)
-import "bug_disasm.bsm";   // x86-64 disassembler for --disasm (objdump-in-bug)
+import "bug_disasm.bsm";   // x86-64 + arm64 disassembler for --disasm (objdump-in-bug)
 
 // Scratch path buffer this entry owns (same role as the_bug's static pathbuf).
 static auto pathbuf;
@@ -96,6 +96,23 @@ static _cstr_has(s, ch) {
         c = str_peek(s, i);
     }
     return 0;
+}
+
+// Compare the NUL-padded fixed-width name field at buf+off (e.g. a Mach-O
+// 16-byte segname / sectname) to the C-string `name`. Returns 1 only when
+// `name` matches AND the field's next byte is the NUL pad — so "__text" does
+// not spuriously match a longer "__textfoo".
+static _field_eq(buf, off, name) {
+    auto i, c;
+    i = 0;
+    c = str_peek(name, 0);
+    while (c != 0) {
+        if ((peek(buf + off + i) & 0xFF) != c) { return 0; }
+        i++;
+        c = str_peek(name, i);
+    }
+    if ((peek(buf + off + i) & 0xFF) != 0) { return 0; }
+    return 1;
 }
 
 // -- Dump mode -- parse a .bug file and print every section to stdout.
@@ -190,6 +207,7 @@ static _hex2(b) {
 static auto _bx_buf;
 static auto _bx_fnoff;
 static auto _bx_filepos;
+static auto _bx_fnlen;     // bytes from this function's entry to the next (0 = unknown)
 
 // Open `bin_path`, read it, parse its ELF program headers to find the code
 // section's file offset, load `<bin_path>.bug`, and locate `fn_name` in the
@@ -205,6 +223,7 @@ static auto _bx_filepos;
 // not at the address-map `main` entry.
 static _bx_locate(bin_path, fn_name) {
     auto fd, blen, i, phoff, phentsize, phnum, ph, ptype, note_off, note_fsz, code_base, plen;
+    auto magic0, ncmds, lc, cmd, cmdsize, nsects, sec, s;
 
     fd = sys_open(bin_path, 0);
     if (fd < 0) { out_str("bug: cannot open "); out_str(bin_path); out_nl(); return 1; }
@@ -213,23 +232,62 @@ static _bx_locate(bin_path, fn_name) {
     sys_close(fd);
     if (blen <= 0) { out_str("bug: empty / short read"); out_nl(); return 1; }
 
-    if (peek(_bx_buf) != 0x7F) {
-        out_str("bug: ELF only for now (Mach-O is a follow-on)"); out_nl();
+    // Code-base derivation differs per container, but both formats end up with
+    // a single number: the file offset where the code section begins. The .bug
+    // address map stores each function code-relative to that point, so a
+    // function at address-map offset N sits at file offset code_base + N.
+    code_base = 0 - 1;
+    magic0 = peek(_bx_buf) & 0xFF;
+
+    if (magic0 == 0x7F) {
+        // ELF: layout is [ELF header][program headers][PT_NOTE][code], and the
+        // exec PT_LOAD has p_offset 0 — so code starts where PT_NOTE ends.
+        phoff     = read_u32(_bx_buf, 0x20);    // e_phoff
+        phentsize = read_u16(_bx_buf, 0x36);
+        phnum     = read_u16(_bx_buf, 0x38);
+        note_off = 0; note_fsz = 0;
+        for (i = 0; i < phnum; i++) {
+            ph = phoff + i * phentsize;
+            ptype = read_u32(_bx_buf, ph);
+            if (ptype == 4) {                          // PT_NOTE
+                note_off = read_u32(_bx_buf, ph + 8);     // p_offset
+                note_fsz = read_u32(_bx_buf, ph + 32);    // p_filesz
+            }
+        }
+        code_base = note_off + note_fsz;
+    } else if (magic0 == 0xCF) {
+        // Mach-O 64 (little-endian, thin — magic 0xFEEDFACF, first byte 0xCF).
+        // Walk the load commands for the __TEXT segment's __text section; its
+        // `offset` field is exactly where the code begins (the Mach header +
+        // load commands occupy the bytes before it). mach_header_64 is 32
+        // bytes with ncmds at +16; LC_SEGMENT_64 = 0x19; segment_command_64 has
+        // nsects at +64 and its sections (80 bytes each) start at +72; a
+        // section_64's file `offset` is the u32 at +48.
+        ncmds = read_u32(_bx_buf, 16);
+        lc = 32;
+        for (i = 0; i < ncmds; i++) {
+            cmd     = read_u32(_bx_buf, lc);
+            cmdsize = read_u32(_bx_buf, lc + 4);
+            if (cmd == 0x19 && _field_eq(_bx_buf, lc + 8, "__TEXT")) {
+                nsects = read_u32(_bx_buf, lc + 64);
+                sec = lc + 72;
+                for (s = 0; s < nsects; s++) {
+                    if (_field_eq(_bx_buf, sec, "__text")) {
+                        code_base = read_u32(_bx_buf, sec + 48);
+                    }
+                    sec = sec + 80;
+                }
+            }
+            lc = lc + cmdsize;
+        }
+    } else {
+        out_str("bug: unrecognized binary (not ELF or Mach-O 64)"); out_nl();
         return 1;
     }
-    phoff     = read_u32(_bx_buf, 0x20);    // e_phoff
-    phentsize = read_u16(_bx_buf, 0x36);
-    phnum     = read_u16(_bx_buf, 0x38);
-    note_off = 0; note_fsz = 0;
-    for (i = 0; i < phnum; i++) {
-        ph = phoff + i * phentsize;
-        ptype = read_u32(_bx_buf, ph);
-        if (ptype == 4) {                          // PT_NOTE
-            note_off = read_u32(_bx_buf, ph + 8);     // p_offset
-            note_fsz = read_u32(_bx_buf, ph + 32);    // p_filesz
-        }
+    if (code_base < 0) {
+        out_str("bug: could not locate the code section"); out_nl();
+        return 1;
     }
-    code_base = note_off + note_fsz;
 
     plen = copy_cstr(pathbuf, bin_path);
     poke(pathbuf + plen, '.'); poke(pathbuf + plen + 1, 'b');
@@ -244,6 +302,19 @@ static _bx_locate(bin_path, fn_name) {
     }
     if (_bx_fnoff < 0) { out_str("bug: no function '"); out_str(fn_name); out_str("' in the map"); out_nl(); return 1; }
     _bx_filepos = code_base + _bx_fnoff;
+
+    // Derive the function's byte length as the gap to the next entry in the
+    // address map — the nearest function offset strictly greater than ours.
+    // This lets --disasm cover the WHOLE function instead of a fixed window.
+    // 0 means "unknown" (the last function in the map); callers fall back.
+    auto best, cur;
+    best = 0 - 1;
+    for (i = 0; i < bug_am_count; i++) {
+        cur = arr_get(bug_am_off, i);
+        if (cur > _bx_fnoff && (best < 0 || cur < best)) { best = cur; }
+    }
+    _bx_fnlen = 0;
+    if (best > _bx_fnoff) { _bx_fnlen = best - _bx_fnoff; }
     return 0;
 }
 
@@ -266,14 +337,20 @@ static _run_bytes(bin_path, fn_name) {
 }
 
 // -- `bug --disasm <binary> <fn>`: disassemble a function (objdump-in-bug) ----
-// Decodes the x86-64 subset the B++ backend emits (see bug_disasm.bsm), so a
-// codegen bug -- a reversed operand, a wild displacement -- reads off the
-// screen instead of being hand-decoded from a hexdump.
+// Decodes the subset the B++ backend emits (x86-64 on ELF, AArch64 on Mach-O;
+// the decoder is picked from the .bug map's target byte), so a codegen bug -- a
+// reversed operand, a wild displacement -- reads off the screen instead of
+// being hand-decoded from a hexdump. Disassembles the whole function (length
+// derived from the address map), falling back to a 192-byte window when the
+// length is unknown (the last function in the map) or implausibly large.
 static _run_disasm(bin_path, fn_name) {
+    auto n;
     if (_bx_locate(bin_path, fn_name)) { return 1; }
     out_str("--- disasm: "); out_str(fn_name);
     out_str("  (text+"); out_hex(_bx_fnoff); out_str(") ---"); out_nl();
-    disasm_range(_bx_buf, _bx_filepos, _bx_fnoff, 192);
+    n = _bx_fnlen;
+    if (n <= 0 || n > 65536) { n = 192; }
+    disasm_range(_bx_buf, _bx_filepos, _bx_fnoff, n);
     return 0;
 }
 
@@ -285,9 +362,9 @@ static _usage() {
     putstr_err("  bug --tui ./program [args]   run + observe under gdbserver\n");
     putstr_err("  bug --tui --break fn ./prog  break only on function fn\n");
     putstr_err("  bug --tui --watch a,b ./prog watch names/expressions\n");
-    putstr_err("  bug --bytes ./prog fn        hexdump fn's machine code (ELF)\n");
-    putstr_err("  bug --disasm ./prog fn       disassemble fn (x86-64, ELF)\n");
-    putstr_err("(for the windowed inspector use the GUI build, macOS only)\n");
+    putstr_err("  bug --bytes ./prog fn        hexdump fn's machine code (ELF + Mach-O)\n");
+    putstr_err("  bug --disasm ./prog fn       disassemble fn (x86-64 + arm64)\n");
+    putstr_err("(for the windowed inspector run `the_bug`, the macOS GUI build)\n");
 }
 
 main() {

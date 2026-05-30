@@ -7,45 +7,54 @@ through the platform's remote stub (`debugserver` on macOS,
 a B++ program reading a B++-defined format and speaking the GDB
 remote serial protocol directly.
 
-The debugger ships as a single binary, **`bug`**, built from
-`tools/the_bug/the_bug.bpp`. The same engine drives three modes
-chosen at the command line. The earlier split into a CLI-only
-`src/bug.bpp` and a separate GUI `the_bug` was retired during
-0.23.x — `bug` now does both. The build still installs the
-binary as `./bug` at the repo root for convenience; the source
-lives in `tools/the_bug/`.
+The debugger ships as **two binaries over one shared engine**:
 
-The observer module (`bug_observe_<os>.bsm`) and debug-map
-reader are shared across modes, so any feature documented here
-works regardless of how you launched the debugger. The GUI
-panels are layered on top of the same engine.
+- **`bug`** — the headless CLI, built from `src/bug.bpp`. It imports
+  no GUI modules (no Cocoa), so it cross-compiles to Linux x86_64 and
+  runs in Docker. Reach for it to dump a map, observe a program under
+  the remote stub, or read machine code (`--bytes` / `--disasm`).
+- **`the_bug`** — the windowed inspector, built from
+  `tools/the_bug/the_bug.bpp` (macOS) — the same panels Bang 9 embeds.
+
+Both share the observer (`bug_observe_<os>.bsm`), the debug-map reader,
+and the dump engine, so a feature behaves the same regardless of which
+front-end launched it. (A 0.23.x-era refactor briefly fused the two
+into one `bug`; the split was reinstated on 2026-05-28 precisely so the
+CLI could build for Linux without dragging in the macOS window layer.)
 
 This document covers every feature the debugger exposes today.
 
 ---
 
-## Three modes
+## Modes
 
-The CLI dispatches on the first non-flag argument and the
-explicit `--dump` / `--tui` overrides:
+`bug` (the CLI) dispatches on its flags and **never opens a window** —
+the windowed inspector is the separate `the_bug` binary.
 
 ```
-bug                                 # GUI: file picker, browse a .bug
-bug hello.bug                       # GUI: open with .bug pre-loaded
 bug --dump hello.bug                # dump the .bug map to stdout (text)
-bug --tui ./hello                   # TUI live observation + REPL
+bug --tui ./hello                   # live observation + REPL in the terminal
+bug --bytes ./hello fn              # hexdump one function's machine code
+bug --disasm ./hello fn             # disassemble one function (objdump-in-bug)
+
+the_bug                             # GUI: file picker, browse a .bug
+the_bug hello.bug                   # GUI: open with .bug pre-loaded
 ```
 
-| Mode  | Invocation | What you get |
-|-------|-----------|--------------|
-| GUI   | `bug` or `bug file.bug` | Window with map browser + live panels |
-| Dump  | `bug --dump file.bug`  | Static text dump of the `.bug` map (~2 k lines for the compiler) |
-| TUI   | `bug --tui ./prog`     | Live trace + REPL in the terminal |
+| Tool / mode    | Invocation                  | What you get |
+|----------------|-----------------------------|--------------|
+| `bug` dump     | `bug --dump file.bug`       | Static text dump of the `.bug` map (~2 k lines for the compiler) |
+| `bug` tui      | `bug --tui ./prog`          | Live trace + REPL in the terminal (drives the remote stub) |
+| `bug` bytes    | `bug --bytes ./prog fn`     | Hexdump of one function's machine code — static, no ptrace |
+| `bug` disasm   | `bug --disasm ./prog fn`    | Disassembly of one function — static, no ptrace |
+| `the_bug` GUI  | `the_bug` / `the_bug f.bug` | Window with map browser + live panels |
 
-**Heads up — `bug file.bug` opens the GUI, not the dump.** A
-`.bug` file argument without `--dump` launches the windowed
-inspector. From a headless shell or CI that hangs waiting for an
-event loop. Always pass `--dump` when you want text on stdout.
+**`bug` is headless — safe for CI / Docker.** With no arguments it
+prints usage; it never blocks on an event loop. The two static
+sub-commands (`--bytes`, `--disasm`) need only the binary + its `.bug`
+map and no ptrace, so they work cross-target — a macOS `bug` can read a
+Linux x86_64 ELF, and vice-versa. For the windowed inspector, run
+`the_bug` on macOS.
 
 ### Building a target with debug info
 
@@ -111,9 +120,9 @@ section the compiler emitted to stdout. Useful for confirming
 functions, structs, globals, externs, and source positions
 landed where you expected before touching the program at all.
 
-Plain `bug file.bug` (no `--dump`) opens the GUI inspector
-instead — same data, different surface. Pick the mode by
-context: dump for grep-friendly text, GUI for click-to-explore.
+For the same data with a click-to-explore surface, open the file in
+the GUI: `the_bug file.bug`. Pick by context — `bug --dump` for
+grep-friendly text on stdout, `the_bug` for the windowed browser.
 
 Output sections, in order:
 
@@ -140,6 +149,66 @@ to `out_type` is a routine patch.
 The GUI dump mode (`the_bug` opens `.bug` in the file picker)
 shows the same sections, scrollable with mouse wheel / Page
 Up/Down, with section headers in accent colour.
+
+---
+
+## Reading machine code — `--bytes` and `--disasm` (objdump-in-bug)
+
+Two static sub-commands read a function's emitted machine code straight
+from the binary — no ptrace, no running the program. Both take a binary
+and a function name, find the function in the `.bug` address map, map
+its code-relative offset to a file position by parsing the container,
+and then either hexdump or disassemble it:
+
+```
+bug --bytes  ./game _proj_hit_check     # raw bytes, 16 per line
+bug --disasm ./game _proj_hit_check     # decoded instructions
+```
+
+Because they never attach to a process, they work where a live debugger
+cannot: in Docker, on a cross-compiled binary, or on a Rosetta-translated
+x86_64 process that `gdb` / `lldb` refuse to trace. This is the path that
+caught the x86_64 self-host bugs during the Linux bring-up — an operand
+order emitted as `3 << i` instead of `i << 3` reads straight off the
+`--disasm` output. As of 2026-05-29 it has full parity on both backends.
+
+**Both containers, both ISAs.** `--bytes`/`--disasm` detect the binary
+format from its first byte (`0x7F` = ELF, `0xCF` = Mach-O 64) to find
+where the code section begins:
+
+- **ELF**: code starts where the `PT_NOTE` program header ends (the B++
+  layout is `[ELF header][program headers][PT_NOTE][code]` with the exec
+  `PT_LOAD` at `p_offset 0`).
+- **Mach-O**: code starts at the `__TEXT/__text` section's file `offset`
+  (the Mach header + load commands sit before it).
+
+`--disasm` then picks the decoder from the **target byte in the `.bug`
+map** (`0` = ARM64, `1` = x86_64), so a macOS `bug` disassembles a Linux
+ELF as x86-64 and a Linux `bug` disassembles a Mach-O as arm64 — the
+decoder follows the file, not the host.
+
+**Coordinates.** Offsets in the left column are *code-relative* — the
+same coordinate the `bug --dump` Address Map uses — so a `+0x664b8`
+label, a `cbz x0, 0x66754` branch target, and a `bl 0x339d0` call target
+all line up with the map. (They are not absolute VM addresses; that keeps
+them stable across PIE load slides.)
+
+`--disasm` disassembles the **whole function** (its length is the gap to
+the next address-map entry) and interleaves the source line above the
+instructions it covers (`; file:line`, from the v6 line table) —
+objdump-`-l` style, entirely static.
+
+**Coverage and the `.byte` / `.word` escape hatch.** Each decoder knows
+the SUBSET its backend emits, which is enough to read codegen and spot
+operand-order or wild-displacement bugs. Anything outside that vocabulary
+prints as `.byte 0xNN` (x86, variable length) or `.word 0x........`
+(arm64, fixed 4-byte, so the stream always stays aligned). On arm64 the
+scalar coverage is ~99.998%; the only gap is NEON/SIMD, which appears
+solely in auto-vectorized hot loops and is intentionally left raw.
+
+Both need the `.bug` map present — build with `bpp --bug ...` (see
+*Building a target with debug info* above). The map carries the function
+names, the target byte, and the line table.
 
 ---
 
@@ -583,6 +652,7 @@ investigation.
 | Phase 6.4.1 | Cooperative sampling profiler (boundaries in `bpp_job` workers + maestro phases) | shipped |
 | Phase 6.4.2 | SIGPROF supplement (macOS): per-thread mcontext capture + pthread_kill fan-out | shipped |
 | Phase 6.5  | `caller(n)` sugar wrapper over `caller_pc` + `caller_name` | deferred (YAGNI — no consumer yet) |
+| CLI / disasm | `bug` re-split as the Linux-capable CLI (`src/bug.bpp`); `--bytes` + `--disasm` objdump-in-bug; v6 line table source interleaving; ELF/x86-64 **and** Mach-O/arm64 parity (2026-05-28 → 29) | shipped |
 
 Phase 6 detail: see the planning doc archived at
 `legacy_bootstrap/legacy_docs/bug_phase6_plan.md` (kept for

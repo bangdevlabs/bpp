@@ -211,8 +211,9 @@ sudo cp src/bug_tui.bsm "$LIB_DIR/"
 # from the_bug.bpp so both the GUI entry and the CLI entry (src/bug.bpp) share
 # it. Imported explicitly by both, so it must live next to the other bug_*.bsm.
 sudo cp src/bug_dump.bsm "$LIB_DIR/"
-# bug_disasm.bsm is the x86-64 disassembler behind `bug --disasm` (objdump in
-# bug). Imported by src/bug.bpp; must sit next to the other bug_*.bsm modules.
+# bug_disasm.bsm is the disassembler behind `bug --disasm` (objdump in bug),
+# covering both backends: x86-64 (ELF) and AArch64 (Mach-O). Imported by
+# src/bug.bpp; must sit next to the other bug_*.bsm modules.
 sudo cp src/bug_disasm.bsm "$LIB_DIR/"
 
 # Install standard library.
