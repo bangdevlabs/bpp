@@ -366,94 +366,32 @@ void emit_body(arr, cnt) {
                     out("];");
                     putchar('\n');
                 } else {
-                // Emit variables grouped by their C type.
-                // Sub-word hints in n.c select a narrower C type for truncation semantics.
-                auto dh;
-                dh = n.c;
-                if (ty_slice(dh) == SL_DOUBLE) {
-                    // 128-bit SIMD slot — Autovec P1 (2026-05-22).
-                    // `: double` locals lower to `_bpp_vec4f` defined
-                    // in the SIMD preamble. The `is_float_type` filter
-                    // does NOT match SL_DOUBLE (it's a vector slot,
-                    // not a scalar float) so we emit the variable
-                    // group unconditionally for every name in the
-                    // declaration.
-                    di = 0; has_int = 0;
-                    while (di < dcnt) {
-                        if (has_int == 0) { emit_pad(); out("_bpp_vec4f "); has_int = 1; }
-                        else { out(", "); }
+                    // Emit each name with the C type of ITS OWN hint
+                    // (cg_decl_var_hint), not a single statement-wide slice.
+                    // Otherwise a `: byte` / `: half` on one name would narrow
+                    // its neighbours (the slice-flood) — the float vs non-float
+                    // split was already per-variable, this makes the slice
+                    // width per-variable too. One declaration per name keeps it
+                    // simple and correct for mixed lines. Synthesized decls
+                    // (e.g. autovec) carry no per-name array, so cg_decl_var_hint
+                    // falls back to n.c and their uniform-by-construction
+                    // grouping is preserved. SL_DOUBLE is the 128-bit SIMD slot
+                    // (`_bpp_vec4f`); a scalar float lowers to `double`.
+                    auto vh, sl;
+                    for (di = 0; di < dcnt; di++) {
+                        vh  = cg_decl_var_hint(n, di);
+                        sl  = ty_slice(vh);
+                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
+                        emit_pad();
+                        if (sl == SL_DOUBLE)         { out("_bpp_vec4f "); }
+                        else if (is_float_type(vty)) { out("double "); }
+                        else if (sl == SL_BYTE)      { out("uint8_t "); }
+                        else if (sl == SL_QUARTER)   { out("uint16_t "); }
+                        else if (sl == SL_HALF)      { out("uint32_t "); }
+                        else                         { out("long long "); }
                         print_p(darr[di]);
-                        di++;
+                        out(";"); putchar('\n');
                     }
-                    if (has_int) { out(";"); putchar('\n'); }
-                } else if (ty_slice(dh) == SL_BYTE) {
-                    // uint8_t variables.
-                    di = 0; has_int = 0;
-                    while (di < dcnt) {
-                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                        if (is_float_type(vty) == 0) {
-                            if (has_int == 0) { emit_pad(); out("uint8_t "); has_int = 1; }
-                            else { out(", "); }
-                            print_p(darr[di]);
-                        }
-                        di++;
-                    }
-                    if (has_int) { out(";"); putchar('\n'); }
-                } else if (ty_slice(dh) == SL_QUARTER) {
-                    // uint16_t variables.
-                    di = 0; has_int = 0;
-                    while (di < dcnt) {
-                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                        if (is_float_type(vty) == 0) {
-                            if (has_int == 0) { emit_pad(); out("uint16_t "); has_int = 1; }
-                            else { out(", "); }
-                            print_p(darr[di]);
-                        }
-                        di++;
-                    }
-                    if (has_int) { out(";"); putchar('\n'); }
-                } else if (ty_slice(dh) == SL_HALF) {
-                    // uint32_t variables.
-                    di = 0; has_int = 0;
-                    while (di < dcnt) {
-                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                        if (is_float_type(vty) == 0) {
-                            if (has_int == 0) { emit_pad(); out("uint32_t "); has_int = 1; }
-                            else { out(", "); }
-                            print_p(darr[di]);
-                        }
-                        di++;
-                    }
-                    if (has_int) { out(";"); putchar('\n'); }
-                } else {
-                    // Default: long long variables.
-                    has_int = 0;
-                    for (di = 0; di < dcnt; di++) {
-                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                        if (is_float_type(vty) == 0) {
-                            if (has_int == 0) { emit_pad(); out("long long "); has_int = 1; }
-                            else { out(", "); }
-                            print_p(darr[di]);
-                        }
-                    }
-                    if (has_int) { out(";"); putchar('\n'); }
-                }
-                // Emit float variables — skip SL_DOUBLE (handled
-                // above as `_bpp_vec4f`). `is_float_type` matches
-                // both scalar floats and SL_DOUBLE, so the slice
-                // check excludes the vector slot from this group.
-                has_flt = 0;
-                if (ty_slice(dh) != SL_DOUBLE) {
-                    for (di = 0; di < dcnt; di++) {
-                        vty = get_fn_var_type(cur_fn_idx, darr[di]);
-                        if (is_float_type(vty)) {
-                            if (has_flt == 0) { emit_pad(); out("double "); has_flt = 1; }
-                            else { out(", "); }
-                            print_p(darr[di]);
-                        }
-                    }
-                    if (has_flt) { out(";"); putchar('\n'); }
-                }
                 }
             } else if (n.ntype == T_IF | n.ntype == T_WHILE) {
                 emit_pad();
@@ -470,7 +408,7 @@ void emit_body(arr, cnt) {
 
 // Emit C code for a single AST node (recursive).
 void emit_node(nd) {
-    auto n: Node, an: Node;
+    auto (n, an): Node;
     auto t, i, arr, cnt, name_p, exi;
     auto atype_arr, atype_cnt, atp, arg_node, ret_tp;
     auto is_str_lit, vs, op_p;
