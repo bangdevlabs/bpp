@@ -35,14 +35,14 @@ struct CamUniforms {
 // SPRITE_BUF_SZ on B++ side) together when later sessions need more.
 //
 // Kind codes (must match B++ side fps_wolf3d.bpp::_pack_sprite_buf):
-//   1 = enemy (red quad)
+//   1 = enemy (textured from the sprite atlas, slot idx)
 //   2 = door  (brown quad)
 struct Sprite {
     float x;
     float y;
     uint  kind;
-    uint  _pad;   // round to 16-byte alignment so the array stride is
-                  // predictable across Metal versions
+    uint  idx;    // sprite-atlas tile index (used when kind == 1); the
+                  // atlas is a 64px-tile grid, tex_sprites at texture(4)
 };
 
 struct SpriteList {
@@ -79,14 +79,19 @@ vertex VOut fps_vert(uint vid [[vertex_id]]) {
 // loads through stbasset without touching this shader.
 constexpr sampler wall_smp(filter::linear, address::repeat);
 
+// Sprite atlas sampler — nearest filter (pixel-art, no blur) and clamp so a
+// tile never bleeds into its neighbour at the 64px cell edges.
+constexpr sampler spr_smp(filter::nearest, address::clamp_to_edge);
+
 fragment float4 fps_frag(VOut in [[stage_in]],
                          constant CamUniforms& cam     [[buffer(0)]],
                          constant uchar*       map     [[buffer(1)]],
                          constant SpriteList&  sprites [[buffer(2)]],
-                         texture2d<float> tex_brick [[texture(0)]],
-                         texture2d<float> tex_stone [[texture(1)]],
-                         texture2d<float> tex_wood  [[texture(2)]],
-                         texture2d<float> tex_solid [[texture(3)]]) {
+                         texture2d<float> tex_brick   [[texture(0)]],
+                         texture2d<float> tex_stone   [[texture(1)]],
+                         texture2d<float> tex_wood    [[texture(2)]],
+                         texture2d<float> tex_solid   [[texture(3)]],
+                         texture2d<float> tex_sprites [[texture(4)]]) {
     float fx = in.position.x;
     float fy = in.position.y;
     float sw_f = float(cam.sw);
@@ -292,19 +297,35 @@ fragment float4 fps_frag(VOut in [[stage_in]],
         // -fov/2 .. +fov/2 across 0..sw).
         float col_center = (ang / cam.fov + 0.5) * sw_f;
         float half_size  = sh_f / rx * 0.5;          // 1-unit sprite
+        if (sp.kind == 3u) { half_size = half_size * 0.18; }  // bullets are small
         if (fx < col_center - half_size) { continue; }
         if (fx > col_center + half_size) { continue; }
         if (fy < half_h    - half_size) { continue; }
         if (fy > half_h    + half_size) { continue; }
 
-        // Inside the sprite footprint. Pick a color by kind. New
-        // kinds added later sessions must extend this dispatch in
-        // lockstep with the B++ packer.
+        // Inside the sprite footprint. Local UV (0..1) across the square.
+        float su = (fx - (col_center - half_size)) / (2.0 * half_size);
+        float sv = (fy - (half_h    - half_size)) / (2.0 * half_size);
+
         float3 sp_col;
         if (sp.kind == 1u) {
-            sp_col = float3(0.85, 0.20, 0.20);       // enemy red
+            // Textured enemy: map the local UV into atlas tile `idx`. The
+            // atlas is a grid of 64px tiles (columns = width / 64). A
+            // transparent texel means this fragment isn't part of the sprite
+            // here, so skip it and let the wall (or a nearer sprite) show.
+            float aw   = float(tex_sprites.get_width());
+            float ah   = float(tex_sprites.get_height());
+            uint  cols = uint(aw) / 64u;
+            float cx   = float(sp.idx % cols) * 64.0;
+            float cy   = float(sp.idx / cols) * 64.0;
+            float2 auv = float2((cx + su * 64.0) / aw, (cy + sv * 64.0) / ah);
+            float4 texel = tex_sprites.sample(spr_smp, auv);
+            if (texel.a < 0.5) { continue; }         // transparent — see behind
+            sp_col = texel.rgb;
         } else if (sp.kind == 2u) {
             sp_col = float3(0.55, 0.35, 0.18);       // door brown
+        } else if (sp.kind == 3u) {
+            sp_col = float3(1.00, 0.95, 0.40);       // bullet — bright tracer
         } else {
             sp_col = float3(1.00, 0.00, 1.00);       // unknown — magenta
         }

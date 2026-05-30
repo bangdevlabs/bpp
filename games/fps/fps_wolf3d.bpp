@@ -33,12 +33,14 @@ import "stbprofile.bsm";   // profile_gpu_enable + profile_hud_draw
 import "stbfx.bsm";        // Sessão A4 — CRT post-process (Phase 6.4)
 import "stbtexture.bsm";   // Phase 7 — procedural wall textures
 import "stbecs.bsm";       // Phase 2 Session 2 — entity world / payload component
+import "stbprojectile.bsm"; // flying bullets (Wolf3D is hitscan, but a visible
+                            //   tracer is more fun) — pool + spawn + tick
 
 // Game-local AI module. `load` (not `import`) per the project's
 // load-vs-import convention: per-game logic lives next to the
 // game; generic primitives (LoS / steering) live in stb/stbai.bsm
 // which ai.bsm itself imports.
-load "ai.bsm";
+load "fps_ai.bsm";
 
 // ── Compile-time constants ─────────────────────────────────
 
@@ -88,10 +90,71 @@ const SPRITE_BUF_SZ  = 16 + SPRITE_MAX * SPRITE_REC_SZ;
 const SPRITE_KIND_ENEMY = 1;
 const SPRITE_KIND_DOOR  = 2;
 
+// Which Wolf3D sprite (index into assets/sprites.png — the funnel's 16-column
+// 64px sheet) an enemy billboard renders as. Tile N is at column N%16, row
+// N/16, so eyeball sprites.png and remap. Best guess at a guard-standing
+// frame (static objects occupy the low indices; the actors come after).
+const WOLF_SPR_ENEMY = 50;
+
+// Guard walk cycle. In the Wolf3D sprite order the 8-frame standing block is
+// followed by 4 walk poses (8 facing frames each), so the FRONT-facing walk
+// frames sit at WOLF_SPR_ENEMY + 8*(1..4). Cycling these while the guard moves
+// stops it looking like a sliding statue. Full 8-way directional facing is the
+// next refinement; tune the stride/base by eyeballing sprites.png if the cycle
+// flickers onto the wrong frames.
+const WOLF_SPR_GUARD_DIRS        = 8;   // facing frames per pose (one per octant)
+const WOLF_SPR_GUARD_WALK_POSES  = 4;   // walk animation frames
+const WOLF_ANIM_TICKS_PER_POSE   = 6;   // render frames per pose (~100ms @ 60fps)
+
+// ── Combat tuning (the kill-two-guards mini-game) ──────────
+const PLAYER_HP_MAX   = 100;
+const GUARD_HP        = 3;       // shots to down a guard
+const FIRE_RANGE      = 12.0;    // cells a hitscan shot reaches
+const FIRE_COS        = 0.985;   // dot(aim, to-guard) threshold (~10° cone)
+const MELEE_RANGE     = 1.2;     // cells at which a guard can hit the player
+const GUARD_DMG       = 10;      // player HP lost per guard hit
+const ATTACK_COOLDOWN = 1.0;     // seconds between a guard's hits
+
+// Game-loop states.
+const WOLF_PLAYING = 0;
+const WOLF_WIN     = 1;
+const WOLF_LOSE    = 2;
+
+// Player weapon HUD. The gun frames are near the END of the sprite sheet (the
+// Wolf3D weapon sprites are the last group). idle = the held pistol, fire = a
+// muzzle-flash frame shown briefly after a shot. Tune by eyeballing
+// sprites.png (the gun cells are at the bottom of the sheet).
+const WOLF_SPR_WEAPON_IDLE = 421;
+const WOLF_SPR_WEAPON_FIRE = 423;
+const WOLF_FIRE_FLASH_SEC  = 0.12;   // how long the fire frame stays up
+
+// Flying bullet (stbprojectile). The shot is a fast projectile that travels
+// along the aim and damages a guard on impact, drawn as a small bright
+// kind==3 billboard. (Authentic Wolf3D is hitscan; this is the fun version.)
+const SPRITE_KIND_BULLET = 3;
+const PROJ_SPEED         = 16.0;   // cells/sec
+const PROJ_LIFETIME_MS   = 1200;   // self-expire so strays don't pile up
+const PROJ_HIT_RADIUS    = 0.5;    // cells — impact distance to a guard
+const PROJ_MAX           = 16;     // pool capacity
+
 // ── Game state (read by all phases, mutated by solo) ───────
 
 // Field of view in radians (60° = Wolf3D default). Set once in init.
 global FOV: float;
+
+// Combat state. player_hp drops when a guard hits; wolf_game_state moves to
+// WOLF_WIN when both guards are down or WOLF_LOSE when the player dies (R restarts).
+global player_hp;
+global wolf_game_state;
+
+// Player weapon HUD: the sprite sheet loaded as an Image (so a frame can be
+// drawn as a 2D overlay), plus a countdown that shows the muzzle-flash frame
+// for a beat after firing.
+extrn wolf_weapon_img;
+global wolf_fire_timer: float;
+
+// Pool of in-flight bullets (stbprojectile).
+extrn wolf_proj_pool;
 
 // Player FPSBody — same struct, same tuning as fps_3d.bpp so the
 // two programs feel identical to the user.
@@ -110,6 +173,7 @@ extrn ray_pipeline;
 extrn cam_buf;
 extrn map_buf;
 extrn sprite_buf;
+extrn wolf_spr_atlas;   // GPU texture: the Wolf3D sprite sheet (assets/sprites.png)
 
 // Sessão A2 — HUD overlay atlas. Procedural 2-tile atlas painted
 // at init: tile 0 is a white crosshair, tile 1 is a red heart icon.
@@ -154,6 +218,35 @@ extrn TEX_STONE;
 extrn TEX_WOOD;
 extrn TEX_SOLID;
 const TEX_SIZE = 64;
+
+// Which Wolf3D wall (index into assets/walls.png — the funnel's 16-column
+// 64x64 sheet) maps to each wall_type slot. Tile N sits at column N%16,
+// row N/16, so eyeball the sheet and remap to taste. Defaults are spread
+// across rows so the four surfaces look distinct.
+const WALL_TEX_BRICK = 0;
+const WALL_TEX_STONE = 9;
+const WALL_TEX_WOOD  = 16;
+const WALL_TEX_SOLID = 22;
+
+// Cut one 64x64 wall out of the funnel's wall sheet and upload it as a GPU
+// texture. `atlas` is the RGBA sheet from pixels_load, `atlas_w` its pixel
+// width (16*64), `idx` the wall index. RGBA byte order (R,G,B,A) already
+// matches _stb_gpu_create_texture, so it is a straight per-row copy.
+_wolf_wall_tex(atlas, atlas_w, idx) {
+    auto buf, tx, ty, row, src, dst, i;
+    buf = buf_byte(TEX_SIZE * TEX_SIZE * 4);
+    tx = (idx % 16) * TEX_SIZE;
+    ty = (idx / 16) * TEX_SIZE;
+    row = 0;
+    while (row < TEX_SIZE) {
+        src = atlas + (((ty + row) * atlas_w) + tx) * 4;
+        dst = buf + (row * TEX_SIZE) * 4;
+        i = 0;
+        while (i < TEX_SIZE * 4) { poke(dst + i, peek(src + i)); i++; }
+        row++;
+    }
+    return _stb_gpu_create_texture(buf, TEX_SIZE, TEX_SIZE);
+}
 
 // Phase 2 Session 2 — entities live in an stbecs World plus a
 // game-local custom payload. Authoring schema (level JSON v2)
@@ -312,23 +405,43 @@ static fps_init_phase() {
         return 0;
     }
 
-    // Phase 7 — generate wall textures procedurally and upload to
-    // GPU. Same parameters the CPU baseline (fps_3d.bpp) uses, so
-    // visually the two binaries differ only in the post-process
-    // pass, not in the wall surfaces themselves.
-    TEX_BRICK = texture_brick(TEX_SIZE, TEX_SIZE,
-                              0xFFB5390F,    // saturated red brick
-                              0xFF2D1F18,    // dark mortar
-                              16, 8);
-    TEX_STONE = texture_stone(TEX_SIZE, TEX_SIZE,
-                              0xFF8C8C8C,    // mid grey base
-                              0xFF4A4A4A);   // darker speckle
-    TEX_WOOD  = texture_wood(TEX_SIZE, TEX_SIZE,
-                             0xFF8B5A2B,     // saddle wood
-                             0xFF4F2F18,     // dark plank seam
-                             8);
-    TEX_SOLID = texture_solid(TEX_SIZE, TEX_SIZE,
-                              0xFFFF00FF);   // magenta debug accent
+    // Phase 7 — walls. Load the real Wolf3D wall tileset the funnel produced
+    // (tools/funnel/vswap_walls -> assets/walls.png, a 16-column sheet of
+    // 64x64 tiles) and bind four by wall_type. Falls back to the procedural
+    // set if the sheet is missing, so the binary still runs without the asset.
+    auto wsheet, ww;
+    wsheet = pixels_load("assets/walls.png");
+    if (wsheet != 0) {
+        ww = pixels_w();                 // 1024 = 16 * 64
+        TEX_BRICK = _wolf_wall_tex(wsheet, ww, WALL_TEX_BRICK);
+        TEX_STONE = _wolf_wall_tex(wsheet, ww, WALL_TEX_STONE);
+        TEX_WOOD  = _wolf_wall_tex(wsheet, ww, WALL_TEX_WOOD);
+        TEX_SOLID = _wolf_wall_tex(wsheet, ww, WALL_TEX_SOLID);
+        pixels_free(wsheet);
+    } else {
+        TEX_BRICK = texture_brick(TEX_SIZE, TEX_SIZE, 0xFFB5390F, 0xFF2D1F18, 16, 8);
+        TEX_STONE = texture_stone(TEX_SIZE, TEX_SIZE, 0xFF8C8C8C, 0xFF4A4A4A);
+        TEX_WOOD  = texture_wood(TEX_SIZE, TEX_SIZE, 0xFF8B5A2B, 0xFF4F2F18, 8);
+        TEX_SOLID = texture_solid(TEX_SIZE, TEX_SIZE, 0xFFFF00FF);
+    }
+
+    // Sprite atlas (funnel: vswap_sprites -> assets/sprites.png) — the whole
+    // 16-column 64px sheet uploaded as one GPU texture. The raycast shader
+    // samples tile `idx` per billboard (kind==enemy) with alpha-discard.
+    auto ssheet;
+    ssheet = pixels_load("assets/sprites.png");
+    if (ssheet != 0) {
+        wolf_spr_atlas = _stb_gpu_create_texture(ssheet, pixels_w(), pixels_h());
+        pixels_free(ssheet);
+    } else {
+        wolf_spr_atlas = 0;
+    }
+
+    // Weapon HUD: the sprite sheet as a drawable Image (a frame is the gun at
+    // the bottom of the screen) + the bullet pool.
+    wolf_weapon_img = image_load("assets/sprites.json");
+    wolf_fire_timer = 0.0;
+    wolf_proj_pool  = projectile_pool_new(PROJ_MAX);
 
     FOV = 1.0472;            // 60° in radians
     player = fps_body(3.5, 8.5, 0.0, 0.3, 3.0, 2.0);
@@ -340,6 +453,13 @@ static fps_init_phase() {
     action_define("fps_turn_l",     KEY_LEFT,  0);
     action_define("fps_turn_r",     KEY_RIGHT, 0);
     action_define("profile_toggle", KEY_P,     0);
+    action_define("fps_fire",        KEY_SPACE, 0);
+    action_define("fps_restart",     KEY_R,     0);
+
+    // Combat state — full HP, both guards to kill, game live.
+    player_hp       = PLAYER_HP_MAX;
+    wolf_game_state = WOLF_PLAYING;
+
     init_profile();
 
     world_map = tile_new(MAP_W, MAP_H, 1, 1);
@@ -389,44 +509,131 @@ static fps_init_phase() {
 // callback (same action names, same bindings, same fps_walk /
 // fps_turn dispatch). dt is float seconds — the maestro convention
 // since the AAPCS64 / SysV refactor.
+// Combat tick — the kill-two-guards loop. Fire a hitscan on the nearest guard
+// inside the crosshair cone; let guards in melee range chip the player's HP on
+// their cooldown; flip to WIN when no guards remain or LOSE when the player
+// dies; restart (R) respawns the level + resets HP. Runs after the AI step.
+// stbprojectile per-bullet callback: when a bullet reaches an alive guard,
+// damage it and kill the bullet. The callback gets only the slot, so it works
+// off the wolf_* globals.
+static void _proj_hit_check(slot) {
+    // IMPORTANT: keep the float local on its own `auto` line. A `: float`
+    // annotation mixed into a comma list floats EVERY declarator in that
+    // statement (the struct/int ones too), which silently turns the
+    // pointer arithmetic for `p`/`pr` into double math and crashes. So
+    // struct and integer locals go on a float-free line; floats get theirs.
+    auto pr: Projectile, p: WolfEntPayload, i, cap;
+    auto d: float;
+    pr  = slot;
+    cap = ecs_capacity(wolf_world);
+    for (i = 0; i < cap; i++) {
+        if (ecs_alive(wolf_world, i) == 0) { continue; }
+        p = ecs_component_at(wolf_payload, i, sizeof(WolfEntPayload));
+        if (p.kind != SPRITE_KIND_ENEMY) { continue; }
+        d = ai_dist(pr.x, pr.y, p.x, p.y);
+        if (d < PROJ_HIT_RADIUS) {
+            p.hp = p.hp - 1;
+            if (p.hp <= 0) { ecs_kill(wolf_world, i); }
+            projectile_kill(wolf_proj_pool, slot);
+            return;
+        }
+    }
+}
+
+static void _wolf_combat_tick(dt: float) {
+    auto pb: FPSBody, i, cap, p: WolfEntPayload, alive;
+    auto (fdx, fdy, d): float;
+
+    pb = player;
+
+    // Muzzle-flash countdown — drives the weapon HUD frame.
+    wolf_fire_timer = wolf_fire_timer - dt;
+    if (wolf_fire_timer < 0.0) { wolf_fire_timer = 0.0; }
+
+    // A finished game only listens for restart.
+    if (wolf_game_state != WOLF_PLAYING) {
+        if (action_pressed("fps_restart") != 0) {
+            _load_level(_level_path(), 1);     // respawn guards + reset player pos
+            player_hp       = PLAYER_HP_MAX;
+            wolf_game_state = WOLF_PLAYING;
+        }
+        return;
+    }
+
+    cap = ecs_capacity(wolf_world);
+
+    // Fire: launch a bullet down the aim — damage happens on impact (the
+    // projectile has to reach the guard), not instantly.
+    if (action_pressed("fps_fire") != 0 || mouse_pressed(MOUSE_LEFT) != 0) {
+        fdx = cos_f(pb.angle);
+        fdy = sin_f(pb.angle);
+        projectile_spawn(wolf_proj_pool, pb.x, pb.y, 0.0,
+                         fdx * PROJ_SPEED, fdy * PROJ_SPEED, 0.0,
+                         0.0, PROJ_LIFETIME_MS, 0);
+        wolf_fire_timer = WOLF_FIRE_FLASH_SEC;
+    }
+
+    // Advance the bullets, then test each against the guards (impact = damage).
+    projectile_tick(wolf_proj_pool, trunc_int(dt * 1000.0), 0);   // dt_ms is int
+    projectile_each(wolf_proj_pool, fn_ptr(_proj_hit_check));
+
+    // Guards in melee range chip the player on their attack cooldown; tally
+    // survivors as we go.
+    alive = 0;
+    for (i = 0; i < cap; i++) {
+        if (ecs_alive(wolf_world, i) == 0) { continue; }
+        p = ecs_component_at(wolf_payload, i, sizeof(WolfEntPayload));
+        if (p.kind != SPRITE_KIND_ENEMY) { continue; }
+        alive = alive + 1;
+        d = ai_dist(pb.x, pb.y, p.x, p.y);
+        if (d < MELEE_RANGE && p.cooldown <= 0.0) {
+            player_hp  = player_hp - GUARD_DMG;
+            p.cooldown = ATTACK_COOLDOWN;
+        }
+    }
+
+    if (alive == 0)          { wolf_game_state = WOLF_WIN; }
+    else if (player_hp <= 0) { wolf_game_state = WOLF_LOSE; }
+}
+
+// Last frame's mouse X — the look delta is the change since this.
+static auto _prev_mouse_x;
+
 static fps_solo_phase(dt: float)  {
-    auto forward: float, strafe: float, turn: float;
+    auto (forward, strafe, turn, mdx): float;
+    auto pb: FPSBody;
 
     // Drive the per-frame stbgame plumbing: input edge state, ui
-    // arena reset, and — critical for fxlab propagation —
-    // image_hot_reload_tick_throttled, which is what tics file_watch
-    // and re-pokes effect uniforms when fxlab rewrites the JSONs.
-    // Without this call the slider drag in fxlab never reaches the
-    // running game.
+    // arena reset, and image_hot_reload_tick_throttled (fxlab path).
     game_frame_begin();
 
     if (key_pressed(KEY_ESC)) { maestro_quit(); return 0; }
+    if (action_pressed("profile_toggle")) { profile_hud_toggle(); }
 
-    if (action_pressed("profile_toggle")) {
-        profile_hud_toggle();
+    // Movement + AI only run while the game is live; on win/lose the
+    // world freezes and only the restart key (handled below) responds.
+    if (wolf_game_state == WOLF_PLAYING) {
+        forward = action_down("fps_forward")  - action_down("fps_back");
+        strafe  = action_down("fps_strafe_r") - action_down("fps_strafe_l");
+        turn    = action_down("fps_turn_r")   - action_down("fps_turn_l");
+        fps_turn(player, turn,    dt);
+        fps_walk(player, forward, strafe, dt, world_map);
+
+        // Mouse look — rotate the view by the horizontal mouse delta
+        // (radians per pixel). Arrow keys still turn too.
+        mdx = mouse_x() - _prev_mouse_x;
+        pb = player;
+        pb.angle = pb.angle + mdx * 0.0012;   // radians/pixel — lower = calmer
+
+        // Drive every alive entity through the AI module. The cooldown
+        // decrement (autovec P1 shape) runs over EVERY slot; ai_step_all
+        // dispatches by WolfEntPayload.kind.
+        wolf_ai_tick_cooldowns(dt, wolf_payload);
+        wolf_ai_step_all(dt, wolf_world, wolf_payload, world_map, player);
     }
+    _prev_mouse_x = mouse_x();    // track every frame: no jump on restart
 
-    forward = action_down("fps_forward")  - action_down("fps_back");
-    strafe  = action_down("fps_strafe_r") - action_down("fps_strafe_l");
-    turn    = action_down("fps_turn_r")   - action_down("fps_turn_l");
-
-    fps_turn(player, turn,    dt);
-    fps_walk(player, forward, strafe, dt, world_map);
-
-    // Phase 2 Session 2 — drive every alive entity through the
-    // game's AI module. Dispatch by `WolfEntPayload.kind` happens
-    // inside ai_step_all; this site is intentionally one line so
-    // future kinds (projectiles in Session 3, doors in Session 5)
-    // graduate without re-touching the solo phase.
-    // Per-frame cooldown decrement. Autovec lowers this to a
-    // 4-wide SIMD loop + scalar tail (commit `4bc79dd`); the
-    // matcher catches the canonical P1 shape `e.cooldown =
-    // e.cooldown - dt` over the entity payload array. Decrement
-    // runs over EVERY slot (alive or not) to keep the body
-    // single-T_MEMST — non-alive slots have kind==0 and the
-    // stale cooldown is dontcare.
-    wolf_ai_tick_cooldowns(dt, wolf_payload);
-    wolf_ai_step_all(dt, wolf_world, wolf_payload, world_map, player);
+    _wolf_combat_tick(dt);
     return 0;
 }
 
@@ -488,6 +695,7 @@ static fps_render_phase(alpha: float) {
         gpu_bind_texture_frag(1, TEX_STONE);
         gpu_bind_texture_frag(2, TEX_WOOD);
         gpu_bind_texture_frag(3, TEX_SOLID);
+        gpu_bind_texture_frag(4, wolf_spr_atlas);   // Wolf3D sprite sheet
         gpu_draw_full();
         gpu_pipeline_use_default();
     }
@@ -500,6 +708,20 @@ static fps_render_phase(alpha: float) {
         cross_y = SCREEN_H / 2 - HUD_TILE / 2;
         image_draw_size(hud_atlas, HUD_CROSS, cross_x, cross_y, HUD_TILE, HUD_TILE);
         image_draw_size(hud_atlas, HUD_HEART, 8, SCREEN_H - 24, HUD_TILE, HUD_TILE);
+        // Player weapon at bottom-center; the fire frame shows during the flash.
+        if (wolf_weapon_img != 0) {
+            auto wframe;
+            wframe = wolf_fire_timer > 0.0 ? WOLF_SPR_WEAPON_FIRE : WOLF_SPR_WEAPON_IDLE;
+            image_draw_size(wolf_weapon_img, wframe, SCREEN_W / 2 - 96, SCREEN_H - 192, 192, 192);
+        }
+        // Player HP beside the heart, plus the mini-game outcome banner.
+        render_number(8 + HUD_TILE + 4, SCREEN_H - 22, 2, 0xFFFFFFFF, player_hp);
+        if (wolf_game_state == WOLF_WIN) {
+            render_text("YOU WIN - press R",  SCREEN_W / 2 - 70, SCREEN_H / 2 - 40, 2, 0xFF33FF33);
+        }
+        if (wolf_game_state == WOLF_LOSE) {
+            render_text("YOU DIED - press R", SCREEN_W / 2 - 76, SCREEN_H / 2 - 40, 2, 0xFFFF3333);
+        }
         profile_hud_draw(8, 8, 1, 0xFFFF3333);
         // Zone breakdown panel pinned to the upper-right corner so
         // it doesn't collide with the function top-N column on the
@@ -626,8 +848,30 @@ static _kind_to_shader_code(kind_str) {
 //
 // Called per render frame. Cheap — capacity ≤ 32, mostly pointer
 // arithmetic + four 4-byte writes per renderable record.
+// Walk-cycle clock — advances one step per packed frame; `phase` below picks
+// which walk pose a moving guard shows.
+static auto _wolf_anim_tick;
+
+// Bridge for packing bullets into sprite_buf via projectile_each (whose
+// callback gets only the slot). Holds the running sprite count across the call.
+static auto _pack_count;
+
+static void _pack_proj(slot) {
+    auto pr: Projectile, base;
+    if (_pack_count >= SPRITE_MAX) { return; }
+    pr   = slot;
+    base = sprite_buf + 16 + _pack_count * SPRITE_REC_SZ;
+    write_f32(base,  0, pr.x);
+    write_f32(base,  4, pr.y);
+    write_u32(base,  8, SPRITE_KIND_BULLET);
+    write_u32(base, 12, 0);
+    _pack_count = _pack_count + 1;
+}
+
 static void _pack_sprite_buf() {
-    auto i, p: WolfEntPayload, count, base, cap;
+    auto i, p: WolfEntPayload, count, base, cap, phase, idx, moving;
+    _wolf_anim_tick = _wolf_anim_tick + 1;
+    phase = (_wolf_anim_tick / WOLF_ANIM_TICKS_PER_POSE) % WOLF_SPR_GUARD_WALK_POSES;
     count = 0;
     cap   = ecs_capacity(wolf_world);
     for (i = 0; i < cap; i++) {
@@ -635,13 +879,29 @@ static void _pack_sprite_buf() {
         if (count >= SPRITE_MAX) { break; }
         p = ecs_component_at(wolf_payload, i, sizeof(WolfEntPayload));
         if (p.kind == 0) { continue; }               // not renderable
+        // Atlas tile index. A moving guard cycles its 4 front-facing walk
+        // poses (so the legs animate instead of sliding); a still one shows
+        // the standing frame.
+        idx = 0;
+        if (p.kind == SPRITE_KIND_ENEMY) {
+            moving = (p.vx != 0.0) || (p.vy != 0.0);
+            if (moving != 0) {
+                idx = WOLF_SPR_ENEMY + WOLF_SPR_GUARD_DIRS * (1 + phase);
+            } else {
+                idx = WOLF_SPR_ENEMY;
+            }
+        }
         base = sprite_buf + 16 + count * SPRITE_REC_SZ;
         write_f32(base,  0, p.x);
         write_f32(base,  4, p.y);
         write_u32(base,  8, p.kind);
-        write_u32(base, 12, 0);                      // padding slot
+        write_u32(base, 12, idx);
         count++;
     }
+    // Append live bullets as small bright kind==3 billboards.
+    _pack_count = count;
+    projectile_each(wolf_proj_pool, fn_ptr(_pack_proj));
+    count = _pack_count;
     write_u32(sprite_buf,  0, count);
     write_u32(sprite_buf,  4, 0);
     write_u32(sprite_buf,  8, 0);
@@ -786,7 +1046,7 @@ static _load_level(path, apply_spawn) {
             ep.y        = ey;
             ep.vx       = 0.0;
             ep.vy       = 0.0;
-            ep.hp       = 0;
+            ep.hp       = code == SPRITE_KIND_ENEMY ? GUARD_HP : 0;
             ep.cooldown = 0;
         }
     }

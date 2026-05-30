@@ -1,0 +1,305 @@
+// games/fps/ai.bsm — Wolf3D Phase 2 enemy AI module.
+//
+// Game-local module (`load`ed by fps_wolf3d.bpp), NOT a cartridge.
+// Per the project's load-vs-import convention:
+//   - generic primitives → `stb/stb*.bsm` (imported by anyone)
+//   - per-game logic     → `games/<g>/<m>.bsm` (loaded by that game)
+//
+// What this module does:
+//   - Walks the wolf_world ECS each solo tick
+//   - For every alive entity, dispatches by `WolfEntPayload.kind`
+//   - Enemy FSM: IDLE ↔ CHASE driven by line-of-sight to the player
+//   - Door / other kinds: no AI in this session (Sessions 5+)
+//
+// What this module does NOT do (lives elsewhere):
+//   - LoS / steering / move-with-collision — `stb/stbai.bsm`
+//   - Pathfinding A* — `stb/stbpath.bsm`. This module is the
+//     first consumer of both libraries together, and proves
+//     the territory split (continuous-space primitives vs
+//     discrete-grid search) by composing them in one function.
+//   - Combat / damage — Session 3 (`combat.bsm` future sibling)
+//   - Entity storage — `stb/stbecs.bsm` (this module just walks it)
+//
+// Composition rule the AI uses every frame:
+//   1. LoS to player is clear → ai_seek straight (fast path)
+//   2. LoS blocked but still within sight range → path_find via
+//      A*, walk toward the first waypoint (slow path but smart)
+//   3. Out of sight range → IDLE (no work)
+
+import "stbai.bsm";        // los, dist, seek, step_collide
+import "stbpath.bsm";      // A* fallback when LoS to player is blocked
+import "stbecs.bsm";       // capacity / alive / component_at
+import "stbphys.bsm";      // FPSBody — player struct shape
+import "stbtile.bsm";      // tile_get / tile_is_solid (for the sync)
+
+// ── Per-entity payload shape ───────────────────────────────
+//
+// Lives here (not in fps_wolf3d.bpp) so this module's typed
+// access to `ep.kind`, `ep.x`, etc. has the struct visible at
+// parse time. `load "ai.bsm"` near the top of the game file
+// hoists this definition above every consumer site, so the
+// packer in fps_wolf3d.bpp picks it up too.
+//
+// Field semantics:
+//   kind     — 1 = enemy, 2 = door (matches the shader code in
+//              `assets/shaders/fps_raycast.metal`)
+//   state    — FSM index (_ENEMY_IDLE / _ENEMY_CHASE etc.)
+//   x, y     — world position in cell units (FPSBody convention)
+//   vx, vy   — velocity in cells/sec (zero for idle entities)
+//   hp       — remaining health (Session 3 fills this in)
+//   cooldown — generic countdown in seconds (kind-specific meaning).
+//              `half float` (BASE_FLOAT + SL_HALF) so the per-frame
+//              decrement loop in `wolf_ai_tick_cooldowns` matches
+//              the autovec P1 pattern (`arr[i].cooldown =
+//              arr[i].cooldown - dt`) and gets 4-wide SIMD emission.
+struct WolfEntPayload {
+    kind:     byte,
+    state:    byte,
+    x: float, y: float,
+    vx: float, vy: float,
+    hp:       half,
+    cooldown: half float
+}
+
+// ── FSM states for the Wolf3D enemy ────────────────────────
+
+const _ENEMY_IDLE  = 0;
+const _ENEMY_CHASE = 1;
+
+// Sight + behaviour tuning. NOT declared as `const` — B++ const
+// slots silently demote float literals to int (e.g. `0.3` becomes
+// `0`), per feedback memory `feedback_const_float_demotes`. The
+// tunings live as locals inside `_enemy_step` instead. When
+// const learns float typing, hoist these back to module scope.
+//
+//   sight_range = 12.0   cells — beyond this, LoS scan is skipped
+//   speed       =  1.8   cells/sec
+//   stop_dist   =  0.8   cells — close enough to player (no closer)
+//   radius      =  0.3   hitbox half-extent
+
+// Shared scratch state — Vec2 outputs from ai_seek (velocity)
+// and ai_step_collide (next position), plus the PathFinder and
+// the waypoint output buffer used by the A* fallback. All
+// allocated once at module init and reused across every enemy
+// every frame — zero allocator pressure per tick.
+//
+// `_pf_path_buf` capacity = 64 cells, plenty for a 16×16 demo
+// (worst-case diagonal path is ~22 cells); raise alongside any
+// larger map.
+const _PF_PATH_MAX = 64;
+static extrn _ai_vel: Vec2;       // ai_seek output (velocity vec)
+static extrn _ai_pos: Vec2;       // ai_step_collide output (new pos)
+static extrn _pf;
+static extrn _pf_path_buf;
+
+// Module-scope cap mirror — wolf_ai_init records the ECS
+// capacity here so per-frame hot loops (notably
+// `wolf_ai_tick_cooldowns`) can use a global bound instead of a
+// function parameter. Smart-dispatch gate 5 rejects loops whose
+// bound is a function parameter; the global bound makes the loop
+// outlining-eligible AND autovec-eligible at the same time.
+global _wolf_ent_cap;
+
+// Module init — call once from the game's init_phase before
+// wolf_ai_step_all runs. Allocates the scratch buffers + the
+// PathFinder, then mirrors the Tilemap's solid cells into the
+// PathFinder's internal `blocked` array.
+//
+// The sync is one-shot because Wolf3D walls don't move at
+// runtime. Sessions that mutate the map (destructible walls,
+// doors that close in real time) must call
+// `path_set_blocked(_pf, gx, gy, …)` themselves on each change.
+//
+// `tm` is the live Tilemap; `w, h` its dimensions in cells. This
+// 10-line sync loop is the first instance of stbpath ↔ stbtile
+// integration in the project — promote to a sibling cartridge
+// `stbpath_tilemap.bsm` when a second consumer appears.
+void wolf_ai_init(tm, w, h) {
+    // Scratch Vec2s for ai_seek + ai_step_collide outputs. The
+    // initial (0, 0) values get overwritten on the first AI tick;
+    // we just need backing storage. `vec2_new` is the canonical
+    // float-typed allocator from `bpp_math.bsm`.
+    _ai_vel      = vec2_new(0.0, 0.0);
+    _ai_pos      = vec2_new(0.0, 0.0);
+    _pf          = path_new(w, h);
+    // path_find writes (gx, gy) word pairs — 2 words = 16 bytes per
+    // waypoint slot. Buffer must be max_steps * 16 bytes per the
+    // stbpath contract.
+    _pf_path_buf = malloc(_PF_PATH_MAX * 16);
+    wolf_ai_resync_walls(tm, w, h);
+}
+
+// Late init: game passes the ECS world capacity so per-frame hot
+// loops in this module can use a module-global bound (gate-5
+// requirement for smart-dispatch / autovec eligibility).
+void wolf_ai_set_capacity(cap) {
+    _wolf_ent_cap = cap;
+}
+
+// Re-mirror the Tilemap's solid bits into the PathFinder's
+// `blocked` array. Cheap (w × h cell scans, no allocation).
+// Call after any level change — initial load OR hot-reload from
+// the editor — so A* fallbacks see the current walls.
+void wolf_ai_resync_walls(tm, w, h) {
+    auto gx, gy, t;
+    for (gy = 0; gy < h; gy++) {
+        for (gx = 0; gx < w; gx++) {
+            t = tile_get(tm, gx, gy);
+            path_set_blocked(_pf, gx, gy, tile_is_solid(tm, t));
+        }
+    }
+}
+
+// ── Per-enemy step ─────────────────────────────────────────
+
+// Step one enemy entity. Reads the player position to decide
+// chase vs idle, then mutates payload.x/y/vx/vy and .state in
+// place. `tm` is the level Tilemap (used for LoS + collision).
+//
+// Sprite kind dispatch lives in the caller — this function only
+// runs for entities whose kind == 1 (enemy in Wolf3D's encoding).
+// Move the enemy by one tick toward `(tx, ty)` at `speed`,
+// updating payload position via ai_step_collide. Factored out
+// because both the direct-seek and A*-waypoint branches do
+// exactly this once they've picked a target point.
+static void _step_toward(ep: WolfEntPayload, tx: float, ty: float,
+                         speed: float, radius: float, dt: float,
+                         tm)  {
+    auto (vx, vy, nx, ny): float;
+    ai_seek(ep.x, ep.y, tx, ty, speed, _ai_vel);
+    vx = _ai_vel.x;
+    vy = _ai_vel.y;
+    ep.vx = vx;
+    ep.vy = vy;
+    ai_step_collide(tm, ep.x, ep.y, vx, vy, radius, dt, _ai_pos);
+    nx = _ai_pos.x;
+    ny = _ai_pos.y;
+    ep.x = nx;
+    ep.y = ny;
+}
+
+static void _enemy_step(ep: WolfEntPayload, p: FPSBody,
+                        tm, dt: float)  {
+    auto d: float, can_see;
+    auto (sight_range, speed): float;
+    auto (stop_dist, radius): float;
+    auto sx, sy, gx, gy, waypts;
+    auto (wpx, wpy): float;
+
+    sight_range = 12.0;
+    speed       = 1.8;
+    stop_dist   = 0.8;
+    radius      = 0.3;
+
+    d = ai_dist(ep.x, ep.y, p.x, p.y);
+
+    // Already in melee range — no movement, no work. Session 3
+    // turns this branch into ATTACK windup.
+    if (d <= stop_dist) {
+        ep.state = _ENEMY_IDLE;
+        ep.vx = 0.0;
+        ep.vy = 0.0;
+        return;
+    }
+
+    // Out of sight range entirely — wander/idle. The DDA LoS scan
+    // is skipped here, so this branch is the cheapest one (no
+    // sqrt, no A*).
+    if (d >= sight_range) {
+        ep.state = _ENEMY_IDLE;
+        ep.vx = 0.0;
+        ep.vy = 0.0;
+        return;
+    }
+
+    // Inside sight range. Two ways to be aware of the player:
+    //  (a) LoS clear → walk straight (fast, every-frame path).
+    //  (b) LoS blocked → ask A* for a route around walls.
+    can_see = ai_los_clear(tm, ep.x, ep.y, p.x, p.y);
+    if (can_see != 0) {
+        ep.state = _ENEMY_CHASE;
+        _step_toward(ep, p.x, p.y, speed, radius, dt, tm);
+        return;
+    }
+
+    // A* fallback. Re-query every frame because Wolf3D's map is
+    // small (16 × 16) and the search is well under a millisecond.
+    // path_find writes (gx, gy) word pairs starting at index 0;
+    // index 0 is the enemy's current cell, index 1 is the first
+    // move target. We walk toward that cell's CENTER (gx + 0.5,
+    // gy + 0.5) so the step direction aligns with the grid even
+    // when the enemy is offset within its current cell.
+    sx     = floor_int(ep.x);
+    sy     = floor_int(ep.y);
+    gx     = floor_int(p.x);
+    gy     = floor_int(p.y);
+    waypts = path_find(_pf, sx, sy, gx, gy, _pf_path_buf, _PF_PATH_MAX);
+    if (waypts < 2) {
+        // No route (player walled off or already on same cell).
+        // Idle until something changes.
+        ep.state = _ENEMY_IDLE;
+        ep.vx = 0.0;
+        ep.vy = 0.0;
+        return;
+    }
+    ep.state = _ENEMY_CHASE;
+    wpx = _pf_path_buf[2] + 0.5;
+    wpy = _pf_path_buf[3] + 0.5;
+    _step_toward(ep, wpx, wpy, speed, radius, dt, tm);
+}
+
+// ── World-level step ───────────────────────────────────────
+
+// Run AI for every alive entity in `world` against `player` (an
+// FPSBody) and the Tilemap `tm`. Dispatch is by
+// `WolfEntPayload.kind` (1 = enemy, 2 = door, …). Per Tonify
+// Rule 4 the wrapper inherits `@solo` because it both reads and
+// writes per-entity heap state.
+// Cooldown tick — separate hot loop that decrements every entity's
+// `cooldown` field by `dt`. Designed to match autovec pattern P1
+// exactly: single-statement T_MEMST body with BASE_FLOAT + SL_HALF
+// hint and same-shape load/store on `e.cooldown`. The compiler's
+// matcher (commits 376ff2f → c9f1d7a → 4bc79dd) flags the loop and
+// P5 lowers it to a 4-wide SIMD vector loop + scalar tail.
+//
+// Caller (game tick) calls this BEFORE wolf_ai_step_all so AI logic
+// sees the freshly-decremented cooldown. Cooldown semantics:
+//   < 0  → ready to fire (combat module checks)
+//   > 0  → counting down
+//
+// Walks the full payload buffer including non-alive slots. The
+// non-alive slots' cooldown is dontcare (kind == 0 means the slot
+// is empty), so harmlessly decrementing them avoids the
+// `if (alive) continue;` shape that would reject at gate 8.
+//
+// Bound MUST be a global / const literal for outlining to also
+// catch the loop (gate 5). `cap` here is a function parameter; if
+// outlining is desired later, hoist `cap` to a module-scope global
+// or pass via a captured struct.
+// `dt` accepted as full-precision `: float` — the matcher only
+// requires the STORE hint to be half-float; the RHS arithmetic
+// promotes naturally. Passing full-precision avoids a narrowing
+// W010 at the call site.
+void wolf_ai_tick_cooldowns(dt: float, payload) @safe {
+    auto i;
+    for (i = 0; i < _wolf_ent_cap; i++) {
+        auto e: WolfEntPayload;
+        e = payload + i * sizeof(WolfEntPayload);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+
+void wolf_ai_step_all(dt: float, world, payload, tm, p)  {
+    auto cap, i, ep: WolfEntPayload, pb: FPSBody;
+    pb  = p;
+    cap = ecs_capacity(world);
+    for (i = 0; i < cap; i++) {
+        if (ecs_alive(world, i) == 0) { continue; }
+        ep = ecs_component_at(payload, i, sizeof(WolfEntPayload));
+        if (ep.kind == 1) {
+            _enemy_step(ep, pb, tm, dt);
+        }
+        // kind == 2 (door): no AI in this session — Sessão 5
+        // adds open/closed animation state.
+    }
+}
