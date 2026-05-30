@@ -1,0 +1,110 @@
+// vswap_walls — funnel S1: decode Wolf3D VSWAP wall pages into a tileset.
+//
+// Reads the wall chunks of a VSWAP file (the [0, sprite_start) pages — each a
+// 64x64 COLUMN-MAJOR page of palette indices) plus a 768-byte RGB palette, and
+// emits a packed tileset:
+//   <out_dir>/walls.png   — a 16-column sheet of 64x64 RGBA tiles
+//   <out_dir>/walls.json  — the atlas_grid sidecar (type:atlas_grid, tile 64)
+// consumed by the engine's image_load / tile_bind_image, and the shape
+// games/fps already binds per wall_type (TEX_SIZE = 64).
+//
+// The palette is INPUT data — the game's own VGA palette, read from the .pal
+// file and never hardcoded here. Walls are opaque (alpha 255). 8-bit RGB
+// palettes (0..255) are used as-is; a 6-bit VGA palette (0..63) is scaled <<2.
+//
+// Usage: vswap_walls <VSWAP.WL1> <palette.pal (768-byte RGB)> <out_dir>
+
+import "stbpixels.bsm";   // pixels_save_png — Layer-1 codec, no GPU dependency
+
+const TILE = 64;          // Wolf3D wall = 64x64
+const SHEET_COLS = 16;    // tiles per sheet row
+
+main() {
+    auto vpath: ptr; auto ppath: ptr; auto out_dir: ptr;
+    auto vbuf, vsize, pal, psize, pmax, pshift;
+    auto chunk_count, sprite_start, n_walls, off_base;
+    auto sheet_rows, sheet_w, sheet_h, rgba, nbytes;
+    auto i, w, col, row, idx, page, tx, ty, px, py, dst, rc;
+    auto json, png_path, json_path;
+
+    if (argc_get() < 4) {
+        putstr_err("usage: vswap_walls <VSWAP.WL1> <palette.pal> <out_dir>\n");
+        return 1;
+    }
+    vpath = argv_get(1); ppath = argv_get(2); out_dir = argv_get(3);
+
+    vsize = 0; vbuf = file_read_all(vpath, &vsize);
+    if (vbuf == 0) { putstr_err("vswap_walls: cannot read VSWAP\n"); return 1; }
+    psize = 0; pal = file_read_all(ppath, &psize);
+    if (pal == 0) { putstr_err("vswap_walls: cannot read palette\n"); return 1; }
+    if (psize < 768) {
+        putstr_err("vswap_walls: palette must be >= 768 bytes (256 RGB)\n");
+        return 1;
+    }
+
+    // Detect 6-bit (VGA DAC, 0..63) vs 8-bit (0..255) palette. Scale 6-bit up.
+    pmax = 0; i = 0;
+    while (i < 768) { if (peek(pal + i) > pmax) { pmax = peek(pal + i); } i++; }
+    pshift = pmax <= 63 ? 2 : 0;
+
+    chunk_count  = peek_q(vbuf + 0);
+    sprite_start = peek_q(vbuf + 2);
+    n_walls  = sprite_start;
+    off_base = vbuf + 6;
+
+    sheet_rows = (n_walls + SHEET_COLS - 1) / SHEET_COLS;
+    sheet_w = SHEET_COLS * TILE;
+    sheet_h = sheet_rows * TILE;
+    nbytes  = sheet_w * sheet_h * 4;
+    rgba = malloc(nbytes);
+    i = 0; while (i < nbytes) { poke(rgba + i, 0); i++; }   // transparent base
+
+    // Decode each wall page (column-major) into its sheet cell (row-major).
+    w = 0;
+    while (w < n_walls) {
+        page = vbuf + peek_h(off_base + w * 4);
+        tx = w % SHEET_COLS;
+        ty = w / SHEET_COLS;
+        col = 0;
+        while (col < TILE) {
+            row = 0;
+            while (row < TILE) {
+                idx = peek(page + col * TILE + row);
+                px = tx * TILE + col;
+                py = ty * TILE + row;
+                dst = rgba + (py * sheet_w + px) * 4;
+                poke(dst + 0, peek(pal + idx * 3 + 0) << pshift);
+                poke(dst + 1, peek(pal + idx * 3 + 1) << pshift);
+                poke(dst + 2, peek(pal + idx * 3 + 2) << pshift);
+                poke(dst + 3, 255);
+                row++;
+            }
+            col++;
+        }
+        w++;
+    }
+
+    png_path = strbuf_new();
+    png_path = strbuf_cat(png_path, out_dir);
+    png_path = strbuf_cat(png_path, "/walls.png");
+    png_path = strbuf_ch(png_path, 0);              // NUL-terminate for path
+    rc = pixels_save_png(png_path, rgba, sheet_w, sheet_h);
+    if (rc != 0) { putstr_err("vswap_walls: PNG write failed\n"); return 1; }
+
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"type\":\"atlas_grid\",\"tile_w\":");
+    json = strbuf_num(json, TILE);
+    json = strbuf_cat(json, ",\"tile_h\":");
+    json = strbuf_num(json, TILE);
+    json = strbuf_cat(json, ",\"image\":\"walls.png\"}");
+    json_path = strbuf_new();
+    json_path = strbuf_cat(json_path, out_dir);
+    json_path = strbuf_cat(json_path, "/walls.json");
+    json_path = strbuf_ch(json_path, 0);
+    file_write_all(json_path, json, strbuf_len(json));
+
+    putstr("vswap_walls: "); putnum(n_walls); putstr(" walls -> ");
+    putnum(sheet_w); putstr("x"); putnum(sheet_h);
+    putstr(" sheet at "); putstr(out_dir); putstr("/walls.png (+ walls.json)\n");
+    return 0;
+}

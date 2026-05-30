@@ -1,0 +1,145 @@
+// vswap_sprites — funnel S2: decode Wolf3D VSWAP sprite pages into an atlas.
+//
+// Sprite pages (the [sprite_start, sound_start) chunks) are "compiled shapes":
+// column-post runs with transparency, not raw rasters. Layout of one page:
+//   int16 leftpix, rightpix           first / last non-empty column (0..63)
+//   uint16 dataofs[rightpix-leftpix+1] byte offset (from page start) to each
+//                                      used column's post list
+//   ... post lists + a pixel pool ...
+// A column's post list is repeated triplets of words, terminated by a 0 word:
+//   word endy        post end row, stored *2  (0 here = end of column)
+//   word pixstart    base byte offset into the page for this post's pixels
+//   word starty      post start row, stored *2
+// For each row yy in [starty/2, endy/2): the palette index is page[pixstart+yy]
+// (opaque). Every uncovered (col,row) stays transparent (alpha 0).
+//
+// Output: <out_dir>/sprites.png (16-col sheet of 64x64 RGBA tiles, with alpha)
+//       + <out_dir>/sprites.json (Aseprite frames[]; named animation tags are a
+//         later step — S4 ports the ECWolf sprite enums). The palette is INPUT
+//         data (the game's VGA palette), read from the .pal, never hardcoded.
+//
+// Usage: vswap_sprites <VSWAP.WL1> <palette.pal (768-byte RGB)> <out_dir>
+
+import "stbpixels.bsm";   // pixels_save_png — Layer-1 codec, no GPU dependency
+
+const TILE = 64;
+const SHEET_COLS = 16;
+
+main() {
+    auto vpath: ptr; auto ppath: ptr; auto out_dir: ptr;
+    auto vbuf, vsize, pal, psize, pmax, pshift;
+    auto chunk_count, sprite_start, sound_start, n_spr;
+    auto off_base, len_base, sheet_rows, sheet_w, sheet_h, rgba, nbytes;
+    auto i, s, chunk, clen, leftpix, rightpix, cx, cy;
+    auto col, lp, endraw, endy, pixstart, starty, yy, idx, px, py, dst;
+    auto json, jp, sx, sy;
+
+    if (argc_get() < 4) {
+        putstr_err("usage: vswap_sprites <VSWAP.WL1> <palette.pal> <out_dir>\n");
+        return 1;
+    }
+    vpath = argv_get(1); ppath = argv_get(2); out_dir = argv_get(3);
+
+    vsize = 0; vbuf = file_read_all(vpath, &vsize);
+    if (vbuf == 0) { putstr_err("vswap_sprites: cannot read VSWAP\n"); return 1; }
+    psize = 0; pal = file_read_all(ppath, &psize);
+    if (pal == 0 || psize < 768) {
+        putstr_err("vswap_sprites: palette must be a 768-byte RGB file\n");
+        return 1;
+    }
+    pmax = 0; i = 0;
+    while (i < 768) { if (peek(pal + i) > pmax) { pmax = peek(pal + i); } i++; }
+    pshift = pmax <= 63 ? 2 : 0;
+
+    chunk_count  = peek_q(vbuf + 0);
+    sprite_start = peek_q(vbuf + 2);
+    sound_start  = peek_q(vbuf + 4);
+    n_spr    = sound_start - sprite_start;
+    off_base = vbuf + 6;
+    len_base = vbuf + 6 + chunk_count * 4;
+
+    sheet_rows = (n_spr + SHEET_COLS - 1) / SHEET_COLS;
+    sheet_w = SHEET_COLS * TILE;
+    sheet_h = sheet_rows * TILE;
+    nbytes  = sheet_w * sheet_h * 4;
+    rgba = malloc(nbytes);
+    i = 0; while (i < nbytes) { poke(rgba + i, 0); i++; }   // fully transparent
+
+    s = 0;
+    while (s < n_spr) {
+        chunk = vbuf + peek_h(off_base + (sprite_start + s) * 4);
+        clen  = peek_q(len_base + (sprite_start + s) * 2);
+        leftpix  = peek_q(chunk + 0);
+        rightpix = peek_q(chunk + 2);
+        cx = (s % SHEET_COLS) * TILE;
+        cy = (s / SHEET_COLS) * TILE;
+        col = leftpix;
+        while (col <= rightpix) {
+            lp = chunk + peek_q(chunk + 4 + (col - leftpix) * 2);
+            while (1) {
+                endraw = peek_q(lp); lp = lp + 2;
+                if (endraw == 0) { break; }
+                endy     = endraw >> 1;
+                pixstart = peek_q(lp); lp = lp + 2;
+                starty   = peek_q(lp) >> 1; lp = lp + 2;
+                yy = starty;
+                while (yy < endy) {
+                    if (pixstart + yy < clen) {        // defensive bound
+                        idx = peek(chunk + pixstart + yy);
+                        px = cx + col; py = cy + yy;
+                        dst = rgba + (py * sheet_w + px) * 4;
+                        poke(dst + 0, peek(pal + idx * 3 + 0) << pshift);
+                        poke(dst + 1, peek(pal + idx * 3 + 1) << pshift);
+                        poke(dst + 2, peek(pal + idx * 3 + 2) << pshift);
+                        poke(dst + 3, 255);            // opaque
+                    }
+                    yy++;
+                }
+            }
+            col++;
+        }
+        s++;
+    }
+
+    jp = strbuf_new();
+    jp = strbuf_cat(jp, out_dir); jp = strbuf_cat(jp, "/sprites.png");
+    jp = strbuf_ch(jp, 0);
+    if (pixels_save_png(jp, rgba, sheet_w, sheet_h) != 0) {
+        putstr_err("vswap_sprites: PNG write failed\n"); return 1;
+    }
+
+    // Aseprite "Array" frames — one 64x64 frame per sprite, addressable by
+    // index. Named animation tags (guard_walk_N, ...) come in S4.
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"frames\":[");
+    s = 0;
+    while (s < n_spr) {
+        if (s > 0) { json = strbuf_ch(json, ','); }
+        sx = (s % SHEET_COLS) * TILE;
+        sy = (s / SHEET_COLS) * TILE;
+        json = strbuf_cat(json, "{\"filename\":\"sprite ");
+        json = strbuf_num(json, s);
+        json = strbuf_cat(json, "\",\"frame\":{\"x\":");
+        json = strbuf_num(json, sx);
+        json = strbuf_cat(json, ",\"y\":");
+        json = strbuf_num(json, sy);
+        json = strbuf_cat(json, ",\"w\":64,\"h\":64},\"rotated\":false,\"trimmed\":false,");
+        json = strbuf_cat(json, "\"spriteSourceSize\":{\"x\":0,\"y\":0,\"w\":64,\"h\":64},");
+        json = strbuf_cat(json, "\"sourceSize\":{\"w\":64,\"h\":64},\"duration\":100}");
+        s++;
+    }
+    json = strbuf_cat(json, "],\"meta\":{\"image\":\"sprites.png\",\"size\":{\"w\":");
+    json = strbuf_num(json, sheet_w);
+    json = strbuf_cat(json, ",\"h\":");
+    json = strbuf_num(json, sheet_h);
+    json = strbuf_cat(json, "},\"scale\":\"1\",\"format\":\"RGBA8888\",\"frameTags\":[]}}");
+    jp = strbuf_new();
+    jp = strbuf_cat(jp, out_dir); jp = strbuf_cat(jp, "/sprites.json");
+    jp = strbuf_ch(jp, 0);
+    file_write_all(jp, json, strbuf_len(json));
+
+    putstr("vswap_sprites: "); putnum(n_spr); putstr(" sprites -> ");
+    putnum(sheet_w); putstr("x"); putnum(sheet_h);
+    putstr(" sheet at "); putstr(out_dir); putstr("/sprites.png (+ sprites.json)\n");
+    return 0;
+}

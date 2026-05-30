@@ -26,6 +26,13 @@ CLI: `funnel <source> <kind> <input> <out_dir> [opts]`, e.g.
 `funnel wc1 map forest1.sms out/`.
 A `(source, kind)` pair selects one `(frontend, backend)` lane.
 
+**Now under one roof (2026-05-28):** `tools/funnel/` holds all five shipped
+lanes — `vswap_dump`, `vswap_walls`, `vswap_sprites` (Wolf3D) plus
+`wc1_sprite_convert`, `wc1_map_convert` (moved in from the old `tools/`, having
+done their one-shot rts1 conversion). Each is still a standalone `.bpp` tool; a
+single `funnel <source> <kind>` dispatcher is the eventual unification, and the
+shared backend (atlas packer + emitters) is the de-duplication step (S3).
+
 ## The three canonical output formats (already shipped — do not change)
 
 1. **Aseprite sprite** (`peasant.json`): `frames[]` (per-frame pixel rects +
