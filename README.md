@@ -1,6 +1,4 @@
-# B++ (MAX_V2) 
-
-## B++ 0.99
+ ## B++ 0.99
 
 B++ tools producing content for B++ games, on a stack where every byte — from the PCM decoder to the bus volume to the note scheduler — compiles from pure B++ source.
 
