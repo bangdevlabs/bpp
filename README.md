@@ -1,4 +1,4 @@
-# B++ 2 MONTHS 
+# B++ (MAX_V2) 
 
 ## B++ 0.99
 
@@ -6,22 +6,18 @@ B++ tools producing content for B++ games, on a stack where every byte — from 
 
 > **Version 0.99x**: B++ — **produced entirely inside the B++ toolchain by way of [Bang 9](bang9/)**
 
-**What's new in the compiler (May 21–25):**
-The compiler now does the structural work natural-for loops imply.
-**Inline** (S4 cost-model inliner) splices small `: base` helpers
-at every call site; **outline** (smart-dispatch capture rewriter)
-turns natural `for` loops over `@safe` hosts into
-`job_parallel_for_data` dispatches; **compose** (outline × autovec)
-runs SIMD inside the synthesised worker — 6× measured on
-`bench_compose.bpp`, ~32× theoretical ceiling. The two native
-backends collapsed their AST walkers into one shared spine
-(Wave 20 + 21, –1300 LOC of duplicated codegen) — the chip files
-are now pure primitive providers, so adding a third backend is a
-single file. A latent silent float→int store bug
-(`fmov`/`movq` reinterpret instead of `fcvtzs`/`cvttsd2si` truncate)
-fixed on both backends; cross-module global float types flow
-through the validator without per-consumer annotations; HUD
-overhead killed (60 fps held flat, no more 60→59→60 flicker).
+**Latest achievements (May 27–29):**
+
+- **Linux self-host shipped.** `bpp` compiles itself on Linux, gen2 == gen3 byte-identical in Docker. Two latent x86_64 operand-order bugs in the spine array builtins (`arr_len`, `arr_get`) found and fixed; the full test suite **passes on Linux for the first time (153/0/41)**.
+- **`bug --disasm` covers x86-64 ELF + ARM64 Mach-O.** A from-scratch disassembler shipped inside the debugger — "objdump in bug" — necessary because Rosetta blocks gdb/strace/core on a translated process. Two compiler bugs in two days were diagnosed by aiming it at the project's own binaries.
+- **Recycling allocator + parser overflow killed.** rts1's frame profile drove `bpp_mem` from mmap-per-malloc to a size-class free-list (**−37 % bootstrap**, 0.35 s → 0.22 s). Turning on full reuse exposed a fixed-buffer overflow class in the parser (per-decl / per-param / per-struct hint tables) that the old page-slack allocator had masked for the project's life — all three migrated to growable primitives; the "fixed buffer + cap + E-net" anti-pattern is gone.
+- **`file_stat` builtin + Aseprite-aware hot-reload.** New `sys_stat` lowered through `_core_<os>.bsm` returning a portable `{ is_dir, size, mtime }`. Hot-reload now polls by mtime + watches the Aseprite `meta.image` sibling PNG — editing a level or sprite in **Bang 9 updates the running game live**, `file_read_all` gone from the frame.
+- **Rule 42 closed via the disassembler.** A `: float` declarator was floating every neighbour in the same `auto` (pointer locals → doubles → SIGSEGV). Found in fps_wolf3d's bullet path via `scvtf` on a pointer op in `bug --disasm`; fixed by reading the parser's per-name hint array (`n.e[j]`) in a64 + x64 + C-emit. **Rule 43** (`auto (a, b, c): T;` grouped sugar) fell out the same arc once the per-name array was being consulted.
+- **x86_64 reached full optimization parity with ARM64.** Inline (single + multi + void), B1 expression-register freelist, B3 local promotion, B4 `: double` SIMD, and smart-dispatch outlining all live on both backends; the only differences are System V's tighter register budget vs AAPCS64.
+- **Bang 9 — the IDE — runs on Linux.** Three pre-existing bugs unlocked it: a Mach-O GOT page-straddle, an X11 `ConfigureNotify` resize gap, and a clip-rect / non-negative layout pass in stbui.
+
+**Earlier this month (May 21–25): structural-work compiler.**
+**Inline** (S4 cost-model inliner) splices small helpers at every call site; **outline** (smart-dispatch capture rewriter) turns natural `for` loops over `@safe` hosts into `job_parallel_for_data` dispatches; **compose** (outline × autovec) runs SIMD inside the synthesised worker — **6× measured** on `bench_compose.bpp`, ~32× theoretical ceiling. Both native backends collapsed their AST walkers into one shared spine (Wave 20 + 21, **–1300 LOC** of duplicated codegen). A latent silent float→int store bug fixed on both backends; HUD overhead killed (60 fps held flat).
 
 ---
 
@@ -421,7 +417,8 @@ stb is the game engine. It's not a wrapper around SDL or raylib — it **is** th
 | Module | What it does |
 |--------|-------------|
 | `stbasset` | Handle-based asset manager — `uint32` handles with 16-bit generation, dedup by path, ABA-safe stale detection, one table for sprites/sounds/music/fonts |
-| `stbimage` | Pure B++ PNG loader — DEFLATE, Huffman, all filter types, zero FFI |
+| `stbpixels` | Layer-1 PNG codec — `pixels_load` / `pixels_save_png` + width/height/depth/channels accessors, DEFLATE + Huffman + every PNG filter type, zero FFI. Split from `stbimage` (2026-05-29) so tools that need only the codec (funnel's `vswap_sprites`, atlas packers) don't drag the whole Image cartridge |
+| `stbimage` | Layer-2 Image struct — atlases, sprite/named lookup, mtime-based hot-reload with Aseprite `meta.image` sibling watching + cached sibling list, draw routines. Built on `stbpixels` |
  
 ### AND MANY MORE TO COME!!!!!
 
@@ -746,8 +743,8 @@ b++/
 
 | Target | Status |
 |--------|--------|
-| macOS ARM64 (Apple Silicon) | **Working** — native Cocoa + Metal GPU, SDL2, raylib |
-| Linux x86_64 | **Working** — static + dynamic ELF (FFI shared libs via PLT/GOT), X11 windowing (Bang 9 + games over XQuartz). GPU (Vulkan) door open + Docker-verified, driver calls stubbed until x86 hardware |
+| macOS ARM64 (Apple Silicon) | **Working** — native Cocoa + Metal GPU, SDL2, raylib. Self-hosting, suite 182/0/12. |
+| Linux x86_64 | **Self-hosting** — `bpp` compiles itself on Linux (gen2 == gen3 byte-identical in Docker, 2026-05-27). Full test suite **passes 153/0/41** (2026-05-28). Static + dynamic ELF (FFI shared libs via PLT/GOT). X11 windowing (Bang 9 + games over XQuartz). Full optimization parity with ARM64 (inline / outline / B1 / B3 / B4 SIMD). GPU (Vulkan) and audio (ALSA) door open + Docker-verified at the link layer; driver call bodies stubbed until tested on x86 hardware. |
 | Windows x86_64 | Planned — codegen + Win32 + DX12/Vulkan |
 | WebAssembly | Future — codegen + WebGPU |
 
@@ -762,7 +759,8 @@ GPU access is native per platform — Metal on macOS, Vulkan on Linux, DirectX 1
 
 **Linux x86_64:**
 - Cross-compile from macOS: `bpp --linux64 game.bpp -o game`
-- Run natively or in Docker — 45KB static binary, zero dependencies
+- Self-host on Linux: a Linux-built `bpp` defaults to ELF output (no `--linux64` flag needed). Self-hosting in Docker verified byte-stable across generations.
+- Run natively or in Docker — 45KB static binary for the simple path, dynamic ELF when FFI is needed
 
 ## The Compiler
 

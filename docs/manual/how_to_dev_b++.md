@@ -121,7 +121,32 @@ main() {
 
 ### Where the three-line program lives in the repo
 
-`examples/hello_world.bpp`. Open Bang 9 (or your editor), point at `examples/`, and this file plus a dozen siblings (`hello_window.bpp`, `snake_cpu.bpp`, `ui_demo.bpp`) are the learning on-ramp. Read the source, run the binary, modify, rebuild.
+`examples/hello_world.bpp`. Open Bang 9 (or your editor), point at
+`examples/`, and the 40+ files there are the learning on-ramp. Read the
+source, run the binary, modify, rebuild.
+
+Quick map of what's in there, by what you want to learn:
+
+| You want to learn | Look at |
+|---|---|
+| The minimum program | `hello_world.bpp` |
+| Opening a window | `hello_window.bpp`, `window_smoke.bpp` |
+| A game loop with stbgame | `hello_game.bpp`, `snake_cpu.bpp` |
+| GPU rendering | `snake_gpu.bpp`, `gpu_colours.bpp`, `gpu_pipeline_smoke.bpp` |
+| Palette cycling | `gpu_palette_cycle.bpp` |
+| Post-process effects (CRT etc.) | `fx_crt_smoke.bpp`, `fx_library_smoke.bpp` |
+| Sprite atlases | `atlas_smoke.bpp`, `atlas_batch_smoke.bpp` |
+| Parallax backgrounds | `parallax_smoke.bpp` |
+| Layout UI (stbui v2) | `stbui_layout_smoke.bpp` |
+| Mouse + input | `mouse_tester.bpp` |
+| Platformer physics | `platformer.bpp` |
+| 2.5D raycaster | `fps_3d_cpu.bpp`, `fps_3d_gpu.bpp` |
+| `@safe` effect annotation | `phase_lattice.bpp` (passes), `phase_lattice_bad.bpp` (fires W026) |
+| Profiler + `@profile` zones | `profile_zones_smoke.bpp` |
+| Autovec / outline / compose | `bench_autovec.bpp`, `bench_outline.bpp`, `bench_compose.bpp` |
+| Hash + array workload | `tablah.bpp`, `tablah_opt.bpp` |
+| Linux GPU/audio door | `gpu_door_linux.bpp` |
+| FFI — SDL / raylib | `sdl_demo.bpp`, `raylib_demo.bpp`, `snake_sdl.bpp`, `snake_raylib.bpp` |
 
 ---
 
@@ -131,21 +156,46 @@ main() {
 *Source: new (documents `src/bpp_import.bsm`:601-750 implicit behaviour)*
 *Status: COMPLETE — 2026-04-21*
 
-Every B++ program starts with nine modules already in scope. You do not need to `import` them. Their functions are globals. This is the "prelude" — the libraries the compiler auto-injects into every compilation unit.
+Every B++ program starts with **21 modules already in scope** (as of 2026-05-29). You do not need to `import` them. Their functions are globals. This is the "prelude" — the libraries the compiler auto-injects into every compilation unit, in dependency order, via `src/bpp_import.bsm`.
 
 ### The prelude
 
+**Runtime + platform substrate** (the OS-aware base layer):
+
 | Module | What it gives you | Examples |
 |--------|-------------------|----------|
-| `_core.bsm` (per-OS: `_core_macos.bsm` / `_core_linux.bsm`) | Memory allocator + runtime base | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
-| `bpp_io.bsm` | stdout / stderr output, stdin input | `put`, `put_err`, `putchar`, `putchar_err`, `putstr`, `putnum`, `putfloat`, `putline`, `putmsg`, `getchar`, `getenv` |
+| `_core.bsm` (per-OS: `_core_macos.bsm` / `_core_linux.bsm`) | Page primitives, startup globals | `_mem_alloc_pages`, `_mem_free_pages`, `_bpp_argc`, `_bpp_argv`, `_bpp_envp` |
+| `bpp_mem.bsm` | Portable heap (size-class free-list) | `malloc`, `malloc_aligned`, `free`, `realloc`, `memcpy` |
+| `bpp_time.bsm` | Portable monotonic clock | `_stb_get_time`, `_stb_get_time_us`, `_stb_get_time_ns` |
+| `bpp_thread.bsm` | Portable worker-thread spawn / wait | `_thread_spawn`, `_thread_wait` |
+| `bpp_runtime.bsm` | Crash + sampling | `panic`, `profile_start`, `profile_dump`, `profile_print_chains` |
+| `bpp_args.bsm` | argv / envp access | `argc_get`, `argv_get`, `envp_get`, `getenv` |
+| `_stb_platform.bsm` (per-OS) | Window + GPU + input + audio primitives | `_stb_init_window`, `_stb_poll_events`, `_stb_frame_wait`, `_stb_should_close`, `_stb_gpu_*`, ... |
+
+**Data primitives** (the language's stdlib core):
+
+| Module | What it gives you | Examples |
+|--------|-------------------|----------|
+| `bpp_array.bsm` | Dynamic word arrays with 16-byte shadow header | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_free`, `arr_clear`, `arr_last` |
+| `bpp_arr.bsm` | Growable **struct** arrays (AoS sibling of `arr_new`) | `arr_struct_new`, `arr_struct_alloc`, `arr_struct_at`, `arr_struct_count`, `arr_struct_reset`, `arr_struct_free` |
+| `bpp_hash.bsm` | Hash tables (word keys + string keys) | `hash_new`, `hash_set`, `hash_get`, `hash_str_new`, `hash_str_set` |
+| `bpp_buf.bsm` | Raw byte/word buffers + typed LE/BE read/write | `buf_byte`, `buf_word`, `buf_fill`, `buf_copy`, `read_u8/16/32/64`, `write_u8/16/32/64`, `peekfloat`, `pokefloat` |
 | `bpp_str.bsm` | C-string operations + dynamic string builder | `str_len`, `str_eq`, `str_cpy`, `str_ends`, `str_starts`, `str_dup`, `strbuf_new`, `strbuf_cat`, `strbuf_ch`, `strbuf_num`, `strbuf_len`, `strbuf_free` |
-| `bpp_array.bsm` | Dynamic arrays with 16-byte shadow header | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_free`, `arr_clear`, `arr_last` |
-| `bpp_buf.bsm` | Raw byte/word buffers + typed LE/BE read/write | `buf_byte`, `buf_word`, `buf_fill`, `buf_copy`, `read_u8/16/32/64`, `write_u8/16/32/64`, `read_u16be/u32be`, `write_u16be/u32be` |
-| `bpp_hash.bsm` | hash tables (word keys + string keys) | `hash_new`, `hash_set`, `hash_get`, `hash_str_new`, `hash_str_set` |
-| `bpp_math.bsm` | pure B++ sqrt, sin, cos | `sqrt`, `sin`, `cos`, `abs`, `min`, `max` |
-| `bpp_file.bsm` | file I/O | `file_read_all`, `file_write_all` |
-| `_stb_platform.bsm` (per-OS) | window, clock, input primitives | `_stb_init_window`, `_stb_get_time`, `_stb_poll_events`, `_stb_frame_wait`, `_stb_should_close` |
+| `bpp_arena.bsm` | Bump allocator — O(1) alloc + reset | `arena_new`, `arena_alloc`, `arena_reset`, `arena_free` |
+| `bpp_io.bsm` | Console output / input (smart-dispatch + width primitives) | `put`, `put_err`, `putchar`, `putchar_err`, `putstr`, `putnum`, `putfloat`, `putline`, `putmsg`, `getchar` |
+| `bpp_math.bsm` | Trig, Vec2, PRNG, clamp, abs/min/max | `sqrt`, `sin`, `cos`, `abs`, `min`, `max`, `clamp`, `rand_xor`, `vec2_*` |
+| `bpp_file.bsm` | File I/O | `file_read_all`, `file_write_all`, `file_stat`, `file_mtime` |
+| `bpp_path.bsm` | Asset path resolution (relative to binary) | `path_resolve_asset`, `_stb_user_config_dir` |
+| `bpp_json.bsm` | JSON reader + writer | `json_parse`, `json_root`, `json_object_get`, `json_object_get_string`, `json_*` |
+
+**Game / engine plumbing** (still auto-injected, but more game-oriented):
+
+| Module | What it gives you | Examples |
+|--------|-------------------|----------|
+| `bpp_beat.bsm` | Time-unit conversion (ms / µs / samples / BPM / frames) from one clock | `beat_ms`, `beat_us`, `beat_samples`, `beat_bpm_step` |
+| `bpp_job.bsm` | Worker pool + lock-free SPSC queues + `mem_barrier` | `job_parallel_for`, `job_parallel_for_data`, `_job_workers`, `_job_n_workers` |
+| `bpp_maestro.bsm` | Game loop split into solo / base / render phases, fixed-timestep accumulator | `maestro_loop`, `maestro_set_solo`, `maestro_set_render`, `maestro_set_base` |
+| `bpp_bench.bsm` | Benchmark helpers (`bench_run`, sample → median + min + max) | `bench_run`, `bench_print` |
 
 ### Why this works
 
@@ -196,6 +246,11 @@ calling them directly is reserved for new platform-layer bring-up
 or one-off probes. See Cap 26 for when to use `stbgame`'s 60-FPS
 wrappers; tools use `stbwindow` (per Tonify Rule 23 — cartridge
 minimalism, tools split from games at the window layer).
+
+The two minimal examples in the repo show both paths:
+`examples/hello_window.bpp` is the raw `_stb_*` tick loop above;
+`examples/hello_game.bpp` is the same shape wrapped in `stbgame` —
+read both side by side to see what stbgame adds.
 
 ---
 
@@ -472,7 +527,8 @@ fits in a byte.
 ### §4.4 — Type propagation
 
 The compiler tracks types through assignments + function calls in
-one pass (see Cap 21). Forward-declared variables inherit the
+one pass (the inference engine in `src/bpp_types.bsm`; full walk-through
+in `bootstrap_manual.md`). Forward-declared variables inherit the
 hint from their first use:
 
 ```c
@@ -623,10 +679,42 @@ Cross-references:
 - §4.6 — the `: u_word` family that separates signed/unsigned
   arithmetic dispatch (the same family of concerns).
 
-### §4.8 — What this chapter does NOT cover
+### §4.8 — Per-declarator hints and grouped sugar
 
-- **Type inference engine internals** — `src/bpp_types.bsm`, covered
-  in Cap 21 as part of parser/analysis pipeline.
+Two refinements landed 2026-05-29 that change how you write multi-name
+`auto` statements.
+
+**Per-declarator hints (Rule 42 — resolved).** Each name on an `auto`
+line carries its own type hint, independent of its neighbours:
+
+```c
+// Pre-2026-05-29 BUG (now fixed): `: float` infected EVERY name on
+// the line. `pr` and `p` were emitted as doubles, pointer arithmetic
+// ran in IEEE 754, and the first store SEGV'd. The compiler now reads
+// the per-name hint array directly. Mixing is safe.
+auto pr: Projectile, i, cap, p: WolfEntPayload, d: float;
+//        ^Projectile  ^word ^word  ^Payload    ^float — each correct.
+```
+
+**Grouped-annotation sugar (Rule 43).** When a run of names share the
+same type, parenthesise them:
+
+```c
+auto (a, b, c): Node;             // three Node-typed locals
+auto (x, y, z): float;            // three doubles
+auto (binop, node, ln): Node;     // dog-fooded in the compiler itself
+
+// equivalent to (and prefer over):
+auto a: Node, b: Node, c: Node;
+```
+
+Pick the grouped form whenever two or more names share a single type;
+keep the comma form when every name needs a different annotation.
+
+### §4.9 — What this chapter does NOT cover
+
+- **Type inference engine internals** — `src/bpp_types.bsm`. See
+  `bootstrap_manual.md` for the compiler-internal walk-through.
 - **Struct / enum declaration syntax** — Caps 10 / 11.
 - **Runtime type representation** — there isn't one. All values are
   just 64-bit words; hints live only in the compile-time symbol
@@ -642,8 +730,10 @@ Cross-references:
 
 Functions are the unit of scheduling in B++. Every function has
 a signature, optional effect annotation, and a body. The effect
-annotation is the lever that drives smart dispatch (Cap 22) and
-the maestro concurrency pattern (Cap 24).
+annotation is the lever that drives smart dispatch and the
+maestro concurrency pattern (Cap 24). The compiler-internal
+dispatch + classifier infrastructure is covered in
+`bootstrap_manual.md`.
 
 ### §5.1 — Declaration syntax
 
@@ -780,17 +870,21 @@ runs whether or not the function is annotated; the annotation is the
 mechanism that turns the classifier's result into a diagnostic.
 `@safe` claims a property; the compiler proves or refutes the claim.
 
-**Inlining is automatic.** Small pure helpers (single-statement
-trivial returns up to multi-statement bodies meeting the S4 cost
-model — caller fan-out × callsite hotness × const-arg savings) get
-spliced at every call site without any annotation. Programmers should
-write the idiomatic accessor (`get_x(p)` returning `p.x`) instead of
-manually inlining for performance — the compiler eliminates the call
-frame and emits the same code as the manual inline would. The
-opposite annotation (`@no_inline`) does NOT exist: per Tonify Rule 4,
-user-facing annotations earn their keep by catching a bug class
-(`@safe`) or driving instrumentation codegen (`@profile`); inlining
-heuristics belong inside the compiler, not at the source level.
+**Inlining is automatic.** Three forms ship: single-return helpers
+(Phase B2), multi-statement bodies meeting the S4 cost model (caller
+fan-out × callsite hotness × const-arg savings), and **void /
+statement-context helpers** that fall off the end without returning a
+value (VI, shipped 2026-05-27 — e.g. the A* heap-swap inside the sift
+loop). All three splice at every call site without any annotation.
+Both a64 and x64 carry the full inline pipeline (May 27 parity).
+Programmers should write the idiomatic accessor (`get_x(p)` returning
+`p.x`) instead of manually inlining for performance — the compiler
+eliminates the call frame and emits the same code as the manual
+inline would. The opposite annotation (`@no_inline`) does NOT exist:
+per Tonify Rule 4, user-facing annotations earn their keep by
+catching a bug class (`@safe`) or driving instrumentation codegen
+(`@profile`); inlining heuristics belong inside the compiler, not at
+the source level.
 
 #### The killer use case
 
@@ -803,6 +897,18 @@ contract that catches latent bugs before the program runs.
 The two CoreAudio callbacks in
 `src/backend/os/macos/_stb_audio_macos.bsm` (`_aud_square_cb`,
 `_aud_stream_cb`) are the canonical `@safe` consumers in the stdlib.
+
+Worked examples in the repo:
+
+- `examples/phase_lattice.bpp` — a function that legitimately holds
+  the `@safe` contract (bounded arithmetic, no allocation, no IO).
+  Compiles clean.
+- `examples/phase_lattice_bad.bpp` — same shape but the call graph
+  reaches `malloc` through a helper; the compiler fires **W026** at
+  build time so the violation never makes it to runtime.
+- `examples/bench_compose.bpp` — `@safe` on the outer host
+  unlocks both outlining and autovec, demonstrating compose × SIMD
+  (6× measured on the bandwidth-bound mul-by-literal loop).
 
 #### Migration history (2026-05-11)
 
@@ -834,9 +940,9 @@ call(cb, 42, "hello");   // invokes my_handler(42, "hello")
 ```
 
 Function pointers are 64-bit words stored in regular variables.
-Pass them through arrays (event handlers, scene registries — see
-Cap 34 `scene_register`), struct fields (ChipPrimitives — Cap 23),
-or returned from builder functions.
+Pass them through arrays (event handlers, scene registries via
+`stbscene`), struct fields (e.g. the compiler's own ChipPrimitives —
+see `bootstrap_manual.md`), or returned from builder functions.
 
 ### §5.6 — The Maestro pattern (introduction)
 
@@ -972,7 +1078,7 @@ Full details in Cap 24 (Maestro concurrency) and Tonify Rule 38.
 - **Struct / enum parameters** — Caps 10 / 11.
 - **Maestro scheduling internals** — Cap 24.
 - **Type system interactions** (hint propagation through calls) —
-  Cap 21.
+  see `bootstrap_manual.md` for the compiler-internal walk-through.
 
 ---
 
@@ -1203,7 +1309,7 @@ All three reside in `src/bpp_internal.bsm`. Import it only when hacking on the c
 
 A "packed ref" is a single 64-bit word encoding `(offset << 32) | length`. The parser creates them with `make_packed_tok(s, l)`. They let the tokenizer identify thousands of tokens with zero heap allocation.
 
-User programs import `bpp_str` for string work. The packed-ref API exists purely for the tokenizer's inner loop. Cap 21 describes where in the pipeline this API is consumed.
+User programs import `bpp_str` for string work. The packed-ref API exists purely for the tokenizer's inner loop. `bootstrap_manual.md` describes where in the parser/lexer pipeline this API is consumed.
 
 ### §6.5 — Common patterns
 
@@ -1280,20 +1386,21 @@ auto copy;
 copy = str_dup(source);    // allocates exactly str_len(source) + 1
 // Use copy, then:
 free(copy);
+```
 
 ---
 
-## Cap 7 — Arrays (bpp_array + bpp_buf)
+## Cap 7 — Arrays (bpp_array + bpp_arr + bpp_buf)
 
 *Depends on: Cap 4*
-*Source: legacy_docs/the_b++_programming_language.md §5*
-*Status: COMPLETE — 2026-04-26*
+*Source: legacy_docs/the_b++_programming_language.md §5; bpp_arr.bsm shipped 2026-05-20*
+*Status: COMPLETE — 2026-05-20*
 
-B++ has two distinct array shapes:
+B++ has **three** array shapes — pick by what you store and whether the size is known up front.
 
-**Dynamic arrays** (`arr_new` — TY_ARR): 16-byte shadow header holds length and capacity. Use `arr_push`/`arr_pop`/`arr_len`. Pointer returned points at element 0; header lives at `ptr - 16`. Free with `arr_free`.
+**Dynamic word arrays** (`arr_new` — TY_ARR): 16-byte shadow header holds length and capacity. Use `arr_push`/`arr_pop`/`arr_len`. Pointer returned points at element 0; header lives at `ptr - 16`. Free with `arr_free`. Stores one 64-bit word per slot.
 
-```
+```c
 auto a: array;
 a = arr_new();
 a = arr_push(a, 42);     // always reassign — may realloc
@@ -1303,9 +1410,26 @@ arr_get(a, 0);            // → 42
 a = arr_free(a);          // returns 0
 ```
 
-**Raw buffers** (`buf_word`/`buf_byte` — TY_PTR): no header. Size is known at allocation. Access via `buf[i]` (word) or `poke`/`peek` (byte). Free with `free(buf)` directly, not `arr_free`.
+**Dynamic struct arrays** (`arr_struct_new` — handle into Arr struct): the AoS sibling of `arr_new`. Stores fixed-size records (not just words) contiguously, grows on demand. Used heavily by the compiler since 2026-05-20 (VtEntry / GlEntry / FnMeta / FieldRec / ArchetypeRec) and by stb/games for any "growable list of typed records."
 
+```c
+struct Particle { x: float, y: float, life: word }
+
+auto a: Arr, idx, p: Particle;
+a = arr_struct_new(sizeof(Particle), 32);   // initial capacity
+idx = arr_struct_alloc(a);                  // returns index; may grow
+p = arr_struct_at(a, idx);                  // pointer; valid until next alloc
+p.x = 1.0; p.y = 2.0; p.life = 60;
+arr_struct_count(a);                        // live element count
+arr_struct_reset(a);                        // count := 0, keep buffer
+arr_struct_free(a);
 ```
+
+**Critical contract**: the pointer returned by `arr_struct_at` is valid **until the next `arr_struct_alloc`** that triggers a grow. Cache `idx` (a stable integer) across allocs, never the pointer. This is the canonical "alloc-then-at" idiom — pattern documented in the cartridge header.
+
+**Raw buffers** (`buf_word` / `buf_byte` — TY_PTR): no header. Size is known at allocation. Access via `buf[i]` (word) or `poke`/`peek` (byte). Free with `free(buf)` directly, not `arr_free`.
+
+```c
 auto w;
 w = buf_word(256);    // 256 × 8 bytes, no header
 w[0] = 42;            // word-indexed
@@ -1318,9 +1442,21 @@ free(b);
 ```
 
 **Which to use:**
-- Size unknown at allocation, grows dynamically → `arr_new`
-- Size known at allocation (Huffman tables, pixel buffers, audio PCM, vertex buffers, game entity pools) → `buf_word` or `buf_byte`
-- In practice: compiler internals use `arr_new`; every stb module and game uses `buf_word`/`buf_byte`
+- Growable list of words (event queue, hint codes, tokens) → `arr_new`
+- Growable list of structs (entities, type-table rows, declared functions) → `arr_struct_new` ✨ **prefer this over parallel `arr_new` arrays** — AoS layout beats SoA for cache locality and was the 2026-05-20 compiler refactor of 6 clusters.
+- Size known at allocation (Huffman tables, pixel buffers, audio PCM, vertex buffers, fixed entity pools) → `buf_word` / `buf_byte`
+- Per-frame scratch with O(1) free-all → `bpp_arena` (Cap 13 / bootstrap_manual.md)
+
+The "fixed buffer + cap + E-net" anti-pattern (declare `malloc(N)`, hope no caller overruns, hand-roll a bounds-check that emits a diagnostic) was retired in May 2026 after three latent overflows surfaced — `sd_*`, `dh_arr`, `ph_arr` — all migrated to growable primitives. If you find yourself reaching for `malloc(N)` of a hint or symbol table, reach for `arr` or `arr_struct` instead.
+
+Worked examples:
+- `examples/tablah.bpp` + `tablah_opt.bpp` — external 1M-entry
+  hashmap benchmark (Swift port). Exercises `arr_new` + `hash_*` at
+  scale; `tablah_opt.bpp` is the version after the iteration-API
+  upgrades the bench drove.
+- `examples/bench_compose.bpp` — `arr_new` + autovec; the bench
+  body is the canonical "fill an array, transform it, sum it"
+  shape that compose unlocks.
 
 ---
 
@@ -1430,19 +1566,161 @@ For single-byte access at any offset, use the inline builtins `peek(ptr)` / `pok
 
 ---
 
-## Cap 10 — Structs (bpp_struct)
+## Cap 10 — Structs
 
 *Depends on: Cap 4*
-*Source: legacy_docs/the_b++_programming_language.md §4.5 + new module bpp_struct.bsm*
-*Status: PENDING — module bpp_struct.bsm does not exist yet; Fase 1.2 creates it*
+*Source: parser (`src/bpp_parser.bsm` `add_struct_def` / `add_struct_field`); type system (`bpp_types.bsm`).*
+*Status: COMPLETE — 2026-05-29*
+
+Struct declarations are a language feature, not a library module. The parser
+recognises them; the type system tracks their layout; the codegen emits
+field-offset arithmetic. There is no `bpp_struct.bsm` to import.
+
+### §10.1 — Declaration
+
+```c
+// Plain word fields (8 bytes each):
+struct Vec2 { x, y }
+
+// Mixed slice annotations control packing:
+struct Entity {
+    hp: half,          // offset 0, 4 bytes
+    level: byte,       // offset 4, 1 byte
+    flags: bit4,       // offset 5, 4 bits
+    team:  bit2,       // offset 5, 2 bits (packs with flags)
+    pos_x, pos_y,      // offsets 8, 16 — plain words
+    vel: double        // offset 24, 16 bytes (SIMD)
+}
+
+// Newtype — a distinct type sharing the layout of another struct.
+// World vs Grid mixing becomes a compile error (Excalibur Arc, May 12).
+struct WorldPos as Vec2
+struct GridPos  as Vec2
+```
+
+Fields are listed inside `{ }`, separated by commas. The parser builds a
+`FieldRec` per field (`field_p`, `hint`, `byte_off`, `bit_off`) inside an
+`arr_struct<FieldRec>` per struct (migrated 2026-05-27 from four parallel
+fixed buffers — old `buf_word(64)` overflow class is gone).
+
+### §10.2 — Use
+
+Declare a local typed by the struct; access fields with `.name`:
+
+```c
+auto v: Vec2;
+v.x = 10;
+v.y = 20;
+
+// As a pointer to existing memory:
+auto e: Entity;
+e = arr_struct_at(entities, idx);   // sets the pointer
+if (e.hp > 0) { e.hp = e.hp - 1; }
+```
+
+A `: <Struct>` annotation tells the compiler the size and field offsets. The
+compiler emits the narrowest load/store for sliced fields (`strb`/`strh` on
+bytes/halves, bit-mask reads on packed bits).
+
+### §10.3 — Sizeof + alloc
+
+```c
+auto p: Particle;
+p = malloc(sizeof(Particle));
+p.life = 60;
+// ... use p ...
+free(p);
+```
+
+`sizeof(Type)` is a compile-time integer. For a growable list of structs,
+use `arr_struct_new(sizeof(T), initial_cap)` (Cap 7).
+
+### §10.4 — The trap: sliced fields need a typed local
+
+A raw pointer + offset does NOT decode sliced fields. The compiler emits
+narrow-load/store ONLY through `.field` access on a typed local:
+
+```c
+// WRONG — n is untyped (word), *(n + 8) reads 8 bytes regardless of field slice.
+auto n;
+n = some_node;
+auto a = *(n + 8);                  // 8-byte read; if Node.a is `: half`,
+                                     // the high 4 bytes are garbage.
+
+// RIGHT — typed local, sliced field access uses the right width.
+auto n: Node;
+n = some_node;
+auto a = n.a;                       // emits the right `ldr`/`ldrh`/`ldrb`.
+```
+
+Tonify Rule 16 captures the rule formally.
+
+### §10.5 — Newtype identity
+
+`struct WorldPos as Vec2;` produces a distinct *type* sharing Vec2's *layout*.
+Passing a `GridPos` to a function declared `world_to_screen(p: WorldPos)` is a
+compile error (E050 / E248) — the bit pattern is compatible, the identity
+isn't. Newtypes have zero runtime cost; they exist only in the compile-time
+type table to catch coordinate-system mixing.
 
 ---
 
-## Cap 11 — Enums (bpp_enum)
+## Cap 11 — Enums
 
 *Depends on: Cap 4*
-*Source: legacy_docs/the_b++_programming_language.md §4.6 + new module bpp_enum.bsm*
-*Status: PENDING — module bpp_enum.bsm does not exist yet; Fase 1.3 creates it*
+*Source: parser (`src/bpp_parser.bsm`); type system tracks named constants.*
+*Status: COMPLETE — 2026-05-29*
+
+Enums in B++ are named integer constants resolved at compile time. They have
+no runtime representation; an enum value is just a word.
+
+### §11.1 — Declaration
+
+```c
+enum State { MENU, PLAY, OVER }       // 0, 1, 2
+enum Cmd  { NEW = 1, OPEN, SAVE }     // 1, 2, 3 — explicit start
+enum Dir  { UP = 0, DOWN, LEFT = 10, RIGHT }   // 0, 1, 10, 11
+```
+
+The values auto-increment unless an explicit `= N` resets the counter.
+There is no enum *type* — `State` is a parser-scope namespace for constants.
+A variable holding an enum value is just `auto`.
+
+### §11.2 — Use with switch
+
+```c
+auto s;
+s = MENU;
+// ... eventually s = PLAY; ...
+
+switch (s) {
+    MENU       { draw_menu(); }
+    PLAY       { tick(); render(); }
+    OVER       { draw_summary(); }
+    else       { panic("unknown state"); }
+}
+```
+
+Switch with value dispatch (Cap 3) accepts enum names directly because they
+are integer literals as far as the compiler is concerned. Comma syntax
+handles multi-value cases:
+
+```c
+switch (cmd) {
+    NEW, OPEN { reset_grid(); }
+    SAVE      { write_file(); }
+    else      {}
+}
+```
+
+### §11.3 — Why no enum struct type
+
+Adding a distinct type per enum would force pattern-matching and convert
+operators that are currently bit-identical to use cases. The Tonify R12
+decision: enums are integer constants, not a discriminated type. If you want
+type-distinct identity (e.g. `Direction != HitResult`), use `struct
+Direction as word` (Cap 10) — newtype gives the identity without the
+runtime cost.
 
 ---
 
@@ -1550,10 +1828,14 @@ panic: buf_alloc: negative capacity
   at main
 ```
 
-The classifier sees `panic` as `@io` (it writes to stderr), so
-any `@time` audio callback that reaches `panic` lights up W026
-at compile time. This catches realtime-IO violations before
-production hits an audible glitch.
+The classifier sees `panic` as touching IO (`sys_write` to stderr +
+`exit`), so any `@safe` function — audio callback or worker entry —
+that transitively reaches `panic` lights up W026 at compile time.
+This catches realtime-IO violations before production hits an
+audible glitch. (The phase lattice that used to spell this `@time`
+vs `@io` collapsed to a single `@safe` annotation on 2026-05-11; the
+classifier behaviour is identical, the annotation surface is one
+keyword.)
 
 C-path fallback: `bpp --c` rewrites the call to
 `(fprintf(stderr, "panic: %s\n", msg), abort(), 0LL)`. No stack
@@ -1677,6 +1959,12 @@ mcontext on the same tick. Without that, samples concentrate
 on whichever thread the kernel schedules and miss the others
 entirely.
 
+End-to-end demo: `examples/profile_zones_smoke.bpp` instruments
+three workload-tiered blocks with `@profile("heavy") { ... }` /
+`@profile("medium") { ... }` / `@profile("light") { ... }`, runs
+them for ~1 s, then dumps the per-zone aggregate (total_us +
+count) — the panel sorts them within ~1 second of running.
+
 ### §13.5 — Recursive dispatch guard
 
 `job_parallel_for` and `job_parallel_reduce` detect when they
@@ -1691,9 +1979,10 @@ guard makes it transparent.
 
 ### §13.6 — What this chapter does NOT cover
 
-- Worker-thread pthread_kill fan-out for SIGPROF on Linux —
-  blocked on ELF dynlink + thread parity. Cooperative path
-  covers single-threaded Linux today.
+- Worker-thread SIGPROF fan-out on Linux — ELF dynlink shipped
+  2026-05-28, but threads still wait on `clone(2)` + TLS wiring.
+  Single-threaded Linux works via the cooperative path; the
+  multi-worker SIGPROF path stays macOS-only until then.
 - Folded-stacks export (`flamegraph.pl` format) — the
   aggregator already produces the data, but the export sugar
   is YAGNI until a consumer asks.
@@ -1723,19 +2012,26 @@ That file is canonical: every new function in the codebase is
 written against its 20 rules from the first keystroke, not
 post-hoc cleanup. Read it once before contributing.
 
-A two-line preview of the rules:
+A three-line preview of the rules most worth remembering:
 
-- **Rule 1** — storage classes: `extrn` (write-once-after-init),
-  `global` (worker-shared), `const` (compile-time), `static` (private).
-- **Rule 4** — `@phase` annotations (`@base`, `@time`, `@io`, `@gpu`,
-  `@solo`) on functions where intent is obvious; the classifier
-  fills the rest.
-- **Rule 25** — `@profile("name") { ... }` block annotation that
-  pairs each instrumented region with a runtime aggregate visible in
-  the profile HUD. Shipped 2026-05-07 (Phase 6.3 of the GPU pipeline
-  roadmap).
+- **Rule 1** — storage classes: `auto` (default), `static` (module-private),
+  `extrn` (frozen post-init), `global` (worker-shared), `const`
+  (compile-time), `global const` / `static const` (immutable .data slots).
+- **Rule 4** — the only effect annotations are `@safe` (proven bounded /
+  alloc-free / IO-free by the call-graph classifier — fires W026 on
+  violation) and `@profile("name") { ... }` (block-scoped instrumentation
+  that pairs each region with a runtime aggregate in the profile HUD).
+  The phase lattice that used to spell this `@base` / `@time` / `@io` /
+  `@gpu` / `@solo` collapsed to a single `@safe` keyword on 2026-05-11 —
+  E260 catches the deprecated keywords.
+- **Rule 41** — Additive portability: per-OS / per-chip primitives live
+  in their own files; new targets ADD layers, never modify existing ones.
+- **Rule 42 / Rule 43** — per-declarator type hints (mixing `: float`
+  with other types in one `auto` is now safe) + grouped-annotation sugar
+  `auto (a, b, c): T;`. Both shipped 2026-05-29.
 
-Twenty-five rules total, ~1100 lines including examples and pitfalls.
+Forty-three rules total (Rule 42 / Rule 43 shipped 2026-05-29 alongside
+the per-declarator hint arc), ~3700 lines including examples and pitfalls.
 
 ---
 
@@ -1769,7 +2065,7 @@ The "general / battalion" mental model applies at FOUR layers of B++, each with 
 | **Data primitives** | `src/bpp_*.bsm` auto-injected (strings, arrays, hash, buf) | Every program, tool, game, stb module | User | `arr_push` canonical in `bpp_array.bsm` — consumers call it, do not reimplement |
 | **Runtime functions** | `src/bpp_runtime.bsm` declares the ABI contract; `src/backend/os/<os>/_core_<os>.bsm` implements it | Consumers call `malloc(n)` as a normal function | User + compiler | `malloc`, `free`, `realloc`, `memcpy`, `memset` |
 | **Inline builtins (codegen dispatch)** | `src/bpp_codegen.bsm` `cg_builtin_dispatch` | `src/backend/chip/<chip>/<chip>_primitives.bsm` | User (transparently) | `peek`, `poke`, `peek_w`, `poke_w`, `peekfloat`, `peekfloat_h`, `sys_write` — single-instruction primitives only; readers of pre-populated runtime globals (`argc_get`, `argv_get`, `envp_get`) live in Tier 1 (`src/bpp_args.bsm`), not here |
-| **Compiler-internal libraries** | `src/bpp_internal.bsm`, `src/bpp_struct.bsm`, `src/bpp_enum.bsm` | Parser, validator, codegen, dispatch | Compiler only (not auto-injected) | `buf_eq(a, b, len)` operates on raw byte ranges; `packed_eq(a, b)` on source-buffer slices; `struct_register(name)` on the metadata table |
+| **Compiler-internal libraries** | `src/bpp_internal.bsm`, `src/bpp_parser.bsm`, `src/bpp_types.bsm`, `src/bpp_codegen.bsm` | Parser, validator, codegen, dispatch | Compiler only (not auto-injected) | `buf_eq(a, b, len)` operates on raw byte ranges; `packed_eq(a, b)` on source-buffer slices; `add_struct_def` / `add_struct_field` register layouts into the per-struct `arr_struct<FieldRec>` |
 
 Four tiers, four canonical homes in `src/`. The fourth tier is where B++'s compiler-internal vocabulary lives — shapes and operations the compiler needs for its own work that user programs never see. Like the third tier (inline builtins), the fourth tier is HQ-controlled; unlike the third tier, it is not transparently available to user code.
 
@@ -1848,7 +2144,7 @@ When in doubt:
 
 A leaf module has zero `import` statements pointing at other stb files. It only depends on compiler builtins and auto-injected core modules. Leaf modules are testable in isolation.
 
-Examples of leaf modules today: `stbcol`, `stbcolor`, `stbecs`, `stbinput`, `stbpath`, `stbpool`, `stbscene`, `stbsound`.
+Examples of leaf modules today: `stbcol`, `stbecs`, `stbinput`, `stbpath`, `stbpool`, `stbscene`, `stbsound`, `stbgrid`, `stbcharsheet`.
 
 Couple a module only when the **purpose** demands it. `stbphys` imports `stbtile` because "platformer physics for tilemaps" is its purpose. `stbtile` imports `stbimage` because loading a tileset PNG needs a decoder. Those couplings are honest.
 
@@ -1889,15 +2185,19 @@ Before inventing a data structure, check whether one already exists:
 
 | Need | Module | Functions |
 |------|--------|-----------|
-| Dynamic array | `bpp_array` | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_clear`, `arr_free` |
+| Dynamic word array | `bpp_array` | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_clear`, `arr_free` |
+| Dynamic struct array (AoS) | `bpp_arr` | `arr_struct_new`, `arr_struct_alloc`, `arr_struct_at`, `arr_struct_count`, `arr_struct_reset`, `arr_struct_free` |
 | Hash map word→word | `bpp_hash` | `hash_new`, `hash_set`, `hash_get`, `hash_has`, `hash_del`, `hash_clear`, `hash_count`, `hash_free` |
 | Hash map bytes→word | `bpp_hash` | `hash_str_new`, `hash_str_set`, `hash_str_get`, ... |
 | Bump allocator (frame scope) | `bpp_arena` | `arena_new`, `arena_alloc`, `arena_reset`, `arena_free` |
 | Fixed-size object pool | `stbpool` | `pool_new`, `pool_get`, `pool_put`, `pool_free` |
 | Entity-component system | `stbecs` | `ecs_new`, `ecs_spawn`, `ecs_kill`, ... |
 | Growable string builder | `bpp_str` | `strbuf_new`, `strbuf_cat`, `strbuf_num`, `strbuf_ch`, `strbuf_free` |
-| Raw byte buffer | `bpp_buf` | `read_u8/u16/u32/u64`, `write_u8/u16/u32/u64` |
-| File I/O | `bpp_file` | `file_read_all`, `file_write_all` |
+| Raw byte buffer + LE/BE I/O | `bpp_buf` | `read_u8/u16/u32/u64`, `write_u8/u16/u32/u64`, `read_u16be/u32be`, `peekfloat`, `pokefloat` |
+| File I/O + metadata | `bpp_file` | `file_read_all`, `file_write_all`, `file_stat` (`{is_dir, size, mtime}`), `file_mtime` |
+| JSON read / write | `bpp_json` | `json_parse`, `json_root`, `json_object_get`, `json_object_get_string`, `json_array_*` |
+| Asset path resolution | `bpp_path` | `path_resolve_asset`, `_stb_user_config_dir` |
+| Vec2, PRNG, trig, sqrt | `bpp_math` | `sqrt`, `sin`, `cos`, `abs`, `min`, `max`, `clamp`, `rand_xor`, `vec2_*` |
 
 The compiler itself uses several directly: `arr_*` for function/extern/global tables, `hash_str_*` for symbol-lookup hashes, `buf_eq` from `bpp_internal.bsm` for byte comparison.
 
@@ -2456,6 +2756,19 @@ worker pool run it safely; the lack of annotation on `game_base`
 is the convention that lets the callback dispatch + return without
 needing the bounded discipline (it's main-thread code).
 
+### §24.10b — Working examples in the repo
+
+The canonical end-to-end maestro program is
+`games/snake/snake_maestro.bpp` — registers all four callbacks
+(init / solo / base / render), runs the SPSC mixer + a one-shot
+SFX, ships a music loop, and is what every other game in the
+repo cribbed its main-loop shape from. `games/pathfind/pathfind.bpp`
+and `games/rts1/rts.bpp` are the two larger consumers; rts1 is
+the stress test (200v200 unit simulation that drove the May 27
+allocator + file_stat arcs). The parallel-dispatch + `@safe`
+pattern shows up cleanly inside `wolf_ai_tick_cooldowns` in
+`games/fps/` (the May 22 outline + autovec compose target).
+
 ### §24.11 — What this chapter does NOT cover
 
 - **`bpp_job` internals** — SPSC ring layout, memory barriers,
@@ -2563,13 +2876,16 @@ buffer, mixer routes via voice slots.
 **stbinput** — keyboard, mouse, text-input ring buffer. 77 keys
 across 4 octaves, modifiers, action-rebinding via `action_define`.
 Frame-edge "pressed" detection separate from "down" hold-state.
+Demo: `examples/mouse_tester.bpp`.
 
 **stbwindow** — native dialogs (`window_save_dialog`, `window_alert`)
 and basic window queries. macOS via NSPanel/NSAlert, Linux via X11.
 
 **stbgame** — the game loop. `game_init` / `game_update(dt)` /
 `game_render` / `game_quit` callbacks. Owns frame timing and the
-quit flag. Built on `_stb_platform_<os>.bsm` underneath.
+quit flag. Built on `_stb_platform_<os>.bsm` underneath. Demos:
+`examples/hello_game.bpp` (minimum), `examples/snake_cpu.bpp`
+(CPU rendering), `examples/snake_gpu.bpp` (GPU).
 
 ## Drawing + UI (Caps 35-37)
 
@@ -2580,17 +2896,32 @@ tilemaps + level editing without re-malloc per frame.
 **stbui** — widgets on top of stbdraw: button, slider, dropdown,
 text_input, grid, palette swatch, scroll_view, tabs, tooltip.
 Theme system with `theme_dark` / `theme_light` / `theme_retro`
-presets.
+presets. v2 declarative layout API
+(`ui_box / ui_row / ui_col / ui_layout_end`, FIT/GROW/FIXED/PERCENT
+solver) shipped 2026-05-17 + a clip-rect stack on 2026-05-28 so
+content holds inside its panel. Demo: `examples/stbui_layout_smoke.bpp`.
 
-**stbimage** — PNG decode (deflate + Paeth + tRNS) and PNG write
-(uncompressed deflate). No FFI, no library — pure B++. Output
-buffer is RGBA32.
+**stbpixels** — Layer-1 PNG codec (split out of stbimage on
+2026-05-29). `pixels_load` + `pixels_save_png` + width / height /
+depth / channels accessors. DEFLATE + Paeth + tRNS + every PNG
+filter type. No FFI, no library — pure B++. Output buffer is
+RGBA32. Tools that need only the codec (atlas packers, funnel's
+vswap_sprites) import this directly without dragging in the Image
+struct.
+
+**stbimage** — Layer-2 Image abstraction on top of stbpixels.
+Atlas / sprite-id / named lookup, mtime-based hot-reload that
+watches the Aseprite `meta.image` sibling PNG (cached sibling
+list, re-parsed only when the manifest mtime changes — editing in
+Bang 9 updates the running game live), `image_draw_size` /
+`image_draw_size_tinted` draw routines.
 
 ## Sprite + Tile + Forge (Caps 38-40, 46)
 
 **stbpal** — palettes (count + ARGB array). Seven catalogs
 shipped (NES-54, GB-4, PICO-8, NKOTC-4, MCU-8, CB-32, DB-32),
 plus cycling, LUT (flash + generic), lerp, .pal.json save/load.
+Demo: `examples/gpu_palette_cycle.bpp`.
 
 **stbtile** — tilemap built on `Layer*` (byte grid). Load tileset
 PNG, slice into N×M cells, paint into level. Used by platformer +
@@ -2628,11 +2959,50 @@ right defaults — AoS belongs to the 1990s C++ era that modern AAA
 rationale + decision matrix.
 
 **stbphys** — platformer physics. Collide-and-slide AABB against
-Tilemap, gravity, jump, state machine (idle/run/jump/fall).
+Tilemap, gravity, jump, state machine (idle/run/jump/fall). Demo:
+`examples/platformer.bpp` (uses Kenney Pixel Platformer CC0
+assets). FPS chapter (`FPSBody` / `fps_walk` / `fps_turn`)
+documented under §2.5D below.
 
 **stbpath** — A* on grid. `path_new(cols, rows)`, `path_set_cost(x, y, c)`,
-`path_solve(sx, sy, gx, gy)`. Returns step list. ~80 LOC of A*, no
-heap during solve (pre-allocated open + closed sets).
+`path_solve(sx, sy, gx, gy)`. Returns step list. Binary min-heap
+with indexed decrease-key, Manhattan heuristic, no heap allocation
+during solve (pre-allocated open + closed sets).
+
+**stbflow** — flow-field pathfinding (one BFS per goal, all units
+sample). Drops N×A* to a constant cost when many units chase the
+same target — the RTS Stress Arc S4 fix.
+
+**stbai** — enemy AI primitives. Wander / chase / attack
+state-machine helpers, line-of-sight checks, steering. Genre-
+agnostic; per-game behaviour brains live in `games/<g>/<g>_ai.bsm`.
+
+**stbcamera** — 2D camera state + clamp + offset. Factored out of
+per-game `_camera_clamp` after rts1 + the platformer hit the same
+pattern. Supports HUD-inset worlds via `Camera2D.offset`.
+
+**stbcharsheet** — universal character sheet (HP / shields /
+energy / armor / damage / cooldown / etc.) consumed by RTS unit
+sheets, RPG party members, FPS enemies.
+
+**stbprojectile** — 2D / 3D projectile motion + lifecycle pool.
+`Projectile { x, y, z, vx, vy, vz, gravity_z, ... }` (spatial
+fields explicitly `: float` since 2026-05-29) + opaque
+`payload_w`. Built on stbpool; consumers wrap with targeting /
+collision / render policy.
+
+**stbgrid** — generic 2D cell storage (bytes or words per cell).
+Tier-1 leaf primitive consumed by occupancy / fog-of-war /
+tile-class / BFS scratch across rts1, fps, etc.
+
+**stbhud** — Tier-2 GPU HUD widgets (`hud_image` / `hud_bar` /
+`hud_render`) layered on stbui's layout engine. Games inside
+`game_render_begin` / `_end` get declarative layout without
+dragging stbimage into tools that pull only stbui.
+
+**stbmidi** — XMI / MIDI parser + per-channel tone scheduler
+routed through stbmixer. Drives WC1's converted soundtrack and any
+future MIDI-driven music.
 
 ## Engine plumbing (Caps 43-45)
 
@@ -2676,7 +3046,11 @@ cartridge stays content-blind on purpose: the caller dispatches
 `hit.wall_type` to a texture handle, so a future game with
 different wall types (DOOM clone, dungeon crawler) drops in
 without forking the ray cast logic. Composes with stbtile for map
-storage and stbrender for the per-column blit.
+storage and stbrender for the per-column blit. Worked examples:
+`examples/fps_3d_cpu.bpp` (software path) and
+`examples/fps_3d_gpu.bpp` (GPU column blit); the production
+consumer is `games/fps/fps_wolf3d.bpp` with the funnel-extracted
+Wolfenstein 3D Episode 1 atlas.
 
 **stbprofile** — runtime profiler HUD overlay. Wraps the
 auto-injected `bpp_runtime` profile primitives (`profile_start`,
@@ -2712,7 +3086,9 @@ running from any cwd find their shaders without code changes.
 `gpu_target_create / gpu_target_bind / gpu_present_target` give
 off-screen render-to-texture infrastructure; `gpu_uniform_set_*`
 + `gpu_bind_texture_*` cover the standard MTLBuffer / MTLTexture
-binding surface.
+binding surface. Demos: `examples/gpu_pipeline_smoke.bpp`,
+`gpu_pipeline_textured_smoke.bpp`, `gpu_timing_smoke.bpp`,
+`render_target_smoke.bpp`.
 
 **stbscene** — layered backgrounds with parallax. Three function
 calls per layer for the side-scroller depth illusion:
@@ -2721,7 +3097,7 @@ updates the global camera, `bg_draw_all()` iterates registered
 layers in order and dispatches one textured fullscreen quad per
 visible layer. The `bg_layer.metal` shader handles the parallax
 offset + normalised UV with NEAREST + repeat sampler for infinite
-tiling.
+tiling. Demo: `examples/parallax_smoke.bpp`.
 
 **stbfx** — post-process effect chain. Owns two scratch GPU
 targets internally and ping-pongs between them so any number of
@@ -2733,7 +3109,9 @@ effects. Four typed factories ship out of the box:
 `effect_crt(...)` (barrel + chromatic + scanlines),
 `effect_scanlines(...)`, `effect_chromatic(...)`,
 `effect_dither(...)` (4×4 Bayer). `effect_palette_quantize` is
-the planned 5th — needs stbpal integration.
+the planned 5th — needs stbpal integration. Demos:
+`examples/fx_crt_smoke.bpp`, `fx_library_smoke.bpp` (cycles all
+four), `fx_passthrough_smoke.bpp` (no-op chain for baseline).
 
 **`@profile("name") { ... }`** — Phase 6.3 compiler annotation
 that lowers at parse time to a synthesized `T_BLOCK` carrying
@@ -2764,9 +3142,9 @@ panel sorts them by total_us within ~1 second.
 
 ## Cap 48 — Compiler Flags Reference
 
-*Depends on: Cap 18*
-*Source: legacy_docs/manual/how_to_dev_b++.md Part 8*
-*Status: COMPLETE — 2026-04-27*
+*Depends on: Caps 1–13*
+*Source: `src/bpp.bpp` flag parser + `bootstrap_manual.md`*
+*Status: COMPLETE — 2026-04-27, last refreshed 2026-05-29*
 
 All flags are passed to `bpp` on the command line before the source file.
 
@@ -2794,40 +3172,66 @@ Monolithic mode is used by `--asm` and `--c` automatically. For native builds, m
 | Flag | Effect |
 |------|--------|
 | `--show-deps` | Print the module dependency graph and exit |
-| `--show-promotions` | Print `auto → extrn/global` promotion decisions |
-| `--show-phases` | Print per-function phase classification (BASE/REALTIME/HEAP/IO/GPU/SOLO) |
-| `--stats` | Print module/function/token counts to stderr |
+| `--show-promotions` | Print `auto → extrn/global` storage-class promotion decisions |
+| `--stats` | Print module / function / token counts and build timings to stderr |
 
-These flags exit after printing — they do not produce a binary.
+`--show-deps` and `--show-promotions` exit after printing — they do not
+produce a binary. (The legacy `--show-phases` flag was removed when the
+8-phase lattice collapsed to `@safe` on 2026-05-11.)
 
 ### Compatibility
 
 | Flag | Effect |
 |------|--------|
-| `--clean-cache` | No-op; kept for backward compatibility with scripts that used the old cache |
+| `--clean-cache` | No-op; accepted silently. The `.bo` cache was removed entirely on 2026-04-13. |
 
-The cache was removed entirely in 2026-04-13. This flag is accepted silently.
+### Debugger flags (`bug` binary, not `bpp`)
+
+| Flag | Effect |
+|------|--------|
+| `bug` *(no args)* | Open the GUI debugger (file picker, map browser, watch + viz panels) |
+| `bug file.bug` | GUI with a `.bug` map pre-loaded |
+| `bug --dump file.bug` | Text dump of every section the `.bug` map carries |
+| `bug --tui ./prog [args]` | Live REPL under debugserver/gdbserver — step + watch + locals |
+| `bug --tui --break fn ./prog` | Break only on function `fn` |
+| `bug --tui --watch "a, b" ./prog` | Watch expressions live on every stop |
+| `bug --bytes ./prog fn` | Hexdump function `fn`'s machine code (ELF + Mach-O) |
+| `bug --disasm ./prog fn` | Disassemble function `fn` (x86-64 ELF + AArch64 Mach-O) |
+
+`--bytes` + `--disasm` shipped 2026-05-27 as the "objdump in bug" path —
+necessary because Rosetta blocks gdb/strace/core on a translated x64
+process, so cross-architecture debugging on macOS goes through static
+binary inspection. Both read the `.bug` map for symbol → address
+resolution, then walk the binary directly.
 
 ### Quick reference for common workflows
 
 ```bash
-# Default: native ARM64 binary on macOS
+# Default: native binary for the host (ARM64 Mach-O on macOS, x86_64 ELF on Linux)
 bpp games/pathfind/pathfind.bpp -o /tmp/pathfind
 
-# Cross-compile for Linux, test in Docker
+# Cross-compile for Linux, test in Docker (macOS host)
 bpp --linux64 games/pathfind/pathfind.bpp -o /tmp/pathfind_linux
 
-# Debug build (required for bug debugger)
+# Emit the .bug map next to the binary (required by the `bug` debugger)
 bpp --bug games/pathfind/pathfind.bpp -o /tmp/pathfind
 
 # Inspect module graph
 bpp --show-deps src/bpp.bpp
 
-# Inspect phase annotations
-bpp --show-phases src/bpp.bpp | grep REALTIME
+# Inspect storage-class promotions
+bpp --show-promotions src/bpp.bpp
+
+# Build statistics (module / function / token counts, timings)
+bpp --stats src/bpp.bpp -o /tmp/bpp_test
 
 # Emit C for portability analysis
 bpp --c src/bpp.bpp > /tmp/bpp.c
+
+# Once the binary is built, drive the debugger against it:
+bug --disasm /tmp/pathfind path_solve     # disassemble path_solve
+bug --bytes  /tmp/pathfind path_solve     # hexdump path_solve's machine code
+bug --tui --watch "open_n, closed_n" /tmp/pathfind   # live REPL with watches
 ```
 
 ---

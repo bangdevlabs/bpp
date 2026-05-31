@@ -12742,3 +12742,164 @@ x64-only / ELF-only); gen1==gen2 byte-stable every step.
   path, x64 took the int path." Diffing the sibling primitive found each fix
   faster than reasoning from scratch — the same lesson the dynlink extern-routing
   fix taught this morning.
+
+## 2026-05-29 — the second dog-food lap: `: float` infected mixed `auto`, the disassembler caught it
+
+A bullet in fps_wolf3d SIGSEGV'd on first fire. The faulting store landed at
+address `0x22` — `(WolfEntPayload*) NULL + offsetof(hp)`. The trigger function
+`_proj_hit_check` opened with one line of mixed `auto`:
+
+```c
+auto pr: Projectile, i, cap, p: WolfEntPayload, d: float;
+```
+
+The melee scan a few lines below — same shape minus the trailing `: float` —
+never crashed. That asymmetry was the whole tell.
+
+### What the new disassembler found
+
+`bug --disasm` (built in the Linux self-host arc the day before) had grown an
+AArch64 path that morning so it could read Mach-O too — picker keyed off
+`bug_target` in the .bug map header (`bug_disasm.bsm` +580 lines, `bug.bpp`
+threaded through). Aiming it at `_proj_hit_check` printed:
+
+```
+scvtf  d0, x0       // pr = slot 0
+fmov   d1, #42.0
+fmul   d0, d0, d1   // (double)pr * 42  ← pointer arithmetic in floats
+scvtf  d0, x0       // p = ecs_component_at(...)
+```
+
+A `scvtf` on a pointer/struct assignment is impossible from correct codegen.
+`pr`, `i`, `cap`, `p` had all been emitted as floats because of the trailing
+`: float` on `d`. The compiler was **forcing every declarator in the statement
+to share the last name's type hint** — a 64-bit pointer rounded through a
+double lands near zero, and `p.hp = …` faulted at `0x22`. The first reading
+in `bug --disasm`'s output read off the bug.
+
+### The bug — one statement-wide field where the parser had a per-name array
+
+The parser had been collecting **per-declarator** hints into a parallel array
+attached to the T_DECL node as `n.e`; `n.c` had been kept only as the LAST
+hint seen on the line, used as a one-line fallback. Three code paths
+(`pre_reg_vars` in `a64_codegen.bsm`, the mirror in `x64_codegen.bsm`, and the
+inline-register path) read `n.c` and stamped it onto every name in the
+statement. The array had been *built* correctly for a long time; it had simply
+never been *read*. (Probably an old artefact from when the parser only
+captured one hint per `auto`.)
+
+Fix: one spine helper, used by all three sites.
+
+```c
+// src/bpp_codegen.bsm
+cg_decl_var_hint(n: Node, j) {
+    if (n.e != 0) { return arr_get(n.e, j); }
+    return n.c;
+}
+```
+
+`pre_reg_vars` (a64 + x64 + inline) now calls `cg_decl_var_hint(n, j)` per
+name. The fallback path (`n.e == 0`) keeps the old behaviour for any caller
+that constructed a T_DECL without the per-name array, e.g. the synthesized
+T_DECLs the dispatch outliner emits — those carry a single shared shape, and
+`n.c` is the right answer for them. `ast_clone_subst` shares the array by
+value, so inlined callee declarations resolve correctly across the splice
+boundary too.
+
+Bootstrap byte-stable through the change; `bug --disasm` on the patched
+binary showed clean integer code (`add` / `lsl` / `ldr` on the pointer ops,
+zero `scvtf`). The minimal probe `auto p: S, i, x: float;` that had reproduced
+the fault now types `p` and `i` as integer.
+
+Tonify Rule 42 was opened as the "diagnostic guardrail" right when the bug was
+found — "isolate floats on their own `auto` line." Once the fix landed, Rule
+42 was rewritten as **RESOLVED** with the prescription kept only as historical
+context. The bug is gone; mixing is now safe. (Residual: the `--c` emitter
+still floods the *slice* width — `: byte`/`: half` — onto neighbouring names.
+Its float handling is already per-name and correct; the slice gap is a
+separate one-line fix tracked at the bottom of Rule 42.)
+
+### Rule 43 — grouped-annotation sugar fell out as a side-quest
+
+While reading the parser to chase the per-declarator path, the dual lack
+became obvious: even with the per-name array correctly threaded, a programmer
+who wanted to type three locals with the same struct still had to spell
+`auto a: Node, b: Node, c: Node;`. The parser already buffered a parallel
+list; it just needed a `(` branch at the declarator position.
+
+New syntax: `auto (a, b, c): MyStruct;` — the type parses once and is pushed
+to every member's slot. Implemented in `parse_statement`'s declarator loop
+(grouped path uses `_struct_hint` captured by `try_type_annotation`, then
+`set_var_type` per member; primitive hints `_prim_hint` push into `dh_arr`
+the same way the per-name loop already did). Dog-fooded immediately in the
+compiler itself — `bpp_parser`, `bpp_io`, `bpp_math`, `src/bug.bpp` all now
+read `auto (a, b, c): Node;` shape. `tests/test_grouped_auto.bpp` covers the
+parser path; `tests/bench_mixed_auto.{bpp,sh}` benches the mixed-auto fix.
+
+Rule 43 is the inverse of Rule 42: 42 says "the compiler now handles mixed
+declarators correctly"; 43 says "and here's the sugar for the common case
+where you want the *same* type on a row of names."
+
+### The disassembler arc — second lap, second class of bug
+
+The pattern is becoming a doctrine in two iterations now: build the tool while
+chasing a bug, ship the tool, the *next* bug falls out of the tool. The first
+lap was the Linux self-host arc (`ef1f777` / `f671949` / `5da2e2b`): two x64
+operand-order bugs found because `bug --bytes` + `bug --disasm` could read a
+function's emitted bytes. The second lap was today: one parser/codegen hint
+bug found because the same disassembler now also reads ARM64 and the `scvtf`
+on a pointer was as legible as `16 - arr` had been the day before.
+
+Two latent compiler bugs in two days, both decades-class (in the sense that
+they had been in the codebase since the relevant feature was added), both
+found by aiming the project's own tool at a real game crashing. Neither
+showed up in the test suite — the suite's call graph never built the exact
+operand shape that triggered them. The games did.
+
+### Other work folded into the same uncommitted lump
+
+- **`stbimage` split into `stbimage` + `stbpixels`** (2026-05-28). 1090 lines
+  of pure PNG codec (`pixels_*`, IO helpers, the chunk reader, the inflate
+  path) moved out of `stbimage.bsm` into a new Layer-1 cartridge
+  `stb/stbpixels.bsm`. `stbimage` keeps the Image struct / atlas / hot-reload
+  / draw routines as Layer-2 over `stbpixels`. Per Rule 33's tier system —
+  pure pixel codec is the primitive, sprite-aware Image is the consumer.
+- **fps_wolf3d combat went live** — the funnel's VSWAP extraction (Wolf3D
+  Episode 1 sprites + walls) is now wired through `image_load` into
+  `fps_wolf3d.bpp`. Guard walk cycle (8 facing dirs × 4 walk poses),
+  hitscan firing with a 10° cone, melee range + attack cooldown, player HP.
+  `stbprojectile` for visible tracers (Wolf3D is hitscan, but a flying
+  tracer reads better). This game's first bullet is what found Rule 42.
+- **Funnel under one roof** — `tools/funnel/` now holds all five shipped
+  lanes: `vswap_dump`/`vswap_walls`/`vswap_sprites` (Wolf3D) plus
+  `wc1_sprite_convert`/`wc1_map_convert` (moved in from `tools/`, having
+  done their one-shot rts1 conversion). Each remains a standalone `.bpp`;
+  the single `funnel <source> <kind>` dispatcher + shared atlas
+  packer/emitters is the S3 unification step.
+- **Doc cleanup** — 14 closed sidequest docs (`sidequest_*.md`) moved to a
+  new top-level `legacy_docs/` folder so `docs/plans/` only carries open
+  arcs. Old `tools/sprite_viewer/`, `tools/wc1_*`, `tools/window_demo/`
+  retired to `legacy_tools/`.
+
+### Lessons
+
+- **A latent bug becomes "the compiler had this for years" the moment a tool
+  can read its codegen.** Both arcs this week were the same shape: the bug
+  predated the test suite that would have caught it, and the tool that found
+  it was built *to* read what the suite couldn't. Once `bug --disasm` exists,
+  the next codegen bug shows up because something in the project will trigger
+  it and the disassembler will spell it out. Worth keeping that loop hot.
+- **`scvtf` on a pointer/struct op is a smoking gun.** The same way "wild
+  address in arr_len" was the tell yesterday. Pattern-of-the-tell vocabulary
+  is a thing now; collect them in the `bug --disasm` doc as you find them.
+- **The compiler had the data — it just didn't read it.** A whole per-name
+  hint array existed and was correctly populated; three code paths reached
+  for the wrong field. The fix was a 4-line helper. The bug class is "two
+  representations of the same thing, only one is consulted." Keep an eye out
+  for these.
+- **Rule N solves a bug; Rule N+1 is often the ergonomic sugar the user would
+  have wanted next.** Rule 42 closed the float-infect bug; Rule 43 noticed
+  the parser already had everything in place to *also* support
+  grouped-annotation declarators. Don't pass the chance to fold the
+  follow-on in the same arc — it costs one extra commit and the doctrine
+  reads as one coherent move.
