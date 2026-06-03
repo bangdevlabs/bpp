@@ -66,7 +66,10 @@ const _AI_PEON_CAP    = 4;       // 1 chopper + up to 3 gold miners. The mine
                                  // gold income scales past the old 1-miner cap.
 const _AI_MIN_CHOPPERS = 1;      // keep at least one peon on wood (buildings +
                                  // some units cost wood); the rest mine gold.
-const _AI_ARMY_TARGET = 3;       // military to mass before pushing the enemy base
+const _AI_ARMY_TARGET = 6;       // military to mass before pushing the enemy base
+                                 // (WC2-sized force; reachable now that the AI
+                                 // builds supply farms on demand instead of
+                                 // capping at one).
 const _AI_DEFEND_RANGE_SQ = 36864;  // (12 tiles * 16 px)^2 — enemy within this of
                                     // our town hall triggers the defense response.
 const _AI_SCAN_MAX    = 64;      // scratch buffer capacity
@@ -96,6 +99,8 @@ static auto _ai_gold_n;            // peons currently gathering gold
 static auto _ai_wood_n;            // peons currently chopping wood
 static auto _ai_th_eid, _ai_barracks_eid, _ai_barracks_done;
 static auto _ai_farm_eid, _ai_farm_done;
+static auto _ai_stable_eid, _ai_stable_done;
+static auto _ai_train_flip;   // alternates barracks melee / ranged each train
 static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
 static auto _ai_enemy_hq, _ai_enemy_tgt;
 
@@ -169,12 +174,17 @@ static void _ai_bldg_visit(w, eid) {
         _ai_barracks_eid = eid;
         if (b.state == BLDG_STATE_DONE) { _ai_barracks_done = 1; }
     }
+    if (b.kind == BLDG_STABLE) {
+        _ai_stable_eid = eid;
+        if (b.state == BLDG_STATE_DONE) { _ai_stable_done = 1; }
+    }
     return;
 }
 
 static void _ai_scan_buildings(world) {
     _ai_th_eid = 0 - 1; _ai_barracks_eid = 0 - 1; _ai_barracks_done = 0;
     _ai_farm_eid = 0 - 1; _ai_farm_done = 0;
+    _ai_stable_eid = 0 - 1; _ai_stable_done = 0;
     _ai_scan_player = _ai_player;
     ecs_query_each(building_q, fn_ptr(_ai_bldg_visit));
     return;
@@ -409,41 +419,65 @@ static void _ai_heartbeat(mine) {
 
 // One strategic step (runs at 5 Hz).
 static void _ai_think(world) {
-    auto th_p: Pos, mine, menu, n, builder;
+    auto th_p: Pos, mine, menu, n, builder, pick;
     _ai_scan_buildings(world);
     if (_ai_th_eid < 0) { return; }                    // no hall left -> defeated
     _ai_scan_units(world);
     th_p = ecs_get(world, pos_comp, _ai_th_eid);
     mine = _ai_find_mine(world, th_p.x, th_p.y);
 
-    // Build order (always — no longer gated on a phase, so the AI can't
-    // stall in ECON forever): a farm first (raises the food cap from 4 to
-    // 8 so the army fits alongside the workers), then a barracks for
-    // military. _ai_build pulls a worker (idle preferred, else off
-    // mining); we exclude it from the worker pass below so it isn't
-    // re-sent to gather this tick.
+    // WC2 build order (always — never gated on a phase, so the AI can't
+    // stall in ECON forever). Priority chain, one building started per
+    // tick; _ai_build pulls a worker (idle preferred, else off mining) and
+    // we exclude it from the worker pass below so it isn't re-sent to
+    // gather this tick:
+    //   1. first farm   — raises supply 4 -> 8 so the early army fits.
+    //   2. barracks     — unlocks melee + ranged military.
+    //   3. supply farm  — whenever food used is within 2 of the cap, build
+    //                     another farm so the army is never supply-blocked
+    //                     (Stratagus AiNeedSupply). This is what lets the
+    //                     WC2 army actually reach _AI_ARMY_TARGET.
+    //   4. stable       — once the barracks stands, a stable unlocks the
+    //                     tier-2 mounted unit (knight / ogre-raider).
     builder = 0 - 1;
     if (_ai_farm_eid < 0) {
-        if (_ai_build(world, BLDG_FARM) != 0)     { builder = _ai_builder_eid; }
+        if (_ai_build(world, BLDG_FARM) != 0)         { builder = _ai_builder_eid; }
     } else if (_ai_barracks_eid < 0) {
-        if (_ai_build(world, BLDG_BARRACKS) != 0) { builder = _ai_builder_eid; }
+        if (_ai_build(world, BLDG_BARRACKS) != 0)     { builder = _ai_builder_eid; }
+    } else if (wc1_resources_food(_ai_player) >= wc1_resources_food_cap(_ai_player) - 2) {
+        if (_ai_build(world, BLDG_FARM) != 0)         { builder = _ai_builder_eid; }
+    } else if (_ai_stable_eid < 0 && _ai_barracks_done != 0) {
+        if (_ai_build(world, BLDG_STABLE) != 0)       { builder = _ai_builder_eid; }
     }
 
     // Economy (always): keep EVERY idle peon busy + train peons to the cap.
     _ai_manage_workers(world, th_p, builder, mine);
     _ai_try_train(world, _ai_th_eid, UNIT_PEASANT, _AI_PEON_CAP, _ai_peon_n);
 
-    // Military: once the farm + barracks stand, mass toward the army
-    // target. _ai_try_train gates on gold+wood affordability, so production
-    // paces with the economy. menu[0] is the barracks' basic melee unit
-    // (grunt for orcs, footman for humans).
+    // Military: once farm + barracks stand, mass a MIXED army toward the
+    // target. From the barracks, alternate melee (menu[0] = footman/grunt)
+    // and ranged (menu[1] = archer/spearman) each successful train so the
+    // WC2 force isn't all-melee; from the stable (when it stands) add the
+    // tier-2 mounted unit (menu[0] = knight/raider). _ai_try_train gates on
+    // gold+wood affordability AND the per-building one-in-flight queue, so
+    // production paces with the economy.
     if (_ai_farm_done != 0 && _ai_barracks_done != 0
         && _ai_army_n < _AI_ARMY_TARGET) {
         menu = buf_word(8);
         n = wc1_train_menu(BLDG_BARRACKS, _ai_player, menu);
         if (n > 0) {
-            _ai_try_train(world, _ai_barracks_eid, menu[0],
-                          _AI_ARMY_TARGET, _ai_army_n);
+            pick = (_ai_train_flip != 0 && n > 1) ? menu[1] : menu[0];
+            if (_ai_try_train(world, _ai_barracks_eid, pick,
+                              _AI_ARMY_TARGET, _ai_army_n) != 0) {
+                _ai_train_flip = _ai_train_flip == 0 ? 1 : 0;
+            }
+        }
+        if (_ai_stable_done != 0) {
+            n = wc1_train_menu(BLDG_STABLE, _ai_player, menu);
+            if (n > 0) {
+                _ai_try_train(world, _ai_stable_eid, menu[0],
+                              _AI_ARMY_TARGET, _ai_army_n);
+            }
         }
         free(menu);
     }
