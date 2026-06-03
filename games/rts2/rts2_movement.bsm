@@ -118,30 +118,33 @@ const _TERRAIN_BLOCKER = 0x7FFFFFFF;
 // and the tree-grid bootstrap in wc1_gather. A wider terrain
 // classifier (water / cliffs / transitions) graduates when the
 // second blocked-terrain class earns its slot.
-const _WC1_TREE_CLUSTER_LO = 71;
-const _WC1_TREE_CLUSTER_HI = 94;
+// WC2 terrain walkability table — one byte per tileset tile-group
+// (tile_id >> 4): 0 = walkable, 1 = forest (impassable but choppable for
+// wood), 2 = rock / water / wall (impassable, not choppable). Loaded from the
+// tileset's `.blk` sidecar (emitted by tools/funnel/war2_tiles from the mape
+// group flags + megatile colour) and set by rts2.bpp before wc1_movement_init.
+// 0 (unset) means "nothing blocks" — the safe default for legacy maps.
+global _terrain_blk;
 
-// Returns 1 if `tid` lies inside the forest tree cluster, else 0.
-// Exported (not `static`) so the input + gather modules consume
-// it directly without re-declaring the bounds.
-wc1_is_forest_tile(tid) {
-    if (tid >= _WC1_TREE_CLUSTER_LO && tid <= _WC1_TREE_CLUSTER_HI) {
-        return 1;
-    }
-    return 0;
+void wc1_movement_set_terrain_blk(buf) {
+    _terrain_blk = buf;
 }
 
-// Tile ID written into the map when a tree is felled — the cell
-// reverts to plain walkable grass (WC1 harvested forest clears to
-// ground). 109 is the canonical grass tile verified by frequency
-// analysis of forest1.sms (WC1_T_GRASS in rts1_map.bsm), so it
-// renders cleanly as cleared ground. The war1gus "removed-tree"
-// stump (95) was tried first but slice 95 of the CONVERTED forest
-// tileset reads as canopy, not a stump — so a chopped tile still
-// looked like trees and the peasant appeared to walk into the
-// forest. Grass makes the clearing obvious. Keep in sync with
-// _WC1_FELLED_TILE_ID in wc1_gather.bsm.
-const _WC1_FELLED_TILE = 109;
+// Returns 1 if `tid` is a choppable forest tile (.blk class 1). Exported (not
+// `static`) so the input + gather modules consume it directly. Empty cells and
+// the no-data case read as non-forest.
+wc1_is_forest_tile(tid) {
+    if (tid == 0 || _terrain_blk == 0) { return 0; }
+    return peek(_terrain_blk + (tid >> 4)) == 1;
+}
+
+// Tile value written into the map when a tree is felled — the cell
+// reverts to plain walkable grass so a chopped cell reads as cleared
+// ground and the pathfinder opens behind the worker. 82 is the most
+// common grass value in the WC2 summer maps (group 5, variation 2;
+// frequency analysis of alamo.json), so it renders cleanly as cleared
+// ground. Keep in sync with _WC1_FELLED_TILE_ID in wc1_gather.bsm.
+const _WC1_FELLED_TILE = 82;
 
 // Allocate every shared scratch resource the movement system
 // needs: A* pathfinder, flow field, flow scratch buffer, and the
@@ -164,19 +167,9 @@ const _WC1_FELLED_TILE = 109;
 // consumer; readers extrn it.
 global world_map;
 
-// WC2 terrain walkability — one byte per tileset tile-group (tile_id >> 4),
-// 1 = impassable (forest / rock / water / wall). Loaded from the tileset's
-// `.blk` sidecar (emitted by tools/funnel/war2_tiles from the mape group
-// flags) and set by rts2.bpp before wc1_movement_init. 0 (unset) means
-// "nothing blocks" — the safe default for legacy / palette-mode maps.
-global _terrain_blk;
-
-void wc1_movement_set_terrain_blk(buf) {
-    _terrain_blk = buf;
-}
-
-// 1 if a map tile id is impassable terrain (its tile-group is flagged blocked
-// in the .blk table). Empty cells (0) and the no-data case are walkable.
+// 1 if a map tile id is impassable terrain — both forest (.blk class 1) and
+// rock / water (class 2) block movement; only walkable (0) and the no-data
+// case pass. Used by the movement-init seeder to mark blockers.
 wc1_terrain_blocked(tile_id) {
     if (tile_id == 0 || _terrain_blk == 0) { return 0; }
     return peek(_terrain_blk + (tile_id >> 4));

@@ -75,6 +75,41 @@ static _extract_entry(cp: ptr, len_out: ptr) -> ptr {
     return dest;
 }
 
+// 1 if a megatile is green-dominant (i.e. forest / trees), else 0. Averages
+// the RGB of all non-transparent pixels across the 4x4 minitiles and tests
+// green > red and green > blue. Used to tell choppable forest apart from rock
+// and water among the impassable tile groups — the colour is unambiguous where
+// the mape type-code is not (a single type-code spans both grass and forest).
+static _mega_is_green(mega, mini, pal, mt, mega_len) {
+    auto tx, ty, ref, mo, k, vidx, r, g, b, cnt;
+    r = 0; g = 0; b = 0; cnt = 0;
+    if (mt == 0 || mt * 32 + 32 > mega_len) { return 0; }
+    ty = 0;
+    while (ty < 4) {
+        tx = 0;
+        while (tx < 4) {
+            ref = peek_q(mega + mt * 32 + (tx + ty * 4) * 2);
+            mo = (ref & 0xFFFC) << 4;
+            k = 0;
+            while (k < 64) {
+                vidx = peek(mini + mo + k);
+                if (vidx != 0) {
+                    r = r + peek(pal + vidx * 3 + 0);
+                    g = g + peek(pal + vidx * 3 + 1);
+                    b = b + peek(pal + vidx * 3 + 2);
+                    cnt++;
+                }
+                k++;
+            }
+            tx++;
+        }
+        ty++;
+    }
+    if (cnt == 0) { return 0; }
+    r = r / cnt; g = g / cnt; b = b / cnt;
+    return (g > r && g > b && g > 50) ? 1 : 0;
+}
+
 // Blit one 8x8 minitile (byte offset `mindex` into `mini`) into the tile
 // image at minitile cell (ix, iy), optionally mirrored.
 static _decode_mini(image, ix, iy, iadd, mini, mindex, flipx, flipy) {
@@ -103,7 +138,7 @@ main() {
     auto width, height, image, nbytes, rgba;
     auto v, mt, cx, cy, tx, ty, ref, i, val;
     auto json, jpath, bn, plen;
-    auto blk, ngg, blkpath;
+    auto blk, ngg, blkpath, blocked;
 
     if (argc_get() < 7) {
         putstr_err("usage: war2_tiles <ARCHIVE.WAR> <pal> <mega> <mini> <mape> <out.png>\n");
@@ -205,14 +240,24 @@ main() {
     json = strbuf_cat(json, "\"}");
     file_write_all(jpath, json, strbuf_len(json));
 
-    // Walkability sidecar (.blk): one byte per mape group, 1 = impassable
-    // (forest / rock / water / wall). The flag is bit 0x80 of byte 40 in each
-    // 42-byte mape group. The game blocks a map tile V when blk[V >> 4] != 0.
+    // Walkability sidecar (.blk): one byte per mape group encoding terrain:
+    //   0 = walkable  1 = forest (impassable but choppable for wood)
+    //   2 = blocked-other (rock / water / wall — impassable, not choppable)
+    // Impassable = bit 0x80 of byte 40 in the 42-byte mape group; forest vs
+    // rock/water is decided by the group's megatile colour (_mega_is_green).
+    // The game blocks tile V when blk[V >> 4] != 0, and chops it when == 1.
     ngg = mape_len / 42;
     blk = malloc(ngg);
     i = 0;
     while (i < ngg) {
-        poke(blk + i, (peek(mape + i * 42 + 40) & 0x80) != 0 ? 1 : 0);
+        blocked = (peek(mape + i * 42 + 40) & 0x80) != 0;
+        if (blocked == 0) {
+            poke(blk + i, 0);
+        } else if (_mega_is_green(mega, mini, pal, peek_q(mape + i * 42), mega_len)) {
+            poke(blk + i, 1);
+        } else {
+            poke(blk + i, 2);
+        }
         i++;
     }
     blkpath = strbuf_new();
