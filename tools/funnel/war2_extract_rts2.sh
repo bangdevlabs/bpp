@@ -25,10 +25,12 @@ if [ ! -f "$WAR" ]; then echo "MAINDAT.WAR not found: $WAR" >&2; exit 1; fi
 
 TILETOOL=/tmp/war2_tiles
 MAPTOOL=/tmp/war2_pud
-echo "building war2_gfx + war2_tiles + war2_pud ..."
+IMGTOOL=/tmp/war2_img
+echo "building war2_gfx + war2_tiles + war2_pud + war2_img ..."
 "$REPO/bpp" "$REPO/tools/funnel/war2_gfx.bpp"   -o "$TOOL"
 "$REPO/bpp" "$REPO/tools/funnel/war2_tiles.bpp" -o "$TILETOOL"
 "$REPO/bpp" "$REPO/tools/funnel/war2_pud.bpp"   -o "$MAPTOOL"
+"$REPO/bpp" "$REPO/tools/funnel/war2_img.bpp"   -o "$IMGTOOL"
 mkdir -p "$OUT"
 
 # --- PUD maps -> level JSON (all .PUD under the game dir) ---
@@ -149,5 +151,41 @@ done <<'TABLE'
 118 2  bldg_neutral_118
 119 2  bldg_neutral_119
 TABLE
+
+# --- named buildings (palette 2 summer; identified visually, idx from
+# war2_maindat_index.md). Orc mirrors human at idx+1. Construction uses the
+# generic land construction-site sprite (idx 252) aliased per building. ---
+BH="$OUT/buildings/human"; BO="$OUT/buildings/orc"; BN="$OUT/buildings/neutral"
+mkdir -p "$BH" "$BO" "$BN"
+for e in town_hall:100 farm:92 barracks:102 lumber_mill:104 blacksmith:90 \
+         stable:108 church:96 tower:80 stormwind_keep:116; do
+    "$TOOL" "$WAR" 2 "${e##*:}" "$BH/${e%%:*}.png" >/dev/null
+done
+for e in town_hall:101 farm:93 barracks:103 lumber_mill:105 blacksmith:91 \
+         kennel:109 temple:97 tower:81 blackrock_spire:117; do
+    "$TOOL" "$WAR" 2 "${e##*:}" "$BO/${e%%:*}.png" >/dev/null
+done
+"$TOOL" "$WAR" 2 119 "$BN/gold_mine.png" >/dev/null
+"$TOOL" "$WAR" 2 252 "$BH/_construction_site.png" >/dev/null
+cp "$BH/_construction_site.json" "$BO/_construction_site.json"
+cp "$BH/_construction_site.png"  "$BO/_construction_site.png"
+for n in town_hall farm barracks lumber_mill blacksmith stable church tower; do
+    cp "$BH/_construction_site.json" "$BH/${n}_construction.json"
+done
+for n in town_hall farm barracks lumber_mill blacksmith kennel temple tower; do
+    cp "$BO/_construction_site.json" "$BO/${n}_construction.json"
+done
+echo "buildings -> $OUT/buildings/{human,orc,neutral}"
+
+# --- HUD chrome: portrait icons (graphic, 196 unit/building icons) +
+# UI panels (Image type: button panel / resource bar / status line). ---
+HF="$OUT/hud/forest"; HH="$OUT/hud/human"; HO="$OUT/hud/orc"
+mkdir -p "$HF" "$HH" "$HO"
+"$TOOL"    "$WAR" 2 356 "$HF/portrait_icons.png"   >/dev/null
+"$IMGTOOL" "$WAR" 2 287 "$HH/top_resource_bar.png" >/dev/null
+"$IMGTOOL" "$WAR" 2 291 "$HH/bottom_panel.png"     >/dev/null
+"$IMGTOOL" "$WAR" 2 297 "$HH/buttonpanel.png"      >/dev/null
+"$IMGTOOL" "$WAR" 2 298 "$HO/buttonpanel.png"      >/dev/null
+echo "hud -> $OUT/hud/{forest,human,orc}"
 
 echo "war2_extract_rts2: $count sprites -> $OUT"

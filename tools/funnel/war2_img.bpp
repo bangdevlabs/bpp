@@ -1,0 +1,155 @@
+// war2_img — funnel: decode a Warcraft 2 full-screen Image chunk (type 'I')
+// into a PNG. Used for UI panels / chrome (button panel, resource bar,
+// status line, minimap frame, title, ...).
+//
+// Ported from Wargus `wartool.cpp` ConvertImg. The format is the simplest in
+// the archive: u16 width, u16 height, then width*height raw palette indices
+// (no compression beyond the outer LZSS, no frames, no RLE).
+//
+//   pal/img indices come from wartool.h Todo[] (type 'I'). Examples:
+//     ui/human/buttonpanel  pal 2  idx 297      ui/orc/buttonpanel  2 298
+//     ui/human/resource     pal 2  idx 287      ui/human/statusline 2 291
+//     ui/human/minimap      pal 2  idx 295      ui/human/filler-right 2 289
+//
+// Output: <out>.png + an atlas_grid sidecar with a single full-image frame
+// (tile_w/h = the image size) so image_load + image_draw_size(a, 0, ...)
+// draws the whole panel.
+//
+// Usage: war2_img <ARCHIVE.WAR> <pal_idx> <img_idx> <out.png>
+
+import "stbpixels.bsm";
+
+static _parse_uint(s: ptr) -> word {
+    auto v, i, c;
+    v = 0; i = 0;
+    c = peek(s + i);
+    while (c >= 48 && c <= 57) { v = v * 10 + (c - 48); i++; c = peek(s + i); }
+    return v;
+}
+
+// LZSS-decompress (or raw-copy) one `.WAR` chunk. Same format as war2_gfx.
+static _extract_entry(cp: ptr, len_out: ptr) -> ptr {
+    auto hdr, ulen, flags, dest, dp, ring, bi, i, bflags, o, j, val;
+    hdr = peek_h(cp); ulen = hdr & 0x00FFFFFF; flags = (hdr >> 24) & 0xFF;
+    cp = cp + 4; *len_out = ulen; dest = malloc(ulen);
+    if (flags != 0x20) {
+        i = 0; while (i < ulen) { poke(dest + i, peek(cp + i)); i++; }
+        return dest;
+    }
+    ring = malloc(4096); i = 0; while (i < 4096) { poke(ring + i, 0); i++; }
+    bi = 0; dp = 0;
+    while (dp < ulen) {
+        bflags = peek(cp); cp = cp + 1; i = 0;
+        while (i < 8) {
+            if (bflags & 1) {
+                val = peek(cp); cp = cp + 1;
+                poke(dest + dp, val); dp++;
+                poke(ring + (bi & 0xFFF), val); bi++;
+            } else {
+                o = peek_q(cp); cp = cp + 2; j = (o >> 12) + 3; o = o & 0xFFF;
+                while (j > 0) {
+                    val = peek(ring + (o & 0xFFF));
+                    poke(dest + dp, val); dp++;
+                    poke(ring + (bi & 0xFFF), val); bi++;
+                    o++;
+                    if (dp >= ulen) { j = 1; }
+                    j--;
+                }
+            }
+            if (dp >= ulen) { i = 8; }
+            bflags = bflags >> 1; i++;
+        }
+    }
+    free(ring);
+    return dest;
+}
+
+main() {
+    auto path: ptr;
+    auto out_path: ptr;
+    auto buf, size, off_base;
+    auto pal_idx, img_idx;
+    auto pal_raw, pal_len, pal;
+    auto img, img_len, w, h, data;
+    auto rgba, i, val;
+    auto json, jpath, bn, plen;
+
+    if (argc_get() < 5) {
+        putstr_err("usage: war2_img <ARCHIVE.WAR> <pal_idx> <img_idx> <out.png>\n");
+        return 1;
+    }
+    path     = argv_get(1);
+    pal_idx  = _parse_uint(argv_get(2));
+    img_idx  = _parse_uint(argv_get(3));
+    out_path = argv_get(4);
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) { putstr_err("war2_img: cannot read archive\n"); return 1; }
+    off_base = buf + 8;
+
+    pal_len = 0;
+    pal_raw = _extract_entry(buf + peek_h(off_base + pal_idx * 4), &pal_len);
+    pal = malloc(768);
+    i = 0;
+    while (i < 768) {
+        val = i < pal_len ? peek(pal_raw + i) : 0;
+        poke(pal + i, (val << 2) & 0xFF);
+        i++;
+    }
+    free(pal_raw);
+
+    img_len = 0;
+    img = _extract_entry(buf + peek_h(off_base + img_idx * 4), &img_len);
+    w = peek_q(img + 0);          // u16 width
+    h = peek_q(img + 2);          // u16 height
+    data = img + 4;               // w*h palette indices
+
+    rgba = malloc(w * h * 4);
+    i = 0;
+    while (i < w * h) {
+        val = peek(data + i);
+        if (val == 0) {           // index 0 transparent (panel cut-outs)
+            poke(rgba + i * 4 + 0, 0); poke(rgba + i * 4 + 1, 0);
+            poke(rgba + i * 4 + 2, 0); poke(rgba + i * 4 + 3, 0);
+        } else {
+            poke(rgba + i * 4 + 0, peek(pal + val * 3 + 0));
+            poke(rgba + i * 4 + 1, peek(pal + val * 3 + 1));
+            poke(rgba + i * 4 + 2, peek(pal + val * 3 + 2));
+            poke(rgba + i * 4 + 3, 255);
+        }
+        i++;
+    }
+    free(img);
+
+    if (pixels_save_png(out_path, rgba, w, h) != 0) {
+        putstr_err("war2_img: PNG write failed\n");
+        return 1;
+    }
+
+    // atlas_grid sidecar: one full-image frame.
+    bn = out_path; plen = 0;
+    while (peek(out_path + plen) != 0) {
+        if (peek(out_path + plen) == 47) { bn = out_path + plen + 1; }
+        plen++;
+    }
+    jpath = strbuf_new();
+    i = 0; while (i < plen - 4) { jpath = strbuf_ch(jpath, peek(out_path + i)); i++; }
+    jpath = strbuf_cat(jpath, ".json"); jpath = strbuf_ch(jpath, 0);
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"type\":\"atlas_grid\",\"tile_w\":");
+    json = strbuf_num(json, w);
+    json = strbuf_cat(json, ",\"tile_h\":");
+    json = strbuf_num(json, h);
+    json = strbuf_cat(json, ",\"image\":\"");
+    json = strbuf_cat(json, bn);
+    json = strbuf_cat(json, "\"}");
+    file_write_all(jpath, json, strbuf_len(json));
+
+    putstr("war2_img: idx "); putnum(img_idx);
+    putstr(" -> "); putnum(w); putstr("x"); putnum(h);
+    putstr(" -> "); putstr(out_path); putstr(" (+ .json)\n");
+
+    free(rgba); free(pal);
+    return 0;
+}
