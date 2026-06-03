@@ -1,0 +1,184 @@
+// war2_pud — funnel: convert a Warcraft 2 PUD map into a level_editor JSON.
+//
+// A PUD is a flat sequence of tagged sections: a 4-byte ASCII tag, a u32
+// little-endian length, then that many bytes of data. This tool reads the
+// three sections needed to render terrain and emits the same level JSON shape
+// Bang 9's level_editor / the rts game loader read (and hot-reload):
+//
+//   ERA   u16 tileset id  (0 summer/forest, 1 winter, 2 wasteland, 3 swamp)
+//   DIM   u16 width, u16 height  (in tiles)
+//   MTXM  width*height u16 tile values — each indexes the tileset sheet
+//         produced by war2_tiles (verified: MTXM maps directly to the
+//         megatile sheet cell).
+//
+// Output JSON:
+//   {"type":"level","version":2,"width":W,"height":H,
+//    "tileset":"summer","tiles":[[...],[...]]}
+//
+// The game pairs "tileset" with games/<g>/assets/tiles/wc2/<tileset>.png
+// (atlas_grid, 16x16). Other PUD sections (UNIT start positions, OWNR,
+// resources) are a later step — this lands terrain rendering + hot-reload
+// first, mirroring how wc1_map_convert shipped Session 2.
+//
+// Usage: war2_pud <map.PUD> <out.json>
+
+// Compare the 4-byte tag at `p` against four ASCII codes.
+static _tag_eq(p: ptr, a, b, c, d) -> word {
+    return peek(p) == a && peek(p + 1) == b && peek(p + 2) == c && peek(p + 3) == d;
+}
+
+// Tileset name for an ERA id. Returns a static string.
+static _era_name(era) -> ptr {
+    if (era == 1) { return "winter"; }
+    if (era == 2) { return "wasteland"; }
+    if (era == 3) { return "swamp"; }
+    return "summer";
+}
+
+main() {
+    auto path: ptr;
+    auto out_path: ptr;
+    auto buf, size;
+    auto p, len, data;
+    auto era, w, h, mtxm, have_dim, have_mtxm;
+    auto unit_data, unit_len, have_unit;
+    auto json, x, y, t;
+    auto i, nunits, ux, uy, utype, uplayer, remap, nextpl, first_ent, ent;
+
+    if (argc_get() < 3) {
+        putstr_err("usage: war2_pud <map.PUD> <out.json>\n");
+        return 1;
+    }
+    path     = argv_get(1);
+    out_path = argv_get(2);
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) {
+        putstr_err("war2_pud: cannot read "); putstr_err(path); putstr_err("\n");
+        return 1;
+    }
+
+    era = 0;
+    w = 0;
+    h = 0;
+    mtxm = 0;
+    have_dim = 0;
+    have_mtxm = 0;
+    unit_data = 0;
+    unit_len = 0;
+    have_unit = 0;
+
+    // Walk the tagged sections.
+    p = 0;
+    while (p + 8 <= size) {
+        len  = peek_h(buf + p + 4);     // u32 section length
+        data = buf + p + 8;
+        if (_tag_eq(buf + p, 69, 82, 65, 32)) {        // "ERA "
+            era = peek_q(data);
+        } else if (_tag_eq(buf + p, 68, 73, 77, 32)) { // "DIM "
+            w = peek_q(data);
+            h = peek_q(data + 2);
+            have_dim = 1;
+        } else if (_tag_eq(buf + p, 77, 84, 88, 77)) { // "MTXM"
+            mtxm = data;
+            have_mtxm = 1;
+        } else if (_tag_eq(buf + p, 85, 78, 73, 84)) { // "UNIT"
+            unit_data = data;
+            unit_len = len;
+            have_unit = 1;
+        }
+        p = p + 8 + len;
+    }
+
+    if (have_dim == 0 || have_mtxm == 0) {
+        putstr_err("war2_pud: missing DIM or MTXM section — not a PUD?\n");
+        return 1;
+    }
+
+    // Emit the level JSON.
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"type\":\"level\",\"version\":2,\"width\":");
+    json = strbuf_num(json, w);
+    json = strbuf_cat(json, ",\"height\":");
+    json = strbuf_num(json, h);
+    json = strbuf_cat(json, ",\"tileset\":\"");
+    json = strbuf_cat(json, _era_name(era));
+    json = strbuf_cat(json, "\",\"tiles\":[");
+    y = 0;
+    while (y < h) {
+        if (y > 0) { json = strbuf_cat(json, ","); }
+        json = strbuf_cat(json, "[");
+        x = 0;
+        while (x < w) {
+            if (x > 0) { json = strbuf_cat(json, ","); }
+            // MTXM map-tile value indexes the war2_tiles sheet directly
+            // (identity remap in stbtile). Value 0 is "empty" (not drawn).
+            t = peek_q(mtxm + (y * w + x) * 2);    // u16 tile value
+            json = strbuf_num(json, t);
+            x++;
+        }
+        json = strbuf_cat(json, "]");
+        y++;
+    }
+    json = strbuf_cat(json, "]");          // close tiles array
+
+    // Entities from the PUD UNIT section: start locations (type 94/95) become
+    // "start_view" (the loader seeds camera + a town hall + worker per one),
+    // gold mines (type 92) become "gold-mine". PUD player ids are remapped to
+    // 0,1,2,... in encounter order so the loader's "player 0 = local" holds.
+    json = strbuf_cat(json, ",\"entities\":[");
+    first_ent = 1;
+    if (have_unit != 0) {
+        remap = malloc(16 * 8);
+        i = 0;
+        while (i < 16) { *(remap + i * 8) = 0 - 1; i++; }
+        nextpl = 0;
+        nunits = unit_len / 8;
+        i = 0;                              // pass 1: number the start owners
+        while (i < nunits) {
+            utype   = peek(unit_data + i * 8 + 4);
+            uplayer = peek(unit_data + i * 8 + 5);
+            if ((utype == 94 || utype == 95) && uplayer < 16) {
+                if (*(remap + uplayer * 8) < 0) {
+                    *(remap + uplayer * 8) = nextpl;
+                    nextpl++;
+                }
+            }
+            i++;
+        }
+        i = 0;                              // pass 2: emit
+        while (i < nunits) {
+            ux      = peek_q(unit_data + i * 8 + 0);
+            uy      = peek_q(unit_data + i * 8 + 2);
+            utype   = peek(unit_data + i * 8 + 4);
+            uplayer = peek(unit_data + i * 8 + 5);
+            if (utype == 94 || utype == 95) {
+                if (first_ent == 0) { json = strbuf_cat(json, ","); }
+                json = strbuf_cat(json, "{\"kind\":\"start_view\",\"x\":");
+                json = strbuf_num(json, ux); json = strbuf_cat(json, ".5,\"y\":");
+                json = strbuf_num(json, uy); json = strbuf_cat(json, ".5,\"player\":");
+                json = strbuf_num(json, *(remap + uplayer * 8));
+                json = strbuf_cat(json, "}");
+                first_ent = 0;
+            } else if (utype == 92) {
+                if (first_ent == 0) { json = strbuf_cat(json, ","); }
+                json = strbuf_cat(json, "{\"kind\":\"gold-mine\",\"x\":");
+                json = strbuf_num(json, ux); json = strbuf_cat(json, ".5,\"y\":");
+                json = strbuf_num(json, uy); json = strbuf_cat(json, ".5,\"player\":0}");
+                first_ent = 0;
+            }
+            i++;
+        }
+        free(remap);
+    }
+    json = strbuf_cat(json, "]}");
+
+    file_write_all(out_path, json, strbuf_len(json));
+
+    putstr("war2_pud: "); putstr(path);
+    putstr(" -> "); putnum(w); putstr("x"); putnum(h);
+    putstr(" "); putstr(_era_name(era));
+    putstr(" -> "); putstr(out_path); putstr("\n");
+    return 0;
+}

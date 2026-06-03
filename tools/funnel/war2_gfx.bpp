@@ -1,0 +1,449 @@
+// war2_gfx — funnel: decode one WC1/WC2 `.WAR` graphic chunk into a PNG.
+//
+// Ported from war1gus `war1tool.cpp` (ConvertGfu / ConvertGraphic /
+// DecodeGfuEntry / ExtractEntry / ConvertPalette). The decode algorithm is
+// shared between Warcraft 1 and Warcraft 2 — only the chunk INDICES differ
+// per game, so this tool takes the palette + graphic indices on the command
+// line. Point it at different graphic indices to discover what each WC2 chunk
+// holds (peasant, footman, building, …) by eye — the same sweep war1tool does.
+//
+// Pipeline:
+//   1. Read the archive, parse the offset table (see war2_dump).
+//   2. ExtractEntry(palette_idx)  — LZSS-decompress the palette chunk.
+//   3. ConvertPalette             — VGA 6-bit -> 8-bit (<< 2).
+//   4. ExtractEntry(graphic_idx)  — LZSS-decompress the graphic chunk.
+//   5. ConvertGraphic             — header + 8-byte frame descriptors blit
+//                                   the indexed frames into a 5-per-row sheet.
+//   6. Apply palette -> RGBA      — palette index 0 is transparent.
+//   7. pixels_save_png            — write the sheet.
+//
+// `.WAR` chunk entry (after the offset table points here):
+//   u32 ulen_flags   low 24 bits = uncompressed length, high byte = flags
+//                    flags 0x20 = LZSS compressed, 0x00 = raw copy
+//   ... payload ...
+//
+// LZSS: 4096-byte ring buffer. A control byte's 8 bits, LSB first, select
+// literal (1: copy one byte) vs back-reference (0: u16 = (len-3)<<12 | offset).
+//
+// Graphic chunk (decompressed):
+//   u16 count        number of frames
+//   u8  max_width    cell width
+//   u8  max_height   cell height
+//   frame[count]     8 bytes each: u8 xoff,yoff,width,height + u32 offset
+//                    (offset high bit set -> width += 256; data at chunk+offset)
+//
+// Usage: war2_gfx <ARCHIVE.WAR> <pal_idx> <gfx_idx> <out.png>
+
+import "stbpixels.bsm";   // pixels_save_png — Layer-1 codec, no GPU dependency
+
+// Parse a non-negative decimal integer from a NUL/garbage-terminated string.
+static _parse_uint(s: ptr) -> word {
+    auto v, i, c;
+    v = 0;
+    i = 0;
+    c = peek(s + i);
+    while (c >= 48 && c <= 57) {
+        v = v * 10 + (c - 48);
+        i++;
+        c = peek(s + i);
+    }
+    return v;
+}
+
+// LZSS-decompress (or raw-copy) one `.WAR` chunk whose first word is the
+// length+flags header. `cp` points at that header; writes the uncompressed
+// length through `len_out` and returns a freshly malloc'd buffer.
+static _extract_entry(cp: ptr, len_out: ptr) -> ptr {
+    auto hdr, ulen, flags;
+    auto dest, dp, ring, bi;
+    auto i, c, bflags, o, j, val;
+
+    hdr   = peek_h(cp);              // u32 length + flags
+    ulen  = hdr & 0x00FFFFFF;
+    flags = (hdr >> 24) & 0xFF;
+    cp    = cp + 4;
+    *len_out = ulen;
+
+    dest = malloc(ulen);
+
+    if (flags != 0x20) {
+        // Uncompressed: straight copy.
+        i = 0;
+        while (i < ulen) { poke(dest + i, peek(cp + i)); i++; }
+        return dest;
+    }
+
+    // Compressed: LZSS over a 4096-byte ring window (zero-filled).
+    ring = malloc(4096);
+    i = 0;
+    while (i < 4096) { poke(ring + i, 0); i++; }
+    bi = 0;
+    dp = 0;
+    while (dp < ulen) {
+        bflags = peek(cp);
+        cp = cp + 1;
+        i = 0;
+        while (i < 8) {
+            if (bflags & 1) {
+                // Literal byte.
+                val = peek(cp);
+                cp = cp + 1;
+                poke(dest + dp, val);
+                dp++;
+                poke(ring + (bi & 0xFFF), val);
+                bi++;
+            } else {
+                // Back-reference: length (3..18) and ring offset.
+                o = peek_q(cp);          // u16 LE
+                cp = cp + 2;
+                j = (o >> 12) + 3;
+                o = o & 0xFFF;
+                while (j > 0) {
+                    val = peek(ring + (o & 0xFFF));
+                    poke(dest + dp, val);
+                    dp++;
+                    poke(ring + (bi & 0xFFF), val);
+                    bi++;
+                    o++;
+                    if (dp >= ulen) { j = 1; }   // last byte written — stop
+                    j--;
+                }
+            }
+            if (dp >= ulen) { i = 8; }           // chunk complete — stop
+            bflags = bflags >> 1;
+            i++;
+        }
+    }
+    free(ring);
+    return dest;
+}
+
+// Direction name for column d (WC2 sheets cover N,NE,E,SE,S; the game
+// mirrors these for W,NW,SW).
+static _dname(d) -> ptr {
+    if (d == 0) { return "N"; }
+    if (d == 1) { return "NE"; }
+    if (d == 2) { return "E"; }
+    if (d == 3) { return "SE"; }
+    return "S";
+}
+
+// Emit one Aseprite frameTag object body {"name":"<name>_<dir>",...}. Caller
+// handles the separating comma. Returns the (possibly grown) strbuf.
+static _tag_body(sb, name: ptr, dir: ptr, from, to) -> word {
+    sb = strbuf_cat(sb, "{\"name\":\"");
+    sb = strbuf_cat(sb, name);
+    sb = strbuf_cat(sb, "_");
+    sb = strbuf_cat(sb, dir);
+    sb = strbuf_cat(sb, "\",\"from\":");
+    sb = strbuf_num(sb, from);
+    sb = strbuf_cat(sb, ",\"to\":");
+    sb = strbuf_num(sb, to);
+    sb = strbuf_cat(sb, ",\"direction\":\"forward\"}");
+    return sb;
+}
+
+main() {
+    auto path: ptr;
+    auto out_path: ptr;
+    auto buf, size, magic, n_entries, off_base;
+    auto pal_idx, gfx_idx;
+    auto pal_raw, pal_len, pal;
+    auto gfx, gfx_len;
+    auto count, max_w, max_h, ipr, length;
+    auto sheet_w, sheet_h, sheet_sz, desc_base;
+    auto idx_img, rgba;
+    auto i, d, xoff, yoff, width, height, offset, src;
+    auto cell, iadd, row, col, di, val;
+    auto fdata, rp, b, cnt, pv, k;
+    auto json, jpath, bn, plen, fx, fy;
+    auto is_unit, rows, base, dd, rr, first_f;
+
+    if (argc_get() < 5) {
+        putstr_err("usage: war2_gfx <ARCHIVE.WAR> <pal_idx> <gfx_idx> <out.png>\n");
+        return 1;
+    }
+    path     = argv_get(1);
+    pal_idx  = _parse_uint(argv_get(2));
+    gfx_idx  = _parse_uint(argv_get(3));
+    out_path = argv_get(4);
+    is_unit  = argc_get() >= 6;     // 5th arg present -> emit directional anim tags
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) {
+        putstr_err("war2_gfx: cannot read "); putstr_err(path); putstr_err("\n");
+        return 1;
+    }
+    if (size < 8) { putstr_err("war2_gfx: not a .WAR\n"); return 1; }
+
+    magic     = peek_h(buf + 0);   // 0x18 = WC1 (u8 w/h header), 0x19 = WC2 (u16)
+    n_entries = peek_q(buf + 4);
+    off_base  = buf + 8;
+    if (pal_idx >= n_entries || gfx_idx >= n_entries) {
+        putstr_err("war2_gfx: index out of range (n_entries="); putnum(n_entries);
+        putstr_err(")\n");
+        return 1;
+    }
+
+    // --- Palette: extract, pad to 768, scale VGA 6-bit -> 8-bit. ---
+    pal_len = 0;
+    pal_raw = _extract_entry(buf + peek_h(off_base + pal_idx * 4), &pal_len);
+    pal = malloc(768);
+    i = 0;
+    while (i < 768) {
+        val = i < pal_len ? peek(pal_raw + i) : 0;
+        poke(pal + i, (val << 2) & 0xFF);
+        i++;
+    }
+    free(pal_raw);
+
+    // --- Graphic: extract, then decode the frame sheet. ---
+    gfx_len = 0;
+    gfx = _extract_entry(buf + peek_h(off_base + gfx_idx * 4), &gfx_len);
+
+    count = peek_q(gfx + 0);     // u16 frame count (both games)
+    if (magic == 0x19) {
+        // Warcraft 2: u16 width, u16 height — 6-byte header.
+        max_w = peek_q(gfx + 2);
+        max_h = peek_q(gfx + 4);
+        desc_base = gfx + 6;
+    } else {
+        // Warcraft 1: u8 width, u8 height — 4-byte header.
+        max_w = peek(gfx + 2);
+        max_h = peek(gfx + 3);
+        desc_base = gfx + 4;
+    }
+
+    // 5 frames per row when the count is a multiple of 5 (the direction
+    // convention), otherwise a single vertical column.
+    if (count - (count / 5) * 5 == 0) {
+        ipr = 5;
+        length = ((count + ipr - 1) / ipr) * ipr;
+    } else {
+        ipr = 1;
+        length = count;
+    }
+    sheet_w  = max_w * ipr;
+    sheet_h  = max_h * (length / ipr);
+    sheet_sz = sheet_w * sheet_h;
+    iadd     = sheet_w;
+
+    idx_img = malloc(sheet_sz);
+    i = 0;
+    while (i < sheet_sz) { poke(idx_img + i, 0); i++; }   // index 0 = transparent
+
+    // Blit each frame's width x height indexed block into its sheet cell.
+    i = 0;
+    while (i < count) {
+        d = desc_base + i * 8;
+        xoff   = peek(d + 0);
+        yoff   = peek(d + 1);
+        width  = peek(d + 2);
+        height = peek(d + 3);
+        offset = peek_h(d + 4);                 // u32
+        if (offset & 0x80000000) {              // high bit -> wide frame
+            offset = offset & 0x7FFFFFFF;
+            width  = width + 256;
+        }
+        cell = max_w * (i - (i / ipr) * ipr) + max_h * max_w * ipr * (i / ipr);
+        if (magic == 0x19) {
+            // Warcraft 2: each frame is RLE-encoded per row. The frame data
+            // opens with u16 rowoffset[height]; each row is a run of packets:
+            //   b & 0x80 -> transparent run of (b & 0x7F)
+            //   b & 0x40 -> run-length: (b & 0x3F) copies of the next byte
+            //   else     -> literal: copy b bytes
+            fdata = gfx + offset;
+            row = 0;
+            while (row < height) {
+                rp  = fdata + peek_q(fdata + row * 2);
+                col = 0;
+                while (col < width) {
+                    b = peek(rp);
+                    rp = rp + 1;
+                    if (b & 0x80) {
+                        col = col + (b & 0x7F);
+                    } else if (b & 0x40) {
+                        cnt = b & 0x3F;
+                        pv  = peek(rp);
+                        rp  = rp + 1;
+                        k = 0;
+                        while (k < cnt) {
+                            di = cell + (yoff + row) * iadd + xoff + col;
+                            if (di >= 0 && di < sheet_sz) { poke(idx_img + di, pv); }
+                            col++;
+                            k++;
+                        }
+                    } else {
+                        cnt = b;
+                        k = 0;
+                        while (k < cnt) {
+                            pv = peek(rp);
+                            rp = rp + 1;
+                            di = cell + (yoff + row) * iadd + xoff + col;
+                            if (di >= 0 && di < sheet_sz) { poke(idx_img + di, pv); }
+                            col++;
+                            k++;
+                        }
+                    }
+                }
+                row++;
+            }
+        } else {
+            // Warcraft 1: raw width x height rows.
+            src = gfx + offset;
+            row = 0;
+            while (row < height) {
+                col = 0;
+                while (col < width) {
+                    di = cell + (yoff + row) * iadd + xoff + col;
+                    if (di >= 0 && di < sheet_sz) {
+                        poke(idx_img + di, peek(src + row * width + col));
+                    }
+                    col++;
+                }
+                row++;
+            }
+        }
+        i++;
+    }
+    free(gfx);
+
+    // --- Indexed sheet -> RGBA (index 0 transparent). ---
+    rgba = malloc(sheet_sz * 4);
+    i = 0;
+    while (i < sheet_sz) {
+        val = peek(idx_img + i);
+        // Transparent: index 0 always; WC2 also uses index 255 (wartool maps
+        // 0 -> 255 and marks 255 transparent, so both vanish).
+        if (val == 0 || (magic == 0x19 && val == 255)) {
+            poke(rgba + i * 4 + 0, 0);
+            poke(rgba + i * 4 + 1, 0);
+            poke(rgba + i * 4 + 2, 0);
+            poke(rgba + i * 4 + 3, 0);
+        } else {
+            poke(rgba + i * 4 + 0, peek(pal + val * 3 + 0));
+            poke(rgba + i * 4 + 1, peek(pal + val * 3 + 1));
+            poke(rgba + i * 4 + 2, peek(pal + val * 3 + 2));
+            poke(rgba + i * 4 + 3, 255);
+        }
+        i++;
+    }
+
+    if (pixels_save_png(out_path, rgba, sheet_w, sheet_h) != 0) {
+        putstr_err("war2_gfx: PNG write failed\n");
+        return 1;
+    }
+
+    // --- Aseprite "Array" sidecar: one frame entry per cell, index-addressable.
+    // Named animation tags (walk/attack/die) are a later step — they need the
+    // per-unit frame counts from the wargus anim definitions. This grid sidecar
+    // is enough for image_load to address frames by index right now.
+    bn = out_path;                               // basename for meta.image
+    plen = 0;
+    while (peek(out_path + plen) != 0) {
+        if (peek(out_path + plen) == 47) { bn = out_path + plen + 1; }
+        plen++;
+    }
+    jpath = strbuf_new();                         // out_path with ".png" -> ".json"
+    i = 0;
+    while (i < plen - 4) { jpath = strbuf_ch(jpath, peek(out_path + i)); i++; }
+    jpath = strbuf_cat(jpath, ".json");
+    jpath = strbuf_ch(jpath, 0);
+
+    rows = length / ipr;            // animation rows (frames per direction)
+
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"frames\":[");
+    if (is_unit) {
+        // Direction-major order so per-direction tags are contiguous ranges:
+        // frame (d*rows + r) lives at PNG cell (column d, row r).
+        dd = 0;
+        while (dd < ipr) {
+            rr = 0;
+            while (rr < rows) {
+                fx = dd * max_w;
+                fy = rr * max_h;
+                if (dd != 0 || rr != 0) { json = strbuf_cat(json, ","); }
+                json = strbuf_cat(json, "{\"filename\":\"");
+                json = strbuf_num(json, dd * rows + rr);
+                json = strbuf_cat(json, "\",\"frame\":{\"x\":"); json = strbuf_num(json, fx);
+                json = strbuf_cat(json, ",\"y\":"); json = strbuf_num(json, fy);
+                json = strbuf_cat(json, ",\"w\":"); json = strbuf_num(json, max_w);
+                json = strbuf_cat(json, ",\"h\":"); json = strbuf_num(json, max_h);
+                json = strbuf_cat(json, "},\"rotated\":false,\"trimmed\":false,");
+                json = strbuf_cat(json, "\"spriteSourceSize\":{\"x\":0,\"y\":0,\"w\":");
+                json = strbuf_num(json, max_w); json = strbuf_cat(json, ",\"h\":");
+                json = strbuf_num(json, max_h); json = strbuf_cat(json, "},\"sourceSize\":{\"w\":");
+                json = strbuf_num(json, max_w); json = strbuf_cat(json, ",\"h\":");
+                json = strbuf_num(json, max_h); json = strbuf_cat(json, "}}");
+                rr++;
+            }
+            dd++;
+        }
+    } else {
+        i = 0;
+        while (i < count) {
+            fx = (i - (i / ipr) * ipr) * max_w;
+            fy = (i / ipr) * max_h;
+            if (i > 0) { json = strbuf_cat(json, ","); }
+            json = strbuf_cat(json, "{\"filename\":\"");
+            json = strbuf_num(json, i);
+            json = strbuf_cat(json, "\",\"frame\":{\"x\":"); json = strbuf_num(json, fx);
+            json = strbuf_cat(json, ",\"y\":"); json = strbuf_num(json, fy);
+            json = strbuf_cat(json, ",\"w\":"); json = strbuf_num(json, max_w);
+            json = strbuf_cat(json, ",\"h\":"); json = strbuf_num(json, max_h);
+            json = strbuf_cat(json, "},\"rotated\":false,\"trimmed\":false,");
+            json = strbuf_cat(json, "\"spriteSourceSize\":{\"x\":0,\"y\":0,\"w\":");
+            json = strbuf_num(json, max_w); json = strbuf_cat(json, ",\"h\":");
+            json = strbuf_num(json, max_h); json = strbuf_cat(json, "},\"sourceSize\":{\"w\":");
+            json = strbuf_num(json, max_w); json = strbuf_cat(json, ",\"h\":");
+            json = strbuf_num(json, max_h); json = strbuf_cat(json, "}}");
+            i++;
+        }
+    }
+    json = strbuf_cat(json, "],\"meta\":{\"app\":\"war2_gfx\",\"image\":\"");
+    json = strbuf_cat(json, bn);
+    json = strbuf_cat(json, "\",\"size\":{\"w\":"); json = strbuf_num(json, sheet_w);
+    json = strbuf_cat(json, ",\"h\":"); json = strbuf_num(json, sheet_h);
+    json = strbuf_cat(json, "},\"scale\":\"1\"");
+
+    // Directional animation tags (WC2 standard layout: walk rows 0-4,
+    // attack 5-8, death 9+). idle is row 0. Only emit tags the row count
+    // supports, so short sheets (siege/ships) don't reference missing rows.
+    if (is_unit) {
+        json = strbuf_cat(json, ",\"frameTags\":[");
+        first_f = 1;
+        dd = 0;
+        while (dd < ipr) {
+            base = dd * rows;
+            if (first_f == 0) { json = strbuf_cat(json, ","); }
+            json = _tag_body(json, "idle", _dname(dd), base, base);
+            first_f = 0;
+            json = strbuf_cat(json, ",");
+            json = _tag_body(json, "walk", _dname(dd), base,
+                             rows < 5 ? base + rows - 1 : base + 4);
+            if (rows >= 9) {
+                json = strbuf_cat(json, ",");
+                json = _tag_body(json, "attack", _dname(dd), base + 5, base + 8);
+            }
+            if (rows >= 10) {
+                json = strbuf_cat(json, ",");
+                json = _tag_body(json, "die", _dname(dd), base + 9, base + rows - 1);
+            }
+            dd++;
+        }
+        json = strbuf_cat(json, "]");
+    }
+    json = strbuf_cat(json, "}}");
+    file_write_all(jpath, json, strbuf_len(json));
+
+    putstr("war2_gfx: chunk "); putnum(gfx_idx);
+    putstr(" -> "); putnum(count); putstr(" frames, cell ");
+    putnum(max_w); putstr("x"); putnum(max_h);
+    putstr(", sheet "); putnum(sheet_w); putstr("x"); putnum(sheet_h);
+    putstr(" -> "); putstr(out_path); putstr(" (+ sidecar .json)\n");
+
+    free(idx_img); free(rgba); free(pal);
+    return 0;
+}

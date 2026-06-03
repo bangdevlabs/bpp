@@ -1,0 +1,436 @@
+// wc1_combat.bsm — Session 7 combat tick.
+//
+// Per-frame engagement resolution: every unit with a live
+// AttackTarget gets one step closer to combat resolution. Three
+// outcomes per attacker per frame:
+//
+//   1. Target invalid (killed or sentinel -1) → clear our claim,
+//      idle.
+//   2. Target alive but out of weapon range → request a fresh
+//      path to the target's tile. wc1_movement walks the path
+//      on the next movement tick; collision keeps us from
+//      stepping ONTO the target tile so we stall adjacent.
+//   3. Target alive and in range → halt movement, run the
+//      cooldown timer, fire damage on overflow. If damage drops
+//      the target's HP to zero, kill the entity, free its
+//      CharSheet handle, and release its tile claim so other
+//      units can walk through the corpse-tile.
+//
+// Damage formula (S7.3 v1): max(1, raw_damage - target.armor).
+// The damage-type × size-class matrix (Normal / Concussive /
+// Explosive vs Small / Medium / Large) lands in S7.4 — until
+// then every hit is a "Normal vs anything" multiplier of 1.0.
+//
+// Pathing strategy: re-request the path every frame the target
+// is out of range so the attacker tracks a moving target. A* on
+// a 64×64 grid is microseconds per call — cheap enough at
+// crowd-pathing scale validated by the Stress Arc S4 bench;
+// optimize when a profile says so.
+//
+// Death: ecs_kill_at marks the row dead in the world's archetype
+// alive bitmap. ecs_get on the freed eid returns 0 after this,
+// so other attackers' next combat tick sees the target gone and
+// clears their AttackTarget reference automatically.
+
+import "stbecs.bsm";
+import "stbcharsheet.bsm";
+import "stbgame.bsm";
+load   "rts2_units.bsm";
+load   "rts2_anims.bsm";
+load   "rts2_missiles.bsm";
+
+// ECS component handles + query. ecs_query_each's callback shape
+// (`fn(world, eid)`) means combat state flows through globals.
+extrn pos_comp, sheet_comp, attack_target_comp, path_comp, anim_comp, faction_comp;
+extrn peasant_q;
+extrn building_comp;    // S11 — tells a building target from a unit (ecs_has)
+extrn wc1_debug;        // verbose hit / kill logging gate (set by rts.bpp)
+
+// Per-tick dt in ms — set once at the top of wc1_combat_tick so
+// the per-entity callback reads a global instead of re-querying
+// game_dt_ms per unit.
+static auto _combat_dt_ms;
+
+// Time a dying unit lingers on the map playing its 3-frame death
+// animation before ecs_kill_at finalizes it. ~600 ms = three 200 ms
+// frames, the rhythm WC1's classic chunky death felt right at.
+const _DIE_DURATION_MS = 600;
+
+// Walk every unit, advance its combat state by one frame. Call
+// AFTER wc1_input_tick (which writes AttackTargets) and BEFORE
+// wc1_movement_tick (which walks any path that combat may have
+// requested this frame).
+void wc1_combat_tick(world) {
+    _combat_dt_ms = game_dt_ms();
+    ecs_query_each(peasant_q, fn_ptr(_combat_step));
+}
+
+// Tile-space Chebyshev distance between two pixel positions.
+// Used by the in-range check — diagonal neighbours count as
+// "1 tile away" so 8-connected adjacency means melee range = 1.
+static _tile_chebyshev(ax_px, ay_px, bx_px, by_px) {
+    auto dx, dy;
+    dx = (bx_px / 16) - (ax_px / 16);
+    dy = (by_px / 16) - (ay_px / 16);
+    if (dx < 0) { dx = 0 - dx; }
+    if (dy < 0) { dy = 0 - dy; }
+    if (dy > dx) { return dy; }
+    return dx;
+}
+
+// Damage-type × size-class multiplier in percent. SC1 Brood War
+// canon (Liquipedia / BWAPI), kept in integer percent form because
+// the simulation hot path is float-free per handoff numeric model.
+//
+//   Type / Size      | SMALL | MEDIUM | LARGE
+//   ─────────────────┼───────┼────────┼──────
+//   NORMAL           |  100  |  100   |  100
+//   CONCUSSIVE       |  100  |   50   |   25
+//   EXPLOSIVE        |   50  |   75   |  100
+//
+// Concussive shines vs small (peon / peasant / footman swarms);
+// Explosive shines vs large (catapult / dragon / future siege);
+// Normal is the well-rounded middle. The two extreme rows give
+// unit composition meaning — pick the right attacker for the
+// target class, not just the highest raw damage.
+//
+// Out-of-range inputs return 100 so a unit shipped before its
+// damage_type slot is filled in defaults to the no-op multiplier
+// rather than crashing. New rows / columns are appended by adding
+// const enums in wc1_units.bsm and a matching branch here.
+static _damage_mult_pct(dtype, size) {
+    if (dtype == DAMAGE_NORMAL) { return 100; }
+    if (dtype == DAMAGE_CONCUSSIVE) {
+        if (size == SIZE_SMALL)  { return 100; }
+        if (size == SIZE_MEDIUM) { return 50; }
+        if (size == SIZE_LARGE)  { return 25; }
+    }
+    if (dtype == DAMAGE_EXPLOSIVE) {
+        if (size == SIZE_SMALL)  { return 50; }
+        if (size == SIZE_MEDIUM) { return 75; }
+        if (size == SIZE_LARGE)  { return 100; }
+    }
+    return 100;
+}
+
+// Drop combat engagement: clear the AttackTarget sentinel + reset
+// the cooldown, and if we were mid-attack, flip the anim state back
+// to IDLE so the movement tick can resume control. Called from
+// every "target gone" branch in _combat_step (target dead, target
+// HP empty, target dying). The state reset is critical — without
+// it the ATTACK guard in wc1_movement._step_unit would refuse to
+// step the unit forever, even after a new right-click target.
+static void _disengage(an: Anim, at: AttackTarget) {
+    at.eid = -1;
+    at.last_attack_ms = 0;
+    if (an.state == UNIT_STATE_ATTACK) {
+        an.state      = UNIT_STATE_IDLE;
+        an.elapsed_ms = 0;
+    }
+}
+
+// S10.4 — the player (0 = human, 1 = orc) that owns entity `eid`.
+// Used to look up that side's researched weapon / armor bonus.
+static _player_of(w, eid) {
+    auto fa: Faction;
+    fa = ecs_get(w, faction_comp, eid);
+    return fa.player;
+}
+
+// ── Auto-target acquisition (Stratagus UnitActionStill → AutoAttack) ──
+// An idle unit with no orders defends itself: it engages the nearest enemy
+// unit within reaction range, the way WC1/SC1 units do (a footman doesn't
+// stand and watch a grunt walk up and hit it). This lives in the engine,
+// not the AI brain, so it applies to BOTH the player's idle units and the
+// enemy AI's — the "units are dumb at attacking" fix.
+//
+// The scan walks the (2R+1)² tile WINDOW of the movement occupancy grid
+// around the unit (via wc1_collision_unit_at) — O(window), constant in the
+// army size — and keeps the nearest enemy in it. The first cut walked every
+// unit per idle unit (O(N²)); at 400-unit scale that dominated the frame
+// profile, so it was rewritten to this spatial window. Reaction range is in
+// TILES; the window bounds the range, so the nearest is picked by raw
+// tile-distance with no separate range check.
+const _ACQ_RANGE_TILES = 6;
+
+// Per-entity combat tick. Three branches: dying (timer expiration
+// → finalize), engaged (out of range → path, in range → swing),
+// idle (nothing to do — early return).
+static void _combat_step(w, eid) {
+    auto at: AttackTarget, sh: Sheet, target_sh: Sheet, target_an: Anim;
+    auto an: Anim, my_p: Pos, target_p: Pos, my_pa: Path;
+    auto target_eid, dist_tiles, my_range;
+    auto cooldown_ms, damage, target_armor, target_hp;
+    auto my_dtype, target_size, mult_pct, target_is_building;
+
+    an = ecs_get(w, anim_comp, eid);
+
+    // Building peasants don't fight. Their state is owned by
+    // wc1_production_tick (parks the worker, advances the BUILD
+    // anim). The combat tick skips them entirely so engagements
+    // / disengagements never tangle with construction.
+    if (an.state == UNIT_STATE_BUILD) { return; }
+    // S9 — peasants gathering / returning don't engage in combat
+    // (canonical WC1 behavior — workers won't auto-fight while
+    // hauling resources).
+    if (an.state == UNIT_STATE_GATHER_GOLD)    { return; }
+    if (an.state == UNIT_STATE_GATHER_WOOD)    { return; }
+    if (an.state == UNIT_STATE_RETURNING_GOLD) { return; }
+    if (an.state == UNIT_STATE_RETURNING_WOOD) { return; }
+
+    // Dying — advance the death-anim timer; finalize when expired.
+    // Other branches must be skipped: a dying unit has no business
+    // pathing, swinging, or being commanded.
+    if (an.state == UNIT_STATE_DYING) {
+        an.elapsed_ms = an.elapsed_ms + _combat_dt_ms;
+        if (an.elapsed_ms >= _DIE_DURATION_MS) {
+            _finalize_death(w, eid);
+        }
+        return;
+    }
+
+    at = ecs_get(w, attack_target_comp, eid);
+    if (at.eid < 0) {
+        // No target. If we were attacking last frame (e.g. just
+        // killed the target, or the user right-clicked elsewhere
+        // and wc1_input cleared at.eid), flip state back so the
+        // movement tick can take over. Without this, the ATTACK
+        // guard in _step_unit would keep the unit frozen forever.
+        if (an.state == UNIT_STATE_ATTACK) {
+            an.state      = UNIT_STATE_IDLE;
+            an.elapsed_ms = 0;
+        }
+        // Auto-acquire: a truly idle unit (no orders, not walking to a
+        // commanded destination) engages the nearest enemy in reaction
+        // range, so it defends itself instead of standing there. Skipped
+        // for WALK / other states so we never override a move or
+        // attack-move the player or AI just issued. The engage logic
+        // below picks it up on the next tick (≤0.2s at the 5 Hz combat
+        // tick — imperceptible).
+        if (an.state == UNIT_STATE_IDLE) {
+            auto mgx, mgy, ox, oy, other, ofa: Faction, ddx, ddy, d2;
+            auto best_eid, best_d2, my_player;
+            my_p      = ecs_get(w, pos_comp, eid);
+            mgx       = my_p.x / 16;
+            mgy       = my_p.y / 16;
+            my_player = _player_of(w, eid);
+            best_eid  = 0 - 1;
+            best_d2   = 0;
+            // Walk the tile window of the occupancy grid; keep the nearest
+            // live enemy. wc1_collision_unit_at is O(1) per cell and
+            // bounds-safe, so this is O((2R+1)^2) regardless of army size.
+            oy = mgy - _ACQ_RANGE_TILES;
+            while (oy <= mgy + _ACQ_RANGE_TILES) {
+                ox = mgx - _ACQ_RANGE_TILES;
+                while (ox <= mgx + _ACQ_RANGE_TILES) {
+                    other = wc1_collision_unit_at(ox, oy);
+                    if (other >= 0 && other != eid) {
+                        ofa = ecs_get(w, faction_comp, other);
+                        if (ofa.player != my_player && ecs_alive_at(w, other) != 0) {
+                            ddx = ox - mgx;
+                            ddy = oy - mgy;
+                            d2  = ddx * ddx + ddy * ddy;
+                            if (best_eid < 0 || d2 < best_d2) {
+                                best_eid = other;
+                                best_d2  = d2;
+                            }
+                        }
+                    }
+                    ox = ox + 1;
+                }
+                oy = oy + 1;
+            }
+            if (best_eid >= 0) {
+                at.eid            = best_eid;
+                at.last_attack_ms = 0;
+            }
+        }
+        return;
+    }
+    target_eid = at.eid;
+
+    // Validate target is still alive (it may have been killed last
+    // frame by another attacker). ecs_alive_at is the canonical
+    // check for stale eids.
+    if (ecs_alive_at(w, target_eid) == 0) {
+        _disengage(an, at);
+        return;
+    }
+    target_sh = ecs_get(w, sheet_comp, target_eid);
+    if (cs_res_empty(target_sh.handle, RES_HP) != 0) {
+        _disengage(an, at);
+        return;
+    }
+    // Also skip if target is mid-death-animation — let it finish.
+    // Buildings share Pos / Faction / Sheet with units but carry NO Anim
+    // (their archetype omits it), so the DYING check applies to units only.
+    // ecs_has(building_comp) is the discriminator — the engine primitive
+    // graduated this session.
+    target_is_building = ecs_has(w, building_comp, target_eid);
+    if (target_is_building == 0) {
+        target_an = ecs_get(w, anim_comp, target_eid);
+        if (target_an.state == UNIT_STATE_DYING) {
+            _disengage(an, at);
+            return;
+        }
+    }
+
+    // Tile-space distance — close enough to engage?
+    my_p     = ecs_get(w, pos_comp, eid);
+    target_p = ecs_get(w, pos_comp, target_eid);
+    dist_tiles = _tile_chebyshev(my_p.x, my_p.y, target_p.x, target_p.y);
+
+    sh = ecs_get(w, sheet_comp, eid);
+    my_range = cs_stat_get(sh.handle, STAT_WEAPON_RANGE);
+
+    if (dist_tiles > my_range) {
+        // Out of range — re-request a path each frame so we
+        // adapt if the target moves. wc1_movement_request runs
+        // A* and writes Path.buf / count / cursor; the tile-claim
+        // collision keeps us from stepping ONTO the target tile.
+        // Cooldown clears while moving — closing the gap costs
+        // a swing's worth of recovery, same as SC1 melee feel.
+        // Movement tick will set state to WALK on its own.
+        wc1_movement_request(w, eid, target_p.x / 16, target_p.y / 16);
+        at.last_attack_ms = 0;
+        return;
+    }
+
+    // In range — halt any in-flight move path (cursor = count
+    // forces _step_unit into the idle branch next movement tick)
+    // and face the target so the chop animation aims correctly.
+    my_pa = ecs_get(w, path_comp, eid);
+    my_pa.cursor = my_pa.count;
+    an.facing = wc1_facing_for_delta(target_p.x - my_p.x,
+                                     target_p.y - my_p.y);
+    // State flip to ATTACK on entry (resets the anim cycle so the
+    // chop starts at frame 0); subsequent frames in the same state
+    // let the anim cycle naturally via elapsed_ms accumulation.
+    if (an.state != UNIT_STATE_ATTACK) {
+        an.state      = UNIT_STATE_ATTACK;
+        an.elapsed_ms = 0;
+    } else {
+        an.elapsed_ms = an.elapsed_ms + _combat_dt_ms;
+    }
+
+    // Cooldown gate. Accumulate elapsed time toward the unit's
+    // STAT_COOLDOWN_MS; only fire when it overflows.
+    cooldown_ms = cs_stat_get(sh.handle, STAT_COOLDOWN_MS);
+    at.last_attack_ms = at.last_attack_ms + _combat_dt_ms;
+    if (at.last_attack_ms < cooldown_ms) { return; }
+    at.last_attack_ms = 0;
+
+    // Energy gate (S7.7) — casters can't fire when their RES_ENERGY
+    // pool dips below STAT_ENERGY_COST. Non-casters have
+    // energy_cost == 0 and short-circuit through this check. Drains
+    // happen AFTER the gate passes so the message log only shows
+    // the energy line on the actual cast frame.
+    auto energy_cost, current_energy;
+    energy_cost = cs_stat_get(sh.handle, STAT_ENERGY_COST);
+    if (energy_cost > 0) {
+        current_energy = cs_res_current(sh.handle, RES_ENERGY);
+        if (current_energy < energy_cost) {
+            // Not enough energy — wait one full cooldown cycle for
+            // the regen tick to refill. Roll the cooldown back so
+            // the next frame's check still gates against the same
+            // window (otherwise we'd just keep cycling cooldowns
+            // without firing).
+            at.last_attack_ms = cooldown_ms;
+            return;
+        }
+        cs_res_adjust(sh.handle, RES_ENERGY, 0 - energy_cost);
+    }
+
+    // Ranged branch — weapon_range > 1 means we don't slam HP
+    // directly. We spawn a missile through wc1_missiles_spawn; it
+    // flies for `distance / missile_speed` ms; when it arrives the
+    // stbprojectile expire callback runs the damage matrix + armor
+    // formula against the target's CURRENT stats (which may have
+    // changed during flight). Melee (weapon_range == 1) still
+    // applies damage instantly below.
+    damage   = cs_stat_get(sh.handle, STAT_DAMAGE);
+    my_dtype = cs_stat_get(sh.handle, STAT_DAMAGE_TYPE);
+    // S10.4 — add the attacker's researched weapon upgrade. Applied
+    // before the range split so melee AND the spawned missile both
+    // carry the bonus.
+    damage = damage + wc1_tech_weapon_bonus(_player_of(w, eid));
+    if (my_range > 1) {
+        wc1_missile_spawn(my_p.x, my_p.y, target_p.x, target_p.y,
+                          target_eid, damage, my_dtype);
+        return;
+    }
+
+    // Melee — SC1-style two-stage formula resolves immediately:
+    //   step 1: scale raw by the type × size matrix (in percent)
+    //   step 2: subtract armor
+    //   step 3: floor at 1 so an attacker always chips at least
+    //           one HP, preventing "tank with 99 armor vs peasant"
+    //           stalemates that drag forever.
+    // Order matters: SC1 / BWAPI applies the multiplier BEFORE the
+    // armor subtraction. Difference vs the reversed order is small
+    // at low numbers but it's the canonical convention; matters
+    // more once damage upgrades + heavy armor stack later.
+    target_size  = cs_stat_get(target_sh.handle, STAT_SIZE_CLASS);
+    target_armor = cs_stat_get(target_sh.handle, STAT_ARMOR);
+    // S10.4 — add the defender's researched armor upgrade (melee
+    // path; the missile-impact callback is a follow-on).
+    target_armor = target_armor + wc1_tech_armor_bonus(_player_of(w, target_eid));
+    mult_pct     = _damage_mult_pct(my_dtype, target_size);
+    damage = (damage * mult_pct) / 100;
+    damage = damage - target_armor;
+    if (damage < 1) { damage = 1; }
+    target_hp = cs_res_adjust(target_sh.handle, RES_HP, 0 - damage);
+
+    if (wc1_debug != 0) {
+        putstr("hit eid=");
+        putnum(target_eid);
+        putstr(" dmg=");
+        putnum(damage);
+        putstr(" mult=");
+        putnum(mult_pct);
+        putstr("% hp=");
+        putnum(target_hp);
+        putstr("\n");
+    }
+
+    if (target_hp <= 0) {
+        if (target_is_building != 0) {
+            // Buildings have no death anim and aren't ticked by
+            // _combat_step (it walks peasant_q only), so raze immediately:
+            // free footprint + CharSheet + kill the row.
+            wc1_building_destroy(w, target_eid);
+        } else {
+            // Flip the unit into DYING so its death anim plays; the dying
+            // tick (this function on the target's row next frame) finalizes
+            // ecs_kill_at + tile-release + heap-free after _DIE_DURATION_MS.
+            target_an.state      = UNIT_STATE_DYING;
+            target_an.elapsed_ms = 0;
+        }
+        at.eid = -1;
+        at.last_attack_ms = 0;
+        if (wc1_debug != 0) {
+            putstr("dying eid=");
+            putstr(" "); putnum(target_eid);
+            putstr("\n");
+        }
+    }
+}
+
+// Final stage of the death pipeline: release the tile claim,
+// free per-unit heap (CharSheet + Path waypoint buffer), then
+// mark the ECS row dead. Other attackers see ecs_alive_at == 0
+// next frame and clear their stale AttackTarget references.
+static void _finalize_death(w, eid) {
+    auto sh: Sheet, pa: Path;
+    sh = ecs_get(w, sheet_comp, eid);
+    pa = ecs_get(w, path_comp, eid);
+    wc1_collision_release(pa.tile_gx, pa.tile_gy);
+    cs_free(sh.handle);
+    free(pa.buf);
+    ecs_kill_at(w, eid);
+    if (wc1_debug != 0) {
+        putstr("kill eid=");
+        putnum(eid);
+        putstr("\n");
+    }
+}

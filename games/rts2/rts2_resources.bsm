@@ -1,0 +1,179 @@
+// wc1_resources.bsm — Session 9 resource economy, per-player (S11).
+//
+// Gold + wood are the two harvestable resources. Food is the cap that
+// gates training. S9 shipped these as single global scalars (player-0
+// only); S11 splits them PER PLAYER so an AI opponent (or a future
+// multiplayer lobby) runs an independent economy instead of dipping
+// into the human's pool. Every counter is now an array indexed by
+// player id; the accessors take a `player` argument so each system
+// (HUD = local player, production = the building's owner, gather =
+// the depositing unit's owner) credits/charges the right side.
+//
+// State machine for peasants in gather mode (unchanged from S9):
+//
+//   IDLE → (right-click mine) → GATHER_GOLD → reach mine → tick
+//        → carry → walk to deposit (town hall) → deposit
+//        → (gold[player] += yield) → walk back → repeat until depleted
+//
+// The state transitions live in `wc1_movement.bsm`; this file owns the
+// numbers + the per-cycle yield tunables + the food-cap recompute.
+//
+// Tonify Rule 33 — Tier 3 game module (`games/rts1/`). All state is
+// game-specific (gold / wood / food are WC1's specific trio, not
+// generic RTS concepts). Reuses Tier 1 primitives only.
+
+import "stbecs.bsm";
+load   "rts2_buildings.bsm";   // building_comp, building_q, BLDG_*, BuildingDef
+load   "rts2_render.bsm";      // peasant_q + Faction struct + faction_comp
+
+// Player-id ceiling. forest1 uses 0-3 for the four corners and 15 for
+// the neutral gold-mine owner; sizing the pools at 16 covers every id
+// the map can carry so the accessors never need a bounds branch.
+const _RES_MAX_PLAYERS = 16;
+
+// ── Per-player pools ───────────────────────────────────────────
+//
+// Each is a buf_word indexed by player id. The POINTER is set once in
+// init (hence extrn, like the S9 scalars were); the contents mutate
+// every frame via subscript.
+extrn _res_gold;        // current gold per player
+extrn _res_wood;        // current wood per player
+extrn _res_food;        // food USED per player (= that player's unit count)
+extrn _res_food_cap;    // food CAP per player (town halls ×1 + farms ×4)
+
+// Per-cycle yield + tick budget (S9 v1 tunables). WC1: 100 gold/chop,
+// 100 wood/chop, ~2 s/cycle; bumped to 1500 ms to match the
+// construction-tick cadence so peasants feel like they're working.
+const _WC1_GOLD_YIELD     = 100;
+const _WC1_WOOD_YIELD     = 100;
+const _WC1_GATHER_TICK_MS = 1500;
+
+// Initial stash. Called once at game start (before any peasant spawn).
+// Every player starts with the canonical WC1 400 gold + 400 wood (per
+// `war1gus/scripts/players.lua`) and a food headroom of 4;
+// wc1_resources_recompute_cap rewires the cap dynamically each tick.
+void init_wc1_resources() {
+    auto p;
+    _res_gold     = buf_word(_RES_MAX_PLAYERS);
+    _res_wood     = buf_word(_RES_MAX_PLAYERS);
+    _res_food     = buf_word(_RES_MAX_PLAYERS);
+    _res_food_cap = buf_word(_RES_MAX_PLAYERS);
+    for (p = 0; p < _RES_MAX_PLAYERS; p++) {
+        _res_gold[p]     = 400;
+        _res_wood[p]     = 400;
+        _res_food[p]     = 0;
+        _res_food_cap[p] = 4;
+    }
+    return;
+}
+
+// ── Public accessors (per player) ──────────────────────────────
+
+wc1_resources_gold(player)     { return _res_gold[player]; }
+wc1_resources_wood(player)     { return _res_wood[player]; }
+wc1_resources_food(player)     { return _res_food[player]; }
+wc1_resources_food_cap(player) { return _res_food_cap[player]; }
+
+// ── Resource accrual ───────────────────────────────────────────
+//
+// Called by the gather state machine when a peasant arrives at a
+// deposit point with a carry. `player` is the depositing unit's owner;
+// `yield_kind` is CARRY_GOLD / CARRY_WOOD. Returns the amount credited.
+
+const CARRY_NONE = 0;
+const CARRY_GOLD = 1;
+const CARRY_WOOD = 2;
+
+wc1_resources_deposit(player, yield_kind) {
+    if (yield_kind == CARRY_GOLD) {
+        _res_gold[player] = _res_gold[player] + _WC1_GOLD_YIELD;
+        return _WC1_GOLD_YIELD;
+    }
+    if (yield_kind == CARRY_WOOD) {
+        _res_wood[player] = _res_wood[player] + _WC1_WOOD_YIELD;
+        return _WC1_WOOD_YIELD;
+    }
+    return 0;
+}
+
+// Per-cycle yield reader — player-independent (the yield is a tunable
+// constant, not a stored balance).
+wc1_resources_yield_for(carry_kind) {
+    if (carry_kind == CARRY_GOLD) { return _WC1_GOLD_YIELD; }
+    if (carry_kind == CARRY_WOOD) { return _WC1_WOOD_YIELD; }
+    return 0;
+}
+
+wc1_resources_gather_tick_ms() { return _WC1_GATHER_TICK_MS; }
+
+// ── Food cap + used recompute (per player) ─────────────────────
+//
+// Recompute called once per game tick. For each player:
+//   food_cap = sum of every completed town hall (1) + farm (4) it owns
+//   food_used = its active unit count
+// Foundations under construction don't count toward the cap until DONE.
+// The per-kind supply contribution lives in BuildingDef.supply so a
+// future "great hall" tier works without touching this loop.
+
+extrn faction_comp;
+
+static void _food_cap_visit(w, eid) {
+    auto b: Building, def: BuildingDef, fa: Faction;
+    b = ecs_get(w, building_comp, eid);
+    if (b.state != BLDG_STATE_DONE) { return; }
+    def = building_def_for(b.kind);
+    if (def == 0) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player < 0 || fa.player >= _RES_MAX_PLAYERS) { return; }
+    _res_food_cap[fa.player] = _res_food_cap[fa.player] + def.supply;
+    return;
+}
+
+static void _food_used_visit(w, eid) {
+    auto fa: Faction;
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player < 0 || fa.player >= _RES_MAX_PLAYERS) { return; }
+    _res_food[fa.player] = _res_food[fa.player] + 1;
+    return;
+}
+
+void wc1_resources_recompute_cap() {
+    auto p;
+    for (p = 0; p < _RES_MAX_PLAYERS; p++) { _res_food_cap[p] = 0; }
+    ecs_query_each(building_q, fn_ptr(_food_cap_visit));
+    // Floor each player at 4 so a fresh game (or a deathmatch start
+    // with only peasants) never locks a side out of training.
+    for (p = 0; p < _RES_MAX_PLAYERS; p++) {
+        if (_res_food_cap[p] < 4) { _res_food_cap[p] = 4; }
+    }
+    for (p = 0; p < _RES_MAX_PLAYERS; p++) { _res_food[p] = 0; }
+    ecs_query_each(peasant_q, fn_ptr(_food_used_visit));
+    return;
+}
+
+// ── Production gate ────────────────────────────────────────────
+//
+// Returns 1 if `player` can afford `gold_cost` + `wood_cost` AND has
+// room under its food cap. The training UI greys out unaffordable
+// buttons; the spawn path consumes via wc1_resources_spend.
+
+wc1_resources_can_afford(player, gold_cost, wood_cost) {
+    if (_res_gold[player] < gold_cost) { return 0; }
+    if (_res_wood[player] < wood_cost) { return 0; }
+    if (_res_food[player] >= _res_food_cap[player]) { return 0; }
+    return 1;
+}
+
+void wc1_resources_spend(player, gold_cost, wood_cost) {
+    _res_gold[player] = _res_gold[player] - gold_cost;
+    _res_wood[player] = _res_wood[player] - wood_cost;
+    return;
+}
+
+// Give resources back (training-queue cancel). Symmetric to spend; its
+// own verb so call sites read as intent, not a negative spend.
+void wc1_resources_refund(player, gold_cost, wood_cost) {
+    _res_gold[player] = _res_gold[player] + gold_cost;
+    _res_wood[player] = _res_wood[player] + wood_cost;
+    return;
+}

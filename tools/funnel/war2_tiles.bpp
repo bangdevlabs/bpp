@@ -1,0 +1,213 @@
+// war2_tiles — funnel: decode a Warcraft 2 tileset from MAINDAT.WAR into a
+// 32x32 tile sheet PNG + atlas_grid sidecar, indexed by MAP TILE VALUE so the
+// game's MTXM values index the sheet directly.
+//
+// Ported from Wargus `wartool.cpp` (ConvertTileset / ConvertTile /
+// CountUsedTiles / DecodeMiniTile). A WC2 game tile is 32x32 px = a 4x4 grid
+// of 8x8 "minitiles". The pieces (from wartool.h Todo[], type 'T'):
+//
+//   summer/forest : pal 2,  mega 3,  mini 4,  mape 5
+//   wasteland     : pal 10, mega 11, mini 12, mape 13
+//   winter        : pal 18, mega 19, mini 20, mape 21
+//   swamp         : pal 438,mega 439,mini 440,mape 441
+//
+//   mega : 32 bytes per megatile = 16 u16 minitile refs (4x4). ref bits 2..15
+//          = minitile index, bit1 = flipx, bit0 = flipy; byte offset into the
+//          mini chunk = (ref & 0xFFFC) << 4.
+//   mini : 64 bytes per 8x8 minitile (palette indices).
+//   mape : 158 groups x 42 bytes; the first 32 bytes are 16 u16 megatile
+//          indices (variations). A map tile value V selects group V>>4,
+//          variation V&0xF -> megatile = u16 at (mape + (V>>4)*42 + (V&0xF)*2).
+//
+// Output sheet: one 32x32 cell per map value V (0..0x9DF), 16 per row, so the
+// game renders frame V for MTXM value V directly. Unused values (megatile 0)
+// stay transparent.
+//
+// Usage: war2_tiles <ARCHIVE.WAR> <pal> <mega> <mini> <mape> <out.png>
+
+import "stbpixels.bsm";
+
+const TILE_PER_ROW = 16;        // 16 map tiles per sheet row
+const MAP_VALUES   = 2528;      // 0x9E groups * 16 variations = 0x9E0
+
+static _parse_uint(s: ptr) -> word {
+    auto v, i, c;
+    v = 0; i = 0;
+    c = peek(s + i);
+    while (c >= 48 && c <= 57) { v = v * 10 + (c - 48); i++; c = peek(s + i); }
+    return v;
+}
+
+// LZSS-decompress (or raw-copy) one `.WAR` chunk. Same format as war2_gfx.
+static _extract_entry(cp: ptr, len_out: ptr) -> ptr {
+    auto hdr, ulen, flags, dest, dp, ring, bi, i, bflags, o, j, val;
+    hdr = peek_h(cp); ulen = hdr & 0x00FFFFFF; flags = (hdr >> 24) & 0xFF;
+    cp = cp + 4; *len_out = ulen; dest = malloc(ulen);
+    if (flags != 0x20) {
+        i = 0; while (i < ulen) { poke(dest + i, peek(cp + i)); i++; }
+        return dest;
+    }
+    ring = malloc(4096); i = 0; while (i < 4096) { poke(ring + i, 0); i++; }
+    bi = 0; dp = 0;
+    while (dp < ulen) {
+        bflags = peek(cp); cp = cp + 1; i = 0;
+        while (i < 8) {
+            if (bflags & 1) {
+                val = peek(cp); cp = cp + 1;
+                poke(dest + dp, val); dp++;
+                poke(ring + (bi & 0xFFF), val); bi++;
+            } else {
+                o = peek_q(cp); cp = cp + 2; j = (o >> 12) + 3; o = o & 0xFFF;
+                while (j > 0) {
+                    val = peek(ring + (o & 0xFFF));
+                    poke(dest + dp, val); dp++;
+                    poke(ring + (bi & 0xFFF), val); bi++;
+                    o++;
+                    if (dp >= ulen) { j = 1; }
+                    j--;
+                }
+            }
+            if (dp >= ulen) { i = 8; }
+            bflags = bflags >> 1; i++;
+        }
+    }
+    free(ring);
+    return dest;
+}
+
+// Blit one 8x8 minitile (byte offset `mindex` into `mini`) into the tile
+// image at minitile cell (ix, iy), optionally mirrored.
+static _decode_mini(image, ix, iy, iadd, mini, mindex, flipx, flipy) {
+    auto x, y, sx, sy;
+    y = 0;
+    while (y < 8) {
+        sy = flipy ? 7 - y : y;
+        x = 0;
+        while (x < 8) {
+            sx = flipx ? 7 - x : x;
+            poke(image + (y + iy * 8) * iadd + ix * 8 + x,
+                 peek(mini + mindex + sy * 8 + sx));
+            x++;
+        }
+        y++;
+    }
+}
+
+main() {
+    auto path: ptr;
+    auto out_path: ptr;
+    auto buf, size, off_base;
+    auto pal_idx, mega_idx, mini_idx, mape_idx;
+    auto pal_raw, pal_len, pal;
+    auto mega, mega_len, mini, mini_len, mape, mape_len;
+    auto width, height, image, nbytes, rgba;
+    auto v, mt, cx, cy, tx, ty, ref, i, val;
+    auto json, jpath, bn, plen;
+
+    if (argc_get() < 7) {
+        putstr_err("usage: war2_tiles <ARCHIVE.WAR> <pal> <mega> <mini> <mape> <out.png>\n");
+        return 1;
+    }
+    path     = argv_get(1);
+    pal_idx  = _parse_uint(argv_get(2));
+    mega_idx = _parse_uint(argv_get(3));
+    mini_idx = _parse_uint(argv_get(4));
+    mape_idx = _parse_uint(argv_get(5));
+    out_path = argv_get(6);
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) { putstr_err("war2_tiles: cannot read archive\n"); return 1; }
+    off_base = buf + 8;
+
+    // Palette: extract, scale VGA 6-bit -> 8-bit.
+    pal_len = 0;
+    pal_raw = _extract_entry(buf + peek_h(off_base + pal_idx * 4), &pal_len);
+    pal = malloc(768);
+    i = 0;
+    while (i < 768) {
+        val = i < pal_len ? peek(pal_raw + i) : 0;
+        poke(pal + i, (val << 2) & 0xFF);
+        i++;
+    }
+    free(pal_raw);
+
+    mega_len = 0; mega = _extract_entry(buf + peek_h(off_base + mega_idx * 4), &mega_len);
+    mini_len = 0; mini = _extract_entry(buf + peek_h(off_base + mini_idx * 4), &mini_len);
+    mape_len = 0; mape = _extract_entry(buf + peek_h(off_base + mape_idx * 4), &mape_len);
+
+    width  = TILE_PER_ROW * 32;
+    height = ((MAP_VALUES + TILE_PER_ROW - 1) / TILE_PER_ROW) * 32;
+    image = malloc(width * height);
+    i = 0; while (i < width * height) { poke(image + i, 0); i++; }
+
+    // One 32x32 cell per map value: V -> megatile via the mape group table,
+    // megatile -> 4x4 minitiles.
+    v = 0;
+    while (v < MAP_VALUES) {
+        // map2tile[V] = u16 at mape + (V>>4)*42 + (V&0xF)*2
+        mt = peek_q(mape + (v >> 4) * 42 + (v - (v >> 4 << 4)) * 2);
+        if (mt != 0 && mt * 32 + 32 <= mega_len) {
+            cx = v - (v / TILE_PER_ROW) * TILE_PER_ROW;   // sheet tile col
+            cy = v / TILE_PER_ROW;                        // sheet tile row
+            ty = 0;
+            while (ty < 4) {
+                tx = 0;
+                while (tx < 4) {
+                    ref = peek_q(mega + mt * 32 + (tx + ty * 4) * 2);
+                    _decode_mini(image,
+                        cx * 4 + tx, cy * 4 + ty, width, mini,
+                        (ref & 0xFFFC) << 4, ref & 2, ref & 1);
+                    tx++;
+                }
+                ty++;
+            }
+        }
+        v++;
+    }
+
+    // Indexed -> RGBA (index 0 transparent).
+    nbytes = width * height * 4;
+    rgba = malloc(nbytes);
+    i = 0;
+    while (i < width * height) {
+        val = peek(image + i);
+        if (val == 0) {
+            poke(rgba + i * 4 + 0, 0); poke(rgba + i * 4 + 1, 0);
+            poke(rgba + i * 4 + 2, 0); poke(rgba + i * 4 + 3, 0);
+        } else {
+            poke(rgba + i * 4 + 0, peek(pal + val * 3 + 0));
+            poke(rgba + i * 4 + 1, peek(pal + val * 3 + 1));
+            poke(rgba + i * 4 + 2, peek(pal + val * 3 + 2));
+            poke(rgba + i * 4 + 3, 255);
+        }
+        i++;
+    }
+
+    if (pixels_save_png(out_path, rgba, width, height) != 0) {
+        putstr_err("war2_tiles: PNG write failed\n");
+        return 1;
+    }
+
+    // atlas_grid sidecar (tile 32), sibling .json.
+    bn = out_path; plen = 0;
+    while (peek(out_path + plen) != 0) {
+        if (peek(out_path + plen) == 47) { bn = out_path + plen + 1; }
+        plen++;
+    }
+    jpath = strbuf_new();
+    i = 0; while (i < plen - 4) { jpath = strbuf_ch(jpath, peek(out_path + i)); i++; }
+    jpath = strbuf_cat(jpath, ".json"); jpath = strbuf_ch(jpath, 0);
+    json = strbuf_new();
+    json = strbuf_cat(json, "{\"type\":\"atlas_grid\",\"tile_w\":32,\"tile_h\":32,\"image\":\"");
+    json = strbuf_cat(json, bn);
+    json = strbuf_cat(json, "\"}");
+    file_write_all(jpath, json, strbuf_len(json));
+
+    putstr("war2_tiles: "); putnum(MAP_VALUES); putstr(" map values -> ");
+    putnum(width); putstr("x"); putnum(height);
+    putstr(" -> "); putstr(out_path); putstr(" (+ .json)\n");
+
+    free(mega); free(mini); free(mape); free(image); free(rgba); free(pal);
+    return 0;
+}

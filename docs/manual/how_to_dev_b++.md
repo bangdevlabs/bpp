@@ -52,17 +52,13 @@ and pointers to the three companion books for everything else.
 
 ---
 
-# Part I — Começo
+# Part I — The Start
 
 Everything you need to write your first line of B++ and know it works.
 
 ---
 
 ## Cap 1 — Hello World
-
-*Depends on: —*
-*Source: new*
-*Status: COMPLETE — 2026-04-21*
 
 The minimum B++ program is three lines. No headers, no imports, no return statement:
 
@@ -151,10 +147,6 @@ Quick map of what's in there, by what you want to learn:
 ---
 
 ## Cap 2 — The Auto-Injected Prelude
-
-*Depends on: Cap 1*
-*Source: new (documents `src/bpp_import.bsm`:601-750 implicit behaviour)*
-*Status: COMPLETE — 2026-04-21*
 
 Every B++ program starts with **21 modules already in scope** (as of 2026-05-29). You do not need to `import` them. Their functions are globals. This is the "prelude" — the libraries the compiler auto-injects into every compilation unit, in dependency order, via `src/bpp_import.bsm`.
 
@@ -2302,7 +2294,7 @@ justification, and the "when to fork" escape hatch): see
 
 **Canonical schemas** for every asset shape Bang 9 / Modulab
 author — level JSON (palette + tileset modes), atlas pack JSON,
-audio format requirements: see **`docs/manual/asset_formats.md`**. That
+audio format requirements: see **`docs/manual/funnel_conversor.md`**. That
 file is the authoritative field-by-field reference; when you add
 a new asset shape, extend it there + update the table in Rule 31.
 

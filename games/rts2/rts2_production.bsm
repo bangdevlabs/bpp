@@ -1,0 +1,824 @@
+// wc1_production.bsm — building construction state machine.
+//
+// Session 8 ships the foundation-to-completed transition: a
+// building spawned in BLDG_STATE_CONSTRUCTING accumulates progress
+// every frame until BuildingDef.construction_time_ms elapses, at
+// which point the state flips to BLDG_STATE_DONE and the renderer
+// swaps from the 3-frame scaffolding strip to the 1-frame
+// completed sprite.
+//
+// The tick is intentionally narrow for v1 — no peasant assignment,
+// no resource consumption, no production queue. Future sessions
+// layer those on top:
+//
+//   S8.1  Peasant-assignment loop: a peasant walks to the
+//         foundation and the construction tick only advances
+//         while at least one peasant is parked on the tile.
+//   S9    Resource economy: gold + wood + food are debited at
+//         foundation placement (per BuildingDef.cost_*) and the
+//         supply field grants food cap on completion.
+//   S10   Training queues + research: barracks / stable / church
+//         schedule unit production; lumber mill + blacksmith
+//         schedule upgrades.
+//
+// For now the foundation spawns and ticks down to completion on
+// its own — enough to verify the rendering pipeline + state-machine
+// shape end-to-end, and unblock the manual smoke that S8.0
+// instructs.
+
+import "stbecs.bsm";          // ecs_query_each
+import "stbgame.bsm";          // game_dt_ms
+load   "rts2_buildings.bsm";    // Building struct + building_comp + building_q
+load   "rts2_render.bsm";       // Pos / Anim structs + pos_comp / anim_comp
+load   "rts2_anims.bsm";        // UNIT_STATE_BUILD + facing helpers
+load   "rts2_units.bsm";        // UnitDef + UNIT_* + unit_def_for (S10 training)
+
+// Pixel radius around the building's center within which an
+// assigned peasant counts as "at the foundation" — i.e., close
+// enough to advance construction. 48 px ≈ 3 tiles, covering the
+// adjacent ring around even the smallest 48×48 footprint and
+// matching the natural stopping distance of A* against a
+// blocked target tile (the pathfinder halts at the closest
+// unblocked cell, which lands the worker 1-2 tiles outside the
+// foundation).
+const _BLDG_ASSIGN_RADIUS_PX = 48;
+
+// ── S10 production: training queue ────────────────────────────
+//
+// Max units a single building may queue at once. 7 is a comfortable
+// depth that fits the command-card pip row without scrolling.
+const _WC1_QUEUE_MAX = 7;
+
+// ── S10.4 research: blacksmith upgrades ───────────────────────
+//
+// Two techs in v1, both researched at the blacksmith, both global
+// per player. A flat weapon / armor bonus the combat tick reads at
+// strike time — enough to prove the research loop (button → cost →
+// tick → flag → effect) without a full upgrade tree.
+const TECH_WEAPON      = 0;
+const TECH_ARMOR       = 1;
+const _WC1_TECH_COUNT  = 2;
+const _WC1_TECH_BONUS  = 2;        // +2 damage / +2 armor per tech
+const _WC1_RESEARCH_MS = 15000;    // 15 s per upgrade
+
+// Per-player tech-done flags, lazy-allocated (2 players × 2 techs).
+// 0 = not researched, 1 = done. Lazy so a game that never opens a
+// blacksmith never allocates the table.
+global _wc1_tech_done;
+
+static _tech_slot(player, tech) { return player * _WC1_TECH_COUNT + tech; }
+
+static void _tech_ensure() {
+    if (_wc1_tech_done == 0) {
+        _wc1_tech_done = buf_byte(2 * _WC1_TECH_COUNT);
+        buf_fill(_wc1_tech_done, 0, 2 * _WC1_TECH_COUNT);
+    }
+}
+
+// 1 if `player` has finished researching `tech`, else 0.
+wc1_tech_has(player, tech) {
+    if (_wc1_tech_done == 0) { return 0; }
+    return peek(_wc1_tech_done + _tech_slot(player, tech));
+}
+
+static void _tech_set_done(player, tech) {
+    _tech_ensure();
+    poke(_wc1_tech_done + _tech_slot(player, tech), 1);
+}
+
+// Combat reads these at strike time — flat bonus once the tech lands.
+wc1_tech_weapon_bonus(player) {
+    return wc1_tech_has(player, TECH_WEAPON) != 0 ? _WC1_TECH_BONUS : 0;
+}
+wc1_tech_armor_bonus(player) {
+    return wc1_tech_has(player, TECH_ARMOR) != 0 ? _WC1_TECH_BONUS : 0;
+}
+
+// Fill `out` with the TECH_* a building offers `player`. Blacksmith
+// only in v1; returns 0 for everything else. Researched techs stay
+// in the menu (the button renders "done") so the player still sees
+// what is already unlocked.
+wc1_research_menu(bldg_kind, player, out) {
+    if (bldg_kind == BLDG_BLACKSMITH) {
+        out[0] = TECH_WEAPON;
+        out[1] = TECH_ARMOR;
+        return 2;
+    }
+    return 0;
+}
+
+wc1_research_cost_gold(tech) { return 500; }
+wc1_research_cost_wood(tech) { return 100; }
+wc1_research_time_ms(tech)   { return _WC1_RESEARCH_MS; }
+
+// Short label for a research button (techs have no unit portrait).
+// Kept to 3 chars so it fits the 36 px button. Lives here, not in the
+// HUD, because the TECH_* constants are defined in this module.
+wc1_tech_label(tech) {
+    switch (tech) {
+    TECH_WEAPON { return "Wpn"; }
+    TECH_ARMOR  { return "Arm"; }
+    else        { return "?"; }
+    }
+    return "?";
+}
+
+// Start researching `tech` at building `eid`. Rejects if the player
+// already has it, the building is already researching, or the player
+// can't afford gold + wood (no food gate — research consumes no
+// supply). Spends on success. Returns 1 if research started.
+wc1_research_start(world, eid, tech) {
+    auto b: Building, fa: Faction, g, wd;
+    b = ecs_get(world, building_comp, eid);
+    if (b.research_tech >= 0) { return 0; }          // one at a time
+    fa = ecs_get(world, faction_comp, eid);
+    if (wc1_tech_has(fa.player, tech) != 0) { return 0; }   // already done
+    g  = wc1_research_cost_gold(tech);
+    wd = wc1_research_cost_wood(tech);
+    if (wc1_resources_gold(fa.player) < g)  { return 0; }
+    if (wc1_resources_wood(fa.player) < wd) { return 0; }
+    wc1_resources_spend(fa.player, g, wd);
+    b.research_tech        = tech;
+    b.research_progress_ms = 0;
+    return 1;
+}
+
+// Fill `out` (a buf_word with at least _WC1_QUEUE_MAX slots) with
+// the UNIT_* kinds a building of `bldg_kind` can train for `player`
+// (0 = human, 1 = orc) and return the count. The same building role
+// trains a faction-distinct roster (human footman vs orc grunt), so
+// the menu branches on player. Non-producer kinds return 0. This is
+// the data the command card lays buttons out from + the enqueue path
+// validates against. Catapults + heroes are intentionally absent —
+// siege production wires onto the blacksmith in a later pass, heroes
+// are mission-placed.
+wc1_train_menu(bldg_kind, player, out) {
+    auto n, human;
+    n = 0;
+    human = player == 0;
+    switch (bldg_kind) {
+        BLDG_TOWN_HALL {
+            out[0] = UNIT_PEASANT;          // peon shares the slot
+            n = 1;
+        }
+        BLDG_BARRACKS {
+            if (human != 0) {
+                out[0] = UNIT_FOOTMAN; out[1] = UNIT_ARCHER;
+            } else {
+                out[0] = UNIT_GRUNT;   out[1] = UNIT_SPEARMAN;
+            }
+            n = 2;
+        }
+        BLDG_STABLE {
+            out[0] = human != 0 ? UNIT_KNIGHT : UNIT_RAIDER;
+            n = 1;
+        }
+        BLDG_CHURCH {
+            if (human != 0) {
+                out[0] = UNIT_CLERIC;    out[1] = UNIT_CONJURER;
+            } else {
+                out[0] = UNIT_NECROLYTE; out[1] = UNIT_WARLOCK;
+            }
+            n = 2;
+        }
+        else { n = 0; }
+    }
+    return n;
+}
+
+// Fill `out` with the BLDG_* a peasant can build for `player` and
+// return the count. v1 offers the eight constructable buildings (keep
+// is an upgrade, gold mine is neutral — both excluded). Faction-
+// symmetric: same kinds for human + orc, only the resolved atlas
+// differs (wc1_building_atlas_idle / _construct).
+wc1_build_menu(player, out) {
+    out[0] = BLDG_TOWN_HALL;
+    out[1] = BLDG_FARM;
+    out[2] = BLDG_BARRACKS;
+    out[3] = BLDG_LUMBER_MILL;
+    out[4] = BLDG_BLACKSMITH;
+    out[5] = BLDG_STABLE;
+    out[6] = BLDG_CHURCH;
+    out[7] = BLDG_TOWER;
+    return 8;
+}
+
+// ── S10.6 per-unit command menu (WC1 two-level command card) ──────
+//
+// WC1 defines command buttons PER UNIT TYPE: war1gus scripts/buttons.lua
+// gives each DefineButton a ForUnit list, a Pos (1-9 slot in the 3x3
+// command grid) and a Level (0 = root card, 1+ = submenu). A peasant's
+// root card is Move / Stop / Harvest + Build Basic + Build Advanced; the
+// two build buttons switch the card to a submenu of the basic / advanced
+// structures, each with a Cancel back to root. Combat units share
+// Move / Stop / Attack; casters add spell slots. Only the peasant card
+// ships here in v1 — every other kind returns an empty menu (name + HP
+// only, as before).
+//
+// Each entry packs (pos, action, value) into one word so the HUD (draw)
+// and the input tick (hit-test) read the same list without sharing the
+// CMD_* constants. pos is 1-9; action is a CMD_*; value carries the
+// BLDG_* for a build button (0 otherwise). The HUD reads entries through
+// the wc1_cmd_entry_* accessors below, so the CMD_* enum stays private.
+const CMD_MOVE        = 1;
+const CMD_STOP        = 2;
+const CMD_HARVEST     = 3;
+const CMD_BUILD_BASIC = 4;   // switch the card to the basic-build submenu
+const CMD_BUILD_ADV   = 5;   // switch the card to the advanced-build submenu
+const CMD_CANCEL      = 6;   // submenu → back to the root card
+const CMD_BUILD       = 7;   // place a specific building (value = BLDG_*)
+const CMD_ATTACK      = 8;   // arm the cursor to attack a target / ground
+
+const CMD_LEVEL_ROOT  = 0;
+const CMD_LEVEL_BASIC = 1;
+const CMD_LEVEL_ADV   = 2;
+
+static _cmd_pack(pos, action, value) { return pos * 100000 + action * 1000 + value; }
+wc1_cmd_entry_pos(e)    { return e / 100000; }
+static _cmd_action(e)   { return (e / 1000) % 100; }
+wc1_cmd_entry_value(e)  { return e % 1000; }
+wc1_cmd_entry_is_build(e) { return _cmd_action(e) == CMD_BUILD; }
+
+// Map a building kind to its frame in the portrait_icons strip (human
+// 14-32 / orc faction-distinct per war1gus icons.lua). Public so both
+// the command-grid icons (here) and the HUD portrait box read the same
+// mapping. player == 1 selects the orc variant where the pair differs.
+wc1_building_icon_frame(kind, player) {
+    switch (kind) {
+    BLDG_TOWN_HALL   { return player == 1 ? 21 : 20; }
+    BLDG_FARM        { return player == 1 ? 15 : 14; }
+    BLDG_BARRACKS    { return player == 1 ? 17 : 16; }
+    BLDG_LUMBER_MILL { return player == 1 ? 23 : 22; }
+    BLDG_BLACKSMITH  { return player == 1 ? 27 : 26; }
+    BLDG_STABLE      { return player == 1 ? 25 : 24; }    // kennel (orc)
+    BLDG_CHURCH      { return player == 1 ? 29 : 28; }    // temple (orc)
+    BLDG_TOWER       { return player == 1 ? 19 : 18; }
+    BLDG_KEEP        { return player == 1 ? 32 : 31; }    // spire (orc)
+    else             { return 20; }
+    }
+    return 20;
+}
+
+// Portrait-icon frame for a command entry. Actions use the war1gus
+// action-icon frames (move-peasant 33 / move-peon 34, stop = shield
+// 79/82, harvest 36, build-basic 37, build-advanced 38, cancel 40);
+// build entries use the building icon frame.
+wc1_cmd_entry_frame(e, player) {
+    auto value;
+    value = e % 1000;
+    switch (_cmd_action(e)) {
+    CMD_MOVE        { return player == 1 ? 34 : 33; }
+    CMD_STOP        { return player == 1 ? 82 : 79; }
+    CMD_ATTACK      { return value; }   // weapon icon packed in the entry
+    CMD_HARVEST     { return 36; }
+    CMD_BUILD_BASIC { return 37; }
+    CMD_BUILD_ADV   { return 38; }
+    CMD_CANCEL      { return 40; }
+    CMD_BUILD       { return wc1_building_icon_frame(value, player); }
+    else            { return 40; }
+    }
+    return 40;
+}
+
+// 1 if the entry's command is currently enabled. Actions are always
+// enabled; a build entry is gated on the player affording its gold +
+// wood (the HUD dims the icon, the click is rejected upstream).
+wc1_cmd_entry_affordable(e) {
+    auto def: BuildingDef, lp;
+    if (_cmd_action(e) != CMD_BUILD) { return 1; }
+    def = building_def_for(e % 1000);
+    if (def == 0) { return 0; }
+    // The command card always shows the LOCAL player's economy.
+    lp = wc1_local_player();
+    return wc1_resources_gold(lp) >= def.cost_gold
+        && wc1_resources_wood(lp) >= def.cost_wood;
+}
+
+// Fill `out` (>= 9 slots) with the command entries for `unit_kind` at
+// menu `level` and return the count. Only the peasant has a card in v1.
+wc1_unit_cmd_menu(unit_kind, player, level, out) {
+    if (unit_kind != UNIT_PEASANT) {
+        // Combat units share one root card: Move / Stop / Attack (no
+        // submenus). The attack icon is the unit's weapon — arrow for
+        // ranged (archer / spearman / catapult), sword for human melee,
+        // axe for orc melee — carried in the entry's value so the HUD
+        // draws the right one. Casters use the melee icon in v1 (spell
+        // buttons land when spell mechanics ship).
+        auto ranged, atk_icon;
+        ranged = unit_kind == UNIT_ARCHER || unit_kind == UNIT_SPEARMAN
+              || unit_kind == UNIT_CATAPULT;
+        atk_icon = ranged != 0 ? 71 : (player == 1 ? 66 : 63);
+        out[0] = _cmd_pack(1, CMD_MOVE,   0);
+        out[1] = _cmd_pack(2, CMD_STOP,   0);
+        out[2] = _cmd_pack(3, CMD_ATTACK, atk_icon);
+        return 3;
+    }
+    if (level == CMD_LEVEL_BASIC) {
+        // Build Basic Structure — WC1 grouping (Farm, Lumber Mill,
+        // Barracks, Town Hall) + Cancel back to the root card.
+        out[0] = _cmd_pack(1, CMD_BUILD, BLDG_FARM);
+        out[1] = _cmd_pack(2, CMD_BUILD, BLDG_LUMBER_MILL);
+        out[2] = _cmd_pack(3, CMD_BUILD, BLDG_BARRACKS);
+        out[3] = _cmd_pack(4, CMD_BUILD, BLDG_TOWN_HALL);
+        out[4] = _cmd_pack(6, CMD_CANCEL, 0);
+        return 5;
+    }
+    if (level == CMD_LEVEL_ADV) {
+        // Build Advanced Structure — Blacksmith, Church, Tower, Stable.
+        out[0] = _cmd_pack(1, CMD_BUILD, BLDG_BLACKSMITH);
+        out[1] = _cmd_pack(2, CMD_BUILD, BLDG_CHURCH);
+        out[2] = _cmd_pack(3, CMD_BUILD, BLDG_TOWER);
+        out[3] = _cmd_pack(4, CMD_BUILD, BLDG_STABLE);
+        out[4] = _cmd_pack(6, CMD_CANCEL, 0);
+        return 5;
+    }
+    // Root card.
+    out[0] = _cmd_pack(1, CMD_MOVE, 0);
+    out[1] = _cmd_pack(2, CMD_STOP, 0);
+    out[2] = _cmd_pack(4, CMD_HARVEST, 0);
+    out[3] = _cmd_pack(5, CMD_BUILD_BASIC, 0);
+    out[4] = _cmd_pack(6, CMD_BUILD_ADV, 0);
+    return 5;
+}
+
+// ── command-card state + armed cursor ─────────────────────────────
+//
+// _cmd_menu_level tracks which card the selected peasant is showing
+// (root / basic / advanced). _cmd_pending is the armed-cursor state:
+// after the player clicks Move or Harvest, the next world click is
+// consumed by the input tick as the command's target. 0 = none,
+// 1 = move-armed, 2 = harvest-armed (the input tick reads these via
+// wc1_cmd_pending and executes against the live selection).
+global _cmd_menu_level;
+global _cmd_pending;
+
+wc1_cmd_menu_level()        { return _cmd_menu_level; }
+void wc1_cmd_menu_reset()   { _cmd_menu_level = 0; _cmd_pending = 0; }
+wc1_cmd_pending()           { return _cmd_pending; }
+void wc1_cmd_pending_clear() { _cmd_pending = 0; }
+
+// Selection state owned by the input module — STOP clears every
+// selected unit's orders. extrn (not load) keeps the dependency one-
+// way: production reads the selection, input drives production.
+extrn selected_eids, selected_count;
+extrn target_comp, attack_target_comp;
+extrn wc1_debug;        // verbose production-event logging gate (set by rts.bpp)
+
+// STOP — clear move / attack / gather orders on the whole selection so
+// the units halt where they stand.
+static void _cmd_stop_selection(world) {
+    auto i, eid, t: Target, at: AttackTarget;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        t = ecs_get(world, target_comp, eid);
+        t.gx = 0 - 1; t.gy = 0 - 1;
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = 0 - 1;
+        wc1_gather_clear(world, eid);
+    }
+}
+
+// Resolve a left-click on the command card while unit `eid` is
+// selected. Hit-tests the active card's entries (same wc1_cmd_button_rect
+// the HUD draws) for the unit's kind + menu level. Build Basic /
+// Advanced / Cancel switch the peasant card; a build entry (if
+// affordable) enters placement; Stop halts the selection; Move /
+// Harvest / Attack arm the cursor for the next world click. Returns 1
+// if any button was hit (so the click is consumed). Units with no card
+// (the menu returns 0 entries) just fall through returning 0.
+wc1_unit_cmd_click(world, eid, mx, my) {
+    auto u: UnitType, fa: Faction, level, menu, n, i, e, pos, action, value;
+    auto rect, bx, by, bw, bh, bdef: BuildingDef;
+    u = ecs_get(world, unit_comp, eid);
+    fa = ecs_get(world, faction_comp, eid);
+    level = _cmd_menu_level;
+    menu = buf_word(9);
+    n = wc1_unit_cmd_menu(u.kind, fa.player, level, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        e   = menu[i];
+        pos = e / 100000;
+        wc1_cmd_button_rect(pos - 1, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            action = _cmd_action(e);
+            value  = e % 1000;
+            // Picking any button cancels a stale armed cursor; the
+            // Move / Harvest cases below re-arm it.
+            _cmd_pending = 0;
+            switch (action) {
+            CMD_BUILD_BASIC { _cmd_menu_level = CMD_LEVEL_BASIC; }
+            CMD_BUILD_ADV   { _cmd_menu_level = CMD_LEVEL_ADV; }
+            CMD_CANCEL      { _cmd_menu_level = CMD_LEVEL_ROOT; }
+            CMD_STOP        { _cmd_stop_selection(world); }
+            CMD_MOVE        { _cmd_pending = 1; }
+            CMD_HARVEST     { _cmd_pending = 2; }
+            CMD_ATTACK      { _cmd_pending = 3; }
+            CMD_BUILD {
+                // Only enter placement when affordable (icon is already
+                // dimmed otherwise); the click is consumed either way.
+                bdef = building_def_for(value);
+                if (bdef != 0
+                    && wc1_resources_gold(fa.player) >= bdef.cost_gold
+                    && wc1_resources_wood(fa.player) >= bdef.cost_wood) {
+                    wc1_placement_begin(value, eid);
+                    _cmd_menu_level = CMD_LEVEL_ROOT;
+                }
+            }
+            else { }
+            }
+            free(menu); free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    free(menu); free(rect);
+    return 0;
+}
+
+// ── S10.5 building placement (peasant build flow) ─────────────
+//
+// Select a peasant → click a build icon → a ghost of the building
+// follows the cursor (green where every footprint tile is free, red
+// otherwise) → click a valid spot to drop the foundation + auto-
+// assign the peasant to build it. State is a small global triple;
+// the HUD renders the ghost, the input tick drives begin / place /
+// cancel through here.
+global _placement_active;     // 0 = not placing, 1 = placing
+global _placement_kind;       // BLDG_* being placed
+global _placement_peasant;    // eid of the worker that will build it
+
+void wc1_placement_begin(kind, peasant_eid) {
+    _placement_active  = 1;
+    _placement_kind    = kind;
+    _placement_peasant = peasant_eid;
+}
+void wc1_placement_cancel() { _placement_active = 0; }
+wc1_placement_active()  { return _placement_active; }
+wc1_placement_kind()    { return _placement_kind; }
+wc1_placement_peasant() { return _placement_peasant; }
+
+// True if a building of `kind` fits with its top-left at tile
+// (gx, gy): every footprint tile must be free (no terrain block, no
+// unit/building claim). self_eid = -1 → a fresh building must land
+// on entirely clear ground. Shared by the ghost render + the place
+// gate so the green/red tint matches what actually drops.
+wc1_placement_valid(kind, gx, gy) {
+    auto def: BuildingDef, ntx, nty, ix, iy;
+    def = building_def_for(kind);
+    if (def == 0) { return 0; }
+    ntx = def.px_w / 16;
+    nty = def.px_h / 16;
+    iy = 0;
+    while (iy < nty) {
+        ix = 0;
+        while (ix < ntx) {
+            if (wc1_collision_is_blocked_for(0 - 1, gx + ix, gy + iy) != 0) {
+                return 0;
+            }
+            ix = ix + 1;
+        }
+        iy = iy + 1;
+    }
+    return 1;
+}
+
+// (S10.5's flat build-icon click handler `wc1_build_try_click` +
+// `wc1_cmd_build_button_rect` were superseded by the S10.6 two-level
+// command card — `wc1_unit_cmd_click` / `wc1_unit_cmd_menu` above —
+// and removed.)
+
+// Try to drop the active placement at tile (gx, gy). On a valid spot
+// with enough gold/wood: spend, spawn the foundation (CONSTRUCTING)
+// with the resolved atlases, auto-assign the placement peasant, and
+// exit placement. Returns 1 if placed. Invalid spot / too poor: stays
+// in placement so the player can reposition.
+wc1_placement_try_at(world, gx, gy) {
+    auto kind, player, def: BuildingDef, fa: Faction, idle, construct, eid;
+    if (_placement_active == 0) { return 0; }
+    kind = _placement_kind;
+    if (wc1_placement_valid(kind, gx, gy) == 0) { return 0; }
+    def = building_def_for(kind);
+    if (def == 0) { return 0; }
+    // The placing peasant's player owns + pays for the building.
+    fa = ecs_get(world, faction_comp, _placement_peasant);
+    player = fa.player;
+    // Buildings cost gold + wood only (no food — they GRANT it).
+    if (wc1_resources_gold(player) < def.cost_gold) { return 0; }
+    if (wc1_resources_wood(player) < def.cost_wood) { return 0; }
+    idle      = wc1_building_atlas_idle(kind, player);
+    construct = wc1_building_atlas_construct(kind, player);
+    wc1_resources_spend(player, def.cost_gold, def.cost_wood);
+    eid = ecs_spawn_building(world, idle, construct, gx, gy, player, kind);
+    // Auto-assign the worker that initiated the build so it walks
+    // over and starts construction (same path the right-click assign
+    // uses).
+    wc1_building_assign_peasant(world, eid, _placement_peasant);
+    _placement_active = 0;
+    return 1;
+}
+
+// Append a unit to a building's training queue. Lazy-allocates the
+// queue buffer on first use (non-producers never pay). The CALLER
+// gates affordability (gold / wood / food) — this only records the
+// order. Returns 1 on success, 0 if the queue is already full.
+wc1_production_enqueue(w, eid, unit_kind) {
+    auto b: Building, q;
+    b = ecs_get(w, building_comp, eid);
+    if (b.train_count >= _WC1_QUEUE_MAX) { return 0; }
+    if (b.train_queue == 0) {
+        b.train_queue = buf_word(_WC1_QUEUE_MAX);
+    }
+    q = b.train_queue;
+    q[b.train_count] = unit_kind;
+    b.train_count = b.train_count + 1;
+    return 1;
+}
+
+// S10 — resolve a left-click that landed on the command card while
+// building `eid` is selected. Hit-tests the click against this
+// building's train buttons (same wc1_cmd_button_rect the HUD draws);
+// on a hit, gates affordability (gold / wood / food via
+// wc1_resources_can_afford) and, if the player can pay, spends +
+// enqueues. Returns 1 if a button was hit (affordable or not), 0
+// otherwise. Lives here rather than in wc1_input because the Building
+// struct + BLDG_* constants are in scope here but not there (input
+// loads first). Only completed friendly buildings produce.
+wc1_production_try_click(world, eid, mx, my) {
+    auto b: Building, fa: Faction, menu, n, i, kind;
+    auto def: UnitDef, rect, bx, by, bw, bh;
+    b = ecs_get(world, building_comp, eid);
+    if (b.state != BLDG_STATE_DONE) { return 0; }
+    fa = ecs_get(world, faction_comp, eid);
+    if (fa.player != wc1_local_player()) { return 0; }   // command own side only
+    menu = buf_word(8);
+    n = wc1_train_menu(b.kind, fa.player, menu);
+    rect = buf_word(4);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            kind = menu[i];
+            def = unit_def_for(kind);
+            if (def != 0
+                && wc1_resources_can_afford(fa.player, def.cost_gold, def.cost_wood) != 0) {
+                wc1_resources_spend(fa.player, def.cost_gold, def.cost_wood);
+                wc1_production_enqueue(world, eid, kind);
+            }
+            free(menu);
+            free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    // Research buttons reuse the same slot rects (a building either
+    // trains or researches, never both, so the slots don't collide).
+    n = wc1_research_menu(b.kind, fa.player, menu);
+    i = 0;
+    while (i < n) {
+        wc1_cmd_button_rect(i, rect);
+        bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+        if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+            wc1_research_start(world, eid, menu[i]);
+            free(menu);
+            free(rect);
+            return 1;
+        }
+        i = i + 1;
+    }
+    // No train button hit — a click on the progress strip cancels the
+    // most-recently-queued unit (and refunds its cost).
+    wc1_cmd_progress_rect(rect);
+    bx = rect[0]; by = rect[1]; bw = rect[2]; bh = rect[3];
+    if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
+        wc1_production_cancel_last(world, eid);
+        free(menu);
+        free(rect);
+        return 1;
+    }
+    free(menu);
+    free(rect);
+    return 0;
+}
+
+// S10 — set a producer's rally point (the tile trained units walk to
+// after they finish). Any building accepts a rally; non-producers
+// just never read it. The spawn default -1/-1 means "no rally → the
+// unit appears adjacent to the footprint and stays".
+void wc1_production_set_rally(world, eid, gx, gy) {
+    auto b: Building;
+    b = ecs_get(world, building_comp, eid);
+    b.rally_gx = gx;
+    b.rally_gy = gy;
+    return;
+}
+
+// S10 — cancel the most-recently-queued unit and refund its gold/wood
+// (LIFO — the player's last misclick is the first undone). Resets the
+// training timer when the queue empties so a re-queue starts fresh.
+// Returns 1 if something was cancelled.
+wc1_production_cancel_last(world, eid) {
+    auto b: Building, q, last_kind, def: UnitDef, fa: Faction;
+    b = ecs_get(world, building_comp, eid);
+    if (b.train_count <= 0) { return 0; }
+    q = b.train_queue;
+    last_kind = q[b.train_count - 1];
+    b.train_count = b.train_count - 1;
+    if (b.train_count == 0) { b.train_progress_ms = 0; }
+    def = unit_def_for(last_kind);
+    if (def != 0) {
+        // Refund to the building's owner.
+        fa = ecs_get(world, faction_comp, eid);
+        wc1_resources_refund(fa.player, def.cost_gold, def.cost_wood);
+    }
+    return 1;
+}
+
+// Advance a completed building's training queue by one frame. When
+// the front unit's build_time_ms elapses, spawn it (at the rally
+// tile if set, else one tile below the footprint) and pop the queue.
+// Called from _tick_building for every BLDG_STATE_DONE building, so
+// it returns immediately for non-producers (train_count == 0).
+static void _tick_training(w, eid) {
+    auto b: Building, def: UnitDef, fa: Faction, bdef: BuildingDef;
+    auto p_b: Pos, dt, front, q, sgx, sgy, atlas, player, i, new_eid;
+    b = ecs_get(w, building_comp, eid);
+    if (b.train_count <= 0) { return; }
+    q     = b.train_queue;
+    front = q[0];
+    def   = unit_def_for(front);
+    if (def == 0) { return; }                  // unknown kind — drop safely
+    dt = game_dt_ms();
+    b.train_progress_ms = b.train_progress_ms + dt;
+    if (b.train_progress_ms < def.build_time_ms) { return; }
+    // Front unit finished — resolve where it appears.
+    fa     = ecs_get(w, faction_comp, eid);
+    player = fa.player;
+    bdef   = building_def_for(b.kind);
+    p_b    = ecs_get(w, pos_comp, eid);
+    // Spawn just below the footprint center; if a rally point is set,
+    // issue a move order so the unit walks there (WC1 behaviour)
+    // instead of teleporting onto the rally tile.
+    sgx = (p_b.x + bdef.px_w / 2) / 16;
+    sgy = (p_b.y + bdef.px_h) / 16 + 1;
+    atlas = wc1_atlas_for_unit(front, player);
+    if (atlas != 0) {
+        new_eid = ecs_spawn_unit(w, atlas, sgx, sgy, player, front);
+        if (b.rally_gx >= 0 && new_eid >= 0) {
+            wc1_movement_request(w, new_eid, b.rally_gx, b.rally_gy);
+        }
+    }
+    // Pop the front of the queue (shift the rest left).
+    i = 0;
+    while (i < b.train_count - 1) {
+        q[i] = q[i + 1];
+        i = i + 1;
+    }
+    b.train_count       = b.train_count - 1;
+    b.train_progress_ms = 0;
+    if (wc1_debug != 0) {
+        putstr("trained unit kind="); putnum(front);
+        putstr(" at building eid="); putnum(eid); putstr("\n");
+    }
+}
+
+// Advance a building's in-progress research by one frame. On
+// completion sets the player's tech flag (read by the combat tick
+// for the weapon / armor bonus) and clears the slot. Independent of
+// the training queue — a blacksmith researches without training.
+static void _tick_research(w, eid) {
+    auto b: Building, fa: Faction, dt;
+    b = ecs_get(w, building_comp, eid);
+    if (b.research_tech < 0) { return; }
+    dt = game_dt_ms();
+    b.research_progress_ms = b.research_progress_ms + dt;
+    if (b.research_progress_ms < _WC1_RESEARCH_MS) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    _tech_set_done(fa.player, b.research_tech);
+    if (wc1_debug != 0) {
+        putstr("research complete: tech="); putnum(b.research_tech);
+        putstr(" player="); putnum(fa.player); putstr("\n");
+    }
+    b.research_tech        = 0 - 1;
+    b.research_progress_ms = 0;
+}
+
+// Per-entity tick. Three behaviours, gated by Building state:
+//
+//   DONE          — no-op. The early-return keeps the per-frame
+//                   cost free for the steady-state late-game
+//                   scenario where most buildings finished.
+//
+//   CONSTRUCTING  — gated on a peasant assignment. With no
+//                   peasant assigned (assigned_peasant_eid ==
+//                   -1) the foundation sits at progress 0,
+//                   showing the early-scaffolding frame
+//                   indefinitely; the player must right-click
+//                   the foundation with a peasant selected to
+//                   assign one. Once assigned, the tick checks
+//                   the worker's pixel distance to the
+//                   building's center — only when that worker
+//                   is within `_BLDG_ASSIGN_RADIUS_PX` does
+//                   `progress_ms` advance. This implements the
+//                   classic RTS "peasant has to physically walk
+//                   to the construction site before it starts"
+//                   loop.
+//
+// On completion the state flips to DONE and progress is clamped
+// to construction_time_ms so the render path picks the final
+// scaffolding frame for the same frame as the flip (no visual
+// glitch).
+static void _tick_building(w, eid) {
+    auto b: Building;
+    auto def: BuildingDef;
+    auto p_b: Pos, p_w: Pos, an_w: Anim;
+    auto bcx, bcy, dx, dy, sq, dt;
+    b = ecs_get(w, building_comp, eid);
+    if (b.state == BLDG_STATE_DONE) {
+        // Completed building → advance its training queue + research
+        // (S10). Both are cheap early-returns for non-producers.
+        _tick_training(w, eid);
+        _tick_research(w, eid);
+        return;
+    }
+    if (b.state != BLDG_STATE_CONSTRUCTING) { return; }   // DEPLETED mine → no-op
+    if (b.assigned_peasant_eid < 0) { return; }   // no worker → no progress
+    def = building_def_for(b.kind);
+    // Building center in pixels. Pos is top-left; add half the
+    // footprint to land on the centroid.
+    p_b = ecs_get(w, pos_comp, eid);
+    bcx = p_b.x + def.px_w / 2;
+    bcy = p_b.y + def.px_h / 2;
+    // Worker position. Squared-distance test avoids a sqrt on
+    // the hot path — same shape every other proximity check in
+    // wc1_combat / wc1_input uses.
+    p_w  = ecs_get(w, pos_comp,  b.assigned_peasant_eid);
+    an_w = ecs_get(w, anim_comp, b.assigned_peasant_eid);
+    dx = p_w.x - bcx;
+    dy = p_w.y - bcy;
+    sq = dx * dx + dy * dy;
+    if (sq > _BLDG_ASSIGN_RADIUS_PX * _BLDG_ASSIGN_RADIUS_PX) {
+        // Worker still walking toward the foundation — drop them
+        // out of BUILD if they had been parked here previously
+        // (e.g. interrupted by another command); the movement /
+        // combat ticks will pick up control again.
+        if (an_w.state == UNIT_STATE_BUILD) {
+            an_w.state      = UNIT_STATE_IDLE;
+            an_w.elapsed_ms = 0;
+        }
+        return;
+    }
+    // Worker is at the foundation — park them in BUILD state so
+    // the render path picks the chop-attack frames + freeze them
+    // facing the foundation. The state flip happens once; the
+    // elapsed_ms bump every frame drives the looping anim.
+    if (an_w.state != UNIT_STATE_BUILD) {
+        an_w.state      = UNIT_STATE_BUILD;
+        an_w.elapsed_ms = 0;
+        an_w.facing     = wc1_facing_for_delta(bcx - p_w.x, bcy - p_w.y);
+        // One-shot debug — confirms the worker reached the
+        // foundation. If this never prints, the worker is
+        // walking but not arriving (tree collision / blocked
+        // path / wrong target tile).
+        if (wc1_debug != 0) {
+            putstr("peasant arrived at foundation: building eid=");
+            putnum(eid);
+            putstr("\n");
+        }
+    }
+    dt = game_dt_ms();
+    an_w.elapsed_ms = an_w.elapsed_ms + dt;
+    // Worker present → advance construction.
+    b.progress_ms = b.progress_ms + dt;
+    if (b.progress_ms >= def.construction_time_ms) {
+        b.state       = BLDG_STATE_DONE;
+        b.progress_ms = def.construction_time_ms;
+        // Worker pops back to IDLE so the next command (move,
+        // attack, another build) lands on a fresh state. The
+        // peasant stays at the foundation tile until the player
+        // gives them new orders.
+        an_w.state      = UNIT_STATE_IDLE;
+        an_w.elapsed_ms = 0;
+        // Debug — confirms the state flip lands on the right
+        // frame. S10 will replace this with a production-system
+        // hook (unlock training UI, grant supply, fire SFX) but
+        // the print is a useful manual-smoke breadcrumb for v1.
+        if (wc1_debug != 0) {
+            putstr("building complete: kind=");
+            putnum(b.kind);
+            putstr("\n");
+        }
+    }
+}
+
+// Per-frame production tick. Walks every Building entity via
+// building_q (mask-filtered to ONLY building_arch) and advances
+// each one's CONSTRUCTING state by dt. Call AFTER the unit
+// movement tick and BEFORE the missile tick so a freshly-built
+// building's completed sprite renders the same frame it flips
+// state.
+void wc1_production_tick(world) {
+    ecs_query_each(building_q, fn_ptr(_tick_building));
+}

@@ -1,0 +1,482 @@
+// rts1_ai.bsm — enemy AI brain (S11 baseline).
+//
+// Game-local RTS strategic AI (Tonify Rule 33, Tier 3). The `stbai`
+// cartridge owns genre-agnostic PRIMITIVES (line-of-sight, steering);
+// the RTS BRAIN — economy management, build order, army composition,
+// attack waves — is game-specific and lives here (the stbai header at
+// commit 52e2dab is explicit: "state machines, per-frame dispatch,
+// combat/target acquisition logic" stay in the game).
+//
+// ── "Virtual player" architecture ──────────────────────────────
+//
+// The AI never touches the human's selection state. It queries its OWN
+// units (ecs_query_each filtered by faction) and issues the SAME
+// commands the human does — wc1_gather_assign_mine, wc1_production_-
+// enqueue, ecs_spawn_building, wc1_movement_request_group, the
+// attack_target component. Resources are per-player (commit 567adb6),
+// so the AI runs a FAIR, independent economy (no cheating). Adding a
+// 2nd/3rd AI later is "instantiate another state", not a rewrite.
+//
+// ── v1 iteration 1 ─────────────────────────────────────────────
+//
+// A single enemy (player = local ^ 1, the diagonally-opposite corner)
+// runs the full loop and re-fills its army on losses, so it plays a
+// match start to finish:
+//
+//   ECON     — assign idle workers to the nearest gold mine; train
+//              workers up to a cap.
+//   BUILDUP  — build ONE barracks (hardcoded; a data-driven / .bang
+//              build ORDER is V2), then train military to a target.
+//   ATTACK   — send the army to focus-fire the enemy near its hall;
+//              when the army is whittled below a floor, fall back to
+//              BUILDUP and rebuild (hysteresis: target 5, floor 4).
+//
+// Player-id convention (see project_rts1_local_player_convention):
+// player 0/2 = human, 1/3 = orc; the local user is wc1_local_player();
+// this AI drives wc1_local_player() ^ 1 and targets the local user.
+
+import "stbecs.bsm";             // ecs_query_each / ecs_get / ecs_alive_at
+load   "rts2_render.bsm";        // Pos/UnitType/Faction/Anim + comps + peasant_q
+load   "rts2_units.bsm";         // UNIT_* + unit_def_for + UnitDef
+load   "rts2_anims.bsm";         // UNIT_STATE_DYING
+load   "rts2_buildings.bsm";     // Building/BuildingDef + building_comp/q + BLDG_* +
+                                 //   ecs_spawn_building + wc1_building_assign_peasant
+load   "rts2_gather.bsm";        // GATHER_TARGET_NONE + wc1_gather_assign_mine + Gather
+load   "rts2_production.bsm";    // wc1_placement_valid + wc1_production_enqueue +
+                                 //   wc1_train_menu + wc1_resources_* (per player)
+load   "rts2_movement.bsm";      // wc1_movement_request_group
+
+// Components owned by the unit/building wiring. attack_target_comp +
+// the AttackTarget struct come from rts1_render / the combat wiring;
+// extrn the comp handle (the struct is in scope via the loads above).
+extrn pos_comp, unit_comp, faction_comp, anim_comp, gather_comp;
+extrn building_comp, peasant_q, building_q;
+extrn attack_target_comp;
+extrn wc1_debug;        // verbose AI state / heartbeat logging gate (rts.bpp)
+
+// Building-atlas resolvers (wc1_building_atlas_idle / _construct) live
+// in rts.bpp (the entry); they're in the compilation's global function
+// table, so they resolve at link time — called directly below.
+
+// ── Tunables ───────────────────────────────────────────────────
+const _AI_TICK_MS     = 200;     // 5 Hz strategic step
+const _AI_PEON_CAP    = 4;       // 1 chopper + up to 3 gold miners. The mine
+                                 // capacity gate (_WC1_MINE_MAX_ON_BOARD = 5)
+                                 // lets several peons share one mine now, so
+                                 // gold income scales past the old 1-miner cap.
+const _AI_MIN_CHOPPERS = 1;      // keep at least one peon on wood (buildings +
+                                 // some units cost wood); the rest mine gold.
+const _AI_ARMY_TARGET = 3;       // military to mass before pushing the enemy base
+const _AI_DEFEND_RANGE_SQ = 36864;  // (12 tiles * 16 px)^2 — enemy within this of
+                                    // our town hall triggers the defense response.
+const _AI_SCAN_MAX    = 64;      // scratch buffer capacity
+const _AI_DIST_MAX    = 0x7FFFFFFF;
+
+// FSM states.
+const _AI_ECON    = 0;
+const _AI_BUILDUP = 1;
+const _AI_ATTACK  = 2;
+
+// ── Per-AI state (one enemy in v1) ─────────────────────────────
+global _ai_active;        // 0 until wc1_ai_init runs
+global _ai_player;        // the player id this brain controls
+global _ai_enemy;         // who it attacks (the local user)
+global _ai_state;         // _AI_ECON / _AI_BUILDUP / _AI_ATTACK
+global _ai_accum_ms;      // 5 Hz tick accumulator
+global _ai_builder_eid;   // worker tasked to raise the barracks (-1 = none)
+global _ai_hb;            // diagnostic heartbeat counter (temporary)
+
+// Scratch filled by the scan callbacks (ecs_query_each can't pass extra
+// args, so the walk target + outputs live at file scope).
+static auto _ai_scan_player;
+static auto _ai_peons, _ai_peon_n;
+static auto _ai_idle,  _ai_idle_n;
+static auto _ai_army,  _ai_army_n;
+static auto _ai_gold_n;            // peons currently gathering gold
+static auto _ai_wood_n;            // peons currently chopping wood
+static auto _ai_th_eid, _ai_barracks_eid, _ai_barracks_done;
+static auto _ai_farm_eid, _ai_farm_done;
+static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
+static auto _ai_enemy_hq, _ai_enemy_tgt;
+
+// Initialize the enemy AI: `ai_player` is the side it commands,
+// `enemy_player` the side it hunts. Call once at startup AFTER the
+// world is populated (units + seeded town halls exist).
+void wc1_ai_init(world, ai_player, enemy_player) {
+    _ai_player      = ai_player;
+    _ai_enemy       = enemy_player;
+    _ai_state       = _AI_ECON;
+    _ai_accum_ms    = 0;
+    _ai_builder_eid = 0 - 1;
+    _ai_peons = buf_word(_AI_SCAN_MAX);
+    _ai_idle  = buf_word(_AI_SCAN_MAX);
+    _ai_army  = buf_word(_AI_SCAN_MAX);
+    _ai_active = 1;
+    return;
+}
+
+// ── Scans ──────────────────────────────────────────────────────
+
+// Classify every AI-owned, living unit into peons / idle-peons / army.
+// A peon is "idle" when it has no gather assignment and isn't the
+// designated barracks builder.
+static void _ai_unit_visit(w, eid) {
+    auto fa: Faction, u: UnitType, an: Anim, gt: Gather;
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_scan_player) { return; }
+    an = ecs_get(w, anim_comp, eid);
+    if (an.state == UNIT_STATE_DYING) { return; }
+    u = ecs_get(w, unit_comp, eid);
+    if (u.kind == UNIT_PEASANT) {
+        if (_ai_peon_n < _AI_SCAN_MAX) { _ai_peons[_ai_peon_n] = eid; _ai_peon_n = _ai_peon_n + 1; }
+        gt = ecs_get(w, gather_comp, eid);
+        // "Available" = truly idle (not walking-to-build / building /
+        // gathering). The anim state is the reliable signal: a worker
+        // sent to build is WALK then BUILD, never IDLE, so it won't be
+        // pulled back to mining.
+        if (an.state == UNIT_STATE_IDLE && gt.target_kind == GATHER_TARGET_NONE) {
+            if (_ai_idle_n < _AI_SCAN_MAX) { _ai_idle[_ai_idle_n] = eid; _ai_idle_n = _ai_idle_n + 1; }
+        } else if (gt.target_kind == GATHER_TARGET_MINE) {
+            _ai_gold_n = _ai_gold_n + 1;
+        } else if (gt.target_kind == GATHER_TARGET_TREE) {
+            _ai_wood_n = _ai_wood_n + 1;
+        }
+    } else {
+        if (_ai_army_n < _AI_SCAN_MAX) { _ai_army[_ai_army_n] = eid; _ai_army_n = _ai_army_n + 1; }
+    }
+    return;
+}
+
+static void _ai_scan_units(world) {
+    _ai_peon_n = 0; _ai_idle_n = 0; _ai_army_n = 0; _ai_gold_n = 0; _ai_wood_n = 0;
+    _ai_scan_player = _ai_player;
+    ecs_query_each(peasant_q, fn_ptr(_ai_unit_visit));
+    return;
+}
+
+// Find the AI's completed town hall + its barracks (any state).
+static void _ai_bldg_visit(w, eid) {
+    auto fa: Faction, b: Building;
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_scan_player) { return; }
+    b = ecs_get(w, building_comp, eid);
+    if (b.kind == BLDG_TOWN_HALL && b.state == BLDG_STATE_DONE) { _ai_th_eid = eid; }
+    if (b.kind == BLDG_FARM) {
+        _ai_farm_eid = eid;
+        if (b.state == BLDG_STATE_DONE) { _ai_farm_done = 1; }
+    }
+    if (b.kind == BLDG_BARRACKS) {
+        _ai_barracks_eid = eid;
+        if (b.state == BLDG_STATE_DONE) { _ai_barracks_done = 1; }
+    }
+    return;
+}
+
+static void _ai_scan_buildings(world) {
+    _ai_th_eid = 0 - 1; _ai_barracks_eid = 0 - 1; _ai_barracks_done = 0;
+    _ai_farm_eid = 0 - 1; _ai_farm_done = 0;
+    _ai_scan_player = _ai_player;
+    ecs_query_each(building_q, fn_ptr(_ai_bldg_visit));
+    return;
+}
+
+// Nearest non-depleted gold mine to (_ai_ref_x, _ai_ref_y).
+static void _ai_mine_visit(w, eid) {
+    auto b: Building, p: Pos, dx, dy, d;
+    b = ecs_get(w, building_comp, eid);
+    if (b.kind != BLDG_GOLD_MINE)       { return; }
+    if (b.state == BLDG_STATE_DEPLETED) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    dx = p.x - _ai_ref_x; dy = p.y - _ai_ref_y;
+    d = dx * dx + dy * dy;
+    if (d < _ai_mine_best) { _ai_mine_best = d; _ai_mine_eid = eid; }
+    return;
+}
+
+static _ai_find_mine(world, ref_x, ref_y) {
+    _ai_mine_eid = 0 - 1; _ai_mine_best = _AI_DIST_MAX;
+    _ai_ref_x = ref_x; _ai_ref_y = ref_y;
+    ecs_query_each(building_q, fn_ptr(_ai_mine_visit));
+    return _ai_mine_eid;
+}
+
+// Enemy town hall (any one).
+static void _ai_enemy_hq_visit(w, eid) {
+    auto fa: Faction, b: Building;
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_enemy) { return; }
+    b = ecs_get(w, building_comp, eid);
+    if (b.kind == BLDG_TOWN_HALL) { _ai_enemy_hq = eid; }
+    return;
+}
+
+static _ai_find_enemy_hq(world) {
+    _ai_enemy_hq = 0 - 1;
+    ecs_query_each(building_q, fn_ptr(_ai_enemy_hq_visit));
+    return _ai_enemy_hq;
+}
+
+// Nearest living enemy unit to (_ai_ref_x, _ai_ref_y).
+static void _ai_enemy_unit_visit(w, eid) {
+    auto fa: Faction, an: Anim, p: Pos, dx, dy, d;
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_enemy) { return; }
+    an = ecs_get(w, anim_comp, eid);
+    if (an.state == UNIT_STATE_DYING) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    dx = p.x - _ai_ref_x; dy = p.y - _ai_ref_y;
+    d = dx * dx + dy * dy;
+    if (d < _ai_mine_best) { _ai_mine_best = d; _ai_enemy_tgt = eid; }
+    return;
+}
+
+static _ai_find_enemy_unit(world, ref_x, ref_y) {
+    _ai_enemy_tgt = 0 - 1; _ai_mine_best = _AI_DIST_MAX;
+    _ai_ref_x = ref_x; _ai_ref_y = ref_y;
+    ecs_query_each(peasant_q, fn_ptr(_ai_enemy_unit_visit));
+    return _ai_enemy_tgt;
+}
+
+// ── Actions ────────────────────────────────────────────────────
+
+// Queue one `unit_kind` at `building_eid` if the AI has fewer than
+// `max_have` of it AND the building's queue is empty (one in flight at
+// a time paces production + prevents over-spending past the cap).
+// Spends only after a successful enqueue (no resource leak on a full
+// queue). Returns 1 if queued.
+static _ai_try_train(world, building_eid, unit_kind, max_have, have_now) {
+    auto def: UnitDef, b: Building;
+    if (have_now >= max_have)       { return 0; }
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.train_count > 0)          { return 0; }
+    def = unit_def_for(unit_kind);
+    if (def == 0)                   { return 0; }
+    if (wc1_resources_can_afford(_ai_player, def.cost_gold, def.cost_wood) == 0) { return 0; }
+    if (wc1_production_enqueue(world, building_eid, unit_kind) == 0)             { return 0; }
+    wc1_resources_spend(_ai_player, def.cost_gold, def.cost_wood);
+    return 1;
+}
+
+// Raise a building of `kind`: pick a worker (idle preferred, else pull
+// one off mining), find the first valid placement in a ring around the
+// town hall, spend, spawn the foundation (CONSTRUCTING), and assign the
+// worker to build it. Clears the worker's gather so it stops mining and
+// walks to the site. Returns 1 if started. Caller gates on "no building
+// of this kind yet" so it isn't re-invoked mid-construction.
+static _ai_build(world, kind) {
+    auto th_p: Pos, def: BuildingDef, gx0, gy0, r, dx, dy, gx, gy;
+    auto idle, construct, b_eid, builder;
+    builder = _ai_idle_n > 0 ? _ai_idle[0] : (_ai_peon_n > 0 ? _ai_peons[0] : (0 - 1));
+    if (builder < 0) { return 0; }                     // no worker at all
+    def = building_def_for(kind);
+    if (def == 0) { return 0; }
+    if (wc1_resources_gold(_ai_player) < def.cost_gold) { return 0; }
+    if (wc1_resources_wood(_ai_player) < def.cost_wood) { return 0; }
+    th_p = ecs_get(world, pos_comp, _ai_th_eid);
+    gx0 = th_p.x / 16; gy0 = th_p.y / 16;
+    r = 3;
+    while (r <= 9) {
+        dy = 0 - r;
+        while (dy <= r) {
+            dx = 0 - r;
+            while (dx <= r) {
+                gx = gx0 + dx; gy = gy0 + dy;
+                if (wc1_placement_valid(kind, gx, gy) != 0) {
+                    idle      = wc1_building_atlas_idle(kind, _ai_player);
+                    construct = wc1_building_atlas_construct(kind, _ai_player);
+                    wc1_resources_spend(_ai_player, def.cost_gold, def.cost_wood);
+                    b_eid = ecs_spawn_building(world, idle, construct,
+                                               gx, gy, _ai_player, kind);
+                    wc1_gather_clear(world, builder);  // stop mining, go build
+                    wc1_building_assign_peasant(world, b_eid, builder);
+                    _ai_builder_eid = builder;
+                    return 1;
+                }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+// Send the massed army to focus-fire the enemy near its town hall. With
+// no reachable enemy units, march to the hall tile so defenders are
+// found next tick.
+static void _ai_launch_attack(world) {
+    auto hq, hq_p: Pos, tgt, i, at: AttackTarget;
+    hq = _ai_find_enemy_hq(world);
+    if (hq < 0) { return; }                            // enemy has no hall
+    hq_p = ecs_get(world, pos_comp, hq);
+    tgt = _ai_find_enemy_unit(world, hq_p.x, hq_p.y);
+    if (tgt < 0) {
+        // No enemy units left near their base — assault the hall itself.
+        // Combat handles building targets now (ecs_has + wc1_building_destroy),
+        // so razing the enemy town hall is a real win condition.
+        tgt = hq;
+    }
+    for (i = 0; i < _ai_army_n; i++) {
+        at = ecs_get(world, attack_target_comp, _ai_army[i]);
+        at.eid = tgt;
+    }
+    return;
+}
+
+static void _ai_set_state(new_state) {
+    if (new_state == _ai_state) { return; }
+    _ai_state = new_state;
+    if (wc1_debug != 0) {
+        putstr("[ai] player="); putnum(_ai_player);
+        putstr(" -> state="); putnum(new_state);
+        putstr(" (peons="); putnum(_ai_peon_n);
+        putstr(" army="); putnum(_ai_army_n); putstr(")\n");
+    }
+    return;
+}
+
+// Keep every idle peon busy (Stratagus AiCollectResources: never leave a
+// harvester idle — assign each to the most-needed resource). Policy: hold
+// _AI_MIN_CHOPPERS on wood, send the rest to the gold mine (the mine now
+// holds up to _WC1_MINE_MAX_ON_BOARD gatherers, so peons share it without
+// the old perimeter pile-up). No reachable forest -> mine gold instead; no
+// reachable mine -> chop wood instead; never stand idle. `builder` is
+// excluded — it was pulled to raise a building this tick.
+static void _ai_manage_workers(world, th_p: Pos, builder, mine) {
+    auto i, eid, tgx, tgy;
+    tgx = th_p.x / 16; tgy = th_p.y / 16;
+    for (i = 0; i < _ai_idle_n; i++) {
+        eid = _ai_idle[i];
+        if (eid == builder) { continue; }
+        if (_ai_wood_n < _AI_MIN_CHOPPERS) {
+            if (wc1_gather_assign_nearest_tree(world, eid, tgx, tgy) != 0) {
+                _ai_wood_n = _ai_wood_n + 1;
+            } else if (mine >= 0) {
+                wc1_gather_assign_mine(world, eid, mine);
+                _ai_gold_n = _ai_gold_n + 1;
+            }
+        } else if (mine >= 0) {
+            wc1_gather_assign_mine(world, eid, mine);
+            _ai_gold_n = _ai_gold_n + 1;
+        } else {
+            wc1_gather_assign_nearest_tree(world, eid, tgx, tgy);
+        }
+    }
+    return;
+}
+
+// Defense (Stratagus AiForce Defend role + AiEnemyUnitsInDistance): if any
+// enemy unit sits within _AI_DEFEND_RANGE_SQ of our town hall, the WHOLE
+// army targets it — overriding a cross-map attack so the AI doesn't march
+// away while its base is razed. Returns 1 if it engaged a home threat, 0 if
+// the base is clear (the caller then pushes the attack). Setting
+// attack_target is enough — _combat_step pursues then attacks.
+static _ai_defend(world, th_p: Pos) {
+    auto threat, tp: Pos, dx, dy, i, eid, at: AttackTarget;
+    threat = _ai_find_enemy_unit(world, th_p.x, th_p.y);
+    if (threat < 0) { return 0; }
+    tp = ecs_get(world, pos_comp, threat);
+    dx = tp.x - th_p.x; dy = tp.y - th_p.y;
+    if (dx * dx + dy * dy > _AI_DEFEND_RANGE_SQ) { return 0; }
+    for (i = 0; i < _ai_army_n; i++) {
+        eid = _ai_army[i];
+        at  = ecs_get(world, attack_target_comp, eid);
+        at.eid = threat;
+    }
+    return 1;
+}
+
+// Diagnostic heartbeat (~every 5 s) — reveals where a stuck AI is blocked.
+// Temporary; removed once S11 v1 plays clean.
+static void _ai_heartbeat(mine) {
+    _ai_hb = _ai_hb + 1;
+    if (_ai_hb < 25) { return; }
+    _ai_hb = 0;
+    if (wc1_debug != 0) {
+        putstr("[ai] hb peon="); putnum(_ai_peon_n);
+        putstr(" idle="); putnum(_ai_idle_n);
+        putstr(" gold_n="); putnum(_ai_gold_n);
+        putstr(" wood_n="); putnum(_ai_wood_n);
+        putstr(" army="); putnum(_ai_army_n);
+        putstr(" gold="); putnum(wc1_resources_gold(_ai_player));
+        putstr(" wood="); putnum(wc1_resources_wood(_ai_player));
+        putstr(" mine="); putnum(mine);
+        putstr(" farm="); putnum(_ai_farm_eid);
+        putstr(" brk="); putnum(_ai_barracks_eid); putstr("\n");
+    }
+    return;
+}
+
+// One strategic step (runs at 5 Hz).
+static void _ai_think(world) {
+    auto th_p: Pos, mine, menu, n, builder;
+    _ai_scan_buildings(world);
+    if (_ai_th_eid < 0) { return; }                    // no hall left -> defeated
+    _ai_scan_units(world);
+    th_p = ecs_get(world, pos_comp, _ai_th_eid);
+    mine = _ai_find_mine(world, th_p.x, th_p.y);
+
+    // Build order (always — no longer gated on a phase, so the AI can't
+    // stall in ECON forever): a farm first (raises the food cap from 4 to
+    // 8 so the army fits alongside the workers), then a barracks for
+    // military. _ai_build pulls a worker (idle preferred, else off
+    // mining); we exclude it from the worker pass below so it isn't
+    // re-sent to gather this tick.
+    builder = 0 - 1;
+    if (_ai_farm_eid < 0) {
+        if (_ai_build(world, BLDG_FARM) != 0)     { builder = _ai_builder_eid; }
+    } else if (_ai_barracks_eid < 0) {
+        if (_ai_build(world, BLDG_BARRACKS) != 0) { builder = _ai_builder_eid; }
+    }
+
+    // Economy (always): keep EVERY idle peon busy + train peons to the cap.
+    _ai_manage_workers(world, th_p, builder, mine);
+    _ai_try_train(world, _ai_th_eid, UNIT_PEASANT, _AI_PEON_CAP, _ai_peon_n);
+
+    // Military: once the farm + barracks stand, mass toward the army
+    // target. _ai_try_train gates on gold+wood affordability, so production
+    // paces with the economy. menu[0] is the barracks' basic melee unit
+    // (grunt for orcs, footman for humans).
+    if (_ai_farm_done != 0 && _ai_barracks_done != 0
+        && _ai_army_n < _AI_ARMY_TARGET) {
+        menu = buf_word(8);
+        n = wc1_train_menu(BLDG_BARRACKS, _ai_player, menu);
+        if (n > 0) {
+            _ai_try_train(world, _ai_barracks_eid, menu[0],
+                          _AI_ARMY_TARGET, _ai_army_n);
+        }
+        free(menu);
+    }
+
+    // Defense (always): if an enemy is near the base, the whole army turns
+    // to fight it — even a lone grunt defends, and the army won't march off
+    // to attack while home is under threat (defense preempts).
+    auto defending;
+    defending = _ai_defend(world, th_p);
+    _ai_heartbeat(mine);
+
+    // Attack only when home is safe AND the army is massed. Surviving
+    // attackers keep their target (an enemy unit, or the enemy hall — see
+    // _ai_launch_attack) until it dies, so dropping under the threshold
+    // just pauses NEW pushes while production refills.
+    if (defending == 0 && _ai_army_n >= _AI_ARMY_TARGET) {
+        _ai_set_state(_AI_ATTACK);
+        _ai_launch_attack(world);
+    } else if (_ai_barracks_done != 0) {
+        _ai_set_state(_AI_BUILDUP);
+    } else {
+        _ai_set_state(_AI_ECON);
+    }
+    return;
+}
+
+// Per-frame entry — accumulate dt and run the strategic step at 5 Hz.
+// Call from the main loop with the frame dt in ms.
+void wc1_ai_tick(world, dt) {
+    if (_ai_active == 0) { return; }
+    _ai_accum_ms = _ai_accum_ms + dt;
+    if (_ai_accum_ms < _AI_TICK_MS) { return; }
+    _ai_accum_ms = 0;
+    _ai_think(world);
+    return;
+}

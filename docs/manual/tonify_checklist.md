@@ -2193,7 +2193,7 @@ editor. Discuss before forking; restraint-bias per Rule 28.
 
 ### Cross-references
 
-- **`docs/manual/asset_formats.md`** — **canonical spec** for every JSON /
+- **`docs/manual/funnel_conversor.md`** — **canonical spec** for every JSON /
   atlas / palette / tileset shape the table above mentions. When a
   new asset shape lands (e.g. animation graph, particle preset),
   document the schema there + extend the table here. THIS is where
@@ -2201,7 +2201,7 @@ editor. Discuss before forking; restraint-bias per Rule 28.
   emit a tileset-mode map."
 - `how_to_dev_b++.md` Cap 16 — "Asset infra" sub-section,
   one-paragraph version of this rule pointing back at this rule +
-  `asset_formats.md`.
+  `funnel_conversor.md`.
 - Modulab atlas-pack reference: `tools/modulab/` (authoring),
   `pathfind.json` (canonical consumer example),
   `stb/stbimage.bsm` `image_load` / `image_hot_reload_enable`.

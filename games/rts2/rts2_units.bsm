@@ -1,0 +1,222 @@
+// wc1_units.bsm — Unit type registry + named frame indices + SC1-
+// style combat stat keys for stbcharsheet wiring.
+//
+// Session 3 shipped one unit (peasant). Session 7 extends the
+// UnitDef record with combat fields (damage, weapon_range,
+// cooldown_ms, sight_tiles, size_class, damage_type) so the
+// per-unit sheet allocated at spawn time picks up SC1-shaped
+// combat data — see the design vision in `wc1_handoff.md` for
+// why combat reads from SC1 conventions, not WC1.
+//
+// Future sessions extend the table — UNIT_FOOTMAN / UNIT_ARCHER
+// lands when those sprites ship, PEASANT_CHOP_* with the combat
+// animation wiring.
+//
+// Frame indices match the row-major grid in the converted PNG
+// strips that war1tool emits for each unit. peasant.png is laid
+// out as 5 columns × 13 rows of 32×32 cells; row 0 is the idle
+// pose facing N → NE → E → SE → S, indices 0..4.
+
+// Unit kind enum — append-only; existing IDs must not shift because
+// level JSONs (forest1.json + future maps) reference them by spawn
+// kind name, and wc1_units.bsm's `unit_defs_init` slots each kind
+// into `_unit_defs[UNIT_X]` by these indices.
+//
+// Roster: 9 human + 7 orc kinds covering the WC1 unit table that
+// war1gus' `units.lua` defines (heroes lothar / medivh included).
+// Workers (peasant / peon) share the same UnitDef slot because
+// their stats are identical — only the rendered atlas differs.
+const UNIT_PEASANT        = 0;
+const UNIT_FOOTMAN        = 1;
+const UNIT_KNIGHT         = 2;
+const UNIT_ARCHER         = 3;
+const UNIT_CLERIC         = 4;
+const UNIT_CONJURER       = 5;
+const UNIT_CATAPULT       = 6;
+const UNIT_LOTHAR         = 7;
+const UNIT_MEDIVH         = 8;
+const UNIT_GRUNT          = 9;
+const UNIT_RAIDER         = 10;
+const UNIT_SPEARMAN       = 11;
+const UNIT_NECROLYTE      = 12;
+const UNIT_WARLOCK        = 13;
+
+// Peasant frame layout in peasant.png (5 cols × 13 rows):
+//   row 0: idle facing N, NE, E, SE, S — indices 0..4
+//   row 1+: walk anims (wired in a future commit once the sprite
+//   pipeline migrates to Aseprite-compatible sheet format)
+//   later rows: chop / attack / die (S7+ unlocks)
+const PEASANT_IDLE_N  = 0;
+const PEASANT_IDLE_NE = 1;
+const PEASANT_IDLE_E  = 2;
+const PEASANT_IDLE_SE = 3;
+const PEASANT_IDLE_S  = 4;
+
+// ── SC1-style combat enums ──────────────────────────────────────
+//
+// Size classes feed the damage-type × size matrix that S7.4 will
+// resolve to a multiplier. SC1's three-tier model is the proven
+// shape (small/medium/large); B++ adopts it as-is. Peasants are
+// SMALL (the canonical infantry size).
+const SIZE_SMALL  = 0;
+const SIZE_MEDIUM = 1;
+const SIZE_LARGE  = 2;
+
+// Damage types — the other axis of S7.4's matrix. SC1's Normal/
+// Concussive/Explosive maps to "attacks small effectively /
+// attacks medium effectively / attacks large effectively" once
+// the matrix lands. Peasant chop is NORMAL (no special bonus).
+const DAMAGE_NORMAL     = 0;
+const DAMAGE_CONCUSSIVE = 1;
+const DAMAGE_EXPLOSIVE  = 2;
+
+// ── Sheet key registry (stbcharsheet slots) ─────────────────────
+//
+// stbcharsheet stores stats + resources by integer key. The game
+// registers what each slot means; below is rts1's mapping. STAT
+// slots are scalar per-unit constants (read often, written at
+// spawn or upgrade); RES slots are current/max pairs (HP today,
+// shields + energy when those tech upgrades land).
+//
+// Adding a new STAT? Bump WC1_STAT_COUNT so cs_new gives the
+// right slot count. Same for RES.
+const STAT_ARMOR        = 0;
+const STAT_DAMAGE       = 1;
+const STAT_WEAPON_RANGE = 2;     // tiles (1 = melee, 4+ = ranged)
+const STAT_COOLDOWN_MS  = 3;     // ms between consecutive attacks
+const STAT_SIGHT_TILES  = 4;     // vision range, distinct from weapon
+const STAT_SIZE_CLASS   = 5;     // SIZE_SMALL / MEDIUM / LARGE
+const STAT_DAMAGE_TYPE  = 6;     // DAMAGE_NORMAL / CONCUSSIVE / EXPLOSIVE
+const STAT_ENERGY_COST  = 7;     // energy drained per attack (0 = no gate)
+const WC1_STAT_COUNT    = 8;
+
+const RES_HP            = 0;
+const RES_SHIELDS       = 1;     // tech-blessed regen pool (0 base)
+const RES_ENERGY        = 2;     // caster spell pool
+const WC1_RES_COUNT     = 3;
+
+// Per-unit static data the game reads at spawn time. Flat record
+// indexed by UNIT_* constant. Spawn copies these into the Sheet
+// component for live consumers (combat, HP UI, AI); UnitDef stays
+// the immutable template per kind.
+struct UnitDef {
+    kind,             // UNIT_PEASANT, UNIT_FOOTMAN, ...
+    hp,               // starting hit points (spawn-time max)
+    armor,            // damage reduction
+    speed_pxs,        // movement speed in pixels/sec — 128 = 8 tiles/sec
+    atlas_frame,      // default render frame (idle facing south)
+    px_size,          // sprite dimension on screen, usually 32
+    damage,           // base damage per attack
+    weapon_range,     // tiles (1 melee, 4+ ranged)
+    cooldown_ms,      // attack period
+    sight_tiles,      // vision range
+    size_class,       // SIZE_* enum
+    damage_type,      // DAMAGE_* enum
+    start_energy,     // initial RES_ENERGY pool (casters > 0)
+    start_shields,    // initial RES_SHIELDS pool (tech upgrades > 0)
+    energy_cost,      // energy drained per attack (0 = no gate)
+    // ── S10 production economics ──────────────────────────────
+    // What it costs to train this unit and how long it takes.
+    // Buildings GRANT food cap (BuildingDef.supply); units CONSUME
+    // it via food_cost. Numbers are SC1/WC1-flavored starting
+    // points — tune as the economy reveals what plays well.
+    cost_gold,        // gold debited at enqueue time
+    cost_wood,        // wood debited at enqueue time
+    food_cost,        // food (supply) the unit occupies once alive
+    build_time_ms     // training duration once it reaches the queue front
+}
+
+// Module-private table allocated by unit_defs_init. Indexed by
+// UNIT_* constant; entries are populated in init order. The
+// public accessor `unit_def_for` does the bounds check.
+extrn _unit_defs;
+extrn _unit_def_count;
+
+// Compact UnitDef populator — every kind shares the same template
+// shape, so an inline helper trims a ~14× repetition. The function
+// is private to this module; new kinds add one more `_def(...)`
+// call below and a matching const at the top of the file.
+static void _def(idx, hp, armor, dmg, range, cooldown_ms,
+                 sight, size_class, dtype, px_size, speed_pxs,
+                 energy, shields, energy_cost,
+                 cost_gold, cost_wood, food_cost, build_time_ms) {
+    auto d: UnitDef;
+    d = _unit_defs + idx * sizeof(UnitDef);
+    d.kind          = idx;
+    d.hp            = hp;
+    d.armor         = armor;
+    d.speed_pxs     = speed_pxs;
+    d.atlas_frame   = 4;             // idle_S — fifth frame in atlas
+    d.px_size       = px_size;
+    d.damage        = dmg;
+    d.weapon_range  = range;
+    d.cooldown_ms   = cooldown_ms;
+    d.sight_tiles   = sight;
+    d.size_class    = size_class;
+    d.damage_type   = dtype;
+    d.start_energy  = energy;
+    d.start_shields = shields;
+    d.energy_cost   = energy_cost;
+    d.cost_gold     = cost_gold;
+    d.cost_wood     = cost_wood;
+    d.food_cost     = food_cost;
+    d.build_time_ms = build_time_ms;
+}
+
+// Allocate + populate the unit table. Call once at game startup
+// before any spawn. Sized for 16 entries which covers the full WC1
+// roster (9 human + 7 orc) plus a slot of headroom; bump if a future
+// expansion lands more kinds.
+//
+// Stats are SC1-flavored starting points cribbed from BWAPI/
+// Liquipedia (footman ≈ marine+, knight ≈ siege tank, conjurer ≈
+// high templar, etc.). Numbers tuned for "plays like a WC1 mod
+// with SC1 mechanical depth" rather than DOSBox-fidelity. The
+// damage type × size matrix in wc1_combat resolves the per-pair
+// multiplier at strike time.
+//
+// Stats are SC1-flavored. `energy`/`shields`/`cost` columns:
+//   energy = starting RES_ENERGY (75 for casters, 50 for hero
+//            mage = medivh, 0 for melee/ranged infantry)
+//   shields = starting RES_SHIELDS — universally 0 in v1; tech
+//             upgrades (S8+) bump this for "blessed" units
+//   cost = STAT_ENERGY_COST drained per attack (0 = no energy
+//          gate, casters spend 15-25 per spell cast)
+//
+//        idx              hp arm dmg rng cd  sight size      dtype                 px speed energy shields cost   gold wood food build_ms
+unit_defs_init() {
+    _unit_defs = malloc(16 * sizeof(UnitDef));
+    // ── Workers (melee, weakest) ──
+    _def(UNIT_PEASANT,     30,  0,  4,  1,  480, 4, SIZE_SMALL,  DAMAGE_NORMAL,     32, 128,    0,      0,     0,    400,   0,   1,   8000);
+    // ── Light infantry (melee, the backbone of any army) ──
+    _def(UNIT_FOOTMAN,     60,  2,  6,  1,  600, 4, SIZE_MEDIUM, DAMAGE_NORMAL,     48, 128,    0,      0,     0,    600,   0,   1,   9000);
+    _def(UNIT_GRUNT,       70,  2,  7,  1,  600, 4, SIZE_MEDIUM, DAMAGE_NORMAL,     32, 128,    0,      0,     0,    600,   0,   1,   9000);
+    // ── Cavalry (melee, faster + tankier) ──
+    _def(UNIT_KNIGHT,      90,  4,  8,  1,  700, 5, SIZE_LARGE,  DAMAGE_NORMAL,     32, 192,    0,      0,     0,    850, 100,   2,  13000);
+    _def(UNIT_RAIDER,      90,  4,  9,  1,  700, 5, SIZE_LARGE,  DAMAGE_NORMAL,     48, 192,    0,      0,     0,    850, 100,   2,  13000);
+    // ── Ranged infantry (arrow / spear projectile) ──
+    _def(UNIT_ARCHER,      25,  0,  3,  4,  900, 5, SIZE_SMALL,  DAMAGE_NORMAL,     32, 128,    0,      0,     0,    450,  50,   1,   9000);
+    _def(UNIT_SPEARMAN,    28,  0,  4,  4,  800, 5, SIZE_SMALL,  DAMAGE_NORMAL,     32, 128,    0,      0,     0,    450,  50,   1,   9000);
+    // ── Casters (energy-gated spell-attack, EXPLOSIVE damage) ──
+    _def(UNIT_CLERIC,      40,  1,  6,  4,  700, 5, SIZE_SMALL,  DAMAGE_NORMAL,     32, 128,   75,      0,    15,    700,   0,   1,  12000);
+    _def(UNIT_CONJURER,    40,  0,  5,  4,  800, 5, SIZE_SMALL,  DAMAGE_EXPLOSIVE,  32, 128,   75,      0,    20,    700, 100,   1,  12000);
+    _def(UNIT_NECROLYTE,   40,  0,  5,  4,  800, 5, SIZE_SMALL,  DAMAGE_EXPLOSIVE,  32, 128,   75,      0,    20,    700,   0,   1,  12000);
+    _def(UNIT_WARLOCK,     40,  0,  5,  4,  800, 5, SIZE_SMALL,  DAMAGE_EXPLOSIVE,  32, 128,   75,      0,    20,    700, 100,   1,  12000);
+    // ── Siege (slow, expensive, devastates SIZE_LARGE) ──
+    _def(UNIT_CATAPULT,   110,  0, 50,  8, 2000, 6, SIZE_LARGE,  DAMAGE_EXPLOSIVE,  32,  64,    0,      0,     0,    900, 200,   2,  20000);
+    // ── Heroes (campaign-only, larger HP + damage; cost 0 = not
+    //    trainable — placed by the mission orchestrator, never
+    //    queued from a building command card). ──
+    _def(UNIT_LOTHAR,     150,  5, 15,  1,  500, 6, SIZE_LARGE,  DAMAGE_NORMAL,     48, 160,    0,      0,     0,      0,   0,   1,      0);
+    _def(UNIT_MEDIVH,     100,  2, 12,  5,  600, 6, SIZE_SMALL,  DAMAGE_EXPLOSIVE,  32, 144,  100,      0,    25,      0,   0,   1,      0);
+
+    _unit_def_count = 14;
+}
+
+// Look up a unit's static data by kind constant. Returns 0 on
+// out-of-range so callers can probe blindly without a separate
+// "is this a known unit?" check.
+unit_def_for(kind) {
+    if (kind < 0 || kind >= _unit_def_count) { return 0; }
+    return _unit_defs + kind * sizeof(UnitDef);
+}

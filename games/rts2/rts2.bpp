@@ -1,0 +1,1555 @@
+// rts.bpp — Warcraft 1 in B++ (mod plan, Session 2).
+//
+// Session 2 ship: load the real forest1 map from the war1tool-
+// derived JSON (converted offline by tools/wc1_map_convert from
+// the original SMS file) and render it. ESC quits.
+//
+// Build the binary alongside the assets/ directory (the canonical
+// layout other B++ games use — pathfind ships `path`/`path2`,
+// rhythm ships `rtm`):
+//
+//   ./bpp games/rts1/rts.bpp -o games/rts1/rts
+//   cd games/rts1 && ./rts        # or just `games/rts1/rts`
+//
+// Asset paths are resolved through `path_asset()` (bpp_path.bsm),
+// which walks up to 4 parent levels from the binary's own location
+// to find the `assets/` directory — so the same binary works from
+// any CWD.
+//
+// Hot-reload: the forest1.json file is registered with
+// `file_watch_register`, so any save of that JSON from Bang 9's
+// Levels tab (or a manual edit + save) re-loads the tile grid
+// into the running game within ~30 ms. Meta goal anchor —
+// docs/manual/tonify_checklist.md Rule 31.
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbtile.bsm";
+import "stbimage.bsm";       // for file_watch_register / file_watch_tick
+import "stbecs.bsm";         // ECS world for unit entities
+import "stbcamera.bsm";      // 2D camera state + clamp
+import "stbprofile.bsm";     // P toggles FPS / frame-time / top-N HUD (flick triage)
+load   "rts2_map.bsm";        // sibling .bsm — load, not import (Rule 0)
+load   "rts2_units.bsm";
+load   "rts2_anims.bsm";
+load   "rts2_render.bsm";
+load   "rts2_input.bsm";
+load   "rts2_hud.bsm";
+load   "rts2_movement.bsm";
+load   "rts2_combat.bsm";
+load   "rts2_missiles.bsm";
+load   "rts2_regen.bsm";
+load   "rts2_buildings.bsm";   // S8 — BuildingDef + ECS archetype + render
+load   "rts2_production.bsm";  // S8 — construction state-machine tick
+load   "rts2_resources.bsm";   // S9 — gold/wood/food + food-cap recompute
+load   "rts2_gather.bsm";      // S9 — peasant gather/return state machine
+load   "rts2_ai.bsm";          // S11 — enemy AI brain (econ/buildup/attack)
+
+// ── Constants ────────────────────────────────────────────
+
+// Virtual screen: 30 × ~17 tiles at 16 px each = 480 × 270. 16:9
+// aspect ratio so a modern monitor (1920×1080, 2560×1440, 3840×2160)
+// hits an exact integer scale and presents WITHOUT letterbox —
+// 4× at 1080p, 5⅓ clamped to 5 at 1440p (still tight), 8× at 4K.
+// Wider strategic view than the WC1 original's 320×200 viewport
+// (the original's narrow viewport made sense when monitors were
+// 4:3 and the HUD ate the right quarter of the screen; we keep
+// the HUD scenic and let the player see more battlefield).
+// forest1 is 64×64 tiles = 1024×1024 world pixels, so the camera
+// can pan freely in both axes.
+const SCREEN_W = 480;
+const SCREEN_H = 270;
+
+// ── Game state ───────────────────────────────────────────
+
+// Allocated once in main, never reassigned — Tonify Rule 1.
+extrn map;
+
+// Verbose combat / AI / command logging gate (defined in rts1_render).
+// main sets it from the RTS_DEBUG environment variable below.
+extrn wc1_debug;
+
+// ECS world holding every unit entity. Sized for 256 — covers
+// Session 3's "spawn one peasant from forest1.json" plus headroom
+// for the production economy + AI that arrives in Sessions 6-9.
+// When that lands, revisit the cap.
+extrn world;
+
+// Peasant atlas handle. Loaded from the atlas_grid sister JSON
+// (see assets/sprites/wc1/peasant.json). Hot-reload registered so
+// edits to the JSON or the underlying PNG re-propagate via
+// image_hot_reload_tick_throttled. peon_atlas is the orc-side
+// equivalent (same 5×13 grid, same frameTags, distinct pixels).
+// All 16 unit atlases loaded at startup. Global so wc1_render +
+// the debug spawn tick can pick the right sheet by kind. Atlases
+// are paired with UnitDef stats via the `kind` argument flowing
+// through ecs_spawn_unit; the atlas just provides pixels.
+extrn peasant_atlas, peon_atlas;
+extrn footman_atlas, grunt_atlas;
+extrn knight_atlas, raider_atlas;
+extrn archer_atlas, spearman_atlas;
+extrn cleric_atlas, conjurer_atlas;
+extrn necrolyte_atlas, warlock_atlas;
+extrn human_catapult_atlas, orc_catapult_atlas;
+extrn lothar_atlas, medivh_atlas;
+extrn arrow_atlas;
+
+// S8 — building atlases. Two PNGs per building (completed +
+// 3-frame construction strip) per faction, except keep / spire
+// which ship completed-only (NotConstructable per buildings.lua —
+// they're campaign-given, not player-built). Pre-loaded at boot
+// so the production tick can flip a foundation into a finished
+// building with a zero-allocation atlas swap.
+//
+// Naming: `<faction>_<role>[_construction]_atlas`. The _atlas
+// suffix matches the unit-atlas convention (peasant_atlas, etc.);
+// the leading faction prefix keeps human + orc atlas slots
+// distinct since the on-disk basename collides ("barracks.png"
+// in both folders).
+extrn human_town_hall_atlas, human_town_hall_construct_atlas;
+extrn human_farm_atlas, human_farm_construct_atlas;
+extrn human_barracks_atlas, human_barracks_construct_atlas;
+extrn human_lumber_mill_atlas, human_lumber_mill_construct_atlas;
+extrn human_blacksmith_atlas, human_blacksmith_construct_atlas;
+extrn human_stable_atlas, human_stable_construct_atlas;
+extrn human_church_atlas, human_church_construct_atlas;
+extrn human_tower_atlas, human_tower_construct_atlas;
+extrn stormwind_keep_atlas;            // NotConstructable: completed only
+extrn orc_town_hall_atlas, orc_town_hall_construct_atlas;
+extrn orc_farm_atlas, orc_farm_construct_atlas;
+extrn orc_barracks_atlas, orc_barracks_construct_atlas;
+extrn orc_lumber_mill_atlas, orc_lumber_mill_construct_atlas;
+extrn orc_blacksmith_atlas, orc_blacksmith_construct_atlas;
+extrn orc_kennel_atlas, orc_kennel_construct_atlas;
+extrn orc_temple_atlas, orc_temple_construct_atlas;
+extrn orc_tower_atlas, orc_tower_construct_atlas;
+extrn blackrock_spire_atlas;           // NotConstructable: completed only
+// S9 — neutral gold mine. Pre-placed on the map at level load;
+// not constructable, no construction atlas.
+extrn gold_mine_atlas;
+
+// S8.5 — authentic WC1 HUD atlases. portrait_icons holds the 93-
+// frame strip of mini-unit-portraits (27×19 each) the command
+// card uses to show a per-selection picture; icon_border wraps
+// any portrait in the WC1-faithful frame; bottom_panel is the
+// 240×12 strip we tile across the bottom of the canvas as the
+// divider between the game viewport and the HUD area.
+extrn portrait_icons_atlas;
+extrn icon_border_atlas;
+extrn bottom_panel_atlas;
+// S10.6 — WC1 stone panel (panel_1) for the command-card background,
+// per faction. Not in the curated hud atlas set, so loaded raw (solo
+// PNG, 1-frame). Both loaded so the HUD switches chrome when race
+// selection (future) flips _hud_player_faction; defaults to human (0).
+extrn panel_bg_human_atlas, panel_bg_orc_atlas;
+global _hud_player_faction;
+
+// S11 — the player id the local user commands, chosen on the race
+// screen (0 = human, 1 = orc per the forest1.json 4-corner layout).
+// Read via wc1_local_player() from the input / HUD / production
+// faction gates so "my units" follows the chosen race. Functions
+// resolve at link time, so the loaded game modules call the accessor
+// without depending on this global being in their scope.
+global _local_player;
+wc1_local_player() { return _local_player; }
+// S9 — top resource bar (gold + lumber icons + strip chrome).
+// Loaded once at startup; read every frame by _draw_top_resource_bar.
+extrn top_resource_bar_atlas;
+extrn gold_icon_atlas, lumber_icon_atlas;
+// S9 — carry-sprite atlases for peasant + peon, gold + wood.
+// Same 160×416 layout as the base atlases; wc1_gather swaps to
+// these for RETURNING_GOLD / RETURNING_WOOD states.
+extrn peasant_with_gold_atlas, peasant_with_wood_atlas;
+extrn peon_with_gold_atlas,    peon_with_wood_atlas;
+
+// Camera handle — owned by main, read by tile_draw and the per-
+// entity render callback (which extrn's it). cam_pan / cam_set
+// keep the clamp uniform with every other 2D consumer of the
+// engine (platformer + future RTS games + zelda-style top-down).
+extrn cam;
+
+// Camera pan speed in pixels per second. RTS-typical pace: pans
+// the 1024 px (64 × 16) forest map edge-to-edge in ~5 seconds at
+// 200 px/s. Higher feels twitchy on a 320 px-wide viewport.
+const CAM_SPEED_PX_S = 200;
+
+// Path used by both the initial load and the hot-reload callback.
+// Kept in a global so the callback (which receives no arguments,
+// per file_watch_register's contract) can find it.
+extrn _map_json_path;
+
+// Hot-reload callback. Fires from file_watch_tick when forest1.json
+// changes on disk. Re-loads the JSON into the existing map handle
+// (preserving the bound GPU tileset). On failure the existing
+// tiles stay untouched so the game keeps something walkable on
+// screen.
+void _reload_map() {
+    if (wc1_map_reload_from(map, _map_json_path) != 0) {
+        put_err("rts: forest1.json reload failed — keeping previous tiles\n");
+    }
+}
+
+// Load one atlas JSON from `assets/sprites/wc1/<name>`. Wraps the
+// path_asset + image_load + image_hot_reload_enable triple so the
+// per-unit load reads as a single line at the call site. Returns
+// the atlas handle on success or 0 on failure; the caller batches
+// the null check across the whole roster (image_free(0) is a no-op
+// so partial loads still clean up correctly via _free_all_atlases).
+static _load_wc1_atlas(name: ptr) {
+    auto path, full, atlas, prefix_len, name_len;
+    auto prefix: ptr;
+    prefix = "assets/sprites/wc2/";
+    prefix_len = str_len(prefix);
+    name_len   = str_len(name);
+    full = malloc(prefix_len + name_len + 1);
+    str_cpy(full, prefix);
+    str_cpy(full + prefix_len, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+// Building-atlas loader. Same wrap as _load_wc1_atlas but rooted
+// at `assets/sprites/wc1/buildings/<faction>/<name>` so the
+// per-faction nesting the converter writes is honored. Hot-reload
+// enabled so a Bang 9 edit on the JSON or PNG re-propagates into
+// the running game in ~30 ms — same rail every unit atlas uses.
+// HUD-atlas loader. Same shape as `_load_wc1_building_atlas` but
+// rooted at `assets/sprites/wc1/hud/<faction>/<name>` — the
+// hand-converted WC1 panels + portrait strip live there per
+// the asset-conversion pass in S8.5. The faction segment is
+// `forest` for the portrait icons (tileset-shared sprite, the
+// same strip works for both player colors after palette swap),
+// `human` for the human player chrome, `orc` for the orc set.
+static _load_wc1_hud_atlas(faction: ptr, name: ptr) {
+    auto path, full, atlas;
+    auto (prefix, sep): ptr;
+    auto prefix_len, faction_len, sep_len, name_len, off;
+    prefix      = "assets/sprites/wc2/hud/";
+    sep         = "/";
+    prefix_len  = str_len(prefix);
+    faction_len = str_len(faction);
+    sep_len     = str_len(sep);
+    name_len    = str_len(name);
+    full = malloc(prefix_len + faction_len + sep_len + name_len + 1);
+    off = 0;
+    str_cpy(full + off, prefix);  off = off + prefix_len;
+    str_cpy(full + off, faction); off = off + faction_len;
+    str_cpy(full + off, sep);     off = off + sep_len;
+    str_cpy(full + off, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+static _load_wc1_building_atlas(faction: ptr, name: ptr) {
+    auto path, full, atlas;
+    auto (prefix, sep): ptr;
+    auto prefix_len, faction_len, sep_len, name_len, off;
+    prefix      = "assets/sprites/wc2/buildings/";
+    sep         = "/";
+    prefix_len  = str_len(prefix);
+    faction_len = str_len(faction);
+    sep_len     = str_len(sep);
+    name_len    = str_len(name);
+    full = malloc(prefix_len + faction_len + sep_len + name_len + 1);
+    off = 0;
+    str_cpy(full + off, prefix);  off = off + prefix_len;
+    str_cpy(full + off, faction); off = off + faction_len;
+    str_cpy(full + off, sep);     off = off + sep_len;
+    str_cpy(full + off, name);
+    path = path_asset(full);
+    free(full);
+    atlas = image_load(path);
+    free(path);
+    if (atlas != 0) { image_hot_reload_enable(atlas); }
+    return atlas;
+}
+
+// Release every unit + building + missile atlas. Safe to call with
+// partially-loaded state (image_free is null-tolerant). Called by
+// the failure path during init AND by the normal shutdown.
+static void _free_all_atlases() {
+    image_free(peasant_atlas);
+    image_free(peon_atlas);
+    image_free(footman_atlas);
+    image_free(grunt_atlas);
+    image_free(knight_atlas);
+    image_free(raider_atlas);
+    image_free(archer_atlas);
+    image_free(spearman_atlas);
+    image_free(cleric_atlas);
+    image_free(conjurer_atlas);
+    image_free(necrolyte_atlas);
+    image_free(warlock_atlas);
+    image_free(human_catapult_atlas);
+    image_free(orc_catapult_atlas);
+    image_free(lothar_atlas);
+    image_free(medivh_atlas);
+    image_free(arrow_atlas);
+    image_free(human_town_hall_atlas);
+    image_free(human_town_hall_construct_atlas);
+    image_free(human_farm_atlas);
+    image_free(human_farm_construct_atlas);
+    image_free(human_barracks_atlas);
+    image_free(human_barracks_construct_atlas);
+    image_free(human_lumber_mill_atlas);
+    image_free(human_lumber_mill_construct_atlas);
+    image_free(human_blacksmith_atlas);
+    image_free(human_blacksmith_construct_atlas);
+    image_free(human_stable_atlas);
+    image_free(human_stable_construct_atlas);
+    image_free(human_church_atlas);
+    image_free(human_church_construct_atlas);
+    image_free(human_tower_atlas);
+    image_free(human_tower_construct_atlas);
+    image_free(stormwind_keep_atlas);
+    image_free(orc_town_hall_atlas);
+    image_free(orc_town_hall_construct_atlas);
+    image_free(orc_farm_atlas);
+    image_free(orc_farm_construct_atlas);
+    image_free(orc_barracks_atlas);
+    image_free(orc_barracks_construct_atlas);
+    image_free(orc_lumber_mill_atlas);
+    image_free(orc_lumber_mill_construct_atlas);
+    image_free(orc_blacksmith_atlas);
+    image_free(orc_blacksmith_construct_atlas);
+    image_free(orc_kennel_atlas);
+    image_free(orc_kennel_construct_atlas);
+    image_free(orc_temple_atlas);
+    image_free(orc_temple_construct_atlas);
+    image_free(orc_tower_atlas);
+    image_free(orc_tower_construct_atlas);
+    image_free(blackrock_spire_atlas);
+    image_free(gold_mine_atlas);
+    image_free(portrait_icons_atlas);
+    image_free(icon_border_atlas);
+    image_free(bottom_panel_atlas);
+    image_free(panel_bg_human_atlas);
+    image_free(panel_bg_orc_atlas);
+    image_free(top_resource_bar_atlas);
+    image_free(gold_icon_atlas);
+    image_free(lumber_icon_atlas);
+    image_free(peasant_with_gold_atlas);
+    image_free(peasant_with_wood_atlas);
+    image_free(peon_with_gold_atlas);
+    image_free(peon_with_wood_atlas);
+}
+
+// ── Entry point ──────────────────────────────────────────
+
+main() {
+    auto tile_atlas, tm;
+    auto tileset_json_path: ptr;
+
+    // Open the window + initialise input/draw/font/etc. via the
+    // standard stbgame floor (Rule 23 — stbgame ships the floor
+    // only; the wc1 arc opts in to stbrender + stbtile + stbimage
+    // explicitly).
+    game_init(SCREEN_W, SCREEN_H, "Warcraft 1 (B++)", 60);
+    render_init();
+    // S10.6 — the HUD draws through stbrender + stbimage directly
+    // (the left command panel is imperative draw calls), so the
+    // stbui/stbhud layout engine is no longer wired in.
+
+    // Resolve the forest tileset against the binary's own location
+    // — works from any CWD as long as the binary lives somewhere
+    // inside the games/rts1/ tree (canonical layout for B++ games;
+    // same convention as pathfind/rhythm/snake).
+    //
+    // The tileset loads through the modern atlas_grid path (single
+    // MTLTexture, sprite_id-indexed sub-rects) instead of the legacy
+    // tile_load_set / tile_bind_set pair (one MTLTexture per tile —
+    // 320 separate textures for the WC1 forest tileset, which both
+    // wastes bind cycles and surfaces visual artifacts under Phase
+    // 3.2 smart-bind batching). Pathfind has run this path since
+    // its inception; rts1 graduates to it as part of S7 closeout.
+    tileset_json_path = path_asset("assets/tiles/wc2/summer.json");
+    tile_atlas = image_load(tileset_json_path);
+    if (tile_atlas == 0) {
+        put_err("rts: failed to load tileset atlas at ");
+        put_err(tileset_json_path);
+        put_err("\n");
+        free(tileset_json_path);
+        return 1;
+    }
+    free(tileset_json_path);
+
+    // Load the converted forest1 map (64×64). The JSON shape
+    // matches pathfind's level1.json — Bang 9's Levels tab can
+    // open and edit the same file.
+    // Canonical location: every B++ game ships level JSONs under
+    // `assets/levels/`. Bang 9's Levels tab auto-discovers that
+    // directory when the project folder is opened — moving the
+    // map here gives rts1 the same one-click load pathfind / fps
+    // already enjoy.
+    _map_json_path = path_asset("assets/levels/wc2/alamo.json");
+    map = wc1_map_load(_map_json_path);
+    if (map == 0) {
+        put_err("rts: forest1.json load failed — exiting\n");
+        free(_map_json_path);
+        return 1;
+    }
+    tm = wc1_map_tm(map);
+    tile_bind_image(tm, tile_atlas);
+
+    // Hot-reload: re-runs _reload_map whenever forest1.json
+    // changes on disk. Same rail pathfind uses for level1.json
+    // edits in Bang 9.
+    file_watch_register(_map_json_path, fn_ptr(_reload_map));
+
+    // Full WC1 sprite roster — atlases load through the atlas_grid
+    // sister JSON (`assets/sprites/wc1/<unit>.json`). `_load_wc1_atlas`
+    // wraps path_asset + image_load + image_hot_reload_enable; returns
+    // 0 on failure (caller checks). Hot-reload runs through
+    // image_hot_reload_tick_throttled below — edit the JSON or the
+    // sister PNG and the running game picks it up in ~30ms.
+    peasant_atlas        = _load_wc1_atlas("peasant.json");
+    peon_atlas           = _load_wc1_atlas("peon.json");
+    footman_atlas        = _load_wc1_atlas("footman.json");
+    grunt_atlas          = _load_wc1_atlas("grunt.json");
+    knight_atlas         = _load_wc1_atlas("knight.json");
+    raider_atlas         = _load_wc1_atlas("raider.json");
+    archer_atlas         = _load_wc1_atlas("archer.json");
+    spearman_atlas       = _load_wc1_atlas("spearman.json");
+    cleric_atlas         = _load_wc1_atlas("cleric.json");
+    conjurer_atlas       = _load_wc1_atlas("conjurer.json");
+    necrolyte_atlas      = _load_wc1_atlas("necrolyte.json");
+    warlock_atlas        = _load_wc1_atlas("warlock.json");
+    human_catapult_atlas = _load_wc1_atlas("human_catapult.json");
+    orc_catapult_atlas   = _load_wc1_atlas("orc_catapult.json");
+    lothar_atlas         = _load_wc1_atlas("lothar.json");
+    medivh_atlas         = _load_wc1_atlas("medivh.json");
+    arrow_atlas          = _load_wc1_atlas("arrow.json");
+
+    // S8 — building atlases. Two per constructable building
+    // (completed + 3-frame construction strip), one for keep /
+    // spire (NotConstructable per buildings.lua). 34 atlases
+    // total across both factions. Same hot-reload rail as units.
+    human_town_hall_atlas             = _load_wc1_building_atlas("human", "town_hall.json");
+    human_town_hall_construct_atlas   = _load_wc1_building_atlas("human", "town_hall_construction.json");
+    human_farm_atlas                  = _load_wc1_building_atlas("human", "farm.json");
+    human_farm_construct_atlas        = _load_wc1_building_atlas("human", "farm_construction.json");
+    human_barracks_atlas              = _load_wc1_building_atlas("human", "barracks.json");
+    human_barracks_construct_atlas    = _load_wc1_building_atlas("human", "barracks_construction.json");
+    human_lumber_mill_atlas           = _load_wc1_building_atlas("human", "lumber_mill.json");
+    human_lumber_mill_construct_atlas = _load_wc1_building_atlas("human", "lumber_mill_construction.json");
+    human_blacksmith_atlas            = _load_wc1_building_atlas("human", "blacksmith.json");
+    human_blacksmith_construct_atlas  = _load_wc1_building_atlas("human", "blacksmith_construction.json");
+    human_stable_atlas                = _load_wc1_building_atlas("human", "stable.json");
+    human_stable_construct_atlas      = _load_wc1_building_atlas("human", "stable_construction.json");
+    human_church_atlas                = _load_wc1_building_atlas("human", "church.json");
+    human_church_construct_atlas      = _load_wc1_building_atlas("human", "church_construction.json");
+    human_tower_atlas                 = _load_wc1_building_atlas("human", "tower.json");
+    human_tower_construct_atlas       = _load_wc1_building_atlas("human", "tower_construction.json");
+    stormwind_keep_atlas              = _load_wc1_building_atlas("human", "stormwind_keep.json");
+    orc_town_hall_atlas               = _load_wc1_building_atlas("orc",   "town_hall.json");
+    orc_town_hall_construct_atlas     = _load_wc1_building_atlas("orc",   "town_hall_construction.json");
+    orc_farm_atlas                    = _load_wc1_building_atlas("orc",   "farm.json");
+    orc_farm_construct_atlas          = _load_wc1_building_atlas("orc",   "farm_construction.json");
+    orc_barracks_atlas                = _load_wc1_building_atlas("orc",   "barracks.json");
+    orc_barracks_construct_atlas      = _load_wc1_building_atlas("orc",   "barracks_construction.json");
+    orc_lumber_mill_atlas             = _load_wc1_building_atlas("orc",   "lumber_mill.json");
+    orc_lumber_mill_construct_atlas   = _load_wc1_building_atlas("orc",   "lumber_mill_construction.json");
+    orc_blacksmith_atlas              = _load_wc1_building_atlas("orc",   "blacksmith.json");
+    orc_blacksmith_construct_atlas    = _load_wc1_building_atlas("orc",   "blacksmith_construction.json");
+    orc_kennel_atlas                  = _load_wc1_building_atlas("orc",   "kennel.json");
+    orc_kennel_construct_atlas        = _load_wc1_building_atlas("orc",   "kennel_construction.json");
+    orc_temple_atlas                  = _load_wc1_building_atlas("orc",   "temple.json");
+    orc_temple_construct_atlas        = _load_wc1_building_atlas("orc",   "temple_construction.json");
+    orc_tower_atlas                   = _load_wc1_building_atlas("orc",   "tower.json");
+    orc_tower_construct_atlas         = _load_wc1_building_atlas("orc",   "tower_construction.json");
+    blackrock_spire_atlas             = _load_wc1_building_atlas("orc",   "blackrock_spire.json");
+    // S9 — neutral gold mine sprite (single-frame, 64×64). One
+    // copy shared between forest + swamp tilesets; the canonical
+    // forest variant is what level1 spawns from.
+    gold_mine_atlas                   = _load_wc1_building_atlas("neutral", "gold_mine.json");
+
+    // S8.5 — authentic WC1 HUD atlases. Loaded once at boot from
+    // `assets/sprites/wc1/hud/{forest,human}/<name>.json` so the
+    // command card can swap in real portraits + frame chrome
+    // without per-frame allocation. Hot-reload enabled so tweaks
+    // to the source PNG propagate live.
+    portrait_icons_atlas = _load_wc1_hud_atlas("forest", "portrait_icons.json");
+    icon_border_atlas    = _load_wc1_hud_atlas("human",  "icon_border.json");
+    bottom_panel_atlas   = _load_wc1_hud_atlas("human",  "bottom_panel.json");
+    // S10.6 — WC1 stone command-card background, raw per-faction PNGs
+    // (not in the curated hud set). Both loaded; the HUD picks by the
+    // local-player faction. Default human.
+    panel_bg_human_atlas = _load_raw_png("assets/converted/graphics/ui/human/panel_1.png");
+    panel_bg_orc_atlas   = _load_raw_png("assets/converted/graphics/ui/orc/panel_1.png");
+    _hud_player_faction  = 0;
+    // S9 / HUD evolution S8.6 — top resource bar + the two
+    // resource-counter icons (gold pile, lumber log). Loaded
+    // alongside the bottom_panel divider so the chrome is
+    // uniform across both panels.
+    top_resource_bar_atlas = _load_wc1_hud_atlas("human", "top_resource_bar.json");
+    gold_icon_atlas        = _load_wc1_hud_atlas("human", "gold_icon.json");
+    lumber_icon_atlas      = _load_wc1_hud_atlas("human", "lumber_icon.json");
+    // S9 — peasant + peon carry-sprite atlases. Same shape as the
+    // base atlases so wc1_gather's atlas swap reuses the animation
+    // ids cached from the base peasant atlas via wc1_anims_init.
+    peasant_with_gold_atlas = _load_wc1_atlas("peasant_with_gold.json");
+    peasant_with_wood_atlas = _load_wc1_atlas("peasant_with_wood.json");
+    peon_with_gold_atlas    = _load_wc1_atlas("peon_with_gold.json");
+    peon_with_wood_atlas    = _load_wc1_atlas("peon_with_wood.json");
+
+    // Single failure check covers the whole batch — image_free(0)
+    // is a no-op so _free_all_atlases handles partial loads
+    // cleanly without per-atlas cascading.
+    if (peasant_atlas == 0 || peon_atlas == 0 ||
+        footman_atlas == 0 || grunt_atlas == 0 ||
+        knight_atlas  == 0 || raider_atlas == 0 ||
+        archer_atlas  == 0 || spearman_atlas == 0 ||
+        cleric_atlas  == 0 || conjurer_atlas == 0 ||
+        necrolyte_atlas == 0 || warlock_atlas == 0 ||
+        human_catapult_atlas == 0 || orc_catapult_atlas == 0 ||
+        lothar_atlas == 0 || medivh_atlas == 0 ||
+        arrow_atlas  == 0 ||
+        human_town_hall_atlas == 0 || human_farm_atlas == 0 ||
+        human_barracks_atlas == 0 || human_lumber_mill_atlas == 0 ||
+        human_blacksmith_atlas == 0 || human_stable_atlas == 0 ||
+        human_church_atlas == 0 || human_tower_atlas == 0 ||
+        stormwind_keep_atlas == 0 ||
+        orc_town_hall_atlas == 0 || orc_farm_atlas == 0 ||
+        orc_barracks_atlas == 0 || orc_lumber_mill_atlas == 0 ||
+        orc_blacksmith_atlas == 0 || orc_kennel_atlas == 0 ||
+        orc_temple_atlas == 0 || orc_tower_atlas == 0 ||
+        blackrock_spire_atlas == 0 ||
+        gold_mine_atlas == 0 ||
+        portrait_icons_atlas == 0 || icon_border_atlas == 0 ||
+        bottom_panel_atlas == 0 ||
+        top_resource_bar_atlas == 0 ||
+        gold_icon_atlas == 0 || lumber_icon_atlas == 0 ||
+        peasant_with_gold_atlas == 0 || peasant_with_wood_atlas == 0 ||
+        peon_with_gold_atlas == 0    || peon_with_wood_atlas == 0) {
+        // WC2 transition: the roster is partial (units extracted; buildings/
+        // HUD not yet named/extracted). image_draw_size is null-safe, so a
+        // missing atlas just doesn't draw — warn once and keep running.
+        put_err("rts: some atlases missing (WC2 partial roster) — continuing\n");
+    }
+    // Cache anim ids from the loaded sidecar's frameTags so the
+    // per-frame render lookup is two array reads + modulo math
+    // (no string compare). Must run AFTER image_load but BEFORE
+    // the first frame renders.
+    wc1_anims_init(peasant_atlas);
+
+    // ECS world + per-game wiring. unit_defs_init populates the
+    // unit kind table; ecs_wire registers components + the peasant
+    // archetype + the render query. Both run once at startup.
+    // S8 — building_defs_init populates the 9-kind BuildingDef
+    // table; buildings_wire registers the Building component + a
+    // SECOND archetype + a mask-filtered query that walks only
+    // building entities (Rule 30 — distinct component set warrants
+    // archetype fan-out). Order matters: buildings_wire references
+    // pos_comp / faction_comp / sheet_comp which ecs_wire registers,
+    // so it MUST come after.
+    unit_defs_init();
+    building_defs_init();
+    world = ecs_new(512);   // 512 so the RTS_STRESS arena (up to 230v230 +
+                            // the match's own units) fits; normal play uses
+                            // far fewer. Kept in step with _MAX_SELECTION.
+    ecs_wire(world);
+    buildings_wire(world);
+
+    // S11 — race select. The player picks Humans (player 0) or Orcs
+    // (player 1); the choice drives every "my faction" gate (selection,
+    // command card, production, minimap colors) and the HUD panel skin.
+    _local_player = _race_select_screen();
+    _hud_player_faction = _player_is_human(_local_player) != 0 ? 0 : 1;
+
+    // Seed the camera before unit spawn so the start_view consumer
+    // can override it. cam_new lands at (0, 0); the seeder
+    // looks for a `start_view` entity belonging to player 0 (the
+    // human in WC1 campaign maps) and centers the viewport on it.
+    //
+    // S10.6 — the world view is inset to the RIGHT of the WC1 left
+    // command panel. The camera's screen_w is the VISIBLE world width
+    // (canvas minus the panel) so the clamp reaches the true map edge;
+    // cam_set_viewport plants the world origin at (panel_w, 0) so every
+    // world<->screen transform lands inside the play area while the HUD
+    // panel owns x < panel_w in absolute screen space.
+    cam = cam_new(SCREEN_W - wc1_panel_w(), SCREEN_H,
+                    wc1_map_w(map) * 16, wc1_map_h(map) * 16);
+    cam_set_viewport(cam, wc1_panel_w(), 0);
+    _seed_camera_from_level(map);
+    // wc1_movement_init MUST precede _spawn_units_from_level: spawn
+    // calls wc1_collision_register on the peasant's starting tile,
+    // and the shared occupancy grid is allocated inside movement_init.
+    wc1_input_init();
+    wc1_movement_init(map);
+    wc1_missiles_init(arrow_atlas);
+    // S9 — resource state + gather wiring. init_wc1_resources
+    // seeds the gold / wood / food / food_cap globals; the carry-
+    // atlas registration tells wc1_gather which sprite to swap to
+    // per faction + carry kind during RETURNING_* states.
+    init_wc1_resources();
+    wc1_render_set_carry_atlases(peasant_with_gold_atlas,
+                                 peasant_with_wood_atlas,
+                                 peon_with_gold_atlas,
+                                 peon_with_wood_atlas);
+    _spawn_buildings_from_level(world, map);
+    // S9 closure — seed every player a pre-DONE town hall as a
+    // deposit point; without it the gather cycle stalls after the
+    // first chop / mine tick (peasant carries the resource
+    // forever with nowhere to drop it). forest1.json clusters
+    // every player's entities on a single tile (campaign-style
+    // "drop pod"); the seeder spreads a faction-appropriate town
+    // hall a few tiles inward from each `start_view`. Runs
+    // BEFORE unit spawn so the unit spawner can route peasants
+    // around the claimed building footprints.
+    _seed_town_halls_for_players(world, map);
+    _spawn_units_from_level(world, map);
+
+    // S11 — wake the enemy AI. It commands the faction diagonally
+    // opposite the local player (local ^ 1) and hunts the local user.
+    // Runs after spawns so its town hall + starting worker exist.
+    wc1_ai_init(world, wc1_local_player() ^ 1, wc1_local_player());
+
+    // Profiler HUD (stbprofile) — off until P is pressed. Wired to triage
+    // the render flicks seen in skirmish play: FPS + frame-time avg/max +
+    // a top-N hot-function sampler. Pure overlay; nothing draws until the
+    // toggle is on.
+    init_profile();
+
+    // Verbose per-event logging (hit / kill / target / AI state) prints
+    // only when `RTS_DEBUG` is set. Read once here so the hot combat /
+    // command paths just test a global instead of re-querying the env.
+    wc1_debug = (getenv("RTS_DEBUG") != 0);
+
+    // ── Skirmish / stress arena — `RTS_STRESS=N ./rts` turns this match into
+    // an N-vs-N field battle for profiling the engine with units actually IN
+    // ACTION (the "profile under load" loop). It (1) grasses over every tile
+    // so there is a clear field — forest1's centre is dense forest and packed
+    // units got stuck in the trees — (2) spawns N of YOUR footmen and N of the
+    // enemy's grunts in 10-wide blocks facing each other across a narrow
+    // no-man's-land at the centre of the map, and (3) plants the camera on the
+    // seam so the clash is on-screen at once. The blocks start ~7 tiles apart
+    // — just OUTSIDE the auto-acquire range — so YOU command the engagement:
+    // select your footmen and attack-move forward a couple of tiles, and the
+    // enemy AI's grunts auto-defend on contact (the new auto-target scan). The
+    // armies start in contact range ON PURPOSE: marching a dense block across
+    // the WHOLE map still gridlocks (the open movement arc — see
+    // docs/plans/sidequest_horde_movement.md), so starting them adjacent gives
+    // a real battle to profile today instead of two armies that never meet.
+    // Off unless the env var is set — a dev/profiling lever, never shipped
+    // behaviour. (Atlas is just pixels; the kind drives stats. The map keeps
+    // forest1's town halls / gold mine, so the AI brain still has its seeds.)
+    auto _stress_s;
+    _stress_s = getenv("RTS_STRESS");
+    if (_stress_s != 0) {
+        auto _sn, _si, _d, _i, _mw, _mh, _gx, _gy, _y0, _lp, _en;
+        auto _cx, _gap, _pl_x0, _en_x0;
+        _sn = 0; _si = 0;
+        while (str_peek(_stress_s, _si) != 0) {
+            _d = str_peek(_stress_s, _si) - '0';
+            if (_d < 0 || _d > 9) { break; }
+            _sn = _sn * 10 + _d;
+            _si = _si + 1;
+        }
+        if (_sn <= 0) { _sn = 200; }
+        // 2*N units must fit ecs_new(512) with headroom for the existing
+        // units + the marquee selection buffer (_MAX_SELECTION, bumped to
+        // match). Both bumped together this arc.
+        if (_sn > 230) { _sn = 230; }
+        _mw = wc1_map_w(map);
+        _mh = wc1_map_h(map);
+        // (1) Open the battlefield — solid grass everywhere.
+        _gy = 0;
+        while (_gy < _mh) {
+            _gx = 0;
+            while (_gx < _mw) {
+                wc1_map_set(map, _gx, _gy, WC1_T_GRASS);
+                _gx = _gx + 1;
+            }
+            _gy = _gy + 1;
+        }
+        // (2) Two 10-wide blocks centred on the map, facing across a 6-tile
+        // gap. Player block sits left of centre, enemy block right of it; the
+        // facing columns end up ~7 tiles apart — one short advance from the
+        // auto-acquire range, so the player drives the charge.
+        _lp = wc1_local_player();
+        _en = _lp ^ 1;
+        _cx = _mw / 2;
+        _gap = 6;
+        _pl_x0 = _cx - _gap / 2 - 10;
+        if (_pl_x0 < 1) { _pl_x0 = 1; }
+        _en_x0 = _cx + _gap / 2;
+        _y0 = _mh / 2 - (_sn / 10) / 2;
+        if (_y0 < 1) { _y0 = 1; }
+        _i = 0;
+        while (_i < _sn) {
+            _gx = _pl_x0 + (_i % 10);
+            _gy = _y0 + (_i / 10);
+            ecs_spawn_unit(world, footman_atlas, _gx, _gy, _lp, UNIT_FOOTMAN);
+            _i = _i + 1;
+        }
+        _i = 0;
+        while (_i < _sn) {
+            _gx = _en_x0 + (_i % 10);
+            _gy = _y0 + (_i / 10);
+            ecs_spawn_unit(world, grunt_atlas, _gx, _gy, _en, UNIT_GRUNT);
+            _i = _i + 1;
+        }
+        // (3) Look at the seam so the battle is centred on screen.
+        cam_set(cam, _cx * 16 - SCREEN_W / 2, (_mh / 2) * 16 - SCREEN_H / 2);
+        put("[skirmish] centred arena: ");
+        putnum(_sn);
+        put(" footmen vs ");
+        putnum(_sn);
+        put(" grunts, 6-tile gap — attack-move to charge, profile the clash\n");
+    }
+
+    // Game loop. Identical shape to the existing pathfind /
+    // platformer / fps_3d_gpu loops — game_frame_begin handles
+    // dt + input polling; game_render_begin / end wrap the GPU
+    // pass; tile_draw culls to the screen-visible region;
+    // ecs_render_units walks every unit entity and emits its
+    // sprite on top of the tilemap.
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+        // Asset hot-reload (forest1.json level + peasant.json/.png sprites) is
+        // auto-ticked inside game_frame_begin: image_hot_reload_tick_throttled
+        // covers BOTH the image registry and file_watch, on a ~30-frame
+        // throttle with a burst while you're actively editing. The old
+        // explicit per-frame file_watch_tick() re-read the whole 16 KB
+        // forest1.json EVERY frame — a >4 KB allocation through the direct
+        // page path (mmap/munmap), which dominated the profile (_mem_*_pages +
+        // file_read_all) and caused the frame-time spikes. Removed; the
+        // throttled auto-tick keeps hot-reload responsive at a fraction of the
+        // cost.
+        if (key_pressed(KEY_ESC)) {
+            // S10.5 — ESC cancels an in-progress building placement
+            // first; only quits the game when nothing is being placed.
+            if (wc1_placement_active() != 0) { wc1_placement_cancel(); }
+            else { break; }
+        }
+        // P toggles the profiler HUD (FPS / frame-time / hot functions).
+        if (key_pressed(KEY_P) != 0) { profile_hud_toggle(); }
+
+        _camera_pan_tick();
+        wc1_input_tick(world);
+        _debug_spawn_tick();
+        _debug_spawn_building_tick();
+        _debug_train_tick();
+        // S11 — enemy AI strategic step (5 Hz internally). Runs BEFORE
+        // combat + movement so the orders it issues this frame (gather
+        // assignments, attack targets, group moves) are picked up by
+        // those ticks immediately.
+        wc1_ai_tick(world, game_dt_ms());
+        // Combat runs BEFORE movement so attackers can request a
+        // fresh path-to-target this frame and the movement tick
+        // walks them toward weapon range immediately. Missiles
+        // tick AFTER both so any arrows spawned by this frame's
+        // combat get one frame of motion before the next.
+        wc1_combat_tick(world);
+        wc1_movement_tick(world);
+        wc1_missiles_tick(world);
+        wc1_regen_tick(world);
+        // Production tick — advances every CONSTRUCTING building's
+        // progress + scaffolding-animation clock. Flips state to
+        // DONE the first frame progress_ms crosses
+        // BuildingDef.construction_time_ms.
+        wc1_production_tick(world);
+        // S9 — gather tick. Advances every peasant in
+        // GATHER_GOLD / GATHER_WOOD state + every peasant on a
+        // RETURNING_* run. Resource counters update on deposit.
+        wc1_gather_tick(world, game_dt_ms());
+        // S9 / Phase D — food cap + used recompute. Walks the
+        // building + unit archetypes once; cheap. Drives the
+        // HUD's "n/cap" counter.
+        wc1_resources_recompute_cap();
+
+        game_render_begin();
+        render_clear(rgba(0, 0, 0, 255));
+        // World tiles drawn shifted right by the viewport origin so they
+        // land in the play area. tile_draw computes screen x as
+        // `gx*tw - cam_arg`, so passing `cam_x - view_ox` adds the +view_ox
+        // shift to every cell. The leftmost view_ox px of tiles draw under
+        // where the command panel will paint over them (it renders last).
+        tile_draw(tm, cam_x(cam) - cam_view_ox(cam),
+                      cam_y(cam) - cam_view_oy(cam), SCREEN_W, SCREEN_H);
+        // Buildings render AFTER the tilemap but BEFORE units so
+        // units overlap building footprints when they walk past
+        // (classic RTS draw order — units in front of structures).
+        ecs_render_buildings(world);
+        ecs_render_units(world);
+        wc1_missiles_render();
+        wc1_hud_render(world);
+        // Profiler overlay — self-gates on the P toggle, drawn last so it
+        // sits on top of the HUD. x=104 clears the 96px command panel.
+        profile_hud_draw(104, 8, 1, 0xFFFF3333);
+        game_render_end();
+    }
+
+    ecs_query_free(peasant_q);
+    free(world);
+    wc1_missiles_free();
+    _free_all_atlases();
+    image_free(tile_atlas);
+    cam_free(cam);
+    wc1_map_free(map);
+    free(_map_json_path);
+    return 0;
+}
+
+// Walk the entity records the level loader parsed and route each
+// recognized kind to the right ECS spawn. Unknown kinds are
+// silently ignored — Session 4 adds start_view (handled separately
+// by _seed_camera_from_level so the camera lands BEFORE units
+// spawn). door / chest entities arrive in later sessions; until
+// those handlers ship, the level editor can still author them
+// without crashing the game.
+//
+// Session 7 routes every supported unit kind through ecs_spawn_unit,
+// picking the atlas + UnitDef by the entity's `kind` string in the
+// level JSON. Atlases are read from the module-global pointers (all
+// extrn'd at the top of the file) so the signature stays clean as
+// the roster grows. Unknown kinds are silently ignored — the level
+// editor can author placeholders before the spawn route lands.
+//
+// S9 — spawn pre-placed buildings (gold mines, future neutral
+// fountains / dropships in scenario maps). Runs BEFORE
+// `_spawn_units_from_level` so the gold mines exist as ECS
+// entities before any peasant tries to right-click them.
+//
+// Only handles entities `wc1_map_entity_kind` reports as
+// "gold-mine" today; other kinds (start_view, peasant, peon,
+// ...) fall through to their respective spawn pipelines.
+static void _spawn_buildings_from_level(world, map) {
+    auto i, n, k, gx, gy, player;
+    n = wc1_map_entity_count(map);
+    for (i = 0; i < n; i++) {
+        k      = wc1_map_entity_kind(map, i);
+        gx     = wc1_map_entity_gx(map, i);
+        gy     = wc1_map_entity_gy(map, i);
+        player = wc1_map_entity_player(map, i);
+        if (str_eq(k, "gold-mine") != 0) {
+            // Param order matches ecs_spawn_building signature:
+            //   (world, atlas_idle, atlas_construct, gx, gy, player, kind)
+            // Gold mine: idle atlas only, no construct atlas, kind =
+            // BLDG_GOLD_MINE so the spawn flow lands DONE state +
+            // the initial 25,500 gold reserve.
+            ecs_spawn_building(world, gold_mine_atlas, 0,
+                               gx, gy, player, BLDG_GOLD_MINE);
+        }
+    }
+}
+
+// Tilemap handle exported by wc1_movement once `wc1_movement_init`
+// has run. Imported here for the town-hall seeder's clear-tile
+// scan; declared inline so it lives next to its only user. The
+// predicate functions (`wc1_is_forest_tile`,
+// `wc1_collision_is_blocked_for`) resolve through the cross-module
+// function table directly — `extrn` is for globals only.
+extrn world_map;
+
+// Faction lookup for town-hall atlases — players 0/2 are human,
+// players 1/3 are orc per forest1.json convention. Multi-faction
+// lobbies graduate later; the v1 table is hard-coded against the
+// current 4-corner level.
+static _player_is_human(player) {
+    if (player == 0) { return 1; }
+    if (player == 2) { return 1; }
+    return 0;
+}
+
+// Probe a 4×4 region rooted at (rx, ry). Returns 1 if every tile
+// is in-bounds, walkable (not a forest cluster cell), and free of
+// any prior collision claim. -2 is the sentinel "not me" entity id
+// — `wc1_collision_is_blocked_for` returns 1 for any non-zero
+// claim because no entity id matches -1 in storage.
+static _region_4x4_is_clear(rx, ry, w, h) {
+    auto dx, dy, tx, ty, tid;
+    for (dy = 0; dy < 4; dy++) {
+        for (dx = 0; dx < 4; dx++) {
+            tx = rx + dx;
+            ty = ry + dy;
+            if (tx < 0 || ty < 0)        { return 0; }
+            if (tx >= w || ty >= h)      { return 0; }
+            tid = tile_get(world_map, tx, ty);
+            if (wc1_is_forest_tile(tid) != 0)                 { return 0; }
+            if (wc1_collision_is_blocked_for(0 - 2, tx, ty)
+                                                       != 0)  { return 0; }
+        }
+    }
+    return 1;
+}
+
+// Single-tile variant of `_region_4x4_is_clear` — checks one cell
+// for the unit spawner. Workers occupy a single tile, so the 4×4
+// scan is overkill; this faster probe gets called once per unit
+// spawn.
+static _cell_is_clear(rx, ry, w, h) {
+    auto tid;
+    if (rx < 0 || ry < 0)             { return 0; }
+    if (rx >= w || ry >= h)           { return 0; }
+    tid = tile_get(world_map, rx, ry);
+    if (wc1_is_forest_tile(tid) != 0)              { return 0; }
+    if (wc1_collision_is_blocked_for(0 - 2, rx, ry) != 0) { return 0; }
+    return 1;
+}
+
+// Spiral-search a clear 1×1 cell near (origin_gx, origin_gy).
+// Returns the cell via out_gxy[0..1] and 1 on success; 0 when no
+// open tile is found within `radius`. Mirrors `_find_clear_4x4`'s
+// expansion pattern but probes single cells — used by the unit
+// spawner to walk a worker off a building-claimed tile.
+static _find_clear_cell(origin_gx, origin_gy, radius, w, h, out_gxy) {
+    auto r, dx, dy;
+    if (_cell_is_clear(origin_gx, origin_gy, w, h) != 0) {
+        out_gxy[0] = origin_gx;
+        out_gxy[1] = origin_gy;
+        return 1;
+    }
+    for (r = 1; r <= radius; r++) {
+        for (dy = 0 - r; dy <= r; dy++) {
+            for (dx = 0 - r; dx <= r; dx++) {
+                if (dx > 0 - r && dx < r && dy > 0 - r && dy < r) { continue; }
+                if (_cell_is_clear(origin_gx + dx,
+                                   origin_gy + dy, w, h) != 0) {
+                    out_gxy[0] = origin_gx + dx;
+                    out_gxy[1] = origin_gy + dy;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Spiral-search a clear 4×4 region near (origin_gx, origin_gy),
+// starting at radius `min_r` (so the placement is guaranteed to
+// be at least that many tiles from the origin tile). Returns the
+// top-left tile of the placement via out_gxy[0..1] and 1 on
+// success; 0 when no free spot is found within `radius`. The
+// `min_r` knob lets the town-hall seeder push the hall a few
+// tiles off the gold mine (both share the start_view position in
+// forest1.json) so the two buildings don't sit corner-to-corner
+// — their sprites otherwise overlap visually and the path
+// between them becomes a single-tile gap.
+static _find_clear_4x4(origin_gx, origin_gy, min_r, radius, w, h, out_gxy) {
+    auto r, dx, dy;
+    if (min_r <= 0 && _region_4x4_is_clear(origin_gx, origin_gy, w, h) != 0) {
+        out_gxy[0] = origin_gx;
+        out_gxy[1] = origin_gy;
+        return 1;
+    }
+    auto r_start;
+    r_start = min_r;
+    if (r_start < 1) { r_start = 1; }
+    for (r = r_start; r <= radius; r++) {
+        // Walk the perimeter of an (origin ± r) square; pick the
+        // first clear region. Order (E / W / S / N then corners)
+        // is arbitrary — the first match wins.
+        for (dy = 0 - r; dy <= r; dy++) {
+            for (dx = 0 - r; dx <= r; dx++) {
+                // Skip the interior already probed at smaller r.
+                if (dx > 0 - r && dx < r && dy > 0 - r && dy < r) { continue; }
+                if (_region_4x4_is_clear(origin_gx + dx,
+                                         origin_gy + dy, w, h) != 0) {
+                    out_gxy[0] = origin_gx + dx;
+                    out_gxy[1] = origin_gy + dy;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// Seed a town hall per player. Iterates `start_view` entities,
+// picks faction by `_player_is_human`, and drops a pre-DONE town
+// hall at the first clear 4×4 region inside a 12-tile radius of
+// the start. Skipped silently if no clear region exists in range
+// — the player can still build one manually; we don't crash the
+// map load over a tight forest pocket.
+static void _seed_town_halls_for_players(world, map) {
+    auto i, n, k, sgx, sgy, sp, mw, mh;
+    auto atlas_idle, out_gxy;
+    n  = wc1_map_entity_count(map);
+    mw = wc1_map_w(map);
+    mh = wc1_map_h(map);
+    out_gxy = buf_word(2);
+    for (i = 0; i < n; i++) {
+        k = wc1_map_entity_kind(map, i);
+        if (str_eq(k, "start_view") == 0) { continue; }
+        sgx = wc1_map_entity_gx(map, i);
+        sgy = wc1_map_entity_gy(map, i);
+        sp  = wc1_map_entity_player(map, i);
+        if (_player_is_human(sp) != 0) {
+            atlas_idle = human_town_hall_atlas;
+        } else {
+            atlas_idle = orc_town_hall_atlas;
+        }
+        // min_r=6: keeps the seeded town hall at least 6 tiles
+        // off the start_view + gold mine so the two 4×4 footprints
+        // don't end up corner-to-corner (the visual collision the
+        // S9 close-out smoke flagged).
+        if (_find_clear_4x4(sgx, sgy, 6, 14, mw, mh, out_gxy) == 0) {
+            putstr_err("[seed-th] player="); putnum_err(sp);
+            putstr_err(" NO CLEAR REGION near (");
+            putnum_err(sgx); putstr_err(",");
+            putnum_err(sgy); putstr_err(")\n");
+            continue;
+        }
+        putstr_err("[seed-th] player="); putnum_err(sp);
+        putstr_err(" hall at ("); putnum_err(out_gxy[0]);
+        putstr_err(","); putnum_err(out_gxy[1]); putstr_err(")\n");
+        // atlas_construct = 0 → ecs_spawn_building flips to DONE
+        // immediately (no scaffolding phase for the seeded hall).
+        ecs_spawn_building(world, atlas_idle, 0,
+                           out_gxy[0], out_gxy[1], sp, BLDG_TOWN_HALL);
+    }
+    free(out_gxy);
+}
+
+// Workers (peasant/peon) share UNIT_PEASANT stats — only the
+// rendered atlas differs by faction. Same for casters / heroes
+// that aren't faction-mirrored: each kind keeps its own UnitDef
+// slot.
+//
+// Spawn-tile resolution: the level may place a worker on the
+// same tile as a gold mine or town hall ("drop pod" campaign
+// convention). Stepping onto a building-claimed tile traps the
+// worker because the collision check sees a foreign claim on
+// every neighbour. `_resolve_unit_spawn_tile` walks the same
+// spiral the town-hall seeder uses to find the first 1×1 cell
+// the worker can stand on without colliding with another entity.
+static void _spawn_units_from_level(world, map) {
+    auto i, n, k, p, sprite_a, kind;
+    auto sgx, sgy, out_gxy;
+    n = wc1_map_entity_count(map);
+    out_gxy = buf_word(2);
+    for (i = 0; i < n; i++) {
+        k = wc1_map_entity_kind(map, i);
+        p = wc1_map_entity_player(map, i);
+        sprite_a = 0;
+        kind     = 0 - 1;
+        // Workers — same stats, different atlas per faction.
+        if (str_eq(k, "peasant")        != 0) { sprite_a = peasant_atlas;        kind = UNIT_PEASANT;   }
+        if (str_eq(k, "peon")           != 0) { sprite_a = peon_atlas;           kind = UNIT_PEASANT;   }
+        // Light infantry.
+        if (str_eq(k, "footman")        != 0) { sprite_a = footman_atlas;        kind = UNIT_FOOTMAN;   }
+        if (str_eq(k, "grunt")          != 0) { sprite_a = grunt_atlas;          kind = UNIT_GRUNT;     }
+        // Cavalry.
+        if (str_eq(k, "knight")         != 0) { sprite_a = knight_atlas;         kind = UNIT_KNIGHT;    }
+        if (str_eq(k, "raider")         != 0) { sprite_a = raider_atlas;         kind = UNIT_RAIDER;    }
+        // Ranged infantry.
+        if (str_eq(k, "archer")         != 0) { sprite_a = archer_atlas;         kind = UNIT_ARCHER;    }
+        if (str_eq(k, "spearman")       != 0) { sprite_a = spearman_atlas;       kind = UNIT_SPEARMAN;  }
+        // Casters.
+        if (str_eq(k, "cleric")         != 0) { sprite_a = cleric_atlas;         kind = UNIT_CLERIC;    }
+        if (str_eq(k, "conjurer")       != 0) { sprite_a = conjurer_atlas;       kind = UNIT_CONJURER;  }
+        if (str_eq(k, "necrolyte")      != 0) { sprite_a = necrolyte_atlas;      kind = UNIT_NECROLYTE; }
+        if (str_eq(k, "warlock")        != 0) { sprite_a = warlock_atlas;        kind = UNIT_WARLOCK;   }
+        // Siege.
+        if (str_eq(k, "human_catapult") != 0) { sprite_a = human_catapult_atlas; kind = UNIT_CATAPULT;  }
+        if (str_eq(k, "orc_catapult")   != 0) { sprite_a = orc_catapult_atlas;   kind = UNIT_CATAPULT;  }
+        // Heroes (campaign).
+        if (str_eq(k, "lothar")         != 0) { sprite_a = lothar_atlas;         kind = UNIT_LOTHAR;    }
+        if (str_eq(k, "medivh")         != 0) { sprite_a = medivh_atlas;         kind = UNIT_MEDIVH;    }
+
+        if (sprite_a != 0) {
+            // Resolve a clear cell near the entity's level tile so
+            // workers don't spawn inside a gold-mine / town-hall
+            // footprint. The spiral falls back silently to the
+            // original tile if nothing within 8 tiles is open —
+            // worker stays stuck, but at least the spawn doesn't
+            // crash and the level still loads.
+            sgx = wc1_map_entity_gx(map, i);
+            sgy = wc1_map_entity_gy(map, i);
+            if (_find_clear_cell(sgx, sgy, 8,
+                                 wc1_map_w(map), wc1_map_h(map),
+                                 out_gxy) != 0) {
+                sgx = out_gxy[0];
+                sgy = out_gxy[1];
+            }
+            ecs_spawn_unit(world, sprite_a, sgx, sgy, p, kind);
+        }
+    }
+    free(out_gxy);
+}
+
+// S11 — one faction banner on the race-select screen: a stone box with
+// the faction's portrait face (footman 0 / grunt 1) and a label, gold-
+// rimmed + lit when the cursor is over it.
+static void _race_box(bx, by, bw, bh, frame, label: ptr, hovered) {
+    auto pw, ph, px, py, lw;
+    render_rect(bx, by, bw, bh,
+                hovered != 0 ? rgba(64, 52, 38, 255) : rgba(40, 34, 26, 255));
+    render_rect_outline(bx, by, bw, bh, hovered != 0 ? 0xE6C200FF : 0x6A6A6AFF);
+    // Faction face, scaled to the box keeping the 27:19 portrait aspect.
+    pw = bw - 24;
+    ph = pw * 19 / 27;
+    px = bx + (bw - pw) / 2;
+    py = by + 16;
+    image_draw_size(portrait_icons_atlas, frame, px, py, pw, ph);
+    lw = render_measure(label, 1);
+    render_text(label, bx + (bw - lw) / 2, by + bh - 22, 1, 0xFFFFFFFF);
+}
+
+// S11 — race-select start screen. Runs its own frame loop before the
+// match: the player clicks Humans (→ player 0) or Orcs (→ player 1),
+// or presses 1 / 2. Returns the chosen player id. Closing the window
+// returns 0 (Humans) and the caller exits cleanly on game_should_quit.
+// Uses the already-loaded portrait atlas for the two faction faces.
+static _race_select_screen() {
+    auto choice, mx, my, hx, ox, by, bw, bh, hh, ho, title: ptr, hint: ptr, tw;
+    bw = 130; bh = 140; by = 64;
+    hx = 64;                       // human banner x
+    ox = SCREEN_W - 64 - bw;       // orc banner x (mirrored)
+    choice = 0 - 1;
+    while (game_should_quit() == 0 && choice < 0) {
+        game_frame_begin();
+        mx = mouse_x();
+        my = mouse_y();
+        hh = mx >= hx && mx < hx + bw && my >= by && my < by + bh;
+        ho = mx >= ox && mx < ox + bw && my >= by && my < by + bh;
+        if (mouse_pressed(MOUSE_LEFT) != 0) {
+            if (hh != 0) { choice = 0; }
+            if (ho != 0) { choice = 1; }
+        }
+        if (key_pressed(KEY_1) != 0) { choice = 0; }
+        if (key_pressed(KEY_2) != 0) { choice = 1; }
+        game_render_begin();
+        render_clear(rgba(24, 18, 12, 255));
+        title = "CHOOSE YOUR RACE";
+        tw = render_measure(title, 2);
+        render_text(title, (SCREEN_W - tw) / 2, 26, 2, 0xE6C200FF);
+        _race_box(hx, by, bw, bh, 0, "HUMANS", hh);
+        _race_box(ox, by, bw, bh, 1, "ORCS",   ho);
+        hint = "click a banner   ( 1 humans  /  2 orcs )";
+        tw = render_measure(hint, 1);
+        render_text(hint, (SCREEN_W - tw) / 2, by + bh + 18, 1, 0xB0B0B0FF);
+        game_render_end();
+    }
+    return choice < 0 ? 0 : choice;
+}
+
+// Seed the camera on the LOCAL player's `start_view` entity (the race
+// the user picked), falling back to the first start_view if the level
+// has none for that player. WC1 SMS files declare one SetStartView per
+// player; the converter emits all of them.
+//
+// The view position is the grid cell the campaign wants the camera to
+// LOOK AT — center the viewport on it. cam_set folds in the clamp so a
+// near-edge anchor never exposes off-map area.
+static void _seed_camera_from_level(map) {
+    auto i, n, k, fallback_i;
+    n = wc1_map_entity_count(map);
+    fallback_i = 0 - 1;
+    for (i = 0; i < n; i++) {
+        k = wc1_map_entity_kind(map, i);
+        if (str_eq(k, "start_view") == 0) { continue; }
+        if (fallback_i < 0) { fallback_i = i; }
+        if (wc1_map_entity_player(map, i) == _local_player) {
+            cam_set(cam,
+                      wc1_map_entity_gx(map, i) * 16 - SCREEN_W / 2,
+                      wc1_map_entity_gy(map, i) * 16 - SCREEN_H / 2);
+            return;
+        }
+    }
+    if (fallback_i >= 0) {
+        cam_set(cam,
+                  wc1_map_entity_gx(map, fallback_i) * 16 - SCREEN_W / 2,
+                  wc1_map_entity_gy(map, fallback_i) * 16 - SCREEN_H / 2);
+    }
+}
+
+// S10.6 — load a raw solo PNG as a 1-frame Image (no sister .json).
+// Used for HUD textures that aren't in the curated atlas set.
+static _load_raw_png(rel: ptr) {
+    auto p, img;
+    p = path_asset(rel);
+    img = image_load(p);
+    free(p);
+    return img;
+}
+
+// S10.6 — local-player HUD faction (0 = human, 1 = orc). Race
+// selection (future) sets this; defaults to human. Drives which
+// faction's stone chrome the command card draws. The selected
+// ENTITY's portrait still follows its own faction — only the panel
+// chrome follows the local player.
+wc1_hud_faction() { return _hud_player_faction; }
+void wc1_hud_set_faction(f) { _hud_player_faction = f; }
+wc1_hud_panel_bg() {
+    return _hud_player_faction != 0 ? panel_bg_orc_atlas : panel_bg_human_atlas;
+}
+
+// S10.6 — map size in tiles, for the minimap scale. world_map is the
+// stbtile Tilemap; the HUD doesn't import stbtile, so it reads the
+// dimensions through these accessors (defined here where the struct
+// is in scope).
+wc1_map_tiles_w() { auto tm: Tilemap; tm = world_map; return tm.w; }
+wc1_map_tiles_h() { auto tm: Tilemap; tm = world_map; return tm.h; }
+
+// Resolve the render atlas for a unit kind + faction (0 = human,
+// 1 = orc). The S10 production tick calls this when a trained unit
+// is ready to spawn — the unit atlases are owned here (loaded once
+// at startup), so the lookup lives where they are in scope. Returns
+// 0 for an unknown kind so the caller skips the spawn. Most kinds
+// have a single atlas (footman vs grunt are distinct kinds, not a
+// faction skin); only peasant/peon and the catapult share a kind
+// across factions, so those two branch on `human`.
+wc1_atlas_for_unit(kind, player) {
+    auto human;
+    human = player == 0;
+    switch (kind) {
+        UNIT_PEASANT   { return human != 0 ? peasant_atlas : peon_atlas; }
+        UNIT_FOOTMAN   { return footman_atlas; }
+        UNIT_GRUNT     { return grunt_atlas; }
+        UNIT_KNIGHT    { return knight_atlas; }
+        UNIT_RAIDER    { return raider_atlas; }
+        UNIT_ARCHER    { return archer_atlas; }
+        UNIT_SPEARMAN  { return spearman_atlas; }
+        UNIT_CLERIC    { return cleric_atlas; }
+        UNIT_CONJURER  { return conjurer_atlas; }
+        UNIT_NECROLYTE { return necrolyte_atlas; }
+        UNIT_WARLOCK   { return warlock_atlas; }
+        UNIT_CATAPULT  { return human != 0 ? human_catapult_atlas : orc_catapult_atlas; }
+        UNIT_LOTHAR    { return lothar_atlas; }
+        UNIT_MEDIVH    { return medivh_atlas; }
+        else           { return 0; }
+    }
+    return 0;
+}
+
+// Resolve a building's idle (completed) render atlas for kind +
+// faction. Atlases are owned here (loaded at startup); the S10.5
+// build-placement path and the debug spawn both resolve through this
+// so they can never disagree. Returns 0 for an unknown kind.
+wc1_building_atlas_idle(kind, player) {
+    auto human;
+    human = player == 0;
+    switch (kind) {
+    BLDG_TOWN_HALL   { return human != 0 ? human_town_hall_atlas   : orc_town_hall_atlas; }
+    BLDG_FARM        { return human != 0 ? human_farm_atlas        : orc_farm_atlas; }
+    BLDG_BARRACKS    { return human != 0 ? human_barracks_atlas    : orc_barracks_atlas; }
+    BLDG_LUMBER_MILL { return human != 0 ? human_lumber_mill_atlas : orc_lumber_mill_atlas; }
+    BLDG_BLACKSMITH  { return human != 0 ? human_blacksmith_atlas  : orc_blacksmith_atlas; }
+    BLDG_STABLE      { return human != 0 ? human_stable_atlas      : orc_kennel_atlas; }
+    BLDG_CHURCH      { return human != 0 ? human_church_atlas      : orc_temple_atlas; }
+    BLDG_TOWER       { return human != 0 ? human_tower_atlas       : orc_tower_atlas; }
+    BLDG_KEEP        { return human != 0 ? stormwind_keep_atlas    : blackrock_spire_atlas; }
+    else             { return 0; }
+    }
+    return 0;
+}
+
+// Resolve a building's 3-frame scaffolding atlas. Returns 0 for kinds
+// that ship DONE only (keep / spire) — ecs_spawn_building reads that
+// as "spawn completed immediately, skip CONSTRUCTING".
+wc1_building_atlas_construct(kind, player) {
+    auto human;
+    human = player == 0;
+    switch (kind) {
+    BLDG_TOWN_HALL   { return human != 0 ? human_town_hall_construct_atlas   : orc_town_hall_construct_atlas; }
+    BLDG_FARM        { return human != 0 ? human_farm_construct_atlas        : orc_farm_construct_atlas; }
+    BLDG_BARRACKS    { return human != 0 ? human_barracks_construct_atlas    : orc_barracks_construct_atlas; }
+    BLDG_LUMBER_MILL { return human != 0 ? human_lumber_mill_construct_atlas : orc_lumber_mill_construct_atlas; }
+    BLDG_BLACKSMITH  { return human != 0 ? human_blacksmith_construct_atlas  : orc_blacksmith_construct_atlas; }
+    BLDG_STABLE      { return human != 0 ? human_stable_construct_atlas      : orc_kennel_construct_atlas; }
+    BLDG_CHURCH      { return human != 0 ? human_church_construct_atlas      : orc_temple_construct_atlas; }
+    BLDG_TOWER       { return human != 0 ? human_tower_construct_atlas       : orc_tower_construct_atlas; }
+    else             { return 0; }
+    }
+    return 0;
+}
+
+// Debug helper (S10.1): press T with a producer building selected to
+// queue its first trainable unit. Exercises the training tick before
+// the command-card buttons (S10.2) exist. Skips the resource gate on
+// purpose — it is a developer trigger, not the player path.
+static void _debug_train_tick() {
+    auto eid, b: Building, fa: Faction, menu, n, kind;
+    if (key_pressed(KEY_T) == 0) { return; }
+    if (selected_kind != SEL_KIND_BUILDING) { return; }
+    if (selected_count <= 0) { return; }
+    eid = selected_eids[0];
+    b = ecs_get(world, building_comp, eid);
+    if (b.state != BLDG_STATE_DONE) { return; }
+    fa = ecs_get(world, faction_comp, eid);
+    menu = buf_word(8);
+    n = wc1_train_menu(b.kind, fa.player, menu);
+    if (n <= 0) {
+        free(menu);
+        return;
+    }
+    kind = menu[0];
+    free(menu);
+    wc1_production_enqueue(world, eid, kind);
+    putstr("debug: queued unit kind="); putnum(kind);
+    putstr(" at building eid="); putnum(eid); putstr("\n");
+}
+
+// Debug helper for S6 smoke. Each press of P spawns a 5 × 2 cluster
+// of peasants centered on the tile under the cursor — one tap is
+// enough to cross FLOW_THRESHOLD so the flow-field branch of
+// wc1_movement_request_group fires immediately. Spawning a cluster
+// (rather than a single peasant per tap) avoids the common pitfall
+// where multiple presses at a static mouse position stack at the
+// same pixel and read as a single sprite. key_pressed is edge-
+// triggered so each tap = exactly one cluster; the cap on accidental
+// over-spawn is the ECS world size (256 in rts.bpp). Kept here
+// rather than in wc1_input.bsm because it is strictly a verifier
+// affordance — once a real production trigger (training UI / AI
+// spawn) lands, this can come out.
+static void _debug_spawn_tick() {
+    auto mx, my, wx, wy, gx, gy, dx, dy, sx, sy;
+    auto atlas, kind, player, cluster_w, cluster_h;
+    // Number keys 1..9 + 0 pick the unit kind to spawn at the
+    // mouse cursor. Keys deliberately don't overlap WASD (camera
+    // pan) or P (kept as a peasant alias from the S6 debug
+    // spawner). Each press = one cluster spawn (key_pressed is
+    // edge-triggered).
+    //
+    //   1 / Q → peasant  (human worker)        player 0
+    //   2     → footman  (human melee)         player 0
+    //   3     → knight   (human cavalry)       player 0
+    //   4     → archer   (human ranged)        player 0
+    //   5     → cleric   (human caster)        player 0
+    //   6     → conjurer (human caster)        player 0
+    //   7     → peon     (orc worker)          player 1
+    //   8     → grunt    (orc melee)           player 1
+    //   9     → raider   (orc cavalry)         player 1
+    //   0     → spearman (orc ranged)          player 1
+    //   -     → necrolyte (orc caster)         player 1
+    //   =     → warlock  (orc caster)          player 1
+    //   [     → catapult (human siege)         player 0
+    //   ]     → catapult (orc siege)           player 1
+    //   ;     → lothar   (human hero)          player 0
+    //   '     → medivh   (orc hero / mage)     player 1
+    //
+    // Modifier keys route the number keys to building spawn
+    // instead — Shift = human, Ctrl = orc; see
+    // _debug_spawn_building_tick. Early-return here so the same
+    // key doesn't fire both spawns in one frame.
+    if (key_down(KEY_SHIFT) != 0) { return; }
+    if (key_down(KEY_CTRL)  != 0) { return; }
+    atlas  = 0;
+    kind   = 0 - 1;
+    player = 0;
+    cluster_w = 1;
+    cluster_h = 1;
+    if (key_pressed(KEY_1) != 0) {
+        atlas = peasant_atlas;  kind = UNIT_PEASANT;  player = 0;
+        cluster_w = 5; cluster_h = 2;
+    } else if (key_pressed(KEY_2) != 0) {
+        atlas = footman_atlas;  kind = UNIT_FOOTMAN;  player = 0;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_3) != 0) {
+        atlas = knight_atlas;   kind = UNIT_KNIGHT;   player = 0;
+        cluster_w = 2; cluster_h = 1;
+    } else if (key_pressed(KEY_4) != 0) {
+        atlas = archer_atlas;   kind = UNIT_ARCHER;   player = 0;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_5) != 0) {
+        atlas = cleric_atlas;   kind = UNIT_CLERIC;   player = 0;
+    } else if (key_pressed(KEY_6) != 0) {
+        atlas = conjurer_atlas; kind = UNIT_CONJURER; player = 0;
+    } else if (key_pressed(KEY_7) != 0) {
+        atlas = peon_atlas;     kind = UNIT_PEASANT;  player = 1;
+        cluster_w = 5; cluster_h = 2;
+    } else if (key_pressed(KEY_8) != 0) {
+        atlas = grunt_atlas;    kind = UNIT_GRUNT;    player = 1;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_9) != 0) {
+        atlas = raider_atlas;   kind = UNIT_RAIDER;   player = 1;
+        cluster_w = 2; cluster_h = 1;
+    } else if (key_pressed(KEY_0) != 0) {
+        atlas = spearman_atlas; kind = UNIT_SPEARMAN; player = 1;
+        cluster_w = 3; cluster_h = 1;
+    } else if (key_pressed(KEY_MINUS) != 0) {
+        atlas = necrolyte_atlas; kind = UNIT_NECROLYTE; player = 1;
+    } else if (key_pressed(KEY_EQUAL) != 0) {
+        atlas = warlock_atlas;  kind = UNIT_WARLOCK;  player = 1;
+    } else if (key_pressed(KEY_LBRACKET) != 0) {
+        atlas = human_catapult_atlas; kind = UNIT_CATAPULT; player = 0;
+    } else if (key_pressed(KEY_RBRACKET) != 0) {
+        atlas = orc_catapult_atlas;   kind = UNIT_CATAPULT; player = 1;
+    } else if (key_pressed(KEY_SEMICOLON) != 0) {
+        atlas = lothar_atlas;   kind = UNIT_LOTHAR;   player = 0;
+    } else if (key_pressed(KEY_QUOTE) != 0) {
+        atlas = medivh_atlas;   kind = UNIT_MEDIVH;   player = 1;
+    } else {
+        return;
+    }
+    if (atlas == 0) { return; }   // unit class not yet wired
+
+    mx = mouse_x();
+    my = mouse_y();
+    wx = cam_screen_to_world_x(cam, mx);
+    wy = cam_screen_to_world_y(cam, my);
+    gx = wx / 16;
+    gy = wy / 16;
+    for (dy = 0; dy < cluster_h; dy++) {
+        for (dx = 0; dx < cluster_w; dx++) {
+            sx = gx + dx - cluster_w / 2;
+            sy = gy + dy;
+            if (sx < 0) { sx = 0; }
+            if (sy < 0) { sy = 0; }
+            ecs_spawn_unit(world, atlas, sx, sy, player, kind);
+        }
+    }
+}
+
+// S8 debug-spawn for buildings. The modifier-key route picks the
+// faction; the number key picks the building kind. Cursor decides
+// the foundation tile.
+//
+//   Shift+1 → Town Hall (human)      Shift+6 → Stable
+//   Shift+2 → Farm                   Shift+7 → Church
+//   Shift+3 → Barracks               Shift+8 → Tower
+//   Shift+4 → Lumber Mill            Shift+9 → Stormwind Keep
+//   Shift+5 → Blacksmith                       (spawns DONE —
+//                                              NotConstructable)
+//
+//   Ctrl+1 → Town Hall (orc)         Ctrl+6 → Kennel
+//   Ctrl+2 → Farm                    Ctrl+7 → Temple
+//   Ctrl+3 → Barracks                Ctrl+8 → Tower
+//   Ctrl+4 → Lumber Mill             Ctrl+9 → Blackrock Spire
+//   Ctrl+5 → Blacksmith                       (spawns DONE)
+//
+// Both routes go through `ecs_spawn_building` so faction tagging
+// is just the `player` argument (0 = human, 1 = orc). Tile
+// occupancy + assignment slot wire identically.
+static void _debug_spawn_building_tick() {
+    auto mx, my, wx, wy, gx, gy;
+    auto atlas_idle, atlas_construct, kind, player;
+    auto shift_held, ctrl_held;
+    shift_held = key_down(KEY_SHIFT);
+    ctrl_held  = key_down(KEY_CTRL);
+    if (shift_held == 0 && ctrl_held == 0) { return; }
+    atlas_idle      = 0;
+    atlas_construct = 0;
+    kind            = 0 - 1;
+    player          = ctrl_held != 0 ? 1 : 0;
+    if (shift_held != 0) {
+        if (key_pressed(KEY_1) != 0) {
+            atlas_idle = human_town_hall_atlas;
+            atlas_construct = human_town_hall_construct_atlas;
+            kind = BLDG_TOWN_HALL;
+        } else if (key_pressed(KEY_2) != 0) {
+            atlas_idle = human_farm_atlas;
+            atlas_construct = human_farm_construct_atlas;
+            kind = BLDG_FARM;
+        } else if (key_pressed(KEY_3) != 0) {
+            atlas_idle = human_barracks_atlas;
+            atlas_construct = human_barracks_construct_atlas;
+            kind = BLDG_BARRACKS;
+        } else if (key_pressed(KEY_4) != 0) {
+            atlas_idle = human_lumber_mill_atlas;
+            atlas_construct = human_lumber_mill_construct_atlas;
+            kind = BLDG_LUMBER_MILL;
+        } else if (key_pressed(KEY_5) != 0) {
+            atlas_idle = human_blacksmith_atlas;
+            atlas_construct = human_blacksmith_construct_atlas;
+            kind = BLDG_BLACKSMITH;
+        } else if (key_pressed(KEY_6) != 0) {
+            atlas_idle = human_stable_atlas;
+            atlas_construct = human_stable_construct_atlas;
+            kind = BLDG_STABLE;
+        } else if (key_pressed(KEY_7) != 0) {
+            atlas_idle = human_church_atlas;
+            atlas_construct = human_church_construct_atlas;
+            kind = BLDG_CHURCH;
+        } else if (key_pressed(KEY_8) != 0) {
+            atlas_idle = human_tower_atlas;
+            atlas_construct = human_tower_construct_atlas;
+            kind = BLDG_TOWER;
+        } else if (key_pressed(KEY_9) != 0) {
+            // Keep ships completed-only — passing 0 for construct
+            // tells ecs_spawn_building to skip the CONSTRUCTING
+            // state and spawn DONE on frame 0.
+            atlas_idle = stormwind_keep_atlas;
+            atlas_construct = 0;
+            kind = BLDG_KEEP;
+        } else {
+            return;
+        }
+    } else {
+        // ctrl_held — orc faction. Same kinds map; different atlases.
+        if (key_pressed(KEY_1) != 0) {
+            atlas_idle = orc_town_hall_atlas;
+            atlas_construct = orc_town_hall_construct_atlas;
+            kind = BLDG_TOWN_HALL;
+        } else if (key_pressed(KEY_2) != 0) {
+            atlas_idle = orc_farm_atlas;
+            atlas_construct = orc_farm_construct_atlas;
+            kind = BLDG_FARM;
+        } else if (key_pressed(KEY_3) != 0) {
+            atlas_idle = orc_barracks_atlas;
+            atlas_construct = orc_barracks_construct_atlas;
+            kind = BLDG_BARRACKS;
+        } else if (key_pressed(KEY_4) != 0) {
+            atlas_idle = orc_lumber_mill_atlas;
+            atlas_construct = orc_lumber_mill_construct_atlas;
+            kind = BLDG_LUMBER_MILL;
+        } else if (key_pressed(KEY_5) != 0) {
+            atlas_idle = orc_blacksmith_atlas;
+            atlas_construct = orc_blacksmith_construct_atlas;
+            kind = BLDG_BLACKSMITH;
+        } else if (key_pressed(KEY_6) != 0) {
+            atlas_idle = orc_kennel_atlas;
+            atlas_construct = orc_kennel_construct_atlas;
+            kind = BLDG_STABLE;        // kennel is the orc variant of stable
+        } else if (key_pressed(KEY_7) != 0) {
+            atlas_idle = orc_temple_atlas;
+            atlas_construct = orc_temple_construct_atlas;
+            kind = BLDG_CHURCH;        // temple is the orc variant of church
+        } else if (key_pressed(KEY_8) != 0) {
+            atlas_idle = orc_tower_atlas;
+            atlas_construct = orc_tower_construct_atlas;
+            kind = BLDG_TOWER;
+        } else if (key_pressed(KEY_9) != 0) {
+            atlas_idle = blackrock_spire_atlas;
+            atlas_construct = 0;
+            kind = BLDG_KEEP;
+        } else {
+            return;
+        }
+    }
+    if (atlas_idle == 0) { return; }
+
+    mx = mouse_x();
+    my = mouse_y();
+    wx = cam_screen_to_world_x(cam, mx);
+    wy = cam_screen_to_world_y(cam, my);
+    gx = wx / 16;
+    gy = wy / 16;
+    if (gx < 0) { gx = 0; }
+    if (gy < 0) { gy = 0; }
+    ecs_spawn_building(world, atlas_idle, atlas_construct, gx, gy,
+                       player, kind);
+}
+
+// Per-frame camera pan. Arrow keys + WASD push the camera at the
+// constant CAM_SPEED_PX_S rate; opposing keys cancel out. ms-
+// based int math keeps cam coords on the integer rail (tile_draw
+// expects int pixel coords) — at 60 FPS the per-frame step is
+// ~3 px which still reads as smooth on a 320 px viewport. The
+// cam_pan call folds in the clamp so a held key against a map
+// edge doesn't accumulate negative coords.
+static void _camera_pan_tick() {
+    auto dx, dy, step;
+    step = CAM_SPEED_PX_S * game_dt_ms() / 1000;
+    dx = 0;
+    dy = 0;
+    if (key_down(KEY_LEFT)  != 0) { dx = dx - step; }
+    if (key_down(KEY_A)     != 0) { dx = dx - step; }
+    if (key_down(KEY_RIGHT) != 0) { dx = dx + step; }
+    if (key_down(KEY_D)     != 0) { dx = dx + step; }
+    if (key_down(KEY_UP)    != 0) { dy = dy - step; }
+    if (key_down(KEY_W)     != 0) { dy = dy - step; }
+    if (key_down(KEY_DOWN)  != 0) { dy = dy + step; }
+    if (key_down(KEY_S)     != 0) { dy = dy + step; }
+    cam_pan(cam, dx, dy);
+}

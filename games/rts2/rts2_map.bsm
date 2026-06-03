@@ -1,0 +1,368 @@
+// wc1_map.bsm — Warcraft 1 map data + tile-grid wrapper.
+//
+// Session 1 ship: a thin shell over `stbtile` that fixes the WC1
+// conventions in one place — 16×16 pixel tiles, 1-based tile IDs
+// matching the converted forest tileset (`graphics/tilesets/forest/
+// terrain.png`, 256×320 = 16 cols × 20 rows = 320 tiles total). Real
+// SMS / SMP loading lands in Session 2; for now the map is painted
+// from a hand-authored pattern so the tile pipeline can be smoke-
+// tested independently of the file-format work.
+//
+// Convention reminder (per the wc1_handoff coordinate section):
+//   gx, gy — tile coordinates, integer
+//   px, py — world pixels (gx * 16 + sub)
+//   sx, sy — screen pixels (after camera; identity in Session 1)
+
+import "stbtile.bsm";
+
+// Pixel size of every tile in the WC1 forest tileset. The tileset
+// PNG is laid out as a 16-column grid; tile_load_set slices it on
+// these dimensions and assigns 1-based row-major IDs that match
+// the war1tool SetTile output.
+const WC1_TILE_PX = 16;
+
+// Forest-tileset IDs verified by frequency analysis of
+// `assets/converted/maps/forest1.sms`: tile 109 occurs 1659 times
+// (canonical grass). Tile 76 falls in the 71-87 cluster the SMS
+// uses for tree groves. Other variants (80, 79, 72, 251) are also
+// present in the corpus but their semantics depend on context
+// (cliff edges, water borders, etc.) and aren't safe to use as
+// hand-authored placeholders without a real map context.
+const WC1_T_GRASS = 109;
+const WC1_T_TREE  = 76;
+
+// ── Map struct ──────────────────────────────────────────────
+
+// Game-side mirror of one entity record carried inside the level
+// JSON (`{"kind":"peasant","x":10.5,"y":7.5}`). Session 3 reads
+// these and uses them to drive ECS spawn at startup. The level
+// editor stores positions as cell-centered floats; the loader
+// reverses the half-cell offset so consumers get whole-cell
+// integer grid coordinates.
+// Game-side mirror of one entity record carried inside the level
+// JSON. Fields stay untyped (TY_WORD) to mirror the level_editor
+// LvlEntity pattern — str_dup and json pointer-arithmetic flow
+// through here as words, and adding `: ptr` annotations cascades
+// into E053/E050 errors at the assign sites until the upstream
+// chain (str_dup, json_string) also gains annotations.
+struct WC1Entity {
+    kind,           // heap-owned C-string ("peasant", "start_view", ...)
+    gx,             // grid x (whole-cell)
+    gy,             // grid y (whole-cell)
+    player          // owning player id (0 = human side 1, 1 = orc side 1, ...)
+}
+
+// A WC1 map is a `stbtile` tilemap plus the dimensions in the
+// units the game cares about, plus the entity list parsed from
+// the level JSON. The `tm` field is the underlying tilemap
+// handle; `entities`/`entity_count` carry the spawn metadata
+// for Session 3+ consumers.
+struct WC1Map {
+    tm,                    // stbtile handle (tile_new return)
+    w,                     // grid width in tiles
+    h,                     // grid height in tiles
+    entities,              // contiguous WC1Entity records (0 when empty)
+    entity_count           // number of valid entries in `entities`
+}
+
+// ── Lifecycle ───────────────────────────────────────────────
+
+// Allocate a fresh map of the requested grid size. Tile cells
+// start at 0 (empty); the caller paints tiles with `wc1_map_set`
+// or one of the `wc1_map_paint_*` helpers below.
+wc1_map_new(w, h) {
+    auto m: WC1Map;
+    m = malloc(sizeof(WC1Map));
+    m.w = w;
+    m.h = h;
+    m.tm = tile_new(w, h, WC1_TILE_PX, WC1_TILE_PX);
+    m.entities = 0;
+    m.entity_count = 0;
+    return m;
+}
+
+// Free the map, its underlying tilemap, and every entity record
+// (each kind string is heap-owned via str_dup at load time, so
+// the array's bytes alone aren't enough — walk + free per-entry
+// first, then free the array, then the map struct itself).
+void wc1_map_free(map) {
+    auto m: WC1Map, i, e: WC1Entity;
+    m = map;
+    if (m.tm != 0) { tile_free(m.tm); }
+    if (m.entities != 0) {
+        for (i = 0; i < m.entity_count; i++) {
+            e = m.entities + i * sizeof(WC1Entity);
+            if (e.kind != 0) { free(e.kind); }
+        }
+        free(m.entities);
+    }
+    free(map);
+}
+
+// ── Tile access ─────────────────────────────────────────────
+
+// Write a tile ID at grid (gx, gy). Out-of-bounds writes are
+// silently dropped by the underlying `tile_set`.
+void wc1_map_set(map, gx, gy, tile_id) {
+    auto m: WC1Map;
+    m = map;
+    tile_set(m.tm, gx, gy, tile_id);
+}
+
+// Fetch the underlying stbtile handle so the renderer can call
+// `tile_draw` directly. Wrapped here so callers don't need to
+// know the struct layout.
+wc1_map_tm(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.tm;
+}
+
+wc1_map_w(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.w;
+}
+
+wc1_map_h(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.h;
+}
+
+// ── Entity access ───────────────────────────────────────────
+
+// Number of entity records loaded from the level JSON. Returns
+// 0 for maps authored before Session 3 (no `entities` field).
+wc1_map_entity_count(map) {
+    auto m: WC1Map;
+    m = map;
+    return m.entity_count;
+}
+
+// Kind tag for entity `i` (e.g. "peasant", "start_view", "door").
+// Returns 0 on out-of-range index so callers can probe blindly.
+// Untyped return: the kind string flows through unannotated
+// (str_dup is untyped upstream), so adding `-> ptr` would force
+// callers to annotate their receivers as `: ptr` and that
+// cascades into the json layer that isn't annotated yet.
+wc1_map_entity_kind(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.kind;
+}
+
+// Grid x coordinate (whole-cell integer) for entity `i`.
+wc1_map_entity_gx(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.gx;
+}
+
+// Grid y coordinate (whole-cell integer) for entity `i`.
+wc1_map_entity_gy(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.gy;
+}
+
+// Owning player id for entity `i`. 0 in JSONs that pre-date the
+// player-aware writer; readers should treat 0 as "player 1, human
+// side" to keep legacy maps loading consistently.
+wc1_map_entity_player(map, i) {
+    auto m: WC1Map, e: WC1Entity;
+    m = map;
+    if (i < 0 || i >= m.entity_count) { return 0; }
+    e = m.entities + i * sizeof(WC1Entity);
+    return e.player;
+}
+
+// ── JSON loader (Session 2) ─────────────────────────────────
+
+// Load a WC1 map from the level_editor JSON format that the
+// `tools/wc1_map_convert` offline tool produces from a war1tool-
+// emitted SMS file. Returns a WC1Map handle on success, 0 on any
+// read/parse/shape error.
+//
+// JSON shape (matches games/pathfind/assets/levels/level1.json
+// so Bang 9's level_editor opens the same file for hot-reload
+// editing):
+//
+//   {"type":"level","version":2,"width":W,"height":H,
+//    "tiles":[[id, id, ...], [id, ...], ...]}
+//
+// `id` values are 1-based row-major indices into the bound
+// tileset, matching the original war1tool SetTile output.
+wc1_map_load(path: ptr) {
+    auto buf, fsize, doc, root;
+    auto w_idx, h_idx, tiles_idx, w, h;
+    auto x, y, row_idx, cell, map: WC1Map, m;
+    auto ents_idx, n_ents, i, ent_obj, kind_idx, x_idx, y_idx;
+    auto kind_s, ex: word, ey: word, e: WC1Entity;
+
+    buf = file_read_all(path, &fsize);
+    if (buf == 0) {
+        put_err("wc1_map_load: cannot read ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    doc = json_parse(buf, fsize);
+    free(buf);
+    if (doc == 0) {
+        put_err("wc1_map_load: malformed JSON in ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    root      = json_root(doc);
+    w_idx     = json_object_get(doc, root, "width");
+    h_idx     = json_object_get(doc, root, "height");
+    tiles_idx = json_object_get(doc, root, "tiles");
+    if (w_idx < 0 || h_idx < 0 || tiles_idx < 0) {
+        json_free(doc);
+        put_err("wc1_map_load: missing width/height/tiles in ");
+        put_err(path);
+        put_err("\n");
+        return 0;
+    }
+
+    w = json_int(doc, w_idx);
+    h = json_int(doc, h_idx);
+
+    map = wc1_map_new(w, h);
+    m = map;
+    for (y = 0; y < h; y++) {
+        row_idx = json_child(doc, tiles_idx, y);
+        for (x = 0; x < w; x++) {
+            cell = json_int(doc, json_child(doc, row_idx, x));
+            if (cell != 0) { tile_set(m.tm, x, y, cell); }
+        }
+    }
+
+    // Entities array — optional. Legacy maps shipped before
+    // Session 3 carry no `entities` field; treat as empty. Each
+    // entry must declare kind + x + y; malformed entries are
+    // skipped with a stderr note so a corrupt file never kills
+    // the load. The kind string is copied (str_dup) because
+    // json_string returns a pointer into the doc buffer that
+    // dies on json_free.
+    ents_idx = json_object_get(doc, root, "entities");
+    if (ents_idx >= 0) {
+        n_ents = json_length(doc, ents_idx);
+        if (n_ents > 0) {
+            m.entities = malloc(n_ents * sizeof(WC1Entity));
+            for (i = 0; i < n_ents; i++) {
+                ent_obj  = json_child(doc, ents_idx, i);
+                kind_idx = json_object_get(doc, ent_obj, "kind");
+                x_idx    = json_object_get(doc, ent_obj, "x");
+                y_idx    = json_object_get(doc, ent_obj, "y");
+                if (kind_idx < 0 || x_idx < 0 || y_idx < 0) {
+                    put_err("wc1_map_load: entity ");
+                    putnum_err(i);
+                    put_err(" malformed, skipped\n");
+                    continue;
+                }
+                kind_s = str_dup(json_string(doc, kind_idx));
+                // Level editor stores positions as cell-centered
+                // floats (gx + 0.5). Reverse the offset so game
+                // consumers see whole-cell indices.
+                ex = json_float(doc, x_idx) - 0.5;
+                ey = json_float(doc, y_idx) - 0.5;
+                e = m.entities + m.entity_count * sizeof(WC1Entity);
+                e.kind = kind_s;
+                e.gx   = ex;
+                e.gy   = ey;
+                // Optional `player` field — defaults to 0 (player
+                // 1, the human side in WC1 campaigns) when missing,
+                // matching the SMS conversion convention.
+                e.player = json_object_get_int(doc, ent_obj, "player", 0);
+                m.entity_count++;
+            }
+        }
+    }
+
+    json_free(doc);
+    return map;
+}
+
+// Clear every tile in the map back to empty (0). Used by the
+// hot-reload callback to wipe the grid before re-loading the
+// edited JSON — without this, deleted tiles linger.
+void wc1_map_clear(map) {
+    auto m: WC1Map;
+    auto gx, gy;
+    m = map;
+    for (gy = 0; gy < m.h; gy++) {
+        for (gx = 0; gx < m.w; gx++) {
+            tile_set(m.tm, gx, gy, 0);
+        }
+    }
+}
+
+// Re-load tile data from a JSON file into an EXISTING map handle
+// (preserving the underlying stbtile so the GPU tileset binding
+// stays valid through the swap). Returns 0 on success, -1 on
+// load failure (in which case the existing tiles stay untouched).
+wc1_map_reload_from(map, path: ptr) {
+    auto (fresh, m): WC1Map;
+    auto gx, gy, w, h;
+
+    fresh = wc1_map_load(path);
+    if (fresh == 0) { return -1; }
+
+    m = map;
+    w = m.w;
+    h = m.h;
+    if (w != fresh.w || h != fresh.h) {
+        wc1_map_free(fresh);
+        return -1;
+    }
+
+    for (gy = 0; gy < h; gy++) {
+        for (gx = 0; gx < w; gx++) {
+            tile_set(m.tm, gx, gy, tile_get(fresh.tm, gx, gy));
+        }
+    }
+    wc1_map_free(fresh);
+    return 0;
+}
+
+// ── Hand-authored test layout (Session 1 only) ──────────────
+
+// Paint a uniform field of grass with a single 2×2 tree cluster
+// at (5, 5). Deliberately minimal — the smoke goal is "tileset
+// renders, positions land where the paint code says" not "looks
+// like a real WC1 map." Real maps come in Session 2 via the SMS
+// converter; until then any artificial pattern just adds visual
+// noise that competes with the actual debugging signal.
+void wc1_map_paint_smoke(map) {
+    auto m: WC1Map;
+    auto gx, gy;
+    m = map;
+
+    // Base layer: solid grass everywhere.
+    for (gy = 0; gy < m.h; gy++) {
+        for (gx = 0; gx < m.w; gx++) {
+            tile_set(m.tm, gx, gy, WC1_T_GRASS);
+        }
+    }
+
+    // Single 2×2 tree cluster at (5, 5) so the visual smoke can
+    // confirm "tile X gets painted at (gx, gy) → tile X appears
+    // at (gx * 16, gy * 16) on screen." Pick a position that's
+    // off-axis so a tile-coords-vs-pixel-coords swap would be
+    // visually obvious.
+    tile_set(m.tm, 5, 5, WC1_T_TREE);
+    tile_set(m.tm, 6, 5, WC1_T_TREE);
+    tile_set(m.tm, 5, 6, WC1_T_TREE);
+    tile_set(m.tm, 6, 6, WC1_T_TREE);
+}

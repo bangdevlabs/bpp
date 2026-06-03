@@ -1,0 +1,100 @@
+// war2_dump — funnel S0: report the entry table of a WC1/WC2 `.WAR` archive.
+//
+// This proves we own the `.WAR` CONTAINER format before writing the chunk
+// decoders (graphics / tilesets / strings). It decodes NO pixels — it only
+// reads the header + the offset table and reports how many chunks the file
+// holds, the magic (which game), and a spot-check of the first and last
+// entries with their computed byte sizes.
+//
+// `.WAR` header (little-endian, DOS/x86 — peek_q reads 2 bytes, peek_h 4):
+//   u32 magic              0x18 = Warcraft 1, 0x19 = Warcraft 2
+//   u16 n_entries          number of chunks in the archive
+//   u16 id                 archive id / flags (MAINDAT.WAR = 1000)
+//   u32 offset[n_entries]  absolute file offset of each chunk
+//
+// The chunk's byte size is offset[i+1] - offset[i]; the last chunk runs to
+// end-of-file. A WC1/WC2 archive places its offset table right after the
+// 8-byte header, so the FIRST offset must equal 8 + n_entries * 4 — that
+// identity is the integrity check this tool prints (PASS / FAIL).
+//
+// Usage:  war2_dump <MAINDAT.WAR | REZDAT.WAR | STRDAT.WAR | DATA.WAR>
+//
+// Verified against the Tides of Darkness DOS DATA/ files: MAINDAT.WAR
+// (magic 0x19, 528 entries, offset[0] = 2120 = 8 + 528*4) and the WC1
+// DATA.WAR (magic 0x18). Reads bytes only — never executes the archive.
+
+main() {
+    auto path: ptr;
+    auto buf, size;
+    auto magic, n_entries, id, off_base;
+    auto first_expected, table_end;
+    auto i, ofs, next, sz, shown, last_ofs;
+
+    if (argc_get() < 2) {
+        putstr_err("usage: war2_dump <ARCHIVE.WAR>\n");
+        return 1;
+    }
+    path = argv_get(1);
+
+    size = 0;
+    buf = file_read_all(path, &size);
+    if (buf == 0) {
+        putstr_err("war2_dump: cannot read ");
+        putstr_err(path);
+        putstr_err("\n");
+        return 1;
+    }
+    if (size < 8) {
+        putstr_err("war2_dump: file too small to hold a .WAR header\n");
+        return 1;
+    }
+
+    // Header: magic is a 4-byte word, n_entries and id are 2-byte halves.
+    magic     = peek_h(buf + 0);   // 4 bytes
+    n_entries = peek_q(buf + 4);   // 2 bytes
+    id        = peek_q(buf + 6);   // 2 bytes
+
+    // The offset table must fit inside the file.
+    table_end = 8 + n_entries * 4;
+    if (size < table_end) {
+        putstr_err("war2_dump: truncated header (offset table doesn't fit)\n");
+        return 1;
+    }
+    off_base = buf + 8;
+
+    putstr("WAR: "); putstr(path); putline();
+    putstr("  file size  : "); putnum(size); putline();
+    putstr("  magic      : "); putnum(magic);
+    putstr(magic == 0x18 ? "  (Warcraft 1)" : magic == 0x19 ? "  (Warcraft 2)"
+                                                            : "  (unknown!)");
+    putline();
+    putstr("  n_entries  : "); putnum(n_entries); putline();
+    putstr("  id / flags : "); putnum(id); putline();
+
+    // Integrity: the first offset must land right after the offset table.
+    first_expected = table_end;
+    ofs = peek_h(off_base + 0);    // 4 bytes
+    putstr("  offset[0]  : "); putnum(ofs);
+    putstr("  expected "); putnum(first_expected);
+    putstr(ofs == first_expected ? "  -> PASS" : "  -> FAIL"); putline();
+
+    // Spot-check the first few chunks with their computed sizes.
+    putstr("  first chunks (idx: offset, size):"); putline();
+    shown = n_entries < 6 ? n_entries : 6;
+    for (i = 0; i < shown; i++) {
+        ofs = peek_h(off_base + i * 4);
+        next = i + 1 < n_entries ? peek_h(off_base + (i + 1) * 4) : size;
+        sz = next - ofs;
+        putstr("    "); putnum(i); putstr(": "); putnum(ofs);
+        putstr(", "); putnum(sz); putline();
+    }
+
+    // Last chunk runs to end-of-file; flag if any offset overshoots the file.
+    last_ofs = peek_h(off_base + (n_entries - 1) * 4);
+    putstr("  last chunk : idx "); putnum(n_entries - 1);
+    putstr(" @ "); putnum(last_ofs);
+    putstr(", size "); putnum(size - last_ofs);
+    putstr(last_ofs <= size ? "  (in bounds)" : "  (OVERSHOOT!)"); putline();
+
+    return 0;
+}

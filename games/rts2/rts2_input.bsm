@@ -1,0 +1,631 @@
+// wc1_input.bsm — selection bookkeeping + click-to-target.
+//
+// Session 4 shipped single-select; Session 6 extends to marquee
+// multi-select. Left-mouse-down + drag paints a screen-space
+// rectangle; on release every unit whose bounding box overlaps
+// the rect joins the selection. A release within ~3 px of the
+// down-point falls back to the Session 4 single-hit-test
+// (click-on-unit selects, click on empty ground deselects),
+// so a slightly jittery click still behaves like a click.
+//
+// Right-click routes the destination to every selected unit via
+// wc1_movement_request_group, which decides flow-field vs A* by
+// group size (>= FLOW_THRESHOLD → one shared flow_compute,
+// else N × A*). The threshold matches the Stress Arc S4 bench.
+//
+// Earned-slot deferrals per Rule 28: shift-extend selection,
+// Ctrl+1/2/3 selection groups, multi-button modifiers, drag-to-
+// rotate camera — land when a concrete consumer asks.
+
+import "stbecs.bsm";
+import "stbinput.bsm";
+import "stbcamera.bsm";
+import "stbtile.bsm";
+import "bpp_io.bsm";
+load   "rts2_anims.bsm";
+load   "rts2_buildings.bsm";    // Building struct + BLDG_STATE_* + wc1_building_at_world
+load   "rts2_gather.bsm";       // S9 — wc1_gather_assign_mine / _tree
+
+// Selection buffer + live count. selected_count == 0 is the
+// "nothing selected" state honored by wc1_hud_render and the
+// right-click branch. Capacity matches the ECS world cap in
+// rts.bpp (512) so a marquee covering every unit — including the
+// full RTS_STRESS arena — cannot overflow.
+const _MAX_SELECTION = 512;
+
+// Selection kind enum. Tracks whether `selected_eids` holds
+// units or a single building, so the right-click handler can
+// skip unit-only paths (move, attack, peasant-assignment) when
+// the player has a building selected, and wc1_hud_render can
+// pick the right selection-ring geometry. v1 disallows mixed
+// selection — clicking a building replaces any unit selection
+// and vice versa.
+const SEL_KIND_NONE     = 0;
+const SEL_KIND_UNITS    = 1;
+const SEL_KIND_BUILDING = 2;
+
+global selected_eids: ptr;
+global selected_count;
+global selected_kind;
+
+// Drag-rectangle state. drag_active flips on press, off on
+// release; while active, drag_x1/drag_y1 track the live mouse so
+// wc1_hud_render can paint the marquee overlay. All four coords
+// are SCREEN pixels — converted to world space at release time.
+global drag_active;
+global drag_x0, drag_y0, drag_x1, drag_y1;
+
+// Displacement (screen pixels) below which a press/release pair
+// is treated as a click rather than a drag. 3 px tolerates a
+// shaky mouse without swallowing real micro-marquees.
+const _DRAG_PX_THRESHOLD = 3;
+
+// S11 — the player id the local user commands is now chosen on the
+// race-select screen and read via wc1_local_player() (defined in
+// rts.bpp, resolved at link time). Selection + command gates compare
+// against it so the user drives whichever faction they picked.
+
+extrn pos_comp, target_comp, peasant_q;
+extrn faction_comp, attack_target_comp, anim_comp;
+extrn cam;
+extrn wc1_debug;        // verbose command logging gate (set by rts.bpp)
+
+// Single-hit scratch for the click branch (unchanged from S4).
+// First-hit-wins via early return in _hit_test_cb.
+static auto _hit_wx, _hit_wy;
+static auto _hit_eid;
+
+// Marquee scratch — world-space rect set before walking peasant_q
+// with _marquee_test_cb. The callback appends every overlapping
+// eid into selected_eids and bumps selected_count.
+static auto _mq_x0, _mq_y0, _mq_x1, _mq_y1;
+
+// Initialize selection state. Call once at startup before the
+// game loop runs.
+wc1_input_init() {
+    selected_eids  = buf_word(_MAX_SELECTION);
+    selected_count = 0;
+    selected_kind  = SEL_KIND_NONE;
+    drag_active    = 0;
+    drag_x0 = 0; drag_y0 = 0; drag_x1 = 0; drag_y1 = 0;
+}
+
+// Per-entity callback for the single-click hit-test. Picks the
+// first unit whose 32 × 32 bbox contains (_hit_wx, _hit_wy);
+// first-hit-wins by spawn order. Z-ordered hit-test is polish
+// for a future session.
+//
+// SELECTION VARIANT — invoked by _unit_at_world_owned. Skips
+// units that don't belong to the human side (player 0). The
+// attack-target hit-test (S7.2 right-click) uses a different
+// callback that scans EVERY unit so the player can click on
+// enemies.
+static void _hit_test_cb(w, eid) {
+    auto p: Pos, x0, y0, fa: Faction, an: Anim;
+    if (_hit_eid >= 0) { return; }
+    // Skip units mid-death-animation — selecting a corpse is a
+    // dead-end interaction.
+    an = ecs_get(w, anim_comp, eid);
+    if (an.state == UNIT_STATE_DYING) { return; }
+    // Selection is human-only — a player commanding orcs is a
+    // future multiplayer / spectator feature (Rule 28). The
+    // attack-target hit-test below uses _hit_test_any_cb which
+    // skips this filter.
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != wc1_local_player()) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    x0 = p.x - 8;
+    y0 = p.y - 16;
+    if (_hit_wx <  x0)      { return; }
+    if (_hit_wy <  y0)      { return; }
+    if (_hit_wx >= x0 + 32) { return; }
+    if (_hit_wy >= y0 + 32) { return; }
+    _hit_eid = eid;
+}
+
+// Hit-test variant that ignores Faction — used by the right-click
+// attack-target lookup so the player can click an enemy unit. The
+// _is_enemy guard upstream filters out friendly hits before
+// treating it as an attack.
+static void _hit_test_any_cb(w, eid) {
+    auto p: Pos, x0, y0, an: Anim;
+    if (_hit_eid >= 0) { return; }
+    // Dying units aren't valid attack-targets — they're already
+    // dropping HP-zero and waiting on the dying timer.
+    an = ecs_get(w, anim_comp, eid);
+    if (an.state == UNIT_STATE_DYING) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    x0 = p.x - 8;
+    y0 = p.y - 16;
+    if (_hit_wx <  x0)      { return; }
+    if (_hit_wy <  y0)      { return; }
+    if (_hit_wx >= x0 + 32) { return; }
+    if (_hit_wy >= y0 + 32) { return; }
+    _hit_eid = eid;
+}
+
+// Per-entity callback for the marquee walk. Appends every PLAYER-
+// OWNED unit whose bbox overlaps the world-space rect. Filters out
+// enemy factions for the same reason _hit_test_cb does — the human
+// player only commands their own side. AABB-overlap: rectangles
+// overlap when neither is strictly to the side / above the other.
+static void _marquee_test_cb(w, eid) {
+    auto p: Pos, ux0, uy0, ux1, uy1, fa: Faction, an: Anim;
+    if (selected_count >= _MAX_SELECTION) { return; }
+    an = ecs_get(w, anim_comp, eid);
+    if (an.state == UNIT_STATE_DYING) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != wc1_local_player()) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    ux0 = p.x - 8;
+    uy0 = p.y - 16;
+    ux1 = ux0 + 32;
+    uy1 = uy0 + 32;
+    if (_mq_x1 < ux0) { return; }
+    if (_mq_y1 < uy0) { return; }
+    if (_mq_x0 > ux1) { return; }
+    if (_mq_y0 > uy1) { return; }
+    selected_eids[selected_count] = eid;
+    selected_count = selected_count + 1;
+}
+
+// Single-hit lookup at world point (wx, wy), HUMAN-OWNED units
+// only. Returns -1 when nothing was hit (or only enemies are
+// under the cursor). Use this for the "selection" click — a
+// player can't select enemies.
+static _unit_at_world_owned(world, wx, wy) {
+    _hit_wx  = wx;
+    _hit_wy  = wy;
+    _hit_eid = -1;
+    ecs_query_each(peasant_q, fn_ptr(_hit_test_cb));
+    return _hit_eid;
+}
+
+// Single-hit lookup at world point (wx, wy), ANY faction. Returns
+// -1 when nothing was hit. Use this for the "attack-target" right-
+// click — the player needs to be able to click on enemies. The
+// upstream _is_enemy guard rejects friendly hits before turning
+// them into attack commands.
+static _unit_at_world_any(world, wx, wy) {
+    _hit_wx  = wx;
+    _hit_wy  = wy;
+    _hit_eid = -1;
+    ecs_query_each(peasant_q, fn_ptr(_hit_test_any_cb));
+    return _hit_eid;
+}
+
+// Resolve a mouse-release: decide click vs drag from the
+// displacement between drag_x0/y0 and drag_x1/y1, then either run
+// the single hit-test (click) or walk peasant_q with the marquee
+// callback (drag). Either way the previous selection is replaced.
+static void _resolve_release(world) {
+    auto sx0, sy0, sx1, sy1, swap, dx, dy, hit, building_eid;
+    auto wx, wy, mx, my;
+    // A new selection always resets the command card back to its root
+    // level and disarms any pending Move / Harvest cursor (WC1: picking
+    // a different unit starts on its top-level command card).
+    wc1_cmd_menu_reset();
+    sx0 = drag_x0;
+    sy0 = drag_y0;
+    sx1 = drag_x1;
+    sy1 = drag_y1;
+    dx = sx1 - sx0;
+    if (dx < 0) { dx = 0 - dx; }
+    dy = sy1 - sy0;
+    if (dy < 0) { dy = 0 - dy; }
+    if (dx <= _DRAG_PX_THRESHOLD && dy <= _DRAG_PX_THRESHOLD) {
+        // Click — single hit-test at the release point. The down
+        // and up points are within _DRAG_PX_THRESHOLD of each
+        // other, so picking either is fine.
+        mx = mouse_x();
+        my = mouse_y();
+        wx = cam_screen_to_world_x(cam, mx);
+        wy = cam_screen_to_world_y(cam, my);
+        // 1. Building hit-test first. Buildings are larger than
+        //    units; clicking on a footprint that overlaps a unit
+        //    sprite should still prefer the building (matches WC1
+        //    behaviour). Single-building selection replaces any
+        //    prior unit selection.
+        building_eid = wc1_building_at_world(world, wx, wy);
+        if (building_eid >= 0) {
+            selected_eids[0] = building_eid;
+            selected_count   = 1;
+            selected_kind    = SEL_KIND_BUILDING;
+            return;
+        }
+        // 2. Unit hit-test. _owned variant skips enemy factions
+        //    (selection is player-only in v1).
+        hit = _unit_at_world_owned(world, wx, wy);
+        if (hit >= 0) {
+            selected_eids[0] = hit;
+            selected_count   = 1;
+            selected_kind    = SEL_KIND_UNITS;
+        } else {
+            selected_count = 0;
+            selected_kind  = SEL_KIND_NONE;
+        }
+        return;
+    }
+    // Drag — normalize the screen rect, project corners to world
+    // pixels via the camera, then walk peasant_q. Marquee selects
+    // units only; buildings are excluded (matches WC1).
+    if (sx0 > sx1) { swap = sx0; sx0 = sx1; sx1 = swap; }
+    if (sy0 > sy1) { swap = sy0; sy0 = sy1; sy1 = swap; }
+    _mq_x0 = cam_screen_to_world_x(cam, sx0);
+    _mq_y0 = cam_screen_to_world_y(cam, sy0);
+    _mq_x1 = cam_screen_to_world_x(cam, sx1);
+    _mq_y1 = cam_screen_to_world_y(cam, sy1);
+    selected_count = 0;
+    ecs_query_each(peasant_q, fn_ptr(_marquee_test_cb));
+    if (selected_count > 0) { selected_kind = SEL_KIND_UNITS; }
+    else                    { selected_kind = SEL_KIND_NONE; }
+}
+
+// Per-frame input dispatch. Reads mouse state via stbinput's
+// edge / level helpers, translates screen coords to world coords
+// through the camera, and routes to selection or target-write.
+// Call AFTER the camera pan tick — clicks resolve against where
+// the camera ended up THIS frame, not last.
+void wc1_input_tick(world) {
+    auto mx, my, wx, wy, gx, gy, i, eid;
+    auto t: Target;
+
+    // Left mouse: edge-triggered press starts the drag; level
+    // mouse_down tracks the moving end; release resolves into
+    // click-or-marquee and clears drag_active.
+    if (mouse_pressed(MOUSE_LEFT) != 0) {
+        // S10.6 — armed cursor: after the player clicked Move or Harvest
+        // on the peasant command card, the next WORLD click is the
+        // command's target (WC1 click-button-then-click-target flow).
+        // A click on the panel falls through so the player can re-pick.
+        if (wc1_cmd_pending() != 0 && mouse_x() >= wc1_panel_w()) {
+            wx = cam_screen_to_world_x(cam, mouse_x());
+            wy = cam_screen_to_world_y(cam, mouse_y());
+            gx = wx / 16;
+            gy = wy / 16;
+            if (gx < 0) { gx = 0; }
+            if (gy < 0) { gy = 0; }
+            if (wc1_cmd_pending() == 1)      { _issue_move(world, gx, gy); }
+            else if (wc1_cmd_pending() == 2) { _cmd_exec_harvest(world, gx, gy); }
+            else                             { _cmd_exec_attack(world, wx, wy, gx, gy); }
+            wc1_cmd_pending_clear();
+            return;
+        }
+        // S10.5 — in placement mode, a world click drops the
+        // foundation (clicks on the command panel still fall through to
+        // the build icons below). Stays in placement on an invalid spot
+        // so the player can reposition.
+        if (wc1_placement_active() != 0 && mouse_x() >= wc1_panel_w()) {
+            wx = cam_screen_to_world_x(cam, mouse_x());
+            wy = cam_screen_to_world_y(cam, mouse_y());
+            wc1_placement_try_at(world, wx / 16, wy / 16);
+            return;
+        }
+        // S10.6 — the left command panel is an opaque overlay. A press
+        // on it (mouse_x < panel width) is consumed here so it never
+        // starts a marquee or deselects whatever is behind it. Route to
+        // the train buttons (building selected) or the build icons
+        // (worker selected).
+        if (mouse_x() < wc1_panel_w()) {
+            // S10.6 — a click on the minimap pans the camera; otherwise
+            // route to the command buttons.
+            if (wc1_minimap_click(mouse_x(), mouse_y()) != 0) {
+                return;
+            }
+            if (selected_count > 0) {
+                if (selected_kind == SEL_KIND_BUILDING) {
+                    wc1_production_try_click(world, selected_eids[0],
+                                             mouse_x(), mouse_y());
+                } else if (selected_kind == SEL_KIND_UNITS) {
+                    // S10.6 — per-unit command card: peasant build/
+                    // harvest, combat units Move / Stop / Attack.
+                    wc1_unit_cmd_click(world, selected_eids[0],
+                                       mouse_x(), mouse_y());
+                }
+            }
+            return;
+        }
+        drag_active = 1;
+        drag_x0 = mouse_x();
+        drag_y0 = mouse_y();
+        drag_x1 = drag_x0;
+        drag_y1 = drag_y0;
+    }
+    if (drag_active != 0 && mouse_down(MOUSE_LEFT) != 0) {
+        drag_x1 = mouse_x();
+        drag_y1 = mouse_y();
+    }
+    if (drag_active != 0 && mouse_released(MOUSE_LEFT) != 0) {
+        drag_x1 = mouse_x();
+        drag_y1 = mouse_y();
+        _resolve_release(world);
+        drag_active = 0;
+    }
+
+    // Right mouse: faction-aware dispatch. Hit-test the click
+    // against buildings first (S8 — assign the first selected
+    // peasant to a CONSTRUCTING foundation), then against units
+    // (attack-target if enemy), then fall through to a move
+    // command on the clicked tile.
+    //
+    // Only fires when the current selection is units — clicking
+    // right while a building is selected is a no-op for v1 (S10
+    // will hook this into the training-queue dispatch when the
+    // command card UI lands).
+    if (mouse_pressed(MOUSE_RIGHT) != 0) {
+        // S10.6 — right-click also cancels an armed Move/Harvest cursor
+        // and closes the build submenu (back to the root command card).
+        wc1_cmd_menu_reset();
+        // S10.5 — right-click cancels an in-progress building placement.
+        if (wc1_placement_active() != 0) {
+            wc1_placement_cancel();
+            return;
+        }
+        if (selected_count > 0 && selected_kind == SEL_KIND_UNITS) {
+            mx = mouse_x();
+            my = mouse_y();
+            wx = cam_screen_to_world_x(cam, mx);
+            wy = cam_screen_to_world_y(cam, my);
+            auto target_eid, building_eid;
+            // 1. Construction-assignment hit-test. Click on a
+            //    friendly CONSTRUCTING building → assign the
+            //    first selected peasant to it. Production tick
+            //    advances progress while peasant is in range.
+            building_eid = wc1_building_at_world(world, wx, wy);
+            if (building_eid >= 0
+                && _building_is_friendly_constructing(world, building_eid) != 0) {
+                wc1_building_assign_peasant(world, building_eid,
+                                            selected_eids[0]);
+                return;
+            }
+            // 1b. S9 — manual delivery. Click on a friendly DONE
+            //     town hall while any selected peasant is carrying
+            //     gold or wood → route every carrying peasant to
+            //     deposit at this hall. Canonical WC1 fallback
+            //     after the player cancelled the auto-deliver mid
+            //     trip and now wants the resource dropped off
+            //     somewhere specific. Non-carrying peasants in the
+            //     selection fall through to the normal move below.
+            if (building_eid >= 0
+                && _building_is_friendly_townhall(world, building_eid) != 0) {
+                auto k, any_carry;
+                any_carry = 0;
+                for (k = 0; k < selected_count; k++) {
+                    if (wc1_gather_carry(world, selected_eids[k]) != CARRY_NONE) {
+                        any_carry = 1;
+                    }
+                }
+                if (any_carry != 0) {
+                    for (k = 0; k < selected_count; k++) {
+                        if (wc1_gather_carry(world, selected_eids[k]) != CARRY_NONE) {
+                            wc1_gather_route_to_deposit(world,
+                                                        selected_eids[k],
+                                                        building_eid);
+                        }
+                    }
+                    return;
+                }
+            }
+            // 1c. S9 — gold mine hit-test. Click on a (neutral)
+            //     gold mine → start the gather cycle for every
+            //     selected peasant. Mines accept multiple workers
+            //     in WC1 canon; we route each peasant
+            //     independently and they share the mine reserve.
+            if (building_eid >= 0
+                && _building_is_gold_mine(world, building_eid) != 0) {
+                auto i;
+                for (i = 0; i < selected_count; i++) {
+                    wc1_gather_assign_mine(world, selected_eids[i],
+                                            building_eid);
+                }
+                return;
+            }
+            // 2. Attack-target hit-test against units of any
+            //    faction; _is_enemy filters friendly hits before
+            //    issuing the attack.
+            target_eid = _unit_at_world_any(world, wx, wy);
+            // No enemy unit under the cursor? Fall back to the building
+            // there (building_eid was hit-tested above for selection /
+            // gold-mine). This is what lets the player attack the enemy
+            // base — combat handles building targets now. _is_enemy filters
+            // the player's own buildings; neutral gold mines never reach
+            // here (the gold-mine branch above returns first).
+            if (target_eid < 0 && building_eid >= 0) {
+                target_eid = building_eid;
+            }
+            if (target_eid >= 0 && _is_enemy(world, target_eid) != 0) {
+                _issue_attack(world, target_eid);
+            } else {
+                gx = wx / 16;
+                gy = wy / 16;
+                if (gx < 0) { gx = 0; }
+                if (gy < 0) { gy = 0; }
+                // 2b. S9 — tree-tile hit-test BEFORE the generic
+                //     move. The pathfinder treats trees as blocked
+                //     so a plain move-to-tree command would fail
+                //     silently; the gather assignment routes to
+                //     an adjacent cell instead.
+                if (_tile_is_tree(gx, gy) != 0) {
+                    auto j;
+                    for (j = 0; j < selected_count; j++) {
+                        wc1_gather_assign_tree(world, selected_eids[j],
+                                                gx, gy);
+                    }
+                    return;
+                }
+                _issue_move(world, gx, gy);
+            }
+        } else if (selected_count > 0 && selected_kind == SEL_KIND_BUILDING) {
+            // S10 — right-click sets the rally point for the selected
+            // producer building; trained units walk here on completion.
+            mx = mouse_x();
+            my = mouse_y();
+            if (mx >= wc1_panel_w()) {        // ignore clicks on the command panel
+                wx = cam_screen_to_world_x(cam, mx);
+                wy = cam_screen_to_world_y(cam, my);
+                gx = wx / 16;
+                gy = wy / 16;
+                if (gx < 0) { gx = 0; }
+                if (gy < 0) { gy = 0; }
+                wc1_production_set_rally(world, selected_eids[0], gx, gy);
+            }
+        }
+    }
+}
+
+// S9 — true if the right-clicked tile holds a tree. The pathfinder
+// treats every cell in the forest cluster as blocked; the gather
+// assignment translates the click into a chop command instead of a
+// doomed move-to-blocked-tile. `wc1_is_forest_tile` is the shared
+// 71..87 cluster predicate exported by wc1_movement.bsm.
+extrn world_map;
+static _tile_is_tree(gx, gy) {
+    return wc1_is_forest_tile(tile_get(world_map, gx, gy));
+}
+
+// S9 — true if `building_eid` is a (neutral) gold mine. Gold mines
+// always carry the BLDG_GOLD_MINE kind regardless of faction —
+// peasants from any side can mine the same node. Depleted mines
+// (state == BLDG_STATE_DEPLETED) reject the gather assignment so
+// the right-click falls through to a regular move.
+static _building_is_gold_mine(world, building_eid) {
+    auto b: Building;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.kind != BLDG_GOLD_MINE)       { return 0; }
+    if (b.state == BLDG_STATE_DEPLETED) { return 0; }
+    return 1;
+}
+
+// S9 — true if `building_eid` is a finished town hall owned by the
+// human player. Drop-off point for the manual delivery branch:
+// right-clicking such a hall while the selected peasants carry
+// gold/wood routes them through `wc1_gather_route_to_deposit`.
+// CONSTRUCTING town halls go to the construction-assign path
+// instead (the worker chops at the foundation, not delivers to it).
+static _building_is_friendly_townhall(world, building_eid) {
+    auto b: Building, fa: Faction;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.kind != BLDG_TOWN_HALL)   { return 0; }
+    if (b.state != BLDG_STATE_DONE) { return 0; }
+    fa = ecs_get(world, faction_comp, building_eid);
+    if (fa.player != wc1_local_player()) { return 0; }
+    return 1;
+}
+
+// Return 1 if `building_eid` is a CONSTRUCTING building owned by
+// the human player — the gate the right-click construction
+// assignment uses before flipping the building's assignment slot.
+// DONE buildings + enemy foundations both skip the assignment
+// branch (clicking an enemy building should still fall through
+// to move-or-attack; clicking a completed one is a no-op for v1
+// until production UI lands in S10).
+static _building_is_friendly_constructing(world, building_eid) {
+    auto b: Building, fa: Faction;
+    b = ecs_get(world, building_comp, building_eid);
+    if (b.state == BLDG_STATE_DONE) { return 0; }
+    fa = ecs_get(world, faction_comp, building_eid);
+    if (fa.player != wc1_local_player()) { return 0; }
+    return 1;
+}
+
+// True if `target_eid` is held by a faction other than the FIRST
+// selected unit's. Mixed-faction selection (only possible via
+// marquee in v1) resolves against the first entry; future
+// selection-filter polish would prevent that case at marquee
+// time.
+static _is_enemy(world, target_eid) {
+    auto (fs, ft): Faction;
+    fs = ecs_get(world, faction_comp, selected_eids[0]);
+    ft = ecs_get(world, faction_comp, target_eid);
+    return fs.player != ft.player;
+}
+
+// Write the attack-target on every selected unit so S7.3's combat
+// tick can engage in lockstep. Clears any in-flight move target so
+// the units don't keep walking past the enemy. Movement toward the
+// target is wired in S7.3 (the combat tick will path each unit to
+// weapon range using the existing flow / A* dispatch).
+static void _issue_attack(world, target_eid) {
+    auto i, eid, at: AttackTarget, t: Target;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = target_eid;
+        t = ecs_get(world, target_comp, eid);
+        t.gx = -1;
+        t.gy = -1;
+    }
+    // Debug — confirms the hit-test fired. Replaced by combat
+    // resolution in S7.3.
+    if (wc1_debug != 0) {
+        putstr("attack target = ");
+        putnum(target_eid);
+        putstr("  N=");
+        putnum(selected_count);
+        putstr("\n");
+    }
+}
+
+// Move command — clears any in-flight attack-target on every
+// selected unit and dispatches the group movement (S6 behavior).
+static void _issue_move(world, gx, gy) {
+    auto i, eid, t: Target, at: AttackTarget;
+    for (i = 0; i < selected_count; i++) {
+        eid = selected_eids[i];
+        t = ecs_get(world, target_comp, eid);
+        t.gx = gx;
+        t.gy = gy;
+        at = ecs_get(world, attack_target_comp, eid);
+        at.eid = -1;
+        // S9 — clear any pending gather. A bare move command
+        // cancels the gold / wood loop so the peasant goes where
+        // the player pointed instead of resuming the cycle.
+        wc1_gather_clear(world, eid);
+    }
+    wc1_movement_request_group(world, selected_eids,
+                               selected_count, gx, gy);
+    if (wc1_debug != 0) {
+        putstr("target = (");
+        putnum(gx);
+        putstr(", ");
+        putnum(gy);
+        putstr(")  N=");
+        putnum(selected_count);
+        putstr("\n");
+    }
+}
+
+// S10.6 — execute a Harvest command (armed via the peasant command
+// card) at world tile (gx, gy): a tree tile → chop; a gold mine under
+// the tile → mine. Routes every selected unit, matching the right-click
+// gather behaviour. No tree / mine at the tile → nothing happens (the
+// click already consumed the armed cursor).
+static void _cmd_exec_harvest(world, gx, gy) {
+    auto i, beid;
+    if (_tile_is_tree(gx, gy) != 0) {
+        for (i = 0; i < selected_count; i++) {
+            wc1_gather_assign_tree(world, selected_eids[i], gx, gy);
+        }
+        return;
+    }
+    beid = wc1_building_at_world(world, gx * 16 + 8, gy * 16 + 8);
+    if (beid >= 0 && _building_is_gold_mine(world, beid) != 0) {
+        for (i = 0; i < selected_count; i++) {
+            wc1_gather_assign_mine(world, selected_eids[i], beid);
+        }
+    }
+}
+
+// S10.6 — execute an Attack command (armed via a combat unit's command
+// card) at world point (wx, wy) / tile (gx, gy): an enemy unit under the
+// cursor → attack it; empty ground → move there (attack-move degrades to
+// a plain move in v1). Mirrors the right-click combat dispatch.
+static void _cmd_exec_attack(world, wx, wy, gx, gy) {
+    auto teid;
+    teid = _unit_at_world_any(world, wx, wy);
+    if (teid >= 0 && _is_enemy(world, teid) != 0) {
+        _issue_attack(world, teid);
+    } else {
+        _issue_move(world, gx, gy);
+    }
+}
