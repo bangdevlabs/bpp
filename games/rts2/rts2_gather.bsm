@@ -152,7 +152,8 @@ const _WC1_FELLED_TILE_ID  = 82;
 // Map-aligned grid sized to the level dims; one word per tile holds
 // the remaining wood. Lazy-allocated on first chop assignment so
 // games that never harvest pay nothing.
-static auto _tree_wood;            // stbgrid handle
+static auto _tree_wood;            // stbgrid handle — remaining wood per tile
+static auto _tree_claim;           // stbgrid handle — peasant_eid+1 chopping each tile (0 = free)
 static auto _tree_grid_w;
 static auto _tree_grid_h;
 
@@ -162,7 +163,37 @@ static void _ensure_tree_grid() {
     tm = world_map;
     _tree_grid_w = tm.w;
     _tree_grid_h = tm.h;
-    _tree_wood = grid_new_word(tm.w, tm.h);
+    _tree_wood  = grid_new_word(tm.w, tm.h);
+    _tree_claim = grid_new_word(tm.w, tm.h);
+    return;
+}
+
+// Per-tree-tile claim so multiple choppers spread across the grove instead of
+// piling onto one tile (WC2: one peasant per tree). Stores peasant_eid+1; 0 is
+// free. A claim by a now-dead peasant reads as free (validated at pick time).
+static _tree_claim_get(gx, gy) {
+    if (gx < 0 || gy < 0 || gx >= _tree_grid_w || gy >= _tree_grid_h) { return 0; }
+    return grid_get(_tree_claim, gx, gy);
+}
+
+static void _tree_claim_set(gx, gy, v) {
+    if (gx < 0 || gy < 0 || gx >= _tree_grid_w || gy >= _tree_grid_h) { return; }
+    grid_set(_tree_claim, gx, gy, v);
+    return;
+}
+
+// Release the tree this peasant currently claims (if any), so the tile frees
+// for another chopper. Safe to call when the peasant holds no tree claim.
+static void _tree_release(world, peasant_eid) {
+    auto gt: Gather, t_gx, t_gy;
+    if (_tree_claim == 0) { return; }
+    gt = ecs_get(world, gather_comp, peasant_eid);
+    if (gt.target_kind != GATHER_TARGET_TREE) { return; }
+    t_gy = gt.target / _tree_grid_w;
+    t_gx = gt.target - t_gy * _tree_grid_w;
+    if (_tree_claim_get(t_gx, t_gy) == peasant_eid + 1) {
+        _tree_claim_set(t_gx, t_gy, 0);
+    }
     return;
 }
 
@@ -292,6 +323,7 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
     _ensure_tree_grid();
     if (_tree_wood_get(tile_gx, tile_gy) <= 0) { return 0; }
     _reset_anim_if_gathering(world, peasant_eid);
+    _tree_release(world, peasant_eid);   // drop any tree this worker held before
     gt = ecs_get(world, gather_comp, peasant_eid);
     gt.target_kind  = GATHER_TARGET_TREE;
     gt.target       = tile_gy * _tree_grid_w + tile_gx;
@@ -312,6 +344,7 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
         gt.target_kind = GATHER_TARGET_NONE;
         return 0;
     }
+    _tree_claim_set(tile_gx, tile_gy, peasant_eid + 1);   // reserve this tree
     wc1_movement_request(world, peasant_eid, walk_gx, walk_gy);
     return 1;
 }
@@ -323,7 +356,7 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
 wc1_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
     auto ntx, nty;
     ntx = 0; nty = 0;
-    if (_nearest_tree(ref_gx, ref_gy, &ntx, &nty) == 0) { return 0; }
+    if (_nearest_tree(world, ref_gx, ref_gy, peasant_eid, &ntx, &nty) == 0) { return 0; }
     return wc1_gather_assign_tree(world, peasant_eid, ntx, nty);
 }
 
@@ -379,16 +412,20 @@ static _tile_open(tm: Tilemap, w, h, x, y) {
     return wc1_is_forest_tile(tile_get(tm, x, y)) == 0;
 }
 
-static _nearest_tree(gx, gy, out_x, out_y) {
-    auto tm: Tilemap, w, h, r, dx, dy, x, y;
+static _nearest_tree(world, gx, gy, self_eid, out_x, out_y) {
+    auto tm: Tilemap, w, h, r, dx, dy, x, y, claimer;
+    auto fb_x, fb_y, have_fb;
     tm = world_map;
     w = tm.w; h = tm.h;
+    fb_x = 0; fb_y = 0; have_fb = 0;
     r = 1;
     // Wide enough that a corner base finds the forest (forest1 is 64×64;
     // the nearest grove can be 20-30 tiles away). Accept only an EDGE
     // tree — one with an open neighbour the chopper can stand on. Now
     // that the whole 71-94 cluster blocks, an interior tile has no
-    // reachable chop spot and would leave the worker stuck.
+    // reachable chop spot and would leave the worker stuck. Prefer an
+    // UNCLAIMED tree so a batch of choppers spreads across the grove; fall
+    // back to the nearest claimed one only if every reachable tree is taken.
     while (r <= 40) {
         dy = 0 - r;
         while (dy <= r) {
@@ -402,8 +439,15 @@ static _nearest_tree(gx, gy, out_x, out_y) {
                          || _tile_open(tm, w, h, x + 1, y) != 0
                          || _tile_open(tm, w, h, x, y - 1) != 0
                          || _tile_open(tm, w, h, x, y + 1) != 0)) {
-                        *out_x = x; *out_y = y;
-                        return 1;
+                        claimer = _tree_claim_get(x, y);
+                        // Free, mine, or held by a dead peasant -> take it.
+                        if (claimer == 0 || claimer == self_eid + 1
+                            || ecs_alive_at(world, claimer - 1) == 0) {
+                            *out_x = x; *out_y = y;
+                            return 1;
+                        }
+                        // Held by a live other chopper -> remember as fallback.
+                        if (have_fb == 0) { fb_x = x; fb_y = y; have_fb = 1; }
                     }
                 }
                 dx = dx + 1;
@@ -412,6 +456,7 @@ static _nearest_tree(gx, gy, out_x, out_y) {
         }
         r = r + 1;
     }
+    if (have_fb != 0) { *out_x = fb_x; *out_y = fb_y; return 1; }
     return 0;
 }
 
@@ -424,6 +469,7 @@ static _nearest_tree(gx, gy, out_x, out_y) {
 void wc1_gather_clear(world, peasant_eid) {
     auto gt: Gather;
     _reset_anim_if_gathering(world, peasant_eid);
+    _tree_release(world, peasant_eid);   // free the tree this worker reserved
     gt = ecs_get(world, gather_comp, peasant_eid);
     gt.target_kind = GATHER_TARGET_NONE;
     gt.progress_ms = 0;
@@ -748,7 +794,7 @@ static void _gather_visit(w, eid) {
             if (wc1_is_forest_tile(tile_get(world_map, tile_gx, tile_gy)) == 0) {
                 auto ntx, nty;
                 ntx = 0; nty = 0;
-                if (_nearest_tree(tile_gx, tile_gy, &ntx, &nty) != 0) {
+                if (_nearest_tree(w, tile_gx, tile_gy, eid, &ntx, &nty) != 0) {
                     wc1_gather_assign_tree(w, eid, ntx, nty);
                     return;
                 }
