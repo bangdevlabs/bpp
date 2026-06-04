@@ -152,6 +152,22 @@ done <<'TABLE'
 119 2  bldg_neutral_119
 TABLE
 
+# --- WC1-roster -> WC2-sprite aliases. The game loads the WC1 kind names
+# (cleric/raider/...), but the sprites are their WC2 equivalents. Copy the
+# source sidecar (it carries the foot anchor + directional frameTags) under
+# the alias name; the JSON's image field already points at the shared PNG,
+# so no pixels are duplicated. ---
+cp "$OUT/ogre.json"         "$OUT/raider.json"
+cp "$OUT/axethrower.json"   "$OUT/spearman.json"
+cp "$OUT/mage.json"         "$OUT/cleric.json"
+cp "$OUT/mage.json"         "$OUT/conjurer.json"
+cp "$OUT/mage.json"         "$OUT/medivh.json"
+cp "$OUT/death_knight.json" "$OUT/necrolyte.json"
+cp "$OUT/death_knight.json" "$OUT/warlock.json"
+cp "$OUT/ballista.json"     "$OUT/human_catapult.json"
+cp "$OUT/catapult.json"     "$OUT/orc_catapult.json"
+cp "$OUT/knight.json"       "$OUT/lothar.json"
+
 # --- named buildings (palette 2 summer; identified visually, idx from
 # war2_maindat_index.md). Orc mirrors human at idx+1. Construction uses the
 # generic land construction-site sprite (idx 252) aliased per building. ---
