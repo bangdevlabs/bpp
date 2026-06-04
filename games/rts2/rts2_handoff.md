@@ -13,6 +13,12 @@ This document is the canonical anchor for the multi-session arc.
 Each session below is sized to fit one focused work block; every
 session ships visible value and leaves the tree green.
 
+**AI port spec:** the computer-player AI is being ported point-by-point
+from the Stratagus engine — full behavior enumeration + rts2 status +
+port order in [`docs/plans/wc2_ai_port.md`](../../docs/plans/wc2_ai_port.md).
+We reimplement the *algorithms* in B++ (no Stratagus dependency, per the
+zero-non-B++ rule above).
+
 **Scope clarifier (2026-05-12):** the original WC1 numbers are a
 starting point, not a spec. Where war1gus / DOSBox mechanics make
 the game more fun, we copy them. Where they don't (or where we
