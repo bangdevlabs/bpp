@@ -58,36 +58,46 @@ extrn wc1_debug;        // verbose AI state / heartbeat logging gate (rts.bpp)
 // in rts.bpp (the entry); they're in the compilation's global function
 // table, so they resolve at link time — called directly below.
 
-// ── Tunables ───────────────────────────────────────────────────
-const _AI_TICK_MS     = 200;     // 5 Hz strategic step
-const _AI_PEON_CAP    = 4;       // 1 chopper + up to 3 gold miners. The mine
-                                 // capacity gate (_WC1_MINE_MAX_ON_BOARD = 5)
-                                 // lets several peons share one mine now, so
-                                 // gold income scales past the old 1-miner cap.
-const _AI_MIN_CHOPPERS = 1;      // keep at least one peon on wood (buildings +
-                                 // some units cost wood); the rest mine gold.
-const _AI_ARMY_TARGET = 6;       // military to mass before pushing the enemy base
-                                 // (WC2-sized force; reachable now that the AI
-                                 // builds supply farms on demand instead of
-                                 // capping at one).
-const _AI_DEFEND_RANGE_SQ = 147456;  // (12 tiles * 32 px)^2 — enemy within this of
-                                    // our town hall triggers the defense response.
-const _AI_SCAN_MAX    = 64;      // scratch buffer capacity
-const _AI_DIST_MAX    = 0x7FFFFFFF;
+// ── AI script opcodes (Stratagus land_attack model) ─────────────
+// The AI runs a build-order TAPE: a flat array of {op, a, b, c} steps
+// executed one per strategic tick, advancing a program counter (_ai_pc).
+// Non-blocking steps (WORKERS / FORCE / LOOP) advance immediately;
+// blocking steps (BUILD / WAIT / ATTACK) stay on the same step until
+// their condition holds. The economy (worker target + supply farms) and
+// home defence run EVERY tick underneath the script — the tape only sets
+// strategic targets (how many workers, the army composition) and launches
+// attack waves, mirroring wargus's AiSet / AiNeed / AiForce / AiAttack.
+const AI_WORKERS = 1;    // a = desired peon count (economy trains toward it)
+const AI_BUILD   = 2;    // a = BLDG_* kind — start one; block until it exists
+const AI_WAIT    = 3;    // a = BLDG_* kind — block until one is completed
+const AI_FORCE   = 4;    // a/b/c = melee / ranged / cavalry target counts
+const AI_ATTACK  = 5;    // block until the force is massed, then launch it
+const AI_LOOP    = 6;    // a = step index to jump back to (endless waves)
 
-// FSM states.
-const _AI_ECON    = 0;
-const _AI_BUILDUP = 1;
-const _AI_ATTACK  = 2;
+// ── Tunables ───────────────────────────────────────────────────
+const _AI_TICK_MS      = 200;    // 5 Hz strategic step
+const _AI_MIN_CHOPPERS = 1;      // keep >= 1 peon on wood; the rest mine gold
+const _AI_DEFEND_RANGE_SQ = 147456;  // (12 tiles * 32 px)^2 — home-defence trigger
+const _AI_SCAN_MAX     = 64;     // scratch buffer capacity
+const _AI_DIST_MAX     = 0x7FFFFFFF;
+const _AI_NKINDS       = 16;     // BuildingDef kind range (per-kind scan arrays)
 
 // ── Per-AI state (one enemy in v1) ─────────────────────────────
 global _ai_active;        // 0 until wc1_ai_init runs
 global _ai_player;        // the player id this brain controls
 global _ai_enemy;         // who it attacks (the local user)
-global _ai_state;         // _AI_ECON / _AI_BUILDUP / _AI_ATTACK
 global _ai_accum_ms;      // 5 Hz tick accumulator
-global _ai_builder_eid;   // worker tasked to raise the barracks (-1 = none)
+global _ai_builder_eid;   // worker pulled to raise a building this tick (-1 = none)
 global _ai_hb;            // diagnostic heartbeat counter (temporary)
+
+// Build-order tape + interpreter state.
+static auto _ai_script;        // buf_word, 4 words per step: op, a, b, c
+static auto _ai_script_n;      // number of steps emitted
+static auto _ai_pc;            // current step index
+static auto _ai_worker_target; // desired peon count (AI_WORKERS sets it)
+static auto _ai_force_melee;   // army composition targets (AI_FORCE sets them)
+static auto _ai_force_ranged;
+static auto _ai_force_cav;
 
 // Scratch filled by the scan callbacks (ecs_query_each can't pass extra
 // args, so the walk target + outputs live at file scope).
@@ -95,12 +105,12 @@ static auto _ai_scan_player;
 static auto _ai_peons, _ai_peon_n;
 static auto _ai_idle,  _ai_idle_n;
 static auto _ai_army,  _ai_army_n;
+static auto _ai_melee_n, _ai_ranged_n, _ai_cav_n;  // standing army by role
 static auto _ai_gold_n;            // peons currently gathering gold
 static auto _ai_wood_n;            // peons currently chopping wood
-static auto _ai_th_eid, _ai_barracks_eid, _ai_barracks_done;
-static auto _ai_farm_eid, _ai_farm_done;
-static auto _ai_stable_eid, _ai_stable_done;
-static auto _ai_train_flip;   // alternates barracks melee / ranged each train
+static auto _ai_th_eid, _ai_barracks_eid, _ai_stable_eid;
+static auto _ai_bldg_count;        // buf_word[_AI_NKINDS] — owned count per kind
+static auto _ai_bldg_done;         // buf_word[_AI_NKINDS] — completed count per kind
 static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
 static auto _ai_enemy_hq, _ai_enemy_tgt;
 
@@ -110,13 +120,56 @@ static auto _ai_enemy_hq, _ai_enemy_tgt;
 void wc1_ai_init(world, ai_player, enemy_player) {
     _ai_player      = ai_player;
     _ai_enemy       = enemy_player;
-    _ai_state       = _AI_ECON;
     _ai_accum_ms    = 0;
     _ai_builder_eid = 0 - 1;
+    _ai_pc          = 0;
+    _ai_worker_target = 1;            // the script bumps this immediately
+    _ai_force_melee = 0; _ai_force_ranged = 0; _ai_force_cav = 0;
     _ai_peons = buf_word(_AI_SCAN_MAX);
     _ai_idle  = buf_word(_AI_SCAN_MAX);
     _ai_army  = buf_word(_AI_SCAN_MAX);
+    _ai_bldg_count = buf_word(_AI_NKINDS);
+    _ai_bldg_done  = buf_word(_AI_NKINDS);
+    _ai_script_init();
     _ai_active = 1;
+    return;
+}
+
+// Build the strategic tape. This is the wargus `land_attack.lua` opening,
+// scaled to our roster + small maps: secure the economy, harass early,
+// then send escalating waves. Editing this list re-tunes the whole AI —
+// the eventual bangscript AI will generate exactly this shape from a DSL.
+static void _ai_emit(op, a, b, c) {
+    auto base;
+    base = _ai_script_n * 4;
+    _ai_script[base]     = op;
+    _ai_script[base + 1] = a;
+    _ai_script[base + 2] = b;
+    _ai_script[base + 3] = c;
+    _ai_script_n = _ai_script_n + 1;
+}
+
+static void _ai_script_init() {
+    _ai_script   = buf_word(4 * 40);
+    _ai_script_n = 0;
+    //                op          a              b  c     // step
+    _ai_emit(AI_WORKERS, 4,             0, 0);   // 0  grow to 4 peons
+    _ai_emit(AI_BUILD,   BLDG_FARM,     0, 0);   // 1  supply farm (food 4 -> 8)
+    _ai_emit(AI_BUILD,   BLDG_BARRACKS, 0, 0);   // 2  barracks
+    _ai_emit(AI_WAIT,    BLDG_BARRACKS, 0, 0);   // 3  wait for it
+    _ai_emit(AI_WORKERS, 6,             0, 0);   // 4  grow to 6 peons
+    _ai_emit(AI_FORCE,   1,             0, 0);   // 5  fast & furious: 1 melee
+    _ai_emit(AI_ATTACK,  0,             0, 0);   // 6  harass
+    _ai_emit(AI_FORCE,   4,             0, 0);   // 7  second attack: 4 melee
+    _ai_emit(AI_ATTACK,  0,             0, 0);   // 8
+    _ai_emit(AI_WORKERS, 8,             0, 0);   // 9  grow to 8 peons
+    _ai_emit(AI_BUILD,   BLDG_STABLE,   0, 0);   // 10 stable (tier-2 cavalry)
+    _ai_emit(AI_WAIT,    BLDG_STABLE,   0, 0);   // 11
+    _ai_emit(AI_FORCE,   6,             2, 0);   // 12 serious: 6 melee + 2 ranged
+    _ai_emit(AI_ATTACK,  0,             0, 0);   // 13
+    _ai_emit(AI_FORCE,   6,             4, 2);   // 14 combined arms + cavalry
+    _ai_emit(AI_ATTACK,  0,             0, 0);   // 15
+    _ai_emit(AI_LOOP,    12,            0, 0);   // 16 cycle the two big waves
     return;
 }
 
@@ -148,43 +201,50 @@ static void _ai_unit_visit(w, eid) {
         }
     } else {
         if (_ai_army_n < _AI_SCAN_MAX) { _ai_army[_ai_army_n] = eid; _ai_army_n = _ai_army_n + 1; }
+        // Classify into the three force roles the script targets. Casters
+        // and siege fall outside the buckets (not in the build order yet)
+        // but still count in _ai_army_n for the launch + heartbeat.
+        switch (u.kind) {
+            UNIT_FOOTMAN, UNIT_GRUNT    { _ai_melee_n  = _ai_melee_n  + 1; }
+            UNIT_ARCHER, UNIT_SPEARMAN  { _ai_ranged_n = _ai_ranged_n + 1; }
+            UNIT_KNIGHT, UNIT_RAIDER    { _ai_cav_n    = _ai_cav_n    + 1; }
+            else { }
+        }
     }
     return;
 }
 
 static void _ai_scan_units(world) {
     _ai_peon_n = 0; _ai_idle_n = 0; _ai_army_n = 0; _ai_gold_n = 0; _ai_wood_n = 0;
+    _ai_melee_n = 0; _ai_ranged_n = 0; _ai_cav_n = 0;
     _ai_scan_player = _ai_player;
     ecs_query_each(peasant_q, fn_ptr(_ai_unit_visit));
     return;
 }
 
-// Find the AI's completed town hall + its barracks (any state).
+// Tally the AI's buildings into the per-kind count / done arrays the script
+// interpreter reads (BUILD checks count, WAIT checks done), and cache the
+// town-hall / barracks / stable eids the placement + training paths need.
 static void _ai_bldg_visit(w, eid) {
     auto fa: Faction, b: Building;
     fa = ecs_get(w, faction_comp, eid);
     if (fa.player != _ai_scan_player) { return; }
     b = ecs_get(w, building_comp, eid);
-    if (b.kind == BLDG_TOWN_HALL && b.state == BLDG_STATE_DONE) { _ai_th_eid = eid; }
-    if (b.kind == BLDG_FARM) {
-        _ai_farm_eid = eid;
-        if (b.state == BLDG_STATE_DONE) { _ai_farm_done = 1; }
-    }
-    if (b.kind == BLDG_BARRACKS) {
-        _ai_barracks_eid = eid;
-        if (b.state == BLDG_STATE_DONE) { _ai_barracks_done = 1; }
-    }
-    if (b.kind == BLDG_STABLE) {
-        _ai_stable_eid = eid;
-        if (b.state == BLDG_STATE_DONE) { _ai_stable_done = 1; }
+    if (b.kind < 0 || b.kind >= _AI_NKINDS) { return; }
+    _ai_bldg_count[b.kind] = _ai_bldg_count[b.kind] + 1;
+    if (b.state == BLDG_STATE_DONE) {
+        _ai_bldg_done[b.kind] = _ai_bldg_done[b.kind] + 1;
+        if (b.kind == BLDG_TOWN_HALL) { _ai_th_eid       = eid; }
+        if (b.kind == BLDG_BARRACKS)  { _ai_barracks_eid = eid; }
+        if (b.kind == BLDG_STABLE)    { _ai_stable_eid   = eid; }
     }
     return;
 }
 
 static void _ai_scan_buildings(world) {
-    _ai_th_eid = 0 - 1; _ai_barracks_eid = 0 - 1; _ai_barracks_done = 0;
-    _ai_farm_eid = 0 - 1; _ai_farm_done = 0;
-    _ai_stable_eid = 0 - 1; _ai_stable_done = 0;
+    auto i;
+    _ai_th_eid = 0 - 1; _ai_barracks_eid = 0 - 1; _ai_stable_eid = 0 - 1;
+    for (i = 0; i < _AI_NKINDS; i++) { _ai_bldg_count[i] = 0; _ai_bldg_done[i] = 0; }
     _ai_scan_player = _ai_player;
     ecs_query_each(building_q, fn_ptr(_ai_bldg_visit));
     return;
@@ -333,14 +393,76 @@ static void _ai_launch_attack(world) {
     return;
 }
 
-static void _ai_set_state(new_state) {
-    if (new_state == _ai_state) { return; }
-    _ai_state = new_state;
-    if (wc1_debug != 0) {
-        putstr("[ai] player="); putnum(_ai_player);
-        putstr(" -> state="); putnum(new_state);
-        putstr(" (peons="); putnum(_ai_peon_n);
-        putstr(" army="); putnum(_ai_army_n); putstr(")\n");
+// Train the standing army toward the current force composition (set by the
+// last AI_FORCE step). The barracks fills melee first, then ranged; the
+// stable adds cavalry. One enqueue per building per tick, gated on
+// affordability + the one-in-flight queue, so output paces the economy.
+static void _ai_train_army(world) {
+    auto menu, n;
+    menu = buf_word(8);
+    if (_ai_barracks_eid >= 0) {
+        n = wc1_train_menu(BLDG_BARRACKS, _ai_player, menu);
+        if (n > 0 && _ai_melee_n < _ai_force_melee) {
+            _ai_try_train(world, _ai_barracks_eid, menu[0], _ai_force_melee, _ai_melee_n);
+        } else if (n > 1 && _ai_ranged_n < _ai_force_ranged) {
+            _ai_try_train(world, _ai_barracks_eid, menu[1], _ai_force_ranged, _ai_ranged_n);
+        }
+    }
+    if (_ai_stable_eid >= 0 && _ai_cav_n < _ai_force_cav) {
+        n = wc1_train_menu(BLDG_STABLE, _ai_player, menu);
+        if (n > 0) {
+            _ai_try_train(world, _ai_stable_eid, menu[0], _ai_force_cav, _ai_cav_n);
+        }
+    }
+    free(menu);
+    return;
+}
+
+// Execute the current build-order step (the strategic spine). Non-blocking
+// ops (WORKERS / FORCE / LOOP) advance _ai_pc immediately; blocking ops
+// (BUILD / WAIT / ATTACK) hold the step until satisfied. The economy + army
+// production run every tick to FULFILL the targets this sets.
+static void _ai_run_script(world) {
+    auto base, op, a;
+    if (_ai_pc >= _ai_script_n) { return; }
+    base = _ai_pc * 4;
+    op = _ai_script[base];
+    a  = _ai_script[base + 1];
+    switch (op) {
+        AI_WORKERS {
+            _ai_worker_target = a;
+            _ai_pc = _ai_pc + 1;
+        }
+        AI_BUILD {
+            // Hold until one of kind `a` exists (started or done); retry the
+            // placement each tick until the economy can afford it.
+            if (_ai_bldg_count[a] > 0) { _ai_pc = _ai_pc + 1; }
+            else { _ai_build(world, a); }
+        }
+        AI_WAIT {
+            if (_ai_bldg_done[a] > 0) { _ai_pc = _ai_pc + 1; }
+        }
+        AI_FORCE {
+            _ai_force_melee  = a;
+            _ai_force_ranged = _ai_script[base + 2];
+            _ai_force_cav    = _ai_script[base + 3];
+            _ai_pc = _ai_pc + 1;
+        }
+        AI_ATTACK {
+            // Hold until the force is massed, then send it. Survivors keep
+            // pressing; if losses drop us back under target a later wave
+            // re-masses before launching again.
+            if (_ai_melee_n   >= _ai_force_melee
+                && _ai_ranged_n >= _ai_force_ranged
+                && _ai_cav_n    >= _ai_force_cav) {
+                _ai_launch_attack(world);
+                _ai_pc = _ai_pc + 1;
+            }
+        }
+        AI_LOOP {
+            _ai_pc = a;
+        }
+        else { _ai_pc = _ai_pc + 1; }
     }
     return;
 }
@@ -403,104 +525,57 @@ static void _ai_heartbeat(mine) {
     if (_ai_hb < 25) { return; }
     _ai_hb = 0;
     if (wc1_debug != 0) {
-        putstr("[ai] hb peon="); putnum(_ai_peon_n);
-        putstr(" idle="); putnum(_ai_idle_n);
-        putstr(" gold_n="); putnum(_ai_gold_n);
-        putstr(" wood_n="); putnum(_ai_wood_n);
-        putstr(" army="); putnum(_ai_army_n);
+        putstr("[ai] pc="); putnum(_ai_pc);
+        putstr(" peon="); putnum(_ai_peon_n); putstr("/"); putnum(_ai_worker_target);
+        putstr(" army="); putnum(_ai_melee_n); putstr("m");
+        putnum(_ai_ranged_n); putstr("r"); putnum(_ai_cav_n); putstr("c");
+        putstr(" force="); putnum(_ai_force_melee); putstr("/");
+        putnum(_ai_force_ranged); putstr("/"); putnum(_ai_force_cav);
         putstr(" gold="); putnum(wc1_resources_gold(_ai_player));
-        putstr(" wood="); putnum(wc1_resources_wood(_ai_player));
-        putstr(" mine="); putnum(mine);
-        putstr(" farm="); putnum(_ai_farm_eid);
-        putstr(" brk="); putnum(_ai_barracks_eid); putstr("\n");
+        putstr(" brk="); putnum(_ai_bldg_done[BLDG_BARRACKS]);
+        putstr(" stb="); putnum(_ai_bldg_done[BLDG_STABLE]); putstr("\n");
     }
     return;
 }
 
-// One strategic step (runs at 5 Hz).
+// One strategic step (runs at 5 Hz). The build-order tape drives strategy;
+// the economy, army production and defence run every tick to fulfil the
+// targets it sets and to react to threats between scripted steps.
 static void _ai_think(world) {
-    auto th_p: Pos, mine, menu, n, builder, pick;
+    auto th_p: Pos, mine;
     _ai_scan_buildings(world);
     if (_ai_th_eid < 0) { return; }                    // no hall left -> defeated
     _ai_scan_units(world);
     th_p = ecs_get(world, pos_comp, _ai_th_eid);
     mine = _ai_find_mine(world, th_p.x, th_p.y);
 
-    // WC2 build order (always — never gated on a phase, so the AI can't
-    // stall in ECON forever). Priority chain, one building started per
-    // tick; _ai_build pulls a worker (idle preferred, else off mining) and
-    // we exclude it from the worker pass below so it isn't re-sent to
-    // gather this tick:
-    //   1. first farm   — raises supply 4 -> 8 so the early army fits.
-    //   2. barracks     — unlocks melee + ranged military.
-    //   3. supply farm  — whenever food used is within 2 of the cap, build
-    //                     another farm so the army is never supply-blocked
-    //                     (Stratagus AiNeedSupply). This is what lets the
-    //                     WC2 army actually reach _AI_ARMY_TARGET.
-    //   4. stable       — once the barracks stands, a stable unlocks the
-    //                     tier-2 mounted unit (knight / ogre-raider).
-    builder = 0 - 1;
-    if (_ai_farm_eid < 0) {
-        if (_ai_build(world, BLDG_FARM) != 0)         { builder = _ai_builder_eid; }
-    } else if (_ai_barracks_eid < 0) {
-        if (_ai_build(world, BLDG_BARRACKS) != 0)     { builder = _ai_builder_eid; }
-    } else if (wc1_resources_food(_ai_player) >= wc1_resources_food_cap(_ai_player) - 2) {
-        if (_ai_build(world, BLDG_FARM) != 0)         { builder = _ai_builder_eid; }
-    } else if (_ai_stable_eid < 0 && _ai_barracks_done != 0) {
-        if (_ai_build(world, BLDG_STABLE) != 0)       { builder = _ai_builder_eid; }
+    // 1. Advance the build-order tape. A BUILD step may pull a worker to
+    //    raise a building; _ai_build records it in _ai_builder_eid so the
+    //    economy pass below doesn't send that worker back to gather.
+    _ai_builder_eid = 0 - 1;
+    _ai_run_script(world);
+
+    // 2. Supply: keep food headroom so the escalating army never stalls
+    //    (Stratagus AiNeedSupply). Build a farm whenever food used is within
+    //    2 of the cap — unless the script already pulled a builder this tick.
+    if (_ai_builder_eid < 0
+        && wc1_resources_food(_ai_player) >= wc1_resources_food_cap(_ai_player) - 2) {
+        _ai_build(world, BLDG_FARM);
     }
 
-    // Economy (always): keep EVERY idle peon busy + train peons to the cap.
-    _ai_manage_workers(world, th_p, builder, mine);
-    _ai_try_train(world, _ai_th_eid, UNIT_PEASANT, _AI_PEON_CAP, _ai_peon_n);
+    // 3. Economy: keep every idle peon busy + train peons toward the target
+    //    the WORKERS step set.
+    _ai_manage_workers(world, th_p, _ai_builder_eid, mine);
+    _ai_try_train(world, _ai_th_eid, UNIT_PEASANT, _ai_worker_target, _ai_peon_n);
 
-    // Military: once farm + barracks stand, mass a MIXED army toward the
-    // target. From the barracks, alternate melee (menu[0] = footman/grunt)
-    // and ranged (menu[1] = archer/spearman) each successful train so the
-    // WC2 force isn't all-melee; from the stable (when it stands) add the
-    // tier-2 mounted unit (menu[0] = knight/raider). _ai_try_train gates on
-    // gold+wood affordability AND the per-building one-in-flight queue, so
-    // production paces with the economy.
-    if (_ai_farm_done != 0 && _ai_barracks_done != 0
-        && _ai_army_n < _AI_ARMY_TARGET) {
-        menu = buf_word(8);
-        n = wc1_train_menu(BLDG_BARRACKS, _ai_player, menu);
-        if (n > 0) {
-            pick = (_ai_train_flip != 0 && n > 1) ? menu[1] : menu[0];
-            if (_ai_try_train(world, _ai_barracks_eid, pick,
-                              _AI_ARMY_TARGET, _ai_army_n) != 0) {
-                _ai_train_flip = _ai_train_flip == 0 ? 1 : 0;
-            }
-        }
-        if (_ai_stable_done != 0) {
-            n = wc1_train_menu(BLDG_STABLE, _ai_player, menu);
-            if (n > 0) {
-                _ai_try_train(world, _ai_stable_eid, menu[0],
-                              _AI_ARMY_TARGET, _ai_army_n);
-            }
-        }
-        free(menu);
-    }
+    // 4. Army production toward the current force composition.
+    _ai_train_army(world);
 
-    // Defense (always): if an enemy is near the base, the whole army turns
-    // to fight it — even a lone grunt defends, and the army won't march off
-    // to attack while home is under threat (defense preempts).
-    auto defending;
-    defending = _ai_defend(world, th_p);
+    // 5. Home defence preempts: if an enemy is near the base, the whole army
+    //    turns on it, overriding whatever the last ATTACK launched.
+    _ai_defend(world, th_p);
+
     _ai_heartbeat(mine);
-
-    // Attack only when home is safe AND the army is massed. Surviving
-    // attackers keep their target (an enemy unit, or the enemy hall — see
-    // _ai_launch_attack) until it dies, so dropping under the threshold
-    // just pauses NEW pushes while production refills.
-    if (defending == 0 && _ai_army_n >= _AI_ARMY_TARGET) {
-        _ai_set_state(_AI_ATTACK);
-        _ai_launch_attack(world);
-    } else if (_ai_barracks_done != 0) {
-        _ai_set_state(_AI_BUILDUP);
-    } else {
-        _ai_set_state(_AI_ECON);
-    }
     return;
 }
 
