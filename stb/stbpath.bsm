@@ -93,7 +93,10 @@ struct PathFinder {
     heap_cnt,           // current heap size in entries
     closed,             // w*h byte array: 1 if cell has been finalized
     touched,            // w*h word array: indices of cells written this query
-    touched_cnt         // count of live entries in `touched`
+    touched_cnt,        // count of live entries in `touched`
+    dyn_cb              // optional fn_ptr(gx,gy)->blocked: dynamic obstacles
+                        // (moving units, reservations) layered on top of the
+                        // static `cells` grid. 0 = none. See path_set_dyn_blocked.
 }
 
 // Sentinel value used in the g_score / f_score arrays to mean "infinity".
@@ -132,6 +135,7 @@ path_new(w, h) {
     pf.touched   = buf_word(n);         // dirty list: cells written per query
     pf.heap_cnt  = 0;
     pf.touched_cnt = 0;
+    pf.dyn_cb    = 0;                  // no dynamic-obstacle callback by default
 
     buf_fill(pf.cells, 0, n);
 
@@ -188,6 +192,23 @@ path_is_blocked(pf, gx, gy) {
     p = pf;
     if (gx < 0 || gy < 0 || gx >= p.w || gy >= p.h) { return 1; }
     return peek(p.cells + gy * p.w + gx);
+}
+
+// Install (or clear, with cb = 0) a DYNAMIC-OBSTACLE callback. `cb` is an
+// fn_ptr taking (gx, gy) and returning non-zero when that cell must be treated
+// as blocked for the CURRENT search, on top of the static `cells` grid. This
+// is the Stratagus dynamic-obstacle model: the caller's predicate reports
+// stationary units as blocked (the path routes around them) and moving units
+// as passable (they will clear), excluding the searching unit's own tile and
+// the goal. The callback is consulted for every neighbour A* expands, so keep
+// it cheap (an early-out on empty cells). Set once per PathFinder; the caller
+// stashes the per-search context (which unit, which goal) in its own globals
+// before each path_find.
+void path_set_dyn_blocked(pf, cb) {
+    auto p: PathFinder;
+    p = pf;
+    p.dyn_cb = cb;
+    return;
 }
 
 // ── Search internals ────────────────────────────────────────
@@ -380,6 +401,9 @@ static void _path_relax(pf, cur_idx, nx, ny, gx, gy) {
     n_idx = ny * p.w + nx;
     // Skip blocked cells and cells already finalized in the closed set.
     if (peek(p.cells + n_idx) || peek(p.closed + n_idx)) { return; }
+    // Dynamic obstacles (moving/stationary units, reservations): a cheap
+    // per-search predicate layered on top of the static grid.
+    if (p.dyn_cb != 0 && call(p.dyn_cb, nx, ny) != 0) { return; }
 
     tentative = p.g_score[cur_idx] + 1;
     if (tentative >= p.g_score[n_idx]) { return; }

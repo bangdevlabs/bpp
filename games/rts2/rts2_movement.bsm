@@ -181,6 +181,7 @@ wc1_movement_init(map) {
     w = wc1_map_w(map);
     h = wc1_map_h(map);
     _pf  = path_new(w, h);
+    path_set_dyn_blocked(_pf, fn_ptr(_path_dyn_blocked));   // route around units
     _flow = flow_new(w, h);
     _flow_step_buf = buf_word(2);
     _occupied = grid_new_word(w, h);
@@ -396,6 +397,34 @@ static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
 //
 // The current position is the floor-of-pixel-pos / 32 so the
 // peasant pathfinds from the tile it is CURRENTLY standing on.
+// ── Dynamic-obstacle pathfinding (Stratagus CostMoveTo port) ────────────
+// The A* now routes AROUND other units, the real fix for workers piling up at
+// a resource. Faithful to Stratagus's cost callback: a STATIONARY other unit
+// is a hard obstacle (path goes around it); a MOVING unit is crossable (it
+// will clear); the searching unit's own tile and the goal are always free;
+// terrain blockers are already in the static grid. Installed once on `_pf`;
+// wc1_movement_request stashes the per-search context (which unit, which goal)
+// in these globals before each path_find, which the callback reads.
+global _path_self_eid;             // the unit currently pathing (its claim is free)
+global _path_goal_gx;              // goal tile — always passable so it's reachable
+global _path_goal_gy;
+global _path_world;                // ECS world, for the occupant's anim state
+
+static _path_dyn_blocked(gx, gy) {
+    auto claim, occ, an: Anim;
+    if (_path_world == 0) { return 0; }            // no context set -> static only
+    claim = grid_get(_occupied, gx, gy);
+    if (claim <= 0)                  { return 0; } // empty cell
+    if (claim == _TERRAIN_BLOCKER)   { return 0; } // terrain — already in `cells`
+    occ = claim - 1;                                // grid stores eid + 1
+    if (occ == _path_self_eid)       { return 0; } // our own claim
+    if (gx == _path_goal_gx && gy == _path_goal_gy) { return 0; }   // the goal cell
+    if (ecs_alive_at(_path_world, occ) == 0) { return 0; }          // stale claim
+    an = ecs_get(_path_world, anim_comp, occ);
+    if (an.state == UNIT_STATE_WALK) { return 0; } // moving -> crossable
+    return 1;                                        // stationary other unit -> avoid
+}
+
 void wc1_movement_request(world, eid, dst_gx, dst_gy) {
     auto p: Pos, pa: Path;
     auto src_gx, src_gy, n;
@@ -403,6 +432,12 @@ void wc1_movement_request(world, eid, dst_gx, dst_gy) {
     pa = ecs_get(world, path_comp, eid);
     src_gx = p.x / 32;
     src_gy = p.y / 32;
+    // Publish the per-search context for _path_dyn_blocked, then path AROUND
+    // stationary units to this goal.
+    _path_self_eid = eid;
+    _path_world    = world;
+    _path_goal_gx  = dst_gx;
+    _path_goal_gy  = dst_gy;
     n = path_find(_pf, src_gx, src_gy, dst_gx, dst_gy,
                   pa.buf, MAX_WAYPOINTS);
     pa.mode   = PATH_MODE_ASTAR;
