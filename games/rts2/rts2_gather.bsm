@@ -336,7 +336,7 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
     // passable 4-neighbour as the walk target instead — the
     // gather tick's reach-radius check handles the final hop.
     p = ecs_get(world, pos_comp, peasant_eid);
-    if (_nearest_walkable_neighbor(p.x, p.y, tile_gx, tile_gy,
+    if (_nearest_walkable_neighbor(p.x, p.y, tile_gx, tile_gy, peasant_eid,
                                    &walk_gx, &walk_gy) == 0) {
         // Every neighbour is also blocked — peasant cannot reach
         // this tree at all. Drop the assignment instead of
@@ -367,15 +367,16 @@ wc1_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
 // sits in a fully enclosed forest pocket). 4-neighbour (no
 // diagonals) keeps the chop animation visually aligned with the
 // cardinal-face frames in wc1_anims.
-static _nearest_walkable_neighbor(px, py, tx, ty, out_gx, out_gy) {
-    auto best_gx, best_gy, best_d, found;
-    auto cx, cy, candidates;
-    found  = 0;
-    best_d = 0x7FFFFFFF;
-    // Probe order: south, north, east, west. The body of the loop
-    // recomputes distance² from the peasant to the candidate cell
-    // centre; the minimum wins. Distance² is fine — we only need
-    // ordering, not absolute distance.
+static _nearest_walkable_neighbor(px, py, tx, ty, self_eid, out_gx, out_gy) {
+    auto best_gx, best_gy, best_d, found;       // PREFER: terrain-walkable AND unit-free
+    auto fb_gx, fb_gy, fb_d, fb_found;          // FALLBACK: any terrain-walkable
+    auto cx;
+    found = 0; best_d = 0x7FFFFFFF;
+    fb_found = 0; fb_d = 0x7FFFFFFF;
+    // Probe order: south, north, east, west. The body recomputes distance²
+    // from the peasant to the candidate; the minimum wins (ordering only).
+    // A neighbour already held by another unit is a valid spot but a poor one
+    // — picking it would make the re-path loop, so prefer a free one.
     for (cx = 0; cx < 4; cx++) {
         auto dx, dy, gx, gy, d;
         // (dx, dy) walks {(0,1), (0,-1), (1,0), (-1,0)}.
@@ -385,19 +386,16 @@ static _nearest_walkable_neighbor(px, py, tx, ty, out_gx, out_gy) {
         if (cx == 3) { dx = 0 - 1; dy = 0;  }
         gx = tx + dx;
         gy = ty + dy;
-        if (path_is_blocked(_pf, gx, gy) != 0) { continue; }
+        if (path_is_blocked(_pf, gx, gy) != 0) { continue; }   // terrain wall
         d = _dist_sq(px, py, gx * 32 + 16, gy * 32 + 16);
-        if (d < best_d) {
-            best_gx = gx;
-            best_gy = gy;
-            best_d  = d;
-            found   = 1;
+        if (d < fb_d) { fb_gx = gx; fb_gy = gy; fb_d = d; fb_found = 1; }
+        if (wc1_collision_is_blocked_for(self_eid, gx, gy) == 0 && d < best_d) {
+            best_gx = gx; best_gy = gy; best_d = d; found = 1;
         }
     }
-    if (found == 0) { return 0; }
-    *out_gx = best_gx;
-    *out_gy = best_gy;
-    return 1;
+    if (found != 0)    { *out_gx = best_gx; *out_gy = best_gy; return 1; }
+    if (fb_found != 0) { *out_gx = fb_gx;  *out_gy = fb_gy;  return 1; }
+    return 0;
 }
 
 // Nearest forest tile to (gx, gy), ring-searched outward. Writes the
@@ -744,6 +742,14 @@ static void _gather_visit(w, eid) {
                     }
                     an.state = UNIT_STATE_RETURNING_WOOD;
                 }
+            } else {
+                // Arrived but not adjacent to the tree (the chop spot was
+                // taken, or the detour around other workers landed us short).
+                // Re-path to a fresh free neighbour — Stratagus MoveToResource
+                // retries on the way. The cursor < count gate above means this
+                // fires once PER ARRIVAL, not per frame, so it never thrashes
+                // the pathfinder.
+                wc1_gather_assign_tree(w, eid, tile_gx, tile_gy);
             }
             return;
         }
