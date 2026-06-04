@@ -322,8 +322,12 @@ Ordered by *gameplay impact per LOC*, smallest robust wins first.
 2. ✅ **AiCanNotMove unblock (7d).** `AiMoveUnitInTheWay` ported — shove a parked
    blocker one tile into a free neighbour, throttled. `6dc1077`. *(Plus the
    deep fix it pairs with: dynamic-obstacle A* in `stbpath`, `0752194`.)*
-3. **Depot requests (3c).** When a mine is far from the hall, queue a new town
-   hall near it (`AiNewDepotRequest` + usable-mine check). Big-map economy.
+3. ✅ **Depot requests (3c).** `AiNewDepotRequest` ported: when the nearest
+   worked mine is > 14 tiles from every hall (and affordable, and no hall
+   within 8 tiles covers it), `_ai_check_depot` raises a new town hall next to
+   the mine via `_ai_build_near`. The gather already deposits at the nearest
+   hall, so the second one load-balances itself. `_ai_build` refactored to
+   `_ai_build_near(kind, gx0, gy0)`. (commit below)
 4. **Repair (3e).** Idle-worker repair of damaged buildings when resources are
    flush.
 5. **Worker rebalance + NeededMask ×2 (3b).** Demand-driven gold/wood split;

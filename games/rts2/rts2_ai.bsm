@@ -81,6 +81,10 @@ const _AI_DEFEND_RANGE_SQ = 147456;  // (12 tiles * 32 px)^2 — home-defence tr
 const _AI_SCAN_MAX     = 64;     // scratch buffer capacity
 const _AI_DIST_MAX     = 0x7FFFFFFF;
 const _AI_NKINDS       = 16;     // BuildingDef kind range (per-kind scan arrays)
+const _AI_DEPOT_FAR    = 14;     // tiles — a worked mine beyond this from the main
+                                 // hall earns a new depot (Stratagus AiNewDepotRequest)
+const _AI_DEPOT_NEAR   = 8;      // tiles — a hall within this already covers the mine
+                                 // (Stratagus FindDepositNearLoc, range 15)
 
 // ── Per-AI state (one enemy in v1) ─────────────────────────────
 global _ai_active;        // 0 until wc1_ai_init runs
@@ -113,6 +117,7 @@ static auto _ai_bldg_count;        // buf_word[_AI_NKINDS] — owned count per k
 static auto _ai_bldg_done;         // buf_word[_AI_NKINDS] — completed count per kind
 static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
 static auto _ai_enemy_hq, _ai_enemy_tgt;
+static auto _ai_hn_gx, _ai_hn_gy, _ai_hn_range_sq, _ai_hn_found;  // hall-near scan
 
 // Initialize the enemy AI: `ai_player` is the side it commands,
 // `enemy_player` the side it hunts. Call once at startup AFTER the
@@ -402,8 +407,8 @@ static _ai_place_building(world, kind, builder, def: BuildingDef, gx, gy) {
 // hall for the BEST placement (Stratagus order: a fully-open spot first, then
 // the nearest < 5-obstacle spot, then any valid cell so a tight base never
 // stalls the build queue), spend + spawn. Returns 1 if started.
-static _ai_build(world, kind) {
-    auto th_p: Pos, def: BuildingDef, gx0, gy0, r, dx, dy, gx, gy;
+static _ai_build_near(world, kind, gx0, gy0) {
+    auto def: BuildingDef, r, dx, dy, gx, gy;
     auto ntx, nty, count, bk_gx, bk_gy, any_gx, any_gy, builder;
     builder = _ai_idle_n > 0 ? _ai_idle[0] : (_ai_peon_n > 0 ? _ai_peons[0] : (0 - 1));
     if (builder < 0) { return 0; }                     // no worker at all
@@ -411,8 +416,6 @@ static _ai_build(world, kind) {
     if (def == 0) { return 0; }
     if (wc1_resources_gold(_ai_player) < def.cost_gold) { return 0; }
     if (wc1_resources_wood(_ai_player) < def.cost_wood) { return 0; }
-    th_p = ecs_get(world, pos_comp, _ai_th_eid);
-    gx0 = th_p.x / 32; gy0 = th_p.y / 32;
     ntx = def.px_w / 32; nty = def.px_h / 32;
     bk_gx = 0 - 1; any_gx = 0 - 1;
     r = 3;
@@ -440,6 +443,57 @@ static _ai_build(world, kind) {
     if (bk_gx >= 0)  { return _ai_place_building(world, kind, builder, def, bk_gx, bk_gy); }
     if (any_gx >= 0) { return _ai_place_building(world, kind, builder, def, any_gx, any_gy); }
     return 0;
+}
+
+// Raise a building near the AI's main town hall — the default base placement
+// the build-order tape uses.
+static _ai_build(world, kind) {
+    auto th_p: Pos;
+    th_p = ecs_get(world, pos_comp, _ai_th_eid);
+    return _ai_build_near(world, kind, th_p.x / 32, th_p.y / 32);
+}
+
+// 1 if the AI owns a town hall (any state) within `range` tiles of (gx, gy).
+static void _ai_hall_near_visit(w, eid) {
+    auto fa: Faction, b: Building, p: Pos, dx, dy;
+    if (_ai_hn_found != 0) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_scan_player) { return; }
+    b = ecs_get(w, building_comp, eid);
+    if (b.kind != BLDG_TOWN_HALL) { return; }
+    p = ecs_get(w, pos_comp, eid);
+    dx = p.x / 32 - _ai_hn_gx; dy = p.y / 32 - _ai_hn_gy;
+    if (dx * dx + dy * dy <= _ai_hn_range_sq) { _ai_hn_found = 1; }
+    return;
+}
+
+static _ai_hall_near(world, gx, gy, range) {
+    _ai_hn_gx = gx; _ai_hn_gy = gy; _ai_hn_range_sq = range * range;
+    _ai_hn_found = 0;
+    _ai_scan_player = _ai_player;
+    ecs_query_each(building_q, fn_ptr(_ai_hall_near_visit));
+    return _ai_hn_found;
+}
+
+// Depot request (Stratagus AiNewDepotRequest): when the nearest worked mine is
+// far from every town hall, raise a NEW hall next to it so the gold round-trip
+// stays short. Builds once, near the mine, only when affordable and no hall
+// already covers it (a constructing one counts, so it won't spam). The gather
+// already deposits at the nearest hall, so a second hall load-balances itself.
+static void _ai_check_depot(world, th_p: Pos, mine_eid) {
+    auto def: BuildingDef, mp: Pos, mgx, mgy, dx, dy;
+    if (mine_eid < 0) { return; }
+    def = building_def_for(BLDG_TOWN_HALL);
+    if (def == 0) { return; }
+    if (wc1_resources_gold(_ai_player) < def.cost_gold) { return; }
+    if (wc1_resources_wood(_ai_player) < def.cost_wood) { return; }
+    mp = ecs_get(world, pos_comp, mine_eid);
+    mgx = mp.x / 32 + 2; mgy = mp.y / 32 + 2;          // mine centre (4×4 footprint)
+    if (_ai_hall_near(world, mgx, mgy, _AI_DEPOT_NEAR) != 0) { return; }  // already covered
+    dx = mgx - th_p.x / 32; dy = mgy - th_p.y / 32;
+    if (dx * dx + dy * dy < _AI_DEPOT_FAR * _AI_DEPOT_FAR) { return; }    // close enough
+    _ai_build_near(world, BLDG_TOWN_HALL, mgx, mgy);
+    return;
 }
 
 // Send the massed army to focus-fire the enemy near its town hall. With
@@ -632,6 +686,12 @@ static void _ai_think(world) {
     if (_ai_builder_eid < 0
         && wc1_resources_food(_ai_player) >= wc1_resources_food_cap(_ai_player) - 2) {
         _ai_build(world, BLDG_FARM);
+    }
+
+    // 2b. Depot expansion (Stratagus AiNewDepotRequest): if the worked mine is
+    //     far from every hall, raise a depot next to it. Same one-builder gate.
+    if (_ai_builder_eid < 0) {
+        _ai_check_depot(world, th_p, mine);
     }
 
     // 3. Economy: keep every idle peon busy + train peons toward the target
