@@ -350,6 +350,35 @@ runtime [`bangscript_plan.md`](bangscript_plan.md) will emit into.
 
 ---
 
+## Part F — stb graduation map (Tonify Rule 33 / Rule 20)
+
+**Principle.** `stbai`'s own header deliberately EXCLUDES the RTS brain:
+*"Combat / target acquisition logic (… RTS routes orders — too different)"*.
+The RTS AI is Tier-3 (`rts2_ai.bsm`) by design. Only one RTS exists
+(`games_roadtrip.md` Game 3), so per Rule 20 there is **no second consumer** —
+the brain stays in rts2. A few port items, however, are **fully-generic grid
+algorithms** (not RTS-specific) with a natural Tier-1/2 home; write *those*
+as pure functions over a grid + a predicate so graduating them later is a
+move, not a rewrite.
+
+| Port item | Nature | Home now | Graduation target | Gate |
+|---|---|---|---|---|
+| Placement surround/open check (item 1) | fully-generic grid algo (count free→blocked transitions around a footprint) | rts2 — **pure** `(gx,gy,w,h,range)` over a cell-free predicate | `stbgrid` (perimeter scan taking a `fn_ptr` predicate) | a 2nd grid-placement consumer |
+| Unblock stuck unit (item 2) | movement-coupled | `rts2_movement` | `stbflow` / `stbgrid` | a 2nd RTS |
+| Nearest-enemy flood / target acquisition (6a) | combat AI | rts2 | — `stbai` **excludes** this by its own header | — |
+| Worker balancer (3b), depot (3c), repair (3e) | RTS economy brain | rts2 | — Tier-3 | a 2nd RTS |
+| Force state machine / rally (5, 6) | RTS brain | rts2 | — Tier-3 | a 2nd RTS |
+| Build-order tape VM (Part A) | RTS-shaped behavior VM | rts2 | **bangscript** (the DSL emits the tape) | the bangscript arc |
+
+**Convention for this port:** write the generic-algorithm rows (placement,
+unblock) as PURE helpers — a grid/footprint in, an obstacle count out, no
+`_ai_*` globals — so graduation is a file move + rename. Everything else is RTS
+brain and correctly lives in `rts2_ai` (Tier-3); it graduates only when a
+second RTS appears (then revisit a possible `stbrts` Tier-2 cartridge). Do
+**not** widen `stbai` for the RTS brain — its header already drew that line.
+
+---
+
 ## Constants we'll reuse (rts2 units, 32 px tiles)
 
 Stratagus distances are in tiles; multiply by `WC1_TILE_PX = 32` for pixel

@@ -333,9 +333,78 @@ static _ai_try_train(world, building_eid, unit_kind, max_have, have_now) {
 // worker to build it. Clears the worker's gather so it stops mining and
 // walks to the site. Returns 1 if started. Caller gates on "no building
 // of this kind yet" so it isn't re-invoked mid-construction.
+// ── Building placement quality (Stratagus AiCheckSurrounding port) ──────
+// PURE grid algorithm — graduation candidate for stbgrid (a perimeter scan
+// taking a fn_ptr predicate); see docs/plans/wc2_ai_port.md Part F. Kept here
+// with its one game-specific call (the cell-free predicate) until a second
+// grid-placement game earns the move.
+
+// A build cell is "free" when nothing blocks it in the shared occupancy grid
+// (terrain blocker, unit claim, or another building's footprint). Off-grid
+// cells read as blocked via wc1_collision_is_blocked_for.
+static _ai_cell_free(gx, gy) {
+    return wc1_collision_is_blocked_for(0 - 1, gx, gy) == 0;
+}
+
+// Walk the perimeter ring one cell outside a (gx,gy,w,h) footprint and count
+// blocked->free transitions ("obstacle segments"). 0 means the spot is
+// uniformly open (or fully enclosed); a high count means dropping a building
+// here would fragment the surrounding paths. The AI prefers 0, accepts < 5.
+static _ai_obstacle_count(gx, gy, w, h) {
+    auto x0, y0, x1, y1, x, y, first, last, isfree, count;
+    x0 = gx - 1; y0 = gy - 1;
+    x1 = gx + w; y1 = gy + h;
+    first = _ai_cell_free(x0, y0);
+    last = first; count = 0;
+    x = x0 + 1;                                     // top edge, left -> right
+    while (x < x1) {
+        isfree = _ai_cell_free(x, y0);
+        if (isfree != 0 && last == 0) { count = count + 1; }
+        last = isfree; x = x + 1;
+    }
+    y = y0;                                         // right edge, top -> bottom
+    while (y < y1) {
+        isfree = _ai_cell_free(x1, y);
+        if (isfree != 0 && last == 0) { count = count + 1; }
+        last = isfree; y = y + 1;
+    }
+    x = x1;                                         // bottom edge, right -> left
+    while (x0 < x) {
+        isfree = _ai_cell_free(x, y1);
+        if (isfree != 0 && last == 0) { count = count + 1; }
+        last = isfree; x = x - 1;
+    }
+    y = y1;                                         // left edge, bottom -> top
+    while (y0 < y) {
+        isfree = _ai_cell_free(x0, y);
+        if (isfree != 0 && last == 0) { count = count + 1; }
+        last = isfree; y = y - 1;
+    }
+    if (first != 0 && last == 0) { count = count + 1; }
+    return count;
+}
+
+// Drop the foundation at (gx,gy): resolve atlases, spend, spawn CONSTRUCTING,
+// pull the builder off mining and assign it. Returns 1.
+static _ai_place_building(world, kind, builder, def: BuildingDef, gx, gy) {
+    auto idle, construct, b_eid;
+    idle      = wc1_building_atlas_idle(kind, _ai_player);
+    construct = wc1_building_atlas_construct(kind, _ai_player);
+    wc1_resources_spend(_ai_player, def.cost_gold, def.cost_wood);
+    b_eid = ecs_spawn_building(world, idle, construct, gx, gy, _ai_player, kind);
+    wc1_gather_clear(world, builder);              // stop mining, go build
+    wc1_building_assign_peasant(world, b_eid, builder);
+    _ai_builder_eid = builder;
+    return 1;
+}
+
+// Raise a building of `kind`: pick a worker, search a ring around the town
+// hall for the BEST placement (Stratagus order: a fully-open spot first, then
+// the nearest < 5-obstacle spot, then any valid cell so a tight base never
+// stalls the build queue), spend + spawn. Returns 1 if started.
 static _ai_build(world, kind) {
     auto th_p: Pos, def: BuildingDef, gx0, gy0, r, dx, dy, gx, gy;
-    auto idle, construct, b_eid, builder;
+    auto ntx, nty, count, bk_gx, bk_gy, any_gx, any_gy, builder;
     builder = _ai_idle_n > 0 ? _ai_idle[0] : (_ai_peon_n > 0 ? _ai_peons[0] : (0 - 1));
     if (builder < 0) { return 0; }                     // no worker at all
     def = building_def_for(kind);
@@ -344,6 +413,8 @@ static _ai_build(world, kind) {
     if (wc1_resources_wood(_ai_player) < def.cost_wood) { return 0; }
     th_p = ecs_get(world, pos_comp, _ai_th_eid);
     gx0 = th_p.x / 32; gy0 = th_p.y / 32;
+    ntx = def.px_w / 32; nty = def.px_h / 32;
+    bk_gx = 0 - 1; any_gx = 0 - 1;
     r = 3;
     while (r <= 9) {
         dy = 0 - r;
@@ -352,15 +423,12 @@ static _ai_build(world, kind) {
             while (dx <= r) {
                 gx = gx0 + dx; gy = gy0 + dy;
                 if (wc1_placement_valid(kind, gx, gy) != 0) {
-                    idle      = wc1_building_atlas_idle(kind, _ai_player);
-                    construct = wc1_building_atlas_construct(kind, _ai_player);
-                    wc1_resources_spend(_ai_player, def.cost_gold, def.cost_wood);
-                    b_eid = ecs_spawn_building(world, idle, construct,
-                                               gx, gy, _ai_player, kind);
-                    wc1_gather_clear(world, builder);  // stop mining, go build
-                    wc1_building_assign_peasant(world, b_eid, builder);
-                    _ai_builder_eid = builder;
-                    return 1;
+                    if (any_gx < 0) { any_gx = gx; any_gy = gy; }  // nearest valid (last resort)
+                    count = _ai_obstacle_count(gx, gy, ntx, nty);
+                    if (count == 0) {
+                        return _ai_place_building(world, kind, builder, def, gx, gy);
+                    }
+                    if (count < 5 && bk_gx < 0) { bk_gx = gx; bk_gy = gy; }  // nearest backupok
                 }
                 dx = dx + 1;
             }
@@ -368,6 +436,9 @@ static _ai_build(world, kind) {
         }
         r = r + 1;
     }
+    // No fully-open spot in range — nearest < 5-obstacle, else any valid.
+    if (bk_gx >= 0)  { return _ai_place_building(world, kind, builder, def, bk_gx, bk_gy); }
+    if (any_gx >= 0) { return _ai_place_building(world, kind, builder, def, any_gx, any_gy); }
     return 0;
 }
 
