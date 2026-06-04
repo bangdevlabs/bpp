@@ -306,7 +306,7 @@ wc1_gather_assign_mine(world, peasant_eid, mine_eid) {
     mp = ecs_get(world, pos_comp, mine_eid);
     if (wc1_movement_find_walkable_perimeter(mine_eid,
                                              mp.x / 32, mp.y / 32,
-                                             4, 4, &gx, &gy) == 0) {
+                                             4, 4, 0 - 1, 0 - 1, &gx, &gy) == 0) {
         gx = (mp.x + 64) / 32;
         gy = (mp.y + 128) / 32;
     }
@@ -507,13 +507,14 @@ wc1_gather_carry(world, peasant_eid) {
 //
 // No-op when carry == CARRY_NONE: there's nothing to deliver.
 void wc1_gather_route_to_deposit(world, peasant_eid, th_eid) {
-    auto gt: Gather, an: Anim;
+    auto gt: Gather, an: Anim, p: Pos;
     auto drop_gxy;
     gt = ecs_get(world, gather_comp, peasant_eid);
     if (gt.carry == CARRY_NONE) { return; }
     gt.deposit_eid = th_eid;
+    p = ecs_get(world, pos_comp, peasant_eid);
     drop_gxy = buf_word(2);
-    _deposit_drop_tile(world, th_eid, drop_gxy);
+    _deposit_drop_tile(world, th_eid, p.x, p.y, drop_gxy);
     wc1_movement_request(world, peasant_eid, drop_gxy[0], drop_gxy[1]);
     free(drop_gxy);
     an = ecs_get(world, anim_comp, peasant_eid);
@@ -562,13 +563,16 @@ static _dist_sq(ax, ay, bx, by) {
 // dispatch stays uniform. Falls back to south-mid if every
 // adjacent cell is blocked (which would have failed path_find
 // anyway — the fallback at least feeds a well-formed coord).
-static _deposit_drop_tile(world, deposit_eid, out_gxy) {
+static _deposit_drop_tile(world, deposit_eid, ref_px, ref_py, out_gxy) {
     auto p: Pos;
     auto gx, gy;
     p = ecs_get(world, pos_comp, deposit_eid);
+    // ref_px/ref_py = the returning worker's position, so a crowd of
+    // depositors spreads across the hall's perimeter (each picks the free
+    // edge tile nearest its approach) instead of all queuing at one doorway.
     if (wc1_movement_find_walkable_perimeter(deposit_eid,
                                               p.x / 32, p.y / 32,
-                                              4, 4, &gx, &gy) != 0) {
+                                              4, 4, ref_px, ref_py, &gx, &gy) != 0) {
         out_gxy[0] = gx;
         out_gxy[1] = gy;
     } else {
@@ -674,7 +678,7 @@ static void _gather_visit(w, eid) {
                     th_eid = gt.deposit_eid;
                     if (th_eid >= 0) {
                         drop_gxy = buf_word(2);
-                        _deposit_drop_tile(w, th_eid, drop_gxy);
+                        _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
                         wc1_movement_request(w, eid,
                                                     drop_gxy[0], drop_gxy[1]);
                         free(drop_gxy);
@@ -735,7 +739,7 @@ static void _gather_visit(w, eid) {
                     th_eid = gt.deposit_eid;
                     if (th_eid >= 0) {
                         drop_gxy = buf_word(2);
-                        _deposit_drop_tile(w, th_eid, drop_gxy);
+                        _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
                         wc1_movement_request(w, eid,
                                                     drop_gxy[0], drop_gxy[1]);
                         free(drop_gxy);
@@ -765,7 +769,7 @@ static void _gather_visit(w, eid) {
         gt.deposit_eid = _find_nearest_town_hall(w, eid);
         if (gt.deposit_eid < 0) { return; }
         drop_gxy = buf_word(2);
-        _deposit_drop_tile(w, gt.deposit_eid, drop_gxy);
+        _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
         wc1_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
         free(drop_gxy);
         return;
@@ -774,6 +778,21 @@ static void _gather_visit(w, eid) {
     mp_cx = tp.x + 64;
     mp_cy = tp.y + 64;
     dist = _dist_sq(p.x + 16, p.y + 16, mp_cx, mp_cy);
+    if (dist > reach_sq) {
+        // Not in reach yet. If the path is exhausted but we landed short (the
+        // doorway was taken or a unit-avoiding detour stopped us before the
+        // hall), re-path to a fresh free drop tile — Stratagus MoveToDepot
+        // retries. The cursor >= count gate makes it fire once per arrival.
+        auto pa_d: Path;
+        pa_d = ecs_get(w, path_comp, eid);
+        if (pa_d.cursor >= pa_d.count) {
+            drop_gxy = buf_word(2);
+            _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
+            wc1_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
+            free(drop_gxy);
+        }
+        return;
+    }
     if (dist <= reach_sq) {
         // Deposit. Resources credited to the worker's OWN player; mine
         // reserve charged.
@@ -823,7 +842,7 @@ static void _gather_visit(w, eid) {
             tp = ecs_get(w, pos_comp, gt.target);
             if (wc1_movement_find_walkable_perimeter(gt.target,
                                                       tp.x / 32, tp.y / 32,
-                                                      4, 4,
+                                                      4, 4, p.x, p.y,
                                                       &mgx, &mgy) == 0) {
                 mgx = (tp.x + 64) / 32;
                 mgy = (tp.y + 128) / 32;
