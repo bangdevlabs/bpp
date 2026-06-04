@@ -309,12 +309,19 @@ explorer ray (start 3, ×1.5, 8 tries), `AiSendExplorers` 5 retries.
 
 Ordered by *gameplay impact per LOC*, smallest robust wins first.
 
-1. **Placement surround check (4a/4b).** Port `AiCheckSurrounding` (perimeter
-   obstacle count ≤ limit) + enemy-within-8 rejection into `_ai_build`.
-   Suspected fix for the AI getting stuck unable to place a building.
-2. **AiCanNotMove unblock (7d).** Port `AiMoveUnitInTheWay` (throttled shove of
-   one idle blocker) into the movement tick. Suspected fix for units freezing
-   — pairs with our existing tile-claim collision.
+> **Progress (2026-06-04):** items 1, 2 ✅ **DONE** + the deep movement fix
+> (dynamic-obstacle pathfinding, the real Stratagus `CostMoveToCallBack_Default`
+> mechanism) shipped — it wasn't a numbered item but turned out to be the root
+> of the worker pile-ups. The whole gather-contention pass landed (dynamic A* in
+> `stbpath` + two-pass fallback + per-tree / perimeter spread + `MoveToResource`
+> /`MoveToDepot` re-path on all three legs). Commits `0f26f67` `6dc1077`
+> `0752194` `91de6b3` `1846722` `75d2006` `0a4e294` `381d85b`. **Next: item 3.**
+
+1. ✅ **Placement surround check (4a/4b).** `AiCheckSurrounding` ported into
+   `_ai_build` (prefer fully-open, then <5-obstacle, then any valid). `0f26f67`.
+2. ✅ **AiCanNotMove unblock (7d).** `AiMoveUnitInTheWay` ported — shove a parked
+   blocker one tile into a free neighbour, throttled. `6dc1077`. *(Plus the
+   deep fix it pairs with: dynamic-obstacle A* in `stbpath`, `0752194`.)*
 3. **Depot requests (3c).** When a mine is far from the hall, queue a new town
    hall near it (`AiNewDepotRequest` + usable-mine check). Big-map economy.
 4. **Repair (3e).** Idle-worker repair of damaged buildings when resources are
@@ -376,6 +383,15 @@ unblock) as PURE helpers — a grid/footprint in, an obstacle count out, no
 brain and correctly lives in `rts2_ai` (Tier-3); it graduates only when a
 second RTS appears (then revisit a possible `stbrts` Tier-2 cartridge). Do
 **not** widen `stbai` for the RTS brain — its header already drew that line.
+
+**Shipped 2026-06-04:** the one row that *did* graduate is **dynamic-obstacle
+pathfinding** — a genuinely generic A* feature, so it landed in `stbpath` as a
+`path_set_dyn_blocked(pf, fn_ptr)` hook (default off = identical for existing
+consumers, suite 183/0/12), with rts2 providing the unit-occupancy predicate.
+That's the boundary working as intended: the generic mechanism in the
+cartridge, the game-specific predicate in the game. The placement + unblock
+helpers stay pure in rts2 (single consumer), ready to move when a second one
+appears.
 
 ---
 

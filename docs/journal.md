@@ -12903,3 +12903,116 @@ operand shape that triggered them. The games did.
   grouped-annotation declarators. Don't pass the chance to fold the
   follow-on in the same arc — it costs one extra commit and the doctrine
   reads as one coherent move.
+
+## 2026-06-04 — rts2 (WC2 mod): native FOV, portraits, and the gather-contention saga solved by porting Stratagus
+
+A long single-session day on `games/rts2/` (the Warcraft II mod, copied from
+rts1). It started cosmetic and ended with the resource economy finally
+flowing — the breakthrough being a hard rule the user enforced midway:
+**stop guessing, read the source.**
+
+### Field of view — the Blizzard-Remaster technique
+
+The native-32px tiles had quietly zoomed the game in: a 480×270 16:9 canvas at
+32px shows only ~12×8 tiles of battlefield, far tighter than the original. The
+question "can't we just do what the original did?" sent me to the research, and
+the answer was clean: StarCraft / Warcraft Remastered **preserve the classic
+field of view** on purpose (documented, for competitive balance) and modernise
+through HD art + UI, never by revealing more map; widescreen letterboxes to
+4:3. So the design resolution went to **640×480** — the literal WC2 resolution,
+which at native 32px reproduces the original's ~17×15-tile view. `stbgame`
+already scales + letterboxes a fixed canvas, so the camera viewport is now a
+fixed tile count; the earlier 16:9 choice had traded the authentic view away to
+dodge the side bars. The top resource bar's strip tiling was rewritten as a
+loop to the canvas edge (resolution-independent) and the MENU button re-pinned
+to the taller 4:3 panel. `e2d5833`.
+
+### Portrait icons — WC1 frame order on a WC2 strip
+
+The command-card portraits and command-grid icons were all wrong. The in-world
+*sprites* were correct (verified by reading the actual PNGs — footman is a
+sword soldier, archer holds a bow, the barracks is the barracks), but the icon
+*index tables* still used the WC1 (war1gus) frame order while the loaded strip
+is the WC2 icon graphic — 196 frames, MAINDAT entry 356, ordered per wargus
+`scripts/icons.lua`. Remapped all three resolvers (`_unit_portrait_frame`,
+`wc1_building_icon_frame`, `wc1_cmd_entry_frame`) to the WC2 frames in one pass,
+which fixed the portrait box, the build menu and the train buttons together.
+`c004259`.
+
+### AI port — enumerate the engine, port point by point
+
+The user asked to study the wargus AI and reimplement it for rts2. The wargus
+*scripts* (the build-order tapes) sit on the **Stratagus AI engine** (~7000 LOC
+of C++), so a subagent enumerated the whole engine — lifecycle, data model,
+resource manager, force state machine, building placement, attack planner,
+event handlers, the script primitives — into a port spec,
+`docs/plans/wc2_ai_port.md` (Part B), with a per-subsystem rts2 status map
+(Part C), a point-by-point port order (Part D), and an stb-graduation map
+(Part F: the RTS brain stays Tier-3 in `rts2_ai`, since `stbai`'s own header
+excludes target-acquisition / order-routing and there's only one RTS; only the
+fully-generic grid algorithms graduate). Then the first two items:
+
+- **Item 1 — placement surround check** (`AiCheckSurrounding` port): `_ai_build`
+  now scores each candidate by perimeter free→blocked transitions and prefers a
+  fully-open spot, then the nearest <5-obstacle spot, then any valid cell — a
+  faithful port, written pure over a cell-free predicate so it can graduate to
+  `stbgrid`. `0f26f67`.
+- **Item 2 — `AiMoveUnitInTheWay`**: when a unit can't advance, shove a parked
+  blocker one tile into a free neighbour. `6dc1077`.
+
+### The gather contention — "the treasure map"
+
+Peasants kept jamming at the forest and the mine. I patched symptoms for a few
+rounds (per-tree claim, perimeter guesses) until the user pushed: *"a gente não
+tem o mapa do tesouro? porque estamos tentando adivinhar?"* — we have the
+Stratagus source, read it. That changed everything:
+
+- `action_resource.cpp` showed the mine model: path to the resource, stop at
+  any adjacent tile, **enter-and-disappear** while gathering (frees the tile),
+  **wait-in-place** if `MaxOnBoard` is full, and `AiCanNotMove → shove` on a
+  block. We already had the enter/wait pieces; the gap was that we sent every
+  worker to ONE perimeter tile.
+- `astar.cpp::CostMoveToCallBack_Default` showed the real spreading mechanism:
+  the pathfinder treats a **stationary unit as a hard obstacle** (route around)
+  and a **moving unit as crossable** (it'll clear). Ours ignored units, so they
+  pathed straight through each other and gridlocked.
+
+The user chose the deep fix. So **`stbpath` gained a generic dynamic-obstacle
+hook** (`path_set_dyn_blocked` — an `fn_ptr(gx,gy)->blocked` consulted per
+neighbour, default off = identical behaviour, suite stayed 183/0/12); rts2's
+predicate reads the occupancy grid and the occupant's WALK state to tell moving
+from parked (`0752194`). A binary A* can't express Stratagus's *soft* crossing
+cost, so when avoidance boxes a worker in we fall back to a unit-blind direct
+path (`91de6b3`) — the tile-claim, give-way and the Item-2 unblock resolve the
+rest at execution time.
+
+On top of that, the spread + retry, all grounded in the source: a **per-tree
+claim** so a group right-click sends each chopper to the nearest FREE tree;
+`find_walkable_perimeter` gained a **reference point** so depositors spread
+across the hall's edges instead of one doorway; and **re-path on arrival** (the
+`MoveToResource`/`MoveToDepot` retry, throttled once-per-arrival by the
+cursor≥count gate) on all three legs — tree chop, deposit, and the mine
+re-entry. That last one was the final bug: the mine re-entry was the one leg
+without the retry, which is exactly why miners "deposited but never went back
+for gold" while chopping never showed it. `1846722` / `75d2006` / `0a4e294` /
+`381d85b`.
+
+Result: 10 peasants, 5 to the mine and 5 to the forest, spread out, chop and
+mine and deliver on a clean loop — a 3700-gold / 4600-wood stockpile with
+everyone working.
+
+### Lessons
+
+- **When you hold the source for a system you're reimplementing, reading it
+  beats guessing — every time.** Three rounds of symptom-patching collapsed
+  into one correct model the moment I read `action_resource.cpp` +
+  `CostMoveToCallBack_Default`. Captured as a feedback memory; the AI port plan
+  is the worked example of the enumerate-then-port discipline.
+- **Generic algorithm vs game brain is the graduation line, not "it's RTS".**
+  The dynamic-obstacle hook is a real `stbpath` (Tier-2) enhancement that any
+  consumer gets; the RTS economy/force logic stays Tier-3 in `rts2_ai`. Writing
+  the generic pieces pure (grid + predicate) makes the boundary a move, not a
+  rewrite.
+- **Authenticity is a field-of-view decision, not just art.** The Blizzard
+  remasters spell it out: preserve the classic view, letterbox for widescreen.
+  Our 16:9 "no letterbox" optimisation had quietly broken the feel.
