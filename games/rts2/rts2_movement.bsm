@@ -528,6 +528,70 @@ static _flow_avoid(eid, cur_gx, cur_gy, pref_dx, pref_dy, out) {
 // one happen in the same step, with the blocked-check in between.
 // During sub-pixel transit the unit's claim is on the DESTINATION
 // tile, which prevents others from heading there.
+// ── Unblock stuck units (Stratagus AiMoveUnitInTheWay port) ─────────────
+// Fixes the gap noted at the top of this file: "a unit blocked by a stationary
+// idle unit will sit forever". When a unit can't advance because the next tile
+// is held by another unit, shove that blocker one tile into a free neighbour so
+// the movement jam clears (the peasants-piling-up-at-the-forest case). Only
+// IDLE / WALKING blockers are shoved — a worker that is gathering / building /
+// fighting holds its tile legitimately. Throttled globally (Stratagus: 1 move
+// per 10 cycles) so it never thrashes the pathfinder. PURE-ish over the
+// occupancy grid + a move request; graduation candidate for stbflow (see
+// docs/plans/wc2_ai_port.md Part F).
+const _UNBLOCK_THROTTLE = 4;        // frames between shoves
+static auto _unblock_cd;            // countdown; a shove is allowed at 0
+static auto _dir8;                  // buf_word(16): {dx,dy} x 8 neighbours
+
+static void _unblock_init() {
+    if (_dir8 != 0) { return; }
+    _dir8 = buf_word(16);
+    _dir8[0]  = 0 - 1; _dir8[1]  = 0 - 1;   // NW
+    _dir8[2]  = 0 - 1; _dir8[3]  = 0;        // W
+    _dir8[4]  = 0 - 1; _dir8[5]  = 1;        // SW
+    _dir8[6]  = 0;     _dir8[7]  = 1;        // S
+    _dir8[8]  = 1;     _dir8[9]  = 1;        // SE
+    _dir8[10] = 1;     _dir8[11] = 0;        // E
+    _dir8[12] = 1;     _dir8[13] = 0 - 1;    // NE
+    _dir8[14] = 0;     _dir8[15] = 0 - 1;    // N
+}
+
+static _try_unblock(w, eid, bx, by, blocked_p: Pos) {
+    auto blocker, ba: Anim, bp: Pos, b_gx, b_gy, e_gx, e_gy, d, nx, ny;
+    if (_unblock_cd > 0)             { return 0; }
+    blocker = grid_get(_occupied, bx, by);
+    if (blocker <= 0)                { return 0; }   // empty cell / off grid
+    if (blocker == _TERRAIN_BLOCKER) { return 0; }   // permanent terrain
+    blocker = blocker - 1;                            // grid stores eid + 1
+    if (blocker == eid)              { return 0; }
+    if (ecs_alive_at(w, blocker) == 0) { return 0; }
+    // Only shove a unit that's idle or merely walking — never one parked at a
+    // resource / foundation / fight (it holds its tile on purpose).
+    ba = ecs_get(w, anim_comp, blocker);
+    if (ba.state == UNIT_STATE_GATHER_GOLD || ba.state == UNIT_STATE_GATHER_WOOD
+        || ba.state == UNIT_STATE_BUILD || ba.state == UNIT_STATE_ATTACK
+        || ba.state == UNIT_STATE_DYING) { return 0; }
+    bp = ecs_get(w, pos_comp, blocker);
+    b_gx = bp.x / 32; b_gy = bp.y / 32;
+    e_gx = blocked_p.x / 32; e_gy = blocked_p.y / 32;
+    _unblock_init();
+    d = 0;
+    while (d < 8) {
+        nx = b_gx + _dir8[d * 2];
+        ny = b_gy + _dir8[d * 2 + 1];
+        // A free shove target: on grid, not blocked, and not the stuck unit's
+        // own tile (don't send the blocker straight into us).
+        if (grid_in_bounds(_occupied, nx, ny) != 0
+            && wc1_collision_is_blocked_for(blocker, nx, ny) == 0
+            && (nx != e_gx || ny != e_gy)) {
+            wc1_movement_request(w, blocker, nx, ny);   // shove one tile over
+            _unblock_cd = _UNBLOCK_THROTTLE;
+            return 1;
+        }
+        d = d + 1;
+    }
+    return 0;
+}
+
 static void _step_unit(w, eid) {
     auto p: Pos, pa: Path, t: Target, an: Anim;
     auto wp_gx, wp_gy, wp_px, wp_py;
@@ -624,6 +688,12 @@ static void _step_unit(w, eid) {
                 wc1_collision_register(eid, wp_gx, wp_gy);
                 pa.tile_gx = wp_gx;
                 pa.tile_gy = wp_gy;
+            } else if (_try_unblock(w, eid, wp_gx, wp_gy, p) != 0) {
+                // 4. Shoved the stationary blocker aside (Stratagus
+                //    AiMoveUnitInTheWay). Idle this frame; the contested tile
+                //    frees over the next few as the blocker steps off it.
+                _idle_anim(an);
+                return;
             } else {
                 _idle_anim(an);
                 return;
@@ -699,5 +769,6 @@ void wc1_movement_tick(world) {
     _dt_ms = game_dt_ms();
     _frame_step = def.speed_pxs * _dt_ms / 1000;
     if (_frame_step < 1) { _frame_step = 1; }
+    if (_unblock_cd > 0) { _unblock_cd = _unblock_cd - 1; }   // throttle shoves
     ecs_query_each(peasant_q, fn_ptr(_step_unit));
 }
