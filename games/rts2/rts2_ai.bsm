@@ -51,7 +51,7 @@ load   "rts2_movement.bsm";      // wc2_movement_request_group
 // extrn the comp handle (the struct is in scope via the loads above).
 extrn pos_comp, unit_comp, faction_comp, anim_comp, gather_comp;
 extrn building_comp, peasant_q, building_q;
-extrn attack_target_comp;
+extrn attack_target_comp, sheet_comp;
 extrn wc2_debug;        // verbose AI state / heartbeat logging gate (rts.bpp)
 
 // Building-atlas resolvers (wc2_building_atlas_idle / _construct) live
@@ -85,6 +85,8 @@ const _AI_DEPOT_FAR    = 14;     // tiles — a worked mine beyond this from the
                                  // hall earns a new depot (Stratagus AiNewDepotRequest)
 const _AI_DEPOT_NEAR   = 8;      // tiles — a hall within this already covers the mine
                                  // (Stratagus FindDepositNearLoc, range 15)
+const _AI_REPAIR_MIN_GOLD = 200; // gold floor below which the AI won't pull a worker
+                                 // onto repair (Stratagus AiCheckRepair affordability)
 
 // ── Per-AI state (one enemy in v1) ─────────────────────────────
 global _ai_active;        // 0 until wc2_ai_init runs
@@ -92,6 +94,7 @@ global _ai_player;        // the player id this brain controls
 global _ai_enemy;         // who it attacks (the local user)
 global _ai_accum_ms;      // 5 Hz tick accumulator
 global _ai_builder_eid;   // worker pulled to raise a building this tick (-1 = none)
+global _ai_repair_eid;    // worker currently on repair duty (-1 = none; one at a time)
 global _ai_hb;            // diagnostic heartbeat counter (temporary)
 
 // Build-order tape + interpreter state.
@@ -118,6 +121,7 @@ static auto _ai_bldg_done;         // buf_word[_AI_NKINDS] — completed count p
 static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
 static auto _ai_enemy_hq, _ai_enemy_tgt;
 static auto _ai_hn_gx, _ai_hn_gy, _ai_hn_range_sq, _ai_hn_found;  // hall-near scan
+static auto _ai_rep_player, _ai_rep_found, _ai_rep_eid;          // damaged-building scan
 
 // Initialize the enemy AI: `ai_player` is the side it commands,
 // `enemy_player` the side it hunts. Call once at startup AFTER the
@@ -127,6 +131,7 @@ void wc2_ai_init(world, ai_player, enemy_player) {
     _ai_enemy       = enemy_player;
     _ai_accum_ms    = 0;
     _ai_builder_eid = 0 - 1;
+    _ai_repair_eid  = 0 - 1;
     _ai_pc          = 0;
     _ai_worker_target = 1;            // the script bumps this immediately
     _ai_force_melee = 0; _ai_force_ranged = 0; _ai_force_cav = 0;
@@ -496,6 +501,60 @@ static void _ai_check_depot(world, th_p: Pos, mine_eid) {
     return;
 }
 
+// Damaged-building scan (Stratagus AiCheckRepair): finds the first AI-owned,
+// COMPLETED building whose HP sits below max and records it in _ai_rep_eid.
+static void _ai_repair_visit(w, eid) {
+    auto fa: Faction, b: Building, sh: Sheet;
+    if (_ai_rep_found != 0) { return; }
+    fa = ecs_get(w, faction_comp, eid);
+    if (fa.player != _ai_rep_player) { return; }
+    b = ecs_get(w, building_comp, eid);
+    if (b.state != BLDG_STATE_DONE) { return; }
+    sh = ecs_get(w, sheet_comp, eid);
+    if (cs_res_current(sh.handle, RES_HP) >= cs_res_max(sh.handle, RES_HP)) { return; }
+    _ai_rep_found = 1;
+    _ai_rep_eid   = eid;
+    return;
+}
+
+// Return the eid of a damaged AI building, or -1 when all are at full HP.
+static _ai_find_damaged(world) {
+    _ai_rep_player = _ai_player;
+    _ai_rep_found  = 0;
+    _ai_rep_eid    = 0 - 1;
+    ecs_query_each(building_q, fn_ptr(_ai_repair_visit));
+    return _ai_rep_eid;
+}
+
+// Repair upkeep (Stratagus AiCheckRepair): keep ONE worker mending a damaged
+// building at a time. _ai_repair_eid remembers that worker across ticks — while
+// it is alive and still on repair duty we leave it alone (and re-mark it as this
+// tick's builder so the worker pass doesn't yank it back to gathering). When the
+// slot is free and a building is damaged, pull a worker (idle preferred, else a
+// gatherer) provided the AI can afford the repair bill.
+static void _ai_check_repair(world) {
+    auto dmg, worker, gt: Gather;
+    if (_ai_repair_eid >= 0) {
+        if (ecs_alive_at(world, _ai_repair_eid) != 0) {
+            gt = ecs_get(world, gather_comp, _ai_repair_eid);
+            if (gt.target_kind == GATHER_TARGET_REPAIR) {
+                _ai_builder_eid = _ai_repair_eid;   // protect it from the worker pass
+                return;
+            }
+        }
+        _ai_repair_eid = 0 - 1;                      // mended or died -> free the slot
+    }
+    if (wc2_resources_gold(_ai_player) < _AI_REPAIR_MIN_GOLD) { return; }
+    dmg = _ai_find_damaged(world);
+    if (dmg < 0) { return; }
+    worker = _ai_idle_n > 0 ? _ai_idle[0] : (_ai_peon_n > 0 ? _ai_peons[0] : (0 - 1));
+    if (worker < 0) { return; }
+    if (wc2_repair_assign(world, worker, dmg) == 0) { return; }
+    _ai_repair_eid  = worker;
+    _ai_builder_eid = worker;                        // economy pass skips this worker
+    return;
+}
+
 // Send the massed army to focus-fire the enemy near its town hall. With
 // no reachable enemy units, march to the hall tile so defenders are
 // found next tick.
@@ -692,6 +751,13 @@ static void _ai_think(world) {
     //     far from every hall, raise a depot next to it. Same one-builder gate.
     if (_ai_builder_eid < 0) {
         _ai_check_depot(world, th_p, mine);
+    }
+
+    // 2c. Repair upkeep (Stratagus AiCheckRepair): keep one worker mending a
+    //     damaged building. Same one-builder gate — build/depot already pulled
+    //     a worker this tick, so repair waits its turn.
+    if (_ai_builder_eid < 0) {
+        _ai_check_repair(world);
     }
 
     // 3. Economy: keep every idle peon busy + train peons toward the target

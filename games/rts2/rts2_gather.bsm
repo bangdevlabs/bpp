@@ -370,6 +370,45 @@ wc2_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
     return wc2_gather_assign_tree(world, peasant_eid, ntx, nty);
 }
 
+// Assign `peasant_eid` to repair the building `b_eid` (Stratagus action_repair
+// entry point — both the player's repair command and the AI route through here).
+// Walks the worker to a free perimeter tile of the footprint; the gather tick's
+// REPAIR branch does the per-cycle HP restore + resource charge. Returns 1 when
+// the target is a finished, damaged structure worth mending, 0 otherwise.
+wc2_repair_assign(world, peasant_eid, b_eid) {
+    auto gt: Gather, b: Building, sh_b: Sheet, bdef: BuildingDef;
+    auto p: Pos, tp: Pos, wgx, wgy, u: UnitType;
+    // Only workers repair — a mixed selection (peasants + soldiers) routes the
+    // soldiers harmlessly through here, so reject non-peasants like the tick does.
+    u = ecs_get(world, unit_comp, peasant_eid);
+    if (u.kind != UNIT_PEASANT) { return 0; }
+    if (ecs_alive_at(world, b_eid) == 0) { return 0; }
+    b = ecs_get(world, building_comp, b_eid);
+    if (b.state != BLDG_STATE_DONE) { return 0; }          // only finished buildings
+    sh_b = ecs_get(world, sheet_comp, b_eid);
+    if (cs_res_current(sh_b.handle, RES_HP)
+        >= cs_res_max(sh_b.handle, RES_HP)) { return 0; }  // already at full HP
+    _reset_anim_if_gathering(world, peasant_eid);
+    _tree_release(world, peasant_eid);   // drop any tree this worker held before
+    gt = ecs_get(world, gather_comp, peasant_eid);
+    gt.target_kind = GATHER_TARGET_REPAIR;
+    gt.target      = b_eid;
+    gt.deposit_eid = -1;
+    gt.progress_ms = 0;
+    gt.carry       = CARRY_NONE;
+    // Walk to a passable perimeter tile of the building footprint (reuses the
+    // same spread-aware walker the mine/tree assignments use).
+    bdef = building_def_for(b.kind);
+    tp = ecs_get(world, pos_comp, b_eid);
+    p  = ecs_get(world, pos_comp, peasant_eid);
+    wgx = 0; wgy = 0;
+    if (wc2_movement_find_walkable_perimeter(b_eid, tp.x / 32, tp.y / 32,
+            bdef.px_w / 32, bdef.px_h / 32, p.x, p.y, &wgx, &wgy) != 0) {
+        wc2_movement_request(world, peasant_eid, wgx, wgy);
+    }
+    return 1;
+}
+
 // Pick the 4-neighbour of (tx, ty) closest to the peasant pixel
 // position (px, py) that is NOT pathfinder-blocked. Writes the
 // chosen cell into the out-pointers and returns 1; returns 0 when
@@ -777,6 +816,56 @@ static void _gather_visit(w, eid) {
                 // fires once PER ARRIVAL, not per frame, so it never thrashes
                 // the pathfinder.
                 wc2_gather_assign_tree(w, eid, tile_gx, tile_gy);
+            }
+            return;
+        }
+        if (gt.target_kind == GATHER_TARGET_REPAIR) {
+            // Mending a damaged building (Stratagus action_repair). gt.target
+            // is the building eid (like a mine). Walk to its perimeter, then
+            // restore HP per cycle while charging the owner gold/wood.
+            auto sh_b: Sheet, bdef: BuildingDef, cur, hpmax, hp, gcost, wcost;
+            auto mgx2, mgy2;
+            if (ecs_alive_at(w, gt.target) == 0) {
+                gt.target_kind = GATHER_TARGET_NONE; an.state = UNIT_STATE_IDLE; return;
+            }
+            b    = ecs_get(w, building_comp, gt.target);
+            bdef = building_def_for(b.kind);
+            sh_b = ecs_get(w, sheet_comp, gt.target);
+            cur   = cs_res_current(sh_b.handle, RES_HP);
+            hpmax = cs_res_max(sh_b.handle, RES_HP);
+            if (cur >= hpmax) {                       // fully mended -> done
+                gt.target_kind = GATHER_TARGET_NONE; an.state = UNIT_STATE_IDLE; return;
+            }
+            tp   = ecs_get(w, pos_comp, gt.target);
+            dist = _dist_sq(p.x + 16, p.y + 16, tp.x + 64, tp.y + 64);   // building centre
+            if (dist > reach_sq) {
+                // Landed short -> re-path to a fresh perimeter tile. The cursor
+                // gate above throttles this to once per arrival.
+                if (wc2_movement_find_walkable_perimeter(gt.target, tp.x / 32, tp.y / 32,
+                        bdef.px_w / 32, bdef.px_h / 32, p.x, p.y, &mgx2, &mgy2) != 0) {
+                    wc2_movement_request(w, eid, mgx2, mgy2);
+                }
+                return;
+            }
+            // In reach -> hammer: park (BUILD anim) + mend per cycle, charging
+            // resources. RepairCosts proportional to the build price (half for
+            // a full repair). Out of resources -> stop.
+            an.state       = UNIT_STATE_BUILD;
+            an.elapsed_ms  = an.elapsed_ms + _gather_dt;
+            gt.progress_ms = gt.progress_ms + _gather_dt;
+            if (gt.progress_ms >= _WC2_GATHER_TICK_MS) {
+                gt.progress_ms = 0;
+                hp = _WC2_REPAIR_HP;
+                if (hp > hpmax - cur) { hp = hpmax - cur; }
+                gcost = hp * bdef.cost_gold / hpmax * _WC2_REPAIR_NUM / _WC2_REPAIR_DEN;
+                wcost = hp * bdef.cost_wood / hpmax * _WC2_REPAIR_NUM / _WC2_REPAIR_DEN;
+                fa = ecs_get(w, faction_comp, eid);
+                if (wc2_resources_gold(fa.player) < gcost
+                    || wc2_resources_wood(fa.player) < wcost) {
+                    gt.target_kind = GATHER_TARGET_NONE; an.state = UNIT_STATE_IDLE; return;
+                }
+                wc2_resources_spend(fa.player, gcost, wcost);
+                cs_res_adjust(sh_b.handle, RES_HP, hp);
             }
             return;
         }
