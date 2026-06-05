@@ -287,7 +287,7 @@ explorer ray (start 3, ×1.5, 8 tries), `AiSendExplorers` 5 retries.
 | 3b | Wood/forest balance + NeededMask ×2 boost | 🟡 | We hold ≥1 chopper; no demand-driven rebalance, no "double the needy resource". |
 | 3c | Depot requests (new hall near far mines) | ❌ | `AiNewDepotRequest`/`AiGetSuitableDepot` — expand toward distant mines; **high value on big maps**. |
 | 3d | Supply | ✅ | Farms on demand (food within 2 of cap). |
-| 3e | Repair | ❌ | `AiCheckRepair` — repair damaged buildings with spare workers. |
+| 3e | Repair | ✅ | `_ai_check_repair` ≈ `AiCheckRepair` — one idle worker mends a damaged building, gated on gold. Shares `wc2_repair_assign` with the player command. `d763b8c`. |
 | 4a | Placement search | 🟡 | Ring search r=3..9. **Missing the surround/spacing check** → can box itself in or fail to place (suspected cause of the *AI-stuck* bug). |
 | 4b | Placement enemy-rejection | ❌ | Don't build within 8 tiles of enemies. |
 | 5a | Force composition → build orders | ✅ | `_ai_train_army` trains toward melee/ranged/cav. |
@@ -309,13 +309,17 @@ explorer ray (start 3, ×1.5, 8 tries), `AiSendExplorers` 5 retries.
 
 Ordered by *gameplay impact per LOC*, smallest robust wins first.
 
-> **Progress (2026-06-04):** items 1, 2 ✅ **DONE** + the deep movement fix
+> **Progress (2026-06-05):** items 1, 2, 3, 4 ✅ **DONE** + the deep movement fix
 > (dynamic-obstacle pathfinding, the real Stratagus `CostMoveToCallBack_Default`
 > mechanism) shipped — it wasn't a numbered item but turned out to be the root
 > of the worker pile-ups. The whole gather-contention pass landed (dynamic A* in
 > `stbpath` + two-pass fallback + per-tree / perimeter spread + `MoveToResource`
 > /`MoveToDepot` re-path on all three legs). Commits `0f26f67` `6dc1077`
-> `0752194` `91de6b3` `1846722` `75d2006` `0a4e294` `381d85b`. **Next: item 3.**
+> `0752194` `91de6b3` `1846722` `75d2006` `0a4e294` `381d85b`. Item 3 (depot) +
+> item 4 (repair, player + AI) shipped `d763b8c`. Also this stretch: the WC2 FOV
+> (640×480 Blizzard letterbox), portraits/command icons on the WC2 icon strip,
+> native foot-anchored unit draw, and the full `wc1_`→`wc2_` rename + stale-header
+> cleanup (`67e4304` `bb730a1`). **Next: item 5 (worker rebalance + NeededMask).**
 
 1. ✅ **Placement surround check (4a/4b).** `AiCheckSurrounding` ported into
    `_ai_build` (prefer fully-open, then <5-obstacle, then any valid). `0f26f67`.
@@ -328,8 +332,14 @@ Ordered by *gameplay impact per LOC*, smallest robust wins first.
    the mine via `_ai_build_near`. The gather already deposits at the nearest
    hall, so the second one load-balances itself. `_ai_build` refactored to
    `_ai_build_near(kind, gx0, gy0)`. (commit below)
-4. **Repair (3e).** Idle-worker repair of damaged buildings when resources are
-   flush.
+4. ✅ **Repair (3e).** `action_repair.cpp` ported as a third gather target
+   (`GATHER_TARGET_REPAIR`): per cycle restore HP + charge gold/wood
+   proportional to the build price (half for a full repair), stop when full /
+   broke. `wc2_repair_assign` is the shared entry for **both** sides — player
+   right-clicks a finished friendly damaged building (`rts2_input` 1d), AI keeps
+   one worker mending via `_ai_check_repair` / `AiCheckRepair` (idle worker
+   preferred, gated on gold ≥ 200, same one-builder gate as build/depot).
+   `d763b8c`.
 5. **Worker rebalance + NeededMask ×2 (3b).** Demand-driven gold/wood split;
    double the workers on a resource the build queue is starved of.
 6. **Rally-point force state (5c) + better target find (6a).** Gather at a safe

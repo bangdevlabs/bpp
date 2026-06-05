@@ -13016,3 +13016,46 @@ everyone working.
 - **Authenticity is a field-of-view decision, not just art.** The Blizzard
   remasters spell it out: preserve the classic view, letterbox for widescreen.
   Our 16:9 "no letterbox" optimisation had quietly broken the feel.
+
+## 2026-06-05 — rts2 (WC2 mod): worker repair (player + AI), and the wc1→wc2 rename
+
+Closed **item 4 of the AI port — repair** — and did it the way the user asked:
+study how Stratagus does it and ship the **player option too**, not an AI-only
+hack. `action_repair.cpp` ports cleanly as a **third gather target**
+(`GATHER_TARGET_REPAIR`), reusing everything the gather rework already built —
+the footprint-perimeter walker and the per-arrival re-path. Per cycle, if the
+building is below max HP, restore `_WC2_REPAIR_HP` and charge the owner gold +
+wood **proportional to the build price** (half the cost for a full repair),
+stopping when full or broke.
+
+The key design move: **`wc2_repair_assign` is the single entry point for both
+sides.** The player right-clicks a finished friendly damaged building with
+workers selected (`rts2_input` branch 1d — the per-worker "is it damaged?" and
+"is this a peasant?" checks live inside the assign, so a soldier-only selection
+or an undamaged building falls through to move/attack). The AI routes through
+the same function from `_ai_check_repair` (≈ Stratagus `AiCheckRepair`): keep
+**one** worker mending at a time (`_ai_repair_eid` persists it across ticks and
+re-marks it as the tick's builder so the economy pass doesn't yank it back to
+gathering), pull a worker only when a building is damaged and gold ≥ 200, under
+the same one-builder gate as build/depot. Same source, two callers, one model.
+`d763b8c`.
+
+Before the repair, knocked out the housekeeping the day's work had earned: the
+full **`wc1_`→`wc2_` rename** across all 16 rts2 files — functions, consts,
+comments — then a second pass fixing the stale **file-header / sibling
+references** (headers still read `wc2_X.bsm` / `rts1_ai.bsm` while the files are
+`rts2_*.bsm`) and the lingering "Warcraft 1" mentions, leaving the genuine
+historical `rts1` credits alone. `67e4304` / `bb730a1`.
+
+### Lessons
+
+- **"Do it right with the player option" is a tell that the feature is shared,
+  not AI-only.** Designing `wc2_repair_assign` as the common entry made the
+  player command and the AI upkeep two thin callers over one mechanic — the
+  damaged/peasant guards living in the assign meant the input branch didn't need
+  HP access at all.
+- **Rename in two passes: identifiers first, then the references the identifier
+  rename exposed.** The blanket `wc1→wc2` sweep left headers naming the file as
+  `wc2_X.bsm` when the file is `rts2_X.bsm`; only a second, narrower pass
+  (filenames + paths in comments) caught it, while preserving the `rts1` history
+  a blunt sweep would have erased.
