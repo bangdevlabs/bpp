@@ -1,7 +1,7 @@
-// wc1_buildings.bsm — building type table + ECS archetype + render.
+// wc2_buildings.bsm — building type table + ECS archetype + render.
 //
 // Session 8 introduces buildings as a second ECS archetype, distinct
-// from the unit archetype peasant_arch defined in wc1_render.bsm.
+// from the unit archetype peasant_arch defined in wc2_render.bsm.
 // Buildings differ from units in component set (no Path, Target,
 // AttackTarget, Anim, UnitType, Sprite — buildings own their two
 // atlases directly in the Building component) so they live in a
@@ -14,8 +14,8 @@
 // building_q (`1 << building_comp`) sees only buildings.
 //
 // Per buildings.lua: 9 building kinds across both factions. Cost +
-// HP + footprint numbers are SC1-flavored adaptations of the WC1
-// original values (the same "WC1 visual identity + SC1 mechanical
+// HP + footprint numbers are SC1-flavored adaptations of the WC2
+// original values (the same "WC2 visual identity + SC1 mechanical
 // depth" lens the unit roster uses). Construction times shipped
 // here are placeholders tuned for fast iteration — final pacing
 // lands when the resource economy arrives in S9.
@@ -32,7 +32,7 @@ load   "rts2_render.bsm";      // Pos / Faction / Sheet structs + their comp ids
 // Building kind enum. The faction-asymmetric pairs (church/temple,
 // stable/kennel, keep/spire) share a single kind constant — the
 // gameplay role is the same; only the rendered atlas differs by
-// faction. wc1_buildings_load_atlas picks the right atlas from the
+// faction. wc2_buildings_load_atlas picks the right atlas from the
 // caller-provided per-faction pair at spawn time.
 const BLDG_TOWN_HALL   = 0;
 const BLDG_FARM        = 1;
@@ -43,7 +43,7 @@ const BLDG_STABLE      = 5;   // orc kennel = same kind, different atlas
 const BLDG_CHURCH      = 6;   // orc temple = same kind, different atlas
 const BLDG_TOWER       = 7;
 const BLDG_KEEP        = 8;   // orc blackrock spire = same kind
-// S9 — neutral gold mine. Player 15 in WC1 / war1gus convention
+// S9 — neutral gold mine. Player 15 in WC2 / war1gus convention
 // (the "Neutral" faction). Spawned pre-DONE from the level
 // loader, gold reserve tracked per-instance via Building.payload
 // (the same word slot Building.assigned_peasant_eid uses for
@@ -52,13 +52,13 @@ const BLDG_GOLD_MINE   = 9;
 
 // Total kinds — sized for the v1 roster. Bump alongside the
 // `_bdef` block below if S10+ adds expansion-era buildings.
-const _WC1_BLDG_COUNT  = 10;
+const _WC2_BLDG_COUNT  = 10;
 
 // ── Construction state ─────────────────────────────────────────
 
 // Two-state machine. CONSTRUCTING runs the 3-frame scaffolding
 // loop on `atlas_construct`; DONE swaps to the 1-frame completed
-// `atlas_idle`. State transitions are owned by wc1_production —
+// `atlas_idle`. State transitions are owned by wc2_production —
 // this module just exposes the constants.
 const BLDG_STATE_CONSTRUCTING = 0;
 const BLDG_STATE_DONE         = 1;
@@ -73,18 +73,18 @@ const BLDG_STATE_DEPLETED     = 2;
 // campaign; `balancing.lua:85` rebalances it to 3 for multiplayer.
 // We take the campaign value. A worker arriving when the mine is
 // full waits at its perimeter tile (see _gather_visit's enter gate).
-const _WC1_MINE_MAX_ON_BOARD  = 5;
+const _WC2_MINE_MAX_ON_BOARD  = 5;
 
 // ── Static type table (BuildingDef) ────────────────────────────
 
 // Per-kind template. Same shape as UnitDef but for buildings:
 // HP, footprint in pixels, construction duration, resource cost,
 // and the supply contribution (farms + town halls add 5 each in
-// the WC1 baseline; combat buildings add 0). The build cost
+// the WC2 baseline; combat buildings add 0). The build cost
 // columns hook into S9's resource economy; today they're stored
 // but not consumed.
 //
-// Numbers cribbed from `war1gus/scripts/buildings.lua` with WC1
+// Numbers cribbed from `war1gus/scripts/buildings.lua` with WC2
 // "ticks" (30 ticks/sec) converted to milliseconds and trimmed to
 // keep playtesting tight. The original Town Hall is 100 ticks ≈
 // 3.3 s; we ship 12 s so the player sees the scaffolding cycle
@@ -130,7 +130,7 @@ static void _bdef(idx, hp, px_w, px_h, time_ms, gold, wood, supply) {
 // 4, town hall / keep 1, others 0).
 //                                hp   pw  ph   build  gold wood  supply
 void building_defs_init() {
-    _building_defs = malloc(_WC1_BLDG_COUNT * sizeof(BuildingDef));
+    _building_defs = malloc(_WC2_BLDG_COUNT * sizeof(BuildingDef));
     _bdef(BLDG_TOWN_HALL,        1200, 128, 128, 15300, 1200,  800,  1);
     _bdef(BLDG_FARM,              400, 64, 64,  6000,  500,  250,  4);
     _bdef(BLDG_BARRACKS,          800, 96, 96, 12000,  700,  450,  0);
@@ -151,7 +151,7 @@ void building_defs_init() {
 // Look up a building's template by kind. Returns 0 on out-of-range
 // so callers can probe blindly; defensive callers should check.
 building_def_for(kind) {
-    if (kind < 0 || kind >= _WC1_BLDG_COUNT) { return 0; }
+    if (kind < 0 || kind >= _WC2_BLDG_COUNT) { return 0; }
     return _building_defs + kind * sizeof(BuildingDef);
 }
 
@@ -184,15 +184,15 @@ struct Building {
                            // hits 0. Other kinds leave this at 0.
     active,                // S11 — gatherers currently INSIDE this mine
                            // (Stratagus Resource.Active model). Gated by
-                           // _WC1_MINE_MAX_ON_BOARD: a worker arriving
+                           // _WC2_MINE_MAX_ON_BOARD: a worker arriving
                            // when active >= cap waits at the perimeter
                            // instead of entering. ++ on enter, -- on
                            // leave / cancel. Mine-only; 0 for other kinds.
     // ── S10 production state (training queue + rally point) ───
-    train_queue,           // ptr to buf_word(_WC1_QUEUE_MAX) of UNIT_*
+    train_queue,           // ptr to buf_word(_WC2_QUEUE_MAX) of UNIT_*
                            // kinds; 0 until the first enqueue (lazy —
                            // non-producers never allocate it).
-    train_count,           // units currently queued (0.._WC1_QUEUE_MAX)
+    train_count,           // units currently queued (0.._WC2_QUEUE_MAX)
     train_progress_ms,     // elapsed training time for the front unit
     rally_gx,              // rally tile col, -1 = unset (spawn adjacent)
     rally_gy,              // rally tile row, -1 = unset
@@ -201,18 +201,18 @@ struct Building {
 }
 
 // Component id + archetype + query — populated by buildings_wire.
-// Same shape as the unit globals defined in wc1_render.bsm.
+// Same shape as the unit globals defined in wc2_render.bsm.
 global building_comp;
 global building_arch;
 global building_q;
 
-// Pos / Faction / Sheet component ids are owned by wc1_render.bsm's
+// Pos / Faction / Sheet component ids are owned by wc2_render.bsm's
 // ecs_wire. We extrn them here so the Building archetype reuses
 // the same registered slots — buildings have a position and a
 // faction tag, and their HP lives in the same CharSheet rail
 // units use.
 extrn pos_comp, faction_comp, sheet_comp;
-extrn wc1_debug;        // verbose building-event logging gate (set by rts.bpp)
+extrn wc2_debug;        // verbose building-event logging gate (set by rts.bpp)
 
 // Camera handle owned by rts.bpp — read by _render_building's
 // world-to-screen conversion.
@@ -283,7 +283,7 @@ ecs_spawn_building(world, atlas_idle: ptr, atlas_construct: ptr,
     // sheet keeps the spawn shape uniform with units so the combat
     // tick can damage buildings without a per-archetype branch.
     sh = ecs_get(world, sheet_comp, eid);
-    sh.handle = cs_new(WC1_STAT_COUNT, WC1_RES_COUNT);
+    sh.handle = cs_new(WC2_STAT_COUNT, WC2_RES_COUNT);
     cs_res_init(sh.handle, RES_HP, def.hp_max);
     // Building component — runtime state.
     b = ecs_get(world, building_comp, eid);
@@ -303,12 +303,12 @@ ecs_spawn_building(world, atlas_idle: ptr, atlas_construct: ptr,
     }
     // S8 assignment slot — -1 means "no peasant assigned yet, do
     // not progress". Construction is gated on a worker reaching
-    // the foundation tile (see wc1_production._tick_building).
-    // The right-click handler in wc1_input flips this to a real
+    // the foundation tile (see wc2_production._tick_building).
+    // The right-click handler in wc2_input flips this to a real
     // entity id when the player commands a selected peasant.
     b.assigned_peasant_eid = 0 - 1;
-    // S9 — gold mine reserve. Canonical WC1 default is 25,500
-    // gold per mine; spent in _WC1_GOLD_YIELD increments per
+    // S9 — gold mine reserve. Canonical WC2 default is 25,500
+    // gold per mine; spent in _WC2_GOLD_YIELD increments per
     // deposit cycle. Non-mine kinds leave this at 0 — only the
     // gather state machine reads the field.
     if (kind == BLDG_GOLD_MINE) {
@@ -319,7 +319,7 @@ ecs_spawn_building(world, atlas_idle: ptr, atlas_construct: ptr,
     // S11 — no gatherers inside yet (Stratagus Resource.Active starts 0).
     b.active = 0;
     // S10 — production queue starts empty. train_queue is lazy-
-    // allocated on the first enqueue (wc1_production_enqueue) so
+    // allocated on the first enqueue (wc2_production_enqueue) so
     // non-producer buildings (farms, towers, mines) never pay for
     // a buffer. Rally point is unset (-1) until the player right-
     // clicks the terrain with this building selected (S10.3).
@@ -335,8 +335,8 @@ ecs_spawn_building(world, atlas_idle: ptr, atlas_construct: ptr,
     // building's pixel-footprint so other units can't path
     // through and other buildings can't be placed on overlap.
     // Footprint = (px_w / 32) × (px_h / 32) tiles. Same
-    // wc1_collision_register API units use, with the building's
-    // encoded eid as the holder so wc1_movement's blocker-check
+    // wc2_collision_register API units use, with the building's
+    // encoded eid as the holder so wc2_movement's blocker-check
     // distinguishes it from peasant-claimed cells.
     _claim_building_footprint(eid, gx, gy, def);
     return eid;
@@ -359,8 +359,8 @@ static void _claim_building_footprint(eid, gx, gy, def: BuildingDef) {
     nty = def.px_h / 32;
     for (dy = 0; dy < nty; dy++) {
         for (dx = 0; dx < ntx; dx++) {
-            wc1_collision_register(eid, gx + dx, gy + dy);
-            wc1_movement_block_path_tile(gx + dx, gy + dy);
+            wc2_collision_register(eid, gx + dx, gy + dy);
+            wc2_movement_block_path_tile(gx + dx, gy + dy);
         }
     }
 }
@@ -368,10 +368,10 @@ static void _claim_building_footprint(eid, gx, gy, def: BuildingDef) {
 // Raze a building: the inverse of _claim_building_footprint. Frees every
 // footprint tile (occupancy + path block) so units can walk the rubble,
 // frees the CharSheet, and kills the ECS row. Called by combat
-// (wc1_combat._combat_step) when a building's HP reaches 0 — buildings
+// (wc2_combat._combat_step) when a building's HP reaches 0 — buildings
 // have no death animation and aren't ticked by the combat walk, so the
 // teardown happens here in one shot.
-void wc1_building_destroy(w, eid) {
+void wc2_building_destroy(w, eid) {
     auto b: Building, def: BuildingDef, p: Pos, sh: Sheet;
     auto gx, gy, ntx, nty, dx, dy;
     b   = ecs_get(w, building_comp, eid);
@@ -382,15 +382,15 @@ void wc1_building_destroy(w, eid) {
         ntx = def.px_w / 32; nty = def.px_h / 32;
         for (dy = 0; dy < nty; dy++) {
             for (dx = 0; dx < ntx; dx++) {
-                wc1_collision_release(gx + dx, gy + dy);
-                wc1_movement_unblock_tile(gx + dx, gy + dy);
+                wc2_collision_release(gx + dx, gy + dy);
+                wc2_movement_unblock_tile(gx + dx, gy + dy);
             }
         }
     }
     sh = ecs_get(w, sheet_comp, eid);
     cs_free(sh.handle);
     ecs_kill_at(w, eid);
-    if (wc1_debug != 0) { putstr("building razed eid="); putnum(eid); putstr("\n"); }
+    if (wc2_debug != 0) { putstr("building razed eid="); putnum(eid); putstr("\n"); }
     return;
 }
 
@@ -477,7 +477,7 @@ ecs_render_buildings(world) {
 
 // Scratch for the building hit-test walk. ecs_query_each callbacks
 // can't pass extra state directly so the click coords + result
-// flow through globals — same shape wc1_input's unit hit-test
+// flow through globals — same shape wc2_input's unit hit-test
 // uses.
 static auto _bldg_hit_wx, _bldg_hit_wy;
 static auto _bldg_hit_eid;
@@ -504,9 +504,9 @@ static void _bldg_hit_test_cb(w, eid) {
 
 // Find the building (if any) at world point (wx, wy). Returns
 // the entity id, or -1 when no building's footprint covers that
-// pixel. Used by wc1_input's right-click branch to decide
+// pixel. Used by wc2_input's right-click branch to decide
 // peasant-assignment vs the existing attack / move dispatch.
-wc1_building_at_world(world, wx, wy) {
+wc2_building_at_world(world, wx, wy) {
     _bldg_hit_wx  = wx;
     _bldg_hit_wy  = wy;
     _bldg_hit_eid = 0 - 1;
@@ -517,14 +517,14 @@ wc1_building_at_world(world, wx, wy) {
 // Pick a free tile adjacent to the building's footprint that the
 // worker can stand on while constructing. Walks the perimeter
 // ring (one tile outside the footprint) clockwise from the
-// south-center — peasants approach from the south in the WC1
+// south-center — peasants approach from the south in the WC2
 // convention — and returns the first cell that's not currently
 // occupied by another entity (the worker itself, the foundation,
-// or any other unit) according to `wc1_collision_is_blocked_for`.
+// or any other unit) according to `wc2_collision_is_blocked_for`.
 //
 // Returns the (gx, gy) of the free tile through the out-pointers
 // and 1 on success, 0 if the entire ring is blocked. Caller
-// (wc1_building_assign_peasant) falls back to the foundation's
+// (wc2_building_assign_peasant) falls back to the foundation's
 // top-left when the ring is fully blocked — A* will halt at
 // whatever's reachable.
 static _find_free_perimeter_tile(self_eid, fgx, fgy, ntx, nty,
@@ -563,7 +563,7 @@ static _find_free_perimeter_tile(self_eid, fgx, fgy, ntx, nty,
     for (i = 0; i < n; i++) {
         cx = candidates[i * 2 + 0];
         cy = candidates[i * 2 + 1];
-        if (wc1_collision_is_blocked_for(self_eid, cx, cy) == 0) {
+        if (wc2_collision_is_blocked_for(self_eid, cx, cy) == 0) {
             *(out_gx) = cx;
             *(out_gy) = cy;
             free(candidates);
@@ -585,10 +585,10 @@ static _find_free_perimeter_tile(self_eid, fgx, fgy, ntx, nty,
 // around the footprint instead.
 //
 // No-op if the building is already DONE or is owned by a
-// different faction; callers (wc1_input) gate these but the
+// different faction; callers (wc2_input) gate these but the
 // defensive check keeps the API misuse-safe.
 extrn faction_comp, target_comp, attack_target_comp, anim_comp, path_comp;
-wc1_building_assign_peasant(world, building_eid, peasant_eid) {
+wc2_building_assign_peasant(world, building_eid, peasant_eid) {
     auto b: Building, fa_b: Faction, fa_p: Faction;
     auto (p, p_w): Pos;
     auto def: BuildingDef;
@@ -635,7 +635,7 @@ wc1_building_assign_peasant(world, building_eid, peasant_eid) {
         an.state      = UNIT_STATE_IDLE;
         an.elapsed_ms = 0;
     }
-    wc1_movement_request(world, peasant_eid, target_gx, target_gy);
+    wc2_movement_request(world, peasant_eid, target_gx, target_gy);
     // Debug — confirms the assignment AND surfaces whether
     // path_find actually built a route. pa.count > 0 means the
     // worker has a real path; pa.count == 0 means the destination
@@ -643,7 +643,7 @@ wc1_building_assign_peasant(world, building_eid, peasant_eid) {
     // unit + tight terrain) and the worker will idle in place.
     pa = ecs_get(world, path_comp, peasant_eid);
     p_w = ecs_get(world, pos_comp, peasant_eid);
-    if (wc1_debug != 0) {
+    if (wc2_debug != 0) {
         putstr("peasant assigned to construction: eid=");
         putnum(peasant_eid);
         putstr(" -> building eid=");

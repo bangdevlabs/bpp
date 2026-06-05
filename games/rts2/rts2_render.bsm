@@ -1,9 +1,9 @@
-// wc1_render.bsm — ECS wiring + spawn + per-frame render walk.
+// wc2_render.bsm — ECS wiring + spawn + per-frame render walk.
 //
 // Session 3 ships one archetype (peasant) with three components:
 // Pos (grid coords), Sprite (atlas + frame), UnitType (kind tag).
 // Render is a thin walk that reads Pos + Sprite per entity and
-// calls image_draw_size with the WC1 visual offset (sprites are
+// calls image_draw_size with the WC2 visual offset (sprites are
 // 32 px tall but tiles are 16 px, so each peasant overhangs one
 // tile row — center horizontally + bottom-align so the feet sit
 // on the tile, matching war1gus).
@@ -21,12 +21,12 @@ import "stbcharsheet.bsm";
 load   "rts2_units.bsm";
 load   "rts2_anims.bsm";
 
-// S9 — Gather component constants (mirrored from wc1_gather.bsm
-// to avoid a wc1_render ↔ wc1_gather load cycle). The render
+// S9 — Gather component constants (mirrored from wc2_gather.bsm
+// to avoid a wc2_render ↔ wc2_gather load cycle). The render
 // path inlines the carry-atlas dispatch + mine-hide check
 // because both are one-struct-load decisions that don't earn
-// a cross-module function call. wc1_gather owns the writes;
-// wc1_render only reads.
+// a cross-module function call. wc2_gather owns the writes;
+// wc2_render only reads.
 const _GATHER_TARGET_NONE_RD = 0;
 const _GATHER_TARGET_MINE_RD = 1;
 const _CARRY_NONE_RD         = 0;
@@ -34,8 +34,8 @@ const _CARRY_GOLD_RD         = 1;
 const _CARRY_WOOD_RD         = 2;
 
 // Per-faction carry atlases — populated by rts.bpp at startup via
-// `wc1_render_set_carry_atlases`. Mirrors the symmetric setup in
-// wc1_gather (both modules read these for their own dispatch); we
+// `wc2_render_set_carry_atlases`. Mirrors the symmetric setup in
+// wc2_gather (both modules read these for their own dispatch); we
 // keep TWO copies instead of one shared global because the cycle
 // would require `import` instead of `load`, and the four extrn
 // slots live on the bare-minimum heap (32 bytes).
@@ -44,7 +44,7 @@ static auto _render_carry_atlas_human_wood;
 static auto _render_carry_atlas_orc_gold;
 static auto _render_carry_atlas_orc_wood;
 
-void wc1_render_set_carry_atlases(human_gold, human_wood,
+void wc2_render_set_carry_atlases(human_gold, human_wood,
                                   orc_gold,   orc_wood) {
     _render_carry_atlas_human_gold = human_gold;
     _render_carry_atlas_human_wood = human_wood;
@@ -59,16 +59,16 @@ void wc1_render_set_carry_atlases(human_gold, human_wood,
 // Sprite carries the atlas pointer per entity so future archetypes
 // can reference their own atlas without a global-table lookup.
 // UnitType is the kind tag (UNIT_PEASANT etc). Target carries the
-// right-clicked DESTINATION GRID CELL set by wc1_input; gx == -1
+// right-clicked DESTINATION GRID CELL set by wc2_input; gx == -1
 // sentinel means "no target". Path tracks the active movement
 // intent: `mode` switches between A* waypoints (0) and flow-field
-// sampling (1) — see wc1_movement.bsm PATH_MODE_*; `buf` is a per-
+// sampling (1) — see wc2_movement.bsm PATH_MODE_*; `buf` is a per-
 // unit buf_word(MAX_WP * 2) used by mode 0; `count` is the live
 // waypoint count (0 = no path); `cursor` is the next waypoint
 // index. In flow mode `count` / `cursor` are unused — the field
 // itself drives the next-tile sample each frame. `tile_gx` /
 // `tile_gy` is the unit's CURRENT TILE CLAIM in the occupancy
-// grid (see wc1_movement.bsm `_occupied`); transferred atomically
+// grid (see wc2_movement.bsm `_occupied`); transferred atomically
 // whenever the micro-target tile changes so two units can never
 // stack on the same tile.
 struct Pos      { x, y }
@@ -97,12 +97,12 @@ struct Sheet    { handle }
 // when it crosses STAT_COOLDOWN_MS, then resets to 0.
 struct AttackTarget { eid, last_attack_ms }
 // Anim drives the per-unit animation state. `state` is one of
-// UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc1_anims.bsm)
+// UNIT_STATE_IDLE / UNIT_STATE_WALK (const enums in wc2_anims.bsm)
 // — used to dispatch between idle anim and walk anim families.
 // `facing` is one of FACE_N..FACE_NW (clockwise from north,
 // 0..7); picks which atlas tag to play and whether to mirror
 // horizontally. `elapsed_ms` accumulates since the last state OR
-// facing change so wc1_movement can reset the cycle to frame 0
+// facing change so wc2_movement can reset the cycle to frame 0
 // when the unit turns or starts/stops.
 struct Anim     { state, facing, elapsed_ms }
 // S9 — gather state. Carried by every peasant in the unit
@@ -112,7 +112,7 @@ struct Anim     { state, facing, elapsed_ms }
 // index gy*map_w+gx (TREE). `deposit_eid` is latched to the
 // nearest town hall on the first cycle so subsequent runs route
 // through the same building. `progress_ms` accumulates dt while
-// peasant is at the target; reaches _WC1_GATHER_TICK_MS and the
+// peasant is at the target; reaches _WC2_GATHER_TICK_MS and the
 // peasant flips to RETURNING_*. `carry` is CARRY_NONE / GOLD /
 // WOOD — drives the atlas swap to peasant_with_gold /
 // peasant_with_wood while the peasant walks back.
@@ -138,7 +138,7 @@ global peasant_arch, peasant_q;
 // environment. The hit / kill / target / AI-state lines flood the
 // terminal AND show up in the frame profile (putstr was the #2 cost
 // during a stress battle), so they only print when explicitly asked for.
-global wc1_debug;
+global wc2_debug;
 
 // Camera handle owned by rts.bpp. Read by _render_unit via
 // cam_x / cam_y accessors to subtract the viewport offset from
@@ -222,9 +222,9 @@ ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     t.gx = -1;
     t.gy = -1;
     // Per-unit path buffer. count = 0 means "no path", so the
-    // movement tick is a no-op until wc1_input writes a target
+    // movement tick is a no-op until wc2_input writes a target
     // and the path planner populates count + cursor. mode = 0
-    // is PATH_MODE_ASTAR (defined in wc1_movement.bsm); a fresh
+    // is PATH_MODE_ASTAR (defined in wc2_movement.bsm); a fresh
     // peasant always starts on the A* code path. tile_gx /
     // tile_gy mirror the spawn tile so the unit's occupancy
     // claim aligns with its initial Pos.
@@ -237,9 +237,9 @@ ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     pa.tile_gy = gy;
     // Reserve the spawn tile in the shared occupancy grid so
     // pathing for OTHER units treats this peasant as a blocker.
-    wc1_collision_register(eid, gx, gy);
+    wc2_collision_register(eid, gx, gy);
     // Initial anim state: idle facing south (the convention every
-    // WC1 unit sprite renders by default). wc1_movement updates
+    // WC2 unit sprite renders by default). wc2_movement updates
     // facing per step + flips to UNIT_STATE_WALK when a path is
     // active.
     an = ecs_get(world, anim_comp, eid);
@@ -259,7 +259,7 @@ ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
     sh = ecs_get(world, sheet_comp, eid);
     sh.handle = cs_clone(def.tmpl);
     // AttackTarget — sentinel -1 means "no target." Right-click
-    // on an enemy unit (wc1_input.bsm) writes the target eid; the
+    // on an enemy unit (wc2_input.bsm) writes the target eid; the
     // combat tick reads + engages. last_attack_ms accumulates
     // toward STAT_COOLDOWN_MS while in range.
     at = ecs_get(world, attack_target_comp, eid);
@@ -278,9 +278,9 @@ ecs_spawn_unit(world, atlas, gx, gy, player, kind) {
 }
 
 // Per-entity render callback. Reads Pos + Sprite + Anim, resolves
-// the current animation frame via wc1_anim_id_for + image_anim_frame,
+// the current animation frame via wc2_anim_id_for + image_anim_frame,
 // then dispatches to image_draw_size or image_draw_size_flipped
-// depending on whether the facing requires horizontal mirror (WC1
+// depending on whether the facing requires horizontal mirror (WC2
 // only stores 5 facings; W/NW/SW reuse E/NE/SE flipped).
 //
 // Per-entity render callback. Sprite size comes from the unit's
@@ -308,7 +308,7 @@ static void _render_unit(w, eid) {
     px    = def.frame_w;
     off_x = 16 - def.anc_x;
     off_y = 32 - def.anc_y;
-    // S9 — peasants inside a gold mine vanish (canonical WC1
+    // S9 — peasants inside a gold mine vanish (canonical WC2
     // feedback). The gather state machine sets the Anim.state to
     // GATHER_GOLD only after the peasant arrives at the mine,
     // so this check skips the actual draw without removing the
@@ -320,10 +320,10 @@ static void _render_unit(w, eid) {
     }
     anim_id = 0;
     flip    = 0;
-    wc1_anim_id_for(an.state, an.facing, &anim_id, &flip);
+    wc2_anim_id_for(an.state, an.facing, &anim_id, &flip);
     // S9 — atlas swap. Peasants carrying gold / wood render
     // through the peasant_with_* / peon_with_* atlases so the
-    // WC1 carry visual shows up. Faction read tells us which
+    // WC2 carry visual shows up. Faction read tells us which
     // sprite set to use (human vs orc).
     // Carry sprite is a PEASANT-only visual. Guard on kind so a
     // military unit that happens to carry stale gather state (ECS slot

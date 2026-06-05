@@ -1,4 +1,4 @@
-// wc1_gather.bsm — Session 9 gather state machine.
+// wc2_gather.bsm — Session 9 gather state machine.
 //
 // Owns the peasant gold-mining + tree-chopping loop:
 //
@@ -19,44 +19,44 @@
 //                      ▼
 //   UNIT_STATE_GATHER_GOLD  (sprite hidden; mine.assigned = eid)
 //                      │
-//                      │  (progress_ms >= _WC1_GATHER_TICK_MS)
+//                      │  (progress_ms >= _WC2_GATHER_TICK_MS)
 //                      ▼
 //   UNIT_STATE_RETURNING_GOLD  (sprite swapped to peasant_with_gold;
 //                                walking to deposit_eid)
 //                      │
 //                      │  (peasant.x within 24 px of town hall)
 //                      ▼
-//   deposit → wc1_gold += yield → mine.gold_remaining -= yield
+//   deposit → wc2_gold += yield → mine.gold_remaining -= yield
 //                      │
 //                      │  (mine still has gold)
 //                      ▼
 //   UNIT_STATE_WALK  → back to mine    (loop)
 //
 // Wood follows the same shape with the tree-tile flip standing in
-// for the mine-hide step. `wc1_gather_tick` is called once per game
+// for the mine-hide step. `wc2_gather_tick` is called once per game
 // tick from rts.bpp; it iterates every peasant whose Gather.target_kind
 // is non-zero. Peasants without a gather assignment pay one branch
 // per tick (the early-return).
 //
 // Tonify Rule 33 — Tier 3 game module (`games/rts1/`). Reuses
 // stbecs / stbgrid / stbcamera, and lives next to the other
-// wc1_* per-game files.
+// wc2_* per-game files.
 
 import "stbecs.bsm";
 import "stbcamera.bsm";
 import "stbtile.bsm";
 import "stbgrid.bsm";
-load   "rts2_resources.bsm";   // wc1_resources_deposit, CARRY_*, tick budget
+load   "rts2_resources.bsm";   // wc2_resources_deposit, CARRY_*, tick budget
 load   "rts2_anims.bsm";       // UNIT_STATE_*, FACE_*
 load   "rts2_buildings.bsm";   // Building, building_q, building_comp, BLDG_*
 load   "rts2_render.bsm";      // Pos / Anim / Gather / peasant_q / *_comp
-load   "rts2_movement.bsm";    // wc1_movement_request
+load   "rts2_movement.bsm";    // wc2_movement_request
 
 extrn building_comp, building_q;
 extrn pos_comp, anim_comp, sprite_comp, target_comp, gather_comp;
-extrn peasant_q, faction_comp, path_comp;
+extrn peasant_q, faction_comp, path_comp, sheet_comp;   // sheet_comp: building HP (repair)
 
-// ── Public constants (mirror wc1_resources.bsm's CARRY_*) ──────
+// ── Public constants (mirror wc2_resources.bsm's CARRY_*) ──────
 // Defined above the first consumer (_reset_anim_if_gathering reads
 // GATHER_TARGET_MINE) so the single-pass parser has them in scope —
 // a `const` is compile-time literal substitution, so it must precede
@@ -64,6 +64,16 @@ extrn peasant_q, faction_comp, path_comp;
 const GATHER_TARGET_NONE = 0;
 const GATHER_TARGET_MINE = 1;
 const GATHER_TARGET_TREE = 2;
+const GATHER_TARGET_REPAIR = 3;     // worker mending a damaged building
+
+// Repair (Stratagus action_repair model): each repair cycle restores HP and
+// charges resources proportional to the building. _WC2_REPAIR_HP is restored
+// per _WC2_GATHER_TICK_MS; the gold/wood cost is HP_restored / hp_max × cost ×
+// REPAIR_NUM/REPAIR_DEN, so fully repairing a building costs about half its
+// build price (WC2's repair tax). Resources run out → the worker stops.
+const _WC2_REPAIR_HP      = 100;    // HP mended per cycle
+const _WC2_REPAIR_NUM     = 1;      // cost factor numerator   (1/2 = half build
+const _WC2_REPAIR_DEN     = 2;      // cost factor denominator  cost for full repair)
 
 // Reset the peasant's animation state back to IDLE when a fresh
 // command lands while it is parked at a resource. _step_unit
@@ -111,43 +121,43 @@ static void _reset_anim_if_gathering(world, peasant_eid) {
 // mine centre. 96 leaves slack for the peasant tile-step
 // granularity; bigger than 96 risks overlapping unrelated
 // resources in tight forests.
-const _WC1_GATHER_REACH_PX = 96;
+const _WC2_GATHER_REACH_PX = 96;
 
 // ── Tree-tile state (Phase C — tree-to-stump flip) ─────────────
 //
 // When a peasant finishes chopping a tree, the tile flips to a
 // felled-tile variant. The pathfinder needs to unblock that cell
 // so the peasant can walk THROUGH it to the next target. The
-// felled tile (109, plain grass — `_WC1_FELLED_TILE` exported by
-// wc1_movement.bsm) is walkable; the path / occupancy grids both
+// felled tile (109, plain grass — `_WC2_FELLED_TILE` exported by
+// wc2_movement.bsm) is walkable; the path / occupancy grids both
 // get rewired so peasants can stand on it.
 //
 // Per-tile remaining-wood counter — every fresh tree carries
-// `_WC1_TREE_RESERVE` wood. Each chop tick deducts one yield;
+// `_WC2_TREE_RESERVE` wood. Each chop tick deducts one yield;
 // when it hits 0, the tile flips. The counter lives in a grid
 // keyed by tile linear index (gy*map_w+gx) so multiple peasants
 // chopping the same tile share the same accounting.
 //
 // The "is this a tree?" predicate spans the whole 71..87 forest
-// cluster (see wc1_movement.bsm) — every variant in the tileset
-// stands for some flavour of tree. The shared `wc1_is_forest_tile`
+// cluster (see wc2_movement.bsm) — every variant in the tileset
+// stands for some flavour of tree. The shared `wc2_is_forest_tile`
 // helper is the single truth used by the chop assignment, the
 // tick's reach check, and the lazy-seed in `_tree_wood_get`.
-const _WC1_TREE_RESERVE    = 100;   // one yield per tree — matches
-                                     // WC1's per-tree economy
+const _WC2_TREE_RESERVE    = 100;   // one yield per tree — matches
+                                     // WC2's per-tree economy
                                      // (a peasant fells a tree in one
                                      // gather cycle).
 
-extrn world_map;                   // Tilemap handle from wc1_render
-extrn _pf;                         // shared A* pathfinder from wc1_movement
+extrn world_map;                   // Tilemap handle from wc2_render
+extrn _pf;                         // shared A* pathfinder from wc2_movement
 
 // Walkable tile written into the map when a tree is felled — the
 // chopped cell reverts to plain grass (82, the dominant WC2 summer
 // grass value) so it reads as cleared ground instead of still looking
-// like forest. Mirrors `_WC1_FELLED_TILE` in wc1_movement.bsm (kept as
+// like forest. Mirrors `_WC2_FELLED_TILE` in wc2_movement.bsm (kept as
 // a local const because B++ `const` values are per-module compile-time
 // symbols, not extrn'd globals — keep the two in sync).
-const _WC1_FELLED_TILE_ID  = 82;
+const _WC2_FELLED_TILE_ID  = 82;
 
 // Map-aligned grid sized to the level dims; one word per tile holds
 // the remaining wood. Lazy-allocated on first chop assignment so
@@ -207,8 +217,8 @@ static _tree_wood_get(gx, gy) {
     // first read so the chop tick has a real counter to decrement.
     // The tile-id check ensures non-tree tiles (grass, paths)
     // don't accidentally turn into chop targets.
-    if (v == 0 && wc1_is_forest_tile(tile_get(world_map, gx, gy)) != 0) {
-        v = _WC1_TREE_RESERVE;
+    if (v == 0 && wc2_is_forest_tile(tile_get(world_map, gx, gy)) != 0) {
+        v = _WC2_TREE_RESERVE;
         grid_set(_tree_wood, gx, gy, v);
     }
     return v;
@@ -222,7 +232,7 @@ static void _tree_wood_set(gx, gy, v) {
 // ── Find nearest town hall (or any deposit-class building) ─────
 //
 // A peasant arriving at the mine with gold needs to know where
-// to drop it. Canonical WC1 routes both gold AND wood through
+// to drop it. Canonical WC2 routes both gold AND wood through
 // the town hall; the lumber mill discount is a later tech. For
 // v1 every deposit goes to the nearest friendly town hall.
 //
@@ -267,14 +277,14 @@ static _find_nearest_town_hall(world, peasant_eid) {
     return _nearest_th_best_eid;
 }
 
-// ── Assignment entry points (called from wc1_input.bsm) ────────
+// ── Assignment entry points (called from wc2_input.bsm) ────────
 //
 // Both return 1 on success (gather started), 0 if the assignment
 // is rejected (e.g. building is not a mine, mine is depleted,
 // peasant is not actually a worker). The input layer can fall
 // through to a regular move command on rejection.
 
-wc1_gather_assign_mine(world, peasant_eid, mine_eid) {
+wc2_gather_assign_mine(world, peasant_eid, mine_eid) {
     auto gt: Gather, b: Building, mp: Pos;
     auto gx, gy;
     b = ecs_get(world, building_comp, mine_eid);
@@ -300,24 +310,24 @@ wc1_gather_assign_mine(world, peasant_eid, mine_eid) {
     // Discover a walkable perimeter tile dynamically — forest1.json
     // wraps some mines in trees on the south edge so the canonical
     // "south of footprint" target is path-blocked and the peasant
-    // never starts walking. `wc1_movement_find_walkable_perimeter`
+    // never starts walking. `wc2_movement_find_walkable_perimeter`
     // scans the entire ring; fallback to the south-mid tile only if
     // the whole perimeter is walled in (would have failed anyway).
     mp = ecs_get(world, pos_comp, mine_eid);
-    if (wc1_movement_find_walkable_perimeter(mine_eid,
+    if (wc2_movement_find_walkable_perimeter(mine_eid,
                                              mp.x / 32, mp.y / 32,
                                              4, 4, 0 - 1, 0 - 1, &gx, &gy) == 0) {
         gx = (mp.x + 64) / 32;
         gy = (mp.y + 128) / 32;
     }
-    wc1_movement_request(world, peasant_eid, gx, gy);
+    wc2_movement_request(world, peasant_eid, gx, gy);
     return 1;
 }
 
-wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
+wc2_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
     auto gt: Gather, p: Pos;
     auto walk_gx, walk_gy;
-    if (wc1_is_forest_tile(tile_get(world_map, tile_gx, tile_gy)) == 0) {
+    if (wc2_is_forest_tile(tile_get(world_map, tile_gx, tile_gy)) == 0) {
         return 0;
     }
     _ensure_tree_grid();
@@ -345,7 +355,7 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
         return 0;
     }
     _tree_claim_set(tile_gx, tile_gy, peasant_eid + 1);   // reserve this tree
-    wc1_movement_request(world, peasant_eid, walk_gx, walk_gy);
+    wc2_movement_request(world, peasant_eid, walk_gx, walk_gy);
     return 1;
 }
 
@@ -353,11 +363,11 @@ wc1_gather_assign_tree(world, peasant_eid, tile_gx, tile_gy) {
 // Lets a caller start a wood-gather without already knowing a tree tile
 // (the AI uses it to put a worker on lumber near its town hall).
 // Returns 1 if a tree was found + assigned, 0 if no forest is in range.
-wc1_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
+wc2_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
     auto ntx, nty;
     ntx = 0; nty = 0;
     if (_nearest_tree(world, ref_gx, ref_gy, peasant_eid, &ntx, &nty) == 0) { return 0; }
-    return wc1_gather_assign_tree(world, peasant_eid, ntx, nty);
+    return wc2_gather_assign_tree(world, peasant_eid, ntx, nty);
 }
 
 // Pick the 4-neighbour of (tx, ty) closest to the peasant pixel
@@ -366,7 +376,7 @@ wc1_gather_assign_nearest_tree(world, peasant_eid, ref_gx, ref_gy) {
 // every neighbour is blocked (rare — happens only when the tree
 // sits in a fully enclosed forest pocket). 4-neighbour (no
 // diagonals) keeps the chop animation visually aligned with the
-// cardinal-face frames in wc1_anims.
+// cardinal-face frames in wc2_anims.
 static _nearest_walkable_neighbor(px, py, tx, ty, self_eid, out_gx, out_gy) {
     auto best_gx, best_gy, best_d, found;       // PREFER: terrain-walkable AND unit-free
     auto fb_gx, fb_gy, fb_d, fb_found;          // FALLBACK: any terrain-walkable
@@ -389,7 +399,7 @@ static _nearest_walkable_neighbor(px, py, tx, ty, self_eid, out_gx, out_gy) {
         if (path_is_blocked(_pf, gx, gy) != 0) { continue; }   // terrain wall
         d = _dist_sq(px, py, gx * 32 + 16, gy * 32 + 16);
         if (d < fb_d) { fb_gx = gx; fb_gy = gy; fb_d = d; fb_found = 1; }
-        if (wc1_collision_is_blocked_for(self_eid, gx, gy) == 0 && d < best_d) {
+        if (wc2_collision_is_blocked_for(self_eid, gx, gy) == 0 && d < best_d) {
             best_gx = gx; best_gy = gy; best_d = d; found = 1;
         }
     }
@@ -401,13 +411,13 @@ static _nearest_walkable_neighbor(px, py, tx, ty, self_eid, out_gx, out_gy) {
 // Nearest forest tile to (gx, gy), ring-searched outward. Writes the
 // cell into the out-pointers + returns 1; 0 if no forest within range.
 // Used to auto-continue wood gathering onto the next tree after the
-// current one is felled, so wood loops like gold (WC1 peasants keep
+// current one is felled, so wood loops like gold (WC2 peasants keep
 // working the forest down).
 // True if (x, y) is in-bounds and NOT a (blocking) forest tile — i.e.
 // open ground a worker can stand on to chop an adjacent tree.
 static _tile_open(tm: Tilemap, w, h, x, y) {
     if (x < 0 || y < 0 || x >= w || y >= h) { return 0; }
-    return wc1_is_forest_tile(tile_get(tm, x, y)) == 0;
+    return wc2_is_forest_tile(tile_get(tm, x, y)) == 0;
 }
 
 static _nearest_tree(world, gx, gy, self_eid, out_x, out_y) {
@@ -432,7 +442,7 @@ static _nearest_tree(world, gx, gy, self_eid, out_x, out_y) {
                 if (dx == 0 - r || dx == r || dy == 0 - r || dy == r) {
                     x = gx + dx; y = gy + dy;
                     if (x >= 0 && y >= 0 && x < w && y < h
-                        && wc1_is_forest_tile(tile_get(tm, x, y)) != 0
+                        && wc2_is_forest_tile(tile_get(tm, x, y)) != 0
                         && (_tile_open(tm, w, h, x - 1, y) != 0
                          || _tile_open(tm, w, h, x + 1, y) != 0
                          || _tile_open(tm, w, h, x, y - 1) != 0
@@ -458,13 +468,13 @@ static _nearest_tree(world, gx, gy, self_eid, out_x, out_y) {
     return 0;
 }
 
-// Clear the gather assignment. Called by wc1_input.bsm's
+// Clear the gather assignment. Called by wc2_input.bsm's
 // movement-issue path (right-click on ground while a peasant is
 // gathering cancels the loop). Also wakes the peasant out of any
 // in-flight GATHER animation — _step_unit early-returns for that
 // state, so the worker would otherwise stay frozen on the chop
 // frame when the player cancels mid-gather.
-void wc1_gather_clear(world, peasant_eid) {
+void wc2_gather_clear(world, peasant_eid) {
     auto gt: Gather;
     _reset_anim_if_gathering(world, peasant_eid);
     _tree_release(world, peasant_eid);   // free the tree this worker reserved
@@ -475,10 +485,10 @@ void wc1_gather_clear(world, peasant_eid) {
 }
 
 // True if the peasant currently has a gather assignment. Used by
-// wc1_render to swap the atlas to a carry sprite + by the input
+// wc2_render to swap the atlas to a carry sprite + by the input
 // layer to skip the movement-cancel branch when a fresh gather
 // assignment lands.
-wc1_gather_is_active(world, peasant_eid) {
+wc2_gather_is_active(world, peasant_eid) {
     auto gt: Gather;
     gt = ecs_get(world, gather_comp, peasant_eid);
     return gt.target_kind != GATHER_TARGET_NONE;
@@ -486,7 +496,7 @@ wc1_gather_is_active(world, peasant_eid) {
 
 // Returns the peasant's carry kind (NONE/GOLD/WOOD) for atlas
 // swap in the render path.
-wc1_gather_carry(world, peasant_eid) {
+wc2_gather_carry(world, peasant_eid) {
     auto gt: Gather;
     gt = ecs_get(world, gather_comp, peasant_eid);
     return gt.carry;
@@ -495,7 +505,7 @@ wc1_gather_carry(world, peasant_eid) {
 // Manual delivery — route a peasant carrying gold/wood to a
 // specific town hall to drop it off. Called by the input layer
 // when the player right-clicks a friendly DONE town hall while
-// the worker carries a resource (canonical WC1 "I picked up the
+// the worker carries a resource (canonical WC2 "I picked up the
 // log but the auto-deliver was cancelled — let me drop this off
 // here please" interaction).
 //
@@ -506,7 +516,7 @@ wc1_gather_carry(world, peasant_eid) {
 // keeps the with-log sprite during the walk.
 //
 // No-op when carry == CARRY_NONE: there's nothing to deliver.
-void wc1_gather_route_to_deposit(world, peasant_eid, th_eid) {
+void wc2_gather_route_to_deposit(world, peasant_eid, th_eid) {
     auto gt: Gather, an: Anim, p: Pos;
     auto drop_gxy;
     gt = ecs_get(world, gather_comp, peasant_eid);
@@ -515,7 +525,7 @@ void wc1_gather_route_to_deposit(world, peasant_eid, th_eid) {
     p = ecs_get(world, pos_comp, peasant_eid);
     drop_gxy = buf_word(2);
     _deposit_drop_tile(world, th_eid, p.x, p.y, drop_gxy);
-    wc1_movement_request(world, peasant_eid, drop_gxy[0], drop_gxy[1]);
+    wc2_movement_request(world, peasant_eid, drop_gxy[0], drop_gxy[1]);
     free(drop_gxy);
     an = ecs_get(world, anim_comp, peasant_eid);
     if (gt.carry == CARRY_GOLD) {
@@ -528,7 +538,7 @@ void wc1_gather_route_to_deposit(world, peasant_eid, th_eid) {
 
 // ── Per-tick gather progression ─────────────────────────────────
 //
-// One global walker. The peasant_q iteration in wc1_render's render
+// One global walker. The peasant_q iteration in wc2_render's render
 // callback runs every frame; the same `world` + `dt` thread through
 // here. Branches inside `_gather_visit`:
 //
@@ -557,7 +567,7 @@ static _dist_sq(ax, ay, bx, by) {
 
 // Build a tile target for the deposit walk. Discovers a walkable
 // adjacent cell around the deposit building's 4x4 footprint via
-// `wc1_movement_find_walkable_perimeter` — TH seeded by
+// `wc2_movement_find_walkable_perimeter` — TH seeded by
 // `_seed_town_halls_for_players` usually has a clear south
 // edge, but the same helper is used for the mine return so the
 // dispatch stays uniform. Falls back to south-mid if every
@@ -570,7 +580,7 @@ static _deposit_drop_tile(world, deposit_eid, ref_px, ref_py, out_gxy) {
     // ref_px/ref_py = the returning worker's position, so a crowd of
     // depositors spreads across the hall's perimeter (each picks the free
     // edge tile nearest its approach) instead of all queuing at one doorway.
-    if (wc1_movement_find_walkable_perimeter(deposit_eid,
+    if (wc2_movement_find_walkable_perimeter(deposit_eid,
                                               p.x / 32, p.y / 32,
                                               4, 4, ref_px, ref_py, &gx, &gy) != 0) {
         out_gxy[0] = gx;
@@ -605,7 +615,7 @@ static void _gather_visit(w, eid) {
     }
     an = ecs_get(w, anim_comp, eid);
     p  = ecs_get(w, pos_comp,  eid);
-    reach_sq = _WC1_GATHER_REACH_PX * _WC1_GATHER_REACH_PX;
+    reach_sq = _WC2_GATHER_REACH_PX * _WC2_GATHER_REACH_PX;
     if (gt.carry == CARRY_NONE) {
         // ── Outbound: walking to / at the gather target ──
         // The path-cursor gate guards every "in reach" check below:
@@ -618,7 +628,7 @@ static void _gather_visit(w, eid) {
         // perimeter pick. Requiring `pa.cursor >= pa.count` means
         // gather only triggers once the path is fully consumed,
         // i.e. the peasant is parked at the perimeter pick from
-        // `wc1_movement_find_walkable_perimeter`.
+        // `wc2_movement_find_walkable_perimeter`.
         auto pa_o: Path;
         pa_o = ecs_get(w, path_comp, eid);
         if (pa_o.cursor < pa_o.count) { return; }
@@ -639,14 +649,14 @@ static void _gather_visit(w, eid) {
                 // tiles when we walk back out to the depot.
                 if (an.state != UNIT_STATE_GATHER_GOLD) {
                     // Capacity gate (Stratagus action_resource.cpp:569).
-                    // The WC1 gold mine holds _WC1_MINE_MAX_ON_BOARD (5)
+                    // The WC2 gold mine holds _WC2_MINE_MAX_ON_BOARD (5)
                     // concurrent gatherers. A worker arriving when the
                     // mine is full waits CHEAPLY at its perimeter tile —
                     // no re-path, just idle and re-test next tick. The
                     // poll loop is our equivalent of Stratagus's explicit
                     // wake-the-waiter drain; the waiter holds its one
                     // perimeter tile meanwhile (bounded contention).
-                    if (b.active >= _WC1_MINE_MAX_ON_BOARD) {
+                    if (b.active >= _WC2_MINE_MAX_ON_BOARD) {
                         an.state = UNIT_STATE_IDLE;
                         return;
                     }
@@ -658,7 +668,7 @@ static void _gather_visit(w, eid) {
                     // GATHER_GOLD worker (vanishes into the mine);
                     // _step_unit re-acquires a tile when we walk back out.
                     b.active = b.active + 1;
-                    wc1_movement_release_unit_tile(w, eid);
+                    wc2_movement_release_unit_tile(w, eid);
                 }
                 an.state = UNIT_STATE_GATHER_GOLD;
                 // Advance the anim clock so the chop frame cycles
@@ -667,7 +677,7 @@ static void _gather_visit(w, eid) {
                 // returns without touching elapsed_ms).
                 an.elapsed_ms = an.elapsed_ms + _gather_dt;
                 gt.progress_ms = gt.progress_ms + _gather_dt;
-                if (gt.progress_ms >= _WC1_GATHER_TICK_MS) {
+                if (gt.progress_ms >= _WC2_GATHER_TICK_MS) {
                     // Flip to RETURNING_GOLD, charge the mine,
                     // walk to the nearest town hall.
                     gt.progress_ms = 0;
@@ -679,7 +689,7 @@ static void _gather_visit(w, eid) {
                     if (th_eid >= 0) {
                         drop_gxy = buf_word(2);
                         _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
-                        wc1_movement_request(w, eid,
+                        wc2_movement_request(w, eid,
                                                     drop_gxy[0], drop_gxy[1]);
                         free(drop_gxy);
                     }
@@ -697,10 +707,10 @@ static void _gather_visit(w, eid) {
                 // lands short sits forever (deposits but never re-mines). The
                 // cursor >= count gate above fires it once per arrival.
                 auto mgx2, mgy2;
-                if (wc1_movement_find_walkable_perimeter(gt.target,
+                if (wc2_movement_find_walkable_perimeter(gt.target,
                         tp.x / 32, tp.y / 32, 4, 4, p.x, p.y,
                         &mgx2, &mgy2) != 0) {
-                    wc1_movement_request(w, eid, mgx2, mgy2);
+                    wc2_movement_request(w, eid, mgx2, mgy2);
                 }
             }
             return;
@@ -731,20 +741,20 @@ static void _gather_visit(w, eid) {
                 // parked at the tree (analogous to the mine path).
                 an.elapsed_ms = an.elapsed_ms + _gather_dt;
                 gt.progress_ms = gt.progress_ms + _gather_dt;
-                if (gt.progress_ms >= _WC1_GATHER_TICK_MS) {
+                if (gt.progress_ms >= _WC2_GATHER_TICK_MS) {
                     // Flip tree → stump, transfer yield.
                     gt.progress_ms = 0;
                     gt.carry       = CARRY_WOOD;
-                    if (_tree_wood_get(tile_gx, tile_gy) <= _WC1_WOOD_YIELD) {
+                    if (_tree_wood_get(tile_gx, tile_gy) <= _WC2_WOOD_YIELD) {
                         // Felled. Flip the cluster cell to the
                         // walkable "removed-tree" stump (tile 95)
                         // + unblock the pathfinder/occupancy grids.
-                        tile_set(world_map, tile_gx, tile_gy, _WC1_FELLED_TILE_ID);
-                        wc1_movement_unblock_tile(tile_gx, tile_gy);
+                        tile_set(world_map, tile_gx, tile_gy, _WC2_FELLED_TILE_ID);
+                        wc2_movement_unblock_tile(tile_gx, tile_gy);
                         _tree_wood_set(tile_gx, tile_gy, 0);
                     } else {
                         _tree_wood_set(tile_gx, tile_gy,
-                                       _tree_wood_get(tile_gx, tile_gy) - _WC1_WOOD_YIELD);
+                                       _tree_wood_get(tile_gx, tile_gy) - _WC2_WOOD_YIELD);
                     }
                     if (gt.deposit_eid < 0) {
                         gt.deposit_eid = _find_nearest_town_hall(w, eid);
@@ -753,7 +763,7 @@ static void _gather_visit(w, eid) {
                     if (th_eid >= 0) {
                         drop_gxy = buf_word(2);
                         _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
-                        wc1_movement_request(w, eid,
+                        wc2_movement_request(w, eid,
                                                     drop_gxy[0], drop_gxy[1]);
                         free(drop_gxy);
                     }
@@ -766,7 +776,7 @@ static void _gather_visit(w, eid) {
                 // retries on the way. The cursor < count gate above means this
                 // fires once PER ARRIVAL, not per frame, so it never thrashes
                 // the pathfinder.
-                wc1_gather_assign_tree(w, eid, tile_gx, tile_gy);
+                wc2_gather_assign_tree(w, eid, tile_gx, tile_gy);
             }
             return;
         }
@@ -783,7 +793,7 @@ static void _gather_visit(w, eid) {
         if (gt.deposit_eid < 0) { return; }
         drop_gxy = buf_word(2);
         _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
-        wc1_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
+        wc2_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
         free(drop_gxy);
         return;
     }
@@ -801,7 +811,7 @@ static void _gather_visit(w, eid) {
         if (pa_d.cursor >= pa_d.count) {
             drop_gxy = buf_word(2);
             _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
-            wc1_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
+            wc2_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
             free(drop_gxy);
         }
         return;
@@ -810,7 +820,7 @@ static void _gather_visit(w, eid) {
         // Deposit. Resources credited to the worker's OWN player; mine
         // reserve charged.
         fa = ecs_get(w, faction_comp, eid);
-        yielded = wc1_resources_deposit(fa.player, gt.carry);
+        yielded = wc2_resources_deposit(fa.player, gt.carry);
         if (gt.target_kind == GATHER_TARGET_MINE) {
             b = ecs_get(w, building_comp, gt.target);
             b.gold_remaining = b.gold_remaining - yielded;
@@ -825,15 +835,15 @@ static void _gather_visit(w, eid) {
         if (gt.target_kind == GATHER_TARGET_TREE) {
             // The original tree is felled (one chop = stump → grass).
             // Auto-continue on the nearest remaining tree so wood loops
-            // like gold (WC1 peasants keep harvesting the forest); idle
+            // like gold (WC2 peasants keep harvesting the forest); idle
             // only when no forest is left in range.
             tile_gy = gt.target / _tree_grid_w;
             tile_gx = gt.target - tile_gy * _tree_grid_w;
-            if (wc1_is_forest_tile(tile_get(world_map, tile_gx, tile_gy)) == 0) {
+            if (wc2_is_forest_tile(tile_get(world_map, tile_gx, tile_gy)) == 0) {
                 auto ntx, nty;
                 ntx = 0; nty = 0;
                 if (_nearest_tree(w, tile_gx, tile_gy, eid, &ntx, &nty) != 0) {
-                    wc1_gather_assign_tree(w, eid, ntx, nty);
+                    wc2_gather_assign_tree(w, eid, ntx, nty);
                     return;
                 }
                 gt.target_kind = GATHER_TARGET_NONE;
@@ -845,7 +855,7 @@ static void _gather_visit(w, eid) {
         // Cycle continues — drop carry, walk back to the target if
         // one is still set. target_kind == NONE means the user
         // cancelled mid-trip and routed the worker here manually via
-        // `wc1_gather_route_to_deposit`; in that case there's nothing
+        // `wc2_gather_route_to_deposit`; in that case there's nothing
         // to loop back to, so the peasant idles after the deposit.
         // Mine return uses the perimeter walker so tree-bound mines
         // still land on a path-reachable cell (see assign_mine).
@@ -853,18 +863,18 @@ static void _gather_visit(w, eid) {
         if (gt.target_kind == GATHER_TARGET_MINE) {
             auto mgx, mgy;
             tp = ecs_get(w, pos_comp, gt.target);
-            if (wc1_movement_find_walkable_perimeter(gt.target,
+            if (wc2_movement_find_walkable_perimeter(gt.target,
                                                       tp.x / 32, tp.y / 32,
                                                       4, 4, p.x, p.y,
                                                       &mgx, &mgy) == 0) {
                 mgx = (tp.x + 64) / 32;
                 mgy = (tp.y + 128) / 32;
             }
-            wc1_movement_request(w, eid, mgx, mgy);
+            wc2_movement_request(w, eid, mgx, mgy);
         } else if (gt.target_kind == GATHER_TARGET_TREE) {
             tile_gy = gt.target / _tree_grid_w;
             tile_gx = gt.target - tile_gy * _tree_grid_w;
-            wc1_movement_request(w, eid, tile_gx, tile_gy);
+            wc2_movement_request(w, eid, tile_gx, tile_gy);
         } else {
             an.state = UNIT_STATE_IDLE;
         }
@@ -873,9 +883,9 @@ static void _gather_visit(w, eid) {
 }
 
 // Public tick. Called once per frame from rts.bpp after movement +
-// before render. `dt` is integer ms (the wc1 game tick uses
-// integer ms throughout; matches every other wc1_*_tick).
-void wc1_gather_tick(world, dt) {
+// before render. `dt` is integer ms (the wc2 game tick uses
+// integer ms throughout; matches every other wc2_*_tick).
+void wc2_gather_tick(world, dt) {
     _gather_world = world;
     _gather_dt    = dt;
     ecs_query_each(peasant_q, fn_ptr(_gather_visit));

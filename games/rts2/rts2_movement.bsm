@@ -1,4 +1,4 @@
-// wc1_movement.bsm — A* + flow-field movement with tile-claim
+// wc2_movement.bsm — A* + flow-field movement with tile-claim
 // collision.
 //
 // Session 5 shipped single-unit A* via stbpath; Session 6 adds three
@@ -6,7 +6,7 @@
 //   1. Flow-field crowd movement (≥ FLOW_THRESHOLD units share one
 //      BFS field) — matches the Stress Arc S4 bench's ~38× win.
 //   2. Marquee multi-select + per-unit group dispatch (the
-//      `wc1_movement_request_group` entry point below).
+//      `wc2_movement_request_group` entry point below).
 //   3. Tile-claim collision (Stratagus / OpenRA pattern). Each
 //      peasant reserves the tile under its feet in a shared stbgrid
 //      occupancy field; the next-tile is claimed atomically before
@@ -53,13 +53,13 @@ extrn _pf;
 // Module-private flow field. Allocated alongside _pf; reused
 // across crowd commands by overwriting the dist field on each
 // flow_compute. Single field at a time keeps memory bounded and
-// matches the single-rally-point shape of WC1 group commands.
+// matches the single-rally-point shape of WC2 group commands.
 extrn _flow;
 
 // Module-private occupancy grid (stbgrid word-grid). Cells store
 // `eid + 1` so 0 stays the "empty" sentinel. Allocated by
-// wc1_movement_init and consulted by every claim-transfer in
-// _step_unit. The wc1_collision_* helpers below give it occupancy
+// wc2_movement_init and consulted by every claim-transfer in
+// _step_unit. The wc2_collision_* helpers below give it occupancy
 // semantics; stbgrid itself stays storage-only.
 extrn _occupied;
 
@@ -72,12 +72,12 @@ const PATH_MODE_FLOW  = 1;
 
 // Globals captured by the per-frame tick callback (ecs_query_each
 // signature is fn(world, eid)). Same closure-via-globals pattern
-// wc1_render / wc1_input use.
+// wc2_render / wc2_input use.
 extrn pos_comp, target_comp, path_comp, anim_comp;
 extrn peasant_q;
 
 // Per-tick dt + frame step in pixels. Set once at the top of
-// wc1_movement_tick so the per-entity callback reads a global
+// wc2_movement_tick so the per-entity callback reads a global
 // instead of re-multiplying speed * dt per unit.
 static auto _dt_ms;
 static auto _frame_step;
@@ -92,7 +92,7 @@ static auto _flow_step_buf;
 // can never collide with a real `eid + 1` payload — entity ids
 // are array-row indices well under 31 bits, so 0x7FFFFFFF is
 // safely out of reach for the v1 entity cap. Treated as
-// "permanently held" by `wc1_collision_is_blocked_for` (the
+// "permanently held" by `wc2_collision_is_blocked_for` (the
 // claim != self_eid + 1 branch fires).
 const _TERRAIN_BLOCKER = 0x7FFFFFFF;
 
@@ -110,30 +110,30 @@ const _TERRAIN_BLOCKER = 0x7FFFFFFF;
 // all four gold mines reachable (2637 connected cells), so the
 // fear was unfounded and the gap just let peasants stroll into
 // what looks like solid forest. Felled trees flip to 109 (grass,
-// walkable) — see _WC1_FELLED_TILE — so a chopped cell reads as
+// walkable) — see _WC2_FELLED_TILE — so a chopped cell reads as
 // cleared ground and keeps the path open behind the worker.
 //
-// `wc1_is_forest_tile` is the single truth used by the movement
-// init seeder, `_tile_is_tree` in wc1_input (right-click → chop),
-// and the tree-grid bootstrap in wc1_gather. A wider terrain
+// `wc2_is_forest_tile` is the single truth used by the movement
+// init seeder, `_tile_is_tree` in wc2_input (right-click → chop),
+// and the tree-grid bootstrap in wc2_gather. A wider terrain
 // classifier (water / cliffs / transitions) graduates when the
 // second blocked-terrain class earns its slot.
 // WC2 terrain walkability table — one byte per tileset tile-group
 // (tile_id >> 4): 0 = walkable, 1 = forest (impassable but choppable for
 // wood), 2 = rock / water / wall (impassable, not choppable). Loaded from the
 // tileset's `.blk` sidecar (emitted by tools/funnel/war2_tiles from the mape
-// group flags + megatile colour) and set by rts2.bpp before wc1_movement_init.
+// group flags + megatile colour) and set by rts2.bpp before wc2_movement_init.
 // 0 (unset) means "nothing blocks" — the safe default for legacy maps.
 global _terrain_blk;
 
-void wc1_movement_set_terrain_blk(buf) {
+void wc2_movement_set_terrain_blk(buf) {
     _terrain_blk = buf;
 }
 
 // Returns 1 if `tid` is a choppable forest tile (.blk class 1). Exported (not
 // `static`) so the input + gather modules consume it directly. Empty cells and
 // the no-data case read as non-forest.
-wc1_is_forest_tile(tid) {
+wc2_is_forest_tile(tid) {
     if (tid == 0 || _terrain_blk == 0) { return 0; }
     return peek(_terrain_blk + (tid >> 4)) == 1;
 }
@@ -143,14 +143,14 @@ wc1_is_forest_tile(tid) {
 // ground and the pathfinder opens behind the worker. 82 is the most
 // common grass value in the WC2 summer maps (group 5, variation 2;
 // frequency analysis of alamo.json), so it renders cleanly as cleared
-// ground. Keep in sync with _WC1_FELLED_TILE_ID in wc1_gather.bsm.
-const _WC1_FELLED_TILE = 82;
+// ground. Keep in sync with _WC2_FELLED_TILE_ID in wc2_gather.bsm.
+const _WC2_FELLED_TILE = 82;
 
 // Allocate every shared scratch resource the movement system
 // needs: A* pathfinder, flow field, flow scratch buffer, and the
 // tile-occupancy grid. Call once at startup AFTER the map is
 // loaded so the grid dimensions are known, and BEFORE any peasant
-// is spawned so spawn-time wc1_collision_register has a live grid.
+// is spawned so spawn-time wc2_collision_register has a live grid.
 //
 // S8.5 — also seeds permanent terrain blockers (trees) into BOTH
 // the pathfinder's blocked array (path_set_blocked) AND the
@@ -160,37 +160,37 @@ const _WC1_FELLED_TILE = 82;
 // have to know the tree is impassable or units fall through the
 // crack between the two systems.
 // S9 — shared Tilemap handle, cached at init for every system that
-// needs to query tile ids (wc1_input's tree-click detection +
-// wc1_gather's tree-to-stump flip). Holding the handle once here
+// needs to query tile ids (wc2_input's tree-click detection +
+// wc2_gather's tree-to-stump flip). Holding the handle once here
 // avoids threading `map` through every right-click → tile-check
-// path. Set by `wc1_movement_init` because that's the first
+// path. Set by `wc2_movement_init` because that's the first
 // consumer; readers extrn it.
 global world_map;
 
 // 1 if a map tile id is impassable terrain — both forest (.blk class 1) and
 // rock / water (class 2) block movement; only walkable (0) and the no-data
 // case pass. Used by the movement-init seeder to mark blockers.
-wc1_terrain_blocked(tile_id) {
+wc2_terrain_blocked(tile_id) {
     if (tile_id == 0 || _terrain_blk == 0) { return 0; }
     return peek(_terrain_blk + (tile_id >> 4));
 }
 
-wc1_movement_init(map) {
+wc2_movement_init(map) {
     auto w, h, gx, gy, tile_id;
     auto tm;
-    w = wc1_map_w(map);
-    h = wc1_map_h(map);
+    w = wc2_map_w(map);
+    h = wc2_map_h(map);
     _pf  = path_new(w, h);
     path_set_dyn_blocked(_pf, fn_ptr(_path_dyn_blocked));   // route around units
     _flow = flow_new(w, h);
     _flow_step_buf = buf_word(2);
     _occupied = grid_new_word(w, h);
-    tm = wc1_map_tm(map);
-    world_map = tm;   // publish for wc1_input + wc1_gather
+    tm = wc2_map_tm(map);
+    world_map = tm;   // publish for wc2_input + wc2_gather
     for (gy = 0; gy < h; gy++) {
         for (gx = 0; gx < w; gx++) {
             tile_id = tile_get(tm, gx, gy);
-            if (wc1_terrain_blocked(tile_id) != 0) {
+            if (wc2_terrain_blocked(tile_id) != 0) {
                 path_set_blocked(_pf, gx, gy, 1);
                 grid_set(_occupied, gx, gy, _TERRAIN_BLOCKER);
             }
@@ -204,7 +204,7 @@ wc1_movement_init(map) {
 // "empty" sentinel. Out-of-bounds writes are silently absorbed by
 // stbgrid — lets the spawn pipeline pass world coords without
 // pre-clamping.
-void wc1_collision_register(eid, gx, gy) {
+void wc2_collision_register(eid, gx, gy) {
     grid_set(_occupied, gx, gy, eid + 1);
 }
 
@@ -214,10 +214,10 @@ void wc1_collision_register(eid, gx, gy) {
 // perimeter freely (Stratagus capacity model — no perimeter pile-up).
 // The unit re-acquires tiles via the normal _step_unit claim-transfer
 // when it next walks (out to the depot). Safe to call repeatedly.
-void wc1_movement_release_unit_tile(world, eid) {
+void wc2_movement_release_unit_tile(world, eid) {
     auto pa: Path;
     pa = ecs_get(world, path_comp, eid);
-    wc1_collision_release(pa.tile_gx, pa.tile_gy);
+    wc2_collision_release(pa.tile_gx, pa.tile_gy);
     pa.tile_gx = 0 - 1;
     pa.tile_gy = 0 - 1;
     return;
@@ -229,15 +229,15 @@ void wc1_movement_release_unit_tile(world, eid) {
 // stall at the collision check inside `_step_unit`, producing
 // the classic "auto-deliver parou no meio do caminho" bug).
 // Idempotent + bounds-safe via stbpath.
-void wc1_movement_block_path_tile(gx, gy) {
+void wc2_movement_block_path_tile(gx, gy) {
     path_set_blocked(_pf, gx, gy, 1);
 }
 
 // S9 — drop a permanent terrain blocker from BOTH the pathfinder
-// + occupancy grid. Called by wc1_gather when a tree is felled
+// + occupancy grid. Called by wc2_gather when a tree is felled
 // so peasants can stand on the stump tile + path through the
 // freshly-cleared cell. Idempotent on already-unblocked tiles.
-void wc1_movement_unblock_tile(gx, gy) {
+void wc2_movement_unblock_tile(gx, gy) {
     path_set_blocked(_pf, gx, gy, 0);
     grid_set(_occupied, gx, gy, 0);
     return;
@@ -270,7 +270,7 @@ static auto _perimeter_cy_px;
 static void _perimeter_probe(cx, cy) {
     auto dx_p, dy_p, d_sq;
     if (path_is_blocked(_pf, cx, cy) != 0)                          { return; }
-    if (wc1_collision_is_blocked_for(_perimeter_self_eid, cx, cy) != 0) { return; }
+    if (wc2_collision_is_blocked_for(_perimeter_self_eid, cx, cy) != 0) { return; }
     dx_p = cx * 32 + 16 - _perimeter_cx_px;
     dy_p = cy * 32 + 16 - _perimeter_cy_px;
     d_sq = dx_p * dx_p + dy_p * dy_p;
@@ -282,7 +282,7 @@ static void _perimeter_probe(cx, cy) {
     }
     return;
 }
-wc1_movement_find_walkable_perimeter(self_eid, fgx, fgy, ntx, nty,
+wc2_movement_find_walkable_perimeter(self_eid, fgx, fgy, ntx, nty,
                                      ref_px, ref_py, out_gx: ptr, out_gy: ptr) {
     auto i;
     _perimeter_self_eid = self_eid;
@@ -291,7 +291,7 @@ wc1_movement_find_walkable_perimeter(self_eid, fgx, fgy, ntx, nty,
     // position spreads a crowd — each arrives at the edge nearest its
     // approach instead of all funnelling onto one doorway (the deposit /
     // mine pile-up). Pass -1 to fall back to the south-mid doorway bias
-    // (WC1 mines + halls face south), used when there's no relevant worker.
+    // (WC2 mines + halls face south), used when there's no relevant worker.
     if (ref_px < 0) {
         _perimeter_cx_px = fgx * 32 + (ntx * 32) / 2;
         _perimeter_cy_px = (fgy + nty) * 32 + 16;
@@ -320,7 +320,7 @@ wc1_movement_find_walkable_perimeter(self_eid, fgx, fgy, ntx, nty,
 // Free a tile previously held by some unit. Idempotent and bounds-
 // safe via stbgrid. Does NOT check ownership — the caller (always
 // the unit whose claim it is) is trusted.
-void wc1_collision_release(gx, gy) {
+void wc2_collision_release(gx, gy) {
     grid_set(_occupied, gx, gy, 0);
 }
 
@@ -334,7 +334,7 @@ void wc1_collision_release(gx, gy) {
 // asks about OOB tiles (waypoints come from path_find, which only
 // emits in-bounds cells, and flow_step never picks OOB neighbours).
 // Treating OOB as blocked would be defensive noise.
-wc1_collision_is_blocked_for(eid, gx, gy) {
+wc2_collision_is_blocked_for(eid, gx, gy) {
     auto claim;
     claim = grid_get(_occupied, gx, gy);
     if (claim == 0)       { return 0; }
@@ -346,7 +346,7 @@ wc1_collision_is_blocked_for(eid, gx, gy) {
 // cell is empty or holds a static terrain blocker. Lets combat / AI find
 // nearby enemies by scanning a small tile window (O(window)) instead of
 // walking every unit (O(N)). Bounds-safe via stbgrid — OOB reads as empty.
-wc1_collision_unit_at(gx, gy) {
+wc2_collision_unit_at(gx, gy) {
     auto claim;
     claim = grid_get(_occupied, gx, gy);
     if (claim == 0)                { return 0 - 1; }
@@ -383,8 +383,8 @@ static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
     bwy = bp.buf[bp.cursor * 2 + 1];
     if (bwx != pa.tile_gx || bwy != pa.tile_gy) { return 0; }   // not head-on
     old_x = pa.tile_gx; old_y = pa.tile_gy;
-    wc1_collision_register(eid, wp_gx, wp_gy);    // I take the blocker's tile
-    wc1_collision_register(blk, old_x, old_y);    // blocker takes mine
+    wc2_collision_register(eid, wp_gx, wp_gy);    // I take the blocker's tile
+    wc2_collision_register(blk, old_x, old_y);    // blocker takes mine
     bp.tile_gx = old_x;  bp.tile_gy = old_y;
     pa.tile_gx = wp_gx;  pa.tile_gy = wp_gy;
     return 1;
@@ -394,7 +394,7 @@ static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
 
 // Compute a fresh A* path from the unit's current pixel position
 // to the destination grid cell and stash it in the unit's Path
-// component. Called by the click branch of wc1_input on right-
+// component. Called by the click branch of wc2_input on right-
 // click when only one unit is selected, and also by the group
 // fallback below when count < FLOW_THRESHOLD.
 //
@@ -406,7 +406,7 @@ static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
 // is a hard obstacle (path goes around it); a MOVING unit is crossable (it
 // will clear); the searching unit's own tile and the goal are always free;
 // terrain blockers are already in the static grid. Installed once on `_pf`;
-// wc1_movement_request stashes the per-search context (which unit, which goal)
+// wc2_movement_request stashes the per-search context (which unit, which goal)
 // in these globals before each path_find, which the callback reads.
 global _path_self_eid;             // the unit currently pathing (its claim is free)
 global _path_goal_gx;              // goal tile — always passable so it's reachable
@@ -428,7 +428,7 @@ static _path_dyn_blocked(gx, gy) {
     return 1;                                        // stationary other unit -> avoid
 }
 
-void wc1_movement_request(world, eid, dst_gx, dst_gy) {
+void wc2_movement_request(world, eid, dst_gx, dst_gy) {
     auto p: Pos, pa: Path;
     auto src_gx, src_gy, n;
     p  = ecs_get(world, pos_comp,  eid);
@@ -468,7 +468,7 @@ void wc1_movement_request(world, eid, dst_gx, dst_gy) {
 //
 // `eids` is a buf_word holding the entity ids; `count` is the live
 // length. The buffer is read-only here — the input layer owns it.
-void wc1_movement_request_group(world, eids: ptr, count, dst_gx, dst_gy) {
+void wc2_movement_request_group(world, eids: ptr, count, dst_gx, dst_gy) {
     auto i, eid, pa: Path;
     if (count <= 0) { return; }
     if (count >= FLOW_THRESHOLD) {
@@ -483,7 +483,7 @@ void wc1_movement_request_group(world, eids: ptr, count, dst_gx, dst_gy) {
         return;
     }
     for (i = 0; i < count; i++) {
-        wc1_movement_request(world, eids[i], dst_gx, dst_gy);
+        wc2_movement_request(world, eids[i], dst_gx, dst_gy);
     }
 }
 
@@ -541,7 +541,7 @@ static _flow_avoid(eid, cur_gx, cur_gy, pref_dx, pref_dy, out) {
                 if (dot >= 0) {
                     nx = cur_gx + dx;
                     ny = cur_gy + dy;
-                    if (wc1_collision_is_blocked_for(eid, nx, ny) == 0) {
+                    if (wc2_collision_is_blocked_for(eid, nx, ny) == 0) {
                         nd = flow_dist(_flow, nx, ny);
                         // nd <= here_d also rejects unreachable cells:
                         // their flow_dist is the infinity sentinel, which
@@ -629,9 +629,9 @@ static _try_unblock(w, eid, bx, by, blocked_p: Pos) {
         // A free shove target: on grid, not blocked, and not the stuck unit's
         // own tile (don't send the blocker straight into us).
         if (grid_in_bounds(_occupied, nx, ny) != 0
-            && wc1_collision_is_blocked_for(blocker, nx, ny) == 0
+            && wc2_collision_is_blocked_for(blocker, nx, ny) == 0
             && (nx != e_gx || ny != e_gy)) {
-            wc1_movement_request(w, blocker, nx, ny);   // shove one tile over
+            wc2_movement_request(w, blocker, nx, ny);   // shove one tile over
             _unblock_cd = _UNBLOCK_THROTTLE;
             return 1;
         }
@@ -653,19 +653,19 @@ static void _step_unit(w, eid) {
     // when it expires.
     if (an.state == UNIT_STATE_DYING) { return; }
 
-    // Attacking units don't move either — wc1_combat_tick owns the
+    // Attacking units don't move either — wc2_combat_tick owns the
     // ATTACK state (it set facing, halted the path via cursor=count,
     // and advances elapsed_ms so the chop anim cycles). Without this
     // guard, _step_unit would fall through to has_target==0 and
     // _idle_anim would clobber state back to IDLE every tick,
     // making the chop animation invisible. UNIT_STATE_BUILD shares
-    // the same "don't move" guarantee — `wc1_production_tick` parks
+    // the same "don't move" guarantee — `wc2_production_tick` parks
     // the assigned worker at the foundation and advances the build
     // anim.
     if (an.state == UNIT_STATE_ATTACK) { return; }
     if (an.state == UNIT_STATE_BUILD)  { return; }
     // S9 — gather states behave like ATTACK/BUILD: the peasant is
-    // parked at the resource cell while wc1_gather_tick advances
+    // parked at the resource cell while wc2_gather_tick advances
     // progress + cycles the chop anim. Without this guard,
     // _step_unit falls through to _idle_anim and clobbers the
     // gather state back to IDLE every frame, freezing the chop
@@ -713,7 +713,7 @@ static void _step_unit(w, eid) {
     // If the next tile is held by another unit, idle this frame —
     // the other unit may have cleared by the next tick.
     if (wp_gx != pa.tile_gx || wp_gy != pa.tile_gy) {
-        if (wc1_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
+        if (wc2_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
             // Blocked by another unit. Three escalating responses before
             // giving up and waiting this frame:
             //   1. Head-on crossing → swap tiles so neither freezes (the
@@ -732,8 +732,8 @@ static void _step_unit(w, eid) {
                 // over its claim (atomic release-old / register-new).
                 wp_gx = _flow_step_buf[0];
                 wp_gy = _flow_step_buf[1];
-                wc1_collision_release(pa.tile_gx, pa.tile_gy);
-                wc1_collision_register(eid, wp_gx, wp_gy);
+                wc2_collision_release(pa.tile_gx, pa.tile_gy);
+                wc2_collision_register(eid, wp_gx, wp_gy);
                 pa.tile_gx = wp_gx;
                 pa.tile_gy = wp_gy;
             } else if (_try_unblock(w, eid, wp_gx, wp_gy, p) != 0) {
@@ -747,8 +747,8 @@ static void _step_unit(w, eid) {
                 return;
             }
         } else {
-            wc1_collision_release(pa.tile_gx, pa.tile_gy);
-            wc1_collision_register(eid, wp_gx, wp_gy);
+            wc2_collision_release(pa.tile_gx, pa.tile_gy);
+            wc2_collision_register(eid, wp_gx, wp_gy);
             pa.tile_gx = wp_gx;
             pa.tile_gy = wp_gy;
         }
@@ -764,7 +764,7 @@ static void _step_unit(w, eid) {
     dx = wp_px - p.x;
     dy = wp_py - p.y;
     if (dx != 0 || dy != 0) {
-        new_facing = wc1_facing_for_delta(dx, dy);
+        new_facing = wc2_facing_for_delta(dx, dy);
         if (new_facing != an.facing) {
             an.facing     = new_facing;
             an.elapsed_ms = 0;
@@ -811,7 +811,7 @@ static void _step_unit(w, eid) {
 // Walk every peasant and step its movement one frame. Compute
 // _frame_step from speed + dt once so each callback just reads
 // the global.
-void wc1_movement_tick(world) {
+void wc2_movement_tick(world) {
     auto def: UnitDef;
     def = unit_def_for(UNIT_PEASANT);
     _dt_ms = game_dt_ms();
