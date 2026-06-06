@@ -12745,6 +12745,7 @@ x64-only / ELF-only); gen1==gen2 byte-stable every step.
 
 ## 2026-05-29 — the second dog-food lap: `: float` infected mixed `auto`, the disassembler caught it
 
+
 A bullet in fps_wolf3d SIGSEGV'd on first fire. The faulting store landed at
 address `0x22` — `(WolfEntPayload*) NULL + offsetof(hp)`. The trigger function
 `_proj_hit_check` opened with one line of mixed `auto`:
@@ -13059,3 +13060,8 @@ historical `rts1` credits alone. `67e4304` / `bb730a1`.
   `wc2_X.bsm` when the file is `rts2_X.bsm`; only a second, narrower pass
   (filenames + paths in comments) caught it, while preserving the `rts1` history
   a blunt sweep would have erased.
+  
+## 2026-06-05 — Refactoring stbpath & RTS2 Movement Architecture (WC2 Mod) - Additive Pathfinding, Regression Testing, and Thrashing Reduction
+---
+
+ Improved stbpath — without breaking anythingAdded path_find_near(pf, sx,sy, gx,gy, gw,gh, range, out, max): paths up to Manhattan range from the goal-rectangle (footprint), and the goal can be blocked (building/mine) — stops at the 1st adjacent walkable cell. With gw=gh=1, range=0 ≡ path_find.path_find and _path_relax (the tuned hot loop) remain 100% intact — added separate _path_rect_dist + _path_relax_rect. rts1/fps: byte-for-byte identical behavior, zero performance regression.Verification:tests/test_path.bpp — added 4 cases (range0≡path_find, range1 for adjacent, reachable blocked goal, 2×2 rect): all PASS.Full native suite: 183 passed, 0 failed, 12 skipped — exactly the handoff baseline. Nothing broke.Now the faithful movement port becomes cleaner than I had planned: rts2 can request "path up to adjacent to the mine (4×4 footprint, range 1)" directly — removing the "choose-perimeter-tile" + "re-path-when-wrong-tile-picked" (which was half of the thrashing). Stratagus' NewPath literally becomes path_find_near(... range 1).Path gets a wait state (the Fast countdown)._step_unit = NextPathElement/DoActionMove: follows cached path → blocked? waits N cycles → dynamic re-path 1x (via path_find_near for resource/building case) → still blocked? UNREACHABLE → shove.Rip out competing re-paths (gather-on-arrival, re-path-on-stuck, self-heal wedge, Pass-2 unit-blind) + review head-on/give-way.Gather/build/repair now use path_find_near(footprint, range 1) instead of find_walkable_perimeter.Clean up accumulated debug code (heartbeat parked/mineAct, [mv], [place])._step_unit = NextPathElement: follows cached path → blocked by unit? waits 10 cycles → re-paths 1x → still blocked? shove (_try_unblock). A paused loop, replacing the 4 competing re-paths (swap, re-path-on-stuck, self-heal, perimeter).Goal stored in Path (rect+range) → the unit re-paths on its own.Gather/build/repair/depot all use path_find_near(footprint, range 1) — paths directly to adjacent to the target, without choosing a perimeter tile and without re-path-when-wrong-tile-picked (the other half of the thrashing).stbpath only gained the additive path_find_near; path_find/_path_relax left intact (183/0/12 suite, rts1/fps unchanged).

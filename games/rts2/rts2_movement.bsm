@@ -75,6 +75,7 @@ const PATH_MODE_FLOW  = 1;
 // wc2_render / wc2_input use.
 extrn pos_comp, target_comp, path_comp, anim_comp;
 extrn peasant_q;
+extrn wc2_debug;        // RTS_DEBUG gate — temporary movement-stall tracing
 
 // Per-tick dt + frame step in pixels. Set once at the top of
 // wc2_movement_tick so the per-entity callback reads a global
@@ -330,12 +331,17 @@ void wc2_collision_release(gx, gy) {
 // matters because a unit re-claiming the same tile (no movement
 // this frame) must not see its own marker as a blocker.
 //
-// Out-of-bounds queries return 0, NOT 1 — the simulation never
-// asks about OOB tiles (waypoints come from path_find, which only
-// emits in-bounds cells, and flow_step never picks OOB neighbours).
-// Treating OOB as blocked would be defensive noise.
+// Out-of-bounds queries return 1 (BLOCKED) — a faithful port of Stratagus
+// IsPosFree's first line (`if (!Map.Info.IsPointOnMap(pos)) return false;`).
+// Movement waypoints are always in-bounds (path_find / flow_step only emit
+// on-map cells), so the hot path is unaffected; but the AI BUILDING PLACEMENT
+// scan (_ai_obstacle_count / wc2_placement_valid) probes the ring AROUND a
+// footprint, which reaches off-map at a corner base. Without this guard an
+// off-map cell read as "free", so the AI happily built a farm hanging off the
+// top edge (origin y = -2) — its builder then jammed the row-0 worker corridor.
 wc2_collision_is_blocked_for(eid, gx, gy) {
     auto claim;
+    if (grid_in_bounds(_occupied, gx, gy) == 0) { return 1; }   // off-map = blocked
     claim = grid_get(_occupied, gx, gy);
     if (claim == 0)       { return 0; }
     if (claim == eid + 1) { return 0; }
@@ -354,40 +360,59 @@ wc2_collision_unit_at(gx, gy) {
     return claim - 1;
 }
 
-// Head-on deadlock breaker. `eid` (at tile pa.tile) wants to step onto
-// (wp_gx, wp_gy), which is held by another unit. If that blocker's NEXT
-// path step is onto eid's CURRENT tile, the two are crossing head-on and
-// would each wait forever — so exchange their tile claims: eid takes the
-// blocker's tile, the blocker takes eid's. Each then interpolates to its
-// new tile and passes the other. Returns 1 if the swap fired (caller
-// proceeds), 0 if it's a genuine block (caller waits a frame). Only
-// resolves the head-on case (the dominant gather-route deadlock); a unit
-// parked on the target tile is left for the caller to wait out.
-static _try_headon_swap(w, eid, wp_gx, wp_gy, pa: Path) {
-    auto claim, blk, bp: Path, bwx, bwy, old_x, old_y;
-    // Only a moving UNIT can head-on swap. The blocker on this tile may
-    // instead be terrain (_TERRAIN_BLOCKER) or a BUILDING footprint
-    // (registered with the building's eid but no Path component) — both
-    // must bail. ecs_get returns 0 for a building (component absent) or
-    // an out-of-range "eid", so the `bp == 0` guard is the real safety
-    // net: a building eid here SIGSEGV'd before this check existed.
-    claim = grid_get(_occupied, wp_gx, wp_gy);
-    if (claim == 0 || claim == _TERRAIN_BLOCKER) { return 0; }
-    blk = claim - 1;
-    bp = ecs_get(w, path_comp, blk);
-    if (bp == 0)                   { return 0; }   // building / dead — not a unit
-    if (bp.mode == PATH_MODE_FLOW) { return 0; }   // flow units have no waypoints
-    if (bp.cursor >= bp.count)     { return 0; }   // blocker isn't moving
-    if (bp.buf == 0)               { return 0; }   // defensive: no path buffer
-    bwx = bp.buf[bp.cursor * 2];
-    bwy = bp.buf[bp.cursor * 2 + 1];
-    if (bwx != pa.tile_gx || bwy != pa.tile_gy) { return 0; }   // not head-on
-    old_x = pa.tile_gx; old_y = pa.tile_gy;
-    wc2_collision_register(eid, wp_gx, wp_gy);    // I take the blocker's tile
-    wc2_collision_register(blk, old_x, old_y);    // blocker takes mine
-    bp.tile_gx = old_x;  bp.tile_gy = old_y;
-    pa.tile_gx = wp_gx;  pa.tile_gy = wp_gy;
+// ── Drop-out (Stratagus DropOutOnSide port, unit/unit.cpp) ───────────────
+// When a building COMPLETES construction or finishes TRAINING a unit, that
+// unit must end up on a guaranteed-FREE tile beside the building — never boxed
+// in on the footprint or stacked on top of a sibling. This is the engine
+// primitive Stratagus calls on every build/train completion (and on transport
+// unload); without it our builders + freshly-trained units piled up around the
+// building and froze in place. Spiral outward from the footprint ring until a
+// walkable, unclaimed cell is found, then TELEPORT the unit there (the
+// Stratagus `unit.Place(pos)`). `bgx,bgy` = footprint top-left tile; `bw,bh` =
+// footprint size in tiles.
+static _drop_cell_free(eid, gx, gy) {
+    if (path_is_blocked(_pf, gx, gy) != 0)              { return 0; }   // wall / building / OOB
+    if (wc2_collision_is_blocked_for(eid, gx, gy) != 0) { return 0; }   // another unit's claim
     return 1;
+}
+
+void wc2_movement_drop_out(world, eid, bgx, bgy, bw, bh) {
+    auto p: Pos, pa: Path, an: Anim;
+    auto r, x, y, x0, y0, x1, y1, fx, fy, found;
+    found = 0; fx = 0; fy = 0;
+    r = 1;
+    while (r <= 8 && found == 0) {
+        x0 = bgx - r;          y0 = bgy - r;
+        x1 = bgx + bw - 1 + r; y1 = bgy + bh - 1 + r;
+        x = x0;                                        // top + bottom edges
+        while (x <= x1 && found == 0) {
+            if (_drop_cell_free(eid, x, y0) != 0)      { fx = x; fy = y0; found = 1; }
+            else if (_drop_cell_free(eid, x, y1) != 0) { fx = x; fy = y1; found = 1; }
+            x = x + 1;
+        }
+        y = y0 + 1;                                    // left + right edges
+        while (y < y1 && found == 0) {
+            if (_drop_cell_free(eid, x0, y) != 0)      { fx = x0; fy = y; found = 1; }
+            else if (_drop_cell_free(eid, x1, y) != 0) { fx = x1; fy = y; found = 1; }
+            y = y + 1;
+        }
+        r = r + 1;
+    }
+    if (found == 0) { return; }                        // ringed-in 8 deep (shouldn't happen)
+    p  = ecs_get(world, pos_comp,  eid);
+    pa = ecs_get(world, path_comp, eid);
+    an = ecs_get(world, anim_comp, eid);
+    // Release the unit's old claim (only if it still holds it), move the Pos
+    // onto the free tile, take the new claim, clear the path + stall counter.
+    if (wc2_collision_unit_at(pa.tile_gx, pa.tile_gy) == eid) {
+        wc2_collision_release(pa.tile_gx, pa.tile_gy);
+    }
+    p.x = fx * 32; p.y = fy * 32;
+    wc2_collision_register(eid, fx, fy);
+    pa.tile_gx = fx; pa.tile_gy = fy;
+    pa.count = 0; pa.cursor = 0; pa.wait = 0;
+    an.state = UNIT_STATE_IDLE; an.elapsed_ms = 0;
+    return;
 }
 
 // ── Path requests ───────────────────────────────────────────────
@@ -428,32 +453,74 @@ static _path_dyn_blocked(gx, gy) {
     return 1;                                        // stationary other unit -> avoid
 }
 
-void wc2_movement_request(world, eid, dst_gx, dst_gy) {
-    auto p: Pos, pa: Path;
-    auto src_gx, src_gy, n;
+// Cycles a unit waits on a unit-blocked tile before it re-paths (Stratagus
+// PathFinderOutput::Fast / MAX_FAST). Waiting lets a transient blocker (another
+// worker cycling in/out of a resource) clear on its own instead of triggering a
+// path recompute every frame — the over-eager re-pathing was the gather thrash.
+const _MOVE_WAIT_MAX = 10;
+
+// Shared core: stash the GOAL (rect gx,gy,gw,gh + range) on the unit's Path so
+// the movement tick can re-path to it autonomously, then compute an initial
+// route. Two-pass: pass 1 routes AROUND parked units; pass 2 (units ignored)
+// routes THROUGH them so the unit at least heads in and resolves the contention
+// at execution time by waiting / shoving — faithful to Stratagus's "Astar may
+// allow you to walk onto a unit" + WAIT + AiMoveUnitInTheWay.
+static void _movement_goal(world, eid, gx, gy, gw, gh, range) {
+    auto p: Pos, pa: Path, src_gx, src_gy, n;
     p  = ecs_get(world, pos_comp,  eid);
     pa = ecs_get(world, path_comp, eid);
     src_gx = p.x / 32;
     src_gy = p.y / 32;
-    // Pass 1 — route AROUND parked units (dynamic obstacles), so a batch of
-    // workers spreads to free approach tiles instead of funnelling onto one.
+    pa.goal_gx = gx; pa.goal_gy = gy;
+    pa.goal_gw = gw; pa.goal_gh = gh; pa.goal_range = range;
+    pa.wait    = _MOVE_WAIT_MAX;
     _path_self_eid = eid;
     _path_world    = world;
-    _path_goal_gx  = dst_gx;
-    _path_goal_gy  = dst_gy;
-    n = path_find(_pf, src_gx, src_gy, dst_gx, dst_gy,
-                  pa.buf, MAX_WAYPOINTS);
-    // Pass 2 — if avoidance left no route (the unit is boxed in by others, the
-    // common case in a tight forest), fall back to the unit-blind path. A
-    // binary A* can't express Stratagus's "soft" crossing cost, so instead of
-    // freezing we take the direct route and let the tile-claim swap / give-way
-    // / AiMoveUnitInTheWay unblock resolve the contention at execution time.
+    _path_goal_gx  = gx;
+    _path_goal_gy  = gy;
+    n = path_find_near(_pf, src_gx, src_gy, gx, gy, gw, gh, range,
+                       pa.buf, MAX_WAYPOINTS);
     if (n == 0) {
-        _path_world = 0;               // disable the dynamic-obstacle callback
-        n = path_find(_pf, src_gx, src_gy, dst_gx, dst_gy,
-                      pa.buf, MAX_WAYPOINTS);
+        _path_world = 0;               // pass 2: ignore units (route through)
+        n = path_find_near(_pf, src_gx, src_gy, gx, gy, gw, gh, range,
+                           pa.buf, MAX_WAYPOINTS);
     }
     pa.mode   = PATH_MODE_ASTAR;
+    pa.count  = n;
+    pa.cursor = 1;
+}
+
+// Move to an exact destination tile (right-click / AI move order).
+void wc2_movement_request(world, eid, dst_gx, dst_gy) {
+    _movement_goal(world, eid, dst_gx, dst_gy, 1, 1, 0);
+}
+
+// Move to WITHIN `range` tiles of a footprint (gx,gy,gw,gh) — the gather /
+// build / deposit "approach a building or resource" order. The unit stops on a
+// walkable tile adjacent to the footprint; the caller no longer hand-picks a
+// perimeter tile (that picking + its re-path-on-wrong-tile was half the thrash).
+void wc2_movement_request_near(world, eid, gx, gy, gw, gh, range) {
+    _movement_goal(world, eid, gx, gy, gw, gh, range);
+}
+
+// Re-path to the unit's stored goal (Stratagus NewPath on Fast-expiry). Same
+// two-pass as the initial request; keeps the goal, resets the cursor.
+static void _movement_repath(world, eid, pa: Path) {
+    auto p: Pos, src_gx, src_gy, n;
+    p = ecs_get(world, pos_comp, eid);
+    src_gx = p.x / 32;
+    src_gy = p.y / 32;
+    _path_self_eid = eid;
+    _path_world    = world;
+    _path_goal_gx  = pa.goal_gx;
+    _path_goal_gy  = pa.goal_gy;
+    n = path_find_near(_pf, src_gx, src_gy, pa.goal_gx, pa.goal_gy,
+                       pa.goal_gw, pa.goal_gh, pa.goal_range, pa.buf, MAX_WAYPOINTS);
+    if (n == 0) {
+        _path_world = 0;
+        n = path_find_near(_pf, src_gx, src_gy, pa.goal_gx, pa.goal_gy,
+                           pa.goal_gw, pa.goal_gh, pa.goal_range, pa.buf, MAX_WAYPOINTS);
+    }
     pa.count  = n;
     pa.cursor = 1;
 }
@@ -588,6 +655,7 @@ static _flow_avoid(eid, cur_gx, cur_gy, pref_dx, pref_dy, out) {
 // docs/plans/wc2_ai_port.md Part F).
 const _UNBLOCK_THROTTLE = 4;        // frames between shoves
 static auto _unblock_cd;            // countdown; a shove is allowed at 0
+
 static auto _dir8;                  // buf_word(16): {dx,dy} x 8 neighbours
 
 static void _unblock_init() {
@@ -709,48 +777,65 @@ static void _step_unit(w, eid) {
         return;
     }
 
-    // Atomic claim transfer when the micro-target tile changes.
-    // If the next tile is held by another unit, idle this frame —
-    // the other unit may have cleared by the next tick.
+    // Atomic claim transfer when the micro-target tile changes. If the next
+    // tile is held by another unit, follow the Stratagus NextPathElement model:
+    // WAIT a few cycles for it to clear; only after the wait window expires
+    // re-path ONCE toward the stored goal; if the fresh route's first step is
+    // still blocked, shove the blocker (AiCanNotMove -> AiMoveUnitInTheWay) and
+    // wait. This single, paced loop replaces the old pile of every-frame
+    // re-path heuristics (head-on swap / re-path-on-stuck / self-heal) whose
+    // mutual thrashing was the gather-wedge bug.
     if (wp_gx != pa.tile_gx || wp_gy != pa.tile_gy) {
         if (wc2_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
-            // Blocked by another unit. Three escalating responses before
-            // giving up and waiting this frame:
-            //   1. Head-on crossing → swap tiles so neither freezes (the
-            //      classic gather-route deadlock).
-            //   2. Flow-mode crowd → local give-way: slip into a free
-            //      neighbour that still heads toward the goal, so a packed
-            //      column flows around its stalled front line instead of
-            //      gridlocking (the Brood-War / OpenRA behaviour).
-            //   3. Nothing free → idle; the blocker may clear next tick.
-            if (_try_headon_swap(w, eid, wp_gx, wp_gy, pa) != 0) {
-                // Swap fired: pa.tile is already updated to the new tile.
-            } else if (pa.mode == PATH_MODE_FLOW
-                       && _flow_avoid(eid, p_gx, p_gy, flow_dx, flow_dy,
-                                      _flow_step_buf) != 0) {
-                // Give-way fired — retarget to the chosen cell and take
-                // over its claim (atomic release-old / register-new).
-                wp_gx = _flow_step_buf[0];
-                wp_gy = _flow_step_buf[1];
-                wc2_collision_release(pa.tile_gx, pa.tile_gy);
-                wc2_collision_register(eid, wp_gx, wp_gy);
-                pa.tile_gx = wp_gx;
-                pa.tile_gy = wp_gy;
-            } else if (_try_unblock(w, eid, wp_gx, wp_gy, p) != 0) {
-                // 4. Shoved the stationary blocker aside (Stratagus
-                //    AiMoveUnitInTheWay). Idle this frame; the contested tile
-                //    frees over the next few as the blocker steps off it.
+            if (pa.mode == PATH_MODE_FLOW) {
+                // Flow-mode crowds have no stored A* goal — keep the local
+                // give-way (packed column slips around its stalled front line).
+                if (_flow_avoid(eid, p_gx, p_gy, flow_dx, flow_dy,
+                                _flow_step_buf) != 0) {
+                    wp_gx = _flow_step_buf[0];
+                    wp_gy = _flow_step_buf[1];
+                    wc2_collision_release(pa.tile_gx, pa.tile_gy);
+                    wc2_collision_register(eid, wp_gx, wp_gy);
+                    pa.tile_gx = wp_gx;
+                    pa.tile_gy = wp_gy;
+                } else {
+                    _idle_anim(an);
+                    return;
+                }
+            } else if (pa.wait > 0) {
+                pa.wait = pa.wait - 1;          // WAIT — give the blocker time
                 _idle_anim(an);
                 return;
             } else {
-                _idle_anim(an);
-                return;
+                // Wait expired → re-path once toward the goal, then re-check the
+                // first step of the fresh route.
+                _movement_repath(w, eid, pa);
+                pa.wait = _MOVE_WAIT_MAX;
+                if (pa.cursor >= pa.count) {     // no route this tick — wait it out
+                    _idle_anim(an);
+                    return;
+                }
+                wp_gx = pa.buf[pa.cursor * 2];
+                wp_gy = pa.buf[pa.cursor * 2 + 1];
+                if (wp_gx == pa.tile_gx && wp_gy == pa.tile_gy) {
+                    // First step is our own tile — fall through and walk it.
+                } else if (wc2_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
+                    _try_unblock(w, eid, wp_gx, wp_gy, p);   // shove the blocker
+                    _idle_anim(an);
+                    return;
+                } else {
+                    wc2_collision_release(pa.tile_gx, pa.tile_gy);
+                    wc2_collision_register(eid, wp_gx, wp_gy);
+                    pa.tile_gx = wp_gx;
+                    pa.tile_gy = wp_gy;
+                }
             }
         } else {
             wc2_collision_release(pa.tile_gx, pa.tile_gy);
             wc2_collision_register(eid, wp_gx, wp_gy);
             pa.tile_gx = wp_gx;
             pa.tile_gy = wp_gy;
+            pa.wait    = _MOVE_WAIT_MAX;     // moving freely — refill the window
         }
     }
 

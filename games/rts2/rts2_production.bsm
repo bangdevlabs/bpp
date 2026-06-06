@@ -672,8 +672,15 @@ static void _tick_training(w, eid) {
     atlas = wc2_atlas_for_unit(front, player);
     if (atlas != 0) {
         new_eid = ecs_spawn_unit(w, atlas, sgx, sgy, player, front);
-        if (b.rally_gx >= 0 && new_eid >= 0) {
-            wc2_movement_request(w, new_eid, b.rally_gx, b.rally_gy);
+        if (new_eid >= 0) {
+            // Eject the freshly-trained unit to a free tile beside the building
+            // (Stratagus DropOutOnSide) so a stream of trained units spreads
+            // out instead of stacking on the single spawn tile and freezing.
+            wc2_movement_drop_out(w, new_eid, p_b.x / 32, p_b.y / 32,
+                                  bdef.px_w / 32, bdef.px_h / 32);
+            if (b.rally_gx >= 0) {
+                wc2_movement_request(w, new_eid, b.rally_gx, b.rally_gy);
+            }
         }
     }
     // Pop the front of the queue (shift the rest left).
@@ -774,6 +781,17 @@ static void _tick_building(w, eid) {
             an_w.state      = UNIT_STATE_IDLE;
             an_w.elapsed_ms = 0;
         }
+        // Re-drive a STALLED builder. A builder that is genuinely WALKING is
+        // left alone (movement + the re-path-on-stuck handle it); only one
+        // sitting IDLE short of the site is re-commanded, so it keeps heading
+        // in instead of freezing the build forever (the pc=3 "WAIT BARRACKS"
+        // deadlock — the AI's constructing-builder guard protects it from
+        // being re-tasked, so nothing else re-drives it). Gating on IDLE (not
+        // "path exhausted") fires once per stall, not every frame while it
+        // walks — the per-frame re-issue otherwise spams the pathfinder.
+        if (an_w.state == UNIT_STATE_IDLE) {
+            wc2_building_assign_peasant(w, eid, b.assigned_peasant_eid);
+        }
         return;
     }
     // Worker is at the foundation — park them in BUILD state so
@@ -802,11 +820,17 @@ static void _tick_building(w, eid) {
         b.state       = BLDG_STATE_DONE;
         b.progress_ms = def.construction_time_ms;
         // Worker pops back to IDLE so the next command (move,
-        // attack, another build) lands on a fresh state. The
-        // peasant stays at the foundation tile until the player
-        // gives them new orders.
+        // attack, another build) lands on a fresh state.
         an_w.state      = UNIT_STATE_IDLE;
         an_w.elapsed_ms = 0;
+        // Eject the builder to a guaranteed-free tile beside the finished
+        // building (Stratagus DropOutOnSide). Without this the worker was
+        // left standing against the footprint and — with a sibling or the
+        // forest hemming it in — froze in place; this is the engine
+        // primitive that keeps a just-built base from clogging with workers.
+        wc2_movement_drop_out(w, b.assigned_peasant_eid,
+                              p_b.x / 32, p_b.y / 32,
+                              def.px_w / 32, def.px_h / 32);
         // Debug — confirms the state flip lands on the right
         // frame. S10 will replace this with a production-system
         // hook (unlock training UI, grant supply, fire SFX) but

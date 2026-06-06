@@ -286,7 +286,6 @@ static _find_nearest_town_hall(world, peasant_eid) {
 
 wc2_gather_assign_mine(world, peasant_eid, mine_eid) {
     auto gt: Gather, b: Building, mp: Pos;
-    auto gx, gy;
     b = ecs_get(world, building_comp, mine_eid);
     if (b.kind != BLDG_GOLD_MINE)       { return 0; }
     if (b.state == BLDG_STATE_DEPLETED) { return 0; }
@@ -307,20 +306,13 @@ wc2_gather_assign_mine(world, peasant_eid, mine_eid) {
     gt.deposit_eid  = -1;
     gt.progress_ms  = 0;
     gt.carry        = CARRY_NONE;
-    // Discover a walkable perimeter tile dynamically — forest1.json
-    // wraps some mines in trees on the south edge so the canonical
-    // "south of footprint" target is path-blocked and the peasant
-    // never starts walking. `wc2_movement_find_walkable_perimeter`
-    // scans the entire ring; fallback to the south-mid tile only if
-    // the whole perimeter is walled in (would have failed anyway).
+    // Walk to WITHIN 1 tile of the mine's 4×4 footprint. path_find_near picks
+    // the reachable adjacent tile itself (Stratagus goal-rect + range), so the
+    // gather tick no longer hand-picks a perimeter tile and no longer re-paths
+    // on landing short — the movement layer owns the approach + its contention.
     mp = ecs_get(world, pos_comp, mine_eid);
-    if (wc2_movement_find_walkable_perimeter(mine_eid,
-                                             mp.x / 32, mp.y / 32,
-                                             4, 4, 0 - 1, 0 - 1, &gx, &gy) == 0) {
-        gx = (mp.x + 64) / 32;
-        gy = (mp.y + 128) / 32;
-    }
-    wc2_movement_request(world, peasant_eid, gx, gy);
+    wc2_movement_request_near(world, peasant_eid,
+                              mp.x / 32, mp.y / 32, 4, 4, 1);
     return 1;
 }
 
@@ -396,16 +388,12 @@ wc2_repair_assign(world, peasant_eid, b_eid) {
     gt.deposit_eid = -1;
     gt.progress_ms = 0;
     gt.carry       = CARRY_NONE;
-    // Walk to a passable perimeter tile of the building footprint (reuses the
-    // same spread-aware walker the mine/tree assignments use).
+    // Walk to WITHIN 1 tile of the building footprint (path_find_near picks the
+    // reachable adjacent cell; the movement layer owns the approach).
     bdef = building_def_for(b.kind);
     tp = ecs_get(world, pos_comp, b_eid);
-    p  = ecs_get(world, pos_comp, peasant_eid);
-    wgx = 0; wgy = 0;
-    if (wc2_movement_find_walkable_perimeter(b_eid, tp.x / 32, tp.y / 32,
-            bdef.px_w / 32, bdef.px_h / 32, p.x, p.y, &wgx, &wgy) != 0) {
-        wc2_movement_request(world, peasant_eid, wgx, wgy);
-    }
+    wc2_movement_request_near(world, peasant_eid, tp.x / 32, tp.y / 32,
+                              bdef.px_w / 32, bdef.px_h / 32, 1);
     return 1;
 }
 
@@ -452,11 +440,22 @@ static _nearest_walkable_neighbor(px, py, tx, ty, self_eid, out_gx, out_gy) {
 // Used to auto-continue wood gathering onto the next tree after the
 // current one is felled, so wood loops like gold (WC2 peasants keep
 // working the forest down).
-// True if (x, y) is in-bounds and NOT a (blocking) forest tile — i.e.
-// open ground a worker can stand on to chop an adjacent tree.
+// True if (x, y) is a cell a worker can actually STAND on to chop an
+// adjacent tree. This is the edge test `_nearest_tree` uses to decide
+// whether a forest tile is reachable for harvesting, so it must agree
+// with the pathfinder — not just the tileset.
+//
+// The old check ("not a forest tile") was blind to building footprints
+// and rock: a tree whose only non-forest neighbour was the AI's own town
+// hall read as a valid edge tree, but `_nearest_walkable_neighbor` then
+// found no walkable chop-spot and the assignment failed — so a base
+// wrapped in forest left the AI mining gold forever (never chopping the
+// wood it needs to build). `path_is_blocked` covers terrain walls
+// (forest + rock) AND building footprints, exactly the cells a worker
+// cannot occupy, matching `_nearest_walkable_neighbor`'s primary gate.
 static _tile_open(tm: Tilemap, w, h, x, y) {
     if (x < 0 || y < 0 || x >= w || y >= h) { return 0; }
-    return wc2_is_forest_tile(tile_get(tm, x, y)) == 0;
+    return path_is_blocked(_pf, x, y) == 0;
 }
 
 static _nearest_tree(world, gx, gy, self_eid, out_x, out_y) {
@@ -726,11 +725,9 @@ static void _gather_visit(w, eid) {
                     }
                     th_eid = gt.deposit_eid;
                     if (th_eid >= 0) {
-                        drop_gxy = buf_word(2);
-                        _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
-                        wc2_movement_request(w, eid,
-                                                    drop_gxy[0], drop_gxy[1]);
-                        free(drop_gxy);
+                        tp = ecs_get(w, pos_comp, th_eid);
+                        wc2_movement_request_near(w, eid,
+                                tp.x / 32, tp.y / 32, 4, 4, 1);
                     }
                     // LEAVE the mine: free our capacity slot (Stratagus
                     // StopGathering, :871) so a worker waiting at the
@@ -738,20 +735,11 @@ static void _gather_visit(w, eid) {
                     b.active = b.active - 1;
                     an.state = UNIT_STATE_RETURNING_GOLD;
                 }
-            } else {
-                // Arrived but short of the mine (the perimeter tile was taken,
-                // or a unit-avoiding detour stopped us before the doorway).
-                // Re-path to a fresh free perimeter tile — Stratagus
-                // MoveToResource retry. Without this a returning miner that
-                // lands short sits forever (deposits but never re-mines). The
-                // cursor >= count gate above fires it once per arrival.
-                auto mgx2, mgy2;
-                if (wc2_movement_find_walkable_perimeter(gt.target,
-                        tp.x / 32, tp.y / 32, 4, 4, p.x, p.y,
-                        &mgx2, &mgy2) != 0) {
-                    wc2_movement_request(w, eid, mgx2, mgy2);
-                }
             }
+            // else: still en route to the mine — the movement tick
+            // (request_near + WAIT / re-path / shove) owns the approach and its
+            // contention. The gather tick does nothing until the worker is in
+            // reach, so there is no competing re-path here any more.
             return;
         }
         if (gt.target_kind == GATHER_TARGET_TREE) {
@@ -800,11 +788,9 @@ static void _gather_visit(w, eid) {
                     }
                     th_eid = gt.deposit_eid;
                     if (th_eid >= 0) {
-                        drop_gxy = buf_word(2);
-                        _deposit_drop_tile(w, th_eid, p.x, p.y, drop_gxy);
-                        wc2_movement_request(w, eid,
-                                                    drop_gxy[0], drop_gxy[1]);
-                        free(drop_gxy);
+                        tp = ecs_get(w, pos_comp, th_eid);
+                        wc2_movement_request_near(w, eid,
+                                tp.x / 32, tp.y / 32, 4, 4, 1);
                     }
                     an.state = UNIT_STATE_RETURNING_WOOD;
                 }
@@ -824,7 +810,6 @@ static void _gather_visit(w, eid) {
             // is the building eid (like a mine). Walk to its perimeter, then
             // restore HP per cycle while charging the owner gold/wood.
             auto sh_b: Sheet, bdef: BuildingDef, cur, hpmax, hp, gcost, wcost;
-            auto mgx2, mgy2;
             if (ecs_alive_at(w, gt.target) == 0) {
                 gt.target_kind = GATHER_TARGET_NONE; an.state = UNIT_STATE_IDLE; return;
             }
@@ -839,13 +824,7 @@ static void _gather_visit(w, eid) {
             tp   = ecs_get(w, pos_comp, gt.target);
             dist = _dist_sq(p.x + 16, p.y + 16, tp.x + 64, tp.y + 64);   // building centre
             if (dist > reach_sq) {
-                // Landed short -> re-path to a fresh perimeter tile. The cursor
-                // gate above throttles this to once per arrival.
-                if (wc2_movement_find_walkable_perimeter(gt.target, tp.x / 32, tp.y / 32,
-                        bdef.px_w / 32, bdef.px_h / 32, p.x, p.y, &mgx2, &mgy2) != 0) {
-                    wc2_movement_request(w, eid, mgx2, mgy2);
-                }
-                return;
+                return;   // still en route — the movement layer owns the approach
             }
             // In reach -> hammer: park (BUILD anim) + mend per cycle, charging
             // resources. RepairCosts proportional to the build price (half for
@@ -880,10 +859,8 @@ static void _gather_visit(w, eid) {
         // alive-check the deref below would read a dead row and crash.
         gt.deposit_eid = _find_nearest_town_hall(w, eid);
         if (gt.deposit_eid < 0) { return; }
-        drop_gxy = buf_word(2);
-        _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
-        wc2_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
-        free(drop_gxy);
+        tp = ecs_get(w, pos_comp, gt.deposit_eid);
+        wc2_movement_request_near(w, eid, tp.x / 32, tp.y / 32, 4, 4, 1);
         return;
     }
     tp = ecs_get(w, pos_comp, gt.deposit_eid);
@@ -891,18 +868,8 @@ static void _gather_visit(w, eid) {
     mp_cy = tp.y + 64;
     dist = _dist_sq(p.x + 16, p.y + 16, mp_cx, mp_cy);
     if (dist > reach_sq) {
-        // Not in reach yet. If the path is exhausted but we landed short (the
-        // doorway was taken or a unit-avoiding detour stopped us before the
-        // hall), re-path to a fresh free drop tile — Stratagus MoveToDepot
-        // retries. The cursor >= count gate makes it fire once per arrival.
-        auto pa_d: Path;
-        pa_d = ecs_get(w, path_comp, eid);
-        if (pa_d.cursor >= pa_d.count) {
-            drop_gxy = buf_word(2);
-            _deposit_drop_tile(w, gt.deposit_eid, p.x, p.y, drop_gxy);
-            wc2_movement_request(w, eid, drop_gxy[0], drop_gxy[1]);
-            free(drop_gxy);
-        }
+        // Not in reach yet — the movement tick (request_near + WAIT / re-path /
+        // shove) owns the approach to the hall. Nothing to do until we arrive.
         return;
     }
     if (dist <= reach_sq) {
@@ -950,20 +917,14 @@ static void _gather_visit(w, eid) {
         // still land on a path-reachable cell (see assign_mine).
         gt.carry = CARRY_NONE;
         if (gt.target_kind == GATHER_TARGET_MINE) {
-            auto mgx, mgy;
             tp = ecs_get(w, pos_comp, gt.target);
-            if (wc2_movement_find_walkable_perimeter(gt.target,
-                                                      tp.x / 32, tp.y / 32,
-                                                      4, 4, p.x, p.y,
-                                                      &mgx, &mgy) == 0) {
-                mgx = (tp.x + 64) / 32;
-                mgy = (tp.y + 128) / 32;
-            }
-            wc2_movement_request(w, eid, mgx, mgy);
+            wc2_movement_request_near(w, eid, tp.x / 32, tp.y / 32, 4, 4, 1);
         } else if (gt.target_kind == GATHER_TARGET_TREE) {
             tile_gy = gt.target / _tree_grid_w;
             tile_gx = gt.target - tile_gy * _tree_grid_w;
-            wc2_movement_request(w, eid, tile_gx, tile_gy);
+            // Tree tile is itself blocked (forest) — request_near stops on a
+            // walkable cell 1 tile away (adjacent), where the chop fires.
+            wc2_movement_request_near(w, eid, tile_gx, tile_gy, 1, 1, 1);
         } else {
             an.state = UNIT_STATE_IDLE;
         }

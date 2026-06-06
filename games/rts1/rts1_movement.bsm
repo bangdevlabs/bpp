@@ -327,18 +327,6 @@ wc1_collision_is_blocked_for(eid, gx, gy) {
     return 1;
 }
 
-// Public spatial query — the unit eid occupying tile (gx, gy), or -1 if the
-// cell is empty or holds a static terrain blocker. Lets combat / AI find
-// nearby enemies by scanning a small tile window (O(window)) instead of
-// walking every unit (O(N)). Bounds-safe via stbgrid — OOB reads as empty.
-wc1_collision_unit_at(gx, gy) {
-    auto claim;
-    claim = grid_get(_occupied, gx, gy);
-    if (claim == 0)                { return 0 - 1; }
-    if (claim == _TERRAIN_BLOCKER) { return 0 - 1; }
-    return claim - 1;
-}
-
 // Head-on deadlock breaker. `eid` (at tile pa.tile) wants to step onto
 // (wp_gx, wp_gy), which is held by another unit. If that blocker's NEXT
 // path step is onto eid's CURRENT tile, the two are crossing head-on and
@@ -443,72 +431,6 @@ static void _idle_anim(an: Anim) {
     }
 }
 
-// Local give-way for flow-mode crowds — the Brood-War / OpenRA "step
-// aside" so a packed column flows around its own stalled front line
-// instead of freezing in place. Called only when the flow-preferred
-// next cell is already claimed by another unit (the gridlock trigger).
-//
-// It scans the eight neighbours of (cur_gx, cur_gy) and picks the best
-// FREE one that:
-//   (a) is no farther from the goal than the current cell
-//       (flow_dist <= here) — never trade ground away from the goal; and
-//   (b) does not point AWAY from the flow direction (dot product with
-//       the preferred step >= 0), so a unit only slips forward or
-//       sideways, never backward. That forward/sideways restriction is
-//       what keeps the motion from oscillating into a back-and-forth.
-// Among the survivors the smallest flow_dist wins, breaking ties toward
-// the preferred direction (largest dot) so the give-way still drifts
-// goalward. Writes the chosen cell into out[0..1] and returns 1, or
-// returns 0 when nothing better-and-free exists (the caller then waits
-// this frame, exactly as before).
-//
-// Precondition: the caller is in flow mode and flow_step already
-// returned a nonzero step, so the current cell's flow_dist is finite and
-// positive — no infinity / at-goal guard is needed here.
-static _flow_avoid(eid, cur_gx, cur_gy, pref_dx, pref_dy, out) {
-    auto here_d, best_d, best_gx, best_gy, best_dot;
-    auto dx, dy, nx, ny, nd, dot;
-    here_d  = flow_dist(_flow, cur_gx, cur_gy);
-    best_gx = 0 - 1;
-    best_d  = 0;
-    best_dot = 0;
-    dy = 0 - 1;
-    while (dy <= 1) {
-        dx = 0 - 1;
-        while (dx <= 1) {
-            if (dx != 0 || dy != 0) {
-                // Forward or sideways only (never backward vs the goal).
-                dot = dx * pref_dx + dy * pref_dy;
-                if (dot >= 0) {
-                    nx = cur_gx + dx;
-                    ny = cur_gy + dy;
-                    if (wc1_collision_is_blocked_for(eid, nx, ny) == 0) {
-                        nd = flow_dist(_flow, nx, ny);
-                        // nd <= here_d also rejects unreachable cells:
-                        // their flow_dist is the infinity sentinel, which
-                        // is far larger than the finite here_d.
-                        if (nd <= here_d) {
-                            if (best_gx < 0 || nd < best_d
-                                || (nd == best_d && dot > best_dot)) {
-                                best_gx  = nx;
-                                best_gy  = ny;
-                                best_d   = nd;
-                                best_dot = dot;
-                            }
-                        }
-                    }
-                }
-            }
-            dx = dx + 1;
-        }
-        dy = dy + 1;
-    }
-    if (best_gx < 0) { return 0; }
-    out[0] = best_gx;
-    out[1] = best_gy;
-    return 1;
-}
-
 // Per-entity tick. Resolves the micro-target (A* waypoint or
 // flow-sampled neighbor), tries to claim it through the shared
 // occupancy grid, and either walks toward it or idles.
@@ -591,32 +513,14 @@ static void _step_unit(w, eid) {
     // the other unit may have cleared by the next tick.
     if (wp_gx != pa.tile_gx || wp_gy != pa.tile_gy) {
         if (wc1_collision_is_blocked_for(eid, wp_gx, wp_gy) != 0) {
-            // Blocked by another unit. Three escalating responses before
-            // giving up and waiting this frame:
-            //   1. Head-on crossing → swap tiles so neither freezes (the
-            //      classic gather-route deadlock).
-            //   2. Flow-mode crowd → local give-way: slip into a free
-            //      neighbour that still heads toward the goal, so a packed
-            //      column flows around its stalled front line instead of
-            //      gridlocking (the Brood-War / OpenRA behaviour).
-            //   3. Nothing free → idle; the blocker may clear next tick.
-            if (_try_headon_swap(w, eid, wp_gx, wp_gy, pa) != 0) {
-                // Swap fired: pa.tile is already updated to the new tile.
-            } else if (pa.mode == PATH_MODE_FLOW
-                       && _flow_avoid(eid, p_gx, p_gy, flow_dx, flow_dy,
-                                      _flow_step_buf) != 0) {
-                // Give-way fired — retarget to the chosen cell and take
-                // over its claim (atomic release-old / register-new).
-                wp_gx = _flow_step_buf[0];
-                wp_gy = _flow_step_buf[1];
-                wc1_collision_release(pa.tile_gx, pa.tile_gy);
-                wc1_collision_register(eid, wp_gx, wp_gy);
-                pa.tile_gx = wp_gx;
-                pa.tile_gy = wp_gy;
-            } else {
+            // Blocked by another unit. If it's a head-on crossing, swap
+            // tiles so neither freezes (the common gather-route
+            // deadlock); otherwise wait a frame for it to clear.
+            if (_try_headon_swap(w, eid, wp_gx, wp_gy, pa) == 0) {
                 _idle_anim(an);
                 return;
             }
+            // Swap fired: pa.tile is already updated to the new tile.
         } else {
             wc1_collision_release(pa.tile_gx, pa.tile_gy);
             wc1_collision_register(eid, wp_gx, wp_gy);

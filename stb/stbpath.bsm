@@ -494,3 +494,103 @@ path_find(pf, sx, sy, gx, gy, out_buf, max_steps) {
     // Heap exhausted without reaching the goal.
     return 0;
 }
+
+// ── Range / rect goal search (additive — path_find above is untouched) ──────
+//
+// Stratagus's pathfinder targets a goal RECT with a [0..range] band, so a unit
+// routes to a tile ADJACENT to a building / resource without the caller
+// hand-picking a perimeter tile. `path_find_near` ports that: it stops at the
+// first walkable cell within `range` Manhattan tiles of the rect
+// (gx, gy, gw, gh). The goal rect itself may be BLOCKED (a footprint) — only
+// the START must be walkable. With gw=gh=1, range=0 it reduces to path_find.
+//
+// This is a NEW entry point: path_find and the perf-tuned _path_relax it uses
+// are left exactly as-is, so existing consumers (rts1, fps, …) are byte-for-
+// byte unchanged. Only callers that opt into path_find_near see the new behaviour.
+
+// Manhattan distance from cell (cx, cy) to the nearest cell of the rect
+// (rx, ry, rw, rh). 0 when the cell is inside the rect. The heuristic +
+// goal test for the rect search; reduces to _path_manhattan when gw=gh=1.
+static _path_rect_dist(cx, cy, rx, ry, rw, rh) {
+    auto dx, dy;
+    dx = 0;
+    if (cx < rx)               { dx = rx - cx; }
+    else if (cx > rx + rw - 1) { dx = cx - (rx + rw - 1); }
+    dy = 0;
+    if (cy < ry)               { dy = ry - cy; }
+    else if (cy > ry + rh - 1) { dy = cy - (ry + rh - 1); }
+    return dx + dy;
+}
+
+// Edge-relax for the rect search. Identical to _path_relax except the
+// heuristic measures distance to the goal RECT instead of a single goal cell.
+// Kept as a separate copy so the original _path_relax (the hot path for every
+// existing path_find consumer) is not touched.
+static void _path_relax_rect(pf, cur_idx, nx, ny, rx, ry, rw, rh) {
+    auto p: PathFinder, n_idx, tentative;
+    p = pf;
+    if (nx < 0 || ny < 0 || nx >= p.w || ny >= p.h) { return; }
+    n_idx = ny * p.w + nx;
+    if (peek(p.cells + n_idx) || peek(p.closed + n_idx)) { return; }
+    if (p.dyn_cb != 0 && call(p.dyn_cb, nx, ny) != 0) { return; }
+    tentative = p.g_score[cur_idx] + 1;
+    if (tentative >= p.g_score[n_idx]) { return; }
+    if (p.g_score[n_idx] == PATH_INF) {
+        p.touched[p.touched_cnt] = n_idx;
+        p.touched_cnt = p.touched_cnt + 1;
+    }
+    p.came_from[n_idx] = cur_idx;
+    p.g_score[n_idx]   = tentative;
+    p.f_score[n_idx]   = tentative + _path_rect_dist(nx, ny, rx, ry, rw, rh);
+    if (p.heap_pos[n_idx] < 0) {
+        _path_heap_push(pf, n_idx);
+    } else {
+        _path_heap_decrease_key(pf, n_idx);
+    }
+}
+
+// Find a path from (sx, sy) to WITHIN `range` Manhattan tiles of the goal rect
+// (gx, gy, gw, gh). Writes waypoints (start .. near-goal) to out_buf as (gx, gy)
+// word pairs; returns the waypoint count, or 0 if no walkable cell within range
+// is reachable (or the buffer overflows / the start is off-grid or blocked).
+//
+// Unlike path_find, the goal rect may be blocked — the search stops adjacent to
+// it. Honours the dynamic-obstacle callback (path_set_dyn_blocked) the same way.
+path_find_near(pf, sx, sy, gx, gy, gw, gh, range, out_buf, max_steps) {
+    auto p: PathFinder, start_idx, cur_idx, cx, cy;
+    p = pf;
+    if (sx < 0 || sy < 0 || sx >= p.w || sy >= p.h) { return 0; }
+    start_idx = sy * p.w + sx;
+    // Only the START must be walkable — the goal rect may be a footprint.
+    if (peek(p.cells + start_idx)) { return 0; }
+    // Trivial: already within range of the goal rect.
+    if (_path_rect_dist(sx, sy, gx, gy, gw, gh) <= range) {
+        out_buf[0] = sx;
+        out_buf[1] = sy;
+        return 1;
+    }
+    path_clear(pf);
+    p.g_score[start_idx] = 0;
+    p.f_score[start_idx] = _path_rect_dist(sx, sy, gx, gy, gw, gh);
+    p.touched[p.touched_cnt] = start_idx;
+    p.touched_cnt = p.touched_cnt + 1;
+    _path_heap_push(pf, start_idx);
+    while (p.heap_cnt > 0) {
+        cur_idx = _path_heap_pop_min(pf);
+        cx = cur_idx % p.w;
+        cy = cur_idx / p.w;
+        // Goal test: first walkable cell within `range` of the rect. Every
+        // popped cell is walkable (only such cells enter the heap), so this
+        // lands the unit on a reachable tile adjacent to the footprint.
+        if (_path_rect_dist(cx, cy, gx, gy, gw, gh) <= range) {
+            return _path_reconstruct(pf, cur_idx, out_buf, max_steps);
+        }
+        poke(p.closed + cur_idx, 1);
+        _path_relax_rect(pf, cur_idx, cx + 1, cy,     gx, gy, gw, gh);
+        _path_relax_rect(pf, cur_idx, cx - 1, cy,     gx, gy, gw, gh);
+        _path_relax_rect(pf, cur_idx, cx,     cy + 1, gx, gy, gw, gh);
+        _path_relax_rect(pf, cur_idx, cx,     cy - 1, gx, gy, gw, gh);
+    }
+    // No reachable walkable cell within range of the goal rect.
+    return 0;
+}

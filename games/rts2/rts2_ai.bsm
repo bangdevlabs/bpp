@@ -115,9 +115,14 @@ static auto _ai_army,  _ai_army_n;
 static auto _ai_melee_n, _ai_ranged_n, _ai_cav_n;  // standing army by role
 static auto _ai_gold_n;            // peons currently gathering gold
 static auto _ai_wood_n;            // peons currently chopping wood
+static auto _ai_parked_n;          // DEBUG: peons with a gather target but sitting
+                                   //   IDLE (assigned yet not cycling = "stuck")
+static auto _ai_dbg_mine_active;   // DEBUG: the worked mine's `active` slot count
 static auto _ai_th_eid, _ai_barracks_eid, _ai_stable_eid;
 static auto _ai_bldg_count;        // buf_word[_AI_NKINDS] — owned count per kind
 static auto _ai_bldg_done;         // buf_word[_AI_NKINDS] — completed count per kind
+static auto _ai_bldg_builders;     // buf_word[_AI_SCAN_MAX] — peons a CONSTRUCTING
+static auto _ai_bldg_builder_n;    //   building is waiting on (don't yank to gather)
 static auto _ai_mine_eid, _ai_mine_best, _ai_ref_x, _ai_ref_y;
 static auto _ai_enemy_hq, _ai_enemy_tgt;
 static auto _ai_hn_gx, _ai_hn_gy, _ai_hn_range_sq, _ai_hn_found;  // hall-near scan
@@ -140,6 +145,7 @@ void wc2_ai_init(world, ai_player, enemy_player) {
     _ai_army  = buf_word(_AI_SCAN_MAX);
     _ai_bldg_count = buf_word(_AI_NKINDS);
     _ai_bldg_done  = buf_word(_AI_NKINDS);
+    _ai_bldg_builders = buf_word(_AI_SCAN_MAX);
     _ai_script_init();
     _ai_active = 1;
     return;
@@ -198,6 +204,12 @@ static void _ai_unit_visit(w, eid) {
     if (u.kind == UNIT_PEASANT) {
         if (_ai_peon_n < _AI_SCAN_MAX) { _ai_peons[_ai_peon_n] = eid; _ai_peon_n = _ai_peon_n + 1; }
         gt = ecs_get(w, gather_comp, eid);
+        // DEBUG: a peon IDLE while still holding a gather assignment is
+        // "parked" — it was sent to a resource but isn't cycling (the
+        // suspected mine-capacity / perimeter stall). Counted for the heartbeat.
+        if (an.state == UNIT_STATE_IDLE && gt.target_kind != GATHER_TARGET_NONE) {
+            _ai_parked_n = _ai_parked_n + 1;
+        }
         // "Available" = truly idle (not walking-to-build / building /
         // gathering). The anim state is the reliable signal: a worker
         // sent to build is WALK then BUILD, never IDLE, so it won't be
@@ -226,7 +238,7 @@ static void _ai_unit_visit(w, eid) {
 
 static void _ai_scan_units(world) {
     _ai_peon_n = 0; _ai_idle_n = 0; _ai_army_n = 0; _ai_gold_n = 0; _ai_wood_n = 0;
-    _ai_melee_n = 0; _ai_ranged_n = 0; _ai_cav_n = 0;
+    _ai_melee_n = 0; _ai_ranged_n = 0; _ai_cav_n = 0; _ai_parked_n = 0;
     _ai_scan_player = _ai_player;
     ecs_query_each(peasant_q, fn_ptr(_ai_unit_visit));
     return;
@@ -247,6 +259,17 @@ static void _ai_bldg_visit(w, eid) {
         if (b.kind == BLDG_TOWN_HALL) { _ai_th_eid       = eid; }
         if (b.kind == BLDG_BARRACKS)  { _ai_barracks_eid = eid; }
         if (b.kind == BLDG_STABLE)    { _ai_stable_eid   = eid; }
+    } else if (b.state == BLDG_STATE_CONSTRUCTING && b.assigned_peasant_eid >= 0) {
+        // Record the worker this foundation is waiting on so the economy pass
+        // doesn't pull it back to gathering. The builder goes momentarily IDLE
+        // the instant it reaches the foundation (before _tick_building flips it
+        // to BUILD); without this guard _ai_manage_workers grabs it as an idle
+        // peon and re-tasks it to a mine — the construction is then abandoned
+        // forever (its assigned worker walked off, progress frozen at 0).
+        if (_ai_bldg_builder_n < _AI_SCAN_MAX) {
+            _ai_bldg_builders[_ai_bldg_builder_n] = b.assigned_peasant_eid;
+            _ai_bldg_builder_n = _ai_bldg_builder_n + 1;
+        }
     }
     return;
 }
@@ -254,6 +277,7 @@ static void _ai_bldg_visit(w, eid) {
 static void _ai_scan_buildings(world) {
     auto i;
     _ai_th_eid = 0 - 1; _ai_barracks_eid = 0 - 1; _ai_stable_eid = 0 - 1;
+    _ai_bldg_builder_n = 0;
     for (i = 0; i < _AI_NKINDS; i++) { _ai_bldg_count[i] = 0; _ai_bldg_done[i] = 0; }
     _ai_scan_player = _ai_player;
     ecs_query_each(building_q, fn_ptr(_ai_bldg_visit));
@@ -349,6 +373,19 @@ static _ai_try_train(world, building_eid, unit_kind, max_have, have_now) {
 // with its one game-specific call (the cell-free predicate) until a second
 // grid-placement game earns the move.
 
+// 1 if `eid` is the worker a CONSTRUCTING building is currently waiting on
+// (recorded by the building scan). Such a worker must NOT be re-tasked to
+// gathering OR pulled to raise a DIFFERENT building — it is on its way to (or
+// already at) a foundation, and yanking it abandons that build. Linear scan
+// over the small per-tick builder list.
+static _ai_is_constructing_builder(eid) {
+    auto i;
+    for (i = 0; i < _ai_bldg_builder_n; i++) {
+        if (_ai_bldg_builders[i] == eid) { return 1; }
+    }
+    return 0;
+}
+
 // A build cell is "free" when nothing blocks it in the shared occupancy grid
 // (terrain blocker, unit claim, or another building's footprint). Off-grid
 // cells read as blocked via wc2_collision_is_blocked_for.
@@ -413,10 +450,22 @@ static _ai_place_building(world, kind, builder, def: BuildingDef, gx, gy) {
 // the nearest < 5-obstacle spot, then any valid cell so a tight base never
 // stalls the build queue), spend + spawn. Returns 1 if started.
 static _ai_build_near(world, kind, gx0, gy0) {
-    auto def: BuildingDef, r, dx, dy, gx, gy;
+    auto def: BuildingDef, r, dx, dy, gx, gy, bi;
     auto ntx, nty, count, bk_gx, bk_gy, any_gx, any_gy, builder;
-    builder = _ai_idle_n > 0 ? _ai_idle[0] : (_ai_peon_n > 0 ? _ai_peons[0] : (0 - 1));
-    if (builder < 0) { return 0; }                     // no worker at all
+    // Pick a worker: idle preferred, else pull one off gathering — but NEVER a
+    // worker another foundation is already waiting on (it reads as idle while
+    // parked at its site before BUILD engages; stealing it abandons that build,
+    // the farmC=2 "same peon on two foundations" bug).
+    builder = 0 - 1;
+    for (bi = 0; bi < _ai_idle_n; bi++) {
+        if (_ai_is_constructing_builder(_ai_idle[bi]) == 0) { builder = _ai_idle[bi]; break; }
+    }
+    if (builder < 0) {
+        for (bi = 0; bi < _ai_peon_n; bi++) {
+            if (_ai_is_constructing_builder(_ai_peons[bi]) == 0) { builder = _ai_peons[bi]; break; }
+        }
+    }
+    if (builder < 0) { return 0; }                     // no free worker
     def = building_def_for(kind);
     if (def == 0) { return 0; }
     if (wc2_resources_gold(_ai_player) < def.cost_gold) { return 0; }
@@ -434,6 +483,11 @@ static _ai_build_near(world, kind, gx0, gy0) {
                     if (any_gx < 0) { any_gx = gx; any_gy = gy; }  // nearest valid (last resort)
                     count = _ai_obstacle_count(gx, gy, ntx, nty);
                     if (count == 0) {
+                        if (wc2_debug != 0) {
+                            putstr("[place] kind="); putnum(kind);
+                            putstr(" OPEN ("); putnum(gx); putstr(",");
+                            putnum(gy); putstr(") r="); putnum(r); putstr("\n");
+                        }
                         return _ai_place_building(world, kind, builder, def, gx, gy);
                     }
                     if (count < 5 && bk_gx < 0) { bk_gx = gx; bk_gy = gy; }  // nearest backupok
@@ -445,8 +499,28 @@ static _ai_build_near(world, kind, gx0, gy0) {
         r = r + 1;
     }
     // No fully-open spot in range — nearest < 5-obstacle, else any valid.
-    if (bk_gx >= 0)  { return _ai_place_building(world, kind, builder, def, bk_gx, bk_gy); }
-    if (any_gx >= 0) { return _ai_place_building(world, kind, builder, def, any_gx, any_gy); }
+    // Trace which fallback fired: BACKUP/ANY means no open ground was found in
+    // the r<=9 ring, so the AI settled for a cramped spot (the suspected
+    // corridor-block). Stratagus flood-fills a much larger area + retries
+    // instead of settling — this print confirms whether that's our gap.
+    if (bk_gx >= 0)  {
+        if (wc2_debug != 0) {
+            putstr("[place] kind="); putnum(kind);
+            putstr(" BACKUP ("); putnum(bk_gx); putstr(",");
+            putnum(bk_gy); putstr(") count=");
+            putnum(_ai_obstacle_count(bk_gx, bk_gy, ntx, nty));
+            putstr(" (no OPEN spot in r<=9)\n");
+        }
+        return _ai_place_building(world, kind, builder, def, bk_gx, bk_gy);
+    }
+    if (any_gx >= 0) {
+        if (wc2_debug != 0) {
+            putstr("[place] kind="); putnum(kind);
+            putstr(" ANY ("); putnum(any_gx); putstr(",");
+            putnum(any_gy); putstr(") (no OPEN or BACKUP spot in r<=9)\n");
+        }
+        return _ai_place_building(world, kind, builder, def, any_gx, any_gy);
+    }
     return 0;
 }
 
@@ -664,7 +738,14 @@ static void _ai_manage_workers(world, th_p: Pos, builder, mine) {
     for (i = 0; i < _ai_idle_n; i++) {
         eid = _ai_idle[i];
         if (eid == builder) { continue; }
-        if (_ai_wood_n < _AI_MIN_CHOPPERS) {
+        if (_ai_is_constructing_builder(eid)) { continue; }   // a foundation needs it
+        // Gold has priority while the worker count is tiny: gold trains more
+        // peons + funds every building, so the FIRST worker must mine, not
+        // chop. Only spare one for wood once there are MORE peons than the
+        // chopper floor — that guarantees at least one stays on gold. Without
+        // this the lone starting peon went to wood, gold stayed 0, and the AI
+        // could never afford a second peon (frozen at 1, chopping forever).
+        if (_ai_wood_n < _AI_MIN_CHOPPERS && _ai_peon_n > _AI_MIN_CHOPPERS) {
             if (wc2_gather_assign_nearest_tree(world, eid, tgx, tgy) != 0) {
                 _ai_wood_n = _ai_wood_n + 1;
             } else if (mine >= 0) {
@@ -716,6 +797,19 @@ static void _ai_heartbeat(mine) {
         putstr(" force="); putnum(_ai_force_melee); putstr("/");
         putnum(_ai_force_ranged); putstr("/"); putnum(_ai_force_cav);
         putstr(" gold="); putnum(wc2_resources_gold(_ai_player));
+        // Worker split (proves the economy-stall bug). idle/g/w are the
+        // scan counts; `busy` = peons that are NEITHER idle NOR gathering,
+        // i.e. parked in BUILD / walking-to-build / repair limbo — a high,
+        // persistent `busy` is the "stolen builder" signature. `farmC` is
+        // the number of farms CONSTRUCTING (count - done); > 1 means the
+        // supply step is spamming foundations (missing AiRequestSupply's
+        // "already queued -> abort" gate).
+        putstr(" idle="); putnum(_ai_idle_n);
+        putstr(" g="); putnum(_ai_gold_n); putstr(" w="); putnum(_ai_wood_n);
+        putstr(" busy="); putnum(_ai_peon_n - _ai_idle_n - _ai_gold_n - _ai_wood_n);
+        putstr(" parked="); putnum(_ai_parked_n);
+        putstr(" mineAct="); putnum(_ai_dbg_mine_active);
+        putstr(" farmC="); putnum(_ai_bldg_count[BLDG_FARM] - _ai_bldg_done[BLDG_FARM]);
         putstr(" brk="); putnum(_ai_bldg_done[BLDG_BARRACKS]);
         putstr(" stb="); putnum(_ai_bldg_done[BLDG_STABLE]); putstr("\n");
     }
@@ -732,6 +826,15 @@ static void _ai_think(world) {
     _ai_scan_units(world);
     th_p = ecs_get(world, pos_comp, _ai_th_eid);
     mine = _ai_find_mine(world, th_p.x, th_p.y);
+    // DEBUG: snapshot the worked mine's capacity counter for the heartbeat —
+    // if it leaks above _WC2_MINE_MAX_ON_BOARD (5) the mine reads "full" and
+    // arriving workers park IDLE forever (the suspected stall).
+    _ai_dbg_mine_active = 0 - 1;
+    if (mine >= 0) {
+        auto _mb: Building;
+        _mb = ecs_get(world, building_comp, mine);
+        _ai_dbg_mine_active = _mb.active;
+    }
 
     // 1. Advance the build-order tape. A BUILD step may pull a worker to
     //    raise a building; _ai_build records it in _ai_builder_eid so the
@@ -742,7 +845,13 @@ static void _ai_think(world) {
     // 2. Supply: keep food headroom so the escalating army never stalls
     //    (Stratagus AiNeedSupply). Build a farm whenever food used is within
     //    2 of the cap — unless the script already pulled a builder this tick.
+    // Skip if a farm is already CONSTRUCTING (count > done) — Stratagus
+    // AiRequestSupply aborts "if one is already queued". Without this gate the
+    // supply step re-fired every 200 ms for the ~6 s a farm takes to build
+    // (food cap only rises on completion), dropping a fresh foundation each
+    // tick and shuffling builders between them (the farmC=2 spam).
     if (_ai_builder_eid < 0
+        && (_ai_bldg_count[BLDG_FARM] - _ai_bldg_done[BLDG_FARM]) == 0
         && wc2_resources_food(_ai_player) >= wc2_resources_food_cap(_ai_player) - 2) {
         _ai_build(world, BLDG_FARM);
     }
