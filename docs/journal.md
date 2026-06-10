@@ -13136,11 +13136,13 @@ compiler warnings.
   usage slip, not a tool fault (the debugger works fine when compiled with
   `--bug`). A behavioural probe pinned the inliner bug anyway: `f(n*2)` (BIND,
   safe) vs `f(n)` (SIMPLE, corrupt) isolated the SIMPLE-substitution-of-a-
-  written-parameter as the cause in one shot. Hardened so this does not recur:
-  `debug_with_bug.md` now calls out the `--bug` prerequisite (and the exact
-  `cannot load ./prog.bug` error) at the top of the command list, and **Tonify
-  Rule 44** makes "compile with `--bug`, read the disassembly first" a standing
-  rule.
+  written-parameter as the cause in one shot. Hardened on three fronts so this
+  does not recur: (1) `bug` now self-documents — a missing map prints
+  `no debug map at … — recompile with bpp --bug`, probing the path to tell an
+  absent map apart from a present-but-unreadable one (`src/bug.bpp`); (2)
+  `debug_with_bug.md` calls out the `--bug` prerequisite at the top of the
+  command list; (3) **Tonify Rule 44** makes "compile with `--bug`, read the
+  disassembly first" a standing rule.
 - **"Missing a control-flow node in a walker" is a recurring shape here.** The
   `switch`-arm bug is the same family as the outlining-era `ast_clone_subst`
   gap. When a pass walks `T_IF`/`T_WHILE`/`T_BLOCK`, check it also walks

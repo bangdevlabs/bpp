@@ -3754,16 +3754,18 @@ bug --bytes  ./prog fn            # raw machine code, 16/line
 The trap that cost a debugging session: **`.bug` emission is opt-in.** A
 plain `bpp prog.bpp -o prog` writes *only* the binary; the `--disasm` /
 `--bytes` / `--dump` / `--tui` modes all need the `.bug` map, which the
-compiler writes **only when you pass `--bug`**. Skip the flag and
-`bug --disasm` reports:
+compiler writes **only when you pass `--bug`**. Skip the flag and `bug`
+now tells you exactly what is wrong (it probes the path: absent map vs a
+present-but-unreadable one):
 
 ```
-bug: cannot load ./prog.bug
+bug: no debug map at ./prog.bug
+      `.bug` is opt-in — recompile the program with `bpp --bug` to emit it, then retry
 ```
 
-That line is the missing flag — **not** a broken debugger and **not** a
-broken binary. Rebuild with `--bug` and re-run. (`bpp --bug=<path>` puts
-the map off to the side, e.g. under `/tmp`, instead of next to the binary.)
+That is the missing flag — **not** a broken debugger and **not** a broken
+binary. Rebuild with `--bug` and re-run. (`bpp --bug=<path>` puts the map
+off to the side, e.g. under `/tmp`, instead of next to the binary.)
 
 ### Why this is a rule, not a footnote
 
