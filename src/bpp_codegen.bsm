@@ -2648,6 +2648,108 @@ _bug_line_record(pc, tok) {
     return 0;
 }
 
+// Does the subtree `nd` WRITE the variable named `pname` — assign to it,
+// or take its address (which lets it be written through a pointer)?
+//
+// The inliner uses this to stay both correct and fast. A parameter that
+// is only READ may be substituted with the caller's argument directly
+// (the SIMPLE strategy). A parameter that is WRITTEN must instead get
+// its own per-callsite local (the BIND strategy): substituting the
+// caller's variable for a written parameter would route the assignment
+// back into the caller, breaking call-by-value (e.g. `f(x){ x = x+100; }`
+// called as `f(n)` would change the caller's `n`). Reading `pname` —
+// including using it as the base of a `*(pname + i) = v` store — is not
+// a write, so the common read-only parameter keeps the fast path.
+//
+// The traversal mirrors ast_clone_subst (bpp_dispatch.bsm) field for
+// field so the two stay in agreement about the shape of every node.
+static _inline_writes_param(nd, pname) {
+    auto n: Node, t, arr, cnt, i, lhs: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    t = n.ntype;
+
+    if (t == T_ASSIGN) {
+        // A direct write `pname = ...`.
+        lhs = n.a;
+        if (lhs != 0 && lhs.ntype == T_VAR && packed_eq(lhs.a, pname)) { return 1; }
+        if (_inline_writes_param(n.a, pname)) { return 1; }
+        return _inline_writes_param(n.b, pname);
+    }
+    if (t == T_ADDR) {
+        // `&pname` — the address escapes; conservatively a write.
+        lhs = n.a;
+        if (lhs != 0 && lhs.ntype == T_VAR && packed_eq(lhs.a, pname)) { return 1; }
+        return _inline_writes_param(n.a, pname);
+    }
+    if (t == T_BINOP) {
+        if (_inline_writes_param(n.b, pname)) { return 1; }
+        return _inline_writes_param(n.c, pname);
+    }
+    if (t == T_UNARY) { return _inline_writes_param(n.b, pname); }
+    if (t == T_MEMLD) { return _inline_writes_param(n.a, pname); }
+    if (t == T_RET)   { return _inline_writes_param(n.a, pname); }
+    if (t == T_MEMST) {
+        // Store THROUGH an address — the base var is read, not written.
+        // Recurse so a nested assignment inside either side is still seen.
+        if (_inline_writes_param(n.a, pname)) { return 1; }
+        return _inline_writes_param(n.b, pname);
+    }
+    if (t == T_TERNARY) {
+        if (_inline_writes_param(n.a, pname)) { return 1; }
+        if (_inline_writes_param(n.b, pname)) { return 1; }
+        return _inline_writes_param(n.c, pname);
+    }
+    if (t == T_CALL) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_writes_param(arr[i], pname)) { return 1; }
+        }
+        return 0;
+    }
+    if (t == T_IF) {
+        if (_inline_writes_param(n.a, pname)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_writes_param(arr[i], pname)) { return 1; }
+        }
+        if (n.e > 0) {
+            arr = n.d; cnt = n.e;
+            for (i = 0; i < cnt; i++) {
+                if (_inline_writes_param(arr[i], pname)) { return 1; }
+            }
+        }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        if (_inline_writes_param(n.a, pname)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_writes_param(arr[i], pname)) { return 1; }
+        }
+        if (n.e != 0) { return _inline_writes_param(n.e, pname); }
+        return 0;
+    }
+    if (t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) {
+            if (_inline_writes_param(arr[i], pname)) { return 1; }
+        }
+        return 0;
+    }
+    // T_LIT, T_VAR, T_DECL, T_NOP, T_BREAK, T_CONTINUE: no write to pname.
+    return 0;
+}
+
+// Scan a whole callee body for any write to the parameter `pname`.
+static _inline_param_is_written(body_arr, bcnt, pname) {
+    auto i;
+    for (i = 0; i < bcnt; i++) {
+        if (_inline_writes_param(body_arr[i], pname)) { return 1; }
+    }
+    return 0;
+}
+
 // Multi-statement / void inline splice, shared by both chips (was
 // _a64_emit_inline_multi / _x64_emit_inline_multi). Binds non-trivial args into
 // per-callsite mangled slots, alpha-renames params + locals, emits the body via
@@ -2694,10 +2796,14 @@ cg_emit_inline_multi(call_node, fidx) {
         i++;
     }
     // 1. Per-param strategy:
-    //    - Arg is T_VAR or T_LIT (cheap, idempotent): SUBSTITUTE.
-    //      Multiple refs to the param re-emit the load/lit each
-    //      time — same cost as a single ref with no binding
-    //      overhead.
+    //    - Arg is T_VAR or T_LIT (cheap, idempotent) AND the param is
+    //      only READ in the body: SUBSTITUTE. Multiple refs re-emit the
+    //      load/lit each time — same cost as a single ref with no
+    //      binding overhead.
+    //    - Param is WRITTEN in the body (`x = ...`, `&x`): BIND, even for
+    //      a T_VAR/T_LIT arg. Substituting the caller's variable for a
+    //      written param would route the assignment back into the caller
+    //      and break call-by-value — see `_inline_writes_param`.
     //    - Arg is anything else (T_CALL, T_BINOP, etc.): BIND.
     //      Emit `_inl<N>_<param> = <arg_expr>` once via
     //      `cg_emit_stmt`, then the rename map uses the mangled
@@ -2723,7 +2829,8 @@ cg_emit_inline_multi(call_node, fidx) {
     while (i < inl_pcnt) {
         arg_node = *(args_arr + i * 8);
         arg_t = arg_node.ntype;
-        if (arg_t == T_VAR || arg_t == T_LIT) {
+        if ((arg_t == T_VAR || arg_t == T_LIT) &&
+            _inline_param_is_written(inl_body, inl_bcnt, *(inl_params + i * 8)) == 0) {
             *(bind_needed + i * 8) = 0;
         } else {
             *(bind_needed + i * 8) = 1;
