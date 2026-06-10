@@ -3737,3 +3737,59 @@ to confuse it with.
 - Parser: `bpp_parser.bsm` — the grouped declarator is parsed in the
   `auto` branch of `parse_statement`; `_struct_hint` carries the
   resolved struct id so a struct group re-applies one type to N names.
+
+## Rule 44: Diagnose codegen by disassembly — and `.bug` is opt-in (`--bug`)
+
+When a program miscompiles — wrong value, corrupted variable, a print
+that emits garbage — **read the machine code before theorising**. The
+`bug` debugger disassembles one function statically (no ptrace, works
+cross-target):
+
+```
+bpp --bug prog.bpp -o prog        # the --bug flag is REQUIRED to emit the map
+bug --disasm ./prog fn            # decoded instructions for `fn`
+bug --bytes  ./prog fn            # raw machine code, 16/line
+```
+
+The trap that cost a debugging session: **`.bug` emission is opt-in.** A
+plain `bpp prog.bpp -o prog` writes *only* the binary; the `--disasm` /
+`--bytes` / `--dump` / `--tui` modes all need the `.bug` map, which the
+compiler writes **only when you pass `--bug`**. Skip the flag and
+`bug --disasm` reports:
+
+```
+bug: cannot load ./prog.bug
+```
+
+That line is the missing flag — **not** a broken debugger and **not** a
+broken binary. Rebuild with `--bug` and re-run. (`bpp --bug=<path>` puts
+the map off to the side, e.g. under `/tmp`, instead of next to the binary.)
+
+### Why this is a rule, not a footnote
+
+This repo's whole codegen-debugging ethos is "read the disassembly, don't
+guess" — it is how the spine bugs, the float-through-memory bug, and the
+arr_len/arr_get operand-order bugs were all caught. Forgetting `--bug` and
+then *abandoning* the disassembly for a guess inverts that ethos. The
+behavioural probe (vary the input, watch which case breaks) is a fine
+*complement* — it pinned the inliner's written-parameter bug fast — but it
+is not a substitute for confirming the mechanism in the emitted code.
+
+### The checklist
+
+1. Reproduce with the smallest program that miscompiles.
+2. Compile it **with `--bug`**.
+3. `bug --disasm ./prog <fn>` on the suspect function; read the registers
+   and offsets against the source lines the map prints.
+4. Only after the disassembly agrees with your hypothesis, change codegen.
+5. Re-verify: bootstrap byte-stable (gen1 == gen2) + suite green.
+
+### Cross-references
+
+- `docs/manual/debug_with_bug.md` — the `--bug` prerequisite is called out
+  at the top of the command list and again under "Building a target with
+  debug info"; the C emitter (`--c`) is the one path that cannot emit a
+  `.bug` (offsets are decided by gcc/clang downstream).
+- `feedback_port_dont_guess_read_source` (memory) — the sibling discipline:
+  when porting a known engine, read its source; when debugging codegen,
+  read the disassembly. Both are "don't guess what you can observe".

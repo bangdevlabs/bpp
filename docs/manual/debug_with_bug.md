@@ -41,6 +41,15 @@ the_bug                             # GUI: file picker, browse a .bug
 the_bug hello.bug                   # GUI: open with .bug pre-loaded
 ```
 
+> **Prerequisite — the `.bug` map is opt-in.** Every mode above reads a
+> `.bug` map, and the compiler writes one **only when you pass `--bug`**
+> (`bpp --bug prog.bpp -o prog`). If `bug --disasm ./prog fn` prints
+> `cannot load ./prog.bug`, that is the missing flag — *not* a broken
+> debugger, *not* a broken binary. Rebuild with `--bug` and re-run.
+> Diagnosing a codegen / miscompile bug? Compile with `--bug` and read the
+> disassembly **first**, before guessing from behaviour. (See "Building a
+> target with debug info" below.)
+
 | Tool / mode    | Invocation                  | What you get |
 |----------------|-----------------------------|--------------|
 | `bug` dump     | `bug --dump file.bug`       | Static text dump of the `.bug` map (~2 k lines for the compiler) |
