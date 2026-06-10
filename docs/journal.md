@@ -13065,3 +13065,79 @@ historical `rts1` credits alone. `67e4304` / `bb730a1`.
 ---
 
  Improved stbpath — without breaking anythingAdded path_find_near(pf, sx,sy, gx,gy, gw,gh, range, out, max): paths up to Manhattan range from the goal-rectangle (footprint), and the goal can be blocked (building/mine) — stops at the 1st adjacent walkable cell. With gw=gh=1, range=0 ≡ path_find.path_find and _path_relax (the tuned hot loop) remain 100% intact — added separate _path_rect_dist + _path_relax_rect. rts1/fps: byte-for-byte identical behavior, zero performance regression.Verification:tests/test_path.bpp — added 4 cases (range0≡path_find, range1 for adjacent, reachable blocked goal, 2×2 rect): all PASS.Full native suite: 183 passed, 0 failed, 12 skipped — exactly the handoff baseline. Nothing broke.Now the faithful movement port becomes cleaner than I had planned: rts2 can request "path up to adjacent to the mine (4×4 footprint, range 1)" directly — removing the "choose-perimeter-tile" + "re-path-when-wrong-tile-picked" (which was half of the thrashing). Stratagus' NewPath literally becomes path_find_near(... range 1).Path gets a wait state (the Fast countdown)._step_unit = NextPathElement/DoActionMove: follows cached path → blocked? waits N cycles → dynamic re-path 1x (via path_find_near for resource/building case) → still blocked? UNREACHABLE → shove.Rip out competing re-paths (gather-on-arrival, re-path-on-stuck, self-heal wedge, Pass-2 unit-blind) + review head-on/give-way.Gather/build/repair now use path_find_near(footprint, range 1) instead of find_walkable_perimeter.Clean up accumulated debug code (heartbeat parked/mineAct, [mv], [place])._step_unit = NextPathElement: follows cached path → blocked by unit? waits 10 cycles → re-paths 1x → still blocked? shove (_try_unblock). A paused loop, replacing the 4 competing re-paths (swap, re-path-on-stuck, self-heal, perimeter).Goal stored in Path (rect+range) → the unit re-paths on its own.Gather/build/repair/depot all use path_find_near(footprint, range 1) — paths directly to adjacent to the target, without choosing a perimeter tile and without re-path-when-wrong-tile-picked (the other half of the thrashing).stbpath only gained the additive path_find_near; path_find/_path_relax left intact (183/0/12 suite, rts1/fps unchanged).
+
+## 2026-06-10 — A book to learn B++ by, and two codegen bugs it found
+
+### What was built
+
+Two strands today, and the second fell out of the first.
+
+**A study, then a book.** Started by mapping B++'s own shape: a written analysis
+of the codegen *spine* against Simon Peyton Jones' C-- / Cmm (it fills the same
+"narrow waist between one front-end and many machine backends" role, but is a
+higher-level tree-walking IR and skips C--'s reason for being — a portable
+runtime for a garbage-collected functional language, which an imperative B++
+does not need), plus a terminology note on B++'s typing: statically typed in the
+weak, optional sense — types are compile-time-only and drive codegen, but the
+default is an untyped machine word and the smart inference is orthogonal to
+soundness. Lives in `docs/manual/spine_analysis.md`.
+
+That led to **The B++ Programming Language** — a learner's book transposing
+Kernighan & Ritchie chapter by chapter into B++ (an original work in the K&R
+tradition, not a copy). The hook writes itself: B (Thompson, 1969) was typeless;
+C added types; B++ keeps B's machine-word default and layers optional smart
+hints on top — so the book teaches a language that sits historically between B
+and C. `docs/plans/bpp_book_plan.md` holds the Phase-0 chapter-by-chapter
+mapping; `books/The_B++_Programming_Language/` holds Chapter 1: ten sections
+(hello → variables → for → const → char I/O → arrays → functions → call by value
+→ char arrays → scope), 13 runnable examples, 7 self-checking exercises, and a
+conformance gate (`tests/run_book.sh`) that compiles **and runs** every listing
+— an assert trip fails it. 20/20 green.
+
+**Two codegen bugs, surfaced by writing the examples** — exactly the "book as
+design driver" payoff the plan predicted.
+
+1. **Inliner corrupted the caller when a function wrote its parameter.**
+   `f(x){ x = x+100; }` called as `f(n)` left the caller's `n` changed; `f(n+0)`
+   leaked too (it folds to `n` before inlining), while `f(n*2)` was always safe
+   (a `T_BINOP` arg already takes the BIND path) — the tell that pinned it. The
+   inliner's SIMPLE strategy substitutes every reference to a parameter with the
+   caller's argument node, which is correct for a *read* parameter but rewrites
+   a *write* (`x = x+100`) into the caller's variable. Fix: a new
+   `_inline_writes_param` scanner (mirroring `ast_clone_subst`'s traversal)
+   forces the BIND strategy — the parameter gets its own per-callsite local —
+   for any parameter assigned in the body, keeping the fast SIMPLE path for
+   read-only parameters. `src/bpp_codegen.bsm`.
+
+2. **`put("literal")` mis-printed inside a `switch` arm** — it printed the
+   string pointer as an integer. The type-inference pass (`bpp_types.bsm`) had
+   three statement walkers (`add_type`, `propagate_in_node`, `uses_int_ops_node`)
+   that descended into `T_IF`/`T_WHILE`/`T_BLOCK` but not `T_SWITCH`, so a `put`
+   inside an arm was never typed and lost its smart-dispatch rewrite. Same class
+   as the historical "ast_clone_subst missed T_IF/T_WHILE/T_BLOCK". Fix: a
+   `T_SWITCH` case in all three walkers, traversing the subject, each arm's
+   case-label values (`n.b`) and body statements (`n.src_tok`), and the else
+   body. `put` now works inside switch arms; float-param propagation and int-op
+   detection reach arm bodies too. `src/bpp_types.bsm`.
+
+Both fixes bootstrap byte-stable (gen1 == gen2) and leave the native suite at
+**183 passed, 0 failed, 12 skipped** — the handoff baseline — with zero
+compiler warnings.
+
+### Lessons
+
+- **A textbook is a conformance suite.** Writing the smallest honest examples of
+  a language exercises corners the real programs never hit — a parameter written
+  in a leaf function, a `put` inside a `switch` — and two latent codegen bugs
+  fell out of Chapter 1 before a single exercise was assigned. Every listing is
+  a `.bpp` the gate compiles and runs, so the book regresses itself.
+- **Don't forget `--bug`.** `.bug`/disasm emission is opt-in via the compiler's
+  `--bug` flag; skipping it is why the first `bug --disasm` found no map — a
+  usage slip, not a tool fault (the debugger works fine when compiled with
+  `--bug`). A behavioural probe pinned the inliner bug anyway: `f(n*2)` (BIND,
+  safe) vs `f(n)` (SIMPLE, corrupt) isolated the SIMPLE-substitution-of-a-
+  written-parameter as the cause in one shot.
+- **"Missing a control-flow node in a walker" is a recurring shape here.** The
+  `switch`-arm bug is the same family as the outlining-era `ast_clone_subst`
+  gap. When a pass walks `T_IF`/`T_WHILE`/`T_BLOCK`, check it also walks
+  `T_SWITCH` (bodies in `src_tok`, values in `n.b`).
