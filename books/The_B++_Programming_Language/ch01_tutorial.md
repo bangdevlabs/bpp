@@ -15,6 +15,27 @@ bpp examples/ch01/01_hello.bpp -o /tmp/p
 /tmp/p
 ```
 
+> **Sidebar — what each piece of that command means.** Worth one paragraph
+> because every later example follows the same shape:
+>
+> - **`bpp`** is the B++ compiler — the program that turns `.bpp` source
+>   into a native binary. It comes built in this book's repository.
+> - **`examples/ch01/01_hello.bpp`** is the source file, relative to the
+>   directory you are running the command from (the book's root).
+> - **`-o /tmp/p`** tells the compiler where to write the binary. `-o` is
+>   the "output file" flag; `/tmp/p` is the path. `/tmp` is the Unix
+>   convention for scratch files that need not survive a reboot, and `p`
+>   is just a short name — pick whatever you like (`/tmp/hello`,
+>   `./build/hello`, anything writable).
+> - **`/tmp/p`** on the second line is *running* the binary we just
+>   built. Native binaries on macOS and Linux are executed by typing
+>   their path; B++ adds no wrapper command.
+>
+> If you compile a different program, change the source path and pick a
+> different output name so you do not overwrite the last binary you cared
+> about. The book uses `/tmp/p` everywhere out of habit; nothing depends
+> on the name.
+
 ---
 
 ## 1.1 Getting started
@@ -55,9 +76,7 @@ main() {
     last = 8;
 
     while (n <= last) {
-        putnum(n);          putchar('\t');
-        putnum(n * n);      putchar('\t');
-        putnum(n * n * n);  putchar('\n');
+        put(n, "\t", n * n, "\t", n * n * n, "\n");
         n = n + 1;
     }
 }
@@ -68,21 +87,22 @@ main() {
 how a type *hint* turns a word into a float, a byte, and so on.)
 
 The `while` loop runs its body as long as the condition `n <= last` is true.
-Each pass prints a row and then advances `n`. `putchar` writes a single
-character — here a tab (`'\t'`) between columns and a newline at the end.
+Each pass prints a row and then advances `n`. **`put` takes any number of
+arguments** and prints each in order, picking the right printer for its type:
+the numbers print as digits, the `"\t"` and `"\n"` strings as text. There is no
+format string and no placeholders — the values sit between the literal pieces,
+exactly where you want them.
 
-Notice we print numbers with `putnum`, not `put`. That is deliberate:
-
-> **C → B++.** `put` is *smart*: it picks a printer from the **type** of its
-> argument, at compile time, and when the type is known it just works and stays
-> quiet — a string literal (or a `: ptr` value) prints as text, a `: float`
-> prints with a fraction. The one ambiguous case is a plain `auto` variable: it
-> is only a machine word, which could be an integer *or* a pointer to text, so
-> `put(n)` on such a value prints it as a number **and** raises a warning (W032)
-> asking you to confirm. The dispatch is not failing there — it is the
-> optional-typing trade-off in action (Chapter 2 returns to it). To stay both
-> clear and quiet, we name the printer directly throughout this book: `putnum`
-> for a number, `putstr` for a string, `putchar` for one character.
+> **C → B++.** `put` is *smart*: it picks a printer from the **type** of each
+> argument, at compile time — a number prints as digits, a string as text, a
+> `: float` with a fraction. Inside a multi-argument `put(...)` every value is
+> unambiguously meant to print, so it just works and stays quiet. The one place
+> `put` asks you to confirm is a **lone** word: `put(n)` by itself could mean
+> "the number n" *or* "the text at the address n", so it prints the number
+> **and** raises a warning (W032). That is the optional-typing trade-off, not a
+> failure (Chapter 2 returns to it). In practice you almost always have context —
+> `put("count: ", n, "\n")` — so the warning rarely appears; when you really do
+> want a bare number, `putnum(n)` says so explicitly.
 
 ---
 
@@ -97,17 +117,16 @@ main() {
     auto n;
 
     for (n = 1; n <= 8; n = n + 1) {
-        putnum(n);          putchar('\t');
-        putnum(n * n);      putchar('\t');
-        putnum(n * n * n);  putchar('\n');
+        put(n, "\t", n * n, "\t", n * n * n, "\t", n * n * n * n, "\n");
     }
 }
 ```
 
-The three clauses are *initialise*, *test*, and *advance*. The output is
-identical to the `while` version. Use whichever reads better: a `for` when the
-loop is plainly counted, a `while` when the continuation is a more general
-condition.
+The three clauses are *initialise*, *test*, and *advance*. This version also
+adds a fourth column — `n` to the fourth power — and adding it cost nothing but
+one more value and one more `"\t"` in the `put`: the call scales to as many
+columns as you like. Use a `for` when the loop is plainly counted, a `while`
+when the continuation is a more general condition.
 
 ---
 
@@ -125,9 +144,7 @@ const STEP  = 1;    // distance between rows
 main() {
     auto n;
     for (n = LOWER; n <= UPPER; n = n + STEP) {
-        putnum(n);          putchar('\t');
-        putnum(n * n);      putchar('\t');
-        putnum(n * n * n);  putchar('\n');
+        put(n, "\t", n * n, "\t", n * n * n, "\n");
     }
 }
 ```
@@ -157,13 +174,74 @@ main() {
 }
 ```
 
-Read a byte; if it is not the end-of-input marker, write it and read again. Run
-it and type; what you type is echoed back. Feed it a file instead:
+Read a byte; if it is not the end-of-input marker, write it and read again.
+Compile once, then experiment with three different ways to feed input into the
+running program — they look almost identical at the command line but produce
+drastically different behaviour:
 
 ```sh
 bpp examples/ch01/05_echo.bpp -o /tmp/echo
-/tmp/echo < examples/ch01/05_echo.bpp     # the program echoes its own source
 ```
+
+**Mode 1 — stdin is the keyboard.** The program reads what you type. Each line
+appears twice: once as you type it, once as the program echoes it back. Press
+**Ctrl+D** on an empty line to send end-of-input.
+
+```sh
+/tmp/echo
+hello                # you typed this
+hello                # the program echoed it
+^D                   # Ctrl+D — end of input, program exits
+```
+
+**Mode 2 — stdin is a file.** The shell connects the file to the program's
+input *before* the program starts running. The program reads all the bytes
+and exits cleanly when the file ends. This is the common case.
+
+```sh
+/tmp/echo < examples/ch01/05_echo.bpp    # the program echoes its own source
+```
+
+**Mode 3 — the file is an *argument*, not stdin.** The program receives the
+filename in its `argv`, but `05_echo.bpp` does not look at `argv` at all. Its
+`getchar` still reads from the keyboard, so the program *blocks* waiting for
+you to type, exactly as in Mode 1:
+
+```sh
+/tmp/echo examples/ch01/05_echo.bpp
+                     # nothing happens — the program is waiting for the keyboard.
+^D                   # send EOF manually to escape.
+```
+
+> **Sidebar — the `<` operator is the shell, not B++.** The `<` between the
+> program and the filename is a feature of your shell (`zsh`, `bash`,
+> `sh`) — defined by the POSIX standard. The shell opens the file and
+> connects it to the program's standard input *before* invoking the
+> program. From inside B++, nothing changes: `getchar` still calls
+> `sys_read(0, ...)` — it reads from *file descriptor 0*, and the kernel
+> decides what 0 points to (terminal, file, pipe, socket). The program
+> never sees the `<`.
+>
+> Three sibling shell operators appear in the rest of this chapter:
+> `>` redirects output to a file (`/tmp/prog > out.txt`), `|` connects
+> one program's output to the next program's input (`cat file | wc`),
+> and `<<` lets you write the input inline (a "here-document"). All
+> four are shell, not B++.
+
+> **Keyboard shortcuts at the prompt.** Three control-key combinations
+> confuse most newcomers; learn them once:
+>
+> - **Ctrl+D** — send end-of-input. The program's `getchar` returns `-1`
+>   and the loop exits. This is *not* a way to kill the program; it is a
+>   polite "I am done sending input."
+> - **Ctrl+C** — send `SIGINT`. The OS interrupts the program and it
+>   exits immediately, without finishing whatever it was doing. Use this
+>   to escape a runaway loop.
+> - **Ctrl+Z** — send `SIGTSTP`. The OS *suspends* the program (puts it
+>   in the background); the shell prints `suspended`. Use `fg` to bring
+>   it back, or `kill %1` to kill the suspended job. (On Windows
+>   command shells, "end-of-input" is **Ctrl+Z then Enter** — confusing,
+>   but unrelated to Unix's `SIGTSTP`.)
 
 > **C → B++.** C marks end of input with the named constant `EOF`. B++ uses the
 > plain value **−1** returned by `getchar`. Write the loop against `-1`
@@ -178,9 +256,34 @@ characters** (`06_count_chars.bpp`) keeps a tally instead of echoing:
         count = count + 1;
         c = getchar();
     }
-    putnum(count);
-    putchar('\n');
+    put(count, "\n");
 ```
+
+> **Sidebar — output-per-byte vs output-at-the-end.** `05_echo` printed
+> each byte the instant it arrived; you saw it react while you typed.
+> `06_count_chars` is different: it accumulates silently and prints the
+> total *only after* end-of-input. Running it from the keyboard with no
+> redirect, you will see **nothing at all** until you press **Ctrl+D**
+> to close stdin — at which point the total appears in one shot.
+> Pressing Ctrl+Z instead does not work; that suspends the process
+> without sending EOF, and you can stay there forever waiting for a
+> total that will never come. Two programs sharing the same read-loop
+> skeleton can have wildly different output shapes; **the shape decides
+> what "running it" looks like at the prompt.**
+
+> **Sidebar — stdin is a live stream, not a snapshot.** If you feed
+> the program a file with `<` and then edit that file between runs,
+> the count changes — the program reads whatever bytes the disk
+> serves *at the moment of reading*, not whatever was on disk when
+> the binary was compiled. Type `//` in front of a line to comment
+> it out and the file grows by exactly two bytes; the next run of
+> `06_count_chars` will report two more characters than the last.
+> This is what stdin *is*: a byte stream from whatever source the
+> kernel has connected to fd 0, read lazily one byte at a time.
+> Compiled programs can read their own source, watch logs grow, or
+> process input that did not exist when they were built — the
+> binary does not "know about" the input until it asks for the
+> next byte.
 
 **Counting lines** (`07_count_lines.bpp`) counts the newline characters, since
 each line ends with one:
@@ -267,9 +370,7 @@ power(base, n) {
 main() {
     auto i;
     for (i = 0; i < 10; i = i + 1) {
-        putnum(i);           putchar('\t');
-        putnum(power(2, i)); putchar('\t');
-        putnum(power(3, i)); putchar('\n');
+        put(i, "\t", power(2, i), "\t", power(3, i), "\n");
     }
 }
 ```
@@ -304,8 +405,8 @@ main() {
     k = 5;
     total = countdown_sum(k);
 
-    putstr("total = "); putnum(total); putchar('\n');   // 5+4+3+2+1 = 15
-    putstr("k     = "); putnum(k);     putchar('\n');   // still 5
+    put("total = ", total, "\n");   // 5+4+3+2+1 = 15
+    put("k     = ", k, "\n");       // still 5
 }
 ```
 
@@ -373,6 +474,15 @@ the current line aside with `buf_move` whenever it sets a new record:
 at an offset; `buf_move(dst, src, n)` copies a block. A B++ string is just such
 a buffer with a 0 byte marking the end.
 
+> **Running it.** Feed the program a file the same way you fed `05_echo` in
+> §1.5 (Mode 2 — `<` redirects stdin). A handy test is to point it at the
+> book's own chapter text:
+>
+> ```sh
+> bpp examples/ch01/12_longest_line.bpp -o /tmp/longest
+> /tmp/longest < ch01_tutorial.md
+> ```
+
 ---
 
 ## 1.10 External variables and scope
@@ -409,8 +519,11 @@ The "C → B++" boxes collected:
 
 - **No `#include` / `import` for everyday tools** — they come from the prelude
   (§1.1).
-- **Explicit printers** — `putnum` / `putstr` / `putchar` rather than `printf`
-  with format strings; smart `put` warns on a bare number (§1.2).
+- **Variadic `put`** — one call prints any number of arguments, each formatted
+  by type (`put("count: ", n, "\n")`), instead of `printf` with format strings.
+  A *lone* word like `put(n)` warns (number or pointer?), but in a list every
+  value is unambiguously meant to print (§1.2). `putnum`/`putstr`/`putchar`
+  remain for when you want one explicitly.
 - **End of input is −1**, not a named `EOF` (§1.5).
 - **Arguments are call by value** — just like C: a parameter is a private copy,
   and to modify a caller's variable you pass a pointer (Chapter 5) (§1.8).
@@ -420,7 +533,11 @@ The "C → B++" boxes collected:
 ## Exercises
 
 Reference solutions are under `tests/ch01/`; most check themselves with
-`assert`. Run the whole set with `sh tests/run_book.sh`.
+`assert`. Run the whole set with `sh tests/run_book.sh` — `sh` is your
+system's POSIX shell interpreting the script that builds and runs every
+exercise in turn; the script is plain text, open it to see what it does.
+Exercises that read input (like **7. Squeeze blanks**) follow Mode 2 from
+§1.5 — pipe a file in via `<`.
 
 1. **Temperature table.** Print a Celsius-to-Fahrenheit table from 0 to 100 in
    steps of 10, using a conversion function. (`ex01_temperature.bpp`)
