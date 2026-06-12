@@ -1,0 +1,107 @@
+// zoomer.bpp — screen zoomer (a B++ port of Tsoding's boomer), render core.
+//
+// Captures the desktop once, then shows it on a GPU quad you can zoom
+// into: hold the LEFT mouse button to zoom in toward the cursor, RIGHT
+// to zoom out. Close the window to quit.
+//
+// Portable by construction (Rule 41 / additive portability): the per-OS
+// primitives it calls — `_stb_screen_capture` and
+// `_stb_gpu_create_texture_bgra` — resolve to the macOS backend today
+// and to future Linux (X11 capture + Vulkan GPU) backends with no change
+// to this file, exactly the way stbrender calls `_stb_gpu_create_texture`.
+//
+// macOS needs Screen Recording permission (the first run prompts;
+// System Settings -> Privacy & Security -> Screen Recording).
+
+import "stbgame.bsm";
+import "stbrender.bsm";
+import "stbshader.bsm";
+import "stbpanzoom.bsm";
+
+main() {
+    auto w, h, buf, tex, sampler, pipe, ubuf, mx, my, pz, prev_mx, prev_my;
+    auto (cux, cuy, dsx, dsy): float;
+
+    // Capture the desktop BEFORE opening our window so the zoomer
+    // window is not part of the captured image.
+    w = 0;
+    h = 0;
+    buf = _stb_screen_capture(&w, &h);
+    if (buf == 0) {
+        putstr("zoomer: screen capture failed (grant Screen Recording permission)\n");
+        return 1;
+    }
+    putstr("zoomer: captured "); putnum(w); putstr(" x "); putnum(h);
+    putstr(" (BGRA)\n");
+
+    // Borderless full-screen overlay sized to the display; the render
+    // canvas is the capture's pixel resolution so the zoom stays crisp.
+    _stb_set_fullscreen(1);
+    game_init(w, h, "zoomer", 60);
+    render_init();
+
+    // BGRA8 texture — matches the capture's byte order, no swizzle.
+    tex     = _stb_gpu_create_texture_bgra(buf, w, h);
+    sampler = gpu_sampler_linear();
+    pipe    = gpu_pipeline_load("tools/zoomer/zoomer.metal", "zoom_vert", "zoom_frag");
+    if (pipe == 0) {
+        putstr("zoomer: failed to load the shader pipeline\n");
+        return 1;
+    }
+
+    ubuf = buf_byte(16);
+    pz = panzoom_new();          // the navigation engine (stbpanzoom)
+    prev_mx = mouse_x();
+    prev_my = mouse_y();
+
+    while (game_should_quit() == 0) {
+        game_frame_begin();
+
+        // ESC quits — a borderless full-screen window has no close box.
+        if (key_pressed(KEY_ESC)) { break; }
+
+        mx = mouse_x();
+        my = mouse_y();
+
+        // Cursor as screen UV [0,1] — the zoom focus.
+        cux = (mx * 1.0) / (w * 1.0);
+        cuy = (my * 1.0) / (h * 1.0);
+
+        // Zoom: hold '=' to zoom in toward the cursor, '-' to zoom out.
+        // Momentum makes a few taps glide. (Scroll-wheel input is a
+        // future platform add that would feed the same impulse.)
+        if (key_down(KEY_EQUAL)) { panzoom_zoom_at(pz, 0.06, cux, cuy); }
+        if (key_down(KEY_MINUS)) { panzoom_zoom_at(pz, 0.0 - 0.06, cux, cuy); }
+
+        // Pan: drag with the left mouse button.
+        if (mouse_down(MOUSE_LEFT)) {
+            dsx = ((mx - prev_mx) * 1.0) / (w * 1.0);
+            dsy = ((my - prev_my) * 1.0) / (h * 1.0);
+            panzoom_pan(pz, dsx, dsy);
+        }
+
+        // '0' snaps back to the un-zoomed view.
+        if (key_pressed(KEY_0)) { panzoom_reset(pz); }
+
+        prev_mx = mx;
+        prev_my = my;
+
+        panzoom_update(pz);
+        panzoom_uniform(pz, ubuf);   // fills the ZoomU shader uniform
+
+        render_begin();
+        render_clear(BLACK);
+
+        gpu_pipeline_use(pipe);
+        gpu_bind_texture_frag(0, tex);
+        gpu_bind_sampler_frag(0, sampler);
+        gpu_uniform_set_frag(0, ubuf, 16);
+        gpu_draw_full();
+        gpu_pipeline_use_default();
+
+        render_end();
+    }
+
+    panzoom_free(pz);
+    return 0;
+}
