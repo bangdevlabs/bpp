@@ -2215,23 +2215,30 @@ editor. Discuss before forking; restraint-bias per Rule 28.
   `project_<game>_bang9_editable_meta.md` so future sessions
   inherit the format choice without re-deciding.
 
-## Rule 32: `: u_word` family — unsigned semantics for `/`, `%`, `>>`
+## Rule 32: `: u_word` family — unsigned `/`, `%`, `>>`, and ordering comparisons
 
 The `: u_word` / `: u_half` / `: u_quarter` / `: u_byte`
 storage-class annotations declare the variable as **unsigned**.
 The bit pattern stored in memory is unchanged — these annotations
-only affect the codegen for three operators where signed and
-unsigned semantics diverge:
+only affect the codegen for the operators where signed and unsigned
+semantics actually diverge:
 
-| Operator | Signed (default) | With `: u_*` LHS                |
-|----------|------------------|---------------------------------|
-| `/`      | SDIV / IDIV      | UDIV / DIV (zero-extend RDX)    |
-| `%`      | signed remainder | unsigned remainder              |
-| `>>`     | ASR / SAR (sign) | LSR / SHR (zero-fill)           |
+| Operator            | Signed (default)  | With `: u_*` LHS                          |
+|---------------------|-------------------|-------------------------------------------|
+| `/`                 | SDIV / IDIV       | UDIV / DIV (zero-extend RDX)              |
+| `%`                 | signed remainder  | unsigned remainder                        |
+| `>>`                | ASR / SAR (sign)  | LSR / SHR (zero-fill)                      |
+| `<` `<=` `>` `>=`   | LT/LE/GT/GE cond  | LO/LS/HI/HS cond (a64); below/above (x86) |
 
-Every other operator (`+`, `-`, `*`, `&`, `|`, `^`, `<<`, `==`,
-`!=`, `<`, `>`, `<=`, `>=`) is **bit-identical** in two's-complement
+Every other operator (`+`, `-`, `*`, `&`, `|`, `^`, `<<`, and the
+equality tests `==` / `!=`) is **bit-identical** in two's-complement
 and stays on the existing signed path — no annotation needed.
+
+Ordering comparisons used to be (incorrectly) listed as bit-identical;
+they are not. The value `0x8000000000000000` is "< 10" signed (it is
+INT64_MIN) but "> 10" unsigned — same bits, opposite answer. Equality
+(`==` / `!=`) genuinely does not care about signedness. (Comparison
+gap closed 2026-06-12; see `tests/test_unsigned_cmp.bpp`.)
 
 ### Dispatch is LHS-only
 

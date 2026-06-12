@@ -579,11 +579,15 @@ auto idx: u_half;      // 32-bit unsigned int
 ```
 
 The bit pattern in memory is identical to the signed counterpart.
-The annotation only steers codegen for three operators where signed
-and unsigned diverge: `/` (UDIV vs SDIV), `%` (unsigned vs signed
-remainder), and `>>` (LSR/zero-fill vs ASR/sign-extend). Every
-other operator (`+`, `-`, `*`, `&`, `|`, `^`, `<<`, `==`, etc.) is
-bit-identical in two's-complement and stays on the signed path.
+The annotation steers codegen for the operators where signed and
+unsigned actually diverge: `/` (UDIV vs SDIV), `%` (unsigned vs signed
+remainder), `>>` (LSR/zero-fill vs ASR/sign-extend), and the four
+ordering comparisons `<` `<=` `>` `>=` (unsigned set/branch — a64
+`cc`/`ls`/`hi`/`cs`, x86 below/above). Every other operator (`+`, `-`,
+`*`, `&`, `|`, `^`, `<<`, and the equality tests `==` / `!=`) is
+bit-identical in two's-complement and stays on the signed path. The
+discriminating case is any value past 2^63: `0x8000000000000000` is
+"< 10" signed (it is INT64_MIN) but "> 10" unsigned.
 
 The dispatch is **LHS-only**: `z = x / y` looks at `x`'s type, not
 `y`'s. This mirrors the float-promotion convention. Mixed-sign
