@@ -438,6 +438,12 @@ cg_prim_alloc() {
 // Each chip's primitive maps these to its native cond encoding
 // (a64 nzcv codes 0-15 vs x86_64 CC_E/NE/L/LE/G/GE etc.).
 extrn CG_CC_EQ, CG_CC_NE, CG_CC_LT, CG_CC_LE, CG_CC_GT, CG_CC_GE;
+// Unsigned ordering condition codes. Equality (EQ/NE) is signedness-
+// agnostic, but the four ordering comparisons diverge between signed
+// and unsigned exactly like / % >> — so `: u_word` routes them here and
+// each chip maps them to its native unsigned set/branch condition
+// (a64 cc/ls/hi/cs; x86 below / below-or-equal / above / above-or-equal).
+extrn CG_CC_LO, CG_CC_LS, CG_CC_HI, CG_CC_HS;
 void cg_init_cc() {
     CG_CC_EQ = 0;
     CG_CC_NE = 1;
@@ -445,6 +451,10 @@ void cg_init_cc() {
     CG_CC_LE = 3;
     CG_CC_GT = 4;
     CG_CC_GE = 5;
+    CG_CC_LO = 6;    // unsigned <   (lower)
+    CG_CC_LS = 7;    // unsigned <=  (lower or same)
+    CG_CC_HI = 8;    // unsigned >   (higher)
+    CG_CC_HS = 9;    // unsigned >=  (higher or same)
 }
 
 // Portable syscall identifiers consumed by emit_syscall. The spine
@@ -3049,10 +3059,13 @@ cg_emit_node(nd) {
             return 1;
         }
         // Smart dispatch: when LHS carries the BASE_UWORD family
-        // (`: u_word` annotation), route /, %, >> through the
-        // unsigned chip primitives (UDIV / UDIV+MSUB / LSR). Other
-        // operators (+, -, *, &, |, ^, <<, cmp) are bit-identical
-        // in two's-complement and stay on the signed path.
+        // (`: u_word` annotation), route /, %, >> AND the four ordering
+        // comparisons (< <= > >=) through the unsigned path; the chip
+        // maps the unsigned condition codes (LO/LS/HI/HS) to its native
+        // set/branch. Only those seven operators diverge between signed
+        // and unsigned two's-complement. The rest (+, -, *, &, |, ^, <<,
+        // and equality == / !=) are bit-identical and stay on the
+        // signed/shared path.
         // LHS-only rule mirrors B++'s float dispatch convention
         // (Unsigned annotations sidequest 2026-05-14). Ported to
         // the spine in Wave 21 Commit 3 — without this branch the
@@ -3065,6 +3078,15 @@ cg_emit_node(nd) {
             if (c0 == '/' && op_l == 1) { call(p.emit_udiv, left_reg_int); return 0; }
             if (c0 == '%' && op_l == 1) { call(p.emit_umod, left_reg_int); return 0; }
             if (c0 == '>' && c1 == '>') { call(p.emit_lshr, left_reg_int); return 0; }
+            // Ordering comparisons diverge by signedness too — route them
+            // to the unsigned condition codes. (>> already returned above,
+            // so the >= / > checks below never see a shift.) Equality
+            // falls through to the shared EQ/NE dispatch — it is the same
+            // for signed and unsigned.
+            if (c0 == '<' && c1 == '=') { call(p.emit_cmp_int, CG_CC_LS, left_reg_int); return 0; }
+            if (c0 == '>' && c1 == '=') { call(p.emit_cmp_int, CG_CC_HS, left_reg_int); return 0; }
+            if (c0 == '<' && op_l == 1) { call(p.emit_cmp_int, CG_CC_LO, left_reg_int); return 0; }
+            if (c0 == '>' && op_l == 1) { call(p.emit_cmp_int, CG_CC_HI, left_reg_int); return 0; }
         }
         if (c0 == '+' && op_l == 1) { call(p.emit_add, left_reg_int); return 0; }
         if (c0 == '-' && op_l == 1) { call(p.emit_sub, left_reg_int); return 0; }
