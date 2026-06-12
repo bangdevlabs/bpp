@@ -101,7 +101,7 @@ main() {
 }
 ```
 
-B++ has no `printf` format strings. You compose output with `put` calls — the compiler routes each call to `putstr`, `putnum`, or `putfloat` based on the argument type. For newlines, use `putchar('\n')` or `putmsg(s)` (which appends `\n` automatically). Build multi-part strings with `strbuf_*` (Cap 6).
+B++ has no `printf` format strings. You compose output with `put`, which takes **any number of arguments** and prints each in order, routing each through smart-dispatch by type: `put("count: ", n, "\n")` prints the label, the number, then the newline. No placeholders, no separator, no auto-newline — include `"\n"` where you want one. A single argument works the same way (`put(s)` / `put(n)`), and `put_err` is the stderr mirror. (A word argument in a one-arg `put(n)` warns W032 — is it a number or a string pointer? — but inside a multi-arg `put(...)` list the value is unambiguously meant to print, so no warning.) Build reusable multi-part strings with `strbuf_*` (Cap 6).
 
 Byte-level output when you need it:
 

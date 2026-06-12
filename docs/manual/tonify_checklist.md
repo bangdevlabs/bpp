@@ -3795,3 +3795,38 @@ is not a substitute for confirming the mechanism in the emitted code.
 - `feedback_port_dont_guess_read_source` (memory) — the sibling discipline:
   when porting a known engine, read its source; when debugging codegen,
   read the disassembly. Both are "don't guess what you can observe".
+
+## Rule 45: Extend an existing name before minting a new one
+
+When a capability can be exposed by **generalising a name the user already
+knows**, do that instead of adding a new name. A second name is a second thing
+to learn, document, and keep consistent; a generalisation is free to the reader.
+
+**The worked example — variadic `put`.** Printing a labelled value used to cost
+three calls (`putstr("count: "); putnum(n); putchar('\n')`). The fix was *not*
+`println` / `printf` / `puts` — it was letting `put` take N arguments
+(`put("count: ", n, "\n")`), each smart-dispatched by type, exactly as it
+already did for one. No new name, no new syntax, no format mini-language — the
+natural generalisation of behaviour the reader already had. (Parser-only
+expansion; see `_expand_put_variadic`.)
+
+The same instinct recurs:
+- **`put`'s smart dispatch itself** — one `put` that picks `putstr`/`putnum`/
+  `putfloat`, rather than making the caller choose at every site.
+- **`screen_capture` in `stbwindow`** — extended the platform-facing cartridge
+  rather than minting a premature `stbcapture` (Rule 33 / Rule 20).
+- **`_stb_set_fullscreen` / `_stb_gpu_create_texture_bgra`** — new per-OS
+  *primitives* under existing agnostic surfaces (Rule 41), not new tool-facing
+  names.
+
+**When a new name IS right:** when the new thing is genuinely a *different*
+concept, not the same one generalised — forcing it under an old name to avoid a
+new one is its own dishonesty. The test: would a user reasonably expect the
+existing name to do this once they see it? `put(a, b)` printing both args — yes.
+A name that quietly changes semantics by argument shape — no. Generalise when
+it's the *same* capability; name anew when it's a *different* one.
+
+**Cross-references:**
+- `docs/plans/sidequest_put_variadic_arc.md` — the arc + reviewer questions.
+- Rule 28 (restraint) — the dual: don't add capability without a killer use
+  case. Rule 45 is the narrower "and when you do add it, prefer extension".
