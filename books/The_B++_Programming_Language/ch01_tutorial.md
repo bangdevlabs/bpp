@@ -132,14 +132,14 @@ when the continuation is a more general condition.
 
 ## 1.4 Symbolic constants
 
-The numbers `1` and `8` in the loop are *magic numbers* — bare values whose
+The numbers `2` and `16` in the loop are *magic numbers* — bare values whose
 meaning lives only in your head. Give them names with `const` at file scope
 (`04_squares_const.bpp`):
 
 ```
-const LOWER = 1;    // first value in the table
-const UPPER = 8;    // last value in the table
-const STEP  = 1;    // distance between rows
+const LOWER = 2;    // first value in the table
+const UPPER = 16;    // last value in the table
+const STEP  = 2;    // distance between rows
 
 main() {
     auto n;
@@ -289,9 +289,20 @@ characters** (`06_count_chars.bpp`) keeps a tally instead of echoing:
 each line ends with one:
 
 ```
+main() {
+    auto c, lines;
+    lines = 0;
+
+    c = getchar();
+    while (c != -1) {
         if (c == '\n') {
             lines = lines + 1;
         }
+        c = getchar();
+    }
+
+    put(lines, " lines \n");
+}
 ```
 
 **Counting words** (`08_count_words.bpp`) is the first program that has to
@@ -326,10 +337,36 @@ To count *each* digit separately we need ten counters. An array holds them in
 one indexed block (`09_char_classes.bpp`):
 
 ```
+ main() {
+    auto c, i, white, other, digits;
+
     digits = buf_word(10);
     for (i = 0; i < 10; i = i + 1) {
         digits[i] = 0;
     }
+    white = 0;
+    other = 0;
+
+    c = getchar();
+    while (c != -1) {
+        if (c >= '0' && c <= '9') {
+            digits[c - '0'] = digits[c - '0'] + 1;
+        } else if (c == ' ' || c == '\n' || c == '\t') {
+            white = white + 1;
+        } else {
+            other = other + 1;
+        }
+        c = getchar();
+    }
+
+    put("digits =");
+    for (i = 0; i < 10; i = i + 1) {
+        put(" ", digits[i]);
+			}
+
+			put("\n", "white  = ", white, "\n", "other  = ", other, "\n");
+   
+}
 ```
 
 `buf_word(10)` reserves ten word-sized slots; `digits[k]` reads or writes slot

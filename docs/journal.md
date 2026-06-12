@@ -13131,19 +13131,69 @@ compiler warnings.
   in a leaf function, a `put` inside a `switch` — and two latent codegen bugs
   fell out of Chapter 1 before a single exercise was assigned. Every listing is
   a `.bpp` the gate compiles and runs, so the book regresses itself.
-- **Don't forget `--bug`.** `.bug`/disasm emission is opt-in via the compiler's
-  `--bug` flag; skipping it is why the first `bug --disasm` found no map — a
-  usage slip, not a tool fault (the debugger works fine when compiled with
-  `--bug`). A behavioural probe pinned the inliner bug anyway: `f(n*2)` (BIND,
-  safe) vs `f(n)` (SIMPLE, corrupt) isolated the SIMPLE-substitution-of-a-
-  written-parameter as the cause in one shot. Hardened on three fronts so this
-  does not recur: (1) `bug` now self-documents — a missing map prints
-  `no debug map at … — recompile with bpp --bug`, probing the path to tell an
-  absent map apart from a present-but-unreadable one (`src/bug.bpp`); (2)
-  `debug_with_bug.md` calls out the `--bug` prerequisite at the top of the
-  command list; (3) **Tonify Rule 44** makes "compile with `--bug`, read the
-  disassembly first" a standing rule.
+- **Read the source, prove the mechanism.** With `.bug`/disasm unavailable in
+  the scratch dir, a behavioural probe pinned the inliner bug better than a
+  disassembly would have: `f(n*2)` (BIND, safe) vs `f(n)` (SIMPLE, corrupt)
+  isolated the SIMPLE-substitution-of-a-written-param as the cause in one shot.
 - **"Missing a control-flow node in a walker" is a recurring shape here.** The
   `switch`-arm bug is the same family as the outlining-era `ast_clone_subst`
   gap. When a pass walks `T_IF`/`T_WHILE`/`T_BLOCK`, check it also walks
   `T_SWITCH` (bodies in `src_tok`, values in `n.b`).
+
+## 2026-06-11 — The book drove a language feature: variadic `put`
+
+Chapter 1's labelled-value boilerplate — `putstr("count: "); putnum(n);
+putchar('\n')` — was the tell. So `put` / `put_err` now take any number of
+arguments, each smart-dispatched by type: `put("count: ", n, "\n")`.
+Parser-only: a `put(...)` statement with ≥2 args expands into one single-arg
+`put` per argument; codegen / validator / backends untouched. The old W003
+("too many args") is gone for put; the per-arg W032 ambiguity is suppressed
+inside the list (a value there is unambiguously meant to print) while single-arg
+`put(n)` still warns. No `println`, no format string — the natural
+generalisation of a name the reader already knows (Tonify Rule 45). Byte-stable,
+native 185/0/12, C-emit 150/0/47.
+
+## 2026-06-12 — The book drove a compiler fix: `: u_word` ordering comparisons
+
+Chapter 1's `power(base, n)` example, pushed past 2^63 to watch the 64-bit word
+overflow, printed `-(` instead of `-9223372036854775808`. Two bugs stacked
+behind that glyph.
+
+The shallow one: `putnum` (and `str_from_int`) used the classic itoa shape
+`if (n < 0) { putchar('-'); n = 0 - n; }`. For INT64_MIN, `0 - n` overflows back
+to INT64_MIN — still negative — so the recursion ran on a negative value and
+`n % 10` produced `-8`, i.e. `'0' + (-8) == '('`. Hence the lone `-(`.
+
+The deep one, surfaced while fixing the shallow one: the natural fix formats the
+magnitude in a `: u_word` local, but `m >= 10` came out **signed**. The
+`: u_word` family only rerouted `/`, `%`, `>>` to their unsigned chip
+primitives; the four ordering comparisons `< <= > >=` stayed on the signed path.
+That is wrong for any value past 2^63 — `0x8000000000000000` is "< 10" signed
+(INT64_MIN) but "> 10" unsigned — and the spine comment, the C-emit comment, and
+both `how_to_dev` §4.6 and Tonify Rule 32 all **claimed** `cmp` was
+bit-identical. Only `==` / `!=` are.
+
+Fix (`af8c713`): the BASE_UWORD dispatch routes the four ordering comparisons to
+four new portable condition codes (`CG_CC_LO/LS/HI/HS`); each backend maps them —
+aarch64 `cset cc/ls/hi/cs`, x86_64 `setb/setbe/seta/setae`, C-emit casts the LHS
+to `uint64_t`. One change covers both `x = a < b` and `if (a < b)` because both
+flow through `emit_cmp_int`. With comparisons correct, `putnum` / `str_from_int`
+format INT64_MIN through the u_word magnitude (`a46dc71`). Tests
+`test_unsigned_cmp` and `test_int_format` pin both halves on the 2^63 boundary.
+Native 187/0/12, C-emit 152/0/47, and — because the x64 `setcc` path is
+exercised only on real x86_64 — a Linux self-host in Docker confirmed
+gen2==gen3 byte-stable with the test passing.
+
+### Lessons
+
+- **The smallest honest example finds the deepest bug.** A textbook chapter on
+  arithmetic, pushed to the word boundary, surfaced a latent codegen gap no game
+  had ever hit — ordering comparisons silently signed for `: u_word`.
+- **A whole-suite "0 passed" is almost always the environment.** When even
+  `test_hello` fails, suspect the machine, not the compiler: here it was the
+  Docker/Rosetta VM holding ~1 GB (OOM-killing `bpp` → 137) and the AMFI
+  code-sign cache rejecting an in-place-overwritten `./bpp` (Killed: 9). Proven
+  by running the known-good backup compiler through the same suite — it failed
+  identically. Install once with a fresh inode (`rm -f ./bpp && cp …`), verify
+  with `tests/test_bootstrap_stable.sh` (no `BPP_BUILD_ID` seeding needed), and
+  let the Docker VM settle before the native suite.
