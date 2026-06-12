@@ -2550,6 +2550,62 @@ static _build_profile_zone(zone_name_p) {
 }
 
 // Parse a single statement: declaration, if, while, return, or expression.
+// Variadic put / put_err — parser-only expansion. A `put(a, b, c, ...)` or
+// `put_err(...)` STATEMENT with >= 2 args becomes a T_BLOCK of N single-arg
+// sub-calls, in order; each single-arg `put(arg)` then flows through the
+// existing per-type smart-dispatch (string -> putstr, word -> putnum, float
+// -> putfloat) downstream. No format string, no separator, no auto-newline.
+//
+// `call` is the T_CALL(put/put_err, args[], count). We reuse the same callee
+// name for every sub-call and preserve the loop-depth stamp (.d). T_BLOCK as a
+// statement is already produced by the parser's const-DCE, so codegen handles
+// it. Single-arg put(x) never reaches here; put(...) in expression position is
+// left untouched (this fires only while a statement is being built).
+static _expand_put_variadic(call) {
+    auto c: Node, blk: Node, sub: Node;
+    auto args, n, i, body, one, name_p, depth;
+    c = call;
+    name_p = c.a;
+    args = c.b;
+    n = c.c;
+    depth = c.d;
+
+    body = buf_word(n);
+    i = 0;
+    while (i < n) {
+        sub = make_node(T_CALL);
+        sub.a = name_p;
+        one = buf_word(1);
+        one[0] = args[i];
+        sub.b = one;
+        sub.c = 1;
+        sub.d = depth;
+        // Mark this as a variadic sub-call so the type pass suppresses the
+        // per-arg W032 ambiguity warning: a value positioned in a put(...)
+        // argument list is unambiguously meant to print, not a maybe-string.
+        // `.dispatch` is otherwise unused on T_CALL nodes (only T_WHILE uses
+        // it, for SEQ/PAR/GPU); 200 is well outside that 0..3 range.
+        sub.dispatch = 200;
+        sub.src_tok  = c.src_tok;   // point diagnostics at the original call
+        body[i] = sub;
+        i = i + 1;
+    }
+
+    blk = make_node(T_BLOCK);
+    blk.b = body;
+    blk.c = n;
+    return blk;
+}
+
+// Is the packed name `nm` the smart-print builtin `put` or `put_err`?
+static _is_put_name(nm) {
+    auto nl;
+    nl = unpack_l(nm);
+    if (nl == 3 && buf_eq(vbuf + unpack_s(nm), "put", 3))     { return 1; }
+    if (nl == 7 && buf_eq(vbuf + unpack_s(nm), "put_err", 7)) { return 1; }
+    return 0;
+}
+
 static parse_statement() {
     auto node: Node, var_p, hint_p, decl_hint, dh_arr, dh_has, kw_hint;
     // `@`-prefixed annotations come in two flavours at statement level:
@@ -2705,6 +2761,13 @@ static parse_statement() {
     }
     node = parse_expr();
     if (val_is_ch(';')) { consume(); }
+    // Variadic put / put_err: a `put(...)` / `put_err(...)` statement with two
+    // or more arguments expands into a block of single-arg sub-calls, each
+    // independently smart-dispatched (see _expand_put_variadic). Statement
+    // position only — put(...) used as an expression value is left as-is.
+    if (node.ntype == T_CALL && node.c >= 2 && _is_put_name(node.a)) {
+        return _expand_put_variadic(node);
+    }
     return node;
 }
 
