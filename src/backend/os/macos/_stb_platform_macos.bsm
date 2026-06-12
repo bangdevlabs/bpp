@@ -238,6 +238,14 @@ static _plt_map_vkey(vk) {
 }
 
 // Open a native macOS window with a framebuffer view.
+// Fullscreen request flag. An app calls _stb_set_fullscreen(1) BEFORE
+// game_init / window_open; _stb_init_window then builds a borderless
+// window the exact size of the main display, raised above the menu bar
+// (the magnifier/overlay shape the zoomer uses) instead of the normal
+// titled, scaled, centered window.
+static auto _stb_fs_want;
+void _stb_set_fullscreen(f) { _stb_fs_want = f; }
+
 void _stb_init_window(w: word, h: word, title) {
     auto pool, view, cg, cf;
     auto fn_main_disp, fn_disp_wide, fn_disp_high;
@@ -295,6 +303,16 @@ void _stb_init_window(w: word, h: word, title) {
     win_h = h * scale;
     _plt_scale = scale;
 
+    // Fullscreen overlay: a borderless window the exact size of the main
+    // display (scr_w/scr_h are the logical points from
+    // CGDisplayPixelsWide/High above), placed at the screen origin and
+    // raised above the menu bar below.
+    if (_stb_fs_want != 0) {
+        win_w = scr_w;
+        win_h = scr_h;
+        _plt_scale = 1;
+    }
+
     // Window at the chosen scale. The initial origin (100, 100)
     // is a placeholder — `center` below picks the actual
     // position on the main screen. In Cocoa coordinates
@@ -302,8 +320,15 @@ void _stb_init_window(w: word, h: word, title) {
     // near the bottom-left corner, which is the "always
     // spawning in the corner" bug games saw before this fix.
     _plt_win = objc_msgSend(objc_getClass("NSWindow"), sel_registerName("alloc"));
-    _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
-        100.0, 100.0, win_w * 1.0, win_h * 1.0, 15, 2, 0);
+    if (_stb_fs_want != 0) {
+        // styleMask 0 = NSWindowStyleMaskBorderless; origin (0, 0) at the
+        // bottom-left of the main screen covers the whole display.
+        _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
+            0.0, 0.0, win_w * 1.0, win_h * 1.0, 0, 2, 0);
+    } else {
+        _plt_win = objc_msgSend(_plt_win, sel_registerName("initWithContentRect:styleMask:backing:defer:"),
+            100.0, 100.0, win_w * 1.0, win_h * 1.0, 15, 2, 0);
+    }
 
     // NSImageView fills the window for framebuffer display.
     //
@@ -352,7 +377,13 @@ void _stb_init_window(w: word, h: word, title) {
     // Center on the active screen before showing. -[NSWindow center]
     // computes (screen_visible_frame.width - win.width) / 2 on both
     // axes, which matches what users expect from a fresh app.
-    objc_msgSend(_plt_win, sel_registerName("center"));
+    if (_stb_fs_want != 0) {
+        // Raise above the menu bar (level 24) and normal windows so the
+        // overlay covers the entire screen. 1000 ≈ screen-saver level.
+        objc_msgSend(_plt_win, sel_registerName("setLevel:"), 1000);
+    } else {
+        objc_msgSend(_plt_win, sel_registerName("center"));
+    }
 
     objc_msgSend(_plt_win, sel_registerName("makeKeyAndOrderFront:"), 0);
     objc_msgSend(_plt_app, sel_registerName("activateIgnoringOtherApps:"), 1);
@@ -396,6 +427,69 @@ void _stb_present() {
 
     call(_plt_cg_img_rel, cgimg);
     call(_plt_cg_ctx_rel, ctx);
+}
+
+// Capture the whole main display into a freshly malloc'd BGRA buffer.
+// Writes the captured pixel width/height to *out_w / *out_h and returns
+// the buffer (the caller frees it), or 0 on failure.
+//
+// macOS path: CoreGraphics `CGDisplayCreateImage` grabs the main display
+// as a CGImage; we read its pixels through the image's data provider.
+// The pixels come back BGRA — the display's native byte order, which is
+// also Metal's default `MTLPixelFormatBGRA8Unorm`, so a GPU consumer
+// needs no channel swizzle. Any per-row padding is dropped so the result
+// is tightly packed at width*4 bytes per row.
+//
+// IMPORTANT: macOS requires Screen Recording permission (System Settings
+// -> Privacy & Security -> Screen Recording). The first run triggers the
+// permission prompt; until it is granted the captured pixels are blank.
+_stb_screen_capture(out_w, out_h) {
+    auto cg, cf;
+    auto fn_main, fn_cap, fn_w, fn_h, fn_bpr, fn_prov, fn_copy, fn_bytes, fn_cfrel, fn_imgrel;
+    auto disp, img, w, h, bpr, prov, data, src, buf, y;
+
+    cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", 1);
+    cf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", 1);
+
+    fn_main   = dlsym(cg, "CGMainDisplayID");
+    fn_cap    = dlsym(cg, "CGDisplayCreateImage");
+    fn_w      = dlsym(cg, "CGImageGetWidth");
+    fn_h      = dlsym(cg, "CGImageGetHeight");
+    fn_bpr    = dlsym(cg, "CGImageGetBytesPerRow");
+    fn_prov   = dlsym(cg, "CGImageGetDataProvider");
+    fn_copy   = dlsym(cg, "CGDataProviderCopyData");
+    fn_bytes  = dlsym(cf, "CFDataGetBytePtr");
+    fn_cfrel  = dlsym(cf, "CFRelease");
+    fn_imgrel = dlsym(cg, "CGImageRelease");
+
+    disp = call(fn_main);
+    img  = call(fn_cap, disp);
+    if (img == 0) {
+        *(out_w) = 0;
+        *(out_h) = 0;
+        return 0;
+    }
+
+    w    = call(fn_w, img);
+    h    = call(fn_h, img);
+    bpr  = call(fn_bpr, img);           // source bytes per row (may be padded)
+    prov = call(fn_prov, img);
+    data = call(fn_copy, prov);         // CFData — retained, released below
+    src  = call(fn_bytes, data);        // pointer to the BGRA pixels
+
+    buf = malloc(w * h * 4);
+    y = 0;
+    while (y < h) {
+        buf_move(buf + y * w * 4, src + y * bpr, w * 4);
+        y = y + 1;
+    }
+
+    call(fn_cfrel, data);
+    call(fn_imgrel, img);
+
+    *(out_w) = w;
+    *(out_h) = h;
+    return buf;
 }
 
 // Sleep for the remaining time in the current frame budget.
@@ -1422,6 +1516,38 @@ _stb_gpu_create_texture(data, w, h) {
     texdesc = objc_msgSend(texdesc, sel_registerName("init"));
     objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
     objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 70);  // MTLPixelFormatRGBA8Unorm
+    objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
+    objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
+    tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);
+
+    region = malloc(48);
+    write_u64(region, 0, 0);
+    write_u64(region, 8, 0);
+    write_u64(region, 16, 0);
+    write_u64(region, 24, w);
+    write_u64(region, 32, h);
+    write_u64(region, 40, 1);
+    call(_gpu_msg, tex,
+         sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+         region, 0, data, w * 4);
+    // Do not free region — Metal may read the MTLRegion struct asynchronously.
+    return tex;
+}
+
+// Create a BGRA8 texture from a BGRA pixel buffer (4 bytes per pixel,
+// byte order B,G,R,A). Identical to _stb_gpu_create_texture except the
+// pixel format is BGRA8Unorm (80) instead of RGBA8Unorm (70), so the GPU
+// interprets the channels correctly with no shader swizzle and no CPU
+// byte-swap. This matches the native byte order of macOS screen capture
+// (`CGDisplayCreateImage` returns BGRA) — the same reasoning as
+// _stb_gpu_create_palette_texture, which uploads our little-endian ARGB
+// words as BGRA8 for the same no-swap reason.
+_stb_gpu_create_texture_bgra(data, w, h) {
+    auto texdesc, tex, region;
+    texdesc = objc_msgSend(objc_getClass("MTLTextureDescriptor"), sel_registerName("alloc"));
+    texdesc = objc_msgSend(texdesc, sel_registerName("init"));
+    objc_msgSend(texdesc, sel_registerName("setTextureType:"), 2);
+    objc_msgSend(texdesc, sel_registerName("setPixelFormat:"), 80);  // MTLPixelFormatBGRA8Unorm
     objc_msgSend(texdesc, sel_registerName("setWidth:"), w);
     objc_msgSend(texdesc, sel_registerName("setHeight:"), h);
     tex = objc_msgSend(_gpu_device, sel_registerName("newTextureWithDescriptor:"), texdesc);

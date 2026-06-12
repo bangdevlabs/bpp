@@ -1,0 +1,119 @@
+// stbpanzoom.bsm — a 2D pan/zoom viewport with momentum.
+//
+// The navigation engine behind tools and games that pan and zoom a 2D
+// view with inertia: a screen magnifier (tools/zoomer), a map / tilemap
+// viewer, a pixel-art canvas. Pure state + math — NO GPU, NO platform,
+// NO input. The consumer feeds it impulses (drag to pan, a zoom amount
+// toward a focus point), calls `panzoom_update` once per frame, and
+// reads back the transform via `panzoom_uniform` for its own shader.
+//
+// Distinct from stbcamera, which is a world-clamped, *zoom-less* game
+// camera that follows targets (its header excludes zoom by Rule 28).
+// This is the user-driven *viewport* camera, with momentum.
+//
+// The transform the consumer applies (e.g. in a fragment shader), with
+// screen UV `s` in [0,1] and the look-at (cx,cy) shown at screen center:
+//
+//   content_uv = (cx, cy) + (s - 0.5) / scale
+//
+// So scale > 1 zooms in around the look-at; zoom-toward-a-point is done
+// here by nudging the look-at as the zoom rides out, leaving the shader
+// trivial.
+//
+// No imports: malloc/free, write_f32, sizeof and struct support all come
+// from the auto-injected prelude (same as stbgrid / stbpath).
+
+struct PanZoom {
+    scale: float, cx: float, cy: float,      // zoom + look-at (content UV)
+    vscale: float, vcx: float, vcy: float,   // velocities (momentum)
+    fx: float, fy: float,                    // last zoom focus (screen UV)
+    scale_fric: float, pan_fric: float,      // per-frame velocity decay
+    min_scale: float, max_scale: float
+}
+
+// Create a viewport: scale 1, centred, sensible friction + clamps.
+panzoom_new() {
+    auto p: PanZoom;
+    p = malloc(sizeof(PanZoom));
+    p.scale = 1.0; p.cx = 0.5; p.cy = 0.5;
+    p.vscale = 0.0; p.vcx = 0.0; p.vcy = 0.0;
+    p.fx = 0.5; p.fy = 0.5;
+    p.scale_fric = 0.82;   // velocity *= this each frame → glide-out
+    p.pan_fric   = 0.82;
+    p.min_scale  = 1.0;
+    p.max_scale  = 40.0;
+    return p;
+}
+
+void panzoom_free(pz) { free(pz); }
+
+// Zoom impulse `amount` (e.g. +0.06 per held key / scroll tick), keeping
+// the content under screen point (sx,sy) fixed as the zoom rides out.
+// sx, sy are screen UV in [0,1].
+void panzoom_zoom_at(pz, amount: float, sx: float, sy: float) {
+    auto p: PanZoom;
+    p = pz;
+    p.vscale = p.vscale + amount;
+    p.fx = sx;
+    p.fy = sy;
+}
+
+// Pan: a drag delta (dsx,dsy) in screen UV. Sets the pan velocity so the
+// view tracks the drag and glides on release. Dragging right moves the
+// content right under you (the look-at moves left), scaled by the zoom.
+void panzoom_pan(pz, dsx: float, dsy: float) {
+    auto p: PanZoom;
+    auto inv: float;
+    p = pz;
+    inv = 1.0 / p.scale;
+    p.vcx = (0.0 - dsx) * inv;
+    p.vcy = (0.0 - dsy) * inv;
+}
+
+// Integrate one frame: advance scale + look-at by their velocities, keep
+// the zoom focus fixed as scale moves, clamp, then decay the velocities.
+void panzoom_update(pz) {
+    auto p: PanZoom;
+    auto old_scale: float, k: float;
+    p = pz;
+
+    old_scale = p.scale;
+    p.scale = p.scale + p.vscale;
+    if (p.scale < p.min_scale) { p.scale = p.min_scale; p.vscale = 0.0; }
+    if (p.scale > p.max_scale) { p.scale = p.max_scale; p.vscale = 0.0; }
+
+    // Keep the content under the zoom focus (fx,fy) fixed as scale moves:
+    //   cx += (fx - 0.5) * (1/old_scale - 1/scale)
+    k = (1.0 / old_scale) - (1.0 / p.scale);
+    p.cx = p.cx + (p.fx - 0.5) * k;
+    p.cy = p.cy + (p.fy - 0.5) * k;
+
+    // Pan.
+    p.cx = p.cx + p.vcx;
+    p.cy = p.cy + p.vcy;
+
+    // Friction (glide-out).
+    p.vscale = p.vscale * p.scale_fric;
+    p.vcx = p.vcx * p.pan_fric;
+    p.vcy = p.vcy * p.pan_fric;
+}
+
+// Snap back to the un-zoomed, centred view (velocity cleared).
+void panzoom_reset(pz) {
+    auto p: PanZoom;
+    p = pz;
+    p.scale = 1.0; p.cx = 0.5; p.cy = 0.5;
+    p.vscale = 0.0; p.vcx = 0.0; p.vcy = 0.0;
+}
+
+// Write the consumer's shader uniform — four f32 (cx, cy, scale, pad) —
+// into `buf` (>= 16 bytes). Keeping the floats inside this function (via
+// write_f32) avoids passing them back across a call boundary.
+void panzoom_uniform(pz, buf) {
+    auto p: PanZoom;
+    p = pz;
+    write_f32(buf, 0,  p.cx);
+    write_f32(buf, 4,  p.cy);
+    write_f32(buf, 8,  p.scale);
+    write_f32(buf, 12, 0.0);
+}
