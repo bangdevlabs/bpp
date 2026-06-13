@@ -1259,6 +1259,119 @@ phase end-to-end:
 | VI void inline | `4beaec3` (VI-1 inert), `d6547fe` (VI-2 activation, a64). |
 | x86_64 parity push | `5289e53` (B2 single-return), `d1ffddf` (S4 + VI multi), `4050080` (B1 T_BINOP), `ee2e054` (T_MEMST + B3), `290d77d` (spine-unification). See journal `2026-05-27 (parity push)`. |
 
+## Codegen Quality and the Register-Allocation Frontier
+
+> Measured 2026-06-13 while studying multi-value return for the book.
+> Recorded so the findings are not lost. The numbers are honest, not
+> aspirational — a first measurement disproved the exciting version.
+
+### The model: accumulator + value-stack, with an opportunistic freelist
+
+`cg_emit_node` evaluates expressions into an **accumulator** (`x0` / `d0`)
+with `x1` / `rcx` as scratch. A binary operator is:
+
+```
+lty = emit_node(left)                            // left → acc
+tok = emit_binop_save_left(has_call(right), lty) // stash left
+rty = emit_node(right)                           // right → acc
+emit_binop_resolve(tok, ...)                     // bring left back to a reg
+<op> acc, left
+```
+
+This is **not** a pure stack machine. On aarch64, `emit_binop_save_left`
+stashes the left operand in a **register freelist** — UNLESS the right
+subtree contains a call (`cg_has_call`), which would clobber the
+caller-saved register, in which case it spills to the stack. So b++
+already has a call-aware, embryonic register-allocation discipline for
+expression-tree intermediates. (x86_64 always uses the stack here.)
+
+What it does NOT have:
+
+- **No FP freelist.** A float left operand always `fpush`es to the stack
+  (`_a64_emit_binop_save_left`: `if (lty == 1) { a64_emit_fpush(); }`).
+  Every float intermediate round-trips through memory — the audio/DSP gap.
+- **No local-variable register caching.** Locals live in frame slots and
+  reload on every use; nothing is kept in a register across statements or
+  a loop. A loop-carried accumulator reloads from its frame slot every
+  iteration.
+- **No general register allocator** (no liveness intervals, no
+  linear-scan / graph-colouring). Register allocation exists only for the
+  ABI argument banks (`arg_reg_int`/`arg_reg_flt`: x0–x7 / d0–d7, spill
+  beyond) — the calling convention, not general compute.
+
+A deliberate one-pass design: fast to compile (~0.3 s self-host), easy to
+keep correct and byte-stable.
+
+### The measured gap: ~2× on the worst case, hidden everywhere else
+
+A serial-dependent scalar LCG loop (300 M iterations; every step depends
+on the previous, so no vectorisation or unrolling can help — the only
+lever is keeping the accumulator in a register), compiled three ways,
+byte-identical output:
+
+| Build | Time | What |
+|---|---:|---|
+| b++ native (accumulator/stack) | **1.01 s** | our codegen |
+| `--c` → `gcc -O0` | 1.18 s | a real compiler, unoptimised |
+| `--c` → `gcc -O2` | **0.48 s** | a real compiler, register-allocated |
+
+1. **b++ native is on par with (slightly ahead of) `gcc -O0`.** The
+   accumulator codegen is "as good as an unoptimised real compiler."
+   Out-of-order cores **store-forward** the stack spills (a load from a
+   just-written slot is satisfied from the store buffer in ~0–1 cycles),
+   so the spill traffic is far cheaper than "memory access" implies.
+2. **`gcc -O2` is ~2.1× faster.** On this loop the win is almost purely
+   register allocation (the serial dependency forbids vectorise/unroll).
+   So **~2× is the size of the register-allocation hole on the worst
+   case** — arithmetic-bound, dependency-chained scalar code.
+
+For typical workloads the effective gap is far below 2× (Amdahl): games
+are GPU-bound, tools are I/O/parsing-bound, the compiler is
+algorithm-bound. The penalty only bites arithmetic-heavy inner loops —
+software DSP, software rasterisation, physics — which is exactly where
+the audio ambition will eventually hit it. That is why the project got
+this far without an allocator: the bottleneck was almost never scalar
+arithmetic.
+
+Reproduce: write a dependent scalar loop, then `bpp x.bpp -o n` versus
+`bpp --c x.bpp > x.c && cc -w -Wno-error=implicit-function-declaration
+-O2 x.c -o c -lobjc -lm`, and time both. The `--c` + `gcc -O2` path is a
+perfect "what would an optimiser buy" oracle.
+
+### The frontier: incremental, not a rewrite
+
+Because the freelist + `save_left` / `resolve` abstraction already exists,
+register allocation is reachable **incrementally**:
+
+1. **Extend the freelist to FP** (float `save_left` → an FP register
+   instead of `fpush`). Localised to the `emit_binop_save_left/resolve`
+   FP path; directly helps float/DSP loops. Small.
+2. **Local-variable register caching across statements** — keep hot
+   locals (loop counters, loop-carried accumulators) in callee-saved
+   registers instead of frame slots. This is the real ~2× and a proper
+   arc (liveness across statements + allocation + spill), but it can
+   **build on** the existing freelist and the `cg_has_call` clobber
+   signal rather than replacing the accumulator model.
+
+### Multi-value return (the ABI side)
+
+Surfaced in the same study: because b++ is typeless, a multi-value return
+(`a, b = f()`) is cheap to add — the per-scalar 2-bank classification
+(int → x-reg, float → d-reg) is the SAME logic already implemented for
+arguments (`cg_emit_call_arg_rearrange` and the prologue's
+`int_seq`/`flt_seq` loop), just mirrored onto the return-register
+sequence. No System-V-style recursive aggregate classifier is needed.
+b++ could even return more than C's 2 registers (symmetric with the 8
+argument registers) — "functions as register-window transformers."
+
+**But:** without register allocation, multi-value return is *convenience*
+(cleaner than out-parameters), not speed — values returned in registers
+are spilled to the frame by the next operation. Its performance payoff
+(e.g. a register-resident `osc → filter → pan` DSP chain) is **gated
+behind the local-variable register caching above.** Record it as a future
+language feature; do not pitch it as a performance win until the
+allocator lands.
+
 ## Portability Tiers — Where Stdlib Features Live
 
 Above the chip / os / target backend layers, the stdlib has its own
