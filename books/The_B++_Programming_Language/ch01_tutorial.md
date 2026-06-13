@@ -158,8 +158,8 @@ changes by editing one labelled line instead of hunting for stray numbers.
 ## 1.5 Character input and output
 
 Most useful programs read input. The lowest-level reader is `getchar`, which
-returns the next byte of standard input as a value 0–255, or **−1** when the
-input is exhausted. The matching writer is `putchar`. With just those two we
+returns the next byte of standard input as a value 0–255, or **`EOF`** (the
+value −1) when the input is exhausted. The matching writer is `putchar`. With just those two we
 can copy input to output (`05_echo.bpp`):
 
 ```
@@ -167,7 +167,7 @@ main() {
     auto c;
 
     c = getchar();
-    while (c != -1) {
+    while (c != EOF) {
         putchar(c);
         c = getchar();
     }
@@ -231,7 +231,7 @@ you to type, exactly as in Mode 1:
 > **Keyboard shortcuts at the prompt.** Three control-key combinations
 > confuse most newcomers; learn them once:
 >
-> - **Ctrl+D** — send end-of-input. The program's `getchar` returns `-1`
+> - **Ctrl+D** — send end-of-input. The program's `getchar` returns `EOF`
 >   and the loop exits. This is *not* a way to kill the program; it is a
 >   polite "I am done sending input."
 > - **Ctrl+C** — send `SIGINT`. The OS interrupts the program and it
@@ -243,16 +243,19 @@ you to type, exactly as in Mode 1:
 >   command shells, "end-of-input" is **Ctrl+Z then Enter** — confusing,
 >   but unrelated to Unix's `SIGTSTP`.)
 
-> **C → B++.** C marks end of input with the named constant `EOF`. B++ uses the
-> plain value **−1** returned by `getchar`. Write the loop against `-1`
-> directly, or give it your own name with a `const` if you prefer.
+> **C → B++.** Both languages mark end of input with the named constant `EOF`
+> (the value −1, defined in the prelude). Compare against `EOF`, never a bare
+> `-1`, so the loop reads as intent. Keep the byte in a plain `auto` — a signed
+> machine word — because `EOF` (−1) cannot be held in a `: byte` (it would read
+> as 255, and the loop would never end) nor compared correctly in a `: u_word`
+> (it would read as a huge unsigned value).
 
 This read loop is a skeleton you fill differently for each job. **Counting
 characters** (`06_count_chars.bpp`) keeps a tally instead of echoing:
 
 ```
     c = getchar();
-    while (c != -1) {
+    while (c != EOF) {
         count = count + 1;
         c = getchar();
     }
@@ -294,7 +297,7 @@ main() {
     lines = 0;
 
     c = getchar();
-    while (c != -1) {
+    while (c != EOF) {
         if (c == '\n') {
             lines = lines + 1;
         }
@@ -314,7 +317,7 @@ memory is a small state variable:
 const IN  = 1;   // the scanner is inside a word
 const OUT = 0;   // the scanner is between words
 
-    while (c != -1) {
+    while (c != EOF) {
         if (c == ' ' || c == '\n' || c == '\t') {
             state = OUT;
         } else if (state == OUT) {
@@ -348,7 +351,7 @@ one indexed block (`09_char_classes.bpp`):
     other = 0;
 
     c = getchar();
-    while (c != -1) {
+    while (c != EOF) {
         if (c >= '0' && c <= '9') {
             digits[c - '0'] = digits[c - '0'] + 1;
         } else if (c == ' ' || c == '\n' || c == '\t') {
@@ -479,7 +482,7 @@ get_line(buf, limit) {
     auto c, i;
     i = 0;
     c = getchar();
-    while (c != -1 && c != '\n') {
+    while (c != EOF && c != '\n') {
         if (i < limit - 1) { write_u8(buf, i, c); }
         i = i + 1;
         c = getchar();
@@ -561,7 +564,7 @@ The "C → B++" boxes collected:
   A *lone* word like `put(n)` warns (number or pointer?), but in a list every
   value is unambiguously meant to print (§1.2). `putnum`/`putstr`/`putchar`
   remain for when you want one explicitly.
-- **End of input is −1**, not a named `EOF` (§1.5).
+- **End of input is `EOF`** — the prelude's named constant for −1, just like C (§1.5).
 - **Arguments are call by value** — just like C: a parameter is a private copy,
   and to modify a caller's variable you pass a pointer (Chapter 5) (§1.8).
 
