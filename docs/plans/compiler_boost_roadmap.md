@@ -139,53 +139,53 @@ exists** — `_a64_b3_select()` ranks vars by `cg_var_refs` and promotes
 the top 6 to `x19..x24`. So F.2 is NOT green-field; it is three slices
 from cheap-and-sure to big-and-precise:
 
-- **F.2.a — extend B3 to FLOAT locals.** B3 promotes GP locals to
-  `x19..x24` but **not** float locals (`a64_primitives.bsm`: "B3
-  promotion of float params ... is not yet implemented"). The biquad's
-  34 float frame loads/stores per sample are entirely this gap. Mirror
-  the existing int-B3 selection onto the callee-saved FP bank
-  (`d8..d15`) — the same move step 1 made (the FP freelist mirrored the
-  GP freelist). Reuses the whole B3 ref-count + promotion + spill path;
-  the only new work is a second selection pass over eligible float vars,
-  routing promoted-float reads/writes to `fmov d<reg>` instead of
-  `ldr/str d, [x29]`, and saving `d8..d15` in the prologue. **Small,
-  contained, directly attacks the measured 34/sample.** Mirror on x64
-  (callee-saved-xmm is empty in SysV, so x64 float promotion spills to a
-  fixed slot or is skipped — note the asymmetry, measure separately).
-- **F.2.b — loop-weight the ref count.** B3 ranks by *total* refs today;
-  a local read once per iteration of a hot loop should outrank one read
-  5× in straight-line code. Weight `cg_var_refs` by loop nesting depth
-  during the counting pre-pass. Small heuristic change, no liveness —
-  improves *which* locals win the 6+N register budget.
-- **F.2.c — the full live-interval allocator** (the original design
-  below). CFG + liveness + linear-scan, for register *reuse* beyond
-  whole-function promotion. The big arc; do it only if a/b leave a
-  measured gap.
+- **F.2.a — extend B3 to FLOAT locals. ❌ TRIED, MEASURED, REVERTED
+  (2026-06-13).** Implemented end to end — a second B3 selection pass to
+  `d8..d15`, float-aware load / store / zero-init / arg-copy, and prologue
+  save/restore — and it is **12.7% SLOWER** on the biquad (1.081s →
+  1.218s, min-of-8, identical output) despite cutting the 34 float frame
+  loads/stores per sample to **zero**. Why: the `ldr/str d, [x29]` it
+  removes are **store-forwarded** (a load from a just-written stack slot
+  is satisfied from the store buffer in ~0–1 cycles), so they were nearly
+  free; the `fmov d<reg>` that replaces them costs an **FP port**, and a
+  float-heavy DSP loop is already FP-port-bound, so it piles onto the
+  bottleneck. **Counting frame accesses overstated their cost; measuring
+  time corrected it.** (Same lesson as the step-1 residual-fmov removal,
+  which was also slower.) Reverted; the consumer-site list it surfaced
+  (load, store, zero-init, arg-copy-flt all read `cg_var_promote`) is kept
+  here in case a future, port-aware version revisits it.
+- **F.2.b — loop-weight the ref count.** Moot: the float case (F.2.a) is
+  rejected, and int register-caching (B3) already removes its frame
+  traffic, so re-ranking which locals win the budget does not touch the
+  real gap (below).
+- **F.2.c — compute-in-place (the original live-interval design below).**
+  The **only** lever that addresses the real gap. The big arc.
 
-**Two distinct gaps — do not conflate them (verified 2026-06-13 by
-disasm).** The ~2× is the sum of two unrelated costs:
+**The gap is the accumulator MODEL, not frame traffic (corrected
+2026-06-13 by measurement).** The earlier "two gaps" framing was wrong:
+frame traffic is store-forwarded and nearly free, so removing it (F.2.a)
+does not help — and trading it for FP-port `fmov` hurts. The entire ~2×
+to -O2 is the **accumulator shuttle**: every op loads its operands into
+x0/d0, computes, then stores the result back, emitting ~2–3× the ops
+-O2 needs. -O2 wins by **computing in place** (`fadd d_dst, d_a, d_b`
+with the operands already in their registers) — fewer ops on the
+bottleneck port — NOT by "keeping values in registers" (b++ already does
+that via B3 + the freelist; promoting MORE values, as F.2.a showed, can
+even lose).
 
-1. **Frame traffic** — a local lives in a frame slot and reloads on
-   every use. B3 already eliminates this for INT locals (the serial LCG
-   loop disassembles to `acc` in x19, `i` in x20, **zero `[x29]`
-   traffic**), but NOT for float — so this gap is **float-only**, and
-   **F.2.a closes it**.
-2. **Accumulator move tax** — even when a local is in a callee-saved
-   register, b++'s accumulator model shuttles it through x0/d0 on every
-   op (`add x19, x0, #0` … `mul x0, …` … `add x19, x0, #0`). This hits
-   INT and float equally and is the *entire* remaining int gap to -O2
-   (the int loop is already frame-free). Whole-function promotion
-   (F.2.a/b) does NOT touch it — only **F.2.c** does, because removing it
-   means ops target the promoted register directly instead of x0, i.e.
-   replacing the accumulator model with real register targeting. That is
-   exactly the "register reuse beyond whole-function promotion" F.2.c is
-   for.
+So the honest conclusion: **there is no cheap slice.** Whole-function
+register promotion (F.2.a/b) cannot close the gap, because the gap is not
+where the values live — it is the accumulator evaluation order. Only
+F.2.c (ops writing their destination register directly, no x0/d0
+shuttle) addresses it, and that is the big arc — it replaces the
+accumulator model, not a heuristic tweak.
 
-So: F.2.a accelerates **float** loops (kills float frame traffic, brings
-float up to int's current frame-free-but-shuttled level); F.2.c
-accelerates **both** (kills the shuttle). Set expectations accordingly —
-F.2.a will NOT speed up the integer LCG loop, because that loop's gap is
-the accumulator tax, not frame traffic.
+Why step 1 (the SIMD freelist, `c54a19b`) WAS a win where F.2.a was not:
+it removed the **value-stack** push/pop (`str/ldr d, [sp, #-0x10]!` with
+the pre/post-index SP write), genuinely more expensive than a
+store-forwarded frame slot, and added no offsetting `fmov` on the hot
+path. The rule: target the expensive memory ops (stack push/pop, the
+shuttle), never the cheap ones (store-forwarded frame slots).
 
 Each slice is gated the same way: bench the biquad + the serial LCG loop
 against the `--c` → `gcc -O2` oracle, confirm byte-stable bootstrap +

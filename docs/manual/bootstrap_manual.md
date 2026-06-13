@@ -1338,20 +1338,33 @@ Reproduce: write a dependent scalar loop, then `bpp x.bpp -o n` versus
 -O2 x.c -o c -lobjc -lm`, and time both. The `--c` + `gcc -O2` path is a
 perfect "what would an optimiser buy" oracle.
 
-### The frontier: incremental, not a rewrite
+### The frontier: measured, not assumed
 
-Because the freelist + `save_left` / `resolve` abstraction already exists,
-register allocation is reachable **incrementally**:
+Two slices were tried; only one helped — and the difference rewrote the
+plan (full detail in `docs/plans/compiler_boost_roadmap.md` F.2):
 
-1. **Extend the freelist to FP** (float `save_left` → an FP register
-   instead of `fpush`). Localised to the `emit_binop_save_left/resolve`
-   FP path; directly helps float/DSP loops. Small.
-2. **Local-variable register caching across statements** — keep hot
-   locals (loop counters, loop-carried accumulators) in callee-saved
-   registers instead of frame slots. This is the real ~2× and a proper
-   arc (liveness across statements + allocation + spill), but it can
-   **build on** the existing freelist and the `cg_has_call` clobber
-   signal rather than replacing the accumulator model.
+1. **Extend the freelist to FP — SHIPPED (`c54a19b`), 1.86×.** Float
+   `save_left` now parks the left operand in a SIMD register instead of
+   `fpush`ing to the value-stack. A win, because the value-stack push/pop
+   (with its pre/post-index SP write) is genuinely expensive and the fix
+   adds no offsetting move on the hot path.
+2. **Promote hot float locals to callee-saved registers — TRIED,
+   MEASURED 12.7% SLOWER, REVERTED.** B3 already does this for *int*
+   locals (the serial LCG loop is frame-free, `acc` in x19), so extending
+   it to float looked like the obvious next slice. It cut the biquad's 34
+   float frame loads/stores per sample to zero — and ran *slower*. The
+   frame accesses it removed were **store-forwarded** (~free); the `fmov`
+   that replaced them costs an FP port, and a float-heavy loop is already
+   FP-port-bound. **Counting memory accesses overstated their cost.**
+
+The correction: **the ~2× is the accumulator MODEL, not where values
+live.** Every op shuttles operands through x0/d0 (`ldr/mov → op →
+str/mov`); -O2 wins by computing in place (`fadd d_dst, d_a, d_b`) —
+fewer ops on the bottleneck port. So there is **no cheap slice** for the
+remaining gap: register caching (which b++ already does, via B3 + the
+freelist) doesn't help, and promoting *more* values can lose. Only
+replacing the accumulator model with real register targeting closes it,
+and that is the big arc (F.2.c).
 
 ### Multi-value return (the ABI side)
 
@@ -1364,13 +1377,15 @@ sequence. No System-V-style recursive aggregate classifier is needed.
 b++ could even return more than C's 2 registers (symmetric with the 8
 argument registers) — "functions as register-window transformers."
 
-**But:** without register allocation, multi-value return is *convenience*
+**But:** under the accumulator model, multi-value return is *convenience*
 (cleaner than out-parameters), not speed — values returned in registers
-are spilled to the frame by the next operation. Its performance payoff
-(e.g. a register-resident `osc → filter → pan` DSP chain) is **gated
-behind the local-variable register caching above.** Record it as a future
-language feature; do not pitch it as a performance win until the
-allocator lands.
+are shuttled through x0/d0 by the very next operation. Its performance
+payoff (e.g. a register-resident `osc → filter → pan` DSP chain) is
+**gated behind compute-in-place (F.2.c) above** — note from the F.2.a
+result that more register residency alone does not help; the win needs
+ops to target their destination directly. Record multi-value return as a
+future language feature; do not pitch it as a performance win until
+compute-in-place lands.
 
 ## Portability Tiers — Where Stdlib Features Live
 
