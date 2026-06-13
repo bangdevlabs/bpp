@@ -162,6 +162,31 @@ from cheap-and-sure to big-and-precise:
   whole-function promotion. The big arc; do it only if a/b leave a
   measured gap.
 
+**Two distinct gaps — do not conflate them (verified 2026-06-13 by
+disasm).** The ~2× is the sum of two unrelated costs:
+
+1. **Frame traffic** — a local lives in a frame slot and reloads on
+   every use. B3 already eliminates this for INT locals (the serial LCG
+   loop disassembles to `acc` in x19, `i` in x20, **zero `[x29]`
+   traffic**), but NOT for float — so this gap is **float-only**, and
+   **F.2.a closes it**.
+2. **Accumulator move tax** — even when a local is in a callee-saved
+   register, b++'s accumulator model shuttles it through x0/d0 on every
+   op (`add x19, x0, #0` … `mul x0, …` … `add x19, x0, #0`). This hits
+   INT and float equally and is the *entire* remaining int gap to -O2
+   (the int loop is already frame-free). Whole-function promotion
+   (F.2.a/b) does NOT touch it — only **F.2.c** does, because removing it
+   means ops target the promoted register directly instead of x0, i.e.
+   replacing the accumulator model with real register targeting. That is
+   exactly the "register reuse beyond whole-function promotion" F.2.c is
+   for.
+
+So: F.2.a accelerates **float** loops (kills float frame traffic, brings
+float up to int's current frame-free-but-shuttled level); F.2.c
+accelerates **both** (kills the shuttle). Set expectations accordingly —
+F.2.a will NOT speed up the integer LCG loop, because that loop's gap is
+the accumulator tax, not frame traffic.
+
 Each slice is gated the same way: bench the biquad + the serial LCG loop
 against the `--c` → `gcc -O2` oracle, confirm byte-stable bootstrap +
 full suite + Linux x64 (B3 touches both backends' var access and
