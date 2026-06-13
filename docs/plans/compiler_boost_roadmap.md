@@ -124,6 +124,52 @@ CSE, we need:
 
 ## F.2 — Register Allocator v2 (SSA-lite + liveness)
 
+### Phasing (added 2026-06-13 — grounded in measurement)
+
+A 2026-06-13 study measured the real codegen gap (see
+`docs/manual/bootstrap_manual.md` "Codegen Quality and the
+Register-Allocation Frontier"): b++ native is ~on par with `gcc -O0`,
+and ~2.1× behind `gcc -O2` on serial-dependent scalar loops, the gap
+dominated by register allocation. A biquad IIR kernel split that gap:
+**~half is float binop intermediates** (fixed in `c54a19b` — the float
+path now uses the SIMD freelist, 1.86×) and **~half is local-variable
+frame traffic** (this section). Crucially, the study found that the
+"promote hottest locals to callee-saved registers" machinery **already
+exists** — `_a64_b3_select()` ranks vars by `cg_var_refs` and promotes
+the top 6 to `x19..x24`. So F.2 is NOT green-field; it is three slices
+from cheap-and-sure to big-and-precise:
+
+- **F.2.a — extend B3 to FLOAT locals.** B3 promotes GP locals to
+  `x19..x24` but **not** float locals (`a64_primitives.bsm`: "B3
+  promotion of float params ... is not yet implemented"). The biquad's
+  34 float frame loads/stores per sample are entirely this gap. Mirror
+  the existing int-B3 selection onto the callee-saved FP bank
+  (`d8..d15`) — the same move step 1 made (the FP freelist mirrored the
+  GP freelist). Reuses the whole B3 ref-count + promotion + spill path;
+  the only new work is a second selection pass over eligible float vars,
+  routing promoted-float reads/writes to `fmov d<reg>` instead of
+  `ldr/str d, [x29]`, and saving `d8..d15` in the prologue. **Small,
+  contained, directly attacks the measured 34/sample.** Mirror on x64
+  (callee-saved-xmm is empty in SysV, so x64 float promotion spills to a
+  fixed slot or is skipped — note the asymmetry, measure separately).
+- **F.2.b — loop-weight the ref count.** B3 ranks by *total* refs today;
+  a local read once per iteration of a hot loop should outrank one read
+  5× in straight-line code. Weight `cg_var_refs` by loop nesting depth
+  during the counting pre-pass. Small heuristic change, no liveness —
+  improves *which* locals win the 6+N register budget.
+- **F.2.c — the full live-interval allocator** (the original design
+  below). CFG + liveness + linear-scan, for register *reuse* beyond
+  whole-function promotion. The big arc; do it only if a/b leave a
+  measured gap.
+
+Each slice is gated the same way: bench the biquad + the serial LCG loop
+against the `--c` → `gcc -O2` oracle, confirm byte-stable bootstrap +
+full suite + Linux x64 (B3 touches both backends' var access and
+prologue). Eligibility rules are load-bearing for correctness: a local
+whose address is taken (`&x`) CANNOT be promoted (it must have a frame
+slot) — `cg_b3_eligible` already encodes this for the GP path; the float
+pass must honour the same exclusions (address-taken, struct, sliced).
+
 ### What it does
 
 Replace the current B3 "count refs + promote hottest N" heuristic
@@ -178,6 +224,13 @@ A v2 allocator needs:
   of hot-loop time
 - OR: a specific workload (RTS with 1000 units, dense ECS) demands
   tighter register reuse
+
+**Partially unblocked 2026-06-13:** the biquad measurement above IS that
+profile — frame traffic is ~half the measured ~2× gap on arithmetic-bound
+float loops, and the audio/DSP direction is the workload that demands it.
+Start at F.2.a (extend B3 to float); F.2.c (the full live-interval
+allocator below) stays gated until a/b are measured and a real gap
+remains.
 
 ### Expected gain
 
