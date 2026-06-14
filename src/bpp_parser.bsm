@@ -2429,6 +2429,52 @@ static parse_return() {
     return node;
 }
 
+// Lookahead test for a multi-value assignment statement `a, b, … = f()`.
+// True when the current token is a bare identifier and the very next
+// token is a comma. b++ has no comma operator in expressions, so this
+// shape can only be a multi-assign — there is no ambiguity with an
+// ordinary expression statement (whose second token is `(`, `=`, `.`,
+// `[`, an operator, or `;`).
+static _stmt_is_multi_assign() {
+    auto addr;
+    if (cur_type() != TK_ID) { return 0; }
+    if (tok_pos + 1 >= tok_cnt) { return 0; }
+    addr = toks + (tok_pos + 1) * 24;
+    if (*(addr + 16) != 1) { return 0; }            // next value is 1 char
+    return peek(vbuf + *(addr + 8)) == ',';         // … and it is a comma
+}
+
+// Parse `a, b, … = call();`. Targets are bare identifiers (slice 1:
+// pre-declared locals). Lowered to a T_ASSIGN node carrying the target
+// list so codegen can unpack the call's banked results:
+//   n.a = first target (single-value alias / b3 ref counting)
+//   n.b = right-hand side (the call expression)
+//   n.c = arr of all target T_VAR nodes
+//   n.d = target count (>1 marks the multi-assign path)
+static parse_multi_assign() {
+    auto node: Node, targets, tnode: Node;
+    targets = arr_new();
+    tnode = make_node(T_VAR);
+    tnode.a = cur_packed();
+    targets = arr_push(targets, tnode);
+    consume();                           // first identifier
+    while (val_is_ch(',')) {
+        consume();                       // ','
+        tnode = make_node(T_VAR);
+        tnode.a = cur_packed();
+        targets = arr_push(targets, tnode);
+        consume();                       // identifier
+    }
+    if (val_is_ch('=')) { consume(); }   // '='
+    node = make_node(T_ASSIGN);
+    node.a = *(targets + 0);
+    node.b = parse_expr();               // the call
+    node.c = targets;
+    node.d = arr_len(targets);
+    if (val_is_ch(';')) { consume(); }
+    return node;
+}
+
 // Parse a switch statement. B++ switch has no fallthrough — each arm exits
 // at its closing brace. Comma-separated values share an arm body.
 // W021 is emitted if no `else` arm is present (exhaustiveness hint).
@@ -2799,6 +2845,9 @@ static parse_statement() {
             return make_node(T_CONTINUE);
         }
     }
+    // Multi-value assignment `a, b, … = f()` is detected here, before the
+    // ordinary expression-statement fallthrough, by its `IDENT ,` prefix.
+    if (_stmt_is_multi_assign()) { return parse_multi_assign(); }
     node = parse_expr();
     if (val_is_ch(';')) { consume(); }
     // Variadic put / put_err: a `put(...)` / `put_err(...)` statement with two

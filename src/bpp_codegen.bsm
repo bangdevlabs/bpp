@@ -424,6 +424,8 @@ struct ChipPrimitives {
     emit_fop_into,            // (op_code, dreg, s1, s2) — d<dreg> = d<s1> OP d<s2>
                               //   op_code: 0=add 1=sub 2=mul 3=div
     emit_fmov_reg,            // (dst, src) — fmov d<dst>, d<src> (promoted read)
+    emit_mov_reg_reg,         // (dst, src) — mov x<dst>, x<src> (banked return
+                              //   placement / multi-value unpack)
     simd_temp_alloc,          // () → a caller-saved SIMD temp reg, or -1
     simd_temp_free,           // (reg) — return a temp to the pool
     simd_temp_count,          // () → temp-pool size (0 disables the path)
@@ -3392,6 +3394,24 @@ void cg_emit_stmt(nd) {
     // T_RET: evaluate return expression, coerce to the function's
     // declared return type, jump to the epilogue.
     if (t == T_RET) {
+        // Multi-value return `return e1, e2, …;` — place each result in
+        // its banked int register x0..x_{n-1} (slice 1: all integer).
+        // Reverse-evaluate so e_0 ends in x0 and e_i (i>0) is moved up to
+        // x_i; the trailing eval of e_0 must not clobber x1..x_{n-1},
+        // which holds for the call-free expressions slice 1 targets.
+        if (n.c > 1) {
+            auto rexprs, ri;
+            rexprs = n.b;
+            ri = n.c - 1;
+            while (ri >= 1) {
+                call(p.emit_node, *(rexprs + ri * 8));   // x0 = e_ri
+                call(p.emit_mov_reg_reg, ri, 0);         // mov x_ri, x0
+                ri = ri - 1;
+            }
+            call(p.emit_node, *(rexprs + 0));            // x0 = e_0
+            call(p.emit_jump_to_epilogue);
+            return 0;
+        }
         rty = call(p.emit_node, n.a);
         if (is_float_type(get_fn_ret_type(cg_cur_fn_idx))) {
             if (rty == 0) { call(p.emit_promote_int_to_flt); }
@@ -3408,6 +3428,29 @@ void cg_emit_stmt(nd) {
     // primitive) or a global (primitive with float coercion).
     if (t == T_ASSIGN) {
         auto lhs: Node, vi, off;
+
+        // Multi-value assignment `a, b, … = f()` — n.c is the array of
+        // target T_VAR nodes, n.d the count. The call (n.b) leaves its
+        // results in the banked int registers x0..x_{n-1}; store each into
+        // its target, bringing x_k down into x0 first (slice 1: integer
+        // targets). Storing target_k uses only x0 (+ x8 for addressing),
+        // so the not-yet-read x_{k+1}..x_{n-1} survive.
+        if (n.d > 1) {
+            auto targets, mk, tnode: Node, tvi, toff;
+            targets = n.c;
+            call(p.emit_node, n.b);                  // call → x0..x_{n.d-1}
+            mk = 0;
+            while (mk < n.d) {
+                if (mk > 0) { call(p.emit_mov_reg_reg, 0, mk); }   // x0 = x_mk
+                tnode = *(targets + mk * 8);
+                tvi = cg_var_idx(tnode.a);
+                toff = arr_get(cg_var_off, tvi);
+                call(p.emit_store_var_typed, tvi, toff, 0);
+                mk = mk + 1;
+            }
+            return 0;
+        }
+
         lhs = n.a;
         if (lhs.ntype == T_VAR) {
             vi = cg_var_idx(lhs.a);
