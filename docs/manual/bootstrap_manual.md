@@ -1366,6 +1366,30 @@ freelist) doesn't help, and promoting *more* values can lose. Only
 replacing the accumulator model with real register targeting closes it,
 and that is the big arc (F.2.c).
 
+### What shipped (2026-06-14) — and the final numbers
+
+The "big arc" turned out tractable, and the inversion above was the key:
+**compute-in-place alone is ~0%** (the shuttle it removes is store-
+forwarded), but it is the foundation that makes **float promotion** —
+rejected *alone* as 12.7% slower — finally pay, because the ops then read
+the promoted registers directly. The two together = **1.27×**. On top,
+**fmadd** fuses the filter-tap `(left) ± a*b` into one rounded op
+(`docs/plans/multi_value_return_plan.md` is the sibling feature this
+unblocked). Final biquad IIR (min of 12): accumulator baseline 1.140s →
+**0.769s = 1.48×**, now *beating* gcc -O0 (0.927s) and 1.99× off -O2
+(0.386s, down from 2.85×). Compile time unaffected (`bench_compile.sh`
+bootstrap 0.25s).
+
+The remaining gap to -O2 is **instruction scheduling** (software
+pipelining), not register allocation. The other named lever — integer
+loop control (the bound constant reloaded each iteration, the compare
+materialised through the accumulator) — was **measured at ~0%** on the
+biquad: the integer control runs parallel to the FP feedback chain and is
+hidden by FP latency, the same store-forwarding lesson again. It would
+help integer-bound loops, not FP-bound DSP, so it was not built. The
+recurring discipline: count instructions and everything looks wasteful;
+measure time and the off-critical-path work costs nothing.
+
 ### Multi-value return (the ABI side)
 
 Surfaced in the same study: because b++ is typeless, a multi-value return

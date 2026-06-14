@@ -13197,3 +13197,112 @@ gen2==gen3 byte-stable with the test passing.
   identically. Install once with a fresh inode (`rm -f ./bpp && cp …`), verify
   with `tests/test_bootstrap_stable.sh` (no `BPP_BUILD_ID` seeding needed), and
   let the Docker VM settle before the native suite.
+
+## 2026-06-14 — The audio codegen arc: a register-allocation frontier, the arity-8 register-window return, and fmadd
+
+A marathon, and the throughline was not a feature — it was **measurement
+killing the obvious**, over and over, until what shipped was only what the
+clock actually rewarded.
+
+### F.2.c — compute-in-place + float promotion (the premise was wrong)
+
+The `docs/plans/compiler_boost_roadmap.md` F.2 plan named *float register
+promotion* (F.2.a) the win and *compute-in-place* (F.2.c) the optional big
+arc. The clock inverted both. Measured in the real compiler (the only honest
+control — a hand-written decomposition had conflated two variables and
+mis-attributed the win):
+
+- **Compute-in-place alone: ~0%.** It removes the d0 accumulator shuttle, but
+  that shuttle is store-forwarded / off the critical path — exactly what the
+  earlier residual-fmov experiment had already predicted.
+- **Float promotion alone: 12.7% *slower*** (the original F.2.a — promoting to
+  a register adds an `fmov` on the FP-port bottleneck without removing the
+  shuttle).
+- **The two together: 1.27x.** Synergistic — neither helps alone; compute-in-
+  place lets the ops read the promoted registers *directly*, so the promotion
+  finally pays. A correctness bug (a promoted float *param* never received its
+  incoming argument — the arg-copy always spilled to the frame) was caught not
+  by the disassembly, which looked correct, but by `lldb`: putfloat printed
+  2.0 for every input because it read the caller's stale d9.
+
+### Multi-value return — the arity-8 "register-window transformer"
+
+The whole register-allocation sidequest existed to unlock this. Because b++
+is typeless and every scalar is a 64-bit word, a function can take 8 args in
+registers and *return* up to 8 the same way — a symmetric 8-in/8-out ABI C
+can't express. A peer study (C / C++ / Go / Odin / Jai / Zig / Rust) put b++
+in the **genuine-N-values family** (Go/Odin/Jai), not the tuple family
+(Rust/C++): there is no tuple object, just N banked registers, so the syntax
+is `a, b = f()` with no parens. Shipped in slices — integer banks, then float
++ mixed banks — each gated on bootstrap byte-stability + both suites. The
+payoff is concrete for audio: `l, r = filter(l, r)` returns two floats in
+d0/d1, and over F.2.c the stereo pair stays register-resident in d8/d9 across
+a whole filter chain — verified in the disassembly, zero per-sample frame
+traffic. A real bug surfaced here too: the cost-model inliner spliced a multi-
+return as a single value, dropping the second result (a `swap()` test printed
+`20 garbage`); fixed by excluding `ret_arity > 1` functions from inlining. And
+the rigor held against my own shortcut: the first float-return cut used
+reverse-eval with a documented "hoist complex exprs" caveat; the test
+`return x*0.5, y*0.25` exposed it as a *silent* miscompile (slot 0's float
+expr clobbered slot 1 parked in the d1 scratch), so it was replaced with a
+scratch-safe two-pass (evaluate + push, then pop into banks — no evaluation in
+pass two, so the FP scratch is never touched).
+
+### fmadd — the filter-tap fusion
+
+The compute-in-place float tree now fuses `(left) + a*b → fmadd` and
+`(left) - a*b → fmsub` (the left-associative filter-tap shape). The biquad's
+inner expression drops from 5 fmul + 4 fadd/fsub to 1 fmul + 4 fma, single-
+rounded (more precise). ~9% on the biquad — honestly modest, because the IIR
+is latency-bound on its own feedback chain (fmadd cuts op *count*, not the
+critical path); throughput-bound kernels (FIR, gain, mix) gain more.
+
+### Cross-platform — the spine is the portable base; x64 opts out cleanly
+
+A review question — "is x86_64 updated?" — surfaced a real footgun: the spine
+fires the multi-return codegen on *both* backends, but x64's bank primitives
+are stubs (SysV rax/rdx is a different map), so x64-native multi-return would
+have silently miscompiled. Closed with a `cap_multi_ret` capability — x64 now
+emits a clean E266 instead of wrong code. Verified end to end in Docker
+(XQuartz/`--linux64` per the bootstrap manual): **Linux x86_64 self-host
+gen2==gen3 byte-stable**, biquad + tests correct on x64, `--linux64` multi-
+return → clean E266. F.2.c and fmadd are a64-only and gate themselves off on
+x64 (the CIP path returns a temp-pool size of 0), so the x64 accumulator model
+is untouched and correct.
+
+### The integer-loop lever — measured ~0%, skipped
+
+The plan's last named lever was the integer loop control (the bound constant
+reloaded every iteration, the compare materialised through the accumulator).
+Before building a risky core-control-flow change, the measurement: hoisting
+the loop constant by hand moved the biquad **0.1% — noise.** The integer
+control runs in parallel with the FP feedback chain and is absorbed by the
+out-of-order engine; it is hidden by FP latency, the same lesson as store-
+forwarding. It would help *integer*-bound loops, not FP-bound DSP. Not built —
+the rigor that stopped three earlier "obvious" wins stopped this one too.
+
+### The benchmark
+
+- **Compile time** (`tests/bench_compile.sh`, 5 runs): bootstrap 0.25s, small
+  0.03s, medium 0.04s — the new passes (multi-return, CIP analysis, fmadd
+  match) added no measurable overhead.
+- **Runtime** (biquad IIR, min of 12): accumulator baseline 1.140s →
+  **0.769s = 1.48x**, now *beating* gcc -O0 (0.927s), 1.99x off -O2 (0.386s,
+  down from 2.85x). The remaining gap is instruction scheduling (software
+  pipelining) — a large arc with low return on latency-bound audio.
+
+### Lessons
+
+- **The real compiler is the only honest control.** A hand-written asm
+  "decomposition" conflated compute-in-place with a tight integer loop and
+  mis-attributed the entire win; the real compiler, changing one variable,
+  showed compute-in-place alone is 0%. Hand-written asm lies by omission.
+- **Counting instructions is not measuring time.** Store-forwarded frame
+  slots, off-critical-path fmovs, and FP-latency-hidden integer control all
+  *look* wasteful and cost ~0%. Four separate "obvious" optimisations died
+  this way across the arc.
+- **Tonify rules apply to new code, not just sweeps.** The idiom rules
+  (Rule 14 `++`, Pitfall 4 `-1`) slipped under focus on byte-stability and
+  green suites; a 30-second per-commit grep is the fix (new feedback memory).
+- 13 commits, every one bootstrap-byte-stable; native 188/0/12, C-emit
+  152/0/48 throughout.
