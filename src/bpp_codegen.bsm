@@ -423,12 +423,19 @@ struct ChipPrimitives {
     emit_fload_var_into,      // (dreg, off) — ldr d<dreg>, [fp, #off]
     emit_fop_into,            // (op_code, dreg, s1, s2) — d<dreg> = d<s1> OP d<s2>
                               //   op_code: 0=add 1=sub 2=mul 3=div
+    emit_fma,                 // (op_code, dst, n, m, a) — fused multiply-add:
+                              //   op 0: d<dst> = d<n>*d<m> + d<a>  (fmadd)
+                              //   op 1: d<dst> = d<a> - d<n>*d<m>  (fmsub)
     emit_fmov_reg,            // (dst, src) — fmov d<dst>, d<src> (promoted read)
     emit_mov_reg_reg,         // (dst, src) — mov x<dst>, x<src> (banked return
                               //   placement / multi-value unpack)
     emit_bank_push,           // (is_flt) — push acc (x0 / d0) to the value stack
     emit_bank_pop,            // (is_flt, reg) — pop value-stack top into x<reg>/d<reg>
                               //   (two-pass multi-return placement, scratch-safe)
+    cap_multi_ret,            // () → 1 if this backend implements multi-value
+                              //   return banking (a64), 0 otherwise (x86_64 /
+                              //   C-emit — the spine diagnoses instead of
+                              //   emitting silently wrong code)
     simd_temp_alloc,          // () → a caller-saved SIMD temp reg, or -1
     simd_temp_free,           // (reg) — return a temp to the pool
     simd_temp_count,          // () → temp-pool size (0 disables the path)
@@ -3071,6 +3078,39 @@ cg_emit_float_into(nd, dreg) {
     if (c0 == '*') { op_code = 2; }
     if (c0 == '/') { op_code = 3; }
 
+    // Fused multiply-add fusion: `(left) + (a*b)` → fmadd, `(left) - (a*b)`
+    // → fmsub. Fires when this op is + or - and the RIGHT child is a `*`
+    // binop — the left-associative shape of a filter tap chain
+    // (`b0*x + b1*x1 + b2*x2 - …`). The addend is the left operand (its
+    // register reused when promoted, else computed into dreg); the two
+    // multiplicands go to registers (promoted direct or a temp). One fused
+    // op replaces fmul+fadd, halving the FP-port work and rounding once.
+    if (c0 == '+' || c0 == '-') {
+        auto rn: Node;
+        rn = n.c;
+        if (rn != 0 && rn.ntype == T_BINOP && unpack_l(rn.a) == 1 && peek(cg_sbuf + unpack_s(rn.a)) == '*') {
+            auto a_node: Node, b_node: Node, addr_reg, fasrc, fbsrc, fta, ftb, alk, blk, fllk, fma_op;
+            a_node = rn.b; b_node = rn.c;
+            fllk = cg_float_leaf_kind(n.b);
+            if (fllk > 0) { addr_reg = fllk; }
+            else { cg_emit_float_into(n.b, dreg); addr_reg = dreg; }
+            alk = cg_float_leaf_kind(a_node);
+            fta = 0 - 1;
+            if (alk > 0) { fasrc = alk; }
+            else { fta = call(p.simd_temp_alloc); cg_emit_float_into(a_node, fta); fasrc = fta; }
+            blk = cg_float_leaf_kind(b_node);
+            ftb = 0 - 1;
+            if (blk > 0) { fbsrc = blk; }
+            else { ftb = call(p.simd_temp_alloc); cg_emit_float_into(b_node, ftb); fbsrc = ftb; }
+            fma_op = 0;
+            if (c0 == '-') { fma_op = 1; }
+            call(p.emit_fma, fma_op, dreg, fasrc, fbsrc, addr_reg);
+            if (ftb >= 0) { call(p.simd_temp_free, ftb); }
+            if (fta >= 0) { call(p.simd_temp_free, fta); }
+            return 0;
+        }
+    }
+
     lk = cg_float_leaf_kind(n.b);
     if (lk > 0) {
         lsrc = lk;
@@ -3409,6 +3449,12 @@ void cg_emit_stmt(nd) {
         // later slot's expression.
         if (n.c > 1) {
             auto rexprs, ri, rdt, ris_f, rbpos, rbj, rrty;
+            if (call(p.cap_multi_ret) == 0) {
+                diag_error(266);
+                diag_str("multi-value return is only supported on the aarch64 backend for now");
+                diag_newline();
+                return 0;
+            }
             rexprs = n.b;
             // Pass 1: evaluate left-to-right, coerce, push.
             ri = 0;
@@ -3466,6 +3512,12 @@ void cg_emit_stmt(nd) {
         // higher bank registers survive each store.
         if (n.d > 1) {
             auto targets, mk, tnode: Node, tvi, toff, tis_f, tbpos, tbj, tbn: Node, tbvi;
+            if (call(p.cap_multi_ret) == 0) {
+                diag_error(266);
+                diag_str("multi-value assignment is only supported on the aarch64 backend for now");
+                diag_newline();
+                return 0;
+            }
             targets = n.c;
             call(p.emit_node, n.b);                  // call → banked results
             mk = 0;
