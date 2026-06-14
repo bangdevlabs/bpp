@@ -412,6 +412,21 @@ struct ChipPrimitives {
     // So caller_name(caller_pc(0)) names the current function,
     // caller_name(caller_pc(1)) names its direct caller, etc.
     emit_caller_pc,           // () — n in result reg, PC out in result reg
+
+    // ── F.2.c prototype: compute-in-place for pure float arithmetic ──
+    // The spine's cg_emit_float_into walks a `+ - * /` tree whose leaves
+    // are plain `: float` locals and emits destination-driven ops
+    // (`fop d_dst, d_a, d_b`) instead of routing every value through the
+    // d0 accumulator (the "shuttle"). These five slots are the chip hooks
+    // it needs. A chip that returns 0 from simd_temp_count opts out and
+    // keeps the accumulator path (x86_64 today).
+    emit_fload_var_into,      // (dreg, off) — ldr d<dreg>, [fp, #off]
+    emit_fop_into,            // (op_code, dreg, s1, s2) — d<dreg> = d<s1> OP d<s2>
+                              //   op_code: 0=add 1=sub 2=mul 3=div
+    emit_fmov_reg,            // (dst, src) — fmov d<dst>, d<src> (promoted read)
+    simd_temp_alloc,          // () → a caller-saved SIMD temp reg, or -1
+    simd_temp_free,           // (reg) — return a temp to the pool
+    simd_temp_count,          // () → temp-pool size (0 disables the path)
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -1101,6 +1116,26 @@ cg_b3_eligible(vi) {
     fty = arr_get(cg_var_forced_ty, vi);
     if (is_float_type(fty)) { return 0; }
     if (ty_slice(fty) != SL_FULL) { return 0; }
+    return 1;
+}
+
+// F.2.c Stage 2: the float counterpart of cg_b3_eligible. A plain
+// 64-bit `: float` local that is neither address-taken nor a stack
+// struct can be promoted to a callee-saved d-register. Sub-word floats
+// (`: half` / `: quarter`) and 128-bit `: double` keep their frame slots
+// because their load / store widths differ. The chip's float B3 pass
+// uses this; the compute-in-place emitter then reads the promoted
+// register directly (cg_float_leaf_kind).
+cg_b3_eligible_float(vi) {
+    auto fty, sl;
+    if (arr_get(cg_var_stack, vi)) { return 0; }
+    if (arr_get(cg_var_addr_taken, vi)) { return 0; }
+    fty = arr_get(cg_var_forced_ty, vi);
+    if (is_float_type(fty) == 0) { return 0; }
+    sl = ty_slice(fty);
+    if (sl == SL_HALF) { return 0; }
+    if (sl == SL_QUARTER) { return 0; }
+    if (sl == SL_DOUBLE) { return 0; }
     return 1;
 }
 
@@ -2926,6 +2961,134 @@ cg_emit_inline_multi(call_node, fidx) {
     return final_ety;
 }
 
+// ── F.2.c: compute-in-place for pure float arithmetic trees ──────────
+//
+// cg_float_tree_need analyses whether a node is a pure `+ - * /` tree
+// over plain `: float` locals, and if so returns how many SIMD temp
+// registers the destination-driven emitter needs. The count uses the
+// left-first Sethi-Ullman recurrence that mirrors how cg_emit_float_into
+// allocates: a leaf costs 0 temps (it loads straight into its
+// destination register); a binop costs max(need(left), 1 + need(right))
+// because the left operand reuses the destination register down the
+// whole left spine while each right operand occupies one fresh temp.
+//
+// Any node that is not such a tree (a call, an integer leaf, a promoted
+// or address-taken local, a sub-word/SIMD float, a comparison) makes the
+// function return the sentinel 999. The caller compares the result with
+// the chip's temp-pool size, so the sentinel simply forces the fall-back
+// to the accumulator path. (999 is far above any real register budget.)
+// Classify a float-tree leaf. Returns -1 if nd is not an eligible float
+// leaf (not a plain-double `: float` local), 0 if it is a FRAME-resident
+// float local, or the promoted register number (8..15) when B3 has
+// promoted it to a callee-saved d-register. The promoted case is the
+// Stage-2 payoff: the op reads that register directly, with no load and
+// no fmov.
+cg_float_leaf_kind(nd) {
+    auto n: Node, vi, fty, sl, preg;
+    if (nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype != T_VAR) { return -1; }
+    vi = cg_var_idx(n.a);
+    if (vi < 0) { return -1; }                       // global / unknown
+    if (cg_var_is_float(vi) == 0) { return -1; }     // not a float local
+    if (arr_get(cg_var_stack, vi)) { return -1; }    // address-taken / struct
+    fty = arr_get(cg_var_forced_ty, vi);
+    sl = ty_slice(fty);
+    if (sl == SL_HALF) { return -1; }
+    if (sl == SL_QUARTER) { return -1; }
+    if (sl == SL_DOUBLE) { return -1; }
+    preg = arr_get(cg_var_promote, vi);
+    if (preg >= 0) { return preg; }                  // promoted d8..d15
+    return 0;                                         // frame leaf
+}
+
+cg_float_tree_need(nd) {
+    auto n: Node, t, c0, op_l, nl, nr, k, rc;
+    if (nd == 0) { return 999; }
+    n = nd; t = n.ntype;
+    if (t == T_VAR) {
+        if (cg_float_leaf_kind(nd) < 0) { return 999; }
+        return 0;                                    // any leaf: 0 temps
+    }
+    if (t == T_BINOP) {
+        op_l = unpack_l(n.a);
+        if (op_l != 1) { return 999; }
+        c0 = peek(cg_sbuf + unpack_s(n.a));
+        if (c0 != '+' && c0 != '-' && c0 != '*' && c0 != '/') { return 999; }
+        nl = cg_float_tree_need(n.b);                // left computes into dreg
+        if (nl >= 999) { return 999; }
+        // Right cost: a promoted-leaf right is read directly (0 temps);
+        // anything else needs one temp to hold it for the op.
+        k = cg_float_leaf_kind(n.c);
+        if (k > 0) {
+            rc = 0;
+        } else {
+            nr = cg_float_tree_need(n.c);
+            if (nr >= 999) { return 999; }
+            rc = 1 + nr;
+        }
+        if (nl > rc) { return nl; }
+        return rc;
+    }
+    return 999;
+}
+
+// Emit a pure float arithmetic tree (already validated and budgeted by
+// cg_float_tree_need) directly into d<dreg>, computing in place. The left
+// operand reuses dreg as its running accumulator down the entire left
+// spine; each right operand lands in a freshly allocated SIMD temp; the
+// op writes its destination directly. No value shuttles through the d0
+// accumulator. Precondition: cg_float_tree_need(nd) <= simd_temp_count(),
+// so simd_temp_alloc never returns -1 here.
+cg_emit_float_into(nd, dreg) {
+    auto p: ChipPrimitives;
+    auto n: Node, t, vi, off, c0, op_code, lsrc, rsrc, tr, lk, rk;
+    p = cg_prim;
+    n = nd; t = n.ntype;
+    if (t == T_VAR) {
+        lk = cg_float_leaf_kind(nd);
+        if (lk > 0) {
+            // Promoted local: move the callee-saved d-register into dreg.
+            call(p.emit_fmov_reg, dreg, lk);
+        } else {
+            vi = cg_var_idx(n.a);
+            off = arr_get(cg_var_off, vi);
+            call(p.emit_fload_var_into, dreg, off);
+        }
+        return 0;
+    }
+    // T_BINOP: dreg = (left) OP (right). A promoted-leaf operand is read
+    // straight from its register — no load, no temp. Otherwise the left
+    // computes into dreg and the right into a freshly allocated temp.
+    c0 = peek(cg_sbuf + unpack_s(n.a));
+    op_code = 0;
+    if (c0 == '-') { op_code = 1; }
+    if (c0 == '*') { op_code = 2; }
+    if (c0 == '/') { op_code = 3; }
+
+    lk = cg_float_leaf_kind(n.b);
+    if (lk > 0) {
+        lsrc = lk;
+    } else {
+        cg_emit_float_into(n.b, dreg);
+        lsrc = dreg;
+    }
+
+    rk = cg_float_leaf_kind(n.c);
+    tr = 0 - 1;
+    if (rk > 0) {
+        rsrc = rk;
+    } else {
+        tr = call(p.simd_temp_alloc);
+        cg_emit_float_into(n.c, tr);
+        rsrc = tr;
+    }
+
+    call(p.emit_fop_into, op_code, dreg, lsrc, rsrc);
+    if (tr >= 0) { call(p.simd_temp_free, tr); }
+    return 0;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -3020,6 +3183,16 @@ cg_emit_node(nd) {
     if (t == T_BINOP) {
         auto op_s, op_l, c0, c1, is_io, lty, rty, use_flt;
         auto save_token, left_reg_int;
+
+        // F.2.c: a pure float `+ - * /` tree computes in place, bypassing
+        // the accumulator save/resolve dance below. The gate compares the
+        // tree's temp need with the chip's pool size; a chip without an FP
+        // freelist returns 0 and always falls through to the dance.
+        if (cg_float_tree_need(n) <= call(p.simd_temp_count)) {
+            cg_emit_float_into(n, 0);
+            return 1;
+        }
+
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         c0 = peek(cg_sbuf + op_s);
         c1 = 0; if (op_l > 1) { c1 = peek(cg_sbuf + op_s + 1); }

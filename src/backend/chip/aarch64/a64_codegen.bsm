@@ -50,6 +50,12 @@ import "a64_primitives.bsm";
 // offset.
 extrn a64_promoted_regs;  // Array pointer stable; contents cleared by a64_primitives.
 global a64_b3_spill_base; // Assigned by a64_primitives (a64_emit_func_prologue).
+// F.2.c Stage 2: float B3 promotes hot `: float` locals to callee-saved
+// d8..d15. a64_promoted_fregs holds those d-register numbers (8..15);
+// a64_b3_fspill_base is where they are saved in the frame (right after
+// the integer B3 spill band).
+extrn a64_promoted_fregs;
+global a64_b3_fspill_base;
 
 // Shared per-function state (cg_flt_tbl, cg_str_tbl, cg_lbl_cnt,
 // cg_depth, cg_break_stack, cg_continue_stack, cg_cur_fn_name,
@@ -143,6 +149,12 @@ void cg_install_arm64_primitives() {
     p.emit_fsub             = fn_ptr(_a64_emit_fsub);
     p.emit_fmul             = fn_ptr(_a64_emit_fmul);
     p.emit_fdiv             = fn_ptr(_a64_emit_fdiv);
+    p.emit_fload_var_into   = fn_ptr(_a64_emit_fload_var_into);
+    p.emit_fop_into         = fn_ptr(_a64_emit_fop_into);
+    p.emit_fmov_reg         = fn_ptr(_a64_emit_fmov_reg);
+    p.simd_temp_alloc       = fn_ptr(_a64_simd_temp_alloc);
+    p.simd_temp_free        = fn_ptr(_a64_simd_temp_free);
+    p.simd_temp_count       = fn_ptr(_a64_simd_temp_count);
     p.emit_cmp_int          = fn_ptr(_a64_emit_cmp_int);
     p.emit_cmp_flt          = fn_ptr(_a64_emit_cmp_flt);
     p.emit_new_label        = fn_ptr(_a64_emit_new_label);
@@ -274,6 +286,7 @@ void init_codegen_arm64() {
     cg_var_addr_taken = arr_new();
     cg_var_promote = arr_new();
     a64_promoted_regs = arr_new();
+    a64_promoted_fregs = arr_new();
     cg_flt_tbl = arr_new();
     cg_str_tbl = arr_new();
     cg_lbl_cnt = 0; cg_depth = 0;
@@ -489,6 +502,37 @@ void _a64_b3_select() {
     }
 }
 
+// F.2.c Stage 2 — float B3. Promote the hottest `: float` locals into the
+// callee-saved d8..d15 band (8 registers). Mirrors _a64_b3_select but
+// over cg_b3_eligible_float, recording the chosen d-register numbers
+// (8..15) in cg_var_promote and a64_promoted_fregs (used by the prologue
+// spill). Runs alongside the integer pass: the two pools never overlap
+// (x19..x24 vs d8..d15), so a var is promoted by at most one of them.
+void _a64_b3_select_float() {
+    auto budget, used, vi, n, best_vi, best_refs, reg;
+    budget = 8;
+    n = arr_len(cg_vars);
+    arr_clear(a64_promoted_fregs);
+    used = 0;
+    while (used < budget) {
+        best_vi = -1;
+        best_refs = 1;
+        for (vi = 0; vi < n; vi++) {
+            if (arr_get(cg_var_promote, vi) >= 0) { continue; }
+            if (cg_b3_eligible_float(vi) == 0) { continue; }
+            if (arr_get(cg_var_refs, vi) > best_refs) {
+                best_refs = arr_get(cg_var_refs, vi);
+                best_vi = vi;
+            }
+        }
+        if (best_vi < 0) { return; }
+        reg = 8 + used;
+        arr_set(cg_var_promote, best_vi, reg);
+        a64_promoted_fregs = arr_push(a64_promoted_fregs, reg);
+        used++;
+    }
+}
+
 
 // Walk a function body and register all declared variables (for frame sizing).
 // S4 P3b-2: top-level entry also walks the body for inlineable multi-stmt
@@ -589,6 +633,14 @@ a64_emit_load_var(vi, off) {
     // Phase B3: promoted local — emit register move, skip stack load.
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
+        // F.2.c Stage 2: a promoted FLOAT local lives in d8..d15; bring it
+        // into the d0 accumulator with fmov (not a GP mov) and report the
+        // float result type.
+        if (cg_var_is_float(vi)) {
+            if (a64_bin_mode) { enc_fmov(0, _preg); }
+            else { out("  fmov d0, d"); a64_print_dec(_preg); putchar(10); }
+            return 1;
+        }
         if (a64_bin_mode) { enc_add_imm(0, _preg, 0); }
         else { out("  mov x0, x"); a64_print_dec(_preg); putchar(10); }
         return 0;
@@ -651,6 +703,17 @@ void a64_emit_store_var(vi, off, rty) {
     auto fty, sl, _preg;
     _preg = arr_get(cg_var_promote, vi);
     if (_preg >= 0) {
+        // F.2.c Stage 2: a promoted FLOAT local lives in d8..d15. Keep the
+        // float bits (fmov), widening an integer RHS with scvtf first —
+        // never the fcvtzs int-coercion used for promoted int locals.
+        if (cg_var_is_float(vi)) {
+            if (rty == 0) {
+                if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar(10); }
+            }
+            if (a64_bin_mode) { enc_fmov(_preg, 0); }
+            else { out("  fmov d"); a64_print_dec(_preg); out(", d0"); putchar(10); }
+            return 0;
+        }
         if (rty == 1) {
             if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar(10); }
         }

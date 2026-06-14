@@ -209,6 +209,54 @@ void _a64_emit_fdiv() {
     else { out("  fdiv d0, d1, d0"); putchar('\n'); }
 }
 
+// ── F.2.c compute-in-place hooks ──
+//
+// Load a plain 64-bit float local straight into an arbitrary d-register
+// (no detour through d0), and run a 3-register float op writing its
+// destination directly. These let the spine's cg_emit_float_into build a
+// DSP expression with operands kept in registers instead of shuttling
+// every value through the d0 accumulator.
+void _a64_emit_fload_var_into(dreg, off) {
+    if (a64_bin_mode) { enc_ldr_d_uoff(dreg, 29, off); }
+    else {
+        out("  ldr d"); a64_print_dec(dreg);
+        out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+    }
+}
+void _a64_emit_fop_into(op_code, dreg, s1, s2) {
+    if (op_code == 1) {
+        if (a64_bin_mode) { enc_fsub(dreg, s1, s2); }
+        else { out("  fsub d"); a64_print_dec(dreg); out(", d"); a64_print_dec(s1); out(", d"); a64_print_dec(s2); putchar('\n'); }
+        return 0;
+    }
+    if (op_code == 2) {
+        if (a64_bin_mode) { enc_fmul(dreg, s1, s2); }
+        else { out("  fmul d"); a64_print_dec(dreg); out(", d"); a64_print_dec(s1); out(", d"); a64_print_dec(s2); putchar('\n'); }
+        return 0;
+    }
+    if (op_code == 3) {
+        if (a64_bin_mode) { enc_fdiv(dreg, s1, s2); }
+        else { out("  fdiv d"); a64_print_dec(dreg); out(", d"); a64_print_dec(s1); out(", d"); a64_print_dec(s2); putchar('\n'); }
+        return 0;
+    }
+    if (a64_bin_mode) { enc_fadd(dreg, s1, s2); }
+    else { out("  fadd d"); a64_print_dec(dreg); out(", d"); a64_print_dec(s1); out(", d"); a64_print_dec(s2); putchar('\n'); }
+    return 0;
+}
+// Move one d-register into another (fmov d<dst>, d<src>). Used by the
+// compute-in-place emitter to bring a promoted local into the running
+// accumulator when it is a tree's left-most operand.
+void _a64_emit_fmov_reg(dst, src) {
+    if (a64_bin_mode) { enc_fmov(dst, src); }
+    else { out("  fmov d"); a64_print_dec(dst); out(", d"); a64_print_dec(src); putchar('\n'); }
+}
+// Temp-pool wrappers. The pool is the caller-saved v2..v7 band already
+// used by the float binop save_left path, so compute-in-place and the
+// accumulator dance draw from the same 6 registers (count = 6).
+_a64_simd_temp_alloc() { return a64_simd_alloc_temp(); }
+void _a64_simd_temp_free(reg) { a64_simd_free(reg); }
+_a64_simd_temp_count() { return 6; }
+
 // ── BINOP comparisons (Wave 6) ──
 //
 // Map portable CG_CC_* to AArch64 nzcv condition codes for cset.
@@ -682,6 +730,12 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
             off = a64_b3_spill_base + i * 8;
             enc_str_uoff(reg, 29, off);
         }
+        n = arr_len(a64_promoted_fregs);
+        for (i = 0; i < n; i++) {
+            reg = arr_get(a64_promoted_fregs, i);
+            off = a64_b3_fspill_base + i * 8;
+            enc_str_d_uoff(reg, 29, off);
+        }
     } else {
         a64_ret_lbl = enc_new_label();
         out(".p2align 2"); putchar('\n');
@@ -704,6 +758,12 @@ void _a64_emit_prologue(name_p, fn_lbl_id, frame_size) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             out("  str x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+        }
+        n = arr_len(a64_promoted_fregs);
+        for (i = 0; i < n; i++) {
+            reg = arr_get(a64_promoted_fregs, i);
+            off = a64_b3_fspill_base + i * 8;
+            out("  str d"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
         }
     }
 }
@@ -897,6 +957,7 @@ void _a64_emit_prologue_full(name_p, fn_lbl_id, frame_size) {
 // Called once by the spine at the start of every emit_func.
 void _a64_fn_reset_chip_state() {
     arr_clear(a64_promoted_regs);
+    arr_clear(a64_promoted_fregs);
     a64_freelist_reset();
 }
 
@@ -906,8 +967,12 @@ void _a64_fn_reset_chip_state() {
 // On aarch64, offsets grow UP from fp, so the spill base is the
 // absolute offset of the first spill slot (40 + total).
 _a64_fn_reserve_spill(total) {
+    auto int_bytes;
     a64_b3_spill_base = 40 + total;
-    return total + arr_len(a64_promoted_regs) * 8;
+    // Integer B3 spills first, then the float B3 band right after it.
+    int_bytes = arr_len(a64_promoted_regs) * 8;
+    a64_b3_fspill_base = a64_b3_spill_base + int_bytes;
+    return total + int_bytes + arr_len(a64_promoted_fregs) * 8;
 }
 
 // Pre-register every variable declared in the function body (walks
@@ -992,7 +1057,7 @@ void _a64_emit_narrow_float_params(par_cnt) {
 // Called by the spine's cg_emit_func to run the aarch64-specific
 // B3 register-promotion selector. Chip owns the register budget
 // decision because each ISA has a different free-reg count.
-void _a64_b3_select_prim() { _a64_b3_select(); }
+void _a64_b3_select_prim() { _a64_b3_select(); _a64_b3_select_float(); }
 
 // Save argc / argv / envp from the current function's incoming arg
 // registers (x0/x1/x2 on aarch64 macOS) into the runtime-global
@@ -1082,6 +1147,21 @@ void _a64_emit_arg_int_to_flt(flt_seq, src_int_seq) {
 // B3 promotion of float params into callee-saved regs is not yet
 // supported (preg >= 0 path falls back to frame-slot storage).
 void _a64_emit_arg_copy_flt(var_idx, abi_seq_idx, frame_off) {
+    auto preg;
+    // F.2.c Stage 2: a B3-promoted float param takes its incoming arg
+    // register straight into its callee-saved d-register (fmov), never the
+    // frame slot — otherwise the promoted register keeps the caller's
+    // stale value and the param reads garbage. Mirrors the promoted-int
+    // path in _a64_emit_arg_copy_int.
+    preg = arr_get(cg_var_promote, var_idx);
+    if (preg >= 0) {
+        if (a64_bin_mode) { enc_fmov(preg, abi_seq_idx); }
+        else {
+            out("  fmov d"); a64_print_dec(preg);
+            out(", d"); a64_print_dec(abi_seq_idx); putchar('\n');
+        }
+        return 0;
+    }
     if (a64_bin_mode) {
         enc_str_d_uoff(abi_seq_idx, 29, frame_off);
     } else {
@@ -1149,6 +1229,12 @@ void _a64_emit_frame_teardown(frame_size) {
             off = a64_b3_spill_base + i * 8;
             enc_ldr_uoff(reg, 29, off);
         }
+        n = arr_len(a64_promoted_fregs);
+        for (i = 0; i < n; i++) {
+            reg = arr_get(a64_promoted_fregs, i);
+            off = a64_b3_fspill_base + i * 8;
+            enc_ldr_d_uoff(reg, 29, off);
+        }
         if (frame_size <= 504) {
             enc_ldp_post(29, 30, 31, frame_size);
         } else {
@@ -1166,6 +1252,12 @@ void _a64_emit_frame_teardown(frame_size) {
             reg = arr_get(a64_promoted_regs, i);
             off = a64_b3_spill_base + i * 8;
             out("  ldr x"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+        }
+        n = arr_len(a64_promoted_fregs);
+        for (i = 0; i < n; i++) {
+            reg = arr_get(a64_promoted_fregs, i);
+            off = a64_b3_fspill_base + i * 8;
+            out("  ldr d"); a64_print_dec(reg); out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
         }
         if (frame_size <= 504) {
             out("  ldp x29, x30, [sp], #"); a64_print_dec(frame_size); putchar('\n');
