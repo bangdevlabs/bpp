@@ -126,6 +126,25 @@ CSE, we need:
 
 ### Phasing (added 2026-06-13 — grounded in measurement)
 
+> **✅ OUTCOME (2026-06-14): F.2.c SHIPPED in `c099438` (1.27× on the
+> biquad). Label reconciliation — read this first, the original a/b/c
+> premise was overturned by measurement:**
+> - **F.2.c (compute-in-place)** = the real lever = **DONE.** Shipped as
+>   "Stage 1": a spine path emits a float `+ - * /` tree straight into its
+>   destination registers, no x0/d0 shuttle. Worth ~0% *alone* (the shuttle
+>   it removes is store-forwarded / off the critical path) but it is the
+>   foundation the next item needs.
+> - **F.2.a (float promotion)** = rejected ALONE (12.7% slower, below) but
+>   **REVIVED on the F.2.c foundation** as "Stage 2" — operands are now read
+>   directly from promoted d8..d15 registers, no offsetting fmov, and it
+>   WINS. The two are synergistic: neither alone helps, together = 1.27×.
+> - **F.2.b (loop-weight)** = **skipped** (moot).
+>
+> So we did F.2.c + a working F.2.a, not "F.2.a + F.2.b". The narrative
+> below is the measurement trail that led here — still true, kept for the
+> record. Remaining gap to `gcc -O1`: only 8 of 12 floats fit d8..d15, and
+> the int loop control is still accumulator-shaped (a separate lever).
+
 A 2026-06-13 study measured the real codegen gap (see
 `docs/manual/bootstrap_manual.md` "Codegen Quality and the
 Register-Allocation Frontier"): b++ native is ~on par with `gcc -O0`,
