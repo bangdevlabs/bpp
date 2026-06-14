@@ -1852,12 +1852,33 @@ static void parse_function(is_stub, is_static, is_void) {
     // record is pushed below. The C emitter and type checker both
     // honor the hint — without it, return-typed functions fall back
     // to TY_WORD which silently truncates floats.
-    auto ret_hint;
+    // ret_arity is the number of return values. It stays 1 for every
+    // normal function (single `-> type` or no annotation); a parenthesised
+    // list `-> (t1, t2, …)` declares a multi-value return and sets the
+    // count. ret_hint keeps the FIRST return type (single-value alias used
+    // by the existing inference + emitter paths). Slice 1 counts the extra
+    // return types but only stores the first hint — banking by per-slot
+    // type lands with the float slice.
+    auto ret_hint, ret_arity;
     ret_hint = 0;
+    ret_arity = 1;
     if (val_is("->", 2)) {
         consume();              // '->'
-        parse_type_expr(0);
-        ret_hint = _prim_hint;
+        if (val_is_ch('(')) {
+            consume();          // '('
+            parse_type_expr(0); // first return type
+            ret_hint = _prim_hint;
+            ret_arity = 1;
+            while (val_is_ch(',')) {
+                consume();          // ','
+                parse_type_expr(0); // additional return type
+                ret_arity = ret_arity + 1;
+            }
+            consume();          // ')'
+        } else {
+            parse_type_expr(0);
+            ret_hint = _prim_hint;
+        }
     }
 
     // @safe — the only user-facing phase annotation as of the
@@ -2035,6 +2056,7 @@ static void parse_function(is_stub, is_static, is_void) {
             arr_set(fn_void, _dup_idx, is_void);
             arr_set(fn_phase_hint, _dup_idx, phase_hint);
             arr_set(fn_ret_hint, _dup_idx, ret_hint);
+            arr_set(fn_ret_arity, _dup_idx, ret_arity);
             _dup_found = 1;
             _dup_idx = func_cnt;
         }
@@ -2047,6 +2069,7 @@ static void parse_function(is_stub, is_static, is_void) {
         fn_void = arr_push(fn_void, is_void);
         fn_phase_hint = arr_push(fn_phase_hint, phase_hint);
         fn_ret_hint   = arr_push(fn_ret_hint, ret_hint);
+        fn_ret_arity  = arr_push(fn_ret_arity, ret_arity);
     }
 
     // Fix 2: enforce main() only in the entry file (module 0).
@@ -2375,17 +2398,34 @@ static parse_for() {
 // Parse a return statement. Bare `return;` is allowed in void functions
 // and produces T_RET with implicit value 0, same as implicit return at
 // the end of a function body.
+// Layout: T_RET node with:
+//   n.a = first return expression (single-value path uses only this)
+//   n.b = arr of ALL return expressions (0 when single-value)
+//   n.c = number of return values (1 when single-value)
+// A multi-value return `return e1, e2, …;` fills n.b / n.c so codegen
+// can place each result in its banked register; single returns leave
+// them at 0 / 1 and every existing path is unchanged.
 static parse_return() {
-    auto node: Node;
+    auto node: Node, exprs;
     consume();
     node = make_node(T_RET);
     if (val_is_ch(';')) {
         node.a = make_int_lit(0);
         consume();
-    } else {
-        node.a = parse_expr();
-        if (val_is_ch(';')) { consume(); }
+        return node;
     }
+    node.a = parse_expr();
+    if (val_is_ch(',')) {
+        exprs = arr_new();
+        exprs = arr_push(exprs, node.a);
+        while (val_is_ch(',')) {
+            consume();                       // ','
+            exprs = arr_push(exprs, parse_expr());
+        }
+        node.b = exprs;
+        node.c = arr_len(exprs);
+    }
+    if (val_is_ch(';')) { consume(); }
     return node;
 }
 
