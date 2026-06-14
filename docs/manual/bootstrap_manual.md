@@ -1377,15 +1377,19 @@ sequence. No System-V-style recursive aggregate classifier is needed.
 b++ could even return more than C's 2 registers (symmetric with the 8
 argument registers) — "functions as register-window transformers."
 
-**But:** under the accumulator model, multi-value return is *convenience*
-(cleaner than out-parameters), not speed — values returned in registers
-are shuttled through x0/d0 by the very next operation. Its performance
-payoff (e.g. a register-resident `osc → filter → pan` DSP chain) is
-**gated behind compute-in-place (F.2.c) above** — note from the F.2.a
-result that more register residency alone does not help; the win needs
-ops to target their destination directly. Record multi-value return as a
-future language feature; do not pitch it as a performance win until
-compute-in-place lands.
+**The gate was compute-in-place — and it has shipped** (F.2.c, `c099438`,
+1.27x on the biquad). Before it, a multi-value return was *convenience*
+(cleaner than out-parameters) but not speed: under the pure accumulator
+model the values came back in registers and were shuttled through x0/d0
+by the very next operation. Now that float locals are B3-promoted and the
+compute-in-place emitter reads registers directly, a returned d0..d7 value
+whose consumer is promoted is `fmov`'d straight into its callee-saved
+register — the register-resident `osc → filter → pan` DSP chain is
+reachable. (F.2.a confirmed that register residency ALONE does not help;
+the win needs ops to target their destination directly, which is exactly
+what F.2.c added.) The full design — an arity-8 "register-window
+transformer" ABI symmetric with the 8 argument registers — is phased in
+`docs/plans/multi_value_return_plan.md`.
 
 ## Portability Tiers — Where Stdlib Features Live
 
