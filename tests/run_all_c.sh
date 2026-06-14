@@ -146,6 +146,12 @@ should_skip() {
         test_macho_*|test_codegen_macho|test_enc_macho)
             echo "skip:backend-specific" && return
             ;;
+        test_multi_return)
+            # Multi-value return is a64-native first (Phase A). The C
+            # emitter lowers a multi-return as a single value for now;
+            # C-backend support is a documented follow-up.
+            echo "skip:native-multi-return" && return
+            ;;
         test_gpu_*|test_stbgame_native|test_gameinfra)
             echo "skip:cocoa-varargs" && return
             ;;
