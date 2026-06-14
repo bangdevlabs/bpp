@@ -61,8 +61,13 @@ static auto fn_ret_table;
 struct FnMeta {
     vt_block,    // ptr to 24-byte VtEntry-shaped blob (name,type,elem per local)
     vt_count,    // number of locals in vt_block
-    ret_type,    // inferred return type (TY_*)
-    par_block    // ptr to buf_word holding param type codes
+    ret_type,    // inferred return type of the FIRST result (TY_*) — kept as a
+                 // single-value alias so every existing reader still works
+    par_block,   // ptr to buf_word holding param type codes
+    ret_count,   // number of return values (1 for every normal function;
+                 // >1 only for multi-value-return functions). Default 1.
+    ret_block    // ptr to buf_word of ret_count return type codes (banked
+                 // int/float at the ABI); ret_block[0] == ret_type
 }
 extrn fn_metas;
 
@@ -827,12 +832,35 @@ get_fn_elem_type(func_idx, name_p) {
     return TY_WORD;
 }
 
-// Query a function's inferred return type.
+// Query a function's inferred return type (the first result).
 get_fn_ret_type(func_idx) {
     auto m: FnMeta;
     m = arr_struct_at(fn_metas, func_idx);
     if (m == 0) { return TY_WORD; }
     return m.ret_type;
+}
+
+// Query a function's return arity (1 for every normal function).
+get_fn_ret_count(func_idx) {
+    auto m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return 1; }
+    if (m.ret_count < 1) { return 1; }
+    return m.ret_count;
+}
+
+// Query the type of a function's k-th return value (0-based). Falls back
+// to ret_type for k==0 / single-return functions, TY_WORD otherwise.
+get_fn_ret_type_at(func_idx, k) {
+    auto block, m: FnMeta;
+    m = arr_struct_at(fn_metas, func_idx);
+    if (m == 0) { return TY_WORD; }
+    block = m.ret_block;
+    if (block == 0) {
+        if (k == 0) { return m.ret_type; }
+        return TY_WORD;
+    }
+    return block[k];
 }
 
 // Query a parameter's inferred type for a given function index.
@@ -1313,6 +1341,8 @@ infer_module(mi) {
         _new_m.vt_count  = 0;
         _new_m.ret_type  = 0;
         _new_m.par_block = 0;
+        _new_m.ret_count = 1;
+        _new_m.ret_block = 0;
     }
 
     // Infer types for this module's functions only.
@@ -1382,6 +1412,8 @@ run_types() {
         _pre_m.vt_count  = 0;
         _pre_m.ret_type  = 0;
         _pre_m.par_block = 0;
+        _pre_m.ret_count = 1;
+        _pre_m.ret_block = 0;
     }
 
     // Fixed-point loop: infer → propagate → re-infer until stable.
