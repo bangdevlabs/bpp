@@ -13374,6 +13374,30 @@ the rest of the day to run down:
   integer-loop control was hidden by FP latency and the fmov shuttle by
   store-forwarding.** Vectorising a bandwidth-bound kernel buys nothing.
 
+- **Multi-return did NOT regress it (the question that started this).** The
+  worry was that opening multi-value return + the IO improvements slowed the
+  autovec — the 16x→6x drop looked causal. It is not: every arc commit
+  (`c099438` F.2.c, `258dc82`/`f503051` multi-return, `f04e846` fmadd,
+  `c54a19b` float-binop freelist) was grepped against the vector-emit path —
+  **zero hits**. `c54a19b`'s freelist is scoped to scalar `T_BINOP` float left
+  operands; the autovec's `vec_load4`/`vec_mul4`/`vec_store4` are builtins on
+  a separate dispatch path the arc never touched. The synth's vector loop is
+  byte-identical before and after the arc. Stable best-of-5 today: COMPOSE
+  ~19ms, 5–6x — matching the 2026-05-22 arc-close number, so it *came back* to
+  its true value; the 05-25 panorama 16x was the outlier.
+
+- **The real 6x ceiling is the un-optimised synth, and it predates the arc.**
+  Now that `bug --disasm` reads the whole vector loop, the cost is visible:
+  per 4-element iteration the synth does ~3× the essential memory traffic — it
+  `str q0,[sp,#-0x10]!` / `ldr q1,[sp],#0x10` **spills the loaded vector to the
+  stack and reloads it** (the value-stack machine's "FP always fpush", no SIMD
+  register reuse), **recomputes the loop-invariant `dup v0.4s,w0` dt-splat
+  every iteration** (no LICM), and shuffles addresses through redundant
+  `mov/add #0`. This is the register-allocation frontier, not a regression.
+  The lever to actually exceed 6x is to extend `c54a19b`'s SIMD-freelist trick
+  from scalar `T_BINOP` to the `vec_*` builtins + hoist the invariant splat —
+  a *forward* optimisation. (Flagged, not done.)
+
 - **There was never an autovec regression — the disassembler was lying.**
   To get a detector the bandwidth bound could not blind, a static gate
   (`tests/bench_autovec_gate.sh`) was built to read the EMITTED CODE of the
