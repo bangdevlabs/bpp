@@ -1,0 +1,119 @@
+// bench_autovec_compute.bpp — a COMPUTE-bound autovec gate.
+//
+// Why this exists: `bench_compose.bpp` is memory-BANDWIDTH-bound (N=1M cells,
+// ~800MB of traffic per the K rounds), so the 4-wide SIMD the autovec emits is
+// hidden behind the memory wall — the runtime is ~6x with or WITHOUT the
+// vectorisation firing. That made it blind to an autovec regression that went
+// unnoticed for weeks (the matcher matched but the outlined synth body emitted
+// scalar `ldr s / fmul / str s`).
+//
+// This benchmark keeps the data small enough to stay cache-resident and does
+// many rounds, so the per-element multiply dominates and the SIMD shows. It
+// runs three forms of the SAME indexed half-float store so the two orthogonal
+// optimisations are separable:
+//
+//   SERIAL   — descending loop: defeats both outlining and autovec (baseline).
+//   PARALLEL — ascending @safe `c.v = c.v * c.v`: the autovec matcher rejects
+//              it (the second factor is the loaded value, not a loop-invariant),
+//              so it OUTLINES but does NOT vectorise. Isolates the parallel win.
+//   COMPOSE  — ascending @safe `c.v = c.v * dt`: matches P1 (field OP invariant)
+//              AND outlines. PARALLEL→COMPOSE ratio is the SIMD contribution.
+//
+// The runtime is the measurement; the deterministic regression gate is the
+// disassembly of `__synth_0` (tests/bench_autovec_gate.sh) — when the autovec
+// is healthy the COMPOSE synth body contains 4-wide `.4s` ops, when it
+// regresses it falls back to scalar `s`-register code.
+
+import "bpp_beat.bsm";
+import "bpp_io.bsm";
+import "bpp_job.bsm";
+
+struct Cell { v: half float }
+
+const N = 32768;          // 32768 * 4B = 128KB — stays in L2, NOT bandwidth-bound
+const K = 6000;           // many rounds → the multiply dominates
+const NUM_WORKERS = 8;
+
+auto cells;
+
+// SERIAL — descending defeats both gates.
+static void serial_once(dt: half float) {
+    auto i;
+    for (i = N - 1; i >= 0; i--) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * dt;
+    }
+}
+
+// PARALLEL-only — outlines, but `c.v * c.v` defeats the autovec matcher
+// (second operand is not loop-invariant), so the synth body stays scalar.
+static void parallel_once() @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * c.v;
+    }
+}
+
+// COMPOSE — outlines AND vectorises (`c.v * dt`, dt a caller-frame capture).
+static void compose_once(dt: half float) @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * dt;
+    }
+}
+
+static void reseed() {
+    auto i;
+    auto one: half float;
+    one = 1.0;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = one;
+    }
+}
+
+static void print_timing(label: ptr, us) {
+    put(label);
+    put(us / 1000);
+    putchar('.');
+    auto frac;
+    frac = us % 1000;
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    put(frac);
+    putmsg(" ms");
+}
+
+main() {
+    auto t0, t_serial, t_parallel, t_compose, dt: half float, k;
+    dt = 0.999;
+    cells = malloc(N * 4);
+
+    reseed();
+    t0 = beat_now_us();
+    for (k = 0; k < K; k++) { serial_once(dt); }
+    t_serial = beat_now_us() - t0;
+    print_timing("SERIAL    ", t_serial);
+
+    reseed();
+    t0 = beat_now_us();
+    for (k = 0; k < K; k++) { parallel_once(); }
+    t_parallel = beat_now_us() - t0;
+    print_timing("PARALLEL  ", t_parallel);
+
+    reseed();
+    t0 = beat_now_us();
+    for (k = 0; k < K; k++) { compose_once(dt); }
+    t_compose = beat_now_us() - t0;
+    print_timing("COMPOSE   ", t_compose);
+
+    putstr("\n--- ratios (integer) ---\n");
+    if (t_compose > 0)  { putstr("SERIAL/COMPOSE     "); put(t_serial / t_compose);   putstr("x\n"); }
+    if (t_compose > 0)  { putstr("PARALLEL/COMPOSE   "); put(t_parallel / t_compose); putstr("x  (the SIMD slice; ~1 when autovec is broken)\n"); }
+}
