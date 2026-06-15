@@ -195,6 +195,9 @@ static auto _bx_buf;
 static auto _bx_fnoff;
 static auto _bx_filepos;
 static auto _bx_fnlen;     // bytes from this function's entry to the next (0 = unknown)
+static auto _bx_code_end;  // file offset where the code section ends — bounds the
+                           // LAST function in the map, which has no next entry to
+                           // measure against (else it truncates to a tiny window).
 
 // Open `bin_path`, read it, parse its ELF program headers to find the code
 // section's file offset, load `<bin_path>.bug`, and locate `fn_name` in the
@@ -224,11 +227,14 @@ static _bx_locate(bin_path, fn_name) {
     // address map stores each function code-relative to that point, so a
     // function at address-map offset N sits at file offset code_base + N.
     code_base = 0 - 1;
+    _bx_code_end = 0;
     magic0 = peek(_bx_buf) & 0xFF;
 
     if (magic0 == 0x7F) {
         // ELF: layout is [ELF header][program headers][PT_NOTE][code], and the
-        // exec PT_LOAD has p_offset 0 — so code starts where PT_NOTE ends.
+        // exec PT_LOAD has p_offset 0 — so code starts where PT_NOTE ends. That
+        // same PT_LOAD's p_filesz reaches to the end of the code, which bounds
+        // the last function in the map.
         phoff     = read_u32(_bx_buf, 0x20);    // e_phoff
         phentsize = read_u16(_bx_buf, 0x36);
         phnum     = read_u16(_bx_buf, 0x38);
@@ -239,6 +245,9 @@ static _bx_locate(bin_path, fn_name) {
             if (ptype == 4) {                          // PT_NOTE
                 note_off = read_u32(_bx_buf, ph + 8);     // p_offset
                 note_fsz = read_u32(_bx_buf, ph + 32);    // p_filesz
+            }
+            if (ptype == 1 && read_u32(_bx_buf, ph + 8) == 0) {   // PT_LOAD @ file 0
+                _bx_code_end = read_u32(_bx_buf, ph + 32);        // p_filesz
             }
         }
         code_base = note_off + note_fsz;
@@ -260,7 +269,10 @@ static _bx_locate(bin_path, fn_name) {
                 sec = lc + 72;
                 for (s = 0; s < nsects; s++) {
                     if (_field_eq(_bx_buf, sec, "__text")) {
-                        code_base = read_u32(_bx_buf, sec + 48);
+                        code_base = read_u32(_bx_buf, sec + 48);    // section file offset
+                        // __text size is the u64 at +40; the code (and thus the
+                        // last function) ends at offset + size.
+                        _bx_code_end = code_base + read_u32(_bx_buf, sec + 40);
                     }
                     sec = sec + 80;
                 }
@@ -316,7 +328,14 @@ static _bx_locate(bin_path, fn_name) {
         if (cur > _bx_fnoff && (best < 0 || cur < best)) { best = cur; }
     }
     _bx_fnlen = 0;
-    if (best > _bx_fnoff) { _bx_fnlen = best - _bx_fnoff; }
+    if (best > _bx_fnoff) {
+        _bx_fnlen = best - _bx_fnoff;
+    } else if (_bx_code_end > _bx_filepos) {
+        // No later entry — this is the LAST function in the map (often the
+        // autovec `__synth_N`, emitted after main). Measure to the end of the
+        // code section instead of falling back to a tiny fixed window.
+        _bx_fnlen = _bx_code_end - _bx_filepos;
+    }
     return 0;
 }
 
