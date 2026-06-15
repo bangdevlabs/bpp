@@ -13475,3 +13475,65 @@ debugging when the debugger falls short is the wrong one here — the durable
 move is to grow the debugger, and it paid for itself within the same session
 four times over. Suite 188/0/12 green throughout; `bug` changes are
 debugger-only (no compiler bytes touched, bootstrap identity unaffected).
+
+### 2026-06-15 (cont) — the dispatch cost-model + a benchmark roundup
+
+Pulling the autovec thread one turn further uncovered a real win and two
+genuine bugs, and ended with a consolidated benchmark snapshot.
+
+**The E232 regression (`c0ddef3`).** `fps_wolf3d` had stopped compiling:
+`auto moving = (p.vx != 0.0) || (p.vy != 0.0)` was rejected by E232 ("storing
+a float into an untyped local"). The bug was in the TYPER: `T_BINOP` ran
+`promote(lt, rt)` for EVERY operator, so a float comparison was typed FLOAT —
+but a comparison result is a boolean (0/1), always int. Latent for as long as
+the codegen has emitted `cmp`+`cset` (which always produced an int); surfaced
+only once the type-hardening (E232) plus sharper float inference both landed.
+Fix: comparison / relational / equality operators now return `TY_WORD`. Since
+`&&` / `||` lower to a ternary over these comparisons, it fixed the logical
+operators too. This had *hidden a real consumer* — see below.
+
+**The sweep correction.** With fps building again, a full compile-sweep of
+every game / example / stb (reading EMITTED CODE, not just counting synths)
+corrected an earlier claim: outline+autovec is NOT dormant. `fps_wolf3d` IS a
+real consumer (`wolf_ai_tick_cooldowns @safe`, vectorised synth) — it had been
+invisible only because the E232 bug broke its build. The other games dispatch
+workers EXPLICITLY (`ecs_query_each_parallel` → `job_parallel_for_data`, the
+ALIVE path the profiler shows). Parallelism ≠ auto-parallelisation; counting
+synths measured only the latter.
+
+**The dispatch cost-model (`ca44fe5`).** A calibration harness measured the
+auto-outline dispatch: one `job_parallel_for_data` call costs a FLAT ~130µs (8
+worker submits + barrier) regardless of N, while the serial path runs the
+synth — itself vectorised — in place. The cross-over is near **500K elements**;
+below it the auto-outline is a PESSIMISATION. fps's cooldown loop is N=32
+per-frame → pure waste. Fix: the auto-outliner's capture path emits a guarded
+`_outline_dispatch` (serial if `n < 524288`, else fan out); the EXPLICIT
+`job_parallel_for_data` that stbecs/user code calls stays unguarded (it may
+carry arbitrarily heavy bodies). A long detour chasing "fps routes through the
+standard-MAP path" turned out to be a **stale installed prelude**:
+`/usr/local/lib/bpp/bpp_job.bsm` predated `_outline_dispatch`, and games
+compiled from their own subdir resolve the prelude from the global install
+(relative `src/` is tried first, but doesn't exist under `games/fps/`). Built
+against the repo prelude, fps routes through `_outline_dispatch` correctly —
+the guard covers it. Lesson re-learned: confirm the prelude SOURCE in the
+`.bug` dump; dev edits to `src/` don't reach subdir builds until reinstall.
+
+**Benchmark roundup (after reinstalling the prelude):**
+
+| benchmark | prior journal | now | note |
+|---|---|---|---|
+| compile bootstrap | 0.24s | **0.25s** | stable (Rule 37 anchor) |
+| autovec static gate | — | **PASS (8 vec ops)** | SIMD healthy |
+| bench_compose N=1M (bandwidth) | 6x | **5–6x** (~20ms COMPOSE) | unchanged — large N still fans out |
+| **bench_compose N=32K (cache-resident)** | **800ms = 3.6× SLOWER** | **63ms = 3.3× faster** | 🎯 **~13× swing — the guard** |
+| tablah / tablah_opt | 44 / 38ms | ~50 / ~45ms | stable (int/memory-bound, untouched) |
+
+The headline: the cost-model turns the auto-outline from a **3.6× slowdown**
+into a **3.3× speedup** for cache-resident loops — the regime EVERY real game
+loop lives in (entities, tiles, particles, audio buffers). Large
+bandwidth-bound data (N≥512K) still fans out to workers unchanged. The autovec
+SIMD itself was always correct; what was broken was *when to also parallelise*.
+Open follow-ups (parked): guard the standard-MAP + reduction dispatch paths
+for completeness; hoist the loop-invariant `dup v0.4s` splat the synth still
+recomputes per iteration (~15% on the in-place path). gen2==gen3 byte-stable;
+native 188/0/12, C-emit 152/0/48 throughout.
