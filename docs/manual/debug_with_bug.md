@@ -209,9 +209,11 @@ all line up with the map. (They are not absolute VM addresses; that keeps
 them stable across PIE load slides.)
 
 `--disasm` disassembles the **whole function** (its length is the gap to
-the next address-map entry) and interleaves the source line above the
-instructions it covers (`; file:line`, from the v6 line table) —
-objdump-`-l` style, entirely static.
+the next address-map entry; the *last* function in the map — typically the
+autovec `__synth_N`, emitted after `main` — is bounded by the code-section
+end instead, so it is no longer truncated to a fixed window) and interleaves
+the source line above the instructions it covers (`; file:line`, from the v6
+line table) — objdump-`-l` style, entirely static.
 
 **Coverage and the `.byte` / `.word` escape hatch.** Each decoder knows
 the SUBSET its backend emits, which is enough to read codegen and spot

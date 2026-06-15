@@ -13420,12 +13420,34 @@ bug"* — find the solution, not the culprit):
    against `otool` instruction-for-instruction; zero `.word` left in the synth.
    The gate now reads **PASS (6 vector ops — 4-wide SIMD fired)**.
 
+4. **`--disasm` covers the LAST function in the map** (`bug.bpp`). Closing
+   the loop on bench_compose surfaced a fourth gap: the function length was
+   the gap to the next address-map entry, so the *last* function fell back to
+   a 192-byte window and truncated. That last function is the autovec
+   `__synth_N` (emitted after `main`) — so the very function the gate inspects
+   was cut off mid-body, showing the vector loop but hiding the scalar tail.
+   Now bounded by the code-section end (Mach-O `__text` offset+size; ELF exec
+   `PT_LOAD` p_filesz).
+
+**Full closure on bench_compose.** With all four fixes, `__synth_0`
+disassembles whole (112 instructions): vector loop (`ldr q0` / `dup v0.4s,w0`
+/ `fmul v0.4s,v1.4s,v0.4s` / `str q0`, 4 cells/iter) → scalar tail at the
+`i < end` remainder (`fcvt` widen / `fmul d` / `fcvt` narrow / `str s`) →
+`ret`. The textbook Rule 39 `[vector loop | scalar tail]` shape, in full.
+Runtime confirms correctness: SERIAL 119ms → COMPOSE 20ms = **6x**, the
+bandwidth ceiling — the autovec is whole, correct, and was never the
+problem. Note `half float` is **32-bit single** (`quarter float` is the
+16-bit one), so the `Cell { v: half float }` array is contiguous f32 at
+stride 4 — `ldr q` (4×f32) maps to four cells exactly, no widen/narrow in
+the hot path (the scalar tail's `fcvt` is just the b++ scalar-FP-in-double
+convention, absent from the vector path).
+
 **Lessons.** (a) A gate is only as honest as the tool it reads through —
 when a disassembly-based check disagrees with expectation, cross-check
 `otool`/`objdump` before believing the regression. (b) "Measure, don't
 believe" cuts both ways: the same rigor that killed three false *wins* this
 maratona also killed a false *loss*. (c) The instinct to reach for `print`
 debugging when the debugger falls short is the wrong one here — the durable
-move is to grow the debugger, and it paid for itself within the same session.
-Suite 188/0/12 green throughout; `bug` changes are debugger-only (no compiler
-bytes touched, bootstrap identity unaffected).
+move is to grow the debugger, and it paid for itself within the same session
+four times over. Suite 188/0/12 green throughout; `bug` changes are
+debugger-only (no compiler bytes touched, bootstrap identity unaffected).
