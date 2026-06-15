@@ -13537,3 +13537,52 @@ Open follow-ups (parked): guard the standard-MAP + reduction dispatch paths
 for completeness; hoist the loop-invariant `dup v0.4s` splat the synth still
 recomputes per iteration (~15% on the in-place path). gen2==gen3 byte-stable;
 native 188/0/12, C-emit 152/0/48 throughout.
+
+### 2026-06-15 (cont) — the autovec was silently WRONG (two correctness bugs)
+
+Chasing the LICM follow-up, then verifying fps, uncovered that the
+outline+autovec COMPOSE path — the thing measured, profiled, and "fixed" all
+day — **produced incorrect results** for any realistic input. `bench_compose`
+masked it perfectly because it used `dt = 1.0` and a `Cell` of exactly 4
+bytes, and only ever measured *time*, never *values*. Plan was 2-1-3: harden
+the benchmark, fix the bug, verify fps.
+
+**Hardening first (`5a699d4`).** Added a value check to `bench_compose`
+(`CORRECTNESS: PASS/FAIL`, compose == scalar on a non-trivial factor) and a
+suite gate `tests/test_autovec_compose.bpp`. The moment it multiplied by
+anything other than 1.0 and *looked at the result*, COMPOSE read **FAIL** —
+all zeros.
+
+**Bug #1 — captured float published as int (`5a834ae`).** The outline capture
+struct typed EVERY field `TY_WORD`. So a captured float invariant (`dt`) was
+published with `fcvtzs` (float -> int) and the synth splatted that integer's
+bits as an f32 — a near-zero denormal. The whole loop became multiply-by-~0.
+(And `1.0` -> int 1 -> denormal ~0 too: that is *why* `dt=1.0` never tripped
+it.) Fix: record each capture's inferred type at collection, type the struct
+field by it, and carry that type on the publish STORE hint and the synth READ
+hint (new `get_field_type` in bpp_parser) so a float survives the boundary.
+`2.0 * 3.0 = 6.0` now (was `0.0`). The LICM landed on top — correct only
+because the capture now reaches the synth as a real float.
+
+**Bug #2 — strided AoS fields corrupt (`691ae06`).** Verifying fps's cooldown
+loop (`e.cooldown = e.cooldown - dt`) surfaced a second, independent bug:
+`vec_load4` reads 4 CONTIGUOUS elements, but the matcher never checked the
+stride. `WolfEntPayload` is ~40 bytes with `cooldown` 16 bytes apart, so the
+SIMD pulled the neighbouring fields into lanes 1..3 (lane 0 right, the rest
+garbage) and the strided store corrupted adjacent fields. Only
+`bench_compose`'s 4-byte `Cell` (stride == element width) ever hit the
+contiguous happy path. Fix: extract the loop variable's byte stride from the
+`c = base + i*K` pre-amble (handling the parser's strength-reduced `i << K`)
+and reject when it isn't the element width — the loop stays scalar, correct,
+per Rule 39 (strided needs gather/scatter the vectoriser does not do). fps's
+cooldown synth is scalar again.
+
+**The honest correction.** Every autovec/compose number this maratona — the
+6x, the cache-resident "13x swing", the dispatch-guard win — was measured on a
+**degenerate computation** (multiply-by-~0 over a 4-byte struct). The *timing*
+was real memory-throughput, but the *math* was wrong, and a strided real-world
+struct would have corrupted memory. The autovec is now **correct** (contiguous
+arrays) and **honest** (rejects what it can't vectorise), and the benchmark can
+no longer hide a wrong result behind `dt=1.0`. Lesson, again: a benchmark that
+checks only time is not a correctness test — make it look at the values, or it
+will lie for years. gen2==gen3 byte-stable; native 189/0/12, C-emit 153/0/48.
