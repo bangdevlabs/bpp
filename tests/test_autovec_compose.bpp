@@ -1,0 +1,71 @@
+// test_autovec_compose.bpp — Correctness gate for the outline + autovec
+// COMPOSE path.
+//
+// The captured loop-invariant factor (`dt`) must reach the vectorised
+// synth AS A FLOAT. A latent bug typed the outline capture-struct field
+// as an integer, so the host published `dt` via `fcvtzs` (float -> int)
+// and the synth splatted that integer's bit pattern as an f32 — a
+// denormal near zero. `bench_compose` masked this for a long time by
+// using `dt = 1.0`: published as int 1, splatted to ~0, so the whole
+// loop silently became multiply-by-zero while the TIMING looked perfect.
+//
+// This test multiplies by a non-trivial factor and checks the VALUES, so
+// the timing can never again hide a wrong computation. Exits 0 when the
+// autovec COMPOSE matches the scalar result, 1 otherwise.
+
+import "bpp_io.bsm";
+import "bpp_job.bsm";
+
+struct Cell { v: half float }
+const N = 1024;
+global cells;
+
+// COMPOSE: @safe + caller-frame `dt` capture + single half-float store —
+// matches both outlining and the autovectoriser.
+static void compose(dt: half float) @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = c.v * dt;
+    }
+}
+
+static void seed(v: half float) {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        c.v = v;
+    }
+}
+
+// 1 when every cell equals `expected` within tolerance, 0 otherwise.
+static all_eq(expected: half float) {
+    auto i, lo: half float, hi: half float;
+    lo = expected - 0.01;
+    hi = expected + 0.01;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        if (c.v < lo || c.v > hi) { return 0; }
+    }
+    return 1;
+}
+
+main() {
+    cells = malloc(N * 4);
+    job_init(4);
+
+    seed(2.0);
+    compose(3.0);               // 2.0 * 3.0 = 6.0 in every cell
+
+    if (all_eq(6.0) == 0) {
+        putmsg("FAIL: autovec compose produced wrong values (captured-float invariant)");
+        job_shutdown();
+        return 1;
+    }
+    putmsg("OK: autovec compose correct (2.0 * 3.0 = 6.0)");
+    job_shutdown();
+    return 0;
+}

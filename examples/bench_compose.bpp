@@ -85,6 +85,23 @@ static void reseed() {
     }
 }
 
+// Returns 1 when every cell holds `expected` (within a small tolerance),
+// 0 on the first mismatch. This is the value check the timed loops cannot
+// do — and the one that would have caught, years earlier, the captured-
+// float-invariant bug that made COMPOSE multiply by ~0 while the timing
+// looked perfect (1.0 was published as int 1 and splatted to a denormal).
+static _check_all(expected: half float) {
+    auto i, lo: half float, hi: half float;
+    lo = expected - 0.01;
+    hi = expected + 0.01;
+    for (i = 0; i < N; i++) {
+        auto c: Cell;
+        c = cells + i * 4;
+        if (c.v < lo || c.v > hi) { return 0; }
+    }
+    return 1;
+}
+
 main() {
     auto t0, t_serial, t_compose;
     auto dt: half float;
@@ -114,6 +131,27 @@ main() {
         put("COMPOSE speedup vs SERIAL: ");
         put(t_serial / t_compose);
         putmsg("x");
+    }
+
+    // ── Correctness gate ──────────────────────────────────────────────
+    // The timed loops use dt = 1.0, which a captured-float-invariant bug
+    // rendered indistinguishable from multiply-by-zero. Verify the autovec
+    // COMPOSE matches the scalar SERIAL on a NON-trivial factor so no
+    // correctness regression can ever again hide behind a no-op dt.
+    auto ok_serial, ok_compose;
+    reseed();
+    serial_once(2.0);                 // scalar:  1.0 * 2.0 = 2.0
+    ok_serial = _check_all(2.0);
+    reseed();
+    compose_once(2.0);                // autovec: 1.0 * 2.0 = 2.0
+    ok_compose = _check_all(2.0);
+    putmsg("");
+    if (ok_serial == 0) {
+        putmsg("CORRECTNESS: FAIL — scalar SERIAL itself is wrong");
+    } else if (ok_compose == 0) {
+        putmsg("CORRECTNESS: FAIL — autovec COMPOSE produced wrong values");
+    } else {
+        putmsg("CORRECTNESS: PASS — compose == scalar (1.0 * 2.0 = 2.0)");
     }
 
     free(cells);
