@@ -380,10 +380,28 @@ static _arnsp(r, sf) {
 
 // Scalar FP register name: ty 1 -> dN (double), 3 -> hN (half), else sN.
 static _frn(r, ty) {
-    if (ty == 1)      { out_ch('d'); }
-    else if (ty == 3) { out_ch('h'); }
-    else              { out_ch('s'); }
+    if (ty == 1)      { out_ch('d'); }   // 64-bit double
+    else if (ty == 3) { out_ch('h'); }   // 16-bit half
+    else if (ty == 4) { out_ch('q'); }   // 128-bit vector
+    else if (ty == 5) { out_ch('b'); }   // 8-bit byte
+    else              { out_ch('s'); }   // 32-bit single
     out_int(r);
+    return 0;
+}
+
+// Print a NEON vector register with its arrangement, e.g. `v3.4s`. `esz` is
+// the element size (0 = b, 1 = h, 2 = s, 3 = d) and `Q` selects the 64-bit
+// (half) or 128-bit (full) form, so the lane count is the bytes that fit:
+// 8 << Q total bytes divided by the element width.
+static _vrn(r, Q, esz) {
+    auto lanes, letter;
+    out_ch('v'); out_int(r); out_ch('.');
+    if (esz == 0)      { letter = 'b'; lanes = 8; }
+    else if (esz == 1) { letter = 'h'; lanes = 4; }
+    else if (esz == 2) { letter = 's'; lanes = 2; }
+    else               { letter = 'd'; lanes = 1; }
+    if (Q != 0) { lanes = lanes * 2; }
+    out_int(lanes); out_ch(letter);
     return 0;
 }
 
@@ -444,9 +462,16 @@ static _amem(Rn, imm, mode) {
 // size/V/opc. Shared by the immediate-offset and register-offset forms.
 static _ld_head(sz, V, opc, Rt) {
     auto rw;
-    if (V != 0) {                                  // FP/SIMD: sz 3 -> d, 2 -> s
+    if (V != 0) {
+        // FP/SIMD transfer width is (opc<1> << 2) | sz: opc bit 1 set means
+        // the 128-bit q register (the autovectoriser's `ldr q` / `str q`),
+        // otherwise sz picks b / h / s / d.
         if ((opc & 1) != 0) { out_str("ldr  "); } else { out_str("str  "); }
-        if (sz == 3) { _frn(Rt, 1); } else { _frn(Rt, 0); }
+        if ((opc & 2) != 0)      { _frn(Rt, 4); }   // 128-bit -> q
+        else if (sz == 0)        { _frn(Rt, 5); }   // 8-bit   -> b
+        else if (sz == 1)        { _frn(Rt, 3); }   // 16-bit  -> h
+        else if (sz == 2)        { _frn(Rt, 0); }   // 32-bit  -> s
+        else                     { _frn(Rt, 1); }   // 64-bit  -> d
         return 0;
     }
     rw = 0;
@@ -749,10 +774,16 @@ static _dis1_arm64(buf, fp, show_off) {
     // load / store register, unsigned immediate offset
     //   (size 111 V 01 opc imm12 Rn Rt)
     if (((insn >> 27) & 7) == 7 && ((insn >> 24) & 3) == 1) {
+        auto eff_sz;
         sz  = (insn >> 30) & 3;
         V   = (insn >> 26) & 1;
         opc = (insn >> 22) & 3;
-        imm = ((insn >> 10) & 0xfff) << sz;     // scaled by access size
+        // The unsigned offset scales by the access size. For a 128-bit q
+        // transfer (V set, opc bit 1 set) that is 16 bytes (1 << 4), which
+        // the size field alone (sz == 00) does not express.
+        eff_sz = sz;
+        if (V != 0 && (opc & 2) != 0) { eff_sz = 4; }
+        imm = ((insn >> 10) & 0xfff) << eff_sz;  // scaled by access size
         Rn  = (insn >> 5) & 0x1f;
         Rd  = insn & 0x1f;
         _ld_emit(sz, V, opc, Rd, Rn, imm, 0);
@@ -877,6 +908,82 @@ static _dis1_arm64(buf, fp, show_off) {
         }
         out_str(".word "); _dh(insn); out_nl();
         return 4;
+    }
+
+    // Scalar floating-point three-source: fmadd / fmsub / fnmadd / fnmsub —
+    // the fused multiply-add the filter-tap codegen emits. bits[30:24] is
+    // 0011111; `type` (bits[23:22]) picks s/d/h, o1 (bit21) and o0 (bit15)
+    // select the variant.
+    if (((insn >> 24) & 0x7f) == 0x1f) {
+        auto o1, o0;
+        ty = (insn >> 22) & 3;
+        o1 = (insn >> 21) & 1;
+        o0 = (insn >> 15) & 1;
+        Rm = (insn >> 16) & 0x1f;
+        Ra = (insn >> 10) & 0x1f;
+        Rn = (insn >> 5) & 0x1f;
+        Rd = insn & 0x1f;
+        if (o1 == 0 && o0 == 0)      { out_str("fmadd "); }
+        else if (o1 == 0 && o0 == 1) { out_str("fmsub "); }
+        else if (o1 == 1 && o0 == 0) { out_str("fnmadd "); }
+        else                         { out_str("fnmsub "); }
+        _frn(Rd, ty); out_str(", "); _frn(Rn, ty); out_str(", ");
+        _frn(Rm, ty); out_str(", "); _frn(Ra, ty); out_nl();
+        return 4;
+    }
+
+    // Advanced SIMD (NEON): the vector ops the autovectoriser and the fmadd
+    // lowering emit — DUP from a general register (vec_splat4) and the
+    // floating-point three-same arithmetic (vec_mul4 / vec_add4 / fmla, ...).
+    // Identified by bits[28:24] == 01110 with bit31 clear. Unmatched encodings
+    // still fall through to the raw `.word` below, so the stream stays aligned.
+    if (((insn >> 24) & 0x1f) == 0x0e && ((insn >> 31) & 1) == 0) {
+        auto Q, U, op23, esz, opcode;
+        Q = (insn >> 30) & 1;
+        U = (insn >> 29) & 1;
+        // DUP (general): bits[28:21] == 01110000, bits[15:10] == 000011.
+        // The element size is the position of the lowest set bit of imm5, and
+        // the source is a W register except for a 64-bit (D) element (X).
+        if (((insn >> 21) & 0xff) == 0x70 && ((insn >> 10) & 0x3f) == 0x03) {
+            auto imm5, gpw;
+            imm5 = (insn >> 16) & 0x1f;
+            Rn   = (insn >> 5) & 0x1f;
+            Rd   = insn & 0x1f;
+            if ((imm5 & 1) != 0)      { esz = 0; }
+            else if ((imm5 & 2) != 0) { esz = 1; }
+            else if ((imm5 & 4) != 0) { esz = 2; }
+            else                      { esz = 3; }
+            out_str("dup  "); _vrn(Rd, Q, esz); out_str(", ");
+            gpw = 0; if (esz == 3) { gpw = 1; }
+            _arn(Rn, gpw); out_nl();
+            return 4;
+        }
+        // FP three-same: bit21 == 1, bit10 == 1. opcode is bits[15:11], bit23
+        // distinguishes the add/sub-style pairs, bit22 picks .s vs .d lanes.
+        if (((insn >> 21) & 1) == 1 && ((insn >> 10) & 1) == 1) {
+            auto matched;
+            op23   = (insn >> 23) & 1;
+            esz    = 2 + ((insn >> 22) & 1);   // 2 -> s lanes, 3 -> d lanes
+            opcode = (insn >> 11) & 0x1f;
+            Rm     = (insn >> 16) & 0x1f;
+            Rn     = (insn >> 5) & 0x1f;
+            Rd     = insn & 0x1f;
+            matched = 1;
+            if (U == 0 && op23 == 0 && opcode == 0x1a)      { out_str("fadd "); }
+            else if (U == 0 && op23 == 1 && opcode == 0x1a) { out_str("fsub "); }
+            else if (U == 1 && op23 == 0 && opcode == 0x1b) { out_str("fmul "); }
+            else if (U == 1 && op23 == 0 && opcode == 0x1f) { out_str("fdiv "); }
+            else if (U == 0 && op23 == 0 && opcode == 0x19) { out_str("fmla "); }
+            else if (U == 0 && op23 == 1 && opcode == 0x19) { out_str("fmls "); }
+            else if (U == 0 && op23 == 0 && opcode == 0x1e) { out_str("fmax "); }
+            else if (U == 0 && op23 == 1 && opcode == 0x1e) { out_str("fmin "); }
+            else { matched = 0; }
+            if (matched != 0) {
+                _vrn(Rd, Q, esz); out_str(", "); _vrn(Rn, Q, esz);
+                out_str(", "); _vrn(Rm, Q, esz); out_nl();
+                return 4;
+            }
+        }
     }
 
     // Unknown — print the raw word; the 4-byte stride keeps the stream aligned.

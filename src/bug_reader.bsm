@@ -292,16 +292,42 @@ void init_reader() {
 // -- File loading ---------------------------------------------
 
 // Load a .bug file from disk. Returns bytes read or -1 on error.
+//
+// The buffer is sized to the actual file: the compiler's own map is
+// ~550KB, far past the original 256KB cap that silently truncated the
+// tail sections (line table, module names) and left `file:line`
+// breakpoints unresolvable. The string buffer is grown to the same
+// size because every name the parser copies into it comes from the
+// file, so the file size is a safe upper bound for both. A 256KB
+// floor keeps small maps on the original single-read fast path.
 bug_load(path) {
-    auto fd, nread;
+    auto fd, fsize, cap, total, nread;
     fd = sys_open(path, 0);
     if (fd < 0) { return -1; }
-    nread = sys_read(fd, _br_buf, 262144);
+    // Discover the exact size via lseek-to-end, then rewind.
+    fsize = sys_lseek(fd, 0, 2);
+    sys_lseek(fd, 0, 0);
+    if (fsize <= 0) { sys_close(fd); return -1; }
+    cap = fsize;
+    if (cap < 262144) { cap = 262144; }
+    if (_br_buf != 0)    { free(_br_buf); }
+    _br_buf = malloc(cap);
+    if (_br_strbuf != 0) { free(_br_strbuf); }
+    _br_strbuf = malloc(cap);
+    _br_strbuf_pos = 0;
+    // sys_read can return short on a large file, so read until the
+    // whole map is in memory or the stream ends.
+    total = 0;
+    nread = 1;
+    while (total < fsize && nread > 0) {
+        nread = sys_read(fd, _br_buf + total, fsize - total);
+        if (nread > 0) { total = total + nread; }
+    }
     sys_close(fd);
-    if (nread <= 0) { return -1; }
+    if (total <= 0) { return -1; }
     _br_pos = 0;
-    _br_size = nread;
-    return nread;
+    _br_size = total;
+    return total;
 }
 
 // -- Parsing --------------------------------------------------
