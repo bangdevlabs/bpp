@@ -461,6 +461,38 @@ void job_parallel_for_data(n, fn, data) {
     job_wait_all();
 }
 
+// Trip-count floor below which auto-outlined loops run SERIALLY instead of
+// dispatching workers. Measured: one `job_parallel_for_data` dispatch costs a
+// FLAT ~130µs (8 worker submits + the wait barrier), regardless of N — while
+// the serial path runs the synth body, which is itself vectorised, in place.
+// A sweep of the canonical `arr[i] = arr[i] OP k` body found the cross-over
+// near half a million elements: below it the in-place vector loop wins (by up
+// to 19000x at N=32, the Wolf3D cooldown loop), above it the worker fan-out
+// finally pays for the barrier. Real game loops (entities, tiles, particles)
+// sit far below this, so the default is now "vectorise in place, do not
+// dispatch" until the data is genuinely large. Tunable as workloads change.
+const _OUTLINE_MIN_N = 524288;
+
+// Dispatch entry used ONLY by the compiler's auto-outliner (the synth call it
+// emits routes here, NOT through the explicit `job_parallel_for` / `_data`
+// that user code and stbecs call). That separation is deliberate: the
+// auto-outliner only ever produces cheap, bounded loop bodies (the autovec /
+// MAP shapes), so the trip-count floor below is safe for them — whereas an
+// explicit `job_parallel_for_data` may carry an arbitrarily heavy worker the
+// programmer chose to parallelise, and must never be second-guessed.
+void _outline_dispatch(n, fn, data) {
+    if (n < _OUTLINE_MIN_N) {
+        // Publish the capture pointer exactly as the dispatch path does, then
+        // run the synth once over the whole range on this thread. The synth's
+        // body is already a 4-wide vector loop + scalar tail, so this is
+        // in-place SIMD with zero worker-dispatch overhead.
+        _outline_cap_ptr = data;
+        call(fn, 0, n);
+        return;
+    }
+    job_parallel_for_data(n, fn, data);
+}
+
 // ── Reduction support (multicore Sprint 2b) ──────────────────
 //
 // Parallel reduction works in two halves:
