@@ -2297,6 +2297,11 @@ static auto _fdc_write_set;
 // struct type is synthesised — that's when we have the variable's
 // declared type readily available via the parser's vt_block.
 static auto _fdc_captures;
+// Parallel to _fdc_captures: each capture's inferred type (`n.itype` at the
+// reference site). The capture struct fields are typed from this so a FLOAT
+// invariant (e.g. `dt`) is stored/read as float bits — not int-converted on
+// publish, which silently turned the autovec multiply into multiply-by-zero.
+static auto _fdc_capture_types;
 
 // ── Autovec P2 (2026-05-22) ──────────────────────────────────
 // Per-candidate scoreboard for the autovectorization
@@ -2479,7 +2484,10 @@ static _fdc_collect_captures(nd, loop_var_p) {
             else { i++; }
         }
         if (already == 0) {
+            if (_fdc_capture_types == 0) { _fdc_capture_types = arr_new(); }
             _fdc_captures = arr_push(_fdc_captures, name_p);
+            // Record the reference's inferred type, kept index-parallel.
+            _fdc_capture_types = arr_push(_fdc_capture_types, n.itype);
         }
         return 0;
     }
@@ -2582,10 +2590,21 @@ static _outline_synth_capture_struct() {
     i = 0;
     while (i < arr_len(_fdc_captures)) {
         fname = arr_get(_fdc_captures, i);
-        // TY_WORD = 0x02 (see bpp_defs.bsm). Pointer / scalar both
-        // fit in a single 8-byte slot, so this is the safe default
-        // until P3's mode inference distinguishes them.
-        add_struct_field(sidx, fname, 0x02);
+        // Type the field by the capture's inferred type. A FLOAT capture
+        // MUST keep its float type: otherwise the publish stores it via
+        // `fcvtzs` (float -> int) and the synth splats that integer's bits
+        // as an f32 — a near-zero denormal — so the autovec loop silently
+        // multiplies by ~0. Pointers / words / unknowns keep the safe
+        // 8-byte word slot (TY_WORD = 0x02).
+        auto fty, cap_ty;
+        fty = 0x02;
+        if (_fdc_capture_types != 0) {
+            if (i < arr_len(_fdc_capture_types)) {
+                cap_ty = arr_get(_fdc_capture_types, i);
+                if (is_float_type(cap_ty)) { fty = cap_ty; }
+            }
+        }
+        add_struct_field(sidx, fname, fty);
         i++;
     }
     return sidx;
@@ -2983,7 +3002,11 @@ static _av_make_call(name_p, args_arr, argc) {
 // Single-arg variant (vec_store4 inside another expression) is
 // also emitted at the parser-recognised builtin so codegen
 // already handles it.
-static _av_lower_stmt(orig_memst, pattern) {
+// `splat_name`: when non-zero (P1 only), the loop-invariant splat is
+// hoisted ONCE before the loop into that local, so this lowering just
+// references it instead of recomputing `vec_splat4(invariant)` every
+// iteration (LICM). Zero keeps the original inline-splat behaviour.
+static _av_lower_stmt(orig_memst, pattern, splat_name) {
     auto (orig, rhs, ld1, ld2_or_rhs): Node;
     auto vec_op_name, ld_args1, ld_args2, splat_args;
     auto vec_load_name, vec_splat_name, vec_store_name;
@@ -3007,6 +3030,9 @@ static _av_lower_stmt(orig_memst, pattern) {
         ld_args2 = malloc(8);
         *ld_args2 = ld2_or_rhs.a;
         load2_or_splat = _av_make_call(vec_load_name, ld_args2, 1);
+    } else if (splat_name != 0) {
+        // Hoisted: reference the splat local computed once before the loop.
+        load2_or_splat = _dsp_make_var(splat_name);
     } else {
         splat_args = malloc(8);
         *splat_args = ld2_or_rhs;
@@ -3028,7 +3054,7 @@ static _av_lower_stmt(orig_memst, pattern) {
 // Build the SIMD version of the loop body. Walks the original
 // body, copies pre-amble T_DECL / T_ASSIGN statements, and
 // replaces the single T_MEMST with the lowered vec_store4 call.
-static _av_build_simd_body(body_arr, body_cnt, pattern, simd_body_out, simd_cnt_out) {
+static _av_build_simd_body(body_arr, body_cnt, pattern, simd_body_out, simd_cnt_out, splat_name) {
     auto i, out_i;
     auto stmt: Node;
     out_i = 0;
@@ -3037,7 +3063,7 @@ static _av_build_simd_body(body_arr, body_cnt, pattern, simd_body_out, simd_cnt_
         stmt = body_arr[i];
         if (stmt != 0) {
             if (stmt.ntype == T_MEMST) {
-                *(simd_body_out + out_i * 8) = _av_lower_stmt(stmt, pattern);
+                *(simd_body_out + out_i * 8) = _av_lower_stmt(stmt, pattern, splat_name);
             } else {
                 // T_DECL / T_ASSIGN pre-amble — keep verbatim.
                 // Cloning avoids sharing nodes between vector
@@ -3127,7 +3153,9 @@ static _av_rewrite_loop(wh, loop_var_p, bound_n, body_arr, body_cnt, pattern) {
     simd_body = malloc(body_cnt * 8);
     simd_cnt_p = malloc(8);
     *simd_cnt_p = 0;
-    _av_build_simd_body(body_arr, body_cnt, pattern, simd_body, simd_cnt_p);
+    // In-place path keeps the inline splat (splat_name = 0) — the hoist
+    // is wired only on the outlined/synth path below.
+    _av_build_simd_body(body_arr, body_cnt, pattern, simd_body, simd_cnt_p, 0);
     simd_cnt = *simd_cnt_p;
     vec_loop = _av_build_vector_loop(loop_var_p, bound_n, simd_body, simd_cnt);
     tail_loop = _av_build_scalar_tail(loop_var_p, bound_n, body_arr, body_cnt);
@@ -3242,7 +3270,9 @@ static _outline_make_field_access(sidx, field_p) {
 
     mem_node = make_node(T_MEMLD);
     mem_node.a = ptr_node;
-    mem_node.b = 0;     // default field hint (full word)
+    // Carry the field's real type so a captured float reads back as float
+    // (matching the float-typed publish), not as a raw word.
+    mem_node.b = get_field_type(sidx, field_p);
     return mem_node;
 }
 
@@ -3619,6 +3649,7 @@ static void _fdc_try_candidate(wh_p, fn_idx, prev_stmt) {
     arr_clear(_fdc_loop_locals);
     arr_clear(_fdc_write_set);
     arr_clear(_fdc_captures);
+    if (_fdc_capture_types != 0) { arr_clear(_fdc_capture_types); }
     body_arr = wh.b;
     body_cnt = wh.c;
     for (i = 0; i < body_cnt; i++) {
@@ -4443,6 +4474,10 @@ static _outline_rewrite_with_captures(wh, sidx, synth_name, bound_n, src_fi, jpf
             addr_expr.b = cap_var;
             addr_expr.c = _outline_make_int_lit(off);
             memst_node = _dsp_make_memst(addr_expr, val_var);
+            // Store hint = the field's real type, so publishing a float
+            // capture stores its bit pattern (fcvt + str) instead of an
+            // `fcvtzs` int-conversion that destroys the value.
+            memst_node.c = get_field_type(sidx, cap_name);
             *(stmts + stmt_count * 8) = memst_node;
             stmt_count++;
         }
@@ -4642,11 +4677,36 @@ void synthesize_loop_fn() {
                     auto _vec_while, _tail_while, _block_stmts;
                     auto _block_node: Node, _block_arr;
                     auto _end_var: Node;
+                    // LICM: hoist the loop-invariant splat (P1 only) so the
+                    // `dup v0.4s` runs once per synth call, not per iteration.
+                    // Find the store's invariant operand (the second factor of
+                    // `field = field OP invariant`) and pre-compute its splat
+                    // into a synth-local; the vector loop then references it.
+                    auto _splat_name, _inv, _bi2;
+                    auto _st: Node, _st_rhs: Node;
+                    auto _splat_decl: Node, _splat_assign: Node;
+                    auto _splat_decl_arr, _splat_args, _splat_call: Node;
+                    _splat_name = 0;
+                    _inv = 0;
+                    if (_av_p == 1) {
+                        _bi2 = 0;
+                        while (_bi2 < wh.c) {
+                            _st = wh.b[_bi2];
+                            if (_st != 0) {
+                                if (_st.ntype == T_MEMST) {
+                                    _st_rhs = _st.b;
+                                    _inv = _st_rhs.c;
+                                }
+                            }
+                            _bi2++;
+                        }
+                        if (_inv != 0) { _splat_name = _dsp_pack_name("_av_splat", 9); }
+                    }
                     _simd_body = malloc(wh.c * 8);
                     _simd_cnt_p = malloc(8);
                     *_simd_cnt_p = 0;
                     _av_build_simd_body(wh.b, wh.c, _av_p,
-                        _simd_body, _simd_cnt_p);
+                        _simd_body, _simd_cnt_p, _splat_name);
                     _simd_cnt = *_simd_cnt_p;
                     _end_var = _dsp_make_var(_av_get_end_param_name());
                     _vec_while = _av_build_vector_loop(loop_var_p,
@@ -4654,12 +4714,38 @@ void synthesize_loop_fn() {
                     _end_var = _dsp_make_var(_av_get_end_param_name());
                     _tail_while = _av_build_scalar_tail(loop_var_p,
                         _end_var, wh.b, wh.c);
-                    _block_arr = malloc(16);
-                    *_block_arr = _vec_while;
-                    *(_block_arr + 8) = _tail_while;
-                    _block_node = make_node(T_BLOCK);
-                    _block_node.b = _block_arr;
-                    _block_node.c = 2;
+                    if (_splat_name != 0) {
+                        // Prepend [ auto _av_splat;  _av_splat = vec_splat4(inv); ].
+                        _splat_decl_arr = malloc(8);
+                        *_splat_decl_arr = _splat_name;
+                        _splat_decl = make_node(T_DECL);
+                        _splat_decl.a = _splat_decl_arr;
+                        _splat_decl.b = 1;
+                        _splat_decl.c = 0xB3;   // TY_FLOAT_D — 128-bit SIMD slot
+                        _splat_decl.d = 0;
+                        _splat_decl.e = 0;
+                        _splat_args = malloc(8);
+                        *_splat_args = ast_clone_subst(_inv, 0, 0, 0);
+                        _splat_call = _av_make_call(
+                            _dsp_pack_name("vec_splat4", 10), _splat_args, 1);
+                        _splat_assign = _dsp_make_assign(
+                            _dsp_make_var(_splat_name), _splat_call);
+                        _block_arr = malloc(32);
+                        *(_block_arr     ) = _splat_decl;
+                        *(_block_arr +  8) = _splat_assign;
+                        *(_block_arr + 16) = _vec_while;
+                        *(_block_arr + 24) = _tail_while;
+                        _block_node = make_node(T_BLOCK);
+                        _block_node.b = _block_arr;
+                        _block_node.c = 4;
+                    } else {
+                        _block_arr = malloc(16);
+                        *_block_arr = _vec_while;
+                        *(_block_arr + 8) = _tail_while;
+                        _block_node = make_node(T_BLOCK);
+                        _block_node.b = _block_arr;
+                        _block_node.c = 2;
+                    }
                     // Now apply capture substitution to the whole
                     // block. The cloner recurses into T_BLOCK +
                     // T_WHILE bodies (added P6 outlining fix) and
