@@ -2929,6 +2929,51 @@ static _av_is_local_setup_assign(stmt) {
     return 0;
 }
 
+// Is `nd` the loop induction variable?
+static _av_is_loop_var_node(nd, loop_var_p) {
+    auto n: Node;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype != T_VAR) { return 0; }
+    if (n.a == loop_var_p) { return 1; }
+    return packed_eq(n.a, loop_var_p);
+}
+
+// Find `loop_var * K` (or `K * loop_var`) in an address-arithmetic tree
+// and return K — the per-iteration BYTE stride. Returns 0 when no such
+// product is present. `vec_load4` reads 4 CONTIGUOUS elements, so the
+// autovec is only correct when the stride equals the element width; a
+// larger stride (an AoS struct field) would pull adjacent fields into
+// lanes 1..3 and corrupt them. This lets the matcher reject those.
+static _av_loop_var_mult(nd, loop_var_p) {
+    auto n: Node, lit: Node, op_s, op_l, c0, c1, r;
+    if (nd == 0) { return 0; }
+    n = nd;
+    if (n.ntype != T_BINOP) { return 0; }
+    op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+    c0 = peek(vbuf + op_s);
+    c1 = 0; if (op_l > 1) { c1 = peek(vbuf + op_s + 1); }
+    // `loop_var * K` or `K * loop_var`.
+    if (op_l == 1 && c0 == '*') {
+        if (_av_is_loop_var_node(n.b, loop_var_p) && is_int_lit_node(n.c)) {
+            lit = n.c; return parse_int_lit_value(lit.a);
+        }
+        if (_av_is_loop_var_node(n.c, loop_var_p) && is_int_lit_node(n.b)) {
+            lit = n.b; return parse_int_lit_value(lit.a);
+        }
+    }
+    // `loop_var << K` — the parser strength-reduces `* 2^K` to a shift, so a
+    // stride of 4 reaches here as `i << 2` and 16 as `i << 4`.
+    if (op_l == 2 && c0 == '<' && c1 == '<') {
+        if (_av_is_loop_var_node(n.b, loop_var_p) && is_int_lit_node(n.c)) {
+            lit = n.c; return 1 << parse_int_lit_value(lit.a);
+        }
+    }
+    r = _av_loop_var_mult(n.b, loop_var_p);
+    if (r != 0) { return r; }
+    return _av_loop_var_mult(n.c, loop_var_p);
+}
+
 // Run the autovec matcher on a candidate body. Returns the
 // pattern ordinal:
 //   0 = not eligible
@@ -2947,11 +2992,12 @@ static _av_is_local_setup_assign(stmt) {
 // two statements (T_ASSIGN + T_MEMST). The strict
 // every-statement-matches form rejected those bodies.
 static _av_classify_body(body_arr, body_cnt, loop_var_p) {
-    auto i, p, memst_count, memst_pattern;
+    auto i, p, memst_count, memst_pattern, found_stride, m;
     auto stmt: Node;
     if (body_cnt <= 0) { return 0; }
     memst_count = 0;
     memst_pattern = 0;
+    found_stride = 0;
     i = 0;
     while (i < body_cnt) {
         stmt = body_arr[i];
@@ -2966,8 +3012,14 @@ static _av_classify_body(body_arr, body_cnt, loop_var_p) {
             }
             if (p == 0) { return 0; }
             memst_pattern = p;
+            // Direct `arr[i]`-shaped store address carries the stride.
+            m = _av_loop_var_mult(stmt.a, loop_var_p);
+            if (m != 0) { found_stride = m; }
         } else if (stmt.ntype == T_ASSIGN) {
             if (_av_is_local_setup_assign(stmt) == 0) { return 0; }
+            // `c = base + i*STRIDE` pre-amble carries the stride.
+            m = _av_loop_var_mult(stmt.b, loop_var_p);
+            if (m != 0) { found_stride = m; }
         } else if (stmt.ntype == T_DECL) {
             // Body-local declarations are pre-walked into
             // `_fdc_loop_locals` already; the T_DECL node
@@ -2979,6 +3031,13 @@ static _av_classify_body(body_arr, body_cnt, loop_var_p) {
         i++;
     }
     if (memst_count != 1) { return 0; }
+    // Contiguity gate: the matcher only accepts SL_HALF (4-byte) stores, so a
+    // correct vectorisable access advances 4 bytes per iteration. A larger
+    // stride means an AoS struct field (e.g. `cooldown` inside a 40-byte
+    // entity) — vec_load4 would read the neighbouring fields as lanes 1..3
+    // and corrupt them. Reject; the loop stays scalar (Rule 39: strided
+    // access needs gather/scatter, which the autovectoriser does not do).
+    if (found_stride != 0 && found_stride != 4) { return 0; }
     return memst_pattern;
 }
 

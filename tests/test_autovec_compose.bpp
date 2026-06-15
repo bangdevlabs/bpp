@@ -53,8 +53,42 @@ static all_eq(expected: half float) {
     return 1;
 }
 
+// A struct whose half-float field is NOT contiguous (16 bytes apart). The
+// autovectoriser must reject `e.cooldown OP dt` here and stay scalar.
+struct Ent { x: float, cooldown: half float }
+global ents;
+
+static void strided_sub(dt: half float) @safe {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto e: Ent;
+        e = ents + i * sizeof(Ent);
+        e.cooldown = e.cooldown - dt;
+    }
+}
+static void strided_init(v: half float) {
+    auto i;
+    for (i = 0; i < N; i++) {
+        auto e: Ent;
+        e = ents + i * sizeof(Ent);
+        e.cooldown = v;
+    }
+}
+static strided_ok(expected: half float) {
+    auto i, lo: half float, hi: half float;
+    lo = expected - 0.01;
+    hi = expected + 0.01;
+    for (i = 0; i < N; i++) {
+        auto e: Ent;
+        e = ents + i * sizeof(Ent);
+        if (e.cooldown < lo || e.cooldown > hi) { return 0; }
+    }
+    return 1;
+}
+
 main() {
     cells = malloc(N * 4);
+    ents = malloc(N * 64);
     job_init(4);
 
     seed(2.0);
@@ -65,7 +99,19 @@ main() {
         job_shutdown();
         return 1;
     }
-    putmsg("OK: autovec compose correct (2.0 * 3.0 = 6.0)");
+
+    // Strided AoS field: the autovectoriser MUST reject this (the field is
+    // 16 bytes apart, not contiguous) and fall back to scalar — otherwise
+    // vec_load4 reads neighbouring fields as lanes 1..3 and corrupts them.
+    strided_init(5.0);
+    strided_sub(2.0);            // 5.0 - 2.0 = 3.0 in every cooldown
+    if (strided_ok(3.0) == 0) {
+        putmsg("FAIL: strided field vectorised incorrectly (should stay scalar)");
+        job_shutdown();
+        return 1;
+    }
+
+    putmsg("OK: contiguous autovec correct + strided correctly rejected");
     job_shutdown();
     return 0;
 }
