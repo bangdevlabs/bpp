@@ -13306,3 +13306,126 @@ the rigor that stopped three earlier "obvious" wins stopped this one too.
   green suites; a 30-second per-commit grep is the fix (new feedback memory).
 - 13 commits, every one bootstrap-byte-stable; native 188/0/12, C-emit
   152/0/48 throughout.
+
+## 2026-06-15 — Benchmark snapshot vs the historical record
+
+After the audio codegen arc, a measured snapshot against the numbers this
+journal recorded over the months. Two paired harnesses: **compile-time**
+(`tests/bench_compile.sh`, the reproducible one — pins `BPP_BUILD_ID`) and
+**runtime** (the `--c` → gcc -O2 *oracle* for codegen quality, plus the
+in-language `bench_*` API in `bpp_bench.bsm` that workload benchmarks like
+`tablah` self-time with).
+
+**Compile time (bootstrap — the compiler compiling itself):**
+
+| When | bootstrap |
+|------|-----------|
+| pre-hot-path (2026-05-20) | 0.51s |
+| hot-path arc (`32dd8e3`) | 0.30s |
+| +outlining / Wave 21 | 0.34–0.37s |
+| **now** | **0.24s** |
+
+At or below the historical best — the new passes (multi-return banking,
+the compute-in-place tree analysis, the fmadd match) added no measurable
+compile overhead. `--stats`: 49 modules, 1609 functions (1134 reachable),
+215580 tokens.
+
+**Runtime — codegen quality (biquad IIR oracle, an FP-bound audio kernel):**
+accumulator baseline 1.140s → **0.769s = 1.48×**, now *beating* gcc -O0
+(0.927s) and 1.99× off -O2 (0.386s, down from 2.85× at baseline). This is
+where the arc's float work (F.2.c + fmadd) shows up.
+
+**Runtime — workload (`examples/tablah`, an int/memory-bound hashmap
+benchmark ported from Swift):** total wall time, min of 3 —
+
+| variant | recorded (2026-05-21) | now |
+|---|---|---|
+| `tablah` (clean public API) | 49 ms | ~44 ms |
+| `tablah_opt` (inline + unroll) | 40 ms | ~38 ms |
+| clean→opt gap | ~18% | ~13% |
+
+Slightly better and the clean-vs-opt gap narrowed a touch (general codegen
++ the inliner over the months), but **the audio float work did NOT move
+tablah** — and that's the point: tablah is dominated by hashing and cache
+misses on the 1M-entry table, a different bottleneck than the biquad's FP
+feedback chain. The two benchmarks moving independently is the codegen
+working as understood, not a contradiction.
+
+**Caveat (honest):** cross-session *absolute* runtime numbers carry
+machine/thermal variance; `bench_compile.sh` is the reproducible anchor
+(pinned build id), and the *relative* gaps (baseline vs now, clean vs opt)
+are the trustworthy signal — not the raw milliseconds. Same lesson Rule 37
+was written for.
+
+**Runtime — the outlining × autovec compose gate (`examples/bench_compose.bpp`,
+the runtime value the 2026-05-22 outlining/inline arc paired with compile
+time):** N=1M `: half` cells × K=100 `v = v * dt` rounds. Now: SERIAL ~113ms
+→ COMPOSE ~19ms = **~6x**. The outlining fires (14 `job_parallel_for`
+dispatches, a `___synth_0` worker). One finding here, and a second that took
+the rest of the day to run down:
+
+- **The recorded "16x" (2026-05-25 panorama) was an artifact.** The
+  consistent recorded value is **6x** (2026-05-22, cited several times), and
+  the workload is *memory-bandwidth-bound*: the journal itself put the floor
+  at 800MB ÷ 50GB/s ≈ 16ms ≈ 6x. A 1M-cell memory-bound loop cannot do 16x —
+  the bottleneck is bandwidth, not compute. So today's 6x *matches the real
+  ceiling*, and there is no runtime regression. **The same lesson a third
+  time: the SIMD compute is hidden by memory bandwidth, exactly as the
+  integer-loop control was hidden by FP latency and the fmov shuttle by
+  store-forwarding.** Vectorising a bandwidth-bound kernel buys nothing.
+
+- **There was never an autovec regression — the disassembler was lying.**
+  To get a detector the bandwidth bound could not blind, a static gate
+  (`tests/bench_autovec_gate.sh`) was built to read the EMITTED CODE of the
+  `__synth_0` worker via `bug --disasm` and grep for 4-wide `.4s`. It read
+  **FAIL** — "2 vector ops, scalar `ldr s` / `fcvt`." That looked like a
+  matcher regression. It was not. Breaking inside the compiler at
+  `bpp_dispatch.bsm:4623` (with the brand-new `file:line` breakpoint, see
+  below) showed `_av_p = 1`, `_cap_idx = 11` — the SIMD branch *is* taken and
+  `_av_build_simd_body` *does* lower the store. Cross-checking the same
+  `__synth_0` with `otool -tvV` settled it: `ldr q0` / `dup.4s v0, w0` /
+  `fmul.4s v0, v1, v0` / `str q0` + a scalar tail — a textbook 4-wide
+  vector loop. **`bug --disasm` could not decode NEON**: it printed the
+  128-bit `ldr q` as scalar `ldr s` and the `.4s` arithmetic as `.word`, so
+  the gate's grep found nothing. Both detectors were blind — the runtime to
+  bandwidth, the gate to its own NEON-illiterate disassembler. The autovec
+  has been healthy the whole time.
+
+### 2026-06-15 (cont) — evolving `bug` so the gate could tell the truth
+
+The fix was not in the compiler; it was three gaps in `bug`, each found by
+needing it and hitting a wall (the user's framing: *"não seria o caso de
+evoluir o bug pra pegar o que você quer? é sempre assim que expandimos o
+bug"* — find the solution, not the culprit):
+
+1. **`--break file:line` breakpoints** (`bug_observe_macos.bsm` +
+   `bug_observe_linux.bsm`). Function-entry breakpoints can't inspect a value
+   computed mid-function. The new resolver maps `file:line` through the `.bug`
+   v6 line table (basename match + nearest-forward emitted line), so
+   `--break bpp_dispatch.bsm:4623 --watch "_av_p, _cap_idx"` stops exactly
+   where the autovec transform decides. Verified on a loop: it stops every
+   iteration with the induction variable re-printed.
+
+2. **Large `.bug` maps load in full** (`bug_reader.bsm`). The reader capped
+   reads at 256KB; the compiler's own map is ~550KB, so its tail sections —
+   the line table and module names — were silently truncated, leaving every
+   `file:line` breakpoint on the compiler unresolvable (line table read as 0
+   rows). Now it `lseek`s the size and reads the whole file. This had to land
+   *first* — without it, debugging the compiler with itself was impossible.
+
+3. **`bug --disasm` decodes NEON** (`bug_disasm.bsm`): 128-bit `ldr q` /
+   `str q`, `dup Vd.4s, Wn`, the FP three-same family (`fmul`/`fadd`/`fsub`/
+   `fdiv`/`fmla`/`fmls`/`fmax`/`fmin` on `.4s`/`.2d`), and the scalar
+   `fmadd`/`fmsub`/`fnmadd`/`fnmsub` this very arc added. Every op cross-checked
+   against `otool` instruction-for-instruction; zero `.word` left in the synth.
+   The gate now reads **PASS (6 vector ops — 4-wide SIMD fired)**.
+
+**Lessons.** (a) A gate is only as honest as the tool it reads through —
+when a disassembly-based check disagrees with expectation, cross-check
+`otool`/`objdump` before believing the regression. (b) "Measure, don't
+believe" cuts both ways: the same rigor that killed three false *wins* this
+maratona also killed a false *loss*. (c) The instinct to reach for `print`
+debugging when the debugger falls short is the wrong one here — the durable
+move is to grow the debugger, and it paid for itself within the same session.
+Suite 188/0/12 green throughout; `bug` changes are debugger-only (no compiler
+bytes touched, bootstrap identity unaffected).

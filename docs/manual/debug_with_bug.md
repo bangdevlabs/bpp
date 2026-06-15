@@ -217,9 +217,20 @@ objdump-`-l` style, entirely static.
 the SUBSET its backend emits, which is enough to read codegen and spot
 operand-order or wild-displacement bugs. Anything outside that vocabulary
 prints as `.byte 0xNN` (x86, variable length) or `.word 0x........`
-(arm64, fixed 4-byte, so the stream always stays aligned). On arm64 the
-scalar coverage is ~99.998%; the only gap is NEON/SIMD, which appears
-solely in auto-vectorized hot loops and is intentionally left raw.
+(arm64, fixed 4-byte, so the stream always stays aligned).
+
+On arm64 the decoder covers the scalar instruction set **plus the NEON
+the codegen actually emits**: the 128-bit `ldr q` / `str q` vector
+load-stores, `dup Vd.4s, Wn` (the autovectoriser's lane splat), the
+floating-point three-same arithmetic (`fmul` / `fadd` / `fsub` / `fdiv`
+/ `fmla` / `fmls` / `fmax` / `fmin`, e.g. `fmul v0.4s, v1.4s, v0.4s`),
+and the scalar fused multiply-adds (`fmadd` / `fmsub` / `fnmadd` /
+`fnmsub`). This closed a real trap: the autovec gate
+(`tests/bench_autovec_gate.sh`) read a healthy 4-wide loop as a FAIL
+because the old decoder printed `ldr q` as scalar `ldr s` and the `.4s`
+ops as `.word` — the SIMD was fine, the *disassembler* was blind. When a
+disassembly-based check disagrees with what you expect, cross-check the
+same function with `otool -tvV` / `objdump -d` before trusting it.
 
 Both need the `.bug` map present — build with `bpp --bug ...` (see
 *Building a target with debug info* above). The map carries the function
@@ -318,11 +329,68 @@ Each `--break` adds one function name to a 32-slot array. Only
 the named functions are registered with the remote stub; every
 other function entry is invisible.
 
-`name:line` breakpoints are **not yet implemented** —
-scaffolding exists (per-function source position is in `.bug`)
-but resolving `source.bpp:42 → function index → byte offset`
-hits an off-by-N in the source map. Passing a colon-bearing spec
-returns a clean error today instead of resolving wrong.
+### `file:line` breakpoints — stopping mid-function
+
+`--break <file>:<line>` stops at a **source line**, not just a
+function entry — the one way to inspect a loop's induction variable
+or a value computed halfway down a function:
+
+```
+bug --tui --break bpp_dispatch.bsm:4623 --watch "_cap_idx, _av_p" ./bpp prog.bpp -o /tmp/out
+```
+
+Resolution goes straight through the `.bug` **v6 line table**, so it
+sidesteps the function-index hop that the old per-function source map
+got an off-by-N from: the file part is matched by basename against the
+module-name table, and the line part selects the nearest FORWARD line
+that actually emitted code (the smallest line `>= ` the one you asked
+for, then its first instruction). Ask for a blank or comment line and
+you land on the next real statement — same as `gdb`. The file part may
+be a bare basename (`bpp_dispatch.bsm:4623`) or carry a path
+(`src/bpp_dispatch.bsm:4623`); both anchor on a path boundary so
+`dispatch.bsm` will not spuriously match `bpp_dispatch.bsm`.
+
+A `file:line` breakpoint hits once per execution of that line — set one
+inside a loop and it fires every iteration, with the in-scope locals
+re-printed each time, which is exactly how you watch an accumulator
+evolve.
+
+**Driving it non-interactively.** The TUI reads its commands from
+stdin and re-prints the watch list at every stop, so a pipe turns it
+into a batch tracer — feed it enough `c` (continue) lines and a final
+`q`:
+
+```
+printf 'c\nc\nc\nq\n' | bug --tui --break work.bpp:8 --watch "i, acc" ./work
+```
+
+### Debugging the compiler with itself
+
+`file:line` breakpoints make `bug` a usable lens on the **compiler's
+own** mid-pass state — build a debuggable `bpp`, then break inside a
+pass while it compiles a test program:
+
+```
+bpp --bug src/bpp.bpp -o /tmp/bpp_dbg
+bug --tui --break src/bpp_dispatch.bsm:4623 --watch "_av_p, _cap_idx" \
+    /tmp/bpp_dbg examples/bench_compose.bpp -o /tmp/out
+```
+
+Two things this leans on:
+
+- **Large `.bug` maps load in full.** The compiler's own map is ~550KB
+  — the reader now sizes its buffers to the actual file (it used to cap
+  at 256KB and silently drop the tail sections, which left the line
+  table empty and every `file:line` breakpoint unresolvable on the
+  compiler). If a `file:line` breakpoint resolves on a small program
+  but not on a big one, suspect a truncated read first.
+- **Synth workers are named `__synth_N`.** Auto-vectorised / outlined
+  loop bodies are lifted into functions the source never wrote; they
+  appear in the `.bug` map and on `--disasm` as `__synth_0`,
+  `__synth_1`, … (the object-file symbol carries an extra leading
+  underscore — `___synth_0` in `nm` / `otool` output, `__synth_0` in
+  the map and in `bug`). To inspect what the autovectoriser emitted,
+  `bug --disasm /tmp/out __synth_0`.
 
 ### Combining selective with full trace — `--break-all`
 
@@ -668,6 +736,7 @@ investigation.
 | Phase 6.4.2 | SIGPROF supplement (macOS): per-thread mcontext capture + pthread_kill fan-out | shipped |
 | Phase 6.5  | `caller(n)` sugar wrapper over `caller_pc` + `caller_name` | deferred (YAGNI — no consumer yet) |
 | CLI / disasm | `bug` re-split as the Linux-capable CLI (`src/bug.bpp`); `--bytes` + `--disasm` objdump-in-bug; v6 line table source interleaving; ELF/x86-64 **and** Mach-O/arm64 parity (2026-05-28 → 29) | shipped |
+| `file:line` + NEON | `--break file:line` via the v6 line table (mid-function locals, both observers); reader sizes buffers to the file (large maps like the compiler's own ~550KB load in full); `--disasm` decodes NEON `ldr q`/`str q` + `dup`/`fmul.4s`-family + scalar `fmadd` (2026-06-15) | shipped |
 
 Phase 6 detail: see the planning doc archived at
 `legacy_bootstrap/legacy_docs/bug_phase6_plan.md` (kept for
@@ -728,8 +797,6 @@ in the profile output.
 
 ## Appendix — what `bug` cannot do yet
 
-- **No `name:line` breakpoints.** Function-entry only. Tracked
-  as `docs/plans/todo.md` bug #3b.
 - **No watchpoints.** Memory writes are not observed.
 - **No attach-to-pid.** `bug` always fork-execs its target.
 - **Linux GUI not wired.** `bug_observe_linux.bsm` speaks the

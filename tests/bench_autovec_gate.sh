@@ -1,14 +1,23 @@
 #!/bin/sh
-# bench_autovec_gate.sh — deterministic autovectorisation regression gate.
+# bench_autovec_gate.sh — deterministic autovectorisation gate.
 #
 # Why a static gate instead of a runtime benchmark: `examples/bench_compose.bpp`
 # is memory-BANDWIDTH-bound (1M cells), so the 4-wide SIMD the autovectoriser
 # emits is hidden behind the memory wall — its runtime is the same whether the
-# vectorisation fires or silently regresses to scalar. That blindness let an
-# autovec regression go unnoticed for weeks. This gate reads the EMITTED MACHINE
-# CODE instead: it compiles the canonical autovec pattern with `--bug`, finds the
-# outlined worker, and checks for 4-wide `.4s` ops. PASS iff the synth body is
+# vectorisation fires or silently regresses to scalar. A runtime benchmark
+# therefore can NOT tell you whether the SIMD is alive. This gate reads the
+# EMITTED MACHINE CODE instead: it compiles the canonical autovec pattern with
+# `--bug`, finds the outlined worker, and checks for 4-wide `.4s` ops (and the
+# 128-bit `ldr q` / `str q` they bracket). PASS iff the synth body is
 # vectorised; FAIL (scalar synth) is the regression, deterministically.
+#
+# History note: this gate first read FAIL not because the autovec was broken
+# but because the `bug` disassembler could not decode NEON — it printed the
+# 128-bit `ldr q` as a scalar `ldr s` and the `.4s` arithmetic as `.word`, so
+# the grep below found nothing. The fix was to teach `bug --disasm` NEON (see
+# src/bug_disasm.bsm); the autovec itself was correct all along. Lesson: a gate
+# is only as honest as the tool it reads through — cross-check against `otool`
+# / `objdump` when a disassembly-based gate disagrees with expectation.
 #
 # Uses the `bug` debugger's static sub-commands (`--dump`, `--disasm`) — no
 # ptrace, so it works in CI / Docker.
