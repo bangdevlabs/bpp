@@ -199,6 +199,30 @@ F.2.c (ops writing their destination register directly, no x0/d0
 shuttle) addresses it, and that is the big arc — it replaces the
 accumulator model, not a heuristic tweak.
 
+**Integer F.2.c — the throughput measurement (2026-06-16).** The float
+F.2.c (`cg_emit_float_into`) shipped; the INTEGER accumulator shuttle is
+still live, and a new committed benchmark proves it dominates. `examples/
+bench_codegen.bpp` adds a throughput-bound `xform` kernel
+(`out[i] = (in[i]*A + C) >> 17` over a cache-resident array): native
+**3.71× behind gcc -O2** (22.9ms vs 6.2ms), versus only 1.35–1.52× on the
+serial biquad/lcg where OoO hides the shuttle. A controlled isolation
+experiment (big-vs-small constants; params-vs-locals) decomposed the
+throughput gap:
+  - accumulator shuffle (the `add x0,r,#0; mov x9,x0` x0 funnel): **~58%**
+  - loop-invariant 64-bit constant rematerialisation (mov+movk/iter): **~29%**
+  - param reloads from the frame each iteration: **~13%**
+So neither constant nor param hoisting is the dominant lever — the x0 funnel
+is. Order: integer-CIP FIRST (mirrors the float arc — Stage-1 CIP is the
+foundation Stage-2 promotion reads from, and unlike floats it is NOT
+OoO-hidden so it wins standalone), then constant promotion + param caching as
+the integer Stage-2. Build: `cg_int_leaf_kind` / `cg_int_tree_need` /
+`cg_emit_int_into` mirroring the float trio; chip primitives `emit_iop_into` /
+`emit_iload_var_into` / `emit_iconst_into` drawing temps from the existing GP
+freelist (x9..x15, `a64_gp_alloc`). Staged by leaf shape: local+constant
+leaves first (helps lcg) → memory-load leaves + shift ops (helps xform).
+Gated by `bench_codegen` (biquad/lcg/xform vs gcc -O2) + byte-stable
+bootstrap + Linux x64, each increment.
+
 Why step 1 (the SIMD freelist, `c54a19b`) WAS a win where F.2.a was not:
 it removed the **value-stack** push/pop (`str/ldr d, [sp, #-0x10]!` with
 the pre/post-index SP write), genuinely more expensive than a
