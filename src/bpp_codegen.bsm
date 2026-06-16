@@ -573,7 +573,18 @@ cg_emit_lit(packed) {
         call(p.emit_load_float_const, fid);
         return 1;
     }
-    call(p.emit_mov_imm, cg_parse_int(packed));
+    // Stage 2a accumulator use-site: a promoted hot constant moves from its
+    // callee-saved register into the accumulator instead of a fresh
+    // movz/movk. (Only set on a64; mov-from-reg is sign-agnostic and works
+    // for any non-CIP integer expression — shifts, division, etc.)
+    auto _lcv, _lcx, _lcr;
+    _lcv = cg_parse_int(packed);
+    _lcx = cg_const_find(_lcv);
+    if (_lcx >= 0) {
+        _lcr = arr_get(cg_const_reg, _lcx);
+        if (_lcr >= 0) { call(p.emit_mov_reg_reg, 0, _lcr); return 0; }
+    }
+    call(p.emit_mov_imm, _lcv);
     return 0;
 }
 
@@ -974,6 +985,17 @@ global cg_var_refs;
 global cg_var_addr_taken;
 global cg_var_promote;
 
+// ── Stage 2a: hot loop-invariant constant promotion ─────────
+// Parallel arrays over DISTINCT large integer constants seen in the
+// current function (those that cost a movz/movk chain). cg_const_wt is a
+// loop-weighted occurrence count — a constant inside a loop counts far more
+// than one in straight-line code, because it executes every iteration. The
+// B3 const-select promotes the hottest to spare callee-saved registers,
+// materialised once after the prologue; cg_const_reg holds the assigned
+// register (or -1). cg_b3_loop_depth tracks loop nesting during the B3 walk.
+global cg_const_val, cg_const_wt, cg_const_reg;
+global cg_b3_loop_depth;
+
 // Add a variable to the current scope. Initialises all parallel
 // arrays to their defaults and returns the fresh slot index.
 cg_var_add(name_p) {
@@ -1165,6 +1187,40 @@ cg_b3_eligible_float(vi) {
     return 1;
 }
 
+// Return the constant-table index of `val`, or -1 if not present.
+cg_const_find(val) {
+    auto i, n;
+    n = arr_len(cg_const_val);
+    for (i = 0; i < n; i++) {
+        if (arr_get(cg_const_val, i) == val) { return i; }
+    }
+    return 0 - 1;
+}
+
+// Record one occurrence of an integer-literal leaf, loop-weighted. Only
+// constants that cost a movz/movk chain (not a single mov) are tracked —
+// a value fitting one mov saves nothing by living in a register. String
+// and float literals are ignored.
+cg_const_record(packed) {
+    auto lit_s, val, idx, w;
+    lit_s = unpack_s(packed);
+    if (peek(cg_sbuf + lit_s) == '"') { return 0; }
+    if (cg_is_float_lit(packed) == 1) { return 0; }
+    val = cg_parse_int(packed);
+    if (val >= 0 && val < 65536) { return 0; }
+    w = 1;
+    if (cg_b3_loop_depth > 0) { w = 1000; }
+    idx = cg_const_find(val);
+    if (idx >= 0) {
+        arr_set(cg_const_wt, idx, arr_get(cg_const_wt, idx) + w);
+        return 0;
+    }
+    cg_const_val = arr_push(cg_const_val, val);
+    cg_const_wt = arr_push(cg_const_wt, w);
+    cg_const_reg = arr_push(cg_const_reg, 0 - 1);
+    return 0;
+}
+
 cg_b3_walk(nd) {
     auto n: Node, t, vi, child: Node, arr, cnt, i;
     if (nd == 0) { return 0; }
@@ -1173,6 +1229,10 @@ cg_b3_walk(nd) {
     if (t == T_VAR) {
         vi = cg_var_idx(n.a);
         if (vi >= 0) { arr_set(cg_var_refs, vi, arr_get(cg_var_refs, vi) + 1); }
+        return 0;
+    }
+    if (t == T_LIT) {
+        cg_const_record(n.a);
         return 0;
     }
     if (t == T_ADDR) {
@@ -1207,10 +1267,12 @@ cg_b3_walk(nd) {
         }
     }
     T_WHILE {
+        cg_b3_loop_depth = cg_b3_loop_depth + 1;
         cg_b3_walk(n.a);
         arr = n.b; cnt = n.c;
         for (i = 0; i < cnt; i++) { cg_b3_walk(arr[i]); }
         if (n.e != 0) { cg_b3_walk(n.e); }
+        cg_b3_loop_depth = cg_b3_loop_depth - 1;
     }
     T_BLOCK {
         arr = n.b; cnt = n.c;
@@ -2365,6 +2427,10 @@ void cg_emit_func(fi) {
     arr_clear(cg_var_refs);
     arr_clear(cg_var_addr_taken);
     arr_clear(cg_var_promote);
+    arr_clear(cg_const_val);
+    arr_clear(cg_const_wt);
+    arr_clear(cg_const_reg);
+    cg_b3_loop_depth = 0;
 
     // 3. Reset chip-specific state (freelist, promoted-reg array).
     call(p.fn_reset_chip_state);
@@ -2531,6 +2597,17 @@ void cg_emit_func(fi) {
     for (vi = par_cnt; vi < n_vars; vi++) {
         preg = arr_get(cg_var_promote, vi);
         if (preg >= 0) { call(p.emit_zero_reg, preg); }
+    }
+
+    // 12b. Stage 2a — materialise each promoted hot constant into its
+    // callee-saved register, once, here in the prologue. cg_const_reg is
+    // only ever set on backends whose b3_select_const ran (a64), so this
+    // loop is a no-op elsewhere.
+    auto _nc, _ci, _creg;
+    _nc = arr_len(cg_const_val);
+    for (_ci = 0; _ci < _nc; _ci++) {
+        _creg = arr_get(cg_const_reg, _ci);
+        if (_creg >= 0) { call(p.emit_iconst_into, _creg, arr_get(cg_const_val, _ci)); }
     }
 
     // 13. Narrow float params (aarch64 SL_HALF/SL_QUARTER; x64 no-op).
@@ -3162,13 +3239,20 @@ cg_emit_float_into(nd, dreg) {
 // a positive value = the callee-saved register a B3-promoted local lives in
 // (read directly, no load).
 cg_int_leaf_kind(nd) {
-    auto n: Node, vi, fty, preg, lit_s;
+    auto n: Node, vi, fty, preg, lit_s, cidx, creg;
     if (nd == 0) { return -1; }
     n = nd;
     if (n.ntype == T_LIT) {
         lit_s = unpack_s(n.a);
         if (peek(cg_sbuf + lit_s) == '"') { return -1; }   // string literal
         if (cg_is_float_lit(n.a) == 1) { return -1; }       // float literal
+        // A promoted hot constant reads straight from its callee-saved
+        // register (no per-use movz/movk), exactly like a promoted local.
+        cidx = cg_const_find(cg_parse_int(n.a));
+        if (cidx >= 0) {
+            creg = arr_get(cg_const_reg, cidx);
+            if (creg >= 0) { return creg; }
+        }
         return 0;                                           // integer constant
     }
     if (n.ntype != T_VAR) { return -1; }
@@ -3231,7 +3315,14 @@ cg_emit_int_into(nd, dreg) {
     p = cg_prim;
     n = nd; t = n.ntype;
     if (t == T_LIT) {
-        call(p.emit_iconst_into, dreg, cg_parse_int(n.a));
+        auto _civ, _cix, _cir;
+        _civ = cg_parse_int(n.a);
+        _cix = cg_const_find(_civ);
+        if (_cix >= 0) {
+            _cir = arr_get(cg_const_reg, _cix);
+            if (_cir >= 0) { call(p.emit_mov_reg_reg, dreg, _cir); return 0; }
+        }
+        call(p.emit_iconst_into, dreg, _civ);
         return 0;
     }
     if (t == T_VAR) {
