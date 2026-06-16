@@ -1,117 +1,94 @@
-// test_autovec_compose.bpp — Correctness gate for the outline + autovec
-// COMPOSE path.
+// test_autovec_compose.bpp — Correctness gate for the outline + autovec path.
 //
-// The captured loop-invariant factor (`dt`) must reach the vectorised
-// synth AS A FLOAT. A latent bug typed the outline capture-struct field
-// as an integer, so the host published `dt` via `fcvtzs` (float -> int)
-// and the synth splatted that integer's bit pattern as an f32 — a
-// denormal near zero. `bench_compose` masked this for a long time by
-// using `dt = 1.0`: published as int 1, splatted to ~0, so the whole
-// loop silently became multiply-by-zero while the TIMING looked perfect.
+// The autovectoriser was silently wrong for a long time because the only
+// thing exercising it (bench_compose) used dt=1.0, a 4-byte struct, and
+// checked only TIME. Two bugs hid behind that: a captured float invariant
+// published as int (multiply-by-~0), and strided AoS fields read as if
+// contiguous (lanes 1..3 garbage). This gate checks VALUES across every
+// pattern and operator the matcher accepts, plus the strided REJECT path.
 //
-// This test multiplies by a non-trivial factor and checks the VALUES, so
-// the timing can never again hide a wrong computation. Exits 0 when the
-// autovec COMPOSE matches the scalar result, 1 otherwise.
+// Exits 0 when all results are correct, 1 on the first wrong value.
 
 import "bpp_io.bsm";
 import "bpp_job.bsm";
 
 struct Cell { v: half float }
 const N = 1024;
-global cells;
+global a, b, d;
 
-// COMPOSE: @safe + caller-frame `dt` capture + single half-float store —
-// matches both outlining and the autovectoriser.
-static void compose(dt: half float) @safe {
+static void seed(arr, v: half float) {
     auto i;
-    for (i = 0; i < N; i++) {
-        auto c: Cell;
-        c = cells + i * 4;
-        c.v = c.v * dt;
-    }
+    for (i = 0; i < N; i++) { auto c: Cell; c = arr + i * 4; c.v = v; }
 }
 
-static void seed(v: half float) {
-    auto i;
-    for (i = 0; i < N; i++) {
-        auto c: Cell;
-        c = cells + i * 4;
-        c.v = v;
-    }
-}
-
-// 1 when every cell equals `expected` within tolerance, 0 otherwise.
-static all_eq(expected: half float) {
+// 1 when every element of `arr` equals `expected` within tolerance.
+static eq(arr, expected: half float) {
     auto i, lo: half float, hi: half float;
     lo = expected - 0.01;
     hi = expected + 0.01;
     for (i = 0; i < N; i++) {
         auto c: Cell;
-        c = cells + i * 4;
+        c = arr + i * 4;
         if (c.v < lo || c.v > hi) { return 0; }
     }
     return 1;
 }
 
-// A struct whose half-float field is NOT contiguous (16 bytes apart). The
-// autovectoriser must reject `e.cooldown OP dt` here and stay scalar.
+// ── P1: arr[i] = arr[i] OP captured-invariant (contiguous) ───────────────
+static void p1_mul(k: half float) @safe { auto i; for (i=0;i<N;i++){ auto c: Cell; c=a+i*4; c.v=c.v*k; } }
+static void p1_add(k: half float) @safe { auto i; for (i=0;i<N;i++){ auto c: Cell; c=a+i*4; c.v=c.v+k; } }
+static void p1_sub(k: half float) @safe { auto i; for (i=0;i<N;i++){ auto c: Cell; c=a+i*4; c.v=c.v-k; } }
+static void p1_div(k: half float) @safe { auto i; for (i=0;i<N;i++){ auto c: Cell; c=a+i*4; c.v=c.v/k; } }
+
+// ── P2: d[i] = a[i] OP b[i] (three contiguous arrays) ────────────────────
+static void p2_mul() @safe { auto i; for (i=0;i<N;i++){ auto ca:Cell,cb:Cell,cd:Cell; ca=a+i*4;cb=b+i*4;cd=d+i*4; cd.v=ca.v*cb.v; } }
+static void p2_add() @safe { auto i; for (i=0;i<N;i++){ auto ca:Cell,cb:Cell,cd:Cell; ca=a+i*4;cb=b+i*4;cd=d+i*4; cd.v=ca.v+cb.v; } }
+
+// ── Strided AoS field — MUST reject (stay scalar, stay correct) ──────────
 struct Ent { x: float, cooldown: half float }
 global ents;
-
 static void strided_sub(dt: half float) @safe {
     auto i;
-    for (i = 0; i < N; i++) {
-        auto e: Ent;
-        e = ents + i * sizeof(Ent);
-        e.cooldown = e.cooldown - dt;
-    }
-}
-static void strided_init(v: half float) {
-    auto i;
-    for (i = 0; i < N; i++) {
-        auto e: Ent;
-        e = ents + i * sizeof(Ent);
-        e.cooldown = v;
-    }
+    for (i = 0; i < N; i++) { auto e: Ent; e = ents + i * sizeof(Ent); e.cooldown = e.cooldown - dt; }
 }
 static strided_ok(expected: half float) {
     auto i, lo: half float, hi: half float;
-    lo = expected - 0.01;
-    hi = expected + 0.01;
+    lo = expected - 0.01; hi = expected + 0.01;
     for (i = 0; i < N; i++) {
-        auto e: Ent;
-        e = ents + i * sizeof(Ent);
+        auto e: Ent; e = ents + i * sizeof(Ent);
         if (e.cooldown < lo || e.cooldown > hi) { return 0; }
     }
     return 1;
 }
 
+static fail(msg: ptr) {
+    putmsg(msg);
+    job_shutdown();
+    return 1;
+}
+
 main() {
-    cells = malloc(N * 4);
+    a = malloc(N * 4); b = malloc(N * 4); d = malloc(N * 4);
     ents = malloc(N * 64);
     job_init(4);
 
-    seed(2.0);
-    compose(3.0);               // 2.0 * 3.0 = 6.0 in every cell
+    // P1 — every operator, with a captured float invariant.
+    seed(a, 2.0);  p1_mul(3.0); if (eq(a, 6.0)  == 0) { return fail("FAIL: P1 mul (2*3)"); }
+    seed(a, 10.0); p1_add(5.0); if (eq(a, 15.0) == 0) { return fail("FAIL: P1 add (10+5)"); }
+    seed(a, 10.0); p1_sub(4.0); if (eq(a, 6.0)  == 0) { return fail("FAIL: P1 sub (10-4)"); }
+    seed(a, 12.0); p1_div(3.0); if (eq(a, 4.0)  == 0) { return fail("FAIL: P1 div (12/3)"); }
 
-    if (all_eq(6.0) == 0) {
-        putmsg("FAIL: autovec compose produced wrong values (captured-float invariant)");
-        job_shutdown();
-        return 1;
-    }
+    // P2 — three-array.
+    seed(a, 2.0); seed(b, 3.0); p2_mul(); if (eq(d, 6.0) == 0) { return fail("FAIL: P2 mul (2*3)"); }
+    seed(a, 4.0); seed(b, 5.0); p2_add(); if (eq(d, 9.0) == 0) { return fail("FAIL: P2 add (4+5)"); }
 
-    // Strided AoS field: the autovectoriser MUST reject this (the field is
-    // 16 bytes apart, not contiguous) and fall back to scalar — otherwise
-    // vec_load4 reads neighbouring fields as lanes 1..3 and corrupts them.
-    strided_init(5.0);
-    strided_sub(2.0);            // 5.0 - 2.0 = 3.0 in every cooldown
-    if (strided_ok(3.0) == 0) {
-        putmsg("FAIL: strided field vectorised incorrectly (should stay scalar)");
-        job_shutdown();
-        return 1;
-    }
+    // Strided field — must stay scalar and stay correct.
+    auto i;
+    for (i = 0; i < N; i++) { auto e: Ent; e = ents + i * sizeof(Ent); e.cooldown = 5.0; }
+    strided_sub(2.0);
+    if (strided_ok(3.0) == 0) { return fail("FAIL: strided field vectorised incorrectly"); }
 
-    putmsg("OK: contiguous autovec correct + strided correctly rejected");
+    putmsg("OK: P1 (mul/add/sub/div) + P2 (mul/add) correct, strided rejected");
     job_shutdown();
     return 0;
 }
