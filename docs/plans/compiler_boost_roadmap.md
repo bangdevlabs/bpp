@@ -199,6 +199,24 @@ F.2.c (ops writing their destination register directly, no x0/d0
 shuttle) addresses it, and that is the big arc — it replaces the
 accumulator model, not a heuristic tweak.
 
+**Integer F.2.c — Stage 1 SHIPPED (2026-06-16, `86a7bab` + `7e7279d`).**
+`cg_emit_int_into` (a64) emits `+ - * & | ^` integer trees over local,
+constant, and full-word memory-load (`arr[i]`) leaves destination-driven,
+killing the x0 shuttle. Gated `cg_int_tree_need <= int_temp_count` (GP
+freelist x9..x15; x64 opts out via -1). Division/shifts/sub-word loads stay
+on the accumulator path (signedness/extension the type system owns).
+Measured: lcg 24.3 -> 22ms (gap 1.35x -> 1.21x); throughput xform 22.9 ->
+20.3ms. The xform's *residual* gap to gcc -O2 (6.2ms) is NOT the shuffle
+(CIP removed that) — it is gcc's auto-vectorisation/unroll of the int64
+kernel (F.3, a separate PhD-level lever). REMAINING STAGES, each a real
+feature: Stage 2a constant promotion (~29%) needs LOOP-DEPTH-WEIGHTED B3
+ranking (a loop constant appears once in source but runs every iteration, so
+raw ref-count won't rank it) + a constant table + prologue materialisation +
+dual use-sites (accumulator literal-emit AND the CIP iconst leaf); Stage 2b
+param/loop-invariant-load caching (~13%); x64 integer-CIP parity deferred
+(SysV's 1-deep GP freelist makes it register-pressure-bound, like the float
+CIP's x64 opt-out). The decomposition below is the original measurement.
+
 **Integer F.2.c — the throughput measurement (2026-06-16).** The float
 F.2.c (`cg_emit_float_into`) shipped; the INTEGER accumulator shuttle is
 still live, and a new committed benchmark proves it dominates. `examples/
