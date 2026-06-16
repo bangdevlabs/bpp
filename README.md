@@ -743,7 +743,7 @@ b++/
 | Target | Status |
 |--------|--------|
 | macOS ARM64 (Apple Silicon) | **Working** — native Cocoa + Metal GPU, SDL2, raylib. Self-hosting, suite 182/0/12. |
-| Linux x86_64 | **Self-hosting** — `bpp` compiles itself on Linux (gen2 == gen3 byte-identical in Docker, 2026-05-27). Full test suite **passes 153/0/41** (2026-05-28). Static + dynamic ELF (FFI shared libs via PLT/GOT). X11 windowing (Bang 9 + games over XQuartz). Full optimization parity with ARM64 (inline / outline / B1 / B3 / B4 SIMD). GPU (Vulkan) and audio (ALSA) door open + Docker-verified at the link layer; driver call bodies stubbed until tested on x86 hardware. |
+| Linux x86_64 | **Self-hosting** — `bpp` compiles itself on Linux (gen2 == gen3 byte-identical in Docker, 2026-05-27). Full test suite **passes 153/0/41** (2026-05-28). Static + dynamic ELF (FFI shared libs via PLT/GOT). X11 windowing (Bang 9 + games over XQuartz). Core optimization parity with ARM64 (inline / outline / B1 / B3 / loop-weighted B3 / B4 SIMD / byte SIMD / multi-value return). The destination-driven float **and** integer compute-in-place + constant promotion are arm64-only — partly architectural (SysV has no callee-saved xmm and a 1-deep GP freelist), partly deferred with spine + stubs ready; the full a64↔x64 status is tracked in [docs/manual/backend_parity.md](docs/manual/backend_parity.md). GPU (Vulkan) and audio (ALSA) door open + Docker-verified at the link layer; driver call bodies stubbed until tested on x86 hardware. |
 | Windows x86_64 | Planned — codegen + Win32 + DX12/Vulkan |
 | WebAssembly | Future — codegen + WebGPU |
 
