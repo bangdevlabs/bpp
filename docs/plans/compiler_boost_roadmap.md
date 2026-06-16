@@ -199,23 +199,34 @@ F.2.c (ops writing their destination register directly, no x0/d0
 shuttle) addresses it, and that is the big arc — it replaces the
 accumulator model, not a heuristic tweak.
 
-**Integer F.2.c — Stage 1 SHIPPED (2026-06-16, `86a7bab` + `7e7279d`).**
-`cg_emit_int_into` (a64) emits `+ - * & | ^` integer trees over local,
-constant, and full-word memory-load (`arr[i]`) leaves destination-driven,
-killing the x0 shuttle. Gated `cg_int_tree_need <= int_temp_count` (GP
-freelist x9..x15; x64 opts out via -1). Division/shifts/sub-word loads stay
-on the accumulator path (signedness/extension the type system owns).
-Measured: lcg 24.3 -> 22ms (gap 1.35x -> 1.21x); throughput xform 22.9 ->
-20.3ms. The xform's *residual* gap to gcc -O2 (6.2ms) is NOT the shuffle
-(CIP removed that) — it is gcc's auto-vectorisation/unroll of the int64
-kernel (F.3, a separate PhD-level lever). REMAINING STAGES, each a real
-feature: Stage 2a constant promotion (~29%) needs LOOP-DEPTH-WEIGHTED B3
-ranking (a loop constant appears once in source but runs every iteration, so
-raw ref-count won't rank it) + a constant table + prologue materialisation +
-dual use-sites (accumulator literal-emit AND the CIP iconst leaf); Stage 2b
-param/loop-invariant-load caching (~13%); x64 integer-CIP parity deferred
-(SysV's 1-deep GP freelist makes it register-pressure-bound, like the float
-CIP's x64 opt-out). The decomposition below is the original measurement.
+**Integer F.2.c — Stages 1 + 2a + 2b ALL SHIPPED (2026-06-16,
+`86a7bab`→`5483f51`).** The whole arc landed:
+- **Stage 1 (CIP, `86a7bab` + `7e7279d`):** `cg_emit_int_into` (a64) emits
+  `+ - * & | ^` integer trees over local / constant / full-word memory-load
+  (`arr[i]`) leaves destination-driven, killing the x0 shuttle. Gated
+  `cg_int_tree_need <= int_temp_count` (GP freelist x9..x15). Division /
+  shifts / sub-word loads stay on the accumulator path (signedness /
+  extension the type system owns).
+- **Stage 2a (constant promotion, `64648fe`):** loop-weighted constant table
+  (a loop constant counts 1000x) → `_a64_b3_select_const` promotes the
+  hottest to spare x19..x24, materialised once in the prologue, read by all
+  three use-sites (CIP leaf, CIP iconst, accumulator literal). Reuses the
+  proven a64_promoted_regs save/restore + spill machinery.
+- **Stage 2b (param caching, `5483f51`):** loop-weight the *local* ref count
+  in cg_b3_walk so a loop-invariant param (array base, loop bound) used once
+  per iteration clears B3's promotion threshold instead of reloading from the
+  frame. Backend-agnostic (both a64 + x64 benefit).
+
+Cumulative, warm: lcg 24.3 → 20.8ms (gap to gcc -O2 1.35x → **1.14x**);
+throughput xform 22.9 → 14.6ms (3.71x → **2.35x**). The xform's residual gap
+is gcc's auto-vectorisation/unroll of the int64 kernel (F.3, separate
+PhD-level lever) — NOT the shuffle, which the arc removed. Each stage:
+byte-stable 1-cycle bootstrap, native 192/0/12, C-emit 155/0/49, x64
+self-host stable, compile-time 0.25s unchanged. **x64 integer-CIP parity
+deferred** (SysV's 1-deep GP freelist makes destination-driven trees
+register-pressure-bound — only ≤1-temp trees would fire; like the float
+CIP's x64 opt-out). x64 still gets Stage 2b via the shared B3. The
+decomposition below is the original measurement that drove all of it.
 
 **Integer F.2.c — the throughput measurement (2026-06-16).** The float
 F.2.c (`cg_emit_float_into`) shipped; the INTEGER accumulator shuttle is

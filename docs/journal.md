@@ -13698,3 +13698,55 @@ Docker) — the "backend agnostic" check passed by verification, not a stub.
 
 Native 192/0/12, C-emit 155/0/49, Mach-O + ELF self-host byte-stable,
 bootstrap 0.25 s (compiler now 1.06 MB). Commits `d34fd0e` → `0a6c81f`.
+
+### 2026-06-16 (cont) — the integer compute-in-place arc (the AAA codegen gap)
+
+Pushed the compiler-perf frontier the roadmap had long deferred. It started
+with a question — "polish the compiler" — and the discipline was measure
+first, every step.
+
+**The measurement reframed the target twice.** A new committed gate
+(`examples/bench_codegen.bpp`: biquad FP-serial, lcg int-serial, and a
+throughput `xform = (in[i]*A + C) >> 17`) showed the serial kernels only
+1.35–1.52x behind gcc -O2, but the **throughput kernel 3.71x** — the AAA
+inner-loop shape, where the cost can't hide behind the critical path. A
+controlled isolation (big-vs-small constants; params-vs-locals) decomposed
+the gap: **accumulator shuffle ~58%, constants ~29%, params ~13%**. So the
+direction we almost took (constant hoisting) was the *third* lever — the
+dominant one is the x0 funnel itself.
+
+**Stage 1 — integer compute-in-place (`86a7bab` + `7e7279d`).** The integer
+analog of the float F.2.c: `cg_emit_int_into` walks a `+ - * & | ^` tree and
+emits each op into its destination register (left reuses dreg down the left
+spine, right operands take freelist temps), instead of routing every value
+through x0. A separate gated path (`cg_int_tree_need <= int_temp_count`)
+with the accumulator dance as fallback, so it's additive and bootstrap-safe.
+Extended with constant leaves and a full-word memory-load leaf (`arr[i]`:
+compute the address tree into dreg, load through it). Division/shifts stay on
+the accumulator path — their signedness needs the type the CIP doesn't track.
+
+**Stage 2a — constant promotion (`64648fe`).** A loop-invariant constant
+appears *once* in source but runs every iteration, so raw ref-count can't
+rank it: the B3 walk now tallies integer literals into a **loop-weighted**
+table (1000x inside a loop). `_a64_b3_select_const` promotes the hottest to
+whatever callee-saved registers the locals left free, materialised once in
+the prologue — and by feeding a64_promoted_regs it reuses the proven
+save/restore + spill machinery untouched. Three use-sites read the register
+instead of a per-iteration movz/movk.
+
+**Stage 2b — loop-weighted params (`5483f51`).** The same loop-weighting
+applied to *local* ref-counts: a param used once per iteration (an array
+base, the loop bound) is loop-invariant but was reloaded from the frame
+because ref-count 1 missed B3's threshold. Now it promotes. Backend-agnostic,
+so x64 gets it too.
+
+**Result, warm:** xform 22.9 → 14.6ms (3.71x → 2.35x to gcc -O2), lcg 24.3 →
+20.8ms (1.35x → 1.14x). The residual xform gap is gcc's auto-vectorisation of
+the int64 kernel (F.3, separate). Every stage byte-stable (1-cycle
+oscillation, gen2==gen3), native 192/0/12, C-emit 155/0/49, x64 self-host
+stable, compile-time 0.25s unchanged. x64 integer-CIP parity deferred (SysV's
+1-deep freelist is register-pressure-bound). Lessons: **measure before you
+build** (the decomposition killed the constant-first plan); **the gap was the
+evaluation order, not where values live** (the roadmap called it years ago);
+and an **additive, gated fast path** lets you rewrite the hot path of the
+codegen without risking the rest.
