@@ -149,21 +149,59 @@ void _x64_emit_fop_into(op_code, dreg, s1, s2) { }
 // Linux x86_64" contract, so this stub is correct: the float tree falls
 // back to separate mulsd + addsd (same as it always has).
 void _x64_emit_fma(op_code, dst, n, m, a) { }
-void _x64_emit_fmov_reg(dst, src) { }
-// Multi-value return is a64-first (slice 1). On x86_64 the result bank is
-// rax/rdx (SysV), not the index-addressed x0..x7 the spine assumes, so a
-// faithful x64 lowering needs its own bank map — a Phase-A-x64 follow-up.
-// This literal mov keeps the primitive non-null; no current test path
-// reaches it (the suites use no multi-value returns).
-void _x64_emit_mov_reg_reg(dst, src) { x64_enc_mov_reg(dst, src); }
-// Multi-value return is a64-first; these never execute on the x64 path
-// (no test reaches it). Present only to keep the primitive table non-null.
-void _x64_emit_bank_push(is_flt) { }
-void _x64_emit_bank_pop(is_flt, reg) { }
-// x86_64 has no multi-value-return banking yet (the SysV result bank is
-// rax/rdx + xmm0/xmm1, a different map). Report 0 so the spine emits a
-// clean diagnostic instead of wrong code.
-_x64_cap_multi_ret() { return 0; }
+// ── Multi-value return banking — the x86_64 register window ──
+// b++ multi-value return is a CUSTOM register-window convention, not the
+// SysV struct-return rule: both caller and callee are b++ code compiled
+// here, so they may agree on any registers that survive the callee
+// epilogue. That frees x64 from SysV's two-register return limit and gives
+// it the same arity-8 banks the a64 side has. The spine addresses results
+// by BANK POSITION (0..7); a64 maps position straight to x0..x7 / d0..d7,
+// and here we map the integer positions onto eight caller-saved GP
+// registers. Position 0 stays rax / xmm0 so a single-value return lands in
+// the conventional register.
+//
+//   int  pos: 0=rax 1=rdx 2=rcx 3=rsi 4=rdi 5=r8 6=r9 7=r10
+//   float pos: position == xmm register number (xmm0..xmm7)
+//
+// All eight integer registers are caller-saved and untouched by the
+// epilogue (which only restores rbx/rbp/r12..r15 and rsp), so the results
+// survive the return; the caller reads each before clobbering it.
+static _x64_int_bank_reg(pos) {
+    if (pos == 0) { return 0; }   // rax
+    if (pos == 1) { return 2; }   // rdx
+    if (pos == 2) { return 1; }   // rcx
+    if (pos == 3) { return 6; }   // rsi
+    if (pos == 4) { return 7; }   // rdi
+    if (pos == 5) { return 8; }   // r8
+    if (pos == 6) { return 9; }   // r9
+    return 10;                    // r10  (pos 7)
+}
+
+// Move a banked float result into the accumulator's lane. The float bank
+// position already IS the xmm register number, so no remap is needed.
+// (Also the F.2.c compute-in-place hook, but x64 opts out of that path —
+// the only live caller here is the multi-value assignment unpack.)
+void _x64_emit_fmov_reg(dst, src) { x64_enc_movsd_reg(dst, src); }
+
+// Move a banked integer result into the accumulator. Both operands are
+// bank positions; remap each onto its physical register.
+void _x64_emit_mov_reg_reg(dst, src) {
+    x64_enc_mov_reg(_x64_int_bank_reg(dst), _x64_int_bank_reg(src));
+}
+
+// Two-pass placement: pass 1 pushes each result (acc rax / xmm0) to the
+// value stack; pass 2 pops them (LIFO, reverse slot order) into each
+// slot's bank register. Pass 2 only pops, so it never re-evaluates an
+// expression and cannot clobber an already-placed result.
+void _x64_emit_bank_push(is_flt) {
+    if (is_flt) { x64_emit_vpush(); } else { x64_emit_push(); }
+}
+void _x64_emit_bank_pop(is_flt, reg) {
+    if (is_flt) { x64_emit_vpop(reg); } else { x64_emit_pop(_x64_int_bank_reg(reg)); }
+}
+// x86_64 now implements multi-value-return banking via the register window
+// above (matching the a64 arity-8 banks).
+_x64_cap_multi_ret() { return 1; }
 _x64_simd_temp_alloc() { return -1; }
 void _x64_simd_temp_free(reg) { }
 _x64_simd_temp_count() { return 0; }
