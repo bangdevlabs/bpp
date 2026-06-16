@@ -13586,3 +13586,115 @@ arrays) and **honest** (rejects what it can't vectorise), and the benchmark can
 no longer hide a wrong result behind `dt=1.0`. Lesson, again: a benchmark that
 checks only time is not a correctness test — make it look at the values, or it
 will lie for years. gen2==gen3 byte-stable; native 189/0/12, C-emit 153/0/48.
+
+## 2026-06-16 — Byte-wide SIMD across three backends, x64 multi-return parity, and a latent Mach-O bug
+
+A long day with one through-line: take the byte-wide SIMD idea from a hash
+question all the way to a production prelude primitive, closing the x64
+backend's real gaps on the way, and flush out a years-latent Mach-O bug when
+the compiler finally crossed 1 MB.
+
+### The hash-table question, answered by measurement (not adoption)
+
+The industry standardised on SwissTables (Go 1.24, Zig, Abseil, F14); should
+`bpp_hash`? A cross-load microbench (same avalanche hash, isolating the probe
+strategy) settled it. swiss-SWAR is **1.5–2.1× slower than linear** at the
+25–75 % load `bpp_hash` actually runs (it resizes at 75 %; `tablah` pre-sizes
+to 25 %), and only wins above ~95 %. The premise behind swiss adoption —
+running *dense* to save memory — is a trade we deliberately don't make. So:
+don't swissify `bpp_hash`. The finding, the benchmark, and the one place
+swiss *would* pay off (a dense, hot, large spatial hash in a future 3D game)
+are recorded in `docs/swiss_table_evaluation.md` + `examples/swiss_neon_bench.bpp`.
+
+### Byte-wide SIMD builtins — all three backends (`1605d87`, `8abdea6`, `422da28`)
+
+Four 16-lane uint8 primitives, the group-scan kit behind memchr / string
+search / swiss hashing: `vec_load16b`, `vec_splat_byte`, `vec_cmeq_byte`,
+`vec_movemask`. The movemask is the interesting one: x86 has the single
+`PMOVMSKB`, ARM has nothing — so a64 synthesises a clean 16-bit mask with a
+constant-free SRA reduction tree (`ushr.16b #7` → `usra.8h #7` → `usra.4s #14`
+→ `usra.2d #28` → two `umov.b` + `orr`-lsl-8), verified against `otool`. x64
+uses `PMOVMSKB`; the byte broadcast is `movd`+`punpcklbw`+`punpcklwd`+`pshufd`
+(SSE2, no SSSE3 dependency). C-emit lowers them PORTABLY — a scalar
+`_bpp_vec16b` struct + four `static inline` helpers the C compiler vectorises
+at -O2, composed inline as nested by-value expressions (no C vector type
+needed) — which is *better* than the float `vec_*` that `#error` without
+SSE2/NEON. Every step asserted VALUES, not structure: `test_simd_bytes`
+checks the exact mask for single / none / all / alternating / top-lane /
+split patterns on arm64, x86_64 (Docker), and the C emitter.
+
+The consumer that justifies them (Rule 28): `buf_find_byte(buf, len, c)` in
+`bpp_buf` (`0a6c81f`) — a SIMD memchr, 16-wide scan + scalar tail (never
+reads past `buf+len`), **11× (a64) / 9.6× (x64)** over the byte loop on a
+4 MiB buffer (`examples/simd_memchr.bpp`). Now that the builtins lower on all
+three backends, the primitive lives in a prelude module the compiler and
+every program import, with no backend left behind.
+
+### x64 multi-value return — full register-window parity (`7caa734`)
+
+The E266 guard is gone; `return e1, e2, …` and `a, b = f()` now work on
+x86_64. The key insight: B++ multi-value return is a CUSTOM register-window
+convention, not the SysV struct-return rule — caller and callee are both B++
+code compiled here, so they may agree on any registers that survive the
+epilogue. That frees x64 from SysV's two-register return limit and gives it
+the same arity-8 banks as a64: integer positions map to
+`rax, rdx, rcx, rsi, rdi, r8, r9, r10` (all caller-saved, untouched by the
+epilogue), floats to `xmm0..7`. `_x64_emit_fmov_reg` had been a dead no-op
+stub — the multi-value float unpack actually needs it, so it became `movsd`.
+Verified by VALUES in Docker: `swap3`'s 3-int return (beats SysV's 2-register
+limit) plus an 8-int / 6-float wide test that drives the REX.B registers.
+
+### `fmadd` / F.2.c — an architectural x64 opt-out, not a gap (`c9be04f`)
+
+The "is x64 missing the float fusion?" review has a definitive answer: it
+opts out BY DESIGN. F.2.c's 1.27× came almost entirely from promoting hot
+floats into CALLEE-SAVED `d8..d15`; SysV AMD64 has **zero** callee-saved xmm
+registers, so that stage has no target band on Linux x64 and cannot be
+ported. `fmadd`/`fmsub` need FMA3 (Haswell+, x86-64-v3), not the baseline
+SSE2 the ELF target assumes — emitting it would `SIGILL` on older CPUs. The
+comments now say "by design," so the question isn't re-opened.
+
+### The latent Mach-O bug the growth flushed out (`6df6ebc`)
+
+Adding the C-emit helper strings pushed the compiler binary past **one
+`__DATA` page (16 KB)** for the first time — and it came out MALFORMED:
+`dyld: malformed import table, string overflow`. Diagnosed exactly the right
+way — **debugging the compiler with itself**, not `otool`: a debug build of
+the good compiler run under `bug --break a64_macho.bsm:982 --break :740
+--watch mo_cf_size` showed the `LC_DYLD_CHAINED_FIXUPS` datasize **declared
+432 vs actually written 444**. Root cause: the precompute hardcoded the
+`chained_starts_in_segment` size as **24** (the one-page value) while the
+real writer emits `22 + 2*page_count` padded to 4 — they agreed only at
+page_count == 1 (`24`), and the compiler binary had simply never exceeded one
+`__DATA` page in the whole life of the chained-fixups writer. The 12-byte gap
+(`36 − 24`, page_count 6) ran the import symbol-string pool past the declared
+end. The fix mirrors the writer exactly (real page-count seg size + 4-byte
+padding, not the precompute's 8).
+
+The *discipline* was as much the story as the bug. The old compiler can't
+emit the >1-page binary correctly, so the fix had to bootstrap FIRST in
+isolation: stash the feature, build the macho-fix-only compiler (it stays
+under one page, so the old compiler emits it fine → a fixed compiler), then
+rebuild the feature on top. The fix is a 1-cycle bootstrap oscillation (it
+changes the compiler's own chained-fixups size) — `gen2 == gen3`, install
+gen2. And the Golden Rule earned its keep: an untested `gen1` got `cp`'d over
+`./bpp` once; `git checkout -- bpp` recovered it. ELF/Linux has no
+counterpart (no chained fixups; x64 self-host 938933 < 1 MB, byte-stable in
+Docker) — the "backend agnostic" check passed by verification, not a stub.
+
+### Lessons
+
+- **Measure before adopting, even an industry standard.** SwissTables are
+  right for dense tables; ours run sparse on purpose. The reason a technique
+  won elsewhere may not be a reason it wins here.
+- **A size-dependent computation duplicated in two places is a time bomb.**
+  When a binary crosses a page/MB boundary and dyld says "string overflow,"
+  suspect a datasize precompute that doesn't track `page_count`.
+- **Debug the compiler with itself.** `bug --break file:line --watch` on a
+  debug build read the wrong size straight off the screen; `otool` could only
+  show the symptom.
+- **Fix the foundation first, in isolation, when the old tool can't build the
+  new one.** Then layer the feature on the fixed tool.
+
+Native 192/0/12, C-emit 155/0/49, Mach-O + ELF self-host byte-stable,
+bootstrap 0.25 s (compiler now 1.06 MB). Commits `d34fd0e` → `0a6c81f`.

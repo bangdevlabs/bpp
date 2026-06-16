@@ -171,7 +171,7 @@ Every B++ program starts with **21 modules already in scope** (as of 2026-05-29)
 | `bpp_array.bsm` | Dynamic word arrays with 16-byte shadow header | `arr_new`, `arr_push`, `arr_pop`, `arr_get`, `arr_set`, `arr_len`, `arr_free`, `arr_clear`, `arr_last` |
 | `bpp_arr.bsm` | Growable **struct** arrays (AoS sibling of `arr_new`) | `arr_struct_new`, `arr_struct_alloc`, `arr_struct_at`, `arr_struct_count`, `arr_struct_reset`, `arr_struct_free` |
 | `bpp_hash.bsm` | Hash tables (word keys + string keys) | `hash_new`, `hash_set`, `hash_get`, `hash_str_new`, `hash_str_set` |
-| `bpp_buf.bsm` | Raw byte/word buffers + typed LE/BE read/write | `buf_byte`, `buf_word`, `buf_fill`, `buf_copy`, `read_u8/16/32/64`, `write_u8/16/32/64`, `peekfloat`, `pokefloat` |
+| `bpp_buf.bsm` | Raw byte/word buffers + typed LE/BE read/write + SIMD scan | `buf_byte`, `buf_word`, `buf_fill`, `buf_copy`, `buf_move`, `buf_cmp`, `buf_find_byte` (SIMD memchr), `read_u8/16/32/64`, `write_u8/16/32/64`, `peekfloat`, `pokefloat` |
 | `bpp_str.bsm` | C-string operations + dynamic string builder | `str_len`, `str_eq`, `str_cpy`, `str_ends`, `str_starts`, `str_dup`, `strbuf_new`, `strbuf_cat`, `strbuf_ch`, `strbuf_num`, `strbuf_len`, `strbuf_free` |
 | `bpp_arena.bsm` | Bump allocator — O(1) alloc + reset | `arena_new`, `arena_alloc`, `arena_reset`, `arena_free` |
 | `bpp_io.bsm` | Console output / input (smart-dispatch + width primitives) | `put`, `put_err`, `putchar`, `putchar_err`, `putstr`, `putnum`, `putfloat`, `putline`, `putmsg`, `getchar` |
