@@ -932,6 +932,43 @@ x64_emit_call(nd) {
             return 1;
         }
 
+        // ── Byte-wide SIMD (16 × uint8) — group-scan kit, x86 SSE2 ──
+        // Mirrors the a64 byte builtins. load16b / splat_byte / cmeq_byte
+        // leave a vector in xmm0 (return 2); movemask uses the single
+        // PMOVMSKB instruction to drop a 16-bit mask into the accumulator.
+        if (cg_str_eq(n.a, "vec_load16b", 11)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // byte pointer → rax
+            x64_enc_movups_load(0, 0, 0);     // movups xmm0, [rax] (16 bytes)
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_splat_byte", 14)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // byte value → rax (low 8 bits used)
+            // Broadcast the low byte of EAX to all 16 lanes (SSE2-only):
+            //   MOVD xmm0, eax ; PUNPCKLBW ; PUNPCKLWD ; PSHUFD 0x00.
+            x64_enc_movd_to_xmm(0, 0);
+            x64_enc_punpcklbw(0, 0);
+            x64_enc_punpcklwd(0, 0);
+            x64_enc_pshufd(0, 0, 0x00);
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_cmeq_byte", 13)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 8));   // second operand → xmm0
+            x64_emit_vpush();
+            call(pp.emit_node, *(arr + 0));   // first operand → xmm0
+            x64_emit_vpop(1);                 // xmm1 = second operand
+            x64_enc_pcmpeqb(0, 1);            // xmm0 = (xmm0 == xmm1) per byte
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_movemask", 12)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // lane vector → xmm0
+            x64_enc_pmovmskb(0, 0);           // pmovmskb eax, xmm0 → 16-bit mask in rax
+            return 0;
+        }
+
         // Regular B++ function call.
         // Query bpp_types for callee's parameter types (mirrors ARM64 logic).
         fidx_c = find_func_idx(n.a);
