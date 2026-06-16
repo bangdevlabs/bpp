@@ -962,17 +962,30 @@ void mo_compute_layout(code_size, data_count) {
     // __LINKEDIT content: chained fixups + exports trie + symtab + strtab.
     if (arr_len(mo_got_syms) > 0) {
         // Real chained fixups: header(32) + starts_in_image(4+4*nseg)
-        //   + starts_in_segment(24) + imports(4*got_cnt) + symbol strings.
-        // Compute exact symbol strings size: 1 (null) + sum("_" + name + "\0").
-        auto sym_str_size, si;
+        //   + starts_in_segment + imports(4*got_cnt) + symbol strings,
+        //   padded to 4 bytes. This precompute feeds the LC command's
+        //   declared datasize, so it MUST match the bytes that
+        //   mo_write_chained_fixups_real actually writes. The
+        //   starts_in_segment size grows with the __DATA page count
+        //   (22-byte fixed header + 2 bytes per page, padded to 4) — it was
+        //   hardcoded to 24, the one-page value, which under-declared the
+        //   datasize for any binary whose __DATA spans more than one page.
+        //   dyld then read the import symbol strings past the declared end
+        //   ("malformed import table, string overflow"). Mirror the writer's
+        //   page-count math (lines ~637-640) and its final 4-byte padding.
+        auto sym_str_size, si, cf_pc, cf_seg;
         sym_str_size = 1;
         si = 0;
         while (si < arr_len(mo_got_syms)) {
             sym_str_size += unpack_l(arr_get(mo_got_syms, si)) + 2;
             si++;
         }
-        cf_data_size = 32 + 4 + nseg * 4 + 24 + arr_len(mo_got_syms) * 4 + sym_str_size;
-        cf_data_size = (cf_data_size + 7) / 8 * 8;
+        cf_pc = (mo_data_size + MO_PAGE_SIZE - 1) / MO_PAGE_SIZE;
+        if (cf_pc < 1) { cf_pc = 1; }
+        cf_seg = 22 + cf_pc * 2;
+        if ((cf_seg & 3) != 0) { cf_seg += 4 - (cf_seg & 3); }
+        cf_data_size = 32 + 4 + nseg * 4 + cf_seg + arr_len(mo_got_syms) * 4 + sym_str_size;
+        if ((cf_data_size & 3) != 0) { cf_data_size += 4 - (cf_data_size & 3); }
     } else {
         // Empty chained fixups: header + starts struct + sentinel, 8-byte aligned.
         cf_data_size = 32 + 4 + nseg * 4 + 8;
