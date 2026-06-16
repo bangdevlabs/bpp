@@ -1,0 +1,94 @@
+// swiss_neon_bench.bpp — linear probing vs a SwissTable that uses the real
+// byte-wide NEON builtins (vec_load16b / vec_splat_byte / vec_cmeq_byte /
+// vec_movemask), measured across the full load spectrum.
+//
+// This is the evaluation artifact behind docs/swiss_table_evaluation.md:
+// "should bpp_hash adopt a SwissTable now that the NEON builtins exist?".
+// Both strategies use the SAME avalanche hash, so the timing isolates the
+// PROBE STRATEGY, nothing else. Each row prints INSert and GET times (ms)
+// for 2M operations and a correctness tag — the two strategies must return
+// the same checksum or the row is marked [MISMATCH].
+//
+// Run (native — the builtins are native-only):
+//   bpp examples/swiss_neon_bench.bpp -o /tmp/swiss_neon_bench && /tmp/swiss_neon_bench
+//
+// Headline result (Apple M-series, best of 2): swiss-NEON beats swiss-SWAR
+// everywhere and moves the linear/swiss crossover from ~95% down to ~87%
+// load, but is still 1.25-1.75x SLOWER than linear at 25-75% load — the
+// regime bpp_hash actually runs in. See the doc for the full table and the
+// "where swiss would pay off" discussion (dense, hot, large tables — e.g.
+// spatial hashing in a 3D game).
+
+import "bpp_io.bsm";
+import "bpp_beat.bsm";
+
+const CAP = 2097152;            // 2^21 slots, a multiple of 16 (group size)
+const NMASK = CAP - 1;
+auto used, lkeys, lvals, ctrl, skeys, svals, ks, rng;
+
+// Xorshift PRNG for the key stream.
+static rnd(){ rng=rng^(rng<<13); rng=rng^(rng>>7); rng=rng^(rng<<17); return rng; }
+// Strong avalanche finalizer — used by BOTH strategies so all bits (the low
+// 7 the fingerprint reads, and the rest the slot reads) are well mixed.
+static hmix(k){ auto h; h=k*2654435761; h=h^(h>>29); h=h*15750249268501108917; h=h^(h>>32); return h; }
+// Count trailing zeros of a non-zero 16-bit movemask -> first matching lane.
+static _ctz16(x){ auto n; n=0; if((x&0xFF)==0){n=n+8;x=x>>8;} if((x&0xF)==0){n=n+4;x=x>>4;} if((x&0x3)==0){n=n+2;x=x>>2;} if((x&0x1)==0){n=n+1;} return n; }
+
+// ── Linear probing — the current bpp_hash strategy. ──
+static void lput(k,v){ auto s; s=hmix(k)&NMASK; while(peek(used+s)!=0){ if(lkeys[s]==k){lvals[s]=v;return;} s=(s+1)&NMASK; } poke(used+s,1); lkeys[s]=k; lvals[s]=v; }
+static lget(k){ auto s; s=hmix(k)&NMASK; while(peek(used+s)!=0){ if(lkeys[s]==k){return lvals[s];} s=(s+1)&NMASK; } return 0; }
+
+// ── SwissTable, 16-slot groups, real SIMD. The control byte is 0x80 for an
+//    empty slot, otherwise the 7-bit fingerprint (hash & 0x7F). Each group
+//    is one 128-bit load; cmeq+movemask compares all 16 fingerprints at
+//    once. b++ has no vector locals, so the empty-check reloads the group
+//    (it stays in L1) — present-key GET never reaches it, hitting on the
+//    fingerprint compare first. ──
+static void sput_neon(k,v){ auto h,fp,grp,mfp,me,i,slot;
+    h=hmix(k); fp=h&0x7F; grp=((h>>7)&NMASK)&~15;
+    while(1){
+        mfp = vec_movemask(vec_cmeq_byte(vec_load16b(ctrl+grp), vec_splat_byte(fp)));
+        while(mfp!=0){ i=_ctz16(mfp); slot=grp+i; if(skeys[slot]==k){svals[slot]=v;return;} mfp=mfp&(mfp-1); }
+        me = vec_movemask(vec_cmeq_byte(vec_load16b(ctrl+grp), vec_splat_byte(0x80)));
+        if(me!=0){ i=_ctz16(me); slot=grp+i; poke(ctrl+slot,fp); skeys[slot]=k; svals[slot]=v; return; }
+        grp=(grp+16)&NMASK;
+    } }
+static sget_neon(k){ auto h,fp,grp,mfp,me,i,slot;
+    h=hmix(k); fp=h&0x7F; grp=((h>>7)&NMASK)&~15;
+    while(1){
+        mfp = vec_movemask(vec_cmeq_byte(vec_load16b(ctrl+grp), vec_splat_byte(fp)));
+        while(mfp!=0){ i=_ctz16(mfp); slot=grp+i; if(skeys[slot]==k){return svals[slot];} mfp=mfp&(mfp-1); }
+        me = vec_movemask(vec_cmeq_byte(vec_load16b(ctrl+grp), vec_splat_byte(0x80)));
+        if(me!=0){ return 0; }
+        grp=(grp+16)&NMASK;
+    } }
+
+// Fill to `load_pct`, then time INSert and GET for both strategies.
+static void bench(load_pct){
+    auto N, i, t0, tli, tlg, tsi, tsg, sl, ss;
+    N = (CAP * load_pct) / 100;
+    for(i=0;i<CAP;i++){ poke(used+i,0); poke(ctrl+i,0x80); }
+    rng=88172645463325252;
+    for(i=0;i<N;i++){ ks[i]=rnd(); }
+
+    t0=beat_now_us(); for(i=0;i<N;i++){ lput(ks[i],ks[i]+1); } tli=beat_now_us()-t0;
+    t0=beat_now_us(); for(i=0;i<N;i++){ sput_neon(ks[i],ks[i]+1); } tsi=beat_now_us()-t0;
+
+    sl=0; ss=0; for(i=0;i<N;i++){ sl=sl+lget(ks[i]); ss=ss+sget_neon(ks[i]); }
+
+    t0=beat_now_us(); for(i=0;i<N;i++){ lget(ks[i]); } tlg=beat_now_us()-t0;
+    t0=beat_now_us(); for(i=0;i<N;i++){ sget_neon(ks[i]); } tsg=beat_now_us()-t0;
+
+    putstr(" load "); putnum(load_pct); putstr("%  "); putstr(sl==ss?"[ok]":"[MISMATCH]");
+    putstr("  INS lin="); putnum(tli/1000); putstr("."); putnum((tli%1000)/100);
+    putstr(" neon="); putnum(tsi/1000); putstr("."); putnum((tsi%1000)/100);
+    putstr("   GET lin="); putnum(tlg/1000); putstr("."); putnum((tlg%1000)/100);
+    putstr(" neon="); putnum(tsg/1000); putstr("."); putnum((tsg%1000)/100); putchar(10);
+}
+main(){
+    used=malloc(CAP); lkeys=malloc(CAP*8); lvals=malloc(CAP*8);
+    ctrl=malloc(CAP); skeys=malloc(CAP*8); svals=malloc(CAP*8); ks=malloc(CAP*8);
+    putmsg("linear vs swiss-NEON  (ms, INSert + GET, same avalanche hash):");
+    bench(25); bench(50); bench(70); bench(87); bench(95); bench(99);
+    return 0;
+}
