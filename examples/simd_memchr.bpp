@@ -1,0 +1,124 @@
+// simd_memchr.bpp — the byte-wide SIMD builtins, doing real work.
+//
+// A 16-byte-at-a-time memchr (find the first occurrence of a byte in a
+// buffer) built from vec_load16b / vec_splat_byte / vec_cmeq_byte /
+// vec_movemask, benchmarked against the obvious scalar loop. This is the
+// concrete consumer that justifies the builtins (Rule 28): the group-scan
+// kit pays off on LONG byte scans — exactly where a scalar byte-at-a-time
+// loop is slowest.
+//
+// The harness first asserts that the SIMD scan returns the EXACT same
+// index as the scalar scan for every needle position it tests, then times
+// both on a large buffer. Correctness before speed, values before timing.
+
+import "bpp_io.bsm";
+import "bpp_beat.bsm";
+
+// Count trailing zeros of a non-zero 16-bit mask — turns the movemask
+// result into the lane index of the first match.
+static _ctz16(x) {
+    auto n;
+    n = 0;
+    if ((x & 0xFF) == 0) { n = n + 8; x = x >> 8; }
+    if ((x & 0xF)  == 0) { n = n + 4; x = x >> 4; }
+    if ((x & 0x3)  == 0) { n = n + 2; x = x >> 2; }
+    if ((x & 0x1)  == 0) { n = n + 1; }
+    return n;
+}
+
+// SIMD memchr: scan 16 bytes per step, fall back to a scalar tail for the
+// final partial group. Returns the byte index of the first match, or -1.
+static simd_memchr(buf, len, c) {
+    auto i, mask;
+    i = 0;
+    while (i + 16 <= len) {
+        mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf + i), vec_splat_byte(c)));
+        if (mask != 0) { return i + _ctz16(mask); }
+        i = i + 16;
+    }
+    while (i < len) { if (peek(buf + i) == c) { return i; } i++; }
+    return 0 - 1;
+}
+
+// Reference scalar memchr.
+static scalar_memchr(buf, len, c) {
+    auto i;
+    for (i = 0; i < len; i++) { if (peek(buf + i) == c) { return i; } }
+    return 0 - 1;
+}
+
+static print_ms(label, us) {
+    auto ms, frac;
+    ms = us / 1000; frac = us % 1000;
+    putstr(label); putnum(ms); putchar('.');
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    putnum(frac); putmsg(" ms");
+}
+
+const LEN = 4194304;       // 4 MiB buffer
+const ITERS = 200;         // scans per timing run
+
+main() {
+    auto buf, i, pos, a, b, t0, ts, tv, checksum_s, checksum_v;
+
+    buf = malloc(LEN);
+    // Fill with a byte that is NOT the needle (0x2E = '.'); needle = '!'.
+    for (i = 0; i < LEN; i++) { poke(buf + i, 0x2E); }
+
+    // ── Correctness: SIMD and scalar must agree for every needle position
+    //    we plant, including unaligned offsets and the scalar tail. ──
+    auto positions, np, ok;
+    positions = malloc(8 * 9);
+    positions[0] = 0;          // first byte
+    positions[1] = 1;          // unaligned, before first group end
+    positions[2] = 15;         // last lane of first group
+    positions[3] = 16;         // first lane of second group
+    positions[4] = 17;         // unaligned
+    positions[5] = 1000;       // deep, aligned-ish
+    positions[6] = 1003;       // deep, unaligned
+    positions[7] = LEN - 1;    // very last byte (forces full scan)
+    positions[8] = LEN - 3;    // inside the scalar tail region
+    np = 9;
+    ok = 1;
+    for (i = 0; i < np; i++) {
+        pos = positions[i];
+        poke(buf + pos, 0x21);                 // plant '!'
+        a = scalar_memchr(buf, LEN, 0x21);
+        b = simd_memchr(buf, LEN, 0x21);
+        poke(buf + pos, 0x2E);                 // restore
+        if (a != pos || b != pos) {
+            putstr("FAIL pos="); putnum(pos);
+            putstr(" scalar="); putnum(a); putstr(" simd="); putnum(b); putchar(10);
+            ok = 0;
+        }
+    }
+    if (ok == 0) { return 1; }
+    putmsg("CORRECTNESS: scalar and SIMD agree on all 9 needle positions");
+
+    // ── Throughput: needle at the very end forces a full-buffer scan. ──
+    poke(buf + (LEN - 1), 0x21);
+
+    checksum_s = 0;
+    t0 = beat_now_us();
+    for (i = 0; i < ITERS; i++) { checksum_s = checksum_s + scalar_memchr(buf, LEN, 0x21); }
+    ts = beat_now_us() - t0;
+
+    checksum_v = 0;
+    t0 = beat_now_us();
+    for (i = 0; i < ITERS; i++) { checksum_v = checksum_v + simd_memchr(buf, LEN, 0x21); }
+    tv = beat_now_us() - t0;
+
+    if (checksum_s != checksum_v) { putmsg("FAIL: checksum mismatch under timing"); return 1; }
+
+    putstr("buffer="); putnum(LEN / 1048576); putstr(" MiB  iters="); putnum(ITERS); putchar(10);
+    print_ms("  scalar memchr: ", ts);
+    print_ms("  simd   memchr: ", tv);
+    if (tv > 0) {
+        // Integer speedup x10 for one decimal place.
+        putstr("  speedup: "); putnum((ts * 10) / tv / 10); putchar('.');
+        putnum((ts * 10) / tv % 10); putmsg("x");
+    }
+    free(buf);
+    return 0;
+}
