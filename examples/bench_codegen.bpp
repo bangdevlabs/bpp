@@ -1,0 +1,108 @@
+// bench_codegen.bpp — the codegen-quality gate for register-allocation work.
+//
+// Two serial-dependent scalar kernels, the ones the compiler_boost_roadmap
+// uses to measure the gap to gcc -O2 (the register-allocation frontier):
+//
+//   biquad — a direct-form IIR filter. Each sample's output feeds the next
+//            (y depends on y1, y2), so the loop is latency-bound on the FP
+//            critical path: 5 fmul + 4 fadd/fsub per iteration. This is
+//            where float register allocation shows.
+//   lcg    — a 64-bit linear congruential generator. Each step depends on
+//            the previous (y = y*A + C), an integer serial chain — where
+//            integer register allocation / loop-control quality shows.
+//
+// Run native vs the oracle and compare:
+//   bpp  tests/bench_codegen.bpp -o /tmp/bcg_native && /tmp/bcg_native
+//   bpp --c tests/bench_codegen.bpp > /tmp/bcg.c
+//   cc -O2 /tmp/bcg.c -o /tmp/bcg_o2 && /tmp/bcg_o2
+// The printed checksums MUST match (correctness); the times give the gap.
+
+import "bpp_io.bsm";
+import "bpp_beat.bsm";
+import "bpp_buf.bsm";
+
+const N = 20000000;      // 20M iterations — sub-second, well above timer noise
+const TN = 65536;        // 64K-element array (512 KB, L2-resident → compute-bound)
+const TREP = 320;        // 320 passes = ~20M element-ops, matching N
+
+// Direct-form biquad IIR. Alternating ±1 input keeps the loop from settling
+// to a constant (which a compiler could fold). Returns the output sum as a
+// checksum; the FP feedback chain is the point.
+static biquad_sum() {
+    auto b0: float, b1: float, b2: float, a1: float, a2: float;
+    auto x1: float, x2: float, y1: float, y2: float;
+    auto i, x: float, y: float, acc: float;
+    b0 = 0.2;  b1 = 0.4;  b2 = 0.2;  a1 = 0.5;  a2 = 0.25;
+    x1 = 0.0;  x2 = 0.0;  y1 = 0.0;  y2 = 0.0;  acc = 0.0;
+    for (i = 0; i < N; i++) {
+        x = 1.0;
+        if ((i & 1) == 0) { x = 0.0 - 1.0; }
+        y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        acc = acc + y;
+    }
+    return acc;
+}
+
+// 64-bit LCG (Numerical Recipes constants). Pure integer serial chain.
+static lcg_final() {
+    auto i, s;
+    s = 1;
+    for (i = 0; i < N; i++) {
+        s = s * 6364136223846793005 + 1442695040888963407;
+    }
+    return s;
+}
+
+// THROUGHPUT-bound fixed-point transform: out[i] = (in[i]*A + C) >> 17.
+// Every element is independent (no serial chain), so the two loop-invariant
+// 64-bit constants A and C are rematerialised as pure per-element overhead
+// with no critical path to hide them behind. This is the AAA inner-loop
+// shape (vertex / fixed-point / hashing kernels) where loop-invariant
+// constant hoisting helps most — the case worth measuring before building.
+static void transform(in, out, n) {
+    auto i;
+    for (i = 0; i < n; i++) {
+        out[i] = (in[i] * 6364136223846793005 + 1442695040888963407) >> 17;
+    }
+}
+
+static print_ms(label, us) {
+    auto ms, frac;
+    ms = us / 1000; frac = us % 1000;
+    putstr(label); putnum(ms); putchar('.');
+    if (frac < 100) { putchar('0'); }
+    if (frac < 10)  { putchar('0'); }
+    putnum(frac); putmsg(" ms");
+}
+
+main() {
+    auto t0, tb, tl, tt, bsum: float, lsum, tsum, in, out, i, r;
+
+    t0 = beat_now_us();
+    bsum = biquad_sum();
+    tb = beat_now_us() - t0;
+
+    t0 = beat_now_us();
+    lsum = lcg_final();
+    tl = beat_now_us() - t0;
+
+    // Throughput kernel: a cache-resident array transformed TREP times.
+    in = buf_word(TN);
+    out = buf_word(TN);
+    for (i = 0; i < TN; i++) { in[i] = i * 2654435761; }
+    t0 = beat_now_us();
+    for (r = 0; r < TREP; r++) { transform(in, out, TN); }
+    tt = beat_now_us() - t0;
+    tsum = 0;
+    for (i = 0; i < TN; i++) { tsum = tsum + out[i]; }
+
+    putstr("biquad checksum: "); putfloat(bsum); putchar(10);
+    putstr("lcg    checksum: "); putnum(lsum); putchar(10);
+    putstr("xform  checksum: "); putnum(tsum); putchar(10);
+    print_ms("biquad (20M, FP serial):    ", tb);
+    print_ms("lcg    (20M, int serial):   ", tl);
+    print_ms("xform  (20M, int thruput):  ", tt);
+    free(in); free(out);
+    return 0;
+}
