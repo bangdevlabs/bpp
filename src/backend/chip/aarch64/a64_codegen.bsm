@@ -1331,6 +1331,61 @@ a64_emit_call(nd) {
             return 1;
         }
 
+        // ── Byte-wide SIMD (16 × uint8) — group-scan kit for memchr,
+        // string search and swiss-style hashing. vec_load16b / splat /
+        // cmeq leave a vector in V0 (return 2, same as the 4×f32 ops);
+        // vec_movemask collapses a lane vector to a plain 16-bit integer
+        // bitmask in the accumulator (return 0).
+        if (cg_str_eq(n.a, "vec_load16b", 11)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // byte pointer → x0
+            if (a64_bin_mode) { enc_ldr_q_uoff(0, 0, 0); }
+            else { out("  ldr q0, [x0]"); putchar('\n'); }
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_splat_byte", 14)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // byte value → x0 (low 8 bits used)
+            if (a64_bin_mode) { enc_dup_v_16b(0, 0); }
+            else { out("  dup v0.16b, w0"); putchar('\n'); }
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_cmeq_byte", 13)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 8));   // second operand → v0
+            a64_emit_vpush();
+            call(pp.emit_node, *(arr + 0));   // first operand → v0
+            a64_emit_vpop(1);                 // v1 = second operand
+            if (a64_bin_mode) { enc_cmeq_v_16b(0, 0, 1); }
+            else { out("  cmeq v0.16b, v0.16b, v1.16b"); putchar('\n'); }
+            return 2;
+        }
+        if (cg_str_eq(n.a, "vec_movemask", 12)) {
+            arr = n.b;
+            call(pp.emit_node, *(arr + 0));   // lane vector → v0
+            // Reduce 16 high-bits (one per byte lane) to a 16-bit integer
+            // mask, bit i set when lane i's high bit is set. SRA tree —
+            // the constant-free NEON equivalent of x86 PMOVMSKB.
+            if (a64_bin_mode) {
+                enc_ushr_v_16b(0, 0, 7);
+                enc_usra_v_8h(0, 0, 7);
+                enc_usra_v_4s(0, 0, 14);
+                enc_usra_v_2d(0, 0, 28);
+                enc_umov_w_b(0, 0, 0);        // w0 = lanes 0..7
+                enc_umov_w_b(1, 0, 8);        // w1 = lanes 8..15
+                enc_orr_w_lsl(0, 0, 1, 8);    // x0 = w0 | (w1 << 8)
+            } else {
+                out("  ushr v0.16b, v0.16b, #7"); putchar('\n');
+                out("  usra v0.8h, v0.8h, #7");   putchar('\n');
+                out("  usra v0.4s, v0.4s, #14");  putchar('\n');
+                out("  usra v0.2d, v0.2d, #28");  putchar('\n');
+                out("  umov w0, v0.b[0]");        putchar('\n');
+                out("  umov w1, v0.b[8]");        putchar('\n');
+                out("  orr w0, w0, w1, lsl #8");  putchar('\n');
+            }
+            return 0;
+        }
+
         // Regular B++ function call.
         // Query bpp_types.bsm for callee's parameter and return types.
         fidx_c = find_func_idx(n.a);

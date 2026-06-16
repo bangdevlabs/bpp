@@ -867,6 +867,71 @@ void enc_umov_w_s(rd, rn, lane) {
     enc_emit32(0x0E043C00 | (((lane * 4 + 4) & 0x1F) << 16) | (rn << 5) | rd);
 }
 
+// ── Byte-wide SIMD (16 × uint8) — the swiss/memchr group-scan kit ──
+// These complement the 4×float32 ops above. A 128-bit Q register holds
+// sixteen bytes (Vd.16B); these primitives load, broadcast, compare and
+// finally collapse the lanes into a plain integer bitmask so ordinary
+// B++ integer code can act on a 16-byte parallel comparison.
+
+// DUP Vd.16B, Wn — broadcast the low byte of a GPR into all 16 lanes.
+// Use to build the "needle" vector before a CMEQ scan.
+void enc_dup_v_16b(rd, rn) {
+    enc_emit32(0x4E010C00 | (rn << 5) | rd);
+}
+
+// CMEQ Vd.16B, Vn.16B, Vm.16B — per-lane equality. Each byte lane of the
+// result is 0xFF when the inputs match and 0x00 otherwise.
+void enc_cmeq_v_16b(rd, rn, rm) {
+    enc_emit32(0x6E208C00 | (rm << 16) | (rn << 5) | rd);
+}
+
+// USHR Vd.16B, Vn.16B, #shift — unsigned shift right, byte lanes.
+// The SIMD shift-by-immediate encoding stores (16 - shift) split across
+// immh:immb; this helper computes that split for any 1..8 shift.
+void enc_ushr_v_16b(rd, rn, shift) {
+    auto f;
+    f = 16 - shift;
+    enc_emit32(0x6F000000 | (((f >> 3) & 0xF) << 19) | ((f & 0x7) << 16) | (1 << 10) | (rn << 5) | rd);
+}
+
+// USRA Vd.8H, Vn.8H, #shift — unsigned shift right and ACCUMULATE,
+// 16-bit lanes. (16-bit field = 32 - shift.) Step in the movemask
+// reduction tree that folds 16 single-bit lanes toward two bytes.
+void enc_usra_v_8h(rd, rn, shift) {
+    auto f;
+    f = 32 - shift;
+    enc_emit32(0x6F000000 | (((f >> 3) & 0xF) << 19) | ((f & 0x7) << 16) | (2 << 11) | (1 << 10) | (rn << 5) | rd);
+}
+
+// USRA Vd.4S, Vn.4S, #shift — unsigned shift right and accumulate,
+// 32-bit lanes. (32-bit field = 64 - shift.)
+void enc_usra_v_4s(rd, rn, shift) {
+    auto f;
+    f = 64 - shift;
+    enc_emit32(0x6F000000 | (((f >> 3) & 0xF) << 19) | ((f & 0x7) << 16) | (2 << 11) | (1 << 10) | (rn << 5) | rd);
+}
+
+// USRA Vd.2D, Vn.2D, #shift — unsigned shift right and accumulate,
+// 64-bit lanes. (64-bit field = 128 - shift.)
+void enc_usra_v_2d(rd, rn, shift) {
+    auto f;
+    f = 128 - shift;
+    enc_emit32(0x6F000000 | (((f >> 3) & 0xF) << 19) | ((f & 0x7) << 16) | (2 << 11) | (1 << 10) | (rn << 5) | rd);
+}
+
+// UMOV Wd, Vn.B[lane] — extract one byte lane into a GPR. The byte index
+// encodes in imm5 as (lane*2 + 1). Used to read the two reduced mask
+// bytes (lanes 0..7 and 8..15) out of the movemask reduction.
+void enc_umov_w_b(rd, rn, lane) {
+    enc_emit32(0x0E003C00 | ((((lane * 2) | 1) & 0x1F) << 16) | (rn << 5) | rd);
+}
+
+// ORR Wd, Wn, Wm, LSL #sh — 32-bit bitwise OR with the second operand
+// shifted left. Combines the two mask bytes into the final 16-bit mask.
+void enc_orr_w_lsl(rd, rn, rm, sh) {
+    enc_emit32(0x2A000000 | (rm << 16) | ((sh & 0x3F) << 10) | (rn << 5) | rd);
+}
+
 // ── PC-relative addressing ───────────────────────────────
 
 // ADRP Xd, 0 — emit with zero page offset; actual value set by relocation.

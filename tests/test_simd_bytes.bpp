@@ -1,0 +1,56 @@
+// skip-c: byte-wide SIMD builtins — C-emit lowering lands in the x64/C slice
+// test_simd_bytes.bpp — Correctness gate for the byte-wide SIMD builtins.
+//
+// Exercises the full group-scan pipeline (vec_load16b -> vec_splat_byte ->
+// vec_cmeq_byte -> vec_movemask) and asserts the EXACT 16-bit bitmask for
+// single-match, no-match, all-match, alternating, high-lane and split
+// patterns. The SIMD values are composed inline because they live in V0,
+// never in a typed local; only the final integer mask is stored.
+//
+// Exits 0 when every mask is correct, 1 on the first wrong value.
+
+import "bpp_io.bsm";
+
+static fail(msg, got, want) {
+    putstr(msg); putstr(" got="); putnum(got); putstr(" want="); putnum(want); putchar(10);
+    return 1;
+}
+
+main() {
+    auto buf, i, mask;
+    buf = malloc(16);
+
+    // Case 1: lanes 0..15 = 0..15; search 7 -> only lane 7 matches -> bit 7.
+    for (i = 0; i < 16; i++) { poke(buf + i, i); }
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(7)));
+    if (mask != 128) { return fail("C1 single-match", mask, 128); }
+
+    // Case 2: same buffer, search 99 (absent) -> no lanes -> 0.
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(99)));
+    if (mask != 0) { return fail("C2 no-match", mask, 0); }
+
+    // Case 3: all bytes 0xAA, search 0xAA -> every lane -> 0xFFFF.
+    for (i = 0; i < 16; i++) { poke(buf + i, 0xAA); }
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(0xAA)));
+    if (mask != 0xFFFF) { return fail("C3 all-match", mask, 0xFFFF); }
+
+    // Case 4: even lanes = 5, odd lanes = 0; search 5 -> 0x5555.
+    for (i = 0; i < 16; i++) { if ((i & 1) == 0) { poke(buf + i, 5); } else { poke(buf + i, 0); } }
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(5)));
+    if (mask != 0x5555) { return fail("C4 even-lanes", mask, 0x5555); }
+
+    // Case 5: only the top lane (15) matches -> bit 15 -> 0x8000.
+    for (i = 0; i < 16; i++) { poke(buf + i, 1); }
+    poke(buf + 15, 42);
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(42)));
+    if (mask != 0x8000) { return fail("C5 lane-15", mask, 0x8000); }
+
+    // Case 6: lanes 0 and 8 match -> bits 0 and 8 -> 0x0101.
+    for (i = 0; i < 16; i++) { poke(buf + i, 3); }
+    poke(buf + 0, 9); poke(buf + 8, 9);
+    mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf), vec_splat_byte(9)));
+    if (mask != 0x0101) { return fail("C6 lanes-0-8", mask, 0x0101); }
+
+    putmsg("OK: vec_load16b + splat_byte + cmeq_byte + movemask correct");
+    return 0;
+}
