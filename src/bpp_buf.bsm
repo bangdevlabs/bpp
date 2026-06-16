@@ -196,6 +196,44 @@ buf_cmp(a, b, n) {
     return 0;
 }
 
+// Count trailing zeros of a non-zero 16-bit value — the lane index of the
+// first set bit in a vec_movemask result.
+static _buf_ctz16(x) {
+    auto n;
+    n = 0;
+    if ((x & 0xFF) == 0) { n += 8; x = x >> 8; }
+    if ((x & 0xF)  == 0) { n += 4; x = x >> 4; }
+    if ((x & 0x3)  == 0) { n += 2; x = x >> 2; }
+    if ((x & 0x1)  == 0) { n += 1; }
+    return n;
+}
+
+// Find the first byte equal to `c` (low 8 bits) in buf[0..len).
+// Returns the byte index, or -1 if the byte is not present.
+//
+// Scans 16 bytes at a time with the byte-wide SIMD builtins (vec_load16b /
+// vec_splat_byte / vec_cmeq_byte / vec_movemask) and falls back to a scalar
+// loop for the final partial group, so it never reads past `buf + len`. On a
+// long buffer this is roughly an order of magnitude faster than a
+// byte-at-a-time scan; on a short one it is just the scalar tail. The
+// builtins lower to NEON on arm64, SSE2 on x86_64, and a portable scalar
+// form under the C emitter. See examples/simd_memchr.bpp for the benchmark.
+buf_find_byte(buf, len, c) {
+    auto i, needle, mask;
+    needle = c & 255;
+    i = 0;
+    while (i + 16 <= len) {
+        mask = vec_movemask(vec_cmeq_byte(vec_load16b(buf + i), vec_splat_byte(needle)));
+        if (mask != 0) { return i + _buf_ctz16(mask); }
+        i += 16;
+    }
+    while (i < len) {
+        if (peek(buf + i) == needle) { return i; }
+        i++;
+    }
+    return 0 - 1;
+}
+
 // ── Allocation helpers ─────────────────────────────────────────────────────────
 
 // Allocate n bytes. Returns a raw pointer — no header, no length.
