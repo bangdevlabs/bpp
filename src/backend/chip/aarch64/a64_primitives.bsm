@@ -291,6 +291,68 @@ _a64_simd_temp_alloc() { return a64_simd_alloc_temp(); }
 void _a64_simd_temp_free(reg) { a64_simd_free(reg); }
 _a64_simd_temp_count() { return 6; }
 
+// ── Integer compute-in-place primitives (the int analog of fload/fop) ──
+// The spine's cg_emit_int_into builds a `+ - * / & | ^` integer tree with
+// operands kept in registers instead of shuttling every value through x0.
+// Temps come from the existing GP freelist (x9..x15); the count reported
+// is the CURRENT free count, so a nested tree that runs out of registers
+// falls back to the accumulator path via the spine's gate.
+
+// Load a plain 64-bit integer local straight into x<dreg> (no x0 detour).
+void _a64_emit_iload_var_into(dreg, off) {
+    if (a64_bin_mode) { enc_ldr_uoff(dreg, 29, off); }
+    else {
+        out("  ldr x"); a64_print_dec(dreg);
+        out(", [x29, #"); a64_print_dec(off); out("]"); putchar('\n');
+    }
+}
+
+// Materialise a 64-bit immediate directly into x<dreg> (movz/movk).
+void _a64_emit_iconst_into(dreg, val) {
+    auto lo, hi;
+    if (a64_bin_mode) { enc_mov_wide(dreg, val); return 0; }
+    if (val >= 0 && val < 65536) {
+        out("  mov x"); a64_print_dec(dreg); out(", #"); a64_print_dec(val); putchar('\n');
+        return 0;
+    }
+    lo = val & 0xFFFF;
+    out("  movz x"); a64_print_dec(dreg); out(", #"); a64_print_dec(lo); putchar('\n');
+    hi = (val >> 16) & 0xFFFF;
+    if (hi > 0) { out("  movk x"); a64_print_dec(dreg); out(", #"); a64_print_dec(hi); out(", lsl #16"); putchar('\n'); }
+    hi = (val >> 32) & 0xFFFF;
+    if (hi > 0) { out("  movk x"); a64_print_dec(dreg); out(", #"); a64_print_dec(hi); out(", lsl #32"); putchar('\n'); }
+    hi = (val >> 48) & 0xFFFF;
+    if (hi > 0) { out("  movk x"); a64_print_dec(dreg); out(", #"); a64_print_dec(hi); out(", lsl #48"); putchar('\n'); }
+}
+
+// x<dreg> = x<s1> OP x<s2>. op: 0=add 1=sub 2=mul 3=sdiv 4=and 5=orr 6=eor.
+void _a64_emit_iop_into(op_code, dreg, s1, s2) {
+    if (a64_bin_mode) {
+        if (op_code == 1) { enc_sub_reg(dreg, s1, s2); return 0; }
+        if (op_code == 2) { enc_mul(dreg, s1, s2);     return 0; }
+        if (op_code == 3) { enc_sdiv(dreg, s1, s2);    return 0; }
+        if (op_code == 4) { enc_and_reg(dreg, s1, s2); return 0; }
+        if (op_code == 5) { enc_orr_reg(dreg, s1, s2); return 0; }
+        if (op_code == 6) { enc_eor_reg(dreg, s1, s2); return 0; }
+        enc_add_reg(dreg, s1, s2); return 0;
+    }
+    if (op_code == 1) { out("  sub x"); }
+    else if (op_code == 2) { out("  mul x"); }
+    else if (op_code == 3) { out("  sdiv x"); }
+    else if (op_code == 4) { out("  and x"); }
+    else if (op_code == 5) { out("  orr x"); }
+    else if (op_code == 6) { out("  eor x"); }
+    else { out("  add x"); }
+    a64_print_dec(dreg); out(", x"); a64_print_dec(s1); out(", x"); a64_print_dec(s2); putchar('\n');
+}
+
+// GP-freelist temp wrappers. count = current free registers (via the
+// owning file's accessor), so the spine's `need <= count` gate respects
+// what is actually available at this point in the expression.
+_a64_int_temp_alloc() { return a64_gp_alloc(); }
+void _a64_int_temp_free(reg) { a64_gp_free(reg); }
+_a64_int_temp_count() { return a64_gp_free_count(); }
+
 // ── BINOP comparisons (Wave 6) ──
 //
 // Map portable CG_CC_* to AArch64 nzcv condition codes for cset.

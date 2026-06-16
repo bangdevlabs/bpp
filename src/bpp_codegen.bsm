@@ -439,6 +439,19 @@ struct ChipPrimitives {
     simd_temp_alloc,          // () → a caller-saved SIMD temp reg, or -1
     simd_temp_free,           // (reg) — return a temp to the pool
     simd_temp_count,          // () → temp-pool size (0 disables the path)
+
+    // ── Integer compute-in-place (the int analog of the float CIP above) ──
+    // cg_emit_int_into walks a `+ - * / & | ^` integer tree and emits
+    // destination-driven ops instead of the x0 accumulator shuttle. Temps
+    // come from the GP freelist; a chip that returns 0 from int_temp_count
+    // opts out and keeps the accumulator path (x86_64 until ported).
+    emit_iload_var_into,      // (dreg, off) — ldr x<dreg>, [fp, #off]
+    emit_iconst_into,         // (dreg, val) — materialise immediate into x<dreg>
+    emit_iop_into,            // (op_code, dreg, s1, s2) — x<dreg> = x<s1> OP x<s2>
+                              //   op: 0=add 1=sub 2=mul 3=sdiv 4=and 5=orr 6=eor
+    int_temp_alloc,           // () → a free GP temp reg, or -1
+    int_temp_free,            // (reg) — return a temp to the pool
+    int_temp_count,           // () → CURRENT free temp count (0 disables)
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -3134,6 +3147,116 @@ cg_emit_float_into(nd, dreg) {
     return 0;
 }
 
+// ── Integer compute-in-place (the int analog of the float trio above) ──
+// Same shape as cg_float_leaf_kind / cg_float_tree_need / cg_emit_float_into,
+// extended for the two integer-only leaf kinds the float tree lacked: an
+// integer constant (materialised straight into its register) and the same
+// plain frame/promoted local. Ops are the sign-agnostic `+ - * & | ^`
+// (division and shifts are deferred — sdiv vs udiv depends on the operand's
+// signedness, and shifts arrive with the memory-load leaves in a later
+// slice). Comparisons and 2-char ops fall through to the accumulator path.
+
+// Classify an integer-tree leaf. -1 = not eligible; 0 = needs
+// materialisation into a register (a frame local OR an integer constant);
+// a positive value = the callee-saved register a B3-promoted local lives in
+// (read directly, no load).
+cg_int_leaf_kind(nd) {
+    auto n: Node, vi, fty, preg, lit_s;
+    if (nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype == T_LIT) {
+        lit_s = unpack_s(n.a);
+        if (peek(cg_sbuf + lit_s) == '"') { return -1; }   // string literal
+        if (cg_is_float_lit(n.a) == 1) { return -1; }       // float literal
+        return 0;                                           // integer constant
+    }
+    if (n.ntype != T_VAR) { return -1; }
+    vi = cg_var_idx(n.a);
+    if (vi < 0) { return -1; }                       // global / unknown
+    if (cg_var_is_float(vi)) { return -1; }          // float local, not int
+    if (arr_get(cg_var_stack, vi)) { return -1; }    // address-taken / struct
+    fty = arr_get(cg_var_forced_ty, vi);
+    if (ty_slice(fty) != SL_FULL) { return -1; }     // sub-word ints: diff load width
+    preg = arr_get(cg_var_promote, vi);
+    if (preg >= 0) { return preg; }                  // B3-promoted int register
+    return 0;                                         // frame leaf
+}
+
+// Sethi-Ullman temp need for an eligible integer tree, or 999 (forces the
+// accumulator fallback). Same left-first recurrence as the float pass.
+cg_int_tree_need(nd) {
+    auto n: Node, t, c0, op_l, nl, nr, k, rc;
+    if (nd == 0) { return 999; }
+    n = nd; t = n.ntype;
+    if (t == T_LIT || t == T_VAR) {
+        if (cg_int_leaf_kind(nd) < 0) { return 999; }
+        return 0;
+    }
+    if (t == T_BINOP) {
+        op_l = unpack_l(n.a);
+        if (op_l != 1) { return 999; }               // 2-char ops (<< >> == …) excluded
+        c0 = peek(cg_sbuf + unpack_s(n.a));
+        if (c0 != '+' && c0 != '-' && c0 != '*' && c0 != '&' && c0 != '|' && c0 != '^') { return 999; }
+        nl = cg_int_tree_need(n.b);
+        if (nl >= 999) { return 999; }
+        k = cg_int_leaf_kind(n.c);
+        if (k > 0) {
+            rc = 0;                                  // promoted right: read directly
+        } else {
+            nr = cg_int_tree_need(n.c);
+            if (nr >= 999) { return 999; }
+            rc = 1 + nr;
+        }
+        if (nl > rc) { return nl; }
+        return rc;
+    }
+    return 999;
+}
+
+// Emit an eligible integer tree (validated/budgeted by cg_int_tree_need)
+// directly into x<dreg>: the left operand reuses dreg down the left spine,
+// each right operand lands in a freshly allocated GP temp, the op writes
+// its destination. No value shuttles through x0.
+cg_emit_int_into(nd, dreg) {
+    auto p: ChipPrimitives;
+    auto n: Node, t, vi, off, c0, op_code, lsrc, rsrc, tr, lk, rk;
+    p = cg_prim;
+    n = nd; t = n.ntype;
+    if (t == T_LIT) {
+        call(p.emit_iconst_into, dreg, cg_parse_int(n.a));
+        return 0;
+    }
+    if (t == T_VAR) {
+        lk = cg_int_leaf_kind(nd);
+        if (lk > 0) {
+            call(p.emit_mov_reg_reg, dreg, lk);      // promoted: mov x<dreg>, x<lk>
+        } else {
+            vi = cg_var_idx(n.a);
+            off = arr_get(cg_var_off, vi);
+            call(p.emit_iload_var_into, dreg, off);
+        }
+        return 0;
+    }
+    // T_BINOP: dreg = (left) OP (right).
+    c0 = peek(cg_sbuf + unpack_s(n.a));
+    op_code = 0;
+    if (c0 == '-') { op_code = 1; }
+    if (c0 == '*') { op_code = 2; }
+    if (c0 == '&') { op_code = 4; }
+    if (c0 == '|') { op_code = 5; }
+    if (c0 == '^') { op_code = 6; }
+    lk = cg_int_leaf_kind(n.b);
+    if (lk > 0) { lsrc = lk; }
+    else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
+    rk = cg_int_leaf_kind(n.c);
+    tr = -1;
+    if (rk > 0) { rsrc = rk; }
+    else { tr = call(p.int_temp_alloc); cg_emit_int_into(n.c, tr); rsrc = tr; }
+    call(p.emit_iop_into, op_code, dreg, lsrc, rsrc);
+    if (tr >= 0) { call(p.int_temp_free, tr); }
+    return 0;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -3236,6 +3359,17 @@ cg_emit_node(nd) {
         if (cg_float_tree_need(n) <= call(p.simd_temp_count)) {
             cg_emit_float_into(n, 0);
             return 1;
+        }
+
+        // Integer compute-in-place: a pure `+ - * & | ^` integer tree whose
+        // register need fits the currently-free GP temps emits
+        // destination-driven into x0 (no accumulator shuttle). Same gate
+        // shape; a chip that returns a negative int_temp_count opts out
+        // (x86_64 today). Float trees already returned above, so this only
+        // sees integer trees (cg_int_tree_need is 999 otherwise).
+        if (cg_int_tree_need(n) <= call(p.int_temp_count)) {
+            cg_emit_int_into(n, 0);
+            return 0;
         }
 
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
