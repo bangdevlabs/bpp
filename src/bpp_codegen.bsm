@@ -472,6 +472,7 @@ struct ChipPrimitives {
     emit_iv_setup,            // (base_reg, idx_reg) — base_reg += idx_reg*8 (pre-loop)
     iv_supported,             // () → 1 if the chip supports the pointer walk (a64), else 0
     emit_self_op_imm,         // (reg, imm, is_sub) — x<reg> = x<reg> +/- imm (in place; `i = i + 1`)
+    emit_cmp_branch,          // (cond_id, left_reg, lbl) — cmp + branch-to-lbl-when-false (no cset)
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -3748,6 +3749,43 @@ cg_iv_detect(while_nd) {
     return 1;
 }
 
+// Loop/if condition fusion: if `cond_node` is a SIGNED INTEGER comparison,
+// evaluate its operands and branch to `exit_lbl` when the comparison is FALSE
+// (cmp + b.cc), returning 1. Otherwise return 0 and the caller emits the
+// boolean then tests it (cmp + cset + cbz). Float (fcmp) and unsigned (LO/LS/
+// HI/HS condition codes) comparisons keep the existing boolean path.
+cg_emit_cmp_to_branch(cond_node, exit_lbl) {
+    auto p: ChipPrimitives, n: Node, op_s, op_l, c0, c1, cond_id;
+    auto lhs_n: Node, lhs_ty, lty, rty, save_token, left_reg;
+    p = cg_prim;
+    if (cond_node == 0) { return 0; }
+    n = cond_node;
+    if (n.ntype != T_BINOP) { return 0; }
+    op_s = unpack_s(n.a); op_l = unpack_l(n.a);
+    c0 = peek(cg_sbuf + op_s);
+    c1 = 0; if (op_l > 1) { c1 = peek(cg_sbuf + op_s + 1); }
+    cond_id = -1;
+    if (c0 == '=' && c1 == '=') { cond_id = CG_CC_EQ; }
+    if (c0 == '!' && c1 == '=') { cond_id = CG_CC_NE; }
+    if (c0 == '<' && c1 == '=') { cond_id = CG_CC_LE; }
+    if (c0 == '>' && c1 == '=') { cond_id = CG_CC_GE; }
+    if (c0 == '<' && op_l == 1) { cond_id = CG_CC_LT; }
+    if (c0 == '>' && op_l == 1) { cond_id = CG_CC_GT; }
+    if (cond_id < 0) { return 0; }
+    lhs_n = n.b;
+    lhs_ty = lhs_n.itype;
+    if (is_float_type(lhs_ty)) { return 0; }
+    if (is_unsigned_type(lhs_ty)) { return 0; }
+    // Evaluate operands like the BINOP comparison path, then branch instead of
+    // materialising a boolean.
+    lty = call(p.emit_node, n.b);
+    save_token = call(p.emit_binop_save_left, cg_has_call(n.c), lty);
+    rty = call(p.emit_node, n.c);
+    left_reg = call(p.emit_binop_resolve, save_token, 0, lty, rty);
+    call(p.emit_cmp_branch, cond_id, left_reg, exit_lbl);
+    return 1;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -4064,9 +4102,11 @@ void cg_emit_stmt(nd) {
     if (t == T_IF) {
         lbl  = call(p.emit_new_label);
         lbl2 = call(p.emit_new_label);
-        ety = call(p.emit_node, n.a);
-        if (ety == 1) { call(p.emit_fcond_to_int_truth); }
-        call(p.emit_branch_if_zero, lbl);
+        if (cg_emit_cmp_to_branch(n.a, lbl) == 0) {
+            ety = call(p.emit_node, n.a);
+            if (ety == 1) { call(p.emit_fcond_to_int_truth); }
+            call(p.emit_branch_if_zero, lbl);
+        }
         call(p.emit_body, n.b, n.c);
         call(p.emit_jump, lbl2);
         call(p.emit_label, lbl);
@@ -4093,9 +4133,11 @@ void cg_emit_stmt(nd) {
         cg_break_stack = arr_push(cg_break_stack, lbl2);
         cg_continue_stack = arr_push(cg_continue_stack, lbl3);
         call(p.emit_label, lbl);
-        ety = call(p.emit_node, n.a);
-        if (ety == 1) { call(p.emit_fcond_to_int_truth); }
-        call(p.emit_branch_if_zero, lbl2);
+        if (cg_emit_cmp_to_branch(n.a, lbl2) == 0) {
+            ety = call(p.emit_node, n.a);
+            if (ety == 1) { call(p.emit_fcond_to_int_truth); }
+            call(p.emit_branch_if_zero, lbl2);
+        }
         call(p.emit_body, n.b, n.c);
         call(p.emit_label, lbl3);
         if (step_node != 0) { cg_emit_stmt(step_node); }
