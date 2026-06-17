@@ -2431,7 +2431,7 @@ The single anchor: **the oracle is `gcc -O2`.** Emit the same program to C
 `examples/bench_codegen.bpp` does exactly this for three kernels (a serial FP
 filter, a serial integer LCG, and a throughput transform). As of 2026-06-17 the
 serial kernels and a register-heavy leaf kernel are at gcc -O2 parity; the
-throughput transform is ~1.3–1.4×.
+throughput transform is ~1.1× (within machine noise of the oracle).
 
 ### §18.1 — Register allocation (where your values live)
 
@@ -2464,6 +2464,8 @@ funnelled through an accumulator. On top of that:
 | `i * 8` (power-of-two multiply) | `lsl x0, x0, #3` (strength reduction) |
 | `a*b + c` | `madd x0, a, b, c` (one fused multiply-add) |
 | a big loop-invariant constant | materialised **once** in a register before the loop |
+| `i = i + 1` (promoted local, small constant) | `add x19, x19, #1` in place |
+| `while (i < n)` / `if (a < b)` (int compare) | `cmp; b.ge` — branch on the flags, no boolean |
 
 These are why a fixed-point inner line like `out[i] = (in[i]*A + C) >> 17`
 becomes `ldr; madd; asr; str` — the same instructions gcc picks.

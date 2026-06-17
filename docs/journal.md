@@ -13859,3 +13859,33 @@ things, and the disassembly said the AAA kernel's bottleneck was never
 register *pressure* (6 registers fit) but instruction selection + addressing.
 b++ already had a register allocator (B1 freelist + B3 promotion); the work was
 widening and extending it, not inventing one.
+
+### 2026-06-17 (cont) — loop control: the cheap general peepholes
+
+The xform loop body had matched gcc since the induction walk, but the loop
+CONTROL was still ~10 instructions to gcc's 2: a 6-instruction condition
+(`cmp; cset; cbz` plus copying the promoted operands to scratch) and a
+3-instruction `i++` (`mov #1; add; mov`). Rather than the narrow loop-reversal
+(count the trip count down to `subs/b.ne`), two GENERAL peepholes — useful in
+every loop and every `if` in the whole codebase, not just counted array loops:
+
+- **Self-update with an immediate (`820dd54`).** `v = v + k` / `v = v - k` for a
+  promoted integer local and a small constant updates the register in place
+  (`add/sub reg, reg, #k`). `i++` drops 3 → 1 instruction.
+- **Compare-and-branch fusion (`ab16804`).** A loop/if condition that is a
+  signed integer comparison branches directly on the flags (`cmp; b.ge`) instead
+  of materialising a boolean and testing it (`cmp; cset; cbz`). The exit branch
+  uses the INVERSE condition code (`cc ^ 1`, valid on both ISAs for the eq/ne,
+  lt/ge, le/gt pairs). Wired into the T_IF and T_WHILE statement conditions.
+
+Both land on both backends. **xform 8.87 → 7.3 ms (1.44× → ~1.1× gcc -O2)** —
+the throughput kernel is now within noise of the oracle. The remaining residual
+is the condition operand copies (`cmp` could read the promoted `i`/`n`
+registers directly) and computing a result straight into its destination
+register — micro-opts with diminishing returns. lcg's loop control tightened
+the same way (its 23 ms vs gcc's 18 ms is machine load on a shared laptop, not a
+regression — the disassembly is strictly smaller than before).
+
+Full benchmark catalog + historical record consolidated in
+`docs/manual/benchmarks.md`. Native 192/0/12, C-emit 155/0/49, gen2==gen3
+byte-stable, x64 self-host byte-stable, compile-time 0.25s, 0 bootstrap warnings.

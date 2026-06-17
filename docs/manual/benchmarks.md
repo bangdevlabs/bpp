@@ -58,9 +58,12 @@ numbers, and how the headline metrics have evolved over time.
 | `tests/bench_stbflow.bpp` | flow-field vs A* pathfinding | same | ~5× |
 | `examples/tablah_opt.bpp` | table-processing kernel variants | `bpp examples/tablah_opt.bpp -o /tmp/x && /tmp/x` | — |
 
-## Latest results — 2026-06-17 (before the loop-control arc)
+## Latest results — 2026-06-17 (after the loop-control arc)
 
-Machine: Apple-silicon laptop (shared, noisy); min of 5–7 runs.
+Machine: Apple-silicon laptop (shared, noisy); min of 7–12 runs. The
+serial/FP ratios swing with machine load — treat the codegen structure
+(verified by disassembly) as the ground truth and the wall-clock as
+directional.
 
 **Compile-time** (`bench_compile.sh`): bootstrap **0.25s**, small 0.03s, medium 0.04s.
 
@@ -68,9 +71,9 @@ Machine: Apple-silicon laptop (shared, noisy); min of 5–7 runs.
 
 | kernel | b++ | gcc -O2 | ratio |
 |---|---|---|---|
-| biquad (FP serial) | ~62 ms | ~62 ms | ~1.0× (noisy) |
-| lcg (int serial) | 20.5 ms | 18.7 ms | 1.09× |
-| xform (int throughput) | 8.87 ms | 6.14 ms | 1.44× |
+| biquad (FP serial) | ~64 ms | ~46–62 ms | ~1.0–1.4× (noisy) |
+| lcg (int serial) | ~20–23 ms | ~18 ms | ~1.1–1.3× (noisy; codegen tighter than before) |
+| xform (int throughput) | 7.3 ms | 6.4 ms | **~1.1×** (loop body + control now match gcc's structure) |
 | regheavy (register-heavy leaf) | 0.35 s | 0.30 s | ~1.17× |
 
 **Autovec / parallel / SIMD:**
@@ -112,8 +115,8 @@ Machine: Apple-silicon laptop (shared, noisy); min of 5–7 runs.
 | 2026-06-16 | `bench_codegen` introduced; baseline | 3.71× |
 | 2026-06-16 | integer compute-in-place + constant/param promotion | 2.35× |
 | 2026-06-17 | instruction selection (immediate shift, CIP memory-leaf fix, strength reduction, integer madd) | ~1.6× |
-| 2026-06-17 | induction-variable pointer walk | **~1.44×** |
-| (next) | loop-control (count-down trip count → `subs/b.ne`) | TBD |
+| 2026-06-17 | induction-variable pointer walk | ~1.44× |
+| 2026-06-17 | loop control (self-update `i++` + compare-and-branch fusion) | **~1.1×** |
 
 ### lcg — integer serial kernel, ratio to gcc -O2
 
@@ -131,6 +134,19 @@ Machine: Apple-silicon laptop (shared, noisy); min of 5–7 runs.
 | 2026-06-17 | current (SERIAL 89.9 → 19.3 ms) | 4× |
 
 Bandwidth-bound at N=1M; compute-bound workloads approach the ~32× ceiling.
+
+### tablah — Swift-port hashmap benchmark (total, both variants)
+
+| Date | Note | `tablah` | `tablah_opt` |
+|---|---|---|---|
+| 2026-04-24 | introduced (external developer port) — drove `print_str` + the hash iteration API | — | — |
+| ~2026-05 | hot-path era | ~49 ms | ~40 ms |
+| 2026-06-17 | current | ~48 ms | ~39 ms |
+
+tablah is hashmap-bound (insertion + filtering dominate), so it moves little
+with scalar codegen work; the steady ~18–20 % `tablah` → `tablah_opt` gap is the
+hand inline+unroll of `xorshift64`. It is the standing reference for "what a
+real external workload costs," not a codegen micro-gate.
 
 ## Adding a benchmark
 
