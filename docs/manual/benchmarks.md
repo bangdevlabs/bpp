@@ -84,6 +84,15 @@ Machine: Apple-silicon laptop (shared, noisy); min of 5–7 runs.
 | bench_ecs_sparse_query | ~22× vs sparse |
 | bench_ecs_iter (archetype vs legacy) | 1.12× |
 
+**tablah** (Swift-port hashmap benchmark, 1M items → 24544 filtered), per phase:
+
+| phase | `tablah.bpp` | `tablah_opt.bpp` (inline+unroll) |
+|---|---|---|
+| generate u64 vector | 12.5 ms | 6.7 ms |
+| generate u32 vector | 1.0 ms | 1.3 ms |
+| hashmap create (1M inserts) | 17.5 ms | 18.6 ms |
+| hashmap filter | 16.7 ms | 12.1 ms |
+
 ## Historical evolution
 
 ### Bootstrap self-compile time
