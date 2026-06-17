@@ -456,6 +456,7 @@ struct ChipPrimitives {
     emit_iop_into,            // (op_code, dreg, s1, s2) — x<dreg> = x<s1> OP x<s2>
                               //   op: 0=add 1=sub 2=mul 3=sdiv 4=and 5=orr 6=eor
     emit_iload_mem_into,      // (dreg) — ldr x<dreg>, [x<dreg>] (full-word load)
+    emit_ishl_imm_into,       // (dreg, src, amt) — x<dreg> = x<src> << amt (strength-reduced multiply)
     int_temp_alloc,           // () → a free GP temp reg, or -1
     int_temp_free,            // (reg) — return a temp to the pool
     int_temp_count,           // () → CURRENT free temp count (0 disables)
@@ -3326,6 +3327,25 @@ cg_int_tree_need(nd) {
     return 999;
 }
 
+// If `nd` is an integer literal equal to 2^k for k in [1,63], return k;
+// otherwise -1. Lets `x * 2^k` strength-reduce into `x << k` — a shift is
+// cheaper than a multiply and skips materialising the constant.
+cg_const_pow2(nd) {
+    auto n: Node, v, k;
+    if (nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype != T_LIT) { return -1; }
+    if (peek(cg_sbuf + unpack_s(n.a)) == '"') { return -1; }   // string literal
+    if (cg_is_float_lit(n.a) == 1) { return -1; }               // float literal
+    v = cg_parse_int(n.a);
+    if (v < 2) { return -1; }
+    if ((v & (v - 1)) != 0) { return -1; }                      // not a power of two
+    k = 0;
+    while (v > 1) { v = v >> 1; k++; }
+    if (k > 63) { return -1; }
+    return k;
+}
+
 // Emit an eligible integer tree (validated/budgeted by cg_int_tree_need)
 // directly into x<dreg>: the left operand reuses dreg down the left spine,
 // each right operand lands in a freshly allocated GP temp, the op writes
@@ -3371,6 +3391,19 @@ cg_emit_int_into(nd, dreg) {
     if (c0 == '&') { op_code = 4; }
     if (c0 == '|') { op_code = 5; }
     if (c0 == '^') { op_code = 6; }
+    // Strength reduction: `x * 2^k` is emitted as `x << k`. The left operand
+    // (promoted leaf or computed into dreg) is shifted into dreg directly.
+    if (c0 == '*') {
+        auto _p2k;
+        _p2k = cg_const_pow2(n.c);
+        if (_p2k >= 0) {
+            lk = cg_int_leaf_kind(n.b);
+            if (lk > 0) { lsrc = lk; }
+            else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
+            call(p.emit_ishl_imm_into, dreg, lsrc, _p2k);
+            return 0;
+        }
+    }
     lk = cg_int_leaf_kind(n.b);
     if (lk > 0) { lsrc = lk; }
     else { cg_emit_int_into(n.b, dreg); lsrc = dreg; }
