@@ -457,6 +457,7 @@ struct ChipPrimitives {
                               //   op: 0=add 1=sub 2=mul 3=sdiv 4=and 5=orr 6=eor
     emit_iload_mem_into,      // (dreg) — ldr x<dreg>, [x<dreg>] (full-word load)
     emit_ishl_imm_into,       // (dreg, src, amt) — x<dreg> = x<src> << amt (strength-reduced multiply)
+    emit_imadd,               // (op, dreg, n, m, a) — x<dreg> = a +/- n*m (integer fused multiply-add)
     int_temp_alloc,           // () → a free GP temp reg, or -1
     int_temp_free,            // (reg) — return a temp to the pool
     int_temp_count,           // () → CURRENT free temp count (0 disables)
@@ -3391,6 +3392,50 @@ cg_emit_int_into(nd, dreg) {
     if (c0 == '&') { op_code = 4; }
     if (c0 == '|') { op_code = 5; }
     if (c0 == '^') { op_code = 6; }
+    // Integer fused multiply-add: `(a*b) + c` or `c + (a*b)` -> madd, and
+    // `c - (a*b)` -> msub. One fused op replaces the mul + add/sub and reads
+    // the promoted operands directly. The integer twin of the float CIP's
+    // fmadd fusion. Addition is commutative so either side may hold the
+    // product; subtraction only fuses when the product is the subtrahend
+    // (msub computes addend - product, never product - addend).
+    if (c0 == '+' || c0 == '-') {
+        auto _ml: Node, _mr: Node, _prod: Node, _add: Node, _fop;
+        _ml = n.b; _mr = n.c;
+        _prod = 0; _add = 0; _fop = -1;
+        if (c0 == '-') {
+            if (_mr != 0 && _mr.ntype == T_BINOP && unpack_l(_mr.a) == 1 && peek(cg_sbuf + unpack_s(_mr.a)) == '*') {
+                _prod = _mr; _add = _ml; _fop = 1;
+            }
+        } else {
+            if (_ml != 0 && _ml.ntype == T_BINOP && unpack_l(_ml.a) == 1 && peek(cg_sbuf + unpack_s(_ml.a)) == '*') {
+                _prod = _ml; _add = _mr; _fop = 0;
+            } else if (_mr != 0 && _mr.ntype == T_BINOP && unpack_l(_mr.a) == 1 && peek(cg_sbuf + unpack_s(_mr.a)) == '*') {
+                _prod = _mr; _add = _ml; _fop = 0;
+            }
+        }
+        // Skip when the product is a strength-reducible `x * 2^k` — that lowers
+        // to a cheaper shift (and array-index arithmetic `base + i*8` lives
+        // here), so fusing it would lose the shift.
+        if (_fop >= 0 && cg_const_pow2(_prod.c) < 0) {
+            auto _fa: Node, _fb: Node, _asrc, _nsrc, _msrc, _ta, _tn, _tm, _alk, _nlk, _mlk;
+            _fa = _prod.b; _fb = _prod.c;
+            _alk = cg_int_leaf_kind(_add);
+            if (_alk > 0) { _asrc = _alk; }
+            else { cg_emit_int_into(_add, dreg); _asrc = dreg; }
+            _nlk = cg_int_leaf_kind(_fa);
+            _tn = -1;
+            if (_nlk > 0) { _nsrc = _nlk; }
+            else { _tn = call(p.int_temp_alloc); cg_emit_int_into(_fa, _tn); _nsrc = _tn; }
+            _mlk = cg_int_leaf_kind(_fb);
+            _tm = -1;
+            if (_mlk > 0) { _msrc = _mlk; }
+            else { _tm = call(p.int_temp_alloc); cg_emit_int_into(_fb, _tm); _msrc = _tm; }
+            call(p.emit_imadd, _fop, dreg, _nsrc, _msrc, _asrc);
+            if (_tm >= 0) { call(p.int_temp_free, _tm); }
+            if (_tn >= 0) { call(p.int_temp_free, _tn); }
+            return 0;
+        }
+    }
     // Strength reduction: `x * 2^k` is emitted as `x << k`. The left operand
     // (promoted leaf or computed into dreg) is shifted into dreg directly.
     if (c0 == '*') {
