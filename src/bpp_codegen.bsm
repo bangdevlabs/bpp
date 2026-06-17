@@ -471,6 +471,7 @@ struct ChipPrimitives {
     emit_iv_advance,          // (base_reg) — base_reg += 8 (once per iteration, in the step)
     emit_iv_setup,            // (base_reg, idx_reg) — base_reg += idx_reg*8 (pre-loop)
     iv_supported,             // () → 1 if the chip supports the pointer walk (a64), else 0
+    emit_self_op_imm,         // (reg, imm, is_sub) — x<reg> = x<reg> +/- imm (in place; `i = i + 1`)
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -4242,6 +4243,39 @@ void cg_emit_stmt(nd) {
                         j++;
                     }
                     return 0;
+                }
+            }
+        }
+        // Self-update with an immediate: `v = v + k` / `v = v - k` for a
+        // promoted integer local and a small constant k updates the register
+        // in place (`add/sub reg, reg, #k`) — the canonical `i++` / `i += k`
+        // loop step — instead of materialising k, adding through the
+        // accumulator, and storing back.
+        if (lhs.ntype == T_VAR) {
+            auto _su_vi, _su_reg, _su_rhs: Node, _su_l: Node, _su_r: Node, _su_c0, _su_rs, _su_k;
+            _su_vi = cg_var_idx(lhs.a);
+            if (_su_vi >= 0) {
+                _su_reg = arr_get(cg_var_promote, _su_vi);
+                _su_rhs = n.b;
+                if (_su_reg >= 0 && cg_var_is_float(_su_vi) == 0 && arr_get(cg_var_stack, _su_vi) == 0 &&
+                    _su_rhs != 0 && _su_rhs.ntype == T_BINOP && unpack_l(_su_rhs.a) == 1) {
+                    _su_c0 = peek(cg_sbuf + unpack_s(_su_rhs.a));
+                    if (_su_c0 == '+' || _su_c0 == '-') {
+                        _su_l = _su_rhs.b; _su_r = _su_rhs.c;
+                        if (_su_l != 0 && _su_l.ntype == T_VAR && cg_var_idx(_su_l.a) == _su_vi &&
+                            _su_r != 0 && _su_r.ntype == T_LIT) {
+                            _su_rs = unpack_s(_su_r.a);
+                            if (peek(cg_sbuf + _su_rs) != '"' && cg_is_float_lit(_su_r.a) == 0) {
+                                _su_k = cg_parse_int(_su_r.a);
+                                if (_su_k >= 1 && _su_k <= 4095) {
+                                    auto _su_sub;
+                                    _su_sub = 0; if (_su_c0 == '-') { _su_sub = 1; }
+                                    call(p.emit_self_op_imm, _su_reg, _su_k, _su_sub);
+                                    return 0;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
