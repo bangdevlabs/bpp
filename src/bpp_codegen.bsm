@@ -135,6 +135,12 @@ struct ChipPrimitives {
     emit_shl,           // (left_reg)            shift left
     emit_shr,           // (left_reg)            arithmetic shift right (ASR / SAR) — sign-extends
     emit_lshr,          // (left_reg)            logical shift right    (LSR / SHR) — zero-fills, :u_word family
+    // Immediate-form shifts: the value being shifted is already in the
+    // accumulator and the count is a compile-time constant, so no register
+    // is materialised for the count and no variable shift is needed.
+    emit_shl_imm,       // (amt)                 acc <<= amt
+    emit_shr_imm,       // (amt)                 acc >>= amt  (arithmetic, sign-extends)
+    emit_lshr_imm,      // (amt)                 acc >>= amt  (logical, zero-fills, :u_word family)
     emit_not,           // ()                    bitwise not (Wave 4)
 
     // ── Move / compare (7) ──
@@ -3489,6 +3495,39 @@ cg_emit_node(nd) {
         op_s = unpack_s(n.a); op_l = unpack_l(n.a);
         c0 = peek(cg_sbuf + op_s);
         c1 = 0; if (op_l > 1) { c1 = peek(cg_sbuf + op_s + 1); }
+
+        // Stage A — shift by a constant amount. When the right operand of
+        // `<<` / `>>` is an integer literal in [1,63], emit the immediate-form
+        // shift (lsl/asr/lsr #amt) instead of materialising the count into a
+        // register and doing a variable shift. Evaluating the left operand via
+        // emit_node also lets a CIP-eligible subtree compute in place — the
+        // shift root would otherwise force the whole tree onto the accumulator
+        // path. Signedness of `>>` follows the left operand's type, exactly
+        // like the variable-shift dispatch further below.
+        if (op_l == 2 && ((c0 == '<' && c1 == '<') || (c0 == '>' && c1 == '>'))) {
+            auto _sh_rhs: Node, _sh_lhs: Node, _sh_amt, _sh_s;
+            _sh_rhs = n.c;
+            if (_sh_rhs.ntype == T_LIT) {
+                _sh_s = unpack_s(_sh_rhs.a);
+                if (peek(cg_sbuf + _sh_s) != '"' && cg_is_float_lit(_sh_rhs.a) == 0) {
+                    _sh_amt = cg_parse_int(_sh_rhs.a);
+                    if (_sh_amt >= 1 && _sh_amt <= 63) {
+                        call(p.emit_node, n.b);              // left value -> acc
+                        if (c0 == '<') {
+                            call(p.emit_shl_imm, _sh_amt);
+                        } else {
+                            _sh_lhs = n.b;
+                            if (is_unsigned_type(_sh_lhs.itype)) {
+                                call(p.emit_lshr_imm, _sh_amt);
+                            } else {
+                                call(p.emit_shr_imm, _sh_amt);
+                            }
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
 
         is_io = 0;
         if (c0 == '%' || c0 == '^') { is_io = 1; }
