@@ -473,6 +473,7 @@ struct ChipPrimitives {
     iv_supported,             // () → 1 if the chip supports the pointer walk (a64), else 0
     emit_self_op_imm,         // (reg, imm, is_sub) — x<reg> = x<reg> +/- imm (in place; `i = i + 1`)
     emit_cmp_branch,          // (cond_id, left_reg, lbl) — cmp + branch-to-lbl-when-false (no cset)
+    emit_cmp_branch_rr,       // (cond_id, lreg, rreg, lbl) — cmp two registers directly + branch
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -3788,7 +3789,7 @@ cg_iv_detect(while_nd) {
 // HI/HS condition codes) comparisons keep the existing boolean path.
 cg_emit_cmp_to_branch(cond_node, exit_lbl) {
     auto p: ChipPrimitives, n: Node, op_s, op_l, c0, c1, cond_id;
-    auto lhs_n: Node, lhs_ty, lty, rty, save_token, left_reg;
+    auto lhs_n: Node, lhs_ty, lty, rty, save_token, left_reg, clk, crk;
     p = cg_prim;
     if (cond_node == 0) { return 0; }
     n = cond_node;
@@ -3808,6 +3809,14 @@ cg_emit_cmp_to_branch(cond_node, exit_lbl) {
     lhs_ty = lhs_n.itype;
     if (is_float_type(lhs_ty)) { return 0; }
     if (is_unsigned_type(lhs_ty)) { return 0; }
+    // Both operands already in registers (promoted leaves): compare them
+    // directly, no copy to scratch — `while (i < n)` becomes `cmp i, n; b.ge`.
+    clk = cg_int_leaf_kind(n.b);
+    crk = cg_int_leaf_kind(n.c);
+    if (clk > 0 && crk > 0) {
+        call(p.emit_cmp_branch_rr, cond_id, clk, crk, exit_lbl);
+        return 1;
+    }
     // Evaluate operands like the BINOP comparison path, then branch instead of
     // materialising a boolean.
     lty = call(p.emit_node, n.b);
