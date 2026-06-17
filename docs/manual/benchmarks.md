@@ -71,10 +71,14 @@ directional.
 
 | kernel | b++ | gcc -O2 | ratio |
 |---|---|---|---|
-| biquad (FP serial) | ~64 ms | ~46–62 ms | ~1.0–1.4× (noisy) |
-| lcg (int serial) | ~20–23 ms | ~18 ms | ~1.1–1.3× (noisy; codegen tighter than before) |
-| xform (int throughput) | 7.3 ms | 6.4 ms | **~1.1×** (loop body + control now match gcc's structure) |
+| biquad (FP serial) | 62.2 ms | 43.1 ms | **1.44×** — the real residual (FP loop-carried dependency + scheduling) |
+| lcg (int serial) | 22.5 ms | 19.7 ms | **1.14×** |
+| xform (int throughput) | 7.29 ms | 6.14 ms | **1.18×** (loop body + control match gcc's structure) |
 | regheavy (register-heavy leaf) | 0.35 s | 0.30 s | ~1.17× |
+
+(best-of-15 b++ / best-of-12 gcc, same shared laptop). The integer kernels sit
+~1.1–1.2× off the oracle; the float serial kernel is the standing gap — gcc
+schedules the FP dependency chain better, the lever b++ has not built yet.
 
 **Autovec / parallel / SIMD:**
 
