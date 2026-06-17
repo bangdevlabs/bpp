@@ -3353,6 +3353,38 @@ cg_int_tree_need(nd) {
     return 999;
 }
 
+// True iff the CIP would emit `rhs` into its destination register in a SINGLE
+// instruction reading only direct register leaves — a madd `(a*b) +/- c` or a
+// binop `l OP c` where every operand is a promoted register (leaf_kind > 0).
+// In that case the destination can BE the assignment's promoted target (the
+// lone instruction reads all sources, then writes the destination, so it can
+// never clobber a not-yet-read source — even when the target itself is one of
+// the sources). Lets `s = s*A + C` emit `madd s, s, A, C` with no copy-back.
+cg_assign_into_dest_ok(rhs) {
+    auto n: Node, c0, op_l, l: Node, r: Node;
+    if (rhs == 0) { return 0; }
+    n = rhs;
+    if (n.ntype != T_BINOP) { return 0; }
+    op_l = unpack_l(n.a);
+    if (op_l != 1) { return 0; }
+    c0 = peek(cg_sbuf + unpack_s(n.a));
+    l = n.b; r = n.c;
+    // madd shape: (a*b) +/- c  or  c + (a*b), a/b/c all promoted leaves.
+    if (c0 == '+' || c0 == '-') {
+        if (l != 0 && l.ntype == T_BINOP && unpack_l(l.a) == 1 && peek(cg_sbuf + unpack_s(l.a)) == '*' &&
+            cg_int_leaf_kind(l.b) > 0 && cg_int_leaf_kind(l.c) > 0 && cg_int_leaf_kind(r) > 0 &&
+            cg_const_pow2(l.c) < 0) { return 1; }
+        if (c0 == '+' && r != 0 && r.ntype == T_BINOP && unpack_l(r.a) == 1 && peek(cg_sbuf + unpack_s(r.a)) == '*' &&
+            cg_int_leaf_kind(r.b) > 0 && cg_int_leaf_kind(r.c) > 0 && cg_int_leaf_kind(l) > 0 &&
+            cg_const_pow2(r.c) < 0) { return 1; }
+    }
+    // single binop over two promoted-register leaves.
+    if (c0 == '+' || c0 == '-' || c0 == '*' || c0 == '&' || c0 == '|' || c0 == '^') {
+        if (cg_int_leaf_kind(l) > 0 && cg_int_leaf_kind(r) > 0) { return 1; }
+    }
+    return 0;
+}
+
 // If `nd` is an integer literal equal to 2^k for k in [1,63], return k;
 // otherwise -1. Lets `x * 2^k` strength-reduce into `x << k` — a shift is
 // cheaper than a multiply and skips materialising the constant.
@@ -4318,6 +4350,24 @@ void cg_emit_stmt(nd) {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Assign-into-destination-register: `promoted = <single-instruction CIP
+        // expr over register leaves>` computes straight into the target's
+        // register — no accumulator round-trip + copy-back (`s = s*A + C`
+        // emits one `madd s, s, A, C`).
+        if (lhs.ntype == T_VAR) {
+            auto _ad_vi, _ad_reg;
+            _ad_vi = cg_var_idx(lhs.a);
+            if (_ad_vi >= 0) {
+                _ad_reg = arr_get(cg_var_promote, _ad_vi);
+                // int_temp_count >= 0 gates out backends without integer CIP
+                // (x64 returns -1) — cg_emit_int_into uses the CIP primitives.
+                if (_ad_reg >= 0 && cg_var_is_float(_ad_vi) == 0 && arr_get(cg_var_stack, _ad_vi) == 0 &&
+                    call(p.int_temp_count) >= 0 && cg_assign_into_dest_ok(n.b)) {
+                    cg_emit_int_into(n.b, _ad_reg);
+                    return 0;
                 }
             }
         }
