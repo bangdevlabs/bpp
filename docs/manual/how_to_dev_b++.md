@@ -42,6 +42,7 @@ expert-style**, go to `tonify_checklist.md`.
 | 15 | Disciplina QG (general vs battalion) | III |
 | 16 | Idioms | III |
 | 17 | Anti-patterns | III |
+| 18 | The performance model (how the codegen optimizes your loops) | III |
 | — | Compiler dev — see `bootstrap_manual.md` | IV+V (REMOVED) |
 | Apx | Standard Library Tour — see `standard_b++_lib.md` for depth | VI |
 | 48 | Compiler Flags Reference | last |
@@ -2413,6 +2414,99 @@ shasum /tmp/bpp_verify /tmp/bpp_verify2   # must match
 cp /tmp/bpp_verify2 ./bpp
 ./tests/run_all.sh                         # must be green
 ```
+
+---
+
+## Cap 18 — The performance model: how B++ optimizes your loops
+
+B++ has no optimizer pass in the classic sense — semantics live in the
+frontend, emission in the backend, and a small set of **destination-driven
+codegen rules** turn ordinary B++ into tight machine code. You do not annotate
+for speed; you write the obvious loop and the compiler recognises the shape.
+This chapter is the map of those rules, so you know which shapes pay off and how
+to check.
+
+The single anchor: **the oracle is `gcc -O2`.** Emit the same program to C
+(`bpp --c prog.bpp > prog.c`), build it `cc -O2`, and compare. The codegen gate
+`examples/bench_codegen.bpp` does exactly this for three kernels (a serial FP
+filter, a serial integer LCG, and a throughput transform). As of 2026-06-17 the
+serial kernels and a register-heavy leaf kernel are at gcc -O2 parity; the
+throughput transform is ~1.3–1.4×.
+
+### §18.1 — Register allocation (where your values live)
+
+Three layers, all automatic:
+
+- **B1 — expression freelist.** Temporaries inside one expression live in
+  caller-saved scratch registers (a64 `x9..x15`), spilling to the stack only
+  when a call would clobber them. You get this for free.
+- **B3 — local promotion.** The hottest locals (by reference count, with refs
+  *inside a loop* weighted 1000×) are promoted to callee-saved registers
+  (a64 `x19..x24`). So a loop-invariant array base or bound used once per
+  iteration lives in a register, not the frame.
+- **Wider budget in leaf functions.** A function that makes **no calls** can
+  also hold locals in caller-saved `x9..x12` — nothing clobbers them
+  mid-function — lifting the budget from 6 to 10. A leaf kernel with ten hot
+  accumulators keeps them all in registers instead of spilling four.
+
+**What you do:** keep hot loops leaf (no calls in the inner loop), and the
+compiler keeps your working set in registers.
+
+### §18.2 — Compute-in-place + instruction selection
+
+An integer or float arithmetic tree (`+ - * & | ^`, and the float `/`) computes
+**destination-driven** — each operation writes its own register, no value is
+funnelled through an accumulator. On top of that:
+
+| You write | The compiler emits |
+|---|---|
+| `x >> 17` (constant shift) | `asr x0, x0, #17` (immediate, no count register) |
+| `i * 8` (power-of-two multiply) | `lsl x0, x0, #3` (strength reduction) |
+| `a*b + c` | `madd x0, a, b, c` (one fused multiply-add) |
+| a big loop-invariant constant | materialised **once** in a register before the loop |
+
+These are why a fixed-point inner line like `out[i] = (in[i]*A + C) >> 17`
+becomes `ldr; madd; asr; str` — the same instructions gcc picks.
+
+### §18.3 — Counted array loops become pointer walks
+
+A loop of the exact shape
+
+```b++
+for (i = 0; i < n; i++) {
+    out[i] = f(in[i]);
+}
+```
+
+where `in` / `out` are used **only** as `in[i]` / `out[i]` (with the loop's `i`)
+turns each base into a *walking pointer*: the access becomes `*base_reg` and the
+pointer advances by one element per iteration, so `base + i*8` is never
+recomputed. This is the largest single win for array kernels and it fires
+automatically — but only when the shape is safe:
+
+- `in` / `out` are never used "bare" (e.g. `p = in;` or `in + 5` outside the
+  index) anywhere in the function;
+- the loop has no nested loop and no `continue`;
+- the step is exactly `i = i + 1` (`i++`).
+
+If you reach for the base pointer directly mid-loop, the compiler quietly keeps
+the index-arithmetic form — correct, just not walked. Keep array loops in the
+canonical shape above and they walk.
+
+### §18.4 — How to check (disassemble the *reference*)
+
+When a kernel is slower than you expect, the discipline that pays off is to
+**disassemble gcc's output first**, not just yours:
+
+```bash
+bpp --c kernel.bpp > k.c && cc -O2 -c k.c -o k.o && otool -tv k.o   # the target
+bpp --bug kernel.bpp -o k && bug --disasm ./k fn                    # ours
+```
+
+The 2026-06-17 arc started by assuming the residual gap was gcc's
+auto-vectorisation; one `otool` of gcc's loop showed a plain six-instruction
+scalar loop instead, which replaced a non-problem (SIMD) with four tractable
+scalar wins. Measure the reference; do not guess what it does.
 
 ---
 
