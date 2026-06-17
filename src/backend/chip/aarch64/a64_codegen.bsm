@@ -507,14 +507,33 @@ void a64_print_dec(n) {
 
 // cg_b3_eligible, cg_b3_walk live in bpp_codegen.bsm.
 
-// ARM64 callee-saved pool: x19..x24 (6 regs).
+// Promotion-register sequence. Slots 0..5 are the callee-saved pool x19..x24
+// (always safe). In a LEAF function (no calls) slots 6..9 extend into the
+// caller-saved x9..x12 — nothing can clobber them mid-function — widening the
+// budget from 6 to 10. x13..x15 stay reserved as expression / CIP temps.
+// Returns the physical register for `slot`, or -1 past the budget.
+static _a64_b3_reg_at(slot) {
+    if (slot < 6) { return 19 + slot; }
+    if (cg_fn_leaf) {
+        if (slot < 10) { return 9 + (slot - 6); }
+    }
+    return -1;
+}
+
+// When a caller-saved register (x9..x15) is claimed for promotion it must
+// leave the expression-temp freelist so it is not handed out as a temp too.
+static _a64_b3_claim_freelist(reg) {
+    if (reg <= 15) { a64_gp_free_mask = a64_gp_free_mask & ~(1 << (reg - 9)); }
+}
+
 void _a64_b3_select() {
-    auto budget, used, vi, n, best_vi, best_refs, reg;
-    budget = 6;
+    auto used, vi, n, best_vi, best_refs, reg;
     n = arr_len(cg_vars);
     arr_clear(a64_promoted_regs);
     used = 0;
-    while (used < budget) {
+    while (1) {
+        reg = _a64_b3_reg_at(used);
+        if (reg < 0) { return; }
         best_vi = -1;
         best_refs = 1;
         for (vi = 0; vi < n; vi++) {
@@ -526,9 +545,9 @@ void _a64_b3_select() {
             }
         }
         if (best_vi < 0) { return; }
-        reg = 19 + used;
         arr_set(cg_var_promote, best_vi, reg);
         a64_promoted_regs = arr_push(a64_promoted_regs, reg);
+        _a64_b3_claim_freelist(reg);
         used++;
     }
 }
@@ -542,10 +561,12 @@ void _a64_b3_select() {
 // constants stay inline.
 void _a64_b3_select_const() {
     auto used, n, best_idx, best_wt, ci, reg;
-    used = arr_len(a64_promoted_regs);   // x19 + used = next free callee-saved
+    used = arr_len(a64_promoted_regs);   // next free promotion slot after locals
     n = arr_len(cg_const_val);
-    while (19 + used <= 24) {
-        best_idx = 0 - 1;
+    while (1) {
+        reg = _a64_b3_reg_at(used);      // callee-saved, then caller-saved in a leaf
+        if (reg < 0) { return; }
+        best_idx = -1;
         best_wt = 999;                   // threshold: only loop constants (>= 1000)
         for (ci = 0; ci < n; ci++) {
             if (arr_get(cg_const_reg, ci) >= 0) { continue; }
@@ -555,10 +576,10 @@ void _a64_b3_select_const() {
             }
         }
         if (best_idx < 0) { return; }
-        reg = 19 + used;
         arr_set(cg_const_reg, best_idx, reg);
         a64_promoted_regs = arr_push(a64_promoted_regs, reg);
-        used = used + 1;
+        _a64_b3_claim_freelist(reg);
+        used++;
     }
 }
 
