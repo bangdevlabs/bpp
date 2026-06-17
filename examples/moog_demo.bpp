@@ -1,0 +1,94 @@
+// moog_demo.bpp — the first tiny_lofi plugin: a Moog-style ladder low-pass.
+//
+// A Moog ladder filter is four one-pole low-passes in series with a resonant
+// feedback path from the last stage back to the input. It is the classic warm,
+// vocal, "wah" filter. This demo generates a 110 Hz sawtooth (A2) and sweeps a
+// high-resonance cutoff across it, then writes a WAV you can listen to.
+//
+// Run:  ./bpp examples/moog_demo.bpp -o /tmp/moog && /tmp/moog
+//       then play moog_demo.wav
+import "stbsound.bsm";
+
+const SR        = 44100;          // sample rate (the engine's fixed rate)
+const SECONDS   = 4;
+const NF        = 176400;         // SR * SECONDS frames
+const TWO_PI    = 6.2831853;
+
+// ── The plugin: a Moog ladder filter ──────────────────────────────
+//
+// State is six floats: the four stage memories s1..s4, the cutoff
+// coefficient g, and the resonance amount k.
+struct Moog { s1: float, s2: float, s3: float, s4: float, g: float, k: float }
+
+// Set the cutoff (Hz) and resonance (0 = none, ~3.9 = on the edge of
+// self-oscillation). The coefficient uses g = x/(1+x) with x = 2*pi*fc/SR — a
+// stable, exp-free one-pole mapping (no exp() needed, and g stays below 1 so
+// the resonant feedback cannot run away).
+void moog_set(m, cutoff_hz: float, resonance: float) {
+    auto mm: Moog, x: float;
+    mm = m;
+    x = TWO_PI * cutoff_hz / 44100.0;
+    mm.g = x / (1.0 + x);
+    mm.k = resonance;
+}
+
+// Push one sample through the four poles and return the filtered output.
+moog_tick(m, in: float) {
+    auto mm: Moog, g: float, fb: float, a: float, b: float, c: float, d: float;
+    mm = m;
+    g  = mm.g;
+    fb = in - mm.k * mm.s4;            // resonant feedback from the last stage
+    a  = mm.s1 + g * (fb - mm.s1);     // pole 1
+    b  = mm.s2 + g * (a  - mm.s2);     // pole 2
+    c  = mm.s3 + g * (b  - mm.s3);     // pole 3
+    d  = mm.s4 + g * (c  - mm.s4);     // pole 4
+    mm.s1 = a; mm.s2 = b; mm.s3 = c; mm.s4 = d;
+    return d;
+}
+
+main() {
+    auto pcm, m, i, peak;
+    auto phase: float, dphase: float, saw: float;
+    auto lfo: float, cut: float, y: float, swf: float;
+    auto (pos, s): word;             // word: the float->s16 result converts here
+
+    pcm = malloc(NF * 4);             // stereo s16, 4 bytes per frame
+    m   = malloc(48);                 // Moog state (zeroed by malloc)
+
+    phase  = 0.0;
+    dphase = 110.0 / 44100.0;         // 110 Hz sawtooth
+    swf    = 44100.0;                 // one cutoff sweep per second
+    peak   = 0;
+
+    for (i = 0; i < NF; i++) {
+        // Naive sawtooth: phase ramps 0..1, output -1..+1. The aliasing is part
+        // of the lofi charm.
+        phase = phase + dphase;
+        if (phase >= 1.0) { phase = phase - 1.0; }
+        saw = 2.0 * phase - 1.0;
+
+        // Cutoff LFO: a triangle 0..1 over one second, sweeping 150..5000 Hz.
+        pos = i - (i / 44100) * 44100;        // i mod SR  (integer)
+        lfo = pos;                            // int -> float
+        lfo = lfo / swf;                      // 0..1
+        if (lfo > 0.5) { lfo = 1.0 - lfo; }   // fold to a 0..0.5 ramp
+        lfo = lfo + lfo;                      // back to 0..1 triangle
+        cut = 150.0 + 4850.0 * lfo;
+        moog_set(m, cut, 3.0);
+
+        y = moog_tick(m, saw);
+
+        // Float [-1,1] -> s16 with makeup gain (the low-pass attenuates), then
+        // clamp. The clamp doubling as a soft ceiling is itself lofi-friendly.
+        s = y * 52000.0;
+        if (s >  32767) { s =  32767; }
+        if (s < -32767) { s = -32767; }
+        if (s > peak) { peak = s; }
+        write_u16(pcm, i * 4 + 0, s);         // left
+        write_u16(pcm, i * 4 + 2, s);         // right (mono)
+    }
+
+    sound_save_wav("moog_demo.wav", pcm, NF);
+    put("wrote moog_demo.wav — ", NF, " frames, peak ", peak, "/32767\n");
+    return 0;
+}
