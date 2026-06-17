@@ -3386,6 +3386,39 @@ cg_assign_into_dest_ok(rhs) {
     return 0;
 }
 
+// Does variable `vi` appear anywhere in `nd`? Used to prove a destination
+// register is free of the assignment target before computing an expression
+// straight into it (no aliasing with a not-yet-read source). Unknown node
+// types return 1 (conservative — assume the variable could be used).
+cg_node_uses_var(nd, vi) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_VAR) { if (cg_var_idx(n.a) == vi) { return 1; } return 0; }
+    if (t == T_LIT || t == T_DECL || t == T_NOP || t == T_BREAK || t == T_CONTINUE) { return 0; }
+    if (t == T_BINOP) {                                  // n.a is the operator
+        if (cg_node_uses_var(n.b, vi)) { return 1; }
+        return cg_node_uses_var(n.c, vi);
+    }
+    if (t == T_TERNARY) {
+        if (cg_node_uses_var(n.a, vi)) { return 1; }
+        if (cg_node_uses_var(n.b, vi)) { return 1; }
+        return cg_node_uses_var(n.c, vi);
+    }
+    if (t == T_ASSIGN || t == T_MEMST) {                 // n.c is hint / targets
+        if (cg_node_uses_var(n.a, vi)) { return 1; }
+        return cg_node_uses_var(n.b, vi);
+    }
+    if (t == T_UNARY) { return cg_node_uses_var(n.b, vi); }
+    if (t == T_MEMLD || t == T_ADDR || t == T_RET) { return cg_node_uses_var(n.a, vi); }
+    if (t == T_CALL || t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (cg_node_uses_var(arr[i], vi)) { return 1; } }
+        return 0;
+    }
+    return 1;
+}
+
 // If `nd` is an integer literal equal to 2^k for k in [1,63], return k;
 // otherwise -1. Lets `x * 2^k` strength-reduce into `x << k` — a shift is
 // cheaper than a multiply and skips materialising the constant.
@@ -4376,6 +4409,26 @@ void cg_emit_stmt(nd) {
                 if (_ad_reg >= 0 && cg_var_is_float(_ad_vi) == 0 && arr_get(cg_var_stack, _ad_vi) == 0 &&
                     call(p.int_temp_count) >= 0 && cg_assign_into_dest_ok(n.b)) {
                     cg_emit_int_into(n.b, _ad_reg);
+                    return 0;
+                }
+            }
+        }
+        // Float assign-into-destination (the float twin): `promoted_float =
+        // <float expr that does not read the target>` computes straight into
+        // the target's d-register via the float CIP — no round-trip through d0
+        // and no copy-back. The not-used-in-RHS check guarantees the
+        // destination register is free of a not-yet-read source (so a multi-op
+        // expression like a biquad's `y = b0*x + …` is safe). Naturally a64-only
+        // — x64 has no float promotion (no callee-saved xmm), so _af_reg < 0.
+        if (lhs.ntype == T_VAR) {
+            auto _af_vi, _af_reg;
+            _af_vi = cg_var_idx(lhs.a);
+            if (_af_vi >= 0) {
+                _af_reg = arr_get(cg_var_promote, _af_vi);
+                if (_af_reg >= 0 && cg_var_is_float(_af_vi) == 1 && arr_get(cg_var_stack, _af_vi) == 0 &&
+                    cg_float_tree_need(n.b) <= call(p.simd_temp_count) &&
+                    cg_node_uses_var(n.b, _af_vi) == 0) {
+                    cg_emit_float_into(n.b, _af_reg);
                     return 0;
                 }
             }
