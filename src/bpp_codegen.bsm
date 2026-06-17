@@ -464,6 +464,13 @@ struct ChipPrimitives {
     int_temp_alloc,           // () → a free GP temp reg, or -1
     int_temp_free,            // (reg) — return a temp to the pool
     int_temp_count,           // () → CURRENT free temp count (0 disables)
+    // Induction-variable pointer walk (a counted array loop walks a register
+    // pointer instead of recomputing base + i*8 each iteration).
+    emit_iv_load,             // (dreg, base_reg) — x<dreg> = *base_reg
+    emit_iv_store,            // (base_reg) — *base_reg = x0
+    emit_iv_advance,          // (base_reg) — base_reg += 8 (once per iteration, in the step)
+    emit_iv_setup,            // (base_reg, idx_reg) — base_reg += idx_reg*8 (pre-loop)
+    iv_supported,             // () → 1 if the chip supports the pointer walk (a64), else 0
 }
 
 // Active chip's primitive table. Allocated lazily on first call
@@ -2502,6 +2509,11 @@ void cg_emit_func(fi) {
     // true and is cleared by any T_CALL the walk meets; a leaf function lets the
     // chip widen its promotion pool into caller-saved registers.
     cg_fn_leaf = 1;
+    // Expose the function body + reset the induction state so the pointer-walk
+    // pass (cg_iv_detect) can scan the whole function for unsafe base uses.
+    cg_cur_body = body_arr;
+    cg_cur_bcnt = body_cnt;
+    cg_iv_active = 0;
     for (i = 0; i < body_cnt; i++) {
         stmt_i = body_arr[i];
         if (stmt_i != 0) { cg_b3_walk(stmt_i); }
@@ -3390,6 +3402,15 @@ cg_emit_int_into(nd, dreg) {
         return 0;
     }
     if (t == T_MEMLD) {
+        // Induction pointer walk: a `base[i]` leaf loads through the base's
+        // walking register (post-incremented) instead of recomputing the
+        // address. The CIP only sees full-word integer loads, so no hint check.
+        auto _ivk;
+        _ivk = cg_iv_match(n.a);
+        if (_ivk >= 0) {
+            call(p.emit_iv_load, dreg, arr_get(cg_iv_reg, _ivk));
+            return 0;
+        }
         // Compute the address tree into dreg, then load through it.
         cg_emit_int_into(n.a, dreg);
         call(p.emit_iload_mem_into, dreg);
@@ -3472,6 +3493,260 @@ cg_emit_int_into(nd, dreg) {
     return 0;
 }
 
+// ── Induction-variable pointer walk ──────────────────────────
+//
+// A counted loop `for (i = 0; i < n; i++) { ...base[i]... }` recomputes
+// `base + i*8` on every array access. When `base` is a promoted, loop-
+// invariant variable used ONLY as `base[i]` (with the loop's induction
+// variable) ANYWHERE in the function, its register becomes a walking pointer:
+// each access loads/stores through `[base_reg]` and post-increments it by 8,
+// so the per-iteration index math disappears — what gcc -O2 emits. Reusing the
+// base's own register adds no register pressure. Gated hard (cg_iv_detect); any
+// loop that does not match keeps the normal codegen. a64-only (post-index).
+
+global cg_iv_active;       // count of live induction pointers for the current loop
+global cg_iv_base;         // arr of base variable indices
+global cg_iv_reg;          // arr of their promoted registers (walking pointers)
+global cg_iv_idx;          // the induction variable index
+global cg_iv_tmp_bases;    // scratch base-collection array (detection only)
+global cg_cur_body;        // current function's statement array (whole-function scan)
+global cg_cur_bcnt;        // current function's statement count
+
+// Address shape `base + idx*8` for the active induction idx, base one of the
+// active bases → returns the base's slot; else -1.
+cg_iv_match(nd) {
+    auto n: Node, l: Node, r: Node, rl: Node, rr: Node, bvi, k;
+    if (cg_iv_active == 0 || nd == 0) { return -1; }
+    n = nd;
+    if (n.ntype != T_BINOP) { return -1; }
+    if (unpack_l(n.a) != 1 || peek(cg_sbuf + unpack_s(n.a)) != '+') { return -1; }
+    l = n.b; r = n.c;
+    if (l == 0 || l.ntype != T_VAR || r == 0 || r.ntype != T_BINOP) { return -1; }
+    if (unpack_l(r.a) != 1 || peek(cg_sbuf + unpack_s(r.a)) != '*') { return -1; }
+    rl = r.b; rr = r.c;
+    if (rl == 0 || rl.ntype != T_VAR || rr == 0 || rr.ntype != T_LIT) { return -1; }
+    if (cg_parse_int(rr.a) != 8 || cg_var_idx(rl.a) != cg_iv_idx) { return -1; }
+    bvi = cg_var_idx(l.a);
+    for (k = 0; k < cg_iv_active; k++) {
+        if (arr_get(cg_iv_base, k) == bvi) { return k; }
+    }
+    return -1;
+}
+
+// Count references to `bvi` that are NOT the base of a `bvi[idx]` access. Any
+// such bare use makes the pointer-walk rewrite unsafe (the register no longer
+// holds `base`). Mirrors cg_b3_walk's coverage; an unrecognised node type
+// (e.g. T_SWITCH) is treated as unsafe so it can never produce a false "safe".
+cg_iv_bare_uses(nd, bvi) {
+    auto n: Node, t, c, arr, cnt, i, l: Node, r: Node, rl: Node, rr: Node;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_BINOP && unpack_l(n.a) == 1 && peek(cg_sbuf + unpack_s(n.a)) == '+') {
+        l = n.b; r = n.c;
+        if (l != 0 && l.ntype == T_VAR && cg_var_idx(l.a) == bvi &&
+            r != 0 && r.ntype == T_BINOP && unpack_l(r.a) == 1 && peek(cg_sbuf + unpack_s(r.a)) == '*') {
+            rl = r.b; rr = r.c;
+            if (rl != 0 && rl.ntype == T_VAR && cg_var_idx(rl.a) == cg_iv_idx &&
+                rr != 0 && rr.ntype == T_LIT && cg_parse_int(rr.a) == 8) {
+                return cg_iv_bare_uses(r, bvi);     // safe indexed use: scan only the index
+            }
+        }
+    }
+    if (t == T_VAR) { if (cg_var_idx(n.a) == bvi) { return 1; } return 0; }
+    if (t == T_LIT || t == T_DECL || t == T_NOP || t == T_BREAK || t == T_CONTINUE) { return 0; }
+    c = 0;
+    switch (t) {
+    T_BINOP    { c = cg_iv_bare_uses(n.b, bvi) + cg_iv_bare_uses(n.c, bvi); }
+    T_ASSIGN   {
+        c = cg_iv_bare_uses(n.a, bvi) + cg_iv_bare_uses(n.b, bvi);
+        // Multi-value assignment: the remaining LHS targets live in n.c[1..n.d].
+        if (n.d > 1) { arr = n.c; cnt = n.d; for (i = 1; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); } }
+    }
+    T_MEMST    { c = cg_iv_bare_uses(n.a, bvi) + cg_iv_bare_uses(n.b, bvi); }
+    T_UNARY    { c = cg_iv_bare_uses(n.b, bvi); }
+    T_MEMLD    { c = cg_iv_bare_uses(n.a, bvi); }
+    T_ADDR     { c = cg_iv_bare_uses(n.a, bvi); }
+    T_RET      { c = cg_iv_bare_uses(n.a, bvi); }
+    T_TERNARY  { c = cg_iv_bare_uses(n.a, bvi) + cg_iv_bare_uses(n.b, bvi) + cg_iv_bare_uses(n.c, bvi); }
+    T_CALL {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); }
+    }
+    T_IF {
+        c = cg_iv_bare_uses(n.a, bvi);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); }
+        if (n.e > 0) { arr = n.d; cnt = n.e; for (i = 0; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); } }
+    }
+    T_WHILE {
+        c = cg_iv_bare_uses(n.a, bvi);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); }
+        if (n.e != 0) { c = c + cg_iv_bare_uses(n.e, bvi); }
+    }
+    T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { c = c + cg_iv_bare_uses(arr[i], bvi); }
+    }
+    else { c = 1000000; }
+    }
+    return c;
+}
+
+// True if the subtree contains a node of type `want` (used to reject loops with
+// a nested loop or a `continue`, either of which breaks the walk's invariants).
+cg_iv_subtree_has(nd, want) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == want) { return 1; }
+    if (t == T_VAR || t == T_LIT || t == T_DECL || t == T_NOP || t == T_BREAK || t == T_CONTINUE) { return 0; }
+    if (t == T_BINOP) {                                   // n.a is the operator, not a node
+        if (cg_iv_subtree_has(n.b, want)) { return 1; }
+        return cg_iv_subtree_has(n.c, want);
+    }
+    if (t == T_TERNARY) {
+        if (cg_iv_subtree_has(n.a, want)) { return 1; }
+        if (cg_iv_subtree_has(n.b, want)) { return 1; }
+        return cg_iv_subtree_has(n.c, want);
+    }
+    if (t == T_ASSIGN || t == T_MEMST) {                  // n.c is a field hint / targets, not a node
+        if (cg_iv_subtree_has(n.a, want)) { return 1; }
+        return cg_iv_subtree_has(n.b, want);
+    }
+    if (t == T_UNARY) { return cg_iv_subtree_has(n.b, want); }
+    if (t == T_MEMLD || t == T_ADDR || t == T_RET) { return cg_iv_subtree_has(n.a, want); }
+    if (t == T_CALL || t == T_BLOCK) {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (cg_iv_subtree_has(arr[i], want)) { return 1; } }
+        return 0;
+    }
+    if (t == T_IF) {
+        if (cg_iv_subtree_has(n.a, want)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (cg_iv_subtree_has(arr[i], want)) { return 1; } }
+        if (n.e > 0) { arr = n.d; cnt = n.e; for (i = 0; i < cnt; i++) { if (cg_iv_subtree_has(arr[i], want)) { return 1; } } }
+        return 0;
+    }
+    if (t == T_WHILE) {
+        if (cg_iv_subtree_has(n.a, want)) { return 1; }
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { if (cg_iv_subtree_has(arr[i], want)) { return 1; } }
+        if (n.e != 0) { return cg_iv_subtree_has(n.e, want); }
+        return 0;
+    }
+    return 1;        // unknown type → assume it could contain `want` (conservative)
+}
+
+// If `addr` is `base + idx*8` and `hint` is a full-word integer, record the
+// base variable index in cg_iv_tmp_bases (deduplicated).
+cg_iv_try_add_base(addr, hint) {
+    auto a: Node, l: Node, r: Node, rl: Node, rr: Node, bvi, j;
+    if (addr == 0) { return 0; }
+    if (is_float_type(hint) || ty_slice(hint) != SL_FULL) { return 0; }
+    a = addr;
+    if (a.ntype != T_BINOP || unpack_l(a.a) != 1 || peek(cg_sbuf + unpack_s(a.a)) != '+') { return 0; }
+    l = a.b; r = a.c;
+    if (l == 0 || l.ntype != T_VAR || r == 0 || r.ntype != T_BINOP) { return 0; }
+    if (unpack_l(r.a) != 1 || peek(cg_sbuf + unpack_s(r.a)) != '*') { return 0; }
+    rl = r.b; rr = r.c;
+    if (rl == 0 || rl.ntype != T_VAR || cg_var_idx(rl.a) != cg_iv_idx) { return 0; }
+    if (rr == 0 || rr.ntype != T_LIT || cg_parse_int(rr.a) != 8) { return 0; }
+    bvi = cg_var_idx(l.a);
+    if (bvi < 0) { return 0; }
+    for (j = 0; j < arr_len(cg_iv_tmp_bases); j++) {
+        if (arr_get(cg_iv_tmp_bases, j) == bvi) { return 0; }
+    }
+    cg_iv_tmp_bases = arr_push(cg_iv_tmp_bases, bvi);
+}
+
+// Walk a subtree collecting candidate bases from `base[idx]` loads/stores.
+cg_iv_collect(nd) {
+    auto n: Node, t, arr, cnt, i;
+    if (nd == 0) { return 0; }
+    n = nd; t = n.ntype;
+    if (t == T_MEMLD) { cg_iv_try_add_base(n.a, n.b); cg_iv_collect(n.a); return 0; }
+    if (t == T_MEMST) { cg_iv_try_add_base(n.a, n.c); cg_iv_collect(n.a); cg_iv_collect(n.b); return 0; }
+    if (t == T_VAR || t == T_LIT || t == T_DECL || t == T_NOP || t == T_BREAK || t == T_CONTINUE || t == T_ADDR) { return 0; }
+    switch (t) {
+    T_BINOP { cg_iv_collect(n.b); cg_iv_collect(n.c); }   // n.a is the operator, not a node
+    T_ASSIGN { cg_iv_collect(n.a); cg_iv_collect(n.b); }  // n.c is multi-assign targets, not a node
+    T_TERNARY { cg_iv_collect(n.a); cg_iv_collect(n.b); cg_iv_collect(n.c); }
+    T_UNARY { cg_iv_collect(n.b); }
+    T_RET   { cg_iv_collect(n.a); }
+    T_CALL, T_BLOCK {
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { cg_iv_collect(arr[i]); }
+    }
+    T_IF {
+        cg_iv_collect(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { cg_iv_collect(arr[i]); }
+        if (n.e > 0) { arr = n.d; cnt = n.e; for (i = 0; i < cnt; i++) { cg_iv_collect(arr[i]); } }
+    }
+    T_WHILE {
+        cg_iv_collect(n.a);
+        arr = n.b; cnt = n.c;
+        for (i = 0; i < cnt; i++) { cg_iv_collect(arr[i]); }
+    }
+    else { }
+    }
+    return 0;
+}
+
+// Decide whether the counted loop `while_nd` can run as a pointer walk; if so,
+// populate cg_iv_* and emit the pre-loop pointer setup, returning 1.
+cg_iv_detect(while_nd) {
+    auto p: ChipPrimitives, n: Node, step: Node, sl: Node, sr: Node, srl: Node, srr: Node;
+    auto idxv, bvi, i, found, bi, j;
+    p = cg_prim;
+    cg_iv_active = 0;
+    if (call(p.iv_supported) == 0) { return 0; }
+    n = while_nd;
+    step = n.e;
+    if (step == 0 || step.ntype != T_ASSIGN) { return 0; }
+    sl = step.a; sr = step.b;
+    if (sl == 0 || sl.ntype != T_VAR) { return 0; }
+    idxv = cg_var_idx(sl.a);
+    if (idxv < 0 || arr_get(cg_var_promote, idxv) < 0) { return 0; }
+    if (sr == 0 || sr.ntype != T_BINOP || unpack_l(sr.a) != 1 || peek(cg_sbuf + unpack_s(sr.a)) != '+') { return 0; }
+    srl = sr.b; srr = sr.c;
+    if (srl == 0 || srl.ntype != T_VAR || cg_var_idx(srl.a) != idxv) { return 0; }
+    if (srr == 0 || srr.ntype != T_LIT || cg_parse_int(srr.a) != 1) { return 0; }
+    // Reject anything that breaks the walk invariants: a nested loop (would
+    // clobber cg_iv_*) or a `continue` (would skip an access's post-increment).
+    for (i = 0; i < n.c; i++) {
+        bi = *(n.b + i * 8);
+        if (cg_iv_subtree_has(bi, T_WHILE)) { return 0; }
+        if (cg_iv_subtree_has(bi, T_CONTINUE)) { return 0; }
+    }
+    cg_iv_idx = idxv;
+    cg_iv_tmp_bases = arr_new();
+    for (i = 0; i < n.c; i++) { cg_iv_collect(*(n.b + i * 8)); }
+    cg_iv_base = arr_new();
+    cg_iv_reg = arr_new();
+    found = 0;
+    for (i = 0; i < arr_len(cg_iv_tmp_bases); i++) {
+        bvi = arr_get(cg_iv_tmp_bases, i);
+        if (arr_get(cg_var_promote, bvi) < 0) { continue; }
+        // Every reference to bvi in the WHOLE function must be a bvi[idx] access.
+        j = 0;
+        for (j = 0; j < cg_cur_bcnt; j++) {
+            if (cg_iv_bare_uses(*(cg_cur_body + j * 8), bvi) != 0) { break; }
+        }
+        if (j < cg_cur_bcnt) { continue; }       // a bare use was found
+        cg_iv_base = arr_push(cg_iv_base, bvi);
+        cg_iv_reg  = arr_push(cg_iv_reg, arr_get(cg_var_promote, bvi));
+        found++;
+    }
+    if (found == 0) { return 0; }
+    cg_iv_active = found;
+    for (i = 0; i < found; i++) {
+        call(p.emit_iv_setup, arr_get(cg_iv_reg, i), arr_get(cg_var_promote, cg_iv_idx));
+    }
+    return 1;
+}
+
 // Wave 21 takeover: the spine owns expression emission for every
 // AST case. Eight cases handled inline (T_LIT, T_VAR including
 // stack-struct address-of via emit_addr_stack_struct, T_TERNARY,
@@ -3535,6 +3810,14 @@ cg_emit_node(nd) {
 
     // T_MEMLD: *(ptr) — load with sub-word dispatch via field hint.
     if (t == T_MEMLD) {
+        // Induction pointer walk: a full-word integer `base[i]` loads through
+        // the base's walking register and post-increments it (no address math).
+        auto _ivk;
+        _ivk = cg_iv_match(n.a);
+        if (_ivk >= 0 && is_float_type(n.b) == 0 && ty_slice(n.b) == SL_FULL) {
+            call(p.emit_iv_load, 0, arr_get(cg_iv_reg, _ivk));
+            return 0;
+        }
         ety = call(p.emit_node, n.a);
         if (ety == 1) { call(p.emit_demote_flt_to_int); }
         return call(p.emit_memld_load, n.b);
@@ -3796,7 +4079,13 @@ void cg_emit_stmt(nd) {
     // runs the step before re-testing.
     if (t == T_WHILE) {
         auto step_node, lbl3;
+        auto _iv_sa, _iv_sb, _iv_sr, _iv_si;
         step_node = n.e;
+        // Induction pointer walk: detect a counted array loop and emit the
+        // pre-loop pointer setup. cg_iv_* is saved/restored so a loop nested
+        // inside another (induction) loop can never corrupt the outer state.
+        _iv_sa = cg_iv_active; _iv_sb = cg_iv_base; _iv_sr = cg_iv_reg; _iv_si = cg_iv_idx;
+        cg_iv_detect(nd);
         lbl  = call(p.emit_new_label);
         lbl2 = call(p.emit_new_label);
         lbl3 = call(p.emit_new_label);
@@ -3809,10 +4098,20 @@ void cg_emit_stmt(nd) {
         call(p.emit_body, n.b, n.c);
         call(p.emit_label, lbl3);
         if (step_node != 0) { cg_emit_stmt(step_node); }
+        // Advance each induction pointer once per iteration. Emitting it here
+        // (at the continue/step point) keeps it in lock-step with `i++` even
+        // when the body hits `continue`.
+        if (cg_iv_active > 0) {
+            auto _ivi;
+            for (_ivi = 0; _ivi < cg_iv_active; _ivi++) {
+                call(p.emit_iv_advance, arr_get(cg_iv_reg, _ivi));
+            }
+        }
         call(p.emit_jump, lbl);
         call(p.emit_label, lbl2);
         arr_pop(cg_break_stack);
         arr_pop(cg_continue_stack);
+        cg_iv_active = _iv_sa; cg_iv_base = _iv_sb; cg_iv_reg = _iv_sr; cg_iv_idx = _iv_si;
         return 0;
     }
 
@@ -3972,8 +4271,17 @@ void cg_emit_stmt(nd) {
     // uses d0/xmm0 with the FP stack; int uses x0/rax with a freelist
     // save on aarch64, a plain push/pop on x86_64).
     if (t == T_MEMST) {
-        auto fh, fh_sl;
+        auto fh, fh_sl, _ivk;
         fh = n.c;
+        // Induction pointer walk: a full-word integer `base[i] = v` evaluates v
+        // into the accumulator then stores through the base's walking register,
+        // post-incrementing it (no address math).
+        _ivk = cg_iv_match(n.a);
+        if (_ivk >= 0 && is_float_type(fh) == 0 && ty_slice(fh) == SL_FULL) {
+            call(p.emit_node, n.b);
+            call(p.emit_iv_store, arr_get(cg_iv_reg, _ivk));
+            return 0;
+        }
         if (is_float_type(fh)) {
             fh_sl = ty_slice(fh);
             if (fh_sl == SL_DOUBLE) {
