@@ -33,7 +33,9 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | ↳ CIP memory-load leaf — `a[i]` subscripts (Jun 17 fix) | ✅ | ❌ (CIP off) | rides Int-CIP |
 | ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ❌ stub | rides Int-CIP |
 | ↳ CIP integer `madd`/`msub` fusion (Stage E) | ✅ | ❌ stub (no int MAC) | rides Int-CIP |
-| **Constant promotion (Stage 2a)** | ✅ | ❌ no stub yet | **deferred** |
+| Constant promotion (Stage 2a) | ✅ x19..x24 | ✅ rbx/r12..r15 | parity (`emit_mov_phys`) |
+| Wider B3 budget — caller-saved promotion in leaf fns | ✅ x9..x12 (6→10) | ❌ (keeps 5) | **a64 only** |
+| Induction-variable pointer walk (`base[i]` → walking reg) | ✅ | ❌ `iv_supported`=0 (no post-index) | **a64 only** |
 
 ## Architectural gaps (permanent — do NOT "fix")
 

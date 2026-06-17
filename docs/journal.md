@@ -13810,3 +13810,52 @@ path, so the spine changes are inert there pending the deferred x64 CIP port).
 The "auto-vectorisation" story had been in the journal for a day; one `otool`
 of gcc's loop replaced a PhD-level non-problem (SIMD) with four tractable
 peephole/instruction-selection wins.
+
+### 2026-06-17 (cont) — register allocation finished + the pointer walk
+
+After the instruction-selection arc above, three more commits closed the
+"professionalise register allocation" request — and the measurement kept
+steering. The user asked for all three and to pick the token-cheapest order.
+
+- **x64 constant promotion (`b66ed08`).** Brought x64 up to a64's Stage 2a.
+  `_x64_b3_select_const` mirrors the a64 selector over the SysV callee-saved
+  pool (rbx/r12..r15). This surfaced a real convention mismatch: the constant
+  use-site read its register through `emit_mov_reg_reg`, which on x64 remaps
+  operands through the *return-bank* table — but a promoted reg is a physical
+  rbx/r12..r15, not a bank slot. New `emit_mov_phys` does a physical move on
+  both backends (a64 byte-identical to the old path, so a64 stays unchanged).
+
+- **Wider register budget (`261129e`).** B3 promoted only into the 6
+  callee-saved regs. A LEAF function (no calls) can also hold locals in
+  caller-saved x9..x12 — nothing clobbers them mid-function — lifting the
+  budget 6 → 10 (`_a64_b3_reg_at` + a freelist claim). A register-heavy leaf
+  kernel (10 hot locals, 4 spilling every iteration) went 0.45 → 0.36s,
+  **reaching gcc -O2 parity**, result byte-equal to gcc. No change to the
+  existing benchmarks (already fit in 6) or compiler self-compile (non-leaf
+  hot paths).
+
+- **Induction-variable pointer walk (`0b64a4b`).** The big one. A counted
+  `for (i...) base[i]` now walks `base`'s register as a pointer (deref
+  `[base_reg]`, advance once per iteration) instead of recomputing `base+i*8`.
+  The xform loop body collapses to **gcc's four instructions**
+  (`ldr; madd; asr; str`). Gated airtight: step is exactly `i=i+1`, no nested
+  loop / no continue, and every reference to the base in the WHOLE function is
+  a `base[i]` access (so mutating the register is provably safe). Advancing
+  once per iteration (not post-incrementing per access) keeps it correct for
+  read-and-write or double-read of `base[i]`. Two bring-up crashes, both found
+  by an lldb backtrace pointing at `cg_iv_subtree_has`: the safety walkers
+  recursed into `T_BINOP`'s operator slot and into `T_MEMST`'s field-hint /
+  `T_ASSIGN`'s multi-assign targets — none of which are child nodes.
+
+**Cumulative this session:** the throughput xform fell **2.35x → ~1.3x** gcc
+-O2 (the loop body now equals gcc's; the residual is loop control — gcc counts
+the trip count down with `subs/b.ne`, we count `i` up), the serial lcg and a
+register-heavy leaf both reached **gcc -O2 parity**, and x64 was levelled up on
+constant promotion. Every commit: native 192/0/12, C-emit 155/0/49, gen2==gen3
+byte-stable, x64 self-host byte-stable, 0 bootstrap warnings.
+
+**Lesson:** "fix the register allocator" turned out to be three different
+things, and the disassembly said the AAA kernel's bottleneck was never
+register *pressure* (6 registers fit) but instruction selection + addressing.
+b++ already had a register allocator (B1 freelist + B3 promotion); the work was
+widening and extending it, not inventing one.
