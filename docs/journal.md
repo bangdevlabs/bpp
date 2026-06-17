@@ -13741,12 +13741,72 @@ because ref-count 1 missed B3's threshold. Now it promotes. Backend-agnostic,
 so x64 gets it too.
 
 **Result, warm:** xform 22.9 → 14.6ms (3.71x → 2.35x to gcc -O2), lcg 24.3 →
-20.8ms (1.35x → 1.14x). The residual xform gap is gcc's auto-vectorisation of
-the int64 kernel (F.3, separate). Every stage byte-stable (1-cycle
-oscillation, gen2==gen3), native 192/0/12, C-emit 155/0/49, x64 self-host
-stable, compile-time 0.25s unchanged. x64 integer-CIP parity deferred (SysV's
-1-deep freelist is register-pressure-bound). Lessons: **measure before you
-build** (the decomposition killed the constant-first plan); **the gap was the
+20.8ms (1.35x → 1.14x). Every stage byte-stable (1-cycle oscillation,
+gen2==gen3), native 192/0/12, C-emit 155/0/49, x64 self-host stable,
+compile-time 0.25s unchanged. x64 integer-CIP parity deferred (SysV's 1-deep
+freelist is register-pressure-bound). Lessons: **measure before you build**
+(the decomposition killed the constant-first plan); **the gap was the
 evaluation order, not where values live** (the roadmap called it years ago);
 and an **additive, gated fast path** lets you rewrite the hot path of the
 codegen without risking the rest.
+
+> **Correction (Jun 17).** This entry originally blamed the residual xform gap
+> on "gcc's auto-vectorisation of the int64 kernel (F.3)." That was wrong, and
+> disassembling gcc proved it: gcc -O2 **and** -O3 emit a scalar 6-instruction
+> loop (`ldr [x0],#8; madd; asr #17; str [x1],#8; subs; b.ne`) — no SIMD (NEON
+> has no 64×64→64 vector multiply, so it can't). The real residual was
+> ordinary scalar codegen quality, addressed by the Jun 17 instruction-
+> selection arc below. A second finding from the same disassembly: the Stage 1
+> CIP **never fired on this kernel** — its memory-load leaf checked `n.b != 8`,
+> but subscripts carry the field hint 0 (a full-word type, not a byte width),
+> so every `a[i]` tree fell to the accumulator path. The 22.9 → 14.6 win above
+> came entirely from constant + param promotion (2a/2b), not Stage 1.
+
+## 2026-06-17 — instruction selection: closing the AAA inner-loop on arithmetic
+
+A continuation of the integer compute-in-place arc, driven by a single
+question — "professionalise register allocation" — that the measurement
+redirected twice. **Disassembling gcc -O2 first** (measure the target, not
+just our output) overturned the premise: gcc's xform loop is six scalar
+instructions using `madd` + post-increment addressing, **not** auto-
+vectorisation and **not** unrolling. So the gap was never the register
+allocator (the 6-register B3 was enough — the kernel fits) and never SIMD —
+it was three missing instruction-selection features and one latent dead-code
+bug. Four byte-stable commits:
+
+- **Stage A — immediate-form shift** (`f7d6f49`). `<< / >>` by a constant
+  literal emits `lsl/asr/lsr #imm` (a64 SBFM/UBFM aliases; x64 existing
+  imm encoders) instead of materialising the count and doing a variable
+  shift. `mov #17; asrv` → `asr #17`.
+
+- **CIP memory-load leaf fix** (`f10d647`). The integer-CIP gate rejected
+  every `a[i]` load: the T_MEMLD field hint `n.b` is a *type*, but the gate
+  compared it to the byte width 8. Subscripts carry hint 0 (full-word
+  integer), so the leaf shipped dead. Replaced with the full-word-integer
+  idiom (`is_float_type` / `ty_slice != SL_FULL`). This is the funnel-killer:
+  `(in[i]*A+C)` now computes destination-driven, reading the promoted
+  constants straight from their callee-saved registers — the `x0` shuttle and
+  the per-iteration constant copies vanish.
+
+- **Stage C — strength reduction** (`8de1120`). `x * 2^k` → `x << k`. Array
+  indexing `a[i]` = `*(a + i*8)` drops a `mov #8` and a `mul` per subscript.
+
+- **Stage E — integer fused multiply-add** (`1e46e08`). `(a*b)+c` → `madd`,
+  `c-(a*b)` → `msub` in the CIP — the integer twin of the float fmadd fusion
+  (new `enc_madd`). A guard keeps `x * 2^k` products as shifts.
+
+**Result (same loaded machine, best-of-3, identical harness):** the serial
+**lcg `s = s*A + C` reached gcc -O2 parity** (the arithmetic CIP is now
+gcc-level), and the throughput **xform fell from 2.35x to ~1.5x gcc -O2**
+(22 → 9 instructions in the loop body). The entire remaining xform gap is now
+**addressing**: gcc walks two pointers (`ldr [x0],#8`) while we recompute
+`i*8` twice and add the base — i.e. induction-variable strength reduction /
+linear-function-test replacement, a separate loop-analysis pass. Every stage:
+checksums unchanged, native 192/0/12, C-emit 155/0/49, gen2==gen3 byte-stable,
+x64 self-host byte-stable with identical checksums (x64 keeps the accumulator
+path, so the spine changes are inert there pending the deferred x64 CIP port).
+
+**Lesson reinforced:** disassemble the *reference*, not just your own output.
+The "auto-vectorisation" story had been in the journal for a day; one `otool`
+of gcc's loop replaced a PhD-level non-problem (SIMD) with four tractable
+peephole/instruction-selection wins.

@@ -26,9 +26,13 @@ always confirm a codegen change with the Docker self-host (`gen1 == gen2`).
 | Multi-value return banking | ✅ x0..x7/d0..d7 | ✅ rax,rdx,rcx,rsi,rdi,r8-r10/xmm0-7 | parity (custom window) |
 | Autovec + outline (loop→worker, SIMD synth) | ✅ | ✅ | parity (shared spine) |
 | Dynamic linking / FFI externs | ✅ Mach-O | ✅ ELF PLT/GOT | parity |
+| Immediate-form shift (`<<`/`>>` by a constant) | ✅ SBFM/UBFM | ✅ `C1 /4,/5,/7` | parity (shared spine peephole) |
 | Int expression freelist (B1) | ✅ x9..x15 (7 deep) | ⚠️ r11 (1 deep) | **architectural** |
 | Float compute-in-place (F.2.c) + float-B3 + `fmadd` | ✅ | ❌ | **architectural** |
 | **Integer compute-in-place (Stage 1)** | ✅ | ❌ stubs ready | **deferred** |
+| ↳ CIP memory-load leaf — `a[i]` subscripts (Jun 17 fix) | ✅ | ❌ (CIP off) | rides Int-CIP |
+| ↳ CIP strength reduction `x*2^k` → shift (Stage C) | ✅ | ❌ stub | rides Int-CIP |
+| ↳ CIP integer `madd`/`msub` fusion (Stage E) | ✅ | ❌ stub (no int MAC) | rides Int-CIP |
 | **Constant promotion (Stage 2a)** | ✅ | ❌ no stub yet | **deferred** |
 
 ## Architectural gaps (permanent — do NOT "fix")
