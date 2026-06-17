@@ -195,6 +195,12 @@ void _x64_emit_fmov_reg(dst, src) { x64_enc_movsd_reg(dst, src); }
 void _x64_emit_mov_reg_reg(dst, src) {
     x64_enc_mov_reg(_x64_int_bank_reg(dst), _x64_int_bank_reg(src));
 }
+// Move between PHYSICAL x86 register numbers — no return-bank remap. Used for
+// B3 promoted-register reads (the promoted regs are physical rbx/r12..r15, not
+// bank positions).
+void _x64_emit_mov_phys(dst, src) {
+    x64_enc_mov_reg(dst, src);
+}
 
 // Two-pass placement: pass 1 pushes each result (acc rax / xmm0) to the
 // value stack; pass 2 pops them (LIFO, reverse slot order) into each
@@ -228,7 +234,10 @@ _x64_simd_temp_count() { return 0; }
 //   emit_ishl_imm_into(dreg,src,amt): mov dreg,src (if dreg!=src) then shl dreg,amt.
 // Then give _x64_int_temp_count a real free count + temp pool.
 void _x64_emit_iload_var_into(dreg, off) { }
-void _x64_emit_iconst_into(dreg, val) { }
+// Real (not a CIP stub): the constant-promotion materialisation (emit_func
+// step 12b) loads each promoted constant into its callee-saved register, and
+// that path is backend-agnostic. dreg is a physical x86 register number.
+void _x64_emit_iconst_into(dreg, val) { x64_enc_mov_wide(dreg, val); }
 void _x64_emit_iop_into(op_code, dreg, s1, s2) { }
 void _x64_emit_iload_mem_into(dreg) { }
 void _x64_emit_ishl_imm_into(dreg, src, amt) { }
@@ -497,15 +506,13 @@ void _x64_emit_prologue(name_p, fn_lbl_id, frame_size) {
         x64_enc_store(reg, 5, off);
     }
 }
-// Constant promotion (Stage 2a) is arm64-only: a64's prim also calls
-// _a64_b3_select_const here. The spine machinery (loop-weighted const table,
-// prologue materialise, all 3 use-sites) is backend-agnostic and already a
-// no-op on x64 because cg_const_reg stays -1. TO IMPLEMENT, add a
-// _x64_b3_select_const (mirror the a64 one over x64's free callee-saved
-// r12..r15/rbx, push onto x64_promoted_regs) and chain it below — higher
-// value than x64 integer-CIP since it rides the accumulator path, no
-// freelist pressure. See docs/manual/backend_parity.md.
-void _x64_b3_select_prim() { _x64_b3_select(); }
+// Constant promotion (Stage 2a) runs on both backends now. _x64_b3_select_const
+// (in x64_codegen.bsm) mirrors the a64 one over x64's free callee-saved pool
+// (rbx/r12..r15) left after the local pass; it rides the accumulator path (no
+// freelist pressure), which is why it lands even though x64 integer-CIP stays
+// deferred. The spine const machinery (loop-weighted table, prologue
+// materialise, the cg_emit_lit use-site via emit_mov_phys) is backend-agnostic.
+void _x64_b3_select_prim() { _x64_b3_select(); _x64_b3_select_const(); }
 
 // ── Wave 20 statement orchestration primitives ──
 //
