@@ -71,14 +71,16 @@ directional.
 
 | kernel | b++ | gcc -O2 | ratio |
 |---|---|---|---|
-| biquad (FP serial) | 62.2 ms | 43.1 ms | **1.44×** — the real residual (FP loop-carried dependency + scheduling) |
-| lcg (int serial) | 22.5 ms | 19.7 ms | **1.14×** |
-| xform (int throughput) | 7.29 ms | 6.14 ms | **1.18×** (loop body + control match gcc's structure) |
+| lcg (int serial) | 18.9 ms | 18.5 ms | **1.02× — parity** |
+| xform (int throughput) | 6.72 ms | 6.10 ms | **1.10×** |
 | regheavy (register-heavy leaf) | 0.35 s | 0.30 s | ~1.17× |
+| biquad (FP serial) | 65.6 ms | 44.0 ms | **1.49×** — the one standing gap (FP `fmov` funnel + scheduling) |
 
-(best-of-15 b++ / best-of-12 gcc, same shared laptop). The integer kernels sit
-~1.1–1.2× off the oracle; the float serial kernel is the standing gap — gcc
-schedules the FP dependency chain better, the lever b++ has not built yet.
+(best-of-12 b++ / best-of-10 gcc, same shared laptop). After the loop-control
+arc and the two register levers (assign-into-destination, compare-promoted-
+directly) the **integer kernels are at gcc -O2 parity**. The only remaining
+codegen gap is the float serial kernel — see `docs/plans/fp_serial_scheduler.md`
+(the bulk of it is the float twin of the x0 funnel, a cheap Phase 1).
 
 **Autovec / parallel / SIMD:**
 
@@ -120,7 +122,8 @@ schedules the FP dependency chain better, the lever b++ has not built yet.
 | 2026-06-16 | integer compute-in-place + constant/param promotion | 2.35× |
 | 2026-06-17 | instruction selection (immediate shift, CIP memory-leaf fix, strength reduction, integer madd) | ~1.6× |
 | 2026-06-17 | induction-variable pointer walk | ~1.44× |
-| 2026-06-17 | loop control (self-update `i++` + compare-and-branch fusion) | **~1.1×** |
+| 2026-06-17 | loop control (self-update `i++` + compare-and-branch fusion) | ~1.18× |
+| 2026-06-17 | register levers (assign-into-destination + compare-promoted-directly) | **~1.10× (≈ parity)** |
 
 ### lcg — integer serial kernel, ratio to gcc -O2
 
@@ -128,7 +131,8 @@ schedules the FP dependency chain better, the lever b++ has not built yet.
 |---|---|---|
 | 2026-06-16 | baseline | 1.35× |
 | 2026-06-16 | integer CIP | 1.14× |
-| 2026-06-17 | integer madd fusion | **1.09× (≈ parity)** |
+| 2026-06-17 | integer madd fusion | 1.09× |
+| 2026-06-17 | loop control + register levers | **1.02× (parity)** |
 
 ### bench_compose — outline × autovec speedup
 

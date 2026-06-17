@@ -13889,3 +13889,41 @@ regression — the disassembly is strictly smaller than before).
 Full benchmark catalog + historical record consolidated in
 `docs/manual/benchmarks.md`. Native 192/0/12, C-emit 155/0/49, gen2==gen3
 byte-stable, x64 self-host byte-stable, compile-time 0.25s, 0 bootstrap warnings.
+
+### 2026-06-17 (cont) — the sweet spot: integer kernels at gcc -O2 parity
+
+Two more register levers closed the last of the integer gap — both extensions
+of the existing CIP, not new arcs:
+
+- **Assign into the destination register (`fa7f9f9`).** `promoted = <single-
+  instruction CIP shape over register leaves>` computes straight into the
+  target's register. `s = s*A + C` emits one `madd s, s, A, C` — no accumulator
+  round-trip + copy-back. Safe because the lone instruction reads every source
+  before writing the destination (so the target may itself be a source). Gated
+  on `int_temp_count >= 0` (a64); a stub-only x64 would have emitted garbage —
+  caught by the Docker checksum before commit.
+- **Compare promoted registers directly (`71569c7`).** When both operands of a
+  loop/if comparison are promoted leaves, `while (i < n)` becomes `cmp x19, x21;
+  b.ge` — no copy of i or n to scratch. The x64 operand order (dst=left/
+  src=right, the inverse of my first guess) was caught by the Docker checksum
+  (loops exited immediately → wrong) and fixed.
+
+The lcg loop is now **five instructions** — `cmp; b.ge; madd; add; b` — the same
+shape gcc emits. Measured: **lcg 1.02× (parity), xform 1.10×**. The integer
+kernels are at `gcc -O2`. This is the sweet spot the compiler work was aiming
+for: codegen is no longer the bottleneck for game logic, so the focus can move
+to tools / games / stb.
+
+The one remaining codegen gap is the **float serial kernel (biquad 1.49×)** —
+and disassembly shows the bulk of it is the float twin of the x0 funnel: the
+state updates `x2=x1; x1=x; …` route through `d0` with two `fmov`s each instead
+of one direct `fmov dDst, dSrc`. The fix (a cheap Phase 1) plus the genuine FP
+instruction-scheduling lever (Phase 2, opt-in because FP addition is not
+associative) are planned in `docs/plans/fp_serial_scheduler.md`. Audio is a
+first-class target, so that plan is the next codegen work when it is wanted.
+
+Every commit: native 192/0/12, C-emit 155/0/49, gen2==gen3 byte-stable, x64
+self-host byte-stable, compile-time 0.25s, 0 bootstrap warnings. This closes the
+codegen-quality journey: a continuous arc that took the AAA throughput kernel
+from 3.71× to parity and the serial kernels to parity, with its own from-scratch
+backend, over a single span of days.

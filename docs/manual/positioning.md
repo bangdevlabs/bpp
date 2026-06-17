@@ -23,10 +23,10 @@ toolchain, written in itself.
 
   | kernel | ratio to `gcc -O2` |
   |---|---|
-  | integer serial (lcg) | **1.14×** |
-  | integer throughput (xform) | **1.18×** |
+  | integer serial (lcg) | **1.02× (parity)** |
+  | integer throughput (xform) | **1.10×** |
   | register-heavy leaf | **1.17×** |
-  | float serial (biquad) | 1.44× (the standing gap) |
+  | float serial (biquad) | 1.49× (the one standing gap — float `fmov` funnel + scheduling) |
 
   It got there by building, in order: a call-aware register freelist; B3 local
   promotion (now widened into caller-saved regs for leaf functions);
@@ -58,9 +58,10 @@ that mature optimizers still hold.
 So the honest placement:
 
 - **On raw scalar codegen**, the LLVM-backed languages win — they *are* C-level
-  because they emit LLVM IR. B++ is ~1.1–1.2× off on integer kernels and ~1.4×
-  on float-serial. That gap is real but narrow, and it is closing
-  feature-by-feature (it was 2–3.7× a month ago).
+  because they emit LLVM IR. B++ is now **at `gcc -O2` parity on integer
+  kernels** (lcg 1.02×, xform 1.10×) and ~1.5× on float-serial. The integer gap
+  is effectively closed; the float-serial gap is named, diagnosed (mostly a copy
+  funnel, a cheap fix), and planned. It was 2–3.7× a month ago.
 - **On compile speed and footprint**, B++ is in the Jai/Zig "fast iteration"
   camp and arguably ahead — a 0.25 s self-host with no LLVM, no system linker.
 - **On what ships in the box**, B++ is alone: the others are languages (plus a
@@ -83,8 +84,8 @@ instruction scheduling) would pay off.
 ## The honest verdict
 
 B++ is a genuinely fast, self-contained, self-hosted compiler that has reached
-**within ~1.1–1.2× of `gcc -O2` on integer code with its own from-scratch
-backend, in months**, while also shipping a complete game engine and editor.
+**`gcc -O2` parity on integer code with its own from-scratch backend, in
+months**, while also shipping a complete game engine and editor.
 It does not beat C/C++ or the LLVM-backed languages on raw codegen, and it
 does not pretend to — the remaining gap (float scheduling, more aggressive
 auto-vectorisation) is named and measurable. What it offers instead is a point
