@@ -73,14 +73,16 @@ directional.
 |---|---|---|---|
 | lcg (int serial) | 18.9 ms | 18.5 ms | **1.02× — parity** |
 | xform (int throughput) | 6.72 ms | 6.10 ms | **1.10×** |
+| biquad (FP serial) | 50.1 ms | 48.9 ms | **1.02× — parity** |
 | regheavy (register-heavy leaf) | 0.35 s | 0.30 s | ~1.17× |
-| biquad (FP serial) | 65.6 ms | 44.0 ms | **1.49×** — the one standing gap (FP `fmov` funnel + scheduling) |
 
-(best-of-12 b++ / best-of-10 gcc, same shared laptop). After the loop-control
-arc and the two register levers (assign-into-destination, compare-promoted-
-directly) the **integer kernels are at gcc -O2 parity**. The only remaining
-codegen gap is the float serial kernel — see `docs/plans/fp_serial_scheduler.md`
-(the bulk of it is the float twin of the x0 funnel, a cheap Phase 1).
+(best-of-8–12 b++ / best-of-6–10 gcc, same shared laptop). After the loop-
+control arc, the two register levers, and the float assign-into-destination
+(FP-serial Phase 1), **all three bench_codegen kernels — integer serial,
+integer throughput, and float serial — are at gcc -O2 parity.** The FP
+scheduler (`docs/plans/fp_serial_scheduler.md` Phase 2) is deferred: the
+measured gap is closed; it would be speculative until a real audio DSP workload
+shows a scheduling-bound gap.
 
 **Autovec / parallel / SIMD:**
 

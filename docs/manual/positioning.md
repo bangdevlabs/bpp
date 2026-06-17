@@ -25,8 +25,8 @@ toolchain, written in itself.
   |---|---|
   | integer serial (lcg) | **1.02× (parity)** |
   | integer throughput (xform) | **1.10×** |
+  | float serial (biquad) | **1.02× (parity)** |
   | register-heavy leaf | **1.17×** |
-  | float serial (biquad) | 1.49× (the one standing gap — float `fmov` funnel + scheduling) |
 
   It got there by building, in order: a call-aware register freelist; B3 local
   promotion (now widened into caller-saved regs for leaf functions);
@@ -57,11 +57,12 @@ that mature optimizers still hold.
 
 So the honest placement:
 
-- **On raw scalar codegen**, the LLVM-backed languages win — they *are* C-level
-  because they emit LLVM IR. B++ is now **at `gcc -O2` parity on integer
-  kernels** (lcg 1.02×, xform 1.10×) and ~1.5× on float-serial. The integer gap
-  is effectively closed; the float-serial gap is named, diagnosed (mostly a copy
-  funnel, a cheap fix), and planned. It was 2–3.7× a month ago.
+- **On raw scalar codegen**, the LLVM-backed languages win on the long tail
+  (aggressive auto-vectorisation, whole-program scheduling) — but on the scalar
+  kernels b++ is now **at `gcc -O2` parity across the board**: integer serial
+  (1.02×), integer throughput (1.10×), and float serial (1.02×). It was 2–3.7×
+  a month ago. The remaining edge the LLVM-backed compilers hold is the heavy
+  SIMD auto-vectoriser and cross-iteration scheduling, not basic scalar codegen.
 - **On compile speed and footprint**, B++ is in the Jai/Zig "fast iteration"
   camp and arguably ahead — a 0.25 s self-host with no LLVM, no system linker.
 - **On what ships in the box**, B++ is alone: the others are languages (plus a

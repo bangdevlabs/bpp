@@ -1,6 +1,15 @@
 # Plan — closing the FP-serial gap (biquad 1.49× → parity)
 
-**Status:** PLANNED (2026-06-17). The integer kernels reached `gcc -O2` parity
+**UPDATE (2026-06-17): Phase 1 SHIPPED (`befad75`) and it CLOSED the gap —
+biquad 1.49× → 1.02× (parity). Phase 2 (the FP scheduler) is DEFERRED: there is
+no longer a measured gap to chase. Build it only when a real audio DSP workload
+(an FFT butterfly bank, a polyphase filter, a convolution) demonstrates a
+scheduling-bound gap against gcc — building it now would be speculative, against
+the measure-first discipline, and it carries the FP-non-associativity opt-in
+complexity for an unmeasured benefit. The diagnosis below was correct: the bulk
+of the gap was the float copy funnel, not scheduling.**
+
+**Status:** Phase 1 DONE, Phase 2 deferred. The integer kernels reached `gcc -O2` parity
 (lcg 1.02×, xform 1.10×) after the loop-control + the two register levers. The
 one standing codegen gap is the **float serial kernel** — the biquad IIR filter
 at **1.49× gcc -O2**. Audio/DSP is a first-class target, so this is worth

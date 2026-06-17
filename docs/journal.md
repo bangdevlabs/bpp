@@ -13927,3 +13927,33 @@ self-host byte-stable, compile-time 0.25s, 0 bootstrap warnings. This closes the
 codegen-quality journey: a continuous arc that took the AAA throughput kernel
 from 3.71× to parity and the serial kernels to parity, with its own from-scratch
 backend, over a single span of days.
+
+### 2026-06-17 (cont) — the FP-serial gap, closed by Phase 1 alone
+
+The one remaining codegen gap was the float serial kernel (biquad 1.49×). The
+plan named two phases: a cheap copy-elimination, then a real FP scheduler. The
+disassembly had already told the truth — the biquad inner loop was a wall of
+`fmov d0, src; fmov dst, d0` pairs, the float twin of the integer x0 funnel.
+
+**Float assign-into-destination (`befad75`).** The float twin of the integer
+lever: a `promoted_float = <expr that does not read the target>` computes
+straight into the target's d-register via the float CIP. A new `cg_node_uses_var`
+walker proves the destination is free of a not-yet-read source, so the multi-op
+`y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2` lands in `y`'s register directly and
+the state shuffles `x2=x1; x1=x; …` become single direct `fmov dDst, dSrc`.
+Naturally a64-only (x64 has no callee-saved xmm, so no float promotion).
+
+**This closed the gap on its own: biquad 1.49× → 1.02× (parity).** Phase 2 — the
+FP instruction scheduler — was DEFERRED, not built: with the measured gap gone,
+building it would be speculative, and it carries the FP-non-associativity opt-in
+complexity. It waits for a real audio DSP workload that demonstrates a
+scheduling-bound gap. The measure-don't-believe discipline cuts both ways: it
+tells you what to build, and it tells you when to stop.
+
+**The journey is complete.** All three `bench_codegen` kernels — integer serial,
+integer throughput, and float serial — are at `gcc -O2` parity. A continuous
+arc, measured at every step, took a from-scratch self-hosted backend from
+~2–3.7× off the oracle to parity in a span of days, while staying byte-stable on
+two backends and never adding a bootstrap warning. The "sidequest that became a
+pilgrimage" reached its destination: codegen is no longer the bottleneck, and
+the focus turns to tools, games, and stb.
