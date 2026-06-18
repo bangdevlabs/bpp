@@ -1,0 +1,76 @@
+// tl_timeline.bsm — clips arranged over time + the offline mix.
+//
+// A clip is a slice of an s16 mono buffer placed on a channel at a start frame.
+// This module owns the clip store and the render: a frame-outer, channel-inner
+// mix that sums each channel's active clips, runs them through the channel
+// strip (tl_channel_process), and writes the master to a stereo s16 buffer.
+
+// One clip: `len` frames of s16 mono `buf`, placed at `start` on the timeline.
+// `frames` is the buffer's own length, so a split clip can point part-way into
+// a shared buffer without copying it.
+struct Clip { track, buf, frames, start, len }
+
+static auto _tl_clips;      // arr_struct<Clip>
+
+void tl_timeline_init() {
+    _tl_clips = arr_struct_new(sizeof(Clip), 64);
+}
+
+// Place a clip on `track` starting at timeline frame `start`, playing `len`
+// frames of `buf` (an s16 mono buffer of `frames` samples).
+void tl_add_clip(track, buf, frames, start, len) {
+    auto idx, cl: Clip;
+    // alloc reserves a slot and returns its INDEX; `at` turns that into the
+    // pointer we fill in (the canonical alloc-then-at pattern).
+    idx = arr_struct_alloc(_tl_clips);
+    cl  = arr_struct_at(_tl_clips, idx);
+    cl.track  = track;
+    cl.buf    = buf;
+    cl.frames = frames;
+    cl.start  = start;
+    cl.len    = len;
+}
+
+// How many clips are on the timeline, and the pointer to clip `i`. The tools
+// and the render reach the clip store only through these two accessors.
+tl_clip_count() { return arr_struct_count(_tl_clips); }
+tl_clip_at(i)   { return arr_struct_at(_tl_clips, i); }
+
+// Render `total_frames` of the whole arrangement into `out_buf` (stereo s16),
+// scaled by `master`. Frame-outer, channel-inner so each channel's stateful
+// filter sees consecutive samples.
+void tl_render(out_buf, total_frames, master: float) {
+    auto t, tr, ci, nclips, cl: Clip;
+    auto master_v: float, ts: float, sf: float;
+    auto (rel, raw, si): word;       // word: the s16 results convert here (fcvtzs)
+
+    tl_channel_reset_filters();
+    nclips = arr_struct_count(_tl_clips);
+
+    for (t = 0; t < total_frames; t++) {
+        master_v = 0.0;
+        for (tr = 0; tr < TL_NTRACKS; tr++) {
+            ts = 0.0;
+            // Sum this channel's clips that are active at frame t.
+            for (ci = 0; ci < nclips; ci++) {
+                cl = arr_struct_at(_tl_clips, ci);
+                if (cl.track != tr) { continue; }
+                if (t < cl.start)   { continue; }
+                rel = t - cl.start;
+                if (rel >= cl.len)  { continue; }
+                raw = read_u16(cl.buf, rel * 2);
+                if (raw >= 32768) { raw -= 65536; }   // u16 -> s16
+                sf = raw;                              // int -> float
+                ts += sf / 32768.0;
+            }
+            // The channel strip: filter insert + volume fader.
+            master_v += tl_channel_process(tr, ts);
+        }
+        master_v *= master;
+        si = master_v * 32767.0;                       // float -> s16
+        if (si >  32767) { si =  32767; }
+        if (si < -32767) { si = -32767; }
+        write_u16(out_buf, t * 4 + 0, si);             // L
+        write_u16(out_buf, t * 4 + 2, si);             // R (mono)
+    }
+}

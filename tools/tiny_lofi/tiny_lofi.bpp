@@ -1,0 +1,77 @@
+// tiny_lofi.bpp — an 8/16-bit mini DAW (standalone entry).
+//
+// This is the standalone tool: it loads the tiny_lofi engine (tl_lib.bsm) and
+// runs a hardcoded test project to prove the whole audio path offline — clips
+// on two channels, a filter insert, a scissors cut, the master mix, and WAV
+// export — before any GUI exists.
+//
+// The engine is split into modules (channel / timeline / io / tools) so it is
+// easy to maintain and grow, and so a Bang 9 tab can later drive the same
+// engine through tl_lib.bsm without this file's `main`.
+//
+// Run:  ./bpp tools/tiny_lofi/tiny_lofi.bpp -o /tmp/tl && (cd /tmp && /tmp/tl)
+//       then play tiny_lofi_test.wav
+load "tl_lib.bsm";
+
+const TL_2PI = 6.2831853;     // for the test-signal generators (float const)
+
+// ── Test signal generators (scaffolding until WAV import lands) ──────
+
+gen_sine(freq: float, frames) {
+    auto buf, i, ph: float, dph: float;
+    buf = malloc(frames * 2);
+    ph = 0.0; dph = TL_2PI * freq / 44100.0;
+    for (i = 0; i < frames; i++) {
+        auto sw: word;
+        sw = 18000.0 * sin_f(ph);
+        write_u16(buf, i * 2, sw);
+        ph += dph;
+        if (ph > TL_2PI) { ph -= TL_2PI; }
+    }
+    return buf;
+}
+
+gen_saw(freq: float, frames) {
+    auto buf, i, ph: float, dph: float, val: float;
+    buf = malloc(frames * 2);
+    ph = 0.0; dph = freq / 44100.0;
+    for (i = 0; i < frames; i++) {
+        auto sw: word;
+        val = 2.0 * ph - 1.0;
+        sw = 16000.0 * val;
+        write_u16(buf, i * 2, sw);
+        ph += dph;
+        if (ph >= 1.0) { ph -= 1.0; }
+    }
+    return buf;
+}
+
+// ── The hardcoded test project: prove the engine end to end ─────────
+
+main() {
+    auto sine, saw, total;
+    tl_init();
+
+    // Channel 0: a clean 220 Hz sine (a bass note), no filter, slope unused.
+    tl_track_set(0, 0.7, 0, 0.0, 0.0, 4);
+    sine = gen_sine(220.0, 88200);                 // 2 seconds
+    tl_add_clip(0, sine, 88200, 0, 88200);         // plays 0.0 .. 2.0 s
+
+    // Scissors: cut the bass clip in half at 1.0 s. Playing the two halves is
+    // identical to the whole — the cut is lossless (this dogfoods tl_tools).
+    tl_clip_split(0, 44100);
+
+    // Channel 1: a 330 Hz sawtooth through the Moog at a 2-pole (12 dB/oct)
+    // slope — an open, buzzy lofi lead. The slope is selected from the filter's
+    // four ladder taps, which moog_taps returns in one multi-value call.
+    tl_track_set(1, 0.6, 1, 1200.0, 2.6, 2);
+    saw = gen_saw(330.0, 110250);                  // 2.5 seconds
+    tl_add_clip(1, saw, 110250, 22050, 110250);    // plays 0.5 .. 3.0 s
+
+    total = 132300;                                // 3 seconds
+    tl_export("tiny_lofi_test.wav", total, 0.85);
+
+    put("rendered tiny_lofi_test.wav — ", total,
+        " frames, 2 channels (sine + 12 dB/oct Moog saw), 1 scissors cut\n");
+    return 0;
+}
