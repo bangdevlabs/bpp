@@ -1,0 +1,69 @@
+// tl_bench.bpp — measure the tiny_lofi render (no window).
+//
+// Renders the test project in a tight loop and reports microseconds per render
+// + the realtime factor (how many seconds of audio per second of CPU). This is
+// the headless engine only, so it also emits to C (`bpp --c`) — letting us
+// compare our codegen against gcc -O2 on the SAME real workload, not a
+// microbenchmark.
+//
+//   ./bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb
+//   ./bpp --c tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb.c && gcc -O2 /tmp/tlb.c -o /tmp/tlb_gcc && /tmp/tlb_gcc
+load "tl_lib.bsm";
+
+const TL_2PI  = 6.2831853;
+const RENDERS = 400;            // how many times to render the 3 s project
+
+gen_sine(freq: float, frames) {
+    auto buf, i, ph: float, dph: float;
+    buf = malloc(frames * 2);
+    ph = 0.0; dph = TL_2PI * freq / 44100.0;
+    for (i = 0; i < frames; i++) {
+        auto sw: word;
+        sw = 18000.0 * sin_f(ph);
+        write_u16(buf, i * 2, sw);
+        ph += dph;
+        if (ph > TL_2PI) { ph -= TL_2PI; }
+    }
+    return buf;
+}
+
+gen_saw(freq: float, frames) {
+    auto buf, i, ph: float, dph: float, val: float;
+    buf = malloc(frames * 2);
+    ph = 0.0; dph = freq / 44100.0;
+    for (i = 0; i < frames; i++) {
+        auto sw: word;
+        val = 2.0 * ph - 1.0;
+        sw = 16000.0 * val;
+        write_u16(buf, i * 2, sw);
+        ph += dph;
+        if (ph >= 1.0) { ph -= 1.0; }
+    }
+    return buf;
+}
+
+main() {
+    auto sine, saw, total, buf, i, t0, t1, us, per, rtf;
+    tl_init();
+    tl_track_set(0, 0.7, 0, 0.0, 0.0, 4);
+    sine = gen_sine(220.0, 88200);
+    tl_add_clip(0, sine, 88200, 0, 88200);
+    tl_clip_split(0, 44100);
+    tl_track_set(1, 0.6, 1, 1200.0, 2.6, 2);
+    saw = gen_saw(330.0, 110250);
+    tl_add_clip(1, saw, 110250, 22050, 110250);
+    total = 132300;                                // 3 s
+    buf = malloc(total * 4);
+
+    t0 = _stb_get_time_us();
+    for (i = 0; i < RENDERS; i++) { tl_render(buf, total, 0.85); }
+    t1 = _stb_get_time_us();
+
+    us  = t1 - t0;
+    per = us / RENDERS;                            // us to render 3 s of audio
+    rtf = 3000000 / per;                           // 3 s = 3,000,000 us of audio
+    put("renders: ", RENDERS, "  total_us: ", us, "\n");
+    put("per 3s-render: ", per, " us\n");
+    put("realtime factor: ", rtf, "x  (audio seconds per CPU second)\n");
+    return 0;
+}

@@ -34,6 +34,32 @@ numbers, and how the headline metrics have evolved over time.
 |---|---|---|---|
 | `examples/bench_codegen.bpp` | biquad (FP serial), lcg (int serial), xform (int throughput) — the canonical codegen gate | `bpp examples/bench_codegen.bpp -o /tmp/bcg && /tmp/bcg` | serial near gcc -O2 parity; throughput as low as possible |
 | oracle | the same three kernels under gcc -O2 | `bpp --c examples/bench_codegen.bpp > /tmp/b.c && cc -O2 -w /tmp/b.c -o /tmp/o2 -lobjc -lm && /tmp/o2` | — |
+| `tools/tiny_lofi/tl_bench.bpp` | a REAL assembled program — the tiny_lofi DAW render (3 s project, call-heavy) | `bpp tools/tiny_lofi/tl_bench.bpp -o /tmp/tlb && /tmp/tlb` | realtime factor ≫ 1× |
+
+### Real-program codegen — the tiny_lofi finding (2026-06-18)
+
+The microbenchmark parity (biquad 1.02×, lcg 1.02×) is measured on **tight,
+already-flat kernels**. The tiny_lofi DAW render is the first **call-heavy real
+program** measured the same way (`bpp --c` → `cc -O2`), and it does **NOT** hold
+parity:
+
+| | per 3 s render | realtime factor | vs clang -O2 |
+|---|---|---|---|
+| our codegen | 16.9 ms | 177× | — |
+| clang -O2 (same source) | 2.3 ms | ~1300× | **7.3× faster** |
+
+Cause (disasm-confirmed): our `tl_render` inner loop has 6 `bl` calls per
+iteration (`arr_struct_at`, `read_u16`, `write_u16`×2, and `tl_channel_process`
+→ which calls the whole `moon_process → moog_slope → moog_taps →
+flt_onepole_tick` chain). clang's `tl_render` has **1 `bl` total** — it inlines
+the entire per-sample path into flat FP. At ~1M calls/render the call overhead
+*is* the gap.
+
+**Honest takeaway:** "gcc -O2 parity" is a claim about tight inlined kernels,
+NOT about assembled call-heavy code. The DAW works comfortably (177× realtime),
+but the next codegen frontier is an **inliner that collapses the call graph**
+(cross-module + multi-value-return functions don't inline for us yet; they do
+for clang). Measure beat believe — again.
 
 ### Autovectorisation + outlining (parallel)
 
