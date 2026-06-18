@@ -1,0 +1,242 @@
+// tl_gui.bsm — the tiny_lofi DAW window (slice 2: the visible shell).
+//
+// Opens a window and draws the arrangement the engine already holds: a
+// transport bar (Play / Stop / Export), a time ruler, eight track lanes with
+// their clips as blocks, a playhead, and a mixer strip down the right side.
+// The view is read-only over the model (the engine owns the data); the only
+// interaction so far is the transport, which renders the project once and
+// streams it through the audio device while the playhead tracks the cursor.
+//
+// Drawing is immediate-mode into the window framebuffer: clear() at the top,
+// draw_rect()/draw_text() for everything, draw_end() to present.
+
+// ── Layout (a 960x600 window) ──────────────────────────────────────
+const GUI_W    = 960;
+const GUI_H    = 600;
+const TRANSP_H = 46;                 // transport bar
+const RULER_H  = 22;                 // time ruler
+const HEAD_W   = 150;                // track-header column
+const MIX_W    = 196;                // mixer strip (right)
+const LANE_Y0  = 68;                 // TRANSP_H + RULER_H
+const LANE_H   = 64;                 // 8 lanes * 64 = 512
+const TL_X0    = 150;                // timeline left  (= HEAD_W)
+const TL_X1    = 764;                // timeline right (= GUI_W - MIX_W)
+const PXPS     = 150;                // pixels per second on the timeline
+
+// ── Transport / playback state ─────────────────────────────────────
+// Master volume is held as integer permille (e.g. 850 = 0.85): un-annotated
+// globals reject float stores, so we keep the int and convert when the engine
+// needs a float (the stbaudio amplitude pattern).
+static auto _g_playing;              // 0 = stopped, 1 = playing
+static auto _g_play_pos;             // frame cursor pushed to the audio device
+static auto _g_play_buf;             // the rendered stereo s16 project buffer
+static auto _g_play_frames;          // total frames in the project
+static auto _g_master_pm;            // master volume, permille (int)
+static auto _g_status;               // a short status string, or 0
+
+static _rgb(r, g, b) { return rgba(r, g, b, 255); }
+
+// Master volume as a float (permille -> 0..1), for the engine calls.
+static _g_master_f() -> float {
+    auto mf: float;
+    mf = _g_master_pm;               // int -> float (scvtf)
+    return mf / 1000.0;
+}
+
+// Point-in-rect test for hit testing.
+static _in_rect(px, py, x, y, w, h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+// Draw a labelled button; return 1 if it was clicked this frame. `tint` colors
+// the idle face; hovering brightens it.
+static _button(x, y, w, h, label, tint) {
+    auto mx, my, hot, face;
+    mx = mouse_x(); my = mouse_y();
+    hot = _in_rect(mx, my, x, y, w, h);
+    face = hot ? _rgb(86, 92, 120) : tint;
+    draw_rect(x, y, w, h, face);
+    draw_rect(x, y, w, 1, _rgb(20, 20, 28));
+    draw_text(label, x + 10, y + 7, 8, _rgb(230, 230, 240));
+    return hot && mouse_pressed(MOUSE_LEFT);
+}
+
+// A distinct block color per channel, so lanes read apart at a glance.
+static _clip_color(ch) {
+    switch (ch) {
+        0    { return _rgb(90, 170, 255); }
+        1    { return _rgb(255, 150, 90); }
+        2    { return _rgb(130, 220, 130); }
+        3    { return _rgb(220, 130, 220); }
+        4    { return _rgb(230, 210, 100); }
+        5    { return _rgb(110, 210, 220); }
+        6    { return _rgb(230, 120, 140); }
+        else { return _rgb(160, 160, 200); }
+    }
+}
+
+// ── Transport bar ──────────────────────────────────────────────────
+static void _g_draw_transport() {
+    draw_rect(0, 0, GUI_W, TRANSP_H, _rgb(30, 30, 42));
+    draw_text("tiny_lofi", 12, 6, 8, _rgb(120, 180, 255));
+    draw_text("8/16-bit DAW", 12, 24, 8, _rgb(95, 95, 120));
+
+    if (_button(110, 12, 64, 22, _g_playing ? "PLAYING" : "PLAY", _rgb(54, 120, 70))) {
+        if (_g_play_pos >= _g_play_frames) { _g_play_pos = 0; }
+        _g_playing = 1;
+    }
+    if (_button(180, 12, 56, 22, "STOP", _rgb(120, 60, 60))) {
+        _g_playing = 0; _g_play_pos = 0;
+    }
+    if (_button(242, 12, 70, 22, "EXPORT", _rgb(54, 60, 96))) {
+        tl_export("tiny_lofi_test.wav", _g_play_frames, _g_master_f());
+        _g_status = "exported tiny_lofi_test.wav";
+    }
+
+    // Playhead time readout (whole seconds).
+    draw_text("t=", 340, 18, 8, _rgb(120, 120, 140));
+    draw_number(360, 18, 8, _rgb(210, 210, 220), _g_play_pos / 44100);
+    draw_text("s", 392, 18, 8, _rgb(120, 120, 140));
+    if (_g_status != 0) { draw_text(_g_status, 430, 18, 8, _rgb(120, 190, 130)); }
+}
+
+// ── Time ruler ─────────────────────────────────────────────────────
+static void _g_draw_ruler() {
+    auto s, x;
+    draw_rect(TL_X0, TRANSP_H, TL_X1 - TL_X0, RULER_H, _rgb(30, 30, 42));
+    // One mark per second across the visible range.
+    for (s = 0; s <= 4; s++) {
+        x = TL_X0 + s * PXPS;
+        if (x > TL_X1) { continue; }
+        draw_rect(x, TRANSP_H, 1, RULER_H, _rgb(60, 60, 80));
+        draw_number(x + 3, TRANSP_H + 6, 8, _rgb(140, 140, 160), s);
+    }
+}
+
+// ── Track lanes + clips ────────────────────────────────────────────
+static void _g_draw_lanes() {
+    auto tr, y, nclips, ci, cl: Clip, cx, cw, lane_bg;
+    auto v: float, vw: word;
+    nclips = tl_clip_count();
+
+    for (tr = 0; tr < 8; tr++) {
+        y = LANE_Y0 + tr * LANE_H;
+        // Alternating lane background.
+        lane_bg = tr & 1 ? _rgb(30, 30, 40) : _rgb(26, 26, 36);
+        draw_rect(TL_X0, y, TL_X1 - TL_X0, LANE_H, lane_bg);
+        draw_rect(TL_X0, y + LANE_H - 1, TL_X1 - TL_X0, 1, _rgb(18, 18, 26));
+
+        // Header: channel name, filter badge, volume bar.
+        draw_rect(0, y, HEAD_W, LANE_H, _rgb(34, 34, 46));
+        draw_rect(HEAD_W - 1, y, 1, LANE_H, _rgb(18, 18, 26));
+        draw_text("CH", 10, y + 8, 8, _rgb(150, 150, 170));
+        draw_number(34, y + 8, 8, _rgb(210, 210, 220), tr + 1);
+        if (tl_channel_flt_on(tr) != 0) {
+            draw_rect(64, y + 7, 30, 11, _rgb(70, 90, 140));
+            draw_text("FLT", 67, y + 8, 8, _rgb(220, 220, 240));
+        }
+        // Volume bar.
+        v  = tl_channel_vol(tr);
+        vw = v * 120.0;                       // float -> int width (fcvtzs)
+        draw_rect(10, y + 30, 120, 8, _rgb(44, 44, 58));
+        draw_rect(10, y + 30, vw, 8, _rgb(90, 170, 255));
+
+        // Clips on this lane.
+        for (ci = 0; ci < nclips; ci++) {
+            cl = tl_clip_at(ci);
+            if (cl.track != tr) { continue; }
+            cx = TL_X0 + (cl.start * PXPS) / 44100;
+            cw = (cl.len * PXPS) / 44100;
+            if (cw < 2) { cw = 2; }
+            draw_rect(cx, y + 6, cw, LANE_H - 14, _clip_color(tr));
+            draw_rect(cx, y + 6, cw, 1, _rgb(255, 255, 255));
+            draw_rect(cx, y + 6, 1, LANE_H - 14, _rgb(20, 20, 28));
+        }
+    }
+}
+
+// ── Mixer strip (read-only display for now) ────────────────────────
+static void _g_draw_mixer() {
+    auto i, x, fy, mw;
+    auto v: float, fh: word;
+    draw_rect(TL_X1, TRANSP_H, MIX_W, GUI_H - TRANSP_H, _rgb(34, 34, 46));
+    draw_rect(TL_X1, TRANSP_H, 1, GUI_H - TRANSP_H, _rgb(18, 18, 26));
+    draw_text("MIXER", TL_X1 + 12, TRANSP_H + 6, 8, _rgb(150, 150, 170));
+
+    // Eight channel faders, each a vertical bar.
+    for (i = 0; i < 8; i++) {
+        x  = TL_X1 + 12 + i * 19;
+        v  = tl_channel_vol(i);
+        draw_rect(x, TRANSP_H + 30, 12, 180, _rgb(26, 26, 36));
+        fh = v * 180.0;                        // float -> int height
+        fy = TRANSP_H + 30 + (180 - fh);
+        draw_rect(x, fy, 12, fh, _clip_color(i));
+        draw_number(x + 1, TRANSP_H + 216, 8, _rgb(120, 120, 140), i + 1);
+    }
+    // Master (permille -> a 0..160 px bar, all integer).
+    draw_text("MASTER", TL_X1 + 12, TRANSP_H + 240, 8, _rgb(150, 150, 170));
+    x  = TL_X1 + 12;
+    mw = _g_master_pm * 160 / 1000;
+    draw_rect(x, TRANSP_H + 258, 160, 14, _rgb(26, 26, 36));
+    draw_rect(x, TRANSP_H + 258, mw, 14, _rgb(90, 200, 130));
+}
+
+// ── Playhead ───────────────────────────────────────────────────────
+static void _g_draw_playhead() {
+    auto x;
+    x = TL_X0 + (_g_play_pos * PXPS) / 44100;
+    if (x < TL_X0) { x = TL_X0; }
+    if (x > TL_X1) { x = TL_X1; }
+    draw_rect(x, TRANSP_H, 1, GUI_H - TRANSP_H, _rgb(255, 230, 90));
+}
+
+// Stream the rendered buffer to the audio device. audio_push_frames self-
+// throttles to playback rate (it only accepts up to the ring's free space),
+// so the frame cursor advances at ~real time and the playhead follows it.
+static void _g_pump_audio() {
+    auto space, remain, chunk, pushed;
+    if (_g_playing == 0) { return; }
+    remain = _g_play_frames - _g_play_pos;
+    if (remain <= 0) { _g_playing = 0; return; }
+    space = audio_ring_space();
+    chunk = space < remain ? space : remain;
+    if (chunk > 0) {
+        pushed = audio_push_frames(_g_play_buf + _g_play_pos * 4, chunk);
+        _g_play_pos += pushed;
+    }
+}
+
+// ── Run ────────────────────────────────────────────────────────────
+// Open the window and run the DAW loop over the already-built project.
+void tl_gui_run(total_frames, master: float) {
+    auto pm: word;
+    _g_playing     = 0;
+    _g_play_pos    = 0;
+    _g_play_frames = total_frames;
+    pm             = master * 1000.0;          // float -> int permille
+    _g_master_pm   = pm;
+    _g_status      = 0;
+    _g_play_buf    = malloc(total_frames * 4);
+    tl_render(_g_play_buf, total_frames, master);
+
+    window_init_full(GUI_W, GUI_H, "tiny_lofi");
+    audio_open(4096);
+
+    while (window_should_close() == 0) {
+        window_frame_step();
+        if (key_pressed(KEY_ESC)) { break; }
+
+        _g_pump_audio();
+
+        clear(_rgb(22, 22, 30));
+        _g_draw_ruler();
+        _g_draw_lanes();
+        _g_draw_mixer();
+        _g_draw_playhead();
+        _g_draw_transport();        // last: its buttons sit above everything
+        draw_end();
+    }
+
+    audio_close();
+    free(_g_play_buf);
+}

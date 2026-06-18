@@ -102,9 +102,12 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    the Moog at a 2-pole slope on channel 1 → a mixed WAV. The slope-4 variant
    renders byte-identical to a pre-refactor baseline, so the mix is proven.
    *This is the slice that tests the audio system — it does.*
-2. **GUI shell** — window + the timeline grid (8 lanes, a time ruler, a
-   playhead) + a transport bar (play/stop/export) + a mixer strip (8 faders +
-   master). Read-only view of the model.
+2. **GUI shell** — ✅ DONE (2026-06-18, `tl_gui.bsm`). Window + the timeline
+   grid (8 lanes, a time ruler, a playhead) + a transport bar (Play / Stop /
+   Export, the buttons live) + a mixer strip (8 faders + master). Read-only
+   view of the model; Play renders the project once and streams it through the
+   audio device while the playhead follows the cursor. `./tl` opens the window;
+   `./tl --render` keeps the headless WAV path for CI.
 3. **Clips + tools** — import a WAV as a clip; draw clips as blocks; select;
    drag to move; scissors to cut at the playhead; Ctrl+C / Ctrl+V.
 4. **Insert** — the Moog filter per track, cutoff/resonance in the channel
