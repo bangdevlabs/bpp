@@ -29,7 +29,36 @@ so the **compiler binary grew +132 KB (+13%)** with **no compile-time win**
 loops (+3% DAW only). **Reverted.** Eligibility relaxation only pays at HOT call
 sites; without the gate it's a net loss. So the gate comes first.
 
-## Stages (each: bootstrap byte-stable + 192/0/12 + 155/0/49 + tl_bench + binary-size + audio md5)
+## Lesson from the second attempt (2026-06-18) — verify the BOOTSTRAPPED compiler
+
+The size-gated Inc 1 (commit `a314e36`, since reverted) avoided the bloat and
+passed native 192/0/12 + C-emit 155/0/49 + byte-stable bootstrap — but it
+**broke `--c`**: a compiler *bootstrapped from* the Inc 1 source crashes on
+`bpp --c` (SIGSEGV in the C-emit path — the builtin-wrapper inline mis-compiles
+a function `bpp_emitter.bsm` uses). The native suite never exercises `--c`, and
+**the regression was MISSED because `run_all_c.sh` ran with the OLD `./bpp`, not
+the freshly-bootstrapped Inc 1 compiler** — so it tested the previous codegen's
+`--c`, which was fine. The bug only surfaces when the NEW compiler emits C.
+
+**The verification gap (now a hard rule for this arc):** an inliner change must
+be verified by **bootstrapping → INSTALLING (fresh inode, never codesign) → then
+running `run_all_c.sh`**. The C-emit suite only catches a self-miscompile when
+`./bpp` IS the compiler under test. `test_bootstrap_stable.sh` checks byte-
+stability but NOT `--c` correctness, and a stable fixpoint can still be a
+miscompile. Add a `bpp --c <smoke>.bpp` check on the bootstrapped binary to the
+per-step gate, alongside binary size.
+
+(The whole detour also cost hours to the **Golden Rule** violation — overwriting
+`./bpp` with an untested binary, which AMFI then SIGKILLed (137), contaminating
+every downstream `/tmp` compiler. Recover with `git show HEAD:bpp > bpp` via a
+FRESH inode, and build from the stable installed `/usr/local/bin/bpp`, never the
+just-overwritten `./bpp`.)
+
+## Stages (each gate: bootstrap → INSTALL → 192/0/12 + 155/0/49-on-the-installed-binary + `bpp --c` smoke + tl_bench + binary-size + audio md5)
+
+> **Status: back to baseline (2026-06-18).** Both Inc 1 attempts reverted (bloat,
+> then the `--c` miscompile). The arc has shipped NOTHING net yet — `bpp_dispatch`
+> is at the pre-arc state. Re-attempt with the verification gate above.
 
 Two gating mechanisms, used where each fits: a **size gate** (a thin body that's
 size-neutral to inline can go everywhere) and a **hotness gate** (a bigger or
