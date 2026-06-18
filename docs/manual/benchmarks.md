@@ -48,18 +48,33 @@ parity:
 | our codegen | 16.9 ms | 177× | — |
 | clang -O2 (same source) | 2.3 ms | ~1300× | **7.3× faster** |
 
-Cause (disasm-confirmed): our `tl_render` inner loop has 6 `bl` calls per
-iteration (`arr_struct_at`, `read_u16`, `write_u16`×2, and `tl_channel_process`
-→ which calls the whole `moon_process → moog_slope → moog_taps →
-flt_onepole_tick` chain). clang's `tl_render` has **1 `bl` total** — it inlines
-the entire per-sample path into flat FP. At ~1M calls/render the call overhead
-*is* the gap.
+Decomposition (`tl_bench_flat.bpp` = the same render hand-inlined, 0 calls):
+
+| variant | per 3 s render | vs clang |
+|---|---|---|
+| ours, call-heavy (`tl_render`) | 16.6 ms | 7.5× |
+| ours, hand-inlined (flat) | 4.5 ms | 2.0× |
+| clang -O2 (same source) | 2.2 ms | 1× |
+
+The 7.5× is ~multiplicative: **×3.7 is the inliner** (16.6→4.5, pure call
+overhead — disasm shows 6 `bl`/iter for us vs 1 for clang, the whole
+`tl_channel_process → moon_process → moog_slope → moog_taps → flt_onepole_tick`
+chain plus `arr_struct_at`/`read_u16`/`write_u16`), and **×2.0 is flat-loop
+codegen** (4.5→2.2 — register allocation/liveness across a branchy triple-nested
+loop; the tight-kernel biquad parity does NOT cover this shape).
+
+**The two frontiers, prioritised by measured impact:**
+1. **Inliner (×3.7).** The active inliner (Phase B2) rejects any body with a
+   `T_CALL` — leaf-only. The cost-model inliner (S4, `bpp_dispatch.bsm` ~5600)
+   is built but dormant (`classify_inlineable_v2` never landed). Wire it +
+   bottom-up order (inline leaves first so chains collapse) + relax the
+   all-or-nothing `T_CALL` gate + multi-value-return splice.
+2. **RegAlloc v2 / liveness (×2.0).** Roadmap F.2. The remaining gap on branchy
+   nested loops once the calls are gone.
 
 **Honest takeaway:** "gcc -O2 parity" is a claim about tight inlined kernels,
-NOT about assembled call-heavy code. The DAW works comfortably (177× realtime),
-but the next codegen frontier is an **inliner that collapses the call graph**
-(cross-module + multi-value-return functions don't inline for us yet; they do
-for clang). Measure beat believe — again.
+NOT assembled call-heavy code. The DAW runs comfortably (177× realtime) but the
+real benchmark exposed both frontiers cleanly. Measure beat believe — again.
 
 ### Autovectorisation + outlining (parallel)
 
