@@ -56,9 +56,13 @@ just-overwritten `./bpp`.)
 
 ## Stages (each gate: bootstrap → INSTALL → 192/0/12 + 155/0/49-on-the-installed-binary + `bpp --c` smoke + tl_bench + binary-size + audio md5)
 
-> **Status: back to baseline (2026-06-18).** Both Inc 1 attempts reverted (bloat,
-> then the `--c` miscompile). The arc has shipped NOTHING net yet — `bpp_dispatch`
-> is at the pre-arc state. Re-attempt with the verification gate above.
+> **Status: Inc 1 SHIPPED (re-landed + fixed, 2026-06-18).** Two earlier attempts
+> reverted (bloat; then a `--c` self-miscompile). The third landed: same size-gated
+> approach, plus the real root-cause fix — `classify_inlineable` was comparing
+> callee names with `cg_str_eq`, which reads the *codegen-time* `cg_sbuf` (0 during
+> the analysis pass in the `--c` pipeline → SIGSEGV, confirmed via `bug`: cg_sbuf==0).
+> New `_inline_name_eq` compares against the *parse-time* `vbuf` instead. Verified
+> the proper way (bootstrap → INSTALL → suites + `--c` smoke on the installed binary).
 
 Two gating mechanisms, used where each fits: a **size gate** (a thin body that's
 size-neutral to inline can go everywhere) and a **hotness gate** (a bigger or
@@ -66,13 +70,15 @@ widely-used body inlines only at hot — in-loop — call sites). The size gate 
 cheap and lands first; the hotness gate (per-call-site loop-depth) is built when
 the first bigger/widely-used target needs it.
 
-- **Inc 1 — size-gated inline-instruction builtins. ✅ DONE.**
+- **Inc 1 — size-gated inline-instruction builtins. ✅ SHIPPED (re-landed + fixed).**
   `_inline_is_inst_builtin` (peek/poke family) + a relaxed `_inline_has_tcall`
   (builtin calls don't disqualify a wrapper) + a tight `INLINE_BUILTIN_NODE_CAP`
-  (10) so ONLY thin single-instruction wrappers qualify. read_u16/write_u16 now
-  inline (tl_render 6 bl/iter → 3); DAW 16.7 → 15.9 ms (~4.6%); **binary flat**
-  (998386 → 998482, +96 B vs the +132 KB of the first attempt). Audio
-  byte-identical; 192/0/12 + 155/0/49; compile-time unchanged.
+  (10) so ONLY thin single-instruction wrappers qualify. **The fix that made it
+  real:** name comparison in the analysis pass must use `_inline_name_eq` (over
+  `vbuf`), NOT `cg_str_eq` (over the codegen-time `cg_sbuf`, which is 0 in `--c`).
+  read_u16/write_u16 now inline (tl_render 6 bl/iter → 3); **binary flat** (998386
+  → 998514, +128 B, no bloat). Audio byte-identical; native 192/0/12 + C-emit
+  155/0/49 **on the installed binary** + `bpp --c` smoke + byte-stable bootstrap.
 
 - **Inc 2 — float leaf single-return inlining** (matched types, no coercion).
   Unblocks `flt_onepole_tick` and float leaves. Thin → size gate covers it.
