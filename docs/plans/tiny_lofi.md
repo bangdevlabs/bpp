@@ -14,9 +14,25 @@ producer), after the codegen reached gcc -O2 parity.
 | `stbmixer` | voice table, integer s16 synthesis, buses |
 | `stbsound` | `sound_save_wav` / `sound_load_wav` (RIFF, 44100 / s16 / stereo) |
 | `tools/mini_synth/` | the instrument — keyboard synth, records to WAV |
-| `stb/stbfilter.bsm` | the first plugin — Moog ladder LP (SHIPPED). `moog_taps` returns all four ladder taps (-6/-12/-18/-24 dB/oct) in one b++ multi-value return; `moog_slope` picks one |
+| `stb/stbfilter.bsm` | the DSP filter **cartridge** — reusable primitives (`flt_onepole_*`) + filters built on them (Moog ladder; EQ next). `moog_taps` returns all four ladder taps (-6/-12/-18/-24 dB/oct) in one b++ multi-value return |
+| `tools/moon_filter/` | the first **plugin** — "moon_filter", a named effect (`moon_new`/`set`/`process`/`reset`/`free`) wrapping the cartridge's Moog. Hung on a tiny_lofi channel |
 
 tiny_lofi is the application that arranges these into a timeline + mixer.
+
+### The audio architecture — three layers
+
+```
+stb/stbfilter.bsm   DSP cartridge   reusable primitives + filters (no identity)
+        ↓ import
+tools/moon_filter/  named plugin    moon_filter: state + params + process (a product)
+        ↓ load "../moon_filter/"
+tools/tiny_lofi/    the host (DAW)   hangs plugins on channels, arranges + mixes
+```
+
+A *cartridge* is a category of reusable math (filters) and lives in `stb/`; a
+*plugin* is a named product with its own identity + lifecycle and lives in
+`tools/`. The DAW hosts plugins. New plugins (EQ, bit-crush, drive) follow the
+same shape: cartridge primitive(s) in stbfilter, named wrapper in `tools/`.
 
 ## The MVP feature set (from the user)
 
@@ -65,12 +81,18 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    - *Realtime*: the `@safe` audio callback streams the live mix straight from
      the model as you edit. The real DAW feel, but the realtime/no-malloc
      constraint + per-block mixing is a later slice.
-2. **Recording source.**
-   - *Import-first* (recommended): mini_synth already records to WAV; tiny_lofi
-     imports those as clips and arranges/edits them. The editor + mixer + export
-     is the core; the synth stays a separate instrument.
-   - *Live-record*: capture the mini_synth voice into a track at the playhead in
-     realtime. A follow-up slice once the timeline exists.
+2. **Recording source — the mini-Cubase vision (set by the user 2026-06-18).**
+   The target feel: open the mini_synth *inside a tiny_lofi track*, record a take
+   there, then hang plugins on top (moon_filter first). The key realization is
+   that the synth engine is **stbmixer**, not locked inside mini_synth —
+   mini_synth is just a keyboard UI + a record loop around `mixer_note_on` /
+   `mixer_fill`. So tiny_lofi drives the *same engine* directly; no synth code is
+   duplicated.
+   - *Import-first* (the near step): record in mini_synth → WAV → import as a
+     clip → the channel insert (moon_filter) filters it. Needs only WAV-import.
+   - *Live capture* (the real thing): tiny_lofi imports stbmixer, plays notes,
+     captures `mixer_fill` into the armed channel at the playhead → moon_filter
+     on top. Same engine, a dedicated slice (arm + playhead + record buffer).
 
 ## Build order (vertical slices, each shippable + dogfoodable)
 

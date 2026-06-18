@@ -1,15 +1,46 @@
-// stbfilter.bsm — DSP filter plugins for b++ audio (tiny_lofi and friends).
+// stbfilter.bsm — DSP filter cartridge for b++ audio (tiny_lofi and friends).
 //
-// Today: a Moog-style ladder low-pass — four one-pole stages in series with a
-// resonant feedback path from the last stage back to the input. The classic
-// warm, vocal, "wah" filter.
+// A small library of reusable filter building blocks plus the filters built
+// from them. Plugins — the moon_filter plugin, a future EQ — compose the
+// primitives here instead of re-deriving one-pole math each time.
 //
-// State is six floats (Moog struct, 48 bytes); the caller allocs it and passes
-// the pointer. Run in float and convert to/from s16 at the audio boundary.
-
-struct Moog { s1: float, s2: float, s3: float, s4: float, g: float, k: float }
+//   PRIMITIVES — the shared building blocks:
+//     flt_onepole_g     one-pole lowpass coefficient (exp-free)
+//     flt_onepole_tick  one-pole lowpass step
+//
+//   FILTERS — built from the primitives:
+//     moog_*            4-pole resonant ladder low-pass (moon_filter's engine)
+//
+// Everything runs in float; convert to/from s16 at the audio boundary.
 
 const _FLT_2PI = 6.2831853;
+
+// ── Primitives ─────────────────────────────────────────────────────
+
+// One-pole lowpass coefficient: g = x/(1+x) with x = 2*pi*fc/sr. This is an
+// exp-free mapping (b++ math has no exp() yet) and g stays below 1, so any
+// feedback loop built on the one-pole cannot run away. Shared by the Moog
+// ladder (four one-poles + feedback) and by shelving EQ stages.
+flt_onepole_g(cutoff_hz: float, sample_rate: float) -> float {
+    auto x: float;
+    x = _FLT_2PI * cutoff_hz / sample_rate;
+    return x / (1.0 + x);
+}
+
+// One-pole lowpass step: move state `s` toward input `in` by coefficient `g`
+// and return the new state. y[n] = y[n-1] + g*(in - y[n-1]). The compiler
+// inlines this trivial helper, so composing filters out of it costs nothing.
+flt_onepole_tick(s: float, in: float, g: float) -> float {
+    return s + g * (in - s);
+}
+
+// ── Moog ladder low-pass ───────────────────────────────────────────
+//
+// Four one-pole stages in series with a resonant feedback path from the last
+// stage back to the input — the classic warm, vocal, "wah" filter. State is
+// six floats (Moog struct, 48 bytes); the caller allocs it and passes the ptr.
+
+struct Moog { s1: float, s2: float, s3: float, s4: float, g: float, k: float }
 
 // Bytes the caller must allocate for one filter's state.
 moog_sizeof() { return 48; }
@@ -23,41 +54,36 @@ void moog_reset(m) {
 }
 
 // Set cutoff (Hz) and resonance (0 = none, ~3.9 = on the edge of self-
-// oscillation) for a given sample rate. The coefficient g = x/(1+x) with
-// x = 2*pi*fc/SR is an exp-free one-pole mapping (b++ math has no exp() yet),
-// and g stays below 1 so the resonant feedback cannot run away.
+// oscillation) for a given sample rate, via the one-pole coefficient.
 void moog_set(m, cutoff_hz: float, resonance: float, sample_rate: float) {
-    auto mm: Moog, x: float;
+    auto mm: Moog;
     mm = m;
-    x = _FLT_2PI * cutoff_hz / sample_rate;
-    mm.g = x / (1.0 + x);
+    mm.g = flt_onepole_g(cutoff_hz, sample_rate);
     mm.k = resonance;
 }
 
-// Push one sample through the four poles and return ALL FOUR ladder taps:
-// the outputs after 1, 2, 3, and 4 poles — i.e. the -6, -12, -18, and
-// -24 dB-per-octave slopes. A real ladder filter exposes every tap (the
-// Oberheim Xpander's trick — pick or blend slopes for character), and
-// returning the whole ladder in one call is b++ multi-value return doing
-// real work: the four results bank straight into d0..d3, no struct and no
-// out-params. The wider register-window return (up to 8 values) is the same
-// mechanism — this just uses four of the slots.
+// Push one sample through the four poles and return ALL FOUR ladder taps: the
+// outputs after 1, 2, 3, and 4 poles — i.e. the -6, -12, -18, and -24 dB-per-
+// octave slopes. A real ladder filter exposes every tap (the Oberheim
+// Xpander's trick — pick or blend slopes for character), and returning the
+// whole ladder in one call is b++ multi-value return doing real work: the four
+// results bank straight into d0..d3, no struct and no out-params.
 moog_taps(m, in: float) -> (float, float, float, float) {
     auto mm: Moog, g: float, fb: float, a: float, b: float, c: float, d: float;
     mm = m;
     g  = mm.g;
-    fb = in - mm.k * mm.s4;            // resonant feedback from the last stage
-    a  = mm.s1 + g * (fb - mm.s1);     // pole 1  (-6 dB/oct)
-    b  = mm.s2 + g * (a  - mm.s2);     // pole 2  (-12 dB/oct)
-    c  = mm.s3 + g * (b  - mm.s3);     // pole 3  (-18 dB/oct)
-    d  = mm.s4 + g * (c  - mm.s4);     // pole 4  (-24 dB/oct)
+    fb = in - mm.k * mm.s4;                 // resonant feedback from stage 4
+    a  = flt_onepole_tick(mm.s1, fb, g);    // pole 1  (-6 dB/oct)
+    b  = flt_onepole_tick(mm.s2, a,  g);    // pole 2  (-12 dB/oct)
+    c  = flt_onepole_tick(mm.s3, b,  g);    // pole 3  (-18 dB/oct)
+    d  = flt_onepole_tick(mm.s4, c,  g);    // pole 4  (-24 dB/oct)
     mm.s1 = a; mm.s2 = b; mm.s3 = c; mm.s4 = d;
     return a, b, c, d;
 }
 
 // Convenience wrapper: the classic 4-pole (24 dB/oct) output only. Delegates
-// to moog_taps so the actual filter math lives in exactly one place — taking
-// the last of the four banked results.
+// to moog_taps so the filter math lives in exactly one place — taking the last
+// of the four banked results.
 moog_tick(m, in: float) -> float {
     auto (a, b, c, d): float;
     a, b, c, d = moog_taps(m, in);
@@ -65,8 +91,7 @@ moog_tick(m, in: float) -> float {
 }
 
 // Pick one of the four ladder taps by slope (1..4 poles = -6..-24 dB/oct).
-// This is how the DAW selects a track's filter character from a single
-// stateful tick — one multi-return, then choose the slot.
+// This is how a plugin selects a filter character from a single stateful tick.
 moog_slope(m, in: float, poles) -> float {
     auto (a, b, c, d): float;
     a, b, c, d = moog_taps(m, in);

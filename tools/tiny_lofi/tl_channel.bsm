@@ -1,18 +1,19 @@
 // tl_channel.bsm — the mixer channels.
 //
 // tiny_lofi has TL_NTRACKS channels. Each channel is a volume fader plus an
-// optional Moog ladder-filter insert (cutoff, resonance, and which ladder tap
-// / slope to take). This module owns the channel array; the timeline and the
-// tools reach a channel only through the functions here.
+// optional insert plugin — for now the moon_filter (the Moog ladder). This
+// module owns the channel array; the timeline and the tools reach a channel
+// only through the functions here. Adding a second insert plugin later means
+// giving the channel a small chain instead of one `flt` slot.
 
-// One mixer channel: a volume, an optional filter insert + its settings, and
-// the filter's own state buffer (allocated once at init).
-struct Track { vol: float, flt_on, cutoff: float, reso: float, slope, flt }
+// One mixer channel: a volume, whether the insert is engaged, and the insert
+// plugin instance (a moon_filter, allocated once at init).
+struct Track { vol: float, flt_on, flt }
 
 static auto _tl_tracks;     // malloc(TL_NTRACKS * sizeof(Track))
 
-// Allocate the channels and give each a sensible default: 80% volume, filter
-// off, and a fresh Moog state. Call once at engine init.
+// Allocate the channels and give each a sensible default: 80% volume, insert
+// off, and a fresh moon_filter instance. Call once at engine init.
 void tl_channel_init() {
     auto tr, tk: Track;
     _tl_tracks = malloc(TL_NTRACKS * sizeof(Track));
@@ -20,48 +21,39 @@ void tl_channel_init() {
         tk = _tl_tracks + tr * sizeof(Track);
         tk.vol    = 0.8;
         tk.flt_on = 0;
-        tk.cutoff = 2000.0;
-        tk.reso   = 2.0;
-        tk.slope  = 4;                 // 4 poles = the classic 24 dB/oct
-        tk.flt    = malloc(moog_sizeof());
-        moog_reset(tk.flt);
+        tk.flt    = moon_new(44100.0);
     }
 }
 
 // Configure one channel's volume and filter insert. `slope` selects the ladder
-// tap (1..4 poles = -6..-24 dB/oct). The filter coefficients are computed here
-// so the render loop only has to tick.
+// tap (1..4 poles = -6..-24 dB/oct). The plugin computes its coefficients here
+// so the render loop only has to process samples.
 void tl_track_set(tr, vol: float, flt_on, cutoff: float, reso: float, slope) {
     auto tk: Track;
     tk = _tl_tracks + tr * sizeof(Track);
     tk.vol    = vol;
     tk.flt_on = flt_on;
-    tk.cutoff = cutoff;
-    tk.reso   = reso;
-    tk.slope  = slope;
-    // 44100.0 as a float literal: a const (TL_SR) substitutes as an int node,
-    // which would E233 against the float `sample_rate` param. Pass the literal.
-    if (flt_on != 0) { moog_set(tk.flt, cutoff, reso, 44100.0); }
+    if (flt_on != 0) { moon_set(tk.flt, cutoff, reso, slope); }
 }
 
-// Clear every channel's filter state. The render calls this before a pass so a
+// Clear every channel's insert state. The render calls this before a pass so a
 // filter never carries memory across renders.
 void tl_channel_reset_filters() {
     auto tr, tk: Track;
     for (tr = 0; tr < TL_NTRACKS; tr++) {
         tk = _tl_tracks + tr * sizeof(Track);
-        moog_reset(tk.flt);
+        moon_reset(tk.flt);
     }
 }
 
-// Run one dry sample through channel `tr`: the filter insert (if on, at the
-// channel's chosen slope) then the volume fader. Returns the wet, post-fader
-// sample. This is the per-channel strip the mix loop calls every frame.
+// Run one dry sample through channel `tr`: the insert plugin (if engaged) then
+// the volume fader. Returns the wet, post-fader sample. This is the per-channel
+// strip the mix loop calls every frame.
 tl_channel_process(tr, dry: float) -> float {
     auto tk: Track, wet: float;
     tk  = _tl_tracks + tr * sizeof(Track);
     wet = dry;
-    if (tk.flt_on != 0) { wet = moog_slope(tk.flt, wet, tk.slope); }
+    if (tk.flt_on != 0) { wet = moon_process(tk.flt, wet); }
     wet *= tk.vol;
     return wet;
 }
