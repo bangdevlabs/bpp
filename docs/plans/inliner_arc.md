@@ -31,29 +31,33 @@ sites; without the gate it's a net loss. So the gate comes first.
 
 ## Stages (each: bootstrap byte-stable + 192/0/12 + 155/0/49 + tl_bench + binary-size + audio md5)
 
-- **Inc 1 — wire the S4 cost-model hotness gate.** Move the inline decision from
-  the callee-level `fn_inlineable` flag to a **per-call-site** decision: inline
-  only when the call site is hot (in a loop / hot caller) per the dormant S4
-  threshold (`bpp_dispatch.bsm` ~5640: base 30, ×2 hot caller, ×1.5 in-loop).
-  Foundation: makes ALL later relaxations pay only where they help, no bloat.
-  Verify the binary size does NOT grow on the existing inline set.
+Two gating mechanisms, used where each fits: a **size gate** (a thin body that's
+size-neutral to inline can go everywhere) and a **hotness gate** (a bigger or
+widely-used body inlines only at hot — in-loop — call sites). The size gate is
+cheap and lands first; the hotness gate (per-call-site loop-depth) is built when
+the first bigger/widely-used target needs it.
 
-- **Inc 2 — inline-instruction builtins, now hotness-gated.** Re-add
-  `_inline_is_inst_builtin` + relaxed `_inline_has_tcall`, but inlining now fires
-  only at hot sites. read_u16/write_u16 inline in the DAW loop, NOT codebase-wide.
-  Expect the DAW win WITHOUT the binary bloat.
+- **Inc 1 — size-gated inline-instruction builtins. ✅ DONE.**
+  `_inline_is_inst_builtin` (peek/poke family) + a relaxed `_inline_has_tcall`
+  (builtin calls don't disqualify a wrapper) + a tight `INLINE_BUILTIN_NODE_CAP`
+  (10) so ONLY thin single-instruction wrappers qualify. read_u16/write_u16 now
+  inline (tl_render 6 bl/iter → 3); DAW 16.7 → 15.9 ms (~4.6%); **binary flat**
+  (998386 → 998482, +96 B vs the +132 KB of the first attempt). Audio
+  byte-identical; 192/0/12 + 155/0/49; compile-time unchanged.
 
-- **Inc 3 — float leaf single-return inlining** (matched types, no coercion).
-  Unblocks `flt_onepole_tick` and float leaves.
+- **Inc 2 — float leaf single-return inlining** (matched types, no coercion).
+  Unblocks `flt_onepole_tick` and float leaves. Thin → size gate covers it.
 
-- **Inc 4 — control flow (T_IF) in single-return bodies.** Unblocks
-  `arr_struct_at` — the **biggest single call source** (~3.17M/render).
+- **Inc 3 — control flow (T_IF) in single-return bodies + the HOTNESS GATE.**
+  Unblocks `arr_struct_at` — the **biggest single call source** (~3.17M/render)
+  but a *widely-used* accessor, so inlining it everywhere would bloat → this is
+  where the per-call-site loop-depth gate gets built (inline at hot sites only).
 
-- **Inc 5 — bottom-up + relax the T_CALL gate** (reverse-topo order, recursion
+- **Inc 4 — bottom-up + relax the T_CALL gate** (reverse-topo order, recursion
   guard) so a call to an already-inlinable function stops disqualifying its
-  caller. Collapses the chain.
+  caller. Collapses the chain. Hotness-gated.
 
-- **Inc 6 — multi-value-return splice.** Inline `moog_taps` (4 banked returns →
+- **Inc 5 — multi-value-return splice.** Inline `moog_taps` (4 banked returns →
   4 result locals). Completes the filter-chain collapse.
 
 **Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number). The
