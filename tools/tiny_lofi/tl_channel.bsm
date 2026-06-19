@@ -6,11 +6,30 @@
 // only through the functions here. Adding a second insert plugin later means
 // giving the channel a small chain instead of one `flt` slot.
 
-// One mixer channel: a volume, whether the insert is engaged, and the insert
-// plugin instance (a moon_filter, allocated once at init).
-struct Track { vol: float, flt_on, flt }
+// One mixer channel: a volume, a pan position, whether the insert is engaged,
+// and the insert plugin instance (a moon_filter, allocated once at init).
+// `pan` is the constant-power pan position in [-1, 1] (-1 hard left, 0 centre,
+// +1 hard right). `stereo` is the source-shape flag (0 = mono source, panned
+// into the field — the Moog-bass case; 1 = stereo source, L/R processed
+// separately) — see tl_channel_process. `gain_l`/`gain_r` are the precomputed
+// constant-power pan gains (cos/sin of the pan angle) so the per-frame strip
+// multiplies by a stored constant instead of calling cos/sin every sample —
+// pan is constant per track, so the trig belongs at set-time, not in the hot
+// loop. New fields are appended so the typed accessors below keep their offsets.
+struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float }
 
 static auto _tl_tracks;     // malloc(TL_NTRACKS * sizeof(Track))
+
+// Set a channel's pan position and precompute its constant-power gains ONCE.
+// theta in [0, pi/2] (centre = pi/4 → gain_l = gain_r = 0.707, equal power).
+// Called at init and from tl_track_set — never per frame.
+static void _tl_apply_pan(tk: Track, pan: float) {
+    auto theta: float;
+    tk.pan    = pan;
+    theta     = (pan + 1.0) * 0.78539816;     // (pan + 1) * pi/4
+    tk.gain_l = cos_f(theta);
+    tk.gain_r = sin_f(theta);
+}
 
 // Allocate the channels and give each a sensible default: 80% volume, insert
 // off, and a fresh moon_filter instance. Call once at engine init.
@@ -22,16 +41,19 @@ void tl_channel_init() {
         tk.vol    = 0.8;
         tk.flt_on = 0;
         tk.flt    = moon_new(44100.0);
+        tk.stereo = 0;     // mono source (panned into the stereo field)
+        _tl_apply_pan(tk, 0.0);   // centre
     }
 }
 
 // Configure one channel's volume and filter insert. `slope` selects the ladder
 // tap (1..4 poles = -6..-24 dB/oct). The plugin computes its coefficients here
 // so the render loop only has to process samples.
-void tl_track_set(tr, vol: float, flt_on, cutoff: float, reso: float, slope) {
+void tl_track_set(tr, vol: float, flt_on, cutoff: float, reso: float, slope, pan: float) {
     auto tk: Track;
     tk = _tl_tracks + tr * sizeof(Track);
     tk.vol    = vol;
+    _tl_apply_pan(tk, pan);
     tk.flt_on = flt_on;
     if (flt_on != 0) { moon_set(tk.flt, cutoff, reso, slope); }
 }
@@ -58,14 +80,26 @@ tl_channel_flt_on(tr) {
     return tk.flt_on;
 }
 
-// Run one dry sample through channel `tr`: the insert plugin (if engaged) then
-// the volume fader. Returns the wet, post-fader sample. This is the per-channel
-// strip the mix loop calls every frame.
-tl_channel_process(tr, dry: float) -> float {
-    auto tk: Track, wet: float;
+// Run one dry sample through channel `tr` and return its STEREO (L, R)
+// contribution — the per-channel strip the mix loop calls every frame. This is
+// the headline multi-return consumer: two floats home in d0/d1, no struct, no
+// memory (a C++ `std::pair`/out-param would cost more).
+//
+// Mono source (tk.stereo == 0 — the common case, e.g. a Moog bass): the insert
+// runs ONCE, then the wet, post-fader sample is placed into the field by a
+// constant-power pan (equal power left+right, -3 dB at centre). A stereo-source
+// track would run the insert twice (independent L/R state) — same (float,float)
+// return, the flag only gates the pass count — and lands with stereo clip import
+// (S2); until a stereo source exists, building that branch would be speculative.
+tl_channel_process(tr, dry: float) -> (float, float) {
+    auto tk: Track, wet: float, l: float, r: float;
     tk  = _tl_tracks + tr * sizeof(Track);
     wet = dry;
     if (tk.flt_on != 0) { wet = moon_process(tk.flt, wet); }
     wet *= tk.vol;
-    return wet;
+    // Constant-power pan via the precomputed per-track gains (no trig in the
+    // hot loop — see _tl_apply_pan).
+    l = wet * tk.gain_l;
+    r = wet * tk.gain_r;
+    return l, r;
 }

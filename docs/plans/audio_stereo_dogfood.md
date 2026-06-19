@@ -224,12 +224,19 @@ common case without a second codepath to maintain.
 
 ### Phasing (each shippable + dogfoodable; the audio md5 baseline MOVES — re-baseline)
 - **S1 — model: `tl_channel_process -> (float, float)` + pan, `tl_render` stereo
-  sum.** The offline render becomes real stereo. **New audio baseline** (the mono
-  `7ee452e7…` md5 is intentionally superseded). Verify by ear + the new md5, and —
-  per the user's note — render via **both `tiny_lofi --render` AND `mini_synth`** to
-  measure audio across tools, not one path.
+  sum. ✅ SHIPPED 2026-06-19.** `Track` gained `pan`/`stereo`/precomputed
+  `gain_l`/`gain_r` (constant-power gains computed once in `_tl_apply_pan`, NOT
+  per frame — pan is constant). `tl_channel_process` is the **first real product
+  multi-return consumer** (`return l, r` → `d0/d1`; `tl_render` does `chl, chr =
+  tl_channel_process(...)` and sums each side). The mono path is the gated common
+  case (one filter pass + pan); the stereo-source two-pass path is reserved for
+  S2 (no stereo source yet). Verified: compiles, **new stereo baseline md5
+  `3e258737c9f0ef83193793b63eb7eed8`** (bass centre → L==R, lead pan 0.5 → R>L,
+  both confirmed), tl_bench ~14.6 ms (~205× realtime). (`mini_synth` is still mono
+  — it rides `stbmixer`, which goes stereo in S2.)
 - **S2 — `stbmixer` per-voice pan + stereo `mixer_fill`.** `mini_synth` gains real
-  stereo; `tl_gui` pan knobs.
+  stereo (then measure audio via `mini_synth` too, per the cross-tool note);
+  `tl_gui` pan knobs; the stereo-source two-pass branch in `tl_channel_process`.
 - **S3 — `@safe` on the realtime mix path** (mixer fill / mini_synth loop) — dogfood
   backlog #2; proves no-alloc on the realtime path.
 - **S4 — (optional perf) autovec / block-planar mix**, or the `: double` lane-pair

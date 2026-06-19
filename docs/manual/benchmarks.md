@@ -126,9 +126,19 @@ the per-increment progress signal):
 | `arr_struct_at` | 0 | 0 | 0 | guard-clause → ternary, tier-3 hot-only; inlined at hot sites (3b), standalone for ~80 cold callers |
 
 **Audio correctness baseline:** `tiny_lofi.bpp --render` writes
-`tiny_lofi_test.wav`; its md5 is `7ee452e7eb9237debafa7302b177d66c` (the trusted
-Inc 1 binary and Inc 2 produce byte-identical audio). The earlier
-`8b8742ca…` predated a `tiny_lofi.bpp` edit and is stale — do not chase it.
+`tiny_lofi_test.wav`. The DAW went **stereo** on 2026-06-19
+(`docs/plans/audio_stereo_dogfood.md` S1: `tl_channel_process -> (float, float)`
++ per-channel constant-power pan), so the baseline is now
+**`3e258737c9f0ef83193793b63eb7eed8`** (real stereo — L≠R; bass centred, lead
+panned right). The prior `7ee452e7…` was the **mono** baseline (superseded by the
+stereo feature, not a regression); the older `8b8742ca…` was stale.
+
+**Note — the inliner-arc tl_bench table above is the MONO record** (16.9→13.1
+across the arc). The DAW is now a **stereo** workload (`tl_bench` ~14.6 ms,
+~205× realtime — stereo doubles the per-frame channel work + adds the
+multi-return unpack). Don't compare the mono and stereo numbers directly; the
+inliner arc paused at 13.1 ms mono. Stereo also made `tl_channel_process` the
+first real **multi-return product consumer** (the eventual Inc 5 target).
 
 ### Autovectorisation + outlining (parallel)
 
