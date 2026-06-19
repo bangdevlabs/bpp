@@ -48,6 +48,77 @@ Feature usage across `tools/tiny_lofi`, `tools/mini_synth`, `tools/moon_filter`,
 
 ---
 
+## Part B0 — How b++ transmits data, top-down (the holistic view)
+
+The reason multi-return is a real edge isn't "everything is a word" — it's subtler
+and cleaner. b++ has **exactly two base premises: word and float.** Everything else
+is a *slice* (a narrower width) of one of those two. This is literally one bit.
+
+### 1. The type code (the foundation) — `src/bpp_defs.bsm:212-275`
+A type is a packed byte: **`(slice << 4) | base`**.
+- `ty_base(ty) = ty & 0xF` — base family (low nibble).
+- `ty_slice(ty) = (ty >> 4) & 0xF` — width (high nibble).
+- **`is_float_type(ty) = ty & 1`** — **bit 0 IS the premise**: `0` = word, `1` = float.
+
+Base families: `BASE_WORD 0x02`, `BASE_FLOAT 0x03`, `BASE_UWORD 0x0E`, `BASE_PTR
+0x04`, `BASE_ARR 0x06`, `BASE_STRUCT 0x08`, `BASE_FN 0x0A`. **Only `BASE_FLOAT` has
+bit 0 set.** Pointers, arrays, structs, fn-pointers, unsigned — all bit 0 = 0, i.e.
+the **word family** (they're word-sized handles/addresses). So at the machine level
+there are exactly **two kinds of value: float, and everything-else (word).**
+
+Slices (high nibble): `SL_FULL 0`(64) / `SL_HALF 1`(32) / `SL_QUARTER 2`(16) /
+`SL_BYTE 3`(8) / `SL_BIT..SL_BIT7 4-10`(1-7) / `SL_DOUBLE 11`(128 SIMD). Bit-slices
+exist on **word only** ("float bitfields are not a thing"). So:
+- **word** premise → full/half/quarter/byte/bit1-7 (integer widths) + uword + ptr/arr/struct/fn handles.
+- **float** premise → full(f64)/half(f32)/quarter(f16)/double(128 SIMD).
+
+A slice is the SAME premise at a narrower width — `: byte` is a word loaded/stored 8
+bits at a time; `: half float` is a float loaded/stored as f32. The premise (bit 0)
+never changes; only the load/store width does.
+
+### 2. Transmission: two premises → two register banks → 8-in / 8-out
+Because there are two premises, there are exactly **two register banks**: integer
+(`x0..x7` a64 / SysV int regs x64) and float (`d0..d7` / `xmm`). Every value crossing
+a call boundary is routed by `is_float_type` — the *one bit* — into its bank. The
+argument classifier `cg_emit_call_arg_rearrange` (`bpp_codegen.bsm:732`) does exactly
+this: walk each arg, `is_float_type(get_fn_par_type(...))` → float bank (`flt_idx++`)
+or int bank (`int_idx++`). Slices ride their premise's bank (a `: byte` arg is in an
+x-register, narrowed). **Returns mirror arguments**: up to **8 per bank**, classified
+the same way — the "register-window transformer" (`multi_value_return_plan.md`):
+a function reads ≤8 word + ≤8 float inputs from registers and hands back ≤8 word +
+≤8 float outputs in registers, **never touching memory in between.**
+
+### 3. Where this BEATS C++ (the answer to the original question)
+The C ABIs cap *register* return hard:
+- **x86-64 System V:** a returned aggregate is classified into eightbytes; **≤2
+  eightbytes (≤16 bytes)** go in `RAX:RDX` / `XMM0:XMM1`, **anything bigger → MEMORY**
+  (a hidden `sret` pointer, caller-allocated, callee writes through it). For floats:
+  2 eightbytes = **4 floats** max in registers; 5+ → memory.
+- **AArch64 AAPCS64:** a homogeneous float aggregate (HFA) of **≤4 members** returns
+  in `V0-V3`; **>4, or any non-HFA >16 bytes → MEMORY** (`x8` indirect result).
+
+So **both mainstream C ABIs cap float register-return at 4.** b++ banks **8** per
+bank (a custom register window, explicitly beyond SysV's 2 — `backend_parity.md`).
+**The win zone is 5-8 returned values:** in b++ they stay in registers; in C++ they
+spill to memory (sret) — a store, a pointer hop, a reload, and a lost chance to keep
+the chain register-resident.
+
+This unlocks a **functional / stateless DSP style** that is clean AND register-
+resident in b++ but memory-bound in C++:
+```
+// A pure Moog step: takes the input + 4 ladder states, returns the output + the
+// 4 NEW states — no hidden mutable struct, no aliasing, trivially testable.
+moog_step(in, s1, s2, s3, s4) -> (out, s1', s2', s3', s4')   // 5 floats out
+```
+5 float returns → b++ `d0..d4` (registers); C++ → MEMORY (sret) on BOTH ABIs. The
+**Moog bass you want is the canonical case**: a stateless ladder whose new state
+rides home in registers. This is the concrete "we beat C++ because of multi-return."
+
+*(ABI facts from the SysV AMD64 psABI + AAPCS64 — well-established; I can validate a
+specific case on godbolt if you want hard proof against a real compiler.)*
+
+---
+
 ## Part B — Study: how professional audio does stereo (C++), and can we do better?
 
 ### What pro plugins actually do
@@ -131,6 +202,25 @@ tl_timeline tl_render sums (L,R) per channel into the stereo out_buf
   plays in stereo for free.
 - **Source signal** stays mono per clip/voice (a mono sample panned into the stereo
   field) — standard; true stereo *sources* (a stereo WAV clip) are a later step.
+
+### Mono is a first-class path — a flag on the SAME structure (not a fork)
+Mono is not legacy to be removed; it's a real signal path (a **Moog bass is mono**,
+and mixes routinely mix mono + stereo channels). The rule: **one structure, gated by
+a flag — never a parallel mono codepath.** A `Track` carries `stereo: bit`:
+- **mono track** (`stereo = 0`): the insert/filter runs **once** (one filter state),
+  producing a single `wet`; the channel then places it into the frame at its pan
+  position → `(L, R) = pan(wet, θ)`. Cheaper (one Moog state, not two) — exactly what
+  a mono bass wants.
+- **stereo track** (`stereo = 1`): the insert runs **twice** (independent L/R state)
+  → `(L_wet, R_wet)`, then per-channel gain/pan.
+
+Both return the **same `(float, float)`** from the same `tl_channel_process`; the flag
+only gates *how many filter passes* run inside. So `tl_render`, the `Track` struct,
+the multi-return ABI path, and the mixer sum are **identical** for mono and stereo —
+the flag is the only difference. (A mono *bus/submix* that should stay mono until the
+master is the same idea one level up: a `stereo: bit` on the bus.) This keeps the
+multi-return consumer real for both, and lets a Moog-bass mono channel be the cheap
+common case without a second codepath to maintain.
 
 ### Phasing (each shippable + dogfoodable; the audio md5 baseline MOVES — re-baseline)
 - **S1 — model: `tl_channel_process -> (float, float)` + pan, `tl_render` stereo
