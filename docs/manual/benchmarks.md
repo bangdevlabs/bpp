@@ -76,6 +76,50 @@ loop; the tight-kernel biquad parity does NOT cover this shape).
 NOT assembled call-heavy code. The DAW runs comfortably (177× realtime) but the
 real benchmark exposed both frontiers cleanly. Measure beat believe — again.
 
+#### The inliner arc — tiny_lofi as the standing stressor (2026-06-18)
+
+`tools/tiny_lofi/tl_bench.bpp` is the canonical **call-heavy** perf gate for the
+inliner arc (`docs/plans/inliner_arc.md`). It self-times 400 renders of the 3 s
+DAW project and reports per-3s-render µs. Run all four variants for the gap
+decomposition (min-of-3, same shared laptop, same session):
+
+```sh
+bpp tools/tiny_lofi/tl_bench.bpp      -o /tmp/tlb       && /tmp/tlb   # ours
+bpp tools/tiny_lofi/tl_bench_flat.bpp -o /tmp/tlbf      && /tmp/tlbf  # hand-inlined target
+bpp --c tools/tiny_lofi/tl_bench.bpp > /tmp/t.c && \
+  cc -O2 -w -Wno-error=implicit-function-declaration /tmp/t.c -o /tmp/tlo -lobjc -lm && /tmp/tlo  # oracle
+```
+
+| variant | per 3s-render | vs clang | what it isolates |
+|---|---|---|---|
+| Inc 1 (`7548e4c`) | 16707 µs | 7.1× | read/write_u16 inlined |
+| **Inc 2 (`205ca6a`)** | **16928 µs** | **7.2×** | multi-use-param binding path (foundation — flat by design) |
+| hand-inlined (flat) | 4201 µs | 1.8× | the inliner's target |
+| clang -O2 (oracle) | 2339 µs | 1× | the ceiling |
+
+So the gap is **×4.0 inliner** (16928→4201) + **×1.8 flat-loop codegen**
+(4201→2339). Inc 2 is flat vs Inc 1 — pure foundation; the win arrives when
+Inc 3–5 collapse the call chain. (The oracle `cc` line needs
+`-Wno-error=implicit-function-declaration` + `-lobjc` on recent clang.)
+
+**The mechanism metric — `bl`/iter in the per-sample chain** (`bug --disasm`,
+the per-increment progress signal):
+
+| function | bl (Inc 2) | note |
+|---|---|---|
+| `tl_render` | 3 | reset(once) + `arr_struct_at` + `tl_channel_process` per iter |
+| `tl_channel_process` | 1 | → `moon_process` |
+| `moon_process` | 1 | → `moog_slope` |
+| `moog_slope` | 1 | → `moog_taps` |
+| `moog_taps` | 4 | → 4× `flt_onepole_tick` (ladder stages) |
+| `flt_onepole_tick` | 0 | leaf (float — folds in once float-leaf inlining lands) |
+| `arr_struct_at` | 0 | leaf but has a `T_IF` → **Inc 3 target** (~3.17M calls/render) |
+
+**Audio correctness baseline:** `tiny_lofi.bpp --render` writes
+`tiny_lofi_test.wav`; its md5 is `7ee452e7eb9237debafa7302b177d66c` (the trusted
+Inc 1 binary and Inc 2 produce byte-identical audio). The earlier
+`8b8742ca…` predated a `tiny_lofi.bpp` edit and is stale — do not chase it.
+
 ### Autovectorisation + outlining (parallel)
 
 | Benchmark | Measures | Run | Good |
