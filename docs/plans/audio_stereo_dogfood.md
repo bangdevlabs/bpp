@@ -234,9 +234,28 @@ common case without a second codepath to maintain.
   `3e258737c9f0ef83193793b63eb7eed8`** (bass centre → L==R, lead pan 0.5 → R>L,
   both confirmed), tl_bench ~14.6 ms (~205× realtime). (`mini_synth` is still mono
   — it rides `stbmixer`, which goes stereo in S2.)
-- **S2 — `stbmixer` per-voice pan + stereo `mixer_fill`.** `mini_synth` gains real
-  stereo (then measure audio via `mini_synth` too, per the cross-tool note);
-  `tl_gui` pan knobs; the stereo-source two-pass branch in `tl_channel_process`.
+- **S2 — `stbmixer` per-voice pan + stereo `mixer_fill`. ✅ CORE SHIPPED 2026-06-19.**
+  Per-voice pan gains (`_mx_voice_pan_l/r`, fixed-point /1024, **unity-centre =
+  1024/1024 = identity** so existing consumers are byte-unchanged), a
+  `mixer_set_voice_pan(slot, pan)` API (unity-centre balance law, computed once,
+  no float in the hot loop), pan applied in all three voice paths (tone / sample /
+  music), and — the structural change — **the mono collapse `(left+right)/2` is
+  gone**: master gain + dirt (per-channel, shared decim counter) + clamp + write
+  now run on L and R independently. So a **stereo sample WAV now plays in stereo**
+  (it used to be averaged to mono) and tone voices are pannable. Verified:
+  `test_mixer_sample` + `test_mixer_stream` pass (centre byte-identical); pan probe
+  confirms centre → L==R (6400/6400), hard-right → L=0 / R live. `tiny_lofi`'s
+  render is **unaffected** (it uses stbfilter/`tl_render`, not stbmixer — md5
+  stays `3e258737…`).
+
+  **S2b (pending) — the consumer wiring:**
+  - `mini_synth` "gains real stereo" is now a **UX choice** (the capability is
+    there): pan-by-key (keyboard tracking — can be disorienting), a master/pan
+    control, or stay centre. Interactive, so it needs an ear-check, not a headless
+    md5. *Decide the UX before wiring.*
+  - `tl_gui` pan knobs (GUI — needs the window to verify).
+  - the stereo-source two-pass branch in `tl_channel_process` — deferred until a
+    stereo *source* (stereo clip import) exists; no consumer yet.
 - **S3 — `@safe` on the realtime mix path** (mixer fill / mini_synth loop) — dogfood
   backlog #2; proves no-alloc on the realtime path.
 - **S4 — (optional perf) autovec / block-planar mix**, or the `: double` lane-pair

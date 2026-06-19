@@ -54,6 +54,11 @@ static extrn _mx_voice_pos;      // arr[i] = sample frame position
 static extrn _mx_voice_frames;   // arr[i] = sample total frame count
 static extrn _mx_voice_bus;      // arr[i] = MX_BUS_* tag (routes to a volume bus)
 static extrn _mx_voice_loop;     // arr[i] = 1 if voice loops at end (music)
+static extrn _mx_voice_pan_l;    // arr[i] = left pan gain, fixed-point /1024
+static extrn _mx_voice_pan_r;    // arr[i] = right pan gain, fixed-point /1024
+                                 //   unity centre = 1024/1024 (identity — a
+                                 //   centred voice is byte-identical to the old
+                                 //   mono path). Set via mixer_set_voice_pan.
 
 // Voice kinds — stored in _mx_voice_kind. MX_KIND_NONE means the
 // slot is mixable as silence (legacy code paths that only check
@@ -149,6 +154,8 @@ void mixer_init() {
     _mx_voice_frames = buf_word(_MX_MAX_VOICES);
     _mx_voice_bus    = buf_word(_MX_MAX_VOICES);
     _mx_voice_loop   = buf_word(_MX_MAX_VOICES);
+    _mx_voice_pan_l  = buf_word(_MX_MAX_VOICES);
+    _mx_voice_pan_r  = buf_word(_MX_MAX_VOICES);
 
     buf_fill(_mx_voice_active, 0, _MX_MAX_VOICES * 8);
     buf_fill(_mx_voice_kind,   0, _MX_MAX_VOICES * 8);
@@ -161,6 +168,13 @@ void mixer_init() {
     buf_fill(_mx_voice_frames, 0, _MX_MAX_VOICES * 8);
     buf_fill(_mx_voice_bus,    0, _MX_MAX_VOICES * 8);
     buf_fill(_mx_voice_loop,   0, _MX_MAX_VOICES * 8);
+    // Pan gains default to unity centre (1024/1024) — NOT zero — so an unpanned
+    // voice is byte-identical to the old mono path. (buf_fill can't seed 1024.)
+    auto pv;
+    for (pv = 0; pv < _MX_MAX_VOICES; pv++) {
+        _mx_voice_pan_l[pv] = 1024;
+        _mx_voice_pan_r[pv] = 1024;
+    }
 
     _mx_bus_vol = buf_word(_MX_BUS_COUNT);
     _mx_bus_vol[MX_BUS_MASTER] = 100;
@@ -184,7 +198,8 @@ void mixer_init() {
     _mx_master_vol    = 80;
     _mx_dirt          = 0;
     _mx_decim_counter = 0;
-    _mx_held_sample   = 0;
+    _mx_held_l        = 0;
+    _mx_held_r        = 0;
     _mx_inited        = 1;
 }
 
@@ -504,6 +519,26 @@ void mixer_set_voice_volume(slot: word, amp: word) {
     _mx_voice_amp[slot] = amp;
 }
 
+// Set the stereo pan of a voice. `pan` is -1 (hard left) .. 0 (centre) .. +1
+// (hard right). A unity-centre balance law (centre = full gain both sides, the
+// far side tapers to 0) so an unpanned voice is unchanged — panning never
+// boosts, only attenuates one side. Gains are stored as fixed-point /1024 so the
+// per-sample mix stays integer (no float in the hot loop). Like voice volume,
+// the pan persists until changed; out-of-range slots are ignored.
+void mixer_set_voice_pan(slot: word, pan: float) {
+    auto gl: word, gr: word;
+    if (slot < 0) { return; }
+    if (slot >= _MX_MAX_VOICES) { return; }
+    if (pan < -1.0) { pan = -1.0; }
+    if (pan >  1.0) { pan =  1.0; }
+    gl = 1024;
+    gr = 1024;
+    if (pan > 0.0) { gl = (1.0 - pan) * 1024.0; }   // panned right → attenuate L
+    if (pan < 0.0) { gr = (1.0 + pan) * 1024.0; }   // panned left  → attenuate R
+    _mx_voice_pan_l[slot] = gl;
+    _mx_voice_pan_r[slot] = gr;
+}
+
 // Read the current amplitude of a voice slot. Returns 0 if the
 // slot is out of range.
 mixer_get_voice_volume(slot: word) {
@@ -544,7 +579,8 @@ mixer_get_voice_volume_db(slot: word) {
 // low resolutions, now controllable.
 static extrn _mx_dirt;
 static extrn _mx_decim_counter;
-static extrn _mx_held_sample;
+static extrn _mx_held_l;        // decimation sample-and-hold, left channel
+static extrn _mx_held_r;        // decimation sample-and-hold, right channel
 
 void mixer_set_dirt(val: word) {
     if (val < 0)   { val = 0; }
@@ -564,7 +600,7 @@ mixer_get_dirt() { return _mx_dirt; }
 // sample voices read two s16s (stereo) from their buffer; music
 // voices do the same but loop (or stop) at end-of-buffer.
 mixer_fill(buf, n: word) {
-    auto f, v, sum, sample, phase, hp, amp, period;
+    auto f, v, sample, phase, hp, amp, period;
     auto sn, tri, saw, sq, t, fader, si;
     auto kind, bus, bus_vol, sbuf, spos, sframes, left_s, right_s;
     auto master_bus_vol;
@@ -628,15 +664,16 @@ mixer_fill(buf, n: word) {
                 if (phase >= period) { phase = 0; }
                 _mx_voice_phase[v] = phase;
 
-                // Apply the SFX bus gain then fold tone into both
-                // channels (mono). The percent scale must multiply
+                // Apply the SFX bus gain then fold the tone into L/R through
+                // the voice's pan gains (fixed-point /1024; unity centre keeps a
+                // mono voice equal in both). The percent scale must multiply
                 // before dividing so a sub-100 gain does not collapse
                 // to zero through integer division — `sample *= bus_vol / 100`
                 // would parse as `sample * (bus_vol / 100)` and silently
                 // mute every voice when bus_vol is, say, 80.
                 sample = sample * bus_vol / 100;
-                left  = left  + sample;
-                right = right + sample;
+                left  = left  + sample * _mx_voice_pan_l[v] / 1024;
+                right = right + sample * _mx_voice_pan_r[v] / 1024;
 
             } else if (kind == MX_KIND_SAMPLE) {
                 // One-shot sample. Read one stereo s16 pair then
@@ -653,8 +690,8 @@ mixer_fill(buf, n: word) {
 
                 left_s  = left_s  * bus_vol / 100;
                 right_s = right_s * bus_vol / 100;
-                left  = left  + left_s;
-                right = right + right_s;
+                left  = left  + left_s  * _mx_voice_pan_l[v] / 1024;
+                right = right + right_s * _mx_voice_pan_r[v] / 1024;
 
                 spos++;
                 if (spos >= sframes) {
@@ -678,8 +715,8 @@ mixer_fill(buf, n: word) {
 
                 left_s  = left_s  * bus_vol / 100;
                 right_s = right_s * bus_vol / 100;
-                left  = left  + left_s;
-                right = right + right_s;
+                left  = left  + left_s  * _mx_voice_pan_l[v] / 1024;
+                right = right + right_s * _mx_voice_pan_r[v] / 1024;
 
                 spos++;
                 if (spos >= sframes) {
@@ -693,41 +730,43 @@ mixer_fill(buf, n: word) {
                 _mx_voice_pos[v] = spos;
             }
         }
-        // Mix down to mono for the rest of the chain — the dirt and
-        // master gain are mono-only. Left/right carried the bus-gain
-        // split so far, so average them back now.
-        sum = (left + right) / 2;
+        // Master gain, per channel — per-program master_vol (synthkey-era) then
+        // the MASTER bus slider. Multiply before dividing (see the SFX bus-gain
+        // comment) so a sub-100 percent gain doesn't collapse to zero. A centred
+        // voice has left == right here, so the output is byte-identical to the
+        // old mono path; a panned voice carries a genuine stereo split.
+        left  = left  * _mx_master_vol / 100;   left  = left  * master_bus_vol / 100;
+        right = right * _mx_master_vol / 100;   right = right * master_bus_vol / 100;
+        if (left  >  32767)     { left  =  32767; }
+        if (left  < 0 - 32768)  { left  = 0 - 32768; }
+        if (right >  32767)     { right =  32767; }
+        if (right < 0 - 32768)  { right = 0 - 32768; }
 
-        // Master gain: per-program master_vol (kept for backward
-        // compatibility with synthkey) then the MASTER bus slider.
-        // Multiply before dividing — see the comment at the SFX
-        // bus-gain site above for why `sum *= X / 100` collapses
-        // every sub-100 percent gain to zero through integer division.
-        sum = sum * _mx_master_vol / 100;
-        sum = sum * master_bus_vol / 100;
-        if (sum >  32767) { sum =  32767; }
-        if (sum < 0 - 32768) { sum = 0 - 32768; }
-
-        // Dirt: bitcrush + decimation (sample-and-hold).
+        // Dirt: bitcrush + decimation (sample-and-hold), applied per channel.
+        // The decimation counter is shared so both channels hold/release on the
+        // same tick (a single sample-and-hold rate across the stereo field).
         if (_mx_dirt > 0) {
             auto crush, decim;
             crush = _mx_dirt * 8 / 256;
             if (crush > 0) {
-                sum = (sum >> crush) << crush;
+                left  = (left  >> crush) << crush;
+                right = (right >> crush) << crush;
             }
             decim = 1 + _mx_dirt * 15 / 256;
             _mx_decim_counter++;
             if (_mx_decim_counter >= decim) {
-                _mx_held_sample = sum;
+                _mx_held_l = left;
+                _mx_held_r = right;
                 _mx_decim_counter = 0;
             }
-            sum = _mx_held_sample;
+            left  = _mx_held_l;
+            right = _mx_held_r;
         }
 
-        poke(buf + f * 4 + 0,  sum        & 0xff);
-        poke(buf + f * 4 + 1, (sum >> 8)  & 0xff);
-        poke(buf + f * 4 + 2,  sum        & 0xff);
-        poke(buf + f * 4 + 3, (sum >> 8)  & 0xff);
+        poke(buf + f * 4 + 0,  left        & 0xff);
+        poke(buf + f * 4 + 1, (left  >> 8) & 0xff);
+        poke(buf + f * 4 + 2,  right       & 0xff);
+        poke(buf + f * 4 + 3, (right >> 8) & 0xff);
     }
     return n;
 }
