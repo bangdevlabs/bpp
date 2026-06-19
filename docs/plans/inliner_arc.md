@@ -63,6 +63,22 @@ just-overwritten `./bpp`.)
 > the analysis pass in the `--c` pipeline → SIGSEGV, confirmed via `bug`: cg_sbuf==0).
 > New `_inline_name_eq` compares against the *parse-time* `vbuf` instead. Verified
 > the proper way (bootstrap → INSTALL → suites + `--c` smoke on the installed binary).
+>
+> **Status: Inc 2 SHIPPED (2026-06-18) — the binding-path foundation.** Reframed
+> from the original "float leaf" plan: the real first brick is letting a
+> *single-return body with a multi-use param* inline at all. Such bodies were
+> rejected at criterion 8 because the fast `ast_clone_subst` path shares arg nodes
+> → a side-effecting arg would be re-evaluated per use. Inc 2 marks them
+> `fn_inlineable = 2` (instead of rejecting) and routes them through the
+> multi-statement binding splice `cg_emit_inline_multi`, which binds each arg to a
+> temp ONCE. Shared infra — the whole filter chain AND `arr_struct_at` have
+> multi-use params. `fn_inlineable` is read only truthy / `== 2`, so the new value
+> is safe. **Binary flat (998514, identical to Inc 1 — no bloat), as predicted for
+> pure foundation.** gen2==gen3 byte-stable + `--c` smoke clean (incl. the compiler
+> self-emit that crashed Inc 1) + 193/0/12 + 156/0/49 on the installed binary.
+> tl_bench ~15.4 ms (no regression; small win). Audio byte-identical to the trusted
+> Inc 1 binary (corrected baseline `7ee452e7eb9237debafa7302b177d66c` — the old
+> `8b8742ca…` predated a `tiny_lofi.bpp` edit and was stale).
 
 Two gating mechanisms, used where each fits: a **size gate** (a thin body that's
 size-neutral to inline can go everywhere) and a **hotness gate** (a bigger or
@@ -80,8 +96,14 @@ the first bigger/widely-used target needs it.
   → 998514, +128 B, no bloat). Audio byte-identical; native 192/0/12 + C-emit
   155/0/49 **on the installed binary** + `bpp --c` smoke + byte-stable bootstrap.
 
-- **Inc 2 — float leaf single-return inlining** (matched types, no coercion).
-  Unblocks `flt_onepole_tick` and float leaves. Thin → size gate covers it.
+- **Inc 2 — binding path for multi-use-param single-return bodies. ✅ SHIPPED.**
+  Mark such bodies `fn_inlineable = 2`; both backends skip the re-evaluating fast
+  substitute path and fall to `cg_emit_inline_multi` (bind each arg to a temp
+  once). The `_inline_pre_reg_walk` registers their callsites (`callee_bcnt > 1 ||
+  fn_inlineable == 2`) so the binding path gets its per-callsite slot block. Pure
+  foundation: enables the chain but needs the later bricks to collapse it.
+  (Float-leaf inlining — the originally-planned Inc 2 — is still gated separately
+  by the float-param rejection and folds into a later increment.)
 
 - **Inc 3 — control flow (T_IF) in single-return bodies + the HOTNESS GATE.**
   Unblocks `arr_struct_at` — the **biggest single call source** (~3.17M/render)

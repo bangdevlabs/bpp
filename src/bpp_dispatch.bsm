@@ -5956,7 +5956,10 @@ void _inline_pre_reg_walk(nd) {
             if (arr_get(fn_inlineable, fidx)) {
                 fn_rec = funcs[fidx];
                 callee_bcnt = *(fn_rec + FN_BCNT);
-                if (callee_bcnt > 1) {
+                // body_cnt > 1 (multi-stmt) OR fn_inlineable == 2 (a single-
+                // return body with a multi-use param) both splice through the
+                // binding path, which needs a per-callsite slot block.
+                if (callee_bcnt > 1 || arr_get(fn_inlineable, fidx) == 2) {
                     _inline_register_callsite(n, fidx);
                 }
             } else if (arr_get(fn_void_inlineable, fidx)) {
@@ -6095,7 +6098,7 @@ const INLINE_BUILTIN_NODE_CAP = 10;
 void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
-    auto phase, body_cost, want_void;
+    auto phase, body_cost, want_void, want_bind;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -6205,19 +6208,23 @@ void classify_inlineable() {
         // then the cloned body references that slot — every
         // subsequent param touch is a pure local load with
         // no re-evaluation, regardless of count.
+        // A param referenced more than once cannot use the fast substitute
+        // path (it would re-evaluate a side-effecting arg). Mark such single-
+        // return bodies with `2` so the codegen routes them through the multi-
+        // statement binding splice (cg_emit_inline_multi binds each arg to a
+        // temp once) — instead of rejecting them as criterion 8 used to.
+        want_bind = 0;
         if (body_cnt == 1) {
             params = *(fn_rec + FN_PARS);
-            ok = 1;
             ret_stmt = body_arr[0];
             ret_expr = ret_stmt.a;
             if (ret_expr == 0) { continue; }
             for (j = 0; j < pcnt; j++) {
                 refs = _inline_param_refs(ret_expr, *(params + j * 8));
-                if (refs > 1) { ok = 0; }
+                if (refs > 1) { want_bind = 1; }
             }
-            if (ok == 0) { continue; }
         }
-        arr_set(fn_inlineable, i, 1);
+        arr_set(fn_inlineable, i, want_bind ? 2 : 1);
     }
 }
 
