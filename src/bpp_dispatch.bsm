@@ -101,7 +101,24 @@ static auto _fn_callers;         // arr<arr<int>>: callers per callee
 // is the parallel list of target_fidx arrays.
 static auto _glob_origin_names;   // arr<packed>:    globals with recorded origins
 static auto _glob_origin_targets; // arr<arr<int>>:  parallel, target_fidx lists
-extrn fn_inlineable;       // arr<int>: 1 if call sites should splice the body in place
+extrn fn_inlineable;       // arr<int>: inline tier for each function —
+                          //   0 = not inlineable
+                          //   1 = thin single-return: fast substitute path, EVERY call site
+                          //   2 = single-return, multi-use param: binding splice, EVERY call site
+                          //   3 = HOT-ONLY (bigger / control-flow-normalised body): binding
+                          //       splice, but only at IN-LOOP call sites so a widely-used
+                          //       accessor (arr_struct_at) does not bloat cold sites. Inc 3.
+                          // Tiers 2 + 3 both route through cg_emit_inline_multi gated on the
+                          // pre-reg-stamped callsite id (n.e > 0); the only difference is that
+                          // the pre-reg walk registers a tier-3 callsite ONLY when it sits
+                          // inside a loop (cg_inline_loop_depth > 0). The chips' fast-path
+                          // gate is therefore `fn_inlineable == 1` (tiers 2 + 3 fall to binding).
+// Loop-nesting depth tracked by the inline pre-reg walk so the hotness gate can
+// tell an in-loop (hot) call site from a cold one. Spine-owned, reset per
+// function in _inline_pre_reg_walk_body; both backends drive the same walk, so
+// the hotness gate is backend-agnostic (no per-chip state). Mirrors the
+// cg_b3_loop_depth pattern used by B3 loop-weighted promotion.
+global cg_inline_loop_depth;
 extrn fn_void_inlineable;  // arr<int>: 1 if a void / statement-context callee is
                           // splice-eligible. VI-1 populates this; NOTHING reads it
                           // yet (the walker + a64 splice start consuming it in VI-2).
@@ -5961,6 +5978,13 @@ void _inline_pre_reg_walk(nd) {
                 // binding path, which needs a per-callsite slot block.
                 if (callee_bcnt > 1 || arr_get(fn_inlineable, fidx) == 2) {
                     _inline_register_callsite(n, fidx);
+                } else if (arr_get(fn_inlineable, fidx) == 3) {
+                    // Hot-only tier: splice the body in ONLY when this call site
+                    // sits inside a loop. A cold site is left un-registered, so
+                    // its T_CALL keeps n.e == 0 and the codegen falls through to
+                    // a normal `bl` — no bloat at the hundreds of cold call sites
+                    // a widely-used accessor (arr_struct_at) otherwise has.
+                    if (cg_inline_loop_depth > 0) { _inline_register_callsite(n, fidx); }
                 }
             } else if (arr_get(fn_void_inlineable, fidx)) {
                 // VI-2: void / statement-context callee. Register the slot
@@ -5995,10 +6019,15 @@ void _inline_pre_reg_walk(nd) {
         }
     }
     T_WHILE   {
+        // Inside a loop: both the condition and the body run per iteration, so
+        // any call site here is hot. Bump the depth around the whole construct
+        // (for-loops desugar to T_WHILE, so this covers them too).
+        cg_inline_loop_depth = cg_inline_loop_depth + 1;
         _inline_pre_reg_walk(n.a);
         arr = n.b; cnt = n.c;
         i = 0;
         while (i < cnt) { _inline_pre_reg_walk(arr[i]); i++; }
+        cg_inline_loop_depth = cg_inline_loop_depth - 1;
     }
     T_BLOCK   {
         arr = n.b; cnt = n.c;
@@ -6014,6 +6043,10 @@ void _inline_pre_reg_walk(nd) {
 // statement nodes. Called from each chip's `pre_reg_vars`.
 void _inline_pre_reg_walk_body(arr, cnt) {
     auto i;
+    // Reset the loop-nesting counter for this function. This driver runs once
+    // per function (at pre-reg depth 0), then walks the whole body recursively,
+    // so the hotness gate sees a clean depth here.
+    cg_inline_loop_depth = 0;
     i = 0;
     while (i < cnt) {
         _inline_pre_reg_walk(arr[i]);

@@ -105,10 +105,35 @@ the first bigger/widely-used target needs it.
   (Float-leaf inlining — the originally-planned Inc 2 — is still gated separately
   by the float-param rejection and folds into a later increment.)
 
-- **Inc 3 — control flow (T_IF) in single-return bodies + the HOTNESS GATE.**
-  Unblocks `arr_struct_at` — the **biggest single call source** (~3.17M/render)
-  but a *widely-used* accessor, so inlining it everywhere would bloat → this is
-  where the per-call-site loop-depth gate gets built (inline at hot sites only).
+- **Inc 3 — control flow (guard-clause) inlining + the HOTNESS GATE.** Unblocks
+  `arr_struct_at` — the **biggest single call source** (~3.17M/render) but a
+  *widely-used* accessor (83 call sites), so inlining it everywhere would bloat.
+  Split into two verified bricks:
+
+  - **Inc 3a — hotness-gate infrastructure. ✅ SHIPPED (inert).** New tier
+    `fn_inlineable = 3` (= "hot-only"): the binding splice, but only at IN-LOOP
+    call sites. The whole gate lives in the **spine** (`bpp_dispatch.bsm`): the
+    pre-reg walk tracks `cg_inline_loop_depth` (reset per fn, bumped around
+    T_WHILE) and registers a tier-3 callsite **only when depth > 0** — a cold
+    site keeps `n.e == 0` and the codegen already falls through to a normal `bl`.
+    The only per-backend edits are two mirrored one-liners: the chip fast-path
+    gate is now `fn_inlineable == 1` (tiers 2 + 3 fall to binding). **Fully
+    backend-agnostic** — `_inline_pre_reg_walk_body` runs for both a64 and x64,
+    so no gap/stub. Nothing is tier 3 yet → inert: gen2==gen3 byte-stable,
+    `--c` clean (incl. self-emit), 193/0/12 + 156/0/49 on the installed binary,
+    tl_bench flat (16.9 ms). Binary 998514.
+
+  - **Inc 3b — guard-clause acceptance, `arr_struct_at` as first consumer. NEXT.**
+    `classify_inlineable` recognises the guard-clause shape
+    `if (C) { return A; } return B;` (2 stmts, T_IF whose body is a single
+    T_RET, no else, followed by a final T_RET) and normalises it to the
+    single-return ternary `return C ? A : B;` (semantically exact — ternary
+    only evaluates the taken branch), then marks it tier 3. After normalisation
+    the existing tier-2/3 binding path (Inc 2) emits it — **no new early-return
+    splice machinery**. `arr_struct_at` then inlines only inside loops
+    (`tl_render` per-clip lookup) and stays a normal call at its ~80 cold sites.
+    Gate: byte-stable + suites + `--c` + tl_bench (expect the first real win) +
+    audio md5 == `7ee452e7…`.
 
 - **Inc 4 — bottom-up + relax the T_CALL gate** (reverse-topo order, recursion
   guard) so a call to an already-inlinable function stops disqualifying its
