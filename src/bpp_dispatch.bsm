@@ -6095,6 +6095,59 @@ const INLINE_BODY_NODE_CAP = 50;
 // 32/64 + float load/store wrappers and rejects multi-peek bodies (read_u16be …).
 const INLINE_BUILTIN_NODE_CAP = 10;
 
+// Inc 3b — normalise a guard-clause body to a single-return ternary, IN PLACE.
+// A body of EXACTLY the shape
+//     if (C) { return A; }
+//     return B;
+// is rewritten to the single statement
+//     return C ? A : B;
+// which is semantically exact — a ternary evaluates only the taken branch, just
+// like the guard's early return — and lets the existing single-return binding
+// splice (Inc 2) emit it with NO new early-return machinery. The body array is
+// reused: slot 0 becomes the new T_RET and FN_BCNT drops to 1.
+//
+// The shape is kept deliberately narrow (Rule 28): the first statement must be a
+// T_IF whose body is a single T_RET and which has no `else`, and the second
+// statement a T_RET. Both returns must carry a real expression (a bare `return;`
+// has a == 0 and is rejected). The new wrapper nodes need no `itype` — the
+// ternary emit derives its result type from the (already type-annotated) branch
+// expressions, never from the wrapper (see bpp_codegen.bsm T_TERNARY emit).
+//
+// Returns 1 if it rewrote the body, 0 otherwise. Idempotent in practice:
+// classify_inlineable runs once per compilation (the two call sites in bpp.bpp
+// are the mutually-exclusive modular / monolithic arms), so a rewritten body is
+// never re-examined.
+static _inline_normalize_guard(fn_rec) {
+    auto body_arr, body_cnt, if_body;
+    auto (s0, s1, if_ret, tern, new_ret): Node;
+    auto cond, then_expr, else_expr;
+    body_arr = *(fn_rec + FN_BODY);
+    body_cnt = *(fn_rec + FN_BCNT);
+    if (body_cnt != 2) { return 0; }
+    s0 = body_arr[0];
+    if (s0.ntype != T_IF) { return 0; }
+    if (s0.e != 0)        { return 0; }   // has an else — out of scope
+    if (s0.c != 1)        { return 0; }   // if-body is not exactly one statement
+    if_body = s0.b;
+    if_ret = if_body[0];
+    if (if_ret.ntype != T_RET) { return 0; }
+    s1 = body_arr[1];
+    if (s1.ntype != T_RET) { return 0; }
+    cond      = s0.a;
+    then_expr = if_ret.a;
+    else_expr = s1.a;
+    if (cond == 0 || then_expr == 0 || else_expr == 0) { return 0; }
+    tern = make_node(T_TERNARY);
+    tern.a = cond;
+    tern.b = then_expr;
+    tern.c = else_expr;
+    new_ret = make_node(T_RET);
+    new_ret.a = tern;
+    body_arr[0] = new_ret;
+    *(fn_rec + FN_BCNT) = 1;
+    return 1;
+}
+
 // Walk the function table and tag every entry that meets the
 // inline criteria. Must run after classify_all_functions so
 // fn_phase is final. Codegens read fn_inlineable when emitting
@@ -6131,7 +6184,7 @@ const INLINE_BUILTIN_NODE_CAP = 10;
 void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
-    auto phase, body_cost, want_void, want_bind;
+    auto phase, body_cost, want_void, want_bind, was_guard;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -6168,6 +6221,13 @@ void classify_inlineable() {
         body_cnt = *(fn_rec + FN_BCNT);
         if (body_arr == 0) { continue; }
         if (body_cnt < 1) { continue; }
+        // Inc 3b: normalise a guard-clause body to a single-return ternary in
+        // place, so the checks below (and the binding splice) see a clean
+        // single-return body. A normalised body is tagged tier 3 (hot-only) at
+        // the end so a widely-used accessor (arr_struct_at) inlines only inside
+        // loops. Re-read body_cnt — the rewrite shrinks it from 2 to 1.
+        was_guard = _inline_normalize_guard(fn_rec);
+        body_cnt = *(fn_rec + FN_BCNT);
         // Last statement must be T_RET so the splice has an
         // expression value to use.
         last_stmt = body_arr[body_cnt - 1];
@@ -6257,7 +6317,16 @@ void classify_inlineable() {
                 if (refs > 1) { want_bind = 1; }
             }
         }
-        arr_set(fn_inlineable, i, want_bind ? 2 : 1);
+        // Tier 3 (hot-only) for a guard-clause-normalised body: it is bigger than
+        // a thin wrapper and typically a widely-used accessor (arr_struct_at), so
+        // the pre-reg walk registers — and the codegen inlines — only its in-loop
+        // call sites. Otherwise tier 2 (multi-use param) / tier 1 (thin), both
+        // inlined at every call site.
+        if (was_guard) {
+            arr_set(fn_inlineable, i, 3);
+        } else {
+            arr_set(fn_inlineable, i, want_bind ? 2 : 1);
+        }
     }
 }
 

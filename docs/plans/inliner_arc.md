@@ -123,17 +123,22 @@ the first bigger/widely-used target needs it.
     `--c` clean (incl. self-emit), 193/0/12 + 156/0/49 on the installed binary,
     tl_bench flat (16.9 ms). Binary 998514.
 
-  - **Inc 3b — guard-clause acceptance, `arr_struct_at` as first consumer. NEXT.**
+  - **Inc 3b — guard-clause acceptance, `arr_struct_at` as first consumer. ✅ SHIPPED.**
     `classify_inlineable` recognises the guard-clause shape
     `if (C) { return A; } return B;` (2 stmts, T_IF whose body is a single
     T_RET, no else, followed by a final T_RET) and normalises it to the
     single-return ternary `return C ? A : B;` (semantically exact — ternary
     only evaluates the taken branch), then marks it tier 3. After normalisation
     the existing tier-2/3 binding path (Inc 2) emits it — **no new early-return
-    splice machinery**. `arr_struct_at` then inlines only inside loops
-    (`tl_render` per-clip lookup) and stays a normal call at its ~80 cold sites.
-    Gate: byte-stable + suites + `--c` + tl_bench (expect the first real win) +
-    audio md5 == `7ee452e7…`.
+    splice machinery** (the new ternary/ret wrapper nodes need no `itype`; the
+    ternary emit derives its type from the branches). `arr_struct_at` inlines
+    only inside loops (`tl_render` per-clip lookup, `bl` count 3→2) and stays a
+    normal call at its ~80 cold sites. **Result: tl_bench 16.9→15.3 ms (~10%, the
+    arc's first real win); cost +1.65% compiler binary, self-compile flat
+    (0.24s).** Verified: gen2==gen3 + 193/0/12 + 156/0/49 on the installed binary
+    + `--c` clean (incl. self-emit) + audio md5 `7ee452e7…`. The mutate-in-place
+    is sound because `classify_inlineable` runs once per compilation (the two
+    `bpp.bpp` call sites are the mutually-exclusive modular / monolithic arms).
 
 - **Inc 4 — bottom-up + relax the T_CALL gate** (reverse-topo order, recursion
   guard) so a call to an already-inlinable function stops disqualifying its
