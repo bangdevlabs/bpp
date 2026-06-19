@@ -142,13 +142,40 @@ the first bigger/widely-used target needs it.
 
 - **Inc 4 — bottom-up + relax the T_CALL gate** (reverse-topo order, recursion
   guard) so a call to an already-inlinable function stops disqualifying its
-  caller. Collapses the chain. Hotness-gated.
+  caller. Hotness-gated. **⚠ Investigation 2026-06-19 — two blockers found,
+  re-scope before building:**
+
+  1. **Nested binding-path inlining is an architectural gap, not a one-liner.**
+     The callsite-id scheme stamps a global id on the *caller's own* call node
+     (`cn.e`) and registers `_inl<id>_<param>` slots in the *caller's* frame; the
+     splice clones the callee body (`ast_clone_subst` copies `.e`). For a NESTED
+     inlinable call this breaks: the callee body AST is **shared** (used standalone
+     + by every inliner), so its nested call's `.e` and its mangled slots belong to
+     the *callee's* frame, not the outer caller's → the tier-2/3 binding path would
+     read wrong-frame slots → **miscompile**. (Safe today only because the T_CALL
+     gate blocks every body-with-a-call from inlining at all — which is exactly
+     what Inc 4 relaxes; Inc 3b is unaffected because arr_struct_at is a leaf.)
+     Tier-1 (fast-substitute, no slots) nested calls compose for free, so the
+     *minimal* Inc 4 = relax T_CALL to "calls to TIER-1 callees only". Full
+     tier-2/3 nesting needs the inline tree flattened at pre-reg: clone each
+     inlinable callee body, stamp FRESH ids on the clone, register the clone's
+     slots in the outer frame, and have the splice consume the pre-stamped clone.
+  2. **The filter chain is multi-gate-coupled — T_CALL alone won't move it.**
+     `flt_onepole_tick` (float), `moog_taps` (multi-return), `moog_slope` (switch),
+     `tl_channel_process` (float + if) are each blocked by a DIFFERENT gate too.
+     Collapsing the chain needs float-leaf inlining + Inc 5 (multi-return) + more
+     control-flow + the nested-inline architecture, together — not T_CALL in
+     isolation. Don't ship a T_CALL relaxation expecting a chain win; measure
+     which (if any) real hot call sites a tier-1-only relaxation actually helps
+     first (measure-don't-believe).
 
 - **Inc 5 — multi-value-return splice.** Inline `moog_taps` (4 banked returns →
-  4 result locals). Completes the filter-chain collapse.
+  4 result locals). Part of the coordinated filter-chain push (see Inc 4 note 2).
 
-**Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number). The
-remaining 4.5 → 2.2 ms is Frontier 2 (RegAlloc v2 / liveness, roadmap F.2).
+**Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number); Inc 3b
+took the first step (16.9 → 15.3). The chain collapse is the next big lever but
+needs the coordinated push above. The remaining 4.5 → 2.2 ms is Frontier 2
+(RegAlloc v2 / liveness, roadmap F.2).
 
 ## Discipline
 
