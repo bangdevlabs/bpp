@@ -1,0 +1,113 @@
+// stblfo.bsm — a low-frequency oscillator: the modulation source.
+//
+// An LFO is a slow oscillator (well below audio rate) used to MODULATE another
+// parameter over time: a pan that sweeps L<->R (a Leslie/rotary), a vibrato
+// (pitch), a tremolo (amplitude), a filter-cutoff sweep, PWM, a drum-machine
+// swing. It is the single most reused modulation primitive in a synth, so it is
+// a Tier-1 leaf cartridge: it depends only on bpp_math (sin_f) and names no
+// genre. Output is a float in [-1, 1].
+//
+// Canonical use:
+//   auto lf: Lfo;
+//   lf = lfo_new(44100.0);          // a fresh LFO at the audio sample rate
+//   lfo_set(lf, 6.5, LFO_SIN);      // 6.5 Hz sine (a fast Leslie / tremolo)
+//   ... per sample ...
+//   auto m: float;
+//   m = lfo_tick(lf);               // advance one sample, value in [-1, 1]
+//   // use m to modulate something: pan = m, cutoff = base + m*depth, ...
+//   lfo_free(lf);
+//
+// `lfo_tick` advances exactly one sample-worth of phase — call it once per output
+// sample so the LFO rate stays locked to the sample clock (no wall-clock lookup,
+// no jitter), the same discipline the mixer's oscillators use.
+
+// Pure leaf: bpp_math (sin_f) is auto-injected — no imports.
+
+// Waveform shapes. The value at phase p in [0,1):
+//   SIN  = sin(2*pi*p)              smooth — the Leslie / vibrato default
+//   TRI  = ramp up then down        gentler than sine's peaks
+//   SAW  = ramp -1 -> +1            ramp / sweep
+//   SQUARE = +1 first half, -1 then hard on/off (trill, gate)
+const LFO_SIN    = 0;
+const LFO_TRI    = 1;
+const LFO_SAW    = 2;
+const LFO_SQUARE = 3;
+
+const _LFO_2PI = 6.2831853;
+
+// One LFO instance. `phase` runs in [0, 1) (one full cycle), `inc` is the phase
+// advance per sample (= rate_hz / sample_rate), `wave` is an LFO_* shape, `sr`
+// is the sample rate the increment was computed against.
+struct Lfo { phase: float, inc: float, wave, sr: float }
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_lfo() { return 0; }
+
+// Allocate an LFO bound to `sample_rate`. Defaults: 0 Hz (still), sine. The
+// caller owns the returned pointer and frees it with lfo_free.
+lfo_new(sample_rate: float) {
+    auto l: Lfo;
+    l = malloc(sizeof(Lfo));
+    l.phase = 0.0;
+    l.inc   = 0.0;
+    l.wave  = LFO_SIN;
+    l.sr    = sample_rate;
+    return l;
+}
+
+// Set the LFO rate (in Hz) and waveform. Phase is left untouched so the sweep
+// stays continuous when only the rate changes (e.g. a Leslie speed switch — see
+// lfo_set_rate for a rate-only change that also keeps phase).
+void lfo_set(lfo: Lfo, rate_hz: float, wave) {
+    auto l: Lfo;
+    l = lfo;
+    l.inc  = rate_hz / l.sr;
+    l.wave = wave;
+}
+
+// Change only the rate, keeping the waveform and phase. Used by effects that
+// glide the rate over time (the Leslie chorale<->tremolo ramp).
+void lfo_set_rate(lfo: Lfo, rate_hz: float) {
+    auto l: Lfo;
+    l = lfo;
+    l.inc = rate_hz / l.sr;
+}
+
+// Reset the phase to the start of the cycle (retrigger).
+void lfo_reset(lfo: Lfo) {
+    auto l: Lfo;
+    l = lfo;
+    l.phase = 0.0;
+}
+
+// The current value WITHOUT advancing — read the modulation at this instant
+// (useful when two parameters read the same LFO in one sample).
+lfo_value(lfo: Lfo) -> float {
+    auto l: Lfo, p: float;
+    l = lfo;
+    p = l.phase;
+    switch (l.wave) {
+        LFO_SIN { return sin_f(p * _LFO_2PI); }
+        LFO_TRI { return p < 0.5 ? 4.0 * p - 1.0 : 3.0 - 4.0 * p; }
+        LFO_SAW { return 2.0 * p - 1.0; }
+        else    { return p < 0.5 ? 1.0 : 0.0 - 1.0; }   // square
+    }
+}
+
+// Advance the phase by one sample and return the new value, in [-1, 1]. The
+// per-sample call rate is what keeps the LFO locked to the audio clock.
+lfo_tick(lfo: Lfo) -> float {
+    auto l: Lfo;
+    auto (p, v): float;
+    l = lfo;
+    v = lfo_value(l);
+    p = l.phase + l.inc;
+    if (p >= 1.0) { p -= 1.0; }
+    l.phase = p;
+    return v;
+}
+
+// Free an LFO allocated by lfo_new.
+void lfo_free(lfo) {
+    free(lfo);
+}
