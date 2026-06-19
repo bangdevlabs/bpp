@@ -95,31 +95,35 @@ bpp --c tools/tiny_lofi/tl_bench.bpp > /tmp/t.c && \
 | Inc 1 (`7548e4c`) | 16707 µs | 7.1× | read/write_u16 inlined |
 | Inc 2 (`205ca6a`) | 16928 µs | 7.2× | multi-use-param binding path (foundation — flat by design) |
 | Inc 3a (`ea2b739`) | 16859 µs | 7.2× | hotness-gate infra (inert) |
-| **Inc 3b (`<this>`)** | **15300 µs** | **6.5×** | `arr_struct_at` inlined hot-only (first real win, ~10%) |
+| Inc 3b (`dc03969`) | 15300 µs | 6.5× | `arr_struct_at` inlined hot-only (first win, ~10%) |
+| **float-leaf (`<this>`)** | **13100 µs** | **5.6×** | `flt_onepole_tick` inlined → `moog_taps` 4 `bl`→0 (~14%) |
 | hand-inlined (flat) | 4201 µs | 1.8× | the inliner's target |
 | clang -O2 (oracle) | 2339 µs | 1× | the ceiling |
 
-So the gap is **×3.6 inliner** (15300→4201, was ×4.0) + **×1.8 flat-loop
-codegen** (4201→2339). Inc 3b is the **first measurable win**: `arr_struct_at`
-(the biggest single call source, ~3.17M/render) now inlines inside `tl_render`'s
-per-clip loop. Cost: +1.65% compiler binary (998546→1015058) — the hotness gate
-contains the bloat to in-loop sites, and self-compile time stays flat (0.24s), so
-the trade is net-positive (cf. Inc 1's reverted +13% all-sites attempt). Inc 4–5
-collapse the rest of the filter chain. (The oracle `cc` line needs
+So the gap is now **×3.1 inliner** (13100→4201, was ×4.0 at Inc 2) + **×1.8
+flat-loop codegen** (4201→2339). Cumulative arc win **16.9→13.1 ms (~22%)**.
+Inc 3b inlined `arr_struct_at` hot-only; **float-leaf inlining** then made matched-
+type float leaves inlinable (relax the float gate + float-typed mangled slots),
+collapsing `moog_taps`'s 4 per-sample `flt_onepole_tick` calls. Compiler binary
+flat for float-leaf (no hot float leaves in the compiler itself); audio
+byte-identical throughout. The remaining filter-chain links
+(`tl_channel_process`/`moon_process`/`moog_slope` calls, `moog_taps`
+multi-return) need Inc 5 + control-flow + the nested-inline architecture (T_CALL
+was measured a dead end — see inliner_arc.md). (The oracle `cc` line needs
 `-Wno-error=implicit-function-declaration` + `-lobjc` on recent clang.)
 
 **The mechanism metric — `bl`/iter in the per-sample chain** (`bug --disasm`,
 the per-increment progress signal):
 
-| function | bl (Inc 2) | bl (Inc 3b) | note |
-|---|---|---|---|
-| `tl_render` | 3 | **2** | `arr_struct_at` inlined away (Inc 3b); reset(once) + `tl_channel_process` remain |
-| `tl_channel_process` | 1 | 1 | → `moon_process` (Inc 4 target — relax T_CALL gate) |
-| `moon_process` | 1 | 1 | → `moog_slope` |
-| `moog_slope` | 1 | 1 | → `moog_taps` |
-| `moog_taps` | 4 | 4 | → 4× `flt_onepole_tick` (Inc 5 — multi-value-return splice) |
-| `flt_onepole_tick` | 0 | 0 | leaf (float — folds in once float-leaf inlining lands) |
-| `arr_struct_at` | 0 | 0 | guard-clause → ternary, tier-3 hot-only; **inlined at hot sites (Inc 3b)**, standalone for ~80 cold callers |
+| function | bl (Inc 2) | bl (3b) | bl (float-leaf) | note |
+|---|---|---|---|---|
+| `tl_render` | 3 | 2 | 2 | `arr_struct_at` inlined away (3b); reset(once) + `tl_channel_process` remain |
+| `tl_channel_process` | 1 | 1 | 1 | → `moon_process` (needs control-flow + nested-inline) |
+| `moon_process` | 1 | 1 | 1 | → `moog_slope` |
+| `moog_slope` | 1 | 1 | 1 | → `moog_taps` (has a switch) |
+| `moog_taps` | 4 | 4 | **0** | 4× `flt_onepole_tick` **inlined (float-leaf)**; itself multi-return → Inc 5 |
+| `flt_onepole_tick` | 0 | 0 | 0 | matched-float leaf — **now inlined into moog_taps** |
+| `arr_struct_at` | 0 | 0 | 0 | guard-clause → ternary, tier-3 hot-only; inlined at hot sites (3b), standalone for ~80 cold callers |
 
 **Audio correctness baseline:** `tiny_lofi.bpp --render` writes
 `tiny_lofi_test.wav`; its md5 is `7ee452e7eb9237debafa7302b177d66c` (the trusted

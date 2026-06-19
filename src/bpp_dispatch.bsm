@@ -5926,6 +5926,14 @@ void _inline_register_callsite(call_node, fidx) {
         orig_p = *(params + i * 8);
         mangled = _inline_pack_mangled_name(_inline_callsite_id, orig_p);
         vi = cg_var_add(mangled);
+        // Inc 4-revised: a FLOAT param's mangled slot must carry the float type,
+        // or the binding store `_inl<id>_<param> = <arg>` would write a float
+        // through an int slot → FCVTZS truncation. Type ONLY float params; int /
+        // sub-word slots stay untyped (word) as before, so existing tier-2 int
+        // candidates are byte-for-byte unchanged.
+        if (is_float_type(get_fn_par_type(fidx, i))) {
+            arr_set(cg_var_forced_ty, vi, get_fn_par_type(fidx, i));
+        }
         // Mirror callee body's reference count to the mangled
         // param slot. The b3 selector consults this to decide
         // promotion, and the splice helper may bind args into
@@ -6184,7 +6192,7 @@ static _inline_normalize_guard(fn_rec) {
 void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
-    auto phase, body_cost, want_void, want_bind, was_guard;
+    auto phase, body_cost, want_void, want_bind, was_guard, has_float_param;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -6244,15 +6252,19 @@ void classify_inlineable() {
         }
         pcnt = *(fn_rec + FN_PCNT);
         if (pcnt > 3) { continue; }
-        // Float coercion bypass — inlining skips the call path's
-        // int/float convert logic, so restrict to pure-integer
-        // candidates (mirror Phase B2).
-        if (is_float_type(get_fn_ret_type(i))) { continue; }
-        ok = 1;
+        // Float types are allowed (matched-type leaves, Inc 4-revised). Float
+        // RETURN is safe on either path — the expression-level codegen and the
+        // caller's consuming context apply any conversion, exactly as for a real
+        // call. A float PARAM, though, must go through the BINDING path: the fast
+        // substitute path drops the arg expression in with NO int/float
+        // conversion, so a float param is forced to tier >= 2 (has_float_param
+        // below). There cg_emit_inline_multi binds it to a float-typed slot
+        // (_inline_register_callsite types the slot) and the slot assignment does
+        // the conversion — matching what a real call would emit.
+        has_float_param = 0;
         for (j = 0; j < pcnt; j++) {
-            if (is_float_type(get_fn_par_type(i, j))) { ok = 0; }
+            if (is_float_type(get_fn_par_type(i, j))) { has_float_param = 1; }
         }
-        if (ok == 0) { continue; }
         // Body node count (Q4 hard cap) — also rejects bodies
         // containing T_IF/T_WHILE/T_SWITCH/nested T_BLOCK
         // because `_inline_count_nodes` returns 99 for them
@@ -6324,8 +6336,13 @@ void classify_inlineable() {
         // inlined at every call site.
         if (was_guard) {
             arr_set(fn_inlineable, i, 3);
+        } else if (want_bind || has_float_param) {
+            // has_float_param forces tier 2 so a float param never takes the
+            // fast substitute path (which can't convert the arg) — see the
+            // float-gate note above.
+            arr_set(fn_inlineable, i, 2);
         } else {
-            arr_set(fn_inlineable, i, want_bind ? 2 : 1);
+            arr_set(fn_inlineable, i, 1);
         }
     }
 }

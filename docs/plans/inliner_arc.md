@@ -181,16 +181,22 @@ the first bigger/widely-used target needs it.
     *compile-time* micro-win, a different metric, and only after a 2-pass classify
     + accepting some bloat. Not worth it for the DAW goal.
 
-  **Reprioritised:** the next real DAW lever is **float-leaf inlining**, NOT
-  T_CALL/nesting. `flt_onepole_tick(s,in,g)->float { return s+g*(in-s); }` is a
-  pure matched-float leaf called 4×/sample by `moog_taps`; making it inlinable
-  (relax the float gate for matched-type leaves) collapses those 4 `bl` via the
-  EXISTING Inc 2 binding path — one level (moog_taps is emitted standalone because
-  it is multi-return), so NO nesting architecture needed. The one real piece:
-  float-typed mangled slots in `_inline_register_callsite` (today the mangled
-  param slot is untyped → a float arg would store through an int slot → FCVTZS
-  truncation). T_CALL/nesting (the "1" architecture) becomes the LAST piece, after
-  float-leaf + Inc 5 + control-flow.
+  **Reprioritised → float-leaf inlining. ✅ SHIPPED.** The next real DAW lever was
+  float-leaf, NOT T_CALL/nesting. `flt_onepole_tick(s,in,g)->float { return
+  s+g*(in-s); }` is a pure matched-float leaf called 4×/sample by `moog_taps`.
+  Three spine edits (agnostic, no chip changes): (1) `classify_inlineable` allows
+  float return + float params, and forces any float-param function to tier 2
+  (`has_float_param` — a float param must never take the fast substitute path,
+  which can't convert the arg); (2) `_inline_register_callsite` types the mangled
+  float-param slot (else the bind store writes a float through an int slot →
+  FCVTZS truncation); (3) `cg_emit_inline_multi` force-binds float params (so the
+  conversion happens at the typed-slot assignment, matching a real call). Collapses
+  `moog_taps`'s 4 `bl` → 0 via the EXISTING Inc 2 binding path at one level
+  (moog_taps is standalone — multi-return), so NO nesting architecture needed.
+  **Result: tl_bench 15.3 → 13.1 ms (~14%; cumulative 16.9→13.1 = ~22%).**
+  Compiler binary flat (no hot float leaves in the compiler), audio byte-identical
+  (`7ee452e7…`), gen2==gen3, 193/0/12 + 156/0/49, `--c` clean. T_CALL/nesting
+  (the "1" architecture) remains the LAST piece, after Inc 5 + control-flow.
 
 - **Inc 5 — multi-value-return splice.** Inline `moog_taps` (4 banked returns →
   4 result locals). Part of the coordinated filter-chain push.
