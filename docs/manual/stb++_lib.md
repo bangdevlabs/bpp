@@ -411,8 +411,15 @@ CoreAudio / ALSA / WASAPI directly — it calls the platform primitives via
 target-suffix resolution.
 
 On macOS the platform layer drives CoreAudio's AudioQueue with dlopen'd
-function pointers. Linux ALSA lands when ELF dynamic linking ships. Both
-backends expose the same public contract, so user code is zero-touch when
+function pointers. The wire format is **float32** stereo frames
+(`docs/plans/audio_float_device_boundary.md`, 2026-06-21) — Core Audio's own
+canonical PCM shape, matching `stbmixer`'s internal float signal path (Cap 30,
+`audio_float_core_migration.md`); s16 only remains where it always should:
+the WAV-file interchange format (`stbsound.bsm`, Cap 31) and the ALSA-facing
+contract this same float shape is designed to hand off to once Linux audio
+lands. Linux ALSA lands when ELF dynamic linking's audio door opens
+(`docs/plans/elf_dynlink_plan.md` Phase 2, gated on real x86_64 hardware).
+Both backends expose the same public contract, so user code is zero-touch when
 you cross-compile.
 
 ### §29.0 — Three shapes of volume (and why)
@@ -706,10 +713,13 @@ voice sample
   × _mx_bus_vol[bus] / 100        ← bus gain (MUSIC / SFX)
   × _mx_master_vol / 100          ← master gain (legacy synthkey knob)
   × _mx_bus_vol[MASTER] / 100     ← master bus slider
-  → clipped to s16 → DAC
+  → clipped to ±1.0 (float) → DAC
 ```
 
-Conceptually, the four levels serve different roles:
+The whole chain runs in float internally (`docs/plans/audio_float_core_migration.md`)
+— the four amplitude inputs above stay s16-style / percent / dB at the public
+API, exactly as documented; only the internal math and the final clip changed
+shape, from s16 to float. Conceptually, the four levels serve different roles:
 
 | Level | Who sets it | When | Unit |
 |-------|-------------|------|------|
@@ -722,6 +732,36 @@ Collapsing: if your app only has one slider, set `_mx_bus_vol[MASTER]`
 and leave the rest at defaults. Plugins and games with separate music
 vs effects sliders use the bus layer. DAW-style per-voice ducking
 uses the voice layer.
+
+### §30.1b — Stereo: per-voice pan and the Leslie rotary
+
+Two stereo-split operations sit alongside (not inside) the gain chain above —
+they redistribute a sample between L/R, they never add loudness:
+
+```c
+void mixer_set_voice_pan(slot, pan: float);  // -1 (hard L) .. 0 (centre) .. +1 (hard R)
+```
+
+Unity-centre balance law: centre is full gain both sides, panning only
+attenuates the far side, so a centred voice is unchanged from the old
+mono-on-both-channels path. Internally the gain is stored as a float
+(`peekfloat`/`pokefloat` on the same per-voice slot every other voice array
+uses) and multiplies directly into the per-sample float mix — no fixed-point
+step.
+
+```c
+void mixer_set_rotary(mode);  // MX_ROTARY_OFF / MX_ROTARY_CHORALE / MX_ROTARY_TREMOLO
+mixer_get_rotary();
+```
+
+A global auto-pan on the master sum, modulated by an `stblfo` tick — the
+unity-centre balance law turns a pan sweep into the classic Leslie/rotating-
+speaker swirl. Switching speed glides the rate rather than jumping (the
+"wind-up"); `MX_ROTARY_OFF` bypasses entirely at zero cost. As of this writing
+no shipped instrument calls `mixer_set_rotary` yet — it is proven headless via
+`tests/test_mixer_rotary.bpp` but not yet wired to a keybinding in
+`mini_synth` or any other consumer; see `docs/plans/audio_dsp_architecture.md`
+item 2.
 
 ### §30.2 — Bus operations
 
@@ -902,10 +942,18 @@ voice sample
   × bus_vol / 100                              (mixer)
   × _mx_master_vol / 100                       (mixer)
   × master_bus_vol / 100                       (mixer)
-  → push to audio ring
-  × _aud_amplitude / 32767                     (stbaudio callback)
+  → push to audio ring (float32, docs/plans/audio_float_device_boundary.md)
+  × _aud_amplitude / 32767                     (stbaudio — tone-test path only)
   → DAC
 ```
+
+**Doc/code note:** the `_aud_amplitude` multiply above only happens on the
+tone-test callback (`_aud_square_cb`, used by `audio_tone_test`). The ring-
+drain callback that `mixer_stream` actually uses (`_aud_stream_cb`) is a pure
+copy from the ring to the device buffer and does not read `_aud_amplitude` —
+so for the `stbmixer` path, the mixer's own four gain levels are the entire
+chain to the DAC today. Pre-existing gap, not introduced by the float
+migration; flagged here rather than silently preserved.
 
 Two distinct master layers. **Rule of thumb:** use the mixer's
 master when adjusting game internals (music ducking, fade-outs).
@@ -937,8 +985,7 @@ them after any change to stbmixer:
   ones to 0, restore on un-solo.
 - **Fade curves** over N ms. Not shipped. Step the voice amp in
   your render loop — same pattern as the fade-in example above.
-- **Per-voice panning** (L/R balance). The mixer outputs mono-on-
-  both-channels today. Per-voice pan is a future voice-state field.
+- ~~Per-voice panning~~ — shipped, see §30.1b (`mixer_set_voice_pan`).
 - **Send effects** (reverb / delay routed through a dedicated bus).
   Would require a full FX graph, not just a bus routing; out of
   scope for the current mixer.

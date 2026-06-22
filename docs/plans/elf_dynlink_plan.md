@@ -108,7 +108,7 @@ wired door, couple on arrival." Two phases:
 
 - **Phase 2 — the door (stub NOW, couple when x86 hardware arrives).** The
   GPU/audio API surface + Linux platform hooks (`_gpu_linux.bsm` /
-  `_audio_linux.bsm`, Tier-3 per the manual's Portability Tiers), wired to the
+  `_stb_audio_linux.bsm`, Tier-3 per the manual's Portability Tiers), wired to the
   engine, with the real driver `DT_NEEDED` + calls **stubbed** and marked
   `// ships when x86 hardware + driver present`. When the hardware lands,
   coupling is the small, known step in the Activation checklist — the engine
@@ -250,7 +250,7 @@ wires the *consumers* and leaves the hardware-specific parts stubbed.
   `ALSA.B`→`libasound.so.2`, etc. Docker-verified: `import "Vulkan.B"` emits
   `NEEDED libvulkan.so.1`. (One `DT_NEEDED` per *distinct* soname — for a program
   that mixes two FFI libraries — remains a follow-up; see Engine status.)
-- **Create the Tier-3 platform files** `_gpu_linux.bsm` / `_audio_linux.bsm`
+- **Create the Tier-3 platform files** `_gpu_linux.bsm` / `_stb_audio_linux.bsm`
   (separate files per the manual — GPU/Window/Audio are always per-OS files).
   Wire the abstract API (`bpp_gpu` / `bpp_audio`) to the engine, with each driver
   call **stubbed** and marked `// ships when x86 hardware + driver present`.
@@ -268,7 +268,7 @@ When a real x86_64 Linux box with a GPU/audio driver arrives, coupling a stubbed
 payload is this checklist — the engine is already proven, so this is small:
 
 1. **Confirm the driver is present:** `ldconfig -p | grep -E 'libvulkan|libasound'`.
-2. **Flip the stub to real** in `_gpu_linux.bsm` / `_audio_linux.bsm`: replace
+2. **Flip the stub to real** in `_gpu_linux.bsm` / `_stb_audio_linux.bsm`: replace
    the stub body with the real `import "Vulkan.B" { … }` declaration + call.
 3. **Name the library** — the tag→soname map already exists (`elf_lib_soname`),
    so `import "Vulkan.B"` emits `DT_NEEDED libvulkan.so.1` with no engine change.
@@ -345,7 +345,7 @@ touching **only** the Linux layers.
    contract; only the Linux backing changes.
 2. **No other target's backend touched** — changes confined to
    `src/backend/target/x86_64_linux/x64_elf.bsm` + the new `_gpu_linux.bsm` /
-   `_audio_linux.bsm`. macOS untouched.
+   `_stb_audio_linux.bsm`. macOS untouched.
 3. **Source byte-identical across targets** — a `import "stbgpu.bsm"; main(){…}`
    program compiles unchanged for every target; no `#if TARGET`.
 

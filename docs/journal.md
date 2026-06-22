@@ -13957,3 +13957,72 @@ arc, measured at every step, took a from-scratch self-hosted backend from
 two backends and never adding a bootstrap warning. The "sidequest that became a
 pilgrimage" reached its destination: codegen is no longer the bottleneck, and
 the focus turns to tools, games, and stb.
+
+### 2026-06-21 — the audio stack goes float, end to end (rotary → mixer → device)
+
+Started as item 2 of `docs/plans/audio_dsp_architecture.md` (the Leslie/rotary,
+on top of the freshly-shipped `stblfo`). Wiring the rotary's float LFO tick into
+`stbmixer`'s all-integer per-sample loop meant a fixed-point `/1024` conversion
+— the same tax `mixer_set_voice_pan` already paid. The user's question, "audio
+shouldn't this all be float?", was real doubt, not rhetorical, so the session
+turned into market research before any code: VST/AU/AAX, Ableton, Logic, and
+post-HDX Pro Tools are all float internal / fixed-point only at the wire.
+**`docs/plans/audio_float_core_migration.md`** (Part 1) shipped all four stages
+same day — oscillator, pan, master stage, and sample/music playback all run
+float now; s16 only remains at the WAV-read and (at the time) the final
+device-write boundaries. Suite 195/0/12 throughout, `mini_synth` ear-verified.
+
+That ear-verification turned out to be premature in a scary way: later the same
+day, testing `mini_synth` interactively froze the machine hard enough to need a
+physical reset. The next session opened with that report and a direct question
+— is the float migration the cause? A from-scratch review of `mixer_fill` found
+no unbounded loop, no division by zero, and no denormal-cliff risk (b++ `float`
+is a 64-bit double throughout, nowhere near subnormal range); the rotary code
+path turned out to be **dead for `mini_synth`** — it never calls
+`mixer_set_rotary`, so that whole feature was unexercised the day it supposedly
+got "confirmed by ear". The full suite (`tests/run_all.sh`, which kills any
+single hung test after 10s) and the real-CoreAudio `test_mixer_stream` both ran
+clean with no hang. No bug was found in the diff; the freeze's cause stays
+unconfirmed, most likely unrelated to this code.
+
+That investigation reopened the original roadmap question with sharper focus:
+**if the mixer is float internally now, why does `stbaudio` — the device/ring
+layer underneath it — still convert to s16 before talking to CoreAudio?**
+Checking against the actual platform docs (not memory) settled it: Core Audio's
+own canonical format is Float32 — the HAL re-floats whatever you hand it before
+doing any internal processing, so requesting s16 buys nothing and costs a
+quantization round-trip Core Audio's own path doesn't have. WASAPI's shared-mode
+engine mixes in float32 unconditionally; PortAudio's own design notes say
+plainly that once a native API accepts float, passing it through unconverted is
+preferable; JACK's sample type is `float` everywhere. **Part 2,
+`docs/plans/audio_float_device_boundary.md`, shipped the same session**: the
+`AudioStreamBasicDescription` now asks for `kAudioFormatFlagIsFloat` (32-bit,
+8 bytes/frame), the SPSC ring carries float32, both CoreAudio callbacks and
+`stbaudio.bsm`'s public `audio_push`/`audio_push_frames` contract moved with it,
+and `mixer_fill`'s final write *lost* a conversion step instead of gaining one
+(`pokefloat_h` straight to the wire — no more `*32767.0`/clamp/truncate). One
+real consequence chased down along the way: `mini_synth`'s SPACE-to-record path
+byte-copied the mixer's output buffer verbatim into the WAV recording buffer —
+once that buffer turned float, the recording would have silently saved garbage
+into an s16-labelled WAV file. Fixed by converting sample-by-sample at the
+copy point, keeping "WAV stays s16 on disk" intact. Scope check against
+`docs/manual/bootstrap_manual.md`'s Backend Layout confirmed this is pure
+`os/` + `stb/` territory — the codegen spine needed no changes, since
+`peekfloat_h`/`pokefloat_h` already existed on both chips.
+
+The Linux angle got folded in deliberately, not as scope creep: ALSA's native
+PCM format (`SND_PCM_FORMAT_FLOAT_LE`) is float, so designing the abstract
+`stbaudio` contract as float-native now — while there is exactly one shipped
+backend — means the eventual `_stb_audio_linux.bsm` (the manual's
+Portability-Tiers naming, correcting a stray `_audio_linux.bsm` found in
+`docs/plans/elf_dynlink_plan.md`) inherits the same contract with no redesign
+when that door opens. `elf_dynlink_plan.md`'s own Phase 2 (the GPU/audio door)
+stays exactly as scoped — stubbed, gated on real x86_64 hardware — this session
+did not touch that gate, only made sure the contract it will eventually wire
+against is the right shape. Verification: full suite 195/0/12 (unchanged),
+`bench_compile.sh` unchanged (0.24s bootstrap — no compiler involvement at all,
+confirmed by `git diff --stat -- src/` showing only the one platform file),
+`test_audio_tone` and `test_mixer_stream` both passing against the real
+CoreAudio device with the new float ASBD — the strongest signal available
+short of listening, since a malformed format flag fails queue creation
+outright rather than misplaying silently.

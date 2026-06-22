@@ -79,13 +79,21 @@ An 8/16-bit drum machine = a **step sequencer** over **synthesised drum voices**
   validates the LFO.
 
 ## Recommended order
-1. **`stblfo`** (Tier-1 primitive) — needed for the Leslie you want now, and the
-   most-reused modulation source.
+1. **`stblfo`** (Tier-1 primitive) — ✅ SHIPPED 2026-06-21.
 2. **Leslie/rotary** on `stblfo` — start as a `stbmixer` rotary mode (1 consumer);
    `mini_synth` toggles chorale/tremolo. MVP = rotary-pan + speed ramp
    (headless-testable via `mixer_fill`); AM + Doppler are step 2.
+   **Mixer-side plumbing ✅ SHIPPED 2026-06-21** (`mixer_set_rotary` +
+   `tests/test_mixer_rotary.bpp`, proven headless) — **but `mini_synth` does
+   not call it yet**, so the feature has no live consumer/keybinding today.
+   Wiring that is the open part of this item. Triggered the float-core
+   sidequest (`docs/plans/audio_float_core_migration.md` +
+   `docs/plans/audio_float_device_boundary.md`, both shipped the same day) —
+   the rotary's float LFO tick was the friction that surfaced "the mixer
+   should be float internally", which then surfaced "so should the device
+   wire underneath it."
 3. **`stbenv` + noise** — with `kong_beat` (the next instrument), which also
-   de-clicks `mini_synth`.
+   de-clicks `mini_synth`. Next up.
 4. Graduate **`stbrotary`** (Tier 2) when `tiny_lofi` takes the rotary as a
    channel insert (the 2nd consumer).
 
