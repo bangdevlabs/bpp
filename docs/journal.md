@@ -14078,3 +14078,25 @@ and `kong_beat` itself stay exactly as parked in the architecture plan: no
 named consumer has built the voices yet, so per Rule 28 there is nothing to
 extract speculatively. Verified: suite 197/0/12, `bench_compile.sh`
 unchanged (0.24s bootstrap), `mini_synth` recompiled clean.
+
+One more ask before closing the day: visibility into how `mini_synth`
+actually routes its real-time audio, after a day of changing nearly every
+layer underneath it. `stbprofile`'s sampling profiler + HUD was the obvious
+first reach, but it `import`s `stbrender` directly for its draw calls —
+coupled to the `stbgame` game pattern, not the `stbwindow` tool pattern
+`mini_synth` uses (Tonify Rule 23). Dragging `stbrender` into a tool that
+deliberately doesn't carry it to get a generic CPU sampler was the wrong
+shape for what was actually being asked, which was narrower anyway: not
+"where does the CPU spend time" but "is the ring keeping up." Built a small
+dedicated readout instead, using only `_stb_get_time_us` (already
+auto-injected) and `mini_synth`'s own `draw_text`/`draw_number`: wall time
+for `mixer_fill` and `audio_push_frames` each tick, how many 1024-frame
+batches the fill loop ran (>1 means catching up on backlog, not
+steady-state), the ring's free space, and the realtime callback's actual
+firing rate (measured from `_stb_audio_cb_count()`'s delta over a 500ms
+window, not assumed — should read ~43Hz at 1024 frames/44.1kHz if the
+device is being serviced on schedule). TAB toggles it; deliberately
+overlays the piano keys since it's a debug view, not meant to coexist with
+playing. Compiles clean, suite unaffected (197/0/12) — visual confirmation
+that the readout itself renders sane numbers still needs a human at the
+keyboard.

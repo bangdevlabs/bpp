@@ -37,6 +37,24 @@ static auto _sk_wav_path;
 static auto _sk_fader_acc;
 static auto _sk_dirt_acc;
 
+// ── Real-time audio routing readout (TAB toggles) ─────────────────
+// A direct look at how this loop is actually feeding the ring, not a
+// CPU sampling profile — stbprofile's HUD needs stbrender, which this
+// stbwindow-based tool doesn't carry, so this is a small dedicated
+// readout using _stb_get_time_us (bpp_time, auto-injected) around the
+// two calls that matter: synth (mixer_fill) and handoff (audio_push_
+// frames). _sk_prof_iters counts how many 1024-frame batches the while
+// loop ran THIS tick — >1 means the loop is catching up on backlog, not
+// running steady-state.
+static auto _sk_prof_on;
+static auto _sk_prof_fill_us;
+static auto _sk_prof_push_us;
+static auto _sk_prof_iters;
+static auto _sk_prof_ring_space;
+static auto _sk_prof_cb_hz;
+static auto _sk_prof_last_cb;
+static auto _sk_prof_last_us;
+
 static void _sk_map(idx, key_enum, midi) {
     _sk_keys[idx] = key_enum;
     _sk_midi[idx] = midi;
@@ -173,6 +191,10 @@ main() {
     // per frame which was causing kernel-call jitter.
     _sk_fill_buf = malloc(1024 * 8);
 
+    _sk_prof_on      = 0;
+    _sk_prof_last_cb = 0;
+    _sk_prof_last_us = _stb_get_time_us();
+
     init_beat();
     audio_open(4096);
     mixer_init();
@@ -182,6 +204,11 @@ main() {
         auto dt_ms, fader_step, dirt_step;
         window_frame_step();
         if (key_pressed(KEY_ESC)) { break; }
+
+        // TAB toggles the real-time audio routing readout.
+        if (key_pressed(KEY_TAB)) {
+            _sk_prof_on = _sk_prof_on == 0 ? 1 : 0;
+        }
 
         // dt-aware step sizes — mini_synth runs under stbwindow
         // (no fps cap by design; that lives in stbgame for games),
@@ -252,12 +279,22 @@ main() {
         // the ring has less than 1024 frames of space — this ensures
         // the callback always has enough runway. No malloc per frame;
         // _sk_fill_buf is pre-allocated once.
+        _sk_prof_fill_us = 0;
+        _sk_prof_push_us = 0;
+        _sk_prof_iters   = 0;
         space = audio_ring_space();
         while (space >= 1024) {
-            auto produced, pushed, batch;
+            auto produced, pushed, batch, t0: word, t1: word;
             batch = 1024;
+            t0 = _stb_get_time_us();
             produced = mixer_fill(_sk_fill_buf, batch);
+            t1 = _stb_get_time_us();
+            _sk_prof_fill_us += t1 - t0;
+            t0 = t1;
             pushed = audio_push_frames(_sk_fill_buf, produced);
+            t1 = _stb_get_time_us();
+            _sk_prof_push_us += t1 - t0;
+            _sk_prof_iters++;
             if (_sk_recording && _sk_rec_pos + produced * 4 <= _sk_rec_cap) {
                 // _sk_fill_buf holds float32 frames (mixer_fill's wire
                 // format, docs/plans/audio_float_device_boundary.md) but
@@ -279,6 +316,23 @@ main() {
             }
             if (pushed < produced) { space = 0; }
             else { space = audio_ring_space(); }
+        }
+        _sk_prof_ring_space = space;
+
+        // Callback rate, recomputed once every ~500ms from the delta on
+        // _stb_audio_cb_count() — the real proof of how often CoreAudio's
+        // realtime thread is actually draining the ring, independent of
+        // how fast this main-thread loop happens to be ticking.
+        auto now_us: word, dt_us: word;
+        now_us = _stb_get_time_us();
+        dt_us = now_us - _sk_prof_last_us;
+        if (dt_us >= 500000) {
+            auto cb_now, cb_delta;
+            cb_now = _stb_audio_cb_count();
+            cb_delta = cb_now - _sk_prof_last_cb;
+            _sk_prof_cb_hz = cb_delta * 1000000 / dt_us;
+            _sk_prof_last_cb = cb_now;
+            _sk_prof_last_us = now_us;
         }
 
         // ── Draw ──────────────────────────────────────────────
@@ -331,6 +385,32 @@ main() {
             auto secs;
             secs = _sk_rec_pos / (44100 * 4);
             draw_number(306, 2, 8, RED, secs);
+        }
+
+        // Real-time audio routing readout (TAB). Overlays the keys on
+        // purpose — it's a debug view, not meant to coexist with playing.
+        if (_sk_prof_on) {
+            draw_rect(4, 56, 312, 56, _rgb(10, 10, 18));
+            draw_text("AUDIO ROUTING (TAB to hide)", 8, 60, 8, _rgb(255, 221, 87));
+
+            draw_text("mixer_fill:", 8, 74, 8, _rgb(170, 170, 190));
+            draw_number(96, 74, 8, WHITE, _sk_prof_fill_us);
+            draw_text("us", 132, 74, 8, _rgb(170, 170, 190));
+
+            draw_text("audio_push:", 8, 86, 8, _rgb(170, 170, 190));
+            draw_number(96, 86, 8, WHITE, _sk_prof_push_us);
+            draw_text("us", 132, 86, 8, _rgb(170, 170, 190));
+
+            draw_text("batches/tick:", 160, 74, 8, _rgb(170, 170, 190));
+            draw_number(264, 74, 8, WHITE, _sk_prof_iters);
+
+            draw_text("ring space:", 160, 86, 8, _rgb(170, 170, 190));
+            draw_number(264, 86, 8, WHITE, _sk_prof_ring_space);
+            draw_text("/4096", 290, 86, 8, _rgb(170, 170, 190));
+
+            draw_text("callback rate:", 8, 100, 8, _rgb(170, 170, 190));
+            draw_number(112, 100, 8, WHITE, _sk_prof_cb_hz);
+            draw_text("Hz (~43 healthy at 1024f/44.1k)", 132, 100, 8, _rgb(170, 170, 190));
         }
 
         draw_end();
