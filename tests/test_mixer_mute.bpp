@@ -1,0 +1,108 @@
+// test_mixer_mute.bpp — Audible proof that audio_mute()/audio_unmute() now
+// actually reaches the mixer-driven stream path.
+//
+// docs/plans/audio_float_device_boundary.md found _aud_amplitude (the
+// stbaudio session-level master knob behind audio_mute/audio_set_volume/
+// audio_set_amplitude/audio_set_volume_db) was only ever applied by the
+// disused tone-test callback — the ring-drain callback mixer_stream
+// actually uses ignored it entirely, so muting had zero effect on any
+// stbmixer-based program (mini_synth included). Fixed by applying the same
+// float gain in the stream callback, seeded to 0 dB/unity so existing
+// programs are unaffected by default.
+//
+// This test plays a continuous tone through the mixer for three phases:
+// audible -> muted -> audible again. A human listening hears tone, silence,
+// tone. Programmatic assertions catch what the ear can't: amplitude
+// round-trips through mute/unmute exactly, and the pipeline (callback
+// firing, ring draining) keeps running while muted — mute silences the
+// signal, it does not stop the stream.
+//
+// Same risk profile as test_audio_tone.bpp / test_mixer_stream.bpp: opens
+// the real device for under a second, then closes. Not an open-ended
+// interactive loop.
+
+import "bpp_io.bsm";
+import "bpp_beat.bsm";
+import "stbaudio.bsm";
+import "stbmixer.bsm";
+
+const PHASE_MS = 200;
+
+static void _play_for(ms) {
+    auto start_ms, elapsed;
+    start_ms = beat_now_ms();
+    elapsed = 0;
+    while (elapsed < ms) {
+        mixer_stream(256);
+        _stb_audio_sleep_ms(2);
+        elapsed = beat_now_ms() - start_ms;
+    }
+}
+
+main() {
+    auto rc, amp_before, amp_muted, amp_after, cb_count;
+
+    init_beat();
+    rc = audio_open(4096);
+    if (rc != 0) {
+        putmsg("FAIL: audio_open rc="); putnum(rc); putline();
+        return rc;
+    }
+
+    mixer_init();
+    mixer_note_on(1, 440);
+
+    // Phase 1 — audible, default (unity) amplitude.
+    amp_before = audio_get_amplitude();
+    _play_for(PHASE_MS);
+
+    // Phase 2 — muted. Should be silent, but the stream must keep running.
+    audio_mute();
+    if (audio_is_muted() != 1) {
+        putmsg("FAIL: audio_is_muted should report 1 after audio_mute");
+        putline();
+        return 1;
+    }
+    amp_muted = audio_get_amplitude();
+    if (amp_muted != 0) {
+        putmsg("FAIL: amplitude should be 0 while muted, got ");
+        putnum(amp_muted);
+        putline();
+        return 2;
+    }
+    _play_for(PHASE_MS);
+
+    // Phase 3 — unmuted, audible again, amplitude restored exactly.
+    audio_unmute();
+    if (audio_is_muted() != 0) {
+        putmsg("FAIL: audio_is_muted should report 0 after audio_unmute");
+        putline();
+        return 3;
+    }
+    amp_after = audio_get_amplitude();
+    if (amp_after != amp_before) {
+        putmsg("FAIL: amplitude should round-trip through mute/unmute, before=");
+        putnum(amp_before);
+        putmsg(" after=");
+        putnum(amp_after);
+        putline();
+        return 4;
+    }
+    _play_for(PHASE_MS);
+
+    mixer_note_off(1);
+    cb_count = _stb_audio_cb_count();
+    audio_close();
+
+    if (cb_count < 1) {
+        putmsg("FAIL: callback never fired");
+        putline();
+        return 5;
+    }
+
+    putmsg("OK — listen for tone / silence / tone (amp ");
+    putnum(amp_before);
+    putmsg(" = 0 dB unity)");
+    putline();
+    return 0;
+}

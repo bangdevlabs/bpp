@@ -61,12 +61,28 @@ render(project) -> s16 stereo buffer:
   for each frame:
     sum = 0
     for each track:
+      if (track.muted) { continue; }    // skip entirely — not yet wired, see below
       s = sample from the track's active clip at this frame (0 if none)
       s = track.insert.filter(s)        // the Moog plugin, per track
       s = s * track.volume
       sum += s
     out[frame] = sum * master_volume    // soft-clamp to s16
 ```
+
+**Per-track mute — deferred, not yet implemented** (user request 2026-06-21,
+parked for when the mixer-strip slice below gets interactive write-back).
+`Track.muted` is in the schema but nothing reads it yet — `grep -rn "muted"
+tools/tiny_lofi/` is empty today. This is a *different* mechanism from the
+`stbaudio` session-level mute fixed the same day
+(`docs/plans/audio_float_device_boundary.md` — `_aud_amplitude`, one global
+knob applied after everything is mixed): a tiny_lofi track mute is per-track,
+applied *inside* `tl_render`'s mixing loop, the same shape as `track.volume`
+above — `continue`/skip the track's contribution entirely (cheaper and more
+correct than multiplying by 0, since a muted track's insert/filter state
+doesn't need to keep ticking). Worth mirroring `stbaudio`'s
+save-on-mute/restore-on-unmute pattern (`_aud_is_muted` + `_aud_saved_amp` in
+`_stb_audio_macos.bsm`) for `Track.muted` + `Track.volume` too, so toggling
+mute doesn't lose the fader's prior position.
 
 Clips reference loaded s16 buffers (a mini_synth WAV export, or a recorded
 take). Cut splits a clip into two; copy/paste duplicates a clip's
@@ -107,7 +123,10 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    Export, the buttons live) + a mixer strip (8 faders + master). Read-only
    view of the model; Play renders the project once and streams it through the
    audio device while the playhead follows the cursor. `./tl` opens the window;
-   `./tl --render` keeps the headless WAV path for CI.
+   `./tl --render` keeps the headless WAV path for CI. **Open follow-up:** the
+   faders are visual only — interactive write-back to `track.volume` plus a
+   mute toggle per channel (see the per-track mute note above) is not built
+   yet.
 3. **Clips + tools** — import a WAV as a clip; draw clips as blocks; select;
    drag to move; scissors to cut at the playhead; Ctrl+C / Ctrl+V.
 4. **Insert** — the Moog filter per track, cutoff/resonance in the channel
