@@ -165,6 +165,16 @@ compiler change is in scope.
   disk" intact end to end. This is exactly the grep-the-variants risk Part E
   flagged before implementation — confirms the discipline, not just the
   caution.
+- **Found and fixed (follow-up, same day): `_aud_amplitude` was a silent
+  no-op for every `stbmixer`-based program.** Writing up Cap 30.8's gain
+  chain in `stb++_lib.md` for this plan surfaced it: `_aud_stream_cb` (the
+  callback `mixer_stream` drives) never read `_aud_amplitude`, only the
+  disused tone-test callback did. Fixed by applying the same float gain in
+  `_aud_stream_cb`, with `_stb_audio_open` seeding `_aud_amplitude` to 32700
+  (0 dB / unity gain, the professional-audio convention for "untouched" —
+  not the s16 ceiling 32767, not an arbitrary percent constant) only when
+  unset, so existing programs that never call `audio_set_*` are unaffected.
+  See `docs/journal.md` 2026-06-21 for the full reasoning.
 
 ## Cross-references
 - `docs/plans/audio_float_core_migration.md` — Part 1 (mixer-internal

@@ -943,17 +943,25 @@ voice sample
   × _mx_master_vol / 100                       (mixer)
   × master_bus_vol / 100                       (mixer)
   → push to audio ring (float32, docs/plans/audio_float_device_boundary.md)
-  × _aud_amplitude / 32767                     (stbaudio — tone-test path only)
+  × _aud_amplitude / 32768                     (stbaudio, both callbacks)
   → DAC
 ```
 
-**Doc/code note:** the `_aud_amplitude` multiply above only happens on the
-tone-test callback (`_aud_square_cb`, used by `audio_tone_test`). The ring-
-drain callback that `mixer_stream` actually uses (`_aud_stream_cb`) is a pure
-copy from the ring to the device buffer and does not read `_aud_amplitude` —
-so for the `stbmixer` path, the mixer's own four gain levels are the entire
-chain to the DAC today. Pre-existing gap, not introduced by the float
-migration; flagged here rather than silently preserved.
+**Fixed 2026-06-21** (was a pre-existing gap, not introduced by the float
+migration): `_aud_amplitude` used to apply only on the tone-test callback
+(`_aud_square_cb`); the ring-drain callback `mixer_stream` actually uses
+(`_aud_stream_cb`) was a pure ring-to-buffer copy that never read it, so this
+whole second master layer was a silent no-op for every `stbmixer`-based
+program. `_aud_stream_cb` now applies the same float gain. To keep existing
+programs' volume unchanged, `_stb_audio_open` seeds `_aud_amplitude` to
+**32700 — 0 dB / unity gain**, the professional-audio convention for "this
+control was never touched" (the same value `audio_set_volume_db(0)` already
+set; Pro Tools and most DAWs default every channel fader to 0 dB for the same
+reason: unity is the reference point, not the floor — silence lives at
+-∞ dB, not at 0). A program that never calls `audio_set_*` plays exactly as
+before; one that does now gets a real effect through the mixer path too,
+including `audio_mute()`/`audio_unmute()`, which previously had no audible
+effect on `stbmixer`-based audio.
 
 Two distinct master layers. **Rule of thumb:** use the mixer's
 master when adjusting game internals (music ducking, fade-outs).

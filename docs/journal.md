@@ -14026,3 +14026,28 @@ confirmed by `git diff --stat -- src/` showing only the one platform file),
 CoreAudio device with the new float ASBD — the strongest signal available
 short of listening, since a malformed format flag fails queue creation
 outright rather than misplaying silently.
+
+Writing up Cap 30.8's gain-chain diagram for the docs pass above surfaced one
+more real bug, found by reading the actual callback code rather than trusting
+the prose next to it: `_aud_amplitude` — `stbaudio`'s own session-level
+master-volume knob (`audio_set_amplitude`/`audio_set_volume`/
+`audio_set_volume_db`/`audio_mute`) — was only ever read by the disused
+tone-test callback. The ring-drain callback every real `stbmixer` consumer
+uses (`_aud_stream_cb`) was a pure byte copy that never looked at it, so the
+entire second master layer the docs described was a silent no-op for
+`mini_synth` and everything else that goes through the mixer. Fixing the
+naive way (just add the multiply) would have **silenced every existing
+mixer-based program** outright: `_aud_amplitude` defaults to 0 in BSS, and
+nothing ever seeded it for the mixer path the way `_stb_audio_tone_start`
+seeds 8000 for the tone path. The right default for "this knob was never
+touched" turned into its own small market check — not 32767 (the literal s16
+ceiling) and not 32700-as-in-the-percent-API's-100%, but **0 dB, unity gain,
+the actual professional-audio convention** for a control nobody has adjusted
+(Pro Tools and most DAWs default every channel fader to 0 dB on project
+creation for exactly this reason — unity is the reference point, not the
+floor). The codebase already encodes that convention (`audio_set_volume_db(0)`
+maps to 32700), so the fix seeds that same value, only when `_aud_amplitude`
+is still zero. Net effect: programs that never touch the knob play unchanged;
+programs that do — including `audio_mute()`, previously inert for
+`stbmixer`-based audio — now actually work. Full suite re-verified 195/0/12,
+`test_mixer_stream`/`test_audio_tone` both pass against the real device.

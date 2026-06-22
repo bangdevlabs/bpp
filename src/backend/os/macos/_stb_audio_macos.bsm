@@ -249,19 +249,26 @@ _stb_audio_cb_count() {
 
 // ── Iteration 4 callback — consumes frames from the SPSC ring ────
 //
-// Reads up to `cap / 4` frames from the ring into the CoreAudio
-// buffer. If the ring is short of frames (producer falling behind),
-// the remainder is padded with silence so the audio device never
-// gets starved bytes. Never blocks, never allocates, never calls a
-// syscall — same contract as the square-wave callback above.
+// Reads up to `cap / 8` frames from the ring into the CoreAudio
+// buffer, applying `_aud_amplitude` as a float gain on the way through
+// (docs/manual/stb++_lib.md Cap 30.8 — this is the stbaudio session-level
+// master knob, on top of whatever stbmixer already mixed; previously this
+// callback ignored it entirely, a pre-existing doc/code mismatch). If the
+// ring is short of frames (producer falling behind), the remainder is
+// padded with silence so the audio device never gets starved bytes. Never
+// blocks, never allocates, never calls a syscall — same contract as the
+// square-wave callback above.
 static _aud_stream_cb(user, queue, buffer)@safe {
-    auto cap, data, frames, i, local_write, local_read, avail, sample;
-    auto ridx;
+    auto cap, data, frames, i, local_write, local_read, avail;
+    auto ridx, amp;
+    auto amp_f: float, lf: float, rf: float;
 
     cap   = peek(buffer + 0) + peek(buffer + 1) * 256
           + peek(buffer + 2) * 65536 + peek(buffer + 3) * 16777216;
     data  = *(buffer + 8);
     frames = cap / 8;
+    amp   = _aud_amplitude;
+    amp_f = amp / 32768.0;
 
     // Acquire the producer's published write index. The mem_barrier
     // guarantees every frame byte the producer wrote before advancing
@@ -272,19 +279,14 @@ static _aud_stream_cb(user, queue, buffer)@safe {
     avail       = local_write - local_read;
     if (avail > frames) { avail = frames; }
 
-    // Copy `avail` frames from the ring into the buffer. Each frame is now
-    // 8 bytes (stereo float32) — still a pure byte copy, the callback never
-    // interprets the sample value, only widens the stride.
+    // Copy `avail` frames from the ring into the buffer, scaling by the
+    // session amplitude. Each frame is 8 bytes (stereo float32).
     for (i = 0; i < avail; i++) {
         ridx = (local_read + i) & _aud_ring_mask;
-        poke(data + i * 8 + 0, peek(_aud_ring_data + ridx * 8 + 0));
-        poke(data + i * 8 + 1, peek(_aud_ring_data + ridx * 8 + 1));
-        poke(data + i * 8 + 2, peek(_aud_ring_data + ridx * 8 + 2));
-        poke(data + i * 8 + 3, peek(_aud_ring_data + ridx * 8 + 3));
-        poke(data + i * 8 + 4, peek(_aud_ring_data + ridx * 8 + 4));
-        poke(data + i * 8 + 5, peek(_aud_ring_data + ridx * 8 + 5));
-        poke(data + i * 8 + 6, peek(_aud_ring_data + ridx * 8 + 6));
-        poke(data + i * 8 + 7, peek(_aud_ring_data + ridx * 8 + 7));
+        lf = peekfloat_h(_aud_ring_data + ridx * 8 + 0);
+        rf = peekfloat_h(_aud_ring_data + ridx * 8 + 4);
+        pokefloat_h(data + i * 8 + 0, lf * amp_f);
+        pokefloat_h(data + i * 8 + 4, rf * amp_f);
     }
 
     // Pad the tail with silence when the producer is behind. IEEE-754
@@ -455,6 +457,15 @@ _stb_audio_open(cap_frames) {
 
     _aud_init_ffi();
     if (_aud_tb == 0) { return 1; }
+
+    // Amplitude defaults to 32700 (0 dB / unity gain — the same value
+    // audio_set_volume_db(0) sets, the professional-audio convention for
+    // "untouched": neither boosted nor attenuated) only when the user has
+    // not set a volume beforehand. Without this seed, _aud_stream_cb's new
+    // amplitude multiply would silence every program that has never called
+    // audio_set_amplitude/volume/volume_db — same seed-only-if-unset
+    // discipline as _stb_audio_tone_start's default below.
+    if (_aud_amplitude == 0) { _aud_amplitude = 32700; }
 
     _aud_ring_cap   = cap_frames;
     _aud_ring_mask  = cap_frames - 1;
