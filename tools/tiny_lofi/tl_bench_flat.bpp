@@ -1,8 +1,17 @@
 // tl_bench_flat.bpp — the SAME render as tl_bench, hand-inlined (zero function
 // calls in the hot loop). This is what a perfect inliner would produce. If it
-// lands near clang -O2, the 7x gap is 100% call overhead and our per-sample
+// lands near clang -O2, the gap is 100% call overhead and our per-sample
 // arithmetic codegen is already fine — which tells us the frontier is the
 // inliner, not FP scheduling.
+//
+// Mirrors tl_bench's CURRENT demo project exactly (docs/plans/inliner_arc.md
+// re-decomposition, 2026-06-22): CH0 bass (centre pan, no insert), CH1 lead
+// (Moog @ slope 2 + constant-power pan + the rotary insert, ROTARY_CHORALE).
+// The rotary was added to tl_bench the same day this file was updated — it
+// used to be mono-only and never modelled pan or the rotary at all, which
+// quietly made the inliner-arc gap decomposition stale once stereo (2026-06-19)
+// and the rotary insert (slice 5, 2026-06-22) shipped on the real engine
+// without a matching update here.
 //
 //   ./bpp tools/tiny_lofi/tl_bench_flat.bpp -o /tmp/tlf && /tmp/tlf
 
@@ -41,13 +50,23 @@ gen_saw(freq: float, frames) {
 main() {
     auto sine, saw, total, out, i, t0, t1, us, per, rtf;
     auto ct, cb, cs, cl, nclips;                 // parallel clip arrays
-    auto vol;                                    // per-channel volume (s16-ish *1000)
+    auto vol;                                    // per-channel volume
     auto g: float, k: float, x: float;
+    auto gl0: float, gr0: float, gl1: float, gr1: float;   // precomputed pan gains
+    auto theta: float;
+    auto r_cur: float, r_tgt: float, r_inc_base: float;    // rotary state that
+                                                            // PERSISTS across
+                                                            // renders (only phase
+                                                            // resets — matches
+                                                            // tl_channel_reset_
+                                                            // filters' rotary_reset,
+                                                            // which only resets
+                                                            // LFO phase)
 
     sine = gen_sine(220.0, 88200);
     saw  = gen_saw(330.0, 110250);
     total = 132300;
-    out = malloc(total * 4);
+    out = malloc(total * 8);                     // stereo float32 — tl_render's device-wire output
 
     // Three clips (CH0 sine split in two at 1.0s + CH1 saw), as flat arrays.
     nclips = 3;
@@ -67,17 +86,35 @@ main() {
     g = x / (1.0 + x);
     k = 2.6;
 
+    // Precomputed constant-power pan gains (_tl_apply_pan's math) — CH0 pan
+    // 0.0 (centre), CH1 pan 0.5 (right-leaning). Computed once, same as the
+    // real engine: pan is constant per track, the trig never runs per sample.
+    theta = (0.0 + 1.0) * 0.78539816;
+    gl0 = cos_f(theta); gr0 = sin_f(theta);
+    theta = (0.5 + 1.0) * 0.78539816;
+    gl1 = cos_f(theta); gr1 = sin_f(theta);
+
+    // Rotary on CH1: ROTARY_CHORALE (target rate 0.8 Hz). cur/tgt persist
+    // across the RENDERS loop exactly like the real engine's Rotary instance
+    // does (tl_track_set_rotary is called once, outside tl_bench's render
+    // loop, same as here).
+    r_cur = 0.0;
+    r_tgt = 0.8;
+
     t0 = _stb_get_time_us();
     for (i = 0; i < RENDERS; i++) {
         auto t, tr, ci;
         auto s1: float, s2: float, s3: float, s4: float;
-        auto master_v: float, ts: float, sf: float;
+        auto master_l: float, master_r: float, ts: float, sf: float;
         auto a: float, b: float, c: float, d: float, fb: float;
-        auto (rel, raw, si): word;
+        auto (rel, raw): word;
+        auto l1: float, r1: float;                       // CH1's post-pan stereo pair
+        auto r_phase: float, rm: float, rgl: float, rgr: float;
         s1 = 0.0; s2 = 0.0; s3 = 0.0; s4 = 0.0;     // fresh filter per render
+        r_phase = 0.0;                              // fresh LFO phase per render
 
         for (t = 0; t < total; t++) {
-            master_v = 0.0;
+            master_l = 0.0; master_r = 0.0;
             for (tr = 0; tr < 8; tr++) {
                 ts = 0.0;
                 for (ci = 0; ci < nclips; ci++) {
@@ -100,14 +137,41 @@ main() {
                     ts = b;
                 }
                 ts = ts * peekfloat(vol + tr*8);
-                master_v += ts;
+
+                if (tr == 1) {
+                    // Pan (constant-power, precomputed gains).
+                    l1 = ts * gl1;
+                    r1 = ts * gr1;
+                    // Rotary insert (rotary_tick, inlined): glide cur toward
+                    // tgt, advance the LFO, apply the unity-centre pan law.
+                    if (r_cur < r_tgt) {
+                        r_cur += 0.0001;
+                        if (r_cur > r_tgt) { r_cur = r_tgt; }
+                    } else if (r_cur > r_tgt) {
+                        r_cur -= 0.0001;
+                        if (r_cur < r_tgt) { r_cur = r_tgt; }
+                    }
+                    rm = sin_f(r_phase * TL_2PI);
+                    r_phase += r_cur / 44100.0;
+                    if (r_phase >= 1.0) { r_phase -= 1.0; }
+                    rgl = 1.0; rgr = 1.0;
+                    if (rm > 0.0) { rgl = 1.0 - rm; }
+                    if (rm < 0.0) { rgr = 1.0 + rm; }
+                    l1 = l1 * rgl; r1 = r1 * rgr;
+                    master_l += l1; master_r += r1;
+                } else {
+                    // CH0 (and the silent CH2..7) — pan only, no insert.
+                    master_l += ts * gl0;
+                    master_r += ts * gr0;
+                }
             }
-            master_v = master_v * 0.85;
-            si = master_v * 32767.0;
-            if (si >  32767) { si =  32767; }
-            if (si < -32767) { si = -32767; }
-            poke_q(out + t*4 + 0, si);
-            poke_q(out + t*4 + 2, si);
+            master_l = master_l * 0.85; master_r = master_r * 0.85;
+            if (master_l >  1.0)      { master_l =  1.0; }
+            if (master_l < 0.0 - 1.0) { master_l = 0.0 - 1.0; }
+            if (master_r >  1.0)      { master_r =  1.0; }
+            if (master_r < 0.0 - 1.0) { master_r = 0.0 - 1.0; }
+            pokefloat_h(out + t*8 + 0, master_l);
+            pokefloat_h(out + t*8 + 4, master_r);
         }
     }
     t1 = _stb_get_time_us();
