@@ -413,18 +413,38 @@ void _stb_init_window(w: word, h: word, title) {
 }
 
 // Copy the software framebuffer to the screen. Only presentation, no timing.
+//
+// Writes straight to the backing CALayer's `contents`, NOT through
+// NSImage. This is a deliberate, measured choice, not a style
+// preference: isolation testing (three standalone repro programs,
+// each removing one more layer) showed `CGBitmapContextCreate` +
+// `CGBitmapContextCreateImage` + `CGContextRelease`/`CGImageRelease`
+// alone hold ~0 bytes across 1.6M iterations/12s, but wrapping that
+// same CGImageRef in `[[NSImage alloc] initWithCGImage:size:]` and
+// releasing it immediately — with NO NSImageView involved at all —
+// grew RSS to ~13.5 GB within 4 seconds at the same call rate.
+// `leaks` reports a clean malloc heap throughout (NSImage's cache is
+// not malloc-backed), so this is undocumented AppKit-internal image
+// caching that a correct `alloc`/`init`/`release` pairing cannot opt
+// out of. `CALayer.contents` accepts a `CGImageRef` directly (Apple's
+// documented bridging for this property — Core Animation retains the
+// CGImageRef itself, no NSImage, no cache) and was the path that
+// finally held memory flat under the same sustained test.
 void _stb_present() {
-    auto ctx, cgimg, nsimg;
+    auto ctx, cgimg, layer;
 
     ctx = call(_plt_cg_ctx, _stb_fb, _stb_w, _stb_h, 8, _stb_w * 4, _plt_cs, 8194);
     cgimg = call(_plt_cg_img, ctx);
 
-    nsimg = objc_msgSend(objc_getClass("NSImage"), sel_registerName("alloc"));
-    nsimg = objc_msgSend(nsimg, sel_registerName("initWithCGImage:size:"),
-        cgimg, _stb_w * 1.0, _stb_h * 1.0);
-    objc_msgSend(_plt_imgview, sel_registerName("setImage:"), nsimg);
+    layer = objc_msgSend(_plt_imgview, sel_registerName("layer"));
+    objc_msgSend(layer, sel_registerName("setContents:"), cgimg);
     objc_msgSend(_plt_app, sel_registerName("updateWindows"));
 
+    // CALayer retains its own reference to the CGImageRef when it is
+    // assigned to `contents` (no copy, per Apple's docs for this
+    // specific property) — same shape as the old NSImage path, just
+    // without NSImage in the chain. Safe to release our +1 right
+    // after the assignment.
     call(_plt_cg_img_rel, cgimg);
     call(_plt_cg_ctx_rel, ctx);
 }
@@ -507,6 +527,23 @@ void _stb_poll_events() {
     // for-init `ci = 0` outside the inner `auto ci` declaration. B++
     // allocates these as function-scope stack slots anyway.
     auto chars_ns, char_count, ci, ch;
+    auto pool;
+
+    // Per-call autorelease pool. Every Cocoa message in this function
+    // that returns an autoreleased object (nextEventMatchingMask:'s
+    // event, NSDate.distantPast, NSEvent.characters' NSString, ...) was
+    // being caught by the single NSAutoreleasePool _stb_init_window
+    // creates once at startup and never drains — so those objects sat
+    // alive for the entire process lifetime instead of one poll cycle.
+    // A capped 60 FPS game leaks slowly enough to go unnoticed; a tool
+    // built on stbwindow's uncapped loop (mini_synth) calls this
+    // function as fast as the CPU allows and blows up to multiple GB
+    // within minutes. Creating and draining a pool around every call
+    // bounds the leak to "objects from one poll", which is the
+    // standard Cocoa idiom for a manual (non-NSApplicationMain) event
+    // pump.
+    pool = objc_msgSend(objc_getClass("NSAutoreleasePool"), sel_registerName("new"));
+
     dist_past = objc_msgSend(objc_getClass("NSDate"), sel_registerName("distantPast"));
 
     ev = objc_msgSend(_plt_app,
@@ -740,6 +777,11 @@ void _stb_poll_events() {
     if (objc_msgSend(_plt_win, sel_registerName("isVisible")) == 0) {
         _plt_quit_flag = 1;
     }
+
+    // Drain everything autoreleased during this poll — see the pool
+    // creation comment above. Must be the last thing this function
+    // does so every Cocoa call above lands inside the pool's lifetime.
+    objc_msgSend(pool, sel_registerName("release"));
 }
 
 // _stb_get_time, _stb_thread_create, _stb_thread_join used to live here.

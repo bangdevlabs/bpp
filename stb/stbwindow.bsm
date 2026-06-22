@@ -172,6 +172,24 @@ extrn _stb_last_time;
 // the same `SCREEN_W = w` write below.
 extrn SCREEN_W, SCREEN_H;
 
+// Frame budget read by `_stb_frame_wait` in BOTH platform backends
+// (`_stb_platform_macos.bsm` / `_stb_platform_linux.bsm`). stbgame
+// sets this from its `fps` argument; stbwindow never did — "tools
+// own their pacing, no fixed budget" meant no FORCED target, but it
+// accidentally also meant NO CEILING: with this left at its 0
+// default, `_stb_frame_wait`'s `(_stb_frame_ms - elapsed_ms) * 1000`
+// is always negative, the sleep guard never fires, and the tool's
+// main loop spins as fast as the CPU allows. A tool that calls
+// `_stb_present` every iteration of that unbounded loop (every
+// `stbwindow` tool does, via `draw_end`) was asking the OS compositor
+// to accept a new frame tens of thousands of times per second — far
+// more than any display can drain — and the backlog of in-flight
+// frames is what actually grows without bound, not a missing
+// retain/release pairing in our own Cocoa calls (those existed too
+// and are fixed separately, but were a much smaller leak). See
+// extrn below.
+extrn _stb_frame_ms;
+
 // ── Phase 4.0.1 — full-init convenience layer ──────────────
 //
 // Tools that need the same subsystem init `game_init` does — but
@@ -241,6 +259,21 @@ void window_init_full(w, h, title) {
     // fallback so timing-sensitive tool code that reads `dt_ms`
     // before the first frame sees a familiar value.
     _stb_window_dt_ms = 16;
+    // Ceiling for `_stb_frame_wait`, matching stbgame's 60 Hz
+    // default. A first attempt capped this at ~240 Hz on the theory
+    // that "tools own their pacing" meant "much faster than games,
+    // just bounded" — `leaks` proved that theory wrong: heap growth
+    // was a trivial 48 bytes (one intentional one-time pool, see
+    // _stb_init_window), yet `ps`/Activity Monitor RSS still climbed
+    // by hundreds of MB over ~10s. The growth was never a missing
+    // `free`/`release` — it is the macOS window-server compositor
+    // queuing up `_stb_present`'s NSImage/IOSurface-backed frames
+    // faster than any physical display can drain them (no display
+    // refreshes at 240 Hz). 60 Hz matches what `stbgame` has shipped
+    // since day one with zero reports of this symptom across every
+    // game in the repo, so tools get the same ceiling instead of a
+    // speculative higher one.
+    _stb_frame_ms = 16;
 }
 
 // Per-frame tick — poll the OS event queue once and recompute the
