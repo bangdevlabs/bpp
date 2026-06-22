@@ -29,6 +29,7 @@
 
 import "stbaudio.bsm";
 import "stblfo.bsm";     // the rotary (Leslie) LFO modulation source
+import "stbenv.bsm";     // ADSR — de-clicks tone-voice note_off (docs/plans/audio_dsp_architecture.md item 3)
 
 // ── Configuration ──────────────────────────────────────────────
 // All set once inside mixer_init. Rule 1: static extrn for
@@ -55,6 +56,8 @@ static extrn _mx_voice_pos;      // arr[i] = sample frame position
 static extrn _mx_voice_frames;   // arr[i] = sample total frame count
 static extrn _mx_voice_bus;      // arr[i] = MX_BUS_* tag (routes to a volume bus)
 static extrn _mx_voice_loop;     // arr[i] = 1 if voice loops at end (music)
+static extrn _mx_voice_env;      // arr[i] = an stbenv Envelope* (tone voices only;
+                                 //   de-clicks note_off — see mixer_note_on/off)
 static extrn _mx_voice_pan_l;    // arr[i] = left pan gain, float bits (0.0..1.0),
                                  //   read/written via peekfloat/pokefloat —
                                  //   the slot is still an 8-byte word buffer,
@@ -186,6 +189,20 @@ void mixer_init() {
         pokefloat(_mx_voice_pan_r + pv * 8, 1.0);
     }
 
+    // One Envelope per voice slot, allocated once (not per note_on — the
+    // pool stays @safe-friendly, no malloc on the hot note-on/note-off
+    // path). De-click shape only: fast attack/decay, full sustain (today's
+    // sustained loudness is unchanged), short release — note_off ramps
+    // instead of cutting (docs/plans/audio_dsp_architecture.md item 3). The
+    // shape is the same for every tone voice; not yet exposed as a per-
+    // voice API. Literals, not named consts — see Rule 12 (const demotes
+    // float literals to 0).
+    _mx_voice_env = buf_word(_MX_MAX_VOICES);
+    for (pv = 0; pv < _MX_MAX_VOICES; pv++) {
+        _mx_voice_env[pv] = env_new(44100.0);
+        env_set(_mx_voice_env[pv], 2.0, 2.0, 1.0, 15.0);
+    }
+
     _mx_bus_vol = buf_word(_MX_BUS_COUNT);
     _mx_bus_vol[MX_BUS_MASTER] = 100;
     _mx_bus_vol[MX_BUS_MUSIC]  = 80;
@@ -281,20 +298,31 @@ static _mx_pct_to_db(pct) {
     return 0 - (halvings * 6 + ratio);
 }
 
-// Start a note with unique `key_id` at `freq_hz`. If a voice is
-// already playing the same key, returns that voice's slot without
-// restarting it — the held note keeps sustaining. Returns the
+// Start a note with unique `key_id` at `freq_hz`. If a voice is already
+// playing the same key AND still held (not yet released), returns that
+// voice's slot without restarting it — the held note keeps sustaining. If
+// the same key matches a voice that has already started its release tail
+// (a key was pressed again after note_off but before the tail finished
+// ringing out), retriggers that same slot instead of leaving a stale tail
+// while a second voice for the same key starts elsewhere. Returns the
 // voice slot on success, -1 if every slot is busy.
 mixer_note_on(key_id: word, freq_hz: word) {
     auto i, hp;
+    hp = _MX_SAMPLE_RATE / freq_hz / 2;
+    if (hp < 1) { hp = 1; }
 
-    // Already playing this key? Return the existing slot unchanged.
-    // Only tone voices carry a key_id, so cross-kind collision is
-    // not possible.
+    // Already playing this key? Only tone voices carry a key_id, so
+    // cross-kind collision is not possible.
     for (i = 0; i < _MX_MAX_VOICES; i++) {
         if (_mx_voice_active[i] != 0) {
             if (_mx_voice_kind[i] == MX_KIND_TONE) {
-                if (_mx_voice_key[i] == key_id) { return i; }
+                if (_mx_voice_key[i] == key_id) {
+                    if (env_is_held(_mx_voice_env[i])) { return i; }
+                    _mx_voice_hp[i]    = hp;
+                    _mx_voice_phase[i] = 0;
+                    env_trigger(_mx_voice_env[i]);
+                    return i;
+                }
             }
         }
     }
@@ -303,14 +331,13 @@ mixer_note_on(key_id: word, freq_hz: word) {
     // music, slot 9 is a spare — don't let tones land there.
     for (i = 0; i < 8; i++) {
         if (_mx_voice_active[i] == 0) {
-            hp = _MX_SAMPLE_RATE / freq_hz / 2;
-            if (hp < 1) { hp = 1; }
             _mx_voice_kind[i]   = MX_KIND_TONE;
             _mx_voice_hp[i]     = hp;
             _mx_voice_amp[i]    = _MX_VOICE_AMP;
             _mx_voice_key[i]    = key_id;
             _mx_voice_phase[i]  = 0;
             _mx_voice_bus[i]    = MX_BUS_SFX;
+            env_trigger(_mx_voice_env[i]);
             _mx_voice_active[i] = 1;
             return i;
         }
@@ -442,15 +469,17 @@ mixer_bus_is_muted(bus: word) {
     return _mx_bus_muted[bus];
 }
 
-// Release every voice currently playing the given key_id. No-op
-// when the key is not active. Rule 3: void because it only mutates
-// global state.
+// Release every voice currently playing the given key_id. No-op when the
+// key is not active. Starts the voice's envelope RELEASE stage rather than
+// cutting it instantly — the slot stays active and audible (ringing out the
+// short de-click tail) until mixer_fill ticks the envelope to idle. Rule 3:
+// void because it only mutates global state.
 void mixer_note_off(key_id: word) {
     auto i;
     for (i = 0; i < _MX_MAX_VOICES; i++) {
         if (_mx_voice_active[i] != 0) {
             if (_mx_voice_key[i] == key_id) {
-                _mx_voice_active[i] = 0;
+                env_release(_mx_voice_env[i]);
             }
         }
     }
@@ -745,11 +774,20 @@ mixer_fill(buf, n: word) {
                 if (phase >= period) { phase = 0; }
                 _mx_voice_phase[v] = phase;
 
-                // Apply per-voice amplitude + the SFX bus gain, then fold
-                // into L/R through the voice's float pan gain.
-                sample_f = sample_f * amp_f * (bus_vol / 100.0);
+                // Apply per-voice amplitude + the ADSR envelope (de-click —
+                // docs/plans/audio_dsp_architecture.md item 3) + the SFX bus
+                // gain, then fold into L/R through the voice's float pan gain.
+                auto env_lvl: float;
+                env_lvl = env_tick(_mx_voice_env[v]);
+                sample_f = sample_f * amp_f * env_lvl * (bus_vol / 100.0);
                 left  = left  + sample_f * pan_l_f;
                 right = right + sample_f * pan_r_f;
+
+                // The envelope reaching IDLE is what actually frees the
+                // slot now — note_off only started the release tail.
+                if (env_is_active(_mx_voice_env[v]) == 0) {
+                    _mx_voice_active[v] = 0;
+                }
 
             } else if (kind == MX_KIND_SAMPLE) {
                 // One-shot sample. Read one stereo s16 pair, normalize to

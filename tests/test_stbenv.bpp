@@ -1,0 +1,83 @@
+// test_stbenv.bpp — stbenv: the ADSR shape ticks through its four stages,
+// release is click-free from any stage, and a percussive (sustain=0) shape
+// self-terminates without needing env_release.
+import "stbenv.bsm";
+
+myabs(x: float) -> float { return x < 0.0 ? 0.0 - x : x; }
+
+main() {
+    auto e: Envelope, ok, v: float;
+    ok = 1;
+
+    // ── ADSR at sample rate 8: attack 2 samples, decay 2 samples to a 0.5
+    // sustain, release 4 samples — every stage lands on a round number.
+    e = env_new(8.0);
+    env_set(e, 250.0, 250.0, 0.5, 500.0);
+    env_trigger(e);
+
+    v = env_tick(e);                              // attack 1/2
+    if (myabs(v - 0.5) > 0.001) { ok = 0; }
+    if (env_is_held(e) != 1) { ok = 0; }
+
+    v = env_tick(e);                              // attack 2/2 -> decay begins
+    if (myabs(v - 1.0) > 0.001) { ok = 0; }
+
+    v = env_tick(e);                              // decay 1/2
+    if (myabs(v - 0.75) > 0.001) { ok = 0; }
+
+    v = env_tick(e);                              // decay 2/2 -> sustain
+    if (myabs(v - 0.5) > 0.001) { ok = 0; }
+
+    v = env_tick(e);                              // sustain holds
+    if (myabs(v - 0.5) > 0.001) { ok = 0; }
+    if (env_is_active(e) != 1) { ok = 0; }
+    if (env_is_held(e)   != 1) { ok = 0; }
+
+    // Release from sustain (0.5) over 4 samples -> -0.125/sample.
+    env_release(e);
+    if (env_is_held(e) != 0) { ok = 0; }           // released — no longer held
+    if (env_is_active(e) != 1) { ok = 0; }          // but still audible
+
+    v = env_tick(e);
+    if (myabs(v - 0.375) > 0.001) { ok = 0; }
+    v = env_tick(e);
+    if (myabs(v - 0.25) > 0.001) { ok = 0; }
+    v = env_tick(e);
+    if (myabs(v - 0.125) > 0.001) { ok = 0; }
+    v = env_tick(e);
+    if (myabs(v - 0.0) > 0.001) { ok = 0; }
+    if (env_is_active(e) != 0) { ok = 0; }          // fully idle now
+    env_free(e);
+
+    // ── Click-free release mid-attack: trigger, one tick (level 0.5,
+    // still ramping up), release immediately. Must ramp DOWN from 0.5, not
+    // jump to 0 or keep climbing.
+    e = env_new(8.0);
+    env_set(e, 250.0, 250.0, 0.5, 500.0);   // same shape as above
+    env_trigger(e);
+    v = env_tick(e);                              // attack 1/2 -> 0.5
+    if (myabs(v - 0.5) > 0.001) { ok = 0; }
+    env_release(e);                               // release computed from 0.5, not from 1.0
+    v = env_tick(e);
+    if (v >= 0.5) { ok = 0; }                      // must have started descending
+    if (v < 0.0)  { ok = 0; }                      // never overshoots below 0
+    env_free(e);
+
+    // ── Percussive shape (sustain 0) self-terminates at end of decay — no
+    // env_release call at all. attack 1 sample, decay 2 samples.
+    e = env_new(8.0);
+    env_set(e, 125.0, 250.0, 0.0, 100.0);
+    env_trigger(e);
+    v = env_tick(e);                              // attack -> 1.0, decay begins
+    if (myabs(v - 1.0) > 0.001) { ok = 0; }
+    v = env_tick(e);                              // decay 1/2 -> 0.5
+    if (myabs(v - 0.5) > 0.001) { ok = 0; }
+    if (env_is_active(e) != 1) { ok = 0; }
+    v = env_tick(e);                              // decay 2/2 -> 0, self-idles
+    if (myabs(v - 0.0) > 0.001) { ok = 0; }
+    if (env_is_active(e) != 0) { ok = 0; }         // idle without ever calling env_release
+    env_free(e);
+
+    if (ok) { put("stbenv: PASS\n"); } else { put("stbenv: FAIL\n"); }
+    return 0;
+}

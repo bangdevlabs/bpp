@@ -1,0 +1,191 @@
+// stbenv.bsm — an ADSR envelope generator: shapes a voice's amplitude over time.
+//
+// An envelope answers "how loud is this note right now" as a function of how
+// long ago it started and whether it has been released yet. Four stages:
+//   ATTACK  — ramps 0 -> 1 over attack_ms (the note's onset)
+//   DECAY   — ramps 1 -> sustain_level over decay_ms
+//   SUSTAIN — holds at sustain_level for as long as the note is held
+//   RELEASE — ramps from WHEREVER THE LEVEL CURRENTLY IS down to 0 over
+//             release_ms, started by env_release() regardless of which
+//             stage the note was in — this is what makes a release
+//             click-free even when a note is cut short during attack/decay.
+// A percussive shape (sustain_level = 0.0) self-terminates at the end of
+// DECAY instead of parking in SUSTAIN — a one-shot drum hit needs no
+// explicit env_release() call at all; it just finishes on its own.
+//
+// It is the single most reused "shape a signal over time, then return to
+// rest" primitive in a synth (docs/plans/audio_dsp_architecture.md): every
+// drum hit in kong_beat needs one (a decay envelope on osc/noise), and it
+// de-clicks stbmixer's tone voices, which previously cut to silence in
+// exactly one sample on note_off (stbmixer.bsm's own header used to flag
+// this as a known gap). Tier-1: depends on nothing, names no genre.
+//
+// Canonical use:
+//   auto e: Envelope;
+//   e = env_new(44100.0);
+//   env_set(e, 5.0, 80.0, 0.6, 150.0);   // 5ms attack, 80ms decay, 60% sustain, 150ms release
+//   env_trigger(e);                      // note-on
+//   ... per sample ...
+//   auto lvl: float;
+//   lvl = env_tick(e);                   // advance one sample, value in [0, 1]
+//   ... on note-off ...
+//   env_release(e);
+//   ... when the voice slot can be reused ...
+//   if (env_is_active(e) == 0) { /* fully idle, safe to reuse */ }
+//   env_free(e);
+//
+// `env_tick` advances exactly one sample-worth of time — call it once per
+// output sample, the same discipline stblfo's lfo_tick uses.
+
+// Pure leaf: no imports.
+
+const ENV_IDLE    = 0;   // at rest, level 0, not contributing to the mix
+const ENV_ATTACK  = 1;
+const ENV_DECAY   = 2;
+const ENV_SUSTAIN = 3;
+const ENV_RELEASE = 4;
+
+// One envelope instance. `level` is the current output [0,1]. `a_inc` /
+// `d_inc` are the per-sample level deltas for attack/decay, computed once
+// in env_set from the millisecond durations + the sample rate. `release_ms`
+// is stashed for later; `r_inc` is computed fresh in env_release from the
+// level AT THAT MOMENT, so release is click-free no matter which stage
+// triggered it.
+struct Envelope {
+    stage,
+    level: float,
+    a_inc: float,
+    d_inc: float,
+    sustain: float,
+    release_ms: float,
+    r_inc: float,
+    sr: float
+}
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_stbenv() { return 0; }
+
+// Allocate an envelope bound to `sample_rate`. Defaults to instant attack,
+// no decay, full sustain (effectively a pass-through gate until env_set is
+// called) — the caller owns the pointer and frees it with env_free.
+env_new(sample_rate: float) {
+    auto e: Envelope;
+    e = malloc(sizeof(Envelope));
+    e.stage      = ENV_IDLE;
+    e.level      = 0.0;
+    e.a_inc      = 1.0;
+    e.d_inc      = 0.0;
+    e.sustain    = 1.0;
+    e.release_ms = 1.0;
+    e.r_inc      = 1.0;
+    e.sr         = sample_rate;
+    return e;
+}
+
+// Configure the four stages. Times are in milliseconds; `sustain_level` is
+// the [0,1] plateau DECAY ramps toward and SUSTAIN holds at. A zero or
+// negative time is treated as 1 sample (instant) rather than divide-by-zero.
+void env_set(env: Envelope, attack_ms: float, decay_ms: float, sustain_level: float, release_ms: float) {
+    auto e: Envelope, a_samples: float, d_samples: float;
+    e = env;
+    a_samples = attack_ms / 1000.0 * e.sr;
+    if (a_samples < 1.0) { a_samples = 1.0; }
+    d_samples = decay_ms / 1000.0 * e.sr;
+    if (d_samples < 1.0) { d_samples = 1.0; }
+    e.a_inc      = 1.0 / a_samples;
+    e.d_inc      = (1.0 - sustain_level) / d_samples;
+    e.sustain    = sustain_level;
+    e.release_ms = release_ms;
+}
+
+// Start the envelope from ATTACK, beginning at level 0 — a fresh note
+// onset. Retriggering a still-held note is the caller's choice: call
+// env_trigger again to restart from 0 (this function), or leave the
+// envelope alone to keep sustaining.
+void env_trigger(env: Envelope) {
+    auto e: Envelope;
+    e = env;
+    e.stage = ENV_ATTACK;
+    e.level = 0.0;
+}
+
+// Start the RELEASE stage from whatever level the envelope is at RIGHT NOW
+// — click-free even if release happens mid-attack or mid-decay. Computes
+// r_inc fresh from the current level and the configured release_ms, so the
+// release always takes the same amount of TIME regardless of where it
+// started (a note released early ramps down just as fast per-sample as one
+// released from full sustain, just over a shorter total descent). No-op on
+// an already-idle envelope.
+void env_release(env: Envelope) {
+    auto e: Envelope, r_samples: float;
+    e = env;
+    if (e.stage == ENV_IDLE) { return; }
+    r_samples = e.release_ms / 1000.0 * e.sr;
+    if (r_samples < 1.0) { r_samples = 1.0; }
+    e.r_inc = e.level / r_samples;
+    e.stage = ENV_RELEASE;
+}
+
+// Advance one sample, return the new level in [0, 1].
+env_tick(env: Envelope) -> float {
+    auto e: Envelope;
+    e = env;
+    switch (e.stage) {
+        ENV_ATTACK {
+            e.level = e.level + e.a_inc;
+            if (e.level >= 1.0) { e.level = 1.0; e.stage = ENV_DECAY; }
+        }
+        ENV_DECAY {
+            e.level = e.level - e.d_inc;
+            if (e.level <= e.sustain) {
+                e.level = e.sustain;
+                // A percussive shape (sustain 0) self-terminates here — no
+                // explicit env_release() needed for a one-shot drum hit.
+                e.stage = e.sustain <= 0.0 ? ENV_IDLE : ENV_SUSTAIN;
+            }
+        }
+        ENV_RELEASE {
+            e.level = e.level - e.r_inc;
+            if (e.level <= 0.0) { e.level = 0.0; e.stage = ENV_IDLE; }
+        }
+        else { }   // SUSTAIN / IDLE — level holds, no change
+    }
+    return e.level;
+}
+
+// The current level WITHOUT advancing — read the envelope at this instant.
+env_value(env: Envelope) -> float {
+    auto e: Envelope;
+    e = env;
+    return e.level;
+}
+
+// 1 while the envelope is contributing anything to the mix (ATTACK/DECAY/
+// SUSTAIN/RELEASE), 0 once it has fully returned to IDLE. The check a voice
+// pool uses to decide "is this slot done, safe to reuse" — note-off starts
+// RELEASE, the slot stays alive until the tail finishes on its own.
+env_is_active(env: Envelope) {
+    auto e: Envelope;
+    e = env;
+    return e.stage != ENV_IDLE ? 1 : 0;
+}
+
+// 1 while the note is still HELD (ATTACK/DECAY/SUSTAIN — env_release has not
+// fired yet), 0 once RELEASE has started or the envelope is idle. Distinct
+// from env_is_active: a releasing voice is still active (audible) but no
+// longer held. The check a voice pool uses to decide "is a new press of the
+// same key still the same sustaining note, or should it retrigger" — see
+// stbmixer.bsm's mixer_note_on.
+env_is_held(env: Envelope) {
+    auto e: Envelope;
+    e = env;
+    if (e.stage == ENV_ATTACK)  { return 1; }
+    if (e.stage == ENV_DECAY)   { return 1; }
+    if (e.stage == ENV_SUSTAIN) { return 1; }
+    return 0;
+}
+
+// Free an envelope allocated by env_new.
+void env_free(env) {
+    free(env);
+}

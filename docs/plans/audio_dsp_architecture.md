@@ -93,7 +93,13 @@ An 8/16-bit drum machine = a **step sequencer** over **synthesised drum voices**
    should be float internally", which then surfaced "so should the device
    wire underneath it."
 3. **`stbenv` + noise** — with `kong_beat` (the next instrument), which also
-   de-clicks `mini_synth`. Next up.
+   de-clicks `mini_synth`. **`stbenv` ✅ SHIPPED 2026-06-21** (ADSR, Tier-1,
+   `tests/test_stbenv.bpp`) **and the de-click consumer is live**:
+   `mixer_note_off` now releases through a short envelope instead of cutting
+   instantly (`stb++_lib.md` §30.1c). **Noise is NOT shipped** — still parked
+   for when `kong_beat`'s voices are actually built, per the original call
+   below; `kong_beat` itself (the step sequencer + drum voices) has not
+   started.
 4. Graduate **`stbrotary`** (Tier 2) when `tiny_lofi` takes the rotary as a
    channel insert (the 2nd consumer).
 

@@ -14051,3 +14051,30 @@ is still zero. Net effect: programs that never touch the knob play unchanged;
 programs that do — including `audio_mute()`, previously inert for
 `stbmixer`-based audio — now actually work. Full suite re-verified 195/0/12,
 `test_mixer_stream`/`test_audio_tone` both pass against the real device.
+
+Closed out the day by moving to item 3 of `audio_dsp_architecture.md`:
+**`stbenv`, the ADSR primitive, shipped** — a Tier-1 leaf (`stb/stbenv.bsm`,
+no imports), the same four-stage shape every synth envelope has, designed so
+one detail serves two different consumers without extra code: a percussive
+shape (`sustain_level = 0.0`) self-terminates at the end of DECAY with no
+`env_release()` call at all (what a one-shot `kong_beat` drum hit wants),
+while a held shape sustains until explicitly released (what `mini_synth`
+wants). Release always computes its per-sample step from the envelope's
+*current* level, not from full sustain, so releasing mid-attack is exactly
+as click-free as releasing from a held note — this is what actually
+de-clicks `stbmixer`: `mixer_note_off` now calls `env_release` instead of
+slamming `_mx_voice_active[i]` to 0 (the literal cut stbmixer's own header
+comment had flagged for months as a known gap). One real design wrinkle
+surfaced wiring it in: a voice slot now stays "active" through its ~15ms
+release tail instead of dying the instant `note_off` fires, so re-pressing
+the same key while that tail is still ringing needed its own rule
+(`env_is_held` — distinct from `env_is_active` — lets `mixer_note_on` tell
+"still sustained" apart from "already releasing" and retrigger the same
+slot instead of leaving a stale tail orphaned). That same distinction broke
+`test_mixer_stream.bpp`'s `active_after == 0` assertion, which used to be
+true the instant `note_off` returned and now needs the release tail driven
+through `mixer_stream` first — fixed in the test, not papered over. Noise
+and `kong_beat` itself stay exactly as parked in the architecture plan: no
+named consumer has built the voices yet, so per Rule 28 there is nothing to
+extract speculatively. Verified: suite 197/0/12, `bench_compile.sh`
+unchanged (0.24s bootstrap), `mini_synth` recompiled clean.

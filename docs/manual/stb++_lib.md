@@ -763,6 +763,46 @@ no shipped instrument calls `mixer_set_rotary` yet — it is proven headless via
 `mini_synth` or any other consumer; see `docs/plans/audio_dsp_architecture.md`
 item 2.
 
+### §30.1c — De-click: an ADSR envelope on every tone voice
+
+`mixer_note_off` used to cut a tone voice to silence in exactly one sample —
+the gap stbmixer's own header used to flag explicitly ("Release is
+instantaneous... An ADSR envelope is a future slice"). It now releases
+through a short envelope from `stb/stbenv.bsm` (Tier-1, item 3 of
+`docs/plans/audio_dsp_architecture.md` — the same primitive `kong_beat` will
+reuse for every drum hit, not yet built):
+
+```c
+auto e: Envelope;
+e = env_new(sample_rate);
+env_set(e, attack_ms, decay_ms, sustain_level, release_ms);
+env_trigger(e);              // note-on: ATTACK from 0
+auto lvl: float;
+lvl = env_tick(e);            // call once per sample, value in [0,1]
+env_release(e);               // note-off: RELEASE from whatever level it's at NOW
+env_is_active(e);             // 0 once RELEASE finishes — safe to reuse the slot
+env_is_held(e);                // 0 once release has started, even though still active
+```
+
+The shape stbmixer applies today is fixed (2ms attack, 2ms decay, full
+sustain, 15ms release) — fast enough to be felt only as "no more click," not
+as a deliberate articulation; not yet exposed as a per-voice API. Because
+release is computed from the envelope's *current* level rather than always
+from full sustain, releasing mid-attack or mid-decay is click-free too, not
+just releasing from a held sustain.
+
+This changed `mixer_note_off`'s contract: a voice slot stays
+`mixer_active_voices`-active for the ~15ms release tail instead of going
+inactive the instant `mixer_note_off` is called. Code that checks
+`mixer_active_voices() == 0` immediately after `mixer_note_off` needs to
+drive `mixer_fill`/`mixer_stream` for at least that long first (see
+`tests/test_mixer_stream.bpp` for the pattern). Re-pressing the same key
+while its previous voice is still in that release tail retriggers the same
+slot (a fresh `ATTACK` from 0) rather than starting a second voice or
+leaving the tail to ring out unrelated to the new press —
+`env_is_held(env)` is what `mixer_note_on` checks to tell "still sustained"
+apart from "already releasing."
+
 ### §30.2 — Bus operations
 
 Three named buses are defined at init: `MX_BUS_MASTER`, `MX_BUS_MUSIC`,
