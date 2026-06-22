@@ -171,7 +171,7 @@ main() {
     // Pre-allocated scratch buffer for the fill→push→record loop.
     // 1024 frames = one CoreAudio buffer worth. Avoids malloc/free
     // per frame which was causing kernel-call jitter.
-    _sk_fill_buf = malloc(1024 * 4);
+    _sk_fill_buf = malloc(1024 * 8);
 
     init_beat();
     audio_open(4096);
@@ -254,13 +254,26 @@ main() {
         // _sk_fill_buf is pre-allocated once.
         space = audio_ring_space();
         while (space >= 1024) {
-            auto produced, pushed, bi, batch;
+            auto produced, pushed, batch;
             batch = 1024;
             produced = mixer_fill(_sk_fill_buf, batch);
             pushed = audio_push_frames(_sk_fill_buf, produced);
             if (_sk_recording && _sk_rec_pos + produced * 4 <= _sk_rec_cap) {
-                for (bi = 0; bi < produced * 4; bi++) {
-                    poke(_sk_rec_buf + _sk_rec_pos + bi, peek(_sk_fill_buf + bi));
+                // _sk_fill_buf holds float32 frames (mixer_fill's wire
+                // format, docs/plans/audio_float_device_boundary.md) but
+                // the WAV file on disk stays s16 PCM — convert sample by
+                // sample here, at the recording boundary, same discipline
+                // as every other s16-on-disk interchange point.
+                auto fi, lf: float, rf: float, ls: word, rs: word;
+                for (fi = 0; fi < produced; fi++) {
+                    lf = peekfloat_h(_sk_fill_buf + fi * 8 + 0);
+                    rf = peekfloat_h(_sk_fill_buf + fi * 8 + 4);
+                    ls = lf * 32767.0;
+                    rs = rf * 32767.0;
+                    poke(_sk_rec_buf + _sk_rec_pos + fi * 4 + 0,  ls       & 0xff);
+                    poke(_sk_rec_buf + _sk_rec_pos + fi * 4 + 1, (ls >> 8) & 0xff);
+                    poke(_sk_rec_buf + _sk_rec_pos + fi * 4 + 2,  rs       & 0xff);
+                    poke(_sk_rec_buf + _sk_rec_pos + fi * 4 + 3, (rs >> 8) & 0xff);
                 }
                 _sk_rec_pos += produced * 4;
             }

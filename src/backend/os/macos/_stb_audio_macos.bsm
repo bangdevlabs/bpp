@@ -69,8 +69,10 @@ global _aud_cb_count;
 // ── Iteration 4: SPSC sample ring ────────────────────────────────
 //
 // The producer lives on the main thread; the consumer is the
-// CoreAudio realtime callback. Frames are stereo s16 = 4 bytes each,
-// stored in a power-of-two capacity buffer so index wrap is a bitmask.
+// CoreAudio realtime callback. Frames are stereo float32 = 8 bytes each
+// (docs/plans/audio_float_device_boundary.md — Core Audio's own canonical
+// format), stored in a power-of-two capacity buffer so index wrap is a
+// bitmask.
 //
 // Index discipline (standard SPSC):
 //   producer reads `_aud_ring_read`, writes samples at
@@ -83,7 +85,7 @@ global _aud_cb_count;
 // when indexing the storage buffer. That keeps "available frames =
 // write - read" unambiguous without ever needing to special-case the
 // post-wrap vs pre-wrap case.
-static extrn _aud_ring_data;     // byte buffer, _aud_ring_cap * 4 bytes
+static extrn _aud_ring_data;     // byte buffer, _aud_ring_cap * 8 bytes
 static extrn _aud_ring_cap;      // frame capacity (power of 2)
 static extrn _aud_ring_mask;     // cap - 1, precomputed
 global _aud_ring_write;          // producer-written frame counter
@@ -161,24 +163,27 @@ static void _aud_init_ffi() {
     _aud_fn_dispose        = dlsym(_aud_tb, "AudioQueueDispose");
 }
 
-// Build the AudioStreamBasicDescription that asks CoreAudio for 16-bit
-// signed PCM, stereo, interleaved, at 44.1 kHz. Writes 56 bytes
-// starting at `desc`. The sample rate field is an IEEE 754 double; we
-// hard-code its bit pattern (0x40E5888000000000 = 44100.0) rather than
-// relying on the B++ compiler to emit float literals as 64-bit doubles,
-// which it does not today — the earlier diagnostic run with the
-// `*desc = sr` approach dropped CoreAudio's buffer-refill cadence to
-// ~3 callbacks per second, consistent with a zero or subnormal sample
-// rate rather than 44100.
+// Build the AudioStreamBasicDescription that asks CoreAudio for 32-bit
+// float PCM, stereo, interleaved, at 44.1 kHz — Core Audio's own canonical
+// format (docs/plans/audio_float_device_boundary.md Part A: the HAL
+// processes in float internally regardless of what an app requests, so
+// asking for float instead of s16 removes a round-trip conversion rather
+// than adding one). Writes 56 bytes starting at `desc`. The sample rate
+// field is an IEEE 754 double; we hard-code its bit pattern
+// (0x40E5888000000000 = 44100.0) rather than relying on the B++ compiler to
+// emit float literals as 64-bit doubles, which it does not today — the
+// earlier diagnostic run with the `*desc = sr` approach dropped CoreAudio's
+// buffer-refill cadence to ~3 callbacks per second, consistent with a zero
+// or subnormal sample rate rather than 44100.
 static void _aud_fill_desc(desc) {
     _aud_poke_u64(desc +  0, 0x40E5888000000000);  // mSampleRate = 44100.0
     _aud_poke_u32(desc +  8, 0x6C70636D);          // mFormatID = 'lpcm'
-    _aud_poke_u32(desc + 12, 0x0C);                // kAudioFormatFlagIsSignedInteger | IsPacked
-    _aud_poke_u32(desc + 16, 4);                   // mBytesPerPacket (2 ch * 2 bytes)
+    _aud_poke_u32(desc + 12, 0x09);                // kAudioFormatFlagIsFloat | IsPacked
+    _aud_poke_u32(desc + 16, 8);                   // mBytesPerPacket (2 ch * 4 bytes)
     _aud_poke_u32(desc + 20, 1);                   // mFramesPerPacket
-    _aud_poke_u32(desc + 24, 4);                   // mBytesPerFrame
+    _aud_poke_u32(desc + 24, 8);                   // mBytesPerFrame
     _aud_poke_u32(desc + 28, 2);                   // mChannelsPerFrame (stereo)
-    _aud_poke_u32(desc + 32, 16);                  // mBitsPerChannel
+    _aud_poke_u32(desc + 32, 32);                  // mBitsPerChannel
     _aud_poke_u32(desc + 36, 0);                   // mReserved
 }
 
@@ -200,7 +205,8 @@ static void _aud_fill_desc(desc) {
 // no syscall beyond AudioQueueEnqueueBuffer, bounded execution time.
 // W026 fires if the compiler proves a callee violates the contract.
 static _aud_square_cb(user, queue, buffer)@safe {
-    auto cap, data, i, sample, phase, hp, amp, frames;
+    auto cap, data, i, phase, hp, amp, frames;
+    auto amp_f: float, sample_f: float;
 
     cap   = peek(buffer + 0) + peek(buffer + 1) * 256
           + peek(buffer + 2) * 65536 + peek(buffer + 3) * 16777216;
@@ -208,18 +214,20 @@ static _aud_square_cb(user, queue, buffer)@safe {
     phase = _aud_phase;
     hp    = _aud_half_period;
     amp   = _aud_amplitude;
+    // _aud_amplitude's public contract stays s16-style (0..32767) — the
+    // wire is float now, so the conversion happens once here, at the one
+    // point the gain is actually applied (same boundary-conversion
+    // discipline as docs/plans/audio_float_core_migration.md's
+    // mixer_set_voice_pan).
+    amp_f = amp / 32768.0;
 
-    // Each frame is 4 bytes (stereo s16). Emit the same sample on both
+    // Each frame is 8 bytes (stereo float32). Emit the same sample on both
     // channels so the tone is centered.
-    frames = cap / 4;
+    frames = cap / 8;
     for (i = 0; i < frames; i++) {
-        if (phase < hp) { sample = amp; } else { sample = 0 - amp; }
-        // Left channel (offset 0 of the frame).
-        poke(data + i * 4 + 0, sample & 0xff);
-        poke(data + i * 4 + 1, (sample >> 8) & 0xff);
-        // Right channel (offset 2 of the frame).
-        poke(data + i * 4 + 2, sample & 0xff);
-        poke(data + i * 4 + 3, (sample >> 8) & 0xff);
+        if (phase < hp) { sample_f = amp_f; } else { sample_f = 0.0 - amp_f; }
+        pokefloat_h(data + i * 8 + 0, sample_f);   // left
+        pokefloat_h(data + i * 8 + 4, sample_f);   // right
         phase++;
         if (phase >= hp + hp) { phase = 0; }
     }
@@ -253,7 +261,7 @@ static _aud_stream_cb(user, queue, buffer)@safe {
     cap   = peek(buffer + 0) + peek(buffer + 1) * 256
           + peek(buffer + 2) * 65536 + peek(buffer + 3) * 16777216;
     data  = *(buffer + 8);
-    frames = cap / 4;
+    frames = cap / 8;
 
     // Acquire the producer's published write index. The mem_barrier
     // guarantees every frame byte the producer wrote before advancing
@@ -264,21 +272,33 @@ static _aud_stream_cb(user, queue, buffer)@safe {
     avail       = local_write - local_read;
     if (avail > frames) { avail = frames; }
 
-    // Copy `avail` frames from the ring into the buffer.
+    // Copy `avail` frames from the ring into the buffer. Each frame is now
+    // 8 bytes (stereo float32) — still a pure byte copy, the callback never
+    // interprets the sample value, only widens the stride.
     for (i = 0; i < avail; i++) {
         ridx = (local_read + i) & _aud_ring_mask;
-        poke(data + i * 4 + 0, peek(_aud_ring_data + ridx * 4 + 0));
-        poke(data + i * 4 + 1, peek(_aud_ring_data + ridx * 4 + 1));
-        poke(data + i * 4 + 2, peek(_aud_ring_data + ridx * 4 + 2));
-        poke(data + i * 4 + 3, peek(_aud_ring_data + ridx * 4 + 3));
+        poke(data + i * 8 + 0, peek(_aud_ring_data + ridx * 8 + 0));
+        poke(data + i * 8 + 1, peek(_aud_ring_data + ridx * 8 + 1));
+        poke(data + i * 8 + 2, peek(_aud_ring_data + ridx * 8 + 2));
+        poke(data + i * 8 + 3, peek(_aud_ring_data + ridx * 8 + 3));
+        poke(data + i * 8 + 4, peek(_aud_ring_data + ridx * 8 + 4));
+        poke(data + i * 8 + 5, peek(_aud_ring_data + ridx * 8 + 5));
+        poke(data + i * 8 + 6, peek(_aud_ring_data + ridx * 8 + 6));
+        poke(data + i * 8 + 7, peek(_aud_ring_data + ridx * 8 + 7));
     }
 
-    // Pad the tail with silence (zero s16) when the producer is behind.
+    // Pad the tail with silence when the producer is behind. IEEE-754
+    // 0.0 is all-zero bits, so zero-filling raw bytes is still correct
+    // silence now that the wire is float.
     for (i = avail; i < frames; i++) {
-        poke(data + i * 4 + 0, 0);
-        poke(data + i * 4 + 1, 0);
-        poke(data + i * 4 + 2, 0);
-        poke(data + i * 4 + 3, 0);
+        poke(data + i * 8 + 0, 0);
+        poke(data + i * 8 + 1, 0);
+        poke(data + i * 8 + 2, 0);
+        poke(data + i * 8 + 3, 0);
+        poke(data + i * 8 + 4, 0);
+        poke(data + i * 8 + 5, 0);
+        poke(data + i * 8 + 6, 0);
+        poke(data + i * 8 + 7, 0);
     }
 
     // Publish the new read index. The mem_barrier ensures the
@@ -421,7 +441,7 @@ _stb_audio_get_amplitude() {
 
 // ── Iteration 4 public API — SPSC-driven streaming ───────────────
 //
-// Open the device with a ring of `cap_frames` stereo s16 slots.
+// Open the device with a ring of `cap_frames` stereo float32 slots.
 // `cap_frames` MUST be a power of two (the callback indexes via
 // `& mask`). Returns 0 on success, non-zero on any setup failure.
 //
@@ -438,13 +458,13 @@ _stb_audio_open(cap_frames) {
 
     _aud_ring_cap   = cap_frames;
     _aud_ring_mask  = cap_frames - 1;
-    _aud_ring_data  = malloc(cap_frames * 4);
+    _aud_ring_data  = malloc(cap_frames * 8);
     _aud_ring_write = 0;
     _aud_ring_read  = 0;
 
     // Zero the ring so callback reads return silence before the
     // producer pushes anything.
-    for (i = 0; i < cap_frames * 4; i++) {
+    for (i = 0; i < cap_frames * 8; i++) {
         poke(_aud_ring_data + i, 0);
     }
 
@@ -503,48 +523,46 @@ _stb_audio_ring_space() {
     return _aud_ring_cap - (_aud_ring_write - local_read);
 }
 
-// Push one stereo s16 frame to the ring. Returns 1 on success, 0 if
+// Push one stereo float32 frame to the ring. Returns 1 on success, 0 if
 // the ring is full (the producer should back off and retry). The
 // mem_barrier before publishing the new write index guarantees the
 // callback cannot observe the updated counter before the frame bytes
 // have actually landed in the buffer.
-_stb_audio_push_frame(left, right) {
+_stb_audio_push_frame(left: float, right: float) {
     auto widx, local_read;
     mem_barrier();
     local_read = _aud_ring_read;
     if (_aud_ring_write - local_read >= _aud_ring_cap) { return 0; }
 
     widx = _aud_ring_write & _aud_ring_mask;
-    poke(_aud_ring_data + widx * 4 + 0, left  & 0xff);
-    poke(_aud_ring_data + widx * 4 + 1, (left  >> 8) & 0xff);
-    poke(_aud_ring_data + widx * 4 + 2, right & 0xff);
-    poke(_aud_ring_data + widx * 4 + 3, (right >> 8) & 0xff);
+    pokefloat_h(_aud_ring_data + widx * 8 + 0, left);
+    pokefloat_h(_aud_ring_data + widx * 8 + 4, right);
 
     mem_barrier();
     _aud_ring_write++;
     return 1;
 }
 
-// Bulk push — copy `n` stereo s16 frames from `buf` into the ring.
-// Each frame in `buf` is 4 bytes (left lo, left hi, right lo, right
-// hi). Returns the number of frames actually accepted; fewer than
-// `n` means the ring filled mid-copy and the caller should spin
-// briefly and retry with the remainder. One mem_barrier sandwich
-// covers the entire batch so the callback can only observe the
-// updated write index after every byte is in place.
+// Bulk push — copy `n` stereo float32 frames from `buf` into the ring.
+// Each frame in `buf` is 8 bytes (left float32, right float32). Returns
+// the number of frames actually accepted; fewer than `n` means the ring
+// filled mid-copy and the caller should spin briefly and retry with the
+// remainder. One mem_barrier sandwich covers the entire batch so the
+// callback can only observe the updated write index after every byte is
+// in place. Still a pure byte copy — the producer already holds float
+// bits, so no conversion happens at this boundary.
 _stb_audio_push_frames(buf, n) {
-    auto local_read, space, f, widx, off;
+    auto local_read, space, f, widx, off, b;
     mem_barrier();
     local_read = _aud_ring_read;
     space = _aud_ring_cap - (_aud_ring_write - local_read);
     if (space > n) { space = n; }
     for (f = 0; f < space; f++) {
         widx = (_aud_ring_write + f) & _aud_ring_mask;
-        off  = f * 4;
-        poke(_aud_ring_data + widx * 4 + 0, peek(buf + off + 0));
-        poke(_aud_ring_data + widx * 4 + 1, peek(buf + off + 1));
-        poke(_aud_ring_data + widx * 4 + 2, peek(buf + off + 2));
-        poke(_aud_ring_data + widx * 4 + 3, peek(buf + off + 3));
+        off  = f * 8;
+        for (b = 0; b < 8; b++) {
+            poke(_aud_ring_data + widx * 8 + b, peek(buf + off + b));
+        }
     }
     mem_barrier();
     _aud_ring_write += space;

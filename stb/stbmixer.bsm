@@ -28,6 +28,7 @@
 // sampled playback plug in as new voice kinds later.
 
 import "stbaudio.bsm";
+import "stblfo.bsm";     // the rotary (Leslie) LFO modulation source
 
 // ── Configuration ──────────────────────────────────────────────
 // All set once inside mixer_init. Rule 1: static extrn for
@@ -54,10 +55,14 @@ static extrn _mx_voice_pos;      // arr[i] = sample frame position
 static extrn _mx_voice_frames;   // arr[i] = sample total frame count
 static extrn _mx_voice_bus;      // arr[i] = MX_BUS_* tag (routes to a volume bus)
 static extrn _mx_voice_loop;     // arr[i] = 1 if voice loops at end (music)
-static extrn _mx_voice_pan_l;    // arr[i] = left pan gain, fixed-point /1024
-static extrn _mx_voice_pan_r;    // arr[i] = right pan gain, fixed-point /1024
-                                 //   unity centre = 1024/1024 (identity — a
-                                 //   centred voice is byte-identical to the old
+static extrn _mx_voice_pan_l;    // arr[i] = left pan gain, float bits (0.0..1.0),
+                                 //   read/written via peekfloat/pokefloat —
+                                 //   the slot is still an 8-byte word buffer,
+                                 //   only the bit interpretation is float
+                                 //   (float-core migration S3).
+static extrn _mx_voice_pan_r;    // arr[i] = right pan gain, float bits (0.0..1.0)
+                                 //   unity centre = 1.0/1.0 (identity — a
+                                 //   centred voice is unchanged from the old
                                  //   mono path). Set via mixer_set_voice_pan.
 
 // Voice kinds — stored in _mx_voice_kind. MX_KIND_NONE means the
@@ -127,6 +132,10 @@ void mixer_init() {
     MX_BUS_SFX    = 2;
     _MX_BUS_COUNT = 3;
 
+    MX_ROTARY_OFF     = 0;
+    MX_ROTARY_CHORALE = 1;
+    MX_ROTARY_TREMOLO = 2;
+
     // Two extra voice slots reserved at the end: MUSIC always lives
     // on slot _MX_MAX_VOICES (index 8) so BGM can't be knocked out
     // by a flood of SFX. The slot beyond it is a spare for future
@@ -135,7 +144,7 @@ void mixer_init() {
     _MX_SAMPLE_RATE  = 44100;
     _MX_VOICE_AMP    = 8000;
     _MX_FILL_BUF_FRAMES = 512;
-    _MX_FILL_BUF     = buf_byte(_MX_FILL_BUF_FRAMES * 4);
+    _MX_FILL_BUF     = buf_byte(_MX_FILL_BUF_FRAMES * 8);
 
     // Phase D dogfood (2026-04-22): voice pool is 11 parallel arrays of
     // 10 word-slots each. Using arr_word + buf_fill instead of malloc
@@ -168,12 +177,13 @@ void mixer_init() {
     buf_fill(_mx_voice_frames, 0, _MX_MAX_VOICES * 8);
     buf_fill(_mx_voice_bus,    0, _MX_MAX_VOICES * 8);
     buf_fill(_mx_voice_loop,   0, _MX_MAX_VOICES * 8);
-    // Pan gains default to unity centre (1024/1024) — NOT zero — so an unpanned
-    // voice is byte-identical to the old mono path. (buf_fill can't seed 1024.)
+    // Pan gains default to unity centre (1.0/1.0 float) — NOT zero — so an
+    // unpanned voice is unchanged from the old mono path. (buf_fill can't seed
+    // a non-zero pattern, and the float bits for 1.0 aren't all-zero anyway.)
     auto pv;
     for (pv = 0; pv < _MX_MAX_VOICES; pv++) {
-        _mx_voice_pan_l[pv] = 1024;
-        _mx_voice_pan_r[pv] = 1024;
+        pokefloat(_mx_voice_pan_l + pv * 8, 1.0);
+        pokefloat(_mx_voice_pan_r + pv * 8, 1.0);
     }
 
     _mx_bus_vol = buf_word(_MX_BUS_COUNT);
@@ -198,8 +208,20 @@ void mixer_init() {
     _mx_master_vol    = 80;
     _mx_dirt          = 0;
     _mx_decim_counter = 0;
-    _mx_held_l        = 0;
-    _mx_held_r        = 0;
+    _mx_held_l        = 0.0;
+    _mx_held_r        = 0.0;
+
+    // Rotary starts OFF, motor at rest (0 Hz) — mixer_set_rotary glides it
+    // up. The LFO is bound to the same 44100 Hz timeline as the rest of the
+    // mixer (note the literal: passing the _MX_SAMPLE_RATE word variable
+    // here would hit E240 — a non-literal int can't silently widen to a
+    // float param; only a literal does, per Rule 12).
+    _mx_rotary_mode = MX_ROTARY_OFF;
+    _mx_rotary_lfo  = lfo_new(44100.0);
+    lfo_set(_mx_rotary_lfo, 0.0, LFO_SIN);
+    _mx_rotary_cur = 0.0;
+    _mx_rotary_tgt = 0.0;
+
     _mx_inited        = 1;
 }
 
@@ -522,21 +544,22 @@ void mixer_set_voice_volume(slot: word, amp: word) {
 // Set the stereo pan of a voice. `pan` is -1 (hard left) .. 0 (centre) .. +1
 // (hard right). A unity-centre balance law (centre = full gain both sides, the
 // far side tapers to 0) so an unpanned voice is unchanged — panning never
-// boosts, only attenuates one side. Gains are stored as fixed-point /1024 so the
-// per-sample mix stays integer (no float in the hot loop). Like voice volume,
-// the pan persists until changed; out-of-range slots are ignored.
+// boosts, only attenuates one side. Gains are stored as float bits (0.0..1.0,
+// the float-core migration's S3 — the mix loop is float now, so the gain IS
+// the multiplier, no fixed-point conversion needed). Like voice volume, the
+// pan persists until changed; out-of-range slots are ignored.
 void mixer_set_voice_pan(slot: word, pan: float) {
-    auto gl: word, gr: word;
+    auto gl: float, gr: float;
     if (slot < 0) { return; }
     if (slot >= _MX_MAX_VOICES) { return; }
     if (pan < -1.0) { pan = -1.0; }
     if (pan >  1.0) { pan =  1.0; }
-    gl = 1024;
-    gr = 1024;
-    if (pan > 0.0) { gl = (1.0 - pan) * 1024.0; }   // panned right → attenuate L
-    if (pan < 0.0) { gr = (1.0 + pan) * 1024.0; }   // panned left  → attenuate R
-    _mx_voice_pan_l[slot] = gl;
-    _mx_voice_pan_r[slot] = gr;
+    gl = 1.0;
+    gr = 1.0;
+    if (pan > 0.0) { gl = 1.0 - pan; }   // panned right → attenuate L
+    if (pan < 0.0) { gr = 1.0 + pan; }   // panned left  → attenuate R
+    pokefloat(_mx_voice_pan_l + slot * 8, gl);
+    pokefloat(_mx_voice_pan_r + slot * 8, gr);
 }
 
 // Read the current amplitude of a voice slot. Returns 0 if the
@@ -579,8 +602,42 @@ mixer_get_voice_volume_db(slot: word) {
 // low resolutions, now controllable.
 static extrn _mx_dirt;
 static extrn _mx_decim_counter;
-static extrn _mx_held_l;        // decimation sample-and-hold, left channel
-static extrn _mx_held_r;        // decimation sample-and-hold, right channel
+static extrn _mx_held_l: float;  // decimation sample-and-hold, left channel
+static extrn _mx_held_r: float;  // decimation sample-and-hold, right channel
+
+// Rotary (Leslie) — a global auto-pan on the master mix. The rotary LFO sweeps
+// an antiphase L/R swell (the unity-centre balance turns a pan sweep into the
+// classic rotating-speaker swirl + tremolo in one). Two speeds with an inertia
+// ramp: chorale (slow) and tremolo (fast); switching glides the rate, the
+// signature Leslie "wind-up". OFF bypasses entirely (no cost when off).
+static extrn MX_ROTARY_OFF;       // motor stopped — no pan modulation
+static extrn MX_ROTARY_CHORALE;   // slow rotation (~48 RPM)
+static extrn MX_ROTARY_TREMOLO;   // fast rotation (~400 RPM)
+
+static extrn _mx_rotary_mode;          // MX_ROTARY_OFF / CHORALE / TREMOLO
+static extrn _mx_rotary_lfo;           // an stblfo Lfo handle (the rotation)
+static extrn _mx_rotary_cur: float;    // current rate (Hz), glides toward target
+static extrn _mx_rotary_tgt: float;    // target rate (Hz) for the active speed
+
+// Set the Leslie rotary speed: MX_ROTARY_OFF / MX_ROTARY_CHORALE /
+// MX_ROTARY_TREMOLO. The rate never jumps — it glides toward the new target
+// inside mixer_fill, the same inertia a real Leslie motor has spinning up or
+// down. Out-of-range modes are ignored (current mode + rate keep playing).
+void mixer_set_rotary(mode: word) {
+    if (mode < MX_ROTARY_OFF) { return; }
+    if (mode > MX_ROTARY_TREMOLO) { return; }
+    _mx_rotary_mode = mode;
+    if (mode == MX_ROTARY_OFF) {
+        _mx_rotary_tgt = 0.0;
+    } else if (mode == MX_ROTARY_CHORALE) {
+        _mx_rotary_tgt = 0.8;   // chorale — slow swirl, ~48 RPM
+    } else {
+        _mx_rotary_tgt = 6.7;   // tremolo — fast spin, ~400 RPM
+    }
+}
+
+// Read the active rotary mode.
+mixer_get_rotary() { return _mx_rotary_mode; }
 
 void mixer_set_dirt(val: word) {
     if (val < 0)   { val = 0; }
@@ -590,35 +647,52 @@ void mixer_set_dirt(val: word) {
 
 mixer_get_dirt() { return _mx_dirt; }
 
-// Fill `buf` with `n` stereo s16 frames of the current mix. Writes
-// 4*n bytes — (left_lo, left_hi, right_lo, right_hi) per frame.
-// Returns n. Callers wanting to analyse or record raw samples use
-// this primitive directly; the streaming wrapper below uses it too.
+// Fill `buf` with `n` stereo float32 frames of the current mix. Writes
+// 8*n bytes — (left float32, right float32) per frame, Core Audio's own
+// canonical format (docs/plans/audio_float_device_boundary.md — Part 2 of
+// the float-core architecture). Returns n. Callers wanting to analyse or
+// record raw samples use this primitive directly; the streaming wrapper
+// below uses it too.
 //
-// Left and right channels carry the same mono sum — stereo panning
-// is a future slice. Tone voices synthesize a waveform per sample;
-// sample voices read two s16s (stereo) from their buffer; music
-// voices do the same but loop (or stop) at end-of-buffer.
+// The whole mix runs in float, -1.0..+1.0 full scale (the float-core
+// migration, docs/plans/audio_float_core_migration.md) — s16 only shows up
+// at the read of a sample/music buffer, which stays s16 on disk (the
+// interchange-format boundary); the final write to `buf` is float now,
+// straight through with no boundary conversion. Tone voices synthesize a
+// float waveform per sample; sample voices read two s16s (stereo) from
+// their buffer and normalize to float; music voices do the same but loop
+// (or stop) at end-of-buffer.
 mixer_fill(buf, n: word) {
-    auto f, v, sample, phase, hp, amp, period;
-    auto sn, tri, saw, sq, t, fader, si;
+    auto f, v, phase, hp, amp, period;
+    auto fader, si;
     auto kind, bus, bus_vol, sbuf, spos, sframes, left_s, right_s;
     auto master_bus_vol;
+    auto master_gain_f: float;
 
     fader = _mx_fader;
     master_bus_vol = _mx_bus_vol[MX_BUS_MASTER];
+    // master_vol/master_bus_vol stay the documented 0..100 percent API; the
+    // float fraction is derived once per fill call, not per-sample (same
+    // hoisting discipline as fader/master_bus_vol above).
+    master_gain_f = _mx_master_vol / 100.0 * (master_bus_vol / 100.0);
 
     for (f = 0; f < n; f++) {
-        auto left, right;
-        left  = 0;
-        right = 0;
+        auto left: float, right: float;
+        left  = 0.0;
+        right = 0.0;
         for (v = 0; v < _MX_MAX_VOICES; v++) {
             if (_mx_voice_active[v] == 0) { continue; }
 
             kind    = _mx_voice_kind[v];
             bus     = _mx_voice_bus[v];
             bus_vol = _mx_bus_vol[bus];
-            sample  = 0;
+
+            // Pan gain for this voice — float bits stored in the same 8-byte
+            // slot every other voice array uses, read via peekfloat (S3 of
+            // the float-core migration; see mixer_set_voice_pan).
+            auto pan_l_f: float, pan_r_f: float;
+            pan_l_f = peekfloat(_mx_voice_pan_l + v * 8);
+            pan_r_f = peekfloat(_mx_voice_pan_r + v * 8);
 
             if (kind == MX_KIND_TONE) {
                 hp     = _mx_voice_hp[v];
@@ -626,35 +700,42 @@ mixer_fill(buf, n: word) {
                 phase  = _mx_voice_phase[v];
                 period = hp + hp;
 
-                // Square: identical to _aud_square_cb in the tone test.
-                sq = phase < hp ? amp : 0 - amp;
+                auto amp_f: float;
+                amp_f = amp / 32768.0;
 
-                // Sine: 32-point table lookup from bpp_math, scaled.
+                auto (sn_f, tri_f, saw_f, sq_f, sample_f, t_f): float;
+
+                // Square: full-scale on/off.
+                sq_f = phase < hp ? 1.0 : 0.0 - 1.0;
+
+                // Sine: 32-point table lookup from bpp_math (fixed-point
+                // x1024), normalized to [-1, 1].
                 si = (phase * 32) / period;
                 if (si > 31) { si = 31; }
-                sn = math_sin(si) * amp / 1024;
+                sn_f = math_sin(si) / 1024.0;
 
-                // Triangle: ramp up first half, ramp down second half.
-                tri = phase < hp
-                    ? 0 - amp + (2 * amp * phase) / hp
-                    : 3 * amp - (2 * amp * phase) / hp;
+                // Triangle: ramp -1 -> +1 first half, +1 -> -1 second half.
+                tri_f = phase < hp
+                    ? 0.0 - 1.0 + phase * 2.0 / hp
+                    : 3.0 - phase * 2.0 / hp;
 
-                // Sawtooth: linear ramp -amp → +amp over the period.
-                saw = 0 - amp + (amp * phase) / hp;
+                // Sawtooth: linear ramp -1 -> +1 over the full period.
+                saw_f = 0.0 - 1.0 + phase * 2.0 / period;
 
-                // Crossfade between adjacent waveform pairs.
+                // Crossfade between adjacent waveform pairs (same shape as
+                // before, blending float waveforms instead of int).
                 //   0..256:   sine → triangle
                 //   256..512: triangle → sawtooth
                 //   512..768: sawtooth → square
                 if (fader <= 256) {
-                    t = fader;
-                    sample = (sn * (256 - t) + tri * t) / 256;
+                    t_f = fader;
+                    sample_f = (sn_f * (256.0 - t_f) + tri_f * t_f) / 256.0;
                 } else if (fader <= 512) {
-                    t = fader - 256;
-                    sample = (tri * (256 - t) + saw * t) / 256;
+                    t_f = fader - 256;
+                    sample_f = (tri_f * (256.0 - t_f) + saw_f * t_f) / 256.0;
                 } else {
-                    t = fader - 512;
-                    sample = (saw * (256 - t) + sq * t) / 256;
+                    t_f = fader - 512;
+                    sample_f = (saw_f * (256.0 - t_f) + sq_f * t_f) / 256.0;
                 }
 
                 // Advance phase by exactly 1 per sample — same
@@ -664,20 +745,15 @@ mixer_fill(buf, n: word) {
                 if (phase >= period) { phase = 0; }
                 _mx_voice_phase[v] = phase;
 
-                // Apply the SFX bus gain then fold the tone into L/R through
-                // the voice's pan gains (fixed-point /1024; unity centre keeps a
-                // mono voice equal in both). The percent scale must multiply
-                // before dividing so a sub-100 gain does not collapse
-                // to zero through integer division — `sample *= bus_vol / 100`
-                // would parse as `sample * (bus_vol / 100)` and silently
-                // mute every voice when bus_vol is, say, 80.
-                sample = sample * bus_vol / 100;
-                left  = left  + sample * _mx_voice_pan_l[v] / 1024;
-                right = right + sample * _mx_voice_pan_r[v] / 1024;
+                // Apply per-voice amplitude + the SFX bus gain, then fold
+                // into L/R through the voice's float pan gain.
+                sample_f = sample_f * amp_f * (bus_vol / 100.0);
+                left  = left  + sample_f * pan_l_f;
+                right = right + sample_f * pan_r_f;
 
             } else if (kind == MX_KIND_SAMPLE) {
-                // One-shot sample. Read one stereo s16 pair then
-                // advance position; deactivate at end of buffer.
+                // One-shot sample. Read one stereo s16 pair, normalize to
+                // float, then advance position; deactivate at end of buffer.
                 sbuf    = _mx_voice_buf[v];
                 spos    = _mx_voice_pos[v];
                 sframes = _mx_voice_frames[v];
@@ -688,10 +764,11 @@ mixer_fill(buf, n: word) {
                 if (left_s  >= 32768) { left_s  = left_s  - 65536; }
                 if (right_s >= 32768) { right_s -= 65536; }
 
-                left_s  = left_s  * bus_vol / 100;
-                right_s = right_s * bus_vol / 100;
-                left  = left  + left_s  * _mx_voice_pan_l[v] / 1024;
-                right = right + right_s * _mx_voice_pan_r[v] / 1024;
+                auto ls_f: float, rs_f: float;
+                ls_f = left_s  / 32768.0 * (bus_vol / 100.0);
+                rs_f = right_s / 32768.0 * (bus_vol / 100.0);
+                left  = left  + ls_f * pan_l_f;
+                right = right + rs_f * pan_r_f;
 
                 spos++;
                 if (spos >= sframes) {
@@ -713,10 +790,11 @@ mixer_fill(buf, n: word) {
                 if (left_s  >= 32768) { left_s  = left_s  - 65536; }
                 if (right_s >= 32768) { right_s = right_s - 65536; }
 
-                left_s  = left_s  * bus_vol / 100;
-                right_s = right_s * bus_vol / 100;
-                left  = left  + left_s  * _mx_voice_pan_l[v] / 1024;
-                right = right + right_s * _mx_voice_pan_r[v] / 1024;
+                auto ls_f: float, rs_f: float;
+                ls_f = left_s  / 32768.0 * (bus_vol / 100.0);
+                rs_f = right_s / 32768.0 * (bus_vol / 100.0);
+                left  = left  + ls_f * pan_l_f;
+                right = right + rs_f * pan_r_f;
 
                 spos++;
                 if (spos >= sframes) {
@@ -730,27 +808,73 @@ mixer_fill(buf, n: word) {
                 _mx_voice_pos[v] = spos;
             }
         }
-        // Master gain, per channel — per-program master_vol (synthkey-era) then
-        // the MASTER bus slider. Multiply before dividing (see the SFX bus-gain
-        // comment) so a sub-100 percent gain doesn't collapse to zero. A centred
-        // voice has left == right here, so the output is byte-identical to the
-        // old mono path; a panned voice carries a genuine stereo split.
-        left  = left  * _mx_master_vol / 100;   left  = left  * master_bus_vol / 100;
-        right = right * _mx_master_vol / 100;   right = right * master_bus_vol / 100;
-        if (left  >  32767)     { left  =  32767; }
-        if (left  < 0 - 32768)  { left  = 0 - 32768; }
-        if (right >  32767)     { right =  32767; }
-        if (right < 0 - 32768)  { right = 0 - 32768; }
 
-        // Dirt: bitcrush + decimation (sample-and-hold), applied per channel.
-        // The decimation counter is shared so both channels hold/release on the
-        // same tick (a single sample-and-hold rate across the stereo field).
+        // ── Master stage (float throughout — left/right are already float,
+        // no boundary conversion needed now that S2/S3 carry float all the
+        // way from the per-voice loop) ────────────────────────────────────
+
+        // Rotary (Leslie) — global auto-pan on the master sum, modulated by an
+        // stblfo tick. Bypassed at zero cost once OFF and the glide has
+        // settled back to a dead-still 0 Hz (the common case for programs
+        // that never call mixer_set_rotary).
+        if (_mx_rotary_mode != MX_ROTARY_OFF || _mx_rotary_cur != 0.0) {
+            // Glide the current rate toward the target — the motor's
+            // physical spin-up/spin-down (the Leslie "wind-up"). ~1.3s
+            // end-to-end across the full chorale<->tremolo span at this
+            // step size (inline literal — see Rule 12, const demotes
+            // float literals to 0).
+            if (_mx_rotary_cur < _mx_rotary_tgt) {
+                _mx_rotary_cur = _mx_rotary_cur + 0.0001;
+                if (_mx_rotary_cur > _mx_rotary_tgt) { _mx_rotary_cur = _mx_rotary_tgt; }
+            } else if (_mx_rotary_cur > _mx_rotary_tgt) {
+                _mx_rotary_cur = _mx_rotary_cur - 0.0001;
+                if (_mx_rotary_cur < _mx_rotary_tgt) { _mx_rotary_cur = _mx_rotary_tgt; }
+            }
+            lfo_set_rate(_mx_rotary_lfo, _mx_rotary_cur);
+
+            auto rm: float;
+            rm = lfo_tick(_mx_rotary_lfo);
+
+            // Same unity-centre pan law as mixer_set_voice_pan, a direct
+            // float gain.
+            auto rgl: float, rgr: float;
+            rgl = 1.0;
+            rgr = 1.0;
+            if (rm > 0.0) { rgl = 1.0 - rm; }
+            if (rm < 0.0) { rgr = 1.0 + rm; }
+            left  = left  * rgl;
+            right = right * rgr;
+        }
+
+        // Master gain, per channel — per-program master_vol (synthkey-era) then
+        // the MASTER bus slider, as one float fraction (master_gain_f, hoisted
+        // above the frame loop). A centred voice has left == right here, so the
+        // output stays unchanged from the old mono path; a panned voice carries
+        // a genuine stereo split.
+        left  = left  * master_gain_f;
+        right = right * master_gain_f;
+        if (left  >  1.0) { left  =  1.0; }
+        if (left  < 0.0 - 1.0) { left  = 0.0 - 1.0; }
+        if (right >  1.0) { right =  1.0; }
+        if (right < 0.0 - 1.0) { right = 0.0 - 1.0; }
+
+        // Dirt: bitcrush + decimation (sample-and-hold). A deliberate
+        // quantize-to-reduced-bit-depth-then-back-to-float detour (the real-
+        // bitcrusher-plugin shape) rather than the engine's base precision —
+        // the crush/decimate math itself is unchanged, just bracketed by the
+        // s16 <-> float conversion at this one effect. The decimation counter
+        // is shared so both channels hold/release on the same tick.
         if (_mx_dirt > 0) {
             auto crush, decim;
+            auto il: word, ir: word;
             crush = _mx_dirt * 8 / 256;
             if (crush > 0) {
-                left  = (left  >> crush) << crush;
-                right = (right >> crush) << crush;
+                il = left  * 32768.0;
+                ir = right * 32768.0;
+                il = (il >> crush) << crush;
+                ir = (ir >> crush) << crush;
+                left  = il / 32768.0;
+                right = ir / 32768.0;
             }
             decim = 1 + _mx_dirt * 15 / 256;
             _mx_decim_counter++;
@@ -763,10 +887,12 @@ mixer_fill(buf, n: word) {
             right = _mx_held_r;
         }
 
-        poke(buf + f * 4 + 0,  left        & 0xff);
-        poke(buf + f * 4 + 1, (left  >> 8) & 0xff);
-        poke(buf + f * 4 + 2,  right       & 0xff);
-        poke(buf + f * 4 + 3, (right >> 8) & 0xff);
+        // The wire boundary — float32 now (docs/plans/audio_float_device_
+        // boundary.md), Core Audio's own canonical format. `left`/`right`
+        // are already the exact values the device wants; no conversion
+        // needed here at all (Part 2 deletes a step Part 1 had to add).
+        pokefloat_h(buf + f * 8 + 0, left);
+        pokefloat_h(buf + f * 8 + 4, right);
     }
     return n;
 }

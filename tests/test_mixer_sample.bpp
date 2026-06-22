@@ -6,6 +6,9 @@
 //   3. Looping music wraps position to 0 at end-of-buffer
 //   4. Non-looping music deactivates at end-of-buffer
 //   5. Bus volumes clamp to 0..100
+//   9. A SAMPLE-kind voice respects float pan (float-core migration S4 —
+//      sample/music playback normalizes its s16 read to float before
+//      accumulating, same as every other voice kind)
 //
 // No audio device involved — everything runs through mixer_fill into
 // a scratch buffer that we read back.
@@ -38,7 +41,9 @@ main() {
     }
 
     // (2) mixer_fill 4 frames should drain it (pos advances past end).
-    out = malloc(16);
+    // `out` is float32 stereo frames now (docs/plans/audio_float_device_
+    // boundary.md) — sized for the largest fill call below (snd_frames*3).
+    out = malloc(snd_frames * 3 * 8);
     mixer_fill(out, snd_frames);
     if (mixer_active_voices() != 0) {
         putmsg("FAIL: sample should deactivate after end-of-buffer");
@@ -90,6 +95,31 @@ main() {
     mixer_set_bus_volume(99, 50);
     if (mixer_get_bus_volume(99) != 0) {
         putmsg("FAIL: out-of-range bus get should return 0");
+        return 1;
+    }
+
+    // (9) A SAMPLE voice respects float pan. Needs a non-silent buffer —
+    // the all-zero one above can't tell "panned" from "silent". Restore
+    // MX_BUS_SFX first — step (7) left it clamped to 0, and SAMPLE voices
+    // route to MX_BUS_SFX by default.
+    mixer_set_bus_volume(MX_BUS_SFX, 100);
+    auto pan_buf, pan_voice, (left, right): float;
+    pan_buf = malloc(snd_frames * 4);
+    for (i = 0; i < snd_frames; i++) {
+        poke(pan_buf + i*4 + 0, 0x00); poke(pan_buf + i*4 + 1, 0x40);  // L = 0x4000
+        poke(pan_buf + i*4 + 2, 0x00); poke(pan_buf + i*4 + 3, 0x40);  // R = 0x4000
+    }
+    pan_voice = mixer_play_sample(pan_buf, snd_frames);
+    mixer_set_voice_pan(pan_voice, 1.0);   // hard right
+    mixer_fill(out, snd_frames);
+    left  = peekfloat_h(out + 0);
+    right = peekfloat_h(out + 4);
+    if (left != 0.0) {
+        putmsg("FAIL: hard-right pan should silence L on a sample voice");
+        return 1;
+    }
+    if (right == 0.0) {
+        putmsg("FAIL: hard-right pan should leave R live on a sample voice");
         return 1;
     }
 

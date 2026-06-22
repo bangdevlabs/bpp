@@ -1,0 +1,86 @@
+// test_mixer_rotary.bpp — exercise the Leslie rotary on stbmixer.
+//
+// Covers:
+//   1. Rotary defaults to OFF — L/R stay identical (no pan, no modulation).
+//   2. mixer_set_rotary(CHORALE) eventually makes L diverge from R — proof
+//      the LFO-driven antiphase swell is alive.
+//   3. Out-of-range modes are ignored (mode + rate keep playing).
+//
+// No audio device involved — everything runs through mixer_fill into a
+// scratch buffer that we read back, same shape as test_mixer_sample.bpp.
+
+import "stbaudio.bsm";
+import "stbmixer.bsm";
+
+main() {
+    auto buf, n, i, slot, diverged, (left, right): float;
+
+    init_beat();
+    mixer_init();
+
+    // (1) Rotary defaults to OFF.
+    if (mixer_get_rotary() != MX_ROTARY_OFF) {
+        putmsg("FAIL: rotary should default to OFF");
+        return 1;
+    }
+
+    slot = mixer_note_on(1, 440);
+    if (slot < 0) {
+        putmsg("FAIL: note_on should grab a free slot");
+        return 1;
+    }
+
+    // (2) OFF — L/R must stay byte-identical (the bypass path).
+    // buf is float32 stereo frames now (docs/plans/audio_float_device_
+    // boundary.md), 8 bytes/frame.
+    n = 2000;
+    buf = malloc(n * 8);
+    mixer_fill(buf, n);
+    for (i = 0; i < n; i++) {
+        left  = peekfloat_h(buf + i * 8);
+        right = peekfloat_h(buf + i * 8 + 4);
+        if (left != right) {
+            putmsg("FAIL: rotary OFF should keep L==R at frame ");
+            putnum(i);
+            putline();
+            return 2;
+        }
+    }
+    free(buf);
+
+    // (3) CHORALE — the glide + LFO should eventually swing L away from R.
+    mixer_set_rotary(MX_ROTARY_CHORALE);
+    if (mixer_get_rotary() != MX_ROTARY_CHORALE) {
+        putmsg("FAIL: get_rotary should report CHORALE");
+        return 3;
+    }
+    n = 30000;
+    buf = malloc(n * 8);
+    mixer_fill(buf, n);
+    diverged = 0;
+    for (i = 0; i < n; i++) {
+        left  = peekfloat_h(buf + i * 8);
+        right = peekfloat_h(buf + i * 8 + 4);
+        if (left != right) { diverged = 1; break; }
+    }
+    if (diverged == 0) {
+        putmsg("FAIL: rotary CHORALE never made L diverge from R");
+        return 4;
+    }
+    free(buf);
+
+    // (4) Out-of-range mode is ignored — last valid mode keeps playing.
+    mixer_set_rotary(99);
+    if (mixer_get_rotary() != MX_ROTARY_CHORALE) {
+        putmsg("FAIL: out-of-range rotary mode should be ignored");
+        return 5;
+    }
+    mixer_set_rotary(0 - 1);
+    if (mixer_get_rotary() != MX_ROTARY_CHORALE) {
+        putmsg("FAIL: negative rotary mode should be ignored");
+        return 6;
+    }
+
+    putmsg("stbmixer: rotary passed");
+    return 0;
+}
