@@ -1,9 +1,11 @@
 // tl_timeline.bsm — clips arranged over time + the offline mix.
 //
-// A clip is a slice of an s16 mono buffer placed on a channel at a start frame.
-// This module owns the clip store and the render: a frame-outer, channel-inner
+// A clip is a slice of an s16 mono buffer placed on a channel at a start frame
+// (s16 stays the on-disk/source interchange format — see Clip below). This
+// module owns the clip store and the render: a frame-outer, channel-inner
 // mix that sums each channel's active clips, runs them through the channel
-// strip (tl_channel_process), and writes the master to a stereo s16 buffer.
+// strip (tl_channel_process), and writes the master to a stereo FLOAT32
+// buffer — Core Audio's own device-wire format, see tl_render's own header.
 
 // One clip: `len` frames of s16 mono `buf`, placed at `start` on the timeline.
 // `frames` is the buffer's own length, so a split clip can point part-way into
@@ -47,13 +49,27 @@ void tl_remove_clip(i) {
     arr_struct_remove(_tl_clips, i);
 }
 
-// Render `total_frames` of the whole arrangement into `out_buf` (stereo s16),
-// scaled by `master`. Frame-outer, channel-inner so each channel's stateful
-// filter sees consecutive samples.
+// Render `total_frames` of the whole arrangement into `out_buf` — STEREO
+// FLOAT32 (8 bytes/frame), scaled by `master`. Frame-outer, channel-inner
+// so each channel's stateful filter sees consecutive samples.
+//
+// Float32 is Core Audio's own device-wire format
+// (docs/plans/legacy/audio_float_device_boundary.md) — the same format
+// `stbaudio.audio_push_frames` has read since that migration shipped. This
+// function used to write s16 directly, which made `tl_gui_run`'s live
+// Play path (the only caller that ever fed this buffer straight to
+// `audio_push_frames`) a THIRD hand-rolled-wire-format bug of the exact
+// shape the migration's own "Found and fixed" list already named twice:
+// reinterpreting s16 integer bit patterns as IEEE-754 float32 decodes to
+// huge/NaN magnitudes — audible as harsh, ear-hurting broadband noise, not
+// a subtle glitch. `tl_export` converts to s16 itself, at the WAV
+// interchange-format boundary, the same place every other s16-on-disk
+// conversion in the repo happens (mini_synth's recording loop is the
+// other worked example).
 void tl_render(out_buf, total_frames, master: float) {
     auto t, tr, ci, nclips, cl: Clip;
     auto (master_l, master_r, ts, sf, chl, chr): float;
-    auto (rel, raw, si_l, si_r): word;   // word: the s16 results convert here (fcvtzs)
+    auto (rel, raw): word;
 
     tl_channel_reset_filters();
     nclips = arr_struct_count(_tl_clips);
@@ -81,13 +97,11 @@ void tl_render(out_buf, total_frames, master: float) {
             master_r += chr;
         }
         master_l *= master; master_r *= master;
-        si_l = master_l * 32767.0;                     // float -> s16
-        si_r = master_r * 32767.0;
-        if (si_l >  32767) { si_l =  32767; }
-        if (si_l < -32767) { si_l = -32767; }
-        if (si_r >  32767) { si_r =  32767; }
-        if (si_r < -32767) { si_r = -32767; }
-        write_u16(out_buf, t * 4 + 0, si_l);           // L
-        write_u16(out_buf, t * 4 + 2, si_r);           // R
+        if (master_l >  1.0)       { master_l =  1.0; }
+        if (master_l < 0.0 - 1.0)  { master_l = 0.0 - 1.0; }
+        if (master_r >  1.0)       { master_r =  1.0; }
+        if (master_r < 0.0 - 1.0)  { master_r = 0.0 - 1.0; }
+        pokefloat_h(out_buf + t * 8 + 0, master_l);    // L
+        pokefloat_h(out_buf + t * 8 + 4, master_r);    // R
     }
 }

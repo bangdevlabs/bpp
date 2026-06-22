@@ -1,10 +1,13 @@
 // tl_io.bsm — render the arrangement to disk, and import audio in.
 //
-// Export: the whole project is rendered to a stereo s16 buffer and written
-// as a 44100 Hz WAV via stbsound. Import: a WAV file is decoded via the same
-// stbsound path, then down-mixed to the mono s16 shape every Clip already
-// uses (docs/plans/tiny_lofi.md slice 6a) — tiny_lofi's clips are mono
-// sources panned into the stereo field (Track.stereo == 0, the same
+// Export: the whole project is rendered via tl_render (stereo FLOAT32, the
+// device-wire format) into a scratch buffer, then converted to stereo s16
+// for disk — the WAV interchange-format boundary, same conversion point
+// every other s16-on-disk write in the repo uses (mini_synth's recording
+// loop is the other worked example). Import: a WAV file is decoded via the
+// same stbsound path, then down-mixed to the mono s16 shape every Clip
+// already uses (docs/plans/tiny_lofi.md slice 6a) — tiny_lofi's clips are
+// mono sources panned into the stereo field (Track.stereo == 0, the same
 // convention `tl_channel_process` already documents), so down-mixing at
 // import time is not a compromise, it is the engine's existing convention
 // applied to a new source.
@@ -12,11 +15,22 @@
 // Render the whole project (`total_frames`, scaled by `master`) and write it
 // to `path` as a WAV.
 tl_export(path: ptr, total_frames, master: float) {
-    auto out;
-    out = malloc(total_frames * 4);     // stereo s16, 4 bytes per frame
-    tl_render(out, total_frames, master);
-    sound_save_wav(path, out, total_frames);
-    free(out);
+    auto out_f, out_s16, i, lf: float, rf: float, ls: word, rs: word;
+    out_f = malloc(total_frames * 8);     // stereo float32 — tl_render's native output
+    tl_render(out_f, total_frames, master);
+
+    out_s16 = malloc(total_frames * 4);   // stereo s16 — the WAV interchange format
+    for (i = 0; i < total_frames; i++) {
+        lf = peekfloat_h(out_f + i * 8 + 0);
+        rf = peekfloat_h(out_f + i * 8 + 4);
+        ls = lf * 32767.0;
+        rs = rf * 32767.0;
+        write_u16(out_s16, i * 4 + 0, ls & 0xFFFF);
+        write_u16(out_s16, i * 4 + 2, rs & 0xFFFF);
+    }
+    sound_save_wav(path, out_s16, total_frames);
+    free(out_f);
+    free(out_s16);
     return 0;
 }
 

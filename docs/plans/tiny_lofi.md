@@ -134,6 +134,42 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    GUI doesn't cache them). A per-channel mute toggle is still open, parked
    with the per-track mute note above (same underlying gap: `Track.muted`
    has no write path yet).
+
+   **Found and fixed 2026-06-22 — `tl_render` was feeding s16 bytes to a
+   float32 device wire.** Reported by the user after the slice-3 editing
+   fixes landed: "o audio que veio foi algo muito tosco... lago surreal,
+   doeu o ouvido" the moment Play was pressed. `tl_render` wrote stereo s16
+   (`write_u16`) into `_g_play_buf`, which `tl_gui_run`'s Play path then
+   handed straight to `audio_push_frames` — but that function has read
+   stereo **float32** (8 bytes/frame) since
+   `docs/plans/legacy/audio_float_device_boundary.md` shipped on 2026-06-21.
+   Reinterpreting s16 integer bit patterns as IEEE-754 float32 decodes to
+   huge/NaN magnitudes — exactly the "horrible modem noise" mechanism that
+   plan's own "Found and fixed" list already named twice
+   (`tests/test_audio_pipe.bpp`, and a silent `_aud_amplitude` no-op). This
+   was a **third** instance of the same bug shape: `tl_gui_run` was a third
+   hand-rolled `audio_push_frames` caller (bypassing `stbmixer`, like
+   `test_audio_pipe.bpp` did) that the original migration's grep-the-callers
+   sweep never matched, because `tiny_lofi` didn't exist yet when that sweep
+   ran. It went unnoticed for a full day because the headless `--render` /
+   `tl_export` path never touched `audio_push_frames` at all — only the
+   interactive Play button did, and apparently nobody had pressed it since
+   the float32 migration until right after slice 3 made the editor usable
+   enough to want to.
+
+   Fixed by making `tl_render` itself float32-native (`pokefloat_h`, 8
+   bytes/frame, clamped to [-1,1]) — the same wire format `stbmixer.
+   mixer_fill` already targets — and moving the s16-on-disk conversion into
+   `tl_export` (a dedicated pass, `peekfloat_h` → `*32767.0` → `write_u16`,
+   the same boundary-conversion shape `mini_synth`'s recording loop already
+   uses). **Verified, not assumed:** a sample-by-sample diff between the
+   pre-fix and post-fix EXPORT path (264,600 samples) found a max difference
+   of **1 LSB** — pure float32-precision rounding noise from the
+   `pokefloat_h`/`peekfloat_h` round-trip, confirming the conversion is
+   mathematically equivalent and the export path was never the broken one.
+   A dedicated probe pushed `tl_render`'s real output through the actual
+   CoreAudio device end-to-end: zero NaN/out-of-range samples, callback
+   ran, ring drained real frames. Bootstrap stable, suite 198/0/12.
 3. **Clips + tools — ✅ CLOSED 2026-06-22.** Scissors (`tl_clip_split`,
    non-destructive cut) ✅ DONE. WAV import ✅ SHIPPED (`tl_io.bsm`'s
    `tl_import_wav`/`tl_import_clip` — see slice 6a below for the detail; the
