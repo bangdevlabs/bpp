@@ -1,0 +1,85 @@
+// skip-c: native multi-value return banking (a64 x0..x7/d0..d7, x64 register window)
+// test_multi_return_inline.bpp — Inc 5 (docs/plans/inliner_arc.md): a
+// moog_taps-shaped multi-return leaf, written to pin correctness BEFORE
+// and AFTER classify_inlineable stops hard-rejecting ret_arity > 1
+// candidates (src/bpp_dispatch.bsm:6226). This file must pass against
+// today's compiler via the normal (non-inlined) call path — it is the
+// regression anchor: the eligibility relaxation must not change a single
+// computed value, only how the call is codegen'd.
+//
+// Self-verifying: each mismatch returns a distinct non-zero code so
+// run_all.sh's exit-code check names the failing case.
+
+// Mirrors stb/stbfilter.bsm's moog_taps shape: a struct-pointer param + a
+// float param, a 4-way float return, a leaf body (no nested calls, no
+// control flow) — exactly the candidate shape Inc 5 targets. `in` and `m`
+// are each used once, same as the real moog_taps (the float param alone
+// is what forces tier 2 / the bind path, per classify_inlineable's
+// has_float_param rule — not a multi-use-param concern here).
+struct St { base: float }
+
+taps(m, in: float) -> (float, float, float, float) {
+    auto mm: St, a: float, b: float, c: float, d: float;
+    mm = m;
+    a = in + mm.base;
+    b = a * 2.0;
+    c = b + 1.0;
+    d = c * 0.5;
+    return a, b, c, d;
+}
+
+// A second shape with a MULTI-USE float param (in appears twice) — the
+// other half of the tier-2 bind contract (re-evaluating a side-effecting
+// arg twice would be wrong; binding to a temp once is what tier 2 buys).
+taps_multiuse(m, in: float) -> (float, float, float, float) {
+    auto mm: St, a: float, b: float, c: float, d: float;
+    mm = m;
+    a = in + in;            // multi-use: in read twice
+    b = a + mm.base;
+    c = b * 2.0;
+    d = c - 1.0;
+    return a, b, c, d;
+}
+
+main() {
+    auto m: St, i, a: float, b: float, c: float, d: float;
+    m = malloc(8);
+    m.base = 10.0;
+
+    // Cold call site (not in a loop) — tier 2 inlines everywhere, not
+    // just hot sites (that's tier 3's job, for a DIFFERENT gate).
+    a, b, c, d = taps(m, 5.0);
+    if (a != 15.0) { return 1; }   // 5 + 10
+    if (b != 30.0) { return 2; }   // 15 * 2
+    if (c != 31.0) { return 3; }   // 30 + 1
+    if (d != 15.5) { return 4; }   // 31 * 0.5
+
+    // Hot call site (in a loop) — varying input each iteration, proving
+    // the splice (once it lands) re-evaluates fresh args per call and
+    // never aliases state across iterations.
+    for (i = 0; i < 4; i++) {
+        auto inv: float;
+        inv = i;
+        a, b, c, d = taps(m, inv);
+        if (a != inv + 10.0)        { return 10 + i; }
+        if (b != (inv + 10.0) * 2.0) { return 20 + i; }
+    }
+
+    // The multi-use-param variant, cold site.
+    a, b, c, d = taps_multiuse(m, 3.0);
+    if (a != 6.0)  { return 30; }   // 3 + 3
+    if (b != 16.0) { return 31; }   // 6 + 10
+    if (c != 32.0) { return 32; }   // 16 * 2
+    if (d != 31.0) { return 33; }   // 32 - 1
+
+    // Same variant, hot site — multi-use binding must hold under the
+    // splice's per-iteration argument re-binding too.
+    for (i = 0; i < 3; i++) {
+        auto inv2: float;
+        inv2 = i + 1;
+        a, b, c, d = taps_multiuse(m, inv2);
+        if (a != inv2 + inv2) { return 40 + i; }
+    }
+
+    return 0;
+}

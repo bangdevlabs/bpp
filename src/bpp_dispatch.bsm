@@ -5406,7 +5406,21 @@ static _inline_count_nodes(nd) {
     // T_DECL stands alone (no child walk in cg_b3_walk:2710).
     T_ASSIGN   { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b); }
     T_MEMST    { sum += _inline_count_nodes(n.a) + _inline_count_nodes(n.b); }
-    T_RET      { sum += _inline_count_nodes(n.a); }
+    // Inc 5 (multi-value return inlining): a multi-return T_RET stores its
+    // expression list in n.b/n.c (n.a aliases n.b[0] — see parse_return,
+    // bpp_parser.bsm). Counting only n.a would silently undercount results
+    // 2..N, which could mask a real node-count cap violation on a future
+    // bigger multi-return candidate (moog_taps itself stays comfortably
+    // under the cap either way, but this helper must be correct in
+    // general, not just for moog_taps's specific shape).
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) { sum += _inline_count_nodes(arr[i]); }
+        } else {
+            sum += _inline_count_nodes(n.a);
+        }
+    }
     T_DECL     { return 1; }
     else { return 99; }
     }
@@ -5500,7 +5514,20 @@ static _inline_has_tcall(nd) {
     // S4 P1 statement extensions.
     T_ASSIGN   { return _inline_has_tcall(n.a) || _inline_has_tcall(n.b); }
     T_MEMST    { return _inline_has_tcall(n.a) || _inline_has_tcall(n.b); }
-    T_RET      { return _inline_has_tcall(n.a); }
+    // Inc 5: a multi-return T_RET's results 2..N live in n.b, not n.a
+    // (n.a aliases n.b[0] only) — this gate is correctness-critical (a
+    // disqualifying call hiding in result 2..N must still disqualify the
+    // body), so it cannot just read n.a like the single-return case.
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) {
+                if (_inline_has_tcall(arr[i])) { return 1; }
+            }
+            return 0;
+        }
+        return _inline_has_tcall(n.a);
+    }
     T_DECL     { return 0; }
     else { return 0; }
     }
@@ -5529,7 +5556,16 @@ static _inline_param_refs(nd, name_p) {
     // S4 P1 statement extensions.
     T_ASSIGN   { sum = _inline_param_refs(n.a, name_p) + _inline_param_refs(n.b, name_p); }
     T_MEMST    { sum = _inline_param_refs(n.a, name_p) + _inline_param_refs(n.b, name_p); }
-    T_RET      { sum = _inline_param_refs(n.a, name_p); }
+    // Inc 5: see the matching comment in _inline_count_nodes — a
+    // multi-return T_RET's results 2..N live in n.b, not n.a.
+    T_RET {
+        if (n.c > 1) {
+            arr = n.b; cnt = n.c;
+            for (i = 0; i < cnt; i++) { sum += _inline_param_refs(arr[i], name_p); }
+        } else {
+            sum = _inline_param_refs(n.a, name_p);
+        }
+    }
     T_DECL     { return 0; }
     else { return 0; }
     }
@@ -6193,6 +6229,7 @@ void classify_inlineable() {
     auto i, fn_rec, body_arr, body_cnt, params, pcnt;
     auto last_stmt: Node, ret_stmt: Node, ret_expr, j, ok, refs;
     auto phase, body_cost, want_void, want_bind, was_guard, has_float_param;
+    auto ret_arity;
     while (arr_len(fn_inlineable) < func_cnt) {
         fn_inlineable = arr_push(fn_inlineable, 0);
     }
@@ -6220,10 +6257,14 @@ void classify_inlineable() {
         // contracts (allocator, syscall, real-time deadline,
         // safety verification) that inlining could weaken.
         if (phase != PHASE_BASE && phase != PHASE_AUTO && phase != PHASE_SOLO) { continue; }
-        // Multi-value-return functions are never inlined: the splice keeps
-        // a single result value and would drop the 2nd..Nth banked returns.
-        // (Read fn_ret_arity directly — set at parse time, always present.)
-        if (arr_get(fn_ret_arity, i) > 1) { continue; }
+        // Multi-value-return functions (Inc 5, docs/plans/inliner_arc.md):
+        // the old blanket reject here is gone. A multi-return candidate is
+        // allowed through ONLY when its trailing statement is a multi-return
+        // T_RET whose arity matches the signature exactly — checked below
+        // once last_stmt is available, right where the existing single-
+        // return "must end in T_RET" rule already lives. Read fn_ret_arity
+        // directly — set at parse time, always present.
+        ret_arity = arr_get(fn_ret_arity, i);
         fn_rec = funcs[i];
         body_arr = *(fn_rec + FN_BODY);
         body_cnt = *(fn_rec + FN_BCNT);
@@ -6233,7 +6274,9 @@ void classify_inlineable() {
         // place, so the checks below (and the binding splice) see a clean
         // single-return body. A normalised body is tagged tier 3 (hot-only) at
         // the end so a widely-used accessor (arr_struct_at) inlines only inside
-        // loops. Re-read body_cnt — the rewrite shrinks it from 2 to 1.
+        // loops. Re-read body_cnt — the rewrite shrinks it from 2 to 1. (A
+        // multi-return body never matches this pattern — the normaliser looks
+        // for a 2-statement if/return/return shape — so it's a safe no-op here.)
         was_guard = _inline_normalize_guard(fn_rec);
         body_cnt = *(fn_rec + FN_BCNT);
         // Last statement must be T_RET so the splice has an
@@ -6246,7 +6289,15 @@ void classify_inlineable() {
         // body splices as plain statements with no value. Any other function
         // that does not end in T_RET is rejected exactly as before.
         want_void = 0;
-        if (last_stmt.ntype != T_RET) {
+        if (ret_arity > 1) {
+            // Inc 5: a multi-return candidate must end in a matching
+            // multi-return T_RET. Anything else (early return, control flow
+            // around the return, arity mismatch) is rejected for this
+            // increment — narrowly scoped to the one trailing-multi-return
+            // shape the splice (Part C below) actually knows how to handle.
+            if (last_stmt.ntype != T_RET) { continue; }
+            if (last_stmt.c != ret_arity) { continue; }
+        } else if (last_stmt.ntype != T_RET) {
             if (arr_get(fn_void, i) == 0) { continue; }
             want_void = 1;
         }
@@ -6336,10 +6387,16 @@ void classify_inlineable() {
         // inlined at every call site.
         if (was_guard) {
             arr_set(fn_inlineable, i, 3);
-        } else if (want_bind || has_float_param) {
+        } else if (want_bind || has_float_param || ret_arity > 1) {
             // has_float_param forces tier 2 so a float param never takes the
             // fast substitute path (which can't convert the arg) — see the
-            // float-gate note above.
+            // float-gate note above. ret_arity > 1 forces tier 2 for the same
+            // reason: the fast substitute path's splice point is structurally
+            // single-value (it reads one result, not a result list) — a
+            // multi-return body must always go through the binding splice
+            // (cg_emit_inline_multi_assign, Part C of Inc 5), even when it
+            // would otherwise qualify for tier 1 on every other criterion
+            // (e.g. an all-int multi-return leaf with single-use params).
             arr_set(fn_inlineable, i, 2);
         } else {
             arr_set(fn_inlineable, i, 1);
@@ -6407,7 +6464,25 @@ ast_clone_subst(nd, params, pcnt, args) {
         cl.a = ast_clone_subst(orig.a, params, pcnt, args);
         cl.b = ast_clone_subst(orig.b, params, pcnt, args);
     }
-    T_RET   { cl.a = ast_clone_subst(orig.a, params, pcnt, args); }
+    // Inc 5: the blanket `cl.b = orig.b` copy above leaves a multi-return
+    // T_RET's expression array SHARED, UNSUBSTITUTED, with the original —
+    // alpha-renaming/arg-substitution would silently not happen for
+    // results 2..N (and result 1, since n.a aliases the ORIGINAL n.b[0],
+    // not the freshly-cloned one) while looking like it worked. Clone
+    // each element fresh, same shape as the T_CALL args-array clone above.
+    T_RET {
+        if (orig.c > 1) {
+            arr = orig.b; cnt = orig.c;
+            new_arr = buf_word(cnt);
+            for (i = 0; i < cnt; i++) {
+                new_arr[i] = ast_clone_subst(arr[i], params, pcnt, args);
+            }
+            cl.b = new_arr;
+            cl.a = new_arr[0];   // keep the parser's n.a/n.b[0] aliasing invariant
+        } else {
+            cl.a = ast_clone_subst(orig.a, params, pcnt, args);
+        }
+    }
     T_DECL  { }   // standalone, .a already copied above
     // Outlining P6 — control-flow types whose bodies are arrays of
     // statement nodes. Without these branches, the cloned T_IF /

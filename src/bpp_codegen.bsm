@@ -2947,22 +2947,31 @@ static _inline_param_is_written(body_arr, bcnt, pname) {
 // cg_emit_stmt, and (for value bodies) emits the trailing return expression into
 // acc; detects the void shape (last stmt not a T_RET) and emits all statements.
 // .bug range recording goes through the cur_text_pos chip primitive.
-cg_emit_inline_multi(call_node, fidx) {
+// Shared prelude for both inline-splice tail shapes (Inc 5 — single-value/
+// void via cg_emit_inline_multi, multi-value via cg_emit_inline_multi_assign):
+// binds/substitutes the callee's params, builds the rename map, and emits
+// every body statement except the last. Returns the rename map
+// (names_buf, args_buf, total_names — the caller's tail clones the trailing
+// statement's expression(s) through these) and the untouched last
+// statement node. The caller's tail owns freeing names_buf/args_buf once
+// done with them (mirrors the original single-function's own free()
+// sequence — this split changes no allocation lifetimes, only where the
+// code lives).
+_cg_inline_splice_prelude(call_node, fidx) -> (word, word, word, ptr) {
     auto cn: Node;
     auto callsite_id, inl_callee, inl_body, inl_bcnt;
     auto inl_params, inl_pcnt;
-    auto i, orig_p, args_arr;
+    auto i, args_arr;
     auto (mp_node, bind_lhs, bind_assign): Node;
     auto mangled_params_buf;
     auto locals_buf, mangled_locals_buf, locals_cnt;
     auto names_buf, args_buf, total_names;
-    auto si, cloned, ret_stmt: Node, ret_clone, final_ety;
-    auto pp: ChipPrimitives;
-    pp = cg_prim;
+    auto si, cloned, ret_stmt: Node;
+    auto arg_node: Node, arg_t;
+    auto bind_needed;
+    auto is_void_splice, last_emit;
     cn = call_node;
     callsite_id = cn.e;
-    auto _inl_s;
-    _inl_s = call(pp.cur_text_pos);   // .bug: text offset where this inlined body begins
     inl_callee = funcs[fidx];
     inl_body = *(inl_callee + FN_BODY);
     inl_bcnt = *(inl_callee + FN_BCNT);
@@ -3013,8 +3022,6 @@ cg_emit_inline_multi(call_node, fidx) {
     //    synth T_ASSIGN — the node dispatcher is expression-only
     //    and silently drops statement-typed nodes. Same pitfall as
     //    the body-prelude loop further down; see commit `6a7dcd5`.
-    auto arg_node: Node, arg_t;
-    auto bind_needed;
     bind_needed = buf_word(inl_pcnt + 1);
     i = 0;
     while (i < inl_pcnt) {
@@ -3077,7 +3084,6 @@ cg_emit_inline_multi(call_node, fidx) {
     //     the trailing T_RET's EXPRESSION as the call's value (into acc).
     //   * void body (falls off the end, no trailing T_RET): emit ALL bcnt
     //     statements; the call is in statement position so there is no value.
-    auto is_void_splice, last_emit;
     ret_stmt = inl_body[inl_bcnt - 1];
     is_void_splice = (ret_stmt.ntype != T_RET);
     if (is_void_splice != 0) {
@@ -3095,6 +3101,26 @@ cg_emit_inline_multi(call_node, fidx) {
         cg_emit_stmt(cloned);
         si++;
     }
+    free(locals_buf);
+    free(mangled_locals_buf);
+    free(mangled_params_buf);
+    free(bind_needed);
+    return names_buf, args_buf, total_names, ret_stmt;
+}
+
+// Single-value / void inline splice (Phase B2 + S4 P3b + VI-2 unified).
+// Thin wrapper over the shared prelude: binds args, splices every body
+// statement but the last, then finishes with the ONE shape this call site
+// expects — either no value (void splice) or the trailing T_RET's
+// expression evaluated into acc/d0, exactly as a real call would leave it.
+cg_emit_inline_multi(call_node, fidx) {
+    auto names_buf, args_buf, total_names, ret_stmt: Node;
+    auto pp: ChipPrimitives;
+    auto _inl_s, ret_clone, final_ety, is_void_splice;
+    pp = cg_prim;
+    _inl_s = call(pp.cur_text_pos);   // .bug: text offset where this inlined body begins
+    names_buf, args_buf, total_names, ret_stmt = _cg_inline_splice_prelude(call_node, fidx);
+    is_void_splice = (ret_stmt.ntype != T_RET);
     if (is_void_splice != 0) {
         // No value to leave in acc — the statement-context caller discards it.
         final_ety = 0;
@@ -3106,11 +3132,53 @@ cg_emit_inline_multi(call_node, fidx) {
     _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx);   // .bug: record this inlined range
     free(names_buf);
     free(args_buf);
-    free(locals_buf);
-    free(mangled_locals_buf);
-    free(mangled_params_buf);
-    free(bind_needed);
     return final_ety;
+}
+
+// Multi-value inline splice (Inc 5, docs/plans/inliner_arc.md) — the tail
+// for a multi-assign call site (`a, b, c, d = f();`) whose callee is
+// inline-eligible. Shares the same prelude as cg_emit_inline_multi (param
+// binding, body-statement splice); only the finish differs: instead of
+// leaving ONE value in acc, walk the trailing multi-return's result list
+// and store each cloned expression directly into its matching caller-side
+// target — no bank push/pop at all, because inlining eliminates the
+// function-call boundary those exist to cross in the first place. `targets`
+// is the multi-assign's target-node array (T_ASSIGN.c), `tcount` its count
+// (T_ASSIGN.d) — classify_inlineable's Inc 5 gate already guarantees
+// ret_stmt is a matching multi-return T_RET whenever this is reached, so
+// there is no void/single-value fallback to consider here.
+cg_emit_inline_multi_assign(call_node, fidx, targets, tcount) {
+    auto names_buf, args_buf, total_names, ret_stmt: Node;
+    auto pp: ChipPrimitives;
+    auto _inl_s, k, rexprs, rclone, rrty, tnode: Node, tvi, toff, tis_f;
+    pp = cg_prim;
+    _inl_s = call(pp.cur_text_pos);
+    names_buf, args_buf, total_names, ret_stmt = _cg_inline_splice_prelude(call_node, fidx);
+    rexprs = ret_stmt.b;
+    k = 0;
+    while (k < tcount) {
+        rclone = ast_clone_subst(*(rexprs + k * 8), names_buf, total_names, args_buf);
+        tnode = *(targets + k * 8);
+        tvi = cg_var_idx(tnode.a);
+        toff = arr_get(cg_var_off, tvi);
+        tis_f = cg_var_is_float(tvi);
+        rrty = call(pp.emit_node, rclone);
+        // Convert to the TARGET's declared type, same authority the
+        // existing real-call multi-assign unpack uses (bpp_codegen.bsm's
+        // T_ASSIGN n.d > 1 handler) — not the callee's declared return
+        // type, so both paths agree on who decides.
+        if (tis_f) {
+            if (rrty == 0) { call(pp.emit_promote_int_to_flt); }
+        } else {
+            if (rrty == 1) { call(pp.emit_demote_flt_to_int); }
+        }
+        call(pp.emit_store_var_typed, tvi, toff, tis_f);
+        k++;
+    }
+    _bug_inl_record(_inl_s, call(pp.cur_text_pos), fidx);
+    free(names_buf);
+    free(args_buf);
+    return 0;
 }
 
 // ── F.2.c: compute-in-place for pure float arithmetic trees ──────────
@@ -4316,6 +4384,30 @@ void cg_emit_stmt(nd) {
         // higher bank registers survive each store.
         if (n.d > 1) {
             auto targets, mk, tnode: Node, tvi, toff, tis_f, tbpos, tbj, tbn: Node, tbvi;
+            auto call_n: Node, fidx_m;
+
+            // Inc 5 (docs/plans/inliner_arc.md): if the callee is inline-
+            // eligible, splice instead of emitting a real call + unpacking
+            // banked registers — inlining means there is no ABI boundary
+            // to cross, so there is nothing to bank in the first place.
+            // Without this check, n.b below would still reach the generic
+            // T_CALL dispatch (the chip's single-value inline fast path),
+            // which only knows how to emit ONE result into acc and silently
+            // drops the rest — confirmed by direct testing before this
+            // check existed. `call_n.e > 0` mirrors the existing single-
+            // value inline check's own guard (the pre-reg walker must have
+            // stamped a callsite id; it already descends into every
+            // T_ASSIGN's n.b unconditionally, multi or not, so this fires
+            // correctly with no walker change needed).
+            call_n = n.b;
+            if (call_n.ntype == T_CALL) {
+                fidx_m = find_func_idx(call_n.a);
+                if (fidx_m >= 0 && arr_get(fn_inlineable, fidx_m) && call_n.e > 0) {
+                    cg_emit_inline_multi_assign(call_n, fidx_m, n.c, n.d);
+                    return 0;
+                }
+            }
+
             if (call(p.cap_multi_ret) == 0) {
                 diag_error(266);
                 diag_str("multi-value assignment needs register-bank support; this backend does not implement it (aarch64 and x86_64 do)");

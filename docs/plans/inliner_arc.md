@@ -198,12 +198,78 @@ the first bigger/widely-used target needs it.
   (`7ee452e7…`), gen2==gen3, 193/0/12 + 156/0/49, `--c` clean. T_CALL/nesting
   (the "1" architecture) remains the LAST piece, after Inc 5 + control-flow.
 
-- **Inc 5 — multi-value-return splice.** Inline `moog_taps` (4 banked returns →
-  4 result locals). Part of the coordinated filter-chain push.
+- **Inc 5 — multi-value-return splice. ✅ SHIPPED 2026-06-22, mechanism only —
+  zero measured tl_bench win, as predicted by item 2 above.** Lifted the
+  blanket `fn_ret_arity > 1` reject in `classify_inlineable`
+  (`bpp_dispatch.bsm:6226`) to a narrow shape check (trailing multi-return
+  T_RET, arity matching the signature, forced tier 2); fixed the T_RET-multi
+  blind spot in 4 AST helpers that previously read only `n.a` (the
+  single-return field) — `_inline_count_nodes`, `_inline_has_tcall`,
+  `_inline_param_refs`, and `ast_clone_subst` (the dangerous one: the
+  blanket field copy left a cloned multi-return's expression array SHARED,
+  unsubstituted, with the original — alpha-renaming would have silently not
+  happened for any result); split `cg_emit_inline_multi` into a shared
+  prelude (`_cg_inline_splice_prelude`) + two tails — the existing
+  single-value/void tail, and a new `cg_emit_inline_multi_assign` that
+  stores each cloned result directly into its caller-side target with NO
+  bank push/pop (inlining erases the call boundary banking exists to cross).
+  Added the caller-side dispatch check at the top of `T_ASSIGN`'s `n.d > 1`
+  handler (`bpp_codegen.bsm:4385`) — **necessary**, not optional: without it,
+  `n.b`'s generic `emit_node` dispatch was already routing a multi-return
+  call through the OLD single-value `cg_emit_inline_multi`, which silently
+  computed only the first result and left the rest reading garbage (caught
+  by direct testing before the check existed — exactly the failure mode the
+  arc's own "verify the bootstrapped compiler" lesson warns about, just one
+  call layer deeper).
+  **Verified mechanism correct** on a `moog_taps`-shaped synthetic leaf
+  (`tests/test_multi_return_inline.bpp`, no internal calls): disasm shows
+  the splice landing with zero `bl`s, B3-promoted float registers holding
+  the intermediates, correct values across cold + hot call sites and a
+  multi-use-param variant. 199/0/12 native, 160/0/51 C-emit (added
+  `skip-c` to this new test + to `test_stbrotary.bpp`, which was ALSO
+  hitting the pre-existing, unrelated C-backend multi-return-lowering gap
+  and had simply never been run through `run_all_c.sh` before — confirmed
+  via `git stash` that both failures reproduce identically on the
+  pre-Inc-5 compiler). Audio export md5 unchanged
+  (`f61fac72be5077a6e9ef9cae21dde2a1`). Binary +128 B.
+  **But `moog_taps` itself still doesn't inline into `moog_slope`/
+  `moog_tick`**: its SOURCE still literally calls `flt_onepole_tick` 4×
+  (stbfilter.bsm:76-79) — those are real `T_CALL` nodes in the AST, and
+  `_inline_has_tcall` walks the source AST, not the compiled output. That
+  the 4 calls themselves compile down to 0 `bl` (float-leaf, already
+  shipped) is irrelevant to THIS gate — it inspects what the callee's body
+  *says*, not what it *compiles to*. Confirmed by disasm (`moog_slope` still
+  shows a real `bl` + bank-pop sequence at the `moog_taps` call site) and by
+  re-measuring tl_bench: 15.39 ms min-of-5, statistically unchanged from the
+  15.29 ms pre-Inc-5 baseline. This is exactly item 2's prediction above,
+  now confirmed by measurement rather than assumed: the filter chain is
+  multi-gate-coupled, and Inc 5 alone — while a correct, necessary, tested
+  piece of the puzzle — was never going to move tl_bench by itself. The
+  remaining piece is the nested-inline architecture itemized in (1) above:
+  clone each inlinable callee body, stamp fresh callsite ids on the clone,
+  register the clone's slots in the OUTER frame, and let the splice consume
+  the pre-stamped clone — so a call to an already-inlinable callee (like
+  `flt_onepole_tick` inside `moog_taps`) stops disqualifying its caller.
 
-**Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number); Inc 3b
-took the first step (16.9 → 15.3). Next lever = float-leaf inlining (above). The
-remaining 4.5 → 2.2 ms is Frontier 2 (RegAlloc v2 / liveness, roadmap F.2).
+**Target:** ~16.6 → ~4.5 ms (the hand-inlined `tl_bench_flat` number, as it
+stood pre-rotary); Inc 3b took the first step (16.9 → 15.3), float-leaf the
+second (15.3 → 13.1 ms, *before* the rotary insert existed). The rotary
+(slice 5, 2026-06-22) then added its own per-sample `bl` back, and re-syncing
+`tl_bench`/`tl_bench_flat` to the real post-rotary, post-stereo project
+re-based the table at **15.29 ms (ours) / 5.06 ms (flat) / 3.26 ms (oracle)**
+— Inc 5 shipped the multi-return mechanism against THIS baseline and (as
+explained above) measured no movement: 15.29 → ~15.4 ms, noise. The flat/
+oracle pair is unaffected by Inc 5 either way (neither file calls
+`moog_taps`). Re-measure `ours` again once the nested-inline architecture
+lands — that's the piece that actually lets `moog_taps` (and `rotary_tick`,
+itself blocked the same way once it has a callee in scope) collapse into
+their callers. The gap past that point is Frontier 2 (RegAlloc v2 /
+liveness, roadmap F.2, `docs/plans/compiler_boost_roadmap.md`). Decision
+rule: re-measure `ours` vs `flat` after the nested-inline architecture ships
+— if `ours` is still far from `flat`, more inlining is the lever; if `ours`
+converges but `flat` stays ~1.5x behind `oracle`, disassemble `flat`'s hot
+loop first (accumulator-shuttle gap, cheap, vs. true register-pressure gap,
+the expensive CFG+liveness build) before picking which one to open.
 
 ## Discipline
 
