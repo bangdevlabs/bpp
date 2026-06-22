@@ -74,7 +74,7 @@ parked for when the mixer-strip slice below gets interactive write-back).
 `Track.muted` is in the schema but nothing reads it yet — `grep -rn "muted"
 tools/tiny_lofi/` is empty today. This is a *different* mechanism from the
 `stbaudio` session-level mute fixed the same day
-(`docs/plans/audio_float_device_boundary.md` — `_aud_amplitude`, one global
+(`docs/plans/legacy/audio_float_device_boundary.md` — `_aud_amplitude`, one global
 knob applied after everything is mixed): a tiny_lofi track mute is per-track,
 applied *inside* `tl_render`'s mixing loop, the same shape as `track.volume`
 above — `continue`/skip the track's contribution entirely (cheaper and more
@@ -127,18 +127,102 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    faders are visual only — interactive write-back to `track.volume` plus a
    mute toggle per channel (see the per-track mute note above) is not built
    yet.
-3. **Clips + tools** — import a WAV as a clip; draw clips as blocks; select;
-   drag to move; scissors to cut at the playhead; Ctrl+C / Ctrl+V.
-4. **Insert** — the Moog filter per track, cutoff/resonance in the channel
-   strip; render runs each track through its insert.
-5. **Live record** — capture the mini_synth voice into the armed track at the
-   playhead (needs realtime or a record-then-place flow).
-6. **Realtime playback** — the `@safe` callback streams the live mix; scrubbing
-   and play-while-edit.
+3. **Clips + tools** — partial. Scissors (`tl_clip_split`, non-destructive cut)
+   ✅ DONE. **Open:** WAV import (`tiny_lofi.bpp` still generates its test
+   project with `gen_sine`/`gen_saw` scaffolding, not real audio files), draw
+   clips as blocks, select, drag to move, Ctrl+C / Ctrl+V.
+4. **Insert (single)** — ✅ engine-level DONE: every `Track` already carries
+   one hardcoded Moog-filter slot (`tk.flt_on` / `tk.flt`,
+   `tl_channel_process` calls `moon_process`) and `tl_track_set` already takes
+   cutoff/reso/slope. **Open:** the channel-strip UI doesn't expose
+   cutoff/resonance controls yet (`tl_gui.bsm`'s mixer strip is fader-only).
+5. **Insert CHAIN + the `stbrotary` graduation (2026-06-22 addition).**
+   `tl_channel.bsm`'s own header comment already flagged this: "adding a
+   second insert plugin later means giving the channel a small chain instead
+   of one `flt` slot" — the Leslie/rotary ask is exactly that second plugin
+   arriving. Two parts, sequenced:
+   - **5a — generalize `Track`'s insert.** Replace the single `flt_on`/`flt`
+     pair with a small fixed-size ordered array of typed insert slots (kind +
+     handle), so a channel can carry **Moog → Rotary** (or any order) instead
+     of one hardcoded type. `tl_channel_process` walks the chain instead of
+     calling `moon_process` directly. Existing single-Moog channels keep
+     working — a chain of length 1 is today's behavior.
+   - **5b — extract the rotary's core out of `stbmixer`'s single global
+     instance into a per-instance unit.** Today `_mx_rotary_mode` /
+     `_mx_rotary_lfo` / `_mx_rotary_cur` / `_mx_rotary_tgt` are module-private
+     **globals** — exactly one rotary for the whole mixer
+     (`stb/stbmixer.bsm:642-649`). `stblfo`'s `lfo_new`/`lfo_set_rate`/
+     `lfo_tick` (which the global rotary already calls) is already
+     instance-based, so the extraction is mechanical: wrap the existing
+     mode/glide/tick/pan-law logic into a `Rotary` struct + `rotary_new()` /
+     `rotary_set_mode()` / `rotary_tick(r, l, r) -> (float, float)`, the same
+     shape as `moon_filter`'s `moon_new`/`moon_process`. This **is** the
+     `stbrotary` graduation `docs/plans/audio_dsp_architecture.md` names —
+     "graduate `stbrotary` (Tier 2) when `tiny_lofi` takes the rotary as a
+     channel insert (the 2nd consumer)." `stbmixer`'s own global rotary can
+     either stay as a thin wrapper over the new instanced core (one instance
+     owned by the mixer) or be retired in favor of every caller owning its
+     own — decide when wiring, not before; not a contract change either way.
+   - Both halves are useful independently of live recording — they apply to
+     every existing audio-clip channel today, no instrument-track work
+     required first.
+6. **Live record — open mini_synth inside a channel.** The mini-Cubase vision
+   from Part 2 above, now sized into two real sub-steps instead of one big
+   jump (mini_synth has no synth engine of its own — it is a keyboard UI +
+   record loop around `mixer_note_on`/`mixer_fill`, so neither step duplicates
+   DSP code):
+   - **6a — import-first (cheap, ships now).** Record a take in mini_synth
+     (already does this today, SPACE → `sound_save_wav`) → WAV-import (slice
+     3) drops it onto a track as a normal `Clip` → slice 5's insert chain
+     (Moog + Rotary) processes it like any other audio. Zero new engine work;
+     unblocks "plug the rotary on a recorded performance" immediately once
+     slices 3 and 5 land.
+   - **6b — live capture (the real thing).** `tiny_lofi` imports `stbmixer`
+     directly, drives `mixer_note_on`/`mixer_note_off` from the keyboard the
+     same way `mini_synth` does, and captures `mixer_fill`'s output into the
+     armed track's clip buffer at the playhead. A dedicated slice: arm state,
+     playhead-synced capture, record buffer lifecycle. This is the point
+     where a track stops being strictly "pre-rendered audio" and starts
+     behaving like an instrument track — but it still produces a normal
+     `Clip` at the end (recorded, not live-streamed), so it does NOT require
+     `tl_render` to become realtime. A true always-live instrument track
+     (re-synthesized from a stored note sequence on every render, never
+     baked to a clip) is a further-out idea, not scoped here — 6b already
+     delivers the "open mini_synth inside a track" feel.
+7. **Realtime playback** — the `@safe` callback streams the live mix; scrubbing
+   and play-while-edit. The big architectural jump (offline-render-then-play →
+   true realtime); do this last, once everything above already works offline.
 
 Slices 1–4 give a usable offline DAW: load sounds, arrange on 8 tracks, cut /
-copy / paste, set volumes, filter, export a WAV. Slices 5–6 add live recording
-and realtime feel.
+copy / paste, set volumes, filter, export a WAV. Slice 5 makes inserts
+stackable and lands the rotary. Slice 6 is the live-instrument feel. Slice 7
+is the realtime jump.
+
+### A separate, decoupled `@safe` step — ✅ SHIPPED 2026-06-22
+
+The dogfood backlog's `@safe` item (`docs/plans/audio_stereo_dogfood.md` Part
+A #2) targeted `stbmixer.mixer_fill` — the producer-side fill path mini_synth's
+main loop calls every ~23 ms to keep the SPSC ring fed for the real CoreAudio
+callback (`_aud_stream_cb`, already `@safe`) to drain. Annotated
+`mixer_fill(buf, n: word)@safe` directly (`stb/stbmixer.bsm`); the compiler's
+W026 call-graph walk found **zero violations on the first try** — `math_sin`
+(bpp_math), `env_tick`/`env_is_active` (stbenv), `lfo_set_rate`/`lfo_tick`
+(stblfo) are all pure-arithmetic Tier-1 leaves by design, confirming the
+inspection-based read was right, not just lucky. Verified: bootstrap stable,
+suite 197/0/12, and all three real consumers (`mini_synth`, `games/rhythm`,
+`games/snake/snake_maestro`) recompile clean with zero warnings — rebuilt and
+committed alongside. `mini_synth`'s RSS stayed flat (~68 MB, unrelated to the
+unbounded-RAM fix shipped the same day — this was a compiler-verification
+annotation, not a runtime change).
+
+mini_synth's own per-frame loop (`window_frame_step`/`draw_*`/`audio_push_frames`)
+stays unannotated on purpose — it is the main-thread orchestrator (IO, drawing,
+the ring producer), exactly the shape Tonify Rule 4 says should NOT carry
+`@safe`. The contract that matters lives one level down, in the function that
+actually generates samples — `mixer_fill` — which is now compiler-proven
+bounded. This was worth doing *before* slice 7 (the realtime jump): had W026
+found a violation, that would have been a latent bug worth fixing before
+building a live callback on top of the same code path.
 
 ## Where it lives
 
@@ -159,3 +243,13 @@ installed via the `stb/*.bsm` glob in install.sh) with two consumers:
 `examples/moog_demo.bpp` (the small read-it-in-one-sitting demo) and tiny_lofi.
 Built and authored in the BangDev studio stack (Bang 9) per the studio
 philosophy.
+
+## Cross-references
+- `docs/plans/audio_dsp_architecture.md` — the rotary/LFO/envelope layer map;
+  names the exact "tiny_lofi takes the rotary as a channel insert" moment
+  slice 5 above implements.
+- `docs/plans/audio_stereo_dogfood.md` — the `@safe` dogfood backlog item.
+- `docs/plans/legacy/audio_float_core_migration.md` /
+  `docs/plans/legacy/audio_float_device_boundary.md` — why `stbmixer`'s
+  `mixer_fill` and the device wire are float32 today (closed plans; this is
+  the engine slice 6b would drive directly).
