@@ -128,9 +128,14 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    mute toggle per channel (see the per-track mute note above) is not built
    yet.
 3. **Clips + tools** — partial. Scissors (`tl_clip_split`, non-destructive cut)
-   ✅ DONE. **Open:** WAV import (`tiny_lofi.bpp` still generates its test
-   project with `gen_sine`/`gen_saw` scaffolding, not real audio files), draw
-   clips as blocks, select, drag to move, Ctrl+C / Ctrl+V.
+   ✅ DONE. **WAV import ✅ SHIPPED 2026-06-22** (`tl_io.bsm`'s
+   `tl_import_wav`/`tl_import_clip` — see slice 6a below for the detail; the
+   `tiny_lofi.bpp` demo still ALSO keeps the `gen_sine`/`gen_saw` generators
+   for its two synthetic tracks, not because import didn't land but because
+   they're a convenient zero-dependency way to seed a deterministic demo
+   project — no change needed there). **Still open:** draw clips as blocks
+   (see the waveform/MIDI visualization note under slice 6 below — noted,
+   not built), select, drag to move, Ctrl+C / Ctrl+V.
 4. **Insert (single)** — ✅ engine-level DONE: every `Track` already carries
    one hardcoded Moog-filter slot (`tk.flt_on` / `tk.flt`,
    `tl_channel_process` calls `moon_process`) and `tl_track_set` already takes
@@ -185,12 +190,27 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    jump (mini_synth has no synth engine of its own — it is a keyboard UI +
    record loop around `mixer_note_on`/`mixer_fill`, so neither step duplicates
    DSP code):
-   - **6a — import-first (cheap, ships now).** Record a take in mini_synth
-     (already does this today, SPACE → `sound_save_wav`) → WAV-import (slice
-     3) drops it onto a track as a normal `Clip` → slice 5's insert chain
-     (Moog + Rotary) processes it like any other audio. Zero new engine work;
-     unblocks "plug the rotary on a recorded performance" immediately once
-     slices 3 and 5 land.
+   - **6a — import-first — ✅ SHIPPED 2026-06-22.** `tl_io.bsm` gained
+     `tl_import_wav(path) -> (ptr, word)` (loads via `sound_load_wav`,
+     down-mixes stbsound's always-stereo decode to the mono s16 shape every
+     `Clip` already uses — L+R averaged; this matches the engine's existing
+     "mono source panned into the field" convention, not a new compromise)
+     and `tl_import_clip(track, path, start)` (the one-call "drop a file on
+     a track" action: import + `tl_add_clip` together). **Verified, not
+     assumed:** a synthetic WAV with opposite-sign L/R (100, -100, 200,
+     -200, …) downmixes to exactly 0 every frame; an equal-L/R WAV (12345,
+     12345) downmixes losslessly back to 12345 — both adversarial enough to
+     catch a sign or averaging bug, not just "looked plausible." The
+     `tiny_lofi.bpp` demo now dogfoods the real round-trip: channel 2 saves
+     channel 0's dry bass to a real WAV file and imports it straight back as
+     a fresh clip, hard-panned left so it's audibly distinct — proving a
+     take recorded elsewhere (mini_synth's own SPACE → `sound_save_wav`, or
+     any external sample) becomes a normal `Clip` with zero special-casing,
+     and slice 5's insert chain (Moog + Rotary) processes it exactly like
+     any other audio with no extra wiring. Bootstrap stable, suite 198/0/12.
+     mini_synth's actual recordings remain stereo on disk — down-mixing
+     happens only at tiny_lofi's import boundary, not at mini_synth's
+     recording boundary.
    - **6b — live capture (the real thing).** `tiny_lofi` imports `stbmixer`
      directly, drives `mixer_note_on`/`mixer_note_off` from the keyboard the
      same way `mini_synth` does, and captures `mixer_fill`'s output into the
@@ -203,6 +223,20 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
      (re-synthesized from a stored note sequence on every render, never
      baked to a clip) is a further-out idea, not scoped here — 6b already
      delivers the "open mini_synth inside a track" feel.
+   - **6c — draw the clip's CONTENT in its timeline block (noted 2026-06-22,
+     not built).** Every shipped DAW draws *what's inside* a block, not just
+     a solid rectangle: an audio clip shows its waveform (min/max envelope
+     per pixel column — nobody renders every sample, the block is too
+     narrow), a MIDI/instrument clip shows its notes (a tiny piano-roll
+     silhouette, pitch → vertical position, duration → width). `tl_gui.bsm`
+     today draws clips as plain rectangles. This matters more once 6b lands
+     (an instrument-track block needs ITS OWN visual language, distinct from
+     an audio block, so a user can tell at a glance which track is which
+     kind) — flagged here so the need doesn't get lost, not scheduled. Likely
+     shape when it's time: precompute a per-clip min/max envelope at
+     import/record time (cheap, one pass, stored alongside the `Clip`) rather
+     than recomputing it from raw samples every redraw; a MIDI/note-block
+     needs the NoteEvent sequence 6b's design implies to exist first.
 7. **Realtime playback** — the `@safe` callback streams the live mix; scrubbing
    and play-while-edit. The big architectural jump (offline-render-then-play →
    true realtime); do this last, once everything above already works offline.

@@ -1,8 +1,13 @@
-// tl_io.bsm — render the arrangement to disk (and, later, import audio in).
+// tl_io.bsm — render the arrangement to disk, and import audio in.
 //
-// Today: export. The whole project is rendered to a stereo s16 buffer and
-// written as a 44100 Hz WAV via stbsound. Import (loading a WAV into a clip
-// buffer) lands with the clips slice.
+// Export: the whole project is rendered to a stereo s16 buffer and written
+// as a 44100 Hz WAV via stbsound. Import: a WAV file is decoded via the same
+// stbsound path, then down-mixed to the mono s16 shape every Clip already
+// uses (docs/plans/tiny_lofi.md slice 6a) — tiny_lofi's clips are mono
+// sources panned into the stereo field (Track.stereo == 0, the same
+// convention `tl_channel_process` already documents), so down-mixing at
+// import time is not a compromise, it is the engine's existing convention
+// applied to a new source.
 
 // Render the whole project (`total_frames`, scaled by `master`) and write it
 // to `path` as a WAV.
@@ -13,4 +18,42 @@ tl_export(path: ptr, total_frames, master: float) {
     sound_save_wav(path, out, total_frames);
     free(out);
     return 0;
+}
+
+// Load a WAV via stbsound and down-mix it to a mono s16 buffer (L+R
+// averaged — stbsound's decoder always normalizes to stereo internally,
+// even for a mono source file, so this one averaging pass covers both
+// cases). Returns (buf, frames); buf is 0 and frames is 0 on a load
+// failure (stbsound already printed the diagnostic). The caller owns the
+// returned buffer — same "never freed by the engine" convention every
+// other clip buffer already follows (gen_sine/gen_saw in tiny_lofi.bpp),
+// not a new gap this function introduces.
+tl_import_wav(path: ptr) -> (ptr, word) {
+    auto src_frames, src, mono, i, l, r, m;
+    src_frames = sound_load_wav(path);
+    if (src_frames < 0) { return 0, 0; }
+    src  = sound_buf();
+    mono = malloc(src_frames * 2);
+    for (i = 0; i < src_frames; i++) {
+        l = read_u16(src, i * 4 + 0);
+        if (l >= 32768) { l -= 65536; }
+        r = read_u16(src, i * 4 + 2);
+        if (r >= 32768) { r -= 65536; }
+        m = (l + r) / 2;
+        write_u16(mono, i * 2, m & 0xFFFF);
+    }
+    return mono, src_frames;
+}
+
+// Import `path` as a WAV and place it on `track` at timeline frame `start`,
+// playing the whole file — the one-call action a "drop a file on a track"
+// GUI gesture wants. Returns 1 on success, 0 on a load failure. Reach for
+// `tl_import_wav` directly instead when the caller needs the raw buffer
+// before placing it (e.g. trimming).
+tl_import_clip(track, path: ptr, start) {
+    auto buf, frames;
+    buf, frames = tl_import_wav(path);
+    if (buf == 0) { return 0; }
+    tl_add_clip(track, buf, frames, start, frames);
+    return 1;
 }
