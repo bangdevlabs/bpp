@@ -412,7 +412,7 @@ target-suffix resolution.
 
 On macOS the platform layer drives CoreAudio's AudioQueue with dlopen'd
 function pointers. The wire format is **float32** stereo frames
-(`docs/plans/audio_float_device_boundary.md`, 2026-06-21) — Core Audio's own
+(`docs/plans/legacy/audio_float_device_boundary.md`, 2026-06-21) — Core Audio's own
 canonical PCM shape, matching `stbmixer`'s internal float signal path (Cap 30,
 `audio_float_core_migration.md`); s16 only remains where it always should:
 the WAV-file interchange format (`stbsound.bsm`, Cap 31) and the ALSA-facing
@@ -716,7 +716,7 @@ voice sample
   → clipped to ±1.0 (float) → DAC
 ```
 
-The whole chain runs in float internally (`docs/plans/audio_float_core_migration.md`)
+The whole chain runs in float internally (`docs/plans/legacy/audio_float_core_migration.md`)
 — the four amplitude inputs above stay s16-style / percent / dB at the public
 API, exactly as documented; only the internal math and the final clip changed
 shape, from s16 to float. Conceptually, the four levels serve different roles:
@@ -982,7 +982,7 @@ voice sample
   × bus_vol / 100                              (mixer)
   × _mx_master_vol / 100                       (mixer)
   × master_bus_vol / 100                       (mixer)
-  → push to audio ring (float32, docs/plans/audio_float_device_boundary.md)
+  → push to audio ring (float32, docs/plans/legacy/audio_float_device_boundary.md)
   × _aud_amplitude / 32768                     (stbaudio, both callbacks)
   → DAC
 ```

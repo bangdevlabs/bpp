@@ -13967,7 +13967,7 @@ on top of the freshly-shipped `stblfo`). Wiring the rotary's float LFO tick into
 shouldn't this all be float?", was real doubt, not rhetorical, so the session
 turned into market research before any code: VST/AU/AAX, Ableton, Logic, and
 post-HDX Pro Tools are all float internal / fixed-point only at the wire.
-**`docs/plans/audio_float_core_migration.md`** (Part 1) shipped all four stages
+**`docs/plans/legacy/audio_float_core_migration.md`** (Part 1) shipped all four stages
 same day — oscillator, pan, master stage, and sample/music playback all run
 float now; s16 only remains at the WAV-read and (at the time) the final
 device-write boundaries. Suite 195/0/12 throughout, `mini_synth` ear-verified.
@@ -13995,7 +13995,7 @@ quantization round-trip Core Audio's own path doesn't have. WASAPI's shared-mode
 engine mixes in float32 unconditionally; PortAudio's own design notes say
 plainly that once a native API accepts float, passing it through unconverted is
 preferable; JACK's sample type is `float` everywhere. **Part 2,
-`docs/plans/audio_float_device_boundary.md`, shipped the same session**: the
+`docs/plans/legacy/audio_float_device_boundary.md`, shipped the same session**: the
 `AudioStreamBasicDescription` now asks for `kAudioFormatFlagIsFloat` (32-bit,
 8 bytes/frame), the SPSC ring carries float32, both CoreAudio callbacks and
 `stbaudio.bsm`'s public `audio_push`/`audio_push_frames` contract moved with it,

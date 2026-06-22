@@ -87,8 +87,8 @@ An 8/16-bit drum machine = a **step sequencer** over **synthesised drum voices**
    `tests/test_mixer_rotary.bpp`, proven headless) — **but `mini_synth` does
    not call it yet**, so the feature has no live consumer/keybinding today.
    Wiring that is the open part of this item. Triggered the float-core
-   sidequest (`docs/plans/audio_float_core_migration.md` +
-   `docs/plans/audio_float_device_boundary.md`, both shipped the same day) —
+   sidequest (`docs/plans/legacy/audio_float_core_migration.md` +
+   `docs/plans/legacy/audio_float_device_boundary.md`, both shipped the same day) —
    the rotary's float LFO tick was the friction that surfaced "the mixer
    should be float internally", which then surfaced "so should the device
    wire underneath it."
