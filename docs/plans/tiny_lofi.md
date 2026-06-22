@@ -120,22 +120,65 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    *This is the slice that tests the audio system — it does.*
 2. **GUI shell** — ✅ DONE (2026-06-18, `tl_gui.bsm`). Window + the timeline
    grid (8 lanes, a time ruler, a playhead) + a transport bar (Play / Stop /
-   Export, the buttons live) + a mixer strip (8 faders + master). Read-only
-   view of the model; Play renders the project once and streams it through the
-   audio device while the playhead follows the cursor. `./tl` opens the window;
-   `./tl --render` keeps the headless WAV path for CI. **Open follow-up:** the
-   faders are visual only — interactive write-back to `track.volume` plus a
-   mute toggle per channel (see the per-track mute note above) is not built
-   yet.
-3. **Clips + tools** — partial. Scissors (`tl_clip_split`, non-destructive cut)
-   ✅ DONE. **WAV import ✅ SHIPPED 2026-06-22** (`tl_io.bsm`'s
+   Export, the buttons live) + a mixer strip (8 faders + master). Play
+   renders the project once and streams it through the audio device while
+   the playhead follows the cursor. `./tl` opens the window; `./tl --render`
+   keeps the headless WAV path for CI. **Faders are now interactive ✅
+   SHIPPED 2026-06-22** (closes this slice's open follow-up): the lane
+   header's horizontal volume bar, the mixer strip's 8 vertical faders, and
+   the master bar all read mouse position while dragged and write back live
+   — `tl_channel.bsm` gained `tl_track_set_volume(tr, vol)` as a focused
+   setter (changes only `.vol`, leaving the insert chain and pan untouched —
+   routing this through the kitchen-sink `tl_track_set` would have forced
+   re-supplying flt_on/cutoff/reso/slope/pan on every drag frame, since the
+   GUI doesn't cache them). A per-channel mute toggle is still open, parked
+   with the per-track mute note above (same underlying gap: `Track.muted`
+   has no write path yet).
+3. **Clips + tools — ✅ CLOSED 2026-06-22.** Scissors (`tl_clip_split`,
+   non-destructive cut) ✅ DONE. WAV import ✅ SHIPPED (`tl_io.bsm`'s
    `tl_import_wav`/`tl_import_clip` — see slice 6a below for the detail; the
    `tiny_lofi.bpp` demo still ALSO keeps the `gen_sine`/`gen_saw` generators
    for its two synthetic tracks, not because import didn't land but because
    they're a convenient zero-dependency way to seed a deterministic demo
-   project — no change needed there). **Still open:** draw clips as blocks
-   (see the waveform/MIDI visualization note under slice 6 below — noted,
-   not built), select, drag to move, Ctrl+C / Ctrl+V.
+   project — no change needed there). Select / drag / copy-paste / delete
+   ✅ SHIPPED, in two passes (the first shipped select+drag+copy/paste; the
+   user then live-tested it and reported three real gaps, fixed in the
+   second pass):
+   - **Select + drag** (`_g_draw_lanes`): click a clip to select it (a thick
+     yellow 4-edge outline — the first version only drew 2 thin edges and
+     was too easy to miss, per the user's own report after testing) and
+     start a drag; the clip follows the mouse along the timeline (`start`)
+     and across lanes (`track`) until the button releases. Clicking empty
+     lane space deselects.
+   - **Copy/paste** (`_g_handle_clip_keys`): accepts EITHER Ctrl or Cmd/META
+     — the first version checked only `KEY_CTRL`, which silently did
+     nothing for a Mac user's muscle-memory ⌘C/⌘V (caught by the same
+     live-test). Paste places a new clip (sharing the source's buffer, the
+     same aliasing convention `tl_clip_split` already established) at the
+     current playhead, on the source's own track.
+   - **Delete** (same function, Delete or Backspace): removes the selected
+     clip. Needed a new prelude primitive — `bpp_arr.bsm` had push/at/count/
+     reset/free but no individual removal at all. Added
+     `arr_struct_remove(a, idx)` (swap-remove: the last live element moves
+     into the removed slot, O(1), order not preserved — right for an
+     unordered collection where only "is X still here" matters).
+     `tl_timeline.bsm` wraps it as `tl_remove_clip(i)`. Since `bpp_arr.bsm`
+     is in the COMPILER's own import graph (`bpp.bpp` imports it), this
+     change needed the full bootstrap cycle, not just a suite run — ran
+     clean (gen2==gen3==gen4).
+   - **Click-to-seek** (`_g_draw_ruler` + the empty-lane-click case in
+     `_g_draw_lanes`): clicking the ruler or empty timeline space moves the
+     playhead there — the third gap the live-test caught ("clico na
+     timeline e o marcador não sai do tempo zero"). This was never built in
+     the first pass, not a regression.
+   - **Verified:** new `tests/test_bpp_arr.bpp` Phase 7 (swap-remove from
+     the middle, from the end, and an out-of-range no-op) + a one-off engine
+     probe (`tl_remove_clip` swap behavior, `tl_track_set_volume` clamping)
+     run clean. Bootstrap stable, suite 198/0/12. The interactive-fader
+     work above shipped in the same session, caught by the same live-test
+     pass ("os botões de volume do canal e do mixer tbm não funcionam").
+   - **Still open:** drawing clip CONTENT (waveform/notes) inside the block
+     — noted under slice 6c below, not built.
 4. **Insert (single)** — ✅ engine-level DONE: every `Track` already carries
    one hardcoded Moog-filter slot (`tk.flt_on` / `tk.flt`,
    `tl_channel_process` calls `moon_process`) and `tl_track_set` already takes

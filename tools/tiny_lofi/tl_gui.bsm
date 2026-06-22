@@ -34,6 +34,17 @@ static auto _g_play_frames;          // total frames in the project
 static auto _g_master_pm;            // master volume, permille (int)
 static auto _g_status;               // a short status string, or 0
 
+// ── Selection / drag / clipboard (slice 3) ──────────────────────────
+static auto _g_sel_clip;             // selected clip index, or -1
+static auto _g_drag_clip;            // clip index being dragged, or -1
+static auto _g_drag_dx;              // px offset: mouse_x() - the clip's left edge at pickup
+
+static auto _g_cb_has;               // 1 if the clipboard holds a copied clip
+static auto _g_cb_buf;
+static auto _g_cb_frames;
+static auto _g_cb_len;
+static auto _g_cb_track;
+
 static _rgb(r, g, b) { return rgba(r, g, b, 255); }
 
 // Master volume as a float (permille -> 0..1), for the engine calls.
@@ -83,6 +94,14 @@ static void _g_draw_transport() {
 
     if (_button(110, 12, 64, 22, _g_playing ? "PLAYING" : "PLAY", _rgb(54, 120, 70))) {
         if (_g_play_pos >= _g_play_frames) { _g_play_pos = 0; }
+        // Re-render from the current model on every Play press — slice 3's
+        // drag/copy/paste edit the model live, and the playback buffer was
+        // otherwise only ever rendered once at window-open, so an edit
+        // would silently never be heard (Export already re-rendered fresh
+        // every time; Play didn't). Cheap at this project size (low
+        // milliseconds), so doing it unconditionally is simpler than
+        // tracking a "model is dirty" flag.
+        tl_render(_g_play_buf, _g_play_frames, _g_master_f());
         _g_playing = 1;
     }
     if (_button(180, 12, 56, 22, "STOP", _rgb(120, 60, 60))) {
@@ -102,7 +121,7 @@ static void _g_draw_transport() {
 
 // ── Time ruler ─────────────────────────────────────────────────────
 static void _g_draw_ruler() {
-    auto s, x;
+    auto s, x, mx, my, new_pos;
     draw_rect(TL_X0, TRANSP_H, TL_X1 - TL_X0, RULER_H, _rgb(30, 30, 42));
     // One mark per second across the visible range.
     for (s = 0; s <= 4; s++) {
@@ -111,13 +130,29 @@ static void _g_draw_ruler() {
         draw_rect(x, TRANSP_H, 1, RULER_H, _rgb(60, 60, 80));
         draw_number(x + 3, TRANSP_H + 6, 8, _rgb(140, 140, 160), s);
     }
+
+    // Click-to-seek: clicking the ruler moves the playhead there directly,
+    // the same gesture every DAW's time ruler supports.
+    mx = mouse_x(); my = mouse_y();
+    if (mouse_pressed(MOUSE_LEFT) && _in_rect(mx, my, TL_X0, TRANSP_H, TL_X1 - TL_X0, RULER_H)) {
+        new_pos = (mx - TL_X0) * 44100 / PXPS;
+        if (new_pos < 0) { new_pos = 0; }
+        if (new_pos > _g_play_frames) { new_pos = _g_play_frames; }
+        _g_play_pos = new_pos;
+    }
 }
 
 // ── Track lanes + clips ────────────────────────────────────────────
+// Selection and drag-to-move are handled here, alongside the drawing, the
+// same way `_button` combines hit-test and draw in one place — the clip
+// rect geometry (cx/cw/y) only needs to be computed once per clip either
+// way.
 static void _g_draw_lanes() {
     auto tr, y, nclips, ci, cl: Clip, cx, cw, lane_bg;
-    auto v: float, vw: word;
+    auto v: float, vw: word, nv: float;
+    auto mx, my, border, new_start, new_track;
     nclips = tl_clip_count();
+    mx = mouse_x(); my = mouse_y();
 
     for (tr = 0; tr < 8; tr++) {
         y = LANE_Y0 + tr * LANE_H;
@@ -135,7 +170,16 @@ static void _g_draw_lanes() {
             draw_rect(64, y + 7, 30, 11, _rgb(70, 90, 140));
             draw_text("FLT", 67, y + 8, 8, _rgb(220, 220, 240));
         }
-        // Volume bar.
+        // Volume bar — drag anywhere along it (a couple px of vertical
+        // slack beyond the 8px-tall bar makes it easier to grab) to set
+        // the channel's volume directly.
+        if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, 10, y + 27, 120, 14)) {
+            nv = mx - 10;
+            nv = nv / 120.0;
+            if (nv < 0.0) { nv = 0.0; }
+            if (nv > 1.0) { nv = 1.0; }
+            tl_track_set_volume(tr, nv);
+        }
         v  = tl_channel_vol(tr);
         vw = v * 120.0;                       // float -> int width (fcvtzs)
         draw_rect(10, y + 30, 120, 8, _rgb(44, 44, 58));
@@ -148,24 +192,93 @@ static void _g_draw_lanes() {
             cx = TL_X0 + (cl.start * PXPS) / 44100;
             cw = (cl.len * PXPS) / 44100;
             if (cw < 2) { cw = 2; }
-            draw_rect(cx, y + 6, cw, LANE_H - 14, _clip_color(tr));
-            draw_rect(cx, y + 6, cw, 1, _rgb(255, 255, 255));
-            draw_rect(cx, y + 6, 1, LANE_H - 14, _rgb(20, 20, 28));
+
+            // Pick up the clip on press: select it and start a drag. A
+            // plain click that never moves the mouse just leaves the
+            // selection — there is no separate "drag mode", same as every
+            // DAW's clip-grab gesture.
+            if (mouse_pressed(MOUSE_LEFT) && _in_rect(mx, my, cx, y + 6, cw, LANE_H - 14)) {
+                _g_sel_clip  = ci;
+                _g_drag_clip = ci;
+                _g_drag_dx   = mx - cx;
+            }
+
+            // Selected clip gets a full, thick, bright outline on all four
+            // edges — unselected gets a thin neutral one. The earlier
+            // top+left-only 1px version was too easy to miss against a
+            // busy block color; this is the same kind of obvious-at-a-
+            // glance highlight every DAW uses for "this is the one you'll
+            // move/copy."
+            if (ci == _g_sel_clip) {
+                border = _rgb(255, 230, 90);
+                draw_rect(cx, y + 6, cw, LANE_H - 14, _clip_color(tr));
+                draw_rect(cx,          y + 6,               cw, 2, border);
+                draw_rect(cx,          y + 6 + LANE_H - 16, cw, 2, border);
+                draw_rect(cx,          y + 6,               2, LANE_H - 14, border);
+                draw_rect(cx + cw - 2, y + 6,               2, LANE_H - 14, border);
+            } else {
+                border = _rgb(255, 255, 255);
+                draw_rect(cx, y + 6, cw, LANE_H - 14, _clip_color(tr));
+                draw_rect(cx,          y + 6,               cw, 1, border);
+                draw_rect(cx,          y + 6 + LANE_H - 15, cw, 1, border);
+                draw_rect(cx,          y + 6,               1, LANE_H - 14, border);
+                draw_rect(cx + cw - 1, y + 6,               1, LANE_H - 14, border);
+            }
+        }
+    }
+
+    // Clicking empty lane space (no clip under the cursor this frame)
+    // deselects AND moves the playhead there — the same "click blank
+    // timeline space" gesture as the ruler above. Checked after the clip
+    // loop so a hit on a clip — which would have just set _g_drag_clip
+    // above — always wins.
+    if (mouse_pressed(MOUSE_LEFT) && _g_drag_clip < 0
+        && _in_rect(mx, my, TL_X0, LANE_Y0, TL_X1 - TL_X0, 8 * LANE_H)) {
+        _g_sel_clip = -1;
+        new_start = (mx - TL_X0) * 44100 / PXPS;
+        if (new_start < 0) { new_start = 0; }
+        if (new_start > _g_play_frames) { new_start = _g_play_frames; }
+        _g_play_pos = new_start;
+    }
+
+    // Drag in progress: follow the mouse along the timeline (start, from X)
+    // and across lanes (track, from Y) until the button comes up.
+    if (_g_drag_clip >= 0) {
+        if (mouse_down(MOUSE_LEFT) == 0) {
+            _g_drag_clip = -1;
+        } else {
+            cl = tl_clip_at(_g_drag_clip);
+            new_start = ((mx - _g_drag_dx) - TL_X0) * 44100 / PXPS;
+            if (new_start < 0) { new_start = 0; }
+            cl.start = new_start;
+            new_track = (my - LANE_Y0) / LANE_H;
+            if (new_track >= 0 && new_track < 8) { cl.track = new_track; }
         }
     }
 }
 
 // ── Mixer strip (read-only display for now) ────────────────────────
 static void _g_draw_mixer() {
-    auto i, x, fy, mw;
-    auto v: float, fh: word;
+    auto i, x, fy, mw, mx, my, new_pm;
+    auto v: float, fh: word, nv: float;
+    mx = mouse_x(); my = mouse_y();
     draw_rect(TL_X1, TRANSP_H, MIX_W, GUI_H - TRANSP_H, _rgb(34, 34, 46));
     draw_rect(TL_X1, TRANSP_H, 1, GUI_H - TRANSP_H, _rgb(18, 18, 26));
     draw_text("MIXER", TL_X1 + 12, TRANSP_H + 6, 8, _rgb(150, 150, 170));
 
-    // Eight channel faders, each a vertical bar.
+    // Eight channel faders, each a vertical bar. Drag up/down anywhere in
+    // the fader's column (a few px wider than the 12px bar itself, for an
+    // easier grab) to set that channel's volume — height maps linearly to
+    // 0..1, same as the lane header's horizontal bar.
     for (i = 0; i < 8; i++) {
         x  = TL_X1 + 12 + i * 19;
+        if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, x - 2, TRANSP_H + 30, 16, 180)) {
+            nv = (TRANSP_H + 30 + 180) - my;
+            nv = nv / 180.0;
+            if (nv < 0.0) { nv = 0.0; }
+            if (nv > 1.0) { nv = 1.0; }
+            tl_track_set_volume(i, nv);
+        }
         v  = tl_channel_vol(i);
         draw_rect(x, TRANSP_H + 30, 12, 180, _rgb(26, 26, 36));
         fh = v * 180.0;                        // float -> int height
@@ -173,12 +286,67 @@ static void _g_draw_mixer() {
         draw_rect(x, fy, 12, fh, _clip_color(i));
         draw_number(x + 1, TRANSP_H + 216, 8, _rgb(120, 120, 140), i + 1);
     }
-    // Master (permille -> a 0..160 px bar, all integer).
+    // Master (permille -> a 0..160 px bar, all integer). Drag sets
+    // _g_master_pm directly — it's a GUI-local readout, no engine call.
     draw_text("MASTER", TL_X1 + 12, TRANSP_H + 240, 8, _rgb(150, 150, 170));
     x  = TL_X1 + 12;
+    if (mouse_down(MOUSE_LEFT) && _in_rect(mx, my, x, TRANSP_H + 255, 160, 20)) {
+        new_pm = (mx - x) * 1000 / 160;
+        if (new_pm < 0)    { new_pm = 0; }
+        if (new_pm > 1000) { new_pm = 1000; }
+        _g_master_pm = new_pm;
+    }
     mw = _g_master_pm * 160 / 1000;
     draw_rect(x, TRANSP_H + 258, 160, 14, _rgb(26, 26, 36));
     draw_rect(x, TRANSP_H + 258, mw, 14, _rgb(90, 200, 130));
+}
+
+// ── Copy / paste / delete ────────────────────────────────────────────
+// Ctrl+C copies the selected clip's (buf, frames, len, track) into a
+// one-slot clipboard — the clip data is SHARED (same buf pointer), not
+// duplicated, the same "clips alias buffers freely" convention
+// tl_clip_split already established. Ctrl+V pastes a new clip at the
+// current playhead frame, on the source clip's own track, and selects the
+// freshly pasted clip. Delete/Backspace removes the selected clip (covers
+// either one a pasted OR a pre-existing clip — there's nothing special
+// about a pasted clip once it's on the timeline).
+static void _g_handle_clip_keys() {
+    auto cl: Clip, mod;
+    // Accept either Ctrl (Linux/Windows convention) or Cmd/META (the
+    // native macOS shortcut a Mac user actually presses) — checking only
+    // KEY_CTRL silently did nothing for anyone on a Mac pressing the
+    // muscle-memory Cmd+C/Cmd+V.
+    mod = key_down(KEY_CTRL) || key_down(KEY_META);
+    if (mod && key_pressed(KEY_C)) {
+        if (_g_sel_clip >= 0) {
+            cl = tl_clip_at(_g_sel_clip);
+            _g_cb_buf    = cl.buf;
+            _g_cb_frames = cl.frames;
+            _g_cb_len    = cl.len;
+            _g_cb_track  = cl.track;
+            _g_cb_has    = 1;
+            _g_status    = "copied clip";
+        }
+    }
+    if (mod && key_pressed(KEY_V)) {
+        if (_g_cb_has != 0) {
+            tl_add_clip(_g_cb_track, _g_cb_buf, _g_cb_frames, _g_play_pos, _g_cb_len);
+            _g_sel_clip = tl_clip_count() - 1;
+            _g_status   = "pasted clip";
+        }
+    }
+    if (key_pressed(KEY_DELETE) || key_pressed(KEY_BACKSPACE)) {
+        if (_g_sel_clip >= 0) {
+            tl_remove_clip(_g_sel_clip);
+            // tl_remove_clip is a swap-remove — the index is no longer the
+            // clip we had selected (it's either gone, or now holds what was
+            // last). Deselect and drop any in-progress drag on it rather
+            // than risk operating on the wrong clip next frame.
+            _g_sel_clip  = -1;
+            _g_drag_clip = -1;
+            _g_status    = "deleted clip";
+        }
+    }
 }
 
 // ── Playhead ───────────────────────────────────────────────────────
@@ -219,6 +387,10 @@ void tl_gui_run(total_frames, master: float) {
     _g_play_buf    = malloc(total_frames * 4);
     tl_render(_g_play_buf, total_frames, master);
 
+    _g_sel_clip  = -1;
+    _g_drag_clip = -1;
+    _g_cb_has    = 0;
+
     window_init_full(GUI_W, GUI_H, "tiny_lofi");
     audio_open(4096);
 
@@ -227,6 +399,7 @@ void tl_gui_run(total_frames, master: float) {
         if (key_pressed(KEY_ESC)) { break; }
 
         _g_pump_audio();
+        _g_handle_clip_keys();
 
         clear(_rgb(22, 22, 30));
         _g_draw_ruler();
