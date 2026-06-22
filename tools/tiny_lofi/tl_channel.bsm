@@ -1,22 +1,28 @@
 // tl_channel.bsm — the mixer channels.
 //
-// tiny_lofi has TL_NTRACKS channels. Each channel is a volume fader plus an
-// optional insert plugin — for now the moon_filter (the Moog ladder). This
-// module owns the channel array; the timeline and the tools reach a channel
-// only through the functions here. Adding a second insert plugin later means
-// giving the channel a small chain instead of one `flt` slot.
+// tiny_lofi has TL_NTRACKS channels. Each channel is a volume fader plus a
+// fixed two-slot insert chain: a moon_filter (the Moog ladder) followed by a
+// rotary (Leslie) — docs/plans/tiny_lofi.md slice 5a/5b. Two concrete plugin
+// kinds today, in a fixed natural order (shape the tone, then spin the
+// stereo field — the same order a guitar amp or organ rig chains drive →
+// modulation), so this is two named slots rather than a generic N-deep
+// polymorphic chain; if a third insert kind shows up, THAT is the trigger to
+// generalize (Rule 20's two-consumer bar, applied to "how many slots" too).
+// This module owns the channel array; the timeline and the tools reach a
+// channel only through the functions here.
 
-// One mixer channel: a volume, a pan position, whether the insert is engaged,
-// and the insert plugin instance (a moon_filter, allocated once at init).
-// `pan` is the constant-power pan position in [-1, 1] (-1 hard left, 0 centre,
-// +1 hard right). `stereo` is the source-shape flag (0 = mono source, panned
-// into the field — the Moog-bass case; 1 = stereo source, L/R processed
-// separately) — see tl_channel_process. `gain_l`/`gain_r` are the precomputed
-// constant-power pan gains (cos/sin of the pan angle) so the per-frame strip
-// multiplies by a stored constant instead of calling cos/sin every sample —
-// pan is constant per track, so the trig belongs at set-time, not in the hot
-// loop. New fields are appended so the typed accessors below keep their offsets.
-struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float }
+// One mixer channel: a volume, a pan position, and the two-slot insert
+// chain (moon_filter, then rotary — both allocated once at init, each
+// independently engaged via its own `_on` flag). `pan` is the constant-power
+// pan position in [-1, 1] (-1 hard left, 0 centre, +1 hard right). `stereo`
+// is the source-shape flag (0 = mono source, panned into the field — the
+// Moog-bass case; 1 = stereo source, L/R processed separately) — see
+// tl_channel_process. `gain_l`/`gain_r` are the precomputed constant-power
+// pan gains (cos/sin of the pan angle) so the per-frame strip multiplies by
+// a stored constant instead of calling cos/sin every sample — pan is
+// constant per track, so the trig belongs at set-time, not in the hot loop.
+// New fields are appended so the typed accessors below keep their offsets.
+struct Track { vol: float, flt_on, flt, pan: float, stereo, gain_l: float, gain_r: float, rot_on, rot }
 
 static auto _tl_tracks;     // malloc(TL_NTRACKS * sizeof(Track))
 
@@ -31,8 +37,9 @@ static void _tl_apply_pan(tk: Track, pan: float) {
     tk.gain_r = sin_f(theta);
 }
 
-// Allocate the channels and give each a sensible default: 80% volume, insert
-// off, and a fresh moon_filter instance. Call once at engine init.
+// Allocate the channels and give each a sensible default: 80% volume, both
+// insert slots off, and a fresh moon_filter + rotary instance each. Call
+// once at engine init.
 void tl_channel_init() {
     auto tr, tk: Track;
     _tl_tracks = malloc(TL_NTRACKS * sizeof(Track));
@@ -41,6 +48,8 @@ void tl_channel_init() {
         tk.vol    = 0.8;
         tk.flt_on = 0;
         tk.flt    = moon_new(44100.0);
+        tk.rot_on = 0;
+        tk.rot    = rotary_new(44100.0);
         tk.stereo = 0;     // mono source (panned into the stereo field)
         _tl_apply_pan(tk, 0.0);   // centre
     }
@@ -58,13 +67,26 @@ void tl_track_set(tr, vol: float, flt_on, cutoff: float, reso: float, slope, pan
     if (flt_on != 0) { moon_set(tk.flt, cutoff, reso, slope); }
 }
 
-// Clear every channel's insert state. The render calls this before a pass so a
-// filter never carries memory across renders.
+// Configure one channel's rotary insert. `mode` is ROTARY_OFF /
+// ROTARY_CHORALE / ROTARY_TREMOLO (stbrotary.bsm). A separate setter from
+// tl_track_set because the rotary is a logically independent concern (and
+// keeps tl_track_set's own parameter list from growing further) — same
+// shape as moon_filter's own cutoff/reso/slope group.
+void tl_track_set_rotary(tr, rot_on, mode) {
+    auto tk: Track;
+    tk = _tl_tracks + tr * sizeof(Track);
+    tk.rot_on = rot_on;
+    if (rot_on != 0) { rotary_set_mode(tk.rot, mode); }
+}
+
+// Clear every channel's insert state. The render calls this before a pass so
+// neither insert carries memory across renders.
 void tl_channel_reset_filters() {
     auto tr, tk: Track;
     for (tr = 0; tr < TL_NTRACKS; tr++) {
         tk = _tl_tracks + tr * sizeof(Track);
         moon_reset(tk.flt);
+        rotary_reset(tk.rot);
     }
 }
 
@@ -79,18 +101,27 @@ tl_channel_flt_on(tr) {
     tk = _tl_tracks + tr * sizeof(Track);
     return tk.flt_on;
 }
+tl_channel_rot_on(tr) {
+    auto tk: Track;
+    tk = _tl_tracks + tr * sizeof(Track);
+    return tk.rot_on;
+}
 
 // Run one dry sample through channel `tr` and return its STEREO (L, R)
 // contribution — the per-channel strip the mix loop calls every frame. This is
 // the headline multi-return consumer: two floats home in d0/d1, no struct, no
 // memory (a C++ `std::pair`/out-param would cost more).
 //
-// Mono source (tk.stereo == 0 — the common case, e.g. a Moog bass): the insert
-// runs ONCE, then the wet, post-fader sample is placed into the field by a
-// constant-power pan (equal power left+right, -3 dB at centre). A stereo-source
-// track would run the insert twice (independent L/R state) — same (float,float)
-// return, the flag only gates the pass count — and lands with stereo clip import
-// (S2); until a stereo source exists, building that branch would be speculative.
+// Mono source (tk.stereo == 0 — the common case, e.g. a Moog bass): the Moog
+// insert runs ONCE, then the wet, post-fader sample is placed into the field
+// by a constant-power pan (equal power left+right, -3 dB at centre). The
+// rotary — when engaged — runs AFTER pan, on the now-stereo (L, R) pair, the
+// same position it occupies in stbmixer's master stage (a rotary modulates a
+// stereo signal; it has nothing to do before there's a stereo signal to
+// modulate). A stereo-source track would run the Moog insert twice
+// (independent L/R state) — same (float,float) return, the flag only gates
+// the pass count — and lands with stereo clip import (S2); until a stereo
+// source exists, building that branch would be speculative.
 tl_channel_process(tr, dry: float) -> (float, float) {
     auto tk: Track, wet: float, l: float, r: float;
     tk  = _tl_tracks + tr * sizeof(Track);
@@ -101,5 +132,6 @@ tl_channel_process(tr, dry: float) -> (float, float) {
     // hot loop — see _tl_apply_pan).
     l = wet * tk.gain_l;
     r = wet * tk.gain_r;
+    if (tk.rot_on != 0) { l, r = rotary_tick(tk.rot, l, r); }
     return l, r;
 }

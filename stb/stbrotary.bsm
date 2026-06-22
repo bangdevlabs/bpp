@@ -1,0 +1,123 @@
+// stbrotary.bsm — the Leslie/rotary effect: an LFO-driven antiphase pan
+// sweep that turns a signal into the classic rotating-speaker swirl +
+// tremolo. An instance owns its own LFO and glide state, so any caller can
+// have its own rotary instead of sharing one global.
+//
+// Graduated from stbmixer's single global rotary
+// (docs/plans/audio_dsp_architecture.md's named "2nd consumer" trigger —
+// tiny_lofi taking the rotary as a per-channel insert) into a Tier-2 effect
+// any caller can instantiate. `stbmixer` now wraps an instance of this for
+// its own master-bus rotary (`mixer_set_rotary` keeps its public shape);
+// `tools/tiny_lofi/tl_channel.bsm` owns one per track.
+//
+// Canonical use:
+//   auto r: Rotary;
+//   r = rotary_new(44100.0);
+//   rotary_set_mode(r, ROTARY_CHORALE);
+//   ... per sample ...
+//   auto l: float, rr: float;
+//   l, rr = rotary_tick(r, l, rr);
+//   rotary_free(r);
+//
+// The rate never jumps — it glides toward the new target inside
+// `rotary_tick`, the same inertia a real Leslie motor has spinning up or
+// down. OFF bypasses entirely at zero cost once the glide has settled back
+// to a dead-still 0 Hz (the common case for a channel that never engages
+// the rotary).
+
+import "stblfo.bsm";
+
+const ROTARY_OFF     = 0;   // motor stopped — no pan modulation
+const ROTARY_CHORALE = 1;   // slow rotation (~48 RPM)
+const ROTARY_TREMOLO = 2;   // fast spin (~400 RPM)
+
+// One rotary instance. `lfo` drives the antiphase L/R swell; `cur` glides
+// toward `tgt` one step per `rotary_tick` call (the Leslie "wind-up").
+struct Rotary { mode, lfo, cur: float, tgt: float }
+
+// Init hook for symmetry with the other cartridges. Nothing global to set up.
+init_rotary() { return 0; }
+
+// Allocate a rotary bound to `sample_rate`. Starts OFF, motor at rest. The
+// caller owns the returned pointer and frees it with rotary_free.
+rotary_new(sample_rate: float) {
+    auto r: Rotary;
+    r = malloc(sizeof(Rotary));
+    r.mode = ROTARY_OFF;
+    r.lfo  = lfo_new(sample_rate);
+    lfo_set(r.lfo, 0.0, LFO_SIN);
+    r.cur  = 0.0;
+    r.tgt  = 0.0;
+    return r;
+}
+
+// Set the rotary speed: ROTARY_OFF / ROTARY_CHORALE / ROTARY_TREMOLO.
+// Out-of-range modes are ignored (current mode + rate keep playing).
+void rotary_set_mode(rotary: Rotary, mode) {
+    auto r: Rotary;
+    r = rotary;
+    if (mode < ROTARY_OFF) { return; }
+    if (mode > ROTARY_TREMOLO) { return; }
+    r.mode = mode;
+    if (mode == ROTARY_OFF) {
+        r.tgt = 0.0;
+    } else if (mode == ROTARY_CHORALE) {
+        r.tgt = 0.8;
+    } else {
+        r.tgt = 6.7;
+    }
+}
+
+// Read the active rotary mode.
+rotary_get_mode(rotary: Rotary) {
+    auto r: Rotary;
+    r = rotary;
+    return r.mode;
+}
+
+// Process one stereo sample through the rotary, returning the modulated
+// (L, R) — the per-sample multi-return consumer, two floats home in two
+// registers, no struct, no out-param. Bypassed at zero cost once OFF and
+// the glide has settled to a dead-still 0 Hz.
+rotary_tick(rotary: Rotary, l: float, r_in: float) -> (float, float) {
+    auto r: Rotary;
+    auto rgl: float, rgr: float, rm: float;
+    r = rotary;
+    if (r.mode == ROTARY_OFF && r.cur == 0.0) { return l, r_in; }
+
+    if (r.cur < r.tgt) {
+        r.cur += 0.0001;
+        if (r.cur > r.tgt) { r.cur = r.tgt; }
+    } else if (r.cur > r.tgt) {
+        r.cur -= 0.0001;
+        if (r.cur < r.tgt) { r.cur = r.tgt; }
+    }
+    lfo_set_rate(r.lfo, r.cur);
+    rm = lfo_tick(r.lfo);
+
+    // Unity-centre balance law (same as mixer_set_voice_pan): centre is
+    // full gain both sides, the sweep only ever attenuates the far side.
+    rgl = 1.0;
+    rgr = 1.0;
+    if (rm > 0.0) { rgl = 1.0 - rm; }
+    if (rm < 0.0) { rgr = 1.0 + rm; }
+    return l * rgl, r_in * rgr;
+}
+
+// Reset the rotary's LFO phase (the motor's angular position), keeping the
+// mode and current rate. Used when a render pass must not carry stereo-
+// sweep phase across runs (the same discipline tl_channel_reset_filters
+// applies to the Moog insert).
+void rotary_reset(rotary: Rotary) {
+    auto r: Rotary;
+    r = rotary;
+    lfo_reset(r.lfo);
+}
+
+// Free a rotary allocated by rotary_new.
+void rotary_free(rotary) {
+    auto r: Rotary;
+    r = rotary;
+    lfo_free(r.lfo);
+    free(rotary);
+}

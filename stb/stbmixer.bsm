@@ -28,7 +28,7 @@
 // sampled playback plug in as new voice kinds later.
 
 import "stbaudio.bsm";
-import "stblfo.bsm";     // the rotary (Leslie) LFO modulation source
+import "stbrotary.bsm";  // the Leslie rotary — stbmixer owns one instance for its master bus
 import "stbenv.bsm";     // ADSR — de-clicks tone-voice note_off (docs/plans/audio_dsp_architecture.md item 3)
 
 // ── Configuration ──────────────────────────────────────────────
@@ -135,10 +135,6 @@ void mixer_init() {
     MX_BUS_SFX    = 2;
     _MX_BUS_COUNT = 3;
 
-    MX_ROTARY_OFF     = 0;
-    MX_ROTARY_CHORALE = 1;
-    MX_ROTARY_TREMOLO = 2;
-
     // Two extra voice slots reserved at the end: MUSIC always lives
     // on slot _MX_MAX_VOICES (index 8) so BGM can't be knocked out
     // by a flood of SFX. The slot beyond it is a spare for future
@@ -229,15 +225,13 @@ void mixer_init() {
     _mx_held_r        = 0.0;
 
     // Rotary starts OFF, motor at rest (0 Hz) — mixer_set_rotary glides it
-    // up. The LFO is bound to the same 44100 Hz timeline as the rest of the
-    // mixer (note the literal: passing the _MX_SAMPLE_RATE word variable
-    // here would hit E240 — a non-literal int can't silently widen to a
-    // float param; only a literal does, per Rule 12).
-    _mx_rotary_mode = MX_ROTARY_OFF;
-    _mx_rotary_lfo  = lfo_new(44100.0);
-    lfo_set(_mx_rotary_lfo, 0.0, LFO_SIN);
-    _mx_rotary_cur = 0.0;
-    _mx_rotary_tgt = 0.0;
+    // up. Bound to the same 44100 Hz timeline as the rest of the mixer (note
+    // the literal: passing the _MX_SAMPLE_RATE word variable here would hit
+    // E240 — a non-literal int can't silently widen to a float param; only
+    // a literal does, per Rule 12). stbmixer owns exactly one Rotary
+    // instance for its master bus; tools/tiny_lofi/tl_channel.bsm owns one
+    // per track (docs/plans/tiny_lofi.md slice 5b).
+    _mx_rotary = rotary_new(44100.0);
 
     _mx_inited        = 1;
 }
@@ -634,39 +628,28 @@ static extrn _mx_decim_counter;
 static extrn _mx_held_l: float;  // decimation sample-and-hold, left channel
 static extrn _mx_held_r: float;  // decimation sample-and-hold, right channel
 
-// Rotary (Leslie) — a global auto-pan on the master mix. The rotary LFO sweeps
-// an antiphase L/R swell (the unity-centre balance turns a pan sweep into the
-// classic rotating-speaker swirl + tremolo in one). Two speeds with an inertia
-// ramp: chorale (slow) and tremolo (fast); switching glides the rate, the
-// signature Leslie "wind-up". OFF bypasses entirely (no cost when off).
-static extrn MX_ROTARY_OFF;       // motor stopped — no pan modulation
-static extrn MX_ROTARY_CHORALE;   // slow rotation (~48 RPM)
-static extrn MX_ROTARY_TREMOLO;   // fast rotation (~400 RPM)
+// Rotary (Leslie) — a global auto-pan on the master mix, now a thin wrapper
+// over a single `stbrotary` instance (`docs/plans/tiny_lofi.md` slice 5b —
+// the rotary graduated out of these inline globals into a Tier-2 effect any
+// caller can instantiate; tiny_lofi's tl_channel owns a SEPARATE instance
+// per track). The public API below is unchanged on purpose — every existing
+// caller (`mini_synth`, `tests/test_mixer_rotary.bpp`) keeps working without
+// edits.
+const MX_ROTARY_OFF     = ROTARY_OFF;       // motor stopped — no pan modulation
+const MX_ROTARY_CHORALE = ROTARY_CHORALE;   // slow rotation (~48 RPM)
+const MX_ROTARY_TREMOLO = ROTARY_TREMOLO;   // fast rotation (~400 RPM)
 
-static extrn _mx_rotary_mode;          // MX_ROTARY_OFF / CHORALE / TREMOLO
-static extrn _mx_rotary_lfo;           // an stblfo Lfo handle (the rotation)
-static extrn _mx_rotary_cur: float;    // current rate (Hz), glides toward target
-static extrn _mx_rotary_tgt: float;    // target rate (Hz) for the active speed
+static extrn _mx_rotary;   // a Rotary handle (stbrotary.bsm) — the master-bus rotary
 
 // Set the Leslie rotary speed: MX_ROTARY_OFF / MX_ROTARY_CHORALE /
-// MX_ROTARY_TREMOLO. The rate never jumps — it glides toward the new target
-// inside mixer_fill, the same inertia a real Leslie motor has spinning up or
-// down. Out-of-range modes are ignored (current mode + rate keep playing).
+// MX_ROTARY_TREMOLO. Delegates to stbrotary; out-of-range modes are ignored
+// (current mode + rate keep playing) the same as before the graduation.
 void mixer_set_rotary(mode: word) {
-    if (mode < MX_ROTARY_OFF) { return; }
-    if (mode > MX_ROTARY_TREMOLO) { return; }
-    _mx_rotary_mode = mode;
-    if (mode == MX_ROTARY_OFF) {
-        _mx_rotary_tgt = 0.0;
-    } else if (mode == MX_ROTARY_CHORALE) {
-        _mx_rotary_tgt = 0.8;   // chorale — slow swirl, ~48 RPM
-    } else {
-        _mx_rotary_tgt = 6.7;   // tremolo — fast spin, ~400 RPM
-    }
+    rotary_set_mode(_mx_rotary, mode);
 }
 
 // Read the active rotary mode.
-mixer_get_rotary() { return _mx_rotary_mode; }
+mixer_get_rotary() { return rotary_get_mode(_mx_rotary); }
 
 void mixer_set_dirt(val: word) {
     if (val < 0)   { val = 0; }
@@ -851,38 +834,13 @@ mixer_fill(buf, n: word)@safe {
         // no boundary conversion needed now that S2/S3 carry float all the
         // way from the per-voice loop) ────────────────────────────────────
 
-        // Rotary (Leslie) — global auto-pan on the master sum, modulated by an
-        // stblfo tick. Bypassed at zero cost once OFF and the glide has
-        // settled back to a dead-still 0 Hz (the common case for programs
-        // that never call mixer_set_rotary).
-        if (_mx_rotary_mode != MX_ROTARY_OFF || _mx_rotary_cur != 0.0) {
-            // Glide the current rate toward the target — the motor's
-            // physical spin-up/spin-down (the Leslie "wind-up"). ~1.3s
-            // end-to-end across the full chorale<->tremolo span at this
-            // step size (inline literal — see Rule 12, const demotes
-            // float literals to 0).
-            if (_mx_rotary_cur < _mx_rotary_tgt) {
-                _mx_rotary_cur = _mx_rotary_cur + 0.0001;
-                if (_mx_rotary_cur > _mx_rotary_tgt) { _mx_rotary_cur = _mx_rotary_tgt; }
-            } else if (_mx_rotary_cur > _mx_rotary_tgt) {
-                _mx_rotary_cur = _mx_rotary_cur - 0.0001;
-                if (_mx_rotary_cur < _mx_rotary_tgt) { _mx_rotary_cur = _mx_rotary_tgt; }
-            }
-            lfo_set_rate(_mx_rotary_lfo, _mx_rotary_cur);
-
-            auto rm: float;
-            rm = lfo_tick(_mx_rotary_lfo);
-
-            // Same unity-centre pan law as mixer_set_voice_pan, a direct
-            // float gain.
-            auto rgl: float, rgr: float;
-            rgl = 1.0;
-            rgr = 1.0;
-            if (rm > 0.0) { rgl = 1.0 - rm; }
-            if (rm < 0.0) { rgr = 1.0 + rm; }
-            left  = left  * rgl;
-            right = right * rgr;
-        }
+        // Rotary (Leslie) — global auto-pan on the master sum. Delegates to
+        // the stbrotary instance this mixer owns (`_mx_rotary`); the glide,
+        // LFO tick, and unity-centre pan law all live there now
+        // (docs/plans/tiny_lofi.md slice 5b). Bypass-at-zero-cost when OFF
+        // is `rotary_tick`'s own contract, not something this call site
+        // needs to check first.
+        left, right = rotary_tick(_mx_rotary, left, right);
 
         // Master gain, per channel — per-program master_vol (synthkey-era) then
         // the MASTER bus slider, as one float fraction (master_gain_f, hoisted

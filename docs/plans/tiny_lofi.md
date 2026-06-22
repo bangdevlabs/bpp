@@ -136,36 +136,50 @@ take). Cut splits a clip into two; copy/paste duplicates a clip's
    `tl_channel_process` calls `moon_process`) and `tl_track_set` already takes
    cutoff/reso/slope. **Open:** the channel-strip UI doesn't expose
    cutoff/resonance controls yet (`tl_gui.bsm`'s mixer strip is fader-only).
-5. **Insert CHAIN + the `stbrotary` graduation (2026-06-22 addition).**
-   `tl_channel.bsm`'s own header comment already flagged this: "adding a
+5. **Insert CHAIN + the `stbrotary` graduation — ✅ SHIPPED 2026-06-22.**
+   `tl_channel.bsm`'s own header comment had already flagged this: "adding a
    second insert plugin later means giving the channel a small chain instead
-   of one `flt` slot" — the Leslie/rotary ask is exactly that second plugin
-   arriving. Two parts, sequenced:
-   - **5a — generalize `Track`'s insert.** Replace the single `flt_on`/`flt`
-     pair with a small fixed-size ordered array of typed insert slots (kind +
-     handle), so a channel can carry **Moog → Rotary** (or any order) instead
-     of one hardcoded type. `tl_channel_process` walks the chain instead of
-     calling `moon_process` directly. Existing single-Moog channels keep
-     working — a chain of length 1 is today's behavior.
-   - **5b — extract the rotary's core out of `stbmixer`'s single global
-     instance into a per-instance unit.** Today `_mx_rotary_mode` /
-     `_mx_rotary_lfo` / `_mx_rotary_cur` / `_mx_rotary_tgt` are module-private
-     **globals** — exactly one rotary for the whole mixer
-     (`stb/stbmixer.bsm:642-649`). `stblfo`'s `lfo_new`/`lfo_set_rate`/
-     `lfo_tick` (which the global rotary already calls) is already
-     instance-based, so the extraction is mechanical: wrap the existing
-     mode/glide/tick/pan-law logic into a `Rotary` struct + `rotary_new()` /
-     `rotary_set_mode()` / `rotary_tick(r, l, r) -> (float, float)`, the same
-     shape as `moon_filter`'s `moon_new`/`moon_process`. This **is** the
-     `stbrotary` graduation `docs/plans/audio_dsp_architecture.md` names —
+   of one `flt` slot."
+   - **5a — generalize `Track`'s insert — shipped as a fixed TWO-slot chain,
+     not a generic N-deep one.** `Track` gained `rot_on`/`rot` alongside the
+     existing `flt_on`/`flt`; `tl_channel_process` runs Moog (pre-pan) then
+     Rotary (post-pan, on the now-stereo signal — the same position it
+     occupies in `stbmixer`'s own master stage) in that fixed order.
+     Deliberately NOT a generic kind-dispatched array: there are exactly two
+     concrete plugin kinds today and a fixed tone-then-spin order is the
+     natural signal-chain shape (a guitar amp or organ rig always drives
+     filter/drive into modulation, not the other way round) — Rule 20's
+     two-consumer bar applies to "how many slots get generalized", and two
+     named fields clears it more honestly than an abstraction with one real
+     shape. A third insert kind is the trigger to revisit, not now.
+     `tl_track_set_rotary(tr, rot_on, mode)` is the new setter (kept separate
+     from `tl_track_set` rather than growing its already-7-arg list further).
+   - **5b — extracted the rotary's core out of `stbmixer`'s single global
+     instance into `stb/stbrotary.bsm`, a per-instance Tier-2 effect.** This
+     **is** the graduation `docs/plans/audio_dsp_architecture.md` named —
      "graduate `stbrotary` (Tier 2) when `tiny_lofi` takes the rotary as a
-     channel insert (the 2nd consumer)." `stbmixer`'s own global rotary can
-     either stay as a thin wrapper over the new instanced core (one instance
-     owned by the mixer) or be retired in favor of every caller owning its
-     own — decide when wiring, not before; not a contract change either way.
-   - Both halves are useful independently of live recording — they apply to
-     every existing audio-clip channel today, no instrument-track work
-     required first.
+     channel insert (the 2nd consumer)." `stbmixer`'s public API
+     (`mixer_set_rotary`/`mixer_get_rotary`/`MX_ROTARY_*`) is byte-for-byte
+     unchanged — it now wraps one `Rotary` instance (`_mx_rotary`) instead of
+     four bare globals; `mixer_fill`'s inline glide/LFO/pan-law block
+     collapsed to one `rotary_tick` call. `tl_channel.bsm` owns a SEPARATE
+     instance per track (8 total), proving the instances don't share state.
+   - **Verified, not assumed:** new `tests/test_stbrotary.bpp` (4 cases,
+     including two independent instances not sharing state) + the existing
+     `tests/test_mixer_rotary.bpp` both pass unchanged against the refactor.
+     Rendered `tiny_lofi`'s hardcoded demo project with the lead track's
+     rotary OFF → md5 `3e258737c9f0ef83193793b63eb7eed8`, an EXACT match for
+     the documented pre-existing stereo baseline (`audio_stereo_dogfood.md`)
+     — proves the refactor changed zero bytes of existing behavior. With the
+     rotary ON, the render differs starting at the exact frame the lead clip
+     begins (frame ~22050, 0.5 s) — proves the new insert is doing real,
+     measurable work, not a no-op. Bootstrap stable, suite 198/0/12 (the new
+     test counted). `mini_synth`/`rhythm`/`snake_maestro` recompile clean.
+   - Both halves apply to every existing audio-clip channel today —
+     useful independently of live recording, no instrument-track work
+     required first. `tiny_lofi.bpp`'s own hardcoded demo project now
+     dogfoods the rotary on its lead track, the same way it already
+     dogfoods scissors and pan.
 6. **Live record — open mini_synth inside a channel.** The mini-Cubase vision
    from Part 2 above, now sized into two real sub-steps instead of one big
    jump (mini_synth has no synth engine of its own — it is a keyboard UI +
@@ -233,7 +247,7 @@ maintain and grow, and so a Bang 9 tab can later drive it through `tl_lib.bsm`):
 |---|---|
 | `tiny_lofi.bpp` | standalone entry — `load`s the lib, runs the hardcoded test project |
 | `tl_lib.bsm` | aggregator — `import`s stbsound + stbfilter, `load`s the modules, `tl_init` |
-| `tl_channel.bsm` | the mixer channels (volume + Moog filter insert + slope) — owns the Track array |
+| `tl_channel.bsm` | the mixer channels (volume + a fixed Moog-then-rotary two-slot insert chain) — owns the Track array |
 | `tl_timeline.bsm` | clips arranged over time + the offline mix/render — owns the Clip store |
 | `tl_io.bsm` | export to WAV (import lands with the clips slice) |
 | `tl_tools.bsm` | non-destructive edits — scissors (`tl_clip_split`) today; copy/paste/drag next |
