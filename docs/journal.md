@@ -14100,3 +14100,44 @@ overlays the piano keys since it's a debug view, not meant to coexist with
 playing. Compiles clean, suite unaffected (197/0/12) — visual confirmation
 that the readout itself renders sane numbers still needs a human at the
 keyboard.
+
+That human confirmation paid for itself immediately. The screenshot showed
+`callback rate: 85 Hz` against the readout's own printed "~43 healthy"
+reference — not a rendering bug, a real one: `_stb_audio_tone_start` and
+`_stb_audio_open` both still requested `AudioQueueAllocateBuffer(queue,
+4096, ...)`, a literal byte count that used to equal 1024 frames at 4
+bytes/frame (s16) and silently became 512 frames at 8 bytes/frame
+(float32) once the device-boundary migration shipped — nobody had rederived
+the byte literal from the frame count when the frame width changed. Net
+effect: the callback fired ~2x as often as designed, on half the buffering
+headroom (~11.6ms instead of ~23.2ms) — strictly worse glitch margin even
+though it never actually glitched. Fixed both sites to `8192`.
+`test_audio_tone.bpp`'s `cb_count` check was floor-only (`>= 8`) and
+would have passed right through a doubled rate (it still clears 8); added
+a ceiling (`<= 16`) so the next regression in this shape fails the suite
+instead of waiting for someone to read a screenshot.
+
+Re-running the full suite to confirm the fix surfaced a second, unrelated
+landmine: `test_audio_pipe.bpp` segfaulted. That test deliberately bypasses
+`stbmixer` to exercise `stbaudio`'s ring directly, hand-rolling its own
+wire buffer — which meant it never matched the "grep every test that calls
+`mixer_fill`" sweep from the device-boundary migration, because it doesn't
+call `mixer_fill` at all. It had kept writing s16 bytes at a 4-byte stride
+into a buffer `audio_push_frames` has read at an 8-byte float32 stride
+since that migration shipped, silently corrupted the whole time — until
+today's buffer-size fix changed the drain timing enough to push it into an
+actual out-of-bounds read. Worth naming exactly what that corruption
+sounded like, since it answered a direct question: reinterpreting small
+s16 integer bit patterns as IEEE-754 float32 does not produce small
+numbers — the exponent field lands in essentially arbitrary ranges, so the
+"samples" are huge magnitudes or NaN, and this test bypasses every clamp
+`stbmixer` normally applies before such a value could reach the DAC. That
+is the literal mechanism behind "horrible modem noise" — not a sign the
+engine is broken, a sign this one hand-rolled test was feeding it
+garbage. Fixed the synthesis to real float32 and, more importantly, gave
+the test actual pass/fail assertions — it had none before, pure
+diagnostic prints that always returned 0, which is exactly why silent
+corruption survived two whole commits before a crash finally said
+something. Verified clean: `total_pushed=44100` (exact), `cb_count=44`
+(≈43Hz, confirming the buffer-size fix), `consumed≈42000`. Full suite
+197/0/12, `bench_compile.sh` unchanged.

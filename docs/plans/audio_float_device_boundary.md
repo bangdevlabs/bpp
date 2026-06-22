@@ -165,6 +165,32 @@ compiler change is in scope.
   disk" intact end to end. This is exactly the grep-the-variants risk Part E
   flagged before implementation — confirms the discipline, not just the
   caution.
+- **Found and fixed (later, via `mini_synth`'s routing readout):** the
+  per-buffer `AudioQueueAllocateBuffer` size in `_stb_audio_tone_start` /
+  `_stb_audio_open` stayed hardcoded at `4096` (bytes), which used to equal
+  1024 frames at 4 bytes/frame (s16) but silently became 512 frames at the
+  new 8 bytes/frame (float32) — the callback fired ~2x as often as
+  intended (observed 85 Hz, not the documented ~43 Hz) on half the
+  buffering headroom (~11.6ms instead of ~23.2ms). Fixed: both sites now
+  request `8192`. `tests/test_audio_tone.bpp`'s `cb_count` check was floor-
+  only (`>= 8`) and would not have caught a doubled rate; added a ceiling
+  (`<= 16`) so this class of regression fails loud next time.
+- **Found and fixed (same session):** `tests/test_audio_pipe.bpp`
+  hand-rolls its own wire buffer to test `stbaudio` below `stbmixer` —
+  exactly the kind of direct `audio_push_frames` caller the grep-the-
+  variants sweep above should have caught, and didn't, because it doesn't
+  call `mixer_fill` at all so it never matched that grep. It kept writing
+  s16 bytes at a 4-byte stride into a buffer `audio_push_frames` now reads
+  at an 8-byte float32 stride — silently corrupted (s16 integer bit
+  patterns reinterpreted as IEEE-754 float32 decode to huge/NaN
+  magnitudes, audible as harsh broadband noise once unclamped raw bytes
+  reach the DAC) until it finally read past the end of its own buffer and
+  segfaulted. The test also had no pass/fail assertions at all — pure
+  diagnostic prints that always returned 0 — which is *why* a real crash
+  was the first signal anyone got. Fixed the synthesis to float32 and
+  added the assertions the file's own header already promised
+  ("`total_pushed` should equal the frame count", "`cb_count` should be
+  > 3", "`consumed` should be > 0").
 - **Found and fixed (follow-up, same day): `_aud_amplitude` was a silent
   no-op for every `stbmixer`-based program.** Writing up Cap 30.8's gain
   chain in `stb++_lib.md` for this plan surfaced it: `_aud_stream_cb` (the
