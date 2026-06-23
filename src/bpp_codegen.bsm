@@ -155,6 +155,11 @@ struct ChipPrimitives {
     // chip's primitive maps to the native condition code.
     emit_cmp_int,       // (cond_id, left_reg)   int compare
     emit_cmp_flt,       // (cond_id)             float compare d1<>d0
+    emit_cmp_flt_into,  // (dst_int_reg, l_freg, r_freg, cond_id) — float
+                        // compute-in-place comparison: fcmp d<l_freg>,
+                        // d<r_freg>; cset x<dst_int_reg>, <cc>. Same two
+                        // instructions emit_cmp_flt already emits, just
+                        // parameterized instead of hardcoded to d1/d0/x0.
 
     // ── Memory (10) ──
     emit_load,          // (rd, rbase, off, size, signed)  reserved
@@ -3511,6 +3516,58 @@ cg_int_leaf_kind(nd) {
     return 0;                                         // frame leaf
 }
 
+// Gap 1 of the rotary_tick investigation (the struct-field leaf extension
+// above is gap 2): a float comparison's emit_cmp_flt is hardcoded to
+// `fcmp d1, d0` — a fixed register convention, not a hardware requirement
+// (confirmed reading _a64_emit_cmp_flt directly; ARM64's FCMP/x64's
+// UCOMISD accept any two FP registers). The save-left/resolve dance
+// upstream of it exists ENTIRELY to shuttle the left operand into that
+// fixed d1 slot. Reusing cg_emit_float_into (gap 2) to evaluate each side
+// into an arbitrary temp and comparing those directly removes the shuttle
+// without touching emit_cmp_flt or the old path at all — this is a new,
+// narrow sibling, not a restructuring.
+//
+// Returns (ok, cc). Budget is conservative: reserves a slot for EACH
+// side's own destination on top of its internal need, since both sides'
+// results must be live simultaneously for the final fcmp (unlike
+// arithmetic's single accumulating destination, where a child's temps are
+// freed before the next child is evaluated).
+cg_try_float_cmp(n, op_l, c0, c1) {
+    auto p: ChipPrimitives;
+    auto cc, lneed, rneed, budget;
+    p = cg_prim;
+    cc = -1;
+    if (c0 == '=' && c1 == '=') { cc = CG_CC_EQ; }
+    if (c0 == '!' && c1 == '=') { cc = CG_CC_NE; }
+    if (c0 == '<' && c1 == '=') { cc = CG_CC_LE; }
+    if (c0 == '<' && op_l == 1) { cc = CG_CC_LT; }
+    if (c0 == '>' && c1 == '=') { cc = CG_CC_GE; }
+    if (c0 == '>' && op_l == 1) { cc = CG_CC_GT; }
+    if (cc < 0) { return 0, 0; }
+    lneed = cg_float_tree_need(n.b);
+    if (lneed >= 999) { return 0, 0; }
+    rneed = cg_float_tree_need(n.c);
+    if (rneed >= 999) { return 0, 0; }
+    budget = call(p.simd_temp_count);
+    if (1 + lneed + 1 + rneed > budget) { return 0, 0; }
+    return 1, cc;
+}
+
+// Emits n's two sides via compute-in-place into fresh SIMD temps, then
+// compares those temps directly into int_dreg (0/1). Precondition:
+// cg_try_float_cmp(n, ...) already validated this fits the budget.
+cg_emit_float_cmp_into(n, int_dreg, cc) {
+    auto p: ChipPrimitives, lt, rt;
+    p = cg_prim;
+    lt = call(p.simd_temp_alloc);
+    cg_emit_float_into(n.b, lt);
+    rt = call(p.simd_temp_alloc);
+    cg_emit_float_into(n.c, rt);
+    call(p.emit_cmp_flt_into, int_dreg, lt, rt, cc);
+    call(p.simd_temp_free, rt);
+    call(p.simd_temp_free, lt);
+}
+
 // Sethi-Ullman temp need for an eligible integer tree, or 999 (forces the
 // accumulator fallback). Same left-first recurrence as the float pass.
 cg_int_tree_need(nd) {
@@ -4334,6 +4391,17 @@ cg_emit_node(nd) {
                     }
                 }
             }
+        }
+
+        // Float comparison compute-in-place (gap 1, see cg_try_float_cmp):
+        // bypasses the save-left/resolve dance entirely when both sides
+        // are CIP-eligible float trees. Checked before is_io/the generic
+        // path since a comparison can never be an is_io operator.
+        auto _fc_ok, _fc_cc;
+        _fc_ok, _fc_cc = cg_try_float_cmp(n, op_l, c0, c1);
+        if (_fc_ok) {
+            cg_emit_float_cmp_into(n, 0, _fc_cc);
+            return 0;
         }
 
         is_io = 0;
