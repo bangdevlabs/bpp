@@ -662,3 +662,116 @@ regalloc_name_wants_rpo_dump(fn_name) {
     if (unpack_l(fn_name) < pfx_len) { return 0; }
     return buf_eq(vbuf + unpack_s(fn_name), "__rg_rpo_", pfx_len);
 }
+
+// ── Stage C — live-interval construction ────────────────────────────
+//
+// Flattens per-block liveness (Stage B) into one [start_pos, end_pos]
+// range per variable, in RPO POSITION units (the index a block sits at
+// within the rpo array regalloc_compute_rpo returns — NOT the block's
+// own allocation index, which the RPO sidequest proved isn't faithful
+// to real emission order).
+//
+// Deliberate simplification for this increment: ONE interval per
+// variable, covering every RPO position where it's touched at all
+// (present in live_in, live_out, use_bits, OR def_bits) — even if
+// there's a "gap" in the middle where it's genuinely dead (e.g. a local
+// reused for two unrelated purposes far apart in the function). A
+// conservative (wider-than-necessary) interval is never a CORRECTNESS
+// bug for a future linear-scan stage — it only misses a register-
+// sharing opportunity a gap-aware interval (live-range splitting)
+// could exploit. That refinement is separable future work, not built
+// speculatively now. Block granularity (not per-instruction) is the
+// same kind of deliberate simplification CfgBlock's own use_bits/
+// def_bits already made for Stage B.
+struct LiveInterval {
+    var_idx,
+    start_pos,   // RPO position of first touch
+    end_pos      // RPO position of last touch
+}
+
+// Grows `starts`/`ends` to 64 -1 slots (one per trackable variable
+// index — the same single-word-bitset cap every earlier stage uses)
+// and folds in one block's touched-bits at RPO position `pos`.
+static void _rg_touch_interval(starts, ends, vi, pos) {
+    auto cur;
+    cur = arr_get(starts, vi);
+    if (cur < 0 || pos < cur) { arr_set(starts, vi, pos); }
+    cur = arr_get(ends, vi);
+    if (pos > cur) { arr_set(ends, vi, pos); }
+}
+
+// Computes live intervals for every variable touched anywhere in
+// `blocks`, walking `rpo` (regalloc_compute_rpo's own output) in order
+// so each block's position is simply its index within that array.
+// Returns an arr_struct of LiveInterval — Stage D (linear-scan) is the
+// first consumer; still nothing in codegen reads this.
+regalloc_compute_intervals(blocks, rpo) {
+    auto starts, ends, i, blk, b: CfgBlock, touched, vi, intervals, it: LiveInterval, n;
+    n = arr_len(rpo);
+    starts = arr_new(); ends = arr_new();
+    vi = 0;
+    while (vi < 64) { starts = arr_push(starts, -1); ends = arr_push(ends, -1); vi++; }
+
+    i = 0;
+    while (i < n) {
+        blk = arr_get(rpo, i);
+        b = arr_struct_at(blocks, blk);
+        touched = b.live_in | b.live_out | b.use_bits | b.def_bits;
+        vi = 0;
+        while (vi < 64) {
+            if ((touched & (1 << vi)) != 0) { _rg_touch_interval(starts, ends, vi, i); }
+            vi++;
+        }
+        i++;
+    }
+
+    intervals = arr_struct_new(sizeof(LiveInterval), 8);
+    vi = 0;
+    while (vi < 64) {
+        if (arr_get(starts, vi) >= 0) {
+            it = arr_struct_at(intervals, arr_struct_alloc(intervals));
+            it.var_idx = vi;
+            it.start_pos = arr_get(starts, vi);
+            it.end_pos = arr_get(ends, vi);
+        }
+        vi++;
+    }
+    return intervals;
+}
+
+// Debug dump for Stage C — prints each variable's [start_pos, end_pos]
+// interval, one per line, in increasing var_idx order (the loop above
+// already walks vi from 0 to 63). Same verification role as every
+// earlier stage's dump.
+void regalloc_dump_intervals(intervals, fn_name) {
+    auto n, i, it: LiveInterval;
+    n = arr_struct_count(intervals);
+    diag_str("IVL ");
+    diag_buf(vbuf + unpack_s(fn_name), unpack_l(fn_name));
+    diag_str(": ");
+    diag_int(n);
+    diag_str(" intervals");
+    diag_newline();
+    i = 0;
+    while (i < n) {
+        it = arr_struct_at(intervals, i);
+        diag_str("  var ");
+        diag_int(it.var_idx);
+        diag_str(": [");
+        diag_int(it.start_pos);
+        diag_str(",");
+        diag_int(it.end_pos);
+        diag_str("]");
+        diag_newline();
+        i++;
+    }
+}
+
+// Does `fn_name` start with "__rg_ivl_"? Mirrors the other stages'
+// dump-trigger checks exactly.
+regalloc_name_wants_ivl_dump(fn_name) {
+    auto pfx_len;
+    pfx_len = 9;   // length of "__rg_ivl_"
+    if (unpack_l(fn_name) < pfx_len) { return 0; }
+    return buf_eq(vbuf + unpack_s(fn_name), "__rg_ivl_", pfx_len);
+}
