@@ -568,6 +568,56 @@ parity band).
    disasm). **`tl_bench`: 11.39 → 10.16 ms (~10.6%) — the single biggest
    commit of the whole investigation.**
 
+**Running total at this point: `tl_bench` 15.4 → 10.16 ms (~34%).**
+
+9. `8bbb905` — closed the doc's own predicted "needs control-flow +
+   nested-inline" gap for the remaining chain link. Re-disassembling
+   `moon_process`/`moog_slope` (one hop further down the chain than the
+   `moog_taps` work above) found `moog_slope` rejected outright by
+   `classify_inlineable`'s very first gate — its body ends in a `switch`
+   (one arm per pole count), not a `T_RET`. New
+   `_inline_normalize_switch_ret` rewrites a trailing switch where every
+   arm is exactly one `return` into a single nested-ternary return — the
+   switch's twin of Inc 3b's existing guard-clause normaliser. Surfaced a
+   second bug while computing the now-reachable body's cost:
+   `_inline_count_nodes`'s `T_ASSIGN` case never got the multi-TARGET
+   sibling of the multi-RESULT fix Inc 5/6 already applied to `T_RET` —
+   fixed the one call site that matters today, left the three siblings
+   (`_inline_has_tcall`/`_inline_param_refs`/`_inline_writes_param`)
+   documented-but-untouched since every current candidate's multi-target
+   is a plain local (provably inert, not fixed speculatively).
+
+   Even with `moog_slope` eligible, `moon_process`'s call into it still
+   didn't nest: `moon_process`'s entire body is `pp=p; return
+   moog_slope(...);` — the nested call lives INSIDE the trailing return,
+   and Inc 6's nested-call discovery/consumption both deliberately
+   excluded the trailing return ("`moog_taps`'s own `return a,b,c,d;`
+   has no calls in it, matching this limit exactly" — true then, not
+   anymore). Extended both sides symmetrically (discovery: one more call
+   to the already-correct `_inline_find_nested_calls`, now also applied
+   to the trailing statement; consumption: a new shared
+   `_inline_stamp_nested` helper used by both splice tails, continuing
+   the same id sequence the prelude's per-statement loop started).
+
+   Verified via `bug --disasm` on the REAL target, not just the new
+   synthetic test: `tl_channel_process`'s only remaining `bl` is
+   `rotary_tick` (an unrelated plugin) — `moon_process → moog_slope →
+   moog_taps → flt_onepole_tick` is now fully spliced, zero `bl`,
+   cold and hot call sites alike.
+
+   **`tl_bench`: controlled same-session A/B (git stash, rebuild,
+   measure both back to back) — 10906µs → 10774µs min-of-10, a real but
+   modest ~1.2%.** Smaller than the `bl`-count collapse alone would
+   suggest — the same lesson as the branch-fusion commit above: call/
+   return overhead on this target is cheaper than the node-count metric
+   implies. Shipped anyway because it's a correct, real capability (the
+   nested-inline mechanism now reaches one more genuine shape), not
+   because the number demanded it.
+
 **Running total across the whole "redisassemble instead of guess" arc:
-`tl_bench` 15.4 → 10.16 ms (~34%).** No further named lever remains; the
-next one needs another fresh re-disassembly.
+`tl_bench` 15.4 → ~10.77 ms (~30%, noise band ±~1-2% at this point — see
+commit 9's controlled A/B for the tightest recent measurement).** No
+further named lever remains; the next one needs another fresh
+re-disassembly. Per the user's own explicit direction (2026-06-23):
+**RegAlloc v2 (real liveness-based register allocation) opens next, as
+its own dedicated arc — not another inliner increment.**
