@@ -1,0 +1,91 @@
+// test_call_arg_typed_pushpop.bpp — the call-argument redesign:
+// a64_emit_call / x64_emit_call now push/pop each argument through its
+// own type's stack primitive (fpush/fpop for float, push/pop for int)
+// and route directly into its final ABI register via cg_count_tags,
+// instead of bit-reinterpreting every float argument to int bits,
+// pushing everything through the int stack, then rearranging afterward.
+// Stresses every argument-count/type-order shape that exercises
+// cg_count_tags's positional routing, since a swapped or misrouted
+// argument produces a wrong VALUE, not a crash — exactly the class of
+// bug a smoke test alone would miss.
+//
+// Also exercises the FFI-overload disambiguation fix found while
+// verifying this: cg_find_ext_by_argc matches FFI externs by name+argc
+// only, which is genuinely ambiguous when a symbol has multiple
+// same-arity overloads with different float shapes (objc_msgSend's
+// 6-arg all-double overload colliding with its 6-arg
+// ptr/ptr/int/ptr/ptr/int one is the real-world case, caught via a
+// Cocoa event-loop crash) — fixed by routing every FFI/unknown-target
+// argument by its own evaluated type instead of trusting the (possibly
+// wrong) declared param type. No B++-only repro is needed for that part
+// since the fix routes by ety unconditionally; the GPU/window test
+// suite (test_gpu_clear, test_gpu_shapes, etc.) is the real coverage.
+
+i0(a) -> word { return a; }
+f0(x: float) -> float { return x; }
+
+if1(a: word, x: float) -> float { return x + a; }
+fi1(x: float, a: word) -> float { return x + a; }
+
+ifi(a: word, x: float, b: word) -> float { return a * 100.0 + x + b; }
+fif(x: float, a: word, y: float) -> float { return x * 100.0 + a + y; }
+iif(a: word, b: word, x: float) -> float { return a * 100.0 + b + x; }
+fii(x: float, a: word, b: word) -> float { return x * 100.0 + a + b; }
+
+// 5 args, alternating, stresses cg_count_tags across a longer sequence.
+mix5(a: word, x: float, b: word, y: float, c: word) -> float {
+    return a * 10000.0 + x * 100.0 + b * 100.0 + y + c;
+}
+
+// All-float and all-int multi-arg, the "no separation needed" baseline.
+sum3i(a, b, c) -> word { return a + b + c; }
+sum3f(x: float, y: float, z: float) -> float { return x + y + z; }
+
+main() {
+    auto r: float, w;
+
+    w = i0(42);
+    if (w != 42) { return 1; }
+    r = f0(4.5);
+    if (r != 4.5) { return 2; }
+
+    r = if1(10, 2.5);
+    if (r != 12.5) { return 3; }
+    r = fi1(2.5, 10);
+    if (r != 12.5) { return 4; }
+
+    // ifi(1, 2.5, 3) = 100 + 2.5 + 3 = 105.5
+    r = ifi(1, 2.5, 3);
+    if (r != 105.5) { return 5; }
+    // fif(1.5, 2, 3.5) = 150 + 2 + 3.5 = 155.5
+    r = fif(1.5, 2, 3.5);
+    if (r != 155.5) { return 6; }
+    // iif(1, 2, 3.5) = 100 + 2 + 3.5 = 105.5
+    r = iif(1, 2, 3.5);
+    if (r != 105.5) { return 7; }
+    // fii(1.5, 2, 3) = 150 + 2 + 3 = 155.0
+    r = fii(1.5, 2, 3);
+    if (r != 155.0) { return 8; }
+
+    // mix5(1, 2.5, 3, 4.5, 5) = 10000 + 250 + 300 + 4.5 + 5 = 10559.5
+    r = mix5(1, 2.5, 3, 4.5, 5);
+    if (r != 10559.5) { return 9; }
+
+    w = sum3i(1, 2, 3);
+    if (w != 6) { return 10; }
+    r = sum3f(1.5, 2.5, 3.5);
+    if (r != 7.5) { return 11; }
+
+    // Same calls inside a loop, varying inputs, proving no state leaks
+    // across calls (the types_buf is per-call, freed each time).
+    auto k;
+    for (k = 0; k < 3; k++) {
+        auto kv: float;
+        kv = k + 1;
+        r = ifi(k, kv, k + 10);
+        // ifi(k, k+1.0, k+10) = k*100 + (k+1) + (k+10)
+        if (r != (k * 100.0) + (k + 1.0) + (k + 10.0)) { return 20 + k; }
+    }
+
+    return 0;
+}

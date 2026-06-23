@@ -177,8 +177,6 @@ void cg_install_x86_64_primitives() {
     p.b3_select              = fn_ptr(_x64_b3_select_prim);
     p.emit_arg_copy_int      = fn_ptr(_x64_emit_arg_copy_int);
     p.emit_arg_copy_flt      = fn_ptr(_x64_emit_arg_copy_flt);
-    p.emit_arg_compact_int   = fn_ptr(_x64_emit_arg_compact_int);
-    p.emit_arg_int_to_flt    = fn_ptr(_x64_emit_arg_int_to_flt);
     p.emit_frame_teardown    = fn_ptr(_x64_emit_frame_teardown);
     p.emit_module_setup      = fn_ptr(_x64_emit_module_setup);
     p.emit_module_finalize   = fn_ptr(_x64_emit_module_finalize);
@@ -1077,51 +1075,65 @@ x64_emit_call(nd) {
             }
         }
         arr = n.b; cnt = n.c;
-        // Evaluate all arguments and push as GPR values (uniform convention).
+        // Typed push/pop — mirrors a64_codegen.bsm's equivalent rewrite
+        // and the call() builtin's existing pattern below: record each
+        // argument's FINAL type (post-conversion) into a types_buf, push
+        // through the type-matched stack primitive, then pop in reverse
+        // order routing each one directly into its real System V bank
+        // slot via cg_count_tags — no bit-transfer through RAX, no
+        // separate rearrange pass. exi looked up before the loop (was
+        // after) since final_t needs it per-argument during evaluation.
+        auto exi, types_buf, final_t;
+        exi = cg_find_ext_by_argc(n.a, cnt);
+        types_buf = buf_byte(cnt);
         i = 0;
         while (i < cnt) {
             ety = call(pp.emit_node, *(arr + i * 8));
+            final_t = ety;
             if (fidx_c >= 0) {
-                // Cross-function type awareness: convert value to match callee's expected type.
                 par_flt = is_float_type(get_fn_par_type(fidx_c, i));
                 if (ety == 1) {
-                    if (par_flt) {
-                        // Float expr → float param: bit-transfer XMM0 to RAX.
-                        x64_enc_movq_from_xmm(0, 0);
-                    } else {
-                        // Float expr → int param: value-convert (truncate).
+                    if (par_flt == 0) {
+                        // Float expr -> int param: value-convert (truncate).
                         x64_enc_cvttsd2si(0, 0);
                     }
+                    // Float expr -> float param: already the right type.
                 } else {
                     if (par_flt) {
-                        // Int expr → float param: value-convert to double, then bit-transfer.
+                        // Int expr -> float param: value-convert to double.
                         x64_enc_cvtsi2sd(0, 0);
-                        x64_enc_movq_from_xmm(0, 0);
                     }
-                    // Int expr → int param: nothing needed, already in RAX.
+                    // Int expr -> int param: nothing needed.
                 }
-            } else {
-                // Unknown callee: fallback bit-transfer for float values.
-                if (ety == 1) {
-                    x64_enc_movq_from_xmm(0, 0);
-                }
+                final_t = par_flt;
             }
-            x64_emit_push();
+            // FFI (exi >= 0) and truly-unknown targets both route by the
+            // argument's own natural type (final_t already defaulted to
+            // ety above) — mirrors a64_codegen.bsm's identical fix.
+            // Deliberately NOT consulting the extern's declared param
+            // type: cg_find_ext_by_argc matches by name+argc only,
+            // genuinely ambiguous when an FFI symbol has multiple
+            // same-arity overloads with different float shapes
+            // (objc_msgSend's 6-arg all-double overload colliding with
+            // its 6-arg ptr/ptr/int/ptr/ptr/int one — found via a real
+            // Cocoa event-loop crash, an NSDate argument reinterpreted
+            // as a double). Every real call site already passes
+            // explicitly-typed literals matching the intended param, so
+            // ety always already matches the TRUE intended type.
+            poke(types_buf + i, final_t);
+            if (final_t == 1) { x64_emit_fpush(); } else { x64_emit_push(); }
             i++;
         }
-        // Pop into System V argument registers.
+        // Pop in reverse order, routing each argument directly into its
+        // final ABI register — cg_count_tags counts same-type args
+        // preceding position i, which IS that bank's sequence number.
         i = cnt - 1;
-        while (i >= 0) { x64_emit_pop(x64_arg_reg(i)); i--; }
-
-        // Rearrange args from "all in int regs" to System V
-        // (separate int / float banks). Spine helper walks both FFI
-        // externs and B++-internal calls uniformly via two chip
-        // primitives; see `cg_emit_call_arg_rearrange`.
-        auto exi;
-        exi = cg_find_ext_by_argc(n.a, cnt);
-        if (exi >= 0 || fidx_c >= 0) {
-            cg_emit_call_arg_rearrange(cnt, exi, fidx_c);
+        while (i >= 0) {
+            if (peek(types_buf + i) == 1) { x64_emit_fpop(cg_count_tags(types_buf, 0, i, 1)); }
+            else                          { x64_emit_pop(x64_arg_reg(cg_count_tags(types_buf, 0, i, 0))); }
+            i--;
         }
+        free(types_buf);
 
         // Call the function. Three cases, mirroring a64's split (a64_codegen.bsm
         // cg_find_fn -> bl, cg_find_ext -> GOT, else -> type-4 BL):

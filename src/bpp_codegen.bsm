@@ -209,8 +209,6 @@ struct ChipPrimitives {
     arg_reg_count_flt,  // ()          → 8 (a64) or 8 (x64)
     emit_push_arg_int,  // (dst_or_off, is_spill)
     emit_push_arg_flt,  // (dst_or_off, is_spill)
-    emit_arg_compact_int,    // (dst_int_seq, src_int_seq) — mov within int bank to compact
-    emit_arg_int_to_flt,     // (flt_seq, src_int_seq) — bit-cast int reg → flt reg
     emit_pre_call_align,    // (stack_args) → bytes of padding
     emit_post_call_unalign, // (pad_bytes)
     emit_call_direct,   // (target_lbl)
@@ -726,47 +724,6 @@ cg_count_tags(buf, lo, hi, match_val) {
     return n;
 }
 
-// Rearrange direct-call args from "all int regs" to AAPCS64 / SysV
-// (separate int / float register banks). After the chip's pop loop
-// has put every arg in the int register sequence (x0..xN on
-// aarch64, rdi/rsi/... on x86_64), walk the args once and route
-// each to its correct ABI slot via two chip primitives:
-//
-//   emit_arg_compact_int(dst_int_seq, src_int_seq) — `mov` within
-//     the int bank, compacting toward index 0 so float-skipped
-//     positions collapse.
-//   emit_arg_int_to_flt(flt_seq, src_int_seq) — bit-cast the int
-//     register holding the float bits into the matching FP register.
-//
-// `is_ffi` decides which type-source to consult: external param
-// table (`cg_ext_par_is_float(exi, i)`) for FFI calls, B++ function
-// table (`is_float_type(get_fn_par_type(fidx_c, i))`) for internal
-// calls. Both targets coexist when the symbol matches both — FFI
-// table wins because the external ABI is the binding contract for
-// off-binary calls.
-//
-// Invariant: `int_idx <= i` at every step, so compaction never
-// clobbers an unread arg's register.
-void cg_emit_call_arg_rearrange(cnt, exi, fidx_c) {
-    auto p: ChipPrimitives;
-    auto is_ffi, int_idx, flt_idx, i, is_flt;
-    p = cg_prim;
-    is_ffi = exi >= 0;
-    int_idx = 0; flt_idx = 0;
-    for (i = 0; i < cnt; i++) {
-        if (is_ffi) { is_flt = cg_ext_par_is_float(exi, i); }
-        else        { is_flt = is_float_type(get_fn_par_type(fidx_c, i)); }
-        if (is_flt) {
-            call(p.emit_arg_int_to_flt, flt_idx, i);
-            flt_idx++;
-        } else {
-            if (int_idx != i) {
-                call(p.emit_arg_compact_int, int_idx, i);
-            }
-            int_idx++;
-        }
-    }
-}
 
 // Compare a packed source range against a C string literal.
 // Returns 1 if the bytes match and the lengths are equal,
@@ -1189,14 +1146,6 @@ cg_find_ext_by_argc(name_p, argc) {
         i++;
     }
     return cg_find_ext(name_p);
-}
-
-// Is the i-th parameter of extern `exi` declared `double`?
-cg_ext_par_is_float(exi, par_idx) {
-    auto arr, tp;
-    arr = arr_get(cg_ex_args, exi);
-    tp = *(arr + par_idx * 8);
-    return cg_str_eq(tp, "double", 6);
 }
 
 // Does extern `exi` return `double`?

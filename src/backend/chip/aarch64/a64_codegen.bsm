@@ -209,8 +209,6 @@ void cg_install_arm64_primitives() {
     p.arg_reg_count_flt            = fn_ptr(_a64_arg_reg_count_flt);
     p.emit_push_arg_int            = fn_ptr(_a64_emit_push_arg_int);
     p.emit_push_arg_flt            = fn_ptr(_a64_emit_push_arg_flt);
-    p.emit_arg_compact_int         = fn_ptr(_a64_emit_arg_compact_int);
-    p.emit_arg_int_to_flt          = fn_ptr(_a64_emit_arg_int_to_flt);
     p.emit_pre_call_align          = fn_ptr(_a64_emit_pre_call_align);
     p.emit_post_call_unalign       = fn_ptr(_a64_emit_post_call_unalign);
     p.emit_call_direct             = fn_ptr(_a64_emit_call_direct);
@@ -479,8 +477,8 @@ static _a64_has_call(nd) {
 // ── String utilities ───────────────────────────────────────
 
 // Find an extern function by packed name. Returns first match index or -1.
-// cg_find_ext, cg_find_ext_by_argc, cg_ext_par_is_float,
-// cg_ext_ret_is_float live in bpp_codegen.bsm.
+// cg_find_ext, cg_find_ext_by_argc, cg_ext_ret_is_float live in
+// bpp_codegen.bsm.
 
 // cg_str_eq, cg_str_eq_packed live in bpp_codegen.bsm.
 
@@ -1531,49 +1529,69 @@ a64_emit_call(nd) {
             }
         }
         arr = n.b; cnt = n.c;
+        // Typed push/pop — same pattern the call() builtin already uses
+        // (a64_emit_call's "call" case above, mirrored on x64): record
+        // each argument's FINAL type (post-conversion) into a small
+        // types_buf, push through the type-matched stack primitive, then
+        // pop in reverse order routing each one directly into its real
+        // AAPCS64 bank slot via cg_count_tags — no bit-reinterpretation,
+        // no separate rearrange pass. Looked up before the loop (was
+        // after) since final_t needs it per-argument during evaluation.
+        auto exi, types_buf, final_t;
+        exi = cg_find_ext_by_argc(n.a, cnt);
+        types_buf = buf_byte(cnt);
         i = 0;
         while (i < cnt) {
             ety = call(pp.emit_node, *(arr + i * 8));
+            final_t = ety;
             if (fidx_c >= 0) {
                 vi = is_float_type(get_fn_par_type(fidx_c, i));
                 if (ety == 1) {
                     if (vi == 1) {
-                        if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
+                        // float arg, float param: already the right type,
+                        // no conversion needed.
                     } else {
                         if (a64_bin_mode) { enc_fcvtzs(0, 0); } else { out("  fcvtzs x0, d0"); putchar('\n'); }
                     }
                 } else {
                     if (vi == 1) {
-                        if (a64_bin_mode) {
-                            enc_scvtf(0, 0);
-                            enc_fmov_to_gpr(0, 0);
-                        } else {
-                            out("  scvtf d0, x0"); putchar('\n');
-                            out("  fmov x0, d0"); putchar('\n');
-                        }
+                        if (a64_bin_mode) { enc_scvtf(0, 0); } else { out("  scvtf d0, x0"); putchar('\n'); }
                     }
                 }
-            } else {
-                if (ety == 1) {
-                    if (a64_bin_mode) { enc_fmov_to_gpr(0, 0); } else { out("  fmov x0, d0"); putchar('\n'); }
-                }
+                final_t = vi;
             }
-            a64_emit_push();
+            // FFI (exi >= 0) and truly-unknown targets both route by the
+            // argument's own natural type (final_t already defaulted to
+            // ety above) — no implicit numeric conversion for FFI
+            // (existing contract), and deliberately NOT consulting the
+            // extern's declared param type at all. cg_find_ext_by_argc
+            // matches by name+argc only, which is genuinely ambiguous
+            // when an FFI symbol has multiple same-arity overloads with
+            // different float shapes (objc_msgSend is the real case: a
+            // 6-arg all-double overload collides with a 6-arg
+            // ptr/ptr/int/ptr/ptr/int one). Trusting the declared type
+            // there silently misrouted a real pointer argument into a
+            // float register — found via a Cocoa event-loop crash
+            // (NSDate argument reinterpreted as a double). Every real
+            // call site already passes explicitly-typed literals
+            // matching the intended param (0.0, not 0, for a double
+            // slot), so ety always already matches the TRUE intended
+            // type — routing by it is strictly safer than trusting a
+            // lookup that can pick the wrong overload.
+            poke(types_buf + i, final_t);
+            if (final_t == 1) { a64_emit_fpush(); } else { a64_emit_push(); }
             i++;
         }
-        // Pop args into x0..x(cnt-1) in reverse order.
+        // Pop in reverse order, routing each argument directly into its
+        // final ABI register — cg_count_tags counts same-type args
+        // preceding position i, which IS that bank's sequence number.
         i = cnt - 1;
-        while (i >= 0) { a64_emit_pop(i); i--; }
-
-        // Rearrange args from "all in int regs" to AAPCS64
-        // (separate int / float banks). Spine helper walks both FFI
-        // externs and B++-internal calls uniformly via two chip
-        // primitives; see `cg_emit_call_arg_rearrange`.
-        auto exi;
-        exi = cg_find_ext_by_argc(n.a, cnt);
-        if (exi >= 0 || fidx_c >= 0) {
-            cg_emit_call_arg_rearrange(cnt, exi, fidx_c);
+        while (i >= 0) {
+            if (peek(types_buf + i) == 1) { a64_emit_fpop(cg_count_tags(types_buf, 0, i, 1)); }
+            else                          { a64_emit_pop(cg_count_tags(types_buf, 0, i, 0));  }
+            i--;
         }
+        free(types_buf);
 
         if (a64_bin_mode) {
             fi = cg_find_fn(n.a);
